@@ -3312,6 +3312,16 @@ mod tests {
         fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
             t.mapv(|x| self.a * x.powi(4))
         }
+        fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64> {
+            // The synthetic oracle has no observation rows: its ΔF carries no
+            // deviance channel, so the per-row score moment is empty and the
+            // (b)–(d) channel assembly contracts against nothing.
+            assert_eq!(t.len(), self.block_dim(), "displacement dim mismatch");
+            Array1::zeros(0)
+        }
+        fn base_neg_score(&self) -> Array1<f64> {
+            Array1::zeros(0)
+        }
     }
 
     #[test]
@@ -6143,8 +6153,37 @@ pub trait BlockExcessTarget {
     /// Non-Gaussian remainder `ΔF(t)` at whitened block displacement `t`
     /// (length `block_dim()`).
     fn excess(&self, t: &Array1<f64>) -> f64;
-    /// ρ-gradient `∂ΔF/∂ρ_k` at the same `t`, length `rho_dim()`.
+    /// ρ-gradient `∂ΔF/∂ρ_k` at the same `t`, length `rho_dim()` — the
+    /// explicit penalty-score channel (a) of the gradient exactness contract
+    /// on [`block_sampled_marginal_correction`].
     fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64>;
+    /// Per-row displaced score `∂(D(η̂+s(t))/2φ)/∂η` evaluated at `η̂ + s(t)`
+    /// (length = number of observation rows). This is the only per-draw
+    /// ingredient of the exact-gradient channels (b)–(d) that the assembly
+    /// side cannot reconstruct from fixed fields: everything else (`X V_b`,
+    /// penalty scores, `W`, `c`, the H-eigenpairs) is draw-independent and
+    /// contracts against the moments in [`BlockSampledMoments`].
+    fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64>;
+    /// The same per-row score channel at the undisplaced mode `η̂`.
+    fn base_neg_score(&self) -> Array1<f64>;
+}
+
+/// Self-normalized importance-weighted moments of the per-draw gradient
+/// channels — the sampler-side half of the #784 exact-gradient seam (see the
+/// gradient exactness contract on [`block_sampled_marginal_correction`]).
+/// All expectations are under `p ∝ q·e^{−ΔF}` over the SAME fixed-seed draws
+/// that produced `value`, so the spliced value and its assembled gradient can
+/// never desync (#901 bug class).
+#[derive(Clone, Debug)]
+pub struct BlockSampledMoments {
+    /// `E_p[t]`, length `m`.
+    pub e_t: Array1<f64>,
+    /// `E_p[t tᵀ]`, shape `m × m`.
+    pub e_tt: Array2<f64>,
+    /// `E_p[ngs(η̂+s)]`, length n — the displaced per-row score moment.
+    pub e_neg_score: Array1<f64>,
+    /// Column `r` = `E_p[t_r · ngs(η̂+s)]`, shape `n × m`.
+    pub e_t_neg_score: Array2<f64>,
 }
 
 /// Block-local sampled marginal correction (issue #784).
@@ -6242,13 +6281,17 @@ pub trait BlockExcessTarget {
 pub struct BlockSampledMarginal {
     /// `Δ_b`: additive correction to the block marginal log-likelihood.
     pub value: f64,
-    /// `∂Δ_b/∂ρ`, length `rho_dim()`.
+    /// `∂Δ_b/∂ρ`, length `rho_dim()` — explicit channel (a) ONLY. The caller
+    /// owns the remaining channels (b)–(d), assembled from `moments`.
     pub rho_gradient: Array1<f64>,
     /// Importance-sampling effective sample size (draws), for diagnostics /
     /// trust gating.
     pub importance_ess: f64,
     /// Number of draws used.
     pub n_draws: usize,
+    /// Gradient-channel moments for the exact (b)–(d) assembly; `None` only
+    /// when the block is empty (`m == 0`, where the correction is zero).
+    pub moments: Option<BlockSampledMoments>,
 }
 
 /// Auto-derive the number of importance draws for the block-local sampled
@@ -6304,6 +6347,7 @@ pub fn block_sampled_marginal_correction<T: BlockExcessTarget>(
             rho_gradient: Array1::zeros(k),
             importance_ess: 0.0,
             n_draws: 0,
+            moments: None,
         });
     }
     let lambdas = target.block_curvatures();
@@ -6355,10 +6399,24 @@ pub fn block_sampled_marginal_correction<T: BlockExcessTarget>(
     seed_bits = seed_bits.wrapping_mul(0x1000_0000_01B3);
     let mut rng = StdRng::seed_from_u64(seed_bits);
 
-    // Accumulate log-weights w_s = −ΔF(t_s) (stable log-mean-exp) and the
-    // gradient channel g_{s,k} = −∂ΔF/∂ρ_k(t_s).
-    let mut log_weights = Vec::with_capacity(n_draws);
-    let mut grad_samples: Vec<Array1<f64>> = Vec::with_capacity(n_draws);
+    // Streaming, numerically-stable accumulation of the log-mean-exp value,
+    // the explicit gradient channel `E_p[−∂ΔF/∂ρ]`, AND the gradient-channel
+    // moments `E_p[t]`, `E_p[t tᵀ]`, `E_p[ngs]`, `E_p[t ⊗ ngs]` needed by the
+    // exact (b)–(d) channel assembly (gradient exactness contract above).
+    // Weights are kept relative to a running maximum log-weight: whenever a
+    // new maximum arrives, every accumulator is rescaled by
+    // `exp(max_old − max_new) ≤ 1`, so each per-draw relative weight is ≤ 1
+    // and the sums never overflow. Infeasible / divergent draws contribute
+    // zero weight rather than poisoning the estimate.
+    let n_obs = target.base_neg_score().len();
+    let mut max_lw = f64::NEG_INFINITY;
+    let mut sum_w = 0.0_f64;
+    let mut sum_w2 = 0.0_f64;
+    let mut grad_acc = Array1::<f64>::zeros(k);
+    let mut e_t_acc = Array1::<f64>::zeros(m);
+    let mut e_tt_acc = Array2::<f64>::zeros((m, m));
+    let mut e_ngs_acc = Array1::<f64>::zeros(n_obs);
+    let mut e_t_ngs_acc = Array2::<f64>::zeros((n_obs, m));
     let mut t = Array1::<f64>::zeros(m);
     for _ in 0..n_draws {
         for r in 0..m {
@@ -6367,44 +6425,64 @@ pub fn block_sampled_marginal_correction<T: BlockExcessTarget>(
         }
         let excess = target.excess(&t);
         if !excess.is_finite() {
-            // An infeasible / divergent draw contributes zero weight rather
-            // than poisoning the estimate.
-            log_weights.push(f64::NEG_INFINITY);
-            grad_samples.push(Array1::zeros(k));
             continue;
         }
-        log_weights.push(-excess);
-        let mut g = target.excess_rho_gradient(&t);
-        // gradient channel is −∂ΔF/∂ρ
-        g.mapv_inplace(|v| -v);
-        grad_samples.push(g);
+        let lw = -excess;
+        if lw > max_lw {
+            // exp(−∞ − lw) = 0 zeroes the (empty) accumulators on the first
+            // feasible draw, so no special-casing is needed.
+            let rescale = (max_lw - lw).exp();
+            sum_w *= rescale;
+            sum_w2 *= rescale * rescale;
+            grad_acc *= rescale;
+            e_t_acc *= rescale;
+            e_tt_acc *= rescale;
+            e_ngs_acc *= rescale;
+            e_t_ngs_acc *= rescale;
+            max_lw = lw;
+        }
+        let w = (lw - max_lw).exp();
+        sum_w += w;
+        sum_w2 += w * w;
+        // Explicit channel: −∂ΔF/∂ρ.
+        grad_acc.scaled_add(-w, &target.excess_rho_gradient(&t));
+        // Moment channels.
+        let ngs = target.displaced_neg_score(&t);
+        if ngs.len() != n_obs {
+            return Err(format!(
+                "block_sampled_marginal_correction: displaced_neg_score len {} != {n_obs}",
+                ngs.len()
+            ));
+        }
+        e_t_acc.scaled_add(w, &t);
+        e_ngs_acc.scaled_add(w, &ngs);
+        for r in 0..m {
+            let wt_r = w * t[r];
+            for q in 0..m {
+                e_tt_acc[(q, r)] += wt_r * t[q];
+            }
+            e_t_ngs_acc.column_mut(r).scaled_add(wt_r, &ngs);
+        }
     }
-
-    // Stable log-mean-exp for Δ_b = log mean_s exp(log_weights_s).
-    let max_lw = log_weights
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
     if !max_lw.is_finite() {
         return Err(
             "block_sampled_marginal_correction: all importance draws were infeasible".to_string(),
         );
     }
-    let mut sum_w = 0.0_f64;
-    let mut sum_w2 = 0.0_f64;
-    let mut grad_acc = Array1::<f64>::zeros(k);
-    for (lw, g) in log_weights.iter().zip(grad_samples.iter()) {
-        let w = (lw - max_lw).exp();
-        sum_w += w;
-        sum_w2 += w * w;
-        grad_acc.scaled_add(w, g);
-    }
     let value = max_lw + (sum_w / n_draws as f64).ln();
-    // Self-normalized importance-weighted gradient E_p[−∂ΔF/∂ρ].
-    let rho_gradient = if sum_w > 0.0 {
-        grad_acc / sum_w
+    // Self-normalized importance-weighted gradient E_p[−∂ΔF/∂ρ] and moments.
+    let (rho_gradient, moments) = if sum_w > 0.0 {
+        (
+            grad_acc / sum_w,
+            Some(BlockSampledMoments {
+                e_t: e_t_acc / sum_w,
+                e_tt: e_tt_acc / sum_w,
+                e_neg_score: e_ngs_acc / sum_w,
+                e_t_neg_score: e_t_ngs_acc / sum_w,
+            }),
+        )
     } else {
-        Array1::zeros(k)
+        (Array1::zeros(k), None)
     };
     // Kish effective sample size of the importance weights.
     let importance_ess = if sum_w2 > 0.0 {
@@ -6419,12 +6497,24 @@ pub fn block_sampled_marginal_correction<T: BlockExcessTarget>(
                 .to_string(),
         );
     }
+    if let Some(mo) = moments.as_ref()
+        && (mo.e_t.iter().any(|v| !v.is_finite())
+            || mo.e_tt.iter().any(|v| !v.is_finite())
+            || mo.e_neg_score.iter().any(|v| !v.is_finite())
+            || mo.e_t_neg_score.iter().any(|v| !v.is_finite()))
+    {
+        return Err(
+            "block_sampled_marginal_correction: produced non-finite gradient-channel moments"
+                .to_string(),
+        );
+    }
 
     Ok(BlockSampledMarginal {
         value,
         rho_gradient,
         importance_ess,
         n_draws,
+        moments,
     })
 }
 

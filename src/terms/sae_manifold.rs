@@ -13969,16 +13969,21 @@ impl OuterObjective for SaeManifoldOuterObjective {
         Ok(SeedOutcome::Installed)
     }
 
-    /// The SAE-manifold joint fit MUST enter through the heavy-smoothing
-    /// [`crate::solver::continuation_path::ContinuationPath`]: its joint
-    /// `(logits, t, β)` block has a combinatorial active-set component that a
-    /// cold solve at ρ* can collapse (the K≥2 routing-collapse failure class).
-    /// Returning `true` routes every seed through the coupled ρ / τ / isometry
-    /// homotopy walk (Object 1) and flips the seed cascade's structural-failure
-    /// handling from REJECT to DEMOTE-WITH-REASON, so the candidate set never
-    /// empties on a structural diagnosis.
+    /// The SAE-manifold joint fit enters through the heavy-smoothing
+    /// [`crate::solver::continuation_path::ContinuationPath`] WHEN there is a
+    /// combinatorial inter-atom routing active-set to protect: the joint
+    /// `(logits, t, β)` block has a routing component that a cold solve at ρ*
+    /// can collapse — but that failure class is specifically the **K ≥ 2**
+    /// routing collapse (atoms competing for assignment mass). A single-atom
+    /// (`K = 1`) fit has no inter-atom routing, so the coupled ρ / τ / isometry
+    /// walk has nothing to prevent and is pure overhead: the cold direct cascade
+    /// solves it directly (an order of magnitude faster on tiny fixtures). Gate
+    /// the walk on `K ≥ 2`. When it returns `true` every seed routes through the
+    /// homotopy walk (Object 1) and the seed cascade's structural-failure
+    /// handling flips from REJECT to DEMOTE-WITH-REASON so the candidate set
+    /// never empties on a structural diagnosis.
     fn requires_continuation_path_entry(&self) -> bool {
-        true
+        self.term.k_atoms() >= 2
     }
 
     /// The SAE-manifold objective has a certified anchor (#1007): its `η = 0`
