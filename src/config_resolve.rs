@@ -7,12 +7,10 @@ use crate::inference::model::GroupMetadata;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::solver::build_analytic_penalty_registry_from_descriptors;
 use crate::solver::workflow::{CtnStage1Recipe, FitConfig};
-use crate::survival_location_scale::residual_distribution_inverse_link;
 use crate::survival_construction::parse_survival_distribution;
+use crate::survival_location_scale::residual_distribution_inverse_link;
 use crate::transformation_normal::TransformationNormalConfig;
-use crate::types::{
-    InverseLink, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink,
-};
+use crate::types::{InverseLink, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink};
 use ndarray::Array1;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -191,7 +189,8 @@ pub fn parse_fit_config_json(config_json: Option<&str>) -> Result<ResolvedFitCon
 fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConfig, String> {
     let training_table_kind = json_config.training_table_kind;
     let mut fit_config = FitConfig::default();
-    fit_config.group_metadata = parse_group_metadata(json_config.group_metadata, json_config.groups)?;
+    fit_config.group_metadata =
+        parse_group_metadata(json_config.group_metadata, json_config.groups)?;
     fit_config.penalty_block_gamma_priors = parse_precision_hyperpriors(
         json_config.precision_hyperpriors,
         json_config.penalty_block_gamma_priors,
@@ -219,10 +218,8 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
         fit_config.transformation_normal = flag;
     }
     if let Some(mode) = json_config.survival_likelihood {
-        fit_config.survival_likelihood = resolve_nonempty_string(
-            mode,
-            "survival_likelihood must be a non-empty string",
-        )?;
+        fit_config.survival_likelihood =
+            resolve_nonempty_string(mode, "survival_likelihood must be a non-empty string")?;
     }
     if let Some(target) = json_config.baseline_target {
         fit_config.baseline_target =
@@ -387,9 +384,7 @@ pub fn resolve_cli_frailty_spec(
         Some(CliFrailtyKind::HazardMultiplier) => Ok(FrailtySpec::HazardMultiplier {
             sigma_fixed: validate_sigma()?,
             loading: hazard_loading.map(cli_hazard_loading).ok_or_else(|| {
-                format!(
-                    "{context} requires --hazard-loading with --frailty-kind hazard-multiplier"
-                )
+                format!("{context} requires --hazard-loading with --frailty-kind hazard-multiplier")
             })?,
         }),
     }
@@ -1156,12 +1151,10 @@ mod tests {
         ];
 
         for case in cases {
-            let cli = resolved_cli(case.cli).unwrap_or_else(|err| {
-                panic!("{}: CLI-shaped config failed: {err}", case.name)
-            });
-            let json = resolved_json(case.json).unwrap_or_else(|err| {
-                panic!("{}: JSON wire config failed: {err}", case.name)
-            });
+            let cli = resolved_cli(case.cli)
+                .unwrap_or_else(|err| panic!("{}: CLI-shaped config failed: {err}", case.name));
+            let json = resolved_json(case.json)
+                .unwrap_or_else(|err| panic!("{}: JSON wire config failed: {err}", case.name));
             assert_eq!(
                 canonical_fit_config(cli),
                 canonical_fit_config(json),

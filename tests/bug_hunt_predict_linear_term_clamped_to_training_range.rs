@@ -38,9 +38,7 @@
 //! (the same way it already skips categorical/binary/periodic columns), this
 //! test passes without edits.
 
-use gam::test_support::cli_harness::{
-    fit_then_predict_gaussian, write_predict_csv_rows,
-};
+use gam::test_support::cli_harness::{fit_then_predict_gaussian, write_predict_csv_rows};
 use std::path::Path;
 
 const SLOPE: f64 = 1.25;

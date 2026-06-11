@@ -406,10 +406,8 @@ mod tests {
                                         * (arr3(&w_k3, s, v, w) / 4.0 - arr3(&w_k21, s, w, v))
                                     + arr3(&w_k21, r, t, v) * arr3(&w_k21, s, w, u)
                                     + arr3(&w_k21, r, t, u) * arr3(&w_k21, s, w, v);
-                                lambda6 += kappa_up[[r, s]]
-                                    * kappa_up[[t, u]]
-                                    * kappa_up[[v, w]]
-                                    * braces;
+                                lambda6 +=
+                                    kappa_up[[r, s]] * kappa_up[[t, u]] * kappa_up[[v, w]] * braces;
                             }
                         }
                     }
@@ -578,7 +576,10 @@ mod tests {
         }
         let s_pen = Array2::<f64>::eye(2) * 0.5;
         let eps = lawley_epsilon(x.view(), &kappas, Some(s_pen.view())).expect("ε");
-        assert!(eps.abs() < 1e-14, "Gaussian-identity ε must be 0; got {eps}");
+        assert!(
+            eps.abs() < 1e-14,
+            "Gaussian-identity ε must be 0; got {eps}"
+        );
     }
 
     #[test]
@@ -594,7 +595,7 @@ mod tests {
             x[[i, 0]] = 1.0;
             x[[i, 1]] = (3.1 * z).cos();
             x[[i, 2]] = z - 0.5;
-            let eta = -0.1 + 0.6 * x[[i, 1] ] + 0.4 * x[[i, 2]];
+            let eta = -0.1 + 0.6 * x[[i, 1]] + 0.4 * x[[i, 2]];
             kappas.push(
                 RowExpectedJets::binomial_logit(eta)
                     .kappas()

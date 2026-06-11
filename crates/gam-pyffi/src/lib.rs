@@ -2667,11 +2667,10 @@ fn periodic_spline_curve_basis<'py>(
     penalty_order: usize,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
     let spec = PeriodicBSplineBasisSpec::new(degree, n_knots, 1.0, 0.0, penalty_order);
-    let basis = build_periodic_bspline_basis_1d(t.as_array(), &spec)
+    let basis =
+        build_periodic_bspline_basis_1d(t.as_array(), &spec).map_err(basis_error_to_pyerr)?;
+    let penalty = create_cyclic_difference_penalty_matrix(n_knots, penalty_order)
         .map_err(basis_error_to_pyerr)?;
-    let penalty =
-        create_cyclic_difference_penalty_matrix(n_knots, penalty_order)
-            .map_err(basis_error_to_pyerr)?;
     Ok((
         basis.into_pyarray(py).unbind(),
         penalty.into_pyarray(py).unbind(),
@@ -2788,9 +2787,8 @@ fn duchon_basis_with_jet<'py>(
     // no second, independently-scaled forward pipeline that could drift out of
     // lockstep on the amplification, the null-space basis, or the polynomial
     // column ordering. This is the model the issue prescribes.
-    let (phi, jet) =
-        duchon_sae_atom_basis_with_jet(pts, ctrs, requested_nullspace)
-            .map_err(basis_error_to_pyerr)?;
+    let (phi, jet) = duchon_sae_atom_basis_with_jet(pts, ctrs, requested_nullspace)
+        .map_err(basis_error_to_pyerr)?;
 
     // The penalty matrix `S = Zᵀ K_CC Z` is the conditionally-PD penalty of the
     // *same* basis. It comes from the forward builder over the identical spec,
@@ -3320,8 +3318,8 @@ fn auto_centers_1d<'py>(
     t: PyReadonlyArray1<'py, f64>,
     num_centers: usize,
 ) -> PyResult<Py<PyArray1<f64>>> {
-    let centers = auto_centers_1d_equal_mass(t.as_array(), num_centers)
-        .map_err(basis_error_to_pyerr)?;
+    let centers =
+        auto_centers_1d_equal_mass(t.as_array(), num_centers).map_err(basis_error_to_pyerr)?;
     Ok(centers.into_pyarray(py).unbind())
 }
 
@@ -3495,8 +3493,7 @@ fn duchon_function_norm_penalty<'py>(
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
-    let built = build_duchon_basis(center_matrix.view(), &spec)
-        .map_err(basis_error_to_pyerr)?;
+    let built = build_duchon_basis(center_matrix.view(), &spec).map_err(basis_error_to_pyerr)?;
     // The redesigned non-periodic Euclidean path emits a single native
     // reproducing-norm Gram as the `Primary` candidate (the function-norm
     // penalty on the scale-free polyharmonic basis) plus a null-space shrinkage

@@ -25,10 +25,10 @@
 //! across all three commands the test passes; today it fails because
 //! `gam sample` short-circuits with the entry-metadata error.
 
+use gam::test_support::cli_harness::run_capture_or_panic;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Exp, Uniform};
-use gam::test_support::cli_harness::run_capture_or_panic;
 use std::path::Path;
 use std::process::Command;
 

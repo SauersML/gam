@@ -5055,9 +5055,9 @@ impl OuterProblem {
                         criterion_certificate: None,
                         rho_uncertainty_certificate: None,
                     };
-                    result.rho_uncertainty_certificate = Some(
-                        compute_rho_uncertainty_certificate(obj, &config, context, &result),
-                    );
+                    result.rho_uncertainty_certificate = Some(compute_rho_uncertainty_certificate(
+                        obj, &config, context, &result,
+                    ));
                     return Ok(result);
                 }
                 CacheSeedDecision::Seed {
@@ -5669,10 +5669,7 @@ fn compute_rho_uncertainty_certificate(
             hessian_rho[[row, col]] = hessian[[row, col]];
         }
     }
-    let rho_hat = result
-        .rho
-        .slice(ndarray::s![..rho_dim])
-        .to_owned();
+    let rho_hat = result.rho.slice(ndarray::s![..rho_dim]).to_owned();
     let theta_hat = result.rho.clone();
     let cost_hat = final_eval.cost;
     let final_beta_hint = final_eval.inner_beta_hint.clone();
@@ -7867,15 +7864,14 @@ mod tests {
             "rho-certificate-baseline",
         )
         .expect("baseline outer run");
-        let certified = run_outer(
-            &mut with_certificate,
-            &config,
-            "rho-certificate-certified",
-        )
-        .expect("certified outer run");
+        let certified = run_outer(&mut with_certificate, &config, "rho-certificate-certified")
+            .expect("certified outer run");
 
         assert_eq!(baseline.rho, certified.rho);
-        assert_eq!(baseline.final_value.to_bits(), certified.final_value.to_bits());
+        assert_eq!(
+            baseline.final_value.to_bits(),
+            certified.final_value.to_bits()
+        );
         assert_eq!(baseline.iterations, certified.iterations);
         assert_eq!(baseline.final_grad_norm, certified.final_grad_norm);
         assert!(certified.rho_uncertainty_certificate.is_some());

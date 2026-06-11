@@ -4176,8 +4176,7 @@ fn unwhiten_samples(
     let mut z_buffer = Array1::<f64>::zeros(dim);
     for chain in 0..n_chains {
         for sample_i in 0..n_samples_out {
-            let zview =
-                samples_array.slice(ndarray::s![chain, sample_i, z_start..z_start + dim]);
+            let zview = samples_array.slice(ndarray::s![chain, sample_i, z_start..z_start + dim]);
             z_buffer.assign(&zview);
             let beta = mode + &chol.dot(&z_buffer);
             let sample_idx = chain * n_samples_out + sample_i;

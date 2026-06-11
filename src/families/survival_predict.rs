@@ -15,8 +15,8 @@ use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::scale_design::scale_transform_from_payload;
 use crate::families::survival::assemble_competing_risks_cif_from_endpoints;
 use crate::families::survival_construction::{
-    SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBuildOutput,
-    add_survival_time_derivative_guard_offset, build_survival_time_basis,
+    SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
+    SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_derivative_design,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
     normalize_survival_time_pair, parse_survival_likelihood_mode,
@@ -2036,9 +2036,7 @@ pub(crate) fn location_scale_time_warp_components(
 ) -> Result<LocationScaleTimeWarpComponents, String> {
     let n = x_time_exit.nrows();
     if eta_time_offset_exit.len() != n {
-        return Err(
-            "survival location-scale time-warp row mismatch across inputs".to_string(),
-        );
+        return Err("survival location-scale time-warp row mismatch across inputs".to_string());
     }
     let beta_time = fit.beta_time();
     if x_time_exit.ncols() != beta_time.len() {
@@ -2081,20 +2079,18 @@ pub(crate) fn location_scale_time_warp_components(
                 .to_string()
         })?;
         let beta_w = beta_time.slice(s![p_base..p_time_total]).to_owned();
-        let time_basis =
-            crate::families::wiggle::monotone_wiggle_basis_with_derivative_order(
-                h_base.view(),
-                knots,
-                degree,
-                0,
-            )?;
-        let time_basis_d1 =
-            crate::families::wiggle::monotone_wiggle_basis_with_derivative_order(
-                h_base.view(),
-                knots,
-                degree,
-                1,
-            )?;
+        let time_basis = crate::families::wiggle::monotone_wiggle_basis_with_derivative_order(
+            h_base.view(),
+            knots,
+            degree,
+            0,
+        )?;
+        let time_basis_d1 = crate::families::wiggle::monotone_wiggle_basis_with_derivative_order(
+            h_base.view(),
+            knots,
+            degree,
+            1,
+        )?;
         if time_basis.ncols() != p_wiggle || time_basis_d1.ncols() != p_wiggle {
             return Err(format!(
                 "survival location-scale time-warp timewiggle mismatch: value basis has {} columns, derivative basis has {}, beta has {}",
@@ -2144,9 +2140,7 @@ pub(crate) fn location_scale_eta_components(
         || x_log_sigma.nrows() != n
         || eta_log_sigma_offset.len() != n
     {
-        return Err(
-            "survival location-scale eta component row mismatch across inputs".to_string(),
-        );
+        return Err("survival location-scale eta component row mismatch across inputs".to_string());
     }
     let time_components = location_scale_time_warp_components(
         x_time_exit,
@@ -2160,8 +2154,7 @@ pub(crate) fn location_scale_eta_components(
     let beta_log_sigma = fit.beta_log_sigma();
     let eta_t = x_threshold.matrixvectormultiply(&beta_threshold) + eta_threshold_offset;
     let eta_ls = x_log_sigma.matrixvectormultiply(&beta_log_sigma) + eta_log_sigma_offset;
-    let inv_sigma = eta_ls
-        .mapv(crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar);
+    let inv_sigma = eta_ls.mapv(crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar);
     Ok(LocationScaleEtaComponents {
         h: time_components.h,
         time_jac: time_components.time_jac,
