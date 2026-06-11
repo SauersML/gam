@@ -2,7 +2,7 @@ use crate::faer_ndarray::FaerCholesky;
 use crate::solver::estimate::EstimationError;
 use crate::solver::sensitivity::FitSensitivity;
 use faer::Side;
-use ndarray::{Array1, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 /// Closed-form Riesz representer for a linear functional of a fitted smooth.
 ///
