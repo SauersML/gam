@@ -20530,25 +20530,44 @@ pub fn fit_survival_marginal_slope_terms(
         };
         let n_rows = spec.time_block.design_entry.nrows();
         let preflight = (|| -> Result<(), String> {
-            let mut dq0 = spec
-                .time_block
-                .design_entry
-                .try_to_dense_by_chunks("smgs phase-4b preflight time_entry")?;
-            let mut dq1 = spec
-                .time_block
-                .design_exit
-                .try_to_dense_by_chunks("smgs phase-4b preflight time_exit")?;
+            // The preflight densifies five operator-backed designs
+            // simultaneously to run the parametric cross-block compile.
+            // Without a per-matrix cap, a tensor-product time block at
+            // n=320 000 (e.g. 68 age knots × 8 timewiggle knots) materializes
+            // to ~1.4 GiB per matrix and OOMs the host before the
+            // observability-only diagnostic ever produces a verdict. Cap each
+            // matrix at the strict-mode single-materialization budget
+            // (`ResourcePolicy::analytic_operator_required`); when any block
+            // exceeds it the closure returns `Err` and the surrounding
+            // `warn!`-on-fail handler skips the preflight just like any other
+            // densification refusal — the downstream
+            // `canonicalize_for_identifiability` audit remains the source of
+            // truth for the same diagnostic.
+            const PREFLIGHT_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+            let mut dq0 = spec.time_block.design_entry.try_to_dense_by_chunks_budgeted(
+                "smgs phase-4b preflight time_entry",
+                PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
+            )?;
+            let mut dq1 = spec.time_block.design_exit.try_to_dense_by_chunks_budgeted(
+                "smgs phase-4b preflight time_exit",
+                PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
+            )?;
             let mut dqd1 = spec
                 .time_block
                 .design_derivative_exit
-                .try_to_dense_by_chunks("smgs phase-4b preflight time_deriv")?;
-            let m_dq = marginal_design
-                .design
-                .try_to_dense_by_chunks("smgs phase-4b preflight marginal")?;
+                .try_to_dense_by_chunks_budgeted(
+                    "smgs phase-4b preflight time_deriv",
+                    PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
+                )?;
+            let m_dq = marginal_design.design.try_to_dense_by_chunks_budgeted(
+                "smgs phase-4b preflight marginal",
+                PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
+            )?;
             let m_dqd1 = ndarray::Array2::<f64>::zeros(m_dq.dim());
-            let g_dg = logslope_design
-                .design
-                .try_to_dense_by_chunks("smgs phase-4b preflight logslope")?;
+            let g_dg = logslope_design.design.try_to_dense_by_chunks_budgeted(
+                "smgs phase-4b preflight logslope",
+                PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
+            )?;
             // Channel-aware per-subject Fisher Gram (T8). Pilot primary
             // state at β=0: q0 = offset_entry + marginal_offset, q1 =
             // offset_exit + marginal_offset, qd1 = derivative_offset_exit,
@@ -20915,18 +20934,33 @@ pub fn fit_survival_marginal_slope_terms(
     // Aborting here would defeat the canonical reduction. We emit an info-
     // level diagnostic with the (block, ncols, rank) tuple so the rank-deficit
     // is visible in the log without being fatal.
-    {
+    // The joint rank diagnostic densifies time/marginal/logslope and
+    // stacks them into a single n × p_joint matrix for column-pivoted QR.
+    // At large n the time block alone (n × p_time, where p_time grows
+    // multiplicatively with the time-tensor + timewiggle basis) materializes
+    // to multiple GiB and OOMs the host before the rrqr / W-metric SVD even
+    // starts. The block is explicitly "Diagnostic only" — any rank
+    // deficiency at this point is handled by the canonical-gauge pipeline in
+    // `canonicalize_for_identifiability` (called centrally before the inner
+    // Newton). When the dense footprint exceeds the strict-mode
+    // single-materialization budget we skip the whole block with a `warn!`
+    // and leave the canonical-gauge pipeline as the source of truth, mirror-
+    // ing the smgs phase-4b preflights above.
+    const RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+    let rank_diagnostic_outcome: Result<(), String> = (|| -> Result<(), String> {
         use crate::linalg::faer_ndarray::rrqr_with_permutation;
-        let time_dense = spec
-            .time_block
-            .design_exit
-            .try_to_dense_by_chunks("survival-marginal-slope joint rank diagnostic time")?;
-        let marginal_dense = marginal_design
-            .design
-            .try_to_dense_by_chunks("survival-marginal-slope joint rank diagnostic marginal")?;
-        let logslope_dense = logslope_design
-            .design
-            .try_to_dense_by_chunks("survival-marginal-slope joint rank diagnostic logslope")?;
+        let time_dense = spec.time_block.design_exit.try_to_dense_by_chunks_budgeted(
+            "survival-marginal-slope joint rank diagnostic time",
+            RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES,
+        )?;
+        let marginal_dense = marginal_design.design.try_to_dense_by_chunks_budgeted(
+            "survival-marginal-slope joint rank diagnostic marginal",
+            RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES,
+        )?;
+        let logslope_dense = logslope_design.design.try_to_dense_by_chunks_budgeted(
+            "survival-marginal-slope joint rank diagnostic logslope",
+            RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES,
+        )?;
         let score_warp_dense = score_warp_prepared
             .as_ref()
             .map(|sw| sw.runtime.design_at_training_with_residual(&z_primary))
@@ -21035,7 +21069,16 @@ pub fn fit_survival_marginal_slope_terms(
                 columns: m,
             });
         }
-        joint_training_design_preflight(&segments, &spec.weights)?;
+        joint_training_design_preflight(&segments, &spec.weights)
+            .map_err(|e| format!("survival-marginal-slope joint preflight failed: {e}"))?;
+        Ok(())
+    })();
+    if let Err(reason) = rank_diagnostic_outcome {
+        if reason.contains("refusing to densify") {
+            log::warn!("[survival-marginal-slope joint rank diagnostic] skipped: {reason}");
+        } else {
+            return Err(reason);
+        }
     }
     // Penalty seeds for the flex/aux blocks beyond the core (time/marginal/
     // logslope). The absorbed influence block (#461) contributes ONE trailing
@@ -21245,26 +21288,38 @@ pub fn fit_survival_marginal_slope_terms(
                 extract_term_partition_from_penalty_ranges(p_marg, &marg_penalty_ranges);
             let logslope_partition =
                 extract_term_partition_from_penalty_ranges(p_log, &log_penalty_ranges);
-            // Densify the operator-side designs once.
-            let mut dq0 = spec
-                .time_block
-                .design_entry
-                .try_to_dense_by_chunks("smgs phase-4b active: time_entry")?;
-            let mut dq1 = spec
-                .time_block
-                .design_exit
-                .try_to_dense_by_chunks("smgs phase-4b active: time_exit")?;
+            // Densify the operator-side designs once. Cap each densification
+            // at the strict-mode single-materialization budget so a
+            // tensor-product time block at large n does not OOM the host
+            // before the closure can return Err — phase-4b is gracefully
+            // skipped via the surrounding `warn!`-on-fail match, leaving the
+            // downstream `canonicalize_for_identifiability` audit as the
+            // gate.
+            const ACTIVE_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+            let mut dq0 = spec.time_block.design_entry.try_to_dense_by_chunks_budgeted(
+                "smgs phase-4b active: time_entry",
+                ACTIVE_MATERIALIZATION_BUDGET_BYTES,
+            )?;
+            let mut dq1 = spec.time_block.design_exit.try_to_dense_by_chunks_budgeted(
+                "smgs phase-4b active: time_exit",
+                ACTIVE_MATERIALIZATION_BUDGET_BYTES,
+            )?;
             let mut dqd1 = spec
                 .time_block
                 .design_derivative_exit
-                .try_to_dense_by_chunks("smgs phase-4b active: time_deriv")?;
-            let m_dq = marginal_design
-                .design
-                .try_to_dense_by_chunks("smgs phase-4b active: marginal")?;
+                .try_to_dense_by_chunks_budgeted(
+                    "smgs phase-4b active: time_deriv",
+                    ACTIVE_MATERIALIZATION_BUDGET_BYTES,
+                )?;
+            let m_dq = marginal_design.design.try_to_dense_by_chunks_budgeted(
+                "smgs phase-4b active: marginal",
+                ACTIVE_MATERIALIZATION_BUDGET_BYTES,
+            )?;
             let m_dqd1 = ndarray::Array2::<f64>::zeros(m_dq.dim());
-            let g_dg = logslope_design
-                .design
-                .try_to_dense_by_chunks("smgs phase-4b active: logslope")?;
+            let g_dg = logslope_design.design.try_to_dense_by_chunks_budgeted(
+                "smgs phase-4b active: logslope",
+                ACTIVE_MATERIALIZATION_BUDGET_BYTES,
+            )?;
             // Pilot primary state for the timewiggle Jacobian overwrite
             // below (offset-only β=0 state: q0 = offset_entry +
             // marginal_offset, q1 = offset_exit + marginal_offset, qd1 =
