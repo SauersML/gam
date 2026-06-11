@@ -29500,7 +29500,19 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
-                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        // `extract_spatial_operator_runtime_caches` returns a
+                        // cache only when the term ships an EXPLICIT Stiffness
+                        // penalty (the Charbonnier D2 surrogate has no
+                        // matching shipped penalty otherwise — see
+                        // `extract_spatial_operator_runtime_caches` docs at the
+                        // call site). `DuchonOperatorPenaltySpec::default()`
+                        // disables Stiffness (Primary is the exact RKHS
+                        // curvature), so the runtime cache would be empty and
+                        // the adaptive-overlay path this test exists to
+                        // exercise would never fire. Pin `all_active()` so all
+                        // three operator channels (mass, tension, stiffness)
+                        // are present in the design's penalty list.
+                        operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                         boundary: OneDimensionalBoundary::Open,
                     },
                     input_scales: None,
@@ -30023,7 +30035,13 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
-                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        // Same reason as
+                        // `exact_spatial_adaptive_1dobjective_profile_has_finite_gradient_lambda_surface`:
+                        // the adaptive overlay requires an EXPLICIT Stiffness
+                        // penalty for `extract_spatial_operator_runtime_caches`
+                        // to surface a cache. The default Duchon spec disables
+                        // Stiffness, so pin `all_active()` here too.
+                        operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                         boundary: OneDimensionalBoundary::Open,
                     },
                     input_scales: None,
