@@ -24022,7 +24022,18 @@ mod tests {
             LikelihoodSpec::gaussian_identity(),
             fit_opts,
             &SpatialLengthScaleOptimizationOptions {
-                max_outer_iter: 2,
+                // `max_outer_iter: 2` was set when the iso-κ analytic
+                // optimizer typically converged within two BFGS steps. The
+                // current optimizer reaches the relative-gradient tolerance
+                // only after a handful of outer iterations on the Matérn
+                // monotone fixtures (the previous run-out left
+                // `|g|_proj ≈ 1.65e-1` against `|f| ≈ 1.3e2` — well above
+                // `rel_tol * (1 + |f|) ≈ 1.3e-3`), so a 2-iteration cap
+                // bails before reaching convergence. Raising the cap to 16
+                // gives the optimizer headroom to actually reach the
+                // tolerance the test is asserting against; the
+                // monotone-improvement contract this test pins is unchanged.
+                max_outer_iter: 16,
                 rel_tol: 1e-5,
                 pilot_subsample_threshold: 0,
                 ..SpatialLengthScaleOptimizationOptions::default()
