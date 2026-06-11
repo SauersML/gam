@@ -2106,11 +2106,10 @@ impl RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         let fam = self.family;
         // Time block: channels 0,1,2 via the dense time Jacobians.
         {
-            let mut time = &mut out[self.offsets[0]..self.offsets[1]];
+            let time = &mut out[self.offsets[0]..self.offsets[1]];
             axpy_dense_row_into(&self.dynamic.time_jac_entry, row, v[0], time);
             axpy_dense_row_into(&self.dynamic.time_jac_exit, row, v[1], time);
             axpy_dense_row_into(&self.dynamic.time_jac_deriv, row, v[2], time);
-            let _ = &mut time;
         }
         // Threshold block: channels 3 (exit), 4 (entry), 5 (deriv).
         {
@@ -2272,80 +2271,23 @@ impl RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
 
     fn row_fourth_contracted(
         &self,
-        row: usize,
-        dir_u: &[f64; SLS_ROW_K],
-        dir_v: &[f64; SLS_ROW_K],
+        _row: usize,
+        _dir_u: &[f64; SLS_ROW_K],
+        _dir_v: &[f64; SLS_ROW_K],
     ) -> Result<[[f64; SLS_ROW_K]; SLS_ROW_K], String> {
-        // Second directional derivative. With the third- and fourth-order map
-        // tensors (D3 / D4) restricted to the entry/exit q-channels (g linear in
-        // the time-invariant config), the fourth-order contracted Hessian is the
-        // directional derivative of `row_third_contracted` along `dir_v`,
-        // expanded in closed form below. D4 of the scale map vanishes beyond the
-        // populated D3 slots for the configurations this kernel covers.
-        let m = self.row_maps(row);
-        let mut out = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
-        for i in 0..3 {
-            let di = &m.d[i];
-            let d2i = &m.d2[i];
-            let d3i = &m.d3[i];
-            let l1 = m.l1[i];
-            let l2 = m.l2[i];
-            let l3 = m.l3[i];
-            // ell_iiii = ∂⁴ along index i. For survival the fourth index
-            // derivative is carried by the kernel's d_h_* channels; entry/exit
-            // fourth-order index derivatives are d_h_h0/d_h_h1 already in l3's
-            // siblings. We reconstruct ell_iiii where available (u0,u1) and
-            // treat g as having vanishing fourth order in the covered config.
-            let l4 = match i {
-                0 => self.q.d_h_h0[row],
-                1 => self.q.d_h_h1[row],
-                _ => 0.0,
-            };
-            let mut du = 0.0;
-            let mut dv = 0.0;
-            let mut ddu = [0.0_f64; SLS_ROW_K];
-            let mut ddv = [0.0_f64; SLS_ROW_K];
-            for c in 0..SLS_ROW_K {
-                du += di[c] * dir_u[c];
-                dv += di[c] * dir_v[c];
-                for a in 0..SLS_ROW_K {
-                    ddu[a] += d2i[a][c] * dir_u[c];
-                    ddv[a] += d2i[a][c] * dir_v[c];
-                }
-            }
-            // Δ²_i along (u then v): Σ_{c,e} D2_i[c][e] u_c v_e (= dD_u · v).
-            let mut delta2 = 0.0;
-            for c in 0..SLS_ROW_K {
-                delta2 += ddu[c] * dir_v[c];
-            }
-            for a in 0..SLS_ROW_K {
-                for b in 0..SLS_ROW_K {
-                    // d²H[a][b] expanded from row_third_contracted differentiated
-                    // along dir_v (D4 terms dropped per the covered-config note).
-                    let mut ddu2_ab = 0.0;
-                    let mut ddv2_ab = 0.0;
-                    let mut d3uv = 0.0;
-                    for c in 0..SLS_ROW_K {
-                        ddu2_ab += d3i[a][b][c] * dir_u[c];
-                        ddv2_ab += d3i[a][b][c] * dir_v[c];
-                        // mixed third-map contraction handled via dd arrays
-                        let _ = c;
-                    }
-                    let _ = (ddu2_ab, ddv2_ab, d3uv);
-                    let term = l4 * du * dv * di[a] * di[b]
-                        + l3
-                            * (delta2 * di[a] * di[b]
-                                + du * (ddv[a] * di[b] + di[a] * ddv[b])
-                                + dv * (ddu[a] * di[b] + di[a] * ddu[b]))
-                        + l3 * (du * dv * d2i[a][b])
-                        + l2 * (ddu[a] * ddv[b] + ddv[a] * ddu[b])
-                        + l2 * (delta2 * d2i[a][b])
-                        + l1 * 0.0;
-                    out[a][b] -= term;
-                }
-            }
-        }
-        Ok(out)
+        // The survival location-scale family carries derivative quantities only
+        // up to third order (`d_h_*` are third index derivatives; the fourth
+        // index derivatives `dddr0` / `d4logphi1` are computed in
+        // `exact_*_derivatives_fourth_rescaled` but deliberately not stored).
+        // Its REML outer Hessian is assembled from the **third-order**
+        // directional-derivative operator, never an explicit fourth-order
+        // tensor, so this entry point is not on the location-scale path. Routing
+        // through the generic `row_kernel_second_directional_derivative` would
+        // require persisting the fourth index derivatives first.
+        Err("survival location-scale RowKernel does not provide a fourth-order \
+             contracted derivative: the family's REML uses the third-order \
+             directional operator (no fourth-order tensor is computed)"
+            .to_string())
     }
 }
 
