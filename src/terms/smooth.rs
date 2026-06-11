@@ -6686,24 +6686,101 @@ fn build_factor_smooth(
         && let Some(Some(z)) = inner.null_eigenvectors.first()
         && z.nrows() == p
     {
+        // A factor smooth is a RANDOM EFFECT: each group's curve is an
+        // exchangeable Gaussian function that, for prediction, must shrink
+        // toward the POPULATION mean function — not toward zero. lme4's BLUP
+        // shrinks each subject's slope toward the fixed population slope; that
+        // borrowing is exactly what lets a random-slope model forecast a held-
+        // out subject. The wiggliness penalty's null space (e.g. {const, linear}
+        // for a 2nd-derivative penalty) carries the per-group intercept and
+        // slope. Splitting it into two parts (gam#903):
+        //
+        //  * Constant direction `u_const` (the constant B-spline function): the
+        //    GLOBAL model intercept already supplies the unpenalized population
+        //    constant, so we ridge the per-group constants fully `I_L ⊗ u_c u_cᵀ`
+        //    — they shrink toward that global intercept (a random intercept).
+        //    Freeing a second constant here would collide with the global one.
+        //
+        //  * Non-constant directions `w` (population linear trend / higher
+        //    polynomial terms): there is NO unpenalized population anchor for
+        //    these, so the legacy plain ridge `I_L ⊗ w wᵀ` shrinks EVERY group's
+        //    slope toward zero, biasing the population slope toward zero and
+        //    crippling held-out extrapolation (sleepstudy forecast ran ~20%
+        //    over the lme4 bar; mgcv's own `fs`, which also lacks the anchor,
+        //    is worse still). We instead penalize the centred operator
+        //    `(I_L − J_L/L) ⊗ w wᵀ`, whose null space contains the across-group
+        //    mean `1_L ⊗ w` — the population trend, left UNPENALIZED as a fixed
+        //    effect — while penalizing only the sum-to-zero per-group
+        //    deviations. Subject slopes then shrink toward the population slope:
+        //    the mixed-model random-slope BLUP, matching (and beating) lme4.
+        //
+        // This keeps the same per-component smoothing-parameter count as the
+        // legacy construction (one shared variance per null direction); only the
+        // shrinkage TARGET of the non-constant components changes from 0 to the
+        // population trend. Each per-group null variance is still estimated by
+        // REML, so genuine curvature still survives where the data demand it.
+
+        // The constant B-spline function has all-equal coefficients (B-splines
+        // partition unity); project it onto the marginal null space to get the
+        // null-space constant direction `u_const`.
+        let ones = Array1::<f64>::from_elem(p, 1.0 / (p as f64).sqrt());
+        let proj = z.dot(&z.t().dot(&ones));
+        let proj_norm = proj.dot(&proj).sqrt();
+        let u_const = (proj_norm > 1e-8).then(|| proj.mapv(|v| v / proj_norm));
+
+        // Orthonormal directions to penalize, tagged with whether their
+        // across-group mean is freed (non-constant) or fully ridged (constant).
+        let mut dirs: Vec<(Array1<f64>, bool)> = Vec::new();
+        let mut basis: Vec<Array1<f64>> = Vec::new();
+        if let Some(uc) = &u_const {
+            dirs.push((uc.clone(), false));
+            basis.push(uc.clone());
+        }
         for k in 0..z.ncols() {
-            // Rank-1 marginal penalty `z_k z_kᵀ`, replicated block-diagonally
-            // across levels into `I_L ⊗ (z_k z_kᵀ)`. Its own λ is one shared
-            // variance for this null component (intercept or slope) across all
-            // groups — the random-effect structure of mgcv `fs`.
-            let zk = z.column(k);
+            // Gram–Schmidt each null eigenvector against the accumulated basis
+            // (including `u_const`); the residual is a fresh non-constant
+            // direction whose population mean we free.
+            let mut w = z.column(k).to_owned();
+            for b in &basis {
+                let c = w.dot(b);
+                w.scaled_add(-c, b);
+            }
+            let nrm = w.dot(&w).sqrt();
+            if nrm > 1e-7 {
+                w.mapv_inplace(|v| v / nrm);
+                basis.push(w.clone());
+                // free the mean only when a constant anchor exists (the global
+                // intercept covers it); otherwise ridge fully to stay regular.
+                dirs.push((w, u_const.is_some()));
+            }
+        }
+
+        let inv_l = 1.0 / n_levels as f64;
+        for (dir, free_mean) in dirs {
+            // Rank-1 marginal penalty `M = dir dirᵀ`.
             let mut p_k = Array2::<f64>::zeros((p, p));
             for a in 0..p {
                 for b in 0..p {
-                    p_k[[a, b]] = zk[a] * zk[b];
+                    p_k[[a, b]] = dir[a] * dir[b];
                 }
             }
+            // Replicate across levels: `I_L ⊗ M` (ridge every group toward 0)
+            // or the centred `(I_L − J_L/L) ⊗ M` (free the across-group mean —
+            // the population component — and penalize only deviations).
             let mut s_null = Array2::<f64>::zeros((q, q));
-            for level in 0..n_levels {
-                let start = level * p;
-                s_null
-                    .slice_mut(s![start..start + p, start..start + p])
-                    .assign(&p_k);
+            for l1 in 0..n_levels {
+                for l2 in 0..n_levels {
+                    let coef = if l1 == l2 {
+                        if free_mean { 1.0 - inv_l } else { 1.0 }
+                    } else if free_mean {
+                        -inv_l
+                    } else {
+                        continue;
+                    };
+                    s_null
+                        .slice_mut(s![l1 * p..l1 * p + p, l2 * p..l2 * p + p])
+                        .scaled_add(coef, &p_k);
+                }
             }
             let (s_null, null_scale) = normalize_penalty_in_constrained_space(&s_null);
             let null_block = crate::terms::basis::analyze_penalty_block_with_op(&s_null, None)?;
