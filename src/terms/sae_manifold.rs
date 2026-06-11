@@ -4229,7 +4229,7 @@ fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> Result<f64, 
     let second = atom
         .basis_evaluator
         .as_ref()
-        .and_then(|evaluator| evaluator.second_jet_dyn(coords))
+        .and_then(|evaluator| evaluator.second_jet_dyn(coords.view()))
         .ok_or_else(|| {
             format!(
                 "atom_curvature_bound: atom {atom_idx} has no analytic second jet; cannot compute kappa_hat"
