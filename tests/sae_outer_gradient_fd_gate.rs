@@ -14,7 +14,13 @@ struct Fixture {
     rho: SaeManifoldRho,
 }
 
-fn fixture() -> Fixture {
+/// Build the K=2 periodic-harmonic SAE fixture under a given assignment `mode`.
+///
+/// `log_lambda_sparse` is exposed so the IBP-MAP arm can run its empirical-π
+/// prior at a genuinely active weight (the fixed-`alpha` IBP penalty reads
+/// `lambda_sparse` as its weight lever), which is what exercises the #1006
+/// empirical-`M_k` third channel through the outer-ρ gradient.
+fn fixture(mode: AssignmentMode, log_lambda_sparse: f64) -> Fixture {
     let n = 80usize;
     let p = 6usize;
     let k_atoms = 2usize;
@@ -45,7 +51,10 @@ fn fixture() -> Fixture {
         coords[1][[row, 0]] = (phase + 0.18).fract();
         let route = if row < n / 2 { 1.7 } else { -1.7 };
         logits[[row, 0]] = route;
-        logits[[row, 1]] = 0.0;
+        // A genuine second active gate so the IBP / JumpReLU per-atom logits all
+        // sit inside their optimization bands (softmax ignores the absolute
+        // level, gate modes do not).
+        logits[[row, 1]] = if row % 3 == 0 { 0.9 } else { 0.3 };
         let theta0 = std::f64::consts::TAU * coords[0][[row, 0]];
         let theta1 = std::f64::consts::TAU * coords[1][[row, 0]];
         let basis0 = [
@@ -107,12 +116,12 @@ fn fixture() -> Fixture {
         logits,
         coords,
         vec![LatentManifold::Circle { period: 1.0 }; k_atoms],
-        AssignmentMode::softmax(0.7),
+        mode,
     )
     .expect("assignment");
     let term = SaeManifoldTerm::new(atoms, assignment).expect("term");
     let rho = SaeManifoldRho::new(
-        -8.0,
+        log_lambda_sparse,
         -8.0,
         vec![Array1::from_vec(vec![-8.0]), Array1::from_vec(vec![-8.0])],
     );
@@ -159,16 +168,18 @@ fn centered_fd(
     (vp - vm) / (2.0 * h)
 }
 
-#[test]
-fn sae_outer_rho_gradient_components_match_centered_fd_with_third_order_correction() {
-    let f = fixture();
+/// The full analytic outer-ρ gradient — explicit + direct log-det traces +
+/// Occam + the #1006 third-order implicit-state correction — must match a
+/// centered finite difference of the actual REML criterion (inner problem
+/// re-solved at each ρ, so the FD carries the envelope/IFT terms).
+fn assert_full_gradient_matches_fd(label: &str, f: &Fixture) {
     let (converged, _value, loss, cache) = evaluate(&f.term, &f.target, &f.rho, 8);
     let components = converged
         .analytic_outer_rho_gradient_components(&f.rho, &loss, &cache)
         .expect("analytic components");
     assert!(
         components.third_order_correction_available,
-        "the SAE arrow Hessian must expose the #1006 third-order correction"
+        "[{label}] the SAE arrow Hessian must expose the #1006 third-order correction"
     );
     let analytic = components.gradient_with_available_correction();
     let n_params = f.rho.to_flat().len();
@@ -179,8 +190,32 @@ fn sae_outer_rho_gradient_components_match_centered_fd_with_third_order_correcti
         let tol = 2.5e-3 * (1.0 + fd.abs().max(analytic[coord].abs()));
         assert!(
             diff <= tol,
-            "full rho gradient coord {coord}: fd={fd:.8e}, analytic={:.8e}, diff={diff:.3e}, tol={tol:.3e}",
+            "[{label}] full rho gradient coord {coord}: fd={fd:.8e}, analytic={:.8e}, diff={diff:.3e}, tol={tol:.3e}",
             analytic[coord]
         );
     }
+}
+
+#[test]
+fn sae_outer_rho_gradient_components_match_centered_fd_softmax() {
+    let f = fixture(AssignmentMode::softmax(0.7), -8.0);
+    assert_full_gradient_matches_fd("softmax", &f);
+}
+
+#[test]
+fn sae_outer_rho_gradient_components_match_centered_fd_jumprelu() {
+    // JumpReLU with the threshold below the active logits so both gates sit in
+    // the optimization band and the sigmoid-sparsity third channel is live.
+    let f = fixture(AssignmentMode::jumprelu(0.7, 0.0), -1.5);
+    assert_full_gradient_matches_fd("jumprelu", &f);
+}
+
+#[test]
+fn sae_outer_rho_gradient_components_match_centered_fd_ibp_map() {
+    // IBP-MAP exercises the #1006 empirical-π third channel: pi_k(M_k) couples
+    // every row in a column, so the outer-ρ gradient through log|H| depends on
+    // the cross-row M_k channel of `logdet_theta_adjoint`. lambda_sparse is the
+    // active prior weight here, so coord 0's FD directly stresses it.
+    let f = fixture(AssignmentMode::ibp_map(0.9, 0.7, false), -1.5);
+    assert_full_gradient_matches_fd("ibp_map", &f);
 }

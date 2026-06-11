@@ -909,6 +909,12 @@ pub struct MultiplexedFit {
 /// the global pool. Results are returned in input order. A single A100 thus hosts
 /// many color-/qwen-arm fits at once — the cross-fit batch where the 1e5–1e6×
 /// race speedup materialises.
+///
+/// The GPU runtime singleton (`GpuRuntime::global`) and per-ordinal context
+/// cache are warmed by constructing the resident workspaces (each `new` calls
+/// the same probe), so the per-fit calls inside the Rayon scope only *read* the
+/// already-initialised `OnceLock`s — they never trigger a `get_or_init` whose
+/// closure does nested parallel work, avoiding the OnceLock×Rayon deadlock.
 pub fn run_resident_fits_multiplexed(
     workspaces: Vec<DeviceResidentArrowWorkspace>,
     opts: DeviceResidentInnerOptions,

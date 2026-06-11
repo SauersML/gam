@@ -40,6 +40,8 @@ use crate::solver::evidence::{
     UNION_STRUCTURE_LADDER, UnionStructure, UnionStructureFit, fit_gaussian_mixture,
     fit_union_ladder, fit_union_structure, solve_stacking_weights, union_per_point_log_density,
 };
+use crate::inference::row_measure::CoresetCertificate;
+use crate::solver::logdet_bounds::MarginVerdict;
 use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use ndarray::{Array2, ArrayView2};
 use serde_json::Value as JsonValue;
@@ -1037,6 +1039,12 @@ pub struct CrossClassRaceVerdict {
     pub winner_index: usize,
     /// Which statistic drove the headline.
     pub headline: Headline,
+    /// `Some(_)` when the same-class evidence winner's lead over the runner-up
+    /// did NOT clear the decision margin required by approximate (enclosure /
+    /// coreset) evidence — the verdict is provisional and the caller must
+    /// refine or escalate to the exact path. `None` when the margin held (or no
+    /// approximate evidence was involved, or the race adjudicated by stacking).
+    pub insufficient_margin: Option<InsufficientRaceMargin>,
 }
 
 /// Which statistic adjudicated the headline ranking.
@@ -1048,13 +1056,90 @@ pub enum Headline {
     Stacking,
 }
 
+/// How a candidate's `negative_log_evidence` was certified — the source of the
+/// decision-margin the same-class race must respect before it can transfer a
+/// verdict from approximate evidence to the full-corpus verdict.
+///
+/// * [`Exact`] — the evidence is a genuine point value (dense logdet, full
+///   corpus); no margin floor.
+/// * [`Enclosure`] — the log-determinant half came from a
+///   [`block_preconditioned_logdet_enclosure`]; the race lead Δ must exceed the
+///   enclosure gap (#1011 contract) before the winner is trustworthy.
+/// * [`Coreset`] — the evidence was raced on a certified row coreset; the lead
+///   must exceed the certificate's [`CoresetCertificate::race_transfer_margin`]
+///   (#1012 contract — the SAME margin seam as the enclosure).
+///
+/// [`Exact`]: EvidenceCertification::Exact
+/// [`Enclosure`]: EvidenceCertification::Enclosure
+/// [`Coreset`]: EvidenceCertification::Coreset
+/// [`block_preconditioned_logdet_enclosure`]: crate::solver::logdet_bounds::block_preconditioned_logdet_enclosure
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EvidenceCertification {
+    Exact,
+    Enclosure { gap: f64 },
+    Coreset { certificate: CoresetCertificate },
+}
+
+impl EvidenceCertification {
+    /// The smallest race lead Δ for which this candidate's evidence is
+    /// trustworthy. Exact evidence transfers at any positive lead; an enclosure
+    /// needs its gap; a coreset needs its certified transfer margin.
+    pub fn required_margin(&self) -> f64 {
+        match self {
+            EvidenceCertification::Exact => 0.0,
+            EvidenceCertification::Enclosure { gap } => *gap,
+            EvidenceCertification::Coreset { certificate } => certificate.race_transfer_margin(),
+        }
+    }
+}
+
 /// One candidate entering the cross-class adjudicator: its kind, its rank-aware
-/// Laplace negative-log-evidence (already computed on the common scale), and a
-/// selection-time held-out-density provider that refits per CV fold.
+/// Laplace negative-log-evidence (already computed on the common scale), how
+/// that evidence was certified (for the margin contract), and a selection-time
+/// held-out-density provider that refits per CV fold.
 pub struct CrossClassCandidate<'a> {
     pub kind: AutoTopologyKind,
     pub negative_log_evidence: f64,
+    /// Certification of `negative_log_evidence`. Defaults conceptually to
+    /// [`EvidenceCertification::Exact`]; construct with [`Self::exact`] for the
+    /// classic point-value path.
+    pub certification: EvidenceCertification,
     pub density_provider: HeldOutDensityProvider<'a>,
+}
+
+impl<'a> CrossClassCandidate<'a> {
+    /// Construct a candidate whose evidence is an exact point value (the
+    /// classic full-corpus dense-logdet path — no margin floor).
+    pub fn exact(
+        kind: AutoTopologyKind,
+        negative_log_evidence: f64,
+        density_provider: HeldOutDensityProvider<'a>,
+    ) -> Self {
+        Self {
+            kind,
+            negative_log_evidence,
+            certification: EvidenceCertification::Exact,
+            density_provider,
+        }
+    }
+}
+
+/// Why a same-class race could not transfer its approximate-evidence verdict to
+/// the full corpus: the winner's lead Δ over the runner-up did not clear the
+/// required decision margin (the enclosure gap or the coreset transfer margin).
+/// The consumer must refine (more moments / pair absorption / a larger coreset)
+/// or re-run the top contenders on the exact dense path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InsufficientRaceMargin {
+    /// Index of the provisional (below-margin) winner.
+    pub provisional_winner: usize,
+    /// Index of the runner-up whose evidence is within margin of the winner.
+    pub contender: usize,
+    /// The realized lead Δ = nle[contender] − nle[winner] (≥ 0).
+    pub lead: f64,
+    /// The margin the lead had to exceed (max of the two candidates'
+    /// required margins).
+    pub required_margin: f64,
 }
 
 /// Adjudicate a race that may mix smooth-manifold and discrete candidates
@@ -1088,12 +1173,44 @@ pub fn adjudicate_cross_class_race(
 
     if !is_cross_class {
         // Same-class: winner-take-all on rank-aware evidence (lower wins).
+        let certifications: Vec<EvidenceCertification> =
+            candidates.iter().map(|c| c.certification).collect();
         let mut winner_index = 0usize;
         let mut best = f64::INFINITY;
         for (idx, &nle) in evidence.iter().enumerate() {
             if nle.is_finite() && nle < best {
                 best = nle;
                 winner_index = idx;
+            }
+        }
+        // Decision-margin contract (#1011 enclosure / #1012 coreset, one seam):
+        // the winner's lead over the closest contender must clear the larger of
+        // the two candidates' required margins (an exact candidate floors at 0,
+        // an enclosure at its gap, a coreset at its transfer margin). When the
+        // lead is inside that margin the verdict is provisional — the
+        // approximate evidence does not actually separate them — so we surface
+        // an explicit escalation rather than silently anointing a winner the
+        // bounds cannot distinguish.
+        let mut insufficient_margin: Option<InsufficientRaceMargin> = None;
+        for (idx, &nle) in evidence.iter().enumerate() {
+            if idx == winner_index || !nle.is_finite() {
+                continue;
+            }
+            let lead = nle - best;
+            let required =
+                certifications[winner_index].required_margin().max(certifications[idx].required_margin());
+            if required > 0.0 && lead <= required {
+                let tighter = insufficient_margin
+                    .map(|m| lead < m.lead)
+                    .unwrap_or(true);
+                if tighter {
+                    insufficient_margin = Some(InsufficientRaceMargin {
+                        provisional_winner: winner_index,
+                        contender: idx,
+                        lead,
+                        required_margin: required,
+                    });
+                }
             }
         }
         return Ok(CrossClassRaceVerdict {
@@ -1103,6 +1220,7 @@ pub fn adjudicate_cross_class_race(
             stacking: None,
             winner_index,
             headline: Headline::Evidence,
+            insufficient_margin,
         });
     }
 
@@ -1127,6 +1245,10 @@ pub fn adjudicate_cross_class_race(
         stacking: Some(stacking),
         winner_index,
         headline: Headline::Stacking,
+        // Cross-class headlines adjudicate by held-out predictive stacking on
+        // the full corpus, not by the approximate-evidence scalar, so the
+        // enclosure/coreset margin contract does not gate the verdict here.
+        insufficient_margin: None,
     })
 }
 

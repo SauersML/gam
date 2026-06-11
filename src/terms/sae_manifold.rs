@@ -41,8 +41,9 @@ use crate::solver::arrow_schur::{
 };
 use crate::terms::analytic_penalties::{
     AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DecoderIncoherencePenalty,
-    IBPAssignmentPenalty, IsometryPenalty, MechanismSparsityPenalty, NuclearNormPenalty,
-    PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, WeightField, resolve_learnable_weight,
+    IBPAssignmentPenalty, IbpHessianDiagThirdChannels, IsometryPenalty, MechanismSparsityPenalty,
+    NuclearNormPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, WeightField,
+    resolve_learnable_weight,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
@@ -4857,10 +4858,6 @@ struct SaeManifoldMutableState {
 }
 
 impl SaeManifoldTerm {
-    fn analytic_outer_rho_gradient_supported(&self) -> bool {
-        !matches!(self.assignment.mode, AssignmentMode::IBPMap { .. })
-    }
-
     #[must_use = "build error must be handled"]
     pub fn new(atoms: Vec<SaeManifoldAtom>, assignment: SaeAssignment) -> Result<Self, String> {
         if atoms.is_empty() {
@@ -9390,6 +9387,7 @@ impl SaeManifoldTerm {
         row: usize,
         diag_atom: usize,
         wrt: SaeLocalRowVar,
+        ibp_channels: Option<&IbpHessianDiagThirdChannels>,
     ) -> f64 {
         let SaeLocalRowVar::Logit { atom: wrt_atom } = wrt else {
             return 0.0;
@@ -9447,12 +9445,23 @@ impl SaeManifoldTerm {
                     * inv_tau
             }
             AssignmentMode::IBPMap { .. } => {
-                // #1006 GAP, deliberately loud: the assembled Hessian consumes
-                // `IBPAssignmentPenalty::hessian_diag`, whose derivative also
-                // includes the implicit empirical-pi channel. That third prior
-                // channel is not exposed as a reusable analytic primitive here,
-                // so this branch is incomplete for IBP-MAP assignment priors.
-                0.0
+                // The assembled `htt` diagonal consumes
+                // `IBPAssignmentPenalty::hessian_diag`, whose logit derivative
+                // splits into a row-local direct-`z` channel and a global
+                // empirical-`M_k` channel (π_k couples every row in column k).
+                // This same-row primitive returns only the LOCAL direct-`z`
+                // channel — and only on the matching logit (`diag_atom == w`),
+                // since H_ik depends on no other row's z explicitly. The global
+                // M_k channel is accumulated column-wise in
+                // `logdet_theta_adjoint` (it needs the per-row selected-inverse
+                // diagonals), so adding it here would double-count.
+                if diag_atom != wrt_atom {
+                    return 0.0;
+                }
+                match ibp_channels {
+                    Some(ch) => ch.local_logit_third[row * ch.k_max + diag_atom],
+                    None => 0.0,
+                }
             }
         }
     }
@@ -9583,13 +9592,17 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
     ) -> Result<SaeArrowVector, String> {
-        // #1006 GAP, deliberately loud: `assemble_arrow_schur` currently builds
-        // the SAE row Hessian as Gauss-Newton data curvature (`J^T J`) plus the
-        // same prior majorizers used for the Newton solve. The residual-
-        // contracted full-Hessian third channels from the issue derivation are
-        // therefore not present in this Γ; adding them before the assembly uses
-        // the same full Hessian would desynchronize the logdet gradient from the
-        // factor being differentiated.
+        // Γ_a = tr(H⁻¹ ∂H/∂θ_a) over the inner variables θ (#1006). `H` here is
+        // the SAME object the evidence factor builds — Gauss-Newton data
+        // curvature plus the prior majorizers / `hessian_diag` diagonals the
+        // Newton/Schur Cholesky factorizes — so each block's θ-derivative channel
+        // is differentiated on the criterion's own branch (no value/gradient
+        // desync). The IBP-MAP assignment prior is the one block whose
+        // `hessian_diag` couples every row in a column through the plug-in
+        // empirical mass `M_k = Σ_i z_ik`; its logit derivative therefore has a
+        // row-local channel (handled inline via
+        // `assignment_prior_hdiag_derivative_entry`) and a cross-row channel
+        // (accumulated column-wise after the row loop, below).
         let n = self.n_obs();
         let total_t = cache.delta_t_len();
         let mut gamma_t = Array1::<f64>::zeros(total_t);
@@ -9603,6 +9616,16 @@ impl SaeManifoldTerm {
         } else {
             Array2::<f64>::zeros((0, 0))
         };
+        // Exact IBP `hessian_diag` logit third-derivative channels (#1006), built
+        // once on the same penalty configuration the assembly uses. `None` for
+        // non-IBP modes. The cross-row empirical-`M_k` channel needs the per-row
+        // selected-inverse diagonals collected during the row loop, so it is
+        // distributed column-wise afterwards.
+        let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho)?;
+        let k_atoms = self.k_atoms();
+        // Per active logit position: (row i, column k, global t-index,
+        // (H⁻¹)_ik,ik) — the inputs to the IBP cross-row empirical-`M_k` channel.
+        let mut ibp_logit_sites: Vec<(usize, usize, usize, f64)> = Vec::new();
 
         for row in 0..n {
             let q = cache.row_dims[row];
@@ -9631,6 +9654,16 @@ impl SaeManifoldTerm {
                 }
             }
 
+            // Record each active logit's column, global t-index, and
+            // selected-inverse diagonal (H⁻¹)_ik,ik for the IBP cross-row pass.
+            if ibp_channels.is_some() {
+                for (pos, var) in jets.vars.iter().enumerate() {
+                    if let SaeLocalRowVar::Logit { atom } = *var {
+                        ibp_logit_sites.push((row, atom, base + pos, inv_vv[[pos, pos]]));
+                    }
+                }
+            }
+
             for w in 0..q {
                 let mut gamma = 0.0_f64;
                 for a in 0..q {
@@ -9645,6 +9678,7 @@ impl SaeManifoldTerm {
                                         row,
                                         atom,
                                         jets.vars[w],
+                                        ibp_channels.as_ref(),
                                     ),
                                 SaeLocalRowVar::Coord { atom, axis } if a == w => {
                                     self.ard_majorized_hessian_derivative(rho, row, atom, axis)
@@ -9691,6 +9725,26 @@ impl SaeManifoldTerm {
             }
         }
 
+        // IBP cross-row empirical-`M_k` channel of Γ (#1006). The assembled
+        // diagonal H_ik consumes `hessian_diag`, whose dependence on the column
+        // mass M_k = Σ_i z_ik couples every row in a column. Differentiating
+        // tr(H⁻¹ ∂H/∂ℓ_wk) on that shared branch:
+        //   Γ_wk += [ Σ_i (H⁻¹)_ik,ik · ∂_M H_ik ] · J_wk = C_k · J_wk,
+        // where ∂_M H_ik = `m_channel[i*K+k]` and J_wk = `z_jac[w*K+k]`. The
+        // row-local direct-`z` channel was already added inline above, so this
+        // pass adds only the cross-row remainder (it spans `w ≠ i` and the
+        // self-row M_k self-coupling, which the row-local primitive deliberately
+        // omits to avoid double-counting).
+        if let Some(channels) = ibp_channels.as_ref() {
+            let mut col_coeff = vec![0.0_f64; k_atoms];
+            for &(row, atom, _t_index, inv_diag) in &ibp_logit_sites {
+                col_coeff[atom] += inv_diag * channels.m_channel[row * k_atoms + atom];
+            }
+            for &(row, atom, t_index, _inv_diag) in &ibp_logit_sites {
+                gamma_t[t_index] += col_coeff[atom] * channels.z_jac[row * k_atoms + atom];
+            }
+        }
+
         Ok(SaeArrowVector {
             t: gamma_t,
             beta: gamma_beta,
@@ -9709,12 +9763,6 @@ impl SaeManifoldTerm {
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
     ) -> Result<SaeOuterRhoGradientComponents, String> {
-        if !self.analytic_outer_rho_gradient_supported() {
-            return Err(
-                "analytic_outer_rho_gradient_components: IBP-MAP assignment priors are not supported because their empirical-pi Hessian derivative is global across rows"
-                    .to_string(),
-            );
-        }
         let n_params = rho.to_flat().len();
         let mut explicit = Array1::<f64>::zeros(n_params);
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
@@ -13022,11 +13070,10 @@ impl SaeManifoldOuterObjective {
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         OuterCapability {
-            gradient: if self.term.analytic_outer_rho_gradient_supported() {
-                Derivative::Analytic
-            } else {
-                Derivative::Unavailable
-            },
+            // The full analytic outer-ρ gradient is assembled for every
+            // assignment mode, including IBP-MAP (its empirical-π third channel
+            // landed exactly in `logdet_theta_adjoint`, #1006).
+            gradient: Derivative::Analytic,
             hessian: DeclaredHessianForm::Unavailable,
             n_params: self.baseline_rho.to_flat().len(),
             // ρ are all penalty-like / τ coordinates: precisions and
@@ -14047,6 +14094,43 @@ fn assignment_prior_grad_hdiag(
     grad += &sparsity_grad;
     diag += &sparsity_diag;
     Ok((grad, diag))
+}
+
+/// Build the exact IBP `hessian_diag` logit third-derivative channels (#1006)
+/// for the SAE log-det adjoint Γ, using the SAME penalty configuration —
+/// `alpha`/`tau`/`learnable_alpha` and the `lambda_sparse` weight convention —
+/// that [`assignment_prior_grad_hdiag`] assembles into `htt`. Returns `None`
+/// for non-IBP assignment modes (no cross-row empirical-π coupling to correct).
+fn ibp_assignment_third_channels(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+) -> Result<Option<IbpHessianDiagThirdChannels>, String> {
+    let AssignmentMode::IBPMap {
+        temperature,
+        alpha,
+        learnable_alpha,
+    } = assignment.mode
+    else {
+        return Ok(None);
+    };
+    for row in 0..assignment.n_obs() {
+        validate_finite_logits(assignment.logits.row(row), row)?;
+    }
+    let target = flat_logits(assignment.logits.view());
+    let mut penalty =
+        IBPAssignmentPenalty::new(assignment.k_atoms(), alpha, temperature, learnable_alpha);
+    // Mirror assignment_prior_grad_hdiag exactly: when alpha is learnable the
+    // sparse coordinate already modulates it through resolved_alpha(rho), so the
+    // weight stays 1.0; otherwise lambda_sparse becomes the prior's weight lever.
+    let rho_view = if learnable_alpha {
+        Array1::from_vec(vec![rho.log_lambda_sparse])
+    } else {
+        penalty.weight = rho.lambda_sparse();
+        Array1::zeros(0)
+    };
+    Ok(Some(
+        penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view()),
+    ))
 }
 
 fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {
@@ -19998,13 +20082,16 @@ mod tests {
     }
 
     #[test]
-    fn ibp_map_outer_objective_does_not_advertise_incomplete_analytic_gradient() {
+    fn ibp_map_outer_objective_advertises_analytic_gradient() {
+        // The IBP-MAP empirical-π third channel (including the cross-row M_k
+        // coupling) is now assembled exactly in `logdet_theta_adjoint` (#1006),
+        // so the outer objective advertises an analytic gradient like every
+        // other assignment mode.
         let (mut term, target, rho) = gamma_fd_tiny_fixture();
         term.assignment.mode = AssignmentMode::ibp_map(0.9, 1.0, false);
-        assert!(!term.analytic_outer_rho_gradient_supported());
 
         let obj = SaeManifoldOuterObjective::new(term, target, None, rho, 5, 0.4, 1.0e-6, 1.0e-6);
-        assert_eq!(obj.capability().gradient, Derivative::Unavailable);
+        assert_eq!(obj.capability().gradient, Derivative::Analytic);
     }
 }
 
