@@ -107,6 +107,7 @@ from .fit import FitResult, fit
 from .module import GAM
 from .harvest import (
     HarvestShard,
+    harvest_downstream_output_fisher_factors,
     harvest_output_fisher_factors,
     load_harvest_shard,
     save_harvest_shard,
@@ -118,6 +119,7 @@ __all__ = [
     "FitResult",
     "GAM",
     "HarvestShard",
+    "harvest_downstream_output_fisher_factors",
     "harvest_output_fisher_factors",
     "load_harvest_shard",
     "save_harvest_shard",
