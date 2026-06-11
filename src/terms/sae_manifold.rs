@@ -35,15 +35,14 @@ use std::sync::Arc;
 use crate::solver::arrow_schur::{
     ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem,
     ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, FactoredFrameGBlock,
-    FactoredFrameKroneckerOp, KroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
-    StreamingArrowSchur, solve_arrow_newton_step_with_proximal_correction,
+    FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp,
+    SparseGBlock, StreamingArrowSchur, solve_arrow_newton_step_with_proximal_correction,
     solve_streaming_reduced_beta,
 };
 use crate::terms::analytic_penalties::{
-    AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
-    DecoderIncoherencePenalty, IBPAssignmentPenalty, IsometryPenalty, MechanismSparsityPenalty,
-    NuclearNormPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, WeightField,
-    resolve_learnable_weight,
+    AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DecoderIncoherencePenalty,
+    IBPAssignmentPenalty, IsometryPenalty, MechanismSparsityPenalty, NuclearNormPenalty,
+    PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, WeightField, resolve_learnable_weight,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
@@ -4598,8 +4597,7 @@ impl SaeManifoldTerm {
                 let a = assignments[row][atom_idx];
                 // Partial residual e_{n,k} = z_n − (fitted − a_k decoded_k).
                 for c in 0..p {
-                    let e = target[[row, c]] - fitted[[row, c]]
-                        + a * decoded[[row, atom_idx, c]];
+                    let e = target[[row, c]] - fitted[[row, c]] + a * decoded[[row, atom_idx, c]];
                     targets[[row, c]] = a * e;
                 }
                 // In-span coordinate ĉ_{n,k} = Φ_k(t_n)·C_k ∈ ℝ^r.
@@ -5346,11 +5344,10 @@ impl SaeManifoldTerm {
                     smooth_grad_gb[beta_i] += sb[[i, out_col]];
                 }
             }
-            // KroneckerPenaltyOp: factor_a = λ·S_k (m×m), factor_b = I_p (p×p).
-            let identity_p = Array2::<f64>::eye(p);
-            smooth_ops.push(Arc::new(KroneckerPenaltyOp {
+            // IdentityRightKroneckerPenaltyOp: factor_a = λ·S_k (m×m), factor_b = I_p.
+            smooth_ops.push(Arc::new(IdentityRightKroneckerPenaltyOp {
                 factor_a: scaled_s.clone(),
-                factor_b: identity_p,
+                p,
                 global_offset: off,
                 k: beta_dim,
             }));
@@ -6044,8 +6041,9 @@ impl SaeManifoldTerm {
             // bases) by mapping each `(atom_beta_off + m·p, φ)` load to atom `k`'s
             // factored base `off_C[k] + m·r_k` and attaching `U_k`.
             let off_c = self.factored_beta_offsets();
-            let frames: Vec<Array2<f64>> =
-                (0..self.atoms.len()).map(|k| self.frame_output_matrix(k)).collect();
+            let frames: Vec<Array2<f64>> = (0..self.atoms.len())
+                .map(|k| self.frame_output_matrix(k))
+                .collect();
             let kron = Arc::new(SaeFrameKroneckerRows::new(
                 p,
                 &beta_offsets,
@@ -6154,13 +6152,12 @@ impl SaeManifoldTerm {
             //   * analytic    `Φᵀ hbb Φ`                 (dense, only if written).
             // Un-framed atoms ride the `r_k = p, U_k = I_p` identity special case.
             let off_c = self.factored_beta_offsets();
-            let ranks: Vec<usize> =
-                self.atoms.iter().map(|a| a.border_frame_rank()).collect();
-            let basis_sizes: Vec<usize> =
-                self.atoms.iter().map(|a| a.basis_size()).collect();
+            let ranks: Vec<usize> = self.atoms.iter().map(|a| a.border_frame_rank()).collect();
+            let basis_sizes: Vec<usize> = self.atoms.iter().map(|a| a.basis_size()).collect();
             let border_dim = self.factored_border_dim();
-            let frames: Vec<Array2<f64>> =
-                (0..self.atoms.len()).map(|k| self.frame_output_matrix(k)).collect();
+            let frames: Vec<Array2<f64>> = (0..self.atoms.len())
+                .map(|k| self.frame_output_matrix(k))
+                .collect();
 
             // Project the full-`B` gradient `g_B` → factored `g_C = Φᵀ g_B`:
             //   g_C[off_C[k] + m·r_k + j] = Σ_i U_k[i,j] · g_B[off_B[k] + m·p + i].
@@ -6205,19 +6202,16 @@ impl SaeManifoldTerm {
                     w,
                 });
             }
-            let data_op = FactoredFrameKroneckerOp::new(
-                ranks.clone(),
-                basis_sizes.clone(),
-                frame_blocks,
-            )?;
+            let data_op =
+                FactoredFrameKroneckerOp::new(ranks.clone(), basis_sizes.clone(), frame_blocks)?;
 
             // Smooth penalty in factored space: `λ S_k ⊗ I_{r_k}` at `off_C[k]`.
             let mut ops: Vec<Arc<dyn BetaPenaltyOp>> = Vec::with_capacity(self.atoms.len() + 2);
             for k in 0..self.atoms.len() {
                 let r = ranks[k];
-                ops.push(Arc::new(KroneckerPenaltyOp {
+                ops.push(Arc::new(IdentityRightKroneckerPenaltyOp {
                     factor_a: smooth_scaled_s[k].clone(),
-                    factor_b: Array2::<f64>::eye(r),
+                    p: r,
                     global_offset: off_c[k],
                     k: border_dim,
                 }));
@@ -9273,9 +9267,8 @@ impl SaeManifoldTerm {
             // accepted outer iteration is a sensible cadence (the issue's
             // streaming-polar fixed point).
             if self.frames_active() {
-                self.refresh_active_frames_from_data(target).map_err(|err| {
-                    format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
-                })?;
+                self.refresh_active_frames_from_data(target)
+                    .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             }
         }
         // ρ is owned by the outer engine and unchanged here; just return the
@@ -9652,8 +9645,9 @@ impl SaeManifoldTerm {
         // #972 / #977 T1: magic-by-default frame activation, mirroring the dense
         // driver, so the streaming fit runs in the same factored coordinate
         // space (the chunk terms inherit the frames via `materialize_chunk`).
-        self.auto_activate_decoder_frames()
-            .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}"))?;
+        self.auto_activate_decoder_frames().map_err(|err| {
+            format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
+        })?;
         // The β-tier width the reduced-Schur accumulators are sized at: the
         // FACTORED border `Σ M_k·r_k` when frames are active (every chunk's
         // `sys.gb` / reduced Schur is in that space), else the full-`B`
