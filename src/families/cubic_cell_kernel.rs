@@ -1072,9 +1072,38 @@ pub struct DenestedPartitionCell {
     pub cell: DenestedCubicCell,
     pub score_span: LocalSpanCubic,
     pub link_span: LocalSpanCubic,
+    /// Provenance of the cell's boundaries: a fixed z location (score break
+    /// or ±∞ tail) or a link-knot crossing `z = (τ - a)/b`. Together with
+    /// `(score_span, link_span)` this identifies the cell's two-parameter
+    /// family in `(a, b)` across rows (see
+    /// [`crate::families::cell_moment_family`]).
+    pub left_edge: PartitionEdge,
+    pub right_edge: PartitionEdge,
 }
 
 impl DenestedPartitionCell {}
+
+/// Provenance of one boundary of a denested partition cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PartitionEdge {
+    /// A z location independent of the row scalars: a score-spline break,
+    /// or ±∞ for tail cells.
+    Fixed(f64),
+    /// A link-knot crossing: the boundary sits at `z = (τ - a)/b` for the
+    /// row's `(a, b)`.
+    Crossing { tau: f64 },
+}
+
+impl PartitionEdge {
+    /// The boundary's z location at the row scalars `(a, b)`.
+    #[inline]
+    pub fn z_at(self, a: f64, b: f64) -> f64 {
+        match self {
+            Self::Fixed(z) => z,
+            Self::Crossing { tau } => (tau - a) / b,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct TailCellMomentCacheKey {
@@ -1593,6 +1622,30 @@ fn dedup_sorted_breakpoints(points: &mut Vec<f64>) {
         } else {
             false
         }
+    });
+}
+
+/// Provenance-tagged variant of [`dedup_sorted_breakpoints`]: identical sort
+/// order and coincidence tolerance, but when a fixed score break and a
+/// link-knot crossing coincide (the kink configuration), the surviving entry
+/// keeps the `Fixed` tag — a deterministic choice; the z location is
+/// identical either way.
+fn dedup_sorted_tagged_breakpoints(points: &mut Vec<(f64, PartitionEdge)>) {
+    points.sort_by(|lhs, rhs| lhs.0.partial_cmp(&rhs.0).unwrap_or(std::cmp::Ordering::Equal));
+    points.dedup_by(|lhs, rhs| {
+        let coincide = if lhs.0 == rhs.0 {
+            true
+        } else if lhs.0.is_finite() && rhs.0.is_finite() {
+            (lhs.0 - rhs.0).abs() <= 1e-12
+        } else {
+            false
+        };
+        if coincide && matches!(lhs.1, PartitionEdge::Fixed(_)) {
+            // `dedup_by` keeps `rhs` (the earlier element) — propagate the
+            // Fixed tag onto the survivor.
+            rhs.1 = lhs.1;
+        }
+        coincide
     });
 }
 
@@ -2695,17 +2748,23 @@ where
     FS: FnMut(f64) -> Result<LocalSpanCubic, String>,
     FL: FnMut(f64) -> Result<LocalSpanCubic, String>,
 {
-    // Collect all INTERNAL split points (finite).
-    let mut split_points = score_breaks.to_vec();
+    // Collect all INTERNAL split points (finite), each tagged with its
+    // provenance: a fixed score break or a link-knot crossing. Provenance
+    // identifies the cell's `(a, b)` family for the Chebyshev moment-family
+    // layer; the z coordinates alone cannot distinguish the two kinds.
+    let mut split_points: Vec<(f64, PartitionEdge)> = score_breaks
+        .iter()
+        .map(|&sigma| (sigma, PartitionEdge::Fixed(sigma)))
+        .collect();
     if b.abs() > 1e-12 {
         for &tau in link_breaks {
             let z = (tau - a) / b;
             if z.is_finite() {
-                split_points.push(z);
+                split_points.push((z, PartitionEdge::Crossing { tau }));
             }
         }
     }
-    dedup_sorted_breakpoints(&mut split_points);
+    dedup_sorted_tagged_breakpoints(&mut split_points);
 
     let mut out = Vec::new();
 
@@ -2724,11 +2783,13 @@ where
             },
             score_span,
             link_span,
+            left_edge: PartitionEdge::Fixed(f64::NEG_INFINITY),
+            right_edge: PartitionEdge::Fixed(f64::INFINITY),
         }]);
     }
 
     // ── Left tail cell: (-∞, leftmost_split] ──
-    let leftmost = split_points[0];
+    let (leftmost, leftmost_edge) = split_points[0];
     // Evaluate spans at a point just left of the leftmost split.  The
     // closures return constant tail cubics for this region.
     let left_probe = interval_probe_point(f64::NEG_INFINITY, leftmost)?;
@@ -2756,12 +2817,14 @@ where
         },
         score_span: left_score_span,
         link_span: left_link_span,
+        left_edge: PartitionEdge::Fixed(f64::NEG_INFINITY),
+        right_edge: leftmost_edge,
     });
 
     // ── Interior cells (all finite) ──
     for window in split_points.windows(2) {
-        let left = window[0];
-        let right = window[1];
+        let (left, left_edge) = window[0];
+        let (right, right_edge) = window[1];
         if !left.is_finite() || !right.is_finite() || right - left <= 1e-12 {
             continue;
         }
@@ -2780,11 +2843,13 @@ where
             },
             score_span,
             link_span,
+            left_edge,
+            right_edge,
         });
     }
 
     // ── Right tail cell: [rightmost_split, +∞) ──
-    let rightmost = *split_points.last().unwrap();
+    let (rightmost, rightmost_edge) = *split_points.last().unwrap();
     let right_probe = interval_probe_point(rightmost, f64::INFINITY)?;
     let right_score_span = score_span_at(right_probe)?;
     let right_link_span = link_span_at(a + b * right_probe)?;
@@ -2810,6 +2875,8 @@ where
         },
         score_span: right_score_span,
         link_span: right_link_span,
+        left_edge: rightmost_edge,
+        right_edge: PartitionEdge::Fixed(f64::INFINITY),
     });
 
     Ok(out)

@@ -348,6 +348,8 @@ pub fn trivial_partition_cell(a: f64, b: f64, scale: f64) -> DenestedPartitionCe
             c2: 0.0,
             c3: 0.0,
         },
+        left_edge: crate::families::cubic_cell_kernel::PartitionEdge::Fixed(f64::NEG_INFINITY),
+        right_edge: crate::families::cubic_cell_kernel::PartitionEdge::Fixed(f64::INFINITY),
     }
 }
 
