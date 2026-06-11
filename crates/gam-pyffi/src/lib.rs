@@ -10068,10 +10068,10 @@ fn certificate_evidence_value<'py>(
 ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
     use gam::inference::certificates::EvidenceValue;
     Ok(match value {
-        EvidenceValue::Scalar(v) => v.into_bound_py_any(py)?,
-        EvidenceValue::Integer(v) => v.into_bound_py_any(py)?,
-        EvidenceValue::Flag(v) => v.into_bound_py_any(py)?,
-        EvidenceValue::Text(v) => v.into_bound_py_any(py)?,
+        EvidenceValue::Scalar(v) => (*v).into_bound_py_any(py)?,
+        EvidenceValue::Integer(v) => (*v).into_bound_py_any(py)?,
+        EvidenceValue::Flag(v) => (*v).into_bound_py_any(py)?,
+        EvidenceValue::Text(v) => v.as_str().into_bound_py_any(py)?,
         EvidenceValue::Vector(v) => v.clone().into_bound_py_any(py)?,
     })
 }
