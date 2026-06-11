@@ -55,7 +55,7 @@ pub use matern_gradient::{MaternBasisGradientTarget, StreamingMaternBasisGradien
 pub use sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAssignment,
     SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldLoss,
-    SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, ScheduleKind, SphereChartEvaluator,
-    TorusHarmonicEvaluator,
+    SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, SaeOuterRhoGradientComponents,
+    ScheduleKind, SphereChartEvaluator, TorusHarmonicEvaluator,
 };
 pub use sheaf::{EdgeRestriction, SheafConsistencyPenalty};

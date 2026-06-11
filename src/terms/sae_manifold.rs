@@ -549,6 +549,34 @@ fn bessel_i0(x: f64) -> f64 {
     }
 }
 
+/// Modified Bessel function of the first kind, order one, `I1(x)`.
+///
+/// Uses the Abramowitz & Stegun approximations paired with [`bessel_i0`]. This is
+/// needed only for the derivative of the periodic ARD precision normalizer
+/// `log I0(η)`, whose derivative is `I1(η) / I0(η)`.
+fn bessel_i1(x: f64) -> f64 {
+    let ax = x.abs();
+    let value = if ax < 3.75 {
+        let t = x / 3.75;
+        let t2 = t * t;
+        ax * (0.5
+            + t2 * (0.87890594
+                + t2 * (0.51498869
+                    + t2 * (0.15084934 + t2 * (0.02658733 + t2 * (0.00301532 + t2 * 0.00032411))))))
+    } else {
+        let y = 3.75 / ax;
+        let poly = 0.39894228
+            + y * (-0.03988024
+                + y * (-0.00362018
+                    + y * (0.00163801
+                        + y * (-0.01031555
+                            + y * (0.02282967
+                                + y * (-0.02895312 + y * (0.01787654 - y * 0.00420059)))))));
+        (ax.exp() / ax.sqrt()) * poly
+    };
+    if x < 0.0 { -value } else { value }
+}
+
 pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String>;
 
@@ -3427,6 +3455,39 @@ impl SaeManifoldLoss {
     }
 }
 
+/// Componentized analytic derivative of the SAE REML criterion with respect to
+/// the flat [`SaeManifoldRho`] layout.
+///
+/// This is intentionally only a value object for tests and derivation gates. It
+/// is not wired into [`SaeManifoldOuterObjective`] capability planning until the
+/// third-order logdet correction is available behind its own oracle.
+#[derive(Debug, Clone)]
+pub struct SaeOuterRhoGradientComponents {
+    /// Direct derivative of `loss.total() + extra_penalty_energy` with respect to
+    /// log-strength coordinates, excluding the Hessian logdet and Occam terms.
+    pub explicit: Array1<f64>,
+    /// `0.5 * tr(H^{-1} dH/d rho_j)` for the currently available penalty blocks.
+    pub logdet_trace: Array1<f64>,
+    /// Derivative contribution of `-occam`.
+    pub occam: Array1<f64>,
+    /// Reserved channel for `0.5 * tr(H^{-1} (dH/dtheta * dtheta_hat/d rho_j))`.
+    pub third_order_correction: Array1<f64>,
+    /// Whether `third_order_correction` is populated from analytic channels.
+    pub third_order_correction_available: bool,
+}
+
+impl SaeOuterRhoGradientComponents {
+    #[must_use]
+    pub fn gradient_excluding_unavailable_correction(&self) -> Array1<f64> {
+        &(&self.explicit + &self.logdet_trace) + &self.occam
+    }
+
+    #[must_use]
+    pub fn gradient_with_available_correction(&self) -> Array1<f64> {
+        &self.gradient_excluding_unavailable_correction() + &self.third_order_correction
+    }
+}
+
 /// Cap on the number of coordinates at which a per-atom shape band is
 /// materialized. The full per-atom decoder covariance is exact and exposed
 /// regardless; this only bounds the cost of the convenience band, which is
@@ -4288,12 +4349,10 @@ impl SaeManifoldTerm {
                         }
                         root_row[c] = acc;
                     }
-                    let row_slice = root_row
-                        .as_slice()
-                        .ok_or_else(|| {
-                            "residual_gauge_streamed_data_curvature: non-contiguous root row"
-                                .to_string()
-                        })?;
+                    let row_slice = root_row.as_slice().ok_or_else(|| {
+                        "residual_gauge_streamed_data_curvature: non-contiguous root row"
+                            .to_string()
+                    })?;
                     Self::accumulate_residual_gauge_gram_row(&mut gram, row_slice);
                 }
             } else {
@@ -4505,10 +4564,8 @@ impl SaeManifoldTerm {
     }
 
     fn take_border_hbb_workspace(&mut self, border_dim: usize) -> Array2<f64> {
-        let mut workspace = std::mem::replace(
-            &mut self.border_hbb_workspace,
-            Array2::<f64>::zeros((0, 0)),
-        );
+        let mut workspace =
+            std::mem::replace(&mut self.border_hbb_workspace, Array2::<f64>::zeros((0, 0)));
         if workspace.dim() != (border_dim, border_dim) {
             workspace = Array2::<f64>::zeros((border_dim, border_dim));
         } else {
@@ -7106,6 +7163,16 @@ impl SaeManifoldTerm {
         Ok(occam_penalty - frame_dim_term)
     }
 
+    fn reml_occam_log_lambda_smooth_derivative(&self) -> Result<f64, String> {
+        let mut penalized_channel_dim = 0usize;
+        for atom in &self.atoms {
+            let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
+            penalized_channel_dim += atom.border_frame_rank() * rank_s;
+        }
+        let grassmann_dim = self.grassmann_evidence_dimension();
+        Ok(0.5 * ((penalized_channel_dim as f64) - (grassmann_dim as f64)))
+    }
+
     pub fn reml_criterion_streaming_exact(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -7331,6 +7398,129 @@ impl SaeManifoldTerm {
         Ok(traces)
     }
 
+    fn ard_log_precision_explicit_derivatives(
+        &self,
+        rho: &SaeManifoldRho,
+    ) -> Result<Vec<Array1<f64>>, String> {
+        if rho.log_ard.len() != self.k_atoms() {
+            return Err(format!(
+                "ARD rho has {} atoms but term has {}",
+                rho.log_ard.len(),
+                self.k_atoms()
+            ));
+        }
+        let n = self.n_obs() as f64;
+        let mut out = Vec::with_capacity(self.k_atoms());
+        for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
+            let d = coord.latent_dim();
+            let mut atom_out = Array1::<f64>::zeros(rho.log_ard[atom_idx].len());
+            if rho.log_ard[atom_idx].is_empty() {
+                out.push(atom_out);
+                continue;
+            }
+            if rho.log_ard[atom_idx].len() != d {
+                return Err(format!(
+                    "ARD rho atom {atom_idx} has len {} but atom dim is {d}",
+                    rho.log_ard[atom_idx].len()
+                ));
+            }
+            let periods = coord.effective_axis_periods();
+            for axis in 0..d {
+                let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom_idx][axis]);
+                let period = periods[axis];
+                let mut energy_deriv = 0.0_f64;
+                for row in 0..coord.n_obs() {
+                    let t = coord.row(row)[axis];
+                    energy_deriv += ArdAxisPrior::eval(alpha, t, period).value;
+                }
+                let normalizer_deriv = match period {
+                    None => -0.5 * n,
+                    Some(p) => {
+                        let kappa = std::f64::consts::TAU / p;
+                        let eta = alpha / (kappa * kappa);
+                        let i0 = bessel_i0(eta);
+                        let i1 = bessel_i1(eta);
+                        n * eta * (-1.0 + i1 / i0)
+                    }
+                };
+                atom_out[axis] = energy_deriv + normalizer_deriv;
+            }
+            out.push(atom_out);
+        }
+        Ok(out)
+    }
+
+    fn ard_log_precision_hessian_trace(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+    ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
+        let inv_diag = cache.latent_block_inverse_diagonal()?;
+        let n = self.n_obs();
+        let coord_offsets = self.assignment.coord_offsets();
+        let ard_axis_periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(LatentCoordValues::effective_axis_periods)
+            .collect();
+        let mut traces: Vec<Array1<f64>> = self
+            .assignment
+            .coords
+            .iter()
+            .enumerate()
+            .map(|(k, c)| {
+                if rho.log_ard[k].is_empty() {
+                    Array1::<f64>::zeros(0)
+                } else {
+                    Array1::<f64>::zeros(c.latent_dim())
+                }
+            })
+            .collect();
+        for row in 0..n {
+            let row_base = cache.row_offsets[row];
+            match self.last_row_layout {
+                Some(ref layout) => {
+                    let active = &layout.active_atoms[row];
+                    let starts = &layout.coord_starts[row];
+                    for (pos, &k) in active.iter().enumerate() {
+                        if rho.log_ard[k].is_empty() {
+                            continue;
+                        }
+                        let coord = &self.assignment.coords[k];
+                        let d = coord.latent_dim();
+                        let block_start = starts[pos];
+                        for axis in 0..d {
+                            let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
+                            let t = coord.row(row)[axis];
+                            let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
+                            traces[k][axis] +=
+                                0.5 * inv_diag[row_base + block_start + axis] * prior.hess.max(0.0);
+                        }
+                    }
+                }
+                None => {
+                    for k in 0..self.k_atoms() {
+                        if rho.log_ard[k].is_empty() {
+                            continue;
+                        }
+                        let coord = &self.assignment.coords[k];
+                        let d = coord.latent_dim();
+                        let block_start = coord_offsets[k];
+                        for axis in 0..d {
+                            let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
+                            let t = coord.row(row)[axis];
+                            let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
+                            traces[k][axis] +=
+                                0.5 * inv_diag[row_base + block_start + axis] * prior.hess.max(0.0);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(traces)
+    }
+
     /// Decoder smoothness penalty quadratic form `Σ_k Σ_oc B_k[:,oc]ᵀ S_k B_k[:,oc]`.
     ///
     /// This is `βᵀ (⊕_k S_k ⊗ I_p) β` — the un-scaled (λ-free) penalty energy
@@ -7414,6 +7604,91 @@ impl SaeManifoldTerm {
             }
         }
         Ok(trace)
+    }
+
+    fn assignment_log_strength_hessian_trace(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+    ) -> Result<f64, String> {
+        let hdiag = assignment_prior_log_strength_hdiag(&self.assignment, rho)?;
+        if hdiag.is_empty() {
+            return Ok(0.0);
+        }
+        let inv_diag = cache
+            .latent_block_inverse_diagonal()
+            .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
+        let k_atoms = self.k_atoms();
+        let assignment_dim = self.assignment.assignment_coord_dim();
+        let mut trace = 0.0_f64;
+        for row in 0..self.n_obs() {
+            let row_base = cache.row_offsets[row];
+            let assignment_base = row * k_atoms;
+            match self.last_row_layout {
+                Some(ref layout) => {
+                    for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
+                        trace += inv_diag[row_base + pos] * hdiag[assignment_base + atom];
+                    }
+                }
+                None => {
+                    for free_idx in 0..assignment_dim {
+                        trace += inv_diag[row_base + free_idx] * hdiag[assignment_base + free_idx];
+                    }
+                }
+            }
+        }
+        Ok(0.5 * trace)
+    }
+
+    /// Analytic SAE REML outer-ρ gradient components at the already converged
+    /// inner state represented by `loss` and `cache`.
+    ///
+    /// The returned gradient is deliberately not connected to
+    /// [`SaeManifoldOuterObjective`]. The third-order logdet channel is reported
+    /// separately and remains unavailable until the assembled arrow Hessian has a
+    /// general `dH/dtheta` contraction channel.
+    pub fn analytic_outer_rho_gradient_components(
+        &self,
+        rho: &SaeManifoldRho,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+    ) -> Result<SaeOuterRhoGradientComponents, String> {
+        let n_params = rho.to_flat().len();
+        let mut explicit = Array1::<f64>::zeros(n_params);
+        let mut logdet_trace = Array1::<f64>::zeros(n_params);
+        let mut occam = Array1::<f64>::zeros(n_params);
+        let third_order_correction = Array1::<f64>::zeros(n_params);
+
+        explicit[0] = assignment_prior_log_strength_derivative(&self.assignment, rho);
+        logdet_trace[0] = self.assignment_log_strength_hessian_trace(rho, cache)?;
+
+        explicit[1] = loss.smoothness;
+        logdet_trace[1] = 0.5
+            * self
+                .decoder_smoothness_effective_dof(cache, rho.lambda_smooth())
+                .map_err(|err| format!("analytic_outer_rho_gradient_components: {err}"))?;
+        occam[1] = -self.reml_occam_log_lambda_smooth_derivative()?;
+
+        let ard_explicit = self.ard_log_precision_explicit_derivatives(rho)?;
+        let ard_trace = self
+            .ard_log_precision_hessian_trace(rho, cache)
+            .map_err(|err| format!("analytic_outer_rho_gradient_components: {err}"))?;
+        let mut cursor = 2usize;
+        for k in 0..rho.log_ard.len() {
+            for axis in 0..rho.log_ard[k].len() {
+                explicit[cursor] = ard_explicit[k][axis];
+                logdet_trace[cursor] = ard_trace[k][axis];
+                cursor += 1;
+            }
+        }
+
+        Ok(SaeOuterRhoGradientComponents {
+            explicit,
+            logdet_trace,
+            occam,
+            third_order_correction,
+            third_order_correction_available: false,
+        })
     }
 
     /// Gaussian reconstruction dispersion `φ̂`, the scale that turns the
@@ -11381,6 +11656,110 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
                 }
             }
             sparsity_strength * acc
+        }
+    }
+}
+
+fn assignment_prior_log_strength_derivative(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+) -> f64 {
+    for row in 0..assignment.n_obs() {
+        validate_finite_logits(assignment.logits.row(row), row)
+            .expect("assignment logits must be finite");
+    }
+    let target = flat_logits(assignment.logits.view());
+    if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
+        return 0.0;
+    }
+    match assignment.mode {
+        AssignmentMode::Softmax { .. } | AssignmentMode::JumpReLU { .. } => {
+            assignment_prior_value(assignment, rho)
+        }
+        AssignmentMode::IBPMap {
+            temperature,
+            alpha,
+            learnable_alpha,
+        } => {
+            let mut penalty = IBPAssignmentPenalty::new(
+                assignment.k_atoms(),
+                alpha,
+                temperature,
+                learnable_alpha,
+            );
+            if learnable_alpha {
+                let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse]);
+                penalty.grad_rho(target.view(), rho_view.view())[0]
+            } else {
+                penalty.weight = rho.lambda_sparse();
+                penalty.value(target.view(), Array1::<f64>::zeros(0).view())
+            }
+        }
+    }
+}
+
+fn assignment_prior_log_strength_hdiag(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+) -> Result<Array1<f64>, String> {
+    for row in 0..assignment.n_obs() {
+        validate_finite_logits(assignment.logits.row(row), row)?;
+    }
+    let target = flat_logits(assignment.logits.view());
+    if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
+        return Ok(Array1::<f64>::zeros(target.len()));
+    }
+    match assignment.mode {
+        AssignmentMode::Softmax {
+            temperature,
+            sparsity,
+        } => {
+            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
+            let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
+            penalty
+                .hessian_diag(target.view(), rho_view.view())
+                .ok_or_else(|| {
+                    "softmax assignment log-strength hessian diag unavailable".to_string()
+                })
+        }
+        AssignmentMode::JumpReLU {
+            temperature,
+            threshold,
+        } => {
+            let sparsity_strength = rho.lambda_sparse();
+            let inv_tau = 1.0 / temperature;
+            let inv_tau2 = inv_tau * inv_tau;
+            let mut d = Array1::<f64>::zeros(target.len());
+            for idx in 0..target.len() {
+                let logit = target[idx];
+                if !jumprelu_in_optimization_band(logit, threshold, temperature) {
+                    continue;
+                }
+                let activation =
+                    crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+                let slope = activation * (1.0 - activation);
+                d[idx] = sparsity_strength * slope * slope * inv_tau2;
+            }
+            Ok(d)
+        }
+        AssignmentMode::IBPMap {
+            temperature,
+            alpha,
+            learnable_alpha,
+        } => {
+            if learnable_alpha {
+                return Ok(Array1::<f64>::zeros(target.len()));
+            }
+            let mut penalty = IBPAssignmentPenalty::new(
+                assignment.k_atoms(),
+                alpha,
+                temperature,
+                learnable_alpha,
+            );
+            penalty.weight = rho.lambda_sparse();
+            penalty
+                .hessian_diag(target.view(), Array1::<f64>::zeros(0).view())
+                .ok_or_else(|| "IBP assignment log-strength hessian diag unavailable".to_string())
         }
     }
 }
