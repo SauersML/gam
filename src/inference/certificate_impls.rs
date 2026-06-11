@@ -115,13 +115,13 @@ impl Certificate for CoresetCertificate {
     }
 }
 
-/// Verdict for a coreset race against a concrete consumer `decision_margin`,
-/// reusing the certificate's own [`CoresetCertificate::certify_margin`] rule.
-pub fn coreset_race_verdict(
-    certificate: &CoresetCertificate,
-    decision_margin: f64,
-) -> Verdict {
-    match certificate.certify_margin(decision_margin) {
+/// Map a coreset race outcome (the certificate's own
+/// [`CoresetCertificate::certify_margin`] rule, evaluated against a consumer's
+/// `decision_margin`) onto the shared [`Verdict`] ladder. This is the
+/// margin-resolved entry point a race consumer uses to obtain a unified verdict
+/// without re-deriving the mapping.
+pub fn coreset_race_verdict(verdict: CoresetMarginVerdict) -> Verdict {
+    match verdict {
         CoresetMarginVerdict::Certified { .. } => Verdict::Certified,
         CoresetMarginVerdict::InsufficientMargin { .. } => Verdict::Insufficient,
     }
@@ -404,8 +404,14 @@ mod tests {
         assert_eq!(cert.verdict(), Verdict::Insufficient);
         // A margin below the budget stays insufficient; above it certifies.
         let req = cert.race_transfer_margin();
-        assert_eq!(coreset_race_verdict(&cert, req * 0.5), Verdict::Insufficient);
-        assert_eq!(coreset_race_verdict(&cert, req * 2.0 + 1.0), Verdict::Certified);
+        assert_eq!(
+            coreset_race_verdict(cert.certify_margin(req * 0.5)),
+            Verdict::Insufficient
+        );
+        assert_eq!(
+            coreset_race_verdict(cert.certify_margin(req * 2.0 + 1.0)),
+            Verdict::Certified
+        );
     }
 
     #[test]
