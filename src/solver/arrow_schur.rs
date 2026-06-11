@@ -8281,6 +8281,7 @@ fn cholesky_lower(a: &Array2<f64>) -> Result<Array2<f64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_abs_diff_eq;
     use ndarray::array;
 
     /// `SparseBlockKroneckerPenaltyOp` must reproduce the dense
