@@ -58,7 +58,7 @@ use gam::inference::predict::input::build_predict_input_for_model;
 use gam::inference::predict::linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 use gam::inference::smooth_test::{SmoothTestInput, wood_smooth_test};
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
-use gam::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
+use gam::mixture_link::state_fromspec;
 use gam::predict::{
     PredictableModel, predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
@@ -94,7 +94,7 @@ use gam::survival_construction::{
 use gam::survival_location_scale::{
     SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
     SurvivalLocationScaleTermSpec, TimeBlockInput, predict_survival_location_scale,
-    project_onto_linear_constraints, residual_distribution_inverse_link,
+    project_onto_linear_constraints,
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
 use gam::survival_predict::{
@@ -115,7 +115,7 @@ use gam::types::{
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest,
-    DispersionLocationScaleFitRequest, FitRequest, FitResult, GaussianLocationScaleFitRequest,
+    DispersionLocationScaleFitRequest, FitConfig, FitRequest, FitResult, GaussianLocationScaleFitRequest,
     LatentBinaryFitRequest, LatentSurvivalFitRequest, LinkWiggleConfig, PreparedSurvivalTimeStack,
     StandardBinomialWiggleConfig, StandardFitRequest, SurvivalLocationScaleFitRequest,
     SurvivalMarginalSlopeFitRequest, SurvivalTransformationFitRequest,
@@ -428,13 +428,13 @@ struct FitArgs {
     #[arg(long = "negative-binomial-theta", value_parser = parse_positive_f64_cli)]
     negative_binomial_theta: Option<f64>,
     /// Survival likelihood mode for Surv(...) formulas.
-    #[arg(long = "survival-likelihood", default_value = "transformation", value_parser = parse_survival_likelihood_cli)]
+    #[arg(long = "survival-likelihood", default_value = "transformation", value_parser = gam::config_resolve::parse_survival_likelihood_cli)]
     survival_likelihood: String,
     /// Optional anchor time for survival location-scale mode.
     #[arg(long = "survival-time-anchor", value_parser = parse_nonnegative_f64_cli)]
     survival_time_anchor: Option<f64>,
     /// Baseline target for transformation survival mode.
-    #[arg(long = "baseline-target", default_value = "linear", value_parser = parse_baseline_target_cli)]
+    #[arg(long = "baseline-target", default_value = "linear", value_parser = gam::config_resolve::parse_baseline_target_cli)]
     baseline_target: String,
     /// Weibull baseline scale (>0) when baseline-target=weibull.
     #[arg(long = "baseline-scale", value_parser = parse_positive_f64_cli)]
@@ -822,21 +822,6 @@ fn parse_probability_open_cli(raw: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-fn parse_survival_likelihood_cli(raw: &str) -> Result<String, String> {
-    parse_survival_likelihood_mode(raw)?;
-    Ok(raw.trim().to_ascii_lowercase())
-}
-
-fn parse_baseline_target_cli(raw: &str) -> Result<String, String> {
-    let normalized = raw.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "linear" | "weibull" | "gompertz" | "gompertz-makeham" => Ok(normalized),
-        other => Err(format!(
-            "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
-        )),
-    }
-}
-
 fn parse_time_basis_cli(raw: &str) -> Result<String, String> {
     let normalized = raw.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -952,10 +937,89 @@ fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     };
 }
 
+fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, String> {
+    gam::config_resolve::resolve_cli_fit_config(gam::config_resolve::CliFitConfigInput {
+        family: family_arg_canonical_name(args.family).map(str::to_string),
+        negative_binomial_theta: args.negative_binomial_theta,
+        link: None,
+        flexible_link: false,
+        offset_column: args.offset_column.clone(),
+        weight_column: args.weights_column.clone(),
+        noise_offset_column: args.noise_offset_column.clone(),
+        baseline_target: args.baseline_target.clone(),
+        baseline_scale: args.baseline_scale,
+        baseline_shape: args.baseline_shape,
+        baseline_rate: args.baseline_rate,
+        baseline_makeham: args.baseline_makeham,
+        time_basis: args.time_basis.clone(),
+        time_degree: args.time_degree,
+        time_num_internal_knots: args.time_num_internal_knots,
+        time_smooth_lambda: args.time_smooth_lambda,
+        survival_likelihood: args.survival_likelihood.clone(),
+        survival_distribution: "gaussian".to_string(),
+        threshold_time_k: args.threshold_time_k,
+        threshold_time_degree: args.threshold_time_degree,
+        sigma_time_k: args.sigma_time_k,
+        sigma_time_degree: args.sigma_time_degree,
+        noise_formula: args.predict_noise.clone(),
+        logslope_formula: args.logslope_formula.clone(),
+        z_column: args.z_column.clone(),
+        scale_dimensions: args.scale_dimensions,
+        adaptive_regularization: Some(args.adaptive_regularization),
+        ridge_lambda: args.ridge_lambda,
+        transformation_normal: args.transformation_normal,
+        firth: args.firth,
+        outer_max_iter: None,
+        frailty_kind: cli_frailty_kind(args.frailty_kind),
+        frailty_sd: args.frailty_sd,
+        hazard_loading: cli_hazard_loading(args.hazard_loading),
+    })
+}
+
+fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitConfig, String> {
+    gam::config_resolve::resolve_cli_fit_config(gam::config_resolve::CliFitConfigInput {
+        family: None,
+        negative_binomial_theta: None,
+        link: args.link.clone(),
+        flexible_link: false,
+        offset_column: args.offset_column.clone(),
+        weight_column: args.weights_column.clone(),
+        noise_offset_column: args.noise_offset_column.clone(),
+        baseline_target: args.baseline_target.clone(),
+        baseline_scale: args.baseline_scale,
+        baseline_shape: args.baseline_shape,
+        baseline_rate: args.baseline_rate,
+        baseline_makeham: args.baseline_makeham,
+        time_basis: args.time_basis.clone(),
+        time_degree: args.time_degree,
+        time_num_internal_knots: args.time_num_internal_knots,
+        time_smooth_lambda: args.time_smooth_lambda,
+        survival_likelihood: args.survival_likelihood.clone(),
+        survival_distribution: args.survival_distribution.clone(),
+        threshold_time_k: args.threshold_time_k,
+        threshold_time_degree: args.threshold_time_degree,
+        sigma_time_k: args.sigma_time_k,
+        sigma_time_degree: args.sigma_time_degree,
+        noise_formula: args.predict_noise.clone(),
+        logslope_formula: args.logslope_formula.clone(),
+        z_column: args.z_column.clone(),
+        scale_dimensions: args.scale_dimensions,
+        adaptive_regularization: None,
+        ridge_lambda: args.ridge_lambda,
+        transformation_normal: false,
+        firth: false,
+        outer_max_iter: None,
+        frailty_kind: cli_frailty_kind(args.frailty_kind),
+        frailty_sd: args.frailty_sd,
+        hazard_loading: cli_hazard_loading(args.hazard_loading),
+    })
+}
+
 fn run_fit(args: FitArgs) -> Result<(), String> {
     let formula_text = choose_formula(&args)?;
     let parsed = parse_formula(&formula_text)?;
     validate_fit_args_preflight(&args, &parsed)?;
+    let fit_config = fit_config_from_fit_args(&args)?;
     let formula_link = parsed.linkspec.clone();
     let effective_link_arg = formula_link.as_ref().map(|s| s.link.clone());
     let effective_mixture_rho = formula_link.as_ref().and_then(|s| s.mixture_rho.clone());
@@ -981,8 +1045,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             // `entry == None` = right-censored shorthand `Surv(time, event)`;
             // entry times are synthesized as zero at materialization time.
             formula: rhs,
-            predict_noise: args.predict_noise.clone(),
-            survival_likelihood: args.survival_likelihood.clone(),
+            predict_noise: fit_config.noise_formula.clone(),
+            survival_likelihood: fit_config.survival_likelihood.clone(),
             survival_distribution: formula_surv
                 .as_ref()
                 .and_then(|s| s.survival_distribution.clone())
@@ -992,28 +1056,28 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             sas_init: effective_sas_init.clone(),
             beta_logistic_init: effective_beta_logistic_init.clone(),
             survival_time_anchor: args.survival_time_anchor,
-            baseline_target: args.baseline_target.clone(),
-            baseline_scale: args.baseline_scale,
-            baseline_shape: args.baseline_shape,
-            baseline_rate: args.baseline_rate,
-            baseline_makeham: args.baseline_makeham,
-            time_basis: args.time_basis.clone(),
-            time_degree: args.time_degree,
-            time_num_internal_knots: args.time_num_internal_knots,
-            time_smooth_lambda: args.time_smooth_lambda,
-            ridge_lambda: args.ridge_lambda,
-            threshold_time_k: args.threshold_time_k,
-            threshold_time_degree: args.threshold_time_degree,
-            sigma_time_k: args.sigma_time_k,
-            sigma_time_degree: args.sigma_time_degree,
-            scale_dimensions: args.scale_dimensions,
+            baseline_target: fit_config.baseline_target.clone(),
+            baseline_scale: fit_config.baseline_scale,
+            baseline_shape: fit_config.baseline_shape,
+            baseline_rate: fit_config.baseline_rate,
+            baseline_makeham: fit_config.baseline_makeham,
+            time_basis: fit_config.time_basis.clone(),
+            time_degree: fit_config.time_degree,
+            time_num_internal_knots: fit_config.time_num_internal_knots,
+            time_smooth_lambda: fit_config.time_smooth_lambda,
+            ridge_lambda: fit_config.ridge_lambda,
+            threshold_time_k: fit_config.threshold_time_k,
+            threshold_time_degree: fit_config.threshold_time_degree,
+            sigma_time_k: fit_config.sigma_time_k,
+            sigma_time_degree: fit_config.sigma_time_degree,
+            scale_dimensions: fit_config.scale_dimensions,
             pilot_subsample_threshold: args.pilot_subsample_threshold,
             out: args.out.clone(),
-            logslope_formula: args.logslope_formula.clone(),
-            z_column: args.z_column.clone(),
-            weights_column: args.weights_column.clone(),
-            offset_column: args.offset_column.clone(),
-            noise_offset_column: args.noise_offset_column.clone(),
+            logslope_formula: fit_config.logslope_formula.clone(),
+            z_column: fit_config.z_column.clone(),
+            weights_column: fit_config.weight_column.clone(),
+            offset_column: fit_config.offset_column.clone(),
+            noise_offset_column: fit_config.noise_offset_column.clone(),
             frailty_kind: args.frailty_kind,
             frailty_sd: args.frailty_sd,
             hazard_loading: args.hazard_loading,
@@ -1067,8 +1131,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
     let mut inference_notes: Vec<String> = Vec::new();
 
-    if args.transformation_normal {
-        if args.noise_offset_column.is_some() {
+    if fit_config.transformation_normal {
+        if fit_config.noise_offset_column.is_some() {
             return Err(
                 "--noise-offset-column is not supported with --transformation-normal".to_string(),
             );
@@ -1086,8 +1150,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         );
     }
 
-    if args.logslope_formula.is_some() || args.z_column.is_some() {
-        if args.logslope_formula.is_none() || args.z_column.is_none() {
+    if fit_config.logslope_formula.is_some() || fit_config.z_column.is_some() {
+        if fit_config.logslope_formula.is_none() || fit_config.z_column.is_none() {
             return Err("--logslope-formula and --z-column must be provided together".to_string());
         }
         return run_fit_bernoulli_marginal_slope(
@@ -1108,7 +1172,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         if let Some(components) = choice.mixture_components.as_ref() {
             let expected = components.len().saturating_sub(1);
             let initial_rho = if let Some(raw) = effective_mixture_rho.as_deref() {
-                let vals = parse_comma_f64(raw, "link(rho=...)")?;
+                let vals = gam::config_resolve::parse_comma_f64(raw, "link(rho=...)")?;
                 if vals.len() != expected {
                     return Err(format!(
                         "link(rho=...) length mismatch: expected {expected}, got {}",
@@ -1145,7 +1209,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 );
             }
             if let Some(raw) = effective_sas_init.as_deref() {
-                let vals = parse_comma_f64(raw, "link(sas_init=...)")?;
+                let vals = gam::config_resolve::parse_comma_f64(raw, "link(sas_init=...)")?;
                 if vals.len() != 2 {
                     return Err(format!(
                         "link(sas_init=...) expects two values: epsilon,log_delta (got {})",
@@ -1167,7 +1231,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 return Err("link(sas_init=...) requires link(type=sas)".to_string());
             }
             if let Some(raw) = effective_beta_logistic_init.as_deref() {
-                let vals = parse_comma_f64(raw, "link(beta_logistic_init=...)")?;
+                let vals =
+                    gam::config_resolve::parse_comma_f64(raw, "link(beta_logistic_init=...)")?;
                 if vals.len() != 2 {
                     return Err(format!(
                         "link(beta_logistic_init=...) expects two values: epsilon,delta (got {})",
@@ -1258,10 +1323,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let mean_only_flexible_linkwiggle = link_choice
         .as_ref()
         .is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible));
-    let mean_only_binomial_linkwiggle = args.predict_noise.is_none()
+    let mean_only_binomial_linkwiggle = fit_config.noise_formula.is_none()
         && binomial_mean_linkwiggle_supports_family(&family, link_choice.as_ref());
     if learn_linkwiggle
-        && args.predict_noise.is_none()
+        && fit_config.noise_formula.is_none()
         && !mean_only_flexible_linkwiggle
         && !mean_only_binomial_linkwiggle
     {
@@ -1270,7 +1335,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if let Some(noise_formula_raw) = &args.predict_noise {
+    if let Some(noise_formula_raw) = &fit_config.noise_formula {
         return run_fitwith_predict_noise(
             &mut progress,
             &args,
@@ -1287,7 +1352,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             &formula_text,
         );
     }
-    if args.noise_offset_column.is_some() {
+    if fit_config.noise_offset_column.is_some() {
         return Err(
             "--noise-offset-column requires --predict-noise or survival location-scale".to_string(),
         );
@@ -1309,7 +1374,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         &mut inference_notes,
         &bare_fit_policy,
     )?;
-    if args.scale_dimensions {
+    if fit_config.scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
     let kappa_options = {
@@ -1328,9 +1393,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     print_inference_summary(&inference_notes);
     let has_bounded_terms = termspec_has_bounded_terms(&spec);
     validate_cli_firth_configuration(CliFirthValidation {
-        enabled: args.firth,
+        enabled: fit_config.firth,
         family: family.clone(),
-        predict_noise: args.predict_noise.is_some(),
+        predict_noise: fit_config.noise_formula.is_some(),
         is_survival: false,
         link_choice: link_choice.as_ref(),
     })?;
@@ -1352,7 +1417,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     // silently DROP the bounds — wrong for a bounded model. We therefore keep
     // bounded models on the standard branch (which is already Firth-equivalent)
     // and record the redundancy, rather than refusing the combination.
-    let firth_redundant_for_bounded = args.firth && has_bounded_terms;
+    let firth_redundant_for_bounded = fit_config.firth && has_bounded_terms;
     if firth_redundant_for_bounded {
         inference_notes.push(
             "--firth is redundant for bounded() coefficients: the bounded custom-family solver \
@@ -1366,8 +1431,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
     let fit_max_iter = 200usize;
     let fit_tol = 1e-6f64;
-    let weights = resolve_weight_column(&ds, &col_map, args.weights_column.as_deref())?;
-    let offset = resolve_offset_column(&ds, &col_map, args.offset_column.as_deref())?;
+    let weights = resolve_weight_column(&ds, &col_map, fit_config.weight_column.as_deref())?;
+    let offset = resolve_offset_column(&ds, &col_map, fit_config.offset_column.as_deref())?;
     let frailty = fit_frailty_spec_from_args(&args, "fit")?;
     if let Some(choice) = link_choice.as_ref()
         && matches!(choice.mode, LinkMode::Flexible)
@@ -1388,7 +1453,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         }
     }
     progress.advance_workflow(3);
-    let adaptive_opts = if args.adaptive_regularization {
+    let adaptive_opts = if fit_config.adaptive_regularization.unwrap_or(false) {
         Some(AdaptiveRegularizationOptions {
             enabled: true,
             ..AdaptiveRegularizationOptions::default()
@@ -1440,7 +1505,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         kronecker_factored: None,
     };
     let standard_wiggle = if learn_linkwiggle
-        && args.predict_noise.is_none()
+        && fit_config.noise_formula.is_none()
         && (!mean_only_flexible_linkwiggle || route_flexible_through_standard)
     {
         let wiggle_cfg = effective_linkwiggle
@@ -1485,7 +1550,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         Option<gam::smooth::AdaptiveRegularizationDiagnostics>,
         FittedLinkState,
         Option<(Vec<f64>, usize)>,
-    ) = if args.firth && !firth_redundant_for_bounded {
+    ) = if fit_config.firth && !firth_redundant_for_bounded {
         let design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
         progress.set_stage("fit", "optimizing penalized likelihood");
@@ -1545,7 +1610,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             wiggle: standard_wiggle,
             coefficient_groups: Vec::new(),
             // Gamma precision hyperpriors on penalty blocks are only reachable via the
-            // Python FFI (`PyFitConfig.precision_hyperpriors`). The CLI exposes no flag,
+            // Python FFI fit config. The CLI exposes no flag,
             // config file, or formula-DSL syntax for them, and the magic-by-default
             // policy forbids inventing one here, so an empty prior list is correct.
             penalty_block_gamma_priors: Vec::new(),
@@ -1686,8 +1751,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
         set_saved_offset_columns(
             &mut payload,
-            args.offset_column.clone(),
-            args.noise_offset_column.clone(),
+            fit_config.offset_column.clone(),
+            fit_config.noise_offset_column.clone(),
         );
         write_payload_json(&out, payload)?;
         progress.advance_workflow(5);
@@ -2275,7 +2340,10 @@ fn run_fitwith_predict_noise(
             );
             let resolved_base_link = link_choice
                 .map(|choice| {
-                    effective_link_to_standard(choice.link, "gaussian location-scale base link")
+                    gam::config_resolve::effective_link_to_standard(
+                        choice.link,
+                        "gaussian location-scale base link",
+                    )
                         .map(InverseLink::Standard)
                 })
                 .transpose()?;
@@ -4478,8 +4546,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         effective_args.sas_init = ls.sas_init.clone();
         effective_args.beta_logistic_init = ls.beta_logistic_init.clone();
     }
-    let predict_noise_formula = effective_args
-        .predict_noise
+    effective_args.survival_distribution = effective_survival_distribution;
+    let effective_config = fit_config_from_survival_args(&effective_args)?;
+    let predict_noise_formula = effective_config
+        .noise_formula
         .as_deref()
         .map(|raw| parse_matching_auxiliary_formula(raw, &response_expr, "--predict-noise"))
         .transpose()?;
@@ -4487,7 +4557,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         validate_auxiliary_formula_controls(parsed_noise, "--predict-noise")?;
     }
 
-    let survival_link_choice = match effective_args.link.as_deref() {
+    let survival_link_choice = match effective_config.link.as_deref() {
         Some(raw)
             if matches!(
                 raw.trim().to_ascii_lowercase().as_str(),
@@ -4518,7 +4588,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         }
     };
     let requested_likelihood_mode =
-        parse_survival_likelihood_mode(&effective_args.survival_likelihood)?;
+        parse_survival_likelihood_mode(&effective_config.survival_likelihood)?;
     let likelihood_mode = if predict_noise_formula.is_some() {
         match requested_likelihood_mode {
             SurvivalLikelihoodMode::Weibull => {
@@ -4583,14 +4653,23 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
-    parse_survival_distribution(&effective_survival_distribution)?;
-    let survival_inverse_link = parse_survival_inverse_link(&effective_args)?;
+    parse_survival_distribution(&effective_config.survival_distribution)?;
+    let survival_inverse_link =
+        gam::config_resolve::parse_survival_inverse_link(
+            gam::config_resolve::SurvivalInverseLinkInput {
+                link: effective_config.link.as_deref(),
+                mixture_rho: effective_args.mixture_rho.as_deref(),
+                sas_init: effective_args.sas_init.as_deref(),
+                beta_logistic_init: effective_args.beta_logistic_init.as_deref(),
+                survival_distribution: &effective_config.survival_distribution,
+            },
+        )?;
     if effective_linkwiggle.is_some() && likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         require_inverse_link_supports_joint_wiggle(&survival_inverse_link, "linkwiggle(...)")?;
     }
     if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
         if !matches!(
-            effective_args
+            effective_config
                 .baseline_target
                 .trim()
                 .to_ascii_lowercase()
@@ -4602,7 +4681,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     .to_string(),
             );
         }
-        if effective_args.baseline_rate.is_some() || effective_args.baseline_makeham.is_some() {
+        if effective_config.baseline_rate.is_some() || effective_config.baseline_makeham.is_some() {
             return Err(
                 "--survival-likelihood weibull does not use --baseline-rate or --baseline-makeham"
                     .to_string(),
@@ -4614,13 +4693,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         | SurvivalLikelihoodMode::LocationScale
         | SurvivalLikelihoodMode::MarginalSlope
         | SurvivalLikelihoodMode::Latent
-        | SurvivalLikelihoodMode::LatentBinary => effective_args.baseline_target.clone(),
+        | SurvivalLikelihoodMode::LatentBinary => effective_config.baseline_target.clone(),
         SurvivalLikelihoodMode::Weibull if learn_timewiggle => "weibull".to_string(),
         SurvivalLikelihoodMode::Weibull => "linear".to_string(),
     };
-    if !effective_args.ridge_lambda.is_finite() || effective_args.ridge_lambda < 0.0 {
-        return Err("--ridge-lambda must be finite and >= 0".to_string());
-    }
     let time_basis_cfg = match likelihood_mode {
         SurvivalLikelihoodMode::Transformation
         | SurvivalLikelihoodMode::LocationScale
@@ -4632,10 +4708,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 SurvivalTimeBasisConfig::None
             } else {
                 parse_survival_time_basis_config(
-                    &effective_args.time_basis,
-                    effective_args.time_degree,
-                    effective_args.time_num_internal_knots,
-                    effective_args.time_smooth_lambda,
+                    &effective_config.time_basis,
+                    effective_config.time_degree,
+                    effective_config.time_num_internal_knots,
+                    effective_config.time_smooth_lambda,
                 )?
             }
         }
@@ -4654,7 +4730,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     // to the actual `z_column` index in a local copy of `col_map` so
     // build_termspec resolves it without the user renaming their data column.
     let col_map_local = if matches!(likelihood_mode, SurvivalLikelihoodMode::MarginalSlope) {
-        args.z_column
+        effective_config
+            .z_column
             .as_deref()
             .map(|z_name| column_map_with_alias(&col_map, "z", z_name))
             .unwrap_or_else(|| col_map.clone())
@@ -4669,7 +4746,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         &mut inference_notes,
         &gam::resource::ResourcePolicy::default_library(),
     )?;
-    if args.scale_dimensions {
+    if effective_config.scale_dimensions {
         enable_scale_dimensions(&mut termspec);
     }
     let log_sigmaspec = if let Some((_, parsed_noise)) = predict_noise_formula.as_ref() {
@@ -4680,7 +4757,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &mut inference_notes,
             &gam::resource::ResourcePolicy::default_library(),
         )?;
-        if args.scale_dimensions {
+        if effective_config.scale_dimensions {
             enable_scale_dimensions(&mut spec);
         }
         spec
@@ -4711,10 +4788,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut age_exit = Array1::<f64>::zeros(n);
     let mut event_target = Array1::<u8>::zeros(n);
     let event_competing = Array1::<u8>::zeros(n);
-    let weights = resolve_weight_column(&ds, &col_map, args.weights_column.as_deref())?;
-    let threshold_offset = resolve_offset_column(&ds, &col_map, args.offset_column.as_deref())?;
+    let weights = resolve_weight_column(&ds, &col_map, effective_config.weight_column.as_deref())?;
+    let threshold_offset =
+        resolve_offset_column(&ds, &col_map, effective_config.offset_column.as_deref())?;
     let log_sigma_offset =
-        resolve_offset_column(&ds, &col_map, args.noise_offset_column.as_deref())?;
+        resolve_offset_column(&ds, &col_map, effective_config.noise_offset_column.as_deref())?;
 
     for i in 0..n {
         let entry_val = entry_col.map_or(0.0, |idx| ds.values[[i, idx]]);
@@ -4751,10 +4829,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     let mut baseline_cfg = initial_survival_baseline_config_for_fit(
         &baseline_target_raw,
-        effective_args.baseline_scale,
-        effective_args.baseline_shape,
-        effective_args.baseline_rate,
-        effective_args.baseline_makeham,
+        effective_config.baseline_scale,
+        effective_config.baseline_shape,
+        effective_config.baseline_rate,
+        effective_config.baseline_makeham,
         &age_exit,
     )?;
     if matches!(
@@ -4769,10 +4847,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     let weibull_builtin_beta_seed =
         if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
-            let scale = effective_args
+            let scale = effective_config
                 .baseline_scale
                 .unwrap_or_else(|| positive_survival_time_seed(&age_exit));
-            let shape = effective_args.baseline_shape.unwrap_or(1.0);
+            let shape = effective_config.baseline_shape.unwrap_or(1.0);
             Some(array![-shape * scale.ln(), shape])
         } else {
             None
@@ -4821,8 +4899,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         &age_exit,
         time_basis_cfg,
         Some((
-            effective_args.time_num_internal_knots,
-            effective_args.ridge_lambda,
+            effective_config.time_num_internal_knots,
+            effective_config.ridge_lambda,
         )),
     )?;
     let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
@@ -4845,32 +4923,32 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     print_inference_summary(&inference_notes);
 
     if likelihood_mode == SurvivalLikelihoodMode::LocationScale {
-        let threshold_template = if let Some(tk) = effective_args.threshold_time_k {
+        let threshold_template = if let Some(tk) = effective_config.threshold_time_k {
             cli_err!(
                 "[survival location-scale] building time-varying threshold: k={tk}, degree={}",
-                effective_args.threshold_time_degree
+                effective_config.threshold_time_degree
             );
             build_time_varying_survival_covariate_template(
                 &age_entry,
                 &age_exit,
                 tk,
-                effective_args.threshold_time_degree,
+                effective_config.threshold_time_degree,
                 "threshold",
             )?
         } else {
             SurvivalCovariateTermBlockTemplate::Static
         };
 
-        let log_sigma_template = if let Some(sk) = effective_args.sigma_time_k {
+        let log_sigma_template = if let Some(sk) = effective_config.sigma_time_k {
             cli_err!(
                 "[survival location-scale] building time-varying sigma: k={sk}, degree={}",
-                effective_args.sigma_time_degree
+                effective_config.sigma_time_degree
             );
             build_time_varying_survival_covariate_template(
                 &age_entry,
                 &age_exit,
                 sk,
-                effective_args.sigma_time_degree,
+                effective_config.sigma_time_degree,
                 "sigma",
             )?
         } else {
@@ -5155,7 +5233,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survivalspec: effectivespec.clone(),
                     baseline_cfg: baseline_cfg.clone(),
                     time_basis: SavedSurvivalTimeBasis::from_build(&time_build, time_anchor),
-                    ridge_lambda: effective_args.ridge_lambda,
+                    ridge_lambda: effective_config.ridge_lambda,
                     survival_likelihood_label: survival_likelihood_modename(likelihood_mode)
                         .to_string(),
                     formula_noise: predict_noise_formula
@@ -5171,8 +5249,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 SavedModelSourceMetadata {
                     training_headers: ds.headers.clone(),
                     training_feature_ranges: Some(ds.feature_ranges()),
-                    offset_column: args.offset_column.clone(),
-                    noise_offset_column: args.noise_offset_column.clone(),
+                    offset_column: effective_config.offset_column.clone(),
+                    noise_offset_column: effective_config.noise_offset_column.clone(),
                 },
             );
             write_payload_json(&out, payload)?;
@@ -5187,10 +5265,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             parsed.linkspec.as_ref(),
             "survival marginal-slope",
         )?;
-        let logslope_formula_raw = args.logslope_formula.as_deref().ok_or_else(|| {
+        let logslope_formula_raw = effective_config.logslope_formula.as_deref().ok_or_else(|| {
             "--logslope-formula is required with --survival-likelihood marginal-slope".to_string()
         })?;
-        let z_column_name = args.z_column.as_ref().ok_or_else(|| {
+        let z_column_name = effective_config.z_column.as_ref().ok_or_else(|| {
             "--z-column is required with --survival-likelihood marginal-slope".to_string()
         })?;
         let response_expr = surv_response_expr(args.entry.as_deref(), &args.exit, &args.event);
@@ -5219,7 +5297,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &mut inference_notes,
             &gam::resource::ResourcePolicy::default_library(),
         )?;
-        if args.scale_dimensions {
+        if effective_config.scale_dimensions {
             enable_scale_dimensions(&mut logslopespec);
         }
 
@@ -5474,7 +5552,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survivalspec: effectivespec.clone(),
                     baseline_cfg: baseline_cfg.clone(),
                     time_basis: SavedSurvivalTimeBasis::from_build(&time_build, time_anchor),
-                    ridge_lambda: effective_args.ridge_lambda,
+                    ridge_lambda: effective_config.ridge_lambda,
                     survival_likelihood_label: survival_likelihood_modename(likelihood_mode)
                         .to_string(),
                     resolved_marginalspec,
@@ -5493,8 +5571,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 SavedModelSourceMetadata {
                     training_headers: ds.headers.clone(),
                     training_feature_ranges: Some(ds.feature_ranges()),
-                    offset_column: args.offset_column.clone(),
-                    noise_offset_column: args.noise_offset_column.clone(),
+                    offset_column: effective_config.offset_column.clone(),
+                    noise_offset_column: effective_config.noise_offset_column.clone(),
                 },
             );
             write_payload_json(&out, payload)?;
@@ -5776,15 +5854,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_event: args.event,
                     baseline_cfg: baseline_cfg.clone(),
                     time_basis: SavedSurvivalTimeBasis::from_build(&time_build, time_anchor),
-                    ridge_lambda: effective_args.ridge_lambda,
+                    ridge_lambda: effective_config.ridge_lambda,
                     beta_time: fit.beta_time().to_vec(),
                     resolved_termspec,
                 },
                 SavedModelSourceMetadata {
                     training_headers: ds.headers.clone(),
                     training_feature_ranges: Some(ds.feature_ranges()),
-                    offset_column: args.offset_column.clone(),
-                    noise_offset_column: args.noise_offset_column.clone(),
+                    offset_column: effective_config.offset_column.clone(),
+                    noise_offset_column: effective_config.noise_offset_column.clone(),
                 },
             );
             write_payload_json(&out, payload)?;
@@ -5798,22 +5876,23 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    if args.noise_offset_column.is_some() {
+    if effective_config.noise_offset_column.is_some() {
         return Err(
             "--noise-offset-column is supported only for survival location-scale or marginal-slope"
                 .to_string(),
         );
     }
-    let covariate_offset = resolve_offset_column(&ds, &col_map, args.offset_column.as_deref())?;
+    let covariate_offset =
+        resolve_offset_column(&ds, &col_map, effective_config.offset_column.as_deref())?;
     let dense_cov_design = cov_design.design.to_dense();
     if cause_count > 1 {
         let weibull_seed = if likelihood_mode == SurvivalLikelihoodMode::Weibull
             && !learn_timewiggle
         {
-            let scale = effective_args
+            let scale = effective_config
                 .baseline_scale
                 .unwrap_or_else(|| positive_survival_time_seed(&age_exit));
-            let shape = effective_args.baseline_shape.unwrap_or(1.0);
+            let shape = effective_config.baseline_shape.unwrap_or(1.0);
             if !scale.is_finite() || scale <= 0.0 || !shape.is_finite() || shape <= 0.0 {
                 return Err(
                     "weibull survival fit requires finite positive baseline_scale and baseline_shape"
@@ -5841,9 +5920,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     time_build: time_build.clone(),
                     timewiggle: effective_timewiggle.clone(),
                     weibull_seed,
-                    ridge_lambda: effective_args.ridge_lambda,
+                    ridge_lambda: effective_config.ridge_lambda,
                     // Gamma precision hyperpriors on penalty blocks are only reachable via the
-                    // Python FFI (`PyFitConfig.precision_hyperpriors`). The CLI exposes no flag,
+                    // Python FFI fit config. The CLI exposes no flag,
                     // config file, or formula-DSL syntax for them, and the magic-by-default
                     // policy forbids inventing one here, so an empty prior list is correct.
                     penalty_block_gamma_priors: Vec::new(),
@@ -5908,7 +5987,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     cause_count: Some(cause_count),
                     baseline_cfg: fit.baseline_cfg.clone(),
                     time_basis: fit.time_basis.clone(),
-                    ridge_lambda: effective_args.ridge_lambda,
+                    ridge_lambda: effective_config.ridge_lambda,
                     survival_likelihood_label: survival_likelihood_modename(likelihood_mode)
                         .to_string(),
                     resolved_termspec: fit.resolvedspec.clone(),
@@ -5918,7 +5997,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 SavedModelSourceMetadata {
                     training_headers: ds.headers.clone(),
                     training_feature_ranges: Some(ds.feature_ranges()),
-                    offset_column: args.offset_column.clone(),
+                    offset_column: effective_config.offset_column.clone(),
                     noise_offset_column: None,
                 },
             );
@@ -5963,7 +6042,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         } else {
             0
         };
-        if effective_args.ridge_lambda > 0.0 && p > ridge_range_start {
+        if effective_config.ridge_lambda > 0.0 && p > ridge_range_start {
             let dim = p - ridge_range_start;
             let mut ridge = Array2::<f64>::zeros((dim, dim));
             for d in 0..dim {
@@ -5971,7 +6050,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             }
             penalty_blocks.push(PenaltyBlock {
                 matrix: ridge,
-                lambda: effective_args.ridge_lambda,
+                lambda: effective_config.ridge_lambda,
                 range: ridge_range_start..p,
                 nullspace_dim: 0,
             });
@@ -6305,7 +6384,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 cause_count: None,
                 baseline_cfg: fitted_baseline_cfg.clone(),
                 time_basis: SavedSurvivalTimeBasis::from_build(&time_build, time_anchor),
-                ridge_lambda: effective_args.ridge_lambda,
+                ridge_lambda: effective_config.ridge_lambda,
                 survival_likelihood_label: survival_likelihood_modename(likelihood_mode)
                     .to_string(),
                 resolved_termspec: frozen_termspec,
@@ -6315,8 +6394,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             SavedModelSourceMetadata {
                 training_headers: ds.headers.clone(),
                 training_feature_ranges: Some(ds.feature_ranges()),
-                offset_column: args.offset_column.clone(),
-                noise_offset_column: args.noise_offset_column.clone(),
+                offset_column: effective_config.offset_column.clone(),
+                noise_offset_column: effective_config.noise_offset_column.clone(),
             },
         );
         write_payload_json(&out, payload)?;
@@ -7139,18 +7218,12 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
     if args.negative_binomial_theta.is_some() && args.family != FamilyArg::NegativeBinomial {
         return Err("--negative-binomial-theta requires --family negative-binomial".to_string());
     }
-    frailty_spec_from_cli(
-        args.frailty_kind,
-        args.frailty_sd,
-        args.hazard_loading,
-        "fit",
-    )?;
-
+    let fit_config = fit_config_from_fit_args(args)?;
     let is_survival = parse_surv_response(&parsed.response)?.is_some();
-    let survival_likelihood = parse_survival_likelihood_mode(&args.survival_likelihood)?;
-    let survival_likelihood_raw = args.survival_likelihood.trim().to_ascii_lowercase();
-    let baseline_target_raw = args.baseline_target.trim().to_ascii_lowercase();
-    let time_basis_raw = args.time_basis.trim().to_ascii_lowercase();
+    let survival_likelihood = parse_survival_likelihood_mode(&fit_config.survival_likelihood)?;
+    let survival_likelihood_raw = fit_config.survival_likelihood.trim().to_ascii_lowercase();
+    let baseline_target_raw = fit_config.baseline_target.trim().to_ascii_lowercase();
+    let time_basis_raw = fit_config.time_basis.trim().to_ascii_lowercase();
     if is_survival {
         if !matches!(args.family, FamilyArg::Auto | FamilyArg::RoystonParmar) {
             return Err(
@@ -7171,10 +7244,10 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
             );
         }
         if args.survival_time_anchor.is_some()
-            || args.baseline_scale.is_some()
-            || args.baseline_shape.is_some()
-            || args.baseline_rate.is_some()
-            || args.baseline_makeham.is_some()
+            || fit_config.baseline_scale.is_some()
+            || fit_config.baseline_shape.is_some()
+            || fit_config.baseline_rate.is_some()
+            || fit_config.baseline_makeham.is_some()
             || args.threshold_time_k.is_some()
             || args.sigma_time_k.is_some()
             || survival_likelihood_raw != "transformation"
@@ -7189,7 +7262,14 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
             return Err("--noise-offset-column requires --predict-noise".to_string());
         }
     }
-    validate_survival_baseline_args(args, survival_likelihood, &baseline_target_raw)?;
+    gam::config_resolve::validate_survival_baseline_args(
+        survival_likelihood,
+        &baseline_target_raw,
+        fit_config.baseline_scale,
+        fit_config.baseline_shape,
+        fit_config.baseline_rate,
+        fit_config.baseline_makeham,
+    )?;
     validate_time_margin_args(
         "--threshold-time-k",
         args.threshold_time_k,
@@ -7198,10 +7278,10 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
     validate_time_margin_args("--sigma-time-k", args.sigma_time_k, args.sigma_time_degree)?;
     if time_basis_raw == "ispline" {
         parse_survival_time_basis_config(
-            &args.time_basis,
-            args.time_degree,
-            args.time_num_internal_knots,
-            args.time_smooth_lambda,
+            &fit_config.time_basis,
+            fit_config.time_degree,
+            fit_config.time_num_internal_knots,
+            fit_config.time_smooth_lambda,
         )?;
     }
     Ok(())
@@ -7240,71 +7320,6 @@ fn validate_positive_optional_usize(flag: &str, value: Option<usize>) -> Result<
         return Err(format!("{flag} must be > 0"));
     }
     Ok::<(), _>(())
-}
-
-fn validate_survival_baseline_args(
-    args: &FitArgs,
-    likelihood_mode: SurvivalLikelihoodMode,
-    baseline_target: &str,
-) -> Result<(), String> {
-    if likelihood_mode == SurvivalLikelihoodMode::Weibull {
-        if args.baseline_rate.is_some() || args.baseline_makeham.is_some() {
-            return Err(
-                "--survival-likelihood weibull does not use --baseline-rate or --baseline-makeham"
-                    .to_string(),
-            );
-        }
-        if !matches!(baseline_target, "linear" | "weibull") {
-            return Err(
-                "--survival-likelihood weibull supports only --baseline-target linear|weibull"
-                    .to_string(),
-            );
-        }
-        return Ok(());
-    }
-
-    match baseline_target {
-        "linear" => {
-            if args.baseline_scale.is_some()
-                || args.baseline_shape.is_some()
-                || args.baseline_rate.is_some()
-                || args.baseline_makeham.is_some()
-            {
-                return Err(
-                    "--baseline-target linear does not use baseline parameter flags".to_string(),
-                );
-            }
-        }
-        "weibull" => {
-            if args.baseline_rate.is_some() || args.baseline_makeham.is_some() {
-                return Err(
-                    "--baseline-target weibull does not use --baseline-rate or --baseline-makeham"
-                        .to_string(),
-                );
-            }
-        }
-        "gompertz" => {
-            if args.baseline_scale.is_some() || args.baseline_makeham.is_some() {
-                return Err(
-                    "--baseline-target gompertz does not use --baseline-scale or --baseline-makeham"
-                        .to_string(),
-                );
-            }
-        }
-        "gompertz-makeham" => {
-            if args.baseline_scale.is_some() {
-                return Err(
-                    "--baseline-target gompertz-makeham does not use --baseline-scale".to_string(),
-                );
-            }
-        }
-        other => {
-            return Err(format!(
-                "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn choose_formula(args: &FitArgs) -> Result<String, CliError> {
@@ -7483,69 +7498,24 @@ fn route_marginal_slope_deviation_blocks(
     })
 }
 
-fn hazard_loading_from_arg(
-    loading: HazardLoadingArg,
-) -> gam::families::lognormal_kernel::HazardLoading {
-    match loading {
-        HazardLoadingArg::Full => gam::families::lognormal_kernel::HazardLoading::Full,
-        HazardLoadingArg::LoadedVsUnloaded => {
-            gam::families::lognormal_kernel::HazardLoading::LoadedVsUnloaded
-        }
-    }
+fn cli_frailty_kind(
+    frailty_kind: Option<FrailtyKindArg>,
+) -> Option<gam::config_resolve::CliFrailtyKind> {
+    frailty_kind.map(|kind| match kind {
+        FrailtyKindArg::GaussianShift => gam::config_resolve::CliFrailtyKind::GaussianShift,
+        FrailtyKindArg::HazardMultiplier => gam::config_resolve::CliFrailtyKind::HazardMultiplier,
+    })
 }
 
-fn frailty_spec_from_cli(
-    frailty_kind: Option<FrailtyKindArg>,
-    frailty_sd: Option<f64>,
+fn cli_hazard_loading(
     hazard_loading: Option<HazardLoadingArg>,
-    context: &str,
-) -> Result<gam::families::lognormal_kernel::FrailtySpec, String> {
-    let validate_sigma = || -> Result<Option<f64>, String> {
-        match frailty_sd {
-            None => Ok(None), // learnable
-            Some(sigma) => {
-                if !sigma.is_finite() || sigma < 0.0 {
-                    return Err(format!(
-                        "{context} requires a finite --frailty-sd >= 0, got {sigma}"
-                    ));
-                }
-                Ok(Some(sigma))
-            }
+) -> Option<gam::config_resolve::CliHazardLoading> {
+    hazard_loading.map(|loading| match loading {
+        HazardLoadingArg::Full => gam::config_resolve::CliHazardLoading::Full,
+        HazardLoadingArg::LoadedVsUnloaded => {
+            gam::config_resolve::CliHazardLoading::LoadedVsUnloaded
         }
-    };
-
-    match frailty_kind {
-        None => {
-            if frailty_sd.is_some() || hazard_loading.is_some() {
-                return Err(format!(
-                    "{context} requires --frailty-kind when --frailty-sd or --hazard-loading is provided"
-                ));
-            }
-            Ok(gam::families::lognormal_kernel::FrailtySpec::None)
-        }
-        Some(FrailtyKindArg::GaussianShift) => {
-            if hazard_loading.is_some() {
-                return Err(format!(
-                    "{context} does not accept --hazard-loading with --frailty-kind gaussian-shift"
-                ));
-            }
-            Ok(
-                gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
-                    sigma_fixed: validate_sigma()?,
-                },
-            )
-        }
-        Some(FrailtyKindArg::HazardMultiplier) => Ok(
-            gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
-                sigma_fixed: validate_sigma()?,
-                loading: hazard_loading.map(hazard_loading_from_arg).ok_or_else(|| {
-                    format!(
-                        "{context} requires --hazard-loading with --frailty-kind hazard-multiplier"
-                    )
-                })?,
-            },
-        ),
-    }
+    })
 }
 
 fn latent_cloglog_state_from_frailty_spec(
@@ -7590,10 +7560,10 @@ fn fit_frailty_spec_from_args(
     args: &FitArgs,
     context: &str,
 ) -> Result<gam::families::lognormal_kernel::FrailtySpec, String> {
-    frailty_spec_from_cli(
-        args.frailty_kind,
+    gam::config_resolve::resolve_cli_frailty_spec(
+        cli_frailty_kind(args.frailty_kind),
         args.frailty_sd,
-        args.hazard_loading,
+        cli_hazard_loading(args.hazard_loading),
         context,
     )
 }
@@ -7602,10 +7572,10 @@ fn fit_frailty_spec_from_survival_args(
     args: &SurvivalArgs,
     context: &str,
 ) -> Result<gam::families::lognormal_kernel::FrailtySpec, String> {
-    frailty_spec_from_cli(
-        args.frailty_kind,
+    gam::config_resolve::resolve_cli_frailty_spec(
+        cli_frailty_kind(args.frailty_kind),
         args.frailty_sd,
-        args.hazard_loading,
+        cli_hazard_loading(args.hazard_loading),
         context,
     )
 }
@@ -8619,24 +8589,6 @@ fn resolve_family(
     )
 }
 
-fn parse_comma_f64(v: &str, label: &str) -> Result<Vec<f64>, String> {
-    let mut out = Vec::new();
-    for part in v.split(',') {
-        let t = part.trim();
-        if t.is_empty() {
-            continue;
-        }
-        let parsed = t
-            .parse::<f64>()
-            .map_err(|err| format!("{label} contains non-numeric value '{t}': {err}"))?;
-        if !parsed.is_finite() {
-            return Err(format!("{label} contains non-finite value '{t}'"));
-        }
-        out.push(parsed);
-    }
-    Ok(out)
-}
-
 fn inverse_link_from_fitted_link_state(state: &FittedLinkState) -> Option<InverseLink> {
     match state {
         FittedLinkState::Standard(Some(link)) => Some(InverseLink::Standard(*link)),
@@ -8679,25 +8631,10 @@ fn resolve_binomial_inverse_link_for_fit(
         | InverseLink::Standard(StandardLink::Identity)
         | InverseLink::Standard(StandardLink::Log)
         | InverseLink::LatentCLogLog(_)
-        | InverseLink::Mixture(_) => Ok(InverseLink::Standard(effective_link_to_standard(
-            effective_link,
-            context,
-        )?)),
+        | InverseLink::Mixture(_) => Ok(InverseLink::Standard(
+            gam::config_resolve::effective_link_to_standard(effective_link, context)?,
+        )),
     }
-}
-
-/// Narrow a wide `LinkFunction` into the legal-only `StandardLink` carried by
-/// `InverseLink::Standard`. Sas / BetaLogistic are state-bearing and have
-/// already been routed to their own `InverseLink` variants by the time this
-/// fallback runs; reaching it with one of those wide variants is a contract
-/// violation by the caller.
-fn effective_link_to_standard(link: LinkFunction, context: &str) -> Result<StandardLink, String> {
-    StandardLink::try_from(link).map_err(|_| {
-        format!(
-            "{context}: state-bearing link `{}` must be routed through `InverseLink::Sas` / `InverseLink::BetaLogistic`, not `Standard(_)`",
-            link.name()
-        )
-    })
 }
 
 fn binomial_mean_linkwiggle_supports_family(
@@ -8713,162 +8650,6 @@ fn binomial_mean_linkwiggle_supports_family(
         );
     standard_binomial
         && !link_choice.is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible))
-}
-
-fn survival_link_usage() -> &'static str {
-    "use identity|logit|probit|cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
-}
-
-fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, String> {
-    if let Some(raw) = args.link.as_deref() {
-        let name = raw.trim().to_ascii_lowercase();
-        if name == "loglog" || name == "cauchit" {
-            // `loglog` and `cauchit` previously routed through a degenerate
-            // single-component MixtureLinkSpec, but that wrapper silently lied
-            // about the projected LinkFunction (mixture link_function() returns
-            // Logit for any composition). Because `LinkFunction` has no LogLog
-            // or Cauchit variant, there is no sound projection, so we reject
-            // the survival link until `LinkFunction` is extended (or a
-            // dedicated `InverseLink` variant is introduced). This keeps the
-            // mixture-link invariant required by
-            // `state_fromspec_rejects_cauchit_and_loglog_components` consistent
-            // with the CLI surface.
-            return Err(format!(
-                "survival --link {name} is not supported: cauchit and loglog have no \
-                 LinkFunction representative and cannot be wrapped in a MixtureLinkSpec; \
-                 {}",
-                survival_link_usage()
-            ));
-        }
-    }
-    let choice = parse_link_choice(args.link.as_deref(), false).map_err(|err| {
-        let err = err.to_string();
-        if let Some(raw) = args.link.as_deref() {
-            let name = raw.trim().to_ascii_lowercase();
-            if err.starts_with("unsupported --link ") || err.starts_with("unsupported link type ") {
-                return format!(
-                    "unsupported survival --link '{name}'; {}",
-                    survival_link_usage()
-                );
-            }
-        }
-        err
-    })?;
-    if let Some(choice) = choice {
-        if let Some(components) = choice.mixture_components {
-            if args.sas_init.is_some() || args.beta_logistic_init.is_some() {
-                return Err(
-                    "survival blended(...) link does not accept --sas-init/--beta-logistic-init"
-                        .to_string(),
-                );
-            }
-            let expected = components.len().saturating_sub(1);
-            let initial_rho = if let Some(raw) = args.mixture_rho.as_deref() {
-                let vals = parse_comma_f64(raw, "--mixture-rho")?;
-                if vals.len() != expected {
-                    return Err(format!(
-                        "--mixture-rho expects {expected} values for blended({})",
-                        components
-                            .iter()
-                            .map(|component| component.name())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    ));
-                }
-                Array1::from_vec(vals)
-            } else {
-                Array1::zeros(expected)
-            };
-            return state_fromspec(&MixtureLinkSpec {
-                components,
-                initial_rho,
-            })
-            .map(InverseLink::Mixture)
-            .map_err(|e| format!("invalid survival blended link state: {e}"));
-        }
-
-        if args.mixture_rho.is_some() {
-            return Err(
-                "--mixture-rho requires survival --link blended(...)/mixture(...)".to_string(),
-            );
-        }
-        match choice.link {
-            LinkFunction::Sas => {
-                if args.beta_logistic_init.is_some() {
-                    return Err("--beta-logistic-init requires --link beta-logistic".to_string());
-                }
-                let (epsilon, log_delta) = if let Some(raw) = args.sas_init.as_deref() {
-                    let vals = parse_comma_f64(raw, "--sas-init")?;
-                    if vals.len() != 2 {
-                        return Err(format!(
-                            "--sas-init expects two values: epsilon,log_delta (got {})",
-                            vals.len()
-                        ));
-                    }
-                    (vals[0], vals[1])
-                } else {
-                    (0.0, 0.0)
-                };
-                state_from_sasspec(SasLinkSpec {
-                    initial_epsilon: epsilon,
-                    initial_log_delta: log_delta,
-                })
-                .map(InverseLink::Sas)
-                .map_err(|e| format!("invalid survival SAS link state: {e}"))
-            }
-            LinkFunction::BetaLogistic => {
-                if args.sas_init.is_some() {
-                    return Err("--sas-init requires --link sas".to_string());
-                }
-                let (epsilon, delta) = if let Some(raw) = args.beta_logistic_init.as_deref() {
-                    let vals = parse_comma_f64(raw, "--beta-logistic-init")?;
-                    if vals.len() != 2 {
-                        return Err(format!(
-                            "--beta-logistic-init expects two values: epsilon,delta (got {})",
-                            vals.len()
-                        ));
-                    }
-                    (vals[0], vals[1])
-                } else {
-                    (0.0, 0.0)
-                };
-                state_from_beta_logisticspec(SasLinkSpec {
-                    initial_epsilon: epsilon,
-                    initial_log_delta: delta,
-                })
-                .map(InverseLink::BetaLogistic)
-                .map_err(|e| format!("invalid survival Beta-Logistic link state: {e}"))
-            }
-            LinkFunction::Log => Err(format!(
-                "unsupported survival --link 'log'; {}",
-                survival_link_usage()
-            )),
-            other => {
-                if args.sas_init.is_some() {
-                    return Err("--sas-init requires --link sas".to_string());
-                }
-                if args.beta_logistic_init.is_some() {
-                    return Err("--beta-logistic-init requires --link beta-logistic".to_string());
-                }
-                Ok(InverseLink::Standard(effective_link_to_standard(
-                    other,
-                    "survival inverse link",
-                )?))
-            }
-        }
-    } else {
-        if args.mixture_rho.is_some() {
-            return Err("--mixture-rho requires --link blended(...)/mixture(...)".to_string());
-        }
-        if args.sas_init.is_some() {
-            return Err("--sas-init requires --link sas".to_string());
-        }
-        if args.beta_logistic_init.is_some() {
-            return Err("--beta-logistic-init requires --link beta-logistic".to_string());
-        }
-        let dist = parse_survival_distribution(&args.survival_distribution)?;
-        Ok(residual_distribution_inverse_link(dist))
-    }
 }
 
 fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
