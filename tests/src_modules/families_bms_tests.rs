@@ -6124,8 +6124,8 @@ fn auto_latent_measure_uses_rank_int_calibration_for_bad_normal_diagnostics() {
         latent_measure: LatentMeasureSpec::Auto { grid_size: 5 },
         ..LatentZPolicy::default()
     };
-    let (measure, calibration) =
-        build_latent_measure_with_geometry(&z, &weights, &policy, None).expect("auto latent measure");
+    let (measure, calibration) = build_latent_measure_with_geometry(&z, &weights, &policy, None)
+        .expect("auto latent measure");
     assert!(
         matches!(measure, LatentMeasureKind::StandardNormal),
         "bad-normal latent z must route through rank-INT to the standard-normal kernel"
@@ -6533,9 +6533,7 @@ fn conditional_latent_gate_detects_and_removes_conditional_mean_shift() {
     let c = Array1::from_iter((0..n).map(|i| (i as f64) / (n as f64 - 1.0) * 2.0 - 1.0));
     // z = 0.8·c + mean-zero noise decorrelated from c. Marginally this carries
     // a conditional mean shift E[z|c] = 0.8·c ≠ 0.
-    let z = Array1::from_iter(
-        (0..n).map(|i| 0.8 * c[i] + if i % 2 == 0 { 0.35 } else { -0.35 }),
-    );
+    let z = Array1::from_iter((0..n).map(|i| 0.8 * c[i] + if i % 2 == 0 { 0.35 } else { -0.35 }));
     let weights = Array1::ones(n);
     let a_block = c.clone().insert_axis(ndarray::Axis(1));
 
@@ -6593,9 +6591,7 @@ fn conditional_latent_gate_silent_without_conditional_structure() {
 fn auto_latent_measure_routes_conditional_shift_to_location_scale() {
     let n = 400usize;
     let c = Array1::from_iter((0..n).map(|i| (i as f64) / (n as f64 - 1.0) * 2.0 - 1.0));
-    let z = Array1::from_iter(
-        (0..n).map(|i| 0.8 * c[i] + if i % 2 == 0 { 0.35 } else { -0.35 }),
-    );
+    let z = Array1::from_iter((0..n).map(|i| 0.8 * c[i] + if i % 2 == 0 { 0.35 } else { -0.35 }));
     let weights = Array1::ones(n);
     let a_block = c.insert_axis(ndarray::Axis(1));
     let policy = LatentZPolicy {
@@ -6610,7 +6606,10 @@ fn auto_latent_measure_routes_conditional_shift_to_location_scale() {
             .expect("auto latent measure with conditioning");
     assert!(matches!(measure, LatentMeasureKind::StandardNormal));
     assert!(
-        matches!(calibration, LatentMeasureCalibration::ConditionalLocationScale(_)),
+        matches!(
+            calibration,
+            LatentMeasureCalibration::ConditionalLocationScale(_)
+        ),
         "a conditional shift with a conditioning span must route to the conditional correction"
     );
 
@@ -8551,8 +8550,7 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
         let ref_score = ref_score.expect("non-empty alpha");
         let ref_hess = ref_hess.expect("non-empty alpha");
 
-        let obj_err = (contracted.objective[i] - ref_obj).abs()
-            / (1.0 + ref_obj.abs());
+        let obj_err = (contracted.objective[i] - ref_obj).abs() / (1.0 + ref_obj.abs());
         assert!(
             obj_err < 1e-10,
             "row {i}: contracted objective {} != Σ_j α_j V_ij {} (rel {obj_err:.3e})",
@@ -8648,8 +8646,12 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
     // Two ψ axes on the marginal block: each carries a distinct likelihood
     // design-derivative `x_psi` AND moves the penalty (`s_psi` + `s_psi_psi`),
     // referencing penalty index 0 of the block.
-    let x_psi_0 = Array2::from_shape_fn((n, 2), |(r, c)| ((r * 7 + c * 3 + 1) % 9) as f64 / 9.0 - 0.4);
-    let x_psi_1 = Array2::from_shape_fn((n, 2), |(r, c)| ((r * 5 + c * 2 + 4) % 8) as f64 / 8.0 - 0.55);
+    let x_psi_0 = Array2::from_shape_fn((n, 2), |(r, c)| {
+        ((r * 7 + c * 3 + 1) % 9) as f64 / 9.0 - 0.4
+    });
+    let x_psi_1 = Array2::from_shape_fn((n, 2), |(r, c)| {
+        ((r * 5 + c * 2 + 4) % 8) as f64 / 8.0 - 0.55
+    });
     // Penalty motion sized clearly above the vacuity floor (s_psi/s_psi_psi
     // entries O(1)) so ½βᵀS_ψψβ and the τ-Hessian are unambiguously live, not
     // borderline against 1e-6.
@@ -8658,12 +8660,12 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
     // s_psi_psi[i] is indexed by the SECOND axis j (per assemble_block_local_s_psi_psi):
     // axis i's vector holds ∂²S/∂ψ_i∂ψ_j for each j.
     let s_pp_0 = vec![
-        array![[0.70_f64, 0.12], [0.12, 0.40]], // (0,0)
+        array![[0.70_f64, 0.12], [0.12, 0.40]],   // (0,0)
         array![[0.45_f64, -0.18], [-0.18, 0.55]], // (0,1)
     ];
     let s_pp_1 = vec![
         array![[0.45_f64, -0.18], [-0.18, 0.55]], // (1,0) = (0,1)^sym
-        array![[0.95_f64, 0.20], [0.20, 0.65]], // (1,1)
+        array![[0.95_f64, 0.20], [0.20, 0.65]],   // (1,1)
     ];
     let derivative_blocks: std::sync::Arc<Vec<Vec<CustomFamilyBlockPsiDerivative>>> =
         std::sync::Arc::new(vec![
@@ -8787,7 +8789,10 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
             ref_ld
         );
         let g_err = rel_diff_array1(&contracted.score.row(i).to_owned(), &ref_g);
-        assert!(g_err < 1e-9, "row {i}: hook score diverged from Σ_j α_j ext_ext.g (rel {g_err:.3e})");
+        assert!(
+            g_err < 1e-9,
+            "row {i}: hook score diverged from Σ_j α_j ext_ext.g (rel {g_err:.3e})"
+        );
 
         let hess_dense = match &contracted.hessian[i] {
             DriftDerivResult::Operator(op) => op.to_dense(),
@@ -8989,9 +8994,8 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         // marginal is not degenerate and is less coupled to the logslope block.
         // The matern logslope block carries the spatial design + its penalties.
         let p_log = design.design.ncols();
-        let marginal_mat = Array2::from_shape_fn((n, 2), |(r, c)| {
-            if c == 0 { 1.0 } else { marginal_cov[r] }
-        });
+        let marginal_mat =
+            Array2::from_shape_fn((n, 2), |(r, c)| if c == 0 { 1.0 } else { marginal_cov[r] });
         let marginal_design =
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(marginal_mat));
         let logslope_design = design.design.clone();
@@ -9031,19 +9035,30 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
 
         let opts = BlockwiseFitOptions::default();
         let res = evaluate_custom_family_joint_hyper(
-            &family, &specs, &opts, &rho, &derivative_blocks, None, mode,
+            &family,
+            &specs,
+            &opts,
+            &rho,
+            &derivative_blocks,
+            None,
+            mode,
         )
         .expect("joint hyper eval");
-        assert!(res.inner_converged, "inner solve must converge for valid outer derivatives");
+        assert!(
+            res.inner_converged,
+            "inner solve must converge for valid outer derivatives"
+        );
         (res.gradient, res.outer_hessian)
     };
 
     // Base point: analytic gradient + Hessian over θ=(ρ,ψ).
-    let (grad0, hess0) =
-        outer_at(0.0, 0.0, EvalMode::ValueGradientHessian);
+    let (grad0, hess0) = outer_at(0.0, 0.0, EvalMode::ValueGradientHessian);
     let theta_dim = grad0.len();
     let psi_dim = theta_dim - n_rho;
-    assert!(psi_dim >= 1, "fixture must expose at least one spatial ψ axis");
+    assert!(
+        psi_dim >= 1,
+        "fixture must expose at least one spatial ψ axis"
+    );
     // The ψ-active path returns the outer Hessian as a matrix-free OPERATOR
     // (#740 forces the operator route when the contracted hook is present, and
     // it advertises Unavailable materialization for the PRODUCTION planner).
@@ -9059,7 +9074,10 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
 
     // The single spatial length-scale knob maps to one ψ offset; restrict to one
     // ψ axis so the ψ FD perturbation is unambiguous.
-    assert_eq!(psi_dim, 1, "FD ψ arm assumes one spatial ψ axis (one length-scale)");
+    assert_eq!(
+        psi_dim, 1,
+        "FD ψ arm assumes one spatial ψ axis (one length-scale)"
+    );
 
     // Centered FD of the outer GRADIENT along a θ direction `dir` of length
     // theta_dim = n_rho + 1. The ρ block (dir[0..n_rho]) is shifted UNIFORMLY by

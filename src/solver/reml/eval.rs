@@ -399,7 +399,12 @@ impl<'a> RemlState<'a> {
             )));
         }
         if k_count == 0 {
-            return Ok((0.0, 0, Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
+            return Ok((
+                0.0,
+                0,
+                Array1::zeros(k_count),
+                Array2::zeros((k_count, k_count)),
+            ));
         }
 
         // Build S_k = R_k^T R_k for each penalty component.
@@ -457,7 +462,12 @@ impl<'a> RemlState<'a> {
 
         let k_count = self.canonical_penalties.len();
         if k_count == 0 || lambdas.len() != k_count {
-            return Ok((0.0, 0, Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
+            return Ok((
+                0.0,
+                0,
+                Array1::zeros(k_count),
+                Array2::zeros((k_count, k_count)),
+            ));
         }
 
         let lambdas_slice = lambdas.as_slice().unwrap();

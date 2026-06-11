@@ -11480,7 +11480,8 @@ impl BernoulliMarginalSlopeFamily {
         alpha_psi: &[f64],
         cache: &BernoulliMarginalSlopeExactEvalCache,
         options: &BlockwiseFitOptions,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String> {
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String>
+    {
         use crate::solver::estimate::reml::unified::DriftDerivResult;
         let slices = &cache.slices;
         let primary = &cache.primary;
@@ -11546,8 +11547,10 @@ impl BernoulliMarginalSlopeFamily {
         // Same-block second design maps ∂²X/∂ψ_i∂ψ_j, built once per (i, j)
         // same-block pair. These are the bilinear cross terms; the contracted
         // path needs Σ_j α_j (∂²X/∂ψ_i∂ψ_j · β) per output row i.
-        let mut cross_maps: std::collections::HashMap<(usize, usize), crate::families::custom_family::PsiDesignMap> =
-            std::collections::HashMap::new();
+        let mut cross_maps: std::collections::HashMap<
+            (usize, usize),
+            crate::families::custom_family::PsiDesignMap,
+        > = std::collections::HashMap::new();
         for i in 0..psi_dim {
             for j in 0..psi_dim {
                 if alpha_psi[j] == 0.0 {
@@ -11612,14 +11615,13 @@ impl BernoulliMarginalSlopeFamily {
                     let row = wr.index;
                     let w = wr.weight;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let (f_pi, f_pipi) = self
-                        .compute_row_primary_gradient_hessian_reusing_cache(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                            cache,
-                        )?;
+                    let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian_reusing_cache(
+                        row,
+                        block_states,
+                        primary,
+                        row_ctx,
+                        cache,
+                    )?;
 
                     // Per-axis row quantities (computed once per row, reused by
                     // every output row through their α-combinations).
@@ -11718,21 +11720,22 @@ impl BernoulliMarginalSlopeFamily {
                         // --- scalar (objective) accumulation:
                         //   Σ_j α_j [ dir_i·(f_pipi·dir_j) + f_pi·dir_ij ]
                         //   = dir_i·(f_pipi·dir(α)) + f_pi·dir_ij(α).
-                        acc.0[i] += dir_i.dot(&f_pipi_w.dot(&dir_alpha)) + f_pi_w.dot(&dir_ij_alpha);
+                        acc.0[i] +=
+                            dir_i.dot(&f_pipi_w.dot(&dir_alpha)) + f_pi_w.dot(&dir_ij_alpha);
 
                         // --- score accumulation (mirrors per-pair lines, j→α):
                         // (a) bij term: f_pi[idx_ij] · psi_local_ij(α)
                         if have_ij {
-                            acc.1.row_mut(i).slice_mut(s![br_i_range.clone()]).scaled_add(
-                                f_pi_w[idx_i],
-                                &psi_local_ij_alpha,
-                            );
+                            acc.1
+                                .row_mut(i)
+                                .slice_mut(s![br_i_range.clone()])
+                                .scaled_add(f_pi_w[idx_i], &psi_local_ij_alpha);
                         }
                         // (b) br_i term: (f_pipi.row(idx_i)·dir(α)) · psi_local_i
-                        acc.1.row_mut(i).slice_mut(s![br_i_range.clone()]).scaled_add(
-                            f_pipi_w.row(idx_i).dot(&dir_alpha),
-                            &psi_local[i],
-                        );
+                        acc.1
+                            .row_mut(i)
+                            .slice_mut(s![br_i_range.clone()])
+                            .scaled_add(f_pipi_w.row(idx_i).dot(&dir_alpha), &psi_local[i]);
                         // (c) br_j term contracted: Σ_j α_j (f_pipi.row(idx_j)·dir_i) psi_local_j
                         for j in 0..psi_dim {
                             if alpha_psi[j] == 0.0 {
@@ -15940,7 +15943,8 @@ impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
     fn psi_second_order_terms_contracted(
         &self,
         alpha_psi: &[f64],
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String> {
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String>
+    {
         self.family
             .exact_newton_joint_psisecond_order_terms_contracted_from_cache_with_options(
                 &self.block_states,

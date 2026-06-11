@@ -2350,8 +2350,11 @@ impl<'a> RemlState<'a> {
                 self.structural_penalty_logdet_value_and_derivatives_block_local(&lambdas, ridge)?;
             (rank, value, det1, det2)
         } else if !penalty_roots.is_empty() {
-            let (value, rank, det1, det2) = self
-                .structural_penalty_logdet_value_and_derivatives(penalty_roots, &lambdas, ridge)?;
+            let (value, rank, det1, det2) = self.structural_penalty_logdet_value_and_derivatives(
+                penalty_roots,
+                &lambdas,
+                ridge,
+            )?;
             (rank, value, det1, det2)
         } else {
             // No canonical penalties and no roots: fall back to the subspace
@@ -2363,8 +2366,7 @@ impl<'a> RemlState<'a> {
                 owned_subspace = self.compute_penalty_subspace(e_for_logdet, ridge_passport)?;
                 &owned_subspace
             };
-            let (rank, value) =
-                self.fixed_subspace_penalty_rank_and_logdet_from_subspace(subspace);
+            let (rank, value) = self.fixed_subspace_penalty_rank_and_logdet_from_subspace(subspace);
             (
                 rank,
                 value,

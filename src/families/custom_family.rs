@@ -16097,32 +16097,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // penalty so the threshold is the NLL the trial must beat.
                 let line_search_options =
                     coefficient_line_search_options(options, old_objective + 1e-10 - trial_penalty);
-                let trial_ll = match joint_line_search_log_likelihood(
-                    family,
-                    &line_search_options,
-                    &states,
-                ) {
-                    Ok((value, workspace)) => {
-                        accepted_joint_workspace = workspace;
-                        value
-                    }
-                    Err(e) => {
-                        likelihood_rejects += 1;
-                        if first_likelihood_reject.is_none() {
-                            first_likelihood_reject = Some(e);
+                let trial_ll =
+                    match joint_line_search_log_likelihood(family, &line_search_options, &states) {
+                        Ok((value, workspace)) => {
+                            accepted_joint_workspace = workspace;
+                            value
                         }
-                        for (b, old) in old_beta.iter().enumerate() {
-                            states[b].beta.assign(old);
+                        Err(e) => {
+                            likelihood_rejects += 1;
+                            if first_likelihood_reject.is_none() {
+                                first_likelihood_reject = Some(e);
+                            }
+                            for (b, old) in old_beta.iter().enumerate() {
+                                states[b].beta.assign(old);
+                            }
+                            refresh_all_block_etas(family, specs, &mut states)?;
+                            joint_trust_radius = shrink_active_joint_block_trust_radii(
+                                &mut joint_block_trust_radii,
+                                &block_step_norms,
+                                0.25,
+                            );
+                            continue;
                         }
-                        refresh_all_block_etas(family, specs, &mut states)?;
-                        joint_trust_radius = shrink_active_joint_block_trust_radii(
-                            &mut joint_block_trust_radii,
-                            &block_step_norms,
-                            0.25,
-                        );
-                        continue;
-                    }
-                };
+                    };
                 let trialobjective = -trial_ll + trial_penalty;
                 // Row measure observed by the trial objective at β + δ. The
                 // line-search helper above runs under `coefficient_line_search_options`,
@@ -22658,48 +22655,52 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 psi_workspace.clone(),
             )?;
 
-            let (ext_ext_fn, rho_ext_fn, drift_fn, contracted_psi_fn) = if eval_mode
-                == EvalMode::ValueGradientHessian
-            {
-                let (ext_ext_fn, rho_ext_fn) = build_psi_pair_callbacks(
-                    family,
-                    synced_joint_states.as_ref(),
-                    specs,
-                    Arc::clone(&derivative_blocks),
-                    &beta_flat,
-                    rho_slice,
-                    penalty_counts,
-                    s_logdet_blocks.as_deref(),
-                    psi_workspace.clone(),
-                )?;
-                // #740: build the direction-contracted ψψ hook from the same psi
-                // workspace + penalty data the per-pair `ext_ext_fn` uses, so the
-                // matrix-free outer-Hessian operator collapses the `K²` per-pair
-                // ψψ assembly to one combined-direction family row pass per
-                // matvec. `None` (no contracted family kernel) keeps the exact
-                // per-pair `ext_ext_fn` path. Built before the drift callback
-                // moves `psi_workspace`.
-                let contracted_psi_fn = build_contracted_psi_hook(
-                    specs,
-                    Arc::clone(&derivative_blocks),
-                    &beta_flat,
-                    rho_slice,
-                    penalty_counts,
-                    s_logdet_blocks.as_deref(),
-                    psi_workspace.clone(),
-                )?;
-                let drift_fn = build_psi_drift_deriv_callback(
-                    family,
-                    synced_joint_states.as_ref(),
-                    specs,
-                    Arc::clone(&derivative_blocks),
-                    hessian_beta_independent,
-                    psi_workspace,
-                );
-                (Some(ext_ext_fn), Some(rho_ext_fn), drift_fn, contracted_psi_fn)
-            } else {
-                (None, None, None, None)
-            };
+            let (ext_ext_fn, rho_ext_fn, drift_fn, contracted_psi_fn) =
+                if eval_mode == EvalMode::ValueGradientHessian {
+                    let (ext_ext_fn, rho_ext_fn) = build_psi_pair_callbacks(
+                        family,
+                        synced_joint_states.as_ref(),
+                        specs,
+                        Arc::clone(&derivative_blocks),
+                        &beta_flat,
+                        rho_slice,
+                        penalty_counts,
+                        s_logdet_blocks.as_deref(),
+                        psi_workspace.clone(),
+                    )?;
+                    // #740: build the direction-contracted ψψ hook from the same psi
+                    // workspace + penalty data the per-pair `ext_ext_fn` uses, so the
+                    // matrix-free outer-Hessian operator collapses the `K²` per-pair
+                    // ψψ assembly to one combined-direction family row pass per
+                    // matvec. `None` (no contracted family kernel) keeps the exact
+                    // per-pair `ext_ext_fn` path. Built before the drift callback
+                    // moves `psi_workspace`.
+                    let contracted_psi_fn = build_contracted_psi_hook(
+                        specs,
+                        Arc::clone(&derivative_blocks),
+                        &beta_flat,
+                        rho_slice,
+                        penalty_counts,
+                        s_logdet_blocks.as_deref(),
+                        psi_workspace.clone(),
+                    )?;
+                    let drift_fn = build_psi_drift_deriv_callback(
+                        family,
+                        synced_joint_states.as_ref(),
+                        specs,
+                        Arc::clone(&derivative_blocks),
+                        hessian_beta_independent,
+                        psi_workspace,
+                    );
+                    (
+                        Some(ext_ext_fn),
+                        Some(rho_ext_fn),
+                        drift_fn,
+                        contracted_psi_fn,
+                    )
+                } else {
+                    (None, None, None, None)
+                };
 
             Some(ExtCoordBundle {
                 coords: psi_coords,

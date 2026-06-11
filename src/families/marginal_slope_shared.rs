@@ -1700,7 +1700,8 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
     fn psi_second_order_terms_contracted(
         &self,
         alpha_psi: &[f64],
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String> {
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String>
+    {
         assert!(alpha_psi.len() < usize::MAX);
         Ok(None)
     }
@@ -1772,7 +1773,8 @@ impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspa
     fn second_order_terms_contracted(
         &self,
         alpha_psi: &[f64],
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String> {
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String>
+    {
         // The σ-auxiliary axes do not participate in the family's combined
         // non-σ row stream (their second-order terms come from a separate
         // σ/σ and mixed-σ path with no directional row kernel). If any

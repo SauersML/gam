@@ -118,9 +118,7 @@ impl Clone for WarmStartStore {
             // will sweep once on its first save and resync from disk.
             byte_total: AtomicU64::new(self.byte_total.load(Ordering::Relaxed)),
             save_counter: AtomicU64::new(0),
-            test_time_offset_ns: AtomicU64::new(
-                self.test_time_offset_ns.load(Ordering::Relaxed),
-            ),
+            test_time_offset_ns: AtomicU64::new(self.test_time_offset_ns.load(Ordering::Relaxed)),
         }
     }
 }

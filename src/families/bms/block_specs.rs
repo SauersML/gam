@@ -1674,9 +1674,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let conditioning_dense = if absorber_active {
         None
     } else {
-        Some(marginal_design.design.try_to_dense_arc(
-            "bernoulli marginal-slope conditional latent-z gate",
-        )?)
+        Some(
+            marginal_design
+                .design
+                .try_to_dense_arc("bernoulli marginal-slope conditional latent-z gate")?,
+        )
     };
     let (latent_measure, latent_z_calibration) = build_latent_measure_with_geometry(
         &spec.z,

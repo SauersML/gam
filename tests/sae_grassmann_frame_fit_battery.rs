@@ -273,7 +273,13 @@ fn build_small_term(truth: &SmallTruth, z: &Array2<f64>) -> SaeManifoldTerm {
     }
     let basis_sizes = vec![M; k];
     let logits = residual_seed_logits(basis_values.view(), &basis_sizes, z.view(), 4.0);
-    let decoder = decoder_lsq_init(basis_values.view(), &basis_sizes, z.view(), logits.view(), TAU);
+    let decoder = decoder_lsq_init(
+        basis_values.view(),
+        &basis_sizes,
+        z.view(),
+        logits.view(),
+        TAU,
+    );
 
     let mut atoms = Vec::with_capacity(k);
     for a in 0..k {
@@ -307,11 +313,8 @@ fn build_small_term(truth: &SmallTruth, z: &Array2<f64>) -> SaeManifoldTerm {
 /// mirror the proven small-SAE fixtures.
 fn fit_via_engine(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> (SaeManifoldTerm, f64) {
     let k = term.atoms.len();
-    let init_rho = SaeManifoldRho::new(
-        1.0_f64.ln(),
-        1.0_f64.ln(),
-        vec![Array1::<f64>::zeros(0); k],
-    );
+    let init_rho =
+        SaeManifoldRho::new(1.0_f64.ln(), 1.0_f64.ln(), vec![Array1::<f64>::zeros(0); k]);
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
     let mut objective = SaeManifoldOuterObjective::new(
