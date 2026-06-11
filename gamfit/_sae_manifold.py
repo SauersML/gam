@@ -1192,12 +1192,12 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         IBP/Gumbel assignment path.
     isometry_weight
         Weight for ``IsometryPenalty`` on the latent coordinate block. Defaults
-        to ``0.0`` (off): the MeanProfiled isometry energy is not
-        scale-invariant (it scales as ``decoder⁴``) and can saturate the
-        arrow-Schur proximal ridge during the joint solve, raising
-        ``RemlConvergenceError`` even on a single planted circle (issue #795);
-        pass ``isometry_weight > 0`` to opt in once you know your decoder scale
-        is well conditioned. Issue #673 (resolved): the decoder smoothness
+        to ``0.0`` (off). The Rust core compares ``g / gbar`` with the identity
+        metric, where ``g = JᵀJ`` and ``gbar`` is the mean pullback trace per
+        latent dimension, so the pin encourages a unit-average-speed chart
+        without coupling to decoder scale (issue #795). Positive weights remain
+        opt-in until the cold-start continuation accepts the planted-circle
+        default-on chart-pin test. Issue #673 (resolved): the decoder smoothness
         penalty is reparameterized by the pulled-back metric ``g = JᵀJ`` in the
         Rust core, so the roughness — and the ``reml_score`` topology evidence —
         is gauge-invariant under reparameterization of the latent coordinate
@@ -1404,12 +1404,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # complementary regularizer that drives g -> I for an interpretable
     # near-arc-length chart; turning it off does not make `reml_score`
     # gauge-dependent, so there is nothing to warn about.
-    # NOTE(#795): isometry defaults to 0.0 (OFF). The MeanProfiled isometry
-    # energy is not scale-invariant (it scales as decoder^4), so during the
-    # joint solve it explodes (~1e13) and saturates the arrow-Schur proximal
-    # ridge at 1e15 — every trial step is rejected and the fit raises
-    # RemlConvergenceError even on the single-planted-circle quickstart.
-    # Re-enable by default once the isometry residual is scale-normalized.
+    # NOTE(#795): isometry still defaults OFF. The Rust penalty now normalizes
+    # g = J^T J by the mean trace per latent dimension before comparing to I, so
+    # the chart pin no longer scales as decoder^4; however, the planted-circle
+    # default-on acceptance still fails after the curvature walk bifurcates and
+    # fallback seed validation jumps to the target isometry weight.
     # Eager nuclear_norm_weight validation (issue #672). `0.0` is the canonical
     # "no rank penalty" baseline; reject negative / non-finite values so the
     # descriptor builder does not surface a cryptic Rust error.

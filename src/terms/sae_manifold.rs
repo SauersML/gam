@@ -1057,6 +1057,21 @@ fn bessel_i1(x: f64) -> f64 {
 pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String>;
 
+    /// Return the same evaluator after the coordinate change
+    /// `old_t = shift + scale * new_t`, when the basis family can transport the
+    /// decoder coefficients exactly enough for the accepted-iterate gauge fix.
+    fn affine_transformed_evaluator(
+        &self,
+        shift: &[f64],
+        scale: &[f64],
+        n_basis: usize,
+    ) -> Result<Option<Arc<dyn SaeBasisSecondJet>>, String> {
+        if shift.len() == usize::MAX || scale.len() == usize::MAX || n_basis == usize::MAX {
+            return Err("SaeBasisEvaluator::affine_transformed_evaluator: unreachable affine metadata width".to_string());
+        }
+        Ok(None)
+    }
+
     /// Column split for the curvature homotopy `Phi_eta = [linear, eta*curved]`.
     ///
     /// The default is a flat linear basis. Curved atom evaluators override this
@@ -2226,6 +2241,42 @@ impl DuchonCoordinateEvaluator {
 }
 
 impl SaeBasisEvaluator for DuchonCoordinateEvaluator {
+    fn affine_transformed_evaluator(
+        &self,
+        shift: &[f64],
+        scale: &[f64],
+        n_basis: usize,
+    ) -> Result<Option<Arc<dyn SaeBasisSecondJet>>, String> {
+        let dim = self.centers.ncols();
+        if shift.len() != dim || scale.len() != dim {
+            return Err(format!(
+                "DuchonCoordinateEvaluator::affine_transformed_evaluator: affine vectors must have length {dim}; got shift={} scale={}",
+                shift.len(),
+                scale.len()
+            ));
+        }
+        if n_basis == usize::MAX {
+            return Err(
+                "DuchonCoordinateEvaluator::affine_transformed_evaluator: unreachable basis width"
+                    .to_string(),
+            );
+        }
+        if dim != 1 {
+            return Ok(None);
+        }
+        if !(scale[0].is_finite() && scale[0] > 0.0 && shift[0].is_finite()) {
+            return Ok(None);
+        }
+        let mut centers = self.centers.clone();
+        for row in 0..centers.nrows() {
+            centers[[row, 0]] = (centers[[row, 0]] - shift[0]) / scale[0];
+        }
+        Ok(Some(Arc::new(Self {
+            centers,
+            order: self.order,
+        })))
+    }
+
     fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
         let dim = self.centers.ncols();
         let effective = duchon_effective_order_for_eta(self.centers.view(), self.order);
@@ -2330,6 +2381,10 @@ impl EuclideanPatchEvaluator {
         })
     }
 
+    pub fn basis_size(&self) -> usize {
+        crate::basis::monomial_exponents(self.latent_dim, self.max_degree).len()
+    }
+
     fn order(&self) -> crate::basis::DuchonNullspaceOrder {
         match self.max_degree {
             0 => crate::basis::DuchonNullspaceOrder::Zero,
@@ -2340,6 +2395,37 @@ impl EuclideanPatchEvaluator {
 }
 
 impl SaeBasisEvaluator for EuclideanPatchEvaluator {
+    fn affine_transformed_evaluator(
+        &self,
+        shift: &[f64],
+        scale: &[f64],
+        n_basis: usize,
+    ) -> Result<Option<Arc<dyn SaeBasisSecondJet>>, String> {
+        if shift.len() != self.latent_dim || scale.len() != self.latent_dim {
+            return Err(format!(
+                "EuclideanPatchEvaluator::affine_transformed_evaluator: affine vectors must have length {}; got shift={} scale={}",
+                self.latent_dim,
+                shift.len(),
+                scale.len()
+            ));
+        }
+        if n_basis != self.basis_size() {
+            return Err(format!(
+                "EuclideanPatchEvaluator::affine_transformed_evaluator: n_basis {n_basis} != evaluator width {}",
+                self.basis_size()
+            ));
+        }
+        if shift.iter().chain(scale.iter()).any(|v| !v.is_finite())
+            || scale.iter().any(|&v| v <= 0.0)
+        {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(Self {
+            latent_dim: self.latent_dim,
+            max_degree: self.max_degree,
+        })))
+    }
+
     fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
         let linear_mask = monomial_linear_mask(self.latent_dim, self.max_degree);
         if linear_mask.len() != n_basis {
@@ -8724,14 +8810,18 @@ impl SaeManifoldTerm {
                 ));
             }
             let step_norm = step_norm_sq.sqrt();
-            if grad_norm <= grad_tolerance || step_norm <= step_tolerance {
+            let quotient_step_norm_sq =
+                self.quotient_newton_step_norm_sq(delta_t.view(), delta_beta.view(), step_norm_sq)?;
+            let quotient_step_norm = quotient_step_norm_sq.sqrt();
+            if grad_norm <= grad_tolerance || quotient_step_norm <= step_tolerance {
                 return Ok(cache);
             }
             if total_inner_iter >= max_refine_iter {
                 return Err(format!(
                     "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
                      neither the KKT gradient ‖g‖={grad_norm:.6e} (tol {grad_tolerance:.6e}) nor \
-                     the undamped Newton step ‖Δ‖={step_norm:.6e} (tol {step_tolerance:.6e}) met \
+                     the quotient Newton step ‖Π⊥gauge Δ‖={quotient_step_norm:.6e} \
+                     (raw ‖Δ‖={step_norm:.6e}, tol {step_tolerance:.6e}) met \
                      tolerance after {total_inner_iter} inner iterations. Refusing to rank an \
                      off-optimum Laplace criterion."
                 ));
@@ -11519,6 +11609,350 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    fn canonicalize_affine_gauge_after_accept(&mut self) -> Result<(), String> {
+        for atom_idx in 0..self.k_atoms() {
+            if !matches!(
+                self.atoms[atom_idx].basis_kind,
+                SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Duchon
+            ) {
+                continue;
+            }
+            self.canonicalize_atom_affine_gauge(atom_idx)?;
+        }
+        Ok(())
+    }
+
+    fn canonicalize_atom_affine_gauge(&mut self, atom_idx: usize) -> Result<(), String> {
+        let n = self.n_obs();
+        let d = self.assignment.coords[atom_idx].latent_dim();
+        if n == 0 || d == 0 {
+            return Ok(());
+        }
+        let Some(evaluator) = self.atoms[atom_idx].basis_evaluator.as_ref() else {
+            return Ok(());
+        };
+        let coords = self.assignment.coords[atom_idx].as_matrix();
+        let weights = self.atom_affine_gauge_weights(atom_idx)?;
+        let weight_sum: f64 = weights.iter().sum();
+        if !(weight_sum.is_finite() && weight_sum > 0.0) {
+            return Ok(());
+        }
+
+        let mut shift = vec![0.0_f64; d];
+        for row in 0..n {
+            let w = weights[row];
+            for axis in 0..d {
+                shift[axis] += w * coords[[row, axis]];
+            }
+        }
+        for value in &mut shift {
+            *value /= weight_sum;
+        }
+
+        let mut scale = vec![1.0_f64; d];
+        let mut changed = false;
+        for axis in 0..d {
+            let mut var = 0.0_f64;
+            for row in 0..n {
+                let centered = coords[[row, axis]] - shift[axis];
+                var += weights[row] * centered * centered;
+            }
+            let rms = (var / weight_sum).sqrt();
+            if rms.is_finite() && rms > 1.0e-12 {
+                scale[axis] = rms;
+            }
+            if shift[axis].abs() > 1.0e-12 || (scale[axis] - 1.0).abs() > 1.0e-12 {
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+
+        let Some(new_evaluator) = evaluator.affine_transformed_evaluator(
+            &shift,
+            &scale,
+            self.atoms[atom_idx].basis_size(),
+        )?
+        else {
+            return Ok(());
+        };
+
+        let mut new_coords = coords.clone();
+        for row in 0..n {
+            for axis in 0..d {
+                new_coords[[row, axis]] = (coords[[row, axis]] - shift[axis]) / scale[axis];
+            }
+        }
+        let (new_phi, new_jet) = if self.atoms[atom_idx].homotopy_eta == 1.0 {
+            new_evaluator.evaluate(new_coords.view())?
+        } else {
+            let evaluated = new_evaluator
+                .evaluate_phi_eta(new_coords.view(), self.atoms[atom_idx].homotopy_eta)?;
+            (evaluated.phi, evaluated.jet)
+        };
+        let old_phi = self.atoms[atom_idx].basis_values.clone();
+        if new_phi.dim() != old_phi.dim() {
+            return Err(format!(
+                "SaeManifoldTerm::canonicalize_atom_affine_gauge: transformed basis shape {:?} != {:?}",
+                new_phi.dim(),
+                old_phi.dim()
+            ));
+        }
+        let transport = solve_basis_transport(new_phi.view(), old_phi.view())?;
+        let old_decoder = self.atoms[atom_idx].decoder_coefficients.clone();
+        let new_decoder = fast_ab(&transport, &old_decoder);
+        let old_fit = fast_ab(&old_phi, &old_decoder);
+        let new_fit = fast_ab(&new_phi, &new_decoder);
+        let fit_scale = old_fit
+            .iter()
+            .chain(new_fit.iter())
+            .fold(1.0_f64, |acc, &v| acc.max(v.abs()));
+        let max_abs = old_fit
+            .iter()
+            .zip(new_fit.iter())
+            .fold(0.0_f64, |acc, (&a, &b)| acc.max((a - b).abs()));
+        if max_abs > 1.0e-8 * fit_scale {
+            return Ok(());
+        }
+
+        let flat = Array1::from_iter(new_coords.iter().copied());
+        self.assignment.coords[atom_idx].set_flat(flat.view());
+        let atom = &mut self.atoms[atom_idx];
+        atom.basis_values = new_phi;
+        atom.basis_jacobian = new_jet;
+        atom.decoder_coefficients = new_decoder;
+        let base: Arc<dyn SaeBasisEvaluator> = new_evaluator.clone();
+        atom.basis_evaluator = Some(base);
+        atom.basis_second_jet = Some(new_evaluator);
+        atom.refresh_intrinsic_smooth_penalty();
+        Ok(())
+    }
+
+    fn atom_affine_gauge_weights(&self, atom_idx: usize) -> Result<Array1<f64>, String> {
+        let n = self.n_obs();
+        let mut weights = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let assignments = self.assignment.try_assignments_row(row)?;
+            let mut w = assignments[atom_idx].max(0.0);
+            if let Some(row_weights) = self.row_loss_weights.as_ref() {
+                w *= row_weights[row].max(0.0);
+            }
+            weights[row] = if w.is_finite() { w } else { 0.0 };
+        }
+        Ok(weights)
+    }
+
+    fn quotient_newton_step_norm_sq(
+        &self,
+        delta_ext_coord: ArrayView1<'_, f64>,
+        delta_beta: ArrayView1<'_, f64>,
+        raw_step_norm_sq: f64,
+    ) -> Result<f64, String> {
+        let n = self.n_obs();
+        let q = self.assignment.row_block_dim();
+        let beta_dim = self.beta_dim();
+        if delta_ext_coord.len() != n * q || delta_beta.len() != beta_dim {
+            return Ok(raw_step_norm_sq);
+        }
+        let mut residual = Array1::<f64>::zeros(delta_ext_coord.len() + delta_beta.len());
+        for i in 0..delta_ext_coord.len() {
+            residual[i] = delta_ext_coord[i];
+        }
+        let beta_base = delta_ext_coord.len();
+        for i in 0..delta_beta.len() {
+            residual[beta_base + i] = delta_beta[i];
+        }
+
+        let mut orthonormal: Vec<Array1<f64>> = Vec::new();
+        for mut gauge in self.dense_step_gauge_vectors()? {
+            for basis in &orthonormal {
+                let coeff = gauge.dot(basis);
+                for i in 0..gauge.len() {
+                    gauge[i] -= coeff * basis[i];
+                }
+            }
+            let norm_sq = gauge.iter().map(|v| v * v).sum::<f64>();
+            if norm_sq <= 1.0e-24 || !norm_sq.is_finite() {
+                continue;
+            }
+            let inv_norm = norm_sq.sqrt().recip();
+            for v in gauge.iter_mut() {
+                *v *= inv_norm;
+            }
+            let coeff = residual.dot(&gauge);
+            for i in 0..residual.len() {
+                residual[i] -= coeff * gauge[i];
+            }
+            orthonormal.push(gauge);
+        }
+        let quotient = residual.iter().map(|v| v * v).sum::<f64>();
+        Ok(if quotient.is_finite() {
+            quotient.max(0.0).min(raw_step_norm_sq)
+        } else {
+            raw_step_norm_sq
+        })
+    }
+
+    fn dense_step_gauge_vectors(&self) -> Result<Vec<Array1<f64>>, String> {
+        let n = self.n_obs();
+        let q = self.assignment.row_block_dim();
+        let p = self.output_dim();
+        let coord_offsets = self.assignment.coord_offsets();
+        let beta_offsets = self.beta_offsets();
+        let total_len = n * q + self.beta_dim();
+        let mut out = Vec::new();
+        for atom_idx in 0..self.k_atoms() {
+            let d = self.assignment.coords[atom_idx].latent_dim();
+            let coords = self.assignment.coords[atom_idx].as_matrix();
+            match self.atoms[atom_idx].basis_kind {
+                SaeAtomBasisKind::EuclideanPatch => {
+                    for axis in 0..d {
+                        let mut field = Array2::<f64>::zeros((n, d));
+                        field.column_mut(axis).fill(1.0);
+                        if let Some(g) = self.dense_step_gauge_vector_from_field(
+                            atom_idx,
+                            field.view(),
+                            &coord_offsets,
+                            &beta_offsets,
+                            total_len,
+                        )? {
+                            out.push(g);
+                        }
+                    }
+                    for axis in 0..d {
+                        let mut field = Array2::<f64>::zeros((n, d));
+                        for row in 0..n {
+                            field[[row, axis]] = coords[[row, axis]];
+                        }
+                        if let Some(g) = self.dense_step_gauge_vector_from_field(
+                            atom_idx,
+                            field.view(),
+                            &coord_offsets,
+                            &beta_offsets,
+                            total_len,
+                        )? {
+                            out.push(g);
+                        }
+                    }
+                }
+                SaeAtomBasisKind::Duchon if d == 1 => {
+                    let mut translation = Array2::<f64>::ones((n, 1));
+                    if let Some(g) = self.dense_step_gauge_vector_from_field(
+                        atom_idx,
+                        translation.view(),
+                        &coord_offsets,
+                        &beta_offsets,
+                        total_len,
+                    )? {
+                        out.push(g);
+                    }
+                    for row in 0..n {
+                        translation[[row, 0]] = coords[[row, 0]];
+                    }
+                    if let Some(g) = self.dense_step_gauge_vector_from_field(
+                        atom_idx,
+                        translation.view(),
+                        &coord_offsets,
+                        &beta_offsets,
+                        total_len,
+                    )? {
+                        out.push(g);
+                    }
+                }
+                SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => {
+                    for axis in 0..d {
+                        let mut field = Array2::<f64>::zeros((n, d));
+                        field.column_mut(axis).fill(1.0);
+                        if let Some(g) = self.dense_step_gauge_vector_from_field(
+                            atom_idx,
+                            field.view(),
+                            &coord_offsets,
+                            &beta_offsets,
+                            total_len,
+                        )? {
+                            out.push(g);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if p == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(out)
+    }
+
+    fn dense_step_gauge_vector_from_field(
+        &self,
+        atom_idx: usize,
+        field: ArrayView2<'_, f64>,
+        coord_offsets: &[usize],
+        beta_offsets: &[usize],
+        total_len: usize,
+    ) -> Result<Option<Array1<f64>>, String> {
+        let n = self.n_obs();
+        let q = self.assignment.row_block_dim();
+        let p = self.output_dim();
+        let atom = &self.atoms[atom_idx];
+        let m = atom.basis_size();
+        let d = self.assignment.coords[atom_idx].latent_dim();
+        if field.dim() != (n, d) {
+            return Err(format!(
+                "dense_step_gauge_vector_from_field: field shape {:?} != ({n}, {d})",
+                field.dim()
+            ));
+        }
+        let mut design = Array2::<f64>::zeros((n, m));
+        let mut motion = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            let assignments = self.assignment.try_assignments_row(row)?;
+            let a = assignments[atom_idx];
+            if a == 0.0 {
+                continue;
+            }
+            for col in 0..m {
+                design[[row, col]] = a * atom.basis_values[[row, col]];
+            }
+            for axis in 0..d {
+                let dt = field[[row, axis]];
+                if dt == 0.0 {
+                    continue;
+                }
+                for col in 0..m {
+                    let w = a * dt * atom.basis_jacobian[[row, col, axis]];
+                    if w == 0.0 {
+                        continue;
+                    }
+                    for out_col in 0..p {
+                        motion[[row, out_col]] += w * atom.decoder_coefficients[[col, out_col]];
+                    }
+                }
+            }
+        }
+        let raw = motion.iter().map(|v| v * v).sum::<f64>();
+        if raw <= f64::MIN_POSITIVE || !raw.is_finite() {
+            return Ok(None);
+        }
+        motion.mapv_inplace(|v| -v);
+        let delta_b = solve_design_least_squares(design.view(), motion.view())?;
+        let mut gauge = Array1::<f64>::zeros(total_len);
+        for row in 0..n {
+            let row_base = row * q + coord_offsets[atom_idx];
+            for axis in 0..d {
+                gauge[row_base + axis] = field[[row, axis]];
+            }
+        }
+        let beta_base = n * q + beta_offsets[atom_idx];
+        for col in 0..m {
+            for out_col in 0..p {
+                gauge[beta_base + col * p + out_col] = delta_b[[col, out_col]];
+            }
+        }
+        Ok(Some(gauge))
+    }
+
     /// #976 Layer-1 guard ledger for the most recent joint fit (empty when no
     /// atom ever breached the active-mass floor). A terminal event here is the
     /// canonical death-proposal feed for the structure search.
@@ -12492,6 +12926,7 @@ impl SaeManifoldTerm {
                     break;
                 }
             }
+            self.canonicalize_affine_gauge_after_accept()?;
             // #976 Layer-1 guard 3: after an accepted step (Armijo or proximal
             // — the rejection paths `break` above), check every atom's support
             // and answer breaches with a bounded re-seed or a terminal
@@ -14459,6 +14894,48 @@ fn validate_finite_logits(logits: ArrayView1<'_, f64>, row: usize) -> Result<(),
         }
     }
     Ok(())
+}
+
+fn solve_basis_transport(
+    new_phi: ArrayView2<'_, f64>,
+    old_phi: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    solve_design_least_squares(new_phi, old_phi)
+}
+
+fn solve_design_least_squares(
+    design: ArrayView2<'_, f64>,
+    rhs: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    if design.nrows() != rhs.nrows() {
+        return Err(format!(
+            "solve_design_least_squares: row mismatch design={} rhs={}",
+            design.nrows(),
+            rhs.nrows()
+        ));
+    }
+    let (u_opt, sigma, vt_opt) = design
+        .to_owned()
+        .svd(true, true)
+        .map_err(|err| format!("solve_design_least_squares: SVD failed: {err}"))?;
+    let u = u_opt.ok_or_else(|| "solve_design_least_squares: SVD omitted U".to_string())?;
+    let vt = vt_opt.ok_or_else(|| "solve_design_least_squares: SVD omitted Vt".to_string())?;
+    let smax = sigma.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+    if !(smax.is_finite() && smax > 0.0) {
+        return Err("solve_design_least_squares: design has zero numerical rank".to_string());
+    }
+    let cutoff = smax * f64::EPSILON * (design.nrows().max(design.ncols()) as f64);
+    let coeffs = u.t().dot(&rhs);
+    let mut scaled = Array2::<f64>::zeros(coeffs.dim());
+    for row in 0..sigma.len() {
+        if sigma[row] > cutoff {
+            let inv = 1.0 / sigma[row];
+            for col in 0..rhs.ncols() {
+                scaled[[row, col]] = inv * coeffs[[row, col]];
+            }
+        }
+    }
+    Ok(vt.t().dot(&scaled))
 }
 
 fn canonicalize_softmax_logits(logits: &mut Array2<f64>) {
@@ -18823,6 +19300,97 @@ mod tests {
         // The degree-2 patch in d=2 has columns {1, x, y, x², xy, y²}.
         let (phi, _jet) = evaluator.evaluate(array![[0.0, 0.0]].view())?;
         assert_eq!(phi.ncols(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn euclidean_affine_gauge_canonicalization_preserves_reconstruction() -> Result<(), String> {
+        let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2)?);
+        let canonical = array![[-1.0_f64], [-0.35], [0.1], [0.65], [1.2]];
+        let mut coords = canonical.clone();
+        for row in 0..coords.nrows() {
+            coords[[row, 0]] = 2.75 + 4.0 * canonical[[row, 0]];
+        }
+        let (phi, jet) = evaluator.evaluate(coords.view())?;
+        let decoder = array![[0.25, -0.4], [1.2, 0.3], [-0.15, 0.5]];
+        let atom = SaeManifoldAtom::new(
+            "euclidean_patch",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(evaluator.basis_size()),
+        )?
+        .with_basis_evaluator(evaluator);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((coords.nrows(), 1)),
+            vec![coords],
+            vec![LatentManifold::Euclidean],
+            AssignmentMode::softmax(1.0),
+        )?;
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment)?;
+        let before = term.fitted();
+
+        term.canonicalize_affine_gauge_after_accept()?;
+
+        let after = term.fitted();
+        let max_abs = before
+            .iter()
+            .zip(after.iter())
+            .fold(0.0_f64, |acc, (&a, &b)| acc.max((a - b).abs()));
+        assert!(
+            max_abs <= 1.0e-10,
+            "canonicalization changed reconstruction by {max_abs:.3e}"
+        );
+        let live = term.assignment.coords[0].as_matrix();
+        let mean = live.column(0).sum() / live.nrows() as f64;
+        let rms = (live.column(0).iter().map(|v| v * v).sum::<f64>() / live.nrows() as f64).sqrt();
+        assert_abs_diff_eq!(mean, 0.0, epsilon = 1.0e-12);
+        assert_abs_diff_eq!(rms, 1.0, epsilon = 1.0e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn quotient_step_norm_removes_pure_euclidean_affine_gauge() -> Result<(), String> {
+        let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2)?);
+        let coords = array![[-1.0_f64], [-0.4], [0.2], [0.8], [1.3]];
+        let (phi, jet) = evaluator.evaluate(coords.view())?;
+        let decoder = array![[0.1, -0.2], [1.0, 0.4], [0.25, -0.3]];
+        let atom = SaeManifoldAtom::new(
+            "euclidean_patch",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(evaluator.basis_size()),
+        )?
+        .with_basis_evaluator(evaluator);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((coords.nrows(), 1)),
+            vec![coords],
+            vec![LatentManifold::Euclidean],
+            AssignmentMode::softmax(1.0),
+        )?;
+        let term = SaeManifoldTerm::new(vec![atom], assignment)?;
+        let gauges = term.dense_step_gauge_vectors()?;
+        assert!(
+            gauges.len() >= 2,
+            "expected translation and scale gauge generators"
+        );
+        let n_coord = term.n_obs() * term.assignment.row_block_dim();
+        let gauge = &gauges[1];
+        let delta_t = gauge.slice(s![..n_coord]);
+        let delta_beta = gauge.slice(s![n_coord..]);
+        let raw = gauge.iter().map(|v| v * v).sum::<f64>();
+
+        let quotient = term.quotient_newton_step_norm_sq(delta_t, delta_beta, raw)?;
+
+        assert!(
+            quotient <= raw.max(1.0) * 1.0e-20,
+            "pure affine gauge step left quotient norm squared {quotient:.3e} from raw {raw:.3e}"
+        );
         Ok(())
     }
 
