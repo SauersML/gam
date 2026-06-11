@@ -8569,23 +8569,18 @@ mod tests {
     }
 
     fn workflow_test_outer_result(converged: bool, rho: Array1<f64>) -> OuterResult {
-        OuterResult {
+        let mut result = OuterResult::new(
             rho,
-            final_value: 1.25,
-            iterations: 7,
-            final_grad_norm: Some(0.5),
-            final_gradient: None,
-            final_hessian: None,
+            1.25,
+            7,
             converged,
-            plan_used: OuterPlan {
+            OuterPlan {
                 solver: Solver::Bfgs,
                 hessian_source: HessianSource::BfgsApprox,
             },
-            operator_trust_radius: None,
-            operator_stop_reason: None,
-            criterion_certificate: None,
-            rho_uncertainty_certificate: None,
-        }
+        );
+        result.final_grad_norm = Some(0.5);
+        result
     }
 
     fn duchon_workflow_dataset() -> Dataset {

@@ -4447,20 +4447,51 @@ fn solution_into_outer_result(
     converged: bool,
     plan_used: OuterPlan,
 ) -> OuterResult {
-    OuterResult {
-        rho: solution.final_point,
-        final_value: solution.final_value,
-        iterations: solution.iterations,
-        final_grad_norm: solution.final_gradient_norm,
-        final_gradient: solution.final_gradient,
-        final_hessian: solution.final_hessian,
+    let mut result = OuterResult::new(
+        solution.final_point,
+        solution.final_value,
+        solution.iterations,
         converged,
         plan_used,
-        operator_trust_radius: None,
-        operator_stop_reason: None,
-        criterion_certificate: None,
-        rho_uncertainty_certificate: None,
-    }
+    );
+    result.final_grad_norm = solution.final_gradient_norm;
+    result.final_gradient = solution.final_gradient;
+    result.final_hessian = solution.final_hessian;
+    result
+}
+
+fn outer_result_with_gradient_norm(
+    rho: Array1<f64>,
+    final_value: f64,
+    iterations: usize,
+    final_grad_norm: Option<f64>,
+    converged: bool,
+    plan_used: OuterPlan,
+) -> OuterResult {
+    let mut result = OuterResult::new(rho, final_value, iterations, converged, plan_used);
+    result.final_grad_norm = final_grad_norm;
+    result
+}
+
+fn outer_result_with_gradient(
+    rho: Array1<f64>,
+    final_value: f64,
+    iterations: usize,
+    final_grad_norm: Option<f64>,
+    final_gradient: Option<Array1<f64>>,
+    converged: bool,
+    plan_used: OuterPlan,
+) -> OuterResult {
+    let mut result = outer_result_with_gradient_norm(
+        rho,
+        final_value,
+        iterations,
+        final_grad_norm,
+        converged,
+        plan_used,
+    );
+    result.final_gradient = final_gradient;
+    result
 }
 
 use crate::inference::diagnostics::format_top_abs as format_top_abs_components;
@@ -5041,20 +5072,8 @@ impl OuterProblem {
                         prior_obj_display,
                         iterations,
                     );
-                    let mut result = OuterResult {
-                        rho,
-                        final_value,
-                        iterations,
-                        final_grad_norm: None,
-                        final_gradient: None,
-                        final_hessian: None,
-                        converged: true,
-                        plan_used,
-                        operator_trust_radius: None,
-                        operator_stop_reason: None,
-                        criterion_certificate: None,
-                        rho_uncertainty_certificate: None,
-                    };
+                    let mut result =
+                        OuterResult::new(rho, final_value, iterations, true, plan_used);
                     result.rho_uncertainty_certificate = Some(compute_rho_uncertainty_certificate(
                         obj, &config, context, &result,
                     ));
@@ -5272,6 +5291,29 @@ pub struct OuterResult {
 }
 
 impl OuterResult {
+    pub fn new(
+        rho: Array1<f64>,
+        final_value: f64,
+        iterations: usize,
+        converged: bool,
+        plan_used: OuterPlan,
+    ) -> Self {
+        Self {
+            rho,
+            final_value,
+            iterations,
+            final_grad_norm: None,
+            final_gradient: None,
+            final_hessian: None,
+            converged,
+            plan_used,
+            operator_trust_radius: None,
+            operator_stop_reason: None,
+            criterion_certificate: None,
+            rho_uncertainty_certificate: None,
+        }
+    }
+
     /// Human-readable rendering of `final_grad_norm` for diagnostics. Returns
     /// `"n/a"` when no gradient was measured (gradient-free / cache-hit paths).
     pub fn final_grad_norm_report(&self) -> String {
@@ -5813,20 +5855,14 @@ fn run_outer_uncertified(
     if cap.n_params == 0 {
         let cost = obj.eval_cost(&Array1::zeros(0))?;
         let the_plan = plan_with_class(&cap, config.solver_class);
-        return Ok(OuterResult {
-            rho: Array1::zeros(0),
-            final_value: cost,
-            iterations: 0,
-            final_grad_norm: Some(0.0),
-            final_gradient: None,
-            final_hessian: None,
-            converged: true,
-            plan_used: the_plan,
-            operator_trust_radius: None,
-            operator_stop_reason: None,
-            criterion_certificate: None,
-            rho_uncertainty_certificate: None,
-        });
+        return Ok(outer_result_with_gradient_norm(
+            Array1::zeros(0),
+            cost,
+            0,
+            Some(0.0),
+            true,
+            the_plan,
+        ));
     }
 
     // Build the ordered list of capabilities to attempt: primary first, then
@@ -6068,12 +6104,7 @@ fn run_per_atom_efs_if_frontier(
     let the_plan = plan_with_class(&cap, config.solver_class);
     let rho_dim = cap.theta_layout().rho_dim();
 
-    let (lower, upper) = config.bounds.clone().unwrap_or_else(|| {
-        (
-            Array1::<f64>::from_elem(cap.n_params, -config.rho_bound),
-            Array1::<f64>::from_elem(cap.n_params, config.rho_bound),
-        )
-    });
+    let (lower, upper) = outer_bounds_template(config, cap.n_params);
 
     // Seed: cache/explicit initial ρ if present, otherwise the first generated
     // candidate. The per-atom multiplicative fixed point is locally
@@ -6117,6 +6148,15 @@ fn run_per_atom_efs_if_frontier(
 fn outer_bounds(lo: &Array1<f64>, hi: &Array1<f64>) -> Result<Bounds, EstimationError> {
     Bounds::new(lo.clone(), hi.clone(), 1e-6).map_err(|err| {
         EstimationError::InvalidInput(format!("outer rho bounds are invalid: {err}"))
+    })
+}
+
+fn outer_bounds_template(config: &OuterConfig, n: usize) -> (Array1<f64>, Array1<f64>) {
+    config.bounds.clone().unwrap_or_else(|| {
+        (
+            Array1::<f64>::from_elem(n, -config.rho_bound),
+            Array1::<f64>::from_elem(n, config.rho_bound),
+        )
     })
 }
 
@@ -6167,6 +6207,71 @@ fn bfgs_axis_step_caps(config: &OuterConfig, layout: OuterThetaLayout) -> Option
     Some(caps)
 }
 
+enum FixedPointOuterRunError {
+    SeedRejected(EstimationError),
+    ImmediateFallback(EstimationError),
+    Failed(EstimationError),
+}
+
+fn run_fixed_point_outer_solver(
+    obj: &mut dyn OuterObjective,
+    layout: OuterThetaLayout,
+    barrier_config: Option<BarrierConfig>,
+    config: &OuterConfig,
+    context: &str,
+    seed: &Array1<f64>,
+    the_plan: OuterPlan,
+    label: &str,
+    failure_prefix: &str,
+) -> Result<OuterResult, FixedPointOuterRunError> {
+    let mut objective = OuterFixedPointBridge {
+        obj,
+        layout,
+        barrier_config,
+        fixed_point_tolerance: config.tolerance,
+        consecutive_psi_zero_iters: 0,
+    };
+    match objective.eval_step(seed) {
+        Ok(_) => {}
+        Err(err) => {
+            let err = match err {
+                ObjectiveEvalError::Recoverable { message }
+                | ObjectiveEvalError::Fatal { message } => {
+                    EstimationError::RemlOptimizationFailed(message)
+                }
+            };
+            if requests_immediate_first_order_fallback(&err.to_string()) {
+                return Err(FixedPointOuterRunError::ImmediateFallback(err));
+            }
+            return Err(FixedPointOuterRunError::SeedRejected(err));
+        }
+    };
+    let (lo, hi) = outer_bounds_template(config, layout.n_params);
+    let bounds = outer_bounds(&lo, &hi).map_err(FixedPointOuterRunError::Failed)?;
+    let tol = outer_tolerance(config.tolerance).map_err(FixedPointOuterRunError::Failed)?;
+    let max_iter =
+        outer_max_iterations(config.max_iter).map_err(FixedPointOuterRunError::Failed)?;
+    let mut optimizer = FixedPoint::new(seed.clone(), objective)
+        .with_bounds(bounds)
+        .with_tolerance(tol)
+        .with_max_iterations(max_iter);
+    match optimizer.run() {
+        Ok(sol) => Ok(solution_into_outer_result(sol, true, the_plan)),
+        Err(FixedPointError::MaxIterationsReached { last_solution }) => {
+            log::warn!(
+                "[OUTER warning] {context}: {label} hit max_iter={} at final_value={:.6e} step_norm={:.3e}",
+                config.max_iter,
+                last_solution.final_value,
+                last_solution.final_gradient_norm.unwrap_or(f64::NAN),
+            );
+            Ok(solution_into_outer_result(*last_solution, false, the_plan))
+        }
+        Err(e) => Err(FixedPointOuterRunError::Failed(
+            EstimationError::RemlOptimizationFailed(format!("{failure_prefix}: {e:?}")),
+        )),
+    }
+}
+
 /// Execute a single plan attempt (seed generation → solver loop → best result).
 fn run_outer_with_plan(
     obj: &mut dyn OuterObjective,
@@ -6198,12 +6303,7 @@ fn run_outer_with_plan(
         )));
     }
 
-    let (lower, upper) = config.bounds.clone().unwrap_or_else(|| {
-        (
-            Array1::<f64>::from_elem(cap.n_params, -config.rho_bound),
-            Array1::<f64>::from_elem(cap.n_params, config.rho_bound),
-        )
-    });
+    let (lower, upper) = outer_bounds_template(config, cap.n_params);
     crate::solver::estimate::reml::runtime::record_current_outer_rho_upper_bounds_for_ift(&upper);
     let bounds_template = (lower, upper);
     let mut projected_seeds = Vec::with_capacity(seeds.len());
@@ -7119,20 +7219,15 @@ fn run_outer_with_plan(
                                 outcome.final_grad_norm.unwrap_or(f64::NAN),
                                 outcome.converged,
                             );
-                            let result = OuterResult {
-                                rho: outcome.rho,
-                                final_value: outcome.objective,
-                                iterations: outcome.iterations,
-                                final_grad_norm: outcome.final_grad_norm,
-                                final_gradient: outcome.final_gradient,
-                                final_hessian: None,
-                                converged: outcome.converged,
-                                plan_used: *the_plan,
-                                operator_trust_radius: None,
-                                operator_stop_reason: None,
-                                criterion_certificate: None,
-                                rho_uncertainty_certificate: None,
-                            };
+                            let result = outer_result_with_gradient(
+                                outcome.rho,
+                                outcome.objective,
+                                outcome.iterations,
+                                outcome.final_grad_norm,
+                                outcome.final_gradient,
+                                outcome.converged,
+                                *the_plan,
+                            );
                             Ok::<OuterResult, EstimationError>(result)
                         }
                         Err(err) => {
@@ -7340,109 +7435,67 @@ fn run_outer_with_plan(
                 }
             }
             Solver::Efs => {
-                let mut objective = OuterFixedPointBridge {
+                match run_fixed_point_outer_solver(
                     obj,
                     layout,
-                    barrier_config: cap.barrier_config.clone(),
-                    fixed_point_tolerance: config.tolerance,
-                    consecutive_psi_zero_iters: 0,
-                };
-                match objective.eval_step(seed) {
-                    Ok(_) => {}
-                    Err(err) => {
-                        let err = match err {
-                            ObjectiveEvalError::Recoverable { message }
-                            | ObjectiveEvalError::Fatal { message } => {
-                                EstimationError::RemlOptimizationFailed(message)
-                            }
-                        };
-                        if requests_immediate_first_order_fallback(&err.to_string()) {
-                            return Err(err);
-                        }
+                    cap.barrier_config.clone(),
+                    config,
+                    context,
+                    seed,
+                    *the_plan,
+                    "EFS",
+                    "fixed-point solver failed",
+                ) {
+                    Ok(result) => {
+                        started_seeds += 1;
+                        seed_slot = started_seeds;
+                        Ok(result)
+                    }
+                    Err(FixedPointOuterRunError::SeedRejected(err)) => {
                         log::warn!(
                             "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                         );
                         rejection_reasons.push((seed_idx, "validation", err.to_string()));
                         continue 'seed_attempts;
                     }
-                };
-                started_seeds += 1;
-                seed_slot = started_seeds;
-                let (lo, hi) = &bounds_template;
-                let bounds = outer_bounds(lo, hi)?;
-                let tol = outer_tolerance(config.tolerance)?;
-                let max_iter = outer_max_iterations(config.max_iter)?;
-                let mut optimizer = FixedPoint::new(seed.clone(), objective)
-                    .with_bounds(bounds)
-                    .with_tolerance(tol)
-                    .with_max_iterations(max_iter);
-                match optimizer.run() {
-                    Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
-                    Err(FixedPointError::MaxIterationsReached { last_solution }) => {
-                        log::warn!(
-                            "[OUTER warning] {context}: EFS hit max_iter={} at final_value={:.6e} step_norm={:.3e}",
-                            config.max_iter,
-                            last_solution.final_value,
-                            last_solution.final_gradient_norm.unwrap_or(f64::NAN),
-                        );
-                        Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                    Err(FixedPointOuterRunError::ImmediateFallback(err)) => Err(err),
+                    Err(FixedPointOuterRunError::Failed(err)) => {
+                        started_seeds += 1;
+                        seed_slot = started_seeds;
+                        Err(err)
                     }
-                    Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                        "fixed-point solver failed: {e:?}"
-                    ))),
                 }
             }
             Solver::HybridEfs => {
-                let mut objective = OuterFixedPointBridge {
+                match run_fixed_point_outer_solver(
                     obj,
                     layout,
-                    barrier_config: cap.barrier_config.clone(),
-                    fixed_point_tolerance: config.tolerance,
-                    consecutive_psi_zero_iters: 0,
-                };
-                match objective.eval_step(seed) {
-                    Ok(_) => {}
-                    Err(err) => {
-                        let err = match err {
-                            ObjectiveEvalError::Recoverable { message }
-                            | ObjectiveEvalError::Fatal { message } => {
-                                EstimationError::RemlOptimizationFailed(message)
-                            }
-                        };
-                        if requests_immediate_first_order_fallback(&err.to_string()) {
-                            return Err(err);
-                        }
+                    cap.barrier_config.clone(),
+                    config,
+                    context,
+                    seed,
+                    *the_plan,
+                    "HybridEFS",
+                    "hybrid EFS solver failed",
+                ) {
+                    Ok(result) => {
+                        started_seeds += 1;
+                        seed_slot = started_seeds;
+                        Ok(result)
+                    }
+                    Err(FixedPointOuterRunError::SeedRejected(err)) => {
                         log::warn!(
                             "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                         );
                         rejection_reasons.push((seed_idx, "validation", err.to_string()));
                         continue 'seed_attempts;
                     }
-                };
-                started_seeds += 1;
-                seed_slot = started_seeds;
-                let (lo, hi) = &bounds_template;
-                let bounds = outer_bounds(lo, hi)?;
-                let tol = outer_tolerance(config.tolerance)?;
-                let max_iter = outer_max_iterations(config.max_iter)?;
-                let mut optimizer = FixedPoint::new(seed.clone(), objective)
-                    .with_bounds(bounds)
-                    .with_tolerance(tol)
-                    .with_max_iterations(max_iter);
-                match optimizer.run() {
-                    Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
-                    Err(FixedPointError::MaxIterationsReached { last_solution }) => {
-                        log::warn!(
-                            "[OUTER warning] {context}: HybridEFS hit max_iter={} at final_value={:.6e} step_norm={:.3e}",
-                            config.max_iter,
-                            last_solution.final_value,
-                            last_solution.final_gradient_norm.unwrap_or(f64::NAN),
-                        );
-                        Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                    Err(FixedPointOuterRunError::ImmediateFallback(err)) => Err(err),
+                    Err(FixedPointOuterRunError::Failed(err)) => {
+                        started_seeds += 1;
+                        seed_slot = started_seeds;
+                        Err(err)
                     }
-                    Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                        "hybrid EFS solver failed: {e:?}"
-                    ))),
                 }
             }
             Solver::CompassSearch => {
@@ -7518,40 +7571,16 @@ fn run_outer_with_plan(
                     max_polls,
                 );
                 match outcome {
-                    CompassSearchOutcome::Converged { point, cost, polls } => Ok(OuterResult {
-                        rho: point,
-                        final_value: cost,
-                        iterations: polls,
-                        final_grad_norm: None,
-                        final_gradient: None,
-                        final_hessian: None,
-                        converged: true,
-                        plan_used: *the_plan,
-                        operator_trust_radius: None,
-                        operator_stop_reason: None,
-                        criterion_certificate: None,
-                        rho_uncertainty_certificate: None,
-                    }),
+                    CompassSearchOutcome::Converged { point, cost, polls } => {
+                        Ok(OuterResult::new(point, cost, polls, true, *the_plan))
+                    }
                     CompassSearchOutcome::BudgetExhausted { point, cost, polls } => {
                         log::warn!(
                             "[OUTER warning] {context}: compass search exhausted max_polls={} at best_cost={:.6e}",
                             max_polls,
                             cost,
                         );
-                        Ok(OuterResult {
-                            rho: point,
-                            final_value: cost,
-                            iterations: polls,
-                            final_grad_norm: None,
-                            final_gradient: None,
-                            final_hessian: None,
-                            converged: false,
-                            plan_used: *the_plan,
-                            operator_trust_radius: None,
-                            operator_stop_reason: None,
-                            criterion_certificate: None,
-                            rho_uncertainty_certificate: None,
-                        })
+                        Ok(OuterResult::new(point, cost, polls, false, *the_plan))
                     }
                 }
             }
@@ -9797,57 +9826,34 @@ mod tests {
 
     #[test]
     fn candidate_selection_prefers_lower_cost_within_same_convergence_class() {
-        let nonconverged_hi = OuterResult {
-            rho: array![0.0],
-            final_value: 9.0,
-            iterations: 1,
-            final_grad_norm: Some(1.0),
-            final_gradient: None,
-            final_hessian: None,
-            converged: false,
-            plan_used: OuterPlan {
+        let plan = OuterPlan {
+            solver: Solver::Bfgs,
+            hessian_source: HessianSource::BfgsApprox,
+        };
+        let mut nonconverged_hi = OuterResult::new(array![0.0], 9.0, 1, false, plan);
+        nonconverged_hi.final_grad_norm = Some(1.0);
+        let mut nonconverged_lo = OuterResult::new(
+            array![1.0],
+            1.0,
+            1,
+            false,
+            OuterPlan {
                 solver: Solver::Bfgs,
                 hessian_source: HessianSource::BfgsApprox,
             },
-            operator_trust_radius: None,
-            operator_stop_reason: None,
-            criterion_certificate: None,
-            rho_uncertainty_certificate: None,
-        };
-        let nonconverged_lo = OuterResult {
-            rho: array![1.0],
-            final_value: 1.0,
-            iterations: 1,
-            final_grad_norm: Some(1.0),
-            final_gradient: None,
-            final_hessian: None,
-            converged: false,
-            plan_used: OuterPlan {
+        );
+        nonconverged_lo.final_grad_norm = Some(1.0);
+        let mut converged = OuterResult::new(
+            array![2.0],
+            5.0,
+            1,
+            true,
+            OuterPlan {
                 solver: Solver::Bfgs,
                 hessian_source: HessianSource::BfgsApprox,
             },
-            operator_trust_radius: None,
-            operator_stop_reason: None,
-            criterion_certificate: None,
-            rho_uncertainty_certificate: None,
-        };
-        let converged = OuterResult {
-            rho: array![2.0],
-            final_value: 5.0,
-            iterations: 1,
-            final_grad_norm: Some(0.0),
-            final_gradient: None,
-            final_hessian: None,
-            converged: true,
-            plan_used: OuterPlan {
-                solver: Solver::Bfgs,
-                hessian_source: HessianSource::BfgsApprox,
-            },
-            operator_trust_radius: None,
-            operator_stop_reason: None,
-            criterion_certificate: None,
-            rho_uncertainty_certificate: None,
-        };
+        );
+        converged.final_grad_norm = Some(0.0);
 
         assert!(candidate_improves_best(&nonconverged_hi, None));
         assert!(candidate_improves_best(
