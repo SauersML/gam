@@ -1252,6 +1252,109 @@ pub fn adjudicate_cross_class_race(
     })
 }
 
+// ===========================================================================
+// Closure-parameter smooth class (#1015): circle ⇄ interval as one estimand
+// ===========================================================================
+
+/// The deterministic closure-parameter grid the smooth-class profiler sweeps.
+///
+/// `γ = 1` is the closed circle, `γ = 0` the interval limit; the grid is dense
+/// near both boundaries (where the Wilks crossing for the one-sided CI lives)
+/// and is a fixed function of nothing but this constant, so the profile — and
+/// thus the reported CI — is reproducible with no data-dependent node placement.
+pub const CLOSURE_GAMMA_GRID: &[f64] = &[
+    0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.98, 1.0,
+];
+
+/// One profiled point of the closure family: the closure value `γ`, the
+/// profiled (θ and λ_smooth optimised) negative-log evidence at that γ, and the
+/// fit handle the caller wants carried for the winner.
+#[derive(Debug, Clone)]
+pub struct ClosureProfilePoint<FitHandle> {
+    pub gamma: f64,
+    pub tk_score: f64,
+    pub fit_handle: FitHandle,
+}
+
+/// The result of profiling the closure parameter inside the smooth class.
+///
+/// The headline is `gamma_hat` with its profile-likelihood CI (a regular Wilks
+/// interval when the optimum is interior; one-sided when it touches a boundary).
+/// `representative` is the γ̂ fit, scored on the SAME TK evidence surface the
+/// discrete race uses, so this single smooth-class entry competes directly with
+/// the non-homotopic candidates (mixture/union) the discrete race retains: the
+/// closure family absorbs the within-smooth-class circle/line grid, it does not
+/// replace the cross-class race.
+#[derive(Debug, Clone)]
+pub struct ClosureSelection<FitHandle> {
+    pub ci: crate::geometry::ClosureProfileCi,
+    pub representative: ClosureProfilePoint<FitHandle>,
+    /// True when the profile pinned γ at the singular cluster boundary — the
+    /// "not a regular smooth 1-D topology" signal that must be routed to the
+    /// #907 mixture/union rung rather than reported as a regular closure.
+    pub route_to_mixture_rung: bool,
+}
+
+/// Profile the closure parameter `γ` over [`CLOSURE_GAMMA_GRID`], returning the
+/// minimiser, its profile-likelihood CI, and the representative fit.
+///
+/// `fit_at_gamma` performs the inner fit at a fixed closure value and returns
+/// `(tk_score, fit_handle)`, where `tk_score` is the profiled
+/// negative-log evidence on the same scale [`tk_normalized_score`] produces (so
+/// γ and λ_smooth must both be optimised inside the closure, per the issue's
+/// confounding contract). Lower score is better. The grid is swept in parallel
+/// via [`run_topology_race_parallel`].
+pub fn profile_closure_within_smooth_class<FitHandle, FitAtGamma>(
+    fit_at_gamma: FitAtGamma,
+    level: f64,
+) -> Result<ClosureSelection<FitHandle>, String>
+where
+    FitHandle: Send,
+    FitAtGamma: Fn(f64) -> Result<(f64, FitHandle), String> + Sync,
+{
+    let gammas: Vec<f64> = CLOSURE_GAMMA_GRID.to_vec();
+    let results = run_topology_race_parallel(gammas.clone(), |gamma| {
+        fit_at_gamma(gamma).map(|(score, handle)| (gamma, score, handle))
+    })?;
+
+    let mut points: Vec<ClosureProfilePoint<FitHandle>> = Vec::with_capacity(results.len());
+    for entry in results {
+        let (gamma, tk_score, fit_handle) = entry.result?;
+        if !tk_score.is_finite() {
+            return Err(format!(
+                "closure profile produced non-finite score at γ={gamma}"
+            ));
+        }
+        points.push(ClosureProfilePoint {
+            gamma,
+            tk_score,
+            fit_handle,
+        });
+    }
+    if points.len() < 2 {
+        return Err("closure profile needs at least two evaluable γ grid points".into());
+    }
+    points.sort_by(|a, b| a.gamma.partial_cmp(&b.gamma).expect("finite γ"));
+
+    let grid: Vec<(f64, f64)> = points.iter().map(|p| (p.gamma, p.tk_score)).collect();
+    let ci = crate::geometry::profile_ci_from_grid(&grid, level)?;
+
+    // Pull the representative γ̂ fit out of the points (the minimiser).
+    let hat_index = points
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.tk_score.partial_cmp(&b.tk_score).expect("finite score"))
+        .map(|(i, _)| i)
+        .expect("non-empty points");
+    let representative = points.swap_remove(hat_index);
+
+    Ok(ClosureSelection {
+        ci,
+        representative,
+        route_to_mixture_rung: ci.singular_boundary,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

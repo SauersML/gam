@@ -2073,9 +2073,17 @@ fn residual_gauge_inner(
 
     let residual_gauge_dim = verdicts.iter().filter(|v| v.unpinned).count();
 
-    // Sym(F)-triviality under OutputFisher provenance.
+    // Sym(F)-triviality under any output-Fisher provenance — same-position
+    // (`OutputFisher`) or downstream-influence (`OutputFisherDownstream`, #980).
+    // Both behaviorally separate the atoms (the downstream metric strictly more,
+    // since it sees far-future coupling the same-position metric misses), so the
+    // permutation subgroup must be trivially pinned under either.
     let sym_f_trivial_under_output_fisher =
-        if matches!(metric_provenance, MetricProvenance::OutputFisher { .. }) {
+        if matches!(
+            metric_provenance,
+            MetricProvenance::OutputFisher { .. }
+                | MetricProvenance::OutputFisherDownstream { .. }
+        ) {
             let any_perm_unpinned = verdicts
                 .iter()
                 .any(|v| v.family == GeneratorFamily::AtomPermutation && v.unpinned);

@@ -4,6 +4,7 @@ pub mod continuation_path;
 pub mod cross_node;
 pub mod estimate;
 pub mod evidence;
+pub mod gauge;
 pub mod gaussian_reml;
 pub mod gpu;
 pub mod identifiability_audit;

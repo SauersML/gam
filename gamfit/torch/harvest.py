@@ -43,9 +43,17 @@ import torch
 __all__ = [
     "HarvestShard",
     "harvest_output_fisher_factors",
+    "harvest_downstream_output_fisher_factors",
     "save_harvest_shard",
     "load_harvest_shard",
 ]
+
+# The provenance tags a harvest shard may carry — the same-position output-Fisher
+# pullback and the #980 forward-looking (downstream KV-path) aggregate. These map
+# one-to-one onto the gam-side `RowMetric` constructors
+# (`output_fisher` / `output_fisher_downstream`); both are gauge-only (they never
+# whiten the likelihood) and feed the lens/gauge/enrichment unchanged.
+_HARVEST_PROVENANCES = frozenset({"output_fisher", "output_fisher_downstream"})
 
 
 # ---------------------------------------------------------------------------
@@ -72,12 +80,24 @@ class HarvestShard:
         output-Fisher mass off the captured top-r subspace.
     rank
         ``r``, the number of factors per row (``U.shape[2]``).
+    provenance
+        Which output-Fisher pullback produced ``U`` (#980). ``"output_fisher"``
+        (the default) is the same-position metric ``G_n = J_nᵀ F_n J_n`` that
+        ``RowMetric::output_fisher`` consumes; ``"output_fisher_downstream"`` is
+        the forward-looking metric ``G_n = Σ_{t≥n} J_{t←n}ᵀ F_t J_{t←n}``
+        aggregated over the future positions ``n`` reaches through the KV path
+        (mechanism 2 of the #980 revision), consumed by
+        ``RowMetric::output_fisher_downstream``. The factor *layout* is identical
+        across both; only the tag (and the science it certifies) differs, so the
+        gauge/lens/enrichment machinery is provenance-generic and consumes either
+        unchanged. Any other value is rejected.
     """
 
     X: Any
     U: Any
     mass_residual: Any
     rank: int
+    provenance: str = "output_fisher"
 
     def __post_init__(self) -> None:
         X = np.asarray(self.X)
@@ -92,6 +112,11 @@ class HarvestShard:
             )
         if mr.shape != (n,):
             raise ValueError(f"mass_residual must be (n,) = ({n},); got shape {mr.shape}")
+        if self.provenance not in _HARVEST_PROVENANCES:
+            raise ValueError(
+                f"provenance must be one of {sorted(_HARVEST_PROVENANCES)}; "
+                f"got {self.provenance!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
