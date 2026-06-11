@@ -62,7 +62,7 @@
 //! Fisher block instead.
 
 use crate::families::custom_family::{
-    BlockwiseFitOptions, ParameterBlockState, fit_custom_family_with_rho_prior,
+    BlockwiseFitOptions, ParameterBlockState, PenaltyMatrix, fit_custom_family_with_rho_prior,
 };
 use crate::families::multinomial_reml::MultinomialFamily;
 use crate::families::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector_glm};
@@ -123,6 +123,16 @@ use std::sync::Arc;
 /// `MultinomialSeparationDetected` diagnostic for the path that has no proper
 /// prior to lean on.
 const MULTINOMIAL_FORMULA_RIDGE_FLOOR: f64 = 1.0e-4;
+
+/// Formula-adapter penalty calibration for multinomial softmax REML.
+///
+/// The term builder's normalized penalties are calibrated on single-response
+/// Gaussian-style score curvature. A reference-coded softmax class block sees
+/// smaller per-row Fisher curvature (`p_a(1-p_a)` with cross-class coupling), so
+/// the same physical penalty scale over-shrinks when the REML surface drives rho
+/// to the effective-df cap. Scaling the adapter's penalty matrices preserves the
+/// selected penalty directions while matching the softmax likelihood curvature.
+const MULTINOMIAL_FORMULA_PENALTY_SCALE: f64 = 0.5;
 
 /// Largest smoothing-parameter dimension where exact dense outer curvature is
 /// still worth paying for multinomial formula fits.
@@ -602,6 +612,35 @@ fn build_formula_design_for_multinomial(
     Ok((spec, design, y_col, parsed.response, y_kind))
 }
 
+fn scale_multinomial_formula_penalty(penalty: PenaltyMatrix) -> PenaltyMatrix {
+    match penalty {
+        PenaltyMatrix::Dense(matrix) => {
+            PenaltyMatrix::Dense(matrix.mapv(|v| v * MULTINOMIAL_FORMULA_PENALTY_SCALE))
+        }
+        PenaltyMatrix::KroneckerFactored { left, right } => PenaltyMatrix::KroneckerFactored {
+            left: left.mapv(|v| v * MULTINOMIAL_FORMULA_PENALTY_SCALE),
+            right,
+        },
+        PenaltyMatrix::Blockwise {
+            local,
+            col_range,
+            total_dim,
+        } => PenaltyMatrix::Blockwise {
+            local: local.mapv(|v| v * MULTINOMIAL_FORMULA_PENALTY_SCALE),
+            col_range,
+            total_dim,
+        },
+        PenaltyMatrix::Labeled { label, inner } => PenaltyMatrix::Labeled {
+            label,
+            inner: Box::new(scale_multinomial_formula_penalty(*inner)),
+        },
+        PenaltyMatrix::Fixed { log_lambda, inner } => PenaltyMatrix::Fixed {
+            log_lambda,
+            inner: Box::new(scale_multinomial_formula_penalty(*inner)),
+        },
+    }
+}
+
 /// Top-level formula-driven multinomial fit.
 ///
 /// Routes through [`fit_custom_family_with_rho_prior`] so the per-active-class
@@ -670,7 +709,11 @@ pub fn fit_penalized_multinomial_formula(
     // behaviour) forced a single λ per class that scales `Σ_t S_t`, so one
     // shared λ had to over-smooth a rough term while under-smoothing a smooth
     // one — biasing any multi-term class-probability surface.
-    let per_term_penalties = design.penalties_as_penalty_matrix();
+    let per_term_penalties = design
+        .penalties_as_penalty_matrix()
+        .into_iter()
+        .map(scale_multinomial_formula_penalty)
+        .collect();
     let per_term_nullspace_dims = design.nullspace_dims.clone();
     let k = y_one_hot.ncols();
     let m = k - 1;
