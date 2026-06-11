@@ -60,6 +60,32 @@ def _tile_circle_line(rng):
     return x, dict(K=2, d_atom=[1, 1], atom_topology=["circle", "euclidean"]), np.repeat([0, 1], n)
 
 
+def _tile_three_shapes(rng):
+    n = 130
+    t = rng.uniform(0, 2 * np.pi, n)
+    circ = np.column_stack([np.cos(t) - 2.2, np.sin(t)])
+    s = rng.uniform(-1.2, 1.2, n)
+    line = np.column_stack([0.4 * s, 0.9 * s - 1.6])
+    u = rng.uniform(-1.1, 1.1, n)
+    par = np.column_stack([u + 2.2, 0.9 * u * u - 0.4])
+    x = np.vstack([circ, line, par]) + 0.05 * rng.standard_normal((3 * n, 2))
+    return (
+        x,
+        dict(K=3, d_atom=[1, 1, 1], atom_topology=["circle", "euclidean", "euclidean"]),
+        np.repeat([0, 1, 2], n),
+    )
+
+
+def _tile_intersecting(rng):
+    n = 160
+    t = rng.uniform(0, 2 * np.pi, n)
+    circ = np.column_stack([np.cos(t), np.sin(t)])
+    s = rng.uniform(-1.8, 1.8, n)
+    line = np.column_stack([s, 0.35 * s])  # passes through the circle
+    x = np.vstack([circ, line]) + 0.04 * rng.standard_normal((2 * n, 2))
+    return x, dict(K=2, d_atom=[1, 1], atom_topology=["circle", "euclidean"]), np.repeat([0, 1], n)
+
+
 def _tile_tiny_n(rng):
     t = rng.uniform(0, 2 * np.pi, 40)
     x = np.column_stack([np.cos(t), np.sin(t)]) + 0.05 * rng.standard_normal((40, 2))
@@ -79,6 +105,8 @@ TILES = [
     ("parabola", _tile_parabola),
     ("two circles, K=2", _tile_two_circles),
     ("circle + line, K=2", _tile_circle_line),
+    ("circle + line + parabola, K=3", _tile_three_shapes),
+    ("line THROUGH circle, K=2", _tile_intersecting),
     ("circle, n=40", _tile_tiny_n),
     ("circle, heavy noise", _tile_high_noise),
 ]
@@ -145,7 +173,12 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 4, figsize=(18, 9))
+    n_tiles = len(TILES)
+    n_cols = 5
+    n_rows = (n_tiles + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 4.5 * n_rows))
+    for ax in axes.ravel()[n_tiles:]:
+        ax.set_visible(False)
     for ax, (name, _) in zip(axes.ravel(), TILES):
         print(f"[atlas] {name} ...", flush=True)
         res = run_tile(name, args.seed, args.timeout)
