@@ -398,6 +398,14 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// drives the row kernel through a non-cell path, or when the estimated
     /// resident bytes would exceed the active resource policy budget.
     pub(super) row_cell_moments: Option<RowCellMomentsBundle>,
+    /// Certified Chebyshev cell-moment family forest for the current β
+    /// snapshot (#979 Stage C). Built when the FLEX path is active on the
+    /// standard-normal latent measure and the row-cell-moments bundle was
+    /// refused by the resource budget — i.e. exactly the large-n regime
+    /// where every row evaluation otherwise re-runs ladder quadrature per
+    /// cell. Rows/cells without a certified family fall back to the ladder
+    /// unchanged.
+    pub(super) cell_family_forest: Option<crate::families::cell_moment_family::CellFamilyForest>,
     /// Lazily-built degree-15 bundle for outer dH (1st-derivative of Hessian)
     /// trace paths. Only populated when those paths actually execute.
     /// `RayonSafeOnce` keeps lazy initialization safe from parallel row passes.

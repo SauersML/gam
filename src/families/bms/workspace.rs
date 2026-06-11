@@ -3121,12 +3121,23 @@ impl BernoulliMarginalSlopeFamily {
         let row_cell_started = std::time::Instant::now();
         let row_cell_moments =
             self.build_row_cell_moments_bundle(block_states, &row_contexts, 9, row_cell_mask)?;
+        // #979 Stage C: when the dense bundle was refused (the large-n
+        // regime), build the certified Chebyshev cell-moment family forest
+        // instead — O(leaves × combos × m²) ladder evaluations once per β,
+        // then transcendental-free per-row moment lookups with per-cell
+        // ladder fallback.
+        let cell_family_forest = if row_cell_moments.is_none() {
+            self.build_cell_family_forest(block_states, &row_contexts)?
+        } else {
+            None
+        };
         if log_exact_work(n) {
             log::info!(
-                "[BMS exact-cache] row-cell phase done n={} selected_rows={} built={} elapsed={:.3}s",
+                "[BMS exact-cache] row-cell phase done n={} selected_rows={} built={} forest={} elapsed={:.3}s",
                 n,
                 row_cell_mask.map_or(n, <[usize]>::len),
                 row_cell_moments.is_some(),
+                cell_family_forest.is_some(),
                 row_cell_started.elapsed().as_secs_f64()
             );
             log::info!(
@@ -3144,6 +3155,7 @@ impl BernoulliMarginalSlopeFamily {
             primary,
             row_contexts,
             row_cell_moments,
+            cell_family_forest,
             row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
             row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
             row_primary_hessians: RowPrimaryEvalCache::Empty,
@@ -3152,6 +3164,112 @@ impl BernoulliMarginalSlopeFamily {
             flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
             flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
         })
+    }
+
+    /// Build the certified Chebyshev cell-moment family forest for the
+    /// current β snapshot (#979 Stage C). `None` (never an error) when the
+    /// FLEX path is inactive, the latent measure is non-standard-normal,
+    /// there are no deviation breakpoints, or the forest partition fails —
+    /// every caller falls back to direct ladder quadrature per cell, so a
+    /// missing forest is a performance regression only, never a numerical
+    /// one.
+    fn build_cell_family_forest(
+        &self,
+        block_states: &[ParameterBlockState],
+        row_contexts: &[BernoulliMarginalSlopeRowExactContext],
+    ) -> Result<Option<crate::families::cell_moment_family::CellFamilyForest>, String> {
+        use crate::families::cell_moment_family::{
+            CellFamilyForest, CellMomentFamilySpec, ComboKey,
+        };
+        if !self.effective_flex_active(block_states)? {
+            return Ok(None);
+        }
+        if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
+            return Ok(None);
+        }
+        let n = self.y.len();
+        if row_contexts.len() != n {
+            return Ok(None);
+        }
+        let score_breaks: Vec<f64> = self
+            .score_warp
+            .as_ref()
+            .map(|runtime| runtime.breakpoints().to_vec())
+            .unwrap_or_default();
+        let link_breaks: Vec<f64> = self
+            .link_dev
+            .as_ref()
+            .map(|runtime| runtime.breakpoints().to_vec())
+            .unwrap_or_default();
+        if score_breaks.is_empty() && link_breaks.is_empty() {
+            return Ok(None);
+        }
+        let beta_h = self.score_beta(block_states)?;
+        let beta_w = self.link_beta(block_states)?;
+        let mut a_rows = vec![0.0_f64; n];
+        let mut b_rows = vec![0.0_f64; n];
+        for row in 0..n {
+            a_rows[row] = row_contexts[row].intercept;
+            b_rows[row] = block_states[1].eta[row];
+        }
+        // Subsampled cache builds leave unselected rows at NaN intercepts;
+        // the forest requires finite coordinates, so skip the forest rather
+        // than poison the partition (those builds are small by design).
+        if a_rows.iter().any(|v| !v.is_finite()) || b_rows.iter().any(|v| !v.is_finite()) {
+            return Ok(None);
+        }
+        let started = std::time::Instant::now();
+        let mut forest = match CellFamilyForest::partition(
+            &a_rows,
+            &b_rows,
+            &score_breaks,
+            &link_breaks,
+        ) {
+            Ok(forest) => forest,
+            Err(reason) => {
+                log::debug!("[BMS cell-family-forest] partition skipped: {reason}");
+                return Ok(None);
+            }
+        };
+        // Demand pass: every row's interior finite cells, keyed by combo.
+        // Tail (semi-infinite) cells keep their closed-form affine anchors —
+        // interpolating them would be slower than the closed form.
+        let demands: Vec<(usize, ComboKey, CellMomentFamilySpec)> = (0..n)
+            .into_par_iter()
+            .map(|row| -> Result<Vec<_>, String> {
+                let cells =
+                    self.denested_partition_cells(a_rows[row], b_rows[row], beta_h, beta_w)?;
+                Ok(cells
+                    .into_iter()
+                    .filter(|pc| pc.cell.left.is_finite() && pc.cell.right.is_finite())
+                    .map(|pc| {
+                        (
+                            row,
+                            ComboKey::new(pc.score_span, pc.link_span, pc.left_edge, pc.right_edge),
+                            CellMomentFamilySpec {
+                                score_span: pc.score_span,
+                                link_span: pc.link_span,
+                                left: pc.left_edge,
+                                right: pc.right_edge,
+                                max_degree: 9,
+                            },
+                        )
+                    })
+                    .collect())
+            })
+            .try_reduce(Vec::new, |mut left, right| {
+                left.extend(right);
+                Ok(left)
+            })?;
+        forest.build_families(demands);
+        log::info!(
+            "[BMS cell-family-forest] built n={} leaves={} eligible={} elapsed={:.3}s",
+            n,
+            forest.total_leaves(),
+            forest.eligible_leaves(),
+            started.elapsed().as_secs_f64(),
+        );
+        Ok(Some(forest))
     }
 
     /// Build a top-of-cycle [`RowCellMomentsBundle`] at the given
@@ -4492,6 +4610,7 @@ impl BernoulliMarginalSlopeFamily {
                     &cache.primary,
                     row_ctx,
                     row_moments,
+                    cache.cell_family_forest.as_ref(),
                     true,
                     &mut scratch,
                 )?;
@@ -4956,6 +5075,7 @@ impl BernoulliMarginalSlopeFamily {
                 block_states,
                 primary,
                 row_ctx,
+                None,
                 true,
                 &mut scratch,
             )?;
@@ -5002,6 +5122,7 @@ impl BernoulliMarginalSlopeFamily {
                 primary,
                 row_ctx,
                 row_moments,
+                cache.cell_family_forest.as_ref(),
                 false,
                 &mut scratch,
             )?;
@@ -5018,6 +5139,7 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         primary: &PrimarySlices,
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        family_forest: Option<&crate::families::cell_moment_family::CellFamilyForest>,
         need_hessian: bool,
         scratch: &mut BernoulliMarginalSlopeFlexRowScratch,
     ) -> Result<f64, String> {
@@ -5027,6 +5149,7 @@ impl BernoulliMarginalSlopeFamily {
             primary,
             row_ctx,
             None,
+            family_forest,
             need_hessian,
             scratch,
         )
@@ -5039,6 +5162,7 @@ impl BernoulliMarginalSlopeFamily {
         primary: &PrimarySlices,
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         row_cell_moments: Option<&[CachedDenestedCellMoments]>,
+        family_forest: Option<&crate::families::cell_moment_family::CellFamilyForest>,
         need_hessian: bool,
         scratch: &mut BernoulliMarginalSlopeFlexRowScratch,
     ) -> Result<f64, String> {
@@ -5055,6 +5179,7 @@ impl BernoulliMarginalSlopeFamily {
             beta_w,
             row_ctx,
             row_cell_moments,
+            family_forest,
             need_hessian,
             scratch,
         )
@@ -5070,6 +5195,7 @@ impl BernoulliMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         row_cell_moments: Option<&[CachedDenestedCellMoments]>,
+        family_forest: Option<&crate::families::cell_moment_family::CellFamilyForest>,
         need_hessian: bool,
         scratch: &mut BernoulliMarginalSlopeFlexRowScratch,
     ) -> Result<f64, String> {
@@ -5278,6 +5404,34 @@ impl BernoulliMarginalSlopeFamily {
                     .into_iter()
                     .map(|partition_cell| {
                         let degree = if need_hessian { 9 } else { 3 };
+                        // #979 Stage C: certified Chebyshev family lookup
+                        // first — transcendental-free when this row's leaf
+                        // certified this cell combo; ladder fallback
+                        // otherwise. Families are built at degree 9, which
+                        // covers both the gradient (3) and Hessian (9)
+                        // consumers.
+                        if let Some(forest) = family_forest
+                            && partition_cell.cell.left.is_finite()
+                            && partition_cell.cell.right.is_finite()
+                        {
+                            let key = crate::families::cell_moment_family::ComboKey::new(
+                                partition_cell.score_span,
+                                partition_cell.link_span,
+                                partition_cell.left_edge,
+                                partition_cell.right_edge,
+                            );
+                            let mut family_moments = [0.0_f64; 10];
+                            if forest
+                                .moments_into(row, key, a, b, &mut family_moments)
+                                .is_some()
+                            {
+                                let state = exact::CellDerivativeMomentState {
+                                    branch: exact::branch_cell(partition_cell.cell)?,
+                                    moments: exact::CellMomentVec::from_slice(&family_moments),
+                                };
+                                return Ok((partition_cell, std::borrow::Cow::Owned(state)));
+                            }
+                        }
                         self.evaluate_cell_derivative_moments_lru(partition_cell.cell, degree)
                             .map(|state| (partition_cell, std::borrow::Cow::Owned(state)))
                     })
@@ -9303,6 +9457,7 @@ impl BernoulliMarginalSlopeFamily {
                                     primary,
                                     row_ctx,
                                     row_moments,
+                                    cache.cell_family_forest.as_ref(),
                                     true,
                                     &mut scratch,
                                 )?;
@@ -9517,6 +9672,7 @@ impl BernoulliMarginalSlopeFamily {
                                     primary,
                                     row_ctx,
                                     row_moments,
+                                    cache.cell_family_forest.as_ref(),
                                     cached_hess.is_none(),
                                     &mut scratch,
                                 )?;
@@ -9808,6 +9964,7 @@ impl BernoulliMarginalSlopeFamily {
                         primary,
                         row_ctx,
                         row_moments,
+                        cache.cell_family_forest.as_ref(),
                         false,
                         &mut scratch,
                     )?;
@@ -10259,6 +10416,7 @@ impl BernoulliMarginalSlopeFamily {
                                     primary,
                                     row_ctx,
                                     row_moments,
+                                    cache.cell_family_forest.as_ref(),
                                     true,
                                     &mut scratch,
                                 )?;
@@ -10787,6 +10945,7 @@ impl BernoulliMarginalSlopeFamily {
                                 primary,
                                 row_ctx,
                                 row_moments,
+                                cache.cell_family_forest.as_ref(),
                                 true,
                                 &mut scratch,
                             )?;
@@ -13260,6 +13419,7 @@ impl BernoulliMarginalSlopeFamily {
                                 &primary,
                                 row_ctx,
                                 row_moments,
+                                cache.cell_family_forest.as_ref(),
                                 true,
                                 &mut scratch,
                             )?;
