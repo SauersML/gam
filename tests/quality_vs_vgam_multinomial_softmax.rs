@@ -13,35 +13,24 @@
 //! TRUTH in an absolute, tool-independent sense. We additionally assert the
 //! simplex STRUCTURE directly (every row sums to 1, every entry in [0,1]).
 //!
-//! DATA-ADAPTIVE BASELINE TO MATCH-OR-BEAT (#715). The fair like-for-like
-//! comparator is a multinomial GAM that ALSO estimates its smoothing from the
-//! data, exactly as gam does. We use mgcv's `gam(..., family = multinom(K = 2))`,
-//! whose per-smooth smoothing parameters are selected by REML (the same data-
-//! adaptive criterion gam minimises), fit it on the same rows / same gauge, score
-//! ITS error against the SAME true surface, and assert
-//!     RMSE(P_gam, P_true)  <=  RMSE(P_mgcv, P_true) * 1.05
-//! so gam recovers the truth at least as accurately (within a tight 5%) as the
-//! mature data-adaptive reference. This is the principled #715 re-grounding:
-//! VGAM's `vgam(s(x))` uses a FIXED df = 4 smoothing-spline backfit, not a
-//! data-adaptive selection. This synthetic truth (a cubic in x1, a sigmoid in
-//! x2) happens to sit almost exactly at df ≈ 4, so VGAM's fixed df lands on the
-//! optimum with ZERO df-selection variance — a single-draw cherry-picked
-//! coincidence, not a quality margin. Penalising gam's unbiased REML for the df
-//! sampling variance it pays to ESTIMATE that df (which VGAM is simply handed)
-//! measures luck, not accuracy. Against the like-for-like REML reference
-//! (mgcv multinom), which pays the same df-estimation cost, gam's adaptive
-//! per-(class, term) λ wins. VGAM's fixed-df RMSE is still computed and printed
-//! for context (to document its luck) but is NOT a pass criterion.
+//! MATCH-OR-BEAT BASELINE (#715). VGAM's fixed-df multinomial backfit is a
+//! mature external implementation of the same softmax surface class used by this
+//! test. gam is allowed a 10% slack because it estimates smoothing parameters
+//! from one sampled label draw, but it must not over-shrink the smooths enough to
+//! trail VGAM materially:
+//!     RMSE(P_gam, P_true)  <=  RMSE(P_vgam, P_true) * 1.10
+//! The assertion is intentionally against the known truth, not against VGAM's
+//! fitted probabilities.
 //!
 //! A SECOND arm (`..._heterogeneous_smoothness`) makes gam's advantage explicit:
 //! the two smooth terms have GENUINELY different roughness (one wiggly df ≈ 8,
 //! one near-linear df ≈ 2), so NO single fixed df can fit both — gam's
 //! per-(class, term) REML must, and does, beat a fixed-df backfit there outright.
 //!
-//! Reference tools: `mgcv::gam(..., family = multinom())` (data-adaptive REML,
-//! the match-or-beat criterion) and `VGAM::vgam(..., family = multinomial())`
-//! (fixed df = 4, printed context only). We pin both tools' factor levels to
-//! gam's `class_levels` order so all probability columns line up with the truth.
+//! Reference tools: `VGAM::vgam(..., family = multinomial())` for the
+//! match-or-beat criterion and `mgcv::gam(..., family = multinom())` as printed
+//! context. We pin factor levels to gam's `class_levels` order so all probability
+//! columns line up with the truth.
 
 use csv::StringRecord;
 use gam::families::multinomial::{fit_penalized_multinomial_formula, predict_multinomial_formula};
@@ -322,16 +311,15 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
         "gam does not recover the true class-probability surface: \
          RMSE(P_gam, P_true)={gam_err:.5} > bar={PROB_RMSE_BAR}"
     );
-    // MATCH-OR-BEAT the DATA-ADAPTIVE reference (#715). mgcv multinom selects its
-    // smoothing by REML — the same df-estimation cost gam pays — so this is the
-    // fair, like-for-like accuracy comparison (unlike VGAM's fixed df = 4, which
-    // is handed the truth's df for free). gam's per-(class, term) λ must be at
-    // least as accurate (within a tight 5%) as mgcv's REML on the true surface.
+    // MATCH-OR-BEAT VGAM (#715). The absolute bar above proves gam recovered the
+    // true simplex; this head-to-head catches over-shrunk smoothing parameters
+    // that still pass the absolute threshold but lose to a mature multinomial
+    // backfit on the same sampled rows.
     assert!(
-        gam_err <= mgcv_err * 1.05,
-        "gam is less accurate than the data-adaptive mgcv multinom REML reference \
-         against the truth: gam_RMSE={gam_err:.5} mgcv_REML_RMSE={mgcv_err:.5} \
-         (allowed gam <= 1.05*mgcv). VGAM fixed-df context: vgam_RMSE={vg_err:.5}"
+        gam_err <= vg_err * 1.10,
+        "gam is less accurate than VGAM against the truth: \
+         gam_RMSE={gam_err:.5} vgam_RMSE={vg_err:.5} \
+         (allowed gam <= 1.10*vgam). mgcv REML context: mgcv_RMSE={mgcv_err:.5}"
     );
 
     // ---- #561: independent smoothing parameter per (smooth term, class) -----
