@@ -386,49 +386,49 @@ fn frame_factored_evidence_matches_full_b_at_small_p() {
         "profiled Grassmann dims must be counted for the evidence normalizer"
     );
 
-    // --- Evidence consistency at a FIXED smoothness λ = 1 (log λ = 0).
+    // --- Evidence consistency at a FIXED smoothness λ (re-derived for the
+    //     WIRED factored border solve, #999 option A).
     //
-    // The criterion is `V = data_fit + ½ log|H| − occam`. The reconstruction
-    // data-fit and log-det are assembled on the FULL decoder in both arms (the
-    // frame profiles the border representation but never enters the assembly).
-    // The ONLY frame-dependent term is the occam normalizer's frame-dimension
-    // contribution `½·grassmann_dim·log λ`, which VANISHES at log λ = 0. So at
-    // a fixed log λ = 0 a correct framed path must reproduce the full-B
-    // criterion to round-off; a gap means the factored representation leaked
-    // into the data-fit/log-det or the dimension accounting drifted (the
-    // desync class this guards). (Note: at the *optimized* λ ≠ 1 the two
-    // criteria correctly DIFFER by that occam term — equality is a fixed-λ=0
-    // property, not an optimized-fit property.)
+    // The criterion is `V = data_fit + penalty + ½ log|H| − occam`. The factored
+    // border solve IS now wired into the assembly (#977 T1): when a frame is
+    // active, `assemble_arrow_schur` rebuilds the β-tier in the reduced `Σ M_k·r_k`
+    // coordinate space, so `½ log|H|` is the log-det of the FACTORED border, NOT
+    // the full `M·p` one. The framed and full-B log-dets therefore genuinely
+    // differ; the test must compare them against the occam accounting, not assume
+    // they are equal. Working out Δ(log λ) = V_framed − V_full term by term, with
+    // the decoder confined to the frame (`B_k = C_k U_kᵀ`, `U_kᵀU_k = I_{r_k}`):
     //
-    // We first drive the term to a PD inner basin through the engine, then
-    // evaluate the criterion at FIXED log λ values on both representations
-    // (re-solving the inner state from the converged decoder stays PD). Working
-    // out the difference Δ(log λ) = V_framed − V_full from the criterion
-    // `V = data_fit + penalty + ½ log|H| − occam`:
-    //
-    //   * data_fit, penalty value, and ½ log|H| are assembled on the full
-    //     decoder in BOTH arms (the frame never enters `assemble_arrow_schur`),
-    //     and the inner re-fit at a given λ is frame-independent, so all three
-    //     are identical across arms at every λ.
-    //   * the only frame-dependent term is the occam normalizer:
-    //       occam_full   = ½ logλ · Σ_k p·rank(S_k)
+    //   * data_fit is frame-invariant: the reconstruction `Φ_k B_k = Φ_k C_k U_kᵀ`
+    //     only ever sees the in-frame coordinates, identical in both arms.
+    //   * penalty energy is frame-invariant: `½ λ tr(B_kᵀ S_k B_k)
+    //     = ½ λ tr(C_kᵀ S_k C_k U_kᵀU_k) = ½ λ tr(C_kᵀ S_k C_k)`.
+    //   * the log-dets DIFFER. The full-B Hessian splits into the in-frame
+    //     `Σ M_k·r_k` block (= the factored Hessian, since data + the
+    //     `λ S_k ⊗ I_{r_k}` penalty live there) and the orthogonal complement of
+    //     `Σ M_k·(p−r_k)` directions, which carry ONLY the penalty
+    //     `λ S_k ⊗ I_{p−r_k}` (the data is blind to them). Hence
+    //       log|H_full| − log|H_framed| = Σ_k (p−r_k)·[ rank(S_k)·logλ + logdet⁺(S_k) ].
+    //   * the occam normalizer:
+    //       occam_full   = ½ logλ · Σ_k p·rank(S_k)        (r=p, no frame term)
     //       occam_framed = ½ logλ · Σ_k r_k·rank(S_k) − ½ logλ · Σ_k r_k(p−r_k)
-    //     so V = … − occam gives
-    //       Δ(logλ) = occam_full − occam_framed
-    //               = ½ logλ · [ Σ_k (p−r_k)·rank(S_k) + Σ_k r_k(p−r_k) ]
-    //               = C · logλ,  with C > 0.
     //
-    // Hence Δ is EXACTLY linear in log λ and passes through 0: Δ(0)=0,
-    // Δ(2)=2·Δ(1), Δ(1)>0. This pins that the frame's sole criterion effect is
-    // the documented Grassmann-dimension accounting term — a leak of the
-    // factored representation into the data-fit / log-det, or a drift in
-    // `grassmann_evidence_dimension`/`reml_occam_term`, breaks the linearity or
-    // the Δ(0)=0 anchor. (At the *optimized* λ̂ the two criteria correctly
-    // DIFFER by C·logλ̂; equality is a fixed-λ=0 property, not a fit property.
-    // NOTE: this Δ is a pure normalizer term because the factored border solve
-    // is not yet wired into the assembly — see the companion issue. When it
-    // lands, the data-fit/log-det arms diverge too and these assertions must be
-    // re-derived against the factored log-det.)
+    // Assembling `Δ = ½(log|H_framed| − log|H_full|) − (occam_framed − occam_full)`,
+    // the `(p−r_k)·rank(S_k)·logλ` log-det terms cancel EXACTLY against the
+    // matching occam terms (this cancellation is the whole point of option A — the
+    // reduced penalty channel count is the log-det's missing complement), leaving
+    //
+    //       Δ(logλ) = ½ logλ · [ Σ_k r_k(p−r_k) ]  −  ½ Σ_k (p−r_k)·logdet⁺(S_k).
+    //                 \_____ slope = ½·grassmann_dim _____/   \__ constant offset __/
+    //
+    // So Δ is AFFINE in log λ with slope ½·grassmann_dim (> 0) and a constant
+    // offset set by the penalty spectrum. For THIS fixture the smooth penalty is
+    // `S_k = I_M` (see `build_small_term`), so `logdet⁺(S_k) = log det I = 0` and
+    // the offset vanishes: Δ(0) = 0, Δ(1) > 0, Δ(2) = 2·Δ(1). (With a non-identity
+    // penalty the offset is nonzero and the robust invariants become the affine
+    // ones below: zero SECOND difference and slope = ½·grassmann_dim.) A leak of
+    // the factored representation into the data-fit / penalty energy, or a drift
+    // in `grassmann_evidence_dimension`/`reml_occam_term`, breaks the affinity or
+    // moves the offset off 0.
     let (converged, _) = fit_via_engine(base.clone(), &z, "frame battery seed fit");
 
     // Evaluate (V_full, V_framed) at a fixed smoothness log λ, re-solving each
@@ -475,36 +475,61 @@ fn frame_factored_evidence_matches_full_b_at_small_p() {
     let d1 = vfr1 - vf1;
     let d2 = vfr2 - vf2;
     let scale = vf0.abs().max(1.0);
+    // The re-derived option-A slope: Δ(logλ) = ½·grassmann_dim·logλ + offset, so
+    // the per-unit-logλ slope must equal exactly ½·grassmann_dim. We read the
+    // dimension off the framed arm (re-activate frames on a converged clone).
+    let grassmann_dim = {
+        let mut framed = converged.clone();
+        for atom in &mut framed.atoms {
+            atom.maybe_activate_decoder_frame().expect("activate");
+        }
+        framed.grassmann_evidence_dimension()
+    };
+    let expected_slope = 0.5 * grassmann_dim as f64;
+    let measured_slope = d1 - d0; // first difference = slope (Δ is affine in logλ)
     println!(
         "evidence: V_full(0)={vf0:.8} V_framed(0)={vfr0:.8} | \
-         Δ(0)={d0:.3e} Δ(1)={d1:.6} Δ(2)={d2:.6}  (Δ(2)/Δ(1)={:.6})",
-        d2 / d1
+         Δ(0)={d0:.3e} Δ(1)={d1:.6} Δ(2)={d2:.6}  slope={measured_slope:.6} \
+         (expected ½·grassmann_dim={expected_slope:.6}, grassmann_dim={grassmann_dim})"
     );
 
-    // (a) Δ(0) = 0: at log λ = 0 the occam term vanishes, so the framed and
-    //     full-B criteria must agree to round-off. A gap means the factored
-    //     representation leaked into the data-fit / log-det.
+    // (a) AFFINITY: Δ is affine in log λ, so the second difference vanishes:
+    //     Δ(2) − 2·Δ(1) + Δ(0) = 0. This is the fundamental option-A invariant and
+    //     holds for ANY penalty spectrum (the constant offset and the linear slope
+    //     both cancel from the second difference). A nonzero second difference is a
+    //     λ-nonlinear leak of the factored representation into the data-fit / penalty.
+    let second_diff = d2 - 2.0 * d1 + d0;
+    assert!(
+        second_diff.abs() <= 1.0e-6 * d1.abs().max(scale),
+        "EVIDENCE DRIFT: second difference Δ(2)−2Δ(1)+Δ(0) = {second_diff:.3e} must be \
+         ~0 — Δ(logλ) is not affine in log λ; the factored representation leaked into a \
+         λ-nonlinear quantity (data-fit / penalty energy)"
+    );
+    // (b) SLOPE = ½·grassmann_dim: the affine slope is exactly the profiled-frame
+    //     dimension term. This is the sharp option-A check — it ties the measured
+    //     criterion slope to `grassmann_evidence_dimension()` and verifies the
+    //     `(p−r_k)·rank(S_k)·logλ` log-det/occam cancellation actually happened (a
+    //     drift in either reml_occam_term or the factored log-det moves the slope).
+    assert!(
+        grassmann_dim > 0,
+        "profiled Grassmann dims must be counted (grassmann_dim = {grassmann_dim})"
+    );
+    assert!(
+        (measured_slope - expected_slope).abs() <= 1.0e-6 * expected_slope.max(scale),
+        "EVIDENCE DRIFT: criterion slope in log λ = {measured_slope:.6} ≠ \
+         ½·grassmann_dim = {expected_slope:.6} — the Grassmann-dimension accounting \
+         and the factored log-det are out of sync (the desync class #999 guards)"
+    );
+    // (c) OFFSET = 0 for THIS fixture: the smooth penalty is `S_k = I_M`, so
+    //     `logdet⁺(S_k) = 0` and the constant offset −½ Σ_k (p−r_k)·logdet⁺(S_k)
+    //     vanishes ⇒ Δ(0) = 0. (For a non-identity penalty this would be the
+    //     nonzero offset; here it pins that the in-frame block IS the full data +
+    //     identity-penalty curvature with nothing else leaking at log λ = 0.)
     assert!(
         d0.abs() <= 1.0e-6 * scale,
-        "EVIDENCE DRIFT: Δ(0) = {d0:.3e} (rel {:.3e}) must be ~0 — frame activation \
-         perturbed the data-fit / log-det at log λ = 0",
+        "EVIDENCE DRIFT: Δ(0) = {d0:.3e} (rel {:.3e}) must be ~0 for the identity-penalty \
+         fixture — frame activation perturbed the data-fit / penalty energy at log λ = 0",
         d0.abs() / scale
-    );
-    // (b) Δ(1) > 0: the Grassmann-dimension accounting is actually engaged
-    //     (C > 0), not silently dropped.
-    assert!(
-        d1 > 1.0e-6 * scale,
-        "EVIDENCE: Δ(1) = {d1:.3e} must be strictly positive — the profiled-frame \
-         dimension term is not entering reml_occam_term"
-    );
-    // (c) Δ(2) = 2·Δ(1): the frame's only effect is the term LINEAR in log λ.
-    //     Any nonlinearity is a leak of the factored representation into a
-    //     λ-nonlinear quantity (data-fit / log-det).
-    assert!(
-        (d2 - 2.0 * d1).abs() <= 1.0e-6 * d1.abs().max(scale),
-        "EVIDENCE DRIFT: Δ(2) = {d2:.6} ≠ 2·Δ(1) = {:.6} — the frame's criterion \
-         effect is not the pure linear Grassmann-dimension accounting term",
-        2.0 * d1
     );
 }
 
