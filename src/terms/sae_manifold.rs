@@ -11233,6 +11233,147 @@ impl SaeManifoldTerm {
         &self.collapse_events
     }
 
+    /// Set the curvature-homotopy dial `η ∈ [0, 1]` on every atom (#1007). At
+    /// the default `η = 1` the basis is the full curved basis; `η = 0` is the
+    /// linear (Eckart-Young) relaxation. The next `refresh_basis` — which every
+    /// joint-fit entry point runs — installs the dialed basis, so the dial takes
+    /// effect on the following corrector solve. Errors on a non-finite or
+    /// out-of-range `η`.
+    pub fn set_homotopy_eta(&mut self, eta: f64) -> Result<(), String> {
+        if !(eta.is_finite() && (0.0..=1.0).contains(&eta)) {
+            return Err(format!(
+                "SaeManifoldTerm::set_homotopy_eta: η must be finite in [0, 1]; got {eta}"
+            ));
+        }
+        for atom in &mut self.atoms {
+            atom.homotopy_eta = eta;
+        }
+        Ok(())
+    }
+
+    /// The most recent curvature-homotopy entry walk outcome (#1007), or `None`
+    /// when no walk has run on this term. Read off the fitted term so the
+    /// arrival / bifurcation / collapse outcome is observable.
+    pub fn curvature_walk_report(&self) -> Option<&CurvatureWalkReport> {
+        self.curvature_walk_report.as_ref()
+    }
+
+    /// Record the curvature-homotopy walk outcome on the fit payload (#1007).
+    pub fn set_curvature_walk_report(&mut self, report: CurvatureWalkReport) {
+        self.curvature_walk_report = Some(report);
+    }
+
+    /// Per-row reconstruction residual `r_i = fitted_i − z_i` of the current
+    /// `(gates, coords, decoder)` state against `target`, in the term's native
+    /// `(n, p)` layout. The curvature-homotopy predictor (#1007) contracts this
+    /// against `∂Φ/∂η` to form the data-fit half of `∂g_β/∂η`.
+    fn reconstruction_residual(&self, target: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        let fitted = self.try_fitted()?;
+        if fitted.dim() != target.dim() {
+            return Err(format!(
+                "SaeManifoldTerm::reconstruction_residual: fitted {:?} != target {:?}",
+                fitted.dim(),
+                target.dim()
+            ));
+        }
+        Ok(&fitted - &target)
+    }
+
+    /// Per-atom curved-column basis derivative `∂Φ^η/∂η` (#1007): the raw
+    /// (un-dialed) basis on each evaluator's *curved* columns and zero on the
+    /// linear columns and on caller-managed atoms (no evaluator → no split).
+    /// This is the η-independent derivative channel, so it is exact at any
+    /// current `η`.
+    fn curvature_basis_eta_derivatives(&self) -> Result<Vec<Array2<f64>>, String> {
+        let n = self.n_obs();
+        let mut out = Vec::with_capacity(self.k_atoms());
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let m = atom.basis_size();
+            let mut d = Array2::<f64>::zeros((n, m));
+            if let Some(evaluator) = atom.basis_evaluator.as_ref() {
+                let split = evaluator.phi_eta_split(m)?;
+                if !split.curved_cols.is_empty() {
+                    let coords = self.assignment.coords[atom_idx].as_matrix();
+                    let (phi_raw, _jet) = evaluator.evaluate(coords.view())?;
+                    for &col in &split.curved_cols {
+                        for row in 0..n {
+                            d[[row, col]] = phi_raw[[row, col]];
+                        }
+                    }
+                }
+            }
+            out.push(d);
+        }
+        Ok(out)
+    }
+
+    /// Build the β-block of the curvature-homotopy predictor RHS `∂g_β/∂η`
+    /// (#1007) at the current corrected state, in the flat β layout
+    /// [`Self::flatten_beta`] uses (`[atom][basis_col · p + out_col]`).
+    ///
+    /// The data-fit β-gradient is `g_β[k,μ,c] = Σ_i a_ik Φ^η_k[i,μ] r_i[c]`, so
+    /// (W = I for the Gaussian reconstruction channel)
+    /// `∂g_β/∂η[k,μ,c] = Σ_i a_ik (∂Φ^η_k[i,μ]/∂η) r_i[c]`
+    /// `              + Σ_i a_ik Φ^η_k[i,μ] (∂r_i[c]/∂η)`,
+    /// with `∂Φ^η/∂η` the raw curved-column basis (zero on linear columns) and
+    /// `∂r_i/∂η = Σ_{k'} a_ik' (∂Φ^η_{k'}[i,:]/∂η) · B_{k'}`. The smoothness and
+    /// ARD penalties do not depend on `η`, so they contribute nothing. The
+    /// predictor solves `Δβ = −H⁻¹ · ∂g_β/∂η · Δη` on the cached evidence factor.
+    fn curvature_beta_gradient_eta_derivative(
+        &self,
+        target: ArrayView2<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let offsets = self.beta_offsets();
+        let residual = self.reconstruction_residual(target)?;
+        let dphi_deta = self.curvature_basis_eta_derivatives()?;
+        // ∂fitted_i/∂η = Σ_{k'} a_ik' (dΦ_{k'}[i,:]) · B_{k'}.
+        let mut dfitted = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            let a = self.assignment.try_assignments_row(row)?;
+            for (atom_idx, atom) in self.atoms.iter().enumerate() {
+                let a_k = a[atom_idx];
+                if a_k == 0.0 {
+                    continue;
+                }
+                let m = atom.basis_size();
+                for mu in 0..m {
+                    let dphi = dphi_deta[atom_idx][[row, mu]];
+                    if dphi == 0.0 {
+                        continue;
+                    }
+                    let w = a_k * dphi;
+                    for c in 0..p {
+                        dfitted[[row, c]] += w * atom.decoder_coefficients[[mu, c]];
+                    }
+                }
+            }
+        }
+        // ∂g_β/∂η[k,μ,c] = Σ_i a_ik (dΦ_k[i,μ] r_i[c] + Φ^η_k[i,μ] dfitted_i[c]).
+        let mut out = Array1::<f64>::zeros(self.beta_dim());
+        for row in 0..n {
+            let a = self.assignment.try_assignments_row(row)?;
+            for (atom_idx, atom) in self.atoms.iter().enumerate() {
+                let a_k = a[atom_idx];
+                if a_k == 0.0 {
+                    continue;
+                }
+                let m = atom.basis_size();
+                let off = offsets[atom_idx];
+                for mu in 0..m {
+                    let dphi = dphi_deta[atom_idx][[row, mu]];
+                    let phi = atom.basis_values[[row, mu]];
+                    for c in 0..p {
+                        out[off + mu * p + c] +=
+                            a_k * (dphi * residual[[row, c]] + phi * dfitted[[row, c]]);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// #976 Layer-1 guard 3: the per-atom active-mass floor, checked once per
     /// accepted outer iteration of the joint fit.
     ///
@@ -13213,6 +13354,7 @@ impl SaeManifoldOuterObjective {
             psi_gradient: None,
             psi_indices: None,
             inner_hessian_scale: None,
+            logdet_enclosure_gap: None,
         })
     }
 }

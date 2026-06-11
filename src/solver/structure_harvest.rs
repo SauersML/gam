@@ -863,3 +863,81 @@ fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64 {
 fn sse_accumulate(sse: &mut f64, d: f64) {
     *sse += d * d;
 }
+
+/// Inner-fit knobs for the production structure-search refit (the same numbers
+/// the outer SAE fit drove its inner Arrow-Schur joint fit with).
+#[derive(Clone, Copy, Debug)]
+pub struct ProductionRefitParams {
+    /// Inner Newton iterations per shard refit.
+    pub inner_max_iter: usize,
+    /// Inner Newton step size.
+    pub learning_rate: f64,
+    /// Ext-coordinate ridge.
+    pub ridge_ext_coord: f64,
+    /// β ridge.
+    pub ridge_beta: f64,
+}
+
+/// Run the production structure-search pass around a fitted SAE term: harvest →
+/// e-gated [`search`] over held-out row blocks → adopt certified/demoted moves →
+/// repeat, returning the (possibly restructured) term + ρ and the per-round
+/// ledgers (#997).
+///
+/// The shard refit folds a held-out block into a candidate via the SAME inner
+/// joint-fit driver the outer fit used ([`SaeManifoldTerm::run_joint_fit_arrow_schur`]),
+/// PENALTY-FREE: the gate's evidence is a held-out reconstruction
+/// likelihood-ratio, and the isometry/ARD penalties are gauge/regularization
+/// terms that do not belong in the evaluation likelihood. The refit absorbs its
+/// own inner-solve errors by returning the unchanged candidate (a conservative
+/// no-improvement signal, never a panic). `ledger` carries banked evidence
+/// across rounds so the death veto sees earlier certifications.
+#[allow(clippy::too_many_arguments)]
+pub fn run_production_structure_search(
+    term: SaeManifoldTerm,
+    rho: SaeManifoldRho,
+    target: ArrayView2<'_, f64>,
+    n_shards: usize,
+    budget: MoveBudget,
+    max_rounds: usize,
+    harvest_params: HarvestParams,
+    refit_params: ProductionRefitParams,
+    ledger: &mut StructureLedger,
+) -> Result<StructureSearchResult, String> {
+    run_structure_search_rounds(
+        term,
+        rho,
+        target,
+        n_shards,
+        budget,
+        max_rounds,
+        harvest_params,
+        ledger,
+        move |mut cand_term, mut cand_rho, shard| {
+            // Fold the shard into the candidate by re-running the inner joint
+            // fit on the shard's target rows. The candidate's basis/decoder are
+            // warm; a non-converging inner solve returns the unchanged
+            // candidate (the closure is infallible at the driver boundary).
+            let fit_target = shard.target.view();
+            match cand_term.run_joint_fit_arrow_schur(
+                fit_target,
+                &mut cand_rho,
+                None,
+                refit_params.inner_max_iter,
+                refit_params.learning_rate,
+                refit_params.ridge_ext_coord,
+                refit_params.ridge_beta,
+            ) {
+                Ok(_) => (cand_term, cand_rho),
+                Err(_) => (cand_term, cand_rho),
+            }
+        },
+    )
+}
+
+/// Serialize the per-round ledgers to a JSON string for the fit payload — the
+/// honesty surface the python boundary attaches under an additive
+/// `structure_search` key. Byte-deterministic for identical inputs.
+pub fn rounds_to_json(rounds: &[SearchLedger]) -> Result<String, String> {
+    serde_json::to_string(rounds)
+        .map_err(|e| format!("rounds_to_json: serialize search ledger: {e}"))
+}

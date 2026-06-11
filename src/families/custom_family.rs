@@ -3783,6 +3783,7 @@ fn nonconverged_outer_efs_result(
             psi_gradient: None,
             psi_indices: None,
             inner_hessian_scale: None,
+            logdet_enclosure_gap: None,
         },
         constrained_warm_start_from_inner(rho, inner),
         false,
@@ -20186,6 +20187,7 @@ fn unified_joint_efs_eval(
                 Some(hybrid.psi_indices)
             },
             inner_hessian_scale,
+            logdet_enclosure_gap: None,
         })
     } else {
         let inner_hessian_scale = crate::estimate::reml::unified::hessian_operator_geometric_scale(
@@ -20202,6 +20204,7 @@ fn unified_joint_efs_eval(
             psi_gradient: None,
             psi_indices: None,
             inner_hessian_scale,
+            logdet_enclosure_gap: None,
         })
     }
 }

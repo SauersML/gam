@@ -7841,6 +7841,7 @@ mod tests {
                     psi_gradient: Some(array![1.0]),
                     psi_indices: Some(vec![11]),
                     inner_hessian_scale: None,
+                    logdet_enclosure_gap: None,
                 })
             }),
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
@@ -9533,6 +9534,7 @@ mod tests {
                     psi_gradient: None,
                     psi_indices: None,
                     inner_hessian_scale: None,
+                    logdet_enclosure_gap: None,
                 })
             }),
         );
@@ -9585,6 +9587,7 @@ mod tests {
                             psi_gradient: None,
                             psi_indices: None,
                             inner_hessian_scale: None,
+                            logdet_enclosure_gap: None,
                         })
                     } else {
                         Err(EstimationError::RemlOptimizationFailed(
