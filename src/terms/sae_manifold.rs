@@ -9160,7 +9160,14 @@ impl SaeManifoldTerm {
                     * inv_tau
                     * inv_tau
             }
-            AssignmentMode::IBPMap { .. } => 0.0,
+            AssignmentMode::IBPMap { .. } => {
+                // #1006 GAP, deliberately loud: the assembled Hessian consumes
+                // `IBPAssignmentPenalty::hessian_diag`, whose derivative also
+                // includes the implicit empirical-pi channel. That third prior
+                // channel is not exposed as a reusable analytic primitive here,
+                // so this branch is incomplete for IBP-MAP assignment priors.
+                0.0
+            }
         }
     }
 
@@ -9290,6 +9297,13 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
     ) -> Result<SaeArrowVector, String> {
+        // #1006 GAP, deliberately loud: `assemble_arrow_schur` currently builds
+        // the SAE row Hessian as Gauss-Newton data curvature (`J^T J`) plus the
+        // same prior majorizers used for the Newton solve. The residual-
+        // contracted full-Hessian third channels from the issue derivation are
+        // therefore not present in this Γ; adding them before the assembly uses
+        // the same full Hessian would desynchronize the logdet gradient from the
+        // factor being differentiated.
         let n = self.n_obs();
         let total_t = cache.delta_t_len();
         let mut gamma_t = Array1::<f64>::zeros(total_t);
@@ -9401,10 +9415,9 @@ impl SaeManifoldTerm {
     /// Analytic SAE REML outer-ρ gradient components at the already converged
     /// inner state represented by `loss` and `cache`.
     ///
-    /// The returned gradient is deliberately not connected to
-    /// [`SaeManifoldOuterObjective`]. The third-order logdet channel is reported
-    /// separately and remains unavailable until the assembled arrow Hessian has a
-    /// general `dH/dtheta` contraction channel.
+    /// The returned gradient is the assembled analytic outer derivative:
+    /// explicit penalty terms, direct logdet traces, Occam terms, and the #1006
+    /// implicit-state third-order correction.
     pub fn analytic_outer_rho_gradient_components(
         &self,
         rho: &SaeManifoldRho,

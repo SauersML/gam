@@ -160,38 +160,27 @@ fn centered_fd(
 }
 
 #[test]
-fn sae_outer_rho_gradient_components_match_fixed_state_fd_and_record_third_order_residual() {
+fn sae_outer_rho_gradient_components_match_centered_fd_with_third_order_correction() {
     let f = fixture();
     let (converged, _value, loss, cache) = evaluate(&f.term, &f.target, &f.rho, 8);
     let components = converged
         .analytic_outer_rho_gradient_components(&f.rho, &loss, &cache)
         .expect("analytic components");
     assert!(
-        !components.third_order_correction_available,
-        "the SAE arrow Hessian does not yet expose a general dH/dtheta channel"
+        components.third_order_correction_available,
+        "the SAE arrow Hessian must expose the #1006 third-order correction"
     );
-    let analytic = components.gradient_excluding_unavailable_correction();
+    let analytic = components.gradient_with_available_correction();
     let n_params = f.rho.to_flat().len();
 
     for coord in 0..n_params {
-        let fd = centered_fd(&converged, &f.target, &f.rho, coord, 0);
+        let fd = centered_fd(&converged, &f.target, &f.rho, coord, 8);
         let diff = (fd - analytic[coord]).abs();
-        let tol = 7.5e-3 * (1.0 + fd.abs().max(analytic[coord].abs()));
+        let tol = 2.5e-3 * (1.0 + fd.abs().max(analytic[coord].abs()));
         assert!(
             diff <= tol,
-            "fixed-state rho gradient coord {coord}: fd={fd:.8e}, analytic={:.8e}, diff={diff:.3e}, tol={tol:.3e}",
+            "full rho gradient coord {coord}: fd={fd:.8e}, analytic={:.8e}, diff={diff:.3e}, tol={tol:.3e}",
             analytic[coord]
         );
     }
-
-    let mut omitted_third_linf = 0.0_f64;
-    for coord in 0..n_params {
-        let fd = centered_fd(&converged, &f.target, &f.rho, coord, 8);
-        let residual = fd - analytic[coord];
-        omitted_third_linf = omitted_third_linf.max(residual.abs());
-    }
-    assert!(
-        omitted_third_linf <= 5.0,
-        "omitted third-order logdet correction exceeded the documented fixture budget: {omitted_third_linf:.6e}"
-    );
 }
