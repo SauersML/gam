@@ -188,7 +188,7 @@ impl SaeReconstructionRowProgram {
                     }
                     denom = denom + ej;
                 }
-                numer.div(denom)
+                numer / denom
             }
             RowGate::PerAtomLogistic { inv_tau } => {
                 let l = match self.logit_slot[atom] {
@@ -198,7 +198,7 @@ impl SaeReconstructionRowProgram {
                 // σ(x) = 1 / (1 + exp(−x)).
                 let x = (l - self.gate_shift[atom]).scale(inv_tau);
                 let one = Tower4::<K>::constant(1.0);
-                one.div(one + x.scale(-1.0).exp())
+                one / (one + x.scale(-1.0).exp())
             }
         }
     }
@@ -563,7 +563,7 @@ mod tests {
         let inv_tau = 1.4;
         let logit = 0.6;
         let shift = 0.2;
-        let x = (logit - shift) * inv_tau;
+        let x: f64 = (logit - shift) * inv_tau;
         let sigma = 1.0 / (1.0 + (-x).exp());
         let prog = SaeReconstructionRowProgram {
             atoms: vec![AtomRowBasisJet {
