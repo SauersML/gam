@@ -145,187 +145,105 @@ impl<'a> CellMomentsSource<'a> {
 /// score-warp `β_h` block; `u = 2+p_h..2+p_h+p_w` is the link-wiggle `β_w`
 /// block. So `r = 2 + p_h + p_w` and `u = 1` is the `b` (slope) index used by
 /// the sparse `S_{b·h}` / `S_{b·w}` payloads.
-pub(crate) struct BmsFlexRowKernelInputs<'a> {
-    /// Number of observation rows.
-    pub n_rows: usize,
-    /// Total primary local dimension. `r = 2 + p_h + p_w`.
-    pub r: usize,
-    /// Number of score-warp basis coordinates.
-    pub p_h: usize,
-    /// Number of link-wiggle basis coordinates.
-    pub p_w: usize,
-    /// Per-row latent quantile point `q_i = marginal_link(q)`. Length `n_rows`.
-    pub q: &'a [f64],
-    /// Per-row latent slope `b_i`. Length `n_rows`.
-    pub b: &'a [f64],
-    /// Per-row `μ_1 = ∂q/∂a`. Length `n_rows`.
-    pub mu_1: &'a [f64],
-    /// Per-row `μ_2 = ∂²q/∂a²`. Length `n_rows`.
-    pub mu_2: &'a [f64],
-    /// Per-row observed `z_obs`. Length `n_rows`. (Carried for diagnostics; the
-    /// kernel itself uses the pre-evaluated `chi_obs`, `xi_obs`, `rho`, `tau`,
-    /// `r_uv` arrays the host supplies.)
-    pub z_obs: &'a [f64],
-    /// Per-row response `y_i ∈ {0, 1}`. Length `n_rows`.
-    pub y: &'a [f64],
-    /// Per-row observation weight `w_i`. Length `n_rows`.
-    pub w: &'a [f64],
-    /// Probit frailty scale `S_f` (scalar shared across rows; matches
-    /// `BernoulliMarginalSlope::probit_frailty_scale`).
-    pub s_f: f64,
-    /// Per-row cell range, length `n_rows + 1`. Row `i` owns cells in the
-    /// half-open `[cell_offsets[i], cell_offsets[i+1])` slice of the
-    /// `cell_*` arrays.
-    pub cell_offsets: &'a [u32],
-    /// Cubic predictor coefficient `C0` per cell. Length `total_cells`.
-    pub cell_c0: &'a [f64],
-    /// Cubic predictor coefficient `C1` per cell. Length `total_cells`.
-    pub cell_c1: &'a [f64],
-    /// Cubic predictor coefficient `C2` per cell. Length `total_cells`.
-    pub cell_c2: &'a [f64],
-    /// Cubic predictor coefficient `C3` per cell. Length `total_cells`.
-    pub cell_c3: &'a [f64],
-    /// Per-cell `A_c` derivative coefficient (length `total_cells * 4`,
-    /// row-major `[total_cells, 4]`).
-    pub cell_a: &'a [f64],
-    /// Per-cell `AA_c` second-derivative coefficient (length
-    /// `total_cells * 4`).
-    pub cell_aa: &'a [f64],
-    /// Per-cell `R_{c,u}` for `u ∈ [1, r)` (length
-    /// `total_cells * (r-1) * 4`, row-major `[total_cells, r-1, 4]`).
-    pub cell_r: &'a [f64],
-    /// Per-cell `AR_{c,u}` for `u ∈ [1, r)` (same shape as `cell_r`).
-    pub cell_ar: &'a [f64],
-    /// Per-cell `S_{bb}` second-derivative coefficient (length
-    /// `total_cells * 4`).
-    pub cell_sbb: &'a [f64],
-    /// Per-cell `S_{b·h_j}` second-derivative coefficient
-    /// (length `total_cells * p_h * 4`, row-major `[total_cells, p_h, 4]`).
-    /// Stage 2 stores dense; sparse encoding is Stage 3.
-    pub cell_sbh: &'a [f64],
-    /// Per-cell `S_{b·w_ℓ}` second-derivative coefficient
-    /// (length `total_cells * p_w * 4`, row-major `[total_cells, p_w, 4]`).
-    pub cell_sbw: &'a [f64],
-    /// Per-cell derivative moments from Stage 1: row-major
-    /// `[total_cells, MOMENT_STRIDE = 10]`. Phase-4 wiring: either a host
-    /// slice (legacy upload-on-launch path) or a device-resident
-    /// `CudaSlice<f64>` produced by `src/gpu/cubic_cell::try_build_cubic_cell_derivative_moments`
-    /// with `CubicCellMomentResidency::Device`.
-    pub cell_moments: CellMomentsSource<'a>,
-    /// Per-row `chi_obs`. Length `n_rows`.
-    pub chi_obs: &'a [f64],
-    /// Per-row `xi_obs`. Length `n_rows`.
-    pub xi_obs: &'a [f64],
-    /// Per-row `rho_u`: row-major `[n_rows, r]`.
-    pub rho_u: &'a [f64],
-    /// Per-row `tau_u`: row-major `[n_rows, r]`.
-    pub tau_u: &'a [f64],
-    /// Per-row `r_uv`: row-major `[n_rows, r*r]`.
-    pub r_uv: &'a [f64],
-}
-
-/// Owned twin of [`BmsFlexRowKernelInputs`] — every borrowed slice is replaced
-/// by an owned `Vec`. Built by the host packer in
-/// `BernoulliMarginalSlopeFamily::pack_bms_flex_row_kernel_inputs`; converted
-/// to a borrowed view via [`BmsFlexRowKernelInputsOwned::as_borrowed`] just
-/// before [`launch_bms_flex_row_kernel`] uploads to the device.
-///
-/// Holds all per-row + per-cell SoA buffers in the exact layouts the device
-/// kernel reads (`bms_flex_row_kernel` in [`ROW_KERNEL_BODY`]):
-///   * scalars `n_rows`, `r`, `p_h`, `p_w`, `s_f`,
-///   * per-row `q / b / mu_1 / mu_2 / z_obs / y / w / chi_obs / xi_obs`,
-///   * per-row `rho_u [n*r]`, `tau_u [n*r]`, `r_uv [n*r*r]`,
-///   * CSR `cell_offsets [n+1]` and per-cell `cell_c0..c3`,
-///     `cell_a / cell_aa [n_cells * 4]`,
-///     `cell_r / cell_ar [n_cells * (r-1) * 4]`,
-///     `cell_sbb [n_cells * 4]`,
-///     `cell_sbh [n_cells * p_h * 4]`,
-///     `cell_sbw [n_cells * p_w * 4]`,
-///     `cell_moments [n_cells * 10]`.
-pub(crate) struct BmsFlexRowKernelInputsOwned {
-    pub n_rows: usize,
-    pub r: usize,
-    pub p_h: usize,
-    pub p_w: usize,
-    pub s_f: f64,
-    pub q: Vec<f64>,
-    pub b: Vec<f64>,
-    pub mu_1: Vec<f64>,
-    pub mu_2: Vec<f64>,
-    pub z_obs: Vec<f64>,
-    pub y: Vec<f64>,
-    pub w: Vec<f64>,
-    pub cell_offsets: Vec<u32>,
-    pub cell_c0: Vec<f64>,
-    pub cell_c1: Vec<f64>,
-    pub cell_c2: Vec<f64>,
-    pub cell_c3: Vec<f64>,
-    pub cell_a: Vec<f64>,
-    pub cell_aa: Vec<f64>,
-    pub cell_r: Vec<f64>,
-    pub cell_ar: Vec<f64>,
-    pub cell_sbb: Vec<f64>,
-    pub cell_sbh: Vec<f64>,
-    pub cell_sbw: Vec<f64>,
-    /// Host-resident moments. Phase-4: when `cell_moments_device` is
-    /// `Some(_)`, this stays empty and the device buffer is used instead.
-    pub cell_moments: Vec<f64>,
-    /// Phase-4 device-resident moments. When `Some(_)`, the launcher skips
-    /// the host upload and consumes the buffer directly. Linux-only field.
-    #[cfg(target_os = "linux")]
-    pub cell_moments_device: Option<CudaSlice<f64>>,
-    pub chi_obs: Vec<f64>,
-    pub xi_obs: Vec<f64>,
-    pub rho_u: Vec<f64>,
-    pub tau_u: Vec<f64>,
-    pub r_uv: Vec<f64>,
-}
-
-impl BmsFlexRowKernelInputsOwned {
-    /// Borrowed view over `self` suitable for [`launch_bms_flex_row_kernel`].
-    /// The returned struct holds references into `self` so the owned bundle
-    /// must outlive the launch.
-    pub(crate) fn as_borrowed(&self) -> BmsFlexRowKernelInputs<'_> {
-        #[cfg(target_os = "linux")]
-        let cell_moments = match self.cell_moments_device.as_ref() {
-            Some(d) => CellMomentsSource::Device(d),
-            None => CellMomentsSource::Host(&self.cell_moments),
-        };
-        #[cfg(not(target_os = "linux"))]
-        let cell_moments = CellMomentsSource::Host(&self.cell_moments);
-        BmsFlexRowKernelInputs {
-            n_rows: self.n_rows,
-            r: self.r,
-            p_h: self.p_h,
-            p_w: self.p_w,
-            s_f: self.s_f,
-            q: &self.q,
-            b: &self.b,
-            mu_1: &self.mu_1,
-            mu_2: &self.mu_2,
-            z_obs: &self.z_obs,
-            y: &self.y,
-            w: &self.w,
-            cell_offsets: &self.cell_offsets,
-            cell_c0: &self.cell_c0,
-            cell_c1: &self.cell_c1,
-            cell_c2: &self.cell_c2,
-            cell_c3: &self.cell_c3,
-            cell_a: &self.cell_a,
-            cell_aa: &self.cell_aa,
-            cell_r: &self.cell_r,
-            cell_ar: &self.cell_ar,
-            cell_sbb: &self.cell_sbb,
-            cell_sbh: &self.cell_sbh,
-            cell_sbw: &self.cell_sbw,
-            cell_moments,
-            chi_obs: &self.chi_obs,
-            xi_obs: &self.xi_obs,
-            rho_u: &self.rho_u,
-            tau_u: &self.tau_u,
-            r_uv: &self.r_uv,
+macro_rules! define_bms_flex_row_kernel_input_types {
+    (
+        f64_fields: [$($f64_field:ident),+ $(,)?],
+        u32_fields: [$($u32_field:ident),+ $(,)?],
+        moments_field: $moments_field:ident $(,)?
+    ) => {
+        pub(crate) struct BmsFlexRowKernelInputs<'a> {
+            /// Number of observation rows.
+            pub n_rows: usize,
+            /// Total primary local dimension. `r = 2 + p_h + p_w`.
+            pub r: usize,
+            /// Number of score-warp basis coordinates.
+            pub p_h: usize,
+            /// Number of link-wiggle basis coordinates.
+            pub p_w: usize,
+            /// Probit frailty scale `S_f` (scalar shared across rows; matches
+            /// `BernoulliMarginalSlope::probit_frailty_scale`).
+            pub s_f: f64,
+            $(pub $f64_field: &'a [f64],)+
+            $(pub $u32_field: &'a [u32],)+
+            pub $moments_field: CellMomentsSource<'a>,
         }
-    }
+
+        /// Owned twin of [`BmsFlexRowKernelInputs`] — every borrowed slice is
+        /// replaced by an owned `Vec`. The buffer fields are declared from the
+        /// same schema as the borrowed launch ABI and converted by
+        /// [`BmsFlexRowKernelInputsOwned::as_borrowed`].
+        pub(crate) struct BmsFlexRowKernelInputsOwned {
+            pub n_rows: usize,
+            pub r: usize,
+            pub p_h: usize,
+            pub p_w: usize,
+            pub s_f: f64,
+            $(pub $f64_field: Vec<f64>,)+
+            $(pub $u32_field: Vec<u32>,)+
+            pub $moments_field: Vec<f64>,
+            /// Phase-4 device-resident moments. When `Some(_)`, the launcher
+            /// skips the host upload and consumes the buffer directly.
+            /// Linux-only field.
+            #[cfg(target_os = "linux")]
+            pub cell_moments_device: Option<CudaSlice<f64>>,
+        }
+
+        impl BmsFlexRowKernelInputsOwned {
+            /// Borrowed view over `self` suitable for
+            /// [`launch_bms_flex_row_kernel`]. The returned struct holds
+            /// references into `self` so the owned bundle must outlive the
+            /// launch.
+            pub(crate) fn as_borrowed(&self) -> BmsFlexRowKernelInputs<'_> {
+                #[cfg(target_os = "linux")]
+                let cell_moments = match self.cell_moments_device.as_ref() {
+                    Some(d) => CellMomentsSource::Device(d),
+                    None => CellMomentsSource::Host(&self.cell_moments),
+                };
+                #[cfg(not(target_os = "linux"))]
+                let cell_moments = CellMomentsSource::Host(&self.cell_moments);
+                BmsFlexRowKernelInputs {
+                    n_rows: self.n_rows,
+                    r: self.r,
+                    p_h: self.p_h,
+                    p_w: self.p_w,
+                    s_f: self.s_f,
+                    $($f64_field: &self.$f64_field,)+
+                    $($u32_field: &self.$u32_field,)+
+                    $moments_field: cell_moments,
+                }
+            }
+        }
+    };
+}
+
+define_bms_flex_row_kernel_input_types! {
+    f64_fields: [
+        q,
+        b,
+        mu_1,
+        mu_2,
+        z_obs,
+        y,
+        w,
+        cell_c0,
+        cell_c1,
+        cell_c2,
+        cell_c3,
+        cell_a,
+        cell_aa,
+        cell_r,
+        cell_ar,
+        cell_sbb,
+        cell_sbh,
+        cell_sbw,
+        chi_obs,
+        xi_obs,
+        rho_u,
+        tau_u,
+        r_uv,
+    ],
+    u32_fields: [cell_offsets],
+    moments_field: cell_moments,
 }
 
 /// Per-row outputs produced by [`launch_bms_flex_row_kernel`].
@@ -1756,7 +1674,7 @@ extern "C" __global__ void bms_flex_row_dense_block_partial(
     // Tighter parallel implementations are possible (warp-stripe the
     // 4-way nested u-v-m-n loop) but Phase 6 is a debug-only path and
     // the simple version is easier to audit for correctness against
-    // the CPU `accumulate_row_hessian_pullback` reference.
+    // the host-side P_i pullback oracle.
     if (tid == 0) {
         for (int row = row_lo; row < row_hi; ++row) {
             const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
@@ -4816,7 +4734,7 @@ mod tests {
     }
 
     /// Block 9 Phase 6 — small-fixture parity for the dense-block kernel
-    /// against the CPU pullback in `crate::families::bms::gpu::flex::accumulate_row_hessian_pullback`.
+    /// against the host-side P_i pullback oracle.
     /// Verifies bit-equality (modulo reduction-order f.p. noise) between
     /// the device-resident dense build and the host accumulator over the
     /// same per-row Hessian + designs + P_i pullback.

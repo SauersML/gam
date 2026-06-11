@@ -198,7 +198,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// Unified scalar-objective dispatcher for the rigid Bernoulli kernel.
-    /// Routes to [`RigidProbitKernel::neglog_only`] for the standard-normal
+    /// Routes to [`rigid_standard_normal_neglog_only`] for the standard-normal
     /// latent measure and [`Self::empirical_rigid_neglog_only`] for any
     /// empirical-grid measure. Replaces `rigid_row_kernel_eval(...)`'s
     /// `(neglog, _, _)` return when only the scalar is needed.
@@ -209,7 +209,7 @@ impl BernoulliMarginalSlopeFamily {
         slope: f64,
     ) -> Result<f64, String> {
         match self.latent_measure.empirical_grid_for_training_row(row)? {
-            None => RigidProbitKernel::neglog_only(
+            None => rigid_standard_normal_neglog_only(
                 marginal.q,
                 slope,
                 self.z[row],
@@ -945,21 +945,14 @@ impl BernoulliMarginalSlopeFamily {
         slope: f64,
     ) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
         match self.latent_measure.empirical_grid_for_training_row(row)? {
-            None => {
-                let kernel = RigidProbitKernel::new(
-                    marginal.q,
-                    slope,
-                    self.z[row],
-                    self.y[row],
-                    self.weights[row],
-                    self.probit_frailty_scale(),
-                )?;
-                Ok((
-                    -self.weights[row] * kernel.logcdf,
-                    rigid_transformed_gradient(marginal, &kernel),
-                    rigid_transformed_hessian(marginal, &kernel),
-                ))
-            }
+            None => rigid_standard_normal_row_kernel(
+                marginal,
+                slope,
+                self.z[row],
+                self.y[row],
+                self.weights[row],
+                self.probit_frailty_scale(),
+            ),
             Some(grid) => self.empirical_rigid_primary_grad_hess_closed_form(
                 row,
                 marginal,
@@ -1187,7 +1180,7 @@ impl BernoulliMarginalSlopeFamily {
     /// Per-row uncontracted third-derivative tensor in the rigid path.
     ///
     /// The standard-normal latent measure uses the analytic
-    /// `rigid_transformed_third_full`; empirical-grid rows use the closed-form
+    /// `rigid_standard_normal_third_full`; empirical-grid rows use the closed-form
     /// implicit-function-theorem tensor `empirical_rigid_third_full_closed_form`.
     /// Both yield the four distinct symmetric components `T_mmm, T_mmg, T_mgg,
     /// T_ggg`; the `rank`-many ψ-axis directions are folded in later by a cheap
@@ -1199,17 +1192,14 @@ impl BernoulliMarginalSlopeFamily {
         slope: f64,
     ) -> Result<[[[f64; 2]; 2]; 2], String> {
         match self.latent_measure.empirical_grid_for_training_row(row)? {
-            None => {
-                let kernel = RigidProbitKernel::new(
-                    marginal.q,
-                    slope,
-                    self.z[row],
-                    self.y[row],
-                    self.weights[row],
-                    self.probit_frailty_scale(),
-                )?;
-                Ok(rigid_transformed_third_full(marginal, &kernel))
-            }
+            None => rigid_standard_normal_third_full(
+                marginal,
+                slope,
+                self.z[row],
+                self.y[row],
+                self.weights[row],
+                self.probit_frailty_scale(),
+            ),
             Some(grid) => self.empirical_rigid_third_full_closed_form(
                 row,
                 marginal,
@@ -1223,7 +1213,7 @@ impl BernoulliMarginalSlopeFamily {
     /// Per-row uncontracted fourth-derivative tensor in the rigid path.
     ///
     /// The standard-normal latent measure drops out of
-    /// `rigid_transformed_fourth_full` (five axis-invariant primary-space
+    /// `rigid_standard_normal_fourth_full` (five axis-invariant primary-space
     /// components). Empirical-grid rows use the closed-form implicit-function-
     /// theorem tensor `empirical_rigid_fourth_full_closed_form`, yielding the
     /// five distinct symmetric components `T_mmmm, T_mmmg, T_mmgg, T_mggg,
@@ -1236,17 +1226,14 @@ impl BernoulliMarginalSlopeFamily {
         slope: f64,
     ) -> Result<[[[[f64; 2]; 2]; 2]; 2], String> {
         match self.latent_measure.empirical_grid_for_training_row(row)? {
-            None => {
-                let kernel = RigidProbitKernel::new(
-                    marginal.q,
-                    slope,
-                    self.z[row],
-                    self.y[row],
-                    self.weights[row],
-                    self.probit_frailty_scale(),
-                )?;
-                Ok(rigid_transformed_fourth_full(marginal, &kernel))
-            }
+            None => rigid_standard_normal_fourth_full(
+                marginal,
+                slope,
+                self.z[row],
+                self.y[row],
+                self.weights[row],
+                self.probit_frailty_scale(),
+            ),
             Some(grid) => self.empirical_rigid_fourth_full_closed_form(
                 row,
                 marginal,
@@ -1300,7 +1287,7 @@ impl BernoulliMarginalSlopeFamily {
             // gradient and Hessian returned by `rigid_row_kernel_eval` would
             // be immediately discarded. `rigid_row_neglog_only` dispatches
             // to:
-            //   * `RigidProbitKernel::neglog_only` (standard-normal): a single
+            //   * `rigid_standard_normal_neglog_only` (standard-normal): a single
             //     `signed_probit_logcdf_and_mills_ratio` call, skipping the
             //     `u_k`/`c_k`/`eta_*` chain-rule scaffolding.
             //   * `empirical_rigid_neglog_only` (empirical-grid): the
@@ -4415,80 +4402,15 @@ impl BernoulliMarginalSlopeFamily {
         }
         let completed_rows = AtomicUsize::new(0);
         let progress_step = (n / 10).max(1);
-        // Allocate the three packed arrays up front, then fill them one row
-        // chunk at a time: each chunk is computed in parallel into a small
-        // `Vec<(f64, Vec, Vec)>` (safe disjoint-row collect) and copied into the
-        // packed arrays before the next chunk's scratch is allocated. This caps
-        // transient overhead at one chunk (~tens of MiB) instead of holding a
-        // second full `n×r²` copy alongside the packed arrays — the old
-        // collect-all-then-copy form peaked at ~2× the planned cache size, so
-        // the byte estimate the materialize/stream policy budgets against
-        // (`plan.bytes`) now actually bounds peak memory.
-        let mut packed_neglog = Array1::<f64>::zeros(n);
-        let mut packed_grad = Array2::<f64>::zeros((n, r));
-        let mut packed_hess = Array2::<f64>::zeros((n, r * r));
-        // ~tens of MiB of transient per-chunk scratch at r=20 (8192 * 421 * 8 ≈
-        // 27 MiB) regardless of n.
-        const ROW_PRIMARY_BUILD_CHUNK: usize = 8192;
-        let mut chunk_start = 0usize;
-        while chunk_start < n {
-            let chunk_end = (chunk_start + ROW_PRIMARY_BUILD_CHUNK).min(n);
-            let chunk_evals: Vec<(f64, Vec<f64>, Vec<f64>)> = (chunk_start..chunk_end)
-                .into_par_iter()
-                .map(|row| -> Result<(f64, Vec<f64>, Vec<f64>), String> {
-                    let row_ctx = Self::row_ctx(cache, row);
-                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
-                    let row_moments = cache
-                        .row_cell_moments
-                        .as_ref()
-                        .and_then(|bundle| bundle.row(row, 9));
-                    let neglog = self.compute_row_analytic_flex_into_with_moments(
-                        row,
-                        block_states,
-                        primary,
-                        row_ctx,
-                        row_moments,
-                        true,
-                        &mut scratch,
-                    )?;
-                    if log_exact_work(n) {
-                        let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done == n || done % progress_step == 0 {
-                            log::info!(
-                                "[BMS row-primary-hessian-cache] progress rows={}/{} elapsed={:.3}s",
-                                done,
-                                n,
-                                started.elapsed().as_secs_f64()
-                            );
-                        }
-                    }
-                    Ok((
-                        neglog,
-                        scratch.grad.to_vec(),
-                        scratch
-                            .hess
-                            .as_slice()
-                            .expect("hess is contiguous")
-                            .to_vec(),
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            for (offset, (neglog, grad_flat, hess_flat)) in chunk_evals.into_iter().enumerate() {
-                let row = chunk_start + offset;
-                packed_neglog[row] = neglog;
-                packed_grad
-                    .row_mut(row)
-                    .iter_mut()
-                    .zip(grad_flat.iter())
-                    .for_each(|(d, s)| *d = *s);
-                packed_hess
-                    .row_mut(row)
-                    .iter_mut()
-                    .zip(hess_flat.iter())
-                    .for_each(|(d, s)| *d = *s);
-            }
-            chunk_start = chunk_end;
-        }
+        let rows = self.build_row_primary_hessian_pin(
+            block_states,
+            cache,
+            0..n,
+            &completed_rows,
+            progress_step,
+            started,
+            plan.bytes,
+        )?;
         if log_exact_work(n) {
             log::info!(
                 "[BMS row-primary-hessian-cache] build done n={} r={} elapsed={:.3}s",
@@ -4498,12 +4420,7 @@ impl BernoulliMarginalSlopeFamily {
             );
         }
         drop(process_monitor_guard);
-        Ok(RowPrimaryEvalCache::Host(RowPrimaryEvalPin::new(
-            packed_neglog,
-            packed_grad,
-            packed_hess,
-            plan.bytes,
-        )))
+        Ok(RowPrimaryEvalCache::Host(rows))
     }
 
     fn row_primary_eval_tile_bytes(rows: usize, r: usize) -> u64 {
@@ -4525,6 +4442,32 @@ impl BernoulliMarginalSlopeFamily {
         progress_step: usize,
         started: std::time::Instant,
     ) -> Result<RowPrimaryEvalTile, String> {
+        let tile_len = rows.end - rows.start;
+        let bytes = Self::row_primary_eval_tile_bytes(tile_len, cache.primary.total);
+        Ok(RowPrimaryEvalTile {
+            row_start: rows.start,
+            rows: self.build_row_primary_hessian_pin(
+                block_states,
+                cache,
+                rows,
+                completed_rows,
+                progress_step,
+                started,
+                bytes,
+            )?,
+        })
+    }
+
+    fn build_row_primary_hessian_pin(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        rows: std::ops::Range<usize>,
+        completed_rows: &AtomicUsize,
+        progress_step: usize,
+        started: std::time::Instant,
+        bytes: u64,
+    ) -> Result<RowPrimaryEvalPin, String> {
         let n = self.y.len();
         let r = cache.primary.total;
         let tile_len = rows.end - rows.start;
@@ -4585,11 +4528,12 @@ impl BernoulliMarginalSlopeFamily {
                 .zip(hess_flat.iter())
                 .for_each(|(d, s)| *d = *s);
         }
-        let bytes = Self::row_primary_eval_tile_bytes(tile_len, r);
-        Ok(RowPrimaryEvalTile {
-            row_start: rows.start,
-            rows: RowPrimaryEvalPin::new(packed_neglog, packed_grad, packed_hess, bytes),
-        })
+        Ok(RowPrimaryEvalPin::new(
+            packed_neglog,
+            packed_grad,
+            packed_hess,
+            bytes,
+        ))
     }
 
     /// Look up the cached per-row primary Hessian (`r × r`) materialized at

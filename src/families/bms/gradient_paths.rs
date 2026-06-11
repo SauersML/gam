@@ -1,5 +1,6 @@
 use super::family::clamp_bernoulli_link_probability;
 use super::*;
+use crate::families::jet_tower::Tower4;
 use crate::matrix::{LinearOperator, SignedWeightsView};
 
 pub(crate) fn standardize_latent_z_with_policy(
@@ -1315,244 +1316,74 @@ pub(crate) fn empirical_intercept_from_marginal(
     Ok(root)
 }
 
-/// Rigid probit scalar kernel: closed-form derivatives up to 4th order.
-///
-/// η = q·c(g) + s_f·g·z,  c(g) = √(1+(s_f g)²),  s = 2y−1,  m = s·η.
-/// u_k absorb weight and sign: u1=w·s·κ₁, u2=w·κ₂, u3=w·s·κ₃, u4=w·κ₄.
-pub(super) struct RigidProbitKernel {
-    pub(super) logcdf: f64,
-    pub(super) u1: f64,
-    pub(super) u2: f64,
-    pub(super) u3: f64,
-    pub(super) u4: f64,
-    pub(super) c1: f64,
-    pub(super) c2: f64,
-    pub(super) c3: f64,
-    pub(super) c4: f64,
-    pub(super) eta_q: f64,
-    pub(super) eta_g: f64,
-}
-
-impl RigidProbitKernel {
-    #[inline]
-    pub(super) fn new(
-        q: f64,
-        g: f64,
-        z: f64,
-        y: f64,
-        w: f64,
-        probit_scale: f64,
-    ) -> Result<Self, String> {
-        let s = 2.0 * y - 1.0;
-        let observed_logslope = rigid_observed_logslope(g, probit_scale);
-        let g2 = observed_logslope * observed_logslope;
-        let c = (1.0 + g2).sqrt();
-        let c1 = probit_scale * observed_logslope / c;
-        let c_inv3 = 1.0 / (c * c * c);
-        let c_inv5 = c_inv3 / (c * c);
-        let c_inv7 = c_inv5 / (c * c);
-        let eta = marginal_slope_standard_normal_scalar_eta(q, g, z, probit_scale);
-        let m = s * eta;
-        let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
-        let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(m, w)?;
-        Ok(Self {
-            logcdf,
-            u1: s * k1,
-            u2: k2,
-            u3: s * k3,
-            u4: k4,
-            c1,
-            c2: probit_scale * probit_scale * c_inv3,
-            c3: -3.0 * probit_scale.powi(3) * observed_logslope * c_inv5,
-            c4: probit_scale.powi(4) * (12.0 * g2 - 3.0) * c_inv7,
-            eta_q: c,
-            eta_g: q * c1 + probit_scale * z,
-        })
+#[inline]
+pub(super) fn rigid_standard_normal_neglog_only(
+    q: f64,
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<f64, String> {
+    let s = 2.0 * y - 1.0;
+    let eta = marginal_slope_standard_normal_scalar_eta(q, g, z, probit_scale);
+    let m = s * eta;
+    let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
+    if !logcdf.is_finite() {
+        return Err(format!(
+            "rigid probit neglog_only: non-finite log Φ at q={q}, g={g}, z={z}, y={y}"
+        ));
     }
-
-    /// Objective-only fast path for the rigid probit kernel: returns just
-    /// `-w · log Φ(s · η)` (the row negative log-likelihood) without any
-    /// derivative-state computation.
-    ///
-    /// **Mathematically identical** to `RigidProbitKernel::new(...)?.logcdf`
-    /// scaled by `-w`: same algebraic form for `η = q·c(g) + s_f·g·z`, same
-    /// signed-probit log-CDF kernel. The skipped work is the chain-rule
-    /// scaffolding (`u1..u4`, `c1..c4`, `eta_q`, `eta_g`) that downstream
-    /// gradient/Hessian assembly needs but the line-search accept/reject
-    /// decision never touches.
-    ///
-    /// Used by [`BernoulliMarginalSlopeFamily::rigid_row_neglog_only`] from
-    /// the rigid-path log-likelihood-only loop in
-    /// [`log_likelihood_only_with_options`].
-    #[inline]
-    pub(super) fn neglog_only(
-        q: f64,
-        g: f64,
-        z: f64,
-        y: f64,
-        w: f64,
-        probit_scale: f64,
-    ) -> Result<f64, String> {
-        let s = 2.0 * y - 1.0;
-        let eta = marginal_slope_standard_normal_scalar_eta(q, g, z, probit_scale);
-        let m = s * eta;
-        let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
-        if !logcdf.is_finite() {
-            return Err(format!(
-                "rigid probit neglog_only: non-finite log Φ at q={q}, g={g}, z={z}, y={y}"
-            ));
-        }
-        Ok(-w * logcdf)
-    }
-
-    #[inline]
-    pub(super) fn primary_hessian(&self, q: f64) -> [[f64; 2]; 2] {
-        let h00 = self.u2 * self.eta_q * self.eta_q;
-        let h01 = self.u2 * self.eta_q * self.eta_g + self.u1 * self.c1;
-        let h11 = self.u2 * self.eta_g * self.eta_g + self.u1 * q * self.c2;
-        [[h00, h01], [h01, h11]]
-    }
-
-    #[inline]
-    pub(super) fn third_contracted(&self, q: f64, dq: f64, dg: f64) -> [[f64; 2]; 2] {
-        let dd = self.eta_q * dq + self.eta_g * dg;
-        let dd_q = self.c1 * dg;
-        let dd_g = self.c1 * dq + q * self.c2 * dg;
-        let dd_qg = self.c2 * dg;
-        let dd_gg = self.c2 * dq + q * self.c3 * dg;
-        let t00 = self.u3 * self.eta_q * self.eta_q * dd + self.u2 * 2.0 * self.eta_q * dd_q;
-        let t01 = self.u3 * self.eta_q * self.eta_g * dd
-            + self.u2 * (self.c1 * dd + self.eta_q * dd_g + self.eta_g * dd_q)
-            + self.u1 * dd_qg;
-        let t11 = self.u3 * self.eta_g * self.eta_g * dd
-            + self.u2 * (q * self.c2 * dd + 2.0 * self.eta_g * dd_g)
-            + self.u1 * dd_gg;
-        [[t00, t01], [t01, t11]]
-    }
-
-    #[inline]
-    pub(super) fn fourth_contracted(
-        &self,
-        q: f64,
-        uq: f64,
-        ug: f64,
-        vq: f64,
-        vg: f64,
-    ) -> [[f64; 2]; 2] {
-        let du = self.eta_q * uq + self.eta_g * ug;
-        let dv = self.eta_q * vq + self.eta_g * vg;
-        let du_a = [self.c1 * ug, self.c1 * uq + q * self.c2 * ug];
-        let dv_a = [self.c1 * vg, self.c1 * vq + q * self.c2 * vg];
-        let du_ab = [
-            [0.0, self.c2 * ug],
-            [self.c2 * ug, self.c2 * uq + q * self.c3 * ug],
-        ];
-        let dv_ab = [
-            [0.0, self.c2 * vg],
-            [self.c2 * vg, self.c2 * vq + q * self.c3 * vg],
-        ];
-        let dduv = self.c1 * (uq * vg + ug * vq) + q * self.c2 * ug * vg;
-        let dduv_a = [
-            self.c2 * ug * vg,
-            self.c2 * (uq * vg + ug * vq) + q * self.c3 * ug * vg,
-        ];
-        let dduv_ab = [
-            [0.0, self.c3 * ug * vg],
-            [
-                self.c3 * ug * vg,
-                self.c3 * (uq * vg + ug * vq) + q * self.c4 * ug * vg,
-            ],
-        ];
-        let eta_a = [self.eta_q, self.eta_g];
-        let eta_ab = [[0.0, self.c1], [self.c1, q * self.c2]];
-        let mut f = [[0.0f64; 2]; 2];
-        for a in 0..2 {
-            for b in a..2 {
-                let val = self.u4 * eta_a[a] * eta_a[b] * du * dv
-                    + self.u3
-                        * (eta_ab[a][b] * du * dv
-                            + du_a[a] * eta_a[b] * dv
-                            + dv_a[a] * eta_a[b] * du
-                            + du_a[b] * eta_a[a] * dv
-                            + dv_a[b] * eta_a[a] * du
-                            + dduv * eta_a[a] * eta_a[b])
-                    + self.u2
-                        * (eta_ab[a][b] * dduv
-                            + du_a[a] * dv_a[b]
-                            + dv_a[a] * du_a[b]
-                            + du_ab[a][b] * dv
-                            + dv_ab[a][b] * du
-                            + eta_a[b] * dduv_a[a]
-                            + eta_a[a] * dduv_a[b])
-                    + self.u1 * dduv_ab[a][b];
-                f[a][b] = val;
-                f[b][a] = val;
-            }
-        }
-        f
-    }
+    Ok(-w * logcdf)
 }
 
 #[inline]
-pub(super) fn rigid_transformed_gradient(
+fn rigid_standard_normal_tower(
     marginal: BernoulliMarginalLinkMap,
-    kernel: &RigidProbitKernel,
-) -> [f64; 2] {
-    [
-        kernel.u1 * kernel.eta_q * marginal.q1,
-        kernel.u1 * kernel.eta_g,
-    ]
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<Tower4<2>, String> {
+    let mut q = Tower4::<2>::constant(marginal.q);
+    q.g[0] = marginal.q1;
+    q.h[0][0] = marginal.q2;
+    q.t3[0][0][0] = marginal.q3;
+    q.t4[0][0][0][0] = marginal.q4;
+    let slope = Tower4::<2>::variable(g, 1);
+    let observed_logslope = slope * probit_scale;
+    let c = (observed_logslope * observed_logslope + 1.0).sqrt();
+    let eta = q * c + slope * (probit_scale * z);
+    let signed = eta * (2.0 * y - 1.0);
+    let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(signed.v);
+    let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(signed.v, w)?;
+    Ok(signed.compose_unary([-w * logcdf, k1, k2, k3, k4]))
 }
 
 #[inline]
-pub(super) fn rigid_transformed_hessian(
+pub(super) fn rigid_standard_normal_row_kernel(
     marginal: BernoulliMarginalLinkMap,
-    kernel: &RigidProbitKernel,
-) -> [[f64; 2]; 2] {
-    let h_q = kernel.primary_hessian(marginal.q);
-    let grad_q = kernel.u1 * kernel.eta_q;
-    [
-        [
-            h_q[0][0] * marginal.q1 * marginal.q1 + grad_q * marginal.q2,
-            h_q[0][1] * marginal.q1,
-        ],
-        [h_q[1][0] * marginal.q1, h_q[1][1]],
-    ]
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
+    let tower = rigid_standard_normal_tower(marginal, g, z, y, w, probit_scale)?;
+    Ok((tower.v, tower.g, tower.h))
 }
 
 #[inline]
-pub(super) fn rigid_internal_third_components(
+pub(super) fn rigid_standard_normal_third_full(
     marginal: BernoulliMarginalLinkMap,
-    kernel: &RigidProbitKernel,
-) -> (f64, f64, f64, f64) {
-    let q_dir = kernel.third_contracted(marginal.q, 1.0, 0.0);
-    let g_dir = kernel.third_contracted(marginal.q, 0.0, 1.0);
-    (q_dir[0][0], q_dir[0][1], q_dir[1][1], g_dir[1][1])
-}
-
-#[inline]
-/// Closed-form rigid third-derivative tensor — uncontracted in primary space
-/// `(η, g)`. Indexed `T[a][b][c]` with a/b/c ∈ {0=η, 1=g}; the tensor is
-/// fully symmetric in its three indices, so only four distinct values appear:
-/// `T_ηηη`, `T_ηηg`, `T_ηgg`, `T_ggg`.
-///
-/// This is the axis-invariant building block: a single per-row evaluation
-/// produces a tensor that every ψ-axis then contracts cheaply via
-/// [`contract_third_full`]. The previous design recomputed the
-/// already-contracted matrix per axis, paying the heavy primary-derivative
-/// machinery `n_axes` times per row.
-pub(super) fn rigid_transformed_third_full(
-    marginal: BernoulliMarginalLinkMap,
-    kernel: &RigidProbitKernel,
-) -> [[[f64; 2]; 2]; 2] {
-    let h_q = kernel.primary_hessian(marginal.q);
-    let grad_q = kernel.u1 * kernel.eta_q;
-    let (f_qqq, f_qqg, f_qgg, f_ggg) = rigid_internal_third_components(marginal, kernel);
-    let f_etaetaeta =
-        f_qqq * marginal.q1_cu + 3.0 * h_q[0][0] * marginal.q1 * marginal.q2 + grad_q * marginal.q3;
-    let f_etaetag = f_qqg * marginal.q1_sq + h_q[0][1] * marginal.q2;
-    let f_etagg = f_qgg * marginal.q1;
-    third_full_from_symmetric_components(f_etaetaeta, f_etaetag, f_etagg, f_ggg)
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<[[[f64; 2]; 2]; 2], String> {
+    Ok(rigid_standard_normal_tower(marginal, g, z, y, w, probit_scale)?.t3)
 }
 
 /// Pack the four independent components of a fully-symmetric 3-tensor on
@@ -1595,41 +1426,16 @@ pub(super) fn contract_third_full(t: &[[[f64; 2]; 2]; 2], d_eta: f64, d_g: f64) 
     ]
 }
 
-/// Closed-form rigid fourth-derivative tensor — uncontracted in primary
-/// space `(η, g)`. Indexed `T[a][b][c][d]` with each index ∈ {0=η, 1=g};
-/// fully symmetric in all four indices, so only five distinct values appear:
-/// `T_ηηηη`, `T_ηηηg`, `T_ηηgg`, `T_ηggg`, `T_gggg`.
-///
-/// Same structural role as [`rigid_transformed_third_full`] one order up:
-/// the 5 axis-invariant components are computed once per row, and every
-/// (u, v) ψ-axis pair then folds them into a 2×2 matrix via the cheap
-/// [`contract_fourth_full`]. The previous design re-derived all five
-/// components per (row, axis-pair), or O(rank²) per row.
-pub(super) fn rigid_transformed_fourth_full(
+#[inline]
+pub(super) fn rigid_standard_normal_fourth_full(
     marginal: BernoulliMarginalLinkMap,
-    kernel: &RigidProbitKernel,
-) -> [[[[f64; 2]; 2]; 2]; 2] {
-    let h_q = kernel.primary_hessian(marginal.q);
-    let grad_q = kernel.u1 * kernel.eta_q;
-    let (f_qqq, f_qqg, f_qgg, _) = rigid_internal_third_components(marginal, kernel);
-    let qq = kernel.fourth_contracted(marginal.q, 1.0, 0.0, 1.0, 0.0);
-    let qg = kernel.fourth_contracted(marginal.q, 1.0, 0.0, 0.0, 1.0);
-    let gg = kernel.fourth_contracted(marginal.q, 0.0, 1.0, 0.0, 1.0);
-    let f_qqqq = qq[0][0];
-    let f_qqqg = qq[0][1];
-    let f_qqgg = qq[1][1];
-    let f_qggg = qg[1][1];
-    let f_gggg = gg[1][1];
-    let f_eta4 = f_qqqq * marginal.q1_q
-        + 6.0 * f_qqq * marginal.q1_sq * marginal.q2
-        + 3.0 * h_q[0][0] * marginal.q2 * marginal.q2
-        + 4.0 * h_q[0][0] * marginal.q1 * marginal.q3
-        + grad_q * marginal.q4;
-    let f_eta3g =
-        f_qqqg * marginal.q1_cu + 3.0 * f_qqg * marginal.q1 * marginal.q2 + h_q[0][1] * marginal.q3;
-    let f_eta2g2 = f_qqgg * marginal.q1_sq + f_qgg * marginal.q2;
-    let f_etag3 = f_qggg * marginal.q1;
-    fourth_full_from_symmetric_components(f_eta4, f_eta3g, f_eta2g2, f_etag3, f_gggg)
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<[[[[f64; 2]; 2]; 2]; 2], String> {
+    Ok(rigid_standard_normal_tower(marginal, g, z, y, w, probit_scale)?.t4)
 }
 
 /// Pack the five independent components of a fully-symmetric 4-tensor on a

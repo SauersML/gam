@@ -421,7 +421,7 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// hits `rigid_row_third_contracted` once per (row, ψ-axis) — 32× per
     /// row at large-scale shape — but the per-row jet is axis-invariant. This
     /// cache lets the closed-form third-derivative tensor
-    /// (`empirical_rigid_third_full_closed_form`, or `rigid_transformed_third_full`
+    /// (`empirical_rigid_third_full_closed_form`, or `rigid_standard_normal_third_full`
     /// for the standard-normal measure) run at most once per row per cache
     /// lifetime; per-axis callers reduce to a 2×2 [`contract_third_full`].
     ///
