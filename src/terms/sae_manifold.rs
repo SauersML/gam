@@ -7340,6 +7340,29 @@ impl SaeManifoldTerm {
             // Assignment prior in logit space.
             // For compact layout: position `j` = active_atoms index.
             // For dense layout: position `atom_idx` directly.
+            //
+            // H-consistency note (#1006 audit). This `assignment_hdiag` is the
+            // assignment penalty's EXACT `hessian_diag` (softmax-sparsity, IBP-MAP
+            // empirical-π, or JumpReLU surrogate), added RAW — unlike the ARD
+            // coordinate curvature (`prior.hess.max(0.0)` below) and the
+            // decoder-tier penalties (`psd_majorizer_diag`), it is NOT majorized.
+            // That diagonal CAN be negative (the softmax `(1−2z)`-type logit
+            // curvature, IBP `score·(1−2z)` term), so the assembled `H_tt` is
+            // Gauss-Newton (PSD) + majorized ARD (PSD) + raw-assignment-prior
+            // (indefinite) and is therefore NOT guaranteed PD off the optimum.
+            // This refutes the "pure GN+majorizer cannot be non-PD" premise: the
+            // genuine non-PD the evidence factorization reports
+            // (`arrow_schur.rs` "evidence mode preserves the genuine Cholesky")
+            // comes from this un-majorized term, not from any divergence between
+            // the Newton-solve H and the evidence H. Both paths factor THIS one
+            // assembled block (single source of truth); they differ only in ridge
+            // policy — Newton conditions a non-PD block, evidence refuses to (a
+            // silent ridge would shift the reported log-det). At the converged
+            // optimum `H_tt` is PD, where the evidence factor is taken. Because
+            // the criterion's log|H| and the Γ adjoint (`logdet_theta_adjoint`)
+            // both differentiate THIS raw diagonal — `hessian_diag` and its exact
+            // logit third channels `hessian_diag_logit_third_channels`,
+            // #1006 — value and gradient stay on the same branch with no desync.
             let assignment_base = row * k_atoms;
             if let Some(ref layout) = row_layout {
                 let active = &layout.active_atoms[row];
