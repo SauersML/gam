@@ -12676,13 +12676,66 @@ fn shrink_active_joint_block_trust_radii(
     factor: f64,
 ) -> f64 {
     assert_eq!(block_radii.len(), block_step_norms.len());
+    // Joint-Newton step-rejection radius shrink. Must guarantee strict
+    // monotone decrease of `max(block_radii)` until the floor, otherwise the
+    // next trust-region attempt computes a step byte-identical to the rejected
+    // one and the inner loop stalls forever (gam joint-Newton fully-rejected
+    // cycles, root cause behind the 8-cycle bail at FULLY_REJECTED_STALL_MAX_CYCLES).
+    //
+    // Two cooperating mechanisms:
+    //   * For every block that participates in the shrink, the new radius is
+    //     pulled below the rejected step's magnitude (`0.5 · step_norm`),
+    //     matching the analogous clamp in `update_joint_trust_region_radius`'s
+    //     reject branch. This forces the next step to be strictly smaller
+    //     than the current one even when `radius * factor` is still larger
+    //     than `step_norm` (which happens whenever the dogleg/truncate path
+    //     returned a Newton step shorter than the block's radius).
+    //   * Block participation: by default only shrink blocks whose step hit
+    //     the per-block trust boundary (the boundary block was the one the
+    //     trust radius actually constrained — interior blocks took their
+    //     natural Newton step and shrinking their radius is wasted). BUT when
+    //     every boundary block already sits at the 1e-12 floor, further
+    //     shrinking those blocks is a no-op (they'd just re-clamp to the
+    //     floor), so we *must* shrink the interior blocks instead to actually
+    //     change the joint step. Without this carve-out the deadlock was:
+    //     boundary block pinned at 1e-12, interior block radius held at its
+    //     pre-stall value, `max(block_radii)` held by the interior block, the
+    //     dogleg/truncate produces an identical joint δ every cycle, every
+    //     trust attempt rejects on the same objective check, the cycle burns
+    //     to `inner_loop_hard_ceiling` (1200) cycles wasting ~120 s per
+    //     outer ρ-evaluation — the Rust CI Test hang and the
+    //     `rust_margslope_aniso_duchon16d_*` large-scale 2400 s timeout.
+    const RADIUS_FLOOR: f64 = 1.0e-12;
     let any_boundary_block = block_radii
         .iter()
         .zip(block_step_norms)
         .any(|(radius, step_norm)| joint_block_step_hit_trust_boundary(*step_norm, *radius));
+    let all_boundary_blocks_at_floor = any_boundary_block
+        && block_radii
+            .iter()
+            .zip(block_step_norms)
+            .filter(|(radius, step_norm)| {
+                joint_block_step_hit_trust_boundary(**step_norm, **radius)
+            })
+            .all(|(radius, _)| *radius <= RADIUS_FLOOR * (1.0 + 1.0e-12));
     for (radius, step_norm) in block_radii.iter_mut().zip(block_step_norms) {
-        if !any_boundary_block || joint_block_step_hit_trust_boundary(*step_norm, *radius) {
-            *radius = (*radius * factor).clamp(1.0e-12, 1.0e6);
+        let at_boundary = joint_block_step_hit_trust_boundary(*step_norm, *radius);
+        let participates = if all_boundary_blocks_at_floor {
+            // Boundary-at-floor stall: the boundary blocks cannot shrink any
+            // further, so participate every block (including interior ones)
+            // so the joint step magnitude actually changes.
+            true
+        } else if any_boundary_block {
+            at_boundary
+        } else {
+            true
+        };
+        if participates {
+            let mut new_radius = *radius * factor;
+            if step_norm.is_finite() && *step_norm > 0.0 {
+                new_radius = new_radius.min(0.5 * *step_norm);
+            }
+            *radius = new_radius.clamp(RADIUS_FLOOR, 1.0e6);
         }
     }
     block_radii.iter().copied().fold(0.0_f64, f64::max)
@@ -34260,6 +34313,59 @@ mod tests {
         assert!(
             block_linearized < 1.0e-6,
             "block-local curvature metric must let the time block neutralize its KKT defect; got {block_linearized:.3e}"
+        );
+    }
+
+    #[test]
+    fn shrink_active_joint_block_trust_radii_strictly_decreases_max_radius() {
+        // Regression for the joint-Newton fully-rejected stall. Before the
+        // fix, when a boundary block's radius was already at the 1e-12 floor
+        // and an interior block held the max, `shrink_active_joint_block_trust_radii`
+        // returned the same `max(block_radii)` on every call — the trust
+        // region never actually shrank, the dogleg recomputed an identical
+        // joint δ, and the inner solver burned `inner_loop_hard_ceiling`
+        // cycles before the 8-cycle stall guard finally bailed it out. The
+        // fix must guarantee that every call strictly decreases the joint
+        // trust radius until the floor.
+        let mut block_radii = vec![1.0, 1.0e-12];
+        // Boundary block (#1) sits at the radius floor with step at boundary;
+        // interior block (#0) has step well inside its radius. Before the
+        // fix: only block #1 participates, its radius re-clamps to 1e-12,
+        // returned max stays at 1.0 — byte-identical to the previous call.
+        let block_step_norms = vec![1.0e-3, 1.0e-12];
+        let old_max = block_radii.iter().copied().fold(0.0_f64, f64::max);
+        let new_max =
+            shrink_active_joint_block_trust_radii(&mut block_radii, &block_step_norms, 0.25);
+        assert!(
+            new_max < old_max,
+            "joint trust radius must strictly decrease when a step is rejected (was {old_max:.3e}, now {new_max:.3e})"
+        );
+        // Interior block must have shrunk below its current step norm so the
+        // next dogleg step is forced strictly smaller in that block.
+        assert!(
+            block_radii[0] < block_step_norms[0],
+            "interior block radius must drop below its step norm to force a strictly smaller next step (radius {:.3e}, step {:.3e})",
+            block_radii[0],
+            block_step_norms[0]
+        );
+    }
+
+    #[test]
+    fn shrink_active_joint_block_trust_radii_pulls_radius_below_step_norm() {
+        // The accept-path radius update (`update_joint_trust_region_radius`)
+        // pulls the new radius below `0.5 * step_norm` on rejection so the
+        // next step is provably smaller; the reject-path block shrink must
+        // do the same. Otherwise an interior block with `step_norm <<
+        // factor * radius` re-takes the identical Newton step on the next
+        // dogleg attempt and the trust-region globalization is degenerate.
+        let mut block_radii = vec![1.0];
+        let block_step_norms = vec![1.0e-3];
+        let new_max =
+            shrink_active_joint_block_trust_radii(&mut block_radii, &block_step_norms, 0.25);
+        assert!(
+            new_max <= 0.5 * block_step_norms[0],
+            "shrunken radius must be ≤ 0.5 · step_norm to force a strictly smaller next step (was {new_max:.3e}, step {:.3e})",
+            block_step_norms[0]
         );
     }
 
