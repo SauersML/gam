@@ -533,11 +533,22 @@ class ManifoldSAE:
     def atom_trust(self, atom: int) -> float:
         """Scalar trust score for one atom, in ``[0, 1]``."""
         k = self._atom_index(atom)
-        return float(np.asarray(self.diagnostics["atom_trust"], dtype=float)[k])
+        trust = np.asarray(self.diagnostics["atom_trust"], dtype=float)
+        if trust.size == 0:
+            raise ValueError(
+                "this fit payload carries no trust diagnostics (the Rust runtime "
+                "did not emit them); atom_trust is unavailable"
+            )
+        return float(trust[k])
 
     def atom_diagnostics(self, atom: int) -> dict[str, Any]:
         """All trust diagnostic components for one atom."""
         k = self._atom_index(atom)
+        if not self.diagnostics["atoms"]:
+            raise ValueError(
+                "this fit payload carries no trust diagnostics (the Rust runtime "
+                "did not emit them); atom_diagnostics is unavailable"
+            )
         return dict(self.diagnostics["atoms"][k])
 
     def shape_uncertainty(self, atom: int = 0, *, n_sd: float = 1.96) -> dict[str, np.ndarray]:
