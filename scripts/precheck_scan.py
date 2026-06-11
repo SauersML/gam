@@ -939,18 +939,29 @@ def scan_useless_tests(rel, stripped_lines, raw_lines, hits):
     fns = _index_fns(stripped_lines)
     by_open = {o: (nm, o, c) for (nm, o, c) in fns}
 
-    def asserts(open_l, close_l, depth=0):
+    # build.rs follows delegated assertions up to MAX_DELEGATION_DEPTH = 4 hops
+    # (a #[test] → helper → helper → … chain). Matching that depth (and tracking
+    # the visited helper set to terminate on mutually-recursive helpers) is what
+    # keeps the gate from false-positiving a test whose asserts live two or more
+    # helper levels down — the failure mode the team flagged.
+    MAX_DELEGATION_DEPTH = 4
+
+    def asserts(open_l, close_l, depth=MAX_DELEGATION_DEPTH, visited=None):
+        if visited is None:
+            visited = {open_l}
         for j in range(open_l, close_l + 1):
             if line_is_assertion_shaped(stripped_lines[j]):
                 return True
-        if depth >= 1:
+        if depth == 0:
             return False
         called = set()
         for j in range(open_l, close_l + 1):
             _collect_calls(stripped_lines[j], called)
         for (nm, o2, c2) in fns:
-            if nm in called and o2 != open_l and asserts(o2, c2, depth + 1):
-                return True
+            if nm in called and o2 not in visited:
+                visited.add(o2)
+                if asserts(o2, c2, depth - 1, visited):
+                    return True
         return False
 
     for idx in range(n):
