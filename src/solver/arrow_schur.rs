@@ -1802,16 +1802,28 @@ pub trait BatchedBlockSolver {
         ridge_t: f64,
         d: usize,
         tolerate_ill_conditioning: bool,
-    ) -> Result<Vec<Array2<f64>>, ArrowSchurError>;
+    ) -> Result<ArrowFactorSlab, ArrowSchurError>;
 
     /// Solve one factored point block against a vector RHS.
-    fn solve_block_vector(&self, factor: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64>;
+    fn solve_block_vector(
+        &self,
+        factor: ArrayView2<'_, f64>,
+        rhs: ArrayView1<'_, f64>,
+    ) -> Array1<f64>;
 
     /// Solve one factored point block against a dense matrix RHS.
-    fn solve_block_matrix(&self, factor: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64>;
+    fn solve_block_matrix(
+        &self,
+        factor: ArrayView2<'_, f64>,
+        rhs: ArrayView2<'_, f64>,
+    ) -> Array2<f64>;
 
     /// Apply the Square-Root BA lower-triangular solve `L_i^-1 rhs`.
-    fn sqrt_solve_block_matrix(&self, factor: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64>;
+    fn sqrt_solve_block_matrix(
+        &self,
+        factor: ArrayView2<'_, f64>,
+        rhs: ArrayView2<'_, f64>,
+    ) -> Array2<f64>;
 
     /// Subtract a row-local Schur product from the dense reduced system.
     fn block_gemm_subtract(&self, schur: &mut Array2<f64>, left: &Array2<f64>, right: &Array2<f64>);
@@ -1832,7 +1844,7 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         ridge_t: f64,
         d: usize,
         tolerate_ill_conditioning: bool,
-    ) -> Result<Vec<Array2<f64>>, ArrowSchurError> {
+    ) -> Result<ArrowFactorSlab, ArrowSchurError> {
         // Multi-GPU fast path: the per-row blocks `H_tt^(i) + ridge_t·I` are
         // independent same-size SPD systems — exactly the batch
         // `crate::gpu::try_cholesky_batched_lower_inplace` spreads across ALL
@@ -1862,18 +1874,30 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
                 tolerate_ill_conditioning,
             )?);
         }
-        Ok(out)
+        Ok(ArrowFactorSlab::from_blocks(out))
     }
 
-    fn solve_block_vector(&self, factor: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
+    fn solve_block_vector(
+        &self,
+        factor: ArrayView2<'_, f64>,
+        rhs: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
         cholesky_solve_vector(factor, rhs)
     }
 
-    fn solve_block_matrix(&self, factor: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
+    fn solve_block_matrix(
+        &self,
+        factor: ArrayView2<'_, f64>,
+        rhs: ArrayView2<'_, f64>,
+    ) -> Array2<f64> {
         cholesky_solve_matrix(factor, rhs)
     }
 
-    fn sqrt_solve_block_matrix(&self, factor: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
+    fn sqrt_solve_block_matrix(
+        &self,
+        factor: ArrayView2<'_, f64>,
+        rhs: ArrayView2<'_, f64>,
+    ) -> Array2<f64> {
         forward_substitution_lower_matrix(factor, rhs)
     }
 
@@ -1931,7 +1955,7 @@ fn try_factor_blocks_batched(
     ridge_t: f64,
     d: usize,
     tolerate_ill_conditioning: bool,
-) -> Option<Vec<Array2<f64>>> {
+) -> Option<ArrowFactorSlab> {
     if d == 0 || rows.is_empty() {
         return None;
     }
@@ -1975,7 +1999,7 @@ fn try_factor_blocks_batched(
             }
         }
     }
-    Some(blocks)
+    Some(ArrowFactorSlab::from_blocks(blocks))
 }
 
 fn row_block_diag_scale(row: &ArrowRowBlock, d: usize) -> f64 {
@@ -3777,7 +3801,7 @@ impl StreamingArrowSchur {
             let htbeta = self.row_htbeta(row_idx, &row, di);
             let factor =
                 factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
-            let v = backend.solve_block_vector(&factor, &row.gt);
+            let v = backend.solve_block_vector(factor.view(), row.gt.view());
             for c in 0..di {
                 let vc = v[c];
                 if vc == 0.0 {
@@ -3798,11 +3822,11 @@ impl StreamingArrowSchur {
                 // rejection at this site is lifted because chunked assembly is
                 // exactly the matrix-free reduction the PCG path wants.
                 ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
-                    let solved = backend.solve_block_matrix(&factor, &htbeta);
+                    let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
                     backend.block_gemm_subtract(&mut self.s_acc, &htbeta, &solved);
                 }
                 ArrowSolverMode::SqrtBA => {
-                    let whitened = backend.sqrt_solve_block_matrix(&factor, &htbeta);
+                    let whitened = backend.sqrt_solve_block_matrix(factor.view(), htbeta.view());
                     backend.block_gemm_subtract(&mut self.s_acc, &whitened, &whitened);
                 }
             }
@@ -3848,11 +3872,12 @@ impl StreamingArrowSchur {
                 }
                 match options.mode {
                     ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
-                        let solved = backend.solve_block_matrix(&factor, &htbeta);
+                        let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
                         backend.block_gemm_subtract(&mut self.s_acc, &htbeta, &solved);
                     }
                     ArrowSolverMode::SqrtBA => {
-                        let whitened = backend.sqrt_solve_block_matrix(&factor, &htbeta);
+                        let whitened =
+                            backend.sqrt_solve_block_matrix(factor.view(), htbeta.view());
                         backend.block_gemm_subtract(&mut self.s_acc, &whitened, &whitened);
                     }
                 }
@@ -3960,7 +3985,7 @@ impl StreamingArrowSchur {
                 for c in 0..di {
                     rhs[c] = row.gt[c] + htbeta_delta[c];
                 }
-                let dt_i = backend.solve_block_vector(&factor, &rhs);
+                let dt_i = backend.solve_block_vector(factor.view(), rhs.view());
                 let row_base = self.row_offsets[row_idx];
                 for c in 0..di {
                     delta_t[row_base + c] = -dt_i[c];
@@ -4069,9 +4094,65 @@ fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKind) -> bool
 /// predicted by re-using these factors against a refreshed RHS, saving
 /// the dominant `O(N d³ + K³)` factorization cost.
 #[derive(Clone)]
+pub struct ArrowFactorSlab {
+    data: Arc<[f64]>,
+    offsets: Arc<[usize]>,
+    dims: Arc<[usize]>,
+}
+
+impl ArrowFactorSlab {
+    pub fn from_blocks(blocks: Vec<Array2<f64>>) -> Self {
+        let mut data = Vec::new();
+        let mut offsets = Vec::with_capacity(blocks.len() + 1);
+        let mut dims = Vec::with_capacity(blocks.len());
+        offsets.push(0);
+        for block in blocks {
+            let (rows, cols) = block.dim();
+            assert_eq!(rows, cols, "ArrowFactorSlab stores square row factors");
+            dims.push(rows);
+            data.extend(block.iter().copied());
+            offsets.push(data.len());
+        }
+        Self {
+            data: data.into(),
+            offsets: offsets.into(),
+            dims: dims.into(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.dims.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dims.is_empty()
+    }
+
+    pub fn factor(&self, row: usize) -> ArrayView2<'_, f64> {
+        let dim = self.dims[row];
+        let range = self.offsets[row]..self.offsets[row + 1];
+        ArrayView2::from_shape((dim, dim), &self.data[range])
+            .expect("ArrowFactorSlab row offset/dim invariant violated")
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = ArrayView2<'_, f64>> + '_ {
+        (0..self.len()).map(|row| self.factor(row))
+    }
+}
+
+impl std::fmt::Debug for ArrowFactorSlab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArrowFactorSlab")
+            .field("rows", &self.len())
+            .field("values", &self.data.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub enum ArrowUndampedFactors {
     SameAsDamped,
-    Owned(Arc<[Array2<f64>]>),
+    Owned(ArrowFactorSlab),
 }
 
 impl std::fmt::Debug for ArrowUndampedFactors {
@@ -4352,7 +4433,7 @@ pub struct ArrowFactorCache {
     ///
     /// These are the *damped* factors used inside the Newton solve. The IFT
     /// predictor must NOT use them — see [`Self::htt_factors_undamped`].
-    pub htt_factors: Arc<[Array2<f64>]>,
+    pub htt_factors: ArrowFactorSlab,
     /// Per-row lower-triangular Cholesky factors of the UNDAMPED
     /// `H_tt^(i)` (no `ridge_t` added).
     ///
@@ -4426,7 +4507,7 @@ impl ArrowFactorMinPivot {
     }
 }
 
-fn lower_cholesky_min_pivot(factor: &Array2<f64>) -> Option<f64> {
+fn lower_cholesky_min_pivot(factor: ArrayView2<'_, f64>) -> Option<f64> {
     let width = factor.nrows().min(factor.ncols());
     let mut out = None;
     for idx in 0..width {
@@ -4457,7 +4538,7 @@ pub fn arrow_factor_min_pivot(cache: &ArrowFactorCache) -> ArrowFactorMinPivot {
     let min_schur_pivot = cache
         .schur_factor
         .as_ref()
-        .and_then(lower_cholesky_min_pivot);
+        .and_then(|factor| lower_cholesky_min_pivot(factor.view()));
     ArrowFactorMinPivot::combine(min_row_pivot, min_schur_pivot)
 }
 
@@ -4470,10 +4551,10 @@ impl ArrowFactorCache {
         self.htbeta.is_available()
     }
 
-    pub fn undamped_factor(&self, row: usize) -> &Array2<f64> {
+    pub fn undamped_factor(&self, row: usize) -> ArrayView2<'_, f64> {
         match &self.htt_factors_undamped {
-            ArrowUndampedFactors::SameAsDamped => &self.htt_factors[row],
-            ArrowUndampedFactors::Owned(factors) => &factors[row],
+            ArrowUndampedFactors::SameAsDamped => self.htt_factors.factor(row),
+            ArrowUndampedFactors::Owned(factors) => factors.factor(row),
         }
     }
 
@@ -4484,7 +4565,7 @@ impl ArrowFactorCache {
         }
     }
 
-    pub fn undamped_factors_iter(&self) -> impl Iterator<Item = &Array2<f64>> {
+    pub fn undamped_factors_iter(&self) -> impl Iterator<Item = ArrayView2<'_, f64>> + '_ {
         (0..self.undamped_factor_count()).map(|row| self.undamped_factor(row))
     }
 
@@ -4946,15 +5027,16 @@ pub fn solve_arrow_newton_step_with_options(
     // ridge_t was zero the damped and undamped factors coincide and we
     // can alias htt_factors directly; otherwise pay a second per-row
     // Cholesky (O(N d³), same complexity class as the Newton solve).
-    let htt_factors = Arc::<[Array2<f64>]>::from(step.htt_factors);
+    let htt_factors = step.htt_factors;
     let htt_factors_undamped = if ridge_t == 0.0 {
         ArrowUndampedFactors::SameAsDamped
     } else {
-        ArrowUndampedFactors::Owned(
-            backend
-                .factor_blocks(&sys.rows, 0.0, sys.d, options.tolerate_ill_conditioning)?
-                .into(),
-        )
+        ArrowUndampedFactors::Owned(backend.factor_blocks(
+            &sys.rows,
+            0.0,
+            sys.d,
+            options.tolerate_ill_conditioning,
+        )?)
     };
     let cache = ArrowFactorCache {
         htt_factors,
@@ -5426,7 +5508,7 @@ fn arrow_gradient_dot_step(
 struct ArrowNewtonStepArtifacts {
     delta_t: Array1<f64>,
     delta_beta: Array1<f64>,
-    htt_factors: Vec<Array2<f64>>,
+    htt_factors: ArrowFactorSlab,
     schur_factor: Option<Array2<f64>>,
     pcg_diagnostics: PcgDiagnostics,
 }
@@ -5452,7 +5534,7 @@ fn solve_arrow_newton_step_artifacts(
         return Ok(ArrowNewtonStepArtifacts {
             delta_t,
             delta_beta,
-            htt_factors: Vec::new(),
+            htt_factors: ArrowFactorSlab::from_blocks(Vec::new()),
             schur_factor,
             pcg_diagnostics: PcgDiagnostics::default(),
         });
@@ -5532,7 +5614,7 @@ fn solve_arrow_newton_step_artifacts(
             }
         }
         let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
-        let dt_i = backend.solve_block_vector(&htt_factors[i], &rhs_slice);
+        let dt_i = backend.solve_block_vector(htt_factors.factor(i), rhs_slice.view());
         for c in 0..di {
             delta_t[row_base + c] = -dt_i[c];
         }
@@ -5558,7 +5640,7 @@ fn solve_arrow_newton_step_artifacts(
 struct ArrowBlockDiagInverse<'a, B: BatchedBlockSolver> {
     sys: &'a ArrowSchurSystem,
     backend: &'a B,
-    htt_factors: Vec<Array2<f64>>,
+    htt_factors: ArrowFactorSlab,
     schur_factor: Array2<f64>,
 }
 
@@ -5604,7 +5686,9 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
             let di = sys.row_dims[i];
             let base = sys.row_offsets[i];
             let r_ti = r_t.slice(ndarray::s![base..base + di]).to_owned();
-            let u_i = self.backend.solve_block_vector(&self.htt_factors[i], &r_ti);
+            let u_i = self
+                .backend
+                .solve_block_vector(self.htt_factors.factor(i), r_ti.view());
             let mut acc = Array1::<f64>::zeros(k);
             sys_htbeta_accumulate_transpose(sys, i, &sys.rows[i], u_i.view(), &mut acc);
             for a in 0..k {
@@ -5631,7 +5715,7 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
             }
             let xi = self
                 .backend
-                .solve_block_vector(&self.htt_factors[i], &rhs_i);
+                .solve_block_vector(self.htt_factors.factor(i), rhs_i.view());
             for c in 0..di {
                 x_t[base + c] = xi[c];
             }
@@ -5885,7 +5969,7 @@ fn cholesky_solve_lower(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
 
 fn reduced_rhs_beta<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
-    htt_factors: &[Array2<f64>],
+    htt_factors: &ArrowFactorSlab,
     backend: &B,
 ) -> Array1<f64> {
     // Numerical invariant: each per-row `H_tt^(i)` factor must be PD
@@ -5893,7 +5977,7 @@ fn reduced_rhs_beta<B: BatchedBlockSolver>(
     let k = sys.k;
     let mut rhs_beta = Array1::<f64>::zeros(k);
     for (i, row) in sys.rows.iter().enumerate() {
-        let v = backend.solve_block_vector(&htt_factors[i], &row.gt);
+        let v = backend.solve_block_vector(htt_factors.factor(i), row.gt.view());
         // H_βt^(i) · v accumulates into rhs_beta.  Routes through
         // sys.htbeta_matvec when the dense block is absent.
         sys_htbeta_accumulate_transpose(sys, i, row, v.view(), &mut rhs_beta);
@@ -5923,7 +6007,7 @@ fn row_schur_contribution_factors<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
     row_idx: usize,
     row: &ArrowRowBlock,
-    htt_factor: &Array2<f64>,
+    htt_factor: ArrayView2<'_, f64>,
     backend: &B,
     kind: SchurReductionKind,
 ) -> (Array2<f64>, Array2<f64>) {
@@ -5932,11 +6016,11 @@ fn row_schur_contribution_factors<B: BatchedBlockSolver>(
     let htbeta = sys_htbeta_materialize_row(sys, row_idx, row);
     match kind {
         SchurReductionKind::Direct => {
-            let solved = backend.solve_block_matrix(htt_factor, &htbeta);
+            let solved = backend.solve_block_matrix(htt_factor, htbeta.view());
             (htbeta, solved)
         }
         SchurReductionKind::SqrtBa => {
-            let whitened = backend.sqrt_solve_block_matrix(htt_factor, &htbeta);
+            let whitened = backend.sqrt_solve_block_matrix(htt_factor, htbeta.view());
             (whitened.clone(), whitened)
         }
     }
@@ -5951,7 +6035,7 @@ fn subtract_row_schur_contribution<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
     row_idx: usize,
     row: &ArrowRowBlock,
-    htt_factor: &Array2<f64>,
+    htt_factor: ArrayView2<'_, f64>,
     backend: &B,
     kind: SchurReductionKind,
     schur: &mut Array2<f64>,
@@ -5974,7 +6058,7 @@ fn subtract_row_schur_contribution<B: BatchedBlockSolver>(
 /// `schur += partial` reproduces the serial `schur -= Σ contribution`.
 fn tile_schur_partial<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
-    htt_factors: &[Array2<f64>],
+    htt_factors: &ArrowFactorSlab,
     backend: &B,
     kind: SchurReductionKind,
     ordinal: usize,
@@ -5987,8 +6071,14 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
     let mut factors: Vec<(Array2<f64>, Array2<f64>)> = Vec::with_capacity(range.len());
     let mut total_d = 0usize;
     for i in range.clone() {
-        let (left, right) =
-            row_schur_contribution_factors(sys, i, &sys.rows[i], &htt_factors[i], backend, kind);
+        let (left, right) = row_schur_contribution_factors(
+            sys,
+            i,
+            &sys.rows[i],
+            htt_factors.factor(i),
+            backend,
+            kind,
+        );
         total_d += left.nrows();
         factors.push((left, right));
     }
@@ -6045,7 +6135,7 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
 /// is bit-for-bit the original behaviour.
 fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
-    htt_factors: &[Array2<f64>],
+    htt_factors: &ArrowFactorSlab,
     backend: &B,
     kind: SchurReductionKind,
     schur: &mut Array2<f64>,
@@ -6060,7 +6150,15 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     let Some(tiles) = tiles else {
         // Single-device / CPU: reduce serially in place (original order).
         for (i, row) in sys.rows.iter().enumerate() {
-            subtract_row_schur_contribution(sys, i, row, &htt_factors[i], backend, kind, schur);
+            subtract_row_schur_contribution(
+                sys,
+                i,
+                row,
+                htt_factors.factor(i),
+                backend,
+                kind,
+                schur,
+            );
         }
         return;
     };
@@ -6118,7 +6216,7 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
 
 fn build_dense_schur_direct<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
-    htt_factors: &[Array2<f64>],
+    htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
     backend: &B,
 ) -> Result<Array2<f64>, ArrowSchurError> {
@@ -6148,7 +6246,7 @@ fn build_dense_schur_direct<B: BatchedBlockSolver + Sync>(
 
 fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
-    htt_factors: &[Array2<f64>],
+    htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
     backend: &B,
 ) -> Result<Array2<f64>, ArrowSchurError> {
@@ -6318,7 +6416,7 @@ fn step_inside_trust_region(
 
 fn schur_matvec<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
-    htt_factors: &[Array2<f64>],
+    htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
     x: &Array1<f64>,
     out: &mut Array1<f64>,
@@ -6354,7 +6452,7 @@ fn schur_matvec<B: BatchedBlockSolver>(
         let mut local_i = local.slice_mut(ndarray::s![..di]).to_owned();
         local_i.fill(0.0);
         sys_htbeta_apply_row(sys, i, row, x.view(), &mut local_i);
-        let solved = backend.solve_block_vector(&htt_factors[i], &local_i);
+        let solved = backend.solve_block_vector(htt_factors.factor(i), local_i.view());
         // H_βt^(i) · solved accumulates into neg_contrib (length k), then
         // subtracted from out.  Routed through sys.htbeta_matvec when needed.
         neg_contrib.fill(0.0);
@@ -6441,7 +6539,7 @@ impl JacobiPreconditioner {
     /// stored.  Otherwise every column gets its own scalar entry.
     pub fn from_arrow_schur<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
-        htt_factors: &[Array2<f64>],
+        htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
         backend: &B,
     ) -> Result<Self, ArrowSchurError> {
@@ -6467,7 +6565,7 @@ impl JacobiPreconditioner {
     /// each column is probed via the matvec (one call per column per row).
     fn build_scalar_jacobi<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
-        htt_factors: &[Array2<f64>],
+        htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
         backend: &B,
     ) -> Result<Self, ArrowSchurError> {
@@ -6502,7 +6600,7 @@ impl JacobiPreconditioner {
                         col_i[c] = row.htbeta[[c, a]];
                     }
                 }
-                let solved = backend.solve_block_vector(&htt_factors[i], &col_i);
+                let solved = backend.solve_block_vector(htt_factors.factor(i), col_i.view());
                 let mut acc = 0.0;
                 for c in 0..di {
                     acc += col_i[c] * solved[c];
@@ -6533,7 +6631,7 @@ impl JacobiPreconditioner {
     /// `sys.block_offsets`.
     fn build_block_jacobi<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
-        htt_factors: &[Array2<f64>],
+        htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
         backend: &B,
     ) -> Result<Self, ArrowSchurError> {
@@ -6580,8 +6678,8 @@ impl JacobiPreconditioner {
                 let mut solved_cols = Array2::<f64>::zeros((di, b));
                 for bj in 0..b {
                     let gj = range.start + bj;
-                    let solved = backend
-                        .solve_block_vector(&htt_factors[i], &htbeta_full.column(gj).to_owned());
+                    let rhs = htbeta_full.column(gj).to_owned();
+                    let solved = backend.solve_block_vector(htt_factors.factor(i), rhs.view());
                     for c in 0..di {
                         solved_cols[[c, bj]] = solved[c];
                     }
@@ -6750,7 +6848,7 @@ pub struct ClusterJacobiPreconditioner {
 impl ClusterJacobiPreconditioner {
     pub fn from_arrow_schur<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
-        htt_factors: &[Array2<f64>],
+        htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
         backend: &B,
     ) -> Result<Self, ArrowSchurError> {
@@ -6782,7 +6880,7 @@ impl ClusterJacobiPreconditioner {
 
     fn build_from_column_groups<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
-        htt_factors: &[Array2<f64>],
+        htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
         backend: &B,
         col_groups: &[Vec<usize>],
@@ -6817,7 +6915,8 @@ impl ClusterJacobiPreconditioner {
                     for c in 0..d {
                         col_vec[c] = row.htbeta[[c, gj]];
                     }
-                    let solved = backend.solve_block_vector(&htt_factors[row_idx], &col_vec);
+                    let solved =
+                        backend.solve_block_vector(htt_factors.factor(row_idx), col_vec.view());
                     for c in 0..d {
                         solved_cols[[c, bj]] = solved[c];
                     }
@@ -6875,7 +6974,7 @@ pub struct AdditiveSchwarzPreconditioner {
 impl AdditiveSchwarzPreconditioner {
     pub fn from_arrow_schur<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
-        htt_factors: &[Array2<f64>],
+        htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
         backend: &B,
         overlap: usize,
@@ -7017,7 +7116,7 @@ fn apply_cluster(
 /// Used when a cluster is non-PD or exceeds `CLUSTER_JACOBI_MAX_CLUSTER`.
 fn build_schur_scalar_inv<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
-    htt_factors: &[Array2<f64>],
+    htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
     backend: &B,
     cols: &[usize],
@@ -7037,7 +7136,7 @@ fn build_schur_scalar_inv<B: BatchedBlockSolver>(
             for c in 0..d {
                 col_vec[c] = row.htbeta[[c, gi]];
             }
-            let solved = backend.solve_block_vector(&htt_factors[row_idx], &col_vec);
+            let solved = backend.solve_block_vector(htt_factors.factor(row_idx), col_vec.view());
             let mut acc = 0.0;
             for c in 0..d {
                 acc += col_vec[c] * solved[c];
@@ -7064,7 +7163,7 @@ fn build_schur_scalar_inv<B: BatchedBlockSolver>(
 /// `AdditiveSchwarz { overlap: 1 }`.
 fn steihaug_pcg_auto<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
-    htt_factors: &[Array2<f64>],
+    htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
     rhs: &Array1<f64>,
     pcg: &ArrowPcgOptions,
@@ -7144,7 +7243,7 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver>(
 /// Routes matvec through GPU when `gpu_matvec` is set.
 fn run_pcg_with_preconditioner<ApplyPrec, B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
-    htt_factors: &[Array2<f64>],
+    htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
     rhs: &Array1<f64>,
     apply_prec: ApplyPrec,
@@ -9064,5 +9163,25 @@ mod tests {
             .expect("tolerated cache must support latent_block_inverse_diagonal");
         assert_eq!(tdiag.len(), n * d);
         assert!(tdiag.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn arrow_factor_slab_accessor_matches_array_blocks_bitwise() {
+        let blocks = vec![
+            array![[1.0_f64]],
+            array![[2.0_f64, 0.0], [0.25, 3.0]],
+            array![[4.0_f64, 0.0, 0.0], [0.5, 5.0, 0.0], [-0.25, 0.75, 6.0]],
+        ];
+        let slab = ArrowFactorSlab::from_blocks(blocks.clone());
+        assert_eq!(slab.len(), blocks.len());
+        for row in 0..blocks.len() {
+            let view = slab.factor(row);
+            assert_eq!(view.dim(), blocks[row].dim());
+            for r in 0..blocks[row].nrows() {
+                for c in 0..blocks[row].ncols() {
+                    assert_eq!(view[[r, c]].to_bits(), blocks[row][[r, c]].to_bits());
+                }
+            }
+        }
     }
 }
