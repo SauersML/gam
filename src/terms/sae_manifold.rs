@@ -4446,6 +4446,10 @@ struct SaeManifoldMutableState {
 }
 
 impl SaeManifoldTerm {
+    fn analytic_outer_rho_gradient_supported(&self) -> bool {
+        !matches!(self.assignment.mode, AssignmentMode::IBPMap { .. })
+    }
+
     #[must_use = "build error must be handled"]
     pub fn new(atoms: Vec<SaeManifoldAtom>, assignment: SaeAssignment) -> Result<Self, String> {
         if atoms.is_empty() {
@@ -9435,6 +9439,12 @@ impl SaeManifoldTerm {
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
     ) -> Result<SaeOuterRhoGradientComponents, String> {
+        if !self.analytic_outer_rho_gradient_supported() {
+            return Err(
+                "analytic_outer_rho_gradient_components: IBP-MAP assignment priors are not supported because their empirical-pi Hessian derivative is global across rows"
+                    .to_string(),
+            );
+        }
         let n_params = rho.to_flat().len();
         let mut explicit = Array1::<f64>::zeros(n_params);
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
@@ -12851,7 +12861,11 @@ impl SaeManifoldOuterObjective {
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         OuterCapability {
-            gradient: Derivative::Analytic,
+            gradient: if self.term.analytic_outer_rho_gradient_supported() {
+                Derivative::Analytic
+            } else {
+                Derivative::Unavailable
+            },
             hessian: DeclaredHessianForm::Unavailable,
             n_params: self.baseline_rho.to_flat().len(),
             // ρ are all penalty-like / τ coordinates: precisions and
@@ -19888,6 +19902,16 @@ mod tests {
                 "Gamma row={row} local_pos={local_pos}: fd={fd:.8e}, analytic={analytic:.8e}"
             );
         }
+    }
+
+    #[test]
+    fn ibp_map_outer_objective_does_not_advertise_incomplete_analytic_gradient() {
+        let (mut term, target, rho) = gamma_fd_tiny_fixture();
+        term.assignment.mode = AssignmentMode::ibp_map(0.9, 1.0, false);
+        assert!(!term.analytic_outer_rho_gradient_supported());
+
+        let obj = SaeManifoldOuterObjective::new(term, target, None, rho, 5, 0.4, 1.0e-6, 1.0e-6);
+        assert_eq!(obj.capability().gradient, Derivative::Unavailable);
     }
 }
 
