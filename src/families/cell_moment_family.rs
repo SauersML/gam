@@ -320,6 +320,287 @@ impl ChebMomentFamily {
     }
 }
 
+// ───────────────────────── Stage B: box forest ──────────────────────────
+
+/// Minimum rows a leaf must hold before family interpolants are built for
+/// it: below this the `m²` ladder evaluations per family cost more than the
+/// direct per-row ladder calls they replace.
+pub const FOREST_MIN_ROWS_PER_LEAF: usize = 256;
+
+/// Maximum k-d subdivision depth of the `(a, b)` box forest.
+pub const FOREST_MAX_DEPTH: usize = 12;
+
+/// Tensor-Chebyshev node count per axis for forest-built families.
+pub const FOREST_NODE_COUNT: usize = 8;
+
+/// Bit-exact identity of one cell family: the `(score_span, link_span,
+/// edge-pair)` combination shared by rows. Built from the provenance the
+/// partition builder records per cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ComboKey {
+    score_bits: [u64; 6],
+    link_bits: [u64; 6],
+    left_bits: (bool, u64),
+    right_bits: (bool, u64),
+}
+
+impl ComboKey {
+    pub fn new(
+        score_span: LocalSpanCubic,
+        link_span: LocalSpanCubic,
+        left: PartitionEdge,
+        right: PartitionEdge,
+    ) -> Self {
+        let span_bits = |s: LocalSpanCubic| {
+            [
+                s.left.to_bits(),
+                s.right.to_bits(),
+                s.c0.to_bits(),
+                s.c1.to_bits(),
+                s.c2.to_bits(),
+                s.c3.to_bits(),
+            ]
+        };
+        let edge_bits = |e: PartitionEdge| match e {
+            PartitionEdge::Fixed(z) => (false, z.to_bits()),
+            PartitionEdge::Crossing { tau } => (true, tau.to_bits()),
+        };
+        Self {
+            score_bits: span_bits(score_span),
+            link_bits: span_bits(link_span),
+            left_bits: edge_bits(left),
+            right_bits: edge_bits(right),
+        }
+    }
+}
+
+/// `true` when the kink line `a + b·σ = τ` crosses the open box (sign of
+/// `a + b·σ − τ` differs across corners). Lines that merely touch a corner
+/// count as crossing — conservative.
+fn kink_line_crosses_box(
+    (a_lo, a_hi): (f64, f64),
+    (b_lo, b_hi): (f64, f64),
+    sigma: f64,
+    tau: f64,
+) -> bool {
+    let corners = [
+        a_lo + b_lo * sigma - tau,
+        a_lo + b_hi * sigma - tau,
+        a_hi + b_lo * sigma - tau,
+        a_hi + b_hi * sigma - tau,
+    ];
+    let any_nonneg = corners.iter().any(|&c| c >= 0.0);
+    let any_nonpos = corners.iter().any(|&c| c <= 0.0);
+    any_nonneg && any_nonpos
+}
+
+/// One leaf of the `(a, b)` forest: a kink-free box plus the rows it owns.
+struct ForestLeaf {
+    a_box: (f64, f64),
+    b_box: (f64, f64),
+    /// Indices into the caller's row arrays.
+    rows: Vec<usize>,
+    /// `true` when families may be built for this leaf (kink-free and
+    /// populated enough to amortize the build).
+    eligible: bool,
+}
+
+/// Adaptive kink-aware box forest over the row cloud `{(a_i, b_i)}`.
+///
+/// Deterministic: the subdivision depends only on the row coordinates and
+/// the knot vectors (longest-axis halving), never on wall-clock, RNG, or
+/// thread schedule — preserving the warm/cold invariance contract.
+pub struct CellFamilyForest {
+    leaves: Vec<ForestLeaf>,
+    /// Per (leaf, combo): a certified family, or `None` after a failed
+    /// build/certification (⇒ ladder fallback for that combo in that leaf).
+    families: std::collections::HashMap<(usize, ComboKey), Option<ChebMomentFamily>>,
+    /// Leaf index per row (parallel to the caller's row arrays).
+    row_leaf: Vec<usize>,
+}
+
+impl CellFamilyForest {
+    /// Partition the row cloud into kink-free boxes.
+    ///
+    /// `score_breaks` and `link_breaks` are the finite knot vectors whose
+    /// pairs `(σ, τ)` generate the kink lines `a + b·σ = τ`; `b = 0` is
+    /// always treated as a kink (crossings escape to ±∞ there).
+    pub fn partition(
+        a: &[f64],
+        b: &[f64],
+        score_breaks: &[f64],
+        link_breaks: &[f64],
+    ) -> Result<Self, String> {
+        if a.len() != b.len() {
+            return Err(format!(
+                "cell family forest: a/b length mismatch ({} vs {})",
+                a.len(),
+                b.len()
+            ));
+        }
+        let n = a.len();
+        if n == 0 {
+            return Ok(Self {
+                leaves: Vec::new(),
+                families: std::collections::HashMap::new(),
+                row_leaf: Vec::new(),
+            });
+        }
+        let mut a_lo = f64::INFINITY;
+        let mut a_hi = f64::NEG_INFINITY;
+        let mut b_lo = f64::INFINITY;
+        let mut b_hi = f64::NEG_INFINITY;
+        for i in 0..n {
+            if !(a[i].is_finite() && b[i].is_finite()) {
+                return Err(format!(
+                    "cell family forest: non-finite row scalars at {i}: (a={}, b={})",
+                    a[i], b[i]
+                ));
+            }
+            a_lo = a_lo.min(a[i]);
+            a_hi = a_hi.max(a[i]);
+            b_lo = b_lo.min(b[i]);
+            b_hi = b_hi.max(b[i]);
+        }
+        // Widen degenerate (single-point) extents so boxes are genuine.
+        let widen = |lo: f64, hi: f64| {
+            if hi > lo {
+                (lo, hi)
+            } else {
+                let pad = lo.abs().max(1.0) * 1.0e-9;
+                (lo - pad, hi + pad)
+            }
+        };
+        let (a_lo, a_hi) = widen(a_lo, a_hi);
+        let (b_lo, b_hi) = widen(b_lo, b_hi);
+
+        let box_is_kink_free = |a_box: (f64, f64), b_box: (f64, f64)| -> bool {
+            // b = 0 inside the box ⇒ crossings blow up.
+            if b_box.0 <= 0.0 && b_box.1 >= 0.0 {
+                return false;
+            }
+            for &sigma in score_breaks {
+                for &tau in link_breaks {
+                    if kink_line_crosses_box(a_box, b_box, sigma, tau) {
+                        return false;
+                    }
+                }
+            }
+            true
+        };
+
+        let mut leaves: Vec<ForestLeaf> = Vec::new();
+        // Explicit work stack of (a_box, b_box, rows, depth).
+        let mut stack: Vec<((f64, f64), (f64, f64), Vec<usize>, usize)> =
+            vec![((a_lo, a_hi), (b_lo, b_hi), (0..n).collect(), 0)];
+        while let Some((a_box, b_box, rows, depth)) = stack.pop() {
+            let kink_free = box_is_kink_free(a_box, b_box);
+            if kink_free || depth >= FOREST_MAX_DEPTH || rows.len() < FOREST_MIN_ROWS_PER_LEAF {
+                leaves.push(ForestLeaf {
+                    a_box,
+                    b_box,
+                    eligible: kink_free && rows.len() >= FOREST_MIN_ROWS_PER_LEAF,
+                    rows,
+                });
+                continue;
+            }
+            // Halve the longer axis (deterministic midpoint split).
+            let a_len = a_box.1 - a_box.0;
+            let b_len = b_box.1 - b_box.0;
+            let split_a = a_len >= b_len;
+            let mid = if split_a {
+                0.5 * (a_box.0 + a_box.1)
+            } else {
+                0.5 * (b_box.0 + b_box.1)
+            };
+            let mut lo_rows = Vec::new();
+            let mut hi_rows = Vec::new();
+            for &i in &rows {
+                let coord = if split_a { a[i] } else { b[i] };
+                if coord <= mid {
+                    lo_rows.push(i);
+                } else {
+                    hi_rows.push(i);
+                }
+            }
+            if split_a {
+                stack.push(((a_box.0, mid), b_box, lo_rows, depth + 1));
+                stack.push(((mid, a_box.1), b_box, hi_rows, depth + 1));
+            } else {
+                stack.push((a_box, (b_box.0, mid), lo_rows, depth + 1));
+                stack.push((a_box, (mid, b_box.1), hi_rows, depth + 1));
+            }
+        }
+
+        let mut row_leaf = vec![usize::MAX; n];
+        for (leaf_idx, leaf) in leaves.iter().enumerate() {
+            for &i in &leaf.rows {
+                row_leaf[i] = leaf_idx;
+            }
+        }
+        if row_leaf.iter().any(|&l| l == usize::MAX) {
+            return Err("cell family forest: a row was not assigned to any leaf".to_string());
+        }
+        Ok(Self {
+            leaves,
+            families: std::collections::HashMap::new(),
+            row_leaf,
+        })
+    }
+
+    /// Phase 2: build (and certify) the family interpolants for the given
+    /// demand set of `(row, combo, spec)` triples. Combos demanded from
+    /// ineligible leaves are skipped (those rows use the ladder directly).
+    /// Build failures and certification refusals record `None` so the
+    /// per-row evaluation falls back without retrying.
+    pub fn build_families<I>(&mut self, demand: I)
+    where
+        I: IntoIterator<Item = (usize, ComboKey, CellMomentFamilySpec)>,
+    {
+        for (row, key, spec) in demand {
+            let leaf_idx = match self.row_leaf.get(row) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+            let leaf = &self.leaves[leaf_idx];
+            if !leaf.eligible {
+                continue;
+            }
+            self.families.entry((leaf_idx, key)).or_insert_with(|| {
+                ChebMomentFamily::build(&spec, leaf.a_box, leaf.b_box, FOREST_NODE_COUNT)
+                    .ok()
+                    .flatten()
+            });
+        }
+    }
+
+    /// Per-row moment lookup: `Some` when a certified family covers this
+    /// row's leaf and combo (writes the interpolated moments into `out`),
+    /// `None` when the row must use direct ladder quadrature.
+    pub fn moments_into(
+        &self,
+        row: usize,
+        key: ComboKey,
+        a: f64,
+        b: f64,
+        out: &mut [f64],
+    ) -> Option<()> {
+        let leaf_idx = *self.row_leaf.get(row)?;
+        let family = self.families.get(&(leaf_idx, key))?.as_ref()?;
+        family.eval_into(a, b, out).ok()
+    }
+
+    /// Number of leaves eligible for family interpolation (observability).
+    pub fn eligible_leaves(&self) -> usize {
+        self.leaves.iter().filter(|leaf| leaf.eligible).count()
+    }
+
+    /// Total leaves (observability).
+    pub fn total_leaves(&self) -> usize {
+        self.leaves.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +695,70 @@ mod tests {
                 direct[k]
             );
         }
+    }
+
+    #[test]
+    fn forest_partitions_avoid_kinks_and_families_match_ladder_end_to_end() {
+        // Synthetic row cloud: a deterministic lattice over an (a, b) region
+        // crossed by several kink lines (a + b·σ = τ for the knot pairs
+        // below), so the forest must subdivide before any leaf certifies.
+        let score_breaks = [-0.4_f64, 0.9];
+        let link_breaks = [-0.2_f64, 1.1, 1.4];
+        let n = 4096;
+        let mut a = Vec::with_capacity(n);
+        let mut b = Vec::with_capacity(n);
+        let phi = 0.618_033_988_749_894_9_f64;
+        for i in 0..n {
+            let fa = (i as f64 * phi).fract();
+            let fb = (i as f64 * phi * phi).fract();
+            a.push(0.0 + fa * 0.9);
+            b.push(0.7 + fb * 0.7);
+        }
+        let mut forest = CellFamilyForest::partition(&a, &b, &score_breaks, &link_breaks)
+            .expect("forest partition");
+        assert!(forest.total_leaves() > 1, "kink lines must force subdivision");
+        assert!(
+            forest.eligible_leaves() > 0,
+            "a dense cloud must yield at least one eligible kink-free leaf"
+        );
+
+        // One combo demanded for every row; the forest builds one family per
+        // eligible leaf and rows in ineligible leaves fall back.
+        let spec = test_spec(9);
+        let key = ComboKey::new(spec.score_span, spec.link_span, spec.left, spec.right);
+        forest.build_families((0..n).map(|row| (row, key, spec)));
+
+        let mut out = vec![0.0_f64; 10];
+        let mut covered = 0usize;
+        for row in 0..n {
+            match forest.moments_into(row, key, a[row], b[row], &mut out) {
+                Some(()) => {
+                    covered += 1;
+                    let direct = spec.moments_direct(a[row], b[row]).expect("direct moments");
+                    let scale = direct
+                        .iter()
+                        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                        .max(f64::MIN_POSITIVE);
+                    for k in 0..10 {
+                        assert!(
+                            (out[k] - direct[k]).abs() <= 1.0e-9 * scale,
+                            "row {row} moment {k}: interp {} vs direct {}",
+                            out[k],
+                            direct[k]
+                        );
+                    }
+                }
+                None => {
+                    // Fallback row: direct ladder must still work (it is the
+                    // production fallback path).
+                    spec.moments_direct(a[row], b[row])
+                        .expect("ladder fallback moments");
+                }
+            }
+        }
+        assert!(
+            covered * 2 >= n,
+            "most rows of a dense cloud should be family-covered, got {covered}/{n}"
+        );
     }
 }
