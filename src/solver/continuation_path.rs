@@ -1079,8 +1079,9 @@ fn default_temperature_schedule() -> GumbelTemperatureSchedule {
 /// for the isometry leg across both heavy-entry constructors.
 #[must_use]
 fn default_isometry_schedule() -> ScalarWeightSchedule {
-    /// Loose entry isometry weight (`w_start`) at `s = 1`.
-    const DEFAULT_ENTRY_ISOMETRY: f64 = 0.01;
+    /// Entry isometry weight (`w_start`) at `s = 1`; the chart pin starts fully
+    /// off and ramps after the anchor has settled.
+    const DEFAULT_ENTRY_ISOMETRY: f64 = 0.0;
     /// Tight target isometry weight (`w_end`) at `s = 0`.
     const DEFAULT_TARGET_ISOMETRY: f64 = 1.0;
     ScalarWeightSchedule::new(

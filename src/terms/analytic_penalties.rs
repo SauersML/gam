@@ -563,13 +563,6 @@ macro_rules! impl_learnable_weight_rho_count {
 pub enum IsometryReference {
     Euclidean,
     UserSupplied(Arc<Array2<f64>>), // (n_obs, d*d) row-major flattened
-    /// Scale-free reference: the per-atom MEAN pullback metric, the same row
-    /// broadcast to every observation. By the envelope theorem the LS-optimal
-    /// constant reference is the mean of the per-row metrics, so this penalizes
-    /// metric VARIATION across tokens (constant-speed / isometry up to a single
-    /// global scale) rather than absolute scale. Resolved dynamically from the
-    /// live pullback metric in effective_g_ref, so it carries no stored data.
-    MeanProfiled,
 }
 
 impl std::fmt::Debug for IsometryReference {
@@ -580,7 +573,6 @@ impl std::fmt::Debug for IsometryReference {
                 .debug_tuple("UserSupplied")
                 .field(&format_args!("{}×{}", a.nrows(), a.ncols()))
                 .finish(),
-            IsometryReference::MeanProfiled => f.write_str("MeanProfiled"),
         }
     }
 }
@@ -808,71 +800,114 @@ struct IsometryHvpState<'a> {
     p: usize,
     jac2: CowArray<'a, f64, Ix2>,
     jac3: CowArray<'a, f64, Ix3>,
-    g: Array2<f64>,
-    g_ref: CowArray<'a, f64, Ix2>,
+    metric: IsometryMetricState,
     wj_rows: Vec<Array2<f64>>,
 }
 
-/// Build the per-row Gauss-Newton Hessian-vector product for `IsometryPenalty`,
-/// shared between the exact `hvp` (where it is the GN piece, added to the K
-/// residual term) and `psd_majorizer_hvp` (where it is the full PSD operator).
-///
-/// Computes `dgdt[a, b, c] = ∂g_{ab}/∂t_c
-///                          = Σ_i (J²_{i,a,c}·WJ_{i,b} + WJ_{i,a}·J²_{i,b,c})`
-/// once, then derives
-///   `delta_g[a, b] = Σ_c dgdt[a, b, c]·v[n·d+c]`           (directional dG)
-///   `gn_out[c]     = Σ_{a,b} dgdt[a, b, c]·delta_g[a, b]`  (GN HVP row)
-///
-/// The caller multiplies `gn_out` by μ and writes it into the per-row output
-/// slice. `delta_g` is returned so `hvp` can reuse it inside the K residual
-/// loop, where `(g − g_ref)·B·v` is summed against `dgdt` and the third
-/// decoder jet `K`.
-///
-/// Returning a single tensor + contraction (instead of recomputing `dgdt`
-/// inline in two functions) collapses four duplicated O(d²·d·p) loops into
-/// a single O(d³·p) build, and — crucially — makes the GN summation order
-/// identical across `hvp` and `psd_majorizer_hvp` so the two paths agree
-/// bit-exactly when the residual `g − g_ref` vanishes. Without that
-/// identity the exact-vs-PSD-equality regression test fails by ~1 ULP at
-/// values of magnitude 10⁶ purely from `(vc · Σ_i …)` vs `Σ_i (vc · …)`
-/// reassociating differently in fp64.
-fn isometry_row_gn_hvp(
+#[derive(Debug, Clone)]
+struct IsometryMetricState {
+    g: Array2<f64>,
+    residual: Array2<f64>,
+    metric_grad: Array2<f64>,
+    normalizer: f64,
+    trace_denominator: f64,
+    residual_dot_g: f64,
+}
+
+impl IsometryMetricState {
+    fn residual_direction(&self, delta_g: ArrayView2<'_, f64>, d: usize) -> (Array2<f64>, f64) {
+        let n_obs = self.g.nrows();
+        let dd = d * d;
+        let mut delta_trace_sum = 0.0;
+        for n in 0..n_obs {
+            for a in 0..d {
+                delta_trace_sum += delta_g[[n, a * d + a]];
+            }
+        }
+        let delta_normalizer = delta_trace_sum / self.trace_denominator;
+        let inv_norm = 1.0 / self.normalizer;
+        let inv_norm_sq = inv_norm * inv_norm;
+        let mut delta_residual = Array2::<f64>::zeros((n_obs, dd));
+        for n in 0..n_obs {
+            for k in 0..dd {
+                delta_residual[[n, k]] =
+                    delta_g[[n, k]] * inv_norm - self.g[[n, k]] * delta_normalizer * inv_norm_sq;
+            }
+        }
+        (delta_residual, delta_normalizer)
+    }
+
+    fn metric_grad_direction(&self, delta_g: ArrayView2<'_, f64>, d: usize) -> Array2<f64> {
+        let n_obs = self.g.nrows();
+        let dd = d * d;
+        let (delta_residual, delta_normalizer) = self.residual_direction(delta_g, d);
+        let mut delta_residual_dot_g = 0.0;
+        for n in 0..n_obs {
+            for k in 0..dd {
+                delta_residual_dot_g += delta_residual[[n, k]] * self.g[[n, k]];
+                delta_residual_dot_g += self.residual[[n, k]] * delta_g[[n, k]];
+            }
+        }
+        let inv_norm = 1.0 / self.normalizer;
+        let inv_norm_sq = inv_norm * inv_norm;
+        let delta_trace_coeff = delta_residual_dot_g * inv_norm_sq / self.trace_denominator
+            - 2.0 * self.residual_dot_g * delta_normalizer * inv_norm_sq * inv_norm
+                / self.trace_denominator;
+        let mut out = Array2::<f64>::zeros((n_obs, dd));
+        for n in 0..n_obs {
+            for a in 0..d {
+                for b in 0..d {
+                    let k = a * d + b;
+                    let mut value = delta_residual[[n, k]] * inv_norm
+                        - self.residual[[n, k]] * delta_normalizer * inv_norm_sq;
+                    if a == b {
+                        value -= delta_trace_coeff;
+                    }
+                    out[[n, k]] = value;
+                }
+            }
+        }
+        out
+    }
+}
+
+fn isometry_dg_entry(
+    jac2: ArrayView2<'_, f64>,
+    wj: ArrayView2<'_, f64>,
+    n: usize,
+    d: usize,
+    p: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+) -> f64 {
+    let mut s = 0.0;
+    for i in 0..p {
+        s += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
+        s += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
+    }
+    s
+}
+
+fn isometry_row_delta_g(
     jac2: ArrayView2<'_, f64>,
     wj: ArrayView2<'_, f64>,
     v: ArrayView1<'_, f64>,
     n: usize,
     d: usize,
     p: usize,
-) -> (Array2<f64>, Array1<f64>) {
-    let dg_entry = |a: usize, b: usize, c: usize| -> f64 {
-        let mut s = 0.0;
-        for i in 0..p {
-            s += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
-            s += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
-        }
-        s
-    };
+) -> Array2<f64> {
     let mut delta_g = Array2::<f64>::zeros((d, d));
     for a in 0..d {
         for b in 0..d {
             let mut s = 0.0;
             for c in 0..d {
-                s += dg_entry(a, b, c) * v[n * d + c];
+                s += isometry_dg_entry(jac2, wj, n, d, p, a, b, c) * v[n * d + c];
             }
             delta_g[[a, b]] = s;
         }
     }
-    let mut gn_out = Array1::<f64>::zeros(d);
-    for c in 0..d {
-        let mut s = 0.0;
-        for a in 0..d {
-            for b in 0..d {
-                s += dg_entry(a, b, c) * delta_g[[a, b]];
-            }
-        }
-        gn_out[c] = s;
-    }
-    (delta_g, gn_out)
+    delta_g
 }
 
 impl IsometryPenalty {
@@ -1343,7 +1378,7 @@ impl IsometryPenalty {
         let jac2 = self.jacobian_second(target.view(), n_obs, d)?;
         let jac3 = self.jacobian_third(target.view(), n_obs, d)?;
         let g = self.pullback_metric(d)?;
-        let g_ref = self.effective_g_ref(&g, n_obs, d);
+        let metric = self.normalized_metric_state(g, n_obs, d)?;
         let mut wj_rows = Vec::with_capacity(n_obs);
         for n in 0..n_obs {
             wj_rows.push(self.weighted_jacobian_row(n, d)?);
@@ -1354,8 +1389,7 @@ impl IsometryPenalty {
             p,
             jac2,
             jac3,
-            g,
-            g_ref,
+            metric,
             wj_rows,
         })
     }
@@ -1372,23 +1406,39 @@ impl IsometryPenalty {
         let p = state.p;
         let jac2 = &state.jac2;
         let jac3 = &state.jac3;
-        let g = &state.g;
-        let g_ref = &state.g_ref;
+        let metric = &state.metric;
         let mut out = Array1::<f64>::zeros(v.len());
+        let mut delta_g = Array2::<f64>::zeros((n_obs, d * d));
+        for n in 0..n_obs {
+            let wj = &state.wj_rows[n];
+            let row_delta = isometry_row_delta_g(jac2.view(), wj.view(), v, n, d, p);
+            for a in 0..d {
+                for b in 0..d {
+                    delta_g[[n, a * d + b]] = row_delta[[a, b]];
+                }
+            }
+        }
+        let delta_metric_grad = metric.metric_grad_direction(delta_g.view(), d);
 
         for n in 0..n_obs {
             let wj = &state.wj_rows[n];
-            let (_delta_g, gn_out) = isometry_row_gn_hvp(jac2.view(), wj.view(), v, n, d, p);
             for c in 0..d {
-                out[n * d + c] = mu * gn_out[c];
+                let mut acc = 0.0;
+                for a in 0..d {
+                    for b in 0..d {
+                        let dg = isometry_dg_entry(jac2.view(), wj.view(), n, d, p, a, b, c);
+                        acc += dg * delta_metric_grad[[n, a * d + b]];
+                    }
+                }
+                out[n * d + c] = mu * acc;
             }
 
             for c in 0..d {
                 let mut acc_res = 0.0;
                 for a in 0..d {
                     for b in 0..d {
-                        let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
-                        if diff == 0.0 {
+                        let metric_grad = metric.metric_grad[[n, a * d + b]];
+                        if metric_grad == 0.0 {
                             continue;
                         }
                         let mut bv = 0.0;
@@ -1420,7 +1470,7 @@ impl IsometryPenalty {
                             bv +=
                                 (k_a_cd_w_j_b + h_a_c_w_h_b_d + h_a_d_w_h_b_c + j_a_w_k_b_cd) * vd;
                         }
-                        acc_res += diff * bv;
+                        acc_res += metric_grad * bv;
                     }
                 }
                 out[n * d + c] += mu * acc_res;
@@ -1463,7 +1513,7 @@ impl IsometryPenalty {
         Some(g_all)
     }
 
-    /// Reference metric per row, `(n_obs, d*d)`.
+    /// Reference metric per row for the normalized pullback metric, `(n_obs, d*d)`.
     fn reference_metric(&self, n_obs: usize, d: usize) -> CowArray<'_, f64, Ix2> {
         match &self.reference {
             IsometryReference::Euclidean => {
@@ -1480,53 +1530,79 @@ impl IsometryPenalty {
                 assert_eq!(a.ncols(), d * d);
                 CowArray::from(a.view())
             }
-            // MeanProfiled has no data-independent reference: it must be
-            // resolved from the live per-row pullback metric `G_n` via
-            // `effective_g_ref`. Any data-independent call site (none currently)
-            // falls back to the Euclidean identity reference rather than
-            // fabricating a metric.
-            IsometryReference::MeanProfiled => {
-                let mut out = Array2::<f64>::zeros((n_obs, d * d));
-                for n in 0..n_obs {
-                    for a in 0..d {
-                        out[[n, a * d + a]] = 1.0;
-                    }
-                }
-                CowArray::from(out)
-            }
         }
     }
 
-    /// Effective reference metric `g_ref`, resolved against the live per-row
-    /// pullback metric `G_n`. For `MeanProfiled` this is the row-mean of `G_n`
-    /// (the LS-optimal constant reference, by the envelope theorem) broadcast to
-    /// every row, making the penalty scale-free: it penalizes metric VARIATION
-    /// across tokens rather than absolute scale. For every other reference it
-    /// delegates to the data-independent `reference_metric`.
-    fn effective_g_ref(&self, g: &Array2<f64>, n_obs: usize, d: usize) -> CowArray<'_, f64, Ix2> {
-        match &self.reference {
-            IsometryReference::MeanProfiled => {
-                let dd = d * d;
-                let mut mean = vec![0.0_f64; dd];
-                for n in 0..n_obs {
-                    for k in 0..dd {
-                        mean[k] += g[[n, k]];
-                    }
-                }
-                let inv = if n_obs > 0 { 1.0 / n_obs as f64 } else { 0.0 };
-                for v in mean.iter_mut() {
-                    *v *= inv;
-                }
-                let mut out = Array2::<f64>::zeros((n_obs, dd));
-                for n in 0..n_obs {
-                    for k in 0..dd {
-                        out[[n, k]] = mean[k];
-                    }
-                }
-                CowArray::from(out)
+    /// Shared normalized metric state for the scale-invariant isometry gauge.
+    ///
+    /// The residual is `R_n = g_n / gbar - g_ref,n`, with
+    /// `gbar = (1 / (N d)) Σ_n tr(g_n)`. The metric-gradient is the exact
+    /// derivative of `0.5 Σ ||R_n||²` with respect to the raw pullback metrics:
+    ///
+    /// `A_n = R_n / gbar - (Σ_l R_l:g_l) I / (gbar² N d)`.
+    ///
+    /// All value, gradient, and HVP paths consume this state so the global
+    /// normalizer's derivative is never detached.
+    fn normalized_metric_state(
+        &self,
+        g: Array2<f64>,
+        n_obs: usize,
+        d: usize,
+    ) -> Option<IsometryMetricState> {
+        let dd = d * d;
+        let trace_denominator = (n_obs * d) as f64;
+        let mut trace_sum = 0.0;
+        for n in 0..n_obs {
+            for a in 0..d {
+                trace_sum += g[[n, a * d + a]];
             }
-            _ => self.reference_metric(n_obs, d),
         }
+        let normalizer = trace_sum / trace_denominator;
+        if !(normalizer.is_finite() && normalizer > f64::MIN_POSITIVE) {
+            self.missing_cache_default(
+                "normalized_metric_state",
+                &format!(
+                    "unit-average-speed normalizer is non-positive or non-finite: {normalizer}"
+                ),
+            );
+            return None;
+        }
+        let g_ref = self.reference_metric(n_obs, d);
+        let mut residual = Array2::<f64>::zeros((n_obs, dd));
+        let inv_norm = 1.0 / normalizer;
+        for n in 0..n_obs {
+            for k in 0..dd {
+                residual[[n, k]] = g[[n, k]] * inv_norm - g_ref[[n, k]];
+            }
+        }
+        let mut residual_dot_g = 0.0;
+        for n in 0..n_obs {
+            for k in 0..dd {
+                residual_dot_g += residual[[n, k]] * g[[n, k]];
+            }
+        }
+        let trace_coeff = residual_dot_g / (normalizer * normalizer * trace_denominator);
+        let mut metric_grad = Array2::<f64>::zeros((n_obs, dd));
+        for n in 0..n_obs {
+            for a in 0..d {
+                for b in 0..d {
+                    let k = a * d + b;
+                    let mut value = residual[[n, k]] * inv_norm;
+                    if a == b {
+                        value -= trace_coeff;
+                    }
+                    metric_grad[[n, k]] = value;
+                }
+            }
+        }
+        Some(IsometryMetricState {
+            g,
+            residual,
+            metric_grad,
+            normalizer,
+            trace_denominator,
+            residual_dot_g,
+        })
     }
 
     /// Exact closed-form gradient of the isometry penalty with respect to the
@@ -1536,18 +1612,18 @@ impl IsometryPenalty {
     ///
     /// Derivation (W-aware, reference-aware, weight-aware):
     ///
-    ///   P        = ½ μ Σ_n ‖g_n − g^ref_n‖²_F,   g_n = J_n^T W_n J_n
-    ///   D_n      = g_n − g^ref_n   (symmetric, since g and g_ref are)
+    ///   P        = ½ μ Σ_n ‖R_n‖²_F,
+    ///   R_n      = g_n / gbar − g^ref_n,
+    ///   gbar     = (1 / (N d)) Σ_n tr(g_n)
+    ///   A_n      = ∂(P/μ)/∂g_n
     ///   ∂g_{ab}/∂J_{i,c}
     ///            = δ_{ca}(W J)_{i,b} + δ_{cb}(W J)_{i,a}   (W symmetric)
     ///   ∂P/∂J_{i,c}
-    ///            = μ Σ_{a,b} D_{ab} ∂g_{ab}/∂J_{i,c}
-    ///            = 2 μ Σ_b D_{cb} (W J)_{i,b}
-    ///            = 2 μ ((W J) D)_{i,c}
+    ///            = μ Σ_{a,b} A_{ab} ∂g_{ab}/∂J_{i,c}
+    ///            = 2 μ Σ_b A_{cb} (W J)_{i,b}
+    ///            = 2 μ ((W J) A)_{i,c}
     ///
-    /// where `μ = scalar_weight · exp(ρ_index)`. For the unweighted Euclidean
-    /// reference (`W = I`, `g^ref = I`, `scalar_weight = 1`) this collapses to
-    /// the familiar `2 μ J (J^T J − I)`.
+    /// where `A` includes the exact derivative of the shared `gbar` normalizer.
     pub fn grad_jacobian(
         &self,
         target: ArrayView1<'_, f64>,
@@ -1566,7 +1642,9 @@ impl IsometryPenalty {
         let Some(g) = self.pullback_metric(d) else {
             return grad;
         };
-        let g_ref = self.effective_g_ref(&g, n_obs, d);
+        let Some(metric) = self.normalized_metric_state(g, n_obs, d) else {
+            return grad;
+        };
         let mu = resolve_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         for n in 0..n_obs {
             let Some(wj) = self.weighted_jacobian_row(n, d) else {
@@ -1576,8 +1654,7 @@ impl IsometryPenalty {
                 for c in 0..d {
                     let mut acc = 0.0;
                     for b in 0..d {
-                        let diff = g[[n, c * d + b]] - g_ref[[n, c * d + b]];
-                        acc += diff * wj[[i, b]];
+                        acc += metric.metric_grad[[n, c * d + b]] * wj[[i, b]];
                     }
                     grad[[n, i * d + c]] = 2.0 * mu * acc;
                 }
@@ -1604,12 +1681,14 @@ impl AnalyticPenalty for IsometryPenalty {
         let Some(g) = self.pullback_metric(d) else {
             return Self::DEFAULT_VALUE_ON_MISSING_CACHE;
         };
-        let g_ref = self.effective_g_ref(&g, n_obs, d);
+        let Some(metric) = self.normalized_metric_state(g, n_obs, d) else {
+            return Self::DEFAULT_VALUE_ON_MISSING_CACHE;
+        };
         let mu = resolve_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         let mut acc = 0.0;
         for n in 0..n_obs {
             for k in 0..(d * d) {
-                let diff = g[[n, k]] - g_ref[[n, k]];
+                let diff = metric.residual[[n, k]];
                 acc += diff * diff;
             }
         }
@@ -1619,12 +1698,14 @@ impl AnalyticPenalty for IsometryPenalty {
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
         // Exact closed-form gradient, W-aware:
         //
-        //   P     = ½ μ Σ_n ‖D_n‖²_F,   D_n = g_n − g^ref_n
+        //   P     = ½ μ Σ_n ‖R_n‖²_F,   R_n = g_n / gbar − g^ref_n
         //   g_n   = J_n^T W_n J_n,      W_n = U_n U_n^T
+        //   A_n   = ∂(P/μ)/∂g_n, including the exact derivative of
+        //           gbar = (1 / (N d)) Σ_n tr(g_n)
         //   ∂g_{ab}/∂t_c
         //         = (H_{:,a,c})^T (W J)_{:,b}  +  (J_{:,a})^T W H_{:,b,c}
         //   ∂P/∂t_c
-        //         = μ Σ_{a,b} D_{a,b} · ∂g_{ab}/∂t_c
+        //         = μ Σ_{a,b} A_{a,b} · ∂g_{ab}/∂t_c
         //
         // `H = ∂J/∂t` comes either from the live cache or from the radial
         // Duchon `φ''(r)` helper. The sign is positive: differentiating
@@ -1642,7 +1723,9 @@ impl AnalyticPenalty for IsometryPenalty {
         let Some(g) = self.pullback_metric(d) else {
             return Array1::<f64>::zeros(target.len());
         };
-        let g_ref = self.effective_g_ref(&g, n_obs, d);
+        let Some(metric) = self.normalized_metric_state(g, n_obs, d) else {
+            return Array1::<f64>::zeros(target.len());
+        };
         let p = self.p_out;
         let mu = resolve_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         let mut grad = Array1::<f64>::zeros(target.len());
@@ -1659,13 +1742,12 @@ impl AnalyticPenalty for IsometryPenalty {
                 let mut acc = 0.0;
                 for a in 0..d {
                     for b in 0..d {
-                        let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
                         let mut dg = 0.0;
                         for i in 0..p {
                             dg += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
                             dg += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
                         }
-                        acc += diff * dg;
+                        acc += metric.metric_grad[[n, a * d + b]] * dg;
                     }
                 }
                 grad[n * d + c] = mu * acc;
@@ -1685,12 +1767,11 @@ impl AnalyticPenalty for IsometryPenalty {
         // shared `radial_basis_cartesian_derivative` engine when no
         // third-derivative cache is supplied.
         //
-        // The full Hessian of P_iso = (μ/2) Σ_n ||J^T W J - G_ref||²_F
+        // The full Hessian of P_iso = (μ/2) Σ_n ||J^T W J / gbar - G_ref||²_F
         // (per proposal §4(b)) is
-        //   ∂²P/∂t_c ∂t_d = μ Σ_{a,b} [
-        //       ∂g_{ab}/∂t_c · ∂g_{ab}/∂t_d                  (GN piece)
-        //     + (g_{ab} - g^ref_{ab}) · B_{ab,cd}             (residual piece)
-        //   ],
+        //   μ [Dgᵀ · ∂²(0.5||R||²)/∂g² · Dg + A · ∂²g],
+        // where R = g/gbar - G_ref and A = ∂(0.5||R||²)/∂g includes the global
+        // gbar derivative.
         //   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
         //             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd},
         // where K is the third decoder derivative and H is the second.
@@ -1703,27 +1784,11 @@ impl AnalyticPenalty for IsometryPenalty {
     /// PSD majorizer-vector product `B_GN(target; ρ) v` for the **nonconvex**
     /// isometry penalty.
     ///
-    /// `P_iso = (μ/2) Σ_n ‖g_n − g^ref_n‖²_F` is a nonlinear least-squares
-    /// objective in the latent coords `t` through `g_n(t) = J_nᵀ W J_n`. Its
-    /// exact Hessian (the [`Self::hvp`] above) carries an indefinite
-    /// residual·curvature term `(g − g^ref)·B_{ab,cd}` whose `B` needs the
-    /// **third** decoder jet `K = ∂³φ/∂t³`. For every basis that does not
-    /// supply `K` (i.e. everything except the radial-Duchon source) that exact
-    /// `hvp` returns the zero vector, which would leave the Arrow-Schur
-    /// Newton/PIRLS curvature block with no isometry contribution at all.
-    ///
-    /// The Gauss-Newton block drops the residual term and keeps only
-    ///   `(B_GN)_{cd} = μ Σ_{a,b} (∂g_{ab}/∂t_c)(∂g_{ab}/∂t_d)`,
-    /// with `∂g_{ab}/∂t_c = H_{a,c}ᵀ W J_b + J_aᵀ W H_{b,c}`. This is PSD by
-    /// construction (a sum of rank-1 outer products `(∂g/∂t)(∂g/∂t)ᵀ`), equals
-    /// the exact Hessian as the residual `g − g^ref → 0`, and needs only the
-    /// first jet `J` and the second jet `H` — both cached for any basis with an
-    /// analytic second jet (sphere, circle, torus, …). The curvature block must
-    /// stay positive-definite for the inner solve, so the GN block is the
-    /// *correct* operator here regardless of whether `K` happens to be
-    /// available; mirroring the other nonconvex penalties (sparsity, JumpReLU)
-    /// that override the majorizer rather than handing back an indefinite
-    /// Hessian.
+    /// The Gauss-Newton block differentiates the normalized residual
+    /// `R = g/gbar - G_ref` itself and returns `μ DRᵀ DR v`. This is PSD by
+    /// construction and includes the shared-normalizer derivative exactly;
+    /// using only `∂g` would reintroduce scale coupling and would not be the
+    /// Gauss-Newton operator of the objective being minimized.
     fn psd_majorizer_hvp(
         &self,
         target: ArrayView1<'_, f64>,
@@ -1743,16 +1808,56 @@ impl AnalyticPenalty for IsometryPenalty {
         let Some(jac2) = self.jacobian_second(target, n_obs, d) else {
             return Array1::<f64>::zeros(v.len());
         };
+        let Some(g) = self.pullback_metric(d) else {
+            return Array1::<f64>::zeros(v.len());
+        };
+        let Some(metric) = self.normalized_metric_state(g, n_obs, d) else {
+            return Array1::<f64>::zeros(v.len());
+        };
         let p = self.p_out;
         let mu = resolve_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         let mut out = Array1::<f64>::zeros(v.len());
+        let mut wj_rows = Vec::with_capacity(n_obs);
         for n in 0..n_obs {
             let Some(wj) = self.weighted_jacobian_row(n, d) else {
                 return Array1::<f64>::zeros(v.len());
             };
-            let (_delta_g, gn_out) = isometry_row_gn_hvp(jac2.view(), wj.view(), v, n, d, p);
+            wj_rows.push(wj);
+        }
+        let mut delta_g = Array2::<f64>::zeros((n_obs, d * d));
+        for n in 0..n_obs {
+            let row_delta = isometry_row_delta_g(jac2.view(), wj_rows[n].view(), v, n, d, p);
+            for a in 0..d {
+                for b in 0..d {
+                    delta_g[[n, a * d + b]] = row_delta[[a, b]];
+                }
+            }
+        }
+        let (delta_residual, _delta_normalizer) = metric.residual_direction(delta_g.view(), d);
+        let mut g_dot_delta_residual = 0.0;
+        for n in 0..n_obs {
+            for k in 0..(d * d) {
+                g_dot_delta_residual += metric.g[[n, k]] * delta_residual[[n, k]];
+            }
+        }
+        let inv_norm = 1.0 / metric.normalizer;
+        let inv_norm_sq = inv_norm * inv_norm;
+        for n in 0..n_obs {
+            let wj = &wj_rows[n];
             for c in 0..d {
-                out[n * d + c] = mu * gn_out[c];
+                let mut trace_dg = 0.0;
+                for a in 0..d {
+                    trace_dg += isometry_dg_entry(jac2.view(), wj.view(), n, d, p, a, a, c);
+                }
+                let delta_normalizer_c = trace_dg / metric.trace_denominator;
+                let mut acc = -delta_normalizer_c * inv_norm_sq * g_dot_delta_residual;
+                for a in 0..d {
+                    for b in 0..d {
+                        let dg = isometry_dg_entry(jac2.view(), wj.view(), n, d, p, a, b, c);
+                        acc += dg * inv_norm * delta_residual[[n, a * d + b]];
+                    }
+                }
+                out[n * d + c] = mu * acc;
             }
         }
         out
@@ -8383,6 +8488,21 @@ macro_rules! define_analytic_penalty_kind {
 
 crate::analytic_penalty_registry!(define_analytic_penalty_kind);
 
+impl AnalyticPenaltyKind {
+    pub(crate) fn isometry_scalar_weight(&self) -> Option<f64> {
+        match self {
+            AnalyticPenaltyKind::Isometry(p) => Some(p.scalar_weight),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_isometry_scalar_weight(&mut self, weight: f64) {
+        if let AnalyticPenaltyKind::Isometry(p) = self {
+            Arc::make_mut(p).scalar_weight = weight;
+        }
+    }
+}
+
 /// Registry of analytic penalties active in a single fit. The owning
 /// `RemlState` builder concatenates the per-penalty ρ-axes onto its global
 /// ρ vector in the order they appear here, so the rho-index bookkeeping
@@ -8418,6 +8538,32 @@ impl AnalyticPenaltyRegistry {
         for penalty in &mut self.penalties {
             penalty.apply_schedule(iter);
         }
+    }
+
+    pub fn isometry_scalar_weights(&self) -> Vec<f64> {
+        self.penalties
+            .iter()
+            .filter_map(AnalyticPenaltyKind::isometry_scalar_weight)
+            .collect()
+    }
+
+    pub fn set_isometry_scalar_weights(&mut self, weights: &[f64]) {
+        let mut idx = 0usize;
+        for penalty in &mut self.penalties {
+            if penalty.isometry_scalar_weight().is_some() {
+                assert!(
+                    idx < weights.len(),
+                    "set_isometry_scalar_weights received fewer weights than registered isometry penalties"
+                );
+                penalty.set_isometry_scalar_weight(weights[idx]);
+                idx += 1;
+            }
+        }
+        assert_eq!(
+            idx,
+            weights.len(),
+            "set_isometry_scalar_weights received extra weights"
+        );
     }
 
     /// Returns `(local_rho_slice, target_tier, name)` for each registered
@@ -9324,29 +9470,36 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use ndarray::{array, s};
 
-    /// The scale-free isometry penalty (math review #681) defaults to a
-    /// `MeanProfiled` reference: the per-row pullback metric `G_n` is compared
-    /// against its own row-mean, so the penalty charges metric VARIATION across
-    /// tokens rather than absolute scale. Pin that `effective_g_ref` returns the
-    /// column-mean of `G_n` broadcast to every row.
+    /// The isometry penalty is scale-invariant in decoder units: the per-row
+    /// pullback metric is normalized by `gbar = mean(trace(g))/d` before comparing
+    /// to the reference metric. Scaling every decoder Jacobian by a constant
+    /// therefore leaves value and normalized residuals unchanged.
     #[test]
-    fn mean_profiled_isometry_reference_is_row_mean_broadcast() {
+    fn isometry_value_is_decoder_scale_invariant() {
         let n_obs = 2;
         let d = 2;
+        let p = 3;
         let target = PsiSlice::full(n_obs * d, Some(d));
-        let pen = IsometryPenalty::new_euclidean(target, 3)
-            .with_reference(IsometryReference::MeanProfiled);
-
-        // Two per-row pullback metrics, flattened to d·d = 4 columns; the
-        // column means are [2, 3, 4, 5].
-        let g = array![[1.0_f64, 2.0, 3.0, 4.0], [3.0, 4.0, 5.0, 6.0]];
-        let g_ref = pen.effective_g_ref(&g, n_obs, d);
-        let expected = [2.0_f64, 3.0, 4.0, 5.0];
+        let pen = IsometryPenalty::new_euclidean(target, p);
+        let mut j = Array2::<f64>::zeros((n_obs, p * d));
         for n in 0..n_obs {
-            for k in 0..(d * d) {
-                assert_abs_diff_eq!(g_ref[[n, k]], expected[k], epsilon = 1e-12);
+            for i in 0..p {
+                for a in 0..d {
+                    j[[n, i * d + a]] = 0.4 + 0.2 * n as f64 - 0.1 * i as f64 + 0.3 * a as f64;
+                }
             }
         }
+        let mut j_scaled = j.clone();
+        for value in j_scaled.iter_mut() {
+            *value *= 17.0;
+        }
+        let rho = array![0.0_f64];
+        let t = Array1::<f64>::zeros(n_obs * d);
+        pen.set_jacobian_cache(Some(Arc::new(j)));
+        let value = pen.value(t.view(), rho.view());
+        pen.set_jacobian_cache(Some(Arc::new(j_scaled)));
+        let scaled_value = pen.value(t.view(), rho.view());
+        assert_abs_diff_eq!(value, scaled_value, epsilon = 1e-10);
     }
 
     #[test]
@@ -9667,7 +9820,7 @@ mod tests {
         }
     }
 
-    /// As the residual `g − g_ref → 0` the exact Hessian collapses onto its
+    /// As the normalized residual `g/gbar − g_ref → 0` the exact Hessian collapses onto its
     /// Gauss-Newton block. Pinning the reference metric to the model's own
     /// pullback metric drives the residual to exactly zero, so the exact `hvp`
     /// (which here also has a — zero — third jet so its state assembles) must
@@ -9679,12 +9832,22 @@ mod tests {
         let target = PsiSlice::full(n, Some(d));
 
         // Stage caches on a scratch penalty to read the pullback metric g(t),
-        // then pin the reference to it (residual g − g_ref ≡ 0).
+        // then pin the reference to g/gbar (normalized residual ≡ 0).
         let scratch = IsometryPenalty::new_euclidean(target.clone(), p);
         scratch.refresh_caches(Some(j.clone()), Some(h.clone()));
-        let g = scratch
+        let mut g = scratch
             .pullback_metric(d)
             .expect("pullback metric available once J is cached");
+        let mut trace_sum = 0.0_f64;
+        for row in 0..g.nrows() {
+            for axis in 0..d {
+                trace_sum += g[[row, axis * d + axis]];
+            }
+        }
+        let normalizer = trace_sum / (g.nrows() * d) as f64;
+        for value in g.iter_mut() {
+            *value /= normalizer;
+        }
 
         // A zero third jet lets the exact hvp_state assemble (it requires a
         // third-derivative source) while contributing nothing to the result.

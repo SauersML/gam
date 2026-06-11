@@ -135,7 +135,10 @@ fn re_random_slope_partial_pools_toward_population() {
     let mut gam_group_slope = vec![0.0; N_GROUPS];
     for gi in 0..N_GROUPS {
         let lo = gi * N_TEST_PER_GROUP;
-        let (s, _) = ols(&test_x[lo..lo + N_TEST_PER_GROUP], &gam_pred[lo..lo + N_TEST_PER_GROUP]);
+        let (s, _) = ols(
+            &test_x[lo..lo + N_TEST_PER_GROUP],
+            &gam_pred[lo..lo + N_TEST_PER_GROUP],
+        );
         gam_group_slope[gi] = s;
     }
     let mean_gam_slope = gam_group_slope.iter().sum::<f64>() / N_GROUPS as f64;

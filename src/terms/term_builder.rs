@@ -1506,7 +1506,9 @@ pub fn build_smooth_basis(
             // noise-fitting capacity it does not need. An explicit `k`/`basis_dim`
             // overrides this (parse_ps_internal_knots); `re` is the raw linear
             // effect handled above.
-            let fs_default_internal = FACTOR_SMOOTH_DEFAULT_BASIS_DIM.saturating_sub(degree + 1).max(1);
+            let fs_default_internal = FACTOR_SMOOTH_DEFAULT_BASIS_DIM
+                .saturating_sub(degree + 1)
+                .max(1);
             capped.min(fs_default_internal)
         };
         let (n_knots, _) = parse_ps_internal_knots(options, degree, default_internal)?;

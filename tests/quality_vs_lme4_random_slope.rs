@@ -450,8 +450,12 @@ fn gam_factor_smooth_random_slope_matches_lme4_on_real_data() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("Reaction ~ Days + s(Days, Subject, bs=\"re\")", &train_ds, &cfg)
-        .expect("gam random-slope fit");
+    let result = fit_from_formula(
+        "Reaction ~ Days + s(Days, Subject, bs=\"re\")",
+        &train_ds,
+        &cfg,
+    )
+    .expect("gam random-slope fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian random-slope model");
     };

@@ -57,7 +57,11 @@ const REDUCED_INFO_ABSOLUTE_FLOOR: f64 = 1e-12;
 /// magnitude floor (signed, gam#814), `1/floor` inside the band.
 #[inline]
 fn floored_inverse(lam: f64, floor: f64) -> f64 {
-    if lam.abs() >= floor { 1.0 / lam } else { 1.0 / floor }
+    if lam.abs() >= floor {
+        1.0 / lam
+    } else {
+        1.0 / floor
+    }
 }
 
 /// `d'(λ)` with the floor held fixed: `−1/λ²` above the magnitude floor, `0`
@@ -1196,13 +1200,12 @@ where
                 let dp_j = floored_inverse_prime(evals[j], floor);
                 let lam_dot_i = dbar_red[[i, i]];
                 let lam_dot_j = dbar_red[[j, j]];
-                dpsi[[i, j]] = ((dp_i - psi[[i, j]]) * lam_dot_i
-                    + (psi[[i, j]] - dp_j) * lam_dot_j)
-                    / gap;
+                dpsi[[i, j]] =
+                    ((dp_i - psi[[i, j]]) * lam_dot_i + (psi[[i, j]] - dp_j) * lam_dot_j) / gap;
                 if dfloor != 0.0 {
-                    dpsi[[i, j]] +=
-                        (d_floor_sensitivity(evals[i]) - d_floor_sensitivity(evals[j])) / gap
-                            * dfloor;
+                    dpsi[[i, j]] += (d_floor_sensitivity(evals[i]) - d_floor_sensitivity(evals[j]))
+                        / gap
+                        * dfloor;
                 }
             } else {
                 // Confluent/diagonal: Ψ = d'(λ), so δΨ = d''(λ)·λ̇ with the
@@ -1253,8 +1256,7 @@ where
         let d_a_pert = z_j.t().dot(&pert_hdot_a.dot(&z_j)); // Z_Jᵀ (∂Hdot[e_a]) Z_J
 
         // δṼ_a = Vᵀ (∂D_a) V + Ṽ_a C − C Ṽ_a.
-        let da_a = evecs.t().dot(&d_a_pert).dot(&evecs) + &a_a.dot(&rotation)
-            - &rotation.dot(&a_a);
+        let da_a = evecs.t().dot(&d_a_pert).dot(&evecs) + &a_a.dot(&rotation) - &rotation.dot(&a_a);
 
         let mut col = 0usize;
         for i in 0..m {
@@ -1275,8 +1277,7 @@ where
         for b in a..p {
             let mut acc = 0.0;
             for col in 0..(m * m) {
-                acc += dw_rows[[a, col]] * a_rows[[b, col]]
-                    + aw_rows[[a, col]] * da_rows[[b, col]];
+                acc += dw_rows[[a, col]] * a_rows[[b, col]] + aw_rows[[a, col]] * da_rows[[b, col]];
             }
             let value = -0.5 * acc;
             out[[a, b]] = value;
