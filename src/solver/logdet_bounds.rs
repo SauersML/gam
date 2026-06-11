@@ -82,11 +82,7 @@ fn forward_substitution(l: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
 
 /// `Ẽ_ij = L_i⁻¹ · S_ij · L_j⁻ᵀ`: forward-solve on the left, then on the
 /// right via the transpose identity `(X L_j⁻ᵀ)ᵀ = L_j⁻¹ Xᵀ`.
-fn whitened_off_block(
-    l_i: &Array2<f64>,
-    l_j: &Array2<f64>,
-    s_ij: &Array2<f64>,
-) -> Array2<f64> {
+fn whitened_off_block(l_i: &Array2<f64>, l_j: &Array2<f64>, s_ij: &Array2<f64>) -> Array2<f64> {
     let x = forward_substitution(l_i, s_ij);
     let xt = x.t().to_owned();
     forward_substitution(l_j, &xt).t().to_owned()
@@ -243,7 +239,15 @@ mod tests {
     /// Deterministic block-SPD fixture: strong SPD diagonal blocks, weak
     /// off-diagonal coupling (so the certificate ρ < 1 holds), assembled
     /// densely for the oracle.
-    fn fixture(k: usize, m: usize, coupling: f64) -> (Vec<Array2<f64>>, Vec<(usize, usize, Array2<f64>)>, Array2<f64>) {
+    fn fixture(
+        k: usize,
+        m: usize,
+        coupling: f64,
+    ) -> (
+        Vec<Array2<f64>>,
+        Vec<(usize, usize, Array2<f64>)>,
+        Array2<f64>,
+    ) {
         let dim = k * m;
         let mut dense = Array2::<f64>::zeros((dim, dim));
         let mut diag = Vec::new();
@@ -280,7 +284,8 @@ mod tests {
                 let mut b = Array2::<f64>::zeros((m, m));
                 for r in 0..m {
                     for c in 0..m {
-                        b[[r, c]] = coupling * ((r as f64) - (c as f64) + (i + j) as f64 * 0.31).cos();
+                        b[[r, c]] =
+                            coupling * ((r as f64) - (c as f64) + (i + j) as f64 * 0.31).cos();
                     }
                 }
                 for r in 0..m {
@@ -309,10 +314,10 @@ mod tests {
     fn enclosure_contains_dense_truth_and_order3_tightens() {
         let (diag, off, dense) = fixture(4, 3, 0.08);
         let truth = dense_logdet(&dense);
-        let e2 = block_preconditioned_logdet_enclosure(&diag, &off, false)
-            .expect("order-2 enclosure");
-        let e3 = block_preconditioned_logdet_enclosure(&diag, &off, true)
-            .expect("order-3 enclosure");
+        let e2 =
+            block_preconditioned_logdet_enclosure(&diag, &off, false).expect("order-2 enclosure");
+        let e3 =
+            block_preconditioned_logdet_enclosure(&diag, &off, true).expect("order-3 enclosure");
         assert!(
             e2.lower <= truth && truth <= e2.upper,
             "order-2 enclosure [{}, {}] must contain dense log|S| = {}",

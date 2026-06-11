@@ -6829,7 +6829,8 @@ fn materialize_survival<'a>(
             // Survival marginal-slope shares the operator-only invariant with
             // the Bernoulli path; flag it as such so strict mode is selected
             // even at small n.
-            marginal_slope_large_scale_active: survival_mode == SurvivalLikelihoodMode::MarginalSlope,
+            marginal_slope_large_scale_active: survival_mode
+                == SurvivalLikelihoodMode::MarginalSlope,
         },
     );
     // Alias `z` to the dose column for the marginal termspec only when a raw

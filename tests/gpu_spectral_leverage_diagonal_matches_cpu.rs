@@ -25,9 +25,7 @@ fn gpu_spectral_leverage_diagonal_matches_cpu_when_available() {
     let x = Array2::from_shape_fn((n, p), |(i, j)| {
         (((i * 7 + j * 3 + 1) as f64) * 0.001).sin()
     });
-    let g = Array2::from_shape_fn((p, rank), |(i, j)| {
-        (((i + 2 * j + 1) as f64) * 0.013).cos()
-    });
+    let g = Array2::from_shape_fn((p, rank), |(i, j)| (((i + 2 * j + 1) as f64) * 0.013).cos());
     let design = DesignMatrix::Dense(DenseDesignMatrix::from(x.clone()));
 
     let Some(gpu_lev) = gpu::linalg::try_fast_spectral_leverage_diagonal(&design, g.view()) else {

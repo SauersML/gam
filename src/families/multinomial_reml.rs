@@ -972,8 +972,7 @@ impl MultinomialFamily {
                                         let scaled = wcd * xi;
                                         let out_row = axis_base + (row_c + i) * dim;
                                         for j in 0..p {
-                                            acc[out_row + col_d + j] +=
-                                                scaled * design[[row, j]];
+                                            acc[out_row + col_d + j] += scaled * design[[row, j]];
                                         }
                                     }
                                 }
@@ -1221,7 +1220,9 @@ impl CustomFamily for MultinomialFamily {
         // (#715/#722/#753). The cached value is bit-faithful to the generic path
         // up to row-sum associativity.
         if let Some(axis) = self.canonical_axis_index(d_beta_flat) {
-            return Ok(Some(self.cached_axis_directional_derivative(eta.view(), axis)));
+            return Ok(Some(
+                self.cached_axis_directional_derivative(eta.view(), axis),
+            ));
         }
         // General direction (e.g. the outer mode-response drift `Hdot[δ]`): the
         // exact per-direction jet → dense contraction.

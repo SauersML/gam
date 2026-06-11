@@ -35,9 +35,11 @@ fn bench_margslope_flex_large_scale_cycle0(c: &mut Criterion) {
             BENCH_MULTI_RHS_PROBE,
         )
         .expect("large-scale multi-RHS HVP scratch budget");
-        let per_rhs_full_row_cache =
-            (n * LARGE_SCALE_HVP_PRIMARY_R * LARGE_SCALE_HVP_PRIMARY_R * std::mem::size_of::<f64>()) as u64
-                * BENCH_MULTI_RHS_PROBE as u64;
+        let per_rhs_full_row_cache = (n
+            * LARGE_SCALE_HVP_PRIMARY_R
+            * LARGE_SCALE_HVP_PRIMARY_R
+            * std::mem::size_of::<f64>()) as u64
+            * BENCH_MULTI_RHS_PROBE as u64;
         eprintln!(
             "[MS-FLEX-LARGE_SCALE-BENCH-HVP-MULTI-RHS] n={} p={} r={} rhs={} scratch_mib={:.3} full_row_cache_per_rhs_mib={:.3}",
             n,

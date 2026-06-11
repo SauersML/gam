@@ -1212,7 +1212,8 @@ fn build_latent_measure_with_geometry(
             // rank-INT provably cannot fix, so it takes precedence: route to the
             // conditional location-scale correction `ζ = (z−m(C))/√v(C)`.
             if let Some(a_block) = conditioning
-                && let Some(cal) = fit_conditional_latent_calibration_if_needed(z, weights, a_block)?
+                && let Some(cal) =
+                    fit_conditional_latent_calibration_if_needed(z, weights, a_block)?
             {
                 log::info!(
                     "[BMS latent-z] conditional location-scale calibrated: basis_ncols={} var_active={} post_mean={:.3e} post_sd={:.3e} (E[z|C]/Var(z|C) Rao gate fired)",

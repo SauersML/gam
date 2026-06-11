@@ -444,7 +444,6 @@ impl ExactGaussianFullConformal {
             boundary_margin,
         }
     }
-
 }
 
 /// The symmetric augmented fitting map the discrete enumeration arm walks.

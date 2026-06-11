@@ -75,7 +75,8 @@ fn binary_outcome_shape_dataset() -> EncodedDataset {
     }
     EncodedDataset {
         headers,
-        values: Array2::from_shape_vec((n, 11), values).expect("binary-outcome-shape BMS data shape"),
+        values: Array2::from_shape_vec((n, 11), values)
+            .expect("binary-outcome-shape BMS data shape"),
         schema: DataSchema {
             columns: vec![
                 SchemaColumn {

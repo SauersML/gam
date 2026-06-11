@@ -1758,11 +1758,7 @@ impl CurvatureReduction {
         })
     }
 
-    fn from_gram(
-        gram: Array2<f64>,
-        root_rows: usize,
-        param_dim: usize,
-    ) -> Result<Self, String> {
+    fn from_gram(gram: Array2<f64>, root_rows: usize, param_dim: usize) -> Result<Self, String> {
         if gram.nrows() != param_dim || gram.ncols() != param_dim {
             return Err(format!(
                 "residual_gauge: curvature gram has shape ({}, {}) but param_dim = {param_dim}",
@@ -1777,11 +1773,9 @@ impl CurvatureReduction {
                 gram,
             });
         }
-        let (evals, _) = gram
-            .eigh(Side::Lower)
-            .map_err(|e| {
-                format!("residual_gauge: eigendecomposition of curvature gram failed: {e}")
-            })?;
+        let (evals, _) = gram.eigh(Side::Lower).map_err(|e| {
+            format!("residual_gauge: eigendecomposition of curvature gram failed: {e}")
+        })?;
         let sigma_max_sq = evals.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
         let sigma_max = sigma_max_sq.sqrt();
         let rank_tol = default_rrqr_rank_alpha()

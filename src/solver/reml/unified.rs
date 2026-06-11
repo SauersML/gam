@@ -11463,9 +11463,13 @@ impl UnifiedOuterHessianOperator {
             .iter()
             .map(|drift| match (self.subspace.as_deref(), drift) {
                 (Some(kernel), DriftDerivResult::Dense(m)) => kernel.trace_projected_logdet(m),
-                (Some(kernel), DriftDerivResult::Operator(op)) => kernel.trace_operator(op.as_ref()),
+                (Some(kernel), DriftDerivResult::Operator(op)) => {
+                    kernel.trace_operator(op.as_ref())
+                }
                 (None, DriftDerivResult::Dense(m)) => self.hop.trace_logdet_gradient(m),
-                (None, DriftDerivResult::Operator(op)) => self.hop.trace_logdet_operator(op.as_ref()),
+                (None, DriftDerivResult::Operator(op)) => {
+                    self.hop.trace_logdet_operator(op.as_ref())
+                }
             })
             .collect();
         Ok(Some(PsiContractedContrib {
@@ -11494,9 +11498,8 @@ impl UnifiedOuterHessianOperator {
         let coord = &self.coords[idx];
         // ψ output row index into the hook contraction (when this idx is a ψ
         // coordinate and the hook is active); `None` for ρ rows or no hook.
-        let psi_row = psi_contrib.and_then(|contrib| {
-            (idx >= self.k_rho).then(|| (contrib, idx - self.k_rho))
-        });
+        let psi_row = psi_contrib
+            .and_then(|contrib| (idx >= self.k_rho).then(|| (contrib, idx - self.k_rho)));
         let mut pair_a = self.pair_a.row(idx).dot(alpha);
         let mut pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
         let g_dot_v_alpha = self.g_dot_v.row(idx).dot(alpha);
@@ -19661,7 +19664,9 @@ mod tests {
                 c_array: c_array.clone(),
                 d_array: Some(d_array.clone()),
                 hessian_weights: Array1::ones(3),
-                x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone())),
+                x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    x.clone(),
+                )),
             };
             let contracted_psi_second_order: Option<ContractedPsiSecondOrderFn> = if with_hook {
                 let g = psi_pair_g.clone();
@@ -19891,7 +19896,9 @@ mod tests {
                 c_array: Array1::zeros(3),
                 d_array: Some(Array1::zeros(3)),
                 hessian_weights: Array1::ones(3),
-                x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone())),
+                x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    x.clone(),
+                )),
             });
             compute_outer_hessian(
                 &sol,

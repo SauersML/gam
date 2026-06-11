@@ -44,8 +44,8 @@ pub mod vector_response;
 pub mod wiggle;
 
 pub use identifiability_compiler::{
-    BlockOrder, CompiledBlock, CompiledBlocks, CompilerError, RowHessian,
-    RowJacobianOperator, compile,
+    BlockOrder, CompiledBlock, CompiledBlocks, CompilerError, RowHessian, RowJacobianOperator,
+    compile,
 };
 pub use vector_response::{
     GaussianVectorLikelihood, MultinomialLogitLikelihood, VectorLikelihood, VectorNoise,
