@@ -1527,6 +1527,7 @@ pub fn survival_fit_from_parts(
             null_space_dim: None,
             survival_link_wiggle_knots: link_wiggle_knots,
             survival_link_wiggle_degree: link_wiggle_degree,
+            criterion_certificate: None,
         },
         inner_cycles: 0,
     })
