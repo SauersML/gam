@@ -9118,3 +9118,158 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     mixed[n_rho] = 1.0;
     check(mixed, "mixed-ρψ");
 }
+
+/// The single-expression Taylor-jet tower (#932) of the rigid standard-normal
+/// Bernoulli marginal-slope row NLL, written ONCE over `Tower4<2>` primaries
+/// `(η_m, g)`:
+///
+/// ```text
+///   q   = q(η_m)                  (the family's own certified [q, q1..q4]
+///                                  link-map stack — Φ⁻¹∘clamp∘Φ)
+///   gᵒ  = s_f · g
+///   c   = √(1 + gᵒ²)
+///   η   = q·c + gᵒ·z
+///   m   = s·η,  s = 2y − 1
+///   nll = −w·log Φ(m)             (the family's own signed-probit stack)
+/// ```
+///
+/// It reuses the family's hand-certified `[f64; 5]` special-function stacks
+/// (`unary_derivatives_sqrt` / `unary_derivatives_neglog_phi` and the
+/// link-map's q-derivatives) through `Tower4::compose_unary`, so no probit
+/// primitive is re-derived here: the tower mechanizes only the
+/// Leibniz / Faà di Bruno composition that `RigidProbitKernel` +
+/// `rigid_transformed_{gradient,hessian,third_full,fourth_full}` code by
+/// hand — the chain-rule scaffolding (`u1..u4`, `c1..c4`, q-transform
+/// stacking) where cross-block sign errors of the #736 genus live.
+struct BernoulliRigidNllProgram {
+    family: BernoulliMarginalSlopeFamily,
+    block_states: Vec<ParameterBlockState>,
+}
+
+impl crate::families::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
+    fn n_rows(&self) -> usize {
+        self.family.y.len()
+    }
+
+    fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+        Ok([
+            self.block_states[0].eta[row],
+            self.block_states[1].eta[row],
+        ])
+    }
+
+    fn row_nll(
+        &self,
+        row: usize,
+        p: &[crate::families::jet_tower::Tower4<2>; 2],
+    ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
+        let y = self.family.y[row];
+        let w = self.family.weights[row];
+        let z = self.family.z[row];
+        let s = 2.0 * y - 1.0;
+        let s_f = self.family.probit_frailty_scale();
+
+        let marginal = self.family.marginal_link_map(p[0].v)?;
+        let q = p[0].compose_unary([
+            marginal.q, marginal.q1, marginal.q2, marginal.q3, marginal.q4,
+        ]);
+        let observed_g = p[1] * s_f;
+        let one_plus_b2 = observed_g * observed_g + 1.0;
+        let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.v));
+        let eta = q * c + observed_g * z;
+        let m = eta * s;
+        Ok(m.compose_unary(unary_derivatives_neglog_phi(m.v, w)))
+    }
+}
+
+/// #932 universal oracle on the SECOND (and final) production `RowKernel`
+/// impl: `BernoulliRigidRowKernel`.
+///
+/// Audits every channel the hand-written kernel emits — value / gradient /
+/// Hessian / `row_third_contracted(dir)` / `row_fourth_contracted(u, v)` —
+/// against the single-expression `RowNllProgram<2>`-derived tower truth,
+/// over per-row-varying `(η_m, g)` fixtures (mixed labels, non-unit weights,
+/// with and without Gaussian frailty so the probit scale ≠ 1) and several
+/// direction vectors. Together with the survival marginal-slope oracle this
+/// closes #932 deployment step 2: every hand-written `RowKernel` in the tree
+/// is CI-verified channel-by-channel against the one-expression truth.
+#[test]
+fn bernoulli_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
+    use crate::families::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
+    use crate::families::row_kernel::RowKernel;
+
+    let n = 6usize;
+    let dirs: [[f64; 2]; 3] = [[0.8, -0.6], [-0.35, 1.1], [1.4, 0.25]];
+
+    for frailty in [None, Some(0.7_f64)] {
+        let family = BernoulliMarginalSlopeFamily {
+            gaussian_frailty_sd: frailty,
+            ..make_rigid_test_family(n)
+        };
+        // Per-row varying primaries so every channel sees nontrivial
+        // (η_m, g) variation, away from the link-map clamp tails.
+        let eta_m = Array1::from_iter((0..n).map(|i| -1.0 + 0.43 * i as f64));
+        let g_eta = Array1::from_iter((0..n).map(|i| 0.5 - 0.21 * i as f64));
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: eta_m,
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: g_eta,
+            },
+        ];
+
+        let kernel = super::row_kernel::BernoulliRigidRowKernel::new(
+            family.clone(),
+            block_states.clone(),
+        );
+        let program = BernoulliRigidNllProgram {
+            family,
+            block_states,
+        };
+
+        for row in 0..n {
+            let tower = evaluate_program(&program, row).expect("tower evaluation");
+
+            let (value, gradient, hessian) =
+                RowKernel::row_kernel(&kernel, row).expect("hand kernel value/grad/hess");
+
+            let third: Vec<([f64; 2], [[f64; 2]; 2])> = dirs
+                .iter()
+                .map(|dir| {
+                    let claim = RowKernel::row_third_contracted(&kernel, row, dir)
+                        .expect("hand kernel third");
+                    (*dir, claim)
+                })
+                .collect();
+
+            let fourth: Vec<([f64; 2], [f64; 2], [[f64; 2]; 2])> = dirs
+                .iter()
+                .enumerate()
+                .map(|(i, u)| {
+                    let v = dirs[(i + 1) % dirs.len()];
+                    let claim = RowKernel::row_fourth_contracted(&kernel, row, u, &v)
+                        .expect("hand kernel fourth");
+                    (*u, v, claim)
+                })
+                .collect();
+
+            let claims = KernelChannels {
+                value,
+                gradient,
+                hessian,
+                third,
+                fourth,
+            };
+
+            verify_kernel_channels(&tower, &claims, 1e-9).unwrap_or_else(|e| {
+                panic!(
+                    "frailty {frailty:?} row {row}: hand BernoulliRigidRowKernel disagrees \
+                     with #932 jet-tower truth: {e}"
+                )
+            });
+        }
+    }
+}
