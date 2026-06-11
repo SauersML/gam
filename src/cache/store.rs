@@ -1133,12 +1133,20 @@ mod tests {
 
     #[test]
     fn ttl_drops_old_entries() {
+        // Expiration is driven by `test_advance_time` (additive simulated time
+        // on top of the wall clock), so the TTL itself only needs to be larger
+        // than any plausible save→lookup wall-time on the CI runner. The
+        // 1-second TTL the original fixture used was tighter than the worst
+        // ext4 fsync this image sees (see `save_overwrite`'s late-stamp
+        // comment), so the first `is_some()` check would flake to "expired"
+        // before any time advance ever ran. 60 s clears that race with margin.
         let dir = tempfile::tempdir().unwrap();
+        let ttl = Duration::from_secs(60);
         let store = WarmStartStore::open(
             dir.path().to_path_buf(),
             StoreOptions {
                 size_budget_bytes: 1024 * 1024,
-                ttl: Duration::from_secs(1),
+                ttl,
             },
         )
         .unwrap();
@@ -1147,7 +1155,7 @@ mod tests {
             .save(&key, b"x", None, None, EntryKind::Checkpoint)
             .unwrap();
         assert!(store.lookup(&key).unwrap().is_some());
-        store.test_advance_time(Duration::from_millis(1_500));
+        store.test_advance_time(ttl + Duration::from_secs(5));
         // Trigger eviction via a save under an unrelated key.
         let other = key_for("ttl-other");
         store
