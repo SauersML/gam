@@ -371,6 +371,11 @@ class ManifoldSAE:
     # verdict; ``metric_provenance`` records the inner product it was computed in.
     # Pure read; ``None`` only for payloads predating the diagnostic.
     residual_gauge: dict[str, Any] | None = None
+    # Empirical curved-dictionary certificate inputs (#1008): frame incoherence
+    # ``mu_hat``, per-atom curvature bounds, activity floors, and an SNR proxy.
+    # This is deliberately quantities-only; no global-optimality verdict exists
+    # until the theorem threshold is implemented.
+    incoherence_report: dict[str, Any] | None = None
     # WP-D output-Fisher shard the fit installed (#980), retained so a follow-up
     # :meth:`steer` call can re-install ``RowMetric::OutputFisher`` and report the
     # path-integrated KL dose. The ``(n, p, r)`` factor stack ``U`` exactly as
@@ -458,9 +463,10 @@ class ManifoldSAE:
                 if payload.get("fisher_mass_residual") is None
                 else np.asarray(payload["fisher_mass_residual"], dtype=float)
             ),
-            # Additive post-fit diagnostics (#980): the two-score per-atom lens
-            # and the residual-gauge certificate. Absent ⇒ ``None`` (payloads
-            # predating the diagnostic); present ⇒ the Rust report dict verbatim.
+            # Additive post-fit diagnostics: the two-score per-atom lens,
+            # residual-gauge certificate, and empirical incoherence inputs.
+            # Absent ⇒ ``None`` (payloads predating each diagnostic); present
+            # ⇒ the Rust report dict verbatim.
             atom_two_lens=(
                 None
                 if payload.get("atom_two_lens") is None
@@ -470,6 +476,11 @@ class ManifoldSAE:
                 None
                 if payload.get("residual_gauge") is None
                 else dict(payload["residual_gauge"])
+            ),
+            incoherence_report=(
+                None
+                if payload.get("incoherence_report") is None
+                else dict(payload["incoherence_report"])
             ),
         )
 
@@ -933,6 +944,15 @@ class ManifoldSAE:
         def _optional_list(value: np.ndarray | None) -> Any:
             return None if value is None else value.tolist()
 
+        def _jsonable(value: Any) -> Any:
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, dict):
+                return {str(k): _jsonable(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_jsonable(v) for v in value]
+            return value
+
         return {
             "schema": "gamfit.ManifoldSAE/v1",
             "atom_topology": self.atom_topology,
@@ -987,6 +1007,11 @@ class ManifoldSAE:
             "basis_sizes": list(self._basis_sizes),
             "n_harmonics": list(self._n_harmonics),
             "duchon_centers": [None if c is None else c.tolist() for c in self._duchon_centers],
+            "atom_two_lens": None if self.atom_two_lens is None else _jsonable(self.atom_two_lens),
+            "residual_gauge": None if self.residual_gauge is None else _jsonable(self.residual_gauge),
+            "incoherence_report": (
+                None if self.incoherence_report is None else _jsonable(self.incoherence_report)
+            ),
         }
 
     def save(self, path: str | Path) -> None:
@@ -1069,6 +1094,17 @@ class ManifoldSAE:
             jumprelu_threshold=float(payload["jumprelu_threshold"]),
             _oos_projection_top1=bool(payload["oos_projection_top1"]),
             dispersion=float(payload["dispersion"]),
+            atom_two_lens=(
+                None if payload.get("atom_two_lens") is None else dict(payload["atom_two_lens"])
+            ),
+            residual_gauge=(
+                None if payload.get("residual_gauge") is None else dict(payload["residual_gauge"])
+            ),
+            incoherence_report=(
+                None
+                if payload.get("incoherence_report") is None
+                else dict(payload["incoherence_report"])
+            ),
         )
 
     @classmethod

@@ -3721,8 +3721,36 @@ impl SaeRowLayout {
     }
 }
 
+/// Empirical quantities that feed the future curved-dictionary incoherence
+/// theorem. This is deliberately a measurement bundle only: the threshold
+/// `f(kappa, SNR, sparsity)` is not in-tree yet, so no certified/uncertified
+/// verdict is emitted here.
+#[derive(Clone, Debug)]
+pub struct CertificateInputs {
+    /// `max_{j != k} sigma_max(U_j^T U_k)` over decoder output subspaces.
+    pub mu_hat: f64,
+    /// Per-atom maximum empirical second-fundamental-form norm on the fitted
+    /// coordinate grid.
+    pub per_atom_kappa_hat: Vec<f64>,
+    /// Mean fitted gate/assignment mass per atom.
+    pub per_atom_mean_activity: Vec<f64>,
+    /// Largest fitted gate/assignment mass per atom.
+    pub per_atom_peak_activity: Vec<f64>,
+    /// Conservative dictionary activity floor, `min_k mean_i a_ik`.
+    pub mean_activity_floor: f64,
+    /// Support floor matching the collapse guard statistic, `min_k max_i a_ik`.
+    pub peak_activity_floor: f64,
+    /// `mean_i ||sum_k a_ik g_k(t_ik)||^2 / dispersion`.
+    pub snr_proxy: f64,
+    /// Dispersion used in [`Self::snr_proxy`].
+    pub dispersion: f64,
+    /// Human-readable caveat: quantities only; no theorem threshold/verdict yet.
+    pub note: String,
+}
+
 /// The additive post-fit diagnostics for a fitted [`SaeManifoldTerm`]: the
-/// two-score per-atom lens and the residual-gauge certificate.
+/// two-score per-atom lens, residual-gauge certificate, and empirical
+/// incoherence/curvature certificate inputs.
 ///
 /// Built by [`SaeManifoldTerm::fit_diagnostics_report`]. Both reports are pure
 /// reads of the fitted term + its single per-row metric; nothing here feeds back
@@ -3737,6 +3765,256 @@ pub struct SaeManifoldFitDiagnostics {
     /// Residual-gauge certificate: which symmetry group the fit is identified up
     /// to ([`crate::sae_identifiability::residual_gauge`]).
     pub residual_gauge: crate::sae_identifiability::ResidualGaugeReport,
+    /// Empirical curved-dictionary certificate inputs (#1008). Present when the
+    /// caller supplies the fitted reconstruction dispersion needed for the SNR
+    /// proxy; absent for legacy callers that only need the existing diagnostics.
+    pub incoherence_report: Option<CertificateInputs>,
+}
+
+/// Build the empirical curved-dictionary certificate quantities from a fitted
+/// term and its Gaussian reconstruction dispersion.
+///
+/// This reports only computable theorem-side inputs. It intentionally has no
+/// global-optimality verdict: the threshold function relating these inputs is
+/// future theory (#1008).
+pub fn dictionary_incoherence_report(term: &SaeManifoldTerm) -> Result<CertificateInputs, String> {
+    let dispersion = term.certificate_dispersion.ok_or_else(|| {
+        "dictionary_incoherence_report: fitted reconstruction dispersion is unavailable".to_string()
+    })?;
+    dictionary_incoherence_report_with_dispersion(term, dispersion)
+}
+
+/// Build the empirical curved-dictionary certificate quantities from a fitted
+/// term and an explicit Gaussian reconstruction dispersion.
+pub fn dictionary_incoherence_report_with_dispersion(
+    term: &SaeManifoldTerm,
+    dispersion: f64,
+) -> Result<CertificateInputs, String> {
+    if !dispersion.is_finite() || dispersion <= 0.0 {
+        return Err(format!(
+            "dictionary_incoherence_report: dispersion must be finite and positive, got {dispersion}"
+        ));
+    }
+    let mu_hat = dictionary_frame_incoherence(term)?;
+    let per_atom_kappa_hat = term
+        .atoms
+        .iter()
+        .enumerate()
+        .map(|(atom_idx, _)| atom_curvature_bound(term, atom_idx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let assignments = term.assignment.assignments();
+    let n = assignments.nrows();
+    let k_atoms = assignments.ncols();
+    let mut per_atom_mean_activity = Vec::with_capacity(k_atoms);
+    let mut per_atom_peak_activity = Vec::with_capacity(k_atoms);
+    for atom_idx in 0..k_atoms {
+        let mut sum = 0.0_f64;
+        let mut peak = 0.0_f64;
+        for row in 0..n {
+            let value = assignments[[row, atom_idx]];
+            sum += value;
+            peak = peak.max(value);
+        }
+        per_atom_mean_activity.push(if n > 0 { sum / n as f64 } else { 0.0 });
+        per_atom_peak_activity.push(peak);
+    }
+    let mean_activity_floor = per_atom_mean_activity
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let peak_activity_floor = per_atom_peak_activity
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let fitted = term.fitted();
+    let signal_power = if fitted.is_empty() {
+        0.0
+    } else {
+        fitted.iter().map(|v| v * v).sum::<f64>() / fitted.len() as f64
+    };
+    Ok(CertificateInputs {
+        mu_hat,
+        per_atom_kappa_hat,
+        per_atom_mean_activity,
+        per_atom_peak_activity,
+        mean_activity_floor: if mean_activity_floor.is_finite() {
+            mean_activity_floor
+        } else {
+            0.0
+        },
+        peak_activity_floor: if peak_activity_floor.is_finite() {
+            peak_activity_floor
+        } else {
+            0.0
+        },
+        snr_proxy: signal_power / dispersion,
+        dispersion,
+        note: "empirical quantities only; no incoherence-threshold verdict is implemented yet"
+            .to_string(),
+    })
+}
+
+fn dictionary_frame_incoherence(term: &SaeManifoldTerm) -> Result<f64, String> {
+    let frames = (0..term.k_atoms())
+        .map(|atom_idx| certificate_output_frame(term, atom_idx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut mu = 0.0_f64;
+    for j in 0..frames.len() {
+        for k in (j + 1)..frames.len() {
+            if frames[j].ncols() == 0 || frames[k].ncols() == 0 {
+                continue;
+            }
+            let overlap = fast_atb(&frames[j], &frames[k]);
+            let (_u, s, _vt) = overlap.svd(false, false).map_err(|e| {
+                format!("dictionary_frame_incoherence: SVD failed for atom pair ({j}, {k}): {e}")
+            })?;
+            let pair = s.iter().copied().fold(0.0_f64, f64::max);
+            mu = mu.max(pair);
+        }
+    }
+    Ok(mu)
+}
+
+fn certificate_output_frame(
+    term: &SaeManifoldTerm,
+    atom_idx: usize,
+) -> Result<Array2<f64>, String> {
+    let atom = &term.atoms[atom_idx];
+    if atom.decoder_frame.is_some() {
+        return Ok(term.frame_output_matrix(atom_idx));
+    }
+    let p = atom.output_dim();
+    let (_u, s, vt_opt) = atom
+        .decoder_coefficients
+        .svd(false, true)
+        .map_err(|e| format!("certificate_output_frame: SVD failed for atom {atom_idx}: {e}"))?;
+    let max_sv = s.iter().copied().fold(0.0_f64, f64::max);
+    if !(max_sv > 0.0) {
+        return Ok(Array2::<f64>::zeros((p, 0)));
+    }
+    let tol = SAE_FRAME_RANK_CUTOFF * max_sv;
+    let rank = s.iter().filter(|&&value| value > tol).count();
+    let vt = vt_opt.ok_or_else(|| {
+        format!("certificate_output_frame: SVD returned no right factor for atom {atom_idx}")
+    })?;
+    let rank = rank.min(vt.nrows());
+    let mut frame = Array2::<f64>::zeros((p, rank));
+    for col in 0..rank {
+        for row in 0..p {
+            frame[[row, col]] = vt[[col, row]];
+        }
+    }
+    Ok(frame)
+}
+
+fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> Result<f64, String> {
+    let atom = &term.atoms[atom_idx];
+    let coords = term.assignment.coords[atom_idx].as_matrix();
+    let second = atom
+        .basis_evaluator
+        .as_ref()
+        .and_then(|evaluator| evaluator.second_jet_dyn(coords))
+        .ok_or_else(|| {
+            format!(
+                "atom_curvature_bound: atom {atom_idx} has no analytic second jet; cannot compute kappa_hat"
+            )
+        })?
+        .map_err(|e| format!("atom_curvature_bound: atom {atom_idx} second jet failed: {e}"))?;
+    let n = atom.n_obs();
+    let m = atom.basis_size();
+    let d = atom.latent_dim;
+    let p = atom.output_dim();
+    if second.dim() != (n, m, d, d) {
+        return Err(format!(
+            "atom_curvature_bound: atom {atom_idx} second jet shape {:?} must be ({n}, {m}, {d}, {d})",
+            second.dim()
+        ));
+    }
+    let mut max_kappa = 0.0_f64;
+    let mut tangent = Array2::<f64>::zeros((p, d));
+    let mut second_vec = vec![0.0_f64; p];
+    for row in 0..n {
+        for axis in 0..d {
+            let mut col = vec![0.0_f64; p];
+            atom.fill_decoded_derivative_row(row, axis, &mut col);
+            for out in 0..p {
+                tangent[[out, axis]] = col[out];
+            }
+        }
+        let tangent_rank = tangent_frame_rank(tangent.view())?;
+        let tangent_scale = tangent_rank.0;
+        let q = tangent_rank.1;
+        for axis_a in 0..d {
+            for axis_b in 0..d {
+                second_vec.fill(0.0);
+                for basis_col in 0..m {
+                    let h = second[[row, basis_col, axis_a, axis_b]];
+                    if h == 0.0 {
+                        continue;
+                    }
+                    for out in 0..p {
+                        second_vec[out] += h * atom.decoder_coefficients[[basis_col, out]];
+                    }
+                }
+                let perp_norm = projected_perp_norm(&second_vec, q.view());
+                if tangent_scale > 0.0 {
+                    max_kappa = max_kappa.max(perp_norm / tangent_scale);
+                } else if perp_norm > 0.0 {
+                    return Ok(f64::INFINITY);
+                }
+            }
+        }
+    }
+    Ok(max_kappa)
+}
+
+fn tangent_frame_rank(tangent: ArrayView2<'_, f64>) -> Result<(f64, Array2<f64>), String> {
+    let p = tangent.nrows();
+    let d = tangent.ncols();
+    if p == 0 || d == 0 {
+        return Ok((0.0, Array2::<f64>::zeros((p, 0))));
+    }
+    let (u_opt, s, _vt) = tangent
+        .to_owned()
+        .svd(true, false)
+        .map_err(|e| format!("tangent_frame_rank: SVD failed: {e}"))?;
+    let max_sv = s.iter().copied().fold(0.0_f64, f64::max);
+    if !(max_sv > 0.0) {
+        return Ok((0.0, Array2::<f64>::zeros((p, 0))));
+    }
+    let tol = SAE_FRAME_RANK_CUTOFF * max_sv;
+    let rank = s.iter().filter(|&&value| value > tol).count();
+    let min_positive = s
+        .iter()
+        .copied()
+        .filter(|value| *value > tol)
+        .fold(f64::INFINITY, f64::min);
+    let u = u_opt.ok_or_else(|| "tangent_frame_rank: SVD returned no U".to_string())?;
+    let rank = rank.min(u.ncols());
+    let mut q = Array2::<f64>::zeros((p, rank));
+    for col in 0..rank {
+        for row in 0..p {
+            q[[row, col]] = u[[row, col]];
+        }
+    }
+    Ok((min_positive * min_positive, q))
+}
+
+fn projected_perp_norm(vector: &[f64], tangent_frame: ArrayView2<'_, f64>) -> f64 {
+    let mut residual = vector.to_vec();
+    for axis in 0..tangent_frame.ncols() {
+        let mut coeff = 0.0_f64;
+        for out in 0..tangent_frame.nrows() {
+            coeff += tangent_frame[[out, axis]] * vector[out];
+        }
+        if coeff == 0.0 {
+            continue;
+        }
+        for out in 0..tangent_frame.nrows() {
+            residual[out] -= coeff * tangent_frame[[out, axis]];
+        }
+    }
+    residual.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
 
 /// Full SAE-manifold term.
@@ -3799,6 +4077,10 @@ pub struct SaeManifoldTerm {
     /// immediately lowers the dense block into a `BetaPenaltyOp`, so the returned
     /// `ArrowSchurSystem` does not need to keep owning the allocation.
     border_hbb_workspace: Array2<f64>,
+    /// Fitted Gaussian reconstruction dispersion used only by the empirical
+    /// incoherence/curvature certificate-input report. `None` for synthetic terms
+    /// or legacy internal callers that have not computed post-fit dispersion.
+    certificate_dispersion: Option<f64>,
 }
 
 impl Clone for SaeManifoldTerm {
@@ -3813,6 +4095,7 @@ impl Clone for SaeManifoldTerm {
             row_loss_weights: self.row_loss_weights.clone(),
             last_frames_active: self.last_frames_active,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
+            certificate_dispersion: self.certificate_dispersion,
         }
     }
 }
@@ -3893,7 +4176,21 @@ impl SaeManifoldTerm {
             row_loss_weights: None,
             last_frames_active: false,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
+            certificate_dispersion: None,
         })
+    }
+
+    /// Install the fitted reconstruction dispersion used by
+    /// [`dictionary_incoherence_report`]. This is a pure diagnostic scalar and
+    /// does not feed any loss, criterion, penalty, or optimizer state.
+    pub fn set_certificate_dispersion(&mut self, dispersion: f64) -> Result<(), String> {
+        if !dispersion.is_finite() || dispersion <= 0.0 {
+            return Err(format!(
+                "SaeManifoldTerm::set_certificate_dispersion: dispersion must be finite and positive, got {dispersion}"
+            ));
+        }
+        self.certificate_dispersion = Some(dispersion);
+        Ok(())
     }
 
     /// Install per-row design honesty weights (#991) — the `1/π` inclusion
@@ -4023,6 +4320,7 @@ impl SaeManifoldTerm {
         &self,
         per_atom_ard_variances: Option<&[Option<Array1<f64>>]>,
         isometry_pin_active: bool,
+        reconstruction_dispersion: Option<f64>,
     ) -> Result<SaeManifoldFitDiagnostics, String> {
         let metric = self.diagnostic_metric()?;
         let atom_two_lens = crate::inference::atom_lens::atom_two_lens(self, &metric);
@@ -4061,6 +4359,12 @@ impl SaeManifoldTerm {
         Ok(SaeManifoldFitDiagnostics {
             atom_two_lens,
             residual_gauge,
+            incoherence_report: match reconstruction_dispersion.or(self.certificate_dispersion) {
+                Some(dispersion) => Some(dictionary_incoherence_report_with_dispersion(
+                    self, dispersion,
+                )?),
+                None => None,
+            },
         })
     }
 

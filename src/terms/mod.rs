@@ -53,9 +53,10 @@ pub use latent_coord::{
 };
 pub use matern_gradient::{MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator};
 pub use sae_manifold::{
-    AssignmentMode, GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAssignment,
-    SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldLoss,
+    AssignmentMode, CertificateInputs, GumbelTemperatureSchedule, PeriodicHarmonicEvaluator,
+    SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldLoss,
     SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, SaeOuterRhoGradientComponents,
-    ScheduleKind, SphereChartEvaluator, TorusHarmonicEvaluator,
+    ScheduleKind, SphereChartEvaluator, TorusHarmonicEvaluator, dictionary_incoherence_report,
+    dictionary_incoherence_report_with_dispersion,
 };
 pub use sheaf::{EdgeRestriction, SheafConsistencyPenalty};
