@@ -8,6 +8,7 @@ use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
 use crate::linalg::utils::{
     StableSolver, boundary_hit_indices, enforce_symmetry, symmetric_spectrum_condition_number,
 };
+use crate::inference::hmc::BlockExcessTarget;
 use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;

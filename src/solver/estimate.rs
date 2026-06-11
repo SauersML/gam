@@ -4503,6 +4503,7 @@ where
     // SE computation via solve-on-demand after dispersion is determined.
     let mut edf_factor: Option<Box<dyn FactorizedSystem>> = None;
     let mut bias_correction_beta = None;
+    let mut rho_posterior_certificate = None;
 
     if opts.compute_inference {
         // EDF by block using stabilized H and penalty roots in transformed basis.
@@ -4792,7 +4793,7 @@ where
         // its criterion is the fit's own bit-for-bit (no retain/rebuild). Absent
         // when there are no smoothing parameters or the outer Hessian is
         // unavailable; never fatal.
-        let rho_posterior_certificate = reml_state.tier0_rho_certificate(&final_rho, None);
+        rho_posterior_certificate = reml_state.tier0_rho_certificate(&final_rho, None);
 
         // Standard errors: prefer the diagonal of the full inverse when
         // available; otherwise use the factorised Hessian from the EDF pass
