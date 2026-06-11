@@ -384,6 +384,12 @@ class ManifoldSAE:
     # off_manifold_norm) but ``predicted_nats`` / ``validity_radius`` are ``None``
     # (no behavioral axis to measure the dose through).
     fisher_factors: np.ndarray | None = None
+    # Which output-Fisher pullback produced ``fisher_factors`` (#980):
+    # ``"output_fisher"`` (same-position, the default) or
+    # ``"output_fisher_downstream"`` (KV-path aggregate over future positions). A
+    # follow-up :meth:`steer` re-installs the matching ``RowMetric`` so the dose
+    # is measured in the same geometry the fit's gauge used.
+    fisher_provenance: str = "output_fisher"
 
     def __repr__(self) -> str:
         d_atom = int(self.coords[0].shape[1]) if self.coords else 0
@@ -858,6 +864,9 @@ class ManifoldSAE:
             alpha=float(self.alpha),
             jumprelu_threshold=float(self.jumprelu_threshold),
             fisher_factors=fisher,
+            fisher_provenance=(
+                None if self.fisher_factors is None else str(self.fisher_provenance)
+            ),
         )
         return dict(plan)
 
@@ -1548,6 +1557,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         jumprelu_threshold=float(jumprelu_threshold),
         fisher_factors=None if fisher_shard is None else fisher_shard[0],
         fisher_mass_residual=None if fisher_shard is None else fisher_shard[1],
+        fisher_provenance=None if fisher_shard is None else fisher_shard[2],
     )
     payload_dict = dict(payload)
     model = ManifoldSAE.from_payload(
@@ -1564,6 +1574,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # Euclidean (no-shard) path this stays None and steering is geometry-only.
     if fisher_shard is not None:
         model.fisher_factors = np.ascontiguousarray(fisher_shard[0])
+        model.fisher_provenance = fisher_shard[2]
     return model
 
 
@@ -1752,9 +1763,9 @@ def _as_2d_float(value: Any, name: str) -> np.ndarray:
 
 def _normalize_fisher_factors(
     fisher_factors: Any, n_obs: int, p_out: int
-) -> tuple[np.ndarray, np.ndarray | None] | None:
-    """Coerce a WP-D output-Fisher shard into the ``(U, mass_residual)`` the
-    Rust ``sae_manifold_fit_minimal`` FFI consumes (#980).
+) -> tuple[np.ndarray, np.ndarray | None, str] | None:
+    """Coerce a WP-D output-Fisher shard into the ``(U, mass_residual, provenance)``
+    the Rust ``sae_manifold_fit_minimal`` FFI consumes (#980).
 
     ``fisher_factors`` may be: ``None`` (Euclidean, no shard); a
     :class:`gamfit.torch.harvest.HarvestShard` (``.U`` ``(n, p, r)`` /
@@ -1769,10 +1780,14 @@ def _normalize_fisher_factors(
     if fisher_factors is None:
         return None
     # HarvestShard dataclass or load_harvest_shard() dict — both carry U +
-    # mass_residual; a bare array carries only U.
+    # mass_residual; a bare array carries only U. The provenance tag (#980)
+    # rides along so the FFI installs the matching output-Fisher `RowMetric`;
+    # a bare array or a pre-#980 shard defaults to the same-position metric.
+    provenance = "output_fisher"
     if hasattr(fisher_factors, "U") and hasattr(fisher_factors, "mass_residual"):
         u_src: Any = fisher_factors.U
         mr_src: Any = fisher_factors.mass_residual
+        provenance = str(getattr(fisher_factors, "provenance", "output_fisher"))
     elif isinstance(fisher_factors, Mapping):
         if "U" not in fisher_factors:
             raise ValueError(
@@ -1780,9 +1795,15 @@ def _normalize_fisher_factors(
             )
         u_src = fisher_factors["U"]
         mr_src = fisher_factors.get("mass_residual")
+        provenance = str(fisher_factors.get("provenance", "output_fisher"))
     else:
         u_src = fisher_factors
         mr_src = None
+    if provenance not in ("output_fisher", "output_fisher_downstream"):
+        raise ValueError(
+            "fisher_factors provenance must be 'output_fisher' or "
+            f"'output_fisher_downstream'; got {provenance!r}"
+        )
     u = np.asarray(u_src, dtype=np.float64)
     if u.ndim != 3:
         raise ValueError(
@@ -1804,7 +1825,7 @@ def _normalize_fisher_factors(
         raise ValueError("fisher_factors U must be finite")
     u = np.ascontiguousarray(u)
     if mr_src is None:
-        return u, None
+        return u, None, provenance
     mr = np.asarray(mr_src, dtype=np.float64)
     if mr.shape != (n_obs,):
         raise ValueError(
@@ -1813,7 +1834,7 @@ def _normalize_fisher_factors(
         )
     if not np.all(np.isfinite(mr)):
         raise ValueError("fisher_factors mass_residual must be finite")
-    return u, np.ascontiguousarray(mr)
+    return u, np.ascontiguousarray(mr), provenance
 
 
 def _dims(k_atoms: int, d_atom: Any) -> list[int]:
