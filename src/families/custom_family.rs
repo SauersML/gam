@@ -31865,6 +31865,63 @@ mod tests {
             .map(|(obj, grad, _warm)| (*obj, grad.len()))
             .map_err(|err| err.as_str());
         eprintln!("bug979_diag base-case result: {result2_summary:?}");
+
+        // ρ-grid probe along each coordinate for both fixtures: is V(ρ) smooth
+        // (h vs 2h central FD agree), and what is the analytic gradient?
+        for (label, y_probe, b0, b1, rho_c) in [
+            (
+                "base",
+                vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+                0.0,
+                0.0,
+                array![0.0, 0.0],
+            ),
+            (
+                "hard",
+                vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+                0.2,
+                -0.1,
+                array![0.15, -0.25],
+            ),
+        ] {
+            let (fam, sp, pc, op) =
+                binomial_location_scale_outer_fixture(Array1::from_vec(y_probe), b0, b1);
+            let h = 1e-5;
+            for k in 0..2 {
+                let mut vals = Vec::new();
+                for step in [-2.0_f64, -1.0, 0.0, 1.0, 2.0] {
+                    let mut rho_p = rho_c.clone();
+                    rho_p[k] += step * h;
+                    match outerobjective_andgradient(&fam, &sp, &op, &pc, &rho_p, None) {
+                        Ok((f, g, _)) => vals.push((step, f, g[k])),
+                        Err(e) => {
+                            eprintln!("bug979_diag {label} k={k} step={step}: ERR {e}");
+                            vals.push((step, f64::NAN, f64::NAN));
+                        }
+                    }
+                }
+                let f = |s: f64| {
+                    vals.iter()
+                        .find(|(st, _, _)| *st == s)
+                        .map(|(_, fv, _)| *fv)
+                };
+                let g0 = vals
+                    .iter()
+                    .find(|(st, _, _)| *st == 0.0)
+                    .map(|(_, _, gv)| *gv);
+                if let (Some(fm2), Some(fm1), Some(fp1), Some(fp2)) =
+                    (f(-2.0), f(-1.0), f(1.0), f(2.0))
+                {
+                    eprintln!(
+                        "bug979_diag {label} k={k}: analytic={:?} fd_h={:.8} fd_2h={:.8} f(0)={:?}",
+                        g0,
+                        (fp1 - fm1) / (2.0 * h),
+                        (fp2 - fm2) / (4.0 * h),
+                        f(0.0)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
