@@ -25559,13 +25559,29 @@ mod tests {
         let x = Array1::linspace(0.0, 1.0, n);
         let mut data = Array2::<f64>::zeros((n, 1));
         data.column_mut(0).assign(&x);
-        // `BSplineIdentifiability::None` keeps the smooth block sparse through
-        // `build_bspline_basis_1d`. The default `WeightedSumToZero` policy is
-        // deliberately densified by `apply_sum_to_zero_constraint_sparse`
-        // (orthonormal Z, so ZZᵀ is a true projector — `B·Z` is mathematically
-        // dense), which would prevent the assembled design from landing in
-        // `DesignMatrix::Sparse`; the sparse-design pin only holds on the None
-        // branch (see `test_build_bspline_basis_1d_default_identifiability_densifies_via_orthonormal_centering`).
+        // `BSplineIdentifiability::None` keeps the per-term basis sparse
+        // through `build_bspline_basis_1d`. The default `WeightedSumToZero`
+        // policy is deliberately densified by
+        // `apply_sum_to_zero_constraint_sparse` (orthonormal Z, so ZZᵀ is a
+        // true projector — `B·Z` is mathematically dense), which would
+        // prevent the assembled design from landing in
+        // `DesignMatrix::Sparse`.
+        //
+        // The other implicit densification path is the joint-null absorption
+        // rotation in `build_smooth_design_withworkspace_unvalidated`: when
+        // the per-term joint penalty `Σ_k S_k` has a non-trivial null space,
+        // the term is rotated through a DENSE `(p × p)` orthogonal `Q` from
+        // eigh, and `built.design = DesignMatrix::Dense(X · Q)`. A single
+        // smoothness penalty (`double_penalty: false`, penalty order 2) has a
+        // null space of dimension 2 (the constants and the linear monomial),
+        // so the rotation fires and densifies the design.
+        //
+        // Pin `double_penalty: true` so the per-term joint penalty is the
+        // smoothness penalty plus the null-space shrinkage; their sum is
+        // full-rank on the basis, `compute_joint_null_rotation` returns
+        // `None`, and the rotation step is skipped. The assembled design then
+        // genuinely lands in `DesignMatrix::Sparse` and the sparse-design
+        // capability gate this test exists to verify is actually exercised.
         let spec = TermCollectionSpec {
             linear_terms: vec![],
             random_effect_terms: vec![],
@@ -25580,7 +25596,7 @@ mod tests {
                             data_range: (0.0, 1.0),
                             num_internal_knots: 32,
                         },
-                        double_penalty: false,
+                        double_penalty: true,
                         identifiability: BSplineIdentifiability::None,
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
