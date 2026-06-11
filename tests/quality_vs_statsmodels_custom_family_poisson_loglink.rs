@@ -41,7 +41,7 @@ use gam::custom_family::{
 };
 use gam::matrix::{DenseDesignMatrix, DesignMatrix, LinearOperator};
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, run_python};
+use gam::test_support::reference::{Column, pad_to, relative_l2, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::{Array1, Array2};
 use std::path::Path;
@@ -582,19 +582,4 @@ emit("mu_test", mu_test)
         gam_edf > 1.0 && gam_edf < 30.0,
         "gam effective dof out of sane range: {gam_edf:.3}"
     );
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len` so a
-/// test-length prediction input can ride along inside a train-length reference
-/// `data.frame`; only the first `v.len()` entries are read back by the body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }
