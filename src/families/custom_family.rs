@@ -16508,10 +16508,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // the local quadratic model can reconcile at this β. After
                 // FULLY_REJECTED_STALL_MAX_CYCLES such cycles, exit
                 // non-converged so the outer optimizer rejects this ρ.
-                let all_attempts_objective_rejected =
-                    objective_rejects == JOINT_TRUST_MAX_ATTEMPTS
-                        && model_rejects == 0
-                        && likelihood_rejects == 0;
+                let all_attempts_objective_rejected = objective_rejects == JOINT_TRUST_MAX_ATTEMPTS
+                    && model_rejects == 0
+                    && likelihood_rejects == 0;
                 let radius_held_since_last_reject = match prev_rejected_trust_radius {
                     Some(prev) => {
                         joint_trust_radius.is_finite()
