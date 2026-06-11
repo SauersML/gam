@@ -266,7 +266,8 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
             let factor = q_i * s * s * g_i / c_i + s * z_i;
             // J[i,:] = factor · G[i,:]
             let g_row = self.logslope_dense.row(i);
-            out.row_mut(i - rows.start).assign(&g_row.mapv(|x| factor * x));
+            out.row_mut(i - rows.start)
+                .assign(&g_row.mapv(|x| factor * x));
         }
         Ok(out)
     }

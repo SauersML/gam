@@ -42,8 +42,7 @@ use crate::families::custom_family::{
     PenaltyMatrix,
 };
 use crate::families::identifiability_compiler::{
-    IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks,
-    symmetric_sqrt_into,
+    IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
 };
 use crate::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
@@ -143,7 +142,9 @@ impl BlockJacobianAsRowOp {
                 let state = Self::zero_state();
                 let stacked = cb
                     .effective_jacobian_rows(&state, start..end)
-                    .map_err(|e| format!("BlockJacobianAsRowOp block '{}': {e}", self.block_name))?;
+                    .map_err(|e| {
+                        format!("BlockJacobianAsRowOp block '{}': {e}", self.block_name)
+                    })?;
                 let chunk = end - start;
                 if stacked.nrows() != self.k_block * chunk || stacked.ncols() != self.p {
                     return Err(format!(
@@ -295,8 +296,7 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
         for ch in 0..self.k_block {
             for local_i in 0..chunk {
                 for col in 0..self.p {
-                    out[[local_i * self.k_target + ch, col]] =
-                        stacked[[ch * chunk + local_i, col]];
+                    out[[local_i * self.k_target + ch, col]] = stacked[[ch * chunk + local_i, col]];
                 }
             }
         }
@@ -524,31 +524,28 @@ fn canonicalize_for_identifiability_inner(
                     // `from_callback` zero-pads the trailing channels for
                     // blocks with fewer outputs than the audit's common k,
                     // building the padded tensor directly.
-                    let row_op =
-                        BlockJacobianAsRowOp::from_callback(
-                            Arc::clone(cb),
-                            n_rows,
-                            spec.design.ncols(),
-                            k,
-                            &spec.name,
-                        )
-                            .map_err(|e| CustomFamilyError::DimensionMismatch {
-                                reason: format!(
-                                    "canonicalize_for_identifiability: build \
-                                         BlockJacobianAsRowOp for block '{}': {e}",
-                                    spec.name,
-                                ),
-                            })?;
-                    Arc::new(row_op)
-                }
-                None => {
-                    Arc::new(BlockJacobianAsRowOp::from_flat_design(
-                        spec.design.clone(),
+                    let row_op = BlockJacobianAsRowOp::from_callback(
+                        Arc::clone(cb),
                         n_rows,
+                        spec.design.ncols(),
                         k,
                         &spec.name,
-                    ))
+                    )
+                    .map_err(|e| CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "canonicalize_for_identifiability: build \
+                                         BlockJacobianAsRowOp for block '{}': {e}",
+                            spec.name,
+                        ),
+                    })?;
+                    Arc::new(row_op)
                 }
+                None => Arc::new(BlockJacobianAsRowOp::from_flat_design(
+                    spec.design.clone(),
+                    n_rows,
+                    k,
+                    &spec.name,
+                )),
             };
             operators.push(op);
         }
