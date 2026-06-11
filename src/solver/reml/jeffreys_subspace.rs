@@ -51,39 +51,90 @@ const REDUCED_INFO_RELATIVE_FLOOR: f64 = 1e-10;
 /// (near) zero, so `λ_max ≈ 0` cannot scale the relative floor.
 const REDUCED_INFO_ABSOLUTE_FLOOR: f64 = 1e-12;
 
-/// Floored signed inverse `d(λ) = g'(λ)` of the Jeffreys eigenvalue
-/// antiderivative `g` (`g(λ) = ln|λ|` for `|λ| ≥ floor`, the #787 linear
-/// continuation `λ/floor + ln(floor) − 1` inside the band): `1/λ` above the
-/// magnitude floor (signed, gam#814), `1/floor` inside the band.
+/// Slope `d(λ) = g'(λ)` of the Jeffreys eigenvalue antiderivative `g`:
+///
+///   * `λ ≥ floor`:      `g = ln λ`,                          `d = 1/λ`
+///     (the exact Jeffreys log-volume on identified curvature);
+///   * `0 ≤ λ < floor`:  `g = λ/floor + ln(floor) − 1`,       `d = 1/floor`
+///     (the #787 linear continuation — C¹ at `+floor`, preserves the
+///     1/floor separation bound);
+///   * `λ < 0`:          `g = ln(floor) − 1 + λ/(floor − λ)`, `d = floor/(floor − λ)²`
+///     (SATURATING continuation, gam#979 — see below). C¹ at `0`
+///     (`g(0) = ln(floor) − 1`, `d(0) = 1/floor` from both sides), monotone
+///     increasing everywhere, and `g → ln(floor) − 2`, `d → 0` as `λ → −∞`.
+///
+/// WHY THE NEGATIVE BRANCH SATURATES (gam#979; supersedes the gam#814
+/// `ln|λ|` magnitude branch). `ln|λ|` on `λ < 0` made `Φ` REWARD increasingly
+/// indefinite curvature: `∂Φ/∂λ = 1/(2λ) < 0`, so the Φ-augmented inner
+/// objective `−ℓ + ½βᵀSβ − Φ` could be descended indefinitely by driving a
+/// reduced eigenvalue more negative. The old `K²` vec-Gram phantom curvature
+/// froze the step and masked this; with the exact divided-difference `H_Φ`
+/// the joint Newton followed the reward into likelihood saturation (measured
+/// on the constrained binomial-LS wiggle fixture: bare `−ℓ + pen` climbing
+/// 5.2 → 9.9 over 500 cycles while the augmented Δobj stayed negative every
+/// cycle, residual → 3e2, budget exhausted). The Jeffreys prior is the
+/// log-volume of POSITIVE information; an indefinite direction carries no
+/// prior signal, so the principled continuation is FLAT in the limit: the
+/// rational saturation keeps `g` monotone (no reward), bounded below
+/// (no sink), with `d` bounded by `1/floor` (no gam#814 phantom score on
+/// moderate negatives: `d(−0.3) ≈ floor/0.09 ≈ 0`) and no kink anywhere
+/// (the gam#814 `±floor` jump is gone).
 #[inline]
 fn floored_inverse(lam: f64, floor: f64) -> f64 {
-    if lam.abs() >= floor {
+    if lam >= floor {
         1.0 / lam
-    } else {
+    } else if lam >= 0.0 {
         1.0 / floor
+    } else {
+        let denom = floor - lam;
+        floor / (denom * denom)
     }
 }
 
-/// `d'(λ)` with the floor held fixed: `−1/λ²` above the magnitude floor, `0`
-/// inside the band (the linear continuation has no curvature in `λ`).
+/// `d'(λ)` with the floor held fixed: `−1/λ²` above the floor, `0` inside the
+/// band (the linear continuation has no curvature in `λ`),
+/// `2·floor/(floor − λ)³` on the saturating negative branch.
 #[inline]
 fn floored_inverse_prime(lam: f64, floor: f64) -> f64 {
-    if lam.abs() >= floor {
+    if lam >= floor {
         -1.0 / (lam * lam)
-    } else {
+    } else if lam >= 0.0 {
         0.0
+    } else {
+        let denom = floor - lam;
+        2.0 * floor / (denom * denom * denom)
     }
 }
 
-/// `d''(λ)` with the floor held fixed: `2/λ³` above the magnitude floor, `0`
-/// inside the band. Needed by the drift path for the confluent-pair limit of
-/// the divided-difference kernel motion (`δΨ_ii = d''(λ_i)·λ̇_i`).
+/// `d''(λ)` with the floor held fixed: `2/λ³` above the floor, `0` inside the
+/// band, `6·floor/(floor − λ)⁴` on the saturating negative branch. Needed by
+/// the drift path for the confluent-pair limit of the divided-difference
+/// kernel motion (`δΨ_ii = d''(λ_i)·λ̇_i`).
 #[inline]
 fn floored_inverse_second(lam: f64, floor: f64) -> f64 {
-    if lam.abs() >= floor {
+    if lam >= floor {
         2.0 / (lam * lam * lam)
-    } else {
+    } else if lam >= 0.0 {
         0.0
+    } else {
+        let denom = floor - lam;
+        6.0 * floor / (denom * denom * denom * denom)
+    }
+}
+
+/// `∂d/∂floor` with `λ` held fixed: `0` above the floor, `−1/floor²` inside
+/// the band, `−(floor + λ)/(floor − λ)³` on the saturating negative branch.
+/// Feeds the floor-motion term of the kernel drift when the floor is in its
+/// active relative regime (`floor = REL·λ_max(β)`).
+#[inline]
+fn floored_inverse_floor_sensitivity(lam: f64, floor: f64) -> f64 {
+    if lam >= floor {
+        0.0
+    } else if lam >= 0.0 {
+        -1.0 / (floor * floor)
+    } else {
+        let denom = floor - lam;
+        -(floor + lam) / (denom * denom * denom)
     }
 }
 
@@ -97,9 +148,8 @@ fn floored_inverse_second(lam: f64, floor: f64) -> f64 {
 /// term `½ tr(K D_ab)` (which carries the vanishing curvature factor of a
 /// separating direction, so it is O(1) exactly where the term arms),
 ///   `∂²Φ[a,b] = ½ Σ_ij Ψ_ij (Ṽ_a)_ij (Ṽ_b)_ij`,  `Ṽ_k = Vᵀ D_k V`.
-/// The kink of `d` at `λ = −floor` (gam#814 magnitude-floor branch) makes the
-/// divided difference across that boundary large but finite — the honest
-/// secant slope of the implemented `d`; the trust region owns that band.
+/// With the saturating negative branch `d` is continuous everywhere, so every
+/// divided difference is bounded by `max|d'| ≤ 2/floor`.
 fn floored_inverse_divided_differences(evals: &Array1<f64>, floor: f64) -> Array2<f64> {
     let m = evals.len();
     let mut psi = Array2::<f64>::zeros((m, m));
@@ -784,49 +834,36 @@ where
     // h_id_inv = V diag(1/max(λ,floor)) Vᵀ  (floored symmetric pseudo-inverse).
     let mut inv_diag = Array1::<f64>::zeros(m);
     for (i, &lam) in evals.iter().enumerate() {
-        // VALUE / GRADIENT CONSISTENCY (was a stall — gam#787/#785) AND SIGN
-        // HANDLING ON INDEFINITE REDUCED INFO (gam#814). The gradient below is
-        // `½ tr(H_id⁻¹ D_k) = ½ Σ_i inv_diag_i ∂λ_i/∂β`, so for the value/gradient
-        // pair to be consistent (∇Φ = d/dβ Φ) the value `Φ = ½ Σ_i g(λ_i)` must use
-        // the antiderivative `g` of `λ ↦ inv_diag(λ)`.
-        //
-        // We floor on the MAGNITUDE `|λ|` and keep the SIGN of the inverse:
-        //   • |λ| ≥ floor: g(λ) = ln|λ|               (g'(λ) = 1/λ),
-        //   • |λ| < floor: g(λ) = λ/floor + ln(floor) − 1  (g'(λ) = 1/floor),
-        // the #787 linear continuation, C¹ at λ = +floor (g(floor) = ln(floor),
-        // g'(floor⁻) = g'(floor⁺) = 1/floor).
-        //
-        // WHY THE FLOOR IS ON `|λ|`, NOT `λ` (gam#814). `H_id = Z_Jᵀ H Z_J` is the
-        // reduced OBSERVED information; for a non-canonical link (e.g. the
-        // marginal-slope survival family) it need NOT be PSD away from the mode, so
-        // at off-mode trial points it carries MODERATE NEGATIVE eigenvalues
-        // (measured: λ ≈ −0.05 … −0.36, |λ| ≫ floor = 1e-10·λ_max). The previous
-        // `1/max(λ, floor)` flooring keyed on the SIGNED eigenvalue, so EVERY
-        // negative direction — however moderate — was treated as near-zero and
-        // pinned to `1/floor ≈ 1.7e6`: a phantom Firth score (∇Φ ≈ 1.4e6,
-        // H_Φ ≈ 1e12) that no Newton step could satisfy, so the inner joint-Newton
-        // crawled its whole cycle budget and the outer LAML never received a
-        // stationary mode (gam#814 survival clustered-PC marginal-slope timeout).
-        // Flooring on `|λ|` with the SIGNED true inverse `1/λ` gives the moderate
-        // negatives their genuine `1/λ ≈ −20 … −2.8` instead of `+1.7e6`, so the
-        // Jeffreys log-volume uses `½ ln|λ|` (the determinant magnitude, the
-        // PSD-realisation of `½ log det I` the Jeffreys prior intends) and the term
-        // self-limits rather than exploding. On a genuinely PSD fit every λ ≥ floor
-        // and this is BYTE-IDENTICAL to the prior `1/λ`, `½ ln λ`; the #787
-        // near-separation branch (`0 ≤ λ < floor`) is UNCHANGED, preserving the
-        // 1/floor separation bound. There is a harmless C⁰ kink in inv_diag at
-        // λ = ±floor (it jumps `+1/floor ↔ −1/floor`), but no eigenvalue sits near
-        // ∓floor in practice and the value `½ ln|λ|` stays continuous there.
-        let lam_mag = lam.abs();
-        if lam_mag >= floor {
-            phi += 0.5 * lam_mag.ln();
+        // VALUE / GRADIENT CONSISTENCY (was a stall — gam#787/#785). The gradient
+        // below is `½ tr(H_id⁻¹ D_k) = ½ Σ_i inv_diag_i ∂λ_i/∂β`, so for the
+        // value/gradient pair to be consistent (∇Φ = d/dβ Φ) the value
+        // `Φ = ½ Σ_i g(λ_i)` must use the antiderivative `g` of
+        // `λ ↦ inv_diag(λ) = floored_inverse(λ)` — the three-branch `g`
+        // documented on `floored_inverse`: exact `ln λ` on identified positive
+        // curvature, the #787 linear continuation inside the band, and the
+        // gam#979 SATURATING continuation on negative curvature (which replaced
+        // the gam#814 `ln|λ|` magnitude branch — that branch made Φ REWARD
+        // increasingly indefinite curvature, an unbounded sink the exact
+        // divided-difference H_Φ let the inner Newton descend into likelihood
+        // saturation; the saturating branch is monotone, bounded below, and
+        // keeps the gam#814 guarantee that moderate negatives carry no phantom
+        // score: `d(−0.3) = floor/(floor+0.3)² ≈ 0`).
+        if lam >= floor {
+            phi += 0.5 * lam.ln();
             inv_diag[i] = floored_inverse(lam, floor);
-        } else {
+        } else if lam >= 0.0 {
             phi += 0.5 * (lam / floor + floor.ln() - 1.0);
             inv_diag[i] = floored_inverse(lam, floor);
             // ∂g(λ; floor)/∂floor = 1/floor − λ/floor², accumulated so the gradient
             // below can add the floor-response term `½ · this · ∂floor/∂β_k`.
             floor_value_sensitivity += 1.0 / floor - lam / (floor * floor);
+        } else {
+            phi += 0.5 * (floor.ln() - 1.0 + lam / (floor - lam));
+            inv_diag[i] = floored_inverse(lam, floor);
+            // ∂g(λ; floor)/∂floor = 1/floor − λ/(floor − λ)² for the saturating
+            // branch (λ < 0 makes both terms positive).
+            let denom = floor - lam;
+            floor_value_sensitivity += 1.0 / floor - lam / (denom * denom);
         }
     }
     // Daleckii–Krein divided-difference kernel of the floored signed inverse on
@@ -1181,13 +1218,6 @@ where
     let mut rotation = Array2::<f64>::zeros((m, m));
     // Kernel motion δΨ.
     let mut dpsi = Array2::<f64>::zeros((m, m));
-    let d_floor_sensitivity = |lam: f64| -> f64 {
-        if lam.abs() < floor {
-            -1.0 / (floor * floor)
-        } else {
-            0.0
-        }
-    };
     for i in 0..m {
         for j in 0..m {
             let denom = evals[j] - evals[i];
@@ -1203,16 +1233,24 @@ where
                 dpsi[[i, j]] =
                     ((dp_i - psi[[i, j]]) * lam_dot_i + (psi[[i, j]] - dp_j) * lam_dot_j) / gap;
                 if dfloor != 0.0 {
-                    dpsi[[i, j]] += (d_floor_sensitivity(evals[i]) - d_floor_sensitivity(evals[j]))
+                    dpsi[[i, j]] += (floored_inverse_floor_sensitivity(evals[i], floor)
+                        - floored_inverse_floor_sensitivity(evals[j], floor))
                         / gap
                         * dfloor;
                 }
             } else {
                 // Confluent/diagonal: Ψ = d'(λ), so δΨ = d''(λ)·λ̇ with the
-                // averaged eigenvalue motion of the (near-)tied pair.
+                // averaged eigenvalue motion of the (near-)tied pair, plus the
+                // floor motion of d' (nonzero only on the saturating negative
+                // branch, where `∂d'/∂floor = −2(2·floor + λ)/(floor − λ)⁴`).
                 dpsi[[i, j]] = floored_inverse_second(evals[i], floor)
                     * 0.5
                     * (dbar_red[[i, i]] + dbar_red[[j, j]]);
+                if dfloor != 0.0 && evals[i] < 0.0 {
+                    let denom = floor - evals[i];
+                    dpsi[[i, j]] +=
+                        -2.0 * (2.0 * floor + evals[i]) / (denom * denom * denom * denom) * dfloor;
+                }
             }
         }
     }
