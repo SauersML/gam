@@ -494,10 +494,17 @@ fn family_jet_sups(atom: &SaeManifoldAtom, chart: &ChartRegion) -> Result<JetSup
             JetSups::from_family(&ev, chart)
         }
         Duchon => {
-            // Reconstruct a radial bound from the atom's stored centers when
-            // available; otherwise treat the kernel as cubic over the chart.
+            // The atom carries the basis kind but not the nullspace order, and
+            // the certificate needs an UPPER bound on L. The kernel-tail bound
+            // (cubic r³ coefficients vs the chart's r_min/r_max) is independent
+            // of the constructed order; the polynomial-block bound grows with the
+            // order, so we construct with a conservative order whose polynomial
+            // degree upper-bounds any nullspace the atom's basis width can hold.
+            // Constructing with `m = basis_size` maps to `Degree(basis_size − 1)`
+            // — an over-estimate that keeps the Lipschitz bound sound.
             let centers = duchon_centers_from_atom(atom);
-            let ev = DuchonCoordinateEvaluator::new(centers, 1)?;
+            let conservative_m = m.max(1);
+            let ev = DuchonCoordinateEvaluator::new(centers, conservative_m)?;
             JetSups::from_family(&ev, chart)
         }
         Precomputed(name) => {
