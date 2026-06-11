@@ -829,6 +829,22 @@ pub struct SparseBlockKroneckerPenaltyOp {
     pub blocks: Vec<SparseGBlock>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DeviceSaeSmoothBlock {
+    pub global_offset: usize,
+    pub factor_a: Array2<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceSaePcgData {
+    pub p: usize,
+    pub beta_dim: usize,
+    pub a_phi: Vec<Vec<(usize, f64)>>,
+    pub local_jac: Vec<Vec<f64>>,
+    pub smooth_blocks: Vec<DeviceSaeSmoothBlock>,
+    pub sparse_g_blocks: Vec<SparseGBlock>,
+}
+
 impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
     fn dim(&self) -> usize {
         self.k
@@ -2878,6 +2894,12 @@ pub struct ArrowSchurSystem {
     /// `DensePenaltyOp` — identical observable behaviour, no new allocation
     /// hot-path cost for callers that have not opted in.
     pub penalty_op: Option<Arc<dyn BetaPenaltyOp>>,
+    /// Device-uploadable SAE Kronecker data for CUDA-resident reduced PCG.
+    ///
+    /// The generic matrix-free closures remain the authoritative CPU path. This
+    /// descriptor is installed only when SAE assembly has a matching CUDA sparse
+    /// representation for both `H_tβ` and `H_ββ`.
+    pub device_sae_pcg: Option<Arc<DeviceSaePcgData>>,
     /// Registered Psi-tier analytic penalties whose Hessian couples *distinct*
     /// latent rows (non-row-block-diagonal), captured by
     /// [`Self::add_analytic_penalty_contributions`].
@@ -2917,6 +2939,7 @@ impl Clone for ArrowSchurSystem {
             analytic_row_hessian_fingerprint: self.analytic_row_hessian_fingerprint,
             block_offsets: Arc::clone(&self.block_offsets),
             penalty_op: self.penalty_op.clone(),
+            device_sae_pcg: self.device_sae_pcg.clone(),
             cross_row_penalties: self.cross_row_penalties.clone(),
         }
     }
@@ -2993,6 +3016,7 @@ impl ArrowSchurSystem {
             analytic_row_hessian_fingerprint: 0,
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op: None,
+            device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
         };
         sys.refresh_row_hessian_fingerprint();
@@ -3041,6 +3065,7 @@ impl ArrowSchurSystem {
             analytic_row_hessian_fingerprint: 0,
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op: None,
+            device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
         };
         sys.refresh_row_hessian_fingerprint();
@@ -3095,6 +3120,7 @@ impl ArrowSchurSystem {
             analytic_row_hessian_fingerprint: 0,
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op,
+            device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
         };
         sys.refresh_row_hessian_fingerprint();
@@ -3155,6 +3181,7 @@ impl ArrowSchurSystem {
             analytic_row_hessian_fingerprint: 0,
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op: None,
+            device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
         };
         sys.refresh_row_hessian_fingerprint();
@@ -3214,6 +3241,7 @@ impl ArrowSchurSystem {
             analytic_row_hessian_fingerprint: 0,
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op: None,
+            device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
         };
         sys.refresh_row_hessian_fingerprint();
@@ -3334,6 +3362,13 @@ impl ArrowSchurSystem {
         // installed operator; refresh it so the factorization / evidence cache
         // (`cache_matches_system`) invalidates when the β-block changes.
         self.refresh_row_hessian_fingerprint();
+    }
+
+    pub fn set_device_sae_pcg_data(&mut self, data: DeviceSaePcgData) {
+        assert_eq!(data.beta_dim, self.k);
+        assert_eq!(data.a_phi.len(), self.rows.len());
+        assert_eq!(data.local_jac.len(), self.rows.len());
+        self.device_sae_pcg = Some(Arc::new(data));
     }
 
     /// Return the effective penalty operator: the installed `penalty_op` if
@@ -6485,6 +6520,43 @@ fn solve_arrow_newton_step_artifacts(
             // Auto-select preconditioner level: starts with JacobiPreconditioner
             // (Diagonal / BetaBlockJacobi) and escalates to ClusterJacobi or
             // AdditiveSchwarz when K > 100 and PCG exhausts max_iterations.
+            if options.trust_region.radius == f64::INFINITY {
+                if let Some(device_data) = sys.device_sae_pcg.as_ref() {
+                    let max_iterations = options
+                        .pcg
+                        .max_iterations
+                        .min(options.trust_region.max_iterations);
+                    let relative_tolerance = options
+                        .pcg
+                        .relative_tolerance
+                        .max(options.trust_region.steihaug_relative_tolerance);
+                    if let Ok((delta, mut diag)) =
+                        crate::gpu::arrow_schur::solve_sae_matrix_free_pcg(
+                            sys,
+                            device_data.as_ref(),
+                            ridge_t,
+                            ridge_beta,
+                            &rhs_beta,
+                            max_iterations,
+                            relative_tolerance,
+                        )
+                    {
+                        diag.used_device_arrow = true;
+                        return Ok(ArrowNewtonStepArtifacts {
+                            delta_t: back_substitute_delta_t(
+                                sys,
+                                &htt_factors,
+                                delta.view(),
+                                &backend,
+                            ),
+                            delta_beta: delta,
+                            htt_factors,
+                            schur_factor: None,
+                            pcg_diagnostics: diag,
+                        });
+                    }
+                }
+            }
             let (delta, diag) = steihaug_pcg_auto(
                 sys,
                 &htt_factors,
