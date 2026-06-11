@@ -732,6 +732,23 @@ pub struct StructureSearchResult {
     pub rounds: Vec<SearchLedger>,
 }
 
+/// The round driver's configuration: how the data is split into shards, the
+/// e-gate's budget/level, the round cap, and the per-round harvest breadth.
+/// Bundled so the driver entry points stay below the argument-count threshold
+/// and so a caller configures one object rather than a positional argument
+/// cascade.
+#[derive(Clone, Copy, Debug)]
+pub struct RoundDriverConfig {
+    /// Number of held-out evaluation shards the gate streams over.
+    pub n_shards: usize,
+    /// Move budget + α the e-gates certify at (fixed for the run).
+    pub budget: MoveBudget,
+    /// Maximum harvest → search rounds before stopping at the fixpoint.
+    pub max_rounds: usize,
+    /// Per-round harvest breadth (max fusions / fissions / births).
+    pub harvest_params: HarvestParams,
+}
+
 /// Drive evidence-guarded structure search around a fitted SAE term until a
 /// round applies no moves (#997 round driver).
 ///
@@ -750,15 +767,11 @@ pub struct StructureSearchResult {
 /// fold is a no-op: the candidate is fixed across the stream (a predictable
 /// plug-in), and each shard contributes its held-out reconstruction
 /// likelihood-ratio against the honestly-refit null sup.
-#[allow(clippy::too_many_arguments)]
 pub fn run_structure_search_rounds(
     mut term: SaeManifoldTerm,
     mut rho: SaeManifoldRho,
     target: ArrayView2<'_, f64>,
-    n_shards: usize,
-    budget: MoveBudget,
-    max_rounds: usize,
-    harvest_params: HarvestParams,
+    config: RoundDriverConfig,
     ledger: &mut StructureLedger,
     mut candidate_fit: impl FnMut(
         SaeManifoldTerm,
@@ -766,6 +779,12 @@ pub fn run_structure_search_rounds(
         &[usize],
     ) -> (SaeManifoldTerm, SaeManifoldRho),
 ) -> Result<StructureSearchResult, String> {
+    let RoundDriverConfig {
+        n_shards,
+        budget,
+        max_rounds,
+        harvest_params,
+    } = config;
     let split = estimation_eval_split(target, n_shards);
     let mut rounds: Vec<SearchLedger> = Vec::new();
 
@@ -951,15 +970,11 @@ pub struct ProductionRefitParams {
 /// own inner-solve errors by returning the unchanged candidate (a conservative
 /// no-improvement signal, never a panic). `ledger` carries banked evidence
 /// across rounds so the death veto sees earlier certifications.
-#[allow(clippy::too_many_arguments)]
 pub fn run_production_structure_search(
     term: SaeManifoldTerm,
     rho: SaeManifoldRho,
     target: ArrayView2<'_, f64>,
-    n_shards: usize,
-    budget: MoveBudget,
-    max_rounds: usize,
-    harvest_params: HarvestParams,
+    config: RoundDriverConfig,
     refit_params: ProductionRefitParams,
     ledger: &mut StructureLedger,
 ) -> Result<StructureSearchResult, String> {
@@ -969,10 +984,7 @@ pub fn run_production_structure_search(
         term,
         rho,
         target,
-        n_shards,
-        budget,
-        max_rounds,
-        harvest_params,
+        config,
         ledger,
         move |mut cand_term, mut cand_rho, estimation_rows| {
             // Refit the restructured candidate on the ESTIMATION rows only: the
@@ -1324,20 +1336,18 @@ mod tests {
                 max_fissions: 0,
                 max_births: 0,
             };
+            let config = RoundDriverConfig {
+                n_shards: 3,
+                budget,
+                max_rounds: 2,
+                harvest_params: params,
+            };
             // Deterministic no-op fit: the scripted gate sees the unrefit
             // candidate (the engine's determinism is what this asserts, not the
             // SAE inner solve).
-            run_structure_search_rounds(
-                term,
-                rho,
-                target.view(),
-                3,
-                budget,
-                2,
-                params,
-                &mut ledger,
-                |t, r, _est| (t, r),
-            )
+            run_structure_search_rounds(term, rho, target.view(), config, &mut ledger, |t, r, _| {
+                (t, r)
+            })
             .unwrap()
         };
 

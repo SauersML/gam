@@ -9694,14 +9694,17 @@ fn sae_manifold_fit_inner<'py>(
             max_moves: term.k_atoms().max(1),
             alpha: 0.05,
         };
+        let config = gam::solver::structure_harvest::RoundDriverConfig {
+            n_shards: 4,
+            budget,
+            max_rounds: 3,
+            harvest_params,
+        };
         match gam::solver::structure_harvest::run_production_structure_search(
             term,
             rho,
             z_view.view(),
-            4,
-            budget,
-            3,
-            harvest_params,
+            config,
             refit_params,
             &mut structure_ledger,
         ) {
