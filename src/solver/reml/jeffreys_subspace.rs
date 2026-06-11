@@ -1751,23 +1751,52 @@ mod tests {
         };
         let h = h_at(&beta);
         let (phi, grad, hphi) = joint_jeffreys_term(h.view(), z.view(), hdir).unwrap();
-        // Sanity: the negative direction must NOT have been pinned to the floor.
-        // With the buggy signed floor, |grad| would be ~1/floor ≈ 1.7e9 here.
+        // Sanity (the gam#814 guarantee, preserved by the gam#979 saturating
+        // branch): the moderate negative direction must NOT carry a phantom
+        // 1/floor-scale Firth score. With the original signed floor, |grad|
+        // would be ~1/floor ≈ 1.7e9 here; with the saturating branch the
+        // negative direction's slope is `floor/(floor − λ)² ≈ 0`.
         assert!(
             grad.iter().all(|g| g.abs() < 1e3),
-            "indefinite direction must use the signed 1/λ inverse, not 1/floor; grad={grad:?}"
+            "indefinite direction must carry no phantom Firth score; grad={grad:?}"
         );
-        // Φ = ½(ln|λ0| + ln|λ1|) = ½ ln(exp(b0) · (1 + b1^2)), both |λ| ≫ floor.
-        let expected_phi = 0.5 * (beta[0].exp() * (1.0 + beta[1] * beta[1])).ln();
+        // The saturating branch must also not REWARD deeper indefiniteness
+        // (the gam#979 runaway): the gradient along the negative-curvature
+        // coordinate is essentially zero, not the gam#814 signed `1/λ` that
+        // pulled λ further negative.
+        assert!(
+            grad[1].abs() < 1e-6,
+            "saturating branch must be flat on a moderate negative eigenvalue; grad[1]={}",
+            grad[1]
+        );
+        // Φ = ½(ln λ0 + g_sat(λ1)) with the saturating continuation on λ1 < 0:
+        // g_sat(λ) = ln(floor) − 1 + λ/(floor − λ). λ_max = e^{b0}, so
+        // floor = REL · λ_max here (relative regime).
+        let lam0 = beta[0].exp();
+        let lam1 = -(1.0 + beta[1] * beta[1]);
+        let floor = 1e-10_f64 * lam0;
+        let g_sat = |lam: f64, floor: f64| -> f64 {
+            if lam >= floor {
+                lam.ln()
+            } else if lam >= 0.0 {
+                lam / floor + floor.ln() - 1.0
+            } else {
+                floor.ln() - 1.0 + lam / (floor - lam)
+            }
+        };
+        let expected_phi = 0.5 * (lam0.ln() + g_sat(lam1, floor));
         assert!(
             (phi - expected_phi).abs() < 1e-9,
             "phi {phi} vs {expected_phi}"
         );
-        // Finite-difference the value the term accumulates (½ Σ ln|λ_i| since both
-        // magnitudes are above the floor) and compare to the analytic gradient.
+        // Finite-difference the value the term accumulates (the same three-branch
+        // antiderivative, floor moving with λ_max) and compare to the analytic
+        // gradient — value/gradient consistency on the mixed-sign spectrum.
         let value_at = |b: &Array1<f64>| -> f64 {
             let hh = h_at(b);
-            0.5 * (hh[[0, 0]].abs().ln() + hh[[1, 1]].abs().ln())
+            let lam_max = hh[[0, 0]].max(0.0);
+            let fl = (1e-10 * lam_max).max(1e-12);
+            0.5 * (g_sat(hh[[0, 0]], fl) + g_sat(hh[[1, 1]], fl))
         };
         let eps = 1e-7;
         for k in 0..p {
@@ -1778,20 +1807,17 @@ mod tests {
             let fd = (value_at(&bp) - value_at(&bm)) / (2.0 * eps);
             assert!(
                 (grad[k] - fd).abs() <= 1e-5 * (1.0 + fd.abs()),
-                "indefinite grad[{k}] {} vs fd {fd}; value must be ½Σln|λ| (signed 1/λ inverse)",
+                "indefinite grad[{k}] {} vs fd {fd}; value/gradient must share the saturating g",
                 grad[k]
             );
         }
-        // H_Phi is a Gram (½ S Sᵀ) so it stays symmetric PSD even with a negative
-        // eigenvalue in H_id.
+        // The exact divided-difference H_Φ is symmetric; on a mixed-sign
+        // spectrum it may be indefinite (that is the honest curvature of Φ —
+        // the Moré–Sorensen step owns it), so only symmetry is asserted here.
         for a in 0..p {
             for b in 0..p {
                 assert!((hphi[[a, b]] - hphi[[b, a]]).abs() < 1e-12);
             }
-        }
-        let (evals, _) = hphi.eigh(Side::Lower).unwrap();
-        for e in evals.iter() {
-            assert!(*e >= -1e-10, "H_Phi must be PSD, got eigenvalue {e}");
         }
     }
 
