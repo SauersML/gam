@@ -28,6 +28,7 @@ use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
 };
+use gam::terms::CurvatureWalkReport;
 use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3, s};
 use std::sync::Arc;
 
@@ -653,5 +654,129 @@ fn sae_manifold_joint_two_circle_recovery_ibp_map() {
         sigma_min[1],
         circ_corr[0],
         circ_corr[1],
+    );
+}
+
+/// Build the production objective for the two-circle fixture (same cold term and
+/// entry ρ as `run_production_fit`), without driving the outer cascade — the
+/// caller exercises the curvature-homotopy entry walk directly.
+fn build_objective(truth: &Truth, z: &Array2<f64>) -> SaeManifoldOuterObjective {
+    let term = build_cold_term(truth, z.view());
+    let init_rho = SaeManifoldRho::new(
+        SPARSITY.ln(),
+        SMOOTHNESS.ln(),
+        vec![Array1::<f64>::zeros(0); K],
+    );
+    SaeManifoldOuterObjective::new(
+        term,
+        z.clone(),
+        None,
+        init_rho,
+        INNER_MAX_ITER,
+        LEARNING_RATE,
+        RIDGE_EXT_COORD,
+        RIDGE_BETA,
+    )
+}
+
+/// #1007 walk-path oracle: the certified curvature-homotopy entry walk reaches
+/// the gate-0 two-circle fixture's optimum from the Eckart-Young anchor with
+/// ZERO reseeds, no recorded bifurcation, and no inner active-mass collapse —
+/// the certified-anchor replacement for the blind multi-seed multistart.
+///
+/// This drives `run_curvature_homotopy_entry` directly (the same call the outer
+/// seed loop makes as its entry leg) and asserts:
+///   1. the walk ARRIVED at `η = 1` on the certified optimal branch;
+///   2. it recorded NO bifurcation (the arrow-factor min pivot stayed above the
+///      safe-SPD floor across the whole walk);
+///   3. it triggered ZERO scaffold reseeds and observed NO inner collapse
+///      events — a clean walk from the global anchor does not need them;
+///   4. the post-walk reconstruction recovers the planted two-plane structure
+///      (R² high), i.e. the certified branch reached a genuinely good optimum,
+///      not merely "arrived".
+#[test]
+fn sae_two_circle_curvature_homotopy_entry_arrives_zero_reseed() {
+    let (u_a, u_b) = planted_frames();
+    let truth = planted_truth();
+    let (z, signal_scale) = planted_response(&truth, &u_a, &u_b);
+
+    let mut objective = build_objective(&truth, &z);
+    let arrived = objective
+        .run_curvature_homotopy_entry()
+        .expect("curvature-homotopy entry walk must not hard-error on the gate-0 fixture");
+
+    let report: CurvatureWalkReport = objective
+        .curvature_walk_report()
+        .expect("a walk that ran must record a report")
+        .clone();
+
+    // Post-walk reconstruction R² at the certified η = 1 state.
+    let (fitted_term, _rho, _loss) = objective.into_fitted();
+    let fitted = fitted_term.fitted();
+    let mut ssr = 0.0;
+    let mut sst = 0.0;
+    let mut zbar = 0.0;
+    for i in 0..N {
+        for j in 0..P {
+            zbar += z[[i, j]];
+        }
+    }
+    zbar /= (N * P) as f64;
+    for i in 0..N {
+        for j in 0..P {
+            let r = z[[i, j]] - fitted[[i, j]];
+            ssr += r * r;
+            let d = z[[i, j]] - zbar;
+            sst += d * d;
+        }
+    }
+    let r2 = 1.0 - ssr / sst.max(1.0e-12);
+
+    println!("=== SAE two-circle curvature-homotopy entry walk (#1007) ===");
+    println!("signal_scale={signal_scale:.6}");
+    println!(
+        "walk: arrived={} eta_steps={} step_halvings={} reseeds={} collapse_events={} \
+         anchor_residual_norm_sq={:.6e} bifurcation={:?}",
+        report.arrived,
+        report.eta_steps,
+        report.step_halvings,
+        report.reseeds,
+        report.collapse_events,
+        report.anchor_residual_norm_sq,
+        report.bifurcation,
+    );
+    println!("post-walk reconstruction R2={r2:.6}");
+
+    let mut failures: Vec<&str> = Vec::new();
+    if !arrived || !report.arrived {
+        failures.push("walk did not arrive at eta=1 on the certified branch");
+    }
+    if report.bifurcation.is_some() {
+        failures.push("walk recorded a branch bifurcation");
+    }
+    if report.reseeds != 0 {
+        failures.push("walk triggered a scaffold reseed");
+    }
+    if report.collapse_events != 0 {
+        failures.push("walk observed an inner active-mass collapse");
+    }
+    if !(report.eta_steps >= 1) {
+        failures.push("walk recorded no accepted eta waypoint");
+    }
+    if !(r2 >= 0.9) {
+        failures.push("post-walk reconstruction R2 below 0.9");
+    }
+
+    assert!(
+        failures.is_empty(),
+        "SAE two-circle curvature-homotopy entry FAILED {failures:?}; \
+         arrived={arrived}/{} eta_steps={} step_halvings={} reseeds={} collapse_events={} \
+         bifurcation={:?} R2={r2:.6}",
+        report.arrived,
+        report.eta_steps,
+        report.step_halvings,
+        report.reseeds,
+        report.collapse_events,
+        report.bifurcation,
     );
 }
