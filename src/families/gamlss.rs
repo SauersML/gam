@@ -3300,6 +3300,70 @@ struct DispersionRowKernel {
     disp_response: f64,
 }
 
+#[inline]
+fn dispersion_nb_nll_tower(
+    yi: f64,
+    mu_value: f64,
+    theta_value: f64,
+    wi: f64,
+) -> crate::families::jet_tower::Tower4<2> {
+    use crate::families::jet_tower::Tower4;
+    let mu = Tower4::<2>::variable(mu_value, 0);
+    let theta = Tower4::<2>::variable(theta_value, 1);
+    let tpm = theta + mu;
+    let loglik = (theta + yi).ln_gamma() - theta.ln_gamma() - ln_gamma(yi + 1.0)
+        + theta * theta.ln()
+        - theta * tpm.ln()
+        + mu.ln() * yi
+        - tpm.ln() * yi;
+    -loglik * wi
+}
+
+#[inline]
+fn dispersion_gamma_nll_tower(
+    yi: f64,
+    y_pos: f64,
+    mu_value: f64,
+    nu_value: f64,
+    wi: f64,
+) -> crate::families::jet_tower::Tower4<2> {
+    use crate::families::jet_tower::Tower4;
+    let mu = Tower4::<2>::variable(mu_value, 0);
+    let nu = Tower4::<2>::variable(nu_value, 1);
+    let loglik = nu * nu.ln() - nu * mu.ln() - nu.ln_gamma() + (nu - 1.0) * y_pos.ln()
+        - nu * (mu.recip() * yi);
+    -loglik * wi
+}
+
+#[inline]
+fn dispersion_beta_nll_tower(
+    yi: f64,
+    mu_value: f64,
+    phi_value: f64,
+    wi: f64,
+) -> crate::families::jet_tower::Tower4<2> {
+    use crate::families::jet_tower::Tower4;
+    let mu = Tower4::<2>::variable(mu_value, 0);
+    let phi = Tower4::<2>::variable(phi_value, 1);
+    let one_minus_mu = Tower4::<2>::constant(1.0) - mu;
+    let yc = yi.clamp(1e-12, 1.0 - 1e-12);
+    let a = mu * phi;
+    let b = one_minus_mu * phi;
+    let loglik = phi.ln_gamma() - a.ln_gamma() - b.ln_gamma()
+        + (a - 1.0) * yc.ln()
+        + (b - 1.0) * (1.0 - yc).ln();
+    -loglik * wi
+}
+
+#[inline]
+fn tower_score_info(tower: &crate::families::jet_tower::Tower4<2>, idx: usize, wi: f64) -> (f64, f64) {
+    if wi == 0.0 {
+        (0.0, 0.0)
+    } else {
+        (-tower.g[idx] / wi, tower.h[idx][idx] / wi)
+    }
+}
+
 /// Evaluate the row log-likelihood and the (mean, log-precision) Fisher-scoring
 /// working sets for one observation. `eta_mu`/`eta_d` already include any
 /// per-channel offset (they are the block predictors). `prior_weight` is the
@@ -3318,26 +3382,19 @@ fn dispersion_row_kernel(
         DispersionFamilyKind::NegativeBinomial => {
             let mu = em.exp().max(1e-300);
             let theta = ed.exp().max(1e-12); // precision (size)
-            let tpm = theta + mu;
-            let tpy = theta + yi;
-            let loglik = wi
-                * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
-                    + theta * theta.ln()
-                    - theta * tpm.ln()
-                    + yi * mu.ln()
-                    - yi * tpm.ln());
-            // Mean block (log link): W = μθ/(θ+μ) = full NB2 Fisher weight,
-            // z = η + (y−μ)/μ.
-            let mean_weight = wi * mu * theta / tpm;
-            let mean_response = em + (yi - mu) / mu;
-            // Precision block (log link on θ): MASS glm.nb θ score / observed
-            // information, chained to η_d = log θ.
-            let s_theta =
-                digamma(yi + theta) - digamma(theta) + theta.ln() + 1.0 - tpm.ln() - tpy / tpm;
-            let info_theta = -dispersion_trigamma(yi + theta) + dispersion_trigamma(theta)
-                - 1.0 / theta
-                + 2.0 / tpm
-                - tpy / (tpm * tpm);
+            let tower = dispersion_nb_nll_tower(yi, mu, theta, wi);
+            let mean_info_tower = dispersion_nb_nll_tower(mu, mu, theta, wi);
+            let score_mu = tower_score_info(&tower, 0, wi).0;
+            let (s_theta, info_theta_raw) = tower_score_info(&tower, 1, wi);
+            let loglik = -tower.v;
+            let info_mu = if wi == 0.0 {
+                DISPERSION_MIN_CURVATURE
+            } else {
+                (mean_info_tower.h[0][0] / wi).max(DISPERSION_MIN_CURVATURE)
+            };
+            let mean_weight = wi * mu * mu * info_mu;
+            let mean_response = em + score_mu / (mu * info_mu);
+            let info_theta = info_theta_raw;
             let info_pos = info_theta.max(DISPERSION_MIN_CURVATURE);
             let disp_weight = wi * theta * theta * info_pos;
             let disp_response = ed + s_theta / (theta * info_pos);
@@ -3353,16 +3410,19 @@ fn dispersion_row_kernel(
             let mu = em.exp().max(1e-300);
             let nu = ed.exp().max(1e-12); // precision = shape ν
             let y_pos = yi.max(1e-300);
-            let loglik = wi
-                * (nu * nu.ln() - nu * mu.ln() - ln_gamma(nu) + (nu - 1.0) * y_pos.ln()
-                    - nu * yi / mu);
-            // Mean block (log link): Var = μ²/ν ⇒ W = ν, z = η + (y−μ)/μ.
-            let mean_weight = wi * nu;
-            let mean_response = em + (yi - mu) / mu;
-            // Shape block (log link on ν): deterministic Fisher information
-            // ψ'(ν) − 1/ν > 0 for all ν > 0.
-            let s_nu = nu.ln() + 1.0 - mu.ln() - digamma(nu) + y_pos.ln() - yi / mu;
-            let info_nu = (dispersion_trigamma(nu) - 1.0 / nu).max(DISPERSION_MIN_CURVATURE);
+            let tower = dispersion_gamma_nll_tower(yi, y_pos, mu, nu, wi);
+            let mean_info_tower = dispersion_gamma_nll_tower(mu, mu, mu, nu, wi);
+            let score_mu = tower_score_info(&tower, 0, wi).0;
+            let (s_nu, info_nu_raw) = tower_score_info(&tower, 1, wi);
+            let loglik = -tower.v;
+            let info_mu = if wi == 0.0 {
+                DISPERSION_MIN_CURVATURE
+            } else {
+                (mean_info_tower.h[0][0] / wi).max(DISPERSION_MIN_CURVATURE)
+            };
+            let mean_weight = wi * mu * mu * info_mu;
+            let mean_response = em + score_mu / (mu * info_mu);
+            let info_nu = info_nu_raw.max(DISPERSION_MIN_CURVATURE);
             let disp_weight = wi * nu * nu * info_nu;
             let disp_response = ed + s_nu / (nu * info_nu);
             DispersionRowKernel {
@@ -3378,27 +3438,14 @@ fn dispersion_row_kernel(
             let mu = (1.0 / (1.0 + (-em).exp())).clamp(1e-12, 1.0 - 1e-12);
             let phi = ed.exp().max(1e-12); // precision
             let q = (mu * (1.0 - mu)).max(1e-12); // dμ/dη
-            let yc = yi.clamp(1e-12, 1.0 - 1e-12);
-            let a = (mu * phi).max(1e-12);
-            let b = ((1.0 - mu) * phi).max(1e-12);
-            let loglik = wi
-                * (ln_gamma(phi) - ln_gamma(a) - ln_gamma(b)
-                    + (a - 1.0) * yc.ln()
-                    + (b - 1.0) * (1.0 - yc).ln());
-            // Mean block (logit link): Ferrari–Cribari-Neto score/information.
-            let score_mu = phi * (digamma(b) - digamma(a) + yc.ln() - (1.0 - yc).ln());
-            let info_mu = (phi * phi * (dispersion_trigamma(a) + dispersion_trigamma(b)))
-                .max(DISPERSION_MIN_CURVATURE);
+            let tower = dispersion_beta_nll_tower(yi, mu, phi, wi);
+            let (score_mu, info_mu_raw) = tower_score_info(&tower, 0, wi);
+            let (s_phi, info_phi_raw) = tower_score_info(&tower, 1, wi);
+            let loglik = -tower.v;
+            let info_mu = info_mu_raw.max(DISPERSION_MIN_CURVATURE);
             let mean_weight = wi * q * q * info_mu;
             let mean_response = em + score_mu / (q * info_mu);
-            // Precision block (log link on φ).
-            let s_phi = digamma(phi) - mu * digamma(a) - (1.0 - mu) * digamma(b)
-                + mu * yc.ln()
-                + (1.0 - mu) * (1.0 - yc).ln();
-            let info_phi = (mu * mu * dispersion_trigamma(a)
-                + (1.0 - mu) * (1.0 - mu) * dispersion_trigamma(b)
-                - dispersion_trigamma(phi))
-            .max(DISPERSION_MIN_CURVATURE);
+            let info_phi = info_phi_raw.max(DISPERSION_MIN_CURVATURE);
             let disp_weight = wi * phi * phi * info_phi;
             let disp_response = ed + s_phi / (phi * info_phi);
             DispersionRowKernel {
@@ -5064,6 +5111,59 @@ fn binomial_location_scale_core(
     })
 }
 
+#[inline]
+fn binomial_location_scale_nll_tower(
+    y: f64,
+    weight: f64,
+    eta_t: f64,
+    eta_ls: f64,
+    q_value: f64,
+    mu: f64,
+    dmu_dq: f64,
+    d2mu_dq2: f64,
+    d3mu_dq3: f64,
+    link_kind: &InverseLink,
+) -> Result<crate::families::jet_tower::Tower4<2>, String> {
+    use crate::families::jet_tower::Tower4;
+    let eta_t_tower = Tower4::<2>::variable(eta_t, 0);
+    let eta_ls_tower = Tower4::<2>::variable(eta_ls, 1);
+    let inv_sigma = (eta_ls_tower * -1.0).exp();
+    let q = -eta_t_tower * inv_sigma;
+    let ll = binomial_location_scale_log_likelihood(y, weight, q_value, link_kind, mu)?;
+    let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+        y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
+    );
+    let m4 = binomial_neglog_q_fourth_derivative_dispatch(
+        y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
+    )?;
+    Ok(q.compose_unary([-ll, m1, m2, m3, m4]))
+}
+
+#[inline]
+fn binomial_location_scale_nll_tower_from_core_row(
+    y: f64,
+    weight: f64,
+    core: &BinomialLocationScaleCore,
+    row: usize,
+    link_kind: &InverseLink,
+) -> Result<crate::families::jet_tower::Tower4<2>, String> {
+    let sigma = core.sigma[row];
+    let eta_t = -core.q0[row] * sigma;
+    let eta_ls = sigma.ln();
+    binomial_location_scale_nll_tower(
+        y,
+        weight,
+        eta_t,
+        eta_ls,
+        core.q0[row],
+        core.mu[row],
+        core.dmu_dq[row],
+        core.d2mu_dq2[row],
+        core.d3mu_dq3[row],
+        link_kind,
+    )
+}
+
 /// Pure row-coefficient builder for the binomial location-scale joint
 /// directional derivative `D_β H_L[u]`. Returns `(c_tt, c_tl, c_ll)` such
 /// that the resulting matrix is
@@ -5080,63 +5180,28 @@ fn binomial_location_scale_first_directional_coefficients(
     d_eta_t: &Array1<f64>,
     d_eta_ls: &Array1<f64>,
     link_kind: &InverseLink,
-) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
     let n = y.len();
-    let mut c_tt_v = vec![0.0_f64; n];
-    let mut c_tl_v = vec![0.0_f64; n];
-    let mut c_ll_v = vec![0.0_f64; n];
-    let y_slice = y.as_slice().expect("y must be contiguous");
-    let w_slice = weights.as_slice().expect("weights must be contiguous");
-    let q0_slice = core.q0.as_slice().expect("q0 must be contiguous");
-    let sigma_slice = core.sigma.as_slice().expect("sigma must be contiguous");
-    let dsigma_slice = core
-        .dsigma_deta
-        .as_slice()
-        .expect("dsigma_deta must be contiguous");
-    let mu_slice = core.mu.as_slice().expect("mu must be contiguous");
-    let dmu_slice = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
-    let d2mu_slice = core
-        .d2mu_dq2
-        .as_slice()
-        .expect("d2mu_dq2 must be contiguous");
-    let d3mu_slice = core
-        .d3mu_dq3
-        .as_slice()
-        .expect("d3mu_dq3 must be contiguous");
-    let det_slice = d_eta_t.as_slice().expect("d_eta_t must be contiguous");
-    let del_slice = d_eta_ls.as_slice().expect("d_eta_ls must be contiguous");
-    c_tt_v
-        .par_iter_mut()
-        .zip(c_tl_v.par_iter_mut())
-        .zip(c_ll_v.par_iter_mut())
-        .enumerate()
-        .for_each(|(i, ((c_tt, c_tl), c_ll))| {
-            let q = q0_slice[i];
-            let r = 1.0 / sigma_slice[i];
-            let s = dsigma_slice[i] / sigma_slice[i];
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                y_slice[i],
-                w_slice[i],
-                q,
-                mu_slice[i],
-                dmu_slice[i],
-                d2mu_slice[i],
-                d3mu_slice[i],
-                link_kind,
-            );
-            let a = det_slice[i];
-            let b = del_slice[i];
-            let sb = s * b;
-            let du = -r * a - q * sb;
-            *c_tt = r * r * (m3 * du - 2.0 * m2 * sb);
-            *c_tl = s * r * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
-            *c_ll = s * s * (m1 + 3.0 * q * m2 + q * q * m3) * du;
-        });
-    (
-        Array1::from_vec(c_tt_v),
-        Array1::from_vec(c_tl_v),
-        Array1::from_vec(c_ll_v),
-    )
+    let triples: Result<Vec<(f64, f64, f64)>, String> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let tower = binomial_location_scale_nll_tower_from_core_row(
+                y[i], weights[i], core, i, link_kind,
+            )?;
+            let dir = [d_eta_t[i], d_eta_ls[i]];
+            let contracted = tower.third_contracted(&dir);
+            Ok((contracted[0][0], contracted[0][1], contracted[1][1]))
+        })
+        .collect();
+    let mut coeff_tt = Array1::<f64>::zeros(n);
+    let mut coeff_tl = Array1::<f64>::zeros(n);
+    let mut coeff_ll = Array1::<f64>::zeros(n);
+    for (i, (tt, tl, ll)) in triples?.into_iter().enumerate() {
+        coeff_tt[i] = tt;
+        coeff_tl[i] = tl;
+        coeff_ll[i] = ll;
+    }
+    Ok((coeff_tt, coeff_tl, coeff_ll))
 }
 
 /// Pure row-coefficient builder for the binomial location-scale joint
@@ -5161,51 +5226,13 @@ fn binomial_location_scalesecond_directional_coefficients(
     let triples: Result<Vec<(f64, f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| -> Result<(f64, f64, f64), String> {
-            let q = core.q0[i];
-            let r = 1.0 / core.sigma[i];
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                y[i],
-                weights[i],
-                q,
-                core.mu[i],
-                core.dmu_dq[i],
-                core.d2mu_dq2[i],
-                core.d3mu_dq3[i],
-                link_kind,
-            );
-            let m4 = binomial_neglog_q_fourth_derivative_dispatch(
-                y[i],
-                weights[i],
-                q,
-                core.mu[i],
-                core.dmu_dq[i],
-                core.d2mu_dq2[i],
-                core.d3mu_dq3[i],
-                link_kind,
+            let tower = binomial_location_scale_nll_tower_from_core_row(
+                y[i], weights[i], core, i, link_kind,
             )?;
-            let s = core.dsigma_deta[i] / core.sigma[i];
-            let a = d_eta_t_u[i];
-            let b = s * d_eta_ls_u[i];
-            let c = d_eta_t_v[i];
-            let d = s * d_eta_ls_v[i];
-            let du = -r * a - q * b;
-            let dv = -r * c - q * d;
-            let d2 = r * (a * d + b * c) + q * b * d;
-            let tt =
-                r * r * (m4 * du * dv + m3 * (d2 - 2.0 * d * du - 2.0 * b * dv) + 4.0 * m2 * b * d);
-            let tl = s
-                * r
-                * (q * m4 * du * dv
-                    + m3 * (q * d2 + 3.0 * du * dv - q * (d * du + b * dv))
-                    + m2 * (q * b * d + 2.0 * d2 - 2.0 * (d * du + b * dv))
-                    + m1 * b * d);
-            let ll = s
-                * s
-                * (q * q * m4 * du * dv
-                    + m3 * (q * q * d2 + 5.0 * q * du * dv)
-                    + m2 * (3.0 * q * d2 + 4.0 * du * dv)
-                    + m1 * d2);
-            Ok((tt, tl, ll))
+            let dir_u = [d_eta_t_u[i], d_eta_ls_u[i]];
+            let dir_v = [d_eta_t_v[i], d_eta_ls_v[i]];
+            let contracted = tower.fourth_contracted(&dir_u, &dir_v);
+            Ok((contracted[0][0], contracted[0][1], contracted[1][1]))
         })
         .collect();
     let triples = triples?;
@@ -14464,38 +14491,31 @@ impl BinomialLocationScaleFamily {
         let y_slice = self.y.as_slice().expect("y must be contiguous");
         let w_slice = self.weights.as_slice().expect("weights must be contiguous");
         let q0_slice = core.q0.as_slice().expect("q0 must be contiguous");
-        let sigma_slice = core.sigma.as_slice().expect("sigma must be contiguous");
-        let mu_slice = core.mu.as_slice().expect("mu must be contiguous");
-        let dmu_slice = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
-        let d2mu_slice = core
-            .d2mu_dq2
-            .as_slice()
-            .expect("d2mu_dq2 must be contiguous");
-        let d3mu_slice = core
-            .d3mu_dq3
-            .as_slice()
-            .expect("d3mu_dq3 must be contiguous");
         let eta_t_slice = eta_t.as_slice().expect("eta_t must be contiguous");
+        let eta_ls_slice = eta_ls.as_slice().expect("eta_ls must be contiguous");
         let link_kind = &self.link_kind;
-        grad_eta_t_v
-            .par_iter_mut()
-            .zip(grad_eta_ls_v.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, (g_t, g_ls))| {
-                let (m1, _, _) = binomial_neglog_q_derivatives_dispatch(
+        let gradient_pairs: Result<Vec<(f64, f64)>, String> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let tower = binomial_location_scale_nll_tower(
                     y_slice[i],
                     w_slice[i],
+                    eta_t_slice[i],
+                    eta_ls_slice[i],
                     q0_slice[i],
-                    mu_slice[i],
-                    dmu_slice[i],
-                    d2mu_slice[i],
-                    d3mu_slice[i],
+                    core.mu[i],
+                    core.dmu_dq[i],
+                    core.d2mu_dq2[i],
+                    core.d3mu_dq3[i],
                     link_kind,
-                );
-                let q0d = nonwiggle_q_derivs(eta_t_slice[i], sigma_slice[i]);
-                *g_t = -m1 * q0d.q_t;
-                *g_ls = -m1 * q0d.q_ls;
-            });
+                )?;
+                Ok((-tower.g[0], -tower.g[1]))
+            })
+            .collect();
+        for (i, (g_t, g_ls)) in gradient_pairs?.into_iter().enumerate() {
+            grad_eta_t_v[i] = g_t;
+            grad_eta_ls_v[i] = g_ls;
+        }
         let grad_eta_t = Array1::from_vec(grad_eta_t_v);
         let grad_eta_ls = Array1::from_vec(grad_eta_ls_v);
         let grad_t = x_t.transpose_vector_multiply(&grad_eta_t);
@@ -14917,14 +14937,15 @@ impl BinomialLocationScaleFamily {
             None,
             &self.link_kind,
         )?;
-        let (coeff_tt, coeff_tl, coeff_ll) = binomial_location_scale_first_directional_coefficients(
-            &self.y,
-            &self.weights,
-            &core,
-            &d_eta_t,
-            &d_eta_ls,
-            &self.link_kind,
-        );
+        let (coeff_tt, coeff_tl, coeff_ll) =
+            binomial_location_scale_first_directional_coefficients(
+                &self.y,
+                &self.weights,
+                &core,
+                &d_eta_t,
+                &d_eta_ls,
+                &self.link_kind,
+            )?;
 
         let d_h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
         let d_h_tl = xt_diag_y_dense(x_t, &coeff_tl, x_ls)?;
@@ -16249,38 +16270,31 @@ impl CustomFamily for BinomialLocationScaleFamily {
         let y_slice_e = self.y.as_slice().expect("y must be contiguous");
         let w_slice_e = self.weights.as_slice().expect("weights must be contiguous");
         let q0_slice_e = core.q0.as_slice().expect("q0 must be contiguous");
-        let sigma_slice_e = core.sigma.as_slice().expect("sigma must be contiguous");
-        let mu_slice_e = core.mu.as_slice().expect("mu must be contiguous");
-        let dmu_slice_e = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
-        let d2mu_slice_e = core
-            .d2mu_dq2
-            .as_slice()
-            .expect("d2mu_dq2 must be contiguous");
-        let d3mu_slice_e = core
-            .d3mu_dq3
-            .as_slice()
-            .expect("d3mu_dq3 must be contiguous");
         let eta_t_slice_e = eta_t.as_slice().expect("eta_t must be contiguous");
+        let eta_ls_slice_e = eta_ls.as_slice().expect("eta_ls must be contiguous");
         let link_kind_e = &self.link_kind;
-        grad_eta_t_v
-            .par_iter_mut()
-            .zip(grad_eta_ls_v.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, (g_t, g_ls))| {
-                let (m1, _, _) = binomial_neglog_q_derivatives_dispatch(
+        let gradient_pairs: Result<Vec<(f64, f64)>, String> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let tower = binomial_location_scale_nll_tower(
                     y_slice_e[i],
                     w_slice_e[i],
+                    eta_t_slice_e[i],
+                    eta_ls_slice_e[i],
                     q0_slice_e[i],
-                    mu_slice_e[i],
-                    dmu_slice_e[i],
-                    d2mu_slice_e[i],
-                    d3mu_slice_e[i],
+                    core.mu[i],
+                    core.dmu_dq[i],
+                    core.d2mu_dq2[i],
+                    core.d3mu_dq3[i],
                     link_kind_e,
-                );
-                let q0d = nonwiggle_q_derivs(eta_t_slice_e[i], sigma_slice_e[i]);
-                *g_t = -m1 * q0d.q_t;
-                *g_ls = -m1 * q0d.q_ls;
-            });
+                )?;
+                Ok((-tower.g[0], -tower.g[1]))
+            })
+            .collect();
+        for (i, (g_t, g_ls)) in gradient_pairs?.into_iter().enumerate() {
+            grad_eta_t_v[i] = g_t;
+            grad_eta_ls_v[i] = g_ls;
+        }
         let grad_eta_t = Array1::from_vec(grad_eta_t_v);
         let grad_eta_ls = Array1::from_vec(grad_eta_ls_v);
         let grad_t = threshold_design.transpose_vector_multiply(&grad_eta_t);
@@ -17323,7 +17337,7 @@ impl BinomialLocationScaleHessianWorkspace {
         &self,
         key: &BinomialDirectionKey,
         eta: &BinomialDirectionEta,
-    ) -> Arc<BinomialRowCoeffTriple> {
+    ) -> Result<Arc<BinomialRowCoeffTriple>, String> {
         if let Some(value) = self
             .first_coeff_cache
             .lock()
@@ -17331,7 +17345,7 @@ impl BinomialLocationScaleHessianWorkspace {
             .get(key)
             .cloned()
         {
-            return value;
+            return Ok(value);
         }
         let (tt, tl, ll) = binomial_location_scale_first_directional_coefficients(
             &self.family.y,
@@ -17340,7 +17354,7 @@ impl BinomialLocationScaleHessianWorkspace {
             &eta.t,
             &eta.ls,
             &self.family.link_kind,
-        );
+        )?;
         let value = Arc::new(BinomialRowCoeffTriple {
             tt: Arc::new(tt),
             tl: Arc::new(tl),
@@ -17350,10 +17364,10 @@ impl BinomialLocationScaleHessianWorkspace {
             .first_coeff_cache
             .lock()
             .expect("binomial first coefficient cache lock poisoned");
-        cache
+        Ok(cache
             .entry(key.clone())
             .or_insert_with(|| value.clone())
-            .clone()
+            .clone())
     }
 
     /// No caching here, deliberately: at large-scale shape (n=320k, K=14 outer
@@ -17517,7 +17531,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         }
         let key = BinomialDirectionKey::from_array(d_beta_flat);
         let eta = self.direction_eta(&key, d_beta_flat, pt, total);
-        let coeffs = self.first_coefficients(&key, &eta);
+        let coeffs = self.first_coefficients(&key, &eta)?;
         Ok(Some(Arc::new(make_two_block_design_row_coeff_operator(
             self.x_t.clone(),
             self.x_ls.clone(),

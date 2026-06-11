@@ -330,6 +330,21 @@ impl<const K: usize> Tower4<K> {
         self.compose_unary([f0, f1, f2, f3, f4])
     }
 
+    /// ln Γ(self). Caller guarantees positivity.
+    pub fn ln_gamma(&self) -> Self {
+        self.compose_unary(ln_gamma_derivative_stack(self.v))
+    }
+
+    /// ψ(self), the digamma function. Caller guarantees positivity.
+    pub fn digamma(&self) -> Self {
+        self.compose_unary(digamma_derivative_stack(self.v))
+    }
+
+    /// ψ′(self), the trigamma function. Caller guarantees positivity.
+    pub fn trigamma(&self) -> Self {
+        self.compose_unary(trigamma_derivative_stack(self.v))
+    }
+
     /// Contract `t3` with one primary-space direction:
     /// `out[a][b] = Σ_c t3[a][b][c] · dir[c]` — exactly the
     /// `row_third_contracted` shape.
@@ -365,6 +380,104 @@ impl<const K: usize> Tower4<K> {
         }
         out
     }
+}
+
+pub fn ln_gamma_derivative_stack(x: f64) -> [f64; 5] {
+    [
+        statrs::function::gamma::ln_gamma(x),
+        statrs::function::gamma::digamma(x),
+        polygamma_positive(1, x),
+        polygamma_positive(2, x),
+        polygamma_positive(3, x),
+    ]
+}
+
+pub fn digamma_derivative_stack(x: f64) -> [f64; 5] {
+    [
+        statrs::function::gamma::digamma(x),
+        polygamma_positive(1, x),
+        polygamma_positive(2, x),
+        polygamma_positive(3, x),
+        polygamma_positive(4, x),
+    ]
+}
+
+pub fn trigamma_derivative_stack(x: f64) -> [f64; 5] {
+    [
+        polygamma_positive(1, x),
+        polygamma_positive(2, x),
+        polygamma_positive(3, x),
+        polygamma_positive(4, x),
+        polygamma_positive(5, x),
+    ]
+}
+
+fn polygamma_positive(order: usize, mut x: f64) -> f64 {
+    if !(x.is_finite() && x > 0.0) {
+        return f64::NAN;
+    }
+    let mut acc = 0.0;
+    while x < 8.0 {
+        acc += polygamma_recurrence_term(order, x);
+        x += 1.0;
+    }
+    acc + polygamma_asymptotic(order, x)
+}
+
+fn polygamma_recurrence_term(order: usize, x: f64) -> f64 {
+    let sign = if order % 2 == 1 { 1.0 } else { -1.0 };
+    sign * factorial(order) / x.powi((order + 1) as i32)
+}
+
+fn polygamma_asymptotic(order: usize, x: f64) -> f64 {
+    match order {
+        1 => {
+            let inv = 1.0 / x;
+            let inv2 = inv * inv;
+            inv + 0.5 * inv2 + inv2 * inv / 6.0 - inv2 * inv2 * inv / 30.0
+                + inv2 * inv2 * inv2 * inv / 42.0
+                - inv2 * inv2 * inv2 * inv2 * inv / 30.0
+        }
+        2 => {
+            let inv = 1.0 / x;
+            let inv2 = inv * inv;
+            let inv3 = inv2 * inv;
+            -inv2 - inv3 - 0.5 * inv2 * inv2 + inv3 * inv3 / 6.0 - inv2 * inv3 * inv3 / 6.0
+                + 0.3 * inv2 * inv2 * inv3 * inv3
+                - 5.0 * inv2 * inv2 * inv2 * inv3 * inv3 / 6.0
+        }
+        3 => {
+            let inv = 1.0 / x;
+            let inv2 = inv * inv;
+            let inv3 = inv2 * inv;
+            let inv4 = inv2 * inv2;
+            inv3 * 2.0 + inv4 * 3.0 + inv4 * inv * 2.0 - inv4 * inv3
+                + inv4 * inv3 * inv2 * (4.0 / 3.0)
+                - inv4 * inv3 * inv4 * 3.0
+        }
+        4 => {
+            let inv = 1.0 / x;
+            let inv2 = inv * inv;
+            let inv4 = inv2 * inv2;
+            -6.0 * inv4 - 12.0 * inv4 * inv - 10.0 * inv4 * inv2 + 7.0 * inv4 * inv4
+                - 12.0 * inv4 * inv4 * inv2
+                + 33.0 * inv4 * inv4 * inv4
+        }
+        5 => {
+            let inv = 1.0 / x;
+            let inv2 = inv * inv;
+            let inv4 = inv2 * inv2;
+            24.0 * inv4 * inv + 60.0 * inv4 * inv2 + 60.0 * inv4 * inv2 * inv
+                - 56.0 * inv4 * inv4 * inv
+                + 120.0 * inv4 * inv4 * inv2 * inv
+                - 396.0 * inv4 * inv4 * inv4 * inv
+        }
+        _ => f64::NAN,
+    }
+}
+
+fn factorial(n: usize) -> f64 {
+    (1..=n).fold(1.0, |acc, k| acc * k as f64)
 }
 
 impl<const K: usize> std::ops::Add for Tower4<K> {
@@ -1030,4 +1143,37 @@ mod tests {
             }
         }
     }
+}
+
+/// Stable derivative stack for `log Φ(x)` through fourth order.
+///
+/// The value and Mills ratio come from the shared probit primitive, so the
+/// deep left tail uses the same erfcx path as production log-CDF code.
+#[inline]
+pub(crate) fn unary_derivatives_normal_logcdf(x: f64) -> [f64; 5] {
+    let (log_cdf, lambda) = crate::probability::signed_probit_logcdf_and_mills_ratio(x);
+    let lambda2 = lambda * lambda;
+    let lambda3 = lambda2 * lambda;
+    let x2 = x * x;
+    [
+        log_cdf,
+        lambda,
+        -lambda * (x + lambda),
+        lambda * (x2 - 1.0 + 3.0 * x * lambda + 2.0 * lambda2),
+        -lambda
+            * ((x * x2 - 3.0 * x) + (7.0 * x2 - 4.0) * lambda + 12.0 * x * lambda2 + 6.0 * lambda3),
+    ]
+}
+
+/// Stable derivative stack for `log(1 - exp(-x))`, `x > 0`, through fourth order.
+#[inline]
+pub(crate) fn unary_derivatives_log1mexp_positive(x: f64) -> [f64; 5] {
+    let r = 1.0 / x.exp_m1();
+    [
+        crate::probability::log1mexp_positive(x),
+        r,
+        -r * (1.0 + r),
+        r * (1.0 + r) * (1.0 + 2.0 * r),
+        -r * (1.0 + r) * (1.0 + 6.0 * r + 6.0 * r * r),
+    ]
 }

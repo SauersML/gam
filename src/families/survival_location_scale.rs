@@ -1685,18 +1685,22 @@ struct SurvivalExactRowKernel {
     r0: f64,
     dr0: f64,
     ddr0: f64,
+    dddr0: f64,
     log_s1: f64,
     r1: f64,
     dr1: f64,
     ddr1: f64,
+    dddr1: f64,
     logphi1: f64,
     dlogphi1: f64,
     d2logphi1: f64,
     d3logphi1: f64,
+    d4logphi1: f64,
     log_g: f64,
     d_log_g: f64,
     d2_log_g: f64,
     d3_log_g: f64,
+    d4_log_g: f64,
 }
 
 /// Mix event and censored contributions, avoiding `0 * Inf = NaN` when
@@ -1716,6 +1720,99 @@ impl SurvivalExactRowKernel {
     #[inline]
     fn log_likelihood(self) -> f64 {
         self.w * (event_mix(self.d, self.logphi1 + self.log_g, self.log_s1) - self.log_s0)
+    }
+
+    #[inline]
+    fn nll_index_tower(self) -> crate::families::jet_tower::Tower4<3> {
+        use crate::families::jet_tower::Tower4;
+
+        let u0 = Tower4::<3>::variable(0.0, 0);
+        let u1 = Tower4::<3>::variable(0.0, 1);
+        let g = Tower4::<3>::variable(0.0, 2);
+        let mut nll = u0
+            .compose_unary([self.log_s0, -self.r0, -self.dr0, -self.ddr0, -self.dddr0])
+            .scale(self.w);
+
+        let censored_weight = self.w * (1.0 - self.d);
+        if censored_weight != 0.0 {
+            nll = nll
+                + u1.compose_unary([self.log_s1, -self.r1, -self.dr1, -self.ddr1, -self.dddr1])
+                    .scale(-censored_weight);
+        }
+
+        let event_weight = self.w * self.d;
+        if event_weight != 0.0 {
+            nll = nll
+                + u1.compose_unary([
+                    self.logphi1,
+                    self.dlogphi1,
+                    self.d2logphi1,
+                    self.d3logphi1,
+                    self.d4logphi1,
+                ])
+                .scale(-event_weight)
+                + g.compose_unary([
+                    self.log_g,
+                    self.d_log_g,
+                    self.d2_log_g,
+                    self.d3_log_g,
+                    self.d4_log_g,
+                ])
+                .scale(-event_weight);
+        }
+
+        nll
+    }
+
+    #[inline]
+    fn location_scale_nll_tower(
+        self,
+        row: SurvivalLsLocationScaleRow,
+    ) -> crate::families::jet_tower::Tower4<2> {
+        use crate::families::jet_tower::Tower4;
+
+        let eta_location = Tower4::<2>::variable(row.eta_location, 0);
+        let eta_logscale = Tower4::<2>::variable(row.eta_logscale, 1);
+        let inv_sigma = (-eta_logscale).exp();
+        let q_entry = (Tower4::<2>::constant(row.entry_index) - eta_location) * inv_sigma;
+        let q_exit = (Tower4::<2>::constant(row.exit_index) - eta_location) * inv_sigma;
+        let g = Tower4::<2>::constant(row.exit_index_derivative) * inv_sigma;
+
+        let mut nll = q_entry
+            .compose_unary([self.log_s0, -self.r0, -self.dr0, -self.ddr0, -self.dddr0])
+            .scale(row.weight);
+
+        let censored_weight = row.weight * (1.0 - row.event);
+        if censored_weight != 0.0 {
+            nll = nll
+                + q_exit
+                    .compose_unary([self.log_s1, -self.r1, -self.dr1, -self.ddr1, -self.dddr1])
+                    .scale(-censored_weight);
+        }
+
+        let event_weight = row.weight * row.event;
+        if event_weight != 0.0 {
+            nll = nll
+                + q_exit
+                    .compose_unary([
+                        self.logphi1,
+                        self.dlogphi1,
+                        self.d2logphi1,
+                        self.d3logphi1,
+                        self.d4logphi1,
+                    ])
+                    .scale(-event_weight)
+                + g.compose_unary([
+                    self.log_g,
+                    self.d_log_g,
+                    self.d2_log_g,
+                    self.d3_log_g,
+                    self.d4_log_g,
+                ])
+                .scale(-event_weight);
+        }
+
+        nll
     }
 }
 
@@ -1798,45 +1895,66 @@ impl crate::families::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNll
         let eta_location = p[0];
         let eta_logscale = p[1];
         let inv_sigma = (-eta_logscale).exp();
-        let q_entry = (Tower4::<2>::constant(self.row.entry_index) - eta_location) * inv_sigma;
-        let q_exit = (Tower4::<2>::constant(self.row.exit_index) - eta_location) * inv_sigma;
-        let g = Tower4::<2>::constant(self.row.exit_index_derivative) * inv_sigma;
+        let q_entry = (self.row.entry_index - eta_location.v) * inv_sigma.v;
+        let q_exit = (self.row.exit_index - eta_location.v) * inv_sigma.v;
+        let g = self.row.exit_index_derivative * inv_sigma.v;
 
-        let mut nll = q_entry
-            .compose_unary(survival_ls_log_survival_stack(
-                self.inverse_link,
-                q_entry.v,
-                self.deriv_log_scale,
-            )?)
-            .scale(self.row.weight);
+        let stack_entry =
+            survival_ls_log_survival_stack(self.inverse_link, q_entry, self.deriv_log_scale)?;
+        let mut kernel = SurvivalExactRowKernel {
+            w: self.row.weight,
+            d: self.row.event,
+            log_s0: stack_entry[0],
+            r0: -stack_entry[1],
+            dr0: -stack_entry[2],
+            ddr0: -stack_entry[3],
+            dddr0: -stack_entry[4],
+            log_s1: 0.0,
+            r1: 0.0,
+            dr1: 0.0,
+            ddr1: 0.0,
+            dddr1: 0.0,
+            logphi1: 0.0,
+            dlogphi1: 0.0,
+            d2logphi1: 0.0,
+            d3logphi1: 0.0,
+            d4logphi1: 0.0,
+            log_g: 0.0,
+            d_log_g: 0.0,
+            d2_log_g: 0.0,
+            d3_log_g: 0.0,
+            d4_log_g: 0.0,
+        };
 
         let censored_weight = self.row.weight * (1.0 - self.row.event);
         if censored_weight != 0.0 {
-            nll = nll
-                + q_exit
-                    .compose_unary(survival_ls_log_survival_stack(
-                        self.inverse_link,
-                        q_exit.v,
-                        self.deriv_log_scale,
-                    )?)
-                    .scale(-censored_weight);
+            let stack_exit =
+                survival_ls_log_survival_stack(self.inverse_link, q_exit, self.deriv_log_scale)?;
+            kernel.log_s1 = stack_exit[0];
+            kernel.r1 = -stack_exit[1];
+            kernel.dr1 = -stack_exit[2];
+            kernel.ddr1 = -stack_exit[3];
+            kernel.dddr1 = -stack_exit[4];
         }
 
         let event_weight = self.row.weight * self.row.event;
         if event_weight != 0.0 {
-            nll = nll
-                + q_exit
-                    .compose_unary(survival_ls_log_pdf_stack(
-                        self.inverse_link,
-                        q_exit.v,
-                        self.deriv_log_scale,
-                    )?)
-                    .scale(-event_weight)
-                + g.compose_unary(survival_ls_positive_log_stack(g.v))
-                    .scale(-event_weight);
+            let stack_pdf =
+                survival_ls_log_pdf_stack(self.inverse_link, q_exit, self.deriv_log_scale)?;
+            kernel.logphi1 = stack_pdf[0];
+            kernel.dlogphi1 = stack_pdf[1];
+            kernel.d2logphi1 = stack_pdf[2];
+            kernel.d3logphi1 = stack_pdf[3];
+            kernel.d4logphi1 = stack_pdf[4];
+            let stack_g = survival_ls_positive_log_stack(g);
+            kernel.log_g = stack_g[0];
+            kernel.d_log_g = stack_g[1];
+            kernel.d2_log_g = stack_g[2];
+            kernel.d3_log_g = stack_g[3];
+            kernel.d4_log_g = stack_g[4];
         }
 
-        Ok(nll)
+        Ok(kernel.location_scale_nll_tower(self.row))
     }
 }
 
@@ -3805,7 +3923,7 @@ impl SurvivalLocationScaleFamily {
             }
             .into());
         }
-        let (log_g, d_log_g, d2_log_g, d3_log_g, ..) = Self::logwith_derivatives_positive(g);
+        let (log_g, d_log_g, d2_log_g, d3_log_g, d4_log_g) = Self::logwith_derivatives_positive(g);
 
         Ok(Some(SurvivalExactRowKernel {
             w,
@@ -3814,18 +3932,22 @@ impl SurvivalLocationScaleFamily {
             r0,
             dr0,
             ddr0,
+            dddr0,
             log_s1,
             r1,
             dr1,
             ddr1,
+            dddr1,
             logphi1,
             dlogphi1,
             d2logphi1,
             d3logphi1,
+            d4logphi1,
             log_g,
             d_log_g,
             d2_log_g,
             d3_log_g,
+            d4_log_g,
         }))
     }
 
@@ -3846,71 +3968,15 @@ impl SurvivalLocationScaleFamily {
         let Some(kernel) = self.exact_row_kernel_rescaled(row, state, deriv_log_scale)? else {
             return Ok(None);
         };
-        // The row likelihood is written in terms of the survival values
-        //
-        //   S(u0),  S(u1),
-        //
-        // not in terms of the failure probability `mu = F(u)`.
-        //
-        // Numerically, reconstructing `S` as `1 - mu` is unsafe in the upper
-        // tail. For cloglog/Gumbel in particular, fitted rows can legitimately
-        // land near `S(u) ~ 1e-12`, where `mu` is already within a few ulps of 1.
-        // Then:
-        //
-        //   S_direct  = exp(-exp(u))
-        //   S_naive   = 1 - (1 - S_direct)
-        //
-        // and the latter loses the very quantity the objective differentiates.
-        //
-        // The exact score / Hessian algebra from the derivation assumes the row
-        // objective and its derivatives are taken with respect to the *same*
-        // scalar function
-        //
-        //   ell = w [ d(log f(u1) + log g) + (1-d) log S(u1) - log S(u0) ].
-        //
-        // So we evaluate both log-density and log-survival through the same
-        // inverse-link-specific exact formulas used by the derivative algebra.
-
-        // With
-        //
-        //   ell = w [ d(log f(u1) + log g) + (1-d) log S(u1) - log S(u0) ],
-        //   u0 = q0 + h0,
-        //   u1 = q1 + h1,
-        //
-        // the entry-only derivatives (w.r.t. q0):
-        //
-        //   ell_q0   = w r(u0)
-        //   ell_q0q0 = w r'(u0)
-        //   ell_q0q0q0 = w r''(u0)
-        //   ell_q0q0q0q0 = w r'''(u0)        ← 4th-order entry derivative
-        //
-        // and exit-only derivatives (w.r.t. q1):
-        //
-        //   ell_q1   = w [ d d/du log f(u1) + (1-d) (-r(u1)) ]
-        //   ell_q1q1 = w [ d d²/du² log f(u1) + (1-d) (-r'(u1)) ]
-        //   ell_q1q1q1 = w [ d d³/du³ log f(u1) + (1-d) (-r''(u1)) ]
-        //   ell_q1q1q1q1 = w [ d d⁴/du⁴ log f(u1) + (1-d) (-r'''(u1)) ]  ← 4th-order exit derivative
-        //
-        // When q0 = q1 = q (time-invariant blocks), ell_q = ell_q0 + ell_q1.
-        //
-        // Cross-Hessian d²ell/(dq0 dq1) = 0 because u0 depends only on q0
-        // and u1 depends only on q1.
-        //
-        // The time-side partials follow from u0 = q0 + h0 and u1 = q1 + h1:
-        //
-        //   ell_h0   = ell_q0 = w r(u0)
-        //   ell_h1   = ell_q1
-        //   ell_h0q0 = w r'(u0)
-        //   ell_h1q1 = w [ d d²/du² log f(u1) - (1-d) r'(u1) ]
-        //
-        // Use `event_mix` for d * (event term) + (1-d) * (censored term) to
-        // avoid 0 * Inf = NaN when d ∈ {0, 1} and one branch is non-finite.
-        let d1_q0 = kernel.w * kernel.r0;
-        let d2_q0 = kernel.w * kernel.dr0;
-        let d3_q0 = kernel.w * kernel.ddr0;
-        let d1_q1 = kernel.w * event_mix(kernel.d, kernel.dlogphi1, -kernel.r1);
-        let d2_q1 = kernel.w * event_mix(kernel.d, kernel.d2logphi1, -kernel.dr1);
-        let d3_q1 = kernel.w * event_mix(kernel.d, kernel.d3logphi1, -kernel.ddr1);
+        let tower = kernel.nll_index_tower();
+        let d1_q0 = -tower.g[0];
+        let d2_q0 = -tower.h[0][0];
+        let d3_q0 = -tower.t3[0][0][0];
+        let d1_q1 = -tower.g[1];
+        let d2_q1 = -tower.h[1][1];
+        let d3_q1 = -tower.t3[1][1][1];
+        let d1_qdot1 = -tower.g[2];
+        let d2_qdot1 = -tower.h[2][2];
         let d1_q = d1_q0 + d1_q1;
         let d2_q = d2_q0 + d2_q1;
         let d3_q = d3_q0 + d3_q1;
@@ -3925,17 +3991,17 @@ impl SurvivalLocationScaleFamily {
             d1_q1,
             d2_q1,
             d3_q1,
-            d1_qdot1: kernel.w * kernel.d * kernel.d_log_g,
-            d2_qdot1: kernel.w * kernel.d * kernel.d2_log_g,
-            grad_time_eta_h0: kernel.w * kernel.r0,
-            grad_time_eta_h1: kernel.w * event_mix(kernel.d, kernel.dlogphi1, -kernel.r1),
-            grad_time_eta_d: kernel.w * kernel.d * kernel.d_log_g,
-            h_time_h0: kernel.w * kernel.dr0,
-            h_time_h1: kernel.w * event_mix(kernel.d, kernel.d2logphi1, -kernel.dr1),
-            h_time_d: -kernel.w * kernel.d * kernel.d2_log_g,
-            d_h_h0: kernel.w * kernel.ddr0,
-            d_h_h1: kernel.w * event_mix(kernel.d, kernel.d3logphi1, -kernel.ddr1),
-            d_h_d: -kernel.w * kernel.d * kernel.d3_log_g,
+            d1_qdot1,
+            d2_qdot1,
+            grad_time_eta_h0: d1_q0,
+            grad_time_eta_h1: d1_q1,
+            grad_time_eta_d: d1_qdot1,
+            h_time_h0: d2_q0,
+            h_time_h1: d2_q1,
+            h_time_d: tower.h[2][2],
+            d_h_h0: d3_q0,
+            d_h_h1: d3_q1,
+            d_h_d: tower.t3[2][2][2],
         }))
     }
 }
@@ -13715,10 +13781,10 @@ mod tests {
         }
     }
 
-    fn survival_ls_exact_row_nll(
+    fn survival_ls_exact_row_kernel(
         inverse_link: &InverseLink,
         row: SurvivalLsLocationScaleRow,
-    ) -> f64 {
+    ) -> SurvivalExactRowKernel {
         let family = SurvivalLocationScaleFamily {
             n: 1,
             y: array![row.event],
@@ -13753,14 +13819,13 @@ mod tests {
             -row.eta_location * inv_sigma,
             0.0,
         );
-        -family
+        family
             .exact_row_kernel(0, state)
             .expect("survival LS exact row kernel")
             .expect("positive-weight oracle row")
-            .log_likelihood()
     }
 
-    fn survival_ls_hand_witness_channels(
+    fn hand_survival_ls_channels(
         inverse_link: &InverseLink,
         row: SurvivalLsLocationScaleRow,
     ) -> SlsHandWitnessChannels {
@@ -13805,7 +13870,7 @@ mod tests {
         channels
     }
 
-    fn survival_ls_kernel_channels_from_hand_witness(
+    fn hand_survival_ls_kernel_channels(
         channels: &SlsHandWitnessChannels,
         dirs: &[[f64; 2]],
     ) -> crate::families::jet_tower::KernelChannels<2> {
@@ -13857,18 +13922,25 @@ mod tests {
                     row: row_data,
                 };
                 let tower = evaluate_program(&program, 0).expect("survival LS tower");
-                let witness = survival_ls_hand_witness_channels(&inverse_link, row_data);
-                let exact_value = survival_ls_exact_row_nll(&inverse_link, row_data);
+                let witness = hand_survival_ls_channels(&inverse_link, row_data);
+                let exact_kernel = survival_ls_exact_row_kernel(&inverse_link, row_data);
+                let exact_value = -exact_kernel.log_likelihood();
                 assert!(
                     (witness.value - exact_value).abs() <= 1e-11 * exact_value.abs().max(1.0),
                     "exact row kernel value mismatch for {distribution:?} row {row_index}: witness={} exact={}",
                     witness.value,
                     exact_value
                 );
-                let claims = survival_ls_kernel_channels_from_hand_witness(&witness, &dirs);
+                let claims = hand_survival_ls_kernel_channels(&witness, &dirs);
                 verify_kernel_channels(&tower, &claims, 1e-12).unwrap_or_else(|err| {
                     panic!(
-                        "survival LS K=2 production jet mismatch against hand witness for {distribution:?} row {row_index}: {err}"
+                        "survival LS K=2 RowNllProgram mismatch against hand witness for {distribution:?} row {row_index}: {err}"
+                    )
+                });
+                let production_tower = exact_kernel.location_scale_nll_tower(row_data);
+                verify_kernel_channels(&production_tower, &claims, 1e-12).unwrap_or_else(|err| {
+                    panic!(
+                        "survival LS K=2 production exact-kernel jet mismatch against hand witness for {distribution:?} row {row_index}: {err}"
                     )
                 });
             }
