@@ -362,24 +362,20 @@ impl WarmStartStore {
         let pid = std::process::id();
         // 1. Compute checksum from payload.
         let checksum = checksum_hex(payload);
-        // 2. Build meta JSON. Sanitize NaN/Inf objectives — `serde_json`
-        // hard-errors on non-finite f64 by default, which would abort the
-        // entire checkpoint write and lose warm-start progress. A
-        // non-finite objective is no better than "unknown" for ranking
-        // purposes, so collapse it to `None` rather than failing the save.
         let objective_finite = objective.filter(|o| o.is_finite());
-        let (secs, subsec_nanos) = self.unix_now_parts();
-        let meta = OnDiskMeta {
-            schema_version: SCHEMA_VERSION,
-            written_unix_secs: secs,
-            written_nanos: subsec_nanos,
-            objective: objective_finite,
-            iteration,
-            kind,
-            checksum_hex: checksum,
-            payload_bytes: payload.len() as u64,
-        };
-        let meta_json = serde_json::to_vec_pretty(&meta)?;
+        // The meta's `written_unix_secs`/`written_nanos` are captured INSIDE the
+        // write loop — just before the meta_tmp is written, AFTER the bin write
+        // has completed. The stored timestamp drives the TTL contract: an
+        // entry's clock should start ticking from when the entry becomes
+        // (nearly) visible to lookups, not from `save_overwrite`'s entry. On
+        // slow disks the bin write + fsync + rename can take longer than the
+        // entire TTL window itself (the warm-start test fixture pins TTL=1s
+        // while the ext4-backed CI image takes >1s on small writes), so an
+        // up-front stamp causes the entry to be classified as expired the
+        // moment `save_overwrite` returns. Pushing the stamp past the bin
+        // fsync removes that systemic drift from the cost of writing the
+        // entry — only the meta fsync + final rename + dir fsync still
+        // elapse between the stamp and the entry becoming visible.
 
         // 3. Write both temp files and atomically rename them into place. The
         //    whole "ensure dir → write temps → rename" sequence is retried once
@@ -401,17 +397,36 @@ impl WarmStartStore {
         let bin_final = dir.join(format!("{run_id}.bin"));
         let meta_final = dir.join(format!("{run_id}.json"));
         let mut attempt = 0u8;
+        let build_meta_json = |secs: u64, subsec_nanos: u32| -> Result<Vec<u8>, StoreError> {
+            let meta = OnDiskMeta {
+                schema_version: SCHEMA_VERSION,
+                written_unix_secs: secs,
+                written_nanos: subsec_nanos,
+                objective: objective_finite,
+                iteration,
+                kind,
+                checksum_hex: checksum.clone(),
+                payload_bytes: payload.len() as u64,
+            };
+            Ok(serde_json::to_vec_pretty(&meta)?)
+        };
         loop {
             let bin_tmp = dir.join(format!("{run_id}.bin.tmp.{pid}.{nonce}.{attempt}"));
             let meta_tmp = dir.join(format!("{run_id}.json.tmp.{pid}.{nonce}.{attempt}"));
+            let stamp_fn = || self.unix_now_parts();
+            let build_meta_for_io = |secs: u64, subsec_nanos: u32| -> io::Result<Vec<u8>> {
+                build_meta_json(secs, subsec_nanos)
+                    .map_err(|e| io::Error::other(format!("meta build: {e:?}")))
+            };
             match write_and_promote_entry(&EntryWrite {
                 dir: &dir,
                 bin_tmp: &bin_tmp,
                 meta_tmp: &meta_tmp,
                 payload,
-                meta_json: &meta_json,
                 bin_final: &bin_final,
                 meta_final: &meta_final,
+                stamp_fn: &stamp_fn,
+                build_meta_json: &build_meta_for_io,
             }) {
                 Ok(()) => break,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && attempt == 0 => {
@@ -599,9 +614,18 @@ struct EntryWrite<'a> {
     bin_tmp: &'a Path,
     meta_tmp: &'a Path,
     payload: &'a [u8],
-    meta_json: &'a [u8],
     bin_final: &'a Path,
     meta_final: &'a Path,
+    /// Read the current wall clock as `(unix_secs, subsec_nanos)`. Called
+    /// AFTER the bin write and bin fsync complete (and after the bin rename)
+    /// so the recorded write time tracks when the entry actually becomes
+    /// (nearly) visible, not when `save_overwrite` was first invoked. On
+    /// slow disks the bin fsync can dominate save latency and a pre-write
+    /// stamp would burn TTL the caller never sees.
+    stamp_fn: &'a dyn Fn() -> (u64, u32),
+    /// Build the meta JSON given the captured `(secs, subsec_nanos)`. The
+    /// closure folds those values into `OnDiskMeta` and serializes it.
+    build_meta_json: &'a dyn Fn(u64, u32) -> io::Result<Vec<u8>>,
 }
 
 fn write_and_promote_entry(w: &EntryWrite<'_>) -> io::Result<()> {
@@ -614,12 +638,23 @@ fn write_and_promote_entry(w: &EntryWrite<'_>) -> io::Result<()> {
         f.write_all(w.payload)?;
         f.sync_all().ok();
     }
+    // Promote the bin first so a crash between the two renames leaves an
+    // orphan .bin (cleaned up by `evict_overflow`) rather than a meta
+    // pointing at a missing .bin (which the reader would mark corrupt).
+    fs::rename(w.bin_tmp, w.bin_final)?;
+    // Stamp the meta AFTER the bin promotion. This is the latest moment the
+    // timestamp can still be inlined into the meta JSON. The remaining gap
+    // before the entry is visible to lookups is one meta write+fsync + the
+    // meta rename + the caller's directory fsync — all bounded, so TTL is
+    // measured from a near-visible moment instead of from the entry to
+    // `save_overwrite`.
+    let (secs, subsec_nanos) = (w.stamp_fn)();
+    let meta_json = (w.build_meta_json)(secs, subsec_nanos)?;
     {
         let mut f = fs::File::create(w.meta_tmp)?;
-        f.write_all(w.meta_json)?;
+        f.write_all(&meta_json)?;
         f.sync_all().ok();
     }
-    fs::rename(w.bin_tmp, w.bin_final)?;
     if let Err(e) = fs::rename(w.meta_tmp, w.meta_final) {
         // Roll back the bin we just promoted to avoid orphaning it, then
         // surface the error so the caller can retry or fail.
@@ -1189,15 +1224,17 @@ mod tests {
         let meta_tmp = dir.join("r0.json.tmp.1.0.0");
         let bin_final = dir.join("r0.bin");
         let meta_final = dir.join("r0.json");
-        let meta_json = b"{}";
+        let stamp_fn = || (0u64, 0u32);
+        let build_meta_json = |_: u64, _: u32| -> io::Result<Vec<u8>> { Ok(b"{}".to_vec()) };
         write_and_promote_entry(&EntryWrite {
             dir: &dir,
             bin_tmp: &bin_tmp,
             meta_tmp: &meta_tmp,
             payload: b"payload",
-            meta_json,
             bin_final: &bin_final,
             meta_final: &meta_final,
+            stamp_fn: &stamp_fn,
+            build_meta_json: &build_meta_json,
         })
         .expect("promote into a missing dir must recreate it and succeed");
         assert!(bin_final.exists() && meta_final.exists());
