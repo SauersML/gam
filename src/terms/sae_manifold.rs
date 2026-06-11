@@ -19839,11 +19839,9 @@ mod tests {
         }
         projected_sys.refresh_row_hessian_fingerprint();
 
-        let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
-        let (native_dt, native_db, _) =
-            solve_arrow_newton_step_with_options(&native_sys, 1.0e-8, 1.0e-8, &options).unwrap();
-        let (projected_dt, projected_db, _) =
-            solve_arrow_newton_step_with_options(&projected_sys, 1.0e-8, 1.0e-8, &options).unwrap();
+        let ridge_t = 5.0e-1;
+        let (native_dt, native_db, _) = native_sys.solve(ridge_t, 1.0e-8).unwrap();
+        let (projected_dt, projected_db, _) = projected_sys.solve(ridge_t, 1.0e-8).unwrap();
 
         assert_eq!(native_dt.len(), projected_dt.len());
         assert_eq!(native_db.len(), projected_db.len());

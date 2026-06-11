@@ -381,6 +381,18 @@ const ROW_KERNEL_BODY: &str = r#"
 
 #define INV_TWO_PI     0.15915494309189535
 
+extern "C" __device__ __forceinline__ double atomic_add_f64(double *addr, double value) {
+    unsigned long long int *addr_as_ull = (unsigned long long int *)addr;
+    unsigned long long int old = *addr_as_ull;
+    unsigned long long int assumed;
+    do {
+        assumed = old;
+        double next = __longlong_as_double((long long int)assumed) + value;
+        old = atomicCAS(addr_as_ull, assumed, (unsigned long long int)__double_as_longlong(next));
+    } while (assumed != old);
+    return __longlong_as_double((long long int)old);
+}
+
 // `nan_fill_outputs`: thread-0-only path used when row inputs are degenerate
 // (`F_a` non-finite or non-positive). Writes NaNs to neglog/grad/hess so the
 // host falls back to CPU for that row.
@@ -390,14 +402,14 @@ nan_fill_outputs(int r,
                  double *out_neglog,
                  double *out_grad,
                  double *out_hess) {
-    double nan = nan("");
-    out_neglog[row] = nan;
+    double nan_value = __longlong_as_double(0x7ff8000000000000ULL);
+    out_neglog[row] = nan_value;
     for (int u = 0; u < r; ++u) {
-        out_grad[row * r + u] = nan;
+        out_grad[row * r + u] = nan_value;
     }
     int rr = r * r;
     for (int idx = 0; idx < rr; ++idx) {
-        out_hess[row * rr + idx] = nan;
+        out_hess[row * rr + idx] = nan_value;
     }
 }
 
@@ -537,8 +549,8 @@ extern "C" __global__ void bms_flex_row_kernel(
             double d_R   = D_OF(R_u);
             double d_AR  = D_OF(AR_u);
             double q_AR  = Q_OF(A_c, R_u);
-            atomicAdd(&F_u[u], d_R);
-            atomicAdd(&F_au[u], d_AR - q_AR);
+            atomic_add_f64(&F_u[u], d_R);
+            atomic_add_f64(&F_au[u], d_AR - q_AR);
         }
 
         // F_uv: only b·b, b·h_j, b·w_ℓ have a material `S_{c,uv}`; every other
@@ -571,7 +583,7 @@ extern "C" __global__ void bms_flex_row_kernel(
                 // Symmetric mirror: u in (h or w) block, v == 1 cannot happen
                 // because we iterate v >= u; skip.
                 double val = d_s - q_uv;
-                atomicAdd(&F_uv[u * r + v], val);
+                atomic_add_f64(&F_uv[u * r + v], val);
             }
         }
 
