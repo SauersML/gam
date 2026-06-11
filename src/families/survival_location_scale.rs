@@ -11025,7 +11025,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // third-order map tensor. The wrapper routes supported non-wiggle
         // dense Hessian / first directional derivative calls through the
         // generic engine, while unsupported wiggle and time-varying-qdot
-        // cases stay on the legacy algebra instead of pretending the generic
+        // cases stay on the existing complete algebra instead of pretending the generic
         // fourth-order hook is complete.
         Ok(Some(Arc::new(
             SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
@@ -13433,7 +13433,7 @@ mod tests {
     /// assembly bit-for-bit. We build a non-time-varying, non-wiggle fixture
     /// (the config the kernel covers), then assert the generic row-kernel engine
     /// (`build_row_kernel_cache` → `row_kernel_hessian_dense` /
-    /// `row_kernel_log_likelihood`) matches the legacy assembly oracle and the
+    /// `row_kernel_log_likelihood`) matches the existing assembly oracle and the
     /// bespoke per-row log-likelihood. The public `exact_newton_joint_hessian`
     /// method now delegates to this RowKernel path for the covered non-wiggle
     /// shape, so the test calls `assemble_joint_hessian_from_quantities`
