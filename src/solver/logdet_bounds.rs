@@ -38,6 +38,7 @@ use faer::Side;
 use ndarray::Array2;
 
 use crate::linalg::faer_ndarray::FaerCholesky;
+use crate::linalg::triangular::forward_substitution_lower_matrix;
 
 /// A certified enclosure of `log|S|` for a block-partitioned SPD matrix.
 #[derive(Debug, Clone)]
@@ -63,29 +64,12 @@ impl LogdetEnclosure {
     }
 }
 
-/// Forward substitution: solve `L · X = B` for dense lower-triangular `L`.
-fn forward_substitution(l: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
-    let n = l.nrows();
-    let m = b.ncols();
-    let mut x = b.clone();
-    for col in 0..m {
-        for row in 0..n {
-            let mut acc = x[[row, col]];
-            for k in 0..row {
-                acc -= l[[row, k]] * x[[k, col]];
-            }
-            x[[row, col]] = acc / l[[row, row]];
-        }
-    }
-    x
-}
-
 /// `Ẽ_ij = L_i⁻¹ · S_ij · L_j⁻ᵀ`: forward-solve on the left, then on the
 /// right via the transpose identity `(X L_j⁻ᵀ)ᵀ = L_j⁻¹ Xᵀ`.
 fn whitened_off_block(l_i: &Array2<f64>, l_j: &Array2<f64>, s_ij: &Array2<f64>) -> Array2<f64> {
-    let x = forward_substitution(l_i, s_ij);
+    let x = forward_substitution_lower_matrix(l_i, s_ij);
     let xt = x.t().to_owned();
-    forward_substitution(l_j, &xt).t().to_owned()
+    forward_substitution_lower_matrix(l_j, &xt).t().to_owned()
 }
 
 fn frobenius_sq(a: &Array2<f64>) -> f64 {
