@@ -2,7 +2,7 @@ use crate::faer_ndarray::FaerCholesky;
 use crate::solver::estimate::EstimationError;
 use crate::solver::sensitivity::FitSensitivity;
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, ArrayView1, ArrayView2};
 
 /// Closed-form Riesz representer for a linear functional of a fitted smooth.
 ///
@@ -311,7 +311,7 @@ fn plugin_standard_error(centered_influence: &Array1<f64>) -> Result<f64, Estima
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
+    use ndarray::{Array2, array};
 
     fn dense_solve(mut a: Array2<f64>, mut b: Array1<f64>) -> Array1<f64> {
         let n = b.len();

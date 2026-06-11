@@ -9,9 +9,9 @@ use super::{
     compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
     covariance_from_model, effectivelinkwiggle_formulaspec, family_arg_canonical_name,
     fit_result_from_external, load_dataset_projected, parse_formula, parse_link_choice,
-    parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
-    parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
-    required_columns_for_fit, required_columns_for_formula, resolve_family, summarizewiggle_domain,
+    parse_matching_auxiliary_formula, parse_surv_response, parse_survival_time_basis_config,
+    predict_gam, prepend_id_column_to_prediction_csv, required_columns_for_fit,
+    required_columns_for_formula, resolve_family, summarizewiggle_domain,
     validate_cli_firth_configuration, validate_fit_args_preflight,
     write_gaussian_location_scale_prediction_csv, write_prediction_csv,
     write_survival_binary_prediction_csv, write_survival_prediction_csv,
@@ -27,6 +27,9 @@ use gam::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     DuchonOperatorPenaltySpec, KnotSource, MaternBasisSpec, MaternNu, OneDimensionalBoundary,
     SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
+};
+use gam::config_resolve::{
+    SurvivalInverseLinkInput, parse_survival_inverse_link as parse_config_survival_inverse_link,
 };
 use gam::estimate::{
     ExternalOptimResult, FitGeometry, FitInference, FittedBlock, FittedLinkState,
@@ -5593,6 +5596,16 @@ fn parse_link_choice_flexible_shorthand_defaults_to_probit() {
     assert!(matches!(choice.mode, LinkMode::Flexible));
     assert!(matches!(choice.link, LinkFunction::Probit));
     assert!(choice.mixture_components.is_none());
+}
+
+fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, String> {
+    parse_config_survival_inverse_link(SurvivalInverseLinkInput {
+        link: args.link.as_deref(),
+        mixture_rho: args.mixture_rho.as_deref(),
+        sas_init: args.sas_init.as_deref(),
+        beta_logistic_init: args.beta_logistic_init.as_deref(),
+        survival_distribution: &args.survival_distribution,
+    })
 }
 
 #[test]
