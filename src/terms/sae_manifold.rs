@@ -4087,6 +4087,30 @@ pub struct SaeManifoldFitDiagnostics {
     pub incoherence_report: Option<CertificateInputs>,
 }
 
+/// Honest trust-diagnostics payload for the Python `diagnostics` block (#1005).
+///
+/// This deliberately contains only quantities with exact fitted-state producers:
+/// tangent spectrum/condition, assignment support, activation frequency, and the
+/// basis-kind untyped flag. No topology margins, level-0 references, coherence,
+/// or reconstruction proxy fields are represented here.
+#[derive(Clone, Debug)]
+pub struct SaeTrustDiagnostics {
+    pub atom_trust: Vec<f64>,
+    pub atoms: Vec<SaeAtomTrustDiagnostics>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SaeAtomTrustDiagnostics {
+    pub trust_score: f64,
+    pub sigma_min_tangent: f64,
+    pub sigma_max_tangent: f64,
+    pub tangent_condition_score: f64,
+    pub coverage: f64,
+    pub activation_frequency: f64,
+    pub untyped: bool,
+    pub active_token_count: usize,
+}
+
 /// Build the empirical curved-dictionary certificate quantities from a fitted
 /// term and its Gaussian reconstruction dispersion.
 ///
@@ -4686,6 +4710,148 @@ impl SaeManifoldTerm {
                 None => None,
             },
         })
+    }
+
+    /// Build the trust-diagnostics producer for the Python `diagnostics` block.
+    ///
+    /// `assignments` is supplied by the payload assembly site so top-k projection,
+    /// when requested, is reflected in coverage/frequency and in the tangent
+    /// spectra. The active threshold is shared with the atom lens so all
+    /// assignment-support diagnostics agree on what "active" means.
+    pub fn trust_diagnostics_report(
+        &self,
+        assignments: ArrayView2<'_, f64>,
+    ) -> Result<SaeTrustDiagnostics, String> {
+        let n = self.n_obs();
+        let k_atoms = self.k_atoms();
+        if assignments.dim() != (n, k_atoms) {
+            return Err(format!(
+                "trust_diagnostics_report: assignments shape {:?} must be ({n}, {k_atoms})",
+                assignments.dim()
+            ));
+        }
+        if !assignments.iter().all(|v| v.is_finite()) {
+            return Err("trust_diagnostics_report: assignments must be finite".to_string());
+        }
+        let metric = self.diagnostic_metric()?;
+        let active_threshold = crate::inference::atom_lens::SAE_TRUST_ACTIVE_MASS_FLOOR;
+        let mut atoms = Vec::with_capacity(k_atoms);
+        let mut atom_trust = Vec::with_capacity(k_atoms);
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let mut active_token_count = 0usize;
+            let mut activation_sum = 0.0_f64;
+            for row in 0..n {
+                let mass = assignments[[row, atom_idx]];
+                activation_sum += mass;
+                if mass > active_threshold {
+                    active_token_count += 1;
+                }
+            }
+            let coverage = if n > 0 {
+                active_token_count as f64 / n as f64
+            } else {
+                0.0
+            };
+            let activation_frequency = if n > 0 {
+                activation_sum / n as f64
+            } else {
+                0.0
+            };
+            let (sigma_min_tangent, sigma_max_tangent) = self
+                .atom_tangent_spectrum_from_assignments(
+                    atom_idx,
+                    assignments,
+                    &metric,
+                    active_threshold,
+                )?;
+            let tangent_condition_score = if sigma_max_tangent > 0.0 {
+                (sigma_min_tangent / sigma_max_tangent).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let trust_score = tangent_condition_score;
+            atom_trust.push(trust_score);
+            atoms.push(SaeAtomTrustDiagnostics {
+                trust_score,
+                sigma_min_tangent,
+                sigma_max_tangent,
+                tangent_condition_score,
+                coverage,
+                activation_frequency,
+                untyped: matches!(atom.basis_kind, SaeAtomBasisKind::Precomputed(_)),
+                active_token_count,
+            });
+        }
+        Ok(SaeTrustDiagnostics { atom_trust, atoms })
+    }
+
+    fn atom_tangent_spectrum_from_assignments(
+        &self,
+        atom_idx: usize,
+        assignments: ArrayView2<'_, f64>,
+        metric: &crate::inference::row_metric::RowMetric,
+        active_threshold: f64,
+    ) -> Result<(f64, f64), String> {
+        let atom = &self.atoms[atom_idx];
+        let d = atom.latent_dim;
+        let p = self.output_dim();
+        if d == 0 || p == 0 {
+            return Ok((0.0, 0.0));
+        }
+        let mut gram = Array2::<f64>::zeros((d, d));
+        let mut active_mass_sum = 0.0_f64;
+        let mut jac_row = vec![0.0_f64; p * d];
+        for row in 0..self.n_obs() {
+            let mass = assignments[[row, atom_idx]];
+            if !(mass > active_threshold) {
+                continue;
+            }
+            active_mass_sum += mass;
+            for axis in 0..d {
+                let start = axis;
+                let mut tangent = vec![0.0_f64; p];
+                atom.fill_decoded_derivative_row(row, axis, &mut tangent);
+                for out in 0..p {
+                    jac_row[out * d + start] = tangent[out];
+                }
+            }
+            let row_pullback = metric.pullback(row, &jac_row, d);
+            for axis_a in 0..d {
+                for axis_b in 0..=axis_a {
+                    gram[[axis_a, axis_b]] += mass * row_pullback[[axis_a, axis_b]];
+                }
+            }
+            jac_row.fill(0.0);
+        }
+        if !(active_mass_sum > 0.0) {
+            return Ok((0.0, 0.0));
+        }
+        let inv_mass = 1.0 / active_mass_sum;
+        for axis_a in 0..d {
+            for axis_b in 0..=axis_a {
+                let value = gram[[axis_a, axis_b]] * inv_mass;
+                gram[[axis_a, axis_b]] = value;
+                gram[[axis_b, axis_a]] = value;
+            }
+        }
+        let (evals, _) = gram.eigh(Side::Lower).map_err(|e| {
+            format!(
+                "trust_diagnostics_report: atom {atom_idx} tangent eigendecomposition failed: {e}"
+            )
+        })?;
+        let mut sigma_min = f64::INFINITY;
+        let mut sigma_max = 0.0_f64;
+        for value in evals.iter().copied() {
+            let clamped = value.max(0.0);
+            let sigma = clamped.sqrt();
+            sigma_min = sigma_min.min(sigma);
+            sigma_max = sigma_max.max(sigma);
+        }
+        if sigma_min.is_finite() {
+            Ok((sigma_min, sigma_max))
+        } else {
+            Ok((0.0, 0.0))
+        }
     }
 
     /// Per-atom exact parameter-space views for the #998 certificate path:
