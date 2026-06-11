@@ -1,17 +1,16 @@
 use crate::basis::{BasisOptions, PenaltyInfo, PenaltySource};
 use crate::custom_family::{
-    AdditiveBlockJacobian, BatchedOuterGradientTerms, BlockEffectiveJacobian, BlockWorkingSet,
-    BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
-    CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
-    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
-    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiDirectCache,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace, FamilyChannelHessian,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
-    fit_custom_family_fixed_log_lambdas, resolve_custom_family_x_psi_map,
-    resolve_custom_family_x_psi_psi_map, second_psi_linear_map, shared_dense_arc,
-    weighted_crossprod_psi_maps,
+    AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
+    CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel,
+    CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
+    CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction,
+    CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiDirectCache, ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiWorkspace, FamilyChannelHessian, FamilyEvaluation, ParameterBlockSpec,
+    ParameterBlockState, PenaltyMatrix, PsiDesignMap, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
+    shared_dense_arc, weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_ab, fast_atv, fast_av, fast_joint_hessian_2x2};
@@ -4895,6 +4894,42 @@ fn binomial_expected_q_information_derivatives(
     } else {
         (0.0, 0.0, 0.0)
     }
+}
+
+fn binomial_expected_location_scale_second_coefficients(
+    q: NonWiggleQDerivs,
+    f: f64,
+    f1: f64,
+    f2: f64,
+    d_eta_t_u: f64,
+    d_eta_ls_u: f64,
+    d_eta_t_v: f64,
+    d_eta_ls_v: f64,
+) -> (f64, f64, f64) {
+    let u = nonwiggle_q_directional(q, d_eta_t_u, d_eta_ls_u);
+    let v = nonwiggle_q_directional(q, d_eta_t_v, d_eta_ls_v);
+    let q_uv = q.q_tl * (d_eta_t_u * d_eta_ls_v + d_eta_t_v * d_eta_ls_u)
+        + q.q_ll * d_eta_ls_u * d_eta_ls_v;
+    let q_t_uv = q.q_tl_ls * d_eta_ls_u * d_eta_ls_v;
+    let q_ls_uv = q.q_tl_ls * (d_eta_ls_u * d_eta_t_v + d_eta_ls_v * d_eta_t_u)
+        + q.q_ll_ls * d_eta_ls_u * d_eta_ls_v;
+    let scalar = f2 * u.delta_q * v.delta_q + f1 * q_uv;
+    let tt = scalar * q.q_t * q.q_t
+        + 2.0 * f1 * u.delta_q * q.q_t * v.delta_q_t
+        + 2.0 * f1 * v.delta_q * q.q_t * u.delta_q_t
+        + 2.0 * f * (q.q_t * q_t_uv + u.delta_q_t * v.delta_q_t);
+    let tl = scalar * q.q_t * q.q_ls
+        + f1 * u.delta_q * (v.delta_q_t * q.q_ls + q.q_t * v.delta_q_ls)
+        + f1 * v.delta_q * (u.delta_q_t * q.q_ls + q.q_t * u.delta_q_ls)
+        + f * (q_t_uv * q.q_ls
+            + q.q_t * q_ls_uv
+            + u.delta_q_t * v.delta_q_ls
+            + v.delta_q_t * u.delta_q_ls);
+    let ll = scalar * q.q_ls * q.q_ls
+        + 2.0 * f1 * u.delta_q * q.q_ls * v.delta_q_ls
+        + 2.0 * f1 * v.delta_q * q.q_ls * u.delta_q_ls
+        + 2.0 * f * (q.q_ls * q_ls_uv + u.delta_q_ls * v.delta_q_ls);
+    (tt, tl, ll)
 }
 
 fn binomial_location_scalerow(
@@ -14798,14 +14833,6 @@ impl BinomialLocationScaleFamily {
             .into_par_iter()
             .map(|i| {
                 let q = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
-                let u = nonwiggle_q_directional(q, d_eta_t_u[i], d_eta_ls_u[i]);
-                let v = nonwiggle_q_directional(q, d_eta_t_v[i], d_eta_ls_v[i]);
-                let q_uv = q.q_tl * (d_eta_t_u[i] * d_eta_ls_v[i] + d_eta_t_v[i] * d_eta_ls_u[i])
-                    + q.q_ll * d_eta_ls_u[i] * d_eta_ls_v[i];
-                let q_t_uv = q.q_tl_ls * d_eta_ls_u[i] * d_eta_ls_v[i];
-                let q_ls_uv = q.q_tl_ls
-                    * (d_eta_ls_u[i] * d_eta_t_v[i] + d_eta_ls_v[i] * d_eta_t_u[i])
-                    + q.q_ll_ls * d_eta_ls_u[i] * d_eta_ls_v[i];
                 let (f, f1, f2) = binomial_expected_q_information_derivatives(
                     self.weights[i],
                     core.mu[i],
@@ -14813,23 +14840,16 @@ impl BinomialLocationScaleFamily {
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
                 );
-                let scalar = f2 * u.delta_q * v.delta_q + f1 * q_uv;
-                let tt = scalar * q.q_t * q.q_t
-                    + 2.0 * f1 * u.delta_q * q.q_t * v.delta_q_t
-                    + 2.0 * f1 * v.delta_q * q.q_t * u.delta_q_t
-                    + 2.0 * f * (q.q_t * q_t_uv + u.delta_q_t * v.delta_q_t);
-                let tl = scalar * q.q_t * q.q_ls
-                    + f1 * u.delta_q * (v.delta_q_t * q.q_ls + q.q_t * v.delta_q_ls)
-                    + f1 * v.delta_q * (u.delta_q_t * q.q_ls + q.q_t * u.delta_q_ls)
-                    + f * (q_t_uv * q.q_ls
-                        + q.q_t * q_ls_uv
-                        + u.delta_q_t * v.delta_q_ls
-                        + v.delta_q_t * u.delta_q_ls);
-                let ll = scalar * q.q_ls * q.q_ls
-                    + 2.0 * f1 * u.delta_q * q.q_ls * v.delta_q_ls
-                    + 2.0 * f1 * v.delta_q * q.q_ls * u.delta_q_ls
-                    + 2.0 * f * (q.q_ls * q_ls_uv + u.delta_q_ls * v.delta_q_ls);
-                (tt, tl, ll)
+                binomial_expected_location_scale_second_coefficients(
+                    q,
+                    f,
+                    f1,
+                    f2,
+                    d_eta_t_u[i],
+                    d_eta_ls_u[i],
+                    d_eta_t_v[i],
+                    d_eta_ls_v[i],
+                )
             })
             .collect();
         let mut coeff_tt = Array1::<f64>::zeros(n);
@@ -14849,6 +14869,123 @@ impl BinomialLocationScaleFamily {
         d2_h.slice_mut(s![pt..total, pt..total]).assign(&d2_h_ll);
         mirror_upper_to_lower(&mut d2_h);
         Ok(Some(d2_h))
+    }
+
+    fn expected_joint_contracted_trace_hessian_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        trace_weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != 2 {
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n
+            || eta_ls.len() != n
+            || self.weights.len() != n
+            || x_t.nrows() != n
+            || x_ls.nrows() != n
+        {
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleFamily expected contracted trace input size mismatch"
+                    .to_string(),
+            }
+            .into());
+        }
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let total = pt + pls;
+        if trace_weight.dim() != (total, total) {
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily expected contracted trace weight shape {:?} == ({total}, {total})",
+                    trace_weight.dim()
+                ),
+            }
+            .into());
+        }
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )?;
+        let rows: Vec<(f64, f64, f64)> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut trace_tt = 0.0;
+                for a in 0..pt {
+                    for b in 0..pt {
+                        trace_tt += x_t[[i, a]] * trace_weight[[a, b]] * x_t[[i, b]];
+                    }
+                }
+                let mut trace_tl = 0.0;
+                for a in 0..pt {
+                    for b in 0..pls {
+                        trace_tl += x_t[[i, a]]
+                            * (trace_weight[[a, pt + b]] + trace_weight[[pt + b, a]])
+                            * x_ls[[i, b]];
+                    }
+                }
+                let mut trace_ll = 0.0;
+                for a in 0..pls {
+                    for b in 0..pls {
+                        trace_ll += x_ls[[i, a]] * trace_weight[[pt + a, pt + b]] * x_ls[[i, b]];
+                    }
+                }
+                let q = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
+                let (f, f1, f2) = binomial_expected_q_information_derivatives(
+                    self.weights[i],
+                    core.mu[i],
+                    core.dmu_dq[i],
+                    core.d2mu_dq2[i],
+                    core.d3mu_dq3[i],
+                );
+                let (tt_tt, tt_tl, tt_ll) = binomial_expected_location_scale_second_coefficients(
+                    q, f, f1, f2, 1.0, 0.0, 1.0, 0.0,
+                );
+                let (tl_tt, tl_tl, tl_ll) = binomial_expected_location_scale_second_coefficients(
+                    q, f, f1, f2, 1.0, 0.0, 0.0, 1.0,
+                );
+                let (ll_tt, ll_tl, ll_ll) = binomial_expected_location_scale_second_coefficients(
+                    q, f, f1, f2, 0.0, 1.0, 0.0, 1.0,
+                );
+                (
+                    trace_tt * tt_tt + trace_tl * tt_tl + trace_ll * tt_ll,
+                    trace_tt * tl_tt + trace_tl * tl_tl + trace_ll * tl_ll,
+                    trace_tt * ll_tt + trace_tl * ll_tl + trace_ll * ll_ll,
+                )
+            })
+            .collect();
+        let mut coeff_tt = Array1::<f64>::zeros(n);
+        let mut coeff_tl = Array1::<f64>::zeros(n);
+        let mut coeff_ll = Array1::<f64>::zeros(n);
+        for (i, (tt, tl, ll)) in rows.into_iter().enumerate() {
+            coeff_tt[i] = tt;
+            coeff_tl[i] = tl;
+            coeff_ll[i] = ll;
+        }
+        let h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
+        let h_tl = xt_diag_y_dense(x_t, &coeff_tl, x_ls)?;
+        let h_ll = xt_diag_x_dense(x_ls, &coeff_ll)?;
+        let mut h = Array2::<f64>::zeros((total, total));
+        h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
+        h.slice_mut(s![0..pt, pt..total]).assign(&h_tl);
+        h.slice_mut(s![pt..total, pt..total]).assign(&h_ll);
+        mirror_upper_to_lower(&mut h);
+        Ok(Some(h))
     }
 
     fn expected_joint_information_for_specs(
@@ -14895,6 +15032,23 @@ impl BinomialLocationScaleFamily {
             &x_ls,
             d_beta_u_flat,
             d_betav_flat,
+        )
+    }
+
+    fn expected_joint_contracted_trace_hessian_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: Option<&[ParameterBlockSpec]>,
+        trace_weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(specs)? else {
+            return Ok(None);
+        };
+        self.expected_joint_contracted_trace_hessian_from_designs(
+            block_states,
+            &x_t,
+            &x_ls,
+            trace_weight,
         )
     }
 
@@ -15146,6 +15300,13 @@ impl BinomialLocationScaleFamily {
         x_t: &DesignMatrix,
         x_ls: &DesignMatrix,
     ) -> Result<Option<Array2<f64>>, String> {
+        if let (Some(x_t_dense), Some(x_ls_dense)) = (x_t.as_dense_ref(), x_ls.as_dense_ref()) {
+            return self.exact_newton_joint_hessian_from_designs(
+                block_states,
+                x_t_dense,
+                x_ls_dense,
+            );
+        }
         let (coeff_tt, coeff_tl, coeff_ll) =
             self.exact_newton_joint_hessian_row_coefficients(block_states)?;
         let pt = x_t.ncols();
@@ -16999,6 +17160,19 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
+    fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.expected_joint_contracted_trace_hessian_for_specs(block_states, Some(specs), weight)
+    }
+
+    fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
+        true
+    }
+
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
@@ -17091,446 +17265,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
         }
         let n = self.y.len();
         specs[Self::BLOCK_T].design.nrows() == n && specs[Self::BLOCK_LOG_SIGMA].design.nrows() == n
-    }
-
-    /// Batched analytic-gradient hook (Fix #8).
-    ///
-    /// Falls through to `None` (generic per-θ_j path) whenever any θ_j is a
-    /// ψ coordinate; the design-drift composition for ψ is handled by the
-    /// existing unified evaluator. ρ-only is the common warm-start regime
-    /// and the dominant large-scale cost.
-    fn batched_outer_gradient_terms(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        rho: &ndarray::Array1<f64>,
-        options: &BlockwiseFitOptions,
-        workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-    ) -> Result<Option<BatchedOuterGradientTerms>, String> {
-        use crate::faer_ndarray::FaerCholesky;
-        use faer::Side;
-
-        if options.outer_score_subsample.is_some() {
-            return Ok(None);
-        }
-
-        // ψ-coords fall back to the generic path; the leverage form here is
-        // ρ-only (penalty hyperparameters).
-        let psi_dim: usize = derivative_blocks.iter().map(Vec::len).sum();
-        if psi_dim != 0 {
-            return Ok(None);
-        }
-
-        if !self.exact_joint_supported() {
-            return Ok(None);
-        }
-        if block_states.len() != 2 || specs.len() != 2 {
-            return Ok(None);
-        }
-
-        // Designs and dimensions.
-        let Some((x_t_cow, x_ls_cow)) = self.exact_joint_dense_block_designs(Some(specs))? else {
-            return Ok(None);
-        };
-        let x_t = x_t_cow.into_owned();
-        let x_ls = x_ls_cow.into_owned();
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let total = pt + pls;
-        let n = self.y.len();
-
-        // Operator-aware downgrade: in the matrix-free regime the unified
-        // per-θ_j path uses the family's `ExactNewtonJointHessianWorkspace`
-        // (matvec + dH/d²H operators) and never materializes the dense
-        // total×total joint Hessian, the dense Cholesky factor, or the
-        // total×n leverage panels (`Q_t`, `Q_l`) that this batched fast-path
-        // builds below. At large scale (e.g. n≈4·10⁵, total≈120) those
-        // dense allocations and the n·total² leverage solve dominate
-        // wall-clock time and inflate resident memory by ~6 GiB. Decline
-        // the batched path when the joint dimensions cross the same gate
-        // used for matrix-free outer routing — the unified evaluator will
-        // produce identical gradient values via the operator workspace.
-        if crate::custom_family::use_joint_matrix_free_path(total, n) {
-            return Ok(None);
-        }
-
-        // ── Step 1: build dense joint Hessian H_L (unpenalized).
-        let h_l = if let Some(workspace) = workspace.as_ref() {
-            if let Some(hessian) = workspace.hessian_dense()? {
-                hessian
-            } else {
-                self.exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)?
-                    .ok_or_else(|| {
-                        "BinomialLocationScaleFamily: unable to assemble joint Hessian for batched gradient"
-                            .to_string()
-                    })?
-            }
-        } else {
-            self.exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)?
-                .ok_or_else(|| {
-                "BinomialLocationScaleFamily: unable to assemble joint Hessian for batched gradient"
-                    .to_string()
-            })?
-        };
-
-        // ── Step 2: assemble penalty `S_λ` and add to H.
-        // Match the unified evaluator's per-block convention.
-        let mut h = h_l.clone();
-        let total_pen: usize = specs.iter().map(|s| s.penalties.len()).sum();
-        if rho.len() != total_pen {
-            return Ok(None);
-        }
-        // Per-block per-penalty lambdas.
-        let mut per_block_rho: Vec<Vec<f64>> = Vec::with_capacity(specs.len());
-        let mut cursor = 0;
-        for spec in specs {
-            let cnt = spec.penalties.len();
-            let mut row = Vec::with_capacity(cnt);
-            for k in 0..cnt {
-                row.push(rho[cursor + k]);
-            }
-            per_block_rho.push(row);
-            cursor += cnt;
-        }
-        // Ranges in flattened β.
-        let ranges: Vec<(usize, usize)> = {
-            let mut out = Vec::with_capacity(specs.len());
-            let mut s_pos = 0usize;
-            for spec in specs {
-                let p = spec.design.ncols();
-                out.push((s_pos, s_pos + p));
-                s_pos += p;
-            }
-            out
-        };
-        // Add S_λ block-wise.
-        for (b, spec) in specs.iter().enumerate() {
-            let (start, end) = ranges[b];
-            let p = end - start;
-            let mut s_b = ndarray::Array2::<f64>::zeros((p, p));
-            for (k, pen) in spec.penalties.iter().enumerate() {
-                let lambda = per_block_rho[b][k].exp();
-                pen.add_scaled_to(lambda, &mut s_b);
-            }
-            // Add to H.
-            let mut h_block = h.slice_mut(s![start..end, start..end]);
-            h_block += &s_b;
-        }
-
-        // ── Step 3: Cholesky-factor H.
-        let factor = h
-            .cholesky(Side::Lower)
-            .map_err(|e| format!("BinomialLocationScale batched gradient: Cholesky failed: {e}"))?;
-
-        // β flattened.
-        let beta_flat = {
-            let mut out = ndarray::Array1::<f64>::zeros(total);
-            for b in 0..specs.len() {
-                let (start, end) = ranges[b];
-                out.slice_mut(s![start..end]).assign(&block_states[b].beta);
-            }
-            out
-        };
-
-        // ── Step 4: leverage blocks L_i = Z_i H⁻¹ Z_iᵀ (2×2 per row).
-        // Solve H · M = Zᵀ where Z stacks both block designs into n × total
-        // logical rows, but each row is (x_t_i, 0) for the threshold direction
-        // and (0, x_ls_i) for the log-σ direction. We materialize Q_t and Q_l
-        // as two (total × n) panels, one per channel.
-        const LEVERAGE_CHUNK_ROWS: usize = 1024;
-        const MIN_PARALLEL_LEVERAGE_ROWS: usize = 2 * LEVERAGE_CHUNK_ROWS;
-        let leverage_chunk_rows = if n >= MIN_PARALLEL_LEVERAGE_ROWS {
-            LEVERAGE_CHUNK_ROWS
-        } else {
-            n.max(1)
-        };
-        let leverage_chunks = n.div_ceil(leverage_chunk_rows);
-
-        struct LeverageScratch {
-            rhs_t: ndarray::Array2<f64>,
-            rhs_l: ndarray::Array2<f64>,
-        }
-
-        impl LeverageScratch {
-            fn new(total: usize, chunk_rows: usize) -> Self {
-                Self {
-                    rhs_t: ndarray::Array2::<f64>::zeros((total, chunk_rows)),
-                    rhs_l: ndarray::Array2::<f64>::zeros((total, chunk_rows)),
-                }
-            }
-        }
-
-        let leverage_parts: Vec<(
-            usize,
-            ndarray::Array1<f64>,
-            ndarray::Array1<f64>,
-            ndarray::Array1<f64>,
-        )> = (0..leverage_chunks)
-            .into_par_iter()
-            .map_init(
-                || LeverageScratch::new(total, leverage_chunk_rows),
-                |scratch, chunk_idx| {
-                    let row_start = chunk_idx * leverage_chunk_rows;
-                    let row_end = (row_start + leverage_chunk_rows).min(n);
-                    let m = row_end - row_start;
-                    let mut rhs_t = scratch.rhs_t.slice_mut(s![.., 0..m]);
-                    let mut rhs_l = scratch.rhs_l.slice_mut(s![.., 0..m]);
-                    rhs_t.fill(0.0);
-                    rhs_l.fill(0.0);
-                    for j in 0..m {
-                        let i = row_start + j;
-                        for c in 0..pt {
-                            rhs_t[[c, j]] = x_t[[i, c]];
-                        }
-                        for c in 0..pls {
-                            rhs_l[[pt + c, j]] = x_ls[[i, c]];
-                        }
-                    }
-                    let q_t = factor.solve_mat(&rhs_t.to_owned());
-                    let q_l = factor.solve_mat(&rhs_l.to_owned());
-                    let mut chunk_00 = ndarray::Array1::<f64>::zeros(m);
-                    let mut chunk_01 = ndarray::Array1::<f64>::zeros(m);
-                    let mut chunk_11 = ndarray::Array1::<f64>::zeros(m);
-                    for j in 0..m {
-                        let i = row_start + j;
-                        let mut l00 = 0.0;
-                        let mut l11 = 0.0;
-                        let mut l01 = 0.0;
-                        for c in 0..pt {
-                            l00 += x_t[[i, c]] * q_t[[c, j]];
-                            l01 += x_t[[i, c]] * q_l[[c, j]];
-                        }
-                        for c in 0..pls {
-                            l11 += x_ls[[i, c]] * q_l[[pt + c, j]];
-                        }
-                        chunk_00[j] = l00;
-                        chunk_01[j] = l01;
-                        chunk_11[j] = l11;
-                    }
-                    (row_start, chunk_00, chunk_01, chunk_11)
-                },
-            )
-            .collect();
-
-        // L00, L01, L11: per-row leverage entries.
-        let mut leverage_00 = ndarray::Array1::<f64>::zeros(n);
-        let mut leverage_01 = ndarray::Array1::<f64>::zeros(n);
-        let mut leverage_11 = ndarray::Array1::<f64>::zeros(n);
-        for (row_start, chunk_00, chunk_01, chunk_11) in leverage_parts {
-            let row_end = row_start + chunk_00.len();
-            leverage_00
-                .slice_mut(s![row_start..row_end])
-                .assign(&chunk_00);
-            leverage_01
-                .slice_mut(s![row_start..row_end])
-                .assign(&chunk_01);
-            leverage_11
-                .slice_mut(s![row_start..row_end])
-                .assign(&chunk_11);
-        }
-
-        // ── Step 5: per-coordinate accumulation.
-        // Build (H^{-1})_{b,b} once per block; this amortizes
-        // tr(H^{-1} A_k) across all penalties supported in block b.
-        let h_inv_block_diag: Vec<ndarray::Array2<f64>> = (0..specs.len())
-            .into_par_iter()
-            .map(|b| {
-                let (start, end) = ranges[b];
-                let p_b = end - start;
-                let mut rhs = ndarray::Array2::<f64>::zeros((total, p_b));
-                for c in 0..p_b {
-                    rhs[[start + c, c]] = 1.0;
-                }
-                let m_full = factor.solve_mat(&rhs);
-                let mut block = ndarray::Array2::<f64>::zeros((p_b, p_b));
-                for r in 0..p_b {
-                    for c in 0..p_b {
-                        block[[r, c]] = m_full[[start + r, c]];
-                    }
-                }
-                block
-            })
-            .collect();
-
-        // Pseudologdet helper for the penalty pseudo-inverse trace.
-        let mut s_pseudologdet_blocks: Vec<
-            crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet,
-        > = Vec::with_capacity(specs.len());
-        for b in 0..specs.len() {
-            let (start, end) = ranges[b];
-            let p_b = end - start;
-            let mut s_b = ndarray::Array2::<f64>::zeros((p_b, p_b));
-            for (k, pen) in specs[b].penalties.iter().enumerate() {
-                let lambda = per_block_rho[b][k].exp();
-                pen.add_scaled_to(lambda, &mut s_b);
-            }
-            // No metadata-based structural-nullity hint: the
-            // PenaltyPseudologdet classifier derives the positive eigenspace
-            // from the assembled spectrum alone (issues #192/#318).
-            s_pseudologdet_blocks.push(
-                crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_assembled(
-                    s_b, None,
-                )?,
-            );
-        }
-
-        // Cache the family core once: per-row scalars are independent of u_k.
-        let core = binomial_location_scale_core(
-            &self.y,
-            &self.weights,
-            &block_states[Self::BLOCK_T].eta,
-            &block_states[Self::BLOCK_LOG_SIGMA].eta,
-            None,
-            &self.link_kind,
-        )?;
-        // Pre-compute per-row m1/m2/m3, r, s_factor, q.
-        let mut row_m1 = ndarray::Array1::<f64>::zeros(n);
-        let mut row_m2 = ndarray::Array1::<f64>::zeros(n);
-        let mut row_m3 = ndarray::Array1::<f64>::zeros(n);
-        let mut row_r = ndarray::Array1::<f64>::zeros(n);
-        let mut row_s = ndarray::Array1::<f64>::zeros(n);
-        let mut row_q = ndarray::Array1::<f64>::zeros(n);
-        let row_scalars: Vec<(f64, f64, f64, f64, f64, f64)> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let q = core.q0[i];
-                let r = 1.0 / core.sigma[i];
-                let s_factor = core.dsigma_deta[i] / core.sigma[i];
-                let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                    self.y[i],
-                    self.weights[i],
-                    q,
-                    core.mu[i],
-                    core.dmu_dq[i],
-                    core.d2mu_dq2[i],
-                    core.d3mu_dq3[i],
-                    &self.link_kind,
-                );
-                (m1, m2, m3, r, s_factor, q)
-            })
-            .collect();
-        for (i, (m1, m2, m3, r, s_factor, q)) in row_scalars.into_iter().enumerate() {
-            row_m1[i] = m1;
-            row_m2[i] = m2;
-            row_m3[i] = m3;
-            row_r[i] = r;
-            row_s[i] = s_factor;
-            row_q[i] = q;
-        }
-
-        let mut objective_theta = ndarray::Array1::<f64>::zeros(total_pen);
-        let mut trace_h_inv_hdot = ndarray::Array1::<f64>::zeros(total_pen);
-        let mut trace_s_pinv_sdot = ndarray::Array1::<f64>::zeros(total_pen);
-
-        const MIN_PARALLEL_PENALTY_COORDS: usize = 2;
-        let mut penalty_coords = Vec::with_capacity(total_pen);
-        let mut flat_idx = 0usize;
-        for b in 0..specs.len() {
-            for k_local in 0..specs[b].penalties.len() {
-                penalty_coords.push((flat_idx, b, k_local));
-                flat_idx += 1;
-            }
-        }
-        let penalty_coord_chunk_size = if penalty_coords.len() >= MIN_PARALLEL_PENALTY_COORDS {
-            1
-        } else {
-            penalty_coords.len().max(1)
-        };
-
-        struct PenaltyGradientPart {
-            flat_idx: usize,
-            objective_theta: f64,
-            trace_h_inv_hdot: f64,
-            trace_s_pinv_sdot: f64,
-        }
-
-        let penalty_parts: Vec<Result<Vec<PenaltyGradientPart>, String>> = penalty_coords
-            .par_chunks(penalty_coord_chunk_size)
-            .map(|chunk| {
-                let mut chunk_parts = Vec::with_capacity(chunk.len());
-                for &(flat_idx, b, k_local) in chunk {
-                    let (start, end) = ranges[b];
-                    let p_b = end - start;
-                    let beta_b = beta_flat.slice(s![start..end]).to_owned();
-                    let pen = &specs[b].penalties[k_local];
-                    let lambda_k = per_block_rho[b][k_local].exp();
-                    let mut s_k_local = ndarray::Array2::<f64>::zeros((p_b, p_b));
-                    pen.add_scaled_to(lambda_k, &mut s_k_local);
-                    let s_k_beta_local = s_k_local.dot(&beta_b);
-                    let objective_theta = 0.5 * beta_b.dot(&s_k_beta_local);
-
-                    // u_k = -H^{-1} (A_k β).
-                    let mut a_k_beta_full = ndarray::Array1::<f64>::zeros(total);
-                    a_k_beta_full
-                        .slice_mut(s![start..end])
-                        .assign(&s_k_beta_local);
-                    let mut u_k = factor.solvevec(&a_k_beta_full);
-                    u_k.mapv_inplace(|v| -v);
-
-                    // tr(H^{-1} A_k) = tr( (H^{-1})_{b,b} · (λ_k S_k) ).
-                    let m_block = &h_inv_block_diag[b];
-                    let mut tr_pen = 0.0;
-                    for r in 0..p_b {
-                        for c in 0..p_b {
-                            tr_pen += m_block[[r, c]] * s_k_local[[c, r]];
-                        }
-                    }
-
-                    // Drift trace: Σ_i tr(C_i(u_k) · L_i).
-                    let u_k_t = u_k.slice(s![0..pt]).to_owned();
-                    let u_k_ls = u_k.slice(s![pt..total]).to_owned();
-                    let d_eta_t = fast_av(&x_t, &u_k_t);
-                    let d_eta_ls = fast_av(&x_ls, &u_k_ls);
-                    let mut drift_trace = 0.0;
-                    for i in 0..n {
-                        let q = row_q[i];
-                        let r_val = row_r[i];
-                        let s_factor = row_s[i];
-                        let m1 = row_m1[i];
-                        let m2 = row_m2[i];
-                        let m3 = row_m3[i];
-                        let a_eta = d_eta_t[i];
-                        let b_eta = d_eta_ls[i];
-                        let sb = s_factor * b_eta;
-                        let du = -r_val * a_eta - q * sb;
-                        let c_tt = r_val * r_val * (m3 * du - 2.0 * m2 * sb);
-                        let c_tl =
-                            s_factor * r_val * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
-                        let c_ll = s_factor * s_factor * (m1 + 3.0 * q * m2 + q * q * m3) * du;
-                        drift_trace += c_tt * leverage_00[i]
-                            + 2.0 * c_tl * leverage_01[i]
-                            + c_ll * leverage_11[i];
-                    }
-
-                    // Penalty pseudo-logdet derivative: tr(S^+ · λ_k S_k) (block-local).
-                    let trace_s_pinv_sdot =
-                        s_pseudologdet_blocks[b].tau_gradient_component(&s_k_local);
-
-                    chunk_parts.push(PenaltyGradientPart {
-                        flat_idx,
-                        objective_theta,
-                        trace_h_inv_hdot: tr_pen + drift_trace,
-                        trace_s_pinv_sdot,
-                    });
-                }
-                Ok(chunk_parts)
-            })
-            .collect();
-
-        for chunk in penalty_parts {
-            for part in chunk? {
-                objective_theta[part.flat_idx] = part.objective_theta;
-                trace_h_inv_hdot[part.flat_idx] = part.trace_h_inv_hdot;
-                trace_s_pinv_sdot[part.flat_idx] = part.trace_s_pinv_sdot;
-            }
-        }
-
-        Ok(Some(BatchedOuterGradientTerms {
-            objective_theta,
-            trace_h_inv_hdot,
-            trace_s_pinv_sdot,
-        }))
     }
 }
 

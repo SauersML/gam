@@ -18886,8 +18886,7 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
                 let xd = self.design_deriv[[i, j]];
                 jac[[local_i, j]] = c_i * entry_dq * xe;
                 jac[[chunk + local_i, j]] = c_i * exit_dq * xx;
-                jac[[2 * chunk + local_i, j]] =
-                    c_i * (exit_d2q * d_raw * xx + exit_dq * xd);
+                jac[[2 * chunk + local_i, j]] = c_i * (exit_d2q * d_raw * xx + exit_dq * xd);
             }
 
             // Wiggle tail columns.

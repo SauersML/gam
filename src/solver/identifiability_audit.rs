@@ -1685,18 +1685,17 @@ pub fn audit_identifiability_channel_aware(
         std::iter::repeat(crate::families::identifiability_compiler::BlockOrder::Marginal)
             .take(operators.len())
             .collect();
-    let compiled_map =
-        compile_from_raw_grams(
-            &geometry.gram_h,
-            &geometry.gram_struct,
-            &geometry.raw_ranges,
-            &ordering,
-        )
-        .map_err(|e| {
-            EstimationError::LayoutError(format!(
-                "audit_identifiability_channel_aware compile failed: {e:?}"
-            ))
-        })?;
+    let compiled_map = compile_from_raw_grams(
+        &geometry.gram_h,
+        &geometry.gram_struct,
+        &geometry.raw_ranges,
+        &ordering,
+    )
+    .map_err(|e| {
+        EstimationError::LayoutError(format!(
+            "audit_identifiability_channel_aware compile failed: {e:?}"
+        ))
+    })?;
 
     // Build per-block identity entries from the compiled output.
     let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());

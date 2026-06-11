@@ -12126,7 +12126,10 @@ impl BlockEffectiveJacobian for BoundedEffectiveJacobian {
                 );
             }
         }
-        let mut jac = self.design.slice(ndarray::s![rows.start..rows.end, ..]).to_owned();
+        let mut jac = self
+            .design
+            .slice(ndarray::s![rows.start..rows.end, ..])
+            .to_owned();
         for term in &self.bounded_terms {
             let theta = if state.beta.is_empty() {
                 0.0

@@ -11,8 +11,8 @@
 //! audit on the joint primary-state design deterministically drops
 //! trailing pivots from the latest block when joint rank is lost.
 
-use std::sync::Arc;
 use std::ops::Range;
+use std::sync::Arc;
 
 use ndarray::{Array1, Array2, Array3, Axis, s};
 
