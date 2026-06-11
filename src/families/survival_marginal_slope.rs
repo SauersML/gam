@@ -24416,15 +24416,16 @@ mod tests {
         };
         use crate::families::row_kernel::RowKernel;
 
-        let n = 5;
-        let z = [0.4, -1.1, 0.0, 0.7, -0.3];
-        let weights = [1.0, 0.8, 1.3, 0.9, 1.1];
-        // Mix of events (d=1) and censored (d=0); row 2 censored, row 4 event.
-        let event = [1.0, 0.0, 0.0, 1.0, 1.0];
+        let n = 7;
+        let z = [0.4, -1.1, 0.0, 0.7, -0.3, 1.6, -1.4];
+        let weights = [1.0, 0.8, 1.3, 0.9, 1.1, 0.7, 1.4];
+        // Mix exact events and right-censored rows; the last two rows push
+        // eta into opposite normal-tail regimes while retaining finite truth.
+        let event = [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
         // logslope eta (g) per row, fed through block 2.
-        let g_eta = array![0.2, -0.5, 0.35, -0.15, 0.6];
+        let g_eta = array![0.2, -0.5, 0.35, -0.15, 0.6, 0.45, -0.55];
         // marginal eta (block 1) — additive index shared by η0 and η1.
-        let marginal_eta = array![0.1, -0.2, 0.05, 0.12, -0.08];
+        let marginal_eta = array![0.1, -0.2, 0.05, 0.12, -0.08, 6.2, -7.4];
 
         // Deterministic pseudo-random direction vectors (no RNG dependency).
         let dirs: [[f64; 4]; 3] = [
