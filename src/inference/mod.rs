@@ -1,5 +1,6 @@
 pub mod alo;
 pub mod atom_lens;
+pub mod certificates;
 pub mod conformal;
 pub mod data;
 pub mod diagnostics;
