@@ -73,7 +73,9 @@ pub fn average_derivative_gaussian_identity_with_sensitivity(
     for i in 0..n {
         let residual = input.y[i] - input.mu[i];
         let row_score_projection = input.design.row(i).dot(&riesz) * residual;
-        let phi_i = -(n as f64) * row_score_projection;
+        // phi_i = -a'Hbar^-1 grad l_i with grad l_i = -x_i r_i, so the sign is
+        // positive; its mean is +a'H^-1 S beta, cancelling the smoothing bias.
+        let phi_i = (n as f64) * row_score_projection;
         influence_sum += phi_i;
         influence_sq_sum += phi_i * phi_i;
     }
@@ -85,9 +87,7 @@ pub fn average_derivative_gaussian_identity_with_sensitivity(
         || !se.is_finite()
         || !penalty_bias.is_finite()
     {
-        crate::bail_invalid_estim!(
-            "average-derivative functional produced non-finite estimate"
-        );
+        crate::bail_invalid_estim!("average-derivative functional produced non-finite estimate");
     }
 
     Ok(FunctionalEstimate {
@@ -99,10 +99,7 @@ pub fn average_derivative_gaussian_identity_with_sensitivity(
     })
 }
 
-pub fn penalty_times_beta(
-    penalty: ArrayView2<'_, f64>,
-    beta: ArrayView1<'_, f64>,
-) -> Array1<f64> {
+pub fn penalty_times_beta(penalty: ArrayView2<'_, f64>, beta: ArrayView1<'_, f64>) -> Array1<f64> {
     penalty.dot(&beta)
 }
 
@@ -145,7 +142,10 @@ fn validate_average_derivative_input(
         );
     }
     if input.design.iter().any(|value| !value.is_finite())
-        || input.derivative_design.iter().any(|value| !value.is_finite())
+        || input
+            .derivative_design
+            .iter()
+            .any(|value| !value.is_finite())
         || input.y.iter().any(|value| !value.is_finite())
         || input.mu.iter().any(|value| !value.is_finite())
         || input.beta.iter().any(|value| !value.is_finite())
