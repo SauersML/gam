@@ -31648,7 +31648,6 @@ mod tests {
 
     #[test]
     fn outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active() {
-        crate::solver::visualizer::init_logging();
         let BinomialLocationScaleWiggleOuterFixture {
             family,
             specs,
