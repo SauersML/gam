@@ -36,7 +36,7 @@ const CHUNKED_DENSE_MATERIALIZATION_BYTES: usize = 8 * 1024 * 1024;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
 const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
 /// Minimum n*p product for the dense-row parallel fold/reduce paths
-/// (`diag_gram`, `apply_weighted_normal`, `dense_transpose_matvec_view`).
+/// (`diag_gram`, `apply_weighted_normal`, dense transpose reductions).
 /// Below this, the sequential row loop wins on overhead.
 const DENSE_ROW_PARALLEL_MIN_NP: u64 = 200_000;
 const WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS: u64 = 500_000;
@@ -411,103 +411,6 @@ impl<'a, O: LinearOperator + ?Sized> PenalizedWeightedNormalOperator<'a, O> {
         }
         Ok(diag)
     }
-}
-
-#[inline]
-fn dense_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<f64> {
-    fast_av(matrix, vector)
-}
-
-#[inline]
-fn dense_transpose_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<f64> {
-    fast_atv(matrix, vector)
-}
-
-#[inline]
-fn dense_transpose_matvec_view(matrix: &Array2<f64>, vector: ArrayView1<'_, f64>) -> Array1<f64> {
-    let n = matrix.nrows();
-    let p = matrix.ncols();
-    let row_major_slices = if matrix.is_standard_layout() {
-        match (matrix.as_slice(), vector.as_slice()) {
-            (Some(x), Some(v)) => Some((x, v)),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    if (n as u64) * (p as u64) < DENSE_ROW_PARALLEL_MIN_NP {
-        let mut out = Array1::<f64>::zeros(p);
-        if let Some((x, v)) = row_major_slices {
-            let out_slice = out.as_slice_mut().expect("zeros are contiguous");
-            for i in 0..n {
-                let vi = v[i];
-                if vi == 0.0 {
-                    continue;
-                }
-                let row = &x[i * p..i * p + p];
-                for j in 0..p {
-                    out_slice[j] += row[j] * vi;
-                }
-            }
-        } else {
-            for i in 0..n {
-                let vi = vector[i];
-                if vi == 0.0 {
-                    continue;
-                }
-                for j in 0..p {
-                    out[j] += matrix[[i, j]] * vi;
-                }
-            }
-        }
-        return out;
-    }
-    if let Some((x, v)) = row_major_slices {
-        return (0..n)
-            .into_par_iter()
-            .fold(
-                || Array1::<f64>::zeros(p),
-                |mut acc, i| {
-                    let vi = v[i];
-                    if vi != 0.0 {
-                        let row = &x[i * p..i * p + p];
-                        let acc_slice = acc.as_slice_mut().expect("zeros are contiguous");
-                        for j in 0..p {
-                            acc_slice[j] += row[j] * vi;
-                        }
-                    }
-                    acc
-                },
-            )
-            .reduce(
-                || Array1::<f64>::zeros(p),
-                |mut a, b| {
-                    a += &b;
-                    a
-                },
-            );
-    }
-    (0..n)
-        .into_par_iter()
-        .fold(
-            || Array1::<f64>::zeros(p),
-            |mut acc, i| {
-                let vi = vector[i];
-                if vi != 0.0 {
-                    for j in 0..p {
-                        acc[j] += matrix[[i, j]] * vi;
-                    }
-                }
-                acc
-            },
-        )
-        .reduce(
-            || Array1::<f64>::zeros(p),
-            |mut a, b| {
-                a += &b;
-                a
-            },
-        )
 }
 
 #[inline]
@@ -1354,14 +1257,14 @@ impl LinearOperator for DenseDesignMatrix {
 
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         match self {
-            Self::Materialized(matrix) => dense_matvec(matrix, vector),
+            Self::Materialized(matrix) => fast_av(matrix, vector),
             Self::Lazy(op) => op.apply(vector),
         }
     }
 
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
         match self {
-            Self::Materialized(matrix) => dense_transpose_matvec(matrix, vector),
+            Self::Materialized(matrix) => fast_atv(matrix, vector),
             Self::Lazy(op) => op.apply_transpose(vector),
         }
     }
@@ -1377,7 +1280,14 @@ impl LinearOperator for DenseDesignMatrix {
                     ));
                 }
                 let mut xtwx = Array2::<f64>::zeros((matrix.ncols(), matrix.ncols()));
-                streaming_blas_xt_diag_x(matrix, weights, &mut xtwx);
+                stream_weighted_crossprod_into(
+                    matrix,
+                    weights,
+                    &mut xtwx,
+                    CrossprodStructure::Full,
+                    CrossprodAccum::Replace,
+                    faer::get_global_parallelism(),
+                );
                 Ok(xtwx)
             }
             Self::Lazy(op) => op.diag_xtw_x(weights),
@@ -3344,7 +3254,14 @@ impl LinearOperator for TensorProductDesignOperator {
                 }
 
                 let mut block = Array2::<f64>::zeros((q0, q0));
-                streaming_blas_xt_diag_x(b0.as_ref(), &gamma, &mut block);
+                stream_weighted_crossprod_into(
+                    b0.as_ref(),
+                    &gamma,
+                    &mut block,
+                    CrossprodStructure::Full,
+                    CrossprodAccum::Replace,
+                    faer::get_global_parallelism(),
+                );
                 (a_flat, b_flat, block)
             })
             .collect();
@@ -3671,7 +3588,7 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
     }
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         if let Some(combined) = self.materialized_combined() {
-            return dense_matvec(combined, vector);
+            return fast_av(combined, vector);
         }
         let k_eff = self
             .constraint_transform
@@ -3695,7 +3612,7 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
     }
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
         if let Some(combined) = self.materialized_combined() {
-            return dense_transpose_matvec(combined, vector);
+            return fast_atv(combined, vector);
         }
         let k_eff = self
             .constraint_transform
@@ -3725,7 +3642,14 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
         // Duchon / TPS designs.
         if let Some(combined) = self.materialized_combined() {
             let mut xtwx = Array2::<f64>::zeros((p, p));
-            streaming_blas_xt_diag_x(combined, weights, &mut xtwx);
+            stream_weighted_crossprod_into(
+                combined,
+                weights,
+                &mut xtwx,
+                CrossprodStructure::Full,
+                CrossprodAccum::Replace,
+                faer::get_global_parallelism(),
+            );
             return Ok(xtwx);
         }
         // Fallback: design too large to materialize.  Run row chunks in
@@ -3959,14 +3883,14 @@ impl LinearOperator for CoefficientTransformOperator {
     }
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         if let Some(combined) = self.materialized_combined() {
-            return dense_matvec(combined, vector);
+            return fast_av(combined, vector);
         }
         let tv = fast_av(&self.transform, vector);
         self.inner.apply(&tv)
     }
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
         if let Some(combined) = self.materialized_combined() {
-            return dense_transpose_matvec(combined, vector);
+            return fast_atv(combined, vector);
         }
         let xtv = self.inner.apply_transpose(vector);
         fast_atv(&self.transform, &xtv)
@@ -3974,7 +3898,14 @@ impl LinearOperator for CoefficientTransformOperator {
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if let Some(combined) = self.materialized_combined() {
             let mut xtwx = Array2::<f64>::zeros((self.p_out, self.p_out));
-            streaming_blas_xt_diag_x(combined, weights, &mut xtwx);
+            stream_weighted_crossprod_into(
+                combined,
+                weights,
+                &mut xtwx,
+                CrossprodStructure::Full,
+                CrossprodAccum::Replace,
+                faer::get_global_parallelism(),
+            );
             return Ok(xtwx);
         }
         let inner_xtwx = self.inner.diag_xtw_x(weights)?;
@@ -4186,7 +4117,7 @@ impl LinearOperator for ResidualisedDesignOperator {
     }
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         if let Some(combined) = self.materialized_combined() {
-            return dense_matvec(combined, vector);
+            return fast_av(combined, vector);
         }
         // y = C_b · (V_b · v) − Σ_a A_a · (R_{a,b} · v)
         let tv = fast_av(&self.transform, vector);
@@ -4200,7 +4131,7 @@ impl LinearOperator for ResidualisedDesignOperator {
     }
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
         if let Some(combined) = self.materialized_combined() {
-            return dense_transpose_matvec(combined, vector);
+            return fast_atv(combined, vector);
         }
         let xtv = self.inner.apply_transpose(vector);
         let mut out = fast_atv(&self.transform, &xtv);
@@ -4214,7 +4145,14 @@ impl LinearOperator for ResidualisedDesignOperator {
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if let Some(combined) = self.materialized_combined() {
             let mut xtwx = Array2::<f64>::zeros((self.p_out, self.p_out));
-            streaming_blas_xt_diag_x(combined, weights, &mut xtwx);
+            stream_weighted_crossprod_into(
+                combined,
+                weights,
+                &mut xtwx,
+                CrossprodStructure::Full,
+                CrossprodAccum::Replace,
+                faer::get_global_parallelism(),
+            );
             return Ok(xtwx);
         }
         // Fall back to the default DenseDesignOperator chunked path via
@@ -4237,7 +4175,14 @@ impl LinearOperator for ResidualisedDesignOperator {
                 .map_err(|e| e.to_string())?;
             let w_slice = weights.slice(s![start..end]).to_owned();
             let mut local = Array2::<f64>::zeros((p, p));
-            streaming_blas_xt_diag_x(&chunk, &w_slice, &mut local);
+            stream_weighted_crossprod_into(
+                &chunk,
+                &w_slice,
+                &mut local,
+                CrossprodStructure::Full,
+                CrossprodAccum::Replace,
+                faer::get_global_parallelism(),
+            );
             xtwx += &local;
             start = end;
         }
@@ -5106,8 +5051,8 @@ impl SymmetricMatrix {
 /// may contain negative entries when the working curvature is not guaranteed
 /// PSD (e.g. binomial + cloglog, Gamma + identity, any IRLS step that uses
 /// the true Hessian rather than the Fisher information). All internal kernels
-/// — `streaming_blas_xt_diag_x`, `streaming_sparse_csc_xt_diag_x`, and the
-/// sparse-row accumulator — preserve the sign of the weights; only the
+/// — `stream_weighted_crossprod_into`, `streaming_sparse_csc_xt_diag_x`, and
+/// the sparse-row accumulator — preserve the sign of the weights; only the
 /// PSD-precondition kernels in this module (`sparse_csr_weighted_xtwx_rows`,
 /// `weighted_crossprod_dense_rows`, `dense_diag_gram_view`) clip / assert
 /// nonneg, and none of them is reachable from this entry.
@@ -5206,7 +5151,14 @@ pub fn xt_diag_x_symmetric(
                     checked_dense_nbytes(n, p, "xt_diag_x_symmetric dense sparse route")?;
                 if dense_bytes <= MAX_SPARSE_TO_DENSE_BYTES {
                     let xd = xs.try_to_dense_arc("xt_diag_x_symmetric dense sparse route")?;
-                    streaming_blas_xt_diag_x(xd.as_ref(), diag, &mut xtwx);
+                    stream_weighted_crossprod_into(
+                        xd.as_ref(),
+                        diag,
+                        &mut xtwx,
+                        CrossprodStructure::Full,
+                        CrossprodAccum::Replace,
+                        faer::get_global_parallelism(),
+                    );
                 } else {
                     let (symbolic, values) = xs.parts();
                     streaming_sparse_csc_xt_diag_x(
@@ -5755,7 +5707,14 @@ impl LinearOperator for DesignMatrix {
                     if dense_bytes <= MAX_SPARSE_TO_DENSE_BYTES {
                         let xd =
                             xs.try_to_dense_arc("DesignMatrix::diag_xtw_x dense sparse route")?;
-                        streaming_blas_xt_diag_x(xd.as_ref(), weights, &mut xtwx);
+                        stream_weighted_crossprod_into(
+                            xd.as_ref(),
+                            weights,
+                            &mut xtwx,
+                            CrossprodStructure::Full,
+                            CrossprodAccum::Replace,
+                            faer::get_global_parallelism(),
+                        );
                     } else {
                         let (symbolic, values) = xs.parts();
                         streaming_sparse_csc_xt_diag_x(
@@ -5982,11 +5941,11 @@ impl LinearOperator for DenseRightProductView<'_> {
                 &rhs
             }
         };
-        dense_matvec(self.base, v)
+        fast_av(self.base, v)
     }
 
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let mut out = dense_transpose_matvec(self.base, vector);
+        let mut out = fast_atv(self.base, vector);
         if let Some(factor) = self.first {
             out = fast_atv(factor, &out);
         }
@@ -6060,18 +6019,16 @@ impl LinearOperator for EmbeddedColumnBlock<'_> {
     }
 
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        dense_matvec(
+        fast_av(
             self.local,
-            &vector
-                .slice(ndarray::s![self.global_range.clone()])
-                .to_owned(),
+            &vector.slice(ndarray::s![self.global_range.clone()]),
         )
     }
 
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(self.total_cols);
         out.slice_mut(ndarray::s![self.global_range.clone()])
-            .assign(&dense_transpose_matvec(self.local, vector));
+            .assign(&fast_atv(self.local, vector));
         out
     }
 
@@ -6134,24 +6091,6 @@ impl EmbeddedColumnBlock<'_> {
         DesignMatrix::Dense(DenseDesignMatrix::from(self.local.clone()))
             .quadratic_form_diag(&middle_local)
     }
-}
-
-/// Streaming chunked computation of X^T * diag(W) * X into a `p × p` output.
-///
-/// Thin adapter over the shared dense weighted-Gram kernel
-/// [`stream_weighted_crossprod_into`]: it requests a full output and replaces
-/// `out` with `Xᵀ·diag(W)·X`. All callers here pass a freshly-zeroed buffer
-/// and want the complete (non-triangular) Gram, so the chunk sizing, signed
-/// negative-weight handling, and layout tuning all live in the one kernel.
-fn streaming_blas_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>, out: &mut Array2<f64>) {
-    stream_weighted_crossprod_into(
-        x,
-        weights,
-        out,
-        CrossprodStructure::Full,
-        CrossprodAccum::Replace,
-        faer::get_global_parallelism(),
-    );
 }
 
 impl DesignMatrix {
@@ -7131,9 +7070,7 @@ impl DesignMatrix {
 
     fn apply_transpose_view(&self, vector: ArrayView1<'_, f64>) -> Array1<f64> {
         match self {
-            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
-                dense_transpose_matvec_view(matrix, vector)
-            }
+            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => fast_atv(matrix, &vector),
             Self::Dense(DenseDesignMatrix::Lazy(op)) => op.apply_transpose(&vector.to_owned()),
             Self::Sparse(matrix) => {
                 let mut output = Array1::<f64>::zeros(matrix.ncols());
@@ -7417,8 +7354,8 @@ mod tests {
         ChunkedKernelDesignOperator, CoefficientTransformOperator, DenseDesignMatrix,
         DenseDesignOperator, DesignMatrix, EmbeddedColumnBlock, MultiChannelOperator,
         PsdWeightsView, ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator,
-        SignedWeightsView, SparseDesignMatrix, dense_matvec, dense_operator_to_dense_by_chunks,
-        dense_transpose_matvec, dense_transpose_weighted_response, streaming_sparse_csc_xt_diag_x,
+        SignedWeightsView, SparseDesignMatrix, dense_operator_to_dense_by_chunks,
+        dense_transpose_weighted_response, fast_atv, fast_av, streaming_sparse_csc_xt_diag_x,
         weighted_crossprod_dense_view,
     };
     use crate::linalg::matrix::LinearOperator;
@@ -7530,22 +7467,22 @@ mod tests {
     }
 
     #[test]
-    fn dense_matvec_matches_ndarray_dot() {
+    fn fast_av_matches_ndarray_dot() {
         let x = array![[1.0, 2.0, -1.0], [0.5, -3.0, 4.0], [2.0, 0.0, 1.5]];
         let v = array![0.25, -1.0, 2.0];
         let expected = x.dot(&v);
-        let got = dense_matvec(&x, &v);
+        let got = fast_av(&x, &v);
         for i in 0..expected.len() {
             assert!((expected[i] - got[i]).abs() < 1e-12);
         }
     }
 
     #[test]
-    fn dense_transpose_matvec_matches_ndarray_dot() {
+    fn fast_atv_matches_ndarray_dot() {
         let x = array![[1.0, 2.0, -1.0], [0.5, -3.0, 4.0], [2.0, 0.0, 1.5]];
         let v = array![0.25, -1.0, 2.0];
         let expected = x.t().dot(&v);
-        let got = dense_transpose_matvec(&x, &v);
+        let got = fast_atv(&x, &v);
         for i in 0..expected.len() {
             assert!((expected[i] - got[i]).abs() < 1e-12);
         }
@@ -8082,7 +8019,7 @@ mod tests {
 
         let reference = {
             let wy = Array1::from_shape_fn(n, |i| y[i] * w[i].max(0.0));
-            dense_transpose_matvec(&x, &wy)
+            fast_atv(&x, &wy)
         };
         let fused = dense_transpose_weighted_response(&x, &w, &y, None);
         for j in 0..p {

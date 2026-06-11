@@ -529,7 +529,7 @@ fn fast_atv_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
     use faer::linalg::matmul::matmul;
-    use faer::{Accum, Mat};
+    use faer::Accum;
 
     let (n, p) = a.dim();
     assert_eq!(n, v.len(), "A rows must match v length");
@@ -539,7 +539,8 @@ fn fast_atv_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return a.t().dot(v);
     }
 
-    let mut result = Mat::<f64>::zeros(p, 1);
+    let mut out = Array1::<f64>::zeros(p);
+    let mut outview = array1_to_col_matmut(&mut out);
 
     let aview = FaerArrayView::new(a);
     let vview = FaerColView::new(v);
@@ -549,7 +550,7 @@ fn fast_atv_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     // dst = A^T * v (treating v as n×1 matrix)
     let par = matmul_parallelism(p, 1, n);
     matmul(
-        result.as_mut(),
+        outview.as_mut(),
         Accum::Replace,
         a_ref.transpose(),
         v_ref,
@@ -557,28 +558,24 @@ fn fast_atv_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         par,
     );
 
-    let mut out = Array1::<f64>::zeros(p);
-    for i in 0..p {
-        out[i] = result[(i, 0)];
-    }
     out
 }
 
 /// Compute A^T * v into a pre-allocated output buffer.
 /// `out` must be length p where A is (n, p) and v is length n.
 #[inline]
-pub fn fast_atv_into<S: Data<Elem = f64>>(
-    a: &ArrayBase<S, Ix2>,
-    v: &Array1<f64>,
+pub fn fast_atv_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    v: &ArrayBase<S2, Ix1>,
     out: &mut Array1<f64>,
 ) {
     fast_atv_into_impl(a, v, out);
 }
 
 #[inline]
-fn fast_atv_into_impl<S: Data<Elem = f64>>(
-    a: &ArrayBase<S, Ix2>,
-    v: &Array1<f64>,
+fn fast_atv_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    v: &ArrayBase<S2, Ix1>,
     out: &mut Array1<f64>,
 ) {
     use faer::Accum;
@@ -690,10 +687,9 @@ pub enum CrossprodAccum {
 /// Shared dense weighted-Gram kernel: accumulate `Xᵀ·diag(W)·X` into `out`.
 ///
 /// This is the single tuned implementation of the chunked row-scaling +
-/// matmul strategy; the matrix-returning (`fast_xt_diag_x*`) and
-/// stream-into (`streaming_blas_xt_diag_x`) entry points are thin adapters
-/// over it so that performance tuning, negative-weight handling, chunk
-/// sizing, and layout fixes land in exactly one place.
+/// matmul strategy; the matrix-returning (`fast_xt_diag_x*`) entry points and
+/// stream-in callers share it so that performance tuning, negative-weight
+/// handling, chunk sizing, and layout fixes land in exactly one place.
 ///
 /// Computes the product as `Xᵀ·(W·X)` to preserve the sign of `W`: the prior
 /// `sqrt(max(0, w))`-then-Gram form clipped negative weights to zero, which
@@ -1960,11 +1956,9 @@ mod tests {
 
     #[test]
     fn stream_weighted_crossprod_full_and_triangular_parity_with_negative_weights() {
-        // The two historical kernels (matrix.rs `streaming_blas_xt_diag_x`,
-        // full GEMM, stream-into; and faer_ndarray `fast_xt_diag_x*`,
-        // triangular + mirror, return) are now adapters over the one shared
-        // kernel. Both packaging modes — and both accumulation modes — must
-        // reproduce the naive `Xᵀ·diag(w)·X` reference, including signed
+        // The stream-in and matrix-returning `fast_xt_diag_x*` packaging modes
+        // share one kernel. Both packaging modes — and both accumulation
+        // modes — must reproduce the naive `Xᵀ·diag(w)·X` reference, including signed
         // (negative) weights, which the pre-unification sqrt-clip form
         // silently corrupted.
         //
