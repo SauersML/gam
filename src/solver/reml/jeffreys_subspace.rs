@@ -71,6 +71,18 @@ fn floored_inverse_prime(lam: f64, floor: f64) -> f64 {
     }
 }
 
+/// `d''(λ)` with the floor held fixed: `2/λ³` above the magnitude floor, `0`
+/// inside the band. Needed by the drift path for the confluent-pair limit of
+/// the divided-difference kernel motion (`δΨ_ii = d''(λ_i)·λ̇_i`).
+#[inline]
+fn floored_inverse_second(lam: f64, floor: f64) -> f64 {
+    if lam.abs() >= floor {
+        2.0 / (lam * lam * lam)
+    } else {
+        0.0
+    }
+}
+
 /// Daleckii–Krein divided-difference matrix of the floored signed inverse on
 /// the reduced spectrum: `Ψ_ij = (d(λ_i) − d(λ_j)) / (λ_i − λ_j)` for
 /// well-separated pairs, with the confluent limit `Ψ_ii = d'(λ_i)` on the
@@ -1118,84 +1130,97 @@ where
         return Ok(Array2::zeros((p, p)));
     }
     let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
-    let mut inv_diag = Array1::<f64>::zeros(m);
-    for (i, &lam) in evals.iter().enumerate() {
-        // Floor on |λ| with the SIGNED true inverse, identical to the value/gradient
-        // path in `joint_jeffreys_term` (gam#814).
-        inv_diag[i] = floored_inverse(lam, floor);
-    }
-    let scaled = &evecs * &inv_diag.view().insert_axis(ndarray::Axis(0));
-    let h_id_inv = scaled.dot(&evecs.t());
-
     // Ḋ = Z_Jᵀ (∂H_joint) Z_J, the reduced perturbation of the reduced information.
     let dbar = z_j.t().dot(&pert_h.dot(&z_j)); // m x m
 
-    // EXACT DERIVATIVE OF THE FLOORED PSEUDO-INVERSE K (value↔gradient consistency,
-    // gam#808). The value path builds `H_Φ[a,b] = ½⟨K D_a, K D_b⟩` with the FLOORED
-    // signed pseudo-inverse `K = V diag(d_i) Vᵀ`, `d_i = 1/λ_i` if `|λ_i| ≥ floor`
-    // else `1/floor`. The earlier drift used `δK = −K Ḋ K`, which is the directional
-    // derivative of the UNfloored inverse `1/λ` only. On a separating direction one
-    // or more reduced eigenvalues sit BELOW the floor (exactly the regime that
-    // activates this term), where `d_i = 1/floor` is flat in λ_i (∂d_i/∂λ_i = 0) and
-    // the floor itself moves with `λ_max(β)`. `−K Ḋ K` then assigns those entries the
-    // wrong divided differences `−d_i d_j` (it pretends `d'(λ_i) = −d_i²` and ignores
-    // the floor motion), so the analytic outer-LAML drift `D_β H_Φ[v_k]` differed from
-    // the value the inner Newton converged on — no outer step satisfied descent
-    // (the frozen `|g|` survival-marginal-slope stall). We instead form the EXACT
-    // directional derivative of the floored matrix function via the Daleckii–Krein
-    // divided-difference formula in the eigenbasis, plus the floor-motion term.
-    //
-    //   δK = V (Ψ ∘ (Vᵀ Ḋ V)) Vᵀ  +  V diag(∂d_i/∂floor · δfloor) Vᵀ,
-    //
-    // with divided differences of the floored `d(λ)`:
-    //   Ψ_ij = (d_i − d_j)/(λ_i − λ_j)  (i ≠ j, well-separated),
-    //   Ψ_ii = d'(λ_i) = −1/λ_i² if |λ_i| ≥ floor else 0 (floor frozen),
-    // and the limit `Ψ_ij → d'(λ_i)` as `λ_i → λ_j` (continuous divided difference).
-    // The floor-motion term fires only in the active RELATIVE regime, mirroring the
-    // value path's floor-response gradient: `δfloor = REL · δλ_max = REL · (Vᵀ Ḋ V)_{mm}`
-    // for the dominant eigenvalue index `m`, and `∂d_i/∂floor = −1/floor²` on below-
-    // floor entries (0 otherwise). On a fully-PSD/above-floor fit every `|λ_i| ≥ floor`
-    // and the floor is constant, so Ψ reduces to `−d_i d_j` and the floor-motion term
-    // vanishes — `δK` is byte-identical to the previous `−K Ḋ K` there.
-    let delta_k = {
-        let dbar_red = evecs.t().dot(&dbar).dot(&evecs); // Vᵀ Ḋ V (m × m)
-        let floor_in_relative_regime = lambda_max > 0.0
-            && REDUCED_INFO_RELATIVE_FLOOR * lambda_max >= REDUCED_INFO_ABSOLUTE_FLOOR;
-        let mut idx_max = 0usize;
-        for i in 1..m {
-            if evals[i] > evals[idx_max] {
-                idx_max = i;
-            }
+    // EXACT DERIVATIVE OF THE DIVIDED-DIFFERENCE CURVATURE (value↔drift
+    // consistency, gam#979). The value path builds
+    //   `H_Φ_raw[a,b] = −½ Σ_ij Ψ_ij (Ṽ_a)_ij (Ṽ_b)_ij`,
+    // with `Ṽ_k = Vᵀ D_k V` the eigenbasis-rotated reduced derivatives and `Ψ`
+    // the Daleckii–Krein divided differences of the floored signed inverse
+    // (see `joint_jeffreys_term`). Under a perturbation that moves `H_id` by
+    // `Ḋ` and each `D_a` by `∂D_a`, the exact first-order pieces are:
+    //   * eigenvalue motion       λ̇_i = (Ḋ̃)_ii,            Ḋ̃ = Vᵀ Ḋ V,
+    //   * eigenvector rotation    δV = V C,   C_ij = (Ḋ̃)_ij/(λ_j − λ_i) (i≠j),
+    //   * rotated derivatives     δṼ_a = Vᵀ (∂D_a) V + Ṽ_a C − C Ṽ_a,
+    //   * kernel motion           δΨ_ij from the chain rule on the divided
+    //     difference `Ψ(λ_i, λ_j; floor)` — for separated pairs
+    //       δΨ_ij = [(d'(λ_i) − Ψ_ij)·λ̇_i + (Ψ_ij − d'(λ_j))·λ̇_j]/(λ_i − λ_j)
+    //               + (∂d_i/∂floor − ∂d_j/∂floor)/(λ_i − λ_j) · δfloor,
+    //     and for confluent/diagonal entries `δΨ_ii = d''(λ_i)·λ̇_i` (the floor
+    //     branch has `d'' = 0`, and `d'` is floor-independent in both branches
+    //     so no diagonal floor-motion arises). The floor-motion term fires only
+    //     in the active RELATIVE regime, mirroring the value path's
+    //     floor-response: `δfloor = REL · λ̇_{idx_max}`, `∂d_i/∂floor = −1/floor²`
+    //     on below-floor entries (0 otherwise).
+    // Then
+    //   δH_Φ_raw[a,b] = −½ Σ_ij [δΨ_ij (Ṽ_a)_ij (Ṽ_b)_ij
+    //                            + Ψ_ij ((δṼ_a)_ij (Ṽ_b)_ij + (Ṽ_a)_ij (δṼ_b)_ij)].
+    let dbar_red = evecs.t().dot(&dbar).dot(&evecs); // Vᵀ Ḋ V (m × m)
+    let psi = floored_inverse_divided_differences(&evals, floor);
+    let floor_in_relative_regime =
+        lambda_max > 0.0 && REDUCED_INFO_RELATIVE_FLOOR * lambda_max >= REDUCED_INFO_ABSOLUTE_FLOOR;
+    let mut idx_max = 0usize;
+    for i in 1..m {
+        if evals[i] > evals[idx_max] {
+            idx_max = i;
         }
-        let psi = floored_inverse_divided_differences(&evals, floor);
-        let mut psi_dbar = Array2::<f64>::zeros((m, m));
-        for i in 0..m {
-            for j in 0..m {
-                psi_dbar[[i, j]] = psi[[i, j]] * dbar_red[[i, j]];
-            }
-        }
-        // Floor-motion term (active relative regime only). δfloor = REL · δλ_max,
-        // δλ_max = v_maxᵀ Ḋ v_max = (Vᵀ Ḋ V)_{idx_max, idx_max}.
-        if floor_in_relative_regime {
-            let dfloor = REDUCED_INFO_RELATIVE_FLOOR * dbar_red[[idx_max, idx_max]];
-            if dfloor != 0.0 {
-                let inv_floor_sq = 1.0 / (floor * floor);
-                for i in 0..m {
-                    if evals[i].abs() < floor {
-                        // ∂d_i/∂floor = −1/floor², contributes only to the diagonal.
-                        psi_dbar[[i, i]] += -inv_floor_sq * dfloor;
-                    }
-                }
-            }
-        }
-        evecs.dot(&psi_dbar).dot(&evecs.t()) // δK (m × m), back to the standard basis
+    }
+    let dfloor = if floor_in_relative_regime {
+        REDUCED_INFO_RELATIVE_FLOOR * dbar_red[[idx_max, idx_max]]
+    } else {
+        0.0
     };
+    // Eigenvector-rotation generator C (skew: C_ij = (Ḋ̃)_ij/(λ_j − λ_i), 0 on
+    // the diagonal and on confluent pairs, where first-order rotation within
+    // the degenerate subspace cancels out of the symmetric contraction).
+    let mut rotation = Array2::<f64>::zeros((m, m));
+    // Kernel motion δΨ.
+    let mut dpsi = Array2::<f64>::zeros((m, m));
+    let d_floor_sensitivity = |lam: f64| -> f64 {
+        if lam.abs() < floor {
+            -1.0 / (floor * floor)
+        } else {
+            0.0
+        }
+    };
+    for i in 0..m {
+        for j in 0..m {
+            let denom = evals[j] - evals[i];
+            if denom.abs() > REDUCED_INFO_ABSOLUTE_FLOOR {
+                rotation[[i, j]] = dbar_red[[i, j]] / denom;
+            }
+            let gap = evals[i] - evals[j];
+            if gap.abs() > REDUCED_INFO_ABSOLUTE_FLOOR {
+                let dp_i = floored_inverse_prime(evals[i], floor);
+                let dp_j = floored_inverse_prime(evals[j], floor);
+                let lam_dot_i = dbar_red[[i, i]];
+                let lam_dot_j = dbar_red[[j, j]];
+                dpsi[[i, j]] = ((dp_i - psi[[i, j]]) * lam_dot_i
+                    + (psi[[i, j]] - dp_j) * lam_dot_j)
+                    / gap;
+                if dfloor != 0.0 {
+                    dpsi[[i, j]] +=
+                        (d_floor_sensitivity(evals[i]) - d_floor_sensitivity(evals[j])) / gap
+                            * dfloor;
+                }
+            } else {
+                // Confluent/diagonal: Ψ = d'(λ), so δΨ = d''(λ)·λ̇ with the
+                // averaged eigenvalue motion of the (near-)tied pair.
+                dpsi[[i, j]] = floored_inverse_second(evals[i], floor)
+                    * 0.5
+                    * (dbar_red[[i, i]] + dbar_red[[j, j]]);
+            }
+        }
+    }
 
-    // For each canonical axis e_a: base M_a = K D_a and its perturbation δM_a. We
-    // assemble flattened vec(M_a) and vec(δM_a) so the final contraction is a pair
-    // of m·m inner products per (a,b).
-    let mut m_rows = Array2::<f64>::zeros((p, m * m)); // vec(M_a)
-    let mut dm_rows = Array2::<f64>::zeros((p, m * m)); // vec(δM_a)
+    // Per canonical axis e_a: rotated base Ṽ_a, its Ψ-weighted partner, the
+    // perturbed rotation δṼ_a, and the δΨ/Ψ-weighted derivative rows, flattened
+    // so the final contraction is a pair of m·m inner products per (a,b).
+    let mut a_rows = Array2::<f64>::zeros((p, m * m)); // vec(Ṽ_a)
+    let mut aw_rows = Array2::<f64>::zeros((p, m * m)); // vec(Ψ ∘ Ṽ_a)
+    let mut da_rows = Array2::<f64>::zeros((p, m * m)); // vec(δṼ_a)
+    let mut dw_rows = Array2::<f64>::zeros((p, m * m)); // vec(δΨ ∘ Ṽ_a + Ψ ∘ δṼ_a)
     let mut axis = Array1::<f64>::zeros(p);
     for a in 0..p {
         axis.fill(0.0);
@@ -1212,7 +1237,7 @@ where
             ));
         }
         let d_a = z_j.t().dot(&hdot_a.dot(&z_j)); // Z_Jᵀ ∂_a H Z_J
-        let m_a = h_id_inv.dot(&d_a); // K D_a
+        let a_a = evecs.t().dot(&d_a).dot(&evecs); // Ṽ_a
 
         let pert_hdot_a = match pert_hessian_dir(&axis)? {
             Some(h2) => h2,
@@ -1227,30 +1252,33 @@ where
         }
         let d_a_pert = z_j.t().dot(&pert_hdot_a.dot(&z_j)); // Z_Jᵀ (∂Hdot[e_a]) Z_J
 
-        // δM_a = (δK) D_a + K (∂D_a), with the EXACT floored-pseudo-inverse
-        // derivative `δK` formed above (Daleckii–Krein + floor motion) — NOT the
-        // unfloored `−K Ḋ K`, which is wrong on below-floor (separating) directions.
-        let dm_a = &delta_k.dot(&d_a) + &h_id_inv.dot(&d_a_pert);
+        // δṼ_a = Vᵀ (∂D_a) V + Ṽ_a C − C Ṽ_a.
+        let da_a = evecs.t().dot(&d_a_pert).dot(&evecs) + &a_a.dot(&rotation)
+            - &rotation.dot(&a_a);
 
         let mut col = 0usize;
         for i in 0..m {
             for j in 0..m {
-                m_rows[[a, col]] = m_a[[i, j]];
-                dm_rows[[a, col]] = dm_a[[i, j]];
+                a_rows[[a, col]] = a_a[[i, j]];
+                aw_rows[[a, col]] = psi[[i, j]] * a_a[[i, j]];
+                da_rows[[a, col]] = da_a[[i, j]];
+                dw_rows[[a, col]] = dpsi[[i, j]] * a_a[[i, j]] + psi[[i, j]] * da_a[[i, j]];
                 col += 1;
             }
         }
     }
 
-    // δ(½Gram)[a,b] = ½ (⟨vec δM_a, vec M_b⟩ + ⟨vec M_a, vec δM_b⟩). Symmetric.
+    // δH_Φ_raw[a,b] = −½ (⟨vec(δΨ∘Ṽ_a + Ψ∘δṼ_a), vec(Ṽ_b)⟩ + ⟨vec(Ψ∘Ṽ_a), vec(δṼ_b)⟩).
+    // Mathematically symmetric in (a, b); assembled symmetrically for exactness.
     let mut out = Array2::<f64>::zeros((p, p));
     for a in 0..p {
         for b in a..p {
             let mut acc = 0.0;
             for col in 0..(m * m) {
-                acc += dm_rows[[a, col]] * m_rows[[b, col]] + m_rows[[a, col]] * dm_rows[[b, col]];
+                acc += dw_rows[[a, col]] * a_rows[[b, col]]
+                    + aw_rows[[a, col]] * da_rows[[b, col]];
             }
-            let value = 0.5 * acc;
+            let value = -0.5 * acc;
             out[[a, b]] = value;
             out[[b, a]] = value;
         }
@@ -1265,13 +1293,9 @@ where
     let (g_dlmin, g_dlmax) = conditioning_gate_weight_grad(lambda_min, lambda_max);
     if g_dlmin != 0.0 || g_dlmax != 0.0 {
         let mut idx_min = 0usize;
-        let mut idx_max = 0usize;
         for i in 1..m {
             if evals[i] < evals[idx_min] {
                 idx_min = i;
-            }
-            if evals[i] > evals[idx_max] {
-                idx_max = i;
             }
         }
         let extreme_perturbation = |idx: usize| -> f64 {
@@ -1281,7 +1305,8 @@ where
         let d_gate =
             g_dlmin * extreme_perturbation(idx_min) + g_dlmax * extreme_perturbation(idx_max);
         if d_gate != 0.0 {
-            let hphi_raw = m_rows.dot(&m_rows.t()).mapv(|x| 0.5 * x);
+            // H_Φ_raw = −½ Σ_ij Ψ_ij (Ṽ_a)_ij (Ṽ_b)_ij, matching the value path.
+            let hphi_raw = aw_rows.dot(&a_rows.t()).mapv(|x| -0.5 * x);
             result.scaled_add(d_gate, &hphi_raw);
         }
     }
