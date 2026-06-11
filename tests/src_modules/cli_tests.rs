@@ -3304,6 +3304,7 @@ fn bernoulli_marginal_slope_saved_model_persists_exact_kernel_metadata_only() {
         None,
         None,
         None,
+        None,
         InverseLink::Standard(StandardLink::Probit),
         gam::families::lognormal_kernel::FrailtySpec::None,
     )
@@ -3369,6 +3370,7 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
         latent_z_normalization: SavedLatentZNormalization { mean: 1.1, sd: 2.2 },
         latent_measure: LatentMeasureKind::StandardNormal,
         latent_z_rank_int_calibration: None,
+        latent_z_conditional_calibration: None,
         score_warp_runtime: None,
         link_dev_runtime: None,
         base_link: InverseLink::Standard(StandardLink::Probit),
@@ -3521,6 +3523,7 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         None,
         None,
         None,
+        None,
         InverseLink::Standard(StandardLink::Probit),
         gam::families::lognormal_kernel::FrailtySpec::None,
     )
@@ -3577,6 +3580,7 @@ fn saved_marginal_slope_models_require_latent_z_normalization() {
         0.0,
         SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
         LatentMeasureKind::StandardNormal,
+        None,
         None,
         None,
         None,
