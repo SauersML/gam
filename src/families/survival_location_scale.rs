@@ -13938,7 +13938,11 @@ mod tests {
                     )
                 });
                 let production_tower = exact_kernel.location_scale_nll_tower(row_data);
-                verify_kernel_channels(&production_tower, &claims, 1e-12).unwrap_or_else(|err| {
+                // The production kernel pre-evaluates its primitive stacks in a
+                // different association order than the program path; observed
+                // margin is ~1.3e-12 on fourth-order channels, so 5e-12 bounds
+                // association noise (a dropped term would miss by >=1e-6).
+                verify_kernel_channels(&production_tower, &claims, 5e-12).unwrap_or_else(|err| {
                     panic!(
                         "survival LS K=2 production exact-kernel jet mismatch against hand witness for {distribution:?} row {row_index}: {err}"
                     )
