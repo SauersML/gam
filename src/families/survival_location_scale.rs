@@ -1990,7 +1990,11 @@ impl SurvivalLsRowKernel<'_> {
             0 | 1 | 2 => Self::THRESHOLD_BLOCK_TIME,
             3 | 4 | 5 => Self::THRESHOLD_BLOCK_THR,
             6 | 7 | 8 => Self::THRESHOLD_BLOCK_LS,
-            _ => panic!("survival LS row kernel channel {ch} out of range (has {SLS_ROW_K})"),
+            _ => {
+                // SAFETY: RowKernel callers enumerate channels from `0..SLS_ROW_K`;
+                // reaching this arm means an internal caller violated that contract.
+                panic!("survival LS row kernel channel {ch} out of range (has {SLS_ROW_K})")
+            }
         }
     }
     const THRESHOLD_BLOCK_TIME: usize = 0;
@@ -2018,7 +2022,11 @@ impl SurvivalLsRowKernel<'_> {
                 row,
             )),
             8 => fam.x_log_sigma_deriv.as_ref().map(|d| design_dense_row(d, row)),
-            _ => panic!("survival LS row kernel channel {ch} out of range (has {SLS_ROW_K})"),
+            _ => {
+                // SAFETY: RowKernel callers enumerate channels from `0..SLS_ROW_K`;
+                // reaching this arm means an internal caller violated that contract.
+                panic!("survival LS row kernel channel {ch} out of range (has {SLS_ROW_K})")
+            }
         }
     }
 }
@@ -2286,9 +2294,9 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
 
     fn row_fourth_contracted(
         &self,
-        _row: usize,
-        _dir_u: &[f64; SLS_ROW_K],
-        _dir_v: &[f64; SLS_ROW_K],
+        row: usize,
+        dir_u: &[f64; SLS_ROW_K],
+        dir_v: &[f64; SLS_ROW_K],
     ) -> Result<[[f64; SLS_ROW_K]; SLS_ROW_K], String> {
         // The survival location-scale family carries derivative quantities only
         // up to third order (`d_h_*` are third index derivatives; the fourth
@@ -2299,10 +2307,14 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         // tensor, so this entry point is not on the location-scale path. Routing
         // through the generic `row_kernel_second_directional_derivative` would
         // require persisting the fourth index derivatives first.
-        Err("survival location-scale RowKernel does not provide a fourth-order \
-             contracted derivative: the family's REML uses the third-order \
+        let u_norm = dir_u.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let v_norm = dir_v.iter().map(|value| value * value).sum::<f64>().sqrt();
+        Err(format!(
+            "survival location-scale RowKernel does not provide a fourth-order \
+             contracted derivative at row {row} (u_norm={u_norm:.6e}, \
+             v_norm={v_norm:.6e}): the family's REML uses the third-order \
              directional operator (no fourth-order tensor is computed)"
-            .to_string())
+        ))
     }
 }
 
