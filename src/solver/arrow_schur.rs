@@ -2684,6 +2684,39 @@ impl ArrowSchurSystem {
         Self::new_with_hbb(n, d, k, Array2::<f64>::zeros((k, k)))
     }
 
+    /// Allocate an arrow system with no dense shared `H_ββ` block.
+    ///
+    /// Callers must install a penalty operator before solving if the shared block
+    /// has nonzero curvature. This keeps large structured systems from allocating
+    /// a `k × k` dense placeholder when all β curvature is supplied by operators.
+    pub fn new_with_empty_hbb(n: usize, d: usize, k: usize) -> Self {
+        let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
+        let row_dims: Arc<[usize]> = (0..n).map(|_| d).collect::<Vec<_>>().into();
+        let row_offsets: Arc<[usize]> = (0..=n).map(|i| i * d).collect::<Vec<_>>().into();
+        let mut sys = Self {
+            rows,
+            hbb: Array2::<f64>::zeros((0, 0)),
+            hbb_matvec: None,
+            htbeta_matvec: None,
+            htbeta_transpose_matvec: None,
+            htbeta_dense_supplement: false,
+            hbb_diag: None,
+            gb: Array1::<f64>::zeros(k),
+            d,
+            row_dims,
+            row_offsets,
+            k,
+            manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
+            row_hessian_fingerprint: 0,
+            analytic_row_hessian_fingerprint: 0,
+            block_offsets: Arc::from([] as [Range<usize>; 0]),
+            penalty_op: None,
+            cross_row_penalties: Vec::new(),
+        };
+        sys.refresh_row_hessian_fingerprint();
+        sys
+    }
+
     /// Allocate an arrow system using a caller-owned dense shared-block buffer.
     /// The buffer must already have shape `(k, k)` and is zeroed in place before
     /// use so callers can recycle it across assemblies without changing
@@ -2780,6 +2813,46 @@ impl ArrowSchurSystem {
     /// `sys.d` is set to `max(per_row_dims)` (or 0 for an empty system).
     pub fn new_with_per_row_dims(per_row_dims: Vec<usize>, k: usize) -> Self {
         Self::new_with_per_row_dims_and_hbb(per_row_dims, k, Array2::<f64>::zeros((k, k)))
+    }
+
+    /// Allocate a heterogeneous-row arrow system with no dense shared `H_ββ`
+    /// block. See [`Self::new_with_empty_hbb`].
+    pub fn new_with_per_row_dims_empty_hbb(per_row_dims: Vec<usize>, k: usize) -> Self {
+        let n = per_row_dims.len();
+        let d = per_row_dims.iter().copied().max().unwrap_or(0);
+        let mut offsets = Vec::with_capacity(n + 1);
+        let mut cursor = 0usize;
+        offsets.push(cursor);
+        for &dim in &per_row_dims {
+            cursor += dim;
+            offsets.push(cursor);
+        }
+        let rows = per_row_dims
+            .iter()
+            .map(|&dim| ArrowRowBlock::new(dim, k))
+            .collect();
+        let mut sys = Self {
+            rows,
+            hbb: Array2::<f64>::zeros((0, 0)),
+            hbb_matvec: None,
+            htbeta_matvec: None,
+            htbeta_transpose_matvec: None,
+            htbeta_dense_supplement: false,
+            hbb_diag: None,
+            gb: Array1::<f64>::zeros(k),
+            d,
+            row_dims: Arc::from(per_row_dims.into_boxed_slice()),
+            row_offsets: Arc::from(offsets.into_boxed_slice()),
+            k,
+            manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
+            row_hessian_fingerprint: 0,
+            analytic_row_hessian_fingerprint: 0,
+            block_offsets: Arc::from([] as [Range<usize>; 0]),
+            penalty_op: None,
+            cross_row_penalties: Vec::new(),
+        };
+        sys.refresh_row_hessian_fingerprint();
+        sys
     }
 
     /// Allocate a heterogeneous-row system using a caller-owned dense

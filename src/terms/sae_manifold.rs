@@ -75,6 +75,11 @@ const SAE_MANIFOLD_INNER_STEP_REL_TOL: f64 = 1.0e-4;
 /// accepting inner-solve convergence.
 const SAE_MANIFOLD_INNER_GRAD_REL_TOL: f64 = 1.0e-5;
 
+/// Above this full-`B` β width, dense beta-penalty curvature is never
+/// materialized when Grassmann frames are engaged; exact curvature is probed
+/// directly in the factored coordinate space instead.
+const SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM: usize = 4096;
+
 /// Relative spectral cutoff for counting the numerical rank / nullity of a
 /// symmetric penalty Gram: eigenvalues at or below `cutoff · λ_max` are treated
 /// as zero. Shared by [`SaeManifoldTerm::symmetric_rank`] and
@@ -93,6 +98,22 @@ const SAE_MANIFOLD_ROW_RIDGE_GROWTH: f64 = 10.0;
 /// Maximum number of LM ridge-escalation attempts before declaring the per-row
 /// Hessian unfactorable.
 const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SaeBetaPenaltyAssembly {
+    dense_written: bool,
+    deferred_factored: bool,
+}
+
+impl SaeBetaPenaltyAssembly {
+    fn record_curvature(&mut self, dense_beta_curvature: bool) {
+        if dense_beta_curvature {
+            self.dense_written = true;
+        } else {
+            self.deferred_factored = true;
+        }
+    }
+}
 
 /// #976 Layer-1 guard: cap on one accepted iteration's assignment-logit
 /// update, in units of the gate temperature τ (the gate's natural length
@@ -5541,6 +5562,23 @@ impl SaeManifoldTerm {
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
         penalty_scale: f64,
     ) -> Result<ArrowSchurSystem, String> {
+        self.assemble_arrow_schur_scaled_with_beta_penalty_probe_threshold(
+            target,
+            rho,
+            analytic_penalties,
+            penalty_scale,
+            SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM,
+        )
+    }
+
+    fn assemble_arrow_schur_scaled_with_beta_penalty_probe_threshold(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        penalty_scale: f64,
+        dense_beta_penalty_probe_max_dim: usize,
+    ) -> Result<ArrowSchurSystem, String> {
         if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::assemble_arrow_schur_scaled: penalty_scale must be finite and positive; got {penalty_scale}"
@@ -5716,27 +5754,6 @@ impl SaeManifoldTerm {
                 }
             }
         };
-        // Build the Arrow-Schur system: heterogeneous row dims when a compact
-        // layout is active, uniform `q` otherwise.
-        let hbb_workspace = self.take_border_hbb_workspace(beta_dim);
-        let mut sys = if let Some(ref layout) = row_layout {
-            let per_row_dims: Vec<usize> = (0..n).map(|row| layout.row_q_active(row)).collect();
-            ArrowSchurSystem::new_with_per_row_dims_and_hbb(per_row_dims, beta_dim, hbb_workspace)
-        } else {
-            ArrowSchurSystem::new_with_hbb(n, q, beta_dim, hbb_workspace)
-        };
-        // Apply accumulated smoothness-penalty gradients into sys.gb.
-        for (i, g) in smooth_grad_gb.iter().enumerate() {
-            sys.gb[i] += g;
-        }
-        // Hoist per-row temporaries outside the row loop: these allocations
-        // previously fired N times per assembly, and each `decoded_row` /
-        // `decoded_derivative_row` call inside the loop allocated its own
-        // `Array1<f64>` of length p.
-        let mut decoded = Array2::<f64>::zeros((k_atoms, p));
-        let mut dg_buf = vec![0.0_f64; p];
-        let mut fitted = Array1::<f64>::zeros(p);
-        let mut error = Array1::<f64>::zeros(p);
         // #974 likelihood-whitening seam. The single per-row decision: when the
         // installed `RowMetric` is a genuinely estimated noise model
         // (`whitens_likelihood()` — only `WhitenedStructured`), the
@@ -5763,6 +5780,41 @@ impl SaeManifoldTerm {
         // cleanly. When `frames_engaged` is false, EVERY β-tier object below is
         // assembled bit-for-bit as the historical full-`B` path.
         let frames_engaged = self.any_frame_active() && !whitens_likelihood;
+        let dense_beta_curvature = !(frames_engaged && beta_dim > dense_beta_penalty_probe_max_dim);
+        // Build the Arrow-Schur system: heterogeneous row dims when a compact
+        // layout is active, uniform `q` otherwise.
+        let mut sys = if let Some(ref layout) = row_layout {
+            let per_row_dims: Vec<usize> = (0..n).map(|row| layout.row_q_active(row)).collect();
+            if dense_beta_curvature {
+                let hbb_workspace = self.take_border_hbb_workspace(beta_dim);
+                ArrowSchurSystem::new_with_per_row_dims_and_hbb(
+                    per_row_dims,
+                    beta_dim,
+                    hbb_workspace,
+                )
+            } else {
+                self.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
+                ArrowSchurSystem::new_with_per_row_dims_empty_hbb(per_row_dims, beta_dim)
+            }
+        } else if dense_beta_curvature {
+            let hbb_workspace = self.take_border_hbb_workspace(beta_dim);
+            ArrowSchurSystem::new_with_hbb(n, q, beta_dim, hbb_workspace)
+        } else {
+            self.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
+            ArrowSchurSystem::new_with_empty_hbb(n, q, beta_dim)
+        };
+        // Apply accumulated smoothness-penalty gradients into sys.gb.
+        for (i, g) in smooth_grad_gb.iter().enumerate() {
+            sys.gb[i] += g;
+        }
+        // Hoist per-row temporaries outside the row loop: these allocations
+        // previously fired N times per assembly, and each `decoded_row` /
+        // `decoded_derivative_row` call inside the loop allocated its own
+        // `Array1<f64>` of length p.
+        let mut decoded = Array2::<f64>::zeros((k_atoms, p));
+        let mut dg_buf = vec![0.0_f64; p];
+        let mut fitted = Array1::<f64>::zeros(p);
+        let mut error = Array1::<f64>::zeros(p);
         // `w_dim` is the whitened output dimension: `rank` of the metric factor
         // when whitening, else `p` (identity). `error_white` is the whitened
         // residual `U_nᵀ r_n ∈ ℝ^{w_dim}` whose squared norm is `r_nᵀ M_n r_n`,
@@ -6419,7 +6471,7 @@ impl SaeManifoldTerm {
                 },
             );
         }
-        let mut beta_penalty_written = false;
+        let mut beta_penalty_assembly = SaeBetaPenaltyAssembly::default();
         if let Some(registry) = analytic_penalties {
             // Upfront validation: refuse penalty kinds the SAE row layout
             // cannot host, and refuse mixed-d row-block configurations.
@@ -6427,12 +6479,13 @@ impl SaeManifoldTerm {
             // "unsupported penalty" fallthrough, no K-gating.
             self.validate_analytic_penalty_registry(registry)
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
-            beta_penalty_written = self
+            beta_penalty_assembly = self
                 .add_sae_analytic_penalty_contributions(
                     &mut sys,
                     registry,
                     penalty_scale,
                     row_layout.as_ref(),
+                    dense_beta_curvature,
                 )
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         }
@@ -6520,9 +6573,23 @@ impl SaeManifoldTerm {
             // `Φᵀ hbb Φ` into the factored space. Only present when a Beta-tier
             // penalty actually wrote `hbb` (else `hbb` is all-zero and the dense
             // `(border_dim)²` op is skipped entirely, exactly as full-`B`).
-            if beta_penalty_written {
+            if beta_penalty_assembly.dense_written {
                 let hbb_c = self.project_dense_penalty_to_factored(
                     sys.hbb.view(),
+                    &beta_offsets,
+                    &off_c,
+                    &basis_sizes,
+                    &ranks,
+                    &frames,
+                    border_dim,
+                );
+                ops.push(Arc::new(DensePenaltyOp(hbb_c)));
+            } else if beta_penalty_assembly.deferred_factored {
+                let registry =
+                    analytic_penalties.expect("deferred beta curvature requires registry");
+                let hbb_c = self.build_factored_beta_penalty_curvature(
+                    registry,
+                    penalty_scale,
                     &beta_offsets,
                     &off_c,
                     &basis_sizes,
@@ -6592,7 +6659,7 @@ impl SaeManifoldTerm {
                 k: beta_dim,
                 blocks: g_sparse_blocks,
             }));
-            if beta_penalty_written {
+            if beta_penalty_assembly.dense_written {
                 ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
             }
             sys.set_penalty_op(Arc::new(CompositePenaltyOp { k: beta_dim, ops }));
@@ -6679,6 +6746,330 @@ impl SaeManifoldTerm {
             }
         }
         out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_factored_beta_penalty_curvature(
+        &self,
+        registry: &AnalyticPenaltyRegistry,
+        penalty_scale: f64,
+        beta_offsets: &[usize],
+        off_c: &[usize],
+        basis_sizes: &[usize],
+        ranks: &[usize],
+        frames: &[Array2<f64>],
+        border_dim: usize,
+    ) -> Array2<f64> {
+        let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
+        let layout = registry.rho_layout();
+        let target_beta = self.flatten_beta();
+        let mut hbb_c = Array2::<f64>::zeros((border_dim, border_dim));
+        for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
+            if matches!(penalty, AnalyticPenaltyKind::Ard(_)) {
+                continue;
+            }
+            let rho_local = rho_global.slice(s![rho_slice.clone()]);
+            match tier {
+                PenaltyTier::Psi if matches!(penalty, AnalyticPenaltyKind::NuclearNorm(_)) => {
+                    self.add_factored_beta_penalty_curvature_for_penalty(
+                        &mut hbb_c,
+                        penalty,
+                        target_beta.view(),
+                        rho_local,
+                        penalty_scale,
+                        beta_offsets,
+                        off_c,
+                        basis_sizes,
+                        ranks,
+                        frames,
+                    );
+                }
+                PenaltyTier::Beta => {
+                    self.add_factored_beta_penalty_curvature_for_penalty(
+                        &mut hbb_c,
+                        penalty,
+                        target_beta.view(),
+                        rho_local,
+                        penalty_scale,
+                        beta_offsets,
+                        off_c,
+                        basis_sizes,
+                        ranks,
+                        frames,
+                    );
+                }
+                _ => {}
+            }
+        }
+        hbb_c
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_factored_beta_penalty_curvature_for_penalty(
+        &self,
+        hbb_c: &mut Array2<f64>,
+        penalty: &AnalyticPenaltyKind,
+        target_beta: ArrayView1<'_, f64>,
+        rho_local: ArrayView1<'_, f64>,
+        penalty_scale: f64,
+        beta_offsets: &[usize],
+        off_c: &[usize],
+        basis_sizes: &[usize],
+        ranks: &[usize],
+        frames: &[Array2<f64>],
+    ) {
+        let p = self.output_dim();
+        if let AnalyticPenaltyKind::DecoderIncoherence(base) = penalty {
+            let Some(per_fit) = self.live_decoder_incoherence_penalty(base) else {
+                return;
+            };
+            let beta_dim = self.beta_dim();
+            let mut probe = Array1::<f64>::zeros(beta_dim);
+            for k in 0..self.atoms.len() {
+                for basis_col in 0..basis_sizes[k] {
+                    for frame_col in 0..ranks[k] {
+                        probe.fill(0.0);
+                        self.fill_lifted_full_beta_probe(
+                            &mut probe,
+                            k,
+                            basis_col,
+                            frame_col,
+                            beta_offsets,
+                            frames,
+                        );
+                        let col = off_c[k] + basis_col * ranks[k] + frame_col;
+                        let hv = per_fit.psd_majorizer_hvp(target_beta, rho_local, probe.view());
+                        self.project_full_beta_hv_to_factored_column(
+                            hbb_c,
+                            col,
+                            hv.view(),
+                            beta_offsets,
+                            off_c,
+                            basis_sizes,
+                            ranks,
+                            frames,
+                            penalty_scale,
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        if let AnalyticPenaltyKind::MechanismSparsity(base) = penalty {
+            for (per_atom, start, end) in self.live_mechanism_sparsity_penalties(base) {
+                let atom_idx = beta_offsets
+                    .iter()
+                    .position(|&offset| offset == start)
+                    .expect("live mechanism-sparsity offset must match an SAE atom");
+                let block_len = end - start;
+                let mut local_penalty = per_atom.clone();
+                local_penalty.target = PsiSlice {
+                    range: 0..block_len,
+                    latent_dim: Some(basis_sizes[atom_idx]),
+                };
+                let block = target_beta.slice(s![start..end]);
+                let mut probe = Array1::<f64>::zeros(block_len);
+                for basis_col in 0..basis_sizes[atom_idx] {
+                    for frame_col in 0..ranks[atom_idx] {
+                        probe.fill(0.0);
+                        self.fill_lifted_local_beta_probe(
+                            &mut probe, atom_idx, basis_col, frame_col, frames,
+                        );
+                        let col = off_c[atom_idx] + basis_col * ranks[atom_idx] + frame_col;
+                        let hv = local_penalty.psd_majorizer_hvp(block, rho_local, probe.view());
+                        self.project_local_beta_hv_to_factored_column(
+                            hbb_c,
+                            col,
+                            atom_idx,
+                            hv.view(),
+                            off_c,
+                            basis_sizes,
+                            ranks,
+                            frames,
+                            penalty_scale,
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        if let AnalyticPenaltyKind::NuclearNorm(base) = penalty {
+            for (per_atom, start, end) in self.live_nuclear_norm_penalties(base) {
+                let atom_idx = beta_offsets
+                    .iter()
+                    .position(|&offset| offset == start)
+                    .expect("live nuclear-norm offset must match an SAE atom");
+                let block = target_beta.slice(s![start..end]);
+                let block_len = end - start;
+                let mut probe = Array1::<f64>::zeros(block_len);
+                for basis_col in 0..basis_sizes[atom_idx] {
+                    for frame_col in 0..ranks[atom_idx] {
+                        probe.fill(0.0);
+                        self.fill_lifted_local_beta_probe(
+                            &mut probe, atom_idx, basis_col, frame_col, frames,
+                        );
+                        let col = off_c[atom_idx] + basis_col * ranks[atom_idx] + frame_col;
+                        let hv = per_atom.psd_majorizer_hvp(block, rho_local, probe.view());
+                        self.project_local_beta_hv_to_factored_column(
+                            hbb_c,
+                            col,
+                            atom_idx,
+                            hv.view(),
+                            off_c,
+                            basis_sizes,
+                            ranks,
+                            frames,
+                            penalty_scale,
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        let beta_dim = self.beta_dim();
+        let mut probe = Array1::<f64>::zeros(beta_dim);
+        for k in 0..self.atoms.len() {
+            for basis_col in 0..basis_sizes[k] {
+                for frame_col in 0..ranks[k] {
+                    probe.fill(0.0);
+                    self.fill_lifted_full_beta_probe(
+                        &mut probe,
+                        k,
+                        basis_col,
+                        frame_col,
+                        beta_offsets,
+                        frames,
+                    );
+                    let col = off_c[k] + basis_col * ranks[k] + frame_col;
+                    let hv = penalty.psd_majorizer_hvp(target_beta, rho_local, probe.view());
+                    self.project_full_beta_hv_to_factored_column(
+                        hbb_c,
+                        col,
+                        hv.view(),
+                        beta_offsets,
+                        off_c,
+                        basis_sizes,
+                        ranks,
+                        frames,
+                        penalty_scale,
+                    );
+                }
+            }
+        }
+        debug_assert_eq!(p, self.output_dim());
+    }
+
+    fn fill_lifted_local_beta_probe(
+        &self,
+        probe: &mut Array1<f64>,
+        atom_idx: usize,
+        basis_col: usize,
+        frame_col: usize,
+        frames: &[Array2<f64>],
+    ) {
+        let p = self.output_dim();
+        let base = basis_col * p;
+        if self.atoms[atom_idx].decoder_frame.is_none() {
+            probe[base + frame_col] = 1.0;
+        } else {
+            let uk = &frames[atom_idx];
+            for out_col in 0..p {
+                probe[base + out_col] = uk[[out_col, frame_col]];
+            }
+        }
+    }
+
+    fn fill_lifted_full_beta_probe(
+        &self,
+        probe: &mut Array1<f64>,
+        atom_idx: usize,
+        basis_col: usize,
+        frame_col: usize,
+        beta_offsets: &[usize],
+        frames: &[Array2<f64>],
+    ) {
+        let p = self.output_dim();
+        let base = beta_offsets[atom_idx] + basis_col * p;
+        if self.atoms[atom_idx].decoder_frame.is_none() {
+            probe[base + frame_col] = 1.0;
+        } else {
+            let uk = &frames[atom_idx];
+            for out_col in 0..p {
+                probe[base + out_col] = uk[[out_col, frame_col]];
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_local_beta_hv_to_factored_column(
+        &self,
+        hbb_c: &mut Array2<f64>,
+        col: usize,
+        atom_idx: usize,
+        hv: ArrayView1<'_, f64>,
+        off_c: &[usize],
+        basis_sizes: &[usize],
+        ranks: &[usize],
+        frames: &[Array2<f64>],
+        penalty_scale: f64,
+    ) {
+        let p = self.output_dim();
+        let r = ranks[atom_idx];
+        for basis_row in 0..basis_sizes[atom_idx] {
+            let base_hv = basis_row * p;
+            let base_c = off_c[atom_idx] + basis_row * r;
+            if self.atoms[atom_idx].decoder_frame.is_none() {
+                for frame_row in 0..r {
+                    hbb_c[[base_c + frame_row, col]] += penalty_scale * hv[base_hv + frame_row];
+                }
+            } else {
+                let uk = &frames[atom_idx];
+                for frame_row in 0..r {
+                    let mut acc = 0.0_f64;
+                    for out_col in 0..p {
+                        acc += uk[[out_col, frame_row]] * hv[base_hv + out_col];
+                    }
+                    hbb_c[[base_c + frame_row, col]] += penalty_scale * acc;
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_full_beta_hv_to_factored_column(
+        &self,
+        hbb_c: &mut Array2<f64>,
+        col: usize,
+        hv: ArrayView1<'_, f64>,
+        beta_offsets: &[usize],
+        off_c: &[usize],
+        basis_sizes: &[usize],
+        ranks: &[usize],
+        frames: &[Array2<f64>],
+        penalty_scale: f64,
+    ) {
+        let p = self.output_dim();
+        for atom_idx in 0..self.atoms.len() {
+            let r = ranks[atom_idx];
+            for basis_row in 0..basis_sizes[atom_idx] {
+                let base_hv = beta_offsets[atom_idx] + basis_row * p;
+                let base_c = off_c[atom_idx] + basis_row * r;
+                if self.atoms[atom_idx].decoder_frame.is_none() {
+                    for frame_row in 0..r {
+                        hbb_c[[base_c + frame_row, col]] += penalty_scale * hv[base_hv + frame_row];
+                    }
+                } else {
+                    let uk = &frames[atom_idx];
+                    for frame_row in 0..r {
+                        let mut acc = 0.0_f64;
+                        for out_col in 0..p {
+                            acc += uk[[out_col, frame_row]] * hv[base_hv + out_col];
+                        }
+                        hbb_c[[base_c + frame_row, col]] += penalty_scale * acc;
+                    }
+                }
+            }
+        }
     }
 
     fn ext_coord_matrix(&self) -> Array2<f64> {
@@ -7995,22 +8386,21 @@ impl SaeManifoldTerm {
         Ok(SaeShapeUncertainty { dispersion, atoms })
     }
 
-    /// Returns `true` when a Beta-tier analytic penalty was accumulated into
-    /// the dense `sys.hbb` block (so the caller knows to wrap it in a
-    /// `DensePenaltyOp`); `false` leaves `sys.hbb` all-zero and lets the
-    /// caller skip the dense `(K·p)²` operator entirely.
+    /// Returns whether Beta-tier analytic curvature was accumulated into the
+    /// dense `sys.hbb` block or deferred for exact factored-space probing.
     fn add_sae_analytic_penalty_contributions(
         &self,
         sys: &mut ArrowSchurSystem,
         registry: &AnalyticPenaltyRegistry,
         penalty_scale: f64,
         row_layout: Option<&SaeRowLayout>,
-    ) -> Result<bool, ArrowSchurError> {
+        dense_beta_curvature: bool,
+    ) -> Result<SaeBetaPenaltyAssembly, ArrowSchurError> {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
         let layout = registry.rho_layout();
         let logits_flat = flat_logits(self.assignment.logits.view());
         let beta = self.flatten_beta();
-        let mut beta_penalty_written = false;
+        let mut beta_assembly = SaeBetaPenaltyAssembly::default();
         for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(layout.iter()) {
             let rho_local = rho_global.slice(s![rho_slice.clone()]);
             // The coordinate ARD prior is owned by the built-in `ArdAxisPrior`
@@ -8051,14 +8441,16 @@ impl SaeManifoldTerm {
                         // atom's decoder (β) matrix singular spectrum, not the
                         // coord "t" row block. Route it to the β tier so it
                         // shrinks each atom's embedding rank.
-                        self.add_sae_beta_penalty(
+                        if self.add_sae_beta_penalty(
                             sys,
                             penalty,
                             beta.view(),
                             rho_local,
                             penalty_scale,
-                        );
-                        beta_penalty_written = true;
+                            dense_beta_curvature,
+                        ) {
+                            beta_assembly.record_curvature(dense_beta_curvature);
+                        }
                     } else {
                         // Every other Psi-tier penalty here is row-block
                         // supported with a coord-shape that matches each
@@ -8104,9 +8496,14 @@ impl SaeManifoldTerm {
                                 // isometry energy, which moves with B).
                                 if let AnalyticPenaltyKind::Isometry(corrected) = &corrected_kind {
                                     self.add_sae_isometry_beta_penalty(
-                                        sys, atom_idx, coord, corrected, rho_local,
+                                        sys,
+                                        atom_idx,
+                                        coord,
+                                        corrected,
+                                        rho_local,
+                                        dense_beta_curvature,
                                     );
-                                    beta_penalty_written = true;
+                                    beta_assembly.record_curvature(dense_beta_curvature);
                                 }
                             } else {
                                 self.add_sae_coord_penalty(
@@ -8119,13 +8516,21 @@ impl SaeManifoldTerm {
                 PenaltyTier::Beta => {
                     // β-tier analytic penalties are global (B-only); minibatch-
                     // scaled so per-chunk sums reconstruct one global copy.
-                    self.add_sae_beta_penalty(sys, penalty, beta.view(), rho_local, penalty_scale);
-                    beta_penalty_written = true;
+                    if self.add_sae_beta_penalty(
+                        sys,
+                        penalty,
+                        beta.view(),
+                        rho_local,
+                        penalty_scale,
+                        dense_beta_curvature,
+                    ) {
+                        beta_assembly.record_curvature(dense_beta_curvature);
+                    }
                 }
                 PenaltyTier::Rho => {}
             }
         }
-        Ok(beta_penalty_written)
+        Ok(beta_assembly)
     }
 
     fn corrected_isometry_penalty(
@@ -8589,6 +8994,7 @@ impl SaeManifoldTerm {
         coord: &LatentCoordValues,
         corrected: &Arc<IsometryPenalty>,
         rho_local: ArrayView1<'_, f64>,
+        dense_beta_curvature: bool,
     ) {
         let atom = &self.atoms[atom_idx];
         let d = coord.latent_dim();
@@ -8611,6 +9017,9 @@ impl SaeManifoldTerm {
                 }
                 sys.gb[beta_off + basis_col * p + i] += acc;
             }
+        }
+        if !dense_beta_curvature {
+            return;
         }
         let Some(jac) = corrected.jacobian_cache() else {
             return;
@@ -8767,7 +9176,8 @@ impl SaeManifoldTerm {
         target_beta: ArrayView1<'_, f64>,
         rho_local: ArrayView1<'_, f64>,
         penalty_scale: f64,
-    ) {
+        dense_beta_curvature: bool,
+    ) -> bool {
         // MechanismSparsityPenalty is a group-lasso over a single
         // (latent_dim, p) decoder matrix and indexes its target via
         // `target.range.start + latent * p + feature`, treating its range as
@@ -8789,12 +9199,15 @@ impl SaeManifoldTerm {
         // gradient / PSD curvature are accumulated into the β-tier system.
         if let AnalyticPenaltyKind::DecoderIncoherence(base) = penalty {
             let Some(per_fit) = self.live_decoder_incoherence_penalty(base) else {
-                return;
+                return false;
             };
             let beta_dim = self.beta_dim();
             let grad = per_fit.grad_target(target_beta, rho_local);
             for j in 0..beta_dim {
                 sys.gb[j] += penalty_scale * grad[j];
+            }
+            if !dense_beta_curvature {
+                return true;
             }
             // `hbb` is the PSD Newton / PIRLS curvature block: probe the PSD
             // majorizer (the Gauss-Newton Hessian, which is already PSD here).
@@ -8807,11 +9220,12 @@ impl SaeManifoldTerm {
                     sys.hbb[[i, j]] += penalty_scale * hv[i];
                 }
             }
-            return;
+            return true;
         }
         if let AnalyticPenaltyKind::MechanismSparsity(base) = penalty {
+            let mut any = false;
             for (per_atom, start, end) in self.live_mechanism_sparsity_penalties(base) {
-                self.add_sae_mech_sparsity_atom(
+                any |= self.add_sae_mech_sparsity_atom(
                     sys,
                     &per_atom,
                     target_beta,
@@ -8819,9 +9233,10 @@ impl SaeManifoldTerm {
                     start,
                     end,
                     penalty_scale,
+                    dense_beta_curvature,
                 );
             }
-            return;
+            return any;
         }
         // NuclearNormPenalty is a smoothed sum of singular values of a single
         // (n_eff, latent_dim) matrix. The flat SAE β layout concatenates the
@@ -8830,8 +9245,9 @@ impl SaeManifoldTerm {
         // slice as an `M_k × p` matrix (`n_eff = M_k`, `latent_dim = p`). This
         // penalizes the embedding rank of each atom's decoder independently.
         if let AnalyticPenaltyKind::NuclearNorm(base) = penalty {
+            let mut any = false;
             for (per_atom, start, end) in self.live_nuclear_norm_penalties(base) {
-                self.add_sae_nuclear_norm_atom(
+                any |= self.add_sae_nuclear_norm_atom(
                     sys,
                     &per_atom,
                     target_beta,
@@ -8839,14 +9255,18 @@ impl SaeManifoldTerm {
                     start,
                     end,
                     penalty_scale,
+                    dense_beta_curvature,
                 );
             }
-            return;
+            return any;
         }
         let k = self.beta_dim();
         let grad = penalty.grad_target(target_beta, rho_local);
         for j in 0..k {
             sys.gb[j] += penalty_scale * grad[j];
+        }
+        if !dense_beta_curvature {
+            return true;
         }
         // `hbb` is the PSD Newton / PIRLS curvature block for the β tier:
         // accumulate the PSD majorizer (exact for convex penalties), not the
@@ -8855,7 +9275,7 @@ impl SaeManifoldTerm {
             for j in 0..k {
                 sys.hbb[[j, j]] += penalty_scale * diag[j];
             }
-            return;
+            return true;
         }
         let mut probe = Array1::<f64>::zeros(k);
         for j in 0..k {
@@ -8866,6 +9286,7 @@ impl SaeManifoldTerm {
                 sys.hbb[[i, j]] += penalty_scale * hv[i];
             }
         }
+        true
     }
 
     /// Accumulate one atom's MechanismSparsity contribution into `sys`. The
@@ -8884,10 +9305,14 @@ impl SaeManifoldTerm {
         start: usize,
         end: usize,
         penalty_scale: f64,
-    ) {
+        dense_beta_curvature: bool,
+    ) -> bool {
         let grad = per_atom.grad_target(target_beta, rho_local);
         for j in start..end {
             sys.gb[j] += penalty_scale * grad[j];
+        }
+        if !dense_beta_curvature {
+            return true;
         }
         let k = self.beta_dim();
         let mut probe = Array1::<f64>::zeros(k);
@@ -8904,6 +9329,7 @@ impl SaeManifoldTerm {
                 sys.hbb[[i, j]] += penalty_scale * hv[i];
             }
         }
+        true
     }
 
     /// Accumulate one atom's NuclearNorm contribution into `sys`. The
@@ -8926,12 +9352,16 @@ impl SaeManifoldTerm {
         start: usize,
         end: usize,
         penalty_scale: f64,
-    ) {
+        dense_beta_curvature: bool,
+    ) -> bool {
         let block = target_beta.slice(s![start..end]);
         let block_len = end - start;
         let grad = per_atom.grad_target(block, rho_local);
         for local in 0..block_len {
             sys.gb[start + local] += penalty_scale * grad[local];
+        }
+        if !dense_beta_curvature {
+            return true;
         }
         let mut probe = Array1::<f64>::zeros(block_len);
         for local in 0..block_len {
@@ -8942,6 +9372,7 @@ impl SaeManifoldTerm {
                 sys.hbb[[start + i, start + local]] += penalty_scale * hv[i];
             }
         }
+        true
     }
 
     pub fn solve_newton_step(
@@ -17042,6 +17473,160 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn factored_beta_penalty_probing_matches_projected_dense_curvature() {
+        let k_atoms = 2usize;
+        let m = 4usize;
+        let p = 24usize;
+        let r = 2usize;
+        let n_obs = 5usize;
+        let mut atoms = Vec::with_capacity(k_atoms);
+        let mut coord_blocks = Vec::with_capacity(k_atoms);
+        for atom_idx in 0..k_atoms {
+            let mut frame = Array2::<f64>::zeros((p, r));
+            frame[[atom_idx * r, 0]] = 1.0;
+            frame[[atom_idx * r + 1, 1]] = 1.0;
+            let mut coords = Array2::<f64>::zeros((n_obs, 1));
+            for row in 0..n_obs {
+                coords[[row, 0]] = row as f64;
+            }
+            let mut phi = Array2::<f64>::zeros((n_obs, m));
+            let mut jet = Array3::<f64>::zeros((n_obs, m, 1));
+            for row in 0..n_obs {
+                for basis_col in 0..m {
+                    let x = (row + 1) as f64 * (basis_col + 1) as f64;
+                    phi[[row, basis_col]] = 0.05 * x + if row == basis_col { 1.0 } else { 0.0 };
+                    jet[[row, basis_col, 0]] = 0.01 * x;
+                }
+            }
+            let mut c = Array2::<f64>::zeros((m, r));
+            for basis_col in 0..m {
+                c[[basis_col, 0]] = 0.3 + 0.07 * (basis_col + atom_idx) as f64;
+                c[[basis_col, 1]] = -0.2 + 0.05 * (basis_col * 2 + atom_idx) as f64;
+            }
+            let decoder = fast_abt(&c, &frame);
+            let mut atom = SaeManifoldAtom::new(
+                "factored_probe",
+                SaeAtomBasisKind::EuclideanPatch,
+                1,
+                phi,
+                jet,
+                decoder,
+                Array2::<f64>::eye(m),
+            )
+            .unwrap();
+            atom.maybe_activate_decoder_frame()
+                .expect("frame activation")
+                .expect("rank-2 atom should activate a frame");
+            atoms.push(atom);
+            coord_blocks.push(coords);
+        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::from_elem((n_obs, k_atoms), 0.25),
+            coord_blocks,
+            vec![LatentManifold::Euclidean, LatentManifold::Euclidean],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        assert!(term.frames_active());
+        assert_eq!(term.factored_border_dim(), k_atoms * m * r);
+
+        let beta_len = term.beta_dim();
+        let mut registry = AnalyticPenaltyRegistry::new();
+        let nuclear = NuclearNormPenalty::new(
+            PsiSlice {
+                range: 0..beta_len,
+                latent_dim: Some(beta_len / p),
+            },
+            0.7,
+            p,
+            1.0e-4,
+            None,
+            false,
+        )
+        .unwrap();
+        registry.push(AnalyticPenaltyKind::NuclearNorm(Arc::new(nuclear)));
+        let incoherence = DecoderIncoherencePenalty::new(
+            PsiSlice {
+                range: 0..beta_len,
+                latent_dim: Some(beta_len / p),
+            },
+            vec![m, m],
+            p,
+            Array2::<f64>::from_elem((k_atoms, k_atoms), 0.5),
+            0.6,
+            false,
+        )
+        .unwrap();
+        registry.push(AnalyticPenaltyKind::DecoderIncoherence(Arc::new(
+            incoherence,
+        )));
+
+        let mut dense_sys = ArrowSchurSystem::new(0, 0, beta_len);
+        let dense_assembly = term
+            .add_sae_analytic_penalty_contributions(&mut dense_sys, &registry, 1.0, None, true)
+            .unwrap();
+        assert!(dense_assembly.dense_written);
+        assert!(!dense_assembly.deferred_factored);
+
+        let beta_offsets = term.beta_offsets();
+        let off_c = term.factored_beta_offsets();
+        let basis_sizes: Vec<usize> = term.atoms.iter().map(|atom| atom.basis_size()).collect();
+        let ranks: Vec<usize> = term
+            .atoms
+            .iter()
+            .map(|atom| atom.border_frame_rank())
+            .collect();
+        let frames: Vec<Array2<f64>> = (0..term.atoms.len())
+            .map(|atom_idx| term.frame_output_matrix(atom_idx))
+            .collect();
+        let border_dim = term.factored_border_dim();
+        let projected = term.project_dense_penalty_to_factored(
+            dense_sys.hbb.view(),
+            &beta_offsets,
+            &off_c,
+            &basis_sizes,
+            &ranks,
+            &frames,
+            border_dim,
+        );
+        let direct = term.build_factored_beta_penalty_curvature(
+            &registry,
+            1.0,
+            &beta_offsets,
+            &off_c,
+            &basis_sizes,
+            &ranks,
+            &frames,
+            border_dim,
+        );
+        for row in 0..border_dim {
+            for col in 0..border_dim {
+                assert_abs_diff_eq!(direct[[row, col]], projected[[row, col]], epsilon = 1.0e-10);
+            }
+        }
+
+        let mut deferred_term = term.clone();
+        let rho = SaeManifoldRho::new(
+            0.0,
+            -20.0,
+            vec![Array1::<f64>::zeros(1), Array1::<f64>::zeros(1)],
+        );
+        let target = Array2::<f64>::zeros((n_obs, p));
+        let sys = deferred_term
+            .assemble_arrow_schur_scaled_with_beta_penalty_probe_threshold(
+                target.view(),
+                &rho,
+                Some(&registry),
+                1.0,
+                1,
+            )
+            .unwrap();
+        assert_eq!(sys.k, border_dim);
+        assert!(sys.hbb.is_empty());
     }
 
     /// A full-rank small-`p` decoder must NOT activate a frame: the factored
