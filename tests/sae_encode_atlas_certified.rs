@@ -22,9 +22,11 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
 
-use gam::terms::sae_candidate_index::{IndexConfig, RandomProjectionFrameSketch, SaeCandidateIndex};
+use gam::terms::sae_candidate_index::{
+    IndexConfig, RandomProjectionFrameSketch, SaeCandidateIndex,
+};
 use gam::terms::sae_encode_atlas::{
-    row_certificate, AtlasConfig, EncodeAtlas, KANTOROVICH_THRESHOLD,
+    AtlasConfig, EncodeAtlas, KANTOROVICH_THRESHOLD, row_certificate,
 };
 use gam::terms::sae_manifold::{
     PeriodicHarmonicEvaluator, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
@@ -344,8 +346,8 @@ fn lsh_routed_encode_matches_direct_atom_encode() {
     // decoder block is p×r = 2×2 (the planted circle spans R²); routing returns
     // atom 0 for every direction.
     let frame = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap();
-    let sketch = RandomProjectionFrameSketch::from_decoder_blocks(&[frame], 8, 7)
-        .expect("sketch build");
+    let sketch =
+        RandomProjectionFrameSketch::from_decoder_blocks(&[frame], 8, 7).expect("sketch build");
     let index = SaeCandidateIndex::build(&sketch, IndexConfig::auto(8, 1, 7)).expect("index build");
 
     let n = 64usize;

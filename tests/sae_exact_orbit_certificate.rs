@@ -319,9 +319,12 @@ fn pin_active_orbit_operator_from_second_jet_is_conservative() {
     let (quad_atom, quad_view) = patch_view(true);
     let quad_pin = isometry_orbit_penalty_operator(&quad_view, 1.0)
         .expect("quadratic patch carries Φ'' ⇒ an isometry operator must lower");
-    let report_quad =
-        residual_gauge_exact(&single_atom_model(quad_atom), &[Some(quad_view)], &[Some(quad_pin)])
-            .expect("pin-active quadratic certificate");
+    let report_quad = residual_gauge_exact(
+        &single_atom_model(quad_atom),
+        &[Some(quad_view)],
+        &[Some(quad_pin)],
+    )
+    .expect("pin-active quadratic certificate");
     let rot = exact_isom_verdict(&report_quad);
     assert!(
         !rot.unpinned,

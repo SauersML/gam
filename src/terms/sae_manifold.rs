@@ -4758,10 +4758,7 @@ pub fn dictionary_incoherence_report_with_dispersion(
     // second-fundamental-form norm (the worst graph-approximation error across
     // the dictionary). The support activity floor `min_k max_i a_ik` is the
     // honest "how reliably does the weakest atom fire" statistic.
-    let kappa_max = per_atom_kappa_hat
-        .iter()
-        .copied()
-        .fold(0.0_f64, f64::max);
+    let kappa_max = per_atom_kappa_hat.iter().copied().fold(0.0_f64, f64::max);
     let global_optimality = curved_dictionary_global_optimality_verdict(
         mu_hat,
         kappa_max,
@@ -5305,19 +5302,19 @@ impl SaeManifoldTerm {
         // error. Magic-by-default either way: the choice is derived from the fit,
         // never a flag.
         let views = self.atom_parameter_views();
-        let ops: Vec<Option<crate::sae_identifiability::OrbitPenaltyOperator>> = if isometry_pin_active
-        {
-            views
-                .iter()
-                .map(|view| {
-                    view.as_ref().and_then(|v| {
-                        crate::sae_identifiability::isometry_orbit_penalty_operator(v, 1.0)
+        let ops: Vec<Option<crate::sae_identifiability::OrbitPenaltyOperator>> =
+            if isometry_pin_active {
+                views
+                    .iter()
+                    .map(|view| {
+                        view.as_ref().and_then(|v| {
+                            crate::sae_identifiability::isometry_orbit_penalty_operator(v, 1.0)
+                        })
                     })
-                })
-                .collect()
-        } else {
-            (0..self.k_atoms()).map(|_| None).collect()
-        };
+                    .collect()
+            } else {
+                (0..self.k_atoms()).map(|_| None).collect()
+            };
         let residual_gauge = if isometry_pin_active {
             // The pin-active path consumes the per-row Jacobian curvature
             // directly (the certificate_model retains it under a pin), so route
@@ -10141,8 +10138,9 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
         )?;
-        let log_det = arrow_log_det_from_cache(&cache)
-            .ok_or_else(|| "criterion_as_atoms: arrow_log_det_from_cache returned None".to_string())?;
+        let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
+            "criterion_as_atoms: arrow_log_det_from_cache returned None".to_string()
+        })?;
         let occam = self.reml_occam_term(rho)?;
         let extra_penalty_energy = match registry {
             Some(reg) => self
@@ -13606,7 +13604,8 @@ impl SaeManifoldOuterObjective {
                 && dg_beta.len() == last_cache.k
             {
                 let w_t = Array1::<f64>::zeros(last_cache.delta_t_len());
-                if let Ok((_u_t, u_beta)) = last_cache.full_inverse_apply(w_t.view(), dg_beta.view())
+                if let Ok((_u_t, u_beta)) =
+                    last_cache.full_inverse_apply(w_t.view(), dg_beta.view())
                 {
                     let mut beta = self.term.flatten_beta();
                     if beta.len() == u_beta.len() {
@@ -14992,9 +14991,10 @@ fn ibp_assignment_third_channels(
         penalty.weight = rho.lambda_sparse();
         Array1::zeros(0)
     };
-    Ok(Some(
-        penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view()),
-    ))
+    Ok(Some(penalty.hessian_diag_logit_third_channels(
+        target.view(),
+        rho_view.view(),
+    )))
 }
 
 fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {

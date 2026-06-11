@@ -155,10 +155,7 @@ impl Gauge {
     /// Block-upper-triangular section from per-block `V_b` plus
     /// cross-block residualisation stacks `R_{a→b}` — see
     /// [`assemble_block_triangular_t`] for the packing convention.
-    pub fn from_v_and_r(
-        v_per_term: &[Array2<f64>],
-        r_per_term: &[Option<Array2<f64>>],
-    ) -> Self {
+    pub fn from_v_and_r(v_per_term: &[Array2<f64>], r_per_term: &[Option<Array2<f64>>]) -> Self {
         let raw_widths: Vec<usize> = v_per_term.iter().map(|v| v.nrows()).collect();
         let reduced_widths: Vec<usize> = v_per_term.iter().map(|v| v.ncols()).collect();
         Self {
@@ -514,7 +511,10 @@ mod tests {
         let lifted = gauge.lift_covariance(&cov);
         assert_eq!(lifted.dim(), (4, 4));
         assert!((lifted[[0, 0]] - 1.0).abs() < 1e-14);
-        assert!((lifted[[1, 1]] - 0.0).abs() < 1e-14, "dropped raw row has zero variance");
+        assert!(
+            (lifted[[1, 1]] - 0.0).abs() < 1e-14,
+            "dropped raw row has zero variance"
+        );
         assert!((lifted[[2, 2]] - 1.0).abs() < 1e-14);
         assert!((lifted[[3, 3]] - 1.0).abs() < 1e-14);
         assert!((lifted[[2, 3]] - 0.25).abs() < 1e-14);

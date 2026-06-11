@@ -440,7 +440,10 @@ mod tests {
     #[test]
     fn profile_ci_interior_minimum() {
         let v = |g: f64| 100.0 + 50.0 * (g - 0.6).powi(2);
-        let grid: Vec<(f64, f64)> = (0..=100).map(|k| k as f64 / 100.0).map(|g| (g, v(g))).collect();
+        let grid: Vec<(f64, f64)> = (0..=100)
+            .map(|k| k as f64 / 100.0)
+            .map(|g| (g, v(g)))
+            .collect();
         let ci = profile_ci_from_grid(&grid, 0.95).unwrap();
         assert!((ci.gamma_hat - 0.6).abs() < 0.02, "γ̂ {}", ci.gamma_hat);
         assert!(!ci.ci_includes_circle, "CI hi {}", ci.ci_hi);
@@ -456,7 +459,10 @@ mod tests {
     #[test]
     fn profile_ci_includes_circle_at_boundary() {
         let v = |g: f64| 10.0 + 30.0 * (g - 1.05).powi(2); // min pushed past 1
-        let grid: Vec<(f64, f64)> = (0..=100).map(|k| k as f64 / 100.0).map(|g| (g, v(g))).collect();
+        let grid: Vec<(f64, f64)> = (0..=100)
+            .map(|k| k as f64 / 100.0)
+            .map(|g| (g, v(g)))
+            .collect();
         let ci = profile_ci_from_grid(&grid, 0.95).unwrap();
         assert!(ci.ci_includes_circle);
         assert!(!ci.singular_boundary);
@@ -467,7 +473,10 @@ mod tests {
     #[test]
     fn profile_flags_singular_boundary() {
         let v = |g: f64| 10.0 + 20.0 * g; // monotone increasing ⇒ min at 0, interior worse
-        let grid: Vec<(f64, f64)> = (0..=100).map(|k| k as f64 / 100.0).map(|g| (g, v(g))).collect();
+        let grid: Vec<(f64, f64)> = (0..=100)
+            .map(|k| k as f64 / 100.0)
+            .map(|g| (g, v(g)))
+            .collect();
         let ci = profile_ci_from_grid(&grid, 0.95).unwrap();
         assert!((ci.gamma_hat).abs() < 1e-9);
         assert!(ci.singular_boundary);

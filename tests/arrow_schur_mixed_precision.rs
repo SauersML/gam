@@ -59,7 +59,11 @@ fn dense_arrow_system(sys: &ArrowSchurSystem) -> (Array2<f64>, Array1<f64>) {
 /// Relative backward error `‖b − Hx‖∞ / (‖H‖∞‖x‖∞ + ‖b‖∞)` — the quantity the
 /// certified mixed-precision path drives below its tolerance. Stacks the row
 /// deltas and the β delta into the solver's variable order before measuring.
-fn arrow_backward_error(sys: &ArrowSchurSystem, delta_t: &Array1<f64>, delta_beta: &Array1<f64>) -> f64 {
+fn arrow_backward_error(
+    sys: &ArrowSchurSystem,
+    delta_t: &Array1<f64>,
+    delta_beta: &Array1<f64>,
+) -> f64 {
     let (h, b) = dense_arrow_system(sys);
     let mut x = Array1::<f64>::zeros(6);
     for i in 0..4 {
@@ -74,7 +78,11 @@ fn arrow_backward_error(sys: &ArrowSchurSystem, delta_t: &Array1<f64>, delta_bet
         .map(|i| (0..6).map(|j| h[[i, j]].abs()).sum::<f64>())
         .fold(0.0_f64, f64::max);
     let denom = h_inf * inf(&x) + inf(&b);
-    if denom > 0.0 { inf(&r) / denom } else { inf(&r) }
+    if denom > 0.0 {
+        inf(&r) / denom
+    } else {
+        inf(&r)
+    }
 }
 
 #[test]

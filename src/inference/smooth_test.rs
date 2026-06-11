@@ -148,9 +148,10 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
             // distribution. Rescale the statistic by `c` and re-reference; this
             // recovers the nominal mean to second order at finite n. Reported
             // alongside, never replacing, the first-order p-value.
-            if let Some(c) =
-                crate::inference::higher_order::gaussian_linear_bartlett_factor(ref_df, input.residual_df)
-            {
+            if let Some(c) = crate::inference::higher_order::gaussian_linear_bartlett_factor(
+                ref_df,
+                input.residual_df,
+            ) {
                 let f_corrected = f_stat / c;
                 let p_corr = (1.0 - dist.cdf(f_corrected)).clamp(0.0, 1.0);
                 if p_corr.is_finite() {

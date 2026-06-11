@@ -61,7 +61,9 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::linalg::faer_ndarray::FaerEigh;
-use crate::terms::sae_candidate_index::{auto_candidate_budget, AtomFrameSketch, SaeCandidateIndex};
+use crate::terms::sae_candidate_index::{
+    AtomFrameSketch, SaeCandidateIndex, auto_candidate_budget,
+};
 use crate::terms::sae_manifold::{
     AffineCoordinateEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
     PeriodicHarmonicEvaluator, SaeBasisEvaluator, SaeManifoldAtom, SphereChartEvaluator,
@@ -336,14 +338,20 @@ impl BasisHessianLipschitz for DuchonCoordinateEvaluator {
     }
     fn hessian_sup(&self, chart: &ChartRegion) -> f64 {
         let r_max = chart.radial_r_max.unwrap_or(chart.radius);
-        let r_min = chart.exclusion_r_min.unwrap_or(chart.radius).max(f64::MIN_POSITIVE);
+        let r_min = chart
+            .exclusion_r_min
+            .unwrap_or(chart.radius)
+            .max(f64::MIN_POSITIVE);
         let kernel = 6.0 * r_max + 3.0 * r_max * r_max / r_min;
         let poly = duchon_poly_jet_sup(self.centers.ncols(), self.order_degree(), chart, 2);
         kernel.max(poly)
     }
     fn third_sup(&self, chart: &ChartRegion) -> f64 {
         let r_max = chart.radial_r_max.unwrap_or(chart.radius);
-        let r_min = chart.exclusion_r_min.unwrap_or(chart.radius).max(f64::MIN_POSITIVE);
+        let r_min = chart
+            .exclusion_r_min
+            .unwrap_or(chart.radius)
+            .max(f64::MIN_POSITIVE);
         let kernel = 6.0 + 18.0 * r_max / r_min + 9.0 * r_max * r_max / (r_min * r_min);
         let poly = duchon_poly_jet_sup(self.centers.ncols(), self.order_degree(), chart, 3);
         kernel.max(poly)
@@ -368,7 +376,12 @@ impl DuchonOrderDegree for DuchonCoordinateEvaluator {
 
 /// Per-column `g`-th jet sup of the Duchon polynomial nullspace block, treated
 /// as a monomial patch of degree `order_degree`.
-fn duchon_poly_jet_sup(latent_dim: usize, order_degree: usize, chart: &ChartRegion, order: u32) -> f64 {
+fn duchon_poly_jet_sup(
+    latent_dim: usize,
+    order_degree: usize,
+    chart: &ChartRegion,
+    order: u32,
+) -> f64 {
     if order_degree == 0 {
         return if order == 0 { 1.0 } else { 0.0 };
     }
@@ -861,13 +874,8 @@ impl EncodeAtlas {
         }
         let mut atom_atlases = Vec::with_capacity(atoms.len());
         for (k, atom) in atoms.iter().enumerate() {
-            let atlas = Self::build_atom_atlas(
-                k,
-                atom,
-                amplitude_bound[k],
-                target_norm_bound,
-                &config,
-            )?;
+            let atlas =
+                Self::build_atom_atlas(k, atom, amplitude_bound[k], target_norm_bound, &config)?;
             atom_atlases.push(atlas);
         }
         Ok(Self {
@@ -1039,12 +1047,8 @@ impl EncodeAtlas {
         let mut coords = Array2::<f64>::zeros((n, d));
         let mut certified = Vec::with_capacity(n);
         for row in 0..n {
-            let (t, cert) = self.certified_encode_row(
-                atom,
-                atom_index,
-                targets.row(row),
-                amplitudes[row],
-            )?;
+            let (t, cert) =
+                self.certified_encode_row(atom, atom_index, targets.row(row), amplitudes[row])?;
             coords.row_mut(row).assign(&t);
             certified.push(cert.certified());
         }

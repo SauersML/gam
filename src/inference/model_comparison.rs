@@ -132,9 +132,11 @@ fn wps_correction_term(
     smoothing_correction: Option<ArrayView2<'_, f64>>,
     phi: f64,
 ) -> f64 {
-    let (Some(h), Some(f), Some(corr)) =
-        (penalized_hessian, coefficient_influence, smoothing_correction)
-    else {
+    let (Some(h), Some(f), Some(corr)) = (
+        penalized_hessian,
+        coefficient_influence,
+        smoothing_correction,
+    ) else {
         return 0.0;
     };
     let k = h.nrows();
@@ -174,12 +176,19 @@ fn wps_correction_term(
 ///
 /// Returns `None` when the inputs are degenerate (non-finite, mismatched
 /// lengths, or too few points for a tail fit).
-pub fn psis_loo(loglik_fitted: ArrayView1<'_, f64>, loglik_loo: ArrayView1<'_, f64>) -> Option<PsisLoo> {
+pub fn psis_loo(
+    loglik_fitted: ArrayView1<'_, f64>,
+    loglik_loo: ArrayView1<'_, f64>,
+) -> Option<PsisLoo> {
     let n = loglik_loo.len();
     if n == 0 || loglik_fitted.len() != n {
         return None;
     }
-    if loglik_fitted.iter().chain(loglik_loo.iter()).any(|v| !v.is_finite()) {
+    if loglik_fitted
+        .iter()
+        .chain(loglik_loo.iter())
+        .any(|v| !v.is_finite())
+    {
         return None;
     }
     // Raw importance ratios r_i = p(y_i|η̂_i) / p(y_i|η̃₋ᵢ) = exp(ℓ̂ - ℓ₋ᵢ).
@@ -203,7 +212,11 @@ pub fn psis_loo(loglik_fitted: ArrayView1<'_, f64>, loglik_loo: ArrayView1<'_, f
             for i in 0..n {
                 let r = raw[i];
                 let rs = psis.smoothed[i];
-                let shift = if r > 0.0 && rs > 0.0 { (rs / r).ln() } else { 0.0 };
+                let shift = if r > 0.0 && rs > 0.0 {
+                    (rs / r).ln()
+                } else {
+                    0.0
+                };
                 pw[i] = loglik_loo[i] + shift;
             }
             pointwise = pw;
@@ -224,7 +237,11 @@ pub fn psis_loo(loglik_fitted: ArrayView1<'_, f64>, loglik_loo: ArrayView1<'_, f
 
     let elpd: f64 = pointwise.iter().sum();
     let mean = elpd / n as f64;
-    let var = pointwise.iter().map(|&p| (p - mean) * (p - mean)).sum::<f64>() / n as f64;
+    let var = pointwise
+        .iter()
+        .map(|&p| (p - mean) * (p - mean))
+        .sum::<f64>()
+        / n as f64;
     let se = (n as f64 * var).sqrt();
     Some(PsisLoo {
         elpd,
@@ -261,7 +278,9 @@ pub struct ComparisonReport {
 pub fn compare(a: &ModelComparison, b: &ModelComparison) -> ComparisonReport {
     let delta_aic_corrected = a.aic_corrected - b.aic_corrected;
     match (&a.loo, &b.loo) {
-        (Some(la), Some(lb)) if la.pointwise.len() == lb.pointwise.len() && !la.pointwise.is_empty() => {
+        (Some(la), Some(lb))
+            if la.pointwise.len() == lb.pointwise.len() && !la.pointwise.is_empty() =>
+        {
             let n = la.pointwise.len();
             let diff: Array1<f64> = &la.pointwise - &lb.pointwise;
             let delta_elpd: f64 = diff.iter().sum();
@@ -368,7 +387,7 @@ pub fn psis_loo_from_family(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array2};
+    use ndarray::{Array2, array};
 
     #[test]
     fn wps_correction_is_trace_of_h_f_sigma_over_phi() {
@@ -377,13 +396,7 @@ mod tests {
         let f = Array2::<f64>::eye(3);
         let corr = array![[2.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 6.0]];
         let phi = 2.0;
-        let edf = corrected_edf(
-            3.0,
-            Some(h.view()),
-            Some(f.view()),
-            Some(corr.view()),
-            phi,
-        );
+        let edf = corrected_edf(3.0, Some(h.view()), Some(f.view()), Some(corr.view()), phi);
         // tr(corr)/φ = (2+4+6)/2 = 6, so corrected = 3 + 6 = 9, ρ-df = 6.
         assert!((edf.corrected - 9.0).abs() < 1e-12);
         assert!((edf.rho_uncertainty_df() - 6.0).abs() < 1e-12);
@@ -426,7 +439,10 @@ mod tests {
     fn compare_pairs_pointwise_and_orients_a_minus_b() {
         let mk = |pw: Array1<f64>, aic: f64| ModelComparison {
             log_lik: 0.0,
-            edf: CorrectedEdf { conditional: 0.0, corrected: 0.0 },
+            edf: CorrectedEdf {
+                conditional: 0.0,
+                corrected: 0.0,
+            },
             aic_conditional: aic,
             aic_corrected: aic,
             loo: Some(PsisLoo {
@@ -451,7 +467,10 @@ mod tests {
     fn compare_refuses_unpaired_rows() {
         let mk = |pw: Array1<f64>| ModelComparison {
             log_lik: 0.0,
-            edf: CorrectedEdf { conditional: 0.0, corrected: 0.0 },
+            edf: CorrectedEdf {
+                conditional: 0.0,
+                corrected: 0.0,
+            },
             aic_conditional: 0.0,
             aic_corrected: 5.0,
             loo: Some(PsisLoo {

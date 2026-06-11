@@ -112,7 +112,10 @@ fn cholesky_lower(a: &Array2<f64>) -> Option<Array2<f64>> {
     if n == 0 || a.ncols() != n {
         return None;
     }
-    let scale = (0..n).map(|i| a[[i, i]].abs()).fold(0.0_f64, f64::max).max(1.0);
+    let scale = (0..n)
+        .map(|i| a[[i, i]].abs())
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
     let jitter = 1e-10 * scale;
     let mut l = Array2::<f64>::zeros((n, n));
     for j in 0..n {
@@ -206,7 +209,9 @@ where
         return None;
     }
     let l_inv = whitening_factor_from_outer_hessian(outer_hessian)?;
-    let m = n_samples.unwrap_or(DEFAULT_M).max(2 * crate::inference::psis::MIN_TAIL_COUNT);
+    let m = n_samples
+        .unwrap_or(DEFAULT_M)
+        .max(2 * crate::inference::psis::MIN_TAIL_COUNT);
 
     let mut rng = DetNormal::new(CERTIFICATE_SEED);
     let mut raw_weights: Vec<f64> = Vec::with_capacity(m);
@@ -243,7 +248,13 @@ where
     }
     let weights: Vec<f64> = raw_weights
         .iter()
-        .map(|&lw| if lw.is_finite() { (lw - max_lw).exp() } else { 0.0 })
+        .map(|&lw| {
+            if lw.is_finite() {
+                (lw - max_lw).exp()
+            } else {
+                0.0
+            }
+        })
         .collect();
 
     let psis = pareto_smooth_weights(&weights)?;
@@ -292,8 +303,7 @@ mod tests {
             }
             Some(0.5 * q)
         };
-        let cert = rho_posterior_certificate(&rho_hat, &h, crit, Some(256))
-            .expect("certificate");
+        let cert = rho_posterior_certificate(&rho_hat, &h, crit, Some(256)).expect("certificate");
         // All weights equal ⇒ ESS == M and k̂ small ⇒ plug-in certified.
         assert!(
             (cert.effective_sample_size - cert.n_samples as f64).abs() < 1e-6,
@@ -323,8 +333,7 @@ mod tests {
             let r = rho[0];
             Some((1.0 + r * r).ln())
         };
-        let cert = rho_posterior_certificate(&rho_hat, &h, crit, Some(512))
-            .expect("certificate");
+        let cert = rho_posterior_certificate(&rho_hat, &h, crit, Some(512)).expect("certificate");
         assert!(
             cert.k_hat > 0.5,
             "heavy-tailed target must raise k̂ above 0.5, got {}",
