@@ -13429,7 +13429,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct SurvivalLsJetOracleRow {
+    struct SurvivalLsLocationScaleRow {
         eta_location: f64,
         eta_logscale: f64,
         entry_index: f64,
@@ -13439,7 +13439,122 @@ mod tests {
         weight: f64,
     }
 
-    impl SurvivalLsJetOracleRow {
+    struct SurvivalLsLocationScaleNllProgram<'a> {
+        inverse_link: &'a InverseLink,
+        deriv_log_scale: f64,
+        row: SurvivalLsLocationScaleRow,
+    }
+
+    fn survival_ls_log_survival_stack(
+        inverse_link: &InverseLink,
+        eta: f64,
+        deriv_log_scale: f64,
+    ) -> Result<[f64; 5], String> {
+        let (log_s, r, dr, ddr, dddr) =
+            SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
+                inverse_link,
+                eta,
+                deriv_log_scale,
+            )?;
+        Ok([log_s, -r, -dr, -ddr, -dddr])
+    }
+
+    fn survival_ls_log_pdf_stack(
+        inverse_link: &InverseLink,
+        eta: f64,
+        deriv_log_scale: f64,
+    ) -> Result<[f64; 5], String> {
+        let (log_pdf, d1, d2, d3, d4) =
+            SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
+                inverse_link,
+                eta,
+                deriv_log_scale,
+            )?;
+        Ok([log_pdf, d1, d2, d3, d4])
+    }
+
+    fn survival_ls_positive_log_stack(value: f64) -> [f64; 5] {
+        let (log_v, d1, d2, d3, d4) =
+            SurvivalLocationScaleFamily::logwith_derivatives_positive(value);
+        [log_v, d1, d2, d3, d4]
+    }
+
+    impl crate::families::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNllProgram<'_> {
+        fn n_rows(&self) -> usize {
+            1
+        }
+
+        fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+            if row != 0 {
+                return Err(format!(
+                    "survival LS location-scale jet row {row} out of range"
+                ));
+            }
+            Ok([self.row.eta_location, self.row.eta_logscale])
+        }
+
+        fn row_nll(
+            &self,
+            row: usize,
+            p: &[crate::families::jet_tower::Tower4<2>; 2],
+        ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
+            use crate::families::jet_tower::Tower4;
+
+            if row != 0 {
+                return Err(format!(
+                    "survival LS location-scale jet row {row} out of range"
+                ));
+            }
+            if self.row.weight <= 0.0 {
+                return Ok(Tower4::<2>::zero());
+            }
+
+            let eta_location = p[0];
+            let eta_logscale = p[1];
+            let inv_sigma = (-eta_logscale).exp();
+            let q_entry = (Tower4::<2>::constant(self.row.entry_index) - eta_location) * inv_sigma;
+            let q_exit = (Tower4::<2>::constant(self.row.exit_index) - eta_location) * inv_sigma;
+            let g = Tower4::<2>::constant(self.row.exit_index_derivative) * inv_sigma;
+
+            let mut nll = q_entry
+                .compose_unary(survival_ls_log_survival_stack(
+                    self.inverse_link,
+                    q_entry.v,
+                    self.deriv_log_scale,
+                )?)
+                .scale(self.row.weight);
+
+            let censored_weight = self.row.weight * (1.0 - self.row.event);
+            if censored_weight != 0.0 {
+                nll = nll
+                    + q_exit
+                        .compose_unary(survival_ls_log_survival_stack(
+                            self.inverse_link,
+                            q_exit.v,
+                            self.deriv_log_scale,
+                        )?)
+                        .scale(-censored_weight);
+            }
+
+            let event_weight = self.row.weight * self.row.event;
+            if event_weight != 0.0 {
+                nll = nll
+                    + q_exit
+                        .compose_unary(survival_ls_log_pdf_stack(
+                            self.inverse_link,
+                            q_exit.v,
+                            self.deriv_log_scale,
+                        )?)
+                        .scale(-event_weight)
+                    + g.compose_unary(survival_ls_positive_log_stack(g.v))
+                        .scale(-event_weight);
+            }
+
+            Ok(nll)
+        }
+    }
+
+    impl SurvivalLsLocationScaleRow {
         fn from_standardized_q(
             eta_location: f64,
             eta_logscale: f64,
@@ -13462,104 +13577,8 @@ mod tests {
         }
     }
 
-    struct SurvivalLsLocationScaleNllProgram {
-        inverse_link: InverseLink,
-        rows: Vec<SurvivalLsJetOracleRow>,
-    }
-
-    fn sls_log_survival_stack(inverse_link: &InverseLink, eta: f64) -> [f64; 5] {
-        let (log_s, r, dr, ddr, dddr) =
-            SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
-                inverse_link,
-                eta,
-                0.0,
-            )
-            .expect("survival oracle log-survival stack");
-        [log_s, -r, -dr, -ddr, -dddr]
-    }
-
-    fn sls_log_pdf_stack(inverse_link: &InverseLink, eta: f64) -> [f64; 5] {
-        let (log_pdf, d1, d2, d3, d4) =
-            SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
-                inverse_link,
-                eta,
-                0.0,
-            )
-            .expect("survival oracle log-pdf stack");
-        [log_pdf, d1, d2, d3, d4]
-    }
-
-    fn sls_positive_log_stack(value: f64) -> [f64; 5] {
-        let (log_v, d1, d2, d3, d4) =
-            SurvivalLocationScaleFamily::logwith_derivatives_positive(value);
-        [log_v, d1, d2, d3, d4]
-    }
-
-    impl crate::families::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNllProgram {
-        fn n_rows(&self) -> usize {
-            self.rows.len()
-        }
-
-        fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
-            let row_data = self
-                .rows
-                .get(row)
-                .copied()
-                .ok_or_else(|| format!("survival LS jet oracle row {row} out of range"))?;
-            Ok([row_data.eta_location, row_data.eta_logscale])
-        }
-
-        fn row_nll(
-            &self,
-            row: usize,
-            p: &[crate::families::jet_tower::Tower4<2>; 2],
-        ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
-            use crate::families::jet_tower::Tower4;
-
-            let row_data = self
-                .rows
-                .get(row)
-                .copied()
-                .ok_or_else(|| format!("survival LS jet oracle row {row} out of range"))?;
-            if row_data.weight <= 0.0 {
-                return Ok(Tower4::<2>::zero());
-            }
-            let eta_location = p[0];
-            let eta_logscale = p[1];
-            let inv_sigma = (-eta_logscale).exp();
-            let q_entry =
-                (Tower4::<2>::constant(row_data.entry_index) - eta_location) * inv_sigma;
-            let q_exit =
-                (Tower4::<2>::constant(row_data.exit_index) - eta_location) * inv_sigma;
-            let g = Tower4::<2>::constant(row_data.exit_index_derivative) * inv_sigma;
-
-            let mut nll =
-                q_entry.compose_unary(sls_log_survival_stack(&self.inverse_link, q_entry.v))
-                    .scale(row_data.weight);
-
-            let censored_weight = row_data.weight * (1.0 - row_data.event);
-            if censored_weight != 0.0 {
-                nll = nll
-                    + q_exit
-                        .compose_unary(sls_log_survival_stack(&self.inverse_link, q_exit.v))
-                        .scale(-censored_weight);
-            }
-
-            let event_weight = row_data.weight * row_data.event;
-            if event_weight != 0.0 {
-                nll = nll
-                    + q_exit
-                        .compose_unary(sls_log_pdf_stack(&self.inverse_link, q_exit.v))
-                        .scale(-event_weight)
-                    + g.compose_unary(sls_positive_log_stack(g.v)).scale(-event_weight);
-            }
-
-            Ok(nll)
-        }
-    }
-
     #[derive(Clone, Copy)]
-    struct SlsScalarMap {
+    struct SlsHandWitnessScalarMap {
         v: f64,
         g: [f64; 2],
         h: [[f64; 2]; 2],
@@ -13567,7 +13586,7 @@ mod tests {
         t4: [[[[f64; 2]; 2]; 2]; 2],
     }
 
-    impl SlsScalarMap {
+    impl SlsHandWitnessScalarMap {
         fn standardized_residual(index: f64, eta_location: f64, eta_logscale: f64) -> Self {
             let inv_sigma = (-eta_logscale).exp();
             let q = (index - eta_location) * inv_sigma;
@@ -13585,12 +13604,7 @@ mod tests {
                 map.t3[a][b][c] = -inv_sigma;
             }
             map.t3[1][1][1] = -q;
-            for (a, b, c, d) in [
-                (0, 1, 1, 1),
-                (1, 0, 1, 1),
-                (1, 1, 0, 1),
-                (1, 1, 1, 0),
-            ] {
+            for (a, b, c, d) in [(0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 0, 1), (1, 1, 1, 0)] {
                 map.t4[a][b][c][d] = inv_sigma;
             }
             map.t4[1][1][1][1] = q;
@@ -13613,7 +13627,7 @@ mod tests {
         }
     }
 
-    struct SlsAnalyticChannels {
+    struct SlsHandWitnessChannels {
         value: f64,
         gradient: [f64; 2],
         hessian: [[f64; 2]; 2],
@@ -13621,7 +13635,7 @@ mod tests {
         t4: [[[[f64; 2]; 2]; 2]; 2],
     }
 
-    impl SlsAnalyticChannels {
+    impl SlsHandWitnessChannels {
         fn zero() -> Self {
             Self {
                 value: 0.0,
@@ -13632,7 +13646,7 @@ mod tests {
             }
         }
 
-        fn add_unary(&mut self, map: &SlsScalarMap, stack: [f64; 5], scale: f64) {
+        fn add_unary(&mut self, map: &SlsHandWitnessScalarMap, stack: [f64; 5], scale: f64) {
             self.value += scale * stack[0];
             for i in 0..2 {
                 self.gradient[i] += scale * stack[1] * map.g[i];
@@ -13699,7 +13713,10 @@ mod tests {
         }
     }
 
-    fn survival_ls_exact_row_nll(inverse_link: &InverseLink, row: SurvivalLsJetOracleRow) -> f64 {
+    fn survival_ls_exact_row_nll(
+        inverse_link: &InverseLink,
+        row: SurvivalLsLocationScaleRow,
+    ) -> f64 {
         let family = SurvivalLocationScaleFamily {
             n: 1,
             y: array![row.event],
@@ -13713,14 +13730,10 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             time_linear_constraints: lower_bound_constraints(&array![0.0]),
-            x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0]
-            ])),
+            x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             x_threshold_entry: None,
             x_threshold_deriv: None,
-            x_log_sigma: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0]
-            ])),
+            x_log_sigma: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             x_log_sigma_entry: None,
             x_log_sigma_deriv: None,
             x_link_wiggle: None,
@@ -13745,32 +13758,35 @@ mod tests {
             .log_likelihood()
     }
 
-    fn survival_ls_analytic_channels(
+    fn survival_ls_hand_witness_channels(
         inverse_link: &InverseLink,
-        row: SurvivalLsJetOracleRow,
-    ) -> SlsAnalyticChannels {
-        let q_entry = SlsScalarMap::standardized_residual(
+        row: SurvivalLsLocationScaleRow,
+    ) -> SlsHandWitnessChannels {
+        let q_entry = SlsHandWitnessScalarMap::standardized_residual(
             row.entry_index,
             row.eta_location,
             row.eta_logscale,
         );
-        let q_exit = SlsScalarMap::standardized_residual(
+        let q_exit = SlsHandWitnessScalarMap::standardized_residual(
             row.exit_index,
             row.eta_location,
             row.eta_logscale,
         );
-        let g = SlsScalarMap::exit_derivative(row.exit_index_derivative, row.eta_logscale);
-        let mut channels = SlsAnalyticChannels::zero();
+        let g =
+            SlsHandWitnessScalarMap::exit_derivative(row.exit_index_derivative, row.eta_logscale);
+        let mut channels = SlsHandWitnessChannels::zero();
         channels.add_unary(
             &q_entry,
-            sls_log_survival_stack(inverse_link, q_entry.v),
+            survival_ls_log_survival_stack(inverse_link, q_entry.v, 0.0)
+                .expect("survival witness log-survival stack"),
             row.weight,
         );
         let censored_weight = row.weight * (1.0 - row.event);
         if censored_weight != 0.0 {
             channels.add_unary(
                 &q_exit,
-                sls_log_survival_stack(inverse_link, q_exit.v),
+                survival_ls_log_survival_stack(inverse_link, q_exit.v, 0.0)
+                    .expect("survival witness log-survival stack"),
                 -censored_weight,
             );
         }
@@ -13778,16 +13794,17 @@ mod tests {
         if event_weight != 0.0 {
             channels.add_unary(
                 &q_exit,
-                sls_log_pdf_stack(inverse_link, q_exit.v),
+                survival_ls_log_pdf_stack(inverse_link, q_exit.v, 0.0)
+                    .expect("survival witness log-pdf stack"),
                 -event_weight,
             );
-            channels.add_unary(&g, sls_positive_log_stack(g.v), -event_weight);
+            channels.add_unary(&g, survival_ls_positive_log_stack(g.v), -event_weight);
         }
         channels
     }
 
-    fn survival_ls_kernel_channels_from_analytic(
-        channels: &SlsAnalyticChannels,
+    fn survival_ls_kernel_channels_from_hand_witness(
+        channels: &SlsHandWitnessChannels,
         dirs: &[[f64; 2]],
     ) -> crate::families::jet_tower::KernelChannels<2> {
         let third = dirs
@@ -13817,14 +13834,12 @@ mod tests {
 
         let dirs = [[0.7, -1.1], [-0.4, 0.9], [1.3, 0.25]];
         let rows = vec![
-            SurvivalLsJetOracleRow::from_standardized_q(
-                0.25, 0.2, -0.75, 0.45, 1.15, 1.0, 1.7,
-            ),
-            SurvivalLsJetOracleRow::from_standardized_q(
+            SurvivalLsLocationScaleRow::from_standardized_q(0.25, 0.2, -0.75, 0.45, 1.15, 1.0, 1.7),
+            SurvivalLsLocationScaleRow::from_standardized_q(
                 -0.4, -0.35, -1.4, 1.2, 0.85, 0.0, 0.65,
             ),
-            SurvivalLsJetOracleRow::from_standardized_q(1.1, 0.05, -6.0, 7.0, 1.4, 1.0, 1.25),
-            SurvivalLsJetOracleRow::from_standardized_q(-0.8, 0.4, -5.0, 5.0, 0.55, 0.0, 0.9),
+            SurvivalLsLocationScaleRow::from_standardized_q(1.1, 0.05, -6.0, 7.0, 1.4, 1.0, 1.25),
+            SurvivalLsLocationScaleRow::from_standardized_q(-0.8, 0.4, -5.0, 5.0, 0.55, 0.0, 0.9),
         ];
 
         for distribution in [
@@ -13833,25 +13848,25 @@ mod tests {
             ResidualDistribution::Logistic,
         ] {
             let inverse_link = residual_distribution_inverse_link(distribution);
-            let program = SurvivalLsLocationScaleNllProgram {
-                inverse_link: inverse_link.clone(),
-                rows: rows.clone(),
-            };
             for (row_index, row_data) in rows.iter().copied().enumerate() {
-                let tower = evaluate_program(&program, row_index).expect("survival LS tower");
-                let analytic = survival_ls_analytic_channels(&inverse_link, row_data);
+                let program = SurvivalLsLocationScaleNllProgram {
+                    inverse_link: &inverse_link,
+                    deriv_log_scale: 0.0,
+                    row: row_data,
+                };
+                let tower = evaluate_program(&program, 0).expect("survival LS tower");
+                let witness = survival_ls_hand_witness_channels(&inverse_link, row_data);
                 let exact_value = survival_ls_exact_row_nll(&inverse_link, row_data);
                 assert!(
-                    (analytic.value - exact_value).abs()
-                        <= 1e-11 * exact_value.abs().max(1.0),
-                    "exact row kernel value mismatch for {distribution:?} row {row_index}: analytic={} exact={}",
-                    analytic.value,
+                    (witness.value - exact_value).abs() <= 1e-11 * exact_value.abs().max(1.0),
+                    "exact row kernel value mismatch for {distribution:?} row {row_index}: witness={} exact={}",
+                    witness.value,
                     exact_value
                 );
-                let claims = survival_ls_kernel_channels_from_analytic(&analytic, &dirs);
-                verify_kernel_channels(&tower, &claims, 1e-9).unwrap_or_else(|err| {
+                let claims = survival_ls_kernel_channels_from_hand_witness(&witness, &dirs);
+                verify_kernel_channels(&tower, &claims, 1e-12).unwrap_or_else(|err| {
                     panic!(
-                        "survival LS K=2 jet oracle mismatch for {distribution:?} row {row_index}: {err}"
+                        "survival LS K=2 production jet mismatch against hand witness for {distribution:?} row {row_index}: {err}"
                     )
                 });
             }
