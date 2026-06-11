@@ -121,6 +121,10 @@ const F32_UNIT_ROUNDOFF: f64 = (f32::EPSILON as f64) * 0.5;
 const DEFAULT_MIXED_PRECISION_MAX_REFINEMENTS: usize = 6;
 const DEFAULT_MIXED_PRECISION_CERTIFICATE_TOLERANCE: f64 = 1e-11;
 const DEFAULT_MIXED_PRECISION_KAPPA_MARGIN: f64 = 0.5;
+/// Backward-error certificate floor, expressed as a small multiple of f64 epsilon.
+const MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER: f64 = 64.0;
+/// User-supplied kappa margins above this are no stricter than the unit gate.
+const MIXED_PRECISION_KAPPA_MARGIN_CEILING: f64 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BetaEdge {
@@ -5812,7 +5816,8 @@ fn try_mixed_precision_arrow_solve(
         rhs_t.view(),
         rhs_beta.view(),
     );
-    let certificate_tol = residual_relative_tolerance.max(64.0 * f64::EPSILON);
+    let certificate_tol = residual_relative_tolerance
+        .max(MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER * f64::EPSILON);
     for refinement_steps in 0..=max_refinement_steps {
         let (res_t, res_beta) = arrow_residual(
             sys,
@@ -5912,7 +5917,9 @@ fn mixed_precision_kappa_gate_failure(
         }
     }
     let kappa_u = max_kappa * F32_UNIT_ROUNDOFF;
-    let threshold = margin.min(1.0).max(F32_UNIT_ROUNDOFF);
+    let threshold = margin
+        .min(MIXED_PRECISION_KAPPA_MARGIN_CEILING)
+        .max(F32_UNIT_ROUNDOFF);
     if !(max_kappa.is_finite() && kappa_u < threshold) {
         Some(format!(
             "kappa gate refused f32 refinement: kappa_estimate={max_kappa:e}, \
