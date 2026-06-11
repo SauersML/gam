@@ -655,6 +655,128 @@ impl BetaPenaltyOp for KroneckerPenaltyOp {
     }
 }
 
+/// Kronecker-product penalty with an identity right factor:
+/// `P = A ⊗ I_p`.
+///
+/// This is the hot SAE smoothness case. Storing `I_p` as a dense matrix costs
+/// `O(p²)` memory per atom and makes every matvec pay an unnecessary right-factor
+/// loop. This operator stores only the identity dimension and keeps the same
+/// layout as [`KroneckerPenaltyOp`]: local index `i_a * p + i_b`.
+pub struct IdentityRightKroneckerPenaltyOp {
+    /// Left factor `A`, shape `(p_a, p_a)`.
+    pub factor_a: Array2<f64>,
+    /// Identity right-factor dimension `p`.
+    pub p: usize,
+    /// Global offset into the β vector where this block starts.
+    pub global_offset: usize,
+    /// Full β dimension `K`.
+    pub k: usize,
+}
+
+impl BetaPenaltyOp for IdentityRightKroneckerPenaltyOp {
+    fn dim(&self) -> usize {
+        self.k
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        let p_a = self.factor_a.nrows();
+        let p = self.p;
+        let off = self.global_offset;
+        for i_a in 0..p_a {
+            for i_b in 0..p {
+                let gi = off + i_a * p + i_b;
+                let mut acc = 0.0_f64;
+                for j_a in 0..p_a {
+                    let a_ij = self.factor_a[[i_a, j_a]];
+                    if a_ij == 0.0 {
+                        continue;
+                    }
+                    acc += a_ij * x[off + j_a * p + i_b];
+                }
+                y[gi] += acc;
+            }
+        }
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        self.matvec(beta, out);
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        let p_a = self.factor_a.nrows();
+        let p = self.p;
+        let off = self.global_offset;
+        for i_a in 0..p_a {
+            let a_ii = self.factor_a[[i_a, i_a]];
+            for i_b in 0..p {
+                diag[off + i_a * p + i_b] += a_ii;
+            }
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        let range = &offsets[id.0];
+        let b = range.end - range.start;
+        let p_a = self.factor_a.nrows();
+        let p = self.p;
+        let off = self.global_offset;
+        let block_end = off + p_a * p;
+        if block_end <= range.start || off >= range.end {
+            return;
+        }
+        for bi in 0..b {
+            let gi = range.start + bi;
+            if gi < off || gi >= block_end {
+                continue;
+            }
+            let li = gi - off;
+            let i_a = li / p;
+            let i_b = li % p;
+            for bj in 0..b {
+                let gj = range.start + bj;
+                if gj < off || gj >= block_end {
+                    continue;
+                }
+                let lj = gj - off;
+                let j_a = lj / p;
+                let j_b = lj % p;
+                if i_b == j_b {
+                    out[[bi, bj]] += self.factor_a[[i_a, j_a]];
+                }
+            }
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let p_a = self.factor_a.nrows();
+        let p = self.p;
+        let off = self.global_offset;
+        let mut out = Array2::<f64>::zeros((self.k, self.k));
+        for i_a in 0..p_a {
+            for j_a in 0..p_a {
+                let a_ij = self.factor_a[[i_a, j_a]];
+                if a_ij == 0.0 {
+                    continue;
+                }
+                for i_b in 0..p {
+                    let gi = off + i_a * p + i_b;
+                    let gj = off + j_a * p + i_b;
+                    out[[gi, gj]] += a_ij;
+                }
+            }
+        }
+        out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("identity-right-kronecker-penalty-op-v1");
+        hasher.write_usize(self.global_offset);
+        hasher.write_usize(self.k);
+        hasher.write_usize(self.p);
+        hasher.write_f64_array2(&self.factor_a);
+    }
+}
+
 /// One co-occurring atom-pair block of a block-sparse left factor `A`.
 ///
 /// `data` is the dense `(m_i × m_j)` coupling between the basis columns of
@@ -7259,10 +7381,30 @@ mod tests {
         let w01 = array![[0.8_f64, 0.1, -0.05], [0.0, 0.7, 0.2]];
         let w10 = w01.t().to_owned();
         let blocks = vec![
-            FactoredFrameGBlock { atom_i: 0, atom_j: 0, g: g00.clone(), w: w00.clone() },
-            FactoredFrameGBlock { atom_i: 1, atom_j: 1, g: g11.clone(), w: w11.clone() },
-            FactoredFrameGBlock { atom_i: 0, atom_j: 1, g: g01.clone(), w: w01.clone() },
-            FactoredFrameGBlock { atom_i: 1, atom_j: 0, g: g10.clone(), w: w10.clone() },
+            FactoredFrameGBlock {
+                atom_i: 0,
+                atom_j: 0,
+                g: g00.clone(),
+                w: w00.clone(),
+            },
+            FactoredFrameGBlock {
+                atom_i: 1,
+                atom_j: 1,
+                g: g11.clone(),
+                w: w11.clone(),
+            },
+            FactoredFrameGBlock {
+                atom_i: 0,
+                atom_j: 1,
+                g: g01.clone(),
+                w: w01.clone(),
+            },
+            FactoredFrameGBlock {
+                atom_i: 1,
+                atom_j: 0,
+                g: g10.clone(),
+                w: w10.clone(),
+            },
         ];
         let op = FactoredFrameKroneckerOp::new(ranks.clone(), basis_sizes.clone(), blocks.clone())
             .expect("op");
@@ -7342,10 +7484,30 @@ mod tests {
             vec![p, p],
             vec![2, 2],
             vec![
-                FactoredFrameGBlock { atom_i: 0, atom_j: 0, g: g00.clone(), w: ident.clone() },
-                FactoredFrameGBlock { atom_i: 1, atom_j: 1, g: g11.clone(), w: ident.clone() },
-                FactoredFrameGBlock { atom_i: 0, atom_j: 1, g: g01.clone(), w: ident.clone() },
-                FactoredFrameGBlock { atom_i: 1, atom_j: 0, g: g10.clone(), w: ident.clone() },
+                FactoredFrameGBlock {
+                    atom_i: 0,
+                    atom_j: 0,
+                    g: g00.clone(),
+                    w: ident.clone(),
+                },
+                FactoredFrameGBlock {
+                    atom_i: 1,
+                    atom_j: 1,
+                    g: g11.clone(),
+                    w: ident.clone(),
+                },
+                FactoredFrameGBlock {
+                    atom_i: 0,
+                    atom_j: 1,
+                    g: g01.clone(),
+                    w: ident.clone(),
+                },
+                FactoredFrameGBlock {
+                    atom_i: 1,
+                    atom_j: 0,
+                    g: g10.clone(),
+                    w: ident.clone(),
+                },
             ],
         )
         .expect("factored op");
@@ -7355,10 +7517,26 @@ mod tests {
             dim_a: 4,
             k: 8,
             blocks: vec![
-                SparseGBlock { row_off: 0, col_off: 0, data: g00 },
-                SparseGBlock { row_off: 2, col_off: 2, data: g11 },
-                SparseGBlock { row_off: 0, col_off: 2, data: g01 },
-                SparseGBlock { row_off: 2, col_off: 0, data: g10 },
+                SparseGBlock {
+                    row_off: 0,
+                    col_off: 0,
+                    data: g00,
+                },
+                SparseGBlock {
+                    row_off: 2,
+                    col_off: 2,
+                    data: g11,
+                },
+                SparseGBlock {
+                    row_off: 0,
+                    col_off: 2,
+                    data: g01,
+                },
+                SparseGBlock {
+                    row_off: 2,
+                    col_off: 0,
+                    data: g10,
+                },
             ],
         };
         assert_eq!(factored.dim(), sparse.dim());
@@ -7469,8 +7647,9 @@ mod tests {
         g_blocks.insert((1, 0), g10.clone());
 
         let frames = vec![Some(u0.clone()), Some(u1.clone())];
-        let op = FactoredFrameKroneckerOp::from_frames_and_blocks(&frames, &basis_sizes, p, &g_blocks)
-            .expect("from_frames_and_blocks");
+        let op =
+            FactoredFrameKroneckerOp::from_frames_and_blocks(&frames, &basis_sizes, p, &g_blocks)
+                .expect("from_frames_and_blocks");
         // dim = M_0·r_0 + M_1·r_1 = 2·2 + 3·3 = 13.
         assert_eq!(op.dim(), 13);
 
@@ -7481,10 +7660,30 @@ mod tests {
         let w01 = frame_output_gram(u0.view(), u1.view());
         let w10 = frame_output_gram(u1.view(), u0.view());
         let ref_blocks = vec![
-            FactoredFrameGBlock { atom_i: 0, atom_j: 0, g: g00, w: w00 },
-            FactoredFrameGBlock { atom_i: 1, atom_j: 1, g: g11, w: w11 },
-            FactoredFrameGBlock { atom_i: 0, atom_j: 1, g: g01, w: w01 },
-            FactoredFrameGBlock { atom_i: 1, atom_j: 0, g: g10, w: w10 },
+            FactoredFrameGBlock {
+                atom_i: 0,
+                atom_j: 0,
+                g: g00,
+                w: w00,
+            },
+            FactoredFrameGBlock {
+                atom_i: 1,
+                atom_j: 1,
+                g: g11,
+                w: w11,
+            },
+            FactoredFrameGBlock {
+                atom_i: 0,
+                atom_j: 1,
+                g: g01,
+                w: w01,
+            },
+            FactoredFrameGBlock {
+                atom_i: 1,
+                atom_j: 0,
+                g: g10,
+                w: w10,
+            },
         ];
         let reference = factored_reference_dense(&ranks, &basis_sizes, &ref_blocks);
 
@@ -7545,8 +7744,9 @@ mod tests {
         g_blocks.insert((1, 0), g10.clone());
 
         let frames = vec![Some(u0.clone()), None];
-        let op = FactoredFrameKroneckerOp::from_frames_and_blocks(&frames, &basis_sizes, p, &g_blocks)
-            .expect("from_frames_and_blocks mixed");
+        let op =
+            FactoredFrameKroneckerOp::from_frames_and_blocks(&frames, &basis_sizes, p, &g_blocks)
+                .expect("from_frames_and_blocks mixed");
 
         // dim = M_0·r_0 + M_1·r_1 = 2·2 + 2·4 = 12.
         assert_eq!(op.ranks, vec![2usize, 4]);
@@ -7581,10 +7781,30 @@ mod tests {
         let w01 = frame_output_gram(u0.view(), ident_p.view());
         let w10 = frame_output_gram(ident_p.view(), u0.view());
         let ref_blocks = vec![
-            FactoredFrameGBlock { atom_i: 0, atom_j: 0, g: g00, w: w00 },
-            FactoredFrameGBlock { atom_i: 1, atom_j: 1, g: g11.clone(), w: w11 },
-            FactoredFrameGBlock { atom_i: 0, atom_j: 1, g: g01, w: w01 },
-            FactoredFrameGBlock { atom_i: 1, atom_j: 0, g: g10, w: w10 },
+            FactoredFrameGBlock {
+                atom_i: 0,
+                atom_j: 0,
+                g: g00,
+                w: w00,
+            },
+            FactoredFrameGBlock {
+                atom_i: 1,
+                atom_j: 1,
+                g: g11.clone(),
+                w: w11,
+            },
+            FactoredFrameGBlock {
+                atom_i: 0,
+                atom_j: 1,
+                g: g01,
+                w: w01,
+            },
+            FactoredFrameGBlock {
+                atom_i: 1,
+                atom_j: 0,
+                g: g10,
+                w: w10,
+            },
         ];
         let reference = factored_reference_dense(&ranks, &basis_sizes, &ref_blocks);
 
