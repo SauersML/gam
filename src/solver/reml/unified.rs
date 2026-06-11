@@ -19687,6 +19687,7 @@ mod tests {
             } else {
                 None
             };
+            let pair_b_for_dense = psi_pair_b.clone();
             InnerSolution {
                 log_likelihood: -2.3,
                 penalty_quadratic: 0.6,
@@ -19730,7 +19731,7 @@ mod tests {
                 ext_coord_pair_fn: Some(Box::new(move |_, _| HyperCoordPair {
                     a: psi_pair_a,
                     g: array![0.16, -0.12],
-                    b_mat: array![[0.08, 0.03], [0.03, -0.04]],
+                    b_mat: pair_b_for_dense.clone(),
                     b_operator: None,
                     ld_s: psi_pair_ld_s,
                 })),
