@@ -1056,13 +1056,12 @@ fn rigid_transformed_gradient_matches_negative_log_likelihood_derivative() {
     let probit_scale = 1.0;
     let objective = |eta_value: f64, g_value: f64| {
         let marginal = bernoulli_marginal_link_map(&link, eta_value).unwrap();
-        let kernel =
-            RigidProbitKernel::new(marginal.q, g_value, z, y, weight, probit_scale).unwrap();
-        -weight * kernel.logcdf
+        rigid_standard_normal_neglog_only(marginal.q, g_value, z, y, weight, probit_scale).unwrap()
     };
     let marginal = bernoulli_marginal_link_map(&link, eta).expect("marginal map");
-    let kernel = RigidProbitKernel::new(marginal.q, g, z, y, weight, probit_scale).expect("kernel");
-    let grad = rigid_transformed_gradient(marginal, &kernel);
+    let grad = rigid_standard_normal_row_kernel(marginal, g, z, y, weight, probit_scale)
+        .expect("kernel")
+        .1;
     let step = 1e-6;
     let finite_eta = (objective(eta + step, g) - objective(eta - step, g)) / (2.0 * step);
     let finite_g = (objective(eta, g + step) - objective(eta, g - step)) / (2.0 * step);
@@ -9007,10 +9006,10 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
 /// (`unary_derivatives_sqrt` / `unary_derivatives_neglog_phi` and the
 /// link-map's q-derivatives) through `Tower4::compose_unary`, so no probit
 /// primitive is re-derived here: the tower mechanizes only the
-/// Leibniz / Faà di Bruno composition that `RigidProbitKernel` +
-/// `rigid_transformed_{gradient,hessian,third_full,fourth_full}` code by
-/// hand — the chain-rule scaffolding (`u1..u4`, `c1..c4`, q-transform
-/// stacking) where cross-block sign errors of the #736 genus live.
+/// Leibniz / Faà di Bruno composition that the production
+/// `rigid_standard_normal_*` tower path mechanizes — the chain-rule
+/// scaffolding (`u1..u4`, `c1..c4`, q-transform stacking) where
+/// cross-block sign errors of the #736 genus live.
 struct BernoulliRigidNllProgram {
     family: BernoulliMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
