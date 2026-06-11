@@ -1444,7 +1444,19 @@ pub fn build_smooth_basis(
         // carries no curvature to over-fit.
         let pooled_internal = heuristic_knots_for_column(ds.values.column(c));
         let default_internal = if type_opt == "re" {
-            pooled_internal
+            // `bs="re"` is a PARAMETRIC random effect, not a smooth of the
+            // covariate: `s(x, g, bs="re")` is the mgcv random intercept+slope
+            // `(1 + x | g)`, i.e. a per-group line `[1, x]`, penalized by an iid
+            // ridge. A degree-1 marginal with ZERO internal knots spans exactly
+            // that linear space (2 coefficients per group). Using the pooled
+            // knot heuristic here instead turned the marginal into a
+            // piecewise-linear B-spline (e.g. 6 functions/group on sleepstudy),
+            // i.e. a *smooth* with kinks rather than a random slope — many extra
+            // collinear-across-levels coefficients that ill-condition the joint
+            // Newton/REML solve (minutes-long fits, and a singular block when
+            // combined with a separate random intercept `s(g, bs="re")`). The
+            // raw linear basis is both the correct `re` semantics and fast.
+            0
         } else {
             let min_group_resolution =
                 min_per_group_unique_count(ds.values.column(c), ds.values.column(cols[group_idx]));
