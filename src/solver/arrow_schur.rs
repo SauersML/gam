@@ -1571,6 +1571,7 @@ pub enum MixedPrecisionStatus {
     /// The f32 factor solve was refined until the f64 backward-error certificate held.
     Certified { refinement_steps: usize },
     /// The kappa gate or solve shape rejected mixed precision and the f64 path ran.
+    /// The declining reason is logged at `info` level when the fallback fires.
     F64Fallback,
 }
 
