@@ -1084,6 +1084,449 @@ fn rigid_transformed_gradient_matches_negative_log_likelihood_derivative() {
     );
 }
 
+struct HandRigidProbitKernel {
+    logcdf: f64,
+    u1: f64,
+    u2: f64,
+    u3: f64,
+    u4: f64,
+    c1: f64,
+    c2: f64,
+    c3: f64,
+    c4: f64,
+    eta_q: f64,
+    eta_g: f64,
+}
+
+impl HandRigidProbitKernel {
+    #[inline]
+    fn new(q: f64, g: f64, z: f64, y: f64, w: f64, probit_scale: f64) -> Result<Self, String> {
+        let s = 2.0 * y - 1.0;
+        let observed_logslope = rigid_observed_logslope(g, probit_scale);
+        let g2 = observed_logslope * observed_logslope;
+        let c = (1.0 + g2).sqrt();
+        let c1 = probit_scale * observed_logslope / c;
+        let c_inv3 = 1.0 / (c * c * c);
+        let c_inv5 = c_inv3 / (c * c);
+        let c_inv7 = c_inv5 / (c * c);
+        let eta = marginal_slope_standard_normal_scalar_eta(q, g, z, probit_scale);
+        let m = s * eta;
+        let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
+        let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(m, w)?;
+        Ok(Self {
+            logcdf,
+            u1: s * k1,
+            u2: k2,
+            u3: s * k3,
+            u4: k4,
+            c1,
+            c2: probit_scale * probit_scale * c_inv3,
+            c3: -3.0 * probit_scale.powi(3) * observed_logslope * c_inv5,
+            c4: probit_scale.powi(4) * (12.0 * g2 - 3.0) * c_inv7,
+            eta_q: c,
+            eta_g: q * c1 + probit_scale * z,
+        })
+    }
+
+    #[inline]
+    fn primary_hessian(&self, q: f64) -> [[f64; 2]; 2] {
+        let h00 = self.u2 * self.eta_q * self.eta_q;
+        let h01 = self.u2 * self.eta_q * self.eta_g + self.u1 * self.c1;
+        let h11 = self.u2 * self.eta_g * self.eta_g + self.u1 * q * self.c2;
+        [[h00, h01], [h01, h11]]
+    }
+
+    #[inline]
+    fn third_contracted(&self, q: f64, dq: f64, dg: f64) -> [[f64; 2]; 2] {
+        let dd = self.eta_q * dq + self.eta_g * dg;
+        let dd_q = self.c1 * dg;
+        let dd_g = self.c1 * dq + q * self.c2 * dg;
+        let dd_qg = self.c2 * dg;
+        let dd_gg = self.c2 * dq + q * self.c3 * dg;
+        let t00 = self.u3 * self.eta_q * self.eta_q * dd + self.u2 * 2.0 * self.eta_q * dd_q;
+        let t01 = self.u3 * self.eta_q * self.eta_g * dd
+            + self.u2 * (self.c1 * dd + self.eta_q * dd_g + self.eta_g * dd_q)
+            + self.u1 * dd_qg;
+        let t11 = self.u3 * self.eta_g * self.eta_g * dd
+            + self.u2 * (q * self.c2 * dd + 2.0 * self.eta_g * dd_g)
+            + self.u1 * dd_gg;
+        [[t00, t01], [t01, t11]]
+    }
+
+    #[inline]
+    fn fourth_contracted(&self, q: f64, uq: f64, ug: f64, vq: f64, vg: f64) -> [[f64; 2]; 2] {
+        let du = self.eta_q * uq + self.eta_g * ug;
+        let dv = self.eta_q * vq + self.eta_g * vg;
+        let du_a = [self.c1 * ug, self.c1 * uq + q * self.c2 * ug];
+        let dv_a = [self.c1 * vg, self.c1 * vq + q * self.c2 * vg];
+        let du_ab = [
+            [0.0, self.c2 * ug],
+            [self.c2 * ug, self.c2 * uq + q * self.c3 * ug],
+        ];
+        let dv_ab = [
+            [0.0, self.c2 * vg],
+            [self.c2 * vg, self.c2 * vq + q * self.c3 * vg],
+        ];
+        let dduv = self.c1 * (uq * vg + ug * vq) + q * self.c2 * ug * vg;
+        let dduv_a = [
+            self.c2 * ug * vg,
+            self.c2 * (uq * vg + ug * vq) + q * self.c3 * ug * vg,
+        ];
+        let dduv_ab = [
+            [0.0, self.c3 * ug * vg],
+            [
+                self.c3 * ug * vg,
+                self.c3 * (uq * vg + ug * vq) + q * self.c4 * ug * vg,
+            ],
+        ];
+        let eta_a = [self.eta_q, self.eta_g];
+        let eta_ab = [[0.0, self.c1], [self.c1, q * self.c2]];
+        let mut f = [[0.0f64; 2]; 2];
+        for a in 0..2 {
+            for b in a..2 {
+                let val = self.u4 * eta_a[a] * eta_a[b] * du * dv
+                    + self.u3
+                        * (eta_ab[a][b] * du * dv
+                            + du_a[a] * eta_a[b] * dv
+                            + dv_a[a] * eta_a[b] * du
+                            + du_a[b] * eta_a[a] * dv
+                            + dv_a[b] * eta_a[a] * du
+                            + dduv * eta_a[a] * eta_a[b])
+                    + self.u2
+                        * (eta_ab[a][b] * dduv
+                            + du_a[a] * dv_a[b]
+                            + dv_a[a] * du_a[b]
+                            + du_ab[a][b] * dv
+                            + dv_ab[a][b] * du
+                            + eta_a[b] * dduv_a[a]
+                            + eta_a[a] * dduv_a[b])
+                    + self.u1 * dduv_ab[a][b];
+                f[a][b] = val;
+                f[b][a] = val;
+            }
+        }
+        f
+    }
+}
+
+#[inline]
+fn hand_rigid_transformed_gradient(
+    marginal: BernoulliMarginalLinkMap,
+    kernel: &HandRigidProbitKernel,
+) -> [f64; 2] {
+    [
+        kernel.u1 * kernel.eta_q * marginal.q1,
+        kernel.u1 * kernel.eta_g,
+    ]
+}
+
+#[inline]
+fn hand_rigid_transformed_hessian(
+    marginal: BernoulliMarginalLinkMap,
+    kernel: &HandRigidProbitKernel,
+) -> [[f64; 2]; 2] {
+    let h_q = kernel.primary_hessian(marginal.q);
+    let grad_q = kernel.u1 * kernel.eta_q;
+    [
+        [
+            h_q[0][0] * marginal.q1 * marginal.q1 + grad_q * marginal.q2,
+            h_q[0][1] * marginal.q1,
+        ],
+        [h_q[1][0] * marginal.q1, h_q[1][1]],
+    ]
+}
+
+#[inline]
+fn hand_rigid_internal_third_components(
+    marginal: BernoulliMarginalLinkMap,
+    kernel: &HandRigidProbitKernel,
+) -> (f64, f64, f64, f64) {
+    let q_dir = kernel.third_contracted(marginal.q, 1.0, 0.0);
+    let g_dir = kernel.third_contracted(marginal.q, 0.0, 1.0);
+    (q_dir[0][0], q_dir[0][1], q_dir[1][1], g_dir[1][1])
+}
+
+#[inline]
+fn hand_rigid_transformed_third_full(
+    marginal: BernoulliMarginalLinkMap,
+    kernel: &HandRigidProbitKernel,
+) -> [[[f64; 2]; 2]; 2] {
+    let h_q = kernel.primary_hessian(marginal.q);
+    let grad_q = kernel.u1 * kernel.eta_q;
+    let (f_qqq, f_qqg, f_qgg, f_ggg) = hand_rigid_internal_third_components(marginal, kernel);
+    let q1_sq = marginal.q1 * marginal.q1;
+    let q1_cu = q1_sq * marginal.q1;
+    let f_etaetaeta =
+        f_qqq * q1_cu + 3.0 * h_q[0][0] * marginal.q1 * marginal.q2 + grad_q * marginal.q3;
+    let f_etaetag = f_qqg * q1_sq + h_q[0][1] * marginal.q2;
+    let f_etagg = f_qgg * marginal.q1;
+    hand_third_full_from_symmetric_components(f_etaetaeta, f_etaetag, f_etagg, f_ggg)
+}
+
+#[inline]
+fn hand_third_full_from_symmetric_components(
+    t_qqq: f64,
+    t_qqg: f64,
+    t_qgg: f64,
+    t_ggg: f64,
+) -> [[[f64; 2]; 2]; 2] {
+    let mut t = [[[0.0; 2]; 2]; 2];
+    t[0][0][0] = t_qqq;
+    t[0][0][1] = t_qqg;
+    t[0][1][0] = t_qqg;
+    t[1][0][0] = t_qqg;
+    t[0][1][1] = t_qgg;
+    t[1][0][1] = t_qgg;
+    t[1][1][0] = t_qgg;
+    t[1][1][1] = t_ggg;
+    t
+}
+
+#[inline]
+fn hand_rigid_transformed_fourth_full(
+    marginal: BernoulliMarginalLinkMap,
+    kernel: &HandRigidProbitKernel,
+) -> [[[[f64; 2]; 2]; 2]; 2] {
+    let h_q = kernel.primary_hessian(marginal.q);
+    let grad_q = kernel.u1 * kernel.eta_q;
+    let (f_qqq, f_qqg, f_qgg, _) = hand_rigid_internal_third_components(marginal, kernel);
+    let qq = kernel.fourth_contracted(marginal.q, 1.0, 0.0, 1.0, 0.0);
+    let qg = kernel.fourth_contracted(marginal.q, 1.0, 0.0, 0.0, 1.0);
+    let gg = kernel.fourth_contracted(marginal.q, 0.0, 1.0, 0.0, 1.0);
+    let f_qqqq = qq[0][0];
+    let f_qqqg = qq[0][1];
+    let f_qqgg = qq[1][1];
+    let f_qggg = qg[1][1];
+    let f_gggg = gg[1][1];
+    let q1_sq = marginal.q1 * marginal.q1;
+    let q1_cu = q1_sq * marginal.q1;
+    let q1_q = q1_sq * q1_sq;
+    let f_eta4 = f_qqqq * q1_q
+        + 6.0 * f_qqq * q1_sq * marginal.q2
+        + 3.0 * h_q[0][0] * marginal.q2 * marginal.q2
+        + 4.0 * h_q[0][0] * marginal.q1 * marginal.q3
+        + grad_q * marginal.q4;
+    let f_eta3g =
+        f_qqqg * q1_cu + 3.0 * f_qqg * marginal.q1 * marginal.q2 + h_q[0][1] * marginal.q3;
+    let f_eta2g2 = f_qqgg * q1_sq + f_qgg * marginal.q2;
+    let f_etag3 = f_qggg * marginal.q1;
+    hand_fourth_full_from_symmetric_components(f_eta4, f_eta3g, f_eta2g2, f_etag3, f_gggg)
+}
+
+#[inline]
+fn hand_fourth_full_from_symmetric_components(
+    t_qqqq: f64,
+    t_qqqg: f64,
+    t_qqgg: f64,
+    t_qggg: f64,
+    t_gggg: f64,
+) -> [[[[f64; 2]; 2]; 2]; 2] {
+    let mut t = [[[[0.0; 2]; 2]; 2]; 2];
+    for a in 0..2 {
+        for b in 0..2 {
+            for c in 0..2 {
+                for d in 0..2 {
+                    let g_count = a + b + c + d;
+                    t[a][b][c][d] = match g_count {
+                        0 => t_qqqq,
+                        1 => t_qqqg,
+                        2 => t_qqgg,
+                        3 => t_qggg,
+                        _ => t_gggg,
+                    };
+                }
+            }
+        }
+    }
+    t
+}
+
+fn hand_rigid_standard_normal_row_kernel(
+    marginal: BernoulliMarginalLinkMap,
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
+    let kernel = HandRigidProbitKernel::new(marginal.q, g, z, y, w, probit_scale)?;
+    Ok((
+        -w * kernel.logcdf,
+        hand_rigid_transformed_gradient(marginal, &kernel),
+        hand_rigid_transformed_hessian(marginal, &kernel),
+    ))
+}
+
+fn hand_rigid_standard_normal_third_full(
+    marginal: BernoulliMarginalLinkMap,
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<[[[f64; 2]; 2]; 2], String> {
+    let kernel = HandRigidProbitKernel::new(marginal.q, g, z, y, w, probit_scale)?;
+    Ok(hand_rigid_transformed_third_full(marginal, &kernel))
+}
+
+fn hand_rigid_standard_normal_fourth_full(
+    marginal: BernoulliMarginalLinkMap,
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<[[[[f64; 2]; 2]; 2]; 2], String> {
+    let kernel = HandRigidProbitKernel::new(marginal.q, g, z, y, w, probit_scale)?;
+    Ok(hand_rigid_transformed_fourth_full(marginal, &kernel))
+}
+
+fn assert_scalar_close(actual: f64, expected: f64, tol: f64, context: &str) {
+    let denom = actual.abs().max(expected.abs()).max(1.0);
+    let rel = (actual - expected).abs() / denom;
+    assert!(
+        rel <= tol,
+        "{context}: actual={actual:.17e}, expected={expected:.17e}, rel={rel:.3e}, tol={tol:.3e}"
+    );
+}
+
+#[test]
+fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
+    let link = bernoulli_marginal_slope_probit_link();
+    let eta_grid = [-8.0, -6.5, -2.0, -0.4, 0.0, 0.75, 2.25, 6.0, 8.0];
+    let g_grid = [-1.4, -0.55, 0.0, 0.8, 1.7];
+    let z_grid = [-2.25, -0.35, 0.4, 2.1];
+    let tol = 2.0e-12;
+
+    for eta in eta_grid {
+        let marginal = bernoulli_marginal_link_map(&link, eta).expect("marginal map");
+        for g in g_grid {
+            for z in z_grid {
+                for y in [0.0, 1.0] {
+                    for weight in [1.0, 1.3] {
+                        for probit_scale in [1.0, 0.7] {
+                            let production = rigid_standard_normal_row_kernel(
+                                marginal,
+                                g,
+                                z,
+                                y,
+                                weight,
+                                probit_scale,
+                            )
+                            .expect("production row kernel");
+                            let hand = hand_rigid_standard_normal_row_kernel(
+                                marginal,
+                                g,
+                                z,
+                                y,
+                                weight,
+                                probit_scale,
+                            )
+                            .expect("hand row kernel");
+                            assert_scalar_close(
+                                production.0,
+                                hand.0,
+                                tol,
+                                &format!(
+                                    "value eta={eta} g={g} z={z} y={y} w={weight} scale={probit_scale}"
+                                ),
+                            );
+                            for i in 0..2 {
+                                assert_scalar_close(
+                                    production.1[i],
+                                    hand.1[i],
+                                    tol,
+                                    &format!(
+                                        "gradient[{i}] eta={eta} g={g} z={z} y={y} w={weight} scale={probit_scale}"
+                                    ),
+                                );
+                                for j in 0..2 {
+                                    assert_scalar_close(
+                                        production.2[i][j],
+                                        hand.2[i][j],
+                                        tol,
+                                        &format!(
+                                            "hessian[{i},{j}] eta={eta} g={g} z={z} y={y} w={weight} scale={probit_scale}"
+                                        ),
+                                    );
+                                }
+                            }
+
+                            let production_third = rigid_standard_normal_third_full(
+                                marginal,
+                                g,
+                                z,
+                                y,
+                                weight,
+                                probit_scale,
+                            )
+                            .expect("production third");
+                            let hand_third = hand_rigid_standard_normal_third_full(
+                                marginal,
+                                g,
+                                z,
+                                y,
+                                weight,
+                                probit_scale,
+                            )
+                            .expect("hand third");
+                            for a in 0..2 {
+                                for b in 0..2 {
+                                    for c in 0..2 {
+                                        assert_scalar_close(
+                                            production_third[a][b][c],
+                                            hand_third[a][b][c],
+                                            tol,
+                                            &format!(
+                                                "third[{a},{b},{c}] eta={eta} g={g} z={z} y={y} w={weight} scale={probit_scale}"
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+
+                            let production_fourth = rigid_standard_normal_fourth_full(
+                                marginal,
+                                g,
+                                z,
+                                y,
+                                weight,
+                                probit_scale,
+                            )
+                            .expect("production fourth");
+                            let hand_fourth = hand_rigid_standard_normal_fourth_full(
+                                marginal,
+                                g,
+                                z,
+                                y,
+                                weight,
+                                probit_scale,
+                            )
+                            .expect("hand fourth");
+                            for a in 0..2 {
+                                for b in 0..2 {
+                                    for c in 0..2 {
+                                        for d in 0..2 {
+                                            assert_scalar_close(
+                                                production_fourth[a][b][c][d],
+                                                hand_fourth[a][b][c][d],
+                                                tol,
+                                                &format!(
+                                                    "fourth[{a},{b},{c},{d}] eta={eta} g={g} z={z} y={y} w={weight} scale={probit_scale}"
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn pair_distance(lhs: (f64, f64), rhs: (f64, f64)) -> f64 {
     (lhs.0 - rhs.0).abs() + (lhs.1 - rhs.1).abs()
 }
@@ -8733,6 +9176,284 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         obj_shift > 1e-6,
         "#740 penalty-fold test is vacuous: ½βᵀS_ψψβ penalty contributes ~0 to the objective"
     );
+}
+
+#[test]
+fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
+    use crate::families::custom_family::build_psi_hyper_coords;
+    use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
+    use crate::solver::estimate::reml::unified::{DenseSpectralOperator, HessianOperator};
+
+    let n = 32usize;
+    let y: Array1<f64> =
+        Array1::from_iter((0..n).map(|i| if (i * 41 + 13) % 5 >= 3 { 1.0 } else { 0.0 }));
+    let weights = Array1::from_elem(n, 1.0);
+    let z: Array1<f64> =
+        Array1::from_iter((0..n).map(|i| -1.1 + 2.2 * ((i % 6) as f64 + 0.5) / 6.0));
+    let marginal = Array2::from_shape_fn((n, 2), |(r, c)| {
+        if c == 0 {
+            1.0
+        } else {
+            ((r * 17 + 3) % 13) as f64 / 13.0 - 0.5
+        }
+    });
+    let logslope = Array2::from_shape_fn((n, 1), |_| 1.0);
+    let family = BernoulliMarginalSlopeFamily {
+        y: Arc::new(y),
+        weights: Arc::new(weights),
+        z: Arc::new(z),
+        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            marginal.clone(),
+        )),
+        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(logslope)),
+        ..default_test_family()
+    };
+
+    let beta_marginal = array![0.3, -0.2];
+    let states = vec![
+        ParameterBlockState {
+            beta: beta_marginal.clone(),
+            eta: marginal.dot(&beta_marginal),
+        },
+        ParameterBlockState {
+            beta: array![0.25],
+            eta: Array1::from_elem(n, 0.25),
+        },
+    ];
+
+    let s_pen = array![[1.4_f64, 0.2], [0.2, 1.1]];
+    let mut marginal_spec = dummy_blockspec(2, n);
+    marginal_spec.penalties = vec![crate::custom_family::PenaltyMatrix::Dense(s_pen.clone())];
+    let specs = vec![marginal_spec, dummy_blockspec(1, n)];
+    let penalty_counts = vec![1usize, 0usize];
+    let rho = array![0.15_f64];
+
+    let x_psi_0 = Array2::from_shape_fn((n, 2), |(r, c)| {
+        ((r * 7 + c * 3 + 1) % 9) as f64 / 9.0 - 0.4
+    });
+    let x_psi_1 = Array2::from_shape_fn((n, 2), |(r, c)| {
+        ((r * 5 + c * 2 + 4) % 8) as f64 / 8.0 - 0.55
+    });
+    let s_psi_0 = array![[1.10_f64, 0.25], [0.25, 0.80]];
+    let s_psi_1 = array![[0.90_f64, -0.30], [-0.30, 1.05]];
+    let s_pp_0 = vec![
+        array![[0.70_f64, 0.12], [0.12, 0.40]],
+        array![[0.45_f64, -0.18], [-0.18, 0.55]],
+    ];
+    let s_pp_1 = vec![
+        array![[0.45_f64, -0.18], [-0.18, 0.55]],
+        array![[0.95_f64, 0.20], [0.20, 0.65]],
+    ];
+    let derivative_blocks = vec![
+        vec![
+            crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                Some(0),
+                x_psi_0,
+                s_psi_0,
+                None,
+                None,
+                Some(s_pp_0),
+                None,
+            ),
+            crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                Some(0),
+                x_psi_1,
+                s_psi_1,
+                None,
+                None,
+                Some(s_pp_1),
+                None,
+            ),
+        ],
+        Vec::new(),
+    ];
+    let psi_dim: usize = derivative_blocks.iter().map(Vec::len).sum();
+    assert_eq!(psi_dim, 2, "fixture should expose two ψ coordinates");
+
+    let opts = BlockwiseFitOptions::default();
+    let workspace = family
+        .exact_newton_joint_psi_workspace_with_options(&states, &specs, &derivative_blocks, &opts)
+        .expect("psi workspace")
+        .expect("psi workspace some");
+    let batched = family
+        .batched_outer_gradient_terms(
+            &states,
+            &specs,
+            &derivative_blocks,
+            &rho,
+            &opts,
+            None,
+        )
+        .expect("batched outer gradient")
+        .expect("batched terms some");
+
+    let ranges = BernoulliMarginalSlopeFamily::block_ranges_from_specs(&specs);
+    let total = ranges.last().map(|(_, end)| *end).expect("nonempty specs");
+    let theta_dim = rho.len() + psi_dim;
+    let beta = BernoulliMarginalSlopeFamily::flatten_block_state_betas_for_specs(&states, &specs)
+        .expect("flatten beta");
+    assert_eq!(beta.len(), total);
+
+    let ridge = opts.ridge_floor.max(1e-15);
+    let mut h = family
+        .exact_newton_joint_hessian(&states)
+        .expect("joint hessian")
+        .expect("joint hessian some");
+    let mut manual_objective_theta = Array1::<f64>::zeros(theta_dim);
+    let mut manual_trace_s_pinv_sdot = Array1::<f64>::zeros(theta_dim);
+    let mut penalties_dense: Vec<Vec<Array2<f64>>> = Vec::with_capacity(specs.len());
+    let mut penalty_cursor = 0usize;
+    for (block_idx, spec) in specs.iter().enumerate() {
+        let count = spec.penalties.len();
+        let block_rho = rho
+            .slice(ndarray::s![penalty_cursor..penalty_cursor + count])
+            .to_owned();
+        let (start, end) = ranges[block_idx];
+        let beta_block = beta.slice(ndarray::s![start..end]);
+        let mut s_lambda = Array2::<f64>::zeros((end - start, end - start));
+        let mut block_penalties = Vec::with_capacity(count);
+        for (local_idx, penalty) in spec.penalties.iter().enumerate() {
+            let dense = penalty.to_dense();
+            let lambda = block_rho[local_idx].exp();
+            let s_beta = dense.dot(&beta_block);
+            manual_objective_theta[penalty_cursor + local_idx] =
+                0.5 * lambda * beta_block.dot(&s_beta);
+            s_lambda.scaled_add(lambda, &dense);
+            block_penalties.push(dense);
+        }
+        h.slice_mut(ndarray::s![start..end, start..end])
+            .scaled_add(1.0, &s_lambda);
+        penalties_dense.push(block_penalties);
+        penalty_cursor += count;
+    }
+    if opts.ridge_policy.include_quadratic_penalty || opts.ridge_policy.include_penalty_logdet {
+        for diag in 0..total {
+            h[[diag, diag]] += ridge;
+        }
+    }
+
+    let penalty_logdet_ridge = if opts.ridge_policy.include_penalty_logdet {
+        ridge
+    } else {
+        0.0
+    };
+    let mut penalty_logdet_blocks = Vec::with_capacity(specs.len());
+    penalty_cursor = 0;
+    for (block_idx, spec) in specs.iter().enumerate() {
+        let count = spec.penalties.len();
+        let block_rho = rho
+            .slice(ndarray::s![penalty_cursor..penalty_cursor + count])
+            .to_owned();
+        let lambdas = block_rho.mapv(f64::exp).to_vec();
+        let pld = PenaltyPseudologdet::from_components(
+            &penalties_dense[block_idx],
+            &lambdas,
+            penalty_logdet_ridge,
+        )
+        .expect("penalty pseudologdet");
+        let first = pld.rho_derivatives(&penalties_dense[block_idx], &lambdas).0;
+        for (local_idx, value) in first.iter().enumerate() {
+            manual_trace_s_pinv_sdot[penalty_cursor + local_idx] = *value;
+        }
+        penalty_cursor += spec.penalties.len();
+        penalty_logdet_blocks.push(pld);
+    }
+
+    let spectral = DenseSpectralOperator::from_symmetric_with_mode(&h, family.pseudo_logdet_mode())
+        .expect("dense spectral");
+    let mut manual_trace_h_inv_hdot = Array1::<f64>::zeros(theta_dim);
+    let mut directions = Array2::<f64>::zeros((total, theta_dim));
+    penalty_cursor = 0;
+    for (block_idx, spec) in specs.iter().enumerate() {
+        let (start, end) = ranges[block_idx];
+        let beta_block = beta.slice(ndarray::s![start..end]);
+        for (local_idx, penalty) in spec.penalties.iter().enumerate() {
+            let idx = penalty_cursor + local_idx;
+            let lambda = rho[idx].exp();
+            let dense = penalty.to_dense();
+            manual_trace_h_inv_hdot[idx] +=
+                spectral.trace_logdet_block_local(&dense, lambda, start, end);
+            let curvature_rhs = dense.dot(&beta_block).mapv(|value| lambda * value);
+            let mut rhs = Array1::<f64>::zeros(total);
+            rhs.slice_mut(ndarray::s![start..end])
+                .assign(&curvature_rhs);
+            let v = spectral.solve(&rhs);
+            directions.column_mut(idx).assign(&(-&v));
+        }
+        penalty_cursor += spec.penalties.len();
+    }
+
+    let rho_slice = rho.as_slice().expect("rho contiguous");
+    let psi_coords = build_psi_hyper_coords(
+        &family,
+        &states,
+        &specs,
+        &derivative_blocks,
+        &beta,
+        rho_slice,
+        &penalty_counts,
+        Some(&penalty_logdet_blocks),
+        !family.exact_newton_joint_hessian_beta_dependent(),
+        Some(workspace),
+    )
+    .expect("psi hyper coords");
+    assert_eq!(psi_coords.len(), psi_dim);
+    for (psi_index, coord) in psi_coords.iter().enumerate() {
+        let idx = rho.len() + psi_index;
+        manual_objective_theta[idx] = coord.a;
+        manual_trace_s_pinv_sdot[idx] = coord.ld_s;
+        if let Some(dense) = coord.drift.dense.as_ref() {
+            manual_trace_h_inv_hdot[idx] += spectral.trace_logdet_gradient(dense);
+        }
+        if let Some(block_local) = coord.drift.block_local.as_ref() {
+            manual_trace_h_inv_hdot[idx] += spectral.trace_logdet_block_local(
+                &block_local.local,
+                1.0,
+                block_local.start,
+                block_local.end,
+            );
+        }
+        if let Some(operator) = coord.drift.operator_ref() {
+            manual_trace_h_inv_hdot[idx] += spectral.trace_logdet_operator(operator);
+        }
+        let v = spectral.solve(&coord.g);
+        directions.column_mut(idx).assign(&(-&v));
+    }
+
+    let cache = family
+        .build_exact_eval_cache_with_options(&states, Some(&opts))
+        .expect("exact eval cache");
+    let correction_traces = family
+        .batched_rho_correction_logdet_traces_full_rows(
+            &states,
+            &cache,
+            spectral.logdet_gradient_factor(),
+            &directions,
+        )
+        .expect("batched correction traces");
+    manual_trace_h_inv_hdot += &correction_traces;
+
+    for idx in 0..theta_dim {
+        let label = if idx < rho.len() { "rho" } else { "psi" };
+        assert_scalar_close(
+            batched.objective_theta[idx],
+            manual_objective_theta[idx],
+            1.0e-11,
+            &format!("{label}[{idx}] objective_theta"),
+        );
+        assert_scalar_close(
+            batched.trace_h_inv_hdot[idx],
+            manual_trace_h_inv_hdot[idx],
+            1.0e-10,
+            &format!("{label}[{idx}] trace_h_inv_hdot"),
+        );
+        assert_scalar_close(
+            batched.trace_s_pinv_sdot[idx],
+            manual_trace_s_pinv_sdot[idx],
+            1.0e-11,
+            &format!("{label}[{idx}] trace_s_pinv_sdot"),
+        );
+    }
 }
 
 /// #740 (option B): the INDEPENDENT ground-truth gate — the analytic outer
