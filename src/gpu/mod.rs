@@ -400,8 +400,14 @@ mod policy_tests {
             gpu_available: false,
             ..base
         }));
-        // Below row floor.
+        // Below dense-work floor.
         assert!(!pol.should_use_gpu_pirls_loop(PirlsLoopAdmission { n: 1_000, ..base }));
+        // Small n with large p is admitted because 2*n*p^2 clears the work floor.
+        assert!(pol.should_use_gpu_pirls_loop(PirlsLoopAdmission {
+            n: 2_000,
+            p: 2_048,
+            ..base
+        }));
         // Below column floor.
         assert!(!pol.should_use_gpu_pirls_loop(PirlsLoopAdmission { p: 8, ..base }));
         // Custom family (not in 6 JIT-cached set) declines.

@@ -3775,6 +3775,17 @@ impl SaeOuterRhoGradientComponents {
 
     #[must_use]
     pub fn gradient_with_available_correction(&self) -> Array1<f64> {
+        // The name is a contract: callers asking for the corrected gradient
+        // must not silently receive the uncorrected one. Zeros-by-omission in
+        // the correction channel are exactly the objective↔gradient desync
+        // class; fail loudly instead.
+        assert!(
+            self.third_order_correction_available,
+            "gradient_with_available_correction: third-order correction channel \
+             is not populated for this fit; use \
+             gradient_excluding_unavailable_correction() and account for the \
+             missing term explicitly"
+        );
         &self.gradient_excluding_unavailable_correction() + &self.third_order_correction
     }
 }
