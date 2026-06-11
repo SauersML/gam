@@ -1090,6 +1090,45 @@ impl EvidenceCertification {
             EvidenceCertification::Coreset { certificate } => certificate.race_transfer_margin(),
         }
     }
+
+    /// The unified [`Verdict`](crate::inference::certificates::Verdict) for a race
+    /// won by lead `race_lead` over the runner-up, on the shared certificate
+    /// ladder (task #16). The race transfers its approximate-evidence verdict to
+    /// the full corpus only when the lead strictly clears [`Self::required_margin`]
+    /// — otherwise the consumer must refine or fall back to the exact dense path,
+    /// so the verdict is `Insufficient`, never a silent pass. Exact evidence with
+    /// any positive lead is `Certified`. A non-finite or non-positive lead leaves
+    /// the race undecided (`Insufficient`); the per-family margin verdicts
+    /// ([`crate::inference::certificate_impls::coreset_race_verdict`],
+    /// [`crate::inference::certificate_impls::enclosure_margin_verdict`]) supply
+    /// the underlying mapping so there is one source of truth.
+    pub fn race_verdict(&self, race_lead: f64) -> crate::inference::certificates::Verdict {
+        use crate::inference::certificates::Verdict;
+        if !(race_lead.is_finite() && race_lead > 0.0) {
+            return Verdict::Insufficient;
+        }
+        match self {
+            EvidenceCertification::Exact => Verdict::Certified,
+            EvidenceCertification::Enclosure { gap } => {
+                let enclosure = crate::solver::logdet_bounds::LogdetEnclosure {
+                    block_diag_logdet: 0.0,
+                    lower: 0.0,
+                    upper: *gap,
+                    rho: 0.0,
+                    p2: 0.0,
+                    p3: None,
+                };
+                crate::inference::certificate_impls::enclosure_margin_verdict(
+                    &enclosure, race_lead,
+                )
+            }
+            EvidenceCertification::Coreset { certificate } => {
+                crate::inference::certificate_impls::coreset_race_verdict(
+                    certificate.certify_margin(race_lead),
+                )
+            }
+        }
+    }
 }
 
 /// One candidate entering the cross-class adjudicator: its kind, its rank-aware
@@ -1508,6 +1547,32 @@ mod tests {
             .insufficient_margin
             .expect("lead inside the coreset transfer margin must be flagged");
         assert!((escalation.required_margin - required).abs() < 1e-9);
+    }
+
+    /// The unified certificate ladder (#16): `EvidenceCertification::race_verdict`
+    /// maps the same margin contract onto `Verdict`. Exact transfers at any
+    /// positive lead; an enclosure / coreset certifies only when the lead clears
+    /// the required margin, else `Insufficient` (never a silent pass).
+    #[test]
+    fn race_verdict_maps_onto_unified_ladder() {
+        use crate::inference::certificates::Verdict;
+        assert_eq!(
+            EvidenceCertification::Exact.race_verdict(1e-6),
+            Verdict::Certified
+        );
+        // Non-positive lead is undecided regardless of certification.
+        assert_eq!(
+            EvidenceCertification::Exact.race_verdict(0.0),
+            Verdict::Insufficient
+        );
+        let enc = EvidenceCertification::Enclosure { gap: 0.2 };
+        assert_eq!(enc.race_verdict(0.5), Verdict::Certified);
+        assert_eq!(enc.race_verdict(0.1), Verdict::Insufficient);
+        let cert = CoresetCertificate::new(0.05, 0.1, 32, 1000).expect("certificate");
+        let required = cert.race_transfer_margin();
+        let coreset = EvidenceCertification::Coreset { certificate: cert };
+        assert_eq!(coreset.race_verdict(0.5 * required), Verdict::Insufficient);
+        assert_eq!(coreset.race_verdict(2.0 * required + 1.0), Verdict::Certified);
     }
 
     #[test]
