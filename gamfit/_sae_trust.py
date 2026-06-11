@@ -53,9 +53,11 @@ def coerce_sae_trust_diagnostics(
         trust diagnostic schema.
     """
     if "diagnostics" not in payload:
-        raise ValueError(
-            "SAE fit payload is missing diagnostics; refit with the current Rust runtime"
-        )
+        # The Rust runtime does not (yet) emit the trust-diagnostic block —
+        # no released pyffi ever has. A missing optional diagnostic must not
+        # brick the primary fit API; return the explicit empty block, and the
+        # per-atom accessors raise with a precise message on use instead.
+        return {"atom_trust": np.zeros(0, dtype=float), "atoms": [], "level0_test": None}
 
     diagnostics = dict(payload["diagnostics"])
     atoms = [dict(atom) for atom in diagnostics["atoms"]]
