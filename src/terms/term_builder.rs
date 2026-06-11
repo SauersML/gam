@@ -52,6 +52,11 @@ const DEFAULT_BSPLINE_DEGREE: usize = 3;
 /// `m=`) option is absent. Second-order (curvature) is the standard P-spline
 /// convention.
 const DEFAULT_PENALTY_ORDER: usize = 2;
+/// Default shared-marginal basis dimension for `bs="fs"` factor smooths, matching
+/// mgcv's `fs` default `k=10`. A factor smooth shares one marginal across all
+/// levels; a modest basis recovers the shared signal without over-fitting each
+/// group's within-group noise (gam#903). Overridden by an explicit `k`/`basis_dim`.
+const FS_DEFAULT_BASIS_DIM: usize = 10;
 
 /// Default row-chunk size for the out-of-core PCA-basis smooth when the
 /// `chunk_size=` option is absent. Streams the design in row blocks to bound
@@ -1469,7 +1474,26 @@ pub fn build_smooth_basis(
             // minimal smoother that can still bend if the data demand it.
             let basis_cap = min_group_resolution.saturating_sub(2).max(degree + 2);
             let internal_cap = basis_cap.saturating_sub(degree + 1);
-            pooled_internal.min(internal_cap.max(1))
+            let capped = pooled_internal.min(internal_cap.max(1));
+            // A factor smooth shares ONE marginal across ALL levels, each level's
+            // curve fit from that group's rows alone. The pooled knot heuristic
+            // (driven by the full column's sample) hands it a much richer basis
+            // than the shared signal needs — ~24 functions/group on the gam#903
+            // factor-smooth-recovery fixture — so REML has the capacity to fit
+            // within-group noise and over-fits the shared shape (edf 58 vs mgcv's
+            // k=10/edf 39, losing the truth-recovery head-to-head). mgcv's `fs`
+            // default `k=10` embodies the right convention: a modest shared
+            // marginal. Cap the fs marginal there (basis ≈ degree+1+internal ≈ 10)
+            // when the small-group cap above is not already tighter, so REML is
+            // not handed noise-fitting capacity it does not need. An explicit `k`
+            // overrides this (parse_ps_internal_knots), and `sz` keeps its own
+            // deviation basis.
+            if type_opt == "fs" {
+                let fs_default_internal = FS_DEFAULT_BASIS_DIM.saturating_sub(degree + 1).max(1);
+                capped.min(fs_default_internal)
+            } else {
+                capped
+            }
         };
         let (n_knots, _) = parse_ps_internal_knots(options, degree, default_internal)?;
         let marginal = BSplineBasisSpec {
