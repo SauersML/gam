@@ -57,7 +57,7 @@ def _tile_circle_line(rng):
     s = rng.uniform(-1.4, 1.4, n)
     line = np.column_stack([0.45 * s + 1.7, 0.9 * s])
     x = np.vstack([circ, line]) + 0.05 * rng.standard_normal((2 * n, 2))
-    return x, dict(K=2, d_atom=[1, 1], atom_topology=["circle", "euclidean"]), np.repeat([0, 1], n)
+    return x, dict(K=2, d_atom=[1, 1], atom_basis=["periodic", "duchon"]), np.repeat([0, 1], n)
 
 
 def _tile_three_shapes(rng):
@@ -71,7 +71,7 @@ def _tile_three_shapes(rng):
     x = np.vstack([circ, line, par]) + 0.05 * rng.standard_normal((3 * n, 2))
     return (
         x,
-        dict(K=3, d_atom=[1, 1, 1], atom_topology=["circle", "euclidean", "euclidean"]),
+        dict(K=3, d_atom=[1, 1, 1], atom_basis=["periodic", "duchon", "duchon"]),
         np.repeat([0, 1, 2], n),
     )
 
@@ -83,7 +83,7 @@ def _tile_intersecting(rng):
     s = rng.uniform(-1.8, 1.8, n)
     line = np.column_stack([s, 0.35 * s])  # passes through the circle
     x = np.vstack([circ, line]) + 0.04 * rng.standard_normal((2 * n, 2))
-    return x, dict(K=2, d_atom=[1, 1], atom_topology=["circle", "euclidean"]), np.repeat([0, 1], n)
+    return x, dict(K=2, d_atom=[1, 1], atom_basis=["periodic", "duchon"]), np.repeat([0, 1], n)
 
 
 def _tile_tiny_n(rng):
