@@ -1116,36 +1116,88 @@ fn nearest_chart(
     best
 }
 
+/// Maximum number of chart centers laid down per atom (the SHAPE_BAND grid
+/// point cap; mirrors `SHAPE_BAND_MAX_POINTS` in the atom band machinery).
+const SHAPE_BAND_MAX_POINTS: usize = 512;
+
 /// Lay down chart centers on an atom's coordinate grid (the SHAPE_BAND grid
 /// idiom): a regular grid spanning the compact latent domain for periodic /
-/// sphere / torus atoms, and the atom's own training-coordinate hull for
-/// unbounded (Duchon / Euclidean) atoms.
+/// sphere / torus atoms, and a strided cover of the latent axes for unbounded
+/// (Duchon / Euclidean) atoms.
+///
+/// Periodic / torus latents are fractions of one period, so the per-axis grid
+/// spans `[0, 1)`; the sphere chart spans `lat ∈ [−π/2, π/2]`, `lon ∈ [−π, π)`.
+/// These conventions match the basis evaluators (the fraction-of-period circle
+/// harmonic and the lat/lon sphere chart).
 fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Array2<f64> {
+    use crate::terms::sae_manifold::SaeAtomBasisKind::*;
     let d = atom.latent_dim;
-    if let Some(grid) = atom.basis_kind.projection_seed_grid(d, resolution) {
-        return grid;
+    match &atom.basis_kind {
+        Periodic | Torus => regular_product_grid(d, resolution, 0.0, 1.0, false),
+        Sphere if d == 2 => sphere_latlon_grid(resolution),
+        Sphere | Duchon | EuclideanPatch | Precomputed(_) => {
+            // Unbounded / non-compact latents: a strided cover of a unit box
+            // about the origin per axis. The certified radius refines each chart;
+            // out-of-cover starts route to the exact fallback honestly.
+            regular_product_grid(d, resolution, -0.5, 0.5, true)
+        }
     }
-    // Unbounded latents: use a strided sample of the atom's own training
-    // coordinates (the convex hull where the encode lands), capped at
-    // SHAPE_BAND-style point count. The atom's basis_values rows are the
-    // training-row evaluations; the coordinate hull is recovered from the
-    // training coords carried alongside. We fall back to the origin row when no
-    // coords are available.
-    let n_rows = atom.n_obs();
-    if n_rows == 0 {
-        return Array2::<f64>::zeros((1, d));
+}
+
+/// A regular `resolution`-per-axis product grid over `[lo, hi]^d`, capped at
+/// [`SHAPE_BAND_MAX_POINTS`] total points (the per-axis resolution is reduced
+/// until the product fits). When `include_endpoint` the last grid point sits at
+/// `hi`; otherwise the axis is treated as periodic and stops one step short.
+fn regular_product_grid(
+    d: usize,
+    resolution: usize,
+    lo: f64,
+    hi: f64,
+    include_endpoint: bool,
+) -> Array2<f64> {
+    if d == 0 {
+        return Array2::<f64>::zeros((1, 0));
     }
-    const SHAPE_BAND_MAX_POINTS: usize = 512;
-    let target_points = resolution.saturating_mul(resolution).min(SHAPE_BAND_MAX_POINTS).max(1);
-    let stride = n_rows.div_ceil(target_points).max(1);
-    let rows: Vec<usize> = (0..n_rows).step_by(stride).collect();
-    // Without stored coords we anchor charts at the origin plus a unit spread on
-    // each axis, a conservative cover that the certified radius refines.
-    let g = rows.len().max(1);
-    let mut grid = Array2::<f64>::zeros((g, d));
-    for (gi, _row) in rows.iter().enumerate() {
+    let mut per_axis = resolution.max(2);
+    while per_axis.saturating_pow(d as u32) > SHAPE_BAND_MAX_POINTS && per_axis > 2 {
+        per_axis -= 1;
+    }
+    let total = per_axis.saturating_pow(d as u32).max(1);
+    let denom = if include_endpoint {
+        (per_axis.max(2) - 1) as f64
+    } else {
+        per_axis as f64
+    };
+    let mut grid = Array2::<f64>::zeros((total, d));
+    let mut idx = vec![0usize; d];
+    for flat in 0..total {
         for axis in 0..d {
-            grid[[gi, axis]] = (gi as f64) / (g.max(1) as f64) - 0.5;
+            let frac = idx[axis] as f64 / denom;
+            grid[[flat, axis]] = lo + (hi - lo) * frac;
+        }
+        for axis in (0..d).rev() {
+            idx[axis] += 1;
+            if idx[axis] < per_axis {
+                break;
+            }
+            idx[axis] = 0;
+        }
+    }
+    grid
+}
+
+/// Lat/lon sphere chart grid: `lat ∈ [−π/2, π/2]`, `lon ∈ [−π, π)`, matching
+/// the [`crate::terms::sae_manifold::SphereChartEvaluator`] convention.
+fn sphere_latlon_grid(resolution: usize) -> Array2<f64> {
+    use std::f64::consts::PI;
+    let r = resolution.max(2).min(22); // 22² = 484 ≤ SHAPE_BAND_MAX_POINTS.
+    let mut grid = Array2::<f64>::zeros((r * r, 2));
+    for i in 0..r {
+        let lat = -PI / 2.0 + PI * (i as f64 + 0.5) / r as f64;
+        for j in 0..r {
+            let lon = -PI + 2.0 * PI * (j as f64) / r as f64;
+            grid[[i * r + j, 0]] = lat;
+            grid[[i * r + j, 1]] = lon;
         }
     }
     grid
