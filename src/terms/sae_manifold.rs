@@ -2953,7 +2953,18 @@ impl SaeManifoldAtom {
         let Some(evaluator) = self.basis_evaluator.as_ref() else {
             return Ok(());
         };
-        let (phi, jet) = evaluator.evaluate(coords)?;
+        // Curvature-homotopy dial (#1007): at the default `η = 1` this is the
+        // un-dialed basis (`evaluate_phi_eta` returns the unscaled Φ / jet
+        // bit-for-bit), so the production path is unchanged. For `η < 1` the
+        // tracker scales the curved columns toward the linear relaxation; the
+        // `dphi_deta` / `djet_deta` channels are discarded here (the predictor
+        // forms `∂g/∂η` separately from a dedicated evaluation).
+        let (phi, jet) = if self.homotopy_eta == 1.0 {
+            evaluator.evaluate(coords)?
+        } else {
+            let evaluated = evaluator.evaluate_phi_eta(coords, self.homotopy_eta)?;
+            (evaluated.phi, evaluated.jet)
+        };
         if phi.dim() != self.basis_values.dim() {
             return Err(format!(
                 "SaeManifoldAtom::refresh_basis: evaluator returned Phi {:?}, expected {:?}",
