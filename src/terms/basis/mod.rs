@@ -8294,19 +8294,6 @@ pub fn build_bspline_basis_1d(
     })
 }
 
-fn project_bspline_penalties(
-    penalties: Vec<Array2<f64>>,
-    transform: &Array2<f64>,
-) -> Vec<Array2<f64>> {
-    penalties
-        .into_iter()
-        .map(|s| {
-            let zt_s = fast_atb(transform, &s);
-            fast_ab(&zt_s, transform)
-        })
-        .collect()
-}
-
 fn compose_bspline_transform(
     existing: Option<Array2<f64>>,
     next: Array2<f64>,
@@ -8485,12 +8472,18 @@ fn build_streaming_bspline_design_and_candidates(
                 chunk,
             )?;
             let z = bspline_sum_to_zero_transform_from_cross(&cross)?;
-            penalty_mats = project_bspline_penalties(penalty_mats, &z);
+            penalty_mats = penalty_mats
+                .into_iter()
+                .map(|s| project_penalty_matrix(&s, Some(&z)))
+                .collect();
             transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
         }
         BSplineIdentifiability::RemoveLinearTrend => {
             let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)?;
-            penalty_mats = project_bspline_penalties(penalty_mats, &z);
+            penalty_mats = penalty_mats
+                .into_iter()
+                .map(|s| project_penalty_matrix(&s, Some(&z)))
+                .collect();
             transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
         }
         BSplineIdentifiability::OrthogonalToDesignColumns { columns, weights } => {
@@ -8504,7 +8497,10 @@ fn build_streaming_bspline_design_and_candidates(
                 weights.as_ref().map(|w| w.view()),
                 chunk,
             )?;
-            penalty_mats = project_bspline_penalties(penalty_mats, &z);
+            penalty_mats = penalty_mats
+                .into_iter()
+                .map(|s| project_penalty_matrix(&s, Some(&z)))
+                .collect();
             transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
         }
         BSplineIdentifiability::FrozenTransform { transform } => {
@@ -8520,7 +8516,10 @@ fn build_streaming_bspline_design_and_candidates(
                 );
             }
             let z = transform.clone();
-            penalty_mats = project_bspline_penalties(penalty_mats, &z);
+            penalty_mats = penalty_mats
+                .into_iter()
+                .map(|s| project_penalty_matrix(&s, Some(&z)))
+                .collect();
             transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
         }
     }

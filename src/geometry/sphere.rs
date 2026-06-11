@@ -210,19 +210,6 @@ impl RiemannianManifold for SphereManifold {
         Ok(identity(self.ambient_dim()))
     }
 
-    fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>> {
-        check_len("Sphere Christoffel point", point.len(), self.ambient_dim())?;
-        self.require_unit(point)?;
-        // The sphere is curved: a zero Christoffel tensor would assert that
-        // geodesics satisfy x''=0 in ambient coordinates, contradicting the
-        // great-circle geodesic x''=−x. There is no flat global chart, and the
-        // embedded connection ∇_ξη = P_p(Dη[ξ]) is not a coordinate Christoffel
-        // tensor, so we refuse rather than hand back false (zero) symbols.
-        Err(GeometryError::Unsupported(
-            "Christoffel symbols of the embedded sphere require a local chart",
-        ))
-    }
-
     fn sectional_curvature(
         &self,
         point: ArrayView1<'_, f64>,

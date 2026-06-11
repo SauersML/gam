@@ -67,7 +67,12 @@ pub trait RiemannianManifold: Send + Sync {
 
     fn metric_tensor(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>>;
 
-    fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>>;
+    fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>> {
+        check_len("Christoffel point", point.len(), self.ambient_dim())?;
+        Err(GeometryError::Unsupported(
+            "Christoffel symbols require a manifold-specific local chart",
+        ))
+    }
 
     fn sectional_curvature(
         &self,
