@@ -1629,7 +1629,8 @@ impl Default for ArrowTrustRegionOptions {
 /// `||r||_inf / (||H||_inf ||x||_inf + ||b||_inf) <= residual_relative_tolerance`.
 ///
 /// The kappa gate enforces `kappa_estimate * u_f32 < kappa_unit_roundoff_margin`;
-/// when it fails, the solver emits a loud fallback message and uses the f64 path.
+/// when it fails, the solve reports [`MixedPrecisionStatus::F64Fallback`] and
+/// logs the reason before using the f64 path.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MixedPrecisionPolicy {
     Off,
