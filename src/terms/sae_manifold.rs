@@ -9349,7 +9349,7 @@ impl SaeManifoldTerm {
                 rhs_t[base + col] = 1.0;
                 let (sol_t, sol_beta) =
                     cache
-                        .solve_full(rhs_t.view(), rhs_beta.view())
+                        .full_inverse_apply(rhs_t.view(), rhs_beta.view())
                         .map_err(|err| {
                             format!("logdet_theta_adjoint: selected inverse solve: {err}")
                         })?;
@@ -9479,9 +9479,9 @@ impl SaeManifoldTerm {
             let rhs = self.outer_rho_gradient_ift_rhs(rho, coord, cache)?;
             let (sol_t, sol_beta) =
                 cache
-                    .solve_full(rhs.t.view(), rhs.beta.view())
+                    .full_inverse_apply(rhs.t.view(), rhs.beta.view())
                     .map_err(|err| {
-                        format!("analytic_outer_rho_gradient_components: solve_full: {err}")
+                        format!("analytic_outer_rho_gradient_components: full_inverse_apply: {err}")
                     })?;
             let mut dot = 0.0_f64;
             for idx in 0..gamma.t.len() {
