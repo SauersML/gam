@@ -8273,6 +8273,7 @@ fn bernoulli_flex_hvp_cache_matches_uncached_path_small_case() {
         primary: cached.primary.clone(),
         row_contexts: cached.row_contexts.clone(),
         row_cell_moments: None,
+        cell_family_forest: None,
         row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
         row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
         row_primary_hessians: RowPrimaryEvalCache::Empty,
@@ -8345,6 +8346,7 @@ fn bernoulli_flex_tiled_hvp_cache_matches_host_cache_small_case() {
         primary: host_cache.primary.clone(),
         row_contexts: host_cache.row_contexts.clone(),
         row_cell_moments: host_cache.row_cell_moments.clone(),
+        cell_family_forest: None,
         row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
         row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
         row_primary_hessians: RowPrimaryEvalCache::Tiled(RowPrimaryEvalTiles::new(
@@ -8431,6 +8433,7 @@ fn bernoulli_flex_hvp_cache_timing_large_scale_shape_pattern() {
         primary: cached.primary.clone(),
         row_contexts: cached.row_contexts.clone(),
         row_cell_moments: None,
+        cell_family_forest: None,
         row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
         row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
         row_primary_hessians: RowPrimaryEvalCache::Empty,
