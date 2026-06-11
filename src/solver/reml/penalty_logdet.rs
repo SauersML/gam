@@ -58,7 +58,7 @@ use faer::Side;
 use ndarray::{Array1, Array2, s};
 use rayon::prelude::*;
 
-use crate::faer_ndarray::FaerEigh;
+use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 
 /// Check whether penalty ranges decompose into independent exact blocks.
 ///
@@ -491,7 +491,35 @@ impl PenaltyPseudologdet {
         let nullity = null_indices.len();
 
         // Value: log|S|₊ = Σ log σ_i for positive eigenvalues.
-        let value: f64 = positive_indices.iter().map(|&idx| evals[idx].ln()).sum();
+        //
+        // Full-rank (nullity == 0) SPD case: prefer the Cholesky
+        // log-determinant over Σ log(eigval). eigh introduces ~ε·max|e|
+        // absolute noise on each eigenvalue, which becomes O(ε·κ(S))
+        // relative noise on log(eigval) once a barely-positive mode sits
+        // near the ridge band. The Cholesky factorization is a direct
+        // backward-stable elimination, so 2·Σ log(diag(L)) carries
+        // ~ε absolute precision on log|S| even at high condition number.
+        // Central-difference FDs of value() in ρ then resolve the
+        // analytic gradient λ_k·σ_k/(λ_k·σ_k+ridge) at step sizes h that
+        // would otherwise drown in eigh noise on the barely-active mode
+        // (gam unit test `test_value_matches_rho_gradient_across_ridge_boundary`
+        // pins the ρ1=-20 deep-band regime).
+        //
+        // Rank-deficient (nullity > 0): keep the eigh-based sum over
+        // positive_indices. Subtracting a Σ log(eigval_null) reconstruction
+        // from the Cholesky log-det would push eigh noise on those null
+        // eigenvalues (~ ε·max|e| / ridge in relative log terms) into
+        // value(), which is materially worse precision than direct
+        // log(eigval_positive) summation when the positive spectrum lies
+        // well above ridge (gam test_components_with_stale_nullity_*).
+        let value: f64 = if nullity == 0
+            && matches!(ridge, Some(r) if r > 0.0)
+            && let Ok(fac) = s_total.cholesky(Side::Lower)
+        {
+            2.0 * fac.diag().iter().map(|d| d.ln()).sum::<f64>()
+        } else {
+            positive_indices.iter().map(|&idx| evals[idx].ln()).sum()
+        };
 
         // W factor: p × rank, W_{:,j} = u_j / √σ_j for positive eigenvalues.
         let mut w_factor = Array2::<f64>::zeros((p_dim, rank));
