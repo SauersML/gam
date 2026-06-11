@@ -1528,6 +1528,7 @@ pub fn survival_fit_from_parts(
             survival_link_wiggle_knots: link_wiggle_knots,
             survival_link_wiggle_degree: link_wiggle_degree,
             criterion_certificate: None,
+            rho_posterior_certificate: None,
         },
         inner_cycles: 0,
     })
@@ -2046,7 +2047,7 @@ fn axpy_dense_row_into(jac: &Array2<f64>, row: usize, alpha: f64, out: &mut [f64
     }
 }
 
-impl RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
+impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     fn n_rows(&self) -> usize {
         self.family.n
     }
