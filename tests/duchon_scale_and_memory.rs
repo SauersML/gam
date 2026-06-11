@@ -25,6 +25,7 @@
 use gam::matrix::LinearOperator;
 use gam::resource::{ProblemHints, ResourcePolicy};
 use gam::smooth::build_term_collection_design;
+use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -36,17 +37,6 @@ use rand_distr::{Distribution, Normal};
 /// Root-mean-square of a slice (used for the trivial-predictor floor).
 fn rms(v: &[f64]) -> f64 {
     (v.iter().map(|&t| t * t).sum::<f64>() / v.len() as f64).sqrt()
-}
-
-/// RMSE between two equal-length slices.
-fn rmse(a: &[f64], b: &[f64]) -> f64 {
-    assert_eq!(a.len(), b.len(), "rmse length mismatch");
-    (a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| (x - y) * (x - y))
-        .sum::<f64>()
-        / a.len() as f64)
-        .sqrt()
 }
 
 /// Build a single-feature dataset `{x, y}` from parallel vectors.

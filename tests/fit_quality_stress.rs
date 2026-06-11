@@ -18,6 +18,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -100,16 +101,6 @@ fn categorize(rmse: f64, sigma: f64, span_ratio: f64) -> Category {
     } else {
         Category::Collapsed
     }
-}
-
-fn rmse(yhat: &[f64], truth: &[f64]) -> f64 {
-    let n = yhat.len() as f64;
-    let s: f64 = yhat
-        .iter()
-        .zip(truth.iter())
-        .map(|(a, b)| (a - b).powi(2))
-        .sum();
-    (s / n).sqrt()
 }
 
 fn span(v: &[f64]) -> f64 {

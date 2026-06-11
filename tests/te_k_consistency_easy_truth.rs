@@ -11,6 +11,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -65,17 +66,6 @@ fn predict_grid(
     let design =
         build_term_collection_design(design_in.view(), &fit.resolvedspec).expect("rebuild");
     (design.design.apply(&fit.fit.beta).to_vec(), pts)
-}
-
-fn rmse(yhat: &[f64], y: &[f64]) -> f64 {
-    let n = y.len() as f64;
-    (yhat
-        .iter()
-        .zip(y.iter())
-        .map(|(a, b)| (a - b).powi(2))
-        .sum::<f64>()
-        / n)
-        .sqrt()
 }
 
 #[test]
