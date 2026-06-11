@@ -529,31 +529,11 @@ pub fn pg_saddlepoint_normal_skew_oracle(state: &mut XorwowState, b: u32, tilt: 
 // Normal-approximation regime (math §10, b > 170) — host oracle
 // ────────────────────────────────────────────────────────────────────────
 
-/// Mean of PG(b, c) (Polson, Scott & Windle 2013, eq. 4):
-/// `E[PG(b,c)] = b · tanh(c/2) / (2c)`, with the `c → 0` limit `b/4`.
-#[inline]
-pub fn pg_mean(b: f64, c: f64) -> f64 {
-    let c_abs = c.abs();
-    if c_abs < 1e-8 {
-        0.25 * b
-    } else {
-        b * (0.5 * c_abs).tanh() / (2.0 * c_abs)
-    }
-}
-
-/// Variance of PG(b, c). Same paper: `Var = b · (sinh(c) - c) / (2 c³ (1 + cosh c))`,
-/// with the `c → 0` limit `b / 24`.
-#[inline]
-pub fn pg_variance(b: f64, c: f64) -> f64 {
-    let c_abs = c.abs();
-    if c_abs < 1e-6 {
-        b / 24.0
-    } else {
-        let cosh_c = c_abs.cosh();
-        let sinh_c = c_abs.sinh();
-        b * (sinh_c - c_abs) / (2.0 * c_abs * c_abs * c_abs * (1.0 + cosh_c))
-    }
-}
+// The closed-form `PG(b, c)` moments live once on the inference side
+// (`crate::inference::pg_moments`) so the deterministic evidence path can use
+// them without depending on this GPU module; re-export keeps the device oracle
+// and the host evidence code on a single source of truth.
+pub use crate::inference::pg_moments::{pg_mean, pg_variance};
 
 /// Lyapunov-CLT closed-form draw for `b > NORMAL_MIN_B`. Truncated at
 /// zero because PG support is `(0, +∞)`.

@@ -13,6 +13,8 @@ pub mod hmc;
 pub mod identifiability_diagnostics;
 pub mod model;
 pub mod model_payload_builders;
+pub mod pg_gate_evidence;
+pub mod pg_moments;
 pub mod polya_gamma;
 pub mod polya_gamma_core;
 pub mod posterior;
