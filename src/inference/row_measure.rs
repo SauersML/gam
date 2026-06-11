@@ -57,7 +57,10 @@
 //! Euclidean — which is precisely the uniform-measure degeneracy we want.
 
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
+use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use crate::linalg::utils::splitmix64_hash;
+use faer::Side;
+use ndarray::{Array2, ArrayView2};
 
 /// Where a [`RowMeasure`] came from — the honest record of whether the
 /// enrichment is real (Fisher-mass driven) or the graceful uniform fallback.
@@ -87,6 +90,354 @@ pub struct RowMeasure {
     /// Normalized per-row sampling weights; `weights.len() == n_rows` and
     /// `Σ weights == 1` (exactly uniform `1/n` in the fallback).
     weights: Vec<f64>,
+}
+
+/// Certified coreset error budget carried to race consumers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoresetCertificate {
+    /// Spectral approximation radius for the log-determinant term:
+    /// `(1 - eps_spectral)H <= H_C <= (1 + eps_spectral)H` on the effective
+    /// eigenspace.
+    pub eps_spectral: f64,
+    /// Additive likelihood error radius supplied by the sensitivity coreset on
+    /// its documented chart ball.
+    pub eps_likelihood: f64,
+    /// Rank of the factored border plus active-coordinate subspace actually
+    /// certified. Null directions of the summed row sketch are excluded.
+    pub dim_effective: usize,
+    /// Number of distinct rows retained by the coreset.
+    pub n_selected: usize,
+}
+
+impl CoresetCertificate {
+    pub fn new(
+        eps_spectral: f64,
+        eps_likelihood: f64,
+        dim_effective: usize,
+        n_selected: usize,
+    ) -> Result<Self, String> {
+        if !(eps_spectral.is_finite() && eps_spectral >= 0.0 && eps_spectral < 1.0) {
+            return Err(format!(
+                "coreset certificate requires 0 <= eps_spectral < 1, got {eps_spectral}"
+            ));
+        }
+        if !(eps_likelihood.is_finite() && eps_likelihood >= 0.0) {
+            return Err(format!(
+                "coreset certificate requires finite non-negative eps_likelihood, got {eps_likelihood}"
+            ));
+        }
+        Ok(Self {
+            eps_spectral,
+            eps_likelihood,
+            dim_effective,
+            n_selected,
+        })
+    }
+
+    /// Worst-case log-determinant transfer error implied by the spectral
+    /// certificate.
+    pub fn logdet_error_bound(&self) -> f64 {
+        self.dim_effective as f64 * ((1.0 + self.eps_spectral) / (1.0 - self.eps_spectral)).ln()
+    }
+
+    /// Race-transfer margin: consumers must require a coreset decision margin
+    /// strictly above this value before inheriting the full-corpus verdict.
+    pub fn race_transfer_margin(&self) -> f64 {
+        2.0 * (self.logdet_error_bound() + self.eps_likelihood)
+    }
+
+    /// Explicit verdict for a proposed coreset race margin. Consumers should
+    /// propagate [`CoresetMarginVerdict::InsufficientMargin`] instead of making
+    /// a silent decision below the certificate margin.
+    pub fn certify_margin(&self, decision_margin: f64) -> CoresetMarginVerdict {
+        let required_margin = self.race_transfer_margin();
+        if decision_margin.is_finite() && decision_margin > required_margin {
+            CoresetMarginVerdict::Certified {
+                decision_margin,
+                required_margin,
+            }
+        } else {
+            CoresetMarginVerdict::InsufficientMargin {
+                decision_margin,
+                required_margin,
+            }
+        }
+    }
+}
+
+/// Certificate gate for coreset-backed race decisions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CoresetMarginVerdict {
+    Certified {
+        decision_margin: f64,
+        required_margin: f64,
+    },
+    InsufficientMargin {
+        decision_margin: f64,
+        required_margin: f64,
+    },
+}
+
+/// Output of deterministic BSS spectral row selection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpectralCoreset {
+    /// Distinct selected row indices, ascending.
+    pub indices: Vec<usize>,
+    /// Non-negative row weights aligned with `indices`.
+    pub weights: Vec<f64>,
+    /// Spectral certificate for this row coreset. `eps_likelihood` is zero here;
+    /// combine with a sensitivity certificate before certifying full evidence.
+    pub certificate: CoresetCertificate,
+}
+
+impl SpectralCoreset {
+    pub fn into_indices_weights(self) -> (Vec<usize>, Vec<f64>) {
+        (self.indices, self.weights)
+    }
+}
+
+/// Deterministic Batson-Spielman-Srivastava spectral row coreset.
+///
+/// Each input item is a small row factor `R_i` with contribution
+/// `H_i = R_i.t() R_i`. Selection is run on the effective eigenspace of
+/// `sum_i H_i`; rank-null directions are excluded from the certificate. The
+/// algorithm whitens the factors into that effective space, then applies the
+/// standard two-barrier BSS potential update with deterministic row-index
+/// tie-breaking. Per-row dense `H_i` blocks are never materialized.
+pub fn bss_spectral_coreset<'a, I>(
+    rows: I,
+    target_eps: f64,
+) -> Result<(Vec<usize>, Vec<f64>), String>
+where
+    I: IntoIterator<Item = ArrayView2<'a, f64>>,
+{
+    Ok(bss_spectral_coreset_certified(rows, target_eps)?.into_indices_weights())
+}
+
+/// Deterministic BSS spectral row coreset with the attached certificate.
+pub fn bss_spectral_coreset_certified<'a, I>(
+    rows: I,
+    target_eps: f64,
+) -> Result<SpectralCoreset, String>
+where
+    I: IntoIterator<Item = ArrayView2<'a, f64>>,
+{
+    if !(target_eps.is_finite() && target_eps > 0.0 && target_eps < 1.0) {
+        return Err(format!(
+            "BSS spectral coreset requires 0 < target_eps < 1, got {target_eps}"
+        ));
+    }
+
+    let factors = collect_row_factors(rows)?;
+    let n = factors.len();
+    if n == 0 {
+        let certificate = CoresetCertificate::new(target_eps, 0.0, 0, 0)?;
+        return Ok(SpectralCoreset {
+            indices: Vec::new(),
+            weights: Vec::new(),
+            certificate,
+        });
+    }
+
+    let ambient_dim = factors[0].ncols();
+    let effective = stacked_factor_whitener(&factors, ambient_dim)?;
+    let dim = effective.ncols();
+    if dim == 0 {
+        let certificate = CoresetCertificate::new(target_eps, 0.0, 0, 0)?;
+        return Ok(SpectralCoreset {
+            indices: Vec::new(),
+            weights: Vec::new(),
+            certificate,
+        });
+    }
+
+    let whitened = whiten_row_factors(&factors, &effective);
+    let eta = 0.5 * target_eps;
+    let steps = ((dim as f64) / (eta * eta)).ceil().max(dim as f64) as usize;
+    let delta_lower = 1.0_f64;
+    let delta_upper = (1.0 + eta) / (1.0 - eta);
+    let root = (steps as f64 * dim as f64).sqrt();
+    let mut barrier_matrix = Array2::<f64>::zeros((dim, dim));
+    let mut row_weights = vec![0.0_f64; n];
+
+    for step in 0..steps {
+        let lower = step as f64 - root;
+        let upper = delta_upper * (step as f64 + root);
+        let lower_next = lower + delta_lower;
+        let upper_next = upper + delta_upper;
+
+        let lower_inv = inverse_shifted_lower(&barrier_matrix, lower_next)?;
+        let upper_inv = inverse_shifted_upper(&barrier_matrix, upper_next)?;
+        let lower_denom = lower_potential(&barrier_matrix, lower_next)?
+            - lower_potential(&barrier_matrix, lower)?;
+        let upper_denom = upper_potential(&barrier_matrix, upper)?
+            - upper_potential(&barrier_matrix, upper_next)?;
+        if !(lower_denom.is_finite() && lower_denom > 0.0) {
+            return Err(format!(
+                "BSS lower potential denominator became invalid at step {step}: {lower_denom}"
+            ));
+        }
+        if !(upper_denom.is_finite() && upper_denom > 0.0) {
+            return Err(format!(
+                "BSS upper potential denominator became invalid at step {step}: {upper_denom}"
+            ));
+        }
+
+        let mut chosen: Option<(usize, f64, f64)> = None;
+        for (row, factor) in whitened.iter().enumerate() {
+            let lower_trace = trace_factor_quadratic(factor, &lower_inv);
+            let lower_trace_sq = trace_factor_quadratic_square(factor, &lower_inv);
+            let upper_trace = trace_factor_quadratic(factor, &upper_inv);
+            let upper_trace_sq = trace_factor_quadratic_square(factor, &upper_inv);
+            let lower_score = lower_trace_sq / lower_denom - lower_trace;
+            let upper_score = upper_trace_sq / upper_denom + upper_trace;
+            if lower_score.is_finite()
+                && upper_score.is_finite()
+                && lower_score > 0.0
+                && upper_score > 0.0
+                && lower_score + BSS_SCORE_TOL >= upper_score
+            {
+                match chosen {
+                    None => chosen = Some((row, lower_score, upper_score)),
+                    Some((best_row, best_lower, best_upper)) => {
+                        let gap = lower_score - upper_score;
+                        let best_gap = best_lower - best_upper;
+                        if gap > best_gap + BSS_SCORE_TOL
+                            || ((gap - best_gap).abs() <= BSS_SCORE_TOL && row < best_row)
+                        {
+                            chosen = Some((row, lower_score, upper_score));
+                        }
+                    }
+                }
+            }
+        }
+
+        let (row, lower_score, upper_score) = chosen
+            .ok_or_else(|| format!("BSS failed to find a barrier-admissible row at step {step}"))?;
+        let inv_step_weight = 0.5 * (lower_score + upper_score);
+        if !(inv_step_weight.is_finite() && inv_step_weight > 0.0) {
+            return Err(format!(
+                "BSS invalid inverse step weight at step {step}: {inv_step_weight}"
+            ));
+        }
+        let step_weight = 1.0 / inv_step_weight;
+        add_factor_gram_scaled(&mut barrier_matrix, &whitened[row], step_weight);
+        row_weights[row] += step_weight;
+    }
+
+    let lower_final = steps as f64 - root;
+    let upper_final = delta_upper * (steps as f64 + root);
+    let scale = 2.0 / (lower_final + upper_final);
+    let mut indexed: Vec<(usize, f64)> = row_weights
+        .into_iter()
+        .enumerate()
+        .filter_map(|(row, weight)| {
+            let scaled = weight * scale;
+            (scaled > 0.0).then_some((row, scaled))
+        })
+        .collect();
+    indexed.sort_by_key(|&(row, _)| row);
+    let indices: Vec<usize> = indexed.iter().map(|&(row, _)| row).collect();
+    let weights: Vec<f64> = indexed.iter().map(|&(_, weight)| weight).collect();
+    let certificate = CoresetCertificate::new(target_eps, 0.0, dim, indices.len())?;
+    Ok(SpectralCoreset {
+        indices,
+        weights,
+        certificate,
+    })
+}
+
+/// Sensitivity upper bounds on the chart ball
+/// `||chart(theta) - chart(theta_anchor)|| <= chart_radius`.
+///
+/// The bound uses the linear-anchor leverage and inflates it by the curvature
+/// slack `kappa_hat * chart_radius`, i.e.
+/// `sigma_i <= leverage_i * (1 + kappa_hat * chart_radius)`. The same ball and
+/// curvature estimate must be used by the likelihood consumer that interprets
+/// the returned additive `eps_likelihood` certificate.
+pub fn sensitivity_upper_bounds(
+    linear_anchor_leverage: &[f64],
+    kappa_hat: f64,
+    chart_radius: f64,
+) -> Result<Vec<f64>, String> {
+    if !(kappa_hat.is_finite() && kappa_hat >= 0.0) {
+        return Err(format!(
+            "sensitivity bounds require finite non-negative kappa_hat, got {kappa_hat}"
+        ));
+    }
+    if !(chart_radius.is_finite() && chart_radius >= 0.0) {
+        return Err(format!(
+            "sensitivity bounds require finite non-negative chart_radius, got {chart_radius}"
+        ));
+    }
+    let inflation = 1.0 + kappa_hat * chart_radius;
+    linear_anchor_leverage
+        .iter()
+        .enumerate()
+        .map(|(row, &lev)| {
+            if lev.is_finite() && lev >= 0.0 {
+                Ok(lev * inflation)
+            } else {
+                Err(format!(
+                    "sensitivity leverage at row {row} must be finite and non-negative, got {lev}"
+                ))
+            }
+        })
+        .collect()
+}
+
+/// Greedy deterministic sensitivity coreset under a row budget.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SensitivityCoreset {
+    /// Selected rows sorted by decreasing sensitivity, then row index.
+    pub indices: Vec<usize>,
+    /// Sensitivity mass retained by the selected rows.
+    pub selected_sensitivity_mass: f64,
+    /// Sensitivity mass not retained by the budget. A likelihood consumer can
+    /// map this to its additive `eps_likelihood` on the documented chart ball.
+    pub residual_sensitivity_mass: f64,
+}
+
+pub fn greedy_sensitivity_coreset(
+    sigma_upper_bounds: &[f64],
+    budget: usize,
+) -> Result<SensitivityCoreset, String> {
+    let mut indexed = Vec::with_capacity(sigma_upper_bounds.len());
+    for (row, &sigma) in sigma_upper_bounds.iter().enumerate() {
+        if !(sigma.is_finite() && sigma >= 0.0) {
+            return Err(format!(
+                "sensitivity upper bound at row {row} must be finite and non-negative, got {sigma}"
+            ));
+        }
+        indexed.push((row, sigma));
+    }
+    indexed.sort_by(|&(row_a, sigma_a), &(row_b, sigma_b)| {
+        sigma_b
+            .partial_cmp(&sigma_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(row_a.cmp(&row_b))
+    });
+    let selected_len = budget.min(indexed.len());
+    let indices: Vec<usize> = indexed
+        .iter()
+        .take(selected_len)
+        .map(|&(row, _)| row)
+        .collect();
+    let selected_sensitivity_mass: f64 = indexed
+        .iter()
+        .take(selected_len)
+        .map(|&(_, sigma)| sigma)
+        .sum();
+    let residual_sensitivity_mass: f64 = indexed
+        .iter()
+        .skip(selected_len)
+        .map(|&(_, sigma)| sigma)
+        .sum();
+    Ok(SensitivityCoreset {
+        indices,
+        selected_sensitivity_mass,
+        residual_sensitivity_mass,
+    })
 }
 
 impl RowMeasure {
@@ -448,6 +799,8 @@ const DESIGNED_SAMPLE_SALT: u64 = 0x73AD_0987_5EED_D51F;
 /// other `splitmix64_hash` use of the same numeric seed elsewhere in the crate.
 const ENRICHMENT_SALT: u64 = 0x980E_1C45_F00D_AC70;
 
+const BSS_SCORE_TOL: f64 = 1e-10;
+
 /// Per-row Fisher mass `tr(M_n)` from the metric's criterion-facing traces.
 ///
 /// The traces are recorded at metric construction (un-floored), so the solver
@@ -458,10 +811,196 @@ pub(crate) fn per_row_fisher_mass(metric: &RowMetric) -> Vec<f64> {
     metric.row_traces().to_vec()
 }
 
+fn collect_row_factors<'a, I>(rows: I) -> Result<Vec<Array2<f64>>, String>
+where
+    I: IntoIterator<Item = ArrayView2<'a, f64>>,
+{
+    let mut out = Vec::new();
+    let mut ambient_dim: Option<usize> = None;
+    for (row, factor) in rows.into_iter().enumerate() {
+        if factor.iter().any(|value| !value.is_finite()) {
+            return Err(format!("BSS row factor {row} contains a non-finite value"));
+        }
+        match ambient_dim {
+            None => ambient_dim = Some(factor.ncols()),
+            Some(expected) if expected != factor.ncols() => {
+                return Err(format!(
+                    "BSS row factor {row} has {} columns, expected {expected}",
+                    factor.ncols()
+                ));
+            }
+            Some(_) => {}
+        }
+        out.push(factor.to_owned());
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+fn summed_factor_gram(factors: &[Array2<f64>], ambient_dim: usize) -> Array2<f64> {
+    let mut total = Array2::<f64>::zeros((ambient_dim, ambient_dim));
+    for factor in factors {
+        add_factor_gram_scaled(&mut total, factor, 1.0);
+    }
+    total
+}
+
+fn stacked_factor_whitener(
+    factors: &[Array2<f64>],
+    ambient_dim: usize,
+) -> Result<Array2<f64>, String> {
+    let total_factor_rows: usize = factors.iter().map(|factor| factor.nrows()).sum();
+    if total_factor_rows == 0 || ambient_dim == 0 {
+        return Ok(Array2::<f64>::zeros((ambient_dim, 0)));
+    }
+
+    let mut stacked = Array2::<f64>::zeros((total_factor_rows, ambient_dim));
+    let mut cursor = 0usize;
+    for factor in factors {
+        for row in 0..factor.nrows() {
+            for col in 0..ambient_dim {
+                stacked[[cursor + row, col]] = factor[[row, col]];
+            }
+        }
+        cursor += factor.nrows();
+    }
+
+    let (_, singular, vt) = stacked
+        .svd(false, true)
+        .map_err(|err| format!("BSS stacked row-factor SVD failed: {err}"))?;
+    let vt = vt.ok_or_else(|| "BSS stacked row-factor SVD did not return Vt".to_string())?;
+    let max_sigma = singular.iter().copied().fold(0.0_f64, f64::max);
+    if !(max_sigma.is_finite() && max_sigma >= 0.0) {
+        return Err("BSS stacked row sketch has invalid singular values".to_string());
+    }
+    let tol = (ambient_dim.max(1) as f64) * f64::EPSILON * max_sigma.max(1.0) * 100.0;
+    let kept: Vec<usize> = singular
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &sigma)| (sigma > tol).then_some(idx))
+        .collect();
+    let mut whitener = Array2::<f64>::zeros((ambient_dim, kept.len()));
+    for (out_col, &sv_col) in kept.iter().enumerate() {
+        let scale = 1.0 / singular[sv_col];
+        for ambient_col in 0..ambient_dim {
+            whitener[[ambient_col, out_col]] = vt[[sv_col, ambient_col]] * scale;
+        }
+    }
+    Ok(whitener)
+}
+
+fn whiten_row_factors(factors: &[Array2<f64>], whitener: &Array2<f64>) -> Vec<Array2<f64>> {
+    factors.iter().map(|factor| factor.dot(whitener)).collect()
+}
+
+fn inverse_shifted_lower(matrix: &Array2<f64>, lower: f64) -> Result<Array2<f64>, String> {
+    let n = matrix.nrows();
+    let mut shifted = matrix.clone();
+    for i in 0..n {
+        shifted[[i, i]] -= lower;
+    }
+    inverse_symmetric_positive(&shifted, "BSS lower barrier inverse")
+}
+
+fn inverse_shifted_upper(matrix: &Array2<f64>, upper: f64) -> Result<Array2<f64>, String> {
+    let n = matrix.nrows();
+    let mut shifted = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        shifted[[i, i]] = upper;
+    }
+    for i in 0..n {
+        for j in 0..n {
+            shifted[[i, j]] -= matrix[[i, j]];
+        }
+    }
+    inverse_symmetric_positive(&shifted, "BSS upper barrier inverse")
+}
+
+fn inverse_symmetric_positive(matrix: &Array2<f64>, context: &str) -> Result<Array2<f64>, String> {
+    let (evals, evecs) = matrix
+        .eigh(Side::Lower)
+        .map_err(|err| format!("{context} eigendecomposition failed: {err}"))?;
+    let n = matrix.nrows();
+    let max_eval = evals.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+    let tol = (n.max(1) as f64) * f64::EPSILON * max_eval * 100.0;
+    let mut inv = Array2::<f64>::zeros((n, n));
+    for k in 0..n {
+        let lambda = evals[k];
+        if !(lambda.is_finite() && lambda > tol) {
+            return Err(format!(
+                "{context} expected a positive barrier matrix, eigenvalue {k} was {lambda}"
+            ));
+        }
+        let inv_lambda = 1.0 / lambda;
+        for i in 0..n {
+            for j in 0..n {
+                inv[[i, j]] += evecs[[i, k]] * inv_lambda * evecs[[j, k]];
+            }
+        }
+    }
+    Ok(inv)
+}
+
+fn lower_potential(matrix: &Array2<f64>, lower: f64) -> Result<f64, String> {
+    let inv = inverse_shifted_lower(matrix, lower)?;
+    Ok((0..inv.nrows()).map(|i| inv[[i, i]]).sum())
+}
+
+fn upper_potential(matrix: &Array2<f64>, upper: f64) -> Result<f64, String> {
+    let inv = inverse_shifted_upper(matrix, upper)?;
+    Ok((0..inv.nrows()).map(|i| inv[[i, i]]).sum())
+}
+
+fn trace_factor_quadratic(factor: &Array2<f64>, matrix: &Array2<f64>) -> f64 {
+    let mut trace = 0.0_f64;
+    for row in 0..factor.nrows() {
+        for i in 0..factor.ncols() {
+            let xi = factor[[row, i]];
+            if xi == 0.0 {
+                continue;
+            }
+            for j in 0..factor.ncols() {
+                trace += xi * matrix[[i, j]] * factor[[row, j]];
+            }
+        }
+    }
+    trace
+}
+
+fn trace_factor_quadratic_square(factor: &Array2<f64>, matrix: &Array2<f64>) -> f64 {
+    let mut trace = 0.0_f64;
+    for row in 0..factor.nrows() {
+        for i in 0..factor.ncols() {
+            let mut v = 0.0_f64;
+            for j in 0..factor.ncols() {
+                v += matrix[[i, j]] * factor[[row, j]];
+            }
+            trace += v * v;
+        }
+    }
+    trace
+}
+
+fn add_factor_gram_scaled(target: &mut Array2<f64>, factor: &Array2<f64>, scale: f64) {
+    let dim = factor.ncols();
+    for row in 0..factor.nrows() {
+        for i in 0..dim {
+            let xi = factor[[row, i]];
+            if xi == 0.0 {
+                continue;
+            }
+            for j in 0..dim {
+                target[[i, j]] += scale * xi * factor[[row, j]];
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::Array2;
+    use ndarray::array;
     use std::sync::Arc;
 
     fn factors_from_rows(rows: &[Vec<f64>], p: usize, rank: usize) -> Arc<Array2<f64>> {
@@ -656,5 +1195,127 @@ mod tests {
             w7 < w_other,
             "loud row weight {w7} must be below quiet row weight {w_other}"
         );
+    }
+
+    fn coreset_dense_oracle(rows: &[Array2<f64>], coreset: &SpectralCoreset) -> Array2<f64> {
+        let dim = rows[0].ncols();
+        let mut approx = Array2::<f64>::zeros((dim, dim));
+        for (&row, &weight) in coreset.indices.iter().zip(coreset.weights.iter()) {
+            add_factor_gram_scaled(&mut approx, &rows[row], weight);
+        }
+        approx
+    }
+
+    fn generalized_effective_spectrum(full: &Array2<f64>, approx: &Array2<f64>) -> Vec<f64> {
+        let (evals, evecs) = full.eigh(Side::Lower).expect("oracle eigh");
+        let max_eval = evals.iter().copied().fold(0.0_f64, f64::max);
+        let tol = (full.ncols().max(1) as f64) * f64::EPSILON * max_eval.max(1.0) * 100.0;
+        let kept: Vec<usize> = evals
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &lambda)| (lambda > tol).then_some(idx))
+            .collect();
+        let mut whitener = Array2::<f64>::zeros((full.ncols(), kept.len()));
+        for (col, &eig_idx) in kept.iter().enumerate() {
+            let scale = 1.0 / evals[eig_idx].sqrt();
+            for row in 0..full.ncols() {
+                whitener[[row, col]] = evecs[[row, eig_idx]] * scale;
+            }
+        }
+        let reduced = whitener.t().dot(approx).dot(&whitener);
+        let (spectrum, _) = reduced.eigh(Side::Lower).expect("reduced oracle eigh");
+        spectrum.to_vec()
+    }
+
+    #[test]
+    fn bss_planted_low_rank_rows_match_dense_oracle_spectrum() {
+        let rows = vec![
+            array![[1.0, 0.0, 0.0, 0.0]],
+            array![[0.0, 2.0, 0.0, 0.0]],
+            array![[1.0, 1.0, 0.0, 0.0]],
+            array![[2.0, -1.0, 0.0, 0.0]],
+            array![[0.5, 1.5, 0.0, 0.0]],
+            array![[1.25, -0.25, 0.0, 0.0]],
+        ];
+        let eps = 0.35;
+        let coreset = bss_spectral_coreset_certified(rows.iter().map(|row| row.view()), eps)
+            .expect("BSS coreset");
+        let full = summed_factor_gram(&rows, rows[0].ncols());
+        let approx = coreset_dense_oracle(&rows, &coreset);
+        let spectrum = generalized_effective_spectrum(&full, &approx);
+
+        assert_eq!(coreset.certificate.dim_effective, 2);
+        assert_eq!(spectrum.len(), 2);
+        for lambda in spectrum {
+            assert!(
+                lambda >= 1.0 - eps - 1e-8 && lambda <= 1.0 + eps + 1e-8,
+                "coreset generalized eigenvalue {lambda} outside [{}, {}]",
+                1.0 - eps,
+                1.0 + eps
+            );
+        }
+    }
+
+    #[test]
+    fn bss_selects_single_row_carrying_unique_direction() {
+        let rows = vec![
+            array![[3.0, 0.0]],
+            array![[2.0, 0.0]],
+            array![[1.0, 0.0]],
+            array![[0.0, 4.0]],
+        ];
+        let coreset = bss_spectral_coreset_certified(rows.iter().map(|row| row.view()), 0.4)
+            .expect("BSS coreset");
+        assert!(
+            coreset.indices.contains(&3),
+            "the only row carrying direction e2 must be selected: {:?}",
+            coreset.indices
+        );
+    }
+
+    #[test]
+    fn bss_selection_is_deterministic() {
+        let rows = vec![
+            array![[1.0, 0.0, 0.0]],
+            array![[0.0, 1.0, 0.0]],
+            array![[0.0, 0.0, 1.0]],
+            array![[1.0, 1.0, 0.0]],
+            array![[0.0, 1.0, 1.0]],
+        ];
+        let a = bss_spectral_coreset_certified(rows.iter().map(|row| row.view()), 0.45)
+            .expect("first BSS coreset");
+        let b = bss_spectral_coreset_certified(rows.iter().map(|row| row.view()), 0.45)
+            .expect("second BSS coreset");
+        assert_eq!(a.indices, b.indices);
+        assert_eq!(a.weights, b.weights);
+        assert_eq!(a.certificate, b.certificate);
+    }
+
+    #[test]
+    fn certificate_reports_insufficient_margin_explicitly() {
+        let certificate = CoresetCertificate::new(0.1, 0.25, 3, 5).expect("certificate");
+        let required = certificate.race_transfer_margin();
+        assert!(matches!(
+            certificate.certify_margin(required),
+            CoresetMarginVerdict::InsufficientMargin { .. }
+        ));
+        assert!(matches!(
+            certificate.certify_margin(required + 1.0),
+            CoresetMarginVerdict::Certified { .. }
+        ));
+    }
+
+    #[test]
+    fn sensitivity_bounds_and_greedy_budget_are_deterministic() {
+        let leverage = vec![0.2, 0.5, 0.5, 0.1];
+        let sigma = sensitivity_upper_bounds(&leverage, 2.0, 0.25).expect("sigma");
+        let expected = [0.3, 0.75, 0.75, 0.15];
+        for (got, want) in sigma.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-12);
+        }
+        let selected = greedy_sensitivity_coreset(&sigma, 2).expect("greedy");
+        assert_eq!(selected.indices, vec![1, 2]);
+        assert!((selected.selected_sensitivity_mass - 1.5).abs() < 1e-12);
+        assert!((selected.residual_sensitivity_mass - 0.45).abs() < 1e-12);
     }
 }
