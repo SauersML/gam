@@ -4751,6 +4751,33 @@ pub fn arrow_factor_min_pivot(cache: &ArrowFactorCache) -> ArrowFactorMinPivot {
     ArrowFactorMinPivot::combine(min_row_pivot, min_schur_pivot)
 }
 
+/// Largest cached Cholesky pivot across the row blocks and the dense Schur
+/// factor (Hessian scale, i.e. squared lower-factor diagonal). This is the
+/// diagonal magnitude scale a safe-SPD pivot floor is measured against: the
+/// curvature-homotopy tracker (#1007) compares the min pivot against
+/// `√eps · max(this, 1)`, the same floor the inner solver's
+/// [`safe_spd_pivot_min`] uses. `None` only for an empty cache.
+pub fn arrow_factor_max_pivot(cache: &ArrowFactorCache) -> Option<f64> {
+    let mut max_pivot: Option<f64> = None;
+    for factor in cache.htt_factors.iter() {
+        if let Some(pivot) = lower_cholesky_max_pivot(factor) {
+            max_pivot = Some(match max_pivot {
+                Some(current) => f64::max(current, pivot),
+                None => pivot,
+            });
+        }
+    }
+    if let Some(factor) = cache.schur_factor.as_ref()
+        && let Some(pivot) = lower_cholesky_max_pivot(factor.view())
+    {
+        max_pivot = Some(match max_pivot {
+            Some(current) => f64::max(current, pivot),
+            None => pivot,
+        });
+    }
+    max_pivot
+}
+
 impl ArrowFactorCache {
     pub fn n_rows(&self) -> usize {
         self.htt_factors.len()
@@ -5275,8 +5302,65 @@ pub fn solve_arrow_newton_step_core(
     if let Some(device_step) = try_device_arrow_direct(sys, ridge_t, ridge_beta, options) {
         return device_step;
     }
+    // #1017 production seam for the matrix-free SAE path: the real SAE decoder
+    // β-block is the Kronecker operator (`htbeta_matvec`), never a dense slab,
+    // so the dense device-resident solve above declines and the mode is
+    // `InexactPCG`. The reduced-Schur matvec `Σ_i Y_i^T(Y_i x)` is the PCG hot
+    // loop and is exactly what `gpu_schur_matvec_backend` offloads (dense rows)
+    // or the row-procedural Kronecker apply handles (matrix-free). When the
+    // device admits and the caller did not already supply a matvec, build one
+    // and inject it through a cloned options so the existing InexactPCG branch
+    // consumes it. On any device decline the original (CPU) options are used
+    // unchanged, so results are bit-identical.
+    if let Some(device_options) = maybe_inject_gpu_schur_matvec(sys, ridge_t, ridge_beta, options) {
+        return solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, &device_options).map(
+            |step| {
+                let mut diagnostics = step.pcg_diagnostics;
+                diagnostics.used_device_arrow = true;
+                (step.delta_t, step.delta_beta, diagnostics)
+            },
+        );
+    }
     solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, options)
         .map(|step| (step.delta_t, step.delta_beta, step.pcg_diagnostics))
+}
+
+/// Build and inject the GPU reduced-Schur matvec backend for an admitted
+/// `InexactPCG` solve, returning a cloned `ArrowSolveOptions` carrying it.
+///
+/// Returns `None` (caller keeps the original CPU options) when: the mode is not
+/// `InexactPCG`; the caller already supplied a `gpu_matvec`; no device is
+/// present; the work-based predicate declines the shape; or the backend build
+/// fails for any reason. The PCG numerics are identical whether the matvec runs
+/// on host or device (same reduced Schur operator, same f64 accumulation), so
+/// injecting it changes only where the `Σ_i Y_i^T(Y_i x)` flops execute.
+fn maybe_inject_gpu_schur_matvec(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    options: &ArrowSolveOptions,
+) -> Option<ArrowSolveOptions> {
+    if options.mode != ArrowSolverMode::InexactPCG || options.gpu_matvec.is_some() {
+        return None;
+    }
+    if !sys.cross_row_penalties.is_empty() || options.streaming_chunk_size.is_some() {
+        return None;
+    }
+    let runtime = crate::gpu::runtime::GpuRuntime::global()?;
+    // Key the work predicate on (n_rows, border_k): the reduced Schur matvec is
+    // O(n · d · k) per apply and the PCG runs many applies, so the per-iteration
+    // border work `k` is the dense-Hessian width the threshold is calibrated on.
+    if !runtime
+        .policy()
+        .dense_hessian_work_target_is_gpu(sys.rows.len(), sys.k)
+    {
+        return None;
+    }
+    let matvec =
+        crate::gpu::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta).ok()?;
+    let mut device_options = options.clone();
+    device_options.gpu_matvec = Some(matvec);
+    Some(device_options)
 }
 
 /// Admission + dispatch for the device-resident Direct Arrow-Schur point solve.
@@ -5327,8 +5411,10 @@ fn try_device_arrow_direct(
     }
     match crate::gpu::arrow_schur::solve_arrow_newton_step(sys, ridge_t, ridge_beta) {
         Ok(solution) => {
-            let mut diagnostics = PcgDiagnostics::default();
-            diagnostics.used_device_arrow = true;
+            let diagnostics = PcgDiagnostics {
+                used_device_arrow: true,
+                ..PcgDiagnostics::default()
+            };
             Some(Ok((solution.delta_t, solution.delta_beta, diagnostics)))
         }
         // A non-PD per-row block or Schur pivot is a real numerical condition
@@ -5341,6 +5427,13 @@ fn try_device_arrow_direct(
                 row,
                 reason: format!("device per-row block non-PD; suggested ridge bump {bump:e}"),
             }))
+        }
+        // A non-PD reduced Schur is a real numerical condition the LM escalation
+        // must respond to (bump the β-ridge and retry); surface it as the
+        // matching CPU error rather than re-running the same factorisation on
+        // the CPU only to fail identically.
+        Err(crate::gpu::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed { reason }) => {
+            Some(Err(ArrowSchurError::SchurFactorFailed { reason }))
         }
         // Unavailable (transient / below device policy) and
         // GpuRequiresDenseSystem (matrix-free, already filtered above) both mean
@@ -7064,7 +7157,14 @@ fn solve_dense_reduced_system(
             });
         }
     }
-    let direct = cholesky_solve_vector(&factor, rhs_beta);
+    // Reduced-system solve. The f64 `factor` is always retained and returned —
+    // its diagonal is the EXACT `log|S|` the evidence path reads, so the logdet
+    // stays f64 regardless of how Δβ is computed (#1014 invariant). When the
+    // streaming/residency path enabled certified mixed precision, the Δβ solve
+    // itself runs f32-then-f64-refined (κ-gated, with the f64 triangular solve
+    // as the automatic fallback); the certificate is the f64 backward error.
+    let direct = mixed_precision_reduced_beta(schur, &factor, rhs_beta, options)
+        .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));
     if step_inside_trust_region(direct.view(), options.trust_region.radius, metric_weights) {
         return Ok((direct, Some(factor), PcgDiagnostics::default()));
     }
@@ -9973,5 +10073,79 @@ mod tests {
             + assert_fixed_row_kernels_match_dynamic::<3>()
             + assert_fixed_row_kernels_match_dynamic::<4>();
         assert_eq!(checked, 10);
+    }
+
+    /// Build a small, well-conditioned dense Direct arrow system: `n` rows of
+    /// `d×d` PD blocks, small `d×k` cross blocks, a diagonally-dominant `k×k`
+    /// border. Used to exercise the #1017 production device-routing seam on the
+    /// host (where the device declines, so the CPU path must answer unchanged).
+    fn dense_direct_system(n: usize, d: usize, k: usize) -> ArrowSchurSystem {
+        let mut sys = ArrowSchurSystem::new(n, d, k);
+        for (i, row) in sys.rows.iter_mut().enumerate() {
+            for r in 0..d {
+                for c in 0..d {
+                    row.htt[[r, c]] = if r == c { 4.0 + (i % 3) as f64 } else { 0.1 };
+                }
+                row.gt[r] = 0.05 * ((i + r + 1) as f64).sin();
+                for c in 0..k {
+                    row.htbeta[[r, c]] = 0.01 * (((i + 1) * (c + 1)) as f64).cos();
+                }
+            }
+        }
+        for r in 0..k {
+            sys.gb[r] = 0.02 * ((r + 1) as f64).cos();
+            for c in 0..k {
+                sys.hbb[[r, c]] = if r == c { 6.0 } else { 0.0 };
+            }
+        }
+        sys.refresh_row_hessian_fingerprint();
+        sys
+    }
+
+    /// The #1017 work-based dispatch predicate must admit LLM/SAE shapes (few
+    /// rows, wide border) and reject tiny shapes where launch latency wins.
+    #[test]
+    fn device_dispatch_predicate_gates_on_work_not_rows() {
+        let policy = crate::gpu::policy::GpuDispatchPolicy::default();
+        // Tiny: below the DEVICE_LOOP_MIN_P border floor → never on device.
+        assert!(!policy.dense_hessian_work_target_is_gpu(300, 8));
+        // LLM/SAE: 2000 rows × a few-thousand-wide border clears both the
+        // min-p floor and the 2·n·p² flop threshold.
+        assert!(policy.dense_hessian_work_target_is_gpu(2_000, 4_096));
+    }
+
+    /// On a host without a CUDA device the production seam must decline (return
+    /// `None`), so `solve_arrow_newton_step_core` runs the unchanged CPU path
+    /// and the result equals the direct CPU artifacts solve bit-for-bit.
+    #[test]
+    fn device_seam_declines_without_gpu_and_matches_cpu() {
+        if crate::gpu::runtime::GpuRuntime::global().is_some() {
+            // On a CUDA host the device may legitimately serve the step; this
+            // host-only invariant does not apply. The box harness asserts the
+            // device==CPU 1e-10 parity instead.
+            return;
+        }
+        let sys = dense_direct_system(6, 2, 4);
+        let options = ArrowSolveOptions::direct();
+
+        // The seam helpers both decline when no device is present.
+        assert!(try_device_arrow_direct(&sys, 0.0, 0.0, &options).is_none());
+        assert!(maybe_inject_gpu_schur_matvec(&sys, 0.0, 0.0, &options).is_none());
+
+        // The public core entry therefore equals the direct CPU artifacts solve.
+        let (dt_core, db_core, diag) =
+            solve_arrow_newton_step_core(&sys, 0.0, 0.0, &options).expect("core solve");
+        assert!(
+            !diag.used_device_arrow,
+            "no device present, so the solve must not be flagged device-served"
+        );
+        let artifacts =
+            solve_arrow_newton_step_artifacts(&sys, 0.0, 0.0, &options).expect("artifacts solve");
+        for (a, b) in dt_core.iter().zip(artifacts.delta_t.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "Δt must be bit-identical to CPU");
+        }
+        for (a, b) in db_core.iter().zip(artifacts.delta_beta.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "Δβ must be bit-identical to CPU");
+        }
     }
 }
