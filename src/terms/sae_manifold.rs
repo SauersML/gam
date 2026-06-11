@@ -3899,7 +3899,7 @@ impl SaeManifoldTerm {
         let metric = self.diagnostic_metric()?;
         let atom_two_lens = crate::inference::atom_lens::atom_two_lens(self, &metric);
 
-        let certificate_model =
+        let (certificate_model, streamed_curvature) =
             self.to_residual_gauge_model(metric, per_atom_ard_variances, isometry_pin_active)?;
         // #998: when no isometry pin is installed, within-atom gauge families
         // are certified on their EXACT orbits in the model's own
@@ -3917,7 +3917,17 @@ impl SaeManifoldTerm {
             let views = self.atom_parameter_views();
             let ops: Vec<Option<crate::sae_identifiability::OrbitPenaltyOperator>> =
                 (0..self.k_atoms()).map(|_| None).collect();
-            crate::sae_identifiability::residual_gauge_exact(&certificate_model, &views, &ops)?
+            let (curvature_gram, root_rows) = streamed_curvature.ok_or_else(|| {
+                "fit_diagnostics_report: missing streamed residual-gauge curvature for unpinned exact path"
+                    .to_string()
+            })?;
+            crate::sae_identifiability::residual_gauge_exact_from_curvature_gram(
+                &certificate_model,
+                &views,
+                &ops,
+                curvature_gram,
+                root_rows,
+            )?
         };
 
         Ok(SaeManifoldFitDiagnostics {
@@ -3986,7 +3996,13 @@ impl SaeManifoldTerm {
         metric: crate::inference::row_metric::RowMetric,
         per_atom_ard_variances: Option<&[Option<Array1<f64>>]>,
         isometry_pin_active: bool,
-    ) -> Result<crate::sae_identifiability::FittedSaeManifold, String> {
+    ) -> Result<
+        (
+            crate::sae_identifiability::FittedSaeManifold,
+            Option<(Array2<f64>, usize)>,
+        ),
+        String,
+    > {
         use crate::sae_identifiability::{AtomTopology, FittedAtom, FittedSaeManifold};
 
         let n = self.n_obs();
@@ -4094,28 +4110,43 @@ impl SaeManifoldTerm {
         // of `J_n` is `a_{nk} · ∂g_k/∂t_a(n)[i']` placed at the atom-k frame slot
         // and read out on output coordinate `i = i'` (a frame perturbation of
         // output `i'` moves only the row's output coordinate `i'`).
-        let mut jacobian_rows: Vec<Vec<f64>> = Vec::with_capacity(n);
-        let mut tangent = vec![0.0_f64; p];
-        for row in 0..n {
-            let mut j_flat = vec![0.0_f64; p * param_dim];
-            for (atom_idx, atom) in self.atoms.iter().enumerate() {
-                let a_nk = assignments[[row, atom_idx]];
-                if !(a_nk > 0.0) {
-                    continue;
-                }
-                let d = atom_axis_dim[atom_idx];
-                let base = atom_offsets[atom_idx];
-                for axis in 0..d {
-                    atom.fill_decoded_derivative_row(row, axis, &mut tangent);
-                    for i in 0..p {
-                        // Frame coordinate `(k, i, axis)` sits at column
-                        // `base + i·d + axis`; it sources output coordinate `i`.
-                        j_flat[i * param_dim + base + i * d + axis] += a_nk * tangent[i];
+        //
+        // The pinned certificate still consumes the legacy row-block contract.
+        // The unpinned exact path consumes only `RᵀR`, so stream each transient
+        // row Jacobian through the metric whitening and discard it immediately.
+        let (jacobian_rows, streamed_curvature) = if isometry_pin_active {
+            let mut jacobian_rows: Vec<Vec<f64>> = Vec::with_capacity(n);
+            let mut tangent = vec![0.0_f64; p];
+            for row in 0..n {
+                let mut j_flat = vec![0.0_f64; p * param_dim];
+                for (atom_idx, atom) in self.atoms.iter().enumerate() {
+                    let a_nk = assignments[[row, atom_idx]];
+                    if !(a_nk > 0.0) {
+                        continue;
+                    }
+                    let d = atom_axis_dim[atom_idx];
+                    let base = atom_offsets[atom_idx];
+                    for axis in 0..d {
+                        atom.fill_decoded_derivative_row(row, axis, &mut tangent);
+                        for i in 0..p {
+                            // Frame coordinate `(k, i, axis)` sits at column
+                            // `base + i·d + axis`; it sources output coordinate `i`.
+                            j_flat[i * param_dim + base + i * d + axis] += a_nk * tangent[i];
+                        }
                     }
                 }
+                jacobian_rows.push(j_flat);
             }
-            jacobian_rows.push(j_flat);
-        }
+            (jacobian_rows, None)
+        } else {
+            let streamed = self.residual_gauge_streamed_data_curvature(
+                &metric,
+                &atom_offsets,
+                &atom_axis_dim,
+                param_dim,
+            )?;
+            (Vec::new(), Some(streamed))
+        };
 
         // Isometry-penalty curvature root over the frame parameter space. When
         // the isometry gauge pin is active it gives curvature along every fitted
@@ -4154,12 +4185,107 @@ impl SaeManifoldTerm {
             Array2::<f64>::zeros((0, param_dim))
         };
 
-        Ok(FittedSaeManifold {
-            atoms: fitted_atoms,
-            jacobian_rows,
-            isometry_penalty_root,
-            metric,
-        })
+        Ok((
+            FittedSaeManifold {
+                atoms: fitted_atoms,
+                jacobian_rows,
+                isometry_penalty_root,
+                metric,
+            },
+            streamed_curvature,
+        ))
+    }
+
+    fn residual_gauge_streamed_data_curvature(
+        &self,
+        metric: &crate::inference::row_metric::RowMetric,
+        atom_offsets: &[usize],
+        atom_axis_dim: &[usize],
+        param_dim: usize,
+    ) -> Result<(Array2<f64>, usize), String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if metric.p_out() != p {
+            return Err(format!(
+                "residual_gauge_streamed_data_curvature: metric output dim {} but term has {p}",
+                metric.p_out()
+            ));
+        }
+        let rank = metric.metric_rank();
+        let mut gram = Array2::<f64>::zeros((param_dim, param_dim));
+        if param_dim == 0 || n == 0 || rank == 0 {
+            return Ok((gram, n * rank));
+        }
+
+        let assignments = self.assignment.assignments();
+        let mut tangent = vec![0.0_f64; p];
+        let mut j_flat = vec![0.0_f64; p * param_dim];
+        let mut root_row = Array1::<f64>::zeros(param_dim);
+        for row in 0..n {
+            j_flat.fill(0.0);
+            for (atom_idx, atom) in self.atoms.iter().enumerate() {
+                let a_nk = assignments[[row, atom_idx]];
+                if !(a_nk > 0.0) {
+                    continue;
+                }
+                let d = atom_axis_dim[atom_idx];
+                let base = atom_offsets[atom_idx];
+                for axis in 0..d {
+                    atom.fill_decoded_derivative_row(row, axis, &mut tangent);
+                    for i in 0..p {
+                        j_flat[i * param_dim + base + i * d + axis] += a_nk * tangent[i];
+                    }
+                }
+            }
+
+            if metric.drives_gauge() {
+                for r in 0..rank {
+                    root_row.fill(0.0);
+                    for c in 0..param_dim {
+                        let mut acc = 0.0_f64;
+                        for i in 0..p {
+                            acc += metric.factor_entry(row, i, r) * j_flat[i * param_dim + c];
+                        }
+                        root_row[c] = acc;
+                    }
+                    let row_slice = root_row
+                        .as_slice()
+                        .ok_or_else(|| {
+                            "residual_gauge_streamed_data_curvature: non-contiguous root row"
+                                .to_string()
+                        })?;
+                    Self::accumulate_residual_gauge_gram_row(&mut gram, row_slice);
+                }
+            } else {
+                for i in 0..p {
+                    let start = i * param_dim;
+                    let end = start + param_dim;
+                    Self::accumulate_residual_gauge_gram_row(&mut gram, &j_flat[start..end]);
+                }
+            }
+        }
+
+        for a in 0..param_dim {
+            for b in 0..a {
+                gram[[b, a]] = gram[[a, b]];
+            }
+        }
+        Ok((gram, n * rank))
+    }
+
+    fn accumulate_residual_gauge_gram_row(gram: &mut Array2<f64>, row: &[f64]) {
+        for a in 0..row.len() {
+            let va = row[a];
+            if va == 0.0 {
+                continue;
+            }
+            for b in 0..=a {
+                let vb = row[b];
+                if vb != 0.0 {
+                    gram[[a, b]] += va * vb;
+                }
+            }
+        }
     }
 
     pub fn set_temperature_schedule(
