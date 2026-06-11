@@ -3784,6 +3784,20 @@ pub fn evaluate_cell_moments_cached(
     cache: &CellMomentLruCache,
     stats: Option<&CellMomentCacheStats>,
 ) -> Result<CellMomentState, String> {
+    // Affine cells (every rigid-path cell and every tail cell) evaluate
+    // through the closed-form anchor — cheaper than a single LRU probe. The
+    // LRU exists only to amortize the EXPENSIVE non-affine transport across
+    // recurring cells; at large n the row scalars `(a, b)` are unique per
+    // row, so affine cells never recur and routing them through the sharded
+    // mutex was pure cost (320k lock+insert+evict ops per gradient eval, ~0%
+    // hit — the dominant cost of the rigid n=320k fit, #979). Bypass the
+    // cache entirely for them.
+    if matches!(branch_cell(cell), Ok(ExactCellBranch::Affine)) {
+        if let Some(stats) = stats {
+            stats.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        return evaluate_cell_moments_uncached(cell, max_degree);
+    }
     let key = CellFingerprint::new(cell);
     let existing_derivative = match cache.get(&key) {
         Some(cached) => {
@@ -3828,6 +3842,15 @@ pub fn evaluate_cell_derivative_moments_cached(
     cache: &CellMomentLruCache,
     stats: Option<&CellMomentCacheStats>,
 ) -> Result<CellDerivativeMomentState, String> {
+    // Affine cells bypass the LRU — see `evaluate_cell_moments_cached` for
+    // why the sharded-mutex memo is pure overhead on the closed-form affine
+    // path at large n (#979).
+    if matches!(branch_cell(cell), Ok(ExactCellBranch::Affine)) {
+        if let Some(stats) = stats {
+            stats.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        return evaluate_cell_derivative_moments_uncached(cell, max_degree);
+    }
     let key = CellFingerprint::new(cell);
     let existing_value = match cache.get(&key) {
         Some(cached) => {
