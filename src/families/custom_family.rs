@@ -31679,6 +31679,26 @@ mod tests {
     }
 
     #[test]
+    fn bug979_diag_hard_case_inner_break() {
+        crate::solver::visualizer::init_logging();
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        let (family, specs, penalty_counts, options) =
+            binomial_location_scale_outer_fixture(y, 0.2, -0.1);
+        let rho = array![0.15, -0.25];
+        let result =
+            outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None);
+        eprintln!("bug979_diag hard-case result: {result:?}");
+
+        let y2 = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        let (family2, specs2, penalty_counts2, options2) =
+            binomial_location_scale_outer_fixture(y2, 0.0, 0.0);
+        let rho2 = array![0.0, 0.0];
+        let result2 =
+            outerobjective_andgradient(&family2, &specs2, &options2, &penalty_counts2, &rho2, None);
+        eprintln!("bug979_diag base-case result: {result2:?}");
+    }
+
+    #[test]
     fn outer_lamlgradient_diagonal_binomial_location_scale_matchesfd() {
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
         let (family, specs, penalty_counts, options) =
