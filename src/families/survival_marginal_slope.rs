@@ -20544,14 +20544,20 @@ pub fn fit_survival_marginal_slope_terms(
             // `canonicalize_for_identifiability` audit remains the source of
             // truth for the same diagnostic.
             const PREFLIGHT_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-            let mut dq0 = spec.time_block.design_entry.try_to_dense_by_chunks_budgeted(
-                "smgs phase-4b preflight time_entry",
-                PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
-            )?;
-            let mut dq1 = spec.time_block.design_exit.try_to_dense_by_chunks_budgeted(
-                "smgs phase-4b preflight time_exit",
-                PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
-            )?;
+            let mut dq0 = spec
+                .time_block
+                .design_entry
+                .try_to_dense_by_chunks_budgeted(
+                    "smgs phase-4b preflight time_entry",
+                    PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
+                )?;
+            let mut dq1 = spec
+                .time_block
+                .design_exit
+                .try_to_dense_by_chunks_budgeted(
+                    "smgs phase-4b preflight time_exit",
+                    PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
+                )?;
             let mut dqd1 = spec
                 .time_block
                 .design_derivative_exit
@@ -20949,10 +20955,13 @@ pub fn fit_survival_marginal_slope_terms(
     const RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
     let rank_diagnostic_outcome: Result<(), String> = (|| -> Result<(), String> {
         use crate::linalg::faer_ndarray::rrqr_with_permutation;
-        let time_dense = spec.time_block.design_exit.try_to_dense_by_chunks_budgeted(
-            "survival-marginal-slope joint rank diagnostic time",
-            RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES,
-        )?;
+        let time_dense = spec
+            .time_block
+            .design_exit
+            .try_to_dense_by_chunks_budgeted(
+                "survival-marginal-slope joint rank diagnostic time",
+                RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES,
+            )?;
         let marginal_dense = marginal_design.design.try_to_dense_by_chunks_budgeted(
             "survival-marginal-slope joint rank diagnostic marginal",
             RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES,
@@ -21296,14 +21305,20 @@ pub fn fit_survival_marginal_slope_terms(
             // downstream `canonicalize_for_identifiability` audit as the
             // gate.
             const ACTIVE_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-            let mut dq0 = spec.time_block.design_entry.try_to_dense_by_chunks_budgeted(
-                "smgs phase-4b active: time_entry",
-                ACTIVE_MATERIALIZATION_BUDGET_BYTES,
-            )?;
-            let mut dq1 = spec.time_block.design_exit.try_to_dense_by_chunks_budgeted(
-                "smgs phase-4b active: time_exit",
-                ACTIVE_MATERIALIZATION_BUDGET_BYTES,
-            )?;
+            let mut dq0 = spec
+                .time_block
+                .design_entry
+                .try_to_dense_by_chunks_budgeted(
+                    "smgs phase-4b active: time_entry",
+                    ACTIVE_MATERIALIZATION_BUDGET_BYTES,
+                )?;
+            let mut dq1 = spec
+                .time_block
+                .design_exit
+                .try_to_dense_by_chunks_budgeted(
+                    "smgs phase-4b active: time_exit",
+                    ACTIVE_MATERIALIZATION_BUDGET_BYTES,
+                )?;
             let mut dqd1 = spec
                 .time_block
                 .design_derivative_exit
