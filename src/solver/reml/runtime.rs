@@ -304,7 +304,6 @@ fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option
 
 pub(super) struct PenaltySubspace {
     evals: Array1<f64>,
-    evecs: Array2<f64>,
     rank: usize,
 }
 
@@ -5883,7 +5882,6 @@ impl<'a> RemlState<'a> {
         if e_transformed.nrows() == 0 || p == 0 {
             return Ok(PenaltySubspace {
                 evals: Array1::zeros(p),
-                evecs: Array2::zeros((p, p)),
                 rank: 0,
             });
         }
@@ -5897,7 +5895,7 @@ impl<'a> RemlState<'a> {
                             s_lambda[[i, i]] += ridge;
                         }
                     }
-                    let (evals, evecs) = s_lambda
+                    let (evals, _) = s_lambda
                         .eigh(Side::Lower)
                         .map_err(EstimationError::EigendecompositionFailed)?;
                     let rank = if self.canonical_penalties.is_empty() {
@@ -5909,11 +5907,10 @@ impl<'a> RemlState<'a> {
                             .sum::<usize>()
                             .min(p)
                     };
-                    Ok(PenaltySubspace { evals, evecs, rank })
+                    Ok(PenaltySubspace { evals, rank })
                 })?;
         Ok(PenaltySubspace {
             evals: cached.evals.clone(),
-            evecs: cached.evecs.clone(),
             rank: cached.rank,
         })
     }
@@ -6057,38 +6054,6 @@ impl<'a> RemlState<'a> {
                 h_proj_inverse,
             }),
         ))
-    }
-
-    pub(super) fn fixed_subspace_penalty_trace_from_subspace(
-        &self,
-        penalty_subspace: &PenaltySubspace,
-        s_direction: &Array2<f64>,
-    ) -> Result<f64, EstimationError> {
-        let p_dim = penalty_subspace.evals.len();
-        if penalty_subspace.rank == 0 || p_dim == 0 {
-            return Ok(0.0);
-        }
-        if s_direction.nrows() != p_dim || s_direction.ncols() != p_dim {
-            crate::bail_invalid_estim!(
-                "fixed_subspace_penalty_trace_from_subspace: S_direction must be {}x{}, got {}x{}",
-                p_dim,
-                p_dim,
-                s_direction.nrows(),
-                s_direction.ncols()
-            );
-        }
-
-        // Exact pseudoinverse trace: tr(S⁺ S_direction) on the positive eigenspace.
-        // Use structural rank instead of thresholding evals so ridge-lifted
-        // null directions do not contaminate the log|S|+ derivative kernel.
-        let mut trace = 0.0;
-        for idx in p_dim - penalty_subspace.rank..p_dim {
-            let ev = penalty_subspace.evals[idx];
-            let u = penalty_subspace.evecs.column(idx).to_owned();
-            let spsi_u = s_direction.dot(&u);
-            trace += u.dot(&spsi_u) / ev;
-        }
-        Ok(trace)
     }
 
     pub(super) fn updatewarm_start_from(&self, pr: &PirlsResult) {

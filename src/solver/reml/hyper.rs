@@ -1282,12 +1282,8 @@ impl<'a> RemlState<'a> {
         // --- Transformed design, beta, penalty basis ---
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
 
-        let e_eval;
         if let Some(z) = free_basis_opt.as_ref() {
             beta_eval = crate::faer_ndarray::fast_atv(z, pirls_result.beta_transformed.as_ref());
-            e_eval = reparam_result.e_transformed.dot(z);
-        } else {
-            e_eval = reparam_result.e_transformed.clone();
         }
         let p_dim = beta_eval.len();
         if p_dim == 0 {
@@ -1414,8 +1410,30 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
-        let penalty_subspace =
-            self.compute_penalty_subspace(&e_eval, pirls_result.ridge_passport)?;
+        let ct_eval: Vec<crate::construction::CanonicalPenalty> =
+            if let Some(z) = free_basis_opt.as_ref() {
+                reparam_result
+                    .canonical_transformed
+                    .iter()
+                    .map(|cp| {
+                        let projected_root = cp.root.dot(z);
+                        crate::construction::CanonicalPenalty::from_dense_root(
+                            projected_root,
+                            z.ncols(),
+                        )
+                    })
+                    .collect()
+            } else {
+                reparam_result.canonical_transformed.clone()
+            };
+        let lambdas = rho.mapv(f64::exp);
+        let penalty_logdet = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
+            &ct_eval,
+            lambdas.as_slice().unwrap_or(&[]),
+            bundle.ridge_passport.penalty_logdet_ridge(),
+            p_dim,
+        )
+        .map_err(EstimationError::InvalidInput)?;
 
         let mut coords = Vec::with_capacity(psi_dim);
 
@@ -1656,9 +1674,7 @@ impl<'a> RemlState<'a> {
 
             // --- ld_s_j: penalty pseudo-logdet derivative ---
             // ld_s_j = tr(S⁺ S_{τ_j}).
-            // Uses the exact pseudoinverse from the shared penalty eigensystem.
-            let ld_s_j =
-                self.fixed_subspace_penalty_trace_from_subspace(&penalty_subspace, &s_tau_j)?;
+            let ld_s_j = penalty_logdet.tau_gradient_component(&s_tau_j);
             let tk_x_fixed = Some(
                 Self::ensure_transformed_x_tau_dense(
                     &mut x_tau_j_dense,
