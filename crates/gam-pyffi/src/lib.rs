@@ -9952,6 +9952,15 @@ fn sae_manifold_fit_inner<'py>(
     // assignment-support projection the payload's `fitted` was computed with).
     out.set_item("chosen_k", k_atoms)?;
     out.set_item("oos_projection_top1", top_k == Some(1))?;
+    // #997 — the evidence-guarded structure-search honesty surface: the per-round
+    // SearchLedger (every harvested move in canonical order with its e-gate
+    // verdict) plus the joint fit's collapse events, serialized as JSON. Present
+    // whenever the structure search ran (it runs on every fit); the value is the
+    // certificate of which dictionary moves the held-out data does and does not
+    // support — an all-contested ledger is the common, conservative outcome.
+    if let Some(json) = structure_search_json {
+        out.set_item("structure_search", json)?;
+    }
     Ok(out.unbind())
 }
 
