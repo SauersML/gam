@@ -24474,7 +24474,44 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
     // value/curvature must come from the SAME term evaluation.
     let phi_and_hphi = custom_family_joint_jeffreys_term(family, states, specs, ranges, &z_joint)?
         .map(|(phi, _grad, hphi)| (phi, hphi));
-    Ok(phi_and_hphi)
+    let Some((phi, mut hphi)) = phi_and_hphi else {
+        return Ok(None);
+    };
+    // SECOND-ORDER COMPLETION AT THE MODE (gam#979). The divided-difference
+    // `H_Φ` omits the second-directional-Hessian remainder `½ tr(K·D_ab)`; at
+    // the converged β̂ the outer LAML's curvature object should be the TRUE
+    // Hessian of the Φ-augmented inner objective — the Laplace approximation's
+    // honest curvature. Folding the completion here (one seam) puts the same
+    // `M = H + S_λ + H_Φ + completion` behind the projected logdet, the trace
+    // kernel, the mode-response solves `v_k = ∂β̂/∂ρ_k`, and the IFT
+    // pseudo-inverse at once. Without it, `v_k` is solved on a Hessian missing
+    // an O(1)-comparable term along the Firth-active direction, which biased
+    // every drift contraction (measured: a uniform ~10% analytic-vs-FD outer
+    // gradient gap on the binomial-LS fixtures). The drift wrapper still
+    // differentiates the divided-difference part only; the completion's own
+    // β-motion is the next-order remainder (it needs third directional
+    // derivatives no family exposes). Skipped at wide p (cost is p(p+1)/2
+    // second-directional calls) and degrades safely to the DD curvature when
+    // the family lacks exact second derivatives.
+    let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    if total_p <= JEFFREYS_COMPLETION_MAX_P
+        && let Some(h_joint) = family.exact_newton_joint_hessian_with_specs(states, specs)?
+        && h_joint.nrows() == total_p
+        && h_joint.ncols() == total_p
+        && let Some(completion) =
+            crate::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
+                h_joint.view(),
+                z_joint.view(),
+                |u: &Array1<f64>, v: &Array1<f64>| {
+                    family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
+                        states, specs, u, v,
+                    )
+                },
+            )?
+    {
+        hphi += &completion;
+    }
+    Ok(Some((phi, hphi)))
 }
 
 fn batched_outer_gradient_contract_allows_override(
@@ -31926,6 +31963,7 @@ mod tests {
 
     #[test]
     fn outer_lamlgradient_diagonal_binomial_location_scale_matchesfd() {
+        crate::solver::visualizer::init_logging();
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
         let (family, specs, penalty_counts, options) =
             binomial_location_scale_outer_fixture(y, 0.0, 0.0);
