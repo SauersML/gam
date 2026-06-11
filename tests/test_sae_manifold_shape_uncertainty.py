@@ -15,6 +15,89 @@ import pytest
 gamfit = pytest.importorskip("gamfit")
 
 
+def test_typical_shape_periodic_payload_decodes_ring_not_chord():
+    from gamfit._sae_manifold import ManifoldSAE
+
+    n = 250
+    t = np.linspace(0.0, 1.0, n, endpoint=False)
+    x = np.column_stack([np.cos(2.0 * np.pi * t), np.sin(2.0 * np.pi * t)])
+    decoder = np.asarray(
+        [
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+        ],
+        dtype=float,
+    )
+    order = np.r_[np.arange(n // 2, n), np.arange(0, n // 2)]
+    band_coords = t[order, None]
+    chord = np.column_stack([
+        np.linspace(-0.1, 0.1, n),
+        np.linspace(1.0, -1.0, n),
+    ])
+    payload = {
+        "atom_plans": [
+            {
+                "kind": "periodic",
+                "latent_dim": 1,
+                "basis_size": 3,
+                "n_harmonics": 1,
+                "duchon_centers": None,
+            }
+        ],
+        "atoms": [
+            {
+                "basis_kind": "periodic",
+                "decoder_B": decoder,
+                "assignments_z": np.ones(n),
+                "on_atom_coords_t": t[:, None],
+                "active_dim": 1,
+                "decoder_covariance": np.eye(decoder.size) * 1.0e-4,
+                "shape_band_coords": band_coords,
+                "shape_band_mean": chord,
+                "shape_band_sd": np.full_like(chord, 0.01),
+            }
+        ],
+        "assignments_z": np.ones((n, 1)),
+        "logits": np.ones((n, 1)),
+        "fitted": x,
+        "reml_score": 0.0,
+        "chosen_k": 1,
+        "dispersion": 1.0e-4,
+        "oos_projection_top1": False,
+        "diagnostics": {
+            "atom_trust": np.ones(1),
+            "atoms": [
+                {
+                    "trust_score": 1.0,
+                    "sigma_min_tangent": 1.0,
+                    "sigma_max_tangent": 1.0,
+                    "tangent_condition_score": 1.0,
+                    "coverage": 1.0,
+                    "activation_frequency": 1.0,
+                    "untyped": False,
+                    "active_token_count": n,
+                }
+            ],
+        },
+    }
+    fit = ManifoldSAE.from_payload(
+        x,
+        payload,
+        "circle",
+        "softmax",
+        [],
+        tau=0.5,
+    )
+
+    typical = fit.typical_shape(atom=0)
+    mean = np.asarray(typical["mean"], dtype=float)
+    radii = np.linalg.norm(mean, axis=1)
+    assert np.all((radii >= 0.7) & (radii <= 1.3))
+    singular_values = np.linalg.svd(mean - mean.mean(axis=0), compute_uv=False)
+    assert singular_values[1] / singular_values[0] > 0.25
+
+
 def _fit_circle(n=400, noise=0.18, seed=0, n_iter=40):
     rng = np.random.default_rng(seed)
     t = rng.uniform(0.0, 1.0, n)
