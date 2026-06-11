@@ -79,7 +79,10 @@ impl LogdetEnclosure {
     /// exposed for consumers that hold only the gap (e.g. the EFS engine, which
     /// receives the cost's enclosure width through `EfsEval`).
     pub fn gap_resolves_margin(gap: f64, decision_margin: f64) -> bool {
-        decision_margin.is_finite() && decision_margin > 0.0 && gap.is_finite() && gap < decision_margin
+        decision_margin.is_finite()
+            && decision_margin > 0.0
+            && gap.is_finite()
+            && gap < decision_margin
     }
 
     pub fn decide_within_margin(&self, decision_margin: f64) -> MarginVerdict {
@@ -221,9 +224,8 @@ fn absorb_strongest_pair(
             _ => {}
         }
     }
-    let (best_idx, _) = best.ok_or_else(|| {
-        "absorb_strongest_pair: no off-diagonal pair to absorb".to_string()
-    })?;
+    let (best_idx, _) =
+        best.ok_or_else(|| "absorb_strongest_pair: no off-diagonal pair to absorb".to_string())?;
     let (a, b, _) = &off[best_idx];
     let (a, b) = (*a.min(b), *a.max(b));
     let (ma, mb) = (diag[a].nrows(), diag[b].nrows());
@@ -624,7 +626,11 @@ mod tests {
         let before =
             block_preconditioned_logdet_enclosure(&diag, &off, true).expect("pre-absorption");
         let (mdiag, moff) = absorb_strongest_pair(&diag, &off).expect("absorb");
-        assert_eq!(mdiag.len(), diag.len() - 1, "one fewer block after absorption");
+        assert_eq!(
+            mdiag.len(),
+            diag.len() - 1,
+            "one fewer block after absorption"
+        );
         let after =
             block_preconditioned_logdet_enclosure(&mdiag, &moff, true).expect("post-absorption");
         assert!(
@@ -654,7 +660,10 @@ mod tests {
         let margin = order3.gap() * 0.5;
         let (enc, verdict) =
             refine_logdet_enclosure_to_margin(&diag, &off, margin, 8).expect("ladder");
-        assert!(verdict.is_decided(), "ladder must close the margin via absorption");
+        assert!(
+            verdict.is_decided(),
+            "ladder must close the margin via absorption"
+        );
         assert!(
             enc.lower <= truth && truth <= enc.upper,
             "refined enclosure [{}, {}] must contain log|S| = {truth}",

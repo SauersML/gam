@@ -90,11 +90,7 @@ impl AtomRowBasisJet {
     /// `axis` of this atom). A constant value plus first/second jet
     /// contributions — exactly the local Taylor model the production assembly
     /// consumes.
-    fn basis_tower<const K: usize>(
-        &self,
-        basis_col: usize,
-        coord_slots: &[usize],
-    ) -> Tower4<K> {
+    fn basis_tower<const K: usize>(&self, basis_col: usize, coord_slots: &[usize]) -> Tower4<K> {
         // The latent coordinate increments enter as the seeded tower variables;
         // the basis value at the current point is the constant term.
         let mut acc = Tower4::<K>::constant(self.phi[basis_col]);
@@ -121,11 +117,7 @@ impl AtomRowBasisJet {
     }
 
     /// `decoded_{k,c}(t)` as a tower: `Σ_b Φ_b(t)·B_{b,c}`.
-    fn decoded_tower<const K: usize>(
-        &self,
-        out_col: usize,
-        coord_slots: &[usize],
-    ) -> Tower4<K> {
+    fn decoded_tower<const K: usize>(&self, out_col: usize, coord_slots: &[usize]) -> Tower4<K> {
         let mut acc = Tower4::<K>::zero();
         for basis_col in 0..self.n_basis() {
             let b = self.decoder[basis_col][out_col];
@@ -242,17 +234,14 @@ mod tests {
     /// universal oracle for the SAE row program (the analog of the survival
     /// `rigid_row_kernel_agrees_with_jet_tower_program` oracle).
     struct HandChannels {
-        first: Vec<f64>,      // [primary]
+        first: Vec<f64>,       // [primary]
         second: Vec<Vec<f64>>, // [primary][primary]
         value: f64,
     }
 
     /// Softmax gate first/second derivatives wrt logit primaries, term-for-term
     /// the production `gate_derivatives_for_row` softmax branch.
-    fn softmax_gate_derivs(
-        gate: &[f64],
-        inv_tau: f64,
-    ) -> (Vec<Vec<f64>>, Vec<Vec<Vec<f64>>>) {
+    fn softmax_gate_derivs(gate: &[f64], inv_tau: f64) -> (Vec<Vec<f64>>, Vec<Vec<Vec<f64>>>) {
         let k = gate.len();
         // dz[j][kk] = ∂ζ_kk/∂ℓ_j ; d2z[j][l][kk] = ∂²ζ_kk/∂ℓ_j∂ℓ_l.
         let mut dz = vec![vec![0.0_f64; k]; k];
@@ -398,7 +387,9 @@ mod tests {
         let n_basis = 3;
         let out_dim = 4;
         let mk_atom = |seed: f64| {
-            let phi: Vec<f64> = (0..n_basis).map(|b| 0.3 + 0.2 * (b as f64 + seed)).collect();
+            let phi: Vec<f64> = (0..n_basis)
+                .map(|b| 0.3 + 0.2 * (b as f64 + seed))
+                .collect();
             let d_phi: Vec<Vec<f64>> = (0..n_basis)
                 .map(|b| {
                     (0..2)
@@ -413,7 +404,9 @@ mod tests {
                             (0..2)
                                 .map(|bb| {
                                     // Symmetric in (a, bb).
-                                    0.02 * (b as f64 + 1.0) + 0.01 * (a as f64) + 0.01 * (bb as f64)
+                                    0.02 * (b as f64 + 1.0)
+                                        + 0.01 * (a as f64)
+                                        + 0.01 * (bb as f64)
                                         + 0.004 * seed
                                 })
                                 .collect()

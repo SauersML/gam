@@ -35,12 +35,12 @@
 //! exist only during the race; it is not retained for the saved-model
 //! prediction path. That OOS-retention package is out of scope here.
 
+use crate::inference::row_measure::CoresetCertificate;
 use crate::solver::evidence::{
     GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale,
     UNION_STRUCTURE_LADDER, UnionStructure, UnionStructureFit, fit_gaussian_mixture,
     fit_union_ladder, fit_union_structure, solve_stacking_weights, union_per_point_log_density,
 };
-use crate::inference::row_measure::CoresetCertificate;
 use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use ndarray::{Array2, ArrayView2};
 use serde_json::Value as JsonValue;
@@ -1118,9 +1118,7 @@ impl EvidenceCertification {
                     p2: 0.0,
                     p3: None,
                 };
-                crate::inference::certificate_impls::enclosure_margin_verdict(
-                    &enclosure, race_lead,
-                )
+                crate::inference::certificate_impls::enclosure_margin_verdict(&enclosure, race_lead)
             }
             EvidenceCertification::Coreset { certificate } => {
                 crate::inference::certificate_impls::coreset_race_verdict(
@@ -1235,12 +1233,11 @@ pub fn adjudicate_cross_class_race(
                 continue;
             }
             let lead = nle - best;
-            let required =
-                certifications[winner_index].required_margin().max(certifications[idx].required_margin());
+            let required = certifications[winner_index]
+                .required_margin()
+                .max(certifications[idx].required_margin());
             if required > 0.0 && lead <= required {
-                let tighter = insufficient_margin
-                    .map(|m| lead < m.lead)
-                    .unwrap_or(true);
+                let tighter = insufficient_margin.map(|m| lead < m.lead).unwrap_or(true);
                 if tighter {
                     insufficient_margin = Some(InsufficientRaceMargin {
                         provisional_winner: winner_index,
@@ -1572,7 +1569,10 @@ mod tests {
         let required = cert.race_transfer_margin();
         let coreset = EvidenceCertification::Coreset { certificate: cert };
         assert_eq!(coreset.race_verdict(0.5 * required), Verdict::Insufficient);
-        assert_eq!(coreset.race_verdict(2.0 * required + 1.0), Verdict::Certified);
+        assert_eq!(
+            coreset.race_verdict(2.0 * required + 1.0),
+            Verdict::Certified
+        );
     }
 
     #[test]

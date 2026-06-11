@@ -1490,10 +1490,10 @@ mod tests {
         assert_eq!(certified.rows.len(), certified.weights.len());
         // The race-transfer margin is the certificate's — the shared #1011/#1012
         // seam a race consumer gates on.
-        assert!((certified.race_transfer_margin()
-            - certified.certificate.race_transfer_margin())
-        .abs()
-            < 1e-12);
+        assert!(
+            (certified.race_transfer_margin() - certified.certificate.race_transfer_margin()).abs()
+                < 1e-12
+        );
         assert!(certified.certificate.race_transfer_margin() > 0.0);
         // The certificate's selected count matches the realized coreset.
         assert_eq!(certified.certificate.n_selected, certified.rows.len());

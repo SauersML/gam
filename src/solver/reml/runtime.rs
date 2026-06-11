@@ -4,11 +4,11 @@ use crate::construction::{
     create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
 };
 use crate::faer_ndarray::array2_to_matmut;
+use crate::inference::hmc::BlockExcessTarget;
 use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
 use crate::linalg::utils::{
     StableSolver, boundary_hit_indices, enforce_symmetry, symmetric_spectrum_condition_number,
 };
-use crate::inference::hmc::BlockExcessTarget;
 use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
@@ -4190,7 +4190,9 @@ impl<'a> RemlState<'a> {
         }
         let mut r_mat = x.t().dot(&moments.e_t_neg_score); // p × m
         for r in 0..m {
-            r_mat.column_mut(r).scaled_add(moments.e_t[r], &pen_score_total);
+            r_mat
+                .column_mut(r)
+                .scaled_add(moments.e_t[r], &pen_score_total);
         }
         r_mat -= &x.t().dot(&w_xv_ett);
 
@@ -4201,8 +4203,8 @@ impl<'a> RemlState<'a> {
         let xvt_w_xv_ett = xv.t().dot(&w_xv_ett); // m × m
         let mut m_vec = Array1::<f64>::zeros(m);
         for r in 0..m {
-            m_vec[r] = -0.5
-                * (xvt_etngs[(r, r)] + pterm[r] * moments.e_t[r] - xvt_w_xv_ett[(r, r)]);
+            m_vec[r] =
+                -0.5 * (xvt_etngs[(r, r)] + pterm[r] * moments.e_t[r] - xvt_w_xv_ett[(r, r)]);
         }
 
         // Eigenframe assembly. `block_vecs` are the `block_cols` columns of

@@ -123,7 +123,8 @@ pub fn deterministic_probe_direction(rho_hat: ArrayView1<'_, f64>) -> Vec<f64> {
     // bit patterns are tolerated, they only perturb the seed deterministically).
     let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
     for (idx, &value) in rho_hat.iter().enumerate() {
-        seed = splitmix64(seed ^ value.to_bits() ^ (idx as u64).wrapping_mul(0x2545_F491_4F6C_DD1D));
+        seed =
+            splitmix64(seed ^ value.to_bits() ^ (idx as u64).wrapping_mul(0x2545_F491_4F6C_DD1D));
     }
     let mut dir = vec![0.0_f64; n];
     let mut s = seed;
@@ -163,9 +164,7 @@ fn splitmix64(state: u64) -> u64 {
 #[must_use]
 pub fn probe_step(rho_hat: ArrayView1<'_, f64>) -> f64 {
     const BASE: f64 = 1e-4;
-    let scale = rho_hat
-        .iter()
-        .fold(1.0_f64, |m, &x| m.max(x.abs()));
+    let scale = rho_hat.iter().fold(1.0_f64, |m, &x| m.max(x.abs()));
     BASE * scale
 }
 
@@ -314,7 +313,10 @@ mod tests {
         let b = deterministic_probe_direction(rho.view());
         assert_eq!(a, b, "same fingerprint must give same direction");
         let norm: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-12, "direction must be unit, got {norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-12,
+            "direction must be unit, got {norm}"
+        );
         // A different optimum gives a different direction.
         let rho2 = Array1::from(vec![1.0_f64, -2.0, 0.5, 3.4]);
         let c = deterministic_probe_direction(rho2.view());
@@ -336,7 +338,10 @@ mod tests {
             well_posed: true,
         };
         let cert = certificate_from_samples(&samples);
-        assert!(!cert.well_posed, "NaN value sample must flag not-well-posed");
+        assert!(
+            !cert.well_posed,
+            "NaN value sample must flag not-well-posed"
+        );
         assert!(!cert.passes(1.0), "not-well-posed never certifies");
     }
 }

@@ -708,7 +708,9 @@ pub fn run_per_atom_efs(
         final_step_inf = step_inf;
         let margin = cfg.tolerance.max(PER_ATOM_NEGLIGIBLE_STEP);
         let cost_resolved_below_margin = match efs.logdet_enclosure_gap {
-            Some(gap) => crate::solver::logdet_bounds::LogdetEnclosure::gap_resolves_margin(gap, margin),
+            Some(gap) => {
+                crate::solver::logdet_bounds::LogdetEnclosure::gap_resolves_margin(gap, margin)
+            }
             None => true,
         };
         if step_inf < margin {
@@ -1020,15 +1022,15 @@ mod tests {
             self.inner.eval(rho)
         }
         fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
-            Ok(self.inner.eval_efs(rho)?.with_logdet_enclosure_gap(Some(self.gap)))
+            Ok(self
+                .inner
+                .eval_efs(rho)?
+                .with_logdet_enclosure_gap(Some(self.gap)))
         }
         fn reset(&mut self) {
             self.inner.reset()
         }
-        fn seed_inner_state(
-            &mut self,
-            beta: &Array1<f64>,
-        ) -> Result<SeedOutcome, EstimationError> {
+        fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
             self.inner.seed_inner_state(beta)
         }
     }
@@ -1060,8 +1062,7 @@ mod tests {
             },
             gap: 1e-2,
         };
-        let wide_result =
-            run_per_atom_efs(&mut wide, &seed, &cfg, &topology).expect("wide run");
+        let wide_result = run_per_atom_efs(&mut wide, &seed, &cfg, &topology).expect("wide run");
         assert!(
             !wide_result.converged,
             "an enclosure gap wider than the step tolerance must block convergence"
@@ -1077,8 +1078,7 @@ mod tests {
             },
             gap: 1e-9,
         };
-        let tight_result =
-            run_per_atom_efs(&mut tight, &seed, &cfg, &topology).expect("tight run");
+        let tight_result = run_per_atom_efs(&mut tight, &seed, &cfg, &topology).expect("tight run");
         assert!(
             tight_result.converged,
             "an enclosure gap below the step tolerance must not obstruct convergence"

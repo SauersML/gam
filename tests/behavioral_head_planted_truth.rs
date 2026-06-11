@@ -108,7 +108,9 @@ fn fit_head_newton(
         for j in 0..n_coeffs {
             let mut cp = coeffs.clone();
             cp[j] += eps;
-            let (_n2, gp, _gt) = head.neg_loglik_and_grad(t.view(), cp.view()).expect("head nll");
+            let (_n2, gp, _gt) = head
+                .neg_loglik_and_grad(t.view(), cp.view())
+                .expect("head nll");
             for i in 0..n_coeffs {
                 hess[[i, j]] = (gp[i] - grad[i]) / eps;
             }
@@ -135,7 +137,9 @@ fn fit_head_newton(
     for j in 0..n_coeffs {
         let mut cp = coeffs.clone();
         cp[j] += eps;
-        let (_n2, gp, _g2) = head.neg_loglik_and_grad(t.view(), cp.view()).expect("head nll");
+        let (_n2, gp, _g2) = head
+            .neg_loglik_and_grad(t.view(), cp.view())
+            .expect("head nll");
         for i in 0..n_coeffs {
             hess[[i, j]] = (gp[i] - grad[i]) / eps;
         }
@@ -289,9 +293,9 @@ fn behavioral_loading_on_null_atoms_is_fdr_controlled() {
         coeffs.view(),
         &cov,
         d,
-        1,             // n_eta = 1 (binomial)
+        1, // n_eta = 1 (binomial)
         (n - n_coeffs) as f64,
-        0.1,           // target FDR
+        0.1, // target FDR
     )
     .expect("significance");
 
@@ -303,11 +307,7 @@ fn behavioral_loading_on_null_atoms_is_fdr_controlled() {
     );
     // False discoveries among nulls must be FDR-controlled: at α=0.1 over 5
     // nulls, the expected number of false rejections is well under 1.
-    let false_rejections = sig
-        .fdr_rejected
-        .iter()
-        .filter(|&&k| k != planted)
-        .count();
+    let false_rejections = sig.fdr_rejected.iter().filter(|&&k| k != planted).count();
     assert!(
         false_rejections <= 1,
         "too many false behavioral discoveries on null atoms: {} (rejected {:?})",
@@ -341,7 +341,8 @@ fn leakage_absorber_orthogonalizes_reconstruction_against_label_channel() {
             score_influence[[r, k]] = sw * loading[k];
         }
     }
-    let absorber = LeakageAbsorber::from_score_influence(score_influence.view(), d).expect("absorb");
+    let absorber =
+        LeakageAbsorber::from_score_influence(score_influence.view(), d).expect("absorb");
     assert!(
         absorber.rank() >= 1,
         "absorber found no label-channel direction to orthogonalize against"
@@ -463,10 +464,14 @@ fn head_gradient_matches_finite_difference() {
         for k in 0..d {
             let mut tp = t.clone();
             tp[[r, k]] += eps;
-            let (nllp, _g, _gt) = head.neg_loglik_and_grad(tp.view(), coeffs.view()).expect("nll");
+            let (nllp, _g, _gt) = head
+                .neg_loglik_and_grad(tp.view(), coeffs.view())
+                .expect("nll");
             let mut tm = t.clone();
             tm[[r, k]] -= eps;
-            let (nllm, _g2, _gt2) = head.neg_loglik_and_grad(tm.view(), coeffs.view()).expect("nll");
+            let (nllm, _g2, _gt2) = head
+                .neg_loglik_and_grad(tm.view(), coeffs.view())
+                .expect("nll");
             let fd = (nllp - nllm) / (2.0 * eps);
             assert!(
                 (fd - grad_t[[r, k]]).abs() < 1e-5,

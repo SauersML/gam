@@ -10308,9 +10308,13 @@ mod tests {
         ));
 
         let mut s_f64 = StreamingArrowSchur::from_system(&sys, 8);
-        let (_, db_f64, _) = s_f64.solve(0.0, 0.0, &f64_options).expect("f64 streaming solve");
+        let (_, db_f64, _) = s_f64
+            .solve(0.0, 0.0, &f64_options)
+            .expect("f64 streaming solve");
         let mut s_mp = StreamingArrowSchur::from_system(&sys, 8);
-        let (_, db_mp, _) = s_mp.solve(0.0, 0.0, &mp_options).expect("mp streaming solve");
+        let (_, db_mp, _) = s_mp
+            .solve(0.0, 0.0, &mp_options)
+            .expect("mp streaming solve");
 
         // The mixed-precision Δβ matches the f64 Δβ to the certified tolerance.
         let mut max_abs = 0.0_f64;
@@ -10358,7 +10362,10 @@ mod tests {
                 kappa_unit_roundoff_margin: 0.25,
             },
         );
-        match custom.with_streaming_mixed_precision_default().mixed_precision {
+        match custom
+            .with_streaming_mixed_precision_default()
+            .mixed_precision
+        {
             MixedPrecisionPolicy::Certified {
                 max_refinement_steps,
                 ..

@@ -57,6 +57,11 @@ pub use latent_coord::{
     LatentManifold,
 };
 pub use matern_gradient::{MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator};
+pub use sae_criterion_atoms::{SaeCriterion, SaeCriterionAtom};
+pub use sae_encode_atlas::{
+    AtlasConfig, AtomEncodeAtlas, BasisHessianLipschitz, CertifiedChart, ChartRegion, EncodeAtlas,
+    EncodeResult, KANTOROVICH_THRESHOLD, RowCertificate, row_certificate,
+};
 pub use sae_manifold::{
     AssignmentMode, CertificateInputs, CurvatureBifurcation, CurvatureWalkReport,
     GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
@@ -65,16 +70,9 @@ pub use sae_manifold::{
     TorusHarmonicEvaluator, dictionary_incoherence_report,
     dictionary_incoherence_report_with_dispersion,
 };
-pub use sae_encode_atlas::{
-    AtlasConfig, AtomEncodeAtlas, BasisHessianLipschitz, CertifiedChart, ChartRegion, EncodeAtlas,
-    EncodeResult, KANTOROVICH_THRESHOLD, RowCertificate, row_certificate,
-};
 pub use sae_optimality_certificate::{
     CriterionCertificate, DirectionalSamples, certificate_from_samples,
     deterministic_probe_direction, probe_step,
 };
-pub use sae_criterion_atoms::{SaeCriterion, SaeCriterionAtom};
-pub use sae_row_jet_program::{
-    AtomRowBasisJet, RowGate, SaeReconstructionRowProgram,
-};
+pub use sae_row_jet_program::{AtomRowBasisJet, RowGate, SaeReconstructionRowProgram};
 pub use sheaf::{EdgeRestriction, SheafConsistencyPenalty};

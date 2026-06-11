@@ -239,7 +239,12 @@ pub fn assemble_cumulants(block: &[&[f64]], rows: &[RowLogLikDerivs]) -> Option<
             }
         }
     }
-    if info.iter().chain(nu3.iter()).chain(nu4.iter()).any(|v| !v.is_finite()) {
+    if info
+        .iter()
+        .chain(nu3.iter())
+        .chain(nu4.iter())
+        .any(|v| !v.is_finite())
+    {
         return None;
     }
     Some(CumulantArrays { q, info, nu3, nu4 })
@@ -399,8 +404,18 @@ mod tests {
         let z1 = [-1.0_f64, 0.5];
         let block: Vec<&[f64]> = vec![&z0, &z1];
         let rows = vec![
-            RowLogLikDerivs { d1: 0.0, d2: -1.5, d3: 0.7, d4: -0.2 },
-            RowLogLikDerivs { d1: 0.0, d2: -0.5, d3: 1.1, d4: 0.4 },
+            RowLogLikDerivs {
+                d1: 0.0,
+                d2: -1.5,
+                d3: 0.7,
+                d4: -0.2,
+            },
+            RowLogLikDerivs {
+                d1: 0.0,
+                d2: -0.5,
+                d3: 1.1,
+                d4: 0.4,
+            },
         ];
         let c = assemble_cumulants(&block, &rows).expect("cumulants");
         assert_eq!(c.q, 2);
@@ -434,7 +449,12 @@ mod tests {
         let zcol = [1.0_f64];
         let block: Vec<&[f64]> = (0..n).map(|_| &zcol[..]).collect();
         let rows: Vec<RowLogLikDerivs> = (0..n)
-            .map(|_| RowLogLikDerivs { d1: 0.0, d2: -1.0 / phi, d3: 0.0, d4: 0.0 })
+            .map(|_| RowLogLikDerivs {
+                d1: 0.0,
+                d2: -1.0 / phi,
+                d3: 0.0,
+                d4: 0.0,
+            })
             .collect();
         let c = assemble_cumulants(&block, &rows).expect("cumulants");
         let (rho3, rho4) = scalar_standardized_cumulants(&c).expect("standardized");
@@ -489,7 +509,12 @@ mod tests {
         // length mismatch between block and rows.
         assert!(assemble_cumulants(&block, &[]).is_none());
         // non-finite derivative.
-        let bad = vec![RowLogLikDerivs { d1: 0.0, d2: f64::NAN, d3: 0.0, d4: 0.0 }];
+        let bad = vec![RowLogLikDerivs {
+            d1: 0.0,
+            d2: f64::NAN,
+            d3: 0.0,
+            d4: 0.0,
+        }];
         assert!(assemble_cumulants(&block, &bad).is_none());
     }
 }

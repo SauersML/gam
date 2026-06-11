@@ -58,7 +58,10 @@ impl Certificate for CriterionCertificate {
             },
         );
         e.insert("lambdas_railed_count", self.lambdas_railed.len().into());
-        e.insert("first_order_consistent", self.first_order_consistent().into());
+        e.insert(
+            "first_order_consistent",
+            self.first_order_consistent().into(),
+        );
         e.insert("summary", self.summary().into());
         e
     }
@@ -171,10 +174,7 @@ impl Certificate for LogdetEnclosure {
 
 /// Verdict for an enclosure resolved against a concrete consumer
 /// `decision_margin`, reusing [`LogdetEnclosure::decide_within_margin`].
-pub fn enclosure_margin_verdict(
-    enclosure: &LogdetEnclosure,
-    decision_margin: f64,
-) -> Verdict {
+pub fn enclosure_margin_verdict(enclosure: &LogdetEnclosure, decision_margin: f64) -> Verdict {
     match enclosure.decide_within_margin(decision_margin) {
         MarginVerdict::Decided { .. } => Verdict::Certified,
         MarginVerdict::InsufficientMargin { .. } => Verdict::Insufficient,
@@ -200,7 +200,10 @@ impl Certificate for EncodeResult {
         let certified = n - self.encode_uncertified_count;
         e.insert("rows", n.into());
         e.insert("certified_rows", certified.into());
-        e.insert("encode_uncertified_count", self.encode_uncertified_count.into());
+        e.insert(
+            "encode_uncertified_count",
+            self.encode_uncertified_count.into(),
+        );
         let frac = if n > 0 {
             certified as f64 / n as f64
         } else {
@@ -240,11 +243,17 @@ impl Certificate for ResidualGaugeReport {
 
     fn evidence(&self) -> Evidence {
         let mut e = Evidence::new();
-        e.insert("metric_provenance", format!("{:?}", self.metric_provenance).into());
+        e.insert(
+            "metric_provenance",
+            format!("{:?}", self.metric_provenance).into(),
+        );
         e.insert("group_signature", self.group_signature().into());
         e.insert("pinning_rank", self.pinning_rank.into());
         e.insert("residual_gauge_dim", self.residual_gauge_dim.into());
-        e.insert("diffeomorphism_unpinned", self.diffeomorphism_unpinned.into());
+        e.insert(
+            "diffeomorphism_unpinned",
+            self.diffeomorphism_unpinned.into(),
+        );
         e.insert("generator_count", self.generators.len().into());
         match self.sym_f_trivial_under_output_fisher {
             Some(t) => e.insert("sym_f_trivial_under_output_fisher", t.into()),
@@ -294,7 +303,11 @@ impl Certificate for CertificateInputs {
         put_finite(&mut e, "peak_activity_floor", self.peak_activity_floor);
         put_finite(&mut e, "snr_proxy", self.snr_proxy);
         put_finite(&mut e, "dispersion", self.dispersion);
-        put_finite(&mut e, "global_optimality_margin", self.global_optimality.margin());
+        put_finite(
+            &mut e,
+            "global_optimality_margin",
+            self.global_optimality.margin(),
+        );
         e.insert(
             "global_optimality",
             if self.global_optimality.is_certified() {

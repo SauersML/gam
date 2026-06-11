@@ -385,7 +385,10 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
                 flags.push("outer Hessian not positive definite".to_string());
             }
             if !cert.lambdas_railed.is_empty() {
-                flags.push(format!("\u{03BB} railed at bound: {:?}", cert.lambdas_railed));
+                flags.push(format!(
+                    "\u{03BB} railed at bound: {:?}",
+                    cert.lambdas_railed
+                ));
             }
             format!(
                 "<span class=\"conv-warn\">\u{26A0} {}</span>",

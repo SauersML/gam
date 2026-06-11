@@ -26663,52 +26663,53 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // infinite-width intervals that masquerade as a fit — see the finite-mode
     // check after the refit). The result carries the existing escalation's
     // degraded / sampled-not-certified flagging so confidence is honest.
-    let (rho_star, outer_grad_norm, outer_iters, nonconvergence_escalation, outer_certificate) = match outer_result {
-        Ok(outer_result) => {
-            // Geometry-driven terminal escalation. When the outer smoothing
-            // optimizer cannot certify convergence, the objective is always
-            // *proper* (Jeffreys/PC term unconditionally armed), so a
-            // non-convergence here is a geometry signal (indefinite / non-smooth
-            // LAML landscape that stalled Strong-Wolfe) — not a reason to fail.
-            // Instead we AUTO-ESCALATE to sampling the proper posterior about the
-            // best mode the inner solve reached (the never-fail bottom rung; see
-            // `hmc::sample_gaussian_mode_posterior`). The fast Arc/EFS path is
-            // untouched: this branch is only reached after the optimizer reports
-            // non-convergence, so nice landscapes never pay any sampling cost.
-            let nonconvergence_escalation = !outer_result.converged;
-            if nonconvergence_escalation {
-                log::info!(
-                    "[robust] outer smoothing did not certify convergence (plan={} iters={} |g|={}); \
+    let (rho_star, outer_grad_norm, outer_iters, nonconvergence_escalation, outer_certificate) =
+        match outer_result {
+            Ok(outer_result) => {
+                // Geometry-driven terminal escalation. When the outer smoothing
+                // optimizer cannot certify convergence, the objective is always
+                // *proper* (Jeffreys/PC term unconditionally armed), so a
+                // non-convergence here is a geometry signal (indefinite / non-smooth
+                // LAML landscape that stalled Strong-Wolfe) — not a reason to fail.
+                // Instead we AUTO-ESCALATE to sampling the proper posterior about the
+                // best mode the inner solve reached (the never-fail bottom rung; see
+                // `hmc::sample_gaussian_mode_posterior`). The fast Arc/EFS path is
+                // untouched: this branch is only reached after the optimizer reports
+                // non-convergence, so nice landscapes never pay any sampling cost.
+                let nonconvergence_escalation = !outer_result.converged;
+                if nonconvergence_escalation {
+                    log::info!(
+                        "[robust] outer smoothing did not certify convergence (plan={} iters={} |g|={}); \
                      AUTO-ESCALATE to never-fail posterior sampling about the best mode",
-                    outer_result.plan_used,
+                        outer_result.plan_used,
+                        outer_result.iterations,
+                        outer_result.final_grad_norm_report(),
+                    );
+                }
+                (
+                    outer_result.rho,
+                    outer_result.final_grad_norm,
                     outer_result.iterations,
-                    outer_result.final_grad_norm_report(),
-                );
+                    nonconvergence_escalation,
+                    outer_result.criterion_certificate,
+                )
             }
-            (
-                outer_result.rho,
-                outer_result.final_grad_norm,
-                outer_result.iterations,
-                nonconvergence_escalation,
-                outer_result.criterion_certificate,
-            )
-        }
-        Err(e) if outer_startup_failure_is_escalatable(&e) => {
-            log::warn!(
-                "[robust] outer smoothing raised at startup validation on a structurally-audited \
+            Err(e) if outer_startup_failure_is_escalatable(&e) => {
+                log::warn!(
+                    "[robust] outer smoothing raised at startup validation on a structurally-audited \
                  design (post-audit numerical pathology, gam#860): {e}.{last_error_detail} \
                  AUTO-ESCALATE to never-fail posterior sampling about the initial ρ seed; the \
                  degraded refit below still raises if even the seed produces a non-finite mode.",
-            );
-            (rho0.clone(), None, 0, true, None)
-        }
-        Err(e) => {
-            return Err(format!(
+                );
+                (rho0.clone(), None, 0, true, None)
+            }
+            Err(e) => {
+                return Err(format!(
                 "outer smoothing optimization failed after exhausting strategy fallbacks: {e}.{last_error_detail}"
             )
             .into());
-        }
-    };
+            }
+        };
     screening_cap.store(0, Ordering::Relaxed);
 
     let per_block = split_labeled_log_lambdas(&rho_star, &label_layout)?;

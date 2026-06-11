@@ -46,10 +46,7 @@ fn build_dataset(seed: u64) -> EncodedDataset {
 
 fn fit_and_take_certificate(
     seed: u64,
-) -> (
-    f64,
-    gam::inference::rho_posterior::RhoPosteriorCertificate,
-) {
+) -> (f64, gam::inference::rho_posterior::RhoPosteriorCertificate) {
     let ds = build_dataset(seed);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -60,15 +57,10 @@ fn fit_and_take_certificate(
         panic!("expected a standard GAM fit");
     };
     let reml_score = fit.fit.reml_score;
-    let cert = fit
-        .fit
-        .artifacts
-        .rho_posterior_certificate
-        .clone()
-        .expect(
-            "a smooth-term Gaussian GAM has ρ parameters and an SPD outer Hessian, so the \
+    let cert = fit.fit.artifacts.rho_posterior_certificate.clone().expect(
+        "a smooth-term Gaussian GAM has ρ parameters and an SPD outer Hessian, so the \
              Tier-0 ρ-posterior certificate must be present on the real fit artifact",
-        );
+    );
     (reml_score, cert)
 }
 

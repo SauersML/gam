@@ -16130,7 +16130,9 @@ fn latent_id_objective_contribution(
             // the head's latent-code gradient flows into the `t` block (the
             // arrow-Schur cross-channel coupling).
             let n_coeffs = head.n_coeffs(latent_dim);
-            let coeffs = theta.slice(ndarray::s![cursor..cursor + n_coeffs]).to_owned();
+            let coeffs = theta
+                .slice(ndarray::s![cursor..cursor + n_coeffs])
+                .to_owned();
             let (head_nll, grad_coeffs, grad_t) = head
                 .neg_loglik_and_grad(t.view(), coeffs.view())
                 .map_err(EstimationError::InvalidInput)?;

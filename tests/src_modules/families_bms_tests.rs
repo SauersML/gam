@@ -9152,10 +9152,7 @@ impl crate::families::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
     }
 
     fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
-        Ok([
-            self.block_states[0].eta[row],
-            self.block_states[1].eta[row],
-        ])
+        Ok([self.block_states[0].eta[row], self.block_states[1].eta[row]])
     }
 
     fn row_nll(
@@ -9171,7 +9168,11 @@ impl crate::families::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
 
         let marginal = self.family.marginal_link_map(p[0].v)?;
         let q = p[0].compose_unary([
-            marginal.q, marginal.q1, marginal.q2, marginal.q3, marginal.q4,
+            marginal.q,
+            marginal.q1,
+            marginal.q2,
+            marginal.q3,
+            marginal.q4,
         ]);
         let observed_g = p[1] * s_f;
         let one_plus_b2 = observed_g * observed_g + 1.0;
@@ -9221,10 +9222,8 @@ fn bernoulli_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
             },
         ];
 
-        let kernel = super::row_kernel::BernoulliRigidRowKernel::new(
-            family.clone(),
-            block_states.clone(),
-        );
+        let kernel =
+            super::row_kernel::BernoulliRigidRowKernel::new(family.clone(), block_states.clone());
         let program = BernoulliRigidNllProgram {
             family,
             block_states,

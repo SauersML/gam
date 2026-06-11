@@ -2241,19 +2241,17 @@ fn residual_gauge_inner(
     // Both behaviorally separate the atoms (the downstream metric strictly more,
     // since it sees far-future coupling the same-position metric misses), so the
     // permutation subgroup must be trivially pinned under either.
-    let sym_f_trivial_under_output_fisher =
-        if matches!(
-            metric_provenance,
-            MetricProvenance::OutputFisher { .. }
-                | MetricProvenance::OutputFisherDownstream { .. }
-        ) {
-            let any_perm_unpinned = verdicts
-                .iter()
-                .any(|v| v.family == GeneratorFamily::AtomPermutation && v.unpinned);
-            Some(!any_perm_unpinned)
-        } else {
-            None
-        };
+    let sym_f_trivial_under_output_fisher = if matches!(
+        metric_provenance,
+        MetricProvenance::OutputFisher { .. } | MetricProvenance::OutputFisherDownstream { .. }
+    ) {
+        let any_perm_unpinned = verdicts
+            .iter()
+            .any(|v| v.family == GeneratorFamily::AtomPermutation && v.unpinned);
+        Some(!any_perm_unpinned)
+    } else {
+        None
+    };
 
     let summary = format!(
         "residual gauge certificate (computed in metric {metric_provenance:?}): \

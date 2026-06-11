@@ -93,12 +93,9 @@ fn corrected_aic_penalizes_at_least_as_much_as_conditional() {
         panic!("expected a standard GAM fit");
     };
 
-    let alo = compute_alo_diagnostics_from_fit(
-        &fit.fit,
-        ds.values.column(1),
-        LinkFunction::Identity,
-    )
-    .expect("ALO diagnostics");
+    let alo =
+        compute_alo_diagnostics_from_fit(&fit.fit, ds.values.column(1), LinkFunction::Identity)
+            .expect("ALO diagnostics");
 
     // Fitted linear predictor (identity link, no offset): the in-sample mean.
     let eta_hat = Array1::from(alo.pred_identity.to_vec());
@@ -178,7 +175,9 @@ fn psis_loo_paired_comparison_prefers_the_true_generator() {
     // curvature). PSIS-LOO Δelpd must favour the correctly-specified smooth.
     let n = 250usize;
     let mut rng = DetNormal::new(0x1234_5678_u64);
-    let x: Vec<f64> = (0..n).map(|i| -1.0 + 2.0 * i as f64 / (n as f64 - 1.0)).collect();
+    let x: Vec<f64> = (0..n)
+        .map(|i| -1.0 + 2.0 * i as f64 / (n as f64 - 1.0))
+        .collect();
     // A clearly nonlinear mean: a double bump. Linear-in-x cannot fit it.
     let y: Vec<f64> = x
         .iter()
@@ -201,12 +200,9 @@ fn psis_loo_paired_comparison_prefers_the_true_generator() {
     };
 
     let cmp_of = |fit: &gam::StandardFitResult| {
-        let alo = compute_alo_diagnostics_from_fit(
-            &fit.fit,
-            ds.values.column(1),
-            LinkFunction::Identity,
-        )
-        .expect("ALO diagnostics");
+        let alo =
+            compute_alo_diagnostics_from_fit(&fit.fit, ds.values.column(1), LinkFunction::Identity)
+                .expect("ALO diagnostics");
         let eta_hat = Array1::from(alo.pred_identity.to_vec());
         let weights = Array1::<f64>::ones(n);
         model_comparison_from_unified(

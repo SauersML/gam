@@ -51,9 +51,7 @@
 //!    orthogonalization AND the multiplicity correction are the reportable
 //!    ones.
 
-use crate::inference::smooth_test::{
-    SmoothTestInput, SmoothTestScale, wood_smooth_test,
-};
+use crate::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
 use crate::inference::structure_evidence::e_benjamini_hochberg;
 use crate::linalg::faer_ndarray::FaerSvd;
 use crate::solver::row_measure::RowMeasure;
@@ -323,7 +321,11 @@ impl BehavioralHead {
                     let lse = max_eta + denom.ln();
                     let label = self.y[row] as usize;
                     // log p(y) = η_y − lse, with η_0 = 0 for the reference class.
-                    let eta_y = if label == 0 { 0.0 } else { eta[[row, label - 1]] };
+                    let eta_y = if label == 0 {
+                        0.0
+                    } else {
+                        eta[[row, label - 1]]
+                    };
                     nll += w * (lse - eta_y);
                     // dNLL/dη_c = p_c − 1{y = c+1}, for free channel c (class c+1).
                     for c in 0..n_eta {

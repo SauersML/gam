@@ -43,9 +43,7 @@ use crate::solver::structure_search::{
     CollapseAction, MoveBudget, MoveProposal, SearchLedger, SearchOutcome, StructureMove, search,
 };
 use crate::terms::atom_codes::SparseAtomCodes;
-use crate::terms::sae_manifold::{
-    SaeAtomBasisKind, SaeManifoldRho, SaeManifoldTerm,
-};
+use crate::terms::sae_manifold::{SaeAtomBasisKind, SaeManifoldRho, SaeManifoldTerm};
 
 /// Per-row soft-assignment mass below which an atom is treated as INACTIVE on
 /// that row when deriving the discrete co-activation support. A soft softmax /
@@ -291,11 +289,7 @@ pub fn harvest_move_proposals(
             // (the routing is already gone), ranked above ARD divergence; ARD
             // deaths rank by precision. `max_mass` breaks ties toward emptier
             // atoms.
-            let trigger = if collapsed {
-                f64::MAX / 2.0
-            } else {
-                ard
-            };
+            let trigger = if collapsed { f64::MAX / 2.0 } else { ard };
             // Lower max-mass (emptier) sorts first among equal triggers; encode
             // by subtracting a small mass-proportional term that cannot reorder
             // across the collapsed/ARD bands.
@@ -352,7 +346,11 @@ pub fn harvest_move_proposals(
     // e-gate decides acceptance.
     let fission_carve_skipped = !fission_atoms.is_empty();
     for &(atom, significance) in fission_atoms.iter().take(params.max_fissions) {
-        proposals.push(proposal(term, StructureMove::Fission { atom }, significance));
+        proposals.push(proposal(
+            term,
+            StructureMove::Fission { atom },
+            significance,
+        ));
     }
 
     // --- Births: whitened residual-factor subspace -------------------------
@@ -487,9 +485,7 @@ const DEMOTE_LOGIT: f64 = -40.0;
 fn demote_atom(term: &mut SaeManifoldTerm, atom: usize) -> Result<(), String> {
     let k = term.k_atoms();
     if atom >= k {
-        return Err(format!(
-            "demote_atom: atom {atom} out of range (K={k})"
-        ));
+        return Err(format!("demote_atom: atom {atom} out of range (K={k})"));
     }
     for row in 0..term.assignment.logits.nrows() {
         term.assignment.logits[[row, atom]] = DEMOTE_LOGIT;
@@ -682,10 +678,7 @@ const ESTIMATION_FRACTION: f64 = 0.6;
 /// rows (contiguous) are the estimation set, the remainder is partitioned into
 /// `n_shards` contiguous held-out evaluation blocks. Deterministic — contiguous
 /// blocks, no shuffle. Each shard shares the full target by reference.
-pub fn estimation_eval_split(
-    target: ArrayView2<'_, f64>,
-    n_shards: usize,
-) -> EstimationEvalSplit {
+pub fn estimation_eval_split(target: ArrayView2<'_, f64>, n_shards: usize) -> EstimationEvalSplit {
     let n = target.nrows();
     if n == 0 {
         return EstimationEvalSplit {
@@ -695,8 +688,8 @@ pub fn estimation_eval_split(
     }
     let shared = std::sync::Arc::new(target.to_owned());
     // At least one estimation row and at least one evaluation row when n ≥ 2.
-    let n_est = ((n as f64 * ESTIMATION_FRACTION).round() as usize)
-        .clamp(1, n.saturating_sub(1).max(1));
+    let n_est =
+        ((n as f64 * ESTIMATION_FRACTION).round() as usize).clamp(1, n.saturating_sub(1).max(1));
     let estimation_rows: Vec<usize> = (0..n_est).collect();
     let eval_rows: Vec<usize> = (n_est..n).collect();
     let n_eval = eval_rows.len();
@@ -1303,9 +1296,13 @@ mod tests {
         let m = term.atoms[0].basis_size();
         let mut decoder = Array2::<f64>::zeros((m, p));
         decoder[[0, 0]] = 0.7;
-        let (born, born_rho) =
-            apply_structure_move(&term, &rho, &StructureMove::Birth { candidate: 0 }, &[decoder])
-                .unwrap();
+        let (born, born_rho) = apply_structure_move(
+            &term,
+            &rho,
+            &StructureMove::Birth { candidate: 0 },
+            &[decoder],
+        )
+        .unwrap();
         assert_eq!(born.k_atoms(), k0 + 1);
         assert_eq!(born_rho.log_ard.len(), k0 + 1);
         assert_eq!(born.atoms[k0].decoder_coefficients[[0, 0]], 0.7);
@@ -1356,7 +1353,10 @@ mod tests {
         let b = run();
         let sa = serde_json::to_string(&a.rounds).unwrap();
         let sb = serde_json::to_string(&b.rounds).unwrap();
-        assert_eq!(sa, sb, "identical inputs must produce a byte-identical ledger");
+        assert_eq!(
+            sa, sb,
+            "identical inputs must produce a byte-identical ledger"
+        );
         assert_eq!(a.term.k_atoms(), b.term.k_atoms());
     }
 
@@ -1369,8 +1369,7 @@ mod tests {
         let split = estimation_eval_split(target.view(), 4);
         assert!(!split.estimation_rows.is_empty());
         assert!(!split.shards.is_empty());
-        let est: std::collections::HashSet<usize> =
-            split.estimation_rows.iter().copied().collect();
+        let est: std::collections::HashSet<usize> = split.estimation_rows.iter().copied().collect();
         for shard in &split.shards {
             for &row in &shard.rows {
                 assert!(

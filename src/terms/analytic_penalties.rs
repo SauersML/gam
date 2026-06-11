@@ -2312,7 +2312,8 @@ impl IBPAssignmentPenalty {
             //                                        − 2/(1−π)² + 2(n−M)·pi_jac/(1−π)³ ].
             let one_minus = 1.0 - pk;
             let ddzd = pi_jac * pi_jac * (1.0 / (pk * pk) - 1.0 / (one_minus * one_minus));
-            let dpisd = 2.0 / (pk * pk) - 2.0 * (mass + a - 1.0) * pi_jac / (pk * pk * pk)
+            let dpisd = 2.0 / (pk * pk)
+                - 2.0 * (mass + a - 1.0) * pi_jac / (pk * pk * pk)
                 - 2.0 / (one_minus * one_minus)
                 + 2.0 * (n as f64 - mass) * pi_jac / (one_minus * one_minus * one_minus);
             score_second_derivative[k] = ddzd + dpisd * pi_jac;

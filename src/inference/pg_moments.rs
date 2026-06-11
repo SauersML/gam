@@ -290,9 +290,7 @@ fn gauss_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
         nodes[i] = x;
         // Weight w_i = 2^{n−1} n! √π / (n² H_{n−1}(x_i)²).
         let (pnm1, _) = hermite_p_dp(n - 1, x);
-        let log_w = (n as f64 - 1.0) * std::f64::consts::LN_2
-            + ln_factorial(n)
-            + 0.5 * PI.ln()
+        let log_w = (n as f64 - 1.0) * std::f64::consts::LN_2 + ln_factorial(n) + 0.5 * PI.ln()
             - 2.0 * nf.ln()
             - 2.0 * pnm1.abs().ln();
         weights[i] = log_w.exp();
