@@ -7219,6 +7219,7 @@ impl SaeManifoldTerm {
         let base_refine_iter = inner_max_iter.max(1).saturating_mul(16).max(64);
         let progress_refine_iter = inner_max_iter.max(1).saturating_mul(64).max(256);
         let mut previous_refine_grad_norm: Option<f64> = None;
+        let mut saw_refine_progress = false;
         loop {
             let sys = self
                 .assemble_arrow_schur(target, rho, registry)
@@ -7290,6 +7291,8 @@ impl SaeManifoldTerm {
                             previous_refine_grad_norm,
                             grad_norm,
                             grad_tolerance,
+                            step_tolerance,
+                            saw_refine_progress,
                         );
                         if total_inner_iter >= refine_limit {
                             return Err(format!(
@@ -7302,6 +7305,8 @@ impl SaeManifoldTerm {
                         }
                         let remaining = refine_limit - total_inner_iter;
                         let refine_iter = inner_max_iter.max(1).min(remaining);
+                        saw_refine_progress |=
+                            Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
                         previous_refine_grad_norm = Some(grad_norm);
                         *loss = self.run_joint_fit_arrow_schur(
                             target,
@@ -7350,6 +7355,8 @@ impl SaeManifoldTerm {
                 previous_refine_grad_norm,
                 grad_norm,
                 grad_tolerance,
+                step_tolerance,
+                saw_refine_progress,
             );
             if total_inner_iter >= refine_limit {
                 return Err(format!(
@@ -7363,6 +7370,8 @@ impl SaeManifoldTerm {
             }
             let remaining = refine_limit - total_inner_iter;
             let refine_iter = inner_max_iter.max(1).min(remaining);
+            saw_refine_progress |=
+                Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
             previous_refine_grad_norm = Some(grad_norm);
             *loss = self.run_joint_fit_arrow_schur(
                 target,
@@ -7384,25 +7393,34 @@ impl SaeManifoldTerm {
         previous_grad_norm: Option<f64>,
         grad_norm: f64,
         grad_tolerance: f64,
+        step_tolerance: f64,
+        saw_refine_progress: bool,
     ) -> usize {
         // Flat affine-gauge valleys can keep crawling productively after the
-        // historical base budget. Extend only while the measured KKT residual is
-        // near the stationarity scale and still dropping; true stalls end at the
-        // base work budget (#968).
+        // historical base budget. Extend only when the measured KKT residual has
+        // shown a real round-to-round drop and remains in the stationarity-scale
+        // work window; true stalls end at the base work budget (#968).
         if total_inner_iter < base_refine_iter {
             return base_refine_iter;
         }
-        let making_progress = previous_grad_norm.is_some_and(|prev| {
-            prev.is_finite()
-                && grad_norm.is_finite()
-                && grad_norm <= 0.9 * prev
-                && grad_norm <= 1.0e3 * grad_tolerance
-        });
+        let making_progress =
+            saw_refine_progress || Self::refine_round_made_progress(previous_grad_norm, grad_norm);
+        let work_window = (1.0e3 * grad_tolerance).max(1.0e3 * step_tolerance);
         if making_progress {
-            progress_refine_iter
+            if grad_norm.is_finite() && grad_norm <= work_window {
+                progress_refine_iter
+            } else {
+                base_refine_iter
+            }
         } else {
             base_refine_iter
         }
+    }
+
+    fn refine_round_made_progress(previous_grad_norm: Option<f64>, grad_norm: f64) -> bool {
+        previous_grad_norm.is_some_and(|prev| {
+            prev.is_finite() && grad_norm.is_finite() && grad_norm <= 0.9 * prev
+        })
     }
 
     fn outer_gradient_arrow_solver<'a>(
@@ -19511,8 +19529,14 @@ mod tests {
         let solved = solver
             .solve(rhs_t.view(), rhs_beta.view())
             .expect("adapter solve");
-        assert_abs_diff_eq!(solved.t, plain_t, epsilon = 0.0);
-        assert_abs_diff_eq!(solved.beta, plain_beta, epsilon = 0.0);
+        assert_eq!(solved.t.len(), plain_t.len());
+        for idx in 0..plain_t.len() {
+            assert_abs_diff_eq!(solved.t[idx], plain_t[idx], epsilon = 0.0);
+        }
+        assert_eq!(solved.beta.len(), plain_beta.len());
+        for idx in 0..plain_beta.len() {
+            assert_abs_diff_eq!(solved.beta[idx], plain_beta[idx], epsilon = 0.0);
+        }
     }
 
     #[test]
@@ -19528,7 +19552,9 @@ mod tests {
             .solve(physical_rhs.view(), rhs_beta.view())
             .expect("physical solve");
         let oracle = array![2.0_f64, 0.0];
-        assert_abs_diff_eq!(solved.t, oracle, epsilon = 1.0e-12);
+        for idx in 0..oracle.len() {
+            assert_abs_diff_eq!(solved.t[idx], oracle[idx], epsilon = 1.0e-12);
+        }
 
         let gauge_rhs = array![0.0_f64, 1.0];
         let plain = cache
