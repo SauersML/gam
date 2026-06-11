@@ -9669,7 +9669,8 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     let psi_gradient_rel = (analytic_psi_gradient - fd_psi_gradient).abs() / psi_gradient_scale;
     assert!(
         psi_gradient_rel < 2e-3,
-        "outer ψ gradient disagrees with centered FD of the outer value: analytic={}, fd={}, rel={psi_gradient_rel:.3e}",
+        "outer ψ gradient disagrees with centered FD of the outer value: analytic={}, fd={}, \
+         rel={psi_gradient_rel:.3e}",
         analytic_psi_gradient,
         fd_psi_gradient
     );
