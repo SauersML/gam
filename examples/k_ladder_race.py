@@ -382,6 +382,7 @@ def run_candidate_process(args: argparse.Namespace, k_atoms: int, mix: str) -> d
             "seconds": float(time.time() - started),
             "wall_timeout_seconds": float(args.wall_timeout),
             "peak_rss_kib": int(peak_kib),
+            "peak_rss_gib": float(peak_kib / 1024.0 / 1024.0),
             "rss_samples": int(samples),
             "stdout_log": str(stdout_log),
             "rss_log": str(rss_log),
