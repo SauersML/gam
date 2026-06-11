@@ -558,7 +558,14 @@ impl DeviceResidentArrowWorkspace {
         let n = self.shape.n;
         let d = self.shape.d;
         let p = self.shape.p;
-        let mut sys = base.clone();
+        // `ArrowSchurSystem` is not `Clone` (it carries matrix-free operator
+        // closures whose sharing across a then-mutated system would be a
+        // footgun), so own a fresh system built from the resident slabs rather
+        // than cloning `base`. `to_arrow_system` reproduces the identical
+        // Hessian blocks; we overwrite only the gradients below with the
+        // residual `r(z) = H z − g₀`. The Hessian reads stay on `base` (bit-
+        // identical to the fresh system's blocks).
+        let mut sys = self.to_arrow_system();
         for i in 0..n {
             let t_base = i * d;
             for r in 0..d {
