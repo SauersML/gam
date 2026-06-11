@@ -51,7 +51,10 @@ use crate::terms::sae_optimality_certificate::{
     deterministic_probe_direction, probe_step,
 };
 
-use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb};
+use crate::linalg::faer_ndarray::{
+    FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb,
+};
+use crate::linalg::triangular::cholesky_solve_vector;
 use crate::solver::arrow_schur::{
     ArrowFactorCache, arrow_factor_max_pivot, arrow_factor_min_pivot,
     solve_arrow_newton_step_with_options,
@@ -72,10 +75,11 @@ const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 /// The evidence value can still be honest below this threshold because it only
 /// sums `log(diag(L))`. The analytic gradient is different: selected-inverse
 /// traces and `ArrowFactorCache::full_inverse_apply` divide by those pivots.
-/// Once `min_pivot / max_pivot` is below this floor, f64 has no useful elbow
-/// room left for inverse-based derivative signal, so the gradient is undefined
-/// at that trial rho and the outer line search must retreat.
+/// Once `min_pivot / max_pivot` is below this floor, the gradient lane must
+/// either identify a closed-form gauge orbit and stiffen only that quotient
+/// direction, or reject the trial rho as numerically singular.
 const SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR: f64 = 1.0e-12;
+const SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR: f64 = 1.0e-8;
 
 /// Nominal curvature-homotopy `η` step (#1007): the tracker covers `η ∈ [0, 1]`
 /// in this many equal predictor-corrector waypoints when the branch is clean.
@@ -2620,6 +2624,239 @@ impl SaeOuterRhoGradientComponents {
 pub struct SaeArrowVector {
     pub t: Array1<f64>,
     pub beta: Array1<f64>,
+}
+
+pub(crate) struct DeflatedArrowSolver<'a> {
+    cache: &'a ArrowFactorCache,
+    gauge_basis: Vec<Array1<f64>>,
+    gauge_responses: Vec<Array1<f64>>,
+    woodbury_factor: Option<FaerCholeskyFactor>,
+}
+
+impl<'a> DeflatedArrowSolver<'a> {
+    fn plain(cache: &'a ArrowFactorCache) -> Self {
+        Self {
+            cache,
+            gauge_basis: Vec::new(),
+            gauge_responses: Vec::new(),
+            woodbury_factor: None,
+        }
+    }
+
+    fn from_orthonormal_gauges(
+        cache: &'a ArrowFactorCache,
+        gauge_basis: Vec<Array1<f64>>,
+        stiffness: f64,
+    ) -> Result<Self, String> {
+        if gauge_basis.is_empty() {
+            return Ok(Self::plain(cache));
+        }
+        let full_len = cache.delta_t_len() + cache.k;
+        let mut gauge_responses = Vec::with_capacity(gauge_basis.len());
+        for gauge in &gauge_basis {
+            if gauge.len() != full_len {
+                return Err(format!(
+                    "DeflatedArrowSolver: gauge length {} != cache full length {full_len}",
+                    gauge.len()
+                ));
+            }
+            let (sol_t, sol_beta) = cache
+                .full_inverse_apply(
+                    gauge.slice(s![..cache.delta_t_len()]),
+                    gauge.slice(s![cache.delta_t_len()..]),
+                )
+                .map_err(|err| format!("DeflatedArrowSolver: gauge back-solve: {err}"))?;
+            gauge_responses.push(flatten_arrow_parts(sol_t.view(), sol_beta.view()));
+        }
+
+        let rank = gauge_basis.len();
+        let mut woodbury = Array2::<f64>::eye(rank);
+        for i in 0..rank {
+            woodbury[[i, i]] /= stiffness;
+            for j in 0..rank {
+                woodbury[[i, j]] += gauge_basis[i].dot(&gauge_responses[j]);
+            }
+        }
+        let woodbury_factor = woodbury
+            .cholesky(Side::Lower)
+            .map_err(|err| format!("DeflatedArrowSolver: gauge Woodbury factor failed: {err}"))?;
+        Ok(Self {
+            cache,
+            gauge_basis,
+            gauge_responses,
+            woodbury_factor: Some(woodbury_factor),
+        })
+    }
+
+    fn solve(
+        &self,
+        rhs_t: ArrayView1<'_, f64>,
+        rhs_beta: ArrayView1<'_, f64>,
+    ) -> Result<SaeArrowVector, String> {
+        let (sol_t, sol_beta) = self
+            .cache
+            .full_inverse_apply(rhs_t, rhs_beta)
+            .map_err(|err| format!("DeflatedArrowSolver: full inverse: {err}"))?;
+        let Some(factor) = self.woodbury_factor.as_ref() else {
+            return Ok(SaeArrowVector {
+                t: sol_t,
+                beta: sol_beta,
+            });
+        };
+
+        let full_len = self.cache.delta_t_len() + self.cache.k;
+        let mut flat = flatten_arrow_parts(sol_t.view(), sol_beta.view());
+        if flat.len() != full_len {
+            return Err(format!(
+                "DeflatedArrowSolver: solution length {} != cache full length {full_len}",
+                flat.len()
+            ));
+        }
+        let mut gauge_coeffs = Array1::<f64>::zeros(self.gauge_basis.len());
+        for (idx, gauge) in self.gauge_basis.iter().enumerate() {
+            gauge_coeffs[idx] = gauge.dot(&flat);
+        }
+        let weights = factor.solvevec(&gauge_coeffs);
+        for (response, &weight) in self.gauge_responses.iter().zip(weights.iter()) {
+            for i in 0..flat.len() {
+                flat[i] -= response[i] * weight;
+            }
+        }
+        Ok(SaeArrowVector {
+            t: flat.slice(s![..self.cache.delta_t_len()]).to_owned(),
+            beta: flat.slice(s![self.cache.delta_t_len()..]).to_owned(),
+        })
+    }
+
+    fn latent_inverse_diagonal(&self) -> Result<Array1<f64>, String> {
+        if self.woodbury_factor.is_none() {
+            return self
+                .cache
+                .latent_block_inverse_diagonal()
+                .map_err(|err| format!("DeflatedArrowSolver: latent inverse diagonal: {err}"));
+        }
+        let total_t = self.cache.delta_t_len();
+        let mut out = Array1::<f64>::zeros(total_t);
+        let rhs_beta = Array1::<f64>::zeros(self.cache.k);
+        for idx in 0..total_t {
+            let mut rhs_t = Array1::<f64>::zeros(total_t);
+            rhs_t[idx] = 1.0;
+            let solved = self.solve(rhs_t.view(), rhs_beta.view())?;
+            out[idx] = solved.t[idx];
+        }
+        Ok(out)
+    }
+}
+
+fn flatten_arrow_parts(t: ArrayView1<'_, f64>, beta: ArrayView1<'_, f64>) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(t.len() + beta.len());
+    for i in 0..t.len() {
+        out[i] = t[i];
+    }
+    for i in 0..beta.len() {
+        out[t.len() + i] = beta[i];
+    }
+    out
+}
+
+fn apply_cached_arrow_hessian(
+    cache: &ArrowFactorCache,
+    v_t: ArrayView1<'_, f64>,
+    v_beta: ArrayView1<'_, f64>,
+) -> Result<SaeArrowVector, String> {
+    let total_t = cache.delta_t_len();
+    if v_t.len() != total_t || v_beta.len() != cache.k {
+        return Err(format!(
+            "apply_cached_arrow_hessian: vector shapes (t={}, beta={}) != cache shapes \
+             (t={total_t}, beta={})",
+            v_t.len(),
+            v_beta.len(),
+            cache.k
+        ));
+    }
+
+    let mut out_t = Array1::<f64>::zeros(total_t);
+    let mut out_beta = Array1::<f64>::zeros(cache.k);
+    for row in 0..cache.n_rows() {
+        let di = cache.row_dims[row];
+        let base = cache.row_offsets[row];
+        let row_v = v_t.slice(s![base..base + di]);
+        let factor = cache.undamped_factor(row);
+        let av = cholesky_factor_apply(factor, row_v);
+        for j in 0..di {
+            out_t[base + j] += av[j];
+        }
+        if cache.k > 0 {
+            let mut b_vbeta = Array1::<f64>::zeros(di);
+            if !cache.apply_htbeta_row(row, v_beta, &mut b_vbeta) {
+                return Err(format!(
+                    "apply_cached_arrow_hessian: H_tβ^({row}) apply failed"
+                ));
+            }
+            for j in 0..di {
+                out_t[base + j] += b_vbeta[j];
+            }
+            if !cache.apply_htbeta_row_transpose(row, row_v, &mut out_beta, None) {
+                return Err(format!(
+                    "apply_cached_arrow_hessian: H_βt^({row}) apply failed"
+                ));
+            }
+        }
+    }
+
+    if cache.k > 0 {
+        let Some(schur_factor) = cache.schur_factor.as_ref() else {
+            return Err(
+                "apply_cached_arrow_hessian: dense Schur factor is required for gauge probing"
+                    .to_string(),
+            );
+        };
+        let schur_v = cholesky_factor_apply(schur_factor.view(), v_beta);
+        for i in 0..cache.k {
+            out_beta[i] += schur_v[i];
+        }
+        for row in 0..cache.n_rows() {
+            let di = cache.row_dims[row];
+            let mut b_vbeta = Array1::<f64>::zeros(di);
+            if !cache.apply_htbeta_row(row, v_beta, &mut b_vbeta) {
+                return Err(format!(
+                    "apply_cached_arrow_hessian: H_tβ^({row}) Schur correction apply failed"
+                ));
+            }
+            let a_inv_b_vbeta = cholesky_solve_vector(cache.undamped_factor(row), b_vbeta.view());
+            if !cache.apply_htbeta_row_transpose(row, a_inv_b_vbeta.view(), &mut out_beta, None) {
+                return Err(format!(
+                    "apply_cached_arrow_hessian: H_βt^({row}) Schur correction apply failed"
+                ));
+            }
+        }
+    }
+
+    Ok(SaeArrowVector {
+        t: out_t,
+        beta: out_beta,
+    })
+}
+
+fn cholesky_factor_apply(factor: ArrayView2<'_, f64>, vector: ArrayView1<'_, f64>) -> Array1<f64> {
+    let n = factor.nrows();
+    let mut lt_v = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let mut acc = 0.0_f64;
+        for col in row..n {
+            acc += factor[[col, row]] * vector[col];
+        }
+        lt_v[row] = acc;
+    }
+    let mut out = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let mut acc = 0.0_f64;
+        for col in 0..=row {
+            acc += factor[[row, col]] * lt_v[col];
+        }
+        out[row] = acc;
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6979,7 +7216,9 @@ impl SaeManifoldTerm {
             return Ok(factored.2);
         }
         let mut total_inner_iter = inner_max_iter;
-        let max_refine_iter = inner_max_iter.max(1).saturating_mul(16).max(64);
+        let base_refine_iter = inner_max_iter.max(1).saturating_mul(16).max(64);
+        let progress_refine_iter = inner_max_iter.max(1).saturating_mul(64).max(256);
+        let mut previous_refine_grad_norm: Option<f64> = None;
         loop {
             let sys = self
                 .assemble_arrow_schur(target, rho, registry)
@@ -7044,7 +7283,15 @@ impl SaeManifoldTerm {
                                  (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}); {err}"
                             ));
                         }
-                        if total_inner_iter >= max_refine_iter {
+                        let refine_limit = Self::refine_iteration_limit(
+                            total_inner_iter,
+                            base_refine_iter,
+                            progress_refine_iter,
+                            previous_refine_grad_norm,
+                            grad_norm,
+                            grad_tolerance,
+                        );
+                        if total_inner_iter >= refine_limit {
                             return Err(format!(
                                 "SaeManifoldTerm::reml_criterion: undamped evidence \
                                  factorization hit a non-PD per-row H_tt block before KKT \
@@ -7053,8 +7300,9 @@ impl SaeManifoldTerm {
                                  {total_inner_iter} inner iterations; {err}"
                             ));
                         }
-                        let remaining = max_refine_iter - total_inner_iter;
+                        let remaining = refine_limit - total_inner_iter;
                         let refine_iter = inner_max_iter.max(1).min(remaining);
+                        previous_refine_grad_norm = Some(grad_norm);
                         *loss = self.run_joint_fit_arrow_schur(
                             target,
                             rho_fixed,
@@ -7095,7 +7343,15 @@ impl SaeManifoldTerm {
             if grad_norm <= grad_tolerance || quotient_step_norm <= step_tolerance {
                 return Ok(cache);
             }
-            if total_inner_iter >= max_refine_iter {
+            let refine_limit = Self::refine_iteration_limit(
+                total_inner_iter,
+                base_refine_iter,
+                progress_refine_iter,
+                previous_refine_grad_norm,
+                grad_norm,
+                grad_tolerance,
+            );
+            if total_inner_iter >= refine_limit {
                 return Err(format!(
                     "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
                      neither the KKT gradient ‖g‖={grad_norm:.6e} (tol {grad_tolerance:.6e}) nor \
@@ -7105,8 +7361,9 @@ impl SaeManifoldTerm {
                      off-optimum Laplace criterion."
                 ));
             }
-            let remaining = max_refine_iter - total_inner_iter;
+            let remaining = refine_limit - total_inner_iter;
             let refine_iter = inner_max_iter.max(1).min(remaining);
+            previous_refine_grad_norm = Some(grad_norm);
             *loss = self.run_joint_fit_arrow_schur(
                 target,
                 rho_fixed,
@@ -7118,6 +7375,142 @@ impl SaeManifoldTerm {
             )?;
             total_inner_iter += refine_iter;
         }
+    }
+
+    fn refine_iteration_limit(
+        total_inner_iter: usize,
+        base_refine_iter: usize,
+        progress_refine_iter: usize,
+        previous_grad_norm: Option<f64>,
+        grad_norm: f64,
+        grad_tolerance: f64,
+    ) -> usize {
+        // Flat affine-gauge valleys can keep crawling productively after the
+        // historical base budget. Extend only while the measured KKT residual is
+        // near the stationarity scale and still dropping; true stalls end at the
+        // base work budget (#968).
+        if total_inner_iter < base_refine_iter {
+            return base_refine_iter;
+        }
+        let making_progress = previous_grad_norm.is_some_and(|prev| {
+            prev.is_finite()
+                && grad_norm.is_finite()
+                && grad_norm <= 0.9 * prev
+                && grad_norm <= 1.0e3 * grad_tolerance
+        });
+        if making_progress {
+            progress_refine_iter
+        } else {
+            base_refine_iter
+        }
+    }
+
+    fn outer_gradient_arrow_solver<'a>(
+        &'a self,
+        cache: &'a ArrowFactorCache,
+    ) -> Result<DeflatedArrowSolver<'a>, String> {
+        let Err(conditioning_err) = Self::outer_gradient_conditioning_error(cache) else {
+            return Ok(DeflatedArrowSolver::plain(cache));
+        };
+        let Some(max_pivot) = arrow_factor_max_pivot(cache) else {
+            return Err(conditioning_err);
+        };
+        if !(max_pivot.is_finite() && max_pivot > 0.0) {
+            return Err(conditioning_err);
+        }
+
+        let full_len = cache.delta_t_len() + cache.k;
+        let mut quotient_gauges = Vec::new();
+        for gauge in self.dense_step_gauge_vectors()? {
+            if gauge.len() != full_len {
+                continue;
+            }
+            let norm_sq = gauge.iter().map(|v| v * v).sum::<f64>();
+            if !(norm_sq.is_finite() && norm_sq > 1.0e-24) {
+                continue;
+            }
+            let h_gauge = match apply_cached_arrow_hessian(
+                cache,
+                gauge.slice(s![..cache.delta_t_len()]),
+                gauge.slice(s![cache.delta_t_len()..]),
+            ) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let h_flat = flatten_arrow_parts(h_gauge.t.view(), h_gauge.beta.view());
+            let rayleigh = gauge.dot(&h_flat) / norm_sq;
+            if rayleigh.is_finite()
+                && rayleigh >= 0.0
+                && rayleigh <= SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR * max_pivot
+            {
+                quotient_gauges.push(gauge);
+            }
+        }
+        if quotient_gauges.is_empty() {
+            return Err(conditioning_err);
+        }
+
+        let mut orthonormal: Vec<Array1<f64>> = Vec::new();
+        for mut gauge in quotient_gauges {
+            for basis in &orthonormal {
+                let coeff = gauge.dot(basis);
+                for i in 0..gauge.len() {
+                    gauge[i] -= coeff * basis[i];
+                }
+            }
+            let norm_sq = gauge.iter().map(|v| v * v).sum::<f64>();
+            if !(norm_sq.is_finite() && norm_sq > 1.0e-24) {
+                continue;
+            }
+            let inv_norm = norm_sq.sqrt().recip();
+            for value in gauge.iter_mut() {
+                *value *= inv_norm;
+            }
+            orthonormal.push(gauge);
+        }
+        if orthonormal.is_empty() {
+            return Err(conditioning_err);
+        }
+
+        // Quotient-geometry gauge fixing: add stiffness only along the closed-form
+        // gauge orbit (Faddeev-Popov style). Components orthogonal to that orbit
+        // are identical to the original inverse solve, while gauge components are
+        // bounded at the Hessian scale `max_pivot`.
+        DeflatedArrowSolver::from_orthonormal_gauges(cache, orthonormal, max_pivot)
+            .map_err(|_| conditioning_err)
+    }
+
+    fn outer_gradient_conditioning_error(cache: &ArrowFactorCache) -> Result<(), String> {
+        let pivot = arrow_factor_min_pivot(cache);
+        let Some(min_pivot) = pivot.min_pivot else {
+            return Err(
+                "analytic outer gradient undefined at this rho: joint Hessian numerically \
+                 singular (no cached Cholesky pivots)"
+                    .to_string(),
+            );
+        };
+        let Some(max_pivot) = arrow_factor_max_pivot(cache) else {
+            return Err(
+                "analytic outer gradient undefined at this rho: joint Hessian numerically \
+                 singular (no cached Cholesky pivot scale)"
+                    .to_string(),
+            );
+        };
+        let ratio = min_pivot / max_pivot;
+        if min_pivot.is_finite()
+            && max_pivot.is_finite()
+            && max_pivot > 0.0
+            && ratio.is_finite()
+            && ratio >= SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "analytic outer gradient undefined at this rho: joint Hessian numerically singular \
+             (min/max pivot ratio {ratio:.3e} < floor {floor:.3e}; min pivot {min_pivot:.3e}, \
+             max pivot {max_pivot:.3e})",
+            floor = SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR,
+        ))
     }
 
     /// Smoothing-penalty Occam normalizer `−½ Σ_k r_k·rank(S_k)·log λ_smooth`
@@ -7446,8 +7839,11 @@ impl SaeManifoldTerm {
         &self,
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
-        let inv_diag = cache.latent_block_inverse_diagonal()?;
+        let inv_diag = solver
+            .latent_inverse_diagonal()
+            .map_err(|err| ArrowSchurError::SchurFactorFailed { reason: err })?;
         let n = self.n_obs();
         let coord_offsets = self.assignment.coord_offsets();
         let ard_axis_periods: Vec<Vec<Option<f64>>> = self
@@ -7555,6 +7951,47 @@ impl SaeManifoldTerm {
         lambda_smooth: f64,
     ) -> Result<f64, ArrowSchurError> {
         let p = self.output_dim();
+        let frames_active = self.frames_active();
+        let (offsets, out_dim): (Vec<usize>, Box<dyn Fn(usize) -> usize>) = if frames_active {
+            let ranks: Vec<usize> = self.atoms.iter().map(|a| a.border_frame_rank()).collect();
+            (
+                self.factored_beta_offsets(),
+                Box::new(move |k: usize| ranks[k]),
+            )
+        } else {
+            (self.beta_offsets(), Box::new(move |_k: usize| p))
+        };
+        let k = cache.k;
+        let mut trace = 0.0_f64;
+        let mut m_col = Array1::<f64>::zeros(k);
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let s = &atom.smooth_penalty;
+            let m = atom.basis_size();
+            let off = offsets[atom_idx];
+            let r = out_dim(atom_idx);
+            for mu in 0..m {
+                for oc in 0..r {
+                    let col = off + mu * r + oc;
+                    m_col.fill(0.0);
+                    for nu in 0..m {
+                        let s_nu_mu = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
+                        m_col[off + nu * r + oc] = lambda_smooth * s_nu_mu;
+                    }
+                    let z = cache.schur_inverse_apply(m_col.view())?;
+                    trace += z[col];
+                }
+            }
+        }
+        Ok(trace)
+    }
+
+    fn decoder_smoothness_effective_dof_with_solver(
+        &self,
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+        lambda_smooth: f64,
+    ) -> Result<f64, String> {
+        let p = self.output_dim();
         // #972 / #977 T1: the cache's β block is the FACTORED border when frames
         // are active (`cache.k == factored_border_dim`), so the smoothness edf
         // trace `tr((H⁻¹)_ββ · M)` is taken over the same factored layout, with
@@ -7590,7 +8027,8 @@ impl SaeManifoldTerm {
                         let s_nu_mu = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
                         m_col[off + nu * r + oc] = lambda_smooth * s_nu_mu;
                     }
-                    let z = cache.schur_inverse_apply(m_col.view())?;
+                    let zero_t = Array1::<f64>::zeros(cache.delta_t_len());
+                    let z = solver.solve(zero_t.view(), m_col.view())?.beta;
                     trace += z[col];
                 }
             }
@@ -7602,13 +8040,14 @@ impl SaeManifoldTerm {
         &self,
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
     ) -> Result<f64, String> {
         let hdiag = assignment_prior_log_strength_hdiag(&self.assignment, rho)?;
         if hdiag.is_empty() {
             return Ok(0.0);
         }
-        let inv_diag = cache
-            .latent_block_inverse_diagonal()
+        let inv_diag = solver
+            .latent_inverse_diagonal()
             .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
         let k_atoms = self.k_atoms();
         let assignment_dim = self.assignment.assignment_coord_dim();
@@ -8250,10 +8689,11 @@ impl SaeManifoldTerm {
         Ok(SaeArrowVector { t, beta })
     }
 
-    pub fn logdet_theta_adjoint(
+    pub(crate) fn logdet_theta_adjoint(
         &self,
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
     ) -> Result<SaeArrowVector, String> {
         // Γ_a = tr(H⁻¹ ∂H/∂θ_a) over the inner variables θ (#1006). `H` here is
         // the SAME object the evidence factor builds — Gauss-Newton data
@@ -8272,13 +8712,20 @@ impl SaeManifoldTerm {
         let mut gamma_beta = Array1::<f64>::zeros(cache.k);
         let second_jets = self.atom_second_jets()?;
         let border = self.border_channels_for_cache(cache)?;
-        let schur_inv = if cache.k > 0 {
-            cache
-                .schur_inverse_block(0..cache.k)
-                .map_err(|err| format!("logdet_theta_adjoint: Schur inverse: {err}"))?
-        } else {
-            Array2::<f64>::zeros((0, 0))
-        };
+        let mut beta_inv = Array2::<f64>::zeros((cache.k, cache.k));
+        if cache.k > 0 {
+            let rhs_t = Array1::<f64>::zeros(total_t);
+            for col in 0..cache.k {
+                let mut rhs_beta = Array1::<f64>::zeros(cache.k);
+                rhs_beta[col] = 1.0;
+                let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
+                    format!("logdet_theta_adjoint: beta selected inverse solve: {err}")
+                })?;
+                for row in 0..cache.k {
+                    beta_inv[[row, col]] = solved.beta[row];
+                }
+            }
+        }
         // Exact IBP `hessian_diag` logit third-derivative channels (#1006), built
         // once on the same penalty configuration the assembly uses. `None` for
         // non-IBP modes. The cross-row empirical-`M_k` channel needs the per-row
@@ -8304,16 +8751,14 @@ impl SaeManifoldTerm {
                 let mut rhs_t = Array1::<f64>::zeros(total_t);
                 let rhs_beta = Array1::<f64>::zeros(cache.k);
                 rhs_t[base + col] = 1.0;
-                let (sol_t, sol_beta) = cache
-                    .full_inverse_apply(rhs_t.view(), rhs_beta.view())
-                    .map_err(|err| {
-                        format!("logdet_theta_adjoint: selected inverse solve: {err}")
-                    })?;
+                let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
+                    format!("logdet_theta_adjoint: selected inverse solve: {err}")
+                })?;
                 for r in 0..q {
-                    inv_vv[[r, col]] = sol_t[base + r];
+                    inv_vv[[r, col]] = solved.t[base + r];
                 }
                 for b in 0..cache.k {
-                    inv_vbeta[[col, b]] = sol_beta[b];
+                    inv_vbeta[[col, b]] = solved.beta[b];
                 }
             }
 
@@ -8363,7 +8808,7 @@ impl SaeManifoldTerm {
                     for (beta_j, channel_j) in border.iter().enumerate() {
                         let dh = sae_dot(&jets.beta_deriv[w][beta_i], &jets.beta[beta_j])
                             + sae_dot(&jets.beta[beta_i], &jets.beta_deriv[w][beta_j]);
-                        gamma += schur_inv[[channel_i.index, channel_j.index]] * dh;
+                        gamma += beta_inv[[channel_i.index, channel_j.index]] * dh;
                     }
                 }
                 gamma_t[base + w] = gamma;
@@ -8420,11 +8865,12 @@ impl SaeManifoldTerm {
     /// The returned gradient is the assembled analytic outer derivative:
     /// explicit penalty terms, direct logdet traces, Occam terms, and the #1006
     /// implicit-state third-order correction.
-    pub fn analytic_outer_rho_gradient_components(
+    pub(crate) fn analytic_outer_rho_gradient_components(
         &self,
         rho: &SaeManifoldRho,
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
     ) -> Result<SaeOuterRhoGradientComponents, String> {
         let n_params = rho.to_flat().len();
         let mut explicit = Array1::<f64>::zeros(n_params);
@@ -8433,18 +8879,18 @@ impl SaeManifoldTerm {
         let mut third_order_correction = Array1::<f64>::zeros(n_params);
 
         explicit[0] = assignment_prior_log_strength_derivative(&self.assignment, rho);
-        logdet_trace[0] = self.assignment_log_strength_hessian_trace(rho, cache)?;
+        logdet_trace[0] = self.assignment_log_strength_hessian_trace(rho, cache, solver)?;
 
         explicit[1] = loss.smoothness;
         logdet_trace[1] = 0.5
             * self
-                .decoder_smoothness_effective_dof(cache, rho.lambda_smooth())
+                .decoder_smoothness_effective_dof_with_solver(cache, solver, rho.lambda_smooth())
                 .map_err(|err| format!("analytic_outer_rho_gradient_components: {err}"))?;
         occam[1] = -self.reml_occam_log_lambda_smooth_derivative()?;
 
         let ard_explicit = self.ard_log_precision_explicit_derivatives(rho)?;
         let ard_trace = self
-            .ard_log_precision_hessian_trace(rho, cache)
+            .ard_log_precision_hessian_trace(rho, cache, solver)
             .map_err(|err| format!("analytic_outer_rho_gradient_components: {err}"))?;
         let mut cursor = 2usize;
         for k in 0..rho.log_ard.len() {
@@ -8455,20 +8901,18 @@ impl SaeManifoldTerm {
             }
         }
 
-        let gamma = self.logdet_theta_adjoint(rho, cache)?;
+        let gamma = self.logdet_theta_adjoint(rho, cache, solver)?;
         for coord in 0..n_params {
             let rhs = self.outer_rho_gradient_ift_rhs(rho, coord, cache)?;
-            let (sol_t, sol_beta) = cache
-                .full_inverse_apply(rhs.t.view(), rhs.beta.view())
-                .map_err(|err| {
-                    format!("analytic_outer_rho_gradient_components: full_inverse_apply: {err}")
-                })?;
+            let solved = solver.solve(rhs.t.view(), rhs.beta.view()).map_err(|err| {
+                format!("analytic_outer_rho_gradient_components: full_inverse_apply: {err}")
+            })?;
             let mut dot = 0.0_f64;
             for idx in 0..gamma.t.len() {
-                dot += gamma.t[idx] * sol_t[idx];
+                dot += gamma.t[idx] * solved.t[idx];
             }
             for idx in 0..gamma.beta.len() {
-                dot += gamma.beta[idx] * sol_beta[idx];
+                dot += gamma.beta[idx] * solved.beta[idx];
             }
             third_order_correction[coord] = -0.5 * dot;
         }
@@ -8528,7 +8972,9 @@ impl SaeManifoldTerm {
         };
         let data_fit_priors_value = loss.total() + extra_penalty_energy;
 
-        let components = self.analytic_outer_rho_gradient_components(rho, &loss, &cache)?;
+        let solver = self.outer_gradient_arrow_solver(&cache)?;
+        let components =
+            self.analytic_outer_rho_gradient_components(rho, &loss, &cache, &solver)?;
         Ok(SaeCriterion::assemble(
             data_fit_priors_value,
             log_det,
@@ -12258,9 +12704,10 @@ impl SaeManifoldOuterObjective {
             self.ridge_ext_coord,
             self.ridge_beta,
         )?;
+        let solver = self.term.outer_gradient_arrow_solver(&cache)?;
         let components = self
             .term
-            .analytic_outer_rho_gradient_components(&rho_hat, &loss_hat, &cache)?;
+            .analytic_outer_rho_gradient_components(&rho_hat, &loss_hat, &cache, &solver)?;
         let grad = components.gradient_with_available_correction();
         let grad_norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
         let analytic_directional: f64 = grad.iter().zip(dir.iter()).map(|(g, d)| g * d).sum();
@@ -12694,41 +13141,6 @@ impl SaeManifoldOuterObjective {
             logdet_enclosure_gap: None,
         })
     }
-
-    fn ensure_outer_gradient_factor_well_conditioned(
-        cache: &ArrowFactorCache,
-    ) -> Result<(), String> {
-        let pivot = arrow_factor_min_pivot(cache);
-        let Some(min_pivot) = pivot.min_pivot else {
-            return Err(
-                "analytic outer gradient undefined at this rho: joint Hessian numerically \
-                 singular (no cached Cholesky pivots)"
-                    .to_string(),
-            );
-        };
-        let Some(max_pivot) = arrow_factor_max_pivot(cache) else {
-            return Err(
-                "analytic outer gradient undefined at this rho: joint Hessian numerically \
-                 singular (no cached Cholesky pivot scale)"
-                    .to_string(),
-            );
-        };
-        let ratio = min_pivot / max_pivot;
-        if min_pivot.is_finite()
-            && max_pivot.is_finite()
-            && max_pivot > 0.0
-            && ratio.is_finite()
-            && ratio >= SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR
-        {
-            return Ok(());
-        }
-        Err(format!(
-            "analytic outer gradient undefined at this rho: joint Hessian numerically singular \
-             (min/max pivot ratio {ratio:.3e} < floor {floor:.3e}; min pivot {min_pivot:.3e}, \
-             max pivot {max_pivot:.3e})",
-            floor = SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR,
-        ))
-    }
 }
 
 impl OuterObjective for SaeManifoldOuterObjective {
@@ -12782,11 +13194,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 self.ridge_beta,
             )
             .map_err(EstimationError::RemlOptimizationFailed)?;
-        Self::ensure_outer_gradient_factor_well_conditioned(&cache)
+        let solver = self
+            .term
+            .outer_gradient_arrow_solver(&cache)
             .map_err(EstimationError::RemlOptimizationFailed)?;
         let components = self
             .term
-            .analytic_outer_rho_gradient_components(&rho_state, &loss, &cache)
+            .analytic_outer_rho_gradient_components(&rho_state, &loss, &cache, &solver)
             .map_err(EstimationError::RemlOptimizationFailed)?;
         let gradient = components.gradient_with_available_correction();
         self.current_rho = rho_state;
@@ -19043,11 +19457,38 @@ mod tests {
         }
     }
 
+    fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
+        let dim = diagonal.len();
+        let mut factor = Array2::<f64>::zeros((dim, dim));
+        for i in 0..dim {
+            factor[[i, i]] = diagonal[i].sqrt();
+        }
+        ArrowFactorCache {
+            htt_factors: ArrowFactorSlab::from_blocks(vec![factor]),
+            htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
+            schur_factor: None,
+            solver_mode: ArrowSolverMode::Direct,
+            ridge_t: 0.0,
+            ridge_beta: 0.0,
+            htbeta: ArrowHtbetaCache::Disabled { estimated_bytes: 0 },
+            d: dim,
+            row_dims: Arc::from(vec![dim].into_boxed_slice()),
+            row_offsets: Arc::from(vec![0usize, dim].into_boxed_slice()),
+            k: 0,
+            manifold_mode_fingerprint: 0,
+            row_hessian_fingerprint: 0,
+            pcg_diagnostics: PcgDiagnostics::default(),
+        }
+    }
+
     #[test]
-    fn outer_gradient_conditioning_guard_rejects_near_singular_cache() {
+    fn outer_gradient_solver_rejects_near_singular_cache_without_matching_gauge() {
         let cache = near_singular_outer_gradient_cache();
-        let err = SaeManifoldOuterObjective::ensure_outer_gradient_factor_well_conditioned(&cache)
-            .expect_err("near-singular evidence factor must reject the analytic outer gradient");
+        let obj = warmstart_test_objective();
+        let err = match obj.term.outer_gradient_arrow_solver(&cache) {
+            Err(err) => err,
+            Ok(..) => panic!("near-singular evidence factor without a matching gauge must reject"),
+        };
         assert!(
             err.contains("analytic outer gradient undefined at this rho"),
             "guard error must name the undefined analytic-gradient condition; got: {err}"
@@ -19056,6 +19497,50 @@ mod tests {
             err.contains("min/max pivot ratio") && err.contains("floor"),
             "guard error must report the pivot ratio and floor; got: {err}"
         );
+    }
+
+    #[test]
+    fn deflated_solver_matches_plain_solve_when_no_gauge_is_installed() {
+        let cache = diagonal_latent_cache(&[2.0_f64, 5.0, 7.0]);
+        let solver = DeflatedArrowSolver::plain(&cache);
+        let rhs_t = array![4.0_f64, 10.0, -14.0];
+        let rhs_beta = Array1::<f64>::zeros(0);
+        let (plain_t, plain_beta) = cache
+            .full_inverse_apply(rhs_t.view(), rhs_beta.view())
+            .expect("plain cache solve");
+        let solved = solver
+            .solve(rhs_t.view(), rhs_beta.view())
+            .expect("adapter solve");
+        assert_abs_diff_eq!(solved.t, plain_t, epsilon = 0.0);
+        assert_abs_diff_eq!(solved.beta, plain_beta, epsilon = 0.0);
+    }
+
+    #[test]
+    fn deflated_solver_matches_dense_quotient_pseudoinverse_on_near_null_fixture() {
+        let cache = diagonal_latent_cache(&[2.0_f64, 1.0e-14]);
+        let gauge = array![0.0_f64, 1.0];
+        let solver = DeflatedArrowSolver::from_orthonormal_gauges(&cache, vec![gauge], 2.0)
+            .expect("deflated solver");
+        let rhs_beta = Array1::<f64>::zeros(0);
+
+        let physical_rhs = array![4.0_f64, 0.0];
+        let solved = solver
+            .solve(physical_rhs.view(), rhs_beta.view())
+            .expect("physical solve");
+        let oracle = array![2.0_f64, 0.0];
+        assert_abs_diff_eq!(solved.t, oracle, epsilon = 1.0e-12);
+
+        let gauge_rhs = array![0.0_f64, 1.0];
+        let plain = cache
+            .full_inverse_apply(gauge_rhs.view(), rhs_beta.view())
+            .expect("plain gauge solve")
+            .0;
+        let stiffened = solver
+            .solve(gauge_rhs.view(), rhs_beta.view())
+            .expect("stiffened gauge solve")
+            .t;
+        assert!(plain[1] > 1.0e13, "plain near-null solve must be huge");
+        assert_abs_diff_eq!(stiffened[1], 0.5, epsilon = 1.0e-12);
     }
 
     /// gam#577 / gam#579 root cause: the continuation pre-warm forwards an
@@ -20097,7 +20582,10 @@ mod tests {
         let (_value, _loss, cache) = term
             .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
             .expect("converged cache");
-        let gamma = term.logdet_theta_adjoint(&rho, &cache).expect("Gamma");
+        let solver = DeflatedArrowSolver::plain(&cache);
+        let gamma = term
+            .logdet_theta_adjoint(&rho, &cache, &solver)
+            .expect("Gamma");
         let h = 1.0e-5;
         let probes = [
             (0usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
@@ -20148,7 +20636,10 @@ mod tests {
         let (_value, _loss, cache) = term
             .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
             .expect("converged cache");
-        let gamma = term.logdet_theta_adjoint(&rho, &cache).expect("Gamma");
+        let solver = DeflatedArrowSolver::plain(&cache);
+        let gamma = term
+            .logdet_theta_adjoint(&rho, &cache, &solver)
+            .expect("Gamma");
         let h = 1.0e-5;
         // Probe both atoms across distinct rows so the cross-row coupling
         // (different rows sharing a column) is exercised on both columns.
@@ -20486,7 +20977,6 @@ mod inner_contract_probe_tests {
     fn assert_contract_close(label: &str, analytic: f64, finite_difference: f64) {
         let rel = (analytic - finite_difference).abs()
             / finite_difference.abs().max(analytic.abs()).max(1.0e-12);
-        println!("{label} analytic={analytic:.9e} fd={finite_difference:.9e} rel={rel:.3e}");
         assert!(
             rel < 1.0e-5,
             "{label}: analytic={analytic:.12e} fd={finite_difference:.12e} rel={rel:.3e}"
