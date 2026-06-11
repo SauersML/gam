@@ -3327,8 +3327,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// implied by `theta`'s ψ tail (typically via the
     /// `SingleBlockExactJointDesignCache::ensure_theta` path). The penalty
     /// gradients w.r.t. ρ are independent of κ for the spatial single-block
-    /// path, so `compute_cost(rho)` evaluates the joint REML/LAML cost
-    /// correctly at the full theta.
+    /// path, but correction gates still need to know that the objective lives
+    /// on a joint `[ρ, ψ]` surface. Pass the ψ-tail count into the shared cost
+    /// bridge so value-only probes decline the same ext-coordinate-incomplete
+    /// corrections as the analytic joint path.
     pub(crate) fn evaluate_cost_only(
         &mut self,
         x: &DesignMatrix,
@@ -3358,7 +3360,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             design_revision,
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
-        self.reml_state.compute_cost(&rho)
+        self.reml_state
+            .compute_cost_with_ext_count(&rho, theta.len() - rho_dim)
     }
 }
 
