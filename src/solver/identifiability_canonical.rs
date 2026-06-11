@@ -43,6 +43,7 @@ use crate::families::custom_family::{
 };
 use crate::families::identifiability_compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks,
+    symmetric_sqrt_into,
 };
 use crate::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
@@ -144,7 +145,7 @@ impl BlockJacobianAsRowOp {
                     .effective_jacobian_rows(&state, start..end)
                     .map_err(|e| format!("BlockJacobianAsRowOp block '{}': {e}", self.block_name))?;
                 let chunk = end - start;
-                if stacked.shape() != [self.k_block * chunk, self.p] {
+                if stacked.nrows() != self.k_block * chunk || stacked.ncols() != self.p {
                     return Err(format!(
                         "BlockJacobianAsRowOp block '{}': effective_jacobian_rows returned \
                          shape {:?}, expected [{}, {}]",
@@ -229,23 +230,27 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
         let k = self.k();
         assert_eq!(h_full.shape(), &[n, k, k]);
         let mut out = Array2::<f64>::zeros((n * k, p));
+        let mut sqrt_h = Array2::<f64>::zeros((k, k));
+        let mut h_i = Array2::<f64>::zeros((k, k));
         for start in (0..n).step_by(4096) {
             let end = (start + 4096).min(n);
             let chunk = end - start;
             let mut rows = Array2::<f64>::zeros((chunk * k, p));
             self.channel_flattened_rows(start..end, &mut rows);
             for local_i in 0..chunk {
+                let row = start + local_i;
+                for a in 0..k {
+                    for b in 0..k {
+                        h_i[[a, b]] = h_full[[row, a, b]];
+                    }
+                }
+                symmetric_sqrt_into(&h_i, &mut sqrt_h);
                 for ch in 0..k {
-                    let dst = (start + local_i) * k + ch;
+                    let dst = row * k + ch;
                     for col in 0..p {
                         let mut acc = 0.0;
                         for cp in 0..k {
-                            let h = if ch == cp {
-                                h_full[[start + local_i, ch, cp]].max(0.0).sqrt()
-                            } else {
-                                h_full[[start + local_i, ch, cp]]
-                            };
-                            acc += h * rows[[local_i * k + cp, col]];
+                            acc += sqrt_h[[ch, cp]] * rows[[local_i * k + cp, col]];
                         }
                         out[[dst, col]] = acc;
                     }
