@@ -294,16 +294,6 @@ pub(crate) struct BernoulliMarginalLinkMap {
     pub q2: f64,
     pub q3: f64,
     pub q4: f64,
-    /// Precomputed `q1 * q1`. Used in higher-derivative builders so the
-    /// q1² factor is shared with the q1^3 / q1^4 powers below.
-    pub q1_sq: f64,
-    /// Precomputed `q1^3`. Used by `q3`, `f_etaetaeta` in
-    /// `rigid_transformed_third_full`, and `f_eta3g` in
-    /// `rigid_transformed_fourth_full`.
-    pub q1_cu: f64,
-    /// Precomputed `q1^4`. Used by `q4` and `f_eta4` in
-    /// `rigid_transformed_fourth_full`.
-    pub q1_q: f64,
 }
 
 #[inline]
@@ -347,9 +337,6 @@ pub(crate) fn bernoulli_marginal_link_map(
             q2: 0.0,
             q3: 0.0,
             q4: 0.0,
-            q1_sq: 0.0,
-            q1_cu: 0.0,
-            q1_q: 0.0,
         });
     }
     let phi_eta = normal_pdf(eta);
@@ -382,9 +369,6 @@ pub(crate) fn bernoulli_marginal_link_map(
         q2,
         q3,
         q4,
-        q1_sq,
-        q1_cu,
-        q1_q,
     })
 }
 
