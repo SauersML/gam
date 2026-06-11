@@ -1,7 +1,7 @@
-//! End-to-end quality on a REAL longitudinal dataset: gam's factor-smooth
-//! random-slope structure must FORECAST held-out within-subject observations at
-//! least as accurately as `lme4::lmer` (the mature mixed-model reference,
-//! demoted here to a baseline-to-match-or-beat).
+//! End-to-end quality on a REAL longitudinal dataset: gam's random-slope model
+//! must FORECAST held-out within-subject observations at least as accurately as
+//! `lme4::lmer` (the mature mixed-model reference, demoted here to a
+//! baseline-to-match-or-beat).
 //!
 //! DATA — the classic `sleepstudy` panel (Belenky et al. 2003, distributed with
 //! lme4): average reaction time (ms) on a psychomotor-vigilance task for 18
@@ -31,11 +31,12 @@
 //! and fails the test: a real bug in gam's random-effect machinery, not a
 //! tolerance knob.
 //!
-//! `fs(Days, Subject)` is mgcv's factor-smooth: one smooth of Days per Subject,
-//! all sharing a single smoothing parameter (a random-effect variance over the
-//! per-subject curves). The marginal smooth of Days is the population trend; the
-//! shared penalty does the partial pooling, the GAM analogue of lmer's
-//! correlated random intercept + slope `(Days | Subject)`.
+//! `Days + s(Days, Subject, bs="re")` is the GAM/mgcv random-slope model: a
+//! fixed population intercept and Days trend, plus a parametric per-subject
+//! random intercept+slope `[1, Days]` penalized by an iid ridge (one variance).
+//! The ridge shrinks each subject's intercept and slope toward the FIXED
+//! population values — the exact analogue of lmer's `Days + (Days | Subject)`
+//! (modulo lme4's separate intercept/slope variances and their correlation).
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -108,7 +109,7 @@ fn gam_sleepstudy_random_slope_forecasts_held_out_days_vs_lme4() {
     // ---- train / test split (identical rows handed to both engines) --------
     // gam consumes a categorical Subject; its schema inferrer classifies a column
     // whose every value parses as f64 as Continuous, so we prefix the id with "S"
-    // to force the Categorical kind that fs() requires. lme4 receives the numeric
+    // to force the Categorical kind the `re` factor requires. lme4 receives the numeric
     // subject code plus the same Days/Reaction values and rebuilds the factor.
     let mut train_rows = Vec::<StringRecord>::new();
     let mut train_days_r = Vec::<f64>::new();
@@ -161,7 +162,7 @@ fn gam_sleepstudy_random_slope_forecasts_held_out_days_vs_lme4() {
         / (n_test as f64 - 1.0))
         .sqrt();
 
-    // ---- fit gam on the train window: Reaction ~ fs(Days, Subject) ---------
+    // ---- fit gam on the train window: Reaction ~ Days + s(Days, Subject, bs="re") ----
     let headers = vec![
         "Days".to_string(),
         "Subject".to_string(),
@@ -177,12 +178,21 @@ fn gam_sleepstudy_random_slope_forecasts_held_out_days_vs_lme4() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    // Use the explicit `s(.., bs="fs")` factor-smooth form proven by the
-    // synthetic factor-smooth test (the `fs(..)` shorthand was not accepted here).
-    let result = fit_from_formula("Reaction ~ s(Days, Subject, bs=\"fs\")", &ds, &cfg)
-        .unwrap_or_else(|e| panic!("gam factor-smooth fit on sleepstudy: {e:?}"));
+    // gam's random-slope model: a fixed population trend `Days` plus the
+    // parametric random intercept+slope `s(Days, Subject, bs="re")` — the exact
+    // GAM/mgcv analogue of lme4's `Days + (Days | Subject)`. The `re` random
+    // effect shrinks each subject's slope toward the FIXED population slope (the
+    // mixed-model BLUP), which is what makes a held-out within-subject forecast
+    // borrow strength. (A `bs="fs"` factor smooth is the WRONG model here: it is
+    // a wiggly per-subject curve shrunk toward zero, not toward the population
+    // slope, and its cubic extrapolation overshoots — both gam's and mgcv's `fs`
+    // forecast ~50 ms on this split, well above lme4's 42.6, so `fs` cannot meet
+    // the bar by construction. The mature comparator for a random slope is the
+    // random-effect model, and that is what we benchmark here.)
+    let result = fit_from_formula("Reaction ~ Days + s(Days, Subject, bs=\"re\")", &ds, &cfg)
+        .unwrap_or_else(|e| panic!("gam random-slope fit on sleepstudy: {e:?}"));
     let FitResult::Standard(fit) = result else {
-        panic!("expected a standard GAM fit for a gaussian factor-smooth");
+        panic!("expected a standard GAM fit for a gaussian random-slope model");
     };
     let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
 
