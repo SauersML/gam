@@ -4118,6 +4118,8 @@ mod tests {
                 null_space_dim: None,
                 survival_link_wiggle_knots: None,
                 survival_link_wiggle_degree: None,
+                criterion_certificate: None,
+                rho_posterior_certificate: None,
             },
             inner_cycles: 0,
         }
