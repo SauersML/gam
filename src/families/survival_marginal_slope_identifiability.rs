@@ -35,7 +35,7 @@ use crate::families::identifiability_compiler::{
     BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
 use crate::linalg::faer_ndarray::{FaerEigh, fast_ab};
-use crate::solver::gauge::{Gauge, assemble_block_triangular_t};
+use crate::solver::gauge::assemble_block_triangular_t;
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use faer::Side;
 

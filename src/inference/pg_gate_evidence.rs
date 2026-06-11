@@ -222,7 +222,7 @@ fn evaluate(block: &GateBlock<'_>, lane: Lane) -> Result<PgGateEvidence, String>
         if !log_det.is_finite() {
             return Err("PG gate block Hessian is not positive definite".into());
         }
-        let q_inv_h = factor.solve(&h)?;
+        let q_inv_h = FactorizedSystem::solve(&factor, &h)?;
         let quad = h.dot(&q_inv_h);
 
         // The negative-log conditional evidence at this ω-scale, minus the

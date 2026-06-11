@@ -10145,7 +10145,9 @@ impl SaeManifoldTerm {
             .ok_or_else(|| "criterion_as_atoms: arrow_log_det_from_cache returned None".to_string())?;
         let occam = self.reml_occam_term(rho)?;
         let extra_penalty_energy = match registry {
-            Some(reg) => self.reml_extra_penalty_value_total(reg)?,
+            Some(reg) => self
+                .reml_extra_penalty_value_total(reg)
+                .map_err(|err| format!("SaeManifoldTerm::criterion_as_atoms: {err}"))?,
             None => 0.0,
         };
         let data_fit_priors_value = loss.total() + extra_penalty_energy;
