@@ -798,13 +798,9 @@ pub fn fit_penalized_multinomial_formula(
         screen_initial_rho: false,
         ..BlockwiseFitOptions::default()
     };
-    let fit = fit_custom_family_with_rho_prior(
-        &family,
-        &blocks,
-        &options,
-        crate::types::RhoPrior::default(),
-    )
-    .map_err(|err| EstimationError::InvalidInput(format!("multinomial REML: {err}")))?;
+    let fit =
+        fit_custom_family_with_rho_prior(&family, &blocks, &options, crate::types::RhoPrior::Flat)
+            .map_err(|err| EstimationError::InvalidInput(format!("multinomial REML: {err}")))?;
     if let Some(err) = multinomial_formula_separation_diagnostic(
         fit.inner_cycles,
         fit.outer_iterations,
