@@ -27833,9 +27833,147 @@ mod tests {
             epsilon = 1e-12,
             max_relative = 1e-12
         );
+        // Post gh#752/#901 contract: the trace kernel is the FULL spectral
+        // pseudo-inverse `M⁺ = (H+Sλ)⁺` over range(H+Sλ). On a NONSINGULAR `M`
+        // (this fixture) that is exactly `M⁻¹`, so the projected route and the
+        // full-space operator route compute the same generalized determinant
+        // and the same ρ-trace — the projection must be INVARIANT here. (The
+        // historical assertion that they differ encoded the pre-#752 range(Sλ)
+        // reduction, which dropped the penalty-null likelihood curvature and
+        // was itself the bug. The case where the routes genuinely diverge — a
+        // singular `M` whose ker(H+Sλ) the pseudo-logdet must drop — is
+        // asserted in `joint_outer_gradient_projected_trace_drops_joint_null`.)
+        assert_relative_eq!(
+            projected.gradient[0],
+            unprojected.gradient[0],
+            epsilon = 1e-8,
+            max_relative = 1e-8
+        );
+    }
+
+    /// The discriminating case for `project_hessian_logdet`: a joint Hessian
+    /// whose ker(H) overlaps ker(Sλ), so `M = H + Sλ` is genuinely singular.
+    /// The projected route must drop the unidentified direction (pseudo-logdet
+    /// + `M⁺` trace kernel over range(M)) and produce the exact closed-form
+    /// gradient; a full-space `M⁻¹` route has no finite answer here. This is
+    /// the routing guard the nonsingular fixture above cannot provide (there
+    /// the two routes coincide by design).
+    #[test]
+    fn joint_outer_gradient_projected_trace_drops_joint_null() {
+        let ranges = vec![(0, 3)];
+        let rho = array![0.0];
+        let beta = array![1.0, -1.0, 3.0];
+        let s_lambda = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
+        // ker(h) = span(e3) = ker(s_lambda) ⇒ M = H + Sλ is singular with the
+        // unidentified direction e3.
+        let h = array![[4.0, 0.2, 0.0], [0.2, 9.0, 0.0], [0.0, 0.0, 0.0]];
+        let spec = ParameterBlockSpec {
+            name: "surface".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                1, 3,
+            )))),
+            offset: Array1::zeros(1),
+            penalties: vec![PenaltyMatrix::Dense(s_lambda.clone())],
+            nullspace_dims: vec![1],
+            initial_log_lambdas: rho.clone(),
+            initial_beta: Some(beta.clone()),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        let specs = vec![spec];
+        let inner = BlockwiseInnerResult {
+            block_states: vec![ParameterBlockState {
+                beta: beta.clone(),
+                eta: Array1::zeros(1),
+            }],
+            active_sets: vec![None],
+            log_likelihood: 0.0,
+            penalty_value: 0.5 * beta.dot(&fast_av(&s_lambda, &beta)),
+            cycles: 1,
+            converged: true,
+            block_logdet_h: 0.0,
+            block_logdet_s: 0.0,
+            s_lambdas: vec![s_lambda.clone()],
+            joint_workspace: None,
+            kkt_residual: None,
+            active_constraints: None,
+        };
+        let per_block = vec![rho.clone()];
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let no_dh =
+            |_direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+        let no_d2h = |_u: &Array1<f64>,
+                      _v: &Array1<f64>|
+         -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+
+        let projected = joint_outer_evaluate(
+            &inner,
+            &specs,
+            &per_block,
+            &rho,
+            &beta,
+            JointHessianSource::Dense(h.clone()),
+            &ranges,
+            3,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            true,
+            true,
+            false,
+            true,
+            EvalMode::ValueAndGradient,
+            &options,
+            crate::types::RhoPrior::Flat,
+            PseudoLogdetMode::Smooth,
+            &no_dh,
+            None,
+            &no_d2h,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("projected outer evaluation succeeds on a singular joint Hessian");
+
+        let (_, kernel) = joint_penalty_subspace_trace_parts(
+            &JointHessianSource::Dense(h.clone()),
+            &ranges,
+            std::slice::from_ref(&s_lambda),
+            3,
+            0.0,
+            None,
+        )
+        .expect("projection kernel builds");
+        let projected_trace = kernel
+            .expect("rank-deficient joint Hessian has a positive subspace")
+            .trace_projected_logdet(&s_lambda);
+        let expected_gradient =
+            0.5 * beta.dot(&fast_av(&s_lambda, &beta)) + 0.5 * projected_trace - 0.5 * 2.0;
+
         assert!(
-            (projected.gradient[0] - unprojected.gradient[0]).abs() > 1e-2,
-            "the full-space trace must not silently replace the projected trace"
+            projected.objective.is_finite(),
+            "pseudo-logdet objective must stay finite when ker(H+Sλ) is dropped"
+        );
+        assert_relative_eq!(
+            projected.gradient[0],
+            expected_gradient,
+            epsilon = 1e-10,
+            max_relative = 1e-10
         );
     }
 
