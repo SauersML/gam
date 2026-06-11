@@ -1989,7 +1989,7 @@ impl SurvivalLsRowKernel<'_> {
             0 | 1 | 2 => Self::THRESHOLD_BLOCK_TIME,
             3 | 4 | 5 => Self::THRESHOLD_BLOCK_THR,
             6 | 7 | 8 => Self::THRESHOLD_BLOCK_LS,
-            _ => unreachable!("survival LS row kernel has {SLS_ROW_K} channels"),
+            _ => panic!("survival LS row kernel channel {ch} out of range (has {SLS_ROW_K})"),
         }
     }
     const THRESHOLD_BLOCK_TIME: usize = 0;
@@ -2017,7 +2017,7 @@ impl SurvivalLsRowKernel<'_> {
                 row,
             )),
             8 => fam.x_log_sigma_deriv.as_ref().map(|d| design_dense_row(d, row)),
-            _ => unreachable!(),
+            _ => panic!("survival LS row kernel channel {ch} out of range (has {SLS_ROW_K})"),
         }
     }
 }
@@ -2030,6 +2030,20 @@ fn design_dense_row(d: &DesignMatrix, row: usize) -> Array1<f64> {
     d.axpy_row_into(row, 1.0, &mut out.view_mut())
         .expect("design_dense_row: ncols-sized buffer matches design width");
     out
+}
+
+/// Accumulate `alpha * jac[row, :]` into the coefficient slice `out` for a dense
+/// time Jacobian (the survival time block is materialized densely as
+/// `time_jac_*`, so it has no sparse axpy primitive).
+#[inline]
+fn axpy_dense_row_into(jac: &Array2<f64>, row: usize, alpha: f64, out: &mut [f64]) {
+    if alpha == 0.0 {
+        return;
+    }
+    let jr = jac.row(row);
+    for (o, &j) in out.iter_mut().zip(jr.iter()) {
+        *o += alpha * j;
+    }
 }
 
 impl RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
@@ -15417,7 +15431,7 @@ mod tests {
                         beta_log_sigma_plus[0] += eps;
                         beta_log_sigma_minus[0] -= eps;
                     }
-                    _ => unreachable!(),
+                    other => panic!("FD probe block {other} out of range (expected 0..3)"),
                 }
                 let grad_plus = flattengrad(
                     family
