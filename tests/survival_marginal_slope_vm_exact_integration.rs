@@ -16,7 +16,7 @@
 //! Hard contract (see teammate brief):
 //!   * fit converges (`outer_converged == true`),
 //!   * β block widths after lift equal RAW widths (not compiled widths),
-//!     proving `SmgsLiftViaT::lift_block_betas_via_t` ran,
+//!     proving the result-time `Gauge::lift_block_betas` ran,
 //!   * predictions are finite,
 //!   * the compiled-map log line is emitted at least once (proves the
 //!     channel-aware closed-form path ran, not the old per-term fallback).
