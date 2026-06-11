@@ -12,53 +12,7 @@
 //! `FittedModel` predict pipeline matches the raw `build_term_collection_design`
 //! path.
 
-use gam::test_support::cli_harness::run_or_panic;
-use std::path::Path;
-use std::process::Command;
-
-fn read_predictions(path: &Path) -> Vec<f64> {
-    let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
-    let headers = reader.headers().expect("predict csv headers").clone();
-    let mean_idx = headers
-        .iter()
-        .position(|h| h == "mean")
-        .or_else(|| headers.iter().position(|h| h == "linear_predictor"))
-        .unwrap_or_else(|| {
-            panic!("predict csv has neither `mean` nor `linear_predictor`: {headers:?}")
-        });
-    reader
-        .records()
-        .map(|rec| {
-            let rec = rec.expect("predict csv row");
-            rec[mean_idx]
-                .parse::<f64>()
-                .unwrap_or_else(|_| panic!("non-numeric prediction: {:?}", &rec[mean_idx]))
-        })
-        .collect()
-}
-
-fn fit(train: &Path, formula: &str, model: &Path) {
-    let mut cmd = Command::new(gam::gam_binary!());
-    cmd.arg("fit")
-        .arg(train)
-        .arg(formula)
-        .args(["--family", "gaussian"])
-        .arg("--out")
-        .arg(model);
-    run_or_panic(cmd, &format!("gam fit {formula}"));
-    assert!(model.is_file(), "gam fit did not write {model:?}");
-}
-
-fn predict(model: &Path, data: &Path, out: &Path) -> Vec<f64> {
-    let mut cmd = Command::new(gam::gam_binary!());
-    cmd.arg("predict")
-        .arg(model)
-        .arg(data)
-        .arg("--out")
-        .arg(out);
-    run_or_panic(cmd, "gam predict");
-    read_predictions(out)
-}
+use gam::test_support::cli_harness::fit_then_predict_gaussian;
 
 /// `te(x, z)` on a tilted plane `y = 0.5 + 1.25·x + 0.75·z`, training both axes
 /// over `[0, 2]`. Predicting at `x` beyond the hull (with `z` held in range) must
@@ -99,8 +53,7 @@ fn tensor_te_smooth_extrapolates_along_a_margin_instead_of_flat_clamping() {
         w.flush().unwrap();
     }
 
-    fit(&train, "y ~ te(x, z)", &model);
-    let preds = predict(&model, &pred_in, &out);
+    let preds = fit_then_predict_gaussian(&train, "y ~ te(x, z)", &model, &pred_in, &out);
     let at = |x: f64| preds[probes.iter().position(|&p| (p - x).abs() < 1e-9).unwrap()];
 
     let in_hull_slope = at(2.0) - at(1.0); // ≈ 1.25 along x
@@ -157,8 +110,7 @@ fn radial_matern_reverts_to_mean_instead_of_freezing_at_the_boundary() {
         w.flush().unwrap();
     }
 
-    fit(&train, "y ~ matern(x)", &model);
-    let preds = predict(&model, &pred_in, &out);
+    let preds = fit_then_predict_gaussian(&train, "y ~ matern(x)", &model, &pred_in, &out);
     let at = |x: f64| preds[probes.iter().position(|&p| (p - x).abs() < 1e-9).unwrap()];
 
     let boundary = at(2.0); // ≈ 3.0

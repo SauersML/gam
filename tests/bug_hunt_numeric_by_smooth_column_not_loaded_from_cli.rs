@@ -15,6 +15,7 @@
 //! both near ±1). Before the fix the fit aborts with
 //! `column 'z' not found in data. Available columns: [x, y]`.
 
+use gam::test_support::cli_harness::{read_prediction_means, write_predict_csv_rows};
 use std::path::Path;
 use std::process::Command;
 
@@ -37,34 +38,6 @@ fn write_training_csv(path: &Path) {
             .expect("write training row");
     }
     writer.flush().expect("flush training csv");
-}
-
-fn write_predict_csv(path: &Path, rows: &[(f64, f64)]) {
-    let mut writer = csv::Writer::from_path(path).expect("create predict csv");
-    writer.write_record(["x", "y", "z"]).expect("write header");
-    for &(x, z) in rows {
-        writer
-            .write_record([format!("{x:.10}"), "0.0".to_string(), format!("{z:.10}")])
-            .expect("write predict row");
-    }
-    writer.flush().expect("flush predict csv");
-}
-
-fn read_predictions(path: &Path) -> Vec<f64> {
-    let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
-    let headers = reader.headers().expect("predict csv headers").clone();
-    let mean_idx = headers
-        .iter()
-        .position(|h| h == "mean")
-        .or_else(|| headers.iter().position(|h| h == "linear_predictor"))
-        .unwrap_or_else(|| panic!("predict csv has no mean/linear_predictor column: {headers:?}"));
-    reader
-        .records()
-        .map(|rec| {
-            let rec = rec.expect("predict csv row");
-            rec[mean_idx].parse::<f64>().expect("numeric prediction")
-        })
-        .collect()
 }
 
 #[test]
@@ -99,7 +72,13 @@ fn numeric_by_smooth_loads_its_by_column_and_recovers_varying_coefficient() {
 
     // x = 0.25: sin(2π·0.25) = +1, so prediction ≈ z. Probe z = +1 and z = −1.
     let probes: [(f64, f64); 2] = [(0.25, 1.0), (0.25, -1.0)];
-    write_predict_csv(&predict_path, &probes);
+    write_predict_csv_rows(
+        &predict_path,
+        ["x", "y", "z"],
+        probes
+            .iter()
+            .map(|&(x, z)| [format!("{x:.10}"), "0.0".to_string(), format!("{z:.10}")]),
+    );
 
     let mut predict_cmd = Command::new(gam::gam_binary!());
     predict_cmd
@@ -115,7 +94,7 @@ fn numeric_by_smooth_loads_its_by_column_and_recovers_varying_coefficient() {
         String::from_utf8_lossy(&pred_out.stderr),
     );
 
-    let preds = read_predictions(&out_path);
+    let preds = read_prediction_means(&out_path);
     assert_eq!(preds.len(), 2, "expected one prediction per probe");
     let (pred_pos, pred_neg) = (preds[0], preds[1]);
 

@@ -53,9 +53,8 @@
 //! same way it already skips parametric/periodic/random-effect/sphere columns),
 //! the linear extension fires and this test passes without edits.
 
-use gam::test_support::cli_harness::run_or_panic;
+use gam::test_support::cli_harness::{fit_then_predict_gaussian, write_predict_csv_rows};
 use std::path::Path;
-use std::process::Command;
 
 const SLOPE: f64 = 1.25;
 const INTERCEPT: f64 = 0.5;
@@ -83,41 +82,6 @@ fn write_training_csv(path: &Path) {
     writer.flush().expect("flush training csv");
 }
 
-/// New rows whose `x` reaches beyond the training hull on the right. `y` is a
-/// placeholder (predict ignores it); the schema just needs the column.
-fn write_predict_csv(path: &Path, xs: &[f64]) {
-    let mut writer = csv::Writer::from_path(path).expect("create predict csv");
-    writer.write_record(["x", "y"]).expect("write header");
-    for &x in xs {
-        writer
-            .write_record([format!("{x:.12}"), "0.0".to_string()])
-            .expect("write predict row");
-    }
-    writer.flush().expect("flush predict csv");
-}
-
-/// Read the `mean` column from a `gam predict --out` CSV.
-fn read_predictions(path: &Path) -> Vec<f64> {
-    let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
-    let headers = reader.headers().expect("predict csv headers").clone();
-    let mean_idx = headers
-        .iter()
-        .position(|h| h == "mean")
-        .or_else(|| headers.iter().position(|h| h == "linear_predictor"))
-        .unwrap_or_else(|| {
-            panic!("predict csv has neither `mean` nor `linear_predictor` column: {headers:?}")
-        });
-    reader
-        .records()
-        .map(|rec| {
-            let rec = rec.expect("predict csv row");
-            rec[mean_idx]
-                .parse::<f64>()
-                .unwrap_or_else(|_| panic!("non-numeric prediction: {:?}", &rec[mean_idx]))
-        })
-        .collect()
-}
-
 #[test]
 fn smooth_term_predict_extrapolates_instead_of_flat_clamping_to_training_range() {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -131,29 +95,17 @@ fn smooth_term_predict_extrapolates_instead_of_flat_clamping_to_training_range()
     // Two in-hull anchors (to measure the recovered slope) and three out-of-hull
     // probes to the right, where the clamp bug shows up.
     let probes: [f64; 5] = [1.0, 2.0, 3.0, 4.0, 6.0];
-    write_predict_csv(&predict_path, &probes);
+    // `y` is a placeholder (predict ignores it); the schema just needs the column.
+    write_predict_csv_rows(
+        &predict_path,
+        ["x", "y"],
+        probes
+            .iter()
+            .map(|&x| [format!("{x:.12}"), "0.0".to_string()]),
+    );
 
-    let mut fit_cmd = Command::new(gam::gam_binary!());
-    fit_cmd
-        .arg("fit")
-        .arg(&train_path)
-        .arg("y ~ s(x)")
-        .args(["--family", "gaussian"])
-        .arg("--out")
-        .arg(&model_path);
-    run_or_panic(fit_cmd, "gam fit y ~ s(x) (gaussian)");
-    assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
-
-    let mut predict_cmd = Command::new(gam::gam_binary!());
-    predict_cmd
-        .arg("predict")
-        .arg(&model_path)
-        .arg(&predict_path)
-        .arg("--out")
-        .arg(&out_path);
-    run_or_panic(predict_cmd, "gam predict (smooth extrapolation)");
-
-    let preds = read_predictions(&out_path);
+    let preds =
+        fit_then_predict_gaussian(&train_path, "y ~ s(x)", &model_path, &predict_path, &out_path);
     assert_eq!(
         preds.len(),
         probes.len(),

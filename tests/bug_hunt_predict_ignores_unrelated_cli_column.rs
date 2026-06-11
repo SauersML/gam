@@ -18,6 +18,7 @@
 //! Before the fix the predict aborts; after it, predict succeeds and `g` does
 //! not influence the result.
 
+use gam::test_support::cli_harness::{read_prediction_means, write_predict_csv_rows};
 use std::path::Path;
 use std::process::Command;
 
@@ -41,34 +42,6 @@ fn write_training_csv(path: &Path) {
             .expect("write training row");
     }
     writer.flush().expect("flush training csv");
-}
-
-fn write_predict_csv(path: &Path, rows: &[(f64, &str)]) {
-    let mut writer = csv::Writer::from_path(path).expect("create predict csv");
-    writer.write_record(["x", "y", "g"]).expect("write header");
-    for &(x, g) in rows {
-        writer
-            .write_record([format!("{x:.10}"), "0.0".to_string(), g.to_string()])
-            .expect("write predict row");
-    }
-    writer.flush().expect("flush predict csv");
-}
-
-fn read_predictions(path: &Path) -> Vec<f64> {
-    let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
-    let headers = reader.headers().expect("predict csv headers").clone();
-    let mean_idx = headers
-        .iter()
-        .position(|h| h == "mean")
-        .or_else(|| headers.iter().position(|h| h == "linear_predictor"))
-        .unwrap_or_else(|| panic!("predict csv has no mean/linear_predictor column: {headers:?}"));
-    reader
-        .records()
-        .map(|rec| {
-            let rec = rec.expect("predict csv row");
-            rec[mean_idx].parse::<f64>().expect("numeric prediction")
-        })
-        .collect()
 }
 
 fn fit_model(train_path: &Path, model_path: &Path) {
@@ -111,7 +84,13 @@ fn predict_ignores_unrelated_column_with_unseen_level() {
 
     // Held-out frame: `g = "a"` is a brand-new level, never seen in training.
     let predict_path = dir.path().join("predict_unseen.csv");
-    write_predict_csv(&predict_path, &[(0.25, "a"), (0.5, "a")]);
+    write_predict_csv_rows(
+        &predict_path,
+        ["x", "y", "g"],
+        [(0.25, "a"), (0.5, "a")]
+            .iter()
+            .map(|&(x, g)| [format!("{x:.10}"), "0.0".to_string(), g.to_string()]),
+    );
     let out_path = dir.path().join("pred_unseen.csv");
     let out = predict(&model_path, &predict_path, &out_path);
     assert!(
@@ -120,7 +99,7 @@ fn predict_ignores_unrelated_column_with_unseen_level() {
          --- stderr ---\n{}",
         String::from_utf8_lossy(&out.stderr),
     );
-    let preds = read_predictions(&out_path);
+    let preds = read_prediction_means(&out_path);
     assert_eq!(preds.len(), 2, "expected one prediction per row");
     assert!(
         preds.iter().all(|p| p.is_finite()),
@@ -130,11 +109,17 @@ fn predict_ignores_unrelated_column_with_unseen_level() {
     // The unrelated column must not influence the prediction: predicting the
     // same x with a *seen* level must match predicting it with the unseen one.
     let seen_path = dir.path().join("predict_seen.csv");
-    write_predict_csv(&seen_path, &[(0.25, "b"), (0.5, "c")]);
+    write_predict_csv_rows(
+        &seen_path,
+        ["x", "y", "g"],
+        [(0.25, "b"), (0.5, "c")]
+            .iter()
+            .map(|&(x, g)| [format!("{x:.10}"), "0.0".to_string(), g.to_string()]),
+    );
     let seen_out_path = dir.path().join("pred_seen.csv");
     let seen_out = predict(&model_path, &seen_path, &seen_out_path);
     assert!(seen_out.status.success(), "predict with seen levels failed");
-    let seen_preds = read_predictions(&seen_out_path);
+    let seen_preds = read_prediction_means(&seen_out_path);
     for (a, b) in preds.iter().zip(seen_preds.iter()) {
         assert!(
             (a - b).abs() < 1e-9,
