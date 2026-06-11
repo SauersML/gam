@@ -2223,6 +2223,146 @@ impl IBPAssignmentPenalty {
         }
         pi
     }
+
+    /// Exact third-derivative channels of [`Self::hessian_diag`] with respect to
+    /// the logits, for the SAE outer-ρ log-det adjoint Γ (#1006).
+    ///
+    /// `hessian_diag` returns, per row `i` and column `k`, the on-diagonal
+    /// curvature
+    ///
+    /// ```text
+    ///   H_ik = w · [ sd_k · J_ik²  +  score_k · c_ik ],
+    /// ```
+    ///
+    /// with `J_ik = z(1−z)/τ` the logit→concrete jacobian, `c_ik =
+    /// z(1−z)(1−2z)/τ²` the second jacobian, and the column scalars
+    /// `score_k`, `sd_k = ∂score_k/∂M_k` exactly as assembled there
+    /// (`M_k = Σ_i z_ik` is the column active mass, `π_k(M_k)` the plug-in
+    /// stick-breaking MAP). Because `π_k` couples every row in column `k`, the
+    /// logit derivative splits into a row-local direct-`z` channel and a global
+    /// empirical-`M_k` channel:
+    ///
+    /// ```text
+    ///   ∂H_ik/∂ℓ_wk = δ_iw · (∂_z H_ik)·J_ik   +   (∂_M H_ik) · J_wk,
+    ///   ∂_z H_ik = w·J_ik·[ sd_k·2J_ik·(1−2z)/τ + score_k·(1−6z+6z²)/τ² ],
+    ///   ∂_M H_ik = w·[ sdd_k · J_ik²  +  sd_k · c_ik ],
+    ///   sdd_k = ∂sd_k/∂M_k = ∂²score_k/∂M_k².
+    /// ```
+    ///
+    /// `local_logit_third[i*K+k] = (∂_z H_ik)·J_ik` is the row-diagonal third
+    /// derivative; `m_channel[i*K+k] = ∂_M H_ik` and `z_jac[i*K+k] = J_ik` let
+    /// the caller form, per column, `C_k = Σ_i (H⁻¹)_ik,ik · ∂_M H_ik` and
+    /// distribute `C_k · J_wk` to every row `w` (the cross-row coupling the
+    /// row-local primitive cannot see). All boundary clamps (`pi_jac = 0` at the
+    /// `π_k` clamp) ride the same convention as `hessian_diag`, so the channels
+    /// are zero exactly where the assembled curvature is constant in `M_k`.
+    #[must_use]
+    pub fn hessian_diag_logit_third_channels(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> IbpHessianDiagThirdChannels {
+        let alpha = self.resolved_alpha(rho);
+        let a = alpha / self.k_max as f64;
+        let tau = self.concrete_temperature();
+        let inv_tau = 1.0 / tau;
+        let inv_tau2 = inv_tau * inv_tau;
+        let z = self.concrete_logits(target);
+        let pi = self.pi_map(z.view(), alpha);
+        let n = z.len() / self.k_max;
+        let denom = (n as f64 + a - 1.0).max(IBP_COUNT_DENOM_FLOOR);
+
+        let mut active_mass = Array1::<f64>::zeros(self.k_max);
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                active_mass[k] += z[start + k];
+            }
+        }
+
+        let mut score = Array1::<f64>::zeros(self.k_max);
+        let mut score_derivative = Array1::<f64>::zeros(self.k_max);
+        let mut score_second_derivative = Array1::<f64>::zeros(self.k_max);
+        for k in 0..self.k_max {
+            let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
+            let mass = active_mass[k];
+            let raw = (mass + a - 1.0) / denom;
+            let pi_jac = if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
+                1.0 / denom
+            } else {
+                0.0
+            };
+            let bce_pi_score = -mass / pk + (n as f64 - mass) / (1.0 - pk);
+            let beta_pi_score = -(a - 1.0) / pk;
+            let pi_score = bce_pi_score + beta_pi_score;
+            let pi_score_derivative = -1.0 / pk + (mass + a - 1.0) * pi_jac / (pk * pk)
+                - 1.0 / (1.0 - pk)
+                + (n as f64 - mass) * pi_jac / ((1.0 - pk) * (1.0 - pk));
+            let direct_z_score = ((1.0 - pk) / pk).ln();
+            let implicit_pi_score = pi_score * pi_jac;
+            score[k] = direct_z_score + implicit_pi_score;
+            let direct_z_score_derivative = pi_jac * (-1.0 / pk - 1.0 / (1.0 - pk));
+            score_derivative[k] = direct_z_score_derivative + pi_score_derivative * pi_jac;
+
+            // sdd_k = ∂score_derivative_k/∂M_k, holding the explicit per-row z
+            // fixed (the same partial `hessian_diag` takes for score/sd). With
+            // π_k = (M_k+a−1)/D clamped, ∂π_k/∂M_k = pi_jac (0 at the clamp):
+            //   ∂(direct_z_score_derivative)/∂M = pi_jac²·(1/π² − 1/(1−π)²),
+            //   ∂(pi_score_derivative)/∂M = pi_jac·[ 2/π² − 2(M+a−1)·pi_jac/π³
+            //                                        − 2/(1−π)² + 2(n−M)·pi_jac/(1−π)³ ].
+            let one_minus = 1.0 - pk;
+            let ddzd = pi_jac * pi_jac * (1.0 / (pk * pk) - 1.0 / (one_minus * one_minus));
+            let dpisd = 2.0 / (pk * pk) - 2.0 * (mass + a - 1.0) * pi_jac / (pk * pk * pk)
+                - 2.0 / (one_minus * one_minus)
+                + 2.0 * (n as f64 - mass) * pi_jac / (one_minus * one_minus * one_minus);
+            score_second_derivative[k] = ddzd + dpisd * pi_jac;
+        }
+
+        let len = target.len();
+        let mut z_jac = Array1::<f64>::zeros(len);
+        let mut local_logit_third = Array1::<f64>::zeros(len);
+        let mut m_channel = Array1::<f64>::zeros(len);
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                let zk = z[start + k];
+                let jac = zk * (1.0 - zk) * inv_tau;
+                let c_ik = zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
+                // ∂_z J = (1−2z)/τ, ∂_z c = (1−6z+6z²)/τ².
+                let dz_j = (1.0 - 2.0 * zk) * inv_tau;
+                let dz_c = (1.0 - 6.0 * zk + 6.0 * zk * zk) * inv_tau2;
+                let dz_h = score_derivative[k] * 2.0 * jac * dz_j + score[k] * dz_c;
+                z_jac[start + k] = jac;
+                local_logit_third[start + k] = self.weight * jac * dz_h;
+                m_channel[start + k] = self.weight
+                    * (score_second_derivative[k] * jac * jac + score_derivative[k] * c_ik);
+            }
+        }
+
+        IbpHessianDiagThirdChannels {
+            k_max: self.k_max,
+            z_jac,
+            local_logit_third,
+            m_channel,
+        }
+    }
+}
+
+/// Exact logit third-derivative channels of [`IBPAssignmentPenalty::hessian_diag`]
+/// for the SAE outer-ρ log-det adjoint Γ (#1006). Row-major `(N, K)` layout.
+#[derive(Debug, Clone)]
+pub struct IbpHessianDiagThirdChannels {
+    /// Number of columns `K` (atoms) in the row-major logit layout.
+    pub k_max: usize,
+    /// `J_ik = z(1−z)/τ`, the per-logit concrete jacobian (row-major `N·K`).
+    pub z_jac: Array1<f64>,
+    /// `(∂_z H_ik)·J_ik`: the row-local direct-`z` third derivative of the
+    /// assembled diagonal curvature `H_ik` (row-major `N·K`).
+    pub local_logit_third: Array1<f64>,
+    /// `∂_M H_ik`: the empirical-`M_k` channel of `H_ik`. Contract against the
+    /// selected-inverse diagonal per column, then distribute `C_k·J_wk` to every
+    /// row `w` (row-major `N·K`).
+    pub m_channel: Array1<f64>,
 }
 
 impl AnalyticPenalty for IBPAssignmentPenalty {
