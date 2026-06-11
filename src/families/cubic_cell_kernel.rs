@@ -1612,24 +1612,11 @@ pub(crate) const GL20_WEIGHTS: [f64; 20] = [
     0.017_614_007_139_152_12,
 ];
 
-fn dedup_sorted_breakpoints(points: &mut Vec<f64>) {
-    points.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal));
-    points.dedup_by(|lhs, rhs| {
-        if *lhs == *rhs {
-            true
-        } else if lhs.is_finite() && rhs.is_finite() {
-            (*lhs - *rhs).abs() <= 1e-12
-        } else {
-            false
-        }
-    });
-}
-
-/// Provenance-tagged variant of [`dedup_sorted_breakpoints`]: identical sort
-/// order and coincidence tolerance, but when a fixed score break and a
-/// link-knot crossing coincide (the kink configuration), the surviving entry
-/// keeps the `Fixed` tag — a deterministic choice; the z location is
-/// identical either way.
+/// Provenance-tagged breakpoint dedup: sorts ascending and merges entries
+/// coinciding within 1e-12, but when a fixed score break and a link-knot
+/// crossing coincide (the kink configuration), the surviving entry keeps
+/// the `Fixed` tag — a deterministic choice; the z location is identical
+/// either way.
 fn dedup_sorted_tagged_breakpoints(points: &mut Vec<(f64, PartitionEdge)>) {
     points.sort_by(|lhs, rhs| lhs.0.partial_cmp(&rhs.0).unwrap_or(std::cmp::Ordering::Equal));
     points.dedup_by(|lhs, rhs| {

@@ -330,8 +330,31 @@ pub const FOREST_MIN_ROWS_PER_LEAF: usize = 256;
 /// Maximum k-d subdivision depth of the `(a, b)` box forest.
 pub const FOREST_MAX_DEPTH: usize = 12;
 
-/// Tensor-Chebyshev node count per axis for forest-built families.
-pub const FOREST_NODE_COUNT: usize = 8;
+/// Tensor-Chebyshev node-count escalation ladder for forest-built families:
+/// like the quadrature ladder, the build accepts the first rung whose
+/// certificate passes; wider boxes need higher order to reach the tail
+/// tolerance, narrower boxes certify cheaply at the bottom rung.
+pub const FOREST_NODE_LADDER: [usize; 4] = [8, 12, 16, 20];
+
+/// Build a family at the first node count on [`FOREST_NODE_LADDER`] whose
+/// certificate passes; `None` when no rung certifies (⇒ ladder fallback).
+pub fn build_family_escalating(
+    spec: &CellMomentFamilySpec,
+    a_box: (f64, f64),
+    b_box: (f64, f64),
+) -> Option<ChebMomentFamily> {
+    for &m in FOREST_NODE_LADDER.iter() {
+        match ChebMomentFamily::build(spec, a_box, b_box, m) {
+            Ok(Some(family)) => return Some(family),
+            Ok(None) => continue,
+            // Degenerate cells / non-finite evaluations anywhere on the node
+            // grid: the family parameterization is invalid on this box at
+            // every order — stop escalating.
+            Err(_) => return None,
+        }
+    }
+    None
+}
 
 /// Bit-exact identity of one cell family: the `(score_span, link_span,
 /// edge-pair)` combination shared by rows. Built from the provenance the
@@ -566,11 +589,9 @@ impl CellFamilyForest {
             if !leaf.eligible {
                 continue;
             }
-            self.families.entry((leaf_idx, key)).or_insert_with(|| {
-                ChebMomentFamily::build(&spec, leaf.a_box, leaf.b_box, FOREST_NODE_COUNT)
-                    .ok()
-                    .flatten()
-            });
+            self.families
+                .entry((leaf_idx, key))
+                .or_insert_with(|| build_family_escalating(&spec, leaf.a_box, leaf.b_box));
         }
     }
 
@@ -637,9 +658,8 @@ mod tests {
         let spec = test_spec(9);
         let a_box = (0.1, 0.6);
         let b_box = (0.8, 1.3);
-        let family = ChebMomentFamily::build(&spec, a_box, b_box, 12)
-            .expect("family build must succeed on a smooth box")
-            .expect("family must certify on a smooth box");
+        let family = build_family_escalating(&spec, a_box, b_box)
+            .expect("family must certify on a smooth box at some ladder rung");
         let mut out = vec![0.0_f64; 10];
         let mut worst = 0.0_f64;
         for ia in 0..7 {
@@ -680,9 +700,8 @@ mod tests {
         // (a, b) dependence — even smoother, so a small grid certifies.
         let mut spec = test_spec(9);
         spec.right = PartitionEdge::Fixed(0.9);
-        let family = ChebMomentFamily::build(&spec, (-0.3, 0.5), (0.7, 1.4), 8)
-            .expect("build must succeed")
-            .expect("fixed-edge family must certify at m=8");
+        let family = build_family_escalating(&spec, (-0.3, 0.5), (0.7, 1.4))
+            .expect("fixed-edge family must certify at some ladder rung");
         let mut out = vec![0.0_f64; 10];
         let (a, b) = (0.137, 1.021);
         let direct = spec.moments_direct(a, b).expect("direct moments");
