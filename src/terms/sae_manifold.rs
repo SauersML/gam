@@ -6956,7 +6956,7 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        debug_assert_eq!(p, self.output_dim());
+        assert_eq!(p, self.output_dim());
     }
 
     fn fill_lifted_local_beta_probe(
