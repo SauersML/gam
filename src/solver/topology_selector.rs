@@ -1309,6 +1309,105 @@ mod tests {
         );
     }
 
+    fn trivial_provider<'a>() -> HeldOutDensityProvider<'a> {
+        Box::new(|_train: &[usize], eval: &[usize]| Ok(vec![0.0; eval.len()]))
+    }
+
+    /// #1011/#1012 decision-margin contract on the same-class evidence race:
+    /// when the winner's lead over the runner-up is inside the enclosure gap,
+    /// the verdict is provisional (`insufficient_margin` set) so the caller must
+    /// refine or escalate; a lead that clears the gap transfers cleanly.
+    #[test]
+    fn same_class_race_respects_enclosure_decision_margin() {
+        // Two smooth candidates (same class) whose evidence came from a logdet
+        // enclosure with gap 1.0. Lead of 0.5 < gap ⇒ provisional.
+        let near = vec![
+            CrossClassCandidate {
+                kind: AutoTopologyKind::Circle,
+                negative_log_evidence: 100.0,
+                certification: EvidenceCertification::Enclosure { gap: 1.0 },
+                density_provider: trivial_provider(),
+            },
+            CrossClassCandidate {
+                kind: AutoTopologyKind::Euclidean,
+                negative_log_evidence: 100.5,
+                certification: EvidenceCertification::Enclosure { gap: 1.0 },
+                density_provider: trivial_provider(),
+            },
+        ];
+        let verdict =
+            adjudicate_cross_class_race(8, near, STACKING_CV_FOLDS, StackingConfig::default())
+                .expect("same-class race");
+        assert!(!verdict.is_cross_class);
+        assert_eq!(verdict.winner_index, 0);
+        let escalation = verdict
+            .insufficient_margin
+            .expect("lead inside the enclosure gap must be flagged provisional");
+        assert_eq!(escalation.provisional_winner, 0);
+        assert_eq!(escalation.contender, 1);
+        assert!((escalation.lead - 0.5).abs() < 1e-12);
+        assert!((escalation.required_margin - 1.0).abs() < 1e-12);
+
+        // A lead that clears the gap transfers the verdict cleanly.
+        let far = vec![
+            CrossClassCandidate {
+                kind: AutoTopologyKind::Circle,
+                negative_log_evidence: 100.0,
+                certification: EvidenceCertification::Enclosure { gap: 1.0 },
+                density_provider: trivial_provider(),
+            },
+            CrossClassCandidate {
+                kind: AutoTopologyKind::Euclidean,
+                negative_log_evidence: 105.0,
+                certification: EvidenceCertification::Enclosure { gap: 1.0 },
+                density_provider: trivial_provider(),
+            },
+        ];
+        let verdict_far =
+            adjudicate_cross_class_race(8, far, STACKING_CV_FOLDS, StackingConfig::default())
+                .expect("same-class race");
+        assert_eq!(verdict_far.winner_index, 0);
+        assert!(
+            verdict_far.insufficient_margin.is_none(),
+            "a lead clearing the enclosure gap must transfer the verdict"
+        );
+    }
+
+    /// The coreset transfer margin (#1012) flows through the SAME race seam: a
+    /// lead inside `CoresetCertificate::race_transfer_margin` is provisional.
+    #[test]
+    fn same_class_race_respects_coreset_transfer_margin() {
+        let cert = CoresetCertificate::new(0.05, 0.1, 32, 1000).expect("certificate");
+        let required = cert.race_transfer_margin();
+        // Lead strictly inside the certified transfer margin.
+        let lead = 0.5 * required;
+        let candidates = vec![
+            CrossClassCandidate {
+                kind: AutoTopologyKind::Circle,
+                negative_log_evidence: 10.0,
+                certification: EvidenceCertification::Coreset { certificate: cert },
+                density_provider: trivial_provider(),
+            },
+            CrossClassCandidate {
+                kind: AutoTopologyKind::Euclidean,
+                negative_log_evidence: 10.0 + lead,
+                certification: EvidenceCertification::Coreset { certificate: cert },
+                density_provider: trivial_provider(),
+            },
+        ];
+        let verdict = adjudicate_cross_class_race(
+            8,
+            candidates,
+            STACKING_CV_FOLDS,
+            StackingConfig::default(),
+        )
+        .expect("same-class race");
+        let escalation = verdict
+            .insufficient_margin
+            .expect("lead inside the coreset transfer margin must be flagged");
+        assert!((escalation.required_margin - required).abs() < 1e-9);
+    }
+
     #[test]
     fn topology_race_thread_plan_bounds_nested_rayon_threads() {
         let plan = TopologyRaceThreadPlan::for_budget(3, 8);
