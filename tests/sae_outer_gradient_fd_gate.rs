@@ -216,6 +216,6 @@ fn sae_outer_rho_gradient_components_match_centered_fd_ibp_map() {
     // every row in a column, so the outer-ρ gradient through log|H| depends on
     // the cross-row M_k channel of `logdet_theta_adjoint`. lambda_sparse is the
     // active prior weight here, so coord 0's FD directly stresses it.
-    let f = fixture(AssignmentMode::ibp_map(0.9, 0.7, false), -1.5);
+    let f = fixture(AssignmentMode::ibp_map(0.7, 0.9, false), -1.5);
     assert_full_gradient_matches_fd("ibp_map", &f);
 }
