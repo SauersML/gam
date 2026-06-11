@@ -639,23 +639,37 @@ fn born_atom(
 }
 
 /// A held-out row-block shard for the universal-inference estimation/evaluation
-/// split the gates run over: a contiguous block of target rows the triggers were
-/// NOT tuned on.
+/// split the gates run over: a contiguous block of row indices into the FULL
+/// target the triggers were not tuned on.
+///
+/// The split is realized through the term's per-row reconstruction weights
+/// ([`SaeManifoldTerm::set_row_loss_weights`]): a candidate is refit with the
+/// currently-held-out shards' rows at weight `0` (no fitting pressure) and the
+/// estimation rows at weight `1`, then EVALUATED on the held-out rows. The
+/// predictable-plugin e-process streams the shards: shard `k` is evaluated under
+/// a candidate that has not yet seen its rows, then folded into the estimation
+/// set (un-masked) for shard `k+1` — exactly the contract
+/// [`run_atom_birth_gate`](crate::inference::structure_evidence::run_atom_birth_gate)
+/// guarantees the call order of.
 #[derive(Clone, Debug)]
 pub struct RowBlockShard {
-    /// Target rows for this shard, `(n_shard, p)`.
-    pub target: Array2<f64>,
-    /// Row indices into the full target (for warm-state row alignment).
+    /// The full target, shared across shards (`(N, p)`).
+    pub target: std::sync::Arc<Array2<f64>>,
+    /// Row indices into the full target that this shard holds out for
+    /// evaluation.
     pub rows: Vec<usize>,
 }
 
 /// Partition `n` rows into `n_shards` contiguous held-out blocks (the
 /// estimation/evaluation split). Deterministic — contiguous blocks, no shuffle.
+/// Each shard shares the full target by reference; the row indices select the
+/// held-out block.
 pub fn row_block_shards(target: ArrayView2<'_, f64>, n_shards: usize) -> Vec<RowBlockShard> {
     let n = target.nrows();
     if n_shards == 0 || n == 0 {
         return Vec::new();
     }
+    let shared = std::sync::Arc::new(target.to_owned());
     let n_shards = n_shards.min(n);
     let base = n / n_shards;
     let rem = n % n_shards;
@@ -664,8 +678,10 @@ pub fn row_block_shards(target: ArrayView2<'_, f64>, n_shards: usize) -> Vec<Row
     for s in 0..n_shards {
         let len = base + usize::from(s < rem);
         let rows: Vec<usize> = (start..start + len).collect();
-        let block = target.select(ndarray::Axis(0), &rows);
-        shards.push(RowBlockShard { target: block, rows });
+        shards.push(RowBlockShard {
+            target: shared.clone(),
+            rows,
+        });
         start += len;
     }
     shards
