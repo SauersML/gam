@@ -2848,6 +2848,53 @@ pub trait CustomFamily {
         true
     }
 
+    /// Optional Tier-B Jeffreys information matrix.
+    ///
+    /// Defaults to the exact joint Newton Hessian for existing families.
+    /// Non-canonical Bernoulli/binomial families should override this with the
+    /// expected Fisher information: Jeffreys' prior is defined from expected
+    /// information, while observed information can grow in saturated
+    /// misclassified tails and create an artificial prior-reward valley.
+    fn joint_jeffreys_information_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_with_specs(block_states, specs)
+    }
+
+    /// First beta-directional derivative of
+    /// [`Self::joint_jeffreys_information_with_specs`].
+    fn joint_jeffreys_information_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_directional_derivative_with_specs(
+            block_states,
+            specs,
+            d_beta_flat,
+        )
+    }
+
+    /// Second beta-directional derivative of
+    /// [`Self::joint_jeffreys_information_with_specs`].
+    fn joint_jeffreys_information_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_betav_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_second_directional_derivative_with_specs(
+            block_states,
+            specs,
+            d_beta_u_flat,
+            d_betav_flat,
+        )
+    }
+
     /// Whether the coupled-joint inner Newton should engage its self-vanishing
     /// Levenberg–Marquardt damping `μ` on a FULL-RANK-but-ILL-CONDITIONED
     /// penalized Hessian (cond > `COND_NEWTON_SAFETY`), not only on a
@@ -15650,14 +15697,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             Ok(matrix) => matrix,
                             Err(_) => break,
                         };
-                        // Snapshot the UNPENALIZED likelihood Hessian for the
-                        // Jeffreys second-order completion below, taken before the
-                        // penalty/ridge mutate `lhs_true` in place. Only cloned in
-                        // the endgame cycles that actually consume it.
-                        let h_unpenalized_for_completion = (jeffreys_completion_endgame
+                        // Snapshot the Jeffreys information matrix for the
+                        // second-order completion below. For canonical families
+                        // this is the joint Newton Hessian; non-canonical
+                        // Bernoulli/binomial families override it with expected
+                        // Fisher information, which is the object Jeffreys'
+                        // prior is defined on.
+                        let h_info_for_completion = (jeffreys_completion_endgame
                             && inner_jeffreys_term.is_some()
                             && total_p <= JEFFREYS_COMPLETION_MAX_P)
-                            .then(|| lhs_true.clone());
+                            .then(|| family.joint_jeffreys_information_with_specs(&states, specs))
+                            .transpose()?
+                            .flatten();
                         add_joint_penalty_to_matrix(
                             &mut lhs_true,
                             &ranges,
@@ -15697,16 +15748,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             // only on endgame cycles, only at moderate p; `None`
                             // (no exact second derivative / gate zero) degrades
                             // safely to the divided-difference model.
-                            if let (Some(h_unpen), Some(z_joint)) = (
-                                h_unpenalized_for_completion.as_ref(),
+                            if let (Some(h_info), Some(z_joint)) = (
+                                h_info_for_completion.as_ref(),
                                 joint_jeffreys_subspace.as_ref(),
                             ) && let Some(completion) =
                                 crate::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
-                                    h_unpen.view(),
+                                    h_info.view(),
                                     z_joint.view(),
                                     |u: &Array1<f64>, v: &Array1<f64>| {
                                         family
-                                            .exact_newton_joint_hessian_second_directional_derivative_with_specs(
+                                            .joint_jeffreys_information_second_directional_derivative_with_specs(
                                                 &states, specs, u, v,
                                             )
                                     },
@@ -24416,7 +24467,7 @@ fn custom_family_joint_jeffreys_value<F: CustomFamily + Clone + Send + Sync + 's
     if total_p == 0 || z_joint.ncols() == 0 {
         return 0.0;
     }
-    let h_joint = match family.exact_newton_joint_hessian_with_specs(states, specs) {
+    let h_joint = match family.joint_jeffreys_information_with_specs(states, specs) {
         Ok(Some(h)) if h.nrows() == total_p && h.ncols() == total_p => h,
         _ => return 0.0,
     };
@@ -24446,7 +24497,7 @@ fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send + Sync + 'st
     if total_p == 0 || z_joint.ncols() == 0 {
         return Ok(None);
     }
-    let h_joint = match family.exact_newton_joint_hessian_with_specs(states, specs)? {
+    let h_joint = match family.joint_jeffreys_information_with_specs(states, specs)? {
         Some(h) => h,
         None => return Ok(None),
     };
@@ -24457,9 +24508,7 @@ fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send + Sync + 'st
         h_joint.view(),
         z_joint.view(),
         |direction: &Array1<f64>| {
-            family.exact_newton_joint_hessian_directional_derivative_with_specs(
-                states, specs, direction,
-            )
+            family.joint_jeffreys_information_directional_derivative_with_specs(states, specs, direction)
         },
     )?;
     Ok(Some(term))
@@ -24527,7 +24576,7 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
     let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     let mut completion: Option<Array2<f64>> = None;
     if total_p <= JEFFREYS_COMPLETION_MAX_P
-        && let Some(h_joint) = family.exact_newton_joint_hessian_with_specs(states, specs)?
+        && let Some(h_joint) = family.joint_jeffreys_information_with_specs(states, specs)?
         && h_joint.nrows() == total_p
         && h_joint.ncols() == total_p
     {
@@ -24536,9 +24585,7 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
                 h_joint.view(),
                 z_joint.view(),
                 |u: &Array1<f64>, v: &Array1<f64>| {
-                    family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
-                        states, specs, u, v,
-                    )
+                    family.joint_jeffreys_information_second_directional_derivative_with_specs(states, specs, u, v)
                 },
             )?;
     }
@@ -24594,7 +24641,7 @@ fn custom_family_outer_jeffreys_hphi_drift<F: CustomFamily + Clone + Send + Sync
     // Snapshot the joint Hessian H(β̂) at the current outer point. If the family
     // exposes no exact joint Hessian the Jeffreys term is inapplicable (matching
     // `custom_family_joint_jeffreys_term`), so no drift is installed.
-    let h_joint = match family.exact_newton_joint_hessian_with_specs(states, specs)? {
+    let h_joint = match family.joint_jeffreys_information_with_specs(states, specs)? {
         Some(h) => h,
         None => return Ok(None),
     };
@@ -24615,19 +24662,10 @@ fn custom_family_outer_jeffreys_hphi_drift<F: CustomFamily + Clone + Send + Sync
             z_columns.view(),
             delta,
             |direction: &Array1<f64>| {
-                family_owned.exact_newton_joint_hessian_directional_derivative_with_specs(
-                    &states_owned,
-                    &specs_owned,
-                    direction,
-                )
+                family_owned.joint_jeffreys_information_directional_derivative_with_specs(&states_owned, &specs_owned, direction)
             },
             |u: &Array1<f64>, v: &Array1<f64>| {
-                family_owned.exact_newton_joint_hessian_second_directional_derivative_with_specs(
-                    &states_owned,
-                    &specs_owned,
-                    u,
-                    v,
-                )
+                family_owned.joint_jeffreys_information_second_directional_derivative_with_specs(&states_owned, &specs_owned, u, v)
             },
         )
         .map(Some)
