@@ -13544,6 +13544,28 @@ mod trust_region_subproblem_tests {
 /// spectral-range branch already gets this for free via
 /// `JointSpectralNewtonStep::nullity`; the constrained branch never runs the
 /// eigensolve otherwise, so it computes it here on the already-penalized `lhs`.
+/// PSD part of a symmetric matrix: eigendecompose and clamp negative
+/// eigenvalues to zero. Used by the step consumers that REQUIRE a convex
+/// model (the constrained active-set QP and the SPD-PCG matvec) when folding
+/// the exact divided-difference Jeffreys curvature `H_Φ`, which is indefinite
+/// exactly where `Φ` is (gam#979). On a PSD input this is the identity (up to
+/// eigendecomposition round-off). Falls back to the zero matrix if the
+/// eigendecomposition fails — the safe unaugmented step, never a wrong one.
+fn symmetric_psd_projection(matrix: &Array2<f64>) -> Array2<f64> {
+    let p = matrix.nrows();
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let Ok((evals, evecs)) = FaerEigh::eigh(&sym, Side::Lower) else {
+        return Array2::zeros((p, p));
+    };
+    if evals.iter().all(|lam| *lam >= 0.0) {
+        return sym;
+    }
+    let clamped = Array1::from_iter(evals.iter().map(|lam| lam.max(0.0)));
+    let scaled = &evecs * &clamped.view().insert_axis(ndarray::Axis(0));
+    scaled.dot(&evecs.t())
+}
+
 fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<usize> {
     let p = lhs.nrows();
     if p == 0 || lhs.ncols() != p {
@@ -15172,16 +15194,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let head_beta_key: Array1<f64> = flatten_state_betas(&states, specs);
             let head_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
                 if jeffreys_skippable_this_cycle {
-                    log::info!("[bug979-diag] head jeffreys: skippable");
                     None
                 } else if let Some((_, grad_phi, hphi)) = jeffreys_triple_cache
                     .as_ref()
                     .filter(|(key, _, _)| *key == head_beta_key)
                 {
-                    log::info!(
-                        "[bug979-diag] head jeffreys: cache hit |grad_phi|={:.3e}",
-                        grad_phi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
-                    );
                     // Cross-cycle cache hit: the previous cycle's post-step KKT
                     // residual already computed the exact triple at this β. Reuse.
                     Some((grad_phi.clone(), hphi.clone()))
@@ -15194,22 +15211,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 && hphi.nrows() == total_p
                                 && hphi.ncols() == total_p =>
                         {
-                            log::info!(
-                                "[bug979-diag] head jeffreys: computed |grad_phi|={:.3e} |hphi|={:.3e}",
-                                grad_phi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
-                                hphi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
-                            );
                             Some((grad_phi, hphi))
                         }
-                        other => {
-                            log::info!(
-                                "[bug979-diag] head jeffreys: guard miss, term_some={} grad_joint_len={} total_p={}",
-                                other.is_some(),
-                                grad_joint.len(),
-                                total_p
-                            );
-                            None
-                        }
+                        _ => None,
                     };
                     if let Some((grad_phi, hphi)) = term.as_ref() {
                         jeffreys_triple_cache =
@@ -15313,11 +15317,23 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // gam#826/#872/#715). Skipped when the cheap pre-check certifies
                     // well-conditioning: ∇Φ = 0 and H_Φ = 0 there, so neither
                     // rhs_step nor lhs change.
+                    // PSD PROJECTION (gam#979). The exact divided-difference H_Φ is
+                    // indefinite exactly where Φ is (mixed-sign reduced spectrum at
+                    // off-mode trial points). The unconstrained dense-spectral path
+                    // consumes it exactly — the Moré–Sorensen subproblem handles
+                    // indefiniteness rigorously — but THIS active-set QP requires a
+                    // convex model (an indefinite QP cycles its active set and the
+                    // inner grinds the budget). Use the PSD part of H_Φ here: honest
+                    // magnitudes (unlike the old `K²` vec-Gram phantom), guaranteed
+                    // solvable QP, and the exact ∇Φ in the rhs keeps the fixed point
+                    // unchanged — only the convergence rate on indefinite stretches
+                    // degrades to the damped-Newton rate the constrained path always
+                    // had.
                     if let Some((grad_phi, hphi)) = head_jeffreys_term.as_ref()
                         && grad_phi.len() == rhs_step.len()
                     {
                         rhs_step += grad_phi;
-                        lhs += hphi;
+                        lhs += &symmetric_psd_projection(hphi);
                     }
                     // Self-vanishing Levenberg–Marquardt damping for the
                     // CONSTRAINED active-set QP, mirroring the spectral-range
@@ -15460,9 +15476,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             }
                             _ => None,
                         };
+                    // PSD PROJECTION for the SPD-PCG matvec (gam#979): the exact
+                    // divided-difference H_Φ can be indefinite at off-mode trial
+                    // points, which breaks the SPD-CG contract. The matvec uses its
+                    // PSD part; the dense spectral fallback below keeps the EXACT
+                    // (possibly indefinite) H_Φ — the Moré–Sorensen subproblem
+                    // handles it rigorously.
                     let inner_jeffreys_hphi: Option<Arc<Array2<f64>>> = inner_jeffreys_term
                         .as_ref()
-                        .map(|(_grad_phi, hphi)| Arc::new(hphi.clone()));
+                        .map(|(_grad_phi, hphi)| Arc::new(symmetric_psd_projection(hphi)));
                     let pcg_started = std::time::Instant::now();
                     let pcg_requested = matrix_free_joint_requested && !joint_hessian_is_dense;
                     let mut spectral_nullity_for_step = 0usize;
@@ -16763,11 +16785,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             && hphi.nrows() == total_p
                             && hphi.ncols() == total_p =>
                     {
-                        log::info!(
-                            "[bug979-diag] post-step jeffreys: computed |grad_phi|={:.3e} |hphi|={:.3e}",
-                            grad_phi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
-                            hphi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
-                        );
                         let augmented = gradient + &grad_phi;
                         // Cache the exact triple at the just-accepted β so the next
                         // cycle's head reuses it instead of recomputing the
@@ -31866,91 +31883,6 @@ mod tests {
             ..BlockwiseFitOptions::default()
         };
         (family, specs, penalty_counts, options)
-    }
-
-    #[test]
-    fn bug979_diag_hard_case_inner_break() {
-        crate::solver::visualizer::init_logging();
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
-        let (family, specs, penalty_counts, options) =
-            binomial_location_scale_outer_fixture(y, 0.2, -0.1);
-        let rho = array![0.15, -0.25];
-        let result =
-            outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None);
-        let result_summary = result
-            .as_ref()
-            .map(|(obj, grad, _warm)| (*obj, grad.len()))
-            .map_err(|err| err.as_str());
-        eprintln!("bug979_diag hard-case result: {result_summary:?}");
-
-        let y2 = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
-        let (family2, specs2, penalty_counts2, options2) =
-            binomial_location_scale_outer_fixture(y2, 0.0, 0.0);
-        let rho2 = array![0.0, 0.0];
-        let result2 =
-            outerobjective_andgradient(&family2, &specs2, &options2, &penalty_counts2, &rho2, None);
-        let result2_summary = result2
-            .as_ref()
-            .map(|(obj, grad, _warm)| (*obj, grad.len()))
-            .map_err(|err| err.as_str());
-        eprintln!("bug979_diag base-case result: {result2_summary:?}");
-
-        // ρ-grid probe along each coordinate for both fixtures: is V(ρ) smooth
-        // (h vs 2h central FD agree), and what is the analytic gradient?
-        for (label, y_probe, b0, b1, rho_c) in [
-            (
-                "base",
-                vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
-                0.0,
-                0.0,
-                array![0.0, 0.0],
-            ),
-            (
-                "hard",
-                vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0],
-                0.2,
-                -0.1,
-                array![0.15, -0.25],
-            ),
-        ] {
-            let (fam, sp, pc, op) =
-                binomial_location_scale_outer_fixture(Array1::from_vec(y_probe), b0, b1);
-            let h = 1e-5;
-            for k in 0..2 {
-                let mut vals = Vec::new();
-                for step in [-2.0_f64, -1.0, 0.0, 1.0, 2.0] {
-                    let mut rho_p = rho_c.clone();
-                    rho_p[k] += step * h;
-                    match outerobjective_andgradient(&fam, &sp, &op, &pc, &rho_p, None) {
-                        Ok((f, g, _)) => vals.push((step, f, g[k])),
-                        Err(e) => {
-                            eprintln!("bug979_diag {label} k={k} step={step}: ERR {e}");
-                            vals.push((step, f64::NAN, f64::NAN));
-                        }
-                    }
-                }
-                let f = |s: f64| {
-                    vals.iter()
-                        .find(|(st, _, _)| *st == s)
-                        .map(|(_, fv, _)| *fv)
-                };
-                let g0 = vals
-                    .iter()
-                    .find(|(st, _, _)| *st == 0.0)
-                    .map(|(_, _, gv)| *gv);
-                if let (Some(fm2), Some(fm1), Some(fp1), Some(fp2)) =
-                    (f(-2.0), f(-1.0), f(1.0), f(2.0))
-                {
-                    eprintln!(
-                        "bug979_diag {label} k={k}: analytic={:?} fd_h={:.8} fd_2h={:.8} f(0)={:?}",
-                        g0,
-                        (fp1 - fm1) / (2.0 * h),
-                        (fp2 - fm2) / (4.0 * h),
-                        f(0.0)
-                    );
-                }
-            }
-        }
     }
 
     #[test]
