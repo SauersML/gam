@@ -28,7 +28,7 @@
 //! [`crate::solver::arrow_schur::ArrowSchurSystem`].
 
 use ndarray::{
-    Array1, Array2, Array3, Array4, Array5, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s,
+    Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s,
 };
 use std::sync::Arc;
 
@@ -11287,7 +11287,20 @@ impl SaeManifoldTerm {
                     break;
                 }
             }
+            // Affine gauge canonicalization is a representation change, but the
+            // decoder smoothness term is part of the optimized objective. Keep the
+            // canonicalized state only when the same scalar used by the line search
+            // does not increase; otherwise REML would inspect an off-contract
+            // post-accept state whose gradient was never accepted.
+            let accepted_snapshot = self.snapshot_mutable_state();
+            let accepted_total =
+                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
             self.canonicalize_affine_gauge_after_accept()?;
+            let canonical_total =
+                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+            if !(canonical_total.is_finite() && canonical_total <= accepted_total) {
+                self.restore_mutable_state(&accepted_snapshot);
+            }
             // #976 Layer-1 guard 3: after an accepted step (Armijo or proximal
             // — the rejection paths `break` above), check every atom's support
             // and answer breaches with a bounded re-seed or a terminal
@@ -14403,7 +14416,7 @@ mod tests {
     use crate::terms::analytic_penalties::ARDPenalty;
     use crate::terms::analytic_penalties::IsometryReference;
     use approx::assert_abs_diff_eq;
-    use ndarray::array;
+    use ndarray::{Array5, array};
 
     fn assert_matrix_same_bits(left: &Array2<f64>, right: &Array2<f64>) {
         assert_eq!(left.dim(), right.dim());
