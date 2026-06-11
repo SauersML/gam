@@ -4288,6 +4288,200 @@ impl NuclearNormPenalty {
         }
     }
 
+    /// Apply the right-spectral filter pair directly: returns `(V·R, T·dR[V])`,
+    /// each `(n_rows, d)`, where `R = (TᵀT + ε²I)^{-1/2}` (regularized, active-
+    /// windowed) and `dR[V]` is its Fréchet derivative along `V` — the two
+    /// pieces [`Self::hvp`] sums.
+    ///
+    /// Cost structure: the right Gram `TᵀT` is `d×d` but `rank(G) ≤ n_rows`,
+    /// and the tangent Gram `TᵀV + VᵀT` is supported on the joint row space
+    /// `S = rowspace(T) ∪ rowspace(V)` with `dim S ≤ 2·n_rows`. Every pair of
+    /// eigen-directions with either side in `S⊥` contributes `0` to `dR`
+    /// (the tangent Gram annihilates them), and `R` acts on `S⊥` as the
+    /// constant `f₀ = regularized(0)^{-1/2}` (a tied eigen-class, so the
+    /// filter there is the basis-independent `f₀·(I − SSᵀ)` — active only
+    /// when the window covers the full Gram, i.e. no biting `max_rank`).
+    /// So the whole computation collapses to an `s×s` eigenproblem plus
+    /// `O(n_rows·s·d)` products — replacing the former dense `d×d` eigh and
+    /// two `O(d⁴)` basis rotations PER HVP CALL, which at decoder-block
+    /// orientation (`d = p` in the thousands) was measured eating >99% of
+    /// whole-fit wall time. The dense route is kept below for small `d`
+    /// (no asymptotic win) and remains the defining oracle.
+    fn right_spectral_filters_applied(
+        &self,
+        t: ArrayView2<'_, f64>,
+        v: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let m = t.nrows();
+        let d = t.ncols();
+        if d <= 2 * m + 8 {
+            let (rf, rfd) = self.right_spectral_inverse_sqrt_derivative(t, v)?;
+            return Ok((v.dot(&rf), t.dot(&rfd)));
+        }
+        // Joint row-space basis S (d × s) by modified Gram-Schmidt over the
+        // 2m stacked rows of T and V. Deterministic; relative drop tolerance.
+        let mut basis: Vec<Array1<f64>> = Vec::with_capacity(2 * m);
+        for source in [&t, &v] {
+            for row in source.rows() {
+                let scale = row.iter().fold(0.0_f64, |a, &x| a + x * x).sqrt();
+                if scale <= 0.0 {
+                    continue;
+                }
+                let mut r = row.to_owned();
+                for b in &basis {
+                    let proj = b.dot(&r);
+                    r.scaled_add(-proj, b);
+                }
+                // Re-orthogonalize once (classical MGS twice-is-enough) so the
+                // basis stays orthonormal to working precision.
+                for b in &basis {
+                    let proj = b.dot(&r);
+                    r.scaled_add(-proj, b);
+                }
+                let norm = r.iter().fold(0.0_f64, |a, &x| a + x * x).sqrt();
+                if norm > 1.0e-13 * scale {
+                    basis.push(r / norm);
+                }
+            }
+        }
+        let s_dim = basis.len();
+        if s_dim == 0 {
+            // T = V = 0: R is the constant f₀ filter and dR vanishes.
+            let f0 = self.regularized_sigma_sq(0.0).powf(-0.5);
+            let active_count = self.right_filter_active_count(m, d);
+            let vr = if active_count == d {
+                v.to_owned() * f0
+            } else {
+                Array2::<f64>::zeros((m, d))
+            };
+            return Ok((vr, Array2::<f64>::zeros((m, d))));
+        }
+        let mut s = Array2::<f64>::zeros((d, s_dim));
+        for (j, b) in basis.iter().enumerate() {
+            s.column_mut(j).assign(b);
+        }
+        let ts = t.dot(&s); // m × s
+        let vs = v.dot(&s); // m × s
+        let gh = ts.t().dot(&ts); // Sᵀ G S
+        let dgh = ts.t().dot(&vs) + vs.t().dot(&ts); // Sᵀ dG S
+        let (evals, q) = gh.eigh(Side::Lower).map_err(|err| {
+            format!("NuclearNormPenalty right-Gram eigendecomposition failed: {err}")
+        })?;
+        let trace_scale = evals
+            .iter()
+            .fold(0.0_f64, |acc, &lambda| acc.max(lambda.abs()))
+            .max(1.0);
+        let psd_tol = 1.0e-10 * trace_scale;
+        let mut raw_evals = Array1::<f64>::zeros(s_dim);
+        for i in 0..s_dim {
+            let lambda = evals[i];
+            if !lambda.is_finite() {
+                return Err(format!(
+                    "NuclearNormPenalty expected finite right-Gram eigenvalue; got {lambda}"
+                ));
+            }
+            if lambda < -psd_tol {
+                return Err(format!(
+                    "NuclearNormPenalty expected PSD right Gram; eigenvalue {lambda:.3e} \
+                     is below numerical tolerance {psd_tol:.3e}"
+                ));
+            }
+            raw_evals[i] = lambda.max(0.0);
+        }
+        // Active window over the FULL ascending d-spectrum, which is the
+        // (d − s)-fold tied zero class of S⊥ followed by `raw_evals`
+        // (ascending). Mirrors the dense path's windowing and its tie-split
+        // guard exactly.
+        let active_count = self.right_filter_active_count(m, d);
+        let zero_class_active = active_count == d;
+        if !zero_class_active && active_count > s_dim {
+            // The cutoff would bisect the tied zero class of S⊥ — the same
+            // condition the dense path rejects via its adjacent-eigenvalue
+            // guard (both neighbors are exact zeros).
+            return Err(
+                "NuclearNormPenalty HVP is undefined: max_rank splits a tied \
+                 right-Gram eigenvalue at the active/inactive cutoff (0.0e0, 0.0e0)"
+                    .to_string(),
+            );
+        }
+        // Index of the first ACTIVE entry within the s-block.
+        let active_start_s = s_dim.saturating_sub(active_count.min(s_dim));
+        if self.max_rank.is_some() && !zero_class_active {
+            // Tie guard at the cutoff, on RAW eigenvalues as in the dense path.
+            // Left neighbor is inside the s-block when the window is strictly
+            // interior; when the window covers the whole s-block the left
+            // neighbor is the top of the S⊥ zero class.
+            let (left, right) = if active_start_s > 0 {
+                (evals[active_start_s - 1], evals[active_start_s])
+            } else {
+                (0.0, evals[0])
+            };
+            let scale = (left.abs() + right.abs()).max(1.0);
+            if (right - left).abs() <= 1.0e-12 * scale {
+                return Err(format!(
+                    "NuclearNormPenalty HVP is undefined: max_rank splits a tied \
+                     right-Gram eigenvalue at the active/inactive cutoff \
+                     ({left:.3e}, {right:.3e})"
+                ));
+            }
+        }
+        let mut regularized_evals = Array1::<f64>::zeros(s_dim);
+        let mut f = Array1::<f64>::zeros(s_dim);
+        let mut df = Array1::<f64>::zeros(s_dim);
+        for i in 0..s_dim {
+            regularized_evals[i] = self.regularized_sigma_sq(raw_evals[i]);
+            if i >= active_start_s {
+                let lambda = regularized_evals[i];
+                f[i] = lambda.powf(-0.5);
+                df[i] = -0.5 * lambda.powf(-1.5);
+            }
+        }
+        // B̂ = Q̂ᵀ (Sᵀ dG S) Q̂, then the divided-difference Hadamard product —
+        // identical pair rules to the dense path. All pairs touching S⊥ have
+        // B = 0 (dG is supported on S), so they need no representation.
+        let b_basis = q.t().dot(&dgh).dot(&q);
+        let mut deriv_basis = Array2::<f64>::zeros((s_dim, s_dim));
+        for i in 0..s_dim {
+            for j in 0..s_dim {
+                let denom = regularized_evals[i] - regularized_evals[j];
+                let scale = (regularized_evals[i].abs() + regularized_evals[j].abs())
+                    .max(f64::MIN_POSITIVE);
+                let divided_difference = if denom.abs() <= 1.0e-12 * scale {
+                    let i_active = i >= active_start_s;
+                    let j_active = j >= active_start_s;
+                    if i_active && j_active {
+                        0.5 * (df[i] + df[j])
+                    } else {
+                        0.0
+                    }
+                } else {
+                    (f[i] - f[j]) / denom
+                };
+                deriv_basis[[i, j]] = divided_difference * b_basis[[i, j]];
+            }
+        }
+        // V·R = f₀·V·(I − SSᵀ) [zero-class active only] + (V S) Q̂ f̂ Q̂ᵀ Sᵀ.
+        let qf = {
+            let mut qf = q.clone();
+            for i in 0..s_dim {
+                let fi = f[i];
+                qf.column_mut(i).mapv_inplace(|x| x * fi);
+            }
+            qf.dot(&q.t()) // Q̂ diag(f̂) Q̂ᵀ, s×s
+        };
+        let mut vr = vs.dot(&qf).dot(&s.t());
+        if zero_class_active {
+            let f0 = self.regularized_sigma_sq(0.0).powf(-0.5);
+            // V − (V S) Sᵀ is V's S⊥ component.
+            let v_perp = v.to_owned() - vs.dot(&s.t());
+            vr += &(v_perp * f0);
+        }
+        // T·dR = (T S) Q̂ (Δf̂ ∘ B̂) Q̂ᵀ Sᵀ.
+        let w = q.dot(&deriv_basis).dot(&q.t());
+        let tdr = ts.dot(&w).dot(&s.t());
+        Ok((vr, tdr))
+    }
+
     fn compute_svd_cached(&self, t: ArrayView2<'_, f64>) -> NuclearSvdCache {
         // Existing faer wrapper calls `faer::linalg::svd::svd(..., Thin, Thin, ...)`.
         let owned = t.to_owned();
@@ -4519,25 +4713,15 @@ impl AnalyticPenalty for NuclearNormPenalty {
             return Array1::<f64>::zeros(target.len());
         };
         // `AnalyticPenalty::hvp_target` has no Result channel; decomposition
-        // or active-rank cutoff failures from `right_spectral_inverse_sqrt_derivative`
-        // are upstream contract violations that must surface loudly.
-        let (right_filter, right_filter_derivative) = self
-            .right_spectral_inverse_sqrt_derivative(t.view(), v_mat.view())
+        // or active-rank cutoff failures from the spectral helper are upstream
+        // contract violations that must surface loudly.
+        let (vr, tdr) = self
+            .right_spectral_filters_applied(t.view(), v_mat.view())
             // SAFETY: error path is a caller contract violation; the upstream
             // helper already formatted a diagnostic message.
             .unwrap_or_else(|message| panic!("{}", message));
         let weight = self.resolved_weight(rho);
-        let mut out = Array2::<f64>::zeros(t.dim());
-        for n in 0..t.nrows() {
-            for a in 0..t.ncols() {
-                let mut term = 0.0;
-                for b in 0..t.ncols() {
-                    term += v_mat[[n, b]] * right_filter[[b, a]]
-                        + t[[n, b]] * right_filter_derivative[[b, a]];
-                }
-                out[[n, a]] = weight * term;
-            }
-        }
+        let out = (vr + tdr) * weight;
         Self::flatten_matrix(&out)
     }
 
@@ -10264,6 +10448,71 @@ mod tests {
             expected,
             epsilon = expected.abs() * 1.0e-12
         );
+    }
+
+    /// The subspace fast path (joint-rowspace eigenproblem, used when the
+    /// block is wide: `d > 2m + 8`) must reproduce the dense `d×d` route
+    /// exactly — same regularized spectrum, same active window, same
+    /// divided-difference pair rules. Checked for the default no-cap window
+    /// (where the S⊥ zero class is ACTIVE and carries the constant f₀
+    /// filter) and for a biting `max_rank` (where S⊥ is inactive).
+    #[test]
+    fn nuclear_norm_wide_block_fast_path_matches_dense_oracle() {
+        let n_eff = 3usize;
+        let p = 40usize; // wide: p > 2*n_eff + 8 engages the subspace path
+        for max_rank in [None, Some(2)] {
+            let target = PsiSlice {
+                range: 0..n_eff * p,
+                latent_dim: Some(p),
+            };
+            let pen =
+                NuclearNormPenalty::new(target, 0.8, n_eff, 1.0e-3, max_rank, false).unwrap();
+            let t_flat = Array1::from_vec(
+                (0..n_eff * p)
+                    .map(|i| (0.3 * (i as f64) + 0.11).sin() + 0.05 * (i as f64 % 7.0))
+                    .collect(),
+            );
+            let v_flat = Array1::from_vec(
+                (0..n_eff * p)
+                    .map(|i| (0.17 * (i as f64) - 0.4).cos())
+                    .collect(),
+            );
+            let t = t_flat.view().into_shape_with_order((n_eff, p)).unwrap();
+            let v = v_flat.view().into_shape_with_order((n_eff, p)).unwrap();
+
+            let (fast_vr, fast_tdr) = pen
+                .right_spectral_filters_applied(t.view(), v.view())
+                .expect("fast path");
+            let (rf, rfd) = pen
+                .right_spectral_inverse_sqrt_derivative(t.view(), v.view())
+                .expect("dense oracle");
+            let dense_vr = v.dot(&rf);
+            let dense_tdr = t.dot(&rfd);
+
+            let scale = dense_vr
+                .iter()
+                .chain(dense_tdr.iter())
+                .fold(0.0_f64, |a, &x| a.max(x.abs()))
+                .max(1.0);
+            for n in 0..n_eff {
+                for a in 0..p {
+                    assert!(
+                        (fast_vr[[n, a]] - dense_vr[[n, a]]).abs() <= 1.0e-9 * scale,
+                        "V·R mismatch at ({n},{a}) max_rank={max_rank:?}: \
+                         fast={} dense={}",
+                        fast_vr[[n, a]],
+                        dense_vr[[n, a]]
+                    );
+                    assert!(
+                        (fast_tdr[[n, a]] - dense_tdr[[n, a]]).abs() <= 1.0e-9 * scale,
+                        "T·dR mismatch at ({n},{a}) max_rank={max_rank:?}: \
+                         fast={} dense={}",
+                        fast_tdr[[n, a]],
+                        dense_tdr[[n, a]]
+                    );
+                }
+            }
+        }
     }
 
     #[test]
