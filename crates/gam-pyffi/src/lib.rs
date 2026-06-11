@@ -2443,14 +2443,13 @@ fn competing_risks_cif_impl(
     // bare `PyValueError` rather than forcing it through a typed engine
     // enum it does not belong to.
     let cumulative_hazard =
-        ndarray::stack(Axis(0), &endpoint_views).map_err(|err| py_value_error(err.to_string()))?;
+        ndarray::stack(Axis(0), &endpoint_views).map_err(shape_error_to_pyerr)?;
     // Typed engine path: `assemble_competing_risks_cif` returns
     // `Result<_, SurvivalError>`, dispatch to `gamfit.SurvivalError`.
     let result = gam::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
         .map_err(survival_error_to_pyerr)?;
     let cif_views = result.cif.iter().map(|m| m.view()).collect::<Vec<_>>();
-    let cif_stacked =
-        ndarray::stack(Axis(0), &cif_views).map_err(|err| py_value_error(err.to_string()))?;
+    let cif_stacked = ndarray::stack(Axis(0), &cif_views).map_err(shape_error_to_pyerr)?;
     Ok((cif_stacked, result.overall_survival))
 }
 
@@ -2669,9 +2668,10 @@ fn periodic_spline_curve_basis<'py>(
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
     let spec = PeriodicBSplineBasisSpec::new(degree, n_knots, 1.0, 0.0, penalty_order);
     let basis = build_periodic_bspline_basis_1d(t.as_array(), &spec)
-        .map_err(|e| py_value_error(e.to_string()))?;
-    let penalty = create_cyclic_difference_penalty_matrix(n_knots, penalty_order)
-        .map_err(|e| py_value_error(e.to_string()))?;
+        .map_err(basis_error_to_pyerr)?;
+    let penalty =
+        create_cyclic_difference_penalty_matrix(n_knots, penalty_order)
+            .map_err(basis_error_to_pyerr)?;
     Ok((
         basis.into_pyarray(py).unbind(),
         penalty.into_pyarray(py).unbind(),
@@ -2788,14 +2788,15 @@ fn duchon_basis_with_jet<'py>(
     // no second, independently-scaled forward pipeline that could drift out of
     // lockstep on the amplification, the null-space basis, or the polynomial
     // column ordering. This is the model the issue prescribes.
-    let (phi, jet) = duchon_sae_atom_basis_with_jet(pts, ctrs, requested_nullspace)
-        .map_err(|err| py_value_error(err.to_string()))?;
+    let (phi, jet) =
+        duchon_sae_atom_basis_with_jet(pts, ctrs, requested_nullspace)
+            .map_err(basis_error_to_pyerr)?;
 
     // The penalty matrix `S = Zᵀ K_CC Z` is the conditionally-PD penalty of the
     // *same* basis. It comes from the forward builder over the identical spec,
     // which uses the same `Z` and `α` as the helper above, so `S` is the
     // penalty of exactly the `Φ` returned here.
-    let built = build_duchon_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    let built = build_duchon_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
     let primary_idx = built
         .penaltyinfo
         .iter()
@@ -2927,7 +2928,7 @@ fn duchon_basis_with_jets<'py>(
         &periodic_flags,
         &periods,
     )
-    .map_err(|err| py_value_error(err.to_string()))?;
+    .map_err(basis_error_to_pyerr)?;
 
     Ok((
         phi.into_pyarray(py).unbind(),
@@ -2990,11 +2991,11 @@ fn matern_basis<'py>(
         periodic: None,
         nullspace_shrinkage_survived: None,
     };
-    let built = build_matern_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    let built = build_matern_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
     let design = built
         .design
         .try_to_dense_by_chunks("matern_basis")
-        .map_err(|err| py_value_error(err.to_string()))?;
+        .map_err(py_value_error)?;
     Ok(design.into_pyarray(py).unbind())
 }
 
@@ -3131,7 +3132,7 @@ fn basis_with_jet<'py>(
                     periodic_knot_domain(knots_array.view()).map_err(py_value_error)?;
                 let jet =
                     periodic_bspline_first_derivative_nd(coords, (left, right), degree, num_basis)
-                        .map_err(|err| py_value_error(err.to_string()))?;
+                        .map_err(basis_error_to_pyerr)?;
                 if jet.shape() != [n_rows, n_cols, 1] {
                     return Err(py_value_error(format!(
                         "basis_with_jet bspline shape mismatch: phi=({n_rows},{n_cols}) jet={:?}",
@@ -3139,7 +3140,7 @@ fn basis_with_jet<'py>(
                     )));
                 }
                 let penalty = create_cyclic_difference_penalty_matrix(num_basis, order)
-                    .map_err(|err| py_value_error(err.to_string()))?;
+                    .map_err(basis_error_to_pyerr)?;
                 (jet, penalty)
             } else {
                 let deriv = bspline_basis_derivative_impl(
@@ -3275,7 +3276,7 @@ fn duchon_basis<'py>(
             boundary: OneDimensionalBoundary::Open,
         };
         let built = build_duchon_basis_mixed_periodicity_auto(pts, &spec, &periodic_flags, None)
-            .map_err(|err| py_value_error(err.to_string()))?;
+            .map_err(basis_error_to_pyerr)?;
         return Ok(built.design.to_dense().into_pyarray(py).unbind());
     }
     let spec = DuchonBasisSpec {
@@ -3289,7 +3290,7 @@ fn duchon_basis<'py>(
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
-    let built = build_duchon_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    let built = build_duchon_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(built.design.to_dense().into_pyarray(py).unbind())
 }
 
@@ -3304,7 +3305,7 @@ fn auto_knots_1d<'py>(
     // alongside the knot vector so Python callers can observe when the engine
     // had to downgrade their requested basis to fit small-n data.
     let result = auto_knot_vector_1d_quantile(t.as_array(), num_internal_knots, degree)
-        .map_err(|err| py_value_error(err.to_string()))?;
+        .map_err(basis_error_to_pyerr)?;
     Ok((
         result.knots.into_pyarray(py).unbind(),
         result.degree,
@@ -3320,7 +3321,7 @@ fn auto_centers_1d<'py>(
     num_centers: usize,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let centers = auto_centers_1d_equal_mass(t.as_array(), num_centers)
-        .map_err(|err| py_value_error(err.to_string()))?;
+        .map_err(basis_error_to_pyerr)?;
     Ok(centers.into_pyarray(py).unbind())
 }
 
@@ -3369,7 +3370,7 @@ fn duchon_operator_penalties<'py>(
         None,
         None,
     )
-    .map_err(|err| py_value_error(err.to_string()))?;
+    .map_err(basis_error_to_pyerr)?;
     Ok((
         matrices.mass.into_pyarray(py).unbind(),
         matrices.tension.into_pyarray(py).unbind(),
@@ -3468,7 +3469,7 @@ fn duchon_function_norm_penalty<'py>(
             &periodic_flags,
             periods_1d.as_ref().map(|p| p.as_slice()),
         )
-        .map_err(|err| py_value_error(err.to_string()))?;
+        .map_err(basis_error_to_pyerr)?;
         // Mixed-periodicity builder emits a single Primary candidate (the
         // function-norm Gram).
         let idx = built
@@ -3495,7 +3496,7 @@ fn duchon_function_norm_penalty<'py>(
         boundary: OneDimensionalBoundary::Open,
     };
     let built = build_duchon_basis(center_matrix.view(), &spec)
-        .map_err(|err| py_value_error(err.to_string()))?;
+        .map_err(basis_error_to_pyerr)?;
     // The redesigned non-periodic Euclidean path emits a single native
     // reproducing-norm Gram as the `Primary` candidate (the function-norm
     // penalty on the scale-free polyharmonic basis) plus a null-space shrinkage
@@ -3571,8 +3572,7 @@ fn sphere_basis<'py>(
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
     };
-    let built =
-        build_spherical_spline_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
     let primary_idx = built
         .penaltyinfo
         .iter()
@@ -3609,7 +3609,7 @@ fn sphere_select_farthest_point_centers<'py>(
         )));
     }
     let centers = select_spherical_farthest_point_centers(pts, n_centers, radians)
-        .map_err(|err| py_value_error(err.to_string()))?;
+        .map_err(basis_error_to_pyerr)?;
     Ok(centers.into_pyarray(py).unbind())
 }
 
@@ -3675,8 +3675,7 @@ fn sphere_basis_with_centers<'py>(
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
     };
-    let built =
-        build_spherical_spline_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
     let primary_idx = built
         .penaltyinfo
         .iter()
@@ -3755,8 +3754,7 @@ fn sphere_basis_jet<'py>(
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
     };
-    let jet =
-        spherical_spline_design_jet(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    let jet = spherical_spline_design_jet(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
 }
 
@@ -3807,8 +3805,7 @@ fn sphere_basis_jet_with_centers<'py>(
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
     };
-    let jet =
-        spherical_spline_design_jet(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    let jet = spherical_spline_design_jet(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
 }
 
@@ -3827,8 +3824,7 @@ fn sphere_chart_basis_with_jet<'py>(
     // the returned arrays into Python-facing buffers. Keeping the math in one
     // place is what prevents the core and PyFFI derivatives from drifting.
     let coords = t.as_array();
-    let (phi, jet) =
-        sphere_chart_basis_jet(coords).map_err(|err| py_value_error(err.to_string()))?;
+    let (phi, jet) = sphere_chart_basis_jet(coords).map_err(py_value_error)?;
     let penalty = Array2::from_diag(&Array1::from_vec(SPHERE_CHART_PENALTY_DIAGONAL.to_vec()));
     Ok((
         phi.into_pyarray(py).unbind(),
@@ -3850,7 +3846,7 @@ fn thin_plate_penalty<'py>(
         ));
     }
     let matrix = build_thin_plate_penalty_matrix(centers.as_array(), length_scale)
-        .map_err(|err| py_value_error(err.to_string()))?;
+        .map_err(basis_error_to_pyerr)?;
     Ok(matrix.penalty.into_pyarray(py).unbind())
 }
 
@@ -4847,7 +4843,7 @@ fn gaussian_weighted_ridge_array<'py>(
         weights.as_array(),
         ridge_lambda,
     )
-    .map_err(|err| py_value_error(err.to_string()))?;
+    .map_err(py_value_error)?;
     Ok((
         coefficients.into_pyarray(py).unbind(),
         fitted.into_pyarray(py).unbind(),
@@ -8563,7 +8559,7 @@ fn gaussian_reml_fit_latent<'py>(
     tensor_degrees: Option<Vec<usize>>,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
-        Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
+        Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
         None => None,
     };
     let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
@@ -8682,7 +8678,7 @@ fn gaussian_reml_fit_latent<'py>(
     // it back rather than having to thread the input through themselves.
     let t_matrix = t_for_echo
         .into_shape_with_order((n_obs, latent_dim))
-        .map_err(|err| py_value_error(err.to_string()))?;
+        .map_err(shape_error_to_pyerr)?;
     out.set_item("t", t_matrix.into_pyarray(py))?;
     Ok(out.unbind())
 }
@@ -9144,7 +9140,7 @@ fn sae_manifold_fit_inner<'py>(
     fisher_provenance: Option<&str>,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
-        Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
+        Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
         None => None,
     };
     let (n_obs, p_out) = z_view.dim();
@@ -13169,8 +13165,8 @@ fn gaussian_reml_fit_latent_backward<'py>(
         backward.clone()
     };
     let grad_x = &backward_for_t.grad_x;
-    let mut grad_t = contract_input_loc_gradient(grad_x.view(), &jet)
-        .map_err(|err| py_value_error(err.to_string()))?;
+    let mut grad_t =
+        contract_input_loc_gradient(grad_x.view(), &jet).map_err(basis_error_to_pyerr)?;
     if grad_reml_score != 0.0 {
         add_latent_outer_reml_score_gradient(
             &mut grad_t,
@@ -14138,7 +14134,7 @@ fn gaussian_reml_optimize_latent<'py>(
     let t_matrix = best_t
         .clone()
         .into_shape_with_order((n_obs, latent_dim))
-        .map_err(|err| py_value_error(err.to_string()))?;
+        .map_err(shape_error_to_pyerr)?;
     out.set_item("t", t_matrix.clone().into_pyarray(py))?;
     out.set_item("latent", t_matrix.into_pyarray(py))?;
     out.set_item("t_flat", best_t.into_pyarray(py))?;
@@ -14451,7 +14447,7 @@ fn glm_reml_fit_latent<'py>(
     analytic_penalties: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
-        Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
+        Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
         None => None,
     };
     let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
@@ -19566,7 +19562,7 @@ fn matern_input_location_first_jet<'py>(
         nu_parsed,
         aniso_vec.as_deref(),
     )
-    .map_err(|err| py_value_error(err.to_string()))?;
+    .map_err(basis_error_to_pyerr)?;
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -19598,7 +19594,7 @@ fn matern_input_location_hessian<'py>(
         nu_parsed,
         aniso_vec.as_deref(),
     )
-    .map_err(|err| py_value_error(err.to_string()))?;
+    .map_err(basis_error_to_pyerr)?;
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -19661,10 +19657,10 @@ fn matern_basis_gradient_streaming<'py>(
         aniso,
         chunk_size,
     )
-    .map_err(|err| py_value_error(err.to_string()))?;
+    .map_err(basis_error_to_pyerr)?;
     let out = evaluator
         .evaluate(data.as_array(), target)
-        .map_err(|err| py_value_error(err.to_string()))?;
+        .map_err(basis_error_to_pyerr)?;
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -19688,7 +19684,7 @@ fn sphere_input_location_first_derivative<'py>(
         penalty_order,
         project_to_tangent,
     )
-    .map_err(|err| py_value_error(err.to_string()))?;
+    .map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
 }
 
@@ -19709,7 +19705,7 @@ fn periodic_bspline_input_location_first_derivative<'py>(
         degree,
         num_basis,
     )
-    .map_err(|err| py_value_error(err.to_string()))?;
+    .map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
 }
 
@@ -19759,7 +19755,7 @@ fn bspline_tensor_input_location_first_derivative<'py>(
         per_axis_views.push(knots_concat_view.slice(s![lo..hi]));
     }
     let jet = bspline_tensor_first_derivative(t.as_array(), &per_axis_views, &degrees)
-        .map_err(|err| py_value_error(err.to_string()))?;
+        .map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
 }
 
@@ -24691,6 +24687,9 @@ error_to_pyerr!(
     gam::families::survival::SurvivalError,
     SurvivalError
 );
+error_to_pyerr!(basis_error_to_pyerr, gam::basis::BasisError, GamError);
+error_to_pyerr!(shape_error_to_pyerr, ndarray::ShapeError, GamError);
+error_to_pyerr!(serde_json_error_to_pyerr, serde_json::Error, GamError);
 
 fn inject_scalar_fisher_rao_weight(
     dataset: &mut EncodedDataset,
@@ -28237,7 +28236,7 @@ fn register_analytic_penalties(latents_json: &str, penalties_json: &str) -> PyRe
         "rho_count": registry.total_rho_count(),
         "layout": layout,
     }))
-    .map_err(|err| py_value_error(err.to_string()))
+    .map_err(serde_json_error_to_pyerr)
 }
 
 /// JumpReLU activation-gate value and straight-through-estimator gradients.
