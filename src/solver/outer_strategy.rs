@@ -2021,6 +2021,34 @@ pub trait OuterObjective {
     fn requires_continuation_path_entry(&self) -> bool {
         false
     }
+
+    /// Run the objective's certified curvature-homotopy entry leg, if it has
+    /// one, leaving the inner state warm at the real (`η = 1`) objective.
+    ///
+    /// An objective with a *certified anchor* — a point known by construction to
+    /// be the global optimum of a relaxed problem — can replace the blind
+    /// multi-seed multistart with a single predictor-corrector walk from that
+    /// anchor to the true objective (#1007). The SAE-manifold objective
+    /// overrides this: its `η = 0` Eckart-Young linear relaxation is convex and
+    /// its optimum is certified by `linear_span_anchor`, so the walk in `η`
+    /// tracks the unique optimal branch to `η = 1`. The walk monitors the
+    /// arrow-factor min-pivot and halves the `η` step when it shrinks; a pivot
+    /// collapse below tolerance is a DETECTED bifurcation (recorded on the fit
+    /// payload, never silent), at which point the objective falls back to the
+    /// documented multi-seed cascade.
+    ///
+    /// Returns:
+    ///   * `None` — no certified anchor; use the standard seed cascade
+    ///     (the default for every other objective).
+    ///   * `Some(Ok(true))` — the walk arrived; the inner state is warm at the
+    ///     certified `η = 1` solution and the seed cascade is bypassed.
+    ///   * `Some(Ok(false))` — the anchor degenerated or the walk detected a
+    ///     bifurcation; fall back to the multi-seed cascade (the report is
+    ///     recorded on the objective for the fit payload).
+    ///   * `Some(Err(_))` — a hard failure constructing the anchor.
+    fn curvature_homotopy_entry(&mut self) -> Option<Result<bool, EstimationError>> {
+        None
+    }
 }
 
 // ─── Persistent warm-start checkpoint plumbing ────────────────────────
