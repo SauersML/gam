@@ -35,11 +35,7 @@ fn matern_smooth(name: &str, centers: usize) -> SmoothTermSpec {
                 include_intercept: false,
                 double_penalty: false,
                 identifiability: MaternIdentifiability::default(),
-                // Per-axis kernel-η ARD: unlocks the κ/ψ joint-spatial outer
-                // solver (an explicit isotropic length_scale would LOCK it and
-                // skip straight to the rho-only path). This mirrors what the
-                // formula API's `matern(...)` does and is the path #979 hits.
-                aniso_log_scales: Some(vec![0.0, 0.0]),
+                aniso_log_scales: None,
                 nullspace_shrinkage_survived: None,
             },
             input_scales: None,
@@ -123,8 +119,6 @@ fn build(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSp
     (data, spec)
 }
 
-use std::sync::OnceLock;
-static START: OnceLock<Instant> = OnceLock::new();
 struct StderrInfoLogger;
 impl log::Log for StderrInfoLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
@@ -132,8 +126,7 @@ impl log::Log for StderrInfoLogger {
     }
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
-            let t = START.get().map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
-            eprintln!("[t={t:8.3}] {}", record.args());
+            eprintln!("{}", record.args());
         }
     }
     fn flush(&self) {}
@@ -141,7 +134,6 @@ impl log::Log for StderrInfoLogger {
 static LOGGER: StderrInfoLogger = StderrInfoLogger;
 
 fn main() {
-    let _ = START.set(Instant::now());
     gam::init_parallelism();
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
     let n: usize = 1500;
