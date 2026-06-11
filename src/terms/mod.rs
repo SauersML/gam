@@ -3,6 +3,7 @@ pub mod anova_atom;
 pub mod atom_codes;
 pub mod atom_selection;
 pub mod basis;
+pub mod behavioral_head;
 pub mod closed_form_operator;
 pub(crate) mod coefficient_group_resolver;
 pub mod construction;
