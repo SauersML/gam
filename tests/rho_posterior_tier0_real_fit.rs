@@ -8,6 +8,8 @@
 //! real entry point. It asserts the certificate is present and structurally
 //! sound, and that it is deterministic across identical fits.
 
+use csv::StringRecord;
+use gam::inference::data::EncodedDataset;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -26,17 +28,17 @@ fn mu_true(x: f64, z: f64) -> f64 {
     (2.0 * PI * x).sin() + 0.6 * z
 }
 
-fn build_dataset(seed: u64) -> gam::EncodedDataset {
+fn build_dataset(seed: u64) -> EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
     let unif = Uniform::new(0.0, 1.0).expect("uniform");
     let noise = Normal::new(0.0, SIGMA).expect("normal");
     let headers = ["x", "z", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<csv::StringRecord> = (0..N)
+    let rows: Vec<StringRecord> = (0..N)
         .map(|_| {
             let x = unif.sample(&mut rng);
             let z = unif.sample(&mut rng);
             let y = mu_true(x, z) + noise.sample(&mut rng);
-            csv::StringRecord::from(vec![x.to_string(), z.to_string(), y.to_string()])
+            StringRecord::from(vec![x.to_string(), z.to_string(), y.to_string()])
         })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode dataset")
