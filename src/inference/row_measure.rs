@@ -448,25 +448,14 @@ const DESIGNED_SAMPLE_SALT: u64 = 0x73AD_0987_5EED_D51F;
 /// other `splitmix64_hash` use of the same numeric seed elsewhere in the crate.
 const ENRICHMENT_SALT: u64 = 0x980E_1C45_F00D_AC70;
 
-/// Per-row Fisher mass `tr(M_n)` from the metric's validated PSD blocks.
+/// Per-row Fisher mass `tr(M_n)` from the metric's criterion-facing traces.
 ///
-/// `tr(M_n) = Σ_i M_n[i, i]`. This reads the criterion-facing (un-floored)
-/// blocks, so the solver `δ` never enters the measure — consistent with the
-/// `RowMetric` #747 discipline, and irrelevant anyway because the measure feeds
-/// no criterion. Pure read; touches nothing.
+/// The traces are recorded at metric construction (un-floored), so the solver
+/// `δ` never enters the measure — consistent with the `RowMetric` #747
+/// discipline, and irrelevant anyway because the measure feeds no criterion.
+/// Pure read; touches nothing.
 pub(crate) fn per_row_fisher_mass(metric: &RowMetric) -> Vec<f64> {
-    let blocks = metric.blocks();
-    let n = metric.n_rows();
-    let p = metric.p_out();
-    let mut mass = vec![0.0_f64; n];
-    for row in 0..n {
-        let mut tr = 0.0_f64;
-        for i in 0..p {
-            tr += blocks[[row, i, i]];
-        }
-        mass[row] = tr;
-    }
-    mass
+    metric.row_traces().to_vec()
 }
 
 #[cfg(test)]

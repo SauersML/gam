@@ -8790,6 +8790,13 @@ impl SaeManifoldTerm {
     /// objective, so this touches no loss / criterion / penalty.
     fn enrichment_visit_order(&self) -> Vec<usize> {
         let n = self.n_obs();
+        // No installed metric ⇒ the measure is exactly uniform and the
+        // systematic draw reduces to plain index order (documented below), so
+        // skip building the Euclidean metric object entirely — this runs in
+        // the seeding hot path, per seed-candidate evaluation.
+        if self.row_metric.is_none() {
+            return (0..n).collect();
+        }
         let metric = match self.diagnostic_metric() {
             Ok(m) => m,
             // A metric build failure cannot occur for the term's own validated

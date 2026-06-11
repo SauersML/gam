@@ -150,7 +150,7 @@ fn whitening_a_planted_anisotropic_residual_recovers_isotropy() {
 ///
 /// Two metrics with the SAME factors, one with `δ = 0` and one with a large
 /// `δ`, must produce IDENTICAL criterion-facing quantities: `quad_form`,
-/// `whiten_residual_row`, `fisher_mass`, and the validated `blocks()`. Only
+/// `whiten_residual_row`, `fisher_mass`, and the criterion-facing `row_traces()`. Only
 /// `solver_floor()` differs. This proves `δ` cannot bias the evidence criterion.
 #[test]
 fn delta_floor_is_solver_only_and_never_enters_the_criterion() {
@@ -193,11 +193,11 @@ fn delta_floor_is_solver_only_and_never_enters_the_criterion() {
         assert_eq!(m0, m1, "row {row}: δ floor must not change fisher_mass");
     }
 
-    // The validated PSD blocks (the criterion-facing metric) are δ-free too.
+    // The criterion-facing per-row traces are δ-free too.
     assert_eq!(
-        no_floor.blocks(),
-        with_floor.blocks(),
-        "δ floor must not be baked into the validated criterion-facing blocks"
+        no_floor.row_traces(),
+        with_floor.row_traces(),
+        "δ floor must not be baked into the criterion-facing metric traces"
     );
 }
 
