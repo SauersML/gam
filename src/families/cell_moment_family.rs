@@ -704,7 +704,7 @@ mod tests {
         // below), so the forest must subdivide before any leaf certifies.
         let score_breaks = [-0.4_f64, 0.9];
         let link_breaks = [-0.2_f64, 1.1, 1.4];
-        let n = 4096;
+        let n = 16384;
         let mut a = Vec::with_capacity(n);
         let mut b = Vec::with_capacity(n);
         let phi = 0.618_033_988_749_894_9_f64;
