@@ -2329,6 +2329,7 @@ impl<'a> RemlState<'a> {
         penalty_roots: &[Array2<f64>],
         ridge_passport: RidgePassport,
         penalty_subspace: Option<&PenaltySubspace>,
+        bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<(usize, super::unified::PenaltyLogdetDerivs), EstimationError> {
         let logdet_s_start = std::time::Instant::now();
@@ -2360,7 +2361,7 @@ impl<'a> RemlState<'a> {
             && self.canonical_penalties.len() == rho.len()
         {
             let (value, rank, det1, det2) =
-                self.structural_penalty_logdet_value_and_derivatives_block_local(&lambdas, ridge)?;
+                self.structural_penalty_logdet_value_and_derivatives_block_local(&lambdas, bundle)?;
             (rank, value, det1, det2)
         } else if !penalty_roots.is_empty() {
             let (value, rank, det1, det2) = self.structural_penalty_logdet_value_and_derivatives(
@@ -7094,6 +7095,7 @@ impl<'a> RemlState<'a> {
             })),
             firth_dense_operator: None,
             firth_dense_operator_original,
+            penalty_pseudologdet: std::sync::OnceLock::new(),
         })
     }
 
@@ -9369,6 +9371,7 @@ impl<'a> RemlState<'a> {
             &[],
             ridge_passport,
             penalty_subspace.as_ref(),
+            bundle,
             mode,
         )?;
 
@@ -9476,10 +9479,8 @@ impl<'a> RemlState<'a> {
         let nullspace_dim = p_dim.saturating_sub(sparse.penalty_rank) as f64;
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
             let lambdas = rho.mapv(f64::exp);
-            let (_, det2) = self.structural_penalty_logdet_derivatives_block_local(
-                &lambdas,
-                bundle.ridge_passport.penalty_logdet_ridge(),
-            )?;
+            let (_, det2) =
+                self.structural_penalty_logdet_derivatives_block_local(&lambdas, bundle)?;
             Some(det2)
         } else {
             None
@@ -9709,6 +9710,7 @@ impl<'a> RemlState<'a> {
             &[],
             ridge_passport,
             penalty_subspace.as_ref(),
+            bundle,
             mode,
         )?;
 

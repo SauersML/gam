@@ -1917,13 +1917,15 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
-        let pld = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
+        // ld_s_j components read the SAME penalty pseudo-logdet factorization
+        // the ρ-side criterion value/derivatives are projections of (#931):
+        // one eigendecomposition per evaluation point, one ridge/threshold
+        // convention for `log|Sλ|₊` across ρ and τ alike.
+        let pld = bundle.penalty_pseudologdet_original(
             &self.canonical_penalties,
             &rho.mapv(f64::exp).to_vec(),
-            bundle.ridge_passport.penalty_logdet_ridge(),
             p_dim,
-        )
-        .map_err(EstimationError::InvalidInput)?;
+        )?;
 
         let mut coords = Vec::with_capacity(psi_dim);
         for dir in hyper_dirs {
@@ -2132,14 +2134,16 @@ impl<'a> RemlState<'a> {
                 |i, j| Self::get_pairwisesecond_penalty_components(hyper_dirs, i, j),
             )?;
 
-        // Use block-factored penalty logdet when penalties are disjoint.
-        let pld = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
+        // Pair-callback ld_s blocks contract the SAME penalty pseudo-logdet
+        // factorization as the criterion value/ρ-derivatives and the τ
+        // gradient components (#931): one eigendecomposition per evaluation
+        // point, so τ×τ and ρ×τ Hessian entries cannot drift from the value
+        // they differentiate.
+        let pld = bundle.penalty_pseudologdet_original(
             &self.canonical_penalties,
             lambdas.as_slice().unwrap_or(&[]),
-            bundle.ridge_passport.penalty_logdet_ridge(),
             p_dim,
-        )
-        .map_err(EstimationError::InvalidInput)?;
+        )?;
 
         let x_design = std::sync::Arc::new(self.x().clone());
 
@@ -2155,7 +2159,6 @@ impl<'a> RemlState<'a> {
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
         let s_tau_tau = std::sync::Arc::new(s_tau_tau);
-        let pld = std::sync::Arc::new(pld);
         let s_k_unscaled =
             std::sync::Arc::new(Self::canonical_penalty_matrices(&self.canonical_penalties));
         let beta_eval = std::sync::Arc::new(beta_eval);
@@ -2353,6 +2356,13 @@ impl<'a> RemlState<'a> {
         // Canonical penalty pseudo-logdeterminant: eigendecomposes S once and
         // provides tau_hessian_component / rho_tau_hessian_component methods
         // for all derivative queries on log|S|₊.
+        //
+        // NOT the shared `EvalShared::penalty_pseudologdet_original` cell
+        // (#931): this path factorizes the canonical-TRANSFORMED — and, under
+        // active constraints, free-basis-projected — penalties, so the τ
+        // direction matrices it is contracted against live in that frame. A
+        // genuinely different matrix is a different atom, not a duplicate of
+        // the original-frame factorization.
         let ct_eval: Vec<crate::construction::CanonicalPenalty> =
             if let Some(z) = free_basis_opt.as_ref() {
                 reparam_result
