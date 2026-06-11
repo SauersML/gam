@@ -3,7 +3,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-use gam::gpu::sae_resident::{DeviceResidentArrowError, qwen_non_gating_fixture};
+use gam::gpu::sae_resident::{
+    DeviceResidentArrowError, DeviceResidentInnerOptions, qwen_non_gating_fixture,
+    qwen_non_gating_fixture_seeded, run_resident_fits_multiplexed, run_resident_fits_sequential,
+};
 use gam::solver::arrow_schur::ArrowSolveOptions;
 use gam::solver::estimate::EstimationError;
 use gam::solver::outer_strategy::{
@@ -366,6 +369,144 @@ fn run_device_inner_iter(shape: &Shape) -> Result<(), String> {
     Ok(())
 }
 
+fn run_device_fit(shape: &Shape) -> Result<(), String> {
+    let build_start = Instant::now();
+    let workspace = qwen_non_gating_fixture().map_err(|err| err.to_string())?;
+    let build_ms = ms(build_start);
+    let opts = DeviceResidentInnerOptions::default();
+
+    let cpu_start = Instant::now();
+    let cpu = workspace
+        .cpu_reference_fit(&opts)
+        .map_err(|err| format!("device_fit CPU reference failed: {err}"))?;
+    let cpu_ms = ms(cpu_start);
+
+    let device_start = Instant::now();
+    let device = match workspace.device_fit(&opts) {
+        Ok(outcome) => outcome,
+        Err(DeviceResidentArrowError::Unavailable { reason }) => {
+            print_stage(
+                shape,
+                "device_fit",
+                ms(device_start),
+                &format!(
+                    "status=skipped reason=\"{}\" build_ms={build_ms:.3} cpu_ms={cpu_ms:.3} cpu_iters={} cpu_converged={}",
+                    reason.replace('"', "'"),
+                    cpu.iterations,
+                    cpu.converged
+                ),
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(format!("device_fit device solve failed: {err}")),
+    };
+    let device_ms = ms(device_start);
+
+    let t_err = max_abs_diff(
+        cpu.t.as_slice().ok_or("CPU t not contiguous")?,
+        device.t.as_slice().ok_or("device t not contiguous")?,
+    );
+    let beta_err = max_abs_diff(
+        cpu.beta.as_slice().ok_or("CPU beta not contiguous")?,
+        device.beta.as_slice().ok_or("device beta not contiguous")?,
+    );
+    let obj_err = (cpu.objective - device.objective).abs();
+    let max_err = t_err.max(beta_err).max(obj_err);
+    print_stage(
+        shape,
+        "device_fit",
+        device_ms,
+        &format!(
+            "status=ok build_ms={build_ms:.3} cpu_ms={cpu_ms:.3} speedup={:.3} max_abs_err={max_err:.3e} iters={} accepted={} converged={} objective={:.6e} grad_norm={:.6e} used_device={}",
+            cpu_ms / device_ms.max(f64::MIN_POSITIVE),
+            device.iterations,
+            device.accepted_iterations,
+            device.converged,
+            device.objective,
+            device.gradient_norm,
+            device.used_device
+        ),
+    );
+    if max_err > DEVICE_PARITY_TOL {
+        return Err(format!(
+            "device_fit parity failed: max_abs_err={max_err:e} > {DEVICE_PARITY_TOL:e}"
+        ));
+    }
+
+    // Phase 4: stream-multiplexed independent fits == sequential, bit-identical.
+    let fit_count = 8usize;
+    let mut workspaces = Vec::with_capacity(fit_count);
+    let mut seq_workspaces = Vec::with_capacity(fit_count);
+    for idx in 0..fit_count {
+        let seed = 0x1017_0004_0000_0001u64.wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9));
+        workspaces.push(qwen_non_gating_fixture_seeded(seed).map_err(|err| err.to_string())?);
+        seq_workspaces.push(qwen_non_gating_fixture_seeded(seed).map_err(|err| err.to_string())?);
+    }
+
+    let seq_start = Instant::now();
+    let sequential = run_resident_fits_sequential(&seq_workspaces, &opts);
+    let seq_ms = ms(seq_start);
+    if let Some(Err(DeviceResidentArrowError::Unavailable { reason })) = sequential.first() {
+        print_stage(
+            shape,
+            "device_multiplex",
+            0.0,
+            &format!(
+                "status=skipped reason=\"{}\" fits={fit_count}",
+                reason.replace('"', "'")
+            ),
+        );
+        return Ok(());
+    }
+
+    let mux_start = Instant::now();
+    let multiplexed = run_resident_fits_multiplexed(workspaces, opts)?;
+    let mux_ms = ms(mux_start);
+
+    let mut mux_max_err = 0.0_f64;
+    for (seq, mux) in sequential.iter().zip(multiplexed.iter()) {
+        let seq_fit = seq
+            .as_ref()
+            .map_err(|err| format!("sequential fit failed: {err}"))?;
+        let mux_fit = mux
+            .as_ref()
+            .map_err(|err| format!("multiplexed fit failed: {err}"))?;
+        let te = max_abs_diff(
+            seq_fit.outcome.t.as_slice().ok_or("seq t not contiguous")?,
+            mux_fit.outcome.t.as_slice().ok_or("mux t not contiguous")?,
+        );
+        let be = max_abs_diff(
+            seq_fit
+                .outcome
+                .beta
+                .as_slice()
+                .ok_or("seq beta not contiguous")?,
+            mux_fit
+                .outcome
+                .beta
+                .as_slice()
+                .ok_or("mux beta not contiguous")?,
+        );
+        let oe = (seq_fit.outcome.objective - mux_fit.outcome.objective).abs();
+        mux_max_err = mux_max_err.max(te.max(be).max(oe));
+    }
+    print_stage(
+        shape,
+        "device_multiplex",
+        mux_ms,
+        &format!(
+            "status=ok fits={fit_count} seq_ms={seq_ms:.3} mux_ms={mux_ms:.3} speedup={:.3} mux_vs_seq_max_abs_err={mux_max_err:.3e}",
+            seq_ms / mux_ms.max(f64::MIN_POSITIVE)
+        ),
+    );
+    if mux_max_err != 0.0 {
+        return Err(format!(
+            "device_multiplex non-identical to sequential: max_abs_err={mux_max_err:e} (independent fits must be bit-identical)"
+        ));
+    }
+    Ok(())
+}
+
 fn run(shape: Shape) -> Result<(), String> {
     let total_start = Instant::now();
     let fixture = build_fixture(shape)?;
@@ -406,6 +547,7 @@ fn run(shape: Shape) -> Result<(), String> {
 
     if fixture.shape.name == "qwen" {
         run_device_inner_iter(&fixture.shape)?;
+        run_device_fit(&fixture.shape)?;
     }
 
     let mut term_for_criterion = fixture.term.clone();
