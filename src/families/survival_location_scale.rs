@@ -1717,9 +1717,10 @@ impl SurvivalExactRowKernel {
 }
 
 struct SurvivalJointQuantities {
-    /// Per-row log-likelihood `ell_i` (NOT negated) for the test-only
-    /// `RowKernel` equivalence adapter.
-    #[cfg(test)]
+    /// Per-row log-likelihood `ell_i` (NOT negated). Rows excluded by the
+    /// degeneracy guard (`row_derivatives_rescaled` returns `None`) keep `0.0`,
+    /// matching their zero derivative slots. The RowKernel adapter uses this
+    /// to expose `nll_i = -ell_i` without recomputing row survival values.
     ll: Array1<f64>,
     d1_q: Array1<f64>,
     d2_q: Array1<f64>,
@@ -1848,7 +1849,6 @@ fn split_survival_psi_design(
 /// `assemble_joint_hessian_from_quantities` term-for-term (verified by the
 /// equivalence test). Indices `i ∈ {u0,u1,g}` are functionally independent so
 /// the index-space derivative tensors are diagonal in `i`.
-#[cfg(test)]
 const SLS_ROW_K: usize = 9;
 
 /// `RowKernel<9>` adapter for the survival location-scale joint likelihood
@@ -1857,7 +1857,6 @@ const SLS_ROW_K: usize = 9;
 /// [`SurvivalLocationScaleFamily::build_dynamic_geometry`]; every trait method
 /// is a pure repackaging of those scalars into linear-predictor primary space,
 /// so the math is identical to the bespoke assembly by construction.
-#[cfg(test)]
 struct SurvivalLsRowKernel<'a> {
     family: &'a SurvivalLocationScaleFamily,
     q: &'a SurvivalJointQuantities,
@@ -1869,7 +1868,6 @@ struct SurvivalLsRowKernel<'a> {
 /// Per-index `(D, D2, D3)` map-derivative tensors for one row, plus the
 /// index-space log-likelihood derivatives. `D[i][a] = ∂(index i)/∂(channel a)`,
 /// `D2[i][a][b] = ∂²(index i)/∂a∂b`, `D3[i][a][b][c] = ∂³(index i)/∂a∂b∂c`.
-#[cfg(test)]
 struct SlsRowMaps {
     /// ell_i  = (ell_u0, ell_u1, ell_g)
     l1: [f64; 3],
@@ -1882,12 +1880,14 @@ struct SlsRowMaps {
     d3: [[[[f64; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K]; 3],
 }
 
-#[cfg(test)]
 impl SurvivalLsRowKernel<'_> {
     /// Resolve the design for a threshold/log-sigma channel, falling back to the
     /// exit design when the entry/derivative variant is absent (time-invariant).
     #[inline]
-    fn entry_design<'b>(opt: &'b Option<DesignMatrix>, fallback: &'b DesignMatrix) -> &'b DesignMatrix {
+    fn entry_design<'b>(
+        opt: &'b Option<DesignMatrix>,
+        fallback: &'b DesignMatrix,
+    ) -> &'b DesignMatrix {
         opt.as_ref().unwrap_or(fallback)
     }
 
@@ -1936,13 +1936,21 @@ impl SurvivalLsRowKernel<'_> {
             .d2q_tls_entry
             .as_ref()
             .map_or(q.d2q_tls[row], |a| a[row]);
-        let d2q_ls_en = self.q.d2q_ls_entry.as_ref().map_or(q.d2q_ls[row], |a| a[row]);
+        let d2q_ls_en = self
+            .q
+            .d2q_ls_entry
+            .as_ref()
+            .map_or(q.d2q_ls[row], |a| a[row]);
         let d3q_tls_ls_en = self
             .q
             .d3q_tls_ls_entry
             .as_ref()
             .map_or(q.d3q_tls_ls[row], |a| a[row]);
-        let d3q_ls_en = self.q.d3q_ls_entry.as_ref().map_or(q.d3q_ls[row], |a| a[row]);
+        let d3q_ls_en = self
+            .q
+            .d3q_ls_entry
+            .as_ref()
+            .map_or(q.d3q_ls[row], |a| a[row]);
 
         // Index 0: u0 = h0 + q0(eta_t_entry=ch4, eta_ls_entry=ch7).
         m.d[0][0] = 1.0;
@@ -1986,17 +1994,14 @@ impl SurvivalLsRowKernel<'_> {
     /// Per-row dense design row for each channel within its coefficient block:
     /// returns `(block_index, row_vector)` for channels `0..9`. Used by the
     /// pullback / diagonal assembly. Channels with an absent derivative design
-    /// (time-invariant) get an empty contribution flagged by `block = usize::MAX`.
-    fn channel_block(&self, ch: usize) -> usize {
+    /// (time-invariant derivative channels) return `None` and contribute
+    /// nothing.
+    fn channel_block(&self, ch: usize) -> Option<usize> {
         match ch {
-            0 | 1 | 2 => Self::THRESHOLD_BLOCK_TIME,
-            3 | 4 | 5 => Self::THRESHOLD_BLOCK_THR,
-            6 | 7 | 8 => Self::THRESHOLD_BLOCK_LS,
-            _ => {
-                // SAFETY: RowKernel callers enumerate channels from `0..SLS_ROW_K`;
-                // reaching this arm means an internal caller violated that contract.
-                panic!("survival LS row kernel channel {ch} out of range (has {SLS_ROW_K})")
-            }
+            0 | 1 | 2 => Some(Self::THRESHOLD_BLOCK_TIME),
+            3 | 4 | 5 => Some(Self::THRESHOLD_BLOCK_THR),
+            6 | 7 | 8 => Some(Self::THRESHOLD_BLOCK_LS),
+            _ => None,
         }
     }
     const THRESHOLD_BLOCK_TIME: usize = 0;
@@ -2017,18 +2022,20 @@ impl SurvivalLsRowKernel<'_> {
                 Self::entry_design(&fam.x_threshold_entry, &fam.x_threshold),
                 row,
             )),
-            5 => fam.x_threshold_deriv.as_ref().map(|d| design_dense_row(d, row)),
+            5 => fam
+                .x_threshold_deriv
+                .as_ref()
+                .map(|d| design_dense_row(d, row)),
             6 => Some(design_dense_row(&fam.x_log_sigma, row)),
             7 => Some(design_dense_row(
                 Self::entry_design(&fam.x_log_sigma_entry, &fam.x_log_sigma),
                 row,
             )),
-            8 => fam.x_log_sigma_deriv.as_ref().map(|d| design_dense_row(d, row)),
-            _ => {
-                // SAFETY: RowKernel callers enumerate channels from `0..SLS_ROW_K`;
-                // reaching this arm means an internal caller violated that contract.
-                panic!("survival LS row kernel channel {ch} out of range (has {SLS_ROW_K})")
-            }
+            8 => fam
+                .x_log_sigma_deriv
+                .as_ref()
+                .map(|d| design_dense_row(d, row)),
+            _ => None,
         }
     }
 }
@@ -2036,7 +2043,6 @@ impl SurvivalLsRowKernel<'_> {
 /// Materialize `X[row, :]` as a dense length-`ncols` vector (no sparse-aware
 /// fast path — used only by the dense-Hessian / diagonal assembly, never the
 /// hot matvec inner loop).
-#[cfg(test)]
 fn design_dense_row(d: &DesignMatrix, row: usize) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(d.ncols());
     d.axpy_row_into(row, 1.0, &mut out.view_mut())
@@ -2048,7 +2054,6 @@ fn design_dense_row(d: &DesignMatrix, row: usize) -> Array1<f64> {
 /// time Jacobian (the survival time block is materialized densely as
 /// `time_jac_*`, so it has no sparse axpy primitive).
 #[inline]
-#[cfg(test)]
 fn axpy_dense_row_into(jac: &Array2<f64>, row: usize, alpha: f64, out: &mut [f64]) {
     if alpha == 0.0 {
         return;
@@ -2059,7 +2064,30 @@ fn axpy_dense_row_into(jac: &Array2<f64>, row: usize, alpha: f64, out: &mut [f64
     }
 }
 
-#[cfg(test)]
+fn row_set_from_survival_mask(
+    row_mask: Option<&Array1<f64>>,
+    n: usize,
+) -> crate::families::row_kernel::RowSet {
+    let Some(mask) = row_mask else {
+        return crate::families::row_kernel::RowSet::All;
+    };
+    let rows = mask
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &weight)| {
+            (weight != 0.0).then_some(crate::families::marginal_slope_shared::WeightedOuterRow {
+                index,
+                weight,
+                stratum: 0,
+            })
+        })
+        .collect::<Vec<_>>();
+    crate::families::row_kernel::RowSet::Subsample {
+        rows: Arc::new(rows),
+        n_full: n,
+    }
+}
+
 impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     fn n_rows(&self) -> usize {
         self.family.n
@@ -2178,7 +2206,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         // Materialize each channel's dense block row once, then accumulate
         // h[a][b]·(row_a ⊗ row_b) into the (block_a, block_b) sub-block.
         let rows: Vec<Option<(usize, Array1<f64>)>> = (0..SLS_ROW_K)
-            .map(|ch| self.channel_row(ch, row).map(|r| (self.channel_block(ch), r)))
+            .map(|ch| self.channel_block(ch).zip(self.channel_row(ch, row)))
             .collect();
         for a in 0..SLS_ROW_K {
             let Some((ba, ra)) = rows[a].as_ref() else {
@@ -2217,7 +2245,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         // diag[c] += Σ_{a,b ∈ block(c)} h[a][b]·row_a[c]·row_b[c]. Only
         // same-block channel pairs touch a given coefficient's diagonal slot.
         let rows: Vec<Option<(usize, Array1<f64>)>> = (0..SLS_ROW_K)
-            .map(|ch| self.channel_row(ch, row).map(|r| (self.channel_block(ch), r)))
+            .map(|ch| self.channel_block(ch).zip(self.channel_row(ch, row)))
             .collect();
         for a in 0..SLS_ROW_K {
             let Some((ba, ra)) = rows[a].as_ref() else {
@@ -2329,6 +2357,43 @@ impl SurvivalLocationScaleFamily {
     const BLOCK_LOG_SIGMA: usize = 2;
     const BLOCK_LINK_WIGGLE: usize = 3;
     const EVALUATE_PARALLEL_ROW_THRESHOLD: usize = 1024;
+
+    /// The `RowKernel<K>` engine assumes a fixed linear coefficient-to-primary
+    /// Jacobian for the row. Survival LS satisfies that after choosing the nine
+    /// linear predictors as primary channels, but link-wiggle does not: its
+    /// basis rows are evaluated at q(eta_threshold, eta_log_sigma), so the row
+    /// design itself changes with beta and contributes dJ/dβ terms outside the
+    /// current trait contract.
+    #[inline]
+    fn row_kernel_joint_hessian_supported(&self) -> bool {
+        self.x_link_wiggle.is_none()
+    }
+
+    /// First directional derivatives additionally need third derivatives of
+    /// qdot with respect to time-varying threshold/log-sigma channels. The
+    /// existing directional assembler carries those contractions inline, but
+    /// `SurvivalJointQuantities` currently stores qdot map terms only through
+    /// second order; route the static non-wiggle case through `RowKernel` and
+    /// leave the time-varying qdot tensor path on that complete implementation.
+    #[inline]
+    fn row_kernel_directional_supported(&self) -> bool {
+        self.x_link_wiggle.is_none()
+            && self.x_threshold_deriv.is_none()
+            && self.x_log_sigma_deriv.is_none()
+    }
+
+    fn survival_ls_row_kernel<'a>(
+        &'a self,
+        q: &'a SurvivalJointQuantities,
+        dynamic: &'a SurvivalDynamicGeometry,
+    ) -> SurvivalLsRowKernel<'a> {
+        SurvivalLsRowKernel {
+            family: self,
+            q,
+            dynamic,
+            offsets: self.joint_block_offsets(),
+        }
+    }
 
     #[inline]
     fn time_wiggle_range(&self) -> std::ops::Range<usize> {
@@ -2722,7 +2787,6 @@ impl SurvivalLocationScaleFamily {
     ) -> Result<SurvivalJointQuantities, String> {
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
-        #[cfg(test)]
         let mut ll = Array1::<f64>::zeros(n);
         let mut d1_q = Array1::<f64>::zeros(n);
         let mut d2_q = Array1::<f64>::zeros(n);
@@ -2774,7 +2838,6 @@ impl SurvivalLocationScaleFamily {
             }
         }
 
-        #[cfg(test)]
         let p_ll = SendPtr(ll.as_mut_ptr());
         let p_d1_q = SendPtr(d1_q.as_mut_ptr());
         let p_d2_q = SendPtr(d2_q.as_mut_ptr());
@@ -2813,7 +2876,6 @@ impl SurvivalLocationScaleFamily {
                 // exactly once; pointers target distinct length-`n` `Array1`
                 // buffers not read until the parallel loop completes.
                 unsafe {
-                    #[cfg(test)]
                     p_ll.write(i, row.ll);
                     p_d1_q.write(i, row.d1_q);
                     p_d2_q.write(i, row.d2_q);
@@ -2837,7 +2899,6 @@ impl SurvivalLocationScaleFamily {
             })?;
 
         Ok(SurvivalJointQuantities {
-            #[cfg(test)]
             ll,
             d1_q,
             d2_q,
@@ -9598,6 +9659,16 @@ impl SurvivalLocationScaleFamily {
                 .map(|h| (h, 0.0)));
         }
         let q = self.collect_joint_quantities_rescaled(block_states, log_scale)?;
+        if self.row_kernel_joint_hessian_supported() {
+            let dynamic = self.build_dynamic_geometry(block_states)?;
+            let kernel = self.survival_ls_row_kernel(&q, &dynamic);
+            let rows = crate::families::row_kernel::RowSet::All;
+            let cache = crate::families::row_kernel::build_row_kernel_cache(&kernel, &rows)?;
+            return Ok(Some((
+                crate::families::row_kernel::row_kernel_hessian_dense(&kernel, &cache, &rows),
+                log_scale,
+            )));
+        }
         Ok(self
             .assemble_joint_hessian_from_quantities(&q, block_states)?
             .map(|h| (h, log_scale)))
@@ -9664,6 +9735,19 @@ impl SurvivalLocationScaleFamily {
                 ),
             }
             .into());
+        }
+
+        if self.row_kernel_directional_supported() {
+            let kernel = self.survival_ls_row_kernel(q, dynamic);
+            let rows = row_set_from_survival_mask(row_mask, self.n);
+            return crate::families::row_kernel::row_kernel_directional_derivative(
+                &kernel,
+                &rows,
+                d_beta_flat
+                    .as_slice()
+                    .ok_or_else(|| "joint d_beta must be contiguous".to_string())?,
+            )
+            .map(Some);
         }
 
         let time_dir = d_beta_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
@@ -10604,6 +10688,15 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         let q = self.collect_joint_quantities(block_states)?;
+        if self.row_kernel_joint_hessian_supported() {
+            let dynamic = self.build_dynamic_geometry(block_states)?;
+            let kernel = self.survival_ls_row_kernel(&q, &dynamic);
+            let rows = crate::families::row_kernel::RowSet::All;
+            let cache = crate::families::row_kernel::build_row_kernel_cache(&kernel, &rows)?;
+            return Ok(Some(crate::families::row_kernel::row_kernel_hessian_dense(
+                &kernel, &cache, &rows,
+            )));
+        }
         self.assemble_joint_hessian_from_quantities(&q, block_states)
     }
 
@@ -10926,6 +11019,14 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         self.validate_joint_specs(specs, "SurvivalLocationScaleFamily joint Hessian workspace")?;
+        // #921 remaining boundary: do not replace this wrapper with
+        // `RowKernelHessianWorkspace` wholesale until the RowKernel adapter
+        // stores the fourth index derivatives and the time-varying qdot
+        // third-order map tensor. The wrapper routes supported non-wiggle
+        // dense Hessian / first directional derivative calls through the
+        // generic engine, while unsupported wiggle and time-varying-qdot
+        // cases stay on the legacy algebra instead of pretending the generic
+        // fourth-order hook is complete.
         Ok(Some(Arc::new(
             SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
                 self.clone(),
@@ -10944,6 +11045,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             specs,
             "SurvivalLocationScaleFamily joint Hessian workspace with options",
         )?;
+        // See the non-options workspace constructor above. The same boundary
+        // applies here; the HT row mask is threaded into the supported
+        // RowKernel first-derivative path by `row_set_from_survival_mask`.
         let mut workspace = SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -13292,25 +13396,13 @@ mod tests {
         }
     }
 
-    /// #921: the `RowKernel<9>` repackaging must reproduce the bespoke joint
-    /// assembly bit-for-bit. We build a non-time-varying, non-wiggle fixture
-    /// (the config the kernel covers), then assert the generic row-kernel engine
-    /// (`build_row_kernel_cache` → `row_kernel_hessian_dense` /
-    /// `row_kernel_log_likelihood`) matches `exact_newton_joint_hessian` and the
-    /// bespoke per-row log-likelihood.
-    #[test]
-    fn survival_ls_row_kernel_matches_bespoke_assembly() {
-        use crate::families::row_kernel::{
-            build_row_kernel_cache, row_kernel_gradient, row_kernel_hessian_dense,
-            row_kernel_log_likelihood, RowSet,
-        };
-
-        let family = survival_exact_newton_test_family();
+    fn survival_exact_newton_test_states(
+        family: &SurvivalLocationScaleFamily,
+        beta_t: f64,
+        beta_thr: f64,
+        beta_ls: f64,
+    ) -> Vec<ParameterBlockState> {
         let n = family.n;
-        let beta_t = 0.3_f64;
-        let beta_thr = -0.4_f64;
-        let beta_ls = 0.2_f64;
-        // Time eta is stacked [exit; entry; deriv], each length n.
         let mut eta_time = Array1::<f64>::zeros(3 * n);
         for i in 0..n {
             eta_time[i] = family.x_time_exit[[i, 0]] * beta_t;
@@ -13321,7 +13413,7 @@ mod tests {
             Array1::from_iter((0..n).map(|i| family.x_threshold.dot_row(i, &array![beta_thr])));
         let eta_ls =
             Array1::from_iter((0..n).map(|i| family.x_log_sigma.dot_row(i, &array![beta_ls])));
-        let states = vec![
+        vec![
             ParameterBlockState {
                 beta: array![beta_t],
                 eta: eta_time,
@@ -13334,7 +13426,31 @@ mod tests {
                 beta: array![beta_ls],
                 eta: eta_ls,
             },
-        ];
+        ]
+    }
+
+    /// #921: the `RowKernel<9>` repackaging must reproduce the bespoke joint
+    /// assembly bit-for-bit. We build a non-time-varying, non-wiggle fixture
+    /// (the config the kernel covers), then assert the generic row-kernel engine
+    /// (`build_row_kernel_cache` → `row_kernel_hessian_dense` /
+    /// `row_kernel_log_likelihood`) matches the legacy assembly oracle and the
+    /// bespoke per-row log-likelihood. The public `exact_newton_joint_hessian`
+    /// method now delegates to this RowKernel path for the covered non-wiggle
+    /// shape, so the test calls `assemble_joint_hessian_from_quantities`
+    /// directly to keep an independent oracle.
+    #[test]
+    fn survival_ls_row_kernel_matches_bespoke_assembly() {
+        use crate::families::row_kernel::{
+            RowSet, build_row_kernel_cache, row_kernel_directional_derivative, row_kernel_gradient,
+            row_kernel_hessian_dense, row_kernel_log_likelihood,
+        };
+
+        let family = survival_exact_newton_test_family();
+        let n = family.n;
+        let beta_t = 0.3_f64;
+        let beta_thr = -0.4_f64;
+        let beta_ls = 0.2_f64;
+        let states = survival_exact_newton_test_states(&family, beta_t, beta_thr, beta_ls);
 
         let q = family
             .collect_joint_quantities(&states)
@@ -13352,9 +13468,9 @@ mod tests {
         let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("row kernel cache");
         let h_new = row_kernel_hessian_dense(&kernel, &cache, &RowSet::All);
         let h_old = family
-            .exact_newton_joint_hessian(&states)
-            .expect("bespoke joint hessian")
-            .expect("joint hessian present");
+            .assemble_joint_hessian_from_quantities(&q, &states)
+            .expect("joint Hessian oracle")
+            .expect("joint Hessian oracle present");
         assert_eq!(h_new.dim(), h_old.dim(), "joint hessian shape");
         for ((a, b), &old) in h_old.indexed_iter() {
             let new = h_new[[a, b]];
@@ -13389,6 +13505,47 @@ mod tests {
         // Gradient assembles at the right coefficient dimension.
         let g_new = row_kernel_gradient(&kernel, &cache, &RowSet::All);
         assert_eq!(g_new.len(), *kernel.offsets.last().unwrap());
+
+        let direction = array![0.17, -0.11, 0.07];
+        let d_new = row_kernel_directional_derivative(
+            &kernel,
+            &RowSet::All,
+            direction
+                .as_slice()
+                .expect("literal direction is contiguous"),
+        )
+        .expect("row-kernel directional derivative");
+        let eps = 1e-5;
+        let plus = survival_exact_newton_test_states(
+            &family,
+            beta_t + eps * direction[0],
+            beta_thr + eps * direction[1],
+            beta_ls + eps * direction[2],
+        );
+        let minus = survival_exact_newton_test_states(
+            &family,
+            beta_t - eps * direction[0],
+            beta_thr - eps * direction[1],
+            beta_ls - eps * direction[2],
+        );
+        let q_plus = family.collect_joint_quantities(&plus).expect("plus q");
+        let q_minus = family.collect_joint_quantities(&minus).expect("minus q");
+        let h_plus = family
+            .assemble_joint_hessian_from_quantities(&q_plus, &plus)
+            .expect("plus Hessian oracle")
+            .expect("plus Hessian present");
+        let h_minus = family
+            .assemble_joint_hessian_from_quantities(&q_minus, &minus)
+            .expect("minus Hessian oracle")
+            .expect("minus Hessian present");
+        let d_fd = (&h_plus - &h_minus) / (2.0 * eps);
+        for ((a, b), &fd) in d_fd.indexed_iter() {
+            let new = d_new[[a, b]];
+            assert!(
+                (new - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+                "directional Hessian [{a}][{b}] mismatch: new={new}, fd={fd}"
+            );
+        }
     }
 
     #[test]
@@ -13855,15 +14012,15 @@ mod tests {
         );
     }
 
-    fn survival_exact_newton_test_states(beta_t: f64) -> Vec<ParameterBlockState> {
+    fn survival_exact_newton_threshold_states(beta_threshold: f64) -> Vec<ParameterBlockState> {
         vec![
             ParameterBlockState {
                 beta: array![0.2],
                 eta: array![0.1, 0.35, -0.2, 0.25, 0.6, 0.15, 0.5, 0.7, 0.6],
             },
             ParameterBlockState {
-                beta: array![beta_t],
-                eta: array![beta_t, 0.4 * beta_t, -0.6 * beta_t],
+                beta: array![beta_threshold],
+                eta: array![beta_threshold, 0.4 * beta_threshold, -0.6 * beta_threshold],
             },
             ParameterBlockState {
                 beta: array![-0.15],
@@ -15340,7 +15497,7 @@ mod tests {
     fn threshold_exact_newton_hessian_matches_negative_gradient_jacobian() {
         let family = survival_exact_newton_test_family();
         let beta_t = 0.35;
-        let states = survival_exact_newton_test_states(beta_t);
+        let states = survival_exact_newton_threshold_states(beta_t);
         let eval = family.evaluate(&states).expect("evaluate at center");
         let BlockWorkingSet::ExactNewton { gradient, hessian } =
             &eval.blockworking_sets[SurvivalLocationScaleFamily::BLOCK_THRESHOLD]
@@ -15351,10 +15508,10 @@ mod tests {
 
         let eps = 1e-6;
         let eval_plus = family
-            .evaluate(&survival_exact_newton_test_states(beta_t + eps))
+            .evaluate(&survival_exact_newton_threshold_states(beta_t + eps))
             .expect("evaluate at beta + eps");
         let eval_minus = family
-            .evaluate(&survival_exact_newton_test_states(beta_t - eps))
+            .evaluate(&survival_exact_newton_threshold_states(beta_t - eps))
             .expect("evaluate at beta - eps");
         let grad_plus =
             match &eval_plus.blockworking_sets[SurvivalLocationScaleFamily::BLOCK_THRESHOLD] {
@@ -16025,7 +16182,7 @@ mod tests {
     fn sparse_exact_newton_matches_denseworking_sets() {
         let dense_family = survival_exact_newton_test_family();
         let sparse_family = sparse_survival_exact_newton_test_family();
-        let states = survival_exact_newton_test_states(0.35);
+        let states = survival_exact_newton_threshold_states(0.35);
 
         let dense_eval = dense_family.evaluate(&states).expect("dense evaluate");
         let sparse_eval = sparse_family.evaluate(&states).expect("sparse evaluate");
