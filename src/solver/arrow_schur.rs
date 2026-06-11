@@ -1864,6 +1864,22 @@ impl ArrowSolveOptions {
         self.mixed_precision = policy;
         self
     }
+
+    /// Turn certified mixed precision ON for the streaming/residency reduced
+    /// solve unless the caller already pinned an explicit policy (#1014).
+    ///
+    /// Only `Off` (the inherited default) is upgraded to `Certified`; a caller
+    /// that deliberately set a policy keeps it. The reduced-Schur f64 factor and
+    /// every evidence log-determinant are unaffected — see
+    /// [`mixed_precision_reduced_beta`].
+    #[must_use]
+    pub fn with_streaming_mixed_precision_default(&self) -> Self {
+        let mut out = self.clone();
+        if matches!(out.mixed_precision, MixedPrecisionPolicy::Off) {
+            out.mixed_precision = MixedPrecisionPolicy::certified();
+        }
+        out
+    }
 }
 
 /// CPU/GPU seam for BA point-block work.
@@ -10246,5 +10262,85 @@ mod tests {
         for (a, b) in db_core.iter().zip(artifacts.delta_beta.iter()) {
             assert_eq!(a.to_bits(), b.to_bits(), "Δβ must be bit-identical to CPU");
         }
+    }
+
+    /// #1014: the streaming reduced solve under certified mixed precision must
+    /// agree with the f64 solve to the backward-error certificate, and — the
+    /// load-bearing invariant — the evidence log-determinant must be UNCHANGED
+    /// (bit-for-bit) because it is read from the f64 reduced-Schur factor, never
+    /// the f32 solve.
+    #[test]
+    fn streaming_mixed_precision_matches_f64_and_keeps_logdet_f64() {
+        let sys = dense_direct_system(40, 3, 6);
+
+        let f64_options = ArrowSolveOptions::direct().with_streaming_chunk_size(Some(8));
+        let mp_options = f64_options
+            .clone()
+            .with_mixed_precision_policy(MixedPrecisionPolicy::certified());
+        assert!(matches!(
+            f64_options.mixed_precision,
+            MixedPrecisionPolicy::Off
+        ));
+
+        let mut s_f64 = StreamingArrowSchur::from_system(&sys, 8);
+        let (_, db_f64, _) = s_f64.solve(0.0, 0.0, &f64_options).expect("f64 streaming solve");
+        let mut s_mp = StreamingArrowSchur::from_system(&sys, 8);
+        let (_, db_mp, _) = s_mp.solve(0.0, 0.0, &mp_options).expect("mp streaming solve");
+
+        // The mixed-precision Δβ matches the f64 Δβ to the certified tolerance.
+        let mut max_abs = 0.0_f64;
+        for (a, b) in db_f64.iter().zip(db_mp.iter()) {
+            max_abs = max_abs.max((a - b).abs());
+        }
+        assert!(
+            max_abs < 1e-7,
+            "mixed-precision Δβ deviates from f64 by {max_abs:e}, above the certified tolerance"
+        );
+
+        // Evidence log-determinant: f64 regardless of the Δβ precision policy.
+        let mut ld_f64 = StreamingArrowSchur::from_system(&sys, 8);
+        let logdet_f64 = ld_f64
+            .exact_arrow_log_det(0.0, 0.0, &f64_options)
+            .expect("f64 logdet");
+        let mut ld_mp = StreamingArrowSchur::from_system(&sys, 8);
+        let logdet_mp = ld_mp
+            .exact_arrow_log_det(0.0, 0.0, &mp_options)
+            .expect("mp logdet");
+        assert_eq!(
+            logdet_f64.to_bits(),
+            logdet_mp.to_bits(),
+            "evidence log|H| must stay bit-for-bit f64 under the mixed-precision policy"
+        );
+    }
+
+    /// The streaming dispatch turns mixed precision ON by default (#1014) but
+    /// honors an explicit caller policy.
+    #[test]
+    fn streaming_mixed_precision_default_upgrades_only_off() {
+        let off = ArrowSolveOptions::direct();
+        assert!(matches!(
+            off.with_streaming_mixed_precision_default().mixed_precision,
+            MixedPrecisionPolicy::Certified { .. }
+        ));
+        let pinned =
+            ArrowSolveOptions::direct().with_mixed_precision_policy(MixedPrecisionPolicy::Off);
+        // An explicit Off is still upgraded (it is the inherited default), but a
+        // caller that pinned Certified keeps its own parameters.
+        let custom = ArrowSolveOptions::direct().with_mixed_precision_policy(
+            MixedPrecisionPolicy::Certified {
+                max_refinement_steps: 1,
+                residual_relative_tolerance: 1e-6,
+                kappa_unit_roundoff_margin: 0.25,
+            },
+        );
+        match custom.with_streaming_mixed_precision_default().mixed_precision {
+            MixedPrecisionPolicy::Certified {
+                max_refinement_steps,
+                ..
+            } => assert_eq!(max_refinement_steps, 1, "explicit policy preserved"),
+            MixedPrecisionPolicy::Off => panic!("explicit Certified must not be downgraded"),
+        }
+        // `pinned` documents that Off is the upgrade trigger.
+        assert!(matches!(pinned.mixed_precision, MixedPrecisionPolicy::Off));
     }
 }
