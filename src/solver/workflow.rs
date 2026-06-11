@@ -5392,6 +5392,19 @@ struct LatentDimSelectionSpec {
 }
 
 #[derive(Clone)]
+struct LatentAuxOutcomeSpec {
+    family: crate::terms::behavioral_head::AuxOutcomeFamily,
+    /// Behavioral labels, length `n`. Binomial: 0/1; Multinomial: class index.
+    y: Array1<f64>,
+    /// Optional per-row head weight (semi-supervised); `None` ⇒ all rows
+    /// labeled with unit weight. `0.0` on a row excludes it from the head
+    /// channel — the missing-label seam.
+    row_weights: Option<Array1<f64>>,
+    /// ARD log-precision seed composed with the head (length `d`).
+    init_log_precision: Option<Array1<f64>>,
+}
+
+#[derive(Clone)]
 struct LatentManifoldSpec {
     manifold: LatentManifold,
     auto: bool,
@@ -5407,6 +5420,7 @@ struct LatentSpec {
     retraction_registry: LatentRetractionRegistry,
     aux_prior: Option<LatentAuxPriorSpec>,
     dim_selection: Option<LatentDimSelectionSpec>,
+    aux_outcome: Option<LatentAuxOutcomeSpec>,
     explicit_none_mode: bool,
 }
 
