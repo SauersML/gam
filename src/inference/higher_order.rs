@@ -245,6 +245,38 @@ pub fn assemble_cumulants(block: &[&[f64]], rows: &[RowLogLikDerivs]) -> Option<
     Some(CumulantArrays { q, info, nu3, nu4 })
 }
 
+/// Bartlett's standardized cumulant invariants of a scalar (`q = 1`) sub-model,
+/// the building blocks of the LR-statistic correction.
+///
+/// From the assembled scalar cumulants this returns the dimensionless
+/// `ρ₃ = ν₃ / i^{3/2}` and `ρ₄ = ν₄ / i²`, the parametrization-equivariant
+/// standardized third/fourth cumulants of the score. The Bartlett factor of the
+/// LR statistic is a fixed rational form in these invariants (the full Lawley
+/// (1956) scalar expansion — it also requires the score↔information joint
+/// cumulant, NOT just `ρ₃²` and `ρ₄`, which is why this function deliberately
+/// exposes the invariants rather than guessing a two-term coefficient). The
+/// acceptance fixture for any candidate coefficient is the unit-rate Exponential
+/// rate test, whose exact LR Bartlett factor is the textbook `c = 1 + 1/n`.
+///
+/// Returns `None` unless the cumulants are scalar with positive, finite
+/// information.
+pub fn scalar_standardized_cumulants(cumulants: &CumulantArrays) -> Option<(f64, f64)> {
+    if cumulants.q != 1 {
+        return None;
+    }
+    let i = cumulants.info(0, 0);
+    if !(i.is_finite() && i > 0.0) {
+        return None;
+    }
+    let rho3 = cumulants.nu3(0, 0, 0) / i.powf(1.5);
+    let rho4 = cumulants.nu4(0, 0, 0, 0) / (i * i);
+    if rho3.is_finite() && rho4.is_finite() {
+        Some((rho3, rho4))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +378,118 @@ mod tests {
         assert!(c_small > 1.0);
         assert!((c_large - 1.0).abs() < 1e-3);
         assert!(c_small > c_large);
+    }
+
+    // ── Cumulant assembly from the towers (#939) ──────────────────────────
+
+    #[test]
+    fn nll_tower_sign_flip_gives_loglik_derivatives() {
+        // Tower carries the NLL; ℓ⁽ᵏ⁾ = −tower⁽ᵏ⁾.
+        let d = row_derivs_from_nll_tower(0.5, -2.0, 0.3, -0.1);
+        assert_eq!(d.d1, -0.5);
+        assert_eq!(d.d2, 2.0);
+        assert_eq!(d.d3, -0.3);
+        assert_eq!(d.d4, 0.1);
+    }
+
+    #[test]
+    fn cumulant_arrays_are_exact_row_sums_and_fully_symmetric() {
+        // Two rows, q = 2 block. Hand-compute the exact arrays.
+        let z0 = [1.0_f64, 2.0];
+        let z1 = [-1.0_f64, 0.5];
+        let block: Vec<&[f64]> = vec![&z0, &z1];
+        let rows = vec![
+            RowLogLikDerivs { d1: 0.0, d2: -1.5, d3: 0.7, d4: -0.2 },
+            RowLogLikDerivs { d1: 0.0, d2: -0.5, d3: 1.1, d4: 0.4 },
+        ];
+        let c = assemble_cumulants(&block, &rows).expect("cumulants");
+        assert_eq!(c.q, 2);
+        // info_{ab} = −Σ d2 z_a z_b. Row0: −(−1.5)·z0⊗z0, Row1: −(−0.5)·z1⊗z1.
+        let info00 = 1.5 * (1.0 * 1.0) + 0.5 * (-1.0 * -1.0);
+        let info01 = 1.5 * (1.0 * 2.0) + 0.5 * (-1.0 * 0.5);
+        assert!((c.info(0, 0) - info00).abs() < 1e-12);
+        assert!((c.info(0, 1) - info01).abs() < 1e-12);
+        // Symmetry of info.
+        assert!((c.info(0, 1) - c.info(1, 0)).abs() < 1e-14);
+        // nu3_{abc} = Σ d3 z_a z_b z_c.
+        let nu3_010 = 0.7 * (1.0 * 2.0 * 1.0) + 1.1 * (-1.0 * 0.5 * -1.0);
+        assert!((c.nu3(0, 1, 0) - nu3_010).abs() < 1e-12);
+        // Full symmetry of nu3 across index permutations.
+        assert!((c.nu3(0, 1, 0) - c.nu3(1, 0, 0)).abs() < 1e-14);
+        assert!((c.nu3(0, 1, 0) - c.nu3(0, 0, 1)).abs() < 1e-14);
+        // nu4_{abcd} = Σ d4 z_a z_b z_c z_d.
+        let nu4_0011 = -0.2 * (1.0 * 1.0 * 2.0 * 2.0) + 0.4 * (-1.0 * -1.0 * 0.5 * 0.5);
+        assert!((c.nu4(0, 0, 1, 1) - nu4_0011).abs() < 1e-12);
+        assert!((c.nu4(0, 0, 1, 1) - c.nu4(1, 1, 0, 0)).abs() < 1e-14);
+    }
+
+    /// CONJUGATE FIXTURE 1 (Gaussian known variance, scalar): ℓ''' = ℓ'''' = 0,
+    /// so the standardized cumulants vanish — `W ~ χ²₁` holds EXACTLY and the
+    /// assembly correctly reports no finite-sample correction signal.
+    #[test]
+    fn gaussian_known_variance_has_zero_standardized_cumulants() {
+        // ℓ_i = −½(y−η)²/φ ⇒ ℓ' = (y−η)/φ, ℓ'' = −1/φ, ℓ''' = 0, ℓ'''' = 0.
+        let phi = 2.0;
+        let n = 50usize;
+        let zcol = [1.0_f64];
+        let block: Vec<&[f64]> = (0..n).map(|_| &zcol[..]).collect();
+        let rows: Vec<RowLogLikDerivs> = (0..n)
+            .map(|_| RowLogLikDerivs { d1: 0.0, d2: -1.0 / phi, d3: 0.0, d4: 0.0 })
+            .collect();
+        let c = assemble_cumulants(&block, &rows).expect("cumulants");
+        let (rho3, rho4) = scalar_standardized_cumulants(&c).expect("standardized");
+        assert!(rho3.abs() < 1e-12, "Gaussian ρ₃ must be 0, got {rho3}");
+        assert!(rho4.abs() < 1e-12, "Gaussian ρ₄ must be 0, got {rho4}");
+        // info = n/φ.
+        assert!((c.info(0, 0) - (n as f64) / phi).abs() < 1e-10);
+    }
+
+    /// CONJUGATE FIXTURE 2 (unit-rate Exponential, scalar): the standardized
+    /// cumulants have exact closed forms `ρ₃ = 2/√n`, `ρ₄ = −6/n`. This is the
+    /// anchor the full Lawley LR Bartlett coefficient must reproduce
+    /// (`c = 1 + 1/n`); we assert the assembled invariants exactly so the
+    /// coefficient derivation has a verified substrate to contract.
+    #[test]
+    fn exponential_rate_standardized_cumulants_match_closed_form() {
+        // ℓ_i(θ) = ln θ − θ y_i. At θ = 1: ℓ' = 1/θ − y, ℓ'' = −1/θ², ℓ''' = 2/θ³,
+        // ℓ'''' = −6/θ⁴. Scalar parameter ⇒ z_i = 1.
+        let theta = 1.0_f64;
+        let n = 64usize;
+        let zcol = [1.0_f64];
+        let block: Vec<&[f64]> = (0..n).map(|_| &zcol[..]).collect();
+        let rows: Vec<RowLogLikDerivs> = (0..n)
+            .map(|_| RowLogLikDerivs {
+                d1: 0.0, // not used by the cumulant arrays
+                d2: -1.0 / (theta * theta),
+                d3: 2.0 / theta.powi(3),
+                d4: -6.0 / theta.powi(4),
+            })
+            .collect();
+        let c = assemble_cumulants(&block, &rows).expect("cumulants");
+        // info = n/θ² = n.
+        assert!((c.info(0, 0) - n as f64).abs() < 1e-10);
+        let (rho3, rho4) = scalar_standardized_cumulants(&c).expect("standardized");
+        let nf = n as f64;
+        assert!(
+            (rho3 - 2.0 / nf.sqrt()).abs() < 1e-10,
+            "Exponential ρ₃ must be 2/√n = {}, got {rho3}",
+            2.0 / nf.sqrt()
+        );
+        assert!(
+            (rho4 - (-6.0 / nf)).abs() < 1e-10,
+            "Exponential ρ₄ must be −6/n = {}, got {rho4}",
+            -6.0 / nf
+        );
+    }
+
+    #[test]
+    fn assemble_cumulants_rejects_degenerate_input() {
+        let z = [1.0_f64];
+        let block: Vec<&[f64]> = vec![&z];
+        // length mismatch between block and rows.
+        assert!(assemble_cumulants(&block, &[]).is_none());
+        // non-finite derivative.
+        let bad = vec![RowLogLikDerivs { d1: 0.0, d2: f64::NAN, d3: 0.0, d4: 0.0 }];
+        assert!(assemble_cumulants(&block, &bad).is_none());
     }
 }
