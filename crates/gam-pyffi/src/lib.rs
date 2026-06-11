@@ -9798,6 +9798,14 @@ fn sae_manifold_fit_inner<'py>(
         "residual_gauge",
         sae_residual_gauge_dict(py, &fit_diagnostics.residual_gauge)?,
     )?;
+    // Contract keys the python `ManifoldSAE.from_payload` boundary reads
+    // unconditionally (tightened in 23db2c80a, which rejected stale payload
+    // shapes python-side without adding the producer side): the fitted atom
+    // count, and whether OOS encode projects each row onto its single
+    // top-mass atom (true exactly for `top_k == 1`, mirroring the fit-time
+    // assignment-support projection the payload's `fitted` was computed with).
+    out.set_item("chosen_k", k_atoms)?;
+    out.set_item("oos_projection_top1", top_k == Some(1))?;
     Ok(out.unbind())
 }
 
