@@ -115,10 +115,425 @@ impl SaeBetaPenaltyAssembly {
     }
 }
 
-struct SaeFactoredRowProjection<'a> {
-    off_c: &'a [usize],
-    ranks: &'a [usize],
-    frames: &'a [Array2<f64>],
+#[derive(Clone, Debug)]
+struct FrameProjection {
+    p: usize,
+    beta_offsets: Vec<usize>,
+    border_offsets: Vec<usize>,
+    basis_sizes: Vec<usize>,
+    ranks: Vec<usize>,
+    frames: Vec<Option<Array2<f64>>>,
+}
+
+impl FrameProjection {
+    fn new(term: &SaeManifoldTerm) -> Self {
+        Self {
+            p: term.output_dim(),
+            beta_offsets: term.beta_offsets(),
+            border_offsets: term.factored_border_offsets(),
+            basis_sizes: term.atoms.iter().map(|atom| atom.basis_size()).collect(),
+            ranks: term
+                .atoms
+                .iter()
+                .map(|atom| atom.border_frame_rank())
+                .collect(),
+            frames: term
+                .atoms
+                .iter()
+                .map(|atom| {
+                    atom.decoder_frame
+                        .as_ref()
+                        .map(|frame| frame.frame().to_owned())
+                })
+                .collect(),
+        }
+    }
+
+    fn beta_dim(&self) -> usize {
+        self.basis_sizes.iter().sum::<usize>() * self.p
+    }
+
+    fn border_dim(&self) -> usize {
+        self.basis_sizes
+            .iter()
+            .zip(&self.ranks)
+            .map(|(m, r)| m * r)
+            .sum()
+    }
+
+    fn lift_border_vec(&self, border: ArrayView1<'_, f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.beta_dim());
+        for atom in 0..self.basis_sizes.len() {
+            self.lift_atom_vec_into(atom, border, out.view_mut());
+        }
+        out
+    }
+
+    fn project_border_vec(&self, beta: ArrayView1<'_, f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.border_dim());
+        for atom in 0..self.basis_sizes.len() {
+            self.project_atom_vec_into(atom, beta, out.view_mut(), 1.0);
+        }
+        out
+    }
+
+    fn lift_block(&self, atom: usize, block: ArrayView2<'_, f64>) -> Array2<f64> {
+        let m = self.basis_sizes[atom];
+        let r = self.ranks[atom];
+        if self.frames[atom].is_none() {
+            return block.to_owned();
+        }
+        let uk = self.frames[atom].as_ref().expect("framed atom has a frame");
+        let mut out = Array2::<f64>::zeros((m * self.p, m * self.p));
+        for b1 in 0..m {
+            for b2 in 0..m {
+                for c1 in 0..self.p {
+                    for c2 in 0..self.p {
+                        let mut acc = 0.0;
+                        for j1 in 0..r {
+                            for j2 in 0..r {
+                                acc +=
+                                    uk[[c1, j1]] * block[[b1 * r + j1, b2 * r + j2]] * uk[[c2, j2]];
+                            }
+                        }
+                        out[[b1 * self.p + c1, b2 * self.p + c2]] = acc;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn project_block(&self, hbb: ArrayView2<'_, f64>) -> Array2<f64> {
+        let t = self.project_rows(hbb);
+        let mut out = Array2::<f64>::zeros((self.border_dim(), self.border_dim()));
+        for atom in 0..self.basis_sizes.len() {
+            self.project_block_left_atom(atom, t.view(), out.view_mut());
+        }
+        out
+    }
+
+    fn project_rows(&self, block: ArrayView2<'_, f64>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((block.nrows(), self.border_dim()));
+        for row in 0..block.nrows() {
+            let projected = self.project_border_vec(block.row(row));
+            out.row_mut(row).assign(&projected);
+        }
+        out
+    }
+
+    fn atom_border_range(&self, atom: usize) -> std::ops::Range<usize> {
+        let start = self.border_offsets[atom];
+        start..start + self.basis_sizes[atom] * self.ranks[atom]
+    }
+
+    fn lift_axis_into(
+        &self,
+        out: &mut Array1<f64>,
+        atom: usize,
+        basis_col: usize,
+        frame_col: usize,
+    ) {
+        let base = self.beta_offsets[atom] + basis_col * self.p;
+        match &self.frames[atom] {
+            None => out[base + frame_col] = 1.0,
+            Some(uk) => {
+                for out_col in 0..self.p {
+                    out[base + out_col] = uk[[out_col, frame_col]];
+                }
+            }
+        }
+    }
+
+    fn lift_local_axis_into(
+        &self,
+        out: &mut Array1<f64>,
+        atom: usize,
+        basis_col: usize,
+        frame_col: usize,
+    ) {
+        let base = basis_col * self.p;
+        match &self.frames[atom] {
+            None => out[base + frame_col] = 1.0,
+            Some(uk) => {
+                for out_col in 0..self.p {
+                    out[base + out_col] = uk[[out_col, frame_col]];
+                }
+            }
+        }
+    }
+
+    fn project_atom_vec_into(
+        &self,
+        atom: usize,
+        beta: ArrayView1<'_, f64>,
+        mut out: ndarray::ArrayViewMut1<'_, f64>,
+        scale: f64,
+    ) {
+        let m = self.basis_sizes[atom];
+        let r = self.ranks[atom];
+        let ob = self.beta_offsets[atom];
+        let oc = self.border_offsets[atom];
+        for basis_col in 0..m {
+            let base_b = ob + basis_col * self.p;
+            let base_c = oc + basis_col * r;
+            match &self.frames[atom] {
+                None => {
+                    for j in 0..r {
+                        out[base_c + j] += scale * beta[base_b + j];
+                    }
+                }
+                Some(uk) => {
+                    for j in 0..r {
+                        let mut acc = 0.0;
+                        for i in 0..self.p {
+                            acc += uk[[i, j]] * beta[base_b + i];
+                        }
+                        out[base_c + j] += scale * acc;
+                    }
+                }
+            }
+        }
+    }
+
+    fn project_local_atom_vec_into(
+        &self,
+        atom: usize,
+        beta: ArrayView1<'_, f64>,
+        out: ndarray::ArrayViewMut1<'_, f64>,
+        scale: f64,
+    ) {
+        self.project_atom_vec_into_with_base(atom, beta, out, scale, 0);
+    }
+
+    fn project_atom_vec_into_with_base(
+        &self,
+        atom: usize,
+        beta: ArrayView1<'_, f64>,
+        mut out: ndarray::ArrayViewMut1<'_, f64>,
+        scale: f64,
+        beta_base_offset: usize,
+    ) {
+        let m = self.basis_sizes[atom];
+        let r = self.ranks[atom];
+        let oc = self.border_offsets[atom];
+        for basis_col in 0..m {
+            let base_b = beta_base_offset + basis_col * self.p;
+            let base_c = oc + basis_col * r;
+            match &self.frames[atom] {
+                None => {
+                    for j in 0..r {
+                        out[base_c + j] += scale * beta[base_b + j];
+                    }
+                }
+                Some(uk) => {
+                    for j in 0..r {
+                        let mut acc = 0.0;
+                        for i in 0..self.p {
+                            acc += uk[[i, j]] * beta[base_b + i];
+                        }
+                        out[base_c + j] += scale * acc;
+                    }
+                }
+            }
+        }
+    }
+
+    fn lift_atom_vec_into(
+        &self,
+        atom: usize,
+        border: ArrayView1<'_, f64>,
+        mut out: ndarray::ArrayViewMut1<'_, f64>,
+    ) {
+        let m = self.basis_sizes[atom];
+        let r = self.ranks[atom];
+        let ob = self.beta_offsets[atom];
+        let oc = self.border_offsets[atom];
+        for basis_col in 0..m {
+            let base_b = ob + basis_col * self.p;
+            let base_c = oc + basis_col * r;
+            match &self.frames[atom] {
+                None => {
+                    for i in 0..self.p {
+                        out[base_b + i] = border[base_c + i];
+                    }
+                }
+                Some(uk) => {
+                    for i in 0..self.p {
+                        let mut acc = 0.0;
+                        for j in 0..r {
+                            acc += uk[[i, j]] * border[base_c + j];
+                        }
+                        out[base_b + i] = acc;
+                    }
+                }
+            }
+        }
+    }
+
+    fn accumulate_row_lift(
+        &self,
+        atom: usize,
+        c_base: usize,
+        phi: f64,
+        x: &[f64],
+        out: &mut [f64],
+    ) {
+        match &self.frames[atom] {
+            None => {
+                for i in 0..self.p {
+                    out[i] += phi * x[c_base + i];
+                }
+            }
+            Some(uk) => {
+                for i in 0..self.p {
+                    let mut acc = 0.0;
+                    for j in 0..self.ranks[atom] {
+                        acc += uk[[i, j]] * x[c_base + j];
+                    }
+                    out[i] += phi * acc;
+                }
+            }
+        }
+    }
+
+    fn accumulate_row_project(
+        &self,
+        atom: usize,
+        c_base: usize,
+        phi: f64,
+        u: &[f64],
+        out: &mut [f64],
+    ) {
+        match &self.frames[atom] {
+            None => {
+                for i in 0..self.p {
+                    out[c_base + i] += phi * u[i];
+                }
+            }
+            Some(uk) => {
+                for j in 0..self.ranks[atom] {
+                    let mut acc = 0.0;
+                    for i in 0..self.p {
+                        acc += uk[[i, j]] * u[i];
+                    }
+                    out[c_base + j] += phi * acc;
+                }
+            }
+        }
+    }
+
+    fn accumulate_output_project(
+        &self,
+        atom: usize,
+        c_base: usize,
+        output: usize,
+        value: f64,
+        out: &mut [f64],
+    ) {
+        match &self.frames[atom] {
+            None => out[c_base + output] += value,
+            Some(uk) => {
+                for j in 0..self.ranks[atom] {
+                    out[c_base + j] += value * uk[[output, j]];
+                }
+            }
+        }
+    }
+
+    fn output_variance(
+        &self,
+        atom: usize,
+        cov_c: ArrayView2<'_, f64>,
+        basis: ArrayView1<'_, f64>,
+        output: usize,
+    ) -> f64 {
+        let Some(uk) = &self.frames[atom] else {
+            return self.full_output_variance(atom, cov_c, basis, output);
+        };
+        let m = self.basis_sizes[atom];
+        let r = self.ranks[atom];
+        let mut var = 0.0;
+        for b1 in 0..m {
+            let phi1 = basis[b1];
+            if phi1 == 0.0 {
+                continue;
+            }
+            for b2 in 0..m {
+                let phi2 = basis[b2];
+                if phi2 == 0.0 {
+                    continue;
+                }
+                for j1 in 0..r {
+                    for j2 in 0..r {
+                        var += phi1
+                            * phi2
+                            * uk[[output, j1]]
+                            * cov_c[[b1 * r + j1, b2 * r + j2]]
+                            * uk[[output, j2]];
+                    }
+                }
+            }
+        }
+        var
+    }
+
+    fn full_output_variance(
+        &self,
+        atom: usize,
+        cov: ArrayView2<'_, f64>,
+        basis: ArrayView1<'_, f64>,
+        output: usize,
+    ) -> f64 {
+        let m = self.basis_sizes[atom];
+        let mut var = 0.0;
+        for b1 in 0..m {
+            let phi1 = basis[b1];
+            if phi1 == 0.0 {
+                continue;
+            }
+            for b2 in 0..m {
+                var += phi1 * basis[b2] * cov[[b1 * self.p + output, b2 * self.p + output]];
+            }
+        }
+        var
+    }
+
+    fn project_block_left_atom(
+        &self,
+        atom: usize,
+        t: ArrayView2<'_, f64>,
+        mut out: ndarray::ArrayViewMut2<'_, f64>,
+    ) {
+        let m = self.basis_sizes[atom];
+        let r = self.ranks[atom];
+        let ob = self.beta_offsets[atom];
+        let oc = self.border_offsets[atom];
+        for basis_col in 0..m {
+            let base_b = ob + basis_col * self.p;
+            let base_c = oc + basis_col * r;
+            match &self.frames[atom] {
+                None => {
+                    for j in 0..r {
+                        for c in 0..out.ncols() {
+                            out[[base_c + j, c]] += t[[base_b + j, c]];
+                        }
+                    }
+                }
+                Some(uk) => {
+                    for j in 0..r {
+                        for c in 0..out.ncols() {
+                            let mut acc = 0.0;
+                            for i in 0..self.p {
+                                acc += uk[[i, j]] * t[[base_b + i, c]];
+                            }
+                            out[[base_c + j, c]] += acc;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// #976 Layer-1 guard: cap on one accepted iteration's assignment-logit
@@ -3605,10 +4020,7 @@ struct SaeFrameKroneckerRows {
     /// factor) and is the source of `apply_l` / `apply_l_t`. Its `a_phi` is
     /// retained but UNUSED here (the factored support below replaces it).
     inner: SaeKroneckerRows,
-    /// Per-atom frame `U_k` (`p × r_k`); `I_p` for un-framed atoms.
-    frames: Vec<Array2<f64>>,
-    /// Per-atom frame rank `r_k`.
-    ranks: Vec<usize>,
+    projection: FrameProjection,
     /// Per-row C-space support: `(c_base, phi, atom_idx)`.
     factored_a_phi: Vec<Vec<(usize, f64, usize)>>,
 }
@@ -3618,18 +4030,12 @@ impl SaeFrameKroneckerRows {
     /// `off_B[k] + basis_col·p`) by remapping each load into the factored
     /// C-space. `beta_offsets` / `off_c` are the per-atom full-`B` / factored
     /// offsets; `basis_sizes` / `ranks` the per-atom `M_k` / `r_k`.
-    #[allow(clippy::too_many_arguments)]
     fn new(
         p: usize,
-        beta_offsets: &[usize],
-        off_c: &[usize],
-        basis_sizes: Vec<usize>,
-        ranks: Vec<usize>,
-        frames: Vec<Array2<f64>>,
+        projection: FrameProjection,
         a_phi: Vec<Vec<(usize, f64)>>,
         local_jac: Vec<Vec<f64>>,
     ) -> Result<Self, String> {
-        let n_atoms = basis_sizes.len();
         // Remap each full-`B` load `(beta_base, phi)` to `(c_base, phi, atom)`.
         // `beta_base = off_B[k] + basis_col·p`; locate the atom by its full-`B`
         // offset range and derive `basis_col`, then the factored base.
@@ -3640,9 +4046,9 @@ impl SaeFrameKroneckerRows {
                 // Find the owning atom: largest `k` with `off_B[k] <= beta_base`
                 // and `beta_base < off_B[k] + M_k·p`.
                 let mut atom_idx = None;
-                for k in 0..n_atoms {
-                    let lo = beta_offsets[k];
-                    let hi = lo + basis_sizes[k] * p;
+                for k in 0..projection.basis_sizes.len() {
+                    let lo = projection.beta_offsets[k];
+                    let hi = lo + projection.basis_sizes[k] * p;
                     if beta_base >= lo && beta_base < hi {
                         atom_idx = Some(k);
                         break;
@@ -3653,8 +4059,8 @@ impl SaeFrameKroneckerRows {
                         "SaeFrameKroneckerRows::new: beta_base {beta_base} not in any atom block"
                     )
                 })?;
-                let basis_col = (beta_base - beta_offsets[k]) / p;
-                let c_base = off_c[k] + basis_col * ranks[k];
+                let basis_col = (beta_base - projection.beta_offsets[k]) / p;
+                let c_base = projection.border_offsets[k] + basis_col * projection.ranks[k];
                 row_out.push((c_base, phi, k));
             }
             factored_a_phi.push(row_out);
@@ -3662,8 +4068,7 @@ impl SaeFrameKroneckerRows {
         let inner = SaeKroneckerRows::new(p, a_phi, local_jac);
         Ok(Self {
             inner,
-            frames,
-            ranks,
+            projection,
             factored_a_phi,
         })
     }
@@ -3674,42 +4079,24 @@ impl SaeFrameKroneckerRows {
         for val in u_out.iter_mut() {
             *val = 0.0;
         }
-        let p = self.inner.p;
         for &(c_base, phi, atom) in &self.factored_a_phi[row] {
             if phi == 0.0 {
                 continue;
             }
-            let r = self.ranks[atom];
-            let uk = &self.frames[atom];
-            // u_p[i] += phi · Σ_j U_k[i,j] · x_C[c_base + j].
-            for i in 0..p {
-                let mut acc = 0.0_f64;
-                for j in 0..r {
-                    acc += uk[[i, j]] * x_c[c_base + j];
-                }
-                u_out[i] += phi * acc;
-            }
+            self.projection
+                .accumulate_row_lift(atom, c_base, phi, x_c, u_out);
         }
     }
 
     /// `y_C += J_Cᵀ · u`: scatter the p-space vector back into C-space through
     /// each atom's frame transpose.
     fn scatter_jbeta_factored_t(&self, row: usize, u: &[f64], y_c: &mut [f64]) {
-        let p = self.inner.p;
         for &(c_base, phi, atom) in &self.factored_a_phi[row] {
             if phi == 0.0 {
                 continue;
             }
-            let r = self.ranks[atom];
-            let uk = &self.frames[atom];
-            // y_C[c_base + j] += phi · Σ_i U_k[i,j] · u[i].
-            for j in 0..r {
-                let mut acc = 0.0_f64;
-                for i in 0..p {
-                    acc += uk[[i, j]] * u[i];
-                }
-                y_c[c_base + j] += phi * acc;
-            }
+            self.projection
+                .accumulate_row_project(atom, c_base, phi, u, y_c);
         }
     }
 
@@ -6422,7 +6809,8 @@ impl SaeManifoldTerm {
         let assignment_dim = self.assignment.assignment_coord_dim();
         let q = self.assignment.row_block_dim();
         let beta_dim = self.beta_dim();
-        let beta_offsets = self.beta_offsets();
+        let frame_projection = FrameProjection::new(self);
+        let beta_offsets = frame_projection.beta_offsets.clone();
         let coord_offsets = self.assignment.coord_offsets();
         // β-tier decoder smoothness is a global (B-only) penalty; under a
         // minibatch pass it is scaled by the chunk fraction so the per-chunk
@@ -7203,17 +7591,9 @@ impl SaeManifoldTerm {
             // C-space support is built from the same per-row `a_phi` (full-`B`
             // bases) by mapping each `(atom_beta_off + m·p, φ)` load to atom `k`'s
             // factored base `off_C[k] + m·r_k` and attaching `U_k`.
-            let off_c = self.factored_beta_offsets();
-            let frames: Vec<Array2<f64>> = (0..self.atoms.len())
-                .map(|k| self.frame_output_matrix(k))
-                .collect();
             let kron = Arc::new(SaeFrameKroneckerRows::new(
                 p,
-                &beta_offsets,
-                &off_c,
-                self.atoms.iter().map(|a| a.basis_size()).collect(),
-                self.atoms.iter().map(|a| a.border_frame_rank()).collect(),
-                frames,
+                frame_projection.clone(),
                 kron_a_phi,
                 kron_jac,
             )?);
@@ -7284,28 +7664,11 @@ impl SaeManifoldTerm {
             );
         }
         let mut beta_penalty_assembly = SaeBetaPenaltyAssembly::default();
-        let factored_row_projection_data = if frames_engaged && analytic_penalties.is_some() {
-            Some((
-                self.factored_beta_offsets(),
-                self.atoms
-                    .iter()
-                    .map(|atom| atom.border_frame_rank())
-                    .collect::<Vec<_>>(),
-                (0..self.atoms.len())
-                    .map(|atom_idx| self.frame_output_matrix(atom_idx))
-                    .collect::<Vec<_>>(),
-            ))
+        let factored_row_projection = if frames_engaged && analytic_penalties.is_some() {
+            Some(&frame_projection)
         } else {
             None
         };
-        let factored_row_projection =
-            factored_row_projection_data
-                .as_ref()
-                .map(|(off_c, ranks, frames)| SaeFactoredRowProjection {
-                    off_c: off_c.as_slice(),
-                    ranks: ranks.as_slice(),
-                    frames: frames.as_slice(),
-                });
         if let Some(registry) = analytic_penalties {
             // Upfront validation: refuse penalty kinds the SAE row layout
             // cannot host, and refuse mixed-d row-block configurations.
@@ -7320,7 +7683,7 @@ impl SaeManifoldTerm {
                     penalty_scale,
                     row_layout.as_ref(),
                     dense_beta_curvature,
-                    factored_row_projection.as_ref(),
+                    factored_row_projection,
                 )
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         }
@@ -7338,38 +7701,11 @@ impl SaeManifoldTerm {
             //   * smooth      `λ S_k ⊗ I_{r_k}`          (since `U_kᵀU_k = I`),
             //   * analytic    `Φᵀ hbb Φ`                 (dense, only if written).
             // Un-framed atoms ride the `r_k = p, U_k = I_p` identity special case.
-            let off_c = self.factored_beta_offsets();
-            let ranks: Vec<usize> = self.atoms.iter().map(|a| a.border_frame_rank()).collect();
-            let basis_sizes: Vec<usize> = self.atoms.iter().map(|a| a.basis_size()).collect();
-            let border_dim = self.factored_border_dim();
-            let frames: Vec<Array2<f64>> = (0..self.atoms.len())
-                .map(|k| self.frame_output_matrix(k))
-                .collect();
-
-            // Project the full-`B` gradient `g_B` → factored `g_C = Φᵀ g_B`:
-            //   g_C[off_C[k] + m·r_k + j] = Σ_i U_k[i,j] · g_B[off_B[k] + m·p + i].
-            // `sys.gb` already holds the SUM of the data gradient and the smooth
-            // gradient (both in p-space), so projecting it once carries both the
-            // `Φᵀ g_data` and the `(λ S_k B_k) U_k` smooth-gradient contributions.
-            let mut gb_c = Array1::<f64>::zeros(border_dim);
-            for k in 0..self.atoms.len() {
-                let m = basis_sizes[k];
-                let r = ranks[k];
-                let ob = beta_offsets[k];
-                let oc = off_c[k];
-                let uk = &frames[k];
-                for basis_col in 0..m {
-                    let base_b = ob + basis_col * p;
-                    let base_c = oc + basis_col * r;
-                    for j in 0..r {
-                        let mut acc = 0.0_f64;
-                        for i in 0..p {
-                            acc += uk[[i, j]] * sys.gb[base_b + i];
-                        }
-                        gb_c[base_c + j] = acc;
-                    }
-                }
-            }
+            let off_c = &frame_projection.border_offsets;
+            let ranks = &frame_projection.ranks;
+            let basis_sizes = &frame_projection.basis_sizes;
+            let border_dim = frame_projection.border_dim();
+            let gb_c = frame_projection.project_border_vec(sys.gb.view());
 
             // Data β-Hessian: `G_{ij} ⊗ W_{ij}` with `W_{ij} = U_iᵀU_j`. The
             // basis Gram `g_blocks` is unchanged; only the output factor is the
@@ -7381,7 +7717,7 @@ impl SaeManifoldTerm {
                     continue;
                 }
                 // `W_{ij} = U_iᵀ U_j` from the precomputed per-atom frames.
-                let w = fast_atb(&frames[atom_i], &frames[atom_j]);
+                let w = self.frame_cross_factor(atom_i, atom_j);
                 frame_blocks.push(FactoredFrameGBlock {
                     atom_i,
                     atom_j,
@@ -7409,15 +7745,8 @@ impl SaeManifoldTerm {
             // penalty actually wrote `hbb` (else `hbb` is all-zero and the dense
             // `(border_dim)²` op is skipped entirely, exactly as full-`B`).
             if beta_penalty_assembly.dense_written {
-                let hbb_c = self.project_dense_penalty_to_factored(
-                    sys.hbb.view(),
-                    &beta_offsets,
-                    &off_c,
-                    &basis_sizes,
-                    &ranks,
-                    &frames,
-                    border_dim,
-                );
+                let hbb_c =
+                    self.project_dense_penalty_to_factored(sys.hbb.view(), &frame_projection);
                 ops.push(Arc::new(DensePenaltyOp(hbb_c)));
             } else if beta_penalty_assembly.deferred_factored {
                 let registry =
@@ -7425,12 +7754,7 @@ impl SaeManifoldTerm {
                 let hbb_c = self.build_factored_beta_penalty_curvature(
                     registry,
                     penalty_scale,
-                    &beta_offsets,
-                    &off_c,
-                    &basis_sizes,
-                    &ranks,
-                    &frames,
-                    border_dim,
+                    &frame_projection,
                 );
                 ops.push(Arc::new(DensePenaltyOp(hbb_c)));
             }
@@ -7520,86 +7844,24 @@ impl SaeManifoldTerm {
     /// `T = hbb · Φ` (right multiply, columns fold `U`), then `Φᵀ · T` (left
     /// multiply, rows fold `U`). Analytic Beta-tier penalties are rare and small,
     /// so this only fires when one is actually installed.
-    #[allow(clippy::too_many_arguments)]
     fn project_dense_penalty_to_factored(
         &self,
         hbb: ArrayView2<'_, f64>,
-        beta_offsets: &[usize],
-        off_c: &[usize],
-        basis_sizes: &[usize],
-        ranks: &[usize],
-        frames: &[Array2<f64>],
-        border_dim: usize,
+        projection: &FrameProjection,
     ) -> Array2<f64> {
-        let p = self.output_dim();
-        let beta_dim = hbb.nrows();
-        // Pass 1: `T = hbb · Φ`, shape `(beta_dim × border_dim)`. Column `(k, m,
-        // j)` of `Φ` has support on B-rows `(k, m, i)` with entry `U_k[i, j]`, so
-        //   T[b, off_C[k]+m·r_k+j] = Σ_i hbb[b, off_B[k]+m·p+i] · U_k[i, j].
-        let mut t = Array2::<f64>::zeros((beta_dim, border_dim));
-        for k in 0..self.atoms.len() {
-            let m = basis_sizes[k];
-            let r = ranks[k];
-            let ob = beta_offsets[k];
-            let oc = off_c[k];
-            let uk = &frames[k];
-            for basis_col in 0..m {
-                let base_b = ob + basis_col * p;
-                let base_c = oc + basis_col * r;
-                for b in 0..beta_dim {
-                    for j in 0..r {
-                        let mut acc = 0.0_f64;
-                        for i in 0..p {
-                            acc += hbb[[b, base_b + i]] * uk[[i, j]];
-                        }
-                        t[[b, base_c + j]] += acc;
-                    }
-                }
-            }
-        }
-        // Pass 2: `Φᵀ · T`, shape `(border_dim × border_dim)`. Row `(k, m, j)` of
-        // `Φᵀ` reads B-rows `(k, m, i)` with entry `U_k[i, j]`, so
-        //   out[off_C[k]+m·r_k+j, c] = Σ_i U_k[i, j] · T[off_B[k]+m·p+i, c].
-        let mut out = Array2::<f64>::zeros((border_dim, border_dim));
-        for k in 0..self.atoms.len() {
-            let m = basis_sizes[k];
-            let r = ranks[k];
-            let ob = beta_offsets[k];
-            let oc = off_c[k];
-            let uk = &frames[k];
-            for basis_col in 0..m {
-                let base_b = ob + basis_col * p;
-                let base_c = oc + basis_col * r;
-                for j in 0..r {
-                    for c in 0..border_dim {
-                        let mut acc = 0.0_f64;
-                        for i in 0..p {
-                            acc += uk[[i, j]] * t[[base_b + i, c]];
-                        }
-                        out[[base_c + j, c]] += acc;
-                    }
-                }
-            }
-        }
-        out
+        projection.project_block(hbb)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build_factored_beta_penalty_curvature(
         &self,
         registry: &AnalyticPenaltyRegistry,
         penalty_scale: f64,
-        beta_offsets: &[usize],
-        off_c: &[usize],
-        basis_sizes: &[usize],
-        ranks: &[usize],
-        frames: &[Array2<f64>],
-        border_dim: usize,
+        projection: &FrameProjection,
     ) -> Array2<f64> {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
         let layout = registry.rho_layout();
         let target_beta = self.flatten_beta();
-        let mut hbb_c = Array2::<f64>::zeros((border_dim, border_dim));
+        let mut hbb_c = Array2::<f64>::zeros((projection.border_dim(), projection.border_dim()));
         for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
             if matches!(penalty, AnalyticPenaltyKind::Ard(_)) {
                 continue;
@@ -7613,11 +7875,7 @@ impl SaeManifoldTerm {
                         target_beta.view(),
                         rho_local,
                         penalty_scale,
-                        beta_offsets,
-                        off_c,
-                        basis_sizes,
-                        ranks,
-                        frames,
+                        projection,
                     );
                 }
                 PenaltyTier::Beta => {
@@ -7627,11 +7885,7 @@ impl SaeManifoldTerm {
                         target_beta.view(),
                         rho_local,
                         penalty_scale,
-                        beta_offsets,
-                        off_c,
-                        basis_sizes,
-                        ranks,
-                        frames,
+                        projection,
                     );
                 }
                 _ => {}
@@ -7640,7 +7894,6 @@ impl SaeManifoldTerm {
         hbb_c
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn add_factored_beta_penalty_curvature_for_penalty(
         &self,
         hbb_c: &mut Array2<f64>,
@@ -7648,11 +7901,7 @@ impl SaeManifoldTerm {
         target_beta: ArrayView1<'_, f64>,
         rho_local: ArrayView1<'_, f64>,
         penalty_scale: f64,
-        beta_offsets: &[usize],
-        off_c: &[usize],
-        basis_sizes: &[usize],
-        ranks: &[usize],
-        frames: &[Array2<f64>],
+        projection: &FrameProjection,
     ) {
         let p = self.output_dim();
         if let AnalyticPenaltyKind::DecoderIncoherence(base) = penalty {
@@ -7662,30 +7911,19 @@ impl SaeManifoldTerm {
             let beta_dim = self.beta_dim();
             let mut probe = Array1::<f64>::zeros(beta_dim);
             for k in 0..self.atoms.len() {
-                for basis_col in 0..basis_sizes[k] {
-                    for frame_col in 0..ranks[k] {
+                for basis_col in 0..projection.basis_sizes[k] {
+                    for frame_col in 0..projection.ranks[k] {
                         probe.fill(0.0);
-                        self.fill_lifted_full_beta_probe(
-                            &mut probe,
-                            k,
-                            basis_col,
-                            frame_col,
-                            beta_offsets,
-                            frames,
-                        );
-                        let col = off_c[k] + basis_col * ranks[k] + frame_col;
+                        projection.lift_axis_into(&mut probe, k, basis_col, frame_col);
+                        let col = projection.border_offsets[k]
+                            + basis_col * projection.ranks[k]
+                            + frame_col;
                         let hv = per_fit.psd_majorizer_hvp(target_beta, rho_local, probe.view());
-                        self.project_full_beta_hv_to_factored_column(
-                            hbb_c,
-                            col,
-                            hv.view(),
-                            beta_offsets,
-                            off_c,
-                            basis_sizes,
-                            ranks,
-                            frames,
-                            penalty_scale,
-                        );
+                        projection
+                            .project_border_vec(hv.view())
+                            .iter()
+                            .enumerate()
+                            .for_each(|(row, &v)| hbb_c[[row, col]] += penalty_scale * v);
                     }
                 }
             }
@@ -7693,7 +7931,8 @@ impl SaeManifoldTerm {
         }
         if let AnalyticPenaltyKind::MechanismSparsity(base) = penalty {
             for (per_atom, start, end) in self.live_mechanism_sparsity_penalties(base) {
-                let atom_idx = beta_offsets
+                let atom_idx = projection
+                    .beta_offsets
                     .iter()
                     .position(|&offset| offset == start)
                     .expect("live mechanism-sparsity offset must match an SAE atom");
@@ -7701,27 +7940,22 @@ impl SaeManifoldTerm {
                 let mut local_penalty = per_atom.clone();
                 local_penalty.target = PsiSlice {
                     range: 0..block_len,
-                    latent_dim: Some(basis_sizes[atom_idx]),
+                    latent_dim: Some(projection.basis_sizes[atom_idx]),
                 };
                 let block = target_beta.slice(s![start..end]);
                 let mut probe = Array1::<f64>::zeros(block_len);
-                for basis_col in 0..basis_sizes[atom_idx] {
-                    for frame_col in 0..ranks[atom_idx] {
+                for basis_col in 0..projection.basis_sizes[atom_idx] {
+                    for frame_col in 0..projection.ranks[atom_idx] {
                         probe.fill(0.0);
-                        self.fill_lifted_local_beta_probe(
-                            &mut probe, atom_idx, basis_col, frame_col, frames,
-                        );
-                        let col = off_c[atom_idx] + basis_col * ranks[atom_idx] + frame_col;
+                        projection.lift_local_axis_into(&mut probe, atom_idx, basis_col, frame_col);
+                        let col = projection.border_offsets[atom_idx]
+                            + basis_col * projection.ranks[atom_idx]
+                            + frame_col;
                         let hv = local_penalty.psd_majorizer_hvp(block, rho_local, probe.view());
-                        self.project_local_beta_hv_to_factored_column(
-                            hbb_c,
-                            col,
+                        projection.project_local_atom_vec_into(
                             atom_idx,
                             hv.view(),
-                            off_c,
-                            basis_sizes,
-                            ranks,
-                            frames,
+                            hbb_c.column_mut(col),
                             penalty_scale,
                         );
                     }
@@ -7731,30 +7965,26 @@ impl SaeManifoldTerm {
         }
         if let AnalyticPenaltyKind::NuclearNorm(base) = penalty {
             for (per_atom, start, end) in self.live_nuclear_norm_penalties(base) {
-                let atom_idx = beta_offsets
+                let atom_idx = projection
+                    .beta_offsets
                     .iter()
                     .position(|&offset| offset == start)
                     .expect("live nuclear-norm offset must match an SAE atom");
                 let block = target_beta.slice(s![start..end]);
                 let block_len = end - start;
                 let mut probe = Array1::<f64>::zeros(block_len);
-                for basis_col in 0..basis_sizes[atom_idx] {
-                    for frame_col in 0..ranks[atom_idx] {
+                for basis_col in 0..projection.basis_sizes[atom_idx] {
+                    for frame_col in 0..projection.ranks[atom_idx] {
                         probe.fill(0.0);
-                        self.fill_lifted_local_beta_probe(
-                            &mut probe, atom_idx, basis_col, frame_col, frames,
-                        );
-                        let col = off_c[atom_idx] + basis_col * ranks[atom_idx] + frame_col;
+                        projection.lift_local_axis_into(&mut probe, atom_idx, basis_col, frame_col);
+                        let col = projection.border_offsets[atom_idx]
+                            + basis_col * projection.ranks[atom_idx]
+                            + frame_col;
                         let hv = per_atom.psd_majorizer_hvp(block, rho_local, probe.view());
-                        self.project_local_beta_hv_to_factored_column(
-                            hbb_c,
-                            col,
+                        projection.project_local_atom_vec_into(
                             atom_idx,
                             hv.view(),
-                            off_c,
-                            basis_sizes,
-                            ranks,
-                            frames,
+                            hbb_c.column_mut(col),
                             penalty_scale,
                         );
                     }
@@ -7765,147 +7995,22 @@ impl SaeManifoldTerm {
         let beta_dim = self.beta_dim();
         let mut probe = Array1::<f64>::zeros(beta_dim);
         for k in 0..self.atoms.len() {
-            for basis_col in 0..basis_sizes[k] {
-                for frame_col in 0..ranks[k] {
+            for basis_col in 0..projection.basis_sizes[k] {
+                for frame_col in 0..projection.ranks[k] {
                     probe.fill(0.0);
-                    self.fill_lifted_full_beta_probe(
-                        &mut probe,
-                        k,
-                        basis_col,
-                        frame_col,
-                        beta_offsets,
-                        frames,
-                    );
-                    let col = off_c[k] + basis_col * ranks[k] + frame_col;
+                    projection.lift_axis_into(&mut probe, k, basis_col, frame_col);
+                    let col =
+                        projection.border_offsets[k] + basis_col * projection.ranks[k] + frame_col;
                     let hv = penalty.psd_majorizer_hvp(target_beta, rho_local, probe.view());
-                    self.project_full_beta_hv_to_factored_column(
-                        hbb_c,
-                        col,
-                        hv.view(),
-                        beta_offsets,
-                        off_c,
-                        basis_sizes,
-                        ranks,
-                        frames,
-                        penalty_scale,
-                    );
+                    projection
+                        .project_border_vec(hv.view())
+                        .iter()
+                        .enumerate()
+                        .for_each(|(row, &v)| hbb_c[[row, col]] += penalty_scale * v);
                 }
             }
         }
         assert_eq!(p, self.output_dim());
-    }
-
-    fn fill_lifted_local_beta_probe(
-        &self,
-        probe: &mut Array1<f64>,
-        atom_idx: usize,
-        basis_col: usize,
-        frame_col: usize,
-        frames: &[Array2<f64>],
-    ) {
-        let p = self.output_dim();
-        let base = basis_col * p;
-        if self.atoms[atom_idx].decoder_frame.is_none() {
-            probe[base + frame_col] = 1.0;
-        } else {
-            let uk = &frames[atom_idx];
-            for out_col in 0..p {
-                probe[base + out_col] = uk[[out_col, frame_col]];
-            }
-        }
-    }
-
-    fn fill_lifted_full_beta_probe(
-        &self,
-        probe: &mut Array1<f64>,
-        atom_idx: usize,
-        basis_col: usize,
-        frame_col: usize,
-        beta_offsets: &[usize],
-        frames: &[Array2<f64>],
-    ) {
-        let p = self.output_dim();
-        let base = beta_offsets[atom_idx] + basis_col * p;
-        if self.atoms[atom_idx].decoder_frame.is_none() {
-            probe[base + frame_col] = 1.0;
-        } else {
-            let uk = &frames[atom_idx];
-            for out_col in 0..p {
-                probe[base + out_col] = uk[[out_col, frame_col]];
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn project_local_beta_hv_to_factored_column(
-        &self,
-        hbb_c: &mut Array2<f64>,
-        col: usize,
-        atom_idx: usize,
-        hv: ArrayView1<'_, f64>,
-        off_c: &[usize],
-        basis_sizes: &[usize],
-        ranks: &[usize],
-        frames: &[Array2<f64>],
-        penalty_scale: f64,
-    ) {
-        let p = self.output_dim();
-        let r = ranks[atom_idx];
-        for basis_row in 0..basis_sizes[atom_idx] {
-            let base_hv = basis_row * p;
-            let base_c = off_c[atom_idx] + basis_row * r;
-            if self.atoms[atom_idx].decoder_frame.is_none() {
-                for frame_row in 0..r {
-                    hbb_c[[base_c + frame_row, col]] += penalty_scale * hv[base_hv + frame_row];
-                }
-            } else {
-                let uk = &frames[atom_idx];
-                for frame_row in 0..r {
-                    let mut acc = 0.0_f64;
-                    for out_col in 0..p {
-                        acc += uk[[out_col, frame_row]] * hv[base_hv + out_col];
-                    }
-                    hbb_c[[base_c + frame_row, col]] += penalty_scale * acc;
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn project_full_beta_hv_to_factored_column(
-        &self,
-        hbb_c: &mut Array2<f64>,
-        col: usize,
-        hv: ArrayView1<'_, f64>,
-        beta_offsets: &[usize],
-        off_c: &[usize],
-        basis_sizes: &[usize],
-        ranks: &[usize],
-        frames: &[Array2<f64>],
-        penalty_scale: f64,
-    ) {
-        let p = self.output_dim();
-        for atom_idx in 0..self.atoms.len() {
-            let r = ranks[atom_idx];
-            for basis_row in 0..basis_sizes[atom_idx] {
-                let base_hv = beta_offsets[atom_idx] + basis_row * p;
-                let base_c = off_c[atom_idx] + basis_row * r;
-                if self.atoms[atom_idx].decoder_frame.is_none() {
-                    for frame_row in 0..r {
-                        hbb_c[[base_c + frame_row, col]] += penalty_scale * hv[base_hv + frame_row];
-                    }
-                } else {
-                    let uk = &frames[atom_idx];
-                    for frame_row in 0..r {
-                        let mut acc = 0.0_f64;
-                        for out_col in 0..p {
-                            acc += uk[[out_col, frame_row]] * hv[base_hv + out_col];
-                        }
-                        hbb_c[[base_c + frame_row, col]] += penalty_scale * acc;
-                    }
-                }
-            }
-        }
     }
 
     fn ext_coord_matrix(&self) -> Array2<f64> {
@@ -9513,12 +9618,11 @@ impl SaeManifoldTerm {
                 let mut rhs_t = Array1::<f64>::zeros(total_t);
                 let rhs_beta = Array1::<f64>::zeros(cache.k);
                 rhs_t[base + col] = 1.0;
-                let (sol_t, sol_beta) =
-                    cache
-                        .full_inverse_apply(rhs_t.view(), rhs_beta.view())
-                        .map_err(|err| {
-                            format!("logdet_theta_adjoint: selected inverse solve: {err}")
-                        })?;
+                let (sol_t, sol_beta) = cache
+                    .full_inverse_apply(rhs_t.view(), rhs_beta.view())
+                    .map_err(|err| {
+                        format!("logdet_theta_adjoint: selected inverse solve: {err}")
+                    })?;
                 for r in 0..q {
                     inv_vv[[r, col]] = sol_t[base + r];
                 }
@@ -9643,12 +9747,11 @@ impl SaeManifoldTerm {
         let gamma = self.logdet_theta_adjoint(rho, cache)?;
         for coord in 0..n_params {
             let rhs = self.outer_rho_gradient_ift_rhs(rho, coord, cache)?;
-            let (sol_t, sol_beta) =
-                cache
-                    .full_inverse_apply(rhs.t.view(), rhs.beta.view())
-                    .map_err(|err| {
-                        format!("analytic_outer_rho_gradient_components: full_inverse_apply: {err}")
-                    })?;
+            let (sol_t, sol_beta) = cache
+                .full_inverse_apply(rhs.t.view(), rhs.beta.view())
+                .map_err(|err| {
+                    format!("analytic_outer_rho_gradient_components: full_inverse_apply: {err}")
+                })?;
             let mut dot = 0.0_f64;
             for idx in 0..gamma.t.len() {
                 dot += gamma.t[idx] * sol_t[idx];
@@ -9814,13 +9917,10 @@ impl SaeManifoldTerm {
         // code — which reads the `b·p + c` flat layout — is unchanged. On the
         // full-`B` path the block is already `(M_k·p)` and the lift is skipped.
         let frames_active = self.frames_active();
+        let frame_projection = FrameProjection::new(self);
         let block_ranges = if frames_active {
-            let off_c = self.factored_beta_offsets();
             (0..self.k_atoms())
-                .map(|k| {
-                    let start = off_c[k];
-                    start..start + self.atoms[k].border_coeff_count()
-                })
+                .map(|k| frame_projection.atom_border_range(k))
                 .collect::<Vec<_>>()
         } else {
             self.beta_block_offsets().to_vec()
@@ -9862,42 +9962,12 @@ impl SaeManifoldTerm {
                 //   Var_c(t) = (φ ⊗ u_c)ᵀ Cov(vec C_k) (φ ⊗ u_c)
                 // which is the r×r quadratic form `u_cᵀ Y u_c` with
                 //   Y = Σ_{b1,b2} φ[b1] φ[b2] Cov(C)[(b1,·),(b2,·)].
-                let r = atom.border_frame_rank();
-                let uk = self.frame_output_matrix(k);
                 let mut cov_c = cov_block;
                 cov_c.mapv_inplace(|v| v * dispersion);
-                let mut y = Array2::<f64>::zeros((r, r));
                 for (gi, &row) in eval_rows.iter().enumerate() {
-                    y.fill(0.0);
-                    for b1 in 0..m {
-                        let phi1 = atom.basis_values[[row, b1]];
-                        if phi1 == 0.0 {
-                            continue;
-                        }
-                        for b2 in 0..m {
-                            let phi2 = atom.basis_values[[row, b2]];
-                            if phi2 == 0.0 {
-                                continue;
-                            }
-                            let w = phi1 * phi2;
-                            for j1 in 0..r {
-                                for j2 in 0..r {
-                                    y[[j1, j2]] += w * cov_c[[b1 * r + j1, b2 * r + j2]];
-                                }
-                            }
-                        }
-                    }
+                    let basis = atom.basis_values.row(row);
                     for c in 0..p {
-                        let mut var = 0.0_f64;
-                        for j1 in 0..r {
-                            let u1 = uk[[c, j1]];
-                            if u1 == 0.0 {
-                                continue;
-                            }
-                            for j2 in 0..r {
-                                var += u1 * y[[j1, j2]] * uk[[c, j2]];
-                            }
-                        }
+                        let var = frame_projection.output_variance(k, cov_c.view(), basis, c);
                         band_sd[[gi, c]] = var.max(0.0).sqrt();
                     }
                 }
@@ -9907,33 +9977,7 @@ impl SaeManifoldTerm {
                 // full `(M_k·p)` decoder covariance through this atom's frame;
                 // identity (a plain scaled copy) on the un-framed full-`B` path.
                 let mut cov = if framed {
-                    let r = atom.border_frame_rank();
-                    let uk = self.frame_output_matrix(k);
-                    let mut lifted = Array2::<f64>::zeros((m * p, m * p));
-                    for b1 in 0..m {
-                        for b2 in 0..m {
-                            // Cov(B)[(b1,c1),(b2,c2)]
-                            //   = Σ_{j1,j2} U[c1,j1] Cov(C)[(b1,j1),(b2,j2)] U[c2,j2].
-                            for c1 in 0..p {
-                                for c2 in 0..p {
-                                    let mut acc = 0.0_f64;
-                                    for j1 in 0..r {
-                                        let u1 = uk[[c1, j1]];
-                                        if u1 == 0.0 {
-                                            continue;
-                                        }
-                                        for j2 in 0..r {
-                                            acc += u1
-                                                * cov_block[[b1 * r + j1, b2 * r + j2]]
-                                                * uk[[c2, j2]];
-                                        }
-                                    }
-                                    lifted[[b1 * p + c1, b2 * p + c2]] = acc;
-                                }
-                            }
-                        }
-                    }
-                    lifted
+                    frame_projection.lift_block(k, cov_block.view())
                 } else {
                     cov_block
                 };
@@ -9942,21 +9986,12 @@ impl SaeManifoldTerm {
                     // Var_c = Σ_{b1,b2} Φ[b1]Φ[b2] Cov[(b1,c),(b2,c)]; the flat
                     // decoder index is basis·p + channel (row-major (M_k, p)).
                     for c in 0..p {
-                        let mut var = 0.0_f64;
-                        for b1 in 0..m {
-                            let phi1 = atom.basis_values[[row, b1]];
-                            if phi1 == 0.0 {
-                                continue;
-                            }
-                            let i1 = b1 * p + c;
-                            for b2 in 0..m {
-                                let phi2 = atom.basis_values[[row, b2]];
-                                if phi2 == 0.0 {
-                                    continue;
-                                }
-                                var += phi1 * phi2 * cov[[i1, b2 * p + c]];
-                            }
-                        }
+                        let var = frame_projection.full_output_variance(
+                            k,
+                            cov.view(),
+                            atom.basis_values.row(row),
+                            c,
+                        );
                         band_sd[[gi, c]] = var.max(0.0).sqrt();
                     }
                 }
@@ -9981,7 +10016,7 @@ impl SaeManifoldTerm {
         penalty_scale: f64,
         row_layout: Option<&SaeRowLayout>,
         dense_beta_curvature: bool,
-        factored_row_projection: Option<&SaeFactoredRowProjection<'_>>,
+        factored_row_projection: Option<&FrameProjection>,
     ) -> Result<SaeBetaPenaltyAssembly, ArrowSchurError> {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
         let layout = registry.rho_layout();
@@ -10287,7 +10322,7 @@ impl SaeManifoldTerm {
         penalty: &AnalyticPenaltyKind,
         rho_local: ArrayView1<'_, f64>,
         row_layout: Option<&SaeRowLayout>,
-        factored_row_projection: Option<&SaeFactoredRowProjection<'_>>,
+        factored_row_projection: Option<&FrameProjection>,
     ) {
         let n = coord.n_obs();
         let d = coord.latent_dim();
@@ -10388,7 +10423,7 @@ impl SaeManifoldTerm {
         corrected: &Arc<IsometryPenalty>,
         rho_local: ArrayView1<'_, f64>,
         row_layout: Option<&SaeRowLayout>,
-        factored_row_projection: Option<&SaeFactoredRowProjection<'_>>,
+        factored_row_projection: Option<&FrameProjection>,
     ) {
         let n_obs = coord.n_obs();
         let d = coord.latent_dim();
@@ -10519,18 +10554,17 @@ impl SaeManifoldTerm {
                     if let Some(projection) = factored_row_projection {
                         let basis_col = beta_col / p;
                         let output = beta_col % p;
-                        let r = projection.ranks[atom_idx];
-                        let c_base = projection.off_c[atom_idx] + basis_col * r;
-                        if self.atoms[atom_idx].decoder_frame.is_none() {
-                            assert_eq!(r, p);
-                            sys.rows[row].htbeta[[row_off + c, c_base + output]] += mu * acc;
-                        } else {
-                            let uk = &projection.frames[atom_idx];
-                            for frame_col in 0..r {
-                                sys.rows[row].htbeta[[row_off + c, c_base + frame_col]] +=
-                                    mu * acc * uk[[output, frame_col]];
-                            }
-                        }
+                        let c_base = projection.border_offsets[atom_idx]
+                            + basis_col * projection.ranks[atom_idx];
+                        let mut hrow = sys.rows[row].htbeta.row_mut(row_off + c);
+                        let hrow_slice = hrow.as_slice_mut().expect("htbeta row is contiguous");
+                        projection.accumulate_output_project(
+                            atom_idx,
+                            c_base,
+                            output,
+                            mu * acc,
+                            hrow_slice,
+                        );
                     } else {
                         sys.rows[row].htbeta[[row_off + c, beta_off + beta_col]] += mu * acc;
                     }
@@ -11351,26 +11385,9 @@ impl SaeManifoldTerm {
             // refreshed below via `set_flat_beta` (the authoritative `B_k` is the
             // p-wide flatten; the active frames are re-synced from the decoder by
             // the polar refresh in the joint-fit driver).
-            let p = self.output_dim();
-            let beta_offsets = self.beta_offsets();
-            let off_c = self.factored_beta_offsets();
-            for atom_idx in 0..k_atoms {
-                let m = self.atoms[atom_idx].basis_size();
-                let r = self.atoms[atom_idx].border_frame_rank();
-                let uk = self.frame_output_matrix(atom_idx);
-                let ob = beta_offsets[atom_idx];
-                let oc = off_c[atom_idx];
-                for basis_col in 0..m {
-                    let base_b = ob + basis_col * p;
-                    let base_c = oc + basis_col * r;
-                    for i in 0..p {
-                        let mut acc = 0.0_f64;
-                        for j in 0..r {
-                            acc += delta_beta[base_c + j] * uk[[i, j]];
-                        }
-                        beta[base_b + i] += step_size * acc;
-                    }
-                }
+            let delta_b = FrameProjection::new(self).lift_border_vec(delta_beta);
+            for idx in 0..beta.len() {
+                beta[idx] += step_size * delta_b[idx];
             }
         } else {
             for idx in 0..beta.len() {
@@ -12468,30 +12485,8 @@ impl SaeManifoldTerm {
             // per-trial β update is a plain `beta0 + step·ΔB` (the decoder lives
             // in the full p-space). Un-framed atoms lift by identity. On the
             // full-`B` path `delta_b` is just `delta_beta`.
-            let p = self.output_dim();
             let delta_b: Array1<f64> = if frames_engaged {
-                let mut lifted = Array1::<f64>::zeros(self.beta_dim());
-                let beta_offsets = self.beta_offsets();
-                let off_c = self.factored_beta_offsets();
-                for atom_idx in 0..self.k_atoms() {
-                    let m = self.atoms[atom_idx].basis_size();
-                    let r = self.atoms[atom_idx].border_frame_rank();
-                    let uk = self.frame_output_matrix(atom_idx);
-                    let ob = beta_offsets[atom_idx];
-                    let oc = off_c[atom_idx];
-                    for basis_col in 0..m {
-                        let base_b = ob + basis_col * p;
-                        let base_c = oc + basis_col * r;
-                        for i in 0..p {
-                            let mut acc = 0.0_f64;
-                            for j in 0..r {
-                                acc += delta_beta[base_c + j] * uk[[i, j]];
-                            }
-                            lifted[base_b + i] = acc;
-                        }
-                    }
-                }
-                lifted
+                FrameProjection::new(self).lift_border_vec(delta_beta.view())
             } else {
                 delta_beta.clone()
             };
@@ -19576,37 +19571,10 @@ mod tests {
         assert!(dense_assembly.dense_written);
         assert!(!dense_assembly.deferred_factored);
 
-        let beta_offsets = term.beta_offsets();
-        let off_c = term.factored_beta_offsets();
-        let basis_sizes: Vec<usize> = term.atoms.iter().map(|atom| atom.basis_size()).collect();
-        let ranks: Vec<usize> = term
-            .atoms
-            .iter()
-            .map(|atom| atom.border_frame_rank())
-            .collect();
-        let frames: Vec<Array2<f64>> = (0..term.atoms.len())
-            .map(|atom_idx| term.frame_output_matrix(atom_idx))
-            .collect();
+        let projection = FrameProjection::new(&term);
         let border_dim = term.factored_border_dim();
-        let projected = term.project_dense_penalty_to_factored(
-            dense_sys.hbb.view(),
-            &beta_offsets,
-            &off_c,
-            &basis_sizes,
-            &ranks,
-            &frames,
-            border_dim,
-        );
-        let direct = term.build_factored_beta_penalty_curvature(
-            &registry,
-            1.0,
-            &beta_offsets,
-            &off_c,
-            &basis_sizes,
-            &ranks,
-            &frames,
-            border_dim,
-        );
+        let projected = term.project_dense_penalty_to_factored(dense_sys.hbb.view(), &projection);
+        let direct = term.build_factored_beta_penalty_curvature(&registry, 1.0, &projection);
         for row in 0..border_dim {
             for col in 0..border_dim {
                 assert_abs_diff_eq!(direct[[row, col]], projected[[row, col]], epsilon = 1.0e-10);
@@ -19663,48 +19631,7 @@ mod tests {
         term: &SaeManifoldTerm,
         htbeta_b: ArrayView2<'_, f64>,
     ) -> Array2<f64> {
-        let beta_offsets = term.beta_offsets();
-        let off_c = term.factored_beta_offsets();
-        let border_dim = term.factored_border_dim();
-        let p = term.output_dim();
-        let q_row = htbeta_b.nrows();
-        let mut out = Array2::<f64>::zeros((q_row, border_dim));
-        for atom_idx in 0..term.atoms.len() {
-            let atom = &term.atoms[atom_idx];
-            let m = atom.basis_size();
-            let r = atom.border_frame_rank();
-            let ob = beta_offsets[atom_idx];
-            let oc = off_c[atom_idx];
-            if atom.decoder_frame.is_none() {
-                assert_eq!(r, p);
-                for basis_col in 0..m {
-                    let base_b = ob + basis_col * p;
-                    let base_c = oc + basis_col * r;
-                    for row_col in 0..q_row {
-                        for output in 0..p {
-                            out[[row_col, base_c + output]] = htbeta_b[[row_col, base_b + output]];
-                        }
-                    }
-                }
-            } else {
-                let uk = term.frame_output_matrix(atom_idx);
-                for basis_col in 0..m {
-                    let base_b = ob + basis_col * p;
-                    let base_c = oc + basis_col * r;
-                    for row_col in 0..q_row {
-                        for frame_col in 0..r {
-                            let mut acc = 0.0_f64;
-                            for output in 0..p {
-                                acc +=
-                                    htbeta_b[[row_col, base_b + output]] * uk[[output, frame_col]];
-                            }
-                            out[[row_col, base_c + frame_col]] = acc;
-                        }
-                    }
-                }
-            }
-        }
-        out
+        FrameProjection::new(term).project_rows(htbeta_b)
     }
 
     #[test]
