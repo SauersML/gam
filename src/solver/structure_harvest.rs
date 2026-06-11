@@ -40,8 +40,7 @@ use crate::cache::Fingerprinter;
 use crate::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use crate::inference::structure_evidence::{ClaimKind, StructureLedger};
 use crate::solver::structure_search::{
-    CollapseAction, CollapseEvent, MoveBudget, MoveProposal, SearchLedger, SearchOutcome,
-    StructureMove, search,
+    CollapseAction, MoveBudget, MoveProposal, SearchLedger, SearchOutcome, StructureMove, search,
 };
 use crate::terms::atom_codes::SparseAtomCodes;
 use crate::terms::sae_manifold::{

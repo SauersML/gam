@@ -29,7 +29,7 @@ use crate::estimate::UnifiedFitResult;
 use crate::inference::alo::AloDiagnostics;
 use crate::inference::psis::pareto_smooth_weights;
 use crate::types::{GlmLikelihoodSpec, LikelihoodSpec};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, ArrayView1, ArrayView2};
 
 /// PSIS-LOO predictive-accuracy summary at zero refit cost.
 #[derive(Debug, Clone)]

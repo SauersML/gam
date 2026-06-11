@@ -2897,6 +2897,31 @@ pub struct ArrowSchurSystem {
     pub cross_row_penalties: Vec<CrossRowLatentPenalty>,
 }
 
+impl Clone for ArrowSchurSystem {
+    fn clone(&self) -> Self {
+        Self {
+            rows: self.rows.clone(),
+            hbb: self.hbb.clone(),
+            hbb_matvec: self.hbb_matvec.clone(),
+            htbeta_matvec: self.htbeta_matvec.clone(),
+            htbeta_transpose_matvec: self.htbeta_transpose_matvec.clone(),
+            htbeta_dense_supplement: self.htbeta_dense_supplement,
+            hbb_diag: self.hbb_diag.clone(),
+            gb: self.gb.clone(),
+            d: self.d,
+            row_dims: Arc::clone(&self.row_dims),
+            row_offsets: Arc::clone(&self.row_offsets),
+            k: self.k,
+            manifold_mode_fingerprint: self.manifold_mode_fingerprint,
+            row_hessian_fingerprint: self.row_hessian_fingerprint,
+            analytic_row_hessian_fingerprint: self.analytic_row_hessian_fingerprint,
+            block_offsets: Arc::clone(&self.block_offsets),
+            penalty_op: self.penalty_op.clone(),
+            cross_row_penalties: self.cross_row_penalties.clone(),
+        }
+    }
+}
+
 /// A captured cross-row Psi-tier analytic penalty: the penalty kind plus the
 /// global-ρ slice (`rho_local`) it was registered with.
 ///
