@@ -709,7 +709,7 @@ pub fn fit_penalized_multinomial_formula(
     // behaviour) forced a single λ per class that scales `Σ_t S_t`, so one
     // shared λ had to over-smooth a rough term while under-smoothing a smooth
     // one — biasing any multi-term class-probability surface.
-    let per_term_penalties = design
+    let per_term_penalties: Vec<PenaltyMatrix> = design
         .penalties_as_penalty_matrix()
         .into_iter()
         .map(scale_multinomial_formula_penalty)
