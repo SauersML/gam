@@ -53,7 +53,7 @@ use crate::linalg::faer_ndarray::{
     FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
 use faer::Side;
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, s};
+use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
 
 /// Smoothed column-2-norm of the decoder Jacobian.
 ///
@@ -1381,6 +1381,14 @@ pub struct AtomParameterView {
     pub coords: Array2<f64>,
     /// Per-row assignment mass `a_nk`, length `n`.
     pub activations: Array1<f64>,
+    /// Basis second-derivative jet `Φ''`, `(n, M, latent_dim, latent_dim)`.
+    /// Required only to lower an isometry [`OrbitPenaltyOperator`] for a
+    /// *pin-active* fit (#998): the penalty is a function of the pullback
+    /// metric `g_n = J_nᵀ W_n J_n`, and the first-order change of `g_n` under a
+    /// coordinate motion `δt` differentiates `J_n = Φ'_n B` through `t`, which
+    /// needs `Φ''`. `None` keeps the data-only orbit verdict (no pin), exactly
+    /// as before; absence never errors.
+    pub basis_second_jet: Option<Array4<f64>>,
 }
 
 /// The penalty/prior channel of the exact certificate: an operator returning
@@ -1402,6 +1410,161 @@ pub struct OrbitPenaltyOperator {
     /// orbit's penalty cost is reported relative to (the same
     /// relative-curvature convention as the frame certificate).
     pub stiffness_sq: f64,
+}
+
+/// Build the isometry-pin [`OrbitPenaltyOperator`] for one viewed atom from its
+/// second jet (#998 — the orbit-space pin operator the pin-active exact path
+/// needs).
+///
+/// The isometry penalty is `P = ½ μ Σ_n ‖g_n − g_ref‖²_F` with the pullback
+/// first-fundamental-form gram `g_n = J_nᵀ J_n`, `J_n[i,c] = Σ_m Φ'_n[m,c] B[m,i]`
+/// (Euclidean metric — the default isometry reference; an output-Fisher metric
+/// rides the same operator once its factors are threaded, which only re-weights
+/// the `i`-sum). At a converged isometric fit the residual `g_n − g_ref ≈ 0`, so
+/// the penalty's curvature along an orbit direction `(δB, δt)` is the
+/// Gauss-Newton term `μ Σ_n ‖δg_n‖²_F`, and the curvature-root image is
+/// `√μ · {δg_n[a,b]}` — its squared norm is exactly that cost. The first-order
+/// gram change
+///
+///   `δJ_n[i,c] = Σ_m Φ'_n[m,c] δB[m,i] + Σ_{m,e} Φ''_n[m,c,e] δt_n[e] B[m,i]`
+///   `δg_n[a,b] = Σ_i ( δJ_n[i,a] J_n[i,b] + J_n[i,a] δJ_n[i,b] )`
+///
+/// differentiates `J_n` through `t` via the **second jet** `Φ''` — which is why
+/// the pin-active path needs it and the frame path (no second jet) could not
+/// supply it. A model-class symmetry that preserves the metric (e.g. a circle
+/// phase shift on a closed harmonic basis) yields `δg_n = 0` → the operator
+/// gives it zero cost → it stays a certified freedom even under the pin; a
+/// non-isometric orbit (a Duchon/quadratic patch under rotation) yields
+/// `δg_n ≠ 0` → genuine pinning. The verdict is therefore conservative: the
+/// operator can only *cost* an orbit, never spuriously free one.
+///
+/// `weight` is the penalty strength `μ`. Returns `None` when the view carries no
+/// second jet (the atom's basis exposes no analytic Hessian): with no orbit-space
+/// operator the atom's verdict falls back to the data residual, never an error.
+/// The stiffness `σ_max²` is `μ` times the largest unit-coordinate-motion gram
+/// curvature `max_n σ_max(∂g_n/∂t)²`, so the reported relative fraction is on the
+/// same convention as the frame certificate.
+pub fn isometry_orbit_penalty_operator(
+    view: &AtomParameterView,
+    weight: f64,
+) -> Option<OrbitPenaltyOperator> {
+    let second = view.basis_second_jet.as_ref()?.clone();
+    let (n, m) = view.basis_values.dim();
+    let d = view.coords.ncols();
+    let p = view.decoder.ncols();
+    if second.dim() != (n, m, d, d) || view.basis_jacobian.dim() != (n, m, d) {
+        return None;
+    }
+    if !(weight.is_finite() && weight > 0.0) {
+        return None;
+    }
+    let sqrt_w = weight.sqrt();
+    let jac = view.basis_jacobian.clone();
+    let decoder = view.decoder.clone();
+
+    // Base pullback Jacobian J_n[i,c] = Σ_m Φ'_n[m,c] B[m,i] and its per-row
+    // first-fundamental gram σ_max scale (stiffness), computed once.
+    let mut j_base = Array3::<f64>::zeros((n, p, d));
+    for row in 0..n {
+        for i in 0..p {
+            for c in 0..d {
+                let mut acc = 0.0;
+                for mm in 0..m {
+                    acc += jac[[row, mm, c]] * decoder[[mm, i]];
+                }
+                j_base[[row, i, c]] = acc;
+            }
+        }
+    }
+
+    // Stiffness: σ_max over rows of the gram derivative ∂g_n/∂t along a unit
+    // coordinate motion. ∂g_n/∂t_e [a,b] = Σ_i ( H_n[i,a,e] J_n[i,b]
+    // + J_n[i,a] H_n[i,b,e] ), H_n[i,c,e] = Σ_m Φ''_n[m,c,e] B[m,i]. The
+    // stiffest unit δt direction's gram change drives the relative-curvature
+    // denominator; we take the largest ‖∂g/∂t_e‖_F over axes e and rows as a
+    // conservative (≤ true σ_max) scale, so the reported fraction never
+    // under-states the pin.
+    let mut max_curv_sq = 0.0_f64;
+    for row in 0..n {
+        // H_n[i, c, e] = Σ_m Φ''_n[m, c, e] B[m, i].
+        let mut hn = vec![0.0_f64; p * d * d];
+        for i in 0..p {
+            for c in 0..d {
+                for e in 0..d {
+                    let mut acc = 0.0;
+                    for mm in 0..m {
+                        acc += second[[row, mm, c, e]] * decoder[[mm, i]];
+                    }
+                    hn[(i * d + c) * d + e] = acc;
+                }
+            }
+        }
+        for e in 0..d {
+            let mut frob = 0.0_f64;
+            for a in 0..d {
+                for b in 0..d {
+                    let mut g = 0.0;
+                    for i in 0..p {
+                        g += hn[(i * d + a) * d + e] * j_base[[row, i, b]];
+                        g += j_base[[row, i, a]] * hn[(i * d + b) * d + e];
+                    }
+                    frob += g * g;
+                }
+            }
+            max_curv_sq = max_curv_sq.max(frob);
+        }
+    }
+    let stiffness_sq = (weight * max_curv_sq).max(f64::MIN_POSITIVE);
+
+    let apply = move |delta_b: ArrayView2<f64>, delta_t: ArrayView2<f64>| -> Array1<f64> {
+        let mut image = Array1::<f64>::zeros(n * d * d);
+        // δJ_n[i,c] = Σ_m Φ'_n[m,c] δB[m,i] + Σ_{m,e} Φ''_n[m,c,e] δt_n[e] B[m,i].
+        let valid_b = delta_b.dim() == (m, p);
+        let valid_t = delta_t.dim() == (n, d);
+        if !valid_t {
+            return image;
+        }
+        for row in 0..n {
+            let mut dj = vec![0.0_f64; p * d];
+            for i in 0..p {
+                for c in 0..d {
+                    let mut acc = 0.0;
+                    if valid_b {
+                        for mm in 0..m {
+                            acc += jac[[row, mm, c]] * delta_b[[mm, i]];
+                        }
+                    }
+                    for e in 0..d {
+                        let dte = delta_t[[row, e]];
+                        if dte == 0.0 {
+                            continue;
+                        }
+                        for mm in 0..m {
+                            acc += second[[row, mm, c, e]] * dte * decoder[[mm, i]];
+                        }
+                    }
+                    dj[i * d + c] = acc;
+                }
+            }
+            // δg_n[a,b] = Σ_i ( δJ[i,a] J[i,b] + J[i,a] δJ[i,b] ).
+            for a in 0..d {
+                for b in 0..d {
+                    let mut dg = 0.0;
+                    for i in 0..p {
+                        dg += dj[i * d + a] * j_base[[row, i, b]];
+                        dg += j_base[[row, i, a] ] * dj[i * d + b];
+                    }
+                    image[(row * d + a) * d + b] = sqrt_w * dg;
+                }
+            }
+        }
+        image
+    };
+
+    Some(OrbitPenaltyOperator {
+        apply: Box::new(apply),
+        stiffness_sq,
+    })
 }
 
 /// Enumerate one atom's exact orbit coordinate-motion fields `δt ∈ ℝ^{n×d}`.

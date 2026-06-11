@@ -23,7 +23,7 @@
 use gam::inference::row_metric::RowMetric;
 use gam::sae_identifiability::{
     AtomParameterView, AtomTopology, FittedAtom, FittedSaeManifold, GENERATOR_FLAT_ENERGY_TOL,
-    GeneratorFamily, OrbitPenaltyOperator, residual_gauge_exact,
+    GeneratorFamily, OrbitPenaltyOperator, isometry_orbit_penalty_operator, residual_gauge_exact,
 };
 use ndarray::{Array1, Array2, Array3};
 
@@ -37,16 +37,21 @@ fn circle_view() -> (FittedAtom, AtomParameterView) {
     let p = 4usize;
     let mut basis_values = Array2::<f64>::zeros((N, m));
     let mut basis_jacobian = Array3::<f64>::zeros((N, m, 1));
+    let mut basis_second = ndarray::Array4::<f64>::zeros((N, m, 1, 1));
     let mut coords = Array2::<f64>::zeros((N, 1));
+    let tau = std::f64::consts::TAU;
     for i in 0..N {
         let t = (i as f64 + 0.31) / N as f64;
-        let ang = std::f64::consts::TAU * t;
+        let ang = tau * t;
         coords[[i, 0]] = t;
         basis_values[[i, 0]] = 1.0;
         basis_values[[i, 1]] = ang.cos();
         basis_values[[i, 2]] = ang.sin();
-        basis_jacobian[[i, 1, 0]] = -std::f64::consts::TAU * ang.sin();
-        basis_jacobian[[i, 2, 0]] = std::f64::consts::TAU * ang.cos();
+        basis_jacobian[[i, 1, 0]] = -tau * ang.sin();
+        basis_jacobian[[i, 2, 0]] = tau * ang.cos();
+        // Φ'': second derivative of the harmonics (the constant row stays 0).
+        basis_second[[i, 1, 0, 0]] = -tau * tau * ang.cos();
+        basis_second[[i, 2, 0, 0]] = -tau * tau * ang.sin();
     }
     let mut decoder = Array2::<f64>::zeros((m, p));
     for r in 0..m {
@@ -70,6 +75,7 @@ fn circle_view() -> (FittedAtom, AtomParameterView) {
         decoder,
         coords,
         activations: Array1::<f64>::ones(N),
+        basis_second_jet: Some(basis_second),
     };
     (atom, view)
 }
@@ -84,6 +90,7 @@ fn patch_view(quadratic: bool) -> (FittedAtom, AtomParameterView) {
     let n = side * side;
     let mut basis_values = Array2::<f64>::zeros((n, m));
     let mut basis_jacobian = Array3::<f64>::zeros((n, m, 2));
+    let mut basis_second = ndarray::Array4::<f64>::zeros((n, m, 2, 2));
     let mut coords = Array2::<f64>::zeros((n, 2));
     for gx in 0..side {
         for gy in 0..side {
@@ -99,6 +106,10 @@ fn patch_view(quadratic: bool) -> (FittedAtom, AtomParameterView) {
             if quadratic {
                 basis_values[[row, 2]] = t1 * t1;
                 basis_jacobian[[row, 2, 0]] = 2.0 * t1;
+                // ∂²(t1²)/∂t1² = 2; the only nonzero second jet (the t1·t2 term
+                // a rotation produces lands outside the span, so this basis is
+                // not closed under so(2)).
+                basis_second[[row, 2, 0, 0]] = 2.0;
             }
         }
     }
@@ -125,6 +136,7 @@ fn patch_view(quadratic: bool) -> (FittedAtom, AtomParameterView) {
         decoder,
         coords,
         activations: Array1::<f64>::ones(n),
+        basis_second_jet: Some(basis_second),
     };
     (atom, view)
 }
@@ -267,5 +279,76 @@ fn penalty_channel_alone_decides_true_symmetries() {
         report_pinned.group_signature(),
         report_free.group_signature(),
         "pin on vs off must certify different groups"
+    );
+}
+
+#[test]
+fn pin_active_orbit_operator_from_second_jet_is_conservative() {
+    // #998 pin-active rung: the orbit-space isometry pin operator, lowered from
+    // the atom's SECOND jet Φ'', must be CONSERVATIVE on the exact path —
+    //   (a) it must not spuriously FREE a genuinely non-isometric orbit, and
+    //   (b) it must not spuriously PIN a genuine model-class isometry.
+    // Both are the load-bearing properties the seam worried about ("over-claiming
+    // freedom" under a pin). The pin strength is canonical (1.0): the reported
+    // relative-curvature fraction is invariant to μ.
+
+    // (b) The harmonic circle's phase shift is a metric isometry: its compensated
+    // orbit leaves J (hence g = JᵀJ) unchanged, so the second-jet operator gives
+    // it ZERO cost. It must stay a certified freedom even with the pin installed.
+    let (circle_atom, circle_view) = circle_view();
+    let circle_pin = isometry_orbit_penalty_operator(&circle_view, 1.0)
+        .expect("circle view carries Φ'' ⇒ an isometry operator must lower");
+    let circle_model = single_atom_model(circle_atom);
+    let report_circle =
+        residual_gauge_exact(&circle_model, &[Some(circle_view)], &[Some(circle_pin)])
+            .expect("pin-active circle certificate");
+    let phase = exact_isom_verdict(&report_circle);
+    assert!(
+        phase.unpinned && phase.pinned_energy_fraction <= 1.0e-9,
+        "an isometric phase shift must stay a certified freedom under the \
+         second-jet isometry pin — the operator must not over-claim a pin. \
+         fraction = {}, {}",
+        phase.pinned_energy_fraction,
+        report_circle.summary
+    );
+
+    // (a) The quadratic patch's so(2) rotation is NOT closed under the action and
+    // is already data-pinned; adding the second-jet isometry operator must keep
+    // it pinned (a conservative certificate never frees a pinned orbit). The
+    // operator lowers because the quadratic view carries Φ''.
+    let (quad_atom, quad_view) = patch_view(true);
+    let quad_pin = isometry_orbit_penalty_operator(&quad_view, 1.0)
+        .expect("quadratic patch carries Φ'' ⇒ an isometry operator must lower");
+    let report_quad =
+        residual_gauge_exact(&single_atom_model(quad_atom), &[Some(quad_view)], &[Some(quad_pin)])
+            .expect("pin-active quadratic certificate");
+    let rot = exact_isom_verdict(&report_quad);
+    assert!(
+        !rot.unpinned,
+        "a non-isometric rotation must remain pinned with the isometry pin \
+         active — the pin-active exact path must not free it. {}",
+        report_quad.summary
+    );
+
+    // The linear patch's rotation is both a data-null AND a metric isometry
+    // (rotation preserves the flat metric). Its second jet is identically zero,
+    // so the lowered isometry operator gives every orbit zero cost — installing
+    // it must leave the rotation a certified freedom (the honest "this IS a
+    // symmetry of the model class" verdict, unchanged by a vacuous pin).
+    let (lin_atom, lin_view) = patch_view(false);
+    let lin_pin = isometry_orbit_penalty_operator(&lin_view, 1.0)
+        .expect("a curvature-free basis still lowers a (zero-cost) isometry operator");
+    let report_lin = residual_gauge_exact(
+        &single_atom_model(lin_atom),
+        &[Some(lin_view)],
+        &[Some(lin_pin)],
+    )
+    .expect("pin-active linear patch certificate");
+    let rot_lin = exact_isom_verdict(&report_lin);
+    assert!(
+        rot_lin.unpinned && rot_lin.pinned_energy_fraction <= 1.0e-9,
+        "a linear chart rotation is a genuine isometry ⇒ a certified freedom \
+         even under the (zero-cost) pin. {}",
+        report_lin.summary
     );
 }

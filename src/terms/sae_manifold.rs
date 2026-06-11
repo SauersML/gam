@@ -5120,22 +5120,45 @@ impl SaeManifoldTerm {
 
         let (certificate_model, streamed_curvature) =
             self.to_residual_gauge_model(metric, per_atom_ard_variances, isometry_pin_active)?;
-        // #998: when no isometry pin is installed, within-atom gauge families
-        // are certified on their EXACT orbits in the model's own
-        // (decoder, coordinate) parameter space — compensated symmetries are
-        // data-nulls by construction there, no lowering-error calibration
-        // involved. With a pin active the exact path would need the pin's
-        // orbit-space curvature operator to avoid over-claiming freedom; until
-        // that operator is lowered (it needs the second-derivative jets), the
-        // pinned case stays on the calibrated frame path, which is the honest
-        // floor. Magic-by-default either way: the choice is derived from the
-        // fit, never a flag.
-        let residual_gauge = if isometry_pin_active {
-            crate::sae_identifiability::residual_gauge(&certificate_model)?
+        // #998: within-atom gauge families are certified on their EXACT orbits
+        // in the model's own (decoder, coordinate) parameter space — compensated
+        // symmetries are data-nulls by construction there, no lowering-error
+        // calibration involved. This now holds whether or not an isometry pin is
+        // active:
+        //   * pin INACTIVE ⇒ the orbit verdict is the data residual alone (no
+        //     penalty operator);
+        //   * pin ACTIVE ⇒ the orbit verdict adds the isometry pin's orbit-space
+        //     curvature through an [`OrbitPenaltyOperator`] lowered from the
+        //     atom's second jet `Φ''` (the pullback-metric change along the orbit
+        //     differentiates `J = Φ'B` through `t`). A model-class symmetry that
+        //     preserves the metric stays a certified freedom; a non-isometric
+        //     orbit (a basis not closed under the action) is genuinely pinned.
+        // The relative-curvature fraction `cost/stiffness²` is invariant to the
+        // pin strength μ (both faces scale with μ), so the operator is built at a
+        // canonical unit weight. An atom whose basis exposes no analytic second
+        // jet supplies no operator and falls back to the data residual — never an
+        // error. Magic-by-default either way: the choice is derived from the fit,
+        // never a flag.
+        let views = self.atom_parameter_views();
+        let ops: Vec<Option<crate::sae_identifiability::OrbitPenaltyOperator>> = if isometry_pin_active
+        {
+            views
+                .iter()
+                .map(|view| {
+                    view.as_ref().and_then(|v| {
+                        crate::sae_identifiability::isometry_orbit_penalty_operator(v, 1.0)
+                    })
+                })
+                .collect()
         } else {
-            let views = self.atom_parameter_views();
-            let ops: Vec<Option<crate::sae_identifiability::OrbitPenaltyOperator>> =
-                (0..self.k_atoms()).map(|_| None).collect();
+            (0..self.k_atoms()).map(|_| None).collect()
+        };
+        let residual_gauge = if isometry_pin_active {
+            // The pin-active path consumes the per-row Jacobian curvature
+            // directly (the certificate_model retains it under a pin), so route
+            // through the non-streamed exact entry point.
+            crate::sae_identifiability::residual_gauge_exact(&certificate_model, &views, &ops)?
+        } else {
             let (curvature_gram, root_rows) = streamed_curvature.ok_or_else(|| {
                 "fit_diagnostics_report: missing streamed residual-gauge curvature for unpinned exact path"
                     .to_string()
