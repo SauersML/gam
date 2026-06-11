@@ -4965,7 +4965,7 @@ impl ArrowFactorCache {
     /// (undamped per-row factors + dense Schur), so the solve is against the
     /// criterion's own `H` — never a damped surrogate (that would desync the
     /// gradient from the reported evidence).
-    pub fn solve_full(
+    pub fn full_inverse_apply(
         &self,
         w_t: ArrayView1<'_, f64>,
         w_beta: ArrayView1<'_, f64>,
@@ -4974,7 +4974,7 @@ impl ArrowFactorCache {
         if w_t.len() != total_len || w_beta.len() != self.k {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: format!(
-                    "solve_full: rhs shapes (w_t={}, w_beta={}) != (delta_t_len={}, K={})",
+                    "full_inverse_apply: rhs shapes (w_t={}, w_beta={}) != (delta_t_len={}, K={})",
                     w_t.len(),
                     w_beta.len(),
                     total_len,
@@ -4999,7 +4999,7 @@ impl ArrowFactorCache {
                 if !self.apply_htbeta_row_transpose(i, y_row.view(), &mut acc, None) {
                     return Err(ArrowSchurError::SchurFactorFailed {
                         reason: format!(
-                            "solve_full: H_βt^({i}) apply failed (htbeta cache \
+                            "full_inverse_apply: H_βt^({i}) apply failed (htbeta cache \
                              could not supply row {i})"
                         ),
                     });
@@ -5030,7 +5030,7 @@ impl ArrowFactorCache {
                 if !self.apply_htbeta_row(i, u_beta.view(), &mut cross_owned) {
                     return Err(ArrowSchurError::SchurFactorFailed {
                         reason: format!(
-                            "solve_full: H_tβ^({i}) apply failed (htbeta cache \
+                            "full_inverse_apply: H_tβ^({i}) apply failed (htbeta cache \
                              could not supply row {i})"
                         ),
                     });
@@ -9410,13 +9410,13 @@ mod tests {
         );
     }
 
-    /// `solve_full` (#1006 IFT/adjoint back-solve) must reproduce the dense
+    /// `full_inverse_apply` (#1006 IFT/adjoint back-solve) must reproduce the dense
     /// bordered-arrow inverse applied to an arbitrary arrow-layout RHS, and
     /// solving against the system's own gradient must reproduce the Newton
     /// step the solver itself returned (`Δ = H⁻¹g`) — both to near machine
     /// precision on the ridge-0 Direct factor.
     #[test]
-    fn solve_full_matches_dense_inverse_and_newton_step() {
+    fn full_inverse_apply_matches_dense_inverse_and_newton_step() {
         let n = 3usize;
         let d = 2usize;
         let k = 2usize;
@@ -9438,7 +9438,7 @@ mod tests {
             solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
                 .expect("direct arrow solve should factor this SPD system");
 
-        // (a) The solver returns the DESCENT step Δ = −H⁻¹g; solve_full is the
+        // (a) The solver returns the DESCENT step Δ = −H⁻¹g; full_inverse_apply is the
         // bare inverse application H⁻¹g, so u must equal −Δ exactly.
         let mut g_t = Array1::<f64>::zeros(n * d);
         for i in 0..n {
@@ -9447,12 +9447,12 @@ mod tests {
             }
         }
         let (u_t, u_beta) = cache
-            .solve_full(g_t.view(), sys.gb.view())
-            .expect("solve_full on the ridge-0 Direct cache");
+            .full_inverse_apply(g_t.view(), sys.gb.view())
+            .expect("full_inverse_apply on the ridge-0 Direct cache");
         for idx in 0..n * d {
             assert!(
                 (u_t[idx] + delta_t[idx]).abs() < 1e-10,
-                "t[{idx}]: solve_full {} vs −(Newton step) {}",
+                "t[{idx}]: full_inverse_apply {} vs −(Newton step) {}",
                 u_t[idx],
                 -delta_t[idx]
             );
@@ -9460,7 +9460,7 @@ mod tests {
         for c in 0..k {
             assert!(
                 (u_beta[c] + delta_beta[c]).abs() < 1e-10,
-                "beta[{c}]: solve_full {} vs −(Newton step) {}",
+                "beta[{c}]: full_inverse_apply {} vs −(Newton step) {}",
                 u_beta[c],
                 -delta_beta[c]
             );
@@ -9494,15 +9494,15 @@ mod tests {
         }
         let dense_u = cholesky_solve_vector(&l, &w_full);
         let (u_t2, u_beta2) = cache
-            .solve_full(
+            .full_inverse_apply(
                 w_full.slice(ndarray::s![..n * d]),
                 w_full.slice(ndarray::s![n * d..]),
             )
-            .expect("solve_full on arbitrary RHS");
+            .expect("full_inverse_apply on arbitrary RHS");
         for idx in 0..n * d {
             assert!(
                 (u_t2[idx] - dense_u[idx]).abs() < 1e-10,
-                "t[{idx}]: solve_full {} vs dense {}",
+                "t[{idx}]: full_inverse_apply {} vs dense {}",
                 u_t2[idx],
                 dense_u[idx]
             );
@@ -9510,7 +9510,7 @@ mod tests {
         for c in 0..k {
             assert!(
                 (u_beta2[c] - dense_u[n * d + c]).abs() < 1e-10,
-                "beta[{c}]: solve_full {} vs dense {}",
+                "beta[{c}]: full_inverse_apply {} vs dense {}",
                 u_beta2[c],
                 dense_u[n * d + c]
             );
