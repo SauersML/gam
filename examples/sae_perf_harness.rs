@@ -24,7 +24,7 @@ const ALPHA: f64 = 1.0;
 const LOG_LAMBDA_SPARSE: f64 = -12.0;
 const LOG_LAMBDA_SMOOTH: f64 = -12.0;
 const INNER_MAX_ITER: usize = 12;
-const OUTER_MAX_ITER: usize = 4;
+const OUTER_MAX_ITER: usize = 1;
 const LEARNING_RATE: f64 = 1.0;
 const RIDGE_EXT_COORD: f64 = 1.0e-6;
 const RIDGE_BETA: f64 = 1.0e-6;
@@ -126,11 +126,11 @@ impl OuterObjective for CountingObjective {
     }
 
     fn allow_continuation_prewarm(&self) -> bool {
-        self.inner.allow_continuation_prewarm()
+        false
     }
 
     fn requires_continuation_path_entry(&self) -> bool {
-        self.inner.requires_continuation_path_entry()
+        false
     }
 }
 
