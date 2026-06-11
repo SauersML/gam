@@ -929,6 +929,19 @@ pub(in crate::solver::estimate) fn latent_id_mode_cache_fingerprint(
             hash_aux_prior_strength(&mut hasher, *strength);
         }
         LatentIdMode::DimSelection { .. } => hasher.write_str("dim-selection"),
+        LatentIdMode::AuxOutcome { head, .. } => {
+            use crate::terms::behavioral_head::AuxOutcomeFamily;
+            hasher.write_str("aux-outcome");
+            match head.family() {
+                AuxOutcomeFamily::Binomial => hasher.write_str("binomial"),
+                AuxOutcomeFamily::Multinomial { n_classes } => {
+                    hasher.write_str("multinomial");
+                    hasher.write_usize(n_classes);
+                }
+            }
+            hasher.write_usize(head.n_obs());
+            hasher.write_f64(head.effective_labeled_count());
+        }
         LatentIdMode::None => hasher.write_str("none"),
     }
     hasher.finish_u64()

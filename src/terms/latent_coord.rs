@@ -136,6 +136,27 @@ pub enum LatentIdMode {
     DimSelection {
         init_log_precision: Option<Array1<f64>>,
     },
+    /// Behaviorally-anchored head (issue #912). The auxiliary signal is
+    /// promoted from a fixed-covariate *prior* to a modeled *outcome*: a GLM
+    /// behavioral head `g(E[y|t]) = a + t·w` whose design columns are the
+    /// latent codes contributes a *likelihood* term to the joint objective,
+    /// so REML balances reconstruction vs. behavioral fit with no trade-off
+    /// scalar (magic by default).
+    ///
+    /// The head's coefficients are direct hyperparameters appended to θ (one
+    /// `(1 + d)` block per η-channel), like the AuxPrior log-`μ`. Because a
+    /// single binary label pins ~1 gauge dimension, `AuxOutcome` *composes*
+    /// with `DimSelection` ARD (the `init_log_precision` seed) and the
+    /// isometry pin rather than replacing them; the validator requires that
+    /// composition and rejects a head with no labels.
+    AuxOutcome {
+        head: crate::terms::behavioral_head::BehavioralHead,
+        /// ARD seed composed with the head, one log-precision per latent axis
+        /// (length `d`). `AuxOutcome` always carries the ARD axis-selection
+        /// alongside the behavioral anchor, since the label alone under-pins
+        /// the gauge. `None` defaults to a flat zero seed.
+        init_log_precision: Option<Array1<f64>>,
+    },
     /// No gauge fix. Inner Hessian is rank-deficient; results are not
     /// uniquely defined. Intended only for the explicit "I supply my own
     /// gauge constraint via the smoothing penalty" pathway.
@@ -752,10 +773,37 @@ impl LatentIdMode {
     /// Fixes the audit finding that ARD/DimSelection alone is rotation
     /// symmetric and therefore not a standalone identifiability mode.
     pub fn is_identifiable(&self) -> bool {
-        matches!(
-            self,
-            Self::AuxPrior { .. } | Self::AuxPriorDimSelection { .. }
-        )
+        match self {
+            Self::AuxPrior { .. } | Self::AuxPriorDimSelection { .. } => true,
+            // The behavioral head anchors the gauge through the label channel
+            // and always composes with ARD axis-selection; it is a standalone
+            // identifiable mode provided the head actually carries labels (an
+            // empty head pins nothing, rejected by `validate`).
+            Self::AuxOutcome { head, .. } => head.effective_labeled_count() > 0.0,
+            Self::DimSelection { .. } | Self::None => false,
+        }
+    }
+
+    /// Validate the mode's identifiability composition (issue #912 step 2).
+    ///
+    /// `AuxOutcome` must carry a non-vacuous head (at least one labeled row)
+    /// and composes with ARD — a bare label channel with no axis-selection
+    /// under-pins the gauge. Returns the offending reason on failure so the
+    /// builder can reject before fitting, mirroring the existing
+    /// `reject_dim_selection_alone` gate.
+    pub fn validate(&self) -> Result<(), String> {
+        self.reject_dim_selection_alone();
+        if let Self::AuxOutcome { head, .. } = self
+            && head.effective_labeled_count() <= 0.0
+        {
+            return Err(
+                "LatentIdMode::AuxOutcome: the behavioral head has no labeled rows \
+                 (Σ row-weights = 0); a label-free head pins no gauge dimension. \
+                 Provide labels or use AuxPrior/DimSelection composition."
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     fn reject_dim_selection_alone(&self) {
@@ -859,7 +907,9 @@ impl LatentCoordValues {
         manifold: LatentManifold,
         retraction_registry: LatentRetractionRegistry,
     ) -> Self {
-        id_mode.reject_dim_selection_alone();
+        id_mode
+            .validate()
+            .expect("invalid LatentIdMode for LatentCoordValues::from_matrix_with_manifold");
         let n_obs = matrix.nrows();
         let latent_dim = matrix.ncols();
         retraction_registry
@@ -928,7 +978,9 @@ impl LatentCoordValues {
         retraction_registry: LatentRetractionRegistry,
         id: u64,
     ) -> Self {
-        id_mode.reject_dim_selection_alone();
+        id_mode
+            .validate()
+            .expect("invalid LatentIdMode for LatentCoordValues::from_flat");
         assert_eq!(
             values.len(),
             n_obs * latent_dim,
