@@ -787,9 +787,9 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         if s.nrows() != p || s.ncols() != p || x_star.len() != p {
             return Err("gaussian reml response: column-count mismatch".to_string());
         }
-        let (evals, _) = s
-            .eigh(Side::Lower)
-            .map_err(|e| format!("gaussian reml response: penalty eigendecomposition failed: {e:?}"))?;
+        let (evals, _) = s.eigh(Side::Lower).map_err(|e| {
+            format!("gaussian reml response: penalty eigendecomposition failed: {e:?}")
+        })?;
         let max_ev = evals.iter().cloned().fold(0.0_f64, |a, b| a.max(b.abs()));
         let tol = max_ev * 1e-10 * (p.max(1) as f64);
         let rank_s = evals.iter().filter(|&&e| e > tol).count();
@@ -887,8 +887,8 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         let value = coef * d.ln() + logdet - r * rho;
         let grad = coef * pen / d + lambda * tr_ainv_s - r;
         let pen_prime = pen - 2.0 * lambda * lambda * quad;
-        let hess =
-            coef * (pen_prime * d - pen * pen) / (d * d) + lambda * tr_ainv_s - lambda * lambda * tr_ainv_s_sq;
+        let hess = coef * (pen_prime * d - pen * pen) / (d * d) + lambda * tr_ainv_s
+            - lambda * lambda * tr_ainv_s_sq;
 
         // ∂μ̂/∂ρ = X (dβ̂/dρ) = −λ X v_s.
         let xv = fast_av(self.x, &v_s);
@@ -924,7 +924,9 @@ impl<'a> GaussianRemlRhoResponse<'a> {
     pub fn drho_dz(&self, rho: f64, z: f64) -> Result<f64, String> {
         let ev = self.eval(rho, Some(z))?;
         if ev.hess.abs() < 1e-14 {
-            return Err("gaussian reml response: outer Hessian ∂²Ṽ/∂ρ² ≈ 0; dρ̂/dz singular".to_string());
+            return Err(
+                "gaussian reml response: outer Hessian ∂²Ṽ/∂ρ² ≈ 0; dρ̂/dz singular".to_string(),
+            );
         }
         Ok(-ev.cross / ev.hess)
     }
@@ -1375,7 +1377,11 @@ mod tests {
         let (x, y, s) = gauss_reml_fixture(40, 8);
         let x_star = cosine_row(8, 0.5);
         let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
-        assert_eq!(resp.rank_s(), 6, "quartic penalty with two zeros has rank p−2");
+        assert_eq!(
+            resp.rank_s(),
+            6,
+            "quartic penalty with two zeros has rank p−2"
+        );
 
         let rho = 0.4_f64;
         let z = 0.3_f64;
@@ -1398,9 +1404,9 @@ mod tests {
             hess_fd
         );
         let k = 1e-4_f64;
-        let cross_fd =
-            (v(rho + h, z + k) - v(rho + h, z - k) - v(rho - h, z + k) + v(rho - h, z - k))
-                / (4.0 * h * k);
+        let cross_fd = (v(rho + h, z + k) - v(rho + h, z - k) - v(rho - h, z + k)
+            + v(rho - h, z - k))
+            / (4.0 * h * k);
         assert!(
             (ev.cross - cross_fd).abs() <= 1e-3 * (1.0 + ev.cross.abs()),
             "∂²Ṽ/∂ρ∂z mismatch: analytic={} fd={}",
@@ -1490,13 +1496,23 @@ mod tests {
                     let lo = frozen.intervals.first().unwrap().lo;
                     let hi = frozen.intervals.last().unwrap().hi;
                     let span = (hi - lo).max(1.0);
-                    let z_lo = if lo.is_finite() { lo - 0.5 * span } else { -12.0 };
-                    let z_hi = if hi.is_finite() { hi + 0.5 * span } else { 12.0 };
+                    let z_lo = if lo.is_finite() {
+                        lo - 0.5 * span
+                    } else {
+                        -12.0
+                    };
+                    let z_hi = if hi.is_finite() {
+                        hi + 0.5 * span
+                    } else {
+                        12.0
+                    };
                     let grid = 200usize;
                     for g in 0..=grid {
                         let z = z_lo + (z_hi - z_lo) * (g as f64) / (grid as f64);
-                        let in_frozen =
-                            frozen.intervals.iter().any(|itv| z >= itv.lo && z <= itv.hi);
+                        let in_frozen = frozen
+                            .intervals
+                            .iter()
+                            .any(|itv| z >= itv.lo && z <= itv.hi);
                         let honest = resp.honest_membership(z, alpha).expect("honest");
                         assert_eq!(
                             in_frozen, honest,
@@ -1513,7 +1529,10 @@ mod tests {
             "no benign configuration in the sweep certified — the frozen-ρ certificate \
              is vacuously always-refusing, which would make it useless"
         );
-        assert!(soundness_checks >= 1, "no certified config carried a verifiable set");
+        assert!(
+            soundness_checks >= 1,
+            "no certified config carried a verifiable set"
+        );
     }
 
     /// The certificate must REFUSE to claim a proof when the smoothing

@@ -3219,18 +3219,14 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(None);
         }
         let started = std::time::Instant::now();
-        let mut forest = match CellFamilyForest::partition(
-            &a_rows,
-            &b_rows,
-            &score_breaks,
-            &link_breaks,
-        ) {
-            Ok(forest) => forest,
-            Err(reason) => {
-                log::debug!("[BMS cell-family-forest] partition skipped: {reason}");
-                return Ok(None);
-            }
-        };
+        let mut forest =
+            match CellFamilyForest::partition(&a_rows, &b_rows, &score_breaks, &link_breaks) {
+                Ok(forest) => forest,
+                Err(reason) => {
+                    log::debug!("[BMS cell-family-forest] partition skipped: {reason}");
+                    return Ok(None);
+                }
+            };
         // Demand pass: every row's interior finite cells, keyed by combo.
         // Tail (semi-infinite) cells keep their closed-form affine anchors —
         // interpolating them would be slower than the closed form.

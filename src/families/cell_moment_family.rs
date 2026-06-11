@@ -735,7 +735,10 @@ mod tests {
         }
         let mut forest = CellFamilyForest::partition(&a, &b, &score_breaks, &link_breaks)
             .expect("forest partition");
-        assert!(forest.total_leaves() > 1, "kink lines must force subdivision");
+        assert!(
+            forest.total_leaves() > 1,
+            "kink lines must force subdivision"
+        );
         assert!(
             forest.eligible_leaves() > 0,
             "a dense cloud must yield at least one eligible kink-free leaf"
