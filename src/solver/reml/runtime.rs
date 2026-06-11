@@ -1784,7 +1784,7 @@ impl Gam784BlockTarget<'_> {
     /// is never consumed.
     fn neg_score_at(&self, eta: &Array1<f64>) -> Array1<f64> {
         let spec_response = reml_spec(&self.likelihood).response.clone();
-        let family = crate::pirls::weight_family_for_glm_likelihood(&self.likelihood);
+        let family = pirls::weight_family_for_glm_likelihood(&self.likelihood);
         let fam_scale = match &spec_response {
             ResponseFamily::Gaussian | ResponseFamily::Tweedie { .. } => {
                 1.0 / self.likelihood.fixed_phi().unwrap_or(1.0)
@@ -1810,7 +1810,7 @@ impl Gam784BlockTarget<'_> {
             } else {
                 jet.mu.max(MU_FLOOR)
             };
-            let v = crate::pirls::variance_jet_for_weight_family(family, mu_c).v;
+            let v = pirls::variance_jet_for_weight_family(family, mu_c).v;
             if !(v.is_finite() && v > 0.0) {
                 continue;
             }
