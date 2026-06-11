@@ -295,6 +295,8 @@ def main() -> None:
         report["candidates"].append(res)
         with open(args.out, "w") as f:
             json.dump(report, f, indent=2, default=str)
+    with open(args.out, "w") as f:
+        json.dump(report, f, indent=2, default=str)
     print(f"[done] wrote {args.out}", flush=True)
 
 
