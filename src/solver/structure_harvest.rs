@@ -660,31 +660,67 @@ pub struct RowBlockShard {
     pub rows: Vec<usize>,
 }
 
-/// Partition `n` rows into `n_shards` contiguous held-out blocks (the
-/// estimation/evaluation split). Deterministic — contiguous blocks, no shuffle.
-/// Each shard shares the full target by reference; the row indices select the
-/// held-out block.
-pub fn row_block_shards(target: ArrayView2<'_, f64>, n_shards: usize) -> Vec<RowBlockShard> {
+/// The estimation/evaluation row split the e-process gates run over. The
+/// estimation rows are the candidate's fitting set (weight `1`); the evaluation
+/// rows are held out (weight `0` during the fit) and partitioned into the shard
+/// stream the gate accumulates evidence over.
+#[derive(Clone, Debug)]
+pub struct EstimationEvalSplit {
+    /// Estimation row indices (the candidate is refit on these; held-out rows
+    /// carry weight `0`).
+    pub estimation_rows: Vec<usize>,
+    /// The evaluation shards, in stream order.
+    pub shards: Vec<RowBlockShard>,
+}
+
+/// Fraction of rows reserved for estimation (the candidate's fitting set); the
+/// remainder is split into evaluation shards. A fixed structural constant
+/// (magic-by-default): a majority estimation split keeps the candidate fit
+/// faithful while leaving a held-out block for honest evidence.
+const ESTIMATION_FRACTION: f64 = 0.6;
+
+/// Build the estimation/evaluation split: the first `ESTIMATION_FRACTION` of the
+/// rows (contiguous) are the estimation set, the remainder is partitioned into
+/// `n_shards` contiguous held-out evaluation blocks. Deterministic — contiguous
+/// blocks, no shuffle. Each shard shares the full target by reference.
+pub fn estimation_eval_split(
+    target: ArrayView2<'_, f64>,
+    n_shards: usize,
+) -> EstimationEvalSplit {
     let n = target.nrows();
-    if n_shards == 0 || n == 0 {
-        return Vec::new();
+    if n == 0 {
+        return EstimationEvalSplit {
+            estimation_rows: Vec::new(),
+            shards: Vec::new(),
+        };
     }
     let shared = std::sync::Arc::new(target.to_owned());
-    let n_shards = n_shards.min(n);
-    let base = n / n_shards;
-    let rem = n % n_shards;
-    let mut shards = Vec::with_capacity(n_shards);
-    let mut start = 0usize;
-    for s in 0..n_shards {
-        let len = base + usize::from(s < rem);
-        let rows: Vec<usize> = (start..start + len).collect();
-        shards.push(RowBlockShard {
-            target: shared.clone(),
-            rows,
-        });
-        start += len;
+    // At least one estimation row and at least one evaluation row when n ≥ 2.
+    let n_est = ((n as f64 * ESTIMATION_FRACTION).round() as usize)
+        .clamp(1, n.saturating_sub(1).max(1));
+    let estimation_rows: Vec<usize> = (0..n_est).collect();
+    let eval_rows: Vec<usize> = (n_est..n).collect();
+    let n_eval = eval_rows.len();
+    let n_shards = n_shards.min(n_eval).max(usize::from(n_eval > 0));
+    let mut shards = Vec::new();
+    if n_eval > 0 && n_shards > 0 {
+        let base = n_eval / n_shards;
+        let rem = n_eval % n_shards;
+        let mut cursor = 0usize;
+        for s in 0..n_shards {
+            let len = base + usize::from(s < rem);
+            let rows: Vec<usize> = eval_rows[cursor..cursor + len].to_vec();
+            shards.push(RowBlockShard {
+                target: shared.clone(),
+                rows,
+            });
+            cursor += len;
+        }
     }
-    shards
+    EstimationEvalSplit {
+        estimation_rows,
+        shards,
+    }
 }
 
 /// Outcome of the full round driver: the (possibly restructured) fitted term +
@@ -701,17 +737,20 @@ pub struct StructureSearchResult {
 /// round applies no moves (#997 round driver).
 ///
 /// Each round: harvest proposals from the current fitted term, run [`search`]
-/// over the held-out row-block shards (gating births/fissions/fusions, demoting
+/// over the held-out evaluation shards (gating births/fissions/fusions, demoting
 /// never-certified deaths), and adopt the restructured state. The loop stops
 /// when a round's ledger contains no applied move (every record is
 /// contested / vetoed / deduplicated / deferred / stale) or `max_rounds` is hit.
 ///
-/// `fit` is the production refit: given a candidate term + ρ and a shard, it
-/// folds the shard in and returns the jointly-refit term + ρ (the term carries
-/// its collapse events). It is INFALLIBLE at this boundary — it absorbs its own
-/// inner-solve errors by returning the unchanged candidate, so a failed warm
-/// refit on one shard is a conservative no-improvement signal to the gate, never
-/// a panic and never an aborted round.
+/// `candidate_fit` is the warm refit: given a RESTRUCTURED candidate term + ρ,
+/// it refits the candidate on the ESTIMATION rows only (held-out evaluation rows
+/// carry weight `0`), so the candidate is the predictable plug-in the e-process
+/// evaluates on the held-out shard stream. It is INFALLIBLE at this boundary —
+/// it absorbs its own inner-solve errors by returning the unchanged candidate (a
+/// conservative no-improvement signal to the gate, never a panic). The shard
+/// fold is a no-op: the candidate is fixed across the stream (a predictable
+/// plug-in), and each shard contributes its held-out reconstruction
+/// likelihood-ratio against the honestly-refit null sup.
 #[allow(clippy::too_many_arguments)]
 pub fn run_structure_search_rounds(
     mut term: SaeManifoldTerm,
@@ -722,13 +761,13 @@ pub fn run_structure_search_rounds(
     max_rounds: usize,
     harvest_params: HarvestParams,
     ledger: &mut StructureLedger,
-    mut fit: impl FnMut(
+    mut candidate_fit: impl FnMut(
         SaeManifoldTerm,
         SaeManifoldRho,
-        &RowBlockShard,
+        &[usize],
     ) -> (SaeManifoldTerm, SaeManifoldRho),
 ) -> Result<StructureSearchResult, String> {
-    let shards = row_block_shards(target, n_shards);
+    let split = estimation_eval_split(target, n_shards);
     let mut rounds: Vec<SearchLedger> = Vec::new();
 
     for _ in 0..max_rounds {
@@ -742,7 +781,7 @@ pub fn run_structure_search_rounds(
         // closure inside the gate is a pure function of the candidate index.
         let birth_decoders = build_birth_decoders(&term, residuals.view(), &harvest_params)?;
 
-        if report.proposals.is_empty() {
+        if report.proposals.is_empty() || split.shards.is_empty() {
             // Nothing to do this round — record an empty ledger (with the live
             // collapse events) as the fixpoint and stop.
             rounds.push(SearchLedger {
@@ -754,22 +793,29 @@ pub fn run_structure_search_rounds(
         }
 
         // The search state threads (term, rho) together. apply_move restructures
-        // both; eval / null-sup / refit fold shards.
+        // both AND refits the candidate on the estimation rows so it is the
+        // predictable plug-in the held-out shards are evaluated against.
         type State = (SaeManifoldTerm, SaeManifoldRho);
         let collapse_events = term.collapse_events().to_vec();
         let decoders = birth_decoders;
+        let estimation_rows = split.estimation_rows.clone();
         let outcome: SearchOutcome<State> = search(
             (term, rho),
             report.proposals,
-            &shards,
+            &split.shards,
             &budget,
             ledger,
             |state: &State, mv: &StructureMove| {
-                apply_structure_move(&state.0, &state.1, mv, &decoders)
+                let (cand_term, cand_rho) =
+                    apply_structure_move(&state.0, &state.1, mv, &decoders)?;
+                // Refit the restructured candidate on the estimation rows only.
+                Ok(candidate_fit(cand_term, cand_rho, &estimation_rows))
             },
             |state: &State, shard: &&RowBlockShard| eval_log_lik(&state.0, shard),
             |state: &State, shard: &&RowBlockShard| eval_log_lik(&state.0, shard),
-            |state: State, shard: &&RowBlockShard| fit(state.0, state.1, shard),
+            // No-op fold: the candidate is the fixed predictable plug-in across
+            // the held-out stream.
+            |state: State, _shard: &&RowBlockShard| state,
         )?;
 
         let (next_term, next_rho) = outcome.state;
@@ -840,27 +886,26 @@ fn build_birth_decoders(
 /// (restructured, possibly shard-refit) state. The gate's evaluation statistic;
 /// the engine guarantees a shard is evaluated strictly before it is folded in.
 fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64 {
-    // The fitted reconstruction at the shard rows, scored against the shard
-    // target. We reconstruct on the full term and select the shard rows so the
-    // per-row routing is the established one (no re-encode of held-out rows
-    // before the refit folds them in).
+    // The fitted reconstruction at the shard's held-out rows, scored against the
+    // full target. The term's per-row routing/basis covers all N rows, so the
+    // reconstruction at a held-out row is the model's prediction for it.
     let fitted = match term.try_fitted() {
         Ok(f) => f,
         Err(_) => return f64::NEG_INFINITY,
     };
     let n_full = fitted.nrows();
     let p = fitted.ncols();
-    if p != shard.target.ncols() {
+    if p != shard.target.ncols() || n_full != shard.target.nrows() {
         return f64::NEG_INFINITY;
     }
     let mut sse = 0.0_f64;
     let mut count = 0usize;
-    for (i, &row) in shard.rows.iter().enumerate() {
+    for &row in &shard.rows {
         if row >= n_full {
             continue;
         }
         for out in 0..p {
-            let d = fitted[[row, out]] - shard.target[[i, out]];
+            let d = fitted[[row, out]] - shard.target[[row, out]];
             sse_accumulate(&mut sse, d);
         }
         count += p;
@@ -919,6 +964,8 @@ pub fn run_production_structure_search(
     refit_params: ProductionRefitParams,
     ledger: &mut StructureLedger,
 ) -> Result<StructureSearchResult, String> {
+    let full_target = target.to_owned();
+    let n = full_target.nrows();
     run_structure_search_rounds(
         term,
         rho,
@@ -928,24 +975,39 @@ pub fn run_production_structure_search(
         max_rounds,
         harvest_params,
         ledger,
-        move |mut cand_term, mut cand_rho, shard| {
-            // Fold the shard into the candidate by re-running the inner joint
-            // fit on the shard's target rows. The candidate's basis/decoder are
-            // warm; a non-converging inner solve returns the unchanged
-            // candidate (the closure is infallible at the driver boundary).
-            let fit_target = shard.target.view();
-            match cand_term.run_joint_fit_arrow_schur(
-                fit_target,
-                &mut cand_rho,
-                None,
-                refit_params.inner_max_iter,
-                refit_params.learning_rate,
-                refit_params.ridge_ext_coord,
-                refit_params.ridge_beta,
-            ) {
-                Ok(_) => (cand_term, cand_rho),
-                Err(_) => (cand_term, cand_rho),
+        move |mut cand_term, mut cand_rho, estimation_rows| {
+            // Refit the restructured candidate on the ESTIMATION rows only: the
+            // held-out evaluation rows carry weight 0 (no fitting pressure) via
+            // the per-row reconstruction-weight seam, so the candidate is the
+            // predictable plug-in the held-out shards are scored against. A
+            // non-converging inner solve returns the unchanged candidate (the
+            // closure is infallible at the driver boundary).
+            let mut weights = vec![0.0_f64; n];
+            for &r in estimation_rows {
+                if r < n {
+                    weights[r] = 1.0;
+                }
             }
+            if cand_term.set_row_loss_weights(weights).is_err() {
+                return (cand_term, cand_rho);
+            }
+            // A non-converging inner solve leaves the candidate as-is (the gate
+            // then sees no improvement — a conservative, valid degradation).
+            if cand_term
+                .run_joint_fit_arrow_schur(
+                    full_target.view(),
+                    &mut cand_rho,
+                    None,
+                    refit_params.inner_max_iter,
+                    refit_params.learning_rate,
+                    refit_params.ridge_ext_coord,
+                    refit_params.ridge_beta,
+                )
+                .is_err()
+            {
+                return (cand_term, cand_rho);
+            }
+            (cand_term, cand_rho)
         },
     )
 }
