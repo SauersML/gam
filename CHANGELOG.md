@@ -1,3 +1,60 @@
+## v0.3.112 — gam 0.3.112 / gamfit 0.1.195 (2026-06-11)
+
+Crate + wheel release rolling up the over-dispersed-Gamma predictive-interval
+fix, the random-slope / factor-smooth predictive-quality cluster, and the
+marginal-slope hang / OOM fixes that unblock the survival + binary
+`marginal-slope` study.
+
+Predictive intervals — over-dispersed Gamma / Tweedie (#1018):
+- fix: `gamma_quantile` now inverts an *owned* regularized lower-incomplete-gamma
+  CDF (`regularized_lower_gamma`, the Numerical Recipes power-series / Lentz
+  continued-fraction split with the leading factor kept in logs) instead of
+  `statrs::gamma_lr`, which hard-clamps to `0` for every `x ≤ 1.11e-15`. In the
+  small-shape lower tail (`a ≲ 0.1`, the moment-matched `k = μ²/V` of a strongly
+  over-dispersed predictive) the clamp zeroed the Halley residual and walked the
+  iterate *up* to `~1.6e-15` — so a nominal 2.5% bound carried up to ~19% of the
+  mass and the interval under-covered on the low side. Round-trip
+  `P(a, gamma_quantile(p,a,1)) ≈ p` now holds to 1e-9 down to `q ~ 5e-33`, pinned
+  by an independent self-contained oracle.
+
+Random-slope / factor-smooth predictive quality vs lme4 / mgcv (#903):
+- fix: `bs="re"` is now the parametric random intercept+slope `[1, x]` mgcv's
+  `(1 + x | g)` denotes, not a piecewise-linear B-spline under the pooled-knot
+  heuristic (~6 wiggly coefs/group). The over-parameterized term ill-conditioned
+  the REML/joint-Newton solve (minute-long fits) and broke partial pooling;
+  group slopes now shrink toward the fixed population trend (7 s fit, 2 coef/group
+  edf), beating no-pooling OLS out of sample.
+- fix: cap the `bs="fs"` shared marginal (and `bs="sz"`) at mgcv's default
+  `k ≈ 10`; the pooled heuristic gave ~24 functions/group and REML over-fit the
+  shared shape. fs recovers at 0.0528 (beating mgcv's 0.0548).
+- tests re-grounded onto the correct comparator model (random slope vs lme4's
+  `(1+x|g)`, not the shrink-to-zero `fs`); no quality bar weakened.
+
+Marginal-slope (binary + survival) — hang / OOM (#979, partial):
+- fix: the inner joint-Newton no longer hangs to its 1200-cycle ceiling on
+  fully-rejected cycles (β reverts and an interior block pins `max(block_radii)`,
+  so every subsequent cycle was bytewise identical and rejected for the same
+  reason — ~120 s burned per outer ρ-evaluation, the survival "hang").
+- fix(large-scale): the survival SMGS phase-4b observability / rank-diagnostic
+  blocks densified operator-backed designs unconditionally and OOM-killed the
+  host at n=320k; they now go through a pre-allocation byte budget
+  (`try_to_dense_by_chunks_budgeted`, 256 MiB/matrix) and `warn!`-skip on
+  refusal, while real numerical-rank failures still propagate.
+- correctness: the Jeffreys curvature in the coupled-joint outer LAML is now the
+  exact Daleckii–Krein form (dropping the `K²` vec-Gram surrogate that put ~1e20
+  phantom curvature on floored eigenpairs and froze the inner step along
+  Firth-active directions), with its exact divided-difference drift, the Tier-B
+  `Φ(β̂)` value folded back into the outer cost, and PSD projection on
+  SPD-requiring step paths. The deeper inner-Newton convergence on the hardest
+  binomial-location-scale Firth-active fixtures remains in flight; #979 stays
+  open for that.
+
+Build / CI:
+- #901: keep the non-Gaussian value path on the spectral LAML.
+- CI: per-binary test wall-clock caps now use GNU `timeout` (process-group kill
+  by default) in place of the hand-rolled `setsid` watchdog; removed the stale
+  precheck / hillclimb scripts.
+
 ## v0.3.111 — gam 0.3.111 / gamfit 0.1.193 (2026-06-10)
 
 Crate + wheel release rolling up the factor-smooth predictive-quality fix and
