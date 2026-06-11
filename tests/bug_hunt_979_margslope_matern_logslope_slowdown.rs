@@ -42,15 +42,7 @@ fn matern_smooth(name: &str, centers: usize) -> SmoothTermSpec {
                 include_intercept: false,
                 double_penalty: false,
                 identifiability: MaternIdentifiability::default(),
-                // Per-axis kernel-η ARD UNLOCKS the joint κ/ψ-ρ spatial outer
-                // solver (an explicit isotropic length_scale would lock it and
-                // skip straight to the cheap ρ-only path). This is the path the
-                // formula API's `matern(...)` takes and the one #979's hang
-                // lives on: oversmoothed (ρ, κ) trials whose inner joint-Newton
-                // collapses its trust region and rejects every step. Without
-                // the collapsed-trust-region stuck guard a single such trial
-                // grinds the full 1199-cycle ceiling, blowing past this budget.
-                aniso_log_scales: Some(vec![0.0, 0.0]),
+                aniso_log_scales: None,
                 nullspace_shrinkage_survived: None,
             },
             input_scales: None,
@@ -163,14 +155,8 @@ fn margslope_matern_logslope_timing() {
         Ok(_) => panic!("wrong FitResult variant"),
         Err(e) => panic!("fit failed: {e}"),
     }
-    // With κ optimization on, the fit takes ~13s uncontended; a single
-    // stuck (ρ, κ) trial caught by the collapsed-trust-region guard adds only
-    // ~1.5s. WITHOUT the guard, one stuck trial grinds the 1199-cycle ceiling
-    // and the joint κ-ρ optimization runs many such trials → minutes. The
-    // budget is generous (CI is slower/contended) but far below the grind.
     assert!(
-        elapsed < 180.0,
-        "margslope matern-logslope κ-optimized fit took {elapsed:.1}s at n={n} centers={centers} \
-         (budget 180s) — a collapsed-trust-region inner-solve grind (#979) is the likely cause"
+        elapsed < 60.0,
+        "margslope matern-logslope fit took {elapsed:.1}s at n={n} centers={centers} (budget 60s)"
     );
 }

@@ -14787,48 +14787,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         const RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR: f64 = 50.0;
         let mut best_residual_seen: f64 = f64::INFINITY;
         let mut cycles_since_residual_improved: usize = 0;
-        // Collapsed-trust-region stuck guard (gam#979). The residual-stall /
-        // KKT / plateau certificates below all live PAST the accepted-step
-        // grad-reload, so a cycle that REJECTS every trust-region attempt
-        // `continue`s straight back to the loop head WITHOUT reaching any of
-        // them. On a degenerate oversmoothed (ρ, κ) trial — the regime the
-        // joint κ/ψ-ρ spatial outer solver and its continuation pre-warm
-        // probe for marginal-slope matérn fits — the Newton model offers no
-        // productive step at ANY radius: the trust region shrinks to its
-        // 1e-12 floor and then rejects the (now machine-ε-scale) step every
-        // cycle. With only the `inner_loop_hard_ceiling` to stop it, the inner
-        // solve grinds the full budget on a single such trial — the multi-hour
-        // "hang" / centers≥20 slowdown reported in #979 (and the survival
-        // marginal-slope timeout). Once the radius has collapsed to its floor
-        // and a floor-scale step has been rejected for this many CONSECUTIVE
-        // cycles, no productive Newton step exists from this β: return
-        // `converged = false` with the current finite β so the outer optimizer
-        // rejects this (ρ, κ) cleanly (exactly as the residual-stall and
-        // divergence guards do) instead of burning the cycle budget. The gate
-        // is deterministic (trust radius + reject count, never wall-clock — cf.
-        // the #979 note at the wall-clock-exit refusal below), so it cannot
-        // introduce the "collapses sequentially / fires in parallel" instability.
-        // A healthy trust-region globalization accepts a productive step long
-        // before the radius nears this floor, so a converging fit never trips it.
-        const JOINT_NEWTON_STUCK_TRUST_FLOOR: f64 = 1e-9;
-        const JOINT_NEWTON_STUCK_REJECT_CYCLES: usize = 8;
-        // Unconditional backstop for the rare case where the trust radius
-        // shrinks pathologically slowly (or oscillates just above the floor)
-        // while still never accepting a step: a fit that rejects EVERY trial for
-        // this many CONSECUTIVE cycles has no usable descent direction at this
-        // β regardless of radius. Set far above any legitimate trust-region
-        // adaptation (a healthy near-separating solve clamps a huge cycle-0
-        // proposal and accepts a productive step within a handful of shrink
-        // cycles — gam#826/#715) yet far below `inner_loop_hard_ceiling`, so it
-        // only ever fires on a genuinely stuck solve.
-        const JOINT_NEWTON_STUCK_REJECT_CYCLES_HARD: usize = 96;
-        let mut consecutive_floor_reject_cycles: usize = 0;
-        let mut consecutive_rejected_cycles: usize = 0;
-        // Set when the collapsed-trust-region stuck guard fires (gam#979), so
-        // the bubbled non-convergence error names the cause and the bounded
-        // exit cycle (a regression that re-introduced the grind would surface
-        // here as a much larger cycle, or as the budget-exhaustion path).
-        let mut joint_newton_stuck_exit_cycle: Option<usize> = None;
         // Number of consecutive non-improving cycles after which the
         // conditioning-based self-vanishing Levenberg–Marquardt damping is
         // ARMED inside the spectral-range Newton solve, for EVERY family
@@ -16504,37 +16462,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     converged = true;
                     break;
                 }
-                // Collapsed-trust-region stuck exit (gam#979). The attempt loop
-                // already shrank `joint_trust_radius`; once it has reached its
-                // floor and a floor-scale step is STILL rejected (no productive
-                // descent at any radius) for several consecutive cycles, the
-                // residual-stall / KKT certificates below — which only run on the
-                // accepted-step path past this `continue` — can never fire, so
-                // the loop would otherwise grind to `inner_loop_hard_ceiling`
-                // (the #979 hang). Diagnose non-convergence here and hand the
-                // finite β back so the outer optimizer rejects this (ρ, κ).
-                consecutive_rejected_cycles = consecutive_rejected_cycles.saturating_add(1);
-                if joint_trust_radius <= JOINT_NEWTON_STUCK_TRUST_FLOOR {
-                    consecutive_floor_reject_cycles =
-                        consecutive_floor_reject_cycles.saturating_add(1);
-                } else {
-                    consecutive_floor_reject_cycles = 0;
-                }
-                if consecutive_floor_reject_cycles >= JOINT_NEWTON_STUCK_REJECT_CYCLES
-                    || consecutive_rejected_cycles >= JOINT_NEWTON_STUCK_REJECT_CYCLES_HARD
-                {
-                    log::warn!(
-                        "[JN-EXIT] cycle={cycle} reason=trust_floor_all_reject_stuck trust_radius={:.3e} (floor={:.3e}) consecutive_floor_rejects={} consecutive_rejects={} line_search_attempts={}; the trust region has collapsed (or no step has been accepted for many cycles) and a step is rejected every cycle — no productive Newton step exists at this (ρ,κ). Returning unconverged with finite β so the outer optimizer rejects this evaluation instead of running to inner_max_cycles.",
-                        joint_trust_radius,
-                        JOINT_NEWTON_STUCK_TRUST_FLOOR,
-                        consecutive_floor_reject_cycles,
-                        consecutive_rejected_cycles,
-                        line_search_attempts,
-                    );
-                    joint_newton_stuck_exit_cycle = Some(cycle);
-                    converged = false;
-                    break;
-                }
                 // CONTINUE rather than break (gam#826/#872/#715). The comment
                 // above documents the intent — "retry the joint Newton loop from
                 // the same state after a failed trust-region search" — but the old
@@ -16559,10 +16486,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // principal-block surrogate (the ridge-drift mode this path avoids).
                 continue;
             }
-            // A productive step was accepted this cycle, so the trust region is
-            // not collapsed-and-stuck; reset the gam#979 reject streaks.
-            consecutive_floor_reject_cycles = 0;
-            consecutive_rejected_cycles = 0;
 
             let grad_reload_started = std::time::Instant::now();
             log::info!(
@@ -18108,14 +18031,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     "structured KKT refusal report unavailable: no joint Newton math snapshot"
                         .to_string()
                 });
-            let stuck_marker = match joint_newton_stuck_exit_cycle {
-                Some(c) => format!(
-                    " [collapsed-trust-region stuck guard fired at cycle {c} (gam#979): no productive Newton step at this (ρ,κ)]"
-                ),
-                None => String::new(),
-            };
             return Err(format!(
-                "coupled exact-joint inner solve exited the joint Newton path before convergence{stuck_marker} — {block_diag}"
+                "coupled exact-joint inner solve exited the joint Newton path before convergence — {block_diag}"
             ));
         }
         // Otherwise fall through to blockwise iteration below.
@@ -30081,67 +29998,6 @@ mod tests {
         }
     }
 
-    /// gam#979 fixture: a coupled exact-joint family whose reported gradient
-    /// has the WRONG SIGN, so the `(g, H)` Newton model always proposes an
-    /// ASCENT step of the actual objective. The minimized objective is the
-    /// LINEAR `−ℓ = β0 + β1` (true descent direction `[−1, −1]`), but the
-    /// reported gradient is `[1, 1]` (the negative of `∇ℓ = [−1, −1]`), so the
-    /// model's step points to `[1, 1]`. Every trial therefore INCREASES `−ℓ`
-    /// by an amount LINEAR in the step length — rejected at ANY radius,
-    /// including the trust-region floor (unlike a quadratic objective, whose
-    /// `O(r²)` increase falls inside the round-off-slack accept band for tiny
-    /// `r`). β never moves, the stationarity residual stays `‖[1,1]‖`, and the
-    /// trust region collapses to its floor while rejecting every step — the
-    /// canonical all-reject stall behind the #979 hang / matérn marginal-slope
-    /// slowdown.
-    #[derive(Clone)]
-    struct TwoBlockCollapsedTrustStuckFamily;
-
-    impl CustomFamily for TwoBlockCollapsedTrustStuckFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let beta0 = block_states[0].beta[0];
-            let beta1 = block_states[1].beta[0];
-            Ok(FamilyEvaluation {
-                log_likelihood: -(beta0 + beta1),
-                blockworking_sets: vec![
-                    BlockWorkingSet::ExactNewton {
-                        gradient: array![1.0],
-                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
-                    },
-                    BlockWorkingSet::ExactNewton {
-                        gradient: array![1.0],
-                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
-                    },
-                ],
-            })
-        }
-
-        fn exact_newton_joint_hessian(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(Some(array![[1.0, 0.0], [0.0, 1.0]]))
-        }
-
-        fn exact_newton_joint_hessian_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            arr: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(Some(Array2::zeros((2, 2))))
-        }
-
-        fn has_explicit_joint_hessian(&self) -> bool {
-            true
-        }
-    }
-
     #[derive(Clone)]
     struct TwoBlockJointSurrogateFamily;
 
@@ -30851,76 +30707,6 @@ mod tests {
         assert!(
             err.contains("block_residual_inf"),
             "error should carry per-block residual diagnostics: {err}"
-        );
-    }
-
-    /// gam#979 regression: a coupled exact-joint inner solve whose trust region
-    /// collapses while rejecting every step must NOT grind the full
-    /// `inner_max_cycles` (the multi-hour hang / matérn marginal-slope
-    /// slowdown). The collapsed-trust-region stuck guard must fire and exit
-    /// non-converged in a bounded number of cycles far below the (deliberately
-    /// huge) budget. Verifies the guard from a different angle than the live
-    /// fit: a deterministic all-reject family, asserting the exit is both
-    /// EARLY and NAMED.
-    #[test]
-    fn joint_newton_collapsed_trust_region_all_reject_exits_before_grinding_budget() {
-        let mkspec = |name: &str| ParameterBlockSpec {
-            name: name.to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        // A deliberately huge inner budget: without the guard the all-reject
-        // solve would grind all of it (the #979 hang). The guard must bound the
-        // exit to a handful of cycles — `JOINT_NEWTON_STUCK_REJECT_CYCLES_HARD`
-        // (96) plus the floor-collapse window — well under this ceiling.
-        const HUGE_INNER_BUDGET: usize = 5_000;
-        const STUCK_EXIT_CYCLE_BOUND: usize = 200;
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: HUGE_INNER_BUDGET,
-            ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
-            ..BlockwiseFitOptions::default()
-        };
-        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
-
-        let err = inner_blockwise_fit(
-            &TwoBlockCollapsedTrustStuckFamily,
-            &[mkspec("block0"), mkspec("block1")],
-            &per_block,
-            &options,
-            None,
-        )
-        .expect_err("a fully stuck coupled inner solve must not falsely converge");
-
-        // The named stuck guard fired (a regression to the grind would lose
-        // this marker and instead reach the budget-exhaustion path).
-        assert!(
-            err.contains("collapsed-trust-region stuck guard fired at cycle"),
-            "the gam#979 stuck guard must fire instead of grinding to inner_max_cycles: {err}"
-        );
-        assert!(
-            !err.contains("exhausted the joint Newton budget"),
-            "must exit EARLY, never reach the full-budget grind path: {err}"
-        );
-
-        // The exit cycle must be bounded far below the 5000-cycle budget.
-        let marker = "stuck guard fired at cycle ";
-        let cycle: usize = err
-            .split(marker)
-            .nth(1)
-            .and_then(|tail| tail.split([' ', '(']).next())
-            .and_then(|tok| tok.trim().parse().ok())
-            .unwrap_or_else(|| panic!("stuck-guard error must report its exit cycle: {err}"));
-        assert!(
-            cycle < STUCK_EXIT_CYCLE_BOUND,
-            "stuck exit must be bounded (got cycle {cycle}, budget {HUGE_INNER_BUDGET}): {err}"
         );
     }
 
