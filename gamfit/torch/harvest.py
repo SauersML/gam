@@ -294,6 +294,60 @@ def _capture_activations(
     return act_flat, logits_from_act
 
 
+def _capture_activations_downstream(
+    model: torch.nn.Module,
+    hook_module: torch.nn.Module,
+    inputs: Any,
+) -> tuple[torch.Tensor, Callable[[torch.Tensor, int], torch.Tensor]]:
+    """Like :func:`_capture_activations`, but the recompute returns the logits at
+    **every** token position as a differentiable function of one spliced-in row.
+
+    Returns ``(acts, logits_all_from_act)`` where ``acts`` is ``(n, p)`` and
+    ``logits_all_from_act(x_n, n) -> (n_pos, C)`` is the full flattened logit
+    block when activation row ``n`` is replaced by ``x_n``. The downstream
+    harvest reads rows ``t ≥ n`` of this block: those are exactly the future
+    positions the residual stream at ``n`` reaches through the KV path, so
+    ``∂logits_t/∂x_n`` for ``t ≥ n`` is the forward-looking Jacobian the #980
+    downstream metric aggregates. (For ``t < n`` causal attention makes the
+    Jacobian zero; the harvest never probes them.)
+    """
+    captured: dict[str, torch.Tensor] = {}
+
+    def _grab(_mod: torch.nn.Module, _inp: Any, out: torch.Tensor) -> None:
+        captured["act"] = out
+
+    handle = hook_module.register_forward_hook(_grab)
+    try:
+        with torch.no_grad():
+            model(inputs)
+        act = captured["act"]
+    finally:
+        handle.remove()
+
+    act_flat = act.reshape(-1, act.shape[-1]).detach()
+    feature_shape = act.shape
+
+    def logits_all_from_act(single_row: torch.Tensor, row_index: int) -> torch.Tensor:
+        """Full ``(n_pos, C)`` logit block as a function of one spliced row."""
+        replacement = {"index": row_index, "shape": feature_shape}
+
+        def _splice(_mod: torch.nn.Module, _inp: Any, out: torch.Tensor) -> torch.Tensor:
+            flat = out.reshape(-1, out.shape[-1])
+            rows = [flat[i] for i in range(flat.shape[0])]
+            rows[replacement["index"]] = single_row
+            new_flat = torch.stack(rows, dim=0)
+            return new_flat.reshape(out.shape)
+
+        h = hook_module.register_forward_hook(_splice)
+        try:
+            out_logits = model(inputs)
+        finally:
+            h.remove()
+        return out_logits.reshape(-1, out_logits.shape[-1])
+
+    return act_flat, logits_all_from_act
+
+
 # ---------------------------------------------------------------------------
 # Public harvest entry point
 # ---------------------------------------------------------------------------
@@ -427,6 +481,152 @@ def harvest_output_fisher_factors(
         U[row] = scaled.detach().to(torch.float32).cpu().numpy()
 
     return HarvestShard(X=X, U=U, mass_residual=mass_residual, rank=rank)
+
+
+def _downstream_pullback_matvec(
+    jvp_fn: Callable[[torch.Tensor], torch.Tensor],
+    vjp_fn: Callable[[torch.Tensor], torch.Tensor],
+    probs_future: torch.Tensor,
+    V: torch.Tensor,
+) -> torch.Tensor:
+    """``V ↦ (Σ_t J_{t←n}ᵀ F_t J_{t←n}) V`` for the future positions ``t ≥ n``.
+
+    ``jvp_fn`` maps ``V (p, m)`` to ``J V`` of shape ``(T, C, m)`` — the
+    directional derivative of every future position's logits; ``probs_future`` is
+    ``(T, C)`` the softmax at each future position (its Fisher
+    ``F_t = diag(p_t) − p_t p_tᵀ``); ``vjp_fn`` maps a ``(T, C, m)`` cotangent
+    back to ``(p, m)``. The per-position Fisher contracts the ``C`` axis
+    independently, and the sum over ``t`` is folded into the single VJP, so the
+    aggregated downstream operator is applied with no ``T·C × p`` matrix ever
+    formed. With one future position this reduces bit-for-bit to
+    :func:`_pullback_matvec`.
+    """
+    jv = jvp_fn(V)  # (T, C, m)
+    # F_t (J V): apply each future position's softmax Fisher along C. Move C last
+    # so `_softmax_fisher_apply` broadcasts probs_future (T, C) over the m axis.
+    fjv = _softmax_fisher_apply(
+        probs_future.unsqueeze(1),  # (T, 1, C)
+        jv.transpose(1, 2),  # (T, m, C)
+    ).transpose(1, 2)  # (T, C, m)
+    return vjp_fn(fjv)  # (p, m), already summed over T inside the VJP
+
+
+def harvest_downstream_output_fisher_factors(
+    model: torch.nn.Module,
+    hook_module: torch.nn.Module,
+    inputs: Any,
+    *,
+    rank: int,
+    oversample: int = 4,
+    n_iter: int = 2,
+    trace_probes: int = 8,
+    seed: int = 0,
+) -> HarvestShard:
+    """Harvest per-token **downstream** output-Fisher factors at ``hook_module``.
+
+    Identical interface to :func:`harvest_output_fisher_factors`, but the per-row
+    metric is the forward-looking aggregate
+    ``G_n = Σ_{t ≥ n} J_{t←n}ᵀ F_t J_{t←n}`` over the future positions ``n``
+    reaches through the KV path, rather than the same-position
+    ``G_n = J_nᵀ F_n J_n`` (#980, mechanism 2). The returned shard carries
+    ``provenance="output_fisher_downstream"`` so the gam boundary routes it to
+    ``RowMetric::output_fisher_downstream``; the factor *layout* (``U (n, p, r)``,
+    flattened ``u[n, i*r + k] = U[n, i, k]``) and the ``mass_residual`` truncation
+    diagnostic are exactly the same-position contract.
+
+    Scientifically this is what makes dormant-feature detection forward-looking: a
+    feature whose entire causal effect lands many tokens later has same-position
+    Fisher ≈ 0 (the same-position lens reports it represented-but-not-driving),
+    but registers nonzero downstream coupling here.
+    """
+    if rank < 1:
+        raise ValueError(f"rank must be >= 1; got {rank}")
+
+    act_flat, logits_all_from_act = _capture_activations_downstream(
+        model, hook_module, inputs
+    )
+    n, p = int(act_flat.shape[0]), int(act_flat.shape[1])
+    if rank > p:
+        raise ValueError(f"rank {rank} exceeds activation dimension p = {p}")
+    device = act_flat.device
+    work_dtype = (
+        act_flat.dtype
+        if act_flat.dtype in (torch.float32, torch.float64)
+        else torch.float32
+    )
+
+    U = np.empty((n, p, rank), dtype=np.float32)
+    X = act_flat.to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
+    mass_residual = np.empty((n,), dtype=np.float32)
+
+    for row in range(n):
+        x_row = act_flat[row].to(work_dtype).detach().requires_grad_(False)
+
+        # Future-position logit block as a function of x_n: f_future(x) -> (T, C),
+        # T = n - row future positions (t = row .. n-1). Causal models give zero
+        # Jacobian for t < row, so restricting to t >= row loses nothing and
+        # avoids probing positions x_n cannot influence.
+        def f_future(x: torch.Tensor, _row: int = row) -> torch.Tensor:
+            allpos = logits_all_from_act(x, _row).to(work_dtype)  # (n_pos, C)
+            return allpos[_row:]  # (T, C)
+
+        with torch.no_grad():
+            probs_future = torch.softmax(f_future(x_row), dim=-1)  # (T, C)
+
+        def jvp_fn(V: torch.Tensor, _f=f_future, _x=x_row) -> torch.Tensor:
+            cols = []
+            for j in range(V.shape[1]):
+                _out, jv = torch.func.jvp(_f, (_x,), (V[:, j].contiguous(),))
+                cols.append(jv)  # (T, C)
+            return torch.stack(cols, dim=2)  # (T, C, m)
+
+        _out0, vjp_raw = torch.func.vjp(f_future, x_row)
+
+        def vjp_fn(W: torch.Tensor, _vjp=vjp_raw) -> torch.Tensor:
+            cols = []
+            for j in range(W.shape[2]):
+                (gx,) = _vjp(W[:, :, j].contiguous())  # (p,)
+                cols.append(gx)
+            return torch.stack(cols, dim=1)  # (p, m)
+
+        def matvec(V: torch.Tensor, _j=jvp_fn, _vj=vjp_fn, _pf=probs_future) -> torch.Tensor:
+            return _downstream_pullback_matvec(_j, _vj, _pf, V)
+
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(seed + row)
+        evals, evecs = _top_r_eigenpairs(
+            matvec,
+            p,
+            rank,
+            oversample=oversample,
+            n_iter=n_iter,
+            generator=gen,
+            dtype=work_dtype,
+            device=device,
+        )
+        scaled = evecs * evals.clamp_min(0.0).sqrt().unsqueeze(0)  # (p, r)
+
+        gen_tr = torch.Generator(device="cpu")
+        gen_tr.manual_seed(seed + 10_000 + row)
+        trace = _trace_estimate(
+            matvec,
+            p,
+            n_probes=trace_probes,
+            generator=gen_tr,
+            dtype=work_dtype,
+            device=device,
+        )
+        residual = float(trace.item() - float(evals.sum().item()))
+        mass_residual[row] = max(residual, 0.0)
+        U[row] = scaled.detach().to(torch.float32).cpu().numpy()
+
+    return HarvestShard(
+        X=X,
+        U=U,
+        mass_residual=mass_residual,
+        rank=rank,
+        provenance="output_fisher_downstream",
+    )
 
 
 # ---------------------------------------------------------------------------

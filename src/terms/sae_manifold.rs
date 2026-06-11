@@ -46,6 +46,10 @@ use crate::terms::analytic_penalties::{
     resolve_learnable_weight,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
+use crate::terms::sae_optimality_certificate::{
+    CriterionCertificate, DirectionalSamples, certificate_from_samples,
+    deterministic_probe_direction, probe_step,
+};
 
 use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb};
 use crate::solver::arrow_schur::{ArrowFactorCache, solve_arrow_newton_step_with_options};
@@ -12963,6 +12967,97 @@ impl SaeManifoldOuterObjective {
             }
         }
         (term, current_rho, loss)
+    }
+
+    /// First-order optimality certificate for this fit (#934).
+    ///
+    /// At the converged outer optimum `ρ̂` this runs the self-audit the desync
+    /// bug genus (#752/#748/#808/#901) was always diagnosed by hand: it draws
+    /// one deterministic direction `v` from the problem fingerprint, central-
+    /// differences the criterion **value path** at `ρ̂ ± h v` (with a Richardson
+    /// `2h` step for the FD's own error bar), and compares against the analytic
+    /// directional derivative `∇V(ρ̂)·v` from the production gradient path. The
+    /// returned [`CriterionCertificate`] records whether the objective and its
+    /// analytic gradient agree *here*, on this data shape, where #901-class
+    /// desyncs actually manifest.
+    ///
+    /// The finite difference is the *audit instrument*, not an estimator: it
+    /// only checks the production analytic gradient against the production value
+    /// path at one point after convergence, so it is fully compatible with the
+    /// exact-REML-only policy (see `sae_optimality_certificate`). Cost is four
+    /// criterion value-path evaluations at the single final point.
+    ///
+    /// The value probes are taken on a **clone of the pristine baseline term**
+    /// so the production fitted state is untouched and the value caches start
+    /// cold — they must not alias the gradient path's converged warm state,
+    /// since that aliasing is exactly what the certificate audits. Call before
+    /// [`Self::into_fitted`].
+    pub fn optimality_certificate(&mut self) -> Result<CriterionCertificate, String> {
+        let rho_hat_flat = self.current_rho.to_flat();
+        let dir = deterministic_probe_direction(rho_hat_flat.view());
+        let h = probe_step(rho_hat_flat.view());
+
+        // Analytic directional derivative at ρ̂, from the production gradient
+        // path (same code the outer optimizer consumed). Re-forming the cache
+        // here re-runs the inner solve at the settled ρ — already at its
+        // optimum, so it converges immediately — and reads the exact analytic
+        // outer gradient with the third-order correction included.
+        let rho_hat = self.current_rho.clone();
+        let (_v_hat, loss_hat, cache) = self.term.reml_criterion_with_cache(
+            self.target.view(),
+            &rho_hat,
+            self.registry.as_ref(),
+            self.inner_max_iter,
+            self.learning_rate,
+            self.ridge_ext_coord,
+            self.ridge_beta,
+        )?;
+        let components = self
+            .term
+            .analytic_outer_rho_gradient_components(&rho_hat, &loss_hat, &cache)?;
+        let grad = components.gradient_with_available_correction();
+        let grad_norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+        let analytic_directional: f64 = grad.iter().zip(dir.iter()).map(|(g, d)| g * d).sum();
+
+        // Value-path probe on a cold clone of the pristine baseline term: the
+        // value path must be exercised WITHOUT the gradient path's warm caches,
+        // since aliasing the two is exactly the failure the certificate audits.
+        let mut probe_term = self.baseline_term.clone();
+        let mut value_at = |term: &mut SaeManifoldTerm, mult: f64| -> Result<f64, String> {
+            let flat: Array1<f64> =
+                Array1::from_shape_fn(rho_hat_flat.len(), |i| rho_hat_flat[i] + mult * h * dir[i]);
+            let rho = self.baseline_rho.from_flat(flat.view());
+            let (cost, _loss) = term.reml_criterion(
+                self.target.view(),
+                &rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            )?;
+            Ok(cost)
+        };
+        let plus_h = value_at(&mut probe_term, 1.0)?;
+        let minus_h = value_at(&mut probe_term, -1.0)?;
+        let plus_2h = value_at(&mut probe_term, 2.0)?;
+        let minus_2h = value_at(&mut probe_term, -2.0)?;
+
+        let well_posed = plus_h.is_finite()
+            && minus_h.is_finite()
+            && plus_2h.is_finite()
+            && minus_2h.is_finite();
+        let samples = DirectionalSamples {
+            plus_h,
+            minus_h,
+            plus_2h,
+            minus_2h,
+            step: h,
+            grad_norm,
+            analytic_directional,
+            well_posed,
+        };
+        Ok(certificate_from_samples(&samples))
     }
 
     /// Posterior shape uncertainty of the fitted atoms — per-atom decoder

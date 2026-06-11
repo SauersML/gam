@@ -47,6 +47,71 @@ pub fn create_cyclic_difference_penalty_matrix(
     Ok(fast_ata(&d))
 }
 
+/// Creates the OPEN (non-wrapping) finite-difference penalty `S = D'D` over the
+/// same coefficient ring, but with the difference stencils truncated at the
+/// endpoints instead of closed across the seam.
+///
+/// This is the `γ = 0` (interval) end of the closure family: the constant *and*
+/// the low-order polynomial tails are unpenalised at the boundary, so the two
+/// ends are free to drift apart. `S_circle = S_open + S_wrap`, where `S_wrap`
+/// is the closing-edge contribution the cyclic penalty adds on top.
+pub fn create_open_difference_penalty_matrix(
+    num_basis_functions: usize,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
+    if order == 0 || order >= num_basis_functions {
+        return Err(BasisError::InvalidPenaltyOrder {
+            order,
+            num_basis: num_basis_functions,
+        });
+    }
+    // Banded forward-difference operator with `num_basis - order` rows: the
+    // ordinary open P-spline Reinsch difference, no wrap.
+    let rows = num_basis_functions - order;
+    let mut d = Array2::<f64>::zeros((rows, num_basis_functions));
+    for i in 0..rows {
+        // Row i is the order-th forward difference centred at i:
+        // coefficients are the signed binomials (-1)^{order-j} C(order, j).
+        for j in 0..=order {
+            let sign = if (order - j) % 2 == 0 { 1.0 } else { -1.0 };
+            d[[i, i + j]] = sign * binomial(order, j);
+        }
+    }
+    Ok(fast_ata(&d))
+}
+
+/// The closure-aware difference penalty `S(γ) = S_open + c(γ)·S_wrap` and its
+/// first/second γ-derivatives, where `S_wrap = S_circle − S_open` is the
+/// seam-closing contribution and `c(γ)` is the boundary-conductance interpolant
+/// (`c(0)=0`, `c(1)=1`). At `γ = 1` this is exactly the cyclic penalty; at
+/// `γ = 0` it is exactly the open penalty. Returns `(S, ∂S/∂γ, ∂²S/∂γ²)`.
+///
+/// This is the penalty-moving MVP of the closure family (#1015); the
+/// support-moving period-extension basis lives in
+/// [`crate::geometry::closure_family`]. Both ride the same ψ-channel pattern as
+/// `M_κ` (#944).
+pub fn create_closure_difference_penalty_jet(
+    num_basis_functions: usize,
+    order: usize,
+    gamma: f64,
+) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), BasisError> {
+    let s_open = create_open_difference_penalty_matrix(num_basis_functions, order)?;
+    let s_circle = create_cyclic_difference_penalty_matrix(num_basis_functions, order)?;
+    let s_wrap = &s_circle - &s_open;
+    Ok(crate::geometry::conductance_penalty_jet(
+        &s_open, &s_wrap, gamma,
+    ))
+}
+
+/// Binomial coefficient `C(n, k)` for the small penalty orders used here.
+fn binomial(n: usize, k: usize) -> f64 {
+    let mut acc = 1.0_f64;
+    for i in 0..k {
+        acc = acc * (n - i) as f64 / (i + 1) as f64;
+    }
+    acc
+}
+
 #[inline]
 pub(crate) fn wrap_to_period(x: f64, start: f64, period: f64) -> f64 {
     // Keep wrapped values numerically inside the half-open period
@@ -116,4 +181,55 @@ pub(crate) fn create_cyclic_bspline_basis_dense(
         }
     }
     Ok((cyclic, knots))
+}
+
+#[cfg(test)]
+mod closure_tests {
+    use super::*;
+
+    /// At `γ = 0` the closure penalty is the open penalty; at `γ = 1` it is the
+    /// cyclic penalty. The wrap piece carries the seam.
+    #[test]
+    fn closure_penalty_interpolates_open_to_cyclic() {
+        let n = 8;
+        let order = 2;
+        let s_open = create_open_difference_penalty_matrix(n, order).unwrap();
+        let s_circle = create_cyclic_difference_penalty_matrix(n, order).unwrap();
+
+        let (s0, _, _) = create_closure_difference_penalty_jet(n, order, 0.0).unwrap();
+        let (s1, _, _) = create_closure_difference_penalty_jet(n, order, 1.0).unwrap();
+        assert!((&s0 - &s_open).iter().all(|v| v.abs() < 1e-12));
+        assert!((&s1 - &s_circle).iter().all(|v| v.abs() < 1e-12));
+    }
+
+    /// The closure penalty's γ-derivative matches a finite difference of the
+    /// penalty matrix.
+    #[test]
+    fn closure_penalty_gamma_derivative_matches_fd() {
+        let n = 6;
+        let order = 2;
+        let g = 0.45;
+        let (_, ds, _) = create_closure_difference_penalty_jet(n, order, g).unwrap();
+        let h = 1e-6;
+        let (sp, _, _) = create_closure_difference_penalty_jet(n, order, g + h).unwrap();
+        let (sm, _, _) = create_closure_difference_penalty_jet(n, order, g - h).unwrap();
+        let fd = (&sp - &sm).mapv(|v| v / (2.0 * h));
+        assert!((&ds - &fd).iter().all(|v| v.abs() < 1e-6));
+    }
+
+    /// The open penalty leaves the constant vector and the linear ramp in its
+    /// null space (order-2 difference), while the cyclic penalty only leaves the
+    /// constant — the wrap piece is what penalises the boundary ramp.
+    #[test]
+    fn open_penalty_null_space_is_larger_than_cyclic() {
+        let n = 7;
+        let s_open = create_open_difference_penalty_matrix(n, 2).unwrap();
+        let ones = ndarray::Array1::<f64>::ones(n);
+        let ramp = ndarray::Array1::from_iter((0..n).map(|i| i as f64));
+        // Constant is in both null spaces; ramp is in the open null space.
+        let open_const = ones.dot(&s_open.dot(&ones));
+        let open_ramp = ramp.dot(&s_open.dot(&ramp));
+        assert!(open_const.abs() < 1e-10, "open S·1 ≠ 0: {open_const}");
+        assert!(open_ramp.abs() < 1e-8, "open S·ramp ≠ 0: {open_ramp}");
+    }
 }
