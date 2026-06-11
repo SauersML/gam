@@ -13461,7 +13461,7 @@ impl SaeManifoldOuterObjective {
         // value path must be exercised WITHOUT the gradient path's warm caches,
         // since aliasing the two is exactly the failure the certificate audits.
         let mut probe_term = self.baseline_term.clone();
-        let mut value_at = |term: &mut SaeManifoldTerm, mult: f64| -> Result<f64, String> {
+        let value_at = |term: &mut SaeManifoldTerm, mult: f64| -> Result<f64, String> {
             let flat: Array1<f64> =
                 Array1::from_shape_fn(rho_hat_flat.len(), |i| rho_hat_flat[i] + mult * h * dir[i]);
             let rho = self.baseline_rho.from_flat(flat.view());

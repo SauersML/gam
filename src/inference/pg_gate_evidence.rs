@@ -198,7 +198,7 @@ fn evaluate(block: &GateBlock<'_>, lane: Lane) -> Result<PgGateEvidence, String>
     let log_two_pi = (2.0 * std::f64::consts::PI).ln();
     let mut terms: Vec<f64> = Vec::with_capacity(scales.len());
 
-    for (q, &scale) in scales.iter().enumerate() {
+    for (scale_idx, &scale) in scales.iter().enumerate() {
         // Ω_q = diag(scale · ω̄_i): the row PG variance at this shared scale.
         let omega_diag = omega_bar.mapv(|w| (scale * w).max(0.0));
 
@@ -229,7 +229,7 @@ fn evaluate(block: &GateBlock<'_>, lane: Lane) -> Result<PgGateEvidence, String>
         // fixed d_g·log(2π)/2 (folded once below) and the dropped c_ω constant.
         let v_q = 0.5 * log_det - 0.5 * quad;
         // logsumexp accumulates ln w_q + (−V_q) since evidence = exp(−V_q).
-        terms.push(weights[q].ln() - v_q);
+        terms.push(weights[scale_idx].ln() - v_q);
     }
 
     let log_evidence_core = log_sum_exp(&terms);
