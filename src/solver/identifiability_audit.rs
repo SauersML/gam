@@ -2941,10 +2941,21 @@ mod tests {
             }
         }
         // Block 2: smooth in sin(x) — 6 columns. No alias with block 1.
+        // Start at frequency 4 (k+4), NOT 1: sin(x) and sin(2x) share their
+        // leading Taylor term with `x` (sin(x) = x − x³/6 + …), and the joint
+        // design [1, x, RBFs, sin(x), sin(2x), …, x_alias, cos(kx)] inherits
+        // a numerical near-degeneracy at σ ≈ 1.8e-10 — the right singular
+        // vector is dominated by ≈ +0.88·sin(x) − 0.31·sin(2x) − 0.24·x − …,
+        // i.e. a `sin(x) ≈ x + …` Taylor identity. That σ lands BELOW the
+        // joint RRQR rank tolerance (≈ 7.3e-10) and so RRQR demotes a SECOND
+        // column on top of the seeded x~x alias, producing `dropped.len() == 2`
+        // and failing the "exactly the seeded alias" assertion. Frequencies
+        // ≥ 4 keep the next-smallest σ at ≈ 6e-8, comfortably above tol, so
+        // only the genuine x~x seeded alias is demoted.
         let mut s_sin = Array2::<f64>::zeros((n, 6));
         for i in 0..n {
             for k in 0..6 {
-                s_sin[[i, k]] = ((k as f64 + 1.0) * x[i]).sin();
+                s_sin[[i, k]] = ((k as f64 + 4.0) * x[i]).sin();
             }
         }
         // Block 3: deliberately seeded alias — first column is exactly
