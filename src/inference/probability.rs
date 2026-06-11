@@ -742,6 +742,45 @@ mod tests {
     }
 
     #[test]
+    fn regularized_lower_gamma_is_accurate_and_unclamped_below_statrs_floor() {
+        use statrs::function::gamma::{gamma_lr, ln_gamma};
+
+        // (1) Agrees with statrs `gamma_lr` everywhere statrs is itself valid
+        // (arguments well above its `x ≤ 1.11e-15` clamp), across both the
+        // series (x < a+1) and continued-fraction (x ≥ a+1) branches.
+        for &a in &[0.05_f64, 0.3, 1.0, 2.5, 50.0] {
+            for &x in &[1e-6_f64, 0.01, 0.5, 1.0, 3.0, 25.0, 120.0] {
+                let ours = regularized_lower_gamma(a, x);
+                let theirs = gamma_lr(a, x);
+                assert!(
+                    (ours - theirs).abs() < 1e-12,
+                    "P({a},{x}): ours={ours} statrs={theirs}"
+                );
+                assert!((0.0..=1.0).contains(&ours), "P({a},{x})={ours} out of [0,1]");
+            }
+        }
+
+        // (2) Exp(1) closed form P(1, x) = 1 − e^{−x}.
+        for &x in &[1e-3_f64, 0.25, 2.0, 9.0] {
+            assert!((regularized_lower_gamma(1.0, x) - (1.0 - (-x).exp())).abs() < 1e-13);
+        }
+
+        // (3) The regression heart of #1018: for x far below statrs's clamp the
+        // CDF must remain a faithful, nonzero value, not snap to 0. Compare to
+        // the small-x leading order P(a, x) ≈ x^a / Γ(a+1).
+        for &(a, x) in &[(0.05_f64, 1e-20_f64), (0.1, 1e-25), (0.02, 1e-40)] {
+            assert_eq!(gamma_lr(a, x), 0.0, "precondition: statrs clamps P({a},{x}) to 0");
+            let ours = regularized_lower_gamma(a, x);
+            let leading = (a * x.ln() - ln_gamma(a + 1.0)).exp();
+            assert!(ours > 0.0, "P({a},{x})={ours} clamped to 0 like statrs");
+            assert!(
+                (ours - leading).abs() < 1e-9 * leading,
+                "P({a},{x})={ours}, leading order {leading}"
+            );
+        }
+    }
+
+    #[test]
     fn gamma_quantile_scale_and_monotonicity() {
         // Scale is a pure multiplier, and the quantile is strictly increasing
         // in p (an equal-tailed interval must order correctly).
