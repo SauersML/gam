@@ -13489,6 +13489,12 @@ mod tests {
         [log_pdf, d1, d2, d3, d4]
     }
 
+    fn sls_positive_log_stack(value: f64) -> [f64; 5] {
+        let (log_v, d1, d2, d3, d4) =
+            SurvivalLocationScaleFamily::logwith_derivatives_positive(value);
+        [log_v, d1, d2, d3, d4]
+    }
+
     impl crate::families::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNllProgram {
         fn n_rows(&self) -> usize {
             self.rows.len()
@@ -13545,10 +13551,7 @@ mod tests {
                     + q_exit
                         .compose_unary(sls_log_pdf_stack(&self.inverse_link, q_exit.v))
                         .scale(-event_weight)
-                    + g.compose_unary(SurvivalLocationScaleFamily::logwith_derivatives_positive(
-                        g.v,
-                    ))
-                    .scale(-event_weight);
+                    + g.compose_unary(sls_positive_log_stack(g.v)).scale(-event_weight);
             }
 
             Ok(nll)
@@ -13778,11 +13781,7 @@ mod tests {
                 sls_log_pdf_stack(inverse_link, q_exit.v),
                 -event_weight,
             );
-            channels.add_unary(
-                &g,
-                SurvivalLocationScaleFamily::logwith_derivatives_positive(g.v),
-                -event_weight,
-            );
+            channels.add_unary(&g, sls_positive_log_stack(g.v), -event_weight);
         }
         channels
     }
