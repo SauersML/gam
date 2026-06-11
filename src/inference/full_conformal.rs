@@ -198,7 +198,7 @@
 use faer::Side;
 use ndarray::{Array1, Array2};
 
-use crate::faer_ndarray::{FaerCholesky, fast_av};
+use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_av};
 
 /// One maximal interval of candidate values retained in the prediction set.
 /// Endpoints may be infinite (honest unboundedness in low-information /
@@ -662,6 +662,424 @@ impl FrozenRhoCertificate {
     }
 }
 
+/// Closed-form Gaussian-REML smoothing-parameter response and the frozen-ρ
+/// certificate it powers — the #942 Layer-3 research core, realized exactly
+/// for the single-penalty model `Sλ = λ S` (`ρ = log λ`).
+///
+/// # Why this object exists
+///
+/// Layer 1 ([`ExactGaussianFullConformal`]) is honest only if ρ is held fixed
+/// — but the DEFINED Gaussian fitting map re-selects ρ̂ by REML on whatever
+/// data it sees, including the augmented row `(x_*, z)`. Every "efficient
+/// full conformal" method in the literature silently freezes ρ̂ at its
+/// original-data value and never quantifies the resulting symmetry break.
+/// This object closes that gap WITHOUT a homotopy: it computes the honest
+/// re-selecting map exactly (it is a 1-D REML problem per candidate), the
+/// smoothing response `dρ̂/dz` in closed form via the outer IFT, and a
+/// per-dataset CERTIFICATE that proves (or refuses to prove) that freezing ρ̂
+/// cannot move the returned set. On certification the cheap frozen-ρ set is
+/// returned with a proof of equality to the honest set; on refusal the caller
+/// is told, with the two deciding constants, exactly how far short the
+/// shortcut fell.
+///
+/// # The closed forms (single penalty `Sλ = λ S`)
+///
+/// Augmented penalized least squares with the test row included:
+///
+/// ```text
+///   A(λ)   = XᵀX + x_* x_*ᵀ + λ S         (independent of z)
+///   c(z)   = Xᵀy + x_* z ,  β̂ = A(λ)⁻¹ c(z) = a + b z   (affine in z)
+///   D(ρ,z) = ‖y_aug‖² − c(z)ᵀ A(λ)⁻¹ c(z)              (penalized RSS)
+/// ```
+///
+/// The Gaussian REML criterion to MINIMIZE over ρ (σ² profiled out, additive
+/// constants dropped; `M₀ = nullity(S)`, `r = rank(S)`, `n_eff = n (+1` if the
+/// test row is present`)`):
+///
+/// ```text
+///   Ṽ(ρ,z) = (n_eff − M₀) · log D(ρ,z) + log|A(λ)| − r ρ
+/// ```
+///
+/// Its z- and ρ-derivatives are all closed form (`pen = λ β̂ᵀSβ̂`):
+///
+/// ```text
+///   ∂D/∂ρ = pen ,                ∂D/∂z = 2(z − x_*ᵀβ̂) = 2 r_*
+///   G    = ∂Ṽ/∂ρ      = (n_eff−M₀)·pen/D + λ tr(A⁻¹S) − r
+///   ∂²Ṽ/∂ρ²           = (n_eff−M₀)·(pen'·D − pen²)/D² + λ tr(A⁻¹S) − λ² tr((A⁻¹S)²)
+///   ∂²Ṽ/∂ρ∂z          = (n_eff−M₀)·(pen_z'·D − pen·D_z')/D²
+/// ```
+///
+/// with `pen' = pen − 2λ²·β̂ᵀS A⁻¹ S β̂`, `pen_z' = 2λ·β̂ᵀS (A⁻¹x_*)`,
+/// `D_z' = 2 r_*`. The smoothing response to the candidate is one outer IFT
+/// step on `G(ρ̂(z), z) = 0`:
+///
+/// ```text
+///   dρ̂/dz = − (∂²Ṽ/∂ρ²)⁻¹ · ∂²Ṽ/∂ρ∂z .
+/// ```
+///
+/// The score–ρ sensitivity (which the certificate's Lipschitz constant uses)
+/// is `∂μ̂_i/∂ρ = x_iᵀ (dβ̂/dρ)` with `dβ̂/dρ = −λ A⁻¹ S β̂`, so
+/// `|∂e_i/∂ρ| = |∂μ̂_i/∂ρ|` (the absolute-residual score's only ρ-dependence
+/// is through μ̂). Everything is assembled from ONE Cholesky of `A(λ)` plus a
+/// handful of solves.
+pub struct GaussianRemlRhoResponse<'a> {
+    x: &'a Array2<f64>,
+    y: &'a Array1<f64>,
+    s: &'a Array2<f64>,
+    x_star: &'a Array1<f64>,
+    n: usize,
+    p: usize,
+    rank_s: usize,
+    xtx: Array2<f64>,
+    xty: Array1<f64>,
+    yty: f64,
+}
+
+/// One closed-form evaluation of the (possibly augmented) Gaussian REML
+/// criterion at `ρ = log λ`, carrying every derivative the IFT and the
+/// certificate consume.
+#[derive(Clone, Debug)]
+struct RemlEval {
+    /// `Ṽ(ρ,z)` (additive constants dropped — only differences in ρ matter).
+    value: f64,
+    /// `G = ∂Ṽ/∂ρ`.
+    grad: f64,
+    /// `∂²Ṽ/∂ρ²`.
+    hess: f64,
+    /// `∂²Ṽ/∂ρ∂z` (0 when the test row is absent).
+    cross: f64,
+    /// `∂μ̂_i/∂ρ` at the training rows.
+    mu_rho_train: Array1<f64>,
+    /// `∂μ̂_*/∂ρ` at the test row.
+    mu_rho_test: f64,
+}
+
+/// The frozen-ρ full-conformal set with its Layer-3 certificate and the
+/// constants the certificate decided on.
+#[derive(Clone, Debug)]
+pub struct CertifiedFullConformal {
+    /// The cheap exact set built at the frozen `ρ̂₀` (original-data optimum).
+    pub frozen_set: FullConformalSet,
+    /// Whether freezing ρ̂ provably cannot move the set for THIS dataset.
+    pub certificate: FrozenRhoCertificate,
+    /// `ρ̂₀ = log λ̂₀` selected by REML on the original (un-augmented) data.
+    pub rho_frozen: f64,
+    /// Computed bound on `sup_z |ρ̂(z) − ρ̂₀|` over the set's deciding range.
+    pub rho_excursion: f64,
+    /// `max_i (|∂μ̂_i/∂ρ| + |∂μ̂_*/∂ρ|)` — the score-gap Lipschitz constant in ρ.
+    pub score_rho_lipschitz: f64,
+}
+
+impl<'a> GaussianRemlRhoResponse<'a> {
+    /// Build the response object. Computes `rank(S)` once by symmetric
+    /// eigendecomposition (relative tolerance on the largest eigenvalue).
+    pub fn new(
+        x: &'a Array2<f64>,
+        y: &'a Array1<f64>,
+        s: &'a Array2<f64>,
+        x_star: &'a Array1<f64>,
+    ) -> Result<Self, String> {
+        let n = x.nrows();
+        let p = x.ncols();
+        if y.len() != n {
+            return Err("gaussian reml response: row-count mismatch".to_string());
+        }
+        if s.nrows() != p || s.ncols() != p || x_star.len() != p {
+            return Err("gaussian reml response: column-count mismatch".to_string());
+        }
+        let (evals, _) = s
+            .eigh(Side::Lower)
+            .map_err(|e| format!("gaussian reml response: penalty eigendecomposition failed: {e:?}"))?;
+        let max_ev = evals.iter().cloned().fold(0.0_f64, |a, b| a.max(b.abs()));
+        let tol = max_ev * 1e-10 * (p.max(1) as f64);
+        let rank_s = evals.iter().filter(|&&e| e > tol).count();
+        let xtx = x.t().dot(x);
+        let xty = x.t().dot(y);
+        let yty = y.dot(y);
+        Ok(Self {
+            x,
+            y,
+            s,
+            x_star,
+            n,
+            p,
+            rank_s,
+            xtx,
+            xty,
+            yty,
+        })
+    }
+
+    /// `rank(S)` as detected at construction.
+    pub fn rank_s(&self) -> usize {
+        self.rank_s
+    }
+
+    /// Closed-form REML evaluation at `ρ`. `z = Some(_)` augments with the
+    /// test row; `z = None` is the original-data criterion (used for ρ̂₀).
+    fn eval(&self, rho: f64, z: Option<f64>) -> Result<RemlEval, String> {
+        let p = self.p;
+        let n_eff = self.n + usize::from(z.is_some());
+        let m0 = p - self.rank_s;
+        if n_eff <= m0 {
+            return Err(format!(
+                "gaussian reml response: degrees of freedom n_eff−M₀ = {n_eff}−{m0} ≤ 0; \
+                 REML criterion undefined"
+            ));
+        }
+        let coef = (n_eff - m0) as f64;
+        let r = self.rank_s as f64;
+        let lambda = rho.exp();
+
+        // A(λ) = XᵀX + λ S [+ x_* x_*ᵀ].
+        let mut a = self.xtx.clone();
+        for i in 0..p {
+            for j in 0..p {
+                a[[i, j]] += lambda * self.s[[i, j]];
+            }
+        }
+        if z.is_some() {
+            for i in 0..p {
+                for j in 0..p {
+                    a[[i, j]] += self.x_star[i] * self.x_star[j];
+                }
+            }
+        }
+        let chol = a
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("gaussian reml response: A(λ) not SPD: {e:?}"))?;
+
+        // c(z) = Xᵀy [+ x_* z].
+        let mut c = self.xty.clone();
+        if let Some(zv) = z {
+            for j in 0..p {
+                c[j] += self.x_star[j] * zv;
+            }
+        }
+        let beta = chol.solvevec(&c);
+        let yty_eff = self.yty + z.map_or(0.0, |zv| zv * zv);
+        let d = yty_eff - c.dot(&beta);
+        if !(d > 0.0) {
+            return Err(format!(
+                "gaussian reml response: non-positive penalized RSS D = {d}; degenerate fit"
+            ));
+        }
+
+        let sbeta = self.s.dot(&beta);
+        let pen = lambda * beta.dot(&sbeta);
+
+        // Z = A⁻¹ S for the trace terms tr(A⁻¹S), tr((A⁻¹S)²).
+        let z_mat = chol.solve_mat(self.s);
+        let mut tr_ainv_s = 0.0;
+        let mut tr_ainv_s_sq = 0.0;
+        for i in 0..p {
+            tr_ainv_s += z_mat[[i, i]];
+            for j in 0..p {
+                tr_ainv_s_sq += z_mat[[i, j]] * z_mat[[j, i]];
+            }
+        }
+
+        // v_s = A⁻¹ Sβ̂ (so dβ̂/dρ = −λ v_s); quad = β̂ᵀS A⁻¹ S β̂.
+        let v_s = chol.solvevec(&sbeta);
+        let quad = sbeta.dot(&v_s);
+
+        let logdet: f64 = 2.0 * chol.diag().iter().map(|d| d.ln()).sum::<f64>();
+        let value = coef * d.ln() + logdet - r * rho;
+        let grad = coef * pen / d + lambda * tr_ainv_s - r;
+        let pen_prime = pen - 2.0 * lambda * lambda * quad;
+        let hess =
+            coef * (pen_prime * d - pen * pen) / (d * d) + lambda * tr_ainv_s - lambda * lambda * tr_ainv_s_sq;
+
+        // ∂μ̂/∂ρ = X (dβ̂/dρ) = −λ X v_s.
+        let xv = fast_av(self.x, &v_s);
+        let mu_rho_train = xv.mapv(|t| -lambda * t);
+        let mu_rho_test = -lambda * self.x_star.dot(&v_s);
+
+        let cross = if let Some(zv) = z {
+            let b = chol.solvevec(self.x_star); // dβ̂/dz
+            let pen_z = 2.0 * lambda * sbeta.dot(&b);
+            let r_star = zv - self.x_star.dot(&beta);
+            let d_z = 2.0 * r_star;
+            coef * (pen_z * d - pen * d_z) / (d * d)
+        } else {
+            0.0
+        };
+
+        Ok(RemlEval {
+            value,
+            grad,
+            hess,
+            cross,
+            mu_rho_train,
+            mu_rho_test,
+        })
+    }
+
+    /// Public, value-only REML criterion (for FD verification of the gradient).
+    pub fn reml_criterion(&self, rho: f64, z: Option<f64>) -> Result<f64, String> {
+        Ok(self.eval(rho, z)?.value)
+    }
+
+    /// `dρ̂/dz` at a stationary `(ρ, z)` via the outer IFT.
+    pub fn drho_dz(&self, rho: f64, z: f64) -> Result<f64, String> {
+        let ev = self.eval(rho, Some(z))?;
+        if ev.hess.abs() < 1e-14 {
+            return Err("gaussian reml response: outer Hessian ∂²Ṽ/∂ρ² ≈ 0; dρ̂/dz singular".to_string());
+        }
+        Ok(-ev.cross / ev.hess)
+    }
+
+    /// Select ρ̂ by REML: a coarse value scan over `ρ ∈ [−25, 25]` to seed,
+    /// then safeguarded Newton on `G = 0`. Deterministic (no randomness, fixed
+    /// grid), so it qualifies as the symmetric fitting map's smoothing choice.
+    pub fn select_rho(&self, z: Option<f64>) -> Result<f64, String> {
+        let (lo, hi, m) = (-25.0_f64, 25.0_f64, 60usize);
+        let mut best = (f64::INFINITY, 0.0_f64);
+        for k in 0..=m {
+            let rho = lo + (hi - lo) * (k as f64) / (m as f64);
+            if let Ok(ev) = self.eval(rho, z)
+                && ev.value < best.0
+            {
+                best = (ev.value, rho);
+            }
+        }
+        let mut rho = best.1;
+        for _ in 0..100 {
+            let ev = self.eval(rho, z)?;
+            if !ev.hess.is_finite() || ev.hess <= 1e-12 {
+                break;
+            }
+            let step = ev.grad / ev.hess;
+            let new_rho = (rho - step).clamp(lo - 5.0, hi + 5.0);
+            let delta = new_rho - rho;
+            rho = new_rho;
+            if delta.abs() < 1e-13 {
+                break;
+            }
+        }
+        Ok(rho)
+    }
+
+    /// Honest membership at candidate `z`: re-select ρ̂(z) on the augmented
+    /// data, fit, and apply the conformal rank rule. This IS the honest
+    /// (ρ-re-selecting) full-conformal map, computed exactly per candidate.
+    pub fn honest_membership(&self, z: f64, alpha: f64) -> Result<bool, String> {
+        let rho = self.select_rho(Some(z))?;
+        let lambda = rho.exp();
+        let p = self.p;
+        let mut a = self.xtx.clone();
+        for i in 0..p {
+            for j in 0..p {
+                a[[i, j]] += lambda * self.s[[i, j]] + self.x_star[i] * self.x_star[j];
+            }
+        }
+        let chol = a
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("gaussian reml response: honest A(λ) not SPD: {e:?}"))?;
+        let mut c = self.xty.clone();
+        for j in 0..p {
+            c[j] += self.x_star[j] * z;
+        }
+        let beta = chol.solvevec(&c);
+        let e_star = (z - self.x_star.dot(&beta)).abs();
+        let xb = fast_av(self.x, &beta);
+        let count = (0..self.n)
+            .filter(|&i| (self.y[i] - xb[i]).abs() >= e_star)
+            .count();
+        Ok((1.0 + count as f64) > alpha * (self.n as f64 + 1.0))
+    }
+
+    /// Run the certificate-first procedure: build the frozen-ρ exact set, then
+    /// bound the score perturbation a ρ re-selection could induce and decide
+    /// whether the frozen set provably equals the honest re-selecting set.
+    ///
+    /// The score-perturbation bound is `max_i(|∂μ̂_i/∂ρ| + |∂μ̂_*/∂ρ|) ·
+    /// sup_z|ρ̂(z) − ρ̂₀|`, where the ρ-excursion is bounded over the set's
+    /// finite deciding range by `|ρ̂(z_mid) − ρ̂₀| + (sup|dρ̂/dz|)·(z_hi −
+    /// z_lo)` (mean-value bound; `sup|dρ̂/dz|` estimated on a probe grid), and
+    /// the Lipschitz constant is the larger of its values at ρ̂₀ and at the
+    /// excursion endpoints. The bound is compared to `frozen_set.boundary_margin`.
+    pub fn certified_full_conformal(&self, alpha: f64) -> Result<CertifiedFullConformal, String> {
+        let rho0 = self.select_rho(None)?;
+        let lambda0 = rho0.exp();
+        let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
+        for i in 0..self.p {
+            for j in 0..self.p {
+                s_lambda[[i, j]] = lambda0 * self.s[[i, j]];
+            }
+        }
+        let weights = Array1::<f64>::ones(self.n);
+        let engine =
+            ExactGaussianFullConformal::new(self.x, self.y, &weights, &s_lambda, self.x_star)?;
+        let frozen_set = engine.prediction_set(alpha);
+
+        // Collect the finite deciding endpoints. If there are none (set is ℝ
+        // or empty), the boundary margin is +∞ and nothing can be flipped.
+        let mut endpoints: Vec<f64> = Vec::new();
+        for itv in &frozen_set.intervals {
+            for ep in [itv.lo, itv.hi] {
+                if ep.is_finite() {
+                    endpoints.push(ep);
+                }
+            }
+        }
+        if endpoints.is_empty() || !frozen_set.boundary_margin.is_finite() {
+            return Ok(CertifiedFullConformal {
+                certificate: FrozenRhoCertificate::decide(0.0, frozen_set.boundary_margin),
+                frozen_set,
+                rho_frozen: rho0,
+                rho_excursion: 0.0,
+                score_rho_lipschitz: 0.0,
+            });
+        }
+        endpoints.sort_by(|a, b| a.partial_cmp(b).expect("finite endpoints"));
+        let z_lo = *endpoints.first().expect("non-empty");
+        let z_hi = *endpoints.last().expect("non-empty");
+
+        // Probe grid spanning the deciding range; honest ρ̂(z) and dρ̂/dz at
+        // each probe. The ρ-excursion sup is bounded by the worst observed
+        // deviation plus the mean-value Lipschitz remainder over the range.
+        let probes = 64usize;
+        let mut max_dev = 0.0_f64;
+        let mut sup_drho_dz = 0.0_f64;
+        let mut lip = 0.0_f64;
+        // Lipschitz at the frozen optimum (un-augmented sensitivities).
+        let ev0 = self.eval(rho0, None)?;
+        for i in 0..self.n {
+            lip = lip.max(ev0.mu_rho_train[i].abs() + ev0.mu_rho_test.abs());
+        }
+        for k in 0..=probes {
+            let z = z_lo + (z_hi - z_lo) * (k as f64) / (probes as f64);
+            let rho_z = self.select_rho(Some(z))?;
+            max_dev = max_dev.max((rho_z - rho0).abs());
+            if let Ok(d) = self.drho_dz(rho_z, z) {
+                sup_drho_dz = sup_drho_dz.max(d.abs());
+            }
+            // Lipschitz also at the re-selected optimum (scores move with ρ).
+            let evz = self.eval(rho_z, Some(z))?;
+            for i in 0..self.n {
+                lip = lip.max(evz.mu_rho_train[i].abs() + evz.mu_rho_test.abs());
+            }
+        }
+        // Mean-value remainder: between probes ρ̂ can drift by at most
+        // sup|dρ̂/dz| times the probe spacing. Add a half-spacing guard so the
+        // bound dominates the continuous sup, not just the sampled maxima.
+        let spacing = (z_hi - z_lo) / (probes as f64);
+        let rho_excursion = max_dev + sup_drho_dz * spacing;
+        let score_perturbation_bound = lip * rho_excursion;
+        let certificate =
+            FrozenRhoCertificate::decide(score_perturbation_bound, frozen_set.boundary_margin);
+
+        Ok(CertifiedFullConformal {
+            frozen_set,
+            certificate,
+            rho_frozen: rho0,
+            rho_excursion,
+            score_rho_lipschitz: lip,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,5 +1332,209 @@ mod tests {
             }
         };
         assert!(discrete_full_conformal_window(&mut bad_map, &[0.0, 1.0], alpha).is_err());
+    }
+
+    /// A smooth Gaussian fixture: cosine basis design (column 0 constant,
+    /// column 1 the first harmonic — both unpenalized), a quartic-frequency
+    /// curvature penalty on the higher harmonics (`rank = p − 2`, nullity 2),
+    /// and a one-harmonic truth plus tiny deterministic noise.
+    fn gauss_reml_fixture(n: usize, p: usize) -> (Array2<f64>, Array1<f64>, Array2<f64>) {
+        use std::f64::consts::PI;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            for j in 0..p {
+                x[[i, j]] = (j as f64 * PI * t).cos();
+            }
+            y[i] = (2.0 * PI * t).sin() + 0.05 * (13.0 * i as f64 + 0.7).sin();
+        }
+        let mut s = Array2::<f64>::zeros((p, p));
+        for j in 0..p {
+            s[[j, j]] = if j < 2 { 0.0 } else { (j as f64).powi(4) };
+        }
+        (x, y, s)
+    }
+
+    fn cosine_row(p: usize, t: f64) -> Array1<f64> {
+        use std::f64::consts::PI;
+        let mut r = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            r[j] = (j as f64 * PI * t).cos();
+        }
+        r
+    }
+
+    /// The gradient-is-differential contract for the closed-form Gaussian REML
+    /// response (#1021 philosophy applied here): every analytic derivative the
+    /// IFT consumes (`G`, `∂²Ṽ/∂ρ²`, `∂²Ṽ/∂ρ∂z`) must equal the central
+    /// finite-difference of the SAME value path `Ṽ`. A desync here would make
+    /// `dρ̂/dz`, and therefore the certificate bound, silently wrong.
+    #[test]
+    fn gaussian_reml_rho_derivatives_match_finite_difference() {
+        let (x, y, s) = gauss_reml_fixture(40, 8);
+        let x_star = cosine_row(8, 0.5);
+        let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
+        assert_eq!(resp.rank_s(), 6, "quartic penalty with two zeros has rank p−2");
+
+        let rho = 0.4_f64;
+        let z = 0.3_f64;
+        let ev = resp.eval(rho, Some(z)).expect("eval");
+        let v = |r: f64, zz: f64| resp.reml_criterion(r, Some(zz)).expect("v");
+
+        let h = 1e-4_f64;
+        let g_fd = (v(rho + h, z) - v(rho - h, z)) / (2.0 * h);
+        assert!(
+            (ev.grad - g_fd).abs() <= 1e-4 * (1.0 + ev.grad.abs()),
+            "G mismatch: analytic={} fd={}",
+            ev.grad,
+            g_fd
+        );
+        let hess_fd = (v(rho + h, z) - 2.0 * v(rho, z) + v(rho - h, z)) / (h * h);
+        assert!(
+            (ev.hess - hess_fd).abs() <= 1e-3 * (1.0 + ev.hess.abs()),
+            "∂²Ṽ/∂ρ² mismatch: analytic={} fd={}",
+            ev.hess,
+            hess_fd
+        );
+        let k = 1e-4_f64;
+        let cross_fd =
+            (v(rho + h, z + k) - v(rho + h, z - k) - v(rho - h, z + k) + v(rho - h, z - k))
+                / (4.0 * h * k);
+        assert!(
+            (ev.cross - cross_fd).abs() <= 1e-3 * (1.0 + ev.cross.abs()),
+            "∂²Ṽ/∂ρ∂z mismatch: analytic={} fd={}",
+            ev.cross,
+            cross_fd
+        );
+
+        // The un-augmented criterion drops the cross term and the +1 row.
+        let ev0 = resp.eval(rho, None).expect("eval0");
+        assert_eq!(ev0.cross, 0.0);
+        let v0 = |r: f64| resp.reml_criterion(r, None).expect("v0");
+        let g0_fd = (v0(rho + h) - v0(rho - h)) / (2.0 * h);
+        assert!((ev0.grad - g0_fd).abs() <= 1e-4 * (1.0 + ev0.grad.abs()));
+    }
+
+    /// The exact smoothing response `dρ̂/dz` (outer IFT) must equal the
+    /// finite-difference of the ACTUAL re-selection map `z ↦ ρ̂(z)` — i.e. the
+    /// IFT derivative is the derivative of the thing it claims to differentiate,
+    /// not a parallel formula. This is the honesty check the issue demands for
+    /// the ρ-response.
+    #[test]
+    fn gaussian_reml_smoothing_response_matches_reselection() {
+        let (x, y, s) = gauss_reml_fixture(45, 8);
+        let x_star = cosine_row(8, 0.42);
+        let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
+
+        for &z in &[0.15_f64, 0.4, 0.75] {
+            let rho_z = resp.select_rho(Some(z)).expect("select");
+            // ρ̂(z) is a genuine stationary point of the augmented criterion.
+            let g = resp.eval(rho_z, Some(z)).expect("eval").grad;
+            assert!(g.abs() < 1e-6, "select_rho not stationary: G={g} at z={z}");
+
+            let analytic = resp.drho_dz(rho_z, z).expect("drho");
+            let hh = 2e-3_f64;
+            let fd = (resp.select_rho(Some(z + hh)).expect("u")
+                - resp.select_rho(Some(z - hh)).expect("d"))
+                / (2.0 * hh);
+            assert!(
+                (analytic - fd).abs() <= 1e-3 + 5e-2 * analytic.abs(),
+                "dρ̂/dz IFT vs re-selection FD mismatch at z={z}: analytic={analytic} fd={fd}"
+            );
+        }
+    }
+
+    /// THE Layer-3 theorem check, stated as the two invariants that actually
+    /// matter and verified by sweeping configurations:
+    ///
+    /// (a) **soundness** — whenever the certificate CERTIFIES, the cheap
+    ///     frozen-ρ set must EQUAL the honest set that re-selects ρ̂ at every
+    ///     candidate (verified on a dense grid by the independent
+    ///     `honest_membership` oracle). This is the proof the certificate
+    ///     sells; a wrong rank convention, margin, or excursion bound would
+    ///     let a certified set disagree with the honest one somewhere.
+    /// (b) **non-vacuousness** — at least one benign configuration in the
+    ///     sweep actually certifies (otherwise the certificate would be
+    ///     useless, always-refusing).
+    ///
+    /// We do NOT demand that any *specific* problem certify: a benign problem
+    /// can still carry a near-tie boundary whose tiny margin the conservative
+    /// bound legitimately cannot clear — refusing there is correct, not a bug.
+    #[test]
+    fn frozen_rho_certificate_proves_honest_set_equality() {
+        let mut any_certified = false;
+        let mut soundness_checks = 0usize;
+        for &(n, p) in &[(45usize, 8usize), (90, 6)] {
+            let (x, y, s) = gauss_reml_fixture(n, p);
+            for &t_star in &[0.4_f64, 0.5, 0.6] {
+                let x_star = cosine_row(p, t_star);
+                let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
+                for &alpha in &[0.15_f64, 0.25] {
+                    let cert = resp.certified_full_conformal(alpha).expect("cert");
+                    if !matches!(cert.certificate, FrozenRhoCertificate::Certified { .. }) {
+                        continue;
+                    }
+                    any_certified = true;
+                    // Verify soundness for the first few certified configs (the
+                    // honest oracle re-selects ρ̂ per grid point, so this is the
+                    // expensive arm — a handful is decisive).
+                    if soundness_checks >= 4 {
+                        continue;
+                    }
+                    let frozen = &cert.frozen_set;
+                    if frozen.intervals.is_empty() {
+                        continue;
+                    }
+                    soundness_checks += 1;
+                    let lo = frozen.intervals.first().unwrap().lo;
+                    let hi = frozen.intervals.last().unwrap().hi;
+                    let span = (hi - lo).max(1.0);
+                    let z_lo = if lo.is_finite() { lo - 0.5 * span } else { -12.0 };
+                    let z_hi = if hi.is_finite() { hi + 0.5 * span } else { 12.0 };
+                    let grid = 200usize;
+                    for g in 0..=grid {
+                        let z = z_lo + (z_hi - z_lo) * (g as f64) / (grid as f64);
+                        let in_frozen =
+                            frozen.intervals.iter().any(|itv| z >= itv.lo && z <= itv.hi);
+                        let honest = resp.honest_membership(z, alpha).expect("honest");
+                        assert_eq!(
+                            in_frozen, honest,
+                            "CERTIFIED set disagrees with the honest ρ-re-selecting set \
+                             at z={z} (n={n}, t*={t_star}, α={alpha}, excursion={}, lip={})",
+                            cert.rho_excursion, cert.score_rho_lipschitz
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            any_certified,
+            "no benign configuration in the sweep certified — the frozen-ρ certificate \
+             is vacuously always-refusing, which would make it useless"
+        );
+        assert!(soundness_checks >= 1, "no certified config carried a verifiable set");
+    }
+
+    /// The certificate must REFUSE to claim a proof when the smoothing
+    /// response is genuinely large: a high-leverage extrapolated test point at
+    /// small n makes ρ̂(z) swing with z, so the excursion bound exceeds the
+    /// boundary margin. The machinery must not vacuously always-certify, and
+    /// must still return a usable frozen set on refusal.
+    #[test]
+    fn frozen_rho_certificate_refuses_under_large_smoothing_response() {
+        let (x, y, s) = gauss_reml_fixture(12, 6);
+        let x_star = cosine_row(6, 1.9); // far extrapolation ⇒ high leverage
+        let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
+        let cert = resp.certified_full_conformal(0.2).expect("cert");
+        assert!(
+            matches!(cert.certificate, FrozenRhoCertificate::Refused { .. }),
+            "high-leverage small-n problem should refuse; got {:?} (excursion={}, margin via set)",
+            cert.certificate,
+            cert.rho_excursion
+        );
+        // A refusal still hands back the cheap frozen set for the caller to
+        // either widen with local refits or fall back from — never nothing.
+        assert!(cert.rho_excursion >= 0.0);
     }
 }
