@@ -1,6 +1,7 @@
 pub mod bernoulli_marginal_slope_identifiability;
 pub mod binomial_multi;
 pub mod bms;
+pub mod cell_moment_family;
 pub(crate) mod coefficient_cost;
 pub mod cubic_cell_kernel;
 pub mod custom_family;
