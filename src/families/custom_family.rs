@@ -20695,11 +20695,14 @@ fn joint_outer_evaluate(
     // no active Jeffreys curvature (empty system, unavailable exact derivatives,
     // or the conditioning gate proved the term zero), not a user-selected
     // robustness-off mode.
-    // Gated Jeffreys VALUE `Φ(β̂)` paired with the curvature `H_Φ` from the same
-    // term evaluation. The value is folded into the LAML cost (`cost −= Φ`) so
-    // the outer criterion is the Laplace approximation of the SAME
-    // Firth-augmented objective the inner Newton converged on (gam#979).
-    robust_jeffreys_phi_hphi: Option<(f64, Array2<f64>)>,
+    // Gated Jeffreys VALUE `Φ(β̂)` paired with the divided-difference curvature
+    // `H_Φ` and its (optional) second-order completion, all from the same term
+    // evaluation. The value is folded into the LAML cost (`cost −= Φ`) so the
+    // outer criterion is the Laplace approximation of the SAME Firth-augmented
+    // objective the inner Newton converged on; the completion is folded into
+    // the mode-response OPERATOR only (see
+    // `custom_family_outer_jeffreys_hphi` for the chain-rule split) (gam#979).
+    robust_jeffreys_phi_hphi: Option<(f64, Array2<f64>, Option<Array2<f64>>)>,
     // Companion mode-response drift `D_β H_Φ[δβ]` for the outer gradient's trace
     // identity. `Some` exactly when `robust_jeffreys_phi_hphi` is `Some` (same
     // under-identified span); installing it wraps the derivative provider so the
@@ -20711,11 +20714,35 @@ fn joint_outer_evaluate(
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
 
-    let (robust_jeffreys_phi, robust_jeffreys_hphi): (Option<f64>, Option<Array2<f64>>) =
-        match robust_jeffreys_phi_hphi {
-            Some((phi, hphi)) => (Some(phi), Some(hphi)),
-            None => (None, None),
-        };
+    let (robust_jeffreys_phi, robust_jeffreys_hphi, robust_jeffreys_completion): (
+        Option<f64>,
+        Option<Array2<f64>>,
+        Option<Array2<f64>>,
+    ) = match robust_jeffreys_phi_hphi {
+        Some((phi, hphi, completion)) => (Some(phi), Some(hphi), completion),
+        None => (None, None, None),
+    };
+    // Mode-response operator curvature: the divided-difference `H_Φ` PLUS its
+    // second-order completion when available — the TRUE Hessian of the
+    // Φ-augmented inner objective, which is what `v_k = ∂β̂/∂ρ_k` solves
+    // against. The logdet VALUE and its trace kernel keep the bare `H_Φ`
+    // (value↔drift consistency); see `custom_family_outer_jeffreys_hphi`.
+    // Folded ONLY when the projected kernel will own the value and the
+    // first-order traces (the same precondition as the kernel install below);
+    // on the unprojected route the operator IS the value/trace object and
+    // must stay on the divided-difference pair.
+    let completion_in_operator = project_hessian_logdet
+        && include_logdet_h
+        && include_logdet_s
+        && pseudo_logdet_mode == PseudoLogdetMode::Smooth;
+    let robust_jeffreys_hphi_for_operator: Option<Array2<f64>> = match (
+        robust_jeffreys_hphi.as_ref(),
+        robust_jeffreys_completion.filter(|_| completion_in_operator),
+    ) {
+        (Some(hphi), Some(completion)) => Some(hphi + &completion),
+        (Some(hphi), None) => Some(hphi.clone()),
+        (None, _) => None,
+    };
     // Pre-scale the outer-REML Jeffreys curvature into the same rescaled space as
     // the penalties so the projected-logdet path and the operator agree. `None`
     // (flag OFF / no under-identified span) keeps the released outer REML exact.
@@ -20782,7 +20809,7 @@ fn joint_outer_evaluate(
                     let apply_h = Arc::clone(&h_joint);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    let apply_hphi = robust_jeffreys_hphi.clone();
+                    let apply_hphi = robust_jeffreys_hphi_for_operator.clone();
                     let hphi_scale = rho_curvature_scale;
                     Arc::new(MatrixFreeSpdOperator::new_with_mode(
                         total,
@@ -20809,7 +20836,7 @@ fn joint_outer_evaluate(
                     let apply_h = Arc::clone(apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    let apply_hphi = robust_jeffreys_hphi.clone();
+                    let apply_hphi = robust_jeffreys_hphi_for_operator.clone();
                     let hphi_scale = rho_curvature_scale;
                     Arc::new(MatrixFreeSpdOperator::new_with_mode(
                         total,
@@ -20854,7 +20881,7 @@ fn joint_outer_evaluate(
                 scaled_joint_trace_diagonal_ridge,
                 None,
             );
-            if let Some(hphi) = robust_jeffreys_hphi.as_ref() {
+            if let Some(hphi) = robust_jeffreys_hphi_for_operator.as_ref() {
                 j_for_traces.scaled_add(rho_curvature_scale, hphi);
             }
             Arc::new(
@@ -23159,7 +23186,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let robust_jeffreys_hphi =
         custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?;
     let batched_gradient_contract_allows_override = batched_outer_gradient_contract_allows_override(
-        robust_jeffreys_hphi.as_ref().map(|(_phi, hphi)| hphi),
+        robust_jeffreys_hphi
+            .as_ref()
+            .map(|(_phi, hphi, _completion)| hphi),
     );
     let mut batched_gradient_override: Option<Array1<f64>> = None;
     if !has_configured_rho_prior
@@ -24460,7 +24489,7 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
-) -> Result<Option<(f64, Array2<f64>)>, String> {
+) -> Result<Option<(f64, Array2<f64>, Option<Array2<f64>>)>, String> {
     if !family.joint_jeffreys_term_required() {
         return Ok(None);
     }
@@ -24474,31 +24503,35 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
     // value/curvature must come from the SAME term evaluation.
     let phi_and_hphi = custom_family_joint_jeffreys_term(family, states, specs, ranges, &z_joint)?
         .map(|(phi, _grad, hphi)| (phi, hphi));
-    let Some((phi, mut hphi)) = phi_and_hphi else {
+    let Some((phi, hphi)) = phi_and_hphi else {
         return Ok(None);
     };
-    // SECOND-ORDER COMPLETION AT THE MODE (gam#979). The divided-difference
-    // `H_Φ` omits the second-directional-Hessian remainder `½ tr(K·D_ab)`; at
-    // the converged β̂ the outer LAML's curvature object should be the TRUE
-    // Hessian of the Φ-augmented inner objective — the Laplace approximation's
-    // honest curvature. Folding the completion here (one seam) puts the same
-    // `M = H + S_λ + H_Φ + completion` behind the projected logdet, the trace
-    // kernel, the mode-response solves `v_k = ∂β̂/∂ρ_k`, and the IFT
-    // pseudo-inverse at once. Without it, `v_k` is solved on a Hessian missing
-    // an O(1)-comparable term along the Firth-active direction, which biased
-    // every drift contraction (measured: a uniform ~10% analytic-vs-FD outer
-    // gradient gap on the binomial-LS fixtures). The drift wrapper still
-    // differentiates the divided-difference part only; the completion's own
-    // β-motion is the next-order remainder (it needs third directional
-    // derivatives no family exposes). Skipped at wide p (cost is p(p+1)/2
-    // second-directional calls) and degrades safely to the DD curvature when
-    // the family lacks exact second derivatives.
+    // SECOND-ORDER COMPLETION AT THE MODE (gam#979), returned SEPARATELY. The
+    // divided-difference `H_Φ` omits the second-directional-Hessian remainder
+    // `½ tr(K·D_ab)`, so the TRUE Hessian of the Φ-augmented inner objective
+    // is `M_true = H + S_λ + H_Φ + completion`. The chain rule fixes where
+    // each belongs in the outer gradient of `V = f(β̂) + ½log|M_DD|₊ − ½log|S|₊`:
+    //   * the logdet VALUE and its trace kernel must share ONE object
+    //     (`M_DD = H + S_λ + H_Φ`), whose drift `D_β H_Φ[v]` the wrapper
+    //     supplies exactly — folding the completion THERE would desync value
+    //     from drift (the completion's own β-motion needs third directional
+    //     derivatives no family exposes; measured: ~38% gradient / ~70%
+    //     Hessian FD bias when tried);
+    //   * the mode response `v_k = ∂β̂/∂ρ_k = −(∇²f)⁻¹ Ṡ_k β̂` must be solved
+    //     on `M_true` — it is a property of the inner stationarity system,
+    //     not of the criterion (measured: ~10% uniform FD bias when solved
+    //     on `M_DD`).
+    // Callers therefore fold this term into the mode-response OPERATOR only.
+    // Skipped at wide p (cost is p(p+1)/2 second-directional calls); `None`
+    // degrades safely to the divided-difference solve.
     let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    let mut completion: Option<Array2<f64>> = None;
     if total_p <= JEFFREYS_COMPLETION_MAX_P
         && let Some(h_joint) = family.exact_newton_joint_hessian_with_specs(states, specs)?
         && h_joint.nrows() == total_p
         && h_joint.ncols() == total_p
-        && let Some(completion) =
+    {
+        completion =
             crate::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
                 h_joint.view(),
                 z_joint.view(),
@@ -24507,11 +24540,9 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
                         states, specs, u, v,
                     )
                 },
-            )?
-    {
-        hphi += &completion;
+            )?;
     }
-    Ok(Some((phi, hphi)))
+    Ok(Some((phi, hphi, completion)))
 }
 
 fn batched_outer_gradient_contract_allows_override(
