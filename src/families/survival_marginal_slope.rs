@@ -21189,7 +21189,7 @@ pub fn fit_survival_marginal_slope_terms(
         crate::linalg::matrix::DesignMatrix,
         crate::terms::smooth::TermCollectionDesign,
         crate::terms::smooth::TermCollectionDesign,
-        Option<crate::families::survival_marginal_slope_identifiability::SmgsLiftViaT>,
+        Option<crate::solver::gauge::Gauge>,
         Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
         Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
         Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
@@ -21208,9 +21208,10 @@ pub fn fit_survival_marginal_slope_terms(
         recompile_after_accept,
     ): SmgsCutoverTuple = {
         use crate::families::survival_marginal_slope_identifiability::{
-            CompiledSurvivalDesignsVMExact, SmgsLiftViaT, apply_compiled_map_to_designs,
+            CompiledSurvivalDesignsVMExact, apply_compiled_map_to_designs,
             extract_term_partition_from_penalty_ranges,
         };
+        use crate::solver::gauge::Gauge;
         // Recompile context, populated when the closed-form compile
         // succeeds. The post-solve recompile-after-accept hook consumes
         // this to rebuild row Hessians at the converged β.
@@ -21221,7 +21222,7 @@ pub fn fit_survival_marginal_slope_terms(
         // and downstream canonicalize_for_identifiability still gate
         // on the audit.
         let attempt =
-            (|| -> Result<Option<(CompiledSurvivalDesignsVMExact, SmgsLiftViaT)>, String> {
+            (|| -> Result<Option<(CompiledSurvivalDesignsVMExact, Gauge)>, String> {
                 let n_rows = spec.time_block.design_entry.nrows();
                 let p_time = spec.time_block.design_entry.ncols();
                 let p_marg = marginal_design.design.ncols();
@@ -21621,7 +21622,7 @@ pub fn fit_survival_marginal_slope_terms(
                                 IdBlockOrder::Marginal,
                                 IdBlockOrder::Logslope,
                             ];
-                            let lift = SmgsLiftViaT::from_compiled_map(&map, &ordering);
+                            let lift = Gauge::from_compiled_map(&map, &ordering);
                             return Ok(Some((applied, lift)));
                         }
                         Ok(None) => {
@@ -22664,10 +22665,7 @@ pub fn fit_survival_marginal_slope_terms(
         let recompile_started = std::time::Instant::now();
         // Lift compiled β → raw β when the cutover fired. Otherwise the
         // block_states already carry raw-width β.
-        let n_lift = smgs_lift_v
-            .as_ref()
-            .map(|l| l.block_starts_compiled.len().saturating_sub(1))
-            .unwrap_or(0);
+        let n_lift = smgs_lift_v.as_ref().map(|l| l.n_blocks()).unwrap_or(0);
         let raw_time_beta = if let Some(ref lift) = smgs_lift_v {
             let compiled_betas: Vec<Array1<f64>> = solved
                 .fit
@@ -22676,7 +22674,7 @@ pub fn fit_survival_marginal_slope_terms(
                 .take(n_lift)
                 .map(|s| s.beta.clone())
                 .collect();
-            let lifted = lift.lift_block_betas_via_t(&compiled_betas);
+            let lifted = lift.lift_block_betas(&compiled_betas);
             lifted.into_iter().next()
         } else {
             solved.fit.block_states.first().map(|s| s.beta.clone())
@@ -22808,10 +22806,10 @@ pub fn fit_survival_marginal_slope_terms(
         final_family.offset_channel_geometry(&solved.fit.block_states)?
     };
 
-    // Phase-4b V+M-exact result-time β lift. When the active cutover
+    // Phase-4b V+M-exact result-time lift. When the active cutover
     // fired, the inner Newton produced θ at *compiled* width across the
     // time/marginal/logslope blocks. Predict-time consumers expect β at
-    // the original raw width: `lift_block_betas_via_t` concatenates the
+    // the original raw width: `Gauge::lift_block_betas` concatenates the
     // per-block compiled θs, multiplies by the full triangular T
     // (V's on the diagonal, `−R_{a→b}` off-diagonals), and splits the
     // result at raw-block boundaries. The corresponding η is
@@ -22819,10 +22817,21 @@ pub fn fit_survival_marginal_slope_terms(
     // X_raw · T · θ = X_compiled · θ) so we leave it alone. When the
     // cutover did NOT fire (smgs_lift_v is None), β is already at raw
     // width and the lift is a no-op. Flex blocks (score_warp_dev,
-    // link_dev) at indices ≥ 3 are not part of the parametric T and
-    // pass through unchanged.
+    // link_dev) at indices ≥ 3 are not part of the parametric T; the
+    // gauge is extended with identity blocks over their widths so the
+    // joint covariance lift below sees them pass through unchanged.
     if let Some(ref lift) = smgs_lift_v {
-        let n_lift = lift.block_starts_compiled.len().saturating_sub(1);
+        let n_lift = lift.n_blocks();
+        // Flex-block widths BEFORE the β lift (identical after — flex
+        // blocks are never compiled), used to extend the gauge so joint
+        // (compiled+flex)-width matrices lift in one sandwich.
+        let flex_widths: Vec<usize> = solved
+            .fit
+            .blocks
+            .iter()
+            .skip(n_lift)
+            .map(|b| b.beta.len())
+            .collect();
         let compiled_betas: Vec<Array1<f64>> = solved
             .fit
             .block_states
@@ -22830,7 +22839,7 @@ pub fn fit_survival_marginal_slope_terms(
             .take(n_lift)
             .map(|s| s.beta.clone())
             .collect();
-        let lifted = lift.lift_block_betas_via_t(&compiled_betas);
+        let lifted = lift.lift_block_betas(&compiled_betas);
         for ((state, block), beta) in solved
             .fit
             .block_states
@@ -22852,6 +22861,47 @@ pub fn fit_survival_marginal_slope_terms(
             off += p;
         }
         solved.fit.beta = flat;
+
+        // Lift the joint covariance / Hessian geometry with the SAME T
+        // the β lift used (#741 cov-lift gap, #933 one-lift-convention):
+        // raw-width β paired with compiled-width Σ would make predict-time
+        // standard errors index the wrong coordinates. The joint matrices
+        // span compiled parametric blocks followed by raw flex blocks, so
+        // the gauge is extended with identity over the flex widths.
+        let joint_gauge = lift.extend_with_identity(&flex_widths);
+        let lift_joint = |name: &str, m: Array2<f64>| -> Array2<f64> {
+            if m.nrows() == joint_gauge.reduced_total() {
+                joint_gauge.lift_covariance(&m)
+            } else {
+                log::warn!(
+                    "[smgs phase-4b result lift] {name} has dim {} but the compiled+flex \
+                     reduced width is {} (raw {}); leaving it unlifted — this indicates a \
+                     width bug upstream",
+                    m.nrows(),
+                    joint_gauge.reduced_total(),
+                    joint_gauge.raw_total(),
+                );
+                m
+            }
+        };
+        solved.fit.covariance_conditional = solved
+            .fit
+            .covariance_conditional
+            .take()
+            .map(|c| lift_joint("covariance_conditional", c));
+        solved.fit.covariance_corrected = solved
+            .fit
+            .covariance_corrected
+            .take()
+            .map(|c| lift_joint("covariance_corrected", c));
+        if let Some(geometry) = solved.fit.geometry.take() {
+            let h_red = geometry.penalized_hessian.into_array();
+            solved.fit.geometry = Some(crate::families::custom_family::FitGeometry {
+                penalized_hessian: lift_joint("penalized_hessian", h_red).into(),
+                working_weights: geometry.working_weights,
+                working_response: geometry.working_response,
+            });
+        }
     }
 
     let mut resolved_specs = solved.resolved_specs;

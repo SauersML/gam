@@ -4114,6 +4114,10 @@ pub struct BlockwiseFitResultParts {
     /// or trivial early-exit); `Some(g)` = measured norm. `outer_converged`
     /// is the authoritative convergence signal.
     pub outer_gradient_norm: Option<f64>,
+    /// First-order optimality certificate from the outer smoothing solve
+    /// (#934); `None` when no outer ran (fixed-λ, one-cycle probe) or the
+    /// audit could not evaluate.
+    pub criterion_certificate: Option<crate::solver::outer_strategy::CriterionCertificate>,
     pub inner_cycles: usize,
     pub outer_converged: bool,
     pub geometry: Option<FitGeometry>,
@@ -4366,6 +4370,7 @@ pub fn blockwise_fit_from_parts(
         penalized_objective,
         outer_iterations,
         outer_gradient_norm,
+        criterion_certificate,
         inner_cycles,
         outer_converged,
         geometry,
@@ -4601,6 +4606,7 @@ pub fn blockwise_fit_from_parts(
         constraint_kkt: None,
         artifacts: crate::solver::estimate::FitArtifacts {
             pirls: None,
+            criterion_certificate,
             ..Default::default()
         },
         inner_cycles,
@@ -25573,6 +25579,7 @@ struct BlockwiseFitAssembly<'a> {
     penalized_objective: f64,
     outer_iterations: usize,
     outer_gradient_norm: Option<f64>,
+    criterion_certificate: Option<crate::solver::outer_strategy::CriterionCertificate>,
     outer_converged: bool,
     context: &'static str,
 }
@@ -25590,6 +25597,7 @@ fn assemble_custom_family_fit_result(
         penalized_objective,
         outer_iterations,
         outer_gradient_norm,
+        criterion_certificate,
         outer_converged,
         context,
     } = assembly;
@@ -25622,6 +25630,7 @@ fn assemble_custom_family_fit_result(
             penalized_objective,
             outer_iterations,
             outer_gradient_norm,
+            criterion_certificate,
             inner_cycles: inner.cycles,
             outer_converged,
             geometry,
@@ -26161,6 +26170,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 penalized_objective,
                 outer_iterations: 0,
                 outer_gradient_norm: None,
+                criterion_certificate: None,
                 outer_converged: inner_converged,
                 context: "fit_custom_family no-smoothing result assembly",
             },
@@ -26206,6 +26216,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 penalized_objective,
                 outer_iterations: 0,
                 outer_gradient_norm: Some(0.0),
+                criterion_certificate: None,
                 outer_converged: inner_converged,
                 context: "fit_custom_family one-cycle result assembly",
             },
@@ -26652,7 +26663,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // infinite-width intervals that masquerade as a fit — see the finite-mode
     // check after the refit). The result carries the existing escalation's
     // degraded / sampled-not-certified flagging so confidence is honest.
-    let (rho_star, outer_grad_norm, outer_iters, nonconvergence_escalation) = match outer_result {
+    let (rho_star, outer_grad_norm, outer_iters, nonconvergence_escalation, outer_certificate) = match outer_result {
         Ok(outer_result) => {
             // Geometry-driven terminal escalation. When the outer smoothing
             // optimizer cannot certify convergence, the objective is always
@@ -26679,6 +26690,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 outer_result.final_grad_norm,
                 outer_result.iterations,
                 nonconvergence_escalation,
+                outer_result.criterion_certificate,
             )
         }
         Err(e) if outer_startup_failure_is_escalatable(&e) => {
@@ -26688,7 +26700,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                  AUTO-ESCALATE to never-fail posterior sampling about the initial ρ seed; the \
                  degraded refit below still raises if even the seed produces a non-finite mode.",
             );
-            (rho0.clone(), None, 0, true)
+            (rho0.clone(), None, 0, true, None)
         }
         Err(e) => {
             return Err(format!(
@@ -26943,6 +26955,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             penalized_objective,
             outer_iterations: outer_iters,
             outer_gradient_norm: outer_grad_norm,
+            criterion_certificate: outer_certificate,
             outer_converged,
             context: "fit_custom_family result assembly",
         },
@@ -27009,6 +27022,7 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
             penalized_objective,
             outer_iterations,
             outer_gradient_norm,
+            criterion_certificate: None,
             outer_converged,
             context: "fit_custom_family_fixed_log_lambdas result assembly",
         },
@@ -27204,6 +27218,7 @@ mod tests {
                 penalized_objective: 1.0,
                 outer_iterations: 0,
                 outer_gradient_norm: Some(0.0),
+                criterion_certificate: None,
                 inner_cycles: 0,
                 outer_converged: true,
                 geometry: Some(FitGeometry {

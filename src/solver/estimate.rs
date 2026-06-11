@@ -4945,6 +4945,7 @@ where
         constraint_kkt: pirls_res.constraint_kkt.clone(),
         artifacts: FitArtifacts {
             pirls: Some(pirls_res),
+            criterion_certificate: outer_result.criterion_certificate.clone(),
             ..Default::default()
         },
         inference,
@@ -5089,6 +5090,12 @@ pub struct FitArtifacts {
     pub survival_link_wiggle_knots: Option<Array1<f64>>,
     #[serde(default)]
     pub survival_link_wiggle_degree: Option<usize>,
+    /// First-order optimality certificate from the outer smoothing-parameter
+    /// optimization (#934): gradient-vs-objective FD audit at the returned
+    /// optimum, Hessian-PD probe, λ-rail flags. `None` when the outer ran
+    /// gradient-free or an audit probe could not evaluate.
+    #[serde(default)]
+    pub criterion_certificate: Option<crate::solver::outer_strategy::CriterionCertificate>,
 }
 
 impl std::fmt::Debug for FitArtifacts {
@@ -5108,6 +5115,7 @@ impl std::fmt::Debug for FitArtifacts {
                 "survival_link_wiggle_degree",
                 &self.survival_link_wiggle_degree,
             )
+            .field("criterion_certificate", &self.criterion_certificate)
             .finish()
     }
 }
