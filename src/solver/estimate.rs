@@ -3825,6 +3825,7 @@ where
             } else {
                 None
             })
+            .with_problem_size(n_obs, x_o.ncols())
             .with_arc_initial_regularization(if gaussian_identity { Some(0.25) } else { None })
             .with_operator_initial_trust_radius(if gaussian_identity { Some(4.0) } else { None })
             .with_rho_bound(crate::estimate::RHO_BOUND);
