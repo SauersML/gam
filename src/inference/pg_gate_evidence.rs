@@ -203,8 +203,8 @@ fn evaluate(block: &GateBlock<'_>, lane: Lane) -> Result<PgGateEvidence, String>
         let omega_diag = omega_bar.mapv(|w| (scale * w).max(0.0));
 
         // Q_ω = Q_base + X_gᵀ Ω X_g  (weighted Gram).
-        let mut q = q_base.clone();
-        weighted_gram_into(block.design, omega_diag.view(), &mut q);
+        let mut q_mat = q_base.clone();
+        weighted_gram_into(block.design, omega_diag.view(), &mut q_mat);
 
         // h_ω = h_const − X_gᵀ Ω o.
         let mut h = h_const.clone();
@@ -215,7 +215,7 @@ fn evaluate(block: &GateBlock<'_>, lane: Lane) -> Result<PgGateEvidence, String>
         }
 
         // Gaussian block: V_q = ½ log|Q| − ½ hᵀ Q⁻¹ h.
-        let q_view = FaerArrayView::new(&q);
+        let q_view = FaerArrayView::new(&q_mat);
         let factor = factorize_symmetricwith_fallback(q_view.as_ref(), Side::Lower)
             .map_err(|e| format!("PG gate block factorization failed: {e:?}"))?;
         let log_det = factor.logdet();
