@@ -5094,34 +5094,6 @@ impl ArrowFactorCache {
         Ok(cholesky_solve_vector(schur_factor, &rhs_owned))
     }
 
-    /// Diagonal of the β-block of the full inverse, `diag((H⁻¹)_ββ) = diag(S_β⁻¹)`,
-    /// length `K`.
-    ///
-    /// Convenience built from `K` Cholesky back-substitutions against the
-    /// unit vectors (`[S_β⁻¹]_{jj} = e_jᵀ S_β⁻¹ e_j`), reusing the cached
-    /// factor. Useful for the per-β-coordinate effective dof. Same dense-Schur
-    /// requirement / error contract as [`Self::schur_inverse_apply`].
-    pub fn schur_inverse_diagonal(&self) -> Result<Array1<f64>, ArrowSchurError> {
-        let Some(schur_factor) = self.schur_factor.as_ref() else {
-            return Err(ArrowSchurError::SchurFactorFailed {
-                reason: "schur_inverse_diagonal requires a dense Schur factor; \
-                         the InexactPCG mode does not form one"
-                    .to_string(),
-            });
-        };
-        let mut out = Array1::<f64>::zeros(self.k);
-        let mut e_j = Array1::<f64>::zeros(self.k);
-        for j in 0..self.k {
-            for c in 0..self.k {
-                e_j[c] = 0.0;
-            }
-            e_j[j] = 1.0;
-            let col = cholesky_solve_vector(schur_factor, &e_j);
-            out[j] = col[j];
-        }
-        Ok(out)
-    }
-
     /// Dense principal sub-block of the β-block of the full inverse,
     /// `(H⁻¹)_ββ[block, block] = S_β⁻¹[block, block]`, shape `(W, W)` with
     /// `W = block.len()`.
@@ -9545,7 +9517,7 @@ mod tests {
         }
     }
 
-    /// `schur_inverse_apply` / `schur_inverse_diagonal` must reproduce the
+    /// `schur_inverse_apply` / `schur_inverse_block` must reproduce the
     /// β-block of the dense bordered-arrow inverse `(H⁻¹)_ββ = S_β⁻¹`, and a
     /// caller-assembled `tr(S_β⁻¹ M)` must match the dense Kron-block trace —
     /// the β-side analogue used by the SAE λ_smooth Fellner-Schall step.
@@ -9599,20 +9571,6 @@ mod tests {
 
         // The β-block of H⁻¹ is the bottom-right K×K corner.
         let beta_off = n * d;
-
-        // schur_inverse_diagonal vs dense β-block diagonal.
-        let sdiag = cache
-            .schur_inverse_diagonal()
-            .expect("dense Schur cache must support schur_inverse_diagonal");
-        assert_eq!(sdiag.len(), k);
-        for j in 0..k {
-            let expected = h_inv[[beta_off + j, beta_off + j]];
-            assert!(
-                (sdiag[j] - expected).abs() < 1e-9,
-                "β diag {j}: {} vs dense {expected}",
-                sdiag[j]
-            );
-        }
 
         // schur_inverse_apply against each unit column reproduces the full
         // β-block (every entry, not just the diagonal).
