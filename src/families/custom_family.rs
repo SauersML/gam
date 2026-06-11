@@ -12765,15 +12765,39 @@ fn shrink_active_joint_block_trust_radii(
                 joint_block_step_hit_trust_boundary(**step_norm, **radius)
             })
             .all(|(radius, _)| *radius <= RADIUS_FLOOR * (1.0 + 1.0e-12));
+    // Snapshot the joint max BEFORE the shrink loop so the max-holding
+    // block(s) — boundary OR interior — always participate. The
+    // Moré–Sorensen inner step uses the SCALAR
+    // `joint_trust_radius = max(block_radii)` as its trust constraint
+    // (`spectrum.trust_region_step(joint_trust_radius)`); if the max-holder
+    // is an interior block whose step came in well below its per-block
+    // radius, the original boundary-only rule left the joint max held, the
+    // MS solve re-computed a byte-identical rejected step, and the inner
+    // loop stalled at `inner_loop_hard_ceiling`. Surfaced as the ~2-hour
+    // Rust CI test hang where cycles 117..305+ all logged
+    // `r=1.562e-2 (held) decision=shrink_reject |δ|=1.562e-2 |δ|∞=1.052e-4`
+    // identically: the boundary block's per-block radius collapsed toward
+    // the floor without ever changing the scalar joint radius, and the
+    // existing `all_boundary_blocks_at_floor` carve-out was unreachable
+    // because the boundary block kept getting deeper than the interior
+    // max-holder. Forcing the max-holder to participate makes the scalar
+    // `max(block_radii)` strictly decrease on every rejected attempt until
+    // the floor, after which the fully-rejected stall guard
+    // (`FULLY_REJECTED_STALL_MAX_CYCLES`) takes over and bails the cycle
+    // cleanly.
+    let max_radius_before = block_radii.iter().copied().fold(0.0_f64, f64::max);
     for (radius, step_norm) in block_radii.iter_mut().zip(block_step_norms) {
         let at_boundary = joint_block_step_hit_trust_boundary(*step_norm, *radius);
+        let holds_max = max_radius_before > 0.0
+            && max_radius_before.is_finite()
+            && *radius >= max_radius_before * (1.0 - 1.0e-12);
         let participates = if all_boundary_blocks_at_floor {
             // Boundary-at-floor stall: the boundary blocks cannot shrink any
             // further, so participate every block (including interior ones)
             // so the joint step magnitude actually changes.
             true
         } else if any_boundary_block {
-            at_boundary
+            at_boundary || holds_max
         } else {
             true
         };
@@ -34712,6 +34736,43 @@ mod tests {
             "interior block radius must drop below its step norm to force a strictly smaller next step (radius {:.3e}, step {:.3e})",
             block_radii[0],
             block_step_norms[0]
+        );
+    }
+
+    #[test]
+    fn shrink_active_joint_block_trust_radii_decreases_max_when_max_held_by_interior_block() {
+        // Production stall (Rust CI Test job ~2-hour hang, cycles
+        // 117..305+ all logging
+        // `r=1.562e-2 (held) decision=shrink_reject |δ|=1.562e-2`
+        // identically): the Moré–Sorensen inner trust-region step
+        // (`spectrum.trust_region_step(joint_trust_radius)`) uses the
+        // SCALAR `joint_trust_radius = max(block_radii)` as its trust
+        // constraint. When a boundary block hits its per-block radius
+        // (and shrinks) while an interior block holds the joint MAX
+        // radius — but the boundary block is NOT yet at the floor, so
+        // the `all_boundary_blocks_at_floor` carve-out doesn't fire —
+        // only the boundary block participates, the interior max-holder
+        // keeps its radius, `max(block_radii)` is held, MS re-computes
+        // the byte-identical rejected step, and the inner Newton loop
+        // stalls at `inner_loop_hard_ceiling`. The fix makes the
+        // max-holder participate even when it's an interior block, so
+        // the scalar joint radius strictly decreases on every rejected
+        // attempt until the floor (where the `FULLY_REJECTED_STALL_MAX_CYCLES`
+        // guard bails cleanly).
+        let mut block_radii = vec![1.562e-2, 1.562e-2];
+        // Block 0: step at per-block boundary (the boundary block).
+        // Block 1: interior step well below its radius.
+        // Both blocks share the joint max radius 1.562e-2 — the MS step
+        // is constrained by that scalar value.
+        let block_step_norms = vec![1.562e-2, 1.0e-6];
+        let old_max = block_radii.iter().copied().fold(0.0_f64, f64::max);
+        let new_max =
+            shrink_active_joint_block_trust_radii(&mut block_radii, &block_step_norms, 0.25);
+        assert!(
+            new_max < old_max,
+            "joint trust radius (= scalar Moré–Sorensen constraint) must \
+             strictly decrease on rejection even when the max is held by \
+             an interior block (was {old_max:.3e}, now {new_max:.3e})"
         );
     }
 
