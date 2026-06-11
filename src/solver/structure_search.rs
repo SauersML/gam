@@ -329,10 +329,17 @@ pub fn search<S, Sh>(
     let mut records: Vec<MoveRecord> = Vec::with_capacity(proposals.len());
 
     for prop in proposals {
-        let verdict = if moves_applied >= budget.max_moves {
-            MoveVerdict::Deferred
-        } else if !seen_hashes.insert(prop.structure_hash) {
+        // Dedup is a property of the proposal stream (a duplicate structural
+        // hash describes a proposal that the engine has already considered),
+        // so it is decided BEFORE the budget gate: a duplicate of an
+        // already-applied move stays a duplicate even when the budget is
+        // exhausted. Reversing this order mislabels duplicates as deferred,
+        // which breaks the dedup-vs-defer accounting downstream (a deferred
+        // record is replayed by the next round; a deduplicated one is not).
+        let verdict = if !seen_hashes.insert(prop.structure_hash) {
             MoveVerdict::Deduplicated
+        } else if moves_applied >= budget.max_moves {
+            MoveVerdict::Deferred
         } else if prop.mv.touches().iter().any(|a| touched.contains(a)) {
             MoveVerdict::Stale
         } else {
