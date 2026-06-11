@@ -19855,7 +19855,7 @@ impl BinomialLocationScaleWiggleFamily {
     }
 
     fn expected_wiggle_geometry_inputs<'a>(
-        &self,
+        &'a self,
         block_states: &'a [ParameterBlockState],
         specs: Option<&'a [ParameterBlockSpec]>,
     ) -> Result<Option<ExpectedWiggleGeometryInputs<'a>>, String> {
