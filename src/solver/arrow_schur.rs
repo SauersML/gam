@@ -9318,7 +9318,7 @@ mod tests {
         (row, rhs)
     }
 
-    fn assert_fixed_row_kernels_match_dynamic<const D: usize>() {
+    fn assert_fixed_row_kernels_match_dynamic<const D: usize>() -> usize {
         let (row, rhs) = fixed_row_kernel_fixture::<D>();
         let ridge = 0.125_f64;
         let fixed = factor_row_block_cholesky_fixed::<D>(&row, ridge).expect("fixed factor");
@@ -9342,13 +9342,15 @@ mod tests {
                 "solve mismatch at D={D} index {i}"
             );
         }
+        D
     }
 
     #[test]
     fn fixed_row_kernels_match_dynamic_path_bitwise() {
-        assert_fixed_row_kernels_match_dynamic::<1>();
-        assert_fixed_row_kernels_match_dynamic::<2>();
-        assert_fixed_row_kernels_match_dynamic::<3>();
-        assert_fixed_row_kernels_match_dynamic::<4>();
+        let checked = assert_fixed_row_kernels_match_dynamic::<1>()
+            + assert_fixed_row_kernels_match_dynamic::<2>()
+            + assert_fixed_row_kernels_match_dynamic::<3>()
+            + assert_fixed_row_kernels_match_dynamic::<4>();
+        assert_eq!(checked, 10);
     }
 }
