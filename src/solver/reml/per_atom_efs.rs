@@ -1000,4 +1000,87 @@ mod tests {
             assert!((result.rho[i] - target[i]).abs() < 1e-5);
         }
     }
+
+    /// Wraps a quadratic objective but reports its `½log|H|` term as a certified
+    /// enclosure with a fixed gap, so the #1011 EFS margin gate can be exercised.
+    struct EnclosureGapObjective {
+        inner: QuadraticObjective,
+        gap: f64,
+    }
+
+    impl OuterObjective for EnclosureGapObjective {
+        fn capability(&self) -> OuterCapability {
+            self.inner.capability()
+        }
+        fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+            self.inner.eval_cost(rho)
+        }
+        fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+            self.inner.eval(rho)
+        }
+        fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+            Ok(self.inner.eval_efs(rho)?.with_logdet_enclosure_gap(Some(self.gap)))
+        }
+        fn reset(&mut self) {
+            self.inner.reset()
+        }
+        fn seed_inner_state(
+            &mut self,
+            beta: &Array1<f64>,
+        ) -> Result<SeedOutcome, EstimationError> {
+            self.inner.seed_inner_state(beta)
+        }
+    }
+
+    /// #1011 EFS margin contract: a step that lands within the step tolerance
+    /// must NOT be allowed to declare convergence while the cost's certified
+    /// logdet enclosure is wider than that tolerance — the bound does not pin
+    /// the cost down at the decision's resolution. The run instead exhausts its
+    /// iteration budget without a premature `converged = true`.
+    #[test]
+    fn efs_refuses_to_converge_below_the_logdet_enclosure_margin() {
+        let dim = 96; // frontier-shaped K so the per-atom path is taken
+        let a = Array2::from_shape_fn(
+            (dim, dim),
+            |(i, j)| if i == j { 1.0 + (i % 5) as f64 } else { 0.0 },
+        );
+        let target = Array1::from_shape_fn(dim, |i| ((i as f64) * 0.37).sin() * 2.0);
+        let mut cfg = wide_bounds(dim);
+        cfg.tolerance = 1e-6;
+        let topology = SharedBorderTopology::disjoint(dim);
+        let seed = Array1::zeros(dim);
+
+        // Gap far wider than the step tolerance ⇒ the margin gate blocks
+        // convergence even though the separable step reaches the target.
+        let mut wide = EnclosureGapObjective {
+            inner: QuadraticObjective {
+                a: a.clone(),
+                target: target.clone(),
+            },
+            gap: 1e-2,
+        };
+        let wide_result =
+            run_per_atom_efs(&mut wide, &seed, &cfg, &topology).expect("wide run");
+        assert!(
+            !wide_result.converged,
+            "an enclosure gap wider than the step tolerance must block convergence"
+        );
+
+        // The same objective with a gap below the tolerance converges exactly
+        // as the exact-logdet path does — the margin contract is transparent
+        // once the bound is tight enough to resolve the decision.
+        let mut tight = EnclosureGapObjective {
+            inner: QuadraticObjective {
+                a,
+                target: target.clone(),
+            },
+            gap: 1e-9,
+        };
+        let tight_result =
+            run_per_atom_efs(&mut tight, &seed, &cfg, &topology).expect("tight run");
+        assert!(
+            tight_result.converged,
+            "an enclosure gap below the step tolerance must not obstruct convergence"
+        );
+    }
 }
