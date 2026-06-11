@@ -24,11 +24,12 @@
 //! Bounds are not weakened to force a pass; a genuine shortfall failing is the
 //! intended behaviour.
 
+use csv::StringRecord;
 use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::inference::model_comparison::{compare, model_comparison_from_unified};
 use gam::types::LinkFunction;
 use gam::{
-    DataSet, FitConfig, FitResult, fit_from_formula, init_parallelism,
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array1;
 
@@ -57,15 +58,14 @@ impl DetNormal {
 }
 
 /// Build a 2-column dataset (predictor `x`, response `y`) from raw vectors.
-fn make_dataset(x: &[f64], y: &[f64]) -> DataSet {
-    use ndarray::Array2;
-    let n = x.len();
-    let mut values = Array2::<f64>::zeros((n, 2));
-    for i in 0..n {
-        values[[i, 0]] = x[i];
-        values[[i, 1]] = y[i];
-    }
-    DataSet::from_parts(vec!["x".to_string(), "y".to_string()], values)
+fn make_dataset(x: &[f64], y: &[f64]) -> gam::data::EncodedDataset {
+    let headers = ["x", "y"].into_iter().map(String::from).collect();
+    let rows: Vec<StringRecord> = x
+        .iter()
+        .zip(y.iter())
+        .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
+        .collect();
+    encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn psis_loo_paired_comparison_prefers_the_true_generator() {
         _ => panic!("expected standard fit"),
     };
 
-    let cmp_of = |fit: &gam::StandardGamModel| {
+    let cmp_of = |fit: &gam::StandardFitResult| {
         let alo = compute_alo_diagnostics_from_fit(
             &fit.fit,
             ds.values.column(1),
