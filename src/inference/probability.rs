@@ -428,6 +428,77 @@ pub fn gamma_moment_matched_interval(
     }
 }
 
+/// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)` — the CDF of a
+/// unit-scale `Gamma(shape = a)` variate — accurate down to the smallest
+/// representable `x`.
+///
+/// This is the exact function [`inverse_regularized_lower_gamma`] inverts, so we
+/// own it rather than borrowing `statrs::gamma_lr`. That routine hard-clamps to
+/// `0.0` for every `x ≤ 1.11e-15` (its `almost_eq(x, 0)` guard, with accuracy
+/// `DEFAULT_F64_ACC`), which silently zeroes the residual `P(a, x) − p` in the
+/// small-shape lower tail: the Halley iterate is then driven *up* — away from a
+/// good sub-`1e-15` seed — until `x` crosses that clamp around `~1.6e-15`, where
+/// the returned point carries far more mass than `p` (#1018). The Numerical
+/// Recipes split — a power series for `x < a + 1`, the modified-Lentz continued
+/// fraction for the complement `Q = 1 − P` otherwise — keeps the leading
+/// `exp(a·ln x − x − ln Γ(a))` factor in logs, so the value stays finite and
+/// nonzero for arguments far below that clamp, and always evaluates the *smaller*
+/// tail directly (no catastrophic cancellation near either edge).
+fn regularized_lower_gamma(a: f64, x: f64) -> f64 {
+    use statrs::function::gamma::ln_gamma;
+    // Callers (`inverse_regularized_lower_gamma`) validate `a > 0` upstream; a
+    // non-positive `a` would only mis-feed `ln_gamma`, never UB.
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let gln = ln_gamma(a);
+    if x < a + 1.0 {
+        // Power series: P(a,x) = exp(a·ln x − x − ln Γ(a)) · Σ_{n≥0} xⁿ / Π_{k=0}^{n}(a+k).
+        // The running term `del` is the ratio form, so no factorial overflows.
+        let mut ap = a;
+        let mut del = 1.0 / a;
+        let mut sum = del;
+        for _ in 0..1000 {
+            ap += 1.0;
+            del *= x / ap;
+            sum += del;
+            if del.abs() <= sum.abs() * f64::EPSILON {
+                break;
+            }
+        }
+        (sum.ln() + a * x.ln() - x - gln).exp()
+    } else {
+        // Modified-Lentz continued fraction for Q(a,x) = 1 − P(a,x); P = 1 − Q.
+        // Evaluating the *upper* tail here keeps the directly-computed quantity
+        // small wherever P is near 1, so `1 − Q` loses no significant digits.
+        const FPMIN: f64 = 1e-300;
+        let mut b = x + 1.0 - a;
+        let mut c = 1.0 / FPMIN;
+        let mut d = 1.0 / b;
+        let mut h = d;
+        for i in 1..1000 {
+            let an = -(i as f64) * (i as f64 - a);
+            b += 2.0;
+            d = an * d + b;
+            if d.abs() < FPMIN {
+                d = FPMIN;
+            }
+            c = b + an / c;
+            if c.abs() < FPMIN {
+                c = FPMIN;
+            }
+            d = 1.0 / d;
+            let del = d * c;
+            h *= del;
+            if (del - 1.0).abs() <= f64::EPSILON {
+                break;
+            }
+        }
+        let q = (a * x.ln() - x - gln + h.ln()).exp();
+        1.0 - q
+    }
+}
+
 /// Inverse of the regularized lower incomplete gamma function: the `x ≥ 0` with
 /// `P(a, x) = p`, where `P(a, x) = γ(a, x) / Γ(a)` is the CDF of a unit-scale
 /// `Gamma(shape = a)` variate, `a > 0`, `p ∈ (0, 1)`.
@@ -435,13 +506,14 @@ pub fn gamma_moment_matched_interval(
 /// Uses the standard rational/Wilson–Hilferty initial estimate (a series form
 /// for `a ≤ 1`) refined by Halley's method on `P(a, x) − p` — third order, a
 /// Newton step scaled by the local curvature of `P`. The ratio `P(a, x)` is the
-/// well-tested `statrs` `gamma_lr`; the density
+/// crate's own [`regularized_lower_gamma`] (NOT `statrs::gamma_lr`, which clamps
+/// the residual to `−p` for tiny `x`; see that fn's note); the density
 /// `f(x) = x^{a−1} e^{−x} / Γ(a)` is evaluated through the same overflow-safe
 /// log factorization Numerical Recipes uses (`invgammp`), so the iteration stays
 /// finite across a wide range of `a`. A positivity step-halving guard keeps the
 /// iterate inside the support.
 fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
-    use statrs::function::gamma::{gamma_lr, ln_gamma};
+    use statrs::function::gamma::ln_gamma;
 
     if !(a.is_finite() && a > 0.0) {
         return f64::NAN;
@@ -493,7 +565,7 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
         if x <= 0.0 {
             return 0.0;
         }
-        let err = gamma_lr(a, x) - p;
+        let err = regularized_lower_gamma(a, x) - p;
         let dens = if a > 1.0 {
             afac * (-(x - a1) + a1 * (x.ln() - lna1)).exp()
         } else {
