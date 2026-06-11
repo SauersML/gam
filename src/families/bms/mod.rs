@@ -416,13 +416,20 @@ impl LatentMeasureKind {
         )
     }
 
+    /// Per-row empirical latent grid, borrowed where possible. This sits in
+    /// the innermost per-row loops of every criterion/gradient/Hessian
+    /// evaluation, so the global grid MUST come back as a borrow — the old
+    /// `grid.clone()` here allocated two `grid_size`-length vectors per row
+    /// per evaluation across the whole fit. Only the local-mixture path,
+    /// which genuinely synthesizes a new grid per row, returns an owned
+    /// value.
     fn empirical_grid_for_training_row(
         &self,
         row: usize,
-    ) -> Result<Option<EmpiricalZGrid>, String> {
+    ) -> Result<Option<std::borrow::Cow<'_, EmpiricalZGrid>>, String> {
         match self {
             Self::StandardNormal => Ok(None),
-            Self::GlobalEmpirical { grid } => Ok(Some(grid.clone())),
+            Self::GlobalEmpirical { grid } => Ok(Some(std::borrow::Cow::Borrowed(grid))),
             Self::LocalEmpirical {
                 grids,
                 train_row_mixtures,
@@ -433,7 +440,9 @@ impl LatentMeasureKind {
                         "local empirical latent measure is missing training mixture for row {row}"
                     )
                 })?;
-                Ok(Some(combine_empirical_grids(grids, mixture)?))
+                Ok(Some(std::borrow::Cow::Owned(combine_empirical_grids(
+                    grids, mixture,
+                )?)))
             }
         }
     }
