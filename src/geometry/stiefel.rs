@@ -205,17 +205,6 @@ impl RiemannianManifold for StiefelManifold {
         Ok(g)
     }
 
-    fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>> {
-        check_len("Stiefel Christoffel point", point.len(), self.ambient_dim())?;
-        // The Stiefel manifold under the canonical metric is curved (its
-        // geodesics Y(t)=Y·exp(tA) have ambient acceleration YA²≠0), so a
-        // zero ambient Christoffel tensor would assert a false flat geometry.
-        // No flat global chart exists; refuse rather than mislead callers.
-        Err(GeometryError::Unsupported(
-            "Christoffel symbols of the embedded Stiefel manifold require a local chart",
-        ))
-    }
-
     fn sectional_curvature(
         &self,
         point: ArrayView1<'_, f64>,

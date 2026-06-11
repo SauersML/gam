@@ -268,22 +268,6 @@ impl RiemannianManifold for GrassmannManifold {
         Ok(identity(self.ambient_dim()))
     }
 
-    fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>> {
-        check_len(
-            "Grassmann Christoffel point",
-            point.len(),
-            self.ambient_dim(),
-        )?;
-        // Gr(k,n) is a curved symmetric space — its sectional_curvature below is
-        // nonzero for k ≥ 2 (and +1 for k = 1), which is incompatible with a
-        // globally-zero ambient Christoffel tensor. There is no flat global
-        // chart, so we refuse rather than return false (zero) symbols that would
-        // make downstream code treat the manifold as flat.
-        Err(GeometryError::Unsupported(
-            "Christoffel symbols of the embedded Grassmannian require a local chart",
-        ))
-    }
-
     fn sectional_curvature(
         &self,
         point: ArrayView1<'_, f64>,
