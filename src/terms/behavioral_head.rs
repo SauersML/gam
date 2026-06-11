@@ -302,7 +302,7 @@ impl BehavioralHead {
                     }
                 }
             }
-            AuxOutcomeFamily::Multinomial { n_classes } => {
+            AuxOutcomeFamily::Multinomial { .. } => {
                 for row in 0..n {
                     let w = self.w_row[row];
                     if w == 0.0 {
@@ -337,7 +337,6 @@ impl BehavioralHead {
                             grad_t[[row, axis]] += r * coeffs[base + 1 + axis];
                         }
                     }
-                    let _ = n_classes;
                 }
             }
         }
@@ -515,7 +514,7 @@ impl LeakageAbsorber {
     /// dictionary update keeps only the component the label channel does not
     /// already explain.
     pub fn orthogonalize_recon_update(&self, delta_t: ArrayView2<'_, f64>) -> Array2<f64> {
-        let (n, d) = delta_t.dim();
+        let (_, d) = delta_t.dim();
         if self.q.ncols() == 0 || self.q.nrows() != d {
             return delta_t.to_owned();
         }
@@ -524,7 +523,6 @@ impl LeakageAbsorber {
         let proj = proj_coords.dot(&self.q.t()); // (n × d)
         let mut out = delta_t.to_owned();
         out -= &proj;
-        let _ = n;
         out
     }
 
