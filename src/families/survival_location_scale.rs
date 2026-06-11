@@ -13283,6 +13283,105 @@ mod tests {
         }
     }
 
+    /// #921: the `RowKernel<9>` repackaging must reproduce the bespoke joint
+    /// assembly bit-for-bit. We build a non-time-varying, non-wiggle fixture
+    /// (the config the kernel covers), then assert the generic row-kernel engine
+    /// (`build_row_kernel_cache` → `row_kernel_hessian_dense` /
+    /// `row_kernel_log_likelihood`) matches `exact_newton_joint_hessian` and the
+    /// bespoke per-row log-likelihood.
+    #[test]
+    fn survival_ls_row_kernel_matches_bespoke_assembly() {
+        use crate::families::row_kernel::{
+            build_row_kernel_cache, row_kernel_gradient, row_kernel_hessian_dense,
+            row_kernel_log_likelihood, RowSet,
+        };
+
+        let family = survival_exact_newton_test_family();
+        let n = family.n;
+        let beta_t = 0.3_f64;
+        let beta_thr = -0.4_f64;
+        let beta_ls = 0.2_f64;
+        // Time eta is stacked [exit; entry; deriv], each length n.
+        let mut eta_time = Array1::<f64>::zeros(3 * n);
+        for i in 0..n {
+            eta_time[i] = family.x_time_exit[[i, 0]] * beta_t;
+            eta_time[n + i] = family.x_time_entry[[i, 0]] * beta_t;
+            eta_time[2 * n + i] = family.x_time_deriv[[i, 0]] * beta_t;
+        }
+        let eta_thr =
+            Array1::from_iter((0..n).map(|i| family.x_threshold.dot_row(i, &array![beta_thr])));
+        let eta_ls =
+            Array1::from_iter((0..n).map(|i| family.x_log_sigma.dot_row(i, &array![beta_ls])));
+        let states = vec![
+            ParameterBlockState {
+                beta: array![beta_t],
+                eta: eta_time,
+            },
+            ParameterBlockState {
+                beta: array![beta_thr],
+                eta: eta_thr,
+            },
+            ParameterBlockState {
+                beta: array![beta_ls],
+                eta: eta_ls,
+            },
+        ];
+
+        let q = family
+            .collect_joint_quantities(&states)
+            .expect("collect joint quantities");
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("dynamic geometry");
+        let kernel = SurvivalLsRowKernel {
+            family: &family,
+            q: &q,
+            dynamic: &dynamic,
+            offsets: family.joint_block_offsets(),
+        };
+
+        let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("row kernel cache");
+        let h_new = row_kernel_hessian_dense(&kernel, &cache, &RowSet::All);
+        let h_old = family
+            .exact_newton_joint_hessian(&states)
+            .expect("bespoke joint hessian")
+            .expect("joint hessian present");
+        assert_eq!(h_new.dim(), h_old.dim(), "joint hessian shape");
+        for ((a, b), &old) in h_old.indexed_iter() {
+            let new = h_new[[a, b]];
+            assert!(
+                (new - old).abs() <= 1e-9 * (1.0 + old.abs()),
+                "joint Hessian [{a}][{b}] mismatch: new={new}, old={old}"
+            );
+        }
+
+        // Log-likelihood: the generic engine returns ℓ = -Σ nll_i; the bespoke
+        // per-row log-likelihood sums `exact_row_kernel(row).log_likelihood()`.
+        let ll_new = row_kernel_log_likelihood(&cache, &RowSet::All);
+        let mut ll_old = 0.0;
+        for i in 0..n {
+            let state = family.row_predictor_state(
+                dynamic.h_entry[i],
+                dynamic.h_exit[i],
+                dynamic.hdot_exit[i],
+                dynamic.q_entry[i],
+                dynamic.q_exit[i],
+                dynamic.qdot_exit[i],
+            );
+            if let Some(k) = family.exact_row_kernel(i, state).expect("row kernel") {
+                ll_old += k.log_likelihood();
+            }
+        }
+        assert!(
+            (ll_new - ll_old).abs() <= 1e-9 * (1.0 + ll_old.abs()),
+            "log-likelihood mismatch: new={ll_new}, old={ll_old}"
+        );
+
+        // Gradient assembles at the right coefficient dimension.
+        let g_new = row_kernel_gradient(&kernel, &cache, &RowSet::All);
+        assert_eq!(g_new.len(), *kernel.offsets.last().unwrap());
+    }
+
     #[test]
     fn survival_location_scale_coefficient_cost_delegates_to_joint_coupled_helper() {
         // SurvivalLocationScale couples time, threshold, log-σ, and optional
