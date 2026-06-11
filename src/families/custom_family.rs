@@ -14829,6 +14829,35 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut residual_descent_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(RESIDUAL_DESCENT_WINDOW);
         let mut tr_clamped_during_stall: bool = false;
+        // Fully-rejected stall guard. The residual-stall guard below
+        // (post-grad-reload) only fires on cycles that produced an accepted
+        // step, because every termination check it gates lives after the
+        // `if !accepted { continue; }` exit at the bottom of the trust-region
+        // attempt loop. When every cycle in a row is fully rejected — all
+        // JOINT_TRUST_MAX_ATTEMPTS trial steps fail the line-search check —
+        // none of those guards ever see the iterate, the cycle loop spins
+        // up to `inner_loop_hard_ceiling` cycles, and the inner solver burns
+        // ~120 s of wall-clock per outer ρ-evaluation that the outer
+        // optimizer will reject anyway. The signature is exact and local:
+        // (i) every trust attempt this cycle was rejected on the actual
+        // objective check (`objective_rejects == JOINT_TRUST_MAX_ATTEMPTS`,
+        // `model_rejects == 0`, `likelihood_rejects == 0`), AND (ii) the joint
+        // trust radius has NOT shrunk relative to the previous fully-rejected
+        // cycle. Condition (ii) is what proves no progress is possible: β is
+        // reverted to its pre-cycle value on every fully-rejected cycle, so
+        // with an identical Newton system AND an identical trust radius the
+        // next cycle's trust-region search is byte-deterministically the
+        // same as this one's. The radius can stall above the 1e-12 floor
+        // when `shrink_active_joint_block_trust_radii` only shrinks blocks
+        // that hit their per-block boundary — an interior block keeps its
+        // radius forever, so `max(block_radii)` is held by that block while
+        // the boundary block's radius collapses to 1e-12 without changing
+        // the max. After `FULLY_REJECTED_STALL_MAX_CYCLES` consecutive cycles
+        // with both conditions, exit non-converged so the outer optimizer
+        // rejects this ρ cleanly instead of waiting for the cycle cap.
+        const FULLY_REJECTED_STALL_MAX_CYCLES: usize = 8;
+        let mut prev_rejected_trust_radius: Option<f64> = None;
+        let mut consecutive_held_rejected_cycles: usize = 0;
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
         // Cross-cycle cache of the joint Jeffreys/Firth triple `(β_key, ∇Φ, H_Φ)`
         // (gam#729/#826/#808). Computing `(∇Φ, H_Φ)` costs `p` family
@@ -16408,7 +16437,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let line_search_elapsed = line_search_started.elapsed();
             if accepted && converged {
                 log::info!(
-                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
+                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
                     cycle,
                     hessian_and_qp_elapsed.as_secs_f64(),
                     line_search_elapsed.as_secs_f64(),
@@ -16466,6 +16495,72 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     converged = true;
                     break;
                 }
+                // Fully-rejected stall guard. See the constant declaration
+                // at the top of this function for the full rationale. The
+                // condition is: every trust attempt this cycle failed the
+                // *actual-objective* line search (model_rejects ==
+                // likelihood_rejects == 0, objective_rejects ==
+                // JOINT_TRUST_MAX_ATTEMPTS) AND the joint trust radius did
+                // not shrink relative to the previous fully-rejected cycle.
+                // Both together prove the next cycle's Newton system,
+                // trust radius, and trust-region search are bytewise
+                // identical to this cycle's — there is no descent direction
+                // the local quadratic model can reconcile at this β. After
+                // FULLY_REJECTED_STALL_MAX_CYCLES such cycles, exit
+                // non-converged so the outer optimizer rejects this ρ.
+                let all_attempts_objective_rejected =
+                    objective_rejects == JOINT_TRUST_MAX_ATTEMPTS
+                        && model_rejects == 0
+                        && likelihood_rejects == 0;
+                let radius_held_since_last_reject = match prev_rejected_trust_radius {
+                    Some(prev) => {
+                        joint_trust_radius.is_finite()
+                            && prev.is_finite()
+                            && joint_trust_radius >= prev * (1.0 - 1e-12)
+                    }
+                    None => false,
+                };
+                if all_attempts_objective_rejected && radius_held_since_last_reject {
+                    consecutive_held_rejected_cycles =
+                        consecutive_held_rejected_cycles.saturating_add(1);
+                } else {
+                    consecutive_held_rejected_cycles = 0;
+                }
+                prev_rejected_trust_radius = Some(joint_trust_radius);
+                if consecutive_held_rejected_cycles >= FULLY_REJECTED_STALL_MAX_CYCLES {
+                    let last_math_summary = last_joint_math
+                        .as_ref()
+                        .map(|math| {
+                            format!(
+                                "last_newton_math={{old_kkt={:.3e}, linearized_next={:.3e}, actual={:+.3e}, pred={:+.3e}, rho={:+.3e}, scalar_relerr={:.3e}, step_inf={:.3e}, proposal_inf={:.3e}}}",
+                                math.old_kkt_inf,
+                                math.linearized_next_kkt_inf,
+                                math.actual_reduction,
+                                math.predicted_reduction,
+                                math.trust_ratio,
+                                math.scalar_model_relative_error(),
+                                math.step_inf,
+                                math.proposal_inf,
+                            )
+                        })
+                        .unwrap_or_else(|| "last_newton_math=<none>".to_string());
+                    log::warn!(
+                        "[PIRLS/joint-Newton convergence] cycle {:>3} | fully-rejected stall \
+                         early-exit: every trust-region attempt rejected on the actual-objective \
+                         check for {} consecutive cycles with joint trust radius held at {:.3e} \
+                         throughout. Reverted β + held trust radius mean the next cycle's Newton \
+                         step is byte-identical to this one's; no descent direction is reachable \
+                         from this iterate under the current local model. {}. Returning \
+                         unconverged with finite β so the outer optimizer rejects this ρ \
+                         evaluation before inner_max_cycles.",
+                        cycle,
+                        consecutive_held_rejected_cycles,
+                        joint_trust_radius,
+                        last_math_summary,
+                    );
+                    converged = false;
+                    break;
+                }
                 // CONTINUE rather than break (gam#826/#872/#715). The comment
                 // above documents the intent — "retry the joint Newton loop from
                 // the same state after a failed trust-region search" — but the old
@@ -16507,6 +16602,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 accepted_joint_workspace.take(),
             )?;
             let grad_reload_elapsed = grad_reload_started.elapsed();
+            // Reset the fully-rejected stall guard's bookkeeping: an accepted
+            // cycle moved β and may have grown the trust radius, so the next
+            // rejected-cycle comparison must start fresh rather than carry
+            // forward a stale radius snapshot from the previous reject streak.
+            prev_rejected_trust_radius = None;
+            consecutive_held_rejected_cycles = 0;
             // Accepted-cycle timing breakdown is debug-only. The per-cycle
             // info line below already includes total cycle time; emitting a
             // four-phase split on every verbose cycle adds a redundant info
