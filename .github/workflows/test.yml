@@ -62,6 +62,14 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # Hard ceiling well under GitHub's 6-hour default. A single hung test
+    # (the scheduled bug-hunt agent commits regression tests that deliberately
+    # drive the solver into degenerate, sometimes non-terminating states) used
+    # to let this job run until the 6h job timeout, at which point GitHub kills
+    # it with no useful signal about which test was stuck. The per-binary
+    # wall-clock cap in "Run tests" below fails the offending binary fast and
+    # names it; this job timeout is the backstop if caps are ever bypassed.
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -152,15 +160,64 @@ jobs:
           # debug sections in every integration-test binary. Dropping dev
           # debuginfo removes the largest non-executable payload from the link
           # and keeps the serialized link job practical on standard runners.
+          #
+          # Per-binary wall-clock caps. Each tests/*.rs links and runs its own
+          # binary in isolation below, so a single test that hangs (or runs
+          # pathologically long) otherwise consumes the whole job budget until
+          # the 6h ceiling. Cap each invocation: on overrun we SIGKILL the
+          # entire process group — cargo PLUS the test exe it spawned, since
+          # killing only cargo would orphan the runaway test and leak a CPU hog
+          # into the next iterations — record the binary as failed, and name it
+          # in the log so the culprit is obvious. These are the finest-grained
+          # caps available on stable: libtest exposes no per-test kill, and the
+          # 652 integration binaries are mostly one-test files, so per-binary is
+          # effectively per-test here. The lib/bins/examples phase bundles many
+          # unit tests into one process and gets a correspondingly larger cap.
+          INTEGRATION_TEST_TIMEOUT=300   # seconds, per tests/*.rs binary
+          LIB_TEST_TIMEOUT=1800          # seconds, lib+bins+examples phase
+
+          # Run a command under a wall-clock cap in its own session so the whole
+          # process tree can be killed on overrun. Output is buffered to a temp
+          # file and appended to /tmp/cargo-test.log when the command finishes
+          # or is killed, preserving the forbidden-pattern grep below. Returns
+          # 124 on timeout (mirrors GNU `timeout`), else the command's status.
+          run_capped() {
+            local cap="$1"; shift
+            local tmp
+            tmp="$(mktemp)"
+            setsid "$@" >"$tmp" 2>&1 &
+            local sid=$!
+            local waited=0
+            while kill -0 "$sid" 2>/dev/null; do
+              if [ "$waited" -ge "$cap" ]; then
+                # $sid is the session/group leader (setsid); kill the group.
+                kill -KILL -"$sid" 2>/dev/null || kill -KILL "$sid" 2>/dev/null
+                wait "$sid" 2>/dev/null || true
+                echo "::error::Test command exceeded ${cap}s wall-clock cap and was killed: $*"
+                tee -a /tmp/cargo-test.log < "$tmp"
+                rm -f "$tmp"
+                return 124
+              fi
+              sleep 1
+              waited=$((waited + 1))
+            done
+            wait "$sid"
+            local status=$?
+            tee -a /tmp/cargo-test.log < "$tmp"
+            rm -f "$tmp"
+            return "$status"
+          }
+
           run_cargo_test() {
-            cargo test --config profile.dev.debug=0 --all-features --jobs 1 "$@" 2>&1 | tee -a /tmp/cargo-test.log
-            return "${PIPESTATUS[0]}"
+            local cap="$1"; shift
+            run_capped "$cap" \
+              cargo test --config profile.dev.debug=0 --all-features --jobs 1 "$@"
           }
 
           test_status=0
           : > /tmp/cargo-test.log
 
-          if ! run_cargo_test --lib --bins --examples; then
+          if ! run_cargo_test "$LIB_TEST_TIMEOUT" --lib --bins --examples; then
             test_status=1
           fi
 
