@@ -5339,7 +5339,7 @@ fn try_device_arrow_direct(
         Err(crate::gpu::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired { row, bump }) => {
             Some(Err(ArrowSchurError::PerRowFactorFailed {
                 row,
-                detail: format!("device per-row block non-PD; suggested ridge bump {bump:e}"),
+                reason: format!("device per-row block non-PD; suggested ridge bump {bump:e}"),
             }))
         }
         // Unavailable (transient / below device policy) and

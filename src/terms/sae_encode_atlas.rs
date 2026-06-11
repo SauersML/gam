@@ -589,13 +589,26 @@ impl JetSups {
     }
 }
 
-/// Evaluate one atom's encode objective gradient `F(t) = ∇f_k(t)` and Hessian
-/// `F'(t) = H_tt` at a single coordinate `t`, for a single target row `x` and
-/// fixed amplitude `z`. This mirrors the fixed-decoder arrow-Schur assembly
-/// (`assemble_arrow_schur`) per row: `g_t = J_mᵀ r`, `H_tt = J_mᵀ J_m`, with
-/// `m = z·BᵀΦ(t)`, `r = m − x`, `J_m = z·Bᵀ J_Φ`. The Gauss-Newton Hessian is
-/// used (PSD, exactly as the production encode solver does), plus an optional
-/// ridge floor.
+/// Evaluate one atom's encode objective gradient `F(t) = ∇f_k(t)` and the FULL
+/// Hessian `F'(t) = ∇²f_k(t)` at a single coordinate `t`, for a single target
+/// row `x` and fixed amplitude `z`. With `m(t) = z·BᵀΦ(t)`, `r = m − x`,
+/// `J_m = z·Bᵀ J_Φ`:
+///
+/// ```text
+/// g_t[a]   = J_m[a] · r                                  (= ∇f)
+/// H_tt[a,b] = J_m[a] · J_m[b] + r · ∂²m/∂t_a∂t_b         (= ∇²f, FULL Hessian)
+/// ```
+///
+/// The certificate uses the FULL Hessian rather than the Gauss-Newton block
+/// `J_mᵀ J_m`. This is the principled choice for Newton–Kantorovich: the
+/// theorem certifies convergence of Newton on `F = ∇f` to the unique nearby
+/// ROOT of `∇f`, but a root of `∇f` can be a maximum. The full Hessian is
+/// positive-definite exactly on the genuine-minimum basin, so requiring
+/// `λ_min(H) > 0` (finite `β`) is what flags a start that would otherwise let
+/// Gauss-Newton march into the wrong root (e.g. the circle antipode, a local
+/// max where `∇f = 0` but the full curvature is negative). The residual term
+/// needs the basis second jet `∂²Φ/∂t²`; an evaluator without one returns
+/// `None`, and the row is flagged (no silent Gauss-Newton fallback).
 fn encode_grad_hess(
     atom: &SaeManifoldAtom,
     evaluator: &dyn SaeBasisEvaluator,
@@ -603,7 +616,7 @@ fn encode_grad_hess(
     x: ArrayView1<'_, f64>,
     amplitude: f64,
     ridge: f64,
-) -> Result<(Array1<f64>, Array2<f64>), String> {
+) -> Result<Option<(Array1<f64>, Array2<f64>)>, String> {
     let d = atom.latent_dim;
     let p = atom.output_dim();
     let m = atom.basis_size();
@@ -641,20 +654,43 @@ fn encode_grad_hess(
             }
         }
     }
-    // g_t[axis] = J_m[axis] · r ;  H_tt[a,b] = J_m[a] · J_m[b].
+    // The full-Hessian residual term needs ∂²Φ/∂t². No second jet ⇒ no
+    // certificate (flag), never a silent Gauss-Newton substitute.
+    let second = match evaluator.second_jet_dyn(coords.view()) {
+        Some(result) => result?,
+        None => return Ok(None),
+    };
+    // g_t[axis] = J_m[axis] · r ;  H_tt[a,b] = J_m[a]·J_m[b] + r·∂²m/∂t_a∂t_b.
     let mut g = Array1::<f64>::zeros(d);
     let mut h = Array2::<f64>::zeros((d, d));
     for a in 0..d {
         let ja = jm.row(a);
         g[a] = ja.dot(&residual);
         for b in 0..d {
-            h[[a, b]] = ja.dot(&jm.row(b));
+            // Gauss-Newton block.
+            let mut hab = ja.dot(&jm.row(b));
+            // Residual · second-jet curvature: r · ∂²m_{ab},
+            // ∂²m_{ab}[out] = z · Σ_basis (∂²Φ/∂t_a∂t_b) · B[basis, out].
+            let mut curv = 0.0;
+            for basis_col in 0..m {
+                let d2phi = second[[0, basis_col, a, b]];
+                if d2phi == 0.0 {
+                    continue;
+                }
+                let mut dot = 0.0;
+                for out in 0..p {
+                    dot += residual[out] * decoder[[basis_col, out]];
+                }
+                curv += amplitude * d2phi * dot;
+            }
+            hab += curv;
+            h[[a, b]] = hab;
         }
     }
     for a in 0..d {
         h[[a, a]] += ridge;
     }
-    Ok((g, h))
+    Ok(Some((g, h)))
 }
 
 /// Operator-norm of `H⁻¹` (i.e. `β = 1/λ_min(H)`) and the Newton step
@@ -703,7 +739,21 @@ pub fn row_certificate(
     lipschitz: f64,
     ridge: f64,
 ) -> Result<(RowCertificate, Array1<f64>), String> {
-    let (g, h) = encode_grad_hess(atom, evaluator, t0, x, amplitude, ridge)?;
+    let uncertified = || {
+        (
+            RowCertificate {
+                beta: f64::INFINITY,
+                eta: f64::INFINITY,
+                lipschitz,
+                h: f64::INFINITY,
+            },
+            Array1::<f64>::zeros(atom.latent_dim),
+        )
+    };
+    // No second jet ⇒ no full Hessian ⇒ uncertifiable (flag).
+    let Some((g, h)) = encode_grad_hess(atom, evaluator, t0, x, amplitude, ridge)? else {
+        return Ok(uncertified());
+    };
     match beta_eta_newton(h.view(), g.view())? {
         Some((beta, eta, delta)) => {
             let cert = RowCertificate {
@@ -714,15 +764,9 @@ pub fn row_certificate(
             };
             Ok((cert, delta))
         }
-        None => Ok((
-            RowCertificate {
-                beta: f64::INFINITY,
-                eta: f64::INFINITY,
-                lipschitz,
-                h: f64::INFINITY,
-            },
-            Array1::<f64>::zeros(atom.latent_dim),
-        )),
+        // Indefinite / negative-curvature full Hessian: the start is at or past
+        // a basin boundary (a max/saddle of f), not the minimum basin — flag.
+        None => Ok(uncertified()),
     }
 }
 

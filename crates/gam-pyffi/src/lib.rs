@@ -9065,6 +9065,56 @@ fn build_sae_basis_evaluators(
     Ok(out)
 }
 
+/// Build the per-row output-Fisher `RowMetric` from a flattened factor stack and
+/// the harvest shard's provenance tag (#980).
+///
+/// `"output_fisher"` (the default, and the only tag a same-position shard or a
+/// raw factor array carries) installs the same-position
+/// [`RowMetric::output_fisher`](gam::inference::row_metric::RowMetric::output_fisher);
+/// `"output_fisher_downstream"` (the KV-path aggregate over future positions)
+/// installs
+/// [`RowMetric::output_fisher_downstream`](gam::inference::row_metric::RowMetric::output_fisher_downstream).
+/// Both are gauge-only and consumed identically by the lens/gauge/enrichment;
+/// only the tag (and the science it certifies) differs. An unknown tag errors —
+/// a silent fall-through to the same-position metric would mislabel the
+/// certificate.
+fn row_metric_from_fisher_provenance(
+    u_flat: Array2<f64>,
+    p_out: usize,
+    rank: usize,
+    provenance: Option<&str>,
+) -> PyResult<gam::inference::row_metric::RowMetric> {
+    let u = std::sync::Arc::new(u_flat);
+    match provenance.unwrap_or("output_fisher") {
+        "output_fisher" => {
+            gam::inference::row_metric::RowMetric::output_fisher(u, p_out, rank)
+        }
+        "output_fisher_downstream" => {
+            gam::inference::row_metric::RowMetric::output_fisher_downstream(u, p_out, rank)
+        }
+        other => Err(format!(
+            "fisher_provenance must be 'output_fisher' or 'output_fisher_downstream'; \
+             got {other:?}"
+        )),
+    }
+    .map_err(py_value_error)
+}
+
+/// The Python-facing label for a [`MetricProvenance`], shared across every FFI
+/// site that surfaces `metric_provenance` (#980). Centralized so a new
+/// provenance variant is labelled in exactly one place.
+fn metric_provenance_label(
+    provenance: gam::inference::row_metric::MetricProvenance,
+) -> &'static str {
+    use gam::inference::row_metric::MetricProvenance;
+    match provenance {
+        MetricProvenance::Euclidean => "Euclidean",
+        MetricProvenance::OutputFisher { .. } => "OutputFisher",
+        MetricProvenance::OutputFisherDownstream { .. } => "OutputFisherDownstream",
+        MetricProvenance::WhitenedStructured { .. } => "WhitenedStructured",
+    }
+}
+
 /// Fit a SAE-manifold term end-to-end in Rust: up to `max_iter` Newton steps
 /// per λ_smooth candidate, refreshing `Phi` and `dPhi/dt` between steps via
 /// the per-atom [`SaeBasisEvaluator`] (analytic harmonic for `Periodic`
