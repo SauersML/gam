@@ -3556,9 +3556,8 @@ fn evaluate_non_affine_cell_simd<const COMPUTE_VALUE: bool>(
 ) -> (CellMomentVec, f64) {
     let mut prev: Option<(CellMomentVec, f64)> = None;
     for (nodes, weights) in non_affine_ladder_rules() {
-        let cur = evaluate_non_affine_cell_with_rule::<COMPUTE_VALUE>(
-            cell, max_degree, nodes, weights,
-        );
+        let cur =
+            evaluate_non_affine_cell_with_rule::<COMPUTE_VALUE>(cell, max_degree, nodes, weights);
         if let Some(prev) = prev.as_ref()
             && non_affine_ladder_converged::<COMPUTE_VALUE>(prev, &cur)
         {
