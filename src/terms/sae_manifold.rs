@@ -34,9 +34,10 @@ use std::sync::Arc;
 
 use crate::solver::arrow_schur::{
     ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem,
-    ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, FactoredFrameGBlock,
-    FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp,
-    SparseGBlock, StreamingArrowSchur, solve_arrow_newton_step_with_proximal_correction,
+    ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, DeviceSaePcgData,
+    DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp,
+    IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
+    StreamingArrowSchur, solve_arrow_newton_step_with_proximal_correction,
     solve_streaming_reduced_beta,
 };
 use crate::terms::analytic_penalties::{
@@ -7957,6 +7958,11 @@ impl SaeManifoldTerm {
         // Symmetric for the transpose: `H_βt = J_βᵀ · Lᵀ`, so apply `Lᵀ`
         // first to map the q_i-vector back to p-space, then scatter through
         // the support.
+        let device_rows = if frames_engaged {
+            None
+        } else {
+            Some((kron_a_phi.clone(), kron_jac.clone()))
+        };
         if frames_engaged {
             // #972 / #977 T1 — FACTORED cross block `H_tC = H_tB · Φ`. The full-`B`
             // cross factorises `H_tB = L · J_β` with `J_β = φᵀ ⊗ I_p`; folding the
@@ -8156,6 +8162,8 @@ impl SaeManifoldTerm {
             sys.set_block_offsets(Arc::from(block_ranges.into_boxed_slice()));
             sys.set_penalty_op(Arc::new(CompositePenaltyOp { k: border_dim, ops }));
         } else {
+            let (device_a_phi, device_local_jac) =
+                device_rows.expect("full-beta SAE PCG rows are cloned before row operator install");
             // Wire per-atom β block ranges so the Jacobi preconditioner builds one
             // dense Schur sub-block per atom (block-Jacobi) instead of scalar-diagonal
             // inversion.  Each atom's decoder coefficients form a natural block:
@@ -8189,6 +8197,22 @@ impl SaeManifoldTerm {
                     }
                 })
                 .collect();
+            let device_smooth_blocks = smooth_scaled_s
+                .iter()
+                .enumerate()
+                .map(|(atom_idx, factor_a)| DeviceSaeSmoothBlock {
+                    global_offset: beta_offsets[atom_idx],
+                    factor_a: factor_a.clone(),
+                })
+                .collect();
+            sys.set_device_sae_pcg_data(DeviceSaePcgData {
+                p,
+                beta_dim,
+                a_phi: device_a_phi,
+                local_jac: device_local_jac,
+                smooth_blocks: device_smooth_blocks,
+                sparse_g_blocks: g_sparse_blocks.clone(),
+            });
             let mut ops: Vec<Arc<dyn BetaPenaltyOp>> = smooth_ops;
             ops.push(Arc::new(SparseBlockKroneckerPenaltyOp {
                 p,
@@ -11701,6 +11725,7 @@ impl SaeManifoldTerm {
         }
         let transport = solve_basis_transport(new_phi.view(), old_phi.view())?;
         let old_decoder = self.atoms[atom_idx].decoder_coefficients.clone();
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
         let new_decoder = fast_ab(&transport, &old_decoder);
         let old_fit = fast_ab(&old_phi, &old_decoder);
         let new_fit = fast_ab(&new_phi, &new_decoder);
@@ -11725,7 +11750,8 @@ impl SaeManifoldTerm {
         let base: Arc<dyn SaeBasisEvaluator> = new_evaluator.clone();
         atom.basis_evaluator = Some(base);
         atom.basis_second_jet = Some(new_evaluator);
-        atom.refresh_intrinsic_smooth_penalty();
+        atom.smooth_penalty =
+            transport_smooth_penalty_for_decoder(transport.view(), old_smooth_penalty.view())?;
         Ok(())
     }
 
@@ -11836,28 +11862,34 @@ impl SaeManifoldTerm {
                         }
                     }
                 }
-                SaeAtomBasisKind::Duchon if d == 1 => {
-                    let mut translation = Array2::<f64>::ones((n, 1));
-                    if let Some(g) = self.dense_step_gauge_vector_from_field(
-                        atom_idx,
-                        translation.view(),
-                        &coord_offsets,
-                        &beta_offsets,
-                        total_len,
-                    )? {
-                        out.push(g);
+                SaeAtomBasisKind::Duchon => {
+                    for axis in 0..d {
+                        let mut field = Array2::<f64>::zeros((n, d));
+                        field.column_mut(axis).fill(1.0);
+                        if let Some(g) = self.dense_step_gauge_vector_from_field(
+                            atom_idx,
+                            field.view(),
+                            &coord_offsets,
+                            &beta_offsets,
+                            total_len,
+                        )? {
+                            out.push(g);
+                        }
                     }
-                    for row in 0..n {
-                        translation[[row, 0]] = coords[[row, 0]];
-                    }
-                    if let Some(g) = self.dense_step_gauge_vector_from_field(
-                        atom_idx,
-                        translation.view(),
-                        &coord_offsets,
-                        &beta_offsets,
-                        total_len,
-                    )? {
-                        out.push(g);
+                    for axis in 0..d {
+                        let mut field = Array2::<f64>::zeros((n, d));
+                        for row in 0..n {
+                            field[[row, axis]] = coords[[row, axis]];
+                        }
+                        if let Some(g) = self.dense_step_gauge_vector_from_field(
+                            atom_idx,
+                            field.view(),
+                            &coord_offsets,
+                            &beta_offsets,
+                            total_len,
+                        )? {
+                            out.push(g);
+                        }
                     }
                 }
                 SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => {
@@ -14925,6 +14957,31 @@ fn solve_basis_transport(
     old_phi: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, String> {
     solve_design_least_squares(new_phi, old_phi)
+}
+
+fn transport_smooth_penalty_for_decoder(
+    decoder_transport: ArrayView2<'_, f64>,
+    old_smooth_penalty: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let m = decoder_transport.nrows();
+    if decoder_transport.ncols() != m {
+        return Err(format!(
+            "transport_smooth_penalty_for_decoder: decoder transport must be square; got {:?}",
+            decoder_transport.dim()
+        ));
+    }
+    if old_smooth_penalty.dim() != (m, m) {
+        return Err(format!(
+            "transport_smooth_penalty_for_decoder: smooth penalty shape {:?} != ({m}, {m})",
+            old_smooth_penalty.dim()
+        ));
+    }
+    let transport_inverse =
+        solve_design_least_squares(decoder_transport, Array2::<f64>::eye(m).view())?;
+    Ok(fast_atb(
+        &transport_inverse,
+        &fast_ab(&old_smooth_penalty.to_owned(), &transport_inverse),
+    ))
 }
 
 fn solve_design_least_squares(
@@ -18412,32 +18469,12 @@ mod tests {
                 || report.coord.absolute_error <= absolute_tolerance;
             let decoder_ok = report.decoder.relative_error <= relative_tolerance
                 || report.decoder.absolute_error <= absolute_tolerance;
-            all_blocks_match = all_blocks_match && coord_ok && decoder_ok;
-            let coord_status = if coord_ok { "MATCH" } else { "MISMATCH" };
-            let decoder_status = if decoder_ok { "MATCH" } else { "MISMATCH" };
-            eprintln!(
-                "{label}: base={base:.12e}; coord_gt={coord_status} max_rel={coord_rel:.6e} \
-                 max_abs={coord_abs:.6e} worst_row={coord_idx} analytic={coord_an:.12e} \
-                 fd={coord_fd:.12e}; decoder_gb={decoder_status} max_rel={decoder_rel:.6e} \
-                 max_abs={decoder_abs:.6e} worst_beta={decoder_idx} analytic={decoder_an:.12e} \
-                 fd={decoder_fd:.12e}",
-                label = report.label,
-                base = report.base_loss,
-                coord_rel = report.coord.relative_error,
-                coord_abs = report.coord.absolute_error,
-                coord_idx = report.coord.index,
-                coord_an = report.coord.analytic,
-                coord_fd = report.coord.finite_difference,
-                decoder_rel = report.decoder.relative_error,
-                decoder_abs = report.decoder.absolute_error,
-                decoder_idx = report.decoder.index,
-                decoder_an = report.decoder.analytic,
-                decoder_fd = report.decoder.finite_difference,
-            );
+            let metadata_ok = !report.label.is_empty() && report.base_loss.is_finite();
+            all_blocks_match = all_blocks_match && metadata_ok && coord_ok && decoder_ok;
         }
         assert!(
             all_blocks_match,
-            "SAE assembled gradient does not match central FD of the penalized objective"
+            "SAE assembled gradient does not match central FD of the penalized objective: {reports:#?}"
         );
     }
 
@@ -18487,33 +18524,12 @@ mod tests {
                 || report.coord.absolute_error <= absolute_tolerance;
             let decoder_ok = report.decoder.relative_error <= relative_tolerance
                 || report.decoder.absolute_error <= absolute_tolerance;
-            all_blocks_match = all_blocks_match && coord_ok && decoder_ok;
-            let coord_status = if coord_ok { "MATCH" } else { "MISMATCH" };
-            let decoder_status = if decoder_ok { "MATCH" } else { "MISMATCH" };
-            let line = format!(
-                "{label}: base={base:.12e}; coord_gt={coord_status} max_rel={coord_rel:.6e} \
-                 max_abs={coord_abs:.6e} worst_row={coord_idx} analytic={coord_an:.12e} \
-                 fd={coord_fd:.12e}; decoder_gb={decoder_status} max_rel={decoder_rel:.6e} \
-                 max_abs={decoder_abs:.6e} worst_beta={decoder_idx} analytic={decoder_an:.12e} \
-                 fd={decoder_fd:.12e}",
-                label = report.label,
-                base = report.base_loss,
-                coord_rel = report.coord.relative_error,
-                coord_abs = report.coord.absolute_error,
-                coord_idx = report.coord.index,
-                coord_an = report.coord.analytic,
-                coord_fd = report.coord.finite_difference,
-                decoder_rel = report.decoder.relative_error,
-                decoder_abs = report.decoder.absolute_error,
-                decoder_idx = report.decoder.index,
-                decoder_an = report.decoder.analytic,
-                decoder_fd = report.decoder.finite_difference,
-            );
-            eprintln!("{line}");
+            let metadata_ok = !report.label.is_empty() && report.base_loss.is_finite();
+            all_blocks_match = all_blocks_match && metadata_ok && coord_ok && decoder_ok;
         }
         assert!(
             all_blocks_match,
-            "SAE d=1 assembled gradient does not match central finite difference"
+            "SAE d=1 assembled gradient does not match central finite difference: {reports:#?}"
         );
     }
 
@@ -20908,6 +20924,101 @@ mod tests {
         assert!(
             diff < 1e-9,
             "intrinsic Gram changed under a global speed rescale (gauge leak): {diff}"
+        );
+    }
+
+    fn affine_canonicalization_test_term() -> SaeManifoldTerm {
+        let n = 80usize;
+        let p = 2usize;
+        let evaluator = EuclideanPatchEvaluator::new(1, 2).unwrap();
+        let mut coords = Array2::<f64>::zeros((n, 1));
+        for row in 0..n {
+            coords[[row, 0]] = -4.0 + 12.0 * row as f64 / (n as f64 - 1.0);
+        }
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let mut decoder = Array2::<f64>::zeros((3, p));
+        decoder[[0, 0]] = 0.8;
+        decoder[[1, 0]] = -0.4;
+        decoder[[2, 0]] = 0.15;
+        decoder[[0, 1]] = -0.2;
+        decoder[[1, 1]] = 0.9;
+        decoder[[2, 1]] = -0.08;
+        let smooth_penalty = crate::basis::create_difference_penalty_matrix(3, 2, None).unwrap();
+        let atom = SaeManifoldAtom::new(
+            "affine-canonicalization",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder,
+            smooth_penalty,
+        )
+        .unwrap()
+        .with_basis_second_jet(Arc::new(evaluator));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords],
+            vec![LatentManifold::Euclidean],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        SaeManifoldTerm::new(vec![atom], assignment).unwrap()
+    }
+
+    #[test]
+    fn affine_canonicalization_transports_live_penalty_instead_of_recomputing() {
+        let mut term = affine_canonicalization_test_term();
+        let before = term.decoder_smoothness_quadratic_form();
+        let old_smooth_penalty = term.atoms[0].smooth_penalty.clone();
+        let old_decoder = term.atoms[0].decoder_coefficients.clone();
+
+        term.canonicalize_atom_affine_gauge(0).unwrap();
+        let after = term.decoder_smoothness_quadratic_form();
+        let invariant_gap = (after - before).abs() / before.abs().max(1.0);
+        assert!(
+            invariant_gap < 1.0e-9,
+            "canonicalization changed fixed-rho smoothness energy: before={before:.12e}, after={after:.12e}"
+        );
+
+        let mut recomputed_atom = term.atoms[0].clone();
+        recomputed_atom.refresh_intrinsic_smooth_penalty();
+        let recomputed_term = SaeManifoldTerm::new(
+            vec![recomputed_atom],
+            SaeAssignment::from_blocks_with_mode_and_manifolds(
+                Array2::<f64>::zeros((term.n_obs(), 1)),
+                vec![term.assignment.coords[0].as_matrix()],
+                vec![LatentManifold::Euclidean],
+                AssignmentMode::softmax(1.0),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let recomputed = recomputed_term.decoder_smoothness_quadratic_form();
+        let recompute_jump = (recomputed - before).abs() / before.abs().max(1.0);
+        assert!(
+            recompute_jump > 1.0e-2,
+            "test fixture failed to expose the intrinsic recompute energy jump: before={before:.12e}, recomputed={recomputed:.12e}"
+        );
+
+        let transport =
+            solve_basis_transport(term.atoms[0].basis_values.view(), old_smooth_penalty.view())
+                .expect_err("shape mismatch must reject invalid transport solve");
+        assert!(
+            transport.contains("row mismatch") || transport.contains("SVD failed"),
+            "unexpected transport-shape diagnostic: {transport}"
+        );
+        let roundtrip = transport_smooth_penalty_for_decoder(
+            solve_design_least_squares(
+                term.atoms[0].decoder_coefficients.view(),
+                old_decoder.view(),
+            )
+            .unwrap_or_else(|err| panic!("decoder transport fixture became singular: {err}"))
+            .view(),
+            old_smooth_penalty.view(),
+        );
+        assert!(
+            roundtrip.is_err(),
+            "non-square decoder transport must not be accepted as a penalty congruence"
         );
     }
 
