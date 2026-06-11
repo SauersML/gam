@@ -15987,6 +15987,9 @@ fn latent_coord_direct_hyper_count(
                 }
         }
         LatentIdMode::DimSelection { .. } => latent_dim,
+        // The behavioral head appends one (1 + d) coefficient block per
+        // η-channel, plus the composed per-axis ARD log-precisions.
+        LatentIdMode::AuxOutcome { head, .. } => head.n_coeffs(latent_dim) + latent_dim,
         LatentIdMode::None => 0,
     }
 }
@@ -16014,6 +16017,16 @@ fn latent_coord_initial_direct_hypers(
             append_latent_ard_seed(&mut values, init_log_precision.as_ref(), latent_dim)?;
         }
         LatentIdMode::DimSelection { init_log_precision } => {
+            append_latent_ard_seed(&mut values, init_log_precision.as_ref(), latent_dim)?;
+        }
+        LatentIdMode::AuxOutcome {
+            head,
+            init_log_precision,
+        } => {
+            // Head coefficients seed at zero: intercept 0 ⇒ baseline rate, all
+            // loadings 0 ⇒ no behavioral anchoring at start (REML/Newton move
+            // them). One (1 + d) block per η-channel.
+            values.extend(std::iter::repeat_n(0.0, head.n_coeffs(latent_dim)));
             append_latent_ard_seed(&mut values, init_log_precision.as_ref(), latent_dim)?;
         }
         LatentIdMode::None => {}
@@ -16108,11 +16121,37 @@ fn latent_id_objective_contribution(
                 gradient[direct_start] += 0.5 * mu * q - 0.5 * n_obs as f64;
             }
         }
+        LatentIdMode::AuxOutcome { head, .. } => {
+            // Behavioral head likelihood channel: the head's design columns are
+            // the live latent codes, so its NLL enters the SAME joint objective
+            // as the reconstruction term and REML balances the two channels.
+            // The head coefficients occupy `head.n_coeffs(d)` direct-hyper slots
+            // starting at `cursor`; their gradient drives the β-tier update and
+            // the head's latent-code gradient flows into the `t` block (the
+            // arrow-Schur cross-channel coupling).
+            let n_coeffs = head.n_coeffs(latent_dim);
+            let coeffs = theta.slice(ndarray::s![cursor..cursor + n_coeffs]).to_owned();
+            let (head_nll, grad_coeffs, grad_t) = head
+                .neg_loglik_and_grad(t.view(), coeffs.view())
+                .map_err(EstimationError::InvalidInput)?;
+            cost += head_nll;
+            for (offset, &g) in grad_coeffs.iter().enumerate() {
+                gradient[cursor + offset] += g;
+            }
+            for n in 0..n_obs {
+                for axis in 0..latent_dim {
+                    gradient[t_start + n * latent_dim + axis] += grad_t[[n, axis]];
+                }
+            }
+            cursor += n_coeffs;
+        }
         LatentIdMode::DimSelection { .. } | LatentIdMode::None => {}
     }
 
     match latent.id_mode() {
-        LatentIdMode::AuxPriorDimSelection { .. } | LatentIdMode::DimSelection { .. } => {
+        LatentIdMode::AuxPriorDimSelection { .. }
+        | LatentIdMode::DimSelection { .. }
+        | LatentIdMode::AuxOutcome { .. } => {
             for axis in 0..latent_dim {
                 let log_alpha = theta[cursor + axis];
                 let alpha = log_alpha.exp();

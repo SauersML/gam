@@ -446,10 +446,34 @@ fn hash_latent_id_mode(id_mode: &LatentIdMode, hasher: &mut Fingerprinter) {
             hasher.write_usize(2);
             hash_optional_vector(init_log_precision.as_ref(), hasher);
         }
+        LatentIdMode::AuxOutcome {
+            head,
+            init_log_precision,
+        } => {
+            hasher.write_usize(4);
+            hash_behavioral_head(head, hasher);
+            hash_optional_vector(init_log_precision.as_ref(), hasher);
+        }
         LatentIdMode::None => {
             hasher.write_usize(3);
         }
     }
+}
+
+fn hash_behavioral_head(
+    head: &crate::terms::behavioral_head::BehavioralHead,
+    hasher: &mut Fingerprinter,
+) {
+    use crate::terms::behavioral_head::AuxOutcomeFamily;
+    match head.family() {
+        AuxOutcomeFamily::Binomial => hasher.write_usize(0),
+        AuxOutcomeFamily::Multinomial { n_classes } => {
+            hasher.write_usize(1);
+            hasher.write_usize(n_classes);
+        }
+    }
+    hasher.write_usize(head.n_obs());
+    hasher.write_f64(head.effective_labeled_count());
 }
 
 fn hash_aux_prior_family(family: AuxPriorFamily, hasher: &mut Fingerprinter) {
