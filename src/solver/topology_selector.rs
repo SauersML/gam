@@ -43,6 +43,8 @@ use crate::solver::evidence::{
 use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use ndarray::{Array2, ArrayView2};
 use serde_json::Value as JsonValue;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const TK_LOG_2PI: f64 = 1.8378770664093453_f64;
 
@@ -338,6 +340,208 @@ impl<FitHandle> TopologyAutoSelectorResult<FitHandle> {
     pub fn winner(&self) -> Option<&TopologyAutoRankedFit<FitHandle>> {
         self.ranked.get(self.winner_index)
     }
+}
+
+/// Result for one candidate executed by [`run_topology_race_parallel`].
+#[derive(Debug, Clone)]
+pub struct TopologyRaceParallelCandidate<FitResult> {
+    /// Original position in the input candidate vector.
+    pub candidate_index: usize,
+    /// The number of Rayon workers made available to this candidate's fit body.
+    pub per_fit_threads: usize,
+    /// Wall-clock time spent inside the candidate's local Rayon pool.
+    pub wall_time: Duration,
+    /// The fit closure's output. Use `FitResult = Result<T, E>` when individual
+    /// candidate failures should be collected rather than short-circuiting.
+    pub result: FitResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopologyRaceThreadPlan {
+    coordinator_threads: usize,
+    per_fit_threads: usize,
+    concurrent_fits: usize,
+}
+
+impl TopologyRaceThreadPlan {
+    fn for_budget(candidate_count: usize, max_total_threads: usize) -> Self {
+        let max_total_threads = max_total_threads.max(1);
+        if candidate_count <= 1 {
+            return Self {
+                coordinator_threads: 0,
+                per_fit_threads: max_total_threads,
+                concurrent_fits: candidate_count,
+            };
+        }
+
+        let concurrent_fits = if max_total_threads >= 4 {
+            candidate_count.min(max_total_threads / 2).max(1)
+        } else {
+            1
+        };
+        let coordinator_threads = concurrent_fits;
+        let remaining = max_total_threads.saturating_sub(coordinator_threads);
+        let per_fit_threads = if remaining == 0 {
+            1
+        } else {
+            (remaining / concurrent_fits).max(1)
+        };
+        Self {
+            coordinator_threads,
+            per_fit_threads,
+            concurrent_fits,
+        }
+    }
+}
+
+/// Run independent topology-race candidates concurrently with bounded nested
+/// Rayon use.
+///
+/// Each candidate is executed inside its own local Rayon pool, so fit internals
+/// that call `par_iter`, `rayon::join`, or faer-through-Rayon consume the
+/// candidate's `per_fit_threads` budget rather than the global pool. For
+/// multi-candidate races the runner batches candidates through a Rayon scope and
+/// chooses `concurrent_fits`/`per_fit_threads` so the coordinator workers plus
+/// per-fit workers do not exceed `std::thread::available_parallelism()` on hosts
+/// with at least two cores. Single-core hosts run candidates sequentially.
+///
+/// The return vector is in input order and keeps each closure output intact; use
+/// `FitResult = Result<T, E>` to collect per-candidate failures with wall times.
+pub fn run_topology_race_parallel<Candidate, FitResult, FitOne>(
+    candidates: Vec<Candidate>,
+    fit_one: FitOne,
+) -> Result<Vec<TopologyRaceParallelCandidate<FitResult>>, String>
+where
+    Candidate: Send,
+    FitResult: Send,
+    FitOne: Fn(Candidate) -> FitResult + Sync,
+{
+    let max_total_threads = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    run_topology_race_parallel_with_budget(candidates, fit_one, max_total_threads)
+}
+
+fn run_topology_race_parallel_with_budget<Candidate, FitResult, FitOne>(
+    candidates: Vec<Candidate>,
+    fit_one: FitOne,
+    max_total_threads: usize,
+) -> Result<Vec<TopologyRaceParallelCandidate<FitResult>>, String>
+where
+    Candidate: Send,
+    FitResult: Send,
+    FitOne: Fn(Candidate) -> FitResult + Sync,
+{
+    let candidate_count = candidates.len();
+    if candidate_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let plan = TopologyRaceThreadPlan::for_budget(candidate_count, max_total_threads);
+    let mut candidates: Vec<Option<Candidate>> = candidates.into_iter().map(Some).collect();
+    let slots: Vec<Mutex<Option<TopologyRaceParallelCandidate<FitResult>>>> =
+        (0..candidate_count).map(|_| Mutex::new(None)).collect();
+    let pool_error: Mutex<Option<String>> = Mutex::new(None);
+
+    if plan.concurrent_fits <= 1 {
+        for idx in 0..candidate_count {
+            let candidate = candidates[idx]
+                .take()
+                .expect("topology race candidate must be present");
+            run_one_topology_race_candidate(
+                idx,
+                candidate,
+                &fit_one,
+                plan.per_fit_threads,
+                &slots[idx],
+                &pool_error,
+            );
+            if let Some(err) = pool_error.lock().expect("pool_error mutex poisoned").take() {
+                return Err(err);
+            }
+        }
+    } else {
+        let coordinator_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(plan.coordinator_threads)
+            .thread_name(|idx| format!("topology-race-coordinator-{idx}"))
+            .build()
+            .map_err(|err| format!("topology race coordinator Rayon pool: {err}"))?;
+        let mut batch_start = 0usize;
+        while batch_start < candidate_count {
+            let batch_end = (batch_start + plan.concurrent_fits).min(candidate_count);
+            coordinator_pool.scope(|scope| {
+                for idx in batch_start..batch_end {
+                    let candidate = candidates[idx]
+                        .take()
+                        .expect("topology race candidate must be present");
+                    let slot = &slots[idx];
+                    let pool_error = &pool_error;
+                    let fit_one = &fit_one;
+                    scope.spawn(move |_| {
+                        run_one_topology_race_candidate(
+                            idx,
+                            candidate,
+                            fit_one,
+                            plan.per_fit_threads,
+                            slot,
+                            pool_error,
+                        );
+                    });
+                }
+            });
+            if let Some(err) = pool_error.lock().expect("pool_error mutex poisoned").take() {
+                return Err(err);
+            }
+            batch_start = batch_end;
+        }
+    }
+
+    let mut out = Vec::with_capacity(candidate_count);
+    for (idx, slot) in slots.into_iter().enumerate() {
+        let row = slot
+            .into_inner()
+            .expect("topology race result mutex poisoned")
+            .ok_or_else(|| format!("topology race candidate {idx} did not produce a result"))?;
+        out.push(row);
+    }
+    Ok(out)
+}
+
+fn run_one_topology_race_candidate<Candidate, FitResult, FitOne>(
+    candidate_index: usize,
+    candidate: Candidate,
+    fit_one: &FitOne,
+    per_fit_threads: usize,
+    slot: &Mutex<Option<TopologyRaceParallelCandidate<FitResult>>>,
+    pool_error: &Mutex<Option<String>>,
+) where
+    Candidate: Send,
+    FitResult: Send,
+    FitOne: Fn(Candidate) -> FitResult + Sync,
+{
+    let pool = match rayon::ThreadPoolBuilder::new()
+        .num_threads(per_fit_threads)
+        .thread_name(move |idx| format!("topology-race-fit-{candidate_index}-{idx}"))
+        .build()
+    {
+        Ok(pool) => pool,
+        Err(err) => {
+            *pool_error.lock().expect("pool_error mutex poisoned") =
+                Some(format!("topology race candidate Rayon pool: {err}"));
+            return;
+        }
+    };
+
+    let started = Instant::now();
+    let result = pool.install(|| fit_one(candidate));
+    let wall_time = started.elapsed();
+    *slot.lock().expect("topology race result mutex poisoned") =
+        Some(TopologyRaceParallelCandidate {
+            candidate_index,
+            per_fit_threads,
+            wall_time,
+            result,
+        });
 }
 
 pub fn select_topology_with_fit<FitHandle, FitErr>(
@@ -924,4 +1128,76 @@ pub fn adjudicate_cross_class_race(
         winner_index,
         headline: Headline::Stacking,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    #[derive(Clone)]
+    struct SyntheticRaceCandidate {
+        seed: u64,
+        len: usize,
+    }
+
+    fn synthetic_fit(candidate: SyntheticRaceCandidate) -> Vec<u64> {
+        (0..candidate.len)
+            .into_par_iter()
+            .map(|i| {
+                let x = candidate.seed ^ ((i as u64 + 1) * 0x9e37_79b9_7f4a_7c15);
+                x.rotate_left((i % 31) as u32)
+                    .wrapping_mul(0xbf58_476d_1ce4_e5b9)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn topology_race_parallel_matches_sequential_synthetic_candidates() {
+        let candidates = vec![
+            SyntheticRaceCandidate { seed: 11, len: 64 },
+            SyntheticRaceCandidate { seed: 29, len: 64 },
+            SyntheticRaceCandidate { seed: 47, len: 64 },
+        ];
+        let sequential = candidates
+            .iter()
+            .cloned()
+            .map(synthetic_fit)
+            .collect::<Vec<_>>();
+
+        let parallel =
+            run_topology_race_parallel_with_budget(candidates, synthetic_fit, 8).unwrap();
+        assert_eq!(parallel.len(), 3);
+        assert_eq!(
+            parallel
+                .iter()
+                .map(|row| row.candidate_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(parallel.iter().all(|row| row.per_fit_threads == 1));
+        let wall_times = parallel.iter().map(|row| row.wall_time).collect::<Vec<_>>();
+        assert_eq!(wall_times.len(), 3);
+        assert_eq!(
+            parallel
+                .into_iter()
+                .map(|row| row.result)
+                .collect::<Vec<_>>(),
+            sequential
+        );
+    }
+
+    #[test]
+    fn topology_race_thread_plan_bounds_nested_rayon_threads() {
+        let plan = TopologyRaceThreadPlan::for_budget(3, 8);
+        assert_eq!(plan.concurrent_fits, 3);
+        assert!(
+            plan.coordinator_threads + plan.concurrent_fits * plan.per_fit_threads <= 8,
+            "plan must bound coordinator plus per-fit Rayon workers"
+        );
+
+        let small = TopologyRaceThreadPlan::for_budget(3, 2);
+        assert_eq!(small.concurrent_fits, 1);
+        assert!(small.coordinator_threads + small.per_fit_threads <= 2);
+    }
 }
