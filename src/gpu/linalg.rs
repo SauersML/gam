@@ -97,7 +97,12 @@ pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
         DispatchOp::Gemv { m, k } => {
             op.flops() >= (policy.gemm_min_flops as u128) && m > 0 && k > 0
         }
-        DispatchOp::Potrf { p, batch } => p >= policy.potrf_min_p && batch > 0,
+        DispatchOp::Potrf { p, batch } => {
+            p > 0
+                && batch > 0
+                && (p >= policy.potrf_min_p
+                    || (batch > 1 && op.flops() >= policy.gemm_min_flops as u128))
+        }
         DispatchOp::SmallDenseBatchedPotrf { p, batch } => {
             p > 0
                 && p <= policy.small_dense_batched_potrf_max_p
@@ -106,17 +111,10 @@ pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
         DispatchOp::Trsm { m, n } => {
             op.flops() >= (policy.gemm_min_flops as u128) && m > 0 && n > 0
         }
-        DispatchOp::XtDiagX { n, p } => {
-            n >= policy.xtwx_n_min && op.flops() >= (policy.xtwx_flops_min as u128) && p > 0
-        }
-        DispatchOp::XtDiagY { n, px, q } => {
-            n >= policy.xtwx_n_min
-                && op.flops() >= (policy.xtwx_flops_min as u128)
-                && px > 0
-                && q > 0
-        }
+        DispatchOp::XtDiagX { n, p } => policy.xtwx_target_is_gpu(n, p, true),
+        DispatchOp::XtDiagY { n, px, q } => policy.xtwy_target_is_gpu(n, px, q, true),
         DispatchOp::JointHessian2x2 { n, pa, pb } => {
-            n >= policy.fused_kernel_min_n && (pa + pb) > 0
+            n > 0 && (pa + pb) > 0 && op.flops() >= policy.gemm_min_flops as u128
         }
     };
     if admit { Some(runtime) } else { None }
@@ -399,6 +397,14 @@ pub fn try_fast_atb_on_ordinal(
         // The size/policy gate is identical to `try_fast_atb`; only the target
         // device differs. We still consult `route_through_gpu` so a below-floor
         // shape declines to the caller's CPU path rather than paying PCIe cost.
+        //
+        // Arrow-Schur's `tile_schur_partial` reaches this gate after stacking
+        // its per-row factors into one transpose tile GEMM:
+        // `(total_d x k)^T * (total_d x k)`.
+        // At the SAE shape n=2000, p=2048, M=12, K=8, that is
+        // 2*(n*M)*p^2 = 201_326_592_000 flops for one stacked tile, or
+        // 1_610_612_736_000 flops across K=8 batches, so admission must be
+        // keyed on work rather than the observation row count.
         route_through_gpu(DispatchOp::Gemm { m: p, n: q, k: n_a })?;
         cuda_backend::gemm_on_ordinal(ordinal, a, b, true, false)
     }
@@ -642,7 +648,8 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
     #[cfg(target_os = "linux")]
     {
         let batch = matrices.len();
-        let runtime = route_through_gpu(DispatchOp::Potrf { p, batch })?;
+        let runtime = route_through_gpu(DispatchOp::SmallDenseBatchedPotrf { p, batch })
+            .or_else(|| route_through_gpu(DispatchOp::Potrf { p, batch }))?;
         if should_split_batch(batch) {
             // `matrices` is already the per-item slice, so the batch dimension
             // tiles directly onto `scatter_batched`: each device factors its own
@@ -699,6 +706,58 @@ pub fn try_solve_upper_triangular_matrix(
     {
         let runtime = route_through_gpu(DispatchOp::Trsm { m, n })?;
         cuda_backend::trsm(runtime, upper, rhs, true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DispatchOp, route_through_gpu};
+    use crate::gpu::runtime::GpuRuntime;
+
+    #[test]
+    fn sae_shape_dispatch_ops_route_when_cuda_runtime_is_present() {
+        let Some(runtime) = GpuRuntime::global() else {
+            eprintln!("[sae dispatch gate] no CUDA runtime - skipping branch-admission check");
+            return;
+        };
+
+        let n = 2_000usize;
+        let p = 2_048usize;
+        let m = 12usize;
+        let k = 8usize;
+        let dense_reduction_ops = [
+            DispatchOp::XtDiagX { n, p },
+            DispatchOp::XtDiagY { n, px: p, q: m * k },
+            DispatchOp::JointHessian2x2 {
+                n,
+                pa: p,
+                pb: m * k,
+            },
+            DispatchOp::Gemm {
+                m: p,
+                n: p,
+                k: n * m,
+            },
+        ];
+
+        for op in dense_reduction_ops {
+            assert!(
+                op.flops() >= runtime.policy.gemm_min_flops as u128,
+                "SAE dispatch fixture must clear the runtime GEMM work floor: op={op:?}, flops={}, floor={}",
+                op.flops(),
+                runtime.policy.gemm_min_flops
+            );
+            assert!(
+                route_through_gpu(op).is_some(),
+                "SAE dispatch fixture should route to GPU when CUDA is present: {op:?}"
+            );
+        }
+
+        let batched_potrf = DispatchOp::SmallDenseBatchedPotrf { p: m, batch: n };
+        assert!(
+            route_through_gpu(batched_potrf).is_some(),
+            "uniform SAE row blocks should reach the small-dense batched POTRF gate"
+        );
     }
 }
 

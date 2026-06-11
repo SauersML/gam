@@ -113,13 +113,47 @@ impl GpuDispatchPolicy {
     }
 
     pub const fn xtwx_target_is_gpu(&self, n: usize, p: usize, materialized: bool) -> bool {
+        materialized && n > 0 && p > 0 && self.xtwx_flops(n, p) >= self.dense_reduction_flops_min()
+    }
+
+    pub const fn xtwy_target_is_gpu(
+        &self,
+        n: usize,
+        px: usize,
+        q: usize,
+        materialized: bool,
+    ) -> bool {
         materialized
-            && n >= self.xtwx_n_min
-            && n.saturating_mul(p).saturating_mul(p).saturating_mul(2) >= self.xtwx_flops_min
+            && n > 0
+            && px > 0
+            && q > 0
+            && self.xtwy_flops(n, px, q) >= self.dense_reduction_flops_min()
     }
 
     pub const fn potrf_target_is_gpu(&self, p: usize, h_resident: bool) -> bool {
         h_resident && p >= self.potrf_min_p
+    }
+
+    pub const fn dense_hessian_work_target_is_gpu(&self, n: usize, p: usize) -> bool {
+        n > 0
+            && p >= Self::DEVICE_LOOP_MIN_P
+            && self.xtwx_flops(n, p) >= self.dense_reduction_flops_min()
+    }
+
+    const fn dense_reduction_flops_min(&self) -> u128 {
+        if self.xtwx_flops_min < self.gemm_min_flops {
+            self.xtwx_flops_min as u128
+        } else {
+            self.gemm_min_flops as u128
+        }
+    }
+
+    const fn xtwx_flops(&self, n: usize, p: usize) -> u128 {
+        2u128 * (n as u128) * (p as u128) * (p as u128)
+    }
+
+    const fn xtwy_flops(&self, n: usize, px: usize, q: usize) -> u128 {
+        2u128 * (n as u128) * (px as u128) * (q as u128)
     }
 }
 
@@ -210,9 +244,9 @@ impl GpuDispatchPolicy {
     /// `fit_model_for_fixed_rho_with_adaptive_kkt` through the Stage 3.3
     /// device-resident PIRLS loop instead of the CPU LM loop.
     ///
-    /// The thresholds (`n ≥ row_kernel_min_n`, `p ≥ DEVICE_LOOP_MIN_P`) are
-    /// deliberately well above the matrix-size where a single PIRLS iter's
-    /// `XᵀWX + Cholesky` would be PCIe-bandwidth-bound. Smaller fits stay on
+    /// The threshold is the dense `XᵀWX` work estimate, not row count alone:
+    /// LLM/SAE fits can have only a few thousand rows but thousands of columns,
+    /// so `2*n*p^2` already dwarfs launch/staging overhead. Smaller fits stay on
     /// the CPU LM loop where the full `PirlsResult` surface (firth, EDF,
     /// per-row weights, …) is already populated as a free side-effect of the
     /// iteration.
@@ -220,10 +254,7 @@ impl GpuDispatchPolicy {
         if !adm.gpu_available {
             return false;
         }
-        if adm.n < self.row_kernel_min_n {
-            return false;
-        }
-        if adm.p < Self::DEVICE_LOOP_MIN_P {
+        if !self.dense_hessian_work_target_is_gpu(adm.n, adm.p) {
             return false;
         }
         match adm.family {
@@ -237,10 +268,10 @@ impl GpuDispatchPolicy {
     /// Hessian approx) on-device and only downloads the per-step scalar
     /// metrics (objective value, gradient norm, convergence flag).
     ///
-    /// The thresholds piggyback on the existing inner-PIRLS admission floor
-    /// (`n ≥ row_kernel_min_n`, `p ≥ DEVICE_LOOP_MIN_P`) because the device-resident outer
-    /// loop calls `pirls_loop_on_stream` per step and must not pay the host
-    /// hop for small fits the inner loop would have rejected anyway. The
+    /// The dense-work threshold piggybacks on the existing inner-PIRLS admission
+    /// predicate because the device-resident outer loop calls
+    /// `pirls_loop_on_stream` per step and must not pay the host hop for small
+    /// fits the inner loop would have rejected anyway. The
     /// `num_rho ≥ 2` floor rules out the trivial single-smoother case where
     /// host orchestration is already negligible and the device BFGS state
     /// (one length-`num_rho` gradient + a `num_rho × num_rho` Hessian
@@ -249,10 +280,7 @@ impl GpuDispatchPolicy {
         if !adm.gpu_available {
             return false;
         }
-        if adm.n < self.row_kernel_min_n {
-            return false;
-        }
-        if adm.p < Self::DEVICE_LOOP_MIN_P {
+        if !self.dense_hessian_work_target_is_gpu(adm.n, adm.p) {
             return false;
         }
         if adm.num_rho < 2 {
