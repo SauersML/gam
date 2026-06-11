@@ -1552,7 +1552,7 @@ pub fn isometry_orbit_penalty_operator(
                     let mut dg = 0.0;
                     for i in 0..p {
                         dg += dj[i * d + a] * j_base[[row, i, b]];
-                        dg += j_base[[row, i, a] ] * dj[i * d + b];
+                        dg += j_base[[row, i, a]] * dj[i * d + b];
                     }
                     image[(row * d + a) * d + b] = sqrt_w * dg;
                 }

@@ -26,6 +26,7 @@ torch = pytest.importorskip("torch")
 
 from gamfit.torch.harvest import (  # noqa: E402
     HarvestShard,
+    harvest_downstream_output_fisher_factors,
     harvest_output_fisher_factors,
     load_harvest_shard,
     save_harvest_shard,
@@ -165,3 +166,98 @@ def test_shard_roundtrip_schema(tmp_path) -> None:
         for a in range(p):
             for k in range(rank):
                 assert flat[i, a * rank + k] == loaded["U"][i, a, k]
+
+    # Default provenance is the same-position metric, and it round-trips.
+    assert shard.provenance == "output_fisher"
+    assert loaded["provenance"] == "output_fisher"
+
+
+class _CausalSumHead(torch.nn.Module):
+    """``logits_t = W · (Σ_{s ≤ t} x_s)`` — a prefix-sum over positions then a
+    fixed linear head.
+
+    This is the minimal model with KV-path-like forward influence: the
+    activation at position ``n`` feeds *every* future position ``t ≥ n`` with
+    ``∂logits_t/∂x_n = W`` (and zero for ``t < n``, the causal mask). The
+    same-position pullback at ``n`` sees only ``t = n``; the downstream pullback
+    aggregates all ``t ≥ n``, so the downstream Fisher mass is strictly larger
+    for early positions.
+    """
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        self.feature = torch.nn.Identity()
+        self.head = torch.nn.Linear(weight.shape[1], weight.shape[0], bias=False)
+        with torch.no_grad():
+            self.head.weight.copy_(weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Hook site = the raw per-position activation x_n (feature is identity),
+        # then a causal prefix sum mixes positions, then the linear head. So
+        # ∂logits_t/∂x_n = W for t ≥ n and 0 otherwise.
+        h = self.feature(x)
+        prefix = torch.cumsum(h, dim=0)  # (n_pos, p)
+        return self.head(prefix)
+
+
+def test_downstream_equals_same_position_for_position_local_model(tmp_path) -> None:
+    # A plain linear head has ∂logits_t/∂x_n = 0 for t ≠ n, so the downstream
+    # aggregate over future positions collapses to the same-position pullback.
+    # The two harvests must therefore produce identical factors (up to the
+    # rank-r sign/rotation gauge) — only the provenance tag differs.
+    torch.manual_seed(3)
+    rng = np.random.default_rng(3)
+    C, p, n, rank = 5, 4, 3, 2
+    W = torch.from_numpy(rng.standard_normal((C, p))).to(torch.float64)
+    X = torch.from_numpy(rng.standard_normal((n, p))).to(torch.float64)
+    model = _LinearHead(W).to(torch.float64)
+
+    same = harvest_output_fisher_factors(model, model.feature, X, rank=rank, seed=0)
+    down = harvest_downstream_output_fisher_factors(
+        model, model.feature, X, rank=rank, seed=0
+    )
+
+    assert same.provenance == "output_fisher"
+    assert down.provenance == "output_fisher_downstream"
+    # Compare the rank-r reconstructions U_n U_nᵀ (gauge-invariant).
+    for i in range(n):
+        a = same.U[i].astype(np.float64)
+        b = down.U[i].astype(np.float64)
+        np.testing.assert_allclose(a @ a.T, b @ b.T, rtol=0, atol=1e-4)
+
+    # The downstream provenance round-trips through the shard I/O.
+    out = save_harvest_shard(down, tmp_path / "down")
+    loaded = load_harvest_shard(out)
+    assert loaded["provenance"] == "output_fisher_downstream"
+
+
+def test_downstream_aggregates_future_positions() -> None:
+    # With the causal-sum head, ∂logits_t/∂x_n = W for every t ≥ n, so the
+    # downstream pullback at an early position aggregates more future positions
+    # than the same-position one — strictly more Fisher mass. The very last
+    # position has no future, so the two coincide there.
+    torch.manual_seed(5)
+    rng = np.random.default_rng(5)
+    C, p, n, rank = 5, 4, 4, 3
+    W = torch.from_numpy(rng.standard_normal((C, p))).to(torch.float64)
+    X = torch.from_numpy(rng.standard_normal((n, p))).to(torch.float64)
+    model = _CausalSumHead(W).to(torch.float64)
+
+    same = harvest_output_fisher_factors(
+        model, model.feature, X, rank=rank, trace_probes=p, seed=0
+    )
+    down = harvest_downstream_output_fisher_factors(
+        model, model.feature, X, rank=rank, trace_probes=p, seed=0
+    )
+
+    # Total captured Fisher mass per row = trace(U_n U_nᵀ) + mass_residual.
+    def total_mass(shard, i):
+        u = shard.U[i].astype(np.float64)
+        return float(np.trace(u @ u.T)) + float(shard.mass_residual[i])
+
+    # Early positions: strictly more downstream mass (more future positions).
+    assert total_mass(down, 0) > total_mass(same, 0) + 1e-6
+    # Last position: no future ⇒ downstream coincides with same-position.
+    np.testing.assert_allclose(
+        total_mass(down, n - 1), total_mass(same, n - 1), rtol=0, atol=1e-4
+    )
