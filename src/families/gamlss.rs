@@ -3367,16 +3367,16 @@ fn dispersion_row_kernel(
         DispersionFamilyKind::NegativeBinomial => {
             let mu = em.exp().max(1e-300);
             let theta = ed.exp().max(1e-12); // precision (size)
+            let tpm = theta + mu;
             let tower = dispersion_nb_nll_tower(yi, mu, theta, wi);
-            let mean_info_tower = dispersion_nb_nll_tower(mu, mu, theta, wi);
-            let score_mu = tower_score_info(&tower, 0, wi).0;
             let (s_theta, info_theta_raw) = tower_score_info(&tower, 1, wi);
             let loglik = -tower.v;
             let info_mu = if wi == 0.0 {
                 DISPERSION_MIN_CURVATURE
             } else {
-                (mean_info_tower.h[0][0] / wi).max(DISPERSION_MIN_CURVATURE)
+                (theta / (mu * tpm)).max(DISPERSION_MIN_CURVATURE)
             };
+            let score_mu = theta * (yi - mu) / (mu * tpm);
             let mean_weight = wi * mu * mu * info_mu;
             let mean_response = em + score_mu / (mu * info_mu);
             let info_theta = info_theta_raw;
@@ -3396,15 +3396,14 @@ fn dispersion_row_kernel(
             let nu = ed.exp().max(1e-12); // precision = shape ν
             let y_pos = yi.max(1e-300);
             let tower = dispersion_gamma_nll_tower(yi, y_pos, mu, nu, wi);
-            let mean_info_tower = dispersion_gamma_nll_tower(mu, mu, mu, nu, wi);
-            let score_mu = tower_score_info(&tower, 0, wi).0;
             let (s_nu, info_nu_raw) = tower_score_info(&tower, 1, wi);
             let loglik = -tower.v;
             let info_mu = if wi == 0.0 {
                 DISPERSION_MIN_CURVATURE
             } else {
-                (mean_info_tower.h[0][0] / wi).max(DISPERSION_MIN_CURVATURE)
+                (nu / (mu * mu)).max(DISPERSION_MIN_CURVATURE)
             };
+            let score_mu = nu * (yi - mu) / (mu * mu);
             let mean_weight = wi * mu * mu * info_mu;
             let mean_response = em + score_mu / (mu * info_mu);
             let info_nu = info_nu_raw.max(DISPERSION_MIN_CURVATURE);

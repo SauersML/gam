@@ -417,12 +417,26 @@ fn polygamma_positive(order: usize, mut x: f64) -> f64 {
         return f64::NAN;
     }
     let mut acc = 0.0;
-    while x < 8.0 {
+    while x < POLYGAMMA_ASYMPTOTIC_MIN_X {
         acc += polygamma_recurrence_term(order, x);
         x += 1.0;
     }
     acc + polygamma_asymptotic(order, x)
 }
+
+const POLYGAMMA_ASYMPTOTIC_MIN_X: f64 = 20.0;
+const BERNOULLI_EVEN: [(usize, f64); 10] = [
+    (2, 1.0 / 6.0),
+    (4, -1.0 / 30.0),
+    (6, 1.0 / 42.0),
+    (8, -1.0 / 30.0),
+    (10, 5.0 / 66.0),
+    (12, -691.0 / 2730.0),
+    (14, 7.0 / 6.0),
+    (16, -3617.0 / 510.0),
+    (18, 43867.0 / 798.0),
+    (20, -174611.0 / 330.0),
+];
 
 fn polygamma_recurrence_term(order: usize, x: f64) -> f64 {
     let sign = if order % 2 == 1 { 1.0 } else { -1.0 };
@@ -430,54 +444,30 @@ fn polygamma_recurrence_term(order: usize, x: f64) -> f64 {
 }
 
 fn polygamma_asymptotic(order: usize, x: f64) -> f64 {
-    match order {
-        1 => {
-            let inv = 1.0 / x;
-            let inv2 = inv * inv;
-            inv + 0.5 * inv2 + inv2 * inv / 6.0 - inv2 * inv2 * inv / 30.0
-                + inv2 * inv2 * inv2 * inv / 42.0
-                - inv2 * inv2 * inv2 * inv2 * inv / 30.0
-        }
-        2 => {
-            let inv = 1.0 / x;
-            let inv2 = inv * inv;
-            let inv3 = inv2 * inv;
-            -inv2 - inv3 - 0.5 * inv2 * inv2 + inv3 * inv3 / 6.0 - inv2 * inv3 * inv3 / 6.0
-                + 0.3 * inv2 * inv2 * inv3 * inv3
-                - 5.0 * inv2 * inv2 * inv2 * inv3 * inv3 / 6.0
-        }
-        3 => {
-            let inv = 1.0 / x;
-            let inv2 = inv * inv;
-            let inv3 = inv2 * inv;
-            let inv4 = inv2 * inv2;
-            inv3 * 2.0 + inv4 * 3.0 + inv4 * inv * 2.0 - inv4 * inv3
-                + inv4 * inv3 * inv2 * (4.0 / 3.0)
-                - inv4 * inv3 * inv4 * 3.0
-        }
-        4 => {
-            let inv = 1.0 / x;
-            let inv2 = inv * inv;
-            let inv4 = inv2 * inv2;
-            -6.0 * inv4 - 12.0 * inv4 * inv - 10.0 * inv4 * inv2 + 7.0 * inv4 * inv4
-                - 12.0 * inv4 * inv4 * inv2
-                + 33.0 * inv4 * inv4 * inv4
-        }
-        5 => {
-            let inv = 1.0 / x;
-            let inv2 = inv * inv;
-            let inv4 = inv2 * inv2;
-            24.0 * inv4 * inv + 60.0 * inv4 * inv2 + 60.0 * inv4 * inv2 * inv
-                - 56.0 * inv4 * inv4 * inv
-                + 120.0 * inv4 * inv4 * inv2 * inv
-                - 396.0 * inv4 * inv4 * inv4 * inv
-        }
-        _ => f64::NAN,
+    if !(1..=5).contains(&order) {
+        return f64::NAN;
     }
+
+    let order_factorial = factorial(order);
+    let leading_sign = if order % 2 == 1 { 1.0 } else { -1.0 };
+    let mut out = leading_sign * factorial(order - 1) / x.powi(order as i32)
+        + leading_sign * order_factorial / (2.0 * x.powi((order + 1) as i32));
+
+    let bernoulli_sign = if order % 2 == 1 { 1.0 } else { -1.0 };
+    for (bernoulli_order, bernoulli) in BERNOULLI_EVEN {
+        let rising = rising_factorial(bernoulli_order, order);
+        out += bernoulli_sign * bernoulli * rising / bernoulli_order as f64
+            / x.powi((bernoulli_order + order) as i32);
+    }
+    out
 }
 
 fn factorial(n: usize) -> f64 {
     (1..=n).fold(1.0, |acc, k| acc * k as f64)
+}
+
+fn rising_factorial(start: usize, len: usize) -> f64 {
+    (start..start + len).fold(1.0, |acc, k| acc * k as f64)
 }
 
 impl<const K: usize> std::ops::Add for Tower4<K> {
