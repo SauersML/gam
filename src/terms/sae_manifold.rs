@@ -407,58 +407,6 @@ impl FrameProjection {
         }
     }
 
-    fn accumulate_row_lift(
-        &self,
-        atom: usize,
-        c_base: usize,
-        phi: f64,
-        x: &[f64],
-        out: &mut [f64],
-    ) {
-        match &self.frames[atom] {
-            None => {
-                for i in 0..self.p {
-                    out[i] += phi * x[c_base + i];
-                }
-            }
-            Some(uk) => {
-                for i in 0..self.p {
-                    let mut acc = 0.0;
-                    for j in 0..self.ranks[atom] {
-                        acc += uk[[i, j]] * x[c_base + j];
-                    }
-                    out[i] += phi * acc;
-                }
-            }
-        }
-    }
-
-    fn accumulate_row_project(
-        &self,
-        atom: usize,
-        c_base: usize,
-        phi: f64,
-        u: &[f64],
-        out: &mut [f64],
-    ) {
-        match &self.frames[atom] {
-            None => {
-                for i in 0..self.p {
-                    out[c_base + i] += phi * u[i];
-                }
-            }
-            Some(uk) => {
-                for j in 0..self.ranks[atom] {
-                    let mut acc = 0.0;
-                    for i in 0..self.p {
-                        acc += uk[[i, j]] * u[i];
-                    }
-                    out[c_base + j] += phi * acc;
-                }
-            }
-        }
-    }
-
     fn accumulate_output_project(
         &self,
         atom: usize,
@@ -4143,120 +4091,6 @@ impl SaeKroneckerRow for SaeKroneckerRows {
     }
 }
 
-/// FRAME-FACTORED variant of [`SaeKroneckerRows`] (issue #972 / #977 T1): the
-/// per-row cross-block operator when the decoders are profiled onto Grassmann
-/// frames so the border carries the reduced coordinates `C_k` instead of the
-/// full `B_k`.
-///
-/// The factorization is identical except the `J_β = φᵀ ⊗ I_p` (output-channel)
-/// factor is replaced by the C-space map `J_C` that folds each atom's frame
-/// `U_k` (`p × r_k`):
-///   forward  `(J_C · c)[i]   = Σ_entries φ · Σ_j U_k[i,j] · c[c_base+j]`,
-///   transpose `(J_Cᵀ · u)[c_base+j] += φ · Σ_i U_k[i,j] · u[i]`.
-/// The t-side local Jacobian `L` (`local_jac`) is FRAME-INDEPENDENT and reused
-/// verbatim, so `apply_l` / `apply_l_t` are inherited unchanged from the
-/// full-`B` path via the shared `SaeKroneckerRows` instance held inside.
-///
-/// Each per-row support entry stores the C-space base `c_base = off_C[k] +
-/// basis_col·r_k` plus the weight `φ = a_k·φ_k[basis_col]·√w_row` and the atom
-/// index `k` (to select `U_k` / `r_k`). Un-framed atoms have `U_k = I_p`,
-/// `r_k = p`, so their entries reduce to the plain `SaeKroneckerRows` scatter.
-struct SaeFrameKroneckerRows {
-    /// Inner full-`B` operator: holds `local_jac` (the frame-independent t-side
-    /// factor) and is the source of `apply_l` / `apply_l_t`. Its `a_phi` is
-    /// retained but UNUSED here (the factored support below replaces it).
-    inner: SaeKroneckerRows,
-    projection: FrameProjection,
-    /// Per-row C-space support: `(c_base, phi, atom_idx)`.
-    factored_a_phi: Vec<Vec<(usize, f64, usize)>>,
-}
-
-impl SaeFrameKroneckerRows {
-    /// Build from the full-`B` per-row support (`a_phi`, with bases
-    /// `off_B[k] + basis_col·p`) by remapping each load into the factored
-    /// C-space. `beta_offsets` / `off_c` are the per-atom full-`B` / factored
-    /// offsets; `basis_sizes` / `ranks` the per-atom `M_k` / `r_k`.
-    fn new(
-        p: usize,
-        projection: FrameProjection,
-        a_phi: Vec<Vec<(usize, f64)>>,
-        local_jac: Vec<Vec<f64>>,
-    ) -> Result<Self, String> {
-        // Remap each full-`B` load `(beta_base, phi)` to `(c_base, phi, atom)`.
-        // `beta_base = off_B[k] + basis_col·p`; locate the atom by its full-`B`
-        // offset range and derive `basis_col`, then the factored base.
-        let mut factored_a_phi: Vec<Vec<(usize, f64, usize)>> = Vec::with_capacity(a_phi.len());
-        for row_loads in &a_phi {
-            let mut row_out: Vec<(usize, f64, usize)> = Vec::with_capacity(row_loads.len());
-            for &(beta_base, phi) in row_loads {
-                // Find the owning atom: largest `k` with `off_B[k] <= beta_base`
-                // and `beta_base < off_B[k] + M_k·p`.
-                let mut atom_idx = None;
-                for k in 0..projection.basis_sizes.len() {
-                    let lo = projection.beta_offsets[k];
-                    let hi = lo + projection.basis_sizes[k] * p;
-                    if beta_base >= lo && beta_base < hi {
-                        atom_idx = Some(k);
-                        break;
-                    }
-                }
-                let k = atom_idx.ok_or_else(|| {
-                    format!(
-                        "SaeFrameKroneckerRows::new: beta_base {beta_base} not in any atom block"
-                    )
-                })?;
-                let basis_col = (beta_base - projection.beta_offsets[k]) / p;
-                let c_base = projection.border_offsets[k] + basis_col * projection.ranks[k];
-                row_out.push((c_base, phi, k));
-            }
-            factored_a_phi.push(row_out);
-        }
-        let inner = SaeKroneckerRows::new(p, a_phi, local_jac);
-        Ok(Self {
-            inner,
-            projection,
-            factored_a_phi,
-        })
-    }
-
-    /// `u_p = J_C · x_C`: contract each C-space basis load through its atom's
-    /// frame into the p-dimensional decoded-output space.
-    fn apply_jbeta_factored(&self, row: usize, x_c: &[f64], u_out: &mut [f64]) {
-        for val in u_out.iter_mut() {
-            *val = 0.0;
-        }
-        for &(c_base, phi, atom) in &self.factored_a_phi[row] {
-            if phi == 0.0 {
-                continue;
-            }
-            self.projection
-                .accumulate_row_lift(atom, c_base, phi, x_c, u_out);
-        }
-    }
-
-    /// `y_C += J_Cᵀ · u`: scatter the p-space vector back into C-space through
-    /// each atom's frame transpose.
-    fn scatter_jbeta_factored_t(&self, row: usize, u: &[f64], y_c: &mut [f64]) {
-        for &(c_base, phi, atom) in &self.factored_a_phi[row] {
-            if phi == 0.0 {
-                continue;
-            }
-            self.projection
-                .accumulate_row_project(atom, c_base, phi, u, y_c);
-        }
-    }
-
-    /// Inherited frame-independent t-side multiply `w = L_i · u`.
-    fn apply_l(&self, row: usize, u: &[f64], w_out: &mut [f64]) {
-        self.inner.apply_l(row, u, w_out);
-    }
-
-    /// Inherited frame-independent t-side transpose `u += L_iᵀ · v`.
-    fn apply_l_t(&self, row: usize, v: &[f64], u_out: &mut [f64]) {
-        self.inner.apply_l_t(row, v, u_out);
-    }
-}
-
 /// Loss breakdown for diagnostics and evidence ranking.
 #[derive(Debug, Clone, Copy)]
 pub struct SaeManifoldLoss {
@@ -7429,9 +7263,9 @@ impl SaeManifoldTerm {
         // matrix retains all atoms for this row so the assignment-Jacobian
         // helper can read it.
         let mut decoded_scratch = vec![0.0_f64; p];
-        // Kronecker htbeta storage: per-row sparse support and local Jacobian.
-        // These replace the O(q · K · p) dense htbeta write with O(m_i · q · p)
-        // storage; the Arrow-Schur solver accesses them via htbeta_matvec.
+        // Kronecker htbeta storage for the full-B path: per-row sparse support
+        // and local Jacobian. Factored rows write their C-space cross slabs
+        // directly in the row loop below.
         let mut kron_a_phi: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n);
         let mut kron_jac: Vec<Vec<f64>> = Vec::with_capacity(n);
         // Dense full-support index `[0, k_atoms)`, used by the row loop when no
@@ -7791,13 +7625,10 @@ impl SaeManifoldTerm {
             // scalar `a_k · phi_k` once and reuse it across the `out_col`
             // and inner `(atom_j, basis_col2)` loops.
             //
-            // The dense (q × K·p) htbeta block is NOT written here.  Instead,
-            // `a_phi` and `local_jac_row` are captured per-row into `SaeKroneckerRows`
-            // and installed as `sys.htbeta_matvec` after the row loop.  All
-            // Arrow-Schur inner paths (schur_matvec, reduced_rhs_beta,
-            // build_dense_schur_*, JacobiPreconditioner) route through
-            // `sys_htbeta_apply_row` / `sys_htbeta_accumulate_transpose` which
-            // already prefer `htbeta_matvec` over the dense slab.
+            // Full-B rows keep the matrix-free Kronecker path below. Factored
+            // rows write the `q_i × Σ M_k r_k` C-space cross slab directly by
+            // folding each output-channel contribution through the atom frame,
+            // so no `q_i × β_dim` slab is ever materialized.
             //
             // Only the row's active atoms contribute `a_phi` support and data
             // curvature: in a compact layout (JumpReLU gate or large-K
@@ -7845,9 +7676,39 @@ impl SaeManifoldTerm {
                 }
                 for out_col in 0..p {
                     sys.gb[beta_base_i + out_col] += j_beta_i * error_metric[out_col];
-                    // No htbeta write — the Kronecker matvec handles this.
                     // No dense hbb write — the sparse `G ⊗ I_p` op installed
                     // after the loop carries the data-fit GN β-Hessian.
+                }
+            }
+            if frames_engaged {
+                for &atom_idx in row_active {
+                    let atom = &self.atoms[atom_idx];
+                    let m = atom.basis_size();
+                    let a_k = assignments[atom_idx];
+                    for basis_col in 0..m {
+                        let phi = atom.basis_values[[row, basis_col]];
+                        let w = a_k * phi * sqrt_row_w;
+                        if w == 0.0 {
+                            continue;
+                        }
+                        let c_base = frame_projection.border_offsets[atom_idx]
+                            + basis_col * frame_projection.ranks[atom_idx];
+                        for c in 0..q_row {
+                            let mut hrow = block.htbeta.row_mut(c);
+                            let hrow_slice =
+                                hrow.as_slice_mut().expect("htbeta row is contiguous");
+                            for out_col in 0..p {
+                                let value = local_jac_row[[c, out_col]] * w;
+                                frame_projection.accumulate_output_project(
+                                    atom_idx,
+                                    c_base,
+                                    out_col,
+                                    value,
+                                    hrow_slice,
+                                );
+                            }
+                        }
+                    }
                 }
             }
             // Data-fit GN β-Hessian: accumulate the channel-independent block
@@ -7874,16 +7735,17 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-            // Save per-row Kronecker data for htbeta_matvec construction.
-            kron_a_phi.push(a_phi);
-            // Flatten local_jac_row row-major into a plain Vec<f64> (q_row * p entries).
-            let mut jac_flat = vec![0.0_f64; q_row * p];
-            for c in 0..q_row {
-                for j in 0..p {
-                    jac_flat[c * p + j] = local_jac_row[[c, j]];
+            if !frames_engaged {
+                kron_a_phi.push(a_phi);
+                // Flatten local_jac_row row-major into a plain Vec<f64> (q_row * p entries).
+                let mut jac_flat = vec![0.0_f64; q_row * p];
+                for c in 0..q_row {
+                    for j in 0..p {
+                        jac_flat[c * p + j] = local_jac_row[[c, j]];
+                    }
                 }
+                kron_jac.push(jac_flat);
             }
-            kron_jac.push(jac_flat);
             sys.rows[row] = block;
         }
         // Apply Riemannian geometry to the per-row row blocks (htt, gt) and
@@ -7905,7 +7767,7 @@ impl SaeManifoldTerm {
             let raw_gt_rows: Vec<Array1<f64>> = sys.rows.iter().map(|row| row.gt.clone()).collect();
             self.apply_sae_riemannian_geometry(&mut sys);
             let manifold = self.ext_coord_manifold();
-            if !manifold.is_euclidean() {
+            if !frames_engaged && !manifold.is_euclidean() {
                 let ext = self.ext_coord_matrix();
                 // Project the local Jacobian columns onto the tangent space at
                 // each row's ext-coord point. Each column `j` of the row's
@@ -7942,7 +7804,7 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        // Build and install the Kronecker htbeta_matvec.
+        // Build and install the full-B Kronecker htbeta_matvec.
         //
         // `SaeKroneckerRows` holds per-row `(a_phi, local_jac)` and implements
         // the cross-block operator without ever materialising the dense
@@ -7963,52 +7825,7 @@ impl SaeManifoldTerm {
         } else {
             Some((kron_a_phi.clone(), kron_jac.clone()))
         };
-        if frames_engaged {
-            // #972 / #977 T1 — FACTORED cross block `H_tC = H_tB · Φ`. The full-`B`
-            // cross factorises `H_tB = L · J_β` with `J_β = φᵀ ⊗ I_p`; folding the
-            // block-diagonal projector `Φ = blkdiag(I_{M_k} ⊗ U_k)` turns the
-            // `J_β` (output-channel) factor into the C-space map
-            // `(J_C · c)[i] = Σ_{k,m} φ_k[m] · Σ_j U_k[i,j] · c[off_C[k]+m·r_k+j]`.
-            // `L` (the t-side local Jacobian) is frame-INDEPENDENT, so `kron_jac`
-            // is reused verbatim; only the basis-load factor folds `U`. The
-            // C-space support is built from the same per-row `a_phi` (full-`B`
-            // bases) by mapping each `(atom_beta_off + m·p, φ)` load to atom `k`'s
-            // factored base `off_C[k] + m·r_k` and attaching `U_k`.
-            let kron = Arc::new(SaeFrameKroneckerRows::new(
-                p,
-                frame_projection.clone(),
-                kron_a_phi,
-                kron_jac,
-            )?);
-            let kron_t = Arc::clone(&kron);
-            let p_dim = p;
-            sys.set_row_htbeta_operator(
-                move |row_idx, x, out| {
-                    // out = L_i · (J_C · x); `x` is a factored ΔC vector.
-                    let out_slice = out.as_slice_mut().expect("out is always standard-layout");
-                    let mut u_p = vec![0.0_f64; p_dim];
-                    if let Some(xs) = x.as_slice() {
-                        kron.apply_jbeta_factored(row_idx, xs, &mut u_p);
-                    } else {
-                        let x_vec: Vec<f64> = x.iter().copied().collect();
-                        kron.apply_jbeta_factored(row_idx, &x_vec, &mut u_p);
-                    }
-                    kron.apply_l(row_idx, &u_p, out_slice);
-                },
-                move |row_idx, v, out| {
-                    // out += J_Cᵀ · (Lᵀ · v); scatter into the factored C-space.
-                    let out_slice = out.as_slice_mut().expect("out is always standard-layout");
-                    let mut u_p = vec![0.0_f64; p_dim];
-                    if let Some(vs) = v.as_slice() {
-                        kron_t.apply_l_t(row_idx, vs, &mut u_p);
-                    } else {
-                        let v_vec: Vec<f64> = v.iter().copied().collect();
-                        kron_t.apply_l_t(row_idx, &v_vec, &mut u_p);
-                    }
-                    kron_t.scatter_jbeta_factored_t(row_idx, &u_p, out_slice);
-                },
-            );
-        } else {
+        if !frames_engaged {
             let kron = Arc::new(SaeKroneckerRows::new(p, kron_a_phi, kron_jac));
             let kron_t = Arc::clone(&kron);
             let p_dim = p;
@@ -8143,11 +7960,10 @@ impl SaeManifoldTerm {
             }
 
             // Re-point the system's β-tier to the factored width. The t-tier
-            // (per-row `htt`, `gt`) is frame-independent and untouched; dense
-            // row cross-block slabs were allocated in factored coordinates at
-            // construction, so any analytic row supplement already has shape
-            // `(q_i × factored_border_dim)`. The data-fit cross block stays on
-            // the matrix-free factored operator.
+            // (per-row `htt`, `gt`) is frame-independent and untouched; row
+            // cross-block slabs were allocated and assembled directly in
+            // factored coordinates, so analytic row supplements and data-fit
+            // cross terms already share shape `(q_i × factored_border_dim)`.
             sys.k = border_dim;
             sys.gb = gb_c;
             self.reclaim_border_hbb_workspace(&mut sys);
@@ -21535,6 +21351,8 @@ mod tests {
             .assemble_arrow_schur(target.view(), &rho, None)
             .unwrap();
         assert_eq!(native_sys.k, border_dim);
+        assert!(native_sys.htbeta_matvec.is_none());
+        assert!(native_sys.htbeta_transpose_matvec.is_none());
         for row in &native_sys.rows {
             assert_eq!(row.htbeta.ncols(), border_dim);
         }
