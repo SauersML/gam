@@ -20,6 +20,7 @@ pub mod sae_candidate_index;
 pub mod sae_corpus;
 pub mod sae_criterion_atoms;
 pub mod sae_encode_atlas;
+pub mod sae;
 pub mod sae_manifold;
 pub mod sae_optimality_certificate;
 pub mod sae_row_jet_program;

@@ -4459,6 +4459,7 @@ fn solution_into_outer_result(
         operator_trust_radius: None,
         operator_stop_reason: None,
         criterion_certificate: None,
+        rho_uncertainty_certificate: None,
     }
 }
 
@@ -4555,6 +4556,7 @@ struct OuterConfig {
     /// seed-prefix key so the next fit with related structure can warm-start
     /// from this one, even after an interrupted run.
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
+    rho_uncertainty_problem_size: crate::inference::rho_uncertainty::RhoUncertaintyProblemSize,
 }
 
 impl Default for OuterConfig {
@@ -4579,6 +4581,8 @@ impl Default for OuterConfig {
             bfgs_step_cap_psi: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
+            rho_uncertainty_problem_size:
+                crate::inference::rho_uncertainty::RhoUncertaintyProblemSize::default(),
         }
     }
 }
@@ -4621,6 +4625,7 @@ pub struct OuterProblem {
     bfgs_step_cap_psi: Option<f64>,
     cache_session: Option<Arc<CacheSession>>,
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
+    rho_uncertainty_problem_size: crate::inference::rho_uncertainty::RhoUncertaintyProblemSize,
 }
 
 impl OuterProblem {
@@ -4652,6 +4657,8 @@ impl OuterProblem {
             bfgs_step_cap_psi: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
+            rho_uncertainty_problem_size:
+                crate::inference::rho_uncertainty::RhoUncertaintyProblemSize::default(),
         }
     }
 
@@ -4829,6 +4836,15 @@ impl OuterProblem {
         self
     }
 
+    pub fn with_problem_size(mut self, n_obs: usize, p_coefficients: usize) -> Self {
+        self.rho_uncertainty_problem_size =
+            crate::inference::rho_uncertainty::RhoUncertaintyProblemSize {
+                n_obs: Some(n_obs),
+                p_coefficients: Some(p_coefficients),
+            };
+        self
+    }
+
     /// Override the fallback policy. Default is [`FallbackPolicy::Automatic`].
     ///
     /// Set [`FallbackPolicy::Disabled`] when the caller requires the primary
@@ -4878,6 +4894,7 @@ impl OuterProblem {
             bfgs_step_cap_psi: self.bfgs_step_cap_psi,
             cache_session: self.cache_session.clone(),
             cache_mirror_sessions: self.cache_mirror_sessions.clone(),
+            rho_uncertainty_problem_size: self.rho_uncertainty_problem_size,
         }
     }
 
@@ -5024,7 +5041,7 @@ impl OuterProblem {
                         prior_obj_display,
                         iterations,
                     );
-                    return Ok(OuterResult {
+                    let mut result = OuterResult {
                         rho,
                         final_value,
                         iterations,
@@ -5036,7 +5053,12 @@ impl OuterProblem {
                         operator_trust_radius: None,
                         operator_stop_reason: None,
                         criterion_certificate: None,
-                    });
+                        rho_uncertainty_certificate: None,
+                    };
+                    result.rho_uncertainty_certificate = Some(
+                        compute_rho_uncertainty_certificate(obj, &config, context, &result),
+                    );
+                    return Ok(result);
                 }
                 CacheSeedDecision::Seed {
                     rho,
@@ -5242,6 +5264,11 @@ pub struct OuterResult {
     /// when an audit probe failed to evaluate. Populated once by
     /// [`run_outer`] after the solver ladder returns, outside all hot loops.
     pub criterion_certificate: Option<CriterionCertificate>,
+    /// Post-fit PSIS certificate for whether smoothing-parameter uncertainty
+    /// makes plug-in REML/LAML intervals unreliable. Populated once by
+    /// [`run_outer`] when the exact rho Hessian is cheap enough to use.
+    pub rho_uncertainty_certificate:
+        Option<crate::inference::rho_uncertainty::RhoUncertaintyCertificate>,
 }
 
 impl OuterResult {
@@ -5574,6 +5601,142 @@ fn audit_first_order_optimality(
     Some(certificate)
 }
 
+fn compute_rho_uncertainty_certificate(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+    result: &OuterResult,
+) -> crate::inference::rho_uncertainty::RhoUncertaintyCertificate {
+    let cap = obj.capability();
+    let layout = cap.theta_layout();
+    let rho_dim = layout.rho_dim();
+    let gate = crate::inference::rho_uncertainty::RhoUncertaintyCostGate {
+        sample_count: 32,
+        problem_size: config.rho_uncertainty_problem_size,
+    };
+    if let Err(reason) = crate::inference::rho_uncertainty::cost_gate_allows(rho_dim, gate) {
+        return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(reason, 0);
+    }
+    if result.rho.len() != layout.n_params {
+        return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(
+            format!(
+                "final outer point length {} does not match objective dimension {}",
+                result.rho.len(),
+                layout.n_params
+            ),
+            0,
+        );
+    }
+
+    let final_eval = match obj.eval_with_order(&result.rho, OuterEvalOrder::ValueGradientHessian) {
+        Ok(eval) => eval,
+        Err(err) => {
+            return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(
+                format!("final exact Hessian evaluation failed: {err}"),
+                1,
+            );
+        }
+    };
+    let hessian = match final_eval.hessian.materialize_dense() {
+        Ok(Some(hessian)) => hessian,
+        Ok(None) => {
+            return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(
+                "exact outer Hessian unavailable at fitted rho",
+                1,
+            );
+        }
+        Err(message) => {
+            return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(
+                format!("exact outer Hessian materialization failed: {message}"),
+                1,
+            );
+        }
+    };
+    if hessian.nrows() != layout.n_params || hessian.ncols() != layout.n_params {
+        return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(
+            format!(
+                "exact outer Hessian shape {}x{} does not match objective dimension {}",
+                hessian.nrows(),
+                hessian.ncols(),
+                layout.n_params
+            ),
+            1,
+        );
+    }
+    let mut hessian_rho = Array2::<f64>::zeros((rho_dim, rho_dim));
+    for row in 0..rho_dim {
+        for col in 0..rho_dim {
+            hessian_rho[[row, col]] = hessian[[row, col]];
+        }
+    }
+    let rho_hat = result
+        .rho
+        .slice(ndarray::s![..rho_dim])
+        .to_owned();
+    let theta_hat = result.rho.clone();
+    let cost_hat = final_eval.cost;
+    let final_beta_hint = final_eval.inner_beta_hint.clone();
+    let certificate = {
+        let mut served_hat_cost = false;
+        let mut criterion = |rho: &Array1<f64>| -> Option<f64> {
+            let is_hat = rho.len() == rho_hat.len()
+                && rho
+                    .iter()
+                    .zip(rho_hat.iter())
+                    .all(|(&left, &right)| left.to_bits() == right.to_bits());
+            if is_hat && !served_hat_cost {
+                served_hat_cost = true;
+                return Some(cost_hat);
+            }
+            let mut theta = theta_hat.clone();
+            for idx in 0..rho_dim {
+                theta[idx] = rho[idx];
+            }
+            if let Some(beta) = final_beta_hint.as_ref()
+                && obj.seed_inner_state(beta).is_err()
+            {
+                return None;
+            }
+            obj.eval_cost(&theta).ok()
+        };
+        crate::inference::rho_uncertainty::rho_uncertainty_certificate(
+            &rho_hat,
+            &hessian_rho,
+            gate,
+            &mut criterion,
+        )
+    };
+    if let Some(beta) = final_beta_hint.as_ref()
+        && let Err(err) = obj.seed_inner_state(beta)
+    {
+        log::debug!(
+            "[RHO uncertainty] {context}: final inner-state restore skipped after certificate ({err})"
+        );
+    }
+    match &certificate.verdict {
+        crate::inference::rho_uncertainty::RhoUncertaintyVerdict::CertifiedAdequate => {
+            log::info!(
+                "[RHO uncertainty] {context}: certified adequate k_hat={:.3} evals={}",
+                certificate.k_hat.unwrap_or(f64::NAN),
+                certificate.n_evaluations,
+            );
+        }
+        crate::inference::rho_uncertainty::RhoUncertaintyVerdict::RhoUncertaintyMatters {
+            k_hat,
+        } => {
+            log::warn!(
+                "[RHO uncertainty] {context}: rho uncertainty matters k_hat={:.3} evals={}",
+                k_hat,
+                certificate.n_evaluations,
+            );
+        }
+        crate::inference::rho_uncertainty::RhoUncertaintyVerdict::Skipped { reason } => {
+            log::info!("[RHO uncertainty] {context}: skipped ({reason})");
+        }
+    }
+    certificate
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperatorTrustRegionStopReason {
     Converged,
@@ -5616,6 +5779,9 @@ fn run_outer(
     // is warm-start residue O(h) from the optimum — every caller recovers
     // its fitted state from `result.rho`, not from last-eval residue.
     result.criterion_certificate = audit_first_order_optimality(obj, config, context, &result);
+    result.rho_uncertainty_certificate = Some(compute_rho_uncertainty_certificate(
+        obj, config, context, &result,
+    ));
     Ok(result)
 }
 
@@ -5662,6 +5828,7 @@ fn run_outer_uncertified(
             operator_trust_radius: None,
             operator_stop_reason: None,
             criterion_certificate: None,
+            rho_uncertainty_certificate: None,
         });
     }
 
@@ -6967,6 +7134,7 @@ fn run_outer_with_plan(
                                 operator_trust_radius: None,
                                 operator_stop_reason: None,
                                 criterion_certificate: None,
+                                rho_uncertainty_certificate: None,
                             };
                             Ok::<OuterResult, EstimationError>(result)
                         }
@@ -7365,6 +7533,7 @@ fn run_outer_with_plan(
                         operator_trust_radius: None,
                         operator_stop_reason: None,
                         criterion_certificate: None,
+                        rho_uncertainty_certificate: None,
                     }),
                     CompassSearchOutcome::BudgetExhausted { point, cost, polls } => {
                         log::warn!(
@@ -7384,6 +7553,7 @@ fn run_outer_with_plan(
                             operator_trust_radius: None,
                             operator_stop_reason: None,
                             criterion_certificate: None,
+                            rho_uncertainty_certificate: None,
                         })
                     }
                 }
@@ -7624,6 +7794,91 @@ mod tests {
             cert.summary(),
         );
         assert!(cert.fd_step > 0.0 && cert.fd_error > 0.0);
+    }
+
+    #[test]
+    fn rho_uncertainty_certificate_does_not_change_outer_solution() {
+        let center = array![0.25];
+        let seed_config = crate::seeding::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        };
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Either)
+            .with_initial_rho(array![1.5])
+            .with_seed_config(seed_config)
+            .with_problem_size(8, 3);
+        let config = problem.config();
+
+        let mut without_certificate = problem.build_objective(
+            (),
+            {
+                let center = center.clone();
+                move |_: &mut (), rho: &Array1<f64>| {
+                    let d = rho - &center;
+                    Ok(0.5 * d.dot(&d))
+                }
+            },
+            {
+                let center = center.clone();
+                move |_: &mut (), rho: &Array1<f64>| {
+                    let d = rho - &center;
+                    Ok(OuterEval {
+                        cost: 0.5 * d.dot(&d),
+                        gradient: d,
+                        hessian: HessianResult::Analytic(array![[1.0]]),
+                        inner_beta_hint: None,
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let mut with_certificate = problem.build_objective(
+            (),
+            {
+                let center = center.clone();
+                move |_: &mut (), rho: &Array1<f64>| {
+                    let d = rho - &center;
+                    Ok(0.5 * d.dot(&d))
+                }
+            },
+            {
+                let center = center.clone();
+                move |_: &mut (), rho: &Array1<f64>| {
+                    let d = rho - &center;
+                    Ok(OuterEval {
+                        cost: 0.5 * d.dot(&d),
+                        gradient: d,
+                        hessian: HessianResult::Analytic(array![[1.0]]),
+                        inner_beta_hint: None,
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+
+        let baseline = run_outer_uncertified(
+            &mut without_certificate,
+            &config,
+            "rho-certificate-baseline",
+        )
+        .expect("baseline outer run");
+        let certified = run_outer(
+            &mut with_certificate,
+            &config,
+            "rho-certificate-certified",
+        )
+        .expect("certified outer run");
+
+        assert_eq!(baseline.rho, certified.rho);
+        assert_eq!(baseline.final_value.to_bits(), certified.final_value.to_bits());
+        assert_eq!(baseline.iterations, certified.iterations);
+        assert_eq!(baseline.final_grad_norm, certified.final_grad_norm);
+        assert!(certified.rho_uncertainty_certificate.is_some());
     }
 
     /// The desync bug genus (#748/#752/#901): the gradient path optimizes a
@@ -9561,6 +9816,7 @@ mod tests {
             operator_trust_radius: None,
             operator_stop_reason: None,
             criterion_certificate: None,
+            rho_uncertainty_certificate: None,
         };
         let nonconverged_lo = OuterResult {
             rho: array![1.0],
@@ -9577,6 +9833,7 @@ mod tests {
             operator_trust_radius: None,
             operator_stop_reason: None,
             criterion_certificate: None,
+            rho_uncertainty_certificate: None,
         };
         let converged = OuterResult {
             rho: array![2.0],
@@ -9593,6 +9850,7 @@ mod tests {
             operator_trust_radius: None,
             operator_stop_reason: None,
             criterion_certificate: None,
+            rho_uncertainty_certificate: None,
         };
 
         assert!(candidate_improves_best(&nonconverged_hi, None));
