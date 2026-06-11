@@ -2288,6 +2288,35 @@ impl SaeManifoldAtom {
         Ok(sv.iter().filter(|&&v| v > tol).count())
     }
 
+    /// Rank that should be carried by the low-rank Grassmann decoder frame for
+    /// the current decoder, or `None` when the full-`B` representation is still
+    /// the intended path. This is the exact activation predicate:
+    ///
+    /// * `r = max(numerical_rank(B_k), 1)`;
+    /// * `r <= p * (1 - SAE_FRAME_ACTIVATION_MARGIN)`;
+    /// * `p - r > 0`.
+    ///
+    /// Because `rank(B_k) <= M_k`, a cold LSQ decoder with `p >= 896` and
+    /// `M_k <= 16` always satisfies the shrink predicate (`16 << 0.75p`) unless
+    /// the decoder has no output dimension or no basis columns.
+    pub fn decoder_frame_activation_rank(&self) -> Result<Option<usize>, String> {
+        let p = self.output_dim();
+        if p == 0 || self.basis_size() == 0 {
+            return Ok(None);
+        }
+        let numerical_rank = self.decoder_numerical_rank()?;
+        // A degenerate all-zero decoder keeps a rank-1 frame so the coordinate
+        // column is non-empty; otherwise use the numerical rank.
+        let r = numerical_rank.max(1).min(p);
+        // Beneficial only if the frame materially shrinks the border AND there
+        // is a positive Grassmann dimension to profile out.
+        let shrink_ok = (r as f64) <= (p as f64) * (1.0 - SAE_FRAME_ACTIVATION_MARGIN);
+        if !shrink_ok || p.saturating_sub(r) == 0 {
+            return Ok(None);
+        }
+        Ok(Some(r))
+    }
+
     /// Auto-derive whether the low-rank Grassmann factorization is beneficial for
     /// this atom and, if so, activate it (issue #972) — magic-by-default, no
     /// flag. The frame is installed (decoder factored as `B_k = C_k Uᵀ`) only
@@ -2302,21 +2331,11 @@ impl SaeManifoldAtom {
     /// machine precision when `r` equals the true rank. Returns the activated
     /// frame rank, or `None` if the full-`B` path was kept.
     pub fn maybe_activate_decoder_frame(&mut self) -> Result<Option<usize>, String> {
-        let p = self.output_dim();
-        if p == 0 || self.basis_size() == 0 {
-            return Ok(None);
-        }
-        let numerical_rank = self.decoder_numerical_rank()?;
-        // A degenerate all-zero decoder keeps a rank-1 frame so the coordinate
-        // column is non-empty; otherwise use the numerical rank.
-        let r = numerical_rank.max(1).min(p);
-        // Beneficial only if the frame materially shrinks the border AND there
-        // is a positive Grassmann dimension to profile out.
-        let shrink_ok = (r as f64) <= (p as f64) * (1.0 - SAE_FRAME_ACTIVATION_MARGIN);
-        if !shrink_ok || p.saturating_sub(r) == 0 {
+        let Some(r) = self.decoder_frame_activation_rank()? else {
             self.decoder_frame = None;
             return Ok(None);
-        }
+        };
+        let p = self.output_dim();
         // Build the canonical frame from the decoder's own column-span evidence:
         // the cross-moment `B_kᵀ B_k`-induced left subspace is exactly the top-`r`
         // right-singular subspace of `B_k`. We obtain it by polaring the rank-`r`
@@ -4642,21 +4661,64 @@ impl SaeManifoldTerm {
     pub fn auto_activate_decoder_frames(&mut self) -> Result<usize, String> {
         let mut activated = 0usize;
         for atom in &mut self.atoms {
-            // Idempotent (issue #972 / #977 T1): an atom that is already framed
-            // keeps its frame — the polar refresh adapts it during the fit.
-            // Re-running activation every outer eval (this is called at the top
-            // of every `run_joint_fit`) would re-SVD and RESET the frame each
-            // time, discarding the polar refinement and making the objective the
-            // outer engine sees non-stationary (it would never converge). Only
-            // atoms WITHOUT a frame are considered for activation here.
-            if atom.decoder_frame.is_some() {
-                continue;
+            let expected_rank = atom.decoder_frame_activation_rank()?;
+            match (
+                expected_rank,
+                atom.decoder_frame.as_ref().map(GrassmannFrame::rank),
+            ) {
+                (Some(expected), Some(current)) if expected == current => {
+                    continue;
+                }
+                (None, Some(_)) => {
+                    atom.deactivate_decoder_frame();
+                    continue;
+                }
+                (None, None) => {
+                    continue;
+                }
+                (Some(_), _) => {}
             }
             if atom.maybe_activate_decoder_frame()?.is_some() {
                 activated += 1;
             }
         }
         Ok(activated)
+    }
+
+    /// Reconcile decoder-frame activation before a fit entry point. The
+    /// user-facing `auto_activate_decoder_frames` contract returns only newly
+    /// installed frames; this helper enforces the stronger invariant the large-p
+    /// solver needs: every atom whose current decoder satisfies the activation
+    /// predicate has an active frame after the pass.
+    fn ensure_decoder_frames_active_for_current_decoder(&mut self) -> Result<(), String> {
+        self.auto_activate_decoder_frames()?;
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let expected_rank = atom.decoder_frame_activation_rank()?;
+            if let Some(expected_rank) = expected_rank {
+                match atom.decoder_frame.as_ref() {
+                    Some(frame) if frame.rank() == expected_rank => {}
+                    Some(frame) => {
+                        return Err(format!(
+                            "SaeManifoldTerm::ensure_decoder_frames_active_for_current_decoder: \
+                             atom {atom_idx} frame rank {} must equal audited rank {expected_rank}",
+                            frame.rank()
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "SaeManifoldTerm::ensure_decoder_frames_active_for_current_decoder: \
+                             atom {atom_idx} has audited rank {expected_rank} but no active frame"
+                        ));
+                    }
+                }
+            } else if atom.decoder_frame.is_some() {
+                return Err(format!(
+                    "SaeManifoldTerm::ensure_decoder_frames_active_for_current_decoder: \
+                     atom {atom_idx} kept a frame after the full-B predicate won"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Closed-form streaming POLAR refresh of every ACTIVE decoder frame from the
@@ -9287,7 +9349,7 @@ impl SaeManifoldTerm {
         // path, so the small-model fits are unchanged; large-ambient-`p`,
         // low-decoder-rank atoms collapse their border `M_k·p → M_k·r_k` and the
         // joint solve runs in the factored coordinate space.
-        self.auto_activate_decoder_frames()
+        self.ensure_decoder_frames_active_for_current_decoder()
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
         // #976 Layer-1 guard ledger is per joint fit: each inner solve gets a
         // fresh re-seed budget and reports only its own breaches.
@@ -9890,9 +9952,10 @@ impl SaeManifoldTerm {
         // #972 / #977 T1: magic-by-default frame activation, mirroring the dense
         // driver, so the streaming fit runs in the same factored coordinate
         // space (the chunk terms inherit the frames via `materialize_chunk`).
-        self.auto_activate_decoder_frames().map_err(|err| {
-            format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
-        })?;
+        self.ensure_decoder_frames_active_for_current_decoder()
+            .map_err(|err| {
+                format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
+            })?;
         // The β-tier width the reduced-Schur accumulators are sized at: the
         // FACTORED border `Σ M_k·r_k` when frames are active (every chunk's
         // `sys.gb` / reduced Schur is in that space), else the full-`B`
