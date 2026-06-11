@@ -15,7 +15,7 @@ use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::scale_design::scale_transform_from_payload;
 use crate::families::survival::assemble_competing_risks_cif_from_endpoints;
 use crate::families::survival_construction::{
-    SurvivalBaselineConfig, SurvivalLikelihoodMode, SurvivalTimeBuildOutput,
+    SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBuildOutput,
     add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_derivative_design,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
@@ -403,7 +403,16 @@ pub fn predict_survival(
     {
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
-    let baseline_cfg = saved_survival_runtime_baseline_config(model)?;
+    let mut baseline_cfg = saved_survival_runtime_baseline_config(model)?;
+    if weibull_baseline_in_beta {
+        baseline_cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Linear,
+            scale: None,
+            shape: None,
+            rate: None,
+            makeham: None,
+        };
+    }
 
     // Resolve the time-grid: either the explicit grid (same for every
     // row) or per-row exit times (one column per row).
@@ -519,25 +528,13 @@ pub fn predict_survival(
                     )?;
                 }
                 let (mut r_eta_entry, mut r_eta_exit, mut r_deriv_exit) =
-                    if weibull_baseline_in_beta {
-                        // The fitted Weibull baseline lives in the (anchor-centered)
-                        // linear time-basis coefficients; the saved `Weibull`
-                        // baseline target is reporting metadata only. Carry a zero
-                        // parametric offset so it is not double-counted (issue #897).
-                        (
-                            Array1::<f64>::zeros(1),
-                            Array1::<f64>::zeros(1),
-                            Array1::<f64>::zeros(1),
-                        )
-                    } else {
-                        build_survival_time_offsets_for_likelihood(
-                            &single_entry,
-                            &single_exit,
-                            &baseline_cfg,
-                            saved_likelihood_mode,
-                            None,
-                        )?
-                    };
+                    build_survival_time_offsets_for_likelihood(
+                        &single_entry,
+                        &single_exit,
+                        &baseline_cfg,
+                        saved_likelihood_mode,
+                        None,
+                    )?;
                 if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
                     add_survival_time_derivative_guard_offset(
                         &single_entry,
