@@ -5123,9 +5123,14 @@ impl BernoulliMarginalSlopeFamily {
                 .iter()
                 .zip(empirical_grid.weights.iter())
             {
+                // coeff_u is read by every per-node loop; coeff_au and coeff_bu
+                // are only read inside the `if need_hessian` branches below, so
+                // their per-node zero-fills are dead work in gradient-only mode.
                 coeff_u.fill([0.0; 4]);
-                coeff_au.fill([0.0; 4]);
-                coeff_bu.fill([0.0; 4]);
+                if need_hessian {
+                    coeff_au.fill([0.0; 4]);
+                    coeff_bu.fill([0.0; 4]);
+                }
 
                 let obs = self.observed_denested_cell_partials_at_z(node, a, b, beta_h, beta_w)?;
                 let eta = eval_coeff4_at(&obs.coeff, node);
@@ -5277,9 +5282,17 @@ impl BernoulliMarginalSlopeFamily {
                     .collect::<Result<Vec<_>, String>>()?
             };
             for (partition_cell, state) in cached_cells {
+                // coeff_u is consumed by `cell_first_derivative_from_moments`
+                // for every cell; coeff_au and coeff_bu only feed the
+                // `if need_hessian` blocks below, so their per-cell zero-fills
+                // — and the `coeff_au[1] = [0.0; 4]; coeff_bu[1] = [0.0; 4];`
+                // pair that used to seed them explicitly — are dead work in
+                // gradient-only mode.
                 coeff_u.fill([0.0; 4]);
-                coeff_au.fill([0.0; 4]);
-                coeff_bu.fill([0.0; 4]);
+                if need_hessian {
+                    coeff_au.fill([0.0; 4]);
+                    coeff_bu.fill([0.0; 4]);
+                }
                 let cell = partition_cell.cell;
                 let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
                 let u_mid = a + b * z_mid;
@@ -5294,8 +5307,6 @@ impl BernoulliMarginalSlopeFamily {
                 let dc_db = scale_coeff4(dc_db_raw, scale);
 
                 coeff_u[1] = dc_db;
-                coeff_au[1] = [0.0; 4];
-                coeff_bu[1] = [0.0; 4];
                 if need_hessian {
                     let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
                         partition_cell.score_span,
@@ -5448,12 +5459,18 @@ impl BernoulliMarginalSlopeFamily {
         let eta_aa_obs = eval_coeff4_at(&obs.dc_daa, z_obs);
         let eta_val = eval_coeff4_at(&obs.coeff, z_obs);
 
+        // `g_u_fixed` feeds `rho` (always read); `g_au_fixed` / `g_bu_fixed`
+        // only feed `tau` and the symmetric-Hessian `pair_from_b_family`
+        // contraction, so their per-row zero-fill and `[1]` seeding are dead
+        // work in gradient-only mode.
         g_u_fixed.fill([0.0; 4]);
-        g_au_fixed.fill([0.0; 4]);
-        g_bu_fixed.fill([0.0; 4]);
         g_u_fixed[1] = obs.dc_db;
-        g_au_fixed[1] = obs.dc_dab;
-        g_bu_fixed[1] = obs.dc_dbb;
+        if need_hessian {
+            g_au_fixed.fill([0.0; 4]);
+            g_bu_fixed.fill([0.0; 4]);
+            g_au_fixed[1] = obs.dc_dab;
+            g_bu_fixed[1] = obs.dc_dbb;
+        }
         if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
             Self::for_each_deviation_basis_cubic_at(
                 runtime,
@@ -5510,13 +5527,19 @@ impl BernoulliMarginalSlopeFamily {
             zero_family,
         );
 
+        // `scratch.reset(need_hessian)` at the top of this function zeroed both
+        // `rho` and `tau` unconditionally, so no manual fill is needed here.
+        // `tau` is consumed only by the symmetric-Hessian assembly below, so
+        // its per-row eval_coeff4_at sweep is dead work in gradient-only mode.
         let rho = &mut scratch.rho;
         let tau = &mut scratch.tau;
-        rho.fill(0.0);
-        tau.fill(0.0);
         for u in 1..r {
             rho[u] = eval_coeff4_at(&g_jet.first[u], z_obs);
-            tau[u] = eval_coeff4_at(&g_jet.a_first[u], z_obs);
+        }
+        if need_hessian {
+            for u in 1..r {
+                tau[u] = eval_coeff4_at(&g_jet.a_first[u], z_obs);
+            }
         }
 
         let eta_u = &mut scratch.grad;

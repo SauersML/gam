@@ -796,7 +796,6 @@ pub(super) struct BernoulliMarginalSlopeFlexRowScratch {
     pub(super) a_uv: Array2<f64>,
     pub(super) rho: Array1<f64>,
     pub(super) tau: Array1<f64>,
-    pub(super) du: Array1<f64>,
     pub(super) grad: Array1<f64>,
     pub(super) hess: Array2<f64>,
     // Per-row [f64; 4] coefficient buffers used by the flex analytic path. Owned
@@ -827,7 +826,6 @@ impl BernoulliMarginalSlopeFlexRowScratch {
             a_uv: Array2::zeros((primary_dim, primary_dim)),
             rho: Array1::zeros(primary_dim),
             tau: Array1::zeros(primary_dim),
-            du: Array1::zeros(primary_dim),
             grad: Array1::zeros(primary_dim),
             hess: Array2::zeros((primary_dim, primary_dim)),
             coeff_u: vec![[0.0; 4]; primary_dim],
@@ -846,7 +844,6 @@ impl BernoulliMarginalSlopeFlexRowScratch {
         self.a_u.fill(0.0);
         self.rho.fill(0.0);
         self.tau.fill(0.0);
-        self.du.fill(0.0);
         self.grad.fill(0.0);
         if need_hessian {
             self.m_au.fill(0.0);
