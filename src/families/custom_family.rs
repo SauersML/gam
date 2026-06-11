@@ -31687,7 +31687,11 @@ mod tests {
         let rho = array![0.15, -0.25];
         let result =
             outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None);
-        eprintln!("bug979_diag hard-case result: {result:?}");
+        let result_summary = result
+            .as_ref()
+            .map(|(obj, grad, _warm)| (*obj, grad.len()))
+            .map_err(|err| err.as_str());
+        eprintln!("bug979_diag hard-case result: {result_summary:?}");
 
         let y2 = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
         let (family2, specs2, penalty_counts2, options2) =
@@ -31695,7 +31699,11 @@ mod tests {
         let rho2 = array![0.0, 0.0];
         let result2 =
             outerobjective_andgradient(&family2, &specs2, &options2, &penalty_counts2, &rho2, None);
-        eprintln!("bug979_diag base-case result: {result2:?}");
+        let result2_summary = result2
+            .as_ref()
+            .map(|(obj, grad, _warm)| (*obj, grad.len()))
+            .map_err(|err| err.as_str());
+        eprintln!("bug979_diag base-case result: {result2_summary:?}");
     }
 
     #[test]
