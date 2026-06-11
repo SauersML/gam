@@ -45,14 +45,8 @@
 //! Related: see the sibling `nonnegative(x)` active-set KKT-abort ticket filed
 //! in the same run (its test also cannot build until this compiles).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 const N: usize = 600;
 
@@ -111,7 +105,7 @@ fn negative_binomial_smooth_recovers_true_mean_surface() {
     let pred = dir.join("nb_pred.csv");
     write_training_csv(&train);
 
-    let fit = Command::new(gam_binary())
+    let fit = Command::new(gam::gam_binary!())
         .arg("fit")
         .arg(&train)
         .arg("y ~ smooth(x)")
@@ -126,7 +120,7 @@ fn negative_binomial_smooth_recovers_true_mean_surface() {
         String::from_utf8_lossy(&fit.stderr)
     );
 
-    let predict = Command::new(gam_binary())
+    let predict = Command::new(gam::gam_binary!())
         .arg("predict")
         .arg(&model)
         .arg(&train)

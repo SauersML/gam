@@ -65,12 +65,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
-
 const N: usize = 400;
 
 /// Deterministic low-discrepancy training data: `x_i = frac((i+1)·φ)`,
@@ -131,7 +125,7 @@ fn try_fit(dir: &Path, label: &str, formula: &str) -> (bool, PathBuf, String) {
     let train = dir.join("train.csv");
     let model = dir.join(format!("model_{label}.json"));
     write_training_csv(&train);
-    let out = Command::new(gam_binary())
+    let out = Command::new(gam::gam_binary!())
         .arg("fit")
         .arg(&train)
         .arg(formula)
@@ -149,7 +143,7 @@ fn probe_slopes(dir: &Path, label: &str, model: &Path) -> (f64, f64) {
     let probe = dir.join("probe.csv");
     let out_csv = dir.join(format!("pred_{label}.csv"));
     write_probe_csv(&probe);
-    let status = Command::new(gam_binary())
+    let status = Command::new(gam::gam_binary!())
         .arg("predict")
         .arg(model)
         .arg(&probe)

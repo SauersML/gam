@@ -48,14 +48,8 @@
 //! passes once the `by=` column is added to the required-column set, with no
 //! edits.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 /// Per-level truth: `g="a"` follows `+sin(2πx)`, `g="b"` follows `-sin(2πx)`.
 fn truth(x: f64, level: &str) -> f64 {
@@ -125,7 +119,7 @@ fn by_factor_smooth_loads_its_by_column_and_recovers_per_level_curves() {
     // Fit the by-factor smooth straight from the CLI, with `g` referenced ONLY
     // through `by=g` (no redundant `+ g`). This is the exact documented syntax
     // (`s(x, by=g)`) used throughout the test suite.
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&train_path)
@@ -148,7 +142,7 @@ fn by_factor_smooth_loads_its_by_column_and_recovers_per_level_curves() {
     let probes: [(f64, &str); 2] = [(0.25, "a"), (0.25, "b")];
     write_predict_csv(&predict_path, &probes);
 
-    let mut predict_cmd = Command::new(gam_binary());
+    let mut predict_cmd = Command::new(gam::gam_binary!());
     predict_cmd
         .arg("predict")
         .arg(&model_path)
