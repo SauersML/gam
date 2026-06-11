@@ -110,6 +110,141 @@ pub fn gaussian_linear_bartlett_factor(q: f64, residual_df: f64) -> Option<f64> 
     Some(1.0 + (q + 1.0) / (2.0 * residual_df))
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Penalized-null cumulant assembly from the #932 derivative towers (issue #939)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Per-row log-likelihood derivatives in the row's linear-predictor `η`, for a
+/// single-predictor (`K = 1`) GLM-type family: `ℓ'ᵢ, ℓ''ᵢ, ℓ'''ᵢ, ℓ''''ᵢ`.
+///
+/// These are exactly the diagonal channels of the `K = 1` #932 row tower
+/// ([`crate::families::jet_tower::Tower4`]): the tower carries the row *negative*
+/// log-likelihood, so `ℓ⁽ᵏ⁾ᵢ = −towerᵢ.derivative_k`. [`row_derivs_from_nll_tower`]
+/// performs that sign flip; constructing this struct directly lets callers feed
+/// closed-form derivatives (e.g. the Gaussian fixture) without a tower.
+#[derive(Debug, Clone, Copy)]
+pub struct RowLogLikDerivs {
+    /// `ℓ'ᵢ = ∂ℓᵢ/∂ηᵢ` (the score contribution).
+    pub d1: f64,
+    /// `ℓ''ᵢ = ∂²ℓᵢ/∂ηᵢ²` (≤ 0 for a concave row likelihood).
+    pub d2: f64,
+    /// `ℓ'''ᵢ`.
+    pub d3: f64,
+    /// `ℓ''''ᵢ`.
+    pub d4: f64,
+}
+
+/// Flip the sign of a `K = 1` NLL row tower's `(g, h, t3, t4)` diagonal channels
+/// into log-likelihood derivatives. The tower stores the *negative* log
+/// likelihood, so `ℓ⁽ᵏ⁾ = −tower⁽ᵏ⁾`.
+pub fn row_derivs_from_nll_tower(
+    value_grad: f64,
+    hess: f64,
+    third: f64,
+    fourth: f64,
+) -> RowLogLikDerivs {
+    RowLogLikDerivs {
+        d1: -value_grad,
+        d2: -hess,
+        d3: -third,
+        d4: -fourth,
+    }
+}
+
+/// The exact cumulant arrays the Bartlett/Skovgaard expansions consume, over a
+/// tested coefficient block `Z` (the `n × q` design columns of the term under
+/// test). For a GLM-type log-likelihood `ℓ = Σᵢ ℓᵢ(ηᵢ)` with `ηᵢ = xᵢᵀβ`, the
+/// derivatives w.r.t. the block coefficients factor through `ηᵢ` by the chain
+/// rule, so every cumulant array is a row sum of the per-row `η`-derivative
+/// times an outer product of `Z`-rows:
+///
+/// ```text
+/// info_{ab}     =  −Σᵢ ℓ''ᵢ · Z_{ia} Z_{ib}          (observed/expected Fisher info)
+/// nu3_{abc}     =   Σᵢ ℓ'''ᵢ · Z_{ia} Z_{ib} Z_{ic}
+/// nu4_{abcd}    =   Σᵢ ℓ''''ᵢ · Z_{ia} Z_{ib} Z_{ic} Z_{id}
+/// ```
+///
+/// These are exact (the per-row `ℓ⁽ᵏ⁾` come from the #932 tower) and fully
+/// symmetric in their indices by construction. They are stored flattened in
+/// row-major order (`nu3` length `q³`, `nu4` length `q⁴`) so the consuming
+/// contraction can stride them without re-deriving the symmetry.
+#[derive(Debug, Clone)]
+pub struct CumulantArrays {
+    /// Block dimension `q`.
+    pub q: usize,
+    /// Fisher information block `info_{ab}` (`q × q`, row-major).
+    pub info: Vec<f64>,
+    /// Third cumulant array `nu3_{abc}` (`q³`, row-major).
+    pub nu3: Vec<f64>,
+    /// Fourth cumulant array `nu4_{abcd}` (`q⁴`, row-major).
+    pub nu4: Vec<f64>,
+}
+
+impl CumulantArrays {
+    #[inline]
+    pub fn info(&self, a: usize, b: usize) -> f64 {
+        self.info[a * self.q + b]
+    }
+    #[inline]
+    pub fn nu3(&self, a: usize, b: usize, c: usize) -> f64 {
+        self.nu3[(a * self.q + b) * self.q + c]
+    }
+    #[inline]
+    pub fn nu4(&self, a: usize, b: usize, c: usize, d: usize) -> f64 {
+        self.nu4[((a * self.q + b) * self.q + c) * self.q + d]
+    }
+}
+
+/// Assemble [`CumulantArrays`] over a tested block.
+///
+/// * `block` — the `n × q` tested design columns `Z`, as `n` row slices each of
+///   length `q` (row-major rows). This is the block the smooth-term test
+///   targets, in the coordinates the per-row derivatives are taken in.
+/// * `rows` — the per-row log-likelihood `η`-derivatives (length `n`), from the
+///   #932 tower via [`row_derivs_from_nll_tower`] or a family closed form.
+///
+/// Returns `None` on a dimension mismatch, an empty block, or a non-finite
+/// entry. The work is `O(n · q⁴)` and embarrassingly parallel in the rows.
+pub fn assemble_cumulants(block: &[&[f64]], rows: &[RowLogLikDerivs]) -> Option<CumulantArrays> {
+    let n = rows.len();
+    if n == 0 || block.len() != n {
+        return None;
+    }
+    let q = block[0].len();
+    if q == 0 || block.iter().any(|r| r.len() != q) {
+        return None;
+    }
+    let mut info = vec![0.0_f64; q * q];
+    let mut nu3 = vec![0.0_f64; q * q * q];
+    let mut nu4 = vec![0.0_f64; q * q * q * q];
+    for (z, d) in block.iter().zip(rows.iter()) {
+        if !(d.d1.is_finite() && d.d2.is_finite() && d.d3.is_finite() && d.d4.is_finite()) {
+            return None;
+        }
+        if z.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        for a in 0..q {
+            let za = z[a];
+            for b in 0..q {
+                let zab = za * z[b];
+                info[a * q + b] -= d.d2 * zab;
+                for c in 0..q {
+                    let zabc = zab * z[c];
+                    nu3[(a * q + b) * q + c] += d.d3 * zabc;
+                    for e in 0..q {
+                        nu4[((a * q + b) * q + c) * q + e] += d.d4 * zabc * z[e];
+                    }
+                }
+            }
+        }
+    }
+    if info.iter().chain(nu3.iter()).chain(nu4.iter()).any(|v| !v.is_finite()) {
+        return None;
+    }
+    Some(CumulantArrays { q, info, nu3, nu4 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
