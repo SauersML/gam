@@ -176,16 +176,20 @@ impl BasisHessianLipschitz for TorusHarmonicEvaluator {
     /// per-axis derivative magnitudes. A per-column sup is therefore bounded by
     /// the top single-axis frequency to the `g`-th power times the number of
     /// such routings (`latent_dim^g`, the count of operator-to-axis maps).
-    fn value_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn value_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         1.0
     }
-    fn jacobian_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn jacobian_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         torus_jet_sup(self.num_harmonics, self.latent_dim, 1)
     }
-    fn hessian_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn hessian_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         torus_jet_sup(self.num_harmonics, self.latent_dim, 2)
     }
-    fn third_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn third_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         torus_jet_sup(self.num_harmonics, self.latent_dim, 3)
     }
 }
@@ -211,16 +215,20 @@ impl BasisHessianLipschitz for SphereChartEvaluator {
     /// = (2+2)^g = 4^g` (using `‖∂^i u‖ ≤ 2^i`, `|u| ≤ 1`). The bilinear columns
     /// dominate, so the per-column sup is `4^g` (`g ≥ 1`). Bounds are global
     /// constants — the chart box `lat ∈ [-π/2, π/2]` does not enlarge them.
-    fn value_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn value_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         1.0
     }
-    fn jacobian_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn jacobian_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         4.0
     }
-    fn hessian_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn hessian_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         16.0
     }
-    fn third_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn third_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         64.0
     }
 }
@@ -233,13 +241,16 @@ impl BasisHessianLipschitz for AffineCoordinateEvaluator {
         let center_norm = chart.center.dot(&chart.center).sqrt();
         1.0 + center_norm + chart.radius
     }
-    fn jacobian_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn jacobian_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         1.0
     }
-    fn hessian_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn hessian_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         0.0
     }
-    fn third_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn third_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         0.0
     }
 }
