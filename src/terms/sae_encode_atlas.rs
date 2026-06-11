@@ -1016,16 +1016,42 @@ impl EncodeAtlas {
     }
 }
 
-/// `β = 1/λ_min(H_tt)` at a chart center, using the encode Gauss-Newton Hessian
-/// with the chart center as the coordinate and a zero residual (the offline
-/// `β` bounds the curvature; the residual term is dropped in Gauss-Newton). The
-/// target is irrelevant to `H_tt = J_mᵀ J_m`, so any `x` gives the same `H`; we
-/// pass zeros.
+/// Offline `β = 1/λ_min(H_GN)` at a chart center from the Gauss-Newton block
+/// `H_GN = J_mᵀ J_m` (residual-free). The offline `β` bounds the curvature the
+/// online certificate sees: charts are placed where the encode lands, so the
+/// representative residual is small and `H_GN` is the dominant, residual-free
+/// curvature estimate. (The online per-row certificate still uses the FULL
+/// Hessian; this is only the offline radius-sizing curvature.) Returns `None`
+/// for a degenerate center (`λ_min ≤ 0`), which marks an uncertifiable chart.
 fn center_beta(atom: &SaeManifoldAtom, center: &Array1<f64>, ridge: f64) -> Option<f64> {
     let evaluator = atom.basis_evaluator.as_ref()?.clone();
+    let d = atom.latent_dim;
     let p = atom.output_dim();
-    let x = Array1::<f64>::zeros(p);
-    let (_g, h) = encode_grad_hess(atom, evaluator.as_ref(), center.view(), x.view(), 1.0, ridge).ok()?;
+    let m = atom.basis_size();
+    let coords = center.view().to_shape((1, d)).ok()?.to_owned();
+    let (_phi, jet) = evaluator.evaluate(coords.view()).ok()?;
+    let decoder = &atom.decoder_coefficients;
+    // J_m[axis] = Bᵀ (∂Φ/∂t_axis) ∈ ℝᵖ (amplitude-1; curvature scales with z²
+    // and is absorbed conservatively by the amplitude-bounded Lipschitz term).
+    let mut jm = Array2::<f64>::zeros((d, p));
+    for axis in 0..d {
+        for basis_col in 0..m {
+            let dphi = jet[[0, basis_col, axis]];
+            if dphi == 0.0 {
+                continue;
+            }
+            for out in 0..p {
+                jm[[axis, out]] += dphi * decoder[[basis_col, out]];
+            }
+        }
+    }
+    let mut h = Array2::<f64>::zeros((d, d));
+    for a in 0..d {
+        for b in 0..d {
+            h[[a, b]] = jm.row(a).dot(&jm.row(b));
+        }
+        h[[a, a]] += ridge;
+    }
     let (vals, _vecs) = h.eigh(Side::Lower).ok()?;
     let lambda_min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
     if lambda_min.is_finite() && lambda_min > 0.0 {
