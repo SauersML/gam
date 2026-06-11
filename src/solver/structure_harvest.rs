@@ -811,11 +811,11 @@ pub fn run_structure_search_rounds(
                 // Refit the restructured candidate on the estimation rows only.
                 Ok(candidate_fit(cand_term, cand_rho, &estimation_rows))
             },
-            |state: &State, shard: &&RowBlockShard| eval_log_lik(&state.0, shard),
-            |state: &State, shard: &&RowBlockShard| eval_log_lik(&state.0, shard),
+            |state: &State, shard: &RowBlockShard| eval_log_lik(&state.0, shard),
+            |state: &State, shard: &RowBlockShard| eval_log_lik(&state.0, shard),
             // No-op fold: the candidate is the fixed predictable plug-in across
             // the held-out stream.
-            |state: State, _shard: &&RowBlockShard| state,
+            |state: State, _: &RowBlockShard| state,
         )?;
 
         let (next_term, next_rho) = outcome.state;
