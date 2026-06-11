@@ -94,7 +94,7 @@ pub use geometry::{
 pub use gpu::GpuPolicy;
 pub use inference::{
     alo, conformal, data, generative, higher_order, hmc, model_comparison, polya_gamma, predict,
-    probability, psis, quadrature, sample, smooth_test,
+    probability, psis, quadrature, rho_posterior, sample, smooth_test,
 };
 pub use linalg::{faer_ndarray, matrix, utils};
 // #931-#935 criterion calculus: the profiled-criterion abstraction
