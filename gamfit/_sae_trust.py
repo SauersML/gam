@@ -17,17 +17,8 @@ _ATOM_DIAGNOSTIC_KEYS = (
     "sigma_min_tangent",
     "sigma_max_tangent",
     "tangent_condition_score",
-    "mean_neighbor_coherence",
-    "coherence_score",
-    "topology_evidence_margin",
-    "topology_margin_score",
     "coverage",
     "activation_frequency",
-    "coverage_score",
-    "typed_reconstruction_mse",
-    "level0_reference_mse",
-    "level0_residual_ratio",
-    "level0_score",
     "untyped",
     "active_token_count",
 )
@@ -42,24 +33,28 @@ def coerce_sae_trust_diagnostics(
     ----------
     payload
         Fit payload or serialized ``ManifoldSAE`` dictionary containing a
-        ``diagnostics`` mapping with ``atom_trust``, ``atoms``, and
-        ``level0_test`` fields.
+        ``diagnostics`` mapping with ``atom_trust`` and ``atoms`` fields.
 
     Returns
     -------
     dict
-        ``{"atom_trust", "atoms", "level0_test"}`` where ``atom_trust`` is a
+        ``{"atom_trust", "atoms"}`` where ``atom_trust`` is a
         1D ``float`` array and each atom record contains the full normalized
         trust diagnostic schema.
     """
     if "diagnostics" not in payload:
-        # The Rust runtime does not (yet) emit the trust-diagnostic block —
-        # no released pyffi ever has. A missing optional diagnostic must not
-        # brick the primary fit API; return the explicit empty block, and the
-        # per-atom accessors raise with a precise message on use instead.
-        return {"atom_trust": np.zeros(0, dtype=float), "atoms": [], "level0_test": None}
+        raise ValueError("SAE trust diagnostics payload is missing the diagnostics block")
 
     diagnostics = dict(payload["diagnostics"])
+    expected_top_level = {"atom_trust", "atoms"}
+    observed_top_level = set(diagnostics)
+    if observed_top_level != expected_top_level:
+        missing = sorted(expected_top_level - observed_top_level)
+        extra = sorted(observed_top_level - expected_top_level)
+        raise ValueError(
+            "SAE trust diagnostics top-level keys mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
     atoms = [dict(atom) for atom in diagnostics["atoms"]]
     trust = np.asarray(diagnostics["atom_trust"], dtype=float)
     if trust.ndim != 1:
@@ -74,9 +69,11 @@ def coerce_sae_trust_diagnostics(
     normalized_atoms: list[dict[str, Any]] = []
     for atom_idx, atom in enumerate(atoms):
         missing = [key for key in _ATOM_DIAGNOSTIC_KEYS if key not in atom]
-        if missing:
+        extra = [key for key in atom if key not in _ATOM_DIAGNOSTIC_KEYS]
+        if missing or extra:
             raise ValueError(
-                f"SAE trust diagnostics atom {atom_idx} is missing keys: {missing}"
+                "SAE trust diagnostics atom "
+                f"{atom_idx} keys mismatch: missing={missing}, extra={extra}"
             )
         normalized = {key: atom[key] for key in _ATOM_DIAGNOSTIC_KEYS}
         normalized["trust_score"] = float(normalized["trust_score"])
@@ -85,38 +82,16 @@ def coerce_sae_trust_diagnostics(
         normalized["tangent_condition_score"] = float(
             normalized["tangent_condition_score"]
         )
-        normalized["mean_neighbor_coherence"] = float(
-            normalized["mean_neighbor_coherence"]
-        )
-        normalized["coherence_score"] = float(normalized["coherence_score"])
-        normalized["topology_evidence_margin"] = float(
-            normalized["topology_evidence_margin"]
-        )
-        normalized["topology_margin_score"] = float(
-            normalized["topology_margin_score"]
-        )
         normalized["coverage"] = float(normalized["coverage"])
         normalized["activation_frequency"] = float(
             normalized["activation_frequency"]
         )
-        normalized["coverage_score"] = float(normalized["coverage_score"])
-        normalized["typed_reconstruction_mse"] = float(
-            normalized["typed_reconstruction_mse"]
-        )
-        normalized["level0_reference_mse"] = float(
-            normalized["level0_reference_mse"]
-        )
-        normalized["level0_residual_ratio"] = float(
-            normalized["level0_residual_ratio"]
-        )
-        normalized["level0_score"] = float(normalized["level0_score"])
         normalized["untyped"] = bool(normalized["untyped"])
         normalized["active_token_count"] = int(normalized["active_token_count"])
         normalized_atoms.append(normalized)
     return {
         "atom_trust": trust.copy(),
         "atoms": normalized_atoms,
-        "level0_test": str(diagnostics["level0_test"]),
     }
 
 

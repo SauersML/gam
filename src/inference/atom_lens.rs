@@ -60,7 +60,7 @@ use crate::terms::sae_manifold::SaeManifoldTerm;
 /// where the atom is essentially off (numerical dust) from the per-atom
 /// averages, so a globally-near-zero atom does not get a spuriously large
 /// amplitude-per-active-row.
-const ACTIVE_MASS_FLOOR: f64 = 1e-6;
+pub const SAE_TRUST_ACTIVE_MASS_FLOOR: f64 = 1e-6;
 
 /// One atom's lens entry.
 #[derive(Clone, Debug, PartialEq)]
@@ -210,7 +210,7 @@ pub fn atom_two_lens(model: &SaeManifoldTerm, metric: &RowMetric) -> AtomTwoLens
 
         for row in 0..n {
             let mass = assignments[[row, atom_idx]];
-            if !(mass > ACTIVE_MASS_FLOOR) {
+            if !(mass > SAE_TRUST_ACTIVE_MASS_FLOOR) {
                 continue;
             }
             active_mass_sum += mass;

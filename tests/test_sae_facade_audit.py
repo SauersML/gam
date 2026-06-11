@@ -189,23 +189,13 @@ def _diagnostics(n_atoms: int, trust: list[float] | None = None) -> dict[str, ob
                 "sigma_min_tangent": 1.0,
                 "sigma_max_tangent": 1.0,
                 "tangent_condition_score": 1.0,
-                "mean_neighbor_coherence": 0.0,
-                "coherence_score": 1.0,
-                "topology_evidence_margin": 0.0,
-                "topology_margin_score": 0.5,
                 "coverage": 1.0,
                 "activation_frequency": 1.0,
-                "coverage_score": 1.0,
-                "typed_reconstruction_mse": 0.0,
-                "level0_reference_mse": 0.0,
-                "level0_residual_ratio": 1.0,
-                "level0_score": 1.0,
                 "untyped": False,
                 "active_token_count": 1,
             }
             for k in range(n_atoms)
         ],
-        "level0_test": "local_pca_active_token_reference",
     }
 
 
@@ -308,7 +298,60 @@ def test_trust_diagnostics_normalize_and_round_trip():
     np.testing.assert_allclose(gamfit.atom_trust_scores(normalized), [0.25, 0.75])
     assert normalized["atoms"][0]["trust_score"] == pytest.approx(0.25)
     assert normalized["atoms"][1]["trust_score"] == pytest.approx(0.75)
-    assert normalized["level0_test"] == "local_pca_active_token_reference"
+    assert set(normalized) == {"atom_trust", "atoms"}
+    deleted = {
+        "mean_neighbor_coherence",
+        "coherence_score",
+        "topology_evidence_margin",
+        "topology_margin_score",
+        "coverage_score",
+        "typed_reconstruction_mse",
+        "level0_reference_mse",
+        "level0_residual_ratio",
+        "level0_score",
+    }
+    assert deleted.isdisjoint(normalized["atoms"][0])
+    stale = _diagnostics(1)
+    stale["atoms"][0]["level0_score"] = 1.0
+    with pytest.raises(ValueError, match="extra=\\['level0_score'\\]"):
+        gamfit.sae_trust_diagnostics({"diagnostics": stale})
+
+
+def test_small_sae_fit_trust_diagnostics_round_trip_new_schema():
+    x = np.random.default_rng(1005).normal(size=(10, 3))
+    fit = sae.sae_manifold_fit(
+        X=x,
+        K=1,
+        d_atom=1,
+        atom_basis="periodic",
+        assignment="softmax",
+        n_iter=1,
+        random_state=0,
+        isometry_weight=0.0,
+        ard_per_atom=False,
+        gate_sparsity="l1",
+        nuclear_norm_weight=0.0,
+        decoder_incoherence_weight=0.0,
+    )
+    expected_atom_keys = {
+        "trust_score",
+        "sigma_min_tangent",
+        "sigma_max_tangent",
+        "tangent_condition_score",
+        "coverage",
+        "activation_frequency",
+        "untyped",
+        "active_token_count",
+    }
+    assert set(fit.diagnostics) == {"atom_trust", "atoms"}
+    assert set(fit.diagnostics["atoms"][0]) == expected_atom_keys
+    restored = sae.ManifoldSAE.from_dict(fit.to_dict())
+    assert set(restored.diagnostics) == {"atom_trust", "atoms"}
+    assert set(restored.diagnostics["atoms"][0]) == expected_atom_keys
+    np.testing.assert_allclose(
+        gamfit.atom_trust_scores(restored.diagnostics),
+        gamfit.atom_trust_scores(fit.diagnostics),
+    )
 
 
 def test_research_trust_scores_are_assignment_weighted():

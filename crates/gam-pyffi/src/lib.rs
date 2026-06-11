@@ -9713,6 +9713,9 @@ fn sae_manifold_fit_inner<'py>(
             }
         }
     }
+    let trust_diagnostics = term
+        .trust_diagnostics_report(assignments.view())
+        .map_err(py_value_error)?;
     let log_ard_py = PyList::empty(py);
     for atom_log_ard in &rho.log_ard {
         log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;
@@ -9779,6 +9782,10 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
     out.set_item("log_ard", log_ard_py)?;
     out.set_item("assignment_prior", assignment_kind)?;
+    out.set_item(
+        "diagnostics",
+        sae_trust_diagnostics_dict(py, &trust_diagnostics)?,
+    )?;
     // Gaussian reconstruction scale φ̂ used to scale every per-atom decoder
     // covariance (Cov(β_k) = φ̂·S_β⁻¹[block]).
     out.set_item("dispersion", shape_uncertainty.dispersion)?;
@@ -9821,6 +9828,33 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("chosen_k", k_atoms)?;
     out.set_item("oos_projection_top1", top_k == Some(1))?;
     Ok(out.unbind())
+}
+
+/// Build the result-dict entry for the honest SAE trust diagnostics (#1005).
+fn sae_trust_diagnostics_dict<'py>(
+    py: Python<'py>,
+    report: &gam::terms::sae_manifold::SaeTrustDiagnostics,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    let atoms = PyList::empty(py);
+    for atom in &report.atoms {
+        let atom_dict = PyDict::new(py);
+        atom_dict.set_item("trust_score", atom.trust_score)?;
+        atom_dict.set_item("sigma_min_tangent", atom.sigma_min_tangent)?;
+        atom_dict.set_item("sigma_max_tangent", atom.sigma_max_tangent)?;
+        atom_dict.set_item("tangent_condition_score", atom.tangent_condition_score)?;
+        atom_dict.set_item("coverage", atom.coverage)?;
+        atom_dict.set_item("activation_frequency", atom.activation_frequency)?;
+        atom_dict.set_item("untyped", atom.untyped)?;
+        atom_dict.set_item("active_token_count", atom.active_token_count)?;
+        atoms.append(atom_dict)?;
+    }
+    d.set_item(
+        "atom_trust",
+        Array1::from_vec(report.atom_trust.clone()).into_pyarray(py),
+    )?;
+    d.set_item("atoms", atoms)?;
+    Ok(d)
 }
 
 /// Build the result-dict entry for the two-score per-atom lens

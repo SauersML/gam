@@ -149,23 +149,13 @@ class _CapturingRustModule:
                         "sigma_min_tangent": 1.0,
                         "sigma_max_tangent": 1.0,
                         "tangent_condition_score": 1.0,
-                        "mean_neighbor_coherence": 0.0,
-                        "coherence_score": 1.0,
-                        "topology_evidence_margin": 0.0,
-                        "topology_margin_score": 0.5,
                         "coverage": 1.0,
                         "activation_frequency": 1.0,
-                        "coverage_score": 1.0,
-                        "typed_reconstruction_mse": 0.0,
-                        "level0_reference_mse": 0.0,
-                        "level0_residual_ratio": 1.0,
-                        "level0_score": 1.0,
                         "untyped": False,
                         "active_token_count": n,
                     }
                     for _ in range(k_atoms)
                 ],
-                "level0_test": "local_pca_active_token_reference",
             },
         }
 

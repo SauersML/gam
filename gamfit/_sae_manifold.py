@@ -547,8 +547,7 @@ class ManifoldSAE:
         trust = np.asarray(self.diagnostics["atom_trust"], dtype=float)
         if trust.size == 0:
             raise ValueError(
-                "this fit payload carries no trust diagnostics (the Rust runtime "
-                "did not emit them); atom_trust is unavailable"
+                "this fit payload carries empty trust diagnostics; atom_trust is unavailable"
             )
         return float(trust[k])
 
@@ -557,8 +556,7 @@ class ManifoldSAE:
         k = self._atom_index(atom)
         if not self.diagnostics["atoms"]:
             raise ValueError(
-                "this fit payload carries no trust diagnostics (the Rust runtime "
-                "did not emit them); atom_diagnostics is unavailable"
+                "this fit payload carries empty trust diagnostics; atom_diagnostics is unavailable"
             )
         return dict(self.diagnostics["atoms"][k])
 
@@ -983,7 +981,6 @@ class ManifoldSAE:
             "diagnostics": {
                 "atom_trust": np.asarray(self.diagnostics["atom_trust"], dtype=float).tolist(),
                 "atoms": [dict(atom) for atom in self.diagnostics["atoms"]],
-                "level0_test": str(self.diagnostics["level0_test"]),
             },
             "coords": [c.tolist() for c in self.coords],
             "decoder_blocks": [b.tolist() for b in self.decoder_blocks],
