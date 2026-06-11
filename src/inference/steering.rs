@@ -321,7 +321,9 @@ pub fn predicted_response(
 fn metric_carries_behavior(p: MetricProvenance) -> bool {
     match p {
         MetricProvenance::Euclidean => false,
-        MetricProvenance::OutputFisher { .. } | MetricProvenance::WhitenedStructured { .. } => true,
+        MetricProvenance::OutputFisher { .. }
+        | MetricProvenance::OutputFisherDownstream { .. }
+        | MetricProvenance::WhitenedStructured { .. } => true,
     }
 }
 

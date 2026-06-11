@@ -74,6 +74,26 @@ pub enum MetricProvenance {
     /// factors. The `rank` is carried in the provenance so a consumer (Object 4)
     /// can certify the factor rank that produced the inner product.
     OutputFisher { rank: usize },
+    /// `M_n = U_n U_nᵀ` from per-row output-Fisher factors that aggregate the
+    /// **downstream** influence of position `n` over future positions through
+    /// the KV path, rather than the same-position logits of
+    /// [`MetricProvenance::OutputFisher`] (#980, mechanism 2).
+    ///
+    /// The same-position pullback `∂logits_t/∂x_t` can be ≈ 0 for a feature
+    /// whose entire causal effect lands many tokens later (information carried
+    /// forward through attention); a gauge built on it is blind to exactly that
+    /// content. This provenance is the forward-looking alternative: each row's
+    /// factor `U_n` is the top-`rank` factorization of the aggregated output
+    /// Fisher `Σ_{t ≥ n} (∂logits_t/∂x_n)ᵀ F_t (∂logits_t/∂x_n)` over future
+    /// positions the residual stream at `n` reaches. It is provenance-generic:
+    /// it whitens nothing ([`Self::whitens_likelihood`] is `false`, like
+    /// [`MetricProvenance::OutputFisher`]) and drives the gauge / lens /
+    /// enrichment unchanged ([`Self::is_output_fisher_like`]). The lens/gauge
+    /// machinery consumes it identically; only the *scientific* reading
+    /// changes — dormant-feature detection becomes forward-looking (a feature
+    /// driving far-future tokens now registers behavioral coupling that the
+    /// same-position metric reported as ≈ 0).
+    OutputFisherDownstream { rank: usize },
     /// Structured-residual whitening: `M_n = Σ_n^{-1}` from the **estimated**
     /// factor-analytic residual covariance `Σ_n = Λ c(z_n) Λᵀ + D` (#974), with
     /// `factor_rank` the selected factor count. Produced by
@@ -150,6 +170,29 @@ impl RowMetric {
     /// the validation path is shared. No solver floor (`δ = 0`).
     pub fn output_fisher(u: Arc<Array2<f64>>, p: usize, rank: usize) -> Result<Self, String> {
         Self::from_factors(MetricProvenance::OutputFisher { rank }, u, p, rank, 0.0)
+    }
+
+    /// Downstream-influence output-Fisher metric: per-row factors `U_n ∈
+    /// ℝ^{p × rank}` whose `M_n = U_n U_nᵀ` is the aggregated output Fisher of
+    /// position `n` over the **future** positions it reaches through the KV path
+    /// ([`MetricProvenance::OutputFisherDownstream`], #980 mechanism 2). The
+    /// factor layout is identical to [`Self::output_fisher`]; only the
+    /// provenance tag (and hence the scientific reading) differs. Whitens
+    /// nothing, drives the gauge / lens / enrichment exactly as the
+    /// same-position metric does — the consuming machinery is provenance-generic
+    /// (see [`Self::is_output_fisher_like`]).
+    pub fn output_fisher_downstream(
+        u: Arc<Array2<f64>>,
+        p: usize,
+        rank: usize,
+    ) -> Result<Self, String> {
+        Self::from_factors(
+            MetricProvenance::OutputFisherDownstream { rank },
+            u,
+            p,
+            rank,
+            0.0,
+        )
     }
 
     /// Like [`Self::output_fisher`] but with a **solver-only** Tikhonov floor
@@ -312,6 +355,22 @@ impl RowMetric {
     /// pullback to the bare `J_nᵀ J_n`, so it does not drive the gauge.
     pub fn drives_gauge(&self) -> bool {
         !matches!(self.provenance, MetricProvenance::Euclidean)
+    }
+
+    /// Whether this metric is an **output-Fisher gauge** — either the
+    /// same-position [`MetricProvenance::OutputFisher`] or the downstream
+    /// [`MetricProvenance::OutputFisherDownstream`] (#980). The two share every
+    /// consumer behavior (Sym(F) separation under the gauge, two-lens coupling,
+    /// steering geometry, enrichment); they differ only in the *scientific*
+    /// reading of what behavioral coupling means (same-position vs
+    /// forward-looking). Consumers that gate on "is this an output-Fisher
+    /// pullback" should use this predicate rather than matching one variant, so
+    /// the downstream metric rides the identical path.
+    pub fn is_output_fisher_like(&self) -> bool {
+        matches!(
+            self.provenance,
+            MetricProvenance::OutputFisher { .. } | MetricProvenance::OutputFisherDownstream { .. }
+        )
     }
 
     /// Number of rows the metric is defined over.
