@@ -36,9 +36,8 @@
 //! (`[-0.8, 0.8]²` ⊂ training `[-1, 1]²`) so the unrelated predict-time input
 //! clamp (`FittedModel::axis_clip_to_training_ranges`) never fires.
 
-use gam::test_support::cli_harness::run_or_panic;
+use gam::test_support::cli_harness::{fit_then_predict_gaussian, write_predict_csv_rows};
 use std::path::Path;
-use std::process::Command;
 
 const NOISE_SD: f64 = 0.05;
 // Training covariates span [-1, 1]²; the prediction grid stays within
@@ -103,41 +102,6 @@ fn write_training_csv(path: &Path, n: usize) {
     writer.flush().expect("flush training csv");
 }
 
-/// Write the prediction CSV at fresh `(x, z)` points. `y` is a placeholder the
-/// predict path ignores; the schema just needs the column.
-fn write_predict_csv(path: &Path, grid: &[(f64, f64)]) {
-    let mut writer = csv::Writer::from_path(path).expect("create predict csv");
-    writer.write_record(["x", "z", "y"]).expect("write header");
-    for &(x, z) in grid {
-        writer
-            .write_record([format!("{x:.12}"), format!("{z:.12}"), "0.0".to_string()])
-            .expect("write predict row");
-    }
-    writer.flush().expect("flush predict csv");
-}
-
-/// Read the `mean` (or `linear_predictor`) column from a `gam predict --out` CSV.
-fn read_predictions(path: &Path) -> Vec<f64> {
-    let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
-    let headers = reader.headers().expect("predict csv headers").clone();
-    let mean_idx = headers
-        .iter()
-        .position(|h| h == "mean")
-        .or_else(|| headers.iter().position(|h| h == "linear_predictor"))
-        .unwrap_or_else(|| {
-            panic!("predict csv has neither `mean` nor `linear_predictor` column: {headers:?}")
-        });
-    reader
-        .records()
-        .map(|rec| {
-            let rec = rec.expect("predict csv row");
-            rec[mean_idx]
-                .parse::<f64>()
-                .unwrap_or_else(|_| panic!("non-numeric prediction: {:?}", &rec[mean_idx]))
-        })
-        .collect()
-}
-
 /// A regular `g × g` grid of `(x, z)` points over `[-GRID_HALF_RANGE, +]²`,
 /// strictly inside the training hull.
 fn fresh_grid(g: usize) -> Vec<(f64, f64)> {
@@ -168,31 +132,21 @@ fn predict_recovers_known_tensor_te_surface_on_a_fresh_grid() {
     write_training_csv(&train_path, 900);
 
     let grid = fresh_grid(11);
-    write_predict_csv(&predict_path, &grid);
+    // `y` is a placeholder (predict ignores it); the schema just needs the column.
+    write_predict_csv_rows(
+        &predict_path,
+        ["x", "z", "y"],
+        grid.iter()
+            .map(|&(x, z)| [format!("{x:.12}"), format!("{z:.12}"), "0.0".to_string()]),
+    );
 
-    // ---- fit: y ~ te(x, z) (Gaussian), save to disk ------------------------
-    let mut fit_cmd = Command::new(gam::gam_binary!());
-    fit_cmd
-        .arg("fit")
-        .arg(&train_path)
-        .arg("y ~ te(x, z, k=8)")
-        .args(["--family", "gaussian"])
-        .arg("--out")
-        .arg(&model_path);
-    run_or_panic(fit_cmd, "gam fit y ~ te(x, z, k=8) (gaussian)");
-    assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
-
-    // ---- reload + predict on the FRESH grid --------------------------------
-    let mut predict_cmd = Command::new(gam::gam_binary!());
-    predict_cmd
-        .arg("predict")
-        .arg(&model_path)
-        .arg(&predict_path)
-        .arg("--out")
-        .arg(&out_path);
-    run_or_panic(predict_cmd, "gam predict (tensor te grid)");
-
-    let preds = read_predictions(&out_path);
+    let preds = fit_then_predict_gaussian(
+        &train_path,
+        "y ~ te(x, z, k=8)",
+        &model_path,
+        &predict_path,
+        &out_path,
+    );
     assert_eq!(
         preds.len(),
         grid.len(),

@@ -31,7 +31,7 @@
 //!      regression that hardcodes `π/2` regardless of the `radians` flag).
 
 use std::f64::consts::PI;
-use gam::test_support::cli_harness::run_or_panic;
+use gam::test_support::cli_harness::{read_prediction_means, run_or_panic};
 use std::path::Path;
 use std::process::Command;
 
@@ -99,27 +99,6 @@ fn write_ring_csv(path: &Path, lat: f64, n_lon: usize, radians: bool) {
     writer.flush().expect("flush predict csv");
 }
 
-fn read_means(path: &Path) -> Vec<f64> {
-    let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
-    let headers = reader.headers().expect("predict csv headers").clone();
-    let mean_idx = headers
-        .iter()
-        .position(|h| h == "mean")
-        .or_else(|| headers.iter().position(|h| h == "linear_predictor"))
-        .unwrap_or_else(|| {
-            panic!("predict csv has neither `mean` nor `linear_predictor` column: {headers:?}")
-        });
-    reader
-        .records()
-        .map(|rec| {
-            let rec = rec.expect("predict csv row");
-            rec[mean_idx]
-                .parse::<f64>()
-                .unwrap_or_else(|_| panic!("non-numeric prediction: {:?}", &rec[mean_idx]))
-        })
-        .collect()
-}
-
 fn spread(values: &[f64]) -> f64 {
     let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -174,8 +153,8 @@ fn pole_and_equator_spread(radians: bool, pole_lat_rad: f64) -> (f64, f64) {
         run_or_panic(cmd, label);
     }
 
-    let pole = read_means(&pole_out);
-    let equator = read_means(&equator_out);
+    let pole = read_prediction_means(&pole_out);
+    let equator = read_prediction_means(&equator_out);
     assert!(
         pole.iter().all(|v| v.is_finite()) && equator.iter().all(|v| v.is_finite()),
         "predictions must be finite"

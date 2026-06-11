@@ -31,9 +31,8 @@
 //! canonical back-transform `M` (divide by `scale`), so the active set enforces
 //! `(1/scale)·β_int ≤ ub`, giving reported `β = β_int/scale ≤ ub`.
 
-use gam::test_support::cli_harness::run_or_panic;
+use gam::test_support::cli_harness::{fit_then_predict_gaussian, write_predict_csv_rows};
 use std::path::Path;
-use std::process::Command;
 
 const INTERCEPT: f64 = 2.0;
 const SLOPE: f64 = 5.0;
@@ -58,41 +57,6 @@ fn write_training_csv(path: &Path) {
     writer.flush().expect("flush training csv");
 }
 
-/// Two in-hull probes whose `x` gap is 1.0, so `pred(x1) - pred(x0)` is exactly
-/// the reported linear-term slope. `y` is a placeholder (predict ignores it).
-fn write_predict_csv(path: &Path) {
-    let mut writer = csv::Writer::from_path(path).expect("create predict csv");
-    writer.write_record(["x", "y"]).expect("write header");
-    for &x in &[0.0_f64, 1.0_f64] {
-        writer
-            .write_record([format!("{x:.12}"), "0.0".to_string()])
-            .expect("write predict row");
-    }
-    writer.flush().expect("flush predict csv");
-}
-
-/// Read the `mean` column from a `gam predict --out` CSV.
-fn read_predictions(path: &Path) -> Vec<f64> {
-    let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
-    let headers = reader.headers().expect("predict csv headers").clone();
-    let mean_idx = headers
-        .iter()
-        .position(|h| h == "mean")
-        .or_else(|| headers.iter().position(|h| h == "linear_predictor"))
-        .unwrap_or_else(|| {
-            panic!("predict csv has neither `mean` nor `linear_predictor` column: {headers:?}")
-        });
-    reader
-        .records()
-        .map(|rec| {
-            let rec = rec.expect("predict csv row");
-            rec[mean_idx]
-                .parse::<f64>()
-                .unwrap_or_else(|_| panic!("non-numeric prediction: {:?}", &rec[mean_idx]))
-        })
-        .collect()
-}
-
 /// Fit `y ~ <formula>` on the noise-free unstandardized line, predict at x∈{0,1},
 /// and return the reported linear-term slope `pred(1) - pred(0)`.
 fn reported_slope(dir: &Path, label: &str, formula: &str) -> f64 {
@@ -102,29 +66,18 @@ fn reported_slope(dir: &Path, label: &str, formula: &str) -> f64 {
     let out_path = dir.join(format!("pred_{label}.csv"));
 
     write_training_csv(&train_path);
-    write_predict_csv(&predict_path);
+    // Two in-hull probes whose `x` gap is 1.0, so `pred(x1) - pred(x0)` is exactly
+    // the reported linear-term slope. `y` is a placeholder (predict ignores it).
+    write_predict_csv_rows(
+        &predict_path,
+        ["x", "y"],
+        [0.0_f64, 1.0_f64]
+            .into_iter()
+            .map(|x| [format!("{x:.12}"), "0.0".to_string()]),
+    );
 
-    let mut fit_cmd = Command::new(gam::gam_binary!());
-    fit_cmd
-        .arg("fit")
-        .arg(&train_path)
-        .arg(formula)
-        .args(["--family", "gaussian"])
-        .arg("--out")
-        .arg(&model_path);
-    run_or_panic(fit_cmd, &format!("gam fit `{formula}`"));
-    assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
-
-    let mut predict_cmd = Command::new(gam::gam_binary!());
-    predict_cmd
-        .arg("predict")
-        .arg(&model_path)
-        .arg(&predict_path)
-        .arg("--out")
-        .arg(&out_path);
-    run_or_panic(predict_cmd, &format!("gam predict `{formula}`"));
-
-    let preds = read_predictions(&out_path);
+    let preds =
+        fit_then_predict_gaussian(&train_path, formula, &model_path, &predict_path, &out_path);
     assert_eq!(
         preds.len(),
         2,

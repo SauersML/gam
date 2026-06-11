@@ -19,7 +19,7 @@
 //! (`FittedModel::axis_clip_to_training_ranges` clamping linear-term columns).
 //! Once the clamp skips linear-term columns, both pass.
 
-use gam::test_support::cli_harness::run_or_panic;
+use gam::test_support::cli_harness::{run_or_panic, write_predict_csv_rows};
 use std::path::Path;
 use std::process::Command;
 
@@ -44,17 +44,6 @@ fn write_training_csv(path: &Path) {
             .expect("write training row");
     }
     writer.flush().expect("flush training csv");
-}
-
-fn write_predict_csv(path: &Path, xs: &[f64]) {
-    let mut writer = csv::Writer::from_path(path).expect("create predict csv");
-    writer.write_record(["x", "y"]).expect("write header");
-    for &x in xs {
-        writer
-            .write_record([format!("{x:.12}"), "0.0".to_string()])
-            .expect("write predict row");
-    }
-    writer.flush().expect("flush predict csv");
 }
 
 fn read_column(path: &Path, name: &str) -> Vec<f64> {
@@ -92,7 +81,13 @@ fn linear_term_prediction_se_grows_outside_training_range() {
     let mut probes = Vec::new();
     probes.extend_from_slice(&probes_pos);
     probes.extend_from_slice(&probes_neg);
-    write_predict_csv(&predict_path, &probes);
+    write_predict_csv_rows(
+        &predict_path,
+        ["x", "y"],
+        probes
+            .iter()
+            .map(|&x| [format!("{x:.12}"), "0.0".to_string()]),
+    );
 
     let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
