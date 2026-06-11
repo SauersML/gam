@@ -2511,9 +2511,17 @@ impl ArrowRowBlock {
     /// Allocate one BA point-block row: local latent Hessian, point-camera
     /// cross block, and point gradient.
     pub fn new(d: usize, k: usize) -> Self {
+        Self::new_with_htbeta_cols(d, k)
+    }
+
+    /// Allocate one BA row whose dense cross-block slab has `htbeta_cols`
+    /// columns. This is used by matrix-free assemblers that keep the shared
+    /// beta tier at one width while dense row supplements live in another
+    /// coordinate system.
+    pub fn new_with_htbeta_cols(d: usize, htbeta_cols: usize) -> Self {
         Self {
             htt: Array2::<f64>::zeros((d, d)),
-            htbeta: Array2::<f64>::zeros((d, k)),
+            htbeta: Array2::<f64>::zeros((d, htbeta_cols)),
             gt: Array1::<f64>::zeros(d),
         }
     }
@@ -2690,7 +2698,20 @@ impl ArrowSchurSystem {
     /// has nonzero curvature. This keeps large structured systems from allocating
     /// a `k × k` dense placeholder when all β curvature is supplied by operators.
     pub fn new_with_empty_hbb(n: usize, d: usize, k: usize) -> Self {
-        let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
+        Self::new_with_empty_hbb_and_htbeta_cols(n, d, k, k)
+    }
+
+    /// Allocate an arrow system with no dense shared `H_ββ` block and with
+    /// per-row dense `H_tβ` slabs allocated at `htbeta_cols` columns.
+    pub fn new_with_empty_hbb_and_htbeta_cols(
+        n: usize,
+        d: usize,
+        k: usize,
+        htbeta_cols: usize,
+    ) -> Self {
+        let rows = (0..n)
+            .map(|_| ArrowRowBlock::new_with_htbeta_cols(d, htbeta_cols))
+            .collect();
         let row_dims: Arc<[usize]> = (0..n).map(|_| d).collect::<Vec<_>>().into();
         let row_offsets: Arc<[usize]> = (0..=n).map(|i| i * d).collect::<Vec<_>>().into();
         let mut sys = Self {
@@ -2721,10 +2742,24 @@ impl ArrowSchurSystem {
     /// The buffer must already have shape `(k, k)` and is zeroed in place before
     /// use so callers can recycle it across assemblies without changing
     /// numerics.
-    pub fn new_with_hbb(n: usize, d: usize, k: usize, mut hbb: Array2<f64>) -> Self {
+    pub fn new_with_hbb(n: usize, d: usize, k: usize, hbb: Array2<f64>) -> Self {
+        Self::new_with_hbb_and_htbeta_cols(n, d, k, hbb, k)
+    }
+
+    /// Allocate an arrow system with a caller-owned dense shared-block buffer and
+    /// per-row dense `H_tβ` slabs allocated at `htbeta_cols` columns.
+    pub fn new_with_hbb_and_htbeta_cols(
+        n: usize,
+        d: usize,
+        k: usize,
+        mut hbb: Array2<f64>,
+        htbeta_cols: usize,
+    ) -> Self {
         assert_eq!(hbb.dim(), (k, k));
         hbb.fill(0.0);
-        let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
+        let rows = (0..n)
+            .map(|_| ArrowRowBlock::new_with_htbeta_cols(d, htbeta_cols))
+            .collect();
         let row_dims: Arc<[usize]> = (0..n).map(|_| d).collect::<Vec<_>>().into();
         let row_offsets: Arc<[usize]> = (0..=n).map(|i| i * d).collect::<Vec<_>>().into();
         let mut sys = Self {
@@ -2818,6 +2853,16 @@ impl ArrowSchurSystem {
     /// Allocate a heterogeneous-row arrow system with no dense shared `H_ββ`
     /// block. See [`Self::new_with_empty_hbb`].
     pub fn new_with_per_row_dims_empty_hbb(per_row_dims: Vec<usize>, k: usize) -> Self {
+        Self::new_with_per_row_dims_empty_hbb_and_htbeta_cols(per_row_dims, k, k)
+    }
+
+    /// Allocate a heterogeneous-row arrow system with no dense shared `H_ββ`
+    /// block and with row `H_tβ` slabs allocated at `htbeta_cols` columns.
+    pub fn new_with_per_row_dims_empty_hbb_and_htbeta_cols(
+        per_row_dims: Vec<usize>,
+        k: usize,
+        htbeta_cols: usize,
+    ) -> Self {
         let n = per_row_dims.len();
         let d = per_row_dims.iter().copied().max().unwrap_or(0);
         let mut offsets = Vec::with_capacity(n + 1);
@@ -2829,7 +2874,7 @@ impl ArrowSchurSystem {
         }
         let rows = per_row_dims
             .iter()
-            .map(|&dim| ArrowRowBlock::new(dim, k))
+            .map(|&dim| ArrowRowBlock::new_with_htbeta_cols(dim, htbeta_cols))
             .collect();
         let mut sys = Self {
             rows,
@@ -2860,7 +2905,18 @@ impl ArrowSchurSystem {
     pub fn new_with_per_row_dims_and_hbb(
         per_row_dims: Vec<usize>,
         k: usize,
+        hbb: Array2<f64>,
+    ) -> Self {
+        Self::new_with_per_row_dims_and_hbb_and_htbeta_cols(per_row_dims, k, hbb, k)
+    }
+
+    /// Allocate a heterogeneous-row system using a caller-owned dense shared
+    /// block and row `H_tβ` slabs allocated at `htbeta_cols` columns.
+    pub fn new_with_per_row_dims_and_hbb_and_htbeta_cols(
+        per_row_dims: Vec<usize>,
+        k: usize,
         mut hbb: Array2<f64>,
+        htbeta_cols: usize,
     ) -> Self {
         assert_eq!(hbb.dim(), (k, k));
         hbb.fill(0.0);
@@ -2877,7 +2933,7 @@ impl ArrowSchurSystem {
         let row_offsets: Arc<[usize]> = off_vec.into();
         let rows = per_row_dims
             .iter()
-            .map(|&di| ArrowRowBlock::new(di, k))
+            .map(|&di| ArrowRowBlock::new_with_htbeta_cols(di, htbeta_cols))
             .collect();
         let mut sys = Self {
             rows,
