@@ -1457,10 +1457,12 @@ pub fn build_smooth_basis(
         // Cap the marginal basis below the minimum per-group covariate resolution
         // so the penalty always retains residual degrees of freedom to shrink each
         // group's curvature toward its linear null space (the random-slope
-        // estimand). Groups with ample data (e.g. 40 points each) keep the full
-        // pooled flexibility; only small-sample groups are protected. The cap is
-        // skipped for the explicit `re` random-effect form, whose degree-1 marginal
-        // carries no curvature to over-fit.
+        // estimand). This small-group cap composes with a separate upper bound at
+        // mgcv's factor-smooth default k=10 (FACTOR_SMOOTH_DEFAULT_BASIS_DIM,
+        // applied below), so even ample-data groups get the modest SHARED marginal
+        // a factor smooth wants rather than the full pooled basis. The explicit
+        // `re` random-effect form takes neither cap: it is a raw linear `[1, x]`
+        // random effect (0 internal knots), handled in the branch above.
         let pooled_internal = heuristic_knots_for_column(ds.values.column(c));
         let default_internal = if type_opt == "re" {
             // `bs="re"` is a PARAMETRIC random effect, not a smooth of the
