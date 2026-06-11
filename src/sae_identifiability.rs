@@ -1721,6 +1721,111 @@ fn stacked_curvature_root(model: &FittedSaeManifold) -> Result<Array2<f64>, Stri
     Ok(r_mat)
 }
 
+enum CurvatureReduction {
+    Root {
+        pinning_rank: usize,
+        sigma_max_sq: f64,
+        root: Array2<f64>,
+    },
+    Gram {
+        pinning_rank: usize,
+        sigma_max_sq: f64,
+        gram: Array2<f64>,
+    },
+}
+
+impl CurvatureReduction {
+    fn from_model(model: &FittedSaeManifold) -> Result<Self, String> {
+        let root = stacked_curvature_root(model)?;
+        if root.nrows() == 0 {
+            return Ok(Self::Root {
+                pinning_rank: 0,
+                sigma_max_sq: 0.0,
+                root,
+            });
+        }
+        let r_t = root.t().to_owned();
+        let rrqr = rrqr_with_permutation(&r_t, default_rrqr_rank_alpha())
+            .map_err(|e| format!("residual_gauge: RRQR on Rᵀ failed: {e:?}"))?;
+        let (_u, sv, _vt) = root
+            .svd(false, false)
+            .map_err(|e| format!("residual_gauge: SVD of curvature root failed: {e}"))?;
+        let smax = sv.iter().cloned().fold(0.0_f64, f64::max);
+        Ok(Self::Root {
+            pinning_rank: rrqr.rank,
+            sigma_max_sq: smax * smax,
+            root,
+        })
+    }
+
+    fn from_gram(
+        gram: Array2<f64>,
+        root_rows: usize,
+        param_dim: usize,
+    ) -> Result<Self, String> {
+        if gram.nrows() != param_dim || gram.ncols() != param_dim {
+            return Err(format!(
+                "residual_gauge: curvature gram has shape ({}, {}) but param_dim = {param_dim}",
+                gram.nrows(),
+                gram.ncols()
+            ));
+        }
+        if param_dim == 0 || root_rows == 0 {
+            return Ok(Self::Gram {
+                pinning_rank: 0,
+                sigma_max_sq: 0.0,
+                gram,
+            });
+        }
+        let (evals, _) = gram
+            .eigh(Side::Lower)
+            .map_err(|e| {
+                format!("residual_gauge: eigendecomposition of curvature gram failed: {e}")
+            })?;
+        let sigma_max_sq = evals.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
+        let sigma_max = sigma_max_sq.sqrt();
+        let rank_tol = default_rrqr_rank_alpha()
+            * f64::EPSILON
+            * (root_rows.max(param_dim).max(1) as f64)
+            * sigma_max.max(1.0);
+        let lambda_tol = rank_tol * rank_tol;
+        let pinning_rank = evals
+            .iter()
+            .filter(|&&lambda| lambda.max(0.0) > lambda_tol)
+            .count();
+        Ok(Self::Gram {
+            pinning_rank,
+            sigma_max_sq,
+            gram,
+        })
+    }
+
+    fn pinning_rank(&self) -> usize {
+        match self {
+            Self::Root { pinning_rank, .. } | Self::Gram { pinning_rank, .. } => *pinning_rank,
+        }
+    }
+
+    fn sigma_max_sq(&self) -> f64 {
+        match self {
+            Self::Root { sigma_max_sq, .. } | Self::Gram { sigma_max_sq, .. } => *sigma_max_sq,
+        }
+    }
+
+    fn unit_generator_energy(&self, unit: &Array1<f64>) -> f64 {
+        match self {
+            Self::Root { root, .. } => {
+                let r_xi = root.dot(unit);
+                r_xi.iter().map(|c| c * c).sum::<f64>()
+            }
+            Self::Gram { gram, .. } => {
+                let h_xi = gram.dot(unit);
+                unit.dot(&h_xi).max(0.0)
+            }
+        }
+    }
+}
+
 /// Evaluate the identifiability rank machinery on the symmetry generators of a
 /// fitted SAE-manifold model and certify which gauge group the fit is identified
 /// up to.
@@ -1766,7 +1871,7 @@ fn stacked_curvature_root(model: &FittedSaeManifold) -> Result<Array2<f64>, Stri
 ///   (the output-Fisher metric separates the atoms behaviorally). The result is
 ///   carried in `sym_f_trivial_under_output_fisher`.
 pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, String> {
-    residual_gauge_inner(model, None)
+    residual_gauge_inner(model, None, None)
 }
 
 /// The #998 full-resolution certificate: within-atom gauge families are
@@ -1793,6 +1898,36 @@ pub fn residual_gauge_exact(
     views: &[Option<AtomParameterView>],
     penalty_ops: &[Option<OrbitPenaltyOperator>],
 ) -> Result<ResidualGaugeReport, String> {
+    let exact = residual_gauge_exact_inputs(model, views, penalty_ops)?;
+    residual_gauge_inner(model, Some(exact), None)
+}
+
+/// Exact-orbit residual-gauge certificate with a pre-reduced streamed curvature
+/// Gram `RᵀR`.
+///
+/// This is the memory-scaled entry point for callers that can stream their
+/// metric-whitened Jacobian rows into the reductions the certificate consumes,
+/// instead of retaining every per-row `p × param_dim` Jacobian block. The Gram
+/// must include the same rows [`stacked_curvature_root`] would have placed in
+/// `R`; `root_rows` is that row count for the rank tolerance scale.
+pub fn residual_gauge_exact_from_curvature_gram(
+    model: &FittedSaeManifold,
+    views: &[Option<AtomParameterView>],
+    penalty_ops: &[Option<OrbitPenaltyOperator>],
+    curvature_gram: Array2<f64>,
+    root_rows: usize,
+) -> Result<ResidualGaugeReport, String> {
+    let param_dim = model.param_dim();
+    let curvature = CurvatureReduction::from_gram(curvature_gram, root_rows, param_dim)?;
+    let exact = residual_gauge_exact_inputs(model, views, penalty_ops)?;
+    residual_gauge_inner(model, Some(exact), Some(curvature))
+}
+
+fn residual_gauge_exact_inputs(
+    model: &FittedSaeManifold,
+    views: &[Option<AtomParameterView>],
+    penalty_ops: &[Option<OrbitPenaltyOperator>],
+) -> Result<(Vec<bool>, Vec<GeneratorVerdict>), String> {
     if views.len() != model.atoms.len() || penalty_ops.len() != model.atoms.len() {
         return Err(format!(
             "residual_gauge_exact: views ({}) and penalty_ops ({}) must align with atoms ({})",
@@ -1813,12 +1948,13 @@ pub fn residual_gauge_exact(
         exact_verdicts.extend(exact_orbit_verdicts(atom, view, penalty_ops[k].as_ref())?);
         mask[k] = true;
     }
-    residual_gauge_inner(model, Some((&mask, exact_verdicts)))
+    Ok((mask, exact_verdicts))
 }
 
 fn residual_gauge_inner(
     model: &FittedSaeManifold,
-    exact: Option<(&[bool], Vec<GeneratorVerdict>)>,
+    exact: Option<(Vec<bool>, Vec<GeneratorVerdict>)>,
+    precomputed_curvature: Option<CurvatureReduction>,
 ) -> Result<ResidualGaugeReport, String> {
     let metric_provenance = model.metric.provenance();
     let param_dim = model.param_dim();
@@ -1843,7 +1979,7 @@ fn residual_gauge_inner(
         // skipped here: the frame-space lift of a compensated orbit measures
         // compression, not the symmetry, and the report must not carry both a
         // lossy and an exact verdict for the same group element.
-        if exact_mask.is_some_and(|mask| mask[k]) {
+        if exact_mask.as_ref().is_some_and(|mask| mask[k]) {
             continue;
         }
         let base = model.atom_offset(k);
@@ -1879,19 +2015,12 @@ fn residual_gauge_inner(
 
     // 2. Stacked curvature root in the metric; pinning rank via the audit's
     // RRQR on Rᵀ, stiffness scale σ_max via SVD (magnitudes kept).
-    let root = stacked_curvature_root(model)?;
-    let (pinning_rank, sigma_max_sq) = if root.nrows() == 0 {
-        (0usize, 0.0_f64)
-    } else {
-        let r_t = root.t().to_owned();
-        let rrqr = rrqr_with_permutation(&r_t, default_rrqr_rank_alpha())
-            .map_err(|e| format!("residual_gauge: RRQR on Rᵀ failed: {e:?}"))?;
-        let (_u, sv, _vt) = root
-            .svd(false, false)
-            .map_err(|e| format!("residual_gauge: SVD of curvature root failed: {e}"))?;
-        let smax = sv.iter().cloned().fold(0.0_f64, f64::max);
-        (rrqr.rank, smax * smax)
+    let curvature = match precomputed_curvature {
+        Some(curvature) => curvature,
+        None => CurvatureReduction::from_model(model)?,
     };
+    let pinning_rank = curvature.pinning_rank();
+    let sigma_max_sq = curvature.sigma_max_sq();
 
     // The isometry pin is inactive ⇒ diffeomorphism-unpinned escalation.
     let diffeomorphism_unpinned = model.isometry_penalty_root.nrows() == 0;
@@ -1929,8 +2058,7 @@ fn residual_gauge_inner(
             0.0
         } else {
             let unit = g.mapv(|v| v / norm);
-            let r_xi = root.dot(&unit);
-            (r_xi.iter().map(|c| c * c).sum::<f64>() / sigma_max_sq).clamp(0.0, 1.0)
+            (curvature.unit_generator_energy(&unit) / sigma_max_sq).clamp(0.0, 1.0)
         };
         let tolerance = GENERATOR_FLAT_ENERGY_TOL.max(*lowering_error_scale);
         let unpinned = pinned_energy_fraction <= tolerance;
