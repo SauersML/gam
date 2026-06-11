@@ -3549,6 +3549,59 @@ fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedConfig {
     }
 }
 
+fn reml_inner_progress_feedback(
+    state: &crate::solver::estimate::reml::RemlState<'_>,
+) -> crate::solver::outer_strategy::InnerProgressFeedback {
+    crate::solver::outer_strategy::InnerProgressFeedback {
+        cap: Arc::clone(&state.outer_inner_cap),
+        accepted_iter: Arc::new(AtomicUsize::new(0)),
+        last_iters: Arc::clone(&state.last_inner_iters),
+        last_converged: Arc::clone(&state.last_inner_converged),
+        ift_residual: Arc::clone(&state.last_ift_prediction_residual),
+        accept_rho: Arc::clone(&state.last_pirls_accept_rho),
+    }
+}
+
+fn with_reml_beta_seed_hook<'state, 'data>() -> impl FnMut(
+    &mut &'state mut crate::solver::estimate::reml::RemlState<'data>,
+    &Array1<f64>,
+) -> Result<(), EstimationError> {
+    |state, beta| {
+        state.setwarm_start_original_beta(Some(beta.view()));
+        Ok(())
+    }
+}
+
+enum RemlInnerCapGuardArm {
+    Standard,
+    MixtureSas,
+}
+
+fn run_outer_inner_cap_guard(
+    state: &mut crate::solver::estimate::reml::RemlState<'_>,
+    rho: &Array1<f64>,
+    arm: RemlInnerCapGuardArm,
+) -> Result<(), EstimationError> {
+    let prev_cap = state.outer_inner_cap.swap(0, Ordering::Relaxed);
+    if prev_cap != 0 {
+        let guard_start = std::time::Instant::now();
+        state.compute_cost(rho)?;
+        match arm {
+            RemlInnerCapGuardArm::Standard => log::info!(
+                "[OUTER guard] convergence-guard re-eval at converged ρ done (prev_cap={prev_cap}, elapsed={:.3}s)",
+                guard_start.elapsed().as_secs_f64()
+            ),
+            RemlInnerCapGuardArm::MixtureSas => log::info!(
+                "[OUTER guard] convergence-guard re-eval at converged ρ done (mixture/SAS arm; prev_cap={prev_cap}, elapsed={:.3}s)",
+                guard_start.elapsed().as_secs_f64()
+            ),
+        }
+    } else if matches!(arm, RemlInnerCapGuardArm::Standard) {
+        log::debug!("[OUTER guard] schedule never lifted (prev_cap=0); skipping refit");
+    }
+    Ok(())
+}
+
 /// The weighted-mean response level an unpenalized intercept would absorb, used
 /// to center the response during outer REML λ-selection (issue #1000).
 ///
@@ -3753,7 +3806,7 @@ where
         crate::bail_invalid_estim!("simultaneous mixture and SAS optimization is not supported");
     } else if mixture_dim == 0 && sas_dim == 0 {
         use crate::solver::outer_strategy::{
-            DeclaredHessianForm, Derivative, InnerProgressFeedback, OuterEvalOrder, OuterProblem,
+            DeclaredHessianForm, Derivative, OuterEvalOrder, OuterProblem,
         };
 
         let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
@@ -3812,14 +3865,7 @@ where
             .with_max_iter(reml_max_iter)
             .with_seed_config(reml_seed_config)
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
-            .with_outer_inner_cap(InnerProgressFeedback {
-                cap: Arc::clone(&reml_state.outer_inner_cap),
-                accepted_iter: Arc::new(AtomicUsize::new(0)),
-                last_iters: Arc::clone(&reml_state.last_inner_iters),
-                last_converged: Arc::clone(&reml_state.last_inner_converged),
-                ift_residual: Arc::clone(&reml_state.last_ift_prediction_residual),
-                accept_rho: Arc::clone(&reml_state.last_pirls_accept_rho),
-            })
+            .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
             .with_objective_scale(if gaussian_identity {
                 Some(n_obs as f64)
             } else {
@@ -3980,12 +4026,7 @@ where
         // solver started (issue #236). Wire the symmetric consumer:
         // when the pre-warm forwards the cached β, install it into the
         // same `warm_start_beta` slot the publisher reads from.
-        let mut obj = obj.with_seed_inner_state(
-            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>, beta: &Array1<f64>| {
-                state.setwarm_start_original_beta(Some(beta.view()));
-                Ok(())
-            },
-        );
+        let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
 
         let strategy_result = problem.run(&mut obj, "standard REML")?;
         // Convergence guard for the outer-aware inner-PIRLS schedule
@@ -3997,23 +4038,11 @@ where
         // 5/10/20 rather than the full inner budget. Reset the cap to 0
         // and run one final cost eval at the converged ρ so the cached
         // β is at full inner tolerance.
-        let prev_cap = reml_state
-            .outer_inner_cap
-            .swap(0, std::sync::atomic::Ordering::Relaxed);
-        if prev_cap != 0 {
-            // Only re-eval when the schedule had actually capped the inner
-            // solve. If prev_cap was already 0 the cached β is at full
-            // tolerance and the refit would be a wasted inner Newton solve
-            // (~30s at large-scale n=320k).
-            let guard_start = std::time::Instant::now();
-            reml_state.compute_cost(&strategy_result.rho)?;
-            log::info!(
-                "[OUTER guard] convergence-guard re-eval at converged ρ done (prev_cap={prev_cap}, elapsed={:.3}s)",
-                guard_start.elapsed().as_secs_f64()
-            );
-        } else {
-            log::debug!("[OUTER guard] schedule never lifted (prev_cap=0); skipping refit");
-        }
+        run_outer_inner_cap_guard(
+            &mut reml_state,
+            &strategy_result.rho,
+            RemlInnerCapGuardArm::Standard,
+        )?;
         (
             strategy_result.rho.clone(),
             cfg.link_kind.mixture_state().cloned(),
@@ -4064,8 +4093,7 @@ where
         let mut reml_seed_config_mix = reml_seed_config;
         reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
         use crate::solver::outer_strategy::{
-            DeclaredHessianForm, Derivative, HessianResult, InnerProgressFeedback, OuterEval,
-            OuterProblem,
+            DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
         };
         let initial_link_kind = cfg.link_kind.clone();
         let problem = OuterProblem::new(theta_dim)
@@ -4081,14 +4109,7 @@ where
             .with_max_iter(reml_max_iter)
             .with_seed_config(reml_seed_config_mix)
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
-            .with_outer_inner_cap(InnerProgressFeedback {
-                cap: Arc::clone(&reml_state.outer_inner_cap),
-                accepted_iter: Arc::new(AtomicUsize::new(0)),
-                last_iters: Arc::clone(&reml_state.last_inner_iters),
-                last_converged: Arc::clone(&reml_state.last_inner_converged),
-                ift_residual: Arc::clone(&reml_state.last_ift_prediction_residual),
-                accept_rho: Arc::clone(&reml_state.last_pirls_accept_rho),
-            })
+            .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
             .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(h) = heuristic_theta_ref {
             problem.with_heuristic_lambdas(h.to_vec())
@@ -4295,12 +4316,7 @@ where
         // `inner_beta_hint = state.current_original_basis_beta()` (see
         // src/solver/estimate.rs:3275), so continuation pre-warm needs
         // a real seed hook to install it.
-        let mut obj = obj.with_seed_inner_state(
-            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>, beta: &Array1<f64>| {
-                state.setwarm_start_original_beta(Some(beta.view()));
-                Ok(())
-            },
-        );
+        let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
         let outer_result = problem.run(&mut obj, "mixture/SAS flexible link")?;
         // Convergence guard for the outer-aware inner-PIRLS schedule
         // (path #3) — see the matching comment in the standard REML arm
@@ -4308,19 +4324,11 @@ where
         // converged ρ so the cached warm-start β is at full inner
         // tolerance regardless of where the BFGS schedule was when the
         // optimizer terminated.
-        let prev_cap_mix = reml_state
-            .outer_inner_cap
-            .swap(0, std::sync::atomic::Ordering::Relaxed);
-        if prev_cap_mix != 0 {
-            // See standard-REML arm: only re-eval when the schedule had
-            // capped, otherwise the cached β is already at full tolerance.
-            let guard_start_mix = std::time::Instant::now();
-            reml_state.compute_cost(&outer_result.rho)?;
-            log::info!(
-                "[OUTER guard] convergence-guard re-eval at converged ρ done (mixture/SAS arm; prev_cap={prev_cap_mix}, elapsed={:.3}s)",
-                guard_start_mix.elapsed().as_secs_f64()
-            );
-        }
+        run_outer_inner_cap_guard(
+            &mut reml_state,
+            &outer_result.rho,
+            RemlInnerCapGuardArm::MixtureSas,
+        )?;
         let final_rho = outer_result.rho.slice(s![..k]).to_owned();
         let final_mix_state = if use_mixture {
             let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
