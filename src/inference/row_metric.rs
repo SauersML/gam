@@ -110,25 +110,28 @@ pub struct RowMetric {
     /// `U_n U_nᵀ`; only [`Self::solve_floor`]-tagged solver helpers see `δ`. A
     /// nonzero floor therefore cannot bias the objective the optimizer reports.
     solver_delta: f64,
-    /// Validated PSD blocks `(n_rows, p, p)` produced **through**
-    /// [`normalize_fisher_rao_blocks`] (the *un-floored* `U_n U_nᵀ`). Retained as
-    /// the provenance-of-validation record; the hot paths use `factors` directly
-    /// to avoid `p × p` work. The solver `δ` is deliberately *not* baked in here,
-    /// so this is the criterion-facing metric.
-    blocks: Array3<f64>,
+    /// Per-row traces `tr(M_n)` of the criterion-facing (un-floored) metric.
+    ///
+    /// This is the only dense-block reduction any consumer reads (the #980
+    /// Fisher-mass row measure); the `(n_rows, p, p)` block stack itself is
+    /// validated **streamingly** at construction through
+    /// [`normalize_fisher_rao_blocks`] one row at a time and then dropped.
+    /// Retaining it was `n·p²·8` bytes — 13 GiB at `(n=2000, p=896)` and an
+    /// OOM at LLM-scale `p` — for a record nothing ever re-read. The solver
+    /// `δ` is deliberately *not* baked in here, so this is the
+    /// criterion-facing trace.
+    traces: ndarray::Array1<f64>,
 }
 
 impl RowMetric {
     /// Euclidean metric: `W_n = I_p` for all `n`. Whitening is the identity, so
     /// the likelihood residual path is bit-for-bit the prior isotropic `φ̂`.
     ///
-    /// Built through the shared normalizer (a length-`n` scalar `1.0` vector,
-    /// broadcast to per-row identity blocks) so the validation seam is the same
-    /// single source of truth as every other provenance.
+    /// Constructed directly: the identity stack is PSD axiomatically, so
+    /// routing it through the dense normalizer would materialize and
+    /// spectrum-check `n` identity blocks (`n·p²` memory, `n·p³` flops) to
+    /// validate a tautology. `tr(I_p) = p` per row.
     pub fn euclidean(n_rows: usize, p: usize) -> Result<Self, String> {
-        let scale = ndarray::Array1::<f64>::ones(n_rows);
-        let blocks = normalize_fisher_rao_blocks(scale.view().into_dyn(), n_rows, p)
-            .map_err(|e| format!("RowMetric::euclidean: {e}"))?;
         Ok(Self {
             provenance: MetricProvenance::Euclidean,
             n_rows,
@@ -136,7 +139,7 @@ impl RowMetric {
             rank: p,
             factors: None,
             solver_delta: 0.0,
-            blocks,
+            traces: ndarray::Array1::<f64>::from_elem(n_rows, p as f64),
         })
     }
 
@@ -241,10 +244,13 @@ impl RowMetric {
         if !u.iter().all(|v| v.is_finite()) {
             return Err("RowMetric::from_factors: factors must be finite".to_string());
         }
-        // Materialize W_n = U_n U_nᵀ once (PSD by construction) and validate it
-        // through the single shared normalizer rather than reimplementing the
-        // PSD check here.
-        let mut full = Array3::<f64>::zeros((n_rows, p, p));
+        // Materialize W_n = U_n U_nᵀ one row at a time (PSD by construction),
+        // validate each through the single shared normalizer rather than
+        // reimplementing the PSD check, record its trace, and drop the block.
+        // Streaming keeps construction O(p²) memory; the former whole-stack
+        // materialization retained `n·p²` doubles nothing ever re-read.
+        let mut traces = ndarray::Array1::<f64>::zeros(n_rows);
+        let mut full = Array3::<f64>::zeros((1, p, p));
         for row in 0..n_rows {
             for i in 0..p {
                 for j in 0..p {
@@ -252,12 +258,17 @@ impl RowMetric {
                     for k in 0..rank {
                         acc += u[[row, i * rank + k]] * u[[row, j * rank + k]];
                     }
-                    full[[row, i, j]] = acc;
+                    full[[0, i, j]] = acc;
                 }
             }
+            normalize_fisher_rao_blocks(full.view().into_dyn(), 1, p)
+                .map_err(|e| format!("RowMetric::from_factors: row {row}: {e}"))?;
+            let mut tr = 0.0_f64;
+            for i in 0..p {
+                tr += full[[0, i, i]];
+            }
+            traces[row] = tr;
         }
-        let blocks = normalize_fisher_rao_blocks(full.view().into_dyn(), n_rows, p)
-            .map_err(|e| format!("RowMetric::from_factors: {e}"))?;
         Ok(Self {
             provenance,
             n_rows,
@@ -265,7 +276,7 @@ impl RowMetric {
             rank,
             factors: Some(u),
             solver_delta,
-            blocks,
+            traces,
         })
     }
 
@@ -322,11 +333,13 @@ impl RowMetric {
         self.rank
     }
 
-    /// Validated PSD blocks `(n_rows, p, p)`. The provenance-of-validation
-    /// record; consumers wanting the explicit `W_n` (e.g. a future dense
-    /// diagnostic) read this, the hot paths use the factors.
-    pub fn blocks(&self) -> &Array3<f64> {
-        &self.blocks
+    /// Per-row traces `tr(M_n)` of the criterion-facing (un-floored) metric —
+    /// the Fisher-mass reduction the #980 row measure consumes. The dense
+    /// `(n_rows, p, p)` stack is validated streamingly at construction and
+    /// never retained; consumers wanting an explicit `W_n` rebuild it from
+    /// [`Self::metric_rank`]-sized factors.
+    pub fn row_traces(&self) -> ndarray::ArrayView1<'_, f64> {
+        self.traces.view()
     }
 
     /// Whiten a single `p`-dimensional residual row `r` into the coordinates
