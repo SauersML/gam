@@ -21,7 +21,7 @@
 use ndarray::{Array1, Array2};
 
 use crate::linalg::triangular::{CholeskyGuard, cholesky_factor_in_place, cholesky_solve_vector};
-use crate::solver::arrow_schur::ArrowSchurSystem;
+use crate::solver::arrow_schur::{ArrowSchurSystem, PcgDiagnostics};
 
 /// Outcome of a single Arrow-Schur Newton solve.
 pub struct ArrowSchurGpuSolution {
@@ -449,11 +449,11 @@ fn build_row_procedural_matvec(
 /// eliminated into `S` on the host streaming path; the device's job is the
 /// dense `K`-dimensional solve, which is the dominant cost at `K = 100K`.
 ///
-/// The dense `S·p` matvec runs on device via cuBLAS `Dgemv` (the `O(K²)` term
-/// that dwarfs the `O(K)` host-side CG scalar recurrences), and the Jacobi
-/// preconditioner uses `diag(S)` extracted once on the host after a single
-/// `dtoh` of the diagonal. Only the `K`-vectors `p` and `S·p` cross the
-/// host↔device boundary per CG iteration.
+/// The dense `S·p` matvec runs on device via cuBLAS `Dgemv`, and the PCG state
+/// vectors (`x`, `r`, `z`, `p`, `S·p`) remain device-resident for the solve.
+/// Jacobi preconditioning is an elementwise CUDA kernel; only convergence
+/// scalars (`pᵀSp`, `rᵀz`, `‖r‖`) cross the host boundary per iteration, plus the
+/// final solution vector.
 ///
 /// Returns `Err(ArrowSchurGpuFailure::Unavailable)` when CUDA is unavailable
 /// or the workload is below the dispatch policy; the caller then runs the CPU
@@ -466,6 +466,17 @@ pub fn solve_reduced_beta_pcg(
     max_iterations: usize,
     relative_tolerance: f64,
 ) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
+    solve_reduced_beta_pcg_with_diagnostics(s_acc, rhs_beta, max_iterations, relative_tolerance)
+        .map(|(x, _)| x)
+}
+
+#[doc(hidden)]
+pub fn solve_reduced_beta_pcg_with_diagnostics(
+    s_acc: &Array2<f64>,
+    rhs_beta: &Array1<f64>,
+    max_iterations: usize,
+    relative_tolerance: f64,
+) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
     let k = rhs_beta.len();
     if s_acc.dim() != (k, k) {
         return Err(ArrowSchurGpuFailure::SchurFactorFailed {
@@ -491,7 +502,12 @@ pub fn solve_reduced_beta_pcg(
 
     #[cfg(target_os = "linux")]
     {
-        cuda::solve_reduced_beta_pcg(s_acc, rhs_beta, max_iterations, relative_tolerance)
+        cuda::solve_reduced_beta_pcg_with_diagnostics(
+            s_acc,
+            rhs_beta,
+            max_iterations,
+            relative_tolerance,
+        )
     }
 }
 
@@ -558,15 +574,18 @@ mod cuda {
     use super::{ArrowSchurGpuFailure, ArrowSchurGpuSolution, pack_block, pack_host};
     use crate::gpu::driver::to_i32;
     use crate::gpu::linalg::{DispatchOp, route_through_gpu};
-    use crate::solver::arrow_schur::ArrowSchurSystem;
+    use crate::solver::arrow_schur::{ArrowSchurSystem, PcgDiagnostics, PcgStopReason};
     use cudarc::cublas::sys::{
         cublasDiagType_t, cublasFillMode_t, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
     };
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig};
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
-    use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+    use cudarc::driver::{
+        CudaContext, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig,
+        PushKernelArg,
+    };
     use ndarray::Array1;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     /// Per-row work slot for the row-block-granular multi-GPU solve. Inputs are
     /// the packed single-row buffers (`d×d` D block + ρ_t ridge, `d×k` B block,
@@ -1480,6 +1499,92 @@ mod cuda {
         Ok(module)
     }
 
+    const PCG_VECTOR_KERNEL_SOURCE: &str = r#"
+extern "C" __global__ void arrow_pcg_jacobi_mul(
+    const double* __restrict__ inv_diag,
+    const double* __restrict__ r,
+    double* __restrict__ z,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        z[idx] = inv_diag[idx] * r[idx];
+    }
+}
+
+extern "C" __global__ void arrow_pcg_update_p(
+    const double* __restrict__ z,
+    double beta,
+    double* __restrict__ p,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        p[idx] = z[idx] + beta * p[idx];
+    }
+}
+"#;
+
+    fn pcg_vector_module(
+        ctx: &Arc<CudaContext>,
+    ) -> Result<&'static Arc<CudaModule>, ArrowSchurGpuFailure> {
+        static CACHE: crate::gpu::common::PtxModuleCache =
+            crate::gpu::common::PtxModuleCache::new();
+        CACHE
+            .get_or_compile(ctx, PCG_VECTOR_KERNEL_SOURCE)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)
+    }
+
+    fn pcg_launch_config(n: usize) -> Result<LaunchConfig, ArrowSchurGpuFailure> {
+        let threads = 256u32;
+        let blocks = ((n as u32).saturating_add(threads - 1) / threads).max(1);
+        Ok(LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+
+    fn launch_jacobi_mul(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        inv_diag: &CudaSlice<f64>,
+        r: &CudaSlice<f64>,
+        z: &mut CudaSlice<f64>,
+        n: usize,
+    ) -> Result<(), ArrowSchurGpuFailure> {
+        let kernel = module
+            .load_function("arrow_pcg_jacobi_mul")
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let n_i32 = to_i32(n).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let mut builder = stream.launch_builder(&kernel);
+        builder.arg(inv_diag).arg(r).arg(z).arg(&n_i32);
+        // SAFETY: all buffers have length n and belong to `stream`; the kernel only
+        // reads/writes indices `< n`.
+        unsafe { builder.launch(pcg_launch_config(n)?) }
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)
+    }
+
+    fn launch_update_p(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        z: &CudaSlice<f64>,
+        beta: f64,
+        p: &mut CudaSlice<f64>,
+        n: usize,
+    ) -> Result<(), ArrowSchurGpuFailure> {
+        let kernel = module
+            .load_function("arrow_pcg_update_p")
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let n_i32 = to_i32(n).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let mut builder = stream.launch_builder(&kernel);
+        builder.arg(z).arg(&beta).arg(p).arg(&n_i32);
+        // SAFETY: z/p both have length n and belong to `stream`; the kernel only
+        // reads/writes indices `< n`.
+        unsafe { builder.launch(pcg_launch_config(n)?) }
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)
+    }
+
     /// Pack `D + ρ_t I`, `B`, and `g` into the strided `(n × P_MAX × P_MAX)`
     /// / `(n × P_MAX × R_TEMPLATE)` / `(n × P_MAX)` layout the fused kernel
     /// expects. Entries outside the runtime `(p, r)` window stay at zero so
@@ -1976,6 +2081,16 @@ mod cuda {
         max_iterations: usize,
         relative_tolerance: f64,
     ) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
+        solve_reduced_beta_pcg_with_diagnostics(s_acc, rhs_beta, max_iterations, relative_tolerance)
+            .map(|(x, _)| x)
+    }
+
+    pub(super) fn solve_reduced_beta_pcg_with_diagnostics(
+        s_acc: &ndarray::Array2<f64>,
+        rhs_beta: &Array1<f64>,
+        max_iterations: usize,
+        relative_tolerance: f64,
+    ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
         let k = rhs_beta.len();
         let runtime =
             crate::gpu::linalg::route_through_gpu(crate::gpu::linalg::DispatchOp::Gemv { m: k, k })
@@ -1984,6 +2099,9 @@ mod cuda {
             .and_then(|ctx| ctx.new_stream().ok())
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let ctx = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let vector_module = pcg_vector_module(&ctx)?;
 
         // Jacobi diagonal from S; must be strictly positive for SPD.
         let mut inv_diag = vec![0.0_f64; k];
@@ -2015,21 +2133,47 @@ mod cuda {
         // uses an unbounded trust region (pure CG to tolerance).
         let rhs_norm = rhs_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
         if rhs_norm == 0.0 {
-            return Ok(Array1::<f64>::zeros(k));
+            return Ok((Array1::<f64>::zeros(k), PcgDiagnostics::default()));
         }
         let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
 
-        let mut x = vec![0.0_f64; k];
-        let mut r: Vec<f64> = rhs_beta.iter().copied().collect();
-        let mut z: Vec<f64> = (0..k).map(|j| inv_diag[j] * r[j]).collect();
-        let mut p = z.clone();
-        let mut rz: f64 = r.iter().zip(&z).map(|(a, b)| a * b).sum();
-        let mut p_dev = stream
-            .clone_htod(&p)
+        // Device-resident PCG state. Only convergence scalars cross back during
+        // the loop; x/r/z/p/Sp stay on CUDA until the final solution download.
+        let mut x_dev = stream
+            .alloc_zeros::<f64>(k)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut r_dev = stream
+            .clone_htod(
+                rhs_beta
+                    .as_slice()
+                    .ok_or(ArrowSchurGpuFailure::Unavailable)?,
+            )
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let inv_diag_dev = stream
+            .clone_htod(&inv_diag)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut z_dev = stream
+            .alloc_zeros::<f64>(k)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        launch_jacobi_mul(&stream, vector_module, &inv_diag_dev, &r_dev, &mut z_dev, k)?;
+        let mut p_dev = stream
+            .alloc_zeros::<f64>(k)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        device_copy(&blas, &stream, k, &z_dev, &mut p_dev)?;
         let mut sp_dev = stream
             .alloc_zeros::<f64>(k)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut rz = device_dot(&blas, &stream, k, &r_dev, &z_dev)?;
+        let mut diag = PcgDiagnostics {
+            precond_apply_calls: 1,
+            stopping_reason: PcgStopReason::MaxIter,
+            ..PcgDiagnostics::default()
+        };
+        if rz <= 0.0 || !rz.is_finite() {
+            return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                reason: format!("reduced-β GPU PCG: non-positive initial rᵀM⁻¹r={rz:e}"),
+            });
+        }
 
         let max_iters = max_iterations.max(1);
         for _ in 0..max_iters {
@@ -2050,11 +2194,10 @@ mod cuda {
             // SAFETY: s_dev is k×k column-major, p_dev / sp_dev length k.
             unsafe { blas.gemv(gemv_cfg, &s_dev, &p_dev, &mut sp_dev) }
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-            let sp = stream
-                .clone_dtoh(&sp_dev)
-                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            diag.matvec_calls += 1;
+            diag.iterations += 1;
 
-            let p_sp: f64 = p.iter().zip(&sp).map(|(a, b)| a * b).sum();
+            let p_sp = device_dot(&blas, &stream, k, &p_dev, &sp_dev)?;
             if !(p_sp > 0.0) {
                 // Non-positive curvature on a (proximal-ridged) SPD system means
                 // numerical breakdown; surface so the caller escalates.
@@ -2063,26 +2206,156 @@ mod cuda {
                 });
             }
             let alpha = rz / p_sp;
-            for j in 0..k {
-                x[j] += alpha * p[j];
-                r[j] -= alpha * sp[j];
-            }
-            let r_norm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+            device_axpy(&blas, &stream, k, alpha, &p_dev, &mut x_dev)?;
+            device_axpy(&blas, &stream, k, -alpha, &sp_dev, &mut r_dev)?;
+            let r_norm = device_nrm2(&blas, &stream, k, &r_dev)?;
             if r_norm <= tol {
+                diag.final_relative_residual = r_norm / rhs_norm;
+                diag.stopping_reason = PcgStopReason::Converged;
                 break;
             }
-            for j in 0..k {
-                z[j] = inv_diag[j] * r[j];
+            launch_jacobi_mul(&stream, vector_module, &inv_diag_dev, &r_dev, &mut z_dev, k)?;
+            diag.precond_apply_calls += 1;
+            let rz_new = device_dot(&blas, &stream, k, &r_dev, &z_dev)?;
+            if rz_new <= 0.0 || !rz_new.is_finite() {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: format!("reduced-β GPU PCG: non-positive rᵀM⁻¹r={rz_new:e}"),
+                });
             }
-            let rz_new: f64 = r.iter().zip(&z).map(|(a, b)| a * b).sum();
             let beta = rz_new / rz;
-            for j in 0..k {
-                p[j] = z[j] + beta * p[j];
-            }
+            launch_update_p(&stream, vector_module, &z_dev, beta, &mut p_dev, k)?;
             rz = rz_new;
         }
+        if diag.stopping_reason != PcgStopReason::Converged {
+            let r_norm = device_nrm2(&blas, &stream, k, &r_dev)?;
+            diag.final_relative_residual = r_norm / rhs_norm;
+            diag.stopping_reason = PcgStopReason::MaxIter;
+        }
 
-        Ok(Array1::from_vec(x))
+        let x = stream
+            .clone_dtoh(&x_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        Ok((Array1::from_vec(x), diag))
+    }
+
+    fn device_copy(
+        blas: &CudaBlas,
+        stream: &Arc<CudaStream>,
+        n: usize,
+        src: &CudaSlice<f64>,
+        dst: &mut CudaSlice<f64>,
+    ) -> Result<(), ArrowSchurGpuFailure> {
+        let n_i = to_i32(n).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let (src_ptr, _src_rec) = src.device_ptr(stream);
+        let (dst_ptr, _dst_rec) = dst.device_ptr_mut(stream);
+        // SAFETY: src and dst are live device allocations on this stream with at
+        // least n contiguous f64 entries and unit stride.
+        let status = unsafe {
+            cudarc::cublas::sys::cublasDcopy_v2(
+                *blas.handle(),
+                n_i,
+                src_ptr as *const f64,
+                1,
+                dst_ptr as *mut f64,
+                1,
+            )
+        };
+        if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(ArrowSchurGpuFailure::Unavailable)
+        }
+    }
+
+    fn device_axpy(
+        blas: &CudaBlas,
+        stream: &Arc<CudaStream>,
+        n: usize,
+        alpha: f64,
+        x: &CudaSlice<f64>,
+        y: &mut CudaSlice<f64>,
+    ) -> Result<(), ArrowSchurGpuFailure> {
+        let n_i = to_i32(n).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let (x_ptr, _x_rec) = x.device_ptr(stream);
+        let (y_ptr, _y_rec) = y.device_ptr_mut(stream);
+        // SAFETY: x and y are live device allocations on this stream with at
+        // least n contiguous f64 entries and unit stride; cuBLAS only reads alpha.
+        let status = unsafe {
+            cudarc::cublas::sys::cublasDaxpy_v2(
+                *blas.handle(),
+                n_i,
+                &alpha,
+                x_ptr as *const f64,
+                1,
+                y_ptr as *mut f64,
+                1,
+            )
+        };
+        if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(ArrowSchurGpuFailure::Unavailable)
+        }
+    }
+
+    fn device_dot(
+        blas: &CudaBlas,
+        stream: &Arc<CudaStream>,
+        n: usize,
+        x: &CudaSlice<f64>,
+        y: &CudaSlice<f64>,
+    ) -> Result<f64, ArrowSchurGpuFailure> {
+        let n_i = to_i32(n).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let (x_ptr, _x_rec) = x.device_ptr(stream);
+        let (y_ptr, _y_rec) = y.device_ptr(stream);
+        let mut result = 0.0_f64;
+        // SAFETY: x and y are live device allocations on this stream with at
+        // least n contiguous f64 entries and unit stride; result is a valid host
+        // out-pointer for the cuBLAS scalar.
+        let status = unsafe {
+            cudarc::cublas::sys::cublasDdot_v2(
+                *blas.handle(),
+                n_i,
+                x_ptr as *const f64,
+                1,
+                y_ptr as *const f64,
+                1,
+                &mut result,
+            )
+        };
+        if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            Ok(result)
+        } else {
+            Err(ArrowSchurGpuFailure::Unavailable)
+        }
+    }
+
+    fn device_nrm2(
+        blas: &CudaBlas,
+        stream: &Arc<CudaStream>,
+        n: usize,
+        x: &CudaSlice<f64>,
+    ) -> Result<f64, ArrowSchurGpuFailure> {
+        let n_i = to_i32(n).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let (x_ptr, _x_rec) = x.device_ptr(stream);
+        let mut result = 0.0_f64;
+        // SAFETY: x is a live device allocation on this stream with at least n
+        // contiguous f64 entries and unit stride; result is a valid host
+        // out-pointer for the cuBLAS scalar.
+        let status = unsafe {
+            cudarc::cublas::sys::cublasDnrm2_v2(
+                *blas.handle(),
+                n_i,
+                x_ptr as *const f64,
+                1,
+                &mut result,
+            )
+        };
+        if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            Ok(result)
+        } else {
+            Err(ArrowSchurGpuFailure::Unavailable)
+        }
     }
 }
 
@@ -2135,6 +2408,97 @@ mod tests {
             sys.gb[r] = sample();
         }
         sys
+    }
+
+    fn device_pcg_fixture(k: usize) -> (Array2<f64>, Array1<f64>) {
+        let mut s = Array2::<f64>::zeros((k, k));
+        for row in 0..k {
+            s[[row, row]] = 2.5 + 0.001 * ((row % 17) as f64);
+            if row + 1 < k {
+                s[[row, row + 1]] = -0.05;
+                s[[row + 1, row]] = -0.05;
+            }
+            if row + 7 < k {
+                s[[row, row + 7]] = 0.01;
+                s[[row + 7, row]] = 0.01;
+            }
+        }
+        let rhs = Array1::from_shape_fn(k, |idx| ((idx as f64 + 1.0) * 0.013).sin());
+        (s, rhs)
+    }
+
+    fn dense_pcg_cpu_reference(
+        s: &Array2<f64>,
+        rhs: &Array1<f64>,
+        max_iterations: usize,
+        relative_tolerance: f64,
+    ) -> Array1<f64> {
+        let k = rhs.len();
+        let rhs_norm = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if rhs_norm == 0.0 {
+            return Array1::<f64>::zeros(k);
+        }
+        let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
+        let inv_diag: Vec<f64> = (0..k).map(|idx| 1.0 / s[[idx, idx]]).collect();
+        let mut x = Array1::<f64>::zeros(k);
+        let mut r = rhs.clone();
+        let mut z = Array1::from_shape_fn(k, |idx| inv_diag[idx] * r[idx]);
+        let mut p = z.clone();
+        let mut sp = Array1::<f64>::zeros(k);
+        let mut rz = r.iter().zip(z.iter()).map(|(a, b)| a * b).sum::<f64>();
+        for _ in 0..max_iterations.max(1) {
+            for row in 0..k {
+                let mut acc = 0.0;
+                for col in 0..k {
+                    acc += s[[row, col]] * p[col];
+                }
+                sp[row] = acc;
+            }
+            let p_sp = p.iter().zip(sp.iter()).map(|(a, b)| a * b).sum::<f64>();
+            let alpha = rz / p_sp;
+            for idx in 0..k {
+                x[idx] += alpha * p[idx];
+                r[idx] -= alpha * sp[idx];
+            }
+            let r_norm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if r_norm <= tol {
+                break;
+            }
+            for idx in 0..k {
+                z[idx] = inv_diag[idx] * r[idx];
+            }
+            let rz_next = r.iter().zip(z.iter()).map(|(a, b)| a * b).sum::<f64>();
+            let beta = rz_next / rz;
+            for idx in 0..k {
+                p[idx] = z[idx] + beta * p[idx];
+            }
+            rz = rz_next;
+        }
+        x
+    }
+
+    #[test]
+    fn device_resident_pcg_matches_cpu_reference_when_cuda_admits() {
+        let (s, rhs) = device_pcg_fixture(512);
+        let max_iterations = 200usize;
+        let relative_tolerance = 1.0e-12;
+        let cpu = dense_pcg_cpu_reference(&s, &rhs, max_iterations, relative_tolerance);
+        let Ok((device, diag)) =
+            solve_reduced_beta_pcg_with_diagnostics(&s, &rhs, max_iterations, relative_tolerance)
+        else {
+            return;
+        };
+        let max_err = cpu
+            .iter()
+            .zip(device.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_err <= 1.0e-10,
+            "device resident PCG parity failed: max_err={max_err:e}, diag={diag:?}"
+        );
+        assert!(diag.matvec_calls > 0);
+        assert_eq!(diag.matvec_calls, diag.iterations);
     }
 
     #[test]
