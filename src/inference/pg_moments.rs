@@ -29,6 +29,8 @@
 
 use std::f64::consts::PI;
 
+use crate::inference::quadrature::compute_gauss_hermite_n;
+
 /// Closed-form moments of `PG(b, c)`.
 ///
 /// `mean = E[PG(b, c)] = b · tanh(c/2) / (2c)` with the removable `c → 0`
@@ -126,7 +128,7 @@ impl PgQuadrature {
     pub fn matched(b: f64, c: f64, tolerance: f64) -> Self {
         let tilt = c.abs();
         let n = node_count_for_tolerance(tolerance);
-        let (xi, gh_w) = gauss_hermite(n);
+        let gh = compute_gauss_hermite_n(n);
 
         // Log-normal carrier matched to PG mean/variance.
         let mu = pg_mean(b, tilt).max(f64::MIN_POSITIVE);
@@ -148,7 +150,8 @@ impl PgQuadrature {
         let mut raw: Vec<(f64, f64)> = Vec::with_capacity(n);
         let mut wsum = 0.0;
         for q in 0..n {
-            let z = sqrt2 * xi[q];
+            let gh_idx = n - 1 - q;
+            let z = sqrt2 * gh.nodes[gh_idx];
             let log_omega = m + s * z;
             let omega = log_omega.exp();
             // Ratio of the target PG density to the log-normal carrier, up to a
@@ -160,7 +163,7 @@ impl PgQuadrature {
             // Gauss–Hermite weight includes the e^{ξ²} that the substitution
             // re-introduces: w_GH already carries e^{−ξ²}, so multiply by the
             // carrier ratio and the √π normaliser folded into renormalisation.
-            let w = gh_w[q] * ratio;
+            let w = gh.weights[gh_idx] * ratio;
             if w.is_finite() && w > 0.0 {
                 raw.push((omega, w));
                 wsum += w;
@@ -258,70 +261,6 @@ fn pg_log_density(b: f64, c: f64, omega: f64) -> f64 {
     // sum is dominated by k=0 at the quadrature scale.
     let base = -1.5 * omega.ln() - 1.0 / (8.0 * omega);
     tilt_term + b * base
-}
-
-/// `n`-point Gauss–Hermite nodes and weights for `∫ e^{−x²} f(x) dx`.
-///
-/// Nodes are the roots of the physicists' Hermite polynomial `H_n`; computed by
-/// Newton iteration from the standard asymptotic seeds with the three-term
-/// recurrence, so the rule is exact-to-machine and fully deterministic for the
-/// small `n` (≤ 21) this module uses.
-fn gauss_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut nodes = vec![0.0; n];
-    let mut weights = vec![0.0; n];
-    let nf = n as f64;
-    for i in 0..n {
-        // Initial guess (Stroud–Secrest seeds).
-        let mut x = match i {
-            0 => (2.0 * nf + 1.0).sqrt() - 1.857_3 * (2.0 * nf + 1.0).powf(-1.0 / 6.0),
-            1 => nodes[0] - 1.14 * nf.powf(0.426) / nodes[0],
-            2 => 1.86 * nodes[1] - 0.86 * nodes[0],
-            3 => 1.91 * nodes[2] - 0.91 * nodes[1],
-            _ => 2.0 * nodes[i - 1] - nodes[i - 2],
-        };
-        for _ in 0..100 {
-            let (p, dp) = hermite_p_dp(n, x);
-            let dx = p / dp;
-            x -= dx;
-            if dx.abs() < 1e-15 {
-                break;
-            }
-        }
-        nodes[i] = x;
-        // Weight w_i = 2^{n−1} n! √π / (n² H_{n−1}(x_i)²).
-        let (pnm1, _) = hermite_p_dp(n - 1, x);
-        let log_w = (n as f64 - 1.0) * std::f64::consts::LN_2 + ln_factorial(n) + 0.5 * PI.ln()
-            - 2.0 * nf.ln()
-            - 2.0 * pnm1.abs().ln();
-        weights[i] = log_w.exp();
-    }
-    (nodes, weights)
-}
-
-/// Physicists' Hermite `H_n(x)` and its derivative via the three-term
-/// recurrence `H_{k+1} = 2x H_k − 2k H_{k−1}`, `H_n' = 2n H_{n−1}`.
-fn hermite_p_dp(n: usize, x: f64) -> (f64, f64) {
-    if n == 0 {
-        return (1.0, 0.0);
-    }
-    let mut p_prev = 1.0;
-    let mut p = 2.0 * x;
-    for k in 1..n {
-        let p_next = 2.0 * x * p - 2.0 * k as f64 * p_prev;
-        p_prev = p;
-        p = p_next;
-    }
-    let dp = 2.0 * n as f64 * p_prev;
-    (p, dp)
-}
-
-/// `ln(n!)` via the exact small-`n` product (this module only needs `n ≤ 21`).
-fn ln_factorial(n: usize) -> f64 {
-    let mut acc = 0.0;
-    for k in 2..=n {
-        acc += (k as f64).ln();
-    }
-    acc
 }
 
 /// Numerically stable `ln Σ_q exp(t_q)`.
@@ -426,9 +365,14 @@ mod tests {
     /// Gauss–Hermite must reproduce `∫ e^{−x²} dx = √π` and `∫ x² e^{−x²} = √π/2`.
     #[test]
     fn gauss_hermite_exact_low_moments() {
-        let (x, w) = gauss_hermite(9);
-        let m0: f64 = w.iter().sum();
-        let m2: f64 = x.iter().zip(w.iter()).map(|(xi, wi)| wi * xi * xi).sum();
+        let gh = compute_gauss_hermite_n(9);
+        let m0: f64 = gh.weights.iter().sum();
+        let m2: f64 = gh
+            .nodes
+            .iter()
+            .zip(gh.weights.iter())
+            .map(|(xi, wi)| wi * xi * xi)
+            .sum();
         assert!((m0 - PI.sqrt()).abs() < 1e-10, "m0 {m0}");
         assert!((m2 - 0.5 * PI.sqrt()).abs() < 1e-10, "m2 {m2}");
     }
