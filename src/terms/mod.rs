@@ -21,6 +21,7 @@ pub mod sae_corpus;
 pub mod sae_encode_atlas;
 pub mod sae_manifold;
 pub mod sae_optimality_certificate;
+pub mod sae_row_jet_program;
 pub mod sheaf;
 pub mod skip_transcoder;
 pub mod smooth;
@@ -69,5 +70,8 @@ pub use sae_encode_atlas::{
 pub use sae_optimality_certificate::{
     CriterionCertificate, DirectionalSamples, certificate_from_samples,
     deterministic_probe_direction, probe_step,
+};
+pub use sae_row_jet_program::{
+    AtomRowBasisJet, RowGate, SaeReconstructionRowProgram,
 };
 pub use sheaf::{EdgeRestriction, SheafConsistencyPenalty};
