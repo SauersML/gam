@@ -15172,11 +15172,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let head_beta_key: Array1<f64> = flatten_state_betas(&states, specs);
             let head_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
                 if jeffreys_skippable_this_cycle {
+                    log::info!("[bug979-diag] head jeffreys: skippable");
                     None
                 } else if let Some((_, grad_phi, hphi)) = jeffreys_triple_cache
                     .as_ref()
                     .filter(|(key, _, _)| *key == head_beta_key)
                 {
+                    log::info!(
+                        "[bug979-diag] head jeffreys: cache hit |grad_phi|={:.3e}",
+                        grad_phi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
+                    );
                     // Cross-cycle cache hit: the previous cycle's post-step KKT
                     // residual already computed the exact triple at this β. Reuse.
                     Some((grad_phi.clone(), hphi.clone()))
@@ -15189,9 +15194,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 && hphi.nrows() == total_p
                                 && hphi.ncols() == total_p =>
                         {
+                            log::info!(
+                                "[bug979-diag] head jeffreys: computed |grad_phi|={:.3e} |hphi|={:.3e}",
+                                grad_phi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
+                                hphi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
+                            );
                             Some((grad_phi, hphi))
                         }
-                        _ => None,
+                        other => {
+                            log::info!(
+                                "[bug979-diag] head jeffreys: guard miss, term_some={} grad_joint_len={} total_p={}",
+                                other.is_some(),
+                                grad_joint.len(),
+                                total_p
+                            );
+                            None
+                        }
                     };
                     if let Some((grad_phi, hphi)) = term.as_ref() {
                         jeffreys_triple_cache =
@@ -16745,6 +16763,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             && hphi.nrows() == total_p
                             && hphi.ncols() == total_p =>
                     {
+                        log::info!(
+                            "[bug979-diag] post-step jeffreys: computed |grad_phi|={:.3e} |hphi|={:.3e}",
+                            grad_phi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
+                            hphi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
+                        );
                         let augmented = gradient + &grad_phi;
                         // Cache the exact triple at the just-accepted β so the next
                         // cycle's head reuses it instead of recomputing the
