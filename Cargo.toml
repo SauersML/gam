@@ -199,6 +199,10 @@ harness = false
 name = "arrow_schur_hill_climb"
 path = "examples/perf/arrow_schur_hill_climb.rs"
 
+[[example]]
+name = "sae_perf_harness"
+path = "examples/sae_perf_harness.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

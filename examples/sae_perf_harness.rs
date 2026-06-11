@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
+use gam::gpu::sae_resident::{DeviceResidentArrowError, qwen_non_gating_fixture};
 use gam::solver::arrow_schur::ArrowSolveOptions;
 use gam::solver::estimate::EstimationError;
 use gam::solver::outer_strategy::{
@@ -11,8 +12,7 @@ use gam::solver::outer_strategy::{
 use gam::terms::sae_manifold::EuclideanPatchEvaluator;
 use gam::terms::{
     AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho,
-    SaeManifoldTerm,
+    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
 };
 use ndarray::{Array1, Array2};
 
@@ -25,6 +25,9 @@ const OUTER_MAX_ITER: usize = 4;
 const LEARNING_RATE: f64 = 0.6;
 const RIDGE_EXT_COORD: f64 = 1.0e-4;
 const RIDGE_BETA: f64 = 1.0e-4;
+const DEVICE_RIDGE_T: f64 = 0.0;
+const DEVICE_RIDGE_BETA: f64 = 0.0;
+const DEVICE_PARITY_TOL: f64 = 1.0e-10;
 
 #[derive(Clone, Copy)]
 enum Topology {
@@ -289,6 +292,85 @@ fn print_stage(shape: &Shape, stage: &str, elapsed_ms: f64, extra: &str) {
     }
 }
 
+fn max_abs_diff(lhs: &[f64], rhs: &[f64]) -> f64 {
+    lhs.iter()
+        .zip(rhs)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max)
+}
+
+fn run_device_inner_iter(shape: &Shape) -> Result<(), String> {
+    let build_start = Instant::now();
+    let workspace = qwen_non_gating_fixture().map_err(|err| err.to_string())?;
+    let build_ms = ms(build_start);
+
+    let cpu_start = Instant::now();
+    let cpu = workspace
+        .cpu_reference_step(DEVICE_RIDGE_T, DEVICE_RIDGE_BETA)
+        .map_err(|err| format!("device_inner_iter CPU reference failed: {err}"))?;
+    let cpu_ms = ms(cpu_start);
+
+    let device_start = Instant::now();
+    let device = match workspace.one_inner_iteration(DEVICE_RIDGE_T, DEVICE_RIDGE_BETA) {
+        Ok(step) => step,
+        Err(DeviceResidentArrowError::Unavailable { reason }) => {
+            print_stage(
+                shape,
+                "device_inner_iter",
+                ms(device_start),
+                &format!(
+                    "status=skipped reason=\"{}\" build_ms={build_ms:.3} cpu_ms={cpu_ms:.3} host_bytes={} device_bytes={}",
+                    reason.replace('"', "'"),
+                    workspace.host_shadow_bytes(),
+                    workspace.resident_device_bytes()
+                ),
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(format!("device_inner_iter device solve failed: {err}")),
+    };
+    let device_ms = ms(device_start);
+
+    let dt_err = max_abs_diff(
+        cpu.delta_t.as_slice().ok_or("CPU delta_t not contiguous")?,
+        device
+            .delta_t
+            .as_slice()
+            .ok_or("device delta_t not contiguous")?,
+    );
+    let db_err = max_abs_diff(
+        cpu.delta_beta
+            .as_slice()
+            .ok_or("CPU delta_beta not contiguous")?,
+        device
+            .delta_beta
+            .as_slice()
+            .ok_or("device delta_beta not contiguous")?,
+    );
+    let logdet_err = (cpu.log_det_hessian - device.log_det_hessian).abs();
+    let max_err = dt_err.max(db_err).max(logdet_err);
+    print_stage(
+        shape,
+        "device_inner_iter",
+        device_ms,
+        &format!(
+            "status=ok build_ms={build_ms:.3} cpu_ms={cpu_ms:.3} speedup={:.3} max_abs_step_err={max_err:.3e} objective={:.6e} grad_norm={:.6e} used_device={} host_bytes={} device_bytes={}",
+            cpu_ms / device_ms.max(f64::MIN_POSITIVE),
+            device.objective,
+            device.gradient_norm,
+            device.used_device,
+            workspace.host_shadow_bytes(),
+            workspace.resident_device_bytes()
+        ),
+    );
+    if max_err > DEVICE_PARITY_TOL {
+        return Err(format!(
+            "device_inner_iter parity failed: max_abs_step_err={max_err:e} > {DEVICE_PARITY_TOL:e}"
+        ));
+    }
+    Ok(())
+}
+
 fn run(shape: Shape) -> Result<(), String> {
     let total_start = Instant::now();
     let fixture = build_fixture(shape)?;
@@ -297,11 +379,8 @@ fn run(shape: Shape) -> Result<(), String> {
 
     let mut term_for_assemble = fixture.term.clone();
     let start = Instant::now();
-    let assembled = term_for_assemble.assemble_arrow_schur(
-        fixture.target.view(),
-        &fixture.rho,
-        None,
-    )?;
+    let assembled =
+        term_for_assemble.assemble_arrow_schur(fixture.target.view(), &fixture.rho, None)?;
     print_stage(
         &fixture.shape,
         "assemble_arrow_schur",
@@ -317,7 +396,11 @@ fn run(shape: Shape) -> Result<(), String> {
 
     let start = Instant::now();
     let (_delta_t, _delta_beta, solve_diag) = assembled
-        .solve_with_options(0.0, 0.0, &ArrowSolveOptions::direct().with_ill_conditioning_tolerated())
+        .solve_with_options(
+            0.0,
+            0.0,
+            &ArrowSolveOptions::direct().with_ill_conditioning_tolerated(),
+        )
         .map_err(|err| format!("inner solve failed: {err}"))?;
     print_stage(
         &fixture.shape,
@@ -325,6 +408,10 @@ fn run(shape: Shape) -> Result<(), String> {
         ms(start),
         &format!("pcg_iterations={}", solve_diag.iterations),
     );
+
+    if fixture.shape.name == "qwen" {
+        run_device_inner_iter(&fixture.shape)?;
+    }
 
     let mut term_for_criterion = fixture.term.clone();
     let start = Instant::now();
@@ -341,7 +428,10 @@ fn run(shape: Shape) -> Result<(), String> {
         &fixture.shape,
         "criterion_eval",
         ms(start),
-        &format!("criterion={criterion:.12e} loss_total={:.12e}", loss.total()),
+        &format!(
+            "criterion={criterion:.12e} loss_total={:.12e}",
+            loss.total()
+        ),
     );
 
     let init_rho_flat = fixture.rho.to_flat();
@@ -386,7 +476,9 @@ fn run(shape: Shape) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let mut args = env::args();
-    let program = args.next().unwrap_or_else(|| "sae_perf_harness".to_string());
+    let program = args
+        .next()
+        .unwrap_or_else(|| "sae_perf_harness".to_string());
     let Some(shape_name) = args.next() else {
         eprintln!("usage: {program} <tiny|color|qwen>");
         return ExitCode::from(2);
