@@ -1038,10 +1038,11 @@ pub fn rounds_to_json(rounds: &[SearchLedger]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::structure_search::{CollapseAction, CollapseEvent, MoveVerdict};
+    use crate::solver::structure_search::{CollapseAction, CollapseEvent};
     use crate::terms::latent_coord::LatentManifold;
     use crate::terms::sae_manifold::{
-        AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
+        AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
+        SaeBasisEvaluator, SaeManifoldAtom,
     };
     use ndarray::Array2;
     use std::sync::Arc;
