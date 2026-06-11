@@ -11417,6 +11417,7 @@ fn fit_reduced_parametric_aft(
             penalized_objective: -log_likelihood,
             outer_iterations: 0,
             outer_gradient_norm: Some(0.0),
+            criterion_certificate: None,
             inner_cycles: 0,
             outer_converged: true,
             geometry,

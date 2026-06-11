@@ -34,7 +34,7 @@ use crate::families::custom_family::{FamilyChannelHessian, PenaltyMatrix};
 use crate::families::identifiability_compiler::{
     BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
-use crate::linalg::faer_ndarray::{FaerEigh, fast_ab, fast_abt};
+use crate::linalg::faer_ndarray::{FaerEigh, fast_ab};
 use crate::solver::gauge::{Gauge, assemble_block_triangular_t};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use faer::Side;
@@ -1263,13 +1263,13 @@ pub fn apply_per_term_survival_parametric_compile_to_designs(
 ///
 /// The full global triangular `T` is built from the per-term `V`/`R` blocks
 /// (diagonal `V_b`, strict-upper `−R_{a→b}` — identical to the matrix the
-/// result-time lift [`SmgsLiftViaT::from_v_and_r`] uses), then partitioned
+/// result-time lift [`Gauge::from_v_and_r`] uses), then partitioned
 /// into the three *block* ranges (raw = summed per-term raw widths, compiled =
 /// summed per-term kept widths). The resulting `CompiledMap` is interchangeable
 /// with one from
 /// [`crate::families::identifiability_compiler::compile_from_raw_grams`], so the
 /// existing [`apply_compiled_map_to_designs`] +
-/// [`SmgsLiftViaT::from_compiled_map`] machinery consumes it unchanged.
+/// [`Gauge::from_compiled_map`] machinery consumes it unchanged.
 ///
 /// This is the seam that lets the survival closed-form fast path engage on the
 /// *correct* identifiable quotient: the cheap η₁-only rawstack metric can
@@ -1315,282 +1315,6 @@ pub fn compiled_map_from_per_term(
         raw_from_compiled: t_full,
         compiled_block_ranges,
         raw_block_ranges,
-    }
-}
-
-/// Per-block V matrices for the SMGS result-time β lift. The block
-/// order is: index 0 = time, 1 = marginal, 2 = logslope, 3+ = flex
-/// (score_warp_dev, link_dev) which are NOT compiled by this path —
-/// they go through `identifiability_compiler::compile` independently
-/// at construction time via `install_compiled_flex_block_into_runtime`
-/// and need no result-time lift.
-#[derive(Debug, Clone)]
-pub struct SmgsLiftPerBlockV {
-    pub v_per_block: Vec<Array2<f64>>,
-}
-
-impl SmgsLiftPerBlockV {
-    /// Lift `block_betas[i]` from compiled width to raw via
-    /// `v_per_block[i] · block_betas[i]` when `i < v_per_block.len()`
-    /// and the V's shape matches; otherwise pass through unchanged
-    /// (so flex blocks and any other consumers stay untouched).
-    pub fn lift_block_betas(&self, block_betas: &mut [Array1<f64>]) {
-        for (i, beta) in block_betas.iter_mut().enumerate() {
-            if let Some(v) = self.v_per_block.get(i) {
-                if v.ncols() == beta.len() && v.nrows() != v.ncols() {
-                    let raw = v.dot(&*beta);
-                    *beta = raw;
-                }
-                // If v is square (identity case) we still apply for
-                // correctness, but the result equals input modulo
-                // floating noise.
-                else if v.ncols() == beta.len() && v.nrows() == v.ncols() {
-                    // Square V — likely identity. Apply for correctness;
-                    // the identity case is a no-op modulo float noise.
-                    let raw = v.dot(&*beta);
-                    *beta = raw;
-                }
-            }
-        }
-    }
-}
-
-/// Triangular block-upper-triangular lift `T` for the V+M-exact path.
-///
-/// Whereas [`SmgsLiftPerBlockV`] performs a strictly per-block lift
-/// `β_b_raw = V_b · θ_b`, the V+M-exact path requires a joint lift
-/// `β_raw = T · θ_full` where `T` is block-upper-triangular: the
-/// diagonal blocks are the per-block `V_b` matrices and the
-/// strictly-upper off-diagonal blocks are `−R_{a,b}` (the
-/// residualisation reparameterisations of earlier-priority block `a`
-/// against later block `b`'s compiled kept directions).
-///
-/// Mathematically, partitioning θ_full into per-block compiled vectors
-/// `θ = (θ_1, …, θ_B)` (concatenated in priority order) and the raw
-/// β_full into per-block raw vectors `β_raw = (β_1_raw, …, β_B_raw)`:
-///
-/// ```text
-///   β_a_raw = V_a · θ_a  −  Σ_{b > a} R_{a,b} · θ_b
-/// ```
-///
-/// `T` packages this as a single dense block-upper-triangular matrix
-/// of shape `(Σ p_b_raw) × (Σ p_b_compiled)`. When all `R_{a,b}` are
-/// zero (no cross-block residualisation), `T` reduces to the
-/// block-diagonal of `V`s and `lift_block_betas_via_t` agrees with
-/// applying [`SmgsLiftPerBlockV`] per block.
-#[derive(Debug, Clone)]
-pub struct SmgsLiftViaT {
-    pub t_full: Array2<f64>,
-    pub block_starts_compiled: Vec<usize>,
-    pub block_starts_raw: Vec<usize>,
-}
-
-impl SmgsLiftViaT {
-    /// Build `T_full` from per-block diagonal `V_b` matrices and the
-    /// strictly-upper off-diagonal `R_{a,b}` matrices.
-    ///
-    /// `r_per_term[b]` (when `Some`) packs ALL strictly-upper
-    /// off-diagonal columns for block `b` stacked row-wise across all
-    /// earlier-priority blocks `a < b`. It must have:
-    ///
-    /// - `nrows = Σ_{a < b} v_per_term[a].nrows()` (sum of raw widths
-    ///   of all earlier blocks), and
-    /// - `ncols = v_per_term[b].ncols()` (compiled width of block `b`).
-    ///
-    /// `r_per_term[0]` is unused (the first block has no earlier
-    /// blocks to residualise against) and should be `None`.
-    pub fn from_v_and_r(v_per_term: &[Array2<f64>], r_per_term: &[Option<Array2<f64>>]) -> Self {
-        let n_blocks = v_per_term.len();
-        let mut block_starts_compiled = Vec::with_capacity(n_blocks + 1);
-        let mut block_starts_raw = Vec::with_capacity(n_blocks + 1);
-        block_starts_compiled.push(0);
-        block_starts_raw.push(0);
-        for v in v_per_term {
-            let prev_c = *block_starts_compiled.last().unwrap();
-            let prev_r = *block_starts_raw.last().unwrap();
-            block_starts_compiled.push(prev_c + v.ncols());
-            block_starts_raw.push(prev_r + v.nrows());
-        }
-        let t_full = assemble_block_triangular_t(v_per_term, r_per_term);
-        Self {
-            t_full,
-            block_starts_compiled,
-            block_starts_raw,
-        }
-    }
-
-    /// Build directly from an already-assembled global `T` plus the
-    /// per-block raw and compiled width partitions. Useful when the
-    /// caller already has `T` from elsewhere (e.g. a dual-metric
-    /// compile that emits the global T directly).
-    pub fn from_t(t_full: Array2<f64>, raw_widths: &[usize], compiled_widths: &[usize]) -> Self {
-        assert_eq!(
-            raw_widths.len(),
-            compiled_widths.len(),
-            "SmgsLiftViaT::from_t: raw_widths len {} != compiled_widths len {}",
-            raw_widths.len(),
-            compiled_widths.len(),
-        );
-        let total_raw: usize = raw_widths.iter().sum();
-        let total_compiled: usize = compiled_widths.iter().sum();
-        assert_eq!(
-            t_full.dim(),
-            (total_raw, total_compiled),
-            "SmgsLiftViaT::from_t: T has shape {:?}, expected ({total_raw}, {total_compiled})",
-            t_full.dim(),
-        );
-        let mut block_starts_raw = Vec::with_capacity(raw_widths.len() + 1);
-        block_starts_raw.push(0);
-        for w in raw_widths {
-            block_starts_raw.push(block_starts_raw.last().copied().unwrap() + w);
-        }
-        let mut block_starts_compiled = Vec::with_capacity(compiled_widths.len() + 1);
-        block_starts_compiled.push(0);
-        for w in compiled_widths {
-            block_starts_compiled.push(block_starts_compiled.last().copied().unwrap() + w);
-        }
-        Self {
-            t_full,
-            block_starts_compiled,
-            block_starts_raw,
-        }
-    }
-
-    /// Apply the triangular lift to per-block compiled betas. Inputs
-    /// are concatenated into θ_full, multiplied by `T_full` to give
-    /// β_full, and split at `block_starts_raw` into per-block raw βs.
-    pub fn lift_block_betas_via_t(&self, compiled_block_betas: &[Array1<f64>]) -> Vec<Array1<f64>> {
-        let n_blocks = self.block_starts_compiled.len().saturating_sub(1);
-        assert_eq!(
-            compiled_block_betas.len(),
-            n_blocks,
-            "SmgsLiftViaT::lift_block_betas_via_t: got {} compiled block betas, expected {}",
-            compiled_block_betas.len(),
-            n_blocks,
-        );
-        for (b, beta) in compiled_block_betas.iter().enumerate() {
-            let expected = self.block_starts_compiled[b + 1] - self.block_starts_compiled[b];
-            assert_eq!(
-                beta.len(),
-                expected,
-                "SmgsLiftViaT::lift_block_betas_via_t: block {b} has β of len {}, expected compiled width {}",
-                beta.len(),
-                expected,
-            );
-        }
-        let total_compiled = *self.block_starts_compiled.last().unwrap_or(&0);
-        let mut theta_full = Array1::<f64>::zeros(total_compiled);
-        for (b, beta) in compiled_block_betas.iter().enumerate() {
-            let c0 = self.block_starts_compiled[b];
-            let c1 = self.block_starts_compiled[b + 1];
-            theta_full.slice_mut(ndarray::s![c0..c1]).assign(beta);
-        }
-        let beta_full = self.t_full.dot(&theta_full);
-        let mut out = Vec::with_capacity(n_blocks);
-        for b in 0..n_blocks {
-            let r0 = self.block_starts_raw[b];
-            let r1 = self.block_starts_raw[b + 1];
-            out.push(beta_full.slice(ndarray::s![r0..r1]).to_owned());
-        }
-        out
-    }
-
-    /// Push a *compiled-width* joint posterior covariance forward to the
-    /// raw coordinate frame via the exact linear lift `Σ_raw = T · Σ_θ ·
-    /// Tᵀ`.
-    ///
-    /// The inner Newton solves in compiled coordinates θ and reports the
-    /// posterior covariance `Σ_θ` of those `Σ p_b_compiled` parameters.
-    /// Raw-width inference (predict-time standard errors, Wald tests on
-    /// the original β columns) needs the covariance of `β_raw = T · θ`.
-    /// For an affine reparameterisation that is exactly the sandwich
-    /// `Σ_raw = T · Σ_θ · Tᵀ` — the same `T` (`V` on the diagonal,
-    /// `−R_{a→b}` off-diagonals) that [`lift_block_betas_via_t`] applies
-    /// to the point estimate, so the mean and its uncertainty stay
-    /// coordinate-consistent.
-    ///
-    /// Dropped raw directions (columns of `T` that are zero because the
-    /// audit removed that raw coordinate) receive exactly zero variance
-    /// and zero covariance with every other coordinate, which is correct:
-    /// a coordinate the reduced fit cannot move carries no posterior
-    /// uncertainty in raw space.
-    ///
-    /// `cov_compiled` must be `(total_compiled × total_compiled)` where
-    /// `total_compiled = Σ_b (block_starts_compiled[b+1] −
-    /// block_starts_compiled[b])`. The returned matrix is
-    /// `(total_raw × total_raw)` and symmetric (modulo floating noise —
-    /// symmetrised explicitly so downstream Cholesky / eigensolves see an
-    /// exactly symmetric input).
-    ///
-    /// [`lift_block_betas_via_t`]: SmgsLiftViaT::lift_block_betas_via_t
-    pub fn lift_covariance_via_t(&self, cov_compiled: &Array2<f64>) -> Array2<f64> {
-        let total_compiled = *self.block_starts_compiled.last().unwrap_or(&0);
-        assert_eq!(
-            cov_compiled.dim(),
-            (total_compiled, total_compiled),
-            "SmgsLiftViaT::lift_covariance_via_t: cov has shape {:?}, expected ({total_compiled}, {total_compiled})",
-            cov_compiled.dim(),
-        );
-        // Σ_raw = T · Σ_θ · Tᵀ, formed as (T · Σ_θ) · Tᵀ.
-        let t_cov = fast_ab(&self.t_full, cov_compiled);
-        let mut raw = fast_abt(&t_cov, &self.t_full);
-        // Symmetrise: T · Σ · Tᵀ is symmetric for symmetric Σ, but the
-        // two matmuls accumulate independent rounding, so average the
-        // transpose pair to land an exactly symmetric result.
-        let n = raw.nrows();
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let avg = 0.5 * (raw[[i, j]] + raw[[j, i]]);
-                raw[[i, j]] = avg;
-                raw[[j, i]] = avg;
-            }
-        }
-        raw
-    }
-
-    /// Build directly from a [`CompiledMap`] emitted by
-    /// [`crate::families::identifiability_compiler::compile_from_raw_grams`].
-    ///
-    /// `map.raw_from_compiled` IS the global triangular T (raw_total ×
-    /// compiled_total); `map.raw_block_ranges` and
-    /// `map.compiled_block_ranges` give the per-block partitions in raw
-    /// and compiled coordinates respectively. The `ordering` argument is
-    /// accepted purely as a length sanity check — the block partitions
-    /// already encode the ordering.
-    pub fn from_compiled_map(
-        map: &crate::families::identifiability_compiler::CompiledMap,
-        ordering: &[crate::families::identifiability_compiler::BlockOrder],
-    ) -> Self {
-        assert_eq!(
-            map.raw_block_ranges.len(),
-            map.compiled_block_ranges.len(),
-            "SmgsLiftViaT::from_compiled_map: CompiledMap raw_block_ranges len {} != \
-             compiled_block_ranges len {}",
-            map.raw_block_ranges.len(),
-            map.compiled_block_ranges.len(),
-        );
-        assert_eq!(
-            map.raw_block_ranges.len(),
-            ordering.len(),
-            "SmgsLiftViaT::from_compiled_map: ordering len {} != block count {}",
-            ordering.len(),
-            map.raw_block_ranges.len(),
-        );
-        let mut block_starts_raw = Vec::with_capacity(map.raw_block_ranges.len() + 1);
-        block_starts_raw.push(0);
-        for r in &map.raw_block_ranges {
-            block_starts_raw.push(r.end);
-        }
-        let mut block_starts_compiled = Vec::with_capacity(map.compiled_block_ranges.len() + 1);
-        block_starts_compiled.push(0);
-        for r in &map.compiled_block_ranges {
-            block_starts_compiled.push(r.end);
-        }
-        Self {
-            t_full: map.raw_from_compiled.clone(),
-            block_starts_compiled,
-            block_starts_raw,
-        }
     }
 }
 
@@ -2982,9 +2706,9 @@ mod tests {
         let v1 = Array2::<f64>::eye(2);
         let v_per_term = vec![v0, v1];
         let r_per_term: Vec<Option<Array2<f64>>> = vec![None, None];
-        let lift = SmgsLiftViaT::from_v_and_r(&v_per_term, &r_per_term);
+        let lift = Gauge::from_v_and_r(&v_per_term, &r_per_term);
         assert_eq!(lift.t_full.dim(), (5, 5));
-        assert_eq!(lift.block_starts_compiled, vec![0, 3, 5]);
+        assert_eq!(lift.block_starts_reduced, vec![0, 3, 5]);
         assert_eq!(lift.block_starts_raw, vec![0, 3, 5]);
         for i in 0..5 {
             for j in 0..5 {
@@ -2994,7 +2718,7 @@ mod tests {
         }
         let theta_0 = Array1::from(vec![1.0_f64, -2.0, 3.5]);
         let theta_1 = Array1::from(vec![-0.5_f64, 7.0]);
-        let lifted = lift.lift_block_betas_via_t(&[theta_0.clone(), theta_1.clone()]);
+        let lifted = lift.lift_block_betas(&[theta_0.clone(), theta_1.clone()]);
         assert_eq!(lifted.len(), 2);
         for (a, b) in theta_0.iter().zip(lifted[0].iter()) {
             assert!((a - b).abs() < 1e-14);
@@ -3021,14 +2745,14 @@ mod tests {
         r_b[[2, 0]] = -0.2;
         r_b[[2, 1]] = 0.5;
         let lift =
-            SmgsLiftViaT::from_v_and_r(&[v_a.clone(), v_b.clone()], &[None, Some(r_b.clone())]);
+            Gauge::from_v_and_r(&[v_a.clone(), v_b.clone()], &[None, Some(r_b.clone())]);
         assert_eq!(lift.t_full.dim(), (6, 5));
-        assert_eq!(lift.block_starts_compiled, vec![0, 3, 5]);
+        assert_eq!(lift.block_starts_reduced, vec![0, 3, 5]);
         assert_eq!(lift.block_starts_raw, vec![0, 3, 6]);
 
         let theta_a = Array1::from(vec![1.0_f64, 2.0, -1.5]);
         let theta_b = Array1::from(vec![0.5_f64, -0.25]);
-        let lifted = lift.lift_block_betas_via_t(&[theta_a.clone(), theta_b.clone()]);
+        let lifted = lift.lift_block_betas(&[theta_a.clone(), theta_b.clone()]);
         let r_theta_b = r_b.dot(&theta_b);
         let expected_a = &theta_a - &r_theta_b;
         assert_eq!(lifted[0].len(), 3);
@@ -3049,13 +2773,13 @@ mod tests {
     /// 2. Rank-1 consistency with the β lift: for a degenerate posterior
     ///    `Σ_θ = θ θᵀ`, the pushforward must equal `(T θ)(T θ)ᵀ`, i.e.
     ///    lifting the covariance of a point mass agrees with lifting the
-    ///    point itself. This couples `lift_covariance_via_t` to
-    ///    `lift_block_betas_via_t` exactly, so the mean and its
+    ///    point itself. This couples `lift_covariance` to
+    ///    `lift_block_betas` exactly, so the mean and its
     ///    uncertainty can never drift into inconsistent coordinates.
     #[test]
-    fn smgs_lift_covariance_via_t_identity_and_rank1_consistency() {
+    fn smgs_lift_covariance_identity_and_rank1_consistency() {
         // ── Invariant 1: identity T leaves the covariance unchanged. ──
-        let lift_id = SmgsLiftViaT::from_v_and_r(
+        let lift_id = Gauge::from_v_and_r(
             &[Array2::<f64>::eye(2), Array2::<f64>::eye(2)],
             &[None, None],
         );
@@ -3066,7 +2790,7 @@ mod tests {
                 cov[[i, j]] = 1.0 / (1.0 + (i as f64 - j as f64).abs());
             }
         }
-        let lifted_id = lift_id.lift_covariance_via_t(&cov);
+        let lifted_id = lift_id.lift_covariance(&cov);
         assert_eq!(lifted_id.dim(), (4, 4));
         for i in 0..4 {
             for j in 0..4 {
@@ -3092,7 +2816,7 @@ mod tests {
         r_b[[1, 1]] = 1.3;
         r_b[[2, 0]] = -0.2;
         r_b[[2, 1]] = 0.5;
-        let lift = SmgsLiftViaT::from_v_and_r(&[v_a, v_b], &[None, Some(r_b)]);
+        let lift = Gauge::from_v_and_r(&[v_a, v_b], &[None, Some(r_b)]);
 
         let theta_a = Array1::from(vec![1.0_f64, 2.0, -1.5]);
         let theta_b = Array1::from(vec![0.5_f64, -0.25]);
@@ -3107,9 +2831,9 @@ mod tests {
                 cov_rank1[[i, j]] = theta_full[i] * theta_full[j];
             }
         }
-        let lifted_cov = lift.lift_covariance_via_t(&cov_rank1);
+        let lifted_cov = lift.lift_covariance(&cov_rank1);
         // Reference: (T θ)(T θ)ᵀ via the point-estimate lift.
-        let lifted_blocks = lift.lift_block_betas_via_t(&[theta_a, theta_b]);
+        let lifted_blocks = lift.lift_block_betas(&[theta_a, theta_b]);
         let beta_raw = Array1::from(
             lifted_blocks
                 .iter()
@@ -3136,8 +2860,8 @@ mod tests {
         }
     }
 
-    /// When all R's are None, lift_block_betas_via_t must equal the
-    /// per-block V · θ lift produced by `SmgsLiftPerBlockV`.
+    /// When all R's are None, the triangular gauge lift must equal the
+    /// strictly per-block `V_b · θ_b` lift.
     #[test]
     fn smgs_lift_via_t_zero_r_matches_per_block_v_lift() {
         let mut v_a = Array2::<f64>::zeros((3, 2));
@@ -3152,10 +2876,10 @@ mod tests {
         v_b[[2, 2]] = 0.7;
         v_b[[3, 2]] = -1.1;
         let v_per_term = vec![v_a.clone(), v_b.clone()];
-        let lift = SmgsLiftViaT::from_v_and_r(&v_per_term, &[None, None]);
+        let lift = Gauge::from_v_and_r(&v_per_term, &[None, None]);
         let theta_a = Array1::from(vec![0.3_f64, -1.4]);
         let theta_b = Array1::from(vec![2.1_f64, 0.0, -0.7]);
-        let via_t = lift.lift_block_betas_via_t(&[theta_a.clone(), theta_b.clone()]);
+        let via_t = lift.lift_block_betas(&[theta_a.clone(), theta_b.clone()]);
         let ref_a = v_a.dot(&theta_a);
         let ref_b = v_b.dot(&theta_b);
         assert_eq!(via_t[0].len(), ref_a.len());
@@ -3165,18 +2889,6 @@ mod tests {
         assert_eq!(via_t[1].len(), ref_b.len());
         for (g, w) in via_t[1].iter().zip(ref_b.iter()) {
             assert!((g - w).abs() < 1e-12);
-        }
-
-        let per_block = SmgsLiftPerBlockV {
-            v_per_block: v_per_term,
-        };
-        let mut block_betas = vec![theta_a, theta_b];
-        per_block.lift_block_betas(&mut block_betas);
-        for (got, want) in via_t[0].iter().zip(block_betas[0].iter()) {
-            assert!((got - want).abs() < 1e-12);
-        }
-        for (got, want) in via_t[1].iter().zip(block_betas[1].iter()) {
-            assert!((got - want).abs() < 1e-12);
         }
     }
 
@@ -3634,9 +3346,9 @@ mod tests {
             crate::families::identifiability_compiler::BlockOrder::Marginal,
             crate::families::identifiability_compiler::BlockOrder::Logslope,
         ];
-        let lift_from_map = SmgsLiftViaT::from_compiled_map(&map, &ordering);
+        let lift_from_map = Gauge::from_compiled_map(&map, &ordering);
         let v_all = vec![v_time, v_marg, v_log];
-        let lift_direct = SmgsLiftViaT::from_v_and_r(&v_all, &[None, Some(r_marg), Some(r_log)]);
+        let lift_direct = Gauge::from_v_and_r(&v_all, &[None, Some(r_marg), Some(r_log)]);
         assert_eq!(lift_from_map.t_full.dim(), lift_direct.t_full.dim());
         for i in 0..lift_from_map.t_full.nrows() {
             for j in 0..lift_from_map.t_full.ncols() {
