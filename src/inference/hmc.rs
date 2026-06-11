@@ -6225,11 +6225,14 @@ pub struct BlockSampledMoments {
 /// functional of β̂ (through η̂, the base deviance, the penalty scores, and
 /// W) with no stationarity of its own.
 ///
-/// Only channel (a) is implemented. The consequence is an
-/// objective↔gradient desync (the #752/#748/#808 bug class): whenever the
-/// fallback ENGAGES on a fit, the spliced gradient differs from the
-/// derivative of the spliced cost by channels (b)–(d), and the outer
-/// optimizer descends a surface that is not the one being evaluated.
+/// The sampler returns channel (a) in `rho_gradient` plus the moment set
+/// in [`BlockSampledMoments`]; the GLM runtime caller
+/// (`block_local_sampled_correction`) assembles channels (b)–(d) from those
+/// moments for every ρ coordinate, and DECLINES the splice when external
+/// (ψ) coordinates are present (their field-motion moments are not yet
+/// carried). Splicing a value whose gradient misses any channel is an
+/// objective↔gradient desync (the #752/#748/#808/#901 bug class): the outer
+/// optimizer would descend a surface that is not the one being evaluated.
 ///
 /// The principled completion (deliberately NOT a partial sum of cheap
 /// channels — a half-exact gradient still desyncs): the sampler returns

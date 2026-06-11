@@ -4784,6 +4784,16 @@ where
         );
         smoothing_correction = smoothing_outcome.into_correction();
 
+        // Tier-0 marginal-smoothing certificate (#938): while the REML objective
+        // is still live, sample the outer criterion around the converged ρ̂ to
+        // read the PSIS k̂ that says whether the plug-in + first-order V_ρ
+        // correction is adequate. This is the objective-lifecycle seam — the
+        // certificate runs against the SAME objective the fit converged on, so
+        // its criterion is the fit's own bit-for-bit (no retain/rebuild). Absent
+        // when there are no smoothing parameters or the outer Hessian is
+        // unavailable; never fatal.
+        let rho_posterior_certificate = reml_state.tier0_rho_certificate(&final_rho, None);
+
         // Standard errors: prefer the diagonal of the full inverse when
         // available; otherwise use the factorised Hessian from the EDF pass
         // (in transformed basis) to compute exact diagonal of H_orig⁻¹ =
@@ -4946,6 +4956,7 @@ where
         artifacts: FitArtifacts {
             pirls: Some(pirls_res),
             criterion_certificate: outer_result.criterion_certificate.clone(),
+            rho_posterior_certificate,
             ..Default::default()
         },
         inference,
@@ -5096,6 +5107,15 @@ pub struct FitArtifacts {
     /// gradient-free or an audit probe could not evaluate.
     #[serde(default)]
     pub criterion_certificate: Option<crate::solver::outer_strategy::CriterionCertificate>,
+    /// Tier-0 marginal-smoothing (`ρ`-uncertainty) PSIS certificate (#938):
+    /// the Pareto-`k̂` diagnostic that says whether the plug-in + first-order
+    /// `V_ρ` correction is adequate or `ρ`-uncertainty needs a heavier
+    /// quadrature/NUTS treatment. Computed against the live REML objective at
+    /// the converged `ρ̂` (see `RemlState::tier0_rho_certificate`). `None` when
+    /// there are no smoothing parameters or the outer Hessian was unavailable.
+    /// Re-derivable from the fit, so it is not serialized.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub rho_posterior_certificate: Option<crate::inference::rho_posterior::RhoPosteriorCertificate>,
 }
 
 impl std::fmt::Debug for FitArtifacts {
@@ -5116,6 +5136,7 @@ impl std::fmt::Debug for FitArtifacts {
                 &self.survival_link_wiggle_degree,
             )
             .field("criterion_certificate", &self.criterion_certificate)
+            .field("rho_posterior_certificate", &self.rho_posterior_certificate)
             .finish()
     }
 }
