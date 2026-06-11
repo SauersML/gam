@@ -30,24 +30,12 @@
 use gam::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, run_r};
+use gam::test_support::reference::{Column, r2, relative_l2, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
 
 const LIDAR_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/lidar.csv");
-
-/// Out-of-sample coefficient of determination of `pred` against `truth`,
-/// referenced to the held-out mean of `truth` (so a flat predictor scores 0
-/// and a predictor worse than the mean scores negative).
-fn r2(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
-    let n = truth.len() as f64;
-    let mean = truth.iter().sum::<f64>() / n;
-    let ss_res: f64 = pred.iter().zip(truth).map(|(p, y)| (y - p) * (y - p)).sum();
-    let ss_tot: f64 = truth.iter().map(|y| (y - mean) * (y - mean)).sum();
-    1.0 - ss_res / ss_tot.max(1e-300)
-}
 
 /// Root-mean-square error of `pred` against `truth`.
 fn rmse_pair(pred: &[f64], truth: &[f64]) -> f64 {

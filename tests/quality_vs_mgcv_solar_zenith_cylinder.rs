@@ -53,7 +53,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -65,18 +65,6 @@ const SZA_CSV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/bench/datasets/solar_zenith_angle.csv"
 );
-
-/// Coefficient of determination of `pred` against observed `truth`, relative to
-/// the mean predictor: `1 - SS_res / SS_tot`. R²=1 is perfect, R²=0 matches the
-/// held-out mean, R²<0 is worse than the mean.
-fn r2(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
-    let n = truth.len() as f64;
-    let mean = truth.iter().sum::<f64>() / n;
-    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
-    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
-    1.0 - ss_res / ss_tot.max(1e-300)
-}
 
 /// Map a calendar-month abbreviation to its 0-based index (jan=0 … dec=11).
 fn month_index(m: &str) -> usize {
