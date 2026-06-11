@@ -3652,7 +3652,7 @@ pub struct SaeManifoldFitDiagnostics {
 }
 
 /// Full SAE-manifold term.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SaeManifoldTerm {
     pub atoms: Vec<SaeManifoldAtom>,
     pub assignment: SaeAssignment,
@@ -3707,6 +3707,26 @@ pub struct SaeManifoldTerm {
     /// lock-step with the assembled system so the step interpretation cannot
     /// drift from the layout the system was built in.
     last_frames_active: bool,
+    /// Reusable dense β-tier workspace for analytic penalty assembly. SAE
+    /// immediately lowers the dense block into a `BetaPenaltyOp`, so the returned
+    /// `ArrowSchurSystem` does not need to keep owning the allocation.
+    border_hbb_workspace: Array2<f64>,
+}
+
+impl Clone for SaeManifoldTerm {
+    fn clone(&self) -> Self {
+        Self {
+            atoms: self.atoms.clone(),
+            assignment: self.assignment.clone(),
+            temperature_schedule: self.temperature_schedule.clone(),
+            last_row_layout: self.last_row_layout.clone(),
+            row_metric: self.row_metric.clone(),
+            collapse_events: self.collapse_events.clone(),
+            row_loss_weights: self.row_loss_weights.clone(),
+            last_frames_active: self.last_frames_active,
+            border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
+        }
+    }
 }
 
 /// Snapshot of exactly the mutable term state that an `apply_newton_step` +
@@ -3784,6 +3804,7 @@ impl SaeManifoldTerm {
             collapse_events: Vec::new(),
             row_loss_weights: None,
             last_frames_active: false,
+            border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
         })
     }
 
@@ -4481,6 +4502,24 @@ impl SaeManifoldTerm {
     pub fn beta_dim(&self) -> usize {
         let p = self.output_dim();
         self.atoms.iter().map(|a| a.basis_size() * p).sum()
+    }
+
+    fn take_border_hbb_workspace(&mut self, border_dim: usize) -> Array2<f64> {
+        let mut workspace = std::mem::replace(
+            &mut self.border_hbb_workspace,
+            Array2::<f64>::zeros((0, 0)),
+        );
+        if workspace.dim() != (border_dim, border_dim) {
+            workspace = Array2::<f64>::zeros((border_dim, border_dim));
+        } else {
+            workspace.fill(0.0);
+        }
+        workspace
+    }
+
+    fn reclaim_border_hbb_workspace(&mut self, sys: &mut ArrowSchurSystem) {
+        let workspace = std::mem::replace(&mut sys.hbb, Array2::<f64>::zeros((0, 0)));
+        self.border_hbb_workspace = workspace;
     }
 
     /// Factored arrow-Schur border dimension `Σ_k M_k · r_k` (issue #972): the
@@ -5622,11 +5661,12 @@ impl SaeManifoldTerm {
         };
         // Build the Arrow-Schur system: heterogeneous row dims when a compact
         // layout is active, uniform `q` otherwise.
+        let hbb_workspace = self.take_border_hbb_workspace(beta_dim);
         let mut sys = if let Some(ref layout) = row_layout {
             let per_row_dims: Vec<usize> = (0..n).map(|row| layout.row_q_active(row)).collect();
-            ArrowSchurSystem::new_with_per_row_dims(per_row_dims, beta_dim)
+            ArrowSchurSystem::new_with_per_row_dims_and_hbb(per_row_dims, beta_dim, hbb_workspace)
         } else {
-            ArrowSchurSystem::new(n, q, beta_dim)
+            ArrowSchurSystem::new_with_hbb(n, q, beta_dim, hbb_workspace)
         };
         // Apply accumulated smoothness-penalty gradients into sys.gb.
         for (i, g) in smooth_grad_gb.iter().enumerate() {
@@ -6443,7 +6483,7 @@ impl SaeManifoldTerm {
             // matrix-free factored operator carries the cross block).
             sys.k = border_dim;
             sys.gb = gb_c;
-            sys.hbb = Array2::<f64>::zeros((0, 0));
+            self.reclaim_border_hbb_workspace(&mut sys);
             // Factored per-atom block ranges for the block-Jacobi Schur
             // preconditioner: `[off_C[k] .. off_C[k] + M_k·r_k]`.
             let mut block_ranges: Vec<std::ops::Range<usize>> =
@@ -6499,6 +6539,7 @@ impl SaeManifoldTerm {
                 ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
             }
             sys.set_penalty_op(Arc::new(CompositePenaltyOp { k: beta_dim, ops }));
+            self.reclaim_border_hbb_workspace(&mut sys);
         }
         // Store the active-set layout for `apply_newton_step`.
         self.last_row_layout = row_layout;
@@ -13352,13 +13393,17 @@ mod tests {
              before={base_norm:.9e}, after={shrunk_norm:.9e}"
         );
 
-        // The β curvature block (hbb) must be PSD (it is the Newton/PIRLS
-        // curvature operator). Symmetric and non-negative diagonal at minimum.
+        // The β curvature block must be PSD. SAE returns `hbb` to the term
+        // workspace after lowering the block into the effective penalty operator,
+        // so validate the operator diagonal rather than the recycled field.
+        assert!(sys.hbb.is_empty());
+        let mut hbb_diag = vec![0.0_f64; m * p];
+        sys.effective_penalty_op().diagonal(&mut hbb_diag);
         for i in 0..m * p {
             assert!(
-                sys.hbb[[i, i]] >= -1.0e-9,
+                hbb_diag[i] >= -1.0e-9,
                 "hbb diagonal must be non-negative (PSD majorizer); hbb[{i},{i}]={:.3e}",
-                sys.hbb[[i, i]]
+                hbb_diag[i]
             );
         }
     }
