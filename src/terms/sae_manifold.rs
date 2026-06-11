@@ -14720,7 +14720,7 @@ mod tests {
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             Array2::<f64>::zeros((n, planes.len())),
             coord_blocks,
-            vec![LatentManifold::Circle; planes.len()],
+            vec![LatentManifold::Circle { period: 1.0 }; planes.len()],
             AssignmentMode::softmax(1.0),
         )
         .unwrap();

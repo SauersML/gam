@@ -2677,6 +2677,7 @@ pub fn cache_matches_system(cache: &ArrowFactorCache, sys: &ArrowSchurSystem) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solver::arrow_schur::ArrowFactorSlab;
 
     // Dense `H⁻¹` apply via explicit inverse (test-only reference solver).
     fn dense_inverse(h: &Array2<f64>) -> Array2<f64> {
