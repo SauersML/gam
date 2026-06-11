@@ -607,6 +607,63 @@ fn bessel_i1(x: f64) -> f64 {
 pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String>;
 
+    /// Column split for the curvature homotopy `Phi_eta = [linear, eta*curved]`.
+    ///
+    /// The default is a flat linear basis. Curved atom evaluators override this
+    /// with their topology-specific split; callers pass `n_basis` so the split is
+    /// checked against the concrete design width currently being evaluated.
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        Ok(PhiEtaSplit::all_linear(n_basis))
+    }
+
+    /// Evaluate the basis at curvature scale `eta in [0, 1]` plus the analytic
+    /// derivative with respect to eta.
+    ///
+    /// At `eta == 1.0` this leaves the existing basis and jet arrays untouched,
+    /// so the returned `phi`/`jet` are exactly the same values as [`Self::evaluate`].
+    fn evaluate_phi_eta(
+        &self,
+        coords: ArrayView2<'_, f64>,
+        eta: f64,
+    ) -> Result<PhiEtaEvaluation, String> {
+        if !(eta.is_finite() && (0.0..=1.0).contains(&eta)) {
+            return Err(format!(
+                "SaeBasisEvaluator::evaluate_phi_eta: eta must be finite in [0, 1]; got {eta}"
+            ));
+        }
+        let (mut phi, mut jet) = self.evaluate(coords)?;
+        let split = self.phi_eta_split(phi.ncols())?;
+        let mut dphi_deta = Array2::<f64>::zeros(phi.dim());
+        let mut djet_deta = Array3::<f64>::zeros(jet.dim());
+        for &col in &split.curved_cols {
+            if col >= phi.ncols() {
+                return Err(format!(
+                    "SaeBasisEvaluator::evaluate_phi_eta: curved column {col} exceeds basis width {}",
+                    phi.ncols()
+                ));
+            }
+            for row in 0..phi.nrows() {
+                dphi_deta[[row, col]] = phi[[row, col]];
+                if eta != 1.0 {
+                    phi[[row, col]] *= eta;
+                }
+                for axis in 0..jet.shape()[2] {
+                    djet_deta[[row, col, axis]] = jet[[row, col, axis]];
+                    if eta != 1.0 {
+                        jet[[row, col, axis]] *= eta;
+                    }
+                }
+            }
+        }
+        Ok(PhiEtaEvaluation {
+            phi,
+            jet,
+            dphi_deta,
+            djet_deta,
+            split,
+        })
+    }
+
     /// Object-safe forwarder to [`SaeBasisSecondJet::second_jet`] for callers
     /// holding `&dyn SaeBasisEvaluator` / `Arc<dyn SaeBasisEvaluator>`.
     ///
@@ -627,6 +684,88 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     /// exists for this evaluator. Evaluators without one return `None`
     /// explicitly; there is no finite-difference fallback.
     fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhiEtaSplit {
+    pub linear_cols: Vec<usize>,
+    pub curved_cols: Vec<usize>,
+}
+
+impl PhiEtaSplit {
+    pub fn all_linear(n_basis: usize) -> Self {
+        Self {
+            linear_cols: (0..n_basis).collect(),
+            curved_cols: Vec::new(),
+        }
+    }
+
+    fn from_curved_mask(mask: Vec<bool>) -> Self {
+        let mut linear_cols = Vec::new();
+        let mut curved_cols = Vec::new();
+        for (col, curved) in mask.into_iter().enumerate() {
+            if curved {
+                curved_cols.push(col);
+            } else {
+                linear_cols.push(col);
+            }
+        }
+        Self {
+            linear_cols,
+            curved_cols,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PhiEtaEvaluation {
+    pub phi: Array2<f64>,
+    pub jet: Array3<f64>,
+    pub dphi_deta: Array2<f64>,
+    pub djet_deta: Array3<f64>,
+    pub split: PhiEtaSplit,
+}
+
+fn monomial_linear_mask(dimension: usize, max_total_degree: usize) -> Vec<bool> {
+    crate::basis::monomial_exponents(dimension, max_total_degree)
+        .iter()
+        .map(|alpha| alpha.iter().sum::<usize>() <= 1)
+        .collect()
+}
+
+fn duchon_effective_order_for_eta(
+    centers: ArrayView2<'_, f64>,
+    order: crate::basis::DuchonNullspaceOrder,
+) -> crate::basis::DuchonNullspaceOrder {
+    let mut effective = order;
+    while effective != crate::basis::DuchonNullspaceOrder::Zero
+        && centers.nrows() <= duchon_polynomial_column_count(centers.ncols(), effective)
+    {
+        effective = match effective {
+            crate::basis::DuchonNullspaceOrder::Zero => crate::basis::DuchonNullspaceOrder::Zero,
+            crate::basis::DuchonNullspaceOrder::Linear => crate::basis::DuchonNullspaceOrder::Zero,
+            crate::basis::DuchonNullspaceOrder::Degree(2) => {
+                crate::basis::DuchonNullspaceOrder::Linear
+            }
+            crate::basis::DuchonNullspaceOrder::Degree(k) => {
+                crate::basis::DuchonNullspaceOrder::Degree(k - 1)
+            }
+        };
+    }
+    effective
+}
+
+fn duchon_polynomial_column_count(
+    dimension: usize,
+    order: crate::basis::DuchonNullspaceOrder,
+) -> usize {
+    match order {
+        crate::basis::DuchonNullspaceOrder::Zero => 1,
+        crate::basis::DuchonNullspaceOrder::Linear => dimension + 1,
+        crate::basis::DuchonNullspaceOrder::Degree(degree) => {
+            crate::basis::monomial_exponents(dimension, degree).len()
+        }
+    }
 }
 
 /// Bases that expose an analytic second jet
@@ -686,6 +825,21 @@ impl PeriodicHarmonicEvaluator {
 }
 
 impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        if n_basis != self.num_basis {
+            return Err(format!(
+                "PeriodicHarmonicEvaluator::phi_eta_split: n_basis {n_basis} != evaluator width {}",
+                self.num_basis
+            ));
+        }
+        let mut curved = vec![false; n_basis];
+        for h in 2..=(n_basis - 1) / 2 {
+            curved[2 * h - 1] = true;
+            curved[2 * h] = true;
+        }
+        Ok(PhiEtaSplit::from_curved_mask(curved))
+    }
+
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
@@ -819,6 +973,15 @@ impl RawPeriodicCircleEvaluator {
 }
 
 impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        if n_basis != 2 {
+            return Err(format!(
+                "RawPeriodicCircleEvaluator::phi_eta_split: n_basis {n_basis} != 2"
+            ));
+        }
+        Ok(PhiEtaSplit::all_linear(n_basis))
+    }
+
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         if coords.ncols() != self.latent_dim {
             return Some(Err(format!(
@@ -955,6 +1118,19 @@ pub fn sphere_chart_basis_jet(
 pub struct SphereChartEvaluator;
 
 impl SaeBasisEvaluator for SphereChartEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        if n_basis != 7 {
+            return Err(format!(
+                "SphereChartEvaluator::phi_eta_split: n_basis {n_basis} != 7"
+            ));
+        }
+        let mut curved = vec![false; n_basis];
+        for col in 4..7 {
+            curved[col] = true;
+        }
+        Ok(PhiEtaSplit::from_curved_mask(curved))
+    }
+
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
@@ -1192,6 +1368,40 @@ impl TorusHarmonicEvaluator {
 }
 
 impl SaeBasisEvaluator for TorusHarmonicEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        let expected = self.basis_size();
+        if n_basis != expected {
+            return Err(format!(
+                "TorusHarmonicEvaluator::phi_eta_split: n_basis {n_basis} != evaluator width {expected}"
+            ));
+        }
+        let d = self.latent_dim;
+        let axis_m = self.axis_basis_size();
+        let mut curved = Vec::with_capacity(n_basis);
+        let mut idx = vec![0usize; d];
+        for _flat in 0..n_basis {
+            let mut nonconstant_axes = 0usize;
+            let mut has_higher_harmonic = false;
+            for &axis_col in &idx {
+                if axis_col > 0 {
+                    nonconstant_axes += 1;
+                    if axis_col > 2 {
+                        has_higher_harmonic = true;
+                    }
+                }
+            }
+            curved.push(has_higher_harmonic || nonconstant_axes > 1);
+            for axis in (0..d).rev() {
+                idx[axis] += 1;
+                if idx[axis] < axis_m {
+                    break;
+                }
+                idx[axis] = 0;
+            }
+        }
+        Ok(PhiEtaSplit::from_curved_mask(curved))
+    }
+
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
@@ -1448,6 +1658,16 @@ impl AffineCoordinateEvaluator {
 }
 
 impl SaeBasisEvaluator for AffineCoordinateEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        let expected = self.latent_dim + 1;
+        if n_basis != expected {
+            return Err(format!(
+                "AffineCoordinateEvaluator::phi_eta_split: n_basis {n_basis} != {expected}"
+            ));
+        }
+        Ok(PhiEtaSplit::all_linear(n_basis))
+    }
+
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
@@ -1556,6 +1776,37 @@ impl DuchonCoordinateEvaluator {
 }
 
 impl SaeBasisEvaluator for DuchonCoordinateEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        let dim = self.centers.ncols();
+        let effective = duchon_effective_order_for_eta(self.centers.view(), self.order);
+        let n_poly = duchon_polynomial_column_count(dim, effective);
+        if n_basis < n_poly {
+            return Err(format!(
+                "DuchonCoordinateEvaluator::phi_eta_split: n_basis {n_basis} smaller than polynomial block {n_poly}"
+            ));
+        }
+        let n_kernel = n_basis - n_poly;
+        let mut curved = vec![false; n_basis];
+        for col in 0..n_kernel {
+            curved[col] = true;
+        }
+        if let crate::basis::DuchonNullspaceOrder::Degree(degree) = effective {
+            let linear_mask = monomial_linear_mask(dim, degree);
+            if linear_mask.len() != n_poly {
+                return Err(format!(
+                    "DuchonCoordinateEvaluator::phi_eta_split: polynomial mask width {} != {n_poly}",
+                    linear_mask.len()
+                ));
+            }
+            for (local_col, linear) in linear_mask.into_iter().enumerate() {
+                if !linear {
+                    curved[n_kernel + local_col] = true;
+                }
+            }
+        }
+        Ok(PhiEtaSplit::from_curved_mask(curved))
+    }
+
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
@@ -1639,6 +1890,19 @@ impl EuclideanPatchEvaluator {
 }
 
 impl SaeBasisEvaluator for EuclideanPatchEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        let linear_mask = monomial_linear_mask(self.latent_dim, self.max_degree);
+        if linear_mask.len() != n_basis {
+            return Err(format!(
+                "EuclideanPatchEvaluator::phi_eta_split: polynomial mask width {} != n_basis {n_basis}",
+                linear_mask.len()
+            ));
+        }
+        Ok(PhiEtaSplit::from_curved_mask(
+            linear_mask.into_iter().map(|linear| !linear).collect(),
+        ))
+    }
+
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
@@ -3513,6 +3777,47 @@ impl SaeOuterRhoGradientComponents {
     pub fn gradient_with_available_correction(&self) -> Array1<f64> {
         &self.gradient_excluding_unavailable_correction() + &self.third_order_correction
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct SaeArrowVector {
+    pub t: Array1<f64>,
+    pub beta: Array1<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SaeLocalRowVar {
+    Logit { atom: usize },
+    Coord { atom: usize, axis: usize },
+}
+
+#[derive(Debug, Clone)]
+struct SaeBorderChannel {
+    atom: usize,
+    basis_col: usize,
+    index: usize,
+    output: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct SaeRowJets {
+    vars: Vec<SaeLocalRowVar>,
+    first: Vec<Vec<f64>>,
+    second: Vec<Vec<Vec<f64>>>,
+    beta: Vec<Vec<f64>>,
+    beta_deriv: Vec<Vec<Vec<f64>>>,
+    beta_l_deriv: Vec<Vec<Vec<f64>>>,
+}
+
+fn sae_dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+}
+
+fn sae_sigmoid_derivatives_from_value(value: f64, inv_tau: f64, scale: f64) -> (f64, f64, f64) {
+    let sig = if scale > 0.0 { value / scale } else { 0.0 };
+    let dz = scale * sig * (1.0 - sig) * inv_tau;
+    let d2z = scale * sig * (1.0 - sig) * (1.0 - 2.0 * sig) * inv_tau * inv_tau;
+    (value, dz, d2z)
 }
 
 /// Cap on the number of coordinates at which a per-atom shape band is
@@ -8381,6 +8686,718 @@ impl SaeManifoldTerm {
         Ok(0.5 * trace)
     }
 
+    fn border_channels_for_cache(
+        &self,
+        cache: &ArrowFactorCache,
+    ) -> Result<Vec<SaeBorderChannel>, String> {
+        let p = self.output_dim();
+        let frames_active = self.last_frames_active && cache.k == self.factored_border_dim();
+        let offsets = if frames_active {
+            self.factored_beta_offsets()
+        } else {
+            self.beta_offsets()
+        };
+        let mut channels = Vec::with_capacity(cache.k);
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let m = atom.basis_size();
+            let frame = if frames_active {
+                self.frame_output_matrix(atom_idx)
+            } else {
+                Array2::<f64>::eye(p)
+            };
+            let r = frame.ncols();
+            for basis_col in 0..m {
+                for channel in 0..r {
+                    let mut output = vec![0.0_f64; p];
+                    for out_col in 0..p {
+                        output[out_col] = frame[[out_col, channel]];
+                    }
+                    channels.push(SaeBorderChannel {
+                        atom: atom_idx,
+                        basis_col,
+                        index: offsets[atom_idx] + basis_col * r + channel,
+                        output,
+                    });
+                }
+            }
+        }
+        if channels.len() != cache.k {
+            return Err(format!(
+                "border channel layout has {} entries but cache border has {}",
+                channels.len(),
+                cache.k
+            ));
+        }
+        Ok(channels)
+    }
+
+    fn row_vars_for_cache_row(
+        &self,
+        row: usize,
+        cache: &ArrowFactorCache,
+    ) -> Result<Vec<SaeLocalRowVar>, String> {
+        let q_row = cache.row_dims[row];
+        let mut vars: Vec<Option<SaeLocalRowVar>> = vec![None; q_row];
+        match self.last_row_layout {
+            Some(ref layout) => {
+                for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
+                    vars[pos] = Some(SaeLocalRowVar::Logit { atom });
+                    let start = layout.coord_starts[row][pos];
+                    let d = self.assignment.coords[atom].latent_dim();
+                    for axis in 0..d {
+                        vars[start + axis] = Some(SaeLocalRowVar::Coord { atom, axis });
+                    }
+                }
+            }
+            None => {
+                let assignment_dim = self.assignment.assignment_coord_dim();
+                let coord_offsets = self.assignment.coord_offsets();
+                for atom in 0..assignment_dim {
+                    vars[atom] = Some(SaeLocalRowVar::Logit { atom });
+                }
+                for atom in 0..self.k_atoms() {
+                    let start = coord_offsets[atom];
+                    let d = self.assignment.coords[atom].latent_dim();
+                    for axis in 0..d {
+                        vars[start + axis] = Some(SaeLocalRowVar::Coord { atom, axis });
+                    }
+                }
+            }
+        }
+        vars.into_iter()
+            .enumerate()
+            .map(|(idx, v)| {
+                v.ok_or_else(|| {
+                    format!("row_vars_for_cache_row: row {row} position {idx} was not mapped")
+                })
+            })
+            .collect()
+    }
+
+    fn atom_second_jets(&self) -> Result<Vec<Array4<f64>>, String> {
+        let mut out = Vec::with_capacity(self.k_atoms());
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let coords = self.assignment.coords[atom_idx].as_matrix();
+            let jet = if let Some(second) = atom.basis_second_jet.as_ref() {
+                second.second_jet(coords.view())?
+            } else {
+                let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
+                    format!(
+                        "logdet_theta_adjoint: atom '{}' has no basis evaluator for second jets",
+                        atom.name
+                    )
+                })?;
+                evaluator
+                    .second_jet_dyn(coords.view())
+                    .ok_or_else(|| {
+                        format!(
+                            "logdet_theta_adjoint: atom '{}' basis does not expose analytic second jets",
+                            atom.name
+                        )
+                    })??
+            };
+            let expected = (
+                atom.n_obs(),
+                atom.basis_size(),
+                atom.latent_dim,
+                atom.latent_dim,
+            );
+            if jet.dim() != expected {
+                return Err(format!(
+                    "logdet_theta_adjoint: atom '{}' second jet shape {:?}, expected {:?}",
+                    atom.name,
+                    jet.dim(),
+                    expected
+                ));
+            }
+            out.push(jet);
+        }
+        Ok(out)
+    }
+
+    fn gate_derivatives_for_row(
+        &self,
+        row: usize,
+        assignments: ArrayView1<'_, f64>,
+        vars: &[SaeLocalRowVar],
+    ) -> Result<(Vec<Vec<f64>>, Vec<Vec<Vec<f64>>>), String> {
+        let k_atoms = self.k_atoms();
+        let q = vars.len();
+        let mut dz = vec![vec![0.0_f64; k_atoms]; q];
+        let mut d2z = vec![vec![vec![0.0_f64; k_atoms]; q]; q];
+        match self.assignment.mode {
+            AssignmentMode::Softmax { temperature, .. } => {
+                let inv_tau = 1.0 / temperature;
+                for (a_idx, var_a) in vars.iter().enumerate() {
+                    let SaeLocalRowVar::Logit { atom: j } = *var_a else {
+                        continue;
+                    };
+                    for k in 0..k_atoms {
+                        let indicator = if k == j { 1.0 } else { 0.0 };
+                        dz[a_idx][k] = assignments[k] * (indicator - assignments[j]) * inv_tau;
+                    }
+                }
+                for (a_idx, var_a) in vars.iter().enumerate() {
+                    let SaeLocalRowVar::Logit { atom: j } = *var_a else {
+                        continue;
+                    };
+                    for (b_idx, var_b) in vars.iter().enumerate() {
+                        let SaeLocalRowVar::Logit { atom: l } = *var_b else {
+                            continue;
+                        };
+                        for k in 0..k_atoms {
+                            let ikl = if k == l { 1.0 } else { 0.0 };
+                            let ikj = if k == j { 1.0 } else { 0.0 };
+                            let ijl = if j == l { 1.0 } else { 0.0 };
+                            d2z[a_idx][b_idx][k] = assignments[k]
+                                * ((ikl - assignments[l]) * (ikj - assignments[j])
+                                    - assignments[j] * (ijl - assignments[l]))
+                                * inv_tau
+                                * inv_tau;
+                        }
+                    }
+                }
+            }
+            AssignmentMode::IBPMap {
+                temperature, alpha, ..
+            } => {
+                let prior = ibp_stick_breaking_prior(k_atoms, alpha);
+                let inv_tau = 1.0 / temperature;
+                for (idx, var) in vars.iter().enumerate() {
+                    let SaeLocalRowVar::Logit { atom } = *var else {
+                        continue;
+                    };
+                    let (_z, d1, d2) =
+                        sae_sigmoid_derivatives_from_value(assignments[atom], inv_tau, prior[atom]);
+                    dz[idx][atom] = d1;
+                    d2z[idx][idx][atom] = d2;
+                }
+            }
+            AssignmentMode::JumpReLU {
+                temperature,
+                threshold,
+            } => {
+                let inv_tau = 1.0 / temperature;
+                let logits = self.assignment.logits.row(row);
+                for (idx, var) in vars.iter().enumerate() {
+                    let SaeLocalRowVar::Logit { atom } = *var else {
+                        continue;
+                    };
+                    if logits[atom] <= threshold {
+                        continue;
+                    }
+                    let (_z, d1, d2) =
+                        sae_sigmoid_derivatives_from_value(assignments[atom], inv_tau, 1.0);
+                    dz[idx][atom] = d1;
+                    d2z[idx][idx][atom] = d2;
+                }
+            }
+        }
+        Ok((dz, d2z))
+    }
+
+    fn decoded_second_row(
+        atom: &SaeManifoldAtom,
+        second_jet: &Array4<f64>,
+        row: usize,
+        axis_a: usize,
+        axis_b: usize,
+        out: &mut [f64],
+    ) {
+        out.fill(0.0);
+        for basis_col in 0..atom.basis_size() {
+            let d2phi = second_jet[[row, basis_col, axis_a, axis_b]];
+            if d2phi == 0.0 {
+                continue;
+            }
+            for out_col in 0..atom.output_dim() {
+                out[out_col] += d2phi * atom.decoder_coefficients[[basis_col, out_col]];
+            }
+        }
+    }
+
+    fn row_jets_for_logdet(
+        &self,
+        row: usize,
+        vars: Vec<SaeLocalRowVar>,
+        assignments: ArrayView1<'_, f64>,
+        second_jets: &[Array4<f64>],
+        border: &[SaeBorderChannel],
+    ) -> Result<SaeRowJets, String> {
+        let p = self.output_dim();
+        let q = vars.len();
+        let k_atoms = self.k_atoms();
+        let sqrt_row_w = self
+            .row_loss_weights
+            .as_deref()
+            .map_or(1.0, |w| w[row].sqrt());
+        let (dz, d2z) = self.gate_derivatives_for_row(row, assignments, &vars)?;
+
+        let mut decoded = vec![vec![0.0_f64; p]; k_atoms];
+        let mut d1: Vec<Vec<Vec<f64>>> = self
+            .atoms
+            .iter()
+            .map(|atom| vec![vec![0.0_f64; p]; atom.latent_dim])
+            .collect();
+        let mut d2: Vec<Vec<Vec<Vec<f64>>>> = self
+            .atoms
+            .iter()
+            .map(|atom| vec![vec![vec![0.0_f64; p]; atom.latent_dim]; atom.latent_dim])
+            .collect();
+        let mut scratch = vec![0.0_f64; p];
+        for k in 0..k_atoms {
+            self.atoms[k].fill_decoded_row(row, &mut decoded[k]);
+            for axis in 0..self.atoms[k].latent_dim {
+                self.atoms[k].fill_decoded_derivative_row(row, axis, &mut d1[k][axis]);
+            }
+            for axis_a in 0..self.atoms[k].latent_dim {
+                for axis_b in 0..self.atoms[k].latent_dim {
+                    Self::decoded_second_row(
+                        &self.atoms[k],
+                        &second_jets[k],
+                        row,
+                        axis_a,
+                        axis_b,
+                        &mut scratch,
+                    );
+                    d2[k][axis_a][axis_b].clone_from_slice(&scratch);
+                }
+            }
+        }
+
+        let mut first = vec![vec![0.0_f64; p]; q];
+        for (idx, var) in vars.iter().enumerate() {
+            match *var {
+                SaeLocalRowVar::Logit { .. } => {
+                    for k in 0..k_atoms {
+                        let coeff = dz[idx][k] * sqrt_row_w;
+                        if coeff == 0.0 {
+                            continue;
+                        }
+                        for out_col in 0..p {
+                            first[idx][out_col] += coeff * decoded[k][out_col];
+                        }
+                    }
+                }
+                SaeLocalRowVar::Coord { atom, axis } => {
+                    let coeff = assignments[atom] * sqrt_row_w;
+                    for out_col in 0..p {
+                        first[idx][out_col] = coeff * d1[atom][axis][out_col];
+                    }
+                }
+            }
+        }
+
+        let mut second = vec![vec![vec![0.0_f64; p]; q]; q];
+        for a in 0..q {
+            for b in 0..q {
+                match (vars[a], vars[b]) {
+                    (SaeLocalRowVar::Logit { .. }, SaeLocalRowVar::Logit { .. }) => {
+                        for k in 0..k_atoms {
+                            let coeff = d2z[a][b][k] * sqrt_row_w;
+                            if coeff == 0.0 {
+                                continue;
+                            }
+                            for out_col in 0..p {
+                                second[a][b][out_col] += coeff * decoded[k][out_col];
+                            }
+                        }
+                    }
+                    (SaeLocalRowVar::Logit { .. }, SaeLocalRowVar::Coord { atom, axis }) => {
+                        let coeff = dz[a][atom] * sqrt_row_w;
+                        for out_col in 0..p {
+                            second[a][b][out_col] = coeff * d1[atom][axis][out_col];
+                        }
+                    }
+                    (SaeLocalRowVar::Coord { atom, axis }, SaeLocalRowVar::Logit { .. }) => {
+                        let coeff = dz[b][atom] * sqrt_row_w;
+                        for out_col in 0..p {
+                            second[a][b][out_col] = coeff * d1[atom][axis][out_col];
+                        }
+                    }
+                    (
+                        SaeLocalRowVar::Coord {
+                            atom: atom_a,
+                            axis: axis_a,
+                        },
+                        SaeLocalRowVar::Coord {
+                            atom: atom_b,
+                            axis: axis_b,
+                        },
+                    ) if atom_a == atom_b => {
+                        let coeff = assignments[atom_a] * sqrt_row_w;
+                        for out_col in 0..p {
+                            second[a][b][out_col] = coeff * d2[atom_a][axis_a][axis_b][out_col];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut beta = vec![vec![0.0_f64; p]; border.len()];
+        let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
+        let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
+        for (beta_pos, channel) in border.iter().enumerate() {
+            let atom = channel.atom;
+            let phi = self.atoms[atom].basis_values[[row, channel.basis_col]];
+            let base = assignments[atom] * phi * sqrt_row_w;
+            for out_col in 0..p {
+                beta[beta_pos][out_col] = base * channel.output[out_col];
+            }
+            for (var_idx, var) in vars.iter().enumerate() {
+                let scalar = match *var {
+                    SaeLocalRowVar::Logit { .. } => dz[var_idx][atom] * phi * sqrt_row_w,
+                    SaeLocalRowVar::Coord {
+                        atom: coord_atom,
+                        axis,
+                    } if coord_atom == atom => {
+                        assignments[atom]
+                            * self.atoms[atom].basis_jacobian[[row, channel.basis_col, axis]]
+                            * sqrt_row_w
+                    }
+                    _ => 0.0,
+                };
+                if scalar != 0.0 {
+                    for out_col in 0..p {
+                        beta_deriv[var_idx][beta_pos][out_col] = scalar * channel.output[out_col];
+                    }
+                }
+                let scalar_l = match *var {
+                    SaeLocalRowVar::Logit { .. } => {
+                        dz[var_idx][atom]
+                            * self.atoms[atom].basis_values[[row, channel.basis_col]]
+                            * sqrt_row_w
+                    }
+                    SaeLocalRowVar::Coord {
+                        atom: coord_atom,
+                        axis,
+                    } if coord_atom == atom => {
+                        assignments[atom]
+                            * self.atoms[atom].basis_jacobian[[row, channel.basis_col, axis]]
+                            * sqrt_row_w
+                    }
+                    _ => 0.0,
+                };
+                if scalar_l != 0.0 {
+                    for out_col in 0..p {
+                        beta_l_deriv[var_idx][beta_pos][out_col] =
+                            scalar_l * channel.output[out_col];
+                    }
+                }
+            }
+        }
+
+        Ok(SaeRowJets {
+            vars,
+            first,
+            second,
+            beta,
+            beta_deriv,
+            beta_l_deriv,
+        })
+    }
+
+    fn assignment_prior_hdiag_derivative_entry(
+        &self,
+        rho: &SaeManifoldRho,
+        row: usize,
+        diag_atom: usize,
+        wrt: SaeLocalRowVar,
+    ) -> f64 {
+        let SaeLocalRowVar::Logit { atom: wrt_atom } = wrt else {
+            return 0.0;
+        };
+        match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } => {
+                let assignments = self.assignment.assignments_row(row);
+                let inv_tau = 1.0 / temperature;
+                let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+                let k_atoms = assignments.len();
+                let mut l = vec![0.0_f64; k_atoms];
+                let mut mean = 0.0_f64;
+                for k in 0..k_atoms {
+                    l[k] = assignments[k].max(1.0e-300).ln() + 1.0;
+                    mean += assignments[k] * l[k];
+                }
+                let mut da = vec![0.0_f64; k_atoms];
+                for k in 0..k_atoms {
+                    let indicator = if k == wrt_atom { 1.0 } else { 0.0 };
+                    da[k] = assignments[k] * (indicator - assignments[wrt_atom]) * inv_tau;
+                }
+                let dmean: f64 = (0..k_atoms).map(|k| da[k] * l[k]).sum();
+                let k = diag_atom;
+                let term = (1.0 - 2.0 * assignments[k]) * (mean - l[k]) + assignments[k] - 1.0;
+                let dl_k = da[k] / assignments[k].max(1.0e-300);
+                let dterm = -2.0 * da[k] * (mean - l[k])
+                    + (1.0 - 2.0 * assignments[k]) * (dmean - dl_k)
+                    + da[k];
+                scale * (da[k] * term + assignments[k] * dterm)
+            }
+            AssignmentMode::JumpReLU {
+                temperature,
+                threshold,
+            } => {
+                if diag_atom != wrt_atom {
+                    return 0.0;
+                }
+                let logit = self.assignment.logits[[row, diag_atom]];
+                if !jumprelu_in_optimization_band(logit, threshold, temperature) {
+                    return 0.0;
+                }
+                let inv_tau = 1.0 / temperature;
+                let activation =
+                    crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+                let slope = activation * (1.0 - activation);
+                2.0 * rho.lambda_sparse()
+                    * slope
+                    * slope
+                    * (1.0 - 2.0 * activation)
+                    * inv_tau
+                    * inv_tau
+                    * inv_tau
+            }
+            AssignmentMode::IBPMap { .. } => 0.0,
+        }
+    }
+
+    fn ard_majorized_hessian_derivative(
+        &self,
+        rho: &SaeManifoldRho,
+        row: usize,
+        atom: usize,
+        axis: usize,
+    ) -> f64 {
+        if rho.log_ard[atom].is_empty() {
+            return 0.0;
+        }
+        let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
+        let periods = self.assignment.coords[atom].effective_axis_periods();
+        let t = self.assignment.coords[atom].row(row)[axis];
+        let prior = ArdAxisPrior::eval(alpha, t, periods[axis]);
+        if prior.hess <= 0.0 {
+            return 0.0;
+        }
+        match periods[axis] {
+            None => 0.0,
+            Some(period) => {
+                let kappa = std::f64::consts::TAU / period;
+                -alpha * kappa * (kappa * t).sin()
+            }
+        }
+    }
+
+    pub fn outer_rho_gradient_ift_rhs(
+        &self,
+        rho: &SaeManifoldRho,
+        j: usize,
+        cache: &ArrowFactorCache,
+    ) -> Result<SaeArrowVector, String> {
+        let n_params = rho.to_flat().len();
+        if j >= n_params {
+            return Err(format!(
+                "outer_rho_gradient_ift_rhs: coordinate {j} outside rho dim {n_params}"
+            ));
+        }
+        let mut t = Array1::<f64>::zeros(cache.delta_t_len());
+        let mut beta = Array1::<f64>::zeros(cache.k);
+        if j == 0 {
+            let (assignment_grad, _) = assignment_prior_grad_hdiag(&self.assignment, rho)?;
+            let k_atoms = self.k_atoms();
+            let assignment_dim = self.assignment.assignment_coord_dim();
+            for row in 0..self.n_obs() {
+                let base = cache.row_offsets[row];
+                let assignment_base = row * k_atoms;
+                match self.last_row_layout {
+                    Some(ref layout) => {
+                        for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
+                            t[base + pos] = assignment_grad[assignment_base + atom];
+                        }
+                    }
+                    None => {
+                        for free_idx in 0..assignment_dim {
+                            t[base + free_idx] = assignment_grad[assignment_base + free_idx];
+                        }
+                    }
+                }
+            }
+        } else if j == 1 {
+            let lambda = rho.lambda_smooth();
+            let frames_active = self.last_frames_active && cache.k == self.factored_border_dim();
+            let offsets = if frames_active {
+                self.factored_beta_offsets()
+            } else {
+                self.beta_offsets()
+            };
+            for (atom_idx, atom) in self.atoms.iter().enumerate() {
+                let m = atom.basis_size();
+                let coeffs = if frames_active {
+                    match &atom.decoder_frame {
+                        Some(frame) => frame.project_decoder(atom.decoder_coefficients.view())?,
+                        None => atom.decoder_coefficients.clone(),
+                    }
+                } else {
+                    atom.decoder_coefficients.clone()
+                };
+                let r = coeffs.ncols();
+                let off = offsets[atom_idx];
+                for mu in 0..m {
+                    for channel in 0..r {
+                        let mut acc = 0.0_f64;
+                        for nu in 0..m {
+                            let s_sym = 0.5
+                                * (atom.smooth_penalty[[mu, nu]] + atom.smooth_penalty[[nu, mu]]);
+                            acc += s_sym * coeffs[[nu, channel]];
+                        }
+                        beta[off + mu * r + channel] = lambda * acc;
+                    }
+                }
+            }
+        } else {
+            let mut cursor = 2usize;
+            for atom in 0..rho.log_ard.len() {
+                for axis in 0..rho.log_ard[atom].len() {
+                    if cursor == j {
+                        let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
+                        let periods = self.assignment.coords[atom].effective_axis_periods();
+                        for row in 0..self.n_obs() {
+                            let row_t = self.assignment.coords[atom].row(row);
+                            let prior = ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
+                            let Some(pos) = sae_coord_penalty_offset(
+                                self.last_row_layout.as_ref(),
+                                self.assignment.coord_offsets()[atom] + axis,
+                                row,
+                                atom,
+                            ) else {
+                                continue;
+                            };
+                            t[cache.row_offsets[row] + pos] = prior.grad;
+                        }
+                        return Ok(SaeArrowVector { t, beta });
+                    }
+                    cursor += 1;
+                }
+            }
+        }
+        Ok(SaeArrowVector { t, beta })
+    }
+
+    pub fn logdet_theta_adjoint(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+    ) -> Result<SaeArrowVector, String> {
+        let n = self.n_obs();
+        let total_t = cache.delta_t_len();
+        let mut gamma_t = Array1::<f64>::zeros(total_t);
+        let mut gamma_beta = Array1::<f64>::zeros(cache.k);
+        let second_jets = self.atom_second_jets()?;
+        let border = self.border_channels_for_cache(cache)?;
+        let schur_inv = if cache.k > 0 {
+            cache
+                .schur_inverse_block(0..cache.k)
+                .map_err(|err| format!("logdet_theta_adjoint: Schur inverse: {err}"))?
+        } else {
+            Array2::<f64>::zeros((0, 0))
+        };
+
+        for row in 0..n {
+            let q = cache.row_dims[row];
+            let base = cache.row_offsets[row];
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            let assignments = self.assignment.try_assignments_row(row)?;
+            let jets =
+                self.row_jets_for_logdet(row, vars, assignments.view(), &second_jets, &border)?;
+
+            let mut inv_vv = Array2::<f64>::zeros((q, q));
+            let mut inv_vbeta = Array2::<f64>::zeros((q, cache.k));
+            for col in 0..q {
+                let mut rhs_t = Array1::<f64>::zeros(total_t);
+                let rhs_beta = Array1::<f64>::zeros(cache.k);
+                rhs_t[base + col] = 1.0;
+                let (sol_t, sol_beta) =
+                    cache
+                        .solve_full(rhs_t.view(), rhs_beta.view())
+                        .map_err(|err| {
+                            format!("logdet_theta_adjoint: selected inverse solve: {err}")
+                        })?;
+                for r in 0..q {
+                    inv_vv[[r, col]] = sol_t[base + r];
+                }
+                for b in 0..cache.k {
+                    inv_vbeta[[col, b]] = sol_beta[b];
+                }
+            }
+
+            for w in 0..q {
+                let mut gamma = 0.0_f64;
+                for a in 0..q {
+                    for b in 0..q {
+                        let mut dh = sae_dot(&jets.second[a][w], &jets.first[b])
+                            + sae_dot(&jets.first[a], &jets.second[b][w]);
+                        if a == b {
+                            dh += match jets.vars[a] {
+                                SaeLocalRowVar::Logit { atom } => self
+                                    .assignment_prior_hdiag_derivative_entry(
+                                        rho,
+                                        row,
+                                        atom,
+                                        jets.vars[w],
+                                    ),
+                                SaeLocalRowVar::Coord { atom, axis } if a == w => {
+                                    self.ard_majorized_hessian_derivative(rho, row, atom, axis)
+                                }
+                                _ => 0.0,
+                            };
+                        }
+                        gamma += inv_vv[[b, a]] * dh;
+                    }
+                }
+                for a in 0..q {
+                    for (beta_pos, channel) in border.iter().enumerate() {
+                        let dh = sae_dot(&jets.second[a][w], &jets.beta[beta_pos])
+                            + sae_dot(&jets.first[a], &jets.beta_deriv[w][beta_pos]);
+                        gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
+                    }
+                }
+                for (beta_i, channel_i) in border.iter().enumerate() {
+                    for (beta_j, channel_j) in border.iter().enumerate() {
+                        let dh = sae_dot(&jets.beta_deriv[w][beta_i], &jets.beta[beta_j])
+                            + sae_dot(&jets.beta[beta_i], &jets.beta_deriv[w][beta_j]);
+                        gamma += schur_inv[[channel_i.index, channel_j.index]] * dh;
+                    }
+                }
+                gamma_t[base + w] = gamma;
+            }
+
+            for (w_beta_pos, w_channel) in border.iter().enumerate() {
+                let mut gamma = 0.0_f64;
+                for a in 0..q {
+                    for b in 0..q {
+                        let dh = sae_dot(&jets.beta_l_deriv[a][w_beta_pos], &jets.first[b])
+                            + sae_dot(&jets.first[a], &jets.beta_l_deriv[b][w_beta_pos]);
+                        gamma += inv_vv[[b, a]] * dh;
+                    }
+                }
+                for a in 0..q {
+                    for (beta_pos, channel) in border.iter().enumerate() {
+                        let dh = sae_dot(&jets.beta_l_deriv[a][w_beta_pos], &jets.beta[beta_pos]);
+                        gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
+                    }
+                }
+                gamma_beta[w_channel.index] += gamma;
+            }
+        }
+
+        Ok(SaeArrowVector {
+            t: gamma_t,
+            beta: gamma_beta,
+        })
+    }
+
     /// Analytic SAE REML outer-ρ gradient components at the already converged
     /// inner state represented by `loss` and `cache`.
     ///
@@ -8398,7 +9415,7 @@ impl SaeManifoldTerm {
         let mut explicit = Array1::<f64>::zeros(n_params);
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
         let mut occam = Array1::<f64>::zeros(n_params);
-        let third_order_correction = Array1::<f64>::zeros(n_params);
+        let mut third_order_correction = Array1::<f64>::zeros(n_params);
 
         explicit[0] = assignment_prior_log_strength_derivative(&self.assignment, rho);
         logdet_trace[0] = self.assignment_log_strength_hessian_trace(rho, cache)?;
@@ -8423,12 +9440,31 @@ impl SaeManifoldTerm {
             }
         }
 
+        let gamma = self.logdet_theta_adjoint(rho, cache)?;
+        for coord in 0..n_params {
+            let rhs = self.outer_rho_gradient_ift_rhs(rho, coord, cache)?;
+            let (sol_t, sol_beta) =
+                cache
+                    .solve_full(rhs.t.view(), rhs.beta.view())
+                    .map_err(|err| {
+                        format!("analytic_outer_rho_gradient_components: solve_full: {err}")
+                    })?;
+            let mut dot = 0.0_f64;
+            for idx in 0..gamma.t.len() {
+                dot += gamma.t[idx] * sol_t[idx];
+            }
+            for idx in 0..gamma.beta.len() {
+                dot += gamma.beta[idx] * sol_beta[idx];
+            }
+            third_order_correction[coord] = -0.5 * dot;
+        }
+
         Ok(SaeOuterRhoGradientComponents {
             explicit,
             logdet_trace,
             occam,
             third_order_correction,
-            third_order_correction_available: false,
+            third_order_correction_available: true,
         })
     }
 
@@ -9286,7 +10322,7 @@ impl SaeManifoldTerm {
                         let r = projection.ranks[atom_idx];
                         let c_base = projection.off_c[atom_idx] + basis_col * r;
                         if self.atoms[atom_idx].decoder_frame.is_none() {
-                            debug_assert_eq!(r, p);
+                            assert_eq!(r, p);
                             sys.rows[row].htbeta[[row_off + c, c_base + output]] += mu * acc;
                         } else {
                             let uk = &projection.frames[atom_idx];
@@ -11791,7 +12827,7 @@ impl SaeManifoldOuterObjective {
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         OuterCapability {
-            gradient: Derivative::Unavailable,
+            gradient: Derivative::Analytic,
             hessian: DeclaredHessianForm::Unavailable,
             n_params: self.baseline_rho.to_flat().len(),
             // ρ are all penalty-like / τ coordinates: precisions and
@@ -11816,13 +12852,37 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
-        let n_params = self.baseline_rho.to_flat().len();
-        let (cost, beta_hat) = self
-            .evaluate(rho.view())
+        let rho_state = self.baseline_rho.from_flat(rho.view());
+        if let Some(beta) = self.seeded_beta.take()
+            && beta.len() == self.term.beta_dim()
+        {
+            self.term
+                .set_flat_beta(beta.view())
+                .map_err(EstimationError::RemlOptimizationFailed)?;
+        }
+        let (cost, loss, cache) = self
+            .term
+            .reml_criterion_with_cache(
+                self.target.view(),
+                &rho_state,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            )
             .map_err(EstimationError::RemlOptimizationFailed)?;
+        let components = self
+            .term
+            .analytic_outer_rho_gradient_components(&rho_state, &loss, &cache)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        let gradient = components.gradient_with_available_correction();
+        self.current_rho = rho_state;
+        self.last_loss = Some(loss);
+        let beta_hat = self.term.flatten_beta();
         Ok(OuterEval {
             cost,
-            gradient: Array1::zeros(n_params),
+            gradient,
             hessian: HessianResult::Unavailable,
             inner_beta_hint: Some(beta_hat),
         })
@@ -12050,6 +13110,116 @@ fn batched_smooth_sb(
         .enumerate()
         .map(|(idx, slot)| slot.unwrap_or_else(|| cpu_one(idx)))
         .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct LinearSpanAtomAnchor {
+    pub gate_weight: f64,
+    pub frame: GrassmannFrame,
+    pub decoder_coordinates: Array2<f64>,
+    pub singular_values: Array1<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinearSpanAnchor {
+    pub atoms: Vec<LinearSpanAtomAnchor>,
+    pub reconstruction: Array2<f64>,
+    pub residual_norm_sq: f64,
+}
+
+fn neutral_gate_weights(mode: AssignmentMode, k_atoms: usize) -> Array1<f64> {
+    match mode {
+        AssignmentMode::Softmax { .. } => Array1::from_elem(k_atoms, 1.0 / (k_atoms.max(1) as f64)),
+        AssignmentMode::IBPMap {
+            temperature, alpha, ..
+        } => ibp_map_row(Array1::<f64>::zeros(k_atoms).view(), temperature, alpha),
+        AssignmentMode::JumpReLU { .. } => Array1::from_elem(k_atoms, 0.5),
+    }
+}
+
+/// Curvature-homotopy linear-span anchor at `eta = 0`.
+///
+/// This stage-1 primitive solves the neutral-gate linear relaxation by
+/// sequential Eckart-Young residual SVDs and canonicalizes every recovered output
+/// subspace through the same [`GrassmannFrame`] gauge used by the #972 frame
+/// machinery. It does not mutate `term` or replace the existing seed cascade.
+pub fn linear_span_anchor(
+    term: &SaeManifoldTerm,
+    targets: ArrayView2<'_, f64>,
+) -> Result<LinearSpanAnchor, String> {
+    let n = term.n_obs();
+    let p = term.output_dim();
+    if targets.dim() != (n, p) {
+        return Err(format!(
+            "linear_span_anchor: targets shape {:?} != ({n}, {p})",
+            targets.dim()
+        ));
+    }
+    if term.k_atoms() == 0 {
+        return Err("linear_span_anchor: term must contain at least one atom".into());
+    }
+    if !targets.iter().all(|v| v.is_finite()) {
+        return Err("linear_span_anchor: targets must be finite".into());
+    }
+    let gates = neutral_gate_weights(term.assignment.mode, term.k_atoms());
+    let mut residual = targets.to_owned();
+    let mut reconstruction = Array2::<f64>::zeros((n, p));
+    let mut atoms = Vec::with_capacity(term.k_atoms());
+    for (atom_idx, atom) in term.atoms.iter().enumerate() {
+        let gate = gates[atom_idx];
+        if !(gate.is_finite() && gate > 0.0) {
+            return Err(format!(
+                "linear_span_anchor: neutral gate for atom {atom_idx} must be positive finite; got {gate}"
+            ));
+        }
+        let requested_rank = atom.basis_size().min(n).min(p);
+        if requested_rank == 0 {
+            return Err(format!(
+                "linear_span_anchor: atom {atom_idx} has no recoverable linear span rank"
+            ));
+        }
+        let weighted = residual.mapv(|v| gate * v);
+        let (_u_opt, singular_values_full, vt_opt) = weighted
+            .svd(false, true)
+            .map_err(|err| format!("linear_span_anchor: SVD failed for atom {atom_idx}: {err}"))?;
+        let vt = vt_opt.ok_or_else(|| {
+            format!("linear_span_anchor: SVD returned no right factor for atom {atom_idx}")
+        })?;
+        let rank = requested_rank
+            .min(vt.nrows())
+            .min(singular_values_full.len());
+        if rank == 0 {
+            return Err(format!(
+                "linear_span_anchor: atom {atom_idx} SVD returned rank zero"
+            ));
+        }
+        let mut frame = Array2::<f64>::zeros((p, rank));
+        for col in 0..rank {
+            for row in 0..p {
+                frame[[row, col]] = vt[[col, row]];
+            }
+        }
+        let singular_values = singular_values_full.slice(s![..rank]).to_owned();
+        let frame = GrassmannFrame::from_oriented(frame, singular_values.clone());
+        let frame_matrix = frame.frame().to_owned();
+        let mut coordinates = residual.dot(&frame_matrix);
+        coordinates.mapv_inplace(|v| v / gate);
+        let contribution = fast_abt(&coordinates, &frame_matrix).mapv(|v| gate * v);
+        reconstruction += &contribution;
+        residual -= &contribution;
+        atoms.push(LinearSpanAtomAnchor {
+            gate_weight: gate,
+            frame,
+            decoder_coordinates: coordinates,
+            singular_values,
+        });
+    }
+    let residual_norm_sq = residual.iter().map(|v| v * v).sum();
+    Ok(LinearSpanAnchor {
+        atoms,
+        reconstruction,
+        residual_norm_sq,
+    })
 }
 
 fn sae_cholesky_solve_neg_gradient(
@@ -13151,6 +14321,244 @@ mod tests {
     use crate::terms::analytic_penalties::IsometryReference;
     use approx::assert_abs_diff_eq;
     use ndarray::array;
+
+    fn assert_matrix_same_bits(left: &Array2<f64>, right: &Array2<f64>) {
+        assert_eq!(left.dim(), right.dim());
+        for ((row, col), &value) in left.indexed_iter() {
+            assert_eq!(
+                value.to_bits(),
+                right[[row, col]].to_bits(),
+                "matrix bits differ at ({row}, {col})"
+            );
+        }
+    }
+
+    fn assert_tensor3_same_bits(left: &Array3<f64>, right: &Array3<f64>) {
+        assert_eq!(left.dim(), right.dim());
+        for ((row, col, axis), &value) in left.indexed_iter() {
+            assert_eq!(
+                value.to_bits(),
+                right[[row, col, axis]].to_bits(),
+                "tensor bits differ at ({row}, {col}, {axis})"
+            );
+        }
+    }
+
+    fn assert_eta_one_parity(
+        evaluator: &dyn SaeBasisEvaluator,
+        coords: ArrayView2<'_, f64>,
+        expected_curved: usize,
+    ) {
+        let (phi, jet) = evaluator.evaluate(coords).expect("base evaluate");
+        let eta = evaluator
+            .evaluate_phi_eta(coords, 1.0)
+            .expect("eta evaluate");
+        assert_matrix_same_bits(&eta.phi, &phi);
+        assert_tensor3_same_bits(&eta.jet, &jet);
+        assert_eq!(eta.split.curved_cols.len(), expected_curved);
+        for &col in &eta.split.linear_cols {
+            for row in 0..phi.nrows() {
+                assert_eq!(eta.dphi_deta[[row, col]], 0.0);
+                for axis in 0..jet.shape()[2] {
+                    assert_eq!(eta.djet_deta[[row, col, axis]], 0.0);
+                }
+            }
+        }
+        for &col in &eta.split.curved_cols {
+            for row in 0..phi.nrows() {
+                assert_eq!(
+                    eta.dphi_deta[[row, col]].to_bits(),
+                    phi[[row, col]].to_bits()
+                );
+                for axis in 0..jet.shape()[2] {
+                    assert_eq!(
+                        eta.djet_deta[[row, col, axis]].to_bits(),
+                        jet[[row, col, axis]].to_bits()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phi_eta_one_reproduces_current_atom_bases_bit_for_bit() {
+        let periodic_coords = array![[0.0_f64], [0.125], [0.4]];
+        let periodic = PeriodicHarmonicEvaluator::new(7).unwrap();
+        assert_eta_one_parity(&periodic, periodic_coords.view(), 4);
+
+        let raw_circle_coords = array![[0.0_f64], [0.3], [1.1]];
+        let raw_circle = RawPeriodicCircleEvaluator::new(1).unwrap();
+        assert_eta_one_parity(&raw_circle, raw_circle_coords.view(), 0);
+
+        let torus_coords = array![[0.0_f64, 0.2], [0.25, 0.5], [0.7, 0.9]];
+        let torus = TorusHarmonicEvaluator::new(2, 2).unwrap();
+        assert_eta_one_parity(&torus, torus_coords.view(), 20);
+
+        let sphere_coords = array![[0.0_f64, 0.0], [0.3, 0.4], [-0.2, 1.1]];
+        let sphere = SphereChartEvaluator;
+        assert_eta_one_parity(&sphere, sphere_coords.view(), 3);
+
+        let centers = array![
+            [-1.0_f64, -1.0],
+            [1.0, -1.0],
+            [-1.0, 1.0],
+            [1.0, 1.0],
+            [0.0, 0.0],
+            [0.5, -0.25]
+        ];
+        let duchon_coords = array![[0.1_f64, 0.2], [0.4, -0.3], [-0.2, 0.7]];
+        let duchon = DuchonCoordinateEvaluator::new(centers, 2).unwrap();
+        let (duchon_phi, _) = duchon.evaluate(duchon_coords.view()).unwrap();
+        let duchon_poly = 3usize;
+        assert_eta_one_parity(
+            &duchon,
+            duchon_coords.view(),
+            duchon_phi.ncols() - duchon_poly,
+        );
+
+        let euclidean = EuclideanPatchEvaluator::new(2, 3).unwrap();
+        let total_cols = crate::basis::monomial_exponents(2, 3).len();
+        let linear_cols = crate::basis::monomial_exponents(2, 3)
+            .iter()
+            .filter(|alpha| alpha.iter().sum::<usize>() <= 1)
+            .count();
+        assert_eta_one_parity(&euclidean, duchon_coords.view(), total_cols - linear_cols);
+    }
+
+    #[test]
+    fn linear_span_anchor_recovers_planted_two_plane_configuration() {
+        let n = 4usize;
+        let p = 4usize;
+        let phi = Array2::<f64>::ones((n, 2));
+        let jet = Array3::<f64>::zeros((n, 2, 1));
+        let decoder = Array2::<f64>::zeros((2, p));
+        let smooth = Array2::<f64>::eye(2);
+        let atoms = vec![
+            SaeManifoldAtom::new(
+                "plane0",
+                SaeAtomBasisKind::EuclideanPatch,
+                1,
+                phi.clone(),
+                jet.clone(),
+                decoder.clone(),
+                smooth.clone(),
+            )
+            .unwrap(),
+            SaeManifoldAtom::new(
+                "plane1",
+                SaeAtomBasisKind::EuclideanPatch,
+                1,
+                phi,
+                jet,
+                decoder,
+                smooth,
+            )
+            .unwrap(),
+        ];
+        let coords = vec![Array2::<f64>::zeros((n, 1)), Array2::<f64>::zeros((n, 1))];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 2)),
+            coords,
+            vec![LatentManifold::Euclidean, LatentManifold::Euclidean],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        let target = array![
+            [3.0_f64, 0.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 1.5, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ];
+        let anchor = linear_span_anchor(&term, target.view()).unwrap();
+        assert_eq!(anchor.atoms.len(), 2);
+        assert_abs_diff_eq!(anchor.residual_norm_sq, 0.0, epsilon = 1.0e-18);
+        let plane0 = array![[1.0_f64, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0]];
+        let plane1 = array![[0.0_f64, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let angle0 = anchor.atoms[0]
+            .frame
+            .max_principal_angle(plane0.view())
+            .unwrap();
+        let angle1 = anchor.atoms[1]
+            .frame
+            .max_principal_angle(plane1.view())
+            .unwrap();
+        assert_abs_diff_eq!(angle0, 0.0, epsilon = 1.0e-12);
+        assert_abs_diff_eq!(angle1, 0.0, epsilon = 1.0e-12);
+    }
+
+    fn circle_certificate_fixture(radius: f64, planes: &[(usize, usize)]) -> SaeManifoldTerm {
+        let n = 16usize;
+        let p = 4usize;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let mut atoms = Vec::with_capacity(planes.len());
+        let mut coord_blocks = Vec::with_capacity(planes.len());
+        for (atom_idx, &(axis_sin, axis_cos)) in planes.iter().enumerate() {
+            let mut decoder = Array2::<f64>::zeros((3, p));
+            decoder[[1, axis_sin]] = radius;
+            decoder[[2, axis_cos]] = radius;
+            let atom = SaeManifoldAtom::new(
+                format!("circle_{atom_idx}"),
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi.clone(),
+                jet.clone(),
+                decoder,
+                Array2::<f64>::eye(3),
+            )
+            .unwrap()
+            .with_basis_second_jet(evaluator.clone());
+            atoms.push(atom);
+            coord_blocks.push(coords.clone());
+        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, planes.len())),
+            coord_blocks,
+            vec![LatentManifold::Circle; planes.len()],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        term.set_certificate_dispersion(1.0).unwrap();
+        term
+    }
+
+    #[test]
+    fn dictionary_incoherence_report_orthogonal_frames_has_zero_mu_hat() {
+        let term = circle_certificate_fixture(2.0, &[(0, 1), (2, 3)]);
+        let report = dictionary_incoherence_report(&term).unwrap();
+        assert_abs_diff_eq!(report.mu_hat, 0.0, epsilon = 1.0e-12);
+        assert_eq!(report.per_atom_kappa_hat.len(), 2);
+        assert!(
+            "empirical quantities only; no incoherence-threshold verdict is implemented yet"
+                == report.note
+        );
+    }
+
+    #[test]
+    fn dictionary_incoherence_report_coherent_frames_has_unit_mu_hat() {
+        let term = circle_certificate_fixture(2.0, &[(0, 1), (0, 1)]);
+        let report = dictionary_incoherence_report(&term).unwrap();
+        assert_abs_diff_eq!(report.mu_hat, 1.0, epsilon = 1.0e-12);
+    }
+
+    #[test]
+    fn dictionary_incoherence_report_circle_kappa_matches_inverse_radius() {
+        let radius = 2.5_f64;
+        let mut term = circle_certificate_fixture(radius, &[(0, 1)]);
+        term.set_certificate_dispersion(0.25).unwrap();
+        let report = dictionary_incoherence_report(&term).unwrap();
+        assert_abs_diff_eq!(
+            report.per_atom_kappa_hat[0],
+            1.0 / radius,
+            epsilon = 1.0e-10
+        );
+        assert!(report.snr_proxy.is_finite() && report.snr_proxy > 0.0);
+        assert_abs_diff_eq!(report.mean_activity_floor, 1.0, epsilon = 1.0e-12);
+        assert_abs_diff_eq!(report.peak_activity_floor, 1.0, epsilon = 1.0e-12);
+    }
 
     #[test]
     fn search_strategy_exposes_fixed_and_sweep_values() {
@@ -18064,7 +19472,7 @@ mod tests {
             let ob = beta_offsets[atom_idx];
             let oc = off_c[atom_idx];
             if atom.decoder_frame.is_none() {
-                debug_assert_eq!(r, p);
+                assert_eq!(r, p);
                 for basis_col in 0..m {
                     let base_b = ob + basis_col * p;
                     let base_c = oc + basis_col * r;
@@ -18327,6 +19735,135 @@ mod tests {
             .max_principal_angle(target_span.view())
             .expect("angle");
         assert_abs_diff_eq!(angle, 0.0, epsilon = 1.0e-9);
+    }
+
+    fn gamma_fd_tiny_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+        let n = 10usize;
+        let p = 3usize;
+        let k_atoms = 2usize;
+        let m = 3usize;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap());
+        let mut logits = Array2::<f64>::zeros((n, k_atoms));
+        let mut coords = vec![Array2::<f64>::zeros((n, 1)), Array2::<f64>::zeros((n, 1))];
+        let weights = [
+            [
+                [0.10, -0.05, 0.03],
+                [0.35, -0.20, 0.12],
+                [-0.16, 0.18, 0.08],
+            ],
+            [
+                [-0.08, 0.04, 0.06],
+                [0.22, 0.10, -0.18],
+                [0.11, -0.24, 0.15],
+            ],
+        ];
+        let mut target = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            let phase = (row as f64 + 0.35) / n as f64;
+            coords[0][[row, 0]] = phase;
+            coords[1][[row, 0]] = (phase + 0.21).fract();
+            logits[[row, 0]] = if row % 2 == 0 { 0.8 } else { -0.6 };
+            let assignments = softmax_row(logits.row(row), 0.9);
+            for atom in 0..k_atoms {
+                let theta = std::f64::consts::TAU * coords[atom][[row, 0]];
+                let basis = [1.0, theta.sin(), theta.cos()];
+                for out_col in 0..p {
+                    for basis_col in 0..m {
+                        target[[row, out_col]] += assignments[atom]
+                            * basis[basis_col]
+                            * weights[atom][basis_col][out_col];
+                    }
+                }
+            }
+        }
+        let mut atoms = Vec::with_capacity(k_atoms);
+        for atom in 0..k_atoms {
+            let (phi, jet) = evaluator.evaluate(coords[atom].view()).unwrap();
+            let decoder = Array2::from_shape_fn((m, p), |(basis_col, out_col)| {
+                weights[atom][basis_col][out_col]
+            });
+            atoms.push(
+                SaeManifoldAtom::new(
+                    format!("gamma_{atom}"),
+                    SaeAtomBasisKind::Periodic,
+                    1,
+                    phi,
+                    jet,
+                    decoder,
+                    Array2::<f64>::eye(m),
+                )
+                .unwrap()
+                .with_basis_second_jet(evaluator.clone()),
+            );
+        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coords,
+            vec![LatentManifold::Circle { period: 1.0 }; k_atoms],
+            AssignmentMode::softmax(0.9),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        let rho = SaeManifoldRho::new(
+            -6.0,
+            -6.0,
+            vec![Array1::from_vec(vec![-6.0]), Array1::from_vec(vec![-6.0])],
+        );
+        (term, target, rho)
+    }
+
+    fn fixed_state_logdet(
+        mut term: SaeManifoldTerm,
+        target: &Array2<f64>,
+        rho: &SaeManifoldRho,
+    ) -> f64 {
+        let (_value, _loss, cache) = term
+            .reml_criterion_with_cache(target.view(), rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
+            .expect("fixed-state cache");
+        let (tt, beta) = cache.arrow_log_det();
+        tt + beta.expect("dense Schur logdet")
+    }
+
+    #[test]
+    fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
+        let (mut term, target, rho) = gamma_fd_tiny_fixture();
+        let (_value, _loss, cache) = term
+            .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+            .expect("converged cache");
+        let gamma = term.logdet_theta_adjoint(&rho, &cache).expect("Gamma");
+        let h = 1.0e-5;
+        let probes = [
+            (0usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
+            (3usize, 1usize, SaeLocalRowVar::Coord { atom: 0, axis: 0 }),
+        ];
+        for (row, local_pos, var) in probes {
+            let mut plus = term.clone();
+            let mut minus = term.clone();
+            match var {
+                SaeLocalRowVar::Logit { atom } => {
+                    plus.assignment.logits[[row, atom]] += h;
+                    minus.assignment.logits[[row, atom]] -= h;
+                }
+                SaeLocalRowVar::Coord { atom, axis } => {
+                    let mut flat_p = plus.assignment.coords[atom].as_flat().clone();
+                    let mut flat_m = minus.assignment.coords[atom].as_flat().clone();
+                    let idx = row * plus.assignment.coords[atom].latent_dim() + axis;
+                    flat_p[idx] += h;
+                    flat_m[idx] -= h;
+                    plus.assignment.coords[atom].set_flat(flat_p.view());
+                    minus.assignment.coords[atom].set_flat(flat_m.view());
+                }
+            }
+            let fd = (fixed_state_logdet(plus, &target, &rho)
+                - fixed_state_logdet(minus, &target, &rho))
+                / (2.0 * h);
+            let analytic = gamma.t[cache.row_offsets[row] + local_pos];
+            let tol = 2.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
+            assert!(
+                (fd - analytic).abs() <= tol,
+                "Gamma row={row} local_pos={local_pos}: fd={fd:.8e}, analytic={analytic:.8e}"
+            );
+        }
     }
 }
 
