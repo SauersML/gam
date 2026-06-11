@@ -3414,6 +3414,13 @@ impl SaeManifoldLoss {
 /// evaluated at an evenly-strided subset of the atom's own on-atom coordinates.
 pub const SHAPE_BAND_MAX_POINTS: usize = 512;
 
+/// Entry budget for materializing one atom's dense `(M_k·p)²` decoder
+/// covariance in the fit payload. Above it (LLM-scale ambient `p`) the band
+/// quantities are computed exactly from the factored frame covariance and the
+/// dense export is omitted (`decoder_covariance: None`) — the python reader
+/// treats it as optional. 2^24 f64 entries = 128 MiB per atom.
+pub const SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES: usize = 1 << 24;
+
 /// Posterior uncertainty of one fitted atom's manifold shape.
 ///
 /// Produced by [`SaeManifoldTerm::assemble_shape_uncertainty`]. The covariance
@@ -3425,7 +3432,14 @@ pub struct SaeAtomShapeUncertainty {
     /// φ-scaled posterior covariance of this atom's decoder coefficients,
     /// `Cov(β_k) = φ·S_β⁻¹[block_k]`, shape `(M_k·p, M_k·p)` in the decoder's
     /// row-major `(basis, channel)` flat layout (flat index `b·p + c`).
-    pub decoder_covariance: Array2<f64>,
+    ///
+    /// `None` when materializing it would exceed
+    /// [`SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES`] (LLM-scale ambient `p`: at
+    /// `(M=8, p=2048)` the dense block is 2 GiB *per atom*, at
+    /// `(M=16, p=5120)` ~50 GiB). The band quantities below are still exact
+    /// in that case — they are computed directly from the factored
+    /// `(M_k·r_k)²` frame covariance without ever lifting it.
+    pub decoder_covariance: Option<Array2<f64>>,
     /// Coordinates at which the band is evaluated, shape `(G, d_k)`.
     pub band_coords: Array2<f64>,
     /// Fitted ambient point `m_k(t) = Φ_k(t)·B_k` at each band coordinate,
@@ -7285,46 +7299,9 @@ impl SaeManifoldTerm {
             let cov_block = cache
                 .schur_inverse_block(block_ranges[k].clone())
                 .map_err(|e| format!("assemble_shape_uncertainty: atom {k}: {e}"))?;
-            // Lift the factored `(M_k·r_k)` coordinate covariance to the full
-            // `(M_k·p)` decoder covariance through this atom's frame; identity
-            // (a plain scaled copy) on the un-framed full-`B` path.
-            let mut cov = if frames_active && atom.decoder_frame.is_some() {
-                let r = atom.border_frame_rank();
-                let uk = self.frame_output_matrix(k);
-                let mut lifted = Array2::<f64>::zeros((m * p, m * p));
-                for b1 in 0..m {
-                    for b2 in 0..m {
-                        // Cov(B)[(b1,c1),(b2,c2)]
-                        //   = Σ_{j1,j2} U[c1,j1] Cov(C)[(b1,j1),(b2,j2)] U[c2,j2].
-                        for c1 in 0..p {
-                            for c2 in 0..p {
-                                let mut acc = 0.0_f64;
-                                for j1 in 0..r {
-                                    let u1 = uk[[c1, j1]];
-                                    if u1 == 0.0 {
-                                        continue;
-                                    }
-                                    for j2 in 0..r {
-                                        acc += u1
-                                            * cov_block[[b1 * r + j1, b2 * r + j2]]
-                                            * uk[[c2, j2]];
-                                    }
-                                }
-                                lifted[[b1 * p + c1, b2 * p + c2]] = acc;
-                            }
-                        }
-                    }
-                }
-                lifted
-            } else {
-                cov_block
-            };
-            cov.mapv_inplace(|v| v * dispersion);
-
             let n_rows = atom.n_obs();
             let d = atom.latent_dim;
-            // Evenly-strided evaluation rows bound the band cost; the full
-            // covariance above is exact and lets callers evaluate any grid.
+            // Evenly-strided evaluation rows bound the band cost.
             let stride = n_rows.div_ceil(SHAPE_BAND_MAX_POINTS).max(1);
             let eval_rows: Vec<usize> = (0..n_rows).step_by(stride).collect();
             let g = eval_rows.len();
@@ -7341,27 +7318,118 @@ impl SaeManifoldTerm {
                 for c in 0..p {
                     band_mean[[gi, c]] = decoded[c];
                 }
-                // Var_c = Σ_{b1,b2} Φ[b1]Φ[b2] Cov[(b1,c),(b2,c)]; the flat
-                // decoder index is basis·p + channel (row-major (M_k, p)).
-                for c in 0..p {
-                    let mut var = 0.0_f64;
+            }
+
+            let framed = frames_active && atom.decoder_frame.is_some();
+            let dense_entries = (m * p).saturating_mul(m * p);
+            let cov = if framed && dense_entries > SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES {
+                // LLM-scale ambient `p`: the dense `(M_k·p)²` lift would be
+                // gigabytes per atom and exists only to export the full
+                // covariance. Compute the band variance EXACTLY from the
+                // factored frame covariance instead: with `B_k = C_k·U_kᵀ`,
+                //   Var_c(t) = (φ ⊗ u_c)ᵀ Cov(vec C_k) (φ ⊗ u_c)
+                // which is the r×r quadratic form `u_cᵀ Y u_c` with
+                //   Y = Σ_{b1,b2} φ[b1] φ[b2] Cov(C)[(b1,·),(b2,·)].
+                let r = atom.border_frame_rank();
+                let uk = self.frame_output_matrix(k);
+                let mut cov_c = cov_block;
+                cov_c.mapv_inplace(|v| v * dispersion);
+                let mut y = Array2::<f64>::zeros((r, r));
+                for (gi, &row) in eval_rows.iter().enumerate() {
+                    y.fill(0.0);
                     for b1 in 0..m {
                         let phi1 = atom.basis_values[[row, b1]];
                         if phi1 == 0.0 {
                             continue;
                         }
-                        let i1 = b1 * p + c;
                         for b2 in 0..m {
                             let phi2 = atom.basis_values[[row, b2]];
                             if phi2 == 0.0 {
                                 continue;
                             }
-                            var += phi1 * phi2 * cov[[i1, b2 * p + c]];
+                            let w = phi1 * phi2;
+                            for j1 in 0..r {
+                                for j2 in 0..r {
+                                    y[[j1, j2]] += w * cov_c[[b1 * r + j1, b2 * r + j2]];
+                                }
+                            }
                         }
                     }
-                    band_sd[[gi, c]] = var.max(0.0).sqrt();
+                    for c in 0..p {
+                        let mut var = 0.0_f64;
+                        for j1 in 0..r {
+                            let u1 = uk[[c, j1]];
+                            if u1 == 0.0 {
+                                continue;
+                            }
+                            for j2 in 0..r {
+                                var += u1 * y[[j1, j2]] * uk[[c, j2]];
+                            }
+                        }
+                        band_sd[[gi, c]] = var.max(0.0).sqrt();
+                    }
                 }
-            }
+                None
+            } else {
+                // Lift the factored `(M_k·r_k)` coordinate covariance to the
+                // full `(M_k·p)` decoder covariance through this atom's frame;
+                // identity (a plain scaled copy) on the un-framed full-`B` path.
+                let mut cov = if framed {
+                    let r = atom.border_frame_rank();
+                    let uk = self.frame_output_matrix(k);
+                    let mut lifted = Array2::<f64>::zeros((m * p, m * p));
+                    for b1 in 0..m {
+                        for b2 in 0..m {
+                            // Cov(B)[(b1,c1),(b2,c2)]
+                            //   = Σ_{j1,j2} U[c1,j1] Cov(C)[(b1,j1),(b2,j2)] U[c2,j2].
+                            for c1 in 0..p {
+                                for c2 in 0..p {
+                                    let mut acc = 0.0_f64;
+                                    for j1 in 0..r {
+                                        let u1 = uk[[c1, j1]];
+                                        if u1 == 0.0 {
+                                            continue;
+                                        }
+                                        for j2 in 0..r {
+                                            acc += u1
+                                                * cov_block[[b1 * r + j1, b2 * r + j2]]
+                                                * uk[[c2, j2]];
+                                        }
+                                    }
+                                    lifted[[b1 * p + c1, b2 * p + c2]] = acc;
+                                }
+                            }
+                        }
+                    }
+                    lifted
+                } else {
+                    cov_block
+                };
+                cov.mapv_inplace(|v| v * dispersion);
+                for (gi, &row) in eval_rows.iter().enumerate() {
+                    // Var_c = Σ_{b1,b2} Φ[b1]Φ[b2] Cov[(b1,c),(b2,c)]; the flat
+                    // decoder index is basis·p + channel (row-major (M_k, p)).
+                    for c in 0..p {
+                        let mut var = 0.0_f64;
+                        for b1 in 0..m {
+                            let phi1 = atom.basis_values[[row, b1]];
+                            if phi1 == 0.0 {
+                                continue;
+                            }
+                            let i1 = b1 * p + c;
+                            for b2 in 0..m {
+                                let phi2 = atom.basis_values[[row, b2]];
+                                if phi2 == 0.0 {
+                                    continue;
+                                }
+                                var += phi1 * phi2 * cov[[i1, b2 * p + c]];
+                            }
+                        }
+                        band_sd[[gi, c]] = var.max(0.0).sqrt();
+                    }
+                }
+                Some(cov)
+            };
             atoms.push(SaeAtomShapeUncertainty {
                 decoder_covariance: cov,
                 band_coords,
