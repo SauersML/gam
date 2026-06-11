@@ -9554,6 +9554,8 @@ impl<'a> RemlState<'a> {
             PseudoLogdetMode::Smooth
         };
 
+        let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
+
         // For ValueOnly evaluations on the SPD fast path (no Firth, no hard
         // linear constraints), use a Cholesky-backed operator.  LLT costs
         // O(p³/3) versus the O(9·p³) full eigendecomposition, giving a
@@ -9561,12 +9563,19 @@ impl<'a> RemlState<'a> {
         // any gradient trace call, so the operator only needs to serve
         // `logdet()` and `solve()`/`solve_multi()` — both provided by LLT.
         //
+        // Keep c-nontrivial non-Gaussian fits on the spectral path even for
+        // value-only probes: their LAML value installs the intrinsic
+        // pseudo-logdet correction below, and using the Cholesky full logdet
+        // here would make cost-only line-search / FD probes evaluate a
+        // different scalar from the value+gradient path (#901).
+        //
         // If LLT fails (near-singular Hessian), fall through to the spectral
         // operator so the soft-floor regularization can handle it.
         let hessian_op: std::sync::Arc<dyn super::unified::HessianOperator> = if mode
             == super::unified::EvalMode::ValueOnly
             && matches!(hessian_mode, PseudoLogdetMode::Smooth)
             && free_basis_opt.is_none()
+            && !c_nontrivial
         {
             match DenseCholeskyValueOnlyOperator::from_spd(h_for_operator.as_ref()) {
                 Ok(chol_op) => std::sync::Arc::new(chol_op),
@@ -9596,7 +9605,6 @@ impl<'a> RemlState<'a> {
             )
         };
 
-        let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
         let uses_kron_penalty_logdet = self.kronecker_penalty_system.as_ref().is_some_and(|kron| {
             self.kronecker_factored.is_some() && kron.num_penalties() == rho.len()
         });
@@ -9896,8 +9904,11 @@ impl<'a> RemlState<'a> {
         } else {
             PseudoLogdetMode::Smooth
         };
+        let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
+
         // Same Cholesky fast path as `build_dense_assembly`: for ValueOnly
-        // evaluations with `Smooth` mode (no Firth), LLT replaces eigh.
+        // evaluations with `Smooth` mode (no Firth and no beta-dependent
+        // Hessian drift), LLT replaces eigh.
         // `build_dense_original_assembly` is only called when there is no
         // active constraint free-basis, so the no-hard-constraints condition
         // is always satisfied here.
@@ -9905,6 +9916,7 @@ impl<'a> RemlState<'a> {
             use super::unified::DenseCholeskyValueOnlyOperator;
             if mode == super::unified::EvalMode::ValueOnly
                 && matches!(hessian_mode, PseudoLogdetMode::Smooth)
+                && !c_nontrivial
             {
                 match DenseCholeskyValueOnlyOperator::from_spd(&h_total_original) {
                     Ok(chol_op) => std::sync::Arc::new(chol_op),
@@ -9936,7 +9948,6 @@ impl<'a> RemlState<'a> {
         };
 
         let e_for_logdet = &pirls_result.reparam_result.e_transformed;
-        let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
         let uses_kron_penalty_logdet = self.kronecker_penalty_system.as_ref().is_some_and(|kron| {
             self.kronecker_factored.is_some() && kron.num_penalties() == rho.len()
         });
