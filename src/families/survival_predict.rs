@@ -2018,7 +2018,6 @@ pub(crate) struct LocationScaleEtaComponents {
     pub eta_t: Array1<f64>,
     pub eta_ls: Array1<f64>,
     pub inv_sigma: Array1<f64>,
-    time_wiggle_dq: Option<Array1<f64>>,
 }
 
 pub(crate) struct LocationScaleTimeWarpComponents {
@@ -2169,7 +2168,6 @@ pub(crate) fn location_scale_eta_components(
         eta_t,
         eta_ls,
         inv_sigma,
-        time_wiggle_dq: time_components.time_wiggle_dq,
     })
 }
 
