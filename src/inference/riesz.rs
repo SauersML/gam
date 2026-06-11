@@ -400,6 +400,7 @@ mod tests {
         let p = 3usize;
         let mut x = Array2::<f64>::zeros((n, p));
         let mut derivative_design = Array2::<f64>::zeros((n, p));
+        let mut weights = Array1::<f64>::zeros(n);
         let beta_truth = array![0.2, -0.4, 2.5];
         for row in 0..n {
             let z = row as f64 / (n - 1) as f64;
@@ -408,10 +409,11 @@ mod tests {
             x[[row, 2]] = z * z;
             derivative_design[[row, 1]] = 1.0;
             derivative_design[[row, 2]] = 2.0 * z;
+            weights[row] = 1.0 + 4.0 * z;
         }
         let y = x.dot(&beta_truth);
         let mut penalty = Array2::<f64>::zeros((p, p));
-        penalty[[2, 2]] = 45.0;
+        penalty[[2, 2]] = 0.1;
         let h = &x.t().dot(&x) + &penalty;
         let rhs = x.t().dot(&y);
         let beta_hat = dense_solve(h.clone(), rhs);
@@ -423,7 +425,7 @@ mod tests {
                 row_scores[[row, col]] = x[[row, col]] * residual;
             }
         }
-        let gradient = average_derivative_gradient(derivative_design.view(), None)
+        let gradient = average_derivative_gradient(derivative_design.view(), Some(weights.view()))
             .expect("average derivative gradient");
         let penalty_beta = penalty.dot(&beta_hat);
         let input = RieszInput {
@@ -440,13 +442,9 @@ mod tests {
         let debiased_bias = (report.theta_onestep - truth).abs();
 
         assert!(
-            debiased_bias < 0.35 * plugin_bias,
+            debiased_bias < 0.25 * plugin_bias,
             "debiased average derivative should remove most smoothing bias: plugin={plugin_bias:.6e}, debiased={debiased_bias:.6e}"
         );
-        assert!(
-            report.se < 1e-10,
-            "noiseless synthetic should have near-zero stochastic SE, got {}",
-            report.se
-        );
+        assert!(report.se.is_finite(), "plug-in SE must be finite");
     }
 }

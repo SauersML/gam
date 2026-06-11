@@ -50,7 +50,7 @@ use crate::families::survival_time_constraints::{
     build_time_derivative_guard_constraints,
 };
 use crate::families::wiggle::monotone_wiggle_basis_with_derivative_order;
-use crate::matrix::{DesignMatrix, SymmetricMatrix};
+use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::smooth::{
@@ -3537,12 +3537,8 @@ fn survival_nonrigid_pilot_eta(
             event.len(),
         ));
     }
-    let loc_dense =
-        location_anchor_design.try_to_dense_arc("survival_nonrigid_pilot_eta: location anchor")?;
-    let g_dense =
-        logslope_design.try_to_dense_arc("survival_nonrigid_pilot_eta: logslope design")?;
-    let p_loc = loc_dense.ncols();
-    let p_g = g_dense.ncols();
+    let p_loc = location_anchor_design.ncols();
+    let p_g = logslope_design.ncols();
     let p_joint = p_loc + p_g;
     if p_joint == 0 {
         return Ok((
@@ -3568,40 +3564,33 @@ fn survival_nonrigid_pilot_eta(
         slope[i] = baseline_slope + logslope_offset[i];
         eta1[i] = rigid_observed_eta(q_exit[i], slope[i], z_primary[i], probit_scale);
     }
-    // Build the η₁ chain-corrected joint design: each location column scales
-    // by c(g_i), each logslope column scales by (q_i·c'(g_i) + s_f'(g_i)·z_i).
-    // This makes the Newton update directly act on η₁ so the resulting pilot
-    // η₁ is the one-shot best linear fit along the dominant channel.
-    let mut x_chain = Array2::<f64>::zeros((n, p_joint));
+    // Per-row chain factors and IRLS gradient/Hessian along η₁.
+    //
+    //   η₁ = q·c(g) + s(g)·z   with c(g) = sqrt(1 + s(g)²), s(g) = observed_logslope(g)
+    //   ∂η₁/∂q = c(g)
+    //   ∂η₁/∂g = q·c'(g) + s'(g)·z
+    //
+    // The chain factors come from `rigid_observed_eta` via numerical
+    // finite-difference on a tiny step (the parametric closed-form
+    // derivatives live further down in `c_derivatives`; reusing it would
+    // couple this helper to private internals, while finite-difference at
+    // 1e-7 is well within the IRLS pilot's accuracy budget — the result is
+    // just used to weight the W metric, not propagated into a final
+    // coefficient).
+    let mut chain_q = Array1::<f64>::zeros(n);
+    let mut chain_g = Array1::<f64>::zeros(n);
     let mut grad_eta1 = Array1::<f64>::zeros(n);
     let mut hess_eta1 = Array1::<f64>::zeros(n);
     for i in 0..n {
         let g_i = slope[i];
         let z_i = z_primary[i];
-        // Chain factors along the η₁ row direction.
-        //   η₁ = q·c(g) + s(g)·z   with c(g) = sqrt(1 + s(g)²), s(g) = observed_logslope(g)
-        //   ∂η₁/∂q = c(g)
-        //   ∂η₁/∂g = q·c'(g) + s'(g)·z
-        // We only need ∂η₁/∂q and ∂η₁/∂g for the chain rule below; rebuild
-        // them from `rigid_observed_eta` via numerical finite-difference on
-        // a tiny step (the parametric closed-form derivatives live further
-        // down in `c_derivatives`; reusing it would couple this helper to
-        // private internals, while finite-difference at 1e-7 is well within
-        // the IRLS pilot's accuracy budget — the result is just used to
-        // weight the W metric, not propagated into a final coefficient).
         let h_fd: f64 = 1.0e-7;
-        let chain_q = (rigid_observed_eta(q_exit[i] + h_fd, g_i, z_i, probit_scale)
+        chain_q[i] = (rigid_observed_eta(q_exit[i] + h_fd, g_i, z_i, probit_scale)
             - rigid_observed_eta(q_exit[i] - h_fd, g_i, z_i, probit_scale))
             / (2.0 * h_fd);
-        let chain_g = (rigid_observed_eta(q_exit[i], g_i + h_fd, z_i, probit_scale)
+        chain_g[i] = (rigid_observed_eta(q_exit[i], g_i + h_fd, z_i, probit_scale)
             - rigid_observed_eta(q_exit[i], g_i - h_fd, z_i, probit_scale))
             / (2.0 * h_fd);
-        for j in 0..p_loc {
-            x_chain[[i, j]] = chain_q * loc_dense[[i, j]];
-        }
-        for j in 0..p_g {
-            x_chain[[i, p_loc + j]] = chain_g * g_dense[[i, j]];
-        }
         // Row gradient and Hessian along η₁ (mirror
         // `survival_pilot_irls_row_metric_at_eta`'s formula):
         //   censored:  d(-log Φ(-η))/dη at weight w·(1-d). The primitive
@@ -3628,16 +3617,55 @@ fn survival_nonrigid_pilot_eta(
         }
     }
     // Normal equations: (Xᵀ W X + λI) β = -Xᵀ g, where W = diag(hess_eta1)
-    // along η₁ and g = grad_eta1. The minus sign is the Newton step
-    // direction.
-    let mut gram = fast_xt_diag_x(&x_chain, &hess_eta1);
-    let rhs = {
-        let mut neg_g = grad_eta1.clone();
-        for i in 0..n {
-            neg_g[i] = -neg_g[i];
+    // along η₁, g = grad_eta1, and X is the η₁ chain-corrected joint design
+    // (each location column scaled by chain_q, each logslope column by
+    // chain_g). X is never materialized at full height: a one-shot dense
+    // `(n, p_joint)` build was ~0.7 GiB at biobank scale (n=320k) and sat
+    // co-resident with the construction phase's other dense transients —
+    // one of the contributors to the #979 large-scale OOM. Instead the Gram
+    // and rhs accumulate over fixed-height row chunks, so peak extra memory
+    // is `chunk × p_joint` regardless of n.
+    let mut gram = Array2::<f64>::zeros((p_joint, p_joint));
+    let mut rhs = Array1::<f64>::zeros(p_joint);
+    const PILOT_ROW_CHUNK: usize = 4096;
+    let mut x_chunk = Array2::<f64>::zeros((PILOT_ROW_CHUNK.min(n), p_joint));
+    let mut chunk_start = 0usize;
+    while chunk_start < n {
+        let chunk_end = (chunk_start + PILOT_ROW_CHUNK).min(n);
+        let rows = chunk_end - chunk_start;
+        let loc_rows = location_anchor_design
+            .try_row_chunk(chunk_start..chunk_end)
+            .map_err(|e| format!("survival_nonrigid_pilot_eta: location anchor rows: {e}"))?;
+        let g_rows = logslope_design
+            .try_row_chunk(chunk_start..chunk_end)
+            .map_err(|e| format!("survival_nonrigid_pilot_eta: logslope rows: {e}"))?;
+        {
+            let mut x_view = x_chunk.slice_mut(s![..rows, ..]);
+            for local in 0..rows {
+                let i = chunk_start + local;
+                for j in 0..p_loc {
+                    x_view[[local, j]] = chain_q[i] * loc_rows[[local, j]];
+                }
+                for j in 0..p_g {
+                    x_view[[local, p_loc + j]] = chain_g[i] * g_rows[[local, j]];
+                }
+            }
         }
-        fast_atv(&x_chain, &neg_g)
-    };
+        let h_chunk = hess_eta1.slice(s![chunk_start..chunk_end]).to_owned();
+        let mut neg_g_chunk = Array1::<f64>::zeros(rows);
+        for local in 0..rows {
+            neg_g_chunk[local] = -grad_eta1[chunk_start + local];
+        }
+        if rows == x_chunk.nrows() {
+            gram += &fast_xt_diag_x(&x_chunk, &h_chunk);
+            rhs += &fast_atv(&x_chunk, &neg_g_chunk);
+        } else {
+            let x_tail = x_chunk.slice(s![..rows, ..]).to_owned();
+            gram += &fast_xt_diag_x(&x_tail, &h_chunk);
+            rhs += &fast_atv(&x_tail, &neg_g_chunk);
+        }
+        chunk_start = chunk_end;
+    }
     // Adaptive ridge: 1e-6 × average diagonal, floored at 1e-12. Keeps the
     // Cholesky well-conditioned even when the rigid design has near-null
     // directions (which it often does at construction — the whole point of
@@ -3668,8 +3696,8 @@ fn survival_nonrigid_pilot_eta(
     for j in 0..p_g {
         beta_g[j] = beta_step[p_loc + j];
     }
-    let q_delta = fast_av(&loc_dense, &beta_loc);
-    let g_delta = fast_av(&g_dense, &beta_g);
+    let q_delta = location_anchor_design.apply(&beta_loc);
+    let g_delta = logslope_design.apply(&beta_g);
     // Trust-region cap to prevent a runaway first step on ill-conditioned
     // pilots: limit |Δη₁| per row to 4·σ_η (σ_η ≈ 1 under probit), measured
     // by the rigid pilot's η₁ standard deviation. This keeps the pilot in
