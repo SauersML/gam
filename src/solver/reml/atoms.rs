@@ -445,6 +445,33 @@ impl CriterionAtom for SampledBlockAtom {
 // the explicit ½λ_k quadratic; beta_channel = Sλ(β̂−μ) = the KKT residual's
 // penalty half) and should be ported alongside the inner-objective atom so
 // the envelope/noise-floor correction emerges from the calculus on day one.
+//
+// ── Migration ledger ──────────────────────────────────────────────────────
+//
+// LANDED (atom 2, the single-factorization half): one original-frame
+// `PenaltyPseudologdet` per evaluation point, shared through
+// `EvalShared::penalty_pseudologdet_original` by the ρ-side criterion
+// value/derivatives (eval.rs / runtime.rs) and the original-basis τ
+// gradient-and-pair builders (hyper.rs). The three per-builder duplicate
+// eigendecompositions are deleted; the ridge/positive-eigenspace threshold
+// of `log|Sλ|₊` is decided exactly once. The transformed-frame pair
+// callbacks factorize the canonical-TRANSFORMED (possibly constraint-
+// projected) penalties — a different matrix, not a duplicate.
+//
+// LANDED (#934 sibling): `CriterionCertificate` FD-audits the value path
+// against the analytic gradient at every returned optimum, so each further
+// port inherits an end-to-end desync alarm even before its per-atom
+// `certify` body exists.
+//
+// DELIBERATELY NOT FORCED: the penalty-quadratic VALUE stays
+// `pirls_result.stable_penalty_term` (computed in the stable reparameterized
+// basis) rather than being rewritten onto the gradient's per-coordinate
+// `shifted_quadratic`. The two formulas are mathematically one atom, but the
+// stable-basis evaluation exists because `βᵀSλβ` cancels catastrophically in
+// the original basis at large λ — unifying the source text would trade a
+// certified value/gradient pair for worse numerics. That pair is covered by
+// the #934 certificate until the quadratic atom can own a stable-basis
+// emission for BOTH channels.
 
 #[cfg(test)]
 mod tests {
