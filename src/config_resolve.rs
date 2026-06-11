@@ -165,6 +165,7 @@ pub struct CliFitConfigInput {
     pub transformation_normal: bool,
     pub firth: bool,
     pub outer_max_iter: Option<usize>,
+    pub gpu: Option<String>,
     pub frailty_kind: Option<CliFrailtyKind>,
     pub frailty_sd: Option<f64>,
     pub hazard_loading: Option<CliHazardLoading>,
@@ -291,6 +292,7 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
         json_config.frailty_sd,
         json_config.hazard_loading,
     )?;
+    validate_resolved_fit_config(&fit_config)?;
     Ok(ResolvedFitConfig {
         fit_config,
         training_table_kind,
@@ -298,9 +300,6 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
 }
 
 pub fn resolve_cli_fit_config(input: CliFitConfigInput) -> Result<FitConfig, String> {
-    if !input.ridge_lambda.is_finite() || input.ridge_lambda < 0.0 {
-        return Err("--ridge-lambda must be finite and >= 0".to_string());
-    }
     let mut fit_config = FitConfig::default();
     fit_config.family = input.family;
     fit_config.negative_binomial_theta = input.negative_binomial_theta;
@@ -333,12 +332,16 @@ pub fn resolve_cli_fit_config(input: CliFitConfigInput) -> Result<FitConfig, Str
     fit_config.transformation_normal = input.transformation_normal;
     fit_config.firth = input.firth;
     fit_config.outer_max_iter = input.outer_max_iter;
+    if let Some(raw_gpu) = input.gpu {
+        fit_config.gpu_policy = parse_gpu_policy(&raw_gpu)?;
+    }
     fit_config.frailty = Some(resolve_cli_frailty_spec(
         input.frailty_kind,
         input.frailty_sd,
         input.hazard_loading,
         "fit",
     )?);
+    validate_resolved_fit_config(&fit_config)?;
     Ok(fit_config)
 }
 
@@ -917,6 +920,312 @@ fn parse_gpu_policy(raw_gpu: &str) -> Result<crate::gpu::GpuPolicy, String> {
     })
 }
 
+fn validate_resolved_fit_config(config: &FitConfig) -> Result<(), String> {
+    if !config.ridge_lambda.is_finite() || config.ridge_lambda < 0.0 {
+        return Err("--ridge-lambda must be finite and >= 0".to_string());
+    }
+    let likelihood_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
+    validate_survival_baseline_args(
+        likelihood_mode,
+        &config.baseline_target,
+        config.baseline_scale,
+        config.baseline_shape,
+        config.baseline_rate,
+        config.baseline_makeham,
+    )
+}
+
 fn survival_link_usage() -> &'static str {
     "use identity|logit|probit|cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::families::lognormal_kernel::FrailtySpec;
+    use serde_json::{Value, json};
+
+    struct ParityCase {
+        name: &'static str,
+        cli: CliFitConfigInput,
+        json: Value,
+    }
+
+    fn base_cli() -> CliFitConfigInput {
+        CliFitConfigInput {
+            family: None,
+            negative_binomial_theta: None,
+            link: None,
+            flexible_link: false,
+            offset_column: None,
+            weight_column: None,
+            noise_offset_column: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            noise_formula: None,
+            logslope_formula: None,
+            z_column: None,
+            scale_dimensions: false,
+            adaptive_regularization: None,
+            ridge_lambda: 1e-6,
+            transformation_normal: false,
+            firth: false,
+            outer_max_iter: None,
+            gpu: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
+        }
+    }
+
+    fn resolved_cli(input: CliFitConfigInput) -> Result<FitConfig, String> {
+        resolve_cli_fit_config(input)
+    }
+
+    fn resolved_json(config: Value) -> Result<FitConfig, String> {
+        parse_fit_config_json(Some(&config.to_string())).map(|resolved| {
+            assert_eq!(resolved.training_table_kind, None);
+            resolved.fit_config
+        })
+    }
+
+    fn canonical_fit_config(mut config: FitConfig) -> String {
+        if config.frailty.is_none() {
+            config.frailty = Some(FrailtySpec::None);
+        }
+        format!("{config:#?}")
+    }
+
+    #[test]
+    fn cli_shaped_and_json_wire_config_resolution_match() {
+        let cases = vec![
+            ParityCase {
+                name: "family and link selection",
+                cli: {
+                    let mut input = base_cli();
+                    input.family = Some("binomial".to_string());
+                    input.link = Some("probit".to_string());
+                    input.flexible_link = true;
+                    input
+                },
+                json: json!({
+                    "family": "binomial",
+                    "link": "probit",
+                    "flexible_link": true
+                }),
+            },
+            ParityCase {
+                name: "offset weights ridge and noise offset columns",
+                cli: {
+                    let mut input = base_cli();
+                    input.offset_column = Some("eta_offset".to_string());
+                    input.weight_column = Some("case_weight".to_string());
+                    input.noise_offset_column = Some("sigma_offset".to_string());
+                    input.ridge_lambda = 0.125;
+                    input
+                },
+                json: json!({
+                    "offset": "eta_offset",
+                    "weights": "case_weight",
+                    "noise_offset": "sigma_offset",
+                    "ridge_lambda": 0.125
+                }),
+            },
+            ParityCase {
+                name: "weibull survival likelihood and baseline scale shape",
+                cli: {
+                    let mut input = base_cli();
+                    input.survival_likelihood = "weibull".to_string();
+                    input.baseline_target = "weibull".to_string();
+                    input.baseline_scale = Some(2.5);
+                    input.baseline_shape = Some(1.75);
+                    input
+                },
+                json: json!({
+                    "survival_likelihood": "weibull",
+                    "baseline_target": "weibull",
+                    "baseline_scale": 2.5,
+                    "baseline_shape": 1.75
+                }),
+            },
+            ParityCase {
+                name: "transformation survival gompertz makeham baseline",
+                cli: {
+                    let mut input = base_cli();
+                    input.survival_likelihood = "transformation".to_string();
+                    input.baseline_target = "gompertz-makeham".to_string();
+                    input.baseline_shape = Some(1.2);
+                    input.baseline_rate = Some(0.04);
+                    input.baseline_makeham = Some(0.01);
+                    input
+                },
+                json: json!({
+                    "survival_likelihood": "transformation",
+                    "baseline_target": "gompertz-makeham",
+                    "baseline_shape": 1.2,
+                    "baseline_rate": 0.04,
+                    "baseline_makeham": 0.01
+                }),
+            },
+            ParityCase {
+                name: "noise formula logslope z column and scale dimensions",
+                cli: {
+                    let mut input = base_cli();
+                    input.noise_formula = Some("~ s(age) + treatment".to_string());
+                    input.logslope_formula = Some("~ s(dose)".to_string());
+                    input.z_column = Some("dose".to_string());
+                    input.scale_dimensions = true;
+                    input
+                },
+                json: json!({
+                    "noise_formula": "~ s(age) + treatment",
+                    "logslope_formula": "~ s(dose)",
+                    "z_column": "dose",
+                    "scale_dimensions": true
+                }),
+            },
+            ParityCase {
+                name: "firth transformation normal outer iterations and adaptive regularization",
+                cli: {
+                    let mut input = base_cli();
+                    input.firth = true;
+                    input.transformation_normal = true;
+                    input.outer_max_iter = Some(7);
+                    input.adaptive_regularization = Some(true);
+                    input
+                },
+                json: json!({
+                    "firth": true,
+                    "transformation_normal": true,
+                    "outer_max_iter": 7,
+                    "adaptive_regularization": true
+                }),
+            },
+            ParityCase {
+                name: "gpu policy toggle",
+                cli: {
+                    let mut input = base_cli();
+                    input.gpu = Some("off".to_string());
+                    input
+                },
+                json: json!({
+                    "gpu": "off"
+                }),
+            },
+            ParityCase {
+                name: "hazard multiplier frailty fields",
+                cli: {
+                    let mut input = base_cli();
+                    input.frailty_kind = Some(CliFrailtyKind::HazardMultiplier);
+                    input.frailty_sd = Some(0.35);
+                    input.hazard_loading = Some(CliHazardLoading::LoadedVsUnloaded);
+                    input
+                },
+                json: json!({
+                    "frailty_kind": "hazard-multiplier",
+                    "frailty_sd": 0.35,
+                    "hazard_loading": "loaded-vs-unloaded"
+                }),
+            },
+            ParityCase {
+                name: "gaussian shift frailty fields",
+                cli: {
+                    let mut input = base_cli();
+                    input.frailty_kind = Some(CliFrailtyKind::GaussianShift);
+                    input.frailty_sd = Some(0.2);
+                    input
+                },
+                json: json!({
+                    "frailty_kind": "gaussian-shift",
+                    "frailty_sd": 0.2
+                }),
+            },
+        ];
+
+        for case in cases {
+            let cli = resolved_cli(case.cli).unwrap_or_else(|err| {
+                panic!("{}: CLI-shaped config failed: {err}", case.name)
+            });
+            let json = resolved_json(case.json).unwrap_or_else(|err| {
+                panic!("{}: JSON wire config failed: {err}", case.name)
+            });
+            assert_eq!(
+                canonical_fit_config(cli),
+                canonical_fit_config(json),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn cli_shaped_and_json_wire_config_resolution_rejections_match() {
+        let cases = vec![
+            ParityCase {
+                name: "negative ridge lambda",
+                cli: {
+                    let mut input = base_cli();
+                    input.ridge_lambda = -1.0;
+                    input
+                },
+                json: json!({
+                    "ridge_lambda": -1.0
+                }),
+            },
+            ParityCase {
+                name: "unknown gpu policy",
+                cli: {
+                    let mut input = base_cli();
+                    input.gpu = Some("cuda".to_string());
+                    input
+                },
+                json: json!({
+                    "gpu": "cuda"
+                }),
+            },
+            ParityCase {
+                name: "linear baseline rejects shape",
+                cli: {
+                    let mut input = base_cli();
+                    input.baseline_shape = Some(1.1);
+                    input
+                },
+                json: json!({
+                    "baseline_shape": 1.1
+                }),
+            },
+            ParityCase {
+                name: "weibull likelihood rejects gompertz target",
+                cli: {
+                    let mut input = base_cli();
+                    input.survival_likelihood = "weibull".to_string();
+                    input.baseline_target = "gompertz".to_string();
+                    input
+                },
+                json: json!({
+                    "survival_likelihood": "weibull",
+                    "baseline_target": "gompertz"
+                }),
+            },
+        ];
+
+        for case in cases {
+            let cli = resolved_cli(case.cli).expect_err(case.name);
+            let json = resolved_json(case.json).expect_err(case.name);
+            assert_eq!(cli, json, "{}", case.name);
+        }
+    }
 }
