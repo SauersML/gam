@@ -115,6 +115,12 @@ impl SaeBetaPenaltyAssembly {
     }
 }
 
+struct SaeFactoredRowProjection<'a> {
+    off_c: &'a [usize],
+    ranks: &'a [usize],
+    frames: &'a [Array2<f64>],
+}
+
 /// #976 Layer-1 guard: cap on one accepted iteration's assignment-logit
 /// update, in units of the gate temperature τ (the gate's natural length
 /// scale — every assignment mode reads logits through `σ(·/τ)` /
@@ -5781,27 +5787,43 @@ impl SaeManifoldTerm {
         // assembled bit-for-bit as the historical full-`B` path.
         let frames_engaged = self.any_frame_active() && !whitens_likelihood;
         let dense_beta_curvature = !(frames_engaged && beta_dim > dense_beta_penalty_probe_max_dim);
+        let row_htbeta_dim = if frames_engaged {
+            self.factored_border_dim()
+        } else {
+            beta_dim
+        };
         // Build the Arrow-Schur system: heterogeneous row dims when a compact
         // layout is active, uniform `q` otherwise.
         let mut sys = if let Some(ref layout) = row_layout {
             let per_row_dims: Vec<usize> = (0..n).map(|row| layout.row_q_active(row)).collect();
             if dense_beta_curvature {
                 let hbb_workspace = self.take_border_hbb_workspace(beta_dim);
-                ArrowSchurSystem::new_with_per_row_dims_and_hbb(
+                ArrowSchurSystem::new_with_per_row_dims_and_hbb_and_htbeta_cols(
                     per_row_dims,
                     beta_dim,
                     hbb_workspace,
+                    row_htbeta_dim,
                 )
             } else {
                 self.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
-                ArrowSchurSystem::new_with_per_row_dims_empty_hbb(per_row_dims, beta_dim)
+                ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(
+                    per_row_dims,
+                    beta_dim,
+                    row_htbeta_dim,
+                )
             }
         } else if dense_beta_curvature {
             let hbb_workspace = self.take_border_hbb_workspace(beta_dim);
-            ArrowSchurSystem::new_with_hbb(n, q, beta_dim, hbb_workspace)
+            ArrowSchurSystem::new_with_hbb_and_htbeta_cols(
+                n,
+                q,
+                beta_dim,
+                hbb_workspace,
+                row_htbeta_dim,
+            )
         } else {
             self.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
-            ArrowSchurSystem::new_with_empty_hbb(n, q, beta_dim)
+            ArrowSchurSystem::new_with_empty_hbb_and_htbeta_cols(n, q, beta_dim, row_htbeta_dim)
         };
         // Apply accumulated smoothness-penalty gradients into sys.gb.
         for (i, g) in smooth_grad_gb.iter().enumerate() {
@@ -6092,7 +6114,7 @@ impl SaeManifoldTerm {
             }
 
             // Build the per-row Arrow-Schur block at the row's active dim.
-            let mut block = ArrowRowBlock::new(q_row, beta_dim);
+            let mut block = ArrowRowBlock::new(q_row, row_htbeta_dim);
             for a in 0..q_row {
                 let mut g = 0.0;
                 for k in 0..w_dim {
@@ -6472,6 +6494,28 @@ impl SaeManifoldTerm {
             );
         }
         let mut beta_penalty_assembly = SaeBetaPenaltyAssembly::default();
+        let factored_row_projection_data = if frames_engaged && analytic_penalties.is_some() {
+            Some((
+                self.factored_beta_offsets(),
+                self.atoms
+                    .iter()
+                    .map(|atom| atom.border_frame_rank())
+                    .collect::<Vec<_>>(),
+                (0..self.atoms.len())
+                    .map(|atom_idx| self.frame_output_matrix(atom_idx))
+                    .collect::<Vec<_>>(),
+            ))
+        } else {
+            None
+        };
+        let factored_row_projection =
+            factored_row_projection_data
+                .as_ref()
+                .map(|(off_c, ranks, frames)| SaeFactoredRowProjection {
+                    off_c: off_c.as_slice(),
+                    ranks: ranks.as_slice(),
+                    frames: frames.as_slice(),
+                });
         if let Some(registry) = analytic_penalties {
             // Upfront validation: refuse penalty kinds the SAE row layout
             // cannot host, and refuse mixed-d row-block configurations.
@@ -6486,6 +6530,7 @@ impl SaeManifoldTerm {
                     penalty_scale,
                     row_layout.as_ref(),
                     dense_beta_curvature,
+                    factored_row_projection.as_ref(),
                 )
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         }
@@ -6601,10 +6646,11 @@ impl SaeManifoldTerm {
             }
 
             // Re-point the system's β-tier to the factored width. The t-tier
-            // (per-row `htt`, `gt`) is frame-independent and untouched; the
-            // per-row dense `htbeta` slabs stay `(q × beta_dim)` zeros and are
-            // skipped by the shape guard in `sys_htbeta_apply_row` (the
-            // matrix-free factored operator carries the cross block).
+            // (per-row `htt`, `gt`) is frame-independent and untouched; dense
+            // row cross-block slabs were allocated in factored coordinates at
+            // construction, so any analytic row supplement already has shape
+            // `(q_i × factored_border_dim)`. The data-fit cross block stays on
+            // the matrix-free factored operator.
             sys.k = border_dim;
             sys.gb = gb_c;
             self.reclaim_border_hbb_workspace(&mut sys);
@@ -8395,6 +8441,7 @@ impl SaeManifoldTerm {
         penalty_scale: f64,
         row_layout: Option<&SaeRowLayout>,
         dense_beta_curvature: bool,
+        factored_row_projection: Option<&SaeFactoredRowProjection<'_>>,
     ) -> Result<SaeBetaPenaltyAssembly, ArrowSchurError> {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
         let layout = registry.rho_layout();
@@ -8484,6 +8531,7 @@ impl SaeManifoldTerm {
                                     &corrected_kind,
                                     rho_local,
                                     row_layout,
+                                    factored_row_projection,
                                 );
                                 // The isometry penalty value depends on the
                                 // decoder B as well as the latent coords, through
@@ -8507,7 +8555,14 @@ impl SaeManifoldTerm {
                                 }
                             } else {
                                 self.add_sae_coord_penalty(
-                                    sys, atom_idx, off, coord, penalty, rho_local, row_layout,
+                                    sys,
+                                    atom_idx,
+                                    off,
+                                    coord,
+                                    penalty,
+                                    rho_local,
+                                    row_layout,
+                                    factored_row_projection,
                                 );
                             }
                         }
@@ -8692,6 +8747,7 @@ impl SaeManifoldTerm {
         penalty: &AnalyticPenaltyKind,
         rho_local: ArrayView1<'_, f64>,
         row_layout: Option<&SaeRowLayout>,
+        factored_row_projection: Option<&SaeFactoredRowProjection<'_>>,
     ) {
         let n = coord.n_obs();
         let d = coord.latent_dim();
@@ -8738,7 +8794,14 @@ impl SaeManifoldTerm {
         }
         if let AnalyticPenaltyKind::Isometry(corrected) = penalty {
             self.add_sae_isometry_metric_gn_blocks(
-                sys, atom_idx, dense_off, coord, corrected, rho_local, row_layout,
+                sys,
+                atom_idx,
+                dense_off,
+                coord,
+                corrected,
+                rho_local,
+                row_layout,
+                factored_row_projection,
             );
             return;
         }
@@ -8785,6 +8848,7 @@ impl SaeManifoldTerm {
         corrected: &Arc<IsometryPenalty>,
         rho_local: ArrayView1<'_, f64>,
         row_layout: Option<&SaeRowLayout>,
+        factored_row_projection: Option<&SaeFactoredRowProjection<'_>>,
     ) {
         let n_obs = coord.n_obs();
         let d = coord.latent_dim();
@@ -8912,7 +8976,24 @@ impl SaeManifoldTerm {
                         acc += metric_coord_jac[[metric_row, c]]
                             * metric_beta_jac[[metric_row, beta_col]];
                     }
-                    sys.rows[row].htbeta[[row_off + c, beta_off + beta_col]] += mu * acc;
+                    if let Some(projection) = factored_row_projection {
+                        let basis_col = beta_col / p;
+                        let output = beta_col % p;
+                        let r = projection.ranks[atom_idx];
+                        let c_base = projection.off_c[atom_idx] + basis_col * r;
+                        if self.atoms[atom_idx].decoder_frame.is_none() {
+                            debug_assert_eq!(r, p);
+                            sys.rows[row].htbeta[[row_off + c, c_base + output]] += mu * acc;
+                        } else {
+                            let uk = &projection.frames[atom_idx];
+                            for frame_col in 0..r {
+                                sys.rows[row].htbeta[[row_off + c, c_base + frame_col]] +=
+                                    mu * acc * uk[[output, frame_col]];
+                            }
+                        }
+                    } else {
+                        sys.rows[row].htbeta[[row_off + c, beta_off + beta_col]] += mu * acc;
+                    }
                     wrote_dense_cross = true;
                 }
             }
@@ -17567,7 +17648,14 @@ mod tests {
 
         let mut dense_sys = ArrowSchurSystem::new(0, 0, beta_len);
         let dense_assembly = term
-            .add_sae_analytic_penalty_contributions(&mut dense_sys, &registry, 1.0, None, true)
+            .add_sae_analytic_penalty_contributions(
+                &mut dense_sys,
+                &registry,
+                1.0,
+                None,
+                true,
+                None,
+            )
             .unwrap();
         assert!(dense_assembly.dense_written);
         assert!(!dense_assembly.deferred_factored);
@@ -17627,6 +17715,190 @@ mod tests {
             .unwrap();
         assert_eq!(sys.k, border_dim);
         assert!(sys.hbb.is_empty());
+    }
+
+    fn materialize_row_htbeta_for_test(sys: &ArrowSchurSystem, row_idx: usize) -> Array2<f64> {
+        let di = sys.row_dims[row_idx];
+        let k = sys.k;
+        let row = &sys.rows[row_idx];
+        let use_dense = sys.htbeta_dense_supplement || sys.htbeta_matvec.is_none();
+        let mut out = if use_dense && row.htbeta.dim() == (di, k) {
+            row.htbeta.clone()
+        } else {
+            Array2::<f64>::zeros((di, k))
+        };
+        if let Some(op) = sys.htbeta_matvec.as_ref() {
+            let mut basis = Array1::<f64>::zeros(k);
+            let mut col = Array1::<f64>::zeros(di);
+            for beta_col in 0..k {
+                basis.fill(0.0);
+                basis[beta_col] = 1.0;
+                col.fill(0.0);
+                op(row_idx, basis.view(), &mut col);
+                for row_col in 0..di {
+                    out[[row_col, beta_col]] += col[row_col];
+                }
+            }
+        }
+        out
+    }
+
+    fn project_row_htbeta_to_factored_for_test(
+        term: &SaeManifoldTerm,
+        htbeta_b: ArrayView2<'_, f64>,
+    ) -> Array2<f64> {
+        let beta_offsets = term.beta_offsets();
+        let off_c = term.factored_beta_offsets();
+        let border_dim = term.factored_border_dim();
+        let p = term.output_dim();
+        let q_row = htbeta_b.nrows();
+        let mut out = Array2::<f64>::zeros((q_row, border_dim));
+        for atom_idx in 0..term.atoms.len() {
+            let atom = &term.atoms[atom_idx];
+            let m = atom.basis_size();
+            let r = atom.border_frame_rank();
+            let ob = beta_offsets[atom_idx];
+            let oc = off_c[atom_idx];
+            if atom.decoder_frame.is_none() {
+                debug_assert_eq!(r, p);
+                for basis_col in 0..m {
+                    let base_b = ob + basis_col * p;
+                    let base_c = oc + basis_col * r;
+                    for row_col in 0..q_row {
+                        for output in 0..p {
+                            out[[row_col, base_c + output]] = htbeta_b[[row_col, base_b + output]];
+                        }
+                    }
+                }
+            } else {
+                let uk = term.frame_output_matrix(atom_idx);
+                for basis_col in 0..m {
+                    let base_b = ob + basis_col * p;
+                    let base_c = oc + basis_col * r;
+                    for row_col in 0..q_row {
+                        for frame_col in 0..r {
+                            let mut acc = 0.0_f64;
+                            for output in 0..p {
+                                acc +=
+                                    htbeta_b[[row_col, base_b + output]] * uk[[output, frame_col]];
+                            }
+                            out[[row_col, base_c + frame_col]] = acc;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn factored_row_htbeta_native_solve_matches_full_b_then_project() {
+        let k_atoms = 2usize;
+        let m = 4usize;
+        let p = 24usize;
+        let r = 2usize;
+        let n_obs = 5usize;
+        let mut atoms = Vec::with_capacity(k_atoms);
+        let mut coord_blocks = Vec::with_capacity(k_atoms);
+        for atom_idx in 0..k_atoms {
+            let mut frame = Array2::<f64>::zeros((p, r));
+            frame[[atom_idx * r, 0]] = 1.0;
+            frame[[atom_idx * r + 1, 1]] = 1.0;
+            let coords = Array2::from_shape_fn((n_obs, 1), |(row, _)| 0.1 * (row + 1) as f64);
+            let mut phi = Array2::<f64>::zeros((n_obs, m));
+            let mut jet = Array3::<f64>::zeros((n_obs, m, 1));
+            for row in 0..n_obs {
+                for basis_col in 0..m {
+                    let x = (row + 1) as f64 * (basis_col + 1) as f64;
+                    phi[[row, basis_col]] = 0.03 * x + if row % m == basis_col { 1.0 } else { 0.0 };
+                    jet[[row, basis_col, 0]] = 0.02 * x;
+                }
+            }
+            let c = Array2::from_shape_fn((m, r), |(basis_col, frame_col)| {
+                0.2 + 0.04 * (basis_col + 2 * frame_col + atom_idx) as f64
+            });
+            let decoder = fast_abt(&c, &frame);
+            let mut atom = SaeManifoldAtom::new(
+                "factored_row_native",
+                SaeAtomBasisKind::EuclideanPatch,
+                1,
+                phi,
+                jet,
+                decoder,
+                Array2::<f64>::eye(m),
+            )
+            .unwrap();
+            atom.maybe_activate_decoder_frame()
+                .expect("frame activation")
+                .expect("rank-2 atom should activate a frame");
+            atoms.push(atom);
+            coord_blocks.push(coords);
+        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::from_shape_fn((n_obs, k_atoms), |(row, atom)| {
+                0.15 * (row + 1) as f64 - 0.07 * atom as f64
+            }),
+            coord_blocks,
+            vec![LatentManifold::Euclidean, LatentManifold::Euclidean],
+            AssignmentMode::softmax(0.9),
+        )
+        .unwrap();
+        let mut factored_term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        assert!(factored_term.frames_active());
+        let border_dim = factored_term.factored_border_dim();
+        assert!(border_dim < factored_term.beta_dim());
+
+        let mut full_term = factored_term.clone();
+        for atom in &mut full_term.atoms {
+            atom.deactivate_decoder_frame();
+        }
+        let rho = SaeManifoldRho::new(
+            0.0,
+            -0.2,
+            vec![Array1::<f64>::zeros(1), Array1::<f64>::zeros(1)],
+        );
+        let target = Array2::<f64>::from_shape_fn((n_obs, p), |(row, col)| {
+            0.01 * (row + 1) as f64 - 0.002 * (col + 1) as f64
+        });
+
+        let native_sys = factored_term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+        assert_eq!(native_sys.k, border_dim);
+        for row in &native_sys.rows {
+            assert_eq!(row.htbeta.ncols(), border_dim);
+        }
+
+        let full_sys = full_term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+        let mut projected_sys = factored_term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+        projected_sys.htbeta_matvec = None;
+        projected_sys.htbeta_transpose_matvec = None;
+        projected_sys.htbeta_dense_supplement = false;
+        for row_idx in 0..n_obs {
+            let htbeta_b = materialize_row_htbeta_for_test(&full_sys, row_idx);
+            projected_sys.rows[row_idx].htbeta =
+                project_row_htbeta_to_factored_for_test(&factored_term, htbeta_b.view());
+        }
+        projected_sys.refresh_row_hessian_fingerprint();
+
+        let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+        let (native_dt, native_db, _) =
+            solve_arrow_newton_step_with_options(&native_sys, 1.0e-8, 1.0e-8, &options).unwrap();
+        let (projected_dt, projected_db, _) =
+            solve_arrow_newton_step_with_options(&projected_sys, 1.0e-8, 1.0e-8, &options).unwrap();
+
+        assert_eq!(native_dt.len(), projected_dt.len());
+        assert_eq!(native_db.len(), projected_db.len());
+        for idx in 0..native_dt.len() {
+            assert_abs_diff_eq!(native_dt[idx], projected_dt[idx], epsilon = 1.0e-10);
+        }
+        for idx in 0..native_db.len() {
+            assert_abs_diff_eq!(native_db[idx], projected_db[idx], epsilon = 1.0e-10);
+        }
     }
 
     /// A full-rank small-`p` decoder must NOT activate a frame: the factored
