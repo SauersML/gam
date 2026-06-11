@@ -5831,9 +5831,89 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
                 Some(LatentDimSelectionSpec { init_log_precision })
             }
         };
-        if dim_selection.is_some() && aux_prior.is_none() {
+        let aux_outcome = match obj.get("aux_outcome").filter(|value| !value.is_null()) {
+            None => None,
+            Some(value) => {
+                use crate::terms::behavioral_head::AuxOutcomeFamily;
+                let ao = value
+                    .as_object()
+                    .ok_or_else(|| format!("latents['{key}'].aux_outcome must be an object"))?;
+                let family = match ao
+                    .get("family")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("binomial")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "binomial" => AuxOutcomeFamily::Binomial,
+                    "multinomial" => {
+                        let n_classes = ao
+                            .get("n_classes")
+                            .and_then(JsonValue::as_u64)
+                            .ok_or_else(|| {
+                                format!(
+                                    "latents['{key}'].aux_outcome.n_classes is required for multinomial"
+                                )
+                            })? as usize;
+                        AuxOutcomeFamily::Multinomial { n_classes }
+                    }
+                    other => {
+                        return Err(format!(
+                            "latents['{key}'].aux_outcome.family must be 'binomial' or 'multinomial', got '{other}'"
+                        ));
+                    }
+                };
+                let y = json_array1(
+                    ao.get("y")
+                        .ok_or_else(|| format!("latents['{key}'].aux_outcome.y is required"))?,
+                    &format!("latents['{key}'].aux_outcome.y"),
+                )?;
+                if y.len() != n {
+                    return Err(format!(
+                        "latents['{key}'].aux_outcome.y has length {}, expected n = {n}",
+                        y.len()
+                    ));
+                }
+                let row_weights = ao
+                    .get("row_weights")
+                    .filter(|value| !value.is_null())
+                    .map(|value| {
+                        json_array1(value, &format!("latents['{key}'].aux_outcome.row_weights"))
+                    })
+                    .transpose()?;
+                if let Some(w) = row_weights.as_ref()
+                    && w.len() != n
+                {
+                    return Err(format!(
+                        "latents['{key}'].aux_outcome.row_weights has length {}, expected n = {n}",
+                        w.len()
+                    ));
+                }
+                let init_log_precision = ao
+                    .get("init_log_precision")
+                    .map(|value| {
+                        json_array1(
+                            value,
+                            &format!("latents['{key}'].aux_outcome.init_log_precision"),
+                        )
+                    })
+                    .transpose()?;
+                Some(LatentAuxOutcomeSpec {
+                    family,
+                    y,
+                    row_weights,
+                    init_log_precision,
+                })
+            }
+        };
+        if dim_selection.is_some() && aux_prior.is_none() && aux_outcome.is_none() {
             return Err(format!(
-                "latents['{key}'] uses dim_selection without aux_prior; ARD alone is not an identifiable latent-coordinate gauge"
+                "latents['{key}'] uses dim_selection without aux_prior or aux_outcome; ARD alone is not an identifiable latent-coordinate gauge"
+            ));
+        }
+        if aux_outcome.is_some() && aux_prior.is_some() {
+            return Err(format!(
+                "latents['{key}'] specifies both aux_prior and aux_outcome; the auxiliary signal is either a prior (gauge-pin covariate) or a modeled outcome (behavioral head), not both"
             ));
         }
         let explicit_none_mode = obj
@@ -5841,9 +5921,13 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
             .or_else(|| obj.get("mode"))
             .and_then(JsonValue::as_str)
             .is_some_and(|s| s.eq_ignore_ascii_case("none"));
-        if aux_prior.is_none() && dim_selection.is_none() && !explicit_none_mode {
+        if aux_prior.is_none()
+            && dim_selection.is_none()
+            && aux_outcome.is_none()
+            && !explicit_none_mode
+        {
             return Err(format!(
-                "latents['{key}'] requires aux_prior for identifiable joint REML; pass id_mode='none' only when a separate gauge fix is supplied"
+                "latents['{key}'] requires aux_prior or aux_outcome for identifiable joint REML; pass id_mode='none' only when a separate gauge fix is supplied"
             ));
         }
         specs.push(LatentSpec {
@@ -5855,6 +5939,7 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
             retraction_registry,
             aux_prior,
             dim_selection,
+            aux_outcome,
             explicit_none_mode,
         });
     }
@@ -5920,6 +6005,28 @@ fn initial_latent_matrix(spec: &LatentSpec, y: ArrayView1<'_, f64>) -> Result<Ar
 }
 
 fn latent_id_mode(spec: &LatentSpec) -> Result<LatentIdMode, String> {
+    if let Some(ao) = spec.aux_outcome.as_ref() {
+        use crate::terms::behavioral_head::BehavioralHead;
+        if let Some(init) = ao.init_log_precision.as_ref()
+            && init.len() != spec.d
+        {
+            return Err(format!(
+                "latent '{}' aux_outcome.init_log_precision has length {}, expected {}",
+                spec.target,
+                init.len(),
+                spec.d
+            ));
+        }
+        let head = match ao.row_weights.as_ref() {
+            Some(w) => BehavioralHead::new(ao.family, ao.y.clone(), w.clone()),
+            None => BehavioralHead::fully_supervised(ao.family, ao.y.clone()),
+        }
+        .map_err(|e| format!("latent '{}' aux_outcome head: {e}", spec.target))?;
+        return Ok(LatentIdMode::AuxOutcome {
+            head,
+            init_log_precision: ao.init_log_precision.clone(),
+        });
+    }
     match (&spec.aux_prior, &spec.dim_selection) {
         (Some(aux), Some(dim)) => {
             if let Some(init) = dim.init_log_precision.as_ref()
