@@ -12,8 +12,8 @@ git pull
 mkdir -p /mnt/work/exp
 
 {
-    printf 'PERF_RUN git_sha=%s\n' "$(git rev-parse HEAD)"
-    nice -n 10 cargo build --release --example sae_perf_harness 2>&1 | tail -1
+    printf 'PERF_RUN ts=%s git_sha=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)"
+    nice -n 10 cargo build -j 1 --release --example sae_perf_harness 2>&1 | tail -1
     for shape in tiny color qwen; do
         "$CARGO_TARGET_DIR/release/examples/sae_perf_harness" "$shape"
     done
