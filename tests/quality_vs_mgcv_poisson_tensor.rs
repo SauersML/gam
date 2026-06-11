@@ -37,7 +37,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -226,21 +226,6 @@ fn poisson_deviance(pred_mean: &[f64], obs: &[f64]) -> f64 {
         s += 2.0 * (ylogymu - (y - mu));
     }
     s / n.max(1.0)
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
-/// test-length column can ride along inside a train-length reference data.frame.
-/// Only the first `v.len()` entries are read back inside the R body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }
 
 /// REAL-DATA arm of the SAME capability (Poisson(log) × tensor-product te()),

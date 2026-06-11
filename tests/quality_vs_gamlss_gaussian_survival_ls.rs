@@ -69,7 +69,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, pad_to, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -596,20 +596,4 @@ fn gam_gaussian_survival_location_scale_matches_gamlss_on_real_data() {
         "gam held-out concordance {gam_cindex:.4} worse than gamlss \
          {gamlss_cindex:.4} - 0.03"
     );
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so
-/// the held-out test covariates can ride along as columns of the training
-/// data.frame handed to the reference body. Only the first `v.len()` entries
-/// are read back inside the R body (indexed by `test_n`).
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }

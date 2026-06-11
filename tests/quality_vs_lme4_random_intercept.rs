@@ -35,7 +35,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, rmse, run_r};
+use gam::test_support::reference::{Column, pad_to, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -427,19 +427,4 @@ fn gam_random_intercept_matches_lme4_on_real_data() {
         gam_test_rmse <= lme4_test_rmse * 1.10,
         "gam held-out RMSE {gam_test_rmse:.3} exceeds lme4 {lme4_test_rmse:.3} * 1.10"
     );
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
-/// held-out vector can ride along as a column of the training-length reference
-/// data.frame. Only the first `v.len()` entries are read back inside the R body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }

@@ -26,7 +26,7 @@
 use gam::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, run_python, run_r};
+use gam::test_support::reference::{Column, pad_to, relative_l2, run_python, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -481,16 +481,4 @@ emit("prob", clf.predict_proba(Xte)[:, 1])
         "gam held-out log-loss trails best baseline: gam={gam_ll:.4} \
          best_ref={best_ref:.4} (mgcv={mgcv_ll:.4} sklearn={sk_ll:.4})"
     );
-}
-
-/// Pad a vector to `len` by repeating its last value (or 0.0 if empty). Used to
-/// ship a short test-row column alongside longer train-row columns through the
-/// single-`data.frame` harness; the reference body slices back to the true
-/// length via an emitted `ntest`/`nfull` count.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(v.len() <= len, "pad_to: source longer than target");
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }

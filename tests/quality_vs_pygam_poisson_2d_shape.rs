@@ -31,7 +31,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
+use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -430,19 +430,4 @@ emit("edf", [float(m.statistics_["edof"])])
         gam_edf > 1.0 && gam_edf < 30.0,
         "real-data 2-D edf outside the signal-appropriate range (1, 30): {gam_edf:.3}"
     );
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so the
-/// held-out test columns can ride along in the single reference data.frame; only
-/// the first `v.len()` entries are read back inside the Python body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }
