@@ -6757,6 +6757,15 @@ impl SaeManifoldTerm {
         Ok((v, loss, cache))
     }
 
+    fn is_undamped_evidence_row_non_pd(err: &ArrowSchurError) -> bool {
+        matches!(
+            err,
+            ArrowSchurError::PerRowFactorFailed { reason, .. }
+                if reason.contains("H_tt is non-PD at base ridge")
+                    && reason.contains("evidence mode preserves the genuine Cholesky")
+        )
+    }
+
     /// Drive the inner `(t, β)` Newton solve to the KKT/step-converged optimum
     /// and return the final UNDAMPED (`ridge = 0`) joint-Hessian factor cache.
     ///
@@ -6837,26 +6846,6 @@ impl SaeManifoldTerm {
                 .map(|row| row.gt.iter().map(|&v| v * v).sum::<f64>())
                 .sum::<f64>()
                 + sys.gb.iter().map(|&v| v * v).sum::<f64>();
-            let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
-                solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options)
-                    .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
-            // The Laplace normaliser ½log|H| is only the correct REML criterion at
-            // the inner optimum (t̂, β̂). Convergence is judged by EITHER a small
-            // gradient (KKT stationarity) OR a small undamped Newton step; the
-            // solve is only rejected as non-converged when BOTH are large, i.e.
-            // the iterate is neither stationary nor about to move negligibly. That
-            // disjunction is what keeps an ill-conditioned-but-stationary fit
-            // (small g, large Δ) from being rejected while still refusing to rank
-            // an off-optimum Laplace criterion that is genuinely mid-flight.
-            let step_norm_sq: f64 = delta_t.iter().map(|&v| v * v).sum::<f64>()
-                + delta_beta.iter().map(|&v| v * v).sum::<f64>();
-            if !step_norm_sq.is_finite() || !grad_norm_sq.is_finite() {
-                return Err(format!(
-                    "SaeManifoldTerm::reml_criterion: undamped inner residual is non-finite at \
-                     the inner optimum (‖Δ‖²={step_norm_sq}, ‖g‖²={grad_norm_sq}); the joint \
-                     Hessian factorisation is degenerate at this ρ"
-                ));
-            }
             let mut iterate_norm_sq = 0.0_f64;
             for &v in self.assignment.logits.iter() {
                 iterate_norm_sq += v * v;
@@ -6872,7 +6861,6 @@ impl SaeManifoldTerm {
                     iterate_norm_sq += v * v;
                 }
             }
-            let step_norm = step_norm_sq.sqrt();
             let grad_norm = grad_norm_sq.sqrt();
             let iterate_scale = 1.0 + iterate_norm_sq.sqrt();
             // Relative parameter-step tolerance for Δ (well-conditioned charts)
@@ -6890,6 +6878,69 @@ impl SaeManifoldTerm {
             // non-convergence the indefinite curvature caused.
             let step_tolerance = SAE_MANIFOLD_INNER_STEP_REL_TOL * iterate_scale;
             let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * iterate_scale;
+            if !grad_norm_sq.is_finite() {
+                return Err(format!(
+                    "SaeManifoldTerm::reml_criterion: undamped inner KKT residual is non-finite \
+                     at the inner optimum (‖g‖²={grad_norm_sq}); the joint Hessian \
+                     factorisation is degenerate at this ρ"
+                ));
+            }
+            let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
+                match solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options) {
+                    Ok(factored) => factored,
+                    Err(err) if Self::is_undamped_evidence_row_non_pd(&err) => {
+                        if grad_norm <= grad_tolerance {
+                            return Err(format!(
+                                "SaeManifoldTerm::reml_criterion: stationary undamped evidence \
+                                 factorization still has a non-PD per-row H_tt block \
+                                 (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}); {err}"
+                            ));
+                        }
+                        if total_inner_iter >= max_refine_iter {
+                            return Err(format!(
+                                "SaeManifoldTerm::reml_criterion: undamped evidence \
+                                 factorization hit a non-PD per-row H_tt block before KKT \
+                                 stationarity (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}) \
+                                 and the refinement budget was exhausted after \
+                                 {total_inner_iter} inner iterations; {err}"
+                            ));
+                        }
+                        let remaining = max_refine_iter - total_inner_iter;
+                        let refine_iter = inner_max_iter.max(1).min(remaining);
+                        *loss = self.run_joint_fit_arrow_schur(
+                            target,
+                            rho_fixed,
+                            registry,
+                            refine_iter,
+                            learning_rate,
+                            ridge_ext_coord,
+                            ridge_beta,
+                        )?;
+                        total_inner_iter += refine_iter;
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(format!("SaeManifoldTerm::reml_criterion: {err}"));
+                    }
+                };
+            // The Laplace normaliser ½log|H| is only the correct REML criterion at
+            // the inner optimum (t̂, β̂). Convergence is judged by EITHER a small
+            // gradient (KKT stationarity) OR a small undamped Newton step; the
+            // solve is only rejected as non-converged when BOTH are large, i.e.
+            // the iterate is neither stationary nor about to move negligibly. That
+            // disjunction is what keeps an ill-conditioned-but-stationary fit
+            // (small g, large Δ) from being rejected while still refusing to rank
+            // an off-optimum Laplace criterion that is genuinely mid-flight.
+            let step_norm_sq: f64 = delta_t.iter().map(|&v| v * v).sum::<f64>()
+                + delta_beta.iter().map(|&v| v * v).sum::<f64>();
+            if !step_norm_sq.is_finite() {
+                return Err(format!(
+                    "SaeManifoldTerm::reml_criterion: undamped inner residual is non-finite at \
+                     the inner optimum (‖Δ‖²={step_norm_sq}, ‖g‖²={grad_norm_sq}); the joint \
+                     Hessian factorisation is degenerate at this ρ"
+                ));
+            }
+            let step_norm = step_norm_sq.sqrt();
             if grad_norm <= grad_tolerance || step_norm <= step_tolerance {
                 return Ok(cache);
             }
@@ -12581,6 +12632,40 @@ mod tests {
         let (stream_cost, stream_loss) = streaming
             .reml_criterion_streaming_exact(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
             .unwrap();
+        assert_abs_diff_eq!(stream_cost, full_cost, epsilon = 1.0e-8);
+        assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
+    }
+
+    #[test]
+    fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
+        let (term0, target, rho) = small_two_atom_periodic_term();
+        let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+        let cold_sys = term0
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+        let cold_factor = solve_arrow_newton_step_with_options(&cold_sys, 0.0, 0.0, &options);
+        let cold_err = match cold_factor {
+            Err(err) => err,
+            Ok(_) => panic!("fixture must start with a non-PD undamped evidence row factor"),
+        };
+        assert!(
+            SaeManifoldTerm::is_undamped_evidence_row_non_pd(&cold_err),
+            "fixture must start with a genuine evidence-mode non-PD row factor; got {cold_err}",
+        );
+
+        let mut full = term0.clone();
+        let mut streaming = term0;
+        let (full_cost, full_loss, cache) = full
+            .reml_criterion_with_cache(target.view(), &rho, None, 1, 0.25, 1.0e-4, 1.0e-4)
+            .expect("dense REML must refine through the cold non-PD evidence factor");
+        let log_det = arrow_log_det_from_cache(&cache).expect("refined cache must carry log-det");
+        assert!(full_cost.is_finite());
+        assert!(full_loss.total().is_finite());
+        assert!(log_det.is_finite());
+
+        let (stream_cost, stream_loss) = streaming
+            .reml_criterion_streaming_exact(target.view(), &rho, None, 1, 0.25, 1.0e-4, 1.0e-4)
+            .expect("streaming REML must share the dense refinement retry");
         assert_abs_diff_eq!(stream_cost, full_cost, epsilon = 1.0e-8);
         assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
     }
