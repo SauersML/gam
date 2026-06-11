@@ -140,12 +140,13 @@ const MULTINOMIAL_FORMULA_RIDGE_FLOOR: f64 = 1.0e-4;
 /// Largest smoothing-parameter dimension where exact dense outer curvature is
 /// still worth paying for multinomial formula fits.
 ///
-/// `D = (K - 1) * n_terms`. Medium-size loaded models (`D <= 6`) benefit from
-/// exact curvature because the first-order route can wander on near-separable
-/// labels. Smooth-by-factor models with one global plus one per-level smooth
-/// already reach `D = 8` for `K = 3`, where the O(D^2) dense outer Hessian
-/// dominates runtime; those stay on the exact-gradient quasi-Newton route.
-const MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM: usize = 6;
+/// Multinomial softmax curvature degenerates near simplex boundaries, and the
+/// exact dense outer Hessian amplifies that into expensive, rejection-prone
+/// startup/line-search behavior on the #715 quality arms. The adapter therefore
+/// uses exact gradients with the quasi-Newton outer path for every multinomial
+/// smoothing dimension; this keeps the REML surface smooth enough for lambda
+/// selection without the dense pairwise Hessian work.
+const MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM: usize = 0;
 
 fn multinomial_formula_use_outer_hessian(total_rho_dim: usize) -> bool {
     total_rho_dim <= MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM
@@ -736,13 +737,11 @@ pub fn fit_penalized_multinomial_formula(
         }
     }
 
-    // ── Outer-derivative policy: auto-derived from the smoothing dimension ──
-    // The total smoothing-parameter dimension is `D = (K−1) · n_terms`.
-    // Multinomial exact outer curvature is pairwise in `D`, so smooth-by-factor
-    // `D = 8` models must avoid the O(D²) dense Hessian path (#714). But
-    // medium `D = 6` loaded models with hard labels benefit from exact
-    // curvature because first-order BFGS can wander along separation-induced
-    // ridges (#722). The helper below encodes that crossover explicitly.
+    // ── Outer-derivative policy: exact-gradient quasi-Newton for multinomial ──
+    // The total smoothing-parameter dimension is `D = (K−1) · n_terms`. The dense
+    // exact-Hessian path is pairwise in `D` and is fragile when softmax Fisher
+    // weights collapse near simplex boundaries, so this adapter keeps every
+    // multinomial formula fit on the exact-gradient quasi-Newton route.
     let total_rho_dim = m.saturating_mul(penalties_arc.len());
     let use_outer_hessian = multinomial_formula_use_outer_hessian(total_rho_dim);
 
@@ -1041,10 +1040,10 @@ mod fisher_override_tests {
     }
 
     #[test]
-    fn formula_outer_route_uses_exact_curvature_for_medium_d() {
+    fn formula_outer_route_uses_first_order_for_medium_d() {
         assert!(
-            multinomial_formula_use_outer_hessian(6),
-            "D=6 loaded multinomial fits need exact curvature to avoid near-separation BFGS wandering"
+            !multinomial_formula_use_outer_hessian(6),
+            "D=6 loaded multinomial fits must avoid dense outer Hessian work on softmax boundary curvature"
         );
     }
 

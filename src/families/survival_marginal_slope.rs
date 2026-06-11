@@ -17701,8 +17701,11 @@ impl SurvivalMarginalSlopeFamilyScalars {
 /// ∂ad1[i]/∂β = 0
 /// ```
 pub struct LogslopeBlockJacobian {
-    /// The logslope basis design (n × p_logslope).
-    design: Array2<f64>,
+    /// The logslope basis design (n × p_logslope). Held behind an `Arc` so a
+    /// materialized design is shared with its owner rather than deep-copied —
+    /// at biobank scale each retained `n × p` copy in these construction-time
+    /// callbacks was hundreds of MiB held for the whole fit (#979 OOM).
+    design: Arc<Array2<f64>>,
     /// Per-row covariate score z_i (length n).
     z: Vec<f64>,
     /// Probit scale s.
@@ -17710,8 +17713,12 @@ pub struct LogslopeBlockJacobian {
 }
 
 impl LogslopeBlockJacobian {
-    pub fn new(design: Array2<f64>, z: Vec<f64>, s: f64) -> Self {
-        Self { design, z, s }
+    pub fn new(design: impl Into<Arc<Array2<f64>>>, z: Vec<f64>, s: f64) -> Self {
+        Self {
+            design: design.into(),
+            z,
+            s,
+        }
     }
 }
 
@@ -17815,13 +17822,16 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
 ///
 /// At g=0 (β=0 init): c=1, so each row is just M[i,:].
 pub struct MarginalBlockJacobian {
-    /// The marginal basis design (n × p_marginal).
-    design: Array2<f64>,
+    /// The marginal basis design (n × p_marginal), `Arc`-shared with its
+    /// owner (see [`LogslopeBlockJacobian::design`]).
+    design: Arc<Array2<f64>>,
 }
 
 impl MarginalBlockJacobian {
-    pub fn new(design: Array2<f64>) -> Self {
-        Self { design }
+    pub fn new(design: impl Into<Arc<Array2<f64>>>) -> Self {
+        Self {
+            design: design.into(),
+        }
     }
 }
 
@@ -17889,21 +17899,22 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
 ///
 /// At g=0 (β=0 init): c=1.
 pub struct TimeBlockJacobian {
-    design_entry: Array2<f64>,
-    design_exit: Array2<f64>,
-    design_deriv: Array2<f64>,
+    // `Arc`-shared with their owners (see [`LogslopeBlockJacobian::design`]).
+    design_entry: Arc<Array2<f64>>,
+    design_exit: Arc<Array2<f64>>,
+    design_deriv: Arc<Array2<f64>>,
 }
 
 impl TimeBlockJacobian {
     pub fn new(
-        design_entry: Array2<f64>,
-        design_exit: Array2<f64>,
-        design_deriv: Array2<f64>,
+        design_entry: impl Into<Arc<Array2<f64>>>,
+        design_exit: impl Into<Arc<Array2<f64>>>,
+        design_deriv: impl Into<Arc<Array2<f64>>>,
     ) -> Self {
         Self {
-            design_entry,
-            design_exit,
-            design_deriv,
+            design_entry: design_entry.into(),
+            design_exit: design_exit.into(),
+            design_deriv: design_deriv.into(),
         }
     }
 }
@@ -19143,27 +19154,22 @@ fn build_time_blockspec(
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
 ) -> ParameterBlockSpec {
-    // Build the three dense design matrices for the multi-output Jacobian.
-    // Densification is cheap here (done once at construction, not per PIRLS
-    // iteration). Falls back to no callback if densification fails.
+    // Share the three dense design matrices with the multi-output Jacobian
+    // via `Arc` — `try_to_dense_arc` is zero-copy for materialized designs,
+    // so the callback retains no duplicate `n × p` storage. Falls back to no
+    // callback if densification fails.
     let jac_cb: Option<Arc<dyn crate::custom_family::BlockEffectiveJacobian>> = (|| {
         let d_entry = time_block
             .design_entry
             .try_to_dense_arc("build_time_blockspec::entry")
-            .ok()?
-            .as_ref()
-            .clone();
+            .ok()?;
         let d_exit = design_exit
             .try_to_dense_arc("build_time_blockspec::exit")
-            .ok()?
-            .as_ref()
-            .clone();
+            .ok()?;
         let d_deriv = time_block
             .design_derivative_exit
             .try_to_dense_arc("build_time_blockspec::deriv")
-            .ok()?
-            .as_ref()
-            .clone();
+            .ok()?;
         if d_entry.dim() != d_exit.dim() || d_entry.dim() != d_deriv.dim() {
             return None;
         }
@@ -19206,11 +19212,8 @@ fn build_logslope_blockspec(
         .try_to_dense_arc("build_logslope_blockspec")
         .ok()
         .map(|d| {
-            Arc::new(LogslopeBlockJacobian::new(
-                d.as_ref().clone(),
-                z_vec,
-                probit_scale,
-            )) as Arc<dyn crate::custom_family::BlockEffectiveJacobian>
+            Arc::new(LogslopeBlockJacobian::new(d, z_vec, probit_scale))
+                as Arc<dyn crate::custom_family::BlockEffectiveJacobian>
         });
 
     ParameterBlockSpec {
@@ -19239,7 +19242,7 @@ fn build_marginal_blockspec(
         .try_to_dense_arc("build_marginal_blockspec")
         .ok()
         .map(|d| {
-            Arc::new(MarginalBlockJacobian::new(d.as_ref().clone()))
+            Arc::new(MarginalBlockJacobian::new(d))
                 as Arc<dyn crate::custom_family::BlockEffectiveJacobian>
         });
 
