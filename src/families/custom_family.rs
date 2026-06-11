@@ -31994,7 +31994,6 @@ mod tests {
 
     #[test]
     fn outer_lamlgradient_diagonal_binomial_location_scale_matchesfd() {
-        crate::solver::visualizer::init_logging();
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
         let (family, specs, penalty_counts, options) =
             binomial_location_scale_outer_fixture(y, 0.0, 0.0);
