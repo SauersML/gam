@@ -4403,6 +4403,64 @@ pub struct ArrowFactorCache {
     pub pcg_diagnostics: PcgDiagnostics,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArrowFactorMinPivot {
+    pub min_row_pivot: Option<f64>,
+    pub min_schur_pivot: Option<f64>,
+    pub min_pivot: Option<f64>,
+}
+
+impl ArrowFactorMinPivot {
+    fn combine(row: Option<f64>, schur: Option<f64>) -> Self {
+        let min_pivot = match (row, schur) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        Self {
+            min_row_pivot: row,
+            min_schur_pivot: schur,
+            min_pivot,
+        }
+    }
+}
+
+fn lower_cholesky_min_pivot(factor: &Array2<f64>) -> Option<f64> {
+    let width = factor.nrows().min(factor.ncols());
+    let mut out = None;
+    for idx in 0..width {
+        let pivot = factor[[idx, idx]] * factor[[idx, idx]];
+        out = Some(match out {
+            Some(current) => f64::min(current, pivot),
+            None => pivot,
+        });
+    }
+    out
+}
+
+/// Smallest cached Cholesky pivot for row blocks and the dense Schur factor.
+///
+/// Pivots are returned as squared lower-factor diagonals, matching the Hessian
+/// scale rather than the Cholesky-factor scale. In inexact PCG mode the dense
+/// Schur factor is absent, so `min_schur_pivot` is `None`.
+pub fn arrow_factor_min_pivot(cache: &ArrowFactorCache) -> ArrowFactorMinPivot {
+    let mut min_row_pivot = None;
+    for factor in cache.htt_factors.iter() {
+        if let Some(pivot) = lower_cholesky_min_pivot(factor) {
+            min_row_pivot = Some(match min_row_pivot {
+                Some(current) => f64::min(current, pivot),
+                None => pivot,
+            });
+        }
+    }
+    let min_schur_pivot = cache
+        .schur_factor
+        .as_ref()
+        .and_then(lower_cholesky_min_pivot);
+    ArrowFactorMinPivot::combine(min_row_pivot, min_schur_pivot)
+}
+
 impl ArrowFactorCache {
     pub fn n_rows(&self) -> usize {
         self.htt_factors.len()
@@ -8165,6 +8223,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn diagonal_arrow_fixture(row_min: f64, schur_min: f64) -> ArrowSchurSystem {
+        let mut sys = ArrowSchurSystem::new(2, 2, 2);
+        sys.rows[0].htt = array![[row_min, 0.0], [0.0, row_min + 1.0]];
+        sys.rows[1].htt = array![[row_min + 2.0, 0.0], [0.0, row_min + 3.0]];
+        for row in sys.rows.iter_mut() {
+            row.htbeta.fill(0.0);
+            row.gt.fill(0.0);
+        }
+        sys.hbb = array![[schur_min, 0.0], [0.0, schur_min + 1.0]];
+        sys.gb.fill(0.0);
+        sys
+    }
+
+    fn diagonal_fixture_dense_lambda_min(sys: &ArrowSchurSystem) -> f64 {
+        let mut out = f64::INFINITY;
+        for row in &sys.rows {
+            for axis in 0..row.htt.nrows() {
+                out = out.min(row.htt[[axis, axis]]);
+            }
+        }
+        for axis in 0..sys.hbb.nrows() {
+            out = out.min(sys.hbb[[axis, axis]]);
+        }
+        out
+    }
+
+    #[test]
+    fn arrow_factor_min_pivot_matches_dense_lambda_min_ordering() {
+        let weak = diagonal_arrow_fixture(0.2, 0.8);
+        let strong = diagonal_arrow_fixture(0.7, 1.2);
+        let options = ArrowSolveOptions::direct();
+        let (_dt_w, _db_w, weak_cache) =
+            solve_arrow_newton_step_with_options(&weak, 0.0, 0.0, &options)
+                .expect("weak diagonal fixture should factor");
+        let (_dt_s, _db_s, strong_cache) =
+            solve_arrow_newton_step_with_options(&strong, 0.0, 0.0, &options)
+                .expect("strong diagonal fixture should factor");
+
+        let weak_lambda = diagonal_fixture_dense_lambda_min(&weak);
+        let strong_lambda = diagonal_fixture_dense_lambda_min(&strong);
+        assert!(weak_lambda < strong_lambda);
+
+        let weak_pivot = arrow_factor_min_pivot(&weak_cache)
+            .min_pivot
+            .expect("weak pivot");
+        let strong_pivot = arrow_factor_min_pivot(&strong_cache)
+            .min_pivot
+            .expect("strong pivot");
+        assert_abs_diff_eq!(weak_pivot, weak_lambda, epsilon = 1.0e-14);
+        assert_abs_diff_eq!(strong_pivot, strong_lambda, epsilon = 1.0e-14);
+        assert!(weak_pivot < strong_pivot);
     }
 
     fn quartic_counterexample_value(t: f64) -> f64 {
