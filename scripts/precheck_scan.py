@@ -134,35 +134,34 @@ def compute_test_mask(lines, rel):
     if file_is_test_scope(rel):
         return [True] * n
 
+    # Mirrors build.rs compute_test_mask EXACTLY (the algorithm is load-bearing
+    # — an off-by-one in the gate entry depth desyncs on the first multi-line
+    # `use {...}` group inside the test module and silently un-exempts the rest
+    # of the file). The gate's entry depth is `depth - 1` AFTER the opening `{`
+    # increments depth; the gate closes when `depth - 1 == entry` is checked
+    # BEFORE the closing `}` decrements. A line is in-test iff a gate was open at
+    # the line's START, so the attribute line, the brace-open line, and the
+    # brace-close line themselves are NOT marked (they belong to enclosing scope).
     mask = [False] * n
     depth = 0
-    gate_stack = []  # brace depths at which an open cfg(test) gate started
-    pending_gate = False  # saw the attribute, waiting for the opening `{`
+    gate_stack = []
+    pending_attr = False
 
     for idx, raw in enumerate(lines):
         code = strip_strings_and_comments(raw)
-        start_depth = depth
-        in_gate_at_line_start = len(gate_stack) > 0
-        if in_gate_at_line_start:
-            mask[idx] = True
-
         if CFG_TEST_RE.search(code):
-            pending_gate = True
-
+            pending_attr = True
+        mask[idx] = len(gate_stack) > 0
         for ch in code:
             if ch == "{":
                 depth += 1
-                if pending_gate:
-                    gate_stack.append(start_depth)
-                    pending_gate = False
-                    # lines from here in the gate are test scope
-                    mask[idx] = True
+                if pending_attr:
+                    gate_stack.append(depth - 1)
+                    pending_attr = False
             elif ch == "}":
-                depth -= 1
-                if gate_stack and depth == gate_stack[-1]:
+                if gate_stack and depth - 1 == gate_stack[-1]:
                     gate_stack.pop()
-        # a cfg(test) attribute followed by no brace on the same line stays
-        # pending until the next `{`
+                depth -= 1
     return mask
 
 
@@ -222,7 +221,10 @@ def scan_file(path, rel):
         if not in_test and DEBUG_EPRINT_RE.search(code) and DEBUG_FMT_RE.search(raw):
             hits.append((idx + 1, "eprintln! with {:?} debug formatting", raw))
 
-        if LET_UNDERSCORE_RE.search(code):
+        # `let _` is test-aware in build.rs (scan_for_let_underscore skips the
+        # test mask), so a `let _ = …` inside a `#[cfg(test)]` block or a test
+        # file is allowed.
+        if not in_test and LET_UNDERSCORE_RE.search(code):
             hits.append((idx + 1, "let _ (use or delete the value)", raw))
         # allow/expect — exempt clippy::/rustc::/rustdoc:: tool lints (build.rs
         # does); only a real rustc-lint silencer is banned.

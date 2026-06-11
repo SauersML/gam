@@ -1767,6 +1767,58 @@ impl Gam784BlockTarget<'_> {
         let s = crate::faer_ndarray::fast_av(self.x_transformed, &delta);
         (delta, s)
     }
+
+    /// Per-row score `∂(D(η)/2φ)/∂η` at the given linear predictor.
+    ///
+    /// Mirrors `calculate_deviance`'s per-family μ-floors so this is the
+    /// exact η-derivative of the SAME deviance the value channel sums:
+    /// `dD_i/dμ = −2·w_i·(y_i − μ_i)/V(μ_i) · s_fam` (the exponential-family
+    /// unit-deviance identity, exact for Binomial/Poisson/Gamma/NB/Tweedie/
+    /// Gaussian — the families `block_local_sampled_correction` admits),
+    /// `s_fam` being the internal dispersion division the Gaussian and
+    /// Tweedie branches of `calculate_deviance` apply. The trailing `/(2φ)`
+    /// matches the excess definition `[D_disp − D_base]/(2φ)`.
+    ///
+    /// Rows whose inverse-link jet is infeasible return 0: the value channel
+    /// scores such draws as `ΔF = ∞` (zero importance weight), so their score
+    /// is never consumed.
+    fn neg_score_at(&self, eta: &Array1<f64>) -> Array1<f64> {
+        let spec_response = reml_spec(&self.likelihood).response.clone();
+        let family = crate::pirls::weight_family_for_glm_likelihood(&self.likelihood);
+        let fam_scale = match &spec_response {
+            ResponseFamily::Gaussian | ResponseFamily::Tweedie { .. } => {
+                1.0 / self.likelihood.fixed_phi().unwrap_or(1.0)
+            }
+            _ => 1.0,
+        };
+        // Same floors as `calculate_deviance`: binomial clamps μ to
+        // [1e-12, 1−1e-12]; the remaining families floor μ at 1e-10.
+        const BINOMIAL_MU_EPS: f64 = 1e-12;
+        const MU_FLOOR: f64 = 1e-10;
+        let is_binomial = matches!(spec_response, ResponseFamily::Binomial);
+        let mut out = Array1::<f64>::zeros(eta.len());
+        for i in 0..eta.len() {
+            let jet = match crate::mixture_link::inverse_link_jet_for_inverse_link(
+                &self.inverse_link,
+                eta[i],
+            ) {
+                Ok(jet) => jet,
+                Err(_) => continue,
+            };
+            let mu_c = if is_binomial {
+                jet.mu.clamp(BINOMIAL_MU_EPS, 1.0 - BINOMIAL_MU_EPS)
+            } else {
+                jet.mu.max(MU_FLOOR)
+            };
+            let v = crate::pirls::variance_jet_for_weight_family(family, mu_c).v;
+            if !(v.is_finite() && v > 0.0) {
+                continue;
+            }
+            let d_dev_d_mu = -2.0 * self.prior_weights[i] * (self.y[i] - mu_c) / v * fam_scale;
+            out[i] = d_dev_d_mu * jet.d1 / (2.0 * self.phi);
+        }
+        out
+    }
 }
 
 impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
@@ -1831,6 +1883,15 @@ impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
             grad[k] = lam * score.dot(&delta);
         }
         grad
+    }
+
+    fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64> {
+        let (_delta, s) = self.displacement(t);
+        self.neg_score_at(&(&self.eta_hat + &s))
+    }
+
+    fn base_neg_score(&self) -> Array1<f64> {
+        self.neg_score_at(&self.eta_hat)
     }
 }
 
@@ -3935,6 +3996,38 @@ impl<'a> RemlState<'a> {
             return Ok(zero());
         }
 
+        // External (ψ) hyper-coordinates present: the exact gradient of the
+        // realized estimator along ψ requires the field motion of `X(ψ)`,
+        // `S(ψ)` and the reparameterized basis — moments this seam does not
+        // yet carry. A spliced value whose ψ-gradient entries are zeroed (or
+        // truncated) is an objective↔gradient desync (#901, the #752/#748
+        // bug class); per the gradient exactness contract on
+        // `block_sampled_marginal_correction`, the correct response is to
+        // DECLINE the splice — value AND gradient together — rather than
+        // approximate.
+        if n_ext > 0 {
+            log::info!(
+                "[#784] block-local fallback declined: {n_ext} external (ψ) coordinate(s) \
+                 present and the ψ-exact gradient channels are not implemented; splicing a \
+                 ψ-truncated gradient would desync objective and gradient (#901)"
+            );
+            return Ok(zero());
+        }
+        // The exact score channel relies on the exponential-family unit-
+        // deviance identity dD/dμ = −2w(y−μ)/V(μ), which does not hold for
+        // the Beta pseudo-family parameterization. Decline rather than splice
+        // a gradient that is not the derivative of the spliced value.
+        if matches!(
+            reml_spec(&self.config.likelihood).response,
+            ResponseFamily::Beta { .. }
+        ) {
+            log::info!(
+                "[#784] block-local fallback declined: Beta family has no exponential-family \
+                 score identity for the exact gradient channels"
+            );
+            return Ok(zero());
+        }
+
         // Build the block subspace V_b from the flagged H-eigenvectors.
         let sym_h = (h_total + &h_total.t()) * 0.5;
         let (evals, evecs) = sym_h.eigh(Side::Lower).map_err(|e| {
@@ -4030,16 +4123,162 @@ impl<'a> RemlState<'a> {
 
         // `Δ_b` is added to the marginal log-likelihood ⇒ subtracted from the
         // REML cost. The gradient ∂Δ_b/∂ρ likewise enters the cost with a
-        // negative sign. Zero-extend over external coordinates — note this is
-        // a further truncation on top of the explicit-channel-only ρ-gradient:
-        // Δ_b moves with ψ through η̂, H's eigenpairs, and the penalty scores,
-        // so the ψ-entries of the exact gradient are NOT zero. See the
-        // "Gradient exactness contract" on `block_sampled_marginal_correction`
-        // for the four-channel pathwise derivative this splice still owes and
-        // the sufficient-statistics seam designed to deliver it.
+        // negative sign.
+        //
+        // ── Exact gradient channels (b)–(d) ─────────────────────────────
+        // The explicit channel `−sampled.rho_gradient` (channel (a)) is NOT
+        // the total ρ-derivative of the realized estimator: with fixed-seed
+        // draws `t_s = z_s/√λ_r(ρ)`, the value also moves through the block
+        // eigenvalues (draw rescale, (b)), the block eigenvectors (frame
+        // rotation, (c)), and the mode β̂ (mode motion, (d)). Splicing (a)
+        // alone is the #752/#748/#901 objective↔gradient desync. The four
+        // channels are assembled here per the gradient exactness contract on
+        // `block_sampled_marginal_correction`, contracting the sampler's
+        // self-normalized moments against fields this evaluator already owns:
+        //
+        //   d(cost)/dρ_j = E_p[dΔF/dρ_j]
+        //                = (a) E_p[∂ΔF/∂ρ_j]
+        //                + (b)+(c) tr(Ḣ_j · (Q_b + Q_c))
+        //                + (d) g_dᵀ · dβ̂/dρ_j,
+        //
+        // with the TOTAL drift `Ḣ_j = λ_j S_j − C[v_j]`,
+        // `C[v] = Xᵀ diag(c ⊙ Xv) X`, the IFT mode response
+        // `dβ̂/dρ_j = −v_j = −H⁻¹ λ_j S_j β̂`, and
+        //
+        //   Q_b = Σ_r (M_r/λ_r) u_r u_rᵀ                       (rank m)
+        //   Q_c = sym( Σ_r Σ_{q≠r} u_q (R̃_{q r}/(λ_r − σ_q)) u_rᵀ )
+        //   M_r = E_p[(∂ΔF/∂t)_r · (−½ t_r)],   R̃ = Uᵀ E_p[t_r ∂ΔF/∂δ].
+        //
+        // Eigenvalue near-degeneracies `λ_r ≈ σ_q` are genuine
+        // non-differentiability points of the eigenframe; the splice is
+        // declined there rather than clamped.
+        let Some(moments) = sampled.moments.as_ref() else {
+            // m > 0 is guaranteed above, so absent moments means every draw
+            // carried zero weight — nothing trustworthy to splice.
+            return Ok(zero());
+        };
+        let x = x_dense.as_ref();
+        let n_rows = x.nrows();
+        let xv = x.dot(&target.block_vecs); // n × m
+        let ngs_base = target.base_neg_score();
+
+        // σ²_i = E_p[s_i²] and the shared n×m intermediates.
+        let xv_ett = xv.dot(&moments.e_tt); // n × m
+        let sigma2 = (&xv_ett * &xv).sum_axis(ndarray::Axis(1)); // n
+        let mut w_xv_ett = xv_ett.clone();
+        for i in 0..n_rows {
+            let w_i = target.weights_obs[i];
+            w_xv_ett.row_mut(i).mapv_inplace(|v| v * w_i);
+        }
+
+        // Channel (d) moment: g_d = E_p[∂ΔF/∂β̂]
+        //   = Xᵀ(E_p[ngs_disp] − ngs_base) + Σ_k λ_k S_k (V_b E_p[t])
+        //     − ½ Xᵀ(c ⊙ E_p[s²]).
+        let delta_mean = target.block_vecs.dot(&moments.e_t); // p
+        let mut g_d = x.t().dot(&(&moments.e_neg_score - &ngs_base));
+        for (pen, &lam) in self.canonical_penalties.iter().zip(target.lambdas.iter()) {
+            g_d.scaled_add(lam, &transformed_penalty_matvec(pen, &delta_mean));
+        }
+        g_d.scaled_add(-0.5, &x.t().dot(&(c_weights * &sigma2)));
+
+        // Channel (c) moment: R[:,r] = E_p[t_r · ∂ΔF/∂δ]
+        //   = Xᵀ E_p[t_r ngs_disp] + (Σ_k λ_k S_k β̂) E_p[t_r] − Xᵀ W X V_b E_p[t tᵀ][:,r].
+        let mut pen_score_total = Array1::<f64>::zeros(p);
+        for (score, &lam) in target.penalty_scores.iter().zip(target.lambdas.iter()) {
+            pen_score_total.scaled_add(lam, score);
+        }
+        let mut r_mat = x.t().dot(&moments.e_t_neg_score); // p × m
+        for r in 0..m {
+            r_mat.column_mut(r).scaled_add(moments.e_t[r], &pen_score_total);
+        }
+        r_mat -= &x.t().dot(&w_xv_ett);
+
+        // Channel (b) moment: M_r = E_p[(∂ΔF/∂t)_r (−½ t_r)] via
+        // ∂ΔF/∂t = (XV)ᵀ ngs_disp + V_bᵀ(Σλ_k S_k β̂) − (XV)ᵀ(W ⊙ s).
+        let xvt_etngs = xv.t().dot(&moments.e_t_neg_score); // m × m
+        let pterm = target.block_vecs.t().dot(&pen_score_total); // m
+        let xvt_w_xv_ett = xv.t().dot(&w_xv_ett); // m × m
+        let mut m_vec = Array1::<f64>::zeros(m);
+        for r in 0..m {
+            m_vec[r] = -0.5
+                * (xvt_etngs[(r, r)] + pterm[r] * moments.e_t[r] - xvt_w_xv_ett[(r, r)]);
+        }
+
+        // Eigenframe assembly. `block_vecs` are the `block_cols` columns of
+        // `evecs`, so `Q_b`/`Q_c` are built from the same spectrum as the
+        // draws — one source of truth for "the direction λ_r".
+        if evals.iter().any(|&s| !(s.is_finite() && s > 0.0)) {
+            log::info!(
+                "[#784] block-local fallback declined: H_pen has a non-positive eigenvalue; \
+                 the IFT mode response is undefined"
+            );
+            return Ok(zero());
+        }
+        let spectral_scale = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let degeneracy_tol = 1e-10 * spectral_scale.max(f64::MIN_POSITIVE);
+        let r_tilde = evecs.t().dot(&r_mat); // p × m
+        let mut g_mat = Array2::<f64>::zeros((p, m));
+        for (jr, &col_r) in block_cols.iter().enumerate() {
+            let lam_r = target.block_lambdas[jr];
+            for q in 0..p {
+                if q == col_r {
+                    continue;
+                }
+                let gap = lam_r - evals[q];
+                if gap.abs() < degeneracy_tol {
+                    log::info!(
+                        "[#784] block-local fallback declined: eigenvalue near-degeneracy \
+                         |λ_r − σ_q| = {:.3e} < {degeneracy_tol:.3e} — the eigenframe is not \
+                         differentiable on this stratum",
+                        gap.abs(),
+                    );
+                    return Ok(zero());
+                }
+                g_mat[(q, jr)] = r_tilde[(q, jr)] / gap;
+            }
+        }
+        let q_c_raw = evecs.dot(&g_mat).dot(&target.block_vecs.t()); // p × p
+        let mut q_mat = 0.5 * (&q_c_raw + &q_c_raw.t());
+        for jr in 0..m {
+            let u_r = target.block_vecs.column(jr);
+            let scale = m_vec[jr] / target.block_lambdas[jr];
+            for a in 0..p {
+                for b in 0..p {
+                    q_mat[(a, b)] += scale * u_r[a] * u_r[b];
+                }
+            }
+        }
+
+        // rowq_i = x_iᵀ Q x_i (for tr(C[v] Q) = Σ_i (c ⊙ Xv)_i rowq_i).
+        let xq = x.dot(&q_mat); // n × p
+        let rowq = (&xq * x).sum_axis(ndarray::Axis(1)); // n
+
+        // Per-coordinate contraction.
         let mut gradient = Array1::<f64>::zeros(n_rho + n_ext);
-        for k in 0..n_rho.min(sampled.rho_gradient.len()) {
-            gradient[k] = -sampled.rho_gradient[k];
+        for j in 0..n_rho.min(sampled.rho_gradient.len()) {
+            let lam_j = target.lambdas[j];
+            let a_j = target.penalty_scores[j].mapv(|v| lam_j * v); // λ_j S_j β̂
+            // v_j = H⁻¹ a_j through the same eigendecomposition as Q.
+            let uta = evecs.t().dot(&a_j);
+            let v_j = evecs.dot(&(&uta / &evals));
+            // tr(A_j Q) = λ_j Σ_c (S_j Q[:,c])_c.
+            let mut tr_sq = 0.0_f64;
+            for c in 0..p {
+                let s_col = transformed_penalty_matvec(
+                    &self.canonical_penalties[j],
+                    &q_mat.column(c).to_owned(),
+                );
+                tr_sq += s_col[c];
+            }
+            // tr(C[v_j] Q) = Σ_i c_i (X v_j)_i rowq_i.
+            let xv_j = crate::faer_ndarray::fast_av(x, &v_j);
+            let mut tr_cq = 0.0_f64;
+            for i in 0..n_rows {
+                tr_cq += c_weights[i] * xv_j[i] * rowq[i];
+            }
+            let trace_j = lam_j * tr_sq - tr_cq;
+            let mode_j = -v_j.dot(&g_d);
+            gradient[j] = -sampled.rho_gradient[j] + trace_j + mode_j;
         }
         Ok(TkCorrectionTerms {
             value: -sampled.value,

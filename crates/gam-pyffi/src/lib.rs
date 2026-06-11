@@ -10041,6 +10041,56 @@ fn sae_atom_two_lens_dict<'py>(
     Ok(d)
 }
 
+/// Render a single [`gam::inference::certificates::EvidenceValue`] to a Python
+/// object (scalar / int / bool / str / list-of-float).
+fn certificate_evidence_value<'py>(
+    py: Python<'py>,
+    value: &gam::inference::certificates::EvidenceValue,
+) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+    use gam::inference::certificates::EvidenceValue;
+    Ok(match value {
+        EvidenceValue::Scalar(v) => v.into_bound_py_any(py)?,
+        EvidenceValue::Integer(v) => v.into_bound_py_any(py)?,
+        EvidenceValue::Flag(v) => v.into_bound_py_any(py)?,
+        EvidenceValue::Text(v) => v.into_bound_py_any(py)?,
+        EvidenceValue::Vector(v) => v.clone().into_bound_py_any(py)?,
+    })
+}
+
+/// Render a [`gam::inference::certificates::CertificateLedger`] as ONE coherent
+/// `certificates` payload block (task #16): a dict keyed by claim id, each entry
+/// `{claim, verdict, certified, evidence{...}}`, plus a top-level `overall`
+/// conservative roll-up verdict (the weakest member). This is the program's
+/// single inspectable certificate artifact; it replaces reading the scattered
+/// per-feature keys (which are kept working alongside it for back-compat).
+fn certificate_ledger_dict<'py>(
+    py: Python<'py>,
+    ledger: &gam::inference::certificates::CertificateLedger,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    // The conservative roll-up: weakest verdict across every recorded claim
+    // (Unavailable on an empty ledger). One number answering "did everything
+    // this fit could certify, certify?" — never stronger than its weakest claim.
+    let overall = ledger.overall();
+    out.set_item("overall", overall.label())?;
+    out.set_item("overall_certified", overall.is_certified())?;
+    let claims = PyDict::new(py);
+    for entry in ledger.entries() {
+        let claim_dict = PyDict::new(py);
+        claim_dict.set_item("claim", &entry.claim.statement)?;
+        claim_dict.set_item("verdict", entry.verdict.label())?;
+        claim_dict.set_item("certified", entry.verdict.is_certified())?;
+        let evidence = PyDict::new(py);
+        for (key, value) in &entry.evidence {
+            evidence.set_item(key, certificate_evidence_value(py, value)?)?;
+        }
+        claim_dict.set_item("evidence", evidence)?;
+        claims.set_item(entry.claim.id, claim_dict)?;
+    }
+    out.set_item("claims", claims)?;
+    Ok(out)
+}
+
 /// Build the result-dict entry for the residual-gauge certificate
 /// ([`gam::sae_identifiability::ResidualGaugeReport`]). Group signature +
 /// per-generator pinned/unpinned verdicts + the metric provenance the
