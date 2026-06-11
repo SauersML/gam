@@ -540,6 +540,19 @@ pub fn build_termspec(
                     inner_options
                         .entry("double_penalty".to_string())
                         .or_insert_with(|| "false".to_string());
+                    // A `bs="sz"` factor smooth shares ONE marginal replicated
+                    // across the level-deviation blocks, so — exactly like `fs` —
+                    // the pooled knot heuristic over-equips it (~24 functions vs
+                    // mgcv's sz default k=10) and REML over-fits the shared shape
+                    // (gam#903: gam 0.068 vs mgcv 0.046 truth RMSE). The inner
+                    // smooth is built as a plain 1-D smooth below, which would
+                    // otherwise take the full pooled basis, so inject mgcv's
+                    // modest default here. An explicit user `k`/`basis_dim` wins
+                    // (it precedes `basis_dim` in the basis-count lookup, and
+                    // `or_insert` leaves a user `basis_dim` untouched).
+                    inner_options
+                        .entry("basis_dim".to_string())
+                        .or_insert_with(|| FACTOR_SMOOTH_DEFAULT_BASIS_DIM.to_string());
                 }
                 // Pop the shape constraint before `build_smooth_basis` runs so
                 // it never reaches the per-kind `validate_known_options`
