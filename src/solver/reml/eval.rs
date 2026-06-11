@@ -525,6 +525,42 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    /// Tier-0 of the exact marginal-smoothing inference stack (#938): the PSIS
+    /// `ρ`-uncertainty certificate, evaluated against THIS live objective.
+    ///
+    /// This is the objective-lifecycle seam. The marginal posterior factorizes
+    /// as `π(β, ρ | y) = π(β | ρ, y) · π(ρ | y)` with
+    /// `π(ρ|y) ∝ exp(−criterion(ρ))`, and the certificate needs to evaluate the
+    /// outer criterion at a handful of `ρ` near `ρ̂`. The criterion IS
+    /// [`Self::compute_cost`] and the proposal Hessian IS
+    /// [`Self::compute_lamlhessian_consistent`] — both `&self` — so a converged
+    /// fit can produce the certificate WITHOUT retaining or rebuilding a
+    /// separate objective: it runs against the same `RemlState` the fit
+    /// converged on, while it is still in scope. The criterion the certificate
+    /// samples is therefore the fit's own criterion bit-for-bit
+    /// (`criterion(ρ̂) == reml_score`), so no fingerprint reconciliation is
+    /// needed — there is exactly one objective.
+    ///
+    /// Returns `None` when there are no smoothing parameters (`K == 0`), the
+    /// outer Hessian at `final_rho` is unavailable, or the criterion is
+    /// infeasible at `ρ̂` — the diagnostic is simply absent, never an error.
+    pub(crate) fn tier0_rho_certificate(
+        &self,
+        final_rho: &Array1<f64>,
+        n_samples: Option<usize>,
+    ) -> Option<crate::inference::rho_posterior::RhoPosteriorCertificate> {
+        if final_rho.is_empty() {
+            return None;
+        }
+        let outer_hessian = self.compute_lamlhessian_consistent(final_rho).ok()?;
+        crate::inference::rho_posterior::rho_posterior_certificate(
+            final_rho,
+            &outer_hessian,
+            |rho| self.compute_cost(rho).ok(),
+            n_samples,
+        )
+    }
+
     pub(crate) fn compute_smoothing_correction_auto(
         &self,
         final_rho: &Array1<f64>,
