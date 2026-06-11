@@ -233,12 +233,11 @@ class _RustPenaltyModule(nn.Module):
 
 
 class IsometryPenalty(_RustPenaltyModule):
-    """Penalize variation of a decoder Jacobian's pullback metric across tokens.
+    """Penalize the normalized decoder pullback metric.
 
-    The Rust isometry penalty uses a scale-free, mean-profiled reference (the
-    per-row mean pullback metric), so this drives the metric toward a *constant*
-    (token-independent) metric rather than a fixed Euclidean one — a period-1
-    circle ``JᵀJ = (2π)² I`` is not fought by a hard identity target.
+    The Rust isometry penalty compares ``JᵀJ / gbar`` with the reference metric,
+    where ``gbar`` is the mean pullback trace per latent dimension. This pins a
+    unit-average-speed chart without coupling the penalty to decoder scale.
     """
 
     def __init__(self, weight: float = 1.0, *, target: str = "t") -> None:
