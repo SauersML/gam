@@ -9600,7 +9600,9 @@ fn sae_manifold_fit_inner<'py>(
     let shape_uncertainty = objective
         .decoder_shape_uncertainty()
         .map_err(py_value_error)?;
-    let (term, rho, loss) = objective.into_fitted();
+    let (mut term, rho, loss) = objective.into_fitted();
+    term.set_certificate_dispersion(shape_uncertainty.dispersion)
+        .map_err(py_value_error)?;
 
     // Additive post-fit diagnostics (#980): the two-score per-atom lens
     // (presence / behavioral coupling / discrepancy) and the residual-gauge
@@ -9622,7 +9624,11 @@ fn sae_manifold_fit_inner<'py>(
         })
         .collect();
     let fit_diagnostics = term
-        .fit_diagnostics_report(Some(&ard_variances), isometry_pin_active)
+        .fit_diagnostics_report(
+            Some(&ard_variances),
+            isometry_pin_active,
+            Some(shape_uncertainty.dispersion),
+        )
         .map_err(py_value_error)?;
 
     let mut assignments = term.assignment.assignments();
@@ -9800,6 +9806,12 @@ fn sae_manifold_fit_inner<'py>(
         "residual_gauge",
         sae_residual_gauge_dict(py, &fit_diagnostics.residual_gauge)?,
     )?;
+    if let Some(report) = &fit_diagnostics.incoherence_report {
+        out.set_item(
+            "incoherence_report",
+            sae_incoherence_report_dict(py, report)?,
+        )?;
+    }
     // Contract keys the python `ManifoldSAE.from_payload` boundary reads
     // unconditionally (tightened in 23db2c80a, which rejected stale payload
     // shapes python-side without adding the producer side): the fitted atom
@@ -9892,6 +9904,35 @@ fn sae_residual_gauge_dict<'py>(
         generators.append(gd)?;
     }
     d.set_item("generators", generators)?;
+    Ok(d)
+}
+
+/// Build the result-dict entry for the curved-dictionary incoherence/curvature
+/// certificate inputs (#1008). This is a measurement payload only; it deliberately
+/// does not include a certified/uncertified verdict.
+fn sae_incoherence_report_dict<'py>(
+    py: Python<'py>,
+    report: &gam::terms::sae_manifold::CertificateInputs,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("mu_hat", report.mu_hat)?;
+    d.set_item(
+        "per_atom_kappa_hat",
+        Array1::from_vec(report.per_atom_kappa_hat.clone()).into_pyarray(py),
+    )?;
+    d.set_item(
+        "per_atom_mean_activity",
+        Array1::from_vec(report.per_atom_mean_activity.clone()).into_pyarray(py),
+    )?;
+    d.set_item(
+        "per_atom_peak_activity",
+        Array1::from_vec(report.per_atom_peak_activity.clone()).into_pyarray(py),
+    )?;
+    d.set_item("mean_activity_floor", report.mean_activity_floor)?;
+    d.set_item("peak_activity_floor", report.peak_activity_floor)?;
+    d.set_item("snr_proxy", report.snr_proxy)?;
+    d.set_item("dispersion", report.dispersion)?;
+    d.set_item("note", report.note.clone())?;
     Ok(d)
 }
 
