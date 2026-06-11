@@ -6332,6 +6332,32 @@ impl DesignMatrix {
         Ok(out)
     }
 
+    /// Like [`Self::try_to_dense_by_chunks`] but refuses to allocate when the
+    /// dense footprint would exceed `max_bytes`. Returned `Err` is the same
+    /// shape as a densification-refused error from the resource policy, so
+    /// observability-only callers can convert it into a `warn!` and skip
+    /// without ever touching the allocator at huge `n`.
+    pub fn try_to_dense_by_chunks_budgeted(
+        &self,
+        context: &str,
+        max_bytes: usize,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.nrows();
+        let p = self.ncols();
+        let dense_bytes = checked_dense_nbytes(n, p, context)?;
+        if dense_bytes > max_bytes {
+            let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            let cap_gib = max_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            return Err(MatrixError::DensificationRefused {
+                reason: format!(
+                    "{context}: refusing to densify {n}x{p} (~{gib:.2} GiB, cap ~{cap_gib:.2} GiB)"
+                ),
+            }
+            .into());
+        }
+        self.try_to_dense_by_chunks(context)
+    }
+
     /// Dot a single design row against a coefficient vector without allocating
     /// a standalone row buffer when the underlying storage permits.
     pub fn dot_row(&self, row: usize, beta: &Array1<f64>) -> f64 {
