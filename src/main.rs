@@ -4257,6 +4257,61 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
 
     cli_out!("ALO diagnostics (top leverage rows):");
     cli_out!("{table}");
+
+    // Model-comparison corroboration channels (#946): exact smoothing-corrected
+    // conditional AIC and zero-refit PSIS-LOO, computed from the fit-retained
+    // exact pieces (smoothing-parameter covariance Σ_ρ, ALO leave-one-out
+    // predictions) and reported alongside the diagnostics. The ALO solves
+    // already reused the fit's factored Hessian, so the LOO channel is free here.
+    if let Some(unified) = model.unified() {
+        let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
+        let eta_hat = &design.design.dot(&fit_saved.beta) + &offset;
+        let comparison = gam::model_comparison::model_comparison_from_unified(
+            unified,
+            y.view(),
+            eta_hat.view(),
+            weights.view(),
+            Some(&alo),
+        );
+        let mut summary = Table::new();
+        summary
+            .load_preset(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_header(vec!["criterion", "value"]);
+        summary.add_row(Row::from(vec![
+            Cell::new("edf (conditional)"),
+            Cell::new(format!("{:.4}", comparison.edf.conditional)),
+        ]));
+        summary.add_row(Row::from(vec![
+            Cell::new("edf (corrected, WPS)"),
+            Cell::new(format!("{:.4}", comparison.edf.corrected)),
+        ]));
+        summary.add_row(Row::from(vec![
+            Cell::new("rho-uncertainty df"),
+            Cell::new(format!("{:.4}", comparison.edf.rho_uncertainty_df())),
+        ]));
+        summary.add_row(Row::from(vec![
+            Cell::new("AIC (conditional)"),
+            Cell::new(format!("{:.4}", comparison.aic_conditional)),
+        ]));
+        summary.add_row(Row::from(vec![
+            Cell::new("AIC (corrected)"),
+            Cell::new(format!("{:.4}", comparison.aic_corrected)),
+        ]));
+        if let Some(loo) = comparison.loo.as_ref() {
+            summary.add_row(Row::from(vec![
+                Cell::new("PSIS-LOO elpd"),
+                Cell::new(format!("{:.4} (se {:.4})", loo.elpd, loo.se)),
+            ]));
+            summary.add_row(Row::from(vec![
+                Cell::new("PSIS k_hat (max)"),
+                Cell::new(format!("{:.3} ({} unreliable)", loo.k_hat_max, loo.n_k_bad)),
+            ]));
+        }
+        cli_out!("Model comparison (corrected AIC + PSIS-LOO):");
+        cli_out!("{summary}");
+    }
+
     progress.advance_workflow(5);
     progress.finish_progress("diagnostics complete");
     Ok(())

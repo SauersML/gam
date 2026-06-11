@@ -12,6 +12,7 @@ pub mod harvest;
 pub mod hmc;
 pub mod identifiability_diagnostics;
 pub mod model;
+pub mod model_comparison;
 pub mod model_payload_builders;
 pub mod pg_gate_evidence;
 pub mod pg_moments;
