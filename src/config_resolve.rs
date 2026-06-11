@@ -904,7 +904,7 @@ fn group_metadata_from_groups(groups: JsonValue) -> Result<Option<GroupMetadata>
             }
             Ok(nonempty_group_metadata(out))
         }
-        _ => Err("groups metadata must be an object or array".to_string()),
+        _ => Err("groups must be an object map or an array of group objects".to_string()),
     }
 }
 
