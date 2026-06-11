@@ -41,7 +41,6 @@ use crate::solver::evidence::{
     fit_union_ladder, fit_union_structure, solve_stacking_weights, union_per_point_log_density,
 };
 use crate::inference::row_measure::CoresetCertificate;
-use crate::solver::logdet_bounds::MarginVerdict;
 use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use ndarray::{Array2, ArrayView2};
 use serde_json::Value as JsonValue;
