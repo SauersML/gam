@@ -756,7 +756,10 @@ mod tests {
                     (ours - theirs).abs() < 1e-12,
                     "P({a},{x}): ours={ours} statrs={theirs}"
                 );
-                assert!((0.0..=1.0).contains(&ours), "P({a},{x})={ours} out of [0,1]");
+                assert!(
+                    (0.0..=1.0).contains(&ours),
+                    "P({a},{x})={ours} out of [0,1]"
+                );
             }
         }
 
@@ -769,7 +772,11 @@ mod tests {
         // CDF must remain a faithful, nonzero value, not snap to 0. Compare to
         // the small-x leading order P(a, x) ≈ x^a / Γ(a+1).
         for &(a, x) in &[(0.05_f64, 1e-20_f64), (0.1, 1e-25), (0.02, 1e-40)] {
-            assert_eq!(gamma_lr(a, x), 0.0, "precondition: statrs clamps P({a},{x}) to 0");
+            assert_eq!(
+                gamma_lr(a, x),
+                0.0,
+                "precondition: statrs clamps P({a},{x}) to 0"
+            );
             let ours = regularized_lower_gamma(a, x);
             let leading = (a * x.ln() - ln_gamma(a + 1.0)).exp();
             assert!(ours > 0.0, "P({a},{x})={ours} clamped to 0 like statrs");
