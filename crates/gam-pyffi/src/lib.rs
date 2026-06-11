@@ -10101,7 +10101,7 @@ fn certificate_ledger_dict<'py>(
         claim_dict.set_item("certified", entry.verdict.is_certified())?;
         let evidence = PyDict::new(py);
         for (key, value) in &entry.evidence {
-            evidence.set_item(key, certificate_evidence_value(py, value)?)?;
+            evidence.set_item(*key, certificate_evidence_value(py, value)?)?;
         }
         claim_dict.set_item("evidence", evidence)?;
         claims.set_item(entry.claim.id, claim_dict)?;
