@@ -844,25 +844,20 @@ fn isometry_row_gn_hvp(
     d: usize,
     p: usize,
 ) -> (Array2<f64>, Array1<f64>) {
-    let mut dgdt = ndarray::Array3::<f64>::zeros((d, d, d));
-    for a in 0..d {
-        for b in 0..d {
-            for c in 0..d {
-                let mut s = 0.0;
-                for i in 0..p {
-                    s += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
-                    s += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
-                }
-                dgdt[[a, b, c]] = s;
-            }
+    let dg_entry = |a: usize, b: usize, c: usize| -> f64 {
+        let mut s = 0.0;
+        for i in 0..p {
+            s += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
+            s += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
         }
-    }
+        s
+    };
     let mut delta_g = Array2::<f64>::zeros((d, d));
     for a in 0..d {
         for b in 0..d {
             let mut s = 0.0;
             for c in 0..d {
-                s += dgdt[[a, b, c]] * v[n * d + c];
+                s += dg_entry(a, b, c) * v[n * d + c];
             }
             delta_g[[a, b]] = s;
         }
@@ -872,7 +867,7 @@ fn isometry_row_gn_hvp(
         let mut s = 0.0;
         for a in 0..d {
             for b in 0..d {
-                s += dgdt[[a, b, c]] * delta_g[[a, b]];
+                s += dg_entry(a, b, c) * delta_g[[a, b]];
             }
         }
         gn_out[c] = s;
