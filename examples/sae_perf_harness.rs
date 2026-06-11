@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
+use gam::gpu::arrow_schur::solve_reduced_beta_pcg_with_diagnostics;
 use gam::gpu::sae_resident::{
     DeviceResidentArrowError, DeviceResidentInnerOptions, qwen_non_gating_fixture,
     qwen_non_gating_fixture_seeded, run_resident_fits_multiplexed, run_resident_fits_sequential,
@@ -297,6 +298,136 @@ fn max_abs_diff(lhs: &[f64], rhs: &[f64]) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+fn dense_spd_for_device_pcg(k: usize) -> (Array2<f64>, Array1<f64>) {
+    let mut s = Array2::<f64>::zeros((k, k));
+    for row in 0..k {
+        s[[row, row]] = 2.5 + 0.001 * ((row % 17) as f64);
+        if row + 1 < k {
+            s[[row, row + 1]] = -0.05;
+            s[[row + 1, row]] = -0.05;
+        }
+        if row + 7 < k {
+            s[[row, row + 7]] = 0.01;
+            s[[row + 7, row]] = 0.01;
+        }
+    }
+    let rhs = Array1::from_shape_fn(k, |idx| ((idx as f64 + 1.0) * 0.013).sin());
+    (s, rhs)
+}
+
+fn dense_matvec_ref(s: &Array2<f64>, x: &Array1<f64>, out: &mut Array1<f64>) {
+    let k = x.len();
+    out.fill(0.0);
+    for row in 0..k {
+        let mut acc = 0.0;
+        for col in 0..k {
+            acc += s[[row, col]] * x[col];
+        }
+        out[row] = acc;
+    }
+}
+
+fn cpu_jacobi_pcg_ref(
+    s: &Array2<f64>,
+    rhs: &Array1<f64>,
+    max_iterations: usize,
+    relative_tolerance: f64,
+) -> Array1<f64> {
+    let k = rhs.len();
+    let rhs_norm = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if rhs_norm == 0.0 {
+        return Array1::<f64>::zeros(k);
+    }
+    let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
+    let inv_diag: Vec<f64> = (0..k).map(|idx| 1.0 / s[[idx, idx]]).collect();
+    let mut x = Array1::<f64>::zeros(k);
+    let mut r = rhs.clone();
+    let mut z = Array1::from_shape_fn(k, |idx| inv_diag[idx] * r[idx]);
+    let mut p = z.clone();
+    let mut sp = Array1::<f64>::zeros(k);
+    let mut rz = r.iter().zip(z.iter()).map(|(a, b)| a * b).sum::<f64>();
+    for _ in 0..max_iterations.max(1) {
+        dense_matvec_ref(s, &p, &mut sp);
+        let p_sp = p.iter().zip(sp.iter()).map(|(a, b)| a * b).sum::<f64>();
+        let alpha = rz / p_sp;
+        for idx in 0..k {
+            x[idx] += alpha * p[idx];
+            r[idx] -= alpha * sp[idx];
+        }
+        let r_norm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if r_norm <= tol {
+            break;
+        }
+        for idx in 0..k {
+            z[idx] = inv_diag[idx] * r[idx];
+        }
+        let rz_next = r.iter().zip(z.iter()).map(|(a, b)| a * b).sum::<f64>();
+        let beta = rz_next / rz;
+        for idx in 0..k {
+            p[idx] = z[idx] + beta * p[idx];
+        }
+        rz = rz_next;
+    }
+    x
+}
+
+fn run_device_pcg(shape: &Shape) -> Result<(), String> {
+    let k = shape.p.max(512);
+    let (s, rhs) = dense_spd_for_device_pcg(k);
+    let max_iterations = 200usize;
+    let relative_tolerance = 1.0e-12;
+
+    let cpu_start = Instant::now();
+    let cpu = cpu_jacobi_pcg_ref(&s, &rhs, max_iterations, relative_tolerance);
+    let cpu_ms = ms(cpu_start);
+
+    let device_start = Instant::now();
+    let (device, diag) =
+        match solve_reduced_beta_pcg_with_diagnostics(&s, &rhs, max_iterations, relative_tolerance)
+        {
+            Ok(out) => out,
+            Err(err) => {
+                print_stage(
+                    shape,
+                    "device_pcg",
+                    ms(device_start),
+                    &format!(
+                        "status=skipped reason=\"{:?}\" reduced_k={} cpu_ms={cpu_ms:.3}",
+                        err, k
+                    ),
+                );
+                return Ok(());
+            }
+        };
+    let device_ms = ms(device_start);
+    let max_err = max_abs_diff(
+        cpu.as_slice().ok_or("CPU PCG output not contiguous")?,
+        device
+            .as_slice()
+            .ok_or("device PCG output not contiguous")?,
+    );
+    print_stage(
+        shape,
+        "device_pcg",
+        device_ms,
+        &format!(
+            "status=ok reduced_k={} cpu_ms={cpu_ms:.3} speedup={:.3} max_abs_err={max_err:.3e} iterations={} matvec_calls={} precond_apply_calls={} final_rel_residual={:.3e}",
+            k,
+            cpu_ms / device_ms.max(f64::MIN_POSITIVE),
+            diag.iterations,
+            diag.matvec_calls,
+            diag.precond_apply_calls,
+            diag.final_relative_residual
+        ),
+    );
+    if max_err > DEVICE_PARITY_TOL {
+        return Err(format!(
+            "device_pcg parity failed: max_abs_err={max_err:e} > {DEVICE_PARITY_TOL:e}"
+        ));
+    }
+    Ok(())
+}
+
 fn run_device_inner_iter(shape: &Shape) -> Result<(), String> {
     let build_start = Instant::now();
     let workspace = qwen_non_gating_fixture().map_err(|err| err.to_string())?;
@@ -546,6 +677,7 @@ fn run(shape: Shape) -> Result<(), String> {
     );
 
     if fixture.shape.name == "qwen" {
+        run_device_pcg(&fixture.shape)?;
         run_device_inner_iter(&fixture.shape)?;
         run_device_fit(&fixture.shape)?;
     }
