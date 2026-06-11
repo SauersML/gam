@@ -34,9 +34,10 @@
 //! `D` is the refinement step when the gap is too wide. `ρ ≥ 1` is an
 //! explicit refusal (`Err`), never a silent fallback.
 
+use faer::Side;
 use ndarray::Array2;
 
-use crate::linalg::faer_ndarray::{FaerCholesky, Side};
+use crate::linalg::faer_ndarray::FaerCholesky;
 
 /// A certified enclosure of `log|S|` for a block-partitioned SPD matrix.
 #[derive(Debug, Clone)]

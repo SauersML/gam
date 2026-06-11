@@ -49,7 +49,7 @@ use crate::linalg::lanczos::{
     SymmetricLanczosOptions, symmetric_lanczos_eigenpairs, symmetric_lanczos_log_quadrature,
 };
 use crate::linalg::triangular::cholesky_solve_vector;
-use crate::solver::arrow_schur::{ArrowFactorCache, ArrowFactorSlab, ArrowSchurSystem};
+use crate::solver::arrow_schur::{ArrowFactorCache, ArrowSchurSystem};
 use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
 
 pub const ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD: usize = 1024;
