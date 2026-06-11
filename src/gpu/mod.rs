@@ -32,6 +32,7 @@ pub mod profile;
 pub mod reml_trace;
 pub mod row_hessian_ops;
 pub mod runtime;
+pub mod sae_resident;
 pub(crate) mod sigma_cubature;
 pub mod solver;
 
