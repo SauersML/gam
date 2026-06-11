@@ -8583,6 +8583,7 @@ mod tests {
             },
             operator_trust_radius: None,
             operator_stop_reason: None,
+            criterion_certificate: None,
         }
     }
 

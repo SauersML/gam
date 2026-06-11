@@ -6962,6 +6962,7 @@ impl<'a> RemlState<'a> {
             sparse_exact: None,
             firth_dense_operator,
             firth_dense_operator_original: None,
+            penalty_pseudologdet: std::sync::OnceLock::new(),
         })
     }
 

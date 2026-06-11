@@ -5285,9 +5285,16 @@ pub fn solve_arrow_newton_step_core(
     options: &ArrowSolveOptions,
 ) -> Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError> {
     if let Some(chunk_size) = options.streaming_chunk_size {
+        // #1014: the streaming/residency path is the memory-bound assembly wall,
+        // so its reduced dense Schur solve runs certified mixed precision by
+        // default (κ-gated f32 factor + f64 residual refinement, automatic f64
+        // fallback). The reduced-Schur f64 factor — and therefore every evidence
+        // log-determinant — is unaffected: only the Δβ solve drops to f32. An
+        // explicit caller policy is honored as-is.
+        let streaming_options = options.with_streaming_mixed_precision_default();
         let mut streaming = StreamingArrowSchur::from_system(sys, chunk_size);
         return streaming
-            .solve(ridge_t, ridge_beta, options)
+            .solve(ridge_t, ridge_beta, &streaming_options)
             .map(|(delta_t, delta_beta, _)| (delta_t, delta_beta, PcgDiagnostics::default()));
     }
     // #1017 phase-3 production seam: when a device is present and the dense
@@ -7117,6 +7124,98 @@ fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver + Sync>(
     );
     symmetrize_upper_from_lower(&mut schur);
     Ok(schur)
+}
+
+/// Certified Carson–Higham mixed-precision solve of the reduced dense Schur
+/// system `S Δβ = rhs` (#1014), specialized to the streaming/residency path.
+///
+/// Returns `Some(Δβ)` when certified mixed precision is enabled AND the κ gate
+/// admits the f32 factorization AND the f64 backward-error certificate closes;
+/// `None` in every other case so the caller falls back to the exact f64
+/// triangular solve. The f64 `factor` (whose diagonal carries the exact
+/// `log|S|`) is supplied by the caller and never re-derived here — the logdet
+/// the evidence path reads stays f64 by construction.
+///
+/// Method: store the f64 Cholesky factor as f32, solve in f32, then refine with
+/// residuals `r = rhs − S·x` computed in f64 against the f64 `S`. With
+/// `κ(S)·u_f32 < margin` the refinement contracts at rate `κ·u`, and the
+/// terminating certificate is the normwise backward error
+/// `‖r‖∞ / (‖S‖∞‖x‖∞ + ‖rhs‖∞) ≤ tol`. A non-decreasing residual or an
+/// unmet certificate after `max_refinement_steps` returns `None`.
+fn mixed_precision_reduced_beta(
+    schur: &Array2<f64>,
+    factor: &Array2<f64>,
+    rhs: &Array1<f64>,
+    options: &ArrowSolveOptions,
+) -> Option<Array1<f64>> {
+    let MixedPrecisionPolicy::Certified {
+        max_refinement_steps,
+        residual_relative_tolerance,
+        kappa_unit_roundoff_margin,
+    } = options.mixed_precision
+    else {
+        return None;
+    };
+    // The reduced-system mixed-precision path is the dense reduced solve only;
+    // a trust-region-truncated step takes the Steihaug branch below in f64.
+    if options.trust_region.radius.is_finite() {
+        return None;
+    }
+    let n = schur.nrows();
+    if n == 0 {
+        return None;
+    }
+
+    // κ gate: the f32 factorization is only admissible when κ(S)·u_f32 leaves
+    // the refinement contraction headroom the certificate needs.
+    let kappa = cholesky_factor_kappa_estimate(factor);
+    if !kappa.is_finite() || kappa * F32_UNIT_ROUNDOFF >= kappa_unit_roundoff_margin {
+        return None;
+    }
+
+    let factor_f32 = factor.mapv(|v| v as f32);
+    let s_inf = matrix_inf_norm(schur);
+    let rhs_inf = rhs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let certificate_tol = residual_relative_tolerance
+        .max(MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER * f64::EPSILON);
+
+    // f32 solve of the seed system, then f64-residual refinement steps.
+    let mut x = cholesky_solve_lower_f32(&factor_f32, &rhs.mapv(|v| v as f32)).mapv(|v| v as f64);
+    let mut last_residual = f64::INFINITY;
+    for _ in 0..=max_refinement_steps {
+        // Residual r = rhs − S·x in f64 against the f64 model.
+        let sx = schur.dot(&x);
+        let mut r = rhs.clone();
+        r -= &sx;
+        let r_inf = r.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let x_inf = x.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let denom = s_inf * x_inf + rhs_inf;
+        let backward_error = if denom > 0.0 { r_inf / denom } else { 0.0 };
+        if backward_error <= certificate_tol {
+            return Some(x);
+        }
+        // Refinement must make monotone progress, else hand back to f64.
+        if !(r_inf < last_residual) {
+            return None;
+        }
+        last_residual = r_inf;
+        // Correction solve in f32 against the f32 factor: S·δ = r.
+        let delta = cholesky_solve_lower_f32(&factor_f32, &r.mapv(|v| v as f32)).mapv(|v| v as f64);
+        x += &delta;
+    }
+    None
+}
+
+/// Infinity norm (max absolute row sum) of a dense matrix.
+fn matrix_inf_norm(a: &Array2<f64>) -> f64 {
+    let mut max_row = 0.0_f64;
+    for row in a.rows() {
+        let s: f64 = row.iter().map(|v| v.abs()).sum();
+        if s > max_row {
+            max_row = s;
+        }
+    }
+    max_row
 }
 
 fn solve_dense_reduced_system(
