@@ -3,9 +3,10 @@
 # precheck.sh — fast pre-push gate for the gam build.rs ban rules.
 #
 # WHY: build.rs fails the build on a family of banned patterns (let _,
-# debug_assert!, #[allow]/#[expect], println!/eprintln! in src, underscore fn
-# params, #[cfg(test)] on src items, bare #[should_panic], assertion-less
-# #[test], and the wider lexical-substring ban list). A full `cargo build`
+# debug_assert!, #[allow]/#[expect] of non-clippy lints, println! in src,
+# underscore fn params, #[cfg(test)] on src items, bare #[should_panic],
+# #[ignore], cfg(feature) gates, assertion-less #[test], and the wider
+# lexical-substring ban list). A full `cargo build`
 # surfaces these only after a ~15-minute compile. This script reproduces the
 # *text-scan* tier of those rules in seconds with NO compiler, so a violation is
 # caught at the keyboard instead of a wheel-cycle later.
