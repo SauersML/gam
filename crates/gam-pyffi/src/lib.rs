@@ -10100,6 +10100,22 @@ fn sae_incoherence_report_dict<'py>(
     d.set_item("peak_activity_floor", report.peak_activity_floor)?;
     d.set_item("snr_proxy", report.snr_proxy)?;
     d.set_item("dispersion", report.dispersion)?;
+    // The #1008 global-optimality verdict: a string label + signed margin so a
+    // consumer can read both the decision and how far it is from the threshold.
+    let (verdict_label, margin) = match report.global_optimality {
+        gam::terms::sae_manifold::GlobalOptimalityVerdict::CertifiedGlobal { margin } => {
+            ("certified_global", margin)
+        }
+        gam::terms::sae_manifold::GlobalOptimalityVerdict::Uncertified { margin } => {
+            ("uncertified", margin)
+        }
+    };
+    d.set_item("global_optimality", verdict_label)?;
+    d.set_item(
+        "global_optimality_certified",
+        report.global_optimality.is_certified(),
+    )?;
+    d.set_item("global_optimality_margin", margin)?;
     d.set_item("note", report.note.clone())?;
     Ok(d)
 }
