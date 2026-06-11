@@ -13121,7 +13121,7 @@ mod tests {
 
     #[test]
     fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
-        let (term0, target, rho) = small_two_atom_periodic_term();
+        let (mut term0, target, rho) = small_two_atom_periodic_term();
         let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
         let cold_sys = term0
             .assemble_arrow_schur(target.view(), &rho, None)
