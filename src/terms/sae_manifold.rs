@@ -6922,7 +6922,7 @@ impl SaeManifoldTerm {
     }
 
     /// Energy of the COORDINATE-tier isometry penalty(ies) at the converged
-    /// SAE state. This is the per-atom `½μ Σ_n ‖J_n^T W_n J_n − g_ref‖²`
+    /// SAE state. This is the per-atom `½μ Σ_n ‖J_n^T W_n J_n / gbar − g_ref‖²`
     /// summed over atoms, evaluated through `corrected_isometry_penalty` so the
     /// live decoder/coordinate caches drive the value exactly as the assemble
     /// path does. It has no `SaeManifoldLoss` twin (the loss carries only
@@ -14003,6 +14003,12 @@ impl SaeManifoldOuterObjective {
     /// ρ-anneal; the outer engine still moves ρ afterward from this warm state.
     pub fn run_curvature_homotopy_entry(&mut self) -> Result<bool, String> {
         let rho = self.baseline_rho.clone();
+        let isometry_targets = self
+            .registry
+            .as_ref()
+            .map(AnalyticPenaltyRegistry::isometry_scalar_weights)
+            .unwrap_or_default();
+        self.set_isometry_homotopy_weight(0.0, &isometry_targets);
         // Eckart-Young anchor certificate at η = 0 (output-subspace coords). A
         // degenerate anchor is the cascade's job, not the walk's.
         let anchor = match linear_span_anchor(&self.term, self.target.view()) {
@@ -14011,19 +14017,21 @@ impl SaeManifoldOuterObjective {
                 log::info!(
                     "[#1007] curvature anchor degenerate ({err}); deferring to seed cascade"
                 );
+                self.set_isometry_homotopy_weight(1.0, &isometry_targets);
                 return Ok(false);
             }
         };
         let anchor_residual_norm_sq = anchor.residual_norm_sq;
 
         // Anchor corrector at η = 0: the convex linear relaxation.
-        let (_loss0, mut last_cache) = match self.solve_at_eta(&rho, 0.0) {
+        let (_loss0, mut last_cache) = match self.solve_at_eta(&rho, 0.0, &isometry_targets) {
             Ok(pair) => pair,
             Err(err) => {
                 log::info!(
                     "[#1007] curvature anchor solve failed at η=0 ({err}); deferring to cascade"
                 );
                 self.term.set_homotopy_eta(1.0).ok();
+                self.set_isometry_homotopy_weight(1.0, &isometry_targets);
                 return Ok(false);
             }
         };
@@ -14064,7 +14072,7 @@ impl SaeManifoldOuterObjective {
             }
 
             // Corrector at η_next.
-            let cache = match self.solve_at_eta(&rho, eta_next) {
+            let cache = match self.solve_at_eta(&rho, eta_next, &isometry_targets) {
                 Ok((_loss, cache)) => cache,
                 Err(err) => {
                     // Corrector struggled: treat like a pivot shrink — halve the
@@ -14084,6 +14092,7 @@ impl SaeManifoldOuterObjective {
                     eta_step *= 0.5;
                     step_halvings += 1;
                     self.term.set_homotopy_eta(eta).ok();
+                    self.set_isometry_homotopy_weight(eta, &isometry_targets);
                     continue 'walk;
                 }
             };
@@ -14099,6 +14108,7 @@ impl SaeManifoldOuterObjective {
                     eta_step *= 0.5;
                     step_halvings += 1;
                     self.term.set_homotopy_eta(eta).ok();
+                    self.set_isometry_homotopy_weight(eta, &isometry_targets);
                     continue 'walk;
                 }
                 log::info!(
@@ -14137,6 +14147,7 @@ impl SaeManifoldOuterObjective {
         if !arrived {
             self.term.set_homotopy_eta(1.0).ok();
         }
+        self.set_isometry_homotopy_weight(1.0, &isometry_targets);
         let collapse_events = self.term.collapse_events().len();
         self.term.set_curvature_walk_report(CurvatureWalkReport {
             arrived,
@@ -14158,8 +14169,10 @@ impl SaeManifoldOuterObjective {
         &mut self,
         rho: &SaeManifoldRho,
         eta: f64,
+        isometry_targets: &[f64],
     ) -> Result<(SaeManifoldLoss, ArrowFactorCache), String> {
         self.term.set_homotopy_eta(eta)?;
+        self.set_isometry_homotopy_weight(eta, isometry_targets);
         let (_cost, loss, cache) = self.term.reml_criterion_with_cache(
             self.target.view(),
             rho,
@@ -14171,6 +14184,17 @@ impl SaeManifoldOuterObjective {
         )?;
         self.last_loss = Some(loss.clone());
         Ok((loss, cache))
+    }
+
+    fn set_isometry_homotopy_weight(&mut self, eta: f64, targets: &[f64]) {
+        if targets.is_empty() {
+            return;
+        }
+        if let Some(registry) = self.registry.as_mut() {
+            let eta = eta.clamp(0.0, 1.0);
+            let weights: Vec<f64> = targets.iter().map(|target| eta * target).collect();
+            registry.set_isometry_scalar_weights(&weights);
+        }
     }
 
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
@@ -20241,23 +20265,34 @@ mod tests {
 
         // Build the reference metric from the EXACT SAME cache the exact HVP
         // differences against (#857). The exact HVP computes its residual
-        // `diff = g − g_ref` where `g = penalty.pullback_metric(d)` is read from
-        // `penalty`'s own Jacobian cache, and skips the third-jet `K` term only
-        // when `diff == 0.0` (a bit-exact float compare). Previously `g_ref` was
+        // `diff = g/gbar − g_ref` where `g = penalty.pullback_metric(d)` is read
+        // from `penalty`'s own Jacobian cache, and skips the third-jet `K` term
+        // only when `diff == 0.0` (a bit-exact float compare). Previously `g_ref` was
         // built from a SEPARATE `scratch` penalty's cache, so a last-ULP
         // difference between the two independent refreshes left `diff` ~1e-16
         // rather than exactly 0; multiplied by the large third decoder jet
         // (`K ~ ω³`) for the torus/sphere bases, that leaked past the 1e-10
         // exact-equality bound. Refreshing `penalty` once and seeding the
-        // UserSupplied reference from `penalty.pullback_metric(d)` makes
-        // `g_ref` the identical array `g` is recomputed from, so the residual is
-        // bit-zero and the K term is genuinely skipped — leaving exactly the GN
-        // term. `with_reference` moves the penalty by value and preserves every
-        // cache slot, so the J/J2/K caches read by the HVP are unchanged.
+        // UserSupplied reference from the normalized `penalty.pullback_metric(d)`
+        // makes `g_ref` the identical array `g/gbar` is recomputed from, so the
+        // residual is bit-zero and the K term is genuinely skipped — leaving
+        // exactly the GN term. `with_reference` moves the penalty by value and
+        // preserves every cache slot, so the J/J2/K caches read by the HVP are
+        // unchanged.
         refresh_isometry_caches_from_atom(&penalty, &atom, coords.view()).unwrap();
-        let g_ref = penalty
+        let mut g_ref = penalty
             .pullback_metric(d)
             .expect("pullback metric is available after the cache refresh");
+        let mut trace_sum = 0.0_f64;
+        for row in 0..g_ref.nrows() {
+            for axis in 0..d {
+                trace_sum += g_ref[[row, axis * d + axis]];
+            }
+        }
+        let normalizer = trace_sum / (g_ref.nrows() * d) as f64;
+        for value in g_ref.iter_mut() {
+            *value /= normalizer;
+        }
         let penalty = penalty.with_reference(IsometryReference::UserSupplied(Arc::new(g_ref)));
         assert!(
             penalty.third_decoder_derivative().is_some(),
@@ -20365,20 +20400,27 @@ mod tests {
             "second-jet cache must install for the PSD-majorizer liveness test"
         );
 
-        // The Euclidean reference makes g − I nonzero on this non-orthonormal
+        // The Euclidean reference makes g/gbar − I nonzero on this non-orthonormal
         // decoder; verify the residual is real so the curvature seam is the
         // production one (and not vacuously the zero-residual case).
         let d = coords.ncols();
         let g = penalty
             .pullback_metric(d)
             .expect("pullback metric available after refresh");
+        let mut trace_sum = 0.0_f64;
+        for row in 0..g.nrows() {
+            for axis in 0..d {
+                trace_sum += g[[row, axis * d + axis]];
+            }
+        }
+        let normalizer = trace_sum / (g.nrows() * d) as f64;
         let mut residual_mass = 0.0_f64;
         for row in 0..g.nrows() {
             for a in 0..d {
                 for b in 0..d {
                     // Euclidean reference is the identity metric I_d.
                     let g_ref = if a == b { 1.0 } else { 0.0 };
-                    residual_mass += (g[[row, a * d + b]] - g_ref).abs();
+                    residual_mass += (g[[row, a * d + b]] / normalizer - g_ref).abs();
                 }
             }
         }

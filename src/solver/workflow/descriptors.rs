@@ -547,11 +547,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let weight = descriptor_weight_scalar(descriptor, &context)?;
                 let p_out = descriptor_usize(descriptor, "p_out", target.d)?;
                 let mut penalty = IsometryPenalty::new_euclidean(slice, p_out);
-                // Scale-free reference: profile g_ref as the per-atom mean
-                // pullback metric (penalize metric variation across tokens, not
-                // absolute scale) so a period-1 circle (J^T J = (2pi)^2 I) is
-                // not fought by a fixed identity reference.
-                penalty.reference = crate::terms::IsometryReference::MeanProfiled;
                 penalty.scalar_weight = weight;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
