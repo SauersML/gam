@@ -26,16 +26,18 @@
 //!   η = q(t)·c(g) + (probit_scale · g) · z_std,
 //! where `z` is the modeled covariate (here EJECTION_FRACTION), `g` is the per-row
 //! log-slope (`baseline_slope + logslope_design·β_logslope`, with
-//! `logslope = s(EJECTION_FRACTION, bs='tp', k=6)`), and SEX + AGE enter the
-//! marginal block. The cumulative hazard is `Λ = −log Φ(−η)`, strictly increasing
+//! `logslope = s(age, bs='tp', k=6)` — an age-modulated EF effect; the z column
+//! itself is structurally reserved as the latent score and cannot appear in the
+//! logslope surface), and SEX + AGE enter the marginal block. The cumulative
+//! hazard is `Λ = −log Φ(−η)`, strictly increasing
 //! in η. For proportional-hazards risk **ranking** the time term is a common
 //! monotone factor across subjects, so we evaluate η at the time anchor q(t)=0:
-//! `η = probit_scale·g(z)·z_std`, the covariate-driven log-risk. Higher η ⇒ higher
+//! `η = probit_scale·g(age)·z_std`, the covariate-driven log-risk. Higher η ⇒ higher
 //! cumulative hazard ⇒ higher predicted risk. We reconstruct η with the *public*
 //! `survival_marginal_slope_vector_eta`, the exact routine the inner likelihood
 //! and saved predictor call, so the test-row scores are self-consistent with the
 //! trained fit (no hand-rederived offsets). The logslope design is rebuilt for
-//! each held-out EF from the frozen spec, so test rows are scored by the trained
+//! each held-out AGE from the frozen spec, so test rows are scored by the trained
 //! coefficients exactly as a deployed predictor would.
 //!
 //! ## Data — real, identical rows to both engines
@@ -217,13 +219,17 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
 
     // ---- fit gam on TRAIN rows only: survival marginal-slope --------------
     // Right-censored shorthand Surv(time, event); SEX + AGE in the marginal
-    // block; EJECTION_FRACTION is the latent score `z` whose smooth log-slope is
-    // `s(ejection_fraction, bs='tp', k=6)`. baseline_target="linear" is the
-    // marginal-slope baseline; frailty=None ⇒ probit_scale = 1.
+    // block; EJECTION_FRACTION is the latent score `z`. The log-slope surface
+    // is a smooth of AGE — an age-modulated EF effect. The z column itself is
+    // structurally excluded from logslope_formula (the model reserves it as
+    // the latent score; nonlinearity IN z is the score-warp channel, and a
+    // g(z)·z term would alias it — the exact marginal/logslope coupling
+    // degeneracy of gam#979). baseline_target="linear" is the marginal-slope
+    // baseline; frailty=None ⇒ probit_scale = 1.
     let cfg = FitConfig {
         survival_likelihood: "marginal-slope".to_string(),
         z_column: Some("ejection_fraction".to_string()),
-        logslope_formula: Some("s(ejection_fraction, bs='tp', k=6)".to_string()),
+        logslope_formula: Some("s(age, bs='tp', k=6)".to_string()),
         baseline_target: "linear".to_string(),
         ..FitConfig::default()
     };
@@ -268,14 +274,15 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
         .expect("rebuild marginal-slope score covariance from standardized EF");
 
     // gam's predicted covariate-driven cumulative hazard at the time anchor
-    // q(t)=0 for any EF. η = probit_scale·g(EF)·z_std; Λ = −log Φ(−η) is strictly
-    // increasing in η, so this is a valid proportional-hazards risk score for
-    // ranking. The logslope design is rebuilt per EF from the frozen TRAIN spec.
-    let logslope_eta_at = |ef_value: f64| -> f64 {
+    // q(t)=0 for any (EF, AGE). η = probit_scale·g(AGE)·z_std(EF); Λ =
+    // −log Φ(−η) is strictly increasing in η, so this is a valid
+    // proportional-hazards risk score for ranking. The logslope design is
+    // rebuilt per AGE from the frozen TRAIN spec.
+    let logslope_eta_at = |age_value: f64| -> f64 {
         let mut grid = Array2::<f64>::zeros((1, ds.headers.len()));
-        grid[[0, ef_idx]] = ef_value;
+        grid[[0, age_idx]] = age_value;
         let design = build_term_collection_design(grid.view(), &fit.logslopespec_resolved)
-            .expect("rebuild logslope design at an EF point");
+            .expect("rebuild logslope design at an AGE point");
         assert_eq!(
             design.design.ncols(),
             beta_logslope.len(),
@@ -283,8 +290,8 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
         );
         design.design.apply(&beta_logslope)[0]
     };
-    let gam_cum_at = |ef_value: f64| -> f64 {
-        let g = fit.baseline_slope + logslope_eta_at(ef_value);
+    let gam_cum_at = |ef_value: f64, age_value: f64| -> f64 {
+        let g = fit.baseline_slope + logslope_eta_at(age_value);
         let z_std = (ef_value - z_mean) / z_sd;
         let eta =
             survival_marginal_slope_vector_eta(0.0, &[z_std], &[g], &covariance, probit_scale)
@@ -295,7 +302,10 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
     // ---- score the HELD-OUT test rows with gam's own forward map ----------
     let test_time: Vec<f64> = test_rows.iter().map(|&i| time[i]).collect();
     let test_event: Vec<f64> = test_rows.iter().map(|&i| event[i]).collect();
-    let gam_test_cum: Vec<f64> = test_rows.iter().map(|&i| gam_cum_at(ef[i])).collect();
+    let gam_test_cum: Vec<f64> = test_rows
+        .iter()
+        .map(|&i| gam_cum_at(ef[i], age[i]))
+        .collect();
     for (k, &c) in gam_test_cum.iter().enumerate() {
         assert!(
             c.is_finite() && c > 0.0,
@@ -306,13 +316,19 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
     let c_gam = concordance_index(&test_time, &test_event, &gam_test_cum);
 
     // ---- STRUCTURE: gam's covariate hazard is monotone in EF --------------
-    // Sort the held-out EF values and confirm Λ(EF) is non-increasing across the
-    // observed range (a single coherent protective EF gradient). This is a direct
-    // property of the fitted survival function, not a comparison to any tool.
+    // Sort the held-out EF values and confirm Λ(EF) at a fixed reference AGE
+    // (the train median) is non-increasing across the observed range (a single
+    // coherent protective EF gradient). This is a direct property of the
+    // fitted survival function, not a comparison to any tool.
+    let age_ref = {
+        let mut train_age_sorted: Vec<f64> = train_rows.iter().map(|&i| age[i]).collect();
+        train_age_sorted.sort_by(|a, b| a.partial_cmp(b).expect("AGE values are finite"));
+        train_age_sorted[train_age_sorted.len() / 2]
+    };
     let mut ef_sorted: Vec<f64> = test_rows.iter().map(|&i| ef[i]).collect();
     ef_sorted.sort_by(|a, b| a.partial_cmp(b).expect("EF values are finite"));
     ef_sorted.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
-    let cum_sorted: Vec<f64> = ef_sorted.iter().map(|&e| gam_cum_at(e)).collect();
+    let cum_sorted: Vec<f64> = ef_sorted.iter().map(|&e| gam_cum_at(e, age_ref)).collect();
     let mono_eps = 1e-9;
     let monotone_decreasing = cum_sorted.windows(2).all(|w| w[1] <= w[0] + mono_eps);
 
