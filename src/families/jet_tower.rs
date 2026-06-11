@@ -385,7 +385,7 @@ impl<const K: usize> Tower4<K> {
 pub fn ln_gamma_derivative_stack(x: f64) -> [f64; 5] {
     [
         statrs::function::gamma::ln_gamma(x),
-        statrs::function::gamma::digamma(x),
+        digamma_positive(x),
         polygamma_positive(1, x),
         polygamma_positive(2, x),
         polygamma_positive(3, x),
@@ -394,7 +394,7 @@ pub fn ln_gamma_derivative_stack(x: f64) -> [f64; 5] {
 
 pub fn digamma_derivative_stack(x: f64) -> [f64; 5] {
     [
-        statrs::function::gamma::digamma(x),
+        digamma_positive(x),
         polygamma_positive(1, x),
         polygamma_positive(2, x),
         polygamma_positive(3, x),
@@ -410,6 +410,18 @@ pub fn trigamma_derivative_stack(x: f64) -> [f64; 5] {
         polygamma_positive(4, x),
         polygamma_positive(5, x),
     ]
+}
+
+fn digamma_positive(mut x: f64) -> f64 {
+    if !(x.is_finite() && x > 0.0) {
+        return f64::NAN;
+    }
+    let mut acc = 0.0;
+    while x < POLYGAMMA_ASYMPTOTIC_MIN_X {
+        acc -= 1.0 / x;
+        x += 1.0;
+    }
+    acc + digamma_asymptotic(x)
 }
 
 fn polygamma_positive(order: usize, mut x: f64) -> f64 {
@@ -443,6 +455,14 @@ fn polygamma_recurrence_term(order: usize, x: f64) -> f64 {
     sign * factorial(order) / x.powi((order + 1) as i32)
 }
 
+fn digamma_asymptotic(x: f64) -> f64 {
+    let mut out = x.ln() - 0.5 / x;
+    for (bernoulli_order, bernoulli) in BERNOULLI_EVEN {
+        out -= bernoulli / (bernoulli_order as f64 * x.powi(bernoulli_order as i32));
+    }
+    out
+}
+
 fn polygamma_asymptotic(order: usize, x: f64) -> f64 {
     if !(1..=5).contains(&order) {
         return f64::NAN;
@@ -456,7 +476,8 @@ fn polygamma_asymptotic(order: usize, x: f64) -> f64 {
     let bernoulli_sign = if order % 2 == 1 { 1.0 } else { -1.0 };
     for (bernoulli_order, bernoulli) in BERNOULLI_EVEN {
         let rising = rising_factorial(bernoulli_order, order);
-        out += bernoulli_sign * bernoulli * rising / bernoulli_order as f64
+        out += bernoulli_sign * bernoulli * rising
+            / bernoulli_order as f64
             / x.powi((bernoulli_order + order) as i32);
     }
     out
@@ -768,6 +789,105 @@ mod tests {
                     "row {row} {label}: got {got:+.15e} want {want:+.15e}"
                 );
             }
+        }
+    }
+
+    fn assert_close(label: &str, got: f64, want: f64, rel_tol: f64) {
+        let diff = (got - want).abs();
+        assert!(
+            diff <= rel_tol * want.abs().max(1.0),
+            "{label}: got {got:+.17e} want {want:+.17e} diff {diff:.3e}"
+        );
+    }
+
+    #[test]
+    fn gamma_special_function_stacks_match_reference_values() {
+        const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+        let pi_sq = std::f64::consts::PI * std::f64::consts::PI;
+        let cases = [
+            (
+                "x=0.1",
+                0.1,
+                -10.423_754_940_411_076,
+                101.433_299_150_792_75,
+            ),
+            (
+                "x=0.5",
+                0.5,
+                -EULER_GAMMA - 2.0 * std::f64::consts::LN_2,
+                pi_sq / 2.0,
+            ),
+            ("x=1", 1.0, -EULER_GAMMA, pi_sq / 6.0),
+            (
+                "x=2.5",
+                2.5,
+                -EULER_GAMMA - 2.0 * std::f64::consts::LN_2 + 2.0 + 2.0 / 3.0,
+                pi_sq / 2.0 - 4.0 - 4.0 / 9.0,
+            ),
+            (
+                "x=50",
+                50.0,
+                3.901_989_673_427_892,
+                0.020_201_333_226_697_128,
+            ),
+        ];
+
+        for (label, x, digamma_ref, trigamma_ref) in cases {
+            let ln_gamma_stack = ln_gamma_derivative_stack(x);
+            let digamma_stack = digamma_derivative_stack(x);
+            let trigamma_stack = trigamma_derivative_stack(x);
+            assert_close(
+                &format!("{label} ln_gamma_stack digamma"),
+                ln_gamma_stack[1],
+                digamma_ref,
+                1e-13,
+            );
+            assert_close(
+                &format!("{label} digamma value"),
+                digamma_stack[0],
+                digamma_ref,
+                1e-13,
+            );
+            assert_close(
+                &format!("{label} ln_gamma_stack trigamma"),
+                ln_gamma_stack[2],
+                trigamma_ref,
+                1e-13,
+            );
+            assert_close(
+                &format!("{label} digamma_stack trigamma"),
+                digamma_stack[1],
+                trigamma_ref,
+                1e-13,
+            );
+            assert_close(
+                &format!("{label} trigamma value"),
+                trigamma_stack[0],
+                trigamma_ref,
+                1e-13,
+            );
+        }
+    }
+
+    #[test]
+    fn gamma_special_function_stacks_obey_recurrences() {
+        for x in [0.1, 0.5, 1.0, 2.5, 50.0] {
+            let digamma_x = digamma_derivative_stack(x)[0];
+            let digamma_next = digamma_derivative_stack(x + 1.0)[0];
+            let trigamma_x = trigamma_derivative_stack(x)[0];
+            let trigamma_next = trigamma_derivative_stack(x + 1.0)[0];
+            assert_close(
+                &format!("digamma recurrence x={x}"),
+                digamma_next,
+                digamma_x + 1.0 / x,
+                1e-13,
+            );
+            assert_close(
+                &format!("trigamma recurrence x={x}"),
+                trigamma_next,
+                trigamma_x - 1.0 / (x * x),
+                1e-13,
+            );
         }
     }
 
