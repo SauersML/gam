@@ -1,0 +1,613 @@
+//! Lawley (1956) cumulant assembly for Bartlett corrections (#939).
+//!
+//! [`crate::inference::higher_order`] owns the correction *plumbing*: given the
+//! second-order null mean `E[W] = q + ε_k − ε_{k−q}` of a likelihood-ratio
+//! statistic, it rescales the statistic so the `χ²_q` reference is accurate to
+//! `O(n⁻²)`. This module computes the missing analytic ingredient — the Lawley
+//! ε terms — exactly, from per-row expected log-likelihood derivative cumulants.
+//!
+//! # Lawley's expansion
+//!
+//! For a `k`-parameter model, `ε_k = Σ_θ (λ_rstu − λ_rstuvw)` with
+//!
+//! ```text
+//! λ_rstu   = κ^{rs} κ^{tu} { κ_rstu/4 − κ_rst^(u) + κ_rt^(su) },
+//! λ_rstuvw = κ^{rs} κ^{tu} κ^{vw} { κ_rtv (κ_suw/6 − κ_sw^(u))
+//!            + κ_rtu (κ_svw/4 − κ_sw^(v)) + κ_rt^(v) κ_sw^(u)
+//!            + κ_rt^(u) κ_sw^(v) },
+//! ```
+//!
+//! where `κ_rs = E[∂²ℓ/∂θ_r∂θ_s]`, `κ_rst = E[∂³ℓ]`, `κ_rs^(t) = ∂κ_rs/∂θ_t`,
+//! and `κ^{rs}` is the matrix inverse of `[κ_rs]` (Lawley 1956; the display
+//! follows Cribari-Neto & Queiroz, "Bartlett corrections in beta regression
+//! models", arXiv:1501.07551, eq. 4). `ε_{k−q}` is the same sum restricted to
+//! the nuisance block, i.e. this function evaluated on the null model.
+//!
+//! # Why the "joint cumulants" are computable here
+//!
+//! GLM-type log-likelihoods are *linear in y*, so every η-derivative of `ℓ_i`
+//! is linear in y and all the arrays above need only `E[y] = μ`: no third or
+//! fourth response moments enter. The mixed arrays `κ_rs^(t)` — which are NOT
+//! recoverable from the pointwise expected contractions ν₃/ν₄ — are
+//! η-derivatives of the expected curvature as a *function*, and those are exact
+//! jet compositions of the link and variance jets. With `c(η) = μ′/V(μ)` and
+//! `u₀ = μ′·c` (the Fisher weight),
+//!
+//! ```text
+//! κ₂ = −u₀          κ₂' = −u₀'                κ₂'' = −u₀''
+//! κ₃ = −(u₀' + μ′c′)            κ₃' = −(u₀'' + μ″c′ + μ′c″)
+//! κ₄ = −(u₀'' + μ″c′ + 2μ′c″)
+//! ```
+//!
+//! (primes are η-derivatives; all divided by the dispersion φ). Canonical
+//! links have `c′ = c″ = 0`, hence `κ₃ = κ₂'` and `κ₄ = κ₃'` — pinned in tests.
+//!
+//! # Row-pair (hat) reduction
+//!
+//! For `θ`-derivatives chained through `η_i = x_iᵀβ` every array is an
+//! `X`-contraction of per-row scalars, and the six-index sum collapses to
+//! pairwise contractions of `E = X K⁻¹ Xᵀ` (`h_i = E_ii`):
+//!
+//! ```text
+//! λ₄ = Σ_i a_i h_i²,                       a_i = κ₄/4 − κ₃' + κ₂''
+//! λ₆ = −Σ_ij { E_ij³ [κ₃ᵢκ₃ⱼ/6 − κ₃ᵢκ₂'ⱼ + κ₂'ᵢκ₂'ⱼ]
+//!            + h_i h_j E_ij [κ₃ᵢκ₃ⱼ/4 − κ₃ᵢκ₂'ⱼ + κ₂'ᵢκ₂'ⱼ] }
+//! ε  = λ₄ − λ₆.
+//! ```
+//!
+//! The reduction is verified against the raw six-index Lawley sum in tests, and
+//! against two *exact* finite-sample distributions: the exponential/log-link
+//! intercept model, where `E[W] = 2n(log n − ψ(n)) = 1 + 1/(6n) + O(n⁻²)`
+//! exactly, and the Poisson/log intercept model by exact pmf summation, where
+//! the classical factor is `1/(6nλ)`.
+//!
+//! # Penalized models
+//!
+//! A quadratic penalty `−½βᵀS_λβ` is deterministic: it shifts `κ_rs` by
+//! `−S_λ` and leaves every third/fourth-order and derivative array unchanged.
+//! When the null value annihilates the penalty (`S_λ β₀ = 0` — the usual
+//! smooth-term null "this smooth is zero"), the penalized score has mean zero
+//! at the null and Lawley's expansion applies verbatim with the penalized
+//! information: pass `penalty` to fold `S_λ` into `K`. The remaining gap to a
+//! fully honest smooth-term correction is the sampling variation of ρ̂, which
+//! is NOT covered here and is tracked on #939.
+//!
+//! Cost: `O(n²k)` time and `O(n²)` memory for the pair matrix `E` — fine for
+//! the small-`n` regimes where Bartlett corrections matter (the correction is
+//! `O(n⁻¹)`; at large `n` the first-order test is already calibrated).
+
+use ndarray::{Array1, Array2, ArrayView2};
+
+use crate::linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
+use crate::linalg::matrix::FactorizedSystem;
+use faer::Side;
+
+/// Order-2 jet (value, first, second η-derivative) product.
+#[inline]
+fn jet_mul(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[0] * b[0],
+        a[0] * b[1] + a[1] * b[0],
+        a[0] * b[2] + 2.0 * a[1] * b[1] + a[2] * b[0],
+    ]
+}
+
+/// Order-2 jet quotient `a / b` (requires `b[0] != 0`).
+#[inline]
+fn jet_div(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    let q0 = a[0] / b[0];
+    let q1 = (a[1] - q0 * b[1]) / b[0];
+    let q2 = (a[2] - q0 * b[2] - 2.0 * q1 * b[1]) / b[0];
+    [q0, q1, q2]
+}
+
+/// Per-row expected jets of a GLM family/link pair at a linear predictor value:
+/// the η-derivatives of the inverse link and the μ-derivatives of the variance
+/// function. Everything Lawley needs is assembled from these by exact jet
+/// composition — no finite differences anywhere.
+#[derive(Debug, Clone, Copy)]
+pub struct RowExpectedJets {
+    /// dμ/dη.
+    pub mu1: f64,
+    /// d²μ/dη².
+    pub mu2: f64,
+    /// d³μ/dη³.
+    pub mu3: f64,
+    /// V(μ).
+    pub var: f64,
+    /// dV/dμ.
+    pub dvar_dmu: f64,
+    /// d²V/dμ².
+    pub d2var_dmu2: f64,
+    /// Dispersion φ (log-likelihood is `[yθ − b(θ)]/φ`): scales every cumulant
+    /// by `1/φ`.
+    pub dispersion: f64,
+}
+
+/// The per-row expected cumulant scalars entering Lawley's arrays.
+#[derive(Debug, Clone, Copy)]
+pub struct RowKappas {
+    /// κ₂ = E[ℓ″] (= −Fisher weight).
+    pub k2: f64,
+    /// κ₃ = E[ℓ‴].
+    pub k3: f64,
+    /// κ₄ = E[ℓ⁗].
+    pub k4: f64,
+    /// κ₂' = dκ₂/dη.
+    pub k2_1: f64,
+    /// κ₂'' = d²κ₂/dη².
+    pub k2_11: f64,
+    /// κ₃' = dκ₃/dη.
+    pub k3_1: f64,
+}
+
+impl RowExpectedJets {
+    /// Assemble the per-row cumulant scalars by jet composition of
+    /// `c = μ′/V(μ)` and `u₀ = μ′·c`.
+    pub fn kappas(&self) -> Result<RowKappas, String> {
+        let phi = self.dispersion;
+        if !(phi.is_finite() && phi > 0.0) {
+            return Err(format!(
+                "RowExpectedJets::kappas: dispersion must be finite and positive; got {phi}"
+            ));
+        }
+        if !(self.var.is_finite() && self.var > 0.0) {
+            return Err(format!(
+                "RowExpectedJets::kappas: variance function must be finite and positive; got {}",
+                self.var
+            ));
+        }
+        // η-jets of μ′ and of V(μ(η)) (chain rule for the composition).
+        let mu1_jet = [self.mu1, self.mu2, self.mu3];
+        let v_jet = [
+            self.var,
+            self.dvar_dmu * self.mu1,
+            self.d2var_dmu2 * self.mu1 * self.mu1 + self.dvar_dmu * self.mu2,
+        ];
+        let c = jet_div(mu1_jet, v_jet);
+        let u0 = jet_mul(mu1_jet, c);
+        let inv_phi = 1.0 / phi;
+        Ok(RowKappas {
+            k2: -u0[0] * inv_phi,
+            k2_1: -u0[1] * inv_phi,
+            k2_11: -u0[2] * inv_phi,
+            k3: -(u0[1] + self.mu1 * c[1]) * inv_phi,
+            k3_1: -(u0[2] + self.mu2 * c[1] + self.mu1 * c[2]) * inv_phi,
+            k4: -(u0[2] + self.mu2 * c[1] + 2.0 * self.mu1 * c[2]) * inv_phi,
+        })
+    }
+
+    /// Gaussian family, identity link, variance φ = σ².
+    pub fn gaussian_identity(dispersion: f64) -> Self {
+        Self {
+            mu1: 1.0,
+            mu2: 0.0,
+            mu3: 0.0,
+            var: 1.0,
+            dvar_dmu: 0.0,
+            d2var_dmu2: 0.0,
+            dispersion,
+        }
+    }
+
+    /// Poisson family, log link (canonical), at linear predictor `eta`.
+    pub fn poisson_log(eta: f64) -> Self {
+        let mu = eta.exp();
+        Self {
+            mu1: mu,
+            mu2: mu,
+            mu3: mu,
+            var: mu,
+            dvar_dmu: 1.0,
+            d2var_dmu2: 0.0,
+            dispersion: 1.0,
+        }
+    }
+
+    /// Bernoulli family, logit link (canonical), at linear predictor `eta`.
+    pub fn binomial_logit(eta: f64) -> Self {
+        let mu = 1.0 / (1.0 + (-eta).exp());
+        let mu1 = mu * (1.0 - mu);
+        let mu2 = mu1 * (1.0 - 2.0 * mu);
+        let mu3 = mu2 * (1.0 - 2.0 * mu) - 2.0 * mu1 * mu1;
+        Self {
+            mu1,
+            mu2,
+            mu3,
+            var: mu1,
+            dvar_dmu: 1.0 - 2.0 * mu,
+            d2var_dmu2: -2.0,
+            dispersion: 1.0,
+        }
+    }
+
+    /// Gamma family, log link (non-canonical), at linear predictor `eta` with
+    /// dispersion φ (shape 1/φ; φ = 1 is the exponential distribution).
+    pub fn gamma_log(eta: f64, dispersion: f64) -> Self {
+        let mu = eta.exp();
+        Self {
+            mu1: mu,
+            mu2: mu,
+            mu3: mu,
+            var: mu * mu,
+            dvar_dmu: 2.0 * mu,
+            d2var_dmu2: 2.0,
+            dispersion,
+        }
+    }
+}
+
+/// Lawley's `ε` for a GLM block: design `x` (n × k), per-row cumulants, and an
+/// optional quadratic penalty `S_λ` folded into the information (valid for
+/// nulls with `S_λ β₀ = 0`; see the module docs). Evaluate at the null fit.
+///
+/// `ε_k − ε_{k−q}` (full minus nuisance-restricted, the latter being this
+/// function on the null model) is the second-order mean shift of the LR
+/// statistic; feed `q + ε_k − ε_{k−q}` to
+/// [`crate::inference::higher_order::bartlett_factor_from_mean`].
+pub fn lawley_epsilon(
+    x: ArrayView2<'_, f64>,
+    kappas: &[RowKappas],
+    penalty: Option<ArrayView2<'_, f64>>,
+) -> Result<f64, String> {
+    let n = x.nrows();
+    let k = x.ncols();
+    if n == 0 || k == 0 {
+        return Err(format!(
+            "lawley_epsilon: empty design ({n} rows, {k} columns)"
+        ));
+    }
+    if kappas.len() != n {
+        return Err(format!(
+            "lawley_epsilon: {} cumulant rows for {n} design rows",
+            kappas.len()
+        ));
+    }
+    // J = −[κ_rs] (+ S_λ): the (penalized) expected information, SPD.
+    let mut j_mat = Array2::<f64>::zeros((k, k));
+    for (i, row_kappas) in kappas.iter().enumerate() {
+        let weight = -row_kappas.k2;
+        if !weight.is_finite() {
+            return Err(format!(
+                "lawley_epsilon: non-finite Fisher weight at row {i}"
+            ));
+        }
+        for r in 0..k {
+            let xr = x[[i, r]] * weight;
+            for s in 0..k {
+                j_mat[[r, s]] += xr * x[[i, s]];
+            }
+        }
+    }
+    if let Some(s_pen) = penalty {
+        if s_pen.nrows() != k || s_pen.ncols() != k {
+            return Err(format!(
+                "lawley_epsilon: penalty is {}×{}, expected {k}×{k}",
+                s_pen.nrows(),
+                s_pen.ncols()
+            ));
+        }
+        j_mat += &s_pen;
+    }
+    let j_view = FaerArrayView::new(&j_mat);
+    let factor = factorize_symmetricwith_fallback(j_view.as_ref(), Side::Lower)
+        .map_err(|e| format!("lawley_epsilon: information factorization failed: {e:?}"))?;
+    let j_inv = FactorizedSystem::solvemulti(&factor, &Array2::<f64>::eye(k))?;
+
+    // Pair matrix E = X J⁻¹ Xᵀ and its diagonal h.
+    let e_pairs = x.dot(&j_inv).dot(&x.t());
+    let h = e_pairs.diag().to_owned();
+
+    // λ₄ = Σ_i a_i h_i².
+    let mut lambda4 = 0.0;
+    for (i, row_kappas) in kappas.iter().enumerate() {
+        let a_i = row_kappas.k4 / 4.0 - row_kappas.k3_1 + row_kappas.k2_11;
+        lambda4 += a_i * h[i] * h[i];
+    }
+
+    // λ₆ = −Σ_ij { E³·b6_ij + h h E·b4_ij } with
+    // b6_ij = κ₃ᵢκ₃ⱼ/6 − κ₃ᵢκ₂'ⱼ + κ₂'ᵢκ₂'ⱼ and b4 the same with 1/4.
+    let k3: Array1<f64> = kappas.iter().map(|r| r.k3).collect();
+    let k21: Array1<f64> = kappas.iter().map(|r| r.k2_1).collect();
+    let mut lambda6 = 0.0;
+    for i in 0..n {
+        for j in 0..n {
+            let e_ij = e_pairs[[i, j]];
+            let cross = k3[i] * k3[j];
+            let mixed = -k3[i] * k21[j] + k21[i] * k21[j];
+            lambda6 -= e_ij * e_ij * e_ij * (cross / 6.0 + mixed)
+                + h[i] * h[j] * e_ij * (cross / 4.0 + mixed);
+        }
+    }
+
+    let epsilon = lambda4 - lambda6;
+    if !epsilon.is_finite() {
+        return Err(format!(
+            "lawley_epsilon: non-finite ε (λ₄={lambda4}, λ₆={lambda6})"
+        ));
+    }
+    Ok(epsilon)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    /// Raw six-index Lawley sum (eq. 4 of the module docs) on dense arrays:
+    /// the independent oracle for the row-pair reduction. `κ^{rs}` is the
+    /// inverse of `[κ_rs]`, i.e. MINUS the inverse information.
+    fn lawley_epsilon_index_oracle(
+        x: &Array2<f64>,
+        kappas: &[RowKappas],
+        penalty: Option<&Array2<f64>>,
+    ) -> f64 {
+        let n = x.nrows();
+        let k = x.ncols();
+        // κ_rs (with penalty subtracted: penalty adds −S to κ_rs).
+        let mut kappa2 = Array2::<f64>::zeros((k, k));
+        for i in 0..n {
+            for r in 0..k {
+                for s in 0..k {
+                    kappa2[[r, s]] += kappas[i].k2 * x[[i, r]] * x[[i, s]];
+                }
+            }
+        }
+        if let Some(s_pen) = penalty {
+            kappa2 -= s_pen;
+        }
+        // κ^{rs}: dense inverse via faer.
+        let j_view = FaerArrayView::new(&kappa2);
+        let factor = factorize_symmetricwith_fallback(j_view.as_ref(), faer::Side::Lower)
+            .expect("oracle κ_rs factorization");
+        let kappa_up = FactorizedSystem::solvemulti(&factor, &Array2::<f64>::eye(k))
+            .expect("oracle κ_rs inverse");
+
+        // Dense symmetric 3- and 4-index arrays as closures over row sums.
+        let arr3 = |weights: &dyn Fn(usize) -> f64, r: usize, s: usize, t: usize| -> f64 {
+            (0..n)
+                .map(|i| weights(i) * x[[i, r]] * x[[i, s]] * x[[i, t]])
+                .sum()
+        };
+        let arr4 =
+            |weights: &dyn Fn(usize) -> f64, r: usize, s: usize, t: usize, u: usize| -> f64 {
+                (0..n)
+                    .map(|i| weights(i) * x[[i, r]] * x[[i, s]] * x[[i, t]] * x[[i, u]])
+                    .sum()
+            };
+        let w_k3 = |i: usize| kappas[i].k3;
+        let w_k21 = |i: usize| kappas[i].k2_1;
+        let w_k4 = |i: usize| kappas[i].k4;
+        let w_k31 = |i: usize| kappas[i].k3_1;
+        let w_k211 = |i: usize| kappas[i].k2_11;
+
+        let mut lambda4 = 0.0;
+        for r in 0..k {
+            for s in 0..k {
+                for t in 0..k {
+                    for u in 0..k {
+                        let braces = arr4(&w_k4, r, s, t, u) / 4.0 - arr4(&w_k31, r, s, t, u)
+                            + arr4(&w_k211, r, t, s, u);
+                        lambda4 += kappa_up[[r, s]] * kappa_up[[t, u]] * braces;
+                    }
+                }
+            }
+        }
+        let mut lambda6 = 0.0;
+        for r in 0..k {
+            for s in 0..k {
+                for t in 0..k {
+                    for u in 0..k {
+                        for v in 0..k {
+                            for w in 0..k {
+                                let braces = arr3(&w_k3, r, t, v)
+                                    * (arr3(&w_k3, s, u, w) / 6.0 - arr3(&w_k21, s, w, u))
+                                    + arr3(&w_k3, r, t, u)
+                                        * (arr3(&w_k3, s, v, w) / 4.0 - arr3(&w_k21, s, w, v))
+                                    + arr3(&w_k21, r, t, v) * arr3(&w_k21, s, w, u)
+                                    + arr3(&w_k21, r, t, u) * arr3(&w_k21, s, w, v);
+                                lambda6 += kappa_up[[r, s]]
+                                    * kappa_up[[t, u]]
+                                    * kappa_up[[v, w]]
+                                    * braces;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        lambda4 - lambda6
+    }
+
+    fn intercept_design(n: usize) -> Array2<f64> {
+        Array2::<f64>::ones((n, 1))
+    }
+
+    /// ψ(n) at integer n, exactly: ψ(n) = −γ + Σ_{j=1}^{n−1} 1/j.
+    fn digamma_integer(n: usize) -> f64 {
+        const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+        -EULER_GAMMA + (1..n).map(|j| 1.0 / j as f64).sum::<f64>()
+    }
+
+    #[test]
+    fn exponential_intercept_matches_exact_digamma_expansion() {
+        // y_i ~ Exponential(mean μ), log link, intercept-only. Exact null mean:
+        // E[W] = 2n(log n − ψ(n)) = 1 + 1/(6n) + O(n⁻²) (ȳ ~ Gamma(n, μ/n)).
+        let eta = 0.4;
+        let mut residual_prev = f64::INFINITY;
+        for &n in &[8usize, 16, 32] {
+            let jets = RowExpectedJets::gamma_log(eta, 1.0);
+            let kappas = vec![jets.kappas().expect("exponential kappas"); n];
+            let x = intercept_design(n);
+            let eps = lawley_epsilon(x.view(), &kappas, None).expect("ε");
+            let analytic = 1.0 / (6.0 * n as f64);
+            assert!(
+                (eps - analytic).abs() < 1e-12,
+                "n={n}: ε={eps} vs analytic 1/(6n)={analytic}"
+            );
+            let exact_mean = 2.0 * n as f64 * ((n as f64).ln() - digamma_integer(n));
+            let residual = (exact_mean - 1.0 - eps).abs();
+            assert!(
+                residual < 0.6 / (n * n) as f64,
+                "n={n}: |E[W] − 1 − ε| = {residual} is not O(n⁻²)"
+            );
+            assert!(
+                residual < residual_prev,
+                "n={n}: residual {residual} did not shrink from {residual_prev}"
+            );
+            residual_prev = residual;
+        }
+    }
+
+    #[test]
+    fn poisson_intercept_matches_exact_pmf_mean() {
+        // y_i ~ Poisson(λ), log link, intercept-only: ε = 1/(6nλ) classically;
+        // E[W] computed exactly by pmf summation over S = Σy ~ Poisson(nλ).
+        let lambda: f64 = 1.7;
+        for &n in &[20usize, 40] {
+            let jets = RowExpectedJets::poisson_log(lambda.ln());
+            let kappas = vec![jets.kappas().expect("poisson kappas"); n];
+            let x = intercept_design(n);
+            let eps = lawley_epsilon(x.view(), &kappas, None).expect("ε");
+            let analytic = 1.0 / (6.0 * n as f64 * lambda);
+            assert!(
+                (eps - analytic).abs() < 1e-12,
+                "n={n}: ε={eps} vs analytic 1/(6nλ)={analytic}"
+            );
+            let total_rate = n as f64 * lambda;
+            let mut pmf = (-total_rate).exp();
+            let mut exact_mean = 0.0;
+            let s_max = (total_rate + 60.0 * total_rate.sqrt()).ceil() as usize;
+            for s in 0..=s_max {
+                if s > 0 {
+                    pmf *= total_rate / s as f64;
+                }
+                let s_f = s as f64;
+                let w = if s == 0 {
+                    2.0 * total_rate
+                } else {
+                    2.0 * (total_rate - s_f + s_f * (s_f / total_rate).ln())
+                };
+                exact_mean += pmf * w;
+            }
+            let residual = (exact_mean - 1.0 - eps).abs();
+            assert!(
+                residual < 0.7 / (n * n) as f64,
+                "n={n}: |E[W] − 1 − ε| = {residual} is not O(n⁻²)"
+            );
+        }
+    }
+
+    #[test]
+    fn row_pair_reduction_matches_index_oracle() {
+        // Non-canonical rows (gamma/log at varying η) on a k=3 design: the
+        // production row-pair form must equal the raw six-index Lawley sum.
+        let n = 17;
+        let k = 3;
+        let mut x = Array2::<f64>::zeros((n, k));
+        let mut kappas = Vec::with_capacity(n);
+        for i in 0..n {
+            let z = i as f64 / n as f64;
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = (7.3 * z).sin();
+            x[[i, 2]] = z * z - 0.4;
+            let eta = 0.2 + 0.5 * x[[i, 1]] - 0.3 * x[[i, 2]];
+            kappas.push(
+                RowExpectedJets::gamma_log(eta, 1.3)
+                    .kappas()
+                    .expect("gamma kappas"),
+            );
+        }
+        let fast = lawley_epsilon(x.view(), &kappas, None).expect("hat form");
+        let oracle = lawley_epsilon_index_oracle(&x, &kappas, None);
+        assert!(
+            (fast - oracle).abs() < 1e-10 * (1.0 + oracle.abs()),
+            "row-pair ε={fast} vs index-form ε={oracle}"
+        );
+
+        // And with a penalty folded into the information (penalized Lawley).
+        let mut s_pen = Array2::<f64>::eye(k);
+        s_pen[[0, 0]] = 0.0; // unpenalized intercept
+        s_pen *= 0.8;
+        let fast_pen = lawley_epsilon(x.view(), &kappas, Some(s_pen.view())).expect("hat form");
+        let oracle_pen = lawley_epsilon_index_oracle(&x, &kappas, Some(&s_pen));
+        assert!(
+            (fast_pen - oracle_pen).abs() < 1e-10 * (1.0 + oracle_pen.abs()),
+            "penalized row-pair ε={fast_pen} vs index-form ε={oracle_pen}"
+        );
+        assert!(
+            (fast_pen - fast).abs() > 1e-6,
+            "penalty must move ε (got {fast} → {fast_pen})"
+        );
+    }
+
+    #[test]
+    fn canonical_links_collapse_the_mixed_arrays() {
+        // Canonical links have c′ = c″ = 0, so κ₃ = κ₂' and κ₄ = κ₃' — the
+        // derivative ("joint") arrays coincide with the pure ones and the
+        // Bartlett ingredients reduce to classical canonical-GLM form.
+        for eta in [-1.3, 0.0, 0.7] {
+            for jets in [
+                RowExpectedJets::poisson_log(eta),
+                RowExpectedJets::binomial_logit(eta),
+            ] {
+                let kappas = jets.kappas().expect("canonical kappas");
+                assert!(
+                    (kappas.k3 - kappas.k2_1).abs() < 1e-13 * (1.0 + kappas.k3.abs()),
+                    "canonical link must satisfy κ₃ = κ₂' (η={eta}): {kappas:?}"
+                );
+                assert!(
+                    (kappas.k4 - kappas.k3_1).abs() < 1e-13 * (1.0 + kappas.k4.abs()),
+                    "canonical link must satisfy κ₄ = κ₃' (η={eta}): {kappas:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_identity_needs_no_correction_even_penalized() {
+        // Gaussian/identity: all third/fourth-order and derivative arrays
+        // vanish, so ε = 0 exactly — including with a penalty (the LR of a
+        // penalized-quadratic model is exactly pivotal at fixed λ).
+        let n = 12;
+        let jets = RowExpectedJets::gaussian_identity(2.3);
+        let kappas = vec![jets.kappas().expect("gaussian kappas"); n];
+        let mut x = Array2::<f64>::ones((n, 2));
+        for i in 0..n {
+            x[[i, 1]] = i as f64 - 5.0;
+        }
+        let s_pen = Array2::<f64>::eye(2) * 0.5;
+        let eps = lawley_epsilon(x.view(), &kappas, Some(s_pen.view())).expect("ε");
+        assert!(eps.abs() < 1e-14, "Gaussian-identity ε must be 0; got {eps}");
+    }
+
+    #[test]
+    fn epsilon_is_invariant_under_linear_reparametrization() {
+        // ε is a property of the model, not the basis: X → X·T for invertible
+        // T must leave it unchanged (the penalty transforms congruently).
+        let n = 15;
+        let k = 3;
+        let mut x = Array2::<f64>::zeros((n, k));
+        let mut kappas = Vec::with_capacity(n);
+        for i in 0..n {
+            let z = i as f64 / n as f64;
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = (3.1 * z).cos();
+            x[[i, 2]] = z - 0.5;
+            let eta = -0.1 + 0.6 * x[[i, 1] ] + 0.4 * x[[i, 2]];
+            kappas.push(
+                RowExpectedJets::binomial_logit(eta)
+                    .kappas()
+                    .expect("binomial kappas"),
+            );
+        }
+        let t_mat = ndarray::arr2(&[[1.0, 0.3, -0.2], [0.0, 1.4, 0.5], [0.0, 0.0, 0.8]]);
+        let xt = x.dot(&t_mat);
+        let eps = lawley_epsilon(x.view(), &kappas, None).expect("ε");
+        let eps_t = lawley_epsilon(xt.view(), &kappas, None).expect("ε reparam");
+        assert!(
+            (eps - eps_t).abs() < 1e-9 * (1.0 + eps.abs()),
+            "ε not reparametrization-invariant: {eps} vs {eps_t}"
+        );
+    }
+}
