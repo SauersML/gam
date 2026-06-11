@@ -1549,4 +1549,3 @@ impl SaeBasisThirdJet for EuclideanPatchEvaluator {
         Ok(t3)
     }
 }
-

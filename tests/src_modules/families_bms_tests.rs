@@ -966,8 +966,7 @@ fn bernoulli_margslope_flex_ll_early_exit_is_exact_or_provably_rejected() {
 
 #[test]
 fn row_primary_fourth_contracted_rejects_bad_direction_lengths() {
-    let family =
-        test_family_with_zero_primary_designs(array![1.0], array![1.0], array![0.25]);
+    let family = test_family_with_zero_primary_designs(array![1.0], array![1.0], array![0.25]);
     let block_states = vec![
         ParameterBlockState {
             beta: Array1::zeros(0),
@@ -9276,14 +9275,7 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
         .expect("psi workspace")
         .expect("psi workspace some");
     let batched = family
-        .batched_outer_gradient_terms(
-            &states,
-            &specs,
-            &derivative_blocks,
-            &rho,
-            &opts,
-            None,
-        )
+        .batched_outer_gradient_terms(&states, &specs, &derivative_blocks, &rho, &opts, None)
         .expect("batched outer gradient")
         .expect("batched terms some");
 
@@ -9558,7 +9550,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     let n_rho = base_design.penalties_as_penalty_matrix().len();
     assert!(n_rho >= 1, "matern block must carry at least one penalty");
 
-    // Build (family, specs, derivative_blocks, gradient, Hessian) for a given ψ
+    // Build (family, specs, derivative_blocks, objective, gradient, Hessian) for a given ψ
     // offset (in −log(length_scale)) and ρ offset. ψ-offset δ ⇒ length_scale =
     // base * exp(−δ); the frozen centers are reused, so only the kernel
     // length-scale moves. Returns the full θ=(ρ,ψ) outer gradient + dense
@@ -9638,11 +9630,11 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
             res.inner_converged,
             "inner solve must converge for valid outer derivatives"
         );
-        (res.gradient, res.outer_hessian)
+        (res.objective, res.gradient, res.outer_hessian)
     };
 
     // Base point: analytic gradient + Hessian over θ=(ρ,ψ).
-    let (grad0, hess0) = outer_at(0.0, 0.0, EvalMode::ValueGradientHessian);
+    let (_, grad0, hess0) = outer_at(0.0, 0.0, EvalMode::ValueGradientHessian);
     let theta_dim = grad0.len();
     let psi_dim = theta_dim - n_rho;
     assert!(
@@ -9669,6 +9661,19 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         "FD ψ arm assumes one spatial ψ axis (one length-scale)"
     );
 
+    let (cost_plus, _, _) = outer_at(eps, 0.0, EvalMode::ValueOnly);
+    let (cost_minus, _, _) = outer_at(-eps, 0.0, EvalMode::ValueOnly);
+    let fd_psi_gradient = (cost_plus - cost_minus) / (2.0 * eps);
+    let analytic_psi_gradient = grad0[n_rho];
+    let psi_gradient_scale = 1.0 + analytic_psi_gradient.abs().max(fd_psi_gradient.abs());
+    let psi_gradient_rel = (analytic_psi_gradient - fd_psi_gradient).abs() / psi_gradient_scale;
+    assert!(
+        psi_gradient_rel < 2e-3,
+        "outer ψ gradient disagrees with centered FD of the outer value: analytic={}, fd={}, rel={psi_gradient_rel:.3e}",
+        analytic_psi_gradient,
+        fd_psi_gradient
+    );
+
     // Centered FD of the outer GRADIENT along a θ direction `dir` of length
     // theta_dim = n_rho + 1. The ρ block (dir[0..n_rho]) is shifted UNIFORMLY by
     // its common value (the directions below set it all-ones or all-zeros), and
@@ -9677,8 +9682,8 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     let fd_along = |dir: &Array1<f64>| -> Array1<f64> {
         let rho_step = dir[0]; // ρ block is uniform in the directions used below
         let psi_step = dir[n_rho];
-        let (gp, _) = outer_at(eps * psi_step, eps * rho_step, EvalMode::ValueAndGradient);
-        let (gm, _) = outer_at(-eps * psi_step, -eps * rho_step, EvalMode::ValueAndGradient);
+        let (_, gp, _) = outer_at(eps * psi_step, eps * rho_step, EvalMode::ValueAndGradient);
+        let (_, gm, _) = outer_at(-eps * psi_step, -eps * rho_step, EvalMode::ValueAndGradient);
         (&gp - &gm).mapv(|v| v / (2.0 * eps))
     };
 

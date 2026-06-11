@@ -134,13 +134,8 @@ fn predict_recovers_known_linear_interaction_on_a_fresh_grid() {
     write_predict_csv_rows(
         &predict_path,
         ["x0", "x1", "y"],
-        grid.iter().map(|&(x0, x1)| {
-            [
-                format!("{x0:.12}"),
-                format!("{x1:.12}"),
-                "0.0".to_string(),
-            ]
-        }),
+        grid.iter()
+            .map(|&(x0, x1)| [format!("{x0:.12}"), format!("{x1:.12}"), "0.0".to_string()]),
     );
 
     let preds = fit_then_predict_gaussian(

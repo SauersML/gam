@@ -115,7 +115,9 @@ fn assemble_bms_block_local_s_psi(
         }
         s_psi
     } else if let Some(penalty_idx) = deriv.penalty_index {
-        deriv.s_psi.mapv(|value| per_block_rho[penalty_idx].exp() * value)
+        deriv
+            .s_psi
+            .mapv(|value| per_block_rho[penalty_idx].exp() * value)
     } else {
         Array2::<f64>::zeros((p_block, p_block))
     }
@@ -13891,9 +13893,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             .map_err(|e| {
                 format!("bernoulli marginal-slope penalty logdet failed for block {block_idx}: {e}")
             })?;
-            let first = pld
-                .rho_derivatives(&penalties_dense[block_idx], &lambdas)
-                .0;
+            let first = pld.rho_derivatives(&penalties_dense[block_idx], &lambdas).0;
             for (local_idx, value) in first.iter().enumerate() {
                 trace_s_pinv_sdot[penalty_cursor + local_idx] = *value;
             }
@@ -13962,16 +13962,17 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 axes.push(self.resolve_psi_axis_spec(derivative_blocks, block_idx, local_idx)?);
                 psi_locations.push((block_idx, local_idx));
             }
-            let psi_terms =
-                self.run_psi_row_pass_for_axes(block_states, cache, options, &axes)?;
+            let psi_terms = self.run_psi_row_pass_for_axes(block_states, cache, options, &axes)?;
             if psi_terms.len() != psi_dim {
                 return Err(format!(
                     "bernoulli marginal-slope batched gradient psi terms length {} != psi_dim {psi_dim}",
                     psi_terms.len()
                 ));
             }
-            for (psi_index, ((block_idx, local_idx), terms)) in
-                psi_locations.into_iter().zip(psi_terms.into_iter()).enumerate()
+            for (psi_index, ((block_idx, local_idx), terms)) in psi_locations
+                .into_iter()
+                .zip(psi_terms.into_iter())
+                .enumerate()
             {
                 let idx = rho.len() + psi_index;
                 if terms.score_psi.len() != total {

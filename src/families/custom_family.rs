@@ -24508,7 +24508,9 @@ fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send + Sync + 'st
         h_joint.view(),
         z_joint.view(),
         |direction: &Array1<f64>| {
-            family.joint_jeffreys_information_directional_derivative_with_specs(states, specs, direction)
+            family.joint_jeffreys_information_directional_derivative_with_specs(
+                states, specs, direction,
+            )
         },
     )?;
     Ok(Some(term))
@@ -24585,7 +24587,9 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
                 h_joint.view(),
                 z_joint.view(),
                 |u: &Array1<f64>, v: &Array1<f64>| {
-                    family.joint_jeffreys_information_second_directional_derivative_with_specs(states, specs, u, v)
+                    family.joint_jeffreys_information_second_directional_derivative_with_specs(
+                        states, specs, u, v,
+                    )
                 },
             )?;
     }
@@ -24662,10 +24666,19 @@ fn custom_family_outer_jeffreys_hphi_drift<F: CustomFamily + Clone + Send + Sync
             z_columns.view(),
             delta,
             |direction: &Array1<f64>| {
-                family_owned.joint_jeffreys_information_directional_derivative_with_specs(&states_owned, &specs_owned, direction)
+                family_owned.joint_jeffreys_information_directional_derivative_with_specs(
+                    &states_owned,
+                    &specs_owned,
+                    direction,
+                )
             },
             |u: &Array1<f64>, v: &Array1<f64>| {
-                family_owned.joint_jeffreys_information_second_directional_derivative_with_specs(&states_owned, &specs_owned, u, v)
+                family_owned.joint_jeffreys_information_second_directional_derivative_with_specs(
+                    &states_owned,
+                    &specs_owned,
+                    u,
+                    v,
+                )
             },
         )
         .map(Some)

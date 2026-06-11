@@ -104,8 +104,13 @@ fn smooth_term_predict_extrapolates_instead_of_flat_clamping_to_training_range()
             .map(|&x| [format!("{x:.12}"), "0.0".to_string()]),
     );
 
-    let preds =
-        fit_then_predict_gaussian(&train_path, "y ~ s(x)", &model_path, &predict_path, &out_path);
+    let preds = fit_then_predict_gaussian(
+        &train_path,
+        "y ~ s(x)",
+        &model_path,
+        &predict_path,
+        &out_path,
+    );
     assert_eq!(
         preds.len(),
         probes.len(),

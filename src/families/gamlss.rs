@@ -19877,8 +19877,9 @@ impl BinomialLocationScaleWiggleFamily {
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
             return Err(GamlssError::DimensionMismatch {
-                reason: "BinomialLocationScaleWiggleFamily expected-information input size mismatch"
-                    .to_string(),
+                reason:
+                    "BinomialLocationScaleWiggleFamily expected-information input size mismatch"
+                        .to_string(),
             }
             .into());
         }
@@ -19979,7 +19980,8 @@ impl BinomialLocationScaleWiggleFamily {
         )?;
         let b0 = self.wiggle_design(core.q0.view())?;
         let d0 = self.wiggle_basiswith_options(core.q0.view(), BasisOptions::first_derivative())?;
-        let dd0 = self.wiggle_basiswith_options(core.q0.view(), BasisOptions::second_derivative())?;
+        let dd0 =
+            self.wiggle_basiswith_options(core.q0.view(), BasisOptions::second_derivative())?;
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let pw = b0.ncols();
@@ -20023,14 +20025,12 @@ impl BinomialLocationScaleWiggleFamily {
             b.fill(0.0);
             bu.fill(0.0);
             b.slice_mut(s![0..pt]).scaled_add(q_t, &x_t.row(i));
-            b.slice_mut(s![pt..pt + pls])
-                .scaled_add(q_ls, &x_ls.row(i));
+            b.slice_mut(s![pt..pt + pls]).scaled_add(q_ls, &x_ls.row(i));
             b.slice_mut(s![pt + pls..]).assign(&b0.row(i));
             bu.slice_mut(s![0..pt]).scaled_add(dq_t_u, &x_t.row(i));
             bu.slice_mut(s![pt..pt + pls])
                 .scaled_add(dq_ls_u, &x_ls.row(i));
-            bu.slice_mut(s![pt + pls..])
-                .scaled_add(dq0_u, &d0.row(i));
+            bu.slice_mut(s![pt + pls..]).scaled_add(dq0_u, &d0.row(i));
             scaled_outer_add(out.view_mut(), f1 * alpha_u, b.view(), b.view());
             scaled_outer_add(out.view_mut(), f, bu.view(), b.view());
             scaled_outer_add(out.view_mut(), f, b.view(), bu.view());
@@ -20067,7 +20067,8 @@ impl BinomialLocationScaleWiggleFamily {
         )?;
         let b0 = self.wiggle_design(core.q0.view())?;
         let d0 = self.wiggle_basiswith_options(core.q0.view(), BasisOptions::first_derivative())?;
-        let dd0 = self.wiggle_basiswith_options(core.q0.view(), BasisOptions::second_derivative())?;
+        let dd0 =
+            self.wiggle_basiswith_options(core.q0.view(), BasisOptions::second_derivative())?;
         let d3q = self.wiggle_d3q_dq03(core.q0.view(), betaw.view())?;
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
@@ -20127,8 +20128,7 @@ impl BinomialLocationScaleWiggleFamily {
             let b2_v = ddr.dot(&vw);
             let dm_u = g2[i] * dq0_u + b1_u;
             let dm_v = g2[i] * dq0_v + b1_v;
-            let d2m_uv =
-                d3q[i] * dq0_u * dq0_v + g2[i] * d2q0_uv + b2_v * dq0_u + b2_u * dq0_v;
+            let d2m_uv = d3q[i] * dq0_u * dq0_v + g2[i] * d2q0_uv + b2_v * dq0_u + b2_u * dq0_v;
             let alpha_u = m[i] * dq0_u + b_u;
             let alpha_v = m[i] * dq0_v + b_v;
             let alpha_uv = m[i] * d2q0_uv + g2[i] * dq0_u * dq0_v + b1_u * dq0_v + b1_v * dq0_u;
@@ -20148,8 +20148,7 @@ impl BinomialLocationScaleWiggleFamily {
             bv.fill(0.0);
             buv.fill(0.0);
             b.slice_mut(s![0..pt]).scaled_add(q_t, &x_t.row(i));
-            b.slice_mut(s![pt..pt + pls])
-                .scaled_add(q_ls, &x_ls.row(i));
+            b.slice_mut(s![pt..pt + pls]).scaled_add(q_ls, &x_ls.row(i));
             b.slice_mut(s![pt + pls..]).assign(&br);
             bu.slice_mut(s![0..pt]).scaled_add(dq_t_u, &x_t.row(i));
             bu.slice_mut(s![pt..pt + pls])
@@ -20159,16 +20158,19 @@ impl BinomialLocationScaleWiggleFamily {
             bv.slice_mut(s![pt..pt + pls])
                 .scaled_add(dq_ls_v, &x_ls.row(i));
             bv.slice_mut(s![pt + pls..]).scaled_add(dq0_v, &dr);
-            buv.slice_mut(s![0..pt])
-                .scaled_add(d2q_t_uv, &x_t.row(i));
+            buv.slice_mut(s![0..pt]).scaled_add(d2q_t_uv, &x_t.row(i));
             buv.slice_mut(s![pt..pt + pls])
                 .scaled_add(d2q_ls_uv, &x_ls.row(i));
             buv.slice_mut(s![pt + pls..])
                 .scaled_add(dq0_u * dq0_v, &ddr);
-            buv.slice_mut(s![pt + pls..])
-                .scaled_add(d2q0_uv, &dr);
+            buv.slice_mut(s![pt + pls..]).scaled_add(d2q0_uv, &dr);
 
-            scaled_outer_add(out.view_mut(), f2 * alpha_u * alpha_v + f1 * alpha_uv, b.view(), b.view());
+            scaled_outer_add(
+                out.view_mut(),
+                f2 * alpha_u * alpha_v + f1 * alpha_uv,
+                b.view(),
+                b.view(),
+            );
             scaled_outer_add(out.view_mut(), f1 * alpha_u, bv.view(), b.view());
             scaled_outer_add(out.view_mut(), f1 * alpha_u, b.view(), bv.view());
             scaled_outer_add(out.view_mut(), f1 * alpha_v, bu.view(), b.view());

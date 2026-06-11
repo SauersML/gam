@@ -115,12 +115,12 @@ use gam::types::{
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest,
-    DispersionLocationScaleFitRequest, FitConfig, FitRequest, FitResult, GaussianLocationScaleFitRequest,
-    LatentBinaryFitRequest, LatentSurvivalFitRequest, LinkWiggleConfig, PreparedSurvivalTimeStack,
-    StandardBinomialWiggleConfig, StandardFitRequest, SurvivalLocationScaleFitRequest,
-    SurvivalMarginalSlopeFitRequest, SurvivalTransformationFitRequest,
-    TransformationNormalFitRequest, fit_model, prepare_survival_time_stack, resolve_offset_column,
-    resolve_weight_column,
+    DispersionLocationScaleFitRequest, FitConfig, FitRequest, FitResult,
+    GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,
+    LinkWiggleConfig, PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest,
+    SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
+    SurvivalTransformationFitRequest, TransformationNormalFitRequest, fit_model,
+    prepare_survival_time_stack, resolve_offset_column, resolve_weight_column,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};
 use rand::{SeedableRng, rngs::StdRng};
@@ -2346,7 +2346,7 @@ fn run_fitwith_predict_noise(
                         choice.link,
                         "gaussian location-scale base link",
                     )
-                        .map(InverseLink::Standard)
+                    .map(InverseLink::Standard)
                 })
                 .transpose()?;
             // Knots/coefficients are already in raw response units.
@@ -4656,16 +4656,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         );
     }
     parse_survival_distribution(&effective_config.survival_distribution)?;
-    let survival_inverse_link =
-        gam::config_resolve::parse_survival_inverse_link(
-            gam::config_resolve::SurvivalInverseLinkInput {
-                link: effective_config.link.as_deref(),
-                mixture_rho: effective_args.mixture_rho.as_deref(),
-                sas_init: effective_args.sas_init.as_deref(),
-                beta_logistic_init: effective_args.beta_logistic_init.as_deref(),
-                survival_distribution: &effective_config.survival_distribution,
-            },
-        )?;
+    let survival_inverse_link = gam::config_resolve::parse_survival_inverse_link(
+        gam::config_resolve::SurvivalInverseLinkInput {
+            link: effective_config.link.as_deref(),
+            mixture_rho: effective_args.mixture_rho.as_deref(),
+            sas_init: effective_args.sas_init.as_deref(),
+            beta_logistic_init: effective_args.beta_logistic_init.as_deref(),
+            survival_distribution: &effective_config.survival_distribution,
+        },
+    )?;
     if effective_linkwiggle.is_some() && likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         require_inverse_link_supports_joint_wiggle(&survival_inverse_link, "linkwiggle(...)")?;
     }
@@ -4793,8 +4792,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let weights = resolve_weight_column(&ds, &col_map, effective_config.weight_column.as_deref())?;
     let threshold_offset =
         resolve_offset_column(&ds, &col_map, effective_config.offset_column.as_deref())?;
-    let log_sigma_offset =
-        resolve_offset_column(&ds, &col_map, effective_config.noise_offset_column.as_deref())?;
+    let log_sigma_offset = resolve_offset_column(
+        &ds,
+        &col_map,
+        effective_config.noise_offset_column.as_deref(),
+    )?;
 
     for i in 0..n {
         let entry_val = entry_col.map_or(0.0, |idx| ds.values[[i, idx]]);
@@ -5267,9 +5269,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             parsed.linkspec.as_ref(),
             "survival marginal-slope",
         )?;
-        let logslope_formula_raw = effective_config.logslope_formula.as_deref().ok_or_else(|| {
-            "--logslope-formula is required with --survival-likelihood marginal-slope".to_string()
-        })?;
+        let logslope_formula_raw =
+            effective_config
+                .logslope_formula
+                .as_deref()
+                .ok_or_else(|| {
+                    "--logslope-formula is required with --survival-likelihood marginal-slope"
+                        .to_string()
+                })?;
         let z_column_name = effective_config.z_column.as_ref().ok_or_else(|| {
             "--z-column is required with --survival-likelihood marginal-slope".to_string()
         })?;

@@ -93,9 +93,7 @@ impl Certificate for RhoUncertaintyCertificate {
                 RhoUncertaintyVerdict::RhoUncertaintyMatters { .. } => {
                     "rho-uncertainty-matters".into()
                 }
-                RhoUncertaintyVerdict::Skipped { reason } => {
-                    format!("skipped: {reason}").into()
-                }
+                RhoUncertaintyVerdict::Skipped { reason } => format!("skipped: {reason}").into(),
             },
         );
         evidence
@@ -358,7 +356,10 @@ mod tests {
     use super::*;
     use ndarray::array;
 
-    fn gaussian_criterion(rho_hat: Array1<f64>, hessian: Array2<f64>) -> impl FnMut(&Array1<f64>) -> Option<f64> {
+    fn gaussian_criterion(
+        rho_hat: Array1<f64>,
+        hessian: Array2<f64>,
+    ) -> impl FnMut(&Array1<f64>) -> Option<f64> {
         move |rho: &Array1<f64>| {
             let delta = rho - &rho_hat;
             Some(0.5 * delta.dot(&hessian.dot(&delta)))

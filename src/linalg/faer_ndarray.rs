@@ -528,8 +528,8 @@ fn fast_atv_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
-    use faer::linalg::matmul::matmul;
     use faer::Accum;
+    use faer::linalg::matmul::matmul;
 
     let (n, p) = a.dim();
     assert_eq!(n, v.len(), "A rows must match v length");

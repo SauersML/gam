@@ -4082,14 +4082,8 @@ impl BinomialLocationScalePredictor {
             "binomial location-scale posterior mean",
         )?;
 
-        let eta_se = self.response_se_from_backend(
-            input,
-            &backend,
-            &q0_base,
-            &sigma,
-            &eta_t,
-            &dmu_deta,
-        )?;
+        let eta_se =
+            self.response_se_from_backend(input, &backend, &q0_base, &sigma, &eta_t, &dmu_deta)?;
 
         let mean = if self.link_wiggle.is_none() {
             let (var_t, var_s, cov_ts) = project_two_block_linear_predictor_covariance(

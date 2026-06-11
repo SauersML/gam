@@ -30,8 +30,8 @@
 //!   3. north pole, degrees mode (the `90.0` bound — guards against a
 //!      regression that hardcodes `π/2` regardless of the `radians` flag).
 
-use std::f64::consts::PI;
 use gam::test_support::cli_harness::{read_prediction_means, run_or_panic};
+use std::f64::consts::PI;
 use std::path::Path;
 use std::process::Command;
 

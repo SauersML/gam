@@ -27,9 +27,7 @@
 //! bordered Hessian in that layout and hands it to
 //! [`crate::solver::arrow_schur::ArrowSchurSystem`].
 
-use ndarray::{
-    Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s,
-};
+use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
 use std::sync::Arc;
 
 use crate::solver::arrow_schur::{
@@ -6156,16 +6154,11 @@ impl SaeManifoldTerm {
                             + basis_col * frame_projection.ranks[atom_idx];
                         for c in 0..q_row {
                             let mut hrow = block.htbeta.row_mut(c);
-                            let hrow_slice =
-                                hrow.as_slice_mut().expect("htbeta row is contiguous");
+                            let hrow_slice = hrow.as_slice_mut().expect("htbeta row is contiguous");
                             for out_col in 0..p {
                                 let value = local_jac_row[[c, out_col]] * w;
                                 frame_projection.accumulate_output_project(
-                                    atom_idx,
-                                    c_base,
-                                    out_col,
-                                    value,
-                                    hrow_slice,
+                                    atom_idx, c_base, out_col, value, hrow_slice,
                                 );
                             }
                         }
@@ -11193,8 +11186,7 @@ impl SaeManifoldTerm {
                 && directional_decrease > 0.0
                 && directional_decrease > directional_decrease_floor;
             if !descent_direction_ok {
-                let grad_tolerance =
-                    SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.inner_iterate_scale();
+                let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.inner_iterate_scale();
                 if grad_norm_sq.sqrt() <= grad_tolerance {
                     self.restore_mutable_state(&snapshot);
                     break;

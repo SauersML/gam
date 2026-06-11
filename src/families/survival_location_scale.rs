@@ -1719,6 +1719,127 @@ impl SurvivalExactRowKernel {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SurvivalLsLocationScaleRow {
+    eta_location: f64,
+    eta_logscale: f64,
+    entry_index: f64,
+    exit_index: f64,
+    exit_index_derivative: f64,
+    event: f64,
+    weight: f64,
+}
+
+pub(crate) struct SurvivalLsLocationScaleNllProgram<'a> {
+    inverse_link: &'a InverseLink,
+    deriv_log_scale: f64,
+    row: SurvivalLsLocationScaleRow,
+}
+
+fn survival_ls_log_survival_stack(
+    inverse_link: &InverseLink,
+    eta: f64,
+    deriv_log_scale: f64,
+) -> Result<[f64; 5], String> {
+    let (log_s, r, dr, ddr, dddr) =
+        SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
+            inverse_link,
+            eta,
+            deriv_log_scale,
+        )?;
+    Ok([log_s, -r, -dr, -ddr, -dddr])
+}
+
+fn survival_ls_log_pdf_stack(
+    inverse_link: &InverseLink,
+    eta: f64,
+    deriv_log_scale: f64,
+) -> Result<[f64; 5], String> {
+    let (log_pdf, d1, d2, d3, d4) =
+        SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
+            inverse_link,
+            eta,
+            deriv_log_scale,
+        )?;
+    Ok([log_pdf, d1, d2, d3, d4])
+}
+
+fn survival_ls_positive_log_stack(value: f64) -> [f64; 5] {
+    let (log_v, d1, d2, d3, d4) = SurvivalLocationScaleFamily::logwith_derivatives_positive(value);
+    [log_v, d1, d2, d3, d4]
+}
+
+impl crate::families::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNllProgram<'_> {
+    fn n_rows(&self) -> usize {
+        1
+    }
+
+    fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+        if row != 0 {
+            return Err("survival LS location-scale jet row out of range".to_string());
+        }
+        Ok([self.row.eta_location, self.row.eta_logscale])
+    }
+
+    fn row_nll(
+        &self,
+        row: usize,
+        p: &[crate::families::jet_tower::Tower4<2>; 2],
+    ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
+        use crate::families::jet_tower::Tower4;
+
+        if row != 0 {
+            return Err("survival LS location-scale jet row out of range".to_string());
+        }
+        if self.row.weight <= 0.0 {
+            return Ok(Tower4::<2>::zero());
+        }
+
+        let eta_location = p[0];
+        let eta_logscale = p[1];
+        let inv_sigma = (-eta_logscale).exp();
+        let q_entry = (Tower4::<2>::constant(self.row.entry_index) - eta_location) * inv_sigma;
+        let q_exit = (Tower4::<2>::constant(self.row.exit_index) - eta_location) * inv_sigma;
+        let g = Tower4::<2>::constant(self.row.exit_index_derivative) * inv_sigma;
+
+        let mut nll = q_entry
+            .compose_unary(survival_ls_log_survival_stack(
+                self.inverse_link,
+                q_entry.v,
+                self.deriv_log_scale,
+            )?)
+            .scale(self.row.weight);
+
+        let censored_weight = self.row.weight * (1.0 - self.row.event);
+        if censored_weight != 0.0 {
+            nll = nll
+                + q_exit
+                    .compose_unary(survival_ls_log_survival_stack(
+                        self.inverse_link,
+                        q_exit.v,
+                        self.deriv_log_scale,
+                    )?)
+                    .scale(-censored_weight);
+        }
+
+        let event_weight = self.row.weight * self.row.event;
+        if event_weight != 0.0 {
+            nll = nll
+                + q_exit
+                    .compose_unary(survival_ls_log_pdf_stack(
+                        self.inverse_link,
+                        q_exit.v,
+                        self.deriv_log_scale,
+                    )?)
+                    .scale(-event_weight)
+                + g.compose_unary(survival_ls_positive_log_stack(g.v))
+                    .scale(-event_weight);
+        }
+
+        Ok(nll)
+    }
+}
+
 struct SurvivalJointQuantities {
     /// Per-row log-likelihood `ell_i` (NOT negated). Rows excluded by the
     /// degeneracy guard (`row_derivatives_rescaled` returns `None`) keep `0.0`,
@@ -13426,132 +13547,6 @@ mod tests {
                 eta: eta_ls,
             },
         ]
-    }
-
-    #[derive(Clone, Copy)]
-    struct SurvivalLsLocationScaleRow {
-        eta_location: f64,
-        eta_logscale: f64,
-        entry_index: f64,
-        exit_index: f64,
-        exit_index_derivative: f64,
-        event: f64,
-        weight: f64,
-    }
-
-    struct SurvivalLsLocationScaleNllProgram<'a> {
-        inverse_link: &'a InverseLink,
-        deriv_log_scale: f64,
-        row: SurvivalLsLocationScaleRow,
-    }
-
-    fn survival_ls_log_survival_stack(
-        inverse_link: &InverseLink,
-        eta: f64,
-        deriv_log_scale: f64,
-    ) -> Result<[f64; 5], String> {
-        let (log_s, r, dr, ddr, dddr) =
-            SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
-                inverse_link,
-                eta,
-                deriv_log_scale,
-            )?;
-        Ok([log_s, -r, -dr, -ddr, -dddr])
-    }
-
-    fn survival_ls_log_pdf_stack(
-        inverse_link: &InverseLink,
-        eta: f64,
-        deriv_log_scale: f64,
-    ) -> Result<[f64; 5], String> {
-        let (log_pdf, d1, d2, d3, d4) =
-            SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
-                inverse_link,
-                eta,
-                deriv_log_scale,
-            )?;
-        Ok([log_pdf, d1, d2, d3, d4])
-    }
-
-    fn survival_ls_positive_log_stack(value: f64) -> [f64; 5] {
-        let (log_v, d1, d2, d3, d4) =
-            SurvivalLocationScaleFamily::logwith_derivatives_positive(value);
-        [log_v, d1, d2, d3, d4]
-    }
-
-    impl crate::families::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNllProgram<'_> {
-        fn n_rows(&self) -> usize {
-            1
-        }
-
-        fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
-            if row != 0 {
-                return Err(format!(
-                    "survival LS location-scale jet row {row} out of range"
-                ));
-            }
-            Ok([self.row.eta_location, self.row.eta_logscale])
-        }
-
-        fn row_nll(
-            &self,
-            row: usize,
-            p: &[crate::families::jet_tower::Tower4<2>; 2],
-        ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
-            use crate::families::jet_tower::Tower4;
-
-            if row != 0 {
-                return Err(format!(
-                    "survival LS location-scale jet row {row} out of range"
-                ));
-            }
-            if self.row.weight <= 0.0 {
-                return Ok(Tower4::<2>::zero());
-            }
-
-            let eta_location = p[0];
-            let eta_logscale = p[1];
-            let inv_sigma = (-eta_logscale).exp();
-            let q_entry = (Tower4::<2>::constant(self.row.entry_index) - eta_location) * inv_sigma;
-            let q_exit = (Tower4::<2>::constant(self.row.exit_index) - eta_location) * inv_sigma;
-            let g = Tower4::<2>::constant(self.row.exit_index_derivative) * inv_sigma;
-
-            let mut nll = q_entry
-                .compose_unary(survival_ls_log_survival_stack(
-                    self.inverse_link,
-                    q_entry.v,
-                    self.deriv_log_scale,
-                )?)
-                .scale(self.row.weight);
-
-            let censored_weight = self.row.weight * (1.0 - self.row.event);
-            if censored_weight != 0.0 {
-                nll = nll
-                    + q_exit
-                        .compose_unary(survival_ls_log_survival_stack(
-                            self.inverse_link,
-                            q_exit.v,
-                            self.deriv_log_scale,
-                        )?)
-                        .scale(-censored_weight);
-            }
-
-            let event_weight = self.row.weight * self.row.event;
-            if event_weight != 0.0 {
-                nll = nll
-                    + q_exit
-                        .compose_unary(survival_ls_log_pdf_stack(
-                            self.inverse_link,
-                            q_exit.v,
-                            self.deriv_log_scale,
-                        )?)
-                        .scale(-event_weight)
-                    + g.compose_unary(survival_ls_positive_log_stack(g.v))
-                        .scale(-event_weight);
-            }
-
-            Ok(nll)
-        }
     }
 
     impl SurvivalLsLocationScaleRow {
