@@ -66,4 +66,8 @@ pub use sae_encode_atlas::{
     AtlasConfig, AtomEncodeAtlas, BasisHessianLipschitz, CertifiedChart, ChartRegion, EncodeAtlas,
     EncodeResult, KANTOROVICH_THRESHOLD, RowCertificate, row_certificate,
 };
+pub use sae_optimality_certificate::{
+    CriterionCertificate, DirectionalSamples, certificate_from_samples,
+    deterministic_probe_direction, probe_step,
+};
 pub use sheaf::{EdgeRestriction, SheafConsistencyPenalty};

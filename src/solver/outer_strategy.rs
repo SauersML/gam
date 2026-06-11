@@ -1813,6 +1813,26 @@ pub struct EfsEval {
     /// used to evaluate the objective. The EFS barrier check uses it for the
     /// dimensionally correct comparison `max_j τ/Δ_j² > threshold · scale`.
     pub inner_hessian_scale: Option<f64>,
+    /// `Some(gap)` when the `½log|H|` term in `cost` was produced as a CERTIFIED
+    /// TWO-SIDED ENCLOSURE (the #1011 block-preconditioned border-Schur bound)
+    /// rather than an exact logdet — `gap` is the enclosure width that `cost`
+    /// inherits. The EFS engine consults the decision-margin contract against
+    /// its step tolerance: a step is only allowed to declare convergence when
+    /// the cost it converged on is resolved more tightly than that tolerance.
+    /// `None` (the default for every exact-logdet objective) preserves today's
+    /// behavior bit-for-bit.
+    pub logdet_enclosure_gap: Option<f64>,
+}
+
+impl EfsEval {
+    /// Attach a certified logdet-enclosure gap to this eval (the #1011 contract).
+    /// The EFS engine then refuses to declare convergence on a cost the
+    /// enclosure does not pin down below the step tolerance, escalating instead.
+    #[must_use]
+    pub fn with_logdet_enclosure_gap(mut self, gap: Option<f64>) -> Self {
+        self.logdet_enclosure_gap = gap;
+        self
+    }
 }
 
 /// Outcome of [`OuterObjective::seed_inner_state`].

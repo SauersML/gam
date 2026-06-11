@@ -694,12 +694,32 @@ pub fn run_per_atom_efs(
             }
         }
 
-        // Convergence on the applied (pre-line-search) step ∞-norm.
+        // Convergence on the applied (pre-line-search) step ∞-norm, gated by the
+        // #1011 decision-margin contract. When the objective produced the cost's
+        // ½log|H| term as a certified enclosure (rather than an exact logdet),
+        // declaring convergence is only honest if that enclosure is tighter than
+        // the step tolerance — the margin this decision is allowed to resolve.
+        // An enclosure gap at or above the tolerance means the cost we would
+        // converge on is not actually pinned down, so we must NOT stop on it: the
+        // objective must refine the bound (more moments / pair absorption) or fall
+        // back to the exact logdet before the EFS step can be called converged.
         let step_inf = full_step.iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
         final_step_inf = step_inf;
-        if step_inf < cfg.tolerance.max(PER_ATOM_NEGLIGIBLE_STEP) {
-            converged = true;
-            break;
+        let margin = cfg.tolerance.max(PER_ATOM_NEGLIGIBLE_STEP);
+        let cost_resolved_below_margin = match efs.logdet_enclosure_gap {
+            Some(gap) => crate::solver::logdet_bounds::LogdetEnclosure::gap_resolves_margin(gap, margin),
+            None => true,
+        };
+        if step_inf < margin {
+            if cost_resolved_below_margin {
+                converged = true;
+                break;
+            }
+            log::info!(
+                "[PER-ATOM-EFS] step within tolerance {margin:.3e} but cost logdet enclosure gap \
+                 {:.3e} exceeds it; refining the bound before declaring convergence",
+                efs.logdet_enclosure_gap.unwrap_or(0.0)
+            );
         }
 
         // ── Layer 3: whole-vector cost line search, then apply ──
