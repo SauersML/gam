@@ -7570,6 +7570,170 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    // ─── #934 first-order optimality certificate ──────────────────────
+
+    /// Quadratic ½‖ρ − c‖² with value and gradient from the SAME center:
+    /// the certificate must attest consistency at the optimum.
+    #[test]
+    fn certificate_attests_consistent_quadratic() {
+        let center = array![0.3, -0.7];
+        let cost_center = center.clone();
+        let grad_center = center.clone();
+        let problem = OuterProblem::new(2)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
+            .with_initial_rho(array![2.0, 2.0])
+            .with_seed_config(crate::seeding::SeedConfig {
+                max_seeds: 1,
+                seed_budget: 1,
+                ..Default::default()
+            });
+        let mut obj = problem.build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let d = rho - &cost_center;
+                Ok(0.5 * d.dot(&d))
+            },
+            move |_: &mut (), rho: &Array1<f64>| {
+                let d = rho - &grad_center;
+                Ok(OuterEval {
+                    cost: 0.5 * d.dot(&d),
+                    gradient: d,
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "certificate consistent quadratic")
+            .expect("consistent quadratic must optimize");
+        let cert = result
+            .criterion_certificate
+            .as_ref()
+            .expect("gradient-based solve must ship a certificate");
+        assert!(
+            cert.first_order_consistent(),
+            "consistent value/gradient paths flagged as desynced: {}",
+            cert.summary(),
+        );
+        assert!(
+            cert.lambdas_railed.is_empty(),
+            "interior optimum reported railed λ: {}",
+            cert.summary(),
+        );
+        assert!(cert.fd_step > 0.0 && cert.fd_error > 0.0);
+    }
+
+    /// The desync bug genus (#748/#752/#901): the gradient path optimizes a
+    /// criterion whose center is silently shifted from the value path's.
+    /// The optimizer happily converges where the WRONG gradient vanishes;
+    /// the certificate's FD of the actual value path must expose it.
+    #[test]
+    fn certificate_flags_value_gradient_desync() {
+        let value_center = array![0.0, 0.0];
+        let wrong_center = array![3.0, -2.0];
+        let wrong_center_for_eval = wrong_center.clone();
+        let problem = OuterProblem::new(2)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
+            .with_initial_rho(array![1.0, 1.0])
+            .with_seed_config(crate::seeding::SeedConfig {
+                max_seeds: 1,
+                seed_budget: 1,
+                ..Default::default()
+            });
+        // eval(): a self-consistent but WRONG world (shifted center) so the
+        // line search accepts steps and BFGS converges to wrong_center.
+        // eval_cost(): the TRUE criterion value — the path the audit probes.
+        let mut obj = problem.build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let d = rho - &value_center;
+                Ok(0.5 * d.dot(&d))
+            },
+            move |_: &mut (), rho: &Array1<f64>| {
+                let d = rho - &wrong_center_for_eval;
+                Ok(OuterEval {
+                    cost: 0.5 * d.dot(&d),
+                    gradient: d,
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "certificate desynced quadratic")
+            .expect("desynced quadratic still returns a result");
+        let cert = result
+            .criterion_certificate
+            .as_ref()
+            .expect("gradient-based solve must ship a certificate");
+        // At wrong_center the analytic slope is ~0 but the true value path
+        // slopes by v·(wrong_center − value_center) along the audit
+        // direction. Guard the assertion on that projection being visible
+        // (the deterministic direction is not axis-aligned, so it is).
+        assert!(
+            cert.fd_directional.abs() > 1e-3,
+            "audit direction nearly orthogonal to the desync displacement: {}",
+            cert.summary(),
+        );
+        assert!(
+            !cert.first_order_consistent(),
+            "value↔gradient desync NOT flagged: {}",
+            cert.summary(),
+        );
+        assert!(cert.agreement_z > CERTIFICATE_Z_GATE);
+    }
+
+    #[test]
+    fn certificate_audit_direction_is_deterministic_and_context_sensitive() {
+        let theta = array![1.5, -0.25, 7.0];
+        let a = certificate_audit_direction(&theta, "ctx-one");
+        let b = certificate_audit_direction(&theta, "ctx-one");
+        assert_eq!(a, b, "same fingerprint must give the same direction");
+        let c = certificate_audit_direction(&theta, "ctx-two");
+        assert!(
+            (&a - &c).iter().any(|d| d.abs() > 1e-12),
+            "different context must give a different direction",
+        );
+        assert!((a.dot(&a).sqrt() - 1.0).abs() < 1e-12, "unit norm");
+    }
+
+    #[test]
+    fn certificate_hessian_pd_probe_classifies_definiteness() {
+        assert_eq!(
+            certificate_hessian_is_pd(&Array2::<f64>::eye(3)),
+            Some(true)
+        );
+        let indefinite = array![[1.0, 2.0], [2.0, 1.0]];
+        assert_eq!(certificate_hessian_is_pd(&indefinite), Some(false));
+        assert_eq!(
+            certificate_hessian_is_pd(&Array2::<f64>::zeros((0, 0))),
+            None
+        );
+        let non_finite = array![[f64::NAN]];
+        assert_eq!(certificate_hessian_is_pd(&non_finite), None);
+    }
+
+    #[test]
+    fn certificate_rail_detection_uses_outer_box() {
+        let config = OuterConfig::default(); // rho_bound = 30
+        let rho = array![29.8, 0.0, -29.6];
+        assert_eq!(certificate_railed_lambdas(&rho, 3, &config), vec![0, 2]);
+        // Only the leading rho_dim coordinates are λ axes.
+        assert_eq!(certificate_railed_lambdas(&rho, 1, &config), vec![0]);
+        let bounded = OuterConfig {
+            bounds: Some((array![-5.0, -5.0, -5.0], array![5.0, 5.0, 5.0])),
+            ..OuterConfig::default()
+        };
+        let pinned = array![4.9, -4.7, 0.0];
+        assert_eq!(certificate_railed_lambdas(&pinned, 3, &bounded), vec![0, 1]);
+    }
+
     // The two `outer_scaled_tolerance_*` tests that lived here have
     // been removed: the helper is gone in favor of opt 0.5.0's
     // `GradientTolerance::relative_to_cost(τ)`. Equivalent threshold

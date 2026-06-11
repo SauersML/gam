@@ -6996,6 +6996,19 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         convergence_status: fit.pirls_status.label().to_string(),
         converged: fit.pirls_status.is_converged(),
         outer_gradient_norm: fit.outer_gradient_norm,
+        criterion_certificate: fit.artifacts.criterion_certificate.as_ref().map(|cert| {
+            report::CriterionCertificateRow {
+                analytic_directional: cert.analytic_directional,
+                fd_directional: cert.fd_directional,
+                fd_error: cert.fd_error,
+                agreement_z: cert.agreement_z,
+                grad_norm: cert.grad_norm,
+                hessian_pd: cert.hessian_pd,
+                lambdas_railed: cert.lambdas_railed.clone(),
+                consistent: cert.first_order_consistent(),
+                clean: cert.is_clean(),
+            }
+        }),
         edf_total: model
             .unified()
             .and_then(|u| u.edf_total())
