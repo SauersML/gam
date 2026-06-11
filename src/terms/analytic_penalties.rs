@@ -4347,13 +4347,19 @@ impl NuclearNormPenalty {
         let s_dim = basis.len();
         if s_dim == 0 {
             // T = V = 0: R is the constant f₀ filter and dR vanishes.
-            let f0 = self.regularized_sigma_sq(0.0).powf(-0.5);
             let active_count = self.right_filter_active_count(m, d);
-            let vr = if active_count == d {
-                v.to_owned() * f0
-            } else {
-                Array2::<f64>::zeros((m, d))
-            };
+            if active_count != d {
+                // The full right-Gram spectrum is one d-fold tied zero class.
+                // A biting max_rank would choose an arbitrary subspace of that
+                // class, matching the dense oracle's tie-split rejection.
+                return Err(
+                    "NuclearNormPenalty HVP is undefined: max_rank splits a tied \
+                     right-Gram eigenvalue at the active/inactive cutoff (0.0e0, 0.0e0)"
+                        .to_string(),
+                );
+            }
+            let f0 = self.regularized_sigma_sq(0.0).powf(-0.5);
+            let vr = v.to_owned() * f0;
             return Ok((vr, Array2::<f64>::zeros((m, d))));
         }
         let mut s = Array2::<f64>::zeros((d, s_dim));
@@ -10513,6 +10519,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn nuclear_norm_wide_zero_joint_rowspace_rejects_biting_zero_tie() {
+        let n_eff = 3usize;
+        let p = 40usize; // wide: p > 2*n_eff + 8 engages the subspace path
+        let target = PsiSlice {
+            range: 0..n_eff * p,
+            latent_dim: Some(p),
+        };
+        let pen = NuclearNormPenalty::new(target, 0.8, n_eff, 1.0e-3, Some(2), false).unwrap();
+        let t = Array2::<f64>::zeros((n_eff, p));
+        let v = Array2::<f64>::zeros((n_eff, p));
+
+        let fast_err = pen
+            .right_spectral_filters_applied(t.view(), v.view())
+            .expect_err("fast path must reject a biting all-zero tied spectrum");
+        let dense_err = pen
+            .right_spectral_inverse_sqrt_derivative(t.view(), v.view())
+            .expect_err("dense oracle rejects the same tied cutoff");
+
+        assert!(
+            fast_err.contains("splits a tied") && dense_err.contains("splits a tied"),
+            "fast path error must preserve dense tie-guard semantics; \
+             fast={fast_err}, dense={dense_err}"
+        );
     }
 
     #[test]
