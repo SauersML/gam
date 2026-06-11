@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
 
+use gam::terms::sae_candidate_index::{IndexConfig, RandomProjectionFrameSketch, SaeCandidateIndex};
 use gam::terms::sae_encode_atlas::{
     row_certificate, AtlasConfig, EncodeAtlas, KANTOROVICH_THRESHOLD,
 };
@@ -316,5 +317,72 @@ fn lipschitz_constant_shrinks_certified_radius_monotonically() {
     assert!(
         (ratio - 100.0).abs() < 1e-6,
         "h must be exactly linear in L; ratio = {ratio}"
+    );
+}
+
+#[test]
+fn lsh_routed_encode_matches_direct_atom_encode() {
+    // The production routing path: the SaeCandidateIndex (#985/#994) selects the
+    // atom per row, then the atlas encodes against that atom's certified charts.
+    // With a single-atom dictionary every row routes to atom 0, so the routed
+    // result must equal the direct per-atom batch encode — verifying the
+    // composition (LSH atom-selection ∘ atlas chart-routing ∘ certificate).
+    let atom = planted_circle_atom(8);
+    let atlas = EncodeAtlas::build(
+        std::slice::from_ref(&atom),
+        &[1.0],
+        1.0,
+        AtlasConfig {
+            grid_resolution: 32,
+            ridge: 1.0e-9,
+            newton_steps: 2,
+        },
+    )
+    .expect("atlas build");
+
+    // Build the LSH index over the single atom's column-space frame. The sketch
+    // decoder block is p×r = 2×2 (the planted circle spans R²); routing returns
+    // atom 0 for every direction.
+    let frame = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap();
+    let sketch = RandomProjectionFrameSketch::from_decoder_blocks(&[frame], 8, 7)
+        .expect("sketch build");
+    let index = SaeCandidateIndex::build(&sketch, IndexConfig::auto(8, 1, 7)).expect("index build");
+
+    let n = 64usize;
+    let mut targets = Array2::<f64>::zeros((n, P));
+    for row in 0..n {
+        let t = row as f64 / n as f64;
+        targets.row_mut(row).assign(&circle_target(t));
+    }
+    let amplitudes = Array1::<f64>::ones(n);
+
+    let direct = atlas
+        .certified_encode_batch(&atom, 0, targets.view(), amplitudes.view())
+        .expect("direct batch");
+    let routed = atlas
+        .certified_encode_with_index(
+            std::slice::from_ref(&atom),
+            &index,
+            &sketch,
+            targets.view(),
+            amplitudes.view(),
+            1,
+        )
+        .expect("routed batch");
+
+    assert_eq!(
+        routed.certified, direct.certified,
+        "single-atom LSH routing must match the direct per-atom encode certificates"
+    );
+    assert_eq!(
+        routed.encode_uncertified_count, direct.encode_uncertified_count,
+        "routed uncertified count must match the direct path"
+    );
+    let coord_diff = (&routed.coords - &direct.coords)
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    assert!(
+        coord_diff < 1e-12,
+        "routed coordinates must equal the direct encode; max abs diff = {coord_diff}"
     );
 }
