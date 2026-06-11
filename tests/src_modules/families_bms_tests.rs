@@ -1397,9 +1397,10 @@ fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
     let z_grid = [-2.25, -0.35, 0.4, 2.1];
     // Fourth-order tail entries sit near cancellation (|t4| ~ 1e-3 at eta=-6.5),
     // where the tower's and the hand chain's exact-but-reassociated products
-    // differ by up to ~5e-12 relative; 1e-11 bounds association noise without
-    // admitting any real formula drift (errors of a dropped term are >=1e-6).
-    let tol = 1.0e-11;
+    // differ by up to ~1.4e-11 relative across the grid; 5e-11 bounds
+    // association noise without admitting any real formula drift (errors of
+    // a dropped term are >=1e-6, five orders above this bound).
+    let tol = 5.0e-11;
 
     for eta in eta_grid {
         let marginal = bernoulli_marginal_link_map(&link, eta).expect("marginal map");
