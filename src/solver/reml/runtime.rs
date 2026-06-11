@@ -8649,6 +8649,14 @@ impl<'a> RemlState<'a> {
     ///     transformed penalty basis, optionally including ridge policy.
     /// These conventions are mirrored in gradient code via corresponding trace terms.
     pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
+        self.compute_cost_with_ext_count(p, 0)
+    }
+
+    pub(crate) fn compute_cost_with_ext_count(
+        &self,
+        p: &Array1<f64>,
+        synthetic_ext_count: usize,
+    ) -> Result<f64, EstimationError> {
         let cost_call_idx = {
             let mut calls = self.arena.cost_eval_count.write().unwrap();
             *calls += 1;
@@ -8756,8 +8764,16 @@ impl<'a> RemlState<'a> {
         );
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             let t_assemble = std::time::Instant::now();
-            let result =
-                self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?;
+            let result = if synthetic_ext_count == 0 {
+                self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?
+            } else {
+                self.evaluate_unified_value_only_with_synthetic_ext_count(
+                    p,
+                    &bundle,
+                    synthetic_ext_count,
+                    true,
+                )?
+            };
             let cost = screening_residual_penalty(result.cost, bundle.pirls_result.as_ref());
             log::debug!(
                 "[REML] eval#{} sparse cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
@@ -8834,7 +8850,16 @@ impl<'a> RemlState<'a> {
         // Delegate to the unified evaluator for the actual formula computation.
         // This ensures cost and gradient share the exact same formula.
         let t_assemble = std::time::Instant::now();
-        let result = self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueOnly)?;
+        let result = if synthetic_ext_count == 0 {
+            self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueOnly)?
+        } else {
+            self.evaluate_unified_value_only_with_synthetic_ext_count(
+                p,
+                &bundle,
+                synthetic_ext_count,
+                false,
+            )?
+        };
         let cost = screening_residual_penalty(result.cost, bundle.pirls_result.as_ref());
         log::debug!(
             "[REML] eval#{} dense cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
@@ -10776,6 +10801,38 @@ impl<'a> RemlState<'a> {
         let assembly = self.build_sparse_assembly(rho, bundle, mode)?;
         self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
+
+    fn evaluate_unified_value_only_with_synthetic_ext_count(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        synthetic_ext_count: usize,
+        force_sparse: bool,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        assert!(synthetic_ext_count > 0);
+        let mode = super::unified::EvalMode::ValueOnly;
+        let mut assembly = if force_sparse {
+            self.build_sparse_assembly(rho, bundle, mode)?
+        } else {
+            self.build_auto_assembly(rho, bundle, mode)?
+        };
+        let p_dim = assembly.beta.len();
+        assembly.ext_coords = (0..synthetic_ext_count)
+            .map(|_| super::unified::HyperCoord {
+                a: 0.0,
+                g: Array1::zeros(p_dim),
+                drift: super::unified::HyperCoordDrift::none(),
+                ld_s: 0.0,
+                b_depends_on_beta: false,
+                is_penalty_like: false,
+                firth_g: None,
+                tk_eta_fixed: None,
+                tk_x_fixed: None,
+            })
+            .collect();
+        self.assemble_and_evaluate(rho, bundle, mode, assembly)
+    }
+
     /// Evaluate the unified REML/LAML objective with anisotropic ψ ext_coords
     /// injected into the `InnerSolution`.
     ///
