@@ -1618,7 +1618,11 @@ pub(crate) const GL20_WEIGHTS: [f64; 20] = [
 /// the `Fixed` tag — a deterministic choice; the z location is identical
 /// either way.
 fn dedup_sorted_tagged_breakpoints(points: &mut Vec<(f64, PartitionEdge)>) {
-    points.sort_by(|lhs, rhs| lhs.0.partial_cmp(&rhs.0).unwrap_or(std::cmp::Ordering::Equal));
+    points.sort_by(|lhs, rhs| {
+        lhs.0
+            .partial_cmp(&rhs.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     points.dedup_by(|lhs, rhs| {
         let coincide = if lhs.0 == rhs.0 {
             true
