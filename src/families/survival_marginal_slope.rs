@@ -22896,7 +22896,7 @@ pub fn fit_survival_marginal_slope_terms(
             .map(|c| lift_joint("covariance_corrected", c));
         if let Some(geometry) = solved.fit.geometry.take() {
             let h_red = geometry.penalized_hessian.into_array();
-            solved.fit.geometry = Some(crate::families::custom_family::FitGeometry {
+            solved.fit.geometry = Some(crate::solver::estimate::FitGeometry {
                 penalized_hessian: lift_joint("penalized_hessian", h_red).into(),
                 working_weights: geometry.working_weights,
                 working_response: geometry.working_response,
