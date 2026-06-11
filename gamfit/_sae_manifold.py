@@ -376,6 +376,16 @@ class ManifoldSAE:
     # This is deliberately quantities-only; no global-optimality verdict exists
     # until the theorem threshold is implemented.
     incoherence_report: dict[str, Any] | None = None
+    # The unified certificate ledger (#16): ONE coherent block consolidating every
+    # certificate this fit produced under a shared claim+evidence+verdict shape.
+    # ``{"overall": str, "overall_certified": bool, "claims": {claim_id: {"claim":
+    # str, "verdict": str, "certified": bool, "evidence": {...}}}}``. ``verdict``
+    # is on the conservative ladder ``unavailable < insufficient < certified`` —
+    # an absent or below-margin certificate never reads as a pass. The bespoke
+    # ``residual_gauge`` / ``incoherence_report`` keys above remain populated with
+    # the same values for back-compat; this is the additive canonical surface.
+    # ``None`` only for payloads predating the ledger.
+    certificates: dict[str, Any] | None = None
     # WP-D output-Fisher shard the fit installed (#980), retained so a follow-up
     # :meth:`steer` call can re-install ``RowMetric::OutputFisher`` and report the
     # path-integrated KL dose. The ``(n, p, r)`` factor stack ``U`` exactly as
@@ -487,6 +497,11 @@ class ManifoldSAE:
                 None
                 if payload.get("incoherence_report") is None
                 else dict(payload["incoherence_report"])
+            ),
+            certificates=(
+                None
+                if payload.get("certificates") is None
+                else dict(payload["certificates"])
             ),
         )
 
@@ -1017,6 +1032,9 @@ class ManifoldSAE:
             "residual_gauge": None if self.residual_gauge is None else _jsonable(self.residual_gauge),
             "incoherence_report": (
                 None if self.incoherence_report is None else _jsonable(self.incoherence_report)
+            ),
+            "certificates": (
+                None if self.certificates is None else _jsonable(self.certificates)
             ),
         }
 

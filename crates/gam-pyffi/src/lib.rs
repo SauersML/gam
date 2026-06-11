@@ -9947,6 +9947,25 @@ fn sae_manifold_fit_inner<'py>(
             sae_incoherence_report_dict(py, report)?,
         )?;
     }
+    // #16 — ONE coherent certificate ledger. Every certificate this fit produced
+    // implements the shared claim+evidence+conservative-verdict contract
+    // ([`gam::inference::certificates::Certificate`]); the ledger folds them into
+    // a single inspectable block keyed by claim id, with a top-level conservative
+    // `overall` roll-up (the weakest member). This consolidates the scattered
+    // per-feature reads — the bespoke `residual_gauge` / `incoherence_report`
+    // keys above are KEPT working (same values) for back-compat, and the ledger
+    // is the additive, canonical surface. Verdicts cannot read stronger than
+    // their evidence: an absent or below-margin certificate is `unavailable` /
+    // `insufficient`, never a silent pass.
+    {
+        use gam::inference::certificates::{Certificate, CertificateLedger};
+        let mut ledger = CertificateLedger::new();
+        ledger.record(&fit_diagnostics.residual_gauge);
+        if let Some(report) = &fit_diagnostics.incoherence_report {
+            ledger.record(report);
+        }
+        out.set_item("certificates", certificate_ledger_dict(py, &ledger)?)?;
+    }
     // Contract keys the python `ManifoldSAE.from_payload` boundary reads
     // unconditionally (tightened in 23db2c80a, which rejected stale payload
     // shapes python-side without adding the producer side): the fitted atom
