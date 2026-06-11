@@ -40,7 +40,7 @@ use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, pearson, r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -341,17 +341,6 @@ fn mean_gaussian_nll(mu: &[f64], sigma: &[f64], y: &[f64]) -> f64 {
         })
         .sum();
     s / n
-}
-
-/// Coefficient of determination of the predicted MEAN against observed `truth`,
-/// relative to the constant-mean predictor: `1 - SS_res / SS_tot`.
-fn r2(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
-    let n = truth.len() as f64;
-    let mean = truth.iter().sum::<f64>() / n;
-    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
-    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
-    1.0 - ss_res / ss_tot.max(1e-300)
 }
 
 /// REAL-DATA arm of the SAME capability (Gaussian location-scale: smooth mean +

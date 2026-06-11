@@ -43,7 +43,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, held_out_r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -337,18 +337,6 @@ fn gam_random_intercept_by_smooth_recovers_truth() {
 //     bar to match-or-beat, never an output to reproduce.
 
 const SLEEPSTUDY_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/sleepstudy.csv");
-
-/// Coefficient of determination of `pred` against observed `truth` relative to
-/// the mean predictor: `1 - SS_res/SS_tot`. R2=1 perfect, R2=0 matches the
-/// held-out mean, R2<0 is worse than the mean.
-fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
-    let n = truth.len() as f64;
-    let mean = truth.iter().sum::<f64>() / n;
-    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
-    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
-    1.0 - ss_res / ss_tot.max(1e-300)
-}
 
 #[test]
 fn gam_random_intercept_by_smooth_recovers_truth_on_real_data() {

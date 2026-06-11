@@ -40,7 +40,9 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, r_package_available, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, held_out_r2, r_package_available, relative_l2, rmse, run_r,
+};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::{Array2, s};
 use std::path::Path;
@@ -50,17 +52,6 @@ const LIDAR_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/lid
 // near Fiji, 1964 onward), shipped here as bench/datasets/quakes.csv with
 // columns rownames,lat,long,depth,mag,stations (n = 1000).
 const QUAKES_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/quakes.csv");
-
-/// Out-of-sample coefficient of determination `R^2 = 1 - SS_res/SS_tot`, with
-/// `SS_tot` taken about the TEST-set mean. A model that predicts the held-out
-/// mean structure scores near 1; predicting the constant test mean scores 0.
-fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "held_out_r2 length mismatch");
-    let m = truth.iter().sum::<f64>() / truth.len() as f64;
-    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (p - t) * (p - t)).sum();
-    let ss_tot: f64 = truth.iter().map(|t| (t - m) * (t - m)).sum();
-    1.0 - ss_res / ss_tot.max(1e-300)
-}
 
 #[test]
 fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla() {

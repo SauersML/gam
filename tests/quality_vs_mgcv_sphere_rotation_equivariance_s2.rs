@@ -40,7 +40,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, pad_to, pearson, r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -334,19 +334,6 @@ fn gam_sphere_smooth_is_rotation_equivariant_and_recovers_truth() {
     );
 }
 
-/// Coefficient of determination of `pred` against observed `truth` relative to
-/// the mean predictor: `1 − SS_res/SS_tot`. R² = 1 perfect, 0 = constant-mean,
-/// < 0 worse than the mean. Used as the held-out absolute accuracy bar on real
-/// data, where no closed-form truth exists.
-fn r2(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
-    let n = truth.len() as f64;
-    let mean = truth.iter().sum::<f64>() / n;
-    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
-    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
-    1.0 - ss_res / ss_tot.max(1e-300)
-}
-
 /// Real-data arm of the S² rotation-equivariance test. SAME gam capability
 /// (`sphere(lat, lon, method=harmonic)`), but on a real geospatial dataset with
 /// no known generating function, so the assertions are OBJECTIVE held-out
@@ -576,19 +563,4 @@ fn make_temp_dataset(lats: &[f64], lons: &[f64], temps: &[f64]) -> gam::data::En
         ]));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode real temperature dataset")
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so the
-/// shorter held-out coordinates can ride along in the reference data.frame; only
-/// the first `v.len()` entries are read back inside the R body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }

@@ -49,7 +49,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, rmse, run_r};
+use gam::test_support::reference::{Column, pad_to, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -399,19 +399,4 @@ fn alo_stabilized_reml_is_bit_preserving_on_low_leverage_gaussian() {
         "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv {mgcv_test_rmse:.4} * 1.10 on a \
          low-leverage design where the objective must be bit-preserved"
     );
-}
-
-/// Right-pad `v` with its last value to length `len` so it can ride along as a
-/// column of the reference data.frame. Only the first `v.len()` entries are read
-/// back inside the R body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }

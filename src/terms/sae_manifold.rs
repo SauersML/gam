@@ -12984,7 +12984,14 @@ impl SaeManifoldTerm {
                     },
                 ) {
                     Ok(step) => step,
-                    Err(_err) => {
+                    Err(err) => {
+                        log::debug!(
+                            "run_joint_fit_arrow_schur: proximal correction errored at \
+                             iteration {outer_iteration} (gᵀΔ={directional_decrease:.3e}, \
+                             floor={directional_decrease_floor:.3e}, \
+                             ‖g‖={:.3e}): {err}",
+                            grad_norm_sq.sqrt()
+                        );
                         self.restore_mutable_state(&snapshot);
                         break;
                     }
@@ -12992,6 +12999,13 @@ impl SaeManifoldTerm {
                 if !(accepted_step.trial_objective_value.is_finite()
                     && accepted_step.trial_objective_value < pre_step_total)
                 {
+                    log::debug!(
+                        "run_joint_fit_arrow_schur: proximal correction made no decrease at \
+                         iteration {outer_iteration} (trial={:.9e}, pre={pre_step_total:.9e}, \
+                         ‖g‖={:.3e})",
+                        accepted_step.trial_objective_value,
+                        grad_norm_sq.sqrt()
+                    );
                     self.restore_mutable_state(&snapshot);
                     break;
                 }
