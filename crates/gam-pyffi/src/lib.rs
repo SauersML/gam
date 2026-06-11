@@ -9736,10 +9736,12 @@ fn sae_manifold_fit_inner<'py>(
         // covariance Cov(β_k) and the closed-form ambient band (coords / mean /
         // per-channel sd) along the atom's on-atom coordinates.
         let unc = &shape_uncertainty.atoms[atom_idx];
-        atom_dict.set_item(
-            "decoder_covariance",
-            unc.decoder_covariance.clone().into_pyarray(py),
-        )?;
+        // Omitted (not set) above the SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES
+        // budget — the python reader treats the key as optional and the band
+        // quantities below remain exact.
+        if let Some(cov) = &unc.decoder_covariance {
+            atom_dict.set_item("decoder_covariance", cov.clone().into_pyarray(py))?;
+        }
         atom_dict.set_item(
             "shape_band_coords",
             unc.band_coords.clone().into_pyarray(py),
