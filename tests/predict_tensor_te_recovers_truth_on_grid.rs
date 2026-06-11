@@ -36,14 +36,9 @@
 //! (`[-0.8, 0.8]²` ⊂ training `[-1, 1]²`) so the unrelated predict-time input
 //! clamp (`FittedModel::axis_clip_to_training_ranges`) never fires.
 
-use std::path::{Path, PathBuf};
+use gam::test_support::cli_harness::run_or_panic;
+use std::path::Path;
 use std::process::Command;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 const NOISE_SD: f64 = 0.05;
 // Training covariates span [-1, 1]²; the prediction grid stays within
@@ -121,19 +116,6 @@ fn write_predict_csv(path: &Path, grid: &[(f64, f64)]) {
     writer.flush().expect("flush predict csv");
 }
 
-fn run_or_panic(mut command: Command, label: &str) {
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
-    assert!(
-        output.status.success(),
-        "`{label}` failed with status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
 /// Read the `mean` (or `linear_predictor`) column from a `gam predict --out` CSV.
 fn read_predictions(path: &Path) -> Vec<f64> {
     let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
@@ -189,7 +171,7 @@ fn predict_recovers_known_tensor_te_surface_on_a_fresh_grid() {
     write_predict_csv(&predict_path, &grid);
 
     // ---- fit: y ~ te(x, z) (Gaussian), save to disk ------------------------
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&train_path)
@@ -201,7 +183,7 @@ fn predict_recovers_known_tensor_te_surface_on_a_fresh_grid() {
     assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
 
     // ---- reload + predict on the FRESH grid --------------------------------
-    let mut predict_cmd = Command::new(gam_binary());
+    let mut predict_cmd = Command::new(gam::gam_binary!());
     predict_cmd
         .arg("predict")
         .arg(&model_path)
