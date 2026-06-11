@@ -89,7 +89,9 @@ use faer::Side;
 use ndarray::{Array1, Array2};
 
 use crate::families::custom_family::{FamilyLinearizationState, ParameterBlockSpec};
-use crate::linalg::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, rrqr_with_permutation};
+use crate::linalg::faer_ndarray::{
+    FaerEigh, default_rrqr_rank_alpha, fast_atb, rrqr_with_permutation,
+};
 use crate::solver::estimate::EstimationError;
 
 const DEFAULT_GAUGE_PRIORITY: u8 = 100;
@@ -109,6 +111,7 @@ const REPORT_FLOOR_NEAR_EXACT: f64 = 0.95;
 /// pairwise sweep) above which a periodic progress ticker is attached. Below
 /// this the audit completes fast enough that progress output is noise.
 const AUDIT_PROGRESS_TICKER_WORK_THRESHOLD: usize = 1_000_000;
+const CHANNEL_AWARE_ROW_CHUNK: usize = 4096;
 
 /// Per-block accounting record. `original_dim` is the spec's column
 /// count at audit entry (post `joint_null_rotation` absorption — the
@@ -1469,6 +1472,142 @@ fn audit_identifiability_impl(
 /// threshold in the channel-weighted view, `fatal` true on rank
 /// deficiency or hard-alias pair above the per-pair leverage-based
 /// halt threshold (`pair_halt_threshold`).
+struct ChannelAwareStreamedGeometry {
+    gram_h: Array2<f64>,
+    gram_struct: Array2<f64>,
+    col_norms: Vec<f64>,
+    col_s2: Vec<f64>,
+    raw_ranges: Vec<std::ops::Range<usize>>,
+}
+
+fn channel_aware_streamed_geometry(
+    operators: &[std::sync::Arc<
+        dyn crate::families::identifiability_compiler::RowJacobianOperator,
+    >],
+    row_hess: &dyn crate::families::identifiability_compiler::RowHessian,
+    row_structural: &dyn crate::families::identifiability_compiler::RowHessian,
+    col_offsets: &[usize],
+) -> Result<ChannelAwareStreamedGeometry, EstimationError> {
+    if operators.is_empty() {
+        return Ok(ChannelAwareStreamedGeometry {
+            gram_h: Array2::<f64>::zeros((0, 0)),
+            gram_struct: Array2::<f64>::zeros((0, 0)),
+            col_norms: Vec::new(),
+            col_s2: Vec::new(),
+            raw_ranges: Vec::new(),
+        });
+    }
+    let n = row_hess.nrows();
+    let k = row_hess.k();
+    let p_total = *col_offsets.last().unwrap_or(&0);
+    let raw_ranges: Vec<std::ops::Range<usize>> = (0..operators.len())
+        .map(|idx| col_offsets[idx]..col_offsets[idx + 1])
+        .collect();
+    let mut gram_h = Array2::<f64>::zeros((p_total, p_total));
+    let mut gram_struct = Array2::<f64>::zeros((p_total, p_total));
+    let mut fourth = vec![0.0_f64; p_total];
+
+    for start in (0..n).step_by(CHANNEL_AWARE_ROW_CHUNK) {
+        let end = (start + CHANNEL_AWARE_ROW_CHUNK).min(n);
+        let chunk = end - start;
+        let mut chunks: Vec<Array2<f64>> = Vec::with_capacity(operators.len());
+        for (block_idx, op) in operators.iter().enumerate() {
+            let p_b = op.ncols();
+            let mut rows = Array2::<f64>::zeros((chunk * k, p_b));
+            op.channel_flattened_rows(start..end, &mut rows);
+            let base = col_offsets[block_idx];
+            for col in 0..p_b {
+                let mut sum4 = 0.0_f64;
+                for value in rows.column(col).iter() {
+                    let sq = value * value;
+                    sum4 += sq * sq;
+                }
+                fourth[base + col] += sum4;
+            }
+            chunks.push(rows);
+        }
+        accumulate_channel_metric_gram(&chunks, row_hess, start, end, col_offsets, &mut gram_h)?;
+        accumulate_channel_metric_gram(
+            &chunks,
+            row_structural,
+            start,
+            end,
+            col_offsets,
+            &mut gram_struct,
+        )?;
+    }
+    for i in 0..p_total {
+        for j in 0..i {
+            gram_h[[i, j]] = gram_h[[j, i]];
+            gram_struct[[i, j]] = gram_struct[[j, i]];
+        }
+    }
+    let mut col_norms = Vec::with_capacity(p_total);
+    let mut col_s2 = Vec::with_capacity(p_total);
+    for col in 0..p_total {
+        let sq_norm = gram_struct[[col, col]].max(0.0);
+        col_norms.push(sq_norm.sqrt());
+        if sq_norm <= 0.0 {
+            col_s2.push(1.0);
+        } else {
+            col_s2.push(fourth[col] / (sq_norm * sq_norm));
+        }
+    }
+    Ok(ChannelAwareStreamedGeometry {
+        gram_h,
+        gram_struct,
+        col_norms,
+        col_s2,
+        raw_ranges,
+    })
+}
+
+fn accumulate_channel_metric_gram(
+    chunks: &[Array2<f64>],
+    metric: &dyn crate::families::identifiability_compiler::RowHessian,
+    start: usize,
+    end: usize,
+    col_offsets: &[usize],
+    out: &mut Array2<f64>,
+) -> Result<(), EstimationError> {
+    let k = metric.k();
+    let chunk = end - start;
+    let mut weighted: Vec<Array2<f64>> = chunks
+        .iter()
+        .map(|chunk_rows| Array2::<f64>::zeros(chunk_rows.dim()))
+        .collect();
+    let mut h_row = vec![0.0_f64; k * k];
+    for local_i in 0..chunk {
+        metric.fill_row(start + local_i, &mut h_row);
+        for (block_idx, chunk_rows) in chunks.iter().enumerate() {
+            let p_b = chunk_rows.ncols();
+            for out_ch in 0..k {
+                for col in 0..p_b {
+                    let mut acc = 0.0_f64;
+                    for in_ch in 0..k {
+                        acc += h_row[out_ch * k + in_ch] * chunk_rows[[local_i * k + in_ch, col]];
+                    }
+                    weighted[block_idx][[local_i * k + out_ch, col]] = acc;
+                }
+            }
+        }
+    }
+    for a in 0..chunks.len() {
+        let range_a = col_offsets[a]..col_offsets[a + 1];
+        for b in a..chunks.len() {
+            let range_b = col_offsets[b]..col_offsets[b + 1];
+            let block = fast_atb(&chunks[a], &weighted[b]);
+            for local_a in 0..block.nrows() {
+                for local_b in 0..block.ncols() {
+                    out[[range_a.start + local_a, range_b.start + local_b]] +=
+                        block[[local_a, local_b]];
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn audit_identifiability_channel_aware(
     specs: &[ParameterBlockSpec],
     operators: &[std::sync::Arc<
@@ -1476,7 +1615,7 @@ pub fn audit_identifiability_channel_aware(
     >],
     row_hess: &dyn crate::families::identifiability_compiler::RowHessian,
 ) -> Result<IdentifiabilityAudit, EstimationError> {
-    use crate::families::identifiability_compiler::{IdentityRowHessian, compile_with_dual_metric};
+    use crate::families::identifiability_compiler::{IdentityRowHessian, compile_from_raw_grams};
 
     if specs.is_empty() {
         return Ok(IdentifiabilityAudit {
@@ -1529,19 +1668,31 @@ pub fn audit_identifiability_channel_aware(
     // audit a structural identifiability check rather than a
     // curvature-aware one.
     let id_struct = IdentityRowHessian::new(n, k);
+    let mut col_offsets: Vec<usize> = Vec::with_capacity(specs.len() + 1);
+    col_offsets.push(0);
+    for spec in specs {
+        let next = col_offsets[col_offsets.len() - 1] + spec.design.ncols();
+        col_offsets.push(next);
+    }
 
-    // Joint compile-with-dual-metric does the heavy lifting: it
-    // returns per-block selectors `t_lw`, the joint rank, and demoted
-    // (block, local_col) attributions in the structural metric.
-    // Routing the audit through this path is what guarantees that the
-    // channel-aware view replaces — not augments — the flat view's
-    // joint RRQR pass.
+    // Stream the row-Jacobian into p×p Grams once. `compile_from_raw_grams`
+    // performs the same structural/curvature residualisation in coefficient
+    // space; its eigenspace rank threshold maps the design singular-value
+    // tolerance through λ=σ², so the fail-closed reduction stays tied to the
+    // exact Gram geometry without retaining `(n*K)×p` designs.
+    let geometry = channel_aware_streamed_geometry(operators, row_hess, &id_struct, &col_offsets)?;
     let ordering: Vec<crate::families::identifiability_compiler::BlockOrder> =
         std::iter::repeat(crate::families::identifiability_compiler::BlockOrder::Marginal)
             .take(operators.len())
             .collect();
-    let compiled =
-        compile_with_dual_metric(operators, row_hess, &id_struct, &ordering).map_err(|e| {
+    let compiled_map =
+        compile_from_raw_grams(
+            &geometry.gram_h,
+            &geometry.gram_struct,
+            &geometry.raw_ranges,
+            &ordering,
+        )
+        .map_err(|e| {
             EstimationError::LayoutError(format!(
                 "audit_identifiability_channel_aware compile failed: {e:?}"
             ))
@@ -1549,15 +1700,9 @@ pub fn audit_identifiability_channel_aware(
 
     // Build per-block identity entries from the compiled output.
     let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());
-    let mut col_offsets: Vec<usize> = Vec::with_capacity(specs.len() + 1);
-    col_offsets.push(0);
     for (idx, spec) in specs.iter().enumerate() {
         let p_block = spec.design.ncols();
-        let kept = compiled
-            .blocks
-            .get(idx)
-            .map(|b| b.t_lw.ncols())
-            .unwrap_or(p_block);
+        let kept = compiled_map.compiled_block_ranges[idx].len();
         blocks.push(BlockIdentity {
             block_name: spec.name.clone(),
             original_dim: p_block,
@@ -1567,27 +1712,28 @@ pub fn audit_identifiability_channel_aware(
             // < `original_dim` as the structural-rank signal.
             design_range_rank: kept,
         });
-        let next = col_offsets[col_offsets.len() - 1] + p_block;
-        col_offsets.push(next);
     }
     let p_total = *col_offsets.last().expect("col_offsets non-empty");
 
-    // Dropped columns come straight from the compiler's
-    // audit-attribution pass. The compiler reports `(block_idx,
-    // local_col)`; map to `DroppedColumn { block, column, reason }`
-    // with a channel-aware reason string.
+    // The Gram compiler emits kept widths. Attribute any lost width to trailing
+    // local columns, matching the existing audit contract that downstream code
+    // consumes for diagnostics rather than for an automatic callback reparam.
     let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
-    for (block_idx, local_col) in &compiled.dropped {
-        let block_name = specs[*block_idx].name.clone();
-        dropped_columns.push(DroppedColumn {
-            block: block_name.clone(),
-            column: *local_col,
-            reason: format!(
-                "channel-aware audit (K={k}) demoted block '{block_name}' \
-                 local column {local_col}: column is in the row-Jacobian span \
-                 of earlier blocks under the structural row metric",
-            ),
-        });
+    for (block_idx, spec) in specs.iter().enumerate() {
+        let p_block = spec.design.ncols();
+        let kept = compiled_map.compiled_block_ranges[block_idx].len();
+        for local_col in kept..p_block {
+            let block_name = spec.name.clone();
+            dropped_columns.push(DroppedColumn {
+                block: block_name.clone(),
+                column: local_col,
+                reason: format!(
+                    "channel-aware audit (K={k}) demoted block '{block_name}' \
+                     local column {local_col}: column is in the row-Jacobian span \
+                     of earlier blocks under the structural row metric",
+                ),
+            });
+        }
     }
 
     // Pairwise overlap scan in the channel-weighted view. The compiler
@@ -1596,9 +1742,16 @@ pub fn audit_identifiability_channel_aware(
     // above the reporting threshold. Compute on the (n·K, p_total)
     // weighted joint W where W_b = sqrt(K^S) · J_b. With K^S = I,
     // sqrt(K^S) = I and W_b is just J_b flattened to (n·K, p_b).
-    let aliased_pairs = channel_aware_aliased_pairs(operators, &col_offsets, specs)?;
+    let aliased_pairs = channel_aware_aliased_pairs(
+        &geometry.gram_struct,
+        &geometry.col_norms,
+        &geometry.col_s2,
+        &col_offsets,
+        specs,
+        n * k,
+    )?;
 
-    let joint_rank = compiled.joint_rank;
+    let joint_rank = compiled_map.raw_from_compiled.ncols();
     let joint_rank_deficient = joint_rank < p_total;
 
     // Penalty-aware joint rank `rank([J_joint; S_blockdiag])` = co-dimension of
@@ -1619,7 +1772,7 @@ pub fn audit_identifiability_channel_aware(
     // remains the precise gate for the genuinely fatal `ker(JᵀWJ) ∩ ker(S) ≠ {0}`
     // case; this only stops the structural-rank gate from shadowing it.
     let penalty_aware_joint_rank =
-        channel_aware_penalty_aware_joint_rank(operators, &col_offsets, specs)?;
+        channel_aware_penalty_aware_joint_rank(&geometry.gram_struct, &col_offsets, specs, n * k)?;
     let penalty_covers_rank_deficiency =
         joint_rank_deficient && penalty_aware_joint_rank >= p_total;
 
@@ -1634,30 +1787,14 @@ pub fn audit_identifiability_channel_aware(
         .all(|s| s.gauge_priority == specs[0].gauge_priority);
 
     // The halt threshold is leverage-based (see flat audit path for details).
-    // For the channel-aware path we compute S2 on the materialised (n·K)
-    // channel-weighted column vectors, which correctly accounts for both
-    // the row dimension and channel weighting.
+    // The streamed geometry accumulated S2 from row chunks, so this path keeps
+    // the same finite-sample threshold without retaining column vectors.
     let block_name_to_idx_ca: std::collections::HashMap<&str, usize> = specs
         .iter()
         .enumerate()
         .map(|(i, s)| (s.name.as_str(), i))
         .collect();
-    // Materialise per-column S2 values from the channel-weighted columns.
-    // This mirrors the inner loop of channel_aware_aliased_pairs but only
-    // computes norms and S2, not the full pairwise scan.
-    let ca_col_s2: Vec<f64> = {
-        let p_total_ca = *col_offsets.last().unwrap_or(&0);
-        let mut s2_vals: Vec<f64> = Vec::with_capacity(p_total_ca);
-        let mut w = Array1::<f64>::zeros(n * k);
-        for op in operators.iter() {
-            let p_b = op.ncols();
-            for c in 0..p_b {
-                op.channel_flattened_column(c, w.as_slice_mut().expect("contiguous column buffer"));
-                s2_vals.push(compute_leverage_s2(&w.view()));
-            }
-        }
-        s2_vals
-    };
+    let ca_col_s2 = &geometry.col_s2;
     let hard_alias_pair = aliased_pairs
         .iter()
         .filter(|p| {

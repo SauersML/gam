@@ -17723,12 +17723,15 @@ impl LogslopeBlockJacobian {
 }
 
 impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &crate::custom_family::FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let n = self.design.nrows();
         let p = self.design.ncols();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let chunk = rows.end - rows.start;
         // Read s_f from the linearization state so that outer-loop σ updates are
         // reflected without requiring the spec to be rebuilt.  Every construction
         // site sets probit_frailty_scale = 1.0 when it does not know the family's
@@ -17747,10 +17750,11 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
         // initialisation call where beta may be shorter or empty.
         let beta = state.beta;
         let p_use = p.min(beta.len());
-        let mut g_rows = vec![0.0_f64; n];
-        for i in 0..n {
+        let mut g_rows = vec![0.0_f64; chunk];
+        for i in rows.clone() {
+            let local_i = i - rows.start;
             for j in 0..p_use {
-                g_rows[i] += self.design[[i, j]] * beta[j];
+                g_rows[local_i] += self.design[[i, j]] * beta[j];
             }
         }
 
@@ -17773,13 +17777,14 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
                 .to_string());
         }
 
-        let mut jac = Array2::<f64>::zeros((3 * n, p));
+        let mut jac = Array2::<f64>::zeros((3 * chunk, p));
 
-        for i in 0..n {
+        for i in rows.clone() {
+            let local_i = i - rows.start;
             // g_i computed from beta above; c_i from family_scalars when present,
             // otherwise computed from g_i.  q0/q1/qd1 from family_scalars -
             // guaranteed present by the contract check whenever g_i != 0.
-            let g = g_rows[i];
+            let g = g_rows[local_i];
             let (q0, q1, qd1, c) = match scalars {
                 Some(sc) => (sc.q0_i[i], sc.q1_i[i], sc.qd1_i[i], sc.c_i[i]),
                 None => {
@@ -17796,9 +17801,9 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
 
             for j in 0..p {
                 let g_ij = self.design[[i, j]];
-                jac[[i, j]] = coeff_eta0 * g_ij;
-                jac[[n + i, j]] = coeff_eta1 * g_ij;
-                jac[[2 * n + i, j]] = coeff_ad1 * g_ij;
+                jac[[local_i, j]] = coeff_eta0 * g_ij;
+                jac[[chunk + local_i, j]] = coeff_eta1 * g_ij;
+                jac[[2 * chunk + local_i, j]] = coeff_ad1 * g_ij;
             }
         }
         Ok(jac)
@@ -17836,12 +17841,15 @@ impl MarginalBlockJacobian {
 }
 
 impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &crate::custom_family::FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let n = self.design.nrows();
         let p = self.design.ncols();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let chunk = rows.end - rows.start;
 
         // c_i = sqrt(1 + (s * g_i)^2) depends on the logslope block's g at the
         // current beta.  This block does not own the logslope design so it cannot
@@ -17863,9 +17871,10 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
                 .to_string());
         }
 
-        let mut jac = Array2::<f64>::zeros((3 * n, p));
+        let mut jac = Array2::<f64>::zeros((3 * chunk, p));
 
-        for i in 0..n {
+        for i in rows.clone() {
+            let local_i = i - rows.start;
             let c = match scalars {
                 Some(sc) => sc.c_i[i],
                 // beta is all-zero here (enforced above), so g = 0 and c = 1.
@@ -17873,8 +17882,8 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
             };
             for j in 0..p {
                 let m_ij = c * self.design[[i, j]];
-                jac[[i, j]] = m_ij;
-                jac[[n + i, j]] = m_ij;
+                jac[[local_i, j]] = m_ij;
+                jac[[chunk + local_i, j]] = m_ij;
                 // jac[[2*n + i, j]] = 0 -- ad1 row stays zero
             }
         }
@@ -17920,12 +17929,15 @@ impl TimeBlockJacobian {
 }
 
 impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &crate::custom_family::FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let n = self.design_entry.nrows();
         let p = self.design_entry.ncols();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let chunk = rows.end - rows.start;
 
         if self.design_exit.nrows() != n || self.design_deriv.nrows() != n {
             return Err(format!(
@@ -17962,18 +17974,19 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
                 .to_string());
         }
 
-        let mut jac = Array2::<f64>::zeros((3 * n, p));
+        let mut jac = Array2::<f64>::zeros((3 * chunk, p));
 
-        for i in 0..n {
+        for i in rows.clone() {
+            let local_i = i - rows.start;
             let c = match scalars {
                 Some(sc) => sc.c_i[i],
                 // beta is all-zero here (enforced above), so g = 0 and c = 1.
                 None => 1.0_f64,
             };
             for j in 0..p {
-                jac[[i, j]] = c * self.design_entry[[i, j]];
-                jac[[n + i, j]] = c * self.design_exit[[i, j]];
-                jac[[2 * n + i, j]] = c * self.design_deriv[[i, j]];
+                jac[[local_i, j]] = c * self.design_entry[[i, j]];
+                jac[[chunk + local_i, j]] = c * self.design_exit[[i, j]];
+                jac[[2 * chunk + local_i, j]] = c * self.design_deriv[[i, j]];
             }
         }
         Ok(jac)
@@ -18226,9 +18239,10 @@ impl LogslopeFlexBlockJacobian {
 }
 
 impl crate::custom_family::BlockEffectiveJacobian for LogslopeFlexBlockJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &crate::custom_family::FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let flex: &SurvivalFlexFamilyScalars = state
             .family_scalars
@@ -18242,6 +18256,8 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeFlexBlockJacobian 
 
         let n = self.design.nrows();
         let p = self.design.ncols();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let chunk = rows.end - rows.start;
         if flex.eta_u_entry.nrows() != n || flex.eta_u_exit.nrows() != n {
             return Err(format!(
                 "LogslopeFlexBlockJacobian: flex scalars have {} rows but design has {n}",
@@ -18253,9 +18269,10 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeFlexBlockJacobian 
         // coords are zero (time, marginal, h, w do not depend on β_logslope).
         // So: ∂output/∂β_j = output_u[idx_g] * design[i,j].
         const N_OUT: usize = 6;
-        let mut jac = Array2::<f64>::zeros((N_OUT * n, p));
+        let mut jac = Array2::<f64>::zeros((N_OUT * chunk, p));
 
-        for i in 0..n {
+        for i in rows.clone() {
+            let local_i = i - rows.start;
             let g_idx = flex.idx_g;
             let cu_eta0_g = flex.eta_u_entry[[i, g_idx]];
             let cu_eta1_g = flex.eta_u_exit[[i, g_idx]];
@@ -18275,10 +18292,10 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeFlexBlockJacobian 
 
             for j in 0..p {
                 let x_ij = self.design[[i, j]];
-                jac[[i, j]] = cu_eta0_g * x_ij;
-                jac[[1 * n + i, j]] = cu_eta1_g * x_ij;
-                jac[[2 * n + i, j]] = cu_logchi1_g * x_ij;
-                jac[[3 * n + i, j]] = cu_logd1_g * x_ij;
+                jac[[local_i, j]] = cu_eta0_g * x_ij;
+                jac[[chunk + local_i, j]] = cu_eta1_g * x_ij;
+                jac[[2 * chunk + local_i, j]] = cu_logchi1_g * x_ij;
+                jac[[3 * chunk + local_i, j]] = cu_logd1_g * x_ij;
                 // rows 4 and 5 remain zero
             }
         }
@@ -18302,9 +18319,10 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeFlexBlockJacobian 
 pub struct MarginalFlexBlockJacobian;
 
 impl crate::custom_family::BlockEffectiveJacobian for MarginalFlexBlockJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &crate::custom_family::FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let flex: &SurvivalFlexFamilyScalars = state
             .family_scalars
@@ -18317,18 +18335,21 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalFlexBlockJacobian 
 
         let n = flex.dq0_marginal.nrows();
         let p = flex.dq0_marginal.ncols();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let chunk = rows.end - rows.start;
         if p == 0 {
-            return Ok(Array2::<f64>::zeros((6 * n, 0)));
+            return Ok(Array2::<f64>::zeros((6 * chunk, 0)));
         }
 
         const N_OUT: usize = 6;
-        let mut jac = Array2::<f64>::zeros((N_OUT * n, p));
+        let mut jac = Array2::<f64>::zeros((N_OUT * chunk, p));
 
         let q0_idx = flex.idx_q0;
         let q1_idx = flex.idx_q1;
         let qd1_idx = flex.idx_qd1;
 
-        for i in 0..n {
+        for i in rows.clone() {
+            let local_i = i - rows.start;
             let chi1 = flex.chi_exit[i];
             let d1 = flex.d_exit[i];
             let q1 = flex.q1_i[i];
@@ -18369,12 +18390,12 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalFlexBlockJacobian 
                 // ∂log_qd1/∂β_m[k] = dqd1 / qd1
                 let dlogqd1 = if qd1 > 0.0 { dqd1 / qd1 } else { 0.0 };
 
-                jac[[i, k]] = deta0;
-                jac[[1 * n + i, k]] = deta1;
-                jac[[2 * n + i, k]] = dlogchi1;
-                jac[[3 * n + i, k]] = dlogd1;
-                jac[[4 * n + i, k]] = dq1_logphi;
-                jac[[5 * n + i, k]] = dlogqd1;
+                jac[[local_i, k]] = deta0;
+                jac[[chunk + local_i, k]] = deta1;
+                jac[[2 * chunk + local_i, k]] = dlogchi1;
+                jac[[3 * chunk + local_i, k]] = dlogd1;
+                jac[[4 * chunk + local_i, k]] = dq1_logphi;
+                jac[[5 * chunk + local_i, k]] = dlogqd1;
             }
         }
         Ok(jac)
@@ -18396,9 +18417,10 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalFlexBlockJacobian 
 pub struct TimeFlexBlockJacobian;
 
 impl crate::custom_family::BlockEffectiveJacobian for TimeFlexBlockJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &crate::custom_family::FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let flex: &SurvivalFlexFamilyScalars = state
             .family_scalars
@@ -18411,18 +18433,21 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeFlexBlockJacobian {
 
         let n = flex.dq0_time.nrows();
         let p = flex.dq0_time.ncols();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let chunk = rows.end - rows.start;
         if p == 0 {
-            return Ok(Array2::<f64>::zeros((6 * n, 0)));
+            return Ok(Array2::<f64>::zeros((6 * chunk, 0)));
         }
 
         const N_OUT: usize = 6;
-        let mut jac = Array2::<f64>::zeros((N_OUT * n, p));
+        let mut jac = Array2::<f64>::zeros((N_OUT * chunk, p));
 
         let q0_idx = flex.idx_q0;
         let q1_idx = flex.idx_q1;
         let qd1_idx = flex.idx_qd1;
 
-        for i in 0..n {
+        for i in rows.clone() {
+            let local_i = i - rows.start;
             let chi1 = flex.chi_exit[i];
             let d1 = flex.d_exit[i];
             let q1 = flex.q1_i[i];
@@ -18459,12 +18484,12 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeFlexBlockJacobian {
                 let dq1_logphi = -q1 * dq1;
                 let dlogqd1 = if qd1 > 0.0 { dqd1 / qd1 } else { 0.0 };
 
-                jac[[i, k]] = deta0;
-                jac[[1 * n + i, k]] = deta1;
-                jac[[2 * n + i, k]] = dlogchi1;
-                jac[[3 * n + i, k]] = dlogd1;
-                jac[[4 * n + i, k]] = dq1_logphi;
-                jac[[5 * n + i, k]] = dlogqd1;
+                jac[[local_i, k]] = deta0;
+                jac[[chunk + local_i, k]] = deta1;
+                jac[[2 * chunk + local_i, k]] = dlogchi1;
+                jac[[3 * chunk + local_i, k]] = dlogd1;
+                jac[[4 * chunk + local_i, k]] = dq1_logphi;
+                jac[[5 * chunk + local_i, k]] = dlogqd1;
             }
         }
         Ok(jac)
@@ -18484,9 +18509,10 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeFlexBlockJacobian {
 pub struct ScoreWarpFlexBlockJacobian;
 
 impl crate::custom_family::BlockEffectiveJacobian for ScoreWarpFlexBlockJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &crate::custom_family::FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let flex: &SurvivalFlexFamilyScalars = state
             .family_scalars
@@ -18499,8 +18525,10 @@ impl crate::custom_family::BlockEffectiveJacobian for ScoreWarpFlexBlockJacobian
 
         let n = flex.score_warp_design.nrows();
         let p = flex.score_warp_design.ncols();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let chunk = rows.end - rows.start;
         if p == 0 || flex.h_len == 0 {
-            return Ok(Array2::<f64>::zeros((6 * n, p)));
+            return Ok(Array2::<f64>::zeros((6 * chunk, p)));
         }
         if flex.h_len != p {
             return Err(format!(
@@ -18510,9 +18538,10 @@ impl crate::custom_family::BlockEffectiveJacobian for ScoreWarpFlexBlockJacobian
         }
 
         const N_OUT: usize = 6;
-        let mut jac = Array2::<f64>::zeros((N_OUT * n, p));
+        let mut jac = Array2::<f64>::zeros((N_OUT * chunk, p));
 
-        for i in 0..n {
+        for i in rows.clone() {
+            let local_i = i - rows.start;
             let chi1 = flex.chi_exit[i];
             let d1 = flex.d_exit[i];
 
@@ -18537,10 +18566,10 @@ impl crate::custom_family::BlockEffectiveJacobian for ScoreWarpFlexBlockJacobian
                 };
                 // rows 4 and 5 (q1_logphi, log_qd1) are zero: q1, qd1 do not depend on β_h
 
-                jac[[i, k]] = deta0;
-                jac[[1 * n + i, k]] = deta1;
-                jac[[2 * n + i, k]] = dlogchi1;
-                jac[[3 * n + i, k]] = dlogd1;
+                jac[[local_i, k]] = deta0;
+                jac[[chunk + local_i, k]] = deta1;
+                jac[[2 * chunk + local_i, k]] = dlogchi1;
+                jac[[3 * chunk + local_i, k]] = dlogd1;
             }
         }
         Ok(jac)
@@ -18559,9 +18588,10 @@ impl crate::custom_family::BlockEffectiveJacobian for ScoreWarpFlexBlockJacobian
 pub struct LinkDevFlexBlockJacobian;
 
 impl crate::custom_family::BlockEffectiveJacobian for LinkDevFlexBlockJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &crate::custom_family::FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let flex: &SurvivalFlexFamilyScalars = state
             .family_scalars
@@ -18574,8 +18604,10 @@ impl crate::custom_family::BlockEffectiveJacobian for LinkDevFlexBlockJacobian {
 
         let n = flex.link_dev_design.nrows();
         let p = flex.link_dev_design.ncols();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let chunk = rows.end - rows.start;
         if p == 0 || flex.w_len == 0 {
-            return Ok(Array2::<f64>::zeros((6 * n, p)));
+            return Ok(Array2::<f64>::zeros((6 * chunk, p)));
         }
         if flex.w_len != p {
             return Err(format!(
@@ -18585,9 +18617,10 @@ impl crate::custom_family::BlockEffectiveJacobian for LinkDevFlexBlockJacobian {
         }
 
         const N_OUT: usize = 6;
-        let mut jac = Array2::<f64>::zeros((N_OUT * n, p));
+        let mut jac = Array2::<f64>::zeros((N_OUT * chunk, p));
 
-        for i in 0..n {
+        for i in rows.clone() {
+            let local_i = i - rows.start;
             let chi1 = flex.chi_exit[i];
             let d1 = flex.d_exit[i];
 
@@ -18609,10 +18642,10 @@ impl crate::custom_family::BlockEffectiveJacobian for LinkDevFlexBlockJacobian {
                     0.0
                 };
 
-                jac[[i, k]] = deta0;
-                jac[[1 * n + i, k]] = deta1;
-                jac[[2 * n + i, k]] = dlogchi1;
-                jac[[3 * n + i, k]] = dlogd1;
+                jac[[local_i, k]] = deta0;
+                jac[[chunk + local_i, k]] = deta1;
+                jac[[2 * chunk + local_i, k]] = dlogchi1;
+                jac[[3 * chunk + local_i, k]] = dlogd1;
             }
         }
         Ok(jac)
@@ -18729,12 +18762,15 @@ impl SmsTimewiggleTimeJacobian {
 }
 
 impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &crate::custom_family::FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let n = self.design_entry.nrows();
         let p = self.p_time;
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let chunk = rows.end - rows.start;
         let p_base = p.saturating_sub(self.p_tw);
 
         let beta = state.beta;
@@ -18775,9 +18811,10 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
         let knots = &self.time_wiggle_knots;
         let degree = self.time_wiggle_degree;
 
-        let mut jac = Array2::<f64>::zeros((3 * n, p));
+        let mut jac = Array2::<f64>::zeros((3 * chunk, p));
 
-        for i in 0..n {
+        for i in rows.clone() {
+            let local_i = i - rows.start;
             // c_i computed directly from logslope design and joint β_g.
             let g_i: f64 = beta_g
                 .iter()
@@ -18847,9 +18884,10 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
                 let xe = self.design_entry[[i, j]];
                 let xx = self.design_exit[[i, j]];
                 let xd = self.design_deriv[[i, j]];
-                jac[[i, j]] = c_i * entry_dq * xe;
-                jac[[n + i, j]] = c_i * exit_dq * xx;
-                jac[[2 * n + i, j]] = c_i * (exit_d2q * d_raw * xx + exit_dq * xd);
+                jac[[local_i, j]] = c_i * entry_dq * xe;
+                jac[[chunk + local_i, j]] = c_i * exit_dq * xx;
+                jac[[2 * chunk + local_i, j]] =
+                    c_i * (exit_d2q * d_raw * xx + exit_dq * xd);
             }
 
             // Wiggle tail columns.
@@ -18858,9 +18896,9 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
                 let b0 = entry_basis.as_ref().map_or(0.0, |b| b[[0, local_idx]]);
                 let b1 = exit_basis.as_ref().map_or(0.0, |b| b[[0, local_idx]]);
                 let bd1 = exit_basis_d1.as_ref().map_or(0.0, |b| b[[0, local_idx]]);
-                jac[[i, col]] = c_i * b0;
-                jac[[n + i, col]] = c_i * b1;
-                jac[[2 * n + i, col]] = c_i * bd1 * d_raw;
+                jac[[local_i, col]] = c_i * b0;
+                jac[[chunk + local_i, col]] = c_i * b1;
+                jac[[2 * chunk + local_i, col]] = c_i * bd1 * d_raw;
             }
         }
         Ok(jac)
@@ -18934,12 +18972,15 @@ impl SmsTimewiggleMarginalJacobian {
 }
 
 impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &crate::custom_family::FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let n = self.design_marginal.nrows();
         let p_m = self.design_marginal.ncols();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let chunk = rows.end - rows.start;
         let p_t = self.p_time;
         let p_base = p_t.saturating_sub(self.p_tw);
 
@@ -18970,9 +19011,10 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
         let knots = &self.time_wiggle_knots;
         let degree = self.time_wiggle_degree;
 
-        let mut jac = Array2::<f64>::zeros((3 * n, p_m));
+        let mut jac = Array2::<f64>::zeros((3 * chunk, p_m));
 
-        for i in 0..n {
+        for i in rows.clone() {
+            let local_i = i - rows.start;
             let g_i: f64 = beta_g
                 .iter()
                 .enumerate()
@@ -19028,9 +19070,9 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
 
             for j in 0..p_m {
                 let m_ij = self.design_marginal[[i, j]];
-                jac[[i, j]] = c_i * entry_dq * m_ij;
-                jac[[n + i, j]] = c_i * exit_dq * m_ij;
-                jac[[2 * n + i, j]] = c_i * exit_d2q * d_raw * m_ij;
+                jac[[local_i, j]] = c_i * entry_dq * m_ij;
+                jac[[chunk + local_i, j]] = c_i * exit_dq * m_ij;
+                jac[[2 * chunk + local_i, j]] = c_i * exit_d2q * d_raw * m_ij;
             }
         }
         Ok(jac)

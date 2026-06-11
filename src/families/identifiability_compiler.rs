@@ -12,6 +12,7 @@
 //! trailing pivots from the latest block when joint rank is lost.
 
 use std::sync::Arc;
+use std::ops::Range;
 
 use ndarray::{Array1, Array2, Array3, Axis, s};
 
@@ -105,6 +106,31 @@ pub trait RowJacobianOperator: Send + Sync {
         for i in 0..n {
             for ch in 0..k {
                 out[i * k + ch] = full[[i, col, ch]];
+            }
+        }
+    }
+
+    /// Write channel-flattened rows for `rows` into `out`.
+    ///
+    /// `out` has shape `(rows.len() * K, ncols)`, with row
+    /// `local_row * K + channel` holding `J[row, :, channel]`. The default
+    /// implementation materialises the full tensor for legacy operators; large
+    /// construction-time adapters override this to stream row chunks.
+    fn channel_flattened_rows(&self, rows: Range<usize>, out: &mut Array2<f64>) {
+        let n = self.nrows();
+        let start = rows.start.min(n);
+        let end = rows.end.min(n);
+        let chunk = end - start;
+        let k = self.k();
+        let p = self.ncols();
+        assert_eq!(out.shape(), &[chunk * k, p]);
+        let full = self.evaluate_full();
+        for local_i in 0..chunk {
+            let row = start + local_i;
+            for ch in 0..k {
+                for col in 0..p {
+                    out[[local_i * k + ch, col]] = full[[row, col, ch]];
+                }
             }
         }
     }

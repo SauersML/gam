@@ -12103,11 +12103,14 @@ struct BoundedEffectiveJacobian {
 }
 
 impl BlockEffectiveJacobian for BoundedEffectiveJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let p = self.design.ncols();
+        let n = self.design.nrows();
+        let rows = rows.start.min(n)..rows.end.min(n);
         if !state.beta.is_empty() {
             if state.beta.len() != p {
                 return Err(format!(
@@ -12123,7 +12126,7 @@ impl BlockEffectiveJacobian for BoundedEffectiveJacobian {
                 );
             }
         }
-        let mut jac = self.design.clone();
+        let mut jac = self.design.slice(ndarray::s![rows.start..rows.end, ..]).to_owned();
         for term in &self.bounded_terms {
             let theta = if state.beta.is_empty() {
                 0.0

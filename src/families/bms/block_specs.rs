@@ -117,9 +117,10 @@ impl BmsMarginalJacobian {
 }
 
 impl BlockEffectiveJacobian for BmsMarginalJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let beta = state.beta;
         let s = state.probit_frailty_scale;
@@ -133,6 +134,7 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
         let p_s_use = p_s_block.min(beta_s_raw.len());
         let beta_s = &beta_s_raw[..p_s_use];
         let n = self.marginal_dense.nrows();
+        let rows = rows.start.min(n)..rows.end.min(n);
         let p_block = self.marginal_dense.ncols();
 
         // ∂η_i/∂β_m = c_i · M[i,:], with c_i = sqrt(1 + (s·g_i)²) and
@@ -144,8 +146,8 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
         // logslope baseline and is generically nonzero).  There is no external
         // scalar this block cannot reconstruct, so the Jacobian is evaluated
         // directly from owned data with no caller-supplied contract.
-        let mut out = Array2::<f64>::zeros((n, p_block));
-        for i in 0..n {
+        let mut out = Array2::<f64>::zeros((rows.end - rows.start, p_block));
+        for i in rows.clone() {
             let g_i = self.offset_s[i]
                 + self
                     .logslope_dense
@@ -156,7 +158,7 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
             let c_i = (1.0 + sg * sg).sqrt();
             // J[i,:] = c_i · M[i,:]
             let m_row = self.marginal_dense.row(i);
-            out.row_mut(i).assign(&m_row.mapv(|x| c_i * x));
+            out.row_mut(i - rows.start).assign(&m_row.mapv(|x| c_i * x));
         }
         Ok(out)
     }
@@ -210,9 +212,10 @@ impl BmsLogslopeJacobian {
 }
 
 impl BlockEffectiveJacobian for BmsLogslopeJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let beta = state.beta;
         let s = state.probit_frailty_scale;
@@ -228,6 +231,7 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
         let p_s_use = p_s_block.min(beta_s_raw.len());
         let beta_s = &beta_s_raw[..p_s_use];
         let n = self.logslope_dense.nrows();
+        let rows = rows.start.min(n)..rows.end.min(n);
 
         // ∂η_i/∂β_s = (q_i · s²·g_i / c_i + s·z_i) · G[i,:] where
         //   q_i = M[i,:] · β_m + offset_m[i],
@@ -241,8 +245,8 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
         // (where g_i = offset_s[i] carries the nonzero fitted logslope
         // baseline).  The Jacobian is therefore evaluated directly from owned
         // data with no caller-supplied scalar contract.
-        let mut out = Array2::<f64>::zeros((n, p_s_block));
-        for i in 0..n {
+        let mut out = Array2::<f64>::zeros((rows.end - rows.start, p_s_block));
+        for i in rows.clone() {
             let q_i = self.offset_m[i]
                 + self
                     .marginal_dense
@@ -262,7 +266,7 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
             let factor = q_i * s * s * g_i / c_i + s * z_i;
             // J[i,:] = factor · G[i,:]
             let g_row = self.logslope_dense.row(i);
-            out.row_mut(i).assign(&g_row.mapv(|x| factor * x));
+            out.row_mut(i - rows.start).assign(&g_row.mapv(|x| factor * x));
         }
         Ok(out)
     }

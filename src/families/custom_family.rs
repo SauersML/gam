@@ -517,6 +517,20 @@ pub struct FamilyLinearizationState<'a> {
 /// - `jacobian_callback = None` → `design.clone()`.
 /// - `jacobian_callback = Some(cb)` → delegates to `cb.effective_jacobian_at`.
 pub trait BlockEffectiveJacobian: Send + Sync {
+    /// Stacked multi-output Jacobian for a contiguous observation row range.
+    ///
+    /// Shape: `(rows.len() * n_outputs, p_block)`, with the same channel-major
+    /// layout as [`Self::effective_jacobian_at`]: row
+    /// `channel * rows.len() + local_row` is `rows.start + local_row` in that
+    /// output channel. Implementations should keep this as the single source of
+    /// row math so large construction-time audits can stream chunks instead of
+    /// materialising all `n * p * K` entries at once.
+    fn effective_jacobian_rows(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, String>;
+
     /// Stacked multi-output Jacobian at the current β.
     ///
     /// Shape: `(n_rows * n_outputs, p_block)`, **channel-major**: rows
@@ -530,7 +544,10 @@ pub trait BlockEffectiveJacobian: Send + Sync {
     fn effective_jacobian_at(
         &self,
         state: &FamilyLinearizationState<'_>,
-    ) -> Result<Array2<f64>, String>;
+    ) -> Result<Array2<f64>, String> {
+        let full = self.effective_jacobian_rows(state, 0..usize::MAX)?;
+        Ok(full)
+    }
 
     /// Number of stacked output channels. 1 for most blocks.
     fn n_outputs(&self) -> usize {
@@ -564,12 +581,14 @@ pub struct AdditiveBlockJacobian {
 }
 
 impl BlockEffectiveJacobian for AdditiveBlockJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &FamilyLinearizationState<'_>,
+        rows: Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let n = self.design.nrows();
         let p = self.design.ncols();
+        let rows = clamp_jacobian_rows(rows, n);
         // Additive (linear) block: Jacobian is β-independent — design does
         // not depend on state.beta. Verify beta contains no NaN when provided.
         if !state.beta.is_empty() && state.beta.iter().any(|v| v.is_nan()) {
@@ -577,11 +596,12 @@ impl BlockEffectiveJacobian for AdditiveBlockJacobian {
                 "AdditiveBlockJacobian::effective_jacobian_at: beta contains NaN".to_string(),
             );
         }
-        let total_rows = self.n_family_outputs * n;
+        let chunk = rows.end - rows.start;
+        let total_rows = self.n_family_outputs * chunk;
         let mut jac = Array2::<f64>::zeros((total_rows, p));
-        let row_start = self.own_output * n;
-        jac.slice_mut(ndarray::s![row_start..row_start + n, ..])
-            .assign(&self.design);
+        let row_start = self.own_output * chunk;
+        jac.slice_mut(ndarray::s![row_start..row_start + chunk, ..])
+            .assign(&self.design.slice(ndarray::s![rows.start..rows.end, ..]));
         Ok(jac)
     }
 
@@ -603,11 +623,13 @@ pub struct RowScaledJacobian {
 }
 
 impl BlockEffectiveJacobian for RowScaledJacobian {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &FamilyLinearizationState<'_>,
+        rows: Range<usize>,
     ) -> Result<Array2<f64>, String> {
         let n = self.design.nrows();
+        let rows = clamp_jacobian_rows(rows, n);
         if self.eta_scaling.len() != n {
             return Err(format!(
                 "RowScaledJacobian: eta_scaling length {} != design nrows {}",
@@ -622,11 +644,14 @@ impl BlockEffectiveJacobian for RowScaledJacobian {
                 "RowScaledJacobian::effective_jacobian_at: state.beta contains NaN".to_string(),
             );
         }
-        let mut scaled = self.design.as_ref().clone();
-        for i in 0..n {
-            let s = self.eta_scaling[i];
+        let mut scaled = self
+            .design
+            .slice(ndarray::s![rows.start..rows.end, ..])
+            .to_owned();
+        for local_i in 0..scaled.nrows() {
+            let s = self.eta_scaling[rows.start + local_i];
             for j in 0..scaled.ncols() {
-                scaled[[i, j]] *= s;
+                scaled[[local_i, j]] *= s;
             }
         }
         Ok(scaled)
@@ -635,6 +660,12 @@ impl BlockEffectiveJacobian for RowScaledJacobian {
     fn eta_row_scaling_for_skewness(&self) -> Option<Arc<[f64]>> {
         Some(Arc::clone(&self.eta_scaling))
     }
+}
+
+fn clamp_jacobian_rows(rows: Range<usize>, n: usize) -> Range<usize> {
+    let start = rows.start.min(n);
+    let end = rows.end.min(n);
+    start..end.max(start)
 }
 
 /// Static specification for one parameter block in a custom family.
