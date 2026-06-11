@@ -42,7 +42,7 @@
 use ndarray::Array2;
 
 use crate::families::cubic_cell_kernel::{
-    DenestedCubicCell, LocalSpanCubic, denested_cell_coefficients,
+    DenestedCubicCell, LocalSpanCubic, PartitionEdge, denested_cell_coefficients,
     evaluate_cell_derivative_moments_uncached,
 };
 
@@ -59,33 +59,16 @@ pub const FAMILY_SPOT_RTOL: f64 = 1.0e-11;
 /// Number of deterministic off-grid interior spot-check points.
 pub const FAMILY_SPOT_CHECK_POINTS: usize = 3;
 
-/// One endpoint of a family cell: a fixed z location (a score break or ±∞
-/// for tail cells) or a link-knot crossing whose z location depends on the
-/// row's `(a, b)`.
-#[derive(Clone, Copy, Debug)]
-pub enum CellEdge {
-    Fixed(f64),
-    Crossing { tau: f64 },
-}
-
-impl CellEdge {
-    #[inline]
-    fn z_at(self, a: f64, b: f64) -> f64 {
-        match self {
-            Self::Fixed(z) => z,
-            Self::Crossing { tau } => (tau - a) / b,
-        }
-    }
-}
-
 /// A fixed `(score_span, link_span, edge-pair)` combination whose moments
-/// form a smooth two-parameter family in the row scalars `(a, b)`.
+/// form a smooth two-parameter family in the row scalars `(a, b)`. Edge
+/// provenance is the kernel's [`PartitionEdge`], carried per cell by
+/// `build_denested_partition_cells_with_tails`.
 #[derive(Clone, Copy, Debug)]
 pub struct CellMomentFamilySpec {
     pub score_span: LocalSpanCubic,
     pub link_span: LocalSpanCubic,
-    pub left: CellEdge,
-    pub right: CellEdge,
+    pub left: PartitionEdge,
+    pub right: PartitionEdge,
     pub max_degree: usize,
 }
 
@@ -362,8 +345,8 @@ mod tests {
                 c2: -0.05,
                 c3: 0.02,
             },
-            left: CellEdge::Fixed(-0.4),
-            right: CellEdge::Crossing { tau: 1.1 },
+            left: PartitionEdge::Fixed(-0.4),
+            right: PartitionEdge::Crossing { tau: 1.1 },
             max_degree,
         }
     }
@@ -415,7 +398,7 @@ mod tests {
         // Both edges fixed: the family varies only through the cell cubic's
         // (a, b) dependence — even smoother, so a small grid certifies.
         let mut spec = test_spec(9);
-        spec.right = CellEdge::Fixed(0.9);
+        spec.right = PartitionEdge::Fixed(0.9);
         let family = ChebMomentFamily::build(&spec, (-0.3, 0.5), (0.7, 1.4), 8)
             .expect("build must succeed")
             .expect("fixed-edge family must certify at m=8");
