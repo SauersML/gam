@@ -163,8 +163,10 @@ impl RowSet {
     /// accumulator, `fold` is the per-row update, `reduce` combines two
     /// accumulators.
     ///
-    /// Returns the reduced result. No `Vec` is allocated per call; both
-    /// branches feed rayon fixed-size row chunks.
+    /// Returns the reduced result. Both branches process fixed-size row chunks
+    /// in parallel, then combine the chunk accumulators in chunk-index order on
+    /// the caller thread. The resulting floating-point reduction tree is fixed
+    /// across Rayon worker counts and work-stealing decisions.
     #[inline]
     pub fn par_reduce_fold<T, I, F, R>(&self, n_total: usize, init: I, fold: F, reduce: R) -> T
     where
@@ -174,32 +176,47 @@ impl RowSet {
         R: Fn(T, T) -> T + Send + Sync,
     {
         match self {
-            Self::All => (0..arrow_row_chunk_count(n_total))
-                .into_par_iter()
-                .map(|chunk_idx| {
-                    let start = chunk_idx * ARROW_ROW_CHUNK;
-                    let end = (start + ARROW_ROW_CHUNK).min(n_total);
-                    let mut acc = init();
-                    for i in start..end {
-                        acc = fold(acc, i, 1.0);
-                    }
-                    acc
-                })
-                .reduce(&init, &reduce),
-            Self::Subsample { rows, .. } => rows
-                .par_chunks(ARROW_ROW_CHUNK)
-                .map(|chunk| {
-                    let mut acc = init();
-                    for r in chunk {
-                        acc = fold(acc, r.index, r.weight);
-                    }
-                    acc
-                })
-                .reduce(&init, &reduce),
+            Self::All => {
+                let chunk_accumulators: Vec<T> = (0..arrow_row_chunk_count(n_total))
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * ARROW_ROW_CHUNK;
+                        let end = (start + ARROW_ROW_CHUNK).min(n_total);
+                        let mut acc = init();
+                        for i in start..end {
+                            acc = fold(acc, i, 1.0);
+                        }
+                        acc
+                    })
+                    .collect();
+                let mut total = init();
+                for acc in chunk_accumulators {
+                    total = reduce(total, acc);
+                }
+                total
+            }
+            Self::Subsample { rows, .. } => {
+                let chunk_accumulators: Vec<T> = rows
+                    .par_chunks(ARROW_ROW_CHUNK)
+                    .map(|chunk| {
+                        let mut acc = init();
+                        for r in chunk {
+                            acc = fold(acc, r.index, r.weight);
+                        }
+                        acc
+                    })
+                    .collect();
+                let mut total = init();
+                for acc in chunk_accumulators {
+                    total = reduce(total, acc);
+                }
+                total
+            }
         }
     }
 
-    /// Parallel try-fold-reduce: short-circuits on the first `Err`.
+    /// Parallel try-fold over fixed-size row chunks, followed by deterministic
+    /// chunk-index-order reduction on the caller thread.
     #[inline]
     pub fn par_try_reduce_fold<T, E, I, F, R>(
         &self,
@@ -216,30 +233,60 @@ impl RowSet {
         R: Fn(T, T) -> Result<T, E> + Send + Sync,
     {
         match self {
-            Self::All => (0..arrow_row_chunk_count(n_total))
-                .into_par_iter()
-                .map(|chunk_idx| {
-                    let start = chunk_idx * ARROW_ROW_CHUNK;
-                    let end = (start + ARROW_ROW_CHUNK).min(n_total);
-                    let mut acc = init();
-                    for i in start..end {
-                        acc = fold(acc, i, 1.0)?;
-                    }
-                    Ok::<T, E>(acc)
-                })
-                .try_reduce(&init, &reduce),
-            Self::Subsample { rows, .. } => rows
-                .par_chunks(ARROW_ROW_CHUNK)
-                .map(|chunk| {
-                    let mut acc = init();
-                    for r in chunk {
-                        acc = fold(acc, r.index, r.weight)?;
-                    }
-                    Ok::<T, E>(acc)
-                })
-                .try_reduce(&init, &reduce),
+            Self::All => {
+                let chunk_accumulators: Vec<Result<T, E>> = (0..arrow_row_chunk_count(n_total))
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * ARROW_ROW_CHUNK;
+                        let end = (start + ARROW_ROW_CHUNK).min(n_total);
+                        let mut acc = init();
+                        for i in start..end {
+                            acc = fold(acc, i, 1.0)?;
+                        }
+                        Ok(acc)
+                    })
+                    .collect();
+                let mut total = init();
+                for acc in chunk_accumulators {
+                    total = reduce(total, acc?)?;
+                }
+                Ok(total)
+            }
+            Self::Subsample { rows, .. } => {
+                let chunk_accumulators: Vec<Result<T, E>> = rows
+                    .par_chunks(ARROW_ROW_CHUNK)
+                    .map(|chunk| {
+                        let mut acc = init();
+                        for r in chunk {
+                            acc = fold(acc, r.index, r.weight)?;
+                        }
+                        Ok(acc)
+                    })
+                    .collect();
+                let mut total = init();
+                for acc in chunk_accumulators {
+                    total = reduce(total, acc?)?;
+                }
+                Ok(total)
+            }
         }
     }
+}
+
+#[inline]
+fn deterministic_chunked_sum<F>(n_items: usize, map_chunk: F) -> f64
+where
+    F: Fn(usize) -> f64 + Send + Sync,
+{
+    let partials: Vec<f64> = (0..arrow_row_chunk_count(n_items))
+        .into_par_iter()
+        .map(map_chunk)
+        .collect();
+    let mut total = 0.0_f64;
+    for partial in partials {
+        total += partial;
+    }
+    total
 }
 
 // ── Trait ────────────────────────────────────────────────────────────
@@ -1089,43 +1136,41 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
         assert_eq!(jf.dim(), (n_rows, K * rank));
         let direction = self.direction.as_slice();
 
-        (0..arrow_row_chunk_count(n_rows))
-            .into_par_iter()
-            .map(|chunk_idx| -> f64 {
-                let start = chunk_idx * ARROW_ROW_CHUNK;
-                let end = (start + ARROW_ROW_CHUNK).min(n_rows);
-                let mut chunk_total = 0.0_f64;
-                for row in start..end {
-                    let dir_k = self.kern.jacobian_action(row, direction);
-                    let third = self.kern.row_third_contracted(row, &dir_k).expect(
-                        "row-kernel third contraction should succeed for validated directions",
-                    );
-                    let jf_row = jf.row(row);
-                    let jf_slice = jf_row
-                        .to_slice()
-                        .expect("J·F is built standard-layout (row-major)");
-                    let mut row_total = 0.0_f64;
-                    for k_col in 0..rank {
-                        let mut vec_k = [0.0_f64; K];
-                        for k in 0..K {
-                            vec_k[k] = jf_slice[k * rank + k_col];
-                        }
-                        // (T_r vec_k)^T vec_k — K is a const-generic small int.
-                        let mut quad = 0.0_f64;
-                        for a in 0..K {
-                            let mut t_dot = 0.0_f64;
-                            for b in 0..K {
-                                t_dot += third[a][b] * vec_k[b];
-                            }
-                            quad += vec_k[a] * t_dot;
-                        }
-                        row_total += quad;
+        deterministic_chunked_sum(n_rows, |chunk_idx| -> f64 {
+            let start = chunk_idx * ARROW_ROW_CHUNK;
+            let end = (start + ARROW_ROW_CHUNK).min(n_rows);
+            let mut chunk_total = 0.0_f64;
+            for row in start..end {
+                let dir_k = self.kern.jacobian_action(row, direction);
+                let third = self
+                    .kern
+                    .row_third_contracted(row, &dir_k)
+                    .expect("row-kernel third contraction should succeed for validated directions");
+                let jf_row = jf.row(row);
+                let jf_slice = jf_row
+                    .to_slice()
+                    .expect("J·F is built standard-layout (row-major)");
+                let mut row_total = 0.0_f64;
+                for k_col in 0..rank {
+                    let mut vec_k = [0.0_f64; K];
+                    for k in 0..K {
+                        vec_k[k] = jf_slice[k * rank + k_col];
                     }
-                    chunk_total += row_total;
+                    // (T_r vec_k)^T vec_k — K is a const-generic small int.
+                    let mut quad = 0.0_f64;
+                    for a in 0..K {
+                        let mut t_dot = 0.0_f64;
+                        for b in 0..K {
+                            t_dot += third[a][b] * vec_k[b];
+                        }
+                        quad += vec_k[a] * t_dot;
+                    }
+                    row_total += quad;
                 }
-                chunk_total
-            })
-            .sum()
+                chunk_total += row_total;
+            }
+            chunk_total
+        })
     }
 }
 
@@ -1263,43 +1308,40 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
         let direction_u = self.direction_u.as_slice();
         let direction_v = self.direction_v.as_slice();
 
-        (0..arrow_row_chunk_count(n_rows))
-            .into_par_iter()
-            .map(|chunk_idx| -> f64 {
-                let start = chunk_idx * ARROW_ROW_CHUNK;
-                let end = (start + ARROW_ROW_CHUNK).min(n_rows);
-                let mut chunk_total = 0.0_f64;
-                for row in start..end {
-                    let dir_u = self.kern.jacobian_action(row, direction_u);
-                    let dir_v = self.kern.jacobian_action(row, direction_v);
-                    let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
-                        "row-kernel fourth contraction should succeed for validated directions",
-                    );
-                    let jf_row = jf.row(row);
-                    let jf_slice = jf_row
-                        .to_slice()
-                        .expect("J·F is built standard-layout (row-major)");
-                    let mut row_total = 0.0_f64;
-                    for k_col in 0..rank {
-                        let mut vec_k = [0.0_f64; K];
-                        for k in 0..K {
-                            vec_k[k] = jf_slice[k * rank + k_col];
-                        }
-                        let mut quad = 0.0_f64;
-                        for a in 0..K {
-                            let mut t_dot = 0.0_f64;
-                            for b in 0..K {
-                                t_dot += fourth[a][b] * vec_k[b];
-                            }
-                            quad += vec_k[a] * t_dot;
-                        }
-                        row_total += quad;
+        deterministic_chunked_sum(n_rows, |chunk_idx| -> f64 {
+            let start = chunk_idx * ARROW_ROW_CHUNK;
+            let end = (start + ARROW_ROW_CHUNK).min(n_rows);
+            let mut chunk_total = 0.0_f64;
+            for row in start..end {
+                let dir_u = self.kern.jacobian_action(row, direction_u);
+                let dir_v = self.kern.jacobian_action(row, direction_v);
+                let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
+                    "row-kernel fourth contraction should succeed for validated directions",
+                );
+                let jf_row = jf.row(row);
+                let jf_slice = jf_row
+                    .to_slice()
+                    .expect("J·F is built standard-layout (row-major)");
+                let mut row_total = 0.0_f64;
+                for k_col in 0..rank {
+                    let mut vec_k = [0.0_f64; K];
+                    for k in 0..K {
+                        vec_k[k] = jf_slice[k * rank + k_col];
                     }
-                    chunk_total += row_total;
+                    let mut quad = 0.0_f64;
+                    for a in 0..K {
+                        let mut t_dot = 0.0_f64;
+                        for b in 0..K {
+                            t_dot += fourth[a][b] * vec_k[b];
+                        }
+                        quad += vec_k[a] * t_dot;
+                    }
+                    row_total += quad;
                 }
-                chunk_total
-            })
-            .sum()
+                chunk_total += row_total;
+            }
+            chunk_total
+        })
     }
 }
 
