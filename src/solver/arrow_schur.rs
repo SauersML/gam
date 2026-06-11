@@ -7202,6 +7202,11 @@ fn cholesky_lower(a: &Array2<f64>) -> Result<Array2<f64>, String> {
         ));
     }
 
+    let mut maybe_device = a.clone();
+    if crate::gpu::try_cholesky_lower_inplace(&mut maybe_device).is_some() {
+        return Ok(maybe_device);
+    }
+
     let mut l = Array2::<f64>::zeros((n, n));
     for i in 0..n {
         for j in 0..=i {
