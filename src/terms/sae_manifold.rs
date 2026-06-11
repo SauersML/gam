@@ -13413,6 +13413,54 @@ fn batched_smooth_sb(
         .collect()
 }
 
+/// A detected bifurcation on the curvature-homotopy branch (#1007): the arrow
+/// factor's smallest Cholesky pivot collapsed below the safe-SPD tolerance at a
+/// homotopy parameter `η`, so the optimal branch the tracker was following lost
+/// strict positive-definiteness. Recorded on [`CurvatureWalkReport`] and never
+/// silent — the walk returns control to the documented multi-seed cascade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurvatureBifurcation {
+    /// Homotopy parameter at which the pivot collapsed.
+    pub eta: f64,
+    /// The smallest arrow-factor pivot observed at `eta` (Hessian-scale, i.e.
+    /// squared lower-Cholesky diagonal); below the safe-SPD floor.
+    pub min_pivot: f64,
+}
+
+/// Outcome of one certified curvature-homotopy entry walk (#1007).
+///
+/// The tracker walks the basis curvature dial `η` from the Eckart-Young anchor
+/// (`η = 0`, global by construction) to the full curved basis (`η = 1`),
+/// predictor-corrector style, holding the per-pivot positivity invariant. This
+/// report makes the outcome observable on the fit payload: `arrived` says the
+/// walk reached `η = 1` on the certified branch; `bifurcation` records the first
+/// detected pivot collapse (if any); `collapse_events` mirrors the inner active
+/// -mass guard's verdict at the arrival state; `eta_steps` / `step_halvings`
+/// are the walk's cost. A walk that did not arrive (degenerate anchor or a
+/// recorded bifurcation) hands control back to the multi-seed cascade.
+#[derive(Debug, Clone)]
+pub struct CurvatureWalkReport {
+    /// Whether the walk reached `η = 1` on the certified optimal branch.
+    pub arrived: bool,
+    /// Eckart-Young anchor residual energy at `η = 0` (the certificate the
+    /// linear relaxation is solved to).
+    pub anchor_residual_norm_sq: f64,
+    /// First detected branch bifurcation (pivot collapse), or `None` when the
+    /// pivot stayed strictly positive across the whole walk.
+    pub bifurcation: Option<CurvatureBifurcation>,
+    /// Number of accepted `η` waypoints (anchor → 1).
+    pub eta_steps: usize,
+    /// Number of `η`-step halvings forced by a shrinking min-pivot.
+    pub step_halvings: usize,
+    /// Number of inner active-mass collapse events recorded at the arrival
+    /// state (the same `#976` guard ledger the cascade reads); a clean walk
+    /// arrives with this empty.
+    pub collapse_events: usize,
+    /// Number of scaffold re-seeds the walk itself triggered. A certified walk
+    /// from the global anchor reaches `η = 1` with zero reseeds.
+    pub reseeds: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct LinearSpanAtomAnchor {
     pub gate_weight: f64,

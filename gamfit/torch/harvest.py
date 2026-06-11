@@ -450,6 +450,7 @@ def save_harvest_shard(shard: HarvestShard, path: str | Path) -> str:
         U=np.ascontiguousarray(shard.U, dtype=np.float32),
         mass_residual=np.ascontiguousarray(shard.mass_residual, dtype=np.float32),
         rank=np.int64(shard.rank),
+        provenance=np.str_(shard.provenance),
     )
     return str(out)
 
@@ -469,9 +470,20 @@ def load_harvest_shard(path: str | Path) -> dict[str, Any]:
         if suffixed.exists():
             target = suffixed
     npz = np.load(target)
+    # `provenance` is absent in pre-#980 shards on disk; default to the
+    # same-position metric so old shards load unchanged.
+    provenance = (
+        str(npz["provenance"].item()) if "provenance" in npz.files else "output_fisher"
+    )
+    if provenance not in _HARVEST_PROVENANCES:
+        raise ValueError(
+            f"harvest shard at {target} has unknown provenance {provenance!r}; "
+            f"expected one of {sorted(_HARVEST_PROVENANCES)}"
+        )
     return {
         "X": np.asarray(npz["X"], dtype=np.float64),
         "U": np.asarray(npz["U"], dtype=np.float64),
         "mass_residual": np.asarray(npz["mass_residual"], dtype=np.float64),
         "rank": int(npz["rank"].item()),
+        "provenance": provenance,
     }

@@ -62,4 +62,8 @@ pub use sae_manifold::{
     ScheduleKind, SphereChartEvaluator, TorusHarmonicEvaluator, dictionary_incoherence_report,
     dictionary_incoherence_report_with_dispersion,
 };
+pub use sae_encode_atlas::{
+    AtlasConfig, AtomEncodeAtlas, BasisHessianLipschitz, CertifiedChart, ChartRegion, EncodeAtlas,
+    EncodeResult, KANTOROVICH_THRESHOLD, RowCertificate, row_certificate,
+};
 pub use sheaf::{EdgeRestriction, SheafConsistencyPenalty};
