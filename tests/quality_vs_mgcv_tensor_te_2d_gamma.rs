@@ -48,7 +48,7 @@ use rand_distr::{Distribution, Gamma, Uniform};
 use std::f64::consts::PI;
 use std::path::Path;
 
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_r};
 
 // MASS `crabs`: Leptograpsus crab morphometrics. Columns we use are FL (frontal
 // lobe size, mm), RW (rear width, mm), CW (carapace width, mm) — all strictly
@@ -69,21 +69,6 @@ fn gamma_deviance_mean(y: &[f64], mu: &[f64]) -> f64 {
         })
         .sum();
     s / y.len().max(1) as f64
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
-/// held-out covariate can ride along as a column of the reference data.frame;
-/// only the first `v.len()` entries are read back inside the R body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }
 
 const SHAPE: f64 = 4.0;

@@ -28,7 +28,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, held_out_r2, pad_to, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -292,18 +292,6 @@ fn gam_factor_smooth_fs_recovers_truth() {
 
 const SLEEPSTUDY_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/sleepstudy.csv");
 
-/// Coefficient of determination of `pred` vs observed `truth`, relative to the
-/// mean predictor: `1 - SS_res/SS_tot`. R^2 = 1 perfect, 0 = grand-mean, < 0
-/// worse than the mean.
-fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
-    let n = truth.len() as f64;
-    let mean = truth.iter().sum::<f64>() / n;
-    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
-    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
-    1.0 - ss_res / ss_tot.max(1e-300)
-}
-
 #[test]
 fn gam_factor_smooth_fs_recovers_truth_on_real_data() {
     init_parallelism();
@@ -491,19 +479,4 @@ fn gam_factor_smooth_fs_recovers_truth_on_real_data() {
         gam_edf > 1.0 && gam_edf < 120.0,
         "gam effective dof out of sane range: {gam_edf:.3}"
     );
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so it
-/// can ride along as a column of the reference data.frame. Only the first
-/// `v.len()` entries are read back inside the R body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }

@@ -43,7 +43,7 @@ use gam::families::sigma_link::logb_sigma_from_eta_scalar;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::solver::estimate::BlockRole;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, held_out_r2, pad_to, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -345,31 +345,6 @@ fn gaussian_nll(mean: &[f64], sigma: &[f64], truth: &[f64]) -> f64 {
         })
         .sum();
     total / n
-}
-
-/// Coefficient of determination of `pred` vs observed `truth`, mean baseline.
-fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
-    let n = truth.len() as f64;
-    let mean = truth.iter().sum::<f64>() / n;
-    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
-    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
-    1.0 - ss_res / ss_tot.max(1e-300)
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
-/// short test column can ride along inside the equal-length reference
-/// data.frame. Only the first `v.len()` entries are read back in the R body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }
 
 #[test]

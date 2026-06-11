@@ -54,7 +54,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, pad_to, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -323,21 +323,6 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
          > ref_err+0.05={:.4}",
         ref_log_sigma_err + 0.05
     );
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
-/// test-length covariate can ride along as a column of the train-length
-/// reference data.frame. Only the first `v.len()` entries are read back in R.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }
 
 /// Standard normal CDF via the error function (Abramowitz & Stegun 7.1.26-grade
