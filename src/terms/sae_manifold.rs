@@ -5329,12 +5329,24 @@ impl SaeManifoldTerm {
                 for row in 0..n {
                     activations[row] = assignments[[row, k]];
                 }
+                // Second jet Φ'' (#998): supplied when the atom's evaluator
+                // exposes an analytic Hessian, so a pin-active fit can lower its
+                // orbit-space isometry penalty operator (the metric-change of the
+                // pullback gram differentiates Φ' through t). Absent ⇒ the orbit
+                // verdict stays on the data residual / no-pin path, never an
+                // error.
+                let basis_second_jet = atom
+                    .basis_evaluator
+                    .as_ref()
+                    .and_then(|evaluator| evaluator.second_jet_dyn(coords.view()))
+                    .and_then(|res| res.ok());
                 Some(crate::sae_identifiability::AtomParameterView {
                     basis_values: atom.basis_values.clone(),
                     basis_jacobian: atom.basis_jacobian.clone(),
                     decoder: atom.decoder_coefficients.clone(),
                     coords,
                     activations,
+                    basis_second_jet,
                 })
             })
             .collect()
@@ -11317,6 +11329,17 @@ impl SaeManifoldTerm {
         &self.collapse_events
     }
 
+    /// Record an externally-observed collapse event on this term's guard ledger
+    /// (#976/#997). The joint fit appends its own events during
+    /// [`Self::run_joint_fit_arrow_schur`]; this lets a structure-search driver
+    /// (or a streaming chunk loop reconciling per-chunk guard outcomes) feed a
+    /// collapse observation back onto the term so the next
+    /// [`crate::solver::structure_harvest::harvest_move_proposals`] pass sees it
+    /// as a death trigger.
+    pub fn record_collapse_event(&mut self, event: CollapseEvent) {
+        self.collapse_events.push(event);
+    }
+
     /// Set the curvature-homotopy dial `η ∈ [0, 1]` on every atom (#1007). At
     /// the default `η = 1` the basis is the full curved basis; `η = 0` is the
     /// linear (Eckart-Young) relaxation. The next `refresh_basis` — which every
@@ -13295,6 +13318,14 @@ impl SaeManifoldOuterObjective {
     /// Schur factor, scaling by the Gaussian reconstruction dispersion `φ̂`.
     /// The term is already at the optimum after the outer fit, so the inner
     /// re-solve converges immediately. Call before [`Self::into_fitted`].
+    /// The most recent curvature-homotopy entry walk outcome on the live term
+    /// (#1007), or `None` when no walk has run. Surfaced on the objective so the
+    /// arrival / bifurcation / collapse outcome is observable without consuming
+    /// the objective via [`Self::into_fitted`].
+    pub fn curvature_walk_report(&self) -> Option<&CurvatureWalkReport> {
+        self.term.curvature_walk_report()
+    }
+
     pub fn decoder_shape_uncertainty(&mut self) -> Result<SaeShapeUncertainty, String> {
         let rho = self.current_rho.clone();
         let (_cost, loss, cache) = self.term.reml_criterion_with_cache(
