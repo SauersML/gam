@@ -532,6 +532,52 @@ where
     Ok(local[0][0].mapv(|v| v.max(0.0).sqrt()))
 }
 
+#[derive(Clone, Copy)]
+struct LinkWiggleGradientLayout {
+    p_main: usize,
+    p_total: usize,
+    wiggle_col_start: usize,
+}
+
+fn link_wiggle_eta_se_from_backend(
+    backend: &PredictionCovarianceBackend<'_>,
+    n_rows: usize,
+    design: &DesignMatrix,
+    q0_base: &Array1<f64>,
+    runtime: &SavedLinkWiggleRuntime,
+    layout: LinkWiggleGradientLayout,
+    dimension_label: &str,
+) -> Result<Array1<f64>, EstimationError> {
+    if backend.nrows() != layout.p_total {
+        return Err(EstimationError::InvalidInput(format!(
+            "{dimension_label}: expected parameter dimension {}, got {}",
+            layout.p_total,
+            backend.nrows()
+        )));
+    }
+    let p_w = runtime.beta.len();
+    linear_predictor_se_from_backend(backend, n_rows, |rows| {
+        let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
+        let x_main = design_row_chunk(design, rows.clone())?;
+        let wiggle_design = runtime.design(&q0_chunk)?;
+        let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
+        let rows_in_chunk = q0_chunk.len();
+        let mut grad = Array2::<f64>::zeros((rows_in_chunk, layout.p_total));
+        for i in 0..rows_in_chunk {
+            let dqi = dq_dq0[i];
+            for j in 0..layout.p_main {
+                grad[[i, j]] = dqi * x_main[[i, j]];
+            }
+        }
+        grad.slice_mut(ndarray::s![
+            ..,
+            layout.wiggle_col_start..layout.wiggle_col_start + p_w
+        ])
+        .assign(&wiggle_design);
+        Ok(vec![grad])
+    })
+}
+
 fn padded_design_standard_errors_from_backend(
     design: &DesignMatrix,
     backend: &PredictionCovarianceBackend<'_>,
@@ -819,30 +865,19 @@ impl StandardPredictor {
         let p_main = self.beta.len();
         let p_w = runtime.beta.len();
         let p_total = p_main + p_w;
-        if backend.nrows() != p_total {
-            return Err(EstimationError::InvalidInput(format!(
-                "standard link-wiggle covariance dimension mismatch: expected parameter dimension {}, got {}",
+        let eta_se = link_wiggle_eta_se_from_backend(
+            backend,
+            eta.len(),
+            &input.design,
+            &eta_base,
+            runtime,
+            LinkWiggleGradientLayout {
+                p_main,
                 p_total,
-                backend.nrows()
-            )));
-        }
-        let eta_se = linear_predictor_se_from_backend(backend, eta.len(), |rows| {
-            let q0_chunk = eta_base.slice(ndarray::s![rows.clone()]).to_owned();
-            let x_main = design_row_chunk(&input.design, rows.clone())?;
-            let wiggle_design = runtime.design(&q0_chunk)?;
-            let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
-            let rows_in_chunk = q0_chunk.len();
-            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-            for i in 0..rows_in_chunk {
-                let dqi = dq_dq0[i];
-                for j in 0..p_main {
-                    grad[[i, j]] = dqi * x_main[[i, j]];
-                }
-            }
-            grad.slice_mut(ndarray::s![.., p_main..p_total])
-                .assign(&wiggle_design);
-            Ok(vec![grad])
-        })?;
+                wiggle_col_start: p_main,
+            },
+            "standard link-wiggle covariance dimension mismatch",
+        )?;
         let mean_se = delta_method_mean_se_from_d1(&dmu_deta, &eta_se);
         Ok((eta, mean, eta_se, mean_se))
     }
@@ -878,29 +913,19 @@ impl StandardPredictor {
         let p_main = self.beta.len();
         let p_w = runtime.beta.len();
         let p_total = p_main + p_w;
-        if backend.nrows() != p_total {
-            return Err(EstimationError::InvalidInput(format!(
-                "standard link-wiggle posterior mean covariance mismatch: expected parameter dimension {}, got {}",
+        let eta_se = link_wiggle_eta_se_from_backend(
+            &backend,
+            plugin.eta.len(),
+            &input.design,
+            &eta_base,
+            runtime,
+            LinkWiggleGradientLayout {
+                p_main,
                 p_total,
-                backend.nrows()
-            )));
-        }
-        let eta_se = linear_predictor_se_from_backend(&backend, plugin.eta.len(), |rows| {
-            let q0_chunk = eta_base.slice(ndarray::s![rows.clone()]).to_owned();
-            let x_main = design_row_chunk(&input.design, rows.clone())?;
-            let wiggle_design = runtime.design(&q0_chunk)?;
-            let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
-            let rows_in_chunk = q0_chunk.len();
-            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-            for i in 0..rows_in_chunk {
-                for j in 0..p_main {
-                    grad[[i, j]] = dq_dq0[i] * x_main[[i, j]];
-                }
-            }
-            grad.slice_mut(ndarray::s![.., p_main..p_total])
-                .assign(&wiggle_design);
-            Ok(vec![grad])
-        })?;
+                wiggle_col_start: p_main,
+            },
+            "standard link-wiggle posterior mean covariance mismatch",
+        )?;
         let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
         let quadctx = crate::quadrature::QuadratureContext::new();
         let mean = plugin
@@ -1057,50 +1082,19 @@ impl PredictableModel for StandardPredictor {
                 let p_main = self.beta.len();
                 let p_w = runtime.beta.len();
                 let p_total = p_main + p_w;
-                if backend.nrows() != p_total {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "standard link-wiggle covariance dimension mismatch: expected parameter dimension {}, got {}",
+                link_wiggle_eta_se_from_backend(
+                    &backend,
+                    result.eta.len(),
+                    &input.design,
+                    &eta_base,
+                    runtime,
+                    LinkWiggleGradientLayout {
+                        p_main,
                         p_total,
-                        backend.nrows()
-                    )));
-                }
-                linear_predictor_se_from_backend(&backend, result.eta.len(), |rows| {
-                    let q0_chunk = eta_base.slice(ndarray::s![rows.clone()]).to_owned();
-                    let x_main = design_row_chunk(&input.design, rows.clone())?;
-                    let wiggle_design = runtime.design(&q0_chunk)?;
-                    let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
-                    let rows_in_chunk = q0_chunk.len();
-                    let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-                    {
-                        let grad_slice = grad.as_slice_mut().expect("row-major grad is contiguous");
-                        if let (Some(x_all), Some(dq_all)) = (x_main.as_slice(), dq_dq0.as_slice())
-                        {
-                            for i in 0..rows_in_chunk {
-                                let dqi = dq_all[i];
-                                let src_off = i * p_main;
-                                let src_row = &x_all[src_off..src_off + p_main];
-                                let dst_off = i * p_total;
-                                let dst_row = &mut grad_slice[dst_off..dst_off + p_main];
-                                for j in 0..p_main {
-                                    dst_row[j] = dqi * src_row[j];
-                                }
-                            }
-                        } else {
-                            for i in 0..rows_in_chunk {
-                                let dqi = dq_dq0[i];
-                                let xrow = x_main.row(i);
-                                let dst_off = i * p_total;
-                                let dst_row = &mut grad_slice[dst_off..dst_off + p_main];
-                                for (j, xij) in xrow.iter().enumerate() {
-                                    dst_row[j] = dqi * xij;
-                                }
-                            }
-                        }
-                    }
-                    grad.slice_mut(ndarray::s![.., p_main..p_total])
-                        .assign(&wiggle_design);
-                    Ok(vec![grad])
-                })?
+                        wiggle_col_start: p_main,
+                    },
+                    "standard link-wiggle covariance dimension mismatch",
+                )?
             } else {
                 eta_standard_errors_from_backend(&input.design, &backend)?
             };
@@ -3632,22 +3626,19 @@ impl GaussianLocationScalePredictor {
         }
         if let Some(runtime) = self.link_wiggle.as_ref() {
             let eta_base = input.design.dot(&self.beta_mu) + &input.offset;
-            linear_predictor_se_from_backend(backend, eta_len, |rows| {
-                let q0_chunk = eta_base.slice(ndarray::s![rows.clone()]).to_owned();
-                let x_mu = design_row_chunk(&input.design, rows.clone())?;
-                let wiggle_design = runtime.design(&q0_chunk)?;
-                let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
-                let rows_in_chunk = q0_chunk.len();
-                let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-                for i in 0..rows_in_chunk {
-                    for j in 0..p_mu {
-                        grad[[i, j]] = dq_dq0[i] * x_mu[[i, j]];
-                    }
-                }
-                grad.slice_mut(ndarray::s![.., p_mu + p_sigma..p_total])
-                    .assign(&wiggle_design);
-                Ok(vec![grad])
-            })
+            link_wiggle_eta_se_from_backend(
+                backend,
+                eta_len,
+                &input.design,
+                &eta_base,
+                runtime,
+                LinkWiggleGradientLayout {
+                    p_main: p_mu,
+                    p_total,
+                    wiggle_col_start: p_mu + p_sigma,
+                },
+                "gaussian location-scale covariance mismatch",
+            )
         } else {
             padded_design_standard_errors_from_backend(
                 &input.design,
@@ -3935,35 +3926,15 @@ impl BinomialLocationScalePredictor {
 }
 
 impl BinomialLocationScalePredictor {
-    /// Plug-in probability point + (covariance-derived) response-scale SE via
-    /// the threshold/scale/wiggle chain rule. The η SE is reported equal to the
-    /// response SE because the threshold-scale η interval is not meaningful on
-    /// the probability scale and is collapsed onto the point predictor.
-    fn plugin_state_from_covariance(
-        &self,
-        input: &PredictInput,
-    ) -> Result<LinearState, EstimationError> {
-        let with_se = self.predict_with_uncertainty_inner(input)?;
-        Ok(LinearState {
-            eta: with_se.eta,
-            mean: with_se.mean,
-            eta_se: with_se.mean_se.clone(),
-            mean_se: with_se.mean_se,
-            covariance_corrected_used: false,
-        })
-    }
-
-    /// Delta-method response-scale SE for the binomial-LS probability from an
-    /// arbitrary covariance `backend`, via the threshold/scale/wiggle chain
-    /// rule. Shared by the conditional point path and the mode-selecting
-    /// full-uncertainty path.
-    fn mean_se_from_backend(
+    fn response_se_from_backend(
         &self,
         input: &PredictInput,
         backend: &PredictionCovarianceBackend<'_>,
+        q0_base: &Array1<f64>,
+        sigma: &Array1<f64>,
+        eta_t: &Array1<f64>,
+        dmu_deta: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
-        let (q0_base, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
-        let (_, _, dmu_deta) = self.apply_link_with_d1(&q0_base)?;
         let n = eta_t.len();
         let p_t = self.beta_threshold.len();
         let p_s = self.beta_noise.len();
@@ -4004,7 +3975,6 @@ impl BinomialLocationScalePredictor {
                 let dphi = dmu_chunk[i];
                 let scale = dq_dq0[i];
                 let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
-                // dq/dη_ls = eta_t / σ for the exact exp link.
                 let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
                 for j in 0..p_t {
                     grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
@@ -4020,6 +3990,38 @@ impl BinomialLocationScalePredictor {
             }
             Ok(vec![grad])
         })
+    }
+
+    /// Plug-in probability point + (covariance-derived) response-scale SE via
+    /// the threshold/scale/wiggle chain rule. The η SE is reported equal to the
+    /// response SE because the threshold-scale η interval is not meaningful on
+    /// the probability scale and is collapsed onto the point predictor.
+    fn plugin_state_from_covariance(
+        &self,
+        input: &PredictInput,
+    ) -> Result<LinearState, EstimationError> {
+        let with_se = self.predict_with_uncertainty_inner(input)?;
+        Ok(LinearState {
+            eta: with_se.eta,
+            mean: with_se.mean,
+            eta_se: with_se.mean_se.clone(),
+            mean_se: with_se.mean_se,
+            covariance_corrected_used: false,
+        })
+    }
+
+    /// Delta-method response-scale SE for the binomial-LS probability from an
+    /// arbitrary covariance `backend`, via the threshold/scale/wiggle chain
+    /// rule. Shared by the conditional point path and the mode-selecting
+    /// full-uncertainty path.
+    fn mean_se_from_backend(
+        &self,
+        input: &PredictInput,
+        backend: &PredictionCovarianceBackend<'_>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let (q0_base, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
+        let (_, _, dmu_deta) = self.apply_link_with_d1(&q0_base)?;
+        self.response_se_from_backend(input, backend, &q0_base, &sigma, &eta_t, &dmu_deta)
     }
 
     fn predict_with_uncertainty_inner(
@@ -4080,54 +4082,14 @@ impl BinomialLocationScalePredictor {
             "binomial location-scale posterior mean",
         )?;
 
-        let eta_se = linear_predictor_se_from_backend(&backend, eta_t.len(), |rows| {
-            let x_t = design_row_chunk(&input.design, rows.clone())?;
-            let x_s = design_row_chunk(design_noise, rows.clone())?;
-            let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
-            let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]);
-            let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]);
-            let dmu_chunk = dmu_deta.slice(ndarray::s![rows.clone()]).to_owned();
-            let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
-                Some(runtime.design(&q0_chunk)?)
-            } else {
-                None
-            };
-            let dq_dq0 = if let Some(runtime) = self.link_wiggle.as_ref() {
-                runtime.derivative_q0(&q0_chunk)?
-            } else {
-                Array1::ones(q0_chunk.len())
-            };
-            let rows_in_chunk = q0_chunk.len();
-            let row_gradients: Result<Vec<Vec<f64>>, String> = (0..rows_in_chunk)
-                .into_par_iter()
-                .map(|i| {
-                    let dphi = dmu_chunk[i];
-                    let scale = dq_dq0[i];
-                    let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
-                    let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
-                    let mut row = vec![0.0; p_total];
-                    for j in 0..p_t {
-                        row[j] = dprob_deta_t * x_t[[i, j]];
-                    }
-                    for j in 0..p_s {
-                        row[p_t + j] = dprob_deta_s * x_s[[i, j]];
-                    }
-                    if let Some(wd) = wiggle_design.as_ref() {
-                        for j in 0..p_w {
-                            row[p_t + p_s + j] = dphi * wd[[i, j]];
-                        }
-                    }
-                    Ok(row)
-                })
-                .collect();
-            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-            for (i, row) in row_gradients?.into_iter().enumerate() {
-                for (j, value) in row.into_iter().enumerate() {
-                    grad[[i, j]] = value;
-                }
-            }
-            Ok(vec![grad])
-        })?;
+        let eta_se = self.response_se_from_backend(
+            input,
+            &backend,
+            &q0_base,
+            &sigma,
+            &eta_t,
+            &dmu_deta,
+        )?;
 
         let mean = if self.link_wiggle.is_none() {
             let (var_t, var_s, cov_ts) = project_two_block_linear_predictor_covariance(
