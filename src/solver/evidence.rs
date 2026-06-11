@@ -49,7 +49,7 @@ use crate::linalg::lanczos::{
     SymmetricLanczosOptions, symmetric_lanczos_eigenpairs, symmetric_lanczos_log_quadrature,
 };
 use crate::linalg::triangular::cholesky_solve_vector;
-use crate::solver::arrow_schur::{ArrowFactorCache, ArrowSchurSystem};
+use crate::solver::arrow_schur::{ArrowFactorCache, ArrowFactorSlab, ArrowSchurSystem};
 use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
 
 pub const ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD: usize = 1024;
@@ -1979,12 +1979,12 @@ pub fn arrow_log_det_from_cache(cache: &ArrowFactorCache) -> Option<f64> {
         acc += 2.0 * log_det_from_chol_lower(l);
     }
     // Schur block: log|A| = 2 Σ log diag(L_schur).
-    acc += 2.0 * log_det_from_chol_lower(schur);
+    acc += 2.0 * log_det_from_chol_lower(schur.view());
     Some(acc)
 }
 
 /// Twice-the-diagonal-log sum for a lower-triangular Cholesky factor.
-fn log_det_from_chol_lower(l: &Array2<f64>) -> f64 {
+fn log_det_from_chol_lower(l: ArrayView2<'_, f64>) -> f64 {
     let n = l.nrows();
     let mut acc = 0.0_f64;
     for i in 0..n {
@@ -2889,7 +2889,7 @@ mod tests {
         let l_schur = Array2::from_shape_vec((1, 1), vec![(1.875_f64).sqrt()]).unwrap();
         let htbeta = Array2::from_shape_vec((1, 1), vec![0.5]).unwrap();
         ArrowFactorCache {
-            htt_factors: std::sync::Arc::from(vec![l_huu]),
+            htt_factors: ArrowFactorSlab::from_blocks(vec![l_huu]),
             htt_factors_undamped: crate::solver::arrow_schur::ArrowUndampedFactors::SameAsDamped,
             schur_factor: Some(l_schur),
             solver_mode: crate::solver::arrow_schur::ArrowSolverMode::Direct,
