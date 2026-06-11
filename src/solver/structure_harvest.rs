@@ -1023,3 +1023,351 @@ pub fn rounds_to_json(rounds: &[SearchLedger]) -> Result<String, String> {
     serde_json::to_string(rounds)
         .map_err(|e| format!("rounds_to_json: serialize search ledger: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::solver::structure_search::{CollapseAction, CollapseEvent, MoveVerdict};
+    use crate::terms::latent_coord::LatentManifold;
+    use crate::terms::sae_manifold::{
+        AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
+    };
+    use ndarray::Array2;
+    use std::sync::Arc;
+
+    /// A high active logit (atom routes strongly on the row) and a low one
+    /// (atom is dormant). With the `ACTIVE_SUPPORT_REL_FLOOR / K` threshold a
+    /// softmax of these separates the discrete support cleanly.
+    const ON: f64 = 6.0;
+    const OFF: f64 = -6.0;
+
+    /// Build a `K`-atom periodic SAE term whose per-row routing is dictated by a
+    /// caller-supplied boolean activity matrix `active[(row, atom)]` (ON/OFF
+    /// logits). Every atom shares the same circle basis; only the routing (and,
+    /// for the birth template, the decoder) differs. Returns the term and a
+    /// matching ρ with native ARD enabled (one axis per atom).
+    fn planted_term(active: &[Vec<bool>]) -> (SaeManifoldTerm, SaeManifoldRho) {
+        let n = active.len();
+        let k = active[0].len();
+        let p = 4usize;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let mut atoms = Vec::with_capacity(k);
+        let mut coord_blocks = Vec::with_capacity(k);
+        for atom_idx in 0..k {
+            let mut decoder = Array2::<f64>::zeros((3, p));
+            // Give each atom a distinct decoder direction so reconstruction is
+            // non-degenerate.
+            decoder[[1, atom_idx % p]] = 1.0;
+            decoder[[2, (atom_idx + 1) % p]] = 1.0;
+            let atom = SaeManifoldAtom::new(
+                format!("atom_{atom_idx}"),
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi.clone(),
+                jet.clone(),
+                decoder,
+                Array2::<f64>::eye(3),
+            )
+            .unwrap()
+            .with_basis_second_jet(evaluator.clone());
+            atoms.push(atom);
+            coord_blocks.push(coords.clone());
+        }
+        let mut logits = Array2::<f64>::zeros((n, k));
+        for (row, atom_active) in active.iter().enumerate() {
+            for (atom, &on) in atom_active.iter().enumerate() {
+                logits[[row, atom]] = if on { ON } else { OFF };
+            }
+        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coord_blocks,
+            vec![LatentManifold::Circle { period: 1.0 }; k],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
+        (term, rho)
+    }
+
+    fn residuals_of(term: &SaeManifoldTerm) -> Array2<f64> {
+        // A term scored against zero target gives R = −fitted; non-degenerate
+        // residuals for the birth channel.
+        let fitted = term.try_fitted().unwrap();
+        -&fitted
+    }
+
+    /// Oracle (#997 trigger): a planted SHATTER — two atoms with identical
+    /// supports (one curved family re-encoded as near-duplicate flat atoms) —
+    /// produces a FUSION proposal on that pair (symmetric code dependence ≈ 1),
+    /// and NO fission audit (asymmetry ≈ 0).
+    #[test]
+    fn planted_shatter_harvests_fusion_not_fission() {
+        // Atoms 0 and 1 share support exactly (every third row); atom 2 is
+        // independent. n = 30.
+        let n = 30usize;
+        let active: Vec<Vec<bool>> = (0..n)
+            .map(|row| {
+                let dup = row % 3 == 0;
+                vec![dup, dup, row % 2 == 0]
+            })
+            .collect();
+        let (term, rho) = planted_term(&active);
+        let residuals = residuals_of(&term);
+        let params = HarvestParams {
+            max_fusions: 4,
+            max_fissions: 4,
+            max_births: 0,
+        };
+        let report = harvest_move_proposals(&term, &rho, residuals.view(), &params).unwrap();
+        let has_fusion_01 = report.proposals.iter().any(|p| {
+            matches!(p.mv, StructureMove::Fusion { a, b } if (a, b) == (0, 1) || (a, b) == (1, 0))
+        });
+        assert!(
+            has_fusion_01,
+            "shattered duplicate pair (0,1) must yield a fusion proposal; got {:?}",
+            report.proposals.iter().map(|p| &p.mv).collect::<Vec<_>>()
+        );
+        // The duplicate pair is symmetric ⇒ no absorption fission audit on it.
+        let has_fission = report
+            .proposals
+            .iter()
+            .any(|p| matches!(p.mv, StructureMove::Fission { .. }));
+        assert!(
+            !has_fission,
+            "symmetric duplicate supports must not trigger an absorption fission audit"
+        );
+    }
+
+    /// Oracle (#997 trigger): a planted ABSORPTION (A⊇B: B's support nests
+    /// inside A's) produces a FISSION audit on the parent A (high conditional
+    /// asymmetry, parent conditional ≈ 1), and the `fission_carve_skipped` flag
+    /// is recorded loudly (the #993 within-atom carve is not yet wired).
+    #[test]
+    fn planted_absorption_harvests_fission_audit_with_loud_carve_skip() {
+        // Atom 0 (parent) active on rows ≡ 0 mod 2 PLUS rows ≡ 1 mod 4; atom 1
+        // (child) active only on rows ≡ 0 mod 4 — strictly nested in 0's
+        // support ⇒ P(0|1) = 1, P(1|0) < 1. n = 40.
+        let n = 40usize;
+        let active: Vec<Vec<bool>> = (0..n)
+            .map(|row| {
+                let child = row % 4 == 0;
+                let parent = row % 2 == 0 || row % 4 == 1;
+                vec![parent, child, row % 5 == 0]
+            })
+            .collect();
+        let (term, rho) = planted_term(&active);
+        let residuals = residuals_of(&term);
+        let params = HarvestParams {
+            max_fusions: 4,
+            max_fissions: 4,
+            max_births: 0,
+        };
+        let report = harvest_move_proposals(&term, &rho, residuals.view(), &params).unwrap();
+        let fissioned_parent = report
+            .proposals
+            .iter()
+            .any(|p| matches!(p.mv, StructureMove::Fission { atom: 0 }));
+        assert!(
+            fissioned_parent,
+            "nested-support parent (atom 0) must be flagged for a fission audit; got {:?}",
+            report.proposals.iter().map(|p| &p.mv).collect::<Vec<_>>()
+        );
+        assert!(
+            report.fission_carve_skipped,
+            "the #993 within-atom carve is unwired; the skip must be recorded, not silent"
+        );
+    }
+
+    /// Oracle (#997 type-I): three INDEPENDENT planted atoms (marginal supports
+    /// at coprime strides) yield NO fusion proposal — the trigger does not
+    /// manufacture binding edges where the codes are independent, so the e-gate
+    /// is never even asked to reject a true null.
+    #[test]
+    fn independent_atoms_harvest_no_fusion() {
+        let n = 60usize;
+        let active: Vec<Vec<bool>> = (0..n)
+            .map(|row| vec![row % 2 == 0, row % 3 == 0, row % 5 == 0])
+            .collect();
+        let (term, rho) = planted_term(&active);
+        let residuals = residuals_of(&term);
+        let params = HarvestParams {
+            max_fusions: 4,
+            max_fissions: 4,
+            max_births: 0,
+        };
+        let report = harvest_move_proposals(&term, &rho, residuals.view(), &params).unwrap();
+        let has_fusion = report
+            .proposals
+            .iter()
+            .any(|p| matches!(p.mv, StructureMove::Fusion { .. }));
+        assert!(
+            !has_fusion,
+            "independent atom supports must not produce fusion proposals; got {:?}",
+            report.proposals.iter().map(|p| &p.mv).collect::<Vec<_>>()
+        );
+    }
+
+    /// Oracle (#997 death trigger): a diverged ARD precision yields a DEATH
+    /// proposal; a terminal collapse event yields a death even with finite ARD.
+    #[test]
+    fn diverged_ard_and_terminal_collapse_harvest_deaths() {
+        let n = 20usize;
+        let active: Vec<Vec<bool>> = (0..n).map(|row| vec![true, row % 2 == 0, false]).collect();
+        let (mut term, mut rho) = planted_term(&active);
+        // Diverge atom 2's ARD precision well past the divergence floor.
+        rho.log_ard[2] = Array1::from_elem(1, ARD_DIVERGENCE_LOG_PRECISION + 5.0);
+        // Inject a terminal collapse for atom 1 (finite ARD, but routing gone).
+        term.record_collapse_event(CollapseEvent {
+            iteration: 3,
+            atom: 1,
+            max_active_mass: 1e-6,
+            floor: 1e-3,
+            action: CollapseAction::Terminal,
+        });
+        let residuals = residuals_of(&term);
+        let params = HarvestParams {
+            max_fusions: 0,
+            max_fissions: 0,
+            max_births: 0,
+        };
+        let report = harvest_move_proposals(&term, &rho, residuals.view(), &params).unwrap();
+        let death_atoms: Vec<usize> = report
+            .proposals
+            .iter()
+            .filter_map(|p| match p.mv {
+                StructureMove::Death { atom } => Some(atom),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            death_atoms.contains(&2),
+            "diverged ARD on atom 2 must yield a death proposal; got {death_atoms:?}"
+        );
+        assert!(
+            death_atoms.contains(&1),
+            "terminal collapse on atom 1 must yield a death proposal; got {death_atoms:?}"
+        );
+    }
+
+    /// Apply-move restructuring oracle: fission GROWS the dictionary by one atom
+    /// (child inherits parent's basis + ARD block), fusion and death keep K
+    /// (fold / demote), birth appends a residual-factor atom.
+    #[test]
+    fn apply_move_restructures_warm() {
+        let n = 12usize;
+        let active: Vec<Vec<bool>> = (0..n).map(|row| vec![true, row % 2 == 0]).collect();
+        let (term, rho) = planted_term(&active);
+        let k0 = term.k_atoms();
+
+        // Fission: K grows, child ARD block inherited.
+        let (fissioned, fissioned_rho) =
+            apply_structure_move(&term, &rho, &StructureMove::Fission { atom: 0 }, &[]).unwrap();
+        assert_eq!(fissioned.k_atoms(), k0 + 1);
+        assert_eq!(fissioned_rho.log_ard.len(), k0 + 1);
+
+        // Fusion: K unchanged, atom b demoted to ~0 routing.
+        let (fused, _) =
+            apply_structure_move(&term, &rho, &StructureMove::Fusion { a: 0, b: 1 }, &[]).unwrap();
+        assert_eq!(fused.k_atoms(), k0);
+        let fused_assign = fused.assignment.assignments();
+        assert!(
+            fused_assign.column(1).iter().all(|&m| m < 1e-6),
+            "fused-away atom 1 must route to ~0 mass"
+        );
+
+        // Death: K unchanged, atom demoted.
+        let (dead, _) =
+            apply_structure_move(&term, &rho, &StructureMove::Death { atom: 1 }, &[]).unwrap();
+        assert_eq!(dead.k_atoms(), k0);
+        let dead_assign = dead.assignment.assignments();
+        assert!(dead_assign.column(1).iter().all(|&m| m < 1e-6));
+
+        // Birth: K grows, new atom carries the supplied residual-factor decoder.
+        let p = term.output_dim();
+        let m = term.atoms[0].basis_size();
+        let mut decoder = Array2::<f64>::zeros((m, p));
+        decoder[[0, 0]] = 0.7;
+        let (born, born_rho) =
+            apply_structure_move(&term, &rho, &StructureMove::Birth { candidate: 0 }, &[decoder])
+                .unwrap();
+        assert_eq!(born.k_atoms(), k0 + 1);
+        assert_eq!(born_rho.log_ard.len(), k0 + 1);
+        assert_eq!(born.atoms[k0].decoder_coefficients[[0, 0]], 0.7);
+    }
+
+    /// Ledger byte-determinism oracle (#997): two runs of the round driver over
+    /// the same planted shatter, with a deterministic scripted fit, serialize
+    /// the per-round ledgers byte-identically.
+    #[test]
+    fn round_driver_ledger_is_byte_deterministic() {
+        let n = 24usize;
+        let active: Vec<Vec<bool>> = (0..n)
+            .map(|row| {
+                let dup = row % 3 == 0;
+                vec![dup, dup, row % 2 == 0]
+            })
+            .collect();
+
+        let run = || {
+            let (term, rho) = planted_term(&active);
+            let target = Array2::<f64>::zeros((n, term.output_dim()));
+            let mut ledger = crate::inference::structure_evidence::StructureLedger::new();
+            let budget = MoveBudget {
+                max_moves: 4,
+                alpha: 0.05,
+            };
+            let params = HarvestParams {
+                max_fusions: 4,
+                max_fissions: 0,
+                max_births: 0,
+            };
+            // Deterministic no-op fit: the scripted gate sees the unrefit
+            // candidate (the engine's determinism is what this asserts, not the
+            // SAE inner solve).
+            run_structure_search_rounds(
+                term,
+                rho,
+                target.view(),
+                3,
+                budget,
+                2,
+                params,
+                &mut ledger,
+                |t, r, _est| (t, r),
+            )
+            .unwrap()
+        };
+
+        let a = run();
+        let b = run();
+        let sa = serde_json::to_string(&a.rounds).unwrap();
+        let sb = serde_json::to_string(&b.rounds).unwrap();
+        assert_eq!(sa, sb, "identical inputs must produce a byte-identical ledger");
+        assert_eq!(a.term.k_atoms(), b.term.k_atoms());
+    }
+
+    /// Estimation/eval split oracle: the split reserves estimation rows and
+    /// partitions the remainder into held-out shards that do NOT overlap the
+    /// estimation set (the universal-inference contract the gates rely on).
+    #[test]
+    fn estimation_eval_split_is_disjoint() {
+        let target = Array2::<f64>::zeros((20, 3));
+        let split = estimation_eval_split(target.view(), 4);
+        assert!(!split.estimation_rows.is_empty());
+        assert!(!split.shards.is_empty());
+        let est: std::collections::HashSet<usize> =
+            split.estimation_rows.iter().copied().collect();
+        for shard in &split.shards {
+            for &row in &shard.rows {
+                assert!(
+                    !est.contains(&row),
+                    "eval shard row {row} must not be in the estimation set"
+                );
+            }
+        }
+    }
+}
