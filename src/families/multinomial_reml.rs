@@ -151,6 +151,9 @@ pub struct MultinomialFamily {
     /// frozen `β`, so a stale clone simply recomputes — never returns a wrong
     /// value. Cheap clones share the slot.
     axis_derivative_cache: Arc<Mutex<Option<AxisDerivativeCache>>>,
+    /// Whether this family instance contributes the full-span Jeffreys/Firth
+    /// correction to the coupled custom-family solve.
+    use_joint_jeffreys_term: bool,
 }
 
 /// One frozen-`β` snapshot of every canonical-axis joint-Hessian directional
@@ -291,7 +294,15 @@ impl MultinomialFamily {
             penalty_nullspace_dims,
             likelihood,
             axis_derivative_cache: Arc::new(Mutex::new(None)),
+            use_joint_jeffreys_term: true,
         })
+    }
+
+    /// Select whether this multinomial adapter instance contributes the
+    /// full-span Jeffreys/Firth correction.
+    pub fn with_joint_jeffreys_term(mut self, enabled: bool) -> Self {
+        self.use_joint_jeffreys_term = enabled;
+        self
     }
 
     /// Build the canonical block specs for this family.
@@ -1073,6 +1084,10 @@ impl MultinomialFamily {
 }
 
 impl CustomFamily for MultinomialFamily {
+    fn joint_jeffreys_term_required(&self) -> bool {
+        self.use_joint_jeffreys_term
+    }
+
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         // H = X^T W(β) X with W depending on softmax probabilities of β.
         true
@@ -1098,10 +1113,9 @@ impl CustomFamily for MultinomialFamily {
         // toward zero as fitted probabilities saturate near the simplex boundary
         // (the near-separating regime of small, well-fit categorical data — e.g.
         // the penguins `species ~ s(bill) + s(flipper) + body_mass` fit). There
-        // `H` stays full rank (the always-on Jeffreys/Firth term supplies the
-        // O(1) curvature on any genuinely separating null direction) but becomes
-        // ILL-CONDITIONED: range-space curvature directions sit just above the
-        // rank cutoff. Undamped, the range-restricted joint-Newton step takes an
+        // `H` stays full rank but becomes ILL-CONDITIONED: range-space
+        // curvature directions sit just above the rank cutoff. Undamped, the
+        // range-restricted joint-Newton step takes an
         // enormous `component/λ` proposal on those near-singular modes, the trust
         // region clips it every cycle, and the stationarity residual along that
         // mode never settles — the inner solve oscillates and never certifies a
@@ -2055,14 +2069,14 @@ mod tests {
         );
     }
 
-    /// #753 — the universal full-span Jeffreys/Firth proper prior must be wired
-    /// into the multinomial path so a SEPARATING fit gets finite, bounded
+    /// #753 — a multinomial adapter instance can arm the universal full-span
+    /// Jeffreys/Firth proper prior so a SEPARATING fit gets finite, bounded
     /// curvature instead of drifting to ±∞.
     ///
     /// `MultinomialFamily` is a `CustomFamily`, so the formula REML entry
     /// (`fit_penalized_multinomial_formula` → `fit_custom_family_with_rho_prior`)
-    /// folds the always-on term `Φ = ½ log|Z_Jᵀ H Z_J|` into the coupled joint
-    /// Newton solve through `build_joint_jeffreys_subspace` +
+    /// can fold the term `Φ = ½ log|Z_Jᵀ H Z_J|` into the coupled joint Newton
+    /// solve through `build_joint_jeffreys_subspace` +
     /// `custom_family_joint_jeffreys_term`. Those wrappers are private to
     /// `custom_family.rs`, but they do exactly two things this test reproduces
     /// verbatim against the multinomial family's own exact joint Hessian and

@@ -20249,7 +20249,7 @@ enum BlockDesignCoords {
 /// slice and the block tag used in the failure diagnostic.
 pub(crate) struct JointPreflightSegment {
     pub block: JointPreflightBlock,
-    pub columns: Array2<f64>,
+    pub columns: DesignMatrix,
 }
 
 /// W-metric joint training-row design preflight.
@@ -20268,7 +20268,7 @@ pub(crate) fn joint_training_design_preflight(
     segments: &[JointPreflightSegment],
     weights: &Array1<f64>,
 ) -> Result<(), SurvivalMarginalSlopeError> {
-    use crate::faer_ndarray::FaerSvd;
+    use crate::faer_ndarray::{FaerEigh, fast_xt_diag_y};
 
     if segments.is_empty() {
         return Ok(());
@@ -20297,53 +20297,75 @@ pub(crate) fn joint_training_design_preflight(
         return Ok(());
     }
 
-    let mut sqrt_w = Array1::<f64>::zeros(n);
     for (i, &w) in weights.iter().enumerate() {
         if !w.is_finite() || w < 0.0 {
             return Err(SurvivalMarginalSlopeError::InvalidInput {
                 reason: format!("joint preflight: weights[{i}] = {w} is not finite/non-negative",),
             });
         }
-        sqrt_w[i] = w.sqrt();
     }
 
-    let mut j_sqw = Array2::<f64>::zeros((n, p_joint));
-    for (seg, (_, start, end)) in segments.iter().zip(block_ranges.iter()) {
-        let width = *end - *start;
-        let mut dst = j_sqw.slice_mut(s![.., *start..*end]);
-        dst.assign(&seg.columns);
-        for i in 0..n {
-            let s_i = sqrt_w[i];
-            for j in 0..width {
-                dst[[i, j]] *= s_i;
+    // W-metric joint Gram `G = Jᵀ diag(w) J`, accumulated over fixed-height
+    // row chunks of the operator-backed segments. The previous implementation
+    // stacked a dense `(n, p_joint)` sqrt(W)-scaled copy of the joint design
+    // and ran a thin-SVD over it — at biobank scale that transient (plus the
+    // SVD's own workspace) was a multi-GiB contributor to the #979 survival
+    // construction-phase OOM, and the budget guard that protected against it
+    // silently skipped the diagnostic at exactly the scale where it matters.
+    // The Gram route needs `O(chunk × p_joint + p_joint²)` memory at any n,
+    // so the preflight always runs. Singular values come back as √eigenvalue;
+    // squaring the spectrum coarsens the detectable near-alias floor from
+    // ~`dim·ε·σ_max` to ~`sqrt(dim·ε)·σ_max`, which is immaterial here:
+    // structural aliases (σ exactly 0) are detected identically, and this
+    // preflight is observability-only — the canonical-gauge RRQR audit
+    // downstream remains the fail-closed authority on borderline cases.
+    const PREFLIGHT_GRAM_ROW_CHUNK: usize = 4096;
+    let mut gram = Array2::<f64>::zeros((p_joint, p_joint));
+    let mut chunk_start = 0usize;
+    while chunk_start < n {
+        let chunk_end = (chunk_start + PREFLIGHT_GRAM_ROW_CHUNK).min(n);
+        let chunks: Vec<Array2<f64>> = segments
+            .iter()
+            .map(|seg| {
+                seg.columns
+                    .try_row_chunk(chunk_start..chunk_end)
+                    .map_err(|e| SurvivalMarginalSlopeError::NumericalFailure {
+                        reason: format!(
+                            "joint preflight: block {} rows {chunk_start}..{chunk_end}: {e}",
+                            seg.block
+                        ),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let w_chunk = weights.slice(s![chunk_start..chunk_end]);
+        for (s, (_, s0, s1)) in block_ranges.iter().enumerate() {
+            for (t, (_, t0, t1)) in block_ranges.iter().enumerate().skip(s) {
+                let g_st = fast_xt_diag_y(&chunks[s], &w_chunk, &chunks[t]);
+                let mut dst = gram.slice_mut(s![*s0..*s1, *t0..*t1]);
+                dst += &g_st;
+                if t > s {
+                    let mut dst_t = gram.slice_mut(s![*t0..*t1, *s0..*s1]);
+                    dst_t += &g_st.t();
+                }
             }
         }
+        chunk_start = chunk_end;
     }
 
-    let (_u, sigma, vt) =
-        j_sqw
-            .svd(false, true)
+    let (eigvals, eigvecs) =
+        gram.eigh(faer::Side::Lower)
             .map_err(|e| SurvivalMarginalSlopeError::NumericalFailure {
-                reason: format!("joint preflight: W-metric thin-SVD failed: {e:?}"),
+                reason: format!("joint preflight: W-metric Gram eigh failed: {e:?}"),
             })?;
-    let vt = vt.ok_or_else(|| SurvivalMarginalSlopeError::NumericalFailure {
-        reason: "joint preflight: thin-SVD requested right singular vectors but none returned"
-            .to_string(),
-    })?;
-    if vt.nrows() != sigma.len() || vt.ncols() != p_joint {
-        return Err(SurvivalMarginalSlopeError::NumericalFailure {
-            reason: format!(
-                "joint preflight: SVD shape inconsistent - sigma.len()={}, vt={:?}, p_joint={}",
-                sigma.len(),
-                vt.shape(),
-                p_joint,
-            ),
-        });
-    }
-
+    // σ_i = sqrt(max(λ_i, 0)); roundoff can push numerically-zero Gram
+    // eigenvalues slightly negative.
+    let sigma: Vec<f64> = eigvals.iter().map(|&l| l.max(0.0).sqrt()).collect();
     let sigma_max = sigma.iter().copied().fold(0.0_f64, f64::max);
     let rank_dim = n.max(p_joint) as f64;
-    let rank_tol = sigma_max * rank_dim * 16.0 * f64::EPSILON;
+    // Gram-spectrum near-alias floor (see the block comment above): aliases
+    // are directions whose singular value is at or below
+    // `σ_max · sqrt(dim · 16ε)`.
+    let rank_tol = sigma_max * (rank_dim * 16.0 * f64::EPSILON).sqrt();
 
     let alias_idx: Vec<usize> = sigma
         .iter()
@@ -20352,7 +20374,7 @@ pub(crate) fn joint_training_design_preflight(
         .collect();
     let rank = sigma.len() - alias_idx.len();
 
-    if alias_idx.is_empty() && sigma.len() == p_joint {
+    if alias_idx.is_empty() {
         let sigma_min = sigma.iter().copied().fold(f64::INFINITY, f64::min);
         let condition = if sigma_min > 0.0 {
             sigma_max / sigma_min
@@ -20366,15 +20388,17 @@ pub(crate) fn joint_training_design_preflight(
         return Ok(());
     }
 
-    let structural_alias = p_joint.saturating_sub(sigma.len());
+    let structural_alias = p_joint.saturating_sub(n.min(p_joint));
 
     let mut columns: Vec<(JointPreflightBlock, usize, f64)> = Vec::new();
     for &idx in alias_idx.iter() {
-        let v_row = vt.row(idx);
+        // Eigenvector column `idx` of the Gram is the right singular vector
+        // of the collapsing direction.
+        let v_col = eigvecs.column(idx);
         let mut best_j = 0usize;
         let mut best_w = 0.0_f64;
         for j in 0..p_joint {
-            let w = v_row[j].abs();
+            let w = v_col[j].abs();
             if w > best_w {
                 best_w = w;
                 best_j = j;
@@ -20971,139 +20995,52 @@ pub fn fit_survival_marginal_slope_terms(
     // Aborting here would defeat the canonical reduction. We emit an info-
     // level diagnostic with the (block, ncols, rank) tuple so the rank-deficit
     // is visible in the log without being fatal.
-    // The joint rank diagnostic densifies time/marginal/logslope and
-    // stacks them into a single n × p_joint matrix for column-pivoted QR.
-    // At large n the time block alone (n × p_time, where p_time grows
-    // multiplicatively with the time-tensor + timewiggle basis) materializes
-    // to multiple GiB and OOMs the host before the rrqr / W-metric SVD even
-    // starts. The block is explicitly "Diagnostic only" — any rank
-    // deficiency at this point is handled by the canonical-gauge pipeline in
-    // `canonicalize_for_identifiability` (called centrally before the inner
-    // Newton). When the dense footprint exceeds the strict-mode
-    // single-materialization budget we skip the whole block with a `warn!`
-    // and leave the canonical-gauge pipeline as the source of truth, mirror-
-    // ing the smgs phase-4b preflights above.
-    const RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+    //
+    // The diagnostic streams the W-metric joint Gram over row chunks of the
+    // operator-backed block designs (see `joint_training_design_preflight`),
+    // so it runs at any n in `O(chunk × p_joint + p_joint²)` memory. The
+    // previous implementation densified every block, stacked an `(n,
+    // p_joint)` joint matrix, and ran column-pivoted QR plus a thin-SVD over
+    // it — multi-GiB of co-resident transients at biobank scale (#979
+    // survival construction OOM), guarded by a budget that silently skipped
+    // the diagnostic at exactly the scale where it matters. The unweighted
+    // RRQR rank pass was deleted along with the densification: the W-metric
+    // spectrum is the rank diagnostic PIRLS actually solves under (and the
+    // two coincide at uniform sample weights).
     let rank_diagnostic_outcome: Result<(), String> = (|| -> Result<(), String> {
-        use crate::linalg::faer_ndarray::rrqr_with_permutation;
-        let time_dense = spec
-            .time_block
-            .design_exit
-            .try_to_dense_by_chunks_budgeted(
-                "survival-marginal-slope joint rank diagnostic time",
-                RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES,
-            )?;
-        let marginal_dense = marginal_design.design.try_to_dense_by_chunks_budgeted(
-            "survival-marginal-slope joint rank diagnostic marginal",
-            RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES,
-        )?;
-        let logslope_dense = logslope_design.design.try_to_dense_by_chunks_budgeted(
-            "survival-marginal-slope joint rank diagnostic logslope",
-            RANK_DIAGNOSTIC_MATERIALIZATION_BUDGET_BYTES,
-        )?;
-        let score_warp_dense = score_warp_prepared
+        let score_warp_design = score_warp_prepared
             .as_ref()
             .map(|sw| sw.runtime.design_at_training_with_residual(&z_primary))
-            .transpose()?;
-        let link_dev_dense = link_dev_prepared
+            .transpose()?
+            .map(|m| DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(m)));
+        let link_dev_design = link_dev_prepared
             .as_ref()
             .map(|ld| {
                 ld.runtime
                     .design_at_training_with_residual(&cross_block_pilot_eta)
             })
-            .transpose()?;
-        let mut total_cols = time_dense.ncols() + marginal_dense.ncols() + logslope_dense.ncols();
-        if let Some(ref m) = score_warp_dense {
-            total_cols += m.ncols();
-        }
-        if let Some(ref m) = link_dev_dense {
-            total_cols += m.ncols();
-        }
-        let mut joint = Array2::<f64>::zeros((n, total_cols));
-        let mut cursor = 0usize;
-        joint
-            .slice_mut(s![.., cursor..cursor + time_dense.ncols()])
-            .assign(&time_dense);
-        cursor += time_dense.ncols();
-        joint
-            .slice_mut(s![.., cursor..cursor + marginal_dense.ncols()])
-            .assign(&marginal_dense);
-        cursor += marginal_dense.ncols();
-        joint
-            .slice_mut(s![.., cursor..cursor + logslope_dense.ncols()])
-            .assign(&logslope_dense);
-        cursor += logslope_dense.ncols();
-        if let Some(ref m) = score_warp_dense {
-            joint
-                .slice_mut(s![.., cursor..cursor + m.ncols()])
-                .assign(m);
-            cursor += m.ncols();
-        }
-        if let Some(ref m) = link_dev_dense {
-            joint
-                .slice_mut(s![.., cursor..cursor + m.ncols()])
-                .assign(m);
-            cursor += m.ncols();
-        }
-        assert_eq!(cursor, total_cols);
-        // Joint is n × p_total with `n ≫ p_total` at large scale, so the
-        // left null space of the *transpose* has dimension `n - rank` and a
-        // basis for it would be n × (n - rank). Materializing that basis is
-        // catastrophic: at n=195780, p_total≈33 the f64 buffer is ≈286 GiB
-        // and faer aborts with `AllocError` deep inside the FFI boundary.
-        // The diagnostic only consumes `rank`, so use `rrqr_with_permutation`
-        // which runs the same column-pivoted QR + diagonal-threshold count
-        // and never builds the null basis.
-        let rank = rrqr_with_permutation(
-            &joint,
-            crate::linalg::faer_ndarray::default_rrqr_rank_alpha(),
-        )
-        .map_err(|e| format!("survival-marginal-slope joint rank diagnostic QR failed: {e}"))?
-        .rank;
-        if rank < total_cols {
-            log::info!(
-                "[survival-marginal-slope joint rank diagnostic] rank={rank} < ncols={total_cols} \
-                 (time={p_time} marginal={p_marginal} logslope={p_logslope} \
-                 score_warp={p_sw} link_dev={p_ld}); canonical-gauge pipeline \
-                 will attribute the {n_drop} surplus column(s) to lower-priority blocks \
-                 via gauge_priority (time=200, marginal=150, logslope=120, \
-                 score_warp=80, link_dev=60) and proceed with reduced specs.",
-                p_time = time_dense.ncols(),
-                p_marginal = marginal_dense.ncols(),
-                p_logslope = logslope_dense.ncols(),
-                p_sw = score_warp_dense.as_ref().map_or(0, |m| m.ncols()),
-                p_ld = link_dev_dense.as_ref().map_or(0, |m| m.ncols()),
-                n_drop = total_cols - rank,
-            );
-        }
-
-        // W-metric SVD preflight (complement to the unweighted rrqr above).
-        // Surfaces near-rank-deficiency under the actual PIRLS curvature
-        // metric and localises the alias to (block, local_col, weight)
-        // triples so the operator sees exactly which column dominates the
-        // collapsing direction. The rrqr above catches structural rank
-        // deficiency; this catches numerical-rank deficiency at the same
-        // tolerance PIRLS will solve under.
+            .transpose()?
+            .map(|m| DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(m)));
         let mut segments: Vec<JointPreflightSegment> = Vec::with_capacity(5);
         segments.push(JointPreflightSegment {
             block: JointPreflightBlock::Time,
-            columns: time_dense,
+            columns: spec.time_block.design_exit.clone(),
         });
         segments.push(JointPreflightSegment {
             block: JointPreflightBlock::Marginal,
-            columns: marginal_dense,
+            columns: marginal_design.design.clone(),
         });
         segments.push(JointPreflightSegment {
             block: JointPreflightBlock::Logslope,
-            columns: logslope_dense,
+            columns: logslope_design.design.clone(),
         });
-        if let Some(m) = score_warp_dense {
+        if let Some(m) = score_warp_design {
             segments.push(JointPreflightSegment {
                 block: JointPreflightBlock::ScoreWarp,
                 columns: m,
             });
         }
-        if let Some(m) = link_dev_dense {
+        if let Some(m) = link_dev_design {
             segments.push(JointPreflightSegment {
                 block: JointPreflightBlock::LinkDev,
                 columns: m,
@@ -21113,12 +21050,11 @@ pub fn fit_survival_marginal_slope_terms(
             .map_err(|e| format!("survival-marginal-slope joint preflight failed: {e}"))?;
         Ok(())
     })();
+    // Observability-only: a failure inside the rank diagnostic must never
+    // abort the fit — the canonical-gauge pipeline downstream is the
+    // fail-closed authority on identifiability.
     if let Err(reason) = rank_diagnostic_outcome {
-        if reason.contains("refusing to densify") {
-            log::warn!("[survival-marginal-slope joint rank diagnostic] skipped: {reason}");
-        } else {
-            return Err(reason);
-        }
+        log::warn!("[survival-marginal-slope joint rank diagnostic] skipped: {reason}");
     }
     // Penalty seeds for the flex/aux blocks beyond the core (time/marginal/
     // logslope). The absorbed influence block (#461) contributes ONE trailing
