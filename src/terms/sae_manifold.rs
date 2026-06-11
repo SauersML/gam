@@ -20106,6 +20106,60 @@ mod tests {
     }
 
     #[test]
+    fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
+        // The #1006 empirical-π third channel: under IBP-MAP, pi_k(M_k) couples
+        // every row of column k, so perturbing one logit shifts EVERY row's
+        // assembled `htt` diagonal in that column. `fixed_state_logdet` rebuilds
+        // H at the perturbed state, so a single-logit FD captures both the
+        // row-local direct-z channel and the global cross-row M_k channel that
+        // `logdet_theta_adjoint` accumulates column-wise. lambda_sparse is the
+        // active prior weight (fixed alpha), so the channel is genuinely live.
+        let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+        term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
+        rho.log_lambda_sparse = -1.0;
+        let (_value, _loss, cache) = term
+            .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+            .expect("converged cache");
+        let gamma = term.logdet_theta_adjoint(&rho, &cache).expect("Gamma");
+        let h = 1.0e-5;
+        // Probe both atoms across distinct rows so the cross-row coupling
+        // (different rows sharing a column) is exercised on both columns.
+        let probes = [
+            (0usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
+            (4usize, 1usize, SaeLocalRowVar::Logit { atom: 1 }),
+            (7usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
+        ];
+        for (row, local_pos, var) in probes {
+            let mut plus = term.clone();
+            let mut minus = term.clone();
+            match var {
+                SaeLocalRowVar::Logit { atom } => {
+                    plus.assignment.logits[[row, atom]] += h;
+                    minus.assignment.logits[[row, atom]] -= h;
+                }
+                SaeLocalRowVar::Coord { atom, axis } => {
+                    let mut flat_p = plus.assignment.coords[atom].as_flat().clone();
+                    let mut flat_m = minus.assignment.coords[atom].as_flat().clone();
+                    let idx = row * plus.assignment.coords[atom].latent_dim() + axis;
+                    flat_p[idx] += h;
+                    flat_m[idx] -= h;
+                    plus.assignment.coords[atom].set_flat(flat_p.view());
+                    minus.assignment.coords[atom].set_flat(flat_m.view());
+                }
+            }
+            let fd = (fixed_state_logdet(plus, &target, &rho)
+                - fixed_state_logdet(minus, &target, &rho))
+                / (2.0 * h);
+            let analytic = gamma.t[cache.row_offsets[row] + local_pos];
+            let tol = 3.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
+            assert!(
+                (fd - analytic).abs() <= tol,
+                "IBP Gamma row={row} local_pos={local_pos}: fd={fd:.8e}, analytic={analytic:.8e}"
+            );
+        }
+    }
+
+    #[test]
     fn ibp_map_outer_objective_advertises_analytic_gradient() {
         // The IBP-MAP empirical-π third channel (including the cross-row M_k
         // coupling) is now assembled exactly in `logdet_theta_adjoint` (#1006),
