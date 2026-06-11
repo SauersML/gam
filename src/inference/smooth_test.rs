@@ -57,6 +57,17 @@ pub struct SmoothTestResult {
     pub statistic: f64,
     pub ref_df: f64,
     pub p_value: f64,
+    /// Second-order-accurate (Bartlett-corrected) p-value, reported *alongside*
+    /// — never replacing — the first-order `p_value` (issue #939). Populated for
+    /// the estimated-scale (Gaussian-linear / penalized-quadratic conjugate)
+    /// branch, where the exact Bartlett factor is a closed form of the reference
+    /// and residual degrees of freedom; `None` for the known-scale branch, where
+    /// the analytic factor needs the family cumulant towers (not yet assembled).
+    pub p_value_corrected: Option<f64>,
+    /// The Bartlett factor `c = E[W]/d` used for `p_value_corrected`. Its
+    /// distance from `1` is the per-test diagnostic the field lacks: how far
+    /// first-order inference is distorted at this `n`.
+    pub bartlett_factor: Option<f64>,
 }
 
 /// Wood (2013) rank-truncated Wald smooth-component test.
@@ -113,6 +124,8 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
     if !statistic.is_finite() || statistic < 0.0 || !ref_df.is_finite() || ref_df <= 0.0 {
         return None;
     }
+    let mut p_value_corrected: Option<f64> = None;
+    let mut bartlett_factor: Option<f64> = None;
     let p_value = match input.scale {
         SmoothTestScale::Known => {
             let dist = ChiSquared::new(ref_df).ok()?;
@@ -128,6 +141,23 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
             // by `φ̂` again would re-introduce a response-unit dependence (#675).
             let f_stat = statistic / ref_df;
             let dist = FisherSnedecor::new(ref_df, input.residual_df).ok()?;
+            // Second-order Bartlett correction (#939). The estimated-scale branch
+            // is the Gaussian-linear / penalized-quadratic conjugate case, where
+            // the exact Bartlett factor `c = 1 + (q+1)/(2ν)` (q = ref_df,
+            // ν = residual_df) maps the first-order reference toward the exact
+            // distribution. Rescale the statistic by `c` and re-reference; this
+            // recovers the nominal mean to second order at finite n. Reported
+            // alongside, never replacing, the first-order p-value.
+            if let Some(c) =
+                crate::inference::higher_order::gaussian_linear_bartlett_factor(ref_df, input.residual_df)
+            {
+                let f_corrected = f_stat / c;
+                let p_corr = (1.0 - dist.cdf(f_corrected)).clamp(0.0, 1.0);
+                if p_corr.is_finite() {
+                    p_value_corrected = Some(p_corr);
+                    bartlett_factor = Some(c);
+                }
+            }
             1.0 - dist.cdf(f_stat)
         }
     };
@@ -138,6 +168,8 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
         statistic,
         ref_df,
         p_value: p_value.clamp(0.0, 1.0),
+        p_value_corrected,
+        bartlett_factor,
     })
 }
 
