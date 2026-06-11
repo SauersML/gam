@@ -4170,6 +4170,20 @@ pub(crate) struct EvalShared {
     /// Cached FirthDenseOperator built from the original (non-reparameterized)
     /// design matrix, for use by the sparse evaluation path.
     firth_dense_operator_original: Option<Arc<FirthDenseOperator>>,
+    /// The ONE original-frame penalty pseudo-logdet factorization for this
+    /// evaluation point (#931 atom discipline). `log|Σ λ_k S_k|₊`'s VALUE,
+    /// ρ-derivatives, τ/ψ components, and ρ×τ cross blocks are all
+    /// contractions of this single eigendecomposition; the ρ-side criterion
+    /// assembly (`dense_penalty_logdet_derivs`, the sparse det2 path) and the
+    /// original-basis hyper-coordinate builders share it through
+    /// [`EvalShared::penalty_pseudologdet_original`]. Building a second
+    /// factorization of the same Sλ for the same evaluation point is the
+    /// objective↔gradient desync surface (#748/#752/#901) this cell removes:
+    /// the ridge and positive-eigenspace threshold are decided exactly once.
+    /// (The transformed-frame pair-callback path builds its own object — it
+    /// factorizes the canonical-TRANSFORMED, possibly constraint-projected
+    /// penalties, a genuinely different matrix, not a duplicate of this one.)
+    penalty_pseudologdet: std::sync::OnceLock<Arc<penalty_logdet::PenaltyPseudologdet>>,
 }
 
 impl EvalShared {
@@ -4178,6 +4192,58 @@ impl EvalShared {
             (None, None) => true,
             (Some(a), Some(b)) => a == b,
             _ => false,
+        }
+    }
+
+    /// Lazily build — once per evaluation point — the original-frame
+    /// [`PenaltyPseudologdet`](penalty_logdet::PenaltyPseudologdet) of
+    /// `Σ λ_k S_k` and hand every caller the SAME factorization.
+    ///
+    /// This is the #931 port of the penalty-logdet term: value, ρ-first /
+    /// ρ-second derivatives, τ-gradient components, τ×τ and ρ×τ Hessian
+    /// blocks are all projections of one eigendecomposition, so no pair of
+    /// consumers can disagree about the ridge or the positive-eigenspace
+    /// threshold. The ridge is read from this bundle's `ridge_passport` —
+    /// the single place that convention is decided.
+    ///
+    /// `lambdas` must be the λ = exp(ρ) vector of this bundle's evaluation
+    /// point and `p` the original-basis coefficient dimension; on a cache
+    /// hit both are checked against the stored object where representable.
+    pub(crate) fn penalty_pseudologdet_original(
+        &self,
+        canonical_penalties: &[crate::construction::CanonicalPenalty],
+        lambdas: &[f64],
+        p: usize,
+    ) -> Result<Arc<penalty_logdet::PenaltyPseudologdet>, EstimationError> {
+        if let Some(pld) = self.penalty_pseudologdet.get() {
+            if pld.dim() != p {
+                return Err(EstimationError::LayoutError(format!(
+                    "shared penalty pseudo-logdet frame mismatch: cached p={}, requested p={}",
+                    pld.dim(),
+                    p
+                )));
+            }
+            return Ok(Arc::clone(pld));
+        }
+        let pld = Arc::new(
+            penalty_logdet::PenaltyPseudologdet::from_penalties(
+                canonical_penalties,
+                lambdas,
+                self.ridge_passport.penalty_logdet_ridge(),
+                p,
+            )
+            .map_err(EstimationError::InvalidInput)?,
+        );
+        match self.penalty_pseudologdet.set(Arc::clone(&pld)) {
+            Ok(()) => Ok(pld),
+            // A concurrent caller initialized the cell first; both objects
+            // were built from identical inputs — return the canonical winner
+            // so every consumer holds literally the same factorization.
+            Err(_) => Ok(Arc::clone(
+                self.penalty_pseudologdet
+                    .get()
+                    .expect("OnceLock set raced, so it is initialized"),
+            )),
         }
     }
 }

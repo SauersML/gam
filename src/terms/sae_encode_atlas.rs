@@ -111,6 +111,19 @@ impl ChartRegion {
         self.radial_r_max = Some(r_max);
         self
     }
+
+    /// A jet-sup certificate is only meaningful over a genuine region. Even
+    /// families whose bounds are manifold-global constants (the sup over any
+    /// chart equals the global sup) must refuse a malformed chart rather than
+    /// certify garbage geometry.
+    fn assert_valid(&self) {
+        assert!(
+            self.radius.is_finite()
+                && self.radius >= 0.0
+                && self.center.iter().all(|c| c.is_finite()),
+            "ChartRegion must have a finite center and a finite non-negative radius"
+        );
+    }
 }
 
 /// Per-column sup-norm bounds on the first three coordinate jets of a basis
@@ -137,16 +150,20 @@ fn harmonic_jet_sup(num_basis: usize, order: u32) -> f64 {
 }
 
 impl BasisHessianLipschitz for PeriodicHarmonicEvaluator {
-    fn value_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn value_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         1.0
     }
-    fn jacobian_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn jacobian_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         harmonic_jet_sup(self.num_basis, 1)
     }
-    fn hessian_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn hessian_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         harmonic_jet_sup(self.num_basis, 2)
     }
-    fn third_sup(&self, _chart: &ChartRegion) -> f64 {
+    fn third_sup(&self, chart: &ChartRegion) -> f64 {
+        chart.assert_valid();
         harmonic_jet_sup(self.num_basis, 3)
     }
 }

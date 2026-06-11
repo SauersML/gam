@@ -18,6 +18,7 @@ pub mod penalties;
 pub mod penalty_op;
 pub mod sae_candidate_index;
 pub mod sae_corpus;
+pub mod sae_criterion_atoms;
 pub mod sae_encode_atlas;
 pub mod sae_manifold;
 pub mod sae_optimality_certificate;
@@ -71,6 +72,7 @@ pub use sae_optimality_certificate::{
     CriterionCertificate, DirectionalSamples, certificate_from_samples,
     deterministic_probe_direction, probe_step,
 };
+pub use sae_criterion_atoms::{SaeCriterion, SaeCriterionAtom};
 pub use sae_row_jet_program::{
     AtomRowBasisJet, RowGate, SaeReconstructionRowProgram,
 };

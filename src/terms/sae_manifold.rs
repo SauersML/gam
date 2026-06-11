@@ -46,6 +46,7 @@ use crate::terms::analytic_penalties::{
     resolve_learnable_weight,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
+use crate::terms::sae_criterion_atoms::SaeCriterion;
 use crate::terms::sae_optimality_certificate::{
     CriterionCertificate, DirectionalSamples, certificate_from_samples,
     deterministic_probe_direction, probe_step,
@@ -9904,6 +9905,61 @@ impl SaeManifoldTerm {
             third_order_correction,
             third_order_correction_available: true,
         })
+    }
+
+    /// Compose the SAE LAML criterion as a sum of atoms (#931 SAE pilot).
+    ///
+    /// This is the single seam that establishes value↔gradient coherence for
+    /// the SAE objective: it runs the inner solve once via
+    /// [`Self::reml_criterion_with_cache`], reads the value decomposition
+    /// (`loss.total() + extra_penalty_energy`, `log|H|`, `occam`) and the
+    /// matching gradient channels (`SaeOuterRhoGradientComponents`) from the
+    /// SAME converged cache, and hands them to [`SaeCriterion::assemble`]. The
+    /// returned criterion's [`SaeCriterion::value`] and
+    /// [`SaeCriterion::gradient`] are then projections of one factorization —
+    /// the outer optimizer can no longer evaluate a value path and a gradient
+    /// path that disagree (the #752/#748/#901 desync class). The
+    /// implicit-stationarity envelope correction (#1006's Γ term) is its own
+    /// named atom, so the channel the desync class keeps dropping is visible
+    /// rather than a silent zero.
+    pub fn criterion_as_atoms(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Result<SaeCriterion, String> {
+        let (_v, loss, cache) = self.reml_criterion_with_cache(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        )?;
+        let log_det = arrow_log_det_from_cache(&cache)
+            .ok_or_else(|| "criterion_as_atoms: arrow_log_det_from_cache returned None".to_string())?;
+        let occam = self.reml_occam_term(rho)?;
+        let extra_penalty_energy = match registry {
+            Some(reg) => self.reml_extra_penalty_value_total(reg)?,
+            None => 0.0,
+        };
+        let data_fit_priors_value = loss.total() + extra_penalty_energy;
+
+        let components = self.analytic_outer_rho_gradient_components(rho, &loss, &cache)?;
+        Ok(SaeCriterion::assemble(
+            data_fit_priors_value,
+            log_det,
+            occam,
+            components.explicit,
+            components.logdet_trace,
+            components.occam,
+            components.third_order_correction,
+        ))
     }
 
     /// Gaussian reconstruction dispersion `φ̂`, the scale that turns the

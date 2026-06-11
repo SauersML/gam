@@ -35,6 +35,7 @@ use crate::families::identifiability_compiler::{
     BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
 use crate::linalg::faer_ndarray::{FaerEigh, fast_ab, fast_abt};
+use crate::solver::gauge::{Gauge, assemble_block_triangular_t};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use faer::Side;
 
@@ -1001,98 +1002,6 @@ pub fn pull_back_blockwise_penalty_per_term(
 /// earlier blocks exist.
 ///
 /// Returns T of shape `(Σ raw_p_b) × (Σ kept_p_b)`.
-pub fn build_full_t_matrix(
-    v_per_term: &[Array2<f64>],
-    r_per_term: &[Option<Array2<f64>>],
-) -> Array2<f64> {
-    assert_eq!(
-        v_per_term.len(),
-        r_per_term.len(),
-        "build_full_t_matrix: v_per_term len {} != r_per_term len {}",
-        v_per_term.len(),
-        r_per_term.len(),
-    );
-    let raw_widths: Vec<usize> = v_per_term.iter().map(|v| v.nrows()).collect();
-    let kept_widths: Vec<usize> = v_per_term.iter().map(|v| v.ncols()).collect();
-    let row_offsets: Vec<usize> = {
-        let mut o = Vec::with_capacity(raw_widths.len() + 1);
-        o.push(0);
-        for w in &raw_widths {
-            o.push(o.last().copied().unwrap_or(0) + w);
-        }
-        o
-    };
-    let col_offsets: Vec<usize> = {
-        let mut o = Vec::with_capacity(kept_widths.len() + 1);
-        o.push(0);
-        for w in &kept_widths {
-            o.push(o.last().copied().unwrap_or(0) + w);
-        }
-        o
-    };
-    let total_rows = row_offsets.last().copied().unwrap_or(0);
-    let total_cols = col_offsets.last().copied().unwrap_or(0);
-    let mut t = Array2::<f64>::zeros((total_rows, total_cols));
-    // Diagonal: place V_b on (b, b).
-    for (b, v) in v_per_term.iter().enumerate() {
-        let r = v.nrows();
-        let c = v.ncols();
-        if r > 0 && c > 0 {
-            t.slice_mut(ndarray::s![
-                row_offsets[b]..row_offsets[b] + r,
-                col_offsets[b]..col_offsets[b] + c
-            ])
-            .assign(v);
-        }
-    }
-    // Upper triangle: for each b ≥ 1, place −R_{a→b} at (a, b) for a < b.
-    // `r_per_term[b]` stacks the R_{a→b} blocks row-wise in order
-    // a = 0, 1, …, b-1; each block has `raw_widths[a]` rows and
-    // `kept_widths[b]` cols.
-    for b in 1..v_per_term.len() {
-        let Some(r_stack) = r_per_term[b].as_ref() else {
-            continue;
-        };
-        let kept_b = kept_widths[b];
-        assert_eq!(
-            r_stack.ncols(),
-            kept_b,
-            "build_full_t_matrix: r_per_term[{b}] has {} cols, expected {}",
-            r_stack.ncols(),
-            kept_b,
-        );
-        let expected_rows: usize = raw_widths.iter().take(b).sum();
-        assert_eq!(
-            r_stack.nrows(),
-            expected_rows,
-            "build_full_t_matrix: r_per_term[{b}] has {} rows, expected {} (sum of raw_widths[0..{}])",
-            r_stack.nrows(),
-            expected_rows,
-            b,
-        );
-        let mut local_row = 0usize;
-        for a in 0..b {
-            let r_a = raw_widths[a];
-            if r_a == 0 || kept_b == 0 {
-                local_row += r_a;
-                continue;
-            }
-            let block = r_stack.slice(ndarray::s![local_row..local_row + r_a, ..]);
-            let mut dst = t.slice_mut(ndarray::s![
-                row_offsets[a]..row_offsets[a] + r_a,
-                col_offsets[b]..col_offsets[b] + kept_b
-            ]);
-            for i in 0..r_a {
-                for j in 0..kept_b {
-                    dst[[i, j]] = -block[[i, j]];
-                }
-            }
-            local_row += r_a;
-        }
-    }
-    t
-}
-
 /// A single global-T block specification: the V matrix and the
 /// optional residualisation against earlier blocks for one block in
 /// the global block ordering. `r_against_earlier` is `Some(R)` where
@@ -1117,7 +1026,7 @@ pub struct GlobalTSpec {
 /// `(Σ raw_p) × (Σ kept_p)` where the sums run over every leaf term
 /// in every top-level block, in nested order.
 ///
-/// This delegates to `build_full_t_matrix` after flattening
+/// This delegates to `assemble_block_triangular_t` after flattening
 /// `spec.blocks` — the block-upper-triangular structure is the same
 /// regardless of how the leaf terms group into top-level blocks; the
 /// only thing the top-level grouping affects is the call-site
@@ -1132,7 +1041,7 @@ pub fn build_global_t_matrix(spec: &GlobalTSpec) -> Array2<f64> {
             r_flat.push(term.r_against_earlier.clone());
         }
     }
-    build_full_t_matrix(&v_flat, &r_flat)
+    assemble_block_triangular_t(&v_flat, &r_flat)
 }
 
 /// Pull a single raw per-term penalty back through the full-width
@@ -1379,7 +1288,7 @@ pub fn compiled_map_from_per_term(
     v_all.extend(compiled.v_marginal_per_term.iter().cloned());
     v_all.extend(compiled.v_logslope_per_term.iter().cloned());
 
-    let t_full = build_full_t_matrix(&v_all, &compiled.r_lw_per_term);
+    let t_full = assemble_block_triangular_t(&v_all, &compiled.r_lw_per_term);
 
     // Per-block raw / compiled widths = summed per-term widths within the block.
     let raw_w = |terms: &[Array2<f64>]| -> usize { terms.iter().map(|v| v.nrows()).sum() };
@@ -1502,7 +1411,7 @@ impl SmgsLiftViaT {
             block_starts_compiled.push(prev_c + v.ncols());
             block_starts_raw.push(prev_r + v.nrows());
         }
-        let t_full = build_full_t_matrix(v_per_term, r_per_term);
+        let t_full = assemble_block_triangular_t(v_per_term, r_per_term);
         Self {
             t_full,
             block_starts_compiled,
@@ -2455,10 +2364,10 @@ mod tests {
     }
 
     #[test]
-    fn build_full_t_matrix_identity_when_v_eye_and_r_none() {
+    fn assemble_block_triangular_t_identity_when_v_eye_and_r_none() {
         let v_a = Array2::<f64>::eye(2);
         let v_b = Array2::<f64>::eye(2);
-        let t = build_full_t_matrix(&[v_a, v_b], &[None, None]);
+        let t = assemble_block_triangular_t(&[v_a, v_b], &[None, None]);
         assert_eq!(t.dim(), (4, 4));
         let eye4 = Array2::<f64>::eye(4);
         for i in 0..4 {
@@ -2469,7 +2378,7 @@ mod tests {
     }
 
     #[test]
-    fn build_full_t_matrix_with_drops_and_nonzero_r() {
+    fn assemble_block_triangular_t_with_drops_and_nonzero_r() {
         let mut v_a = Array2::<f64>::zeros((3, 2));
         v_a[[0, 0]] = 1.0;
         v_a[[1, 0]] = 0.5;
@@ -2477,7 +2386,7 @@ mod tests {
         let v_b = Array2::<f64>::eye(2);
         let r_ab =
             Array2::<f64>::from_shape_fn((3, 2), |(i, j)| 1.0 + (i as f64) + 0.25 * (j as f64));
-        let t = build_full_t_matrix(&[v_a.clone(), v_b.clone()], &[None, Some(r_ab.clone())]);
+        let t = assemble_block_triangular_t(&[v_a.clone(), v_b.clone()], &[None, Some(r_ab.clone())]);
         assert_eq!(t.dim(), (5, 4));
         for i in 0..3 {
             for j in 0..2 {
@@ -2565,7 +2474,7 @@ mod tests {
         use crate::terms::smooth::BlockwisePenalty;
         let v_a = Array2::<f64>::eye(2);
         let v_b = Array2::<f64>::eye(2);
-        let t = build_full_t_matrix(&[v_a, v_b], &[None, None]);
+        let t = assemble_block_triangular_t(&[v_a, v_b], &[None, None]);
         let local = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| (i + 2 * j + 1) as f64);
         let pen = BlockwisePenalty::new(0..2, local.clone());
         let anchor_offset = 2usize;
@@ -2598,7 +2507,7 @@ mod tests {
         let v_a = Array2::<f64>::eye(2);
         let v_b = Array2::<f64>::eye(2);
         let r_ab = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| 1.0 + (i + j) as f64);
-        let t = build_full_t_matrix(&[v_a, v_b], &[None, Some(r_ab.clone())]);
+        let t = assemble_block_triangular_t(&[v_a, v_b], &[None, Some(r_ab.clone())]);
         let mut local = Array2::<f64>::zeros((2, 2));
         local[[0, 0]] = 2.0;
         local[[1, 1]] = 3.0;
@@ -2641,7 +2550,7 @@ mod tests {
         let r_ab = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| {
             0.5 - 0.2 * (i as f64) + 0.1 * (j as f64)
         });
-        let t = build_full_t_matrix(&[v_a.clone(), v_b.clone()], &[None, Some(r_ab.clone())]);
+        let t = assemble_block_triangular_t(&[v_a.clone(), v_b.clone()], &[None, Some(r_ab.clone())]);
         let raw_local =
             Array2::<f64>::from_shape_fn(
                 (2, 2),
@@ -2733,13 +2642,13 @@ mod tests {
         // R_marg: rows = time raw width 3, cols = marginal compiled width 2.
         let r_marg = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| 0.7 - 0.1 * ((i + j) as f64));
         // R_log: rows = time+marg RAW width 6 (3 + 3), cols = logslope compiled
-        // width 2. `build_full_t_matrix` stacks R_{a→b} over a<b, so the row
+        // width 2. `assemble_block_triangular_t` stacks R_{a→b} over a<b, so the row
         // count is the sum of the RAW widths of the prior blocks (not their
         // compiled widths — marginal's compiled width is 2 but its raw width is 3).
         let r_log =
             Array2::<f64>::from_shape_fn((6, 2), |(i, j)| 0.3 + 0.05 * ((i * 2 + j) as f64));
 
-        let t = build_full_t_matrix(
+        let t = assemble_block_triangular_t(
             &[v_time.clone(), v_marg.clone(), v_log.clone()],
             &[None, Some(r_marg.clone()), Some(r_log.clone())],
         );

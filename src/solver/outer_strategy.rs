@@ -4458,6 +4458,7 @@ fn solution_into_outer_result(
         plan_used,
         operator_trust_radius: None,
         operator_stop_reason: None,
+        criterion_certificate: None,
     }
 }
 
@@ -5034,6 +5035,7 @@ impl OuterProblem {
                         plan_used,
                         operator_trust_radius: None,
                         operator_stop_reason: None,
+                        criterion_certificate: None,
                     });
                 }
                 CacheSeedDecision::Seed {
@@ -5233,6 +5235,13 @@ pub struct OuterResult {
     pub operator_trust_radius: Option<f64>,
     /// Why the internal operator trust-region solver stopped.
     pub operator_stop_reason: Option<OperatorTrustRegionStopReason>,
+    /// First-order optimality self-audit at the returned point (#934).
+    ///
+    /// `None` when no analytic gradient was measured at termination
+    /// (gradient-free solvers, cache-hit short-circuits, per-atom EFS) or
+    /// when an audit probe failed to evaluate. Populated once by
+    /// [`run_outer`] after the solver ladder returns, outside all hot loops.
+    pub criterion_certificate: Option<CriterionCertificate>,
 }
 
 impl OuterResult {
@@ -5244,6 +5253,325 @@ impl OuterResult {
             None => "n/a".to_string(),
         }
     }
+}
+
+// ─── First-order optimality certificate (#934) ────────────────────────
+//
+// The objective↔gradient desync bug genus (#748, #752, #808, #901, …) has a
+// universal signature: at the returned "optimum" the analytic gradient says
+// converged while a finite difference of the ACTUAL criterion value says
+// otherwise (or the optimizer stalls and rails λ). Every such bug was
+// diagnosed by a human running exactly that FD comparison by hand. The
+// certificate makes the engine run it on itself, once, at θ̂, on every fit:
+// two central-difference pairs of the VALUE path along one deterministic
+// random direction, compared against ∇F(θ̂)·v from the analytic path, plus
+// the two ancillary facts every desync postmortem asks for (is the outer
+// curvature PD here; did any λ rail to a bound). It is the runtime
+// enforcement layer for the criterion-atom architecture (#931): atoms make
+// desync structurally hard, the certificate makes any residue observable.
+//
+// Cost discipline: at most four value-path evaluations at the single final
+// point, outside every hot loop. The value path is evaluated through
+// `eval_cost` at θ̂±hv — points the gradient path never visited, so the
+// existing ρ-keyed caches naturally miss and the true value code runs.
+// Disagreement does not fail the fit: it names the broken criterion loudly
+// in the result, the log, and the report.
+
+/// Standardized-disagreement gate: the audit flags inconsistency when the
+/// analytic and FD directional derivatives differ by more than this many FD
+/// error bars (and also fail the relative gate).
+const CERTIFICATE_Z_GATE: f64 = 4.0;
+
+/// Relative agreement gate: differences below this fraction of the larger
+/// directional derivative are consistent regardless of the (possibly
+/// underestimated) FD error bar.
+const CERTIFICATE_RELATIVE_GATE: f64 = 1e-3;
+
+/// ρ margin (in log-λ units) within which an outer smoothing coordinate
+/// counts as railed against its box bound — the #752 signature (λ → ∞ when
+/// a curvature term goes missing from the criterion). Same spirit as
+/// [`OVERSMOOTH_BOUNDARY_MARGIN`], which classifies seed *starts*; this one
+/// classifies returned *optima*.
+const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
+
+/// First-order optimality certificate: gradient-vs-objective FD audit at the
+/// returned optimum (#934).
+///
+/// Answers, machine-checkably, the three questions every objective↔gradient
+/// desync postmortem asks: does the analytic gradient match the actual
+/// criterion value HERE ([`Self::first_order_consistent`]); is the outer
+/// curvature positive definite HERE (`hessian_pd`); did any smoothing
+/// coordinate rail to a box bound (`lambdas_railed`).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CriterionCertificate {
+    /// ‖∇F(θ̂)‖₂ from the analytic gradient path at the returned point.
+    pub grad_norm: f64,
+    /// Analytic directional derivative ∇F(θ̂)·v along the audit direction.
+    pub analytic_directional: f64,
+    /// Richardson-extrapolated central difference of the criterion VALUE
+    /// path along the same direction: (4·D_h − D_2h)/3 from the h and 2h
+    /// central-difference pairs.
+    pub fd_directional: f64,
+    /// Error bar on `fd_directional`: the Richardson residual |D_h − D_2h|
+    /// (which absorbs both truncation and inner-solve value noise) floored
+    /// by the central-difference roundoff bound ε·|F|/h.
+    pub fd_error: f64,
+    /// |analytic − fd| / fd_error — standardized disagreement.
+    pub agreement_z: f64,
+    /// Base central-difference step h along the unit direction.
+    pub fd_step: f64,
+    /// Whether the final outer Hessian is positive definite at θ̂, when the
+    /// solver tracked one (`None` when no final Hessian was available).
+    pub hessian_pd: Option<bool>,
+    /// Leading smoothing coordinates (ρ block) pinned within
+    /// [`CERTIFICATE_RAIL_MARGIN`] of either box bound at the optimum.
+    pub lambdas_railed: Vec<usize>,
+}
+
+impl CriterionCertificate {
+    /// Whether the analytic directional derivative agrees with the finite
+    /// difference of the actual criterion value at the optimum.
+    ///
+    /// Two gates, either suffices: within [`CERTIFICATE_Z_GATE`] FD error
+    /// bars (the principled test), or within [`CERTIFICATE_RELATIVE_GATE`]
+    /// of the larger derivative (guards against an underestimated error bar
+    /// flagging two derivatives that agree to 0.1%).
+    pub fn first_order_consistent(&self) -> bool {
+        let diff = (self.analytic_directional - self.fd_directional).abs();
+        let scale = self
+            .analytic_directional
+            .abs()
+            .max(self.fd_directional.abs());
+        diff <= (CERTIFICATE_Z_GATE * self.fd_error).max(CERTIFICATE_RELATIVE_GATE * scale)
+    }
+
+    /// Whether every audited fact is clean: gradient matches objective, no
+    /// definiteness failure, no railed smoothing coordinate.
+    pub fn is_clean(&self) -> bool {
+        self.first_order_consistent()
+            && self.hessian_pd != Some(false)
+            && self.lambdas_railed.is_empty()
+    }
+
+    /// One-line human-readable rendering for logs and reports.
+    pub fn summary(&self) -> String {
+        format!(
+            "grad·v={:.6e} fd·v={:.6e}±{:.1e} z={:.2} |g|={:.3e} hessian_pd={} railed={:?} → {}",
+            self.analytic_directional,
+            self.fd_directional,
+            self.fd_error,
+            self.agreement_z,
+            self.grad_norm,
+            match self.hessian_pd {
+                Some(true) => "yes",
+                Some(false) => "NO",
+                None => "n/a",
+            },
+            self.lambdas_railed,
+            if self.first_order_consistent() {
+                "consistent"
+            } else {
+                "GRADIENT-OBJECTIVE DESYNC"
+            },
+        )
+    }
+}
+
+/// Deterministic unit direction on the θ sphere for the certificate audit.
+///
+/// Seeded from the problem fingerprint (context string + θ̂ bits) via FNV-1a
+/// and expanded with SplitMix64 + Box–Muller — no clock, no global RNG, so
+/// the audit direction is reproducible across runs of the same fit.
+fn certificate_audit_direction(theta: &Array1<f64>, context: &str) -> Array1<f64> {
+    let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut fnv = |byte: u8| {
+        seed ^= u64::from(byte);
+        seed = seed.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for byte in context.bytes() {
+        fnv(byte);
+    }
+    for &x in theta.iter() {
+        for byte in x.to_bits().to_le_bytes() {
+            fnv(byte);
+        }
+    }
+    let mut state = seed;
+    let mut next_unit = move || {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        // Uniform in (0, 1): 53 mantissa bits, nudged off zero for the log.
+        ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    let mut direction = Array1::<f64>::zeros(theta.len());
+    let mut i = 0;
+    while i < direction.len() {
+        let (u1, u2) = (next_unit(), next_unit());
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let angle = 2.0 * std::f64::consts::PI * u2;
+        direction[i] = radius * angle.cos();
+        if i + 1 < direction.len() {
+            direction[i + 1] = radius * angle.sin();
+        }
+        i += 2;
+    }
+    let norm = direction.dot(&direction).sqrt();
+    if norm.is_finite() && norm > f64::EPSILON {
+        direction.mapv_inplace(|v| v / norm);
+        direction
+    } else {
+        // Degenerate draw (probability ~0): fall back to the first axis.
+        let mut fallback = Array1::<f64>::zeros(theta.len());
+        fallback[0] = 1.0;
+        fallback
+    }
+}
+
+/// Plain Cholesky positive-definiteness probe for the (small, outer-dim)
+/// final Hessian. Returns `None` when the matrix is empty, non-square, or
+/// non-finite; `Some(false)` on any non-positive pivot.
+fn certificate_hessian_is_pd(hessian: &Array2<f64>) -> Option<bool> {
+    let n = hessian.nrows();
+    if n == 0 || hessian.ncols() != n || hessian.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let mut chol = hessian.clone();
+    for j in 0..n {
+        for k in 0..j {
+            let l_jk = chol[[j, k]];
+            for i in j..n {
+                chol[[i, j]] -= chol[[i, k]] * l_jk;
+            }
+        }
+        let pivot = chol[[j, j]];
+        if !(pivot > 0.0) || !pivot.is_finite() {
+            return Some(false);
+        }
+        let inv_sqrt = 1.0 / pivot.sqrt();
+        for i in j..n {
+            chol[[i, j]] *= inv_sqrt;
+        }
+    }
+    Some(true)
+}
+
+/// Smoothing coordinates (leading ρ block) railed against the outer box.
+fn certificate_railed_lambdas(
+    rho: &Array1<f64>,
+    rho_dim: usize,
+    config: &OuterConfig,
+) -> Vec<usize> {
+    (0..rho_dim.min(rho.len()))
+        .filter(|&k| {
+            let (lo, hi) = match config.bounds.as_ref() {
+                Some((lo, hi)) if k < lo.len() && k < hi.len() => (lo[k], hi[k]),
+                Some(_) => return false,
+                None => (-config.rho_bound, config.rho_bound),
+            };
+            (rho[k] - lo).abs() <= CERTIFICATE_RAIL_MARGIN
+                || (hi - rho[k]).abs() <= CERTIFICATE_RAIL_MARGIN
+        })
+        .collect()
+}
+
+/// Perform the randomized first-order self-audit at the returned optimum.
+///
+/// Requires an analytic final gradient (the thing being audited); returns
+/// `None` — never an error — when the gradient is absent/non-finite or when
+/// any of the four value probes fails to evaluate, so the audit can never
+/// fail a fit that the optimizer accepted.
+fn audit_first_order_optimality(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+    result: &OuterResult,
+) -> Option<CriterionCertificate> {
+    let gradient = result.final_gradient.as_ref()?;
+    if gradient.is_empty()
+        || gradient.len() != result.rho.len()
+        || gradient.iter().any(|g| !g.is_finite())
+        || result.rho.iter().any(|r| !r.is_finite())
+    {
+        return None;
+    }
+
+    let theta = &result.rho;
+    let direction = certificate_audit_direction(theta, context);
+    // Central-difference step on the optimal ε^(1/3) scale, sized to the
+    // iterate so saturated ρ (|ρ| up to rho_bound) keeps θ̂±2hv resolvable.
+    let theta_scale = theta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let step = f64::EPSILON.cbrt() * (1.0 + theta_scale);
+
+    let mut probe = |scale: f64| -> Option<f64> {
+        let point = theta + &(scale * &direction);
+        match obj.eval_cost(&point) {
+            Ok(value) if value.is_finite() => Some(value),
+            Ok(value) => {
+                log::debug!(
+                    "[CERTIFICATE] {context}: audit probe at θ̂{scale:+.3e}·v returned \
+                     non-finite criterion value {value}; certificate skipped"
+                );
+                None
+            }
+            Err(err) => {
+                log::debug!(
+                    "[CERTIFICATE] {context}: audit probe at θ̂{scale:+.3e}·v failed ({err}); \
+                     certificate skipped"
+                );
+                None
+            }
+        }
+    };
+    let f_plus_h = probe(step)?;
+    let f_minus_h = probe(-step)?;
+    let f_plus_2h = probe(2.0 * step)?;
+    let f_minus_2h = probe(-2.0 * step)?;
+
+    let d_h = (f_plus_h - f_minus_h) / (2.0 * step);
+    let d_2h = (f_plus_2h - f_minus_2h) / (4.0 * step);
+    let fd_directional = (4.0 * d_h - d_2h) / 3.0;
+    // Error bar: the Richardson residual measures truncation + value-path
+    // noise (inner-solve tolerance) empirically; the roundoff bound floors
+    // it when the residual is accidentally tiny.
+    let value_scale = f_plus_h
+        .abs()
+        .max(f_minus_h.abs())
+        .max(f_plus_2h.abs())
+        .max(f_minus_2h.abs());
+    let roundoff = f64::EPSILON * (1.0 + value_scale) / step;
+    let fd_error = (d_h - d_2h).abs().max(roundoff);
+
+    let analytic_directional = gradient.dot(&direction);
+    let grad_norm = gradient.dot(gradient).sqrt();
+    let agreement_z = (analytic_directional - fd_directional).abs() / fd_error;
+
+    let rho_dim = obj.capability().theta_layout().rho_dim();
+    let certificate = CriterionCertificate {
+        grad_norm,
+        analytic_directional,
+        fd_directional,
+        fd_error,
+        agreement_z,
+        fd_step: step,
+        hessian_pd: result
+            .final_hessian
+            .as_ref()
+            .and_then(certificate_hessian_is_pd),
+        lambdas_railed: certificate_railed_lambdas(theta, rho_dim, config),
+    };
+    if certificate.is_clean() {
+        log::info!("[CERTIFICATE] {context}: {}", certificate.summary());
+    } else {
+        log::warn!(
+            "[CERTIFICATE warning] {context}: optimality self-audit flagged the returned \
+             optimum — {}",
+            certificate.summary(),
+        );
+    }
+    Some(certificate)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5276,6 +5604,23 @@ pub enum OperatorTrustRegionStopReason {
 /// Callers should declare only the primary capability and, at most, whether
 /// automatic fallback is enabled at all.
 fn run_outer(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+) -> Result<OuterResult, EstimationError> {
+    let mut result = run_outer_uncertified(obj, config, context)?;
+    // First-order optimality self-audit (#934): once, at the returned θ̂,
+    // outside all hot loops, for every entry point of the solver ladder
+    // (dense, device, per-atom EFS, fallback plans). Probes evaluate the
+    // value path at θ̂±hv AFTER the solve, so the only state they perturb
+    // is warm-start residue O(h) from the optimum — every caller recovers
+    // its fitted state from `result.rho`, not from last-eval residue.
+    result.criterion_certificate = audit_first_order_optimality(obj, config, context, &result);
+    Ok(result)
+}
+
+/// The solver ladder behind [`run_outer`], without the #934 self-audit.
+fn run_outer_uncertified(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     context: &str,
@@ -5316,6 +5661,7 @@ fn run_outer(
             plan_used: the_plan,
             operator_trust_radius: None,
             operator_stop_reason: None,
+            criterion_certificate: None,
         });
     }
 
@@ -5875,6 +6221,36 @@ fn run_outer_with_plan(
         }
         crate::solver::estimate::reml::runtime::record_current_outer_iter_for_ift(0);
         obj.reset();
+        // Certified curvature-homotopy entry leg (#1007). When the objective
+        // has a certified anchor (the SAE-manifold `η = 0` Eckart-Young
+        // relaxation), run the predictor-corrector `η`-walk from it INSTEAD of
+        // relying on the blind multi-seed multistart: a single walk along the
+        // unique optimal branch reaches the real (`η = 1`) objective, leaving
+        // the inner state warm there. The min-pivot invariant + step-halving
+        // make the walk certified; a degenerate anchor or a detected
+        // bifurcation returns `false` (the term is left at the full basis) and
+        // the seed cascade below takes over — the outcome is recorded on the
+        // fit payload either way, never a silent fallback. The walk runs once
+        // per accepted seed entry right after `reset`, so cross-seed state
+        // hygiene is unchanged (#1003): `reset` restores the pristine `η = 1`
+        // baseline before each walk.
+        match obj.curvature_homotopy_entry() {
+            Some(Ok(arrived)) => {
+                log::info!(
+                    "[OUTER] {context}: curvature-homotopy entry seed {seed_idx} arrived={arrived}"
+                );
+            }
+            Some(Err(err)) => {
+                // A hard anchor-construction failure is not a feasibility gate:
+                // fall through to the cascade exactly as a refused pre-warm does.
+                log::warn!(
+                    "[OUTER] {context}: curvature-homotopy entry seed {seed_idx} errored ({err}); \
+                     deferring to seed cascade"
+                );
+                obj.reset();
+            }
+            None => {}
+        }
         // Magic-by-default continuation pre-warm. On hard fits this
         // walks ρ from an oversmoothing ρ₀ down to `seed`, leaving the
         // objective's inner state warm at `seed`. On easy fits (ρ₀
@@ -6590,6 +6966,7 @@ fn run_outer_with_plan(
                                 plan_used: *the_plan,
                                 operator_trust_radius: None,
                                 operator_stop_reason: None,
+                                criterion_certificate: None,
                             };
                             Ok::<OuterResult, EstimationError>(result)
                         }
@@ -6987,6 +7364,7 @@ fn run_outer_with_plan(
                         plan_used: *the_plan,
                         operator_trust_radius: None,
                         operator_stop_reason: None,
+                        criterion_certificate: None,
                     }),
                     CompassSearchOutcome::BudgetExhausted { point, cost, polls } => {
                         log::warn!(
@@ -7005,6 +7383,7 @@ fn run_outer_with_plan(
                             plan_used: *the_plan,
                             operator_trust_radius: None,
                             operator_stop_reason: None,
+                            criterion_certificate: None,
                         })
                     }
                 }
@@ -9017,6 +9396,7 @@ mod tests {
             },
             operator_trust_radius: None,
             operator_stop_reason: None,
+            criterion_certificate: None,
         };
         let nonconverged_lo = OuterResult {
             rho: array![1.0],
@@ -9032,6 +9412,7 @@ mod tests {
             },
             operator_trust_radius: None,
             operator_stop_reason: None,
+            criterion_certificate: None,
         };
         let converged = OuterResult {
             rho: array![2.0],
@@ -9047,6 +9428,7 @@ mod tests {
             },
             operator_trust_radius: None,
             operator_stop_reason: None,
+            criterion_certificate: None,
         };
 
         assert!(candidate_improves_best(&nonconverged_hi, None));

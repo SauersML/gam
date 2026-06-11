@@ -567,6 +567,15 @@ impl PenaltyPseudologdet {
         self.rank
     }
 
+    /// Ambient dimension p of the penalty space this factorization lives in.
+    ///
+    /// Consumers that share one factorization across code paths (#931: the
+    /// `EvalShared` cell) use this to assert they are contracting against an
+    /// object built in the frame they expect.
+    pub fn dim(&self) -> usize {
+        self.w_factor.nrows()
+    }
+
     // ── Reduced-space representations ──────────────────────────────────────
 
     /// Compute Y = W^T M W for an arbitrary symmetric matrix M.
