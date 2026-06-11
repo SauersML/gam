@@ -2861,31 +2861,6 @@ extern "C" __global__ void arrow_sae_diag_sub(
         Ok(closure)
     }
 
-    /// Jacobi-preconditioned conjugate-gradient solve of the dense reduced
-    /// β-system `S·δβ = r` fully on device.
-    ///
-    /// `S` (`k × k`, symmetric positive definite) and `r` (`k`) are uploaded
-    /// once. Each CG iteration evaluates `S·p` via cuBLAS `Dgemv` device-side
-    /// (the `O(k²)` cost that dominates at `k = 100K`), downloads the `k`-vector
-    /// result, and runs the scalar CG recurrences on the host (the `O(k)` dot
-    /// products and `axpy`s are negligible beside the matvec). The Jacobi
-    /// preconditioner `M^{-1} = diag(S)^{-1}` is extracted once from a single
-    /// diagonal `dtoh`.
-    ///
-    /// Returns `Unavailable` when the workload is below the GEMV dispatch
-    /// policy or no CUDA context is reachable, and `SchurFactorFailed` when the
-    /// Jacobi diagonal is not strictly positive (an indefinite reduced system
-    /// the caller escalates with a proximal ridge).
-    pub(super) fn solve_reduced_beta_pcg(
-        s_acc: &ndarray::Array2<f64>,
-        rhs_beta: &Array1<f64>,
-        max_iterations: usize,
-        relative_tolerance: f64,
-    ) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
-        solve_reduced_beta_pcg_with_diagnostics(s_acc, rhs_beta, max_iterations, relative_tolerance)
-            .map(|(x, _)| x)
-    }
-
     pub(super) fn solve_sae_matrix_free_pcg(
         sys: &ArrowSchurSystem,
         data: &DeviceSaePcgData,
