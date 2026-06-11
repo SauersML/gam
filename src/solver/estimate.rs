@@ -6339,6 +6339,18 @@ impl UnifiedFitResult {
         self.inference.as_ref().map(|inf| &inf.working_response)
     }
 
+    /// Smoothing-parameter uncertainty covariance contribution `J·Var(ρ)·Jᵀ`
+    /// in coefficient space, on the same dispersion scale as the conditional
+    /// covariance `Vb = φ·H⁻¹`. This is the exact ρ-uncertainty term assembled
+    /// from the IFT `dβ̂/dρ` and the outer Hessian at the fit optimum; the
+    /// model-comparison machinery divides it by `φ` to recover the H⁻¹-scale
+    /// ρ-covariance needed for the Wood–Pya–Säfken corrected EDF.
+    pub fn smoothing_correction(&self) -> Option<&Array2<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.smoothing_correction.as_ref())
+    }
+
     /// Total effective degrees of freedom.
     pub fn edf_total(&self) -> Option<f64> {
         self.inference.as_ref().map(|inf| inf.edf_total)

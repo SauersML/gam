@@ -12652,13 +12652,7 @@ fn sae_steer_delta<'py>(
     let plan = gam::inference::steering::steer_delta(&term, metric, atom_k, &t_from_vec, &t_to_vec)
         .map_err(py_value_error)?;
 
-    let provenance_str = match plan.metric_provenance {
-        gam::inference::row_metric::MetricProvenance::Euclidean => "Euclidean",
-        gam::inference::row_metric::MetricProvenance::OutputFisher { .. } => "OutputFisher",
-        gam::inference::row_metric::MetricProvenance::WhitenedStructured { .. } => {
-            "WhitenedStructured"
-        }
-    };
+    let provenance_str = metric_provenance_label(plan.metric_provenance);
 
     let out = PyDict::new(py);
     out.set_item("atom", plan.atom)?;

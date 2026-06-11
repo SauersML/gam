@@ -24241,6 +24241,7 @@ mod tests {
                     psi_gradient: None,
                     psi_indices: None,
                     inner_hessian_scale: None,
+                    logdet_enclosure_gap: None,
                 })
             },
             |_beta: &Array1<f64>| Ok(()),
@@ -26020,6 +26021,7 @@ mod tests {
                     psi_gradient: None,
                     psi_indices: None,
                     inner_hessian_scale: None,
+                    logdet_enclosure_gap: None,
                 })
             },
             |_beta: &Array1<f64>| Ok(()),

@@ -47,6 +47,7 @@ use crate::families::identifiability_compiler::{
 };
 use crate::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
+use crate::solver::gauge::Gauge;
 use crate::solver::identifiability_audit::{
     IdentifiabilityAudit, audit_identifiability, audit_identifiability_channel_aware,
 };
@@ -187,8 +188,11 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
 ///
 /// `reduced_specs[i]` carries an `r_i`-column design wrapping the raw
 /// `p_i`-column design via `CoefficientTransformOperator`. Penalties
-/// are pulled back as `T_iᵀ S_k T_i`. `per_block_transform[i]` is the
-/// raw-to-reduced selection matrix `T_i` of shape `(p_i_raw, r_i)`.
+/// are pulled back as `T_iᵀ S_k T_i`. `gauge` is the block-diagonal
+/// [`Gauge`] whose block `i` slab is the raw-to-reduced transform
+/// `T_i` of shape `(p_i_raw, r_i)`; it owns every lift back to raw
+/// coordinates (`lift_block_betas` for β, `lift_covariance` for the
+/// joint covariance / penalized Hessian).
 ///
 /// `used_channel_aware_audit` is `true` when the multi-channel path was
 /// taken (i.e. at least one block declared `n_outputs > 1` via its
@@ -197,102 +201,11 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
 #[derive(Debug)]
 pub struct CanonicalSpecs {
     pub reduced_specs: Vec<ParameterBlockSpec>,
-    pub per_block_transform: Vec<Array2<f64>>,
+    pub gauge: Gauge,
     pub audit: IdentifiabilityAudit,
     /// `true` iff the audit was routed through `audit_identifiability_channel_aware`
     /// (multi-channel families such as survival marginal-slope).
     pub used_channel_aware_audit: bool,
-}
-
-impl CanonicalSpecs {
-    /// Lift reduced-space block coefficients θ_i back to the raw space
-    /// via `β_i_raw = T_i · θ_i`. Dropped raw coordinates receive zero.
-    pub fn lift_block_betas_to_raw(&self, theta_blocks: &[Array1<f64>]) -> Vec<Array1<f64>> {
-        assert_eq!(
-            theta_blocks.len(),
-            self.per_block_transform.len(),
-            "lift_block_betas_to_raw: theta blocks ({}) != transforms ({})",
-            theta_blocks.len(),
-            self.per_block_transform.len(),
-        );
-        let mut out = Vec::with_capacity(theta_blocks.len());
-        for (theta, transform) in theta_blocks.iter().zip(self.per_block_transform.iter()) {
-            assert_eq!(
-                theta.len(),
-                transform.ncols(),
-                "lift_block_betas_to_raw: theta length {} != transform ncols {}",
-                theta.len(),
-                transform.ncols(),
-            );
-            out.push(transform.dot(theta));
-        }
-        out
-    }
-
-    /// Raw block dimensions (rows of each `T_i`). Used to bound expansion.
-    pub fn raw_block_dims(&self) -> Vec<usize> {
-        self.per_block_transform.iter().map(|t| t.nrows()).collect()
-    }
-
-    /// Reduced block dimensions (cols of each `T_i`).
-    pub fn reduced_block_dims(&self) -> Vec<usize> {
-        self.per_block_transform.iter().map(|t| t.ncols()).collect()
-    }
-
-    /// Lift a reduced-space joint matrix `M_red` (total_r × total_r) to
-    /// raw-space (total_p × total_p) via `T_full · M_red · T_fullᵀ`
-    /// where `T_full = blockdiag(T_i)`. For selection-T this places the
-    /// reduced block at surviving raw indices and leaves the rest zero.
-    pub fn lift_joint_matrix_to_raw(&self, m_red: &Array2<f64>) -> Array2<f64> {
-        let raw_dims = self.raw_block_dims();
-        let red_dims = self.reduced_block_dims();
-        let total_p: usize = raw_dims.iter().sum();
-        let total_r: usize = red_dims.iter().sum();
-        assert_eq!(
-            m_red.nrows(),
-            total_r,
-            "lift_joint_matrix_to_raw: m_red rows {} != total reduced dim {}",
-            m_red.nrows(),
-            total_r,
-        );
-        assert_eq!(
-            m_red.ncols(),
-            total_r,
-            "lift_joint_matrix_to_raw: m_red cols {} != total reduced dim {}",
-            m_red.ncols(),
-            total_r,
-        );
-        let mut out = Array2::<f64>::zeros((total_p, total_p));
-        let mut raw_off_i = 0usize;
-        let mut red_off_i = 0usize;
-        for (i, t_i) in self.per_block_transform.iter().enumerate() {
-            let p_i = raw_dims[i];
-            let r_i = red_dims[i];
-            let mut raw_off_j = 0usize;
-            let mut red_off_j = 0usize;
-            for (j, t_j) in self.per_block_transform.iter().enumerate() {
-                let p_j = raw_dims[j];
-                let r_j = red_dims[j];
-                if r_i > 0 && r_j > 0 {
-                    let m_ij = m_red.slice(ndarray::s![
-                        red_off_i..red_off_i + r_i,
-                        red_off_j..red_off_j + r_j
-                    ]);
-                    let lifted = t_i.dot(&m_ij).dot(&t_j.t());
-                    out.slice_mut(ndarray::s![
-                        raw_off_i..raw_off_i + p_i,
-                        raw_off_j..raw_off_j + p_j
-                    ])
-                    .assign(&lifted);
-                }
-                raw_off_j += p_j;
-                red_off_j += r_j;
-            }
-            raw_off_i += p_i;
-            red_off_i += r_i;
-        }
-        out
-    }
 }
 
 /// Run the pre-fit cross-block identifiability audit. Fail-closed
@@ -387,7 +300,7 @@ fn canonicalize_for_identifiability_inner(
     if specs.is_empty() {
         return Ok(CanonicalSpecs {
             reduced_specs: Vec::new(),
-            per_block_transform: Vec::new(),
+            gauge: Gauge::identity(&[]),
             audit: audit_identifiability(specs).map_err(|r| {
                 CustomFamilyError::DimensionMismatch {
                     reason: format!("pre-fit identifiability audit failed: {r}"),
@@ -610,10 +523,7 @@ fn canonicalize_for_identifiability_inner(
 
     let family_owned_geometry = specs.iter().any(|spec| spec.jacobian_callback.is_some());
     if family_owned_geometry && !audit.dropped_columns.is_empty() {
-        let per_block_transform: Vec<Array2<f64>> = specs
-            .iter()
-            .map(|spec| Array2::<f64>::eye(spec.design.ncols()))
-            .collect();
+        let raw_widths: Vec<usize> = specs.iter().map(|spec| spec.design.ncols()).collect();
         let dropped_summary = audit
             .dropped_columns
             .iter()
@@ -628,7 +538,7 @@ fn canonicalize_for_identifiability_inner(
         );
         return Ok(CanonicalSpecs {
             reduced_specs: specs.to_vec(),
-            per_block_transform,
+            gauge: Gauge::identity(&raw_widths),
             audit,
             used_channel_aware_audit: use_channel_aware,
         });

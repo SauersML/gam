@@ -1560,6 +1560,11 @@ pub struct PcgDiagnostics {
     pub stopping_reason: PcgStopReason,
     /// Mixed-precision certificate outcome for this solve.
     pub mixed_precision_status: MixedPrecisionStatus,
+    /// True when this Direct-mode point solve was served by the fully
+    /// device-resident batched Arrow-Schur sequence (#1017). Lets harnesses and
+    /// parity tests observe that the production auto-selection routed to the
+    /// device rather than the CPU dense Cholesky, without changing the numbers.
+    pub used_device_arrow: bool,
 }
 
 /// Outcome of an opt-in mixed-precision arrow solve.
@@ -5258,8 +5263,90 @@ pub fn solve_arrow_newton_step_core(
             .solve(ridge_t, ridge_beta, options)
             .map(|(delta_t, delta_beta, _)| (delta_t, delta_beta, PcgDiagnostics::default()));
     }
+    // #1017 phase-3 production seam: when a device is present and the dense
+    // Schur work clears the work-based dispatch threshold (LLM/SAE shapes —
+    // few rows, thousands of border columns), route the Direct-mode point solve
+    // through the fully device-resident batched Arrow-Schur sequence. The host
+    // never sees the factors here (this `_core` entry discards the IFT cache),
+    // so the device's scalars-only `(Δt, Δβ)` readback is exactly the contract.
+    // Magic-by-default: no flag — the predicate fires from the shape. Any
+    // non-admission or device failure falls through to the bit-identical CPU
+    // path below, so the numbers are unchanged when the device declines.
+    if let Some(device_step) = try_device_arrow_direct(sys, ridge_t, ridge_beta, options) {
+        return device_step;
+    }
     solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, options)
         .map(|step| (step.delta_t, step.delta_beta, step.pcg_diagnostics))
+}
+
+/// Admission + dispatch for the device-resident Direct Arrow-Schur point solve.
+///
+/// Returns `Some(Ok(..))` when the device path produced a step, `Some(Err(..))`
+/// only for a genuine numerical failure the device surfaced that the caller
+/// must see (a non-PD pivot the LM escalation should respond to), and `None`
+/// when the device declined for any reason — shape below threshold, no CUDA,
+/// matrix-free operators present, or a transient device-unavailable — so the
+/// caller transparently falls back to the CPU path.
+///
+/// The predicate is the same work-based gate the device-resident PIRLS loop
+/// uses (`dense_hessian_work_target_is_gpu`) keyed on `(n_rows, border_k)`:
+/// the reduced Schur assembly is `O(n · d · k²)`, dominated by the `k²` border,
+/// so `k` is the dense-Hessian width. Below `DEVICE_LOOP_MIN_P` border columns
+/// or below the flop floor the launch/staging overhead loses to the CPU dense
+/// Cholesky, so the device is not engaged.
+fn try_device_arrow_direct(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    options: &ArrowSolveOptions,
+) -> Option<Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError>> {
+    // Only the dense Direct mode maps onto the device dense-Schur sequence.
+    // SqrtBA / InexactPCG have distinct numerics (square-root factors,
+    // truncated-CG trust region) and must stay on their CPU implementations so
+    // results are unchanged.
+    if options.mode != ArrowSolverMode::Direct {
+        return None;
+    }
+    // Cross-row penalties, streaming, and matrix-free H_ββ / H_tβ operators are
+    // all outside the dense device path; the GPU entry itself rejects the
+    // matrix-free cases, but short-circuit here so we never pay a device probe
+    // for a system that cannot route.
+    if !sys.cross_row_penalties.is_empty()
+        || options.streaming_chunk_size.is_some()
+        || sys.hbb_matvec.is_some()
+        || sys.htbeta_matvec.is_some()
+    {
+        return None;
+    }
+    let runtime = crate::gpu::runtime::GpuRuntime::global()?;
+    let admitted = runtime
+        .policy()
+        .dense_hessian_work_target_is_gpu(sys.rows.len(), sys.k);
+    if !admitted {
+        return None;
+    }
+    match crate::gpu::arrow_schur::solve_arrow_newton_step(sys, ridge_t, ridge_beta) {
+        Ok(solution) => {
+            let mut diagnostics = PcgDiagnostics::default();
+            diagnostics.used_device_arrow = true;
+            Some(Ok((solution.delta_t, solution.delta_beta, diagnostics)))
+        }
+        // A non-PD per-row block or Schur pivot is a real numerical condition
+        // the LM escalation around this solve must respond to; surface it as the
+        // matching CPU error variant so `solve_with_lm_escalation_inner` bumps
+        // the ridge and retries (it re-enters here and may route to device again
+        // at the larger ridge, or fall to CPU if the device keeps declining).
+        Err(crate::gpu::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired { row, bump }) => {
+            Some(Err(ArrowSchurError::PerRowFactorFailed {
+                row,
+                detail: format!("device per-row block non-PD; suggested ridge bump {bump:e}"),
+            }))
+        }
+        // Unavailable (transient / below device policy) and
+        // GpuRequiresDenseSystem (matrix-free, already filtered above) both mean
+        // "device declined" — fall back to CPU transparently.
+        Err(_) => None,
+    }
 }
 
 /// LM-style ridge escalation around `solve_arrow_newton_step_core`.
@@ -6579,6 +6666,7 @@ fn solve_arrow_newton_step_cross_row(
         },
         stopping_reason: PcgStopReason::Converged,
         mixed_precision_status: MixedPrecisionStatus::Off,
+        used_device_arrow: false,
     };
 
     Ok(ArrowNewtonStepArtifacts {
