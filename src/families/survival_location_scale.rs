@@ -1717,11 +1717,9 @@ impl SurvivalExactRowKernel {
 }
 
 struct SurvivalJointQuantities {
-    /// Per-row log-likelihood `ell_i` (NOT negated). Rows excluded by the
-    /// degeneracy guard (`row_derivatives_rescaled` returns `None`) keep `0.0`,
-    /// matching their zero derivative slots. Carried so the `RowKernel`
-    /// repackaging can report `nll_i = -ll_i` without recomputing the survival
-    /// evaluations.
+    /// Per-row log-likelihood `ell_i` (NOT negated) for the test-only
+    /// `RowKernel` equivalence adapter.
+    #[cfg(test)]
     ll: Array1<f64>,
     d1_q: Array1<f64>,
     d2_q: Array1<f64>,
@@ -1850,6 +1848,7 @@ fn split_survival_psi_design(
 /// `assemble_joint_hessian_from_quantities` term-for-term (verified by the
 /// equivalence test). Indices `i ∈ {u0,u1,g}` are functionally independent so
 /// the index-space derivative tensors are diagonal in `i`.
+#[cfg(test)]
 const SLS_ROW_K: usize = 9;
 
 /// `RowKernel<9>` adapter for the survival location-scale joint likelihood
@@ -1858,6 +1857,7 @@ const SLS_ROW_K: usize = 9;
 /// [`SurvivalLocationScaleFamily::build_dynamic_geometry`]; every trait method
 /// is a pure repackaging of those scalars into linear-predictor primary space,
 /// so the math is identical to the bespoke assembly by construction.
+#[cfg(test)]
 struct SurvivalLsRowKernel<'a> {
     family: &'a SurvivalLocationScaleFamily,
     q: &'a SurvivalJointQuantities,
@@ -1869,6 +1869,7 @@ struct SurvivalLsRowKernel<'a> {
 /// Per-index `(D, D2, D3)` map-derivative tensors for one row, plus the
 /// index-space log-likelihood derivatives. `D[i][a] = ∂(index i)/∂(channel a)`,
 /// `D2[i][a][b] = ∂²(index i)/∂a∂b`, `D3[i][a][b][c] = ∂³(index i)/∂a∂b∂c`.
+#[cfg(test)]
 struct SlsRowMaps {
     /// ell_i  = (ell_u0, ell_u1, ell_g)
     l1: [f64; 3],
@@ -1881,6 +1882,7 @@ struct SlsRowMaps {
     d3: [[[[f64; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K]; 3],
 }
 
+#[cfg(test)]
 impl SurvivalLsRowKernel<'_> {
     /// Resolve the design for a threshold/log-sigma channel, falling back to the
     /// exit design when the entry/derivative variant is absent (time-invariant).
@@ -2034,6 +2036,7 @@ impl SurvivalLsRowKernel<'_> {
 /// Materialize `X[row, :]` as a dense length-`ncols` vector (no sparse-aware
 /// fast path — used only by the dense-Hessian / diagonal assembly, never the
 /// hot matvec inner loop).
+#[cfg(test)]
 fn design_dense_row(d: &DesignMatrix, row: usize) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(d.ncols());
     d.axpy_row_into(row, 1.0, &mut out.view_mut())
@@ -2045,6 +2048,7 @@ fn design_dense_row(d: &DesignMatrix, row: usize) -> Array1<f64> {
 /// time Jacobian (the survival time block is materialized densely as
 /// `time_jac_*`, so it has no sparse axpy primitive).
 #[inline]
+#[cfg(test)]
 fn axpy_dense_row_into(jac: &Array2<f64>, row: usize, alpha: f64, out: &mut [f64]) {
     if alpha == 0.0 {
         return;
@@ -2055,6 +2059,7 @@ fn axpy_dense_row_into(jac: &Array2<f64>, row: usize, alpha: f64, out: &mut [f64
     }
 }
 
+#[cfg(test)]
 impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     fn n_rows(&self) -> usize {
         self.family.n
@@ -2717,6 +2722,7 @@ impl SurvivalLocationScaleFamily {
     ) -> Result<SurvivalJointQuantities, String> {
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
+        #[cfg(test)]
         let mut ll = Array1::<f64>::zeros(n);
         let mut d1_q = Array1::<f64>::zeros(n);
         let mut d2_q = Array1::<f64>::zeros(n);
@@ -2768,6 +2774,7 @@ impl SurvivalLocationScaleFamily {
             }
         }
 
+        #[cfg(test)]
         let p_ll = SendPtr(ll.as_mut_ptr());
         let p_d1_q = SendPtr(d1_q.as_mut_ptr());
         let p_d2_q = SendPtr(d2_q.as_mut_ptr());
@@ -2806,6 +2813,7 @@ impl SurvivalLocationScaleFamily {
                 // exactly once; pointers target distinct length-`n` `Array1`
                 // buffers not read until the parallel loop completes.
                 unsafe {
+                    #[cfg(test)]
                     p_ll.write(i, row.ll);
                     p_d1_q.write(i, row.d1_q);
                     p_d2_q.write(i, row.d2_q);
@@ -2829,6 +2837,7 @@ impl SurvivalLocationScaleFamily {
             })?;
 
         Ok(SurvivalJointQuantities {
+            #[cfg(test)]
             ll,
             d1_q,
             d2_q,
