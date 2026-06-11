@@ -54,7 +54,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -120,12 +120,6 @@ fn max_marginal_mean(v: &[f64], rows: usize, cols: usize) -> f64 {
         worst = worst.max(m.abs());
     }
     worst
-}
-
-fn rmse(a: &[f64], b: &[f64]) -> f64 {
-    assert_eq!(a.len(), b.len(), "rmse length mismatch");
-    let s: f64 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
-    (s / a.len() as f64).sqrt()
 }
 
 fn range_of(v: &[f64]) -> f64 {

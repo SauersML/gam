@@ -10,6 +10,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -22,11 +23,6 @@ fn std_dev(v: &[f64]) -> f64 {
     let n = v.len() as f64;
     let mean = v.iter().sum::<f64>() / n;
     (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n).sqrt()
-}
-
-fn rmse(a: &[f64], b: &[f64]) -> f64 {
-    let n = a.len() as f64;
-    (a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f64>() / n).sqrt()
 }
 
 #[test]

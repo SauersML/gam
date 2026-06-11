@@ -12,6 +12,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -54,17 +55,6 @@ fn fit_predict(formula: &str, data: &gam::data::EncodedDataset, x_test: &[f64]) 
     }
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild");
     design.design.apply(&fit.fit.beta).to_vec()
-}
-
-fn rmse(yhat: &[f64], y: &[f64]) -> f64 {
-    let n = y.len() as f64;
-    (yhat
-        .iter()
-        .zip(y.iter())
-        .map(|(a, b)| (a - b).powi(2))
-        .sum::<f64>()
-        / n)
-        .sqrt()
 }
 
 #[test]

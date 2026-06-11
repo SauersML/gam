@@ -16,6 +16,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -36,10 +37,6 @@ const SEED: u64 = 90_3_42;
 const TRAIN_XLO: f64 = 0.0;
 const TRAIN_XHI: f64 = 0.4;
 const TEST_X: [f64; N_TEST_PER_GROUP] = [0.7, 0.8, 0.9, 1.0];
-
-fn rmse(a: &[f64], b: &[f64]) -> f64 {
-    (a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f64>() / a.len() as f64).sqrt()
-}
 
 /// OLS slope+intercept of `y` on `x`.
 fn ols(x: &[f64], y: &[f64]) -> (f64, f64) {

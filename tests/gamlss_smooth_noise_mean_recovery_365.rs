@@ -35,6 +35,7 @@
 
 use csv::StringRecord;
 use gam::solver::estimate::BlockRole;
+use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_model, init_parallelism,
     materialize,
@@ -72,18 +73,6 @@ fn make_issue_data(n: usize, seed: u64) -> (gam::data::EncodedDataset, Vec<f64>)
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode issue data");
     (data, truth)
-}
-
-/// Root-mean-square error of a vector against truth.
-fn rmse(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "rmse length mismatch");
-    let n = pred.len() as f64;
-    let ss: f64 = pred
-        .iter()
-        .zip(truth.iter())
-        .map(|(p, t)| (p - t) * (p - t))
-        .sum();
-    (ss / n).sqrt()
 }
 
 #[test]
