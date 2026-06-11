@@ -2629,8 +2629,9 @@ pub struct SaeArrowVector {
 pub(crate) struct DeflatedArrowSolver<'a> {
     cache: &'a ArrowFactorCache,
     gauge_basis: Vec<Array1<f64>>,
-    gauge_responses: Vec<Array1<f64>>,
+    gauge_response_physical: Vec<Array1<f64>>,
     woodbury_factor: Option<FaerCholeskyFactor>,
+    gauge_stiffness_recip: f64,
 }
 
 impl<'a> DeflatedArrowSolver<'a> {
@@ -2638,8 +2639,9 @@ impl<'a> DeflatedArrowSolver<'a> {
         Self {
             cache,
             gauge_basis: Vec::new(),
-            gauge_responses: Vec::new(),
+            gauge_response_physical: Vec::new(),
             woodbury_factor: None,
+            gauge_stiffness_recip: 0.0,
         }
     }
 
@@ -2650,6 +2652,11 @@ impl<'a> DeflatedArrowSolver<'a> {
     ) -> Result<Self, String> {
         if gauge_basis.is_empty() {
             return Ok(Self::plain(cache));
+        }
+        if !(stiffness.is_finite() && stiffness > 0.0) {
+            return Err(format!(
+                "DeflatedArrowSolver: gauge stiffness must be finite and positive; got {stiffness}"
+            ));
         }
         let full_len = cache.delta_t_len() + cache.k;
         let mut gauge_responses = Vec::with_capacity(gauge_basis.len());
@@ -2670,21 +2677,35 @@ impl<'a> DeflatedArrowSolver<'a> {
         }
 
         let rank = gauge_basis.len();
+        let stiffness_recip = stiffness.recip();
+        let mut gauge_metric = Array2::<f64>::zeros((rank, rank));
         let mut woodbury = Array2::<f64>::eye(rank);
         for i in 0..rank {
-            woodbury[[i, i]] /= stiffness;
+            woodbury[[i, i]] *= stiffness_recip;
             for j in 0..rank {
-                woodbury[[i, j]] += gauge_basis[i].dot(&gauge_responses[j]);
+                let value = gauge_basis[i].dot(&gauge_responses[j]);
+                gauge_metric[[i, j]] = value;
+                woodbury[[i, j]] += value;
             }
         }
         let woodbury_factor = woodbury
             .cholesky(Side::Lower)
             .map_err(|err| format!("DeflatedArrowSolver: gauge Woodbury factor failed: {err}"))?;
+        let mut gauge_response_physical = gauge_responses;
+        for j in 0..rank {
+            for i in 0..rank {
+                let coeff = gauge_metric[[i, j]];
+                for row in 0..full_len {
+                    gauge_response_physical[j][row] -= coeff * gauge_basis[i][row];
+                }
+            }
+        }
         Ok(Self {
             cache,
             gauge_basis,
-            gauge_responses,
+            gauge_response_physical,
             woodbury_factor: Some(woodbury_factor),
+            gauge_stiffness_recip: stiffness_recip,
         })
     }
 
@@ -2717,9 +2738,20 @@ impl<'a> DeflatedArrowSolver<'a> {
             gauge_coeffs[idx] = gauge.dot(&flat);
         }
         let weights = factor.solvevec(&gauge_coeffs);
-        for (response, &weight) in self.gauge_responses.iter().zip(weights.iter()) {
+        for (gauge, &coeff) in self.gauge_basis.iter().zip(gauge_coeffs.iter()) {
+            for i in 0..flat.len() {
+                flat[i] -= gauge[i] * coeff;
+            }
+        }
+        for (response, &weight) in self.gauge_response_physical.iter().zip(weights.iter()) {
             for i in 0..flat.len() {
                 flat[i] -= response[i] * weight;
+            }
+        }
+        for (gauge, &weight) in self.gauge_basis.iter().zip(weights.iter()) {
+            let coeff = self.gauge_stiffness_recip * weight;
+            for i in 0..flat.len() {
+                flat[i] += gauge[i] * coeff;
             }
         }
         Ok(SaeArrowVector {
