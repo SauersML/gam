@@ -32,6 +32,16 @@ use std::sync::Arc;
 /// machinery is pure noise. Above this, a silent multi-minute build is
 /// the documented failure mode this logging exists to expose.
 const ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS: usize = 100_000;
+const ARROW_ROW_CHUNK: usize = 256;
+
+#[inline]
+fn arrow_row_chunk_count(n_rows: usize) -> usize {
+    if n_rows == 0 {
+        0
+    } else {
+        (n_rows - 1) / ARROW_ROW_CHUNK + 1
+    }
+}
 
 // ── Row selector ─────────────────────────────────────────────────────
 //
@@ -130,10 +140,21 @@ impl RowSet {
     {
         match self {
             Self::All => {
-                (0..n_total).into_par_iter().for_each(|i| body(i, 1.0));
+                let chunks = arrow_row_chunk_count(n_total);
+                (0..chunks).into_par_iter().for_each(|chunk_idx| {
+                    let start = chunk_idx * ARROW_ROW_CHUNK;
+                    let end = (start + ARROW_ROW_CHUNK).min(n_total);
+                    for i in start..end {
+                        body(i, 1.0);
+                    }
+                });
             }
             Self::Subsample { rows, .. } => {
-                rows.par_iter().for_each(|r| body(r.index, r.weight));
+                rows.par_chunks(ARROW_ROW_CHUNK).for_each(|chunk| {
+                    for r in chunk {
+                        body(r.index, r.weight);
+                    }
+                });
             }
         }
     }
@@ -143,7 +164,7 @@ impl RowSet {
     /// accumulators.
     ///
     /// Returns the reduced result. No `Vec` is allocated per call; both
-    /// branches forward directly to rayon's `par_iter` adapters.
+    /// branches feed rayon fixed-size row chunks.
     #[inline]
     pub fn par_reduce_fold<T, I, F, R>(&self, n_total: usize, init: I, fold: F, reduce: R) -> T
     where
@@ -153,13 +174,27 @@ impl RowSet {
         R: Fn(T, T) -> T + Send + Sync,
     {
         match self {
-            Self::All => (0..n_total)
+            Self::All => (0..arrow_row_chunk_count(n_total))
                 .into_par_iter()
-                .fold(&init, |acc, i| fold(acc, i, 1.0))
+                .map(|chunk_idx| {
+                    let start = chunk_idx * ARROW_ROW_CHUNK;
+                    let end = (start + ARROW_ROW_CHUNK).min(n_total);
+                    let mut acc = init();
+                    for i in start..end {
+                        acc = fold(acc, i, 1.0);
+                    }
+                    acc
+                })
                 .reduce(&init, &reduce),
             Self::Subsample { rows, .. } => rows
-                .par_iter()
-                .fold(&init, |acc, r| fold(acc, r.index, r.weight))
+                .par_chunks(ARROW_ROW_CHUNK)
+                .map(|chunk| {
+                    let mut acc = init();
+                    for r in chunk {
+                        acc = fold(acc, r.index, r.weight);
+                    }
+                    acc
+                })
                 .reduce(&init, &reduce),
         }
     }
@@ -181,13 +216,27 @@ impl RowSet {
         R: Fn(T, T) -> Result<T, E> + Send + Sync,
     {
         match self {
-            Self::All => (0..n_total)
+            Self::All => (0..arrow_row_chunk_count(n_total))
                 .into_par_iter()
-                .try_fold(&init, |acc, i| fold(acc, i, 1.0))
+                .map(|chunk_idx| {
+                    let start = chunk_idx * ARROW_ROW_CHUNK;
+                    let end = (start + ARROW_ROW_CHUNK).min(n_total);
+                    let mut acc = init();
+                    for i in start..end {
+                        acc = fold(acc, i, 1.0)?;
+                    }
+                    Ok::<T, E>(acc)
+                })
                 .try_reduce(&init, &reduce),
             Self::Subsample { rows, .. } => rows
-                .par_iter()
-                .try_fold(&init, |acc, r| fold(acc, r.index, r.weight))
+                .par_chunks(ARROW_ROW_CHUNK)
+                .map(|chunk| {
+                    let mut acc = init();
+                    for r in chunk {
+                        acc = fold(acc, r.index, r.weight)?;
+                    }
+                    Ok::<T, E>(acc)
+                })
                 .try_reduce(&init, &reduce),
         }
     }
@@ -366,58 +415,75 @@ pub fn build_row_kernel_cache<const K: usize>(
         (work_count >= ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS).then(LoopProgress::default_interval);
     match rows {
         RowSet::All => {
-            let evaluated: Vec<(f64, [f64; K], [[f64; K]; K])> = (0..n)
-                .into_par_iter()
-                .map(|row| {
-                    let out = kern.row_kernel(row);
-                    if let Some(ticker) = progress_ticker.as_ref() {
-                        ticker.tick(1, |progress, elapsed| {
-                            log::info!(
-                                "[STAGE] row-kernel cache (all) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
-                                progress.min(n),
-                                n,
-                                100.0 * progress.min(n) as f64 / n.max(1) as f64,
-                                elapsed,
-                                rayon::current_num_threads(),
-                            );
-                        });
-                    }
-                    out
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            for (i, (l, g, h)) in evaluated.into_iter().enumerate() {
-                nll[i] = l;
-                gradients[i] = g;
-                hessians[i] = h;
+            let evaluated_chunks: Vec<Vec<(f64, [f64; K], [[f64; K]; K])>> =
+                (0..arrow_row_chunk_count(n))
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * ARROW_ROW_CHUNK;
+                        let end = (start + ARROW_ROW_CHUNK).min(n);
+                        let mut chunk = Vec::with_capacity(end - start);
+                        for row in start..end {
+                            let out = kern.row_kernel(row)?;
+                            if let Some(ticker) = progress_ticker.as_ref() {
+                                ticker.tick(1, |progress, elapsed| {
+                                    log::info!(
+                                        "[STAGE] row-kernel cache (all) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
+                                        progress.min(n),
+                                        n,
+                                        100.0 * progress.min(n) as f64 / n.max(1) as f64,
+                                        elapsed,
+                                        rayon::current_num_threads(),
+                                    );
+                                });
+                            }
+                            chunk.push(out);
+                        }
+                        Ok(chunk)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+            for (chunk_idx, chunk) in evaluated_chunks.into_iter().enumerate() {
+                let start = chunk_idx * ARROW_ROW_CHUNK;
+                for (local, (l, g, h)) in chunk.into_iter().enumerate() {
+                    let i = start + local;
+                    nll[i] = l;
+                    gradients[i] = g;
+                    hessians[i] = h;
+                }
             }
         }
         RowSet::Subsample { rows: list, .. } => {
             // Evaluate only the sampled rows in parallel; scatter into
             // the n-sized cache slots keyed by their full-data index.
             let total = list.len();
-            let pairs: Vec<(usize, (f64, [f64; K], [[f64; K]; K]))> = list
-                .par_iter()
-                .map(|r| {
-                    let out = kern.row_kernel(r.index).map(|out| (r.index, out));
-                    if let Some(ticker) = progress_ticker.as_ref() {
-                        ticker.tick(1, |progress, elapsed| {
-                            log::info!(
-                                "[STAGE] row-kernel cache (subsample) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
-                                progress.min(total),
-                                total,
-                                100.0 * progress.min(total) as f64 / total.max(1) as f64,
-                                elapsed,
-                                rayon::current_num_threads(),
-                            );
-                        });
+            let pair_chunks: Vec<Vec<(usize, (f64, [f64; K], [[f64; K]; K]))>> = list
+                .par_chunks(ARROW_ROW_CHUNK)
+                .map(|row_chunk| {
+                    let mut chunk = Vec::with_capacity(row_chunk.len());
+                    for r in row_chunk {
+                        let out = kern.row_kernel(r.index).map(|out| (r.index, out))?;
+                        if let Some(ticker) = progress_ticker.as_ref() {
+                            ticker.tick(1, |progress, elapsed| {
+                                log::info!(
+                                    "[STAGE] row-kernel cache (subsample) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
+                                    progress.min(total),
+                                    total,
+                                    100.0 * progress.min(total) as f64 / total.max(1) as f64,
+                                    elapsed,
+                                    rayon::current_num_threads(),
+                                );
+                            });
+                        }
+                        chunk.push(out);
                     }
-                    out
+                    Ok(chunk)
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            for (idx, (l, g, h)) in pairs {
-                nll[idx] = l;
-                gradients[idx] = g;
-                hessians[idx] = h;
+            for chunk in pair_chunks {
+                for (idx, (l, g, h)) in chunk {
+                    nll[idx] = l;
+                    gradients[idx] = g;
+                    hessians[idx] = h;
+                }
             }
         }
     }
@@ -1023,36 +1089,41 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
         assert_eq!(jf.dim(), (n_rows, K * rank));
         let direction = self.direction.as_slice();
 
-        (0..n_rows)
+        (0..arrow_row_chunk_count(n_rows))
             .into_par_iter()
-            .map(|row| -> f64 {
-                let dir_k = self.kern.jacobian_action(row, direction);
-                let third = self
-                    .kern
-                    .row_third_contracted(row, &dir_k)
-                    .expect("row-kernel third contraction should succeed for validated directions");
-                let jf_row = jf.row(row);
-                let jf_slice = jf_row
-                    .to_slice()
-                    .expect("J·F is built standard-layout (row-major)");
-                let mut row_total = 0.0_f64;
-                for k_col in 0..rank {
-                    let mut vec_k = [0.0_f64; K];
-                    for k in 0..K {
-                        vec_k[k] = jf_slice[k * rank + k_col];
-                    }
-                    // (T_r vec_k)^T vec_k — K is a const-generic small int.
-                    let mut quad = 0.0_f64;
-                    for a in 0..K {
-                        let mut t_dot = 0.0_f64;
-                        for b in 0..K {
-                            t_dot += third[a][b] * vec_k[b];
+            .map(|chunk_idx| -> f64 {
+                let start = chunk_idx * ARROW_ROW_CHUNK;
+                let end = (start + ARROW_ROW_CHUNK).min(n_rows);
+                let mut chunk_total = 0.0_f64;
+                for row in start..end {
+                    let dir_k = self.kern.jacobian_action(row, direction);
+                    let third = self.kern.row_third_contracted(row, &dir_k).expect(
+                        "row-kernel third contraction should succeed for validated directions",
+                    );
+                    let jf_row = jf.row(row);
+                    let jf_slice = jf_row
+                        .to_slice()
+                        .expect("J·F is built standard-layout (row-major)");
+                    let mut row_total = 0.0_f64;
+                    for k_col in 0..rank {
+                        let mut vec_k = [0.0_f64; K];
+                        for k in 0..K {
+                            vec_k[k] = jf_slice[k * rank + k_col];
                         }
-                        quad += vec_k[a] * t_dot;
+                        // (T_r vec_k)^T vec_k — K is a const-generic small int.
+                        let mut quad = 0.0_f64;
+                        for a in 0..K {
+                            let mut t_dot = 0.0_f64;
+                            for b in 0..K {
+                                t_dot += third[a][b] * vec_k[b];
+                            }
+                            quad += vec_k[a] * t_dot;
+                        }
+                        row_total += quad;
                     }
-                    row_total += quad;
+                    chunk_total += row_total;
                 }
-                row_total
+                chunk_total
             })
             .sum()
     }
@@ -1192,35 +1263,41 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
         let direction_u = self.direction_u.as_slice();
         let direction_v = self.direction_v.as_slice();
 
-        (0..n_rows)
+        (0..arrow_row_chunk_count(n_rows))
             .into_par_iter()
-            .map(|row| -> f64 {
-                let dir_u = self.kern.jacobian_action(row, direction_u);
-                let dir_v = self.kern.jacobian_action(row, direction_v);
-                let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
-                    "row-kernel fourth contraction should succeed for validated directions",
-                );
-                let jf_row = jf.row(row);
-                let jf_slice = jf_row
-                    .to_slice()
-                    .expect("J·F is built standard-layout (row-major)");
-                let mut row_total = 0.0_f64;
-                for k_col in 0..rank {
-                    let mut vec_k = [0.0_f64; K];
-                    for k in 0..K {
-                        vec_k[k] = jf_slice[k * rank + k_col];
-                    }
-                    let mut quad = 0.0_f64;
-                    for a in 0..K {
-                        let mut t_dot = 0.0_f64;
-                        for b in 0..K {
-                            t_dot += fourth[a][b] * vec_k[b];
+            .map(|chunk_idx| -> f64 {
+                let start = chunk_idx * ARROW_ROW_CHUNK;
+                let end = (start + ARROW_ROW_CHUNK).min(n_rows);
+                let mut chunk_total = 0.0_f64;
+                for row in start..end {
+                    let dir_u = self.kern.jacobian_action(row, direction_u);
+                    let dir_v = self.kern.jacobian_action(row, direction_v);
+                    let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
+                        "row-kernel fourth contraction should succeed for validated directions",
+                    );
+                    let jf_row = jf.row(row);
+                    let jf_slice = jf_row
+                        .to_slice()
+                        .expect("J·F is built standard-layout (row-major)");
+                    let mut row_total = 0.0_f64;
+                    for k_col in 0..rank {
+                        let mut vec_k = [0.0_f64; K];
+                        for k in 0..K {
+                            vec_k[k] = jf_slice[k * rank + k_col];
                         }
-                        quad += vec_k[a] * t_dot;
+                        let mut quad = 0.0_f64;
+                        for a in 0..K {
+                            let mut t_dot = 0.0_f64;
+                            for b in 0..K {
+                                t_dot += fourth[a][b] * vec_k[b];
+                            }
+                            quad += vec_k[a] * t_dot;
+                        }
+                        row_total += quad;
                     }
-                    row_total += quad;
+                    chunk_total += row_total;
                 }
-                row_total
+                chunk_total
             })
             .sum()
     }
