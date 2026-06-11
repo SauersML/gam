@@ -432,10 +432,10 @@ impl<'a> RemlState<'a> {
     pub(super) fn structural_penalty_logdet_derivatives_block_local(
         &self,
         lambdas: &Array1<f64>,
-        ridge: f64,
+        bundle: &EvalShared,
     ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
         let (_, _, det1, det2) =
-            self.structural_penalty_logdet_value_and_derivatives_block_local(lambdas, ridge)?;
+            self.structural_penalty_logdet_value_and_derivatives_block_local(lambdas, bundle)?;
         Ok((det1, det2))
     }
 
@@ -447,8 +447,9 @@ impl<'a> RemlState<'a> {
     pub(super) fn structural_penalty_logdet_value_and_derivatives_block_local(
         &self,
         lambdas: &Array1<f64>,
-        ridge: f64,
+        bundle: &EvalShared,
     ) -> Result<(f64, usize, Array1<f64>, Array2<f64>), EstimationError> {
+        let ridge = bundle.ridge_passport.penalty_logdet_ridge();
         // Kronecker fast path: compute logdet derivatives directly from the
         // marginal eigenvalue grid.  O(d · ∏q_j) with no coordinate-frame
         // dependence — eigenvalues of Σ_k λ_k (I⊗...⊗S_k⊗...⊗I) are invariant
@@ -472,13 +473,15 @@ impl<'a> RemlState<'a> {
 
         let lambdas_slice = lambdas.as_slice().unwrap();
 
-        let pld = PenaltyPseudologdet::from_penalties(
+        // ONE factorization per evaluation point (#931): the same object also
+        // serves the τ/ψ hyper-coordinate components in hyper.rs, so the
+        // ridge and positive-eigenspace threshold of `log|Sλ|₊` are decided
+        // exactly once for value, ρ-derivatives, and τ components alike.
+        let pld = bundle.penalty_pseudologdet_original(
             &self.canonical_penalties,
             lambdas_slice,
-            ridge,
             self.p,
-        )
-        .map_err(EstimationError::LayoutError)?;
+        )?;
 
         let value = pld.value();
         let rank = pld.rank();
