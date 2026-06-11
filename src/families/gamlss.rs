@@ -56,7 +56,7 @@ use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, RidgePolicy, StandardLink};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
-use statrs::function::gamma::{digamma, ln_gamma};
+use statrs::function::gamma::ln_gamma;
 use std::borrow::Cow;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
@@ -3272,25 +3272,6 @@ const DISPERSION_ETA_CLAMP: f64 = 30.0;
 /// of this floor; it only conditions the inner solve.
 const DISPERSION_MIN_CURVATURE: f64 = 1e-12;
 
-/// Trigamma `ψ'(x)` for `x > 0` via upward recurrence to the asymptotic
-/// regime; matches the PIRLS implementation used by the scalar-dispersion
-/// NB/Beta/Gamma paths so the location-scale derivatives agree with them.
-fn dispersion_trigamma(mut x: f64) -> f64 {
-    if !(x.is_finite() && x > 0.0) {
-        return f64::NAN;
-    }
-    let mut acc = 0.0;
-    while x < 8.0 {
-        acc += 1.0 / (x * x);
-        x += 1.0;
-    }
-    let inv = 1.0 / x;
-    let inv2 = inv * inv;
-    // ψ'(x) ≈ 1/x + 1/(2x²) + 1/(6x³) − 1/(30x⁵) + 1/(42x⁷)
-    acc + inv + 0.5 * inv2 + inv * inv2 / 6.0 - inv * inv2 * inv2 / 30.0
-        + inv * inv2 * inv2 * inv2 / 42.0
-}
-
 /// Per-row working quantities for both channels at the current `(η_μ, η_d)`.
 struct DispersionRowKernel {
     loglik: f64,
@@ -3356,7 +3337,11 @@ fn dispersion_beta_nll_tower(
 }
 
 #[inline]
-fn tower_score_info(tower: &crate::families::jet_tower::Tower4<2>, idx: usize, wi: f64) -> (f64, f64) {
+fn tower_score_info(
+    tower: &crate::families::jet_tower::Tower4<2>,
+    idx: usize,
+    wi: f64,
+) -> (f64, f64) {
     if wi == 0.0 {
         (0.0, 0.0)
     } else {

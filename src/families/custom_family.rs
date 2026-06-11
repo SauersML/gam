@@ -15798,16 +15798,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         // prior is defined on.
                         let jeffreys_completion_pairwise_fallback =
                             total_p <= JEFFREYS_COMPLETION_MAX_P;
-                        let jeffreys_completion_requested =
-                            jeffreys_completion_pairwise_fallback
-                                || family
-                                    .joint_jeffreys_information_contracted_trace_hessian_available();
+                        let jeffreys_completion_requested = jeffreys_completion_pairwise_fallback
+                            || family
+                                .joint_jeffreys_information_contracted_trace_hessian_available();
                         let h_info_for_completion = (jeffreys_completion_endgame
                             && inner_jeffreys_term.is_some()
                             && jeffreys_completion_requested)
-                            .then(|| {
-                                family.joint_jeffreys_information_with_specs(&states, specs)
-                            })
+                            .then(|| family.joint_jeffreys_information_with_specs(&states, specs))
                             .transpose()?
                             .flatten();
                         add_joint_penalty_to_matrix(
