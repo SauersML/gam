@@ -25,7 +25,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -71,20 +71,6 @@ fn mean_nb_deviance(y: &[f64], mu: &[f64], theta: f64) -> f64 {
         .map(|(&yi, &mui)| nb_deviance_per_obs(yi, mui, theta))
         .sum();
     s / y.len().max(1) as f64
-}
-
-/// Right-pad `v` with its last value to length `len` so a held-out covariate can
-/// ride along as a column of the reference data.frame.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }
 
 #[test]

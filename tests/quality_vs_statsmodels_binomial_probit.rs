@@ -42,7 +42,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
+use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -533,19 +533,4 @@ emit("test_mu", np.asarray(res.predict(newd), dtype=float))
         gam_edf > 1.0 && gam_edf < 12.0,
         "gam effective dof out of sane range: {gam_edf:.3}"
     );
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so the
-/// held-out predictors can ride along as columns of the reference data.frame at
-/// the training length; only the first `v.len()` entries are read back.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }

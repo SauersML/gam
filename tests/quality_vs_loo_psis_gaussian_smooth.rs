@@ -35,7 +35,7 @@
 use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, rmse, run_python, run_r};
+use gam::test_support::reference::{Column, pad_to, pearson, rmse, run_python, run_r};
 use gam::types::LinkFunction;
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
@@ -563,19 +563,4 @@ emit("n_obs", [float(N)])
         "gam held-out elpd/pt {gam_test_elpd_mean:.5} fell below arviz PSIS-LOO \
          elpd/pt {arviz_elpd_per_point:.5} by more than the 0.15-nat margin"
     );
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
-/// short metadata vector can ride along as a column of the reference data.frame.
-/// Only the leading entries are read back inside the reference body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }
