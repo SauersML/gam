@@ -52,7 +52,10 @@ use crate::terms::sae_optimality_certificate::{
 };
 
 use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb};
-use crate::solver::arrow_schur::{ArrowFactorCache, solve_arrow_newton_step_with_options};
+use crate::solver::arrow_schur::{
+    ArrowFactorCache, arrow_factor_max_pivot, arrow_factor_min_pivot,
+    solve_arrow_newton_step_with_options,
+};
 use crate::solver::estimate::EstimationError;
 use crate::solver::evidence::arrow_log_det_from_cache;
 use crate::solver::outer_strategy::{
@@ -64,6 +67,23 @@ use faer::Side;
 
 const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
 const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
+
+/// Nominal curvature-homotopy `η` step (#1007): the tracker covers `η ∈ [0, 1]`
+/// in this many equal predictor-corrector waypoints when the branch is clean.
+/// Five waypoints is a few corrector solves — far cheaper than the multi-seed
+/// cascade it replaces — and the step is halved adaptively when the arrow-factor
+/// min pivot shrinks, so a near-bifurcation stretch is resolved at finer
+/// granularity without a separate knob.
+const CURVATURE_WALK_INITIAL_ETA_STEP: f64 = 0.2;
+/// Smallest curvature-homotopy `η` step (#1007). A pivot collapse (or corrector
+/// failure) that persists at this step is a DETECTED branch bifurcation, not a
+/// step-size artifact: the walk records it and defers to the seed cascade.
+const CURVATURE_WALK_MIN_ETA_STEP: f64 = 1.0 / 256.0;
+/// Hard ceiling on accepted corrector solves in one curvature-homotopy walk
+/// (#1007). Bounds the walk's cost under repeated halving; reaching it is a
+/// structural-termination signal (the branch is not cleanly trackable) that
+/// defers to the cascade, never a spin.
+const CURVATURE_WALK_MAX_CORRECTORS: usize = 32;
 
 /// Relative floor on the Newton directional decrease, expressed as a tiny
 /// multiple of `‖g‖·‖Δ‖`. A predicted decrease below this is at the level of
@@ -5004,6 +5024,14 @@ impl SaeManifoldTerm {
     /// exact unweighted path.
     pub fn row_loss_weights(&self) -> Option<&[f64]> {
         self.row_loss_weights.as_deref()
+    }
+
+    /// Drop any installed per-row reconstruction weights, returning the term to
+    /// the exact unweighted (full-pass) path. Used by the #997 structure-search
+    /// wiring to clear the internal estimation/evaluation mask off the adopted
+    /// term before the payload reconstruction is read over all rows.
+    pub fn clear_row_loss_weights(&mut self) {
+        self.row_loss_weights = None;
     }
 
     /// Install the single per-row [`RowMetric`](crate::inference::row_metric::RowMetric)
@@ -13226,6 +13254,205 @@ impl SaeManifoldOuterObjective {
         self.term.assemble_shape_uncertainty(&cache, dispersion)
     }
 
+    /// Certified curvature-homotopy entry walk (#1007): replace the blind
+    /// multi-seed multistart with one predictor-corrector walk of the basis
+    /// curvature dial `η` from the Eckart-Young anchor (`η = 0`, global by
+    /// construction) to the full curved basis (`η = 1`).
+    ///
+    /// 1. **Anchor (`η = 0`).** The curved columns are suppressed, so the decoder
+    ///    sub-problem is convex and its optimum is the Eckart-Young projection
+    ///    certified by [`linear_span_anchor`]; the joint corrector lands on it. A
+    ///    degenerate anchor (no recoverable linear span / a non-finite target /
+    ///    a failed relaxation solve) returns `Ok(false)` — the caller falls back
+    ///    to the cascade.
+    /// 2. **Walk `η: 0 → 1`.** Each waypoint: a *predictor* applies the IFT step
+    ///    `Δβ = −H⁻¹ · ∂g_β/∂η · Δη` on the cached evidence factor
+    ///    ([`ArrowFactorCache::full_inverse_apply`], β-channel; the t / gate
+    ///    blocks are re-converged by the corrector), then the *corrector* (the
+    ///    damped joint Newton in `reml_criterion_with_cache`) re-converges at
+    ///    `η_next`. The invariant is that the arrow factor's smallest pivot stays
+    ///    at or above the safe-SPD floor `√eps · max(diag_scale, 1)`; when it
+    ///    shrinks the `η` step is halved and retried from the last converged
+    ///    state. A pivot collapse at the minimum step is a DETECTED bifurcation
+    ///    (recorded on [`CurvatureWalkReport`], never silent) and returns
+    ///    `Ok(false)`.
+    /// 3. **Arrival (`η = 1`).** The term is left warm at the certified branch's
+    ///    `η = 1` solution; the report is recorded and the call returns
+    ///    `Ok(true)`.
+    ///
+    /// The walk runs at the seed's entry ρ (`baseline_rho`), orthogonal to the
+    /// ρ-anneal; the outer engine still moves ρ afterward from this warm state.
+    pub fn run_curvature_homotopy_entry(&mut self) -> Result<bool, String> {
+        let rho = self.baseline_rho.clone();
+        // Eckart-Young anchor certificate at η = 0 (output-subspace coords). A
+        // degenerate anchor is the cascade's job, not the walk's.
+        let anchor = match linear_span_anchor(&self.term, self.target.view()) {
+            Ok(anchor) => anchor,
+            Err(err) => {
+                log::info!(
+                    "[#1007] curvature anchor degenerate ({err}); deferring to seed cascade"
+                );
+                return Ok(false);
+            }
+        };
+        let anchor_residual_norm_sq = anchor.residual_norm_sq;
+
+        // Anchor corrector at η = 0: the convex linear relaxation.
+        let (_loss0, mut last_cache) = match self.solve_at_eta(&rho, 0.0) {
+            Ok(pair) => pair,
+            Err(err) => {
+                log::info!(
+                    "[#1007] curvature anchor solve failed at η=0 ({err}); deferring to cascade"
+                );
+                self.term.set_homotopy_eta(1.0).ok();
+                return Ok(false);
+            }
+        };
+
+        let mut eta = 0.0_f64;
+        let mut eta_step = CURVATURE_WALK_INITIAL_ETA_STEP;
+        let mut eta_steps = 0usize;
+        let mut step_halvings = 0usize;
+        let mut total_correctors = 0usize;
+        let mut bifurcation: Option<CurvatureBifurcation> = None;
+
+        'walk: while eta < 1.0 {
+            let eta_next = (eta + eta_step).min(1.0);
+            let d_eta = eta_next - eta;
+
+            // Predictor: IFT step on the cached factor warm-starts the corrector
+            // (β-channel only; `w_t = 0`). Non-fatal — on any predictor failure
+            // the corrector simply opens from the previous η's converged β.
+            if let Ok(dg_beta) = self
+                .term
+                .curvature_beta_gradient_eta_derivative(self.target.view())
+                && dg_beta.len() == last_cache.k
+            {
+                let w_t = Array1::<f64>::zeros(last_cache.delta_t_len());
+                if let Ok((_u_t, u_beta)) = last_cache.full_inverse_apply(w_t.view(), dg_beta.view())
+                {
+                    let mut beta = self.term.flatten_beta();
+                    if beta.len() == u_beta.len() {
+                        for (b, u) in beta.iter_mut().zip(u_beta.iter()) {
+                            *b -= u * d_eta;
+                        }
+                        if beta.iter().all(|v| v.is_finite()) {
+                            self.term.set_flat_beta(beta.view()).ok();
+                        }
+                    }
+                }
+            }
+
+            // Corrector at η_next.
+            let cache = match self.solve_at_eta(&rho, eta_next) {
+                Ok((_loss, cache)) => cache,
+                Err(err) => {
+                    // Corrector struggled: treat like a pivot shrink — halve the
+                    // η step and retry from the last converged state. A failure
+                    // at the minimum step is a branch bifurcation.
+                    if eta_step <= CURVATURE_WALK_MIN_ETA_STEP {
+                        log::info!(
+                            "[#1007] curvature corrector failed at η={eta_next:.4} at the minimum \
+                             η-step ({err}); recording branch bifurcation"
+                        );
+                        bifurcation = Some(CurvatureBifurcation {
+                            eta: eta_next,
+                            min_pivot: 0.0,
+                        });
+                        break 'walk;
+                    }
+                    eta_step *= 0.5;
+                    step_halvings += 1;
+                    self.term.set_homotopy_eta(eta).ok();
+                    continue 'walk;
+                }
+            };
+            total_correctors += 1;
+
+            // Pivot invariant: min pivot ≥ √eps · max(diag_scale, 1), the same
+            // safe-SPD floor the inner solver uses.
+            let pivot = arrow_factor_min_pivot(&cache).min_pivot.unwrap_or(0.0);
+            let diag_scale = arrow_factor_max_pivot(&cache).unwrap_or(1.0);
+            let floor = f64::EPSILON.sqrt() * diag_scale.max(1.0);
+            if !(pivot.is_finite() && pivot >= floor) {
+                if eta_step > CURVATURE_WALK_MIN_ETA_STEP {
+                    eta_step *= 0.5;
+                    step_halvings += 1;
+                    self.term.set_homotopy_eta(eta).ok();
+                    continue 'walk;
+                }
+                log::info!(
+                    "[#1007] curvature branch bifurcation at η={eta_next:.4}: min pivot \
+                     {pivot:.3e} < floor {floor:.3e}; deferring to seed cascade"
+                );
+                bifurcation = Some(CurvatureBifurcation {
+                    eta: eta_next,
+                    min_pivot: pivot,
+                });
+                break 'walk;
+            }
+
+            // Accepted waypoint: advance and gently regrow the step toward the
+            // nominal cadence (a clean stretch should not stay throttled).
+            eta = eta_next;
+            last_cache = cache;
+            eta_steps += 1;
+            eta_step = (eta_step * 2.0).min(CURVATURE_WALK_INITIAL_ETA_STEP);
+            if total_correctors >= CURVATURE_WALK_MAX_CORRECTORS && eta < 1.0 {
+                log::info!(
+                    "[#1007] curvature walk hit its corrector budget at η={eta:.4}; deferring to \
+                     seed cascade"
+                );
+                bifurcation = Some(CurvatureBifurcation {
+                    eta,
+                    min_pivot: pivot,
+                });
+                break 'walk;
+            }
+        }
+
+        let arrived = bifurcation.is_none() && eta >= 1.0;
+        // Leave the term at the real (η = 1) objective regardless of outcome so
+        // an aborted walk hands the cascade the full basis.
+        if !arrived {
+            self.term.set_homotopy_eta(1.0).ok();
+        }
+        let collapse_events = self.term.collapse_events().len();
+        self.term.set_curvature_walk_report(CurvatureWalkReport {
+            arrived,
+            anchor_residual_norm_sq,
+            bifurcation,
+            eta_steps,
+            step_halvings,
+            collapse_events,
+            reseeds: 0,
+        });
+        Ok(arrived)
+    }
+
+    /// Curvature-homotopy corrector (#1007): install the `η` dial and re-converge
+    /// the joint fit at the entry ρ, returning the converged loss and the
+    /// undamped evidence cache (for the predictor IFT solve + the pivot
+    /// invariant). The dial is read on the next basis refresh inside the solve.
+    fn solve_at_eta(
+        &mut self,
+        rho: &SaeManifoldRho,
+        eta: f64,
+    ) -> Result<(SaeManifoldLoss, ArrowFactorCache), String> {
+        self.term.set_homotopy_eta(eta)?;
+        let (_cost, loss, cache) = self.term.reml_criterion_with_cache(
+            self.target.view(),
+            rho,
+            self.registry.as_ref(),
+            self.inner_max_iter,
+            self.learning_rate,
+            self.ridge_ext_coord,
+            self.ridge_beta,
+        )?;
+        self.last_loss = Some(loss.clone());
+        Ok((loss, cache))
+    }
+
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
     /// the cached ρ / loss and (optionally) priming the inner solve from a
     /// seeded β. Returns `(cost, β̂)`.
@@ -13475,6 +13702,21 @@ impl OuterObjective for SaeManifoldOuterObjective {
     /// empties on a structural diagnosis.
     fn requires_continuation_path_entry(&self) -> bool {
         true
+    }
+
+    /// The SAE-manifold objective has a certified anchor (#1007): its `η = 0`
+    /// Eckart-Young linear relaxation is convex with a global optimum certified
+    /// by [`linear_span_anchor`]. Run the predictor-corrector `η`-walk from that
+    /// anchor in place of blind multistart. On arrival the inner state is warm
+    /// at the certified `η = 1` solution and the seed cascade is bypassed; on a
+    /// degenerate anchor or a detected bifurcation the term is left at the full
+    /// basis (`η = 1`) and the documented cascade takes over — the outcome is
+    /// recorded on the fit payload either way.
+    fn curvature_homotopy_entry(&mut self) -> Option<Result<bool, EstimationError>> {
+        Some(
+            self.run_curvature_homotopy_entry()
+                .map_err(EstimationError::RemlOptimizationFailed),
+        )
     }
 }
 
