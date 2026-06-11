@@ -1,11 +1,11 @@
 //! SCRATCH (not for commit): diagnose gam's `re` linear random-slope on the
 //! sleepstudy forecast — fit speed, RMSE, and any panic.
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use std::path::Path;
 
@@ -76,13 +76,23 @@ fn re_diag() {
                 match build_term_collection_design(grid.view(), &fit.resolvedspec) {
                     Ok(d) => {
                         let p: Vec<f64> = d.design.apply(&fit.fit.beta).to_vec();
-                        eprintln!("[re-diag] {f:<48} rmse={:.3} edf={edf:.2} secs={:.1}", rmse(&p, &tt), t0.elapsed().as_secs_f64());
+                        eprintln!(
+                            "[re-diag] {f:<48} rmse={:.3} edf={edf:.2} secs={:.1}",
+                            rmse(&p, &tt),
+                            t0.elapsed().as_secs_f64()
+                        );
                     }
-                    Err(e) => eprintln!("[re-diag] {f:<48} PREDICT-ERR {e:?} secs={:.1}", t0.elapsed().as_secs_f64()),
+                    Err(e) => eprintln!(
+                        "[re-diag] {f:<48} PREDICT-ERR {e:?} secs={:.1}",
+                        t0.elapsed().as_secs_f64()
+                    ),
                 }
             }
             Ok(_) => eprintln!("[re-diag] {f:<48} non-standard"),
-            Err(e) => eprintln!("[re-diag] {f:<48} FIT-ERR {e:?} secs={:.1}", t0.elapsed().as_secs_f64()),
+            Err(e) => eprintln!(
+                "[re-diag] {f:<48} FIT-ERR {e:?} secs={:.1}",
+                t0.elapsed().as_secs_f64()
+            ),
         }
     }
 }
