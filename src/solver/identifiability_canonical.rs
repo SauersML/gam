@@ -839,7 +839,7 @@ fn canonicalize_for_identifiability_inner(
 
     Ok(CanonicalSpecs {
         reduced_specs,
-        per_block_transform,
+        gauge: Gauge::from_block_transforms(&per_block_transform),
         audit,
         used_channel_aware_audit: use_channel_aware,
     })
