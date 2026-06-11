@@ -4547,6 +4547,106 @@ impl ArrowFactorCache {
         Ok(out)
     }
 
+    /// Solve the full bordered-arrow system `H·u = w` on the cached factor
+    /// (#1006): `w` arrives in arrow layout — `w_t` flat per
+    /// [`Self::delta_t_len`] / `row_offsets`, `w_beta` of length `K` — and the
+    /// solution comes back in the same layout. Standard block elimination on
+    /// the SAME factors whose log-determinant the evidence reports:
+    ///
+    /// ```text
+    ///   y_i      = H_tt^(i)⁻¹ · w_t^(i)
+    ///   r_β      = w_β − Σ_i H_βt^(i) · y_i
+    ///   u_β      = Schur⁻¹ · r_β
+    ///   u_t^(i)  = y_i − H_tt^(i)⁻¹ · (H_tβ^(i) · u_β)
+    /// ```
+    ///
+    /// This is the IFT / adjoint back-solve the analytic outer ρ-gradient
+    /// consumes: `u_j = H⁻¹ (∂g/∂ρ_j)` per outer coordinate and the
+    /// `H⁻¹`-side of the third-order correction `−½·Γᵀ·H⁻¹·(∂g/∂ρ_j)`.
+    /// Contract: the cache must be the ridge-0 Direct evidence factor
+    /// (undamped per-row factors + dense Schur), so the solve is against the
+    /// criterion's own `H` — never a damped surrogate (that would desync the
+    /// gradient from the reported evidence).
+    pub fn solve_full(
+        &self,
+        w_t: ArrayView1<'_, f64>,
+        w_beta: ArrayView1<'_, f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+        let total_len = self.delta_t_len();
+        if w_t.len() != total_len || w_beta.len() != self.k {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "solve_full: rhs shapes (w_t={}, w_beta={}) != (delta_t_len={}, K={})",
+                    w_t.len(),
+                    w_beta.len(),
+                    total_len,
+                    self.k
+                ),
+            });
+        }
+        let n = self.undamped_factor_count();
+        // Forward pass: y_i = H_tt^(i)⁻¹ w_t^(i), accumulating the border RHS.
+        let mut y = Array1::<f64>::zeros(total_len);
+        let mut r_beta = w_beta.to_owned();
+        for i in 0..n {
+            let di = self.row_dims[i];
+            let base = self.row_offsets[i];
+            let factor = self.undamped_factor(i);
+            let w_row = w_t.slice(ndarray::s![base..base + di]).to_owned();
+            let y_row = cholesky_solve_vector(factor, &w_row);
+            if self.k > 0 {
+                // r_β −= H_βt^(i) y_i: accumulate into a scratch then subtract,
+                // because the helper ACCUMULATES (+=) into its output.
+                let mut acc = Array1::<f64>::zeros(self.k);
+                if !self.apply_htbeta_row_transpose(i, y_row.view(), &mut acc, None) {
+                    return Err(ArrowSchurError::SchurFactorFailed {
+                        reason: format!(
+                            "solve_full: H_βt^({i}) apply failed (htbeta cache \
+                             could not supply row {i})"
+                        ),
+                    });
+                }
+                for c in 0..self.k {
+                    r_beta[c] -= acc[c];
+                }
+            }
+            for j in 0..di {
+                y[base + j] = y_row[j];
+            }
+        }
+        // Border solve + back-substitution.
+        let u_beta = if self.k > 0 {
+            self.schur_inverse_apply(r_beta.view())?
+        } else {
+            Array1::<f64>::zeros(0)
+        };
+        let mut u_t = y;
+        if self.k > 0 {
+            let mut cross = Array1::<f64>::zeros(self.d);
+            for i in 0..n {
+                let di = self.row_dims[i];
+                let base = self.row_offsets[i];
+                let mut cross_row = cross.slice_mut(ndarray::s![..di]);
+                cross_row.fill(0.0);
+                let mut cross_owned = cross_row.to_owned();
+                if !self.apply_htbeta_row(i, u_beta.view(), &mut cross_owned) {
+                    return Err(ArrowSchurError::SchurFactorFailed {
+                        reason: format!(
+                            "solve_full: H_tβ^({i}) apply failed (htbeta cache \
+                             could not supply row {i})"
+                        ),
+                    });
+                }
+                let factor = self.undamped_factor(i);
+                let corr = cholesky_solve_vector(factor, &cross_owned);
+                for j in 0..di {
+                    u_t[base + j] -= corr[j];
+                }
+            }
+        }
+        Ok((u_t, u_beta))
+    }
+
     /// Apply the β-block of the full inverse, `(H⁻¹)_ββ · rhs = S_β⁻¹ · rhs`,
     /// where `S_β` is the Schur complement on β whose Cholesky factor this
     /// cache holds in [`Self::schur_factor`].
@@ -8379,6 +8479,113 @@ mod tests {
             (trace_selected - trace_dense).abs() < 1e-9,
             "full latent trace {trace_selected} vs dense {trace_dense}"
         );
+    }
+
+    /// `solve_full` (#1006 IFT/adjoint back-solve) must reproduce the dense
+    /// bordered-arrow inverse applied to an arbitrary arrow-layout RHS, and
+    /// solving against the system's own gradient must reproduce the Newton
+    /// step the solver itself returned (`Δ = H⁻¹g`) — both to near machine
+    /// precision on the ridge-0 Direct factor.
+    #[test]
+    fn solve_full_matches_dense_inverse_and_newton_step() {
+        let n = 3usize;
+        let d = 2usize;
+        let k = 2usize;
+        let mut sys = ArrowSchurSystem::new(n, d, k);
+        sys.rows[0].htt = array![[4.0_f64, 0.5], [0.5, 3.0]];
+        sys.rows[0].htbeta = array![[1.0_f64, 0.2], [-0.3, 0.7]];
+        sys.rows[0].gt = array![0.4_f64, -0.7];
+        sys.rows[1].htt = array![[5.0_f64, -0.4], [-0.4, 2.5]];
+        sys.rows[1].htbeta = array![[0.6_f64, -0.1], [0.4, 0.9]];
+        sys.rows[1].gt = array![-0.2_f64, 0.9];
+        sys.rows[2].htt = array![[3.5_f64, 0.2], [0.2, 4.5]];
+        sys.rows[2].htbeta = array![[-0.2_f64, 0.5], [0.8, -0.6]];
+        sys.rows[2].gt = array![1.1_f64, 0.3];
+        sys.hbb = array![[12.0_f64, 0.7], [0.7, 10.0]];
+        sys.gb = array![0.5_f64, -0.8];
+
+        let options = ArrowSolveOptions::direct();
+        let (delta_t, delta_beta, cache) =
+            solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+                .expect("direct arrow solve should factor this SPD system");
+
+        // (a) The solver returns the DESCENT step Δ = −H⁻¹g; solve_full is the
+        // bare inverse application H⁻¹g, so u must equal −Δ exactly.
+        let mut g_t = Array1::<f64>::zeros(n * d);
+        for i in 0..n {
+            for j in 0..d {
+                g_t[i * d + j] = sys.rows[i].gt[j];
+            }
+        }
+        let (u_t, u_beta) = cache
+            .solve_full(g_t.view(), sys.gb.view())
+            .expect("solve_full on the ridge-0 Direct cache");
+        for idx in 0..n * d {
+            assert!(
+                (u_t[idx] + delta_t[idx]).abs() < 1e-10,
+                "t[{idx}]: solve_full {} vs −(Newton step) {}",
+                u_t[idx],
+                -delta_t[idx]
+            );
+        }
+        for c in 0..k {
+            assert!(
+                (u_beta[c] + delta_beta[c]).abs() < 1e-10,
+                "beta[{c}]: solve_full {} vs −(Newton step) {}",
+                u_beta[c],
+                -delta_beta[c]
+            );
+        }
+
+        // (b) Arbitrary RHS vs the dense bordered inverse.
+        let dim = n * d + k;
+        let mut h = Array2::<f64>::zeros((dim, dim));
+        for i in 0..n {
+            let base = i * d;
+            for r in 0..d {
+                for c in 0..d {
+                    h[[base + r, base + c]] = sys.rows[i].htt[[r, c]];
+                }
+                for c in 0..k {
+                    let v = sys.rows[i].htbeta[[r, c]];
+                    h[[base + r, n * d + c]] = v;
+                    h[[n * d + c, base + r]] = v;
+                }
+            }
+        }
+        for r in 0..k {
+            for c in 0..k {
+                h[[n * d + r, n * d + c]] = sys.hbb[[r, c]];
+            }
+        }
+        let l = cholesky_lower(&h).expect("assembled bordered H must be SPD");
+        let mut w_full = Array1::<f64>::zeros(dim);
+        for (idx, v) in w_full.iter_mut().enumerate() {
+            *v = 0.3 + 0.17 * (idx as f64) * (if idx % 2 == 0 { 1.0 } else { -1.0 });
+        }
+        let dense_u = cholesky_solve_vector(&l, &w_full);
+        let (u_t2, u_beta2) = cache
+            .solve_full(
+                w_full.slice(ndarray::s![..n * d]),
+                w_full.slice(ndarray::s![n * d..]),
+            )
+            .expect("solve_full on arbitrary RHS");
+        for idx in 0..n * d {
+            assert!(
+                (u_t2[idx] - dense_u[idx]).abs() < 1e-10,
+                "t[{idx}]: solve_full {} vs dense {}",
+                u_t2[idx],
+                dense_u[idx]
+            );
+        }
+        for c in 0..k {
+            assert!(
+                (u_beta2[c] - dense_u[n * d + c]).abs() < 1e-10,
+                "beta[{c}]: solve_full {} vs dense {}",
+                u_beta2[c],
+                dense_u[n * d + c]
+            );
+        }
     }
 
     /// `schur_inverse_apply` / `schur_inverse_diagonal` must reproduce the
