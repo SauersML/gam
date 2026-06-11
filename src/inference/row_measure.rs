@@ -745,6 +745,103 @@ impl RowMeasure {
             expected_size: pi.iter().sum(),
         }
     }
+
+    /// Draw a **certified** designed subsample within a target `eps` of the full
+    /// corpus on BOTH evidence halves (#1012).
+    ///
+    /// Unlike [`Self::designed_subsample`] — whose Horvitz–Thompson design is
+    /// unbiased only in expectation — this is the deterministic CERTIFIED mode:
+    ///
+    /// * **spectral half (`½log|H|`):** deterministic Batson–Spielman–Srivastava
+    ///   selection of `O(dim/eps²)` weighted rows from the per-row factors
+    ///   `R_i` (`H_i = R_iᵀR_i`), giving `(1−eps)H ⪯ H_C ⪯ (1+eps)H` and hence
+    ///   `|log|H_C| − log|H|| ≤ dim·log((1+eps)/(1−eps))`;
+    /// * **likelihood half (`L`):** the sensitivity bounds
+    ///   `σ_i ≤ leverage_i·(1 + κ̂·chart_radius)` on the documented chart ball,
+    ///   greedily selected against the row budget; the residual sensitivity mass
+    ///   is the additive `eps_likelihood·L` the certificate carries.
+    ///
+    /// The two selections are unioned (a row certified for either half is kept),
+    /// the rows carry their deterministic BSS / sensitivity weights, and the
+    /// [`CoresetCertificate`] rides the result so a race consumer can gate the
+    /// transfer with [`CoresetCertificate::race_transfer_margin`] — the SAME
+    /// margin seam the enclosure path (#1011) declares. Below that margin the
+    /// consumer must grow the coreset, never silently decide.
+    ///
+    /// `row_factors` is the per-row factor list aligned with this measure's rows;
+    /// `leverage`, `kappa_hat`, `chart_radius` are the sensitivity inputs (the
+    /// #1007 SVD-anchor leverage and the #1008 curvature slack). `budget` caps
+    /// the likelihood-half greedy selection.
+    pub fn designed_subsample_certified<'a, I>(
+        &self,
+        row_factors: I,
+        target_eps: f64,
+        leverage: &[f64],
+        kappa_hat: f64,
+        chart_radius: f64,
+        budget: usize,
+    ) -> Result<CertifiedRowSample, String>
+    where
+        I: IntoIterator<Item = ArrayView2<'a, f64>>,
+    {
+        // Spectral half: deterministic BSS coreset + its spectral certificate.
+        let spectral = bss_spectral_coreset_certified(row_factors, target_eps)?;
+
+        // Likelihood half: sensitivity-bounded greedy coreset; the residual mass
+        // not covered by the budget becomes the additive eps_likelihood.
+        let sigma = sensitivity_upper_bounds(leverage, kappa_hat, chart_radius)?;
+        let sensitivity = greedy_sensitivity_coreset(&sigma, budget)?;
+        let total_sensitivity =
+            sensitivity.selected_sensitivity_mass + sensitivity.residual_sensitivity_mass;
+        let eps_likelihood = if total_sensitivity > 0.0 {
+            sensitivity.residual_sensitivity_mass / total_sensitivity
+        } else {
+            0.0
+        };
+
+        // Union the two selections; a row certified for either half is retained.
+        // Carry the BSS weight where present, else the HT scale-up `1/π` proxy
+        // (uniform `n/|S|`) so the likelihood-only rows still enter the criterion
+        // unbiasedly.
+        let n = self.weights.len();
+        let bss_weight: std::collections::BTreeMap<usize, f64> = spectral
+            .indices
+            .iter()
+            .zip(spectral.weights.iter())
+            .map(|(&i, &w)| (i, w))
+            .collect();
+        let mut selected: std::collections::BTreeSet<usize> =
+            spectral.indices.iter().copied().collect();
+        for &i in &sensitivity.indices {
+            selected.insert(i);
+        }
+        let selected_len = selected.len().max(1);
+        let ht_scale = if n > 0 {
+            n as f64 / selected_len as f64
+        } else {
+            1.0
+        };
+
+        let rows: Vec<usize> = selected.iter().copied().collect();
+        let weights: Vec<f64> = rows
+            .iter()
+            .map(|i| *bss_weight.get(i).unwrap_or(&ht_scale))
+            .collect();
+
+        let certificate = CoresetCertificate::new(
+            spectral.certificate.eps_spectral,
+            eps_likelihood,
+            spectral.certificate.dim_effective,
+            rows.len(),
+        )?;
+
+        Ok(CertifiedRowSample {
+            provenance: self.provenance,
+            rows,
+            weights,
+            certificate,
+        })
+    }
 }
 
 /// A designed importance subsample with honest Horvitz–Thompson likelihood
@@ -781,6 +878,44 @@ impl DesignedRowSample {
     /// this lands near `n` (it is exactly `n` in expectation).
     pub fn estimated_corpus_rows(&self) -> f64 {
         self.likelihood_weights.iter().sum()
+    }
+}
+
+/// A **certified** designed subsample (#1012): the rows that certify BOTH
+/// evidence halves within the target `eps`, their deterministic BSS /
+/// sensitivity weights, and the [`CoresetCertificate`] a race consumer gates
+/// the verdict transfer against. Produced by
+/// [`RowMeasure::designed_subsample_certified`].
+#[derive(Clone, Debug)]
+pub struct CertifiedRowSample {
+    /// Provenance of the measure that shaped the design.
+    pub provenance: MeasureProvenance,
+    /// Selected row indices, ascending (union of the spectral and sensitivity
+    /// coresets).
+    pub rows: Vec<usize>,
+    /// Per-selected-row weight aligned with `rows`: the BSS spectral weight
+    /// where the row was chosen for the log-determinant half, else the
+    /// Horvitz–Thompson scale-up for a likelihood-only row.
+    pub weights: Vec<f64>,
+    /// The certificate bounding the worst-case evidence transfer error. Feed
+    /// [`CoresetCertificate::race_transfer_margin`] to the race consumer's
+    /// margin gate.
+    pub certificate: CoresetCertificate,
+}
+
+impl CertifiedRowSample {
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The race-transfer margin a consumer must clear before inheriting the
+    /// full-corpus verdict from this coreset — the shared #1011/#1012 seam.
+    pub fn race_transfer_margin(&self) -> f64 {
+        self.certificate.race_transfer_margin()
     }
 }
 
@@ -1316,5 +1451,51 @@ mod tests {
         assert_eq!(selected.indices, vec![1, 2]);
         assert!((selected.selected_sensitivity_mass - 1.5).abs() < 1e-12);
         assert!((selected.residual_sensitivity_mass - 0.45).abs() < 1e-12);
+    }
+
+    /// #1012 certified designed subsample: the result carries a certificate
+    /// whose race-transfer margin equals the certificate's, and the adversarial
+    /// heavy-tail row (one row carrying the curvature signal) is FORCED into the
+    /// coreset by the sensitivity bound — the classic uniform-subsampling miss.
+    #[test]
+    fn certified_subsample_forces_the_heavy_tail_row_and_carries_a_certificate() {
+        // Five rows: four ordinary low-leverage rows and one heavy-tail row
+        // (index 4) with an order-of-magnitude larger leverage and a unique
+        // spectral direction e2.
+        let row_factors = vec![
+            array![[1.0, 0.0]],
+            array![[1.0, 0.0]],
+            array![[1.0, 0.0]],
+            array![[1.0, 0.0]],
+            array![[0.0, 5.0]],
+        ];
+        let leverage = vec![0.05, 0.05, 0.05, 0.05, 0.9];
+        let measure = RowMeasure::uniform(5);
+        let certified = measure
+            .designed_subsample_certified(
+                row_factors.iter().map(|r| r.view()),
+                0.4,
+                &leverage,
+                1.0,
+                0.1,
+                1, // budget admits a single sensitivity row
+            )
+            .expect("certified subsample");
+
+        assert!(
+            certified.rows.contains(&4),
+            "the heavy-tail row carrying the curvature signal must be forced in: {:?}",
+            certified.rows
+        );
+        assert_eq!(certified.rows.len(), certified.weights.len());
+        // The race-transfer margin is the certificate's — the shared #1011/#1012
+        // seam a race consumer gates on.
+        assert!((certified.race_transfer_margin()
+            - certified.certificate.race_transfer_margin())
+        .abs()
+            < 1e-12);
+        assert!(certified.certificate.race_transfer_margin() > 0.0);
+        // The certificate's selected count matches the realized coreset.
+        assert_eq!(certified.certificate.n_selected, certified.rows.len());
     }
 }
