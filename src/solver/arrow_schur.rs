@@ -117,6 +117,10 @@ const DEFAULT_PCG_RELATIVE_TOLERANCE: f64 = 1e-4;
 const PCG_ABSOLUTE_TOLERANCE_FLOOR: f64 = 1e-14;
 const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
 pub const DEFAULT_PROXIMAL_INITIAL_RIDGE: f64 = 1e-8;
+const F32_UNIT_ROUNDOFF: f64 = (f32::EPSILON as f64) * 0.5;
+const DEFAULT_MIXED_PRECISION_MAX_REFINEMENTS: usize = 6;
+const DEFAULT_MIXED_PRECISION_CERTIFICATE_TOLERANCE: f64 = 1e-11;
+const DEFAULT_MIXED_PRECISION_KAPPA_MARGIN: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BetaEdge {
@@ -1550,6 +1554,20 @@ pub struct PcgDiagnostics {
     pub final_relative_residual: f64,
     /// Why the loop stopped.
     pub stopping_reason: PcgStopReason,
+    /// Mixed-precision certificate outcome for this solve.
+    pub mixed_precision_status: MixedPrecisionStatus,
+}
+
+/// Outcome of an opt-in mixed-precision arrow solve.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MixedPrecisionStatus {
+    /// The caller did not request mixed precision or this solve mode cannot use it.
+    #[default]
+    Off,
+    /// The f32 factor solve was refined until the f64 backward-error certificate held.
+    Certified { refinement_steps: usize },
+    /// The kappa gate or solve shape rejected mixed precision and the f64 path ran.
+    F64Fallback,
 }
 
 /// PCG controls for BA's inexact reduced-camera-system solve.
@@ -1596,6 +1614,48 @@ impl Default for ArrowTrustRegionOptions {
     }
 }
 
+/// Opt-in Carson--Higham mixed-precision refinement for dense arrow solves.
+///
+/// Default is [`MixedPrecisionPolicy::Off`]: exact f64 solves remain the default.
+/// [`MixedPrecisionPolicy::Certified`] stores f32 copies of the per-row Cholesky
+/// factors and dense Schur factor, solves corrections in f32, and recomputes the
+/// residual in f64 against the original arrow blocks. The standard refinement
+/// certificate is the normwise backward error
+///
+/// `||r||_inf / (||H||_inf ||x||_inf + ||b||_inf) <= residual_relative_tolerance`.
+///
+/// The kappa gate enforces `kappa_estimate * u_f32 < kappa_unit_roundoff_margin`;
+/// when it fails, the solver emits a loud fallback message and uses the f64 path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MixedPrecisionPolicy {
+    Off,
+    Certified {
+        max_refinement_steps: usize,
+        residual_relative_tolerance: f64,
+        kappa_unit_roundoff_margin: f64,
+    },
+}
+
+impl Default for MixedPrecisionPolicy {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl MixedPrecisionPolicy {
+    pub fn certified() -> Self {
+        Self::Certified {
+            max_refinement_steps: DEFAULT_MIXED_PRECISION_MAX_REFINEMENTS,
+            residual_relative_tolerance: DEFAULT_MIXED_PRECISION_CERTIFICATE_TOLERANCE,
+            kappa_unit_roundoff_margin: DEFAULT_MIXED_PRECISION_KAPPA_MARGIN,
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        matches!(self, MixedPrecisionPolicy::Certified { .. })
+    }
+}
+
 /// Complete BA Schur solve options.
 ///
 /// Use [`ArrowSolveOptions::automatic`] for normal latent-coordinate fits;
@@ -1636,6 +1696,8 @@ pub struct ArrowSolveOptions {
     ///
     /// Default `false`: ordinary solves keep the full guard.
     pub tolerate_ill_conditioning: bool,
+    /// Opt-in certified mixed-precision direct solve. Default is off.
+    pub mixed_precision: MixedPrecisionPolicy,
 }
 
 impl std::fmt::Debug for ArrowSolveOptions {
@@ -1648,6 +1710,7 @@ impl std::fmt::Debug for ArrowSolveOptions {
             .field("riemannian_trust_region", &self.riemannian_trust_region)
             .field("gpu_matvec", &self.gpu_matvec.is_some())
             .field("tolerate_ill_conditioning", &self.tolerate_ill_conditioning)
+            .field("mixed_precision", &self.mixed_precision)
             .finish()
     }
 }
@@ -1722,6 +1785,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
+            mixed_precision: MixedPrecisionPolicy::Off,
         }
     }
 
@@ -1736,6 +1800,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
+            mixed_precision: MixedPrecisionPolicy::Off,
         }
     }
 
@@ -1749,6 +1814,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
+            mixed_precision: MixedPrecisionPolicy::Off,
         }
     }
 
@@ -1762,6 +1828,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
+            mixed_precision: MixedPrecisionPolicy::Off,
         }
     }
 
@@ -1779,6 +1846,11 @@ impl ArrowSolveOptions {
     /// exact regardless of κ.
     pub fn with_ill_conditioning_tolerated(mut self) -> Self {
         self.tolerate_ill_conditioning = true;
+        self
+    }
+
+    pub fn with_mixed_precision_policy(mut self, policy: MixedPrecisionPolicy) -> Self {
+        self.mixed_precision = policy;
         self
     }
 }
@@ -4633,6 +4705,19 @@ fn lower_cholesky_min_pivot(factor: ArrayView2<'_, f64>) -> Option<f64> {
     out
 }
 
+fn lower_cholesky_max_pivot(factor: ArrayView2<'_, f64>) -> Option<f64> {
+    let width = factor.nrows().min(factor.ncols());
+    let mut out = None;
+    for idx in 0..width {
+        let pivot = factor[[idx, idx]] * factor[[idx, idx]];
+        out = Some(match out {
+            Some(current) => f64::max(current, pivot),
+            None => pivot,
+        });
+    }
+    out
+}
+
 /// Smallest cached Cholesky pivot for row blocks and the dense Schur factor.
 ///
 /// Pivots are returned as squared lower-factor diagonals, matching the Hessian
@@ -5626,6 +5711,439 @@ struct ArrowNewtonStepArtifacts {
     pcg_diagnostics: PcgDiagnostics,
 }
 
+enum MixedPrecisionAttempt {
+    Certified {
+        delta_t: Array1<f64>,
+        delta_beta: Array1<f64>,
+        schur_factor: Array2<f64>,
+        refinement_steps: usize,
+    },
+    Fallback {
+        reason: String,
+    },
+}
+
+fn back_substitute_delta_t<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    delta_beta: ArrayView1<'_, f64>,
+    backend: &B,
+) -> Array1<f64> {
+    let n = sys.rows.len();
+    let total_dt_len = sys.row_offsets[n];
+    let mut delta_t = Array1::<f64>::zeros(total_dt_len);
+    let mut rhs = Array1::<f64>::zeros(sys.d);
+    let mut htbeta_delta = Array1::<f64>::zeros(sys.d);
+    for i in 0..n {
+        let di = sys.row_dims[i];
+        let row_base = sys.row_offsets[i];
+        assert_eq!(sys.rows[i].gt.len(), di);
+        for c in 0..di {
+            htbeta_delta[c] = 0.0;
+        }
+        let mut htbeta_slice = htbeta_delta.slice_mut(ndarray::s![..di]).to_owned();
+        sys_htbeta_apply_row(sys, i, &sys.rows[i], delta_beta, &mut htbeta_slice);
+        {
+            let mut rhs_i = rhs.slice_mut(ndarray::s![..di]);
+            for c in 0..di {
+                rhs_i[c] = sys.rows[i].gt[c] + htbeta_slice[c];
+            }
+        }
+        let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
+        let dt_i = backend.solve_block_vector(htt_factors.factor(i), rhs_slice.view());
+        for c in 0..di {
+            delta_t[row_base + c] = -dt_i[c];
+        }
+    }
+    delta_t
+}
+
+fn try_mixed_precision_arrow_solve(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    htt_factors: &ArrowFactorSlab,
+    schur: &Array2<f64>,
+    options: &ArrowSolveOptions,
+) -> Result<Option<MixedPrecisionAttempt>, ArrowSchurError> {
+    let MixedPrecisionPolicy::Certified {
+        max_refinement_steps,
+        residual_relative_tolerance,
+        kappa_unit_roundoff_margin,
+    } = options.mixed_precision
+    else {
+        return Ok(None);
+    };
+
+    if options.trust_region.radius.is_finite() {
+        return Ok(Some(MixedPrecisionAttempt::Fallback {
+            reason: "trust-region-truncated dense solves are not certified by the mixed-precision refinement path".to_string(),
+        }));
+    }
+
+    let schur_factor =
+        cholesky_lower(schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
+    if !options.tolerate_ill_conditioning {
+        let schur_kappa = cholesky_factor_kappa_estimate(&schur_factor);
+        if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "reduced Schur complement Cholesky succeeded but is ill-conditioned \
+                     (kappa_estimate={schur_kappa:e}); accumulated per-row \
+                     (H_tt)^-1 contamination would yield an inaccurate delta_beta"
+                ),
+            });
+        }
+    }
+
+    if let Some(reason) =
+        mixed_precision_kappa_gate_failure(htt_factors, &schur_factor, kappa_unit_roundoff_margin)
+    {
+        return Ok(Some(MixedPrecisionAttempt::Fallback { reason }));
+    }
+
+    let row_factors_f32 = arrow_factor_slab_to_f32(htt_factors);
+    let schur_factor_f32 = schur_factor.mapv(|v| v as f32);
+    let (rhs_t, rhs_beta) = arrow_rhs(sys);
+    let mut x = solve_arrow_system_f32(
+        sys,
+        &row_factors_f32,
+        &schur_factor_f32,
+        rhs_t.view(),
+        rhs_beta.view(),
+    );
+    let certificate_tol = residual_relative_tolerance.max(64.0 * f64::EPSILON);
+    for refinement_steps in 0..=max_refinement_steps {
+        let (res_t, res_beta) = arrow_residual(
+            sys,
+            ridge_t,
+            ridge_beta,
+            x.0.view(),
+            x.1.view(),
+            rhs_t.view(),
+            rhs_beta.view(),
+        );
+        let certificate = arrow_backward_error_certificate(
+            sys,
+            ridge_t,
+            ridge_beta,
+            x.0.view(),
+            x.1.view(),
+            rhs_t.view(),
+            rhs_beta.view(),
+            res_t.view(),
+            res_beta.view(),
+        );
+        if certificate <= certificate_tol {
+            return Ok(Some(MixedPrecisionAttempt::Certified {
+                delta_t: x.0,
+                delta_beta: x.1,
+                schur_factor,
+                refinement_steps,
+            }));
+        }
+        if refinement_steps == max_refinement_steps {
+            return Ok(Some(MixedPrecisionAttempt::Fallback {
+                reason: format!(
+                    "f64 residual certificate did not converge after {max_refinement_steps} refinement steps \
+                     (backward_error={certificate:e}, tolerance={certificate_tol:e})"
+                ),
+            }));
+        }
+        let correction = solve_arrow_system_f32(
+            sys,
+            &row_factors_f32,
+            &schur_factor_f32,
+            res_t.view(),
+            res_beta.view(),
+        );
+        if !correction
+            .0
+            .iter()
+            .chain(correction.1.iter())
+            .all(|v| v.is_finite())
+        {
+            return Ok(Some(MixedPrecisionAttempt::Fallback {
+                reason: "f32 refinement correction produced a non-finite value".to_string(),
+            }));
+        }
+        for i in 0..x.0.len() {
+            x.0[i] += correction.0[i];
+        }
+        for i in 0..x.1.len() {
+            x.1[i] += correction.1[i];
+        }
+    }
+
+    unreachable!("mixed refinement loop returns on certification, fallback, or max-step exhaustion")
+}
+
+fn mixed_precision_kappa_gate_failure(
+    htt_factors: &ArrowFactorSlab,
+    schur_factor: &Array2<f64>,
+    margin: f64,
+) -> Option<String> {
+    let mut max_kappa = cholesky_factor_kappa_estimate(schur_factor);
+    let mut min_pivot = lower_cholesky_min_pivot(schur_factor.view());
+    let mut max_pivot = lower_cholesky_max_pivot(schur_factor.view());
+    for factor in htt_factors.iter() {
+        let owned = factor.to_owned();
+        max_kappa = max_kappa.max(cholesky_factor_kappa_estimate(&owned));
+        if let Some(pivot) = lower_cholesky_min_pivot(owned.view()) {
+            min_pivot = Some(match min_pivot {
+                Some(current) => current.min(pivot),
+                None => pivot,
+            });
+        }
+        if let Some(pivot) = lower_cholesky_max_pivot(owned.view()) {
+            max_pivot = Some(match max_pivot {
+                Some(current) => current.max(pivot),
+                None => pivot,
+            });
+        }
+    }
+    if let (Some(min_pivot), Some(max_pivot)) = (min_pivot, max_pivot) {
+        if min_pivot > 0.0 && max_pivot.is_finite() {
+            max_kappa = max_kappa.max(max_pivot / min_pivot);
+        } else {
+            max_kappa = f64::INFINITY;
+        }
+    }
+    let kappa_u = max_kappa * F32_UNIT_ROUNDOFF;
+    let threshold = margin.min(1.0).max(F32_UNIT_ROUNDOFF);
+    if !(max_kappa.is_finite() && kappa_u < threshold) {
+        Some(format!(
+            "kappa gate refused f32 refinement: kappa_estimate={max_kappa:e}, \
+             kappa*u_f32={kappa_u:e}, required < {threshold:e}"
+        ))
+    } else {
+        None
+    }
+}
+
+fn arrow_factor_slab_to_f32(htt_factors: &ArrowFactorSlab) -> Vec<Array2<f32>> {
+    htt_factors
+        .iter()
+        .map(|factor| factor.mapv(|v| v as f32))
+        .collect()
+}
+
+fn arrow_rhs(sys: &ArrowSchurSystem) -> (Array1<f64>, Array1<f64>) {
+    let n = sys.rows.len();
+    let mut rhs_t = Array1::<f64>::zeros(sys.row_offsets[n]);
+    for i in 0..n {
+        let di = sys.row_dims[i];
+        let base = sys.row_offsets[i];
+        for c in 0..di {
+            rhs_t[base + c] = -sys.rows[i].gt[c];
+        }
+    }
+    let mut rhs_beta = Array1::<f64>::zeros(sys.k);
+    for c in 0..sys.k {
+        rhs_beta[c] = -sys.gb[c];
+    }
+    (rhs_t, rhs_beta)
+}
+
+fn solve_arrow_system_f32(
+    sys: &ArrowSchurSystem,
+    row_factors: &[Array2<f32>],
+    schur_factor: &Array2<f32>,
+    rhs_t: ArrayView1<'_, f64>,
+    rhs_beta: ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>) {
+    let n = sys.rows.len();
+    let mut y_rows = Vec::<Array1<f32>>::with_capacity(n);
+    let mut reduced_beta = rhs_beta.mapv(|v| v as f32);
+    for i in 0..n {
+        let di = sys.row_dims[i];
+        let base = sys.row_offsets[i];
+        let rhs_i = rhs_t.slice(ndarray::s![base..base + di]).mapv(|v| v as f32);
+        let y_i = cholesky_solve_lower_f32(&row_factors[i], &rhs_i);
+        let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i]).mapv(|v| v as f32);
+        for beta_col in 0..sys.k {
+            let mut acc = 0.0_f32;
+            for row_axis in 0..di {
+                acc += htbeta[[row_axis, beta_col]] * y_i[row_axis];
+            }
+            reduced_beta[beta_col] -= acc;
+        }
+        y_rows.push(y_i);
+    }
+
+    let x_beta_f32 = cholesky_solve_lower_f32(schur_factor, &reduced_beta);
+    let mut x_t = Array1::<f64>::zeros(sys.row_offsets[n]);
+    for i in 0..n {
+        let di = sys.row_dims[i];
+        let base = sys.row_offsets[i];
+        let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i]).mapv(|v| v as f32);
+        let mut cross = Array1::<f32>::zeros(di);
+        for row_axis in 0..di {
+            let mut acc = 0.0_f32;
+            for beta_col in 0..sys.k {
+                acc += htbeta[[row_axis, beta_col]] * x_beta_f32[beta_col];
+            }
+            cross[row_axis] = acc;
+        }
+        let correction = cholesky_solve_lower_f32(&row_factors[i], &cross);
+        for row_axis in 0..di {
+            x_t[base + row_axis] = (y_rows[i][row_axis] - correction[row_axis]) as f64;
+        }
+    }
+    let x_beta = x_beta_f32.mapv(|v| v as f64);
+    (x_t, x_beta)
+}
+
+fn cholesky_solve_lower_f32(l: &Array2<f32>, b: &Array1<f32>) -> Array1<f32> {
+    let n = l.nrows();
+    let mut y = Array1::<f32>::zeros(n);
+    for i in 0..n {
+        let mut sum = b[i];
+        for j in 0..i {
+            sum -= l[[i, j]] * y[j];
+        }
+        y[i] = sum / l[[i, i]];
+    }
+    let mut x = Array1::<f32>::zeros(n);
+    for i in (0..n).rev() {
+        let mut sum = y[i];
+        for j in (i + 1)..n {
+            sum -= l[[j, i]] * x[j];
+        }
+        x[i] = sum / l[[i, i]];
+    }
+    x
+}
+
+fn arrow_residual(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    x_t: ArrayView1<'_, f64>,
+    x_beta: ArrayView1<'_, f64>,
+    rhs_t: ArrayView1<'_, f64>,
+    rhs_beta: ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>) {
+    let (ax_t, ax_beta) = arrow_operator_apply(sys, ridge_t, ridge_beta, x_t, x_beta);
+    let mut res_t = rhs_t.to_owned();
+    let mut res_beta = rhs_beta.to_owned();
+    for i in 0..res_t.len() {
+        res_t[i] -= ax_t[i];
+    }
+    for i in 0..res_beta.len() {
+        res_beta[i] -= ax_beta[i];
+    }
+    (res_t, res_beta)
+}
+
+fn arrow_operator_apply(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    x_t: ArrayView1<'_, f64>,
+    x_beta: ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>) {
+    let n = sys.rows.len();
+    let mut y_t = Array1::<f64>::zeros(sys.row_offsets[n]);
+    let mut y_beta = Array1::<f64>::zeros(sys.k);
+    {
+        let x_slice = x_beta.as_slice().expect("x_beta contiguous");
+        let y_slice = y_beta.as_slice_mut().expect("y_beta contiguous");
+        sys.penalty_matvec_add(x_slice, y_slice);
+    }
+    for beta_col in 0..sys.k {
+        y_beta[beta_col] += ridge_beta * x_beta[beta_col];
+    }
+    for i in 0..n {
+        let di = sys.row_dims[i];
+        let base = sys.row_offsets[i];
+        let row = &sys.rows[i];
+        for a in 0..di {
+            let mut acc = ridge_t * x_t[base + a];
+            for b in 0..di {
+                acc += row.htt[[a, b]] * x_t[base + b];
+            }
+            y_t[base + a] = acc;
+        }
+        let mut htbeta_xb = Array1::<f64>::zeros(di);
+        sys_htbeta_apply_row(sys, i, row, x_beta, &mut htbeta_xb);
+        for a in 0..di {
+            y_t[base + a] += htbeta_xb[a];
+        }
+        let x_ti = x_t.slice(ndarray::s![base..base + di]).to_owned();
+        sys_htbeta_accumulate_transpose(sys, i, row, x_ti.view(), &mut y_beta);
+    }
+    (y_t, y_beta)
+}
+
+fn arrow_backward_error_certificate(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    x_t: ArrayView1<'_, f64>,
+    x_beta: ArrayView1<'_, f64>,
+    rhs_t: ArrayView1<'_, f64>,
+    rhs_beta: ArrayView1<'_, f64>,
+    res_t: ArrayView1<'_, f64>,
+    res_beta: ArrayView1<'_, f64>,
+) -> f64 {
+    let residual_norm = infinity_norm_pair(res_t, res_beta);
+    let operator_norm = arrow_operator_infinity_norm(sys, ridge_t, ridge_beta);
+    let solution_norm = infinity_norm_pair(x_t, x_beta);
+    let rhs_norm = infinity_norm_pair(rhs_t, rhs_beta);
+    let denom = operator_norm * solution_norm + rhs_norm;
+    if denom > 0.0 {
+        residual_norm / denom
+    } else {
+        residual_norm
+    }
+}
+
+fn infinity_norm_pair(lhs: ArrayView1<'_, f64>, rhs: ArrayView1<'_, f64>) -> f64 {
+    let mut out = 0.0_f64;
+    for &v in lhs.iter().chain(rhs.iter()) {
+        out = out.max(v.abs());
+    }
+    out
+}
+
+fn arrow_operator_infinity_norm(sys: &ArrowSchurSystem, ridge_t: f64, ridge_beta: f64) -> f64 {
+    let mut out = 0.0_f64;
+    for i in 0..sys.rows.len() {
+        let di = sys.row_dims[i];
+        let row = &sys.rows[i];
+        let htbeta = sys_htbeta_materialize_row(sys, i, row);
+        for a in 0..di {
+            let mut row_sum = 0.0_f64;
+            for b in 0..di {
+                row_sum += row.htt[[a, b]].abs();
+            }
+            row_sum += ridge_t;
+            for beta_col in 0..sys.k {
+                row_sum += htbeta[[a, beta_col]].abs();
+            }
+            out = out.max(row_sum);
+        }
+    }
+    let hbb = sys.effective_penalty_op().to_dense();
+    for beta_row in 0..sys.k {
+        let mut row_sum = 0.0_f64;
+        for beta_col in 0..sys.k {
+            row_sum += hbb[[beta_row, beta_col]].abs();
+        }
+        row_sum += ridge_beta;
+        for i in 0..sys.rows.len() {
+            let di = sys.row_dims[i];
+            let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i]);
+            for a in 0..di {
+                row_sum += htbeta[[a, beta_row]].abs();
+            }
+        }
+        out = out.max(row_sum);
+    }
+    out
+}
+
 fn solve_arrow_newton_step_artifacts(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
@@ -5652,7 +6170,6 @@ fn solve_arrow_newton_step_artifacts(
             pcg_diagnostics: PcgDiagnostics::default(),
         });
     }
-    let n = sys.rows.len();
     let backend = CpuBatchedBlockSolver;
 
     // 1. BA point elimination: per-row Cholesky factors of
@@ -5669,20 +6186,91 @@ fn solve_arrow_newton_step_artifacts(
     let trust_metric_weights = None;
 
     // 3. Solve reduced shared system using the selected BA mode.
-    let (delta_beta, schur_factor, pcg_diagnostics) = match options.mode {
+    let mut mixed_precision_status = MixedPrecisionStatus::Off;
+    let (delta_beta, schur_factor, mut pcg_diagnostics) = match options.mode {
         ArrowSolverMode::Direct => {
             let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend)?;
+            if let Some(attempt) = try_mixed_precision_arrow_solve(
+                sys,
+                ridge_t,
+                ridge_beta,
+                &htt_factors,
+                &schur,
+                options,
+            )? {
+                match attempt {
+                    MixedPrecisionAttempt::Certified {
+                        delta_t,
+                        delta_beta,
+                        schur_factor,
+                        refinement_steps,
+                    } => {
+                        let mut pcg_diagnostics = PcgDiagnostics::default();
+                        pcg_diagnostics.mixed_precision_status =
+                            MixedPrecisionStatus::Certified { refinement_steps };
+                        return Ok(ArrowNewtonStepArtifacts {
+                            delta_t,
+                            delta_beta,
+                            htt_factors,
+                            schur_factor: Some(schur_factor),
+                            pcg_diagnostics,
+                        });
+                    }
+                    MixedPrecisionAttempt::Fallback { reason } => {
+                        eprintln!("arrow-Schur mixed precision fallback to f64: {reason}");
+                        mixed_precision_status = MixedPrecisionStatus::F64Fallback;
+                    }
+                }
+            }
             let (db, sf, diag) =
                 solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?;
             (db, sf, diag)
         }
         ArrowSolverMode::SqrtBA => {
             let schur = build_dense_schur_sqrt_ba(sys, &htt_factors, ridge_beta, &backend)?;
+            if let Some(attempt) = try_mixed_precision_arrow_solve(
+                sys,
+                ridge_t,
+                ridge_beta,
+                &htt_factors,
+                &schur,
+                options,
+            )? {
+                match attempt {
+                    MixedPrecisionAttempt::Certified {
+                        delta_t,
+                        delta_beta,
+                        schur_factor,
+                        refinement_steps,
+                    } => {
+                        let mut pcg_diagnostics = PcgDiagnostics::default();
+                        pcg_diagnostics.mixed_precision_status =
+                            MixedPrecisionStatus::Certified { refinement_steps };
+                        return Ok(ArrowNewtonStepArtifacts {
+                            delta_t,
+                            delta_beta,
+                            htt_factors,
+                            schur_factor: Some(schur_factor),
+                            pcg_diagnostics,
+                        });
+                    }
+                    MixedPrecisionAttempt::Fallback { reason } => {
+                        eprintln!("arrow-Schur mixed precision fallback to f64: {reason}");
+                        mixed_precision_status = MixedPrecisionStatus::F64Fallback;
+                    }
+                }
+            }
             let (db, sf, diag) =
                 solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?;
             (db, sf, diag)
         }
         ArrowSolverMode::InexactPCG => {
+            if options.mixed_precision.is_enabled() {
+                eprintln!(
+                    "arrow-Schur mixed precision fallback to f64: InexactPCG does not expose a dense Schur factor for certified f32 refinement"
+                );
+                mixed_precision_status = MixedPrecisionStatus::F64Fallback;
+            }
             // Auto-select preconditioner level: starts with JacobiPreconditioner
             // (Diagonal / BetaBlockJacobi) and escalates to ClusterJacobi or
             // AdditiveSchwarz when K > 100 and PCG exhausts max_iterations.
@@ -5700,38 +6288,12 @@ fn solve_arrow_newton_step_artifacts(
             (delta, None, diag)
         }
     };
+    if mixed_precision_status != MixedPrecisionStatus::Off {
+        pcg_diagnostics.mixed_precision_status = mixed_precision_status;
+    }
 
     // 4. Back-substitute Δt_i = -(H_tt^(i))⁻¹ (g_t^(i) + H_tβ^(i) Δβ).
-    //
-    // H_tβ^(i) · Δβ is routed through sys.htbeta_matvec when the dense slab
-    // is absent; otherwise indexed directly from row.htbeta.
-    // `row_offsets[n]` gives the total delta_t length for hetereogeneous dims.
-    let total_dt_len = sys.row_offsets[n];
-    let mut delta_t = Array1::<f64>::zeros(total_dt_len);
-    // Allocate scratch at max_d so no per-row realloc.
-    let mut rhs = Array1::<f64>::zeros(sys.d);
-    let mut htbeta_delta = Array1::<f64>::zeros(sys.d);
-    for i in 0..n {
-        let di = sys.row_dims[i];
-        let row_base = sys.row_offsets[i];
-        assert_eq!(sys.rows[i].gt.len(), di);
-        for c in 0..di {
-            htbeta_delta[c] = 0.0;
-        }
-        let mut htbeta_slice = htbeta_delta.slice_mut(ndarray::s![..di]).to_owned();
-        sys_htbeta_apply_row(sys, i, &sys.rows[i], delta_beta.view(), &mut htbeta_slice);
-        {
-            let mut rhs_i = rhs.slice_mut(ndarray::s![..di]);
-            for c in 0..di {
-                rhs_i[c] = sys.rows[i].gt[c] + htbeta_slice[c];
-            }
-        }
-        let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
-        let dt_i = backend.solve_block_vector(htt_factors.factor(i), rhs_slice.view());
-        for c in 0..di {
-            delta_t[row_base + c] = -dt_i[c];
-        }
-    }
+    let delta_t = back_substitute_delta_t(sys, &htt_factors, delta_beta.view(), &backend);
 
     Ok(ArrowNewtonStepArtifacts {
         delta_t,
@@ -6033,6 +6595,7 @@ fn solve_arrow_newton_step_cross_row(
             0.0
         },
         stopping_reason: PcgStopReason::Converged,
+        mixed_precision_status: MixedPrecisionStatus::Off,
     };
 
     Ok(ArrowNewtonStepArtifacts {
