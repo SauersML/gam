@@ -4029,6 +4029,7 @@ where
         let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
 
         let strategy_result = problem.run(&mut obj, "standard REML")?;
+        drop(obj);
         // Convergence guard for the outer-aware inner-PIRLS schedule
         // (path #3): the BFGS bridge stores a coarsen-then-tighten cap
         // into `reml_state.outer_inner_cap` on every accepted gradient
@@ -4318,6 +4319,7 @@ where
         // a real seed hook to install it.
         let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
         let outer_result = problem.run(&mut obj, "mixture/SAS flexible link")?;
+        drop(obj);
         // Convergence guard for the outer-aware inner-PIRLS schedule
         // (path #3) — see the matching comment in the standard REML arm
         // above. Reset the cap and run one final compute_cost at the

@@ -22645,8 +22645,8 @@ mod tests {
                             let jet = inverse_link_jet_for_inverse_link(&link, q_target)
                                 .expect("binomial link jet");
                             let tower = binomial_location_scale_nll_tower(
-                                y, weight, eta_t, eta_ls, q_target, jet.mu, jet.d1, jet.d2,
-                                jet.d3, &link, true,
+                                y, weight, eta_t, eta_ls, q_target, jet.mu, jet.d1, jet.d2, jet.d3,
+                                &link, true,
                             )
                             .expect("binomial row tower");
                             let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
@@ -22671,16 +22671,40 @@ mod tests {
                                 let du = hand_binomial_q_directional(q, u[0], u[1]);
                                 let t3 = tower.third_contracted(&u);
                                 let dh_tt = directionalhessian_coeff_fromobjective_q_terms(
-                                    m1, m2, m3, du.delta_q, q.q_t, q.q_t, 0.0, du.delta_q_t,
-                                    du.delta_q_t, 0.0,
+                                    m1,
+                                    m2,
+                                    m3,
+                                    du.delta_q,
+                                    q.q_t,
+                                    q.q_t,
+                                    0.0,
+                                    du.delta_q_t,
+                                    du.delta_q_t,
+                                    0.0,
                                 );
                                 let dh_tl = directionalhessian_coeff_fromobjective_q_terms(
-                                    m1, m2, m3, du.delta_q, q.q_t, q.q_ls, q.q_tl,
-                                    du.delta_q_t, du.delta_q_ls, du.delta_q_tl,
+                                    m1,
+                                    m2,
+                                    m3,
+                                    du.delta_q,
+                                    q.q_t,
+                                    q.q_ls,
+                                    q.q_tl,
+                                    du.delta_q_t,
+                                    du.delta_q_ls,
+                                    du.delta_q_tl,
                                 );
                                 let dh_ll = directionalhessian_coeff_fromobjective_q_terms(
-                                    m1, m2, m3, du.delta_q, q.q_ls, q.q_ls, q.q_ll,
-                                    du.delta_q_ls, du.delta_q_ls, du.delta_q_ll,
+                                    m1,
+                                    m2,
+                                    m3,
+                                    du.delta_q,
+                                    q.q_ls,
+                                    q.q_ls,
+                                    q.q_ll,
+                                    du.delta_q_ls,
+                                    du.delta_q_ls,
+                                    du.delta_q_ll,
                                 );
                                 assert_rel_close("binomial dh_tt", t3[0][0], dh_tt, 1e-12);
                                 assert_rel_close("binomial dh_tl", t3[0][1], dh_tl, 1e-12);
@@ -22691,21 +22715,67 @@ mod tests {
                                     hand_binomial_second_q_directional(q, u[0], u[1], v[0], v[1]);
                                 let t4 = tower.fourth_contracted(&u, &v);
                                 let d2h_tt = second_directionalhessian_coeff_fromobjective_q_terms(
-                                    m1, m2, m3, m4, du.delta_q, dv.delta_q, d2q, q.q_t, q.q_t,
-                                    0.0, du.delta_q_t, dv.delta_q_t, du.delta_q_t, dv.delta_q_t,
-                                    d2q_t, d2q_t, 0.0, 0.0, 0.0,
+                                    m1,
+                                    m2,
+                                    m3,
+                                    m4,
+                                    du.delta_q,
+                                    dv.delta_q,
+                                    d2q,
+                                    q.q_t,
+                                    q.q_t,
+                                    0.0,
+                                    du.delta_q_t,
+                                    dv.delta_q_t,
+                                    du.delta_q_t,
+                                    dv.delta_q_t,
+                                    d2q_t,
+                                    d2q_t,
+                                    0.0,
+                                    0.0,
+                                    0.0,
                                 );
                                 let d2h_tl = second_directionalhessian_coeff_fromobjective_q_terms(
-                                    m1, m2, m3, m4, du.delta_q, dv.delta_q, d2q, q.q_t, q.q_ls,
-                                    q.q_tl, du.delta_q_t, dv.delta_q_t, du.delta_q_ls,
-                                    dv.delta_q_ls, d2q_t, d2q_ls, du.delta_q_tl,
-                                    dv.delta_q_tl, d2q_tl,
+                                    m1,
+                                    m2,
+                                    m3,
+                                    m4,
+                                    du.delta_q,
+                                    dv.delta_q,
+                                    d2q,
+                                    q.q_t,
+                                    q.q_ls,
+                                    q.q_tl,
+                                    du.delta_q_t,
+                                    dv.delta_q_t,
+                                    du.delta_q_ls,
+                                    dv.delta_q_ls,
+                                    d2q_t,
+                                    d2q_ls,
+                                    du.delta_q_tl,
+                                    dv.delta_q_tl,
+                                    d2q_tl,
                                 );
                                 let d2h_ll = second_directionalhessian_coeff_fromobjective_q_terms(
-                                    m1, m2, m3, m4, du.delta_q, dv.delta_q, d2q, q.q_ls, q.q_ls,
-                                    q.q_ll, du.delta_q_ls, dv.delta_q_ls, du.delta_q_ls,
-                                    dv.delta_q_ls, d2q_ls, d2q_ls, du.delta_q_ll,
-                                    dv.delta_q_ll, d2q_ll,
+                                    m1,
+                                    m2,
+                                    m3,
+                                    m4,
+                                    du.delta_q,
+                                    dv.delta_q,
+                                    d2q,
+                                    q.q_ls,
+                                    q.q_ls,
+                                    q.q_ll,
+                                    du.delta_q_ls,
+                                    dv.delta_q_ls,
+                                    du.delta_q_ls,
+                                    dv.delta_q_ls,
+                                    d2q_ls,
+                                    d2q_ls,
+                                    du.delta_q_ll,
+                                    dv.delta_q_ll,
+                                    d2q_ll,
                                 );
                                 assert_rel_close("binomial d2h_tt", t4[0][0], d2h_tt, 1e-12);
                                 assert_rel_close("binomial d2h_tl", t4[0][1], d2h_tl, 1e-12);
@@ -22752,8 +22822,7 @@ mod tests {
                     + 1.0
                     - tpm.ln()
                     - tpy / tpm;
-                let info_theta = -hand_trigamma(yi + theta) + hand_trigamma(theta)
-                    - 1.0 / theta
+                let info_theta = -hand_trigamma(yi + theta) + hand_trigamma(theta) - 1.0 / theta
                     + 2.0 / tpm
                     - tpy / (tpm * tpm);
                 let info_pos = info_theta.max(DISPERSION_MIN_CURVATURE);
@@ -22770,12 +22839,9 @@ mod tests {
                 let nu = ed.exp().max(1e-12);
                 let y_pos = yi.max(1e-300);
                 let loglik = wi
-                    * (nu * nu.ln() - nu * mu.ln() - ln_gamma(nu)
-                        + (nu - 1.0) * y_pos.ln()
+                    * (nu * nu.ln() - nu * mu.ln() - ln_gamma(nu) + (nu - 1.0) * y_pos.ln()
                         - nu * yi / mu);
-                let s_nu = nu.ln() + 1.0
-                    - mu.ln()
-                    - statrs::function::gamma::digamma(nu)
+                let s_nu = nu.ln() + 1.0 - mu.ln() - statrs::function::gamma::digamma(nu)
                     + y_pos.ln()
                     - yi / mu;
                 let info_nu = (hand_trigamma(nu) - 1.0 / nu).max(DISPERSION_MIN_CURVATURE);
@@ -22799,12 +22865,11 @@ mod tests {
                         + (a - 1.0) * yc.ln()
                         + (b - 1.0) * (1.0 - yc).ln());
                 let score_mu = phi
-                    * (statrs::function::gamma::digamma(b)
-                        - statrs::function::gamma::digamma(a)
+                    * (statrs::function::gamma::digamma(b) - statrs::function::gamma::digamma(a)
                         + yc.ln()
                         - (1.0 - yc).ln());
-                let info_mu =
-                    (phi * phi * (hand_trigamma(a) + hand_trigamma(b))).max(DISPERSION_MIN_CURVATURE);
+                let info_mu = (phi * phi * (hand_trigamma(a) + hand_trigamma(b)))
+                    .max(DISPERSION_MIN_CURVATURE);
                 let s_phi = statrs::function::gamma::digamma(phi)
                     - mu * statrs::function::gamma::digamma(a)
                     - (1.0 - mu) * statrs::function::gamma::digamma(b)
@@ -22831,7 +22896,13 @@ mod tests {
     #[test]
     fn dispersion_row_towers_match_hand_witnesses() {
         let cases = [
-            (DispersionFamilyKind::NegativeBinomial, 0.0, -1.5, -25.0, 0.7),
+            (
+                DispersionFamilyKind::NegativeBinomial,
+                0.0,
+                -1.5,
+                -25.0,
+                0.7,
+            ),
             (DispersionFamilyKind::NegativeBinomial, 6.0, 2.0, 25.0, 1.3),
             (DispersionFamilyKind::Gamma, 0.2, -2.0, -25.0, 0.9),
             (DispersionFamilyKind::Gamma, 9.0, 1.7, 25.0, 1.1),

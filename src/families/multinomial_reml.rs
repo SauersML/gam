@@ -339,12 +339,9 @@ impl MultinomialFamily {
                 // repeated columns for aliases, and strips every block past
                 // `class_0` to width 0 — the failure in #363.
                 //
-                // Each block carries the FULL per-term penalty list, so the
-                // outer loop selects an independent λ_{a,t} per (class, term).
-                // The terms default to distinct precision labels (the engine's
-                // `__block_{b}_penalty_{t}`), so no two are fused — recovering a
-                // multi-term class-probability surface where one term is rough
-                // and another smooth (#561).
+                // Each block carries the FULL per-term physical penalty list, so
+                // the outer loop can select independent smoothing coordinates
+                // for the smooth components that make up each class surface.
                 let mut spec = ParameterBlockSpec {
                     name: format!("class_{a}"),
                     design: DesignMatrix::Dense(DenseDesignMatrix::from(self.design.clone())),

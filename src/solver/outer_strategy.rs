@@ -7458,7 +7458,10 @@ fn run_outer_with_plan(
                         rejection_reasons.push((seed_idx, "validation", err.to_string()));
                         continue 'seed_attempts;
                     }
-                    Err(FixedPointOuterRunError::ImmediateFallback(err)) => Err(err),
+                    Err(FixedPointOuterRunError::ImmediateFallback(err)) => {
+                        seed_slot = started_seeds + 1;
+                        Err(err)
+                    }
                     Err(FixedPointOuterRunError::Failed(err)) => {
                         started_seeds += 1;
                         seed_slot = started_seeds;
