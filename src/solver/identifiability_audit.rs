@@ -2074,24 +2074,13 @@ pub fn audit_identifiability_channel_aware(
 /// of the fitted λ values. Blocks with no penalty contribute no rows, so for an
 /// unpenalized multi-channel model this reduces exactly to `rank(J_joint)`.
 fn channel_aware_penalty_aware_joint_rank(
-    operators: &[std::sync::Arc<
-        dyn crate::families::identifiability_compiler::RowJacobianOperator,
-    >],
+    gram_struct: &Array2<f64>,
     col_offsets: &[usize],
     specs: &[ParameterBlockSpec],
+    n_design_rows: usize,
 ) -> Result<usize, EstimationError> {
-    if operators.is_empty() {
-        return Ok(0);
-    }
-    let k = operators[0].k();
-    let n = operators[0].nrows();
-    let nk = n.checked_mul(k).ok_or_else(|| {
-        EstimationError::LayoutError(format!(
-            "channel-aware penalty-aware rank: n*k overflow (n={n}, k={k})"
-        ))
-    })?;
     let p_total = *col_offsets.last().unwrap_or(&0);
-    if p_total == 0 || nk == 0 {
+    if p_total == 0 || n_design_rows == 0 {
         return Ok(0);
     }
 
@@ -2109,39 +2098,24 @@ fn channel_aware_penalty_aware_joint_rank(
         })
         .sum();
 
-    // Augmented matrix `[J_joint; S_blockdiag]` of shape
-    // `(nk + n_penalty_rows, p_total)`. The top `nk` rows are the
-    // channel-flattened joint row Jacobian; the trailing rows embed each
-    // block's structural penalty on the block's own column range.
-    let mut aug = Array2::<f64>::zeros((nk + n_penalty_rows, p_total));
-    for (block_idx, op) in operators.iter().enumerate() {
-        let base = col_offsets[block_idx];
-        let p_b = op.ncols();
-        let mut col = Array1::<f64>::zeros(nk);
-        for c in 0..p_b {
-            op.channel_flattened_column(c, col.as_slice_mut().expect("contiguous column buffer"));
-            aug.slice_mut(ndarray::s![..nk, base + c]).assign(&col);
-        }
-    }
-    let mut row = nk;
+    // rank([J; S]) is rank(J'J + S'S). Accumulating the PSD Gram keeps the
+    // penalty-aware gate at O(p_total^2) memory; `rank_of_gram` applies the
+    // singular-value tolerance to sqrt(eigenvalue), matching the flat rank
+    // convention without materialising the `(n*K + penalty_rows) × p` design.
+    let mut aug_gram = gram_struct.clone();
     for (idx, s_opt) in block_penalties.iter().enumerate() {
         if let Some(s) = s_opt {
             let start = col_offsets[idx];
-            let end = col_offsets[idx + 1];
-            let h = end - start;
-            aug.slice_mut(ndarray::s![row..row + h, start..end])
-                .assign(s);
-            row += h;
+            let s_gram = fast_atb(s, s);
+            for row in 0..s_gram.nrows() {
+                for col in 0..s_gram.ncols() {
+                    aug_gram[[start + row, start + col]] += s_gram[[row, col]];
+                }
+            }
         }
     }
 
-    rrqr_with_permutation(&aug, default_rrqr_rank_alpha())
-        .map(|r| r.rank)
-        .map_err(|e| {
-            EstimationError::LayoutError(format!(
-                "channel-aware penalty-aware joint RRQR failed: {e:?}"
-            ))
-        })
+    rank_of_gram(&aug_gram, n_design_rows + n_penalty_rows)
 }
 
 /// Pairwise overlap scan on the channel-weighted joint design
@@ -2150,41 +2124,16 @@ fn channel_aware_penalty_aware_joint_rank(
 /// normalised `|wᵀ w'|` exceeds the per-pair leverage-based report
 /// threshold (`pair_report_threshold`), in `(block_a < block_b)` order.
 fn channel_aware_aliased_pairs(
-    operators: &[std::sync::Arc<
-        dyn crate::families::identifiability_compiler::RowJacobianOperator,
-    >],
+    gram_struct: &Array2<f64>,
+    col_norms: &[f64],
+    col_s2: &[f64],
     col_offsets: &[usize],
     specs: &[ParameterBlockSpec],
+    n_design_rows: usize,
 ) -> Result<Vec<AliasedPair>, EstimationError> {
-    if operators.is_empty() {
-        return Ok(Vec::new());
-    }
-    let k = operators[0].k();
-    let n = operators[0].nrows();
-    let nk = n.checked_mul(k).ok_or_else(|| {
-        EstimationError::LayoutError(format!("channel-aware audit: n*k overflow (n={n}, k={k})"))
-    })?;
     let p_total = *col_offsets.last().unwrap_or(&0);
-    if p_total == 0 || nk == 0 {
+    if p_total == 0 || n_design_rows == 0 {
         return Ok(Vec::new());
-    }
-    // Materialise W = (n*K, p_total) column-major (one Array1<f64> of
-    // length nk per joint column).  Also compute S2 per column for the
-    // leverage-based threshold (see `compute_leverage_s2`).
-    let mut cols: Vec<Array1<f64>> = Vec::with_capacity(p_total);
-    let mut col_norms: Vec<f64> = Vec::with_capacity(p_total);
-    let mut col_s2: Vec<f64> = Vec::with_capacity(p_total);
-    for op in operators.iter() {
-        let p_b = op.ncols();
-        for c in 0..p_b {
-            let mut w = Array1::<f64>::zeros(nk);
-            op.channel_flattened_column(c, w.as_slice_mut().expect("contiguous column buffer"));
-            let norm = w.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let s2 = compute_leverage_s2(&w.view());
-            cols.push(w);
-            col_norms.push(norm);
-            col_s2.push(s2);
-        }
     }
     // Total cross-block pairs for Bonferroni correction.
     let total_cross_pairs: usize = {
@@ -2210,12 +2159,10 @@ fn channel_aware_aliased_pairs(
             if col_norms[b] <= 0.0 {
                 continue;
             }
-            let mut dot = 0.0_f64;
-            for i in 0..nk {
-                dot += cols[a][i] * cols[b][i];
-            }
+            let dot = gram_struct[[a, b]];
             let overlap = (dot.abs() / (col_norms[a] * col_norms[b])).min(1.0);
-            let report_thr = pair_report_threshold(col_s2[a], col_s2[b], nk, total_cross_pairs);
+            let report_thr =
+                pair_report_threshold(col_s2[a], col_s2[b], n_design_rows, total_cross_pairs);
             if overlap >= report_thr {
                 let (block_a_idx, dir_a) = locate_block_column(col_offsets, a)?;
                 let (block_b_idx, dir_b) = locate_block_column(col_offsets, b)?;

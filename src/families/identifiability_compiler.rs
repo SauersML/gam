@@ -691,7 +691,7 @@ pub fn scale_jacobian_by_sqrt_h_with(
 
 /// Symmetric matrix square root via eigendecomposition with negative
 /// eigenvalues clamped to zero (PSD projection guard).
-fn symmetric_sqrt_into(m: &Array2<f64>, out: &mut Array2<f64>) {
+pub(crate) fn symmetric_sqrt_into(m: &Array2<f64>, out: &mut Array2<f64>) {
     let k = m.nrows();
     assert_eq!(m.ncols(), k);
     assert_eq!(out.shape(), &[k, k]);
