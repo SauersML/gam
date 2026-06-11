@@ -12,27 +12,9 @@
 //! `FittedModel` predict pipeline matches the raw `build_term_collection_design`
 //! path.
 
-use std::path::{Path, PathBuf};
+use gam::test_support::cli_harness::run_or_panic;
+use std::path::Path;
 use std::process::Command;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
-
-fn run_or_panic(mut command: Command, label: &str) {
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
-    assert!(
-        output.status.success(),
-        "`{label}` failed with status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
 
 fn read_predictions(path: &Path) -> Vec<f64> {
     let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
@@ -56,7 +38,7 @@ fn read_predictions(path: &Path) -> Vec<f64> {
 }
 
 fn fit(train: &Path, formula: &str, model: &Path) {
-    let mut cmd = Command::new(gam_binary());
+    let mut cmd = Command::new(gam::gam_binary!());
     cmd.arg("fit")
         .arg(train)
         .arg(formula)
@@ -68,7 +50,7 @@ fn fit(train: &Path, formula: &str, model: &Path) {
 }
 
 fn predict(model: &Path, data: &Path, out: &Path) -> Vec<f64> {
-    let mut cmd = Command::new(gam_binary());
+    let mut cmd = Command::new(gam::gam_binary!());
     cmd.arg("predict")
         .arg(model)
         .arg(data)

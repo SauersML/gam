@@ -18,14 +18,8 @@
 //! Before the fix the predict aborts; after it, predict succeeds and `g` does
 //! not influence the result.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 fn write_training_csv(path: &Path) {
     use rand::SeedableRng;
@@ -78,7 +72,7 @@ fn read_predictions(path: &Path) -> Vec<f64> {
 }
 
 fn fit_model(train_path: &Path, model_path: &Path) {
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(train_path)
@@ -96,7 +90,7 @@ fn fit_model(train_path: &Path, model_path: &Path) {
 }
 
 fn predict(model_path: &Path, predict_path: &Path, out_path: &Path) -> std::process::Output {
-    let mut predict_cmd = Command::new(gam_binary());
+    let mut predict_cmd = Command::new(gam::gam_binary!());
     predict_cmd
         .arg("predict")
         .arg(model_path)
