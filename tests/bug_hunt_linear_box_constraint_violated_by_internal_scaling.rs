@@ -31,14 +31,9 @@
 //! canonical back-transform `M` (divide by `scale`), so the active set enforces
 //! `(1/scale)·β_int ≤ ub`, giving reported `β = β_int/scale ≤ ub`.
 
-use std::path::{Path, PathBuf};
+use gam::test_support::cli_harness::run_or_panic;
+use std::path::Path;
 use std::process::Command;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 const INTERCEPT: f64 = 2.0;
 const SLOPE: f64 = 5.0;
@@ -76,19 +71,6 @@ fn write_predict_csv(path: &Path) {
     writer.flush().expect("flush predict csv");
 }
 
-fn run_or_panic(mut command: Command, label: &str) {
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
-    assert!(
-        output.status.success(),
-        "`{label}` failed with status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
 /// Read the `mean` column from a `gam predict --out` CSV.
 fn read_predictions(path: &Path) -> Vec<f64> {
     let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
@@ -122,7 +104,7 @@ fn reported_slope(dir: &Path, label: &str, formula: &str) -> f64 {
     write_training_csv(&train_path);
     write_predict_csv(&predict_path);
 
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&train_path)
@@ -133,7 +115,7 @@ fn reported_slope(dir: &Path, label: &str, formula: &str) -> f64 {
     run_or_panic(fit_cmd, &format!("gam fit `{formula}`"));
     assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
 
-    let mut predict_cmd = Command::new(gam_binary());
+    let mut predict_cmd = Command::new(gam::gam_binary!());
     predict_cmd
         .arg("predict")
         .arg(&model_path)

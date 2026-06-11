@@ -2,7 +2,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 use statrs::distribution::{ContinuousCDF, FisherSnedecor};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 const N: usize = 300;
@@ -107,12 +107,6 @@ fn formula() -> String {
     )
 }
 
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
-
 fn run_command(mut command: Command, label: &str) {
     let output = command.output().unwrap_or_else(|err| {
         panic!("failed to run {label}: {err}");
@@ -130,7 +124,7 @@ fn run_command(mut command: Command, label: &str) {
 fn run_fit_predict(workdir: &Path, tag: &str, scale_dimensions: bool, csv_in: &Path) -> Vec<f64> {
     let model = workdir.join(format!("model_{tag}.json"));
     let pred = workdir.join(format!("pred_{tag}.csv"));
-    let mut fit = Command::new(gam_binary());
+    let mut fit = Command::new(gam::gam_binary!());
     fit.current_dir(env!("CARGO_MANIFEST_DIR"))
         .arg("fit")
         .arg("--transformation-normal");
@@ -140,7 +134,7 @@ fn run_fit_predict(workdir: &Path, tag: &str, scale_dimensions: bool, csv_in: &P
     fit.arg("--out").arg(&model).arg(csv_in).arg(formula());
     run_command(fit, &format!("fit {tag}"));
 
-    let mut predict = Command::new(gam_binary());
+    let mut predict = Command::new(gam::gam_binary!());
     predict
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .arg("predict")

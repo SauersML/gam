@@ -15,14 +15,8 @@
 //! both near ±1). Before the fix the fit aborts with
 //! `column 'z' not found in data. Available columns: [x, y]`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 fn write_training_csv(path: &Path) {
     use rand::SeedableRng;
@@ -85,7 +79,7 @@ fn numeric_by_smooth_loads_its_by_column_and_recovers_varying_coefficient() {
 
     // Fit the numeric varying-coefficient smooth straight from the CLI, with `z`
     // referenced ONLY through `by=z` (no redundant `+ z`).
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&train_path)
@@ -107,7 +101,7 @@ fn numeric_by_smooth_loads_its_by_column_and_recovers_varying_coefficient() {
     let probes: [(f64, f64); 2] = [(0.25, 1.0), (0.25, -1.0)];
     write_predict_csv(&predict_path, &probes);
 
-    let mut predict_cmd = Command::new(gam_binary());
+    let mut predict_cmd = Command::new(gam::gam_binary!());
     predict_cmd
         .arg("predict")
         .arg(&model_path)

@@ -53,14 +53,8 @@
 //! `bug_hunt_sphere_gpu_macro_unscoped_breaks_build` ticket. Once that
 //! one-line compile fix lands, this test builds and exercises the diagnose bug.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 fn write_training_csv(path: &Path) {
     use rand::SeedableRng;
@@ -82,7 +76,7 @@ fn write_training_csv(path: &Path) {
 }
 
 fn fit_model(train_path: &Path, model_path: &Path) {
-    let out = Command::new(gam_binary())
+    let out = Command::new(gam::gam_binary!())
         .arg("fit")
         .arg(train_path)
         .arg("y ~ s(x)")
@@ -111,7 +105,7 @@ fn diagnose_runs_on_the_training_data() {
     // Diagnose the model on the *exact* data it was fit on. This must work: the
     // file contains the response column `y` the model needs for leave-one-out
     // diagnostics.
-    let out = Command::new(gam_binary())
+    let out = Command::new(gam::gam_binary!())
         .arg("diagnose")
         .arg(&model_path)
         .arg(&train_path)
