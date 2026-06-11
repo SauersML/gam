@@ -1295,7 +1295,13 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
 /// same operator in the same coefficient basis.
 #[derive(Clone)]
 pub struct ExactJeffreysTerm {
-    operator: std::sync::Arc<super::FirthDenseOperator>,
+    /// Tier-A GLM dense operator carrying the value and all β-gradient
+    /// machinery. `None` for the Tier-B value-only carrier (see
+    /// [`ExactJeffreysTerm::value_only`]), where the coupled joint path
+    /// supplies the curvature/drift terms through its own
+    /// `H_Φ`-aware derivative provider and only the scalar `Φ(β̂)` needs to
+    /// reach the LAML cost.
+    operator: Option<std::sync::Arc<super::FirthDenseOperator>>,
     /// Tangent-projected value override. When `Some`, `value()` returns
     /// this scalar instead of the operator's full-space `½ log|J|`. This
     /// is used by `try_tangent_projected_evaluate` to substitute
@@ -1303,15 +1309,33 @@ pub struct ExactJeffreysTerm {
     /// The same `Arc<FirthDenseOperator>` is retained so any downstream
     /// consumer that accesses the operator (e.g. for β-gradient terms)
     /// sees the unmodified operator; only the scalar contribution to the
-    /// outer LAML cost changes.
+    /// outer LAML cost changes. For the Tier-B value-only carrier this is
+    /// always `Some` (it IS the value).
     value_override: Option<f64>,
 }
 
 impl ExactJeffreysTerm {
     pub(crate) fn new(operator: std::sync::Arc<super::FirthDenseOperator>) -> Self {
         Self {
-            operator,
+            operator: Some(operator),
             value_override: None,
+        }
+    }
+
+    /// Tier-B value-only carrier: the coupled joint custom-family path folds
+    /// the gated Jeffreys value `Φ(β̂) = ½ log|H_id|` into the LAML cost
+    /// (`cost −= Φ`) so the outer criterion is the Laplace approximation of
+    /// the SAME Firth-augmented objective `−ℓ + ½βᵀSβ − Φ` the inner Newton
+    /// converged on. Without this fold the envelope identity breaks at every
+    /// Firth-active mode: `∇_β(−ℓ + ½βᵀSβ)(β̂) = +∇Φ ≠ 0`, so the analytic
+    /// outer gradient (which differentiates the Φ-folded criterion via the
+    /// envelope) disagrees with the finite difference of the Φ-less value
+    /// by `(∇Φ)ᵀ ∂β̂/∂ρ` (gam#979). The β-gradient/curvature machinery for
+    /// Tier-B lives in the `H_Φ`-aware joint derivative provider, not here.
+    pub(crate) fn value_only(phi: f64) -> Self {
+        Self {
+            operator: None,
+            value_override: Some(phi),
         }
     }
 
@@ -1322,20 +1346,23 @@ impl ExactJeffreysTerm {
         projected_value: f64,
     ) -> Self {
         Self {
-            operator,
+            operator: Some(operator),
             value_override: Some(projected_value),
         }
     }
 
     #[inline]
     pub(crate) fn value(&self) -> f64 {
-        self.value_override
-            .unwrap_or_else(|| self.operator.jeffreys_logdet())
+        self.value_override.unwrap_or_else(|| {
+            self.operator
+                .as_ref()
+                .map_or(0.0, |operator| operator.jeffreys_logdet())
+        })
     }
 
     #[inline]
-    pub(crate) fn operator_arc(&self) -> std::sync::Arc<super::FirthDenseOperator> {
-        std::sync::Arc::clone(&self.operator)
+    pub(crate) fn operator_arc(&self) -> Option<std::sync::Arc<super::FirthDenseOperator>> {
+        self.operator.as_ref().map(std::sync::Arc::clone)
     }
 }
 
@@ -5861,8 +5888,11 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
-    pub fn firth(mut self, op: Option<std::sync::Arc<super::FirthDenseOperator>>) -> Self {
-        self.firth = op.map(ExactJeffreysTerm::new);
+    /// Install a pre-built Jeffreys/Firth term (Tier-A operator-backed via
+    /// `ExactJeffreysTerm::new`, or the Tier-B value-only carrier via
+    /// `ExactJeffreysTerm::value_only`).
+    pub fn firth_term(mut self, term: Option<ExactJeffreysTerm>) -> Self {
+        self.firth = term;
         self
     }
 
@@ -7255,11 +7285,19 @@ fn try_tangent_projected_evaluate(
     // overridden. This projection-aware Firth is exact under the same
     // tangent-projected LAML setup as the rest of
     // `try_tangent_projected_evaluate` (mode = ValueAndGradient or below).
-    let projected_firth = solution.firth.as_ref().map(|term| {
-        let op_arc = term.operator_arc();
-        let projected_value = op_arc.jeffreys_logdet_projected(z.view());
-        ExactJeffreysTerm::with_projected_value(op_arc, projected_value)
-    });
+    let projected_firth = solution
+        .firth
+        .as_ref()
+        .map(|term| match term.operator_arc() {
+            Some(op_arc) => {
+                let projected_value = op_arc.jeffreys_logdet_projected(z.view());
+                ExactJeffreysTerm::with_projected_value(op_arc, projected_value)
+            }
+            // Tier-B value-only carrier: the scalar Φ(β̂) is already final (the
+            // coupled joint path owns its own constraint handling upstream), so
+            // the term passes through unchanged.
+            None => term.clone(),
+        });
     // Active-constraint tangent projection for ext coords. The tangent
     // hessian wrapper accepts p-space `g` and p-space drift `M` and
     // applies the `Zᵀ · Z` projection internally inside its `solve` /

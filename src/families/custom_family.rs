@@ -19842,6 +19842,7 @@ fn build_custom_family_inner_assembly<'dp>(
     rho_prior: crate::types::RhoPrior,
     deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
     ext_bundle: Option<ExtCoordBundle>,
+    firth_value: Option<f64>,
 ) -> Result<(crate::estimate::reml::assembly::InnerAssembly<'dp>, usize), String> {
     use crate::estimate::reml::assembly::{
         InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
@@ -19923,7 +19924,11 @@ fn build_custom_family_inner_assembly<'dp>(
         deriv_provider: Some(deriv_provider),
         tk_correction: 0.0,
         tk_gradient: None,
-        firth: None,
+        // Tier-B Firth fold (gam#979): the inner mode minimizes
+        // `−ℓ + ½βᵀSβ − Φ`, so the LAML cost must subtract the same gated
+        // `Φ(β̂)` or the envelope-based analytic outer gradient and the value
+        // describe different criteria at every Firth-active mode.
+        firth: firth_value.map(crate::estimate::reml::unified::ExactJeffreysTerm::value_only),
         nullspace_dim: None,
         barrier_config: None,
         ext_coords,
@@ -20224,6 +20229,10 @@ fn unified_joint_cost_gradient(
     eval_mode: EvalMode,
     ext_bundle: Option<ExtCoordBundle>,
     first_order_trace_skip: Option<Array1<f64>>,
+    // Gated Tier-B Jeffreys value `Φ(β̂)`, folded into the LAML cost
+    // (`cost −= Φ`) so the outer criterion matches the Φ-augmented inner
+    // objective (gam#979). `None` when the term is unavailable/gated to zero.
+    firth_value: Option<f64>,
 ) -> Result<
     (
         f64,
@@ -20256,6 +20265,7 @@ fn unified_joint_cost_gradient(
         rho_prior,
         deriv_provider,
         ext_bundle,
+        firth_value,
     )?;
     let rho_slice = rho
         .as_slice()
@@ -20314,6 +20324,10 @@ fn unified_joint_efs_eval(
         rho_prior,
         deriv_provider,
         ext_bundle,
+        // The EFS screening path evaluates the Φ-less criterion with an
+        // unaugmented operator throughout; it stays self-consistent without
+        // the Tier-B Firth fold.
+        None,
     )?;
     let rho_slice = rho
         .as_slice()
@@ -20596,9 +20610,13 @@ fn joint_outer_evaluate(
     // no active Jeffreys curvature (empty system, unavailable exact derivatives,
     // or the conditioning gate proved the term zero), not a user-selected
     // robustness-off mode.
-    robust_jeffreys_hphi: Option<Array2<f64>>,
+    // Gated Jeffreys VALUE `Φ(β̂)` paired with the curvature `H_Φ` from the same
+    // term evaluation. The value is folded into the LAML cost (`cost −= Φ`) so
+    // the outer criterion is the Laplace approximation of the SAME
+    // Firth-augmented objective the inner Newton converged on (gam#979).
+    robust_jeffreys_phi_hphi: Option<(f64, Array2<f64>)>,
     // Companion mode-response drift `D_β H_Φ[δβ]` for the outer gradient's trace
-    // identity. `Some` exactly when `robust_jeffreys_hphi` is `Some` (same
+    // identity. `Some` exactly when `robust_jeffreys_phi_hphi` is `Some` (same
     // under-identified span); installing it wraps the derivative provider so the
     // first-order trace gains the `½ tr[(H+S_λ+H_Φ)⁻¹ D_β H_Φ[v_k]]` term that
     // makes the analytic gradient match the augmented objective. `None` ⇒ the
@@ -20608,6 +20626,11 @@ fn joint_outer_evaluate(
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
 
+    let (robust_jeffreys_phi, robust_jeffreys_hphi): (Option<f64>, Option<Array2<f64>>) =
+        match robust_jeffreys_phi_hphi {
+            Some((phi, hphi)) => (Some(phi), Some(hphi)),
+            None => (None, None),
+        };
     // Pre-scale the outer-REML Jeffreys curvature into the same rescaled space as
     // the penalties so the projected-logdet path and the operator agree. `None`
     // (flag OFF / no under-identified span) keeps the released outer REML exact.
@@ -20837,6 +20860,7 @@ fn joint_outer_evaluate(
         } else {
             first_order_trace_skip
         },
+        robust_jeffreys_phi,
     )?;
     if !objective.is_finite() {
         log::warn!(
@@ -23049,8 +23073,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
     let robust_jeffreys_hphi =
         custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?;
-    let batched_gradient_contract_allows_override =
-        batched_outer_gradient_contract_allows_override(robust_jeffreys_hphi.as_ref());
+    let batched_gradient_contract_allows_override = batched_outer_gradient_contract_allows_override(
+        robust_jeffreys_hphi.as_ref().map(|(_phi, hphi)| hphi),
+    );
     let mut batched_gradient_override: Option<Array1<f64>> = None;
     if !has_configured_rho_prior
         && batched_gradient_contract_allows_override
@@ -24350,7 +24375,7 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
-) -> Result<Option<Array2<f64>>, String> {
+) -> Result<Option<(f64, Array2<f64>)>, String> {
     if !family.joint_jeffreys_term_required() {
         return Ok(None);
     }
@@ -24358,9 +24383,13 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
         Some(z) => z,
         None => return Ok(None),
     };
-    let hphi = custom_family_joint_jeffreys_term(family, states, specs, ranges, &z_joint)?
-        .map(|(_phi, _grad, hphi)| hphi);
-    Ok(hphi)
+    // Return the gated VALUE alongside the curvature: the outer LAML must fold
+    // `−Φ(β̂)` into its cost (the inner mode is Φ-augmented-stationary, so the
+    // envelope identity only holds for the Φ-folded criterion — gam#979), and
+    // value/curvature must come from the SAME term evaluation.
+    let phi_and_hphi = custom_family_joint_jeffreys_term(family, states, specs, ranges, &z_joint)?
+        .map(|(phi, _grad, hphi)| (phi, hphi));
+    Ok(phi_and_hphi)
 }
 
 fn batched_outer_gradient_contract_allows_override(

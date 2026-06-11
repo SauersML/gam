@@ -1052,7 +1052,6 @@ fn hash_isometry_reference(
             hasher.write_str("user-supplied");
             hash_array2(hasher, values.as_ref());
         }
-        IsometryReference::MeanProfiled => hasher.write_str("mean-profiled"),
     }
 }
 
@@ -9484,7 +9483,9 @@ impl<'a> RemlState<'a> {
             deriv_provider: Some(ctx.deriv_provider),
             tk_correction: 0.0,
             tk_gradient: None,
-            firth: ctx.firth_op,
+            firth: ctx
+                .firth_op
+                .map(crate::estimate::reml::unified::ExactJeffreysTerm::new),
             nullspace_dim: Some(nullspace_dim),
             barrier_config: ctx.barrier_config,
             ext_coords: Vec::new(),
