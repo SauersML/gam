@@ -1017,11 +1017,20 @@ mod tests {
             // Need ~log2(1/ALPHA_FLOOR) = 10 consecutive refusals to
             // underflow α from 0.5 → 2⁻¹¹. Push generously.
             for _ in 0..20 {
+                // The scripted message must mirror the diagnostician's
+                // `format_bubbled_error` shape so `classify_inner_error`
+                // routes it through `KktRefusalDiagnosis::parse_from_error`
+                // (which looks for `diagnosis: <label>`) and lands on
+                // `InnerFailure::CertRefused { Phantom… }`. Without the
+                // tag the message would fall through to `InnerFailure::Other`
+                // and surface as `StructuralPropagate` instead of cycling
+                // through the ShrinkStep / α-floor / retry path this test
+                // exists to exercise.
                 responses.push(ScriptedResponse::Fail(
-                    "coupled exact-joint inner solve exited the joint Newton path \
-                     before convergence — block 'time_surface' carries the dominant \
-                     unresolved KKT gradient (|g_block|∞ = 5.000e+05); \
-                     |∇L − Sβ|∞ = 5.000e+05",
+                    "cycle=7 cert REFUSED: residual=5.0e+05 > 4·tol=4.0e+03; \
+                     carrying-block: time_surface (idx=0, |g|=5.0e+05, |Sβ|=1.0e-03, \
+                     |∇L-Sβ|=5.0e+05, |β|=1.0e+00, width=12); \
+                     diagnosis: phantom_multiplier_with_well_conditioned_H",
                 ));
             }
         }
