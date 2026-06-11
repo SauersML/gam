@@ -12931,6 +12931,21 @@ impl KktRefusalDiagnosis {
 /// penalty-rank machinery uses for "structurally zero".
 const KKT_REFUSAL_RANK_TOL: f64 = 1e-10;
 
+/// Joint width above which the Jeffreys second-order endgame completion
+/// (`p(p+1)/2` exact second-directional joint-Hessian calls per endgame
+/// cycle, gam#979) is not attempted. Wide systems keep the divided-difference
+/// model; the contracted-hook design (the gam#740 cost class) is the
+/// follow-up for exactness there.
+const JEFFREYS_COMPLETION_MAX_P: usize = 64;
+
+/// Residual band (as a multiple of the KKT residual tolerance) inside which
+/// the inner joint Newton is considered to be in its convergence ENDGAME and
+/// the exact Jeffreys second-order completion is added to the step model
+/// (gam#979). Far from the mode the trust region globalizes any model, so
+/// exactness buys nothing there; in the endgame it converts the
+/// divided-difference model's linear sawtooth into quadratic convergence.
+const JEFFREYS_COMPLETION_RESIDUAL_BAND: f64 = 300.0;
+
 /// Self-vanishing Levenberg–Marquardt damping factor for the range-restricted
 /// spectral Newton step (`solve_joint_newton_step_on_spectral_range`). The
 /// caller forms the residual-scaled magnitude
@@ -14953,6 +14968,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // per-block + spectrum breakdown without re-materializing H_pen.
         let mut last_kkt_refusal_report: Option<KktRefusalReport> = None;
         let mut prev_kkt_norm: Option<f64> = None;
+        // Convergence-endgame flag for the Jeffreys second-order completion
+        // (gam#979): set once the post-step KKT residual enters
+        // `JEFFREYS_COMPLETION_RESIDUAL_BAND × residual_tol`, consumed by the
+        // next cycle's dense-spectral step assembly.
+        let mut jeffreys_completion_endgame = false;
         // Plateau streak on |Δobj| ≤ objective_tol. The scale-aware
         // flatness predicate stays local to this loop; the streak/window
         // discipline (grow on flat, reset on recovery) is the shared
@@ -15630,6 +15650,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             Ok(matrix) => matrix,
                             Err(_) => break,
                         };
+                        // Snapshot the UNPENALIZED likelihood Hessian for the
+                        // Jeffreys second-order completion below, taken before the
+                        // penalty/ridge mutate `lhs_true` in place. Only cloned in
+                        // the endgame cycles that actually consume it.
+                        let h_unpenalized_for_completion = (jeffreys_completion_endgame
+                            && inner_jeffreys_term.is_some()
+                            && total_p <= JEFFREYS_COMPLETION_MAX_P)
+                            .then(|| lhs_true.clone());
                         add_joint_penalty_to_matrix(
                             &mut lhs_true,
                             &ranges,
@@ -15654,6 +15682,38 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         let spectral_rhs = rhs.clone();
                         if let Some((_grad_phi, hphi)) = inner_jeffreys_term.as_ref() {
                             lhs_true += hphi;
+                            // ENDGAME EXACTNESS (gam#979). The divided-difference
+                            // H_Φ omits the second-directional-Hessian remainder
+                            // `½ tr(K · D_ab)`; near a Firth-active mode that
+                            // remainder is comparable to the kept curvature, so
+                            // Newton converges only linearly (a residual sawtooth
+                            // plateauing just above the certificate tolerance —
+                            // enough mode noise to swamp outer finite differences
+                            // and feed the IFT near-flat-kernel amplification).
+                            // Once the residual enters the convergence band, add
+                            // the exact completion so the model is the true
+                            // Hessian of the Φ-augmented objective and the endgame
+                            // is quadratic. `p(p+1)/2` second-directional calls,
+                            // only on endgame cycles, only at moderate p; `None`
+                            // (no exact second derivative / gate zero) degrades
+                            // safely to the divided-difference model.
+                            if let (Some(h_unpen), Some(z_joint)) = (
+                                h_unpenalized_for_completion.as_ref(),
+                                joint_jeffreys_subspace.as_ref(),
+                            ) && let Some(completion) =
+                                crate::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
+                                    h_unpen.view(),
+                                    z_joint.view(),
+                                    |u: &Array1<f64>, v: &Array1<f64>| {
+                                        family
+                                            .exact_newton_joint_hessian_second_directional_derivative_with_specs(
+                                                &states, specs, u, v,
+                                            )
+                                    },
+                                )?
+                            {
+                                lhs_true += &completion;
+                            }
                         }
                         // Single metric-whitened eigendecomposition drives BOTH the
                         // seed step and every trust-region re-solve this cycle
@@ -16893,6 +16953,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .map(|(grad_phi, _hphi)| grad_phi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max))
                 .unwrap_or(0.0);
             let residual_tol = inner_tol * (1.0 + grad_inf.max(pen_inf).max(firth_score_inf));
+            // Arm the Jeffreys second-order endgame completion (gam#979) once
+            // the residual enters the convergence band; latched (never
+            // un-armed) so the endgame model cannot oscillate between the
+            // divided-difference and exact Hessians across cycles.
+            if residual.is_finite() && residual <= JEFFREYS_COMPLETION_RESIDUAL_BAND * residual_tol
+            {
+                jeffreys_completion_endgame = true;
+            }
             let block_stationarity_tolerances = block_gradient_norms
                 .iter()
                 .zip(&block_penalty_norms)
@@ -28050,12 +28118,6 @@ mod tests {
                       _v: &Array1<f64>|
          -> Result<Option<DriftDerivResult>, String> { Ok(None) };
 
-        eprintln!("\n=== large-scale rho-scan: unprojected vs projected outer gradient ===");
-        eprintln!(
-            "{:>5}  {:>10}  {:>16}  {:>16}  {:>10}",
-            "rho", "lambda", "g_unprojected", "g_projected", "ratio"
-        );
-
         let mut g_un_at_10 = 0.0_f64;
         let mut g_pr_at_10 = 0.0_f64;
 
@@ -28184,14 +28246,6 @@ mod tests {
 
             let g_un = unprojected.gradient[0];
             let g_pr = projected.gradient[0];
-            eprintln!(
-                "{:>5.1}  {:>10.3e}  {:>16.6e}  {:>16.6e}  {:>10.3e}",
-                rho_val,
-                lam,
-                g_un,
-                g_pr,
-                g_un.abs() / (g_pr.abs() + 1e-30)
-            );
             if rho_val == 10.0 {
                 g_un_at_10 = g_un.abs();
                 g_pr_at_10 = g_pr.abs();
@@ -28525,16 +28579,6 @@ mod tests {
             None,
         )
         .expect("large-scale projected eval");
-
-        eprintln!("\n=== large-scale multi-block reproducer with realistic Ḣ ===");
-        eprintln!("ρ = {:?}", rho.as_slice().unwrap());
-        eprintln!("λ = {:?}", lams.as_slice().unwrap());
-        eprintln!(
-            "|β|∞ = {:.3}",
-            beta_flat.iter().fold(0.0_f64, |a, &b| a.max(b.abs()))
-        );
-        eprintln!("objective = {:.6e}", projected.objective);
-        eprintln!("gradient = {:?}", projected.gradient.as_slice().unwrap());
 
         // Physical-bound check: ½λ_k β'_k S_k β_k is the dominant explicit
         // term per coord. For large-scale shape this is ~10⁸ at ρ=10 with
@@ -31266,11 +31310,6 @@ mod tests {
         let actual = rhs.dot(&delta) - 0.5 * delta.dot(&h_true_delta);
 
         let rho = actual / predicted;
-        eprintln!(
-            "[rho-2 proof] Δ = {big_delta:.6e}, rhs·δ = {rd:.6e}, Δ·‖δ‖² = {dn:.6e}, predicted = {predicted:.6e}, actual = {actual:.6e}, ρ = {rho:.10}",
-            rd = rhs.dot(&delta),
-            dn = big_delta * delta.dot(&delta),
-        );
 
         // ρ must be EXACTLY 2 to floating-point precision (not just "close to 2").
         // This is the structural fingerprint of the SOLVE/APPLY-vs-OBJECTIVE
