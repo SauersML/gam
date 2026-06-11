@@ -69,8 +69,9 @@
 
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, fit_gaussian_mixture};
 use gam::solver::topology_selector::{
-    AutoTopologyKind, CrossClassCandidate, HeldOutDensityProvider, MIXTURE_K_LADDER,
-    STACKING_CV_FOLDS, adjudicate_cross_class_race, fit_mixture_rung, mixture_density_provider,
+    AutoTopologyKind, CrossClassCandidate, EvidenceCertification, HeldOutDensityProvider,
+    MIXTURE_K_LADDER, STACKING_CV_FOLDS, adjudicate_cross_class_race, fit_mixture_rung,
+    mixture_density_provider,
 };
 use gam::test_support::reference::{Column, run_python};
 use ndarray::{Array2, ArrayView2};
@@ -329,6 +330,7 @@ fn build_cross_class_candidates<'a>(
     candidates.push(CrossClassCandidate {
         kind: AutoTopologyKind::Circle,
         negative_log_evidence: circle_evidence,
+        certification: EvidenceCertification::Exact,
         density_provider: circle_density_provider(data),
     });
     // Discrete-mixture rung: one candidate per ladder order.
@@ -340,6 +342,7 @@ fn build_cross_class_candidates<'a>(
         candidates.push(CrossClassCandidate {
             kind: AutoTopologyKind::Mixture { k },
             negative_log_evidence: nle,
+            certification: EvidenceCertification::Exact,
             density_provider: mixture_density_provider(data, k, cfg),
         });
     }
