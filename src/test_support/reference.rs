@@ -360,6 +360,34 @@ pub fn rmse(a: &[f64], b: &[f64]) -> f64 {
     (s / a.len().max(1) as f64).sqrt()
 }
 
+/// Coefficient of determination against the mean predictor.
+pub fn r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+/// Out-of-sample coefficient of determination against the held-out mean.
+pub fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
+    r2(pred, truth)
+}
+
+/// Right-pad a vector with its last value, or 0.0 when empty.
+pub fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
+}
+
 /// Maximum absolute difference between two equal-length vectors.
 pub fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len(), "max_abs_diff length mismatch");

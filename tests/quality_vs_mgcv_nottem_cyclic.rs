@@ -39,7 +39,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, pad_to, r2, relative_l2, rmse, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -57,18 +57,6 @@ const PERIOD_END: f64 = 13.0;
 /// Cyclic-basis dimension. With only 12 distinct months, k=8 is comfortably
 /// resolved by mgcv's `bs="cc"` and leaves ample smoothing freedom.
 const K: usize = 8;
-
-/// Coefficient of determination of `pred` against observed `truth`, relative to
-/// the mean predictor: `1 - SS_res / SS_tot`. R2 = 1 is perfect, R2 = 0 matches
-/// predicting the held-out mean, R2 < 0 is worse than the mean.
-fn r2(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
-    let n = truth.len() as f64;
-    let mean = truth.iter().sum::<f64>() / n;
-    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
-    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
-    1.0 - ss_res / ss_tot.max(1e-300)
-}
 
 #[test]
 fn gam_cyclic_predicts_nottem_seasonal_cycle_vs_mgcv() {
@@ -230,19 +218,4 @@ fn gam_cyclic_predicts_nottem_seasonal_cycle_vs_mgcv() {
         gam_edf > 1.0 && gam_edf < (K as f64),
         "gam effective dof out of sane range: {gam_edf:.3}"
     );
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so it
-/// can ride along as a column of the reference data.frame. Only the first
-/// `v.len()` entries are read back inside the R body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }

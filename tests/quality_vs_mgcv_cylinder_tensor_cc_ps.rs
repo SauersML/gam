@@ -34,7 +34,7 @@
 use csv::{ReaderBuilder, StringRecord};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, pad_to, r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -318,17 +318,6 @@ const SZA_CSV: &str = concat!(
     "/bench/datasets/solar_zenith_angle.csv"
 );
 
-/// Coefficient of determination of `pred` vs observed `truth` relative to the
-/// mean predictor: `1 - SS_res/SS_tot`. R2 = 1 perfect, 0 = constant-mean.
-fn r2(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
-    let n = truth.len() as f64;
-    let mean = truth.iter().sum::<f64>() / n;
-    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
-    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
-    1.0 - ss_res / ss_tot.max(1e-300)
-}
-
 /// Mid-month day-of-year on the [0,365] cyclic axis (Jan→15, Dec→349). Returns
 /// `None` for an unrecognized month token so a malformed row fails loudly.
 fn month_to_doy(m: &str) -> Option<f64> {
@@ -538,19 +527,4 @@ fn gam_cylinder_tensor_cc_ps_recovers_truth_and_mixes_boundaries_on_real_data() 
         gam_edf > 2.0 && gam_edf < 60.0,
         "gam effective dof out of sane range: {gam_edf:.3}"
     );
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so it
-/// can ride along as a column of the reference data.frame. Only the first
-/// `v.len()` entries are read back inside the R body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
 }

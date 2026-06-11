@@ -31,14 +31,9 @@
 //!      regression that hardcodes `π/2` regardless of the `radians` flag).
 
 use std::f64::consts::PI;
-use std::path::{Path, PathBuf};
+use gam::test_support::cli_harness::run_or_panic;
+use std::path::Path;
 use std::process::Command;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 /// Deterministic Fibonacci-lattice cover of S². Returns (lat, lon) in radians,
 /// lon wrapped to `[-π, π]`. The lattice never lands exactly on a pole, which
@@ -104,19 +99,6 @@ fn write_ring_csv(path: &Path, lat: f64, n_lon: usize, radians: bool) {
     writer.flush().expect("flush predict csv");
 }
 
-fn run_or_panic(mut command: Command, label: &str) {
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
-    assert!(
-        output.status.success(),
-        "`{label}` failed with status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
 fn read_means(path: &Path) -> Vec<f64> {
     let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
     let headers = reader.headers().expect("predict csv headers").clone();
@@ -167,7 +149,7 @@ fn pole_and_equator_spread(radians: bool, pole_lat_rad: f64) -> (f64, f64) {
         "y ~ sphere(lat, lon)"
     };
 
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&train_path)
@@ -182,7 +164,7 @@ fn pole_and_equator_spread(radians: bool, pole_lat_rad: f64) -> (f64, f64) {
         (&pole_path, &pole_out, "gam predict (pole ring)"),
         (&equator_path, &equator_out, "gam predict (equator ring)"),
     ] {
-        let mut cmd = Command::new(gam_binary());
+        let mut cmd = Command::new(gam::gam_binary!());
         cmd.arg("predict")
             .arg(&model_path)
             .arg(input)

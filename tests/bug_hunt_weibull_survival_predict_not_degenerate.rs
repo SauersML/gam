@@ -22,7 +22,7 @@
 //! and monotone non-increasing in `t`. With the double-counting removed the
 //! surface tracks the fitted Weibull and the assertions hold.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use csv::StringRecord;
@@ -30,15 +30,10 @@ use gam::encode_recordswith_inferred_schema;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
 use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
+use gam::test_support::cli_harness::run_or_panic;
 use ndarray::Array1;
 
 const N: usize = 500;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 /// Deterministic right-censored data with high mortality (~87% events, median
 /// observed time ~2.5), so any correctly-fitted survival model must predict
@@ -73,19 +68,6 @@ fn build_dataset() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         event.push(ev);
     }
     (age, exit, event)
-}
-
-fn run_or_panic(mut command: Command, label: &str) {
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
-    assert!(
-        output.status.success(),
-        "`{label}` failed with status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
 }
 
 fn write_training_csv(path: &Path, age: &[f64], exit: &[f64], event: &[f64]) {
@@ -139,7 +121,7 @@ fn weibull_survival_predict_surface_is_not_degenerate_unit_survival() {
     let model_path = dir.path().join("model.json");
     write_training_csv(&train_path, &age, &exit, &event);
 
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&train_path)

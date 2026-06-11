@@ -38,14 +38,9 @@
 //! (the same way it already skips categorical/binary/periodic columns), this
 //! test passes without edits.
 
-use std::path::{Path, PathBuf};
+use gam::test_support::cli_harness::run_or_panic;
+use std::path::Path;
 use std::process::Command;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 const SLOPE: f64 = 1.25;
 const INTERCEPT: f64 = 0.5;
@@ -86,19 +81,6 @@ fn write_predict_csv(path: &Path, xs: &[f64]) {
     writer.flush().expect("flush predict csv");
 }
 
-fn run_or_panic(mut command: Command, label: &str) {
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
-    assert!(
-        output.status.success(),
-        "`{label}` failed with status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
 /// Read the `mean` column from a `gam predict --out` CSV.
 fn read_predictions(path: &Path) -> Vec<f64> {
     let mut reader = csv::Reader::from_path(path).expect("open predictions csv");
@@ -137,7 +119,7 @@ fn linear_term_predict_extrapolates_instead_of_clamping_to_training_range() {
     let probes: [f64; 9] = [-10.0, -5.0, -3.0, 0.0, 1.0, 2.0, 3.0, 5.0, 10.0];
     write_predict_csv(&predict_path, &probes);
 
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&train_path)
@@ -148,7 +130,7 @@ fn linear_term_predict_extrapolates_instead_of_clamping_to_training_range() {
     run_or_panic(fit_cmd, "gam fit y ~ x (gaussian)");
     assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
 
-    let mut predict_cmd = Command::new(gam_binary());
+    let mut predict_cmd = Command::new(gam::gam_binary!());
     predict_cmd
         .arg("predict")
         .arg(&model_path)

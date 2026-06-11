@@ -32,7 +32,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, pad_to, r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -51,33 +51,6 @@ const NOTTEM_CSV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/bench/datasets/nottem_monthly_temp.csv"
 );
-
-/// Coefficient of determination of `pred` against observed `truth`, relative to
-/// the mean predictor: `1 - SS_res / SS_tot`. R2 = 1 is perfect, R2 = 0 matches
-/// predicting the held-out mean, R2 < 0 is worse than the mean.
-fn r2(pred: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
-    let n = truth.len() as f64;
-    let mean = truth.iter().sum::<f64>() / n;
-    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
-    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
-    1.0 - ss_res / ss_tot.max(1e-300)
-}
-
-/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so it
-/// can ride along as a column of the reference data.frame of train length. Only
-/// the first `v.len()` entries are read back inside the R body.
-fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(
-        v.len() <= len,
-        "pad target {len} shorter than source {}",
-        v.len()
-    );
-    let fill = v.last().copied().unwrap_or(0.0);
-    let mut out = v.to_vec();
-    out.resize(len, fill);
-    out
-}
 
 #[test]
 fn gam_cyclic_cubic_matches_mgcv_on_sine() {

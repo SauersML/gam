@@ -23,7 +23,8 @@
 //! varies with `x`, and tracks the analytic lognormal survival truth. Without the
 //! `−log t` mirror the surface is flat in `t` and fails every check.
 
-use std::path::{Path, PathBuf};
+use gam::test_support::cli_harness::run_or_panic;
+use std::path::Path;
 use std::process::Command;
 
 use csv::StringRecord;
@@ -38,12 +39,6 @@ const N: usize = 400;
 const A: f64 = 1.0; // intercept of mu(x)
 const B: f64 = 0.6; // slope on x
 const SIGMA_TRUE: f64 = 0.5;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 /// Standard normal CDF via erf, matching the lognormal survival the location-
 /// scale gaussian residual family implements.
@@ -113,19 +108,6 @@ fn build_dataset() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     (x, exit, event)
 }
 
-fn run_or_panic(mut command: Command, label: &str) {
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
-    assert!(
-        output.status.success(),
-        "`{label}` failed with status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
 fn write_training_csv(path: &Path, x: &[f64], exit: &[f64], event: &[f64]) {
     let mut writer = csv::Writer::from_path(path).expect("create training csv");
     writer.write_record(["t", "d", "x"]).expect("write header");
@@ -180,7 +162,7 @@ fn reduced_aft_location_scale_predicts_correct_log_t_surface() {
     let model_path = dir.path().join("model.json");
     write_training_csv(&train_path, &x, &exit, &event);
 
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&train_path)

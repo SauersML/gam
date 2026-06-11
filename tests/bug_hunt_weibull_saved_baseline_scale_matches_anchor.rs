@@ -27,7 +27,7 @@
 //!      hazard up to a single covariate-driven multiplicative shift that is
 //!      constant across the time grid.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use csv::StringRecord;
@@ -35,15 +35,10 @@ use gam::encode_recordswith_inferred_schema;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
 use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
+use gam::test_support::cli_harness::run_or_panic;
 use ndarray::Array1;
 
 const N: usize = 500;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 /// Deterministic LEFT-TRUNCATED Weibull data: entry ages are pushed to a
 /// positive left-tail (entry ∈ [30, 50]), so the time anchor (earliest entry
@@ -79,19 +74,6 @@ fn build_dataset() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         event.push(ev);
     }
     (entry, exit, event)
-}
-
-fn run_or_panic(mut command: Command, label: &str) {
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
-    assert!(
-        output.status.success(),
-        "`{label}` failed with status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
 }
 
 fn write_training_csv(path: &Path, entry: &[f64], exit: &[f64], event: &[f64]) {
@@ -140,7 +122,7 @@ fn weibull_saved_baseline_scale_recovered_from_anchor_not_stale_beta0() {
     // Intercept-only baseline so the entire log-cumulative-hazard sits in the
     // anchor-centered linear time coefficients (no covariate smooth to dilute
     // the baseline-recovery assertion).
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&train_path)
