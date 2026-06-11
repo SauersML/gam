@@ -1489,9 +1489,8 @@ mod cuda {
     // without re-uploading the local factors.
     // ────────────────────────────────────────────────────────────────────
 
-    use cudarc::driver::{CudaContext, CudaModule, LaunchConfig, PushKernelArg};
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     /// One compiled NVRTC module per `(cc_major, cc_minor, p_max, r_template)`.
     /// `cc_*` lets one process drive multiple device generations; the
@@ -1785,7 +1784,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
         static CACHE: crate::gpu::common::PtxModuleCache =
             crate::gpu::common::PtxModuleCache::new();
         CACHE
-            .get_or_compile(ctx, PCG_VECTOR_KERNEL_SOURCE)
+            .get_or_compile(ctx, "arrow_pcg_vector", PCG_VECTOR_KERNEL_SOURCE)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)
     }
 
@@ -1816,6 +1815,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
         // SAFETY: all buffers have length n and belong to `stream`; the kernel only
         // reads/writes indices `< n`.
         unsafe { builder.launch(pcg_launch_config(n)?) }
+            .map(drop)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)
     }
 
@@ -1836,6 +1836,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
         // SAFETY: z/p both have length n and belong to `stream`; the kernel only
         // reads/writes indices `< n`.
         unsafe { builder.launch(pcg_launch_config(n)?) }
+            .map(drop)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)
     }
 
@@ -2040,7 +2041,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
                     .max(1.0);
                 ArrowSchurGpuFailure::RidgeBumpRequired {
                     row: row_idx,
-                    bump: scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN,
+                    bump: scale * f64::EPSILON.sqrt() * super::RIDGE_BUMP_EPS_MARGIN,
                 }
             })?;
             for col in 0..q {
@@ -2139,6 +2140,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
         // entries on `stream`; the kernel writes one in-bounds element per
         // launched index below `n`.
         unsafe { builder.launch(pcg_launch_config(n)?) }
+            .map(drop)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)
     }
 
@@ -2170,7 +2172,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
             let mut builder = stream.launch_builder(&kernel);
             builder
                 .arg(x)
-                .arg(out)
+                .arg(&mut *out)
                 .arg(&buffers.smooth_offsets)
                 .arg(&buffers.smooth_m)
                 .arg(&buffers.smooth_ptr)
@@ -2206,7 +2208,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
             let mut builder = stream.launch_builder(&kernel);
             builder
                 .arg(x)
-                .arg(out)
+                .arg(&mut *out)
                 .arg(&buffers.g_row_off)
                 .arg(&buffers.g_col_off)
                 .arg(&buffers.g_rows)
@@ -2367,7 +2369,9 @@ extern "C" __global__ void arrow_sae_diag_sub(
         // SAFETY: diagonal output and all read-only SAE row metadata buffers are
         // live on `stream` with sizes matching `n_rows`, `p`, and `max_q`; the
         // kernel bounds-checks its flattened work index.
-        unsafe { builder.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)
+        unsafe { builder.launch(cfg) }
+            .map(drop)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)
     }
 
     fn launch_sae_matvec(
