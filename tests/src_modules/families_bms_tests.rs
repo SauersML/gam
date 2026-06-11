@@ -20,17 +20,48 @@ fn bernoulli_marginal_slope_probit_link() -> InverseLink {
     InverseLink::Standard(StandardLink::Probit)
 }
 
-/// Test-only default fields for `BernoulliMarginalSlopeFamily`. Returns a
-/// family whose `y`, `weights`, `z`, `marginal_design`, and `logslope_design`
-/// are all empty/zero placeholders — every test site overrides those via
-/// struct-update syntax (`..default_test_family()`). Bundles the stable
-/// boilerplate fields (latent_measure, base_link, policy, cell-moment
-/// caches, intercept-warm-start, auto-subsample counters) so each test
-/// fixture stops re-listing them.
+fn dense_design(matrix: Array2<f64>) -> DesignMatrix {
+    DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(matrix))
+}
+
+fn test_family_with_dense_designs(
+    y: Array1<f64>,
+    weights: Array1<f64>,
+    z: Array1<f64>,
+    marginal_design: Array2<f64>,
+    logslope_design: Array2<f64>,
+) -> BernoulliMarginalSlopeFamily {
+    BernoulliMarginalSlopeFamily {
+        y: Arc::new(y),
+        weights: Arc::new(weights),
+        z: Arc::new(z),
+        marginal_design: dense_design(marginal_design),
+        logslope_design: dense_design(logslope_design),
+        ..default_test_family()
+    }
+}
+
+fn test_family_with_zero_primary_designs(
+    y: Array1<f64>,
+    weights: Array1<f64>,
+    z: Array1<f64>,
+) -> BernoulliMarginalSlopeFamily {
+    let n = z.len();
+    test_family_with_dense_designs(y, weights, z, Array2::zeros((n, 0)), Array2::zeros((n, 0)))
+}
+
+fn test_family_with_intercept_designs(
+    y: Array1<f64>,
+    weights: Array1<f64>,
+    z: Array1<f64>,
+) -> BernoulliMarginalSlopeFamily {
+    let n = z.len();
+    let ones_col = Array2::ones((n, 1));
+    test_family_with_dense_designs(y, weights, z, ones_col.clone(), ones_col)
+}
+
 fn default_test_family() -> BernoulliMarginalSlopeFamily {
-    let empty_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
-        (0, 0),
-    )));
+    let empty_design = dense_design(Array2::zeros((0, 0)));
     BernoulliMarginalSlopeFamily {
         y: Arc::new(Array1::zeros(0)),
         weights: Arc::new(Array1::zeros(0)),
@@ -92,9 +123,7 @@ fn dummy_blockspec(p: usize, n_rows: usize) -> ParameterBlockSpec {
     let idx = SEQ.fetch_add(1, Ordering::Relaxed);
     ParameterBlockSpec {
         name: format!("dummy_{idx}"),
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::<f64>::zeros((n_rows, p)),
-        )),
+        design: dense_design(Array2::<f64>::zeros((n_rows, p))),
         offset: Array1::zeros(n_rows),
         penalties: vec![],
         nullspace_dims: vec![],
@@ -111,6 +140,13 @@ fn dummy_block_state(beta: Array1<f64>, n_rows: usize) -> ParameterBlockState {
     ParameterBlockState {
         beta,
         eta: Array1::zeros(n_rows),
+    }
+}
+
+fn scalar_block_state(value: f64, n_rows: usize) -> ParameterBlockState {
+    ParameterBlockState {
+        beta: array![value],
+        eta: Array1::from_elem(n_rows, value),
     }
 }
 
@@ -146,16 +182,9 @@ fn flex_hessian_matvec_fixture(
     let link_prepared =
         build_link_deviation_block_from_knots_design_seed_and_weights(&link_seed, &q_seed, &cfg)?;
     let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(y),
-        weights: Arc::new(weights),
-        z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            design.clone(),
-        )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
         score_warp: Some(score_prepared.runtime.clone()),
         link_dev: Some(link_prepared.runtime.clone()),
-        ..default_test_family()
+        ..test_family_with_dense_designs(y, weights, z.clone(), design.clone(), design)
     };
     let marginal_beta = array![0.05, 0.08];
     let logslope_beta = array![-0.15, 0.04];
@@ -190,11 +219,6 @@ fn flex_hessian_matvec_fixture(
     Ok((family, states, cache, direction))
 }
 
-/// Shared fixture for the dual-flex (score-warp + link-deviation) exact
-/// higher-order tests. Returns the family plus its four-block parameter
-/// state. Every dual-flex test site builds the identical `z`/`y`/`weights`
-/// data, the same score-warp and link-deviation blocks, and the same
-/// `block_states`; this collapses that ~57-line preamble into one call.
 fn dual_flex_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
     let z = array![-0.8, 0.2, 1.1];
     let y = array![0.0, 1.0, 1.0];
@@ -217,32 +241,13 @@ fn dual_flex_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBloc
     )
     .expect("link block");
     let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(y.clone()),
-        weights: Arc::new(weights.clone()),
-        z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
         score_warp: Some(score_prepared.runtime.clone()),
         link_dev: Some(link_prepared.runtime.clone()),
-        ..default_test_family()
+        ..test_family_with_intercept_designs(y.clone(), weights.clone(), z.clone())
     };
     let block_states = vec![
-        ParameterBlockState {
-            beta: array![0.25],
-            eta: Array1::from_elem(z.len(), 0.25),
-        },
-        ParameterBlockState {
-            beta: array![0.6],
-            eta: Array1::from_elem(z.len(), 0.6),
-        },
+        scalar_block_state(0.25, z.len()),
+        scalar_block_state(0.6, z.len()),
         ParameterBlockState {
             beta: Array1::from_iter(
                 (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -259,9 +264,6 @@ fn dual_flex_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBloc
     (family, block_states)
 }
 
-/// Shared fixture for the h-only (score-warp deviation) exact higher-order
-/// tests. Identical `seed`, single deviation block, and `block_states`
-/// across every h-only site.
 fn h_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
     let prepared = build_score_warp_deviation_block_from_seed(
@@ -287,24 +289,16 @@ fn h_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockSt
         ),
     ];
     let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-        weights: Arc::new(Array1::ones(seed.len())),
-        z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::zeros((seed.len(), 0)),
-        )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::zeros((seed.len(), 0)),
-        )),
         score_warp: Some(prepared.runtime.clone()),
-        ..default_test_family()
+        ..test_family_with_zero_primary_designs(
+            array![0.0, 1.0, 0.0, 1.0, 0.0],
+            Array1::ones(seed.len()),
+            seed.clone(),
+        )
     };
     (family, block_states)
 }
 
-/// Shared fixture for the w-only (link-deviation) exact higher-order tests.
-/// Identical `seed`, single deviation block, and `block_states` across every
-/// w-only site.
 fn w_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
     let prepared = build_test_link_deviation_block_from_seed(
@@ -330,17 +324,12 @@ fn w_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockSt
         ),
     ];
     let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-        weights: Arc::new(Array1::ones(seed.len())),
-        z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::zeros((seed.len(), 0)),
-        )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::zeros((seed.len(), 0)),
-        )),
         link_dev: Some(prepared.runtime.clone()),
-        ..default_test_family()
+        ..test_family_with_zero_primary_designs(
+            array![0.0, 1.0, 0.0, 1.0, 0.0],
+            Array1::ones(seed.len()),
+            seed.clone(),
+        )
     };
     (family, block_states)
 }
@@ -977,18 +966,8 @@ fn bernoulli_margslope_flex_ll_early_exit_is_exact_or_provably_rejected() {
 
 #[test]
 fn row_primary_fourth_contracted_rejects_bad_direction_lengths() {
-    let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(array![1.0]),
-        weights: Arc::new(array![1.0]),
-        z: Arc::new(array![0.25]),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::zeros((1, 0)),
-        )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::zeros((1, 0)),
-        )),
-        ..default_test_family()
-    };
+    let family =
+        test_family_with_zero_primary_designs(array![1.0], array![1.0], array![0.25]);
     let block_states = vec![
         ParameterBlockState {
             beta: Array1::zeros(0),
@@ -1126,16 +1105,7 @@ fn make_rigid_test_family(n: usize) -> BernoulliMarginalSlopeFamily {
         (0..n).map(|i| -1.5 + 3.0 * (((i * 17 + 5) % n) as f64 + 0.5) / (n as f64)),
     );
     let ones_col = Array2::from_shape_fn((n, 1), |_| 1.0);
-    BernoulliMarginalSlopeFamily {
-        y: Arc::new(y),
-        weights: Arc::new(weights),
-        z: Arc::new(z),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            ones_col.clone(),
-        )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(ones_col)),
-        ..default_test_family()
-    }
+    test_family_with_dense_designs(y, weights, z, ones_col.clone(), ones_col)
 }
 
 fn rigid_block_states(
@@ -1144,16 +1114,7 @@ fn rigid_block_states(
     b: f64,
 ) -> Vec<ParameterBlockState> {
     let n = family.y.len();
-    vec![
-        ParameterBlockState {
-            beta: array![q],
-            eta: Array1::from_elem(n, q),
-        },
-        ParameterBlockState {
-            beta: array![b],
-            eta: Array1::from_elem(n, b),
-        },
-    ]
+    vec![scalar_block_state(q, n), scalar_block_state(b, n)]
 }
 
 #[test]
@@ -1797,17 +1758,12 @@ fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
         .len();
     let beta_link = Array1::from_iter((0..link_dim).map(|idx| 0.1 * (idx as f64 + 1.0)));
     let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(Array1::zeros(seed.len())),
-        weights: Arc::new(Array1::ones(seed.len())),
-        z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::zeros((seed.len(), 0)),
-        )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::zeros((seed.len(), 0)),
-        )),
         link_dev: Some(prepared.runtime.clone()),
-        ..default_test_family()
+        ..test_family_with_zero_primary_designs(
+            Array1::zeros(seed.len()),
+            Array1::ones(seed.len()),
+            seed.clone(),
+        )
     };
     let block_states = vec![
         dummy_block_state(array![0.0], seed.len()),
@@ -1909,20 +1865,11 @@ fn zero_deviation_intercept_fast_path_matches_denested_calibration() {
     .expect("build link-deviation block");
     let n = seed.len();
     let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(Array1::zeros(n)),
-        weights: Arc::new(Array1::ones(n)),
-        z: Arc::new(seed.clone()),
         gaussian_frailty_sd: Some(0.65),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::zeros((n, 0)),
-        )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::zeros((n, 0)),
-        )),
         score_warp: Some(score_prepared.runtime.clone()),
         link_dev: Some(link_prepared.runtime.clone()),
         intercept_warm_starts: Some(new_intercept_warm_start_cache(n)),
-        ..default_test_family()
+        ..test_family_with_zero_primary_designs(Array1::zeros(n), Array1::ones(n), seed.clone())
     };
     let marginal_eta = 0.35;
     let slope = -0.8;
@@ -6660,71 +6607,13 @@ fn auto_latent_measure_preserves_standard_normal_fast_path() {
 
 #[test]
 fn flexible_family_exposes_exact_newton_workspaces() {
-    let z = array![-0.8, 0.2, 1.1];
-    let y = array![0.0, 1.0, 1.0];
-    let weights = array![1.0, 0.7, 1.3];
-    let score_prepared = build_score_warp_deviation_block_from_seed(
-        &z,
-        &DeviationBlockConfig {
-            num_internal_knots: 4,
-            ..DeviationBlockConfig::default()
-        },
-    )
-    .expect("score warp block");
-    let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-    let link_prepared = build_test_link_deviation_block_from_seed(
-        &link_seed,
-        &DeviationBlockConfig {
-            num_internal_knots: 4,
-            ..DeviationBlockConfig::default()
-        },
-    )
-    .expect("link block");
-    let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(y.clone()),
-        weights: Arc::new(weights.clone()),
-        z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        score_warp: Some(score_prepared.runtime.clone()),
-        link_dev: Some(link_prepared.runtime.clone()),
-        ..default_test_family()
-    };
-    let block_states = vec![
-        ParameterBlockState {
-            beta: array![0.25],
-            eta: Array1::from_elem(z.len(), 0.25),
-        },
-        ParameterBlockState {
-            beta: array![0.6],
-            eta: Array1::from_elem(z.len(), 0.6),
-        },
-        ParameterBlockState {
-            beta: Array1::from_iter(
-                (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-            ),
-            eta: Array1::zeros(z.len()),
-        },
-        ParameterBlockState {
-            beta: Array1::from_iter(
-                (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-            ),
-            eta: Array1::zeros(z.len()),
-        },
-    ];
+    let (family, block_states) = dual_flex_exact_fixture();
+    let n = family.z.len();
     let specs = vec![
-        dummy_blockspec(1, z.len()),
-        dummy_blockspec(1, z.len()),
-        dummy_blockspec(score_prepared.block.design.ncols(), z.len()),
-        dummy_blockspec(link_prepared.block.design.ncols(), z.len()),
+        dummy_blockspec(1, n),
+        dummy_blockspec(1, n),
+        dummy_blockspec(block_states[2].beta.len(), n),
+        dummy_blockspec(block_states[3].beta.len(), n),
     ];
     let derivative_blocks = vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
@@ -6749,32 +6638,13 @@ fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
     let weights = array![1.0, 0.7, 1.3];
     let sigma = 0.7;
     let make_family = |sigma: f64| BernoulliMarginalSlopeFamily {
-        y: Arc::new(y.clone()),
-        weights: Arc::new(weights.clone()),
-        z: Arc::new(z.clone()),
         gaussian_frailty_sd: Some(sigma),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        ..default_test_family()
+        ..test_family_with_intercept_designs(y.clone(), weights.clone(), z.clone())
     };
     let family = make_family(sigma);
     let block_states = vec![
-        ParameterBlockState {
-            beta: array![0.25],
-            eta: Array1::from_elem(z.len(), 0.25),
-        },
-        ParameterBlockState {
-            beta: array![0.6],
-            eta: Array1::from_elem(z.len(), 0.6),
-        },
+        scalar_block_state(0.25, z.len()),
+        scalar_block_state(0.6, z.len()),
     ];
     let specs = vec![dummy_blockspec(1, z.len()), dummy_blockspec(1, z.len())];
 
