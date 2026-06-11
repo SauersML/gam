@@ -96,6 +96,31 @@ fn fill_link_basis_cell_coeff_jet(
     cbb[idx] = scale_coeff4(dc_bbw_raw, scale);
 }
 
+fn assemble_bms_block_local_s_psi(
+    deriv: &crate::custom_family::CustomFamilyBlockPsiDerivative,
+    per_block_rho: &Array1<f64>,
+    p_block: usize,
+) -> Array2<f64> {
+    if let Some(ref components) = deriv.s_psi_penalty_components {
+        let mut s_psi = Array2::<f64>::zeros((p_block, p_block));
+        for (penalty_idx, s_part) in components {
+            s_part.add_scaled_to(per_block_rho[*penalty_idx].exp(), &mut s_psi);
+        }
+        return s_psi;
+    }
+    if let Some(ref components) = deriv.s_psi_components {
+        let mut s_psi = Array2::<f64>::zeros((p_block, p_block));
+        for (penalty_idx, s_part) in components {
+            s_psi.scaled_add(per_block_rho[*penalty_idx].exp(), s_part);
+        }
+        s_psi
+    } else if let Some(penalty_idx) = deriv.penalty_index {
+        deriv.s_psi.mapv(|value| per_block_rho[penalty_idx].exp() * value)
+    } else {
+        Array2::<f64>::zeros((p_block, p_block))
+    }
+}
+
 impl BernoulliMarginalSlopeFamily {
     #[inline]
     pub(super) fn probit_frailty_scale(&self) -> f64 {
@@ -13710,11 +13735,16 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
         let psi_dim: usize = derivative_blocks.iter().map(Vec::len).sum();
-        if psi_dim != 0 {
-            return Ok(None);
-        }
         if block_states.len() != specs.len() {
             return Ok(None);
+        }
+        if derivative_blocks.len() != specs.len() {
+            return Ok(None);
+        }
+        for psi_index in 0..psi_dim {
+            if self.is_sigma_aux_index(derivative_blocks, psi_index) {
+                return Ok(None);
+            }
         }
         // Two-phase auto-subsample schedule. Phase 1: stratified
         // Horvitz–Thompson mask (≈ 1 % gradient noise) for the first
@@ -13769,11 +13799,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             };
         let ranges = Self::block_ranges_from_specs(specs);
         let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
+        let theta_dim = rho.len() + psi_dim;
         if total == 0 {
             return Ok(Some(BatchedOuterGradientTerms {
-                objective_theta: Array1::zeros(0),
-                trace_h_inv_hdot: Array1::zeros(0),
-                trace_s_pinv_sdot: Array1::zeros(0),
+                objective_theta: Array1::zeros(theta_dim),
+                trace_h_inv_hdot: Array1::zeros(theta_dim),
+                trace_s_pinv_sdot: Array1::zeros(theta_dim),
             }));
         }
         if rho.len() != specs.iter().map(|spec| spec.penalties.len()).sum::<usize>() {
@@ -13840,8 +13871,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         } else {
             0.0
         };
-        let mut objective_theta = Array1::<f64>::zeros(rho.len());
-        let mut trace_s_pinv_sdot = Array1::<f64>::zeros(rho.len());
+        let mut objective_theta = Array1::<f64>::zeros(theta_dim);
+        let mut trace_s_pinv_sdot = Array1::<f64>::zeros(theta_dim);
         let mut penalty_cursor = 0usize;
         let mut per_block_rho: Vec<Array1<f64>> = Vec::with_capacity(specs.len());
         let mut penalties_dense: Vec<Vec<Array2<f64>>> = Vec::with_capacity(specs.len());
@@ -13881,14 +13912,27 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         } else {
             0.0
         };
-        let per_block_penalty_refs: Vec<&[Array2<f64>]> =
-            penalties_dense.iter().map(Vec::as_slice).collect();
-        let penalty_logdet = crate::estimate::reml::unified::compute_block_penalty_logdet_derivs(
-            &per_block_rho,
-            &per_block_penalty_refs,
-            penalty_logdet_ridge,
-        )?;
-        trace_s_pinv_sdot.assign(&penalty_logdet.first);
+        let mut penalty_logdet_blocks = Vec::with_capacity(specs.len());
+        penalty_cursor = 0;
+        for (block_idx, block_rho) in per_block_rho.iter().enumerate() {
+            let lambdas = block_rho.mapv(f64::exp).to_vec();
+            let pld = crate::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
+                &penalties_dense[block_idx],
+                &lambdas,
+                penalty_logdet_ridge,
+            )
+            .map_err(|e| {
+                format!("bernoulli marginal-slope penalty logdet failed for block {block_idx}: {e}")
+            })?;
+            let first = pld
+                .rho_derivatives(&penalties_dense[block_idx], &lambdas)
+                .0;
+            for (local_idx, value) in first.iter().enumerate() {
+                trace_s_pinv_sdot[penalty_cursor + local_idx] = *value;
+            }
+            penalty_cursor += block_rho.len();
+            penalty_logdet_blocks.push(pld);
+        }
         if log_exact_work(self.y.len()) {
             log::info!(
                 "[BMS batched outer-gradient] penalty assembly/logdet done n={} p={} rho={} elapsed={:.3}s",
@@ -13912,8 +13956,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 spectral_started.elapsed().as_secs_f64()
             );
         }
-        let mut trace_h_inv_hdot = Array1::<f64>::zeros(rho.len());
-        let mut directions = Array2::<f64>::zeros((total, rho.len()));
+        let mut trace_h_inv_hdot = Array1::<f64>::zeros(theta_dim);
+        let mut directions = Array2::<f64>::zeros((total, theta_dim));
         let direction_started = std::time::Instant::now();
         penalty_cursor = 0;
         for (block_idx, spec) in specs.iter().enumerate() {
@@ -13933,12 +13977,87 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             }
             penalty_cursor += spec.penalties.len();
         }
+
+        let psi_cache = if psi_dim == 0 {
+            None
+        } else {
+            Some(self.build_exact_eval_cache_with_options(block_states, Some(options))?)
+        };
+        if let Some(cache) = psi_cache.as_ref() {
+            let mut axes: Vec<PsiAxisSpec> = Vec::with_capacity(psi_dim);
+            let mut psi_locations: Vec<(usize, usize)> = Vec::with_capacity(psi_dim);
+            for psi_index in 0..psi_dim {
+                let Some((block_idx, local_idx)) =
+                    psi_derivative_location(derivative_blocks, psi_index)
+                else {
+                    return Ok(None);
+                };
+                axes.push(self.resolve_psi_axis_spec(derivative_blocks, block_idx, local_idx)?);
+                psi_locations.push((block_idx, local_idx));
+            }
+            let psi_terms =
+                self.run_psi_row_pass_for_axes(block_states, cache, options, &axes)?;
+            if psi_terms.len() != psi_dim {
+                return Err(format!(
+                    "bernoulli marginal-slope batched gradient psi terms length {} != psi_dim {psi_dim}",
+                    psi_terms.len()
+                ));
+            }
+            for (psi_index, ((block_idx, local_idx), terms)) in
+                psi_locations.into_iter().zip(psi_terms.into_iter()).enumerate()
+            {
+                let idx = rho.len() + psi_index;
+                if terms.score_psi.len() != total {
+                    return Err(format!(
+                        "bernoulli marginal-slope batched gradient psi score length {} != p {total}",
+                        terms.score_psi.len()
+                    ));
+                }
+                if terms.hessian_psi.nrows() > 0
+                    && (terms.hessian_psi.nrows() != total || terms.hessian_psi.ncols() != total)
+                {
+                    return Err(format!(
+                        "bernoulli marginal-slope batched gradient psi Hessian shape {}x{} != {total}x{total}",
+                        terms.hessian_psi.nrows(),
+                        terms.hessian_psi.ncols()
+                    ));
+                }
+                let (start, end) = ranges[block_idx];
+                let p_block = end - start;
+                let deriv = &derivative_blocks[block_idx][local_idx];
+                let s_psi_local =
+                    assemble_bms_block_local_s_psi(deriv, &per_block_rho[block_idx], p_block);
+                let beta_block = beta.slice(s![start..end]);
+                let s_psi_beta_local = s_psi_local.dot(&beta_block);
+                objective_theta[idx] =
+                    terms.objective_psi + 0.5 * beta_block.dot(&s_psi_beta_local);
+                let mut rhs = terms.score_psi.clone();
+                {
+                    let mut rhs_block = rhs.slice_mut(s![start..end]);
+                    rhs_block += &s_psi_beta_local;
+                }
+                let v = spectral.solve(&rhs);
+                directions.column_mut(idx).assign(&(-&v));
+                if terms.hessian_psi.nrows() > 0 {
+                    trace_h_inv_hdot[idx] += spectral.trace_logdet_gradient(&terms.hessian_psi);
+                }
+                if let Some(operator) = terms.hessian_psi_operator.as_ref() {
+                    trace_h_inv_hdot[idx] += spectral.trace_logdet_operator(operator.as_ref());
+                }
+                trace_h_inv_hdot[idx] +=
+                    spectral.trace_logdet_block_local(&s_psi_local, 1.0, start, end);
+                trace_s_pinv_sdot[idx] =
+                    penalty_logdet_blocks[block_idx].tau_gradient_component(&s_psi_local);
+            }
+        }
         if log_exact_work(self.y.len()) {
             log::info!(
-                "[BMS batched outer-gradient] direction solves done n={} p={} rho={} elapsed={:.3}s",
+                "[BMS batched outer-gradient] direction solves done n={} p={} theta={} rho={} psi={} elapsed={:.3}s",
                 self.y.len(),
                 total,
+                theta_dim,
                 rho.len(),
+                psi_dim,
                 direction_started.elapsed().as_secs_f64()
             );
         }
@@ -13965,6 +14084,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     options,
                     subsample.mask.as_slice(),
                 )?
+            } else if let Some(cache) = psi_cache {
+                cache
             } else {
                 self.build_exact_eval_cache_with_options(block_states, Some(options))?
             };
@@ -13989,10 +14110,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         trace_h_inv_hdot += &correction_traces;
         if log_exact_work(self.y.len()) {
             log::info!(
-                "[BMS batched outer-gradient] done n={} p={} rho={} trace_elapsed={:.3}s total_elapsed={:.3}s",
+                "[BMS batched outer-gradient] done n={} p={} theta={} rho={} psi={} trace_elapsed={:.3}s total_elapsed={:.3}s",
                 self.y.len(),
                 total,
+                theta_dim,
                 rho.len(),
+                psi_dim,
                 started.elapsed().as_secs_f64(),
                 batched_started.elapsed().as_secs_f64()
             );
