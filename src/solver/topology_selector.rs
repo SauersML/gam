@@ -1512,6 +1512,43 @@ mod tests {
     }
 
     #[test]
+    fn closure_profiler_recovers_interior_minimum_and_ci() {
+        // A planted parabolic profile in γ with minimum at 0.7: the closure
+        // smooth class must recover γ̂ ≈ 0.7 with a CI that excludes both the
+        // circle (γ=1) and the interval (γ=0) boundaries, and must NOT route to
+        // the mixture rung (this is a regular interior optimum).
+        let selection = profile_closure_within_smooth_class(
+            |gamma| Ok::<_, String>((100.0 + 80.0 * (gamma - 0.7).powi(2), gamma)),
+            0.95,
+        )
+        .expect("closure profile");
+        assert!(
+            (selection.ci.gamma_hat - 0.7).abs() < 0.06,
+            "γ̂ {}",
+            selection.ci.gamma_hat
+        );
+        assert!(!selection.ci.ci_includes_circle);
+        assert!(!selection.ci.ci_includes_interval);
+        assert!(!selection.route_to_mixture_rung);
+        // The representative fit handle is the γ̂ point.
+        assert!((selection.representative.gamma - selection.ci.gamma_hat).abs() < 1e-12);
+    }
+
+    #[test]
+    fn closure_profiler_routes_collapse_to_mixture_rung() {
+        // A profile that keeps improving toward γ=0 (support collapse) pins the
+        // minimiser at the floor and must hand off to the mixture/union rung.
+        let selection = profile_closure_within_smooth_class(
+            |gamma| Ok::<_, String>((10.0 + 25.0 * gamma, gamma)),
+            0.95,
+        )
+        .expect("closure profile");
+        assert!(selection.ci.gamma_hat.abs() < 1e-9);
+        assert!(selection.route_to_mixture_rung);
+        assert!(selection.ci.ci_includes_interval);
+    }
+
+    #[test]
     fn topology_race_thread_plan_bounds_nested_rayon_threads() {
         let plan = TopologyRaceThreadPlan::for_budget(3, 8);
         assert_eq!(plan.concurrent_fits, 3);
