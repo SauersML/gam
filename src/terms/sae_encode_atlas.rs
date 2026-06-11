@@ -61,6 +61,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::linalg::faer_ndarray::FaerEigh;
+use crate::terms::sae_candidate_index::{auto_candidate_budget, AtomFrameSketch, SaeCandidateIndex};
 use crate::terms::sae_manifold::{
     AffineCoordinateEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
     PeriodicHarmonicEvaluator, SaeBasisEvaluator, SaeManifoldAtom, SphereChartEvaluator,
@@ -1045,6 +1046,60 @@ impl EncodeAtlas {
                 amplitudes[row],
             )?;
             coords.row_mut(row).assign(&t);
+            certified.push(cert.certified());
+        }
+        Ok(EncodeResult::from_rows(coords, certified))
+    }
+
+    /// LSH-routed certified encode (issue #1010 step 2 + 3): for each target
+    /// row, the existing [`SaeCandidateIndex`] (#985/#994) proposes the
+    /// best-aligned atom by frame alignment to the row direction; the row is then
+    /// encoded against THAT atom's certified chart atlas. This is the production
+    /// routing path — the LSH does sublinear atom selection, the atlas does the
+    /// in-atom nearest-chart routing and the per-row Kantorovich certificate.
+    ///
+    /// `atoms[id]` must be aligned with the atlas's `atoms[id]` (same dictionary
+    /// order the atlas was built from and the sketch/index were built over).
+    /// A row with no LSH proposal (empty bucket) is flagged uncertified — it
+    /// routes to the exact multi-start fallback, never a silent wrong encode.
+    pub fn certified_encode_with_index<S: AtomFrameSketch>(
+        &self,
+        atoms: &[SaeManifoldAtom],
+        index: &SaeCandidateIndex,
+        sketch: &S,
+        targets: ArrayView2<'_, f64>,
+        amplitudes: ArrayView1<'_, f64>,
+        latent_dim: usize,
+    ) -> Result<EncodeResult, String> {
+        let n = targets.nrows();
+        if amplitudes.len() != n {
+            return Err(format!(
+                "certified_encode_with_index: amplitudes len {} != rows {n}",
+                amplitudes.len()
+            ));
+        }
+        let budget = auto_candidate_budget(atoms.len().max(1));
+        let mut coords = Array2::<f64>::zeros((n, latent_dim));
+        let mut certified = Vec::with_capacity(n);
+        for row in 0..n {
+            // The row direction is the (unit-tolerant) target; the LSH ranks
+            // atoms by how much of that direction lies in each atom's column
+            // space. `propose` returns the top-`budget` atom ids by exact frame
+            // alignment.
+            let proposal = index.propose(sketch, targets.row(row), budget, true);
+            let Some(&best_atom) = proposal.proposed.first() else {
+                // No LSH candidate: flag for the exact fallback.
+                certified.push(false);
+                continue;
+            };
+            let atom = atoms.get(best_atom).ok_or_else(|| {
+                format!("certified_encode_with_index: proposed atom {best_atom} out of range")
+            })?;
+            let (t, cert) =
+                self.certified_encode_row(atom, best_atom, targets.row(row), amplitudes[row])?;
+            if t.len() == latent_dim {
+                coords.row_mut(row).assign(&t);
+            }
             certified.push(cert.certified());
         }
         Ok(EncodeResult::from_rows(coords, certified))
