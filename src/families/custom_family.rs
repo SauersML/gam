@@ -25519,7 +25519,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
 }
 
 /// Lift reduced-space `ParameterBlockState`s back to the raw block
-/// dimensions described by `canonical.per_block_transform`. Each block's
+/// dimensions described by `canonical.gauge`. Each block's
 /// `beta` becomes `T_i · θ_i` (selection-T zeros dropped raw entries);
 /// `eta = design · beta` is invariant under the transform, so the
 /// reduced-space `eta` field carries through unchanged.
@@ -25528,7 +25528,7 @@ fn lift_block_states_to_raw(
     reduced: Vec<ParameterBlockState>,
 ) -> Vec<ParameterBlockState> {
     let theta_blocks: Vec<Array1<f64>> = reduced.iter().map(|s| s.beta.clone()).collect();
-    let raw_betas = canonical.lift_block_betas_to_raw(&theta_blocks);
+    let raw_betas = canonical.gauge.lift_block_betas(&theta_blocks);
     reduced
         .into_iter()
         .zip(raw_betas.into_iter())
@@ -25551,10 +25551,10 @@ fn lift_fit_geometry_to_raw(
     covariance_conditional: Option<Array2<f64>>,
     geometry: Option<FitGeometry>,
 ) -> (Option<Array2<f64>>, Option<FitGeometry>) {
-    let lifted_cov = covariance_conditional.map(|c| canonical.lift_joint_matrix_to_raw(&c));
+    let lifted_cov = covariance_conditional.map(|c| canonical.gauge.lift_covariance(&c));
     let lifted_geom = geometry.map(|g| {
         let h_red = g.penalized_hessian.into_array();
-        let h_raw = canonical.lift_joint_matrix_to_raw(&h_red);
+        let h_raw = canonical.gauge.lift_covariance(&h_red);
         FitGeometry {
             penalized_hessian: h_raw.into(),
             working_weights: g.working_weights,

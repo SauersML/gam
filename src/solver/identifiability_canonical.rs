@@ -277,10 +277,9 @@ pub fn canonicalize_for_identifiability(
 /// higher-priority anchor is removed exactly, rather than being penalised by a
 /// hand-tuned ridge. The reparam `V_b` is folded into each block's design via
 /// [`CoefficientTransformOperator`], penalties are pulled back as `V_bᵀ S V_b`,
-/// and `per_block_transform[b] = V_b` so the existing
-/// [`CanonicalSpecs::lift_block_betas_to_raw`] /
-/// [`CanonicalSpecs::lift_joint_matrix_to_raw`] machinery maps the reduced
-/// fit back to raw coordinates unchanged (the lift is `β_raw = V_b · θ`,
+/// and the block-diagonal [`Gauge`] carries `V_b` so the shared
+/// [`Gauge::lift_block_betas`] / [`Gauge::lift_covariance`] machinery maps the
+/// reduced fit back to raw coordinates unchanged (the lift is `β_raw = V_b · θ`,
 /// already supported for dense transforms).
 fn canonicalize_for_identifiability_inner(
     specs: &[ParameterBlockSpec],
@@ -1066,14 +1065,11 @@ fn try_orthogonalize_blocks(
     let inner = canonicalize_for_identifiability_inner(&ortho_specs, false)?;
 
     // Compose the round-trip transform: β_raw = V_b · (T_inner · θ).
-    // `inner.per_block_transform[b]` is T_inner (selection/identity from the
-    // audit gate); the full raw lift is `V_b · T_inner`.
+    // `inner.gauge.block_transform(b)` is T_inner (selection/identity from
+    // the audit gate); the full raw lift is `V_b · T_inner`.
     let mut composed_transform: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
-    for (v_b, t_inner) in ortho
-        .block_transforms
-        .iter()
-        .zip(inner.per_block_transform.iter())
-    {
+    for (b, v_b) in ortho.block_transforms.iter().enumerate() {
+        let t_inner = inner.gauge.block_transform(b);
         if v_b.ncols() != t_inner.nrows() {
             return Err(CustomFamilyError::DimensionMismatch {
                 reason: format!(
@@ -1084,7 +1080,7 @@ fn try_orthogonalize_blocks(
                 ),
             });
         }
-        composed_transform.push(v_b.dot(t_inner));
+        composed_transform.push(v_b.dot(&t_inner));
     }
 
     log::info!(
@@ -1098,7 +1094,7 @@ fn try_orthogonalize_blocks(
 
     Ok(Some(CanonicalSpecs {
         reduced_specs: inner.reduced_specs,
-        per_block_transform: composed_transform,
+        gauge: Gauge::from_block_transforms(&composed_transform),
         audit: inner.audit,
         used_channel_aware_audit: inner.used_channel_aware_audit,
     }))
@@ -1232,10 +1228,10 @@ mod tests {
         let specs = [spec_from_dense("p", p), spec_from_dense("s", s)];
         let canon = canonicalize_for_identifiability(&specs).expect("clean canonical must succeed");
         assert_eq!(canon.reduced_specs.len(), 2);
-        assert_eq!(canon.per_block_transform[0].dim(), (2, 2));
-        assert_eq!(canon.per_block_transform[1].dim(), (2, 2));
+        assert_eq!(canon.gauge.block_transform(0).dim(), (2, 2));
+        assert_eq!(canon.gauge.block_transform(1).dim(), (2, 2));
         let theta = vec![Array1::from(vec![0.5, -0.25]), Array1::from(vec![1.0, 2.0])];
-        let raw = canon.lift_block_betas_to_raw(&theta);
+        let raw = canon.gauge.lift_block_betas(&theta);
         assert_eq!(raw[0].as_slice().unwrap(), &[0.5, -0.25]);
         assert_eq!(raw[1].as_slice().unwrap(), &[1.0, 2.0]);
     }
@@ -1432,7 +1428,7 @@ mod tests {
         // Identity pullback: penalty dimensions equal raw design width.
         assert_eq!(dense_red.dim(), (2, 2));
         // Identity transform: per-block transform is the 2×2 identity.
-        let t_smooth = &canon.per_block_transform[1];
+        let t_smooth = canon.gauge.block_transform(1);
         assert_eq!(t_smooth.dim(), (2, 2));
         for i in 0..2 {
             for j in 0..2 {
@@ -1503,7 +1499,8 @@ mod tests {
             2,
             "callback-owned block keeps raw width instead of applying design-column surgery"
         );
-        for (block, transform) in canon.per_block_transform.iter().enumerate() {
+        for block in 0..canon.gauge.n_blocks() {
+            let transform = canon.gauge.block_transform(block);
             assert_eq!(
                 transform.dim(),
                 (2, 2),
@@ -1549,7 +1546,7 @@ mod tests {
             .expect("orthogonalisation must resolve the overlap, not refuse");
 
         // Block b shed exactly one direction (the x alias): V_b is 2×1.
-        let v_b = &canon.per_block_transform[1];
+        let v_b = canon.gauge.block_transform(1);
         assert_eq!(
             v_b.ncols(),
             1,
@@ -1561,21 +1558,21 @@ mod tests {
             "overlap block transform maps from raw width 2"
         );
         // Anchor block keeps both directions (square rotation).
-        assert_eq!(canon.per_block_transform[0].ncols(), 2);
+        assert_eq!(canon.gauge.block_transform(0).ncols(), 2);
 
         // Round-trip: a reduced fit θ lifts to raw β = V·θ and predicts
         // identically through the raw designs.
         let theta = vec![Array1::from(vec![0.7, -0.3]), Array1::from(vec![1.4])];
-        let raw = canon.lift_block_betas_to_raw(&theta);
+        let raw = canon.gauge.lift_block_betas(&theta);
         assert_eq!(raw[0].len(), 2);
         assert_eq!(raw[1].len(), 2);
         // Raw prediction = a·β_a + b·β_b.
         let pred_a = a.dot(&raw[0]);
         let pred_b = b.dot(&raw[1]);
         // Reduced prediction = (a·V_a)·θ_a + (b·V_b)·θ_b must equal it.
-        let v_a = &canon.per_block_transform[0];
-        let red_a = a.dot(v_a).dot(&theta[0]);
-        let red_b = b.dot(v_b).dot(&theta[1]);
+        let v_a = canon.gauge.block_transform(0);
+        let red_a = a.dot(&v_a).dot(&theta[0]);
+        let red_b = b.dot(&v_b).dot(&theta[1]);
         for i in 0..n {
             let raw_pred = pred_a[i] + pred_b[i];
             let red_pred = red_a[i] + red_b[i];
@@ -1608,8 +1605,8 @@ mod tests {
         ];
         let canon = canonicalize_for_identifiability(&specs).expect("clean design canonicalises");
         // Identity transforms (nothing to orthogonalise) on the clean design.
-        assert_eq!(canon.per_block_transform[0].dim(), (2, 2));
-        assert_eq!(canon.per_block_transform[1].dim(), (2, 2));
+        assert_eq!(canon.gauge.block_transform(0).dim(), (2, 2));
+        assert_eq!(canon.gauge.block_transform(1).dim(), (2, 2));
     }
 
     /// Direct unit test of the compiler primitive: a block whose columns are
