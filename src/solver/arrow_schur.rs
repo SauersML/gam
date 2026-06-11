@@ -2681,12 +2681,22 @@ impl ArrowSchurSystem {
     /// Allocate an empty BA reduced-camera-system instance sized
     /// `(N point/latent rows × d, K shared decoder parameters)`.
     pub fn new(n: usize, d: usize, k: usize) -> Self {
+        Self::new_with_hbb(n, d, k, Array2::<f64>::zeros((k, k)))
+    }
+
+    /// Allocate an arrow system using a caller-owned dense shared-block buffer.
+    /// The buffer must already have shape `(k, k)` and is zeroed in place before
+    /// use so callers can recycle it across assemblies without changing
+    /// numerics.
+    pub fn new_with_hbb(n: usize, d: usize, k: usize, mut hbb: Array2<f64>) -> Self {
+        assert_eq!(hbb.dim(), (k, k));
+        hbb.fill(0.0);
         let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
         let row_dims: Arc<[usize]> = (0..n).map(|_| d).collect::<Vec<_>>().into();
         let row_offsets: Arc<[usize]> = (0..=n).map(|i| i * d).collect::<Vec<_>>().into();
         let mut sys = Self {
             rows,
-            hbb: Array2::<f64>::zeros((k, k)),
+            hbb,
             hbb_matvec: None,
             htbeta_matvec: None,
             htbeta_transpose_matvec: None,
@@ -2769,6 +2779,18 @@ impl ArrowSchurSystem {
     /// hard-concrete) where the active-set size varies per observation.
     /// `sys.d` is set to `max(per_row_dims)` (or 0 for an empty system).
     pub fn new_with_per_row_dims(per_row_dims: Vec<usize>, k: usize) -> Self {
+        Self::new_with_per_row_dims_and_hbb(per_row_dims, k, Array2::<f64>::zeros((k, k)))
+    }
+
+    /// Allocate a heterogeneous-row system using a caller-owned dense
+    /// shared-block buffer. See [`Self::new_with_hbb`] for the reuse contract.
+    pub fn new_with_per_row_dims_and_hbb(
+        per_row_dims: Vec<usize>,
+        k: usize,
+        mut hbb: Array2<f64>,
+    ) -> Self {
+        assert_eq!(hbb.dim(), (k, k));
+        hbb.fill(0.0);
         let n = per_row_dims.len();
         let max_d = per_row_dims.iter().copied().max().unwrap_or(0);
         let row_dims: Arc<[usize]> = per_row_dims.iter().copied().collect::<Vec<_>>().into();
@@ -2786,7 +2808,7 @@ impl ArrowSchurSystem {
             .collect();
         let mut sys = Self {
             rows,
-            hbb: Array2::<f64>::zeros((k, k)),
+            hbb,
             hbb_matvec: None,
             htbeta_matvec: None,
             htbeta_transpose_matvec: None,
