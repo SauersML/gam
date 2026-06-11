@@ -2807,7 +2807,11 @@ impl SurvivalLocationScaleFamily {
             .map(|_| &block_states[Self::BLOCK_LINK_WIGGLE].eta);
         if eta_time.len() != 3 * n {
             return Err(SurvivalLocationScaleError::DimensionMismatch {
-                reason: "survival location-scale time eta dimension mismatch".to_string(),
+                reason: format!(
+                    "survival location-scale time eta length mismatch: got {}, expected {}",
+                    eta_time.len(),
+                    3 * n
+                ),
             }
             .into());
         }
@@ -2874,7 +2878,10 @@ impl SurvivalLocationScaleFamily {
             && w.len() != n
         {
             return Err(SurvivalLocationScaleError::DimensionMismatch {
-                reason: "survival location-scale wiggle eta dimension mismatch".to_string(),
+                reason: format!(
+                    "survival location-scale wiggle eta length mismatch: got {}, expected {n}",
+                    w.len()
+                ),
             }
             .into());
         }
