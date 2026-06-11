@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+import concurrent.futures
 import csv
 import json
 import math
+import os
 import time
 import traceback
 from pathlib import Path
@@ -144,15 +146,23 @@ def predict_vector(model: Any, theta: np.ndarray) -> np.ndarray:
     return np.asarray(pred, dtype=np.float64)
 
 
+def worker_gamfit() -> Any:
+    os.environ["RAYON_NUM_THREADS"] = "4"
+    import gamfit
+
+    return gamfit
+
+
 def fit_layer_chart(
-    gamfit: Any,
-    acts: np.ndarray,
+    bank: str,
     hue: np.ndarray,
     layer: int,
     n_iter: int,
     seed: int,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     t0 = time.time()
+    gamfit = worker_gamfit()
+    acts = np.load(Path(bank) / "activations.npy", mmap_mode="r")
     x = standardize_layer(acts, layer)
     model = gamfit.sae_manifold_fit(
         X=x,
@@ -181,7 +191,6 @@ def fit_layer_chart(
 
 
 def fit_transport(
-    gamfit: Any,
     theta_current: np.ndarray,
     theta_next: np.ndarray,
     layer_current: int,
@@ -190,6 +199,7 @@ def fit_transport(
     grid_size: int,
 ) -> dict[str, Any]:
     t0 = time.time()
+    gamfit = worker_gamfit()
     data = {
         "theta": theta_current,
         "cos_next": np.cos(theta_next),
@@ -309,8 +319,6 @@ def main() -> None:
     parser.add_argument("--profile-prefix", default=DEFAULT_PROFILE_PREFIX)
     args = parser.parse_args()
 
-    import gamfit
-
     bank = Path(args.bank)
     out = Path(args.out)
     profile_prefix = Path(args.profile_prefix)
@@ -336,37 +344,61 @@ def main() -> None:
     write_report(out, report)
 
     theta_by_layer: dict[int, np.ndarray] = {}
-    for layer in layers:
-        print(f"[chart] fitting layer {layer}", flush=True)
-        try:
-            theta, entry = fit_layer_chart(
-                gamfit, acts, hue, layer, args.n_iter, args.seed + layer
+    chart_failed = False
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=min(len(layers), 4)
+    ) as executor:
+        chart_futures = {}
+        for layer in layers:
+            print(f"[chart] fitting layer {layer}", flush=True)
+            future = executor.submit(
+                fit_layer_chart,
+                str(bank),
+                hue,
+                layer,
+                args.n_iter,
+                args.seed + layer,
             )
-        except Exception as exc:
-            entry = {
-                "layer": layer,
-                "status": "error",
-                "error": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc()[-4000:],
-            }
+            chart_futures[future] = layer
+
+        for future in concurrent.futures.as_completed(chart_futures):
+            layer = chart_futures[future]
+            try:
+                theta, entry = future.result()
+            except Exception as exc:
+                chart_failed = True
+                entry = {
+                    "layer": layer,
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc()[-4000:],
+                }
+            else:
+                entry["status"] = "ok"
+                theta_by_layer[layer] = theta
             report["layer_fits"].append(entry)
             write_report(out, report)
-            raise
-        entry["status"] = "ok"
-        theta_by_layer[layer] = theta
-        report["layer_fits"].append(entry)
-        write_report(out, report)
-        print(
-            f"[chart] layer {layer} corr={entry['hue_circular_corr']:.4f} "
-            f"r2={entry['reconstruction_r2']} {entry['seconds']:.1f}s",
-            flush=True,
-        )
+            if entry["status"] == "ok":
+                print(
+                    f"[chart] layer {layer} corr={entry['hue_circular_corr']:.4f} "
+                    f"r2={entry['reconstruction_r2']} {entry['seconds']:.1f}s",
+                    flush=True,
+                )
+            else:
+                print(f"[chart] layer {layer} status=error", flush=True)
+    if chart_failed:
+        raise RuntimeError("one or more layer chart fits failed")
 
-    for left, right in zip(layers[:-1], layers[1:]):
-        print(f"[transport] fitting {left}->{right}", flush=True)
-        try:
-            entry = fit_transport(
-                gamfit,
+    pairs = list(zip(layers[:-1], layers[1:]))
+    transport_failed = False
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=min(len(pairs), 4)
+    ) as executor:
+        transport_futures = {}
+        for left, right in pairs:
+            print(f"[transport] fitting {left}->{right}", flush=True)
+            future = executor.submit(
+                fit_transport,
                 theta_by_layer[left],
                 theta_by_layer[right],
                 left,
@@ -374,25 +406,36 @@ def main() -> None:
                 args.transport_k,
                 args.grid_size,
             )
-        except Exception as exc:
-            entry = {
-                "layer_pair": [left, right],
-                "status": "error",
-                "error": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc()[-4000:],
-            }
+            transport_futures[future] = (left, right)
+
+        for future in concurrent.futures.as_completed(transport_futures):
+            left, right = transport_futures[future]
+            try:
+                entry = future.result()
+            except Exception as exc:
+                transport_failed = True
+                entry = {
+                    "layer_pair": [left, right],
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc()[-4000:],
+                }
+            else:
+                entry["status"] = "ok"
             report["transports"].append(entry)
             write_report(out, report)
-            raise
-        entry["status"] = "ok"
-        report["transports"].append(entry)
-        write_report(out, report)
-        print(
-            f"[transport] {left}->{right} corr={entry['mapped_actual_circular_corr']:.4f} "
-            f"defect_mean={entry['isometry_defect_mean']:.4f} "
-            f"winding={entry['winding_number']:.3f} {entry['seconds']:.1f}s",
-            flush=True,
-        )
+            if entry["status"] == "ok":
+                print(
+                    f"[transport] {left}->{right} "
+                    f"corr={entry['mapped_actual_circular_corr']:.4f} "
+                    f"defect_mean={entry['isometry_defect_mean']:.4f} "
+                    f"winding={entry['winding_number']:.3f} {entry['seconds']:.1f}s",
+                    flush=True,
+                )
+            else:
+                print(f"[transport] {left}->{right} status=error", flush=True)
+    if transport_failed:
+        raise RuntimeError("one or more transport fits failed")
 
     write_profile(profile_prefix, report["transports"])
     report["profile_csv"] = str(profile_prefix.with_suffix(".csv"))

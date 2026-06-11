@@ -29,7 +29,9 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import os
 import time
 import traceback
 
@@ -173,11 +175,18 @@ def official_topk_sae_eval(ckpt_path: str, X_raw: torch.Tensor,
 TOPOLOGY_DEFAULT_DIM = {"circle": 1, "sphere": 2, "torus": 2, "euclidean": 3}
 
 
+def worker_gamfit():
+    os.environ["RAYON_NUM_THREADS"] = "4"
+    import gamfit
+
+    return gamfit
+
+
 def run_candidate(Xn64: np.ndarray, k: int, topology: str, d_atom: int,
                   n_iter: int, seed: int, assignment: str, top_k: int | None,
                   mu: np.ndarray | None = None, sigma: np.ndarray | None = None,
                   X_raw: np.ndarray | None = None) -> dict:
-    import gamfit
+    gamfit = worker_gamfit()
 
     t0 = time.time()
     out: dict = {"topology": topology, "K": k, "d_atom": d_atom,
@@ -282,19 +291,55 @@ def main() -> None:
         print(f"[baseline] {report['vanilla']}", flush=True)
 
     Xn64 = Xn.double().numpy()
-    for topo in [t.strip() for t in args.topologies.split(",") if t.strip()]:
-        d = args.d_atom if args.d_atom is not None else TOPOLOGY_DEFAULT_DIM.get(topo, 2)
-        print(f"[fit] topology={topo} K={args.k} d={d} n_iter={args.n_iter}", flush=True)
-        res = run_candidate(Xn64, args.k, topo, d, args.n_iter, args.seed,
-                            args.assignment, args.top_k,
-                            mu=mu.numpy().astype(np.float64),
-                            sigma=sigma.numpy().astype(np.float64),
-                            X_raw=X_raw.numpy().astype(np.float64))
-        print(f"[fit] -> status={res['status']} ev={res.get('ev')} "
-              f"reml={res.get('reml_score')} {res['seconds']:.1f}s", flush=True)
-        report["candidates"].append(res)
-        with open(args.out, "w") as f:
-            json.dump(report, f, indent=2, default=str)
+    topologies = [t.strip() for t in args.topologies.split(",") if t.strip()]
+    mu64 = mu.numpy().astype(np.float64)
+    sigma64 = sigma.numpy().astype(np.float64)
+    x_raw64 = X_raw.numpy().astype(np.float64)
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=min(len(topologies), 4)
+    ) as executor:
+        futures = {}
+        for topo in topologies:
+            d = args.d_atom if args.d_atom is not None else TOPOLOGY_DEFAULT_DIM.get(topo, 2)
+            print(f"[fit] topology={topo} K={args.k} d={d} n_iter={args.n_iter}", flush=True)
+            future = executor.submit(
+                run_candidate,
+                Xn64,
+                args.k,
+                topo,
+                d,
+                args.n_iter,
+                args.seed,
+                args.assignment,
+                args.top_k,
+                mu=mu64,
+                sigma=sigma64,
+                X_raw=x_raw64,
+            )
+            futures[future] = (topo, d)
+
+        for future in concurrent.futures.as_completed(futures):
+            topo, d = futures[future]
+            try:
+                res = future.result()
+            except Exception as exc:
+                res = {
+                    "topology": topo,
+                    "K": args.k,
+                    "d_atom": d,
+                    "assignment": args.assignment,
+                    "n_iter": args.n_iter,
+                    "seed": args.seed,
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc()[-2000:],
+                }
+            seconds = res.get("seconds", 0.0)
+            print(f"[fit] -> status={res['status']} ev={res.get('ev')} "
+                  f"reml={res.get('reml_score')} {seconds:.1f}s", flush=True)
+            report["candidates"].append(res)
+            with open(args.out, "w") as f:
+                json.dump(report, f, indent=2, default=str)
     with open(args.out, "w") as f:
         json.dump(report, f, indent=2, default=str)
     print(f"[done] wrote {args.out}", flush=True)
