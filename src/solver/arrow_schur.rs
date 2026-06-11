@@ -1849,8 +1849,10 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         // independent same-size SPD systems — exactly the batch
         // `crate::gpu::try_cholesky_batched_lower_inplace` spreads across ALL
         // usable devices (the batched POTRF tiles over the pool). It is only
-        // valid when every row is the uniform `d×d` shape (heterogeneous rows
-        // keep the per-row CPU loop) and only succeeds when EVERY block is PD at
+        // valid when every row is the uniform `d×d` shape; heterogeneous row
+        // dimensions keep the per-row CPU loop because the current cuSOLVER
+        // batched POTRF wrapper accepts one `(d, d)` shape per launch. It only
+        // succeeds when EVERY block is PD at
         // the base ridge; a non-PD block returns `None`, so we fall back to the
         // exact per-row CPU path that performs minimal per-block ridge
         // escalation. After a successful batched factorization we re-apply the
@@ -1882,7 +1884,13 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         factor: ArrayView2<'_, f64>,
         rhs: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        cholesky_solve_vector(factor, rhs)
+        match (factor.nrows(), factor.ncols(), rhs.len()) {
+            (1, 1, 1) => cholesky_solve_vector_fixed::<1>(factor, rhs),
+            (2, 2, 2) => cholesky_solve_vector_fixed::<2>(factor, rhs),
+            (3, 3, 3) => cholesky_solve_vector_fixed::<3>(factor, rhs),
+            (4, 4, 4) => cholesky_solve_vector_fixed::<4>(factor, rhs),
+            _ => cholesky_solve_vector(factor, rhs),
+        }
     }
 
     fn solve_block_matrix(
@@ -1959,7 +1967,8 @@ fn try_factor_blocks_batched(
     if d == 0 || rows.is_empty() {
         return None;
     }
-    // Uniform-shape gate: a heterogeneous row defeats the single batched POTRF.
+    // Uniform-shape gate: a heterogeneous row defeats the single-shape batched
+    // POTRF and deliberately falls through to per-row CPU escalation.
     if rows
         .iter()
         .any(|row| row.htt.dim() != (d, d) || row.gt.len() != d)
@@ -2089,6 +2098,114 @@ fn safe_spd_kappa_max(dim: usize) -> f64 {
     1.0 / (f64::EPSILON.sqrt() * d_scale)
 }
 
+fn factor_row_block_cholesky(
+    row: &ArrowRowBlock,
+    ridge_eff: f64,
+    d: usize,
+) -> Result<Array2<f64>, String> {
+    match d {
+        1 => factor_row_block_cholesky_fixed::<1>(row, ridge_eff),
+        2 => factor_row_block_cholesky_fixed::<2>(row, ridge_eff),
+        3 => factor_row_block_cholesky_fixed::<3>(row, ridge_eff),
+        4 => factor_row_block_cholesky_fixed::<4>(row, ridge_eff),
+        _ => factor_row_block_cholesky_dynamic(row, ridge_eff, d),
+    }
+}
+
+fn factor_row_block_cholesky_dynamic(
+    row: &ArrowRowBlock,
+    ridge_eff: f64,
+    d: usize,
+) -> Result<Array2<f64>, String> {
+    let mut block = row.htt.clone();
+    for a in 0..d {
+        block[[a, a]] += ridge_eff;
+    }
+    cholesky_lower(&block)
+}
+
+fn factor_row_block_cholesky_fixed<const D: usize>(
+    row: &ArrowRowBlock,
+    ridge_eff: f64,
+) -> Result<Array2<f64>, String> {
+    for i in 0..D {
+        for j in 0..D {
+            let value = if i == j {
+                row.htt[[i, j]] + ridge_eff
+            } else {
+                row.htt[[i, j]]
+            };
+            if !value.is_finite() {
+                let idx = i * D + j;
+                return Err(format!(
+                    "cholesky_lower: non-finite entry at linear index {idx}"
+                ));
+            }
+        }
+    }
+
+    let mut l = [[0.0_f64; D]; D];
+    for i in 0..D {
+        for j in 0..=i {
+            let mut sum = if i == j {
+                row.htt[[i, j]] + ridge_eff
+            } else {
+                row.htt[[i, j]]
+            };
+            for kk in 0..j {
+                sum -= l[i][kk] * l[j][kk];
+            }
+            if i == j {
+                if !sum.is_finite() || sum <= 0.0 {
+                    return Err(format!(
+                        "non-PD pivot {sum} at index {i} (matrix is not positive definite)"
+                    ));
+                }
+                l[i][j] = sum.sqrt();
+            } else {
+                l[i][j] = sum / l[j][j];
+            }
+        }
+    }
+
+    let mut out = Array2::<f64>::zeros((D, D));
+    for i in 0..D {
+        for j in 0..=i {
+            out[[i, j]] = l[i][j];
+        }
+    }
+    Ok(out)
+}
+
+fn cholesky_solve_vector_fixed<const D: usize>(
+    l: ArrayView2<'_, f64>,
+    b: ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let mut y = [0.0_f64; D];
+    for i in 0..D {
+        let mut sum = b[i];
+        for k in 0..i {
+            sum -= l[[i, k]] * y[k];
+        }
+        y[i] = sum / l[[i, i]];
+    }
+
+    let mut x = [0.0_f64; D];
+    for i in (0..D).rev() {
+        let mut sum = y[i];
+        for k in (i + 1)..D {
+            sum -= l[[k, i]] * x[k];
+        }
+        x[i] = sum / l[[i, i]];
+    }
+
+    let mut out = Array1::<f64>::zeros(D);
+    for i in 0..D {
+        out[i] = x[i];
+    }
+    out
+}
+
 fn factor_one_row(
     row: &ArrowRowBlock,
     ridge_t: f64,
@@ -2158,11 +2275,7 @@ fn factor_one_row(
     // is bit-for-bit unchanged; only a block that cannot be conditioned even at
     // `ridge_cap` (1e12 × base) still surfaces an error for the outer loop.
     let factor = loop {
-        let mut block = row.htt.clone();
-        for a in 0..d {
-            block[[a, a]] += ridge_eff;
-        }
-        match cholesky_lower(&block) {
+        match factor_row_block_cholesky(row, ridge_eff, d) {
             Ok(factor) => {
                 // Evidence/log-det-only callers tolerate ill-conditioning: the
                 // factor is genuinely PD, so its diagonal gives an exact log|S|
@@ -6085,7 +6198,12 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
 
     // Stack into (total_d × k) left/right matrices for one device AᵀB GEMM on
     // this tile's bound ordinal. `try_fast_atb_on_ordinal` returns leftᵀ·right
-    // (k×k); negate into the partial.
+    // (k×k); negate into the partial. At an SAE-shaped whole-fit tile with
+    // n=2000 rows, k=2048 shared columns, M=12 local rows per observation, and
+    // K=8 candidate/atom batches, the stacked GEMM is
+    // 2*(n*M)*k^2 = 201_326_592_000 flops per batch, or
+    // 1_610_612_736_000 flops across K=8, so the policy work gate is cleared
+    // even though the observation count is far below the old row floor.
     if total_d > 0 && k > 0 {
         let mut left_stack = Array2::<f64>::zeros((total_d, k));
         let mut right_stack = Array2::<f64>::zeros((total_d, k));
@@ -9183,5 +9301,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn fixed_row_kernel_fixture<const D: usize>() -> (ArrowRowBlock, Array1<f64>) {
+        let mut row = ArrowRowBlock::new(D, 0);
+        for r in 0..D {
+            for c in 0..D {
+                row.htt[[r, c]] = if r == c {
+                    4.0 + r as f64
+                } else {
+                    0.03125 * ((r + c + 1) as f64)
+                };
+            }
+        }
+        let rhs = Array1::from_iter((0..D).map(|i| 0.5 + i as f64 * 0.25));
+        (row, rhs)
+    }
+
+    fn assert_fixed_row_kernels_match_dynamic<const D: usize>() {
+        let (row, rhs) = fixed_row_kernel_fixture::<D>();
+        let ridge = 0.125_f64;
+        let fixed = factor_row_block_cholesky_fixed::<D>(&row, ridge).expect("fixed factor");
+        let dynamic = factor_row_block_cholesky_dynamic(&row, ridge, D).expect("dynamic factor");
+        for r in 0..D {
+            for c in 0..D {
+                assert_eq!(
+                    fixed[[r, c]].to_bits(),
+                    dynamic[[r, c]].to_bits(),
+                    "factor mismatch at D={D} ({r},{c})"
+                );
+            }
+        }
+
+        let fixed_solve = cholesky_solve_vector_fixed::<D>(fixed.view(), rhs.view());
+        let dynamic_solve = cholesky_solve_vector(dynamic.view(), rhs.view());
+        for i in 0..D {
+            assert_eq!(
+                fixed_solve[i].to_bits(),
+                dynamic_solve[i].to_bits(),
+                "solve mismatch at D={D} index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_row_kernels_match_dynamic_path_bitwise() {
+        assert_fixed_row_kernels_match_dynamic::<1>();
+        assert_fixed_row_kernels_match_dynamic::<2>();
+        assert_fixed_row_kernels_match_dynamic::<3>();
+        assert_fixed_row_kernels_match_dynamic::<4>();
     }
 }
