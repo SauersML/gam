@@ -14,6 +14,8 @@ macro_rules! gam_binary {
 pub fn run_or_panic(mut command: Command, label: &str) {
     let output = command
         .output()
+        // SAFETY: test-support helper intentionally panics with command context
+        // when the child process cannot even be spawned.
         .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
     assert!(
         output.status.success(),
@@ -27,8 +29,12 @@ pub fn run_or_panic(mut command: Command, label: &str) {
 pub fn run_capture_or_panic(mut command: Command, label: &str) -> String {
     let output = command
         .output()
+        // SAFETY: test-support helper intentionally panics with command context
+        // when the child process cannot even be spawned.
         .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
     if !output.status.success() {
+        // SAFETY: test-support helper intentionally panics with captured child
+        // output so failed CLI invocations preserve the relevant diagnostics.
         panic!(
             "`{label}` failed with status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
             output.status,

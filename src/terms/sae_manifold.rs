@@ -8739,23 +8739,8 @@ impl SaeManifoldTerm {
                 .map(|row| row.gt.iter().map(|&v| v * v).sum::<f64>())
                 .sum::<f64>()
                 + sys.gb.iter().map(|&v| v * v).sum::<f64>();
-            let mut iterate_norm_sq = 0.0_f64;
-            for &v in self.assignment.logits.iter() {
-                iterate_norm_sq += v * v;
-            }
-            for coords in &self.assignment.coords {
-                let matrix = coords.as_matrix();
-                for &v in matrix.iter() {
-                    iterate_norm_sq += v * v;
-                }
-            }
-            for atom in &self.atoms {
-                for &v in atom.decoder_coefficients.iter() {
-                    iterate_norm_sq += v * v;
-                }
-            }
             let grad_norm = grad_norm_sq.sqrt();
-            let iterate_scale = 1.0 + iterate_norm_sq.sqrt();
+            let iterate_scale = self.inner_iterate_scale();
             // Relative parameter-step tolerance for Δ (well-conditioned charts)
             // and a scaled KKT-gradient tolerance. Convergence is accepted on
             // EITHER a small KKT gradient OR a small undamped Newton step: SAE
@@ -11769,6 +11754,31 @@ impl SaeManifoldTerm {
         Ok(weights)
     }
 
+    /// The iterate scale `1 + ‖(logits, coords, decoder)‖` used to make the
+    /// inner KKT gradient and Newton-step tolerances relative. This is the
+    /// SINGLE source of truth for that scale: `reml_criterion`'s convergence
+    /// gate and `run_joint_fit_arrow_schur`'s non-descent stationarity gate
+    /// must agree on it, or a point one of them calls converged is mid-flight
+    /// to the other (the objective↔gradient desync class).
+    fn inner_iterate_scale(&self) -> f64 {
+        let mut iterate_norm_sq = 0.0_f64;
+        for &v in self.assignment.logits.iter() {
+            iterate_norm_sq += v * v;
+        }
+        for coords in &self.assignment.coords {
+            let matrix = coords.as_matrix();
+            for &v in matrix.iter() {
+                iterate_norm_sq += v * v;
+            }
+        }
+        for atom in &self.atoms {
+            for &v in atom.decoder_coefficients.iter() {
+                iterate_norm_sq += v * v;
+            }
+        }
+        1.0 + iterate_norm_sq.sqrt()
+    }
+
     fn quotient_newton_step_norm_sq(
         &self,
         delta_ext_coord: ArrayView1<'_, f64>,
@@ -12880,20 +12890,48 @@ impl SaeManifoldTerm {
             let snapshot = self.snapshot_mutable_state();
             let pre_step_total =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
-            if !(pre_step_total.is_finite()
-                && directional_decrease.is_finite()
-                && directional_decrease > 0.0
-                && directional_decrease > directional_decrease_floor)
-            {
+            if !pre_step_total.is_finite() {
                 // Pre-step state is unperturbed here; restore is a no-op but
                 // keeps the invariant explicit.
                 self.restore_mutable_state(&snapshot);
                 break;
             }
+            // A non-descent Newton direction (gᵀΔ ≤ 0 or below the rounding
+            // floor) is only a STOPPING criterion when the iterate is actually
+            // stationary: the floor exists for benign ill-conditioned
+            // near-convergence, where `gᵀΔ` collapses to rounding noise while
+            // ‖g‖ is already tiny. In degenerate multi-atom geometry (gate
+            // tug-of-war, rank-deficient duchon columns) the LM solve factors
+            // with a near-zero pivot, the step is dominated by that near-null
+            // direction, and `gᵀΔ/(‖g‖·‖Δ‖)` collapses while ‖g‖ is HUGE —
+            // breaking there silently froze the iterate and let the
+            // `reml_criterion` refine loop re-measure the same point until its
+            // budget died (the constant-‖g‖=1e12 signature). Gate the break on
+            // genuine KKT stationarity — the SAME iterate-scaled tolerance
+            // `reml_criterion` uses — and otherwise fall through to the
+            // proximal-correction ridge escalation below: heavier LM damping
+            // bends the step toward steepest descent, which is always a
+            // descent direction for a consistent gradient.
+            let descent_direction_ok = directional_decrease.is_finite()
+                && directional_decrease > 0.0
+                && directional_decrease > directional_decrease_floor;
+            if !descent_direction_ok {
+                let grad_tolerance =
+                    SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.inner_iterate_scale();
+                if grad_norm_sq.sqrt() <= grad_tolerance {
+                    self.restore_mutable_state(&snapshot);
+                    break;
+                }
+            }
 
             let mut trial_step_size = step_size;
             let mut accepted = false;
             for halving in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
+                if !descent_direction_ok {
+                    // No Armijo bound is meaningful along a non-descent
+                    // direction; route straight to the proximal correction.
+                    break;
+                }
                 if halving > 0 {
                     // Reset to the pre-step state before re-applying at the
                     // halved step. The first trial starts from the pre-step

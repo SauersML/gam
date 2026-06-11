@@ -19,14 +19,9 @@
 //! (`FittedModel::axis_clip_to_training_ranges` clamping linear-term columns).
 //! Once the clamp skips linear-term columns, both pass.
 
-use std::path::{Path, PathBuf};
+use gam::test_support::cli_harness::run_or_panic;
+use std::path::Path;
 use std::process::Command;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 const SLOPE: f64 = 1.25;
 const INTERCEPT: f64 = 0.5;
@@ -60,19 +55,6 @@ fn write_predict_csv(path: &Path, xs: &[f64]) {
             .expect("write predict row");
     }
     writer.flush().expect("flush predict csv");
-}
-
-fn run_or_panic(mut command: Command, label: &str) {
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
-    assert!(
-        output.status.success(),
-        "`{label}` failed with status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
 }
 
 fn read_column(path: &Path, name: &str) -> Vec<f64> {
@@ -112,7 +94,7 @@ fn linear_term_prediction_se_grows_outside_training_range() {
     probes.extend_from_slice(&probes_neg);
     write_predict_csv(&predict_path, &probes);
 
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&train_path)
@@ -122,7 +104,7 @@ fn linear_term_prediction_se_grows_outside_training_range() {
         .arg(&model_path);
     run_or_panic(fit_cmd, "gam fit y ~ x (gaussian)");
 
-    let mut predict_cmd = Command::new(gam_binary());
+    let mut predict_cmd = Command::new(gam::gam_binary!());
     predict_cmd
         .arg("predict")
         .arg(&model_path)

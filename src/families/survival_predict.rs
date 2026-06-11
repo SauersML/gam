@@ -2012,6 +2012,167 @@ fn prepared_sigma_design_view(
     &input.x_log_sigma
 }
 
+pub(crate) struct LocationScaleEtaComponents {
+    pub h: Array1<f64>,
+    pub time_jac: Array2<f64>,
+    pub eta_t: Array1<f64>,
+    pub eta_ls: Array1<f64>,
+    pub inv_sigma: Array1<f64>,
+    time_wiggle_dq: Option<Array1<f64>>,
+}
+
+pub(crate) struct LocationScaleTimeWarpComponents {
+    pub(crate) h: Array1<f64>,
+    pub(crate) time_jac: Array2<f64>,
+    pub(crate) time_wiggle_dq: Option<Array1<f64>>,
+}
+
+pub(crate) fn location_scale_time_warp_components(
+    x_time_exit: &Array2<f64>,
+    eta_time_offset_exit: &Array1<f64>,
+    time_wiggle_knots: Option<&Array1<f64>>,
+    time_wiggle_degree: Option<usize>,
+    time_wiggle_ncols: usize,
+    fit: &UnifiedFitResult,
+) -> Result<LocationScaleTimeWarpComponents, String> {
+    let n = x_time_exit.nrows();
+    if eta_time_offset_exit.len() != n {
+        return Err(
+            "survival location-scale time-warp row mismatch across inputs".to_string(),
+        );
+    }
+    let beta_time = fit.beta_time();
+    if x_time_exit.ncols() != beta_time.len() {
+        return Err(format!(
+            "survival location-scale time-warp design mismatch: x_exit={} beta_time={}",
+            x_time_exit.ncols(),
+            beta_time.len()
+        ));
+    }
+
+    let p_time_total = beta_time.len();
+    let p_wiggle = time_wiggle_ncols.min(p_time_total);
+    let p_base = p_time_total - p_wiggle;
+    let beta_base = beta_time.slice(s![..p_base]).to_owned();
+    let h_base = if p_base > 0 {
+        x_time_exit.slice(s![.., ..p_base]).dot(&beta_base) + eta_time_offset_exit
+    } else {
+        eta_time_offset_exit.clone()
+    };
+    let mut h = h_base.clone();
+    let mut time_jac = x_time_exit.clone();
+    let mut time_wiggle_dq = None;
+    if p_wiggle > 0 {
+        if x_time_exit
+            .slice(s![.., p_base..p_time_total])
+            .iter()
+            .any(|&value| value != 0.0)
+        {
+            return Err(
+                "survival location-scale timewiggle prediction requires zero placeholder tail columns"
+                    .to_string(),
+            );
+        }
+        let knots = time_wiggle_knots.ok_or_else(|| {
+            "survival location-scale time-warp: timewiggle coefficients are missing knot metadata"
+                .to_string()
+        })?;
+        let degree = time_wiggle_degree.ok_or_else(|| {
+            "survival location-scale time-warp: timewiggle coefficients are missing degree metadata"
+                .to_string()
+        })?;
+        let beta_w = beta_time.slice(s![p_base..p_time_total]).to_owned();
+        let time_basis =
+            crate::families::wiggle::monotone_wiggle_basis_with_derivative_order(
+                h_base.view(),
+                knots,
+                degree,
+                0,
+            )?;
+        let time_basis_d1 =
+            crate::families::wiggle::monotone_wiggle_basis_with_derivative_order(
+                h_base.view(),
+                knots,
+                degree,
+                1,
+            )?;
+        if time_basis.ncols() != p_wiggle || time_basis_d1.ncols() != p_wiggle {
+            return Err(format!(
+                "survival location-scale time-warp timewiggle mismatch: value basis has {} columns, derivative basis has {}, beta has {}",
+                time_basis.ncols(),
+                time_basis_d1.ncols(),
+                p_wiggle
+            ));
+        }
+        let dq = time_basis_d1.dot(&beta_w) + 1.0;
+        h = &h_base + &time_basis.dot(&beta_w);
+        time_jac = Array2::<f64>::zeros((n, p_time_total));
+        if p_base > 0 {
+            let scaled_base = crate::families::survival_location_scale::scale_dense_rows(
+                &x_time_exit.slice(s![.., ..p_base]).to_owned(),
+                &dq,
+            )?;
+            time_jac.slice_mut(s![.., ..p_base]).assign(&scaled_base);
+        }
+        time_jac
+            .slice_mut(s![.., p_base..p_time_total])
+            .assign(&time_basis);
+        time_wiggle_dq = Some(dq);
+    }
+
+    Ok(LocationScaleTimeWarpComponents {
+        h,
+        time_jac,
+        time_wiggle_dq,
+    })
+}
+
+pub(crate) fn location_scale_eta_components(
+    x_time_exit: &Array2<f64>,
+    eta_time_offset_exit: &Array1<f64>,
+    time_wiggle_knots: Option<&Array1<f64>>,
+    time_wiggle_degree: Option<usize>,
+    time_wiggle_ncols: usize,
+    x_threshold: &crate::matrix::DesignMatrix,
+    eta_threshold_offset: &Array1<f64>,
+    x_log_sigma: &crate::matrix::DesignMatrix,
+    eta_log_sigma_offset: &Array1<f64>,
+    fit: &UnifiedFitResult,
+) -> Result<LocationScaleEtaComponents, String> {
+    let n = x_time_exit.nrows();
+    if x_threshold.nrows() != n
+        || eta_threshold_offset.len() != n
+        || x_log_sigma.nrows() != n
+        || eta_log_sigma_offset.len() != n
+    {
+        return Err(
+            "survival location-scale eta component row mismatch across inputs".to_string(),
+        );
+    }
+    let time_components = location_scale_time_warp_components(
+        x_time_exit,
+        eta_time_offset_exit,
+        time_wiggle_knots,
+        time_wiggle_degree,
+        time_wiggle_ncols,
+        fit,
+    )?;
+    let beta_threshold = fit.beta_threshold();
+    let beta_log_sigma = fit.beta_log_sigma();
+    let eta_t = x_threshold.matrixvectormultiply(&beta_threshold) + eta_threshold_offset;
+    let eta_ls = x_log_sigma.matrixvectormultiply(&beta_log_sigma) + eta_log_sigma_offset;
+    let inv_sigma = eta_ls
+        .mapv(crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar);
+    Ok(LocationScaleEtaComponents {
+        h: time_components.h,
+        time_jac: time_components.time_jac,
+        eta_t,
+        eta_ls,
+        inv_sigma,
+        time_wiggle_dq: time_components.time_wiggle_dq,
+    })
+}
+
 fn location_scale_eta_derivative_components(
     x_time_derivative: &Array2<f64>,
     derivative_offset_exit: &Array1<f64>,
@@ -2045,41 +2206,22 @@ fn location_scale_eta_derivative_components(
         ));
     }
 
+    let time_components = location_scale_time_warp_components(
+        x_time_exit,
+        eta_time_offset_exit,
+        time_wiggle_knots,
+        time_wiggle_degree,
+        time_wiggle_ncols,
+        fit,
+    )?;
     let beta_base = beta_time.slice(s![..p_base]).to_owned();
     let mut eta_derivative = if p_base > 0 {
         x_time_derivative.dot(&beta_base) + derivative_offset_exit
     } else {
         derivative_offset_exit.clone()
     };
-    if p_wiggle > 0 {
-        let knots = time_wiggle_knots.ok_or_else(|| {
-            "survival location-scale hazard derivative: timewiggle coefficients are missing knot metadata"
-                .to_string()
-        })?;
-        let degree = time_wiggle_degree.ok_or_else(|| {
-            "survival location-scale hazard derivative: timewiggle coefficients are missing degree metadata"
-                .to_string()
-        })?;
-        let beta_w = beta_time.slice(s![p_base..p_time_total]).to_owned();
-        let h_base = if p_base > 0 {
-            x_time_exit.slice(s![.., ..p_base]).dot(&beta_base) + eta_time_offset_exit
-        } else {
-            eta_time_offset_exit.clone()
-        };
-        let basis_d1 = crate::families::wiggle::monotone_wiggle_basis_with_derivative_order(
-            h_base.view(),
-            knots,
-            degree,
-            1,
-        )?;
-        if basis_d1.ncols() != p_wiggle {
-            return Err(format!(
-                "survival location-scale hazard derivative timewiggle mismatch: derivative basis has {} columns but beta has {}",
-                basis_d1.ncols(),
-                p_wiggle
-            ));
-        }
-        eta_derivative *= &(basis_d1.dot(&beta_w) + 1.0);
+    if let Some(dq) = time_components.time_wiggle_dq.as_ref() {
+        eta_derivative *= dq;
     }
     if eta_derivative
         .iter()
