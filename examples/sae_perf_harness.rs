@@ -18,13 +18,13 @@ use ndarray::{Array1, Array2};
 
 const TAU: f64 = 0.5;
 const ALPHA: f64 = 1.0;
-const LOG_LAMBDA_SPARSE: f64 = 0.0;
-const LOG_LAMBDA_SMOOTH: f64 = -4.0;
-const INNER_MAX_ITER: usize = 3;
+const LOG_LAMBDA_SPARSE: f64 = -12.0;
+const LOG_LAMBDA_SMOOTH: f64 = -12.0;
+const INNER_MAX_ITER: usize = 12;
 const OUTER_MAX_ITER: usize = 4;
-const LEARNING_RATE: f64 = 0.6;
-const RIDGE_EXT_COORD: f64 = 1.0e-4;
-const RIDGE_BETA: f64 = 1.0e-4;
+const LEARNING_RATE: f64 = 1.0;
+const RIDGE_EXT_COORD: f64 = 1.0e-6;
+const RIDGE_BETA: f64 = 1.0e-6;
 const DEVICE_RIDGE_T: f64 = 0.0;
 const DEVICE_RIDGE_BETA: f64 = 0.0;
 const DEVICE_PARITY_TOL: f64 = 1.0e-10;
@@ -259,16 +259,11 @@ fn build_fixture(shape: Shape) -> Result<Fixture, String> {
         AssignmentMode::ibp_map(TAU, ALPHA, false),
     )?;
     let term = SaeManifoldTerm::new(atoms, assignment)?;
-    let mut target = term.fitted();
-    for row in 0..shape.n {
-        for col in 0..shape.p {
-            target[[row, col]] += 0.01 * rng.signed();
-        }
-    }
+    let target = term.fitted();
     let rho = SaeManifoldRho::new(
         LOG_LAMBDA_SPARSE,
         LOG_LAMBDA_SMOOTH,
-        vec![Array1::<f64>::zeros(shape.d); shape.k],
+        vec![Array1::<f64>::zeros(0); shape.k],
     );
     Ok(Fixture {
         shape,
