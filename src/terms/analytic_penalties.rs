@@ -10466,8 +10466,7 @@ mod tests {
                 range: 0..n_eff * p,
                 latent_dim: Some(p),
             };
-            let pen =
-                NuclearNormPenalty::new(target, 0.8, n_eff, 1.0e-3, max_rank, false).unwrap();
+            let pen = NuclearNormPenalty::new(target, 0.8, n_eff, 1.0e-3, max_rank, false).unwrap();
             let t_flat = Array1::from_vec(
                 (0..n_eff * p)
                     .map(|i| (0.3 * (i as f64) + 0.11).sin() + 0.05 * (i as f64 % 7.0))
