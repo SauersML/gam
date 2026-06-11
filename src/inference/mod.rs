@@ -26,6 +26,7 @@ pub mod probability;
 pub mod psis;
 pub mod quadrature;
 pub mod residual_factor;
+pub mod rho_posterior;
 pub mod row_measure;
 pub mod row_metric;
 pub mod sample;
