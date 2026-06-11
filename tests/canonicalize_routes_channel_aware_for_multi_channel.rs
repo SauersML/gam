@@ -217,8 +217,9 @@ fn post_canonicalize_t_is_identity_for_full_rank_3_block_case() {
     let canon =
         canonicalize_for_identifiability(&specs).expect("full-rank 3-block case must succeed");
 
-    // Each per-block T must be the identity (p × p) — no drops.
-    for (i, t) in canon.per_block_transform.iter().enumerate() {
+    // Each per-block gauge slice must be the identity (p × p) — no drops.
+    for i in 0..canon.gauge.n_blocks() {
+        let t = canon.gauge.block_transform(i);
         assert_eq!(
             t.nrows(),
             p,
