@@ -836,15 +836,6 @@ where
     Ok(out)
 }
 
-#[cfg(test)]
-fn summed_factor_gram(factors: &[Array2<f64>], ambient_dim: usize) -> Array2<f64> {
-    let mut total = Array2::<f64>::zeros((ambient_dim, ambient_dim));
-    for factor in factors {
-        add_factor_gram_scaled(&mut total, factor, 1.0);
-    }
-    total
-}
-
 fn stacked_factor_whitener(
     factors: &[Array2<f64>],
     ambient_dim: usize,
@@ -1002,6 +993,14 @@ mod tests {
     use ndarray::Array2;
     use ndarray::array;
     use std::sync::Arc;
+
+    fn summed_factor_gram(factors: &[Array2<f64>], ambient_dim: usize) -> Array2<f64> {
+        let mut total = Array2::<f64>::zeros((ambient_dim, ambient_dim));
+        for factor in factors {
+            add_factor_gram_scaled(&mut total, factor, 1.0);
+        }
+        total
+    }
 
     fn factors_from_rows(rows: &[Vec<f64>], p: usize, rank: usize) -> Arc<Array2<f64>> {
         let n = rows.len();
