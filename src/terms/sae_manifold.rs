@@ -2845,6 +2845,18 @@ pub struct SaeManifoldAtom {
     /// Activated automatically by [`Self::maybe_activate_decoder_frame`] when the
     /// decoder's effective column rank is materially below `p`; never a flag.
     pub decoder_frame: Option<GrassmannFrame>,
+    /// Curvature-homotopy dial `η ∈ [0, 1]` (#1007). [`Self::refresh_basis`]
+    /// scales every *curved* basis column (per
+    /// [`SaeBasisEvaluator::phi_eta_split`]) by `η`, leaving the *linear*
+    /// columns untouched, so `η = 0` is the Eckart-Young linear relaxation (a
+    /// convex decoder problem whose global optimum [`linear_span_anchor`]
+    /// certifies) and `η = 1` is the full curved basis. The certified tracker
+    /// walks `η` from `0 → 1`; every other caller sees the default `1.0`, which
+    /// makes [`Self::refresh_basis`] bit-for-bit identical to the un-dialed
+    /// `evaluate` path (`evaluate_phi_eta` at `η = 1` returns the unscaled
+    /// basis). Caller-managed atoms (no installed evaluator) ignore the dial —
+    /// there is no curved/linear split without an evaluator to provide it.
+    pub homotopy_eta: f64,
 }
 
 impl SaeManifoldAtom {
@@ -2901,6 +2913,7 @@ impl SaeManifoldAtom {
             basis_evaluator: None,
             basis_second_jet: None,
             decoder_frame: None,
+            homotopy_eta: 1.0,
         };
         // Seed `smooth_penalty` with the intrinsic Gram at the initial
         // decoder/coordinates so the very first assembly already reads the
