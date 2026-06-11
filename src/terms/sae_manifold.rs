@@ -4833,6 +4833,12 @@ pub struct SaeManifoldTerm {
     /// incoherence/curvature certificate-input report. `None` for synthetic terms
     /// or legacy internal callers that have not computed post-fit dispersion.
     certificate_dispersion: Option<f64>,
+    /// Outcome of the most recent curvature-homotopy entry walk (#1007), or
+    /// `None` when no walk has run (the seed cascade entry, or any consumer that
+    /// never invokes the tracker). Recorded on the fit payload so the bifurcation
+    /// / collapse outcome is observable — never a silent fallback. Cleared by
+    /// the objective's `reset` so each seed's walk reports only its own run.
+    curvature_walk_report: Option<CurvatureWalkReport>,
 }
 
 impl Clone for SaeManifoldTerm {
@@ -4848,6 +4854,7 @@ impl Clone for SaeManifoldTerm {
             last_frames_active: self.last_frames_active,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             certificate_dispersion: self.certificate_dispersion,
+            curvature_walk_report: self.curvature_walk_report.clone(),
         }
     }
 }
@@ -4929,6 +4936,7 @@ impl SaeManifoldTerm {
             last_frames_active: false,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             certificate_dispersion: None,
+            curvature_walk_report: None,
         })
     }
 
