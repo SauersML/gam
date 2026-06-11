@@ -35,8 +35,8 @@ use crate::families::identifiability_compiler::{
     BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
 use crate::linalg::faer_ndarray::{FaerEigh, fast_ab};
-use crate::solver::gauge::assemble_block_triangular_t;
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
+use crate::solver::gauge::assemble_block_triangular_t;
 use faer::Side;
 
 const K_SURVIVAL: usize = 4;
@@ -1901,6 +1901,7 @@ pub fn materialise_compiled_primary_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solver::gauge::Gauge;
 
     #[test]
     fn psd_clamp_zeros_negative_eigenvalues() {
@@ -2110,7 +2111,8 @@ mod tests {
         let v_b = Array2::<f64>::eye(2);
         let r_ab =
             Array2::<f64>::from_shape_fn((3, 2), |(i, j)| 1.0 + (i as f64) + 0.25 * (j as f64));
-        let t = assemble_block_triangular_t(&[v_a.clone(), v_b.clone()], &[None, Some(r_ab.clone())]);
+        let t =
+            assemble_block_triangular_t(&[v_a.clone(), v_b.clone()], &[None, Some(r_ab.clone())]);
         assert_eq!(t.dim(), (5, 4));
         for i in 0..3 {
             for j in 0..2 {
@@ -2274,7 +2276,8 @@ mod tests {
         let r_ab = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| {
             0.5 - 0.2 * (i as f64) + 0.1 * (j as f64)
         });
-        let t = assemble_block_triangular_t(&[v_a.clone(), v_b.clone()], &[None, Some(r_ab.clone())]);
+        let t =
+            assemble_block_triangular_t(&[v_a.clone(), v_b.clone()], &[None, Some(r_ab.clone())]);
         let raw_local =
             Array2::<f64>::from_shape_fn(
                 (2, 2),
@@ -2744,8 +2747,7 @@ mod tests {
         r_b[[1, 1]] = 1.3;
         r_b[[2, 0]] = -0.2;
         r_b[[2, 1]] = 0.5;
-        let lift =
-            Gauge::from_v_and_r(&[v_a.clone(), v_b.clone()], &[None, Some(r_b.clone())]);
+        let lift = Gauge::from_v_and_r(&[v_a.clone(), v_b.clone()], &[None, Some(r_b.clone())]);
         assert_eq!(lift.t_full.dim(), (6, 5));
         assert_eq!(lift.block_starts_reduced, vec![0, 3, 5]);
         assert_eq!(lift.block_starts_raw, vec![0, 3, 6]);

@@ -9086,9 +9086,7 @@ fn row_metric_from_fisher_provenance(
 ) -> PyResult<gam::inference::row_metric::RowMetric> {
     let u = std::sync::Arc::new(u_flat);
     match provenance.unwrap_or("output_fisher") {
-        "output_fisher" => {
-            gam::inference::row_metric::RowMetric::output_fisher(u, p_out, rank)
-        }
+        "output_fisher" => gam::inference::row_metric::RowMetric::output_fisher(u, p_out, rank),
         "output_fisher_downstream" => {
             gam::inference::row_metric::RowMetric::output_fisher_downstream(u, p_out, rank)
         }
@@ -9586,12 +9584,8 @@ fn sae_manifold_fit_inner<'py>(
                 }
             }
         }
-        let metric = row_metric_from_fisher_provenance(
-            u_flat,
-            p_out,
-            rank,
-            fisher_provenance.as_deref(),
-        )?;
+        let metric =
+            row_metric_from_fisher_provenance(u_flat, p_out, rank, fisher_provenance.as_deref())?;
         let label = metric_provenance_label(metric.provenance());
         base_term.set_row_metric(metric).map_err(py_value_error)?;
         label
@@ -9958,7 +9952,7 @@ fn sae_manifold_fit_inner<'py>(
     // their evidence: an absent or below-margin certificate is `unavailable` /
     // `insufficient`, never a silent pass.
     {
-        use gam::inference::certificates::{Certificate, CertificateLedger};
+        use gam::inference::certificates::CertificateLedger;
         let mut ledger = CertificateLedger::new();
         ledger.record(&fit_diagnostics.residual_gauge);
         if let Some(report) = &fit_diagnostics.incoherence_report {
@@ -10269,6 +10263,7 @@ fn sae_manifold_fit_ibp<'py>(
         // No output-Fisher shard on this convenience IBP entry point; the
         // metric stays Euclidean (the precomputed-basis `sae_manifold_fit` and
         // the auto `sae_manifold_fit_minimal` entry points carry the shard).
+        None,
         None,
         None,
     )
@@ -12865,12 +12860,8 @@ fn sae_steer_delta<'py>(
                 }
             }
         }
-        let metric = row_metric_from_fisher_provenance(
-            u_flat,
-            p_out,
-            rank,
-            fisher_provenance.as_deref(),
-        )?;
+        let metric =
+            row_metric_from_fisher_provenance(u_flat, p_out, rank, fisher_provenance.as_deref())?;
         term.set_row_metric(metric).map_err(py_value_error)?;
     }
 
@@ -28315,6 +28306,7 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
         convergence_status: fit.pirls_status.label().to_string(),
         converged: fit.pirls_status.is_converged(),
         outer_gradient_norm: fit.outer_gradient_norm,
+        criterion_certificate: None,
         edf_total: fit.edf_total().unwrap_or(0.0),
         r_squared: None,
         coefficients,
