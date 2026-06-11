@@ -5108,6 +5108,7 @@ fn binomial_location_scale_nll_tower(
     d2mu_dq2: f64,
     d3mu_dq3: f64,
     link_kind: &InverseLink,
+    include_fourth: bool,
 ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
     use crate::families::jet_tower::Tower4;
     let eta_t_tower = Tower4::<2>::variable(eta_t, 0);
@@ -5118,9 +5119,13 @@ fn binomial_location_scale_nll_tower(
     let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
         y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
     );
-    let m4 = binomial_neglog_q_fourth_derivative_dispatch(
-        y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
-    )?;
+    let m4 = if include_fourth {
+        binomial_neglog_q_fourth_derivative_dispatch(
+            y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
+        )?
+    } else {
+        0.0
+    };
     Ok(q.compose_unary([-ll, m1, m2, m3, m4]))
 }
 
@@ -5131,6 +5136,7 @@ fn binomial_location_scale_nll_tower_from_core_row(
     core: &BinomialLocationScaleCore,
     row: usize,
     link_kind: &InverseLink,
+    include_fourth: bool,
 ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
     let sigma = core.sigma[row];
     let eta_t = -core.q0[row] * sigma;
@@ -5146,6 +5152,7 @@ fn binomial_location_scale_nll_tower_from_core_row(
         core.d2mu_dq2[row],
         core.d3mu_dq3[row],
         link_kind,
+        include_fourth,
     )
 }
 
@@ -5171,7 +5178,7 @@ fn binomial_location_scale_first_directional_coefficients(
         .into_par_iter()
         .map(|i| {
             let tower = binomial_location_scale_nll_tower_from_core_row(
-                y[i], weights[i], core, i, link_kind,
+                y[i], weights[i], core, i, link_kind, false,
             )?;
             let dir = [d_eta_t[i], d_eta_ls[i]];
             let contracted = tower.third_contracted(&dir);
@@ -5212,7 +5219,7 @@ fn binomial_location_scalesecond_directional_coefficients(
         .into_par_iter()
         .map(|i| -> Result<(f64, f64, f64), String> {
             let tower = binomial_location_scale_nll_tower_from_core_row(
-                y[i], weights[i], core, i, link_kind,
+                y[i], weights[i], core, i, link_kind, true,
             )?;
             let dir_u = [d_eta_t_u[i], d_eta_ls_u[i]];
             let dir_v = [d_eta_t_v[i], d_eta_ls_v[i]];
@@ -14493,6 +14500,7 @@ impl BinomialLocationScaleFamily {
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
                     link_kind,
+                    false,
                 )?;
                 Ok((-tower.g[0], -tower.g[1]))
             })
@@ -16272,6 +16280,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
                     link_kind_e,
+                    false,
                 )?;
                 Ok((-tower.g[0], -tower.g[1]))
             })
@@ -22578,6 +22587,286 @@ mod tests {
             "d_sigma_deta / sigma must preserve the remaining tail derivative"
         );
         assert_eq!(logb_dlog_sigma_deta(f64::INFINITY, f64::INFINITY), 1.0);
+    }
+
+    fn assert_rel_close(label: &str, actual: f64, expected: f64, tol: f64) {
+        let scale = expected.abs().max(1.0);
+        assert!(
+            (actual - expected).abs() <= tol * scale,
+            "{label}: actual={actual:+.16e}, expected={expected:+.16e}, diff={:+.3e}, scale={scale:.3e}",
+            actual - expected
+        );
+    }
+
+    fn hand_binomial_q_directional(
+        q: NonWiggleQDerivs,
+        d_eta_t: f64,
+        d_eta_ls: f64,
+    ) -> NonWiggleQDirectional {
+        NonWiggleQDirectional {
+            delta_q: q.q_t * d_eta_t + q.q_ls * d_eta_ls,
+            delta_q_t: q.q_tl * d_eta_ls,
+            delta_q_ls: q.q_tl * d_eta_t + q.q_ll * d_eta_ls,
+            delta_q_tl: q.q_tl_ls * d_eta_ls,
+            delta_q_ll: q.q_tl_ls * d_eta_t + q.q_ll_ls * d_eta_ls,
+        }
+    }
+
+    fn hand_binomial_second_q_directional(
+        q: NonWiggleQDerivs,
+        u_t: f64,
+        u_ls: f64,
+        v_t: f64,
+        v_ls: f64,
+    ) -> (f64, f64, f64, f64, f64) {
+        let d2q = q.q_tl * (u_t * v_ls + v_t * u_ls) + q.q_ll * u_ls * v_ls;
+        let d2q_t = q.q_tl_ls * u_ls * v_ls;
+        let d2q_ls = q.q_tl_ls * (u_ls * v_t + v_ls * u_t) + q.q_ll_ls * u_ls * v_ls;
+        let d2q_tl = -q.q_tl_ls * u_ls * v_ls;
+        let d2q_ll = d2q;
+        (d2q, d2q_t, d2q_ls, d2q_tl, d2q_ll)
+    }
+
+    #[test]
+    fn binomial_nonwiggle_tower_matches_hand_witness_channels() {
+        let links = [
+            InverseLink::Standard(StandardLink::Probit),
+            InverseLink::Standard(StandardLink::Logit),
+            InverseLink::Standard(StandardLink::CLogLog),
+        ];
+        let dirs = [([0.7, -0.4], [-0.2, 0.9]), ([1.3, 0.2], [0.5, -1.1])];
+        for link in links {
+            for y in [0.0, 1.0] {
+                for weight in [0.25, 2.0] {
+                    for q_target in [-8.0, -6.0, -1.25, 0.0, 1.4, 6.0, 8.0] {
+                        for eta_ls in [-0.7_f64, 0.0, 0.9] {
+                            let sigma = eta_ls.exp();
+                            let eta_t = -q_target * sigma;
+                            let jet = inverse_link_jet_for_inverse_link(&link, q_target)
+                                .expect("binomial link jet");
+                            let tower = binomial_location_scale_nll_tower(
+                                y, weight, eta_t, eta_ls, q_target, jet.mu, jet.d1, jet.d2,
+                                jet.d3, &link, true,
+                            )
+                            .expect("binomial row tower");
+                            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+                                y, weight, q_target, jet.mu, jet.d1, jet.d2, jet.d3, &link,
+                            );
+                            let m4 = binomial_neglog_q_fourth_derivative_dispatch(
+                                y, weight, q_target, jet.mu, jet.d1, jet.d2, jet.d3, &link,
+                            )
+                            .expect("binomial m4");
+                            let q = nonwiggle_q_derivs(eta_t, sigma);
+                            let h_tt =
+                                hessian_coeff_fromobjective_q_terms(m1, m2, q.q_t, q.q_t, 0.0);
+                            let h_tl =
+                                hessian_coeff_fromobjective_q_terms(m1, m2, q.q_t, q.q_ls, q.q_tl);
+                            let h_ll =
+                                hessian_coeff_fromobjective_q_terms(m1, m2, q.q_ls, q.q_ls, q.q_ll);
+                            assert_rel_close("binomial h_tt", tower.h[0][0], h_tt, 1e-12);
+                            assert_rel_close("binomial h_tl", tower.h[0][1], h_tl, 1e-12);
+                            assert_rel_close("binomial h_ll", tower.h[1][1], h_ll, 1e-12);
+
+                            for (u, v) in dirs {
+                                let du = hand_binomial_q_directional(q, u[0], u[1]);
+                                let t3 = tower.third_contracted(&u);
+                                let dh_tt = directionalhessian_coeff_fromobjective_q_terms(
+                                    m1, m2, m3, du.delta_q, q.q_t, q.q_t, 0.0, du.delta_q_t,
+                                    du.delta_q_t, 0.0,
+                                );
+                                let dh_tl = directionalhessian_coeff_fromobjective_q_terms(
+                                    m1, m2, m3, du.delta_q, q.q_t, q.q_ls, q.q_tl,
+                                    du.delta_q_t, du.delta_q_ls, du.delta_q_tl,
+                                );
+                                let dh_ll = directionalhessian_coeff_fromobjective_q_terms(
+                                    m1, m2, m3, du.delta_q, q.q_ls, q.q_ls, q.q_ll,
+                                    du.delta_q_ls, du.delta_q_ls, du.delta_q_ll,
+                                );
+                                assert_rel_close("binomial dh_tt", t3[0][0], dh_tt, 1e-12);
+                                assert_rel_close("binomial dh_tl", t3[0][1], dh_tl, 1e-12);
+                                assert_rel_close("binomial dh_ll", t3[1][1], dh_ll, 1e-12);
+
+                                let dv = hand_binomial_q_directional(q, v[0], v[1]);
+                                let (d2q, d2q_t, d2q_ls, d2q_tl, d2q_ll) =
+                                    hand_binomial_second_q_directional(q, u[0], u[1], v[0], v[1]);
+                                let t4 = tower.fourth_contracted(&u, &v);
+                                let d2h_tt = second_directionalhessian_coeff_fromobjective_q_terms(
+                                    m1, m2, m3, m4, du.delta_q, dv.delta_q, d2q, q.q_t, q.q_t,
+                                    0.0, du.delta_q_t, dv.delta_q_t, du.delta_q_t, dv.delta_q_t,
+                                    d2q_t, d2q_t, 0.0, 0.0, 0.0,
+                                );
+                                let d2h_tl = second_directionalhessian_coeff_fromobjective_q_terms(
+                                    m1, m2, m3, m4, du.delta_q, dv.delta_q, d2q, q.q_t, q.q_ls,
+                                    q.q_tl, du.delta_q_t, dv.delta_q_t, du.delta_q_ls,
+                                    dv.delta_q_ls, d2q_t, d2q_ls, du.delta_q_tl,
+                                    dv.delta_q_tl, d2q_tl,
+                                );
+                                let d2h_ll = second_directionalhessian_coeff_fromobjective_q_terms(
+                                    m1, m2, m3, m4, du.delta_q, dv.delta_q, d2q, q.q_ls, q.q_ls,
+                                    q.q_ll, du.delta_q_ls, dv.delta_q_ls, du.delta_q_ls,
+                                    dv.delta_q_ls, d2q_ls, d2q_ls, du.delta_q_ll,
+                                    dv.delta_q_ll, d2q_ll,
+                                );
+                                assert_rel_close("binomial d2h_tt", t4[0][0], d2h_tt, 1e-12);
+                                assert_rel_close("binomial d2h_tl", t4[0][1], d2h_tl, 1e-12);
+                                assert_rel_close("binomial d2h_ll", t4[1][1], d2h_ll, 1e-12);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn hand_trigamma(x: f64) -> f64 {
+        crate::families::jet_tower::trigamma_derivative_stack(x)[0]
+    }
+
+    fn hand_dispersion_row_kernel(
+        kind: DispersionFamilyKind,
+        yi: f64,
+        eta_mu: f64,
+        eta_d: f64,
+        prior_weight: f64,
+    ) -> DispersionRowKernel {
+        let wi = prior_weight.max(0.0);
+        let em = eta_mu.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
+        let ed = eta_d.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
+        match kind {
+            DispersionFamilyKind::NegativeBinomial => {
+                let mu = em.exp().max(1e-300);
+                let theta = ed.exp().max(1e-12);
+                let tpm = theta + mu;
+                let tpy = theta + yi;
+                let loglik = wi
+                    * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
+                        + theta * theta.ln()
+                        - theta * tpm.ln()
+                        + yi * mu.ln()
+                        - yi * tpm.ln());
+                let mean_weight = wi * mu * theta / tpm;
+                let mean_response = em + (yi - mu) / mu;
+                let s_theta = statrs::function::gamma::digamma(yi + theta)
+                    - statrs::function::gamma::digamma(theta)
+                    + theta.ln()
+                    + 1.0
+                    - tpm.ln()
+                    - tpy / tpm;
+                let info_theta = -hand_trigamma(yi + theta) + hand_trigamma(theta)
+                    - 1.0 / theta
+                    + 2.0 / tpm
+                    - tpy / (tpm * tpm);
+                let info_pos = info_theta.max(DISPERSION_MIN_CURVATURE);
+                DispersionRowKernel {
+                    loglik,
+                    mean_weight,
+                    mean_response,
+                    disp_weight: wi * theta * theta * info_pos,
+                    disp_response: ed + s_theta / (theta * info_pos),
+                }
+            }
+            DispersionFamilyKind::Gamma => {
+                let mu = em.exp().max(1e-300);
+                let nu = ed.exp().max(1e-12);
+                let y_pos = yi.max(1e-300);
+                let loglik = wi
+                    * (nu * nu.ln() - nu * mu.ln() - ln_gamma(nu)
+                        + (nu - 1.0) * y_pos.ln()
+                        - nu * yi / mu);
+                let s_nu = nu.ln() + 1.0
+                    - mu.ln()
+                    - statrs::function::gamma::digamma(nu)
+                    + y_pos.ln()
+                    - yi / mu;
+                let info_nu = (hand_trigamma(nu) - 1.0 / nu).max(DISPERSION_MIN_CURVATURE);
+                DispersionRowKernel {
+                    loglik,
+                    mean_weight: wi * nu,
+                    mean_response: em + (yi - mu) / mu,
+                    disp_weight: wi * nu * nu * info_nu,
+                    disp_response: ed + s_nu / (nu * info_nu),
+                }
+            }
+            DispersionFamilyKind::Beta => {
+                let mu = (1.0 / (1.0 + (-em).exp())).clamp(1e-12, 1.0 - 1e-12);
+                let phi = ed.exp().max(1e-12);
+                let q = (mu * (1.0 - mu)).max(1e-12);
+                let yc = yi.clamp(1e-12, 1.0 - 1e-12);
+                let a = mu * phi;
+                let b = (1.0 - mu) * phi;
+                let loglik = wi
+                    * (ln_gamma(phi) - ln_gamma(a) - ln_gamma(b)
+                        + (a - 1.0) * yc.ln()
+                        + (b - 1.0) * (1.0 - yc).ln());
+                let score_mu = phi
+                    * (statrs::function::gamma::digamma(b)
+                        - statrs::function::gamma::digamma(a)
+                        + yc.ln()
+                        - (1.0 - yc).ln());
+                let info_mu =
+                    (phi * phi * (hand_trigamma(a) + hand_trigamma(b))).max(DISPERSION_MIN_CURVATURE);
+                let s_phi = statrs::function::gamma::digamma(phi)
+                    - mu * statrs::function::gamma::digamma(a)
+                    - (1.0 - mu) * statrs::function::gamma::digamma(b)
+                    + mu * yc.ln()
+                    + (1.0 - mu) * (1.0 - yc).ln();
+                let info_phi = (mu * mu * hand_trigamma(a)
+                    + (1.0 - mu) * (1.0 - mu) * hand_trigamma(b)
+                    - hand_trigamma(phi))
+                .max(DISPERSION_MIN_CURVATURE);
+                DispersionRowKernel {
+                    loglik,
+                    mean_weight: wi * q * q * info_mu,
+                    mean_response: em + score_mu / (q * info_mu),
+                    disp_weight: wi * phi * phi * info_phi,
+                    disp_response: ed + s_phi / (phi * info_phi),
+                }
+            }
+            DispersionFamilyKind::Tweedie { .. } => {
+                panic!("Tweedie dispersion witness is intentionally out of migration scope")
+            }
+        }
+    }
+
+    #[test]
+    fn dispersion_row_towers_match_hand_witnesses() {
+        let cases = [
+            (DispersionFamilyKind::NegativeBinomial, 0.0, -1.5, -25.0, 0.7),
+            (DispersionFamilyKind::NegativeBinomial, 6.0, 2.0, 25.0, 1.3),
+            (DispersionFamilyKind::Gamma, 0.2, -2.0, -25.0, 0.9),
+            (DispersionFamilyKind::Gamma, 9.0, 1.7, 25.0, 1.1),
+            (DispersionFamilyKind::Beta, 0.02, -3.0, -20.0, 0.8),
+            (DispersionFamilyKind::Beta, 0.98, 3.0, 20.0, 1.4),
+        ];
+        for (kind, y, eta_mu, eta_d, weight) in cases {
+            let actual = dispersion_row_kernel(kind, y, eta_mu, eta_d, weight);
+            let expected = hand_dispersion_row_kernel(kind, y, eta_mu, eta_d, weight);
+            assert_rel_close("dispersion loglik", actual.loglik, expected.loglik, 1e-10);
+            assert_rel_close(
+                "dispersion mean_weight",
+                actual.mean_weight,
+                expected.mean_weight,
+                1e-10,
+            );
+            assert_rel_close(
+                "dispersion mean_response",
+                actual.mean_response,
+                expected.mean_response,
+                1e-10,
+            );
+            assert_rel_close(
+                "dispersion disp_weight",
+                actual.disp_weight,
+                expected.disp_weight,
+                1e-10,
+            );
+            assert_rel_close(
+                "dispersion disp_response",
+                actual.disp_response,
+                expected.disp_response,
+                1e-10,
+            );
+        }
     }
 
     fn logistic_numdual<D: DualNum<f64> + Copy>(x: D) -> D {
