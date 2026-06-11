@@ -9152,6 +9152,7 @@ fn metric_provenance_label(
     jumprelu_threshold = 0.0,
     fisher_factors = None,
     fisher_mass_residual = None,
+    fisher_provenance = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit<'py>(
@@ -9186,6 +9187,11 @@ fn sae_manifold_fit<'py>(
     // truncation diagnostic that rides into the report.
     fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
     fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
+    // The harvest shard's provenance tag (#980): `"output_fisher"` (same-position,
+    // the default) or `"output_fisher_downstream"` (KV-path aggregate over future
+    // positions). Selects which output-Fisher `RowMetric` is installed; the gauge
+    // / lens / dose consume either unchanged. Ignored when no shard is supplied.
+    fisher_provenance: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     // The precomputed-basis entry point carries no Duchon centers / kernel
     // metadata, so any basis kind whose refresh needs them cannot re-evaluate
@@ -9231,6 +9237,7 @@ fn sae_manifold_fit<'py>(
         0,
         fisher_u,
         fisher_mr,
+        fisher_provenance.as_deref(),
     )
 }
 
@@ -9272,6 +9279,11 @@ fn sae_manifold_fit_inner<'py>(
     // visible, not silent. Absent ⇒ the bit-identical Euclidean / isotropic path.
     fisher_u: Option<ArrayView3<'_, f64>>,
     fisher_mass_residual: Option<ArrayView1<'_, f64>>,
+    // Harvest provenance (#980): which output-Fisher `RowMetric` to install when
+    // `fisher_u` is present — same-position `"output_fisher"` (default) or
+    // forward-looking `"output_fisher_downstream"`. Gauge/lens consume either
+    // unchanged.
+    fisher_provenance: Option<&str>,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
@@ -9574,14 +9586,15 @@ fn sae_manifold_fit_inner<'py>(
                 }
             }
         }
-        let metric = gam::inference::row_metric::RowMetric::output_fisher(
-            std::sync::Arc::new(u_flat),
+        let metric = row_metric_from_fisher_provenance(
+            u_flat,
             p_out,
             rank,
-        )
-        .map_err(py_value_error)?;
+            fisher_provenance.as_deref(),
+        )?;
+        let label = metric_provenance_label(metric.provenance());
         base_term.set_row_metric(metric).map_err(py_value_error)?;
-        "OutputFisher"
+        label
     } else {
         "Euclidean"
     };
@@ -9650,7 +9663,69 @@ fn sae_manifold_fit_inner<'py>(
     let shape_uncertainty = objective
         .decoder_shape_uncertainty()
         .map_err(py_value_error)?;
-    let (mut term, rho, loss) = objective.into_fitted();
+    let (mut term, mut rho, loss) = objective.into_fitted();
+
+    // #997 — evidence-guarded structure search around the production fit. Harvest
+    // death (diverged ARD ∪ terminal collapse) and fusion (co-activation)
+    // proposals from the fitted dictionary, then run the e-gated move engine over
+    // a held-out estimation/evaluation row split. Births and fissions (which GROW
+    // the atom count) are held out of the production landing so the returned
+    // dictionary shape stays stable for the python `from_payload` boundary;
+    // deaths and fusions are demote-never-reject / fold moves that keep K, so the
+    // returned `atoms`/`logits`/`assignments` stay K-shaped while the ledger
+    // certifies the proposal stream. The SearchLedger (+ the joint fit's collapse
+    // events) is serialized onto the payload as the honesty surface — never a
+    // silent restructure. Conservative by construction: the gates rarely certify,
+    // so the common case returns the fit unchanged with an all-contested ledger.
+    let structure_search_json = {
+        let mut structure_ledger = gam::inference::structure_evidence::StructureLedger::new();
+        let harvest_params = gam::solver::structure_harvest::HarvestParams {
+            max_fusions: 4,
+            max_fissions: 0,
+            max_births: 0,
+        };
+        let refit_params = gam::solver::structure_harvest::ProductionRefitParams {
+            inner_max_iter: max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        };
+        let budget = gam::solver::structure_search::MoveBudget {
+            max_moves: term.k_atoms().max(1),
+            alpha: 0.05,
+        };
+        match gam::solver::structure_harvest::run_production_structure_search(
+            term,
+            rho,
+            z_view.view(),
+            4,
+            budget,
+            3,
+            harvest_params,
+            refit_params,
+            &mut structure_ledger,
+        ) {
+            Ok(result) => {
+                term = result.term;
+                rho = result.rho;
+                gam::solver::structure_harvest::rounds_to_json(&result.rounds).ok()
+            }
+            Err(e) => {
+                // Structure search is a post-fit audit pass; a failure must not
+                // silently corrupt the fit — surface it loudly.
+                return Err(py_value_error(format!(
+                    "structure search around SAE fit failed: {e}"
+                )));
+            }
+        }
+    };
+
+    // Clear any per-row estimation mask the structure-search refit left on the
+    // adopted term so the returned `fitted` / dispersion / diagnostics are
+    // computed over ALL rows (the mask is an internal split device, not a
+    // property of the returned fit).
+    term.clear_row_loss_weights();
+
     term.set_certificate_dispersion(shape_uncertainty.dispersion)
         .map_err(py_value_error)?;
 
@@ -11552,6 +11627,7 @@ fn sae_build_atom_plans(
     native_ard_enabled = true,
     fisher_factors = None,
     fisher_mass_residual = None,
+    fisher_provenance = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit_minimal<'py>(
@@ -11583,6 +11659,10 @@ fn sae_manifold_fit_minimal<'py>(
     // magic-by-default way as the precomputed-basis `sae_manifold_fit`.
     fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
     fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
+    // Harvest provenance tag (#980): same-position `"output_fisher"` (default) or
+    // forward-looking `"output_fisher_downstream"`. Routed to the matching
+    // `RowMetric` constructor; gauge/lens/dose consume either unchanged.
+    fisher_provenance: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let z_view = z.as_array();
     let (n_obs, _p_out) = z_view.dim();
@@ -11836,6 +11916,7 @@ fn sae_manifold_fit_minimal<'py>(
         // Absent ⇒ the bit-identical Euclidean path.
         fisher_u,
         fisher_mr,
+        fisher_provenance.as_deref(),
     )?;
     // Attach per-atom build plans so OOS predict can rebuild design without Python.
     let plans_py = PyList::empty(py);
@@ -12394,6 +12475,7 @@ fn sae_manifold_predict_oos<'py>(
     alpha = 1.0,
     jumprelu_threshold = 0.0,
     fisher_factors = None,
+    fisher_provenance = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn sae_steer_delta<'py>(
@@ -12415,6 +12497,10 @@ fn sae_steer_delta<'py>(
     alpha: f64,
     jumprelu_threshold: f64,
     fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
+    // Harvest provenance tag (#980): same-position `"output_fisher"` (default) or
+    // forward-looking `"output_fisher_downstream"`. Selects the re-installed
+    // output-Fisher `RowMetric` the dose is measured through.
+    fisher_provenance: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let k_atoms = atom_basis.len();
     if n_obs == 0 || p_out == 0 {
@@ -12682,12 +12768,12 @@ fn sae_steer_delta<'py>(
                 }
             }
         }
-        let metric = gam::inference::row_metric::RowMetric::output_fisher(
-            std::sync::Arc::new(u_flat),
+        let metric = row_metric_from_fisher_provenance(
+            u_flat,
             p_out,
             rank,
-        )
-        .map_err(py_value_error)?;
+            fisher_provenance.as_deref(),
+        )?;
         term.set_row_metric(metric).map_err(py_value_error)?;
     }
 

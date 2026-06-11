@@ -977,12 +977,16 @@ pub fn run_production_structure_search(
         ledger,
         move |mut cand_term, mut cand_rho, estimation_rows| {
             // Refit the restructured candidate on the ESTIMATION rows only: the
-            // held-out evaluation rows carry weight 0 (no fitting pressure) via
-            // the per-row reconstruction-weight seam, so the candidate is the
-            // predictable plug-in the held-out shards are scored against. A
-            // non-converging inner solve returns the unchanged candidate (the
-            // closure is infallible at the driver boundary).
-            let mut weights = vec![0.0_f64; n];
+            // held-out evaluation rows carry a near-zero weight (vanishing
+            // fitting pressure) via the per-row reconstruction-weight seam, so
+            // the candidate is the predictable plug-in the held-out shards are
+            // scored against. The seam requires strictly-positive weights, so a
+            // tiny epsilon stands in for the structural zero; after mean-1
+            // normalization the estimation rows carry weight ≈ n/n_est and the
+            // held-out rows ≈ 0. A non-converging inner solve returns the
+            // unchanged candidate (the closure is infallible at the boundary).
+            const HELD_OUT_WEIGHT: f64 = 1e-12;
+            let mut weights = vec![HELD_OUT_WEIGHT; n];
             for &r in estimation_rows {
                 if r < n {
                     weights[r] = 1.0;
