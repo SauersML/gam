@@ -7,7 +7,6 @@
 //! All families and runtime paths provide ingredients and call
 //! [`InnerAssembly::evaluate`] or [`InnerAssembly::build`].
 
-use super::FirthDenseOperator;
 use super::unified::{
     BarrierConfig, ContractedPsiSecondOrderFn, DispersionHandling, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordPair, InnerSolution,
@@ -318,7 +317,12 @@ pub struct InnerAssembly<'dp> {
     pub deriv_provider: Option<Box<dyn HessianDerivativeProvider + 'dp>>,
     pub tk_correction: f64,
     pub tk_gradient: Option<Array1<f64>>,
-    pub firth: Option<Arc<FirthDenseOperator>>,
+    /// Jeffreys/Firth scalar contribution to the LAML cost. Tier-A GLM callers
+    /// construct it from the dense operator (`ExactJeffreysTerm::new`); the
+    /// Tier-B coupled joint path installs the value-only carrier
+    /// (`ExactJeffreysTerm::value_only`) so the cost subtracts the same gated
+    /// `Φ(β̂)` its inner Newton optimized (gam#979).
+    pub firth: Option<crate::estimate::reml::unified::ExactJeffreysTerm>,
     pub nullspace_dim: Option<f64>,
     pub barrier_config: Option<BarrierConfig>,
     pub kkt_residual: Option<ProjectedKktResidual>,
@@ -362,7 +366,7 @@ impl<'dp> InnerAssembly<'dp> {
             builder = builder.deriv_provider(dp);
         }
         builder = builder.tk(self.tk_correction, self.tk_gradient);
-        builder = builder.firth(self.firth);
+        builder = builder.firth_term(self.firth);
         if let Some(nd) = self.nullspace_dim {
             builder = builder.nullspace_dim_override(nd);
         }
