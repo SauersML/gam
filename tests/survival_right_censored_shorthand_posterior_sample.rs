@@ -28,17 +28,12 @@
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Exp, Uniform};
-use std::path::{Path, PathBuf};
+use gam::test_support::cli_harness::run_capture_or_panic;
+use std::path::Path;
 use std::process::Command;
 
 const N: usize = 200;
 const SEED: u64 = 20260528;
-
-fn gam_binary() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_gam")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
-}
 
 /// Write a tiny right-censored survival CSV with three columns: `t`
 /// (positive exit time), `event` (0/1 censoring indicator), and `x`
@@ -83,23 +78,6 @@ fn write_shorthand_survival_fixture(csv_path: &Path) {
     writer.flush().expect("flush csv");
 }
 
-fn run_or_panic(mut command: Command, label: &str) -> String {
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to spawn `{label}`: {err}"));
-    if !output.status.success() {
-        panic!(
-            "`{label}` failed with status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
-    combined
-}
-
 #[test]
 fn gam_sample_succeeds_on_right_censored_shorthand_survival_model() {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -110,7 +88,7 @@ fn gam_sample_succeeds_on_right_censored_shorthand_survival_model() {
     // `Surv(t, event)` — no entry column, so the saved model serializes
     // `survival_entry = None`. That asymmetry is the root of the bug.
     let formula = "Surv(t, event) ~ x";
-    let mut fit_cmd = Command::new(gam_binary());
+    let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&csv_path)
@@ -118,7 +96,7 @@ fn gam_sample_succeeds_on_right_censored_shorthand_survival_model() {
         .args(["--survival-likelihood", "transformation"])
         .arg("--out")
         .arg(&model_path);
-    run_or_panic(fit_cmd, "gam fit Surv(t, event) ~ x");
+    run_capture_or_panic(fit_cmd, "gam fit Surv(t, event) ~ x");
     assert!(
         model_path.is_file(),
         "expected `gam fit` to produce {model_path:?} for the right-censored \
@@ -133,14 +111,14 @@ fn gam_sample_succeeds_on_right_censored_shorthand_survival_model() {
     // sample-side test below would be a false positive: keep them
     // paired so the regression is unambiguous.
     let pred_path = dir.path().join("surv_shorthand.pred.csv");
-    let mut predict_cmd = Command::new(gam_binary());
+    let mut predict_cmd = Command::new(gam::gam_binary!());
     predict_cmd
         .arg("predict")
         .arg(&model_path)
         .arg(&csv_path)
         .arg("--out")
         .arg(&pred_path);
-    run_or_panic(predict_cmd, "gam predict (shorthand survival)");
+    run_capture_or_panic(predict_cmd, "gam predict (shorthand survival)");
     assert!(
         pred_path.is_file(),
         "`gam predict` did not write {pred_path:?} for the shorthand model"
@@ -155,7 +133,7 @@ fn gam_sample_succeeds_on_right_censored_shorthand_survival_model() {
     // `run_predict_survival` does, this command should succeed and
     // write at least one row of posterior draws.
     let sample_path = dir.path().join("surv_shorthand.sample.csv");
-    let mut sample_cmd = Command::new(gam_binary());
+    let mut sample_cmd = Command::new(gam::gam_binary!());
     sample_cmd
         .arg("sample")
         .arg(&model_path)
