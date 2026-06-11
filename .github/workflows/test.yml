@@ -62,13 +62,9 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    # Hard ceiling well under GitHub's 6-hour default. A single hung test
-    # (the scheduled bug-hunt agent commits regression tests that deliberately
-    # drive the solver into degenerate, sometimes non-terminating states) used
-    # to let this job run until the 6h job timeout, at which point GitHub kills
-    # it with no useful signal about which test was stuck. The per-binary
-    # wall-clock cap in "Run tests" below fails the offending binary fast and
-    # names it; this job timeout is the backstop if caps are ever bypassed.
+    # Backstop under GitHub's 6-hour default. The per-command wall-clock caps
+    # below fail the offending cargo test invocation with a useful name; this
+    # job timeout catches anything outside those wrappers.
     timeout-minutes: 120
     steps:
       - name: Checkout
@@ -161,50 +157,22 @@ jobs:
           # debuginfo removes the largest non-executable payload from the link
           # and keeps the serialized link job practical on standard runners.
           #
-          # Per-binary wall-clock caps. Each tests/*.rs links and runs its own
-          # binary in isolation below, so a single test that hangs (or runs
-          # pathologically long) otherwise consumes the whole job budget until
-          # the 6h ceiling. Cap each invocation: on overrun we SIGKILL the
-          # entire process group — cargo PLUS the test exe it spawned, since
-          # killing only cargo would orphan the runaway test and leak a CPU hog
-          # into the next iterations — record the binary as failed, and name it
-          # in the log so the culprit is obvious. These are the finest-grained
-          # caps available on stable: libtest exposes no per-test kill, and the
-          # 652 integration binaries are mostly one-test files, so per-binary is
-          # effectively per-test here. The lib/bins/examples phase bundles many
-          # unit tests into one process and gets a correspondingly larger cap.
-          INTEGRATION_TEST_TIMEOUT=300   # seconds, per tests/*.rs binary
-          LIB_TEST_TIMEOUT=1800          # seconds, lib+bins+examples phase
+          # Per-command wall-clock caps. Each tests/*.rs target is linked and
+          # run in isolation below, so these are the finest-grained caps
+          # available without changing the test harness itself. GNU timeout
+          # runs the command in its own process group by default, so an overrun
+          # kills cargo and the test executable it spawned instead of leaving a
+          # runaway test behind for later iterations.
+          INTEGRATION_TEST_TIMEOUT=300
+          LIB_TEST_TIMEOUT=1800
 
-          # Run a command under a wall-clock cap in its own session so the whole
-          # process tree can be killed on overrun. Output is buffered to a temp
-          # file and appended to /tmp/cargo-test.log when the command finishes
-          # or is killed, preserving the forbidden-pattern grep below. Returns
-          # 124 on timeout (mirrors GNU `timeout`), else the command's status.
           run_capped() {
             local cap="$1"; shift
-            local tmp
-            tmp="$(mktemp)"
-            setsid "$@" >"$tmp" 2>&1 &
-            local sid=$!
-            local waited=0
-            while kill -0 "$sid" 2>/dev/null; do
-              if [ "$waited" -ge "$cap" ]; then
-                # $sid is the session/group leader (setsid); kill the group.
-                kill -KILL -"$sid" 2>/dev/null || kill -KILL "$sid" 2>/dev/null
-                wait "$sid" 2>/dev/null || true
-                echo "::error::Test command exceeded ${cap}s wall-clock cap and was killed: $*"
-                tee -a /tmp/cargo-test.log < "$tmp"
-                rm -f "$tmp"
-                return 124
-              fi
-              sleep 1
-              waited=$((waited + 1))
-            done
-            wait "$sid"
-            local status=$?
-            tee -a /tmp/cargo-test.log < "$tmp"
-            rm -f "$tmp"
+            timeout --kill-after=30s "${cap}s" "$@" 2>&1 | tee -a /tmp/cargo-test.log
+            local status="${PIPESTATUS[0]}"
+            if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+              echo "::error::Test command exceeded ${cap}s wall-clock cap and was killed: $*" | tee -a /tmp/cargo-test.log
+            fi
             return "$status"
           }
 
@@ -254,7 +222,7 @@ jobs:
           # serialized link job within the runner's disk budget.
           for test_file in tests/*.rs; do
             test_name="$(basename "$test_file" .rs)"
-            if ! run_cargo_test --test "$test_name"; then
+            if ! run_cargo_test "$INTEGRATION_TEST_TIMEOUT" --test "$test_name"; then
               test_status=1
             fi
             rm -f "target/debug/deps/${test_name}"-* \
@@ -312,9 +280,15 @@ jobs:
           RUSTFLAGS: "-C link-arg=-Wl,--threads=1"
         run: |
           set -uo pipefail
-          cargo test -p gam-pyffi --no-default-features \
+          PYFFI_TEST_TIMEOUT=1800
+          timeout --kill-after=30s "${PYFFI_TEST_TIMEOUT}s" \
+            cargo test -p gam-pyffi --no-default-features \
             --config profile.dev.debug=0 --jobs 1 2>&1 | tee -a /tmp/cargo-test.log
-          exit "${PIPESTATUS[0]}"
+          status="${PIPESTATUS[0]}"
+          if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+            echo "::error::gam-pyffi tests exceeded ${PYFFI_TEST_TIMEOUT}s wall-clock cap and were killed."
+          fi
+          exit "$status"
 
   python-tests:
     name: Python API tests

@@ -68,6 +68,15 @@ use faer::Side;
 
 const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
 const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
+/// Relative Cholesky-pivot floor for the analytic SAE outer-rho gradient.
+///
+/// The evidence value can still be honest below this threshold because it only
+/// sums `log(diag(L))`. The analytic gradient is different: selected-inverse
+/// traces and `ArrowFactorCache::full_inverse_apply` divide by those pivots.
+/// Once `min_pivot / max_pivot` is below this floor, f64 has no useful elbow
+/// room left for inverse-based derivative signal, so the gradient is undefined
+/// at that trial rho and the outer line search must retreat.
+const SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR: f64 = 1.0e-12;
 
 /// Nominal curvature-homotopy `η` step (#1007): the tracker covers `η ∈ [0, 1]`
 /// in this many equal predictor-corrector waypoints when the branch is clean.
@@ -13860,6 +13869,41 @@ impl SaeManifoldOuterObjective {
             logdet_enclosure_gap: None,
         })
     }
+
+    fn ensure_outer_gradient_factor_well_conditioned(
+        cache: &ArrowFactorCache,
+    ) -> Result<(), String> {
+        let pivot = arrow_factor_min_pivot(cache);
+        let Some(min_pivot) = pivot.min_pivot else {
+            return Err(
+                "analytic outer gradient undefined at this rho: joint Hessian numerically \
+                 singular (no cached Cholesky pivots)"
+                    .to_string(),
+            );
+        };
+        let Some(max_pivot) = arrow_factor_max_pivot(cache) else {
+            return Err(
+                "analytic outer gradient undefined at this rho: joint Hessian numerically \
+                 singular (no cached Cholesky pivot scale)"
+                    .to_string(),
+            );
+        };
+        let ratio = min_pivot / max_pivot;
+        if min_pivot.is_finite()
+            && max_pivot.is_finite()
+            && max_pivot > 0.0
+            && ratio.is_finite()
+            && ratio >= SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "analytic outer gradient undefined at this rho: joint Hessian numerically singular \
+             (min/max pivot ratio {ratio:.3e} < floor {floor:.3e}; min pivot {min_pivot:.3e}, \
+             max pivot {max_pivot:.3e})",
+            floor = SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR,
+        ))
+    }
 }
 
 impl OuterObjective for SaeManifoldOuterObjective {
@@ -13912,6 +13956,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 self.ridge_ext_coord,
                 self.ridge_beta,
             )
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        Self::ensure_outer_gradient_factor_well_conditioned(&cache)
             .map_err(EstimationError::RemlOptimizationFailed)?;
         let components = self
             .term
@@ -15464,6 +15510,9 @@ pub fn grassmann_assert_border_dim_invariant(term: &SaeManifoldTerm) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solver::arrow_schur::{
+        ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics,
+    };
     use crate::terms::analytic_penalties::ARDPenalty;
     use crate::terms::analytic_penalties::IsometryReference;
     use approx::assert_abs_diff_eq;
@@ -20013,6 +20062,40 @@ mod tests {
         let target = array![[0.20_f64], [-0.10], [0.30], [0.05]];
         let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
         SaeManifoldOuterObjective::new(term, target, None, rho, 8, 1.0, 1.0e-6, 1.0e-6)
+    }
+
+    fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
+        ArrowFactorCache {
+            htt_factors: ArrowFactorSlab::from_blocks(vec![array![[1.0_f64, 0.0], [0.0, 1.0e-7]]]),
+            htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
+            schur_factor: Some(array![[1.0_f64]]),
+            solver_mode: ArrowSolverMode::Direct,
+            ridge_t: 0.0,
+            ridge_beta: 0.0,
+            htbeta: ArrowHtbetaCache::Disabled { estimated_bytes: 0 },
+            d: 2,
+            row_dims: Arc::from(vec![2usize].into_boxed_slice()),
+            row_offsets: Arc::from(vec![0usize, 2usize].into_boxed_slice()),
+            k: 1,
+            manifold_mode_fingerprint: 0,
+            row_hessian_fingerprint: 0,
+            pcg_diagnostics: PcgDiagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn outer_gradient_conditioning_guard_rejects_near_singular_cache() {
+        let cache = near_singular_outer_gradient_cache();
+        let err = SaeManifoldOuterObjective::ensure_outer_gradient_factor_well_conditioned(&cache)
+            .expect_err("near-singular evidence factor must reject the analytic outer gradient");
+        assert!(
+            err.contains("analytic outer gradient undefined at this rho"),
+            "guard error must name the undefined analytic-gradient condition; got: {err}"
+        );
+        assert!(
+            err.contains("min/max pivot ratio") && err.contains("floor"),
+            "guard error must report the pivot ratio and floor; got: {err}"
+        );
     }
 
     /// gam#577 / gam#579 root cause: the continuation pre-warm forwards an
