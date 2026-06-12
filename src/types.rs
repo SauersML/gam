@@ -286,9 +286,12 @@ pub enum RhoPrior {
     },
     /// Gamma(shape, rate) conjugate hyperprior on the precision lambda = exp(rho).
     ///
-    /// The REML/LAML objective is minimized, so this contributes
-    /// `rate * exp(rho) - (shape - 1) * rho` up to an additive constant. For a
-    /// block with effective dimension n_p and centered quadratic
+    /// The deterministic REML/LAML objective uses the MAP-in-lambda convention
+    /// and is minimized, so this contributes `rate * exp(rho) - (shape - 1) * rho`
+    /// up to an additive constant. Samplers over rho include the +rho Jacobian
+    /// from lambda = exp(rho), so their log-density contribution is
+    /// `shape * rho - rate * exp(rho)`. For a block with effective dimension n_p
+    /// and centered quadratic
     /// `(beta - mu)'S_p(beta - mu)`, the conditional posterior is
     /// `Gamma(shape + n_p/2, rate + quadratic/2)` and the closed-form MAP
     /// precision is `(shape + n_p/2 - 1) / (rate + quadratic/2)`.

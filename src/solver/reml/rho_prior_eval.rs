@@ -1,4 +1,5 @@
-//! Shared evaluation of the configured smoothing-parameter (ρ) prior.
+//! Shared evaluation of the configured deterministic smoothing-parameter (ρ)
+//! prior objective.
 //!
 //! The cost / gradient / Hessian of the configured [`RhoPrior`] is the same
 //! math whether it is consumed by the custom-family outer objective or by the
@@ -16,9 +17,10 @@
 //!   cost `0.5 · (r − mean)² · inv_var`, grad `(r − mean) · inv_var`,
 //!   Hessian `inv_var`.
 //! * `GammaPrecision{shape,rate}` — Gamma(shape, rate) hyperprior on the
-//!   precision `λ = exp(r)`, contributing (up to an additive constant)
-//!   cost `rate · λ − (shape − 1) · r`, grad `rate · λ − (shape − 1)`,
-//!   Hessian `rate · λ`.
+//!   precision `λ = exp(r)`, using the REML/LAML MAP-in-lambda convention and
+//!   contributing (up to an additive constant) cost `rate · λ − (shape − 1) · r`,
+//!   grad `rate · λ − (shape − 1)`, Hessian `rate · λ`. Samplers over `r`
+//!   include the `+r` Jacobian and therefore use the transformed density instead.
 //! * `Independent`    — one prior per coordinate; the same per-coordinate math
 //!   summed/stacked, with nested `Independent` priors rejected as invalid.
 //!
@@ -172,6 +174,7 @@ fn scalar_terms(prior: &RhoPrior, r: f64, context: &str) -> Result<(f64, f64, f6
                 )));
             }
             let lambda = r.exp();
+            // Deterministic REML/LAML uses the MAP-in-lambda convention; rho samplers add the Jacobian.
             Ok((
                 *rate * lambda - (*shape - 1.0) * r,
                 *rate * lambda - (*shape - 1.0),
