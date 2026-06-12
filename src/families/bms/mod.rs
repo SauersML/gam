@@ -865,6 +865,19 @@ pub struct LatentZConditionalCalibration {
     pub post_mean: f64,
     /// Weighted SD of the calibrated training sample (sanity-check, ≈ 1).
     pub post_sd: f64,
+    /// First-stage (generated-regressor) sandwich covariance of `mean_coeffs`,
+    /// `V₁ᵐ = M⁻¹ (Σ_i w_i² û_i² A_i A_iᵀ) M⁻¹` with `A = [1 | a(C)]`,
+    /// `M = AᵀWA + λR` (the same weighted-ridge normal matrix that produced
+    /// `mean_coeffs`), `û_i = z_i − m̂(C_i)` the HC0 mean residual, and
+    /// `W = diag(w_i)`. Shape `(1+basis_ncols) × (1+basis_ncols)`. This is the
+    /// closed-form estimation uncertainty of `m(C)` that the second stage
+    /// (Murphy–Topel) needs; see [`Self::generated_regressor_term`].
+    pub mean_cov: Array2<f64>,
+    /// First-stage sandwich covariance of `var_coeffs`, computed identically on
+    /// the squared-mean-residual response. Empty (`0 × 0`) exactly when
+    /// `var_coeffs` is empty (mean-only correction; `v(C) ≡ global_var` is a
+    /// constant carrying no first-stage slope uncertainty).
+    pub var_cov: Array2<f64>,
 }
 
 impl LatentZConditionalCalibration {
