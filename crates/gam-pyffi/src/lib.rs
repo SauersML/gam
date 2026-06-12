@@ -27130,6 +27130,7 @@ fn smooth_basis_kind_label(basis: &gam::smooth::SmoothBasisSpec) -> &'static str
         S::TensorBSpline { .. } => "tensor",
         S::ThinPlate { .. } => "thin_plate",
         S::Sphere { .. } => "sphere",
+        S::ConstantCurvature { .. } => "constant_curvature",
         S::Matern { .. } => "matern",
         S::Duchon { .. } => "duchon",
         S::Pca { .. } => "pca",
