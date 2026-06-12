@@ -44,9 +44,11 @@ pub use constant_curvature_smooth::{
     realized_constant_curvature_length_scale,
 };
 pub use measure_jet_smooth::{
-    MeasureJetBand, MeasureJetBasisSpec, MeasureJetFrozenQuadrature, MeasureJetIdentifiability,
-    build_measure_jet_basis, measure_jet_band, measure_jet_center_masses,
-    measure_jet_design_matrix, measure_jet_energy_form, realized_measure_jet_length_scale,
+    MeasureJetBand, MeasureJetBasisSpec, MeasureJetEnergyJets, MeasureJetFrozenQuadrature,
+    MeasureJetIdentifiability, build_measure_jet_basis, measure_jet_band,
+    measure_jet_center_masses, measure_jet_design_matrix, measure_jet_energy_form,
+    measure_jet_energy_form_with_jets, measure_jet_quadrature_nodes, measure_jet_scale_spectrum,
+    measure_jet_support_curve, realized_measure_jet_length_scale,
 };
 pub use sphere_spec::{
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
