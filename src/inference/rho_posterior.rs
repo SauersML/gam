@@ -203,6 +203,7 @@ pub const TIER2_MAX_DIM: usize = 16;
 const ESCALATION_NUTS_SAMPLES: usize = 256;
 /// Deterministic seed for the auto-selected Tier-2 escalation (no clock).
 const ESCALATION_NUTS_SEED: u64 = 0x938_5EED_0938_5EED;
+const RHO_POSTERIOR_NUTS_WARMUP_FLOOR: usize = 32;
 
 const DEFAULT_M: usize = 64;
 const CERTIFICATE_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -723,7 +724,7 @@ where
 ///   (the engine's LAML value and ρ-gradient); `None` for infeasible `ρ`. Each
 ///   call is one warm inner profile solve + IFT gradient.
 /// * `n_samples` — post-warmup draws per chain (2 chains; warmup is
-///   `max(n_samples/2, 80)`).
+///   `max(n_samples/2, 32)`).
 /// * `seed` — deterministic seeding: the seed feeds the same splitmix64 chain /
 ///   transition streams as every other NUTS entry point. No clock, no global
 ///   RNG: the same `(fit, seed)` yields the same draws every run.
@@ -740,7 +741,7 @@ where
     let k = rho_hat.len();
     let config = crate::inference::hmc::NutsConfig {
         n_samples: n_samples.max(4),
-        nwarmup: (n_samples / 2).max(80),
+        nwarmup: (n_samples / 2).max(RHO_POSTERIOR_NUTS_WARMUP_FLOOR),
         n_chains: 2,
         target_accept: 0.9,
         seed,
