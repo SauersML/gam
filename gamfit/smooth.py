@@ -507,12 +507,6 @@ class MeasureJet(Smooth):
     # "defer to the engine" and an explicit ``False`` must be emitted.
     double_penalty: bool | None = None
 
-    # MeasureJet is a formula-path smooth consumed by the Rust core (the
-    # ``mjs(...)`` head plus the ``smooths=`` override bridge); it has no
-    # Python-side basis evaluator. The empty set is the honest contract:
-    # there are no `_evaluate_<backend>` paths to advertise.
-    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset()
-
     def to_rust_descriptor(self) -> dict[str, Any]:
         out = super().to_rust_descriptor()
         if self.centers is not None:
@@ -532,6 +526,12 @@ class MeasureJet(Smooth):
         if self.double_penalty is not None:
             out["double_penalty"] = bool(self.double_penalty)
         return out
+
+    # MeasureJet is a formula-path smooth consumed by the Rust core (the
+    # ``mjs(...)`` head plus the ``smooths=`` override bridge); it has no
+    # Python-side basis evaluator. The empty set is the honest contract:
+    # there are no `_evaluate_<backend>` paths to advertise.
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset()
 
 
 @dataclass(init=False, slots=True)
