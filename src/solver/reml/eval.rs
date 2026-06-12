@@ -584,9 +584,11 @@ impl<'a> RemlState<'a> {
                 |rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
                 |rho| {
                     self.without_persistent_warm_start_store(|| {
-                        let cost = self.compute_cost(rho).ok()?;
-                        let gradient = self.compute_gradient(rho).ok()?;
-                        Some((cost, gradient))
+                        // NUTS leapfrog gradients need the criterion value and
+                        // gradient at the same rho; compute them through one
+                        // value+gradient outer evaluation so the inner PIRLS
+                        // solve and IFT state are shared by construction.
+                        self.compute_cost_and_gradient(rho).ok()
                     })
                 },
             )),

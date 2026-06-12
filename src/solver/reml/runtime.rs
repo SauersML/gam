@@ -6471,8 +6471,10 @@ impl<'a> RemlState<'a> {
 
         self.persistent_warm_start_store_suppression
             .fetch_add(1, Ordering::Relaxed);
-        let _guard = StoreSuppressionGuard(&self.persistent_warm_start_store_suppression);
-        f()
+        let guard = StoreSuppressionGuard(&self.persistent_warm_start_store_suppression);
+        let out = f();
+        drop(guard);
+        out
     }
 
     /// Predict β at `new_rho` via the implicit-function-theorem first-order
@@ -11157,6 +11159,17 @@ impl<'a> RemlState<'a> {
         );
         self.update_hypergradient_budget_after_outer_eval(p, &grad, ift_residual_energy);
         Ok(grad)
+    }
+
+    pub(crate) fn compute_cost_and_gradient(
+        &self,
+        p: &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>), EstimationError> {
+        let eval = self.compute_outer_eval_with_order(
+            p,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+        )?;
+        Ok((eval.cost, eval.gradient))
     }
 
     pub fn compute_outer_eval_with_order(
