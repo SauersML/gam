@@ -2066,7 +2066,18 @@ pub trait OuterObjective {
     ///     bifurcation; fall back to the multi-seed cascade (the report is
     ///     recorded on the objective for the fit payload).
     ///   * `Some(Err(_))` — a hard failure constructing the anchor.
-    fn curvature_homotopy_entry(&mut self) -> Option<Result<bool, EstimationError>> {
+    fn curvature_homotopy_entry(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Option<Result<bool, EstimationError>> {
+        // Default: no certified anchor — but a non-finite seed is reported
+        // here rather than silently handed to the seed cascade, mirroring the
+        // hard-failure contract of the overriding implementations.
+        if rho.iter().any(|v| !v.is_finite()) {
+            return Some(Err(EstimationError::RemlOptimizationFailed(
+                "curvature-homotopy entry received a non-finite seed".to_string(),
+            )));
+        }
         None
     }
 }
@@ -6498,7 +6509,7 @@ fn run_outer_with_plan(
         // per accepted seed entry right after `reset`, so cross-seed state
         // hygiene is unchanged (#1003): `reset` restores the pristine `η = 1`
         // baseline before each walk.
-        match obj.curvature_homotopy_entry() {
+        match obj.curvature_homotopy_entry(seed) {
             Some(Ok(arrived)) => {
                 log::info!(
                     "[OUTER] {context}: curvature-homotopy entry seed {seed_idx} arrived={arrived}"

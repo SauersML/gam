@@ -9095,35 +9095,6 @@ fn sae_manifold_fit<'py>(
     )
 }
 
-fn sae_seed_reconstruction_dispersion(
-    term: &gam::terms::sae_manifold::SaeManifoldTerm,
-    target: ArrayView2<'_, f64>,
-) -> Result<f64, String> {
-    let fitted = term.try_fitted()?;
-    if fitted.dim() != target.dim() {
-        return Err(format!(
-            "sae_seed_reconstruction_dispersion: fitted {:?} != target {:?}",
-            fitted.dim(),
-            target.dim()
-        ));
-    }
-    let n_scalar = (target.nrows() * target.ncols()).max(1) as f64;
-    let mut rss = 0.0_f64;
-    for row in 0..target.nrows() {
-        for col in 0..target.ncols() {
-            let r = target[[row, col]] - fitted[[row, col]];
-            rss += r * r;
-        }
-    }
-    if !rss.is_finite() || rss < 0.0 {
-        return Err(format!(
-            "sae_seed_reconstruction_dispersion: non-finite seed RSS {rss}"
-        ));
-    }
-    const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
-    Ok((rss / n_scalar).max(SAE_SEED_DISPERSION_FLOOR))
-}
-
 fn sae_manifold_fit_inner<'py>(
     py: Python<'py>,
     z_view: ArrayView2<'_, f64>,
@@ -9500,8 +9471,9 @@ fn sae_manifold_fit_inner<'py>(
     // `init_rho` packs `[log_lambda_sparse, log_lambda_smooth, per-atom ARD]`;
     // its `to_flat()` defines the outer ρ vector the engine optimizes, and its
     // length is the objective's declared `n_params`.
-    let seed_dispersion =
-        sae_seed_reconstruction_dispersion(&base_term, z_view).map_err(py_value_error)?;
+    let seed_dispersion = base_term
+        .seed_reconstruction_dispersion(z_view)
+        .map_err(py_value_error)?;
     let init_rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard)
         .seed_scaled_by_dispersion(seed_dispersion)
         .map_err(py_value_error)?;

@@ -380,11 +380,7 @@ fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>) -> SaeManifoldTerm {
 /// the converged assignments, and the engine's final criterion value.
 fn run_production_fit(truth: &Truth, z: &Array2<f64>) -> (SaeManifoldTerm, Array2<f64>, f64) {
     let term = build_cold_term(truth, z.view());
-    let init_rho = SaeManifoldRho::new(
-        SPARSITY.ln(),
-        SMOOTHNESS.ln(),
-        vec![Array1::<f64>::zeros(0); K],
-    );
+    let init_rho = dimensionless_entry_rho(&term, z);
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
     let mut objective = SaeManifoldOuterObjective::new(
@@ -662,11 +658,7 @@ fn sae_manifold_joint_two_circle_recovery_ibp_map() {
 /// caller exercises the curvature-homotopy entry walk directly.
 fn build_objective(truth: &Truth, z: &Array2<f64>) -> SaeManifoldOuterObjective {
     let term = build_cold_term(truth, z.view());
-    let init_rho = SaeManifoldRho::new(
-        SPARSITY.ln(),
-        SMOOTHNESS.ln(),
-        vec![Array1::<f64>::zeros(0); K],
-    );
+    let init_rho = dimensionless_entry_rho(&term, z);
     SaeManifoldOuterObjective::new(
         term,
         z.clone(),
@@ -677,6 +669,55 @@ fn build_objective(truth: &Truth, z: &Array2<f64>) -> SaeManifoldOuterObjective 
         RIDGE_EXT_COORD,
         RIDGE_BETA,
     )
+}
+
+fn dimensionless_entry_rho(term: &SaeManifoldTerm, z: &Array2<f64>) -> SaeManifoldRho {
+    let _seed_dispersion = term
+        .seed_reconstruction_dispersion(z.view())
+        .expect("seed reconstruction dispersion");
+    let mut rho = SaeManifoldRho::new(
+        SPARSITY.ln(),
+        SMOOTHNESS.ln(),
+        vec![Array1::<f64>::zeros(0); K],
+    );
+    rho.log_lambda_sparse += 1.0;
+    rho
+}
+
+#[test]
+fn sae_two_circle_seed_dispersion_diagnostic() {
+    let (u_a, u_b) = planted_frames();
+    let truth = planted_truth();
+    let (z, signal_scale) = planted_response(&truth, &u_a, &u_b);
+    let term = build_cold_term(&truth, z.view());
+    let seed_dispersion = term
+        .seed_reconstruction_dispersion(z.view())
+        .expect("seed reconstruction dispersion");
+    let seed_r2 = {
+        let fitted = term.fitted();
+        let mut ssr = 0.0;
+        let mut sst = 0.0;
+        let mut zbar = 0.0;
+        for i in 0..N {
+            for j in 0..P {
+                zbar += z[[i, j]];
+            }
+        }
+        zbar /= (N * P) as f64;
+        for i in 0..N {
+            for j in 0..P {
+                let r = z[[i, j]] - fitted[[i, j]];
+                ssr += r * r;
+                let d = z[[i, j]] - zbar;
+                sst += d * d;
+            }
+        }
+        1.0 - ssr / sst.max(1.0e-12)
+    };
+    println!(
+        "two-circle seed signal_scale={signal_scale:.6} seed_phi={seed_dispersion:.6e} seed_r2={seed_r2:.6}"
+    );
+    assert!(seed_dispersion.is_finite() && seed_dispersion > 0.0);
 }
 
 /// #1007 walk-path oracle: the certified curvature-homotopy entry walk reaches
