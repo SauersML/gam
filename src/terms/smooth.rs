@@ -9,15 +9,16 @@ use crate::basis::{
     PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
     SphericalSplineIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
     build_bspline_basis_1d, build_constant_curvature_basis, build_duchon_basis,
-    build_duchon_basiswithworkspace, build_matern_basis, build_measure_jet_basis,
+    build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
-    build_spherical_spline_basis, build_thin_plate_basis,
-    build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto, center_strategy_kind,
-    center_strategy_num_centers, center_strategy_with_num_centers, estimate_penalty_nullity,
-    filter_active_penalty_candidates, filter_active_penalty_candidates_with_ops,
-    initial_aniso_contrasts, orthogonality_transform_for_design, pairwise_distance_bounds,
-    pairwise_distance_bounds_sampled, points_in_aniso_y_space, select_centers_by_strategy,
+    build_measure_jet_basis, build_measure_jet_basis_psi_derivatives, build_spherical_spline_basis,
+    build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto,
+    center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
+    estimate_penalty_nullity, filter_active_penalty_candidates,
+    filter_active_penalty_candidates_with_ops, initial_aniso_contrasts,
+    orthogonality_transform_for_design, pairwise_distance_bounds, pairwise_distance_bounds_sampled,
+    points_in_aniso_y_space, select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -2666,6 +2667,15 @@ impl SpatialLogKappaCoords {
         let mut vals = Vec::new();
         let mut dims = Vec::new();
         for &term_idx in term_indices {
+            // Measure-jet: dial coordinates seeded directly from the term's
+            // realized (α, τ[, s]); the −ln(length_scale) convention below is
+            // κ-semantics and never applies to dials.
+            if let Some(mj) = measure_jet_term_spec(spec, term_idx) {
+                let seed = measure_jet_psi_seed(mj);
+                dims.push(seed.len());
+                vals.extend(seed);
+                continue;
+            }
             let length_scale = get_spatial_length_scale(spec, term_idx)
                 .unwrap_or(options.min_length_scale)
                 .clamp(options.min_length_scale, options.max_length_scale);
@@ -2809,6 +2819,18 @@ impl SpatialLogKappaCoords {
         let mut cursor = 0;
         for (slot, &term_idx) in term_indices.iter().enumerate() {
             let d = dims_per_term[slot];
+            // Measure-jet: per-coordinate dial boxes, never κ-window geometry
+            // (which would reject legitimate dial values outright).
+            if let Some(mj) = measure_jet_term_spec(spec, term_idx) {
+                let bounds = measure_jet_psi_bound_values(mj, matches!(end, AnisoBoundEnd::Upper));
+                for (offset, bound) in bounds.into_iter().enumerate() {
+                    if offset < d {
+                        values[cursor + offset] = bound;
+                    }
+                }
+                cursor += d;
+                continue;
+            }
             let psi_bound = {
                 let (lo, hi) = spatial_term_psi_bounds(data, spec, term_idx, options);
                 match end {
@@ -2854,6 +2876,12 @@ impl SpatialLogKappaCoords {
         let mut cursor = 0;
         for (slot, &term_idx) in term_indices.iter().enumerate() {
             let d = self.dims_per_term[slot];
+            // Measure-jet dials are seeded from the realized spec and must
+            // not be recentered into a κ data window.
+            if measure_jet_term_spec(spec, term_idx).is_some() {
+                cursor += d;
+                continue;
+            }
             let Some(psi_bar_new) = spatial_term_psi_seed(data, spec, term_idx, options) else {
                 cursor += d;
                 continue;
@@ -2996,6 +3024,12 @@ impl SpatialLogKappaCoords {
         for (slot, &term_idx) in term_indices.iter().enumerate() {
             let psi = self.term_slice(slot);
             let d = self.dims_per_term[slot];
+            // Measure-jet: write the dial coordinates straight back; the
+            // κ-translation below would misread them as log-scales.
+            if measure_jet_term_spec(&updated, term_idx).is_some() {
+                set_measure_jet_psi_dials(&mut updated, term_idx, psi)?;
+                continue;
+            }
             let (next_length_scale, next_aniso) = spatial_term_psi_to_length_scale_and_aniso(psi);
             if (d == 1 || next_length_scale.is_some())
                 && let Some(length_scale) = next_length_scale
@@ -3069,27 +3103,158 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
         return true;
     }
 
-    // Measure-jet: ψ enrollment is STAGED OFF here for now, deliberately.
-    // The exact penalty-only ψ feedstock is landed and FD-gated
-    // (`build_measure_jet_basis_psi_derivatives`: per-level coords (α, lnτ),
-    // fused coords (s, α, lnτ), zero design drift, fit-time normalization
-    // shared with the candidates), and the outer engine is confirmed generic
-    // (see the MEASURE-JET ψ REGISTRATION block at
-    // `solver/outer_strategy.rs` / `OuterProblem::with_psi_dim`). What
-    // remains before flipping this arm to `spec.tau0 > 0.0` is the dial
-    // plumbing in THIS file, whose current bodies assume κ/length-scale
-    // semantics and would corrupt the (α, lnτ[, s]) dials if enrolled as-is:
-    // `SpatialLogKappaCoords` seeds/bounds (dial boxes, not κ windows),
-    // `apply_log_kappa_to_term` (dial write-back dispatch split), and the
-    // aniso hyper-dirs arm consuming the producer. Until then the dials stay
-    // build-time-fixed — same staging contract as constant-curvature κ
-    // (#944 stage 3).
+    // Measure-jet: the geometry dials (α, lnτ[, s]) are penalty-only ψ
+    // coordinates with zero design drift, produced by
+    // `build_measure_jet_basis_psi_derivatives` on the SAME realized
+    // geometry as the fit-time candidates and FD-gated end to end. The
+    // ln-τ channel needs a positive ridge, so τ = 0 (the pseudo-inverse
+    // oracle mode) keeps the term out of the outer ψ vector entirely.
     if let Some(term) = spec.smooth_terms.get(term_idx)
-        && let SmoothBasisSpec::MeasureJet { .. } = &term.basis
+        && let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &term.basis
     {
-        return false;
+        return mj.tau0 > 0.0;
     }
     get_spatial_length_scale(spec, term_idx).is_some()
+}
+
+/// The measure-jet term's spec, when `term_idx` is a measure-jet smooth.
+/// Single accessor for every dial-plumbing dispatch below.
+fn measure_jet_term_spec(
+    spec: &TermCollectionSpec,
+    term_idx: usize,
+) -> Option<&crate::basis::MeasureJetBasisSpec> {
+    spec.smooth_terms
+        .get(term_idx)
+        .and_then(|term| match &term.basis {
+            SmoothBasisSpec::MeasureJet { spec, .. } => Some(spec),
+            _ => None,
+        })
+}
+
+/// Measure-jet ψ dial boxes. The dials are NOT log-kernel-scales, so the
+/// κ-window machinery never applies: `s` stays inside the admissible order
+/// interval of the affine-jet energy, `α` spans density-weighted (0) through
+/// past-Coifman–Lafon (>1) normalization, and `lnτ` covers the ridge from
+/// numerically-exact-projection to heavy noise-floor damping.
+const MEASURE_JET_PSI_S_BOUNDS: (f64, f64) = (0.05, 1.95);
+const MEASURE_JET_PSI_ALPHA_BOUNDS: (f64, f64) = (-1.0, 3.0);
+const MEASURE_JET_PSI_LN_TAU_BOUNDS: (f64, f64) = (-18.420680743952367, 4.605170185988092);
+
+/// Is this measure-jet term in fused (pinned-order) mode? The `order_s`
+/// sentinel is the spectral/fused mode marker (see the basis module docs).
+fn measure_jet_is_fused(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
+    mj.order_s > 0.0
+}
+
+/// ψ dimension of a measure-jet term: fused mode carries (s, α, lnτ);
+/// per-level (spectral) mode carries (α, lnτ) — the order is absorbed by the
+/// REML-learned per-scale amplitudes. MUST agree with the coordinate layout
+/// of `build_measure_jet_basis_psi_derivatives`.
+fn measure_jet_psi_dim(mj: &crate::basis::MeasureJetBasisSpec) -> usize {
+    if measure_jet_is_fused(mj) { 3 } else { 2 }
+}
+
+/// Seed ψ from the term's realized dials, in producer coordinate order.
+fn measure_jet_psi_seed(mj: &crate::basis::MeasureJetBasisSpec) -> Vec<f64> {
+    let ln_tau = mj.tau0.max(f64::MIN_POSITIVE).ln();
+    if measure_jet_is_fused(mj) {
+        vec![mj.order_s, mj.alpha, ln_tau]
+    } else {
+        vec![mj.alpha, ln_tau]
+    }
+}
+
+/// One end of the per-coordinate dial boxes, in producer coordinate order.
+fn measure_jet_psi_bound_values(mj: &crate::basis::MeasureJetBasisSpec, upper: bool) -> Vec<f64> {
+    let pick = |b: (f64, f64)| if upper { b.1 } else { b.0 };
+    if measure_jet_is_fused(mj) {
+        vec![
+            pick(MEASURE_JET_PSI_S_BOUNDS),
+            pick(MEASURE_JET_PSI_ALPHA_BOUNDS),
+            pick(MEASURE_JET_PSI_LN_TAU_BOUNDS),
+        ]
+    } else {
+        vec![
+            pick(MEASURE_JET_PSI_ALPHA_BOUNDS),
+            pick(MEASURE_JET_PSI_LN_TAU_BOUNDS),
+        ]
+    }
+}
+
+/// Write optimized ψ dials back into a measure-jet spec. Returns `true` when
+/// any dial actually moved. The geometry (centers, masses, band, ℓ, z) is
+/// ψ-FIXED by contract — only the dials change, so frozen-quadrature
+/// rebuilds reproduce the identical penalty layout at the new dials.
+fn apply_measure_jet_psi(
+    mj: &mut crate::basis::MeasureJetBasisSpec,
+    psi: &[f64],
+) -> Result<bool, EstimationError> {
+    if psi.len() != measure_jet_psi_dim(mj) {
+        crate::bail_invalid_estim!(
+            "measure-jet ψ write-back dimension mismatch: got {} values for a {}-dial term",
+            psi.len(),
+            measure_jet_psi_dim(mj)
+        );
+    }
+    let (next_s, next_alpha, next_tau) = if measure_jet_is_fused(mj) {
+        (Some(psi[0]), psi[1], psi[2].exp())
+    } else {
+        (None, psi[0], psi[1].exp())
+    };
+    if !(next_alpha.is_finite() && next_tau.is_finite() && next_tau > 0.0) {
+        crate::bail_invalid_estim!(
+            "measure-jet ψ write-back produced non-finite dials (alpha={next_alpha}, tau={next_tau})"
+        );
+    }
+    let mut changed = false;
+    if let Some(s) = next_s
+        && s != mj.order_s
+    {
+        mj.order_s = s;
+        changed = true;
+    }
+    if next_alpha != mj.alpha {
+        mj.alpha = next_alpha;
+        changed = true;
+    }
+    if next_tau != mj.tau0 {
+        mj.tau0 = next_tau;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// Collection-level measure-jet dial write-back (the `apply_tospec` /
+/// realizer-side entry). Returns whether anything moved.
+fn set_measure_jet_psi_dials(
+    spec: &mut TermCollectionSpec,
+    term_idx: usize,
+    psi: &[f64],
+) -> Result<bool, EstimationError> {
+    let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
+        crate::bail_invalid_estim!("measure-jet ψ write-back: term index {term_idx} out of range");
+    };
+    let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &mut term.basis else {
+        crate::bail_invalid_estim!(
+            "measure-jet ψ write-back targeted a non-measure-jet term ({term_idx})"
+        );
+    };
+    apply_measure_jet_psi(mj, psi)
+}
+
+/// Single-term variant for the cached per-trial build spec. Returns the
+/// same moved flag as the collection-level setter; the realizer caller has
+/// already change-checked at the collection level and rebuilds regardless.
+fn set_single_term_measure_jet_psi_dials(
+    term: &mut SmoothTermSpec,
+    psi: &[f64],
+) -> Result<bool, EstimationError> {
+    let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &mut term.basis else {
+        crate::bail_invalid_estim!(
+            "measure-jet ψ write-back targeted a non-measure-jet build spec"
+        );
+    };
+    apply_measure_jet_psi(mj, psi)
 }
 
 /// Returns `true` when a spatial term has NO outer optimization axes — i.e.
@@ -15649,6 +15814,24 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             build_matern_basis_log_kappa_aniso_derivatives(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
+        // Measure-jet: the grouped dial coordinates (α, lnτ[, s]) ride the
+        // same per-axis carrier. The producer runs on the FROZEN spec
+        // (UserProvided barycenter nodes + frozen quadrature + frozen
+        // transform — the driver runs post-freeze), so per-trial derivative
+        // rebuilds move only the dials; design drift is identically zero and
+        // the penalty jets share the fit-time candidate normalization.
+        SmoothBasisSpec::MeasureJet {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
+            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+            }
+            build_measure_jet_basis_psi_derivatives(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
         _ => return Ok(None),
     };
     // Get number of axes from the shared operator when available; otherwise
@@ -15834,9 +16017,11 @@ fn try_build_spatial_term_log_kappa_derivative(
         // foundation); the κ-as-ψ derivative channel is a later stage, so there
         // is no log-κ derivative bundle to expose here yet.
         SmoothBasisSpec::ConstantCurvature { .. } => return Ok(None),
-        // Measure-jet smooths hold (s, α, τ) fixed at construction; their
-        // analytic ψ-channels (log-weight factors through the fixed geometry —
-        // see the module ψ-contract) are a later stage.
+        // Measure-jet routes through the GROUPED dial builder
+        // (`try_build_spatial_term_log_kappa_aniso_derivativeinfos`):
+        // `spatial_term_uses_per_axis_psi` is true for every enrolled
+        // measure-jet term, so this isotropic path only sees unenrolled
+        // (τ = 0 oracle-mode) terms, which expose no ψ bundle.
         SmoothBasisSpec::MeasureJet { .. } => return Ok(None),
         SmoothBasisSpec::Matern {
             feature_cols,
@@ -16855,6 +17040,13 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
 /// all consult it, so the outer optimizer's `n_params = rho_dim + Σ ψ_per_term`
 /// always matches the gradient length produced by the inner unified evaluator.
 fn spatial_term_uses_per_axis_psi(resolvedspec: &TermCollectionSpec, term_idx: usize) -> bool {
+    // Measure-jet enrolls a multi-coordinate DIAL group (α, lnτ[, s]) —
+    // grouped like per-axis anisotropy in the θ layout, but the coordinates
+    // are geometry dials, not axis scales. Same eligibility condition as
+    // `spatial_term_supports_hyper_optimization` so the layout sources agree.
+    if let Some(mj) = measure_jet_term_spec(resolvedspec, term_idx) {
+        return mj.tau0 > 0.0;
+    }
     let Some(d) = get_spatial_feature_dim(resolvedspec, term_idx) else {
         return false;
     };
@@ -16885,7 +17077,11 @@ pub(crate) fn spatial_dims_per_term(
     spatial_terms
         .iter()
         .map(|&term_idx| {
-            if spatial_term_uses_per_axis_psi(resolvedspec, term_idx) {
+            if let Some(mj) = measure_jet_term_spec(resolvedspec, term_idx) {
+                // Dial group, not per-axis anisotropy: 2 in per-level mode
+                // (α, lnτ), 3 in fused mode (s, α, lnτ).
+                measure_jet_psi_dim(mj)
+            } else if spatial_term_uses_per_axis_psi(resolvedspec, term_idx) {
                 get_spatial_feature_dim(resolvedspec, term_idx).unwrap_or(1)
             } else {
                 1
@@ -19447,22 +19643,37 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             ))
             .into());
         }
-        let current_length_scale = get_spatial_length_scale(&self.spec, term_idx);
-        let current_aniso = get_spatial_aniso_log_scales(&self.spec, term_idx);
-        let (next_length_scale, next_aniso) = spatial_term_psi_to_length_scale_and_aniso(psi);
-        let same_length = spatial_length_scale_matches(current_length_scale, next_length_scale);
-        let same_aniso = spatial_aniso_matches(current_aniso.as_deref(), next_aniso.as_deref());
-        if same_length && same_aniso {
-            return Ok(false);
-        }
-
-        if let Some(length_scale) = next_length_scale {
-            set_spatial_length_scale(&mut self.spec, term_idx, length_scale)
-                .map_err(|e| e.to_string())?;
-        }
-        if let Some(eta) = next_aniso.clone() {
-            set_spatial_aniso_log_scales(&mut self.spec, term_idx, eta)
-                .map_err(|e| e.to_string())?;
+        // Measure-jet terms carry DIAL coordinates (α, lnτ[, s]) rather than
+        // κ/length-scale ψ; the κ-translation below would misread them as
+        // log-scales and corrupt the geometry. Route through the dial setter.
+        let measure_jet_term = measure_jet_term_spec(&self.spec, term_idx).is_some();
+        let mut next_length_scale = None;
+        let mut next_aniso: Option<Vec<f64>> = None;
+        if measure_jet_term {
+            if !set_measure_jet_psi_dials(&mut self.spec, term_idx, psi)
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(false);
+            }
+        } else {
+            let current_length_scale = get_spatial_length_scale(&self.spec, term_idx);
+            let current_aniso = get_spatial_aniso_log_scales(&self.spec, term_idx);
+            let (ls, eta) = spatial_term_psi_to_length_scale_and_aniso(psi);
+            next_length_scale = ls;
+            next_aniso = eta;
+            let same_length = spatial_length_scale_matches(current_length_scale, next_length_scale);
+            let same_aniso = spatial_aniso_matches(current_aniso.as_deref(), next_aniso.as_deref());
+            if same_length && same_aniso {
+                return Ok(false);
+            }
+            if let Some(length_scale) = next_length_scale {
+                set_spatial_length_scale(&mut self.spec, term_idx, length_scale)
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(eta) = next_aniso.clone() {
+                set_spatial_aniso_log_scales(&mut self.spec, term_idx, eta)
+                    .map_err(|e| e.to_string())?;
+            }
         }
 
         // Pick the spec to drive the rebuild. If the per-term geometry cache
@@ -19488,13 +19699,21 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 .ok_or_else(|| format!("incremental realizer smooth term {term_idx} out of range"))?
                 .clone(),
         };
-        if let Some(length_scale) = next_length_scale {
-            set_single_term_spatial_length_scale(&mut build_spec, length_scale)
+        if measure_jet_term {
+            // The cached build spec carries the frozen geometry (UserProvided
+            // barycenter nodes, frozen quadrature + transform); only the
+            // dials move per trial.
+            set_single_term_measure_jet_psi_dials(&mut build_spec, psi)
                 .map_err(|e| e.to_string())?;
-        }
-        if let Some(eta) = next_aniso {
-            set_single_term_spatial_aniso_log_scales(&mut build_spec, eta)
-                .map_err(|e| e.to_string())?;
+        } else {
+            if let Some(length_scale) = next_length_scale {
+                set_single_term_spatial_length_scale(&mut build_spec, length_scale)
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(eta) = next_aniso {
+                set_single_term_spatial_aniso_log_scales(&mut build_spec, eta)
+                    .map_err(|e| e.to_string())?;
+            }
         }
 
         let termname = build_spec.name.clone();
