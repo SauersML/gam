@@ -552,11 +552,7 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
         if analytic_seed == 0.0 {
             return 0.0;
         }
-        if !wh_seed.is_finite()
-            || wh_seed <= 0.0
-            || wh_seed < 1.0e-2
-            || analytic_seed < 1.0e-2
-        {
+        if !wh_seed.is_finite() || wh_seed <= 0.0 || wh_seed < 1.0e-2 || analytic_seed < 1.0e-2 {
             analytic_seed
         } else {
             wh_seed

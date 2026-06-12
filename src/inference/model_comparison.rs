@@ -427,7 +427,10 @@ mod tests {
         }
         let ll_loo: Array1<f64> = Array1::from_elem(ratios.len(), -1.0);
         let ll_hat: Array1<f64> = Array1::from_iter(
-            ll_loo.iter().zip(ratios.iter()).map(|(&ll, &ratio)| ll + ratio.ln()),
+            ll_loo
+                .iter()
+                .zip(ratios.iter())
+                .map(|(&ll, &ratio)| ll + ratio.ln()),
         );
 
         let loo = alo_elpd(ll_hat.view(), ll_loo.view()).expect("alo elpd");

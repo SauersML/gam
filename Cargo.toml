@@ -224,7 +224,6 @@ codegen-units = 1
 # preinstalled-toolchain wipe yields on a given runner image.
 [profile.test]
 debug = "line-tables-only"
-opt-level = 2
 
 # Dev/`maturin develop` profile — same rationale as [profile.test]. Cargo's
 # default dev profile emits full DWARF (`debug = 2`), which is what lets
@@ -238,9 +237,10 @@ debug = "line-tables-only"
 # Dependencies carry most numeric inner loops in dev builds
 # (faer/matrixmultiply GEMM tiles, ndarray kernels, rayon): compile THEM
 # optimized while the workspace crate stays cheap for edit/compile iteration.
-# Test builds optimize the workspace crate too via `[profile.test]`, because
-# quality gates spend their wall-clock inside solver code and should measure
-# production-shaped arithmetic rather than opt-0 indexing overhead.
+# Test builds keep the workspace crate at Cargo's default opt level so local
+# runners do not materialize a huge optimized `gam` test artifact; the numeric
+# dependency kernels below still compile optimized, which is the hot-loop win
+# without the disk cliff.
 [profile.dev.package."*"]
 opt-level = 2
 

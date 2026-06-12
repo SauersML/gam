@@ -206,8 +206,8 @@ mod tests {
     #[test]
     fn empty_draws_reject_posterior_bands() {
         let eta = Array2::<f64>::zeros((0, 3));
-        let err = eta_bands_from_matrix(eta.view(), "identity", 0.95)
-            .expect_err("zero draws must fail");
+        let err =
+            eta_bands_from_matrix(eta.view(), "identity", 0.95).expect_err("zero draws must fail");
         assert!(err.contains("zero draws"));
     }
 

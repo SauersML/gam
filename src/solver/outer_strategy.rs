@@ -6062,9 +6062,7 @@ fn compute_rho_uncertainty_diagnostic(
                 diagnostic.n_evaluations,
             );
         }
-        crate::inference::rho_uncertainty::RhoUncertaintyStatus::HeavyTailsDetected {
-            k_hat,
-        } => {
+        crate::inference::rho_uncertainty::RhoUncertaintyStatus::HeavyTailsDetected { k_hat } => {
             log::warn!(
                 "[RHO uncertainty] {context}: heavy rho-importance tail detected k_hat={:.3} evals={}",
                 k_hat,
@@ -8221,12 +8219,9 @@ mod tests {
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
 
-        let baseline = run_outer_uncertified(
-            &mut without_diagnostic,
-            &config,
-            "rho-diagnostic-baseline",
-        )
-        .expect("baseline outer run");
+        let baseline =
+            run_outer_uncertified(&mut without_diagnostic, &config, "rho-diagnostic-baseline")
+                .expect("baseline outer run");
         let diagnosed = run_outer(&mut with_diagnostic, &config, "rho-diagnostic-run")
             .expect("diagnostic outer run");
 
