@@ -34,7 +34,10 @@
 //! - **Mellin band.** Scales form a geometric grid from the center-spacing
 //!   floor to the half-diameter; `w_ℓ = log_step · ε_ℓ^(−2s)` is the
 //!   quadrature of `∫ ε^(−2s) (·) dε/ε`, giving a continuous smoothness
-//!   order `s ∈ (0, 2)` with no preferred internal scale (default 1.5).
+//!   order `s ∈ (0, 2)` with no preferred internal scale (default 1.5). On a
+//!   flat stratum the symbol of the band-limited form is `≍ |ξ|^{2s}`
+//!   (substitute `t = ε|ξ|` in the Mellin integral) — fractional Duchon on
+//!   the web with learned order.
 //! - **Density normalization.** The outer quadrature weight
 //!   `mass_i · q_i^(1−2α)` realizes `dμ(x)/q_ε(x)^(2α−1)`; `α = 1` (default)
 //!   removes the sampling-density dependence of the limiting energy, `α = 0`
@@ -44,17 +47,47 @@
 //!   both ([`MeasureJetFrozenQuadrature`]) so predict-time (and future
 //!   per-ψ-trial) rebuilds replay the exact fit-time penalty instead of
 //!   recomputing it from predict rows.
+//! - **Single assembly source.** Every quadratic form this module emits —
+//!   the energy, its (s, α) jets, the per-scale spectrum — is produced by
+//!   ONE workhorse ([`assemble_weighted_forms`]) that walks the local
+//!   residual blocks exactly once per request and differs only in the
+//!   scalar weights applied per block. Criterion value and criterion
+//!   derivatives cannot drift apart (the objective↔gradient desync class is
+//!   structurally excluded).
 //!
-//! # ψ-differentiability contract (what a later ψ-channel stage consumes)
+//! # ψ-differentiability contract (what the ψ-channel stage consumes)
 //!
 //! Mirroring the constant-curvature κ-contract (#944): centers, masses, the
 //! band, and the representer range ℓ are all deliberately hyperparameter-
-//! FIXED at build time, so promoting `(s, α, τ)` to fitted outer coordinates
-//! moves the energy only through analytic weights — `∂w_ℓ/∂s` is a log
-//! factor, `∂/∂α` a `log q` factor, `∂/∂τ` a resolvent derivative of the
-//! ridged Gram — with no center/band rebuild and hence no non-smooth design
-//! drift. None of those channels is wired yet; this module only guarantees
-//! the fixed-geometry contract they require.
+//! FIXED at build time. Consequences, available TODAY from this module:
+//!
+//! - **Design drift is identically zero** for every measure-jet ψ
+//!   coordinate: the Gaussian representer design depends on none of
+//!   (s, α, τ), so `∂X/∂ψ ≡ 0` and the channels are penalty-only
+//!   (`is_penalty_like` auto-derives true in the outer engine's
+//!   `DirectionalHyperParam`).
+//! - **Exact (s, α) penalty jets are shipped**:
+//!   [`measure_jet_energy_form_with_jets`] returns `∂Q/∂s`, `∂²Q/∂s²`,
+//!   `∂Q/∂α`, `∂²Q/∂α²`, `∂²Q/∂s∂α` in closed form — both dials enter only
+//!   through the per-block log-weights (`∂ln w/∂s = −2 ln ε`,
+//!   `∂ln w/∂α = −2 ln q`), so the jets are reweighted re-scatters of the
+//!   SAME residual blocks, FD-gated in this module's tests.
+//! - **Not yet shipped:** the τ-channel (a resolvent derivative of the
+//!   ridged local Gram — analytic, heavier plumbing) and the outer-engine
+//!   wiring itself (the `normalize_penaltywith_psi_derivatives` seam), which
+//!   follow the Matérn iso-κ template once the #901 seam is green.
+//!
+//! # Cost shape (and the upgrade ladder above it)
+//!
+//! The outer sum is coarsened per scale to a deterministic ε/2-net (the
+//! outer Riemann sum needs resolution ε, not the center-spacing floor), so
+//! the band totals ~O(m²·d) instead of O(L·m³) — the V0 realization of the
+//! pyramid principle that each scale interacts at its own level. The known
+//! upgrade ladder (jet-MRA synthesis coordinates with a diagonal prior;
+//! Hermite/fast-Gauss moment fusion at n-scale; screening-based sparse
+//! factorization) replaces this module's REALIZATION without touching the
+//! estimand: the analysis-form energy above is the definition, everything
+//! else is certified quadrature of it.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use rayon::prelude::*;
@@ -97,6 +130,13 @@ const MEASURE_JET_MAX_AUTO_SCALES: usize = 8;
 /// the `0.0` auto sentinel: ×2 so adjacent representers overlap and thin
 /// sampling gaps stay inside the basis span.
 const MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR: f64 = 2.0;
+
+/// Memory budget (in f64 entries) above which the multi-form assembly stops
+/// parallelizing over scales: parallel scale partials cost
+/// `L · n_forms · m²` doubles; past this budget the scales run sequentially
+/// (same numbers — the per-scale loop and the ordered sum are deterministic
+/// either way).
+const MEASURE_JET_PARALLEL_FORM_BUDGET_DOUBLES: usize = 1 << 26;
 
 /// Realized-design identifiability policy for the measure-jet smooth.
 /// Mirrors [`super::ConstantCurvatureIdentifiability`] (#532): the fit-time
@@ -184,6 +224,20 @@ impl Default for MeasureJetBasisSpec {
 pub struct MeasureJetBand {
     pub eps: Vec<f64>,
     pub log_step: f64,
+}
+
+/// The energy and its exact (s, α) hyperparameter jets — six symmetric m×m
+/// forms scattered from the SAME local residual blocks in one pass. Both
+/// dials enter only through per-block log-weights, so the jets are exact by
+/// construction (FD-gated in this module's tests), and the future ψ-channel
+/// consumes them with zero design drift.
+pub struct MeasureJetEnergyJets {
+    pub q: Array2<f64>,
+    pub dq_ds: Array2<f64>,
+    pub d2q_ds2: Array2<f64>,
+    pub dq_dalpha: Array2<f64>,
+    pub d2q_dalpha2: Array2<f64>,
+    pub d2q_ds_dalpha: Array2<f64>,
 }
 
 fn validate_finite_points(points: ArrayView2<'_, f64>, what: &str) -> Result<(), BasisError> {
@@ -344,35 +398,41 @@ pub fn measure_jet_center_masses(
     Ok(masses)
 }
 
-/// The multiscale jet-residual energy `Q` (m × m, symmetric PSD) on the
-/// center set. See the module docs for the formula and contracts; the local
-/// residual form is assembled through the closed-form identities
+/// THE single assembly source: walk every (scale, outer-net center) local
+/// residual block exactly once and scatter it into `n_forms` accumulators
+/// with caller-chosen scalar weights. The energy, its (s, α) jets, and the
+/// per-scale spectrum are all this routine with different weight closures,
+/// so a value/derivative desync is structurally impossible.
 ///
-/// ```text
-///   CᵀWC          = W − w·wᵀ/q,
-///   B = CᵀWΦ̃     = WΦ − w·aᵀ          (a = Φᵀw/q),
-///   G = Φ̃ᵀWΦ̃/q  = (ΦᵀWΦ)/q − a·aᵀ,
-///   R_loc         = CᵀWC − B·(G + τI)⁻¹·Bᵀ/q,
-/// ```
-///
-/// with `(G + τI)⁻¹` realized through the symmetric eigendecomposition
-/// (pseudo-inverse with relative threshold when `τ = 0`).
+/// Per block the closure receives `(scale_idx, eps, q, base)` where `base`
+/// is the fully-assembled outer weight
+/// `log_step · ε^(−2s) · net_mass_i · q^(1−2α)`, and writes one scalar
+/// multiplier per requested form.
 ///
 /// The outer sum over centers is coarsened per scale to a deterministic
 /// ε/2-net with nearest-member mass aggregation (the outer Riemann sum needs
 /// resolution ε, not the center-spacing floor), so each scale's cost sits at
 /// its own level and the band totals ~O(m²·d) instead of O(L·m³). The inner
-/// (local-fit) quadrature always uses the full center set.
-pub fn measure_jet_energy_form(
+/// (local-fit) quadrature always uses the full center set, so the local
+/// residual identities (exact constant annihilation, PSD) are untouched.
+fn assemble_weighted_forms<F>(
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
     band: &MeasureJetBand,
     order_s: f64,
     alpha: f64,
     tau0: f64,
-) -> Result<Array2<f64>, BasisError> {
+    n_forms: usize,
+    weights: &F,
+) -> Result<Vec<Array2<f64>>, BasisError>
+where
+    F: Fn(usize, f64, f64, f64, &mut [f64]) + Sync,
+{
     let m = centers.nrows();
     let d = centers.ncols();
+    if n_forms == 0 {
+        crate::bail_invalid_basis!("measure-jet assembly needs at least one output form");
+    }
     if masses.len() != m {
         crate::bail_dim_basis!(
             "measure-jet energy mass/center mismatch: {} masses for {} centers",
@@ -398,152 +458,356 @@ pub fn measure_jet_energy_form(
     }
     let dist2 = center_pairwise_dist2(centers);
 
-    // One m×m accumulator per scale, built in parallel over scales (each
-    // scale's center loop is sequential, so every Q_ℓ — and the ordered sum
-    // below — is bit-deterministic).
-    let per_scale: Vec<Array2<f64>> = band
-        .eps
-        .par_iter()
-        .map(|&eps| {
-            let mut q_l = Array2::<f64>::zeros((m, m));
-            let cutoff2 = (MEASURE_JET_PROFILE_CUTOFF * eps) * (MEASURE_JET_PROFILE_CUTOFF * eps);
-            let inv_two_eps2 = 1.0 / (2.0 * eps * eps);
-            let scale_weight = band.log_step * eps.powf(-2.0 * order_s);
-            // Outer-quadrature coarsening: the outer integral ∫·dμ(x) at
-            // scale ε needs quadrature resolution ε, not the center-spacing
-            // floor. A greedy ε/2-net over the centers (fixed index order —
-            // deterministic) carries the outer points, with every center's
-            // mass aggregated to its nearest net member (lowest-index tie
-            // break). The inner integral keeps the FULL center quadrature,
-            // so the local residual identities (exact constant
-            // annihilation, PSD) are untouched; only the outer Riemann sum
-            // is matched to the resolution it integrates at. This keeps
-            // each scale's cost at its own level — the band totals
-            // ~O(m²·d) instead of O(L·m³).
-            let net_radius2 = 0.25 * eps * eps;
-            let mut outer: Vec<usize> = Vec::new();
-            for i in 0..m {
-                if masses[i] <= 0.0 {
-                    continue;
-                }
-                let covered = outer.iter().any(|&o| dist2[(i, o)] <= net_radius2);
-                if !covered {
-                    outer.push(i);
+    // One block of `n_forms` m×m accumulators per scale. Each scale's center
+    // loop is sequential and the cross-scale sum below runs in band order,
+    // so the result is bit-deterministic whether or not the scales
+    // themselves run in parallel.
+    let assemble_scale = |scale_idx: usize, eps: f64| -> Result<Vec<Array2<f64>>, BasisError> {
+        let mut out: Vec<Array2<f64>> =
+            (0..n_forms).map(|_| Array2::<f64>::zeros((m, m))).collect();
+        let cutoff2 = (MEASURE_JET_PROFILE_CUTOFF * eps) * (MEASURE_JET_PROFILE_CUTOFF * eps);
+        let inv_two_eps2 = 1.0 / (2.0 * eps * eps);
+        let scale_weight = band.log_step * eps.powf(-2.0 * order_s);
+        // Outer-quadrature coarsening: greedy ε/2-net over the centers in
+        // fixed index order (deterministic), with every center's mass
+        // aggregated to its nearest net member (lowest-index tie break).
+        let net_radius2 = 0.25 * eps * eps;
+        let mut outer: Vec<usize> = Vec::new();
+        for i in 0..m {
+            if masses[i] <= 0.0 {
+                continue;
+            }
+            let covered = outer.iter().any(|&o| dist2[(i, o)] <= net_radius2);
+            if !covered {
+                outer.push(i);
+            }
+        }
+        let mut net_mass = vec![0.0_f64; m];
+        for i in 0..m {
+            if masses[i] <= 0.0 {
+                continue;
+            }
+            let mut best = f64::INFINITY;
+            let mut best_o = usize::MAX;
+            for &o in &outer {
+                if dist2[(i, o)] < best {
+                    best = dist2[(i, o)];
+                    best_o = o;
                 }
             }
-            let mut net_mass = vec![0.0_f64; m];
-            for i in 0..m {
-                if masses[i] <= 0.0 {
-                    continue;
-                }
-                let mut best = f64::INFINITY;
-                let mut best_o = usize::MAX;
-                for &o in &outer {
-                    if dist2[(i, o)] < best {
-                        best = dist2[(i, o)];
-                        best_o = o;
-                    }
-                }
-                if best_o != usize::MAX {
-                    net_mass[best_o] += masses[i];
+            if best_o != usize::MAX {
+                net_mass[best_o] += masses[i];
+            }
+        }
+        let mut wbuf = vec![0.0_f64; n_forms];
+        for &i in &outer {
+            // Local neighbor set (always includes i itself).
+            let mut idx: Vec<usize> = Vec::new();
+            for j in 0..m {
+                if dist2[(i, j)] <= cutoff2 {
+                    idx.push(j);
                 }
             }
-            for &i in &outer {
-                // Local neighbor set (always includes i itself).
-                let mut idx: Vec<usize> = Vec::new();
-                for j in 0..m {
-                    if dist2[(i, j)] <= cutoff2 {
-                        idx.push(j);
-                    }
-                }
-                let ml = idx.len();
-                // Kernel weights and mass.
-                let mut w = Array1::<f64>::zeros(ml);
-                let mut q = 0.0_f64;
-                for (a, &j) in idx.iter().enumerate() {
-                    let wj = masses[j] * (-dist2[(i, j)] * inv_two_eps2).exp();
-                    w[a] = wj;
-                    q += wj;
-                }
-                if !(q > 0.0) {
-                    continue;
-                }
-                // Scaled local features Φ (ml × d) and weighted column means a.
-                let mut phi = Array2::<f64>::zeros((ml, d));
-                for (a, &j) in idx.iter().enumerate() {
-                    for k in 0..d {
-                        phi[(a, k)] = (centers[(j, k)] - centers[(i, k)]) / eps;
-                    }
-                }
-                let a_mean = phi.t().dot(&w) / q;
-                // B = WΦ − w·aᵀ and G = (ΦᵀWΦ)/q − a·aᵀ.
-                let mut wphi = phi.clone();
-                for (a, mut row) in wphi.outer_iter_mut().enumerate() {
-                    row.mapv_inplace(|v| v * w[a]);
-                }
-                let mut b = wphi.clone();
-                for (a, mut row) in b.outer_iter_mut().enumerate() {
-                    for k in 0..d {
-                        row[k] -= w[a] * a_mean[k];
-                    }
-                }
-                let mut g = phi.t().dot(&wphi);
-                g.mapv_inplace(|v| v / q);
-                for r in 0..d {
-                    for c in 0..d {
-                        g[(r, c)] -= a_mean[r] * a_mean[c];
-                    }
-                }
-                // (G + τI)⁻¹ via symmetric eigendecomposition; pseudo-inverse
-                // with a relative floor in the τ = 0 oracle mode.
-                let (evals, evecs) = g.eigh(Side::Lower).map_err(|e| {
-                    BasisError::InvalidInput(format!(
-                        "measure-jet local Gram eigendecomposition failed at center {i}: {e}"
-                    ))
-                })?;
-                let lam_max = evals.iter().cloned().fold(0.0_f64, f64::max);
-                let mut inv_diag = Array1::<f64>::zeros(d);
+            let ml = idx.len();
+            // Kernel weights and mass.
+            let mut w = Array1::<f64>::zeros(ml);
+            let mut q = 0.0_f64;
+            for (a, &j) in idx.iter().enumerate() {
+                let wj = masses[j] * (-dist2[(i, j)] * inv_two_eps2).exp();
+                w[a] = wj;
+                q += wj;
+            }
+            if !(q > 0.0) {
+                continue;
+            }
+            // Scaled local features Φ (ml × d) and weighted column means a.
+            let mut phi = Array2::<f64>::zeros((ml, d));
+            for (a, &j) in idx.iter().enumerate() {
                 for k in 0..d {
-                    let lam = evals[k].max(0.0);
-                    inv_diag[k] = if tau0 > 0.0 {
-                        1.0 / (lam + tau0)
-                    } else if lam > MEASURE_JET_PSEUDOINVERSE_RTOL * lam_max {
-                        1.0 / lam
-                    } else {
-                        0.0
-                    };
+                    phi[(a, k)] = (centers[(j, k)] - centers[(i, k)]) / eps;
                 }
-                // M = V·diag(inv)·Vᵀ, then the projected block B·M·Bᵀ/q.
-                let mut vm = evecs.clone();
-                for (k, mut col) in vm.axis_iter_mut(Axis(1)).enumerate() {
-                    col.mapv_inplace(|v| v * inv_diag[k]);
+            }
+            let a_mean = phi.t().dot(&w) / q;
+            // B = WΦ − w·aᵀ and G = (ΦᵀWΦ)/q − a·aᵀ.
+            let mut wphi = phi.clone();
+            for (a, mut row) in wphi.outer_iter_mut().enumerate() {
+                row.mapv_inplace(|v| v * w[a]);
+            }
+            let mut b = wphi.clone();
+            for (a, mut row) in b.outer_iter_mut().enumerate() {
+                for k in 0..d {
+                    row[k] -= w[a] * a_mean[k];
                 }
-                let m_inv = vm.dot(&evecs.t());
-                let bm = b.dot(&m_inv);
-                let coef = scale_weight * net_mass[i] * q.powf(1.0 - 2.0 * alpha);
-                // Scatter-add coef · (W − w·wᵀ/q − B·M·Bᵀ/q) into Q.
-                for (a, &ja) in idx.iter().enumerate() {
-                    let bma = bm.row(a);
-                    for (c, &jc) in idx.iter().enumerate() {
-                        let mut val = -w[a] * w[c] / q - bma.dot(&b.row(c)) / q;
-                        if a == c {
-                            val += w[a];
-                        }
-                        q_l[(ja, jc)] += coef * val;
+            }
+            let mut g = phi.t().dot(&wphi);
+            g.mapv_inplace(|v| v / q);
+            for r in 0..d {
+                for c in 0..d {
+                    g[(r, c)] -= a_mean[r] * a_mean[c];
+                }
+            }
+            // (G + τI)⁻¹ via symmetric eigendecomposition; pseudo-inverse
+            // with a relative floor in the τ = 0 oracle mode.
+            let (evals, evecs) = g.eigh(Side::Lower).map_err(|e| {
+                BasisError::InvalidInput(format!(
+                    "measure-jet local Gram eigendecomposition failed at center {i}: {e}"
+                ))
+            })?;
+            let lam_max = evals.iter().cloned().fold(0.0_f64, f64::max);
+            let mut inv_diag = Array1::<f64>::zeros(d);
+            for k in 0..d {
+                let lam = evals[k].max(0.0);
+                inv_diag[k] = if tau0 > 0.0 {
+                    1.0 / (lam + tau0)
+                } else if lam > MEASURE_JET_PSEUDOINVERSE_RTOL * lam_max {
+                    1.0 / lam
+                } else {
+                    0.0
+                };
+            }
+            // M = V·diag(inv)·Vᵀ, then the projected block B·M·Bᵀ/q.
+            let mut vm = evecs.clone();
+            for (k, mut col) in vm.axis_iter_mut(Axis(1)).enumerate() {
+                col.mapv_inplace(|v| v * inv_diag[k]);
+            }
+            let m_inv = vm.dot(&evecs.t());
+            let bm = b.dot(&m_inv);
+            let base = scale_weight * net_mass[i] * q.powf(1.0 - 2.0 * alpha);
+            weights(scale_idx, eps, q, base, &mut wbuf);
+            // Scatter-add wbuf[k] · (W − w·wᵀ/q − B·M·Bᵀ/q) into each form.
+            for (a, &ja) in idx.iter().enumerate() {
+                let bma = bm.row(a);
+                for (c, &jc) in idx.iter().enumerate() {
+                    let mut val = -w[a] * w[c] / q - bma.dot(&b.row(c)) / q;
+                    if a == c {
+                        val += w[a];
+                    }
+                    for (k, out_k) in out.iter_mut().enumerate() {
+                        out_k[(ja, jc)] += wbuf[k] * val;
                     }
                 }
             }
-            Ok(q_l)
-        })
-        .collect::<Result<Vec<_>, BasisError>>()?;
+        }
+        Ok(out)
+    };
 
-    let mut q_total = Array2::<f64>::zeros((m, m));
-    for q_l in per_scale {
-        q_total += &q_l;
+    let n_scales = band.eps.len();
+    let parallel_ok =
+        m.saturating_mul(m)
+            .saturating_mul(n_scales)
+            .saturating_mul(n_forms)
+            <= MEASURE_JET_PARALLEL_FORM_BUDGET_DOUBLES;
+    let per_scale: Vec<Vec<Array2<f64>>> = if parallel_ok {
+        band.eps
+            .par_iter()
+            .enumerate()
+            .map(|(scale_idx, &eps)| assemble_scale(scale_idx, eps))
+            .collect::<Result<Vec<_>, BasisError>>()?
+    } else {
+        band.eps
+            .iter()
+            .enumerate()
+            .map(|(scale_idx, &eps)| assemble_scale(scale_idx, eps))
+            .collect::<Result<Vec<_>, BasisError>>()?
+    };
+
+    let mut totals: Vec<Array2<f64>> = (0..n_forms).map(|_| Array2::<f64>::zeros((m, m))).collect();
+    for scale_forms in per_scale {
+        for (total, part) in totals.iter_mut().zip(scale_forms) {
+            *total += &part;
+        }
     }
-    // Numerical symmetrization (the analytic form is symmetric).
-    let q_sym = (&q_total + &q_total.t()) * 0.5;
-    Ok(q_sym)
+    // Numerical symmetrization (every analytic form here is symmetric).
+    Ok(totals
+        .into_iter()
+        .map(|t| (&t + &t.t()) * 0.5)
+        .collect())
+}
+
+/// The multiscale jet-residual energy `Q` (m × m, symmetric PSD) on the
+/// center set. See the module docs for the formula and contracts; the local
+/// residual form is assembled through the closed-form identities
+///
+/// ```text
+///   CᵀWC          = W − w·wᵀ/q,
+///   B = CᵀWΦ̃     = WΦ − w·aᵀ          (a = Φᵀw/q),
+///   G = Φ̃ᵀWΦ̃/q  = (ΦᵀWΦ)/q − a·aᵀ,
+///   R_loc         = CᵀWC − B·(G + τI)⁻¹·Bᵀ/q,
+/// ```
+///
+/// with `(G + τI)⁻¹` realized through the symmetric eigendecomposition
+/// (pseudo-inverse with relative threshold when `τ = 0`). One walk of
+/// [`assemble_weighted_forms`] with the unit weight.
+pub fn measure_jet_energy_form(
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+    band: &MeasureJetBand,
+    order_s: f64,
+    alpha: f64,
+    tau0: f64,
+) -> Result<Array2<f64>, BasisError> {
+    let mut forms = assemble_weighted_forms(
+        centers,
+        masses,
+        band,
+        order_s,
+        alpha,
+        tau0,
+        1,
+        &|_, _, _, base, out: &mut [f64]| out[0] = base,
+    )?;
+    Ok(forms.swap_remove(0))
+}
+
+/// The energy together with its exact first and second (s, α) jets — the
+/// measure-jet ψ-channel feedstock. Both dials enter only through the
+/// per-block log-weights, so with `g_s = −2 ln ε` and `g_α = −2 ln q`:
+///
+/// ```text
+///   ∂Q/∂s = Σ g_s·w·R,   ∂²Q/∂s² = Σ g_s²·w·R,
+///   ∂Q/∂α = Σ g_α·w·R,   ∂²Q/∂α² = Σ g_α²·w·R,   ∂²Q/∂s∂α = Σ g_s·g_α·w·R,
+/// ```
+///
+/// scattered from the SAME residual blocks as `Q` in one pass (no second
+/// assembly that could drift). FD-gated in this module's tests.
+pub fn measure_jet_energy_form_with_jets(
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+    band: &MeasureJetBand,
+    order_s: f64,
+    alpha: f64,
+    tau0: f64,
+) -> Result<MeasureJetEnergyJets, BasisError> {
+    let mut forms = assemble_weighted_forms(
+        centers,
+        masses,
+        band,
+        order_s,
+        alpha,
+        tau0,
+        6,
+        &|_, eps: f64, q: f64, base: f64, out: &mut [f64]| {
+            let gs = -2.0 * eps.ln();
+            let ga = -2.0 * q.max(f64::MIN_POSITIVE).ln();
+            out[0] = base;
+            out[1] = gs * base;
+            out[2] = gs * gs * base;
+            out[3] = ga * base;
+            out[4] = ga * ga * base;
+            out[5] = gs * ga * base;
+        },
+    )?;
+    let d2q_ds_dalpha = forms.pop().expect("six assembled forms");
+    let d2q_dalpha2 = forms.pop().expect("six assembled forms");
+    let dq_dalpha = forms.pop().expect("six assembled forms");
+    let d2q_ds2 = forms.pop().expect("six assembled forms");
+    let dq_ds = forms.pop().expect("six assembled forms");
+    let q = forms.pop().expect("six assembled forms");
+    Ok(MeasureJetEnergyJets {
+        q,
+        dq_ds,
+        d2q_ds2,
+        dq_dalpha,
+        d2q_dalpha2,
+        d2q_ds_dalpha,
+    })
+}
+
+/// Per-scale energy decomposition of center values `v`: element ℓ is
+/// `vᵀ Q_ℓ v`, the detail energy charged at scale `ε_ℓ`. Sums exactly to
+/// `vᵀQv` (same blocks, one-hot weights) and doubles as the scale spectrum
+/// diagnostic of the fitted intensity field — where along the band the
+/// signal lives, and the analytic carrier of `∂/∂s` reweightings.
+pub fn measure_jet_scale_spectrum(
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+    band: &MeasureJetBand,
+    order_s: f64,
+    alpha: f64,
+    tau0: f64,
+    values: ArrayView1<'_, f64>,
+) -> Result<Vec<f64>, BasisError> {
+    if values.len() != centers.nrows() {
+        crate::bail_dim_basis!(
+            "measure-jet scale spectrum needs one value per center: {} values for {} centers",
+            values.len(),
+            centers.nrows()
+        );
+    }
+    let n_scales = band.eps.len();
+    let forms = assemble_weighted_forms(
+        centers,
+        masses,
+        band,
+        order_s,
+        alpha,
+        tau0,
+        n_scales,
+        &|scale_idx, _, _, base, out: &mut [f64]| {
+            for (k, slot) in out.iter_mut().enumerate() {
+                *slot = if k == scale_idx { base } else { 0.0 };
+            }
+        },
+    )?;
+    let v = values.to_owned();
+    Ok(forms.iter().map(|q_l| v.dot(&q_l.dot(&v))).collect())
+}
+
+/// The support diagnostic `ε ↦ q_ε(x★)`: kernel mass of the (frozen) center
+/// quadrature seen from each query point at every band scale (n_query × L).
+/// A query ON the web sees its strand's mass already at fine scales; a query
+/// OFF the web accumulates mass only once ε reaches its distance to the
+/// support. This is the on-web-ness statistic shipped alongside predictions
+/// — smooth, multiresolution, derived from the measure with no neighbor
+/// sets.
+pub fn measure_jet_support_curve(
+    queries: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+    eps_band: &[f64],
+) -> Result<Array2<f64>, BasisError> {
+    if queries.ncols() != centers.ncols() {
+        crate::bail_dim_basis!(
+            "measure-jet support curve dimension mismatch: queries d={} centers d={}",
+            queries.ncols(),
+            centers.ncols()
+        );
+    }
+    if masses.len() != centers.nrows() {
+        crate::bail_dim_basis!(
+            "measure-jet support curve mass/center mismatch: {} masses for {} centers",
+            masses.len(),
+            centers.nrows()
+        );
+    }
+    if eps_band.is_empty() || eps_band.iter().any(|e| !(e.is_finite() && *e > 0.0)) {
+        crate::bail_invalid_basis!("measure-jet support curve needs a nonempty positive band");
+    }
+    validate_finite_points(queries, "queries")?;
+    validate_finite_points(centers, "centers")?;
+    let nq = queries.nrows();
+    let nl = eps_band.len();
+    let mut out = Array2::<f64>::zeros((nq, nl));
+    out.axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(qi, mut row)| {
+            let x = queries.row(qi);
+            for (li, &eps) in eps_band.iter().enumerate() {
+                let inv_two_eps2 = 1.0 / (2.0 * eps * eps);
+                let mut acc = 0.0_f64;
+                for (j, c) in centers.outer_iter().enumerate() {
+                    let mut s = 0.0_f64;
+                    for k in 0..c.len() {
+                        let dlt = x[k] - c[k];
+                        s += dlt * dlt;
+                    }
+                    acc += masses[j] * (-s * inv_two_eps2).exp();
+                }
+                row[li] = acc;
+            }
+        });
+    Ok(out)
 }
 
 /// Gaussian representer features `exp(−‖x − c‖²/(2ℓ²))` (n × m).
@@ -868,6 +1132,137 @@ mod tests {
             e_fast > 10.0 * e_slow,
             "alternating values must pay >> a slow trend: fast {e_fast:.3e} vs slow {e_slow:.3e}"
         );
+    }
+
+    /// The exact (s, α) jets must match central finite differences of the
+    /// energy — the FD gate the ψ-channel stage will inherit (the discipline
+    /// whose absence is exactly the objective↔gradient desync bug class).
+    #[test]
+    fn energy_jets_match_finite_differences() {
+        let (centers, masses) = two_cluster_centers();
+        let band = band_for(&centers);
+        let (s0, a0, tau) = (1.3, 0.8, 1e-3);
+        let jets =
+            measure_jet_energy_form_with_jets(centers.view(), masses.view(), &band, s0, a0, tau)
+                .expect("jets");
+        let q_at = |s: f64, a: f64| {
+            measure_jet_energy_form(centers.view(), masses.view(), &band, s, a, tau)
+                .expect("energy form")
+        };
+        // Base form must equal the plain assembly bit-for-bit (same walk).
+        let q_plain = q_at(s0, a0);
+        for (a, b) in jets.q.iter().zip(q_plain.iter()) {
+            assert!((a - b).abs() <= 1e-14 * (1.0 + b.abs()), "Q drift {a} vs {b}");
+        }
+        let h = 1e-5;
+        let checks: [(&str, &Array2<f64>, Array2<f64>); 5] = [
+            ("dq_ds", &jets.dq_ds, {
+                let (p, m_) = (q_at(s0 + h, a0), q_at(s0 - h, a0));
+                (&p - &m_) / (2.0 * h)
+            }),
+            ("d2q_ds2", &jets.d2q_ds2, {
+                let (p, c, m_) = (q_at(s0 + h, a0), q_at(s0, a0), q_at(s0 - h, a0));
+                (&(&p + &m_) - &(&c * 2.0)) / (h * h)
+            }),
+            ("dq_dalpha", &jets.dq_dalpha, {
+                let (p, m_) = (q_at(s0, a0 + h), q_at(s0, a0 - h));
+                (&p - &m_) / (2.0 * h)
+            }),
+            ("d2q_dalpha2", &jets.d2q_dalpha2, {
+                let (p, c, m_) = (q_at(s0, a0 + h), q_at(s0, a0), q_at(s0, a0 - h));
+                (&(&p + &m_) - &(&c * 2.0)) / (h * h)
+            }),
+            ("d2q_ds_dalpha", &jets.d2q_ds_dalpha, {
+                let pp = q_at(s0 + h, a0 + h);
+                let pm = q_at(s0 + h, a0 - h);
+                let mp = q_at(s0 - h, a0 + h);
+                let mm = q_at(s0 - h, a0 - h);
+                (&(&pp - &pm) - &(&mp - &mm)) / (4.0 * h * h)
+            }),
+        ];
+        for (name, analytic, fd) in checks.iter() {
+            let scale = fd.iter().fold(1e-30_f64, |acc, v| acc.max(v.abs()));
+            for (a, b) in analytic.iter().zip(fd.iter()) {
+                assert!(
+                    (a - b).abs() <= 5e-5 * scale,
+                    "{name} jet mismatch: analytic {a:.6e} vs FD {b:.6e} (scale {scale:.3e})"
+                );
+            }
+        }
+    }
+
+    /// The per-scale spectrum must sum exactly to the total energy (same
+    /// blocks, one-hot weights) and concentrate rough content at fine
+    /// scales.
+    #[test]
+    fn scale_spectrum_sums_to_total_and_localizes_roughness() {
+        let m = 24usize;
+        let centers = Array2::<f64>::from_shape_fn((m, 2), |(i, k)| {
+            let t = i as f64 / (m as f64 - 1.0);
+            if k == 0 { t * 4.0 } else { 0.0 }
+        });
+        let masses = Array1::<f64>::from_elem(m, 1.0 / m as f64);
+        let band = band_for(&centers);
+        let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 1e-3)
+            .expect("energy form");
+        let fast = Array1::<f64>::from_shape_fn(m, |i| if i % 2 == 0 { 0.5 } else { -0.5 });
+        let spec = measure_jet_scale_spectrum(
+            centers.view(),
+            masses.view(),
+            &band,
+            1.5,
+            1.0,
+            1e-3,
+            fast.view(),
+        )
+        .expect("spectrum");
+        assert_eq!(spec.len(), band.eps.len());
+        let total = fast.dot(&q.dot(&fast));
+        let sum: f64 = spec.iter().sum();
+        assert!(
+            (sum - total).abs() <= 1e-10 * total.abs().max(1e-30),
+            "spectrum must sum to vᵀQv: {sum:.6e} vs {total:.6e}"
+        );
+        // Alternating-sign content lives at the finest scale of the band.
+        let finest = spec[0];
+        let coarsest = *spec.last().expect("nonempty spectrum");
+        assert!(
+            finest > coarsest,
+            "alternating values must charge fine scales hardest: fine {finest:.3e} vs coarse {coarsest:.3e}"
+        );
+    }
+
+    /// The support curve separates on-web from off-web queries at fine
+    /// scales and grows monotonically in ε for any query.
+    #[test]
+    fn support_curve_separates_on_web_from_off_web() {
+        let m = 24usize;
+        let centers = Array2::<f64>::from_shape_fn((m, 2), |(i, k)| {
+            let t = i as f64 / (m as f64 - 1.0);
+            if k == 0 { t * 4.0 } else { 0.0 }
+        });
+        let masses = Array1::<f64>::from_elem(m, 1.0 / m as f64);
+        let band = band_for(&centers);
+        let queries = array![[2.0, 0.0], [2.0, 1.5]];
+        let curves =
+            measure_jet_support_curve(queries.view(), centers.view(), masses.view(), &band.eps)
+                .expect("support curve");
+        // On-web sees strictly more mass than off-web at the finest scale.
+        assert!(
+            curves[(0, 0)] > 10.0 * curves[(1, 0)],
+            "fine-scale support must separate web from void: on {:.3e} vs off {:.3e}",
+            curves[(0, 0)],
+            curves[(1, 0)]
+        );
+        // Kernel mass is monotone in ε for every query.
+        for qi in 0..2 {
+            for li in 1..band.eps.len() {
+                assert!(
+                    curves[(qi, li)] >= curves[(qi, li - 1)] - 1e-15,
+                    "support curve must be monotone in scale (query {qi}, level {li})"
+                );
+            }
+        }
     }
 
     /// Freeze→replay: rebuilding from the first build's frozen transform and
