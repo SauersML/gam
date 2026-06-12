@@ -4406,7 +4406,9 @@ mod tests {
             vec!["x".to_string()],
             vec![(0.0, 1.0)],
         );
-        payload.validate_for_persistence().expect("scan payload validates");
+        payload
+            .validate_for_persistence()
+            .expect("scan payload validates");
         payload
             .validate_numeric_finiteness()
             .expect("scan payload is finite");
