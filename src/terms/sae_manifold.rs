@@ -14153,6 +14153,48 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.seeded_beta = None;
     }
 
+    fn accept_seed_without_outer_iterations(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<Option<f64>, EstimationError> {
+        if self.baseline_term.k_atoms() != 1 {
+            return Ok(None);
+        }
+        let baseline_flat = self.baseline_rho.to_flat();
+        if baseline_flat.len() != rho.len()
+            || baseline_flat
+                .iter()
+                .zip(rho.iter())
+                .any(|(a, b)| a.to_bits() != b.to_bits())
+        {
+            return Ok(None);
+        }
+        let fitted = self.baseline_term.fitted();
+        let Some(seed_ev) = reconstruction_explained_variance(self.target.view(), fitted.view())
+        else {
+            return Ok(None);
+        };
+        if seed_ev < SAE_PRISTINE_SEED_EV_RETAIN_FLOOR {
+            return Ok(None);
+        }
+        self.term = self.baseline_term.clone();
+        self.current_rho = self.baseline_rho.clone();
+        self.last_loss = Some(
+            self.term
+                .loss(self.target.view(), &self.current_rho)
+                .map_err(EstimationError::RemlOptimizationFailed)?,
+        );
+        self.term
+            .penalized_objective_total(
+                self.target.view(),
+                &self.current_rho,
+                self.registry.as_ref(),
+                1.0,
+            )
+            .map(Some)
+            .map_err(EstimationError::RemlOptimizationFailed)
+    }
+
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
         // Contract (see src/solver/reml/continuation.rs:727-737): an empty-β
         // seed means "no warm-start available, use your own cold default" and
