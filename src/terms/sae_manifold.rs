@@ -11188,7 +11188,94 @@ impl SaeManifoldTerm {
             repar.decoder_transport.view(),
             old_smooth_penalty.view(),
         )?;
-        atom.unit_speed_canonicalized = true;
+        atom.chart_canonicalized = true;
+        Ok(true)
+    }
+
+    /// Apply the minimum-isometry-defect flow reparameterization (#1019
+    /// stage 2) to one eligible `d = 2` torus atom. Returns `Ok(true)` when
+    /// the atom was canonicalized, `Ok(false)` on an honest skip (degenerate
+    /// or already-canonical chart, only folded/non-improving flow candidates,
+    /// basis not closed under the reparameterization, or per-row image drift
+    /// above tolerance).
+    fn canonicalize_atom_torus_flow_chart(
+        &mut self,
+        atom_idx: usize,
+        period: f64,
+    ) -> Result<bool, String> {
+        use crate::terms::sae_chart_canonicalization::{
+            CHART_RECOMPOSITION_REL_TOL, torus_isometry_flow_reparameterization,
+        };
+        let n = self.n_obs();
+        if n == 0 {
+            return Ok(false);
+        }
+        let Some(evaluator) = self.atoms[atom_idx].basis_evaluator.as_ref().cloned() else {
+            return Ok(false);
+        };
+        let coords = self.assignment.coords[atom_idx].as_matrix();
+        let Some(repar) = torus_isometry_flow_reparameterization(
+            evaluator.as_ref(),
+            self.atoms[atom_idx].decoder_coefficients.view(),
+            coords.view(),
+            period,
+        )?
+        else {
+            return Ok(false);
+        };
+
+        // Per-row basis/jet at the canonical coordinates (eligibility pins
+        // `homotopy_eta == 1.0`, so the plain evaluate IS the dialed path).
+        let new_coords = repar.new_row_coords.clone();
+        let (new_phi, new_jet) = evaluator.evaluate(new_coords.view())?;
+        if new_phi.dim() != self.atoms[atom_idx].basis_values.dim()
+            || new_jet.dim() != self.atoms[atom_idx].basis_jacobian.dim()
+        {
+            return Err(format!(
+                "SaeManifoldTerm::canonicalize_atom_torus_flow_chart: canonical basis {:?} / jet {:?} must match the fitted shapes {:?} / {:?}",
+                new_phi.dim(),
+                new_jet.dim(),
+                self.atoms[atom_idx].basis_values.dim(),
+                self.atoms[atom_idx].basis_jacobian.dim()
+            ));
+        }
+
+        // Per-row image-invariance gate: the audit grid certified the image
+        // at the transport nodes; this certifies it at the coordinates the
+        // fit actually sits on. Same honest-fallback contract as d = 1.
+        let old_fit = fast_ab(
+            &self.atoms[atom_idx].basis_values,
+            &self.atoms[atom_idx].decoder_coefficients,
+        );
+        let new_fit = fast_ab(&new_phi, &repar.new_decoder);
+        let mut fit_scale = 0.0_f64;
+        let mut max_abs = 0.0_f64;
+        for (a, b) in old_fit.iter().zip(new_fit.iter()) {
+            fit_scale = fit_scale.max(a.abs()).max(b.abs());
+            max_abs = max_abs.max((a - b).abs());
+        }
+        if !(fit_scale.is_finite() && max_abs.is_finite()) {
+            return Ok(false);
+        }
+        if fit_scale > 0.0 && max_abs > CHART_RECOMPOSITION_REL_TOL * fit_scale {
+            return Ok(false);
+        }
+
+        // Commit: canonical coordinates, basis, decoder, and the congruence-
+        // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as the affine
+        // gauge pass and the d = 1 path).
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
+        let flat = Array1::from_iter(new_coords.iter().copied());
+        self.assignment.coords[atom_idx].set_flat(flat.view());
+        let atom = &mut self.atoms[atom_idx];
+        atom.basis_values = new_phi;
+        atom.basis_jacobian = new_jet;
+        atom.decoder_coefficients = repar.new_decoder;
+        atom.smooth_penalty = transport_smooth_penalty_for_decoder(
+            repar.decoder_transport.view(),
+            old_smooth_penalty.view(),
+        )?;
+        atom.chart_canonicalized = true;
         Ok(true)
     }
 
@@ -13553,19 +13640,18 @@ impl SaeManifoldOuterObjective {
             fitted_rho = pristine_seed_rho;
             fitted_loss = seed_loss;
         }
-        // #1019 stage 1 — the post-fit assembly seam: canonicalize every
-        // eligible d = 1 atom's chart to its arc-length (unit-speed)
-        // representative BEFORE the fitted term is handed to the payload /
-        // residual-gauge certificate. Internally objective-gated and
-        // image-frozen (the fitted state is restored verbatim on any failure
-        // or tolerance breach), so the fit this returns is never degraded —
-        // an error here is a refused canonicalization, not a broken fit.
-        if let Err(err) = fitted.canonicalize_unit_speed_charts_post_fit(
-            target.view(),
-            &fitted_rho,
-            registry.as_ref(),
-        ) {
-            log::debug!("into_fitted: unit-speed chart canonicalization refused: {err}");
+        // #1019 — the post-fit assembly seam: canonicalize every eligible
+        // atom's chart to its canonical Diff(M) representative (arc length
+        // for d = 1, minimum-isometry-defect flow for d = 2 torus atoms)
+        // BEFORE the fitted term is handed to the payload / residual-gauge
+        // certificate. Internally objective-gated and image-frozen (the
+        // fitted state is restored verbatim on any failure or tolerance
+        // breach), so the fit this returns is never degraded — an error here
+        // is a refused canonicalization, not a broken fit.
+        if let Err(err) =
+            fitted.canonicalize_charts_post_fit(target.view(), &fitted_rho, registry.as_ref())
+        {
+            log::debug!("into_fitted: chart canonicalization refused: {err}");
         }
         (fitted, fitted_rho, fitted_loss)
     }
