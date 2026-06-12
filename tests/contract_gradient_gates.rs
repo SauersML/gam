@@ -760,7 +760,7 @@ fn survival_single_block_model(active_lambda: f64) -> WorkingModelSurvival {
 
 fn survival_laml_net_single_block_row() -> Vec<GradientChannel> {
     let model = survival_single_block_model(1.0);
-    let beta0 = array![-2.5_f64, 1.0];
+    let beta0 = Array1::<f64>::zeros(2);
     let rho = array![0.3];
     let rho_slice = rho.as_slice().expect("contiguous rho");
     let analytic = model
