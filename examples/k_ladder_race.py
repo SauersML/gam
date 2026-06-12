@@ -31,6 +31,32 @@ DEFAULT_FIG = "/mnt/work/exp/figI_k_ladder.png"
 MIXES = ("circle-only", "euclidean-only", "mixed")
 
 
+def _estimated_basis_size(basis: str, d_atom: int, n_obs: int) -> int:
+    if basis in {"circle", "periodic"}:
+        return 2 * max(1, int(d_atom)) + 1
+    if basis == "sphere":
+        return 7
+    if basis == "torus":
+        return (2 * 3 + 1) ** max(1, int(d_atom))
+    center_floor = max(8, int(d_atom) + 2)
+    return min(max(center_floor, 32), max(1, int(n_obs)))
+
+
+def sae_candidate_plan(n_obs: int, p_out: int, bases: list[str], dims: list[int]) -> dict[str, Any]:
+    import gamfit
+
+    total_basis = sum(_estimated_basis_size(basis, dim, n_obs) for basis, dim in zip(bases, dims))
+    border_dim = int(total_basis) * int(p_out)
+    plan = gamfit._sae_manifold.rust_module().sae_streaming_plan(
+        int(n_obs),
+        int(total_basis),
+        len(bases),
+        max(int(d) for d in dims),
+        border_dim,
+    )
+    return dict(plan)
+
+
 def load_activations(
     path: str,
     *,
@@ -195,6 +221,12 @@ def run_fit_worker(args: argparse.Namespace) -> int:
         x_fit, x_eval, mu, sigma = normalize_from_fit(x_fit_raw, x_eval_raw)
         x_fit64 = x_fit.double().numpy()
         x_eval64 = x_eval.double().numpy()
+        result["solver_plan"] = sae_candidate_plan(
+            int(x_fit64.shape[0]),
+            int(x_fit64.shape[1]),
+            bases,
+            dims,
+        )
         result["data"] = {
             "acts": args.acts,
             "n_total": int(x_raw.shape[0]),
@@ -218,6 +250,7 @@ def run_fit_worker(args: argparse.Namespace) -> int:
             top_k=args.top_k,
         )
         latents = model.converged_latents(x_eval64)
+        result["solver_plan"] = getattr(model, "solver_plan", None) or result["solver_plan"]
         xhat_fit = np.asarray(model.fitted, dtype=np.float64)
         xhat_eval = np.asarray(latents["fitted"], dtype=np.float64)
         assignments_eval = np.asarray(latents["assignments"], dtype=np.float64)

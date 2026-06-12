@@ -24,6 +24,43 @@ import torch
 TOPOLOGY_DEFAULT_DIM = {"circle": 1, "sphere": 2, "torus": 2, "euclidean": 3}
 
 
+def _estimated_basis_size(topology: str, d_atom: int, n_obs: int) -> int:
+    if topology in {"circle", "periodic"}:
+        return 2 * max(1, int(d_atom)) + 1
+    if topology == "sphere":
+        return 7
+    if topology == "torus":
+        return (2 * 3 + 1) ** max(1, int(d_atom))
+    center_floor = max(8, int(d_atom) + 2)
+    return min(max(center_floor, 32), max(1, int(n_obs)))
+
+
+def sae_candidate_plan(n_obs: int, p_out: int, k: int, topology: str, d_atom: int) -> dict[str, Any]:
+    import gamfit
+
+    total_basis = int(k) * _estimated_basis_size(topology, d_atom, n_obs)
+    border_dim = total_basis * int(p_out)
+    plan = gamfit._sae_manifold.rust_module().sae_streaming_plan(
+        int(n_obs),
+        total_basis,
+        int(k),
+        int(d_atom),
+        border_dim,
+    )
+    return dict(plan)
+
+
+def plan_peak_bytes(plan: dict[str, Any]) -> int:
+    if plan.get("direct_admitted"):
+        return int(plan.get("estimated_direct_peak_bytes") or 0)
+    if plan.get("matrix_free_admitted"):
+        return int(plan.get("estimated_matrix_free_peak_bytes") or 0)
+    return max(
+        int(plan.get("estimated_direct_peak_bytes") or 0),
+        int(plan.get("estimated_matrix_free_peak_bytes") or 0),
+    )
+
+
 def load_activations(path: str, n: int | None, npy_key: str | None,
                      shuffle_seed: int | None) -> torch.Tensor:
     if path.endswith(".npy"):
@@ -254,7 +291,8 @@ def worker_gamfit():
 
 def run_candidate(x_fit: np.ndarray, x_eval: np.ndarray, k: int, topology: str, d_atom: int,
                   n_iter: int, seed: int, assignment: str, top_k: int | None,
-                  mu: np.ndarray, sigma: np.ndarray, x_eval_raw: np.ndarray) -> dict[str, Any]:
+                  mu: np.ndarray, sigma: np.ndarray, x_eval_raw: np.ndarray,
+                  solver_plan: dict[str, Any]) -> dict[str, Any]:
     gamfit = worker_gamfit()
     t0 = time.time()
     role = "union_flat_patches_null" if topology == "euclidean" else "manifold_atom"
@@ -267,6 +305,7 @@ def run_candidate(x_fit: np.ndarray, x_eval: np.ndarray, k: int, topology: str, 
         "assignment": assignment,
         "n_iter": n_iter,
         "seed": seed,
+        "solver_plan": solver_plan,
     }
     try:
         model = gamfit.sae_manifold_fit(
@@ -284,6 +323,7 @@ def run_candidate(x_fit: np.ndarray, x_eval: np.ndarray, k: int, topology: str, 
 
     out["status"] = "ok"
     out["seconds"] = time.time() - t0
+    out["solver_plan"] = getattr(model, "solver_plan", None) or solver_plan
     out["reml_score_fit"] = float(model.reml_score) if model.reml_score is not None else None
     xhat_fit = np.asarray(model.fitted, dtype=np.float64)
     xhat_eval = np.asarray(latents["fitted"], dtype=np.float64)
@@ -490,53 +530,88 @@ def main() -> None:
     mu64 = mu.numpy().astype(np.float64)
     sigma64 = sigma.numpy().astype(np.float64)
     x_eval_raw64 = x_eval_raw.numpy().astype(np.float64)
-    with concurrent.futures.ProcessPoolExecutor(max_workers=min(len(topologies), 4)) as executor:
-        futures = {}
-        for topo in topologies:
-            d = args.d_atom if args.d_atom is not None else TOPOLOGY_DEFAULT_DIM.get(topo, 2)
-            print(f"[fit] topology={topo} K={args.k} d={d} n_iter={args.n_iter}", flush=True)
-            future = executor.submit(
-                run_candidate,
-                x_fit64,
-                x_eval64,
-                args.k,
-                topo,
-                d,
-                args.n_iter,
-                args.seed,
-                args.assignment,
-                args.top_k,
-                mu64,
-                sigma64,
-                x_eval_raw64,
-            )
-            futures[future] = (topo, d)
+    candidates = []
+    for topo in topologies:
+        d = args.d_atom if args.d_atom is not None else TOPOLOGY_DEFAULT_DIM.get(topo, 2)
+        plan = sae_candidate_plan(x_fit64.shape[0], x_fit64.shape[1], args.k, topo, d)
+        candidates.append((topo, d, plan))
 
-        for future in concurrent.futures.as_completed(futures):
-            topo, d = futures[future]
-            try:
-                res = future.result()
-            except Exception as exc:
-                res = {
-                    "method": "gam_manifold_sae",
-                    "topology": topo,
-                    "K": args.k,
-                    "d_atom": d,
-                    "assignment": args.assignment,
-                    "n_iter": args.n_iter,
-                    "seed": args.seed,
-                    "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "traceback": traceback.format_exc()[-2000:],
-                }
-            print(
-                f"[fit] -> topology={topo} status={res['status']} "
-                f"eval_ev={res.get('eval_ev')} reml_fit={res.get('reml_score_fit')}",
-                flush=True,
-            )
-            report["candidates"].append(res)
-            with open(args.out, "w") as f:
-                json.dump(report, f, indent=2, default=str)
+    budget = min(int(c[2].get("in_core_budget_bytes", 0)) for c in candidates) if candidates else 0
+    batches: list[list[tuple[str, int, dict[str, Any]]]] = []
+    current: list[tuple[str, int, dict[str, Any]]] = []
+    current_peak = 0
+    for candidate in sorted(candidates, key=lambda item: plan_peak_bytes(item[2]), reverse=True):
+        peak = plan_peak_bytes(candidate[2])
+        if current and budget > 0 and current_peak + peak > budget:
+            batches.append(current)
+            current = []
+            current_peak = 0
+        current.append(candidate)
+        current_peak += peak
+    if current:
+        batches.append(current)
+    report["protocol"]["fit_budgets"]["solver_plan_batches"] = [
+        {
+            "candidates": [topo for topo, _d, _plan in batch],
+            "predicted_peak_bytes": int(sum(plan_peak_bytes(plan) for _topo, _d, plan in batch)),
+            "budget_bytes": int(budget),
+        }
+        for batch in batches
+    ]
+
+    for batch in batches:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=len(batch)) as executor:
+            futures = {}
+            for topo, d, plan in batch:
+                print(
+                    f"[fit] topology={topo} K={args.k} d={d} n_iter={args.n_iter} "
+                    f"route={plan.get('route')} predicted_peak_gib={plan_peak_bytes(plan) / 1024**3:.2f}",
+                    flush=True,
+                )
+                future = executor.submit(
+                    run_candidate,
+                    x_fit64,
+                    x_eval64,
+                    args.k,
+                    topo,
+                    d,
+                    args.n_iter,
+                    args.seed,
+                    args.assignment,
+                    args.top_k,
+                    mu64,
+                    sigma64,
+                    x_eval_raw64,
+                    plan,
+                )
+                futures[future] = (topo, d, plan)
+
+            for future in concurrent.futures.as_completed(futures):
+                topo, d, plan = futures[future]
+                try:
+                    res = future.result()
+                except Exception as exc:
+                    res = {
+                        "method": "gam_manifold_sae",
+                        "topology": topo,
+                        "K": args.k,
+                        "d_atom": d,
+                        "assignment": args.assignment,
+                        "n_iter": args.n_iter,
+                        "seed": args.seed,
+                        "solver_plan": plan,
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "traceback": traceback.format_exc()[-2000:],
+                    }
+                print(
+                    f"[fit] -> topology={topo} status={res['status']} "
+                    f"eval_ev={res.get('eval_ev')} reml_fit={res.get('reml_score_fit')}",
+                    flush=True,
+                )
+                report["candidates"].append(res)
+                with open(args.out, "w") as f:
+                    json.dump(report, f, indent=2, default=str)
 
     comparable = [*report["candidates"], *report["baselines"]]
     max_rank = max(1, min(x_fit64.shape))
