@@ -1031,7 +1031,6 @@ pub fn composition_defect(
         nullspace_dim: 0,
         residual_df: (n_grid as f64 - fit.edf).max(1.0),
         scale: SmoothTestScale::Known,
-        known_scale_lr_mean_shift: None,
     })
     .ok_or_else(|| "composition defect smooth test degenerated".to_string())?;
 

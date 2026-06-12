@@ -1,10 +1,10 @@
 //! Lawley (1956) cumulant assembly for Bartlett corrections (#939).
 //!
-//! [`crate::inference::higher_order`] owns the correction *plumbing*: given the
+//! [`crate::inference::higher_order`] owns the mean-to-factor helper: given the
 //! second-order null mean `E[W] = q + ε_k − ε_{k−q}` of a likelihood-ratio
-//! statistic, it rescales the statistic so the `χ²_q` reference is accurate to
-//! `O(n⁻²)`. This module computes the missing analytic ingredient — the Lawley
-//! ε terms — exactly, from per-row expected log-likelihood derivative cumulants.
+//! statistic, it returns the Bartlett factor `E[W] / q`. This module computes
+//! the missing analytic ingredient — the Lawley ε terms — exactly, from per-row
+//! expected log-likelihood derivative cumulants.
 //!
 //! # Lawley's expansion
 //!
@@ -57,9 +57,9 @@
 //!
 //! The reduction is verified against the raw six-index Lawley sum in tests, and
 //! against two *exact* finite-sample distributions: the exponential/log-link
-//! intercept model, where `E[W] = 2n(log n − ψ(n)) = 1 + 1/(6n) + O(n⁻²)`
-//! exactly, and the Poisson/log intercept model by exact pmf summation, where
-//! the classical factor is `1/(6nλ)`.
+//! intercept model, where exact `E[W] = 2n(log n − ψ(n))` with expansion
+//! `1 + 1/(6n) + O(n⁻³)`, and the Poisson/log intercept model by exact pmf
+//! summation, where the classical factor is `1/(6nλ)`.
 //!
 //! # Penalized models
 //!
@@ -68,9 +68,8 @@
 //! When the null value annihilates the penalty (`S_λ β₀ = 0` — the usual
 //! smooth-term null "this smooth is zero"), the penalized score has mean zero
 //! at the null and Lawley's expansion applies verbatim with the penalized
-//! information: pass `penalty` to fold `S_λ` into `K`. The remaining gap to a
-//! fully honest smooth-term correction is the sampling variation of ρ̂, which
-//! is NOT covered here and is tracked on #939.
+//! information: pass `penalty` to fold `S_λ` into `K`. This remains LR-only
+//! machinery; it is not a calibration for Wood's rank-truncated Wald statistic.
 //!
 //! Cost: `O(n²k)` time and `O(n²)` memory for the pair matrix `E` — fine for
 //! the small-`n` regimes where Bartlett corrections matter (the correction is
@@ -346,10 +345,10 @@ pub fn lawley_epsilon(
     Ok(epsilon)
 }
 
-/// Row cap for consumers that build the `O(n²)`-memory pair matrix `E` per
-/// tested term (the smooth-summary Bartlett wiring): at `n = 2048` the matrix
-/// is 32 MB and the `O(n⁻¹)` correction is still resolvable; beyond that the
-/// first-order test is already calibrated and the quadratic cost buys nothing.
+/// Row cap for LR consumers that build the `O(n²)`-memory pair matrix `E` per
+/// tested block: at `n = 2048` the matrix is 32 MB and the `O(n⁻¹)` correction
+/// is still resolvable; beyond that the first-order LR reference is already
+/// calibrated and the quadratic cost buys nothing.
 pub const LAWLEY_PAIR_MATRIX_MAX_ROWS: usize = 2048;
 
 /// Lawley's second-order mean shift `Δε = ε_k − ε_{k−q}` of the LR statistic
@@ -415,9 +414,8 @@ pub fn lawley_lr_mean_shift(
 
 /// The Lawley LR Bartlett factor `c = E[W]/d = 1 + (ε_k − ε_{k−q})/d` for the
 /// null "`tested` is zero", referenced against `χ²_d` with `d = ref_df` (the
-/// consumer's reference degrees of freedom — `q` for an exact LR test, the
-/// Wood trace-corrected df in the penalized smooth-term setting, where `Δε`
-/// already carries the penalty through the information; module docs).
+/// consumer's LR reference degrees of freedom; `Δε` already carries any penalty
+/// through the information, as scoped in the module docs).
 pub fn lawley_lr_bartlett_factor(
     x: ArrayView2<'_, f64>,
     kappas: &[RowKappas],
@@ -431,7 +429,13 @@ pub fn lawley_lr_bartlett_factor(
         ));
     }
     let shift = lawley_lr_mean_shift(x, kappas, penalty, tested)?;
-    let factor = 1.0 + shift / ref_df;
+    let mean_w = ref_df + shift;
+    let factor = crate::inference::higher_order::bartlett_factor_from_mean(mean_w, ref_df)
+        .ok_or_else(|| {
+            format!(
+                "lawley_lr_bartlett_factor: degenerate mean {mean_w} (Δε = {shift}, d = {ref_df})"
+            )
+        })?;
     if !(factor.is_finite() && factor > 0.0) {
         return Err(format!(
             "lawley_lr_bartlett_factor: degenerate factor {factor} (Δε = {shift}, d = {ref_df})"
@@ -561,7 +565,7 @@ mod tests {
     #[test]
     fn exponential_intercept_matches_exact_digamma_expansion() {
         // y_i ~ Exponential(mean μ), log link, intercept-only. Exact null mean:
-        // E[W] = 2n(log n − ψ(n)) = 1 + 1/(6n) + O(n⁻²) (ȳ ~ Gamma(n, μ/n)).
+        // E[W] = 2n(log n − ψ(n)) = 1 + 1/(6n) + O(n⁻³) (ȳ ~ Gamma(n, μ/n)).
         let eta = 0.4;
         let mut residual_prev = f64::INFINITY;
         for &n in &[8usize, 16, 32] {
@@ -630,8 +634,10 @@ mod tests {
     /// CERTIFICATION FIXTURE 1 (#939, Gaussian known variance): every third and
     /// fourth expected cumulant and every η-derivative of the curvature vanish
     /// (ℓᵢ = −½(yᵢ−ηᵢ)²/φ is exactly quadratic), so ε_k = ε_{k−q} = 0 and the
-    /// Lawley LR Bartlett factor is EXACTLY 1 at every n — the χ²_q reference
-    /// is already exact and the machinery must not touch it.
+    /// Lawley LR Bartlett factor is exactly 1 at every n. The χ²_q reference is
+    /// exactly calibrated only in the unpenalized quadratic model; with a penalty
+    /// the statistic is a weighted χ² form, e.g. one-parameter ridge gives
+    /// `(n / (n + λ))χ²₁`.
     #[test]
     fn gaussian_known_variance_lr_factor_is_exactly_one() {
         let n = 20;
@@ -672,8 +678,8 @@ mod tests {
         }
     }
 
-    /// CERTIFICATION FIXTURE 2 (#939, Exponential rate, scalar MLE): exact
-    /// analytic Bartlett factor `c = 1 + 1/(6n)`.
+    /// CERTIFICATION FIXTURE 2 (#939, Exponential rate, scalar MLE): Lawley's
+    /// analytic second-order Bartlett factor is `c = 1 + 1/(6n)`.
     ///
     /// Derivation. yᵢ ~ Exp(rate θ), ℓ(θ) = n·log θ − θ·Σyᵢ, θ̂ = 1/ȳ. The LR
     /// statistic for H₀: θ = θ₀ at the truth is
@@ -681,10 +687,11 @@ mod tests {
     /// With T = θ₀·Σyᵢ ~ Gamma(n, 1): E[T] = n, E[log T] = ψ(n), so
     ///   E[W] = 2(E[T] − n) + 2n(log n − E[log T]) = 2n(log n − ψ(n))   (exact).
     /// The digamma expansion ψ(n) = log n − 1/(2n) − 1/(12n²) + O(n⁻⁴) gives
-    ///   E[W] = 1 + 1/(6n) + O(n⁻³)  ⇒  c = 1 + 1/(6n).
+    ///   E[W] = 1 + 1/(6n) + O(n⁻³).
     /// The tested block is the whole (intercept-only) design — a fully
     /// specified null, ε₀ = 0 — and the factor must match both the analytic
-    /// 1 + 1/(6n) (to machine precision) and the exact digamma mean (to O(n⁻²)).
+    /// 1 + 1/(6n) (to machine precision) and the exact digamma mean through the
+    /// expected higher-order remainder.
     #[test]
     fn exponential_rate_lr_factor_is_one_plus_one_sixth_n() {
         let eta = -0.7; // ε is reparametrization-invariant; any η works.
