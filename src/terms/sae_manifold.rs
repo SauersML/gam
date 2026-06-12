@@ -9372,6 +9372,21 @@ impl SaeManifoldTerm {
         })
     }
 
+    /// Public analytic outer-ρ gradient at a converged inner state, constructing
+    /// the deflated arrow solver from the supplied cache. Use this seam from
+    /// integration tests and external consumers that have a converged
+    /// `(loss, cache)` from [`Self::reml_criterion_with_cache`] but no access to
+    /// the crate-private `DeflatedArrowSolver`.
+    pub fn analytic_outer_rho_gradient_at_converged(
+        &self,
+        rho: &SaeManifoldRho,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+    ) -> Result<SaeOuterRhoGradientComponents, String> {
+        let solver = self.outer_gradient_arrow_solver(cache)?;
+        self.analytic_outer_rho_gradient_components(rho, loss, cache, &solver)
+    }
+
     /// Compose the SAE LAML criterion as a sum of atoms (#931 SAE pilot).
     ///
     /// This is the single seam that establishes value↔gradient coherence for

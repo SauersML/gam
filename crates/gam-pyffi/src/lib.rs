@@ -28279,6 +28279,10 @@ fn summary_smooth_terms(
         penalty_cursor += k;
         let smooth_test = if term.shape == ShapeConstraint::None {
             cov_forwald.and_then(|cov| {
+                // The summary table is built from representative inputs reconstructed
+                // from saved feature ranges (not the original training rows), so the
+                // Lawley substrate needed for the second-order Bartlett correction
+                // is not honestly available here. Report first-order p-values only.
                 wood_smooth_test(SmoothTestInput {
                     beta: fit.beta.view(),
                     covariance: cov,
@@ -28288,6 +28292,7 @@ fn summary_smooth_terms(
                     nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),
                     residual_df,
                     scale,
+                    known_scale_lr_mean_shift: None,
                 })
             })
         } else {
