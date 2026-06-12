@@ -153,6 +153,15 @@ pub struct MultinomialFamily {
     axis_derivative_cache: Arc<Mutex<Option<AxisDerivativeCache>>>,
     /// Whether this family instance contributes the full-span Jeffreys/Firth
     /// correction to the coupled custom-family solve.
+    ///
+    /// The formula REML entry (`fit_penalized_multinomial_formula`) arms this
+    /// CONDITIONALLY (#715/#753): attempt 1 fits with it disarmed (the unbiased
+    /// criterion — no Firth shrinkage toward the uniform simplex on interior
+    /// data); on separation evidence (failed solve, non-finite or saturated
+    /// logits) the fit is re-run once with it armed, because a penalty-null
+    /// direction `v` (`Sv = 0`) under softmax saturation has `(H + S_λ)v → 0`
+    /// for EVERY ρ — only a proper prior on that quotient-null subspace can
+    /// bound it, never a smoothing parameter.
     use_joint_jeffreys_term: bool,
 }
 
