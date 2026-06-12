@@ -27,6 +27,11 @@
 
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 
+/// The issue-#939 diagnostic threshold: when `|c − 1|` exceeds this, the
+/// first-order inference is materially distorted at this `n` and the corrected
+/// p-value should be trusted over the first-order one.
+pub const MATERIAL_DISTORTION_THRESHOLD: f64 = 0.10;
+
 /// A Bartlett correction: the multiplicative factor `c` such that the corrected
 /// statistic `W* = W / c` recovers the nominal reference mean, together with the
 /// corrected tail probability.
@@ -44,6 +49,14 @@ pub struct BartlettCorrection {
     /// when this exceeds `0.10` the first-order inference is materially
     /// distorted at this `n` and the corrected value should be trusted.
     pub relative_adjustment: f64,
+}
+
+impl BartlettCorrection {
+    /// `|c − 1| >` [`MATERIAL_DISTORTION_THRESHOLD`]: the issue-#939 flag that
+    /// first-order inference is materially distorted at this sample size.
+    pub fn materially_distorted(&self) -> bool {
+        self.relative_adjustment > MATERIAL_DISTORTION_THRESHOLD
+    }
 }
 
 /// Apply a known Bartlett factor `c = E[W]/d` to a statistic `w` tested against

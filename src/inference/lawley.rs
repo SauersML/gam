@@ -141,6 +141,23 @@ pub struct RowKappas {
     pub k3_1: f64,
 }
 
+impl RowKappas {
+    /// Scale every cumulant by a prior weight `w`: a row observed with weight
+    /// `w` contributes `w·ℓᵢ` to the log-likelihood (for binomial data `w`
+    /// trials at the same η are exactly the sum of `w` independent Bernoulli
+    /// rows), so all six expected derivative cumulants scale linearly in `w`.
+    pub fn weighted(self, w: f64) -> Self {
+        Self {
+            k2: self.k2 * w,
+            k3: self.k3 * w,
+            k4: self.k4 * w,
+            k2_1: self.k2_1 * w,
+            k2_11: self.k2_11 * w,
+            k3_1: self.k3_1 * w,
+        }
+    }
+}
+
 impl RowExpectedJets {
     /// Assemble the per-row cumulant scalars by jet composition of
     /// `c = μ′/V(μ)` and `u₀ = μ′·c`.
@@ -327,6 +344,120 @@ pub fn lawley_epsilon(
         ));
     }
     Ok(epsilon)
+}
+
+/// Row cap for consumers that build the `O(n²)`-memory pair matrix `E` per
+/// tested term (the smooth-summary Bartlett wiring): at `n = 2048` the matrix
+/// is 32 MB and the `O(n⁻¹)` correction is still resolvable; beyond that the
+/// first-order test is already calibrated and the quadratic cost buys nothing.
+pub const LAWLEY_PAIR_MATRIX_MAX_ROWS: usize = 2048;
+
+/// Lawley's second-order mean shift `Δε = ε_k − ε_{k−q}` of the LR statistic
+/// for the null "the coefficients in `tested` are zero" inside the `k`-column
+/// model `x`: `E[W] = q + ε_k − ε_{k−q} + O(n⁻²)` (Lawley 1956; module docs).
+///
+/// * `ε_k` is [`lawley_epsilon`] on the full design (with `penalty` folded in).
+/// * `ε_{k−q}` is the same on the nuisance design — the tested columns removed
+///   and the matching rows/columns of `penalty` dropped. When the tested block
+///   is the whole design the null model is fully specified and `ε_0 = 0`.
+///
+/// The per-row cumulants are expectations, so both ε terms use the same
+/// `kappas`. Lawley evaluates them at the null fit; supplying cumulants at the
+/// full fit instead perturbs ε — itself `O(n⁻¹)` — by the `O(n⁻¹ᐟ²)` null-true
+/// parameter drift, an `O(n⁻³ᐟ²)` error inside the `O(n⁻²)` Bartlett target.
+///
+/// The Bartlett factor against a `d`-df reference is `c = E[W]/d = 1 + Δε/d`
+/// ([`lawley_lr_bartlett_factor`]).
+pub fn lawley_lr_mean_shift(
+    x: ArrayView2<'_, f64>,
+    kappas: &[RowKappas],
+    penalty: Option<ArrayView2<'_, f64>>,
+    tested: std::ops::Range<usize>,
+) -> Result<f64, String> {
+    let n = x.nrows();
+    let k = x.ncols();
+    if tested.start >= tested.end || tested.end > k {
+        return Err(format!(
+            "lawley_lr_mean_shift: tested block {}..{} out of range for {k} columns",
+            tested.start, tested.end
+        ));
+    }
+    // Full-model ε (validates x/kappas/penalty shapes).
+    let eps_full = lawley_epsilon(x, kappas, penalty)?;
+    let nuisance: Vec<usize> = (0..k).filter(|c| !tested.contains(c)).collect();
+    if nuisance.is_empty() {
+        // Fully specified null: the nuisance model has no parameters, ε_0 = 0.
+        return Ok(eps_full);
+    }
+    let m = nuisance.len();
+    let mut x_null = Array2::<f64>::zeros((n, m));
+    for (col_null, &col_full) in nuisance.iter().enumerate() {
+        for i in 0..n {
+            x_null[[i, col_null]] = x[[i, col_full]];
+        }
+    }
+    let penalty_null = penalty.map(|s_pen| {
+        let mut out = Array2::<f64>::zeros((m, m));
+        for (r_null, &r_full) in nuisance.iter().enumerate() {
+            for (c_null, &c_full) in nuisance.iter().enumerate() {
+                out[[r_null, c_null]] = s_pen[[r_full, c_full]];
+            }
+        }
+        out
+    });
+    let eps_null = lawley_epsilon(
+        x_null.view(),
+        kappas,
+        penalty_null.as_ref().map(|s_pen| s_pen.view()),
+    )?;
+    Ok(eps_full - eps_null)
+}
+
+/// The Lawley LR Bartlett factor `c = E[W]/d = 1 + (ε_k − ε_{k−q})/d` for the
+/// null "`tested` is zero", referenced against `χ²_d` with `d = ref_df` (the
+/// consumer's reference degrees of freedom — `q` for an exact LR test, the
+/// Wood trace-corrected df in the penalized smooth-term setting, where `Δε`
+/// already carries the penalty through the information; module docs).
+pub fn lawley_lr_bartlett_factor(
+    x: ArrayView2<'_, f64>,
+    kappas: &[RowKappas],
+    penalty: Option<ArrayView2<'_, f64>>,
+    tested: std::ops::Range<usize>,
+    ref_df: f64,
+) -> Result<f64, String> {
+    if !(ref_df.is_finite() && ref_df > 0.0) {
+        return Err(format!(
+            "lawley_lr_bartlett_factor: reference df must be finite and positive; got {ref_df}"
+        ));
+    }
+    let shift = lawley_lr_mean_shift(x, kappas, penalty, tested)?;
+    let factor = 1.0 + shift / ref_df;
+    if !(factor.is_finite() && factor > 0.0) {
+        return Err(format!(
+            "lawley_lr_bartlett_factor: degenerate factor {factor} (Δε = {shift}, d = {ref_df})"
+        ));
+    }
+    Ok(factor)
+}
+
+/// Expected jets for a known-scale GLM family/link pair at linear predictor
+/// `eta`, when the pair has an exact closed-form jet constructor. Returns
+/// `None` for pairs whose cumulant jets are not derived yet — the consumer
+/// then reports first-order inference only (#939).
+pub fn known_scale_expected_jets(
+    family: &crate::types::LikelihoodSpec,
+    eta: f64,
+) -> Option<RowExpectedJets> {
+    use crate::types::{InverseLink, ResponseFamily, StandardLink};
+    match (&family.response, &family.link) {
+        (ResponseFamily::Poisson, InverseLink::Standard(StandardLink::Log)) => {
+            Some(RowExpectedJets::poisson_log(eta))
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
+            Some(RowExpectedJets::binomial_logit(eta))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
