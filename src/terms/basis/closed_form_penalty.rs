@@ -354,17 +354,14 @@ fn bessel_k_steed_cf2(mu: f64, x: f64) -> (f64, f64) {
             return (rkmu, rk1);
         }
     }
-    // SAFETY: Steed's CF2 continued fraction for K_μ at x > 2 with
-    // |μ| ≤ 1/2 (the reduced-order, large-x branch entered by
-    // `bessel_k_bessik`) is the classical NR §6.7 algorithm, whose
-    // convergence is uniform on this domain; with x > 2, |a_i| grows
-    // linearly while |b_i| grows like x + i, so the modified Lentz
-    // tail shrinks as ~(x+i)^{-1} per step. BESSEL_K_EPS = 1e-15 is
-    // reached in well under 100 iterations for x up to 100;
-    // BESSEL_K_MAX_ITER = 10_000 is a defensive cap whose only
-    // reachable trigger would be invariant violation upstream
-    // (caller-asserted finite ν and 0 < x finite). Emitting any finite
-    // substitute here would silently corrupt the penalty matrix.
+    // SAFETY: Steed's CF2 (NR §6.7) converges uniformly for |μ| ≤ 1/2 at
+    // x > 2 — the reduced-order, large-x branch routed in by
+    // `bessel_k_bessik`. With x > 2, the modified Lentz tail shrinks as
+    // ~(x+i)^{-1}, reaching BESSEL_K_EPS = 1e-15 in well under 100
+    // iterations for x up to 100. BESSEL_K_MAX_ITER = 10_000 is a defensive
+    // cap whose only reachable trigger would be invariant violation upstream
+    // (public `bessel_k` asserts finite ν and 0 < x finite). Emitting any
+    // finite substitute here would silently corrupt the penalty matrix.
     panic!("bessel_k Steed CF2 failed to converge for mu={mu} x={x}");
 }
 
