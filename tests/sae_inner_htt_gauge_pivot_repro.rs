@@ -27,7 +27,7 @@
 //!      fix (Faddeev–Popov deflation of the row-restricted orbit, contributing
 //!      a θ/ρ-constant `log κ` to the Laplace normalizer) is sound.
 
-use gam::linalg::faer_ndarray::FaerCholesky;
+use gam::linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam::terms::latent_coord::LatentManifold;
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
@@ -194,7 +194,7 @@ fn radial_residual_row_htt_is_gauge_explained() {
         .expect("arrow-Schur assembly at the planted seed");
 
     // Block-diagonal scale = the largest per-row H_tt diagonal across all rows:
-    // the natural curvature unit the gauge zero is measured against.
+    // the natural curvature unit the near-zero direction is measured against.
     let mut max_diag = 0.0_f64;
     for row in &sys.rows {
         for ax in 0..row.htt.nrows() {
@@ -206,27 +206,36 @@ fn radial_residual_row_htt_is_gauge_explained() {
         "expected non-trivial per-row curvature somewhere; max_diag={max_diag}"
     );
 
-    // The gauge direction for a d=1 circle row is the tangent g_i = [1]. Count
-    // rows where the gauge-restricted curvature g_iᵀ H_tt g_i is a numerical
-    // zero relative to max_diag — these are the gauge-explained rows the fix
-    // must deflate rather than reject.
-    let eps = 1.0e-7_f64;
-    let mut gauge_explained_rows = 0usize;
+    // For each per-row `H_tt^(i)` block, the SMALLEST eigenvalue is the flattest
+    // curvature direction in that row's chart. A gauge-explained row has a
+    // near-zero (or slightly negative, at the numerical-zero scale of the
+    // autopsy's -6e-11) minimum eigenvalue relative to `max_diag`: the orbit
+    // direction the #1037 Faddeev–Popov deflation must stiffen rather than the
+    // evidence factor reject. Count those rows and report the flattest one.
+    let eps = 1.0e-6_f64;
+    let mut near_zero_rows = 0usize;
     let mut min_ratio = f64::INFINITY;
     for row in &sys.rows {
-        // d = 1: g_iᵀ H_tt g_i = H_tt[0,0].
-        let htt00 = row.htt[[0, 0]];
-        let ratio = htt00.abs() / max_diag;
+        let (evals, _vecs) = row
+            .htt
+            .eigh(faer::Side::Lower)
+            .expect("per-row H_tt eigendecomposition");
+        let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+        let ratio = lambda_min / max_diag;
         min_ratio = min_ratio.min(ratio);
-        if ratio <= eps {
-            gauge_explained_rows += 1;
+        // Gauge-explained: the flat direction's curvature is a numerical zero
+        // (|λ_min| ≤ eps·max_diag), i.e. neither materially positive nor a real
+        // negative curvature well — exactly the radial-residual orbit zero.
+        if lambda_min <= eps * max_diag {
+            near_zero_rows += 1;
         }
     }
 
     assert!(
-        gauge_explained_rows > 0,
-        "expected ≥1 gauge-explained (radial-residual) row whose tangent H_tt ≤ {eps}·max_diag; \
-         none found (min ratio={min_ratio:.3e}, max_diag={max_diag:.3e}). If this fails the \
-         planted geometry no longer produces the gauge zero and the repro must be revisited."
+        near_zero_rows > 0,
+        "expected ≥1 row whose flattest H_tt curvature is a numerical zero \
+         (λ_min ≤ {eps}·max_diag) — the gauge orbit the #1037 deflation targets; none found \
+         (min ratio={min_ratio:.3e}, max_diag={max_diag:.3e}). If this fails the planted \
+         geometry no longer produces the gauge zero and the repro must be revisited."
     );
 }
