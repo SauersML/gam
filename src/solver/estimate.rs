@@ -6627,6 +6627,14 @@ pub struct SmoothTermSummary {
     pub ref_df: f64,
     pub chi_sq: Option<f64>,
     pub pvalue: Option<f64>,
+    /// Second-order (Bartlett-corrected) p-value (#939), reported alongside —
+    /// never replacing — the first-order `pvalue`. `None` when no exact
+    /// correction factor is available for this term/family.
+    pub pvalue_corrected: Option<f64>,
+    /// The Bartlett factor `c = E[W]/d` behind `pvalue_corrected`; `|c − 1|`
+    /// above [`crate::inference::higher_order::MATERIAL_DISTORTION_THRESHOLD`]
+    /// means the first-order inference is materially distorted at this `n`.
+    pub bartlett_factor: Option<f64>,
     pub continuous_order: Option<ContinuousSmoothnessOrder>,
     /// Issue #340: human-readable note describing an automatic B-spline
     /// basis-shrink performed at fit time when `n` was too small for the
@@ -7058,6 +7066,41 @@ impl fmt::Display for ModelSummary {
             )?;
         }
         writeln!(f)?;
+        // #939: second-order (Bartlett-corrected) p-values, alongside — never
+        // replacing — the first-order column above. A term is flagged when
+        // |c − 1| exceeds the material-distortion threshold: at this n the
+        // first-order χ²/F reference is too far off to trust uncorrected.
+        let bartlett_terms = self
+            .smooth_terms
+            .iter()
+            .filter_map(|t| {
+                t.bartlett_factor
+                    .zip(t.pvalue_corrected)
+                    .map(|(c, p)| (&t.name, c, p))
+            })
+            .collect::<Vec<_>>();
+        if !bartlett_terms.is_empty() {
+            writeln!(f, "Second-Order (Bartlett-Corrected) P-Values:")?;
+            for (name, c, p_corr) in bartlett_terms {
+                let flag = if (c - 1.0).abs()
+                    > crate::inference::higher_order::MATERIAL_DISTORTION_THRESHOLD
+                {
+                    "  [first-order p materially distorted at this n]"
+                } else {
+                    ""
+                };
+                writeln!(
+                    f,
+                    "{:<namew$} corrected p = {:>10}  factor c = {:.4}{}",
+                    name,
+                    format_pvalue(Some(p_corr)),
+                    c,
+                    flag,
+                    namew = smoothnamew
+                )?;
+            }
+            writeln!(f)?;
+        }
         let order_terms = self
             .smooth_terms
             .iter()

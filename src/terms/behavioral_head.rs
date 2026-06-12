@@ -619,6 +619,9 @@ pub fn head_feature_significance(
                 nullspace_dim: 1,
                 residual_df,
                 scale: SmoothTestScale::Estimated,
+                // #939: the estimated-scale branch carries its own closed-form
+                // conjugate Bartlett factor; the Lawley shift is known-scale.
+                known_scale_lr_mean_shift: None,
             };
             if let Some(res) = wood_smooth_test(input) {
                 if res.p_value < best_p {

@@ -291,6 +291,51 @@ mod tests {
         assert!((0.0..=1.0).contains(&out.p_value));
     }
 
+    /// Known-scale Bartlett wiring (#939): a positive Lawley mean shift Δε
+    /// gives c = 1 + Δε/ref_df > 1, so the corrected statistic shrinks and the
+    /// corrected p-value exceeds the first-order one — reported alongside it,
+    /// with the exact factor surfaced. No shift ⇒ first-order only.
+    #[test]
+    fn known_scale_branch_applies_lawley_mean_shift() {
+        let beta = array![1.0, 2.0];
+        let cov = array![[2.0, 0.0], [0.0, 3.0]];
+        let f = array![[0.5, 0.0], [0.0, 0.25]];
+        let run = |shift: Option<f64>| {
+            wood_smooth_test(SmoothTestInput {
+                beta: beta.view(),
+                covariance: &cov,
+                influence_matrix: Some(&f),
+                coeff_range: 0..2,
+                edf: 1.0,
+                nullspace_dim: 0,
+                residual_df: 20.0,
+                scale: SmoothTestScale::Known,
+                known_scale_lr_mean_shift: shift,
+            })
+            .expect("smooth test")
+        };
+        let first_order = run(None);
+        assert!(first_order.p_value_corrected.is_none());
+        assert!(first_order.bartlett_factor.is_none());
+
+        let shift = 0.36; // Δε ⇒ c = 1 + 0.36/1.8 = 1.2 against ref_df = 1.8.
+        let corrected = run(Some(shift));
+        assert!((corrected.p_value - first_order.p_value).abs() < 1e-15);
+        let c = corrected.bartlett_factor.expect("factor");
+        assert!((c - 1.2).abs() < 1e-12, "c = {c}");
+        let p_corr = corrected.p_value_corrected.expect("corrected p");
+        assert!(
+            p_corr > corrected.p_value,
+            "c > 1 must enlarge the p-value: {} vs {}",
+            p_corr,
+            corrected.p_value
+        );
+        // Degenerate shift (c ≤ 0) must fall back to first-order only.
+        let degenerate = run(Some(-3.6));
+        assert!(degenerate.p_value_corrected.is_none());
+        assert!(degenerate.bartlett_factor.is_none());
+    }
+
     /// Rescaling the response by `c` is `β → c·β`, `Σ → c²·Σ` (the covariance
     /// is scale-included). The Wald statistic `T = β'Σ⁻β` is then invariant,
     /// and — because the estimated-scale F-statistic is `T/ref_df` with no

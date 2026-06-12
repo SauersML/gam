@@ -6921,6 +6921,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     &fit,
                     family.clone(),
                     y.view(),
+                    offset.view(),
                     reportweights.view(),
                 );
                 for st in &summary.smooth_terms {
@@ -8689,12 +8690,71 @@ fn response_column_kind_for_dataset(ds: &Dataset, y_col: usize) -> ResponseColum
     }
 }
 
+/// Build the Lawley (1956) cumulant substrate for known-scale Bartlett
+/// corrections of the smooth-term tests (#939): the dense design, per-row
+/// expected cumulant jets at the fitted linear predictor (offset included),
+/// and the fitted penalty `S_λ̂` folded over all blocks. Returns `None` when
+/// the family/link pair has no closed-form jets yet, the fit is multi-block,
+/// any shape disagrees, or `n` exceeds the `O(n²)` pair-matrix cap — the
+/// summary then reports first-order p-values only, which is always sound.
+fn lawley_known_scale_substrate(
+    design: &gam::smooth::TermCollectionDesign,
+    fit: &UnifiedFitResult,
+    family: &LikelihoodSpec,
+    offset: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Option<(
+    Array2<f64>,
+    Vec<gam::inference::lawley::RowKappas>,
+    Array2<f64>,
+)> {
+    let n = design.design.nrows();
+    let p = design.design.ncols();
+    if n == 0 || n > gam::inference::lawley::LAWLEY_PAIR_MATRIX_MAX_ROWS {
+        return None;
+    }
+    // Multi-block fits concatenate β across blocks; the substrate is the
+    // single-block mean-model design only.
+    if fit.beta.len() != p || offset.len() != n || weights.len() != n {
+        return None;
+    }
+    // Probe family/link support before paying for η.
+    gam::inference::lawley::known_scale_expected_jets(family, 0.0)?;
+    let mut eta = design.design.dot(&fit.beta);
+    eta += &offset;
+    let mut kappas = Vec::with_capacity(n);
+    for i in 0..n {
+        let w = weights[i];
+        if !(w.is_finite() && w >= 0.0 && eta[i].is_finite()) {
+            return None;
+        }
+        let jets = gam::inference::lawley::known_scale_expected_jets(family, eta[i])?;
+        kappas.push(jets.kappas().ok()?.weighted(w));
+    }
+    if fit.lambdas.len() != design.penalties.len() {
+        return None;
+    }
+    let mut s_pen = Array2::<f64>::zeros((p, p));
+    for (bp, &lambda) in design.penalties.iter().zip(fit.lambdas.iter()) {
+        if !(lambda.is_finite() && lambda >= 0.0) || bp.col_range.end > p {
+            return None;
+        }
+        for (li, gi) in bp.col_range.clone().enumerate() {
+            for (lj, gj) in bp.col_range.clone().enumerate() {
+                s_pen[[gi, gj]] += lambda * bp.local[[li, lj]];
+            }
+        }
+    }
+    Some((design.design.to_dense_cow().into_owned(), kappas, s_pen))
+}
+
 fn build_model_summary(
     design: &gam::smooth::TermCollectionDesign,
     spec: &TermCollectionSpec,
     fit: &UnifiedFitResult,
     family: LikelihoodSpec,
     y: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
 ) -> ModelSummary {
     const CONTINUOUS_ORDER_EPS: f64 = 1e-12;
@@ -8870,10 +8930,15 @@ fn build_model_summary(
             ref_df,
             chi_sq: chi_sq_opt,
             pvalue,
+            pvalue_corrected: None,
+            bartlett_factor: None,
             continuous_order: None,
             basis_note: None,
         });
     }
+    // #939: known-scale Lawley Bartlett substrate (None ⇒ first-order only).
+    let lawley_substrate =
+        lawley_known_scale_substrate(design, fit, &family, offset, weights);
     for term in &design.smooth.terms {
         let k = term.penalties_local.len();
         let term_penalty_start = penalty_cursor;
@@ -8884,6 +8949,21 @@ fn build_model_summary(
             .unwrap_or(0.0);
         penalty_cursor += k;
         let smooth_test = if term.shape == gam::smooth::ShapeConstraint::None {
+            // #939: Lawley's second-order LR mean shift Δε = ε_k − ε_{k−q} for
+            // this term's block, from the exact family cumulant jets at the
+            // fit. A degenerate assembly (singular information, etc.) simply
+            // falls back to first-order reporting.
+            let known_scale_lr_mean_shift = lawley_substrate.as_ref().and_then(
+                |(x_dense, kappas, s_pen)| {
+                    gam::inference::lawley::lawley_lr_mean_shift(
+                        x_dense.view(),
+                        kappas,
+                        Some(s_pen.view()),
+                        term.coeff_range.clone(),
+                    )
+                    .ok()
+                },
+            );
             cov_forwald.and_then(|cov| {
                 wood_smooth_test(SmoothTestInput {
                     beta: fit.beta.view(),
@@ -8898,6 +8978,7 @@ fn build_model_summary(
                     } else {
                         SmoothTestScale::Known
                     },
+                    known_scale_lr_mean_shift,
                 })
             })
         } else {
@@ -8958,6 +9039,8 @@ fn build_model_summary(
             ref_df,
             chi_sq: chi_sq_opt,
             pvalue,
+            pvalue_corrected: smooth_test.as_ref().and_then(|test| test.p_value_corrected),
+            bartlett_factor: smooth_test.as_ref().and_then(|test| test.bartlett_factor),
             continuous_order,
             basis_note,
         });
