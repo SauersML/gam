@@ -1,5 +1,10 @@
 //! Exact marginal smoothing inference over the smoothing parameters `ρ`
-//! (issue #938), Tier 0: the **PSIS certificate**.
+//! (issue #938): the Tier-0 **PSIS certificate**, plus the auto-selected
+//! escalation tiers — Tier-1 **Gauss-Hermite quadrature** over `ρ` (`K ≤ 4`,
+//! [`rho_posterior_quadrature`]) and Tier-2 **NUTS over `ρ`** with the exact
+//! profiled gradient (`K ≤ 16`, [`rho_posterior_nuts`]), routed by
+//! [`escalate_rho_posterior`] when the certificate refuses to certify the
+//! plug-in.
 //!
 //! Every GAM ecosystem conditions inference on the estimated smoothing
 //! parameters `ρ̂`; intervals from `V(β̂|ρ̂)` undercover because they ignore

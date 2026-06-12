@@ -4951,7 +4951,7 @@ where
 pub fn run_rho_criterion_nuts<F>(
     rho_hat: ArrayView1<f64>,
     outer_hessian: ArrayView2<f64>,
-    criterion_and_grad: F,
+    mut criterion_and_grad: F,
     config: &NutsConfig,
 ) -> Result<NutsResult, String>
 where
@@ -4993,7 +4993,6 @@ where
         "rho-posterior NUTS: outer-Hessian Cholesky failed",
     )?;
 
-    let mut criterion_and_grad = criterion_and_grad;
     let cost_hat = match criterion_and_grad(&mode) {
         Some((cost, _)) if cost.is_finite() => cost,
         _ => {
