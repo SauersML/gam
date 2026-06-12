@@ -10751,6 +10751,28 @@ impl SaeManifoldTerm {
         Ok(&fitted - &target)
     }
 
+    /// True when the curvature-homotopy `η` dial cannot move the basis: no
+    /// atom evaluator declares curved columns (caller-managed atoms have no
+    /// evaluator, hence no split — equally immovable). A one-harmonic periodic
+    /// bank (`M = 3`) is the canonical case: constant + fundamental are all
+    /// linear columns. Combined with an all-zero isometry ramp this makes the
+    /// entry walk's corrector problem η-invariant, which
+    /// [`SaeManifoldOuterObjective::run_curvature_homotopy_entry_at_rho`] uses
+    /// to collapse the η-grid to its first corrector.
+    fn curvature_homotopy_eta_is_inert(&self) -> Result<bool, String> {
+        for atom in &self.atoms {
+            if let Some(evaluator) = atom.basis_evaluator.as_ref()
+                && !evaluator
+                    .phi_eta_split(atom.basis_size())?
+                    .curved_cols
+                    .is_empty()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Per-atom curved-column basis derivative `∂Φ^η/∂η` (#1007): the raw
     /// (un-dialed) basis on each evaluator's *curved* columns and zero on the
     /// linear columns and on caller-managed atoms (no evaluator → no split).
@@ -12963,6 +12985,22 @@ impl SaeManifoldOuterObjective {
         let mut total_correctors = 0usize;
         let mut bifurcation: Option<CurvatureBifurcation> = None;
 
+        // Identity-homotopy shortcut: with no curved basis columns anywhere
+        // AND an all-zero isometry ramp, `solve_at_eta` poses the SAME problem
+        // at every η — the grid legs after the anchor corrector would re-solve
+        // its converged state verbatim, paying a full criterion/factorization
+        // rebuild each time. The anchor + first corrector carry all the value
+        // (certified Eckart-Young initialization + one full solve); arrive at
+        // η = 1 directly. `set_homotopy_eta(1.0)` restores the plain-evaluate
+        // fast path (η == 1 skips the dialed evaluator); the isometry weights
+        // are already at target because every ramp target is zero.
+        if isometry_targets.iter().all(|&target| target == 0.0)
+            && self.term.curvature_homotopy_eta_is_inert()?
+        {
+            self.term.set_homotopy_eta(1.0)?;
+            eta = 1.0;
+        }
+
         'walk: while eta < 1.0 {
             let eta_next = (eta + eta_step).min(1.0);
             let d_eta = eta_next - eta;
@@ -14603,6 +14641,47 @@ mod tests {
             err.contains("deflation count changed"),
             "guard must report the quotient-dimension change explicitly; got: {err}"
         );
+    }
+
+    /// The identity-homotopy shortcut's structural probe: the η dial is inert
+    /// iff no atom evaluator declares curved columns. Caller-managed atoms
+    /// (no evaluator) and one-harmonic periodic banks (M = 3: constant +
+    /// fundamental, all linear columns) are inert; an M = 7 periodic bank
+    /// dials its h ≥ 2 harmonics, so the walk must run for it.
+    #[test]
+    fn curvature_homotopy_eta_inertness_probe_tracks_curved_columns() {
+        // Caller-managed atom: no evaluator, nothing to dial.
+        let term = trivial_k1_euclidean_term();
+        assert!(term.curvature_homotopy_eta_is_inert().unwrap());
+
+        // Periodic atoms whose evaluator split declares every column linear.
+        let (term, _target, _rho) = small_two_atom_periodic_term();
+        assert!(term.curvature_homotopy_eta_is_inert().unwrap());
+
+        // M = 7 periodic: harmonics h ≥ 2 are η-dialed curved columns.
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(7).unwrap());
+        let coords = array![[0.05], [0.20], [0.55], [0.80], [0.35]];
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let atom = SaeManifoldAtom::new(
+            "periodic7",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            Array2::<f64>::zeros((7, 1)),
+            Array2::<f64>::eye(7),
+        )
+        .unwrap()
+        .with_basis_evaluator(evaluator);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((5, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        assert!(!term.curvature_homotopy_eta_is_inert().unwrap());
     }
 
     #[test]
