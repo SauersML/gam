@@ -277,9 +277,9 @@ fn streaming_band_assembly_matches_dense_oracle() {
             .max(1e-3);
         for g in 0..p {
             assert!(
-                (fit.coeff[g] - c_oracle[g][0]).abs() <= 1e-8 * c_scale,
+                (fit.coeffs[0][g] - c_oracle[g][0]).abs() <= 1e-8 * c_scale,
                 "coefficient mismatch at {g} (logλ={log_lambda}): engine={} dense={}",
-                fit.coeff[g],
+                fit.coeffs[0][g],
                 c_oracle[g][0]
             );
         }
@@ -290,7 +290,7 @@ fn streaming_band_assembly_matches_dense_oracle() {
             let mean_oracle: f64 = (0..p).map(|g| row[g] * c_oracle[g][0]).sum();
             let z = dense_solve(&a, &row.iter().map(|&v| vec![v]).collect::<Vec<_>>());
             let var_oracle: f64 = (0..p).map(|g| row[g] * z[g][0]).sum();
-            let (mean, var) = fit.predict(pt[0], pt[1]).expect("engine predict");
+            let (mean, var) = fit.predict(0, pt[0], pt[1]).expect("engine predict");
             assert!(
                 (mean - mean_oracle).abs() <= 1e-8 * mean_oracle.abs().max(1e-3),
                 "fitted mean mismatch at check {ci} (logλ={log_lambda}): engine={mean} dense={mean_oracle}"
@@ -317,7 +317,7 @@ fn reml_fit_beats_the_noise_floor() {
     let mut mse_noise = 0.0;
     for r in &rows {
         let truth = (3.0 * r[0]).sin() * (2.0 * r[1]).cos() + 0.4 * r[0] * r[1];
-        let (mean, var) = fit.predict(r[0], r[1]).expect("predict at data point");
+        let (mean, var) = fit.predict(0, r[0], r[1]).expect("predict at data point");
         assert!(var > 0.0, "posterior variance must be positive");
         mse_fit += (mean - truth) * (mean - truth);
         mse_noise += (r[2] - truth) * (r[2] - truth);
@@ -331,9 +331,9 @@ fn reml_fit_beats_the_noise_floor() {
     // Profiled σ̂² should sit near the true noise variance (uniform ±0.25).
     let true_var = noise_amp * noise_amp / 3.0;
     assert!(
-        fit.sigma2 > 0.4 * true_var && fit.sigma2 < 2.5 * true_var,
+        fit.sigma2[0] > 0.4 * true_var && fit.sigma2[0] < 2.5 * true_var,
         "profiled sigma2 {} far from true noise variance {true_var}",
-        fit.sigma2
+        fit.sigma2[0]
     );
 }
 

@@ -727,6 +727,9 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
     if !input.anisotropic_scales.is_empty() {
         nav_items.push(("sec-aniso-scales", "Anisotropy"));
     }
+    if !input.measure_jet_spectra.is_empty() {
+        nav_items.push(("sec-mjet-spectrum", "Measure-Jet"));
+    }
     if input.diagnostics.is_some() {
         nav_items.push(("sec-diagnostics", "Diagnostics"));
     }
@@ -895,6 +898,7 @@ details[open] .toggle::before {{ content:'\25BC\FE0E  '; }}
 
 {continuous_section}
 {aniso_section}
+{measure_jet_section}
 {diagnostics_section}
 {smooth_section}
 {alo_section}
@@ -916,6 +920,7 @@ details[open] .toggle::before {{ content:'\25BC\FE0E  '; }}
         edf_section = edf_section,
         continuous_section = continuous_section,
         aniso_section = aniso_section,
+        measure_jet_section = measure_jet_section,
         diagnostics_section = diagnostics_section,
         smooth_section = smooth_section,
         alo_section = alo_section,
