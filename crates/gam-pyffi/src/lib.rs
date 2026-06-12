@@ -27138,6 +27138,7 @@ fn smooth_basis_kind_label(basis: &gam::smooth::SmoothBasisSpec) -> &'static str
         S::BySmooth { .. } => "by_smooth",
         S::ByVariable { .. } => "by_variable",
         S::FactorSumToZero { .. } => "factor_sum_to_zero",
+        S::MeasureJet { .. } => "measurejet",
     }
 }
 
@@ -28429,6 +28430,7 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
         edf_blocks,
         continuous_order: Vec::new(),
         anisotropic_scales: Vec::new(),
+        measure_jet_spectra: Vec::new(),
         diagnostics: None,
         smooth_plots: Vec::new(),
         alo: None,
