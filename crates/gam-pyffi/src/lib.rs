@@ -9386,7 +9386,9 @@ fn sae_manifold_fit_inner<'py>(
             z_view,
             &basis_sizes,
             assignment_kind.as_str(),
+            alpha,
             tau,
+            jumprelu_threshold,
             seed_refine_random_state,
         )
         .map_err(py_value_error)?;
@@ -10453,9 +10455,10 @@ fn layer_transport_ladder(
 /// `U·diag(s)` from the thin SVD of the centered response.
 /// Seed each atom's decoder coefficient block via a joint ridge-regularized
 /// least-squares projection of `Z` onto the atom design `[a_init * Phi_1, ...,
-/// a_init * Phi_K]`, where `a_init` is the soft-assignment that the inner
-/// Newton driver will produce at iteration 0 from the supplied
-/// `initial_logits`.
+/// a_init * Phi_K]`, where `a_init` is the assignment map that the inner Newton
+/// driver will produce at iteration 0 from the supplied `initial_logits`.
+/// IBP-MAP uses the base `alpha` because learnable-alpha fits start with
+/// `rho0 = 0`, and JumpReLU uses the configured hard threshold.
 ///
 /// Zero-initialised decoder coefficients leave the joint-fit Arrow-Schur
 /// system in a degenerate fixed point on multi-atom configurations: the
@@ -10782,7 +10785,9 @@ fn sae_decoder_lsq_init(
     z: ArrayView2<'_, f64>,
     initial_logits: ArrayView2<'_, f64>,
     assignment_kind: &str,
+    alpha: f64,
     tau: f64,
+    jumprelu_threshold: f64,
 ) -> Result<Array3<f64>, String> {
     let k_atoms = basis_sizes.len();
     let (n_obs, p_out) = z.dim();
@@ -10811,9 +10816,9 @@ fn sae_decoder_lsq_init(
     // Compute per-row, per-atom assignment weight a_init that matches the
     // forward map of `assignment_kind` evaluated at `initial_logits`.
     let mut a_init = Array2::<f64>::zeros((n_obs, k_atoms));
-    let inv_tau = 1.0 / tau;
     match assignment_kind {
         "softmax" => {
+            let inv_tau = 1.0 / tau;
             for row in 0..n_obs {
                 let mut max_logit = f64::NEG_INFINITY;
                 for k in 0..k_atoms {
@@ -10837,34 +10842,35 @@ fn sae_decoder_lsq_init(
             }
         }
         "ibp_map" => {
+            if !alpha.is_finite() || alpha <= 0.0 {
+                return Err(format!(
+                    "sae_decoder_lsq_init: alpha must be finite and positive for IBP-MAP; got {alpha}"
+                ));
+            }
+            // Use the base alpha here. In learnable-alpha fits the first rho
+            // coordinate starts at zero, so alpha_eff = alpha at initialization.
             for row in 0..n_obs {
+                let weights =
+                    gam::terms::sae_manifold::ibp_map_row(initial_logits.row(row), tau, alpha);
                 for k in 0..k_atoms {
-                    let x = initial_logits[[row, k]] * inv_tau;
-                    let a = if x >= 0.0 {
-                        1.0 / (1.0 + (-x).exp())
-                    } else {
-                        let ex = x.exp();
-                        ex / (1.0 + ex)
-                    };
-                    a_init[[row, k]] = a;
+                    a_init[[row, k]] = weights[k];
                 }
             }
         }
         "jumprelu" => {
-            // Inner driver uses zero threshold; gate via `logit > 0`.
+            if !jumprelu_threshold.is_finite() {
+                return Err(format!(
+                    "sae_decoder_lsq_init: jumprelu_threshold must be finite; got {jumprelu_threshold}"
+                ));
+            }
             for row in 0..n_obs {
+                let weights = gam::terms::sae_manifold::jumprelu_row(
+                    initial_logits.row(row),
+                    tau,
+                    jumprelu_threshold,
+                );
                 for k in 0..k_atoms {
-                    let logit = initial_logits[[row, k]];
-                    if logit > 0.0 {
-                        let x = logit * inv_tau;
-                        let a = if x >= 0.0 {
-                            1.0 / (1.0 + (-x).exp())
-                        } else {
-                            let ex = x.exp();
-                            ex / (1.0 + ex)
-                        };
-                        a_init[[row, k]] = a;
-                    }
+                    a_init[[row, k]] = weights[k];
                 }
             }
         }
@@ -11011,7 +11017,9 @@ fn sae_em_refine_routing_seed(
     z: ArrayView2<'_, f64>,
     basis_sizes: &[usize],
     assignment_kind: &str,
+    alpha: f64,
     tau: f64,
+    jumprelu_threshold: f64,
     random_state: u64,
 ) -> Result<(), String> {
     const SAE_SEED_REFINE_ROUNDS: usize = 4;
@@ -11061,7 +11069,9 @@ fn sae_em_refine_routing_seed(
             z,
             term.assignment.logits.view(),
             assignment_kind,
+            alpha,
             tau,
+            jumprelu_threshold,
         )?;
         for atom_idx in 0..k_atoms {
             let m_k = basis_sizes[atom_idx];
@@ -12039,7 +12049,9 @@ fn sae_manifold_fit_minimal<'py>(
         z_view,
         initial_logits.view(),
         assignment_kind.as_str(),
+        alpha,
         tau,
+        jumprelu_threshold,
     )
     .map_err(py_value_error)?;
     // `plan_latent_dim` (computed above) is the optimizer's per-atom latent
