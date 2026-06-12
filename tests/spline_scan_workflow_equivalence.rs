@@ -262,6 +262,72 @@ fn scan_routed_fit_recovers_truth_at_least_as_well_as_dense_path() {
     );
 }
 
+/// #1030 benchmark + no-regression certificate at biobank scale: the scan
+/// fits a single 1-D Gaussian smooth at n = 1e6 in O(n) wall-clock and
+/// recovers the known truth — the regime where the dense design/Gram/REML
+/// route is impractical (O(n·k²) per λ-trial). Timing is logged, not gated
+/// (shared-runner wall-clock is noisy); the HARD assertions are (a) the cost
+/// scales sub-quadratically from 1e5 → 1e6 (proves O(n), not O(n²)), (b)
+/// truth recovery within the injected noise, and (c) a sane EDF. The headline
+/// scan-vs-dense ratio is recorded on the issue from the MSI run.
+#[test]
+fn spline_scan_million_row_fit_scales_linearly_and_recovers_truth() {
+    init_parallelism();
+    let cfg = gaussian_config();
+
+    let time_fit = |n: usize| -> (f64, gam::solver::spline_scan::CubicSplineScanFit) {
+        let (x, y) = training_xy(n);
+        let data = encode_xy(&x, &y);
+        let start = std::time::Instant::now();
+        let fit = fit_spline_scan_from_formula(SCAN_FORMULA, &data, &cfg)
+            .expect("scan-routed fit")
+            .expect("detection must fire for a single 1-D single-penalty Gaussian smooth");
+        (start.elapsed().as_secs_f64(), fit)
+    };
+
+    let (t_small, _) = time_fit(100_000);
+    let (t_big, fit) = time_fit(1_000_000);
+    eprintln!(
+        "[spline-scan bench] n=1e5: {t_small:.4}s | n=1e6: {t_big:.4}s | ratio={:.2} (linear ≈ 10)",
+        t_big / t_small.max(1e-9)
+    );
+
+    // Sub-quadratic scaling: a 10× n increase costs far less than 100× (the
+    // O(n²) dense-Gram blowup). Generous bound absorbs runner noise and the
+    // O(log) golden-section λ-search overhead while still excluding O(n²).
+    assert!(
+        t_big <= 30.0 * t_small.max(1e-6),
+        "scan cost grew super-linearly from n=1e5 ({t_small:.4}s) to n=1e6 ({t_big:.4}s)"
+    );
+
+    // Truth recovery at n=1e6 against the self-constructed truth (#904 style):
+    // the injected noise has half-range 0.15 (variance ≈ 0.0075), and with 1e6
+    // observations the smooth is resolved far tighter than the per-point noise.
+    let grid: Vec<f64> = (0..200).map(|i| 0.02 + 0.96 * i as f64 / 199.0).collect();
+    let mut sse = 0.0;
+    for &t in &grid {
+        let (mean, var) = fit.predict(t).expect("scan predict at scale");
+        assert!(
+            mean.is_finite() && var.is_finite() && var > 0.0,
+            "scan prediction must be finite with positive variance at x={t}"
+        );
+        sse += (mean - truth_fn(t)) * (mean - truth_fn(t));
+    }
+    let mse = sse / grid.len() as f64;
+    assert!(
+        mse < 1e-3,
+        "scan fails truth recovery at n=1e6: MSE={mse} (truth is noise-free)"
+    );
+
+    // EDF must exceed the unpenalized null-space dimension (2) and stay well
+    // below n — a real smooth was fit, not the linear trend or an interpolant.
+    let edf = fit.edf();
+    assert!(
+        edf > 2.0 && edf < 1_000.0,
+        "scan EDF {edf} outside the sane band (2, 1000) for a smooth biobank-scale fit"
+    );
+}
+
 #[test]
 fn detection_falls_through_for_ineligible_shapes() {
     init_parallelism();
