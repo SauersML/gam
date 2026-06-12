@@ -123,7 +123,7 @@ const GL4_WEIGHTS: [f64; 4] = [
 /// Naive dense assembly of S = ∫ a1²·B11 B11ᵀ + 2a1a2·B12 B12ᵀ + a2²·B22 B22ᵀ
 /// by 4-point Gauss–Legendre per axis per cell (exact: per-axis integrand
 /// degree ≤ 6 < 8 — see the engine module header).
-fn dense_penalty(lo: [f64; 2], h: [f64; 2], k: usize, a: [f64; 2]) -> Vec<Vec<f64>> {
+fn dense_penalty(h: [f64; 2], k: usize, a: [f64; 2]) -> Vec<Vec<f64>> {
     let m = k + 3;
     let p = m * m;
     let (s11, s12, s22) = (a[0] * a[0], 2.0 * a[0] * a[1], a[1] * a[1]);
@@ -242,7 +242,7 @@ fn streaming_band_assembly_matches_dense_oracle() {
             }
         }
     }
-    let s = dense_penalty(lo, h, k, metric);
+    let s = dense_penalty(h, k, metric);
 
     // Off-data check points: cell interiors, knot lines, and one point OUTSIDE
     // the box (both paths extend the boundary-cell polynomial identically).
