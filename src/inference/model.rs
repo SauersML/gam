@@ -3616,8 +3616,7 @@ impl FittedModel {
     /// `predict` replays the training Gaussian bridge bit-for-bit.
     pub fn saved_spline_scan(
         &self,
-    ) -> Result<Option<(&str, crate::solver::spline_scan::SplineScanFit)>, FittedModelError>
-    {
+    ) -> Result<Option<(&str, crate::solver::spline_scan::SplineScanFit)>, FittedModelError> {
         let Some(saved) = self.spline_scan.as_ref() else {
             return Ok(None);
         };
@@ -4424,8 +4423,7 @@ mod tests {
         let x: Vec<f64> = (0..40).map(|i| i as f64 / 39.0).collect();
         let y: Vec<f64> = x.iter().map(|&v| (4.0 * v).sin() + 0.1 * v).collect();
         let w = vec![1.0_f64; x.len()];
-        let fit =
-            crate::solver::spline_scan::fit_spline_scan(&x, &y, &w, 2).expect("scan fit");
+        let fit = crate::solver::spline_scan::fit_spline_scan(&x, &y, &w, 2).expect("scan fit");
         let make_payload = || {
             crate::inference::model_payload_builders::assemble_spline_scan_payload(
                 "y ~ s(x)".to_string(),
