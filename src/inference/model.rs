@@ -68,6 +68,15 @@ pub struct DataSchema {
     pub columns: Vec<SchemaColumn>,
 }
 
+/// Saved exact spline-scan fit (#1030/#1034): the predict-time feature column
+/// plus the lossless smoother state the Gaussian-bridge `predict` replays.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedSplineScan {
+    /// Training column name feeding the single 1-D smooth at predict time.
+    pub feature_column: String,
+    pub state: crate::solver::spline_scan::SplineScanState,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchemaColumn {
     pub name: String,
@@ -249,6 +258,15 @@ pub struct FittedModelPayload {
     /// Unified (family-agnostic) representation of the fit result.
     #[serde(default)]
     pub unified: Option<UnifiedFitResult>,
+    /// Exact O(n) spline-scan fit representation (#1030/#1034): the
+    /// state-space smoothing-spline posterior of a single 1-D Gaussian
+    /// smooth. When `Some`, this standard Gaussian model's predictions
+    /// replay the Gaussian bridge from this state and the model carries no
+    /// dense `fit_result` (the representations are mutually exclusive —
+    /// enforced by `validate_for_persistence`). `#[serde(default)]` so older
+    /// payloads read as: not a scan model.
+    #[serde(default)]
+    pub spline_scan: Option<SavedSplineScan>,
     #[serde(default)]
     pub data_schema: Option<DataSchema>,
     pub link: Option<InverseLink>,
@@ -618,6 +636,7 @@ impl FittedModelPayload {
             family,
             fit_result: None,
             unified: None,
+            spline_scan: None,
             data_schema: None,
             link: None,
             mixture_link_param_covariance: None,
@@ -3568,6 +3587,21 @@ impl FittedModel {
             })
     }
 
+    /// Restore the exact in-memory spline-scan fit from a scan-bearing
+    /// payload (#1030/#1034). `Ok(None)` for dense models; the returned
+    /// `predict` replays the training Gaussian bridge bit-for-bit.
+    pub fn saved_spline_scan(
+        &self,
+    ) -> Result<Option<(&str, crate::solver::spline_scan::CubicSplineScanFit)>, FittedModelError>
+    {
+        let Some(saved) = self.spline_scan.as_ref() else {
+            return Ok(None);
+        };
+        let fit = crate::solver::spline_scan::CubicSplineScanFit::from_state(&saved.state)
+            .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
+        Ok(Some((saved.feature_column.as_str(), fit)))
+    }
+
     pub fn random_effect_group_columns(&self) -> HashSet<String> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return HashSet::new();
@@ -3598,7 +3632,39 @@ impl FittedModel {
         // MODEL_PAYLOAD_VERSION constant — every payload must round-trip
         // identically between writers and readers running the same schema.
         self.validate_payload_version()?;
-        if self.fit_result.is_none() {
+        if let Some(scan) = self.spline_scan.as_ref() {
+            // Spline-scan representation (#1030/#1034): the smoother state IS
+            // the fit. It is exclusive with the dense representation, only
+            // standard Gaussian-identity models can carry it, and the state
+            // must restore cleanly so predict never sees a corrupt snapshot.
+            if self.fit_result.is_some() || self.unified.is_some() {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "spline-scan model must not also carry a dense fit_result/unified \
+                             payload; the representations are mutually exclusive"
+                        .to_string(),
+                });
+            }
+            if self.model_kind != ModelKind::Standard
+                || self.family_state.likelihood() != LikelihoodSpec::gaussian_identity()
+            {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "spline-scan representation requires a standard Gaussian-identity model; \
+                         got model_kind={:?}, likelihood={:?}",
+                        self.model_kind,
+                        self.family_state.likelihood()
+                    ),
+                });
+            }
+            if scan.feature_column.is_empty() {
+                return Err(FittedModelError::MissingField {
+                    reason: "spline-scan model is missing its feature column name; refit"
+                        .to_string(),
+                });
+            }
+            crate::solver::spline_scan::CubicSplineScanFit::from_state(&scan.state)
+                .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
+        } else if self.fit_result.is_none() {
             return Err(FittedModelError::MissingField {
                 reason: "model is missing canonical fit_result payload; refit".to_string(),
             });
@@ -4308,6 +4374,90 @@ mod tests {
             random_effect_terms: vec![],
             smooth_terms: vec![],
         }
+    }
+
+    /// #1030/#1034: a scan-bearing payload must round-trip through JSON +
+    /// `validate_for_persistence` and replay the training Gaussian bridge
+    /// bit-for-bit; structural corruption must fail loudly at validation.
+    #[test]
+    fn spline_scan_payload_round_trips_and_validates() {
+        let x: Vec<f64> = (0..40).map(|i| i as f64 / 39.0).collect();
+        let y: Vec<f64> = x.iter().map(|&v| (4.0 * v).sin() + 0.1 * v).collect();
+        let w = vec![1.0_f64; x.len()];
+        let fit = crate::solver::spline_scan::fit_cubic_spline_scan(&x, &y, &w).expect("scan fit");
+        let payload = crate::inference::model_payload_builders::assemble_spline_scan_payload(
+            "y ~ s(x)".to_string(),
+            "x".to_string(),
+            &fit,
+            DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "y".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "x".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            vec!["x".to_string()],
+            vec![(0.0, 1.0)],
+        );
+        payload.validate_for_persistence().expect("scan payload validates");
+        payload
+            .validate_numeric_finiteness()
+            .expect("scan payload is finite");
+
+        let json = serde_json::to_string(&payload).expect("serialize payload");
+        let restored: FittedModelPayload = serde_json::from_str(&json).expect("parse payload");
+        restored
+            .validate_for_persistence()
+            .expect("restored scan payload validates");
+        let (column, replay) = restored
+            .saved_spline_scan()
+            .expect("restore scan fit")
+            .expect("payload carries the scan representation");
+        assert_eq!(column, "x");
+        for &xq in &[-0.1, 0.0, 0.31, 0.5, 0.77, 1.0, 1.4] {
+            let (m0, v0) = fit.predict(xq).expect("predict original");
+            let (m1, v1) = replay.predict(xq).expect("predict replayed");
+            assert_eq!(m0.to_bits(), m1.to_bits(), "mean drift at x={xq}");
+            assert_eq!(v0.to_bits(), v1.to_bits(), "variance drift at x={xq}");
+        }
+
+        // A dense model without the scan channel still requires fit_result.
+        let mut dense = payload.clone();
+        dense.spline_scan = None;
+        let err = dense
+            .validate_for_persistence()
+            .expect_err("dense payload without fit_result must be rejected");
+        assert!(err.to_string().contains("fit_result"));
+
+        // Structural corruption fails at validation, not inside predict.
+        let mut corrupt = payload.clone();
+        corrupt
+            .spline_scan
+            .as_mut()
+            .expect("scan channel present")
+            .state
+            .knots
+            .truncate(2);
+        corrupt
+            .validate_for_persistence()
+            .expect_err("corrupt scan state must be rejected");
+        let mut unnamed = payload.clone();
+        unnamed
+            .spline_scan
+            .as_mut()
+            .expect("scan channel present")
+            .feature_column
+            .clear();
+        unnamed
+            .validate_for_persistence()
+            .expect_err("missing feature column must be rejected");
     }
 
     fn standard_gaussian_payload() -> FittedModelPayload {
