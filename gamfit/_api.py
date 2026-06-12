@@ -397,8 +397,9 @@ def _normalize_smooths(
         if not isinstance(descriptor, _Smooth):
             raise TypeError(
                 f"smooths[{key!r}] must be a gamfit.smooth.Smooth descriptor "
-                f"(Duchon / Matern / Sphere / BSpline / TensorBSpline / Pca / "
-                f"PeriodicSplineCurve / Categorical), got {type(descriptor).__name__}"
+                f"(Duchon / Matern / MeasureJet / Sphere / BSpline / "
+                f"TensorBSpline / Pca / PeriodicSplineCurve / Categorical), "
+                f"got {type(descriptor).__name__}"
             )
         payload = descriptor.to_rust_descriptor()
         if not isinstance(payload, Mapping):
@@ -957,8 +958,9 @@ def fit(
         basis descriptors; pass those through ``smooths=``.
     smooths:
         Optional mapping from formula symbol to :class:`gamfit.smooth.Smooth`
-        basis descriptor (``Duchon``, ``Matern``, ``Sphere``, ``BSpline``,
-        ``TensorBSpline``, ``Pca``, ``PeriodicSplineCurve``, ``Categorical``).
+        basis descriptor (``Duchon``, ``Matern``, ``MeasureJet``, ``Sphere``,
+        ``BSpline``, ``TensorBSpline``, ``Pca``, ``PeriodicSplineCurve``,
+        ``Categorical``).
         Keys are either a single column name (``"x"``) or a tuple of column
         names for multivariate smooths (``("lat", "lon")``). The descriptor
         threads explicit center coordinates / knot vectors / kernel
