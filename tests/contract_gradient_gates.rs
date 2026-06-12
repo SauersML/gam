@@ -1,11 +1,21 @@
 use std::sync::{Arc, RwLock};
 
-use gam::custom_family::{BlockWorkingSet, CustomFamily, ParameterBlockSpec, ParameterBlockState};
+use gam::custom_family::{
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
+    ParameterBlockState, PenaltyMatrix,
+};
 use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
 };
+use gam::families::custom_family::{
+    CustomFamilyBlockPsiDerivative, EvalMode, evaluate_custom_family_joint_hyper,
+};
 use gam::families::gamlss::GaussianLocationScaleFamily;
-use gam::matrix::DesignMatrix;
+use gam::families::survival::{
+    MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalEngineInputs, SurvivalSpec,
+    WorkingModelSurvival,
+};
+use gam::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam::resource::ResourcePolicy;
 use gam::smooth::BlockwisePenalty;
 use gam::terms::sae_manifold::EuclideanPatchEvaluator;
@@ -71,6 +81,18 @@ fn gradient_is_differential_contract_gate() {
         ContractRow {
             name: "glm-reml/duchon-901-rank-deficient",
             run: glm_reml_outer_row,
+        },
+        ContractRow {
+            name: "glm-reml/binomial-noncanonical-outer",
+            run: glm_reml_binomial_noncanonical_outer_row,
+        },
+        ContractRow {
+            name: "survival/laml-net-single-block",
+            run: survival_laml_net_single_block_row,
+        },
+        ContractRow {
+            name: "custom-family/joint-laml-penalized-quadratic",
+            run: custom_family_joint_laml_penalized_quadratic_row,
         },
         ContractRow {
             name: "gamlss/gaussian-dispersion",
