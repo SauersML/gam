@@ -1965,7 +1965,11 @@ fn predict_survival_location_scale_batch(
             // predict path's `t <= 0` handling and keeps the default surface grid
             // — whose first node is the origin for the `Surv(time, event)`
             // right-censored shorthand — evaluable end to end (#1024).
-            let query_time = if per_row_eval { age_exit[i] } else { eval_times[j] };
+            let query_time = if per_row_eval {
+                age_exit[i]
+            } else {
+                eval_times[j]
+            };
             if query_time <= 0.0 {
                 *s = 1.0;
                 *ch = 0.0;
@@ -1997,7 +2001,11 @@ fn predict_survival_location_scale_batch(
         ndarray::Zip::indexed(&mut out).par_for_each(|(i, j), slot| {
             // S(0) = 1 is a deterministic identity, so its standard error is 0
             // at the origin column (consistent with the anchored survival above).
-            let query_time = if per_row_eval { age_exit[i] } else { eval_times[j] };
+            let query_time = if per_row_eval {
+                age_exit[i]
+            } else {
+                eval_times[j]
+            };
             if query_time <= 0.0 {
                 *slot = 0.0;
                 return;
