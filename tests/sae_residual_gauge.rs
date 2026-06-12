@@ -320,6 +320,7 @@ fn exchangeable_atom_pair_yields_the_permutation_factor() {
                 frame: frame_a,
                 ard_variances: None,
                 lowering_error: 0.0,
+                chart_canonicalized: false,
             },
             FittedAtom {
                 name: "b".to_string(),
@@ -327,6 +328,7 @@ fn exchangeable_atom_pair_yields_the_permutation_factor() {
                 frame: frame_b,
                 ard_variances: None,
                 lowering_error: 0.0,
+                chart_canonicalized: false,
             },
         ]
     };
@@ -404,6 +406,7 @@ fn sym_f_triviality_checked_only_under_output_fisher() {
         frame,
         ard_variances: None,
         lowering_error: 0.0,
+        chart_canonicalized: false,
     };
     let frame_a = Array2::<f64>::eye(2);
     let mut frame_b = Array2::<f64>::zeros((2, 2));
@@ -488,6 +491,7 @@ fn equal_ard_patch_atom(ard: [f64; 2]) -> FittedAtom {
         frame,
         ard_variances: Some(Array1::from(ard.to_vec())),
         lowering_error: 0.0,
+        chart_canonicalized: false,
     }
 }
 
@@ -559,6 +563,7 @@ fn exchangeable_atom_pair_surfaces_the_permutation_factor_under_euclidean() {
         frame,
         ard_variances: None,
         lowering_error: 0.0,
+        chart_canonicalized: false,
     };
     let frame_a = Array2::<f64>::eye(2);
     let mut frame_b = Array2::<f64>::zeros((2, 2));
