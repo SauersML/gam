@@ -7202,15 +7202,48 @@ impl SaeManifoldTerm {
             self.k_atoms(),
         )?;
         if plan.streaming {
-            self.reml_criterion_streaming_exact(
-                target,
-                rho,
-                registry,
-                inner_max_iter,
-                learning_rate,
-                ridge_ext_coord,
-                ridge_beta,
-            )
+            if plan.estimated_full_batch_bytes > plan.in_core_budget_bytes
+                && plan.estimated_dense_schur_bytes > plan.in_core_budget_bytes
+            {
+                return Err(format!(
+                    "SaeManifoldTerm::reml_criterion: predicted full-batch working set {} bytes and dense reduced Schur {} bytes both exceed budget {} bytes; shape n={},p={},K={}",
+                    plan.estimated_full_batch_bytes,
+                    plan.estimated_dense_schur_bytes,
+                    plan.in_core_budget_bytes,
+                    self.n_obs(),
+                    self.output_dim(),
+                    self.k_atoms()
+                ));
+            }
+            let mut rho_fixed = rho.clone();
+            let loss = if plan.estimated_full_batch_bytes > plan.in_core_budget_bytes {
+                self.fit_streaming_in_memory(
+                    target,
+                    &mut rho_fixed,
+                    registry,
+                    inner_max_iter,
+                    learning_rate,
+                    ridge_ext_coord,
+                    ridge_beta,
+                )?
+            } else {
+                self.run_joint_fit_arrow_schur(
+                    target,
+                    &mut rho_fixed,
+                    registry,
+                    inner_max_iter,
+                    learning_rate,
+                    ridge_ext_coord,
+                    ridge_beta,
+                )?
+            };
+            let extra_penalty_energy = match registry {
+                Some(reg) => self
+                    .reml_extra_penalty_value_total(reg)
+                    .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?,
+                None => 0.0,
+            };
+            Ok((loss.total() + extra_penalty_energy, loss))
         } else {
             let (v, loss, _cache) = self.reml_criterion_with_cache(
                 target,
@@ -7899,8 +7932,19 @@ impl SaeManifoldTerm {
                 target.dim()
             ));
         }
+        let plan = self.streaming_plan().admitted_or_error(
+            self.n_obs(),
+            self.output_dim(),
+            self.k_atoms(),
+        )?;
+        if plan.estimated_dense_schur_bytes > plan.in_core_budget_bytes {
+            return Err(format!(
+                "SaeManifoldTerm::streaming_exact_arrow_log_det: predicted dense reduced Schur {} bytes exceeds budget {} bytes; cost-only matrix-free route is required",
+                plan.estimated_dense_schur_bytes, plan.in_core_budget_bytes
+            ));
+        }
         let n_total = self.n_obs();
-        let chunk_size = self.streaming_plan().chunk_size.min(n_total.max(1));
+        let chunk_size = plan.chunk_size.min(n_total.max(1));
         // #972 / #977 T1: the reduced β-Schur is over the FACTORED border when
         // frames are active (each chunk inherits the frames via
         // `materialize_chunk`, so every `chunk_schur` is `border_dim²`), matching
@@ -13034,15 +13078,21 @@ impl SaeManifoldOuterObjective {
             baseline_term.output_dim(),
             baseline_term.k_atoms(),
         ) {
-            Ok(plan) if plan.streaming => baseline_term.fit_streaming_in_memory(
-                target.view(),
-                &mut rho_seed,
-                registry.as_ref(),
-                inner_max_iter,
-                learning_rate,
-                ridge_ext_coord,
-                ridge_beta,
-            ),
+            Ok(plan)
+                if plan.streaming
+                    && plan.estimated_full_batch_bytes > plan.in_core_budget_bytes
+                    && plan.estimated_dense_schur_bytes <= plan.in_core_budget_bytes =>
+            {
+                baseline_term.fit_streaming_in_memory(
+                    target.view(),
+                    &mut rho_seed,
+                    registry.as_ref(),
+                    inner_max_iter,
+                    learning_rate,
+                    ridge_ext_coord,
+                    ridge_beta,
+                )
+            }
             Ok(_) => baseline_term.run_joint_fit_arrow_schur(
                 target.view(),
                 &mut rho_seed,
