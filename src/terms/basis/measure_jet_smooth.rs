@@ -98,9 +98,11 @@ use faer::Side;
 use crate::linalg::faer_ndarray::FaerEigh;
 
 use super::{
-    BasisBuildResult, BasisError, BasisMetadata, CenterStrategy, PenaltyCandidate, PenaltySource,
-    filter_active_penalty_candidates_with_ops, normalize_penalty, select_centers_by_strategy,
-    weighted_coefficient_sum_to_zero_transform,
+    AnisoBasisPsiDerivatives, AnisoPenaltyCrossProvider, BasisBuildResult, BasisError,
+    BasisMetadata, CenterStrategy, PenaltyCandidate, PenaltySource,
+    filter_active_penalty_candidates_with_ops, normalize_penalty,
+    normalize_penalty_cross_psi_derivative, normalize_penaltywith_psi_derivatives,
+    select_centers_by_strategy, weighted_coefficient_sum_to_zero_transform,
 };
 
 /// Truncation radius of the Gaussian profile in units of the scale ε: weights
@@ -983,15 +985,30 @@ pub fn realized_measure_jet_length_scale(
     Ok(MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR * spacing)
 }
 
-/// Build the measure-jet smooth: Gaussian representer design `K(data,
-/// centers)·z`, multiscale jet-residual penalty `zᵀ K_ccᵀ Q K_cc z`, and the
-/// replayable [`BasisMetadata::MeasureJet`]. Structure mirrors the
-/// constant-curvature builder; the geometry comes from the empirical measure
-/// (centers + masses + band) rather than any declared chart.
-pub fn build_measure_jet_basis(
+/// The realized, ψ-FIXED geometry shared by the basis builder and the
+/// ψ-derivative producer — ONE realization source, so the penalty the fit
+/// uses and the penalty the ψ-channel differentiates can never drift apart
+/// (the #901 desync class, excluded structurally).
+struct RealizedMeasureJetGeometry {
+    centers: Array2<f64>,
+    masses: Array1<f64>,
+    eps_band: Vec<f64>,
+    log_step: f64,
+    length_scale: f64,
+    /// Assembly order for the energy weights: the realized default in
+    /// per-level mode (absorbed per candidate by normalization), the
+    /// explicit value in fused mode.
+    order_s_eval: f64,
+    /// Spectral-split mode marker (`order_s == 0.0` sentinel).
+    per_level: bool,
+    z: Array2<f64>,
+    kz: Array2<f64>,
+}
+
+fn realize_measure_jet_geometry(
     data: ArrayView2<'_, f64>,
     spec: &MeasureJetBasisSpec,
-) -> Result<BasisBuildResult, BasisError> {
+) -> Result<RealizedMeasureJetGeometry, BasisError> {
     if data.ncols() == 0 {
         crate::bail_invalid_basis!("measure-jet smooth needs at least one feature column");
     }
@@ -1043,10 +1060,6 @@ pub fn build_measure_jet_basis(
         }
     };
     let length_scale = realized_measure_jet_length_scale(centers.view(), spec.length_scale)?;
-    let band = MeasureJetBand {
-        eps: eps_band.clone(),
-        log_step,
-    };
     // Realized-design constraint transform: uniform coefficient sum-to-zero
     // at fit time; the frozen composed `z · z_parametric` at predict time
     // (#532 pattern — see MeasureJetIdentifiability).
@@ -1068,6 +1081,44 @@ pub fn build_measure_jet_basis(
     };
     let k_cc = measure_jet_design_matrix(centers.view(), centers.view(), length_scale)?;
     let kz = k_cc.dot(&z);
+    Ok(RealizedMeasureJetGeometry {
+        centers,
+        masses,
+        eps_band,
+        log_step,
+        length_scale,
+        order_s_eval: order_s,
+        per_level: spec.order_s == 0.0,
+        z,
+        kz,
+    })
+}
+
+/// Build the measure-jet smooth: Gaussian representer design `K(data,
+/// centers)·z`, multiscale jet-residual penalty (one candidate per scale in
+/// spectral mode, one fused candidate in pinned-order mode), and the
+/// replayable [`BasisMetadata::MeasureJet`]. The geometry comes from the
+/// empirical measure (centers + masses + band) through the shared
+/// realization helper — the same source the ψ-derivative producer uses.
+pub fn build_measure_jet_basis(
+    data: ArrayView2<'_, f64>,
+    spec: &MeasureJetBasisSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    let RealizedMeasureJetGeometry {
+        centers,
+        masses,
+        eps_band,
+        log_step,
+        length_scale,
+        order_s_eval: order_s,
+        per_level,
+        z,
+        kz,
+    } = realize_measure_jet_geometry(data, spec)?;
+    let band = MeasureJetBand {
+        eps: eps_band.clone(),
+        log_step,
+    };
     let raw_design = measure_jet_design_matrix(data, centers.view(), length_scale)?;
     let design = crate::matrix::DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
         raw_design.dot(&z),
@@ -1084,7 +1135,6 @@ pub fn build_measure_jet_basis(
     // outright. The sentinel itself is persisted in the metadata as the mode
     // marker: a replay MUST re-enter the same mode or the penalty count
     // desyncs (the gam#860 trap class).
-    let per_level = spec.order_s == 0.0;
     let mut candidates = Vec::new();
     if per_level {
         let forms = measure_jet_energy_forms_per_scale(
@@ -1165,6 +1215,203 @@ pub fn build_measure_jet_basis(
         ops,
         null_eigenvectors,
         joint_null_rotation: None,
+    })
+}
+
+/// Exact ψ-jets of the REALIZED measure-jet penalty candidates, adapted to
+/// the anisotropic group-ψ carrier the spatial optimizer consumes.
+///
+/// Coordinates (the layout contract for the registration arm):
+/// - per-level (spectral) mode, `order_s == 0.0`: `[α, ln τ]` — the order is
+///   absorbed by the REML-learned per-scale amplitudes and is NOT a ψ
+///   coordinate;
+/// - fused (pinned-order) mode: `[s, α, ln τ]`.
+///
+/// Design drift is identically zero for every coordinate (the Gaussian
+/// representer is ψ-fixed), so `design_first`/`design_second_diag` are
+/// correctly-shaped zero matrices and there are no design cross terms.
+/// Penalty derivatives are routed through the SAME constrained Frobenius
+/// normalization as the fit-time candidates
+/// (`normalize_penaltywith_psi_derivatives` + the cross rule), so criterion
+/// value and criterion derivative share one normalization — the #901 lesson
+/// made structural. The ridge candidate (when `double_penalty` is on)
+/// carries identically-zero derivatives. The per-candidate layout follows
+/// the builder's ORIGINAL candidate order (scale candidates then ridge /
+/// primary then ridge); consumers align to the FITTED penalty list via
+/// `PenaltyInfo.original_index` when the active-candidate filter dropped
+/// any.
+pub fn build_measure_jet_basis_psi_derivatives(
+    data: ArrayView2<'_, f64>,
+    spec: &MeasureJetBasisSpec,
+) -> Result<AnisoBasisPsiDerivatives, BasisError> {
+    if !(spec.tau0.is_finite() && spec.tau0 > 0.0) {
+        crate::bail_invalid_basis!(
+            "measure-jet ψ derivatives need tau0 > 0 (the ln-τ channel is undefined at the \
+             τ = 0 pseudo-inverse oracle mode); got {}",
+            spec.tau0
+        );
+    }
+    let geom = realize_measure_jet_geometry(data, spec)?;
+    let band = MeasureJetBand {
+        eps: geom.eps_band.clone(),
+        log_step: geom.log_step,
+    };
+    let n = data.nrows();
+    let p = geom.kz.ncols();
+    let t = spec.tau0;
+    let kz = &geom.kz;
+    let sandwich = |j: &Array2<f64>| {
+        let s = kz.t().dot(j).dot(kz);
+        (&s + &s.t()) * 0.5
+    };
+    // Raw (pre-normalization) value + jet stacks per ORIGINAL candidate, in
+    // coordinate order. `raw[cand] = (S, firsts, seconds, crosses)` with
+    // crosses keyed by coordinate pairs in `pairs` order.
+    let (n_coords, pairs, raw): (
+        usize,
+        Vec<(usize, usize)>,
+        Vec<(Array2<f64>, Vec<Array2<f64>>, Vec<Array2<f64>>, Vec<Array2<f64>>)>,
+    ) = if geom.per_level {
+        let l_count = band.eps.len();
+        // Six forms per scale: value, ∂α, ∂α², ∂lnτ, ∂lnτ², ∂α∂lnτ — same
+        // blocks, one walk (single-source rule).
+        let forms = assemble_weighted_forms(
+            geom.centers.view(),
+            geom.masses.view(),
+            &band,
+            geom.order_s_eval,
+            spec.alpha,
+            t,
+            6 * l_count,
+            3,
+            &|scale_idx, _, q: f64, base: f64, out: &mut [[f64; 3]]| {
+                for slot in out.iter_mut() {
+                    *slot = [0.0, 0.0, 0.0];
+                }
+                let ga = -2.0 * q.max(f64::MIN_POSITIVE).ln();
+                let k0 = 6 * scale_idx;
+                out[k0] = [base, 0.0, 0.0];
+                out[k0 + 1] = [ga * base, 0.0, 0.0];
+                out[k0 + 2] = [ga * ga * base, 0.0, 0.0];
+                out[k0 + 3] = [0.0, t * base, 0.0];
+                out[k0 + 4] = [0.0, t * base, -2.0 * t * t * base];
+                out[k0 + 5] = [0.0, ga * t * base, 0.0];
+            },
+        )?;
+        let mut raw = Vec::with_capacity(l_count);
+        for level in 0..l_count {
+            let chunk = &forms[6 * level..6 * level + 6];
+            raw.push((
+                sandwich(&chunk[0]),
+                vec![sandwich(&chunk[1]), sandwich(&chunk[3])],
+                vec![sandwich(&chunk[2]), sandwich(&chunk[4])],
+                vec![sandwich(&chunk[5])],
+            ));
+        }
+        (2usize, vec![(0usize, 1usize)], raw)
+    } else {
+        let jets = measure_jet_energy_form_with_jets(
+            geom.centers.view(),
+            geom.masses.view(),
+            &band,
+            geom.order_s_eval,
+            spec.alpha,
+            t,
+        )?;
+        let raw = vec![(
+            sandwich(&jets.q),
+            vec![
+                sandwich(&jets.dq_ds),
+                sandwich(&jets.dq_dalpha),
+                sandwich(&jets.dq_dlogtau),
+            ],
+            vec![
+                sandwich(&jets.d2q_ds2),
+                sandwich(&jets.d2q_dalpha2),
+                sandwich(&jets.d2q_dlogtau2),
+            ],
+            vec![
+                sandwich(&jets.d2q_ds_dalpha),
+                sandwich(&jets.d2q_ds_dlogtau),
+                sandwich(&jets.d2q_dalpha_dlogtau),
+            ],
+        )];
+        (
+            3usize,
+            vec![(0usize, 1usize), (0usize, 2usize), (1usize, 2usize)],
+            raw,
+        )
+    };
+    let n_active = raw.len();
+    let ridge = spec.double_penalty;
+    let n_cands = n_active + usize::from(ridge);
+    let zero_p = || Array2::<f64>::zeros((p, p));
+    let mut penalties_first: Vec<Vec<Array2<f64>>> =
+        (0..n_coords).map(|_| Vec::with_capacity(n_cands)).collect();
+    let mut penalties_second_diag: Vec<Vec<Array2<f64>>> =
+        (0..n_coords).map(|_| Vec::with_capacity(n_cands)).collect();
+    // Cross matrices per pair per candidate, precomputed eagerly (the
+    // candidate count is the band length, not the data size) and served
+    // through the on-demand provider.
+    let mut crosses: Vec<Vec<Array2<f64>>> = (0..pairs.len()).map(|_| Vec::new()).collect();
+    for (s_raw, firsts, seconds, cross_raw) in &raw {
+        // The normalized value's Frobenius scale anchors every derivative of
+        // this candidate; the per-coordinate helper recomputes the identical
+        // c, so each coordinate's normalized first/second stay coherent with
+        // the fit-time candidate.
+        let mut c_for_cross = 0.0_f64;
+        for coord in 0..n_coords {
+            let (_, s_first, s_second, c) =
+                normalize_penaltywith_psi_derivatives(s_raw, &firsts[coord], &seconds[coord]);
+            penalties_first[coord].push(s_first);
+            penalties_second_diag[coord].push(s_second);
+            c_for_cross = c;
+        }
+        for (pair_idx, &(a, b)) in pairs.iter().enumerate() {
+            crosses[pair_idx].push(normalize_penalty_cross_psi_derivative(
+                s_raw,
+                &firsts[a],
+                &firsts[b],
+                &cross_raw[pair_idx],
+                c_for_cross,
+            ));
+        }
+    }
+    if ridge {
+        for coord in 0..n_coords {
+            penalties_first[coord].push(zero_p());
+            penalties_second_diag[coord].push(zero_p());
+        }
+        for pair_crosses in crosses.iter_mut() {
+            pair_crosses.push(zero_p());
+        }
+    }
+    let pair_index: Vec<((usize, usize), Vec<Array2<f64>>)> = pairs
+        .iter()
+        .copied()
+        .zip(crosses.into_iter())
+        .collect();
+    let provider = AnisoPenaltyCrossProvider::new(move |a, b| {
+        pair_index
+            .iter()
+            .find(|((pa, pb), _)| (*pa, *pb) == (a, b) || (*pa, *pb) == (b, a))
+            .map(|(_, mats)| mats.clone())
+            .ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "measure-jet ψ cross derivative requested for unknown pair ({a}, {b})"
+                ))
+            })
+    });
+    Ok(AnisoBasisPsiDerivatives {
+        design_first: (0..n_coords).map(|_| Array2::<f64>::zeros((n, p))).collect(),
+        design_second_diag: (0..n_coords).map(|_| Array2::<f64>::zeros((n, p))).collect(),
+        design_second_cross: Vec::new(),
+        design_second_cross_pairs: Vec::new(),
+        penalties_first,
+        penalties_second_diag,
+        penalties_cross_pairs: pairs,
+        penalties_cross_provider: Some(provider),
+        implicit_operator: None,
     })
 }
 
@@ -1503,6 +1750,166 @@ mod tests {
             panic!("measure-jet build must return MeasureJet metadata");
         };
         assert_eq!(*order_s, 1.3, "explicit order must persist verbatim");
+    }
+
+    /// Frozen-geometry fixture shared by the ψ-producer FD gates: build
+    /// once, pin everything (nodes, masses, band, transform, realized ℓ),
+    /// and return the pinned spec so dial-perturbed rebuilds move ONLY the
+    /// dials — the per-trial contract the optimizer relies on.
+    fn frozen_spec_fixture(order_s: f64) -> (Array2<f64>, MeasureJetBasisSpec) {
+        let n = 40usize;
+        let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            if k == 0 {
+                t * 3.0
+            } else {
+                0.5 * (t * 3.0).cos() + if i % 9 == 0 { 0.8 } else { 0.0 }
+            }
+        });
+        let spec = MeasureJetBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 14 },
+            order_s,
+            ..MeasureJetBasisSpec::default()
+        };
+        let first = build_measure_jet_basis(data.view(), &spec).expect("fixture build");
+        let BasisMetadata::MeasureJet {
+            centers,
+            length_scale,
+            eps_band,
+            masses,
+            constraint_transform,
+            ..
+        } = &first.metadata
+        else {
+            panic!("measure-jet build must return MeasureJet metadata");
+        };
+        let frozen = MeasureJetBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            order_s,
+            alpha: spec.alpha,
+            tau0: spec.tau0,
+            num_scales: eps_band.len(),
+            length_scale: *length_scale,
+            double_penalty: spec.double_penalty,
+            identifiability: MeasureJetIdentifiability::FrozenTransform {
+                transform: constraint_transform.clone().expect("fit-time z"),
+            },
+            frozen_quadrature: Some(MeasureJetFrozenQuadrature {
+                masses: masses.clone(),
+                eps_band: eps_band.clone(),
+            }),
+        };
+        (data, frozen)
+    }
+
+    /// ψ-producer vs central finite differences of the NORMALIZED fit-time
+    /// candidates under frozen geometry — per-level mode (coords α, lnτ).
+    /// This is the end-to-end gate #901 never had: the derivative is checked
+    /// against the exact object the optimizer consumes.
+    #[test]
+    fn psi_producer_matches_fd_per_level_mode() {
+        let (data, frozen) = frozen_spec_fixture(0.0);
+        let derivs = build_measure_jet_basis_psi_derivatives(data.view(), &frozen)
+            .expect("psi derivatives");
+        let l_count = frozen
+            .frozen_quadrature
+            .as_ref()
+            .expect("frozen quadrature")
+            .eps_band
+            .len();
+        assert_eq!(derivs.penalties_first.len(), 2, "per-level coords are (α, lnτ)");
+        assert_eq!(derivs.penalties_first[0].len(), l_count + 1);
+        assert_eq!(derivs.penalties_cross_pairs, vec![(0, 1)]);
+        let pen_at = |alpha: f64, tau0: f64| {
+            let trial = MeasureJetBasisSpec {
+                alpha,
+                tau0,
+                ..frozen.clone()
+            };
+            build_measure_jet_basis(data.view(), &trial)
+                .expect("trial build")
+                .penalties
+        };
+        let h = 1e-5;
+        let (a0, t0) = (frozen.alpha, frozen.tau0);
+        let ap = pen_at(a0 + h, t0);
+        let am = pen_at(a0 - h, t0);
+        let tp = pen_at(a0, t0 * h.exp());
+        let tm = pen_at(a0, t0 * (-h).exp());
+        assert_eq!(ap.len(), l_count + 1, "fixture must keep every scale active");
+        for level in 0..l_count {
+            let fd_alpha = (&ap[level] - &am[level]) / (2.0 * h);
+            let fd_tau = (&tp[level] - &tm[level]) / (2.0 * h);
+            for (name, analytic, fd) in [
+                ("alpha", &derivs.penalties_first[0][level], fd_alpha),
+                ("ln_tau", &derivs.penalties_first[1][level], fd_tau),
+            ] {
+                let scale = fd.iter().fold(1e-30_f64, |acc, v| acc.max(v.abs()));
+                for (x, y) in analytic.iter().zip(fd.iter()) {
+                    assert!(
+                        (x - y).abs() <= 5e-5 * scale,
+                        "{name} jet of scale-candidate {level}: analytic {x:.6e} vs FD {y:.6e}"
+                    );
+                }
+            }
+        }
+        // The ridge candidate carries identically-zero derivatives.
+        for coord in 0..2 {
+            assert!(
+                derivs.penalties_first[coord][l_count]
+                    .iter()
+                    .all(|v| *v == 0.0),
+                "ridge candidate must have zero ψ drift"
+            );
+        }
+        // Cross derivative through the provider, against a 4-point FD.
+        let provider = derivs
+            .penalties_cross_provider
+            .as_ref()
+            .expect("cross provider");
+        let cross = provider.evaluate(0, 1).expect("cross pair (α, lnτ)");
+        let pp = pen_at(a0 + h, t0 * h.exp());
+        let pm = pen_at(a0 + h, t0 * (-h).exp());
+        let mp = pen_at(a0 - h, t0 * h.exp());
+        let mm = pen_at(a0 - h, t0 * (-h).exp());
+        for level in 0..l_count {
+            let fd = (&(&pp[level] - &pm[level]) - &(&mp[level] - &mm[level])) / (4.0 * h * h);
+            let scale = fd.iter().fold(1e-30_f64, |acc, v| acc.max(v.abs()));
+            for (x, y) in cross[level].iter().zip(fd.iter()) {
+                assert!(
+                    (x - y).abs() <= 5e-4 * scale,
+                    "cross (α, lnτ) jet of scale-candidate {level}: analytic {x:.6e} vs FD {y:.6e}"
+                );
+            }
+        }
+    }
+
+    /// Fused mode adds the s coordinate; gate it the same way.
+    #[test]
+    fn psi_producer_matches_fd_fused_mode() {
+        let (data, frozen) = frozen_spec_fixture(1.3);
+        let derivs = build_measure_jet_basis_psi_derivatives(data.view(), &frozen)
+            .expect("psi derivatives");
+        assert_eq!(derivs.penalties_first.len(), 3, "fused coords are (s, α, lnτ)");
+        assert_eq!(derivs.penalties_first[0].len(), 2, "primary + ridge");
+        let pen_at = |s: f64| {
+            let trial = MeasureJetBasisSpec {
+                order_s: s,
+                ..frozen.clone()
+            };
+            build_measure_jet_basis(data.view(), &trial)
+                .expect("trial build")
+                .penalties
+        };
+        let h = 1e-5;
+        let fd = (&pen_at(1.3 + h)[0] - &pen_at(1.3 - h)[0]) / (2.0 * h);
+        let scale = fd.iter().fold(1e-30_f64, |acc, v| acc.max(v.abs()));
+        for (x, y) in derivs.penalties_first[0][0].iter().zip(fd.iter()) {
+            assert!(
+                (x - y).abs() <= 5e-5 * scale,
+                "s jet of the fused candidate: analytic {x:.6e} vs FD {y:.6e}"
+            );
+        }
     }
 
     /// Quadrature nodes must be the mass-weighted cell barycenters
