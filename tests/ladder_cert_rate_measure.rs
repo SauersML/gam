@@ -24,7 +24,7 @@ fn report_non_affine_ladder_cert_distribution_on_flex_path() {
     // A few inner cycles, single-pass: enough cache builds to populate the
     // ladder histogram over realistic production cells without a full fit.
     let options = cycle_capped_options(8);
-    let _ = fit_problem(problem, options).expect("flex fit for ladder measurement");
+    let (_fit, timing) = fit_problem(problem, options).expect("flex fit for ladder measurement");
 
     let (per_rung, terminal) = non_affine_ladder_cert_histogram();
     let total: u64 = per_rung.iter().map(|&(_, c)| c).sum::<u64>() + terminal;
@@ -53,8 +53,12 @@ fn report_non_affine_ladder_cert_distribution_on_flex_path() {
     eprintln!(
         "[LADDER-CERT] total_cells={total} per_rung={per_rung:?} terminal_384={terminal} \
          early(<=48)={early} ({:.1}%) nodes_spent={nodes_spent} baseline_384_nodes={baseline_nodes} \
-         speedup={:.2}x",
+         speedup={:.2}x elapsed_s={:.3} outer_iters={} inner_cycles={} converged={}",
         100.0 * early as f64 / total as f64,
         baseline_nodes as f64 / nodes_spent as f64,
+        timing.elapsed.as_secs_f64(),
+        timing.outer_iterations,
+        timing.inner_cycles,
+        timing.outer_converged,
     );
 }

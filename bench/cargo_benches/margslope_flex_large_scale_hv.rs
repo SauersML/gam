@@ -10,11 +10,12 @@ mod margslope_flex_equivalence;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use margslope_flex_equivalence::{
-    DEFAULT_REPRO_N, build_large_scale_shape_problem, cycle_capped_options, fit_problem,
+    build_large_scale_shape_problem, cycle_capped_options, fit_problem,
 };
 use std::hint::black_box;
 use std::time::Duration;
 
+const DEFAULT_REPRO_N: usize = 50_000;
 const BENCH_INNER_CYCLES: usize = 1;
 #[cfg(target_os = "linux")]
 const BENCH_MULTI_RHS_PROBE: usize = 4;
