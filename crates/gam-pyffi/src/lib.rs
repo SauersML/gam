@@ -28292,6 +28292,8 @@ fn summary_smooth_terms(
                     nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),
                     residual_df,
                     scale,
+                    // No Lawley cumulant substrate on this FFI summary path;
+                    // the known-scale branch reports first-order p only (#939).
                     known_scale_lr_mean_shift: None,
                 })
             })
