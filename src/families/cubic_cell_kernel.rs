@@ -3579,23 +3579,25 @@ fn gauss_legendre_rule(n: usize) -> (Vec<f64>, Vec<f64>) {
 }
 
 /// Two-rule agreement certificate for the progressive ladder. `true` when
-/// every moment slot (and the value integral, for value-bearing calls)
-/// agrees to `NON_AFFINE_LADDER_RTOL` relative to the fine result's max
-/// magnitude. Non-finite results never certify, so they fall through to the
-/// terminal 384-node rung and reproduce the fixed rule's behavior exactly.
-fn non_affine_ladder_converged<const COMPUTE_VALUE: bool>(
-    coarse: &(CellMomentVec, f64),
-    fine: &(CellMomentVec, f64),
-) -> bool {
+/// every MOMENT slot agrees to `NON_AFFINE_LADDER_RTOL` relative to the fine
+/// result's max magnitude. Non-finite results never certify, so they fall
+/// through to the terminal 384-node rung and reproduce the fixed rule's
+/// behavior exactly.
+///
+/// The decision is deliberately moment-only and independent of whether the
+/// caller also computed the cell value: the value- and derivative-only
+/// evaluators MUST select the same ladder rung so they accumulate the moment
+/// vector over the same nodes and return bit-identical moments (the
+/// `derivative_moment_evaluator_matches_value_evaluator_moments` invariant).
+/// The value integral converges at the same geometric Gauss-Legendre rate as
+/// the moments on the shared analytic integrand `exp(-q(z))`, so the
+/// moment-certified rung resolves the value to the same tolerance.
+fn non_affine_ladder_converged(coarse: &CellMomentVec, fine: &CellMomentVec) -> bool {
     let mut scale = 0.0_f64;
     let mut err = 0.0_f64;
-    for (&c, &f) in coarse.0.iter().zip(fine.0.iter()) {
+    for (&c, &f) in coarse.iter().zip(fine.iter()) {
         scale = scale.max(f.abs());
         err = err.max((c - f).abs());
-    }
-    if COMPUTE_VALUE {
-        scale = scale.max(fine.1.abs());
-        err = err.max((coarse.1 - fine.1).abs());
     }
     if !(scale.is_finite() && err.is_finite()) {
         return false;
@@ -3617,7 +3619,7 @@ fn evaluate_non_affine_cell_simd<const COMPUTE_VALUE: bool>(
         let cur =
             evaluate_non_affine_cell_with_rule::<COMPUTE_VALUE>(cell, max_degree, nodes, weights);
         if let Some(prev) = prev.as_ref()
-            && non_affine_ladder_converged::<COMPUTE_VALUE>(prev, &cur)
+            && non_affine_ladder_converged(&prev.0, &cur.0)
         {
             return cur;
         }
