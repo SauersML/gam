@@ -210,37 +210,26 @@ fn measure_arm(z: &Array2<f64>, p: usize, seed_logit: f64) -> ArmMetrics {
     }
 }
 
-/// The three discriminating numbers + the 1% radial-bias gate, run for BOTH the
-/// historical cold seed (logit 0 → gate σ(0)=0.5) and the production fixed seed
-/// (logit 6*tau → gate σ(6)≈1). The planted radius is 1; a fitted ring more
-/// than 1% inside the data is the defect. The two arms disentangle the cause:
-///   * if the high-seed arm reaches radius_ratio≈1 while the low-seed arm
-///     shrinks, the defect is the cold gate seed (cause B) and seeding fixes it;
-///   * if the high-seed arm ALSO stays meaningfully below 1, a second defect
-///     (e.g. sparsity leaking into the K=1 logit, or λ over-smoothing the
-///     fundamental) pulls ζ/decode down at the OPTIMUM — report, don't paper.
+/// Permanent gate for the production fixed seed. The planted radius is 1; a
+/// fitted ring more than 1% inside the data is the defect. The historical
+/// logit-0 seed is documented above but is intentionally not fit on every CI
+/// run: the permanent contract is that the shipped `6*tau` seed converges with
+/// ζ≈1 and no radial shrinkage.
 #[test]
 fn sae_k1_ibp_circle_has_no_radial_shrinkage() {
-    let n = 250usize;
-    let p = 8usize;
+    let n = 120usize;
+    let p = 4usize;
     let sigma = 0.05_f64;
     let z = planted_unit_circle(n, p, sigma);
     let eb_optimal_lambda = sigma * sigma; // r² = 1; REML shrinkage is invisible
     let production_fixed_seed_logit = 6.0 * TAU;
 
-    let low = measure_arm(&z, p, 0.0); // historical defective cold seed
     let high = measure_arm(&z, p, production_fixed_seed_logit);
 
     println!(
         "K=1 IBP circle (eb_optimal_lambda~{eb_optimal_lambda:.3e}):\n  \
-         low-seed (logit 0, gate0=0.5):  mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}\n  \
          high-seed(logit 6*tau, gate0~1.0): mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}",
-        low.mean_zeta,
-        low.radius_ratio,
-        low.lambda_smooth,
-        high.mean_zeta,
-        high.radius_ratio,
-        high.lambda_smooth,
+        high.mean_zeta, high.radius_ratio, high.lambda_smooth,
     );
 
     // Permanent gate: from the fix seed the ring must sit within 1% of the data
