@@ -677,11 +677,9 @@ fn dimensionless_entry_rho(term: &SaeManifoldTerm, z: &Array2<f64>) -> SaeManifo
         .expect("seed reconstruction dispersion");
     let mut rho = SaeManifoldRho::new(
         SPARSITY.ln(),
-        SMOOTHNESS.ln(),
+        SMOOTHNESS.ln() + seed_dispersion.ln(),
         vec![Array1::<f64>::zeros(0); K],
-    )
-    .seed_scaled_by_dispersion(seed_dispersion)
-    .expect("dimensionless SAE entry rho");
+    );
     rho.log_lambda_sparse += 1.0;
     rho
 }
