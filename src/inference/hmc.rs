@@ -5011,7 +5011,11 @@ where
         cost_hat,
     };
     let initial_positions = jittered_initial_positions(config, dim, 0.1, 0x3D8A_91C4_E27B_5F60);
-    let mass_cfg = robust_mass_matrix_config(dim, config.nwarmup);
+    // The rho target is already whitened by the exact outer Hessian at rho_hat,
+    // so the local mass matrix in z-space is identity. Re-adapting a diagonal or
+    // dense metric during warmup would spend expensive profile solves estimating
+    // curvature we have already supplied analytically.
+    let mass_cfg = NUTSMassMatrixConfig::disabled();
     let (result, run_stats) = run_whitened_nuts_result(
         target,
         &mode,
