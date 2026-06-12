@@ -13914,12 +13914,12 @@ impl SaeManifoldOuterObjective {
                             "curvature-homotopy decoder LSQ polish produced no EV".to_string()
                         );
                     };
-                    if after_ev >= 0.9 && after_ev > before_ev {
+                    if after_ev > before_ev {
                         self.term.loss(self.target.view(), &rho)
                     } else {
                         Err(format!(
                             "curvature-homotopy decoder LSQ polish refused: EV {after_ev:.6} \
-                             did not clear 0.9 from {before_ev:.6}"
+                             did not improve from {before_ev:.6}"
                         ))
                     }
                 });
