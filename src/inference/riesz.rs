@@ -38,6 +38,16 @@ pub enum SmoothFunctional<'a> {
         derivative_design: ArrayView2<'a, f64>,
         weights: Option<ArrayView1<'a, f64>>,
     },
+    /// `m(x_a) - m(x_b)`, represented by the two prediction design rows.
+    Contrast {
+        design_row_a: ArrayView1<'a, f64>,
+        design_row_b: ArrayView1<'a, f64>,
+    },
+    /// `mean_i w_i * m(x_i)`, represented by value-basis rows.
+    AverageValue {
+        value_design: ArrayView2<'a, f64>,
+        weights: Option<ArrayView1<'a, f64>>,
+    },
     /// Direct caller-supplied linear functional gradient.
     Linear { gradient: ArrayView1<'a, f64> },
 }
@@ -57,6 +67,14 @@ impl<'a> SmoothFunctional<'a> {
                 derivative_design,
                 weights,
             } => average_derivative_gradient(*derivative_design, *weights),
+            Self::Contrast {
+                design_row_a,
+                design_row_b,
+            } => contrast_gradient(*design_row_a, *design_row_b),
+            Self::AverageValue {
+                value_design,
+                weights,
+            } => weighted_row_mean(*value_design, *weights, "average-value"),
             Self::Linear { gradient } => {
                 if gradient.is_empty() || gradient.iter().any(|value| !value.is_finite()) {
                     crate::bail_invalid_estim!(
@@ -153,24 +171,49 @@ pub fn average_derivative_gradient(
     derivative_design: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
 ) -> Result<Array1<f64>, EstimationError> {
-    let n = derivative_design.nrows();
-    let p = derivative_design.ncols();
-    if n == 0 || p == 0 {
+    weighted_row_mean(derivative_design, weights, "average-derivative")
+}
+
+pub fn contrast_gradient(
+    design_row_a: ArrayView1<'_, f64>,
+    design_row_b: ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, EstimationError> {
+    if design_row_a.is_empty() || design_row_a.len() != design_row_b.len() {
         crate::bail_invalid_estim!(
-            "Riesz average-derivative functional requires non-empty derivative design, got {n}x{p}"
+            "Riesz contrast functional requires two non-empty design rows of equal length, got {} and {}",
+            design_row_a.len(),
+            design_row_b.len()
         );
     }
-    if derivative_design.iter().any(|value| !value.is_finite()) {
+    if design_row_a.iter().any(|value| !value.is_finite())
+        || design_row_b.iter().any(|value| !value.is_finite())
+    {
+        crate::bail_invalid_estim!("Riesz contrast functional requires finite design rows");
+    }
+    Ok(&design_row_a.to_owned() - &design_row_b)
+}
+
+fn weighted_row_mean(
+    rows: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    what: &str,
+) -> Result<Array1<f64>, EstimationError> {
+    let n = rows.nrows();
+    let p = rows.ncols();
+    if n == 0 || p == 0 {
         crate::bail_invalid_estim!(
-            "Riesz average-derivative functional requires finite derivative design"
+            "Riesz {what} functional requires non-empty basis rows, got {n}x{p}"
         );
+    }
+    if rows.iter().any(|value| !value.is_finite()) {
+        crate::bail_invalid_estim!("Riesz {what} functional requires finite basis rows");
     }
 
     let mut gradient = Array1::<f64>::zeros(p);
     match weights {
         None => {
             let scale = 1.0 / n as f64;
-            for row in derivative_design.rows() {
+            for row in rows.rows() {
                 for col in 0..p {
                     gradient[col] += scale * row[col];
                 }
@@ -179,20 +222,18 @@ pub fn average_derivative_gradient(
         Some(w) => {
             if w.len() != n || w.iter().any(|value| !value.is_finite()) {
                 crate::bail_invalid_estim!(
-                    "Riesz average-derivative weights must be finite with length {n}, got {}",
+                    "Riesz {what} weights must be finite with length {n}, got {}",
                     w.len()
                 );
             }
             let weight_sum = w.sum();
             if !(weight_sum.is_finite() && weight_sum > 0.0) {
-                crate::bail_invalid_estim!(
-                    "Riesz average-derivative weights must have positive finite sum"
-                );
+                crate::bail_invalid_estim!("Riesz {what} weights must have positive finite sum");
             }
             for row_idx in 0..n {
                 let scale = w[row_idx] / weight_sum;
                 for col in 0..p {
-                    gradient[col] += scale * derivative_design[[row_idx, col]];
+                    gradient[col] += scale * rows[[row_idx, col]];
                 }
             }
         }
