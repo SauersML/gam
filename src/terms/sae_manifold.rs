@@ -72,7 +72,7 @@ use crate::solver::estimate::EstimationError;
 use crate::solver::evidence::arrow_log_det_from_cache;
 use crate::solver::outer_strategy::{
     DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
-    OuterObjective, SeedOutcome,
+    OuterEvalOrder, OuterObjective, SeedOutcome,
 };
 use crate::solver::structure_search::{CollapseAction, CollapseEvent};
 use faer::Side;
@@ -7254,6 +7254,29 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss), String> {
+        self.reml_criterion_with_refine_policy(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            true,
+        )
+    }
+
+    fn reml_criterion_with_refine_policy(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        refine_progress_extension: bool,
+    ) -> Result<(f64, SaeManifoldLoss), String> {
         let plan = self.streaming_plan().admitted_or_error(
             self.n_obs(),
             self.output_dim(),
@@ -7278,7 +7301,7 @@ impl SaeManifoldTerm {
             };
             Ok((loss.total() + extra_penalty_energy, loss))
         } else {
-            let (v, loss, _cache) = self.reml_criterion_with_cache(
+            let (v, loss, _cache) = self.reml_criterion_with_cache_refine_policy(
                 target,
                 rho,
                 registry,
@@ -7286,6 +7309,7 @@ impl SaeManifoldTerm {
                 learning_rate,
                 ridge_ext_coord,
                 ridge_beta,
+                refine_progress_extension,
             )?;
             Ok((v, loss))
         }
@@ -7305,6 +7329,29 @@ impl SaeManifoldTerm {
         learning_rate: f64,
         ridge_ext_coord: f64,
         ridge_beta: f64,
+    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+        self.reml_criterion_with_cache_refine_policy(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            true,
+        )
+    }
+
+    fn reml_criterion_with_cache_refine_policy(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        refine_progress_extension: bool,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
         let admission_plan = self.streaming_plan().admitted_or_error(
             self.n_obs(),
@@ -7358,6 +7405,7 @@ impl SaeManifoldTerm {
             ridge_beta,
             &mut loss,
             &options,
+            refine_progress_extension,
         )?;
         let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
             "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
@@ -7436,6 +7484,7 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         loss: &mut SaeManifoldLoss,
         options: &ArrowSolveOptions,
+        refine_progress_extension: bool,
     ) -> Result<ArrowFactorCache, String> {
         // `inner_max_iter == 0` is a genuine FREEZE of the inner `(t, β)` state
         // — a verbatim warm-start reuse, not a convergence request (gam#577/#579,
@@ -7458,7 +7507,11 @@ impl SaeManifoldTerm {
         }
         let mut total_inner_iter = inner_max_iter;
         let base_refine_iter = inner_max_iter.max(1).saturating_mul(16).max(64);
-        let progress_refine_iter = inner_max_iter.max(1).saturating_mul(64).max(256);
+        let progress_refine_iter = if refine_progress_extension {
+            inner_max_iter.max(1).saturating_mul(64).max(256)
+        } else {
+            base_refine_iter
+        };
         let mut previous_refine_grad_norm: Option<f64> = None;
         let mut saw_refine_progress = false;
         loop {
@@ -7932,6 +7985,7 @@ impl SaeManifoldTerm {
             ridge_beta,
             &mut loss,
             &options,
+            true,
         )?;
         drop(converged_cache);
         let log_det = self.streaming_exact_arrow_log_det(target, rho, registry)?;
@@ -13781,6 +13835,14 @@ impl SaeManifoldOuterObjective {
     /// the cached ρ / loss and (optionally) priming the inner solve from a
     /// seeded β. Returns `(cost, β̂)`.
     fn evaluate(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(f64, Array1<f64>), String> {
+        self.evaluate_with_refine_policy(rho_flat, true)
+    }
+
+    fn evaluate_with_refine_policy(
+        &mut self,
+        rho_flat: ArrayView1<'_, f64>,
+        refine_progress_extension: bool,
+    ) -> Result<(f64, Array1<f64>), String> {
         let rho = self.baseline_rho.from_flat(rho_flat);
         if let Some(beta) = self.seeded_beta.take() {
             // Warm-start the inner decoder coefficients before the solve.
@@ -13788,7 +13850,7 @@ impl SaeManifoldOuterObjective {
                 self.term.set_flat_beta(beta.view())?;
             }
         }
-        let (cost, loss) = self.term.reml_criterion(
+        let (cost, loss) = self.term.reml_criterion_with_refine_policy(
             self.target.view(),
             &rho,
             self.registry.as_ref(),
@@ -13796,6 +13858,7 @@ impl SaeManifoldOuterObjective {
             self.learning_rate,
             self.ridge_ext_coord,
             self.ridge_beta,
+            refine_progress_extension,
         )?;
         self.current_rho = rho;
         self.last_loss = Some(loss);
@@ -13996,6 +14059,29 @@ impl OuterObjective for SaeManifoldOuterObjective {
             hessian: HessianResult::Unavailable,
             inner_beta_hint: Some(beta_hat),
         })
+    }
+
+    fn eval_with_order(
+        &mut self,
+        rho: &Array1<f64>,
+        order: OuterEvalOrder,
+    ) -> Result<OuterEval, EstimationError> {
+        match order {
+            OuterEvalOrder::Value => {
+                let (cost, _beta_hat) = self
+                    .evaluate_with_refine_policy(rho.view(), false)
+                    .map_err(EstimationError::RemlOptimizationFailed)?;
+                Ok(OuterEval {
+                    cost,
+                    gradient: Array1::zeros(rho.len()),
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
+            }
+            OuterEvalOrder::ValueAndGradient | OuterEvalOrder::ValueGradientHessian => {
+                self.eval(rho)
+            }
+        }
     }
 
     fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
@@ -22026,9 +22112,7 @@ mod tests {
                                 .collect(),
                             decoder: (0..m)
                                 .map(|b| {
-                                    (0..p)
-                                        .map(|c| atom.decoder_coefficients[[b, c]])
-                                        .collect()
+                                    (0..p).map(|c| atom.decoder_coefficients[[b, c]]).collect()
                                 })
                                 .collect(),
                             latent_dim: d,

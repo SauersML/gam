@@ -10427,8 +10427,8 @@ fn layer_transport_ladder(
     for coord in &coord_vecs {
         topologies.push(parse_chart_topology(topology, coord.view())?);
     }
-    let ladder = transport_ladder(&layer_labels, &coord_vecs, &topologies)
-        .map_err(PyValueError::new_err)?;
+    let ladder =
+        transport_ladder(&layer_labels, &coord_vecs, &topologies).map_err(PyValueError::new_err)?;
     let out = PyDict::new(py);
     let adjacent = PyList::empty(py);
     for report in &ladder.adjacent {

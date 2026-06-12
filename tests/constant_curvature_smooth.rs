@@ -248,7 +248,10 @@ fn penalty_is_constrained_kernel_gram() {
         constraint_transform,
     } = &built.metadata
     else {
-        panic!("expected ConstantCurvature metadata, got {:?}", built.metadata);
+        panic!(
+            "expected ConstantCurvature metadata, got {:?}",
+            built.metadata
+        );
     };
     assert_eq!(centers, &pts);
     assert_eq!(*meta_kappa, kappa);
@@ -337,10 +340,15 @@ fn termspec_for(formula: &str) -> gam::terms::smooth::TermCollectionSpec {
 fn curv_formula_builds_constant_curvature_term() {
     let spec = termspec_for("y ~ curv(x1, x2, kappa=0.5, centers=4)");
     assert_eq!(spec.smooth_terms.len(), 1);
-    let SmoothBasisSpec::ConstantCurvature { feature_cols, spec: cc } =
-        &spec.smooth_terms[0].basis
+    let SmoothBasisSpec::ConstantCurvature {
+        feature_cols,
+        spec: cc,
+    } = &spec.smooth_terms[0].basis
     else {
-        panic!("expected ConstantCurvature term, got {:?}", spec.smooth_terms[0].basis);
+        panic!(
+            "expected ConstantCurvature term, got {:?}",
+            spec.smooth_terms[0].basis
+        );
     };
     assert_eq!(feature_cols.len(), 2);
     assert_eq!(cc.kappa, 0.5);
