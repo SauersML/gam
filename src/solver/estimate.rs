@@ -71,6 +71,14 @@ use std::sync::Arc;
 /// BFGS reaches the same optimum with lower total work. Low-dimensional classic
 /// fits keep exact second-order geometry.
 const REML_SECOND_ORDER_RHO_CAP: usize = 8;
+/// Continuation prewarm is a seed-polishing pass, not part of the REML
+/// objective. It can be useful for tiny rho spaces where one or two warm
+/// solves amortize, but it scales with the number of starts and runs full
+/// inner solves before the real optimizer even begins. Moderate/high-rho
+/// smooths (measure-jet spectral candidates are the motivating profile) start
+/// directly from the seed lattice; the optimizer's own line search owns
+/// globalization.
+const REML_CONTINUATION_PREWARM_RHO_CAP: usize = 4;
 
 /// Programmatic prior mean for a coefficient penalty block.
 ///
@@ -3862,10 +3870,17 @@ where
         let gaussian_identity = matches!(cfg.link_function(), LinkFunction::Identity);
         let n_obs = y_o.len();
         let prefer_gradient_only = k >= REML_SECOND_ORDER_RHO_CAP;
+        let continuation_prewarm = k < REML_CONTINUATION_PREWARM_RHO_CAP;
         if prefer_gradient_only {
             log::info!(
                 "[OUTER] rho_dim {k} reaches exact REML Hessian budget \
                    ({REML_SECOND_ORDER_RHO_CAP}); routing analytic-gradient quasi-Newton"
+            );
+        }
+        if !continuation_prewarm {
+            log::info!(
+                "[OUTER] rho_dim {k} reaches continuation-prewarm budget \
+                   ({REML_CONTINUATION_PREWARM_RHO_CAP}); starting optimizer directly from seeds"
             );
         }
         let problem = OuterProblem::new(k)
@@ -3876,7 +3891,7 @@ where
                 DeclaredHessianForm::Unavailable
             })
             .with_prefer_gradient_only(prefer_gradient_only)
-            .with_continuation_prewarm(!prefer_gradient_only)
+            .with_continuation_prewarm(continuation_prewarm)
             .with_barrier(
                 crate::solver::estimate::reml::unified::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
@@ -4119,17 +4134,24 @@ where
         };
         let initial_link_kind = cfg.link_kind.clone();
         let prefer_gradient_only = theta_dim >= REML_SECOND_ORDER_RHO_CAP;
+        let continuation_prewarm = theta_dim < REML_CONTINUATION_PREWARM_RHO_CAP;
         if prefer_gradient_only {
             log::info!(
                 "[OUTER] theta_dim {theta_dim} reaches exact REML Hessian budget \
                    ({REML_SECOND_ORDER_RHO_CAP}); routing analytic-gradient quasi-Newton"
             );
         }
+        if !continuation_prewarm {
+            log::info!(
+                "[OUTER] theta_dim {theta_dim} reaches continuation-prewarm budget \
+                   ({REML_CONTINUATION_PREWARM_RHO_CAP}); starting optimizer directly from seeds"
+            );
+        }
         let problem = OuterProblem::new(theta_dim)
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Either)
             .with_prefer_gradient_only(prefer_gradient_only)
-            .with_continuation_prewarm(!prefer_gradient_only)
+            .with_continuation_prewarm(continuation_prewarm)
             .with_psi_dim(mixture_dim + sas_dim)
             .with_barrier(
                 crate::solver::estimate::reml::unified::BarrierConfig::from_constraints(
