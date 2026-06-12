@@ -567,6 +567,7 @@ const SAE_ATOM_COLLAPSE_RESEED_BUDGET: usize = 1;
 /// collapse and must enter the #976 CollapseEvent ledger.
 const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.05;
 const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
+const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
 
 /// Reactivation band width (in units of the JumpReLU temperature `τ`) below the
 /// hard gate threshold. The forward gate value is hard-zero strictly below
@@ -3956,6 +3957,37 @@ impl SaeManifoldTerm {
         }
         self.certificate_dispersion = Some(dispersion);
         Ok(())
+    }
+
+    /// Profile the Gaussian reconstruction dispersion at the current seed
+    /// state. This is the scale used to make SAE penalty seeds dimensionless
+    /// before the outer rho search starts.
+    pub fn seed_reconstruction_dispersion(
+        &self,
+        target: ArrayView2<'_, f64>,
+    ) -> Result<f64, String> {
+        let fitted = self.try_fitted()?;
+        if fitted.dim() != target.dim() {
+            return Err(format!(
+                "SaeManifoldTerm::seed_reconstruction_dispersion: fitted {:?} != target {:?}",
+                fitted.dim(),
+                target.dim()
+            ));
+        }
+        let n_scalar = (target.nrows() * target.ncols()).max(1) as f64;
+        let mut rss = 0.0_f64;
+        for row in 0..target.nrows() {
+            for col in 0..target.ncols() {
+                let r = target[[row, col]] - fitted[[row, col]];
+                rss += r * r;
+            }
+        }
+        if !rss.is_finite() || rss < 0.0 {
+            return Err(format!(
+                "SaeManifoldTerm::seed_reconstruction_dispersion: non-finite seed RSS {rss}"
+            ));
+        }
+        Ok((rss / n_scalar).max(SAE_SEED_DISPERSION_FLOOR))
     }
 
     /// Install per-row design honesty weights (#991) — the `1/π` inclusion
@@ -13273,6 +13305,18 @@ impl SaeManifoldOuterObjective {
     /// ρ-anneal; the outer engine still moves ρ afterward from this warm state.
     pub fn run_curvature_homotopy_entry(&mut self) -> Result<bool, String> {
         let rho = self.baseline_rho.clone();
+        self.run_curvature_homotopy_entry_at_rho(&rho)
+    }
+
+    /// Certified curvature-homotopy entry walk at an explicit seed ρ. The outer
+    /// seed loop calls this form so each generated candidate lands on its own
+    /// fixed baseline instead of every walk reusing the construction baseline.
+    pub fn run_curvature_homotopy_entry_at_rho(
+        &mut self,
+        rho: &SaeManifoldRho,
+    ) -> Result<bool, String> {
+        let rho = rho.clone();
+        self.current_rho = rho.clone();
         let isometry_targets = self
             .registry
             .as_ref()
@@ -13780,9 +13824,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
     /// degenerate anchor or a detected bifurcation the term is left at the full
     /// basis (`η = 1`) and the documented cascade takes over — the outcome is
     /// recorded on the fit payload either way.
-    fn curvature_homotopy_entry(&mut self) -> Option<Result<bool, EstimationError>> {
+    fn curvature_homotopy_entry(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Option<Result<bool, EstimationError>> {
+        let rho_state = self.baseline_rho.from_flat(rho.view());
         Some(
-            self.run_curvature_homotopy_entry()
+            self.run_curvature_homotopy_entry_at_rho(&rho_state)
                 .map_err(EstimationError::RemlOptimizationFailed),
         )
     }
@@ -20983,6 +21031,77 @@ mod tests {
         FrameProjection::new(term).project_rows(htbeta_b)
     }
 
+    fn low_rank_factored_htbeta_term(
+        k_atoms: usize,
+        m: usize,
+        p: usize,
+        frame_rank: usize,
+        latent_dim: usize,
+        n_obs: usize,
+    ) -> SaeManifoldTerm {
+        let mut atoms = Vec::with_capacity(k_atoms);
+        let mut coord_blocks = Vec::with_capacity(k_atoms);
+        for atom_idx in 0..k_atoms {
+            let coords = Array2::from_shape_fn((n_obs, latent_dim), |(row, axis)| {
+                let phase = (row + 1) as f64 * (axis + 2) as f64 + 0.37 * (atom_idx + 1) as f64;
+                0.2 * phase.sin() + 0.1 * (0.17 * phase).cos()
+            });
+            let mut phi = Array2::<f64>::zeros((n_obs, m));
+            let mut jet = Array3::<f64>::zeros((n_obs, m, latent_dim));
+            for row in 0..n_obs {
+                for basis_col in 0..m {
+                    let base = (row + 1) as f64 * (basis_col + 1) as f64;
+                    phi[[row, basis_col]] = if basis_col == 0 { 1.0 } else { 0.0 }
+                        + 0.01 * (base + 3.0 * atom_idx as f64).sin();
+                    for axis in 0..latent_dim {
+                        jet[[row, basis_col, axis]] =
+                            0.005 * ((base * (axis + 1) as f64) + atom_idx as f64).cos();
+                    }
+                }
+            }
+            let mut frame = Array2::<f64>::zeros((p, frame_rank));
+            for frame_col in 0..frame_rank {
+                frame[[(atom_idx * frame_rank + frame_col) % p, frame_col]] = 1.0;
+            }
+            let coords_c = Array2::from_shape_fn((m, frame_rank), |(basis_col, frame_col)| {
+                0.2 + 0.03 * (basis_col + 2 * frame_col + atom_idx) as f64
+            });
+            let decoder = coords_c.dot(&frame.t());
+            let mut atom = SaeManifoldAtom::new(
+                "factored_htbeta_shape",
+                SaeAtomBasisKind::EuclideanPatch,
+                latent_dim,
+                phi,
+                jet,
+                decoder,
+                Array2::<f64>::eye(m),
+            )
+            .unwrap();
+            atom.maybe_activate_decoder_frame()
+                .expect("frame activation")
+                .expect("low-rank atom should activate a frame");
+            atoms.push(atom);
+            coord_blocks.push(coords);
+        }
+        let logits = Array2::<f64>::from_shape_fn((n_obs, k_atoms), |(row, atom)| {
+            0.03 * ((row + 1) as f64 * (atom + 2) as f64).sin()
+        });
+        let manifolds =
+            vec![LatentManifold::Product(vec![LatentManifold::Euclidean; latent_dim]); k_atoms];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coord_blocks,
+            manifolds,
+            AssignmentMode::softmax(0.9),
+        )
+        .unwrap();
+        SaeManifoldTerm::new(atoms, assignment).unwrap()
+    }
+
+    fn factored_htbeta_rho(k_atoms: usize, latent_dim: usize) -> SaeManifoldRho {
+        SaeManifoldRho::new(0.0, -0.2, vec![Array1::<f64>::zeros(latent_dim); k_atoms])
+    }
+
     #[test]
     fn factored_row_htbeta_native_solve_matches_full_b_then_project() {
         let k_atoms = 2usize;
@@ -21091,6 +21210,122 @@ mod tests {
         for idx in 0..native_db.len() {
             assert_abs_diff_eq!(native_db[idx], projected_db[idx], epsilon = 1.0e-10);
         }
+    }
+
+    #[test]
+    fn factored_row_htbeta_d2_matches_dense_full_b_then_project() {
+        let k_atoms = 3usize;
+        let m = 5usize;
+        let p = 32usize;
+        let frame_rank = 2usize;
+        let latent_dim = 2usize;
+        let n_obs = 6usize;
+        let mut factored_term =
+            low_rank_factored_htbeta_term(k_atoms, m, p, frame_rank, latent_dim, n_obs);
+        assert!(factored_term.frames_active());
+        assert_eq!(
+            factored_term.factored_border_dim(),
+            k_atoms * m * frame_rank
+        );
+        assert!(factored_term.factored_border_dim() < factored_term.beta_dim());
+
+        let mut full_term = factored_term.clone();
+        for atom in &mut full_term.atoms {
+            atom.deactivate_decoder_frame();
+        }
+        let rho = factored_htbeta_rho(k_atoms, latent_dim);
+        let target = Array2::<f64>::from_shape_fn((n_obs, p), |(row, col)| {
+            0.01 * (row + 1) as f64 - 0.002 * (col + 1) as f64
+        });
+
+        let native_sys = factored_term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+        let full_sys = full_term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+        let mut projected_sys = factored_term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+        projected_sys.htbeta_matvec = None;
+        projected_sys.htbeta_transpose_matvec = None;
+        projected_sys.htbeta_dense_supplement = false;
+        for row_idx in 0..n_obs {
+            let htbeta_b = materialize_row_htbeta_for_test(&full_sys, row_idx);
+            projected_sys.rows[row_idx].htbeta =
+                project_row_htbeta_to_factored_for_test(&factored_term, htbeta_b.view());
+        }
+        projected_sys.refresh_row_hessian_fingerprint();
+
+        let ridge_t = 5.0e-1;
+        let (native_dt, native_db, _) = native_sys.solve(ridge_t, 1.0e-8).unwrap();
+        let (projected_dt, projected_db, _) = projected_sys.solve(ridge_t, 1.0e-8).unwrap();
+        assert_eq!(native_dt.len(), projected_dt.len());
+        assert_eq!(native_db.len(), projected_db.len());
+        for idx in 0..native_dt.len() {
+            assert_abs_diff_eq!(native_dt[idx], projected_dt[idx], epsilon = 1.0e-10);
+        }
+        for idx in 0..native_db.len() {
+            assert_abs_diff_eq!(native_db[idx], projected_db[idx], epsilon = 1.0e-10);
+        }
+    }
+
+    #[test]
+    fn qwen_shape_d2_factored_htbeta_assembly_stays_below_8gib() {
+        const K_ATOMS: usize = 8;
+        const M: usize = 10;
+        const P: usize = 2048;
+        const FRAME_RANK: usize = 2;
+        const LATENT_DIM: usize = 2;
+        const N_OBS: usize = 2000;
+        const EIGHT_GIB: usize = 8 * 1024 * 1024 * 1024;
+
+        let mut term = low_rank_factored_htbeta_term(K_ATOMS, M, P, FRAME_RANK, LATENT_DIM, N_OBS);
+        assert!(term.frames_active());
+        assert_eq!(term.beta_dim(), K_ATOMS * M * P);
+        assert_eq!(term.factored_border_dim(), K_ATOMS * M * FRAME_RANK);
+        assert!(term.factored_border_dim() < term.beta_dim());
+
+        let rho = factored_htbeta_rho(K_ATOMS, LATENT_DIM);
+        let target = Array2::<f64>::from_shape_fn((N_OBS, P), |(row, col)| {
+            1.0e-4 * ((row + 1) as f64 * (col + 3) as f64).sin()
+        });
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+
+        assert_eq!(sys.k, term.factored_border_dim());
+        assert!(sys.htbeta_matvec.is_none());
+        assert!(sys.htbeta_transpose_matvec.is_none());
+        let expected_row_dim = K_ATOMS * (LATENT_DIM + 1);
+        assert!(sys.row_dims.iter().all(|&dim| dim == expected_row_dim));
+        for row in &sys.rows {
+            assert_eq!(row.htbeta.ncols(), term.factored_border_dim());
+            assert_eq!(row.htbeta.nrows(), expected_row_dim);
+        }
+
+        let htbeta_bytes: usize = sys
+            .rows
+            .iter()
+            .map(|row| row.htbeta.len() * std::mem::size_of::<f64>())
+            .sum();
+        let assembled_dense_bytes = htbeta_bytes
+            + sys.hbb.len() * std::mem::size_of::<f64>()
+            + sys.gb.len() * std::mem::size_of::<f64>();
+        let old_full_b_htbeta_bytes = N_OBS
+            .saturating_mul(expected_row_dim)
+            .saturating_mul(term.beta_dim())
+            .saturating_mul(std::mem::size_of::<f64>());
+
+        assert!(
+            old_full_b_htbeta_bytes > EIGHT_GIB,
+            "test shape must reproduce the old p-wide H_tbeta memory wall"
+        );
+        assert!(
+            assembled_dense_bytes < EIGHT_GIB,
+            "qwen-shaped factored assembly stored {assembled_dense_bytes} bytes, \
+             exceeding the 8 GiB gate"
+        );
     }
 
     /// A full-rank small-`p` decoder must NOT activate a frame: the factored

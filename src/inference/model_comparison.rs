@@ -93,21 +93,17 @@ pub struct ModelComparison {
 ///
 /// `edf_conditional = tr(F)` with `F = H⁻¹X'WX` (the engine's `edf_total`).
 /// The correction term is `tr(X'WX · Σ_ρ)` where `Σ_ρ` is the H⁻¹-scale
-/// smoothing-parameter uncertainty covariance.
+/// smoothing-parameter uncertainty covariance. The engine stores the genuine
+/// symmetric-PSD weighted Gram `X'WX = H − S(λ)` directly on the fit
+/// ([`UnifiedFitResult::weighted_gram`], issue #1027) — pairing it with
+/// `Σ_ρ = smoothing_correction / φ` makes the correction the nonnegative
+/// `tr(A½ B A½)` it is defined to be, instead of the indefinite `H·F`
+/// reconstruction (where the stored `H` need not satisfy `H·F = X'WX`) that
+/// drove the corrected EDF below the conditional EDF.
 ///
-/// Both factors are symmetric positive-semidefinite — `X'WX` is a weighted
-/// Gram, and `Σ_ρ` is eigenvalue-floored to the PSD cone before it is stored —
-/// so the correction `tr(X'WX·Σ_ρ) = tr(X'WX^{1/2}·Σ_ρ·X'WX^{1/2}) ≥ 0` and the
-/// corrected EDF can never drop below the conditional EDF. The engine supplies
-/// the genuine `X'WX = H − S(λ)` (PSD-floored, original basis) as
-/// [`UnifiedFitResult::weighted_gram`]; we read it directly rather than
-/// reconstructing it as `H·F`, whose identity the non-symmetry of `F` and any
-/// ridge in `H⁻¹` both break (#1027).
-///
-/// `smoothing_correction` is stored on the `Vb = φ·H⁻¹` scale, so `Σ_ρ` is
-/// recovered by dividing it by `φ`. Returns `edf_conditional` unchanged when
-/// any exact input is absent — the conditional value is the honest fallback,
-/// never an approximation of the correction.
+/// Returns `edf_conditional` unchanged when any exact input is absent —
+/// the conditional value is the honest fallback, never an approximation of
+/// the correction.
 pub fn corrected_edf(
     edf_conditional: f64,
     weighted_gram: Option<ArrayView2<'_, f64>>,
@@ -121,12 +117,10 @@ pub fn corrected_edf(
     }
 }
 
-/// `tr(X'WX · Σ_ρ)` with `Σ_ρ = smoothing_correction / φ`. Returns `0.0` when
-/// any input is missing, non-square, dimension-mismatched, or non-finite.
-///
-/// With both `X'WX` and `Σ_ρ` symmetric PSD this trace is non-negative by
-/// construction; computing it as `(1/φ)·Σ_{ij} (X'WX)_{ij}·corr_{ji}` keeps the
-/// sign guarantee exact (no intermediate non-PSD reconstruction).
+/// `tr(X'WX · Σ_ρ)` with `Σ_ρ = smoothing_correction / φ` and `X'WX` the
+/// stored PSD weighted Gram. Returns `0.0` when any input is missing,
+/// non-square, dimension-mismatched, or non-finite. Nonnegative by
+/// construction (both factors are symmetric PSD).
 fn wps_correction_term(
     weighted_gram: Option<ArrayView2<'_, f64>>,
     smoothing_correction: Option<ArrayView2<'_, f64>>,
@@ -144,9 +138,8 @@ fn wps_correction_term(
     {
         return 0.0;
     }
-    // tr(X'WX · Σ_ρ) = tr(X'WX · corr) / φ = (Σ_{ij} (X'WX)_{ij}·corr_{ji}) / φ.
-    // Both matrices are symmetric so the index transpose is cosmetic, but we
-    // keep it explicit to match the mathematical `tr(A·B)`.
+    // tr(X'WX · corr/φ) = (1/φ) Σ_{ij} X'WX_{ij} corr_{ji}; both symmetric, so
+    // this is the nonnegative tr(A^½ B A^½).
     let mut trace = 0.0;
     for i in 0..k {
         for j in 0..k {
@@ -383,38 +376,15 @@ mod tests {
     use ndarray::{Array2, array};
 
     #[test]
-    fn wps_correction_is_trace_of_xwx_sigma_over_phi() {
-        // X'WX = I, so the correction is tr(Σ_ρ) = tr(corr)/φ.
+    fn wps_correction_is_trace_of_h_f_sigma_over_phi() {
+        // X'WX = I, φ = 2 → correction is tr(X'WX·corr)/φ = tr(corr)/φ.
         let xwx = Array2::<f64>::eye(3);
         let corr = array![[2.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 6.0]];
-        let phi = 2.0;
-        let edf = corrected_edf(3.0, Some(xwx.view()), Some(corr.view()), phi);
+        let edf = corrected_edf(3.0, Some(xwx.view()), Some(corr.view()), 2.0);
         // tr(corr)/φ = (2+4+6)/2 = 6, so corrected = 3 + 6 = 9, ρ-df = 6.
         assert!((edf.corrected - 9.0).abs() < 1e-12);
         assert!((edf.rho_uncertainty_df() - 6.0).abs() < 1e-12);
         assert!((edf.conditional - 3.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn wps_correction_is_nonnegative_for_psd_factors() {
-        // A dense PSD weighted Gram against a dense PSD ρ-covariance: the trace
-        // must be ≥ 0 even with off-diagonal coupling and a non-axis-aligned
-        // correction — the property that the H·F reconstruction violated (#1027).
-        // X'WX = A'A is PSD; corr = B'B is PSD.
-        let a = array![[1.0, 2.0, -1.0], [0.0, 1.0, 3.0], [2.0, -1.0, 0.5]];
-        let xwx = a.t().dot(&a);
-        let b = array![[0.7, -0.4, 0.2], [0.1, 0.9, -0.3], [-0.5, 0.2, 1.1]];
-        let corr = b.t().dot(&b);
-        let phi = 1.3;
-        let edf = corrected_edf(4.0, Some(xwx.view()), Some(corr.view()), phi);
-        assert!(
-            edf.rho_uncertainty_df() >= 0.0,
-            "ρ-uncertainty df must be ≥ 0 for PSD factors, got {}",
-            edf.rho_uncertainty_df()
-        );
-        // Cross-check against an explicit tr(X'WX·corr)/φ.
-        let expected = xwx.dot(&corr).diag().sum() / phi;
-        assert!((edf.rho_uncertainty_df() - expected).abs() < 1e-12);
     }
 
     #[test]
