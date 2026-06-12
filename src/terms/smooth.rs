@@ -8,16 +8,15 @@ use crate::basis::{
     PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
     SphericalSplineIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
     build_bspline_basis_1d, build_constant_curvature_basis, build_duchon_basis,
-    build_duchon_basiswithworkspace,
-    build_matern_basis, build_matern_basis_log_kappa_aniso_derivatives,
-    build_matern_basis_log_kappa_derivatives, build_matern_basiswithworkspace,
-    build_matern_collocation_operator_matrices, build_spherical_spline_basis,
-    build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto,
-    center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
-    estimate_penalty_nullity, filter_active_penalty_candidates,
-    filter_active_penalty_candidates_with_ops, initial_aniso_contrasts,
-    orthogonality_transform_for_design, pairwise_distance_bounds, pairwise_distance_bounds_sampled,
-    points_in_aniso_y_space, select_centers_by_strategy,
+    build_duchon_basiswithworkspace, build_matern_basis,
+    build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
+    build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
+    build_spherical_spline_basis, build_thin_plate_basis,
+    build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto, center_strategy_kind,
+    center_strategy_num_centers, center_strategy_with_num_centers, estimate_penalty_nullity,
+    filter_active_penalty_candidates, filter_active_penalty_candidates_with_ops,
+    initial_aniso_contrasts, orthogonality_transform_for_design, pairwise_distance_bounds,
+    pairwise_distance_bounds_sampled, points_in_aniso_y_space, select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -20274,12 +20273,12 @@ where
                           theta: &Array1<f64>,
                           order: OuterEvalOrder|
          -> Result<OuterEval, EstimationError> {
-              if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta) {
-                  let cached_satisfies_order = match order {
-                      OuterEvalOrder::Value => true,
-                      OuterEvalOrder::ValueAndGradient => true,
-                      OuterEvalOrder::ValueGradientHessian => hess.is_analytic(),
-                  };
+            if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta) {
+                let cached_satisfies_order = match order {
+                    OuterEvalOrder::Value => true,
+                    OuterEvalOrder::ValueAndGradient => true,
+                    OuterEvalOrder::ValueGradientHessian => hess.is_analytic(),
+                };
                 if cached_satisfies_order {
                     if !cost.is_finite() {
                         return Ok(OuterEval::infeasible(theta.len()));

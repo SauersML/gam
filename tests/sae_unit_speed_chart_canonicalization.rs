@@ -79,7 +79,9 @@ fn honest_angle(t: f64) -> f64 {
 fn circle_point(u: f64, frame: &Array2<f64>) -> Vec<f64> {
     let ang = std::f64::consts::TAU * u;
     let (c, s) = (ang.cos(), ang.sin());
-    (0..P).map(|i| c * frame[[i, 0]] + s * frame[[i, 1]]).collect()
+    (0..P)
+        .map(|i| c * frame[[i, 0]] + s * frame[[i, 1]])
+        .collect()
 }
 
 /// Exact least squares `B = argmin ‖Φ B − Y‖²` via normal equations (the
@@ -389,8 +391,7 @@ fn warped_interval_chart_canonicalizes_to_unit_speed_unit_span() {
         decoder[[3, i]] = direction[i];
     }
 
-    let coords =
-        Array2::from_shape_fn((n, 1), |(i, _)| lo + (hi - lo) * i as f64 / (n - 1) as f64);
+    let coords = Array2::from_shape_fn((n, 1), |(i, _)| lo + (hi - lo) * i as f64 / (n - 1) as f64);
     let evaluator = MonomialEvaluator;
     let (phi, jet) = evaluator.evaluate(coords.view()).expect("row basis");
     let mut z = Array2::<f64>::zeros((n, P));

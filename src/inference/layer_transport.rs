@@ -185,8 +185,7 @@ impl DomainBasis {
         let n = coords.len();
         match topology {
             ChartTopology::Circle => {
-                let num_basis =
-                    (n / OBS_PER_BASIS).clamp(MIN_PERIODIC_BASIS, MAX_PERIODIC_BASIS);
+                let num_basis = (n / OBS_PER_BASIS).clamp(MIN_PERIODIC_BASIS, MAX_PERIODIC_BASIS);
                 Ok(DomainBasis::Periodic(PeriodicBSplineBasisSpec {
                     degree: TRANSPORT_SPLINE_DEGREE,
                     num_basis,
@@ -725,7 +724,11 @@ pub fn fit_transport_map(
             "layer transport needs at least {MIN_TRANSPORT_OBS} paired observations, got {n}"
         ));
     }
-    if coords_from.iter().chain(coords_to.iter()).any(|v| !v.is_finite()) {
+    if coords_from
+        .iter()
+        .chain(coords_to.iter())
+        .any(|v| !v.is_finite())
+    {
         return Err("layer transport coordinates must all be finite".to_string());
     }
     topology_from.validate()?;
@@ -900,9 +903,9 @@ pub struct CompositionDefectReport {
 fn domain_grid(topology: ChartTopology, n: usize) -> Array1<f64> {
     match topology {
         ChartTopology::Circle => Array1::from_iter((0..n).map(|i| TAU * i as f64 / n as f64)),
-        ChartTopology::Interval { lo, hi } => Array1::from_iter(
-            (0..n).map(|i| lo + (hi - lo) * i as f64 / (n - 1).max(1) as f64),
-        ),
+        ChartTopology::Interval { lo, hi } => {
+            Array1::from_iter((0..n).map(|i| lo + (hi - lo) * i as f64 / (n - 1).max(1) as f64))
+        }
     }
 }
 
@@ -930,11 +933,9 @@ pub fn composition_defect(
         || h_ab.topology_to != h_bc.topology_from
         || h_bc.topology_to != h_ac.topology_to
     {
-        return Err(
-            "composition defect requires chart-compatible transports: \
+        return Err("composition defect requires chart-compatible transports: \
              h_ab: A→B, h_bc: B→C, h_ac: A→C"
-                .to_string(),
-        );
+            .to_string());
     }
     if n_grid < MIN_TRANSPORT_OBS {
         return Err(format!(
@@ -1036,8 +1037,8 @@ pub fn composition_defect(
 
     // Šidák bound for the max studentized defect: the defect smooth's EDF is
     // the effective number of independent looks along the grid.
-    let normal = Normal::new(0.0, 1.0)
-        .map_err(|e| format!("standard normal construction failed: {e}"))?;
+    let normal =
+        Normal::new(0.0, 1.0).map_err(|e| format!("standard normal construction failed: {e}"))?;
     let pointwise = (2.0 * (1.0 - normal.cdf(max_z))).clamp(0.0, 1.0);
     let effective_looks = fit.edf.ceil().max(1.0);
     let max_studentized_p_value = (1.0 - (1.0 - pointwise).powf(effective_looks)).clamp(0.0, 1.0);
@@ -1100,7 +1101,13 @@ pub fn transport_ladder(
             topologies[k],
             topologies[k + 1],
         )
-        .map_err(|e| format!("adjacent transport {}→{} failed: {e}", layers[k], layers[k + 1]))?;
+        .map_err(|e| {
+            format!(
+                "adjacent transport {}→{} failed: {e}",
+                layers[k],
+                layers[k + 1]
+            )
+        })?;
         adjacent.push(fit.report(layers[k], layers[k + 1]));
         adjacent_fits.push(fit);
     }
@@ -1113,7 +1120,13 @@ pub fn transport_ladder(
             topologies[k],
             topologies[k + 2],
         )
-        .map_err(|e| format!("two-hop transport {}→{} failed: {e}", layers[k], layers[k + 2]))?;
+        .map_err(|e| {
+            format!(
+                "two-hop transport {}→{} failed: {e}",
+                layers[k],
+                layers[k + 2]
+            )
+        })?;
         let composition = composition_defect(
             &adjacent_fits[k],
             &adjacent_fits[k + 1],

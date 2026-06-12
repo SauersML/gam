@@ -23,7 +23,11 @@ const NOISE_SCALE: f64 = 0.3;
 /// e is exactly orthogonal to both design columns: the OLS solution recovers
 /// the truth exactly and every residual has magnitude NOISE_SCALE.
 fn linear_fixture() -> (Array2<f64>, Array1<f64>, Array1<f64>) {
-    assert_eq!(N % 4, 0, "fixture needs blocks of four for exact orthogonality");
+    assert_eq!(
+        N % 4,
+        0,
+        "fixture needs blocks of four for exact orthogonality"
+    );
     let mut design = Array2::<f64>::zeros((N, 2));
     let mut y = Array1::<f64>::zeros(N);
     let mut noise = Array1::<f64>::zeros(N);

@@ -538,16 +538,11 @@ pub fn rho_posterior_tier1_quadrature(
     nodes_per_axis: usize,
 ) -> Result<RhoQuadratureMixture, EstimationError> {
     let cost_hat = objective.eval_cost(rho_hat)?;
-    let (core_nodes, effective_sample_size) = quadrature_nodes_core(
-        rho_hat,
-        outer_hessian,
-        nodes_per_axis,
-        cost_hat,
-        |rho| {
+    let (core_nodes, effective_sample_size) =
+        quadrature_nodes_core(rho_hat, outer_hessian, nodes_per_axis, cost_hat, |rho| {
             let eval = objective.eval(rho)?;
             Ok(Some((eval.cost, Some(eval.gradient))))
-        },
-    )?;
+        })?;
     let k = rho_hat.len();
     let mut nodes = Vec::with_capacity(core_nodes.len());
     let mut max_gradient_norm = 0.0_f64;
@@ -620,13 +615,10 @@ where
             "rho_posterior_quadrature: criterion is infeasible at rho_hat itself".to_string(),
         )
     })?;
-    let (core_nodes, effective_sample_size) = quadrature_nodes_core(
-        rho_hat,
-        outer_hessian,
-        nodes_per_axis,
-        cost_hat,
-        |rho| Ok(criterion(rho).map(|cost| (cost, None))),
-    )?;
+    let (core_nodes, effective_sample_size) =
+        quadrature_nodes_core(rho_hat, outer_hessian, nodes_per_axis, cost_hat, |rho| {
+            Ok(criterion(rho).map(|cost| (cost, None)))
+        })?;
     let nodes: Vec<RhoMixtureNode> = core_nodes
         .into_iter()
         .map(|node| RhoMixtureNode {
@@ -689,8 +681,7 @@ where
             && first_beta.len() != beta.len()
         {
             return Err(EstimationError::RemlOptimizationFailed(
-                "mixture_coefficient_covariance: inconsistent beta length across nodes"
-                    .to_string(),
+                "mixture_coefficient_covariance: inconsistent beta length across nodes".to_string(),
             ));
         }
         total_weight += node.weight;

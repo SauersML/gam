@@ -8941,8 +8941,7 @@ fn build_model_summary(
         });
     }
     // #939: known-scale Lawley Bartlett substrate (None ⇒ first-order only).
-    let lawley_substrate =
-        lawley_known_scale_substrate(design, fit, &family, offset, weights);
+    let lawley_substrate = lawley_known_scale_substrate(design, fit, &family, offset, weights);
     for term in &design.smooth.terms {
         let k = term.penalties_local.len();
         let term_penalty_start = penalty_cursor;
@@ -8957,17 +8956,18 @@ fn build_model_summary(
             // this term's block, from the exact family cumulant jets at the
             // fit. A degenerate assembly (singular information, etc.) simply
             // falls back to first-order reporting.
-            let known_scale_lr_mean_shift = lawley_substrate.as_ref().and_then(
-                |(x_dense, kappas, s_pen)| {
-                    gam::inference::lawley::lawley_lr_mean_shift(
-                        x_dense.view(),
-                        kappas,
-                        Some(s_pen.view()),
-                        term.coeff_range.clone(),
-                    )
-                    .ok()
-                },
-            );
+            let known_scale_lr_mean_shift =
+                lawley_substrate
+                    .as_ref()
+                    .and_then(|(x_dense, kappas, s_pen)| {
+                        gam::inference::lawley::lawley_lr_mean_shift(
+                            x_dense.view(),
+                            kappas,
+                            Some(s_pen.view()),
+                            term.coeff_range.clone(),
+                        )
+                        .ok()
+                    });
             cov_forwald.and_then(|cov| {
                 wood_smooth_test(SmoothTestInput {
                     beta: fit.beta.view(),

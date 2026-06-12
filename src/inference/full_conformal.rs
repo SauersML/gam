@@ -1225,7 +1225,10 @@ impl CanonicalGlmFamily {
                     (mu * (1.0 - mu) * (1.0 - 2.0 * mu)).abs()
                 };
                 let mut sup = t(lo).max(t(hi));
-                for c in [-LOGIT_THIRD_DERIV_CRITICAL_ETA, LOGIT_THIRD_DERIV_CRITICAL_ETA] {
+                for c in [
+                    -LOGIT_THIRD_DERIV_CRITICAL_ETA,
+                    LOGIT_THIRD_DERIV_CRITICAL_ETA,
+                ] {
                     if lo <= c && c <= hi {
                         sup = sup.max(t(c));
                     }
@@ -1838,7 +1841,9 @@ impl<'a> GlmHomotopyFullConformal<'a> {
             return Err("glm homotopy: empty candidate list".to_string());
         }
         if !(0.0..1.0).contains(&alpha) {
-            return Err(format!("glm homotopy: alpha must be in [0, 1), got {alpha}"));
+            return Err(format!(
+                "glm homotopy: alpha must be in [0, 1), got {alpha}"
+            ));
         }
         if candidates.windows(2).any(|w| !(w[0] < w[1])) {
             return Err("glm homotopy: candidates must be strictly increasing".to_string());
@@ -1979,7 +1984,9 @@ pub fn jackknife_plus_interval(
         .enumerate()
     {
         if !m.is_finite() {
-            return Err(format!("jackknife+: non-finite LOO prediction at index {i}"));
+            return Err(format!(
+                "jackknife+: non-finite LOO prediction at index {i}"
+            ));
         }
         if !(r.is_finite() && r >= 0.0) {
             return Err(format!(
@@ -2715,8 +2722,7 @@ mod tests {
                 c.beta_error_bound,
                 c.z
             );
-            let member_ref =
-                oracle_glm_membership(&x, &y, &x_star, c.z, alpha, &beta_ref, &mean_p);
+            let member_ref = oracle_glm_membership(&x, &y, &x_star, c.z, alpha, &beta_ref, &mean_p);
             assert_eq!(
                 c.member, member_ref,
                 "homotopy membership disagrees with the oracle refit at z={}",
@@ -2743,14 +2749,15 @@ mod tests {
             &x_star,
         )
         .expect("bernoulli engine");
-        let setb = engb.prediction_set(&[0.0, 1.0], alpha).expect("bernoulli set");
+        let setb = engb
+            .prediction_set(&[0.0, 1.0], alpha)
+            .expect("bernoulli set");
         let mean_b = |eta: f64| 1.0 / (1.0 + (-eta).exp());
         let weight_b = |eta: f64| {
             let mu = 1.0 / (1.0 + (-eta).exp());
             mu * (1.0 - mu)
         };
-        let nll_b =
-            |eta: f64, yv: f64| eta.max(0.0) + (-eta.abs()).exp().ln_1p() - yv * eta;
+        let nll_b = |eta: f64, yv: f64| eta.max(0.0) + (-eta.abs()).exp().ln_1p() - yv * eta;
         assert!(
             !setb.candidates[1].cold_refit,
             "the logistic third derivative is globally ≤ 1/(6√3); tracking 0→1 must certify"
@@ -2836,8 +2843,7 @@ mod tests {
                 vec_norm(&diff),
                 c.beta_error_bound
             );
-            let member_ref =
-                oracle_glm_membership(&x, &y, &x_star, c.z, alpha, &beta_ref, &mean_p);
+            let member_ref = oracle_glm_membership(&x, &y, &x_star, c.z, alpha, &beta_ref, &mean_p);
             assert_eq!(
                 c.member, member_ref,
                 "fallback membership at z={} disagrees with the oracle refit",
@@ -2901,7 +2907,10 @@ mod tests {
         upper_vals.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
         let rank_hi = ((n as f64 + 1.0) * (1.0 - alpha)).ceil() as usize;
         let rank_lo = ((n as f64 + 1.0) * alpha).floor() as usize;
-        assert!(rank_lo >= 1 && rank_hi <= n, "fixture sized to certify finite endpoints");
+        assert!(
+            rank_lo >= 1 && rank_hi <= n,
+            "fixture sized to certify finite endpoints"
+        );
         let lo_bf = lower_vals[rank_lo - 1];
         let hi_bf = upper_vals[rank_hi - 1];
         assert!(

@@ -1093,8 +1093,9 @@ fn weighted_ridge_sandwich_cov(
             }
         }
     }
-    let m_inv = crate::linalg::utils::invert_spd_with_ridge(normal_matrix, AUTO_Z_CONDITIONAL_RIDGE_REL)
-        .map_err(|e| format!("conditional latent calibration sandwich inverse failed: {e}"))?;
+    let m_inv =
+        crate::linalg::utils::invert_spd_with_ridge(normal_matrix, AUTO_Z_CONDITIONAL_RIDGE_REL)
+            .map_err(|e| format!("conditional latent calibration sandwich inverse failed: {e}"))?;
     let cov = m_inv.dot(&meat).dot(&m_inv);
     if cov.iter().any(|v| !v.is_finite()) {
         return Err("conditional latent calibration sandwich covariance is non-finite".to_string());

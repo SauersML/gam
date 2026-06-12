@@ -33,9 +33,9 @@ use std::path::PathBuf;
 
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::terms::basis::{
-    BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, ConstantCurvatureBasisSpec,
-    DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, MaternNu, OneDimensionalBoundary,
-    SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
+    BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, ConstantCurvatureBasisSpec, DuchonBasisSpec,
+    DuchonNullspaceOrder, MaternBasisSpec, MaternNu, OneDimensionalBoundary, SphereMethod,
+    SphericalSplineBasisSpec, ThinPlateBasisSpec,
 };
 use crate::terms::smooth::{
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec, TermCollectionSpec, parse_shape_constraint,

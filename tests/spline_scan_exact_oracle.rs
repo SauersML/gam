@@ -142,7 +142,8 @@ fn dense_truth(x: &[f64], y: &[f64], w: &[f64], log_lambda: f64) -> DenseTruth {
     //   rank 2m−2, so logdet⁺ = (2m−2)·ln(1/q) + logdet⁺(K₀); the K₀ part is
     //   λ-free and dropped (the test compares DIFFERENCES across λ).
     let rt_lam_r: f64 = (0..dim).map(|i| rhs[i][0] * mean_full[i][0]).sum();
-    let reml = 0.5 * (2 * m - 2) as f64 * (1.0 / q).ln() - 0.5 * dense_logdet(&lambda)
+    let reml = 0.5 * (2 * m - 2) as f64 * (1.0 / q).ln()
+        - 0.5 * dense_logdet(&lambda)
         - 0.5 * (ytwy - rt_lam_r);
     DenseTruth { mean, var, reml }
 }

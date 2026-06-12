@@ -17,7 +17,10 @@ struct DetNoise(u64);
 
 impl DetNoise {
     fn next_unit(&mut self) -> f64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bits = (self.0 >> 11) ^ (self.0 >> 33);
         (bits & ((1u64 << 53) - 1)) as f64 / (1u64 << 53) as f64
     }
@@ -53,7 +56,11 @@ fn degree_one_map_recovers_degree_and_isometry_defect() {
     )
     .expect("degree-1 transport fit");
 
-    assert_eq!(fit.degree, Some(1), "planted winding degree must be recovered");
+    assert_eq!(
+        fit.degree,
+        Some(1),
+        "planted winding degree must be recovered"
+    );
     assert!(
         fit.topology_preserved,
         "a fold-free degree-1 cover preserves the circle topology: min directional h' = {}",
@@ -82,16 +89,20 @@ fn degree_one_map_recovers_degree_and_isometry_defect() {
         fit.isometry_defect_se
     );
     assert!(fit.edf.is_finite() && fit.edf >= 1.0, "EDF = {}", fit.edf);
-    let conc = fit.degree_concentration.expect("circle→circle concentration");
-    assert!(conc > 0.8, "de-wound residual must be concentrated, R = {conc}");
+    let conc = fit
+        .degree_concentration
+        .expect("circle→circle concentration");
+    assert!(
+        conc > 0.8,
+        "de-wound residual must be concentrated, R = {conc}"
+    );
 }
 
 #[test]
 fn reflected_map_recovers_degree_minus_one() {
     let t = uniform_angles(N_OBS);
     let mut rng = DetNoise(0x1013_0002);
-    let observed =
-        t.mapv(|v| (-v + 0.2 + 0.2 * v.sin() + rng.jitter(NOISE)).rem_euclid(TAU));
+    let observed = t.mapv(|v| (-v + 0.2 + 0.2 * v.sin() + rng.jitter(NOISE)).rem_euclid(TAU));
 
     let fit = fit_transport_map(
         t.view(),
@@ -149,7 +160,10 @@ fn interval_stretch_map_reports_compute_layer_defect() {
     .expect("interval transport fit");
 
     assert_eq!(fit.degree, None, "winding degree is circle→circle only");
-    assert!(fit.topology_preserved, "a monotone affine map is a homeomorphism");
+    assert!(
+        fit.topology_preserved,
+        "a monotone affine map is a homeomorphism"
+    );
     assert!(
         (fit.isometry_defect - 1.0).abs() < 0.3,
         "uniform 2× stretch has defect (2−1)² = 1, got {}",
@@ -158,16 +172,16 @@ fn interval_stretch_map_reports_compute_layer_defect() {
 }
 
 /// Build the consistent A→B→C synthetic stack used by the composition tests.
-fn composition_stack(
-    seed: u64,
-) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+fn composition_stack(seed: u64) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     let t = uniform_angles(N_OBS);
     let mut rng = DetNoise(seed);
     let f = |v: f64| v + 0.25 * v.sin();
     let g = |u: f64| u + 0.6 + 0.2 * u.sin();
     let coords_b = t.mapv(|v| (f(v) + rng.jitter(NOISE)).rem_euclid(TAU));
-    let coords_c =
-        Array1::from_iter(t.iter().map(|&v| (g(f(v)) + rng.jitter(NOISE)).rem_euclid(TAU)));
+    let coords_c = Array1::from_iter(
+        t.iter()
+            .map(|&v| (g(f(v)) + rng.jitter(NOISE)).rem_euclid(TAU)),
+    );
     (t, coords_b, coords_c)
 }
 
@@ -176,8 +190,7 @@ fn composition_law_passes_on_consistent_triples_and_rotated_gauge() {
     let (t, coords_b, coords_c) = composition_stack(0x1013_0005);
     let circle = ChartTopology::Circle;
     let h_ab = fit_transport_map(t.view(), coords_b.view(), circle, circle).expect("h_ab");
-    let h_bc =
-        fit_transport_map(coords_b.view(), coords_c.view(), circle, circle).expect("h_bc");
+    let h_bc = fit_transport_map(coords_b.view(), coords_c.view(), circle, circle).expect("h_bc");
     let h_ac = fit_transport_map(t.view(), coords_c.view(), circle, circle).expect("h_ac");
 
     let report = composition_defect(&h_ab, &h_bc, &h_ac, DEFAULT_COMPOSITION_GRID)
@@ -222,8 +235,7 @@ fn composition_law_rejects_a_planted_inconsistent_triple() {
     let (t, coords_b, coords_c) = composition_stack(0x1013_0006);
     let circle = ChartTopology::Circle;
     let h_ab = fit_transport_map(t.view(), coords_b.view(), circle, circle).expect("h_ab");
-    let h_bc =
-        fit_transport_map(coords_b.view(), coords_c.view(), circle, circle).expect("h_bc");
+    let h_bc = fit_transport_map(coords_b.view(), coords_c.view(), circle, circle).expect("h_bc");
 
     // Planted incoherence: the direct A→C map carries an extra 0.5·sin(2t)
     // warp that no circle isometry (rotation/reflection) can remove.
@@ -269,7 +281,10 @@ fn transport_ladder_wires_adjacent_two_hop_and_composition_fields() {
     let adj = &ladder.adjacent[0];
     assert_eq!((adj.layer_from, adj.layer_to), (20, 21));
     assert_eq!(adj.degree, Some(1));
-    assert!(adj.composition_p_value.is_none(), "adjacent maps carry no triple");
+    assert!(
+        adj.composition_p_value.is_none(),
+        "adjacent maps carry no triple"
+    );
     let hop = &ladder.two_hop[0];
     assert_eq!((hop.layer_from, hop.layer_to), (20, 22));
     assert_eq!(hop.degree, Some(1));

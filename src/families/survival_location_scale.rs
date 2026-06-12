@@ -14163,12 +14163,8 @@ mod tests {
             let event_weight = w * d;
             if event_weight != 0.0 {
                 nll = nll
-                    + u1.compose_unary(survival_ls_log_pdf_stack(
-                        self.inverse_link,
-                        u1.v,
-                        0.0,
-                    )?)
-                    .scale(-event_weight)
+                    + u1.compose_unary(survival_ls_log_pdf_stack(self.inverse_link, u1.v, 0.0)?)
+                        .scale(-event_weight)
                     + g.compose_unary(survival_ls_positive_log_stack(g.v))
                         .scale(-event_weight);
             }
@@ -14190,9 +14186,8 @@ mod tests {
     ) -> SurvivalLocationScaleFamily {
         let n = primaries.len();
         let col = |ch: usize| Array2::from_shape_fn((n, 1), |(r, _)| primaries[r][ch]);
-        let dense = |ch: usize| {
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(col(ch)))
-        };
+        let dense =
+            |ch: usize| DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(col(ch)));
         SurvivalLocationScaleFamily {
             n,
             y: Array1::from(event.to_vec()),
@@ -14224,9 +14219,7 @@ mod tests {
     /// coefficient is 1, and the eta vectors carry the stacked
     /// `[exit; entry; derivative]` layout `validate_joint_states` expects for
     /// time-varying blocks (the time block is always stacked).
-    fn survival_ls_joint_oracle_states(
-        primaries: &[[f64; SLS_ROW_K]],
-    ) -> Vec<ParameterBlockState> {
+    fn survival_ls_joint_oracle_states(primaries: &[[f64; SLS_ROW_K]]) -> Vec<ParameterBlockState> {
         let n = primaries.len();
         let stacked = |exit: usize, entry: usize, deriv: usize| {
             let mut eta = Array1::<f64>::zeros(3 * n);
@@ -14411,9 +14404,8 @@ mod tests {
                     )
                 });
 
-                let fourth_err =
-                    RowKernel::row_fourth_contracted(&kernel, row, &dirs[0], &dirs[1])
-                        .expect_err("fourth-order contraction must refuse, not fabricate");
+                let fourth_err = RowKernel::row_fourth_contracted(&kernel, row, &dirs[0], &dirs[1])
+                    .expect_err("fourth-order contraction must refuse, not fabricate");
                 assert!(
                     fourth_err.contains("fourth-order"),
                     "fourth-order refusal must say why: {fourth_err}"

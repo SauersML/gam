@@ -30736,17 +30736,18 @@ mod tests {
         )
         .expect("completion")
         .expect("completion present");
-        let direct = crate::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
-            h_joint.view(),
-            z_joint.view(),
-            |u: &Array1<f64>, v: &Array1<f64>| {
-                family.joint_jeffreys_information_second_directional_derivative_with_specs(
-                    &states, &specs, u, v,
-                )
-            },
-        )
-        .expect("direct pairwise completion")
-        .expect("direct pairwise completion present");
+        let direct =
+            crate::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
+                h_joint.view(),
+                z_joint.view(),
+                |u: &Array1<f64>, v: &Array1<f64>| {
+                    family.joint_jeffreys_information_second_directional_derivative_with_specs(
+                        &states, &specs, u, v,
+                    )
+                },
+            )
+            .expect("direct pairwise completion")
+            .expect("direct pairwise completion present");
         assert_eq!(
             completion, direct,
             "fallback must be the exact pairwise completion"
