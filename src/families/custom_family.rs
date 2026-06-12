@@ -2996,6 +2996,29 @@ pub trait CustomFamily {
         false
     }
 
+    /// Whether [`Self::joint_jeffreys_information_with_specs`] is the SAME
+    /// object as the observed joint Newton Hessian
+    /// (`exact_newton_joint_hessian_with_specs`).
+    ///
+    /// Default `true`: the trait defaults delegate the Jeffreys information
+    /// to the observed quantities, so conditioning certificates obtained from
+    /// observed-Hessian matvecs transfer to the Jeffreys gate exactly.
+    ///
+    /// Families that override the Jeffreys information with the EXPECTED
+    /// Fisher information must override this to `false`. Every matrix-free
+    /// "Jeffreys provably skippable" pre-check
+    /// (`jeffreys_term_skippable_via_matvec`) certifies conditioning from
+    /// OBSERVED Hessian matvecs; that certificate does NOT transfer when the
+    /// two informations diverge. For probit-class likelihoods the observed
+    /// information GROWS (~η²) on saturated misclassified rows while the
+    /// expected information DECAYS, so an observed-conditioning skip would
+    /// zero the Jeffreys term exactly in the saturation regime it must police
+    /// (gam#1020). When this returns `false` the pre-checks are bypassed and
+    /// the exact expected-information gate always runs.
+    fn joint_jeffreys_information_matches_observed_hessian(&self) -> bool {
+        true
+    }
+
     /// Whether the coupled-joint inner Newton should engage its self-vanishing
     /// Levenberg–Marquardt damping `μ` on a FULL-RANK-but-ILL-CONDITIONED
     /// penalized Hessian (cond > `COND_NEWTON_SAFETY`), not only on a
@@ -12075,7 +12098,14 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
     // LAML logdet consistent with the inner solve (which also gated the term off
     // on the same well-conditioned geometry) while preserving the matrix-free path
     // at outer-eval scale. Returns `false`/unsure ⇒ exact formation below.
+    //
+    // EXPECTED-INFORMATION GUARD (gam#1020): the matvec certifies the
+    // OBSERVED Hessian's conditioning; when the family overrides the Jeffreys
+    // information with the expected Fisher information the certificate does
+    // not transfer (observed grows on saturated rows where expected decays),
+    // so the pre-check is bypassed and the exact gate always runs.
     let outer_precheck_eligible = include_logdet_h
+        && family.joint_jeffreys_information_matches_observed_hessian()
         && total >= crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM;
     let outer_jeffreys_precheck_skips = match preferred_workspace.as_ref() {
         Some(ws) if outer_precheck_eligible && ws.hessian_matvec_available() => {
@@ -15352,7 +15382,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // is dropped here (gam#729/#808).
                 true
             } else if joint_jeffreys_subspace.is_some() {
-                jeffreys_term_skippable_for_source(&joint_hessian_source, total_p).unwrap_or(false)
+                // EXPECTED-INFORMATION GUARD (gam#1020): the skippable
+                // certificate probes the OBSERVED Hessian source; it only
+                // transfers to the Jeffreys gate when the family's Jeffreys
+                // information IS the observed Hessian. Expected-information
+                // families (probit-class) bypass the pre-check — observed
+                // information grows on saturated rows exactly where the
+                // expected information collapses and the gate must arm.
+                family.joint_jeffreys_information_matches_observed_hessian()
+                    && jeffreys_term_skippable_for_source(&joint_hessian_source, total_p)
+                        .unwrap_or(false)
             } else {
                 false
             };
@@ -24558,15 +24597,24 @@ fn jeffreys_term_skippable_for_source(
     if total_p < crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM {
         return Ok(false);
     }
-    // Matrix-free Hessian-vector product against the SAME observed information the
-    // exact gate sees. `joint_jeffreys_term`'s reduced information is `Z_JᵀHZ_J`
-    // with `Z_J = I`, i.e. exactly the UNRIDGED likelihood joint Hessian `H` that
+    // Matrix-free Hessian-vector product against the OBSERVED joint information.
+    // For families whose Jeffreys information IS the observed Hessian (the trait
+    // default), `joint_jeffreys_term`'s reduced information is `Z_JᵀHZ_J` with
+    // `Z_J = I`, i.e. exactly the UNRIDGED likelihood joint Hessian `H` that
     // `exact_newton_joint_hessian_with_specs` materializes; the `Operator::apply`
     // / `Dense` here is that SAME `H` (the workspace's `hessian_matvec`, which the
     // dense source also reconstructs). So the pre-check estimates the spectrum of
     // precisely the matrix the dense path eigendecomposes — the skip decision and
     // the exact gate are consistent by construction, with no ridge discrepancy
     // (the solver's separate ridged solve operator is not involved here).
+    //
+    // EXPECTED-INFORMATION CAVEAT (gam#1020): when the family overrides
+    // `joint_jeffreys_information_with_specs` with the expected Fisher
+    // information, the gate eigendecomposes a DIFFERENT matrix than this matvec
+    // probes, and the certificate does not transfer (observed information grows
+    // on saturated misclassified rows where the expected information decays).
+    // Callers must gate this pre-check on
+    // `family.joint_jeffreys_information_matches_observed_hessian()`.
     let hv = |v: &Array1<f64>| -> Result<Array1<f64>, String> {
         match source {
             JointHessianSource::Dense(matrix) => Ok(matrix.dot(v)),
@@ -30360,6 +30408,327 @@ mod tests {
             "expected nonzero outer Hessian contribution from d2H; with={:?}, without={:?}",
             h_with,
             h_without
+        );
+    }
+
+    fn jeffreys_seam_spec(p: usize) -> ParameterBlockSpec {
+        ParameterBlockSpec {
+            name: "jeffreys-seam".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::eye(p))),
+            offset: Array1::zeros(p),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        }
+    }
+
+    fn jeffreys_seam_state(beta: Array1<f64>) -> ParameterBlockState {
+        let eta = beta.clone();
+        ParameterBlockState { beta, eta }
+    }
+
+    /// Observed-default family for the gam#1020 seam contract: implements only
+    /// the observed joint Newton Hessian (and its directional derivatives) and
+    /// relies on the trait defaults for the Jeffreys information hooks.
+    #[derive(Clone)]
+    struct ObservedJeffreysSeamFamily;
+
+    impl CustomFamily for ObservedJeffreysSeamFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n = block_states
+                .first()
+                .ok_or_else(|| "missing block 0".to_string())?
+                .eta
+                .len();
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(n),
+                    working_weights: Array1::ones(n),
+                }],
+            })
+        }
+
+        fn exact_newton_joint_hessian_with_specs(
+            &self,
+            block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert_eq!(block_states.len(), specs.len());
+            let beta = &block_states[0].beta;
+            Ok(Some(array![
+                [2.0 + beta[0] * beta[0], 0.3],
+                [0.3, 1.5 + beta[1] * beta[1]]
+            ]))
+        }
+
+        fn exact_newton_joint_hessian_directional_derivative_with_specs(
+            &self,
+            block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+            d_beta_flat: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert_eq!(block_states.len(), specs.len());
+            let beta = &block_states[0].beta;
+            Ok(Some(array![
+                [2.0 * beta[0] * d_beta_flat[0], 0.0],
+                [0.0, 2.0 * beta[1] * d_beta_flat[1]]
+            ]))
+        }
+
+        fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+            &self,
+            block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+            d_beta_u_flat: &Array1<f64>,
+            d_betav_flat: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert_eq!(block_states.len(), specs.len());
+            Ok(Some(array![
+                [2.0 * d_beta_u_flat[0] * d_betav_flat[0], 0.0],
+                [0.0, 2.0 * d_beta_u_flat[1] * d_betav_flat[1]]
+            ]))
+        }
+    }
+
+    /// gam#1020 acceptance: families that do NOT override the Jeffreys
+    /// information hooks get the OBSERVED joint Newton quantities — the seam
+    /// defaults are exact delegations, so behavior is unchanged.
+    #[test]
+    fn joint_jeffreys_information_defaults_delegate_to_observed_hessian() {
+        let family = ObservedJeffreysSeamFamily;
+        let specs = vec![jeffreys_seam_spec(2)];
+        let states = vec![jeffreys_seam_state(array![0.4, -0.7])];
+        let u = array![0.3, -0.2];
+        let v = array![-0.1, 0.5];
+
+        let observed = family
+            .exact_newton_joint_hessian_with_specs(&states, &specs)
+            .expect("observed H")
+            .expect("observed H present");
+        let info = family
+            .joint_jeffreys_information_with_specs(&states, &specs)
+            .expect("jeffreys info")
+            .expect("jeffreys info present");
+        assert_eq!(info, observed, "default Jeffreys info must be observed H");
+
+        let observed_dot = family
+            .exact_newton_joint_hessian_directional_derivative_with_specs(&states, &specs, &u)
+            .expect("observed Hdot")
+            .expect("observed Hdot present");
+        let info_dot = family
+            .joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, &u)
+            .expect("jeffreys dI")
+            .expect("jeffreys dI present");
+        assert_eq!(
+            info_dot, observed_dot,
+            "default Jeffreys dI must be observed Hdot"
+        );
+
+        let observed_ddot = family
+            .exact_newton_joint_hessian_second_directional_derivative_with_specs(
+                &states, &specs, &u, &v,
+            )
+            .expect("observed H2dot")
+            .expect("observed H2dot present");
+        let info_ddot = family
+            .joint_jeffreys_information_second_directional_derivative_with_specs(
+                &states, &specs, &u, &v,
+            )
+            .expect("jeffreys d2I")
+            .expect("jeffreys d2I present");
+        assert_eq!(
+            info_ddot, observed_ddot,
+            "default Jeffreys d2I must be observed H2dot"
+        );
+
+        // Contracted hook defaults: declared unavailable and returns None, so
+        // the completion keeps the pairwise H2dot fallback.
+        assert!(!family.joint_jeffreys_information_contracted_trace_hessian_available());
+        let weight = Array2::<f64>::eye(2);
+        let contracted = family
+            .joint_jeffreys_information_contracted_trace_hessian_with_specs(
+                &states, &specs, &weight,
+            )
+            .expect("contracted default");
+        assert!(
+            contracted.is_none(),
+            "default contracted trace hook must be None"
+        );
+
+        // Observed-default families keep the matvec skip pre-checks armed.
+        assert!(family.joint_jeffreys_information_matches_observed_hessian());
+    }
+
+    /// gam#1020: family supplying the contracted trace Hessian. The pairwise
+    /// second-directional path returns wildly different values so the test
+    /// detects which path the completion dispatched to.
+    #[derive(Clone)]
+    struct ContractedJeffreysSeamFamily;
+
+    impl CustomFamily for ContractedJeffreysSeamFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n = block_states
+                .first()
+                .ok_or_else(|| "missing block 0".to_string())?
+                .eta
+                .len();
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(n),
+                    working_weights: Array1::ones(n),
+                }],
+            })
+        }
+
+        fn joint_jeffreys_information_second_directional_derivative_with_specs(
+            &self,
+            block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+            d_beta_u_flat: &Array1<f64>,
+            d_betav_flat: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert_eq!(block_states.len(), specs.len());
+            let scale = 1.0e6 * d_beta_u_flat.dot(d_betav_flat);
+            Ok(Some(scale * Array2::<f64>::eye(2)))
+        }
+
+        fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
+            &self,
+            block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+            weight: &Array2<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert_eq!(block_states.len(), specs.len());
+            assert_eq!(weight.dim(), (2, 2));
+            Ok(Some(7.0 * Array2::<f64>::eye(2)))
+        }
+
+        fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// gam#1020 acceptance: the second-order completion takes the contracted
+    /// trace hook when the family provides one (the wide-p route), scaling it
+    /// by `−½·gate`; the pairwise H2dot path is not consulted.
+    #[test]
+    fn jeffreys_second_order_completion_prefers_contracted_hook() {
+        let family = ContractedJeffreysSeamFamily;
+        let specs = vec![jeffreys_seam_spec(2)];
+        let states = vec![jeffreys_seam_state(Array1::zeros(2))];
+        // λ_min = 1e-4 is far below the absolute conditioning gate, so the
+        // gate weight is exactly 1 and the completion is −½ · contracted.
+        let h_joint = array![[1.0e-4, 0.0], [0.0, 1.0]];
+        let z_joint = Array2::<f64>::eye(2);
+        let completion = custom_family_joint_jeffreys_second_order_completion(
+            &family, &states, &specs, &h_joint, &z_joint, true,
+        )
+        .expect("completion")
+        .expect("completion present");
+        let expected = -3.5 * Array2::<f64>::eye(2);
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (completion[[i, j]] - expected[[i, j]]).abs() < 1e-12,
+                    "contracted completion mismatch at ({i},{j}): {} vs {}",
+                    completion[[i, j]],
+                    expected[[i, j]]
+                );
+            }
+        }
+    }
+
+    /// gam#1020: family without a contracted hook — the completion must fall
+    /// back to the exact pairwise second-directional path, and must return
+    /// `None` when the pairwise fallback is not allowed (width cap exceeded).
+    #[derive(Clone)]
+    struct PairwiseJeffreysSeamFamily;
+
+    impl CustomFamily for PairwiseJeffreysSeamFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n = block_states
+                .first()
+                .ok_or_else(|| "missing block 0".to_string())?
+                .eta
+                .len();
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(n),
+                    working_weights: Array1::ones(n),
+                }],
+            })
+        }
+
+        fn joint_jeffreys_information_second_directional_derivative_with_specs(
+            &self,
+            block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+            d_beta_u_flat: &Array1<f64>,
+            d_betav_flat: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert_eq!(block_states.len(), specs.len());
+            let scale = d_beta_u_flat.dot(d_betav_flat);
+            Ok(Some(scale * array![[2.0, 1.0], [1.0, 3.0]]))
+        }
+    }
+
+    #[test]
+    fn jeffreys_second_order_completion_pairwise_fallback_when_hook_absent() {
+        let family = PairwiseJeffreysSeamFamily;
+        let specs = vec![jeffreys_seam_spec(2)];
+        let states = vec![jeffreys_seam_state(Array1::zeros(2))];
+        let h_joint = array![[1.0e-4, 0.0], [0.0, 1.0]];
+        let z_joint = Array2::<f64>::eye(2);
+
+        let completion = custom_family_joint_jeffreys_second_order_completion(
+            &family, &states, &specs, &h_joint, &z_joint, true,
+        )
+        .expect("completion")
+        .expect("completion present");
+        let direct = crate::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
+            h_joint.view(),
+            z_joint.view(),
+            |u: &Array1<f64>, v: &Array1<f64>| {
+                family.joint_jeffreys_information_second_directional_derivative_with_specs(
+                    &states, &specs, u, v,
+                )
+            },
+        )
+        .expect("direct pairwise completion")
+        .expect("direct pairwise completion present");
+        assert_eq!(
+            completion, direct,
+            "fallback must be the exact pairwise completion"
+        );
+        assert!(
+            completion.iter().any(|value| value.abs() > 0.0),
+            "pairwise completion should be nonzero on this gated fixture"
+        );
+
+        let blocked = custom_family_joint_jeffreys_second_order_completion(
+            &family, &states, &specs, &h_joint, &z_joint, false,
+        )
+        .expect("blocked completion");
+        assert!(
+            blocked.is_none(),
+            "completion must decline (None) when the pairwise fallback is disallowed and no hook exists"
         );
     }
 

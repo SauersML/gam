@@ -17173,6 +17173,17 @@ impl CustomFamily for BinomialLocationScaleFamily {
         true
     }
 
+    fn joint_jeffreys_information_matches_observed_hessian(&self) -> bool {
+        // The Jeffreys information above is the EXPECTED Fisher information,
+        // not the observed Hessian: observed-Hessian conditioning certificates
+        // ("Jeffreys provably skippable" matvec pre-checks) must not gate the
+        // expected-information term off — for probit-class likelihoods the
+        // observed information grows on saturated misclassified rows exactly
+        // where the expected information collapses and the gate must arm
+        // (gam#1020).
+        false
+    }
+
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
@@ -20954,6 +20965,12 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             d_beta_u_flat,
             d_betav_flat,
         )
+    }
+
+    fn joint_jeffreys_information_matches_observed_hessian(&self) -> bool {
+        // Expected Fisher information override (gam#1020): observed-Hessian
+        // conditioning pre-checks must not skip the expected-information gate.
+        false
     }
 
     fn has_explicit_joint_hessian(&self) -> bool {
@@ -24875,6 +24892,9 @@ mod tests {
         let pw = states[2].beta.len();
         assert_eq!(p, pt + pls + pw);
         assert_eq!(xw_at_base.ncols(), pw);
+        // gam#1020: the expected-information override must disarm the
+        // observed-Hessian "Jeffreys skippable" matvec pre-checks.
+        assert!(!family.joint_jeffreys_information_matches_observed_hessian());
         let u = Array1::from_shape_fn(p, |i| 0.04 * ((i + 1) as f64).cos());
         let v = Array1::from_shape_fn(p, |i| -0.03 * ((i + 2) as f64).sin());
         let eps = 1e-5;
@@ -29987,6 +30007,9 @@ mod tests {
             .design
             .as_dense_ref()
             .expect("log-sigma dense design");
+        // gam#1020: the expected-information override must disarm the
+        // observed-Hessian "Jeffreys skippable" matvec pre-checks.
+        assert!(!family.joint_jeffreys_information_matches_observed_hessian());
         let beta_t = Array1::from_iter((0..x_t.ncols()).map(|j| 0.12 - 0.03 * j as f64));
         let beta_ls = Array1::from_iter((0..x_ls.ncols()).map(|j| -0.08 + 0.02 * j as f64));
         let states = vec![
