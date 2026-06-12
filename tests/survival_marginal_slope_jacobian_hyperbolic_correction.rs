@@ -314,9 +314,10 @@ struct LogslopeJacobianImpl {
 }
 
 impl BlockEffectiveJacobian for LogslopeJacobianImpl {
-    fn effective_jacobian_at(
+    fn effective_jacobian_rows(
         &self,
         state: &FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, String> {
         // Prefer family_scalars if provided (they carry updated q0/q1/qd1
         // from the linearization state). Fall back to self.q0/q1/qd1.
@@ -330,9 +331,27 @@ impl BlockEffectiveJacobian for LogslopeJacobianImpl {
             (&self.q0, &self.q1, &self.qd1, &self.z)
         };
 
-        Ok(analytical_logslope_jacobian(
+        let n = self.phi.nrows();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let full = analytical_logslope_jacobian(
             &self.phi, state.beta, q0, q1, qd1, z, self.s_f,
-        ))
+        );
+        // `full` is channel-major: rows [0..n) = η0, [n..2n) = η1, [2n..3n) = ad1.
+        // Re-stack the requested row range per channel into the same channel-major
+        // layout, matching the trait's `effective_jacobian_rows` contract.
+        let k = self.n_outputs();
+        let r_len = rows.end - rows.start;
+        let p = self.phi.ncols();
+        let mut out = Array2::<f64>::zeros((k * r_len, p));
+        for channel in 0..k {
+            let src_start = channel * n + rows.start;
+            let src_end = channel * n + rows.end;
+            let dst_start = channel * r_len;
+            let dst_end = dst_start + r_len;
+            out.slice_mut(ndarray::s![dst_start..dst_end, ..])
+                .assign(&full.slice(ndarray::s![src_start..src_end, ..]));
+        }
+        Ok(out)
     }
 
     fn n_outputs(&self) -> usize {
