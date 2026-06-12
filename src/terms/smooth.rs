@@ -15677,6 +15677,10 @@ fn try_build_spatial_term_log_kappa_derivative(
                 .map_err(EstimationError::from)?
         }
         SmoothBasisSpec::Sphere { .. } => return Ok(None),
+        // Constant-curvature smooths hold κ fixed at construction (#944 stage 3
+        // foundation); the κ-as-ψ derivative channel is a later stage, so there
+        // is no log-κ derivative bundle to expose here yet.
+        SmoothBasisSpec::ConstantCurvature { .. } => return Ok(None),
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
