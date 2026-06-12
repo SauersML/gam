@@ -595,6 +595,7 @@ pub struct SaeStreamingPlan {
     pub chunk_size: usize,
     pub estimated_full_batch_bytes: usize,
     pub estimated_dense_schur_bytes: usize,
+    pub estimated_row_cross_bytes: usize,
     pub estimated_direct_peak_bytes: usize,
     pub estimated_matrix_free_peak_bytes: usize,
     pub in_core_budget_bytes: usize,
@@ -622,9 +623,17 @@ fn sae_streaming_plan_from_budget(
     let dense_schur_bytes = border_dim
         .saturating_mul(border_dim)
         .saturating_mul(SAE_BYTES_PER_F64);
-    let direct_peak_bytes = full_batch_bytes.saturating_add(dense_schur_bytes);
+    let row_block_dim = k_atoms.saturating_mul(1usize.saturating_add(d_max));
+    let row_cross_bytes = n_obs
+        .saturating_mul(row_block_dim)
+        .saturating_mul(border_dim)
+        .saturating_mul(SAE_BYTES_PER_F64);
+    let direct_peak_bytes = full_batch_bytes
+        .saturating_add(row_cross_bytes)
+        .saturating_add(dense_schur_bytes);
     let matrix_free_peak_bytes = chunk_window_bytes
         .min(full_batch_bytes.max(per_row_bytes))
+        .saturating_add(row_cross_bytes)
         .saturating_add(
             border_dim
                 .saturating_mul(SAE_BYTES_PER_F64)
@@ -642,6 +651,7 @@ fn sae_streaming_plan_from_budget(
         },
         estimated_full_batch_bytes: full_batch_bytes,
         estimated_dense_schur_bytes: dense_schur_bytes,
+        estimated_row_cross_bytes: row_cross_bytes,
         estimated_direct_peak_bytes: direct_peak_bytes,
         estimated_matrix_free_peak_bytes: matrix_free_peak_bytes,
         in_core_budget_bytes,
@@ -7202,41 +7212,16 @@ impl SaeManifoldTerm {
             self.k_atoms(),
         )?;
         if plan.streaming {
-            if plan.estimated_full_batch_bytes > plan.in_core_budget_bytes
-                && plan.estimated_dense_schur_bytes > plan.in_core_budget_bytes
-            {
-                return Err(format!(
-                    "SaeManifoldTerm::reml_criterion: predicted full-batch working set {} bytes and dense reduced Schur {} bytes both exceed budget {} bytes; shape n={},p={},K={}",
-                    plan.estimated_full_batch_bytes,
-                    plan.estimated_dense_schur_bytes,
-                    plan.in_core_budget_bytes,
-                    self.n_obs(),
-                    self.output_dim(),
-                    self.k_atoms()
-                ));
-            }
             let mut rho_fixed = rho.clone();
-            let loss = if plan.estimated_full_batch_bytes > plan.in_core_budget_bytes {
-                self.fit_streaming_in_memory(
-                    target,
-                    &mut rho_fixed,
-                    registry,
-                    inner_max_iter,
-                    learning_rate,
-                    ridge_ext_coord,
-                    ridge_beta,
-                )?
-            } else {
-                self.run_joint_fit_arrow_schur(
-                    target,
-                    &mut rho_fixed,
-                    registry,
-                    inner_max_iter,
-                    learning_rate,
-                    ridge_ext_coord,
-                    ridge_beta,
-                )?
-            };
+            let loss = self.run_joint_fit_arrow_schur(
+                target,
+                &mut rho_fixed,
+                registry,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            )?;
             let extra_penalty_energy = match registry {
                 Some(reg) => self
                     .reml_extra_penalty_value_total(reg)
@@ -16770,7 +16755,12 @@ mod tests {
         );
 
         assert_eq!(border_dim, 98_304);
+        assert_eq!(
+            plan.estimated_row_cross_bytes,
+            n_obs * k_atoms * (1 + d_max) * border_dim * SAE_BYTES_PER_F64
+        );
         assert!(plan.estimated_dense_schur_bytes > budget);
+        assert!(plan.estimated_matrix_free_peak_bytes < budget);
         assert!(plan.streaming);
         assert!(!plan.direct_admitted);
         assert!(plan.matrix_free_admitted);

@@ -10262,6 +10262,7 @@ fn sae_streaming_plan(
         "estimated_dense_schur_bytes",
         plan.estimated_dense_schur_bytes,
     )?;
+    out.set_item("estimated_row_cross_bytes", plan.estimated_row_cross_bytes)?;
     out.set_item(
         "estimated_direct_peak_bytes",
         plan.estimated_direct_peak_bytes,
@@ -10302,6 +10303,7 @@ fn sae_streaming_plan_to_pydict<'py>(
         "estimated_dense_schur_bytes",
         plan.estimated_dense_schur_bytes,
     )?;
+    out.set_item("estimated_row_cross_bytes", plan.estimated_row_cross_bytes)?;
     out.set_item(
         "estimated_direct_peak_bytes",
         plan.estimated_direct_peak_bytes,
