@@ -32,6 +32,7 @@ use thiserror::Error;
 
 mod constant_curvature_smooth;
 mod cyclic;
+mod measure_jet_smooth;
 mod polylog;
 mod sphere_kernels;
 mod sphere_spec;
@@ -41,6 +42,11 @@ pub use constant_curvature_smooth::{
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, build_constant_curvature_basis,
     constant_curvature_kernel_kappa_jets, constant_curvature_kernel_matrix,
     realized_constant_curvature_length_scale,
+};
+pub use measure_jet_smooth::{
+    MeasureJetBand, MeasureJetBasisSpec, MeasureJetFrozenQuadrature, MeasureJetIdentifiability,
+    build_measure_jet_basis, measure_jet_band, measure_jet_center_masses,
+    measure_jet_design_matrix, measure_jet_energy_form, realized_measure_jet_length_scale,
 };
 pub use sphere_spec::{
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
@@ -2536,6 +2542,25 @@ pub enum BasisMetadata {
         centers: Array2<f64>,
         kappa: f64,
         length_scale: f64,
+        constraint_transform: Option<Array2<f64>>,
+    },
+    /// Measure-jet spline smooth: multiscale local-jet-residual energy of the
+    /// empirical measure, quadratured on the center set. The penalty depends
+    /// on the FIT data through `masses` and the realized `eps_band`, so both
+    /// are persisted and replayed verbatim by predict-time (and future
+    /// per-ψ-trial) rebuilds — recomputing either from predict rows would
+    /// change the penalty the coefficients were estimated under.
+    /// `constraint_transform` is the composed `z · z_parametric` frozen by
+    /// the global identifiability pipeline (#532 pattern).
+    MeasureJet {
+        centers: Array2<f64>,
+        input_scales: Option<Array1<f64>>,
+        length_scale: f64,
+        eps_band: Vec<f64>,
+        order_s: f64,
+        alpha: f64,
+        tau0: f64,
+        masses: Array1<f64>,
         constraint_transform: Option<Array2<f64>>,
     },
     Matern {
