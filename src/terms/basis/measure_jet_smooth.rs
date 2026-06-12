@@ -471,9 +471,7 @@ pub fn measure_jet_quadrature_nodes(
         .step_by(MEASURE_JET_ASSIGN_BLOCK_ROWS)
         .flat_map(|start| {
             let end = (start + MEASURE_JET_ASSIGN_BLOCK_ROWS).min(n);
-            let g = data
-                .slice(ndarray::s![start..end, ..])
-                .dot(&centers.t());
+            let g = data.slice(ndarray::s![start..end, ..]).dot(&centers.t());
             let block: Vec<usize> = g
                 .axis_iter(Axis(0))
                 .into_par_iter()
@@ -1883,10 +1881,7 @@ mod tests {
         let fast = householder_drop_first_apply(&x, &u);
         let dense = x.dot(&z);
         for (a, b) in fast.iter().zip(dense.iter()) {
-            assert!(
-                (a - b).abs() <= 1e-12,
-                "structured apply drift: {a} vs {b}"
-            );
+            assert!((a - b).abs() <= 1e-12, "structured apply drift: {a} vs {b}");
         }
     }
 

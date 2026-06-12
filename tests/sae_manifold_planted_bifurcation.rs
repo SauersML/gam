@@ -24,7 +24,7 @@ use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
 };
-use ndarray::{Array1, Array2, Array3, s};
+use ndarray::{Array1, Array2, s};
 use std::sync::Arc;
 
 const N: usize = 400;

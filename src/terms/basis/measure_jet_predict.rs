@@ -188,10 +188,7 @@ mod tests {
     /// q_ℓ(d) = total · exp(−d²/(2ε_ℓ²)) — the physical family the support
     /// diagnostic produces for a one-center web.
     fn support_at_distance(d: f64, eps: &[f64]) -> Array1<f64> {
-        Array1::from_iter(
-            eps.iter()
-                .map(|e| TOTAL * (-d * d / (2.0 * e * e)).exp()),
-        )
+        Array1::from_iter(eps.iter().map(|e| TOTAL * (-d * d / (2.0 * e * e)).exp()))
     }
 
     /// (a) Monotone in distance: along the exact kernel-mass family the
@@ -340,8 +337,9 @@ mod tests {
         // Coverage exactly at the floor on the coarsest level only.
         let mut at_floor = sub_floor.clone();
         at_floor[eps.len() - 1] = FLOOR * TOTAL;
-        let v_floor = measure_jet_extrapolation_variance(at_floor.view(), &eps, TOTAL, &lams, FLOOR)
-            .expect("valid inputs");
+        let v_floor =
+            measure_jet_extrapolation_variance(at_floor.view(), &eps, TOTAL, &lams, FLOOR)
+                .expect("valid inputs");
         let expected: f64 = lams[..eps.len() - 1].iter().map(|l| 1.0 / l).sum::<f64>()
             + (1.0 - FLOOR) / lams[eps.len() - 1];
         assert!(

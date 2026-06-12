@@ -71,7 +71,6 @@ fn planted_unit_circle(n: usize, p: usize, sigma: f64) -> Array2<f64> {
 /// would after `term_from_padded_blocks` for one periodic atom.
 fn build_cold_k1_term(z: &Array2<f64>, seed_logit: f64) -> SaeManifoldTerm {
     let n = z.nrows();
-    let p = z.ncols();
     let evaluator = PeriodicHarmonicEvaluator::new(M).unwrap();
     // Seed angle from the ambient (col0, col1) direction (offset so coordinate
     // recovery is not under test), in fraction-of-period units.
@@ -136,9 +135,13 @@ fn run_production_fit(z: &Array2<f64>, seed_logit: f64) -> (SaeManifoldTerm, Sae
     let seed_dispersion = term
         .seed_reconstruction_dispersion(z.view())
         .expect("seed reconstruction dispersion");
-    let init_rho = SaeManifoldRho::new(SPARSITY.ln(), SMOOTHNESS.ln(), vec![Array1::<f64>::zeros(0)])
-        .seed_scaled_by_dispersion(seed_dispersion)
-        .expect("dimensionless seed scaling");
+    let init_rho = SaeManifoldRho::new(
+        SPARSITY.ln(),
+        SMOOTHNESS.ln(),
+        vec![Array1::<f64>::zeros(0)],
+    )
+    .seed_scaled_by_dispersion(seed_dispersion)
+    .expect("dimensionless seed scaling");
     let init_flat = init_rho.to_flat();
     let n_params = init_flat.len();
     let mut objective = SaeManifoldOuterObjective::new(
@@ -229,8 +232,12 @@ fn sae_k1_ibp_circle_has_no_radial_shrinkage() {
         "K=1 IBP circle (eb_optimal_lambda~{eb_optimal_lambda:.3e}):\n  \
          low-seed (logit 0, gate0=0.5):  mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}\n  \
          high-seed(logit 4, gate0~1.0):  mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}",
-        low.mean_zeta, low.radius_ratio, low.lambda_smooth,
-        high.mean_zeta, high.radius_ratio, high.lambda_smooth,
+        low.mean_zeta,
+        low.radius_ratio,
+        low.lambda_smooth,
+        high.mean_zeta,
+        high.radius_ratio,
+        high.lambda_smooth,
     );
 
     // Permanent gate: from the fix seed the ring must sit within 1% of the data
