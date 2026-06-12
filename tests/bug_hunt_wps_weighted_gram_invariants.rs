@@ -155,6 +155,63 @@ fn weighted_gram_is_symmetric_psd() {
 }
 
 #[test]
+fn penalized_hessian_times_influence_equals_weighted_gram() {
+    // H·F = H·(I − H⁻¹·S) = H − S = X'WX is the consistency identity that ties
+    // the three stored matrices together. F = H⁻¹X'WX is a product of two
+    // symmetric matrices and is generally NOT symmetric; symmetrizing it
+    // leaves tr(F) and the basis untouched — so neither
+    // `influence_trace_matches_conditional_edf` above nor any test that reads
+    // the WPS correction via `weighted_gram` (which is now stored directly)
+    // catches it — but it corrupts the frequentist Ve = F·H⁻¹·φ and distorts
+    // the Wood-corrected reference d.f. `tr(F_jj)² / tr(F_jj²)` that
+    // `inference::smooth_test::reference_df` consumes for every smooth's
+    // p-value. This identity catches the symmetrization the moment F is
+    // assembled.
+    init_parallelism();
+    for &wiggle in &[1.0_f64, 0.08] {
+        for seed in 0..3u64 {
+            let (data, _ys) = build_dataset(300, 41 + seed, wiggle);
+            let std_fit = fit_standard(&data);
+            let fit = &std_fit.fit;
+
+            let h = fit
+                .penalized_hessian()
+                .expect("penalized Hessian present on an inferential Gaussian fit");
+            let f = fit
+                .coefficient_influence()
+                .expect("influence matrix present on an inferential Gaussian fit");
+            let xwx = fit
+                .weighted_gram()
+                .expect("weighted Gram present on an inferential Gaussian fit");
+
+            let hf = h.dot(f);
+            let scale = xwx
+                .iter()
+                .copied()
+                .map(f64::abs)
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            let mut worst = 0.0_f64;
+            for i in 0..hf.nrows() {
+                for j in 0..hf.ncols() {
+                    worst = worst.max((hf[[i, j]] - xwx[[i, j]]).abs());
+                }
+            }
+            // Round-off only: H·F = X'WX is exact in real arithmetic.
+            assert!(
+                worst <= 1e-8 * scale,
+                "H·F must equal X'WX (the genuine PSD weighted Gram); max \
+                 entrywise gap {worst:.3e} (scale {scale:.3e}, wiggle={wiggle}, \
+                 seed={seed}). A non-zero gap means F was either reassembled in \
+                 the wrong basis (#1027 root cause) or symmetrized after the \
+                 fact — `enforce_symmetry(F)` makes \
+                 H·F_sym = (X'WX + H·X'WX·H⁻¹)/2 ≠ X'WX."
+            );
+        }
+    }
+}
+
+#[test]
 fn rho_uncertainty_df_nonnegative_across_regimes() {
     init_parallelism();
     for &wiggle in &[1.5_f64, 1.0, 0.3, 0.08] {

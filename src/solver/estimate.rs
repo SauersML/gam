@@ -4786,9 +4786,18 @@ where
             }
             let mut s_mat = qs.dot(&s_t).dot(&qs.t());
             enforce_symmetry(&mut s_mat);
+            // Influence matrix F = I − H⁻¹·S(λ) = H⁻¹·X'WX. This is a product
+            // of two symmetric matrices and is therefore generally NOT
+            // symmetric; it must not be symmetrized — `enforce_symmetry(F)`
+            // both breaks the H·F = X'WX consistency identity (so any
+            // downstream code that reconstructs X'WX from H·F lands on an
+            // asymmetric/indefinite matrix) AND corrupts the frequentist
+            // covariance `Ve = F·H⁻¹·φ` (since (F_sym)·H⁻¹ ≠ H⁻¹·X'WX·H⁻¹)
+            // AND distorts the Wood-corrected reference d.f.
+            // `tr(F_jj)² / tr(F_jj²)` consumed by `smooth_test::reference_df`
+            // (tr(F²) ≠ tr(F_sym²) in general). See issue #1027.
             let mut f_mat = Array2::<f64>::eye(p_cov);
             f_mat -= &h_inv.dot(&s_mat);
-            enforce_symmetry(&mut f_mat);
             let mut ve = f_mat.dot(h_inv);
             ve *= cov_scale;
             enforce_symmetry(&mut ve);
