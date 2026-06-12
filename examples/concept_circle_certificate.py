@@ -28,6 +28,74 @@ CANDIDATES = [
 ]
 
 
+def _estimated_basis_size(topology: str, d_atom: int, n_obs: int) -> int:
+    basis = topology.lower()
+    if basis in {"circle", "periodic"}:
+        return 2 * max(1, int(d_atom)) + 1
+    if basis == "sphere":
+        return 7
+    if basis == "torus":
+        return (2 * 3 + 1) ** max(1, int(d_atom))
+    center_floor = max(8, int(d_atom) + 2)
+    return min(max(center_floor, 32), max(1, int(n_obs)))
+
+
+def sae_candidate_plan(
+    n_obs: int,
+    p_out: int,
+    k: int,
+    topology: str,
+    d_atom: int,
+) -> dict[str, Any]:
+    import gamfit
+
+    total_basis = int(k) * _estimated_basis_size(topology, d_atom, n_obs)
+    border_dim = total_basis * int(p_out)
+    plan = gamfit._sae_manifold.rust_module().sae_streaming_plan(
+        int(n_obs),
+        total_basis,
+        int(k),
+        int(d_atom),
+        border_dim,
+    )
+    return dict(plan)
+
+
+def plan_peak_bytes(plan: dict[str, Any]) -> int:
+    if plan.get("direct_admitted"):
+        return int(plan.get("estimated_direct_peak_bytes") or 0)
+    if plan.get("matrix_free_admitted"):
+        return int(plan.get("estimated_matrix_free_peak_bytes") or 0)
+    return max(
+        int(plan.get("estimated_direct_peak_bytes") or 0),
+        int(plan.get("estimated_matrix_free_peak_bytes") or 0),
+    )
+
+
+def plan_candidate_batches(
+    candidates: list[tuple[str, int, dict[str, Any]]],
+) -> tuple[int, list[list[tuple[str, int, dict[str, Any]]]]]:
+    budget = (
+        min(int(plan.get("in_core_budget_bytes", 0)) for _topo, _d, plan in candidates)
+        if candidates
+        else 0
+    )
+    batches: list[list[tuple[str, int, dict[str, Any]]]] = []
+    current: list[tuple[str, int, dict[str, Any]]] = []
+    current_peak = 0
+    for candidate in sorted(candidates, key=lambda item: plan_peak_bytes(item[2]), reverse=True):
+        peak = plan_peak_bytes(candidate[2])
+        if current and budget > 0 and current_peak + peak > budget:
+            batches.append(current)
+            current = []
+            current_peak = 0
+        current.append(candidate)
+        current_peak += peak
+    if current:
+        batches.append(current)
+    return budget, batches
+
+
 def load_bank_raw(bank: str, layer: int) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
     acts = np.load(f"{bank}/activations.npy", mmap_mode="r")
     x = np.asarray(acts[:, layer, :], dtype=np.float64)
@@ -334,43 +402,64 @@ def run_arm(arm: dict[str, Any], x_raw: np.ndarray, hue: np.ndarray, args: argpa
         "candidates": [],
         "pca": [],
     }
-    max_workers = min(len(CANDIDATES), 4)
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        for topo, d in CANDIDATES:
-            print(f"[fit:{arm['name']}] {topo} d={d}", flush=True)
-            future = executor.submit(
-                fit_candidate,
-                x_fit,
-                x_eval,
-                hue_fit,
-                hue_eval,
-                topo,
-                d,
-                args.n_iter,
-                args.seed,
-                args.assignment,
-            )
-            futures[future] = (topo, d)
-        for future in concurrent.futures.as_completed(futures):
-            topo, d = futures[future]
-            try:
-                entry = future.result()
-            except Exception as exc:
-                entry = {
-                    "method": "gam_manifold_sae",
-                    "topology": topo,
-                    "d_atom": d,
-                    "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "traceback": traceback.format_exc()[-1500:],
-                }
-            report["candidates"].append(entry)
-            print(
-                f"[fit:{arm['name']}] -> {topo} d={d} status={entry['status']} "
-                f"eval_ev={entry.get('eval_ev')}",
-                flush=True,
-            )
+    candidates = [
+        (topo, d, sae_candidate_plan(x_fit.shape[0], x_fit.shape[1], 1, topo, d))
+        for topo, d in CANDIDATES
+    ]
+    budget, batches = plan_candidate_batches(candidates)
+    report["solver_plan_batches"] = [
+        {
+            "candidates": [topo for topo, _d, _plan in batch],
+            "predicted_peak_bytes": int(
+                sum(plan_peak_bytes(plan) for _topo, _d, plan in batch)
+            ),
+            "budget_bytes": int(budget),
+        }
+        for batch in batches
+    ]
+    for batch in batches:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=len(batch)) as executor:
+            futures = {}
+            for topo, d, plan in batch:
+                print(
+                    f"[fit:{arm['name']}] {topo} d={d} "
+                    f"route={plan.get('route')} "
+                    f"predicted_peak_gib={plan_peak_bytes(plan) / 1024**3:.2f}",
+                    flush=True,
+                )
+                future = executor.submit(
+                    fit_candidate,
+                    x_fit,
+                    x_eval,
+                    hue_fit,
+                    hue_eval,
+                    topo,
+                    d,
+                    args.n_iter,
+                    args.seed,
+                    args.assignment,
+                )
+                futures[future] = (topo, d, plan)
+            for future in concurrent.futures.as_completed(futures):
+                topo, d, plan = futures[future]
+                try:
+                    entry = future.result()
+                except Exception as exc:
+                    entry = {
+                        "method": "gam_manifold_sae",
+                        "topology": topo,
+                        "d_atom": d,
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "traceback": traceback.format_exc()[-1500:],
+                    }
+                entry["solver_plan"] = plan
+                report["candidates"].append(entry)
+                print(
+                    f"[fit:{arm['name']}] -> {topo} d={d} status={entry['status']} "
+                    f"eval_ev={entry.get('eval_ev')}",
+                    flush=True,
+                )
     max_rank = max(1, min(x_fit.shape))
     for rank in capacity_ranks(report["candidates"], max_rank):
         entry = pca_eval(x_fit, x_eval, rank)
