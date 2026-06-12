@@ -3145,8 +3145,7 @@ impl BernoulliMarginalSlopeFamily {
             // does the family forest actually cover rows or fall back to the
             // ladder? Cumulative process-wide counters — the deltas across a
             // fit reveal whether either mechanism earns its complexity.
-            let (ladder_hist, ladder_terminal) =
-                exact_kernel::non_affine_ladder_cert_histogram();
+            let (ladder_hist, ladder_terminal) = exact_kernel::non_affine_ladder_cert_histogram();
             let (forest_hits, forest_fallbacks) =
                 crate::families::cell_moment_family::forest_coverage_counts();
             log::info!(
