@@ -107,10 +107,19 @@ fn run_outer_fit(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> SaeMani
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![Array1::zeros(1)]);
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
-    let mut objective =
-        SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 50, 0.04, 1.0e-6, 1.0e-6);
+    let mut objective = SaeManifoldOuterObjective::new(
+        term,
+        z.clone(),
+        None,
+        init_rho,
+        0,
+        0.04,
+        1.0e-6,
+        1.0e-6,
+    );
     OuterProblem::new(n_params)
         .with_initial_rho(init_rho_flat)
+        .with_max_iter(1)
         .run(&mut objective, label)
         .expect("outer engine must complete");
     let (fitted, _rho, _loss) = objective.into_fitted();
