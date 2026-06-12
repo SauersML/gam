@@ -39,12 +39,29 @@
 //! back to direct ladder quadrature for the affected rows — the same
 //! certified-or-fallback discipline as the quadrature ladder itself.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ndarray::Array2;
 
 use crate::families::cubic_cell_kernel::{
     DenestedCubicCell, LocalSpanCubic, PartitionEdge, denested_cell_coefficients,
     evaluate_cell_derivative_moments_uncached,
 };
+
+/// Process-wide count of per-row cell lookups served by a certified family
+/// (a transcendental-free interpolant hit) vs. falling back to direct ladder
+/// quadrature. The delta across a fit reveals whether the forest actually
+/// covers the row cloud or is dead weight (#979 slop check).
+static FOREST_COVERED: AtomicU64 = AtomicU64::new(0);
+static FOREST_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+/// `(covered, fallback)` snapshot of the family-forest coverage counters.
+pub fn forest_coverage_counts() -> (u64, u64) {
+    (
+        FOREST_COVERED.load(Ordering::Relaxed),
+        FOREST_FALLBACK.load(Ordering::Relaxed),
+    )
+}
 
 /// Relative (to the family's max moment magnitude) ceiling on the Chebyshev
 /// tail mass for a family to certify. Analytic interpolands decay
@@ -606,9 +623,17 @@ impl CellFamilyForest {
         b: f64,
         out: &mut [f64],
     ) -> Option<()> {
-        let leaf_idx = *self.row_leaf.get(row)?;
-        let family = self.families.get(&(leaf_idx, key))?.as_ref()?;
-        family.eval_into(a, b, out).ok()
+        let covered = (|| {
+            let leaf_idx = *self.row_leaf.get(row)?;
+            let family = self.families.get(&(leaf_idx, key))?.as_ref()?;
+            family.eval_into(a, b, out).ok()
+        })();
+        if covered.is_some() {
+            FOREST_COVERED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            FOREST_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        }
+        covered
     }
 
     /// Number of leaves eligible for family interpolation (observability).
