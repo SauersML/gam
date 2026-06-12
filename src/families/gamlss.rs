@@ -24867,6 +24867,78 @@ mod tests {
     }
 
     #[test]
+    fn binomial_location_scale_wiggle_expected_info_derivatives_match_finite_difference() {
+        let (family, states, specs, xt, xls, xw_at_base) = bls_wiggle_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
+        let pt = states[0].beta.len();
+        let pls = states[1].beta.len();
+        let pw = states[2].beta.len();
+        assert_eq!(p, pt + pls + pw);
+        assert_eq!(xw_at_base.ncols(), pw);
+        let u = Array1::from_shape_fn(p, |i| 0.04 * ((i + 1) as f64).cos());
+        let v = Array1::from_shape_fn(p, |i| -0.03 * ((i + 2) as f64).sin());
+        let eps = 1e-5;
+        let perturb = |direction: &Array1<f64>, scale: f64| -> Vec<ParameterBlockState> {
+            let mut out = states.clone();
+            for j in 0..pt {
+                out[0].beta[j] += scale * direction[j];
+            }
+            for j in 0..pls {
+                out[1].beta[j] += scale * direction[pt + j];
+            }
+            for j in 0..pw {
+                out[2].beta[j] += scale * direction[pt + pls + j];
+            }
+            out[0].eta = xt.dot(&out[0].beta);
+            out[1].eta = xls.dot(&out[1].beta);
+            let q0 = Array1::from_iter(out[0].eta.iter().zip(out[1].eta.iter()).map(
+                |(&eta_t, &eta_ls)| {
+                    binomial_location_scale_q0(eta_t, exp_sigma_from_eta_scalar(eta_ls))
+                },
+            ));
+            out[2].eta = family
+                .wiggle_design(q0.view())
+                .expect("perturbed wiggle basis")
+                .dot(&out[2].beta);
+            out
+        };
+
+        let h_plus = family
+            .joint_jeffreys_information_with_specs(&perturb(&u, eps), &specs)
+            .expect("expected I plus")
+            .expect("expected I plus present");
+        let h_minus = family
+            .joint_jeffreys_information_with_specs(&perturb(&u, -eps), &specs)
+            .expect("expected I minus")
+            .expect("expected I minus present");
+        let fd_first = (&h_plus - &h_minus) / (2.0 * eps);
+        let analytic_first = family
+            .joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, &u)
+            .expect("expected dI")
+            .expect("expected dI present");
+        assert_close_matrix(&analytic_first, &fd_first, 2e-7, "wiggle expected dI");
+
+        let states_plus = perturb(&v, eps);
+        let states_minus = perturb(&v, -eps);
+        let d_plus = family
+            .joint_jeffreys_information_directional_derivative_with_specs(&states_plus, &specs, &u)
+            .expect("expected dI plus")
+            .expect("expected dI plus present");
+        let d_minus = family
+            .joint_jeffreys_information_directional_derivative_with_specs(&states_minus, &specs, &u)
+            .expect("expected dI minus")
+            .expect("expected dI minus present");
+        let fd_second = (&d_plus - &d_minus) / (2.0 * eps);
+        let analytic_second = family
+            .joint_jeffreys_information_second_directional_derivative_with_specs(
+                &states, &specs, &u, &v,
+            )
+            .expect("expected d2I")
+            .expect("expected d2I present");
+        assert_close_matrix(&analytic_second, &fd_second, 2e-7, "wiggle expected d2I");
+    }
+
+    #[test]
     fn binomial_location_scale_wiggle_workspace_d2h_operator_matches_dense() {
         let (family, states, specs, _xt, _xls, _xw) = bls_wiggle_workspace_fixture();
         let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
@@ -29893,6 +29965,285 @@ mod tests {
             max_err < tol,
             "{label} max error {max_err:.3e} >= {tol:.3e}"
         );
+    }
+
+    #[test]
+    fn binomial_location_scale_expected_info_derivatives_match_finite_difference() {
+        let base = binomial_location_scale_base_fixture();
+        let family = BinomialLocationScaleFamily {
+            y: base.y,
+            weights: base.weights,
+            link_kind: InverseLink::Standard(StandardLink::Probit),
+            threshold_design: Some(base.threshold_design.clone()),
+            log_sigma_design: Some(base.log_sigma_design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let specs = vec![base.threshold_spec, base.log_sigma_spec];
+        let x_t = specs[BinomialLocationScaleFamily::BLOCK_T]
+            .design
+            .as_dense_ref()
+            .expect("threshold dense design");
+        let x_ls = specs[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
+            .design
+            .as_dense_ref()
+            .expect("log-sigma dense design");
+        let beta_t = Array1::from_iter((0..x_t.ncols()).map(|j| 0.12 - 0.03 * j as f64));
+        let beta_ls = Array1::from_iter((0..x_ls.ncols()).map(|j| -0.08 + 0.02 * j as f64));
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: x_t.dot(&beta_t),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: x_ls.dot(&beta_ls),
+            },
+        ];
+        let total = beta_t.len() + beta_ls.len();
+        let u = Array1::from_iter((0..total).map(|j| 0.03 * (j as f64 + 0.4).sin()));
+        let v = Array1::from_iter((0..total).map(|j| -0.02 * (j as f64 + 0.7).cos()));
+
+        let info = |direction: &Array1<f64>, scale: f64| {
+            let mut next = states.clone();
+            let pt = beta_t.len();
+            next[BinomialLocationScaleFamily::BLOCK_T]
+                .beta
+                .scaled_add(scale, &direction.slice(s![0..pt]));
+            next[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
+                .beta
+                .scaled_add(scale, &direction.slice(s![pt..total]));
+            next[BinomialLocationScaleFamily::BLOCK_T].eta =
+                x_t.dot(&next[BinomialLocationScaleFamily::BLOCK_T].beta);
+            next[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta =
+                x_ls.dot(&next[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].beta);
+            family
+                .joint_jeffreys_information_with_specs(&next, &specs)
+                .expect("expected information")
+                .expect("expected information available")
+        };
+
+        let h0 = family
+            .joint_jeffreys_information_with_specs(&states, &specs)
+            .expect("expected information")
+            .expect("expected information available");
+        assert_close_matrix(&info(&u, 0.0), &h0, 1e-12, "expected information value");
+
+        let eps = 1e-5;
+        let hp = info(&u, eps);
+        let hm = info(&u, -eps);
+        let fd_first = (&hp - &hm) / (2.0 * eps);
+        let analytic_first = family
+            .joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, &u)
+            .expect("expected dI")
+            .expect("expected dI available");
+        assert_close_matrix(&analytic_first, &fd_first, 1e-7, "expected dI");
+
+        let mut states_plus = states.clone();
+        let pt = beta_t.len();
+        states_plus[BinomialLocationScaleFamily::BLOCK_T]
+            .beta
+            .scaled_add(eps, &v.slice(s![0..pt]));
+        states_plus[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
+            .beta
+            .scaled_add(eps, &v.slice(s![pt..total]));
+        states_plus[BinomialLocationScaleFamily::BLOCK_T].eta =
+            x_t.dot(&states_plus[BinomialLocationScaleFamily::BLOCK_T].beta);
+        states_plus[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta =
+            x_ls.dot(&states_plus[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].beta);
+        let d_plus = family
+            .joint_jeffreys_information_directional_derivative_with_specs(&states_plus, &specs, &u)
+            .expect("expected dI plus")
+            .expect("expected dI plus available");
+
+        let mut states_minus = states.clone();
+        states_minus[BinomialLocationScaleFamily::BLOCK_T]
+            .beta
+            .scaled_add(-eps, &v.slice(s![0..pt]));
+        states_minus[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
+            .beta
+            .scaled_add(-eps, &v.slice(s![pt..total]));
+        states_minus[BinomialLocationScaleFamily::BLOCK_T].eta =
+            x_t.dot(&states_minus[BinomialLocationScaleFamily::BLOCK_T].beta);
+        states_minus[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta =
+            x_ls.dot(&states_minus[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].beta);
+        let d_minus = family
+            .joint_jeffreys_information_directional_derivative_with_specs(&states_minus, &specs, &u)
+            .expect("expected dI minus")
+            .expect("expected dI minus available");
+        let fd_second = (&d_plus - &d_minus) / (2.0 * eps);
+        let analytic_second = family
+            .joint_jeffreys_information_second_directional_derivative_with_specs(
+                &states, &specs, &u, &v,
+            )
+            .expect("expected d2I")
+            .expect("expected d2I available");
+        assert_close_matrix(&analytic_second, &fd_second, 1e-7, "expected d2I");
+    }
+
+    #[test]
+    fn binomial_location_scale_expected_info_contracted_trace_matches_second_directional() {
+        let base = binomial_location_scale_base_fixture();
+        let family = BinomialLocationScaleFamily {
+            y: base.y,
+            weights: base.weights,
+            link_kind: InverseLink::Standard(StandardLink::Probit),
+            threshold_design: Some(base.threshold_design.clone()),
+            log_sigma_design: Some(base.log_sigma_design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let specs = vec![base.threshold_spec, base.log_sigma_spec];
+        let x_t = specs[BinomialLocationScaleFamily::BLOCK_T]
+            .design
+            .as_dense_ref()
+            .expect("threshold dense design");
+        let x_ls = specs[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
+            .design
+            .as_dense_ref()
+            .expect("log-sigma dense design");
+        let beta_t = Array1::from_iter((0..x_t.ncols()).map(|j| 0.11 - 0.02 * j as f64));
+        let beta_ls = Array1::from_iter((0..x_ls.ncols()).map(|j| -0.07 + 0.03 * j as f64));
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: x_t.dot(&beta_t),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: x_ls.dot(&beta_ls),
+            },
+        ];
+        let total = beta_t.len() + beta_ls.len();
+        let weight = Array2::from_shape_fn((total, total), |(i, j)| {
+            0.03 * ((i + 2 * j + 1) as f64).sin()
+        });
+        let contracted = family
+            .joint_jeffreys_information_contracted_trace_hessian_with_specs(
+                &states, &specs, &weight,
+            )
+            .expect("contracted trace")
+            .expect("contracted trace present");
+        let mut expected = Array2::<f64>::zeros((total, total));
+        for a in 0..total {
+            let mut axis_a = Array1::<f64>::zeros(total);
+            axis_a[a] = 1.0;
+            for b in a..total {
+                let mut axis_b = Array1::<f64>::zeros(total);
+                axis_b[b] = 1.0;
+                let second = family
+                    .joint_jeffreys_information_second_directional_derivative_with_specs(
+                        &states, &specs, &axis_a, &axis_b,
+                    )
+                    .expect("expected d2I")
+                    .expect("expected d2I present");
+                let mut trace = 0.0;
+                for row in 0..total {
+                    for col in 0..total {
+                        trace += weight[[row, col]] * second[[col, row]];
+                    }
+                }
+                expected[[a, b]] = trace;
+                expected[[b, a]] = trace;
+            }
+        }
+        assert_close_matrix(&contracted, &expected, 1e-9, "expected contracted trace");
+    }
+
+    #[test]
+    fn binomial_location_scale_expected_hphi_drift_matches_finite_difference() {
+        let base = binomial_location_scale_base_fixture();
+        let family = BinomialLocationScaleFamily {
+            y: base.y,
+            weights: base.weights,
+            link_kind: InverseLink::Standard(StandardLink::Probit),
+            threshold_design: Some(base.threshold_design.clone()),
+            log_sigma_design: Some(base.log_sigma_design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let specs = vec![base.threshold_spec, base.log_sigma_spec];
+        let x_t = specs[BinomialLocationScaleFamily::BLOCK_T]
+            .design
+            .as_dense_ref()
+            .expect("threshold dense design");
+        let x_ls = specs[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
+            .design
+            .as_dense_ref()
+            .expect("log-sigma dense design");
+        let beta_t = Array1::from_iter((0..x_t.ncols()).map(|j| 0.09 - 0.02 * j as f64));
+        let beta_ls = Array1::from_iter((0..x_ls.ncols()).map(|j| -0.06 + 0.04 * j as f64));
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: x_t.dot(&beta_t),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: x_ls.dot(&beta_ls),
+            },
+        ];
+        let total = beta_t.len() + beta_ls.len();
+        let z = Array2::<f64>::eye(total);
+        let direction = Array1::from_shape_fn(total, |i| 0.03 * ((i + 1) as f64).sin());
+        let perturb = |scale: f64| {
+            let mut next = states.clone();
+            let pt = beta_t.len();
+            next[BinomialLocationScaleFamily::BLOCK_T]
+                .beta
+                .scaled_add(scale, &direction.slice(s![0..pt]));
+            next[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
+                .beta
+                .scaled_add(scale, &direction.slice(s![pt..total]));
+            next[BinomialLocationScaleFamily::BLOCK_T].eta =
+                x_t.dot(&next[BinomialLocationScaleFamily::BLOCK_T].beta);
+            next[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta =
+                x_ls.dot(&next[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].beta);
+            next
+        };
+        let hphi_at = |block_states: &[ParameterBlockState]| {
+            let info = family
+                .joint_jeffreys_information_with_specs(block_states, &specs)
+                .expect("expected info")
+                .expect("expected info present");
+            let (_phi, _grad, hphi) =
+                crate::estimate::reml::jeffreys_subspace::joint_jeffreys_term(
+                    info.view(),
+                    z.view(),
+                    |axis: &Array1<f64>| {
+                        family.joint_jeffreys_information_directional_derivative_with_specs(
+                            block_states,
+                            &specs,
+                            axis,
+                        )
+                    },
+                )
+                .expect("hphi term");
+            hphi
+        };
+        let eps = 1e-5;
+        let h_plus = hphi_at(&perturb(eps));
+        let h_minus = hphi_at(&perturb(-eps));
+        let fd = (&h_plus - &h_minus) / (2.0 * eps);
+        let info = family
+            .joint_jeffreys_information_with_specs(&states, &specs)
+            .expect("expected info")
+            .expect("expected info present");
+        let analytic =
+            crate::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_directional_derivative(
+                info.view(),
+                z.view(),
+                &direction,
+                |axis: &Array1<f64>| {
+                    family.joint_jeffreys_information_directional_derivative_with_specs(
+                        &states, &specs, axis,
+                    )
+                },
+                |u: &Array1<f64>, v: &Array1<f64>| {
+                    family.joint_jeffreys_information_second_directional_derivative_with_specs(
+                        &states, &specs, u, v,
+                    )
+                },
+            )
+            .expect("hphi drift");
+        assert_close_matrix(&analytic, &fd, 1e-7, "expected H_phi drift");
     }
 
     #[test]
