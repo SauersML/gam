@@ -4271,6 +4271,176 @@ pub fn fit_from_formula(
     fit_model(mat.request)
 }
 
+/// Inputs extracted by [`spline_scan_fast_path`] for the exact O(n)
+/// state-space cubic-smoothing-spline scan
+/// ([`crate::solver::spline_scan::fit_cubic_spline_scan`]).
+pub struct SplineScanInputs {
+    /// Abscissae of the single 1-D smooth (training rows of its feature column).
+    pub x: Vec<f64>,
+    /// Gaussian response.
+    pub y: Vec<f64>,
+    /// Observation weights (variance is `σ²/w`).
+    pub w: Vec<f64>,
+}
+
+/// Detection seam for the exact O(n) cubic-smoothing-spline fast path.
+///
+/// This is the EARLIEST point in the standard workflow where a materialized
+/// fit request carries everything needed to prove the model is exactly the
+/// problem the scan solves: a Gaussian likelihood with identity link over
+/// `intercept + one 1-D cubic-class penalized smooth` — i.e. the penalized
+/// least-squares problem `min Σ w_i (y_i − f(x_i))² + λ∫f″²` with an
+/// unpenalized `{1, x}` null space. The Kalman/RTS scan computes that
+/// posterior (mean, pointwise variance, exact diffuse REML for λ) in O(n) per
+/// λ-trial instead of the dense design/Gram O(n·k²) + O(k³) route.
+///
+/// Returns `Some` only when ALL of the following hold; everything else falls
+/// through to the dense path:
+/// - family is Gaussian + identity link;
+/// - no link wiggle, no latent coordinates, no coefficient groups, no penalty
+///   hyperpriors, no linear/box constraints, no Firth, no adaptive
+///   regularization, no Kronecker systems, no externally injected null-space
+///   dims;
+/// - the term collection is exactly one smooth term — no linear terms, no
+///   random effects, no by-variables / factor interactions;
+/// - that smooth is a plain 1-D cubic (degree 3) B-spline with a single
+///   order-2 penalty (`double_penalty=false` — the default `s(x)` adds a
+///   second null-space shrinkage penalty, which the scan's diffuse `{1, x}`
+///   null space deliberately does NOT shrink, so it is not the same
+///   posterior and is excluded), open (non-cyclic) boundary, free endpoint
+///   conditions, and no shape constraint;
+/// - the offset is identically zero and every weight is finite and positive;
+/// - at least 3 distinct finite abscissae (the scan's diffuse rank plus one).
+///
+/// λ-mapping note: the scan's penalty is exactly `λ∫f″²` (state-space
+/// `q = 1/λ` at unit σ²). The dense 1-D B-spline path penalizes the same
+/// cubic class through a reduced-rank discrete-difference Gram whose
+/// normalization differs by a basis-dependent constant, so a λ selected by
+/// one parameterization does not transfer numerically to the other. The scan
+/// therefore always re-selects λ by its own exact diffuse REML criterion
+/// (the optimizer of the same restricted likelihood, expressed in the scan's
+/// parameterization); user-pinned smoothing parameters are not representable
+/// at this seam (the formula DSL exposes none for this term class), so no
+/// pinned-λ mapping arises.
+///
+/// Identifiability transforms on the smooth (centering / linear-trend
+/// removal / orthogonality-to-intercept) are accepted as eligible: they only
+/// re-coordinate the unpenalized null space against the implicit intercept
+/// and do not change the fitted posterior of `E[y|x]`, which is what the
+/// scan returns directly.
+pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineScanInputs> {
+    if !request.family.is_gaussian_identity() {
+        return None;
+    }
+    if request.wiggle.is_some()
+        || request.latent_coord.is_some()
+        || !request.coefficient_groups.is_empty()
+        || !request.penalty_block_gamma_priors.is_empty()
+    {
+        return None;
+    }
+    let options = &request.options;
+    if options.latent_cloglog.is_some()
+        || options.mixture_link.is_some()
+        || options.sas_link.is_some()
+        || options.linear_constraints.is_some()
+        || options.adaptive_regularization.is_some()
+        || options.kronecker_penalty_system.is_some()
+        || options.kronecker_factored.is_some()
+        || options.firth_bias_reduction
+        || !options.nullspace_dims.is_empty()
+    {
+        return None;
+    }
+    let spec = &request.spec;
+    if !spec.linear_terms.is_empty()
+        || !spec.random_effect_terms.is_empty()
+        || spec.smooth_terms.len() != 1
+    {
+        return None;
+    }
+    let term = &spec.smooth_terms[0];
+    if !matches!(term.shape, crate::smooth::ShapeConstraint::None)
+        || term.joint_null_rotation.is_some()
+    {
+        return None;
+    }
+    let crate::smooth::SmoothBasisSpec::BSpline1D {
+        feature_col,
+        spec: bspec,
+    } = &term.basis
+    else {
+        return None;
+    };
+    if bspec.degree != 3
+        || bspec.penalty_order != 2
+        || bspec.double_penalty
+        || !bspec.boundary_conditions.is_free()
+        || !matches!(bspec.boundary, crate::basis::OneDimensionalBoundary::Open)
+        || matches!(
+            bspec.knotspec,
+            crate::basis::BSplineKnotSpec::PeriodicUniform { .. }
+        )
+    {
+        return None;
+    }
+    if request.offset.iter().any(|&v| v != 0.0) {
+        return None;
+    }
+    if request.weights.iter().any(|&v| !(v.is_finite() && v > 0.0)) {
+        return None;
+    }
+    if *feature_col >= request.data.ncols() || request.y.len() != request.data.nrows() {
+        return None;
+    }
+    let x: Vec<f64> = request.data.column(*feature_col).iter().copied().collect();
+    let y: Vec<f64> = request.y.iter().copied().collect();
+    let w: Vec<f64> = request.weights.iter().copied().collect();
+    if x.iter().any(|v| !v.is_finite()) || y.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    // The diffuse `{1, x}` null space consumes two innovations; the scan
+    // needs at least one proper innovation to profile σ².
+    let mut sorted = x.clone();
+    sorted.sort_by(f64::total_cmp);
+    sorted.dedup();
+    if sorted.len() < 3 {
+        return None;
+    }
+    Some(SplineScanInputs { x, y, w })
+}
+
+/// Formula-level entry for the exact O(n) cubic-smoothing-spline fast path.
+///
+/// Materializes the formula exactly like [`fit_from_formula`], then runs the
+/// [`spline_scan_fast_path`] detection on the resulting standard request.
+/// When detection fires the fit is routed through
+/// [`crate::solver::spline_scan::fit_cubic_spline_scan`] — the exact diffuse
+/// REML Kalman/RTS scan — and the full in-memory posterior
+/// ([`crate::solver::spline_scan::CubicSplineScanFit`]: knots, smoothed
+/// states, pointwise variances, lag-one gains, σ², log λ, exact EDF, and an
+/// exact `predict`) is returned. `Ok(None)` means the model is not the
+/// scan-eligible shape and the caller should use the dense
+/// [`fit_from_formula`] path; this keeps every persistence-bearing consumer
+/// (model save, CLI, FFI) transparently on the dense fit, whose saved payload
+/// the scan does not yet have a schema for.
+pub fn fit_spline_scan_from_formula(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<Option<crate::solver::spline_scan::CubicSplineScanFit>, WorkflowError> {
+    let mat = materialize(formula, data, config)?;
+    let FitRequest::Standard(request) = mat.request else {
+        return Ok(None);
+    };
+    let Some(inputs) = spline_scan_fast_path(&request) else {
+        return Ok(None);
+    };
+    crate::solver::spline_scan::fit_cubic_spline_scan(&inputs.x, &inputs.y, &inputs.w)
+        .map(Some)
+        .map_err(|reason| WorkflowError::IntegrationFailed { reason })
+}
+
 /// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
 pub fn materialize<'a>(
     formula: &str,
