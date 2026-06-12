@@ -18639,6 +18639,39 @@ mod tests {
     }
 
     #[test]
+    fn ibp_fixed_alpha_assignment_value_matches_logit_gradient_fd() {
+        let n = 4usize;
+        let k = 3usize;
+        let logits = Array2::<f64>::from_shape_vec(
+            (n, k),
+            vec![-0.4, 0.2, 0.7, 0.1, -0.3, 0.5, 0.8, -0.1, -0.6, 0.3, 0.6, -0.2],
+        )
+        .expect("valid IBP logit grid");
+        let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+        let manifolds = vec![LatentManifold::Circle { period: 1.0 }; k];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coords,
+            manifolds,
+            AssignmentMode::ibp_map(0.9, 1.4, false),
+        )
+        .expect("valid IBP assignment");
+        let rho = SaeManifoldRho::new(0.23_f64.ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
+        let (grad, _) =
+            assignment_prior_grad_hdiag(&assignment, &rho).expect("IBP assignment gradient");
+        let idx = 5usize;
+        let step = 1.0e-6_f64;
+        let mut plus = assignment.clone();
+        plus.logits[[idx / k, idx % k]] += step;
+        let mut minus = assignment.clone();
+        minus.logits[[idx / k, idx % k]] -= step;
+        let fd = (assignment_prior_value(&plus, &rho) - assignment_prior_value(&minus, &rho))
+            / (2.0 * step);
+
+        assert_abs_diff_eq!(grad[idx], fd, epsilon = 2.0e-7);
+    }
+
+    #[test]
     fn jumprelu_assignment_prior_hessian_diag_is_psd_over_logit_sweep() {
         let n = 6usize;
         let k = 2usize;

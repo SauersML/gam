@@ -717,7 +717,7 @@ pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifo
             alpha,
             learnable_alpha,
         } => {
-            let penalty = IBPAssignmentPenalty::new(
+            let mut penalty = IBPAssignmentPenalty::new(
                 assignment.k_atoms(),
                 alpha,
                 temperature,
@@ -726,6 +726,10 @@ pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifo
             let rho_view = if learnable_alpha {
                 Array1::from_vec(vec![rho.log_lambda_sparse])
             } else {
+                // Keep the fixed-alpha value path on the same weighting branch as
+                // assignment_prior_grad_hdiag; that gradient path owns the
+                // lambda_sparse convention for IBP assignment sparsity.
+                penalty.weight = rho.lambda_sparse();
                 Array1::zeros(0)
             };
             penalty.value(target.view(), rho_view.view())
