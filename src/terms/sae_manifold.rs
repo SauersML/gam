@@ -13914,7 +13914,7 @@ impl SaeManifoldOuterObjective {
                             "curvature-homotopy decoder LSQ polish produced no EV".to_string()
                         );
                     };
-                    if after_ev.is_finite() {
+                    if after_ev > before_ev {
                         self.term.loss(self.target.view(), &rho)
                     } else {
                         Err(format!(
