@@ -7,6 +7,7 @@ pub mod evidence;
 pub mod gauge;
 pub mod gaussian_reml;
 pub mod gpu;
+pub mod grid_spline_2d;
 pub mod identifiability_audit;
 pub mod identifiability_canonical;
 pub mod inner_status;
