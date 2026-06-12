@@ -8,9 +8,11 @@
 //! splines `i..i+3` per axis, hence exactly 4×4 = 16 tensor basis entries per
 //! data row.
 //!
-//! Streaming normal equations. ONE pass over the rows `(x1, x2, y, w)`
-//! scatter-adds `X'WX` and `X'Wy`: O(n·16²) work, no n×p design is ever
-//! materialized. Two tensor bases overlap only when both per-axis indices
+//! Streaming normal equations. ONE pass over the rows `(x1, x2, y_·, w)`
+//! scatter-adds `X'WX` and `X'Wy_d` (any number of response dimensions share
+//! the design, the penalty, and one REML λ — the multi-output "one surface
+//! smoothness" contract of the ANOVA pair component): O(n·(16² + 16·D)) work,
+//! no n×p design is ever materialized. Two tensor bases overlap only when both per-axis indices
 //! differ by ≤ 3, so under the row-major coefficient index
 //! `g = j1·(K+3) + j2` both `X'WX` and the penalty `S` are banded with
 //! half-bandwidth `3(K+3)+3`; they are stored as upper bands — O(K³) numbers.
