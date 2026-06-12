@@ -13621,30 +13621,6 @@ fn duchon_matern_operator_block_jets_with_ladder(
 }
 
 #[inline(always)]
-fn duchon_matern_operator_block_jets(
-    r: f64,
-    kappa: f64,
-    n_order: usize,
-    k_dim: usize,
-) -> Result<(f64, f64, f64, f64), BasisError> {
-    if !r.is_finite() || r < 0.0 {
-        crate::bail_invalid_basis!("Duchon Matérn-block distance must be finite and non-negative");
-    }
-    if !kappa.is_finite() || kappa <= 0.0 {
-        crate::bail_invalid_basis!("Duchon Matérn-block kappa must be finite and positive");
-    }
-    if r <= 0.0 {
-        return Ok((0.0, 0.0, 0.0, 0.0));
-    }
-    let ladder = BesselKLadder::build(
-        kappa * r,
-        !k_dim.is_multiple_of(2),
-        duchon_matern_block_max_ladder_steps(n_order, k_dim),
-    );
-    duchon_matern_operator_block_jets_with_ladder(r, kappa, n_order, k_dim, &ladder)
-}
-
-#[inline(always)]
 fn pure_duchon_block_order(p_order: usize, s_order: f64) -> f64 {
     p_order as f64 + s_order
 }
@@ -33767,8 +33743,14 @@ mod tests {
 
         let jets =
             duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs).expect("jets");
+        let block_ladder = BesselKLadder::build(
+            kappa * r,
+            !k_dim.is_multiple_of(2),
+            duchon_matern_block_max_ladder_steps(1, k_dim),
+        );
         let (q_expected, t_expected, t_r_expected, t_rr_expected) =
-            duchon_matern_operator_block_jets(r, kappa, 1, k_dim).expect("block operator jets");
+            duchon_matern_operator_block_jets_with_ladder(r, kappa, 1, k_dim, &block_ladder)
+                .expect("block operator jets");
 
         assert!((jets.q - q_expected).abs() <= 1e-12 * q_expected.abs().max(1.0));
         assert!((jets.t - t_expected).abs() <= 1e-12 * t_expected.abs().max(1.0));
