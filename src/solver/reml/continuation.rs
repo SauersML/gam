@@ -1123,6 +1123,7 @@ mod tests {
             >,
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>>,
+            continuation_prewarm: true,
         };
 
         // No `.with_seed_inner_state(...)` — mirrors standard REML's
@@ -1189,6 +1190,7 @@ mod tests {
             >,
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>>,
+            continuation_prewarm: true,
         };
 
         let mut obj = obj;
