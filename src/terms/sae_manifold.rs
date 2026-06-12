@@ -10499,9 +10499,14 @@ impl SaeManifoldTerm {
         q_row: usize,
     ) {
         let d = self.assignment.coords[atom_idx].latent_dim();
+        let mut tangent = vec![0.0_f64; self.output_dim()];
         match self.atoms[atom_idx].basis_kind {
             SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Duchon => {
                 for axis in 0..d {
+                    self.atoms[atom_idx].fill_decoded_derivative_row(row, axis, &mut tangent);
+                    if tangent.iter().map(|&v| v * v).sum::<f64>() <= 1.0e-24 {
+                        continue;
+                    }
                     let mut translation = Array1::<f64>::zeros(q_row);
                     translation[coord_start + axis] = 1.0;
                     row_dirs.push(translation);
@@ -10514,6 +10519,10 @@ impl SaeManifoldTerm {
             }
             SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => {
                 for axis in 0..d {
+                    self.atoms[atom_idx].fill_decoded_derivative_row(row, axis, &mut tangent);
+                    if tangent.iter().map(|&v| v * v).sum::<f64>() <= 1.0e-24 {
+                        continue;
+                    }
                     let mut phase = Array1::<f64>::zeros(q_row);
                     phase[coord_start + axis] = 1.0;
                     row_dirs.push(phase);
