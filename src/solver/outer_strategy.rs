@@ -2070,13 +2070,10 @@ pub trait OuterObjective {
         &mut self,
         rho: &Array1<f64>,
     ) -> Option<Result<bool, EstimationError>> {
-        // Default: no certified anchor — but a non-finite seed is reported
-        // here rather than silently handed to the seed cascade, mirroring the
-        // hard-failure contract of the overriding implementations.
-        if rho.iter().any(|v| !v.is_finite()) {
-            return Some(Err(EstimationError::RemlOptimizationFailed(
-                "curvature-homotopy entry received a non-finite seed".to_string(),
-            )));
+        if let Some(idx) = rho.iter().position(|value| !value.is_finite()) {
+            return Some(Err(EstimationError::InvalidInput(format!(
+                "curvature-homotopy entry received non-finite rho[{idx}]"
+            ))));
         }
         None
     }
