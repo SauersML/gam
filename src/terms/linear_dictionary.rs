@@ -1,7 +1,6 @@
 use crate::faer_ndarray::{FaerCholesky, FaerEigh};
-use crate::solver::gaussian_reml::gaussian_reml_multi_closed_form_with_cache;
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 
 const DEFAULT_MAX_ITER: usize = 30;
 const DEFAULT_TOP_K: usize = 1;
@@ -119,7 +118,7 @@ pub fn fit_linear_dictionary(
 
         fitted = assignments.dot(&atoms);
         for atom_idx in 0..config.n_atoms {
-            fit_one_atom_reml(
+            fit_one_atom_penalized_ls(
                 x,
                 &mut atoms,
                 &mut assignments,
@@ -127,6 +126,7 @@ pub fn fit_linear_dictionary(
                 &mut lambdas,
                 &mut reml_scores,
                 atom_idx,
+                config.code_ridge,
             )?;
         }
 
@@ -204,28 +204,18 @@ fn fit_rank_one_pca_lane(
     orient_vector(&mut atom);
     let mut assignments = Array2::<f64>::zeros((x.nrows(), 1));
     for row in 0..x.nrows() {
-        assignments[[row, 0]] = x.row(row).dot(&atom);
+        assignments[[row, 0]] = x.row(row).dot(&atom) / (1.0 + config.code_ridge);
     }
-    let design = assignments.clone();
-    let penalty = Array2::from_elem((1, 1), 1.0);
-    let reml = gaussian_reml_multi_closed_form_with_cache(
-        design.view(),
-        x,
-        penalty.view(),
-        None,
-        None,
-        None,
-    )
-    .map_err(|err| format!("linear_dictionary_fit PCA ridge selection failed: {err}"))?;
-    let mut atoms = reml.coefficients.t().to_owned();
+    let mut atoms = atom.insert_axis(Axis(0)).to_owned();
     normalize_atom_and_assignments(&mut atoms, &mut assignments, 0);
     let fitted = assignments.dot(&atoms);
+    let score = penalized_reconstruction_loss(x, fitted.view(), config.code_ridge, atoms.view());
     Ok(LinearDictionaryFit {
         atoms,
         assignments,
         fitted: fitted.clone(),
-        lambdas: Array1::from_elem(1, reml.lambda),
-        reml_scores: Array1::from_elem(1, reml.reml_score),
+        lambdas: Array1::from_elem(1, config.code_ridge),
+        reml_scores: Array1::from_elem(1, score),
         explained_variance: explained_variance(x, fitted.view()),
         iterations: 1.min(config.max_iter),
         converged: true,
@@ -260,7 +250,7 @@ fn initialize_atoms(x: ArrayView2<'_, f64>, n_atoms: usize) -> Array2<f64> {
     atoms
 }
 
-fn fit_one_atom_reml(
+fn fit_one_atom_penalized_ls(
     x: ArrayView2<'_, f64>,
     atoms: &mut Array2<f64>,
     assignments: &mut Array2<f64>,
@@ -268,6 +258,7 @@ fn fit_one_atom_reml(
     lambdas: &mut Array1<f64>,
     reml_scores: &mut Array1<f64>,
     atom_idx: usize,
+    atom_ridge: f64,
 ) -> Result<(), String> {
     let code = assignments.column(atom_idx).to_owned();
     let code_norm2 = code.dot(&code);
@@ -285,33 +276,21 @@ fn fit_one_atom_reml(
         .insert_axis(Axis(1))
         .dot(&old_atom.view().insert_axis(Axis(0)));
 
-    let design = code.insert_axis(Axis(1)).to_owned();
-    let penalty = Array2::from_elem((1, 1), 1.0);
-    let init_lambda = if lambdas[atom_idx].is_finite() && lambdas[atom_idx] > 0.0 {
-        Some(lambdas[atom_idx])
-    } else {
-        None
-    };
-    let reml = gaussian_reml_multi_closed_form_with_cache(
-        design.view(),
-        residual.view(),
-        penalty.view(),
-        None,
-        init_lambda,
-        None,
-    )
-    .map_err(|err| format!("linear_dictionary_fit atom {atom_idx} REML solve failed: {err}"))?;
-
-    atoms.row_mut(atom_idx).assign(&reml.coefficients.row(0));
-    lambdas[atom_idx] = reml.lambda;
-    reml_scores[atom_idx] = reml.reml_score;
+    let denominator = code_norm2 + atom_ridge;
+    for col in 0..x.ncols() {
+        atoms[[atom_idx, col]] = code.dot(&residual.column(col)) / denominator;
+    }
+    lambdas[atom_idx] = atom_ridge;
     normalize_atom_and_assignments(atoms, assignments, atom_idx);
     let updated_code = assignments.column(atom_idx).to_owned();
-    fitted.assign(&residual);
+    fitted.assign(&x);
+    *fitted -= &residual;
     *fitted += &updated_code
         .view()
         .insert_axis(Axis(1))
         .dot(&atoms.row(atom_idx).insert_axis(Axis(0)));
+    reml_scores[atom_idx] =
+        penalized_reconstruction_loss(x, fitted.view(), atom_ridge, atoms.view());
     Ok(())
 }
 
@@ -321,12 +300,11 @@ fn top_k_assignments(
     top_k: usize,
     code_ridge: f64,
 ) -> Result<Array2<f64>, String> {
-    let gram = atoms.dot(&atoms.t());
     let cross = x.dot(&atoms.t());
     let mut assignments = Array2::<f64>::zeros((x.nrows(), atoms.nrows()));
     for row in 0..x.nrows() {
         let active = top_indices_by_abs(cross.row(row), top_k);
-        let coeffs = solve_active_coefficients(gram.view(), cross.row(row), &active, code_ridge)?;
+        let coeffs = solve_active_coefficients(atoms, cross.row(row), &active, code_ridge)?;
         for pos in 0..active.len() {
             assignments[[row, active[pos]]] = coeffs[pos];
         }
@@ -372,8 +350,8 @@ fn softmax_assignments(
 }
 
 fn solve_active_coefficients(
-    gram: ArrayView2<'_, f64>,
-    cross_row: ndarray::ArrayView1<'_, f64>,
+    atoms: ArrayView2<'_, f64>,
+    cross_row: ArrayView1<'_, f64>,
     active: &[usize],
     code_ridge: f64,
 ) -> Result<Array1<f64>, String> {
@@ -383,7 +361,7 @@ fn solve_active_coefficients(
     for i in 0..m {
         rhs[[i, 0]] = cross_row[active[i]];
         for j in 0..m {
-            system[[i, j]] = gram[[active[i], active[j]]];
+            system[[i, j]] = atoms.row(active[i]).dot(&atoms.row(active[j]));
         }
         system[[i, i]] += code_ridge;
     }
@@ -395,16 +373,34 @@ fn solve_active_coefficients(
     Ok(solution.column(0).to_owned())
 }
 
-fn top_indices_by_abs(row: ndarray::ArrayView1<'_, f64>, top_k: usize) -> Vec<usize> {
-    let mut indices: Vec<usize> = (0..row.len()).collect();
-    indices.sort_by(|&a, &b| {
-        row[b]
-            .abs()
-            .partial_cmp(&row[a].abs())
+fn top_indices_by_abs(row: ArrayView1<'_, f64>, top_k: usize) -> Vec<usize> {
+    let mut selected: Vec<(usize, f64)> = Vec::with_capacity(top_k);
+    for idx in 0..row.len() {
+        let score = row[idx].abs();
+        if selected.len() < top_k {
+            selected.push((idx, score));
+            continue;
+        }
+        let mut worst_pos = 0usize;
+        for pos in 1..selected.len() {
+            if selected[pos].1 < selected[worst_pos].1
+                || (selected[pos].1 == selected[worst_pos].1
+                    && selected[pos].0 > selected[worst_pos].0)
+            {
+                worst_pos = pos;
+            }
+        }
+        let worst = selected[worst_pos];
+        if score > worst.1 || (score == worst.1 && idx < worst.0) {
+            selected[worst_pos] = (idx, score);
+        }
+    }
+    selected.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
     });
-    indices.truncate(top_k);
-    indices
+    selected.into_iter().map(|(idx, _)| idx).collect()
 }
 
 fn normalize_atom_and_assignments(
@@ -512,6 +508,22 @@ fn explained_variance(x: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> f6
     }
 }
 
+fn penalized_reconstruction_loss(
+    x: ArrayView2<'_, f64>,
+    fitted: ArrayView2<'_, f64>,
+    ridge: f64,
+    atoms: ArrayView2<'_, f64>,
+) -> f64 {
+    let mut loss = 0.0;
+    for row in 0..x.nrows() {
+        for col in 0..x.ncols() {
+            let residual = x[[row, col]] - fitted[[row, col]];
+            loss += residual * residual;
+        }
+    }
+    loss + ridge * atoms.iter().map(|value| value * value).sum::<f64>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,9 +586,57 @@ mod tests {
         let fit = fit_linear_dictionary(x.view(), &config).expect("rank-one fit");
         let covariance = x.t().dot(&x);
         let (evals, _) = covariance.eigh(Side::Lower).expect("PCA eigensolve");
-        let oracle_ev = evals[evals.len() - 1] / evals.sum();
+        let shrink = 1.0 / (1.0 + DEFAULT_CODE_RIDGE);
+        let oracle_ev = 1.0
+            - ((1.0 - shrink) * (1.0 - shrink) * evals[evals.len() - 1]
+                + evals.slice(s![..evals.len() - 1]).sum())
+                / evals.sum();
 
         assert!(fit.explained_variance > 0.99);
         assert_abs_diff_eq!(fit.explained_variance, oracle_ev, epsilon = 2.0e-4);
+    }
+
+    #[test]
+    fn sparse_assignment_scales_to_thousand_atom_dictionary() {
+        let active_atoms = array![
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut x = Array2::<f64>::zeros((256, 8));
+        for row in 0..x.nrows() {
+            let atom = row % active_atoms.nrows();
+            let scale = 0.7 + 0.003 * row as f64;
+            x.row_mut(row).assign(&(&active_atoms.row(atom) * scale));
+        }
+        let config = LinearDictionaryConfig {
+            n_atoms: 1024,
+            max_iter: 8,
+            top_k: 1,
+            assignment: LinearDictionaryAssignment::TopK,
+            temperature: DEFAULT_TEMPERATURE,
+            code_ridge: DEFAULT_CODE_RIDGE,
+            tolerance: 1.0e-9,
+        };
+
+        let fit = fit_linear_dictionary(x.view(), &config).expect("large-K linear dictionary fit");
+        let max_active = fit
+            .assignments
+            .axis_iter(Axis(0))
+            .map(|row| row.iter().filter(|value| value.abs() > 1.0e-10).count())
+            .max()
+            .unwrap();
+
+        assert_eq!(max_active, 1);
+        assert!(
+            fit.explained_variance > 0.95,
+            "expected EV > 0.95 at K=1024, got {}",
+            fit.explained_variance
+        );
     }
 }
