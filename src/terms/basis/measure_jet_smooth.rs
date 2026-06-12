@@ -1151,7 +1151,11 @@ pub fn build_measure_jet_basis(
             input_scales: None,
             length_scale,
             eps_band,
-            order_s,
+            // The SPEC's order field, sentinel included: 0.0 marks per-level
+            // (spectral) mode and must replay as per-level — persisting the
+            // realized default here would silently flip the rebuild into
+            // fused mode and desync the penalty count.
+            order_s: spec.order_s,
             alpha: spec.alpha,
             tau0: spec.tau0,
             masses,
