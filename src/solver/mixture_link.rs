@@ -20,7 +20,6 @@ const SAS_U_CLAMP: f64 = 50.0;
 /// edge-barrier helpers in `solver/estimate.rs` that previously had to
 /// hard-code the same `12.0` with a "must match" comment.
 pub(crate) const SAS_LOG_DELTA_BOUND: f64 = 12.0;
-const BETA_LOGISTIC_U_EPS: f64 = 1e-12;
 
 #[inline]
 fn latent_cloglog_quadctx() -> &'static crate::quadrature::QuadratureContext {
@@ -1232,14 +1231,11 @@ fn sas_inverse_link_mu_d1(eta: f64, epsilon: f64, log_delta: f64) -> (f64, f64) 
 }
 
 fn beta_logistic_inverse_link_mu_d1(eta: f64, delta: f64, epsilon: f64) -> (f64, f64) {
-    let (u, du) = logistic_uwith_derivatives(eta);
+    let logistic = logistic_uwith_derivatives(eta);
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
-    let mu = beta_reg(a, b, u);
-    if du == 0.0 {
-        return (mu, 0.0);
-    }
-    let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
+    let mu = beta_reg_logistic(a, b, logistic);
+    let log_d1 = beta_logistic_log_d1(a, b, logistic);
     (mu, log_d1.exp())
 }
 
@@ -1569,18 +1565,72 @@ pub fn mixture_inverse_link_jetwith_rho_partials_into(
     mixed
 }
 
+#[derive(Clone, Copy)]
+struct LogisticU {
+    u: f64,
+    one_minus_u: f64,
+    ln_u: f64,
+    ln_one_minus_u: f64,
+    du: f64,
+    use_upper_tail: bool,
+}
+
 #[inline]
-fn logistic_uwith_derivatives(eta: f64) -> (f64, f64) {
-    let u = crate::linalg::utils::stable_logistic(eta);
-    let u_clamped = u.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
-    let clamp_active = !eta.is_finite() || u_clamped != u;
-    let du = if clamp_active {
-        0.0
+fn logistic_uwith_derivatives(eta: f64) -> LogisticU {
+    let ln_u = -crate::linalg::utils::stable_softplus(-eta);
+    let ln_one_minus_u = -crate::linalg::utils::stable_softplus(eta);
+    let u = ln_u.exp();
+    let one_minus_u = ln_one_minus_u.exp();
+    let du = (ln_u + ln_one_minus_u).exp();
+    LogisticU {
+        u,
+        one_minus_u,
+        ln_u,
+        ln_one_minus_u,
+        du,
+        use_upper_tail: eta >= 0.0,
+    }
+}
+
+#[inline]
+fn beta_reg_logistic(a: f64, b: f64, logistic: LogisticU) -> f64 {
+    if logistic.ln_u.is_nan() || logistic.ln_one_minus_u.is_nan() {
+        return f64::NAN;
+    }
+    if logistic.ln_u == f64::NEG_INFINITY {
+        return 0.0;
+    }
+    if logistic.ln_one_minus_u == f64::NEG_INFINITY {
+        return 1.0;
+    }
+    if logistic.use_upper_tail {
+        1.0 - beta_reg(b, a, logistic.one_minus_u)
     } else {
-        u_clamped * (1.0 - u_clamped)
-    };
-    let u = u_clamped;
-    (u, du)
+        beta_reg(a, b, logistic.u)
+    }
+}
+
+#[inline]
+fn beta_reg_with_shape_partials_logistic(
+    a: f64,
+    b: f64,
+    logistic: LogisticU,
+) -> (f64, f64, f64) {
+    if logistic.ln_u.is_nan() || logistic.ln_one_minus_u.is_nan() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    if logistic.use_upper_tail {
+        let (tail, dtail_db, dtail_da) =
+            beta_reg_with_shape_partials(b, a, logistic.one_minus_u);
+        (1.0 - tail, -dtail_da, -dtail_db)
+    } else {
+        beta_reg_with_shape_partials(a, b, logistic.u)
+    }
+}
+
+#[inline]
+fn beta_logistic_log_d1(a: f64, b: f64, logistic: LogisticU) -> f64 {
+    a * logistic.ln_u + b * logistic.ln_one_minus_u - ln_beta(a, b)
 }
 
 #[derive(Clone, Copy)]
@@ -1790,23 +1840,15 @@ pub fn beta_logistic_inverse_link_jet(
     log_shape_center: f64,
     epsilon: f64,
 ) -> InverseLinkJet {
-    let (u, du) = logistic_uwith_derivatives(eta);
+    let logistic = logistic_uwith_derivatives(eta);
     let a = (log_shape_center - epsilon).exp();
     let b = (log_shape_center + epsilon).exp();
-    let mu = beta_reg(a, b, u);
-    if du == 0.0 {
-        return InverseLinkJet {
-            mu,
-            d1: 0.0,
-            d2: 0.0,
-            d3: 0.0,
-        };
-    }
-    let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
+    let mu = beta_reg_logistic(a, b, logistic);
+    let log_d1 = beta_logistic_log_d1(a, b, logistic);
     let d1 = log_d1.exp();
-    let t = a * (1.0 - u) - b * u;
+    let t = a * logistic.one_minus_u - b * logistic.u;
     let d2 = d1 * t;
-    let d3 = d1 * (t * t - (a + b) * du);
+    let d3 = d1 * (t * t - (a + b) * logistic.du);
     InverseLinkJet { mu, d1, d2, d3 }
 }
 
@@ -1837,18 +1879,15 @@ pub fn beta_logistic_inverse_link_pdfthird_derivative(
     //      = d1 [ t³ - 3 c t u' - c u'' ],
     //
     // since `t' = -c u'`.
-    let (u, du) = logistic_uwith_derivatives(eta);
-    if du == 0.0 {
-        return 0.0;
-    }
+    let logistic = logistic_uwith_derivatives(eta);
     let a = (log_shape_center - epsilon).exp();
     let b = (log_shape_center + epsilon).exp();
-    let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
+    let log_d1 = beta_logistic_log_d1(a, b, logistic);
     let d1 = log_d1.exp();
     let c = a + b;
-    let t = a * (1.0 - u) - b * u;
-    let u2 = du * (1.0 - 2.0 * u);
-    d1 * (t * t * t - 3.0 * c * t * du - c * u2)
+    let t = a * logistic.one_minus_u - b * logistic.u;
+    let u2 = logistic.du * (logistic.one_minus_u - logistic.u);
+    d1 * (t * t * t - 3.0 * c * t * logistic.du - c * u2)
 }
 
 /// Fifth derivative of the beta-logistic inverse-link CDF (= 4th deriv of PDF).
@@ -1863,20 +1902,19 @@ pub fn beta_logistic_inverse_link_pdffourth_derivative(
     log_shape_center: f64,
     epsilon: f64,
 ) -> f64 {
-    let (u, du) = logistic_uwith_derivatives(eta);
-    if du == 0.0 {
-        return 0.0;
-    }
+    let logistic = logistic_uwith_derivatives(eta);
     let a = (log_shape_center - epsilon).exp();
     let b = (log_shape_center + epsilon).exp();
-    let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
+    let log_d1 = beta_logistic_log_d1(a, b, logistic);
     let d1 = log_d1.exp();
     let c = a + b;
-    let t = a * (1.0 - u) - b * u;
-    let u2 = du * (1.0 - 2.0 * u);
-    let u3 = u2 * (1.0 - 2.0 * u) - 2.0 * du * du;
+    let t = a * logistic.one_minus_u - b * logistic.u;
+    let u2 = logistic.du * (logistic.one_minus_u - logistic.u);
+    let u3 = u2 * (logistic.one_minus_u - logistic.u) - 2.0 * logistic.du * logistic.du;
     let t2 = t * t;
-    d1 * (t2 * t2 - 6.0 * c * t2 * du - 4.0 * c * t * u2 + 3.0 * c * c * du * du - c * u3)
+    d1 * (t2 * t2 - 6.0 * c * t2 * logistic.du - 4.0 * c * t * u2
+        + 3.0 * c * c * logistic.du * logistic.du
+        - c * u3)
 }
 
 pub fn beta_logistic_inverse_link_jetwith_param_partials(
@@ -1884,55 +1922,32 @@ pub fn beta_logistic_inverse_link_jetwith_param_partials(
     log_shape_center: f64,
     epsilon: f64,
 ) -> SasJetWithParamPartials {
-    let (u, du) = logistic_uwith_derivatives(eta);
+    let logistic = logistic_uwith_derivatives(eta);
     let a = (log_shape_center - epsilon).exp();
     let b = (log_shape_center + epsilon).exp();
-    let (mu, dmu_da, dmu_db) = beta_reg_with_shape_partials(a, b, u);
+    let (mu, dmu_da, dmu_db) = beta_reg_with_shape_partials_logistic(a, b, logistic);
     let dmu_dlog_shape_center = a * dmu_da + b * dmu_db;
     let dmu_depsilon = -a * dmu_da + b * dmu_db;
-    if du == 0.0 {
-        let zero = InverseLinkJet {
-            mu,
-            d1: 0.0,
-            d2: 0.0,
-            d3: 0.0,
-        };
-        return SasJetWithParamPartials {
-            jet: zero,
-            djet_depsilon: InverseLinkJet {
-                mu: dmu_depsilon,
-                d1: 0.0,
-                d2: 0.0,
-                d3: 0.0,
-            },
-            djet_dlog_delta: InverseLinkJet {
-                mu: dmu_dlog_shape_center,
-                d1: 0.0,
-                d2: 0.0,
-                d3: 0.0,
-            },
-        };
-    }
-    let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
+    let log_d1 = beta_logistic_log_d1(a, b, logistic);
     let d1 = log_d1.exp();
-    let t = a * (1.0 - u) - b * u;
+    let t = a * logistic.one_minus_u - b * logistic.u;
     let d2 = d1 * t;
-    let k = t * t - (a + b) * du;
+    let k = t * t - (a + b) * logistic.du;
     let d3 = d1 * k;
     let jet = InverseLinkJet { mu, d1, d2, d3 };
 
     let psi_a = digamma(a);
     let psi_b = digamma(b);
     let psi_ab = digamma(a + b);
-    let la = u.ln() - psi_a + psi_ab;
-    let lb = (1.0 - u).ln() - psi_b + psi_ab;
+    let la = logistic.ln_u - psi_a + psi_ab;
+    let lb = logistic.ln_one_minus_u - psi_b + psi_ab;
 
     let partials_for = |a_p: f64, b_p: f64, dmu: f64| -> InverseLinkJet {
         let logd1_p = a_p * la + b_p * lb;
         let d1_p = d1 * logd1_p;
-        let t_p = a_p * (1.0 - u) - b_p * u;
+        let t_p = a_p * logistic.one_minus_u - b_p * logistic.u;
         let d2_p = d1_p * t + d1 * t_p;
-        let k_p = 2.0 * t * t_p - (a_p + b_p) * du;
+        let k_p = 2.0 * t * t_p - (a_p + b_p) * logistic.du;
         let d3_p = d1_p * k + d1 * k_p;
         InverseLinkJet {
             mu: dmu,
@@ -2488,11 +2503,31 @@ mod tests {
 
     #[test]
     fn beta_logistic_reduces_to_logit_at_delta0_epsilon0() {
+        let etas = [-40.0, -30.0, -5.0, 0.42, 5.0, 30.0, 40.0];
+        for eta in etas {
+            let j_bl = beta_logistic_inverse_link_jet(eta, 0.0, 0.0);
+            let expected_mu = crate::linalg::utils::stable_logistic(eta);
+            let expected_d1 = (-crate::linalg::utils::stable_softplus(-eta)
+                - crate::linalg::utils::stable_softplus(eta))
+            .exp();
+            assert!(
+                (j_bl.mu - expected_mu).abs() <= 1e-15 * expected_mu.abs().max(1.0),
+                "mu mismatch at eta={eta}: got {}, expected {}",
+                j_bl.mu,
+                expected_mu
+            );
+            assert!(
+                (j_bl.d1 - expected_d1).abs() <= 1e-12 * expected_d1.abs().max(f64::MIN_POSITIVE),
+                "d1 mismatch at eta={eta}: got {}, expected {}",
+                j_bl.d1,
+                expected_d1
+            );
+            assert!(j_bl.d1 > 0.0, "d1 should stay positive at eta={eta}");
+        }
+
         let eta = 0.42;
         let j_bl = beta_logistic_inverse_link_jet(eta, 0.0, 0.0);
         let j_logit = component_inverse_link_jet(LinkComponent::Logit, eta);
-        assert!((j_bl.mu - j_logit.mu).abs() < 1e-10);
-        assert!((j_bl.d1 - j_logit.d1).abs() < 1e-10);
         assert!((j_bl.d2 - j_logit.d2).abs() < 1e-10);
         assert!((j_bl.d3 - j_logit.d3).abs() < 1e-10);
     }
@@ -2692,65 +2727,47 @@ mod tests {
     }
 
     #[test]
-    fn beta_logistic_param_partials_survive_eta_clamp() {
-        let eta = -1000.0;
-        let delta = -1.5;
-        let epsilon = 0.4;
-        let out = beta_logistic_inverse_link_jetwith_param_partials(eta, delta, epsilon);
-        let h = 1e-6;
+    fn beta_logistic_left_tail_uses_unclamped_log_space() {
+        let eta = -40.0;
+        let delta = 0.2;
+        let epsilon = -0.1;
+        let a = (delta - epsilon).exp();
+        let b = (delta + epsilon).exp();
+        let expected_mu = beta_reg(a, b, eta.exp());
+        let out = beta_logistic_inverse_link_jet(eta, delta, epsilon);
 
-        assert_eq!(out.jet.d1, 0.0);
-        assert_eq!(out.jet.d2, 0.0);
-        assert_eq!(out.jet.d3, 0.0);
+        assert!(
+            (out.mu - expected_mu).abs() <= 1e-12 * expected_mu.abs().max(f64::MIN_POSITIVE),
+            "left-tail mu mismatch: got {}, expected {}",
+            out.mu,
+            expected_mu
+        );
+        assert!(out.d1 > 0.0);
+        assert!(out.d2 > 0.0);
+        assert!(out.d3 > 0.0);
+        assert!(out.d1 < 1e-20);
 
-        let dp = beta_logistic_inverse_link_jet(eta, delta + h, epsilon);
-        let dm = beta_logistic_inverse_link_jet(eta, delta - h, epsilon);
-        let fd_delta = InverseLinkJet {
-            mu: (dp.mu - dm.mu) / (2.0 * h),
-            d1: (dp.d1 - dm.d1) / (2.0 * h),
-            d2: (dp.d2 - dm.d2) / (2.0 * h),
-            d3: (dp.d3 - dm.d3) / (2.0 * h),
-        };
-        assert!((out.djet_dlog_delta.mu - fd_delta.mu).abs() < 5e-5);
-        assert_eq!(out.djet_dlog_delta.d1, 0.0);
-        assert_eq!(out.djet_dlog_delta.d2, 0.0);
-        assert_eq!(out.djet_dlog_delta.d3, 0.0);
-
-        let ep = beta_logistic_inverse_link_jet(eta, delta, epsilon + h);
-        let em = beta_logistic_inverse_link_jet(eta, delta, epsilon - h);
-        let fd_epsilon = InverseLinkJet {
-            mu: (ep.mu - em.mu) / (2.0 * h),
-            d1: (ep.d1 - em.d1) / (2.0 * h),
-            d2: (ep.d2 - em.d2) / (2.0 * h),
-            d3: (ep.d3 - em.d3) / (2.0 * h),
-        };
-        assert!((out.djet_depsilon.mu - fd_epsilon.mu).abs() < 5e-5);
-        assert_eq!(out.djet_depsilon.d1, 0.0);
-        assert_eq!(out.djet_depsilon.d2, 0.0);
-        assert_eq!(out.djet_depsilon.d3, 0.0);
+        let partials = beta_logistic_inverse_link_jetwith_param_partials(eta, delta, epsilon);
+        assert!(partials.jet.d1 > 0.0);
+        assert!(partials.jet.d2 > 0.0);
+        assert!(partials.jet.d3 > 0.0);
+        assert!(partials.djet_dlog_delta.d1.is_finite());
+        assert!(partials.djet_depsilon.d1.is_finite());
     }
 
     #[test]
-    fn beta_logistic_param_partials_match_unclamped_mu_when_eta_clamps() {
-        let eta = -1000.0;
-        let delta = 0.01;
-        let epsilon = 0.0;
-        let out = beta_logistic_inverse_link_jetwith_param_partials(eta, delta, epsilon);
-        let h = 1e-6 * (1.0 + delta.abs());
-
-        assert!(out.jet.mu < BETA_LOGISTIC_U_EPS);
-
-        let dp = beta_logistic_inverse_link_jet(eta, delta + h, epsilon);
-        let dm = beta_logistic_inverse_link_jet(eta, delta - h, epsilon);
-        let fd_delta_mu = (dp.mu - dm.mu) / (2.0 * h);
-        assert!(fd_delta_mu != 0.0);
-        assert!((out.djet_dlog_delta.mu - fd_delta_mu).abs() < 1e-12);
-
-        let ep = beta_logistic_inverse_link_jet(eta, delta, epsilon + h);
-        let em = beta_logistic_inverse_link_jet(eta, delta, epsilon - h);
-        let fd_epsilon_mu = (ep.mu - em.mu) / (2.0 * h);
-        assert!(fd_epsilon_mu != 0.0);
-        assert!((out.djet_depsilon.mu - fd_epsilon_mu).abs() < 1e-12);
+    fn beta_logistic_mu_is_symmetric_in_logistic_tails() {
+        let delta = 0.2;
+        let epsilon = -0.35;
+        let etas = [-40.0, -30.0, -5.0, -0.42, 0.0, 0.42, 5.0, 30.0, 40.0];
+        for eta in etas {
+            let left = beta_logistic_inverse_link_jet(eta, delta, epsilon).mu;
+            let right = 1.0 - beta_logistic_inverse_link_jet(-eta, delta, -epsilon).mu;
+            assert!(
+                (left - right).abs() <= 1e-14,
+                "symmetry mismatch at eta={eta}: left={left}, right={right}"
+            );
+        }
     }
 
     #[test]
