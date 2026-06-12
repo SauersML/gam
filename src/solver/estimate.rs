@@ -70,7 +70,7 @@ use std::sync::Arc;
 /// dominates wall-clock for spectral multi-penalty smooths; analytic-gradient
 /// BFGS reaches the same optimum with lower total work. Low-dimensional classic
 /// fits keep exact second-order geometry.
-const REML_SECOND_ORDER_RHO_CAP: usize = 8;
+const REML_SECOND_ORDER_RHO_CAP: usize = 4;
 /// Continuation prewarm is a seed-polishing pass, not part of the REML
 /// objective. It can be useful for tiny rho spaces where one or two warm
 /// solves amortize, but it scales with the number of starts and runs full
