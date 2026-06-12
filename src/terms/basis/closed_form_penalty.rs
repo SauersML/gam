@@ -266,24 +266,6 @@ fn bessel_k_half_integer(n: usize, x: f64) -> f64 {
     pref * sum
 }
 
-/// I_ν(x) = (x/2)^ν Σ_{k=0}^∞ (x²/4)^k / (k! Γ(ν+k+1))
-fn bessel_i_series(nu: f64, x: f64) -> f64 {
-    let half_x = 0.5 * x;
-    let half_x_sq = half_x * half_x;
-    // (x/2)^ν via exp(ν ln(x/2))
-    let prefix = (nu * half_x.ln()).exp();
-    let mut term = 1.0 / gamma_fn(nu + 1.0);
-    let mut sum = term;
-    for k in 1..200 {
-        term *= half_x_sq / (k as f64 * (nu + k as f64));
-        sum += term;
-        if term.abs() < 1e-18 * sum.abs() {
-            break;
-        }
-    }
-    prefix * sum
-}
-
 fn bessel_k_temme(mu: f64, x: f64) -> (f64, f64) {
     let half_x = 0.5 * x;
     let mu2 = mu * mu;
@@ -2723,7 +2705,24 @@ pub fn psi_kappa_mixed_derivative(
 
 #[cfg(test)]
 mod tests {
-    use super::{bessel_i_series, bessel_k, bessel_k_half_integer};
+    use super::{bessel_k, bessel_k_half_integer, gamma_fn};
+
+    /// I_ν(x) = (x/2)^ν Σ_{k=0}^∞ (x²/4)^k / (k! Γ(ν+k+1)).
+    fn bessel_i_series(nu: f64, x: f64) -> f64 {
+        let half_x = 0.5 * x;
+        let half_x_sq = half_x * half_x;
+        let prefix = (nu * half_x.ln()).exp();
+        let mut term = 1.0 / gamma_fn(nu + 1.0);
+        let mut sum = term;
+        for k in 1..200 {
+            term *= half_x_sq / (k as f64 * (nu + k as f64));
+            sum += term;
+            if term.abs() < 1e-18 * sum.abs() {
+                break;
+            }
+        }
+        prefix * sum
+    }
 
     fn assert_relative_close(actual: f64, expected: f64, rel_tol: f64) {
         let scale = expected.abs();
