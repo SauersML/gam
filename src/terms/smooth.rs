@@ -2,11 +2,13 @@ use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
     BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError, BasisMetadata,
     BasisOptions, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, BasisWorkspace,
-    CenterStrategy, CenterStrategyKind, Dense, DuchonBasisSpec, KnotSource, KroneckerFactoredBasis,
+    CenterStrategy, CenterStrategyKind, ConstantCurvatureBasisSpec,
+    ConstantCurvatureIdentifiability, Dense, DuchonBasisSpec, KnotSource, KroneckerFactoredBasis,
     MaternBasisSpec, MaternIdentifiability, OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo,
     PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
     SphericalSplineIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
-    build_bspline_basis_1d, build_duchon_basis, build_duchon_basiswithworkspace,
+    build_bspline_basis_1d, build_constant_curvature_basis, build_duchon_basis,
+    build_duchon_basiswithworkspace,
     build_matern_basis, build_matern_basis_log_kappa_aniso_derivatives,
     build_matern_basis_log_kappa_derivatives, build_matern_basiswithworkspace,
     build_matern_collocation_operator_matrices, build_spherical_spline_basis,
@@ -401,6 +403,15 @@ pub enum SmoothBasisSpec {
         feature_cols: Vec<usize>,
         spec: SphericalSplineBasisSpec,
     },
+    /// Constant-curvature (`M_κ`) geodesic-kernel smooth over κ-stereographic
+    /// chart coordinates (#944): one construction interpolating
+    /// S^d → ℝ^d → H^d through the spec's fixed κ. The Wahba S² smooth is the
+    /// structural template; the geometry comes from
+    /// `geometry::constant_curvature::ConstantCurvature`.
+    ConstantCurvature {
+        feature_cols: Vec<usize>,
+        spec: ConstantCurvatureBasisSpec,
+    },
     Matern {
         feature_cols: Vec<usize>,
         spec: MaternBasisSpec,
@@ -480,6 +491,7 @@ impl SmoothBasisSpec {
             }
             Self::ThinPlate { .. }
             | Self::Sphere { .. }
+            | Self::ConstantCurvature { .. }
             | Self::Matern { .. }
             | Self::Duchon { .. } => RADIAL_FLOOR,
             Self::Pca { basis_matrix, .. } => basis_matrix.ncols().max(1),
@@ -558,6 +570,7 @@ impl SmoothBasisSpec {
             Self::FactorSmooth { .. } => "factor_smooth",
             Self::ThinPlate { .. } => "thin_plate",
             Self::Sphere { .. } => "sphere",
+            Self::ConstantCurvature { .. } => "constant_curvature",
             Self::Matern { .. } => "matern",
             Self::Duchon { .. } => "duchon",
             Self::Pca { .. } => "pca",
@@ -578,6 +591,7 @@ impl SmoothBasisSpec {
             Self::BSpline1D { feature_col, .. } => vec![*feature_col],
             Self::ThinPlate { feature_cols, .. }
             | Self::Sphere { feature_cols, .. }
+            | Self::ConstantCurvature { feature_cols, .. }
             | Self::Matern { feature_cols, .. }
             | Self::Duchon { feature_cols, .. }
             | Self::Pca { feature_cols, .. }
@@ -1214,6 +1228,22 @@ impl TermCollectionSpec {
                         ));
                     }
                 }
+                SmoothBasisSpec::ConstantCurvature { spec, .. } => {
+                    if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: ConstantCurvature centers must be UserProvided",
+                            st.name
+                        ))
+                        .into());
+                    }
+                    if !(spec.length_scale.is_finite() && spec.length_scale > 0.0) {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: ConstantCurvature length_scale must be the realized positive value",
+                            st.name
+                        ))
+                        .into());
+                    }
+                }
                 SmoothBasisSpec::Matern { spec, .. } => {
                     if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
                         return Err(SmoothError::invalid_config(format!(
@@ -1425,6 +1455,7 @@ where
         }
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Sphere { feature_cols, .. }
+        | SmoothBasisSpec::ConstantCurvature { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
@@ -7088,6 +7119,23 @@ fn build_single_local_smooth_term(
             let x = select_columns(data, feature_cols)?;
             build_spherical_spline_basis(x.view(), spec)?
         }
+        SmoothBasisSpec::ConstantCurvature { feature_cols, spec } => {
+            if term.shape != ShapeConstraint::None {
+                crate::bail_invalid_basis!(
+                    "ShapeConstraint::{:?} for term '{}' is not supported on constant-curvature smooths",
+                    term.shape,
+                    term.name
+                );
+            }
+            // Chart coordinates are consumed verbatim: NO auto-standardization.
+            // Rescaling axes would change the chart gauge `1 + κ‖x‖²` and
+            // silently redefine which curvature κ refers to (the same point
+            // cloud at a different chart scale has a different κ̂); the user's
+            // coordinates ARE the geometry here, exactly as for the sphere
+            // smooth's (lat, lon).
+            let x = select_columns(data, feature_cols)?;
+            build_constant_curvature_basis(x.view(), spec)?
+        }
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
@@ -8245,6 +8293,7 @@ fn smooth_basis_feature_cols(basis: &SmoothBasisSpec) -> Vec<usize> {
         SmoothBasisSpec::BSpline1D { feature_col, .. } => vec![*feature_col],
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Sphere { feature_cols, .. }
+        | SmoothBasisSpec::ConstantCurvature { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
@@ -8281,6 +8330,7 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::Matern { .. } => 4,
         SmoothBasisSpec::Duchon { .. } => 5,
         SmoothBasisSpec::Pca { .. } => 6,
+        SmoothBasisSpec::ConstantCurvature { .. } => 8,
         SmoothBasisSpec::BySmooth { smooth, .. } => smooth_basis_family_rank(&SmoothTermSpec {
             name: term.name.clone(),
             basis: (**smooth).clone(),
@@ -8317,6 +8367,13 @@ fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
                 || matches!(
                     spec.identifiability,
                     SphericalSplineIdentifiability::FrozenTransform { .. }
+                )
+        }
+        SmoothBasisSpec::ConstantCurvature { spec, .. } => {
+            matches!(spec.center_strategy, CenterStrategy::UserProvided(_))
+                || matches!(
+                    spec.identifiability,
+                    ConstantCurvatureIdentifiability::FrozenTransform { .. }
                 )
         }
         SmoothBasisSpec::Matern { spec, .. } => matches!(
@@ -9261,6 +9318,14 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
                     SphericalSplineIdentifiability::CenterSumToZero
                 )
         }
+        // Constant-curvature geodesic kernel: same #531 collision class as the
+        // Wahba sphere — the coefficient-space sum-to-zero `z` leaves the
+        // realized `K·z` design spanning the constant on the data rows, so the
+        // global parametric orthogonalization must compose onto `z` (#532).
+        SmoothBasisSpec::ConstantCurvature { spec, .. } => matches!(
+            spec.identifiability,
+            ConstantCurvatureIdentifiability::CenterSumToZero
+        ),
         SmoothBasisSpec::BSpline1D { .. }
         | SmoothBasisSpec::TensorBSpline { .. }
         | SmoothBasisSpec::Pca { .. }
@@ -9349,6 +9414,20 @@ fn with_identifiability_transform(
             method: *method,
             max_degree: *max_degree,
             wahba_kernel: *wahba_kernel,
+            constraint_transform: compose_identifiability_transforms(
+                constraint_transform.as_ref(),
+                transform,
+            )?,
+        }),
+        BasisMetadata::ConstantCurvature {
+            centers,
+            kappa,
+            length_scale,
+            constraint_transform,
+        } => Ok(BasisMetadata::ConstantCurvature {
+            centers: centers.clone(),
+            kappa: *kappa,
+            length_scale: *length_scale,
             constraint_transform: compose_identifiability_transforms(
                 constraint_transform.as_ref(),
                 transform,
@@ -18186,6 +18265,31 @@ fn freeze_smooth_basis_from_metadata(
             };
         }
         (
+            SmoothBasisSpec::ConstantCurvature { spec: s, .. },
+            BasisMetadata::ConstantCurvature {
+                centers,
+                kappa,
+                length_scale,
+                constraint_transform,
+            },
+        ) => {
+            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.kappa = *kappa;
+            // Pin the REALIZED kernel range so a `0.0` auto-sentinel spec
+            // replays the exact fit-time geometry at predict time (and at the
+            // future ψ-channel per-trial rebuilds) instead of re-deriving ℓ
+            // from whatever rows the rebuild sees.
+            s.length_scale = *length_scale;
+            // #532 pattern: freeze the composed `z · z_parametric` so the
+            // rebuild replays the fit-time realized transform verbatim.
+            s.identifiability = match constraint_transform {
+                Some(z) => ConstantCurvatureIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                },
+                None => ConstantCurvatureIdentifiability::CenterSumToZero,
+            };
+        }
+        (
             SmoothBasisSpec::Matern {
                 spec: s,
                 input_scales,
@@ -21353,6 +21457,7 @@ mod tests {
                 }
                 SmoothBasisSpec::ThinPlate { feature_cols, .. }
                 | SmoothBasisSpec::Sphere { feature_cols, .. }
+                | SmoothBasisSpec::ConstantCurvature { feature_cols, .. }
                 | SmoothBasisSpec::Matern { feature_cols, .. }
                 | SmoothBasisSpec::Duchon { feature_cols, .. }
                 | SmoothBasisSpec::Pca { feature_cols, .. }

@@ -14066,6 +14066,361 @@ mod tests {
         }
     }
 
+    /// #932 (survival follow-up, the issue's named next step): the survival
+    /// location-scale JOINT row NLL written ONCE over `Tower4<9>` in the
+    /// production kernel's nine linear-predictor primaries
+    /// `(h0, h1, d_raw, eta_t_exit, eta_t_entry, eta_t_deriv, eta_ls_exit,
+    /// eta_ls_entry, eta_ls_deriv)` — the exact `SLS_ROW_K` channel layout of
+    /// [`SurvivalLsRowKernel`]. The whole nonlinear composition that the
+    /// production path hand-writes is expressed here as plain `Tower4`
+    /// arithmetic:
+    ///
+    /// ```text
+    ///   u0 = h0 − eta_t_entry · exp(−eta_ls_entry)            (entry index)
+    ///   u1 = h1 − eta_t_exit  · exp(−eta_ls_exit)             (exit index)
+    ///   g  = d_raw + exp(−eta_ls_exit)·(eta_t_exit·eta_ls_deriv − eta_t_deriv)
+    ///   nll = w·[ log S(u0) − (1−d)·log S(u1) − d·(log f(u1) + log g) ]
+    /// ```
+    ///
+    /// so the tower mechanizes EXACTLY the calculus the hand path splits
+    /// across `q_chain_derivs_scalar` + `compose_survival_dynamic_q` (the
+    /// per-row `D/D2/D3` map tensors of `SurvivalLsRowKernel::row_maps`) and
+    /// the `row_kernel` / `row_third_contracted` Faà di Bruno accumulation
+    /// loops — the entry/exit/qdot cross blocks where the #736 bug genus
+    /// lives. Tail-critical primitives enter through the family's OWN
+    /// hand-certified stacks (`survival_ls_log_survival_stack` /
+    /// `_log_pdf_stack` / `_positive_log_stack`), so no probit/CLogLog/logit
+    /// primitive is re-derived: only the composition is mechanized.
+    struct SurvivalLsJointNllProgram<'a> {
+        inverse_link: &'a InverseLink,
+        primaries: Vec<[f64; SLS_ROW_K]>,
+        event: Vec<f64>,
+        weight: Vec<f64>,
+    }
+
+    impl crate::families::jet_tower::RowNllProgram<SLS_ROW_K> for SurvivalLsJointNllProgram<'_> {
+        fn n_rows(&self) -> usize {
+            self.primaries.len()
+        }
+
+        fn primaries(&self, row: usize) -> Result<[f64; SLS_ROW_K], String> {
+            self.primaries
+                .get(row)
+                .copied()
+                .ok_or_else(|| format!("survival LS joint program: row {row} out of range"))
+        }
+
+        fn row_nll(
+            &self,
+            row: usize,
+            p: &[crate::families::jet_tower::Tower4<SLS_ROW_K>; SLS_ROW_K],
+        ) -> Result<crate::families::jet_tower::Tower4<SLS_ROW_K>, String> {
+            use crate::families::jet_tower::Tower4;
+
+            let w = *self
+                .weight
+                .get(row)
+                .ok_or_else(|| format!("survival LS joint program: weight row {row} missing"))?;
+            let d = self.event[row];
+            if w <= 0.0 {
+                return Ok(Tower4::<SLS_ROW_K>::zero());
+            }
+
+            // Entry index: u0 = h0 + q0, q0 = −eta_t_entry · exp(−eta_ls_entry).
+            let inv_sigma_entry = (-p[7]).exp();
+            let u0 = p[0] - p[4] * inv_sigma_entry;
+            // Exit index: u1 = h1 + q1, q1 = −eta_t_exit · exp(−eta_ls_exit).
+            let inv_sigma_exit = (-p[6]).exp();
+            let u1 = p[1] - p[3] * inv_sigma_exit;
+            // Event Jacobian: g = d_raw + qdot,
+            // qdot = exp(−eta_ls_exit)·(eta_t_exit·eta_ls_deriv − eta_t_deriv).
+            let g = p[2] + inv_sigma_exit * (p[3] * p[8] - p[5]);
+
+            // NLL = w·log S(u0) − w(1−d)·log S(u1) − w·d·(log f(u1) + log g),
+            // term-for-term the sign layout of `SurvivalExactRowKernel::
+            // log_likelihood` / `nll_index_tower` (left truncation divides the
+            // likelihood by S(u0), so its log ADDS to the NLL).
+            let mut nll = u0
+                .compose_unary(survival_ls_log_survival_stack(
+                    self.inverse_link,
+                    u0.v,
+                    0.0,
+                )?)
+                .scale(w);
+
+            let censored_weight = w * (1.0 - d);
+            if censored_weight != 0.0 {
+                nll = nll
+                    + u1.compose_unary(survival_ls_log_survival_stack(
+                        self.inverse_link,
+                        u1.v,
+                        0.0,
+                    )?)
+                    .scale(-censored_weight);
+            }
+
+            let event_weight = w * d;
+            if event_weight != 0.0 {
+                nll = nll
+                    + u1.compose_unary(survival_ls_log_pdf_stack(
+                        self.inverse_link,
+                        u1.v,
+                        0.0,
+                    )?)
+                    .scale(-event_weight)
+                    + g.compose_unary(survival_ls_positive_log_stack(g.v))
+                        .scale(-event_weight);
+            }
+
+            Ok(nll)
+        }
+    }
+
+    /// Build a fully time-varying, non-wiggle survival LS family whose three
+    /// blocks are single-column designs carrying the fixture primaries
+    /// verbatim (every block coefficient is 1), so all nine kernel channels —
+    /// including the entry and derivative threshold/log-sigma channels — are
+    /// live and mutually distinct.
+    fn survival_ls_joint_oracle_family(
+        inverse_link: &InverseLink,
+        primaries: &[[f64; SLS_ROW_K]],
+        event: &[f64],
+        weight: &[f64],
+    ) -> SurvivalLocationScaleFamily {
+        let n = primaries.len();
+        let col = |ch: usize| Array2::from_shape_fn((n, 1), |(r, _)| primaries[r][ch]);
+        let dense = |ch: usize| {
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(col(ch)))
+        };
+        SurvivalLocationScaleFamily {
+            n,
+            y: Array1::from(event.to_vec()),
+            w: Array1::from(weight.to_vec()),
+            inverse_link: inverse_link.clone(),
+            derivative_guard: 1e-8,
+            x_time_entry: Arc::new(col(0)),
+            x_time_exit: Arc::new(col(1)),
+            x_time_deriv: Arc::new(col(2)),
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            time_linear_constraints: lower_bound_constraints(&array![0.0]),
+            x_threshold: dense(3),
+            x_threshold_entry: Some(dense(4)),
+            x_threshold_deriv: Some(dense(5)),
+            x_log_sigma: dense(6),
+            x_log_sigma_entry: Some(dense(7)),
+            x_log_sigma_deriv: Some(dense(8)),
+            x_link_wiggle: None,
+            wiggle_knots: None,
+            wiggle_degree: None,
+            location_log_time: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        }
+    }
+
+    /// Block states matching [`survival_ls_joint_oracle_family`]: every block
+    /// coefficient is 1, and the eta vectors carry the stacked
+    /// `[exit; entry; derivative]` layout `validate_joint_states` expects for
+    /// time-varying blocks (the time block is always stacked).
+    fn survival_ls_joint_oracle_states(
+        primaries: &[[f64; SLS_ROW_K]],
+    ) -> Vec<ParameterBlockState> {
+        let n = primaries.len();
+        let stacked = |exit: usize, entry: usize, deriv: usize| {
+            let mut eta = Array1::<f64>::zeros(3 * n);
+            for i in 0..n {
+                eta[i] = primaries[i][exit];
+                eta[n + i] = primaries[i][entry];
+                eta[2 * n + i] = primaries[i][deriv];
+            }
+            eta
+        };
+        vec![
+            ParameterBlockState {
+                beta: array![1.0],
+                eta: stacked(1, 0, 2),
+            },
+            ParameterBlockState {
+                beta: array![1.0],
+                eta: stacked(3, 4, 5),
+            },
+            ParameterBlockState {
+                beta: array![1.0],
+                eta: stacked(6, 7, 8),
+            },
+        ]
+    }
+
+    /// #932 universal oracle on the production `RowKernel<9>` implementation.
+    ///
+    /// Audits every channel the hand-written [`SurvivalLsRowKernel`] emits —
+    /// value / gradient / Hessian / `row_third_contracted(dir)` — against the
+    /// single-expression `RowNllProgram<9>` tower truth, for every residual
+    /// distribution the family enumerates (Gaussian/probit, Gumbel/CLogLog =
+    /// Weibull-AFT, Logistic/logit = log-logistic-AFT), over a fixture grid
+    /// covering exact deaths, right-censored rows, a fractional event weight,
+    /// deep left-truncated entries, an effectively untruncated entry
+    /// (u0 ≈ −6), and extreme exit-index tails on both sides (u1 ≈ ±6). The
+    /// entry/exit/qdot cross blocks — the channels #736's sign flip class
+    /// corrupts — are contracted explicitly through dense 9-dim directions.
+    ///
+    /// `row_fourth_contracted` is a documented gap on this kernel (the family
+    /// stores only third-order index derivatives; its REML outer Hessian uses
+    /// the third-order directional operator), so the oracle asserts the gap
+    /// is an explicit error rather than a silently wrong tensor.
+    #[test]
+    fn survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels() {
+        // Tower4<9> carries 9⁴ fourth-order entries (≈59 KiB per scalar by
+        // value); the program evaluation keeps a handful of live towers plus
+        // the 9-variable seed array on the stack, so run the body on a
+        // dedicated wide-stack thread instead of the 2 MiB test default.
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(survival_ls_joint_jet_tower_oracle_body)
+            .expect("spawn wide-stack oracle thread")
+            .join()
+            .expect("survival LS joint jet-tower oracle thread");
+    }
+
+    fn survival_ls_joint_jet_tower_oracle_body() {
+        use crate::families::jet_tower::{
+            KernelChannels, evaluate_program, verify_kernel_channels,
+        };
+        use crate::families::row_kernel::RowKernel;
+
+        // Channel layout per row:
+        // [h0, h1, d_raw, eta_t_exit, eta_t_entry, eta_t_deriv,
+        //  eta_ls_exit, eta_ls_entry, eta_ls_deriv]
+        let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+            // Exact death, moderate indices.
+            [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+            // Right-censored, small event Jacobian g (≈0.08, far above guard).
+            [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+            // Exact death, extreme right exit tail (u1 ≈ +6.2), entry
+            // effectively untruncated (u0 ≈ −6.3).
+            [-6.5, 5.6, 1.1, -0.7, -0.3, -0.15, 0.2, 0.4, 0.1],
+            // Right-censored, extreme left exit tail (u1 ≈ −5.8).
+            [-1.0, -5.2, 0.7, 0.5, 0.6, 0.3, -0.1, -0.3, -0.25],
+            // Exact death with DEEP left truncation (u0 ≈ +1.9: S(u0) ≪ 1).
+            [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+            // Fractional event target exercises the d∉{0,1} event_mix branch.
+            [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+        ];
+        let event = [1.0, 0.0, 1.0, 0.0, 1.0, 0.35];
+        let weight = [1.0, 0.8, 1.2, 0.9, 1.1, 1.3];
+        let n = primaries.len();
+
+        // Dense deterministic directions: every one of the nine channels
+        // participates in every contraction, so dropped/flipped cross blocks
+        // (entry×exit, threshold×log-sigma, value×derivative) cannot hide.
+        let dirs: [[f64; SLS_ROW_K]; 3] = [
+            [0.7, -1.3, 0.5, 0.9, -0.6, 0.3, -1.1, 0.4, 0.8],
+            [-0.4, 0.6, -1.1, 0.3, 1.2, -0.7, 0.5, -0.9, 0.2],
+            [1.2, 0.2, -0.7, -0.5, 0.4, 1.0, -0.3, 0.6, -1.2],
+        ];
+
+        for distribution in [
+            ResidualDistribution::Gaussian,
+            ResidualDistribution::Gumbel,
+            ResidualDistribution::Logistic,
+        ] {
+            let inverse_link = residual_distribution_inverse_link(distribution);
+            let family =
+                survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+            let states = survival_ls_joint_oracle_states(&primaries);
+            let q = family
+                .collect_joint_quantities(&states)
+                .expect("collect joint quantities");
+            let dynamic = family
+                .build_dynamic_geometry(&states)
+                .expect("dynamic geometry");
+            let kernel = SurvivalLsRowKernel {
+                family: &family,
+                q: &q,
+                dynamic: &dynamic,
+                offsets: family.joint_block_offsets(),
+            };
+            let program = SurvivalLsJointNllProgram {
+                inverse_link: &inverse_link,
+                primaries: primaries.clone(),
+                event: event.to_vec(),
+                weight: weight.to_vec(),
+            };
+
+            for row in 0..n {
+                // The program's recomputed indices must agree with the
+                // production dynamic geometry to floating-point noise —
+                // otherwise the oracle would compare towers seeded at
+                // different points and prove nothing.
+                let p = primaries[row];
+                let u0_prog = p[0] - p[4] * (-p[7]).exp();
+                let u1_prog = p[1] - p[3] * (-p[6]).exp();
+                let g_prog = p[2] + (-p[6]).exp() * (p[3] * p[8] - p[5]);
+                let u0_dyn = dynamic.h_entry[row] + dynamic.q_entry[row];
+                let u1_dyn = dynamic.h_exit[row] + dynamic.q_exit[row];
+                let g_dyn = dynamic.hdot_exit[row] + dynamic.qdot_exit[row];
+                assert!(
+                    (u0_prog - u0_dyn).abs() <= 1e-12 * u0_dyn.abs().max(1.0),
+                    "{distribution:?} row {row}: entry index mismatch: program {u0_prog} dynamic {u0_dyn}"
+                );
+                assert!(
+                    (u1_prog - u1_dyn).abs() <= 1e-12 * u1_dyn.abs().max(1.0),
+                    "{distribution:?} row {row}: exit index mismatch: program {u1_prog} dynamic {u1_dyn}"
+                );
+                assert!(
+                    (g_prog - g_dyn).abs() <= 1e-12 * g_dyn.abs().max(1.0),
+                    "{distribution:?} row {row}: event Jacobian mismatch: program {g_prog} dynamic {g_dyn}"
+                );
+                assert!(
+                    g_prog > family.derivative_guard,
+                    "{distribution:?} row {row}: fixture must stay clear of the monotonicity \
+                     guard so no clamping perturbs the comparison (g={g_prog})"
+                );
+
+                let tower = evaluate_program(&program, row).expect("survival LS joint tower");
+
+                let (value, gradient, hessian) =
+                    RowKernel::row_kernel(&kernel, row).expect("hand kernel value/grad/hess");
+
+                let third: Vec<([f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K])> = dirs
+                    .iter()
+                    .map(|dir| {
+                        let claim = RowKernel::row_third_contracted(&kernel, row, dir)
+                            .expect("hand kernel third");
+                        (*dir, claim)
+                    })
+                    .collect();
+
+                let claims = KernelChannels {
+                    value,
+                    gradient,
+                    hessian,
+                    third,
+                    // The survival LS kernel stores only third-order index
+                    // derivatives; fourth-order contraction is a refusal by
+                    // design (asserted below), not a comparable channel.
+                    fourth: vec![],
+                };
+
+                verify_kernel_channels(&tower, &claims, 1e-9).unwrap_or_else(|e| {
+                    panic!(
+                        "{distribution:?} row {row}: hand SurvivalLsRowKernel disagrees with \
+                         #932 jet-tower truth: {e}"
+                    )
+                });
+
+                let fourth_err =
+                    RowKernel::row_fourth_contracted(&kernel, row, &dirs[0], &dirs[1])
+                        .expect_err("fourth-order contraction must refuse, not fabricate");
+                assert!(
+                    fourth_err.contains("fourth-order"),
+                    "fourth-order refusal must say why: {fourth_err}"
+                );
+            }
+        }
+    }
+
     /// #921: the `RowKernel<9>` repackaging must reproduce the bespoke joint
     /// assembly bit-for-bit. We build a non-time-varying, non-wiggle fixture
     /// (the config the kernel covers), then assert the generic row-kernel engine

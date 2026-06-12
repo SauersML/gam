@@ -164,6 +164,7 @@ fn smooth_basis_feature_cols(basis: &SmoothBasisSpec) -> Option<Vec<usize>> {
         SmoothBasisSpec::FactorSmooth { spec } => Some(spec.continuous_cols.clone()),
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Sphere { feature_cols, .. }
+        | SmoothBasisSpec::ConstantCurvature { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
@@ -236,6 +237,12 @@ fn apply_kind_specific(
         ("matern", SmoothBasisSpec::Matern { spec, .. }) => apply_matern(spec, descriptor, symbol),
         ("sphere", SmoothBasisSpec::Sphere { spec, .. })
         | ("s2", SmoothBasisSpec::Sphere { spec, .. }) => apply_sphere(spec, descriptor, symbol),
+        ("curvature", SmoothBasisSpec::ConstantCurvature { spec, .. })
+        | ("curv", SmoothBasisSpec::ConstantCurvature { spec, .. })
+        | ("constant_curvature", SmoothBasisSpec::ConstantCurvature { spec, .. })
+        | ("mkappa", SmoothBasisSpec::ConstantCurvature { spec, .. }) => {
+            apply_constant_curvature(spec, descriptor, symbol)
+        }
         ("bspline", SmoothBasisSpec::BSpline1D { spec, .. })
         | ("periodic", SmoothBasisSpec::BSpline1D { spec, .. })
         | ("bc", SmoothBasisSpec::BSpline1D { spec, .. }) => {
@@ -266,6 +273,7 @@ fn smooth_basis_kind_name(basis: &SmoothBasisSpec) -> &'static str {
         SmoothBasisSpec::FactorSmooth { .. } => "factor_smooth",
         SmoothBasisSpec::ThinPlate { .. } => "thin_plate",
         SmoothBasisSpec::Sphere { .. } => "sphere",
+        SmoothBasisSpec::ConstantCurvature { .. } => "constant_curvature",
         SmoothBasisSpec::Matern { .. } => "matern",
         SmoothBasisSpec::Duchon { .. } => "duchon",
         SmoothBasisSpec::Pca { .. } => "pca",

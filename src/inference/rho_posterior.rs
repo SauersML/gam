@@ -104,6 +104,101 @@ pub struct RhoQuadratureMixture {
     pub max_gradient_norm: f64,
 }
 
+/// One node of the criterion-closure Tier-1 mixture (#938): a `ρ` location, its
+/// normalized posterior mass, and the exact profiled criterion value there.
+#[derive(Debug, Clone)]
+pub struct RhoMixtureNode {
+    /// Smoothing parameters at this node.
+    pub rho: Array1<f64>,
+    /// Normalized node probability `w_m ∝ exp(−criterion(ρ_m) + criterion(ρ̂)) ×
+    /// GH weight × exp(½‖z_m‖²)`.
+    pub weight: f64,
+    /// Normalized log node probability.
+    pub log_weight: f64,
+    /// Exact profiled criterion value at the node (`+∞` for infeasible nodes,
+    /// which carry zero weight).
+    pub cost: f64,
+}
+
+/// Tier-1 deliverable (#938): `π(ρ|y)` as a discrete mixture of conditional
+/// Gaussians, with the posterior moment summary of `ρ` itself.
+///
+/// The conditional Gaussian at each node is exactly what the engine already
+/// produces at fixed `ρ`; this struct owns the node locations and weights, and
+/// [`mixture_coefficient_covariance`] assembles the mixture-corrected
+/// coefficient covariance from per-node conditionals supplied by the caller.
+#[derive(Debug, Clone)]
+pub struct RhoPosteriorMixture {
+    /// Quadrature nodes with normalized weights (weights sum to 1).
+    pub nodes: Vec<RhoMixtureNode>,
+    /// Posterior mean of `ρ`: `Σ_m w_m ρ_m`.
+    pub mean: Array1<f64>,
+    /// Posterior covariance of `ρ`: `Σ_m w_m (ρ_m−ρ̄)(ρ_m−ρ̄)ᵀ`.
+    pub covariance: Array2<f64>,
+    /// Kish ESS of the node weights `(Σw)²/Σw²` — how non-Gaussian the exact
+    /// posterior is relative to the Laplace proposal (max = node count).
+    pub effective_sample_size: f64,
+}
+
+/// Tier-2 deliverable (#938): `π(ρ|y)` draws from NUTS with the exact profiled
+/// gradient, whitened by the exact outer Hessian at `ρ̂`.
+#[derive(Debug, Clone)]
+pub struct RhoPosteriorSamples {
+    /// Draws in ρ space: `(n_draws, K)`.
+    pub samples: Array2<f64>,
+    /// Posterior mean of `ρ`.
+    pub mean: Array1<f64>,
+    /// Posterior covariance of `ρ` (sample covariance of the draws).
+    pub covariance: Array2<f64>,
+    /// Split-chain R̂ mixing diagnostic.
+    pub rhat: f64,
+    /// Effective sample size.
+    pub ess: f64,
+    /// Whether the chains mixed (R̂ < 1.1).
+    pub converged: bool,
+}
+
+/// The auto-selected escalation outcome when the Tier-0 certificate reads
+/// [`RhoCertificate::Escalate`] (#938): Tier 1 (deterministic quadrature) for
+/// `K ≤ 4`, Tier 2 (NUTS over `ρ`) for `K ≤ 16`, and an HONEST report that
+/// escalation is unavailable beyond that — never a silently-degraded answer.
+#[derive(Debug, Clone)]
+pub enum RhoPosteriorEscalation {
+    /// Tier 1: deterministic Gauss-Hermite mixture (`K ≤ 4`).
+    Quadrature(RhoPosteriorMixture),
+    /// Tier 2: NUTS draws with the exact profiled gradient (`5 ≤ K ≤ 16`).
+    Nuts(RhoPosteriorSamples),
+    /// Escalation could not run (dimension beyond the NUTS cap, or the chosen
+    /// tier failed); intervals remain plug-in + first-order corrected, and the
+    /// fit reports WHY.
+    Unavailable { n_params: usize, reason: String },
+}
+
+/// Mixture-corrected coefficient posterior moments (law of total
+/// variance/expectation over the `ρ` mixture). See
+/// [`mixture_coefficient_covariance`].
+#[derive(Debug, Clone)]
+pub struct MixtureCoefficientCovariance {
+    /// Mixture posterior mean `β̄ = Σ_m w_m β̂(ρ_m)`.
+    pub beta_bar: Array1<f64>,
+    /// `Vβ_marginal = Σ_m w_m [Vb(ρ_m) + (β̂(ρ_m)−β̄)(β̂(ρ_m)−β̄)ᵀ]`.
+    pub covariance: Array2<f64>,
+}
+
+/// Largest `K` for which the Tier-1 Gauss-Hermite product grid is affordable
+/// (3–5 nodes per axis ⇒ at most 81–125 criterion evaluations).
+pub const TIER1_MAX_DIM: usize = 4;
+/// Largest `K` for which the Tier-2 NUTS escalation runs; beyond this the fit
+/// honestly reports that escalation is unavailable.
+pub const TIER2_MAX_DIM: usize = 16;
+/// Post-warmup draw budget for the auto-selected Tier-2 escalation. Each
+/// leapfrog step is one warm inner profile solve, so the budget is deliberately
+/// modest: the whitened `ρ`-posterior is a smooth, near-Gaussian, low-dim
+/// target where a few hundred draws already pin the first two moments.
+const ESCALATION_NUTS_SAMPLES: usize = 256;
+/// Deterministic seed for the auto-selected Tier-2 escalation (no clock).
+const ESCALATION_NUTS_SEED: u64 = 0x938_5EED_0938_5EED;
+
 const DEFAULT_M: usize = 64;
 const CERTIFICATE_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -254,12 +349,23 @@ pub fn rho_hessian_from_profiled_exact_gradient(
     Ok(hessian)
 }
 
+/// Gauss-Hermite rules for the STANDARD NORMAL weight (probabilists'
+/// convention: nodes are `√2·x_i`, weights `w_i/√π` of the physicists' rule, so
+/// the weights sum to 1 and the rule integrates polynomials of degree
+/// `2n−1` exactly against `N(0,1)`).
 fn standard_normal_gh_rule(nodes_per_axis: usize) -> Option<&'static [(f64, f64)]> {
     match nodes_per_axis {
         3 => Some(&[
             (-1.732_050_807_568_877_2, 1.0 / 6.0),
             (0.0, 2.0 / 3.0),
             (1.732_050_807_568_877_2, 1.0 / 6.0),
+        ]),
+        5 => Some(&[
+            (-2.856_970_013_872_805_6, 1.125_741_132_772_071_8e-2),
+            (-1.355_626_179_974_265_9, 2.220_759_220_056_126_4e-1),
+            (0.0, 5.333_333_333_333_333e-1),
+            (1.355_626_179_974_265_9, 2.220_759_220_056_126_4e-1),
+            (2.856_970_013_872_805_6, 1.125_741_132_772_071_8e-2),
         ]),
         _ => None,
     }
@@ -283,43 +389,57 @@ fn enumerate_gh_product(
     }
 }
 
-/// Tier-1 deterministic higher-order Laplace quadrature over `ρ`.
-///
-/// The input Hessian defines the local Gaussian proposal around `rho_hat`; each
-/// Gauss-Hermite node is reweighted by the exact profiled criterion,
-/// `exp(-V(ρ_node) + V(ρ_hat) + 0.5 ||z||²)`, and stores the exact profiled
-/// gradient from `OuterObjective::eval`.
-pub fn rho_posterior_tier1_quadrature(
-    objective: &mut dyn OuterObjective,
+/// One normalized node from the shared quadrature core: `(ρ, cost, optional
+/// exact gradient, normalized weight, normalized log-weight)`. Infeasible nodes
+/// carry `cost = +∞` and zero weight.
+struct NormalizedQuadratureNode {
+    rho: Array1<f64>,
+    cost: f64,
+    gradient: Option<Array1<f64>>,
+    weight: f64,
+    log_weight: f64,
+}
+
+/// Shared Tier-1 quadrature core (#938): whiten by the exact outer Hessian,
+/// enumerate the Gauss-Hermite product grid, reweight each node by the exact
+/// profiled criterion `exp(−V(ρ_m) + V(ρ̂) + ½‖z_m‖²) × GH-weight`, and
+/// normalize. Both public entry points (the `OuterObjective` form that carries
+/// exact gradients and the criterion-closure form) are thin adapters over this
+/// single implementation.
+fn quadrature_nodes_core<E>(
     rho_hat: &Array1<f64>,
     outer_hessian: &Array2<f64>,
     nodes_per_axis: usize,
-) -> Result<RhoQuadratureMixture, EstimationError> {
+    cost_hat: f64,
+    mut eval_node: E,
+) -> Result<(Vec<NormalizedQuadratureNode>, f64), EstimationError>
+where
+    E: FnMut(&Array1<f64>) -> Result<Option<(f64, Option<Array1<f64>>)>, EstimationError>,
+{
     let k = rho_hat.len();
     if k == 0 || outer_hessian.nrows() != k || outer_hessian.ncols() != k {
         return Err(EstimationError::RemlOptimizationFailed(
-            "rho_posterior_tier1_quadrature: rho/Hessian shape mismatch".to_string(),
+            "rho_posterior_quadrature: rho/Hessian shape mismatch".to_string(),
         ));
     }
-    if k > 4 {
+    if k > TIER1_MAX_DIM {
         return Err(EstimationError::RemlOptimizationFailed(format!(
-            "rho_posterior_tier1_quadrature: product quadrature is capped at K<=4, got {k}"
+            "rho_posterior_quadrature: product quadrature is capped at K<={TIER1_MAX_DIM}, got {k}"
         )));
     }
     let rule = standard_normal_gh_rule(nodes_per_axis).ok_or_else(|| {
         EstimationError::RemlOptimizationFailed(format!(
-            "rho_posterior_tier1_quadrature: unsupported nodes_per_axis {nodes_per_axis}"
+            "rho_posterior_quadrature: unsupported nodes_per_axis {nodes_per_axis}"
         ))
     })?;
     let l_inv = whitening_factor_from_outer_hessian(outer_hessian).ok_or_else(|| {
         EstimationError::RemlOptimizationFailed(
-            "rho_posterior_tier1_quadrature: outer Hessian is not positive definite".to_string(),
+            "rho_posterior_quadrature: outer Hessian is not positive definite".to_string(),
         )
     })?;
-    let cost_hat = objective.eval_cost(rho_hat)?;
     if !cost_hat.is_finite() {
         return Err(EstimationError::RemlOptimizationFailed(
-            "rho_posterior_tier1_quadrature: non-finite criterion at rho_hat".to_string(),
+            "rho_posterior_quadrature: non-finite criterion at rho_hat".to_string(),
         ));
     }
 
@@ -343,53 +463,386 @@ pub fn rho_posterior_tier1_quadrature(
             }
             rho[i] += acc;
         }
-        let eval = objective.eval(&rho)?;
-        let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
-        let log_weight = log_base_weight - eval.cost + cost_hat + half_norm_sq;
+        let (cost, gradient, log_weight) = match eval_node(&rho)? {
+            Some((cost, gradient)) if cost.is_finite() => {
+                let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
+                (
+                    cost,
+                    gradient,
+                    log_base_weight - cost + cost_hat + half_norm_sq,
+                )
+            }
+            // Infeasible node: zero importance weight, never fatal.
+            _ => (f64::INFINITY, None, f64::NEG_INFINITY),
+        };
         if log_weight.is_finite() {
             max_log_weight = max_log_weight.max(log_weight);
         }
-        raw_nodes.push((rho, eval.cost, eval.gradient, log_weight));
+        raw_nodes.push((rho, cost, gradient, log_weight));
     }
     if !max_log_weight.is_finite() {
         return Err(EstimationError::RemlOptimizationFailed(
-            "rho_posterior_tier1_quadrature: all quadrature nodes were non-finite".to_string(),
+            "rho_posterior_quadrature: all quadrature nodes were non-finite".to_string(),
         ));
     }
     let mut total = 0.0;
     let mut scaled = Vec::with_capacity(raw_nodes.len());
     for (_, _, _, log_weight) in &raw_nodes {
-        let w = (*log_weight - max_log_weight).exp();
+        let w = if log_weight.is_finite() {
+            (*log_weight - max_log_weight).exp()
+        } else {
+            0.0
+        };
         total += w;
         scaled.push(w);
     }
     if !(total.is_finite() && total > 0.0) {
         return Err(EstimationError::RemlOptimizationFailed(
-            "rho_posterior_tier1_quadrature: non-positive normalized mass".to_string(),
+            "rho_posterior_quadrature: non-positive normalized mass".to_string(),
         ));
     }
 
     let mut nodes = Vec::with_capacity(raw_nodes.len());
     let mut sum_sq = 0.0;
-    let mut max_gradient_norm = 0.0_f64;
     for ((rho, cost, gradient, log_weight), scaled_weight) in raw_nodes.into_iter().zip(scaled) {
         let weight = scaled_weight / total;
         sum_sq += weight * weight;
+        nodes.push(NormalizedQuadratureNode {
+            rho,
+            cost,
+            gradient,
+            weight,
+            log_weight: log_weight - max_log_weight - total.ln(),
+        });
+    }
+    let ess = if sum_sq > 0.0 { 1.0 / sum_sq } else { 0.0 };
+    Ok((nodes, ess))
+}
+
+/// Tier-1 deterministic higher-order Laplace quadrature over `ρ`, the
+/// `OuterObjective` form.
+///
+/// The input Hessian defines the local Gaussian proposal around `rho_hat`; each
+/// Gauss-Hermite node is reweighted by the exact profiled criterion,
+/// `exp(-V(ρ_node) + V(ρ_hat) + 0.5 ||z||²)`, and stores the exact profiled
+/// gradient from `OuterObjective::eval`.
+pub fn rho_posterior_tier1_quadrature(
+    objective: &mut dyn OuterObjective,
+    rho_hat: &Array1<f64>,
+    outer_hessian: &Array2<f64>,
+    nodes_per_axis: usize,
+) -> Result<RhoQuadratureMixture, EstimationError> {
+    let cost_hat = objective.eval_cost(rho_hat)?;
+    let (core_nodes, effective_sample_size) = quadrature_nodes_core(
+        rho_hat,
+        outer_hessian,
+        nodes_per_axis,
+        cost_hat,
+        |rho| {
+            let eval = objective.eval(rho)?;
+            Ok(Some((eval.cost, Some(eval.gradient))))
+        },
+    )?;
+    let k = rho_hat.len();
+    let mut nodes = Vec::with_capacity(core_nodes.len());
+    let mut max_gradient_norm = 0.0_f64;
+    for node in core_nodes {
+        let gradient = node.gradient.unwrap_or_else(|| Array1::zeros(k));
         let grad_norm = gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
         max_gradient_norm = max_gradient_norm.max(grad_norm);
         nodes.push(RhoQuadratureNode {
-            rho,
-            weight,
-            log_weight: log_weight - max_log_weight - total.ln(),
-            cost,
+            rho: node.rho,
+            weight: node.weight,
+            log_weight: node.log_weight,
+            cost: node.cost,
             gradient,
         });
     }
     Ok(RhoQuadratureMixture {
         nodes,
-        effective_sample_size: if sum_sq > 0.0 { 1.0 / sum_sq } else { 0.0 },
+        effective_sample_size,
         max_gradient_norm,
     })
+}
+
+/// Posterior moments of a normalized discrete mixture over `ρ`.
+fn mixture_moments(nodes: &[RhoMixtureNode], k: usize) -> (Array1<f64>, Array2<f64>) {
+    let mut mean = Array1::<f64>::zeros(k);
+    for node in nodes {
+        for i in 0..k {
+            mean[i] += node.weight * node.rho[i];
+        }
+    }
+    let mut covariance = Array2::<f64>::zeros((k, k));
+    for node in nodes {
+        for i in 0..k {
+            let di = node.rho[i] - mean[i];
+            for j in 0..k {
+                covariance[[i, j]] += node.weight * di * (node.rho[j] - mean[j]);
+            }
+        }
+    }
+    (mean, covariance)
+}
+
+/// Tier-1 of the exact marginal-smoothing inference stack (#938): adaptive
+/// Gauss-Hermite quadrature over `ρ` (`K ≤ 4`), criterion-closure form.
+///
+/// The exact outer Hessian at `ρ̂` whitens/scales the grid; each node of the
+/// product rule is reweighted by the exact profiled criterion,
+/// `w_m ∝ exp(−criterion(ρ_m) + criterion(ρ̂)) × GH-weight × exp(½‖z_m‖²)`,
+/// then normalized. The result is `π(ρ|y)` as a discrete mixture of conditional
+/// Gaussians with its moment summary.
+///
+/// * `criterion` — the `OuterObjective::eval_cost` contract (`None` for
+///   infeasible `ρ`, which gets zero weight). Each call is one warm inner
+///   profile solve.
+/// * `nodes_per_axis` — 3 or 5; pass `None` to auto-select (5 for `K ≤ 2`,
+///   3 for `K ≤ 4` — at most 125 criterion evaluations either way).
+pub fn rho_posterior_quadrature<F>(
+    rho_hat: &Array1<f64>,
+    outer_hessian: &Array2<f64>,
+    mut criterion: F,
+    nodes_per_axis: Option<usize>,
+) -> Result<RhoPosteriorMixture, EstimationError>
+where
+    F: FnMut(&Array1<f64>) -> Option<f64>,
+{
+    let k = rho_hat.len();
+    let nodes_per_axis = nodes_per_axis.unwrap_or(if k <= 2 { 5 } else { 3 });
+    let cost_hat = criterion(rho_hat).ok_or_else(|| {
+        EstimationError::RemlOptimizationFailed(
+            "rho_posterior_quadrature: criterion is infeasible at rho_hat itself".to_string(),
+        )
+    })?;
+    let (core_nodes, effective_sample_size) = quadrature_nodes_core(
+        rho_hat,
+        outer_hessian,
+        nodes_per_axis,
+        cost_hat,
+        |rho| Ok(criterion(rho).map(|cost| (cost, None))),
+    )?;
+    let nodes: Vec<RhoMixtureNode> = core_nodes
+        .into_iter()
+        .map(|node| RhoMixtureNode {
+            rho: node.rho,
+            weight: node.weight,
+            log_weight: node.log_weight,
+            cost: node.cost,
+        })
+        .collect();
+    let (mean, covariance) = mixture_moments(&nodes, k);
+    Ok(RhoPosteriorMixture {
+        nodes,
+        mean,
+        covariance,
+        effective_sample_size,
+    })
+}
+
+/// Assemble the mixture-corrected coefficient covariance from a Tier-1 mixture:
+///
+/// `Vβ_marginal = Σ_m w_m [Vb(ρ_m) + (β̂(ρ_m)−β̄)(β̂(ρ_m)−β̄)ᵀ]`,
+/// `β̄ = Σ_m w_m β̂(ρ_m)`
+///
+/// — the law of total expectation/variance over the discrete `π(ρ|y)` mixture,
+/// where each node's conditional is the Gaussian `N(β̂(ρ_m), Vb(ρ_m))` the
+/// engine already produces at fixed `ρ`.
+///
+/// * `conditional` — supplies `(β̂(ρ_m), Vb(ρ_m))` for a node's `ρ_m`. The
+///   caller holding the fit implements this as ONE WARM INNER PROFILE SOLVE per
+///   node (the same inner solve the node's criterion evaluation already ran,
+///   re-run warm-started, plus the conditional covariance assembly); evaluate
+///   nodes in the order given (nearest-to-`ρ̂` first in the GH enumeration) to
+///   keep warm starts effective. Nodes with zero weight are skipped and never
+///   passed to the closure.
+///
+/// When all mixture weight concentrates at `ρ̂`, the spread term vanishes and
+/// the result reduces to `Vb(ρ̂)` exactly.
+pub fn mixture_coefficient_covariance<G>(
+    mixture: &RhoPosteriorMixture,
+    mut conditional: G,
+) -> Result<MixtureCoefficientCovariance, EstimationError>
+where
+    G: FnMut(&Array1<f64>) -> Result<(Array1<f64>, Array2<f64>), EstimationError>,
+{
+    let mut conditionals: Vec<(f64, Array1<f64>, Array2<f64>)> = Vec::new();
+    let mut total_weight = 0.0;
+    for node in &mixture.nodes {
+        if node.weight <= 0.0 {
+            continue;
+        }
+        let (beta, vb) = conditional(&node.rho)?;
+        if vb.nrows() != beta.len() || vb.ncols() != beta.len() {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "mixture_coefficient_covariance: Vb shape {:?} does not match beta length {}",
+                vb.dim(),
+                beta.len()
+            )));
+        }
+        if let Some((_, first_beta, _)) = conditionals.first()
+            && first_beta.len() != beta.len()
+        {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "mixture_coefficient_covariance: inconsistent beta length across nodes"
+                    .to_string(),
+            ));
+        }
+        total_weight += node.weight;
+        conditionals.push((node.weight, beta, vb));
+    }
+    if conditionals.is_empty() || !(total_weight.is_finite() && total_weight > 0.0) {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "mixture_coefficient_covariance: no positive-weight nodes".to_string(),
+        ));
+    }
+    let p = conditionals[0].1.len();
+    let mut beta_bar = Array1::<f64>::zeros(p);
+    for (weight, beta, _) in &conditionals {
+        for i in 0..p {
+            beta_bar[i] += (weight / total_weight) * beta[i];
+        }
+    }
+    let mut covariance = Array2::<f64>::zeros((p, p));
+    for (weight, beta, vb) in &conditionals {
+        let w = weight / total_weight;
+        for i in 0..p {
+            let di = beta[i] - beta_bar[i];
+            for j in 0..p {
+                covariance[[i, j]] += w * (vb[[i, j]] + di * (beta[j] - beta_bar[j]));
+            }
+        }
+    }
+    Ok(MixtureCoefficientCovariance {
+        beta_bar,
+        covariance,
+    })
+}
+
+/// Tier-2 of the exact marginal-smoothing inference stack (#938): NUTS over `ρ`
+/// with the exact profiled gradient, whitened by the exact outer Hessian at
+/// `ρ̂` (the `hmc` module's whitening design reused one level up).
+///
+/// * `criterion_and_grad` — `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`, both EXACT
+///   (the engine's LAML value and ρ-gradient); `None` for infeasible `ρ`. Each
+///   call is one warm inner profile solve + IFT gradient.
+/// * `n_samples` — post-warmup draws per chain (2 chains; warmup is
+///   `max(n_samples/2, 80)`).
+/// * `seed` — deterministic seeding: the seed feeds the same splitmix64 chain /
+///   transition streams as every other NUTS entry point. No clock, no global
+///   RNG: the same `(fit, seed)` yields the same draws every run.
+pub fn rho_posterior_nuts<F>(
+    rho_hat: &Array1<f64>,
+    outer_hessian: &Array2<f64>,
+    criterion_and_grad: F,
+    n_samples: usize,
+    seed: u64,
+) -> Result<RhoPosteriorSamples, EstimationError>
+where
+    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+{
+    let k = rho_hat.len();
+    let config = crate::inference::hmc::NutsConfig {
+        n_samples: n_samples.max(4),
+        nwarmup: (n_samples / 2).max(80),
+        n_chains: 2,
+        target_accept: 0.9,
+        seed,
+    };
+    let result = crate::inference::hmc::run_rho_criterion_nuts(
+        rho_hat.view(),
+        outer_hessian.view(),
+        criterion_and_grad,
+        &config,
+    )
+    .map_err(EstimationError::RemlOptimizationFailed)?;
+
+    let n_draws = result.samples.nrows();
+    if n_draws == 0 {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "rho_posterior_nuts: sampler returned no draws".to_string(),
+        ));
+    }
+    let mean = result.posterior_mean.clone();
+    let mut covariance = Array2::<f64>::zeros((k, k));
+    for row in result.samples.rows() {
+        for i in 0..k {
+            let di = row[i] - mean[i];
+            for j in 0..k {
+                covariance[[i, j]] += di * (row[j] - mean[j]);
+            }
+        }
+    }
+    covariance.mapv_inplace(|v| v / n_draws as f64);
+
+    Ok(RhoPosteriorSamples {
+        samples: result.samples,
+        mean,
+        covariance,
+        rhat: result.rhat,
+        ess: result.ess,
+        converged: result.converged,
+    })
+}
+
+/// The auto-selection seam (#938): given an [`RhoCertificate::Escalate`]
+/// verdict from the Tier-0 certificate, pick and run the escalation tier by
+/// dimension — Tier 1 (deterministic quadrature) for `K ≤ 4`, Tier 2 (NUTS
+/// over `ρ` with the exact profiled gradient) for `K ≤ 16`, and an honest
+/// [`RhoPosteriorEscalation::Unavailable`] beyond that. Magic by default: no
+/// flags, the tier is chosen from the problem.
+///
+/// Both closures evaluate the SAME live objective the fit converged on
+/// (`criterion` = `OuterObjective::eval_cost`, `criterion_and_grad` = value +
+/// exact LAML ρ-gradient); run this while that objective is still alive.
+pub fn escalate_rho_posterior<F, G>(
+    rho_hat: &Array1<f64>,
+    outer_hessian: &Array2<f64>,
+    criterion: F,
+    criterion_and_grad: G,
+) -> RhoPosteriorEscalation
+where
+    F: FnMut(&Array1<f64>) -> Option<f64>,
+    G: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+{
+    let k = rho_hat.len();
+    if k == 0 {
+        return RhoPosteriorEscalation::Unavailable {
+            n_params: 0,
+            reason: "no smoothing parameters to marginalize".to_string(),
+        };
+    }
+    if k <= TIER1_MAX_DIM {
+        match rho_posterior_quadrature(rho_hat, outer_hessian, criterion, None) {
+            Ok(mixture) => RhoPosteriorEscalation::Quadrature(mixture),
+            Err(e) => RhoPosteriorEscalation::Unavailable {
+                n_params: k,
+                reason: format!("tier-1 quadrature failed: {e}"),
+            },
+        }
+    } else if k <= TIER2_MAX_DIM {
+        match rho_posterior_nuts(
+            rho_hat,
+            outer_hessian,
+            criterion_and_grad,
+            ESCALATION_NUTS_SAMPLES,
+            ESCALATION_NUTS_SEED,
+        ) {
+            Ok(samples) => RhoPosteriorEscalation::Nuts(samples),
+            Err(e) => RhoPosteriorEscalation::Unavailable {
+                n_params: k,
+                reason: format!("tier-2 NUTS failed: {e}"),
+            },
+        }
+    } else {
+        RhoPosteriorEscalation::Unavailable {
+            n_params: k,
+            reason: format!(
+                "rho-posterior escalation is unavailable for K={k} > {TIER2_MAX_DIM} smoothing \
+                 parameters; intervals remain plug-in with the first-order V_rho correction"
+            ),
+        }
+    }
 }
 
 /// Compute the Tier-0 PSIS `ρ`-certificate.
