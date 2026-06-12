@@ -1084,6 +1084,1002 @@ impl<'a> GaussianRemlRhoResponse<'a> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Layer 2 — continuous-GLM certified predictor–corrector homotopy in z
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Maximum number of certified continuation sub-steps the homotopy may
+/// spend walking between two consecutive candidates before it gives up and
+/// falls back to a cold deterministic refit. A work budget, not a tuning
+/// knob: exceeding it can only cost SPEED (one extra cold fit), never
+/// correctness — the fallback solves the same KKT system to its optimum.
+const GLM_HOMOTOPY_MAX_SUBSTEPS: usize = 1024;
+
+/// Maximum step halvings per sub-step before the certificate's refusal is
+/// treated as final and the cold-refit fallback fires.
+const GLM_HOMOTOPY_MAX_HALVINGS: usize = 24;
+
+/// Maximum chord-corrector iterations per certified sub-step. With the
+/// contraction constant certified below [`GLM_CONTRACTION_ACCEPT`], the
+/// residual shrinks at least geometrically, so this budget is generous.
+const GLM_CORRECTOR_MAX_ITERS: usize = 80;
+
+/// Maximum damped-Newton iterations for a cold augmented GLM fit.
+const GLM_NEWTON_MAX_ITERS: usize = 200;
+
+/// Maximum Armijo backtracking halvings per cold Newton iteration.
+const GLM_NEWTON_MAX_BACKTRACKS: usize = 60;
+
+/// Tight relative tolerance on the Newton-step norm declaring convergence.
+const GLM_CONVERGENCE_RTOL: f64 = 1e-12;
+
+/// Loose relative tolerance at which a stalled (floating-point-floor)
+/// corrector residual is still accepted; the COMPUTED error bound carried
+/// out of the step uses the actual residual, so accepting a stall is
+/// honest — the bound is simply larger and the downstream margin gate
+/// decides whether a cold refit is needed.
+const GLM_STALL_ACCEPT_RTOL: f64 = 1e-8;
+
+/// Certified contraction constant below which a predictor step is accepted:
+/// `κ < 1/2` makes the chord-corrector a contraction on the ball
+/// `B(β_pred, 2‖H₀⁻¹F(β_pred)‖)`, which then provably contains the root.
+const GLM_CONTRACTION_ACCEPT: f64 = 0.5;
+
+/// Armijo sufficient-decrease constant for the cold-fit line search.
+const GLM_ARMIJO_C1: f64 = 1e-4;
+
+/// `η` location of the extrema of the logistic third derivative
+/// `b‴(η) = σ(1−σ)(1−2σ)`: `σ = (3±√3)/6 ⇔ η = ±ln(2+√3)`.
+const LOGIT_THIRD_DERIV_CRITICAL_ETA: f64 = 1.316_957_896_924_816_6;
+
+#[inline]
+fn vec_norm(v: &Array1<f64>) -> f64 {
+    v.dot(v).sqrt()
+}
+
+#[inline]
+fn softplus(eta: f64) -> f64 {
+    eta.max(0.0) + (-eta.abs()).exp().ln_1p()
+}
+
+/// Canonical-link GLM families supported by the certified z-homotopy
+/// ([`GlmHomotopyFullConformal`]). Canonical links make the candidate
+/// response enter the augmented penalized score LINEARLY (`∂F/∂z = −x_*`),
+/// so the exact response of the augmented optimum to the candidate is the
+/// single solve `dβ̂/dz = H⁻¹ x_*` — no family-specific cross terms. The
+/// per-η derivative tower `b′ = μ`, `b″ = w`, `b‴` is the K=1 specialization
+/// of the row-kernel channels (`row_kernel` Hessian / `row_third_contracted`
+/// in src/families/row_kernel.rs); it is carried analytically here because
+/// the homotopy must evaluate the tower at MOVING β while a `RowKernel`
+/// evaluates at its internally held coefficients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanonicalGlmFamily {
+    /// Bernoulli response, logit link: `b(η) = log(1+eʸ)`, `μ = σ(η)`.
+    BernoulliLogit,
+    /// Poisson response, log link: `b(η) = eʸ`, `μ = eʸ`.
+    PoissonLog,
+}
+
+impl CanonicalGlmFamily {
+    /// `μ(η) = b′(η)` — the canonical mean function.
+    pub fn mean(&self, eta: f64) -> f64 {
+        match self {
+            Self::BernoulliLogit => {
+                if eta >= 0.0 {
+                    1.0 / (1.0 + (-eta).exp())
+                } else {
+                    let e = eta.exp();
+                    e / (1.0 + e)
+                }
+            }
+            Self::PoissonLog => eta.exp(),
+        }
+    }
+
+    /// `w(η) = b″(η)` — the canonical Fisher weight (strictly positive).
+    pub fn weight(&self, eta: f64) -> f64 {
+        match self {
+            Self::BernoulliLogit => {
+                let mu = self.mean(eta);
+                mu * (1.0 - mu)
+            }
+            Self::PoissonLog => eta.exp(),
+        }
+    }
+
+    /// Per-row negative log-likelihood kernel `b(η) − y η` (the y-independent
+    /// normalizer is dropped — it never moves the optimum).
+    fn nll_term(&self, eta: f64, y: f64) -> f64 {
+        match self {
+            Self::BernoulliLogit => softplus(eta) - y * eta,
+            Self::PoissonLog => eta.exp() - y * eta,
+        }
+    }
+
+    /// `sup { b″(η) : η ∈ [lo, hi] }` — COMPUTED interval bound on the
+    /// Fisher weight, used to convert a coefficient-error bound into a
+    /// mean-scale (score) error bound.
+    fn weight_abs_sup(&self, lo: f64, hi: f64) -> f64 {
+        match self {
+            Self::BernoulliLogit => {
+                if lo <= 0.0 && 0.0 <= hi {
+                    0.25
+                } else {
+                    self.weight(lo).max(self.weight(hi))
+                }
+            }
+            Self::PoissonLog => hi.exp(),
+        }
+    }
+
+    /// `sup { |b‴(η)| : η ∈ [lo, hi] }` — COMPUTED interval bound on the
+    /// third-derivative channel (the K=1 `row_third_contracted` value). The
+    /// logistic case checks the interval endpoints and the two interior
+    /// critical points `η = ±ln(2+√3)` where `|b‴|` attains its global
+    /// maximum `1/(6√3)`; the Poisson case is monotone (`b‴ = eʸ`).
+    fn third_abs_sup(&self, lo: f64, hi: f64) -> f64 {
+        match self {
+            Self::BernoulliLogit => {
+                let t = |eta: f64| {
+                    let mu = self.mean(eta);
+                    (mu * (1.0 - mu) * (1.0 - 2.0 * mu)).abs()
+                };
+                let mut sup = t(lo).max(t(hi));
+                for c in [-LOGIT_THIRD_DERIV_CRITICAL_ETA, LOGIT_THIRD_DERIV_CRITICAL_ETA] {
+                    if lo <= c && c <= hi {
+                        sup = sup.max(t(c));
+                    }
+                }
+                sup
+            }
+            Self::PoissonLog => hi.exp(),
+        }
+    }
+
+    /// Reject a training response outside the family's support — fitting a
+    /// canonical GLM to an impossible response is a caller bug, not a
+    /// numerical regime.
+    fn validate_training_response(&self, y: f64, row: usize) -> Result<(), String> {
+        if !y.is_finite() {
+            return Err(format!("glm homotopy: non-finite response at row {row}"));
+        }
+        match self {
+            Self::BernoulliLogit => {
+                if !(0.0..=1.0).contains(&y) {
+                    return Err(format!(
+                        "glm homotopy: Bernoulli response must lie in [0, 1], got {y} at row {row}"
+                    ));
+                }
+            }
+            Self::PoissonLog => {
+                if y < 0.0 {
+                    return Err(format!(
+                        "glm homotopy: Poisson response must be non-negative, got {y} at row {row}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject a conformal candidate outside the family's response support —
+    /// the full-conformal set is a subset of the support by definition.
+    fn validate_candidate(&self, z: f64) -> Result<(), String> {
+        if !z.is_finite() {
+            return Err(format!("glm homotopy: non-finite candidate {z}"));
+        }
+        match self {
+            Self::BernoulliLogit => {
+                if !(0.0..=1.0).contains(&z) {
+                    return Err(format!(
+                        "glm homotopy: Bernoulli candidate must lie in [0, 1], got {z}"
+                    ));
+                }
+            }
+            Self::PoissonLog => {
+                if z < 0.0 {
+                    return Err(format!(
+                        "glm homotopy: Poisson candidate must be non-negative, got {z}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One candidate's verdict together with the tracked coefficients and the
+/// COMPUTED bound on their distance to the exact augmented optimum.
+#[derive(Clone, Debug)]
+pub struct GlmHomotopyCandidate {
+    pub z: f64,
+    /// Conformal p-value `(1 + #{i ≤ n : e_i ≥ e_*}) / (n+1)` (ties count
+    /// FOR the candidate — the conservative `≥` convention shared with the
+    /// discrete enumeration arm).
+    pub p_value: f64,
+    pub member: bool,
+    /// The coefficients the verdict was computed from: the homotopy-tracked
+    /// β̂(z) (chord-corrected to the augmented KKT root) or a cold refit.
+    pub beta: Array1<f64>,
+    /// Certified bound on `‖beta − β̂(z)‖₂` (distance to the EXACT augmented
+    /// optimum), computed from the chord-contraction constant: with
+    /// `r = ‖H₀⁻¹F(beta)‖` and certified `κ < ½` on `B(beta, 2r)`, the root
+    /// lies in that ball and `‖beta − β̂(z)‖ ≤ r/(1−κ)`. `+∞` when the
+    /// certificate refuses (the membership gate then forces a cold refit or
+    /// reports the tie unresolved — never a silent guess).
+    pub beta_error_bound: f64,
+    /// Whether this candidate was decided from a cold deterministic refit
+    /// (first candidate, certificate refusal, or margin-forced refit)
+    /// rather than the tracked path.
+    pub cold_refit: bool,
+}
+
+/// The exact full-conformal set for a canonical-link GLM, assembled by the
+/// certified predictor–corrector homotopy with cold-refit fallback.
+#[derive(Clone, Debug)]
+pub struct GlmHomotopyConformalSet {
+    /// Retained candidates, ascending.
+    pub members: Vec<f64>,
+    pub candidates: Vec<GlmHomotopyCandidate>,
+    pub alpha: f64,
+    /// `n + 1`.
+    pub n_augmented: usize,
+    /// Number of candidate transitions where the step certificate refused
+    /// (third-order bound too large within the halving/sub-step budget) and
+    /// the engine fell back to a cold deterministic refit.
+    pub refit_fallbacks: usize,
+    /// Number of cold refits forced by the MEMBERSHIP margin gate: the
+    /// tracked solution was certified, but a rank comparison was decided by
+    /// a margin smaller than the propagated score-error bound, so the
+    /// engine refused to call it from the tracked path.
+    pub margin_refits: usize,
+    /// Number of candidates whose verdict remained margin-ambiguous even
+    /// after a cold refit (a genuine floating-point-level score tie). The
+    /// reported verdict then uses the conservative `≥` tie convention — the
+    /// direction that can only over-cover, never under-cover.
+    pub ties_unresolved: usize,
+    /// Largest certified `‖beta − β̂(z)‖` bound over all reported candidates.
+    pub max_beta_error_bound: f64,
+}
+
+struct GlmCandidateVerdict {
+    p_value: f64,
+    member: bool,
+    decided: bool,
+}
+
+/// Certified predictor–corrector homotopy in the candidate response `z` for
+/// canonical-link GLMs (#942 Layer 2, continuous arm).
+///
+/// # The path being tracked
+///
+/// `β̂(z)` solves the augmented penalized score equation
+///
+/// ```text
+///   F(β; z) = Σᵢ xᵢ (μ(ηᵢ) − yᵢ) + x_* (μ(η_*) − z) + Sλ β = 0 ,
+/// ```
+///
+/// which for a canonical link is the gradient of a STRICTLY convex objective
+/// (Fisher weights `b″ > 0`, `Sλ ⪰ 0`, `H` required SPD), so the root is
+/// unique — there is no basin-tracking failure mode and the homotopy can be
+/// wrong only about SPEED, never about the answer. Since `∂F/∂z = −x_*`,
+///
+/// ```text
+///   dβ̂/dz = H(β̂)⁻¹ x_* ,   H(β) = XᵀW(β)X + w_*(β) x_*x_*ᵀ + Sλ .
+/// ```
+///
+/// # The certified step
+///
+/// From a corrected point `β₀` at `z` with factored `H₀ = H(β₀)`:
+///
+/// 1. **Predictor:** `β_pred = β₀ + h·H₀⁻¹x_*`.
+/// 2. **Certificate:** the corrector is the chord iteration
+///    `β ← β − H₀⁻¹F(β; z+h)` on the already-factored `H₀`. Its contraction
+///    constant on the ball `B(β_pred, R)`, `R = 2‖H₀⁻¹F(β_pred)‖`, is
+///    bounded by the COMPUTED quantity
+///
+///    ```text
+///      κ = [ Σᵢ Tᵢ·devᵢ·‖xᵢ‖² + T_*·dev_*·‖x_*‖² ] / λ_min(H₀) ,
+///      devᵢ = |h·xᵢᵀH₀⁻¹x_*| + ‖xᵢ‖·R ,
+///      Tᵢ   = sup |b‴| over [ηᵢ(β₀) − devᵢ , ηᵢ(β₀) + devᵢ]
+///    ```
+///
+///    (`‖H(β)−H₀‖₂ ≤ Σᵢ |wᵢ(β)−wᵢ(β₀)|·‖xᵢ‖²` and `|Δwᵢ| ≤ Tᵢ·|Δηᵢ|` —
+///    the third-derivative tower bounding the Hessian's Lipschitz drift,
+///    exactly the `row_third_contracted` channel evaluated as an interval
+///    bound). `κ < ½` makes the chord map a contraction of `B(β_pred, R)`
+///    into itself, so the (unique) root lies in the ball and the corrector
+///    converges to it geometrically.
+/// 3. **Refusal:** `κ ≥ ½` halves `h`; exhausting the halving or sub-step
+///    budget abandons the path for this transition and falls back to a COLD
+///    deterministic refit — the homotopy is only an acceleration of the
+///    defined symmetric fitting map, never a redefinition of it.
+/// 4. **Carried bound:** at acceptance the distance to the exact root is
+///    bounded by the computed `r/(1−κ_f)` with `r` the final corrector
+///    residual and `κ_f` re-evaluated at the final iterate.
+///
+/// # Membership with a margin gate
+///
+/// Scores are response-scale absolute residuals. The β-error bound
+/// propagates to each score through the computed interval weight bound
+/// (`|Δμᵢ| ≤ sup b″·‖xᵢ‖·bound`); a rank comparison decided by a margin
+/// smaller than the joint perturbation is NOT trusted: the engine cold-refits
+/// and re-decides, and if the tie survives the refit it applies the
+/// conservative `≥` convention and reports it in `ties_unresolved`.
+/// Exact-or-refuse, end to end.
+///
+/// ρ is frozen at the supplied `s_lambda` by construction — the honest
+/// smoothing re-selection and its certificate are Layer 3's domain.
+pub struct GlmHomotopyFullConformal<'a> {
+    family: CanonicalGlmFamily,
+    x: &'a Array2<f64>,
+    y: &'a Array1<f64>,
+    s_lambda: &'a Array2<f64>,
+    x_star: &'a Array1<f64>,
+    n: usize,
+    p: usize,
+    /// `‖xᵢ‖₂` per training row.
+    row_norm: Array1<f64>,
+    /// `‖xᵢ‖₂²` per training row.
+    row_sq: Array1<f64>,
+    star_norm: f64,
+    star_sq: f64,
+}
+
+impl<'a> GlmHomotopyFullConformal<'a> {
+    /// Build the engine. Rejects non-unit prior weights for the same reason
+    /// as [`ExactGaussianFullConformal::new`]: a reweighted training row is
+    /// not exchangeable with the test row, so the coverage proof would not
+    /// apply.
+    pub fn new(
+        family: CanonicalGlmFamily,
+        x: &'a Array2<f64>,
+        y: &'a Array1<f64>,
+        prior_weights: &Array1<f64>,
+        s_lambda: &'a Array2<f64>,
+        x_star: &'a Array1<f64>,
+    ) -> Result<Self, String> {
+        let n = x.nrows();
+        let p = x.ncols();
+        if y.len() != n || prior_weights.len() != n {
+            return Err("glm homotopy: row-count mismatch".to_string());
+        }
+        if s_lambda.nrows() != p || s_lambda.ncols() != p || x_star.len() != p {
+            return Err("glm homotopy: column-count mismatch".to_string());
+        }
+        if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
+            return Err(
+                "glm homotopy full conformal requires unit prior weights: a reweighted \
+                 training row is not exchangeable with the test row, so the finite-sample \
+                 coverage proof does not apply; use the split/ALO conformal calibrator instead"
+                    .to_string(),
+            );
+        }
+        for (i, &yi) in y.iter().enumerate() {
+            family.validate_training_response(yi, i)?;
+        }
+        let mut row_norm = Array1::<f64>::zeros(n);
+        let mut row_sq = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let sq = x.row(i).dot(&x.row(i));
+            row_sq[i] = sq;
+            row_norm[i] = sq.sqrt();
+        }
+        let star_sq = x_star.dot(x_star);
+        Ok(Self {
+            family,
+            x,
+            y,
+            s_lambda,
+            x_star,
+            n,
+            p,
+            row_norm,
+            row_sq,
+            star_norm: star_sq.sqrt(),
+            star_sq,
+        })
+    }
+
+    /// Augmented penalized score `F(β; z)`.
+    fn penalized_score(&self, beta: &Array1<f64>, z: f64) -> Array1<f64> {
+        let eta = fast_av(self.x, beta);
+        let mut resid = Array1::<f64>::zeros(self.n);
+        for i in 0..self.n {
+            resid[i] = self.family.mean(eta[i]) - self.y[i];
+        }
+        let mut g = self.x.t().dot(&resid) + self.s_lambda.dot(beta);
+        let r_star = self.family.mean(self.x_star.dot(beta)) - z;
+        for j in 0..self.p {
+            g[j] += self.x_star[j] * r_star;
+        }
+        g
+    }
+
+    /// Augmented penalized NLL (line-search merit function).
+    fn penalized_nll(&self, beta: &Array1<f64>, z: f64) -> f64 {
+        let eta = fast_av(self.x, beta);
+        let mut nll = 0.0;
+        for i in 0..self.n {
+            nll += self.family.nll_term(eta[i], self.y[i]);
+        }
+        nll += self.family.nll_term(self.x_star.dot(beta), z);
+        nll + 0.5 * beta.dot(&self.s_lambda.dot(beta))
+    }
+
+    /// Augmented penalized Hessian `H(β)` (independent of `z` — the
+    /// candidate enters the score linearly under a canonical link).
+    fn penalized_hessian(&self, beta: &Array1<f64>) -> Array2<f64> {
+        let eta = fast_av(self.x, beta);
+        let mut xw = self.x.to_owned();
+        for i in 0..self.n {
+            let w = self.family.weight(eta[i]);
+            for j in 0..self.p {
+                xw[[i, j]] *= w;
+            }
+        }
+        let mut h = self.x.t().dot(&xw) + self.s_lambda;
+        let w_star = self.family.weight(self.x_star.dot(beta));
+        for a in 0..self.p {
+            for b in 0..self.p {
+                h[[a, b]] += w_star * self.x_star[a] * self.x_star[b];
+            }
+        }
+        h
+    }
+
+    /// The COMPUTED chord-contraction constant `κ` of the module doc: the
+    /// Lipschitz drift of `H` over the stated η-intervals (per-row third
+    /// derivative interval sups), divided by `λ_min(H₀)`. `shift[i]` is the
+    /// known η-displacement of row i between the factorization point and the
+    /// ball center; `radius` the coefficient-space ball radius around it.
+    fn contraction_kappa(
+        &self,
+        eta0: &Array1<f64>,
+        eta0_star: f64,
+        shift: &Array1<f64>,
+        shift_star: f64,
+        radius: f64,
+        lambda_min: f64,
+    ) -> f64 {
+        let mut drift = 0.0_f64;
+        for i in 0..self.n {
+            let dev = shift[i] + self.row_norm[i] * radius;
+            let t_sup = self.family.third_abs_sup(eta0[i] - dev, eta0[i] + dev);
+            drift += t_sup * dev * self.row_sq[i];
+        }
+        let dev_star = shift_star + self.star_norm * radius;
+        drift += self
+            .family
+            .third_abs_sup(eta0_star - dev_star, eta0_star + dev_star)
+            * dev_star
+            * self.star_sq;
+        drift / lambda_min
+    }
+
+    /// Certified bound on `‖beta − β̂(z)‖` at a claimed optimum: fresh
+    /// factorization, one residual solve, contraction certificate on the
+    /// ball `B(beta, 2r)`. `+∞` on refusal — never an assumed zero.
+    fn stationary_error_bound(&self, beta: &Array1<f64>, z: f64) -> f64 {
+        let hess = self.penalized_hessian(beta);
+        let Ok(eigs) = hess.eigh(Side::Lower) else {
+            return f64::INFINITY;
+        };
+        let lambda_min = eigs.0.iter().copied().fold(f64::INFINITY, f64::min);
+        if !(lambda_min > 0.0) {
+            return f64::INFINITY;
+        }
+        let Ok(chol) = hess.cholesky(Side::Lower) else {
+            return f64::INFINITY;
+        };
+        let r0 = vec_norm(&chol.solvevec(&self.penalized_score(beta, z)));
+        let eta0 = fast_av(self.x, beta);
+        let eta0_star = self.x_star.dot(beta);
+        let zero_shift = Array1::<f64>::zeros(self.n);
+        let kappa =
+            self.contraction_kappa(&eta0, eta0_star, &zero_shift, 0.0, 2.0 * r0, lambda_min);
+        if kappa.is_finite() && kappa < GLM_CONTRACTION_ACCEPT {
+            r0 / (1.0 - kappa)
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// Cold deterministic fit of the augmented problem at candidate `z`:
+    /// damped Newton (full refactorization per iteration, Armijo
+    /// backtracking on the convex penalized NLL) from `init`, run to the
+    /// tight step tolerance. Returns the solution and its certified error
+    /// bound. This IS the defined symmetric fitting map — the homotopy is
+    /// only an acceleration of it.
+    fn cold_fit(&self, z: f64, init: Array1<f64>) -> Result<(Array1<f64>, f64), String> {
+        let mut beta = init;
+        let mut nll = self.penalized_nll(&beta, z);
+        if !nll.is_finite() {
+            beta = Array1::<f64>::zeros(self.p);
+            nll = self.penalized_nll(&beta, z);
+        }
+        let mut converged = false;
+        for _ in 0..GLM_NEWTON_MAX_ITERS {
+            let g = self.penalized_score(&beta, z);
+            let hess = self.penalized_hessian(&beta);
+            let chol = hess
+                .cholesky(Side::Lower)
+                .map_err(|e| format!("glm homotopy: augmented Hessian not SPD at z={z}: {e:?}"))?;
+            let step = chol.solvevec(&g);
+            let step_norm = vec_norm(&step);
+            if step_norm <= GLM_CONVERGENCE_RTOL * (1.0 + vec_norm(&beta)) {
+                converged = true;
+                break;
+            }
+            // gᵀH⁻¹g ≥ 0: the Newton direction is a descent direction.
+            let decrease = g.dot(&step);
+            let mut t = 1.0_f64;
+            let mut accepted = false;
+            for _ in 0..GLM_NEWTON_MAX_BACKTRACKS {
+                let mut cand = beta.clone();
+                cand.scaled_add(-t, &step);
+                let cand_nll = self.penalized_nll(&cand, z);
+                if cand_nll.is_finite() && cand_nll <= nll - GLM_ARMIJO_C1 * t * decrease {
+                    beta = cand;
+                    nll = cand_nll;
+                    accepted = true;
+                    break;
+                }
+                t *= 0.5;
+            }
+            if !accepted {
+                return Err(format!(
+                    "glm homotopy: cold-fit line search failed at z={z} (step norm {step_norm})"
+                ));
+            }
+        }
+        if !converged {
+            // The loop may exit by budget with the last step still above the
+            // tight tolerance; re-check once after the final accepted step.
+            let g = self.penalized_score(&beta, z);
+            let hess = self.penalized_hessian(&beta);
+            let chol = hess
+                .cholesky(Side::Lower)
+                .map_err(|e| format!("glm homotopy: augmented Hessian not SPD at z={z}: {e:?}"))?;
+            let step_norm = vec_norm(&chol.solvevec(&g));
+            if step_norm > GLM_STALL_ACCEPT_RTOL * (1.0 + vec_norm(&beta)) {
+                return Err(format!(
+                    "glm homotopy: cold fit did not converge at z={z} (residual {step_norm})"
+                ));
+            }
+        }
+        let bound = self.stationary_error_bound(&beta, z);
+        Ok((beta, bound))
+    }
+
+    /// Walk the corrected path from `z_from` (where `beta` solves the
+    /// augmented KKT system) to `z_to` via certified predictor–corrector
+    /// sub-steps. On success `beta` holds the corrected solution at `z_to`
+    /// and the certified `‖beta − β̂(z_to)‖` bound is returned. `None` is a
+    /// certified REFUSAL (budget exhausted, certificate never below ½, or a
+    /// factorization failure) — the caller falls back to a cold refit; the
+    /// refusal can cost speed only, never correctness.
+    fn track(&self, beta: &mut Array1<f64>, z_from: f64, z_to: f64) -> Option<f64> {
+        let mut z = z_from;
+        let mut h = z_to - z_from;
+        let mut arrival_bound = f64::INFINITY;
+        for _ in 0..GLM_HOMOTOPY_MAX_SUBSTEPS {
+            let remaining = z_to - z;
+            if remaining <= 0.0 {
+                return Some(arrival_bound);
+            }
+            h = h.min(remaining);
+            let hess = self.penalized_hessian(beta);
+            let lambda_min = hess
+                .eigh(Side::Lower)
+                .ok()?
+                .0
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min);
+            if !(lambda_min > 0.0) {
+                return None;
+            }
+            let chol = hess.cholesky(Side::Lower).ok()?;
+            let b_dir = chol.solvevec(self.x_star);
+            let eta0 = fast_av(self.x, beta);
+            let eta0_star = self.x_star.dot(beta);
+            let xb = fast_av(self.x, &b_dir);
+            let xb_star = self.x_star.dot(&b_dir);
+
+            let mut accepted = false;
+            for _ in 0..=GLM_HOMOTOPY_MAX_HALVINGS {
+                let h_eff = h.min(z_to - z);
+                let z_new = if h_eff >= z_to - z { z_to } else { z + h_eff };
+                let mut beta_pred = beta.clone();
+                beta_pred.scaled_add(h_eff, &b_dir);
+                let s0 = chol.solvevec(&self.penalized_score(&beta_pred, z_new));
+                let r0 = vec_norm(&s0);
+                let radius = 2.0 * r0;
+                let shift = xb.mapv(|t| (h_eff * t).abs());
+                let kappa = self.contraction_kappa(
+                    &eta0,
+                    eta0_star,
+                    &shift,
+                    (h_eff * xb_star).abs(),
+                    radius,
+                    lambda_min,
+                );
+                if kappa.is_finite() && kappa < GLM_CONTRACTION_ACCEPT {
+                    // Chord corrector on the already-factored H₀: certified
+                    // geometric contraction toward the unique root.
+                    let mut bcur = beta_pred;
+                    let mut step = s0;
+                    let mut r = r0;
+                    for _ in 0..GLM_CORRECTOR_MAX_ITERS {
+                        if r <= GLM_CONVERGENCE_RTOL * (1.0 + vec_norm(&bcur)) {
+                            break;
+                        }
+                        let mut next = bcur.clone();
+                        next.scaled_add(-1.0, &step);
+                        let next_step = chol.solvevec(&self.penalized_score(&next, z_new));
+                        let r_next = vec_norm(&next_step);
+                        if !(r_next < r) {
+                            // Floating-point floor: stop here; acceptance is
+                            // decided by the residual level below.
+                            break;
+                        }
+                        bcur = next;
+                        step = next_step;
+                        r = r_next;
+                    }
+                    if r <= GLM_STALL_ACCEPT_RTOL * (1.0 + vec_norm(&bcur)) {
+                        // Re-certify at the final iterate and carry the
+                        // COMPUTED distance-to-root bound.
+                        let mut diff = bcur.clone();
+                        diff.scaled_add(-1.0, beta);
+                        let shift_fin = fast_av(self.x, &diff).mapv(f64::abs);
+                        let kappa_fin = self.contraction_kappa(
+                            &eta0,
+                            eta0_star,
+                            &shift_fin,
+                            self.x_star.dot(&diff).abs(),
+                            2.0 * r,
+                            lambda_min,
+                        );
+                        if kappa_fin.is_finite() && kappa_fin < GLM_CONTRACTION_ACCEPT {
+                            arrival_bound = r / (1.0 - kappa_fin);
+                            *beta = bcur;
+                            z = z_new;
+                            // Grow the trial step on an easy acceptance.
+                            h = 2.0 * h_eff;
+                            accepted = true;
+                            break;
+                        }
+                    }
+                }
+                h = 0.5 * h_eff;
+                if !(h > 0.0) {
+                    return None;
+                }
+            }
+            if !accepted {
+                return None;
+            }
+        }
+        if z_to - z <= 0.0 {
+            Some(arrival_bound)
+        } else {
+            None
+        }
+    }
+
+    /// Propagated score-error bound for one row: `|Δe| ≤ |Δμ| ≤
+    /// sup b″ · ‖x‖ · bound`, with the weight sup COMPUTED over the η-interval
+    /// the coefficient ball can reach.
+    fn score_delta(&self, eta: f64, x_norm: f64, beta_error_bound: f64) -> f64 {
+        if beta_error_bound == 0.0 {
+            return 0.0;
+        }
+        if !beta_error_bound.is_finite() {
+            return f64::INFINITY;
+        }
+        let dev = x_norm * beta_error_bound;
+        self.family.weight_abs_sup(eta - dev, eta + dev) * dev
+    }
+
+    /// Rank the candidate with the margin gate: `decided` is true iff every
+    /// possible score perturbation within the certified bound leaves the
+    /// membership verdict unchanged.
+    fn candidate_verdict(
+        &self,
+        z: f64,
+        alpha: f64,
+        beta: &Array1<f64>,
+        beta_error_bound: f64,
+    ) -> GlmCandidateVerdict {
+        let eta = fast_av(self.x, beta);
+        let eta_star = self.x_star.dot(beta);
+        let e_star = (z - self.family.mean(eta_star)).abs();
+        let delta_star = self.score_delta(eta_star, self.star_norm, beta_error_bound);
+        let mut count = 0usize;
+        let mut count_certain = 0usize;
+        let mut count_possible = 0usize;
+        for i in 0..self.n {
+            let e_i = (self.y[i] - self.family.mean(eta[i])).abs();
+            let tol = self.score_delta(eta[i], self.row_norm[i], beta_error_bound) + delta_star;
+            let gap = e_i - e_star;
+            if gap >= 0.0 {
+                count += 1;
+            }
+            if gap >= tol {
+                count_certain += 1;
+            }
+            if gap >= -tol {
+                count_possible += 1;
+            }
+        }
+        let n1 = (self.n + 1) as f64;
+        let member = (1.0 + count as f64) > alpha * n1;
+        let member_lo = (1.0 + count_certain as f64) > alpha * n1;
+        let member_hi = (1.0 + count_possible as f64) > alpha * n1;
+        GlmCandidateVerdict {
+            p_value: (1.0 + count as f64) / n1,
+            member,
+            decided: member_lo == member_hi,
+        }
+    }
+
+    /// Assemble the exact full-conformal set over the (strictly increasing)
+    /// candidate list: cold fit at the first candidate, certified homotopy
+    /// tracking between consecutive candidates with cold-refit fallback on
+    /// certificate refusal, and the margin gate on every verdict.
+    pub fn prediction_set(
+        &self,
+        candidates: &[f64],
+        alpha: f64,
+    ) -> Result<GlmHomotopyConformalSet, String> {
+        if candidates.is_empty() {
+            return Err("glm homotopy: empty candidate list".to_string());
+        }
+        if !(0.0..1.0).contains(&alpha) {
+            return Err(format!("glm homotopy: alpha must be in [0, 1), got {alpha}"));
+        }
+        if candidates.windows(2).any(|w| !(w[0] < w[1])) {
+            return Err("glm homotopy: candidates must be strictly increasing".to_string());
+        }
+        for &z in candidates {
+            self.family.validate_candidate(z)?;
+        }
+
+        let (mut beta, mut bound) = self.cold_fit(candidates[0], Array1::<f64>::zeros(self.p))?;
+        let mut out: Vec<GlmHomotopyCandidate> = Vec::with_capacity(candidates.len());
+        let mut members: Vec<f64> = Vec::new();
+        let mut refit_fallbacks = 0usize;
+        let mut margin_refits = 0usize;
+        let mut ties_unresolved = 0usize;
+        let mut max_bound = 0.0_f64;
+        let mut prev_z = candidates[0];
+        for (idx, &z) in candidates.iter().enumerate() {
+            let mut cold = idx == 0;
+            if idx > 0 {
+                match self.track(&mut beta, prev_z, z) {
+                    Some(b) => bound = b,
+                    None => {
+                        let (refit_beta, refit_bound) = self.cold_fit(z, beta.clone())?;
+                        beta = refit_beta;
+                        bound = refit_bound;
+                        refit_fallbacks += 1;
+                        cold = true;
+                    }
+                }
+            }
+            let mut verdict = self.candidate_verdict(z, alpha, &beta, bound);
+            if !verdict.decided && !cold {
+                let (refit_beta, refit_bound) = self.cold_fit(z, beta.clone())?;
+                beta = refit_beta;
+                bound = refit_bound;
+                cold = true;
+                margin_refits += 1;
+                verdict = self.candidate_verdict(z, alpha, &beta, bound);
+            }
+            if !verdict.decided {
+                ties_unresolved += 1;
+            }
+            if bound.is_finite() {
+                max_bound = max_bound.max(bound);
+            } else {
+                max_bound = f64::INFINITY;
+            }
+            if verdict.member {
+                members.push(z);
+            }
+            out.push(GlmHomotopyCandidate {
+                z,
+                p_value: verdict.p_value,
+                member: verdict.member,
+                beta: beta.clone(),
+                beta_error_bound: bound,
+                cold_refit: cold,
+            });
+            prev_z = z;
+        }
+        Ok(GlmHomotopyConformalSet {
+            members,
+            candidates: out,
+            alpha,
+            n_augmented: self.n + 1,
+            refit_fallbacks,
+            margin_refits,
+            ties_unresolved,
+            max_beta_error_bound: max_bound,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Jackknife+ / CV+ (Barber, Candès, Ramdas & Tibshirani 2021)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A jackknife+ (or CV+) prediction interval at miscoverage `α`, with the
+/// honest ±∞ convention of the split-conformal calibrator: when `n` is too
+/// small for the required order statistic to exist, the corresponding
+/// endpoint is infinite rather than silently clipped.
+#[derive(Clone, Copy, Debug)]
+pub struct JackknifePlusInterval {
+    pub lo: f64,
+    pub hi: f64,
+    pub alpha: f64,
+    /// Number of leave-one-out (or out-of-fold) residual/prediction pairs.
+    pub n: usize,
+}
+
+impl JackknifePlusInterval {
+    /// Whether both endpoints are finite (enough points to certify the
+    /// requested level).
+    pub fn certifies_finite(&self) -> bool {
+        self.lo.is_finite() && self.hi.is_finite()
+    }
+}
+
+/// The jackknife+ interval assembly of Barber et al. (2021), exact order
+/// statistics:
+///
+/// ```text
+///   Ĉ_α = [ q̂⁻_α { μ̂₋ᵢ(x_*) − Rᵢ } ,  q̂⁺_α { μ̂₋ᵢ(x_*) + Rᵢ } ]
+/// ```
+///
+/// where `Rᵢ = |yᵢ − μ̂₋ᵢ(xᵢ)|` are the leave-one-out absolute residuals,
+/// `q̂⁺_α` is the `⌈(1−α)(n+1)⌉`-th smallest value (1-based; `+∞` when that
+/// rank exceeds `n`), and `q̂⁻_α` the `⌊α(n+1)⌋`-th smallest (`−∞` when that
+/// rank is below 1). Guarantee: `P(Y_* ∈ Ĉ_α) ≥ 1 − 2α` for exchangeable
+/// data and a symmetric fitting map — no model correctness assumed.
+///
+/// The CV+ variant is THIS SAME assembly fed with K-fold out-of-fold
+/// quantities (`μ̂₋ₖ₍ᵢ₎(x_*)` and `Rᵢ = |yᵢ − μ̂₋ₖ₍ᵢ₎(xᵢ)|`); the construction
+/// and the guarantee are identical (Barber et al. 2021, Thm 4), so no second
+/// code path exists to drift.
+pub fn jackknife_plus_interval(
+    loo_test_predictions: &Array1<f64>,
+    loo_abs_residuals: &Array1<f64>,
+    alpha: f64,
+) -> Result<JackknifePlusInterval, String> {
+    let n = loo_test_predictions.len();
+    if n == 0 {
+        return Err("jackknife+: empty leave-one-out inputs".to_string());
+    }
+    if loo_abs_residuals.len() != n {
+        return Err(format!(
+            "jackknife+: {} predictions but {} residuals",
+            n,
+            loo_abs_residuals.len()
+        ));
+    }
+    if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
+        return Err(format!("jackknife+: alpha must be in (0, 1), got {alpha}"));
+    }
+    for (i, (&m, &r)) in loo_test_predictions
+        .iter()
+        .zip(loo_abs_residuals.iter())
+        .enumerate()
+    {
+        if !m.is_finite() {
+            return Err(format!("jackknife+: non-finite LOO prediction at index {i}"));
+        }
+        if !(r.is_finite() && r >= 0.0) {
+            return Err(format!(
+                "jackknife+: LOO residual at index {i} must be finite and non-negative, got {r}"
+            ));
+        }
+    }
+    let n1 = (n + 1) as f64;
+    let rank_hi = (n1 * (1.0 - alpha)).ceil() as usize;
+    let rank_lo = (n1 * alpha).floor() as usize;
+    let hi = if rank_hi > n {
+        f64::INFINITY
+    } else {
+        let mut upper: Vec<f64> = (0..n)
+            .map(|i| loo_test_predictions[i] + loo_abs_residuals[i])
+            .collect();
+        upper.sort_by(|a, b| a.partial_cmp(b).expect("finite jackknife+ endpoints"));
+        upper[rank_hi - 1]
+    };
+    let lo = if rank_lo < 1 {
+        f64::NEG_INFINITY
+    } else {
+        let mut lower: Vec<f64> = (0..n)
+            .map(|i| loo_test_predictions[i] - loo_abs_residuals[i])
+            .collect();
+        lower.sort_by(|a, b| a.partial_cmp(b).expect("finite jackknife+ endpoints"));
+        lower[rank_lo - 1]
+    };
+    Ok(JackknifePlusInterval { lo, hi, alpha, n })
+}
+
+/// EXACT jackknife+ for the penalized Gaussian-identity fit at frozen `Sλ`,
+/// with the leave-one-out quantities computed in closed form (no refits):
+/// the LOO fit is a rank-one Sherman–Morrison downdate of the single
+/// factored normal matrix `M = XᵀX + Sλ`, so
+///
+/// ```text
+///   rᵢ = yᵢ − xᵢᵀβ̂ ,  hᵢ = xᵢᵀM⁻¹xᵢ ,
+///   Rᵢ = |rᵢ| / (1 − hᵢ) ,                    (exact LOO residual)
+///   μ̂₋ᵢ(x_*) = x_*ᵀβ̂ − (x_*ᵀM⁻¹xᵢ)·rᵢ/(1 − hᵢ)   (exact LOO test prediction)
+/// ```
+///
+/// — the same factored-Hessian leave-one-out algebra the ALO module
+/// (src/inference/alo.rs) applies on the working-response scale, specialized
+/// here to the Gaussian-identity case where it is exact rather than
+/// approximate. Unit prior weights are required for the exchangeability
+/// guarantee, as everywhere in this module.
+pub fn gaussian_jackknife_plus(
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    prior_weights: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+    x_star: &Array1<f64>,
+    alpha: f64,
+) -> Result<JackknifePlusInterval, String> {
+    let n = x.nrows();
+    let p = x.ncols();
+    if y.len() != n || prior_weights.len() != n {
+        return Err("gaussian jackknife+: row-count mismatch".to_string());
+    }
+    if s_lambda.nrows() != p || s_lambda.ncols() != p || x_star.len() != p {
+        return Err("gaussian jackknife+: column-count mismatch".to_string());
+    }
+    if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
+        return Err(
+            "gaussian jackknife+ requires unit prior weights: a reweighted training row \
+             is not exchangeable with the test row, so the finite-sample coverage proof \
+             does not apply"
+                .to_string(),
+        );
+    }
+    let m = x.t().dot(x) + s_lambda;
+    let chol = m
+        .cholesky(Side::Lower)
+        .map_err(|e| format!("gaussian jackknife+: normal matrix not SPD: {e:?}"))?;
+    let beta = chol.solvevec(&x.t().dot(y));
+    let mu = fast_av(x, &beta);
+    let mu_star = x_star.dot(&beta);
+    let b = chol.solvevec(x_star);
+    let xt = x.t().as_standard_layout().into_owned();
+    let minv_xt = chol.solve_mat(&xt);
+    let mut loo_preds = Array1::<f64>::zeros(n);
+    let mut loo_resids = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let h_i = x.row(i).dot(&minv_xt.column(i));
+        let one_minus_h = 1.0 - h_i;
+        if !(one_minus_h > 1e-10) {
+            return Err(format!(
+                "gaussian jackknife+: leverage hᵢ = {h_i} at row {i} leaves no leave-one-out \
+                 information (1 − hᵢ ≤ 1e-10); the rank-one downdate is exact only for hᵢ < 1"
+            ));
+        }
+        let r_i = y[i] - mu[i];
+        let c_i = x.row(i).dot(&b); // x_*ᵀ M⁻¹ xᵢ by symmetry
+        loo_resids[i] = (r_i / one_minus_h).abs();
+        loo_preds[i] = mu_star - c_i * r_i / one_minus_h;
+    }
+    jackknife_plus_interval(&loo_preds, &loo_resids, alpha)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1557,5 +2553,387 @@ mod tests {
         // A refusal still hands back the cheap frozen set for the caller to
         // either widen with local refits or fall back from — never nothing.
         assert!(cert.rho_excursion >= 0.0);
+    }
+
+    // ── Layer 2 (continuous GLM homotopy) + jackknife+ tests ─────────────
+
+    /// Independent damped-Newton refit of the augmented canonical GLM at a
+    /// single candidate z — explicit per-row loops, its own line search, no
+    /// shared assembly with the engine under test.
+    fn oracle_glm_refit(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        s: &Array2<f64>,
+        x_star: &Array1<f64>,
+        z: f64,
+        mean: &dyn Fn(f64) -> f64,
+        weight: &dyn Fn(f64) -> f64,
+        nll_term: &dyn Fn(f64, f64) -> f64,
+    ) -> Array1<f64> {
+        let n = x.nrows();
+        let p = x.ncols();
+        let pen_nll = |b: &Array1<f64>| -> f64 {
+            let mut acc = 0.0;
+            for i in 0..n {
+                acc += nll_term(x.row(i).dot(b), y[i]);
+            }
+            acc += nll_term(x_star.dot(b), z);
+            acc + 0.5 * b.dot(&s.dot(b))
+        };
+        let mut beta = Array1::<f64>::zeros(p);
+        let mut cur = pen_nll(&beta);
+        for _ in 0..400 {
+            let mut g = s.dot(&beta);
+            let mut h = s.clone();
+            for i in 0..n {
+                let eta = x.row(i).dot(&beta);
+                let r = mean(eta) - y[i];
+                let w = weight(eta);
+                for a in 0..p {
+                    g[a] += x[[i, a]] * r;
+                    for b in 0..p {
+                        h[[a, b]] += w * x[[i, a]] * x[[i, b]];
+                    }
+                }
+            }
+            let eta_s = x_star.dot(&beta);
+            let r_s = mean(eta_s) - z;
+            let w_s = weight(eta_s);
+            for a in 0..p {
+                g[a] += x_star[a] * r_s;
+                for b in 0..p {
+                    h[[a, b]] += w_s * x_star[a] * x_star[b];
+                }
+            }
+            let chol = h.cholesky(Side::Lower).expect("oracle chol");
+            let step = chol.solvevec(&g);
+            if vec_norm(&step) <= 1e-13 * (1.0 + vec_norm(&beta)) {
+                break;
+            }
+            let mut t = 1.0_f64;
+            loop {
+                let mut cand = beta.clone();
+                cand.scaled_add(-t, &step);
+                let cand_nll = pen_nll(&cand);
+                if cand_nll.is_finite() && cand_nll <= cur {
+                    beta = cand;
+                    cur = cand_nll;
+                    break;
+                }
+                t *= 0.5;
+                assert!(t > 1e-18, "oracle line search failed at z={z}");
+            }
+        }
+        beta
+    }
+
+    /// Conformal membership computed directly from an oracle refit.
+    fn oracle_glm_membership(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        x_star: &Array1<f64>,
+        z: f64,
+        alpha: f64,
+        beta: &Array1<f64>,
+        mean: &dyn Fn(f64) -> f64,
+    ) -> bool {
+        let n = x.nrows();
+        let e_star = (z - mean(x_star.dot(beta))).abs();
+        let count = (0..n)
+            .filter(|&i| (y[i] - mean(x.row(i).dot(beta))).abs() >= e_star)
+            .count();
+        (1.0 + count as f64) > alpha * (n as f64 + 1.0)
+    }
+
+    /// (#942 Layer 2 test a) The tracked β̂(z) path must match a direct
+    /// augmented refit at every candidate WITHIN THE CERTIFIED corrector
+    /// bound — for both supported families — and the homotopy must have
+    /// actually tracked (not silently cold-refit everything). Membership
+    /// verdicts must agree with the independent oracle exactly.
+    #[test]
+    fn glm_homotopy_tracks_exact_refit_path_within_certified_bound() {
+        use std::f64::consts::PI;
+        let n = 16usize;
+        let p = 3usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            for j in 0..p {
+                x[[i, j]] = (j as f64 * PI * t).cos();
+            }
+            y[i] = (1.0 + (2.0 * PI * t).sin()).exp().round();
+        }
+        let mut s = Array2::<f64>::eye(p);
+        s *= 1.5;
+        let weights = Array1::<f64>::ones(n);
+        let x_star = cosine_row(p, 0.37);
+        let alpha = 0.2;
+
+        // Poisson-log arm over a count window.
+        let eng = GlmHomotopyFullConformal::new(
+            CanonicalGlmFamily::PoissonLog,
+            &x,
+            &y,
+            &weights,
+            &s,
+            &x_star,
+        )
+        .expect("poisson engine");
+        let candidates: Vec<f64> = (0..=6).map(|k| k as f64).collect();
+        let set = eng.prediction_set(&candidates, alpha).expect("poisson set");
+        assert_eq!(set.candidates.len(), candidates.len());
+        assert_eq!(set.n_augmented, n + 1);
+        assert!(
+            set.candidates.iter().skip(1).any(|c| !c.cold_refit),
+            "the homotopy never tracked a single transition on a benign Poisson fixture \
+             — the certified predictor–corrector path is vacuous"
+        );
+        let mean_p = |eta: f64| eta.exp();
+        let weight_p = |eta: f64| eta.exp();
+        let nll_p = |eta: f64, yv: f64| eta.exp() - yv * eta;
+        for c in &set.candidates {
+            let beta_ref = oracle_glm_refit(&x, &y, &s, &x_star, c.z, &mean_p, &weight_p, &nll_p);
+            let mut diff = c.beta.clone();
+            diff.scaled_add(-1.0, &beta_ref);
+            let err = vec_norm(&diff);
+            assert!(
+                c.beta_error_bound.is_finite(),
+                "certified bound must be finite on a benign fixture (z={})",
+                c.z
+            );
+            assert!(
+                err <= c.beta_error_bound + 1e-7,
+                "tracked β̂({}) is {err} from the oracle refit, exceeding the certified \
+                 corrector bound {} (+ oracle tolerance)",
+                c.z,
+                c.beta_error_bound
+            );
+            assert!(
+                c.beta_error_bound < 1e-6,
+                "certified bound {} at z={} is uselessly loose on a benign fixture",
+                c.beta_error_bound,
+                c.z
+            );
+            let member_ref =
+                oracle_glm_membership(&x, &y, &x_star, c.z, alpha, &beta_ref, &mean_p);
+            assert_eq!(
+                c.member, member_ref,
+                "homotopy membership disagrees with the oracle refit at z={}",
+                c.z
+            );
+        }
+        assert_eq!(
+            set.members.len(),
+            set.candidates.iter().filter(|c| c.member).count()
+        );
+
+        // Bernoulli-logit arm: support {0, 1}, same path-vs-refit contract.
+        let mut yb = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            yb[i] = f64::from(u8::from((2.0 * PI * t).sin() > -0.2));
+        }
+        let engb = GlmHomotopyFullConformal::new(
+            CanonicalGlmFamily::BernoulliLogit,
+            &x,
+            &yb,
+            &weights,
+            &s,
+            &x_star,
+        )
+        .expect("bernoulli engine");
+        let setb = engb.prediction_set(&[0.0, 1.0], alpha).expect("bernoulli set");
+        let mean_b = |eta: f64| 1.0 / (1.0 + (-eta).exp());
+        let weight_b = |eta: f64| {
+            let mu = 1.0 / (1.0 + (-eta).exp());
+            mu * (1.0 - mu)
+        };
+        let nll_b =
+            |eta: f64, yv: f64| eta.max(0.0) + (-eta.abs()).exp().ln_1p() - yv * eta;
+        assert!(
+            !setb.candidates[1].cold_refit,
+            "the logistic third derivative is globally ≤ 1/(6√3); tracking 0→1 must certify"
+        );
+        for c in &setb.candidates {
+            let beta_ref = oracle_glm_refit(&x, &yb, &s, &x_star, c.z, &mean_b, &weight_b, &nll_b);
+            let mut diff = c.beta.clone();
+            diff.scaled_add(-1.0, &beta_ref);
+            assert!(
+                vec_norm(&diff) <= c.beta_error_bound + 1e-7,
+                "Bernoulli tracked path off the refit at z={} beyond the certified bound",
+                c.z
+            );
+            let member_ref =
+                oracle_glm_membership(&x, &yb, &x_star, c.z, alpha, &beta_ref, &mean_b);
+            assert_eq!(c.member, member_ref);
+        }
+    }
+
+    /// (#942 Layer 2 test c) When the third-order bound explodes — a huge
+    /// candidate jump at a high-leverage test row under Poisson-log, where
+    /// `b‴ = eʸ` grows with the candidate — the step certificate must
+    /// REFUSE within its budget and fall back to a cold refit, and the
+    /// fallback must preserve exactness (memberships still equal the
+    /// independent oracle's).
+    #[test]
+    fn glm_homotopy_certificate_refuses_and_falls_back_on_third_order_explosion() {
+        use std::f64::consts::PI;
+        let n = 16usize;
+        let p = 3usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            for j in 0..p {
+                x[[i, j]] = (j as f64 * PI * t).cos();
+            }
+            y[i] = (1.0 + 2.0 * t).round();
+        }
+        let mut s = Array2::<f64>::eye(p);
+        s *= 0.5;
+        let weights = Array1::<f64>::ones(n);
+        let mut x_star = cosine_row(p, 0.31);
+        x_star.mapv_inplace(|v| 6.0 * v);
+        let eng = GlmHomotopyFullConformal::new(
+            CanonicalGlmFamily::PoissonLog,
+            &x,
+            &y,
+            &weights,
+            &s,
+            &x_star,
+        )
+        .expect("engine");
+        let alpha = 0.2;
+        let set = eng
+            .prediction_set(&[1.0, 2000.0], alpha)
+            .expect("set under extreme jump");
+        assert!(
+            set.refit_fallbacks >= 1,
+            "a 1 → 2000 Poisson candidate jump at ‖x_*‖ = {} must exhaust the certified \
+             step budget (b‴ = eʸ explodes along the path) and fall back to a cold refit; \
+             got {} fallbacks",
+            x_star.dot(&x_star).sqrt(),
+            set.refit_fallbacks
+        );
+        assert!(
+            set.candidates[1].cold_refit,
+            "the candidate decided through the fallback must be marked cold"
+        );
+        // Exactness preserved under fallback: the verdicts and coefficients
+        // still match the independent oracle within the computed bound.
+        let mean_p = |eta: f64| eta.exp();
+        let weight_p = |eta: f64| eta.exp();
+        let nll_p = |eta: f64, yv: f64| eta.exp() - yv * eta;
+        for c in &set.candidates {
+            let beta_ref = oracle_glm_refit(&x, &y, &s, &x_star, c.z, &mean_p, &weight_p, &nll_p);
+            let mut diff = c.beta.clone();
+            diff.scaled_add(-1.0, &beta_ref);
+            assert!(
+                vec_norm(&diff) <= c.beta_error_bound + 1e-6,
+                "fallback coefficients at z={} drifted {} from the oracle refit (bound {})",
+                c.z,
+                vec_norm(&diff),
+                c.beta_error_bound
+            );
+            let member_ref =
+                oracle_glm_membership(&x, &y, &x_star, c.z, alpha, &beta_ref, &mean_p);
+            assert_eq!(
+                c.member, member_ref,
+                "fallback membership at z={} disagrees with the oracle refit",
+                c.z
+            );
+        }
+    }
+
+    /// (#942 test b) The closed-form Sherman–Morrison jackknife+ must equal
+    /// the brute-force construction from n actual leave-one-out refits —
+    /// endpoints assembled with the exact Barber et al. (2021) order
+    /// statistics — and the ±∞ honesty must engage exactly when the order
+    /// statistic does not exist.
+    #[test]
+    fn jackknife_plus_matches_brute_force_loo_refits() {
+        use std::f64::consts::PI;
+        let n = 20usize;
+        let p = 4usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            for j in 0..p {
+                x[[i, j]] = (j as f64 * PI * t).cos();
+            }
+            y[i] = (2.0 * PI * t).sin() + 0.15 * (11.0 * i as f64 + 0.3).sin();
+        }
+        let mut s = Array2::<f64>::eye(p);
+        s *= 0.7;
+        let weights = Array1::<f64>::ones(n);
+        let x_star = cosine_row(p, 0.43);
+        let alpha = 0.2;
+
+        let jk = gaussian_jackknife_plus(&x, &y, &weights, &s, &x_star, alpha).expect("jk+");
+
+        // Brute force: n explicit LOO refits, manual order statistics.
+        let mut lower_vals: Vec<f64> = Vec::with_capacity(n);
+        let mut upper_vals: Vec<f64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut m = s.clone();
+            let mut rhs = Array1::<f64>::zeros(p);
+            for r in 0..n {
+                if r == i {
+                    continue;
+                }
+                for a in 0..p {
+                    rhs[a] += x[[r, a]] * y[r];
+                    for b in 0..p {
+                        m[[a, b]] += x[[r, a]] * x[[r, b]];
+                    }
+                }
+            }
+            let chol = m.cholesky(Side::Lower).expect("loo chol");
+            let beta = chol.solvevec(&rhs);
+            let mu_star = x_star.dot(&beta);
+            let resid = (y[i] - x.row(i).dot(&beta)).abs();
+            lower_vals.push(mu_star - resid);
+            upper_vals.push(mu_star + resid);
+        }
+        lower_vals.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        upper_vals.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        let rank_hi = ((n as f64 + 1.0) * (1.0 - alpha)).ceil() as usize;
+        let rank_lo = ((n as f64 + 1.0) * alpha).floor() as usize;
+        assert!(rank_lo >= 1 && rank_hi <= n, "fixture sized to certify finite endpoints");
+        let lo_bf = lower_vals[rank_lo - 1];
+        let hi_bf = upper_vals[rank_hi - 1];
+        assert!(
+            (jk.lo - lo_bf).abs() <= 1e-8 * (1.0 + lo_bf.abs()),
+            "jackknife+ lower endpoint {} disagrees with brute-force LOO refits {}",
+            jk.lo,
+            lo_bf
+        );
+        assert!(
+            (jk.hi - hi_bf).abs() <= 1e-8 * (1.0 + hi_bf.abs()),
+            "jackknife+ upper endpoint {} disagrees with brute-force LOO refits {}",
+            jk.hi,
+            hi_bf
+        );
+        assert!(jk.certifies_finite());
+        assert!(jk.lo < jk.hi);
+        assert_eq!(jk.n, n);
+
+        // Honest ±∞: at α = 0.04 with n = 20, ⌈21·0.96⌉ = 21 > n and
+        // ⌊21·0.04⌋ = 0 < 1 — both order statistics are out of range, so
+        // both endpoints must be infinite, exactly like the split module's
+        // +∞ multiplier convention.
+        let tight = gaussian_jackknife_plus(&x, &y, &weights, &s, &x_star, 0.04).expect("tight");
+        assert!(tight.hi.is_infinite() && tight.hi > 0.0);
+        assert!(tight.lo.is_infinite() && tight.lo < 0.0);
+        assert!(!tight.certifies_finite());
+
+        // The assembly is the pure-core seam CV+ also routes through:
+        // degenerate one-point input keeps the exact rank arithmetic honest.
+        let one_pred = Array1::<f64>::from(vec![1.0]);
+        let one_res = Array1::<f64>::from(vec![0.5]);
+        let tiny = jackknife_plus_interval(&one_pred, &one_res, 0.2).expect("tiny");
+        assert!(tiny.hi.is_infinite() && tiny.lo.is_infinite());
     }
 }
