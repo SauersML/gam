@@ -4982,6 +4982,26 @@ impl OuterProblem {
         self.disable_fixed_point = disable;
         self
     }
+    // MEASURE-JET ψ REGISTRATION: the engine below is already complete for a
+    // 3-coordinate measure-jet ψ group (s, α, ln τ) — `psi_dim` is generic,
+    // `with_bounds` carries the s ∈ (0, 2) box (the same convention matern κ
+    // uses for its log-κ window; no logistic reparameterization exists or is
+    // needed in-house), `with_bfgs_step_cap_psi` caps per-iteration ψ moves,
+    // and `DirectionalHyperParam::new_compact` (solver/reml/mod.rs) carries
+    // penalty-only first/second/cross jets with `is_penalty_like`
+    // auto-derived from the identically-zero design drift (∂X/∂ψ ≡ 0).
+    // Every remaining registration arm is formula-layer dispatch in
+    // src/terms/smooth.rs (eligibility in
+    // `spatial_term_supports_hyper_optimization`, dims in
+    // `spatial_dims_per_term`, seed/bounds/write-back on
+    // `SpatialLogKappaCoords`, the per-trial rebuild in
+    // `apply_log_kappa_to_term`, and the derivative bundle in
+    // `try_build_spatial_term_log_kappa_derivative`, which currently returns
+    // `Ok(None)` for `SmoothBasisSpec::MeasureJet`) plus the
+    // `build_measure_jet_basis_psi_derivatives` producer in
+    // src/terms/basis/measure_jet_smooth.rs; both are owned by the
+    // measure-jet terms actor. Registration stays gated on those arms — do
+    // NOT add measure-jet-specific branches to this engine.
     pub fn with_psi_dim(mut self, dim: usize) -> Self {
         self.psi_dim = dim;
         self
