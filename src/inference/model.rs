@@ -4385,39 +4385,44 @@ mod tests {
         let y: Vec<f64> = x.iter().map(|&v| (4.0 * v).sin() + 0.1 * v).collect();
         let w = vec![1.0_f64; x.len()];
         let fit = crate::solver::spline_scan::fit_cubic_spline_scan(&x, &y, &w).expect("scan fit");
-        let payload = crate::inference::model_payload_builders::assemble_spline_scan_payload(
-            "y ~ s(x)".to_string(),
-            "x".to_string(),
-            &fit,
-            DataSchema {
-                columns: vec![
-                    SchemaColumn {
-                        name: "y".to_string(),
-                        kind: ColumnKindTag::Continuous,
-                        levels: vec![],
-                    },
-                    SchemaColumn {
-                        name: "x".to_string(),
-                        kind: ColumnKindTag::Continuous,
-                        levels: vec![],
-                    },
-                ],
-            },
-            vec!["x".to_string()],
-            vec![(0.0, 1.0)],
-        );
-        payload
+        let make_payload = || {
+            crate::inference::model_payload_builders::assemble_spline_scan_payload(
+                "y ~ s(x)".to_string(),
+                "x".to_string(),
+                &fit,
+                DataSchema {
+                    columns: vec![
+                        SchemaColumn {
+                            name: "y".to_string(),
+                            kind: ColumnKindTag::Continuous,
+                            levels: vec![],
+                        },
+                        SchemaColumn {
+                            name: "x".to_string(),
+                            kind: ColumnKindTag::Continuous,
+                            levels: vec![],
+                        },
+                    ],
+                },
+                vec!["x".to_string()],
+                vec![(0.0, 1.0)],
+            )
+        };
+        // The on-disk form is the FittedModel tagged enum; validation and the
+        // scan accessor live on FittedModel (Deref only goes Model -> Payload).
+        let model = FittedModel::from_payload(make_payload());
+        model
             .validate_for_persistence()
-            .expect("scan payload validates");
-        payload
+            .expect("scan model validates");
+        model
             .validate_numeric_finiteness()
-            .expect("scan payload is finite");
+            .expect("scan model is finite");
 
-        let json = serde_json::to_string(&payload).expect("serialize payload");
-        let restored: FittedModelPayload = serde_json::from_str(&json).expect("parse payload");
+        let json = serde_json::to_string(&model).expect("serialize model");
+        let restored: FittedModel = serde_json::from_str(&json).expect("parse model");
         restored
             .validate_for_persistence()
-            .expect("restored scan payload validates");
+            .expect("restored scan model validates");
         let (column, replay) = restored
             .saved_spline_scan()
             .expect("restore scan fit")
@@ -4431,15 +4436,15 @@ mod tests {
         }
 
         // A dense model without the scan channel still requires fit_result.
-        let mut dense = payload.clone();
+        let mut dense = make_payload();
         dense.spline_scan = None;
-        let err = dense
+        let err = FittedModel::from_payload(dense)
             .validate_for_persistence()
             .expect_err("dense payload without fit_result must be rejected");
         assert!(err.to_string().contains("fit_result"));
 
         // Structural corruption fails at validation, not inside predict.
-        let mut corrupt = payload.clone();
+        let mut corrupt = make_payload();
         corrupt
             .spline_scan
             .as_mut()
@@ -4447,17 +4452,17 @@ mod tests {
             .state
             .knots
             .truncate(2);
-        corrupt
+        FittedModel::from_payload(corrupt)
             .validate_for_persistence()
             .expect_err("corrupt scan state must be rejected");
-        let mut unnamed = payload.clone();
+        let mut unnamed = make_payload();
         unnamed
             .spline_scan
             .as_mut()
             .expect("scan channel present")
             .feature_column
             .clear();
-        unnamed
+        FittedModel::from_payload(unnamed)
             .validate_for_persistence()
             .expect_err("missing feature column must be rejected");
     }
