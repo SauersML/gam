@@ -1,5 +1,6 @@
 use crate::custom_family::{
-    BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix, fit_custom_family_with_rho_prior,
+    AdditiveBlockJacobian, BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix,
+    fit_custom_family_with_rho_prior,
 };
 use crate::estimate::{
     AdaptiveRegularizationOptions, EstimationError, FitOptions, FittedLinkState, UnifiedFitResult,
@@ -2436,6 +2437,38 @@ fn fit_cause_specific_survival_transformation_custom(
             initial_log_lambdas[penalty_idx] = block.lambda.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln();
         }
         let beta_start = beta0_flat.slice(s![cause * p..(cause + 1) * p]).to_owned();
+        // Cause-specific blocks share the same time-basis design `x_exit`
+        // (the same I-spline evaluated at the same observed event times), so
+        // the joint design carries K block-pairs of (near-)identical
+        // columns. The model is identifiable because the cause-specific
+        // likelihood routes each cause to disjoint risk sets and
+        // event-indicator masks
+        // (`CauseSpecificRoystonParmarFamily::likelihood_blocks_uncoupled =
+        // true`), but the identifiability audit operates on the unweighted
+        // joint design. With every cause carrying the same `gauge_priority`
+        // and no Jacobian callback to declare channel ownership, the audit's
+        // `hard_alias_pair` gate fires on the strongest cross-block pair and
+        // refuses the full-rank fit even when `joint_rank == p_total`.
+        //
+        // Mirror the multinomial-class block convention: assign descending
+        // priorities (cause 0 highest, cause K-1 lowest) so the audit's
+        // `pa != pb` filter on cross-block alias pairs always succeeds, and
+        // attach an `AdditiveBlockJacobian` with `own_output = cause` so the
+        // channel-aware audit treats each cause's contribution as occupying
+        // its own output-channel rows. The Jacobian callback also takes the
+        // canonical-gauge orthogonalisation pass out of play (the
+        // family-owned-geometry guard defers when any block exposes a
+        // callback), so the shared near-aliased column is not residualised
+        // into a degenerate near-zero column behind the family's back; the
+        // penalty + line search at solve time still resolves any residual
+        // near-collinearity.
+        let cause_priority =
+            100u8.saturating_add(u8::try_from(cause_count - cause).unwrap_or(u8::MAX));
+        let cause_jacobian = std::sync::Arc::new(AdditiveBlockJacobian {
+            design: x_exit.clone(),
+            own_output: cause,
+            n_family_outputs: cause_count,
+        });
         block_specs.push(ParameterBlockSpec {
             name: format!("time_cause_{}", cause + 1),
             design: crate::matrix::DesignMatrix::from(x_exit.clone()),
@@ -2444,8 +2477,8 @@ fn fit_cause_specific_survival_transformation_custom(
             nullspace_dims,
             initial_log_lambdas,
             initial_beta: Some(beta_start),
-            gauge_priority: 100,
-            jacobian_callback: None,
+            gauge_priority: cause_priority,
+            jacobian_callback: Some(cause_jacobian),
             stacked_design: None,
             stacked_offset: None,
         });

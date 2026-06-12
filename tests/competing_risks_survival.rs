@@ -1,10 +1,13 @@
-use gam::custom_family::{BlockwiseFitOptions, ParameterBlockSpec, fit_custom_family};
+use gam::custom_family::{
+    AdditiveBlockJacobian, BlockwiseFitOptions, ParameterBlockSpec, fit_custom_family,
+};
 use gam::matrix::DesignMatrix;
 use gam::survival::{
     CauseSpecificRoystonParmarBlock, CauseSpecificRoystonParmarFamily,
     survival_event_code_from_value,
 };
 use ndarray::{Array1, Array2};
+use std::sync::Arc;
 
 fn event_codes(cause_count: usize, event_counts: &[usize], n: usize) -> Array1<u8> {
     assert_eq!(event_counts.len(), cause_count);
@@ -61,6 +64,26 @@ fn fit_constant_exposure_cause_specific(event_counts: &[usize], n: usize) -> Arr
             offset_derivative_exit: offset_derivative.clone(),
             derivative_floor: 0.0,
         });
+        // The K cause-specific blocks share the constant `x_exit` design,
+        // so the joint design carries K identical columns. The cause-specific
+        // likelihood routes each cause to disjoint risk sets so each
+        // per-cause baseline is independently identifiable, but the
+        // identifiability audit only sees the unweighted joint design. Mirror
+        // the production cause-specific path (`solver::workflow`) and the
+        // multinomial-class convention: use descending gauge priorities so
+        // the audit's cross-block pair filter resolves the shared direction
+        // by priority, and attach an `AdditiveBlockJacobian` with
+        // `own_output = cause` so the channel-aware audit treats each
+        // cause's contribution as occupying its own output-channel rows
+        // (and the orthogonalisation pass defers to the family-owned
+        // geometry).
+        let cause_priority =
+            100u8.saturating_add(u8::try_from(cause_count - cause).unwrap_or(u8::MAX));
+        let cause_jacobian = Arc::new(AdditiveBlockJacobian {
+            design: x_exit.clone(),
+            own_output: cause,
+            n_family_outputs: cause_count,
+        });
         specs.push(ParameterBlockSpec {
             name: format!("cause_{}", cause + 1),
             design: DesignMatrix::from(x_exit.clone()),
@@ -71,8 +94,8 @@ fn fit_constant_exposure_cause_specific(event_counts: &[usize], n: usize) -> Arr
             initial_beta: Some(Array1::from_vec(vec![
                 ((event_counts[cause] as f64 + 0.5) / n as f64).ln(),
             ])),
-            gauge_priority: 100,
-            jacobian_callback: None,
+            gauge_priority: cause_priority,
+            jacobian_callback: Some(cause_jacobian),
             stacked_design: None,
             stacked_offset: None,
         });
