@@ -1,34 +1,41 @@
-//! Exact O(n) state-space cubic smoothing spline ("the scan").
+//! Exact O(n) state-space polynomial smoothing spline ("the scan").
 //!
-//! The order-2 intrinsic Gaussian prior whose penalized posterior mean is the
-//! cubic smoothing spline (penalty `λ∫f″²`) is a Markov process in the state
-//! `α(x) = (f(x), f′(x))`: an integrated Wiener process. The Kalman filter +
-//! RTS smoother over the x-sorted observations therefore computes the EXACT
-//! smoothing-spline posterior — mean, derivative, pointwise variance — and the
-//! diffuse innovations decomposition computes the EXACT restricted (REML)
-//! likelihood, all in O(n) work per smoothing-parameter trial instead of the
-//! dense O(n·k²) design/Gram + O(k³) solve per trial (Wahba 1978;
-//! Kohn & Ansley 1987; Durbin & Koopman exact diffuse initialization).
+//! The order-`m` intrinsic Gaussian prior whose penalized posterior mean is the
+//! degree-`(2m−1)` smoothing spline (penalty `λ∫(f^{(m)})²`) is a Markov process
+//! in the state `α(x) = (f, f′, …, f^{(m−1)})`: an `m`-fold integrated Wiener
+//! process. The Kalman filter + RTS smoother over the x-sorted observations
+//! therefore computes the EXACT smoothing-spline posterior — mean, derivatives,
+//! pointwise variance — and the diffuse innovations decomposition computes the
+//! EXACT restricted (REML) likelihood, all in O(n) work per smoothing-parameter
+//! trial instead of the dense O(n·k²) design/Gram + O(k³) solve per trial
+//! (Wahba 1978; Kohn & Ansley 1987; Durbin & Koopman exact diffuse init).
+//!
+//! Supported orders are `m ∈ {1, 2}` (`MAX_ORDER`): `m = 1` is the random-walk
+//! / linear smoother (penalty `λ∫f′²`), `m = 2` the cubic smoother (`λ∫f″²`).
+//! Order `m ≥ 3` needs the block-tridiagonal banded smoother (its multiple
+//! partially-diffuse leading nodes are not covered by the reverse-map closure
+//! below) and falls through to the dense path — a documented follow-up.
 //!
 //! Model, after sorting and pooling tied abscissae (precision-weighted):
 //!   α_{t+1} = F_t α_t + η_t,   η_t ~ N(0, q·Q(δ_t)),   q = σ_w²/σ² = 1/λ,
-//!   y_t     = H α_t + ε_t,     ε_t ~ N(0, σ²/w_t),     H = [1 0],
-//!   F(δ) = [[1, δ], [0, 1]],   Q(δ) = [[δ³/3, δ²/2], [δ²/2, δ]],
-//! with a diffuse (improper, flat) prior on α_1 carrying the unpenalized
-//! linear null space — the same null space the spline leaves unshrunk.
+//!   y_t     = H α_t + ε_t,     ε_t ~ N(0, σ²/w_t),     H = [1 0 … 0],
+//!   F(δ) = exp(δA) (nilpotent shift A),   Q(δ) the m-fold IWP noise,
+//! with a diffuse (improper, flat) prior on the first `m` states carrying the
+//! unpenalized degree-`<m` polynomial null space the spline leaves unshrunk.
+//! (`m = 2`: `F = [[1,δ],[0,1]]`, `Q = [[δ³/3,δ²/2],[δ²/2,δ]]`.)
 //!
 //! Exactness boundaries, by construction:
-//! - the diffuse dimension is 2 and is consumed by the first two distinct
-//!   abscissae (F_∞ = P_∞[0,0] = 1 > 0 at t=1, then δ² > 0 at t=2), after
-//!   which the filter is an ordinary proper Kalman filter;
-//! - the t=1 smoothed moments are recovered by direct Markov conditioning
-//!   `p(α_1 | y) = ∫ p(α_1 | α_2, y_1) p(α_2 | y)` (an affine 2×2 Bayes
-//!   update — no diffuse RTS recursion is needed);
+//! - the diffuse dimension is `m` and is consumed by the first `m` distinct
+//!   abscissae, after which the filter is an ordinary proper Kalman filter;
+//! - the leading smoothed moments are recovered by direct Markov conditioning
+//!   `p(α_0 | y) = ∫ p(α_0 | α_1, y_0) p(α_1 | y)` (an affine `m×m` Bayes
+//!   update) — exact for `m ≤ 2`, where node 0 is the only partially-diffuse
+//!   smoothing node; no diffuse RTS recursion is needed;
 //! - off-knot prediction is the Gaussian bridge conditional on the two
 //!   flanking smoothed states (using the exact lag-one smoothed
 //!   cross-covariance `G_t · P^s_{t+1}`), or boundary extrapolation from the
-//!   end states, which reproduces the spline's linear extrapolation with
-//!   cubically growing variance — bridge-don't-sag is a theorem here.
+//!   end states, which reproduces the spline's polynomial extrapolation with
+//!   growing variance — bridge-don't-sag is a theorem here.
 //!
 //! The smoothing parameter is selected by maximizing the concentrated diffuse
 //! (restricted) log-likelihood over log λ with a deterministic coarse-grid +
@@ -364,7 +371,7 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
 pub struct CubicSplineScanFit {
     /// Smoothing-spline order `m` (penalize `∫(f^{(m)})²`); state dimension.
     /// `m = 1` is the random-walk/linear smoother, `m = 2` the cubic smoother.
-    order: usize,
+    pub order: usize,
     /// Distinct sorted abscissae (pooled knots).
     pub knots: Vec<f64>,
     /// Smoothed posterior mean of `f` at each knot.

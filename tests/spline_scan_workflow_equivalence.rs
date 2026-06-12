@@ -147,6 +147,10 @@ fn gaussian_config() -> FitConfig {
 }
 
 const SCAN_FORMULA: &str = "y ~ s(x, double_penalty=false)";
+/// Order-1 (random-walk / linear) smoothing spline: degree 2m−1 = 1,
+/// penalty_order m = 1 — the form `spline_scan_fast_path` routes to the m = 1
+/// exact O(n) scan (#1034 item 2).
+const SCAN_FORMULA_M1: &str = "y ~ s(x, degree=1, penalty_order=1, double_penalty=false)";
 
 #[test]
 fn scan_routed_workflow_fit_matches_dense_oracle_at_selected_lambda() {
@@ -325,6 +329,64 @@ fn spline_scan_million_row_fit_scales_linearly_and_recovers_truth() {
     assert!(
         edf > 2.0 && edf < 1_000.0,
         "scan EDF {edf} outside the sane band (2, 1000) for a smooth biobank-scale fit"
+    );
+}
+
+/// #1034 item 2 end-to-end: the order-1 (random-walk/linear) smoothing spline
+/// routes through the formula → detection → exact O(n) scan → predict pipeline.
+/// Detection must fire, the fit must carry `order == 1`, and the scan must
+/// recover the known smooth truth at least as well as the dense reduced-rank
+/// path on the identical formula (#904 self-truth, dense = match-or-beat).
+#[test]
+fn order_one_scan_routes_and_recovers_truth_vs_dense() {
+    init_parallelism();
+    let (x, y) = training_xy(180);
+    let data = encode_xy(&x, &y);
+    let cfg = gaussian_config();
+
+    let scan = fit_spline_scan_from_formula(SCAN_FORMULA_M1, &data, &cfg)
+        .expect("scan-routed m=1 fit")
+        .expect("detection must fire for a single 1-D order-1 single-penalty Gaussian smooth");
+    assert_eq!(scan.order, 1, "m=1 formula must select the order-1 scan");
+
+    // Dense reduced-rank reference on the identical formula.
+    let dense = fit_from_formula(SCAN_FORMULA_M1, &data, &cfg).expect("dense m=1 fit");
+    let FitResult::Standard(dense) = dense else {
+        panic!("dense reference path must return a standard fit");
+    };
+    let grid: Vec<f64> = (0..200).map(|i| 0.02 + 0.96 * i as f64 / 199.0).collect();
+    let mut dense_design = Array2::<f64>::zeros((grid.len(), 2));
+    for (i, &t) in grid.iter().enumerate() {
+        dense_design[[i, 0]] = t;
+    }
+    let design = build_term_collection_design(dense_design.view(), &dense.resolvedspec)
+        .expect("dense m=1 predict design rebuild");
+    let dense_pred = design.design.apply(&dense.fit.beta).to_vec();
+
+    let mut scan_sse = 0.0;
+    let mut dense_sse = 0.0;
+    for (i, &t) in grid.iter().enumerate() {
+        let truth = truth_fn(t);
+        let (scan_mean, scan_var) = scan.predict(t).expect("m=1 scan predict");
+        assert!(
+            scan_mean.is_finite() && scan_var.is_finite() && scan_var > 0.0,
+            "m=1 scan prediction must be finite with positive variance at x={t}"
+        );
+        scan_sse += (scan_mean - truth) * (scan_mean - truth);
+        dense_sse += (dense_pred[i] - truth) * (dense_pred[i] - truth);
+    }
+    let scan_mse = scan_sse / grid.len() as f64;
+    let dense_mse = dense_sse / grid.len() as f64;
+    // The order-1 smoother is piecewise-linear, so it tracks the curved truth
+    // a little more coarsely than the cubic arm — but still resolves it well
+    // under the noise variance and must not be beaten by the dense m=1 path.
+    assert!(
+        scan_mse < 0.02,
+        "m=1 scan fails absolute truth recovery: MSE={scan_mse}"
+    );
+    assert!(
+        scan_mse <= 1.10 * dense_mse + 1e-12,
+        "m=1 scan worse than dense path: scan MSE={scan_mse}, dense MSE={dense_mse}"
     );
 }
 
