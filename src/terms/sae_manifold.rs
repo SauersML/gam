@@ -557,6 +557,7 @@ const SAE_ATOM_COLLAPSE_RESEED_BUDGET: usize = 1;
 /// fitted matrix is indistinguishable from the column mean is a structural
 /// collapse and must enter the #976 CollapseEvent ledger.
 const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.05;
+const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
 
 /// Reactivation band width (in units of the JumpReLU temperature `τ`) below the
 /// hard gate threshold. The forward gate value is hard-zero strictly below
@@ -7564,7 +7565,8 @@ impl SaeManifoldTerm {
         let (evals, evecs) = h_span
             .eigh(Side::Lower)
             .map_err(|_| conditioning_err.clone())?;
-        let gauge_floor = SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR * max_pivot;
+        let gauge_floor = (SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR * max_pivot)
+            .max(SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR.sqrt() * max_pivot);
         let mut orthonormal: Vec<Array1<f64>> = Vec::new();
         for eig_idx in 0..evals.len() {
             let rayleigh = evals[eig_idx];
@@ -10906,7 +10908,7 @@ impl SaeManifoldTerm {
             return Ok(false);
         }
 
-        let mut recorded = false;
+        let mut collapsed_active_atom = false;
         for atom in 0..self.k_atoms() {
             let active_mass = assignments
                 .column(atom)
@@ -10916,6 +10918,7 @@ impl SaeManifoldTerm {
             if active_mass <= 1.0e-8 {
                 continue;
             }
+            collapsed_active_atom = true;
             let already_terminal = self
                 .collapse_events
                 .iter()
@@ -10930,9 +10933,8 @@ impl SaeManifoldTerm {
                 floor: SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
                 action: CollapseAction::Terminal,
             });
-            recorded = true;
         }
-        Ok(recorded)
+        Ok(collapsed_active_atom)
     }
 
     /// Set the curvature-homotopy dial `η ∈ [0, 1]` on every atom (#1007). At
@@ -13216,6 +13218,22 @@ impl SaeManifoldOuterObjective {
         }
     }
 
+    fn add_fit_data_collapse_penalty(&mut self, cost: f64) -> Result<f64, String> {
+        let fitted = self.term.try_fitted()?;
+        let assignments = self.term.assignment.assignments();
+        let collapsed = self.term.record_fit_data_collapse_if_needed(
+            self.target.view(),
+            fitted.view(),
+            assignments.view(),
+            self.inner_max_iter,
+        )?;
+        if collapsed {
+            Ok(cost + SAE_FIT_DATA_COLLAPSE_COST)
+        } else {
+            Ok(cost)
+        }
+    }
+
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
     /// the cached ρ / loss and (optionally) priming the inner solve from a
     /// seeded β. Returns `(cost, β̂)`.
@@ -13239,6 +13257,7 @@ impl SaeManifoldOuterObjective {
         self.current_rho = rho;
         self.last_loss = Some(loss);
         let beta_hat = self.term.flatten_beta();
+        let cost = self.add_fit_data_collapse_penalty(cost)?;
         Ok((cost, beta_hat))
     }
 
@@ -13342,6 +13361,7 @@ impl SaeManifoldOuterObjective {
         }
 
         let beta_hat = self.term.flatten_beta();
+        let cost = self.add_fit_data_collapse_penalty(cost)?;
         Ok(EfsEval {
             cost,
             steps,
@@ -13366,15 +13386,16 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // ρ are all penalty-like / τ coordinates: precisions and
             // log-smoothing strengths. No design-moving ψ coordinates.
             psi_dim: 0,
-            // EFS fixed-point lane is the right driver for these penalty-like
-            // coords: the multiplicative Fellner-Schall/Mackay step is O(1)
-            // selected-inverse trace per outer iter, vs the cost-only path's
-            // O(K³) dense Schur per cost eval × many derivative-free evals —
-            // intractable at large-scale K. `eval_efs` implements it.
-            fixed_point_available: true,
+            // SAE's penalty coordinates are scale-coupled to the profiled
+            // Gaussian reconstruction dispersion. The generic fixed-point lane
+            // can drive the smoothness axis to the absolute upper boundary after
+            // a good low-noise seed, collapsing the decoder to the mean (#1023).
+            // Keep the analytic value/gradient lane in charge so the
+            // dimensionless seed is not overwritten by an absolute-unit EFS step.
+            fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
-            disable_fixed_point: false,
+            disable_fixed_point: true,
         }
     }
 
@@ -13417,6 +13438,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.current_rho = rho_state;
         self.last_loss = Some(loss);
         let beta_hat = self.term.flatten_beta();
+        let cost = self
+            .add_fit_data_collapse_penalty(cost)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
         Ok(OuterEval {
             cost,
             gradient,
@@ -15026,6 +15050,8 @@ pub fn grassmann_assert_border_dim_invariant(term: &SaeManifoldTerm) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    use crate::linalg::faer_ndarray::fast_ata;
+
     use super::*;
     use crate::solver::arrow_schur::{
         ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics,
