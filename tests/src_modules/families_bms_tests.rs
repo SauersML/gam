@@ -1392,7 +1392,7 @@ fn assert_scalar_close(actual: f64, expected: f64, tol: f64, context: &str) {
 #[test]
 fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
     let link = bernoulli_marginal_slope_probit_link();
-    let eta_grid = [-8.0, -6.5, -2.0, -0.4, 0.0, 0.75, 2.25, 6.0, 8.0];
+    let eta_grid: [f64; 9] = [-8.0, -6.5, -2.0, -0.4, 0.0, 0.75, 2.25, 6.0, 8.0];
     let g_grid = [-1.4, -0.55, 0.0, 0.8, 1.7];
     let z_grid = [-2.25, -0.35, 0.4, 2.1];
     // Per-regime bounds (same construction as the CTN endpoint oracle): the
