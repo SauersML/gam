@@ -110,16 +110,8 @@ fn run_outer_fit(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> SaeMani
     let mut seed_config = SeedConfig::default();
     seed_config.max_seeds = 1;
     seed_config.seed_budget = 1;
-    let mut objective = SaeManifoldOuterObjective::new(
-        term,
-        z.clone(),
-        None,
-        init_rho,
-        0,
-        0.04,
-        1.0e-6,
-        1.0e-6,
-    );
+    let mut objective =
+        SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 0, 0.04, 1.0e-6, 1.0e-6);
     OuterProblem::new(n_params)
         .with_seed_config(seed_config)
         .with_initial_rho(init_rho_flat)

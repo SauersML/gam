@@ -64,7 +64,11 @@ fn crossing_strand_centers() -> (Array2<f64>, Array1<f64>) {
     let centers = Array2::<f64>::from_shape_fn((m, 2), |(i, k)| {
         let strand = i / per_strand;
         let t = (i % per_strand) as f64 - N_ARM as f64;
-        if (strand == 0) == (k == 0) { t * H } else { 0.0 }
+        if (strand == 0) == (k == 0) {
+            t * H
+        } else {
+            0.0
+        }
     });
     let masses = Array1::<f64>::from_elem(m, 1.0 / m as f64);
     (centers, masses)
@@ -129,7 +133,10 @@ fn parallel_strands_share_no_value_coupling_at_affine_order() {
     // median nearest-center spacing H, and 3·H > δ, so even the finest scale
     // couples the strands through the kernel — the "near miss" is real.
     assert!(
-        band.eps.iter().copied().any(|eps| PROFILE_CUTOFF * eps >= DELTA),
+        band.eps
+            .iter()
+            .copied()
+            .any(|eps| PROFILE_CUTOFF * eps >= DELTA),
         "no band scale sees both strands — the geometry is not a near miss"
     );
 
@@ -224,9 +231,8 @@ fn parallel_strands_share_no_value_coupling_at_affine_order() {
             }
         }
         let q_i = strand1_mass + strand2_mass;
-        let outer = band.log_step * eps_star.powf(-2.0 * ORDER_S)
-            * masses[i]
-            * q_i.powf(1.0 - 2.0 * ALPHA);
+        let outer =
+            band.log_step * eps_star.powf(-2.0 * ORDER_S) * masses[i] * q_i.powf(1.0 - 2.0 * ALPHA);
         w_cross += outer * strand1_mass * strand2_mass / q_i;
     }
     assert!(
