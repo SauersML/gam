@@ -5182,14 +5182,6 @@ impl SaeManifoldTerm {
         for (i, g) in smooth_grad_gb.iter().enumerate() {
             sys.gb[i] += g;
         }
-        // Hoist per-row temporaries outside the row loop: these allocations
-        // previously fired N times per assembly, and each `decoded_row` /
-        // `decoded_derivative_row` call inside the loop allocated its own
-        // `Array1<f64>` of length p.
-        let mut decoded = Array2::<f64>::zeros((k_atoms, p));
-        let mut dg_buf = vec![0.0_f64; p];
-        let mut fitted = Array1::<f64>::zeros(p);
-        let mut error = Array1::<f64>::zeros(p);
         // `w_dim` is the whitened output dimension: `rank` of the metric factor
         // when whitening, else `p` (identity). `error_white` is the whitened
         // residual `U_nᵀ r_n ∈ ℝ^{w_dim}` whose squared norm is `r_nᵀ M_n r_n`,
@@ -5199,15 +5191,6 @@ impl SaeManifoldTerm {
             Some(metric) if whitens_likelihood => metric.metric_rank(),
             _ => p,
         };
-        // p-space metric-applied error `M_n r_n = U_n (U_nᵀ r_n)`, used by the
-        // β-tier data-fit gradient (β lives in p-output space, so its gradient
-        // contracts the residual through the full p×p metric, not the rank-space
-        // whitened residual). Identity (`= error`) when not whitening.
-        let mut error_white = vec![0.0_f64; w_dim];
-        let mut error_metric = Array1::<f64>::zeros(p);
-        // Whitened per-row Jacobian `J̃ = U_nᵀ J ∈ ℝ^{q_row × w_dim}` (row-major
-        // flat) reused for the t-block htt = J̃ J̃ᵀ and gt = J̃ ẽ.
-        let mut jac_white = vec![0.0_f64; q * w_dim.max(p)];
         // Data-fit Gauss-Newton β-Hessian is block-diagonal across the `p`
         // output channels and identical in each: with the flat β layout
         // `β[μ·p + oc] = B[μ, oc]` (μ enumerating (atom, basis_col)) the GN
@@ -5229,10 +5212,9 @@ impl SaeManifoldTerm {
         // Gram exactly. A `BTreeMap` key order keeps the installed op's
         // fingerprint deterministic. The `μ`-space offset of atom `k` is
         // `beta_offsets[k] / p`.
+        type SaeGBlocks = std::collections::BTreeMap<(usize, usize), Array2<f64>>;
         let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
         let mu_offsets: Vec<usize> = beta_offsets.iter().map(|&off| off / p).collect();
-        let mut g_blocks: std::collections::BTreeMap<(usize, usize), Array2<f64>> =
-            std::collections::BTreeMap::new();
         // Stick-breaking prior for IBP-MAP depends only on (k_atoms, alpha_eff)
         // which are constant across rows for the current rho; precompute once.
         let ibp_prior_vec = match self.assignment.mode {
@@ -5250,15 +5232,6 @@ impl SaeManifoldTerm {
         // #991 design honesty weights (mean-1 HT inclusion corrections); see
         // the seam comment at the per-row residual below.
         let row_loss_w = self.row_loss_weights.as_deref();
-        // Scratch buffer for per-(row, atom) decoded outputs. The full `decoded`
-        // matrix retains all atoms for this row so the assignment-Jacobian
-        // helper can read it.
-        let mut decoded_scratch = vec![0.0_f64; p];
-        // Kronecker htbeta storage for the full-B path: per-row sparse support
-        // and local Jacobian. Factored rows write their C-space cross slabs
-        // directly in the row loop below.
-        let mut kron_a_phi: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n);
-        let mut kron_jac: Vec<Vec<f64>> = Vec::with_capacity(n);
         // Dense full-support index `[0, k_atoms)`, used by the row loop when no
         // compact layout is engaged so the active-atom iteration is uniform.
         let all_atoms_index: Vec<usize> = (0..k_atoms).collect();
@@ -5271,8 +5244,30 @@ impl SaeManifoldTerm {
             .iter()
             .map(|coord| coord.effective_axis_periods())
             .collect();
-        for row in 0..n {
-            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+        struct SaeAssemblyRow {
+            row: usize,
+            block: ArrowRowBlock,
+            gb_delta: Vec<(usize, f64)>,
+            g_blocks: SaeGBlocks,
+            kron_a_phi: Option<Vec<(usize, f64)>>,
+            kron_jac: Option<Vec<f64>>,
+        }
+
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let row_results: Vec<SaeAssemblyRow> = (0..n)
+            .into_par_iter()
+            .map(|row| -> Result<SaeAssemblyRow, String> {
+                let mut decoded = Array2::<f64>::zeros((k_atoms, p));
+                let mut dg_buf = vec![0.0_f64; p];
+                let mut fitted = Array1::<f64>::zeros(p);
+                let mut error = Array1::<f64>::zeros(p);
+                let mut error_white = vec![0.0_f64; w_dim];
+                let mut error_metric = Array1::<f64>::zeros(p);
+                let mut jac_white = vec![0.0_f64; q * w_dim.max(p)];
+                let mut decoded_scratch = vec![0.0_f64; p];
+                let mut gb_delta: Vec<(usize, f64)> = Vec::new();
+                let mut g_blocks: SaeGBlocks = std::collections::BTreeMap::new();
+                let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
             // Reconstruction uses the row's active support: for the dense
             // full-support layout this is all atoms (exact); for a compact
             // layout the dropped atoms carry negligible `O(a)` reconstruction
@@ -5357,7 +5352,7 @@ impl SaeManifoldTerm {
             //     machine-precision support enter.
             //   * IBP-MAP at large K: only the top-`k_active` atoms.
             //   * Otherwise (small K): the dense uniform-q layout.
-            let (q_row, mut local_jac_row) = if let Some(ref layout) = row_layout {
+            let (q_row, mut local_jac_row) = if let Some(layout) = row_layout.as_ref() {
                 let active = &layout.active_atoms[row];
                 let starts = &layout.coord_starts[row];
                 let q_active = layout.row_q_active(row);
@@ -5510,7 +5505,7 @@ impl SaeManifoldTerm {
             // on one branch. A future dense-row softmax or IBP Woodbury correction
             // must update both assembly and the θ-adjoint together.
             let assignment_base = row * k_atoms;
-            if let Some(ref layout) = row_layout {
+            if let Some(layout) = row_layout.as_ref() {
                 let active = &layout.active_atoms[row];
                 for (j, &k) in active.iter().enumerate() {
                     block.gt[j] += assignment_grad[assignment_base + k];
@@ -5526,7 +5521,7 @@ impl SaeManifoldTerm {
             // ARD on each on-atom coordinate.
             // For compact layout: only active atoms; coord positions use compact starts.
             // For dense layout: all atoms; coord positions use coord_offsets.
-            if let Some(ref layout) = row_layout {
+            if let Some(layout) = row_layout.as_ref() {
                 let active = &layout.active_atoms[row];
                 let starts = &layout.coord_starts[row];
                 for (j, &k) in active.iter().enumerate() {
@@ -5623,8 +5618,8 @@ impl SaeManifoldTerm {
             // keeps both the htbeta support and the `G` accumulation
             // `O(k_active)` rather than `O(K)`. In the dense full-support
             // layout `row_active` spans all atoms.
-            let row_active: &[usize] = match row_layout {
-                Some(ref layout) => layout.active_atoms[row].as_slice(),
+            let row_active: &[usize] = match row_layout.as_ref() {
+                Some(layout) => layout.active_atoms[row].as_slice(),
                 None => &all_atoms_index,
             };
             let mut a_phi: Vec<(usize, f64)> = Vec::with_capacity(row_active.len() * 4);
@@ -5661,7 +5656,7 @@ impl SaeManifoldTerm {
                     continue;
                 }
                 for out_col in 0..p {
-                    sys.gb[beta_base_i + out_col] += j_beta_i * error_metric[out_col];
+                    gb_delta.push((beta_base_i + out_col, j_beta_i * error_metric[out_col]));
                     // No dense hbb write — the sparse `G ⊗ I_p` op installed
                     // after the loop carries the data-fit GN β-Hessian.
                 }
@@ -5716,8 +5711,7 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-            if !frames_engaged {
-                kron_a_phi.push(a_phi);
+            let (kron_a_phi, kron_jac) = if !frames_engaged {
                 // Flatten local_jac_row row-major into a plain Vec<f64> (q_row * p entries).
                 let mut jac_flat = vec![0.0_f64; q_row * p];
                 for c in 0..q_row {
@@ -5725,9 +5719,57 @@ impl SaeManifoldTerm {
                         jac_flat[c * p + j] = local_jac_row[[c, j]];
                     }
                 }
-                kron_jac.push(jac_flat);
+                (Some(a_phi), Some(jac_flat))
+            } else {
+                (None, None)
+            };
+            Ok(SaeAssemblyRow {
+                row,
+                block,
+                gb_delta,
+                g_blocks,
+                kron_a_phi,
+                kron_jac,
+            })
+        })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let mut g_blocks: SaeGBlocks = std::collections::BTreeMap::new();
+        let mut kron_a_phi: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n);
+        let mut kron_jac: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for (row, row_result) in row_results.into_iter().enumerate() {
+            assert_eq!(
+                row, row_result.row,
+                "parallel SAE row assembly returned rows out of order"
+            );
+            for (idx, value) in row_result.gb_delta {
+                sys.gb[idx] += value;
             }
-            sys.rows[row] = block;
+            for ((atom_i, atom_j), data) in row_result.g_blocks {
+                let m_i = data.nrows();
+                let m_j = data.ncols();
+                let blk = g_blocks
+                    .entry((atom_i, atom_j))
+                    .or_insert_with(|| Array2::<f64>::zeros((m_i, m_j)));
+                for li in 0..m_i {
+                    for lj in 0..m_j {
+                        blk[[li, lj]] += data[[li, lj]];
+                    }
+                }
+            }
+            if !frames_engaged {
+                kron_a_phi.push(
+                    row_result
+                        .kron_a_phi
+                        .expect("full-B SAE row assembly must return a_phi rows"),
+                );
+                kron_jac.push(
+                    row_result
+                        .kron_jac
+                        .expect("full-B SAE row assembly must return local Jacobian rows"),
+                );
+            }
+            sys.rows[row] = row_result.block;
         }
         // Apply Riemannian geometry to the per-row row blocks (htt, gt) and
         // also to the per-row Kronecker local Jacobians stored in kron_jac.
