@@ -5,6 +5,12 @@
 //! of rank approximately equal to the term EDF, while unpenalized null-space
 //! coefficients are kept full-rank. The reference degrees of freedom use the
 //! coefficient-space influence block `F_jj = (H⁻¹ X'WX)_jj`.
+//!
+//! Bartlett and Lawley mean corrections are likelihood-ratio corrections, so
+//! they are not applied here. In the ordinary unpenalized Gaussian model the
+//! Wald statistic satisfies `T / q ~ F(q, ν)` exactly, while under a ridge
+//! penalty even the one-parameter statistic becomes `(n / (n + λ))χ²₁` rather
+//! than a central χ²/F reference target.
 
 use crate::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView1, s};
@@ -46,16 +52,6 @@ pub struct SmoothTestInput<'a> {
     pub nullspace_dim: usize,
     pub residual_df: f64,
     pub scale: SmoothTestScale,
-    /// Lawley (1956) second-order LR mean shift `Δε = ε_k − ε_{k−q}` for the
-    /// tested block (issue #939), from
-    /// [`crate::inference::lawley::lawley_lr_mean_shift`] evaluated on the
-    /// family cumulant jets at the fit. When present, the `Known`-scale branch
-    /// reports the Bartlett-corrected p-value (`c = 1 + Δε/ref_df`, the factor
-    /// completed with the same trace-corrected reference d.f. the χ² tail
-    /// uses) alongside the first-order one. Ignored by the `Estimated` branch,
-    /// which has its own closed-form conjugate factor. `None` ⇒ first-order
-    /// only.
-    pub known_scale_lr_mean_shift: Option<f64>,
 }
 
 /// Output of `wood_smooth_test`: the Wald statistic
@@ -67,18 +63,6 @@ pub struct SmoothTestResult {
     pub statistic: f64,
     pub ref_df: f64,
     pub p_value: f64,
-    /// Second-order-accurate (Bartlett-corrected) p-value, reported *alongside*
-    /// — never replacing — the first-order `p_value` (issue #939). Populated for
-    /// the estimated-scale (Gaussian-linear / penalized-quadratic conjugate)
-    /// branch, where the exact Bartlett factor is a closed form of the reference
-    /// and residual degrees of freedom, and for the known-scale branch when the
-    /// caller supplies the Lawley LR mean shift from the family cumulant jets
-    /// (`SmoothTestInput::known_scale_lr_mean_shift`).
-    pub p_value_corrected: Option<f64>,
-    /// The Bartlett factor `c = E[W]/d` used for `p_value_corrected`. Its
-    /// distance from `1` is the per-test diagnostic the field lacks: how far
-    /// first-order inference is distorted at this `n`.
-    pub bartlett_factor: Option<f64>,
 }
 
 /// Wood (2013) rank-truncated Wald smooth-component test.
@@ -135,30 +119,9 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
     if !statistic.is_finite() || statistic < 0.0 || !ref_df.is_finite() || ref_df <= 0.0 {
         return None;
     }
-    let mut p_value_corrected: Option<f64> = None;
-    let mut bartlett_factor: Option<f64> = None;
     let p_value = match input.scale {
         SmoothTestScale::Known => {
             let dist = ChiSquared::new(ref_df).ok()?;
-            // Second-order Bartlett correction for the known-scale branch
-            // (#939). Lawley (1956): E[W] = d + Δε + O(n⁻²) with Δε =
-            // ε_k − ε_{k−q} assembled by the caller from the exact family
-            // cumulant jets (`crate::inference::lawley`), so the factor is
-            // c = E[W]/d = 1 + Δε/d with d the same trace-corrected reference
-            // d.f. the χ² tail uses. Degenerate factors (non-finite, ≤ 0) fall
-            // back to first-order-only reporting inside `bartlett_correct`.
-            // Reported alongside, never replacing, the first-order p-value.
-            if let Some(shift) = input.known_scale_lr_mean_shift {
-                if shift.is_finite() {
-                    let c = 1.0 + shift / ref_df;
-                    if let Some(corr) =
-                        crate::inference::higher_order::bartlett_correct(statistic, ref_df, c)
-                    {
-                        p_value_corrected = Some(corr.corrected_p_value);
-                        bartlett_factor = Some(corr.factor);
-                    }
-                }
-            }
             1.0 - dist.cdf(statistic)
         }
         SmoothTestScale::Estimated => {
@@ -171,24 +134,6 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
             // by `φ̂` again would re-introduce a response-unit dependence (#675).
             let f_stat = statistic / ref_df;
             let dist = FisherSnedecor::new(ref_df, input.residual_df).ok()?;
-            // Second-order Bartlett correction (#939). The estimated-scale branch
-            // is the Gaussian-linear / penalized-quadratic conjugate case, where
-            // the exact Bartlett factor `c = 1 + (q+1)/(2ν)` (q = ref_df,
-            // ν = residual_df) maps the first-order reference toward the exact
-            // distribution. Rescale the statistic by `c` and re-reference; this
-            // recovers the nominal mean to second order at finite n. Reported
-            // alongside, never replacing, the first-order p-value.
-            if let Some(c) = crate::inference::higher_order::gaussian_linear_bartlett_factor(
-                ref_df,
-                input.residual_df,
-            ) {
-                let f_corrected = f_stat / c;
-                let p_corr = (1.0 - dist.cdf(f_corrected)).clamp(0.0, 1.0);
-                if p_corr.is_finite() {
-                    p_value_corrected = Some(p_corr);
-                    bartlett_factor = Some(c);
-                }
-            }
             1.0 - dist.cdf(f_stat)
         }
     };
@@ -199,8 +144,6 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
         statistic,
         ref_df,
         p_value: p_value.clamp(0.0, 1.0),
-        p_value_corrected,
-        bartlett_factor,
     })
 }
 
@@ -268,6 +211,7 @@ fn reference_df(influence: Option<&Array2<f64>>, start: usize, end: usize) -> Op
 mod tests {
     use super::*;
     use ndarray::array;
+    use statrs::distribution::{ChiSquared, ContinuousCDF};
 
     #[test]
     fn reference_df_uses_trace_correction() {
@@ -283,7 +227,6 @@ mod tests {
             nullspace_dim: 0,
             residual_df: 20.0,
             scale: SmoothTestScale::Known,
-            known_scale_lr_mean_shift: None,
         })
         .expect("smooth test");
         assert!((out.ref_df - 1.8).abs() < 1e-12);
@@ -291,49 +234,26 @@ mod tests {
         assert!((0.0..=1.0).contains(&out.p_value));
     }
 
-    /// Known-scale Bartlett wiring (#939): a positive Lawley mean shift Δε
-    /// gives c = 1 + Δε/ref_df > 1, so the corrected statistic shrinks and the
-    /// corrected p-value exceeds the first-order one — reported alongside it,
-    /// with the exact factor surfaced. No shift ⇒ first-order only.
     #[test]
-    fn known_scale_branch_applies_lawley_mean_shift() {
+    fn known_scale_branch_reports_plain_wald_chi_square() {
         let beta = array![1.0, 2.0];
         let cov = array![[2.0, 0.0], [0.0, 3.0]];
         let f = array![[0.5, 0.0], [0.0, 0.25]];
-        let run = |shift: Option<f64>| {
-            wood_smooth_test(SmoothTestInput {
-                beta: beta.view(),
-                covariance: &cov,
-                influence_matrix: Some(&f),
-                coeff_range: 0..2,
-                edf: 1.0,
-                nullspace_dim: 0,
-                residual_df: 20.0,
-                scale: SmoothTestScale::Known,
-                known_scale_lr_mean_shift: shift,
-            })
-            .expect("smooth test")
-        };
-        let first_order = run(None);
-        assert!(first_order.p_value_corrected.is_none());
-        assert!(first_order.bartlett_factor.is_none());
+        let out = wood_smooth_test(SmoothTestInput {
+            beta: beta.view(),
+            covariance: &cov,
+            influence_matrix: Some(&f),
+            coeff_range: 0..2,
+            edf: 1.0,
+            nullspace_dim: 0,
+            residual_df: 20.0,
+            scale: SmoothTestScale::Known,
+        })
+        .expect("smooth test");
 
-        let shift = 0.36; // Δε ⇒ c = 1 + 0.36/1.8 = 1.2 against ref_df = 1.8.
-        let corrected = run(Some(shift));
-        assert!((corrected.p_value - first_order.p_value).abs() < 1e-15);
-        let c = corrected.bartlett_factor.expect("factor");
-        assert!((c - 1.2).abs() < 1e-12, "c = {c}");
-        let p_corr = corrected.p_value_corrected.expect("corrected p");
-        assert!(
-            p_corr > corrected.p_value,
-            "c > 1 must enlarge the p-value: {} vs {}",
-            p_corr,
-            corrected.p_value
-        );
-        // Degenerate shift (c ≤ 0) must fall back to first-order only.
-        let degenerate = run(Some(-3.6));
-        assert!(degenerate.p_value_corrected.is_none());
-        assert!(degenerate.bartlett_factor.is_none());
+        let dist = ChiSquared::new(out.ref_df).expect("chi-square");
+        let expected = 1.0 - dist.cdf(out.statistic);
+        assert!((out.p_value - expected).abs() < 1e-15);
     }
 
     /// Rescaling the response by `c` is `β → c·β`, `Σ → c²·Σ` (the covariance
@@ -360,7 +280,6 @@ mod tests {
                 nullspace_dim: 0,
                 residual_df: 50.0,
                 scale: SmoothTestScale::Estimated,
-                known_scale_lr_mean_shift: None,
             })
             .expect("smooth test")
         };
