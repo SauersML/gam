@@ -315,10 +315,7 @@ fn householder_drop_first_apply(x: &Array2<f64>, u: &Array1<f64>) -> Array2<f64>
     out
 }
 
-fn symmetric_pseudoinverse(
-    a: &Array2<f64>,
-    label: &str,
-) -> Result<Array2<f64>, BasisError> {
+fn symmetric_pseudoinverse(a: &Array2<f64>, label: &str) -> Result<Array2<f64>, BasisError> {
     let n = a.nrows();
     if a.ncols() != n {
         crate::bail_dim_basis!(
@@ -336,11 +333,7 @@ fn symmetric_pseudoinverse(
     let mut scaled = evecs.clone();
     for (k, mut col) in scaled.axis_iter_mut(Axis(1)).enumerate() {
         let lam = evals[k].max(0.0);
-        let inv = if lam > rank_tol {
-            1.0 / lam
-        } else {
-            0.0
-        };
+        let inv = if lam > rank_tol { 1.0 / lam } else { 0.0 };
         col.mapv_inplace(|v| v * inv);
     }
     Ok(scaled.dot(&evecs.t()))
@@ -1504,7 +1497,7 @@ pub fn build_measure_jet_basis_psi_derivatives(
             &band,
             geom.order_s_eval,
             spec.alpha,
-            t,
+            spec.tau0,
         )?;
         let raw = vec![(
             sandwich(&jets.q),
