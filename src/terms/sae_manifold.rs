@@ -13992,10 +13992,13 @@ impl SaeManifoldOuterObjective {
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
     /// the cached ρ / loss and (optionally) priming the inner solve from a
     /// seeded β. Returns `(cost, β̂)`.
-    fn evaluate(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(f64, Array1<f64>), String> {
-        self.evaluate_with_refine_policy(rho_flat, true)
-    }
-
+    ///
+    /// `refine_progress_extension = false` selects the value-probe refine
+    /// budget (#1029). The budget cut keeps the SAME KKT/step tolerance as the
+    /// full path — a successfully returned value is converged to the identical
+    /// stationarity measure, so probe values and accepted-point values are
+    /// always comparable; only an expensive grind-then-refuse becomes a cheap
+    /// refusal (a recoverable line-search reject).
     fn evaluate_with_refine_policy(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
@@ -14170,7 +14173,15 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-        self.evaluate(rho.view())
+        // Value-only comparison path (compass polls, EFS backtracking, seed
+        // validation, FD certificate probes): no gradient/Hessian is ever
+        // consumed at this iterate, so it takes the cheap probe refine budget
+        // (#1029). Accepted points are always re-polished through
+        // `eval`/`eval_with_order(ValueAndGradient|ValueGradientHessian)`
+        // before any derivative consumption, and a probe value — when one is
+        // returned at all — is converged to the same KKT/step tolerance as
+        // the full-budget path, so all ranked comparisons stay in one measure.
+        self.evaluate_with_refine_policy(rho.view(), false)
             .map(|(cost, _beta)| cost)
             .map_err(EstimationError::RemlOptimizationFailed)
     }
@@ -17119,6 +17130,108 @@ mod tests {
             .unwrap();
         assert_abs_diff_eq!(stream_cost, full_cost, epsilon = 1.0e-8);
         assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
+    }
+
+    /// #1029 measure-consistency gate: the value-probe refine policy must
+    /// rank the SAME criterion as the full accepted-point policy. The probe
+    /// budget only caps refinement work — it never loosens the KKT/step
+    /// tolerance — so when both policies converge from the same state, the
+    /// returned criterion values must match to inner-solve tolerance. A loose
+    /// probe value compared against a tight reference value is exactly the
+    /// estimator/threshold measure mismatch that caused the BMS HT-subsample
+    /// false-reject bug; this test pins the invariant that forbids it.
+    #[test]
+    fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
+        let (term0, target, rho) = small_two_atom_periodic_term();
+        let mut full = term0.clone();
+        let mut probe = term0;
+        let (full_cost, full_loss) = full
+            .reml_criterion_with_refine_policy(
+                target.view(),
+                &rho,
+                None,
+                2,
+                0.25,
+                1.0e-4,
+                1.0e-4,
+                true,
+            )
+            .expect("full-budget criterion must converge on the small fixture");
+        let (probe_cost, probe_loss) = probe
+            .reml_criterion_with_refine_policy(
+                target.view(),
+                &rho,
+                None,
+                2,
+                0.25,
+                1.0e-4,
+                1.0e-4,
+                false,
+            )
+            .expect("probe-budget criterion must converge on the small fixture");
+        assert_abs_diff_eq!(probe_cost, full_cost, epsilon = 1.0e-8);
+        assert_abs_diff_eq!(probe_loss.total(), full_loss.total(), epsilon = 1.0e-8);
+    }
+
+    /// #1029 budget-policy gate: value probes get the base refine budget and
+    /// NEVER earn the progress extension (their base and progress budgets
+    /// coincide), while the accepted-point path extends only on a measured
+    /// round-to-round KKT-residual drop and falls back to the base budget on
+    /// a stall.
+    #[test]
+    fn refine_iteration_limit_probe_budget_never_extends() {
+        let probe_base = 16usize;
+        // Probe policy: base == progress, so even perfect progress cannot
+        // extend past the base work budget.
+        assert_eq!(
+            SaeManifoldTerm::refine_iteration_limit(
+                probe_base,
+                probe_base,
+                probe_base,
+                Some(1.0),
+                0.5,
+                true
+            ),
+            probe_base
+        );
+        let accepted_base = 64usize;
+        let accepted_progress = 256usize;
+        // Accepted-point policy: a real residual drop extends the budget…
+        assert_eq!(
+            SaeManifoldTerm::refine_iteration_limit(
+                accepted_base,
+                accepted_base,
+                accepted_progress,
+                Some(1.0),
+                0.5,
+                false
+            ),
+            accepted_progress
+        );
+        // …a stalled residual does not…
+        assert_eq!(
+            SaeManifoldTerm::refine_iteration_limit(
+                accepted_base,
+                accepted_base,
+                accepted_progress,
+                Some(1.0),
+                1.0,
+                false
+            ),
+            accepted_base
+        );
+        // …and below the base budget no extension question arises yet.
+        assert_eq!(
+            SaeManifoldTerm::refine_iteration_limit(
+                accepted_base - 1,
+                accepted_base,
+                accepted_progress,
+                None,
+                1.0e9,
+                false
+            ),
+            accepted_base
+        );
     }
 
     #[test]
