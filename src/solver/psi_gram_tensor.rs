@@ -81,6 +81,15 @@ pub struct PsiGramTensor {
     rhs: Vec<Array1<f64>>,
 }
 
+/// One ladder rung's outcome: a hard evaluation failure aborts the whole
+/// build (no larger rung can fix a non-finite design), an uncertified tail
+/// escalates to the next rung, and a candidate proceeds to the spot check.
+enum BuildOutcome {
+    EvalFailed,
+    TailNotCertified,
+    Candidate(PsiGramTensor),
+}
+
 /// Chebyshev values `T_0..T_{n−1}` at `x ∈ [−1, 1]`.
 fn cheb_t(x: f64, n: usize) -> Vec<f64> {
     let mut t = vec![0.0; n];
@@ -138,14 +147,19 @@ impl PsiGramTensor {
             return None;
         }
         for &m in PSI_GRAM_NODE_LADDER.iter() {
-            let Some(candidate) = Self::build_at(&mut eval_design, weights, z, psi_lo, psi_hi, m)
-            else {
+            match Self::build_at(&mut eval_design, weights, z, psi_lo, psi_hi, m) {
                 // An exact evaluation failed or was non-finite somewhere in
                 // the window — no larger rung can fix that.
-                return None;
-            };
-            if candidate.spot_check(&mut eval_design, weights) {
-                return Some(candidate);
+                BuildOutcome::EvalFailed => return None,
+                // Tail not yet below the certificate at this rung: escalate.
+                // (Conflating this with EvalFailed would kill the ladder at
+                // its first — intentionally coarse — rung.)
+                BuildOutcome::TailNotCertified => continue,
+                BuildOutcome::Candidate(candidate) => {
+                    if candidate.spot_check(&mut eval_design, weights) {
+                        return Some(candidate);
+                    }
+                }
             }
         }
         None
@@ -158,7 +172,7 @@ impl PsiGramTensor {
         psi_lo: f64,
         psi_hi: f64,
         m: usize,
-    ) -> Option<Self> {
+    ) -> BuildOutcome {
         // First-kind Chebyshev nodes (no endpoints) and exact design slabs.
         let mut nodes_x = vec![0.0_f64; m];
         let mut designs: Vec<Array2<f64>> = Vec::with_capacity(m);
@@ -166,9 +180,11 @@ impl PsiGramTensor {
             let x = (std::f64::consts::PI * (2 * i + 1) as f64 / (2 * m) as f64).cos();
             *x_slot = x;
             let psi = 0.5 * (psi_lo + psi_hi) + 0.5 * (psi_hi - psi_lo) * x;
-            let design = eval_design(psi).ok()?;
+            let Ok(design) = eval_design(psi) else {
+                return BuildOutcome::EvalFailed;
+            };
             if design.iter().any(|v| !v.is_finite()) {
-                return None;
+                return BuildOutcome::EvalFailed;
             }
             designs.push(design);
         }
@@ -179,7 +195,7 @@ impl PsiGramTensor {
             || n == 0
             || k == 0
         {
-            return None;
+            return BuildOutcome::EvalFailed;
         }
         // First-kind discrete orthogonality: coefficient slabs
         //   X_d = (γ_d / m) Σ_i X(ψ_i) T_d(x_i),  γ_0 = 1, γ_d = 2.
@@ -210,7 +226,7 @@ impl PsiGramTensor {
                 let bound = PSI_GRAM_CERT_RTOL * scale.max(1e-300);
                 for i in 0..n {
                     if slab[[i, j]].abs() > bound {
-                        return None;
+                        return BuildOutcome::TailNotCertified;
                     }
                 }
             }
@@ -242,7 +258,7 @@ impl PsiGramTensor {
             }
             rhs.push(coeff_slabs[d].t().dot(&wz));
         }
-        Some(Self {
+        BuildOutcome::Candidate(Self {
             psi_lo,
             psi_hi,
             n_coeff: m,
