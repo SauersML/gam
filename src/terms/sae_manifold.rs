@@ -7557,7 +7557,13 @@ impl SaeManifoldTerm {
             return Ok(factored.2);
         }
         let mut total_inner_iter = inner_max_iter;
-        let base_refine_iter = inner_max_iter.max(1).saturating_mul(16).max(64);
+        let accepted_base_refine_iter = inner_max_iter.max(1).saturating_mul(16).max(64);
+        let value_probe_base_refine_iter = inner_max_iter.max(1).saturating_mul(6).max(24);
+        let base_refine_iter = if refine_progress_extension {
+            accepted_base_refine_iter
+        } else {
+            value_probe_base_refine_iter
+        };
         let progress_refine_iter = if refine_progress_extension {
             inner_max_iter.max(1).saturating_mul(64).max(256)
         } else {
