@@ -503,11 +503,14 @@ fn regularized_lower_gamma(a: f64, x: f64) -> f64 {
 /// `P(a, x) = p`, where `P(a, x) = γ(a, x) / Γ(a)` is the CDF of a unit-scale
 /// `Gamma(shape = a)` variate, `a > 0`, `p ∈ (0, 1)`.
 ///
-/// Uses the standard rational/Wilson–Hilferty initial estimate (a series form
-/// for `a ≤ 1`) refined by Halley's method on `P(a, x) − p` — third order, a
-/// Newton step scaled by the local curvature of `P`. The ratio `P(a, x)` is the
-/// crate's own [`regularized_lower_gamma`] (NOT `statrs::gamma_lr`, which clamps
-/// the residual to `−p` for tiny `x`; see that fn's note); the density
+/// Uses the standard rational/Wilson–Hilferty initial estimate, except in the
+/// extreme lower tail where the exact small-`x` seed
+/// `exp((ln p + ln Γ(a + 1)) / a)` follows from `P(a, x) ~ x^a / Γ(a + 1)`.
+/// For `a ≤ 1` it keeps the Numerical Recipes series/log initial estimate. The
+/// seed is refined by Halley's method on `P(a, x) − p` — third order, a Newton
+/// step scaled by the local curvature of `P`. The ratio `P(a, x)` is the crate's
+/// own [`regularized_lower_gamma`] (NOT `statrs::gamma_lr`, which clamps the
+/// residual to `−p` for tiny `x`; see that fn's note); the density
 /// `f(x) = x^{a−1} e^{−x} / Γ(a)` is evaluated through the same overflow-safe
 /// log factorization Numerical Recipes uses (`invgammp`), so the iteration stays
 /// finite across a wide range of `a`. A positivity step-halving guard keeps the
@@ -529,8 +532,9 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
     let a1 = a - 1.0;
 
     // Initial estimate. For `a > 1` a Wilson–Hilferty transform of a normal
-    // quantile (the rational tail approximation avoids depending on the caller's
-    // own quantile); for `a ≤ 1` the small-`x` series / large-`x` log form.
+    // quantile works away from the extreme lower tail; there, the small-`x`
+    // analytic seed is essentially exact. Both seeds feed the same Halley polish,
+    // so the crossover is continuous at the converged quantile.
     let mut x = if a > 1.0 {
         let pp = if p < 0.5 { p } else { 1.0 - p };
         let t = (-2.0 * pp.ln()).sqrt();
@@ -538,7 +542,25 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
         if p < 0.5 {
             z = -z;
         }
-        (a * (1.0 - 1.0 / (9.0 * a) - z / (3.0 * a.sqrt())).powi(3)).max(1.0e-3)
+        let wh_inner = 1.0 - 1.0 / (9.0 * a) - z / (3.0 * a.sqrt());
+        let wh_seed = if wh_inner > 0.0 {
+            a * wh_inner.powi(3)
+        } else {
+            f64::NAN
+        };
+        let analytic_seed = ((p.ln() + ln_gamma(a + 1.0)) / a).exp();
+        if analytic_seed == 0.0 {
+            return 0.0;
+        }
+        if !wh_seed.is_finite()
+            || wh_seed <= 0.0
+            || wh_seed < 1.0e-2
+            || analytic_seed < 1.0e-2
+        {
+            analytic_seed
+        } else {
+            wh_seed
+        }
     } else {
         let t = 1.0 - a * (0.253 + a * 0.12);
         if p < t {
@@ -717,6 +739,36 @@ mod tests {
                 rel < 1e-4,
                 "gamma_quantile(p={p}, a={a}) = {got}, expected ≈ {expected} (rel err {rel})"
             );
+        }
+    }
+
+    #[test]
+    fn gamma_quantile_handles_extreme_lower_tail_for_shape_two() {
+        let got = gamma_quantile(1.0e-300, 2.0, 1.0);
+        let expected = 1.414_213_562_373_095_1e-150;
+        let rel = (got - expected).abs() / expected;
+        assert!(
+            rel < 1.0e-6,
+            "gamma_quantile(1e-300, 2, 1) = {got}, expected {expected} (rel err {rel})"
+        );
+    }
+
+    #[test]
+    fn gamma_quantile_round_trips_extreme_lower_tail_for_shape_above_one() {
+        for &a in &[1.5_f64, 2.0, 5.0, 20.0] {
+            for &p in &[1.0e-300_f64, 1.0e-100, 1.0e-12, 1.0e-3, 0.5, 0.999] {
+                let x = gamma_quantile(p, a, 1.0);
+                assert!(
+                    x.is_finite() && x >= 0.0,
+                    "non-finite quantile a={a} p={p}: {x}"
+                );
+                let recovered = regularized_lower_gamma(a, x);
+                let rel = (recovered - p).abs() / p;
+                assert!(
+                    rel < 1.0e-6,
+                    "round-trip failed a={a} p={p}: q={x}, P(a,q)={recovered}, rel err {rel}"
+                );
+            }
         }
     }
 
