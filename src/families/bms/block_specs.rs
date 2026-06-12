@@ -2538,6 +2538,34 @@ pub fn fit_bernoulli_marginal_slope_terms(
             state.beta = reparam.recover_original_logslope_beta(&state.beta)?;
         }
     }
+    // #905 GENERATED-REGRESSOR (Murphy–Topel) SEAM. When the conditional
+    // location-scale gate fired, the slope fit above treated the calibrated
+    // score `ζ = (z − m̂(C))/√v̂(C)` as KNOWN, so `solved_fit.beta_covariance()`
+    // is the naive second-stage covariance `V_β^naive = H_β⁻¹` that ignores the
+    // first-stage estimation error in `θ₁ = (mean_coeffs, var_coeffs)`. The
+    // honest two-stage covariance is
+    //   `V_β = V_β^naive + (H_β⁻¹ G) V₁ (H_β⁻¹ G)ᵀ`,  `G = ∂(score_β)/∂θ₁`.
+    // The closed-form first-stage covariance `V₁` and the per-row chain-rule
+    // sensitivity `∂ζ_i/∂θ₁` are computed and stored on the calibration at fit
+    // time (see `LatentZConditionalCalibration::{theta1_covariance,
+    // zeta_theta1_jacobian_row, generated_regressor_term}`), so the correction
+    // is consumable wherever the slope information `G` (the per-row
+    // `∂score_β/∂ζ_i` of the marginal/logslope blocks) is available.
+    //
+    // The consumption point is DEFERRED out of this assembly: the second-stage
+    // covariance `solved_fit.beta_covariance()` is produced by the GENERIC
+    // `evaluate_custom_family_joint_hyper_efs_shared` engine (shared with the
+    // survival marginal-slope family), which applies `ζ` to the response BEFORE
+    // building the joint design and never surfaces its per-row response-score
+    // derivatives `∂score_β/∂ζ_i`. Forming `G` here would require either
+    // re-deriving those row-kernel derivatives at the converged `β` or threading
+    // `∂ζ/∂θ₁` through that engine — a cross-family refactor of the inner solve.
+    // Until that engine exposes `∂score_β/∂ζ`, the correction rides the stored
+    // first-stage quantities: a consumer with the converged slope design and the
+    // row-kernel response-score (the same `q`-channel derivative the influence
+    // absorber #461 already forms) builds `G = Σ_i (∂score_β/∂ζ_i) (∂ζ_i/∂θ₁)`,
+    // solves `H_β⁻¹ G` against `solved_fit`'s penalized Hessian, and ADDS
+    // `cal.generated_regressor_term(H_β⁻¹ G)` to the reported `beta_covariance`.
     let (latent_z_rank_int_calibration, latent_z_conditional_calibration) =
         match latent_z_calibration {
             LatentMeasureCalibration::None => (None, None),

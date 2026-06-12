@@ -957,6 +957,149 @@ impl LatentZConditionalCalibration {
         }
         Ok(out)
     }
+
+    /// Dimension of the first-stage parameter vector `θ₁ = (mean_coeffs,
+    /// var_coeffs)` whose estimation uncertainty the generated-regressor
+    /// correction propagates. Equals `len(mean_coeffs)` when the variance block
+    /// is inactive, otherwise `len(mean_coeffs) + len(var_coeffs)`.
+    pub fn theta1_dim(&self) -> usize {
+        self.mean_coeffs.len() + self.var_coeffs.len()
+    }
+
+    /// Per-row sensitivity `∂ζ_i/∂θ₁` of the calibrated score to the first-stage
+    /// calibration coefficients, stacked as `[∂ζ/∂mean_coeffs | ∂ζ/∂var_coeffs]`
+    /// (length [`Self::theta1_dim`]). With `ζ = (z − m(C))/√v(C)`,
+    /// `A_i = [1 | a(C_i)]`, `m = A_iᵀ·mean_coeffs`, `v = A_iᵀ·var_coeffs`:
+    ///
+    ///   `∂ζ/∂m = −1/√v`,  `∂ζ/∂v = −(z − m)/(2 v^{3/2}) = −ζ/(2v)`,
+    ///
+    /// and by the chain rule through the affine basis
+    /// `∂ζ/∂mean_coeffs = (∂ζ/∂m)·A_i`, `∂ζ/∂var_coeffs = (∂ζ/∂v)·A_i`. The
+    /// variance block contributes only when `var_coeffs` is active AND the
+    /// fitted `v(C_i)` is above the floor (a floored row has `∂v/∂var_coeffs = 0`
+    /// in the applied map). `z` is the (normalized) raw latent score at this row.
+    pub fn zeta_theta1_jacobian_row(&self, z: f64, a_row: ArrayView1<'_, f64>) -> Vec<f64> {
+        let m = self.conditional_mean(a_row);
+        let v = self.conditional_var(a_row);
+        let inv_sqrt_v = 1.0 / v.sqrt();
+        // Intercept-augmented basis row A_i = [1 | a(C_i)].
+        let mut out = Vec::with_capacity(self.theta1_dim());
+        let dzeta_dm = -inv_sqrt_v;
+        out.push(dzeta_dm); // intercept column of A
+        for &x in a_row.iter() {
+            out.push(dzeta_dm * x);
+        }
+        if !self.var_coeffs.is_empty() {
+            // ∂ζ/∂v active only off the floor; on the floor the applied v(C) is
+            // constant in var_coeffs, so the variance sensitivity is exactly 0.
+            let raw_v = Self::affine(&self.var_coeffs, a_row);
+            let dzeta_dv = if raw_v > self.var_floor {
+                let zeta = (z - m) * inv_sqrt_v;
+                -zeta / (2.0 * v)
+            } else {
+                0.0
+            };
+            out.push(dzeta_dv);
+            for &x in a_row.iter() {
+                out.push(dzeta_dv * x);
+            }
+        }
+        out
+    }
+
+    /// Block-diagonal first-stage covariance `V₁ = blkdiag(mean_cov, var_cov)`
+    /// of `θ₁`, ordered to match [`Self::zeta_theta1_jacobian_row`]. The two
+    /// stages are fit on (asymptotically) uncorrelated estimating equations
+    /// (the mean score `Σ w û A` and the Breusch–Pagan variance score
+    /// `Σ w (û² − v) A` are orthogonal under the Gaussian working model), so the
+    /// joint first-stage covariance is block-diagonal to first order — the same
+    /// approximation the Rao gate above uses.
+    pub fn theta1_covariance(&self) -> Array2<f64> {
+        let dm = self.mean_coeffs.len();
+        let dv = self.var_coeffs.len();
+        let mut v1 = Array2::<f64>::zeros((dm + dv, dm + dv));
+        v1.slice_mut(s![..dm, ..dm]).assign(&self.mean_cov);
+        if dv > 0 {
+            v1.slice_mut(s![dm.., dm..]).assign(&self.var_cov);
+        }
+        v1
+    }
+
+    /// Murphy–Topel generated-regressor correction term for the second-stage
+    /// slope covariance. Given the second-stage information `H_β` (the penalized
+    /// joint Hessian of the slope fit, whose inverse is the naive `V_β`) and the
+    /// cross-derivative `G = ∂(score_β)/∂θ₁` (`p_β × dim θ₁`), the corrected
+    /// covariance is
+    ///
+    ///   `V_β = V_β^naive + (H_β⁻¹ G) V₁ (H_β⁻¹ G)ᵀ`.
+    ///
+    /// This returns the additive rank-`dim θ₁` term `(H_β⁻¹ G) V₁ (H_β⁻¹ G)ᵀ`
+    /// given the already-formed `hbeta_inv_g = H_β⁻¹ G` (`p_β × dim θ₁`). The
+    /// caller forms `G` by accumulating the per-row slope-score sensitivity to
+    /// `ζ_i` times [`Self::zeta_theta1_jacobian_row`] (chain rule
+    /// `∂score_β/∂θ₁ = Σ_i (∂score_β/∂ζ_i) (∂ζ_i/∂θ₁)`).
+    pub fn generated_regressor_term(&self, hbeta_inv_g: ArrayView2<'_, f64>) -> Array2<f64> {
+        let v1 = self.theta1_covariance();
+        hbeta_inv_g.dot(&v1).dot(&hbeta_inv_g.t())
+    }
+}
+
+/// First-stage robust (HC0) sandwich covariance of a weighted-ridge coefficient
+/// vector: `V₁ = M⁻¹ (Σ_i w_i² û_i² A_i A_iᵀ) M⁻¹` with `M = AᵀWA + λR` the
+/// ridge normal matrix that produced the coefficients, `W = diag(weights)`,
+/// `û_i` the per-row residual, and `A` the regression basis (here `[1 | a(C)]`).
+/// This is the closed-form generated-regressor covariance the second-stage
+/// Murphy–Topel correction consumes; the same `w² û²` meat the Rao gate uses,
+/// so the gate and the propagated SE are derived from one robust convention.
+fn weighted_ridge_sandwich_cov(
+    basis: ArrayView2<'_, f64>,
+    residuals: &[f64],
+    weights: ArrayView1<'_, f64>,
+    normal_matrix: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    let n = basis.nrows();
+    let p = basis.ncols();
+    if residuals.len() != n || weights.len() != n {
+        return Err(format!(
+            "weighted ridge sandwich length mismatch: rows={n}, residuals={}, weights={}",
+            residuals.len(),
+            weights.len()
+        ));
+    }
+    // Robust HC0 meat: Σ_i w_i² û_i² A_i A_iᵀ.
+    let mut meat = Array2::<f64>::zeros((p, p));
+    for i in 0..n {
+        let wi = weights[i];
+        if wi <= 0.0 {
+            continue;
+        }
+        let w2u2 = wi * wi * residuals[i] * residuals[i];
+        if w2u2 == 0.0 {
+            continue;
+        }
+        let a_row = basis.row(i);
+        for j in 0..p {
+            let aj = a_row[j];
+            if aj == 0.0 {
+                continue;
+            }
+            let scaled = w2u2 * aj;
+            for k in j..p {
+                let inc = scaled * a_row[k];
+                meat[[j, k]] += inc;
+                if k != j {
+                    meat[[k, j]] += inc;
+                }
+            }
+        }
+    }
+    let m_inv = crate::linalg::utils::invert_spd_with_ridge(normal_matrix, AUTO_Z_CONDITIONAL_RIDGE_REL)
+        .map_err(|e| format!("conditional latent calibration sandwich inverse failed: {e}"))?;
+    let cov = m_inv.dot(&meat).dot(&m_inv);
+    if cov.iter().any(|v| !v.is_finite()) {
+        return Err("conditional latent calibration sandwich covariance is non-finite".to_string());
+    }
+    Ok(cov)
 }
 
 /// Weighted mean of a slice of values.
@@ -1162,26 +1305,64 @@ fn fit_conditional_latent_calibration_if_needed(
     )?;
     let mean_coeffs: Vec<f64> = mean_coeffs_mat.column(0).to_vec();
 
+    // First-stage (generated-regressor) normal matrix `M = AᵀWA + λR`, the same
+    // weighted-ridge system `gaussian_weighted_ridge` factorizes internally;
+    // rebuilt here so its inverse can form the closed-form coefficient sandwich
+    // `V₁` that the second-stage Murphy–Topel correction consumes. `p` is the
+    // marginal-index width (small), so this is a cheap dense `(p+1)²` form.
+    let normal_matrix = {
+        let mut wa = basis.to_owned();
+        for i in 0..wa.nrows() {
+            let wi = weights[i];
+            wa.row_mut(i).iter_mut().for_each(|value| *value *= wi);
+        }
+        let mut m = basis.t().dot(&wa);
+        m += &(penalty.to_owned() * AUTO_Z_CONDITIONAL_RIDGE_REL);
+        m
+    };
+    let mean_residuals: Vec<f64> = z
+        .iter()
+        .zip(mean_fitted.column(0).iter())
+        .map(|(&zi, &mi)| zi - mi)
+        .collect();
+    let mean_cov = weighted_ridge_sandwich_cov(
+        basis.view(),
+        &mean_residuals,
+        weights.view(),
+        &normal_matrix,
+    )?;
+
     let var_floor = (AUTO_Z_CONDITIONAL_VAR_FLOOR_FRAC * global_var).max(f64::MIN_POSITIVE);
-    let var_coeffs: Vec<f64> = if var_fires {
+    let (var_coeffs, var_cov): (Vec<f64>, Array2<f64>) = if var_fires {
         // Conditional-variance correction: regress the squared mean-residual on
         // the same basis. Fitted values are floored at `var_floor` when applied.
-        let resid_sq: Array1<f64> = z
-            .iter()
-            .zip(mean_fitted.column(0).iter())
-            .map(|(&zi, &mi)| (zi - mi) * (zi - mi))
-            .collect();
+        let resid_sq: Array1<f64> = mean_residuals.iter().map(|&e| e * e).collect();
         let resid_col = resid_sq.view().insert_axis(ndarray::Axis(1));
-        let (var_coeffs_mat, _) = crate::linalg::utils::gaussian_weighted_ridge(
+        let (var_coeffs_mat, var_fitted) = crate::linalg::utils::gaussian_weighted_ridge(
             basis.view(),
             resid_col,
             penalty.view(),
             weights.view(),
             AUTO_Z_CONDITIONAL_RIDGE_REL,
         )?;
-        var_coeffs_mat.column(0).to_vec()
+        // First-stage sandwich for the variance coefficients on the same ridge
+        // normal matrix `M` (the basis and weights are identical; only the
+        // response — and hence the residual — differs). `û_i = (z−m̂)²_i − v̂_i`
+        // is the Breusch–Pagan residual.
+        let var_residuals: Vec<f64> = resid_sq
+            .iter()
+            .zip(var_fitted.column(0).iter())
+            .map(|(&si, &vi)| si - vi)
+            .collect();
+        let cov = weighted_ridge_sandwich_cov(
+            basis.view(),
+            &var_residuals,
+            weights.view(),
+            &normal_matrix,
+        )?;
+        (var_coeffs_mat.column(0).to_vec(), cov)
     } else {
-        Vec::new()
+        (Vec::new(), Array2::<f64>::zeros((0, 0)))
     };
 
     let mut calibration = LatentZConditionalCalibration {
@@ -1192,6 +1373,8 @@ fn fit_conditional_latent_calibration_if_needed(
         global_var,
         post_mean: 0.0,
         post_sd: 1.0,
+        mean_cov,
+        var_cov,
     };
 
     // Sanity-check post-correction moments on the training sample.
