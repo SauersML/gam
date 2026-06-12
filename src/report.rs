@@ -92,8 +92,9 @@ pub struct AnisotropicScalesRow {
 /// physical λ̂_ℓ per scale and the implied continuous order
 /// ŝ = −½ · (least-squares slope of ln λ̂_ℓ on ln ε_ℓ). `per_scale` empty
 /// means the term carries a single fused jet-energy penalty, so only the
-/// band and the spec's order are shown. main.rs computes everything; this
-/// row stays plain data like the rest of the file.
+/// band and the spec's order are shown. main.rs computes everything
+/// (`measure_jet_implied_order` derives ŝ); this row stays plain data like
+/// the rest of the file.
 pub struct MeasureJetSpectrumRow {
     pub term_name: String,
     pub eps_min: f64,

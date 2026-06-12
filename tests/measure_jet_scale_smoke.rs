@@ -63,7 +63,7 @@ fn filament_coordinate(row: usize, dim: usize) -> f64 {
 }
 
 #[test]
-fn measure_jet_build_scales_to_1e6_rows() {
+fn measure_jet_build_scale_smoke_200k_rows() {
     let data = Array2::<f64>::from_shape_fn((N_ROWS, N_DIMS), |(i, k)| filament_coordinate(i, k));
 
     let spec = MeasureJetBasisSpec {

@@ -7,25 +7,32 @@
 //! fixed orthonormal linear map plus small ambient coordinate noise. The
 //! response is a trend in arc-length, continuous at the junction, with a
 //! slope change onto strand C. Training deletes the middle third of strand B
-//! (the gap), so the two gates are exactly the term's two contracts:
+//! (the gap). Five tests gate five contracts, 1:1 and in file order:
 //!
-//! 1. **Truth recovery off-gap**: at d = 8 ambient with 1-D intrinsic
-//!    structure, the measure-learned geometry must recover the strand signal
-//!    within 2.5× the observation noise, and match-or-beat the geometry-blind
-//!    Duchon smoother on the same eight ambient columns (×1.10 flake guard —
-//!    the jet term should genuinely win here, the guard only absorbs seed
-//!    luck).
-//! 2. **Gap bridging with the trend, not the mean**: inside the deleted
+//! 1. **Truth recovery off-gap** (`measure_jet_recovers_web_signal_vs_truth`):
+//!    at d = 8 ambient with 1-D intrinsic structure, the measure-learned
+//!    geometry must recover the strand signal within 2.5× the observation
+//!    noise, and match-or-beat the geometry-blind Duchon smoother on the same
+//!    eight ambient columns (×1.10 flake guard — the jet term should
+//!    genuinely win here, the guard only absorbs seed luck).
+//! 2. **Support diagnostic** (`measure_jet_support_curve_flags_off_web_queries`):
+//!    the support curve must be computable from the FITTED model alone and
+//!    must separate an on-web query from a far off-web query at the finest
+//!    band scale.
+//! 3. **Gap bridging with the trend, not the mean**
+//!    (`measure_jet_bridges_gap_with_trend_not_mean`): inside the deleted
 //!    stretch of strand B the fit must continue the flank-attested slope
 //!    (same sign, within 60% of truth) rather than collapse toward the
 //!    global training mean. This is the no-mass-term/N2 contract observed
 //!    end to end through REML.
-//! 3. **GLM composition**: the same web with a Poisson count response — the
-//!    measure-jet penalty must compose with PIRLS/REML for a non-gaussian
-//!    family and recover the log-intensity off-gap.
-//! 4. **Interval honesty**: 95% pointwise bands built from the fit's
-//!    smoothing-corrected coefficient covariance Vp must approximately cover
-//!    the true mean at held-out on-web points.
+//! 4. **GLM composition** (`measure_jet_poisson_intensity_on_web`): the same
+//!    web with a Poisson count response — the measure-jet penalty must
+//!    compose with PIRLS/REML for a non-gaussian family and recover the
+//!    log-intensity off-gap.
+//! 5. **Interval honesty** (`measure_jet_interval_coverage_on_web`): 95%
+//!    pointwise bands built from the fit's smoothing-corrected coefficient
+//!    covariance Vp must approximately cover the true mean at held-out
+//!    on-web points.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -52,6 +59,14 @@ const TREND_SLOPE_C: f64 = -0.8;
 const POISSON_ETA_SCALE: f64 = 0.5;
 /// Two-sided 95% normal quantile, qnorm(0.975).
 const Z_95: f64 = 1.959963984540054;
+/// All eight ambient columns handed to the measure-jet term.
+const MJS_FORMULA: &str = "y ~ mjs(x0, x1, x2, x3, x4, x5, x6, x7)";
+/// Geometry-blind mature in-crate baseline on the same ambient columns.
+const DUCHON_FORMULA: &str = "y ~ duchon(x0, x1, x2, x3, x4, x5, x6, x7)";
+
+// ---------------------------------------------------------------------------
+// Data generation: latent web geometry, R²→R⁸ embedding, response encoders.
+// ---------------------------------------------------------------------------
 
 /// Fixed embedding R² → R⁸: two exactly orthonormal columns (Householder-free
 /// hand construction; entries chosen irrational-ish so no ambient axis is
@@ -74,6 +89,15 @@ fn embedding() -> [[f64; 2]; AMBIENT_D] {
         e[k][1] = v[k];
     }
     e
+}
+
+/// Apply the fixed R² → R⁸ embedding to a latent point (no ambient noise).
+fn embed_latent(e: &[[f64; 2]; AMBIENT_D], z: [f64; 2]) -> [f64; AMBIENT_D] {
+    let mut coords = [0.0; AMBIENT_D];
+    for k in 0..AMBIENT_D {
+        coords[k] = e[k][0] * z[0] + e[k][1] * z[1];
+    }
+    coords
 }
 
 /// One sampled web point: ambient coordinates, true response value, strand
@@ -102,6 +126,12 @@ fn latent_point(strand: usize, t: f64) -> ([f64; 2], f64) {
     }
 }
 
+/// The training gap: the middle third of strand B (deleted at fit time,
+/// probed at test time by the bridging gate).
+fn in_b_gap(strand: usize, t: f64) -> bool {
+    strand == 1 && (1.0 / 3.0..2.0 / 3.0).contains(&t)
+}
+
 fn sample_web(n_per_strand: usize, seed: u64, drop_b_gap: bool) -> Vec<WebPoint> {
     let mut rng = StdRng::seed_from_u64(seed);
     let ut = Uniform::new(0.0, 1.0).expect("uniform");
@@ -111,14 +141,13 @@ fn sample_web(n_per_strand: usize, seed: u64, drop_b_gap: bool) -> Vec<WebPoint>
     for strand in 0..3usize {
         for _ in 0..n_per_strand {
             let t: f64 = ut.sample(&mut rng);
-            // The training gap: middle third of strand B.
-            if drop_b_gap && strand == 1 && (1.0 / 3.0..2.0 / 3.0).contains(&t) {
+            if drop_b_gap && in_b_gap(strand, t) {
                 continue;
             }
             let (z, truth) = latent_point(strand, t);
-            let mut coords = [0.0; AMBIENT_D];
-            for k in 0..AMBIENT_D {
-                coords[k] = e[k][0] * z[0] + e[k][1] * z[1] + cnoise.sample(&mut rng);
+            let mut coords = embed_latent(&e, z);
+            for c in coords.iter_mut() {
+                *c += cnoise.sample(&mut rng);
             }
             out.push(WebPoint {
                 coords,
@@ -131,41 +160,46 @@ fn sample_web(n_per_strand: usize, seed: u64, drop_b_gap: bool) -> Vec<WebPoint>
     out
 }
 
-fn encode_training(points: &[WebPoint], seed: u64) -> gam::data::EncodedDataset {
+/// Encode web points as the training dataset: ambient columns x0..x7 plus a
+/// `y` column drawn per point by `response` from one seeded StdRng (a single
+/// deterministic stream per encoder call, in point order).
+fn encode_web(
+    points: &[WebPoint],
+    seed: u64,
+    mut response: impl FnMut(&WebPoint, &mut StdRng) -> f64,
+) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
-    let ynoise = Normal::new(0.0, Y_NOISE_SIGMA).expect("normal");
     let mut headers: Vec<String> = (0..AMBIENT_D).map(|k| format!("x{k}")).collect();
     headers.push("y".to_string());
     let rows: Vec<StringRecord> = points
         .iter()
         .map(|p| {
             let mut fields: Vec<String> = p.coords.iter().map(|v| v.to_string()).collect();
-            fields.push((p.truth + ynoise.sample(&mut rng)).to_string());
+            fields.push(response(p, &mut rng).to_string());
             StringRecord::from(fields)
         })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode web dataset")
 }
 
-/// Poisson-count encoding of the web: y_i ~ Poisson(exp(η_i)) with
-/// η = POISSON_ETA_SCALE · truth, drawn from a seeded StdRng (deterministic,
-/// mirrors the gaussian encoder's rand usage).
-fn encode_poisson_training(points: &[WebPoint], seed: u64) -> gam::data::EncodedDataset {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut headers: Vec<String> = (0..AMBIENT_D).map(|k| format!("x{k}")).collect();
-    headers.push("y".to_string());
-    let rows: Vec<StringRecord> = points
-        .iter()
-        .map(|p| {
-            let mut fields: Vec<String> = p.coords.iter().map(|v| v.to_string()).collect();
-            let mu = (POISSON_ETA_SCALE * p.truth).exp();
-            let draw: f64 = Poisson::new(mu).expect("poisson").sample(&mut rng);
-            fields.push(draw.to_string());
-            StringRecord::from(fields)
-        })
-        .collect();
-    encode_recordswith_inferred_schema(headers, rows).expect("encode poisson web dataset")
+/// Gaussian arm: y = truth + N(0, Y_NOISE_SIGMA), one draw per point.
+fn encode_training(points: &[WebPoint], seed: u64) -> gam::data::EncodedDataset {
+    let ynoise = Normal::new(0.0, Y_NOISE_SIGMA).expect("normal");
+    encode_web(points, seed, |p, rng| p.truth + ynoise.sample(rng))
 }
+
+/// Poisson arm: y ~ Poisson(exp(η)) with η = POISSON_ETA_SCALE · truth, one
+/// draw per point (mirrors the gaussian arm's stream discipline).
+fn encode_poisson_training(points: &[WebPoint], seed: u64) -> gam::data::EncodedDataset {
+    encode_web(points, seed, |p, rng| {
+        let mu = (POISSON_ETA_SCALE * p.truth).exp();
+        Poisson::new(mu).expect("poisson").sample(rng)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Fit + readout: formula fits, frozen-spec design replay, error metrics.
+// ---------------------------------------------------------------------------
 
 fn fit_web(
     formula: &str,
@@ -257,9 +291,11 @@ fn pointwise_se(design: ArrayView2<'_, f64>, cov: &Array2<f64>) -> Vec<f64> {
         .collect()
 }
 
-const MJS_FORMULA: &str = "y ~ mjs(x0, x1, x2, x3, x4, x5, x6, x7)";
-const DUCHON_FORMULA: &str = "y ~ duchon(x0, x1, x2, x3, x4, x5, x6, x7)";
-
+/// Contract 1 — truth recovery off-gap: with d = 8 ambient columns and 1-D
+/// intrinsic structure, the fit must resolve the strand signal to within
+/// 2.5× the observation noise (PRIMARY), and match-or-beat the
+/// geometry-blind Duchon baseline on the same columns (SECONDARY, ×1.10
+/// flake guard for seed luck only).
 #[test]
 fn measure_jet_recovers_web_signal_vs_truth() {
     init_parallelism();
@@ -289,7 +325,7 @@ fn measure_jet_recovers_web_signal_vs_truth() {
     );
 }
 
-/// The support diagnostic must be computable from the FITTED model alone
+/// Contract 2 — support diagnostic: computable from the FITTED model alone
 /// (frozen nodes + masses + band ride the replay contract) and must separate
 /// an on-web query from a far off-web query at the finest band scale — the
 /// on-web-ness label every prediction ships with.
@@ -322,11 +358,11 @@ fn measure_jet_support_curve_flags_off_web_queries() {
     // One on-web query (mid strand A, no coordinate noise) and one query far
     // off the web, both standardized exactly as the dispatch standardizes
     // training rows.
-    let e = embedding();
     let (z_on, _) = latent_point(0, 0.5);
+    let on_web = embed_latent(&embedding(), z_on);
     let mut queries = Array2::<f64>::zeros((2, AMBIENT_D));
     for k in 0..AMBIENT_D {
-        queries[(0, k)] = e[k][0] * z_on[0] + e[k][1] * z_on[1];
+        queries[(0, k)] = on_web[k];
         queries[(1, k)] = 5.0;
     }
     if let Some(s) = &scales {
@@ -350,6 +386,10 @@ fn measure_jet_support_curve_flags_off_web_queries() {
     );
 }
 
+/// Contract 3 — gap bridging: inside the deleted stretch of strand B the fit
+/// must continue the flank-attested slope (same sign, within 60% of truth)
+/// rather than collapse toward the global training mean — the
+/// no-mass-term/N2 contract observed end to end through REML.
 #[test]
 fn measure_jet_bridges_gap_with_trend_not_mean() {
     init_parallelism();
@@ -358,7 +398,7 @@ fn measure_jet_bridges_gap_with_trend_not_mean() {
     // Test points INSIDE the strand-B gap (kept only at test time).
     let in_gap: Vec<WebPoint> = sample_web(400, 44, false)
         .into_iter()
-        .filter(|p| p.strand == 1 && (1.0 / 3.0..2.0 / 3.0).contains(&p.t))
+        .filter(|p| in_b_gap(p.strand, p.t))
         .collect();
     assert!(in_gap.len() >= 60, "gap sample unexpectedly thin");
 
@@ -404,7 +444,7 @@ fn measure_jet_bridges_gap_with_trend_not_mean() {
     );
 }
 
-/// GLM e2e: the measure-jet penalty must compose with PIRLS/REML for a
+/// Contract 4 — GLM composition: the measure-jet penalty must compose with PIRLS/REML for a
 /// non-gaussian family. Same Y-web geometry, count response
 /// y ~ Poisson(exp(η)) with η = POISSON_ETA_SCALE · (arc-length truth), scored
 /// on the η (log-intensity) scale at held-out off-gap points — applying the
@@ -437,7 +477,7 @@ fn measure_jet_poisson_intensity_on_web() {
     );
 }
 
-/// Interval honesty e2e: pointwise 95% bands from the fit's PUBLIC
+/// Contract 5 — interval honesty: pointwise 95% bands from the fit's PUBLIC
 /// smoothing-corrected coefficient covariance Vp (`beta_covariance_corrected`,
 /// the mgcv `predict(se.fit = TRUE)` analog used across the CI quality suite)
 /// must approximately cover the TRUE mean at held-out on-web points.
