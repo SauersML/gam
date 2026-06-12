@@ -19480,6 +19480,57 @@ fn build_duchon_basis_designwithworkspace(
         coeffs.as_ref(),
         pure_poly_coeff.as_ref(),
     );
+    // Certified radial value profile for the hybrid path (#979): one exact
+    // hybrid-Duchon kernel value costs microseconds across its
+    // partial-fraction blocks, and this n·k materialization loop runs on
+    // every design rebuild of every κ-trial. For large sweeps, profile φ
+    // once over the observed radius range (distance-only pre-pass) and
+    // answer per-pair queries by Clenshaw; out-of-range radii and
+    // uncertified builds fall back to the exact evaluator (the profile's
+    // exact fallback IS `duchon_radial_jets`, whose value channel is the
+    // same `duchon_matern_kernel_general_from_distance` evaluated below).
+    let hybrid_kind = match (length_scale, coeffs.as_ref()) {
+        (Some(ls), Some(c)) if pure_poly_coeff.is_none() => Some(RadialScalarKind::Duchon {
+            length_scale: ls,
+            p_order,
+            s_order: duchon_power_to_usize(s_order),
+            dim: d,
+            coeffs: c.clone(),
+        }),
+        _ => None,
+    };
+    let value_profile = hybrid_kind.as_ref().and_then(|kind| {
+        if n.saturating_mul(k) < RADIAL_PROFILE_MIN_PAIRS {
+            return None;
+        }
+        let (r_lo, r_hi) = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut lo = f64::INFINITY;
+                let mut hi = 0.0_f64;
+                for j in 0..k {
+                    let r = if let Some(scales) = axis_scales.as_deref() {
+                        aniso_distance_rows_with_scales(data, i, centers, j, scales)
+                    } else {
+                        euclidean_distance_rows(data, i, centers, j)
+                    };
+                    if r > 0.0 {
+                        lo = lo.min(r);
+                        hi = hi.max(r);
+                    }
+                }
+                (lo, hi)
+            })
+            .reduce(
+                || (f64::INFINITY, 0.0_f64),
+                |a, b| (a.0.min(b.0), a.1.max(b.1)),
+            );
+        if r_lo.is_finite() && r_hi > r_lo {
+            radial_profile::RadialProfile::build(kind, r_lo, r_hi)
+        } else {
+            None
+        }
+    });
     let mut basis = Array2::<f64>::zeros((n, total_cols));
     // Process rows in chunks to amortize thread-local allocation across many rows.
     // Use larger chunks (1024) for better cache utilization at large scale.
@@ -19502,6 +19553,10 @@ fn build_duchon_basis_designwithworkspace(
                     let raw = if let Some(ref ppc) = pure_poly_coeff {
                         // Pure Duchon: use precomputed coefficient, skip gamma calls.
                         ppc.eval(r)
+                    } else if let (Some(profile), Some(kind)) =
+                        (value_profile.as_ref(), hybrid_kind.as_ref())
+                    {
+                        profile.eval_or_exact(kind, r)?.0
                     } else {
                         duchon_matern_kernel_general_from_distance(
                             r,
