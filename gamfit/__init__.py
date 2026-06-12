@@ -93,6 +93,7 @@ from ._api import (
 )
 from ._binding import RustExtensionUnavailableError
 from ._compare import compare_models
+from ._linear_dictionary import LinearDictionaryFit, linear_dictionary_fit
 from ._penalties import (
     ARDPenalty,
     AnalyticPenaltyKind,

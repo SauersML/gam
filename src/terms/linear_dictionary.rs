@@ -1,0 +1,584 @@
+use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
+use crate::solver::gaussian_reml::gaussian_reml_multi_closed_form_with_cache;
+use faer::Side;
+use ndarray::{Array1, Array2, ArrayView2, Axis, s};
+
+const DEFAULT_MAX_ITER: usize = 30;
+const DEFAULT_TOP_K: usize = 1;
+const DEFAULT_TEMPERATURE: f64 = 0.25;
+const DEFAULT_CODE_RIDGE: f64 = 1.0e-8;
+const DEFAULT_TOLERANCE: f64 = 1.0e-7;
+const INACTIVE_LAMBDA: f64 = 1.0e30;
+const MIN_NORM2: f64 = 1.0e-24;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinearDictionaryAssignment {
+    TopK,
+    Softmax,
+}
+
+impl LinearDictionaryAssignment {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "top_k" | "topk" | "hard" => Ok(Self::TopK),
+            "softmax" | "soft" => Ok(Self::Softmax),
+            other => Err(format!(
+                "linear dictionary assignment must be 'top_k' or 'softmax'; got {other:?}"
+            )),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TopK => "top_k",
+            Self::Softmax => "softmax",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LinearDictionaryConfig {
+    pub n_atoms: usize,
+    pub max_iter: usize,
+    pub top_k: usize,
+    pub assignment: LinearDictionaryAssignment,
+    pub temperature: f64,
+    pub code_ridge: f64,
+    pub tolerance: f64,
+}
+
+impl LinearDictionaryConfig {
+    pub fn new(n_atoms: usize) -> Self {
+        Self {
+            n_atoms,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for LinearDictionaryConfig {
+    fn default() -> Self {
+        Self {
+            n_atoms: 1,
+            max_iter: DEFAULT_MAX_ITER,
+            top_k: DEFAULT_TOP_K,
+            assignment: LinearDictionaryAssignment::TopK,
+            temperature: DEFAULT_TEMPERATURE,
+            code_ridge: DEFAULT_CODE_RIDGE,
+            tolerance: DEFAULT_TOLERANCE,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LinearDictionaryFit {
+    pub atoms: Array2<f64>,
+    pub assignments: Array2<f64>,
+    pub fitted: Array2<f64>,
+    pub lambdas: Array1<f64>,
+    pub reml_scores: Array1<f64>,
+    pub explained_variance: f64,
+    pub iterations: usize,
+    pub converged: bool,
+    pub assignment: LinearDictionaryAssignment,
+    pub top_k: usize,
+}
+
+pub fn fit_linear_dictionary(
+    x: ArrayView2<'_, f64>,
+    config: &LinearDictionaryConfig,
+) -> Result<LinearDictionaryFit, String> {
+    validate_inputs(x, config)?;
+    if config.n_atoms == 1 {
+        return fit_rank_one_pca_lane(x, config);
+    }
+
+    let top_k = config.top_k.min(config.n_atoms).max(1);
+    let mut atoms = initialize_atoms(x, config.n_atoms);
+    let mut assignments = Array2::<f64>::zeros((x.nrows(), config.n_atoms));
+    let mut fitted = Array2::<f64>::zeros(x.dim());
+    let mut lambdas = Array1::<f64>::from_elem(config.n_atoms, INACTIVE_LAMBDA);
+    let mut reml_scores = Array1::<f64>::zeros(config.n_atoms);
+    let mut previous_ev = f64::NEG_INFINITY;
+    let mut converged = false;
+    let mut completed_iterations = 0usize;
+
+    for iter in 0..config.max_iter {
+        assignments = match config.assignment {
+            LinearDictionaryAssignment::TopK => {
+                top_k_assignments(x, atoms.view(), top_k, config.code_ridge)?
+            }
+            LinearDictionaryAssignment::Softmax => softmax_assignments(
+                x,
+                atoms.view(),
+                top_k,
+                config.temperature,
+                config.code_ridge,
+            )?,
+        };
+
+        fitted = assignments.dot(&atoms);
+        for atom_idx in 0..config.n_atoms {
+            fit_one_atom_reml(
+                x,
+                &mut atoms,
+                &mut assignments,
+                &mut fitted,
+                &mut lambdas,
+                &mut reml_scores,
+                atom_idx,
+            )?;
+        }
+
+        completed_iterations = iter + 1;
+        let ev = explained_variance(x, fitted.view());
+        if (ev - previous_ev).abs() <= config.tolerance.max(0.0) {
+            converged = true;
+            break;
+        }
+        previous_ev = ev;
+    }
+
+    let final_ev = explained_variance(x, fitted.view());
+    Ok(LinearDictionaryFit {
+        atoms,
+        assignments,
+        fitted,
+        lambdas,
+        reml_scores,
+        explained_variance: final_ev,
+        iterations: completed_iterations,
+        converged,
+        assignment: config.assignment,
+        top_k,
+    })
+}
+
+fn validate_inputs(x: ArrayView2<'_, f64>, config: &LinearDictionaryConfig) -> Result<(), String> {
+    if x.nrows() == 0 || x.ncols() == 0 {
+        return Err("linear_dictionary_fit requires a non-empty 2-D matrix".to_string());
+    }
+    if !x.iter().all(|value| value.is_finite()) {
+        return Err("linear_dictionary_fit input must be finite".to_string());
+    }
+    if config.n_atoms == 0 {
+        return Err("linear_dictionary_fit requires K >= 1".to_string());
+    }
+    if config.max_iter == 0 {
+        return Err("linear_dictionary_fit requires max_iter >= 1".to_string());
+    }
+    if config.top_k == 0 || config.top_k > config.n_atoms {
+        return Err(format!(
+            "linear_dictionary_fit top_k must be in [1, K={}]; got {}",
+            config.n_atoms, config.top_k
+        ));
+    }
+    if !(config.temperature.is_finite() && config.temperature > 0.0) {
+        return Err(format!(
+            "linear_dictionary_fit temperature must be finite and positive; got {}",
+            config.temperature
+        ));
+    }
+    if !(config.code_ridge.is_finite() && config.code_ridge > 0.0) {
+        return Err(format!(
+            "linear_dictionary_fit code_ridge must be finite and positive; got {}",
+            config.code_ridge
+        ));
+    }
+    if !config.tolerance.is_finite() {
+        return Err("linear_dictionary_fit tolerance must be finite".to_string());
+    }
+    Ok(())
+}
+
+fn fit_rank_one_pca_lane(
+    x: ArrayView2<'_, f64>,
+    config: &LinearDictionaryConfig,
+) -> Result<LinearDictionaryFit, String> {
+    let covariance = x.t().dot(&x);
+    let (evals, evecs) = covariance
+        .eigh(Side::Lower)
+        .map_err(|err| format!("linear_dictionary_fit PCA eigensolve failed: {err}"))?;
+    let last = evals.len() - 1;
+    let mut atom = evecs.column(last).to_owned();
+    orient_vector(&mut atom);
+    let mut assignments = Array2::<f64>::zeros((x.nrows(), 1));
+    for row in 0..x.nrows() {
+        assignments[[row, 0]] = x.row(row).dot(&atom);
+    }
+    let design = assignments.clone();
+    let penalty = Array2::from_elem((1, 1), 1.0);
+    let reml = gaussian_reml_multi_closed_form_with_cache(
+        design.view(),
+        x,
+        penalty.view(),
+        None,
+        None,
+        None,
+    )
+    .map_err(|err| format!("linear_dictionary_fit PCA ridge selection failed: {err}"))?;
+    let mut atoms = reml.coefficients.t().to_owned();
+    normalize_atom_and_assignments(&mut atoms, &mut assignments, 0);
+    let fitted = assignments.dot(&atoms);
+    Ok(LinearDictionaryFit {
+        atoms,
+        assignments,
+        fitted: fitted.clone(),
+        lambdas: Array1::from_elem(1, reml.lambda),
+        reml_scores: Array1::from_elem(1, reml.reml_score),
+        explained_variance: explained_variance(x, fitted.view()),
+        iterations: 1.min(config.max_iter),
+        converged: true,
+        assignment: config.assignment,
+        top_k: 1,
+    })
+}
+
+fn initialize_atoms(x: ArrayView2<'_, f64>, n_atoms: usize) -> Array2<f64> {
+    let mut atoms = Array2::<f64>::zeros((n_atoms, x.ncols()));
+    let first = max_norm_row(x);
+    atoms.row_mut(0).assign(&x.row(first));
+    normalize_row(atoms.slice_mut(s![0, ..]));
+    let mut min_dist2 = Array1::<f64>::from_elem(x.nrows(), f64::INFINITY);
+
+    for atom_idx in 1..n_atoms {
+        let prev = atoms.row(atom_idx - 1);
+        for row in 0..x.nrows() {
+            let dist2 = squared_distance(x.row(row), prev);
+            if dist2 < min_dist2[row] {
+                min_dist2[row] = dist2;
+            }
+        }
+        let chosen = if atom_idx < x.nrows() {
+            max_index(min_dist2.view())
+        } else {
+            atom_idx % x.nrows()
+        };
+        atoms.row_mut(atom_idx).assign(&x.row(chosen));
+        normalize_row(atoms.slice_mut(s![atom_idx, ..]));
+    }
+    atoms
+}
+
+fn fit_one_atom_reml(
+    x: ArrayView2<'_, f64>,
+    atoms: &mut Array2<f64>,
+    assignments: &mut Array2<f64>,
+    fitted: &mut Array2<f64>,
+    lambdas: &mut Array1<f64>,
+    reml_scores: &mut Array1<f64>,
+    atom_idx: usize,
+) -> Result<(), String> {
+    let code = assignments.column(atom_idx).to_owned();
+    let code_norm2 = code.dot(&code);
+    if code_norm2 <= MIN_NORM2 {
+        atoms.row_mut(atom_idx).fill(0.0);
+        lambdas[atom_idx] = INACTIVE_LAMBDA;
+        reml_scores[atom_idx] = 0.0;
+        return Ok(());
+    }
+
+    let old_atom = atoms.row(atom_idx).to_owned();
+    let mut residual = x.to_owned() - fitted.view();
+    residual += &code
+        .view()
+        .insert_axis(Axis(1))
+        .dot(&old_atom.view().insert_axis(Axis(0)));
+
+    let design = code.insert_axis(Axis(1)).to_owned();
+    let penalty = Array2::from_elem((1, 1), 1.0);
+    let init_lambda = if lambdas[atom_idx].is_finite() && lambdas[atom_idx] > 0.0 {
+        Some(lambdas[atom_idx])
+    } else {
+        None
+    };
+    let reml = gaussian_reml_multi_closed_form_with_cache(
+        design.view(),
+        residual.view(),
+        penalty.view(),
+        None,
+        init_lambda,
+        None,
+    )
+    .map_err(|err| format!("linear_dictionary_fit atom {atom_idx} REML solve failed: {err}"))?;
+
+    atoms.row_mut(atom_idx).assign(&reml.coefficients.row(0));
+    lambdas[atom_idx] = reml.lambda;
+    reml_scores[atom_idx] = reml.reml_score;
+    normalize_atom_and_assignments(atoms, assignments, atom_idx);
+    let updated_code = assignments.column(atom_idx).to_owned();
+    fitted.assign(&residual);
+    *fitted += &updated_code
+        .view()
+        .insert_axis(Axis(1))
+        .dot(&atoms.row(atom_idx).insert_axis(Axis(0)));
+    Ok(())
+}
+
+fn top_k_assignments(
+    x: ArrayView2<'_, f64>,
+    atoms: ArrayView2<'_, f64>,
+    top_k: usize,
+    code_ridge: f64,
+) -> Result<Array2<f64>, String> {
+    let gram = atoms.dot(&atoms.t());
+    let cross = x.dot(&atoms.t());
+    let mut assignments = Array2::<f64>::zeros((x.nrows(), atoms.nrows()));
+    for row in 0..x.nrows() {
+        let active = top_indices_by_abs(cross.row(row), top_k);
+        let coeffs = solve_active_coefficients(gram.view(), cross.row(row), &active, code_ridge)?;
+        for pos in 0..active.len() {
+            assignments[[row, active[pos]]] = coeffs[pos];
+        }
+    }
+    Ok(assignments)
+}
+
+fn softmax_assignments(
+    x: ArrayView2<'_, f64>,
+    atoms: ArrayView2<'_, f64>,
+    top_k: usize,
+    temperature: f64,
+    code_ridge: f64,
+) -> Result<Array2<f64>, String> {
+    let cross = x.dot(&atoms.t());
+    let atom_norm2 = atoms.map_axis(Axis(1), |row| row.dot(&row).max(MIN_NORM2));
+    let mut assignments = Array2::<f64>::zeros((x.nrows(), atoms.nrows()));
+    for row in 0..x.nrows() {
+        let active = top_indices_by_abs(cross.row(row), top_k);
+        let mut max_score = f64::NEG_INFINITY;
+        for &atom_idx in &active {
+            let score = cross[[row, atom_idx]].abs() / (atom_norm2[atom_idx].sqrt() * temperature);
+            if score > max_score {
+                max_score = score;
+            }
+        }
+        let mut denom = 0.0;
+        for &atom_idx in &active {
+            let score = cross[[row, atom_idx]].abs() / (atom_norm2[atom_idx].sqrt() * temperature);
+            let mass = (score - max_score).exp();
+            assignments[[row, atom_idx]] = mass;
+            denom += mass;
+        }
+        if denom <= 0.0 || !denom.is_finite() {
+            return Err("linear_dictionary_fit softmax assignment underflowed".to_string());
+        }
+        for &atom_idx in &active {
+            let projection = cross[[row, atom_idx]] / (atom_norm2[atom_idx] + code_ridge);
+            assignments[[row, atom_idx]] = assignments[[row, atom_idx]] * projection / denom;
+        }
+    }
+    Ok(assignments)
+}
+
+fn solve_active_coefficients(
+    gram: ArrayView2<'_, f64>,
+    cross_row: ndarray::ArrayView1<'_, f64>,
+    active: &[usize],
+    code_ridge: f64,
+) -> Result<Array1<f64>, String> {
+    let m = active.len();
+    let mut system = Array2::<f64>::zeros((m, m));
+    let mut rhs = Array2::<f64>::zeros((m, 1));
+    for i in 0..m {
+        rhs[[i, 0]] = cross_row[active[i]];
+        for j in 0..m {
+            system[[i, j]] = gram[[active[i], active[j]]];
+        }
+        system[[i, i]] += code_ridge;
+    }
+    let factor = FaerArrayView::new(&system)
+        .as_ref()
+        .cholesky(Side::Lower)
+        .map_err(|err| format!("linear_dictionary_fit sparse-code solve failed: {err}"))?;
+    let mut solution = rhs;
+    let mut solution_view = crate::faer_ndarray::array2_to_matmut(&mut solution);
+    factor.solve_in_place(solution_view.as_mut());
+    Ok(solution.column(0).to_owned())
+}
+
+fn top_indices_by_abs(row: ndarray::ArrayView1<'_, f64>, top_k: usize) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..row.len()).collect();
+    indices.sort_by(|&a, &b| {
+        row[b]
+            .abs()
+            .partial_cmp(&row[a].abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    indices.truncate(top_k);
+    indices
+}
+
+fn normalize_atom_and_assignments(
+    atoms: &mut Array2<f64>,
+    assignments: &mut Array2<f64>,
+    atom_idx: usize,
+) {
+    let norm = atoms.row(atom_idx).dot(&atoms.row(atom_idx)).sqrt();
+    if norm > MIN_NORM2.sqrt() {
+        atoms.row_mut(atom_idx).mapv_inplace(|value| value / norm);
+        assignments
+            .column_mut(atom_idx)
+            .mapv_inplace(|value| value * norm);
+    }
+    orient_atom_and_code(atoms, assignments, atom_idx);
+}
+
+fn orient_atom_and_code(atoms: &mut Array2<f64>, assignments: &mut Array2<f64>, atom_idx: usize) {
+    let sign = first_nonzero_sign(atoms.row(atom_idx));
+    if sign < 0.0 {
+        atoms.row_mut(atom_idx).mapv_inplace(|value| -value);
+        assignments
+            .column_mut(atom_idx)
+            .mapv_inplace(|value| -value);
+    }
+}
+
+fn orient_vector(vector: &mut Array1<f64>) {
+    if first_nonzero_sign(vector.view()) < 0.0 {
+        vector.mapv_inplace(|value| -value);
+    }
+}
+
+fn first_nonzero_sign(row: ndarray::ArrayView1<'_, f64>) -> f64 {
+    for &value in row {
+        if value.abs() > 1.0e-12 {
+            return value.signum();
+        }
+    }
+    1.0
+}
+
+fn normalize_row(mut row: ndarray::ArrayViewMut1<'_, f64>) {
+    let norm = row.dot(&row).sqrt();
+    if norm > MIN_NORM2.sqrt() {
+        row.mapv_inplace(|value| value / norm);
+    }
+}
+
+fn max_norm_row(x: ArrayView2<'_, f64>) -> usize {
+    let mut best = 0usize;
+    let mut best_norm = f64::NEG_INFINITY;
+    for row in 0..x.nrows() {
+        let norm = x.row(row).dot(&x.row(row));
+        if norm > best_norm {
+            best = row;
+            best_norm = norm;
+        }
+    }
+    best
+}
+
+fn max_index(values: ndarray::ArrayView1<'_, f64>) -> usize {
+    let mut best = 0usize;
+    let mut best_value = f64::NEG_INFINITY;
+    for idx in 0..values.len() {
+        if values[idx] > best_value {
+            best = idx;
+            best_value = values[idx];
+        }
+    }
+    best
+}
+
+fn squared_distance(a: ndarray::ArrayView1<'_, f64>, b: ndarray::ArrayView1<'_, f64>) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(av, bv)| {
+            let diff = av - bv;
+            diff * diff
+        })
+        .sum()
+}
+
+fn explained_variance(x: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> f64 {
+    let mut rss = 0.0;
+    for row in 0..x.nrows() {
+        for col in 0..x.ncols() {
+            let residual = x[[row, col]] - fitted[[row, col]];
+            rss += residual * residual;
+        }
+    }
+    let means = x.mean_axis(Axis(0)).expect("non-empty input has means");
+    let mut tss = 0.0;
+    for row in 0..x.nrows() {
+        for col in 0..x.ncols() {
+            let centered = x[[row, col]] - means[col];
+            tss += centered * centered;
+        }
+    }
+    if tss <= MIN_NORM2 {
+        if rss <= MIN_NORM2 { 1.0 } else { 0.0 }
+    } else {
+        1.0 - rss / tss
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_abs_diff_eq;
+    use ndarray::{Array2, array};
+
+    #[test]
+    fn planted_sparse_linear_dictionary_reaches_high_explained_variance() {
+        let truth = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut assignments = Array2::<f64>::zeros((160, 4));
+        for row in 0..160 {
+            let atom = row % 4;
+            assignments[[row, atom]] = 0.7 + 0.01 * ((row / 4) as f64);
+            assignments[[row, (atom + 1) % 4]] = 0.2;
+        }
+        let x = assignments.dot(&truth);
+        let config = LinearDictionaryConfig {
+            n_atoms: 4,
+            max_iter: 40,
+            top_k: 2,
+            assignment: LinearDictionaryAssignment::TopK,
+            temperature: DEFAULT_TEMPERATURE,
+            code_ridge: DEFAULT_CODE_RIDGE,
+            tolerance: 1.0e-9,
+        };
+
+        let fit = fit_linear_dictionary(x.view(), &config).expect("linear dictionary fit");
+
+        assert!(
+            fit.explained_variance > 0.95,
+            "expected EV > 0.95, got {}",
+            fit.explained_variance
+        );
+    }
+
+    #[test]
+    fn single_atom_matches_penalized_pca_oracle() {
+        let mut x = Array2::<f64>::zeros((80, 3));
+        for row in 0..80 {
+            let t = (row as f64 - 39.5) / 20.0;
+            x[[row, 0]] = 2.0 * t;
+            x[[row, 1]] = -t;
+            x[[row, 2]] = 0.05 * (row as f64).sin();
+        }
+        let config = LinearDictionaryConfig {
+            n_atoms: 1,
+            max_iter: 5,
+            top_k: 1,
+            assignment: LinearDictionaryAssignment::TopK,
+            temperature: DEFAULT_TEMPERATURE,
+            code_ridge: DEFAULT_CODE_RIDGE,
+            tolerance: DEFAULT_TOLERANCE,
+        };
+
+        let fit = fit_linear_dictionary(x.view(), &config).expect("rank-one fit");
+        let covariance = x.t().dot(&x);
+        let (evals, _) = covariance.eigh(Side::Lower).expect("PCA eigensolve");
+        let oracle_ev = evals[evals.len() - 1] / evals.sum();
+
+        assert!(fit.explained_variance > 0.99);
+        assert_abs_diff_eq!(fit.explained_variance, oracle_ev, epsilon = 2.0e-4);
+    }
+}

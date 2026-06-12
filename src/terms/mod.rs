@@ -13,6 +13,7 @@ pub mod hull;
 pub mod input_loc_derivatives;
 pub mod interchange_decoder;
 pub mod latent_coord;
+pub mod linear_dictionary;
 pub mod matern_gradient;
 pub mod penalties;
 pub mod penalty_op;
@@ -56,6 +57,9 @@ pub use interchange_decoder::{
 pub use latent_coord::{
     AuxPriorFamily, AuxPriorStrength, InputLocationDerivative, LatentCoordValues, LatentIdMode,
     LatentManifold,
+};
+pub use linear_dictionary::{
+    LinearDictionaryAssignment, LinearDictionaryConfig, LinearDictionaryFit, fit_linear_dictionary,
 };
 pub use matern_gradient::{MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator};
 pub use sae_criterion_atoms::{SaeCriterion, SaeCriterionAtom};

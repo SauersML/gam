@@ -107,6 +107,9 @@ use gam::terms::interchange_decoder::{
     interchange_swap_forward as core_interchange_swap_forward,
 };
 use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
+use gam::terms::linear_dictionary::{
+    LinearDictionaryAssignment, LinearDictionaryConfig, fit_linear_dictionary,
+};
 use gam::terms::sae_manifold::{
     AssignmentMode, DuchonCoordinateEvaluator, EuclideanPatchEvaluator, GumbelTemperatureSchedule,
     PeriodicHarmonicEvaluator, SPHERE_CHART_PENALTY_DIAGONAL, SaeAtomBasisKind, SaeBasisEvaluator,
@@ -24090,6 +24093,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(diagnostics_concat_decoder_blocks, module)?)?;
     module.add_function(wrap_pyfunction!(partial_supervision_solve, module)?)?;
     module.add_function(wrap_pyfunction!(thin_svd_scores, module)?)?;
+    module.add_function(wrap_pyfunction!(linear_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(
         identifiable_factor_select_weights_array,
         module
@@ -24429,6 +24433,55 @@ fn thin_svd_scores<'py>(
     let out = gam::sae_identifiability::thin_svd_scores(x.as_array(), k as usize)
         .map_err(py_value_error)?;
     Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (
+    x,
+    k,
+    max_iter = 30,
+    top_k = 1,
+    assignment = "top_k",
+    temperature = 0.25,
+    code_ridge = 1.0e-8,
+    tolerance = 1.0e-7
+))]
+fn linear_dictionary_fit<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    k: usize,
+    max_iter: usize,
+    top_k: usize,
+    assignment: &str,
+    temperature: f64,
+    code_ridge: f64,
+    tolerance: f64,
+) -> PyResult<Py<PyDict>> {
+    let x_values = x.as_array().to_owned();
+    let assignment_kind = LinearDictionaryAssignment::parse(assignment).map_err(py_value_error)?;
+    let config = LinearDictionaryConfig {
+        n_atoms: k,
+        max_iter,
+        top_k,
+        assignment: assignment_kind,
+        temperature,
+        code_ridge,
+        tolerance,
+    };
+    let fit = detach_py_result(py, "linear_dictionary_fit", move || {
+        fit_linear_dictionary(x_values.view(), &config)
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("atoms", fit.atoms.into_pyarray(py))?;
+    out.set_item("assignments", fit.assignments.into_pyarray(py))?;
+    out.set_item("fitted", fit.fitted.into_pyarray(py))?;
+    out.set_item("lambdas", fit.lambdas.into_pyarray(py))?;
+    out.set_item("reml_scores", fit.reml_scores.into_pyarray(py))?;
+    out.set_item("explained_variance", fit.explained_variance)?;
+    out.set_item("iterations", fit.iterations)?;
+    out.set_item("converged", fit.converged)?;
+    out.set_item("assignment", fit.assignment.as_str())?;
+    out.set_item("top_k", fit.top_k)?;
+    Ok(out.unbind())
 }
 
 pub(crate) fn py_value_error(message: String) -> PyErr {
