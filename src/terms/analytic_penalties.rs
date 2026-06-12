@@ -2492,7 +2492,11 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             }
         }
         for k in 0..self.k_max {
-            // Beta(a,1) contributes -(a - 1) ln(pi), matching pi_map.
+            // Normalized Beta(a,1) density is a*pi^(a-1), so its negative
+            // log contribution is -ln(a) - (a - 1) ln(pi). The normalizer is
+            // constant only for fixed alpha; keep it in both modes so the energy
+            // has one mathematical definition across configurations.
+            acc -= a.ln();
             acc -= (a - 1.0) * pi[k].ln();
         }
         self.weight * acc
@@ -2710,7 +2714,9 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 .clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP)
                 .ln();
         }
-        Array1::from_vec(vec![-self.weight * alpha * sum_log_pi / self.k_max as f64])
+        Array1::from_vec(vec![
+            -self.weight * (alpha * sum_log_pi / self.k_max as f64 + self.k_max as f64),
+        ])
     }
 
     fn rho_count(&self) -> usize {
@@ -9591,6 +9597,23 @@ mod tests {
             max_err < 1.0e-7,
             "IBP grad-FD max abs error = {max_err:.3e}"
         );
+    }
+
+    #[test]
+    fn ibp_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
+        let pen = IBPAssignmentPenalty::new(3, 6.0, 0.8, true);
+        let t = array![
+            0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5, 0.6, -0.2, 0.3, 0.1, 0.8, -0.4
+        ];
+        let rho = array![0.2_f64];
+        let grad = pen.grad_rho(t.view(), rho.view());
+        let step = 1.0e-6_f64;
+        let rho_plus = array![rho[0] + step];
+        let rho_minus = array![rho[0] - step];
+        let fd = (pen.value(t.view(), rho_plus.view()) - pen.value(t.view(), rho_minus.view()))
+            / (2.0 * step);
+
+        assert_abs_diff_eq!(grad[0], fd, epsilon = 2.0e-7);
     }
 
     #[test]
