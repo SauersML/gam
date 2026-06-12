@@ -856,6 +856,16 @@ pub struct FittedAtom {
     /// claim a pin it cannot resolve, the same honesty contract as the
     /// `diffeomorphism-unpinned` escalation.
     pub lowering_error: f64,
+    /// #1019 stage 1: `true` when the atom's `d = 1` latent chart was pinned
+    /// post-fit to its arc-length (unit-speed) canonical representative. The
+    /// certificate then records that this atom's continuous chart
+    /// (reparameterization) freedom is **pinned by canonicalization** — a
+    /// provenance distinct from curvature/penalty pinning
+    /// ([`VerdictProvenance::PinnedByCanonicalization`]) — and that the
+    /// residual chart freedom is the finite isometry group of the reference
+    /// manifold: rotation + reflection (`O(2)`) on the circle, reflection +
+    /// translation on the interval.
+    pub chart_canonicalized: bool,
 }
 
 /// The fitted SAE-manifold model the certificate consumes.
@@ -915,6 +925,13 @@ pub enum GeneratorFamily {
     /// An exchange of two topology-identical atoms (`Sym(F)` permutation, built
     /// as the antisymmetric transposition direction).
     AtomPermutation,
+    /// The continuous chart (reparameterization) freedom `Diff(M_k)` of one
+    /// `d = 1` atom, fixed post-fit by the arc-length canonicalization
+    /// (#1019). Always reported **pinned** with
+    /// [`VerdictProvenance::PinnedByCanonicalization`]; the verdict's
+    /// description names the surviving finite isometry group (rotation +
+    /// reflection on `S¹`, reflection + translation on the interval).
+    ChartReparameterization,
 }
 
 impl GeneratorFamily {
@@ -924,8 +941,30 @@ impl GeneratorFamily {
             GeneratorFamily::EqualArdRotation => "equal-ARD rotation",
             GeneratorFamily::FrameRotation => "frame rotation O(output_dim)",
             GeneratorFamily::AtomPermutation => "Sym(F) atom permutation",
+            GeneratorFamily::ChartReparameterization => "Diff(M_k) chart reparameterization",
         }
     }
+}
+
+/// How a generator's pinned/unpinned verdict was decided. Carried
+/// per-generator so the report distinguishes a chart fixed **by convention**
+/// (the #1019 post-fit arc-length canonicalization — an exact, image-frozen
+/// representative choice) from a direction pinned **by curvature** (data or
+/// the isometry penalty giving the orbit genuine objective cost).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictProvenance {
+    /// Decided by the relative-curvature flatness test against the stacked
+    /// pinning root (data + isometry penalty, in the fit's metric) — the
+    /// historical path for every enumerated generator.
+    CurvatureTest,
+    /// Pinned by the post-fit arc-length chart canonicalization (#1019):
+    /// the atom's chart is the unit-speed representative of its `Diff(M)`
+    /// orbit, so the continuous reparameterization freedom is fixed by
+    /// construction — no curvature was (or needed to be) measured. Distinct
+    /// from penalty-pinning on purpose: the certificate must not claim the
+    /// objective resists chart motion when it is the canonicalization that
+    /// removed it.
+    PinnedByCanonicalization,
 }
 
 /// Noise floor for the per-generator flatness verdict: a generator is
@@ -981,6 +1020,10 @@ pub struct GeneratorVerdict {
     /// mean-frame compression cannot distinguish from gauge motion is never
     /// read as a pin.
     pub lowering_error_scale: f64,
+    /// How this verdict was decided: by the curvature flatness test, or
+    /// pinned by the #1019 post-fit arc-length chart canonicalization
+    /// (see [`VerdictProvenance`]).
+    pub provenance: VerdictProvenance,
 }
 
 /// The #972 decoder-frame **inner-rotation gauge**, enumerated for the
@@ -1759,6 +1802,7 @@ fn exact_orbit_verdicts(
                 generator_norm: 0.0,
                 pinned_energy_fraction: 1.0,
                 lowering_error_scale: 0.0,
+                provenance: VerdictProvenance::CurvatureTest,
             });
             continue;
         }
@@ -1797,6 +1841,7 @@ fn exact_orbit_verdicts(
             generator_norm: raw.sqrt(),
             pinned_energy_fraction,
             lowering_error_scale: 0.0,
+            provenance: VerdictProvenance::CurvatureTest,
         });
     }
     Ok(out)
@@ -2198,6 +2243,7 @@ fn residual_gauge_inner(
                 generator_norm: 0.0,
                 pinned_energy_fraction: 1.0,
                 lowering_error_scale: *lowering_error_scale,
+                provenance: VerdictProvenance::CurvatureTest,
             });
             continue;
         }
@@ -2226,6 +2272,7 @@ fn residual_gauge_inner(
             generator_norm: norm,
             pinned_energy_fraction,
             lowering_error_scale: *lowering_error_scale,
+            provenance: VerdictProvenance::CurvatureTest,
         });
     }
 

@@ -1523,6 +1523,16 @@ pub struct SaeManifoldAtom {
     /// basis). Caller-managed atoms (no installed evaluator) ignore the dial —
     /// there is no curved/linear split without an evaluator to provide it.
     pub homotopy_eta: f64,
+    /// #1019 stage 1: `true` once the post-fit arc-length (unit-speed) chart
+    /// canonicalization has been applied to this atom — the latent chart is
+    /// then the canonical (unit-speed) representative of its `Diff(M)` orbit
+    /// and the residual chart freedom is the finite isometry group of the
+    /// reference manifold (rotation + reflection on `S¹`, reflection +
+    /// translation on the interval). Read by the residual-gauge lowering so
+    /// the certificate reports the downgrade with the
+    /// `PinnedByCanonicalization` provenance. Only ever set for
+    /// `latent_dim == 1` atoms; never a flag the user controls.
+    pub unit_speed_canonicalized: bool,
 }
 
 impl SaeManifoldAtom {
@@ -1580,6 +1590,7 @@ impl SaeManifoldAtom {
             basis_second_jet: None,
             decoder_frame: None,
             homotopy_eta: 1.0,
+            unit_speed_canonicalized: false,
         };
         // Seed `smooth_penalty` with the intrinsic Gram at the initial
         // decoder/coordinates so the very first assembly already reads the
@@ -4512,6 +4523,11 @@ impl SaeManifoldTerm {
                 frame,
                 ard_variances,
                 lowering_error,
+                // #1019: post-fit arc-length canonicalization pins the chart;
+                // the certificate downgrades this atom's chart freedom to the
+                // finite isometry group with PinnedByCanonicalization
+                // provenance.
+                chart_canonicalized: atom.unit_speed_canonicalized && d == 1,
             });
             atom_offsets.push(cursor);
             atom_axis_dim.push(d);
@@ -10833,6 +10849,208 @@ impl SaeManifoldTerm {
         Ok(weights)
     }
 
+    /// #1019 stage 1 — post-fit arc-length (unit-speed) chart canonicalization
+    /// for every fitted `d = 1` atom with circle or interval topology.
+    ///
+    /// Image-frozen and gauge-legal: each eligible atom's latent chart is
+    /// replaced by the unit-speed representative of its `Diff(S¹)` /
+    /// `Diff([0, 1])` orbit (cumulative arc length along the fitted decoder
+    /// curve, rescaled to the chart's native span) and the decoder is
+    /// recomposed by exact least squares so the decoded image is unchanged
+    /// ([`crate::terms::sae_chart_canonicalization`]). Atoms whose basis
+    /// cannot absorb the reparameterized curve within the recomposition
+    /// tolerance are left untouched (honest fallback, recorded by the flag
+    /// staying `false`).
+    ///
+    /// The whole pass is additionally gated on the penalized objective: the
+    /// canonical state is kept only when the same scalar the line search
+    /// minimized does not increase beyond the image-invariance tolerance
+    /// (the intrinsic smoothness penalty is reparameterization-invariant by
+    /// design, so a genuine increase means the transport went numerically
+    /// wrong and the fitted state is restored verbatim).
+    ///
+    /// Runs automatically from `into_fitted` after the joint fit converges,
+    /// before the payload / residual-gauge certificate is assembled — never
+    /// a flag (magic-by-default).
+    pub fn canonicalize_unit_speed_charts_post_fit(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+    ) -> Result<(), String> {
+        use crate::terms::sae_chart_canonicalization::{
+            CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology,
+        };
+        let mut eligible: Vec<(usize, CanonicalChartTopology)> = Vec::new();
+        for atom_idx in 0..self.k_atoms() {
+            let atom = &self.atoms[atom_idx];
+            if atom.latent_dim != 1
+                || self.assignment.coords[atom_idx].latent_dim() != 1
+                || atom.basis_evaluator.is_none()
+                || atom.homotopy_eta != 1.0
+            {
+                continue;
+            }
+            let topology = match &atom.basis_kind {
+                // Same fraction-of-period convention as the latent manifold
+                // wiring (`SaeAtomBasisKind::latent_manifold`): the harmonic
+                // evaluators read `t` as a fraction of one period.
+                SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => {
+                    CanonicalChartTopology::Circle { period: 1.0 }
+                }
+                SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch => {
+                    CanonicalChartTopology::Interval
+                }
+                // d = 1 never matches Sphere; Precomputed bases carry no
+                // evaluator semantics to re-express the curve in.
+                SaeAtomBasisKind::Sphere | SaeAtomBasisKind::Precomputed(_) => continue,
+            };
+            eligible.push((atom_idx, topology));
+        }
+        if eligible.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot = self.snapshot_mutable_state();
+        let prior_flags: Vec<bool> = self
+            .atoms
+            .iter()
+            .map(|atom| atom.unit_speed_canonicalized)
+            .collect();
+        let pre_total = self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+
+        let mut any_changed = false;
+        for (atom_idx, topology) in &eligible {
+            match self.canonicalize_atom_unit_speed_chart(*atom_idx, topology) {
+                Ok(changed) => any_changed |= changed,
+                Err(err) => {
+                    self.restore_mutable_state(&snapshot);
+                    for (atom, flag) in self.atoms.iter_mut().zip(prior_flags.iter()) {
+                        atom.unit_speed_canonicalized = *flag;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        if !any_changed {
+            return Ok(());
+        }
+
+        // Keep the canonical state only when the optimized scalar is preserved
+        // within the image-invariance tolerance (the data fit moved by at most
+        // the certified recomposition residual; the intrinsic penalty is
+        // reparameterization-invariant, transported exactly).
+        let canonical_total = self.penalized_objective_total(target, rho, analytic_penalties, 1.0);
+        let keep = match canonical_total {
+            Ok(total) => {
+                total.is_finite()
+                    && total <= pre_total + CHART_RECOMPOSITION_REL_TOL * (1.0 + pre_total.abs())
+            }
+            Err(_) => false,
+        };
+        if !keep {
+            self.restore_mutable_state(&snapshot);
+            for (atom, flag) in self.atoms.iter_mut().zip(prior_flags.iter()) {
+                atom.unit_speed_canonicalized = *flag;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the arc-length reparameterization to one eligible `d = 1` atom.
+    /// Returns `Ok(true)` when the atom was canonicalized, `Ok(false)` on an
+    /// honest skip (degenerate chart, basis not closed under the
+    /// reparameterization, or per-row image drift above tolerance).
+    fn canonicalize_atom_unit_speed_chart(
+        &mut self,
+        atom_idx: usize,
+        topology: &crate::terms::sae_chart_canonicalization::CanonicalChartTopology,
+    ) -> Result<bool, String> {
+        use crate::terms::sae_chart_canonicalization::{
+            CHART_RECOMPOSITION_REL_TOL, unit_speed_reparameterization,
+        };
+        let n = self.n_obs();
+        if n == 0 {
+            return Ok(false);
+        }
+        let Some(evaluator) = self.atoms[atom_idx].basis_evaluator.as_ref().cloned() else {
+            return Ok(false);
+        };
+        let coords = self.assignment.coords[atom_idx].as_matrix();
+        let row_coords = coords.column(0).to_owned();
+        let Some(repar) = unit_speed_reparameterization(
+            evaluator.as_ref(),
+            self.atoms[atom_idx].decoder_coefficients.view(),
+            row_coords.view(),
+            topology,
+        )?
+        else {
+            return Ok(false);
+        };
+
+        // Per-row basis/jet at the canonical coordinates.
+        let mut new_coords = Array2::<f64>::zeros((n, 1));
+        for row in 0..n {
+            new_coords[[row, 0]] = repar.new_row_coords[row];
+        }
+        let (new_phi, new_jet) = if self.atoms[atom_idx].homotopy_eta == 1.0 {
+            evaluator.evaluate(new_coords.view())?
+        } else {
+            let evaluated =
+                evaluator.evaluate_phi_eta(new_coords.view(), self.atoms[atom_idx].homotopy_eta)?;
+            (evaluated.phi, evaluated.jet)
+        };
+        if new_phi.dim() != self.atoms[atom_idx].basis_values.dim()
+            || new_jet.dim() != self.atoms[atom_idx].basis_jacobian.dim()
+        {
+            return Err(format!(
+                "SaeManifoldTerm::canonicalize_atom_unit_speed_chart: canonical basis {:?} / jet {:?} must match the fitted shapes {:?} / {:?}",
+                new_phi.dim(),
+                new_jet.dim(),
+                self.atoms[atom_idx].basis_values.dim(),
+                self.atoms[atom_idx].basis_jacobian.dim()
+            ));
+        }
+
+        // Per-row image-invariance gate: the grid gate certified the curve at
+        // the audit nodes; this certifies it at the coordinates the fit
+        // actually sits on. Same honest-fallback contract.
+        let old_fit = fast_ab(
+            &self.atoms[atom_idx].basis_values,
+            &self.atoms[atom_idx].decoder_coefficients,
+        );
+        let new_fit = fast_ab(&new_phi, &repar.new_decoder);
+        let mut fit_scale = 0.0_f64;
+        let mut max_abs = 0.0_f64;
+        for (a, b) in old_fit.iter().zip(new_fit.iter()) {
+            fit_scale = fit_scale.max(a.abs()).max(b.abs());
+            max_abs = max_abs.max((a - b).abs());
+        }
+        if !(fit_scale.is_finite() && max_abs.is_finite()) {
+            return Ok(false);
+        }
+        if fit_scale > 0.0 && max_abs > CHART_RECOMPOSITION_REL_TOL * fit_scale {
+            return Ok(false);
+        }
+
+        // Commit: canonical coordinates, basis, decoder, and the congruence-
+        // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as the affine
+        // gauge pass).
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
+        let flat = Array1::from_iter(new_coords.iter().copied());
+        self.assignment.coords[atom_idx].set_flat(flat.view());
+        let atom = &mut self.atoms[atom_idx];
+        atom.basis_values = new_phi;
+        atom.basis_jacobian = new_jet;
+        atom.decoder_coefficients = repar.new_decoder;
+        atom.smooth_penalty = transport_smooth_penalty_for_decoder(
+            repar.decoder_transport.view(),
+            old_smooth_penalty.view(),
+        )?;
+        atom.unit_speed_canonicalized = true;
+        Ok(true)
+    }
+
     /// The iterate scale `1 + ‖(logits, coords, decoder)‖` used to make the
     /// inner KKT gradient and Newton-step tolerances relative. This is the
     /// SINGLE source of truth for that scale: `reml_criterion`'s convergence
@@ -13121,7 +13339,8 @@ impl SaeManifoldOuterObjective {
             ),
             Err(err) => Err(err),
         };
-        if let (Ok(settled_total), Ok(seed_loss)) = (settled_objective, seed_solve) {
+        let mut seed_won = false;
+        if let (Ok(settled_total), Ok(_)) = (&settled_objective, &seed_solve) {
             let seed_total = baseline_term.penalized_objective_total(
                 target.view(),
                 &current_rho,
@@ -13129,12 +13348,30 @@ impl SaeManifoldOuterObjective {
                 1.0,
             );
             if let Ok(seed_total) = seed_total {
-                if seed_total.is_finite() && seed_total < settled_total {
-                    return (baseline_term, current_rho, seed_loss);
-                }
+                seed_won = seed_total.is_finite() && seed_total < *settled_total;
             }
         }
-        (term, current_rho, loss)
+        let (mut fitted, fitted_loss) = if seed_won {
+            let seed_loss = seed_solve.expect("seed_won implies seed_solve is Ok");
+            (baseline_term, seed_loss)
+        } else {
+            (term, loss)
+        };
+        // #1019 stage 1 — the post-fit assembly seam: canonicalize every
+        // eligible d = 1 atom's chart to its arc-length (unit-speed)
+        // representative BEFORE the fitted term is handed to the payload /
+        // residual-gauge certificate. Internally objective-gated and
+        // image-frozen (the fitted state is restored verbatim on any failure
+        // or tolerance breach), so the fit this returns is never degraded —
+        // an error here is a refused canonicalization, not a broken fit.
+        if let Err(err) = fitted.canonicalize_unit_speed_charts_post_fit(
+            target.view(),
+            &current_rho,
+            registry.as_ref(),
+        ) {
+            log::debug!("into_fitted: unit-speed chart canonicalization refused: {err}");
+        }
+        (fitted, current_rho, fitted_loss)
     }
 
     /// First-order optimality certificate for this fit (#934).
@@ -14283,7 +14520,7 @@ fn transport_smooth_penalty_for_decoder(
     ))
 }
 
-fn solve_design_least_squares(
+pub(crate) fn solve_design_least_squares(
     design: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, String> {
