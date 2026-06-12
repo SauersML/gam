@@ -7219,8 +7219,9 @@ impl JointBetaRhoPosterior {
             RhoPrior::GammaPrecision { shape, rate } => {
                 for k in 0..n_rho {
                     let lambda = rho[k].exp();
-                    rho_prior += (*shape - 1.0) * rho[k] - *rate * lambda;
-                    grad_rho[k] += (*shape - 1.0) - *rate * lambda;
+                    // Density over sampled rho includes the e^rho Jacobian (Gamma is on lambda = e^rho).
+                    rho_prior += *shape * rho[k] - *rate * lambda;
+                    grad_rho[k] += *shape - *rate * lambda;
                 }
             }
             RhoPrior::PenalizedComplexity { upper, tail_prob } => {
@@ -7252,8 +7253,9 @@ impl JointBetaRhoPosterior {
                         }
                         RhoPrior::GammaPrecision { shape, rate } => {
                             let lambda = rho[k].exp();
-                            rho_prior += (*shape - 1.0) * rho[k] - *rate * lambda;
-                            grad_rho[k] += (*shape - 1.0) - *rate * lambda;
+                            // Density over sampled rho includes the e^rho Jacobian (Gamma is on lambda = e^rho).
+                            rho_prior += *shape * rho[k] - *rate * lambda;
+                            grad_rho[k] += *shape - *rate * lambda;
                         }
                         RhoPrior::PenalizedComplexity { upper, tail_prob } => {
                             if !pc_prior_params_valid(*upper, *tail_prob) {
