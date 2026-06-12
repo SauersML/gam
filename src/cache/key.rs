@@ -236,8 +236,10 @@ impl Fingerprinter {
     /// `hash_vector` copy that previously lived in `solver/latent_cache`.
     pub fn write_f64_array1(&mut self, values: &ndarray::Array1<f64>) {
         self.write_usize(values.len());
-        for &value in values.iter() {
-            self.write_f64(value);
+        if let Some(slice) = values.as_slice() {
+            self.write_f64_slice_payload(slice);
+        } else {
+            self.write_f64_slice_payload_slow_iter(values.iter().copied());
         }
     }
 
@@ -249,7 +251,18 @@ impl Fingerprinter {
     pub fn write_f64_array2(&mut self, values: &ndarray::Array2<f64>) {
         self.write_usize(values.nrows());
         self.write_usize(values.ncols());
-        for &value in values.iter() {
+        if let Some(slice) = values.as_slice() {
+            self.write_f64_slice_payload(slice);
+        } else {
+            self.write_f64_slice_payload_slow_iter(values.iter().copied());
+        }
+    }
+
+    fn write_f64_slice_payload_slow_iter<I>(&mut self, values: I)
+    where
+        I: IntoIterator<Item = f64>,
+    {
+        for value in values {
             self.write_f64(value);
         }
     }
@@ -431,6 +444,40 @@ mod tests {
         normalized[7] = -0.0;
         normalized[113] = f64::from_bits(0x7ff8_0000_0000_0042);
         assert_eq!(fast_key(&normalized), slow_key(&normalized));
+    }
+
+    #[test]
+    fn write_f64_arrays_match_element_protocol() {
+        let values = ndarray::Array2::from_shape_vec(
+            (3, 4),
+            vec![
+                1.25,
+                -2.5,
+                3.75,
+                4.0,
+                5.5,
+                -0.0,
+                7.25,
+                8.5,
+                9.75,
+                10.0,
+                f64::from_bits(0x7ff8_0000_0000_0100),
+                12.25,
+            ],
+        )
+        .expect("test array shape is valid");
+
+        let mut fast = Fingerprinter::new();
+        fast.write_str("write_f64_arrays_match_element_protocol");
+        fast.write_f64_array2(&values);
+
+        let mut slow = Fingerprinter::new();
+        slow.write_str("write_f64_arrays_match_element_protocol");
+        slow.write_usize(values.nrows());
+        slow.write_usize(values.ncols());
+        slow.write_f64_slice_payload_slow_iter(values.iter().copied());
+
+        assert_eq!(fast.finalize(), slow.finalize());
     }
 
     #[test]
