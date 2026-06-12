@@ -1045,12 +1045,23 @@ impl LatentZConditionalCalibration {
 }
 
 /// First-stage robust (HC0) sandwich covariance of a weighted-ridge coefficient
-/// vector: `V₁ = M⁻¹ (Σ_i w_i² û_i² A_i A_iᵀ) M⁻¹` with `M = AᵀWA + λR` the
+/// vector: `V₁ = M⁺ (Σ_i w_i² û_i² A_i A_iᵀ) M⁺` with `M = AᵀWA + λR` the
 /// ridge normal matrix that produced the coefficients, `W = diag(weights)`,
 /// `û_i` the per-row residual, and `A` the regression basis (here `[1 | a(C)]`).
-/// This is the closed-form generated-regressor covariance the second-stage
-/// Murphy–Topel correction consumes; the same `w² û²` meat the Rao gate uses,
-/// so the gate and the propagated SE are derived from one robust convention.
+/// `M⁺` is the Moore–Penrose pseudo-inverse via eigendecomposition with a
+/// relative tolerance: identifiable directions get the usual `(λ_eff)⁻¹` weight,
+/// and rank-deficient directions (where some θ₁ components are not identified
+/// by `A`) are zeroed — they carry no asymptotic distribution, so V₁ in those
+/// directions is zero, and the Murphy–Topel propagation through identifiable
+/// functionals of β remains finite and consistent. Using the ordinary inverse
+/// here let the unregularized direction's `1/ε` blow `M⁻¹·meat·M⁻¹` through
+/// the f64 range whenever the wide marginal-index span had a near-null
+/// direction (the bug behind "conditional latent calibration sandwich
+/// covariance is non-finite" on wide rank-deficient duchon/spline conditioning).
+/// The meat is formed as `BᵀB` with `B_i = w_i û_i A_iᵀ` (signed) so the
+/// fused-multiply GEMM is the same SIMD path used everywhere else in the
+/// codebase, instead of a hand-rolled triple loop whose partial sums could
+/// overflow on a single pathological row of the basis.
 fn weighted_ridge_sandwich_cov(
     basis: ArrayView2<'_, f64>,
     residuals: &[f64],
@@ -1066,37 +1077,40 @@ fn weighted_ridge_sandwich_cov(
             weights.len()
         ));
     }
-    // Robust HC0 meat: Σ_i w_i² û_i² A_i A_iᵀ.
-    let mut meat = Array2::<f64>::zeros((p, p));
+    if normal_matrix.nrows() != p || normal_matrix.ncols() != p {
+        return Err(format!(
+            "weighted ridge sandwich normal-matrix shape mismatch: basis cols={p}, normal {}x{}",
+            normal_matrix.nrows(),
+            normal_matrix.ncols()
+        ));
+    }
+    // Robust HC0 meat as a Gram: build `B` with `B_i = (w_i û_i) A_iᵀ` (rows of
+    // basis scaled by `w_i û_i`, sign carried), so `meat = BᵀB = Σ_i w_i² û_i²
+    // A_i A_iᵀ` from one BLAS Gramian. Identical math to the per-row outer-
+    // product accumulation, but the GEMM path keeps partial sums vectorized
+    // and is less sensitive to a single pathological row producing an
+    // intermediate that overflows f64 before the column-wise reduction cancels.
+    let mut b = basis.to_owned();
     for i in 0..n {
         let wi = weights[i];
-        if wi <= 0.0 {
+        let ri = residuals[i];
+        let scale = wi * ri;
+        if scale == 0.0 {
+            b.row_mut(i).fill(0.0);
             continue;
         }
-        let w2u2 = wi * wi * residuals[i] * residuals[i];
-        if w2u2 == 0.0 {
-            continue;
-        }
-        let a_row = basis.row(i);
-        for j in 0..p {
-            let aj = a_row[j];
-            if aj == 0.0 {
-                continue;
-            }
-            let scaled = w2u2 * aj;
-            for k in j..p {
-                let inc = scaled * a_row[k];
-                meat[[j, k]] += inc;
-                if k != j {
-                    meat[[k, j]] += inc;
-                }
-            }
-        }
+        b.row_mut(i).iter_mut().for_each(|value| *value *= scale);
     }
-    let m_inv =
-        crate::linalg::utils::invert_spd_with_ridge(normal_matrix, AUTO_Z_CONDITIONAL_RIDGE_REL)
-            .map_err(|e| format!("conditional latent calibration sandwich inverse failed: {e}"))?;
-    let cov = m_inv.dot(&meat).dot(&m_inv);
+    let meat = crate::linalg::faer_ndarray::fast_ata(&b);
+    // SPD pseudo-inverse of `M = AᵀWA + λR` via eigendecomposition with a
+    // relative tolerance; symmetrize first to absorb floating-point asymmetry
+    // accumulated in the AᵀWA assembly.
+    let mut m_sym = normal_matrix.clone();
+    crate::linalg::matrix::symmetrize_in_place(&mut m_sym);
+    let (_rank, m_pinv) = crate::linalg::utils::block_penalty_rank_and_pinv(&m_sym).map_err(
+        |e| format!("conditional latent calibration sandwich pseudo-inverse failed: {e}"),
+    )?;
+    let cov = m_pinv.dot(&meat).dot(&m_pinv);
     if cov.iter().any(|v| !v.is_finite()) {
         return Err("conditional latent calibration sandwich covariance is non-finite".to_string());
     }
