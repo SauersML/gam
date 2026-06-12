@@ -71,7 +71,6 @@ fn planted_unit_circle(n: usize, p: usize, sigma: f64) -> Array2<f64> {
 /// would after `term_from_padded_blocks` for one periodic atom.
 fn build_cold_k1_term(z: &Array2<f64>, seed_logit: f64) -> SaeManifoldTerm {
     let n = z.nrows();
-    let p = z.ncols();
     let evaluator = PeriodicHarmonicEvaluator::new(M).unwrap();
     // Seed angle from the ambient (col0, col1) direction (offset so coordinate
     // recovery is not under test), in fraction-of-period units.
