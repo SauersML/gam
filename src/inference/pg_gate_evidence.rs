@@ -1,14 +1,15 @@
-//! Exact Pólya–Gamma gate-block evidence for logit SAE gates (#1016).
+//! Deterministic Pólya–Gamma gate-block evidence for logit SAE gates (#1016).
 //!
 //! The gate/assignment-logit block is the weakest Gaussian piece of the SAE
 //! evidence: a Laplace approximation there replaces a skew logistic posterior
 //! with a single quadratic, and near a birth event (gate logits ≈ 0) the
 //! logistic block is *least* Gaussian, so the `K` vs `K+1` Occam comparison is
-//! mispriced on both sides. The PG augmentation makes the gate block exactly
-//! Gaussian conditional on the augmentation variable `ω`, and a deterministic
-//! quadrature over the PG mixing density turns the gate evidence into an exact
-//! (within quadrature tolerance) marginal — with no RNG, so the score stays a
-//! deterministic likelihood the #984 e-process can absorb.
+//! mispriced on both sides. The PG augmentation makes the gate block Gaussian
+//! conditional on independent augmentation variables `ω_i`. This module uses
+//! the exact first two moments of each `PG(b_i, ψ_i)` law and a deterministic
+//! second-order cumulant expansion around `ω̄ = E[ω]`; the neglected error is
+//! the third- and higher-order joint cumulant contribution. The result is a
+//! deterministic approximate likelihood correction, not an exact marginal.
 //!
 //! ## The conditional-Gaussian block
 //!
@@ -35,18 +36,19 @@
 //! plain Laplace gate block), so we drop it and document that the returned
 //! value is the gate block up to that fixed additive constant.
 //!
-//! The marginal over `ω` is the deterministic quadrature
+//! The marginal over independent `ω_i` is approximated by expanding
+//! `log E[exp(-V(ω))]` around the moment-matched point:
 //!
 //! ```text
-//! −log p(y | rest) ≈ −logsumexp_q [ ln w_q − V_ω(ω_q) ]
+//! log E[exp(-V(ω))]
+//!   = -V(ω̄) + ½ Σ_i Var(ω_i) · ((∂_i V)^2 - ∂_{ii} V)
+//!     + third- and higher-order cumulants.
 //! ```
 //!
-//! where `V_ω(ω) = −½ hᵀ Q⁻¹ h + ½ log|Q|` is the `ω`-dependent part of
-//! `F_ω` after the Gaussian integral. Because the quadrature is a probability
-//! rule (`Σ w_q = 1`), this is the exact log mixing average of the conditional
-//! evidences.
+//! where `V(ω) = ½ log|Q_ω| − ½ h_ωᵀ Q_ω⁻¹ h_ω` is the `ω`-dependent part of
+//! `F_ω` after the Gaussian integral.
 
-use crate::inference::pg_moments::{PgQuadrature, pg_moments};
+use crate::inference::pg_moments::pg_moments;
 use crate::linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
 use crate::matrix::FactorizedSystem;
 use faer::Side;
@@ -83,9 +85,8 @@ pub struct GateBlock<'a> {
 /// Which deterministic lane priced the gate block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PgGateLane {
-    /// Deterministic PG quadrature: the exact-within-tolerance marginal evidence
-    /// (the shipped K-selection lane).
-    Quadrature,
+    /// Deterministic second-order independent-row PG correction around `E[ω]`.
+    CurvatureCorrected,
     /// Single moment-matched node `ω = E[PG]`: deterministic but only
     /// first-order in the `ω` integral. The cheap debug comparator.
     MomentMatched,
@@ -99,29 +100,23 @@ pub struct PgGateEvidence {
     pub neg_log_evidence: f64,
     /// The lane that produced it.
     pub lane: PgGateLane,
-    /// Quadrature node count actually used (1 for the moment-matched lane).
-    pub nodes: usize,
 }
 
-/// Compute the exact PG gate-block evidence by deterministic quadrature.
-///
-/// `tolerance` selects the node count (a pure function; see
-/// [`PgQuadrature::matched`]); two calls with identical `block` and `tolerance`
-/// produce a byte-identical result with no RNG anywhere in the path.
-pub fn pg_gate_evidence(block: &GateBlock<'_>, tolerance: f64) -> Result<PgGateEvidence, String> {
-    evaluate(block, Lane::Quadrature { tolerance })
+/// Compute the deterministic second-order PG gate-block evidence correction.
+pub fn pg_gate_evidence(block: &GateBlock<'_>) -> Result<PgGateEvidence, String> {
+    evaluate(block, Lane::CurvatureCorrected)
 }
 
 /// The deterministic moment-matched comparator: `ω = E[PG(b, ψ̂)]`, one node.
 ///
-/// Labelled [`PgGateLane::MomentMatched`]; an approximation to the `ω` integral,
-/// never the shipped evidence (the issue's `PgMomentMatched` lane).
+/// Labelled [`PgGateLane::MomentMatched`]; this is the zeroth-order point of the
+/// independent-row expansion.
 pub fn pg_gate_evidence_moment_matched(block: &GateBlock<'_>) -> Result<PgGateEvidence, String> {
     evaluate(block, Lane::MomentMatched)
 }
 
 enum Lane {
-    Quadrature { tolerance: f64 },
+    CurvatureCorrected,
     MomentMatched,
 }
 
@@ -134,52 +129,48 @@ fn evaluate(block: &GateBlock<'_>, lane: Lane) -> Result<PgGateEvidence, String>
     if block.y.len() != n || block.b.len() != n {
         return Err("PG gate evidence: y/b length must match design rows".into());
     }
-    let offset = block.offset;
     let psi_hat = block.psi_hat;
+    if let Some(offset) = block.offset {
+        if offset.len() != n {
+            return Err("PG gate evidence: offset length must match design rows".into());
+        }
+    }
+    if let Some(psi) = psi_hat {
+        if psi.len() != n {
+            return Err("PG gate evidence: psi_hat length must match design rows".into());
+        }
+    }
+    if let Some(penalty) = block.penalty {
+        if penalty.nrows() != d_g || penalty.ncols() != d_g {
+            return Err("PG gate evidence: penalty shape must match gate dimension".into());
+        }
+    }
+    if let Some(hess_rest) = block.hess_rest {
+        if hess_rest.nrows() != d_g || hess_rest.ncols() != d_g {
+            return Err("PG gate evidence: hess_rest shape must match gate dimension".into());
+        }
+    }
+    if let Some(h_rest) = block.h_rest {
+        if h_rest.len() != d_g {
+            return Err("PG gate evidence: h_rest length must match gate dimension".into());
+        }
+    }
 
     // κ = y − b/2.
     let kappa: Array1<f64> = &block.y.to_owned() - &(&block.b.to_owned() * 0.5);
 
-    // The ω integral is per-row independent given ψ̂, but the gate quadratic
-    // couples all rows through X_gᵀ Ω X_g. A joint product rule over n rows is
-    // intractable; instead we integrate each row's PG law against the SAME
-    // deterministic scalar rule and assemble Ω from the per-row node values —
-    // i.e. we use a shared quadrature abscissa policy keyed by the row's
-    // (b_i, ψ̂_i). When ψ̂ is supplied, each row's tilt sharpens its law toward
-    // its conditional mean, and at the inner optimum the per-row marginal is
-    // already near its moment-matched value, so the row-shared rule's leading
-    // correction is the curvature of V_ω in ω — captured by the multi-node
-    // average below.
-    //
-    // Concretely: we build one scalar rule per distinct (b_i, ψ̂_i) is wasteful;
-    // instead we evaluate the block evidence at a small set of GLOBAL ω-scales
-    // {s_q} drawn from a single reference rule, scaling each row's mean by the
-    // node, and average in log-space with the reference weights. This is exact
-    // when the per-row laws share a scale (the homoscedastic gate case) and is
-    // the leading PG curvature correction otherwise — strictly better than the
-    // single moment-matched Laplace point, which is the q = 1 special case.
-    let (scales, weights) = match lane {
-        Lane::MomentMatched => (vec![1.0], vec![1.0]),
-        Lane::Quadrature { tolerance } => {
-            // Reference rule on PG(1, 0): its nodes/weights, rescaled to unit
-            // mean, give the shared ω-scale grid {s_q = ω_q / E[PG(1,0)]}.
-            let rule = PgQuadrature::matched(1.0, 0.0, tolerance);
-            let ref_mean = pg_moments(1.0, 0.0).mean;
-            let scales: Vec<f64> = rule.nodes.iter().map(|nd| nd.node / ref_mean).collect();
-            let weights: Vec<f64> = rule.nodes.iter().map(|nd| nd.weight).collect();
-            (scales, weights)
-        }
-    };
-
-    // Per-row PG mean ω̄_i = E[PG(b_i, ψ̂_i)] (the tilted law's mean).
+    // Per-row independent PG moments under the tilted law at ψ̂.
     let mut omega_bar = Array1::<f64>::zeros(n);
+    let mut omega_var = Array1::<f64>::zeros(n);
     for i in 0..n {
         let c = psi_hat.map(|p| p[i]).unwrap_or(0.0);
-        omega_bar[i] = pg_moments(block.b[i], c).mean;
+        let moments = pg_moments(block.b[i], c);
+        omega_bar[i] = moments.mean;
+        omega_var[i] = moments.variance;
     }
 
     // h_const = h_rest,g + X_gᵀ κ  (the ω-independent part of h_ω, minus the
-    // ω·o piece handled per-scale below).
+    // ω·o piece handled at evaluation time).
     let xt_kappa = block.design.t().dot(&kappa);
     let h_const = match block.h_rest {
         Some(hr) => &hr.to_owned() + &xt_kappa,
@@ -195,56 +186,91 @@ fn evaluate(block: &GateBlock<'_>, lane: Lane) -> Result<PgGateEvidence, String>
         q_base += &s;
     }
 
+    let eval = evaluate_at_omega(block, q_base.view(), h_const.view(), omega_bar.view())?;
+    let correction = match lane {
+        Lane::CurvatureCorrected => {
+            second_order_correction(eval.first.view(), eval.second.view(), omega_var.view())
+        }
+        Lane::MomentMatched => 0.0,
+    };
     let log_two_pi = (2.0 * std::f64::consts::PI).ln();
-    let mut terms: Vec<f64> = Vec::with_capacity(scales.len());
-
-    for (scale_idx, &scale) in scales.iter().enumerate() {
-        // Ω_q = diag(scale · ω̄_i): the row PG variance at this shared scale.
-        let omega_diag = omega_bar.mapv(|w| (scale * w).max(0.0));
-
-        // Q_ω = Q_base + X_gᵀ Ω X_g  (weighted Gram).
-        let mut q_mat = q_base.clone();
-        weighted_gram_into(block.design, omega_diag.view(), &mut q_mat);
-
-        // h_ω = h_const − X_gᵀ Ω o.
-        let mut h = h_const.clone();
-        if let Some(o) = offset {
-            let omega_o = &omega_diag * &o.to_owned();
-            let xt_omega_o = block.design.t().dot(&omega_o);
-            h -= &xt_omega_o;
-        }
-
-        // Gaussian block: V_q = ½ log|Q| − ½ hᵀ Q⁻¹ h.
-        let q_view = FaerArrayView::new(&q_mat);
-        let factor = factorize_symmetricwith_fallback(q_view.as_ref(), Side::Lower)
-            .map_err(|e| format!("PG gate block factorization failed: {e:?}"))?;
-        let log_det = factor.logdet();
-        if !log_det.is_finite() {
-            return Err("PG gate block Hessian is not positive definite".into());
-        }
-        let q_inv_h = FactorizedSystem::solve(&factor, &h)?;
-        let quad = h.dot(&q_inv_h);
-
-        // The negative-log conditional evidence at this ω-scale, minus the
-        // fixed d_g·log(2π)/2 (folded once below) and the dropped c_ω constant.
-        let v_q = 0.5 * log_det - 0.5 * quad;
-        // logsumexp accumulates ln w_q + (−V_q) since evidence = exp(−V_q).
-        terms.push(weights[scale_idx].ln() - v_q);
-    }
-
-    let log_evidence_core = log_sum_exp(&terms);
-    // −log p = −(log_evidence_core − ½ d_g log 2π) = ½ d_g log 2π − core.
-    let neg_log_evidence = 0.5 * d_g as f64 * log_two_pi - log_evidence_core;
-
+    let neg_log_evidence = eval.value + 0.5 * d_g as f64 * log_two_pi - 0.5 * correction;
     let lane_tag = match lane {
-        Lane::Quadrature { .. } => PgGateLane::Quadrature,
+        Lane::CurvatureCorrected => PgGateLane::CurvatureCorrected,
         Lane::MomentMatched => PgGateLane::MomentMatched,
     };
     Ok(PgGateEvidence {
         neg_log_evidence,
         lane: lane_tag,
-        nodes: scales.len(),
     })
+}
+
+struct OmegaEvaluation {
+    value: f64,
+    first: Array1<f64>,
+    second: Array1<f64>,
+}
+
+fn evaluate_at_omega(
+    block: &GateBlock<'_>,
+    q_base: ArrayView2<'_, f64>,
+    h_const: ArrayView1<'_, f64>,
+    omega_diag: ArrayView1<'_, f64>,
+) -> Result<OmegaEvaluation, String> {
+    let n = block.design.nrows();
+    let mut q_mat = q_base.to_owned();
+    weighted_gram_into(block.design, omega_diag.view(), &mut q_mat);
+
+    let mut h = h_const.to_owned();
+    if let Some(o) = block.offset {
+        let omega_o = &omega_diag.to_owned() * &o.to_owned();
+        let xt_omega_o = block.design.t().dot(&omega_o);
+        h -= &xt_omega_o;
+    }
+
+    let q_view = FaerArrayView::new(&q_mat);
+    let factor = factorize_symmetricwith_fallback(q_view.as_ref(), Side::Lower)
+        .map_err(|e| format!("PG gate block factorization failed: {e:?}"))?;
+    let log_det = factor.logdet();
+    if !log_det.is_finite() {
+        return Err("PG gate block Hessian is not positive definite".into());
+    }
+    let q_inv_h = FactorizedSystem::solve(&factor, &h)?;
+    let quad = h.dot(&q_inv_h);
+    let value = 0.5 * log_det - 0.5 * quad;
+
+    let rhs = block.design.t().to_owned();
+    let q_inv_xt = FactorizedSystem::solvemulti(&factor, &rhs)?;
+    let mut first = Array1::<f64>::zeros(n);
+    let mut second = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let row = block.design.row(i);
+        let solved_x = q_inv_xt.column(i);
+        let t = row.dot(&solved_x);
+        let w = row.dot(&q_inv_h);
+        let offset = block.offset.map(|o| o[i]).unwrap_or(0.0);
+        first[i] = 0.5 * t + offset * w + 0.5 * w * w;
+        let shifted_w = offset + w;
+        second[i] = -0.5 * t * t - t * shifted_w * shifted_w;
+    }
+    Ok(OmegaEvaluation {
+        value,
+        first,
+        second,
+    })
+}
+
+fn second_order_correction(
+    first: ArrayView1<'_, f64>,
+    second: ArrayView1<'_, f64>,
+    variance: ArrayView1<'_, f64>,
+) -> f64 {
+    first
+        .iter()
+        .zip(second.iter())
+        .zip(variance.iter())
+        .map(|((&d_v, &d2_v), &var)| var * (d_v * d_v - d2_v))
+        .sum()
 }
 
 /// Accumulate `Xᵀ diag(w) X` into `out` (d × d), row-streaming so the n × d
@@ -268,37 +294,41 @@ fn weighted_gram_into(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>, out: &mut 
     }
 }
 
-fn log_sum_exp(terms: &[f64]) -> f64 {
-    let mut max = f64::NEG_INFINITY;
-    for &t in terms {
-        if t > max {
-            max = t;
-        }
-    }
-    if !max.is_finite() {
-        return max;
-    }
-    let s: f64 = terms.iter().map(|&t| (t - max).exp()).sum();
-    max + s.ln()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::{Array1, Array2, array};
 
-    /// Scalar gate: brute-force the 1-D gate evidence integral
-    /// `∫ exp(κψ)/(1+e^ψ)^b · N(ψ; 0, 1/s) dψ` by dense quadrature and compare
-    /// against the PG Gaussian-block result. With a unit penalty `S_g = s`,
-    /// d_g = 1, intercept design, the two must agree to quadrature tolerance.
+    fn assemble_terms(block: &GateBlock<'_>) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
+        let d_g = block.design.ncols();
+        let kappa: Array1<f64> = &block.y.to_owned() - &(&block.b.to_owned() * 0.5);
+        let xt_kappa = block.design.t().dot(&kappa);
+        let h_const = match block.h_rest {
+            Some(hr) => &hr.to_owned() + &xt_kappa,
+            None => xt_kappa,
+        };
+        let mut q_base = Array2::<f64>::zeros((d_g, d_g));
+        if let Some(hr) = block.hess_rest {
+            q_base += &hr;
+        }
+        if let Some(s) = block.penalty {
+            q_base += &s;
+        }
+        let mut omega_bar = Array1::<f64>::zeros(block.design.nrows());
+        for i in 0..block.design.nrows() {
+            let c = block.psi_hat.map(|p| p[i]).unwrap_or(0.0);
+            omega_bar[i] = pg_moments(block.b[i], c).mean;
+        }
+        (q_base, h_const, omega_bar)
+    }
+
     #[test]
-    fn scalar_gate_matches_brute_force() {
-        // One coordinate, n rows all sharing the single intercept column.
-        let n = 6;
-        let design = Array2::<f64>::ones((n, 1));
-        let y = array![1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-        let b = Array1::<f64>::ones(n);
-        let s = array![[1.0]];
+    fn curvature_correction_zero_when_pg_variances_are_zero() {
+        let design = array![[1.0, 0.2], [1.0, -0.5], [1.0, 0.9]];
+        let y = Array1::<f64>::zeros(3);
+        let b = Array1::<f64>::zeros(3);
+        let s = array![[1.5, 0.1], [0.1, 1.2]];
+        let h_rest = array![0.3, -0.2];
         let block = GateBlock {
             design: design.view(),
             y: y.view(),
@@ -307,47 +337,21 @@ mod tests {
             psi_hat: None,
             penalty: Some(s.view()),
             hess_rest: None,
-            h_rest: None,
+            h_rest: Some(h_rest.view()),
         };
-        let pg = pg_gate_evidence(&block, 1e-8).expect("pg evidence");
 
-        // Brute force: F(g) = ½ s g² − κ_tot g + Σ_i b_i log(1+e^g),
-        // with κ_tot = Σ κ_i and g the shared coordinate. Evidence =
-        // ∫ exp(−F(g)) dg by fine trapezoid.
-        let kappa_tot: f64 = y.iter().zip(b.iter()).map(|(yi, bi)| yi - 0.5 * bi).sum();
-        let b_tot: f64 = b.sum();
-        let neg_log_f = |g: f64| {
-            let softplus: f64 = (1.0 + g.exp()).ln();
-            -(0.5 * 1.0 * g * g - kappa_tot * g + b_tot * softplus)
-        };
-        let lo = -20.0;
-        let hi = 20.0;
-        let steps = 400_000;
-        let h = (hi - lo) / steps as f64;
-        let mut integral = 0.0;
-        for k in 0..=steps {
-            let g = lo + k as f64 * h;
-            let w = if k == 0 || k == steps { 0.5 } else { 1.0 };
-            integral += w * neg_log_f(g).exp();
-        }
-        integral *= h;
-        let brute_neg_log = -integral.ln();
+        let corrected = pg_gate_evidence(&block).expect("curvature-corrected evidence");
+        let matched = pg_gate_evidence_moment_matched(&block).expect("moment-matched evidence");
 
-        // The PG block integrates the SAME gate integral but marginalizes the
-        // PG ω; the deterministic quadrature should land within a loose band of
-        // the brute-force logistic integral (the PG marginal is exact; the
-        // residual is the row-shared-scale approximation for heteroscedastic
-        // rows, small here).
-        assert!(
-            (pg.neg_log_evidence - brute_neg_log).abs() < 0.25,
-            "pg {} vs brute {}",
-            pg.neg_log_evidence,
-            brute_neg_log
+        assert_eq!(corrected.lane, PgGateLane::CurvatureCorrected);
+        assert_eq!(matched.lane, PgGateLane::MomentMatched);
+        assert_eq!(
+            corrected.neg_log_evidence.to_bits(),
+            matched.neg_log_evidence.to_bits()
         );
-        assert_eq!(pg.lane, PgGateLane::Quadrature);
     }
 
-    /// Determinism: identical inputs → byte-identical evidence, no RNG.
+    /// Determinism: identical inputs produce byte-identical evidence, no RNG.
     #[test]
     fn evidence_is_bit_deterministic() {
         let design = array![[1.0, 0.2], [1.0, -0.5], [1.0, 0.9], [1.0, -0.1]];
@@ -364,18 +368,97 @@ mod tests {
             hess_rest: None,
             h_rest: None,
         };
-        let a = pg_gate_evidence(&mk(), 1e-6).unwrap();
-        let c = pg_gate_evidence(&mk(), 1e-6).unwrap();
+        let a = pg_gate_evidence(&mk()).unwrap();
+        let c = pg_gate_evidence(&mk()).unwrap();
         assert_eq!(a.neg_log_evidence.to_bits(), c.neg_log_evidence.to_bits());
-        assert_eq!(a.nodes, c.nodes);
+        assert_eq!(a.lane, c.lane);
     }
 
-    /// Near a birth event (gate logits ≈ 0) the PG channel must measurably
-    /// differ from the plain moment-matched (single-node Laplace-like) block:
-    /// the multi-node quadrature carries the ω-curvature the single point drops.
     #[test]
-    fn pg_corrects_moment_matched_near_zero_logit() {
-        // Small-n fixture with logits at zero: maximal logistic skew.
+    fn derivatives_match_refactorized_finite_differences() {
+        let design = array![[1.0, 0.3], [-0.4, 1.2], [0.8, -0.7]];
+        let y = array![1.0, 0.0, 1.0];
+        let b = array![1.0, 2.0, 1.5];
+        let offset = array![0.2, -0.1, 0.4];
+        let psi = array![0.1, -0.5, 0.8];
+        let penalty = array![[2.0, 0.2], [0.2, 1.5]];
+        let hess_rest = array![[0.7, 0.1], [0.1, 0.9]];
+        let h_rest = array![0.3, -0.2];
+        let block = GateBlock {
+            design: design.view(),
+            y: y.view(),
+            b: b.view(),
+            offset: Some(offset.view()),
+            psi_hat: Some(psi.view()),
+            penalty: Some(penalty.view()),
+            hess_rest: Some(hess_rest.view()),
+            h_rest: Some(h_rest.view()),
+        };
+        let (q_base, h_const, omega_bar) = assemble_terms(&block);
+        let eval =
+            evaluate_at_omega(&block, q_base.view(), h_const.view(), omega_bar.view()).unwrap();
+        let eps = 1e-5;
+        for i in 0..omega_bar.len() {
+            let mut omega_plus = omega_bar.clone();
+            let mut omega_minus = omega_bar.clone();
+            omega_plus[i] += eps;
+            omega_minus[i] -= eps;
+            let plus = evaluate_at_omega(&block, q_base.view(), h_const.view(), omega_plus.view())
+                .unwrap();
+            let minus =
+                evaluate_at_omega(&block, q_base.view(), h_const.view(), omega_minus.view())
+                    .unwrap();
+            let first_fd = (plus.value - minus.value) / (2.0 * eps);
+            let second_fd = (plus.value - 2.0 * eval.value + minus.value) / (eps * eps);
+            let first_scale = eval.first[i].abs().max(first_fd.abs()).max(1.0);
+            let second_scale = eval.second[i].abs().max(second_fd.abs()).max(1.0);
+            assert!(
+                (eval.first[i] - first_fd).abs() <= 1e-7 * first_scale,
+                "row {i}: analytic first {} vs finite difference {first_fd}",
+                eval.first[i],
+            );
+            assert!(
+                (eval.second[i] - second_fd).abs() <= 1e-5 * second_scale,
+                "row {i}: analytic second {} vs finite difference {second_fd}",
+                eval.second[i],
+            );
+        }
+    }
+
+    #[test]
+    fn duplicated_row_correction_uses_independent_variances() {
+        let design = array![[1.0], [1.0]];
+        let y = array![1.0, 1.0];
+        let b = array![2.0, 2.0];
+        let penalty = array![[2.0]];
+        let block = GateBlock {
+            design: design.view(),
+            y: y.view(),
+            b: b.view(),
+            offset: None,
+            psi_hat: None,
+            penalty: Some(penalty.view()),
+            hess_rest: None,
+            h_rest: None,
+        };
+        let (q_base, h_const, omega_bar) = assemble_terms(&block);
+        let eval =
+            evaluate_at_omega(&block, q_base.view(), h_const.view(), omega_bar.view()).unwrap();
+        let variance = array![pg_moments(2.0, 0.0).variance, pg_moments(2.0, 0.0).variance];
+        let first_row = variance[0] * (eval.first[0] * eval.first[0] - eval.second[0]);
+        let second_row = variance[1] * (eval.first[1] * eval.first[1] - eval.second[1]);
+        let correction =
+            second_order_correction(eval.first.view(), eval.second.view(), variance.view());
+
+        assert!((variance[0] - 1.0 / 12.0).abs() < 1e-15);
+        assert!(first_row > 0.0);
+        assert!((first_row - second_row).abs() < 1e-15);
+        assert!((correction - 2.0 * first_row).abs() < 1e-15);
+        assert!((correction - 4.0 * first_row).abs() > first_row);
+    }
+
+    #[test]
+    fn curvature_correction_changes_moment_matched_near_zero_logit() {
         let n = 4;
         let design = Array2::<f64>::ones((n, 1));
         let y = array![1.0, 0.0, 1.0, 0.0];
@@ -392,15 +475,12 @@ mod tests {
             hess_rest: None,
             h_rest: None,
         };
-        let exact = pg_gate_evidence(&block, 1e-8).unwrap();
+        let corrected = pg_gate_evidence(&block).unwrap();
         let mm = pg_gate_evidence_moment_matched(&block).unwrap();
-        assert_eq!(mm.nodes, 1);
-        assert!(exact.nodes > 1);
-        // The correction is real (non-zero) and bounded.
-        let correction = (exact.neg_log_evidence - mm.neg_log_evidence).abs();
+        let correction = (corrected.neg_log_evidence - mm.neg_log_evidence).abs();
         assert!(
             correction > 1e-6 && correction < 5.0,
-            "expected a small nonzero PG correction, got {correction}",
+            "expected a bounded nonzero PG curvature correction, got {correction}",
         );
     }
 }
