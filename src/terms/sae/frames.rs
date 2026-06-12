@@ -460,7 +460,7 @@ impl GrassmannFrame {
     /// (largest-magnitude entry per column non-negative) so the span serializes
     /// deterministically. The caller guarantees `U` is already column-orthonormal
     /// and its columns are ordered by descending singular value.
-    fn from_oriented(mut frame: Array2<f64>, gauge_singular_values: Array1<f64>) -> Self {
+    pub(crate) fn from_oriented(mut frame: Array2<f64>, gauge_singular_values: Array1<f64>) -> Self {
         let (p, r) = frame.dim();
         for col in 0..r {
             // Sign-fix: make the largest-magnitude entry of each column

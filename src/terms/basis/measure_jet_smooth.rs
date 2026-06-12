@@ -1068,20 +1068,65 @@ pub fn build_measure_jet_basis(
     };
     let k_cc = measure_jet_design_matrix(centers.view(), centers.view(), length_scale)?;
     let kz = k_cc.dot(&z);
-    let penalty = kz.t().dot(&q_form).dot(&kz);
     let raw_design = measure_jet_design_matrix(data, centers.view(), length_scale)?;
     let design = crate::matrix::DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
         raw_design.dot(&z),
     ));
-    let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
-    let mut candidates = vec![PenaltyCandidate {
-        matrix: penalty_norm,
-        nullspace_dim_hint: 0,
-        source: PenaltySource::Primary,
-        normalization_scale: c_primary,
-        kronecker_factors: None,
-        op: None,
-    }];
+    // Spectral/geometric split. With the auto order sentinel (order_s == 0.0)
+    // the term emits one candidate PER scale: the multi-penalty REML engine
+    // then learns the level amplitudes λ_ℓ directly — scale adaptivity at
+    // ρ-speed, dead scales REML-deselected (the Duchon-ARD pattern) — and the
+    // fitted order is read off the spectrum (ŝ = −½ · slope of ln λ̂_ℓ on
+    // ln ε_ℓ) instead of being optimized. An explicit s > 0 pins the Mellin
+    // weights and fuses the band into one candidate. The Mellin prefactor
+    // ε^(−2s)·log_step inside each per-scale form is absorbed by the
+    // per-candidate Frobenius normalization, so REML owns the amplitudes
+    // outright. The sentinel itself is persisted in the metadata as the mode
+    // marker: a replay MUST re-enter the same mode or the penalty count
+    // desyncs (the gam#860 trap class).
+    let per_level = spec.order_s == 0.0;
+    let mut candidates = Vec::new();
+    if per_level {
+        let forms = measure_jet_energy_forms_per_scale(
+            centers.view(),
+            masses.view(),
+            &band,
+            order_s,
+            spec.alpha,
+            spec.tau0,
+        )?;
+        for (level, q_l) in forms.into_iter().enumerate() {
+            let s_l = kz.t().dot(&q_l).dot(&kz);
+            let (s_norm, c_l) = normalize_penalty(&((&s_l + &s_l.t()) * 0.5));
+            candidates.push(PenaltyCandidate {
+                matrix: s_norm,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::Other(format!("measure_jet_scale_{level}")),
+                normalization_scale: c_l,
+                kronecker_factors: None,
+                op: None,
+            });
+        }
+    } else {
+        let q_form = measure_jet_energy_form(
+            centers.view(),
+            masses.view(),
+            &band,
+            order_s,
+            spec.alpha,
+            spec.tau0,
+        )?;
+        let penalty = kz.t().dot(&q_form).dot(&kz);
+        let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
+        candidates.push(PenaltyCandidate {
+            matrix: penalty_norm,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::Primary,
+            normalization_scale: c_primary,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
     if spec.double_penalty {
         let ridge = Array2::<f64>::eye(design.ncols());
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
