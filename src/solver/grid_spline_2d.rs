@@ -483,6 +483,32 @@ impl GridSpline2dDesign {
         [self.axes[0].h, self.axes[1].h]
     }
 
+    /// Number of data rows the design was streamed from.
+    pub fn num_rows(&self) -> usize {
+        self.n_obs
+    }
+
+    /// Number of response dimensions sharing the design.
+    pub fn num_responses(&self) -> usize {
+        self.rhs.len()
+    }
+
+    /// The four active cubic B-spline values of one AXIS at `x`: returns
+    /// `(j0, values)` where `values[i]` weights basis `j0 + i` of that axis
+    /// (`0..K+3`). The tensor flat index of `(j1, j2)` is `j1·(K+3) + j2` —
+    /// row-major, axis 0 major. Outside the bounding box the boundary cell's
+    /// cubic polynomial extends (same convention as fitting and prediction).
+    pub fn axis_basis(&self, axis: usize, x: f64) -> Result<(usize, [f64; 4]), String> {
+        if axis > 1 {
+            return Err(format!("grid spline 2d: axis {axis} out of range"));
+        }
+        if !x.is_finite() {
+            return Err(format!("grid spline 2d: non-finite axis-{axis} point {x}"));
+        }
+        let (cell, u) = self.axes[axis].locate(x);
+        Ok((cell, bspline_value(u)))
+    }
+
     /// Exact penalty quadratic form `J(f) = c'Sc` of a coefficient vector —
     /// the assembled anisotropic biharmonic energy of the spline it encodes.
     pub fn penalty_value(&self, coeff: &[f64]) -> Result<f64, String> {
@@ -658,43 +684,153 @@ impl GridSpline2dDesign {
         }
         self.fit_at(0.5 * (lo + hi), None)
     }
+
+    /// `a'(X'WX)b` through the retained upper band (exact, O(p·bandwidth)).
+    fn gram_quadratic(&self, a: &[f64], b: &[f64]) -> f64 {
+        let stride = self.band_half + 1;
+        let mut q = 0.0;
+        for g in 0..self.p {
+            let dmax = self.band_half.min(self.p - 1 - g);
+            q += self.gram_band[g * stride] * a[g] * b[g];
+            for d in 1..=dmax {
+                q += self.gram_band[g * stride + d] * (a[g] * b[g + d] + a[g + d] * b[g]);
+            }
+        }
+        q
+    }
+
+    /// Posterior summary of a fit FROM THIS DESIGN, in the exact algebra of
+    /// the solved system (no approximation):
+    /// - `unit_covariance = (X'WX + λS)⁻¹` (scale-free Bayesian posterior
+    ///   covariance of the row-major coefficient vec, shared by dimensions);
+    /// - `edf = tr[(X'WX + λS)⁻¹ X'WX]` (the smoother's effective degrees of
+    ///   freedom at the fitted λ);
+    /// - `residual_cross_cov[d,e] = r_d'W r_e / (n − edf)` assembled from the
+    ///   streamed sufficient statistics
+    ///   (`y_d'Wy_e − c_d'X'Wy_e − c_e'X'Wy_d + c_d'X'WX c_e`).
+    pub fn posterior(&self, fit: &GridSpline2dFit) -> Result<GridSpline2dPosterior, String> {
+        let p = self.p;
+        let n_dims = self.rhs.len();
+        if fit.coeffs.len() != n_dims || fit.coeffs.iter().any(|c| c.len() != p) {
+            return Err(format!(
+                "grid spline 2d: posterior asked for a fit with {} dimensions of length {}, \
+                 design has {n_dims} of {p}",
+                fit.coeffs.len(),
+                fit.coeffs.first().map_or(0, Vec::len)
+            ));
+        }
+        // H⁻¹ column by column through the retained factor (symmetric, O(p³)).
+        let mut unit_covariance = vec![0.0_f64; p * p];
+        let mut e_g = vec![0.0_f64; p];
+        for g in 0..p {
+            e_g[g] = 1.0;
+            let col = chol_solve(&fit.chol, p, &e_g);
+            e_g[g] = 0.0;
+            for (r, &v) in col.iter().enumerate() {
+                unit_covariance[r * p + g] = v;
+            }
+        }
+        // edf = tr(H⁻¹ X'WX) via the gram band (diagonal once, off-band twice).
+        let stride = self.band_half + 1;
+        let mut edf = 0.0;
+        for g in 0..p {
+            let dmax = self.band_half.min(p - 1 - g);
+            edf += self.gram_band[g * stride] * unit_covariance[g * p + g];
+            for d in 1..=dmax {
+                edf += 2.0 * self.gram_band[g * stride + d] * unit_covariance[g * p + g + d];
+            }
+        }
+        let residual_df = self.n_obs as f64 - edf;
+        if !(residual_df >= 1.0) {
+            return Err(format!(
+                "grid spline 2d: too few rows for a scale estimate \
+                 (n = {}, edf = {edf:.2}; need n − edf ≥ 1)",
+                self.n_obs
+            ));
+        }
+        let mut residual_cross_cov = vec![0.0_f64; n_dims * n_dims];
+        for d in 0..n_dims {
+            for e in d..n_dims {
+                let mut cd_rhse = 0.0;
+                let mut ce_rhsd = 0.0;
+                for g in 0..p {
+                    cd_rhse += fit.coeffs[d][g] * self.rhs[e][g];
+                    ce_rhsd += fit.coeffs[e][g] * self.rhs[d][g];
+                }
+                let quad = self.gram_quadratic(&fit.coeffs[d], &fit.coeffs[e]);
+                let v = (self.cross_moments[d * n_dims + e] - cd_rhse - ce_rhsd + quad)
+                    / residual_df;
+                residual_cross_cov[d * n_dims + e] = v;
+                residual_cross_cov[e * n_dims + d] = v;
+            }
+        }
+        Ok(GridSpline2dPosterior {
+            unit_covariance,
+            edf,
+            residual_df,
+            residual_cross_cov,
+        })
+    }
+}
+
+/// Exact posterior summary of a [`GridSpline2dFit`] (see
+/// [`GridSpline2dDesign::posterior`]): the bridge from the streaming engine
+/// to covariance-consuming clients (the ANOVA pair-component carve).
+pub struct GridSpline2dPosterior {
+    /// `(X'WX + λS)⁻¹`, `p × p` row-major — scale-free posterior covariance
+    /// of the row-major coefficient vec, shared by all response dimensions.
+    pub unit_covariance: Vec<f64>,
+    /// `tr[(X'WX + λS)⁻¹ X'WX]`.
+    pub edf: f64,
+    /// `n − edf`.
+    pub residual_df: f64,
+    /// `D × D` row-major residual cross-covariance at `n − edf`.
+    pub residual_cross_cov: Vec<f64>,
 }
 
 /// Fitted penalized tensor-product smoother with its factored covariance.
 pub struct GridSpline2dFit {
-    /// Coefficients in row-major flat order `g = j1·(K+3) + j2`.
-    pub coeff: Vec<f64>,
-    /// Selected (or supplied) log smoothing parameter.
+    /// Per response dimension: coefficients in row-major flat order
+    /// `g = j1·(K+3) + j2`.
+    pub coeffs: Vec<Vec<f64>>,
+    /// Selected (or supplied) log smoothing parameter, shared by all
+    /// response dimensions.
     pub log_lambda: f64,
-    /// Profiled (or supplied) observation variance σ².
-    pub sigma2: f64,
-    /// Restricted log-likelihood at the optimum, up to λ- and data-independent
-    /// additive constants (exact REML differences across λ).
+    /// Per response dimension: profiled (or supplied) observation variance σ².
+    pub sigma2: Vec<f64>,
+    /// Pooled restricted log-likelihood at the optimum, up to λ- and
+    /// data-independent additive constants (exact REML differences across λ).
     pub restricted_loglik: f64,
     /// Lower Cholesky factor of `X'WX + λS` — the factored posterior precision
-    /// (unit-σ² scale) used for prediction variances.
+    /// (unit-σ² scale) used for prediction variances, shared by all dimensions.
     chol: Vec<f64>,
     axes: [Axis; 2],
     m_axis: usize,
 }
 
 impl GridSpline2dFit {
-    /// Posterior `(mean, variance)` at an arbitrary point: the 16-entry basis
-    /// row dotted with the coefficients, and `σ̂²·x'(X'WX+λS)⁻¹x` through the
-    /// retained Cholesky factor. Outside the bounding box the boundary cell's
-    /// cubic polynomial extends.
-    pub fn predict(&self, x1: f64, x2: f64) -> Result<(f64, f64), String> {
+    /// Posterior `(mean, variance)` of response dimension `dim` at an
+    /// arbitrary point: the 16-entry basis row dotted with the coefficients,
+    /// and `σ̂²_dim·x'(X'WX+λS)⁻¹x` through the retained Cholesky factor.
+    /// Outside the bounding box the boundary cell's cubic polynomial extends.
+    pub fn predict(&self, dim: usize, x1: f64, x2: f64) -> Result<(f64, f64), String> {
+        if dim >= self.coeffs.len() {
+            return Err(format!(
+                "grid spline 2d: response dimension {dim} out of range (D = {})",
+                self.coeffs.len()
+            ));
+        }
         if !(x1.is_finite() && x2.is_finite()) {
             return Err(format!(
                 "grid spline 2d: non-finite prediction point ({x1}, {x2})"
             ));
         }
         let (idx, val) = basis_row(&self.axes, self.m_axis, x1, x2);
-        let p = self.coeff.len();
+        let p = self.coeffs[dim].len();
         let mut mean = 0.0;
         let mut row = vec![0.0_f64; p];
         for e in 0..16 {
-            mean += val[e] * self.coeff[idx[e]];
+            mean += val[e] * self.coeffs[dim][idx[e]];
             row[idx[e]] += val[e];
         }
         let z = chol_solve(&self.chol, p, &row);
@@ -702,7 +838,7 @@ impl GridSpline2dFit {
         for g in 0..p {
             quad += row[g] * z[g];
         }
-        Ok((mean, self.sigma2 * quad))
+        Ok((mean, self.sigma2[dim] * quad))
     }
 }
 
