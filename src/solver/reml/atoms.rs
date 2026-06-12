@@ -472,6 +472,45 @@ impl CriterionAtom for SampledBlockAtom {
 // certified value/gradient pair for worse numerics. That pair is covered by
 // the #934 certificate until the quadratic atom can own a stable-basis
 // emission for BOTH channels.
+//
+// LANDED (pass 2, the ThetaDirection shared-drift pass — the β̇ kernel
+// half): `ThetaModeResponseKernel` in unified.rs is now the ONE place the
+// IFT mode-response kernel selection lives (lifted constrained
+// `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S` under active inequality
+// constraints; full `H⁻¹` otherwise, projection on the trace side only).
+// Converted to contractions of it: the gradient solve stack in
+// `reml_laml_evaluate`, the ρ- and ext-coordinate standalone fallbacks in
+// `compute_outer_hessian` (which now share ONE lazily-built kernel per
+// Hessian evaluation instead of two independent Schur factorizations), and
+// the standalone fallback in `build_outer_hessian_operator` (which also
+// stops building the constrained kernel on the production precomputed
+// path, where it was unused work). The four hand-copied selection rules —
+// each carrying a comment warning the others to "mirror the selection
+// exactly" — are deleted; gradient, dense Hessian, and operator Hessian
+// structurally cannot pick different inverses for the same evaluation
+// point (the dβ̂/dθ half of #901-layer-2's per-consumer drift). Per-atom
+// certify body: `certify_tangency` audits every constrained emission
+// against the defining invariant `A_act·v = 0` on the `[CERTIFICATE]`
+// stream (#934 pattern; the unconstrained arm is covered end-to-end by
+// `CriterionCertificate`'s FD audit at every optimum). Bit-identity pin:
+// `theta_mode_response_kernel_matches_preport_assembly_bitwise` reproduces
+// the pre-port per-site assemblies inline and asserts bitwise-equal
+// emissions in both regimes plus the masked-ρ and subspace-without-
+// constraints edges.
+//
+// DELIBERATELY NOT PORTED (pass 2 non-duplicates): `compute_adjoint_z_c`
+// keeps its bare `K_S.apply_pseudo_inverse` route under a penalty subspace
+// WITHOUT active constraints — that is the TRACE-side adjoint (z_c must
+// contract against the same kernel as the leverage h^{G,proj}; see its
+// comment block), a different convention from the IFT mode response, not a
+// missed copy of the selection rule. The per-site solve SHAPES
+// (`respond_one` single-RHS vs `respond_stack` batched) also stay
+// distinct on purpose: GEMV-per-column and blocked GEMM sum in different
+// orders, so collapsing them would break bit-identity with the pre-port
+// assemblies. The remaining ThetaDirection channels — caching β̇/Ḣ_total
+// on the direction object and replacing the per-consumer Ḣ assemblies in
+// the trace branches — land with the #935 Sensitivity operator pass that
+// fills AND reads them.
 
 #[cfg(test)]
 mod tests {
