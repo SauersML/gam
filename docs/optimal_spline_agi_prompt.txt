@@ -64,8 +64,11 @@ NEEDS:
   N4. LEARNED GEOMETRY. Invariance to meaningless transformations
       (units, per-axis affine maps) is the floor. Beyond it, the
       metric in which "near" and "smooth" are measured must itself
-      be learnable — per-axis scales at minimum. Isotropy in the
-      learned metric is a sensible default symmetry, not dogma.
+      be learnable: per-axis scales at minimum (anisotropy is good —
+      axes differ in relevance), richer metrics if they come cheap.
+      Whatever directional structure is real should be learned from
+      the data; whatever isn't learned should not be smuggled in by
+      the basis.
 
   N5. UQ-COMPATIBLE. The construction must not obstruct honest
       uncertainty: valid uncertainty for any linear functional of
@@ -145,9 +148,6 @@ Match the claim to its kind:
     conjectures, flagged as such, with the falsifiable prediction
     that would settle them.
 
-A claim dressed in the wrong evidence — a "proof" of wall-clock, a
-benchmark standing in for a theorem — is worse than an honest gap.
-
 ----------------------------------------------------------------------
 FREEDOMS
 ----------------------------------------------------------------------
@@ -179,6 +179,13 @@ WHAT AN ANSWER LOOKS LIKE
     competent engineer could implement without further invention.
   - The failure modes, stated plainly: where it loses to existing
     methods, and by how much.
+
+One expectation, stated openly: we suspect the answer does not yet
+exist. If your search keeps terminating at known methods, treat that
+as a sign the search space is too small, and widen it before
+concluding the literature already won. If, after genuinely widening
+it, an existing method IS optimal — prove that, and we will believe
+it. But prefer invention over inventory; a survey is not an answer.
 
 If you discover instead that the question is malposed — that
 "optimal spline" dissolves under the right formalization — then say
