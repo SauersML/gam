@@ -10301,6 +10301,148 @@ fn sae_streaming_plan_to_pydict<'py>(
     Ok(out)
 }
 
+/// Parse a chart-topology name into the engine enum. `"circle"` charts carry
+/// radian coordinates mod 2π; `"interval"` charts derive their bounds from
+/// the observed coordinate range (magic by default — no extra knobs).
+fn parse_chart_topology(
+    name: &str,
+    coords: ndarray::ArrayView1<'_, f64>,
+) -> PyResult<gam::inference::layer_transport::ChartTopology> {
+    use gam::inference::layer_transport::ChartTopology;
+    match name {
+        "circle" => Ok(ChartTopology::Circle),
+        "interval" => {
+            let lo = coords.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = coords.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            if !(lo.is_finite() && hi.is_finite()) || hi <= lo {
+                return Err(PyValueError::new_err(format!(
+                    "interval chart needs a non-degenerate finite coordinate range, got [{lo}, {hi}]"
+                )));
+            }
+            Ok(ChartTopology::Interval { lo, hi })
+        }
+        other => Err(PyValueError::new_err(format!(
+            "unknown chart topology {other:?}; expected \"circle\" or \"interval\""
+        ))),
+    }
+}
+
+fn layer_transport_report_to_pydict<'py>(
+    py: Python<'py>,
+    report: &gam::inference::layer_transport::LayerTransportReport,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("layer_from", report.layer_from)?;
+    out.set_item("layer_to", report.layer_to)?;
+    out.set_item("topology_from", report.topology_from.name())?;
+    out.set_item("topology_to", report.topology_to.name())?;
+    out.set_item("topology_preserved", report.topology_preserved)?;
+    out.set_item("degree", report.degree)?;
+    out.set_item("degree_concentration", report.degree_concentration)?;
+    out.set_item("rotation_offset", report.rotation_offset)?;
+    out.set_item("isometry_defect", report.isometry_defect)?;
+    out.set_item("isometry_defect_se", report.isometry_defect_se)?;
+    out.set_item(
+        "min_directional_derivative",
+        report.min_directional_derivative,
+    )?;
+    out.set_item("transport_edf", report.transport_edf)?;
+    out.set_item("smoothing_lambda", report.smoothing_lambda)?;
+    out.set_item("noise_variance", report.noise_variance)?;
+    out.set_item("residual_rms", report.residual_rms)?;
+    out.set_item("n_obs", report.n_obs)?;
+    out.set_item("composition_defect", report.composition_defect)?;
+    out.set_item(
+        "composition_max_studentized",
+        report.composition_max_studentized,
+    )?;
+    out.set_item("composition_p_value", report.composition_p_value)?;
+    out.set_item(
+        "composition_gauge_reflected",
+        report.composition_gauge_reflected,
+    )?;
+    Ok(out)
+}
+
+/// Fit one inter-layer concept transport map `t_to = h(t_from)` with the
+/// engine's REML machinery (issue #1013) and return the evidence payload:
+/// winding degree (circle→circle), topology-preservation verdict, the
+/// data-density-weighted isometry defect with its delta-method SE, EDF, and
+/// the selected smoothing level. See
+/// `gam::inference::layer_transport` for the estimator and gauge discipline.
+#[pyfunction(signature = (coords_from, coords_to, topology_from = "circle", topology_to = "circle", layer_from = 0, layer_to = 1))]
+fn layer_transport_fit(
+    py: Python<'_>,
+    coords_from: PyReadonlyArray1<'_, f64>,
+    coords_to: PyReadonlyArray1<'_, f64>,
+    topology_from: &str,
+    topology_to: &str,
+    layer_from: usize,
+    layer_to: usize,
+) -> PyResult<Py<PyDict>> {
+    let from = coords_from.as_array();
+    let to = coords_to.as_array();
+    let topo_from = parse_chart_topology(topology_from, from)?;
+    let topo_to = parse_chart_topology(topology_to, to)?;
+    let report = gam::inference::layer_transport::fit_layer_transport(
+        layer_from, layer_to, from, to, topo_from, topo_to,
+    )
+    .map_err(PyValueError::new_err)?;
+    Ok(layer_transport_report_to_pydict(py, &report)?.unbind())
+}
+
+/// Fit a whole ladder of layer charts: every adjacent transport map plus
+/// every two-hop map with the composition-law test
+/// `h_{l→l+2} ≟ h_{l+1→l+2} ∘ h_{l→l+1}` attached (issue #1013). `coords` is
+/// a list of equal-length 1-D coordinate arrays (one per layer, same rows);
+/// `topology` applies to every chart; `layers` are optional labels
+/// (defaulting to `0..len`). Returns `{"adjacent": [...], "two_hop": [...]}`.
+#[pyfunction(signature = (coords, topology = "circle", layers = None))]
+fn layer_transport_ladder(
+    py: Python<'_>,
+    coords: &Bound<'_, PyList>,
+    topology: &str,
+    layers: Option<Vec<usize>>,
+) -> PyResult<Py<PyDict>> {
+    use gam::inference::layer_transport::transport_ladder;
+    let mut coord_vecs: Vec<ndarray::Array1<f64>> = Vec::with_capacity(coords.len());
+    for item in coords.iter() {
+        let arr: PyReadonlyArray1<'_, f64> = item.extract()?;
+        coord_vecs.push(arr.as_array().to_owned());
+    }
+    let layer_labels: Vec<usize> = match layers {
+        Some(labels) => {
+            if labels.len() != coord_vecs.len() {
+                return Err(PyValueError::new_err(format!(
+                    "layers has {} entries for {} coordinate arrays",
+                    labels.len(),
+                    coord_vecs.len()
+                )));
+            }
+            labels
+        }
+        None => (0..coord_vecs.len()).collect(),
+    };
+    let mut topologies = Vec::with_capacity(coord_vecs.len());
+    for coord in &coord_vecs {
+        topologies.push(parse_chart_topology(topology, coord.view())?);
+    }
+    let ladder = transport_ladder(&layer_labels, &coord_vecs, &topologies)
+        .map_err(PyValueError::new_err)?;
+    let out = PyDict::new(py);
+    let adjacent = PyList::empty(py);
+    for report in &ladder.adjacent {
+        adjacent.append(layer_transport_report_to_pydict(py, report)?)?;
+    }
+    let two_hop = PyList::empty(py);
+    for report in &ladder.two_hop {
+        two_hop.append(layer_transport_report_to_pydict(py, report)?)?;
+    }
+    out.set_item("adjacent", adjacent)?;
+    out.set_item("two_hop", two_hop)?;
+    Ok(out.unbind())
+}
+
 /// PCA seed: returns coords with shape `(k_atoms, n_obs, d_max)`. For periodic
 /// atoms, column 0 is `atan2(Z·v2, Z·v1) / (2π)` (per-atom v2 picked from PCs)
 /// and remaining columns are min-max normalized projections onto subsequent
@@ -24056,6 +24198,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_steer_delta, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_reconstruction_r2, module)?)?;
     module.add_function(wrap_pyfunction!(sae_streaming_plan, module)?)?;
+    module.add_function(wrap_pyfunction!(layer_transport_fit, module)?)?;
+    module.add_function(wrap_pyfunction!(layer_transport_ladder, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_assignment_summary, module)?)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;
     module.add_function(wrap_pyfunction!(interchange_decode_forward, module)?)?;
