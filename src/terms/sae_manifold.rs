@@ -15084,6 +15084,7 @@ mod tests {
     use crate::linalg::faer_ndarray::fast_ata;
 
     use super::*;
+    use crate::linalg::faer_ndarray::fast_ata;
     use crate::solver::arrow_schur::{
         ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics,
     };
