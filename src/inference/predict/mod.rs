@@ -5364,6 +5364,7 @@ pub enum MeanIntervalMethod {
     TransformEta,
 }
 
+#[derive(Debug)]
 pub struct PredictUncertaintyResult {
     pub eta: Array1<f64>,
     pub mean: Array1<f64>,
