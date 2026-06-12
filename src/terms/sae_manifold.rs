@@ -15627,20 +15627,64 @@ mod tests {
         1.0 - ssr / sst.max(1.0e-300)
     }
 
-    fn planted_circle_seed_term(z: ArrayView2<'_, f64>) -> (SaeManifoldTerm, f64) {
+    #[derive(Clone, Copy)]
+    enum PlantedCircleAssignmentMode {
+        Softmax,
+        IbpMap,
+    }
+
+    impl PlantedCircleAssignmentMode {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Softmax => "softmax",
+                Self::IbpMap => "ibp_map",
+            }
+        }
+
+        fn mode(self) -> AssignmentMode {
+            const TAU: f64 = 1.0;
+            const ALPHA: f64 = 1.0;
+            match self {
+                Self::Softmax => AssignmentMode::softmax(TAU),
+                Self::IbpMap => AssignmentMode::ibp_map(TAU, ALPHA, false),
+            }
+        }
+
+        fn seed_logit(self) -> f64 {
+            const TAU: f64 = 1.0;
+            match self {
+                Self::Softmax => 0.0,
+                Self::IbpMap => 6.0 * TAU,
+            }
+        }
+
+        fn seed_gate(self) -> f64 {
+            match self {
+                Self::Softmax => 1.0,
+                Self::IbpMap => 1.0 / (1.0 + (-6.0_f64).exp()),
+            }
+        }
+    }
+
+    fn planted_circle_seed_term(
+        z: ArrayView2<'_, f64>,
+        assignment_mode: PlantedCircleAssignmentMode,
+    ) -> (SaeManifoldTerm, f64) {
         let n = z.nrows();
         let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let seed_coords =
             sae_pca_seed_initial_coords(z, &[SaeAtomBasisKind::Periodic], &[1]).unwrap();
         let coords = seed_coords.slice(s![0, .., 0..1]).to_owned();
         let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
-        let mut xtx = fast_ata(&phi);
+        let seed_gate = assignment_mode.seed_gate();
+        let gated_phi = &phi * seed_gate;
+        let mut xtx = fast_ata(&gated_phi);
         for i in 0..xtx.nrows() {
             xtx[[i, i]] += 1.0e-10;
         }
-        let xtz = fast_atb(&phi, &z.to_owned());
+        let xtz = fast_atb(&gated_phi, &z.to_owned());
         let decoder = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
-        let seed_fitted = phi.dot(&decoder);
+        let seed_fitted = gated_phi.dot(&decoder);
         let mut rss = 0.0_f64;
         for row in 0..n {
             for col in 0..z.ncols() {
@@ -15661,10 +15705,10 @@ mod tests {
         .unwrap()
         .with_basis_evaluator(evaluator);
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-            Array2::<f64>::zeros((n, 1)),
+            Array2::<f64>::from_elem((n, 1), assignment_mode.seed_logit()),
             vec![coords],
             vec![LatentManifold::Circle { period: 1.0 }],
-            AssignmentMode::softmax(1.0),
+            assignment_mode.mode(),
         )
         .unwrap();
         (
@@ -15675,46 +15719,54 @@ mod tests {
 
     #[test]
     fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionless_rho_seed() {
-        for &n in &[40usize, 250usize] {
-            for &sigma in &[0.02_f64, 0.05, 0.18] {
-                let z = planted_circle_data(n, sigma);
-                let (term, seed_dispersion) = planted_circle_seed_term(z.view());
-                let seed_ev = global_ev(z.view(), term.fitted().view());
-                let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
-                    .seed_scaled_by_dispersion(seed_dispersion)
-                    .unwrap();
-                let init_rho_flat = init_rho.to_flat();
-                let n_params = init_rho_flat.len();
-                let mut objective = SaeManifoldOuterObjective::new(
-                    term,
-                    z.clone(),
-                    None,
-                    init_rho,
-                    50,
-                    0.04,
-                    1.0e-6,
-                    1.0e-6,
-                );
-                crate::solver::outer_strategy::OuterProblem::new(n_params)
-                    .with_initial_rho(init_rho_flat)
-                    .run(&mut objective, "SAE planted circle dimensionless seed")
-                    .unwrap();
-                let (fitted_term, rho, _loss) = objective.into_fitted();
-                let fitted = fitted_term.fitted();
-                let ev = global_ev(z.view(), fitted.view());
-                assert!(
-                    ev > 0.95,
-                    "planted circle n={n} sigma={sigma} seed_ev={seed_ev:.4} seed_phi={seed_dispersion:.3e} \
-                     final_rho=({:.3}, {:.3}, {:?}) EV={ev:.4} should exceed 0.95",
-                    rho.log_lambda_sparse,
-                    rho.log_lambda_smooth,
-                    rho.log_ard
-                );
-                assert!(
-                    fitted_term.collapse_events().is_empty(),
-                    "healthy planted circle fit should not record collapse events: {:?}",
-                    fitted_term.collapse_events()
-                );
+        for assignment_mode in [
+            PlantedCircleAssignmentMode::Softmax,
+            PlantedCircleAssignmentMode::IbpMap,
+        ] {
+            let assignment_label = assignment_mode.label();
+            for &n in &[40usize, 250usize] {
+                for &sigma in &[0.02_f64, 0.05, 0.18] {
+                    let z = planted_circle_data(n, sigma);
+                    let (term, seed_dispersion) =
+                        planted_circle_seed_term(z.view(), assignment_mode);
+                    let seed_ev = global_ev(z.view(), term.fitted().view());
+                    let init_rho =
+                        SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
+                            .seed_scaled_by_dispersion(seed_dispersion)
+                            .unwrap();
+                    let init_rho_flat = init_rho.to_flat();
+                    let n_params = init_rho_flat.len();
+                    let mut objective = SaeManifoldOuterObjective::new(
+                        term,
+                        z.clone(),
+                        None,
+                        init_rho,
+                        50,
+                        0.04,
+                        1.0e-6,
+                        1.0e-6,
+                    );
+                    crate::solver::outer_strategy::OuterProblem::new(n_params)
+                        .with_initial_rho(init_rho_flat)
+                        .run(&mut objective, "SAE planted circle dimensionless seed")
+                        .unwrap();
+                    let (fitted_term, rho, _loss) = objective.into_fitted();
+                    let fitted = fitted_term.fitted();
+                    let ev = global_ev(z.view(), fitted.view());
+                    assert!(
+                        ev > 0.95,
+                        "planted circle assignment={assignment_label} n={n} sigma={sigma} seed_ev={seed_ev:.4} seed_phi={seed_dispersion:.3e} \
+                         final_rho=({:.3}, {:.3}, {:?}) EV={ev:.4} should exceed 0.95",
+                        rho.log_lambda_sparse,
+                        rho.log_lambda_smooth,
+                        rho.log_ard
+                    );
+                    assert!(
+                        fitted_term.collapse_events().is_empty(),
+                        "healthy planted circle assignment={assignment_label} fit should not record collapse events: {:?}",
+                        fitted_term.collapse_events()
+                    );
+                }
             }
         }
     }
