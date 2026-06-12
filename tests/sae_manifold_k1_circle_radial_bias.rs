@@ -1,13 +1,14 @@
 //! #1023 task-2 radial-bias diagnostic: a K=1 IBP-MAP planted-circle fit through
 //! the production outer engine, measuring the three discriminating numbers
 //! (mean gate ζ, fitted_radius/data_radius, and λ_smooth vs the empirical-Bayes
-//! optimum). The user-facing default `sae_manifold_fit(assignment="ibp_map")`
-//! routes K=1 through this gate path, where the cold logit seed is 0 (the EM
-//! residual seed is gated on K>1) so ζ starts at σ(0)=0.5 and the joint fit must
-//! drive it back toward 1. A uniform radial contraction whose size tracks mean ζ
-//! (with no harmonic-spectrum signature) is the gate defect (cause B); a
-//! contraction that also suppresses higher harmonics is λ over-smoothing
-//! (cause A). This test prints all three numbers and gates the radius bias at 1%.
+//! optimum). The historical user-facing default `sae_manifold_fit(assignment="ibp_map")`
+//! routed K=1 through this gate path with a cold logit seed of 0 (the EM
+//! residual seed is gated on K>1), so ζ started at σ(0)=0.5 and the joint fit had
+//! to drive it back toward 1. A uniform radial contraction whose size tracks mean
+//! ζ (with no harmonic-spectrum signature) is the gate defect (cause B); a
+//! contraction that also suppresses higher harmonics is λ over-smoothing (cause
+//! A). This test prints all three numbers and gates the production fixed seed at
+//! 1% radius bias.
 
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use gam::solver::outer_strategy::OuterProblem;
@@ -80,11 +81,12 @@ fn build_cold_k1_term(z: &Array2<f64>, seed_logit: f64) -> SaeManifoldTerm {
     });
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
 
-    // `seed_logit` sets the cold K=1 ibp_map gate. Production today seeds 0
-    // (the EM residual seed is gated on K>1), so the cold gate is σ(0)=0.5 — a
-    // 50% radial seed contraction the joint fit must undo. The fix seeds high
-    // (gate ≈ 1). The decoder LSQ init is fit at whatever gate the seed implies
-    // so ζ·decode ≈ z at the seed regardless.
+    // `seed_logit` sets the cold K=1 ibp_map gate. Production historically
+    // seeded 0 (the EM residual seed is gated on K>1), so the cold gate was
+    // σ(0)=0.5 — a 50% radial seed contraction the joint fit had to undo. The
+    // fixed production seed is 6*tau, so gate = σ(6) independent of tau. The
+    // decoder LSQ init is fit at whatever gate the seed implies so ζ·decode ≈ z
+    // at the seed regardless.
     let logits = Array2::<f64>::from_elem((n, 1), seed_logit);
     let gate0 = 1.0 / (1.0 + (-seed_logit / TAU).exp()); // σ(seed_logit/τ)
     let mut xw = Array2::<f64>::zeros((n, M));
@@ -209,9 +211,9 @@ fn measure_arm(z: &Array2<f64>, p: usize, seed_logit: f64) -> ArmMetrics {
 }
 
 /// The three discriminating numbers + the 1% radial-bias gate, run for BOTH the
-/// current cold seed (logit 0 → gate σ(0)=0.5) and the fix seed (logit 4 →
-/// gate σ(8)≈1). The planted radius is 1; a fitted ring more than 1% inside the
-/// data is the defect. The two arms disentangle the cause:
+/// historical cold seed (logit 0 → gate σ(0)=0.5) and the production fixed seed
+/// (logit 6*tau → gate σ(6)≈1). The planted radius is 1; a fitted ring more
+/// than 1% inside the data is the defect. The two arms disentangle the cause:
 ///   * if the high-seed arm reaches radius_ratio≈1 while the low-seed arm
 ///     shrinks, the defect is the cold gate seed (cause B) and seeding fixes it;
 ///   * if the high-seed arm ALSO stays meaningfully below 1, a second defect
@@ -224,14 +226,15 @@ fn sae_k1_ibp_circle_has_no_radial_shrinkage() {
     let sigma = 0.05_f64;
     let z = planted_unit_circle(n, p, sigma);
     let eb_optimal_lambda = sigma * sigma; // r² = 1; REML shrinkage is invisible
+    let production_fixed_seed_logit = 6.0 * TAU;
 
-    let low = measure_arm(&z, p, 0.0); // current production cold seed
-    let high = measure_arm(&z, p, 4.0); // proposed fix seed (gate σ(8)≈1)
+    let low = measure_arm(&z, p, 0.0); // historical defective cold seed
+    let high = measure_arm(&z, p, production_fixed_seed_logit);
 
     println!(
         "K=1 IBP circle (eb_optimal_lambda~{eb_optimal_lambda:.3e}):\n  \
          low-seed (logit 0, gate0=0.5):  mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}\n  \
-         high-seed(logit 4, gate0~1.0):  mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}",
+         high-seed(logit 6*tau, gate0~1.0): mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}",
         low.mean_zeta,
         low.radius_ratio,
         low.lambda_smooth,
