@@ -4281,6 +4281,10 @@ pub struct SplineScanInputs {
     pub y: Vec<f64>,
     /// Observation weights (variance is `σ²/w`).
     pub w: Vec<f64>,
+    /// Smoothing-spline order `m = penalty_order ∈ {1, 2}`: `m = 1` the
+    /// random-walk/linear smoother (penalty `λ∫f′²`), `m = 2` the cubic
+    /// smoother (penalty `λ∫f″²`).
+    pub order: usize,
 }
 
 /// Detection seam for the exact O(n) cubic-smoothing-spline fast path.
@@ -4372,8 +4376,14 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
     else {
         return None;
     };
-    if bspec.degree != 3
-        || bspec.penalty_order != 2
+    // Smoothing-spline order m = penalty_order ∈ {1, 2}. The exact scan
+    // integrates the order-m integrated-Wiener prior whose natural spline has
+    // degree 2m−1 (m=1 → linear, m=2 → cubic), so require that degree to match
+    // user intent. m≥3 needs the banded smoother (spline_scan MAX_ORDER), so it
+    // falls through to the dense path.
+    let order = bspec.penalty_order;
+    if !(1..=2).contains(&order)
+        || bspec.degree != 2 * order - 1
         || bspec.double_penalty
         || !bspec.boundary_conditions.is_free()
         || !matches!(bspec.boundary, crate::basis::OneDimensionalBoundary::Open)
@@ -4399,15 +4409,15 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
     if x.iter().any(|v| !v.is_finite()) || y.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    // The diffuse `{1, x}` null space consumes two innovations; the scan
-    // needs at least one proper innovation to profile σ².
+    // The diffuse polynomial null space consumes `order` innovations; the scan
+    // needs at least one proper innovation beyond them to profile σ².
     let mut sorted = x.clone();
     sorted.sort_by(f64::total_cmp);
     sorted.dedup();
-    if sorted.len() < 3 {
+    if sorted.len() < order + 1 {
         return None;
     }
-    Some(SplineScanInputs { x, y, w })
+    Some(SplineScanInputs { x, y, w, order })
 }
 
 /// Formula-level entry for the exact O(n) cubic-smoothing-spline fast path.
@@ -4436,7 +4446,7 @@ pub fn fit_spline_scan_from_formula(
     let Some(inputs) = spline_scan_fast_path(&request) else {
         return Ok(None);
     };
-    crate::solver::spline_scan::fit_cubic_spline_scan(&inputs.x, &inputs.y, &inputs.w)
+    crate::solver::spline_scan::fit_cubic_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
         .map(Some)
         .map_err(|reason| WorkflowError::IntegrationFailed { reason })
 }
