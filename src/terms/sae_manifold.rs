@@ -30,13 +30,22 @@
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
 use std::sync::Arc;
 
+const SAE_BYTES_PER_F64: usize = 8;
+const SAE_HOST_IN_CORE_FALLBACK_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR: usize = 3;
+const SAE_HOST_MEMORY_BUDGET_FRACTION_DENOMINATOR: usize = 5;
+const SAE_CPU_L2_CACHE_BYTES: usize = 1024 * 1024;
+const SAE_CHUNK_CACHE_MULTIPLE: usize = 8;
+const SAE_MIN_STREAMING_CHUNK_ROWS: usize = 256;
+const SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER: usize = 32;
+
 use crate::solver::arrow_schur::{
     ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem,
     ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, DeviceSaePcgData,
     DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp,
     IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
     StreamingArrowSchur, solve_arrow_newton_step_with_proximal_correction,
-    solve_streaming_reduced_beta,
+    solve_streaming_reduced_beta, solve_with_lm_escalation_inner,
 };
 use crate::terms::analytic_penalties::{
     AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DecoderIncoherencePenalty,
@@ -585,7 +594,13 @@ pub struct SaeStreamingPlan {
     pub streaming: bool,
     pub chunk_size: usize,
     pub estimated_full_batch_bytes: usize,
+    pub estimated_dense_schur_bytes: usize,
+    pub estimated_direct_peak_bytes: usize,
+    pub estimated_matrix_free_peak_bytes: usize,
     pub in_core_budget_bytes: usize,
+    pub host_available_bytes: usize,
+    pub direct_admitted: bool,
+    pub matrix_free_admitted: bool,
 }
 
 fn sae_streaming_plan_from_budget(
@@ -593,32 +608,135 @@ fn sae_streaming_plan_from_budget(
     total_basis: usize,
     k_atoms: usize,
     d_max: usize,
+    border_dim: usize,
     in_core_budget_bytes: usize,
     chunk_window_bytes: usize,
+    host_available_bytes: usize,
 ) -> SaeStreamingPlan {
-    const BYTES_PER_F64: usize = 8;
-    const MIN_CHUNK_ROWS: usize = 256;
     let per_row_words = total_basis
         .saturating_mul(1 + d_max)
         .saturating_add(k_atoms)
         .max(1);
-    let per_row_bytes = per_row_words.saturating_mul(BYTES_PER_F64);
+    let per_row_bytes = per_row_words.saturating_mul(SAE_BYTES_PER_F64);
     let full_batch_bytes = n_obs.saturating_mul(per_row_bytes);
-    if full_batch_bytes <= in_core_budget_bytes {
-        return SaeStreamingPlan {
-            streaming: false,
-            chunk_size: n_obs.max(1),
-            estimated_full_batch_bytes: full_batch_bytes,
-            in_core_budget_bytes,
-        };
-    }
-    let rows_per_chunk = (chunk_window_bytes / per_row_bytes).max(MIN_CHUNK_ROWS);
+    let dense_schur_bytes = border_dim
+        .saturating_mul(border_dim)
+        .saturating_mul(SAE_BYTES_PER_F64);
+    let direct_peak_bytes = full_batch_bytes.saturating_add(dense_schur_bytes);
+    let matrix_free_peak_bytes = chunk_window_bytes
+        .min(full_batch_bytes.max(per_row_bytes))
+        .saturating_add(
+            border_dim
+                .saturating_mul(SAE_BYTES_PER_F64)
+                .saturating_mul(SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER),
+        );
+    let direct_admitted = direct_peak_bytes <= in_core_budget_bytes;
+    let matrix_free_admitted = matrix_free_peak_bytes <= in_core_budget_bytes;
+    let rows_per_chunk = (chunk_window_bytes / per_row_bytes).max(SAE_MIN_STREAMING_CHUNK_ROWS);
     SaeStreamingPlan {
-        streaming: true,
-        chunk_size: rows_per_chunk.min(n_obs).max(1),
+        streaming: !direct_admitted,
+        chunk_size: if direct_admitted {
+            n_obs.max(1)
+        } else {
+            rows_per_chunk.min(n_obs).max(1)
+        },
         estimated_full_batch_bytes: full_batch_bytes,
+        estimated_dense_schur_bytes: dense_schur_bytes,
+        estimated_direct_peak_bytes: direct_peak_bytes,
+        estimated_matrix_free_peak_bytes: matrix_free_peak_bytes,
         in_core_budget_bytes,
+        host_available_bytes,
+        direct_admitted,
+        matrix_free_admitted,
     }
+}
+
+pub fn sae_streaming_plan_for_shape(
+    n_obs: usize,
+    total_basis: usize,
+    k_atoms: usize,
+    d_max: usize,
+    border_dim: usize,
+) -> SaeStreamingPlan {
+    let (budget, chunk_window, host_available) = match crate::gpu::runtime::GpuRuntime::global() {
+        Some(rt) => {
+            let aggregate_budget: usize = rt
+                .device_ordinals()
+                .iter()
+                .map(|&ord| rt.memory_budget_for(ord))
+                .sum();
+            let per_device_budget = aggregate_budget / rt.device_count().max(1);
+            let window =
+                (per_device_budget / 16).max(SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE);
+            let host_available = sae_host_available_memory_bytes();
+            (
+                (aggregate_budget / 4).min(host_available),
+                window,
+                host_available,
+            )
+        }
+        None => {
+            let (budget, host_available) = sae_host_in_core_budget_bytes();
+            (
+                budget,
+                SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE,
+                host_available,
+            )
+        }
+    };
+    sae_streaming_plan_from_budget(
+        n_obs,
+        total_basis,
+        k_atoms,
+        d_max,
+        border_dim,
+        budget,
+        chunk_window,
+        host_available,
+    )
+}
+
+impl SaeStreamingPlan {
+    fn admitted_or_error(self, n: usize, p: usize, k_atoms: usize) -> Result<Self, String> {
+        if self.direct_admitted || self.matrix_free_admitted {
+            Ok(self)
+        } else {
+            Err(format!(
+                "SaeManifoldTerm::streaming_plan: predicted working set {} bytes exceeds budget {} bytes; shape n={n},p={p},K={k_atoms}",
+                self.estimated_matrix_free_peak_bytes, self.in_core_budget_bytes
+            ))
+        }
+    }
+
+    fn solve_options_for_border_dim(self, border_dim: usize) -> ArrowSolveOptions {
+        if self.direct_admitted {
+            ArrowSolveOptions::automatic(border_dim)
+        } else {
+            ArrowSolveOptions::inexact_pcg()
+        }
+    }
+
+    fn direct_logdet_admitted(self) -> bool {
+        self.direct_admitted
+    }
+}
+
+fn sae_host_available_memory_bytes() -> usize {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let available = sys.available_memory() as usize;
+    if available == 0 {
+        SAE_HOST_IN_CORE_FALLBACK_BYTES
+    } else {
+        available
+    }
+}
+
+fn sae_host_in_core_budget_bytes() -> (usize, usize) {
+    let available = sae_host_available_memory_bytes();
+    let fraction = available.saturating_mul(SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR)
+        / SAE_HOST_MEMORY_BUDGET_FRACTION_DENOMINATOR;
+    (fraction.max(SAE_HOST_IN_CORE_FALLBACK_BYTES), available)
 }
 
 /// Decay law for deterministic Gumbel/concrete assignment temperature.
@@ -4576,9 +4694,6 @@ impl SaeManifoldTerm {
     /// retained full-batch working-set estimate and the currently selected GPU
     /// memory budget when CUDA is usable, otherwise a conservative host budget.
     pub fn streaming_plan(&self) -> SaeStreamingPlan {
-        const HOST_IN_CORE_BYTES: usize = 2 * 1024 * 1024 * 1024;
-        const CPU_L2_CACHE_BYTES: usize = 1024 * 1024;
-        const CHUNK_CACHE_MULTIPLE: usize = 8;
         let n_obs = self.n_obs();
         let total_basis: usize = self.atoms.iter().map(|atom| atom.basis_size()).sum();
         let d_max = self
@@ -4587,37 +4702,12 @@ impl SaeManifoldTerm {
             .map(|atom| atom.latent_dim)
             .max()
             .unwrap_or(0);
-        let (budget, chunk_window) = match crate::gpu::runtime::GpuRuntime::global() {
-            Some(rt) => {
-                // Aggregate the working-set budget over EVERY device: per-atom
-                // batched smoothness/Gram work fans out across the whole pool, so
-                // the in-core ceiling is the sum of all ordinals' budgets rather
-                // than only the primary device's. The per-tile chunk window still
-                // sizes against a single device's slice (one ordinal at a time
-                // holds a tile in core), so it uses the per-device budget.
-                let aggregate_budget: usize = rt
-                    .device_ordinals()
-                    .iter()
-                    .map(|&ord| rt.memory_budget_for(ord))
-                    .sum();
-                let per_device_budget = aggregate_budget / rt.device_count().max(1);
-                let window =
-                    (per_device_budget / 16).max(CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE);
-                (aggregate_budget / 4, window)
-            }
-            None => (
-                HOST_IN_CORE_BYTES,
-                CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE,
-            ),
+        let border_dim = if self.any_frame_active() {
+            self.factored_border_dim()
+        } else {
+            self.beta_dim()
         };
-        sae_streaming_plan_from_budget(
-            n_obs,
-            total_basis,
-            self.k_atoms(),
-            d_max,
-            budget,
-            chunk_window,
-        )
+        sae_streaming_plan_for_shape(n_obs, total_basis, self.k_atoms(), d_max, border_dim)
     }
 
     /// Construction-time validation: every Psi-tier analytic penalty in the
@@ -5123,10 +5213,6 @@ impl SaeManifoldTerm {
     /// Returns `Some((k_active_cap, cutoff))` to engage sparsity, or `None` to
     /// keep the dense full-support layout.
     fn sparse_active_plan(&self) -> Option<(usize, f64)> {
-        const BYTES_PER_F64: usize = 8;
-        // Host in-core ceiling for the dense Gram on a CPU-only build, mirroring
-        // the streaming dispatcher's host budget (`sae_streaming_plan`).
-        const HOST_GRAM_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
         // Relative magnitude cutoff: assignment mass below this fraction of the
         // row's peak `|a_k|` enters the Gram only as `O(a²)` curvature and is
         // dropped. Chosen so dropped terms are ~1e-6 of the peak self-coupling.
@@ -5151,7 +5237,7 @@ impl SaeManifoldTerm {
         // Dense data Gram footprint: (m_total · m_total) f64.
         let dense_gram_bytes = m_total
             .saturating_mul(m_total)
-            .saturating_mul(BYTES_PER_F64);
+            .saturating_mul(SAE_BYTES_PER_F64);
 
         let budget = match crate::gpu::runtime::GpuRuntime::global() {
             // Allow up to one quarter of the AGGREGATE device budget for the dense
@@ -5167,7 +5253,7 @@ impl SaeManifoldTerm {
                     .sum();
                 aggregate / 4
             }
-            None => HOST_GRAM_BYTES,
+            None => sae_host_in_core_budget_bytes().0,
         };
         if dense_gram_bytes <= budget {
             return None;
@@ -5177,7 +5263,7 @@ impl SaeManifoldTerm {
         // `k_active · m_atom`. Solve for the largest `k_active` whose sparse
         // Gram `(k_active · m_atom)²` still fits the budget.
         let m_atom = (m_total as f64 / k_atoms as f64).max(1.0);
-        let max_active_basis = ((budget as f64 / BYTES_PER_F64 as f64).sqrt() / m_atom).floor();
+        let max_active_basis = ((budget as f64 / SAE_BYTES_PER_F64 as f64).sqrt() / m_atom).floor();
         let k_active_cap = (max_active_basis as usize).clamp(1, k_atoms);
         // p does not enter the Gram dimension (it is carried by the `⊗ I_p`
         // structure), but a degenerate `p == 0` term has no decoder columns.
@@ -5913,7 +5999,12 @@ impl SaeManifoldTerm {
         // cleanly. When `frames_engaged` is false, EVERY β-tier object below is
         // assembled bit-for-bit as the historical full-`B` path.
         let frames_engaged = self.any_frame_active() && !whitens_likelihood;
-        let dense_beta_curvature = !(frames_engaged && beta_dim > dense_beta_penalty_probe_max_dim);
+        let admission_plan = self
+            .streaming_plan()
+            .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
+            .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
+        let dense_beta_curvature = admission_plan.direct_admitted
+            && !(frames_engaged && beta_dim > dense_beta_penalty_probe_max_dim);
         let row_htbeta_dim = if frames_engaged {
             self.factored_border_dim()
         } else {
@@ -7105,7 +7196,12 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss), String> {
-        if self.streaming_plan().streaming {
+        let plan = self.streaming_plan().admitted_or_error(
+            self.n_obs(),
+            self.output_dim(),
+            self.k_atoms(),
+        )?;
+        if plan.streaming {
             self.reml_criterion_streaming_exact(
                 target,
                 rho,
@@ -7144,6 +7240,21 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+        let admission_plan = self.streaming_plan().admitted_or_error(
+            self.n_obs(),
+            self.output_dim(),
+            self.k_atoms(),
+        )?;
+        if !admission_plan.direct_logdet_admitted() {
+            return Err(format!(
+                "SaeManifoldTerm::reml_criterion_with_cache: predicted working set {} bytes exceeds budget {} bytes for dense evidence cache; shape n={},p={},K={}; cost-only streaming route is required",
+                admission_plan.estimated_direct_peak_bytes,
+                admission_plan.in_core_budget_bytes,
+                self.n_obs(),
+                self.output_dim(),
+                self.k_atoms()
+            ));
+        }
         // 1. Run the inner (t, β) Newton solve to convergence at FIXED ρ.
         //    `run_joint_fit_arrow_schur` no longer touches ρ.
         let mut rho_fixed = rho.clone();
@@ -9375,6 +9486,39 @@ impl SaeManifoldTerm {
         Ok(SaeShapeUncertainty { dispersion, atoms })
     }
 
+    fn shape_uncertainty_without_decoder_covariance(&self, dispersion: f64) -> SaeShapeUncertainty {
+        let p = self.output_dim();
+        let mut atoms = Vec::with_capacity(self.k_atoms());
+        for (k, atom) in self.atoms.iter().enumerate() {
+            let n_rows = atom.n_obs();
+            let d = atom.latent_dim;
+            let stride = n_rows.div_ceil(SHAPE_BAND_MAX_POINTS).max(1);
+            let eval_rows: Vec<usize> = (0..n_rows).step_by(stride).collect();
+            let g = eval_rows.len();
+            let coords_mat = self.assignment.coords[k].as_matrix();
+            let mut band_coords = Array2::<f64>::zeros((g, d));
+            let mut band_mean = Array2::<f64>::zeros((g, p));
+            let band_sd = Array2::<f64>::from_elem((g, p), f64::NAN);
+            let mut decoded = vec![0.0_f64; p];
+            for (gi, &row) in eval_rows.iter().enumerate() {
+                for axis in 0..d {
+                    band_coords[[gi, axis]] = coords_mat[[row, axis]];
+                }
+                atom.fill_decoded_row(row, &mut decoded);
+                for c in 0..p {
+                    band_mean[[gi, c]] = decoded[c];
+                }
+            }
+            atoms.push(SaeAtomShapeUncertainty {
+                decoder_covariance: None,
+                band_coords,
+                band_mean,
+                band_sd,
+            });
+        }
+        SaeShapeUncertainty { dispersion, atoms }
+    }
+
     /// Returns whether Beta-tier analytic curvature was accumulated into the
     /// dense `sys.hbb` block or deferred for exact factored-space probing.
     fn add_sae_analytic_penalty_contributions(
@@ -10415,7 +10559,12 @@ impl SaeManifoldTerm {
         // escalation, reusing the caller-supplied Tikhonov ridges
         // (`ridge_ext_coord`, `ridge_beta`) as the base damping. No new
         // tuning knobs — just the existing proximal-correction schedule.
-        sys.solve_with_lm_escalation(ridge_ext_coord, ridge_beta)
+        let plan = self
+            .streaming_plan()
+            .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
+        let options = plan.solve_options_for_border_dim(sys.k);
+        solve_with_lm_escalation_inner(&sys, ridge_ext_coord, ridge_beta, &options)
             .map(|(delta_t, delta_beta, _diag)| (delta_t, delta_beta))
     }
 
@@ -11780,6 +11929,11 @@ impl SaeManifoldTerm {
             let sys = self
                 .assemble_arrow_schur(target, rho, analytic_penalties)
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+            let plan = self
+                .streaming_plan()
+                .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
+                .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+            let solve_options = plan.solve_options_for_border_dim(sys.k);
             // Inner Newton step with principled LM-style ridge escalation. The
             // PCA-seed starting state on a small batch (e.g. `predict` on a
             // strict subset of the training set) can produce a per-row
@@ -11792,9 +11946,9 @@ impl SaeManifoldTerm {
             // factor-failure error variants so legitimate, non-recoverable
             // errors (PCG divergence with no factor failure, adaptive-step
             // exhaustion, …) still surface immediately.
-            let (delta_ext_coord, delta_beta, _diag) = sys
-                .solve_with_lm_escalation(ridge_ext_coord, ridge_beta)
-                .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+            let (delta_ext_coord, delta_beta, _diag) =
+                solve_with_lm_escalation_inner(&sys, ridge_ext_coord, ridge_beta, &solve_options)
+                    .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             let directional_decrease = sae_manifold_newton_directional_decrease(
                 &sys,
                 delta_ext_coord.view(),
@@ -11926,7 +12080,7 @@ impl SaeManifoldTerm {
                     // (`factored_border_dim`) when frames are active, else
                     // `beta_dim` — so the direct/PCG mode threshold keys on the
                     // dimension the solve actually runs at.
-                    &ArrowSolveOptions::automatic(sys.k),
+                    &solve_options,
                     &correction,
                     |trial_delta_t, trial_delta_beta| {
                         self.restore_mutable_state(&snapshot);
@@ -12875,15 +13029,31 @@ impl SaeManifoldOuterObjective {
         let settled_objective =
             term.penalized_objective_total(target.view(), &current_rho, registry.as_ref(), 1.0);
         let mut rho_seed = current_rho.clone();
-        let seed_solve = baseline_term.run_joint_fit_arrow_schur(
-            target.view(),
-            &mut rho_seed,
-            registry.as_ref(),
-            inner_max_iter,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-        );
+        let seed_solve = match baseline_term.streaming_plan().admitted_or_error(
+            baseline_term.n_obs(),
+            baseline_term.output_dim(),
+            baseline_term.k_atoms(),
+        ) {
+            Ok(plan) if plan.streaming => baseline_term.fit_streaming_in_memory(
+                target.view(),
+                &mut rho_seed,
+                registry.as_ref(),
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            ),
+            Ok(_) => baseline_term.run_joint_fit_arrow_schur(
+                target.view(),
+                &mut rho_seed,
+                registry.as_ref(),
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            ),
+            Err(err) => Err(err),
+        };
         if let (Ok(settled_total), Ok(seed_loss)) = (settled_objective, seed_solve) {
             let seed_total = baseline_term.penalized_objective_total(
                 target.view(),
@@ -13012,6 +13182,19 @@ impl SaeManifoldOuterObjective {
 
     pub fn decoder_shape_uncertainty(&mut self) -> Result<SaeShapeUncertainty, String> {
         let rho = self.current_rho.clone();
+        let plan = self.term.streaming_plan().admitted_or_error(
+            self.term.n_obs(),
+            self.term.output_dim(),
+            self.term.k_atoms(),
+        )?;
+        if !plan.direct_logdet_admitted() {
+            let loss = self.term.loss(self.target.view(), &rho)?;
+            let n_scalar = (self.term.n_obs().saturating_mul(self.term.output_dim())).max(1) as f64;
+            let dispersion = (2.0 * loss.data_fit / n_scalar).max(f64::MIN_POSITIVE);
+            return Ok(self
+                .term
+                .shape_uncertainty_without_decoder_covariance(dispersion));
+        }
         let (_cost, loss, cache) = self.term.reml_criterion_with_cache(
             self.target.view(),
             &rho,
@@ -13419,11 +13602,17 @@ impl SaeManifoldOuterObjective {
 
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
+        let plan = self.term.streaming_plan();
+        let gradient = if plan.direct_admitted {
+            Derivative::Analytic
+        } else {
+            Derivative::Unavailable
+        };
         OuterCapability {
             // The full analytic outer-ρ gradient is assembled for every
             // assignment mode, including IBP-MAP (its empirical-π third channel
             // landed exactly in `logdet_theta_adjoint`, #1006).
-            gradient: Derivative::Analytic,
+            gradient,
             hessian: DeclaredHessianForm::Unavailable,
             n_params: self.baseline_rho.to_flat().len(),
             // ρ are all penalty-like / τ coordinates: precisions and
@@ -16467,19 +16656,25 @@ mod tests {
             total_basis,
             term0.k_atoms(),
             d_max,
+            term0.beta_dim(),
             usize::MAX / 4,
             1024 * 1024,
+            usize::MAX / 2,
         );
         assert!(!dense_plan.streaming);
+        assert!(dense_plan.direct_admitted);
         let streaming_plan = sae_streaming_plan_from_budget(
             term0.n_obs(),
             total_basis,
             term0.k_atoms(),
             d_max,
+            term0.beta_dim(),
             1,
             512,
+            2,
         );
         assert!(streaming_plan.streaming);
+        assert!(!streaming_plan.direct_admitted);
 
         let mut full = term0.clone();
         // The undamped (`ridge_t = 0`) log-det is only well-defined at the inner
@@ -16502,6 +16697,37 @@ mod tests {
         let mut streaming = StreamingArrowSchur::from_system(&sys, streaming_plan.chunk_size);
         let streaming_logdet = streaming.exact_arrow_log_det(0.0, 0.0, &options).unwrap();
         assert_abs_diff_eq!(streaming_logdet, full_logdet, epsilon = 1.0e-8);
+    }
+
+    #[test]
+    fn giant_host_working_set_plan_flips_to_matrix_free_before_dense_allocation() {
+        let n_obs = 128usize;
+        let total_basis = 48usize;
+        let k_atoms = 8usize;
+        let d_max = 2usize;
+        let p_out = 2048usize;
+        let border_dim = total_basis * p_out;
+        let budget = 60usize * 1024 * 1024 * 1024;
+        let plan = sae_streaming_plan_from_budget(
+            n_obs,
+            total_basis,
+            k_atoms,
+            d_max,
+            border_dim,
+            budget,
+            8 * 1024 * 1024,
+            120usize * 1024 * 1024 * 1024,
+        );
+
+        assert_eq!(border_dim, 98_304);
+        assert!(plan.estimated_dense_schur_bytes > budget);
+        assert!(plan.streaming);
+        assert!(!plan.direct_admitted);
+        assert!(plan.matrix_free_admitted);
+        assert_eq!(
+            plan.solve_options_for_border_dim(border_dim).mode,
+            crate::solver::arrow_schur::ArrowSolverMode::InexactPCG
+        );
     }
 
     #[test]

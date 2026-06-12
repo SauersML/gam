@@ -9761,6 +9761,10 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("log_ard", log_ard_py)?;
     out.set_item("assignment_prior", assignment_kind)?;
     out.set_item(
+        "solver_plan",
+        sae_streaming_plan_to_pydict(py, term.streaming_plan())?,
+    )?;
+    out.set_item(
         "diagnostics",
         sae_trust_diagnostics_dict(py, &trust_diagnostics)?,
     )?;
@@ -10179,53 +10183,97 @@ fn sae_periodic_basis_size(n_harmonics: usize) -> Result<usize, String> {
 /// fit will follow for a given `(n_obs, total_basis, k_atoms, d_max)` without
 /// running it. It carries no tunable knobs — the plan is fully derived from the
 /// problem size and the `GpuRuntime` memory budget.
-#[pyfunction]
+#[pyfunction(signature = (n_obs, total_basis, k_atoms, d_max, border_dim = None))]
 fn sae_streaming_plan(
+    py: Python<'_>,
     n_obs: usize,
     total_basis: usize,
     k_atoms: usize,
     d_max: usize,
-) -> (bool, usize) {
-    const BYTES_PER_F64: usize = 8;
-    // Host working-set we are willing to materialize for the dense full-batch
-    // path on a CPU-only host before switching to streaming.
-    const HOST_IN_CORE_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
-    // CPU L2-cache estimate used to size a chunk so its hot basis stays
-    // resident; chunks are sized to several multiples of this window.
-    const CPU_L2_CACHE_BYTES: usize = 1024 * 1024; // 1 MiB
-    const CHUNK_CACHE_MULTIPLE: usize = 8;
-    const MIN_CHUNK_ROWS: usize = 256;
+    border_dim: Option<usize>,
+) -> PyResult<Py<PyDict>> {
+    let border_dim = border_dim.unwrap_or(total_basis);
+    let plan = gam::terms::sae_manifold::sae_streaming_plan_for_shape(
+        n_obs,
+        total_basis,
+        k_atoms,
+        d_max,
+        border_dim,
+    );
+    let out = PyDict::new(py);
+    out.set_item("streaming", plan.streaming)?;
+    out.set_item("chunk_size", plan.chunk_size)?;
+    out.set_item(
+        "estimated_full_batch_bytes",
+        plan.estimated_full_batch_bytes,
+    )?;
+    out.set_item(
+        "estimated_dense_schur_bytes",
+        plan.estimated_dense_schur_bytes,
+    )?;
+    out.set_item(
+        "estimated_direct_peak_bytes",
+        plan.estimated_direct_peak_bytes,
+    )?;
+    out.set_item(
+        "estimated_matrix_free_peak_bytes",
+        plan.estimated_matrix_free_peak_bytes,
+    )?;
+    out.set_item("in_core_budget_bytes", plan.in_core_budget_bytes)?;
+    out.set_item("host_available_bytes", plan.host_available_bytes)?;
+    out.set_item("direct_admitted", plan.direct_admitted)?;
+    out.set_item("matrix_free_admitted", plan.matrix_free_admitted)?;
+    out.set_item(
+        "route",
+        if plan.direct_admitted {
+            "direct"
+        } else if plan.matrix_free_admitted {
+            "matrix_free_streaming"
+        } else {
+            "refuse"
+        },
+    )?;
+    Ok(out.unbind())
+}
 
-    let per_row_words = total_basis
-        .saturating_mul(1 + d_max)
-        .saturating_add(k_atoms)
-        .max(1);
-    let per_row_bytes = per_row_words.saturating_mul(BYTES_PER_F64);
-    let full_batch_bytes = n_obs.saturating_mul(per_row_bytes);
-
-    let runtime = gam::gpu::GpuRuntime::global();
-    let (in_core_budget, chunk_window_bytes) = match runtime {
-        Some(rt) => {
-            let budget = rt.memory_budget_bytes;
-            // Allow up to one quarter of the device budget for the dense
-            // full-batch buffers; size chunks to a small fraction so several
-            // chunks (plus the reduced system) coexist on-device.
-            let chunk_window = (budget / 16).max(CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE);
-            (budget / 4, chunk_window)
-        }
-        None => (
-            HOST_IN_CORE_BYTES,
-            CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE,
-        ),
-    };
-
-    if full_batch_bytes <= in_core_budget {
-        return (false, n_obs.max(1));
-    }
-    // Streaming: rows per chunk so the chunk's per-row working set fits the
-    // window, clamped to a floor for amortization and to `n_obs`.
-    let rows_per_chunk = (chunk_window_bytes / per_row_bytes).max(MIN_CHUNK_ROWS);
-    (true, rows_per_chunk.min(n_obs).max(1))
+fn sae_streaming_plan_to_pydict<'py>(
+    py: Python<'py>,
+    plan: gam::terms::sae_manifold::SaeStreamingPlan,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("streaming", plan.streaming)?;
+    out.set_item("chunk_size", plan.chunk_size)?;
+    out.set_item(
+        "estimated_full_batch_bytes",
+        plan.estimated_full_batch_bytes,
+    )?;
+    out.set_item(
+        "estimated_dense_schur_bytes",
+        plan.estimated_dense_schur_bytes,
+    )?;
+    out.set_item(
+        "estimated_direct_peak_bytes",
+        plan.estimated_direct_peak_bytes,
+    )?;
+    out.set_item(
+        "estimated_matrix_free_peak_bytes",
+        plan.estimated_matrix_free_peak_bytes,
+    )?;
+    out.set_item("in_core_budget_bytes", plan.in_core_budget_bytes)?;
+    out.set_item("host_available_bytes", plan.host_available_bytes)?;
+    out.set_item("direct_admitted", plan.direct_admitted)?;
+    out.set_item("matrix_free_admitted", plan.matrix_free_admitted)?;
+    out.set_item(
+        "route",
+        if plan.direct_admitted {
+            "direct"
+        } else if plan.matrix_free_admitted {
+            "matrix_free_streaming"
+        } else {
+            "refuse"
+        },
+    )?;
+    Ok(out)
 }
 
 /// PCA seed: returns coords with shape `(k_atoms, n_obs, d_max)`. For periodic
@@ -12378,6 +12426,10 @@ fn sae_manifold_predict_oos<'py>(
     out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
     out.set_item("log_ard", log_ard_py)?;
     out.set_item("assignment_prior", assignment_kind)?;
+    out.set_item(
+        "solver_plan",
+        sae_streaming_plan_to_pydict(py, term.streaming_plan())?,
+    )?;
     out.set_item("chosen_k", k_atoms)?;
     Ok(out.unbind())
 }

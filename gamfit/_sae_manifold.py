@@ -343,6 +343,7 @@ class ManifoldSAE:
     random_state: int = 0
     top_k: int | None = None
     jumprelu_threshold: float = 0.0
+    solver_plan: dict[str, Any] | None = None
     # Gaussian reconstruction scale phi-hat that scales every per-atom decoder
     # covariance (Cov(beta_k) = phi * S_beta^{-1}[block]).
     dispersion: float = 1.0
@@ -539,6 +540,7 @@ class ManifoldSAE:
             max_iter=int(max_iter), random_state=int(random_state),
             top_k=None if top_k is None else int(top_k),
             jumprelu_threshold=float(jumprelu_threshold),
+            solver_plan=None if payload.get("solver_plan") is None else dict(payload["solver_plan"]),
             dispersion=float(payload["dispersion"]),
             # WP-D → fit wiring (#980): surface the metric provenance and the
             # per-row truncation diagnostic the Rust fit reports. Absent ⇒ the
@@ -1063,6 +1065,7 @@ class ManifoldSAE:
             "jumprelu_threshold": float(self.jumprelu_threshold),
             "oos_projection_top1": bool(self._oos_projection_top1),
             "dispersion": float(self.dispersion),
+            "solver_plan": None if self.solver_plan is None else _jsonable(self.solver_plan),
             "primitive_names": list(self.primitive_names),
             "basis_specs": list(self.basis_specs),
             "reml_score": float(self.reml_score),
@@ -1186,6 +1189,7 @@ class ManifoldSAE:
             random_state=int(payload["random_state"]),
             top_k=None if payload["top_k"] is None else int(payload["top_k"]),
             jumprelu_threshold=float(payload["jumprelu_threshold"]),
+            solver_plan=None if payload.get("solver_plan") is None else dict(payload["solver_plan"]),
             _oos_projection_top1=bool(payload["oos_projection_top1"]),
             dispersion=float(payload["dispersion"]),
             atom_two_lens=(

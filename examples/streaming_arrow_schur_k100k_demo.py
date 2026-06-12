@@ -62,9 +62,10 @@ def main() -> None:
     # size chunks, so we pass the conservative monomial-patch estimate.
     per_atom_basis = 1 + D_ATOM + (D_ATOM * (D_ATOM + 1)) // 2  # degree-2 patch
     total_basis = N_ATOMS * per_atom_basis
-    use_streaming, chunk_size = rust_module().sae_streaming_plan(
-        N_OBS, total_basis, N_ATOMS, D_ATOM
-    )
+    plan = dict(rust_module().sae_streaming_plan(
+        N_OBS, total_basis, N_ATOMS, D_ATOM, total_basis * N_FEATURES
+    ))
+    use_streaming, chunk_size = bool(plan["streaming"]), int(plan["chunk_size"])
 
     fit = gamfit.sae_manifold_fit(
         X=z,
