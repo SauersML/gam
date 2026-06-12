@@ -6674,7 +6674,13 @@ fn materialize_standard<'a>(
         sas_link: None,
         optimize_sas: false,
         compute_inference: true,
-        skip_rho_posterior_inference: false,
+        // Formula/workflow fits are the interactive/default path. Keep
+        // coefficient covariance and smoothing correction, but do not run the
+        // optional live-rho posterior certificate/escalation here: escalation can
+        // launch NUTS over rho and turns ordinary quality gates into sampler
+        // benchmarks. Lower-level callers that explicitly need the rho posterior
+        // can still opt in through `FitOptions`.
+        skip_rho_posterior_inference: true,
         max_iter: config.outer_max_iter.unwrap_or(200),
         // Outer REML/LAML smoothing-selection tolerance. The outer convergence
         // test (`outer_gradient_tolerance`) uses a `rel_cost` criterion whose

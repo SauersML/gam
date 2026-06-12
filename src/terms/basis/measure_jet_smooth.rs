@@ -1236,10 +1236,11 @@ fn realize_measure_jet_geometry(
         }
     };
     let k_cc = measure_jet_design_matrix(centers.view(), centers.view(), length_scale)?;
-    let kz = match &sum_to_zero_u {
-        Some(u) => householder_drop_first_apply(&k_cc, u),
-        None => k_cc.dot(&z),
-    };
+    // Penalty-side application is only m x m and is part of the frozen replay
+    // contract, so keep it in the dense operation order used by replay. The
+    // data-sized n x m design path below is where the structured Householder
+    // application matters.
+    let kz = k_cc.dot(&z);
     Ok(RealizedMeasureJetGeometry {
         centers,
         masses,
