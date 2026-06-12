@@ -2155,12 +2155,13 @@ pub struct SaeRowLayout {
 }
 
 impl SaeRowLayout {
-    /// JumpReLU optimization active set: atoms within the reactivation band
-    /// `logit > threshold − MARGIN·τ` (see [`jumprelu_in_optimization_band`]).
-    /// This is intentionally wider than the hard forward gate `logit > threshold`
-    /// so that gated-off atoms near the boundary remain in the Newton system for
-    /// value-consistent prior terms. Their forward reconstruction contribution
-    /// and data-fit logit JVP remain hard-zero while `a_k = 0`.
+    /// JumpReLU optimization active set: atoms inside the smooth prior's
+    /// machine-precision support `(logit - threshold)/tau > -36` (see
+    /// [`jumprelu_in_optimization_band`]). This is intentionally wider than the
+    /// hard forward gate `logit > threshold` so gated-off atoms can remain in the
+    /// Newton system for value-consistent prior terms. Their forward
+    /// reconstruction contribution and data-fit logit JVP remain hard-zero while
+    /// `a_k = 0`.
     fn from_jumprelu(
         n: usize,
         k_atoms: usize,
@@ -4999,12 +5000,13 @@ impl SaeManifoldTerm {
         }
 
         // Per-row active-set layout. Engaged for two regimes:
-        //   * JumpReLU — structural gate plus a reactivation band: atoms with
-        //     `logit > threshold − MARGIN·τ` enter the compact solve
+        //   * JumpReLU — structural gate plus the smooth prior's
+        //     machine-precision support: atoms with
+        //     `(logit - threshold)/tau > -36` enter the compact solve
         //     ([`jumprelu_in_optimization_band`]). Strictly gated-off atoms
         //     (logit ≤ threshold) carry zero assignment mass so their data-fit
         //     reconstruction contribution and data-fit logit JVP are zero, but
-        //     band atoms keep value-consistent prior gradient in the row block.
+        //     supported atoms keep value-consistent prior gradient in the row block.
         //   * IBP-MAP at large `K` — the dense `(m_total · p)²` data
         //     Gram is infeasible, so each row is truncated to its
         //     top-`k_active` atoms above a relative magnitude cutoff
@@ -5301,8 +5303,8 @@ impl SaeManifoldTerm {
             }
 
             // Determine whether this row uses the compact active-set layout.
-            //   * JumpReLU: gated atoms plus the reactivation band
-            //     (logit > threshold − MARGIN·τ) enter.
+            //   * JumpReLU: gated atoms plus the smooth prior's
+            //     machine-precision support enter.
             //   * IBP-MAP at large K: only the top-`k_active` atoms.
             //   * Otherwise (small K): the dense uniform-q layout.
             let (q_row, mut local_jac_row) = if let Some(ref layout) = row_layout {
@@ -5442,11 +5444,12 @@ impl SaeManifoldTerm {
             //
             // H-consistency note (#1006 audit). This `assignment_hdiag` is the
             // assignment penalty's EXACT `hessian_diag` (softmax-sparsity, IBP-MAP
-            // empirical-π, or JumpReLU surrogate), added RAW — unlike the ARD
+            // empirical-π, or JumpReLU sigmoid surrogate), added RAW — unlike the ARD
             // coordinate curvature (`prior.hess.max(0.0)` below) and the
             // decoder-tier penalties (`psd_majorizer_diag`), it is NOT majorized.
             // That diagonal CAN be negative (the softmax `(1−2z)`-type logit
-            // curvature, IBP `score·(1−2z)` term), so the assembled `H_tt` is
+            // curvature, IBP `score·(1−2z)` term, and JumpReLU above its
+            // threshold), so the assembled `H_tt` is
             // Gauss-Newton (PSD) + majorized ARD (PSD) + raw-assignment-prior
             // (indefinite) and is therefore NOT guaranteed PD off the optimum.
             // This refutes the "pure GN+majorizer cannot be non-PD" premise: the
@@ -18644,7 +18647,9 @@ mod tests {
         let k = 3usize;
         let logits = Array2::<f64>::from_shape_vec(
             (n, k),
-            vec![-0.4, 0.2, 0.7, 0.1, -0.3, 0.5, 0.8, -0.1, -0.6, 0.3, 0.6, -0.2],
+            vec![
+                -0.4, 0.2, 0.7, 0.1, -0.3, 0.5, 0.8, -0.1, -0.6, 0.3, 0.6, -0.2,
+            ],
         )
         .expect("valid IBP logit grid");
         let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
@@ -18672,7 +18677,42 @@ mod tests {
     }
 
     #[test]
-    fn jumprelu_assignment_prior_hessian_diag_is_psd_over_logit_sweep() {
+    fn jumprelu_assignment_value_matches_logit_gradient_fd() {
+        let n = 4usize;
+        let k = 2usize;
+        let temperature = 0.35_f64;
+        let threshold = 0.1_f64;
+        let logits = Array2::<f64>::from_shape_vec(
+            (n, k),
+            vec![-13.0, -0.2, 0.0, 0.05, 0.15, 0.4, 0.9, 1.5],
+        )
+        .expect("valid JumpReLU logit grid");
+        let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+        let manifolds = vec![LatentManifold::Circle { period: 1.0 }; k];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coords,
+            manifolds,
+            AssignmentMode::jumprelu(temperature, threshold),
+        )
+        .expect("valid JumpReLU assignment");
+        let rho = SaeManifoldRho::new(0.7_f64.ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
+        let (grad, _) =
+            assignment_prior_grad_hdiag(&assignment, &rho).expect("JumpReLU assignment gradient");
+        let idx = 4usize;
+        let step = 1.0e-6_f64;
+        let mut plus = assignment.clone();
+        plus.logits[[idx / k, idx % k]] += step;
+        let mut minus = assignment.clone();
+        minus.logits[[idx / k, idx % k]] -= step;
+        let fd = (assignment_prior_value(&plus, &rho) - assignment_prior_value(&minus, &rho))
+            / (2.0 * step);
+
+        assert_abs_diff_eq!(grad[idx], fd, epsilon = 2.0e-8);
+    }
+
+    #[test]
+    fn jumprelu_assignment_prior_hessian_diag_is_exact_over_logit_sweep() {
         let n = 6usize;
         let k = 2usize;
         let temperature = 0.35_f64;
@@ -18702,29 +18742,28 @@ mod tests {
 
         assert_eq!(grad.len(), n * k);
         assert_eq!(diag.len(), n * k);
+        let mut saw_negative = false;
         for (idx, &entry) in diag.iter().enumerate() {
             let logit = logits[[idx / k, idx % k]];
-            // Expected = JumpReLU gated majorizer with the threshold-centered
-            // surrogate σ((l−θ)/τ), supported through the reactivation band
-            // (logit > θ − MARGIN·τ) so gated-off atoms near the boundary keep
-            // prior gradient. Softmax identifiability is handled by its
-            // reference-logit chart, not by adding curvature to gate logits.
-            let sparsity = if jumprelu_in_optimization_band(logit, threshold, temperature) {
+            // Expected = exact second derivative of the threshold-centered
+            // surrogate σ((l−θ)/τ), using the same machine-precision support as
+            // the value and gradient paths.
+            let expected = if jumprelu_in_optimization_band(logit, threshold, temperature) {
                 let activation =
                     crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
-                sparsity_strength * slope * slope * inv_tau2
+                sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2
             } else {
                 0.0
             };
-            let expected = sparsity;
-            assert!(
-                entry.is_finite() && entry >= 0.0,
-                "JumpReLU gated hessian_diag majorizer must be finite and non-negative at index \
-                 {idx}; entry={entry}"
-            );
+            assert!(entry.is_finite(), "JumpReLU hessian_diag must be finite at index {idx}");
+            saw_negative |= entry < 0.0;
             assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
         }
+        assert!(
+            saw_negative,
+            "exact JumpReLU hessian_diag must go negative above the threshold"
+        );
     }
 
     /// Regression test for issue #174: K>=2 periodic atoms with zero-init

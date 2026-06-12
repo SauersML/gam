@@ -39,25 +39,20 @@ pub(crate) const SAE_ATOM_ACTIVE_MASS_FLOOR: f64 = 1.0e-3;
 /// to adjudicate — re-seeding in a loop would fight the optimizer.
 pub(crate) const SAE_ATOM_COLLAPSE_RESEED_BUDGET: usize = 1;
 
-/// Reactivation band width (in units of the JumpReLU temperature `τ`) below the
-/// hard gate threshold. The forward gate value is hard-zero strictly below
-/// `threshold`, but an atom whose logit lies within `threshold − MARGIN·τ` is
-/// still admitted to the compact Newton active set for sparsity-prior support.
-/// Below the band the shifted-sigmoid derivative `σ'((l−θ)/τ)` is vanishingly
-/// small, so the band captures essentially all of the prior-gradient mass that
-/// could act on a gated atom (at `MARGIN = 4`, `σ((l−θ)/τ) < σ(−4) ≈ 0.018` at
-/// the band edge). Without the band the gate is an absorbing pruning rule, not a
-/// learnable gate.
-pub(crate) const JUMPRELU_REACTIVATION_MARGIN: f64 = 4.0;
+/// Machine-precision support cutoff for the smooth JumpReLU assignment prior,
+/// in units of the gate temperature below the hard threshold. The forward gate
+/// remains hard-zero at and below `threshold`, but the prior value/gradient and
+/// compact Newton layout keep every logit with `(logit - threshold)/tau > -36`.
+/// At the excluded edge `sigma(-36) ~= 2e-16`, so dropped value/gradient/Hessian
+/// terms are below f64 noise instead of creating an algorithmic discontinuity.
+pub(crate) const JUMPRELU_OPTIMIZATION_LOGIT_CUTOFF: f64 = -36.0;
 
-/// Shared band predicate for JumpReLU optimization inclusion. An atom is kept
-/// optimizable (compact-layout inclusion and prior-gradient support) when its
-/// logit is above the reactivation band's lower edge `threshold − MARGIN·τ`.
-/// This is strictly weaker than the hard forward gate `logit > threshold`,
-/// which still governs data-fit reconstruction and its logit JVP.
+/// Shared support predicate for JumpReLU optimization inclusion. This is
+/// strictly weaker than the hard forward gate `logit > threshold`, which still
+/// governs data-fit reconstruction and its logit JVP.
 #[inline]
 pub(crate) fn jumprelu_in_optimization_band(logit: f64, threshold: f64, temperature: f64) -> bool {
-    logit > threshold - JUMPRELU_REACTIVATION_MARGIN * temperature
+    (logit - threshold) / temperature > JUMPRELU_OPTIMIZATION_LOGIT_CUTOFF
 }
 
 /// Assignment prior/relaxation used by [`SaeAssignment`].
@@ -664,8 +659,8 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
         } => {
             // Data-fit sensitivity follows the hard forward gate: rows at or
             // below the threshold have zero reconstruction value and therefore
-            // zero data-fit logit derivative. The reactivation band is a
-            // compact-layout/prior support rule, not a data-fit STE.
+            // zero data-fit logit derivative. The wider machine-precision prior
+            // support is a compact-layout/prior rule, not a data-fit STE.
             let inv_tau = 1.0 / temperature;
             for logit_col in 0..assignments.len() {
                 if logits[logit_col] <= threshold {
@@ -739,10 +734,8 @@ pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifo
             threshold,
         } => {
             // Sparsity penalty uses the same threshold-centered surrogate and
-            // reactivation-band support as its gradient. This makes band
-            // prior gradients part of the objective evaluated by line search,
-            // while data-fit reconstruction remains hard-gated by
-            // `jumprelu_row`.
+            // machine-precision support as its gradient/Hessian. Data-fit
+            // reconstruction remains hard-gated by `jumprelu_row`.
             let sparsity_strength = rho.lambda_sparse();
             let mut acc = 0.0;
             for &logit in target.iter() {
@@ -833,7 +826,7 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
                 let activation =
                     crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
-                d[idx] = sparsity_strength * slope * slope * inv_tau2;
+                d[idx] = sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2;
             }
             Ok(d)
         }
@@ -930,11 +923,10 @@ pub(crate) fn assignment_prior_grad_hdiag(
             temperature,
             threshold,
         } => {
-            // Gradient of the sparsity value's threshold-centered surrogate
-            // σ((l−θ)/τ). Support extends through the reactivation band
-            // (logit > θ − MARGIN·τ) so a gated-off atom near the boundary keeps
-            // prior gradient. Data-fit JVP support is narrower and follows the
-            // hard forward gate.
+            // Gradient and exact diagonal Hessian of the sparsity value's
+            // threshold-centered surrogate σ((l−θ)/τ), using the same
+            // machine-precision support as the value path. Data-fit JVP support
+            // is narrower and follows the hard forward gate.
             let sparsity_strength = rho.lambda_sparse();
             let inv_tau = 1.0 / temperature;
             let inv_tau2 = inv_tau * inv_tau;
@@ -949,7 +941,7 @@ pub(crate) fn assignment_prior_grad_hdiag(
                     crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
                 g[idx] = sparsity_strength * slope * inv_tau;
-                d[idx] = sparsity_strength * slope * slope * inv_tau2;
+                d[idx] = sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2;
             }
             (g, d)
         }
