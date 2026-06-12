@@ -471,18 +471,24 @@ fn canonicalize_for_identifiability_inner(
     // Log the Frobenius norm and row-count of each block's effective
     // Jacobian before the audit so discrepancies between pilot and outer-fit
     // audits are visible in the log stream.
-    for spec in specs.iter() {
-        let jac_nrows = if use_channel_aware {
+    //
+    // This is purely diagnostic: the only consumer of `frob_sq` is the
+    // `log::debug!` below.  A full `effective_jacobian_at` probe materialises
+    // the block's entire `(n·k, p)` effective Jacobian — an `(n, p, k)`-class
+    // transient that at biobank scale is hundreds of MiB per block, paid every
+    // canonicalisation even when debug logging is OFF (#979).  Gate the whole
+    // loop behind the log level so production fits (info/warn) pay nothing, and
+    // when it does run, accumulate the Frobenius norm by streaming 4096-row
+    // chunks instead of holding the full Jacobian.
+    if log::log_enabled!(log::Level::Debug) {
+        const FROB_CHUNK: usize = 4096;
+        for spec in specs.iter() {
             let k = spec
                 .jacobian_callback
                 .as_ref()
                 .map(|cb| cb.n_outputs())
                 .unwrap_or(1);
-            n_rows * k
-        } else {
-            n_rows
-        };
-        let frob_sq: f64 = {
+            let jac_nrows = if use_channel_aware { n_rows * k } else { n_rows };
             let p = spec.design.ncols();
             let zeros = vec![0.0f64; p];
             let state = FamilyLinearizationState {
@@ -491,24 +497,42 @@ fn canonicalize_for_identifiability_inner(
                 channel_hessian: None,
                 probit_frailty_scale: 1.0,
             };
-            match spec.effective_jacobian_at("canonicalize_for_identifiability", &state) {
-                Ok(j) => j.iter().map(|v| v * v).sum(),
-                Err(e) => {
-                    log::debug!(
-                        "[CANON]   block '{}': effective_jacobian_at probe failed: {e}",
-                        spec.name,
-                    );
-                    f64::NAN
+            let mut frob_sq = 0.0_f64;
+            let mut probe_err: Option<String> = None;
+            for start in (0..n_rows).step_by(FROB_CHUNK) {
+                let end = (start + FROB_CHUNK).min(n_rows);
+                let chunk = match spec.jacobian_callback.as_ref() {
+                    Some(cb) => cb.effective_jacobian_rows(&state, start..end),
+                    None => {
+                        let mut out = Array2::<f64>::zeros((end - start, p));
+                        spec.design
+                            .row_chunk_into(start..end, out.view_mut())
+                            .map(|()| out)
+                            .map_err(|e| e.to_string())
+                    }
+                };
+                match chunk {
+                    Ok(rows) => frob_sq += rows.iter().map(|v| v * v).sum::<f64>(),
+                    Err(e) => {
+                        probe_err = Some(e);
+                        break;
+                    }
                 }
             }
-        };
-        log::debug!(
-            "[CANON]   block '{}': p={} jac_nrows={} frob_norm={:.4e}",
-            spec.name,
-            spec.design.ncols(),
-            jac_nrows,
-            frob_sq.sqrt(),
-        );
+            match probe_err {
+                Some(e) => log::debug!(
+                    "[CANON]   block '{}': effective_jacobian probe failed: {e}",
+                    spec.name,
+                ),
+                None => log::debug!(
+                    "[CANON]   block '{}': p={} jac_nrows={} frob_norm={:.4e}",
+                    spec.name,
+                    p,
+                    jac_nrows,
+                    frob_sq.sqrt(),
+                ),
+            }
+        }
     }
 
     // ── Run the audit ─────────────────────────────────────────────────────
