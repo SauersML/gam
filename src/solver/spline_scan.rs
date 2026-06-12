@@ -529,7 +529,142 @@ pub fn fit_cubic_spline_scan(
     fit_cubic_spline_scan_at(x, y, w, 0.5 * (lo + hi), None)
 }
 
+/// Lossless serializable snapshot of a [`CubicSplineScanFit`] (#1034).
+///
+/// Carries exactly the smoother state the Gaussian-bridge `predict` replays:
+/// pooled knots, smoothed `(f, f′)` states, smoothed state covariances
+/// (unit-σ² scale, symmetric — stored as `[c00, c01, c11]`), RTS backward
+/// gains (full 2×2, row-major — gains are NOT symmetric), pooled node
+/// weights, and the three fit scalars. `q = e^{−log λ}` and the public
+/// `mean`/`deriv`/`var` views are derived on restore rather than stored, so
+/// a snapshot cannot go internally inconsistent.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SplineScanState {
+    pub knots: Vec<f64>,
+    /// Smoothed `(f, f′)` per knot, row-major: `[f_0, f′_0, f_1, f′_1, …]`.
+    pub state: Vec<f64>,
+    /// Smoothed covariance per knot at unit-σ² scale: `[c00, c01, c11]` each.
+    pub cov: Vec<f64>,
+    /// RTS backward gain per knot, row-major `[g00, g01, g10, g11]` each
+    /// (the last knot's gain is structurally unused and stored as written).
+    pub gain: Vec<f64>,
+    /// Pooled (tied-abscissa summed) observation weight per knot.
+    pub node_weight: Vec<f64>,
+    pub log_lambda: f64,
+    pub sigma2: f64,
+    pub restricted_loglik: f64,
+}
+
 impl CubicSplineScanFit {
+    /// Snapshot the full smoother state for persistence (#1034).
+    pub fn to_state(&self) -> SplineScanState {
+        let mut state = Vec::with_capacity(2 * self.knots.len());
+        for s in &self.smoothed_state {
+            state.extend_from_slice(s);
+        }
+        let mut cov = Vec::with_capacity(3 * self.knots.len());
+        for c in &self.smoothed_cov {
+            cov.extend_from_slice(&[c[0][0], c[0][1], c[1][1]]);
+        }
+        let mut gain = Vec::with_capacity(4 * self.knots.len());
+        for g in &self.rts_gain {
+            gain.extend_from_slice(&[g[0][0], g[0][1], g[1][0], g[1][1]]);
+        }
+        SplineScanState {
+            knots: self.knots.clone(),
+            state,
+            cov,
+            gain,
+            node_weight: self.node_weight.clone(),
+            log_lambda: self.log_lambda,
+            sigma2: self.sigma2,
+            restricted_loglik: self.restricted_loglik,
+        }
+    }
+
+    /// Rebuild the exact in-memory fit from a persisted snapshot (#1034).
+    ///
+    /// Validates shape, finiteness, strict knot ordering, positive weights and
+    /// σ², so a corrupt payload fails loudly here instead of inside a later
+    /// `predict`. The restored fit replays the Gaussian bridge bit-for-bit:
+    /// every field `predict`/`edf`/`deriv_at_knot` reads is either stored
+    /// verbatim or derived by the same expressions the fitter uses.
+    pub fn from_state(state: &SplineScanState) -> Result<Self, String> {
+        let m = state.knots.len();
+        if m < 3 {
+            return Err(format!(
+                "spline scan state: needs at least 3 knots, got {m}"
+            ));
+        }
+        if state.state.len() != 2 * m
+            || state.cov.len() != 3 * m
+            || state.gain.len() != 4 * m
+            || state.node_weight.len() != m
+        {
+            return Err(format!(
+                "spline scan state: inconsistent lengths (m={m}, state={}, cov={}, gain={}, weights={})",
+                state.state.len(),
+                state.cov.len(),
+                state.gain.len(),
+                state.node_weight.len()
+            ));
+        }
+        let all = state
+            .state
+            .iter()
+            .chain(&state.cov)
+            .chain(&state.gain)
+            .chain(&state.knots)
+            .chain(&state.node_weight);
+        for (i, v) in all.enumerate() {
+            if !v.is_finite() {
+                return Err(format!("spline scan state: non-finite entry at {i}"));
+            }
+        }
+        if !(state.log_lambda.is_finite()
+            && state.restricted_loglik.is_finite()
+            && state.sigma2.is_finite()
+            && state.sigma2 > 0.0)
+        {
+            return Err(format!(
+                "spline scan state: invalid scalars (log_lambda={}, sigma2={}, restricted_loglik={})",
+                state.log_lambda, state.sigma2, state.restricted_loglik
+            ));
+        }
+        if state.knots.windows(2).any(|kk| !(kk[0] < kk[1])) {
+            return Err("spline scan state: knots must be strictly increasing".to_string());
+        }
+        if state.node_weight.iter().any(|&w| w <= 0.0) {
+            return Err("spline scan state: node weights must be positive".to_string());
+        }
+        let smoothed_state: Vec<Vec2> = state.state.chunks_exact(2).map(|s| [s[0], s[1]]).collect();
+        let smoothed_cov: Vec<Mat2> = state
+            .cov
+            .chunks_exact(3)
+            .map(|c| [[c[0], c[1]], [c[1], c[2]]])
+            .collect();
+        let rts_gain: Vec<Mat2> = state
+            .gain
+            .chunks_exact(4)
+            .map(|g| [[g[0], g[1]], [g[2], g[3]]])
+            .collect();
+        let sigma2 = state.sigma2;
+        Ok(Self {
+            knots: state.knots.clone(),
+            mean: smoothed_state.iter().map(|s| s[0]).collect(),
+            deriv: smoothed_state.iter().map(|s| s[1]).collect(),
+            var: smoothed_cov.iter().map(|c| c[0][0] * sigma2).collect(),
+            log_lambda: state.log_lambda,
+            sigma2,
+            restricted_loglik: state.restricted_loglik,
+            smoothed_state,
+            smoothed_cov,
+            rts_gain,
+            q: (-state.log_lambda).exp(),
+            node_weight: state.node_weight.clone(),
+        })
+    }
+
     /// Exact posterior `(mean, variance)` of `f` at an arbitrary abscissa.
     ///
     /// Interior points use the Gaussian bridge conditional on the two flanking
@@ -629,5 +764,69 @@ impl CubicSplineScanFit {
             self.smoothed_state[t][1],
             self.smoothed_cov[t][1][1] * self.sigma2,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1034 persistence seam: snapshot → JSON → restore must replay the
+    /// Gaussian bridge bit-for-bit — knot posteriors, off-knot bridge,
+    /// boundary extrapolation, EDF, and derivative posteriors all compare
+    /// with exact equality, because every replayed field is either stored
+    /// verbatim or derived by the fitter's own expressions.
+    #[test]
+    fn state_snapshot_round_trips_predict_bit_for_bit() {
+        let n = 60usize;
+        let x: Vec<f64> = (0..n).map(|i| (i as f64) / (n as f64 - 1.0)).collect();
+        // Deterministic wiggly response with a tie pair to exercise pooling.
+        let mut x = x;
+        x[7] = x[6];
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, &xi)| {
+                (6.0 * xi).sin() + 0.3 * (17.0 * xi).cos() + 0.05 * ((i * 37 % 11) as f64 - 5.0)
+            })
+            .collect();
+        let w: Vec<f64> = (0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)).collect();
+        let fit = fit_cubic_spline_scan(&x, &y, &w).expect("scan fit");
+
+        let json = serde_json::to_string(&fit.to_state()).expect("serialize state");
+        let state: SplineScanState = serde_json::from_str(&json).expect("deserialize state");
+        let restored = CubicSplineScanFit::from_state(&state).expect("restore fit");
+
+        assert_eq!(fit.knots, restored.knots);
+        assert_eq!(fit.mean, restored.mean);
+        assert_eq!(fit.var, restored.var);
+        assert_eq!(fit.deriv, restored.deriv);
+        assert_eq!(fit.log_lambda.to_bits(), restored.log_lambda.to_bits());
+        assert_eq!(fit.sigma2.to_bits(), restored.sigma2.to_bits());
+        assert_eq!(fit.edf().to_bits(), restored.edf().to_bits());
+        for t in 0..fit.knots.len() {
+            let (d0, v0) = fit.deriv_at_knot(t);
+            let (d1, v1) = restored.deriv_at_knot(t);
+            assert_eq!(d0.to_bits(), d1.to_bits());
+            assert_eq!(v0.to_bits(), v1.to_bits());
+        }
+        // Off-knot bridge, exact knot hit, and both extrapolation sides.
+        for &xq in &[-0.2, 0.0, 0.013, 0.5, x[6], 0.987, 1.0, 1.3] {
+            let (m0, v0) = fit.predict(xq).expect("predict original");
+            let (m1, v1) = restored.predict(xq).expect("predict restored");
+            assert_eq!(m0.to_bits(), m1.to_bits(), "mean drift at x={xq}");
+            assert_eq!(v0.to_bits(), v1.to_bits(), "variance drift at x={xq}");
+        }
+
+        // Corrupt payloads fail loudly, not inside a later predict.
+        let mut bad = fit.to_state();
+        bad.cov.truncate(bad.cov.len() - 1);
+        CubicSplineScanFit::from_state(&bad).expect_err("length mismatch must error");
+        let mut bad = fit.to_state();
+        bad.sigma2 = -1.0;
+        CubicSplineScanFit::from_state(&bad).expect_err("non-positive sigma2 must error");
+        let mut bad = fit.to_state();
+        bad.knots[2] = bad.knots[1];
+        CubicSplineScanFit::from_state(&bad).expect_err("non-increasing knots must error");
     }
 }
