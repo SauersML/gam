@@ -1525,16 +1525,18 @@ pub struct SaeManifoldAtom {
     /// basis). Caller-managed atoms (no installed evaluator) ignore the dial —
     /// there is no curved/linear split without an evaluator to provide it.
     pub homotopy_eta: f64,
-    /// #1019 stage 1: `true` once the post-fit arc-length (unit-speed) chart
-    /// canonicalization has been applied to this atom — the latent chart is
-    /// then the canonical (unit-speed) representative of its `Diff(M)` orbit
-    /// and the residual chart freedom is the finite isometry group of the
-    /// reference manifold (rotation + reflection on `S¹`, reflection +
-    /// translation on the interval). Read by the residual-gauge lowering so
-    /// the certificate reports the downgrade with the
-    /// `PinnedByCanonicalization` provenance. Only ever set for
-    /// `latent_dim == 1` atoms; never a flag the user controls.
-    pub unit_speed_canonicalized: bool,
+    /// #1019: `true` once the post-fit chart canonicalization has been
+    /// applied to this atom — the latent chart is then the canonical
+    /// representative of its `Diff(M)` orbit (the arc-length / unit-speed
+    /// chart for `d = 1`, the minimum-isometry-defect flow chart for `d = 2`
+    /// torus atoms) and the residual chart freedom is the finite isometry
+    /// group of the reference manifold (rotation + reflection on `S¹`,
+    /// reflection + translation on the interval, `Isom(T², flat)` on the
+    /// torus). Read by the residual-gauge lowering so the certificate reports
+    /// the downgrade with the `PinnedByCanonicalization` provenance. Only
+    /// ever set for `latent_dim == 1` atoms and `latent_dim == 2` torus
+    /// atoms; never a flag the user controls.
+    pub chart_canonicalized: bool,
 }
 
 impl SaeManifoldAtom {
@@ -1592,7 +1594,7 @@ impl SaeManifoldAtom {
             basis_second_jet: None,
             decoder_frame: None,
             homotopy_eta: 1.0,
-            unit_speed_canonicalized: false,
+            chart_canonicalized: false,
         };
         // Seed `smooth_penalty` with the intrinsic Gram at the initial
         // decoder/coordinates so the very first assembly already reads the
@@ -4525,11 +4527,14 @@ impl SaeManifoldTerm {
                 frame,
                 ard_variances,
                 lowering_error,
-                // #1019: post-fit arc-length canonicalization pins the chart;
-                // the certificate downgrades this atom's chart freedom to the
+                // #1019: post-fit chart canonicalization (arc length for
+                // d = 1, isometry-flow for d = 2 torus) pins the chart; the
+                // certificate downgrades this atom's chart freedom to the
                 // finite isometry group with PinnedByCanonicalization
                 // provenance.
-                chart_canonicalized: atom.unit_speed_canonicalized && d == 1,
+                chart_canonicalized: atom.chart_canonicalized
+                    && (d == 1
+                        || (d == 2 && matches!(atom.basis_kind, SaeAtomBasisKind::Torus))),
             });
             atom_offsets.push(cursor);
             atom_axis_dim.push(d);
@@ -10969,12 +10974,13 @@ impl SaeManifoldTerm {
     /// for every fitted `d = 1` atom with circle or interval topology.
     ///
     /// Image-frozen and gauge-legal: each eligible atom's latent chart is
-    /// replaced by the unit-speed representative of its `Diff(S¹)` /
-    /// `Diff([0, 1])` orbit (cumulative arc length along the fitted decoder
-    /// curve, rescaled to the chart's native span) and the decoder is
-    /// recomposed by exact least squares so the decoded image is unchanged
+    /// replaced by the canonical representative of its `Diff(M)` orbit — the
+    /// unit-speed (arc-length) chart for `d = 1` circle/interval atoms, the
+    /// minimum-isometry-defect flow chart for `d = 2` torus atoms (#1019
+    /// stage 2) — and the decoder is recomposed by exact least squares so the
+    /// decoded image is unchanged
     /// ([`crate::terms::sae_chart_canonicalization`]). Atoms whose basis
-    /// cannot absorb the reparameterized curve within the recomposition
+    /// cannot absorb the reparameterized image within the recomposition
     /// tolerance are left untouched (honest fallback, recorded by the flag
     /// staying `false`).
     ///
@@ -10988,7 +10994,7 @@ impl SaeManifoldTerm {
     /// Runs automatically from `into_fitted` after the joint fit converges,
     /// before the payload / residual-gauge certificate is assembled — never
     /// a flag (magic-by-default).
-    pub fn canonicalize_unit_speed_charts_post_fit(
+    pub fn canonicalize_charts_post_fit(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -10997,31 +11003,42 @@ impl SaeManifoldTerm {
         use crate::terms::sae_chart_canonicalization::{
             CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology,
         };
-        let mut eligible: Vec<(usize, CanonicalChartTopology)> = Vec::new();
+        /// Which canonical-representative construction applies to an atom:
+        /// arc length for `d = 1` (#1019 stage 1), the minimum-isometry-defect
+        /// flow for `d = 2` torus atoms (#1019 stage 2).
+        enum ChartPlan {
+            UnitSpeed(CanonicalChartTopology),
+            TorusFlow { period: f64 },
+        }
+        let mut eligible: Vec<(usize, ChartPlan)> = Vec::new();
         for atom_idx in 0..self.k_atoms() {
             let atom = &self.atoms[atom_idx];
-            if atom.latent_dim != 1
-                || self.assignment.coords[atom_idx].latent_dim() != 1
-                || atom.basis_evaluator.is_none()
+            if atom.basis_evaluator.is_none()
                 || atom.homotopy_eta != 1.0
+                || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim
             {
                 continue;
             }
-            let topology = match &atom.basis_kind {
-                // Same fraction-of-period convention as the latent manifold
-                // wiring (`SaeAtomBasisKind::latent_manifold`): the harmonic
-                // evaluators read `t` as a fraction of one period.
-                SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => {
-                    CanonicalChartTopology::Circle { period: 1.0 }
+            // Same fraction-of-period convention as the latent manifold
+            // wiring (`SaeAtomBasisKind::latent_manifold`): the harmonic
+            // evaluators read `t` as a fraction of one period.
+            let plan = match (&atom.basis_kind, atom.latent_dim) {
+                (SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus, 1) => {
+                    ChartPlan::UnitSpeed(CanonicalChartTopology::Circle { period: 1.0 })
                 }
-                SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch => {
-                    CanonicalChartTopology::Interval
+                (SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch, 1) => {
+                    ChartPlan::UnitSpeed(CanonicalChartTopology::Interval)
                 }
+                // #1019 stage 2: d = 2 torus atoms pin to the
+                // minimum-isometry-defect flow representative.
+                (SaeAtomBasisKind::Torus, 2) => ChartPlan::TorusFlow { period: 1.0 },
                 // d = 1 never matches Sphere; Precomputed bases carry no
-                // evaluator semantics to re-express the curve in.
-                SaeAtomBasisKind::Sphere | SaeAtomBasisKind::Precomputed(_) => continue,
+                // evaluator semantics to re-express the image in; S² has no
+                // global pole-free flow basis (hairy ball), so sphere charts
+                // are honestly left as fitted.
+                _ => continue,
             };
-            eligible.push((atom_idx, topology));
+            eligible.push((atom_idx, plan));
         }
         if eligible.is_empty() {
             return Ok(());
@@ -11031,18 +11048,26 @@ impl SaeManifoldTerm {
         let prior_flags: Vec<bool> = self
             .atoms
             .iter()
-            .map(|atom| atom.unit_speed_canonicalized)
+            .map(|atom| atom.chart_canonicalized)
             .collect();
         let pre_total = self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
 
         let mut any_changed = false;
-        for (atom_idx, topology) in &eligible {
-            match self.canonicalize_atom_unit_speed_chart(*atom_idx, topology) {
+        for (atom_idx, plan) in &eligible {
+            let outcome = match plan {
+                ChartPlan::UnitSpeed(topology) => {
+                    self.canonicalize_atom_unit_speed_chart(*atom_idx, topology)
+                }
+                ChartPlan::TorusFlow { period } => {
+                    self.canonicalize_atom_torus_flow_chart(*atom_idx, *period)
+                }
+            };
+            match outcome {
                 Ok(changed) => any_changed |= changed,
                 Err(err) => {
                     self.restore_mutable_state(&snapshot);
                     for (atom, flag) in self.atoms.iter_mut().zip(prior_flags.iter()) {
-                        atom.unit_speed_canonicalized = *flag;
+                        atom.chart_canonicalized = *flag;
                     }
                     return Err(err);
                 }
@@ -11067,7 +11092,7 @@ impl SaeManifoldTerm {
         if !keep {
             self.restore_mutable_state(&snapshot);
             for (atom, flag) in self.atoms.iter_mut().zip(prior_flags.iter()) {
-                atom.unit_speed_canonicalized = *flag;
+                atom.chart_canonicalized = *flag;
             }
         }
         Ok(())
