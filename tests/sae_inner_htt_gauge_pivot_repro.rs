@@ -131,7 +131,11 @@ fn high_dim_circle_inner_evidence_dies_with_gauge_pivot() {
         let n = 150;
         let z = planted_high_dim_circle(n, p, 0xC0FFEE ^ p as u64);
         let mut term = build_k1_circle_term(&z);
-        let rho = SaeManifoldRho::new((1.0e-3_f64).ln(), (1.0e-3_f64).ln(), Vec::new());
+        let rho = SaeManifoldRho::new(
+            (1.0e-3_f64).ln(),
+            (1.0e-3_f64).ln(),
+            vec![Array1::from_elem(1, (1.0e-3_f64).ln())],
+        );
 
         let result = term.reml_criterion(z.view(), &rho, None, 25, 1.0, 0.0, 0.0);
 
@@ -187,7 +191,11 @@ fn radial_residual_row_htt_is_gauge_explained() {
     let p = 512;
     let z = planted_high_dim_circle(n, p, 0x1037);
     let mut term = build_k1_circle_term(&z);
-    let rho = SaeManifoldRho::new((1.0e-3_f64).ln(), (1.0e-3_f64).ln(), Vec::new());
+    let rho = SaeManifoldRho::new(
+        (1.0e-3_f64).ln(),
+        (1.0e-3_f64).ln(),
+        vec![Array1::from_elem(1, (1.0e-3_f64).ln())],
+    );
 
     let sys = term
         .assemble_arrow_schur(z.view(), &rho, None)
