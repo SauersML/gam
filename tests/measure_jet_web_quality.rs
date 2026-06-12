@@ -20,6 +20,12 @@
 //!    (same sign, within 60% of truth) rather than collapse toward the
 //!    global training mean. This is the no-mass-term/N2 contract observed
 //!    end to end through REML.
+//! 3. **GLM composition**: the same web with a Poisson count response — the
+//!    measure-jet penalty must compose with PIRLS/REML for a non-gaussian
+//!    family and recover the log-intensity off-gap.
+//! 4. **Interval honesty**: 95% pointwise bands built from the fit's
+//!    smoothing-corrected coefficient covariance Vp must approximately cover
+//!    the true mean at held-out on-web points.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -27,10 +33,10 @@ use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use ndarray::Array2;
+use ndarray::{Array2, ArrayView2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand_distr::{Distribution, Normal, Uniform};
+use rand_distr::{Distribution, Normal, Poisson, Uniform};
 
 const AMBIENT_D: usize = 8;
 const Y_NOISE_SIGMA: f64 = 0.1;
@@ -39,6 +45,13 @@ const COORD_NOISE_SIGMA: f64 = 0.02;
 const TREND_SLOPE_AB: f64 = 1.5;
 /// Arc-length slope along strand C after the junction (continuous level).
 const TREND_SLOPE_C: f64 = -0.8;
+/// Poisson arm: η = POISSON_ETA_SCALE · (arc-length truth). The truth spans
+/// [0, 3] over the web, so η ∈ [0, 1.5] and μ = e^η ∈ [1, ~4.5] — counts small
+/// enough that the Poisson information is genuinely sparse, large enough that
+/// log-intensity recovery is well posed.
+const POISSON_ETA_SCALE: f64 = 0.5;
+/// Two-sided 95% normal quantile, qnorm(0.975).
+const Z_95: f64 = 1.959963984540054;
 
 /// Fixed embedding R² → R⁸: two exactly orthonormal columns (Householder-free
 /// hand construction; entries chosen irrational-ish so no ambient axis is
@@ -134,19 +147,42 @@ fn encode_training(points: &[WebPoint], seed: u64) -> gam::data::EncodedDataset 
     encode_recordswith_inferred_schema(headers, rows).expect("encode web dataset")
 }
 
-fn fit_and_predict(
-    formula: &str,
-    data: &gam::data::EncodedDataset,
-    test: &[WebPoint],
-) -> Vec<f64> {
+/// Poisson-count encoding of the web: y_i ~ Poisson(exp(η_i)) with
+/// η = POISSON_ETA_SCALE · truth, drawn from a seeded StdRng (deterministic,
+/// mirrors the gaussian encoder's rand usage).
+fn encode_poisson_training(points: &[WebPoint], seed: u64) -> gam::data::EncodedDataset {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut headers: Vec<String> = (0..AMBIENT_D).map(|k| format!("x{k}")).collect();
+    headers.push("y".to_string());
+    let rows: Vec<StringRecord> = points
+        .iter()
+        .map(|p| {
+            let mut fields: Vec<String> = p.coords.iter().map(|v| v.to_string()).collect();
+            let mu = (POISSON_ETA_SCALE * p.truth).exp();
+            let draw: f64 = Poisson::new(mu).expect("poisson").sample(&mut rng);
+            fields.push(draw.to_string());
+            StringRecord::from(fields)
+        })
+        .collect();
+    encode_recordswith_inferred_schema(headers, rows).expect("encode poisson web dataset")
+}
+
+fn fit_web(formula: &str, data: &gam::data::EncodedDataset, family: &str) -> gam::StandardFitResult {
     let cfg = FitConfig {
-        family: Some("gaussian".to_string()),
+        family: Some(family.to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, data, &cfg).expect("web fit succeeded");
     let FitResult::Standard(fit) = result else {
         panic!("expected standard fit")
     };
+    fit
+}
+
+/// Raw ambient-coordinate matrix for the test points, laid out on the
+/// training dataset's column map (the shape `build_term_collection_design`
+/// replays the frozen spec against).
+fn ambient_matrix(data: &gam::data::EncodedDataset, test: &[WebPoint]) -> Array2<f64> {
     let mut m = Array2::<f64>::zeros((test.len(), data.headers.len()));
     let cmap = data.column_map();
     for (i, p) in test.iter().enumerate() {
@@ -154,20 +190,67 @@ fn fit_and_predict(
             m[[i, cmap[format!("x{k}").as_str()]]] = p.coords[k];
         }
     }
+    m
+}
+
+/// Fit and evaluate the LINEAR PREDICTOR η = X·β at the test points (for the
+/// gaussian arm η is the mean; for poisson/log it is the log-intensity —
+/// applying the frozen design to β never passes through the inverse link).
+fn fit_and_predict(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    test: &[WebPoint],
+    family: &str,
+) -> Vec<f64> {
+    let fit = fit_web(formula, data, family);
+    let m = ambient_matrix(data, test);
     let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
         .expect("rebuild design from frozen spec");
     test_design.design.apply(&fit.fit.beta).to_vec()
 }
 
-fn rmse_vs_truth(pred: &[f64], test: &[WebPoint]) -> f64 {
+/// RMSE of predictions against `truth_scale · truth` (scale 1.0 for the
+/// gaussian arms; POISSON_ETA_SCALE for the count arm, where the comparison
+/// lives on the η = log-intensity scale).
+fn rmse_vs_truth(pred: &[f64], test: &[WebPoint], truth_scale: f64) -> f64 {
     let n = pred.len() as f64;
     (pred
         .iter()
         .zip(test.iter())
-        .map(|(p, q)| (p - q.truth) * (p - q.truth))
+        .map(|(p, q)| {
+            let e = p - truth_scale * q.truth;
+            e * e
+        })
         .sum::<f64>()
         / n)
         .sqrt()
+}
+
+/// Pointwise prediction SE from a coefficient covariance: se_i = √(sᵢᵀ V sᵢ)
+/// for design row sᵢ (same access pattern as the mgcv-CI quality suite).
+fn pointwise_se(design: ArrayView2<'_, f64>, cov: &Array2<f64>) -> Vec<f64> {
+    let p = design.ncols();
+    assert_eq!(cov.nrows(), p, "covariance/design dimension mismatch");
+    assert_eq!(cov.ncols(), p, "covariance must be square");
+    design
+        .rows()
+        .into_iter()
+        .map(|s| {
+            let mut acc = 0.0;
+            for a in 0..p {
+                let sa = s[a];
+                if sa == 0.0 {
+                    continue;
+                }
+                let mut row_dot = 0.0;
+                for b in 0..p {
+                    row_dot += cov[[a, b]] * s[b];
+                }
+                acc += sa * row_dot;
+            }
+            acc.max(0.0).sqrt()
+        })
+        .collect()
 }
 
 const MJS_FORMULA: &str = "y ~ mjs(x0, x1, x2, x3, x4, x5, x6, x7)";
@@ -181,8 +264,8 @@ fn measure_jet_recovers_web_signal_vs_truth() {
     // Held-out web draws OUTSIDE the gap (the gap has its own gate below).
     let test: Vec<WebPoint> = sample_web(140, 43, true);
 
-    let jet_pred = fit_and_predict(MJS_FORMULA, &data, &test);
-    let jet_rmse = rmse_vs_truth(&jet_pred, &test);
+    let jet_pred = fit_and_predict(MJS_FORMULA, &data, &test, "gaussian");
+    let jet_rmse = rmse_vs_truth(&jet_pred, &test, 1.0);
 
     // PRIMARY — truth recovery: the measure-learned geometry must resolve
     // the strand signal to within 2.5× the observation noise.
@@ -194,8 +277,8 @@ fn measure_jet_recovers_web_signal_vs_truth() {
 
     // SECONDARY — match-or-beat the geometry-blind mature in-crate smoother
     // on the same eight ambient columns (×1.10 flake guard only).
-    let duchon_pred = fit_and_predict(DUCHON_FORMULA, &data, &test);
-    let duchon_rmse = rmse_vs_truth(&duchon_pred, &test);
+    let duchon_pred = fit_and_predict(DUCHON_FORMULA, &data, &test, "gaussian");
+    let duchon_rmse = rmse_vs_truth(&duchon_pred, &test, 1.0);
     assert!(
         jet_rmse <= 1.10 * duchon_rmse,
         "measure-jet must match-or-beat geometry-blind Duchon at d=8: jet {jet_rmse:.4} vs duchon {duchon_rmse:.4}"
@@ -211,14 +294,7 @@ fn measure_jet_support_curve_flags_off_web_queries() {
     init_parallelism();
     let train_points = sample_web(400, 41, true);
     let data = encode_training(&train_points, 42);
-    let cfg = FitConfig {
-        family: Some("gaussian".to_string()),
-        ..FitConfig::default()
-    };
-    let result = fit_from_formula(MJS_FORMULA, &data, &cfg).expect("web fit succeeded");
-    let FitResult::Standard(fit) = result else {
-        panic!("expected standard fit")
-    };
+    let fit = fit_web(MJS_FORMULA, &data, "gaussian");
     // Dig the frozen measure-jet term out of the resolved collection: the
     // freeze step must have pinned nodes, masses, and band.
     let (spec, scales) = fit
@@ -282,7 +358,7 @@ fn measure_jet_bridges_gap_with_trend_not_mean() {
         .collect();
     assert!(in_gap.len() >= 60, "gap sample unexpectedly thin");
 
-    let pred = fit_and_predict(MJS_FORMULA, &data, &in_gap);
+    let pred = fit_and_predict(MJS_FORMULA, &data, &in_gap, "gaussian");
 
     // Fitted slope across the gap: least-squares regression of prediction on
     // arc-length (= t along B), compared to the flank-attested truth slope.
@@ -323,5 +399,93 @@ fn measure_jet_bridges_gap_with_trend_not_mean() {
     assert!(
         mad_pred >= 0.5 * mad_truth,
         "gap predictions collapse toward the training mean: MAD {mad_pred:.3} vs truth MAD {mad_truth:.3}"
+    );
+}
+
+/// GLM e2e: the measure-jet penalty must compose with PIRLS/REML for a
+/// non-gaussian family. Same Y-web geometry, count response
+/// y ~ Poisson(exp(η)) with η = POISSON_ETA_SCALE · (arc-length truth), scored
+/// on the η (log-intensity) scale at held-out off-gap points — applying the
+/// frozen design to β yields η directly, the same scale the truth lives on
+/// (the convention every non-gaussian quality test in this suite uses).
+#[test]
+fn measure_jet_poisson_intensity_on_web() {
+    init_parallelism();
+    // Same geometry seed as the gaussian arms; counts get their own stream.
+    let train_points = sample_web(400, 41, true); // ~1.07k rows after the gap cut (≤ 1500)
+    let data = encode_poisson_training(&train_points, 45);
+    // Held-out web draws OUTSIDE the gap (gap extrapolation is gated by the
+    // gaussian bridge test; this gate isolates the GLM composition).
+    let test: Vec<WebPoint> = sample_web(140, 43, true);
+
+    let pred = fit_and_predict(MJS_FORMULA, &data, &test, "poisson");
+    let eta_rmse = rmse_vs_truth(&pred, &test, POISSON_ETA_SCALE);
+
+    // Bound: η ∈ [0, 1.5] ⇒ μ = e^η ∈ [1, ~4.5]; the per-observation Fisher
+    // information on the η scale is μ, so the raw per-point η noise is
+    // 1/√μ ≈ 0.47–1.0. With ~1.1k training counts over a 1-D intrinsic web,
+    // REML smoothing concentrates that noise into a per-point estimator error
+    // of roughly sd·√(edf/n) ≈ 0.1, so 0.5 is ~5× the effective per-point
+    // noise — generous against seed luck, yet well below the raw noise floor
+    // and far below the 1.5 signal span, so a broken PIRLS/REML composition
+    // (wrong link gradient, penalty desync, working-weight drift) cannot pass.
+    assert!(
+        eta_rmse <= 0.5,
+        "measure-jet poisson log-intensity recovery too weak: η-RMSE {eta_rmse:.4} vs bound 0.5"
+    );
+}
+
+/// Interval honesty e2e: pointwise 95% bands from the fit's PUBLIC
+/// smoothing-corrected coefficient covariance Vp (`beta_covariance_corrected`,
+/// the mgcv `predict(se.fit = TRUE)` analog used across the CI quality suite)
+/// must approximately cover the TRUE mean at held-out on-web points.
+#[test]
+fn measure_jet_interval_coverage_on_web() {
+    init_parallelism();
+    let train_points = sample_web(400, 41, true);
+    let data = encode_training(&train_points, 42);
+    // Held-out ON-WEB points outside the gap: coverage is a claim about
+    // interpolation honesty; gap extrapolation has its own (bias) gate.
+    let test: Vec<WebPoint> = sample_web(140, 46, true);
+
+    let fit = fit_web(MJS_FORMULA, &data, "gaussian");
+    let m = ambient_matrix(&data, &test);
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
+        .expect("rebuild design from frozen spec");
+    let pred = design.design.apply(&fit.fit.beta);
+    let dense = design.design.to_dense();
+
+    // Vp propagates smoothing-parameter uncertainty into the band; it is the
+    // covariance the rest of the CI quality suite gates coverage on. If the
+    // measure-jet path fails to populate it, that is an honest red, not a
+    // reason to fall back to a weaker object.
+    let vp = fit
+        .fit
+        .beta_covariance_corrected()
+        .expect("standard gaussian fit exposes the smoothing-corrected covariance Vp");
+    let se = pointwise_se(dense.view(), vp);
+
+    let mut hits = 0usize;
+    for ((p, s), q) in pred.iter().zip(se.iter()).zip(test.iter()) {
+        if q.truth >= p - Z_95 * s && q.truth <= p + Z_95 * s {
+            hits += 1;
+        }
+    }
+    let coverage = hits as f64 / test.len() as f64;
+
+    // Window [0.85, 0.995] around the 0.95 nominal: all ~390 trials share ONE
+    // fitted curve and ONE noise draw, so they are strongly correlated and the
+    // empirical rate is far noisier than a binomial count would suggest. The
+    // 0.85 floor still rejects systematically small SEs (a Vp that drops the
+    // measure-jet block or the smoothing-variance term under-covers by far
+    // more than 10 nominal points); the 0.995 ceiling permits the mild
+    // conservatism penalized/Bayesian bands legitimately show where smoothing
+    // bias is small (Nychka 1988; Marra & Wood 2012) while still rejecting
+    // grossly inflated SEs that would cover everything.
+    assert!(
+        (0.85..=0.995).contains(&coverage),
+        "measure-jet 95% interval coverage {coverage:.4} outside the honest window [0.85, 0.995] \
+         ({hits}/{} held-out on-web points)",
+        test.len()
     );
 }

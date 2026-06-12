@@ -165,6 +165,7 @@ from .smooth import (
     Duchon,
     LatentCoord,
     Matern,
+    MeasureJet,
     Pca,
     PeriodicSplineCurve,
     ShapeConstraintLiteral,

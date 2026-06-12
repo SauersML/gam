@@ -41,8 +41,9 @@ def _smooth_kind_name(cls: type) -> str:
     """Map a ``Smooth`` subclass to its canonical Rust ``kind`` discriminator.
 
     The discriminator is the same string the formula DSL uses as the
-    smooth-term head (``duchon``, ``matern``, ``sphere``, ``bspline``,
-    ``tensor_bspline``, ``pca``, ``periodic_spline_curve``, ``categorical``).
+    smooth-term head (``duchon``, ``matern``, ``measurejet``, ``sphere``,
+    ``bspline``, ``tensor_bspline``, ``pca``, ``periodic_spline_curve``,
+    ``categorical``).
     Used by :meth:`Smooth.to_rust_descriptor` so the Rust bridge can match a
     descriptor against the formula-DSL smooth that names the same symbol.
     """
@@ -457,6 +458,80 @@ class Matern(Smooth):
         return out
 
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
+
+
+@dataclass(slots=True)
+class MeasureJet(Smooth):
+    """Measure-jet spline (formula head ``mjs(x0, …, xd)``). Multi-d.
+
+    Penalizes the multiscale local-jet-residual energy of the empirical
+    measure: at every scale the fitted function is compared against its best
+    local affine jet under the data's own sampling measure, so the smoother
+    learns the geometry from data concentrated near an unknown
+    low-dimensional (possibly stratified) set — centers as quadrature nodes,
+    masses as μ-weights, local jet residuals as the roughness carrier, with
+    no graph, mesh, or neighbor-set inside the statistical object. Every
+    option is auto-derived from the data when omitted; set a field only to
+    pin it.
+
+    Parameters
+    ----------
+    centers : optional array-like ``(K, d)`` with ``K ≥ 3`` — explicit
+        center coordinates (quadrature nodes of the empirical measure).
+        Routes through ``CenterStrategy::UserProvided``.
+    n_centers : optional int ``≥ 3`` — number of farthest-point-sampled
+        centers when ``centers`` is omitted.
+    s : optional float in ``(0, 2)`` — continuous smoothness order of the
+        affine-jet energy.
+    alpha : optional finite float — density-normalization exponent (outer
+        weight ``q^(1−2α)``).
+    tau : optional float ``≥ 0`` — dimensionless jet-ridge floor on the
+        local slope Gram; ``0`` selects the exact pseudo-inverse.
+    scales : optional int — number of scale nodes in the multiscale band.
+    length_scale : optional positive float — representer (Gaussian RBF)
+        range.
+    double_penalty : optional bool — add the ridge-like shrinkage penalty
+        alongside the jet-energy penalty. ``None`` defers to the engine
+        default (on); pass ``False`` to disable it explicitly.
+    """
+
+    centers: Any = None
+    n_centers: int | None = None
+    s: float | None = None
+    alpha: float | None = None
+    tau: float | None = None
+    scales: int | None = None
+    length_scale: float | None = None
+    # Tri-state override of the base ``bool = False`` field: the engine
+    # default for measure-jet is double-penalty ON, so ``None`` must mean
+    # "defer to the engine" and an explicit ``False`` must be emitted.
+    double_penalty: bool | None = None
+
+    # MeasureJet is a formula-path smooth consumed by the Rust core (the
+    # ``mjs(...)`` head plus the ``smooths=`` override bridge); it has no
+    # Python-side basis evaluator. The empty set is the honest contract:
+    # there are no `_evaluate_<backend>` paths to advertise.
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset()
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        out = super().to_rust_descriptor()
+        if self.centers is not None:
+            out["centers"] = _array_to_list(self.centers)
+        if self.n_centers is not None:
+            out["n_centers"] = int(self.n_centers)
+        if self.s is not None:
+            out["s"] = float(self.s)
+        if self.alpha is not None:
+            out["alpha"] = float(self.alpha)
+        if self.tau is not None:
+            out["tau"] = float(self.tau)
+        if self.scales is not None:
+            out["scales"] = int(self.scales)
+        if self.length_scale is not None:
+            out["length_scale"] = float(self.length_scale)
+        if self.double_penalty is not None:
+            out["double_penalty"] = bool(self.double_penalty)
+        return out
 
 
 @dataclass(init=False, slots=True)
@@ -903,6 +978,7 @@ __all__ = [
     "BSpline",
     "TensorBSpline",
     "Matern",
+    "MeasureJet",
     "Pca",
     "Sphere",
     "Categorical",
