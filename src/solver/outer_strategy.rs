@@ -1262,11 +1262,12 @@ pub enum HessianSource {
 
 /// Requested derivative order for an outer objective evaluation.
 ///
-/// Cost-only paths continue to use [`OuterObjective::eval_cost`]. This enum is
-/// for the shared `eval` bridge where the runner needs either first-order or
-/// second-order information depending on the active plan.
+/// This enum is for the shared `eval` bridge where the runner needs value-only,
+/// first-order, or second-order information depending on the active plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OuterEvalOrder {
+    /// Compute only the objective value.
+    Value,
     /// Compute value and gradient only.
     ValueAndGradient,
     /// Compute value, gradient, and analytic Hessian when available.
@@ -1946,7 +1947,8 @@ pub trait OuterObjective {
 
     /// Evaluate the outer objective at the order requested by the active plan.
     ///
-    /// The default preserves legacy behavior by delegating to
+    /// The default preserves legacy behavior by delegating value-only requests
+    /// to [`OuterObjective::eval_cost`] and derivative requests to
     /// [`OuterObjective::eval`].
     fn eval_with_order(
         &mut self,
@@ -1954,6 +1956,15 @@ pub trait OuterObjective {
         order: OuterEvalOrder,
     ) -> Result<OuterEval, EstimationError> {
         match order {
+            OuterEvalOrder::Value => {
+                let cost = self.eval_cost(rho)?;
+                Ok(OuterEval {
+                    cost,
+                    gradient: Array1::zeros(rho.len()),
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
+            }
             OuterEvalOrder::ValueAndGradient | OuterEvalOrder::ValueGradientHessian => {
                 self.eval(rho)
             }
@@ -2680,6 +2691,28 @@ struct OuterFirstOrderBridge<'a> {
     /// cap conservatively LARGER than the truly-needed value, never
     /// smaller.
     last_g_norm: Option<f64>,
+    /// Most recent derivative-evaluation point. Value-only line-search probes
+    /// log their distance from this reference so hidden backtracking work is
+    /// visible in STAGE traces.
+    last_value_grad_rho: Option<Array1<f64>>,
+}
+
+fn trial_rho_distance(reference: Option<&Array1<f64>>, trial: &Array1<f64>) -> f64 {
+    let Some(reference) = reference else {
+        return f64::NAN;
+    };
+    if reference.len() != trial.len() {
+        return f64::NAN;
+    }
+    reference
+        .iter()
+        .zip(trial.iter())
+        .map(|(a, b)| {
+            let d = b - a;
+            d * d
+        })
+        .sum::<f64>()
+        .sqrt()
 }
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
@@ -2704,11 +2737,27 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
-        let cost = self
+        let trial_rho_distance = trial_rho_distance(self.last_value_grad_rho.as_ref(), x);
+        let stage_start = std::time::Instant::now();
+        log::info!(
+            "[STAGE] outer eval start order=Value dim={} trial_rho_distance={:.3e} (first-order bridge, iter={})",
+            x.len(),
+            trial_rho_distance,
+            self.iter_count
+        );
+        let eval = self
             .obj
-            .eval_cost(x)
+            .eval_with_order(x, OuterEvalOrder::Value)
             .map_err(|err| into_objective_error("outer eval_cost failed", err))?;
-        finite_cost_or_error("outer eval_cost failed", cost)
+        let cost = finite_cost_or_error("outer eval_cost failed", eval.cost)?;
+        log::info!(
+            "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, iter={})",
+            stage_start.elapsed().as_secs_f64(),
+            cost,
+            trial_rho_distance,
+            self.iter_count
+        );
+        Ok(cost)
     }
 }
 
@@ -2781,6 +2830,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         if g_norm.is_finite() {
             self.last_g_norm = Some(g_norm);
         }
+        self.last_value_grad_rho = Some(x.clone());
         log::info!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge, iter={})",
             stage_start.elapsed().as_secs_f64(),
@@ -3311,6 +3361,9 @@ struct OuterSecondOrderBridge<'a> {
     /// the staleness rationale: monotone-decreasing g_norm means the cap
     /// is conservatively LARGER than truly needed, never smaller.
     last_g_norm: Option<f64>,
+    /// Most recent derivative-evaluation point, used to log value-probe
+    /// displacement in line-search / trial-acceptance STAGE traces.
+    last_value_grad_rho: Option<Array1<f64>>,
 }
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
@@ -3330,11 +3383,25 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
         }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
-        let cost = self
+        let trial_rho_distance = trial_rho_distance(self.last_value_grad_rho.as_ref(), x);
+        let stage_start = std::time::Instant::now();
+        log::info!(
+            "[STAGE] outer eval start order=Value dim={} trial_rho_distance={:.3e}",
+            x.len(),
+            trial_rho_distance
+        );
+        let eval = self
             .obj
-            .eval_cost(x)
+            .eval_with_order(x, OuterEvalOrder::Value)
             .map_err(|err| into_objective_error("outer eval_cost failed", err))?;
-        finite_cost_or_error("outer eval_cost failed", cost)
+        let cost = finite_cost_or_error("outer eval_cost failed", eval.cost)?;
+        log::info!(
+            "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e}",
+            stage_start.elapsed().as_secs_f64(),
+            cost,
+            trial_rho_distance
+        );
+        Ok(cost)
     }
 }
 
@@ -3409,6 +3476,7 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
         if g_norm.is_finite() {
             self.last_g_norm = Some(g_norm);
         }
+        self.last_value_grad_rho = Some(x.clone());
         log::info!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e}",
             stage_start.elapsed().as_secs_f64(),
@@ -3504,6 +3572,7 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         if g_norm.is_finite() {
             self.last_g_norm = Some(g_norm);
         }
+        self.last_value_grad_rho = Some(x.clone());
         log::info!(
             "[STAGE] outer eval end order=ValueGradientHessian elapsed={:.3}s cost={:.6e} |g|={:.3e}",
             stage_start.elapsed().as_secs_f64(),
@@ -3661,6 +3730,9 @@ struct OuterOperatorBridge<'a> {
     g_norm_initial: Option<f64>,
     /// `‖g‖` from the most recent eval.
     last_g_norm: Option<f64>,
+    /// Most recent derivative-evaluation point, used to log value-probe
+    /// displacement in line-search STAGE traces.
+    last_value_grad_rho: Option<Array1<f64>>,
 }
 
 impl ZerothOrderObjective for OuterOperatorBridge<'_> {
@@ -3680,11 +3752,25 @@ impl ZerothOrderObjective for OuterOperatorBridge<'_> {
         }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
-        let cost = self
+        let trial_rho_distance = trial_rho_distance(self.last_value_grad_rho.as_ref(), x);
+        let stage_start = std::time::Instant::now();
+        log::info!(
+            "[STAGE] outer eval start order=Value dim={} trial_rho_distance={:.3e} (operator bridge)",
+            x.len(),
+            trial_rho_distance
+        );
+        let eval = self
             .obj
-            .eval_cost(x)
+            .eval_with_order(x, OuterEvalOrder::Value)
             .map_err(|err| into_objective_error("outer eval_cost failed", err))?;
-        finite_cost_or_error("outer eval_cost failed", cost)
+        let cost = finite_cost_or_error("outer eval_cost failed", eval.cost)?;
+        log::info!(
+            "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (operator bridge)",
+            stage_start.elapsed().as_secs_f64(),
+            cost,
+            trial_rho_distance
+        );
+        Ok(cost)
     }
 }
 
@@ -3703,6 +3789,7 @@ impl FirstOrderObjective for OuterOperatorBridge<'_> {
         if g_norm.is_finite() {
             self.last_g_norm = Some(g_norm);
         }
+        self.last_value_grad_rho = Some(x.clone());
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -3752,6 +3839,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
         if g_norm.is_finite() {
             self.last_g_norm = Some(g_norm);
         }
+        self.last_value_grad_rho = Some(x.clone());
         log::info!(
             "[STAGE] outer eval end elapsed={:.3}s cost={:.6e} |g|={:.3e} (operator bridge)",
             stage_start.elapsed().as_secs_f64(),
@@ -6905,6 +6993,7 @@ fn run_outer_with_plan(
                         eval_count: 0,
                         g_norm_initial: None,
                         last_g_norm: None,
+                        last_value_grad_rho: None,
                     };
 
                     let mut solver = MatrixFreeTrustRegion::new(seed.clone(), bridge_obj)
@@ -7036,6 +7125,7 @@ fn run_outer_with_plan(
                         outer_inner_cap: config.outer_inner_cap.clone(),
                         g_norm_initial: None,
                         last_g_norm: None,
+                        last_value_grad_rho: None,
                     };
 
                     // Build the opt seed sample from the precomputed
@@ -7326,6 +7416,7 @@ fn run_outer_with_plan(
                         iter_count: 0,
                         g_norm_initial: None,
                         last_g_norm: None,
+                        last_value_grad_rho: None,
                     };
                     // Hand the precomputed (cost, gradient) seed eval to
                     // `opt::Bfgs` so its first internal `eval_grad` call is
@@ -8751,8 +8842,12 @@ mod tests {
         assert!(
             seen_orders
                 .iter()
-                .all(|order| *order == OuterEvalOrder::ValueAndGradient),
-            "BFGS should request only value+gradient, saw {seen_orders:?}"
+                .all(|order| *order != OuterEvalOrder::ValueGradientHessian),
+            "BFGS must not request Hessian work, saw {seen_orders:?}"
+        );
+        assert!(
+            seen_orders.contains(&OuterEvalOrder::ValueAndGradient),
+            "BFGS should request value+gradient at accepted points, saw {seen_orders:?}"
         );
     }
 
@@ -8800,6 +8895,7 @@ mod tests {
             iter_count: 0,
             g_norm_initial: None,
             last_g_norm: None,
+            last_value_grad_rho: None,
         };
 
         let first = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
@@ -8841,6 +8937,7 @@ mod tests {
                         cost: theta[0] * theta[0],
                         gradient: array![2.0 * theta[0]],
                         hessian: match order {
+                            OuterEvalOrder::Value => HessianResult::Unavailable,
                             OuterEvalOrder::ValueAndGradient => HessianResult::Unavailable,
                             OuterEvalOrder::ValueGradientHessian => {
                                 HessianResult::Analytic(array![[2.0]])
@@ -8862,6 +8959,7 @@ mod tests {
             outer_inner_cap: None,
             g_norm_initial: None,
             last_g_norm: None,
+            last_value_grad_rho: None,
         };
         let grad_sample =
             FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
@@ -8923,6 +9021,7 @@ mod tests {
             outer_inner_cap: None,
             g_norm_initial: None,
             last_g_norm: None,
+            last_value_grad_rho: None,
         };
         let err = SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0])
             .expect_err("Analytic route must reject Unavailable Hessian, not pass None to opt");
