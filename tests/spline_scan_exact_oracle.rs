@@ -7,8 +7,43 @@
 
 use gam::solver::spline_scan::{fit_spline_scan, fit_spline_scan_at};
 
-/// Dense in-test Gaussian elimination solve A·X = B (partial pivoting).
+/// Dense in-test Gaussian elimination solve A·X = B (partial pivoting), with
+/// one pass of iterative refinement.
+///
+/// The joint state precision Λ at moderate λ carries Q(δ)⁻¹ blocks of size
+/// ~1/(q·δ³); at the test's spacing the condition number reaches ~1e8–1e9, so
+/// a bare Gauss–Jordan answer has relative error up to ε·κ(Λ) ≈ 1e-8–1e-7 —
+/// LARGER than this oracle's machine-precision gate (the scan side, built
+/// from sequential well-conditioned 2×2 ops, does not share that budget).
+/// One refinement step (residual against the ORIGINAL Λ, correction through
+/// the same elimination) restores the oracle to near-ε accuracy whenever
+/// ε·κ ≪ 1, which holds here — strengthening the truth instead of loosening
+/// the gate.
 fn dense_solve(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let mut x = dense_solve_once(a, b);
+    let n = a.len();
+    let m = b[0].len();
+    // Residual R = B − A·X̂ against the ORIGINAL matrix, then X̂ += A⁻¹R.
+    let mut residual = vec![vec![0.0_f64; m]; n];
+    for i in 0..n {
+        for j in 0..m {
+            let mut ax = 0.0;
+            for k in 0..n {
+                ax += a[i][k] * x[k][j];
+            }
+            residual[i][j] = b[i][j] - ax;
+        }
+    }
+    let correction = dense_solve_once(a, &residual);
+    for i in 0..n {
+        for j in 0..m {
+            x[i][j] += correction[i][j];
+        }
+    }
+    x
+}
+
+fn dense_solve_once(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let n = a.len();
     let m = b[0].len();
     let mut aug: Vec<Vec<f64>> = (0..n)
