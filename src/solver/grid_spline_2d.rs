@@ -1,0 +1,668 @@
+//! Streaming scatter-add 2-D smoother: K×K tensor-product cubic B-splines
+//! with the EXACT anisotropic biharmonic penalty and REML-selected λ.
+//!
+//! Basis. Each axis carries K equal-width cells over the data's bounding box
+//! `[lo, hi]` with uniform extended knots `t_j = lo + (j−3)·h`, `h = (hi−lo)/K`,
+//! giving `m = K+3` cubic B-splines per axis; the tensor product has
+//! `p = (K+3)²` coefficients. A point in cell `i` activates exactly the four
+//! splines `i..i+3` per axis, hence exactly 4×4 = 16 tensor basis entries per
+//! data row.
+//!
+//! Streaming normal equations. ONE pass over the rows `(x1, x2, y, w)`
+//! scatter-adds `X'WX` and `X'Wy`: O(n·16²) work, no n×p design is ever
+//! materialized. Two tensor bases overlap only when both per-axis indices
+//! differ by ≤ 3, so under the row-major coefficient index
+//! `g = j1·(K+3) + j2` both `X'WX` and the penalty `S` are banded with
+//! half-bandwidth `3(K+3)+3`; they are stored as upper bands — O(K³) numbers.
+//!
+//! Penalty. The FULL anisotropic biharmonic form for the diagonal metric
+//! `A = diag(a1, a2)`,
+//!   `J(f) = ∫∫ a1²·f_{x1x1}² + 2·a1·a2·f_{x1x2}² + a2²·f_{x2x2}²  dx1 dx2`,
+//! INCLUDING the mixed `f_{x1x2}` term (the axis-wise P-spline difference
+//! shortcut drops it), assembled per knot cell by 4-point Gauss–Legendre per
+//! axis. Exactness degree arithmetic: on a knot cell every basis function is
+//! a single cubic polynomial per axis, so each entry of `S` is a sum over
+//! cells of integrands that factorize per axis as one of value·value
+//! (degree 3+3 = 6), deriv·deriv (2+2 = 4) or 2nd-deriv·2nd-deriv (1+1 = 2);
+//! every channel pairs a low-degree factor on one axis with at worst the
+//! degree-6 value·value factor on the other. 4-point Gauss–Legendre is exact
+//! through degree 2·4−1 = 7 ≥ 6, so the assembled `S` is the EXACT integral,
+//! not a quadrature approximation.
+//!
+//! Solve and selection. For a trial λ the bands are expanded and
+//! `(X'WX + λS)c = X'Wy` is solved by dense Cholesky with the exact
+//! log-determinant read off the factor. `p ≤ (32+3)² = 1225`, so the O(p³)
+//! factorization costs ≲ 1 Gflop per trial and the retained factor is ≤ 12 MB;
+//! K is capped at 32 to keep that sizing contract honest. λ maximizes the
+//! profiled-σ² restricted (REML) criterion
+//!   `ℓ_R(λ) = −½[ log|X'WX+λS| − r·log λ + (n−3)·log σ̂²(λ) ] + const`,
+//! where `r = p−3` is the penalty rank — the null space of `J` is
+//! span{1, x1, x2} (the mixed term penalizes `x1·x2`, whose cross derivative
+//! is 1 ≠ 0, so it is NOT in the null space), `σ̂²(λ) = (y'Wy − c'X'Wy)/(n−3)`
+//! is the profiled scale, and the λ-free additive constants (`log|S|₊` on the
+//! row space of S, `Σ log w`, 2π factors) are dropped: differences across λ
+//! are exact REML criterion differences. Selection is the same deterministic
+//! coarse-grid + golden-section scheme as `spline_scan` — no RNG, same data ⇒
+//! same fit.
+//!
+//! Prediction. `predict(x1, x2)` builds the 16-entry basis row; the mean is
+//! its dot with `c` and the variance is the Bayesian posterior
+//! `σ̂²·x'(X'WX+λS)⁻¹x` through the retained Cholesky factor. Outside the
+//! bounding box the boundary cell's cubic polynomial extends naturally (the
+//! cell index clamps, the local coordinate does not).
+
+/// Dimension of the penalty null space: span{1, x1, x2}. The mixed
+/// `2·a1·a2·f_{x1x2}²` term excludes `x1·x2` (its cross derivative is 1).
+const PENALTY_NULLITY: usize = 3;
+
+/// Deterministic coarse-grid width for the log-λ search.
+const LOG_LAMBDA_GRID: usize = 25;
+/// Search interval for log λ (natural log), generous on both sides.
+const LOG_LAMBDA_LO: f64 = -18.0;
+const LOG_LAMBDA_HI: f64 = 18.0;
+/// Golden-section refinement tolerance on log λ.
+const LOG_LAMBDA_TOL: f64 = 1e-7;
+/// Cholesky pivot floor below which the penalized system is declared singular.
+const PIVOT_FLOOR: f64 = 1e-300;
+/// Dense-Cholesky sizing contract documented in the module header.
+const MAX_CELLS_PER_AXIS: usize = 32;
+
+/// 4-point Gauss–Legendre nodes and weights on [−1, 1]. Exact through degree
+/// 2·4−1 = 7, which dominates the degree-6 worst per-axis factor of the
+/// penalty integrands (see the module header for the degree arithmetic).
+const GL4_NODES: [f64; 4] = [
+    -0.861_136_311_594_052_6,
+    -0.339_981_043_584_856_26,
+    0.339_981_043_584_856_26,
+    0.861_136_311_594_052_6,
+];
+const GL4_WEIGHTS: [f64; 4] = [
+    0.347_854_845_137_453_85,
+    0.652_145_154_862_546_2,
+    0.652_145_154_862_546_2,
+    0.347_854_845_137_453_85,
+];
+
+/// Cubic B-spline segment values at local coordinate `u` within a cell.
+/// Entry `m` weights basis `cell + m`: m = 0 is the spline ENDING in this
+/// cell (`(1−u)³/6`), m = 3 the one STARTING (`u³/6`). The four entries sum
+/// to 1 (partition of unity) for u ∈ [0, 1].
+#[inline]
+fn bspline_value(u: f64) -> [f64; 4] {
+    let v = 1.0 - u;
+    [
+        v * v * v / 6.0,
+        (3.0 * u * u * u - 6.0 * u * u + 4.0) / 6.0,
+        (-3.0 * u * u * u + 3.0 * u * u + 3.0 * u + 1.0) / 6.0,
+        u * u * u / 6.0,
+    ]
+}
+
+/// d/du of `bspline_value` (caller scales by 1/h for d/dx). Entries sum to 0.
+#[inline]
+fn bspline_d1(u: f64) -> [f64; 4] {
+    let v = 1.0 - u;
+    [
+        -0.5 * v * v,
+        0.5 * (3.0 * u * u - 4.0 * u),
+        0.5 * (-3.0 * u * u + 2.0 * u + 1.0),
+        0.5 * u * u,
+    ]
+}
+
+/// d²/du² of `bspline_value` (caller scales by 1/h²). Piecewise LINEAR in u —
+/// the degree-1 factor in the quadrature-exactness argument. Entries sum to 0.
+#[inline]
+fn bspline_d2(u: f64) -> [f64; 4] {
+    [1.0 - u, 3.0 * u - 2.0, 1.0 - 3.0 * u, u]
+}
+
+/// One uniform B-spline axis over `[lo, lo + cells·h]`.
+#[derive(Clone, Copy)]
+struct Axis {
+    lo: f64,
+    h: f64,
+    cells: usize,
+}
+
+impl Axis {
+    /// Cell index and local coordinate. Inside the box `u ∈ [0, 1]`; outside,
+    /// the cell clamps and `u` leaves [0, 1], extending the boundary cell's
+    /// cubic polynomial (deterministic extrapolation, no special casing).
+    #[inline]
+    fn locate(&self, x: f64) -> (usize, f64) {
+        let t = (x - self.lo) / self.h;
+        let cell = (t.floor().max(0.0) as usize).min(self.cells - 1);
+        (cell, t - cell as f64)
+    }
+}
+
+/// The 16 active tensor-basis entries `(flat index, value)` at `(x1, x2)`.
+/// Flat indices are strictly increasing across the returned arrays.
+#[inline]
+fn basis_row(axes: &[Axis; 2], m_axis: usize, x1: f64, x2: f64) -> ([usize; 16], [f64; 16]) {
+    let (c1, u1) = axes[0].locate(x1);
+    let (c2, u2) = axes[1].locate(x2);
+    let b1 = bspline_value(u1);
+    let b2 = bspline_value(u2);
+    let mut idx = [0usize; 16];
+    let mut val = [0f64; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            idx[4 * i + j] = (c1 + i) * m_axis + (c2 + j);
+            val[4 * i + j] = b1[i] * b2[j];
+        }
+    }
+    (idx, val)
+}
+
+/// Dense lower-Cholesky in place (row-major `p×p`); returns the exact
+/// `log det` (twice the log of the pivot products). The strict upper triangle
+/// is zeroed so the buffer is exactly `L` afterwards.
+fn cholesky_logdet(a: &mut [f64], p: usize) -> Result<f64, String> {
+    let mut logdet = 0.0;
+    for j in 0..p {
+        let mut s = a[j * p + j];
+        for t in 0..j {
+            s -= a[j * p + t] * a[j * p + t];
+        }
+        if !(s.is_finite() && s > PIVOT_FLOOR) {
+            return Err(format!(
+                "grid spline 2d: penalized system not positive definite at pivot {j} (value {s})"
+            ));
+        }
+        let l = s.sqrt();
+        a[j * p + j] = l;
+        logdet += 2.0 * l.ln();
+        for i in j + 1..p {
+            let mut s2 = a[i * p + j];
+            for t in 0..j {
+                s2 -= a[i * p + t] * a[j * p + t];
+            }
+            a[i * p + j] = s2 / l;
+        }
+    }
+    for i in 0..p {
+        for j in i + 1..p {
+            a[i * p + j] = 0.0;
+        }
+    }
+    Ok(logdet)
+}
+
+/// Solve `L Lᵀ x = b` from the stored lower factor.
+fn chol_solve(l: &[f64], p: usize, b: &[f64]) -> Vec<f64> {
+    let mut z = b.to_vec();
+    for i in 0..p {
+        let mut s = z[i];
+        for t in 0..i {
+            s -= l[i * p + t] * z[t];
+        }
+        z[i] = s / l[i * p + i];
+    }
+    for i in (0..p).rev() {
+        let mut s = z[i];
+        for t in i + 1..p {
+            s -= l[t * p + i] * z[t];
+        }
+        z[i] = s / l[i * p + i];
+    }
+    z
+}
+
+/// Banded sufficient statistics of one streaming pass plus the exact penalty:
+/// everything needed to evaluate the REML criterion and solve at any λ.
+pub struct GridSpline2dDesign {
+    axes: [Axis; 2],
+    /// Basis count per axis, `K + 3`.
+    m_axis: usize,
+    /// Total coefficients, `(K + 3)²`.
+    p: usize,
+    /// Upper half-bandwidth `3·(K+3) + 3` of both banded matrices.
+    band_half: usize,
+    /// Upper band of `X'WX`: entry `(g, g+d)` at `g·(band_half+1) + d`.
+    gram_band: Vec<f64>,
+    /// Upper band of the exact anisotropic biharmonic penalty `S`.
+    pen_band: Vec<f64>,
+    /// `X'Wy`.
+    rhs: Vec<f64>,
+    /// `y'Wy`, for the profiled-σ² residual quadratic.
+    ytwy: f64,
+    n_obs: usize,
+}
+
+/// Internal solve product at one λ.
+struct Solved {
+    chol: Vec<f64>,
+    logdet: f64,
+    coeff: Vec<f64>,
+    /// Penalized residual quadratic `y'Wy − c'X'Wy` =
+    /// `‖√W(y − Xc)‖² + λ c'Sc` at the minimizer.
+    rss_pen: f64,
+}
+
+impl GridSpline2dDesign {
+    /// One streaming pass over the rows plus the exact per-cell quadrature
+    /// assembly of the penalty. `k` is the number of cells per axis;
+    /// `metric = [a1, a2]` is the diagonal anisotropy of the biharmonic form.
+    pub fn build(
+        x1: &[f64],
+        x2: &[f64],
+        y: &[f64],
+        w: &[f64],
+        k: usize,
+        metric: [f64; 2],
+    ) -> Result<Self, String> {
+        let n = x1.len();
+        if x2.len() != n || y.len() != n || w.len() != n {
+            return Err(format!(
+                "grid spline 2d: length mismatch x1={n}, x2={}, y={}, w={}",
+                x2.len(),
+                y.len(),
+                w.len()
+            ));
+        }
+        if n <= PENALTY_NULLITY {
+            return Err(format!(
+                "grid spline 2d: needs more than {PENALTY_NULLITY} rows for the profiled REML \
+                 degrees of freedom, got {n}"
+            ));
+        }
+        if k == 0 || k > MAX_CELLS_PER_AXIS {
+            return Err(format!(
+                "grid spline 2d: k must be in 1..={MAX_CELLS_PER_AXIS} (dense Cholesky on \
+                 (k+3)² coefficients — see module sizing contract), got {k}"
+            ));
+        }
+        if !(metric[0].is_finite() && metric[0] > 0.0 && metric[1].is_finite() && metric[1] > 0.0)
+        {
+            return Err(format!(
+                "grid spline 2d: metric diagonal must be finite and positive, got [{}, {}]",
+                metric[0], metric[1]
+            ));
+        }
+        for i in 0..n {
+            if !(x1[i].is_finite() && x2[i].is_finite() && y[i].is_finite()) || !(w[i] > 0.0) {
+                return Err(format!(
+                    "grid spline 2d: non-finite or non-positive input at row {i} \
+                     (x1={}, x2={}, y={}, w={})",
+                    x1[i], x2[i], y[i], w[i]
+                ));
+            }
+            if !w[i].is_finite() {
+                return Err(format!("grid spline 2d: non-finite weight at row {i}"));
+            }
+        }
+        let mut axes = [Axis {
+            lo: 0.0,
+            h: 1.0,
+            cells: k,
+        }; 2];
+        for (axis, xs) in axes.iter_mut().zip([x1, x2]) {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for &v in xs {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            if !(hi > lo) {
+                return Err(format!(
+                    "grid spline 2d: degenerate axis bounding box [{lo}, {hi}]"
+                ));
+            }
+            axis.lo = lo;
+            axis.h = (hi - lo) / k as f64;
+        }
+        let m_axis = k + 3;
+        let p = m_axis * m_axis;
+        let band_half = 3 * m_axis + 3;
+        let stride = band_half + 1;
+        let mut gram_band = vec![0.0_f64; p * stride];
+        let mut rhs = vec![0.0_f64; p];
+        let mut ytwy = 0.0_f64;
+
+        // ── ONE streaming pass: scatter-add X'WX (upper band) and X'Wy ──
+        // Each row touches exactly 16 basis entries with strictly increasing
+        // flat indices, so the in-row pair loop (a ≤ b) lands directly in the
+        // upper band: O(n·16²) total work.
+        for i in 0..n {
+            let (idx, val) = basis_row(&axes, m_axis, x1[i], x2[i]);
+            let wi = w[i];
+            for e in 0..16 {
+                rhs[idx[e]] += wi * y[i] * val[e];
+            }
+            ytwy += wi * y[i] * y[i];
+            for a in 0..16 {
+                let base = idx[a] * stride - idx[a];
+                let wa = wi * val[a];
+                for b in a..16 {
+                    gram_band[base + idx[b]] += wa * val[b];
+                }
+            }
+        }
+
+        // ── Exact penalty assembly: 4-pt Gauss–Legendre per axis per cell ──
+        // Per-axis quadrature tables (cell-independent on a uniform grid):
+        // values, d/dx (scaled 1/h), d²/dx² (scaled 1/h²) at each GL node.
+        let mut tab = [[[[0.0_f64; 4]; 4]; 3]; 2]; // [axis][channel][node][basis offset]
+        for ax in 0..2 {
+            let h = axes[ax].h;
+            for q in 0..4 {
+                let u = 0.5 * (1.0 + GL4_NODES[q]);
+                let v0 = bspline_value(u);
+                let v1 = bspline_d1(u);
+                let v2 = bspline_d2(u);
+                for e in 0..4 {
+                    tab[ax][0][q][e] = v0[e];
+                    tab[ax][1][q][e] = v1[e] / h;
+                    tab[ax][2][q][e] = v2[e] / (h * h);
+                }
+            }
+        }
+        // Channel scales: J = ∫ a1²·f11² + 2·a1·a2·f12² + a2²·f22².
+        let s11 = metric[0] * metric[0];
+        let s12 = 2.0 * metric[0] * metric[1];
+        let s22 = metric[1] * metric[1];
+        let cell_area_jac = 0.25 * axes[0].h * axes[1].h; // d(x1,x2)/d(ξ1,ξ2) on [−1,1]²
+        let mut pen_band = vec![0.0_f64; p * stride];
+        let mut r11 = [0.0_f64; 16];
+        let mut r12 = [0.0_f64; 16];
+        let mut r22 = [0.0_f64; 16];
+        let mut idx = [0usize; 16];
+        for c1 in 0..k {
+            for c2 in 0..k {
+                for i in 0..4 {
+                    for j in 0..4 {
+                        idx[4 * i + j] = (c1 + i) * m_axis + (c2 + j);
+                    }
+                }
+                for q1 in 0..4 {
+                    for q2 in 0..4 {
+                        let wq = cell_area_jac * GL4_WEIGHTS[q1] * GL4_WEIGHTS[q2];
+                        for i in 0..4 {
+                            for j in 0..4 {
+                                let e = 4 * i + j;
+                                r11[e] = tab[0][2][q1][i] * tab[1][0][q2][j];
+                                r12[e] = tab[0][1][q1][i] * tab[1][1][q2][j];
+                                r22[e] = tab[0][0][q1][i] * tab[1][2][q2][j];
+                            }
+                        }
+                        for a in 0..16 {
+                            let base = idx[a] * stride - idx[a];
+                            let (pa11, pa12, pa22) =
+                                (wq * s11 * r11[a], wq * s12 * r12[a], wq * s22 * r22[a]);
+                            for b in a..16 {
+                                pen_band[base + idx[b]] +=
+                                    pa11 * r11[b] + pa12 * r12[b] + pa22 * r22[b];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(GridSpline2dDesign {
+            axes,
+            m_axis,
+            p,
+            band_half,
+            gram_band,
+            pen_band,
+            rhs,
+            ytwy,
+            n_obs: n,
+        })
+    }
+
+    /// Number of cells per axis (the caller-supplied K).
+    pub fn num_cells(&self) -> usize {
+        self.axes[0].cells
+    }
+
+    /// Basis functions per axis, `K + 3`.
+    pub fn basis_per_axis(&self) -> usize {
+        self.m_axis
+    }
+
+    /// Total coefficient count `(K + 3)²`.
+    pub fn num_coeffs(&self) -> usize {
+        self.p
+    }
+
+    /// Lower corner of the data bounding box per axis.
+    pub fn lower_corner(&self) -> [f64; 2] {
+        [self.axes[0].lo, self.axes[1].lo]
+    }
+
+    /// Knot-cell width per axis.
+    pub fn cell_widths(&self) -> [f64; 2] {
+        [self.axes[0].h, self.axes[1].h]
+    }
+
+    /// Exact penalty quadratic form `J(f) = c'Sc` of a coefficient vector —
+    /// the assembled anisotropic biharmonic energy of the spline it encodes.
+    pub fn penalty_value(&self, coeff: &[f64]) -> Result<f64, String> {
+        if coeff.len() != self.p {
+            return Err(format!(
+                "grid spline 2d: coefficient length {} != {}",
+                coeff.len(),
+                self.p
+            ));
+        }
+        let stride = self.band_half + 1;
+        let mut j = 0.0;
+        for g in 0..self.p {
+            let dmax = self.band_half.min(self.p - 1 - g);
+            j += self.pen_band[g * stride] * coeff[g] * coeff[g];
+            for d in 1..=dmax {
+                j += 2.0 * self.pen_band[g * stride + d] * coeff[g] * coeff[g + d];
+            }
+        }
+        Ok(j)
+    }
+
+    /// Expand `X'WX + λS` from the bands to a dense symmetric matrix.
+    fn dense_system(&self, lambda: f64) -> Vec<f64> {
+        let p = self.p;
+        let stride = self.band_half + 1;
+        let mut a = vec![0.0_f64; p * p];
+        for g in 0..p {
+            let dmax = self.band_half.min(p - 1 - g);
+            for d in 0..=dmax {
+                let v = self.gram_band[g * stride + d] + lambda * self.pen_band[g * stride + d];
+                a[g * p + g + d] = v;
+                a[(g + d) * p + g] = v;
+            }
+        }
+        a
+    }
+
+    fn solve_at(&self, log_lambda: f64) -> Result<Solved, String> {
+        if !log_lambda.is_finite() {
+            return Err(format!("grid spline 2d: non-finite log lambda {log_lambda}"));
+        }
+        let mut a = self.dense_system(log_lambda.exp());
+        let logdet = cholesky_logdet(&mut a, self.p)?;
+        let coeff = chol_solve(&a, self.p, &self.rhs);
+        let mut quad = 0.0;
+        for g in 0..self.p {
+            quad += self.rhs[g] * coeff[g];
+        }
+        Ok(Solved {
+            chol: a,
+            logdet,
+            coeff,
+            rss_pen: self.ytwy - quad,
+        })
+    }
+
+    /// Profiled-σ² REML criterion at `log λ`, up to λ- and data-independent
+    /// additive constants (differences across λ are exact REML differences).
+    fn criterion(&self, log_lambda: f64) -> Result<f64, String> {
+        let solved = self.solve_at(log_lambda)?;
+        if !(solved.rss_pen > 0.0) {
+            return Err(format!(
+                "grid spline 2d: degenerate penalized residual {}",
+                solved.rss_pen
+            ));
+        }
+        let dof = (self.n_obs - PENALTY_NULLITY) as f64;
+        let sigma2 = solved.rss_pen / dof;
+        let r = (self.p - PENALTY_NULLITY) as f64;
+        Ok(-0.5 * (solved.logdet - r * log_lambda + dof * sigma2.ln()))
+    }
+
+    /// Fit at a FIXED `log λ`, with σ² either supplied or profiled.
+    pub fn fit_at(
+        &self,
+        log_lambda: f64,
+        sigma2: Option<f64>,
+    ) -> Result<GridSpline2dFit, String> {
+        let solved = self.solve_at(log_lambda)?;
+        let dof = (self.n_obs - PENALTY_NULLITY) as f64;
+        let sigma2 = match sigma2 {
+            Some(s) => {
+                if !(s.is_finite() && s > 0.0) {
+                    return Err(format!("grid spline 2d: invalid sigma2 {s}"));
+                }
+                s
+            }
+            None => {
+                if !(solved.rss_pen > 0.0) {
+                    return Err(format!(
+                        "grid spline 2d: degenerate penalized residual {}",
+                        solved.rss_pen
+                    ));
+                }
+                solved.rss_pen / dof
+            }
+        };
+        // Full restricted log-likelihood at this (λ, σ²) up to λ- and σ-free
+        // constants: at the profiled σ̂² the quadratic collapses to the λ-free
+        // constant `dof`, matching `criterion` up to that constant.
+        let r = (self.p - PENALTY_NULLITY) as f64;
+        let restricted_loglik = -0.5
+            * (solved.logdet - r * log_lambda + dof * sigma2.ln() + solved.rss_pen / sigma2);
+        Ok(GridSpline2dFit {
+            coeff: solved.coeff,
+            log_lambda,
+            sigma2,
+            restricted_loglik,
+            chol: solved.chol,
+            axes: self.axes,
+            m_axis: self.m_axis,
+        })
+    }
+
+    /// Fit with `log λ` selected by the profiled REML criterion: deterministic
+    /// coarse grid then golden-section refinement (no RNG — same data, same fit).
+    pub fn fit_reml(&self) -> Result<GridSpline2dFit, String> {
+        let mut best_i = 0usize;
+        let mut best_v = f64::NEG_INFINITY;
+        let step = (LOG_LAMBDA_HI - LOG_LAMBDA_LO) / (LOG_LAMBDA_GRID - 1) as f64;
+        for i in 0..LOG_LAMBDA_GRID {
+            let ll = LOG_LAMBDA_LO + step * i as f64;
+            let v = self.criterion(ll)?;
+            if v > best_v {
+                best_v = v;
+                best_i = i;
+            }
+        }
+        let mut lo = LOG_LAMBDA_LO + step * best_i.saturating_sub(1) as f64;
+        let mut hi = (LOG_LAMBDA_LO + step * (best_i + 1) as f64).min(LOG_LAMBDA_HI);
+        // Golden-section maximization on [lo, hi].
+        let inv_phi = 0.618_033_988_749_894_9_f64;
+        let mut x1 = hi - inv_phi * (hi - lo);
+        let mut x2 = lo + inv_phi * (hi - lo);
+        let mut f1 = self.criterion(x1)?;
+        let mut f2 = self.criterion(x2)?;
+        while hi - lo > LOG_LAMBDA_TOL {
+            if f1 < f2 {
+                lo = x1;
+                x1 = x2;
+                f1 = f2;
+                x2 = lo + inv_phi * (hi - lo);
+                f2 = self.criterion(x2)?;
+            } else {
+                hi = x2;
+                x2 = x1;
+                f2 = f1;
+                x1 = hi - inv_phi * (hi - lo);
+                f1 = self.criterion(x1)?;
+            }
+        }
+        self.fit_at(0.5 * (lo + hi), None)
+    }
+}
+
+/// Fitted penalized tensor-product smoother with its factored covariance.
+pub struct GridSpline2dFit {
+    /// Coefficients in row-major flat order `g = j1·(K+3) + j2`.
+    pub coeff: Vec<f64>,
+    /// Selected (or supplied) log smoothing parameter.
+    pub log_lambda: f64,
+    /// Profiled (or supplied) observation variance σ².
+    pub sigma2: f64,
+    /// Restricted log-likelihood at the optimum, up to λ- and data-independent
+    /// additive constants (exact REML differences across λ).
+    pub restricted_loglik: f64,
+    /// Lower Cholesky factor of `X'WX + λS` — the factored posterior precision
+    /// (unit-σ² scale) used for prediction variances.
+    chol: Vec<f64>,
+    axes: [Axis; 2],
+    m_axis: usize,
+}
+
+impl GridSpline2dFit {
+    /// Posterior `(mean, variance)` at an arbitrary point: the 16-entry basis
+    /// row dotted with the coefficients, and `σ̂²·x'(X'WX+λS)⁻¹x` through the
+    /// retained Cholesky factor. Outside the bounding box the boundary cell's
+    /// cubic polynomial extends.
+    pub fn predict(&self, x1: f64, x2: f64) -> Result<(f64, f64), String> {
+        if !(x1.is_finite() && x2.is_finite()) {
+            return Err(format!(
+                "grid spline 2d: non-finite prediction point ({x1}, {x2})"
+            ));
+        }
+        let (idx, val) = basis_row(&self.axes, self.m_axis, x1, x2);
+        let p = self.coeff.len();
+        let mut mean = 0.0;
+        let mut row = vec![0.0_f64; p];
+        for e in 0..16 {
+            mean += val[e] * self.coeff[idx[e]];
+            row[idx[e]] += val[e];
+        }
+        let z = chol_solve(&self.chol, p, &row);
+        let mut quad = 0.0;
+        for g in 0..p {
+            quad += row[g] * z[g];
+        }
+        Ok((mean, self.sigma2 * quad))
+    }
+}
+
+/// Build the streaming design and fit with REML-selected λ.
+pub fn fit_grid_spline_2d(
+    x1: &[f64],
+    x2: &[f64],
+    y: &[f64],
+    w: &[f64],
+    k: usize,
+    metric: [f64; 2],
+) -> Result<GridSpline2dFit, String> {
+    GridSpline2dDesign::build(x1, x2, y, w, k, metric)?.fit_reml()
+}
+
+/// Build the streaming design and fit at a FIXED `log λ` (σ² supplied or profiled).
+pub fn fit_grid_spline_2d_at(
+    x1: &[f64],
+    x2: &[f64],
+    y: &[f64],
+    w: &[f64],
+    k: usize,
+    metric: [f64; 2],
+    log_lambda: f64,
+    sigma2: Option<f64>,
+) -> Result<GridSpline2dFit, String> {
+    GridSpline2dDesign::build(x1, x2, y, w, k, metric)?.fit_at(log_lambda, sigma2)
+}
