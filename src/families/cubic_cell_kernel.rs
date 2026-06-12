@@ -3605,6 +3605,34 @@ fn non_affine_ladder_converged(coarse: &CellMomentVec, fine: &CellMomentVec) -> 
     err <= NON_AFFINE_LADDER_RTOL * scale
 }
 
+/// Per-rung certification histogram for the non-affine ladder, indexed by the
+/// rung that certified (`NON_AFFINE_LADDER_RUNGS[i]` at index `i`), with the
+/// final slot counting cells that fell through to the terminal 384-node rule.
+/// Incremented once per non-affine cell evaluation; the BMS exact-cache build
+/// logs the distribution so the ladder's real cost (early-certify win vs.
+/// terminal-fallthrough cost) is observable on every large-scale fit rather
+/// than assumed. `+1` length for the terminal bucket.
+pub(crate) static NON_AFFINE_LADDER_CERT_COUNTS: [AtomicU64; NON_AFFINE_LADDER_RUNGS.len() + 1] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Snapshot the ladder certification histogram as `(rung_node_count, count)`
+/// pairs plus the terminal-fallthrough count, for logging/inspection.
+pub fn non_affine_ladder_cert_histogram() -> (Vec<(usize, u64)>, u64) {
+    let per_rung = NON_AFFINE_LADDER_RUNGS
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (n, NON_AFFINE_LADDER_CERT_COUNTS[i].load(Ordering::Relaxed)))
+        .collect();
+    let terminal = NON_AFFINE_LADDER_CERT_COUNTS[NON_AFFINE_LADDER_RUNGS.len()].load(Ordering::Relaxed);
+    (per_rung, terminal)
+}
+
 /// Progressive-ladder evaluation of a non-affine cell: walk the rule ladder
 /// from 12 nodes upward and return the first result certified by two-rule
 /// agreement; a cell that never certifies returns the terminal 384-node
@@ -3615,16 +3643,18 @@ fn evaluate_non_affine_cell_simd<const COMPUTE_VALUE: bool>(
     max_degree: usize,
 ) -> (CellMomentVec, f64) {
     let mut prev: Option<(CellMomentVec, f64)> = None;
-    for (nodes, weights) in non_affine_ladder_rules() {
+    for (i, (nodes, weights)) in non_affine_ladder_rules().iter().enumerate() {
         let cur =
             evaluate_non_affine_cell_with_rule::<COMPUTE_VALUE>(cell, max_degree, nodes, weights);
         if let Some(prev) = prev.as_ref()
             && non_affine_ladder_converged(&prev.0, &cur.0)
         {
+            NON_AFFINE_LADDER_CERT_COUNTS[i].fetch_add(1, Ordering::Relaxed);
             return cur;
         }
         prev = Some(cur);
     }
+    NON_AFFINE_LADDER_CERT_COUNTS[NON_AFFINE_LADDER_RUNGS.len()].fetch_add(1, Ordering::Relaxed);
     evaluate_non_affine_cell_with_rule::<COMPUTE_VALUE>(cell, max_degree, &GL_NODES, &GL_WEIGHTS)
 }
 

@@ -3140,6 +3140,18 @@ impl BernoulliMarginalSlopeFamily {
                 cell_family_forest.is_some(),
                 row_cell_started.elapsed().as_secs_f64()
             );
+            // Ladder + forest observability (#979): does the progressive GL
+            // ladder certify early (win) or fall through to 384 (cost), and
+            // does the family forest actually cover rows or fall back to the
+            // ladder? Cumulative process-wide counters — the deltas across a
+            // fit reveal whether either mechanism earns its complexity.
+            let (ladder_hist, ladder_terminal) =
+                exact_kernel::non_affine_ladder_cert_histogram();
+            let (forest_hits, forest_fallbacks) =
+                crate::families::cell_moment_family::forest_coverage_counts();
+            log::info!(
+                "[BMS ladder/forest stats] ladder_cert_by_rung={ladder_hist:?} ladder_terminal_384={ladder_terminal} forest_covered_rows={forest_hits} forest_fallback_rows={forest_fallbacks}"
+            );
             log::info!(
                 "[BMS exact-cache] build done n={} context_rows={} p={} flex={} elapsed={:.3}s",
                 n,
