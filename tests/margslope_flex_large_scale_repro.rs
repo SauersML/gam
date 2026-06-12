@@ -26,12 +26,13 @@ mod margslope_flex_equivalence;
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::marginal_slope_shared::OuterScoreSubsample;
 use margslope_flex_equivalence::{
-    DEFAULT_REPRO_N, build_large_scale_shape_problem, cycle_capped_options, fit_problem,
+    build_large_scale_shape_problem, cycle_capped_options, fit_problem,
 };
 use ndarray::Array1;
 use std::sync::Arc;
 use std::time::Duration;
 
+const DEFAULT_REPRO_N: usize = 50_000;
 const DEFAULT_SMOKE_N: usize = 2_000;
 const DEFAULT_WALL_BOUND: Duration = Duration::from_secs(300);
 const FULL_OUTER_SMOKE_INNER_CYCLES: usize = 20;
