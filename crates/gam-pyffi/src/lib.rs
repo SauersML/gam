@@ -9470,12 +9470,15 @@ fn sae_manifold_fit_inner<'py>(
     //
     // `init_rho` packs `[log_lambda_sparse, log_lambda_smooth, per-atom ARD]`;
     // its `to_flat()` defines the outer ρ vector the engine optimizes, and its
-    // length is the objective's declared `n_params`.
+    // length is the objective's declared `n_params`. For learnable-alpha IBP,
+    // the first coordinate is a dimensionless log-alpha offset rather than a
+    // response-scale penalty strength, so assignment-aware seed scaling leaves it
+    // unshifted while still scaling smoothness and ARD.
     let seed_dispersion = base_term
         .seed_reconstruction_dispersion(z_view)
         .map_err(py_value_error)?;
     let init_rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard)
-        .seed_scaled_by_dispersion(seed_dispersion)
+        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
         .map_err(py_value_error)?;
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();

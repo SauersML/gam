@@ -1453,6 +1453,33 @@ impl SaeManifoldRho {
     /// absolute penalty weights; adding `log(phi_seed)` makes the seeded
     /// effective stiffness `lambda / phi_seed` dimensionless.
     pub fn seed_scaled_by_dispersion(&self, dispersion: f64) -> Result<Self, String> {
+        self.seed_scaled_by_dispersion_with_sparse_policy(dispersion, true)
+    }
+
+    /// Assignment-aware seed scaling. In learnable-alpha IBP mode the sparse
+    /// coordinate is a dimensionless log-alpha offset, not a penalty strength, so
+    /// response-dispersion scaling must skip it while still scaling smoothness and
+    /// ARD precision seeds.
+    pub fn seed_scaled_by_dispersion_for_assignment(
+        &self,
+        dispersion: f64,
+        assignment_mode: AssignmentMode,
+    ) -> Result<Self, String> {
+        let scale_sparse = !matches!(
+            assignment_mode,
+            AssignmentMode::IBPMap {
+                learnable_alpha: true,
+                ..
+            }
+        );
+        self.seed_scaled_by_dispersion_with_sparse_policy(dispersion, scale_sparse)
+    }
+
+    fn seed_scaled_by_dispersion_with_sparse_policy(
+        &self,
+        dispersion: f64,
+        scale_sparse: bool,
+    ) -> Result<Self, String> {
         if !(dispersion.is_finite() && dispersion > 0.0) {
             return Err(format!(
                 "SaeManifoldRho::seed_scaled_by_dispersion: dispersion must be finite and \
@@ -1461,7 +1488,9 @@ impl SaeManifoldRho {
         }
         let shift = dispersion.ln();
         let mut scaled = self.clone();
-        scaled.log_lambda_sparse += shift;
+        if scale_sparse {
+            scaled.log_lambda_sparse += shift;
+        }
         scaled.log_lambda_smooth += shift;
         for atom in &mut scaled.log_ard {
             for value in atom.iter_mut() {
@@ -15598,7 +15627,9 @@ mod tests {
     fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() {
         let rho = SaeManifoldRho::new(0.7_f64.ln(), 1.3_f64.ln(), vec![array![0.2, -0.4]]);
         let dispersion = 0.05_f64 * 0.05;
-        let scaled = rho.seed_scaled_by_dispersion(dispersion).unwrap();
+        let scaled = rho
+            .seed_scaled_by_dispersion_for_assignment(dispersion, AssignmentMode::softmax(1.0))
+            .unwrap();
         let shift = dispersion.ln();
 
         assert_abs_diff_eq!(
@@ -15619,6 +15650,28 @@ mod tests {
         assert_abs_diff_eq!(
             scaled.log_ard[0][1],
             rho.log_ard[0][1] + shift,
+            epsilon = 1.0e-14
+        );
+
+        let learnable_ibp = rho
+            .seed_scaled_by_dispersion_for_assignment(
+                dispersion,
+                AssignmentMode::ibp_map(1.0, 1.0, true),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(
+            learnable_ibp.log_lambda_sparse,
+            rho.log_lambda_sparse,
+            epsilon = 1.0e-14
+        );
+        assert_abs_diff_eq!(
+            learnable_ibp.log_lambda_smooth,
+            rho.log_lambda_smooth + shift,
+            epsilon = 1.0e-14
+        );
+        assert_abs_diff_eq!(
+            learnable_ibp.log_ard[0][0],
+            rho.log_ard[0][0] + shift,
             epsilon = 1.0e-14
         );
     }
@@ -15808,7 +15861,10 @@ mod tests {
                     let seed_ev = global_ev(z.view(), term.fitted().view());
                     let init_rho =
                         SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
-                            .seed_scaled_by_dispersion(seed_dispersion)
+                            .seed_scaled_by_dispersion_for_assignment(
+                                seed_dispersion,
+                                assignment_mode.mode(),
+                            )
                             .unwrap();
                     let init_rho_flat = init_rho.to_flat();
                     let n_params = init_rho_flat.len();
