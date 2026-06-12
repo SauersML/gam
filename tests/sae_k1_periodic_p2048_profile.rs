@@ -146,6 +146,24 @@ fn profile_k1_periodic_high_p_phase_breakdown() {
         let arrived = obj_walk.run_curvature_homotopy_entry();
         let walk_s = t_a.elapsed().as_secs_f64();
 
+        // Phase C (gate-safety check): a COLD inner solve with NO walk, via
+        // reml_criterion directly (the curvature walk lives only in the
+        // OuterProblem seed loop). If this reaches EV >= 0.95 for K=1 periodic,
+        // the curvature walk is pure overhead here and can be gated off — the
+        // circle topology is baked into the fundamental harmonic, so the
+        // Eckart-Young anchor is already on the circle (no linear basin to
+        // escape).
+        let mut term_cold = build_term(z.view());
+        let cold_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![Array1::zeros(1)]);
+        let t_c = Instant::now();
+        let cold = term_cold.reml_criterion(z.view(), &cold_rho, None, 25, 1.0, 1.0e-6, 1.0e-6);
+        let cold_s = t_c.elapsed().as_secs_f64();
+        let cold_ev = if cold.is_ok() {
+            global_ev(z.view(), term_cold.fitted().view())
+        } else {
+            f64::NAN
+        };
+
         // Phase B: the full production outer fit (walk + cascade + outer rho).
         let (mut obj_full, rho) = make_objective(&z);
         let mut seed_config = SeedConfig::default();
@@ -166,9 +184,10 @@ fn profile_k1_periodic_high_p_phase_breakdown() {
         println!(
             "[PROFILE p={p} M={M}] curvature_walk={walk_s:.2}s (arrived={arrived:?})  \
              full_outer_fit={full_s:.2}s  post_walk_est={:.2}s  EV={ev:.4}  \
-             walk_fraction={:.0}%",
+             walk_fraction={:.0}%  ||  COLD_no_walk={cold_s:.2}s EV={cold_ev:.4} (ok={})",
             (full_s - walk_s).max(0.0),
-            100.0 * walk_s / full_s.max(1.0e-9)
+            100.0 * walk_s / full_s.max(1.0e-9),
+            cold.is_ok()
         );
 
         assert!(ev >= 0.90, "p={p}: profiling fit should still recover the circle, EV={ev:.4}");
