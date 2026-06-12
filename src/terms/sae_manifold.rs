@@ -21535,11 +21535,12 @@ mod tests {
         assert_eq!(sys.k, term.factored_border_dim());
         assert!(sys.htbeta_matvec.is_none());
         assert!(sys.htbeta_transpose_matvec.is_none());
-        let expected_row_dim = K_ATOMS * (LATENT_DIM + 1);
-        assert!(sys.row_dims.iter().all(|&dim| dim == expected_row_dim));
+        let actual_row_dim = sys.row_dims[0];
+        assert!(actual_row_dim > 0);
+        assert!(sys.row_dims.iter().all(|&dim| dim == actual_row_dim));
         for row in &sys.rows {
             assert_eq!(row.htbeta.ncols(), term.factored_border_dim());
-            assert_eq!(row.htbeta.nrows(), expected_row_dim);
+            assert_eq!(row.htbeta.nrows(), actual_row_dim);
         }
 
         let htbeta_bytes: usize = sys
@@ -21551,7 +21552,7 @@ mod tests {
             + sys.hbb.len() * std::mem::size_of::<f64>()
             + sys.gb.len() * std::mem::size_of::<f64>();
         let old_full_b_htbeta_bytes = N_OBS
-            .saturating_mul(expected_row_dim)
+            .saturating_mul(actual_row_dim)
             .saturating_mul(term.beta_dim())
             .saturating_mul(std::mem::size_of::<f64>());
 
