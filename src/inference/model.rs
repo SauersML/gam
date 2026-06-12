@@ -3217,6 +3217,256 @@ impl FittedModel {
         }
     }
 
+    /// V∞ §5 coverage floor for the measure-jet extrapolation variance: a
+    /// band level "covers" a query once its kernel mass reaches this
+    /// fraction of the total quadrature mass. Magic-by-default (no dial):
+    /// 0.05 keeps the ε★ gate's bounded discontinuity at ≤ 5 % of the
+    /// spectrum's total prior ignorance (see the monotonicity theorem in
+    /// `terms/basis/measure_jet_predict.rs`) while still refusing credit
+    /// for stray sub-floor kernel mass at levels finer than the first
+    /// covering scale.
+    const MEASURE_JET_COVERAGE_FLOOR: f64 = 0.05;
+
+    /// V∞ §5 producer: per-row measure-jet extrapolation variance on the η
+    /// scale for a prediction batch (`docs/measure_jet_v_infinity.md`).
+    ///
+    /// For every frozen measure-jet term in `resolved_termspec` this prices
+    /// the off-support ignorance of the fitted multiscale spectrum at each
+    /// query row: support curve from the frozen nodes/masses/band
+    /// ([`crate::basis::measure_jet_support_curve`]), fitted per-scale
+    /// amplitudes λ̂_ℓ read from the fit's `lambdas` through the replayed
+    /// design's penalty layout, folded through
+    /// [`crate::basis::measure_jet_extrapolation_variance`] and scaled by
+    /// the fit's coefficient-covariance scale φ̂ so the result sits on Vp's
+    /// η-variance scale. Terms not yet frozen (no `frozen_quadrature` or
+    /// non-`UserProvided` centers) are skipped with a warning. Returns
+    /// `Ok(None)` when no measure-jet term contributes, so callers leave
+    /// `PredictUncertaintyOptions::extrapolation_variance` untouched.
+    ///
+    /// `data` must be the RAW (unclipped) prediction matrix in prediction
+    /// column order — clipping to the training ranges would freeze the
+    /// distance signal at the hull and defeat the honesty contract — and
+    /// `col_map` the prediction header → column map (the same map handed to
+    /// the design builder). This is the minimal-plumbing producer seam: the
+    /// option-building callers (CLI predict, FFI) hold exactly
+    /// `(model, data, col_map)` at the point where they assemble
+    /// `PredictUncertaintyOptions`, and the fusion in
+    /// `predict_gamwith_uncertainty` adds the array AFTER its multiplicative
+    /// inflations: `Var_total = Var_Vp·inflation + Var_extrap`.
+    pub fn measure_jet_extrapolation_variance(
+        &self,
+        data: ndarray::ArrayView2<'_, f64>,
+        col_map: &HashMap<String, usize>,
+    ) -> Result<Option<Array1<f64>>, FittedModelError> {
+        use crate::basis::{CenterStrategy, PenaltySource};
+        use crate::smooth::{SmoothBasisSpec, build_term_collection_design};
+        let Some(saved_spec) = self.resolved_termspec.as_ref() else {
+            return Ok(None);
+        };
+        if data.nrows() == 0
+            || !saved_spec
+                .smooth_terms
+                .iter()
+                .any(|t| matches!(t.basis, SmoothBasisSpec::MeasureJet { .. }))
+        {
+            return Ok(None);
+        }
+        let fit = self
+            .fit_result
+            .as_ref()
+            .ok_or_else(|| FittedModelError::MissingField {
+                reason: "measure-jet extrapolation variance requires the canonical \
+                    fit_result payload; refit"
+                    .to_string(),
+            })?;
+        let spec = crate::families::survival_predict::resolve_termspec_for_prediction(
+            &self.resolved_termspec,
+            self.training_headers.as_ref(),
+            col_map,
+            "resolved_termspec",
+        )
+        .map_err(|e| FittedModelError::SchemaMismatch {
+            reason: format!("measure-jet extrapolation variance: {e}"),
+        })?;
+        // Penalty layout replay: the global penalty indices (→ `fit.lambdas`)
+        // come from the SAME design builder the predict pipeline uses. One
+        // probe row suffices — for a frozen spec the penalty layout is
+        // row-count-invariant (centers, masses, band, and identifiability
+        // transforms all replay verbatim) — keeping this O(centers²) instead
+        // of duplicating the full O(rows·centers) prediction design build.
+        let probe = data.slice(ndarray::s![0..1, ..]);
+        let design = build_term_collection_design(probe, &spec).map_err(|e| {
+            FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "measure-jet extrapolation variance: penalty-layout replay failed: {e}"
+                ),
+            }
+        })?;
+        let lambdas = &fit.lambdas;
+        // λ̂ are precisions of the φ̂-free penalized criterion, so λ̂⁻¹ sits on
+        // H⁻¹'s scale; multiplying by the coefficient-covariance scale puts
+        // Var_extrap on the same η-variance scale as Vp.
+        let phi_scale = fit.coefficient_covariance_scale();
+        let mut total = Array1::<f64>::zeros(data.nrows());
+        let mut contributed = false;
+        for term in &spec.smooth_terms {
+            let SmoothBasisSpec::MeasureJet {
+                feature_cols,
+                spec: mj,
+                input_scales,
+            } = &term.basis
+            else {
+                continue;
+            };
+            let (Some(frozen), CenterStrategy::UserProvided(centers)) =
+                (mj.frozen_quadrature.as_ref(), &mj.center_strategy)
+            else {
+                log::warn!(
+                    "measure-jet term '{}' is not frozen (UserProvided centers + frozen \
+                    quadrature); skipping its extrapolation variance",
+                    term.name
+                );
+                continue;
+            };
+            let n_levels = frozen.eps_band.len();
+            // λ̂ per level from the replayed layout: per-scale candidates carry
+            // `PenaltySource::Other("measure_jet_scale_ℓ")`; fused
+            // (pinned-order) mode carries a single Primary reused for every
+            // level. The DoublePenaltyNullspace ridge is EXCLUDED — it shrinks
+            // coefficients, it is not a scale amplitude, and counting it would
+            // double-charge the spectrum.
+            let read_lambda = |global_index: usize| -> Result<f64, FittedModelError> {
+                lambdas.get(global_index).copied().ok_or_else(|| {
+                    FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "measure-jet term '{}': penalty global index {global_index} out \
+                            of bounds for {} fitted lambdas",
+                            term.name,
+                            lambdas.len()
+                        ),
+                    }
+                })
+            };
+            let mut per_scale: Vec<(usize, f64)> = Vec::new();
+            let mut fused: Option<f64> = None;
+            for info in &design.penaltyinfo {
+                if info.termname.as_deref() != Some(term.name.as_str()) {
+                    continue;
+                }
+                match &info.penalty.source {
+                    PenaltySource::Other(label) => {
+                        if let Some(level_txt) = label.strip_prefix("measure_jet_scale_") {
+                            let level: usize = level_txt.parse().map_err(|_| {
+                                FittedModelError::SchemaMismatch {
+                                    reason: format!(
+                                        "measure-jet term '{}': unparseable penalty label \
+                                        '{label}'",
+                                        term.name
+                                    ),
+                                }
+                            })?;
+                            per_scale.push((level, read_lambda(info.global_index)?));
+                        }
+                    }
+                    PenaltySource::Primary => {
+                        fused = Some(read_lambda(info.global_index)?);
+                    }
+                    _ => {}
+                }
+            }
+            let lambda_hat: Vec<f64> = if per_scale.is_empty() {
+                let Some(lam) = fused else {
+                    log::warn!(
+                        "measure-jet term '{}' has no fitted amplitude in the penalty \
+                        layout; skipping its extrapolation variance",
+                        term.name
+                    );
+                    continue;
+                };
+                vec![lam; n_levels]
+            } else {
+                per_scale.sort_by_key(|&(level, _)| level);
+                let levels_complete = per_scale.len() == n_levels
+                    && per_scale
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &(level, _))| level == i);
+                if !levels_complete {
+                    log::warn!(
+                        "measure-jet term '{}': {} fitted per-scale amplitudes for {} band \
+                        scales; skipping its extrapolation variance",
+                        term.name,
+                        per_scale.len(),
+                        n_levels
+                    );
+                    continue;
+                }
+                per_scale.iter().map(|&(_, lam)| lam).collect()
+            };
+            // Query rows in the frozen geometry's coordinates: select the
+            // term's axes and replay the per-axis standardization exactly as
+            // the build dispatch does (divide by σ_a when input_scales is
+            // Some; the persisted centers are already post-standardization).
+            let mut queries = Array2::<f64>::zeros((data.nrows(), feature_cols.len()));
+            for (j, &col) in feature_cols.iter().enumerate() {
+                if col >= data.ncols() {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "measure-jet term '{}': prediction column {col} out of bounds \
+                            for {} data columns",
+                            term.name,
+                            data.ncols()
+                        ),
+                    });
+                }
+                queries.column_mut(j).assign(&data.column(col));
+            }
+            if let Some(scales) = input_scales {
+                if scales.len() != feature_cols.len() {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "measure-jet term '{}': {} input scales for {} axes",
+                            term.name,
+                            scales.len(),
+                            feature_cols.len()
+                        ),
+                    });
+                }
+                for (j, &scale) in scales.iter().enumerate() {
+                    queries.column_mut(j).mapv_inplace(|v| v / scale);
+                }
+            }
+            let support = crate::basis::measure_jet_support_curve(
+                queries.view(),
+                centers.view(),
+                frozen.masses.view(),
+                &frozen.eps_band,
+            )
+            .map_err(|e| FittedModelError::SchemaMismatch {
+                reason: format!("measure-jet term '{}': support curve failed: {e}", term.name),
+            })?;
+            let total_mass = frozen.masses.sum();
+            for i in 0..data.nrows() {
+                let v = crate::basis::measure_jet_extrapolation_variance(
+                    support.row(i),
+                    &frozen.eps_band,
+                    total_mass,
+                    &lambda_hat,
+                    Self::MEASURE_JET_COVERAGE_FLOOR,
+                )
+                .map_err(|e| FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "measure-jet term '{}': extrapolation variance failed: {e}",
+                        term.name
+                    ),
+                })?;
+                total[i] += phi_scale * v;
+            }
+            contributed = true;
+        }
+        Ok(contributed.then_some(total))
+    }
+
     /// Returns the block roles for this model via the `PredictableModel` trait.
     ///
     /// For standard models this is `[BlockRole::Mean]`.
