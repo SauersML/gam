@@ -2657,6 +2657,20 @@ pub fn evaluate_survival_marginal_slope_baseline(
     age: f64,
     cfg: &SurvivalBaselineConfig,
 ) -> Result<(f64, f64), String> {
+    // Survival-curve origin. Every cumulative-hazard baseline satisfies
+    // `H0(0) = 0` (`S0(0) = exp(-H0(0)) = 1`), so the probit index
+    // `q(0) = -Phi^{-1}(S0(0)) = -Phi^{-1}(1) = -inf`: there is no *finite*
+    // probit-survival offset at the origin. The survival surface anchors
+    // `S(0) = 1` directly (see the `t <= 0` origin handling in the survival
+    // predict paths), so the baseline contributes nothing here — report the
+    // zero offset rather than aborting in the `age <= 0` hazard guard. This
+    // mirrors `evaluate_survival_baseline`'s explicit `age == 0` branch on the
+    // log-cumulative-hazard channel; without it the probit/marginal-slope
+    // baseline path (location-scale + marginal-slope likelihoods) could not be
+    // evaluated on a prediction grid whose first node is the origin (#1024).
+    if age == 0.0 {
+        return Ok((0.0, 0.0));
+    }
     let Some(point) = evaluate_marginal_slope_baseline_point(age, cfg)? else {
         return Ok((0.0, 0.0));
     };

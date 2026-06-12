@@ -1957,6 +1957,21 @@ fn predict_survival_location_scale_batch(
         .and(&mut cumulative_hazard)
         .and(&mut hazard)
         .par_for_each(|(i, j), s, ch, h| {
+            // Survival-curve origin: at t = 0 everyone is still at risk, so
+            // S(0) = 1, H(0) = 0 and h(0) = 0 exactly, independent of the
+            // fitted baseline. Anchor the origin column directly instead of
+            // routing it through the (probit-survival) baseline, whose index is
+            // -inf at S0(0) = 1. This matches the transformation / marginal-slope
+            // predict path's `t <= 0` handling and keeps the default surface grid
+            // — whose first node is the origin for the `Surv(time, event)`
+            // right-censored shorthand — evaluable end to end (#1024).
+            let query_time = if per_row_eval { age_exit[i] } else { eval_times[j] };
+            if query_time <= 0.0 {
+                *s = 1.0;
+                *ch = 0.0;
+                *h = 0.0;
+                return;
+            }
             let k = if per_row_eval { i } else { i * eval_width + j };
             let surv = survival_prob_full[k].clamp(SURVIVAL_PROB_MIN_FOR_LOG, 1.0);
             *s = surv;
@@ -1972,12 +1987,21 @@ fn predict_survival_location_scale_batch(
     let times = if per_row_eval {
         age_exit.to_vec()
     } else {
-        eval_times
+        // Cloned (not moved) so the origin-column anchor below can still read the
+        // per-column query times when assembling the survival standard errors.
+        eval_times.clone()
     };
 
     let survival_se = response_se_full.as_ref().map(|response_se| {
         let mut out = Array2::<f64>::zeros((n, t_cols));
         ndarray::Zip::indexed(&mut out).par_for_each(|(i, j), slot| {
+            // S(0) = 1 is a deterministic identity, so its standard error is 0
+            // at the origin column (consistent with the anchored survival above).
+            let query_time = if per_row_eval { age_exit[i] } else { eval_times[j] };
+            if query_time <= 0.0 {
+                *slot = 0.0;
+                return;
+            }
             let k = if per_row_eval { i } else { i * eval_width + j };
             *slot = response_se[k].max(0.0);
         });
