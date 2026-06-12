@@ -69,7 +69,7 @@ fn planted_unit_circle(n: usize, p: usize, sigma: f64) -> Array2<f64> {
 /// Cold K=1 IBP-MAP term: PCA-free angle seed from the true ambient angle,
 /// closed-form LSQ decoder at the cold gate, exactly as the production path
 /// would after `term_from_padded_blocks` for one periodic atom.
-fn build_cold_k1_term(z: &Array2<f64>) -> SaeManifoldTerm {
+fn build_cold_k1_term(z: &Array2<f64>, seed_logit: f64) -> SaeManifoldTerm {
     let n = z.nrows();
     let p = z.ncols();
     let evaluator = PeriodicHarmonicEvaluator::new(M).unwrap();
@@ -81,11 +81,13 @@ fn build_cold_k1_term(z: &Array2<f64>) -> SaeManifoldTerm {
     });
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
 
-    // Cold K=1 ibp_map logit seed is 0 (production: EM residual seed gated on
-    // K>1), so the cold gate is σ(0)=0.5. The decoder LSQ init is fit at that
-    // gate so ζ·decode ≈ z at the seed.
-    let logits = Array2::<f64>::zeros((n, 1));
-    let gate0 = 0.5_f64; // σ(0/τ)
+    // `seed_logit` sets the cold K=1 ibp_map gate. Production today seeds 0
+    // (the EM residual seed is gated on K>1), so the cold gate is σ(0)=0.5 — a
+    // 50% radial seed contraction the joint fit must undo. The fix seeds high
+    // (gate ≈ 1). The decoder LSQ init is fit at whatever gate the seed implies
+    // so ζ·decode ≈ z at the seed regardless.
+    let logits = Array2::<f64>::from_elem((n, 1), seed_logit);
+    let gate0 = 1.0 / (1.0 + (-seed_logit / TAU).exp()); // σ(seed_logit/τ)
     let mut xw = Array2::<f64>::zeros((n, M));
     for row in 0..n {
         for c in 0..M {
@@ -129,8 +131,8 @@ fn build_cold_k1_term(z: &Array2<f64>) -> SaeManifoldTerm {
     SaeManifoldTerm::new(vec![atom], assignment).unwrap()
 }
 
-fn run_production_fit(z: &Array2<f64>) -> (SaeManifoldTerm, SaeManifoldRho) {
-    let term = build_cold_k1_term(z);
+fn run_production_fit(z: &Array2<f64>, seed_logit: f64) -> (SaeManifoldTerm, SaeManifoldRho) {
+    let term = build_cold_k1_term(z, seed_logit);
     let seed_dispersion = term
         .seed_reconstruction_dispersion(z.view())
         .expect("seed reconstruction dispersion");
@@ -157,18 +159,21 @@ fn run_production_fit(z: &Array2<f64>) -> (SaeManifoldTerm, SaeManifoldRho) {
     (term, rho)
 }
 
-/// The three discriminating numbers + the 1% radial-bias gate. The planted
-/// radius is 1; a fitted ring more than 1% inside the data is the defect.
-#[test]
-fn sae_k1_ibp_circle_has_no_radial_shrinkage() {
-    let n = 250usize;
-    let p = 8usize;
-    let sigma = 0.05_f64;
-    let z = planted_unit_circle(n, p, sigma);
+struct ArmMetrics {
+    mean_zeta: f64,
+    radius_ratio: f64,
+    lambda_smooth: f64,
+}
 
-    let (term, rho) = run_production_fit(&z);
+/// Fit a K=1 IBP planted unit circle from `seed_logit` and read the three
+/// discriminating numbers: converged mean gate ζ (post-fit, not the seed),
+/// fitted/data radius ratio, and the landed λ_smooth.
+fn measure_arm(z: &Array2<f64>, p: usize, seed_logit: f64) -> ArmMetrics {
+    let n = z.nrows();
+    let (term, rho) = run_production_fit(z, seed_logit);
 
-    // (1) mean gate ζ over rows (K=1 → single column).
+    // (1) converged mean gate ζ over rows (K=1 → single column). This is the
+    //     post-fit value: the objective, not the seed, must drive it toward 1.
     let gates = term.assignment.assignments();
     let mut mean_zeta = 0.0_f64;
     for row in 0..n {
@@ -192,29 +197,57 @@ fn sae_k1_ibp_circle_has_no_radial_shrinkage() {
     }
     mean_fit_r /= n as f64;
     mean_data_r /= n as f64;
-    let radius_ratio = mean_fit_r / mean_data_r;
 
-    // (3) λ_smooth landed, against the empirical-Bayes optimum ~ σ²/r² (r=1):
-    //     the REML-correct shrinkage is invisible (~2σ²/(n·r²)); anything that
-    //     contracts the ring by % is a defect, not REML.
-    let lambda_smooth = rho.lambda_smooth();
-    let eb_optimal_lambda = sigma * sigma; // r² = 1
+    ArmMetrics {
+        mean_zeta,
+        radius_ratio: mean_fit_r / mean_data_r,
+        lambda_smooth: rho.lambda_smooth(),
+    }
+}
+
+/// The three discriminating numbers + the 1% radial-bias gate, run for BOTH the
+/// current cold seed (logit 0 → gate σ(0)=0.5) and the fix seed (logit 4 →
+/// gate σ(8)≈1). The planted radius is 1; a fitted ring more than 1% inside the
+/// data is the defect. The two arms disentangle the cause:
+///   * if the high-seed arm reaches radius_ratio≈1 while the low-seed arm
+///     shrinks, the defect is the cold gate seed (cause B) and seeding fixes it;
+///   * if the high-seed arm ALSO stays meaningfully below 1, a second defect
+///     (e.g. sparsity leaking into the K=1 logit, or λ over-smoothing the
+///     fundamental) pulls ζ/decode down at the OPTIMUM — report, don't paper.
+#[test]
+fn sae_k1_ibp_circle_has_no_radial_shrinkage() {
+    let n = 250usize;
+    let p = 8usize;
+    let sigma = 0.05_f64;
+    let z = planted_unit_circle(n, p, sigma);
+    let eb_optimal_lambda = sigma * sigma; // r² = 1; REML shrinkage is invisible
+
+    let low = measure_arm(&z, p, 0.0); // current production cold seed
+    let high = measure_arm(&z, p, 4.0); // proposed fix seed (gate σ(8)≈1)
 
     println!(
-        "K=1 IBP circle: mean_zeta={mean_zeta:.6} radius_ratio={radius_ratio:.6} \
-         (fit_r={mean_fit_r:.5} data_r={mean_data_r:.5}) lambda_smooth={lambda_smooth:.4e} \
-         eb_optimal~{eb_optimal_lambda:.4e} ratio_lambda={:.2e}",
-        lambda_smooth / eb_optimal_lambda.max(1e-300),
+        "K=1 IBP circle (eb_optimal_lambda~{eb_optimal_lambda:.3e}):\n  \
+         low-seed (logit 0, gate0=0.5):  mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}\n  \
+         high-seed(logit 4, gate0~1.0):  mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}",
+        low.mean_zeta, low.radius_ratio, low.lambda_smooth,
+        high.mean_zeta, high.radius_ratio, high.lambda_smooth,
     );
 
-    // Discriminator: if radius_ratio ≈ mean_zeta the contraction is the gate
-    // (cause B); if radius_ratio < mean_zeta the decoder is also over-smoothed
-    // (cause A on top). Either way the ring must sit within 1% of the data.
-    let radial_bias = (1.0 - radius_ratio).abs();
+    // Permanent gate: from the fix seed the ring must sit within 1% of the data
+    // radius AND the converged gate must reach ≈1 (objective-driven, not seed).
+    let high_bias = (1.0 - high.radius_ratio).abs();
     assert!(
-        radial_bias <= 0.01,
-        "K=1 IBP circle ring is radially biased by {:.2}% (radius_ratio={radius_ratio:.6}, \
-         mean_zeta={mean_zeta:.6}); the fitted manifold must lie within 1% of the data radius",
-        radial_bias * 100.0,
+        high.mean_zeta >= 0.99,
+        "high-seed converged gate ζ={:.6} stuck below 0.99 — a second defect pulls the K=1 \
+         IBP gate off its optimum (π₀=1, no sparsity pressure should keep ζ<1); report it",
+        high.mean_zeta,
+    );
+    assert!(
+        high_bias <= 0.01,
+        "high-seed K=1 IBP circle radially biased by {:.2}% (radius_ratio={:.6}, ζ={:.6}); \
+         the fitted manifold must lie within 1% of the data radius",
+        high_bias * 100.0,
+        high.radius_ratio,
+        high.mean_zeta,
     );
 }
