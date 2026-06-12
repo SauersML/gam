@@ -1479,6 +1479,32 @@ mod tests {
         }
     }
 
+    /// An explicit order pins the Mellin weights and fuses the band into a
+    /// single Primary candidate (+ ridge) — the spectral split's fused mode.
+    #[test]
+    fn fused_mode_emits_single_primary_candidate() {
+        let n = 40usize;
+        let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            if k == 0 { t * 3.0 } else { 0.4 * (t * 3.0).sin() }
+        });
+        let spec = MeasureJetBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 14 },
+            order_s: 1.3,
+            ..MeasureJetBasisSpec::default()
+        };
+        let built = build_measure_jet_basis(data.view(), &spec).expect("fused build");
+        assert_eq!(
+            built.penalties.len(),
+            2,
+            "fused mode must emit exactly Primary + ridge"
+        );
+        let BasisMetadata::MeasureJet { order_s, .. } = &built.metadata else {
+            panic!("measure-jet build must return MeasureJet metadata");
+        };
+        assert_eq!(*order_s, 1.3, "explicit order must persist verbatim");
+    }
+
     /// Quadrature nodes must be the mass-weighted cell barycenters
     /// (first-moment-exact lumping), with empty cells keeping their seed
     /// coordinates at zero mass.
@@ -1561,6 +1587,13 @@ mod tests {
                 eps_band: eps_band.clone(),
             }),
         };
+        // Per-level (auto-sentinel) mode: one candidate per band scale plus
+        // the ridge, and the count must survive freeze→replay bit-for-bit.
+        assert_eq!(
+            first.penalties.len(),
+            eps_band.len() + 1,
+            "per-level mode must emit one candidate per scale + ridge"
+        );
         let second = build_measure_jet_basis(data.view(), &replay_spec).expect("replay build");
         let x1 = first.design.to_dense();
         let x2 = second.design.to_dense();
