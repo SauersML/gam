@@ -25065,6 +25065,51 @@ fn fit_dataset_impl(
 
     let mut payload = match request {
         FitRequest::Standard(standard_request) => {
+            // Exact O(n) spline-scan fast path (#1030/#1034): a single 1-D
+            // Gaussian cubic smooth is the penalized cubic-spline problem the
+            // state-space scan solves exactly — route through it and persist
+            // the smoother state instead of the dense fit. Detection is
+            // structural; every other shape falls through to the dense fit
+            // below. Mirrors the CLI run_fit path so CLI and FFI saves agree.
+            if let Some(inputs) = gam::spline_scan_fast_path(&standard_request) {
+                let scan = gam::solver::spline_scan::fit_cubic_spline_scan(
+                    &inputs.x, &inputs.y, &inputs.w,
+                )
+                .map_err(|reason| gam::WorkflowError::IntegrationFailed { reason })?;
+                let feature_col = match &standard_request.spec.smooth_terms[0].basis {
+                    gam::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => *feature_col,
+                    _ => {
+                        return Err(gam::WorkflowError::SchemaMismatch {
+                            reason: "spline-scan detection accepted a non-1D basis".to_string(),
+                        });
+                    }
+                };
+                let feature_column =
+                    dataset.headers.get(feature_col).cloned().ok_or_else(|| {
+                        gam::WorkflowError::SchemaMismatch {
+                            reason: format!(
+                                "spline-scan feature column {feature_col} has no header"
+                            ),
+                        }
+                    })?;
+                let mut scan_payload =
+                    gam::inference::model_payload_builders::assemble_spline_scan_payload(
+                        formula,
+                        feature_column,
+                        &scan,
+                        dataset.schema.clone(),
+                        dataset.headers.clone(),
+                        dataset.feature_ranges(),
+                    );
+                scan_payload.group_metadata = fit_config.group_metadata.clone();
+                scan_payload.training_table_kind = training_table_kind;
+                let model = FittedModel::from_payload(scan_payload);
+                return serde_json::to_vec(&model).map_err(|err| {
+                    gam::WorkflowError::IntegrationFailed {
+                        reason: format!("failed to serialize model: {err}"),
+                    }
+                });
+            }
             let family = standard_request.family.clone();
             let fit_result = fit_model(FitRequest::Standard(standard_request))?;
             let standard_result = match fit_result {
@@ -25995,6 +26040,36 @@ fn predict_columns(
     options: &PyPredictOptions,
 ) -> Result<BTreeMap<String, Vec<f64>>, String> {
     let col_map = dataset.column_map();
+    // Spline-scan saved model (#1030/#1034): replay the exact Gaussian bridge
+    // per row (identity link, η == mean). No design reconstruction, no
+    // predictor. SE/intervals come from the exact posterior variance.
+    if let Some((feature_column, fit)) = model.saved_spline_scan().map_err(String::from)? {
+        let col = *col_map.get(feature_column).ok_or_else(|| {
+            format!("prediction data is missing the model's feature column '{feature_column}'")
+        })?;
+        let n = dataset.values.nrows();
+        let mut eta = Vec::with_capacity(n);
+        let mut se = Vec::with_capacity(n);
+        for (i, &x) in dataset.values.column(col).iter().enumerate() {
+            let (m, v) = fit
+                .predict(x)
+                .map_err(|e| format!("spline-scan predict failed at row {i}: {e}"))?;
+            eta.push(m);
+            se.push(v.max(0.0).sqrt());
+        }
+        let mut columns = BTreeMap::<String, Vec<f64>>::new();
+        columns.insert("linear_predictor".to_string(), eta.clone());
+        columns.insert("mean".to_string(), eta.clone());
+        if let Some(confidence_level) = options.interval {
+            let z = gam::probability::standard_normal_quantile(0.5 + confidence_level * 0.5)?;
+            let lower: Vec<f64> = eta.iter().zip(&se).map(|(m, s)| m - z * s).collect();
+            let upper: Vec<f64> = eta.iter().zip(&se).map(|(m, s)| m + z * s).collect();
+            columns.insert("std_error".to_string(), se);
+            columns.insert("mean_lower".to_string(), lower);
+            columns.insert("mean_upper".to_string(), upper);
+        }
+        return Ok(columns);
+    }
     let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
     let offset_noise =
         resolve_offset_column(&dataset, &col_map, model.noise_offset_column.as_deref())?;
