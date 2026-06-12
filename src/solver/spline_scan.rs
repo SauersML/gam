@@ -265,6 +265,7 @@ fn run_filter(nodes: &[PooledNode], q: f64) -> Result<FilterPass, String> {
 }
 
 /// Fitted exact smoothing-spline posterior on the pooled knots.
+#[derive(Clone, Debug)]
 pub struct CubicSplineScanFit {
     /// Distinct sorted abscissae (pooled knots).
     pub knots: Vec<f64>,
