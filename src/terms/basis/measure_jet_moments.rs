@@ -1,16 +1,18 @@
-//! Measure-jet V∞ §2 data interface: per-cell Gaussian-weighted moment
-//! tables with an exact binomial-shift merge monoid
+//! Measure-jet V∞ §2 data interface: per-cell frozen-weight polynomial
+//! moment tables with a binomial-shift merge monoid
 //! (`docs/measure_jet_v_infinity.md`, §2 "Data interface: moments or
 //! nothing").
 //!
-//! This module is the ONLY thing that ever touches the n data rows. Every
-//! downstream V∞ consumer — design products (Gram entries, XᵀWX), prior
-//! assembly, every ψ-jet, the support curve, the spectrum report — reads
-//! closed-form couplings of the tables stored here; none of them re-walk
-//! points. Truncation does NOT live here either: the caller computes the
-//! Gaussian weights `w_i` (mass × kernel profile, with whatever cutoff its
-//! explicit `e^{−ρ²/2}` tolerance budget licenses) and this module only
-//! aggregates what it is handed.
+//! This module aggregates caller-computed weights into order-0..2 coordinate
+//! moments. Those tables exactly determine polynomial couplings under the
+//! same frozen weights, including the local affine sufficient statistics used
+//! by `measure_jet_smooth.rs`. They do NOT exactly determine Gaussian
+//! transforms at moved kernel centers: support curves, Gaussian Gram entries,
+//! and Gaussian `XᵀWX` products need their own kernel pass or a separately
+//! controlled approximation. Truncation does NOT live here either: the caller
+//! computes the Gaussian weights `w_i` (mass × kernel profile, with whatever
+//! cutoff its explicit `e^{−ρ²/2}` tolerance budget licenses) and this module
+//! only aggregates what it is handed.
 //!
 //! # The monoid
 //!
@@ -22,9 +24,11 @@
 //!   μ′_α = Σ_{β ≤ α}  C(α, β) (c − c′)^{α−β} μ_β
 //! ```
 //!
-//! re-expresses a table about any other center `c′` EXACTLY — a finite
-//! polynomial identity, no kernel re-evaluation, no quadrature. Merging two
-//! tables is therefore "recenter to a common reference, add componentwise":
+//! re-expresses the same frozen-weight polynomial table about any other
+//! center `c′` exactly as a finite polynomial identity. It does not move the
+//! Gaussian kernel center or recompute weights. Merging two tables with
+//! already-compatible frozen weights is therefore "recenter to a common
+//! reference, add componentwise":
 //! an associative, commutative monoid whose identity is the empty (all-zero)
 //! table at any center. Exact distributed fitting, exact online updates, and
 //! bit-reproducibility under sorted reduction are corollaries of that one
@@ -58,14 +62,15 @@
 //!
 //! # 1:1 contract with `assemble_weighted_forms`
 //!
-//! [`jet_sufficient_stats`] reproduces, in closed form from a stored table,
-//! exactly the local-fit quantities the V0 workhorse
+//! [`jet_sufficient_stats`] reproduces, in closed form from a stored table
+//! whose weights were computed for the same center and scale, exactly the
+//! local-fit quantities the V0 workhorse
 //! (`measure_jet_smooth.rs::assemble_weighted_forms`) computes from raw
 //! points per (center, scale) block: the kernel mass `q`, the dimensionless
 //! weighted feature mean `a_mean`, the dimensionless slope Gram
-//! `G = Φ̃ᵀWΦ̃/q`, the weighted channel mean `uᵀv`, and the local-fit
-//! right-hand side `Bᵀv/q` — so the substrate can later replace the point
-//! loop without changing a single number.
+//! `G = Φ̃ᵀWΦ̃/q`, the weighted channel mean `uᵀv`, and the exact-projection
+//! right-hand side `Bᵀv/q` — so the substrate can later replace that
+//! same-center point loop without changing a single number.
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -314,8 +319,10 @@ pub fn accumulate_moment_table(
     })
 }
 
-/// EXACT recentering via the binomial shift: the same table re-expressed
-/// about `new_center`, with no kernel re-evaluation.
+/// Exact recentering via the binomial shift: the same frozen-weight
+/// polynomial table re-expressed about `new_center`, with no kernel
+/// re-evaluation. This is not a moving-kernel identity; if the Gaussian
+/// center changes, the caller must recompute or approximate the weights.
 ///
 /// Derivation (per channel; write `Δ = c − c′` so `x − c′ = (x − c) + Δ`):
 ///
@@ -327,9 +334,9 @@ pub fn accumulate_moment_table(
 /// which is the multi-index binomial identity
 /// `μ′_α = Σ_{β≤α} C(α,β)(c−c′)^{α−β} μ_β` specialized to `|α| ≤ 2`. Every
 /// term is a finite product of stored moments and `Δ`, so the shift is an
-/// algebraic identity of the table — exact up to floating-point rounding,
-/// and EXACTLY exact whenever the arithmetic is (dyadic lattices; pinned in
-/// the tests).
+/// algebraic identity of the frozen-weight table — exact up to floating-point
+/// rounding, and exactly exact whenever the arithmetic is (dyadic lattices;
+/// pinned in the tests).
 ///
 /// Bit-determinism: the order-2 entry is evaluated in the ONE fixed order
 /// `((μ_2 + Δ_k·μ_{1,l}) + μ_{1,k}·Δ_l) + (Δ_k·Δ_l)·μ_0`; same inputs always
@@ -390,8 +397,9 @@ fn lex_cmp_centers(a: &Array1<f64>, b: &Array1<f64>) -> Ordering {
     Ordering::Equal
 }
 
-/// Monoid merge: recenter onto a common reference, then add componentwise.
-/// Exact (pure binomial shift, no kernel re-evaluation) and deterministic.
+/// Monoid merge: recenter compatible frozen-weight tables onto a common
+/// reference, then add componentwise. Exact for those polynomial moments
+/// (pure binomial shift, no kernel re-evaluation) and deterministic.
 ///
 /// Canonical orientation: the merged table lives at the lexicographically
 /// SMALLER of the two operand centers ([`lex_cmp_centers`]), and the other
@@ -432,7 +440,8 @@ pub fn merge_moment_tables(
 
 /// The local jet-fit sufficient statistics read off one table — exactly the
 /// per-block quantities `assemble_weighted_forms` (measure_jet_smooth.rs)
-/// computes from raw points, reproduced in closed form from stored moments.
+/// computes from raw points when the table weights are frozen at the same
+/// center and scale, reproduced in closed form from stored moments.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeasureJetJetStats {
     /// Kernel mass `q = Σ w_i` (unit-channel zeroth moment).
@@ -443,7 +452,7 @@ pub struct MeasureJetJetStats {
     /// `ā = m1[0]/(qε)` (`Φ` rows are `(x_i − c)/ε`).
     pub gram: Array2<f64>,
     /// Local-fit right-hand side `Bᵀv/q = m1[ch]/(qε) − ā·(m0[ch]/q)` — the
-    /// vector the τ-ridged slope solve `(G + τI) b̂ = Bᵀv/q` consumes.
+    /// vector the exact weighted affine projection consumes.
     pub cross: Array1<f64>,
 }
 
@@ -461,7 +470,7 @@ pub struct MeasureJetJetStats {
 ///   projection `Cv = v − (uᵀv)·1` of the constant-annihilation contract),
 /// - `cross_k = m1[ch,k]/(q·ε) − ā_k·mean`    ↔ `Bᵀv/q` with
 ///   `B = WΦ − w·aᵀ` (column-centering makes `Φ̃ᵀW·1 = 0`, so
-///   `Φ̃ᵀWCv/q = Bᵀv/q` — the exact RHS of the ridged local fit).
+///   `Φ̃ᵀWCv/q = Bᵀv/q` — the exact RHS of the local affine projection).
 ///
 /// For `channel == 0` (the unit channel) `mean` is exactly `1.0` and `cross`
 /// is identically `+0.0` (the same division is subtracted from itself) —

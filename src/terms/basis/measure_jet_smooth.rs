@@ -9,12 +9,14 @@
 //!   w_ℓ = log_step · ε_ℓ^(−2s),
 //! ```
 //!
-//! where `R_{i,ℓ}` is the residual quadratic form of the τ-ridged, weighted
-//! local affine fit at center `i` and scale `ε_ℓ`: kernel weights
+//! where `R_{i,ℓ}` is the residual quadratic form of the exact weighted
+//! local affine projection at center `i` and scale `ε_ℓ`: kernel weights
 //! `w_j = mass_j · exp(−d_ij²/(2ε_ℓ²))`, kernel mass `q_i = Σ_j w_j`, and the
-//! penalized fit `min_b ‖Cv − Φ̃b‖²_W + τ·q·‖b‖²` over weighted-centered
-//! values `Cv = v − (uᵀv)·1` (`u = w/q`) and weighted-centered scaled
-//! features `Φ̃` (rows `(c_j − c_i)/ε`, column means removed under `u`).
+//! fit `min_b ‖Cv − Φ̃b‖²_W` over weighted-centered values
+//! `Cv = v − (uᵀv)·1` (`u = w/q`) and weighted-centered scaled features
+//! `Φ̃` (rows `(c_j − c_i)/ε`, column means removed under `u`). Rank-deficient
+//! cells use the machine-precision pseudo-inverse of `Φ̃ᵀWΦ̃/q`, so ambient
+//! affine values are projected away exactly instead of paying a ridge toll.
 //!
 //! # Contracts (each is load-bearing; tests pin them)
 //!
@@ -24,13 +26,13 @@
 //!   prior mean to revert to. This is the no-mean-reversion contract of the
 //!   measure-jet design; ridging the constant would silently reintroduce
 //!   mean reversion.
-//! - **Ridge as noise floor / rank adaptation.** Only the slope block is
-//!   ridged (`G + τ·I` on the dimensionless local Gram `G = Φ̃ᵀWΦ̃/q`). On a
-//!   1-D filament in ambient dimension d the local Gram has numerical rank
-//!   ~1: the resolved tangent slope is absorbed (not penalized) while slope
-//!   variation in unresolved/below-noise directions is treated as roughness.
-//!   Rank transitions (filament thickening into a sheet) are smooth
-//!   crossovers governed by τ, not discrete decisions.
+//! - **Exact affine projection / rank adaptation.** The slope block uses the
+//!   rank-revealing pseudo-inverse of the dimensionless local Gram
+//!   `G = Φ̃ᵀWΦ̃/q`, not a Tikhonov ridge. On a 1-D filament in ambient
+//!   dimension d the resolved tangent slope is absorbed (not penalized);
+//!   unresolved directions have no variation after weighted centering and do
+//!   not create an affine toll. The retained rank is a numerical property of
+//!   the weighted cell, not a smoothing dial.
 //! - **Mellin band.** Scales form a geometric grid from the center-spacing
 //!   floor to the half-diameter; `w_ℓ = log_step · ε_ℓ^(−2s)` is the
 //!   quadrature of `∫ ε^(−2s) (·) dε/ε`, giving a continuous smoothness
@@ -39,9 +41,11 @@
 //!   (substitute `t = ε|ξ|` in the Mellin integral) — fractional Duchon on
 //!   the web with learned order.
 //! - **Density normalization.** The outer quadrature weight
-//!   `mass_i · q_i^(1−2α)` realizes `dμ(x)/q_ε(x)^(2α−1)`; `α = 1` (default)
-//!   removes the sampling-density dependence of the limiting energy, `α = 0`
-//!   penalizes density-weighted roughness.
+//!   `mass_i · q_i^(1−2α)` realizes `dμ(x)/q_ε(x)^(2α−1)`. On a p-dimensional
+//!   stratum with sampling density `ρ`, `q_ε ~ Cρ ε^p` and the local affine
+//!   residual scales as `R_ε ~ Cρ ε^{p+4}|Hf|²`, so the limiting density
+//!   factor is `ρ^(3−2α)`: `α = 1` (default) is density-weighted Hessian
+//!   energy, while density-free Hessian energy would use `α = 3/2`.
 //! - **Frozen-quadrature replay.** The penalty and extrapolation diagnostic
 //!   depend on the FIT data through center masses, the realized band, on-web
 //!   support anchors, and penalty normalization scales. The freeze step
@@ -73,22 +77,19 @@
 //!   through the per-block log-weights (`∂ln w/∂s = −2 ln ε`,
 //!   `∂ln w/∂α = −2 ln q`), so the jets are reweighted re-scatters of the
 //!   SAME residual blocks, FD-gated in this module's tests.
-//! - **Not yet shipped:** the τ-channel (a resolvent derivative of the
-//!   ridged local Gram — analytic, heavier plumbing) and the outer-engine
-//!   wiring itself (the `normalize_penaltywith_psi_derivatives` seam), which
-//!   follow the Matérn iso-κ template once the #901 seam is green.
+//!   The retained τ coordinate is inert under the exact projection, so its
+//!   derivative slots are identically zero.
 //!
 //! # Cost shape (and the upgrade ladder above it)
 //!
 //! The outer sum is coarsened per scale to a deterministic ε/2-net (the
 //! outer Riemann sum needs resolution ε, not the center-spacing floor), so
 //! the band totals ~O(m²·d) instead of O(L·m³) — the V0 realization of the
-//! pyramid principle that each scale interacts at its own level. The known
-//! upgrade ladder (jet-MRA synthesis coordinates with a diagonal prior;
-//! Hermite/fast-Gauss moment fusion at n-scale; screening-based sparse
-//! factorization) replaces this module's REALIZATION without touching the
-//! estimand: the analysis-form energy above is the definition, everything
-//! else is certified quadrature of it.
+//! pyramid principle that each scale interacts at its own level. This is
+//! mass-lumped quadrature of the displayed outer integral; it is first-
+//! moment exact for the cell locations and carries the usual
+//! `O(diam²/ε²)` relative scale for smooth Gaussian-weighted functionals,
+//! not an estimand-preserving identity.
 //! The long-form home for the ladder and the substrate contracts is the V∞
 //! charter (`docs/measure_jet_v_infinity.md`); its §2 moment substrate is
 //! `measure_jet_moments.rs`, its §5 extrapolation pricing
@@ -112,13 +113,15 @@ use super::{
 
 /// Truncation radius of the Gaussian profile in units of the scale ε: weights
 /// beyond `3ε` are below `e^{-4.5} ≈ 1.1e-2` of the peak and are dropped from
-/// the local fit, bounding each local residual form to the ε-neighborhood.
+/// both the local fit and the `q^(1−2α)` outer weight. This is an absolute
+/// kernel-weight cutoff; using the same truncated q keeps the discrete
+/// functional self-consistent, but it is not a relative tail-error bound.
 const MEASURE_JET_PROFILE_CUTOFF: f64 = 3.0;
 
-/// Relative eigenvalue threshold for the unridged (`tau0 == 0`) pseudo-inverse
-/// of the local slope Gram: directions with `λ ≤ threshold · λ_max` are
-/// treated as unresolved and excluded from the affine fit.
-const MEASURE_JET_PSEUDOINVERSE_RTOL: f64 = 1e-10;
+/// Relative eigenvalue threshold for rank-revealing pseudo-inverses of local
+/// Gram matrices. Directions at the roundoff floor are treated as unresolved
+/// and excluded from the affine fit.
+const MEASURE_JET_PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
 
 /// Default continuous smoothness order `s` realized by the `0.0` auto
 /// sentinel. Sits mid-band in the admissible `(0, 2)` for the affine-jet
@@ -202,16 +205,17 @@ pub struct MeasureJetBasisSpec {
     pub order_s: f64,
     /// Density-normalization exponent α (outer weight `q^{1−2α}`).
     pub alpha: f64,
-    /// Dimensionless jet-ridge floor τ on the local slope Gram. `0.0` selects
-    /// the exact pseudo-inverse (test/oracle mode; the fitted default keeps a
-    /// positive floor as the noise-floor regularizer).
+    /// Historical τ coordinate retained for frozen specs and ψ layout. The
+    /// measure-jet energy itself uses the exact weighted affine projection and
+    /// is independent of τ; the τ ψ derivatives are therefore zero.
     pub tau0: f64,
     /// Number of scale nodes; `0` sentinel = auto dyadic band.
     pub num_scales: usize,
     /// Representer (Gaussian RBF) range ℓ; `0.0` sentinel = auto
     /// (median nearest-center spacing × [`MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR`]).
     pub length_scale: f64,
-    /// Add the ridge-like shrinkage penalty alongside the jet-energy penalty.
+    /// Add an affine-preserving shrinkage penalty alongside the jet-energy
+    /// penalty.
     pub double_penalty: bool,
     /// Realized-design identifiability policy (see type docs).
     #[serde(default)]
@@ -245,14 +249,11 @@ pub struct MeasureJetBand {
     pub log_step: f64,
 }
 
-/// The energy and its exact hyperparameter jets in all three dials —
-/// `(s, α, ψ_τ = ln τ)` — ten symmetric m×m forms scattered from the SAME
-/// local residual blocks in one pass. `s` and `α` enter only through
-/// per-block log-weights; `ln τ` enters through the resolvent of the ridged
-/// local Gram (`∂R/∂τ = B·M²·Bᵀ/q`, `∂²R/∂τ² = −2·B·M³·Bᵀ/q` with
-/// `M = (G + τI)⁻¹`), also closed-form. All ten are exact by construction
-/// (FD-gated in this module's tests), and the ψ-channel consumes them with
-/// zero design drift.
+/// The energy and its exact hyperparameter jets in the live dials. `s` and
+/// `α` enter only through per-block log-weights. The retained `ln τ` slots
+/// are zero because the local fit is the exact weighted affine projection
+/// and no longer depends on τ. All forms are scattered from the SAME local
+/// residual blocks, and the ψ-channel consumes them with zero design drift.
 pub struct MeasureJetEnergyJets {
     pub q: Array2<f64>,
     pub dq_ds: Array2<f64>,
@@ -312,6 +313,98 @@ fn householder_drop_first_apply(x: &Array2<f64>, u: &Array1<f64>) -> Array2<f64>
         }
     }
     out
+}
+
+fn symmetric_pseudoinverse(
+    a: &Array2<f64>,
+    label: &str,
+) -> Result<Array2<f64>, BasisError> {
+    let n = a.nrows();
+    if a.ncols() != n {
+        crate::bail_dim_basis!(
+            "measure-jet pseudo-inverse `{label}` needs a square matrix, got {:?}",
+            a.dim()
+        );
+    }
+    let (evals, evecs) = a.eigh(Side::Lower).map_err(|e| {
+        BasisError::InvalidInput(format!(
+            "measure-jet pseudo-inverse `{label}` eigendecomposition failed: {e}"
+        ))
+    })?;
+    let lam_max = evals.iter().fold(0.0_f64, |acc, v| acc.max((*v).max(0.0)));
+    let rank_tol = MEASURE_JET_PSEUDOINVERSE_RTOL * (n.max(1) as f64) * lam_max;
+    let mut scaled = evecs.clone();
+    for (k, mut col) in scaled.axis_iter_mut(Axis(1)).enumerate() {
+        let lam = evals[k].max(0.0);
+        let inv = if lam > rank_tol {
+            1.0 / lam
+        } else {
+            0.0
+        };
+        col.mapv_inplace(|v| v * inv);
+    }
+    Ok(scaled.dot(&evecs.t()))
+}
+
+fn affine_preserving_coefficient_ridge(
+    kz: &Array2<f64>,
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, BasisError> {
+    let m = centers.nrows();
+    let d = centers.ncols();
+    let p = kz.ncols();
+    if kz.nrows() != m || masses.len() != m {
+        crate::bail_dim_basis!(
+            "measure-jet affine-preserving ridge shape mismatch: kz {:?}, centers {:?}, masses {}",
+            kz.dim(),
+            centers.dim(),
+            masses.len()
+        );
+    }
+    if p == 0 {
+        return Ok(Array2::<f64>::zeros((0, 0)));
+    }
+    let mut weighted_kz = kz.clone();
+    for (i, mut row) in weighted_kz.outer_iter_mut().enumerate() {
+        row.mapv_inplace(|v| v * masses[i]);
+    }
+    let normal = kz.t().dot(&weighted_kz);
+    let normal_pinv = symmetric_pseudoinverse(&normal, "affine ridge normal")?;
+    let mut affine = Array2::<f64>::ones((m, d + 1));
+    for i in 0..m {
+        for k in 0..d {
+            affine[(i, k + 1)] = centers[(i, k)];
+        }
+    }
+    let mut weighted_affine = affine.clone();
+    for (i, mut row) in weighted_affine.outer_iter_mut().enumerate() {
+        row.mapv_inplace(|v| v * masses[i]);
+    }
+    let rhs = kz.t().dot(&weighted_affine);
+    let beta = normal_pinv.dot(&rhs);
+    let beta_gram = beta.t().dot(&beta);
+    let (evals, evecs) = beta_gram.eigh(Side::Lower).map_err(|e| {
+        BasisError::InvalidInput(format!(
+            "measure-jet affine ridge subspace eigendecomposition failed: {e}"
+        ))
+    })?;
+    let lam_max = evals.iter().fold(0.0_f64, |acc, v| acc.max((*v).max(0.0)));
+    let rank_tol = MEASURE_JET_PSEUDOINVERSE_RTOL * ((d + 1).max(1) as f64) * lam_max;
+    let mut ridge = Array2::<f64>::eye(p);
+    for k in 0..(d + 1) {
+        let lam = evals[k].max(0.0);
+        if lam <= rank_tol {
+            continue;
+        }
+        let dir = beta.dot(&evecs.column(k).to_owned()) / lam.sqrt();
+        for r in 0..p {
+            for c in 0..p {
+                ridge[(r, c)] -= dir[r] * dir[c];
+            }
+        }
+    }
+    Ok((&ridge + &ridge.t()) * 0.5)
 }
 
 /// Pairwise squared distances `‖a_i − b_j‖²` via the GEMM identity
@@ -383,10 +476,11 @@ fn median_nearest_center_spacing(dist2: &Array2<f64>) -> Result<f64, BasisError>
 
 /// Build the realized geometric scale band from the center set: floor at the
 /// median nearest-center spacing (below it the quadrature resolves nothing),
-/// ceiling at half the bounding-box diagonal (above it every local fit is the
-/// global affine fit). `num_scales == 0` requests the auto count
-/// `clamp(⌈log2(ε_max/ε_min)⌉ + 1, 3, 8)`; a degenerate band (ceiling ≤
-/// floor) collapses to the single floor scale with `log_step = ln 2`.
+/// ceiling at half the bounding-box diagonal (a deterministic diameter-scale
+/// cap; local fits remain center-weighted and distinct there).
+/// `num_scales == 0` requests the auto count `clamp(⌈log2(ε_max/ε_min)⌉ + 1,
+/// 3, 8)`; a degenerate band (ceiling ≤ floor) collapses to the single floor
+/// scale with `log_step = ln 2`.
 pub fn measure_jet_band(
     centers: ArrayView2<'_, f64>,
     num_scales: usize,
@@ -528,13 +622,14 @@ pub fn measure_jet_center_masses(
 /// per-scale spectrum are all this routine with different weight closures,
 /// so a value/derivative desync is structurally impossible.
 ///
-/// Per block the closure receives `(scale_idx, eps, q, base)` where `base`
+/// Per block the closure receives `(scale_idx, eps, q, base)` where `q` is
+/// the truncated kernel sum used by the local residual and `base`
 /// is the fully-assembled outer weight
 /// `log_step · ε^(−2s) · net_mass_i · q^(1−2α)`, and writes, per requested
-/// form, one weight triple `[w_R, w_2, w_3]` against the three block
-/// channels `R = CᵀWC − B·M·Bᵀ/q`, `B·M²·Bᵀ/q`, and `B·M³·Bᵀ/q`
-/// (`M = (G + τI)⁻¹`) — the resolvent powers carrying the exact ln-τ jets.
-/// Channels 2 and 3 are only computed when `channels` requests them.
+/// form, one weight triple `[w_R, w_2, w_3]`. Only `w_R` is live:
+/// `R = CᵀWC − B·G⁺·Bᵀ/q`, with `G⁺` the rank-revealing pseudo-inverse.
+/// The extra slots are retained for the ψ layout and receive zero local
+/// channels because τ no longer changes the energy.
 ///
 /// The outer sum over centers is coarsened per scale to a deterministic
 /// ε/2-net with nearest-member mass aggregation (the outer Riemann sum needs
@@ -676,43 +771,12 @@ where
                     g[(r, c)] -= a_mean[r] * a_mean[c];
                 }
             }
-            // (G + τI)⁻¹ via symmetric eigendecomposition; pseudo-inverse
-            // with a relative floor in the τ = 0 oracle mode.
-            let (evals, evecs) = g.eigh(Side::Lower).map_err(|e| {
-                BasisError::InvalidInput(format!(
-                    "measure-jet local Gram eigendecomposition failed at center {i}: {e}"
-                ))
-            })?;
-            let lam_max = evals.iter().cloned().fold(0.0_f64, f64::max);
-            let mut inv_diag = Array1::<f64>::zeros(d);
-            for k in 0..d {
-                let lam = evals[k].max(0.0);
-                inv_diag[k] = if tau0 > 0.0 {
-                    1.0 / (lam + tau0)
-                } else if lam > MEASURE_JET_PSEUDOINVERSE_RTOL * lam_max {
-                    1.0 / lam
-                } else {
-                    0.0
-                };
-            }
-            // ONE resolvent-power kernel `M^p = V·diag(inv_diag^p)·Vᵀ`
-            // (`M = (G + τI)⁻¹`) serves the value channel (p = 1) and the
-            // ln-τ jet channels `B·M²·Bᵀ/q`, `B·M³·Bᵀ/q` — the latter two
-            // computed only on request.
-            let m_power = |power: i32| -> Array2<f64> {
-                let mut vm = evecs.clone();
-                for (k, mut col) in vm.axis_iter_mut(Axis(1)).enumerate() {
-                    let s = inv_diag[k].powi(power);
-                    col.mapv_inplace(|v| v * s);
-                }
-                vm.dot(&evecs.t())
-            };
-            let bm = b.dot(&m_power(1));
-            let bm2 = (channels >= 2).then(|| b.dot(&m_power(2)));
-            let bm3 = (channels >= 3).then(|| b.dot(&m_power(3)));
+            let g_pinv = symmetric_pseudoinverse(&g, "local affine Gram")?;
+            let bm = b.dot(&g_pinv);
             let base = scale_weight * net_mass[i] * q.powf(1.0 - 2.0 * alpha);
             weights(scale_idx, eps, q, base, &mut wbuf);
-            // Scatter-add Σ_k wbuf[k]·[R | B·M²·Bᵀ/q | B·M³·Bᵀ/q] into each form.
+            // Scatter-add Σ_k wbuf[k]·R into each form. The τ channels are
+            // zero because the exact projection is τ-independent.
             for (a, &ja) in idx.iter().enumerate() {
                 let bma = bm.row(a);
                 for (c, &jc) in idx.iter().enumerate() {
@@ -721,11 +785,9 @@ where
                     if a == c {
                         val_r += w[a];
                     }
-                    let val_2 = bm2.as_ref().map_or(0.0, |m2| m2.row(a).dot(&b_c) / q);
-                    let val_3 = bm3.as_ref().map_or(0.0, |m3| m3.row(a).dot(&b_c) / q);
                     for (k, out_k) in out.iter_mut().enumerate() {
                         let wk = wbuf[k];
-                        out_k[(ja, jc)] += wk[0] * val_r + wk[1] * val_2 + wk[2] * val_3;
+                        out_k[(ja, jc)] += wk[0] * val_r;
                     }
                 }
             }
@@ -771,12 +833,12 @@ where
 ///   CᵀWC          = W − w·wᵀ/q,
 ///   B = CᵀWΦ̃     = WΦ − w·aᵀ          (a = Φᵀw/q),
 ///   G = Φ̃ᵀWΦ̃/q  = (ΦᵀWΦ)/q − a·aᵀ,
-///   R_loc         = CᵀWC − B·(G + τI)⁻¹·Bᵀ/q,
+///   R_loc         = CᵀWC − B·G⁺·Bᵀ/q,
 /// ```
 ///
-/// with `(G + τI)⁻¹` realized through the symmetric eigendecomposition
-/// (pseudo-inverse with relative threshold when `τ = 0`). One walk of
-/// [`assemble_weighted_forms`] with the unit weight.
+/// with `G⁺` realized through the symmetric eigendecomposition and a
+/// machine-precision rank cutoff. One walk of [`assemble_weighted_forms`]
+/// with the unit weight.
 pub fn measure_jet_energy_form(
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
@@ -799,23 +861,20 @@ pub fn measure_jet_energy_form(
     Ok(forms.swap_remove(0))
 }
 
-/// The energy together with its exact first and second jets in all three
-/// dials `(s, α, ψ_τ = ln τ)` — the complete measure-jet ψ-channel
-/// feedstock. With `g_s = −2 ln ε`, `g_α = −2 ln q`, `M = (G + τI)⁻¹`:
+/// The energy together with its exact first and second jets in the live
+/// dials, plus zero slots for the retained `ψ_τ = ln τ` coordinate. With
+/// `g_s = −2 ln ε`, `g_α = −2 ln q`:
 ///
 /// ```text
 ///   ∂Q/∂s   = Σ g_s·w·R,        ∂²Q/∂s²   = Σ g_s²·w·R,
 ///   ∂Q/∂α   = Σ g_α·w·R,        ∂²Q/∂α²   = Σ g_α²·w·R,
 ///   ∂²Q/∂s∂α = Σ g_s·g_α·w·R,
-///   ∂Q/∂ψ_τ  = Σ w·τ·BM²Bᵀ/q,
-///   ∂²Q/∂ψ_τ² = Σ w·(τ·BM²Bᵀ − 2τ²·BM³Bᵀ)/q,
-///   ∂²Q/∂s∂ψ_τ = Σ g_s·w·τ·BM²Bᵀ/q,   ∂²Q/∂α∂ψ_τ = Σ g_α·w·τ·BM²Bᵀ/q,
+///   ∂Q/∂ψ_τ = ∂²Q/∂ψ_τ² = ∂²Q/∂s∂ψ_τ = ∂²Q/∂α∂ψ_τ = 0.
 /// ```
 ///
 /// all scattered from the SAME local blocks as `Q` in one pass (no second
 /// assembly that could drift). FD-gated in this module's tests. Requires
-/// `tau0 > 0` (the ln-τ channel is undefined in the τ = 0 pseudo-inverse
-/// oracle mode).
+/// `tau0 > 0` only because the retained coordinate is `ln τ`.
 pub fn measure_jet_energy_form_with_jets(
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
@@ -826,11 +885,9 @@ pub fn measure_jet_energy_form_with_jets(
 ) -> Result<MeasureJetEnergyJets, BasisError> {
     if !(tau0.is_finite() && tau0 > 0.0) {
         crate::bail_invalid_basis!(
-            "measure-jet jets need tau0 > 0 (the ln-τ channel is undefined at the τ = 0 \
-             pseudo-inverse oracle mode); got {tau0}"
+            "measure-jet jets need tau0 > 0 because the retained τ coordinate is ln τ; got {tau0}"
         );
     }
-    let t = tau0;
     let mut forms = assemble_weighted_forms(
         centers,
         masses,
@@ -849,10 +906,10 @@ pub fn measure_jet_energy_form_with_jets(
             out[3] = [ga * base, 0.0, 0.0];
             out[4] = [ga * ga * base, 0.0, 0.0];
             out[5] = [gs * ga * base, 0.0, 0.0];
-            out[6] = [0.0, t * base, 0.0];
-            out[7] = [0.0, t * base, -2.0 * t * t * base];
-            out[8] = [0.0, gs * t * base, 0.0];
-            out[9] = [0.0, ga * t * base, 0.0];
+            out[6] = [0.0, 0.0, 0.0];
+            out[7] = [0.0, 0.0, 0.0];
+            out[8] = [0.0, 0.0, 0.0];
+            out[9] = [0.0, 0.0, 0.0];
         },
     )?;
     let d2q_dalpha_dlogtau = forms.pop().expect("ten assembled forms");
@@ -1300,7 +1357,7 @@ pub fn build_measure_jet_basis(
         });
     }
     if spec.double_penalty {
-        let ridge = Array2::<f64>::eye(design.ncols());
+        let ridge = affine_preserving_coefficient_ridge(&kz, centers.view(), masses.view())?;
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
             matrix: ridge_norm,
@@ -1350,7 +1407,8 @@ pub fn build_measure_jet_basis(
 /// Coordinates (the layout contract for the registration arm):
 /// - per-level (spectral) mode, `order_s == 0.0`: `[α, ln τ]` — the order is
 ///   absorbed by the REML-learned per-scale amplitudes and is NOT a ψ
-///   coordinate;
+///   coordinate; `ln τ` is retained as an inert coordinate with zero
+///   derivatives because the exact affine projection is τ-independent;
 /// - fused (pinned-order) mode: `[s, α, ln τ]`.
 ///
 /// Design drift is identically zero for every coordinate (the Gaussian
@@ -1360,10 +1418,11 @@ pub fn build_measure_jet_basis(
 /// normalization as the fit-time candidates
 /// (`normalize_penaltywith_psi_derivatives` + the cross rule), so criterion
 /// value and criterion derivative share one normalization — the #901 lesson
-/// made structural. The ridge candidate (when `double_penalty` is on)
-/// carries identically-zero derivatives. The per-candidate layout follows
-/// the builder's ORIGINAL candidate order (scale candidates then ridge /
-/// primary then ridge); consumers align to the FITTED penalty list via
+/// made structural. The affine-preserving ridge candidate (when
+/// `double_penalty` is on) carries identically-zero derivatives. The
+/// per-candidate layout follows the builder's ORIGINAL candidate order
+/// (scale candidates then ridge / primary then ridge); consumers align to
+/// the FITTED penalty list via
 /// `PenaltyInfo.original_index` when the active-candidate filter dropped
 /// any.
 pub fn build_measure_jet_basis_psi_derivatives(
@@ -1372,8 +1431,7 @@ pub fn build_measure_jet_basis_psi_derivatives(
 ) -> Result<AnisoBasisPsiDerivatives, BasisError> {
     if !(spec.tau0.is_finite() && spec.tau0 > 0.0) {
         crate::bail_invalid_basis!(
-            "measure-jet ψ derivatives need tau0 > 0 (the ln-τ channel is undefined at the \
-             τ = 0 pseudo-inverse oracle mode); got {}",
+            "measure-jet ψ derivatives need tau0 > 0 because the retained τ coordinate is ln τ; got {}",
             spec.tau0
         );
     }
@@ -1384,7 +1442,6 @@ pub fn build_measure_jet_basis_psi_derivatives(
     };
     let n = data.nrows();
     let p = geom.kz.ncols();
-    let t = spec.tau0;
     let kz = &geom.kz;
     let sandwich = |j: &Array2<f64>| {
         let s = kz.t().dot(j).dot(kz);
@@ -1404,7 +1461,7 @@ pub fn build_measure_jet_basis_psi_derivatives(
         )>,
     ) = if geom.per_level {
         let l_count = band.eps.len();
-        // Six forms per scale: value, ∂α, ∂α², ∂lnτ, ∂lnτ², ∂α∂lnτ — same
+        // Six forms per scale: value, ∂α, ∂α², and zero τ slots — same
         // blocks, one walk (single-source rule).
         let forms = assemble_weighted_forms(
             geom.centers.view(),
@@ -1412,7 +1469,7 @@ pub fn build_measure_jet_basis_psi_derivatives(
             &band,
             geom.order_s_eval,
             spec.alpha,
-            t,
+            spec.tau0,
             6 * l_count,
             3,
             &|scale_idx, _, q: f64, base: f64, out: &mut [[f64; 3]]| {
@@ -1424,9 +1481,9 @@ pub fn build_measure_jet_basis_psi_derivatives(
                 out[k0] = [base, 0.0, 0.0];
                 out[k0 + 1] = [ga * base, 0.0, 0.0];
                 out[k0 + 2] = [ga * ga * base, 0.0, 0.0];
-                out[k0 + 3] = [0.0, t * base, 0.0];
-                out[k0 + 4] = [0.0, t * base, -2.0 * t * t * base];
-                out[k0 + 5] = [0.0, ga * t * base, 0.0];
+                out[k0 + 3] = [0.0, 0.0, 0.0];
+                out[k0 + 4] = [0.0, 0.0, 0.0];
+                out[k0 + 5] = [0.0, 0.0, 0.0];
             },
         )?;
         let mut raw = Vec::with_capacity(l_count);
@@ -1612,11 +1669,10 @@ mod tests {
         );
     }
 
-    /// Unridged (τ = 0) local fits annihilate ambient affine functions on
-    /// well-spread centers; the fitted default τ = 1e-3 damps them to far
-    /// below a rough vector's energy instead of exactly zero.
+    /// The default local projection annihilates ambient affine functions
+    /// exactly; τ is retained for ψ layout but no longer adds an affine toll.
     #[test]
-    fn energy_form_annihilates_affine_when_unridged() {
+    fn energy_form_annihilates_affine_at_default_tau() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
         let m = centers.nrows();
@@ -1627,22 +1683,14 @@ mod tests {
             affine[i] = 0.7 + 1.3 * centers[(i, 0)] - 0.4 * centers[(i, 1)];
             rough[i] = if i % 2 == 0 { 1.0 } else { -1.0 };
         }
-        let q0 = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 0.0)
-            .expect("unridged energy form");
-        let e_affine0 = affine.dot(&q0.dot(&affine));
-        let e_rough0 = rough.dot(&q0.dot(&rough));
-        assert!(e_rough0 > 0.0, "rough vector must pay energy");
+        let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 1e-3)
+            .expect("energy form");
+        let e_affine = affine.dot(&q.dot(&affine));
+        let e_rough = rough.dot(&q.dot(&rough));
+        assert!(e_rough > 0.0, "rough vector must pay energy");
         assert!(
-            e_affine0.abs() <= 1e-10 * e_rough0,
-            "unridged affine energy {e_affine0:.3e} vs rough {e_rough0:.3e}"
-        );
-        let q1 = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 1e-3)
-            .expect("ridged energy form");
-        let e_affine1 = affine.dot(&q1.dot(&affine));
-        let e_rough1 = rough.dot(&q1.dot(&rough));
-        assert!(
-            e_affine1 <= 1e-2 * e_rough1,
-            "ridged affine energy {e_affine1:.3e} not damped vs rough {e_rough1:.3e}"
+            e_affine.abs() <= 1e-12 * e_rough,
+            "default affine energy {e_affine:.3e} vs rough {e_rough:.3e}"
         );
     }
 
@@ -1690,9 +1738,10 @@ mod tests {
         );
     }
 
-    /// The exact (s, α) jets must match central finite differences of the
-    /// energy — the FD gate the ψ-channel stage will inherit (the discipline
-    /// whose absence is exactly the objective↔gradient desync bug class).
+    /// The exact (s, α) jets and zero τ slots must match central finite
+    /// differences of the energy — the FD gate the ψ-channel stage will
+    /// inherit (the discipline whose absence is exactly the
+    /// objective↔gradient desync bug class).
     #[test]
     fn energy_jets_match_finite_differences() {
         let (centers, masses) = two_cluster_centers();
