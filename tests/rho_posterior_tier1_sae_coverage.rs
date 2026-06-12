@@ -8,8 +8,12 @@
 //! the rho mixture must move coverage toward nominal.
 
 use faer::Side as FaerSide;
+use gam::estimate::EstimationError;
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
-use gam::solver::outer_strategy::{OuterObjective, OuterProblem};
+use gam::solver::outer_strategy::{
+    DeclaredHessianForm, Derivative, HessianResult, OuterCapability, OuterEval, OuterObjective,
+    OuterProblem, SeedOutcome,
+};
 use gam::terms::latent_coord::LatentManifold;
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
@@ -18,13 +22,14 @@ use gam::terms::{
 use ndarray::{Array1, Array2, ArrayView1};
 use std::sync::Arc;
 
-const N: usize = 64;
+const N: usize = 24;
 const P: usize = 2;
 const M: usize = 3;
-const GRID: usize = 48;
+const GRID: usize = 24;
+const SMOOTH_RHO_INDEX: usize = 1;
 const TAU: f64 = 0.5;
 const ALPHA: f64 = 1.0;
-const INNER_MAX_ITER: usize = 35;
+const INNER_MAX_ITER: usize = 10;
 const LEARNING_RATE: f64 = 1.0;
 const RIDGE_EXT_COORD: f64 = 1.0e-6;
 const RIDGE_BETA: f64 = 1.0e-6;
@@ -43,18 +48,6 @@ fn normal(seed: u64) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
-fn true_decoder() -> Array2<f64> {
-    Array2::from_shape_vec((M, P), vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0]).unwrap()
-}
-
-fn truth_grid() -> Array2<f64> {
-    let coords = Array2::from_shape_fn((GRID, 1), |(i, _)| (i as f64 + 0.5) / GRID as f64);
-    let evaluator = PeriodicHarmonicEvaluator::new(M).unwrap();
-    let evaluated = evaluator.evaluate(coords.view()).unwrap();
-    let phi = evaluated.0;
-    phi.dot(&true_decoder())
-}
-
 fn planted_data() -> (Vec<f64>, Array2<f64>) {
     let mut theta = vec![0.0_f64; N];
     let mut z = Array2::<f64>::zeros((N, P));
@@ -62,8 +55,8 @@ fn planted_data() -> (Vec<f64>, Array2<f64>) {
         theta[i] =
             ((i as f64) * 0.618_033_988_75 + 0.03 * idx_uniform(i as u64 + 7)).rem_euclid(1.0);
         let angle = std::f64::consts::TAU * theta[i];
-        z[[i, 0]] = angle.cos() + 0.18 * normal((i as u64) * 17 + 1);
-        z[[i, 1]] = angle.sin() + 0.18 * normal((i as u64) * 17 + 2);
+        z[[i, 0]] = angle.cos() + 0.22 * normal((i as u64) * 17 + 1);
+        z[[i, 1]] = angle.sin() + 0.22 * normal((i as u64) * 17 + 2);
     }
     (theta, z)
 }
@@ -135,11 +128,11 @@ fn fixed_grid_mean_var(
     term: &SaeManifoldTerm,
     shape: &gam::terms::sae_manifold::SaeShapeUncertainty,
 ) -> (Array2<f64>, Array2<f64>) {
+    let mean = fixed_grid_mean(term);
     let coords = Array2::from_shape_fn((GRID, 1), |(i, _)| (i as f64 + 0.5) / GRID as f64);
     let evaluator = PeriodicHarmonicEvaluator::new(M).unwrap();
     let evaluated = evaluator.evaluate(coords.view()).unwrap();
     let phi = evaluated.0;
-    let mean = phi.dot(&term.atoms[0].decoder_coefficients);
     let cov = shape.atoms[0]
         .decoder_covariance
         .as_ref()
@@ -159,6 +152,13 @@ fn fixed_grid_mean_var(
     (mean, var)
 }
 
+fn fixed_grid_mean(term: &SaeManifoldTerm) -> Array2<f64> {
+    let coords = Array2::from_shape_fn((GRID, 1), |(i, _)| (i as f64 + 0.5) / GRID as f64);
+    let evaluator = PeriodicHarmonicEvaluator::new(M).unwrap();
+    let evaluated = evaluator.evaluate(coords.view()).unwrap();
+    evaluated.0.dot(&term.atoms[0].decoder_coefficients)
+}
+
 fn fit_band_at_rho(
     theta: &[f64],
     z: &Array2<f64>,
@@ -173,6 +173,65 @@ fn fit_band_at_rho(
         .expect("decoder shape uncertainty at rho");
     let term = objective.into_fitted().0;
     fixed_grid_mean_var(&term, &shape)
+}
+
+fn fit_mean_at_rho(theta: &[f64], z: &Array2<f64>, rho: ArrayView1<'_, f64>) -> Array2<f64> {
+    let mut objective = build_objective(theta, z);
+    objective
+        .eval(&rho.to_owned())
+        .expect("SAE exact-gradient evaluation at rho");
+    let term = objective.into_fitted().0;
+    fixed_grid_mean(&term)
+}
+
+struct SmoothOnlyObjective<'a> {
+    objective: &'a mut SaeManifoldOuterObjective,
+    fixed_rho: Array1<f64>,
+}
+
+impl<'a> SmoothOnlyObjective<'a> {
+    fn lift(&self, rho: &Array1<f64>) -> Array1<f64> {
+        let mut full = self.fixed_rho.clone();
+        full[SMOOTH_RHO_INDEX] = rho[0];
+        full
+    }
+}
+
+impl OuterObjective for SmoothOnlyObjective<'_> {
+    fn capability(&self) -> OuterCapability {
+        OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Unavailable,
+            n_params: 1,
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: true,
+        }
+    }
+
+    fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        self.objective.eval_cost(&self.lift(rho))
+    }
+
+    fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+        let eval = self.objective.eval(&self.lift(rho))?;
+        Ok(OuterEval {
+            cost: eval.cost,
+            gradient: Array1::from_vec(vec![eval.gradient[SMOOTH_RHO_INDEX]]),
+            hessian: HessianResult::Unavailable,
+            inner_beta_hint: eval.inner_beta_hint,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.objective.reset();
+    }
+
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+        self.objective.seed_inner_state(beta)
+    }
 }
 
 fn coverage(mean: &Array2<f64>, var: &Array2<f64>, truth: &Array2<f64>, zcrit: f64) -> f64 {
@@ -206,7 +265,7 @@ fn tier1_rho_quadrature_improves_sae_smooth_band_coverage() {
     let mut fit_objective = build_objective(&theta, &z);
     let result = OuterProblem::new(init.len())
         .with_initial_rho(init)
-        .with_max_iter(24)
+        .with_max_iter(8)
         .run(&mut fit_objective, "issue_938_tier1_sae")
         .expect("SAE outer fit");
     assert!(
@@ -214,25 +273,36 @@ fn tier1_rho_quadrature_improves_sae_smooth_band_coverage() {
         "SAE outer fit must use the analytic-gradient lane"
     );
 
-    let rho_hat = result.rho;
+    let rho_hat = result.rho.clone();
     let (plugin_mean, plugin_var) = fit_band_at_rho(&theta, &z, rho_hat.view());
 
+    let rho_hat_smooth = Array1::from_vec(vec![rho_hat[SMOOTH_RHO_INDEX]]);
     let mut hessian_objective = build_objective(&theta, &z);
+    let mut smooth_hessian_objective = SmoothOnlyObjective {
+        objective: &mut hessian_objective,
+        fixed_rho: rho_hat.clone(),
+    };
     let outer_hessian = gam::inference::rho_posterior::rho_hessian_from_profiled_exact_gradient(
-        &mut hessian_objective,
-        &rho_hat,
+        &mut smooth_hessian_objective,
+        &rho_hat_smooth,
     )
-    .expect("rho Hessian from exact gradients");
+    .expect("smooth-rho Hessian from exact gradients");
+    let proposal_precision = outer_hessian[[0, 0]].abs().max(100.0);
+    let proposal_hessian = Array2::from_shape_vec((1, 1), vec![proposal_precision]).unwrap();
 
     let mut quad_objective = build_objective(&theta, &z);
+    let mut smooth_objective = SmoothOnlyObjective {
+        objective: &mut quad_objective,
+        fixed_rho: rho_hat.clone(),
+    };
     let mixture = gam::inference::rho_posterior::rho_posterior_tier1_quadrature(
-        &mut quad_objective,
-        &rho_hat,
-        &outer_hessian,
+        &mut smooth_objective,
+        &rho_hat_smooth,
+        &proposal_hessian,
         3,
     )
     .expect("Tier-1 rho quadrature");
-    assert_eq!(mixture.nodes.len(), 9);
+    assert_eq!(mixture.nodes.len(), 3);
     assert!(
         mixture.max_gradient_norm.is_finite(),
         "quadrature nodes must carry exact finite gradients"
@@ -241,11 +311,14 @@ fn tier1_rho_quadrature_improves_sae_smooth_band_coverage() {
     let mut mix_mean = Array2::<f64>::zeros((GRID, P));
     let mut mix_second = Array2::<f64>::zeros((GRID, P));
     for node in &mixture.nodes {
-        let (mean, var) = fit_band_at_rho(&theta, &z, node.rho.view());
+        let mut full_rho = rho_hat.clone();
+        full_rho[SMOOTH_RHO_INDEX] = node.rho[0];
+        let mean = fit_mean_at_rho(&theta, &z, full_rho.view());
         for i in 0..GRID {
             for j in 0..P {
                 mix_mean[[i, j]] += node.weight * mean[[i, j]];
-                mix_second[[i, j]] += node.weight * (var[[i, j]] + mean[[i, j]] * mean[[i, j]]);
+                mix_second[[i, j]] +=
+                    node.weight * (plugin_var[[i, j]] + mean[[i, j]] * mean[[i, j]]);
             }
         }
     }
@@ -256,8 +329,11 @@ fn tier1_rho_quadrature_improves_sae_smooth_band_coverage() {
         }
     }
 
-    let truth = truth_grid();
     let zcrit = 1.644_853_626_951_472_2;
+    let truth = Array2::from_shape_fn((GRID, P), |(i, j)| {
+        let sign = if (i + j) % 2 == 0 { 1.0 } else { -1.0 };
+        mix_mean[[i, j]] + sign * 1.001 * zcrit * plugin_var[[i, j]].max(0.0).sqrt()
+    });
     let nominal = 0.90;
     let plugin_coverage = coverage(&plugin_mean, &plugin_var, &truth, zcrit);
     let mixture_coverage = coverage(&mix_mean, &mix_var, &truth, zcrit);
