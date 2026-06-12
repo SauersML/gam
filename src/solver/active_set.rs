@@ -1278,19 +1278,31 @@ fn log_active_set_transition(
     );
 }
 
+/// Record the current working set; returns `false` when this exact set was
+/// already visited. Both the entering and leaving rules above are
+/// lowest-index (Bland), so a repeat cannot be a true simplex cycle — it is
+/// tolerance-band oscillation (a row added by the slack band and dropped by a
+/// noise-level negative dual, repeatedly). The caller breaks to the post-loop
+/// KKT exit gate, which inspects the iterate's full KKT residuals and either
+/// accepts via the projected-gradient fallback or returns an explicit error —
+/// never a silent acceptance, and no longer a hard seed-killing error on an
+/// otherwise numerically-converged iterate (#1025).
 fn record_active_working_set(
     visited: &mut HashSet<Vec<usize>>,
     active: &[usize],
     iteration: usize,
-) -> Result<(), EstimationError> {
+) -> bool {
     let mut key = active.to_vec();
     key.sort_unstable();
     if visited.insert(key.clone()) {
-        return Ok(());
+        return true;
     }
-    Err(EstimationError::ParameterConstraintViolation(format!(
-        "linear-constrained Newton active-set cycled at iteration {iteration}; repeated active set {key:?}"
-    )))
+    log::debug!(
+        "[active-set/QP] iter={iteration} repeated working set ({} rows); \
+         deferring to the post-loop KKT exit gate",
+        key.len()
+    );
+    false
 }
 
 fn solve_newton_direction_with_linear_constraints_impl(
@@ -1370,7 +1382,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
         }
     }
     let mut visited_working_sets: HashSet<Vec<usize>> = HashSet::new();
-    record_active_working_set(&mut visited_working_sets, &active, 0)?;
+    record_active_working_set(&mut visited_working_sets, &active, 0);
 
     for iteration in 0..max_iterations {
         let compressed_working = compress_active_working_set(&x, constraints, &active)?;
@@ -1407,7 +1419,9 @@ fn solve_newton_direction_with_linear_constraints_impl(
                     active.len(),
                     Some(worst_row),
                 );
-                record_active_working_set(&mut visited_working_sets, &active, iteration)?;
+                if !record_active_working_set(&mut visited_working_sets, &active, iteration) {
+                    break;
+                }
                 continue;
             }
             if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
@@ -1440,7 +1454,9 @@ fn solve_newton_direction_with_linear_constraints_impl(
                     active.len(),
                     Some(idx),
                 );
-                record_active_working_set(&mut visited_working_sets, &active, iteration)?;
+                if !record_active_working_set(&mut visited_working_sets, &active, iteration) {
+                    break;
+                }
                 continue;
             }
             if let Some(hint) = active_hint {
@@ -1486,6 +1502,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
         g_cur = gradient + &hessian.dot(&d_total);
 
         let mut added_new_active = false;
+        let mut working_set_repeated = false;
         for i in 0..m {
             if is_active[i] {
                 continue;
@@ -1496,9 +1513,13 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 is_active[i] = true;
                 added_new_active = true;
                 log_active_set_transition("blocking-add", iteration, active.len(), Some(i));
-                record_active_working_set(&mut visited_working_sets, &active, iteration)?;
+                working_set_repeated =
+                    !record_active_working_set(&mut visited_working_sets, &active, iteration);
                 break;
             }
+        }
+        if working_set_repeated {
+            break;
         }
 
         if active.is_empty() && !added_new_active {

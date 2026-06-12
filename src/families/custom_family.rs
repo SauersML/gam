@@ -15625,8 +15625,27 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // falls back to the damped path conservatively.
                     let hpen_nullity = symmetric_penalized_hessian_nullity(&lhs);
                     let apply_constrained_floor = hpen_nullity.map(|n| n > 0).unwrap_or(true);
+                    // Self-vanishing scale = the PROJECTED stationarity residual
+                    // (`current_kkt_norm`), NOT the raw ‖∇ℓ − Sβ + ∇Φ‖∞. At a
+                    // CONSTRAINED optimum the raw RHS converges to the active-set
+                    // multiplier mass ‖Aᵀλ‖∞ — an O(1) quantity that never
+                    // vanishes — so a floor scaled by it never lifts, throttling
+                    // every weakly-curved identified direction to a geometric
+                    // H/(H+μ) contraction and exhausting the inner budget with the
+                    // projected residual stalled just above tolerance (#1025: the
+                    // competing-risks twin time-basis fit, per_block_resid stuck at
+                    // 1.457 for the full budget). The projected residual is the
+                    // honest distance-from-KKT measure: it equals the raw RHS on
+                    // unconstrained fits (no behavior change there) and → 0 at a
+                    // constrained optimum, so the floor vanishes exactly where the
+                    // comment above promises it does.
                     let rhs_inf = rhs_step.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-                    let constrained_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * rhs_inf;
+                    let floor_scale = if current_kkt_norm.is_finite() {
+                        current_kkt_norm.min(rhs_inf)
+                    } else {
+                        rhs_inf
+                    };
+                    let constrained_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * floor_scale;
                     if apply_constrained_floor
                         && constrained_levenberg_mu > 0.0
                         && constrained_levenberg_mu.is_finite()
@@ -25910,15 +25929,27 @@ fn exact_newton_joint_projected_stationarity_vector_from_gradient(
             let block_active_hint = block_active_sets
                 .and_then(|sets| sets.get(b))
                 .and_then(|opt| opt.as_deref());
-            block = projected_linear_constraint_stationarity_vector(
+            match projected_linear_constraint_stationarity_vector(
                 &block,
                 &states[b].beta,
                 constraints,
                 block_active_hint,
-            )
-            .ok_or_else(|| {
-                format!("exact-newton projected stationarity vector: failed to project block {b}")
-            })?;
+            ) {
+                Some(projected) => block = projected,
+                None => {
+                    // Cone projection can only SHRINK the residual (it removes
+                    // nonnegative multiplier mass on active rows), so a failed
+                    // projection degrades to the conservative unprojected
+                    // residual — the convergence test gets harder, never
+                    // easier — instead of rejecting the whole seed (#1025:
+                    // 'failed to project block 0' killed an otherwise-healthy
+                    // competing-risks seed outright).
+                    log::warn!(
+                        "exact-newton projected stationarity vector: cone projection failed \
+                         for block {b}; using the conservative unprojected residual"
+                    );
+                }
+            }
         }
         residual.slice_mut(ndarray::s![start..end]).assign(&block);
         offset = end;
