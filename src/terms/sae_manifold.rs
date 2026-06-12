@@ -13883,6 +13883,14 @@ impl SaeManifoldOuterObjective {
                 .term
                 .refit_decoder_least_squares_at_current_state(self.target.view())
                 .and_then(|()| {
+                    self.term
+                        .seed_coords_by_decoder_projection(self.target.view(), 256)
+                })
+                .and_then(|()| {
+                    self.term
+                        .refit_decoder_least_squares_at_current_state(self.target.view())
+                })
+                .and_then(|()| {
                     let after_fit = self.term.try_fitted()?;
                     let Some(after_ev) =
                         reconstruction_explained_variance(self.target.view(), after_fit.view())
