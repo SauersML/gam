@@ -1,11 +1,15 @@
 //! #913: dispersion-channel GAMLSS location-scale families.
 //!
-//! Extracted verbatim from `gamlss.rs` (issue #780) — no behavior change.
+//! Extracted from `gamlss.rs` (issue #780); this module now owns the
+//! dispersion-channel joint-curvature corrections.
 
 use super::{
     BlockwiseTermFitResult, GamlssLambdaLayout, LOCATION_SCALE_N_OUTPUTS,
     LocationScaleFamilyBuilder, build_location_scale_block, fit_location_scale_terms,
     identity_penalty, solve_penalizedweighted_projection,
+};
+use super::weighted_design_products::{
+    mirror_upper_to_lower, xt_diag_x_design, xt_diag_y_design,
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -15,7 +19,7 @@ use crate::estimate::UnifiedFitResult;
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
 };
-use ndarray::Array1;
+use ndarray::{Array1, Array2, s};
 use statrs::function::gamma::ln_gamma;
 
 // ============================================================================
@@ -41,17 +45,28 @@ use statrs::function::gamma::ln_gamma;
 // block is a single intercept and the fit reduces to the scalar-dispersion
 // model.
 //
-// The mean and dispersion parameters of every exponential-dispersion family
-// (and NB2) are Fisher-orthogonal, so block-cyclic Fisher-scoring IRLS — the
-// Rigby–Stasinopoulos scheme `gamlss` uses — converges to the joint MLE with
-// block-diagonal working sets; the inner solver therefore needs no cross-block
-// curvature. Smoothing-parameter selection runs through the engine's
-// first-order (gradient-only) outer path: the family declines the dense outer
-// Hessian capability because its working weights couple the two blocks
-// (`W_μ` depends on the precision and vice-versa), which the block-local
-// diagonal-drift hook cannot represent exactly. The REML criterion *value* is
-// the exact penalised Laplace surface at the converged β̂; only the analytic
-// ρ-Hessian is omitted, exactly as for any first-order custom family.
+// NB2 with `(μ, θ)` and the exponential-dispersion members here with
+// `(μ, φ)` are Fisher-orthogonal in their standard mean/dispersion
+// parameterizations: Gamma uses shape `ν = 1/φ`, and Tweedie models
+// `log(1/φ)`, so those precision-channel transforms preserve zero expected
+// mean/dispersion cross information. Beta is the exception in this module's
+// mean/precision parameterization. For `Beta(μφ, (1−μ)φ)`,
+//
+//   I_{μ,φ} = φ · (μ ψ'(μφ) − (1−μ) ψ'((1−μ)φ)),
+//
+// so in predictor coordinates `(η_μ = logit μ, η_φ = log φ)` the Fisher cross
+// block is
+//
+//   I_{η_μ,η_φ} = μ(1−μ) φ² · (μ ψ'(μφ) − (1−μ) ψ'((1−μ)φ)),
+//
+// which is generically nonzero. Block-cyclic Fisher-scoring IRLS is still a
+// valid block coordinate solve for the point estimate, but joint-curvature
+// consumers (`log|H|`, coefficient covariance, posterior draws) must receive
+// Beta's off-diagonal coefficient block. Smoothing-parameter selection still
+// runs through the engine's first-order (gradient-only) outer path: the family
+// declines the dense outer Hessian capability because its working weights
+// couple the two blocks (`W_μ` depends on the precision and vice-versa), which
+// the block-local diagonal-drift hook cannot represent exactly.
 // ============================================================================
 
 /// The genuine-dispersion mean family whose precision (overdispersion) channel
@@ -167,6 +182,52 @@ fn dispersion_beta_nll_tower(
         + (a - 1.0) * yc.ln()
         + (b - 1.0) * (1.0 - yc).ln();
     -loglik * wi
+}
+
+#[cfg(test)]
+fn beta_fisher_cross_info_mu_phi(mu: f64, phi: f64) -> f64 {
+    let a = mu * phi;
+    let b = (1.0 - mu) * phi;
+    phi * (mu * crate::families::jet_tower::trigamma_derivative_stack(a)[0]
+        - (1.0 - mu) * crate::families::jet_tower::trigamma_derivative_stack(b)[0])
+}
+
+#[inline]
+fn beta_observed_cross_weight_eta(
+    yi: f64,
+    mu: f64,
+    phi: f64,
+    wi: f64,
+) -> f64 {
+    let q = (mu * (1.0 - mu)).max(1e-12);
+    let tower = dispersion_beta_nll_tower(yi, mu, phi, wi);
+    q * phi * tower.h[0][1]
+}
+
+#[inline]
+fn dispersion_row_cross_weight(
+    kind: DispersionFamilyKind,
+    yi: f64,
+    eta_mu: f64,
+    eta_d: f64,
+    prior_weight: f64,
+) -> f64 {
+    let wi = prior_weight.max(0.0);
+    if wi == 0.0 {
+        return 0.0;
+    }
+    let em = eta_mu.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
+    let ed = eta_d.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
+    match kind {
+        DispersionFamilyKind::Beta => {
+            let mu = (1.0 / (1.0 + (-em).exp())).clamp(1e-12, 1.0 - 1e-12);
+            let phi = ed.exp().max(1e-12);
+            beta_observed_cross_weight_eta(yi, mu, phi, wi)
+        }
+        DispersionFamilyKind::NegativeBinomial
+        | DispersionFamilyKind::Gamma
+        | DispersionFamilyKind::Tweedie { .. } => 0.0,
+    }
 }
 
 #[inline]
@@ -416,6 +477,101 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
             self.y.len() as u64,
             specs,
         )
+    }
+
+    fn exact_newton_joint_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !matches!(self.kind, DispersionFamilyKind::Beta) {
+            return Ok(None);
+        }
+        if block_states.len() != 2 || specs.len() != 2 {
+            return Err(format!(
+                "{} exact joint Hessian expects 2 blocks/specs, got states={} specs={}",
+                self.kind.family_tag(),
+                block_states.len(),
+                specs.len()
+            ));
+        }
+        let eta_mu = &block_states[Self::BLOCK_MEAN].eta;
+        let eta_d = &block_states[Self::BLOCK_DISP].eta;
+        let n = self.y.len();
+        if eta_mu.len() != n || eta_d.len() != n || self.weights.len() != n {
+            return Err(format!(
+                "{} exact joint Hessian row-count mismatch: y={n}, eta_mu={}, eta_d={}, weights={}",
+                self.kind.family_tag(),
+                eta_mu.len(),
+                eta_d.len(),
+                self.weights.len()
+            ));
+        }
+
+        let eval = self.evaluate(block_states)?;
+        let BlockWorkingSet::Diagonal {
+            working_weights: mean_weights,
+            ..
+        } = &eval.blockworking_sets[Self::BLOCK_MEAN]
+        else {
+            return Err("Beta dispersion mean block did not return diagonal weights".to_string());
+        };
+        let BlockWorkingSet::Diagonal {
+            working_weights: disp_weights,
+            ..
+        } = &eval.blockworking_sets[Self::BLOCK_DISP]
+        else {
+            return Err(
+                "Beta dispersion precision block did not return diagonal weights".to_string(),
+            );
+        };
+
+        let cross_weights = Array1::from_shape_fn(n, |i| {
+            dispersion_row_cross_weight(
+                self.kind,
+                self.y[i],
+                eta_mu[i],
+                eta_d[i],
+                self.weights[i],
+            )
+        });
+        let mean_spec = &specs[Self::BLOCK_MEAN];
+        let disp_spec = &specs[Self::BLOCK_DISP];
+        if mean_spec.design.nrows() != n || disp_spec.design.nrows() != n {
+            return Err(format!(
+                "{} exact joint Hessian design row mismatch: y={n}, mean rows={}, precision rows={}",
+                self.kind.family_tag(),
+                mean_spec.design.nrows(),
+                disp_spec.design.nrows()
+            ));
+        }
+        let p_mean = mean_spec.design.ncols();
+        let p_disp = disp_spec.design.ncols();
+        if block_states[Self::BLOCK_MEAN].beta.len() != p_mean
+            || block_states[Self::BLOCK_DISP].beta.len() != p_disp
+        {
+            return Err(format!(
+                "{} exact joint Hessian beta/design mismatch: mean beta {} vs cols {}, precision beta {} vs cols {}",
+                self.kind.family_tag(),
+                block_states[Self::BLOCK_MEAN].beta.len(),
+                p_mean,
+                block_states[Self::BLOCK_DISP].beta.len(),
+                p_disp
+            ));
+        }
+
+        let h_mean = xt_diag_x_design(&mean_spec.design, mean_weights)?;
+        let h_cross = xt_diag_y_design(&mean_spec.design, &cross_weights, &disp_spec.design)?;
+        let h_disp = xt_diag_x_design(&disp_spec.design, disp_weights)?;
+        let total = p_mean + p_disp;
+        let mut h = Array2::<f64>::zeros((total, total));
+        h.slice_mut(s![0..p_mean, 0..p_mean]).assign(&h_mean);
+        h.slice_mut(s![0..p_mean, p_mean..total])
+            .assign(&h_cross);
+        h.slice_mut(s![p_mean..total, p_mean..total])
+            .assign(&h_disp);
+        mirror_upper_to_lower(&mut h);
+        Ok(Some(h))
     }
 
     /// The mean and precision working weights couple across both blocks, which
@@ -719,4 +875,63 @@ pub fn fit_dispersion_glm_location_scale_terms(
         options,
         &kappa,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(label: &str, got: f64, want: f64, tol: f64) {
+        assert!(
+            (got - want).abs() <= tol,
+            "{label}: got {got:.12e}, want {want:.12e}, |diff|={:.3e}",
+            (got - want).abs()
+        );
+    }
+
+    #[test]
+    fn beta_tower_mixed_channel_matches_cross_information_formula() {
+        let mu = 0.1;
+        let phi = 10.0;
+        let a = mu * phi;
+        let b = (1.0 - mu) * phi;
+        let digamma_a = crate::families::jet_tower::digamma_derivative_stack(a)[0];
+        let digamma_b = crate::families::jet_tower::digamma_derivative_stack(b)[0];
+        let score_neutral_y = 1.0 / (1.0 + (-(digamma_a - digamma_b)).exp());
+
+        let tower = dispersion_beta_nll_tower(score_neutral_y, mu, phi, 1.0);
+        let trigamma_a = std::f64::consts::PI * std::f64::consts::PI / 6.0;
+        let trigamma_b = crate::families::jet_tower::trigamma_derivative_stack(b)[0];
+        let analytic = phi * (mu * trigamma_a - (1.0 - mu) * trigamma_b);
+        let helper = beta_fisher_cross_info_mu_phi(mu, phi);
+
+        assert!(
+            analytic > 0.58,
+            "audit example should have visibly nonzero cross information, got {analytic}"
+        );
+        assert_close("helper cross information", helper, analytic, 1e-12);
+        assert_close("tower mixed channel", tower.h[0][1], analytic, 1e-8);
+
+        let q = mu * (1.0 - mu);
+        let eta_cross = beta_observed_cross_weight_eta(score_neutral_y, mu, phi, 1.0);
+        assert_close(
+            "eta-scale cross weight",
+            eta_cross,
+            q * phi * analytic,
+            1e-8,
+        );
+    }
+
+    #[test]
+    fn orthogonal_dispersion_families_report_zero_cross_weight() {
+        let cases = [
+            DispersionFamilyKind::NegativeBinomial,
+            DispersionFamilyKind::Gamma,
+            DispersionFamilyKind::Tweedie { p: 1.5 },
+        ];
+        for kind in cases {
+            let got = dispersion_row_cross_weight(kind, 1.25, 0.2, -0.3, 2.0);
+            assert_close(kind.family_tag(), got, 0.0, 1e-12);
+        }
+    }
 }
