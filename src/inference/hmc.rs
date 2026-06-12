@@ -4861,6 +4861,178 @@ pub fn sample_gaussian_mode_posterior(
     })
 }
 
+/// Penalty subtracted from the log-density when the `ρ`-criterion closure
+/// reports an infeasible / non-finite point during Tier-2 `ρ`-posterior NUTS
+/// (#938). The fallback density is the whitened standard normal shifted down by
+/// this constant, so the sampler sees a smooth, coercive pull back toward the
+/// feasible region around `ρ̂` instead of a `-inf` cliff.
+const RHO_NUTS_INFEASIBLE_LOGP_PENALTY: f64 = 1.0e8;
+
+/// Tier-2 of the exact marginal-smoothing inference stack (#938): the whitened
+/// `ρ`-criterion Hamiltonian target.
+///
+/// This reuses the module's β-level whitening design ONE LEVEL UP: the target
+/// log-density is `logp(ρ) = −(criterion(ρ) − criterion(ρ̂))` — i.e.
+/// `π(ρ|y) ∝ exp(−LAML(ρ))`, the exact profiled criterion the outer optimizer
+/// minimizes — expressed in the whitened coordinates `ρ = ρ̂ + L z` with
+/// `L Lᵀ = H_ρ⁻¹` built from the exact outer Hessian at `ρ̂`. The gradient is
+/// the caller's exact profiled `ρ`-gradient pushed through the chain rule:
+/// `∇_z logp = −Lᵀ ∇_ρ criterion`.
+///
+/// The criterion closure is `FnMut` (each evaluation is one warm inner profile
+/// solve with interior caches), so it is serialized behind a `Mutex`; chains
+/// take turns evaluating, which also keeps the inner warm-start trajectory
+/// coherent.
+struct WhitenedRhoCriterionTarget<F> {
+    /// `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`; `None` marks an infeasible point.
+    criterion_and_grad: Mutex<F>,
+    /// `ρ̂`, the converged smoothing parameters (the whitening center).
+    mode: Array1<f64>,
+    /// `L` with `L Lᵀ = H_ρ⁻¹`: maps whitened `z` to `ρ = ρ̂ + L z`.
+    chol: Array2<f64>,
+    /// `Lᵀ`, for the gradient chain rule.
+    chol_t: Array2<f64>,
+    /// `criterion(ρ̂)`, subtracted for numerical stability (cancels in MCMC).
+    cost_hat: f64,
+}
+
+impl<F> HamiltonianTarget<Array1<f64>> for WhitenedRhoCriterionTarget<F>
+where
+    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+{
+    fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
+        let rho = &self.mode + &self.chol.dot(position);
+        let eval = {
+            let mut criterion = self
+                .criterion_and_grad
+                .lock()
+                .expect("rho-criterion mutex poisoned");
+            (*criterion)(&rho)
+        };
+        match eval {
+            Some((cost, g))
+                if cost.is_finite()
+                    && g.len() == position.len()
+                    && g.iter().all(|v| v.is_finite()) =>
+            {
+                let grad_z = self.chol_t.dot(&g);
+                for (gi, &v) in grad.iter_mut().zip(grad_z.iter()) {
+                    *gi = -v;
+                }
+                -(cost - self.cost_hat)
+            }
+            _ => {
+                // Infeasible criterion: smooth coercive fallback toward ρ̂.
+                let mut quad = 0.0;
+                for (gi, &zi) in grad.iter_mut().zip(position.iter()) {
+                    *gi = -zi;
+                    quad += zi * zi;
+                }
+                -0.5 * quad - RHO_NUTS_INFEASIBLE_LOGP_PENALTY
+            }
+        }
+    }
+}
+
+/// Run NUTS over the smoothing parameters `ρ` with the exact profiled criterion
+/// and gradient (#938 Tier 2).
+///
+/// * `rho_hat` — converged `ρ̂` (the whitening center and chain seed).
+/// * `outer_hessian` — exact outer Hessian `H_ρ` at `ρ̂` (symmetrized and
+///   jittered defensively, then Cholesky-factored for the whitening).
+/// * `criterion_and_grad` — `ρ ↦ (LAML(ρ), ∇_ρ LAML(ρ))`, both exact; `None`
+///   for infeasible `ρ`. Each call is one warm inner profile solve.
+/// * `config` — sampler configuration; determinism comes from `config.seed`
+///   through the same splitmix64 chain/transition streams as every other NUTS
+///   entry point (no clock, no global RNG).
+///
+/// Returns draws in the ORIGINAL `ρ` space (un-whitened), with split-R̂/ESS
+/// diagnostics.
+pub fn run_rho_criterion_nuts<F>(
+    rho_hat: ArrayView1<f64>,
+    outer_hessian: ArrayView2<f64>,
+    criterion_and_grad: F,
+    config: &NutsConfig,
+) -> Result<NutsResult, String>
+where
+    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+{
+    validate_nuts_config(config).map_err(String::from)?;
+    let dim = rho_hat.len();
+    if dim == 0 {
+        return Err("rho-posterior NUTS: zero-dimensional rho".to_string());
+    }
+    if outer_hessian.nrows() != dim || outer_hessian.ncols() != dim {
+        return Err(format!(
+            "rho-posterior NUTS: outer Hessian shape {:?} does not match rho dim {dim}",
+            outer_hessian.dim()
+        ));
+    }
+
+    // Symmetrize + jitter the exact outer Hessian so a boundary optimum that is
+    // SPD-up-to-roundoff still factors; jitter only widens the proposal metric.
+    let mut h = outer_hessian.to_owned();
+    for i in 0..dim {
+        for j in (i + 1)..dim {
+            let avg = 0.5 * (h[[i, j]] + h[[j, i]]);
+            h[[i, j]] = avg;
+            h[[j, i]] = avg;
+        }
+    }
+    let diag_scale = (0..dim).map(|i| h[[i, i]].abs()).fold(0.0_f64, f64::max);
+    let jitter = (diag_scale * 1e-10).max(1e-12);
+    for i in 0..dim {
+        h[[i, i]] += jitter;
+    }
+
+    let mode = rho_hat.to_owned();
+    let whitening = hessian_whitening_transform(
+        h.view(),
+        dim,
+        1.0,
+        "rho-posterior NUTS: outer-Hessian Cholesky failed",
+    )?;
+
+    let mut criterion_and_grad = criterion_and_grad;
+    let cost_hat = match criterion_and_grad(&mode) {
+        Some((cost, _)) if cost.is_finite() => cost,
+        _ => {
+            return Err(
+                "rho-posterior NUTS: criterion is infeasible at rho_hat itself".to_string(),
+            );
+        }
+    };
+
+    let chol = whitening.chol;
+    let target = WhitenedRhoCriterionTarget {
+        criterion_and_grad: Mutex::new(criterion_and_grad),
+        mode: mode.clone(),
+        chol: chol.clone(),
+        chol_t: whitening.chol_t,
+        cost_hat,
+    };
+    let initial_positions = jittered_initial_positions(config, dim, 0.1, 0x3D8A_91C4_E27B_5F60);
+    let mass_cfg = robust_mass_matrix_config(dim, config.nwarmup);
+    let (result, run_stats) = run_whitened_nuts_result(
+        target,
+        &mode,
+        &chol,
+        initial_positions,
+        config,
+        dim,
+        mass_cfg,
+        0x6B42_E9A1_05D7_C83F,
+        "rho-posterior NUTS sampling failed",
+        mode.clone(),
+        NutsConvergenceThresholds {
+            max_rhat: 1.1,
+            min_ess: None,
+        },
+    )?;
+    log::info!("rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} {run_stats}");
+    Ok(result)
+}
+
 /// Flattened numeric inputs for GLM-family NUTS sampling.
 pub struct GlmFlatInputs<'a> {
     pub x: ArrayView2<'a, f64>,

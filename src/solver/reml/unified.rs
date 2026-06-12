@@ -5407,6 +5407,161 @@ impl<'a> ConstrainedSubspaceKernel<'a> {
     }
 }
 
+/// Tangency self-audit gate for the constrained mode-response arm: the
+/// emitted `v = K_T · rhs` must lie in `ker(A_act)` by construction, so
+/// `|A_act · v|` is compared against this fraction of the cancellation
+/// scale `|A_act| · |v|` (per active row). Generous enough that legitimate
+/// rank-deficient active sets (whose dropped Schur directions leave
+/// ε-level residue, see [`PenaltySubspaceTrace::with_active_constraints`])
+/// never trip it; the historical failure mode it guards (the d6b17a7f
+/// `1/σ_min ≈ 10¹²` null-space amplification) exceeds it by six orders.
+const THETA_MODE_RESPONSE_TANGENCY_GATE: f64 = 1e-6;
+
+/// #931 migration pass 2 — the ThetaDirection shared-drift pass: the ONE
+/// per-evaluation selection of the IFT mode-response kernel behind every
+/// `dβ̂/dθ = −K · ∂g/∂θ` solve in the outer gradient/Hessian assembly.
+///
+/// Before this object existed, four sites (the gradient solve stack in
+/// `reml_laml_evaluate`, the ρ- and ext-coordinate standalone fallbacks in
+/// `compute_outer_hessian`, and the standalone fallback in
+/// `build_outer_hessian_operator`) each re-implemented the same selection
+/// rule by hand, with comments warning each other to "mirror the
+/// selection exactly, otherwise the operator-form Hessian and dense
+/// materialization disagree on every entry". A hand-copied convention every
+/// caller must remember is precisely the objective↔gradient desync surface
+/// (#748/#752/#901 class) the criterion-as-atoms architecture (#931)
+/// removes. Now the rule is DECIDED in exactly one constructor and every
+/// consumer is a contraction of the same kernel object — the gradient and
+/// both Hessian representations structurally cannot pick different
+/// inverses for the same evaluation point:
+///
+///   * Active inequality constraints recorded on the inner solution → the
+///     lifted constrained kernel
+///     `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`. The inner SCOP solver
+///     clamps β̂(θ) onto `T = range(S₊) ∩ ker(A_act)`, so the true IFT
+///     derivative lives in T and the lifted kernel gives the minimum-norm
+///     solution there; the full solve would amplify any RHS component
+///     outside `range(H_free)` by `1/σ_min(H_active_normal)` — ~10¹² on
+///     large-scale survival marginal-slope (commit d6b17a7f).
+///   * Otherwise → the FULL Hessian solve `v = H⁻¹ · rhs`, even when the
+///     LAML cost surface uses the projected logdet `½ log|U_Sᵀ H U_S|`:
+///     the inner solver converges β̂ ∈ R^p in the unconstrained full
+///     space, so the IFT identity demands the full inverse, and the
+///     penalty-subspace projection acts on the TRACE contraction side
+///     only. Routing through bare `K_S` here would discard the
+///     `null(S₊)` component of dβ̂/dθ — the near-separable ψ-gradient
+///     blow-up pinned by `duchon_probit_per_row_dnu_dpsi_fd_vs_analytic`.
+///
+/// The two emission shapes (`respond_one` per-vector, `respond_stack`
+/// batched) exist because the call sites have different RHS layouts and
+/// their solve shapes must stay bit-identical to the pre-port assembly
+/// (per-column GEMV vs blocked GEMM sum in different orders) — NOT because
+/// a site may choose a different kernel. Both shapes dispatch on the same
+/// stored decision.
+///
+/// This is the `Sensitivity`-operator half of the `ThetaDirection`
+/// calculus sketched in `atoms.rs`: the direction's `β̇` channel is a
+/// contraction of this kernel, so atoms borrowing the shared drift can no
+/// longer see a different chain rule than their neighbors.
+pub(crate) struct ThetaModeResponseKernel<'s> {
+    hop: &'s dyn HessianOperator,
+    /// `Some` exactly when the selection rule chose the lifted constrained
+    /// kernel. Built once per evaluation point (one Schur-complement
+    /// factorization), shared by every gradient/Hessian consumer — the
+    /// pre-port code rebuilt it per consumer site.
+    constrained: Option<ConstrainedSubspaceKernel<'s>>,
+}
+
+impl<'s> ThetaModeResponseKernel<'s> {
+    /// The ONE place the mode-response kernel selection rule lives.
+    pub(crate) fn select(
+        subspace: Option<&'s PenaltySubspaceTrace>,
+        active_constraints: Option<&'s ActiveLinearConstraintBlock>,
+        hop: &'s dyn HessianOperator,
+    ) -> Self {
+        let constrained = match (subspace, active_constraints) {
+            (Some(kernel), Some(block)) => {
+                let ck = kernel.with_active_constraints(block.a.view());
+                ck.has_active_constraints().then_some(ck)
+            }
+            _ => None,
+        };
+        Self { hop, constrained }
+    }
+
+    /// Mode response for one right-hand side: `K_T · rhs` under active
+    /// constraints, `H⁻¹ · rhs` (single-RHS `solve`) otherwise. Used by the
+    /// per-coordinate fallbacks whose pre-port assembly solved one vector at
+    /// a time — the single-RHS shape is preserved bit-identically.
+    pub(crate) fn respond_one(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        match self.constrained.as_ref() {
+            Some(ck) => {
+                let v = ck.apply_pseudo_inverse(rhs);
+                self.certify_tangency(ck, &v);
+                v
+            }
+            None => self.hop.solve(rhs),
+        }
+    }
+
+    /// Mode responses for a column-stacked RHS block: per-column `K_T`
+    /// applies under active constraints (the lifted kernel has no blocked
+    /// form), one batched `solve_multi` otherwise (BLAS-3 / GPU batched
+    /// route) — exactly the shapes the stacked call sites used pre-port.
+    /// Zero RHS columns (box-masked ρ coordinates) emit exact zeros through
+    /// either arm, since both kernels are linear.
+    pub(crate) fn respond_stack(&self, rhs_stack: &Array2<f64>) -> Array2<f64> {
+        match self.constrained.as_ref() {
+            Some(ck) => {
+                let mut out = Array2::<f64>::zeros(rhs_stack.raw_dim());
+                for (j, col) in rhs_stack.columns().into_iter().enumerate() {
+                    let v = ck.apply_pseudo_inverse(&col.to_owned());
+                    self.certify_tangency(ck, &v);
+                    out.column_mut(j).assign(&v);
+                }
+                out
+            }
+            None => self.hop.solve_multi(rhs_stack),
+        }
+    }
+
+    /// Per-atom certify body (#934 FD-self-audit pattern, applied as an
+    /// exact structural invariant): every constrained emission must lie in
+    /// `ker(A_act)` — `A_act · v = 0` is the defining property of `K_T`'s
+    /// range, so a violation can only mean the kernel object and the
+    /// emission desynced. Checked on every constrained response (cost
+    /// `O(k_active · p)`, negligible next to the apply itself) against the
+    /// row-wise cancellation scale `|A_act| · |v|`; a violation does not
+    /// fail the fit — it names the atom loudly in the `[CERTIFICATE]`
+    /// stream, exactly like the outer-optimum criterion audit. The
+    /// unconstrained arm carries no separate certify: its coherence with
+    /// the criterion VALUE is audited end-to-end by the #934
+    /// `CriterionCertificate` at every returned optimum.
+    fn certify_tangency(&self, ck: &ConstrainedSubspaceKernel<'_>, v: &Array1<f64>) {
+        let residual = ck.a_act.dot(v);
+        for (row, r) in residual.iter().enumerate() {
+            let scale: f64 = ck
+                .a_act
+                .row(row)
+                .iter()
+                .zip(v.iter())
+                .map(|(a, x)| (a * x).abs())
+                .sum();
+            if r.abs() > THETA_MODE_RESPONSE_TANGENCY_GATE * (scale + f64::EPSILON) {
+                log::warn!(
+                    "[CERTIFICATE warning] atom \"theta_mode_response\": constrained IFT \
+                     mode response left ker(A_act) — active row {row} residual {:.3e} \
+                     exceeds gate {:.1e}·{:.3e}; the lifted kernel K_T and its emission \
+                     have desynced (#931 pass-2 invariant)",
+                    r.abs(),
+                    THETA_MODE_RESPONSE_TANGENCY_GATE,
+                    scale,
+                );
+            }
+        }
+    }
+}
+
 /// Subspace represented by a stored KKT residual.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KktResidualSubspace {
@@ -7854,67 +8009,43 @@ pub fn reml_laml_evaluate(
         //     only the IFT *direction* `v` is the full solve, which the
         //     kernel `duchon_probit_per_row_dnu_dpsi_fd_vs_analytic`
         //     pins via the FD reference `c · dη/dψ_total = c · (η_+ − η_−)/2h`.
-        let kernel = solution.penalty_subspace_trace.as_ref();
-        let constrained_kernel = match (kernel, solution.active_constraints.as_ref()) {
-            (Some(kernel), Some(block)) => {
-                let ck = kernel.with_active_constraints(block.a.view());
-                ck.has_active_constraints().then_some(ck)
-            }
-            _ => None,
-        };
-        if let Some(ck) = constrained_kernel.as_ref() {
-            let apply = |v: &Array1<f64>| -> Array1<f64> { ck.apply_pseudo_inverse(v) };
-            let rho_v_ks = if need_rho_mode_responses {
-                Some(
-                    rho_curvature_a_k_betas
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, a_k_beta)| {
-                            if upper_active_rho[idx] {
-                                Array1::<f64>::zeros(hop.dim())
-                            } else {
-                                apply(a_k_beta)
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                None
-            };
-            let ext_v_is: Vec<Array1<f64>> = solution
-                .ext_coords
-                .iter()
-                .map(|coord| apply(&coord.g))
-                .collect();
-            (rho_v_ks, ext_v_is)
-        } else {
-            let mut rhs_stack = Array2::<f64>::zeros((dim, total_cols));
-            let mut col_idx = 0;
-            if need_rho_mode_responses {
-                for (idx, a_k_beta) in rho_curvature_a_k_betas.iter().enumerate() {
-                    if !upper_active_rho[idx] {
-                        rhs_stack.column_mut(col_idx).assign(a_k_beta);
-                    }
-                    col_idx += 1;
+        //
+        // The choice itself is no longer made here: it is the ONE
+        // `ThetaModeResponseKernel::select` decision (#931 pass 2), shared
+        // verbatim by `compute_outer_hessian` and
+        // `build_outer_hessian_operator`. Box-masked ρ coordinates keep
+        // their RHS column zero, which both kernel arms map to exact zeros.
+        let mode_kernel = ThetaModeResponseKernel::select(
+            solution.penalty_subspace_trace.as_deref(),
+            solution.active_constraints.as_deref(),
+            hop,
+        );
+        let mut rhs_stack = Array2::<f64>::zeros((dim, total_cols));
+        let mut col_idx = 0;
+        if need_rho_mode_responses {
+            for (idx, a_k_beta) in rho_curvature_a_k_betas.iter().enumerate() {
+                if !upper_active_rho[idx] {
+                    rhs_stack.column_mut(col_idx).assign(a_k_beta);
                 }
-            }
-            for coord in solution.ext_coords.iter() {
-                rhs_stack.column_mut(col_idx).assign(&coord.g);
                 col_idx += 1;
             }
-            assert_eq!(col_idx, total_cols);
-            let solved_stack = hop.solve_multi(&rhs_stack);
-            let rho_v_ks = if need_rho_mode_responses {
-                Some((0..k).map(|i| solved_stack.column(i).to_owned()).collect())
-            } else {
-                None
-            };
-            let ext_offset = if need_rho_mode_responses { k } else { 0 };
-            let ext_v_is: Vec<Array1<f64>> = (0..ext_dim_local)
-                .map(|i| solved_stack.column(ext_offset + i).to_owned())
-                .collect();
-            (rho_v_ks, ext_v_is)
         }
+        for coord in solution.ext_coords.iter() {
+            rhs_stack.column_mut(col_idx).assign(&coord.g);
+            col_idx += 1;
+        }
+        assert_eq!(col_idx, total_cols);
+        let solved_stack = mode_kernel.respond_stack(&rhs_stack);
+        let rho_v_ks = if need_rho_mode_responses {
+            Some((0..k).map(|i| solved_stack.column(i).to_owned()).collect())
+        } else {
+            None
+        };
+        let ext_offset = if need_rho_mode_responses { k } else { 0 };
+        let ext_v_is: Vec<Array1<f64>> = (0..ext_dim_local)
+            .map(|i| solved_stack.column(ext_offset + i).to_owned())
+            .collect();
+        (rho_v_ks, ext_v_is)
     };
     let coord_corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
         let rho_vs = rho_v_ks
@@ -10010,58 +10141,49 @@ fn compute_outer_hessian(
         None => curvature_a_k_betas_storage.as_deref().expect("storage set"),
     };
 
+    // The ONE mode-response kernel selection for this Hessian evaluation
+    // (#931 pass 2): built at most once — lazily, so the production caller
+    // (which supplies every mode response through the workspace) pays
+    // nothing — and shared by the ρ- and ext-coordinate fallbacks below,
+    // which pre-port each rebuilt the constrained Schur factorization and
+    // re-stated the selection rule independently. See
+    // `ThetaModeResponseKernel` for the selection math (lifted `K_T` under
+    // active inequality constraints, full `H⁻¹` otherwise — the gradient
+    // site in `reml_laml_evaluate` makes the same call, so the Hessian-path
+    // mode responses cannot desync from the gradient's).
+    let mode_kernel_cell: std::cell::OnceCell<ThetaModeResponseKernel<'_>> =
+        std::cell::OnceCell::new();
+    let mode_kernel = || {
+        mode_kernel_cell.get_or_init(|| {
+            ThetaModeResponseKernel::select(
+                solution.penalty_subspace_trace.as_deref(),
+                solution.active_constraints.as_deref(),
+                hop,
+            )
+        })
+    };
+
     let v_ks_storage: Option<Vec<Array1<f64>>> = match workspace.and_then(|ws| ws.rho_v_ks) {
         Some(_) => None,
         None => {
-            // IFT mode responses: use the lifted kernel `K_T` ONLY when active
-            // inequality constraints clamp the inner solution onto a smooth
-            // sub-manifold (`T = range(S₊) ∩ ker(A_act)`). Otherwise use the
-            // full `hop.solve` — the inner solver converges β̂ ∈ R^p in the
-            // unconstrained full space and the IFT identity demands the full
-            // Hessian solve `β̂_ψ = −H⁻¹ g_ψ`, even when the LAML cost surface
-            // uses the projected logdet `½ log|U_Sᵀ H U_S|`. Routing `v`
-            // through bare K_S here would discard the `null(S₊)` component of
-            // dβ̂/dρ (over-amplified on near-separable data), desyncing this
-            // Hessian-path mode response from the gradient site. See the
-            // parallel comment at the gradient site (`ext_v_is` / `rho_v_ks`
-            // construction in `reml_laml_evaluate`).
-            let subspace = solution.penalty_subspace_trace.as_deref();
-            let constrained_kernel = match (subspace, solution.active_constraints.as_ref()) {
-                (Some(kernel), Some(block)) => {
-                    let ck = kernel.with_active_constraints(block.a.view());
-                    ck.has_active_constraints().then_some(ck)
-                }
-                _ => None,
-            };
-            if let Some(ck) = constrained_kernel.as_ref() {
-                Some(
-                    curvature_a_k_betas
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, a_k_beta)| {
-                            if upper_active_rho[idx] {
-                                Array1::<f64>::zeros(hop.dim())
-                            } else {
-                                ck.apply_pseudo_inverse(a_k_beta)
-                            }
-                        })
-                        .collect(),
-                )
-            } else {
-                Some(
-                    curvature_a_k_betas
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, a_k_beta)| {
-                            if upper_active_rho[idx] {
-                                Array1::<f64>::zeros(hop.dim())
-                            } else {
-                                hop.solve(a_k_beta)
-                            }
-                        })
-                        .collect(),
-                )
-            }
+            // IFT mode responses `v = K · a_k` via the shared kernel; the
+            // per-vector solve shape of the pre-port assembly is preserved
+            // (`respond_one`), and box-masked coordinates short-circuit to
+            // exact zeros without a solve, exactly as before.
+            let kernel = mode_kernel();
+            Some(
+                curvature_a_k_betas
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, a_k_beta)| {
+                        if upper_active_rho[idx] {
+                            Array1::<f64>::zeros(hop.dim())
+                        } else {
+                            kernel.respond_one(a_k_beta)
+                        }
+                    })
+                    .collect(),
+            )
         }
     };
     let v_ks: &[Array1<f64>] = match workspace.and_then(|ws| ws.rho_v_ks) {
@@ -10202,38 +10324,19 @@ fn compute_outer_hessian(
             None
         }
         None => {
-            // IFT mode responses for ext (ψ/τ) coordinates: lifted kernel `K_T`
-            // ONLY under active inequality constraints; otherwise the full
-            // `hop.solve` (`β̂_ψ = −H⁻¹ g_ψ`). Mirrors the gradient site and the
-            // rho mode-response storage above so the Hessian path and the
-            // gradient path take the SAME solve in the no-constraint regime
-            // (the projected `(U_Sᵀ H U_S)⁻¹` would discard / over-amplify the
-            // `null(S₊)` component of dβ̂/dψ on near-separable data).
-            let subspace = solution.penalty_subspace_trace.as_deref();
-            let constrained_kernel = match (subspace, solution.active_constraints.as_ref()) {
-                (Some(kernel), Some(block)) => {
-                    let ck = kernel.with_active_constraints(block.a.view());
-                    ck.has_active_constraints().then_some(ck)
-                }
-                _ => None,
-            };
-            if let Some(ck) = constrained_kernel.as_ref() {
-                Some(
-                    solution
-                        .ext_coords
-                        .iter()
-                        .map(|coord| ck.apply_pseudo_inverse(&coord.g))
-                        .collect(),
-                )
-            } else {
-                Some(
-                    solution
-                        .ext_coords
-                        .iter()
-                        .map(|coord| hop.solve(&coord.g))
-                        .collect(),
-                )
-            }
+            // IFT mode responses for ext (ψ/τ) coordinates
+            // (`β̂_ψ = −K · g_ψ`) through the SAME shared kernel as the ρ
+            // fallback above and the gradient site — one selection per
+            // evaluation, so the Hessian path structurally cannot take a
+            // different solve than the gradient path in any regime.
+            let kernel = mode_kernel();
+            Some(
+                solution
+                    .ext_coords
+                    .iter()
+                    .map(|coord| kernel.respond_one(&coord.g))
+                    .collect(),
+            )
         }
     };
     let ext_v: &[Array1<f64>] = match workspace.and_then(|ws| ws.ext_v_is) {
@@ -11786,28 +11889,16 @@ fn build_outer_hessian_operator(
     // Mode responses are fixed-β stationarity derivatives. The main
     // evaluator passes precomputed responses so gradient and Hessian share
     // the same solve kernel; when none are provided this standalone path
-    // must mirror the dense evaluator's selection exactly, otherwise the
-    // operator-form Hessian and dense materialization disagree on every
-    // entry whose row or column lives outside `range(U_S)`. The test
-    // `projected_operator_hessian_matches_dense_subspace_trace` exercises
-    // that disagreement.
-    //
-    // Selection rule (same as the gradient and dense-Hessian sites — see
-    // their comments in `reml_laml_evaluate` / `compute_outer_hessian` for
-    // the math):
-    //   * Active inequality constraints present → lifted kernel
-    //     `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S` (β̂ constrained to T).
-    //   * Otherwise → full `hop.solve_multi` (IFT chain rule with the
-    //     full Hessian; LAML projection on the trace contraction side
-    //     only).
+    // routes through the SAME `ThetaModeResponseKernel::select` decision as
+    // the gradient site and the dense Hessian (#931 pass 2) — pre-port it
+    // hand-copied the selection rule and a comment warned it to "mirror the
+    // dense evaluator's selection exactly, otherwise the operator-form
+    // Hessian and dense materialization disagree on every entry whose row
+    // or column lives outside `range(U_S)`" (the
+    // `projected_operator_hessian_matches_dense_subspace_trace` regression).
+    // That mirroring obligation is now structural: one constructor, no copy
+    // to drift.
     let subspace = solution.penalty_subspace_trace.as_deref();
-    let constrained_kernel_for_v = match (subspace, solution.active_constraints.as_ref()) {
-        (Some(kernel), Some(block)) => {
-            let ck = kernel.with_active_constraints(block.a.view());
-            ck.has_active_constraints().then_some(ck)
-        }
-        _ => None,
-    };
     let coord_vs_storage;
     let coord_vs: &[Array1<f64>] = if let Some(precomputed) = precomputed_coord_vs {
         if precomputed.len() != total {
@@ -11824,17 +11915,12 @@ fn build_outer_hessian_operator(
     } else {
         let owned = if total == 0 {
             Vec::new()
-        } else if let Some(ck) = constrained_kernel_for_v.as_ref() {
-            let apply = |v: &Array1<f64>| -> Array1<f64> { ck.apply_pseudo_inverse(v) };
-            let mut vs = Vec::with_capacity(total);
-            for idx in 0..k {
-                vs.push(apply(&rho_curvature_a_k_betas[idx]));
-            }
-            for coord in solution.ext_coords.iter() {
-                vs.push(apply(&coord.g));
-            }
-            vs
         } else {
+            let mode_kernel = ThetaModeResponseKernel::select(
+                subspace,
+                solution.active_constraints.as_deref(),
+                &*hop,
+            );
             let mut rhs_stack = Array2::<f64>::zeros((hop.dim(), total));
             for idx in 0..k {
                 rhs_stack
@@ -11844,7 +11930,7 @@ fn build_outer_hessian_operator(
             for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
                 rhs_stack.column_mut(k + ext_idx).assign(&coord.g);
             }
-            let solved_stack = hop.solve_multi(&rhs_stack);
+            let solved_stack = mode_kernel.respond_stack(&rhs_stack);
             (0..total)
                 .map(|idx| solved_stack.column(idx).to_owned())
                 .collect::<Vec<_>>()
@@ -19167,6 +19253,110 @@ mod tests {
     ///   cost   = … + ½ log|Zᵀ H Z|  − ½ log|Zᵀ S(λ) Z|_+
     ///   grad_k = … + ½ tr((Zᵀ H Z)⁻¹ Zᵀ (λ_k S_k) Z) − ½ ∂_k log|Zᵀ S Z|_+
     ///
+    /// #931 pass-2 bit-identity pin: `ThetaModeResponseKernel`'s emissions
+    /// equal the pre-port per-site assemblies EXACTLY (same factorization,
+    /// same solve shapes, bitwise-equal outputs) in both selection regimes.
+    ///
+    /// The pre-port code at the four consumer sites is reproduced inline
+    /// here as the reference:
+    ///   * unconstrained, per-vector  → `hop.solve(rhs)`         (dense
+    ///     `compute_outer_hessian` ρ/ext fallbacks);
+    ///   * unconstrained, stacked     → `hop.solve_multi(stack)` (gradient
+    ///     site, `build_outer_hessian_operator` fallback);
+    ///   * constrained (active A_act) → per-vector
+    ///     `with_active_constraints(..).apply_pseudo_inverse(rhs)`;
+    ///   * box-masked ρ coordinate    → exact zeros (old code skipped the
+    ///     solve; the kernel maps the zero RHS column to exact zeros by
+    ///     linearity).
+    /// Any future edit that lets one shape drift from its reference breaks
+    /// this test bit-for-bit, which is the point.
+    #[test]
+    fn theta_mode_response_kernel_matches_preport_assembly_bitwise() {
+        use crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock;
+
+        let h = array![[2.0, 0.3, 0.1], [0.3, 1.5, 0.2], [0.1, 0.2, 1.0]];
+        let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let rhs_a = array![0.7, -1.3, 0.4];
+        let rhs_b = array![-0.2, 0.9, 2.1];
+
+        // ── Unconstrained regime: full-Hessian solve, both shapes. ──
+        let kernel_free = ThetaModeResponseKernel::select(None, None, &hop);
+        let one_new = kernel_free.respond_one(&rhs_a);
+        let one_ref = hop.solve(&rhs_a);
+        for (n, r) in one_new.iter().zip(one_ref.iter()) {
+            assert_eq!(n.to_bits(), r.to_bits(), "respond_one vs hop.solve");
+        }
+        let mut stack = Array2::<f64>::zeros((3, 3));
+        stack.column_mut(0).assign(&rhs_a);
+        // column 1 stays zero: a box-masked ρ coordinate's RHS.
+        stack.column_mut(2).assign(&rhs_b);
+        let stack_new = kernel_free.respond_stack(&stack);
+        let stack_ref = hop.solve_multi(&stack);
+        for (n, r) in stack_new.iter().zip(stack_ref.iter()) {
+            assert_eq!(n.to_bits(), r.to_bits(), "respond_stack vs solve_multi");
+        }
+        assert!(
+            stack_new.column(1).iter().all(|v| *v == 0.0),
+            "masked zero RHS column must emit exact zeros"
+        );
+
+        // ── Constrained regime: lifted kernel K_T, selection + emission. ──
+        let trace = PenaltySubspaceTrace {
+            u_s: array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
+            h_proj_inverse: array![[0.5, 0.1], [0.1, 0.8]],
+        };
+        let block = ActiveLinearConstraintBlock {
+            a: array![[1.0, 1.0, 0.0]],
+        };
+        let kernel_con = ThetaModeResponseKernel::select(Some(&trace), Some(&block), &hop);
+        // Pre-port reference: build the constrained kernel the way every
+        // site did, apply per vector.
+        let ck_ref = trace.with_active_constraints(block.a.view());
+        assert!(ck_ref.has_active_constraints());
+        for rhs in [&rhs_a, &rhs_b] {
+            let v_new = kernel_con.respond_one(rhs);
+            let v_ref = ck_ref.apply_pseudo_inverse(rhs);
+            for (n, r) in v_new.iter().zip(v_ref.iter()) {
+                assert_eq!(n.to_bits(), r.to_bits(), "constrained respond_one vs K_T");
+            }
+            // The pass-2 certify invariant: the emission lies in ker(A_act).
+            let tangency = block.a.dot(&v_new);
+            assert!(
+                tangency[0].abs() <= 1e-12 * (1.0 + v_new.iter().map(|x| x.abs()).sum::<f64>()),
+                "constrained mode response must satisfy A_act·v = 0, got {}",
+                tangency[0]
+            );
+        }
+        // Stacked constrained emission = per-column K_T applies in order,
+        // masked column included (zero in, exact zero out).
+        let con_stack_new = kernel_con.respond_stack(&stack);
+        for (j, rhs) in [Some(&rhs_a), None, Some(&rhs_b)].iter().enumerate() {
+            let v_ref = match rhs {
+                Some(rhs) => ck_ref.apply_pseudo_inverse(rhs),
+                None => Array1::<f64>::zeros(3),
+            };
+            for (n, r) in con_stack_new.column(j).iter().zip(v_ref.iter()) {
+                assert_eq!(
+                    n.to_bits(),
+                    r.to_bits(),
+                    "constrained respond_stack column {j} vs per-vector K_T"
+                );
+            }
+        }
+
+        // ── Selection rule edge: subspace without active constraints must
+        // still take the FULL solve (the near-separable null(S₊) rule). ──
+        let kernel_subspace_only = ThetaModeResponseKernel::select(Some(&trace), None, &hop);
+        let v_sub = kernel_subspace_only.respond_one(&rhs_a);
+        for (n, r) in v_sub.iter().zip(one_ref.iter()) {
+            assert_eq!(
+                n.to_bits(),
+                r.to_bits(),
+                "subspace-without-constraints must route through the full H⁻¹"
+            );
+        }
+    }
+
     /// The unified evaluator dispatches to `try_tangent_projected_evaluate`
     /// at the top of `reml_laml_evaluate`, so this test verifies that under
     /// an active constraint set the returned gradient stays bounded

@@ -30,12 +30,18 @@ use std::ops::Range;
 use std::sync::Arc;
 use thiserror::Error;
 
+mod constant_curvature_smooth;
 mod cyclic;
 mod polylog;
 mod sphere_kernels;
 mod sphere_spec;
 mod sphere_spectral;
 
+pub use constant_curvature_smooth::{
+    ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, build_constant_curvature_basis,
+    constant_curvature_kernel_kappa_jets, constant_curvature_kernel_matrix,
+    realized_constant_curvature_length_scale,
+};
 pub use sphere_spec::{
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
 };
@@ -2519,6 +2525,17 @@ pub enum BasisMetadata {
         method: SphereMethod,
         max_degree: Option<usize>,
         wahba_kernel: SphereWahbaKernel,
+        constraint_transform: Option<Array2<f64>>,
+    },
+    /// Constant-curvature (`M_κ`) geodesic-kernel smooth (#944). `kappa` and
+    /// the realized `length_scale` are persisted so predict-time (and the
+    /// future ψ-channel per-trial) rebuilds replay the exact fit-time
+    /// geometry; `constraint_transform` is the composed `z · z_parametric`
+    /// frozen by the global identifiability pipeline (#532 pattern).
+    ConstantCurvature {
+        centers: Array2<f64>,
+        kappa: f64,
+        length_scale: f64,
         constraint_transform: Option<Array2<f64>>,
     },
     Matern {
