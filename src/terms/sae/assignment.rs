@@ -470,11 +470,7 @@ pub(crate) fn ibp_stick_breaking_prior(k_atoms: usize, alpha: f64) -> Array1<f64
 /// IBP-MAP row activations: per-atom sigmoid likelihood times the truncated
 /// stick-breaking prior mass. With tied logits the prior dominates and yields
 /// strictly decreasing activations in atom index.
-pub(crate) fn ibp_map_row(
-    logits: ArrayView1<'_, f64>,
-    temperature: f64,
-    alpha: f64,
-) -> Array1<f64> {
+pub fn ibp_map_row(logits: ArrayView1<'_, f64>, temperature: f64, alpha: f64) -> Array1<f64> {
     let prior = ibp_stick_breaking_prior(logits.len(), alpha);
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
@@ -511,11 +507,7 @@ pub fn ibp_map_row_value_grad(
     (value, grad)
 }
 
-pub(crate) fn jumprelu_row(
-    logits: ArrayView1<'_, f64>,
-    temperature: f64,
-    threshold: f64,
-) -> Array1<f64> {
+pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f64) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
         // Hard gate: strictly zero below threshold (the intended "jump"). Above
