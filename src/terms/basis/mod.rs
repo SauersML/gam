@@ -32,6 +32,7 @@ use thiserror::Error;
 
 mod constant_curvature_smooth;
 mod cyclic;
+mod measure_jet_moments;
 mod measure_jet_predict;
 mod measure_jet_smooth;
 mod polylog;
@@ -43,6 +44,10 @@ pub use constant_curvature_smooth::{
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, build_constant_curvature_basis,
     constant_curvature_kernel_kappa_jets, constant_curvature_kernel_matrix,
     realized_constant_curvature_length_scale,
+};
+pub use measure_jet_moments::{
+    MeasureJetJetStats, MeasureJetMomentTable, accumulate_moment_table, jet_sufficient_stats,
+    merge_moment_tables, recenter_moment_table,
 };
 pub use measure_jet_predict::measure_jet_extrapolation_variance;
 pub use measure_jet_smooth::{
