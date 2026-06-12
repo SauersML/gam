@@ -32,7 +32,7 @@ use crate::families::transformation_normal::TransformationNormalFamily;
 use crate::inference::model::{
     DataSchema, FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
-    TransformationScoreCalibration,
+    SavedSplineScan, TransformationScoreCalibration,
 };
 use crate::smooth::TermCollectionSpec;
 use crate::types::{
@@ -312,6 +312,41 @@ fn truncate_marginal_slope_influence_absorber(
     .map_err(|e| {
         format!("marginal-slope influence-absorber truncation produced an invalid fit result: {e}")
     })
+}
+
+/// Assemble the canonical spline-scan payload (#1030/#1034): a standard
+/// Gaussian-identity model whose fit representation is the exact O(n)
+/// smoothing-spline smoother state instead of a dense `fit_result`. The CLI
+/// and FFI save paths both route through here so the scan on-disk contract
+/// cannot diverge between sources.
+pub fn assemble_spline_scan_payload(
+    formula: String,
+    feature_column: String,
+    fit: &crate::solver::spline_scan::CubicSplineScanFit,
+    data_schema: DataSchema,
+    training_headers: Vec<String>,
+    training_feature_ranges: Vec<(f64, f64)>,
+) -> FittedModelPayload {
+    let mut payload = FittedModelPayload::new(
+        MODEL_PAYLOAD_VERSION,
+        formula,
+        ModelKind::Standard,
+        FittedFamily::Standard {
+            likelihood: LikelihoodSpec::gaussian_identity(),
+            link: None,
+            latent_cloglog_state: None,
+            mixture_state: None,
+            sas_state: None,
+        },
+        "gaussian".to_string(),
+    );
+    payload.spline_scan = Some(SavedSplineScan {
+        feature_column,
+        state: fit.to_state(),
+    });
+    payload.data_schema = Some(data_schema);
+    payload.set_training_feature_metadata(training_headers, training_feature_ranges);
+    payload
 }
 
 /// Assemble the canonical Bernoulli marginal-slope payload.
