@@ -209,6 +209,7 @@ fn fit_web(
 ) -> gam::StandardFitResult {
     let cfg = FitConfig {
         family: Some(family.to_string()),
+        outer_max_iter: Some(35),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, data, &cfg).expect("web fit succeeded");
