@@ -3068,6 +3068,27 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
     {
         return true;
     }
+
+    // Measure-jet: ψ enrollment is STAGED OFF here for now, deliberately.
+    // The exact penalty-only ψ feedstock is landed and FD-gated
+    // (`build_measure_jet_basis_psi_derivatives`: per-level coords (α, lnτ),
+    // fused coords (s, α, lnτ), zero design drift, fit-time normalization
+    // shared with the candidates), and the outer engine is confirmed generic
+    // (see the MEASURE-JET ψ REGISTRATION block at
+    // `solver/outer_strategy.rs` / `OuterProblem::with_psi_dim`). What
+    // remains before flipping this arm to `spec.tau0 > 0.0` is the dial
+    // plumbing in THIS file, whose current bodies assume κ/length-scale
+    // semantics and would corrupt the (α, lnτ[, s]) dials if enrolled as-is:
+    // `SpatialLogKappaCoords` seeds/bounds (dial boxes, not κ windows),
+    // `apply_log_kappa_to_term` (dial write-back dispatch split), and the
+    // aniso hyper-dirs arm consuming the producer. Until then the dials stay
+    // build-time-fixed — same staging contract as constant-curvature κ
+    // (#944 stage 3).
+    if let Some(term) = spec.smooth_terms.get(term_idx)
+        && let SmoothBasisSpec::MeasureJet { .. } = &term.basis
+    {
+        return false;
+    }
     get_spatial_length_scale(spec, term_idx).is_some()
 }
 
