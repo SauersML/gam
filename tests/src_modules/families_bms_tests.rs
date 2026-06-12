@@ -6964,6 +6964,141 @@ fn conditional_latent_gate_detects_and_removes_conditional_mean_shift() {
     assert!(cal.post_mean.abs() < 1.0e-6, "post_mean={}", cal.post_mean);
 }
 
+/// Regression test on `weighted_ridge_sandwich_cov` directly: the HC0 sandwich
+/// must be FINITE on a numerically rank-deficient normal matrix, the smallest
+/// failure mode behind the "conditional latent calibration sandwich covariance
+/// is non-finite" production error. Two identical informative columns make
+/// `AᵀWA` exactly rank 1 inside a 2-D system; even with a diagonal-relative
+/// `1e-8` Tikhonov the explicit `M⁻¹` form blows up the sandwich, but the SPD
+/// pseudo-inverse path projects out the non-identified direction and the
+/// returned covariance is finite and PSD on the identifiable span.
+#[test]
+fn weighted_ridge_sandwich_cov_is_finite_on_rank_deficient_normal_matrix() {
+    let n = 1_024usize;
+    // Two perfectly collinear basis columns: `AᵀA` is rank 1 in a 2-D system.
+    let mut basis = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        let x = (i as f64) / (n as f64 - 1.0) * 2.0 - 1.0;
+        basis[[i, 0]] = x;
+        basis[[i, 1]] = x;
+    }
+    let weights = Array1::ones(n);
+    // Residuals carry signal in the (rank-1) identifiable direction.
+    let residuals: Vec<f64> = (0..n)
+        .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+        .collect();
+    let total = basis.column(0).iter().map(|x| x * x).sum::<f64>();
+    // Match the caller's recipe: `M = AᵀWA + λ · diag(AᵀWA)` with `λ = 1e-8`.
+    // Both diagonals equal `Σ x²`, both off-diagonals equal `Σ x²`, so M has
+    // eigenvalues `(2 + 1e-8)·total` and `1e-8·total` — the second is barely
+    // above zero, the ratio is 2/1e-8 = 2e8 cond.
+    let mut normal_matrix = Array2::<f64>::from_elem((2, 2), total);
+    normal_matrix[[0, 0]] *= 1.0 + AUTO_Z_CONDITIONAL_RIDGE_REL;
+    normal_matrix[[1, 1]] *= 1.0 + AUTO_Z_CONDITIONAL_RIDGE_REL;
+
+    let cov = weighted_ridge_sandwich_cov(
+        basis.view(),
+        &residuals,
+        weights.view(),
+        &normal_matrix,
+    )
+    .expect("rank-deficient normal matrix must yield a finite sandwich via pseudo-inverse");
+
+    assert_eq!(cov.dim(), (2, 2));
+    assert!(
+        cov.iter().all(|v| v.is_finite()),
+        "sandwich covariance must be finite; got {:?}",
+        cov
+    );
+    // Symmetric.
+    assert!(
+        (cov[[0, 1]] - cov[[1, 0]]).abs() < 1.0e-9,
+        "sandwich covariance must be symmetric"
+    );
+    // The identifiable direction is `(1, 1)/√2`; its variance must be positive.
+    let one = ndarray::array![1.0, 1.0];
+    let projected = one.dot(&cov.dot(&one)) * 0.5;
+    assert!(
+        projected.is_finite() && projected > 0.0,
+        "variance in the identifiable direction must be finite positive: {projected}"
+    );
+}
+
+/// Regression test: the Murphy–Topel first-stage sandwich must be FINITE on a
+/// wide rank-deficient conditioning basis. The large-scale benchmarks tripped
+/// "conditional latent calibration sandwich covariance is non-finite" whenever
+/// the marginal design (smooth + 16-D duchon + linkwiggle) contributed a
+/// near-null direction to the conditioning span — the explicit `M⁻¹` of the
+/// near-singular normal matrix blew the sandwich through f64 range. Replacing
+/// it with the SPD pseudo-inverse `M⁺` makes the non-identified directions
+/// contribute zero variance (the correct asymptotic answer for parameters not
+/// identified by the first-stage data) and the sandwich finite.
+#[test]
+fn conditional_latent_gate_handles_rank_deficient_conditioning_basis() {
+    let n = 2_000usize;
+    let p_widen = 8usize;
+    let informative: Vec<f64> = (0..n)
+        .map(|i| (i as f64) / (n as f64 - 1.0) * 2.0 - 1.0)
+        .collect();
+    // Build a deliberately rank-deficient wide conditioning basis: one
+    // informative column carrying the conditional mean shift, four duplicates
+    // (perfect collinearity), and three constant-1 columns (collinear with the
+    // prepended intercept). The weighted Gram of `[1 | a(C)]` therefore has
+    // effective rank 2 inside a 9-dimensional system, mirroring the structural
+    // collinearity the freeze + identifiability pipeline can leave in a wide
+    // marginal design.
+    let mut a_block = Array2::<f64>::zeros((n, p_widen));
+    for j in 0..p_widen {
+        for i in 0..n {
+            a_block[[i, j]] = if j < p_widen / 2 { informative[i] } else { 1.0 };
+        }
+    }
+    // z carries a conditional mean shift on the informative column so the gate
+    // fires and the sandwich path is exercised end-to-end.
+    let z = Array1::from_iter(
+        (0..n).map(|i| 0.8 * informative[i] + if i % 2 == 0 { 0.35 } else { -0.35 }),
+    );
+    let weights = Array1::ones(n);
+
+    let cal = fit_conditional_latent_calibration_if_needed(&z, &weights, a_block.view())
+        .expect("conditional gate must not error on a rank-deficient conditioning basis")
+        .expect("conditional Rao gate must fire on a clear conditional mean shift");
+
+    assert!(
+        cal.mean_cov.iter().all(|v| v.is_finite()),
+        "mean sandwich covariance must be finite on rank-deficient conditioning"
+    );
+    assert!(
+        cal.var_cov.iter().all(|v| v.is_finite()),
+        "variance sandwich covariance must be finite on rank-deficient conditioning"
+    );
+
+    // The covariance is a valid PSD matrix in the identifiable subspace — its
+    // diagonal entries must be non-negative.
+    for j in 0..cal.mean_cov.nrows() {
+        assert!(
+            cal.mean_cov[[j, j]] >= -1.0e-12,
+            "mean sandwich diagonal must be PSD: cov[{j},{j}]={}",
+            cal.mean_cov[[j, j]]
+        );
+    }
+
+    // The calibration must still remove the conditional mean shift even when
+    // some directions of the basis are non-identified: the Rao gate uses a
+    // pseudo-inverse internally, and the fitted m̂(C) lives in the identifiable
+    // span of the basis, so ζ = (z − m̂(C))/√v̂(C) must be conditionally
+    // centered on the informative direction.
+    let zeta = cal
+        .apply(z.view(), a_block.view())
+        .expect("conditional calibration applies on rank-deficient basis");
+    let informative_arr = Array1::from(informative);
+    let cov_after = weighted_cov_for_test(&informative_arr, &zeta, &weights);
+    assert!(
+        cov_after.abs() < 1.0e-4,
+        "ζ must be conditionally centered on the informative direction (cov={cov_after})"
+    );
+}
+
 /// #905: with NO conditional structure (z independent of the conditioning
 /// span), the Rao gate must NOT fire — the conditional correction is reserved
 /// for genuine conditional shifts, leaving the pooled-marginal gate in charge.
