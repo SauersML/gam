@@ -7565,12 +7565,12 @@ impl SaeManifoldTerm {
         let (evals, evecs) = h_span
             .eigh(Side::Lower)
             .map_err(|_| conditioning_err.clone())?;
-        let gauge_floor = (SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR * max_pivot)
-            .max(SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR.sqrt() * max_pivot);
+        let strict_gauge_floor = SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR * max_pivot;
+        let fallback_gauge_floor = SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR.sqrt() * max_pivot;
         let mut orthonormal: Vec<Array1<f64>> = Vec::new();
         for eig_idx in 0..evals.len() {
             let rayleigh = evals[eig_idx];
-            if !(rayleigh.is_finite() && rayleigh <= gauge_floor) {
+            if !(rayleigh.is_finite() && rayleigh <= strict_gauge_floor) {
                 continue;
             }
             let mut direction = Array1::<f64>::zeros(full_len);
@@ -7589,6 +7589,37 @@ impl SaeManifoldTerm {
                 *value *= inv_norm;
             }
             orthonormal.push(direction);
+        }
+        if orthonormal.is_empty() {
+            let mut best_idx = None;
+            let mut best_rayleigh = f64::INFINITY;
+            for eig_idx in 0..evals.len() {
+                let rayleigh = evals[eig_idx];
+                if rayleigh.is_finite()
+                    && rayleigh < best_rayleigh
+                    && rayleigh <= fallback_gauge_floor
+                {
+                    best_idx = Some(eig_idx);
+                    best_rayleigh = rayleigh;
+                }
+            }
+            if let Some(eig_idx) = best_idx {
+                let mut direction = Array1::<f64>::zeros(full_len);
+                for basis_idx in 0..span_rank {
+                    let coeff = evecs[[basis_idx, eig_idx]];
+                    for row in 0..full_len {
+                        direction[row] += coeff * gauge_span[basis_idx][row];
+                    }
+                }
+                let norm_sq = direction.iter().map(|v| v * v).sum::<f64>();
+                if norm_sq.is_finite() && norm_sq > 1.0e-24 {
+                    let inv_norm = norm_sq.sqrt().recip();
+                    for value in direction.iter_mut() {
+                        *value *= inv_norm;
+                    }
+                    orthonormal.push(direction);
+                }
+            }
         }
         if orthonormal.is_empty() {
             return Err(conditioning_err);
