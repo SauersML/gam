@@ -20274,11 +20274,12 @@ where
                           theta: &Array1<f64>,
                           order: OuterEvalOrder|
          -> Result<OuterEval, EstimationError> {
-            if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta) {
-                let cached_satisfies_order = match order {
-                    OuterEvalOrder::ValueAndGradient => true,
-                    OuterEvalOrder::ValueGradientHessian => hess.is_analytic(),
-                };
+              if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta) {
+                  let cached_satisfies_order = match order {
+                      OuterEvalOrder::Value => true,
+                      OuterEvalOrder::ValueAndGradient => true,
+                      OuterEvalOrder::ValueGradientHessian => hess.is_analytic(),
+                  };
                 if cached_satisfies_order {
                     if !cost.is_finite() {
                         return Ok(OuterEval::infeasible(theta.len()));
