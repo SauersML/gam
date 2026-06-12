@@ -2458,6 +2458,10 @@ pub struct ClosureObjective<
     /// Optional inner-state seeding closure. Objectives with PIRLS / Newton
     /// inner state install cached β here before the first outer eval.
     pub(crate) seed_fn: Option<Fseed>,
+    /// Whether a seed hook should also opt the objective into generic
+    /// continuation pre-warm. High-dimensional REML keeps the seed hook for
+    /// cache/warm-start replay but declines the expensive rho-anneal pre-pass.
+    pub(crate) continuation_prewarm: bool,
 }
 
 impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> OuterObjective
@@ -2534,7 +2538,7 @@ where
     }
 
     fn allow_continuation_prewarm(&self) -> bool {
-        self.seed_fn.is_some()
+        self.continuation_prewarm && self.seed_fn.is_some()
     }
 
     fn reset(&mut self) {
@@ -2570,6 +2574,7 @@ where
             efs_fn: self.efs_fn,
             screening_proxy_fn: self.screening_proxy_fn,
             seed_fn: Some(seed_fn),
+            continuation_prewarm: self.continuation_prewarm,
         }
     }
 }
@@ -4922,6 +4927,7 @@ pub struct OuterProblem {
     cache_session: Option<Arc<CacheSession>>,
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
     rho_uncertainty_problem_size: crate::inference::rho_uncertainty::RhoUncertaintyProblemSize,
+    continuation_prewarm: bool,
 }
 
 impl OuterProblem {
@@ -4955,6 +4961,7 @@ impl OuterProblem {
             cache_mirror_sessions: Vec::new(),
             rho_uncertainty_problem_size:
                 crate::inference::rho_uncertainty::RhoUncertaintyProblemSize::default(),
+            continuation_prewarm: true,
         }
     }
 
@@ -5036,6 +5043,13 @@ impl OuterProblem {
     }
     pub fn with_initial_rho(mut self, rho: Array1<f64>) -> Self {
         self.initial_rho = Some(rho);
+        self
+    }
+    /// Toggle the generic rho-continuation seed pre-warm. This does not affect
+    /// objectives that require an explicit continuation path; it only controls
+    /// the cheap-by-default pre-pass gated by `allow_continuation_prewarm()`.
+    pub fn with_continuation_prewarm(mut self, enabled: bool) -> Self {
+        self.continuation_prewarm = enabled;
         self
     }
     pub fn with_screening_cap(mut self, screening_cap: Arc<AtomicUsize>) -> Self {
@@ -5249,6 +5263,7 @@ impl OuterProblem {
             efs_fn,
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>>,
+            continuation_prewarm: self.continuation_prewarm,
         }
     }
 
@@ -5284,6 +5299,7 @@ impl OuterProblem {
             efs_fn,
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>>,
+            continuation_prewarm: self.continuation_prewarm,
         }
     }
 
@@ -5321,6 +5337,7 @@ impl OuterProblem {
             efs_fn,
             screening_proxy_fn: Some(screening_proxy_fn),
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>>,
+            continuation_prewarm: self.continuation_prewarm,
         }
     }
 
@@ -8881,6 +8898,7 @@ mod tests {
             efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
             screening_proxy_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<(), EstimationError>>,
+            continuation_prewarm: true,
         };
         assert_eq!(obj.capability().n_params, 1);
         assert_eq!(obj.eval_cost(&Array1::zeros(1)).unwrap(), 1.0);
@@ -8922,6 +8940,7 @@ mod tests {
                 fn(&mut Vec<f64>, &Array1<f64>) -> Result<f64, EstimationError>,
             >,
             seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<(), EstimationError>>,
+            continuation_prewarm: true,
         }
         .with_seed_inner_state(|state: &mut Vec<f64>, beta: &Array1<f64>| {
             state.extend(beta.iter().copied());
@@ -8986,6 +9005,7 @@ mod tests {
             }),
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>>,
+            continuation_prewarm: true,
         };
         let mut bridge = OuterFixedPointBridge {
             obj: &mut obj,

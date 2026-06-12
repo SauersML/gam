@@ -3876,6 +3876,7 @@ where
                 DeclaredHessianForm::Unavailable
             })
             .with_prefer_gradient_only(prefer_gradient_only)
+            .with_continuation_prewarm(!prefer_gradient_only)
             .with_barrier(
                 crate::solver::estimate::reml::unified::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
@@ -4128,6 +4129,7 @@ where
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Either)
             .with_prefer_gradient_only(prefer_gradient_only)
+            .with_continuation_prewarm(!prefer_gradient_only)
             .with_psi_dim(mixture_dim + sas_dim)
             .with_barrier(
                 crate::solver::estimate::reml::unified::BarrierConfig::from_constraints(
