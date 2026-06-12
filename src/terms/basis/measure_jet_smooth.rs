@@ -1581,7 +1581,12 @@ mod tests {
             measure_jet_energy_form(centers.view(), masses.view(), &band, s0, a0, lt.exp())
                 .expect("energy form")
         };
-        let h = 1e-5;
+        // FD step calibrated for the SECOND differences: their roundoff
+        // floor is ~4·ε_f64·scale/h² (assembly noise amplified by 1/h²), so
+        // h = 1e-4 ≈ ε^(1/4) balances it against the O(h²) truncation —
+        // both land ≥3 orders below the unchanged 5e-5·scale gate. h = 1e-5
+        // sits ON the roundoff floor and fails spuriously.
+        let h = 1e-4;
         let checks: [(&str, &Array2<f64>, Array2<f64>); 9] = [
             ("dq_ds", &jets.dq_ds, {
                 let (p, m_) = (q_at(s0 + h, a0), q_at(s0 - h, a0));
@@ -1834,7 +1839,9 @@ mod tests {
                 .expect("trial build")
                 .penalties
         };
-        let h = 1e-5;
+        // Second-difference-optimal step (see the jets FD test): the 4-point
+        // cross stencil shares the ~ε·scale/h² roundoff floor.
+        let h = 1e-4;
         let (a0, t0) = (frozen.alpha, frozen.tau0);
         let ap = pen_at(a0 + h, t0);
         let am = pen_at(a0 - h, t0);
@@ -1913,7 +1920,7 @@ mod tests {
                 .expect("trial build")
                 .penalties
         };
-        let h = 1e-5;
+        let h = 1e-4;
         let fd = (&pen_at(1.3 + h)[0] - &pen_at(1.3 - h)[0]) / (2.0 * h);
         let scale = fd.iter().fold(1e-30_f64, |acc, v| acc.max(v.abs()));
         for (x, y) in derivs.penalties_first[0][0].iter().zip(fd.iter()) {
