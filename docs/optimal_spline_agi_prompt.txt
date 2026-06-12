@@ -1,0 +1,99 @@
+TO: A mathematician with no limits on depth, patience, or invention.
+RE: Find the optimal spline. Or whatever should replace the spline.
+
+----------------------------------------------------------------------
+THE PROBLEM
+----------------------------------------------------------------------
+
+We observe n points (x_i, y_i), x_i in R^d (d from 1 to a few dozen,
+n from thousands to hundreds of millions), y_i noisy. We want to
+estimate a smooth function f, with honest uncertainty, inside a larger
+model (other terms, link functions, non-Gaussian likelihoods,
+hyperparameters chosen by marginal likelihood). The estimator must be
+computed on physical machines: finite memory, deep memory hierarchies,
+wide parallelism, arithmetic that is fast for some operations and slow
+for others, and floating point that rounds.
+
+Today this is done with splines and kernel methods: choose a smoothness
+functional, derive its minimizer, evaluate the resulting basis
+pointwise, and pay whatever linear algebra falls out. Every named
+construction in the literature fixed the mathematics first and accepted
+the computation that resulted. The reverse direction — and every
+direction orthogonal to both — is essentially unexplored. We do not
+believe the optimum has been found. We are not convinced the right
+*question* has been posed. That is your opening.
+
+----------------------------------------------------------------------
+WHAT "OPTIMAL" MUST ANSWER TO
+----------------------------------------------------------------------
+
+Judge any candidate against all of these at once, as one object:
+
+  1. STATISTICAL: risk under honest assumption classes; correct
+     uncertainty; graceful behavior where data is sparse and beyond
+     its range; invariances that match the problem, not the basis;
+     no hidden bias against structure the user cares about (e.g.
+     large-scale trends).
+
+  2. COMPUTATIONAL: total cost to fit, to evaluate, to differentiate
+     with respect to everything (inputs, coefficients,
+     hyperparameters), and to certify — as functions of n, d, and
+     accuracy. Constants matter. Memory traffic matters. Parallel
+     depth matters. Worst case and typical case both matter.
+
+  3. TRUSTWORTHY: every approximation must be certifiable a
+     posteriori — the algorithm must know when it is wrong and have
+     a correct fallback. Accuracy by fiat is disqualifying.
+
+  4. COMPOSABLE: it must live inside larger models — penalized
+     likelihoods, multiple terms, hyperparameter optimization that
+     needs derivatives of the whole fit. An estimator that is fast
+     alone but opaque to differentiation or marginal likelihood is
+     not a solution.
+
+If these pull against each other, prove it: exhibit the frontier and
+the trade-off theorem. If they do not, exhibit the object that
+achieves them simultaneously. Either result is an answer. Asserted
+tension without proof is not.
+
+----------------------------------------------------------------------
+FREEDOMS
+----------------------------------------------------------------------
+
+You are not required to produce a kernel, a basis expansion, an RKHS,
+a variational problem, or anything called a spline. Those are
+artifacts of how humans found the known solutions. Discard any of
+them. Discard all of them. You may redefine the estimand, the noise
+model, the notion of smoothness, the notion of evaluation, or the
+boundary between "model" and "algorithm" — provided you state what
+you changed and prove the replacement answers the same practical
+need. If the best object is adaptive, randomized, implicit, defined
+only through an algorithm, or stranger than that: fine. The
+requirements above are the only contract.
+
+Do not assume current hardware is permanent; do assume physics —
+locality, parallelism, finite precision — is.
+
+----------------------------------------------------------------------
+WHAT AN ANSWER LOOKS LIKE
+----------------------------------------------------------------------
+
+  - The construction, stated precisely.
+  - Proofs of its statistical properties, with assumption classes
+    made explicit.
+  - Matching lower bounds, or your best obstruction results: in what
+    sense is this optimal, and against what class of alternatives?
+    "Best I found" is a progress report, not an answer.
+  - The algorithm, with cost and certification analysis, to the
+    level a competent engineer could implement without further
+    invention.
+  - The failure modes, stated plainly: where it loses to existing
+    methods, and by how much.
+
+If you discover instead that the question is malposed — that
+"optimal spline" dissolves under the right formalization — then say
+exactly what dissolves it and what the well-posed successor question
+is. That, too, is an answer worth having.
+
+Take whatever path through mathematics you need. We have given you
+the constraints we actually have, and nothing else, on purpose.
