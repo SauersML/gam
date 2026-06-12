@@ -675,13 +675,12 @@ fn dimensionless_entry_rho(term: &SaeManifoldTerm, z: &Array2<f64>) -> SaeManifo
     let seed_dispersion = term
         .seed_reconstruction_dispersion(z.view())
         .expect("seed reconstruction dispersion");
-    let mut rho = SaeManifoldRho::new(
+    assert!(seed_dispersion.is_finite() && seed_dispersion > 0.0);
+    SaeManifoldRho::new(
         SPARSITY.ln(),
-        SMOOTHNESS.ln() + seed_dispersion.ln(),
+        SMOOTHNESS.ln(),
         vec![Array1::<f64>::zeros(0); K],
-    );
-    rho.log_lambda_sparse += 1.0;
-    rho
+    )
 }
 
 #[test]
