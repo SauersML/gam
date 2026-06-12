@@ -3,26 +3,27 @@
 
 This experiment fits a K=1 circle chart to the last-token activations at a
 small ladder of transformer layers, then estimates smooth circular transport
-maps between adjacent ladder layers:
+maps between ladder layers:
 
     theta_next = h(theta_current)
 
 The transport map is represented by two periodic GAMs for cos(theta_next) and
 sin(theta_next). The mapped angle is recovered with atan2, which keeps the
-response circular while using the scalar Gaussian GAM API.
+response circular while using the scalar Gaussian GAM API. Adjacent maps and
+direct two-hop maps are fit on the training split; the held-out split tests the
+composition law h_{l,l+2} ~= h_{l+1,l+2} o h_{l,l+1}.
 """
 
 from __future__ import annotations
 
 import argparse
 import colorsys
-import concurrent.futures
 import csv
 import json
 import math
-import os
 import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +35,19 @@ DEFAULT_BANK = (
     "/home/azuser/Manifold-SAE/runs/OLMO3_32B_TRAJ_SFT/"
     "5e-5-step10790/extra"
 )
-DEFAULT_REPORT = "/mnt/work/exp/layer_transport_report.json"
-DEFAULT_PROFILE_PREFIX = "/mnt/work/exp/layer_transport_isometry_profile"
+DEFAULT_REPORT = "/mnt/work/exp/layer_transport_l20_l30_report.json"
+DEFAULT_PROFILE_PREFIX = "/mnt/work/exp/layer_transport_l20_l30"
+DEFAULT_LAYERS = list(range(20, 31))
+DEFAULT_EVAL_FRACTION = 0.25
+
+
+@dataclass
+class TransportFit:
+    layer_current: int
+    layer_next: int
+    cos_model: Any
+    sin_model: Any
+    entry: dict[str, Any]
 
 
 def json_float(value: Any) -> float | None:
@@ -47,6 +59,10 @@ def json_float(value: Any) -> float | None:
 
 def angle_delta(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.angle(np.exp(1j * (a - b)))
+
+
+def circular_abs_error(pred: np.ndarray, truth: np.ndarray) -> np.ndarray:
+    return np.abs(angle_delta(pred, truth))
 
 
 def circular_corr(alpha: np.ndarray, beta: np.ndarray) -> float:
@@ -89,19 +105,31 @@ def load_bank(bank: Path) -> tuple[np.ndarray, np.ndarray]:
 
 def parse_layers(raw: str | None, n_layers: int) -> list[int]:
     if raw is None or raw.strip() == "":
-        layers = list(range(4, n_layers, 8))
-        if len(layers) > 8:
-            layers = layers[:8]
-        return layers
-    layers = [int(part.strip()) for part in raw.split(",") if part.strip()]
-    if len(layers) < 2:
-        raise ValueError("--layers must name at least two layers")
+        layers = DEFAULT_LAYERS
+    else:
+        layers = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    if len(layers) < 3:
+        raise ValueError("--layers must name at least three layers")
     if len(set(layers)) != len(layers):
         raise ValueError(f"--layers contains duplicates: {layers}")
     for layer in layers:
         if layer < 0 or layer >= n_layers:
             raise ValueError(f"layer {layer} outside activation range [0, {n_layers})")
     return layers
+
+
+def deterministic_split(
+    n_rows: int,
+    eval_fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not 0.0 < eval_fraction < 1.0:
+        raise ValueError("eval_fraction must be in (0, 1)")
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(n_rows)
+    n_eval = max(1, int(round(n_rows * eval_fraction)))
+    n_eval = min(n_eval, n_rows - 1)
+    return np.sort(order[n_eval:]), np.sort(order[:n_eval])
 
 
 def standardize_layer(acts: np.ndarray, layer: int) -> np.ndarray:
@@ -146,11 +174,78 @@ def predict_vector(model: Any, theta: np.ndarray) -> np.ndarray:
     return np.asarray(pred, dtype=np.float64)
 
 
-def worker_gamfit() -> Any:
-    os.environ["RAYON_NUM_THREADS"] = "4"
-    import gamfit
+def predict_map(fit: TransportFit, theta: np.ndarray) -> np.ndarray:
+    pred_cos = predict_vector(fit.cos_model, theta)
+    pred_sin = predict_vector(fit.sin_model, theta)
+    return np.mod(np.arctan2(pred_sin, pred_cos), TAU)
 
-    return gamfit
+
+def angle_error_summary(prefix: str, pred: np.ndarray, truth: np.ndarray) -> dict[str, Any]:
+    err = circular_abs_error(pred, truth)
+    corr = circular_corr(pred, truth) if err.shape[0] >= 3 else 0.0
+    return {
+        f"{prefix}_n": int(err.shape[0]),
+        f"{prefix}_circular_corr": json_float(corr),
+        f"{prefix}_mean_abs_error_rad": json_float(err.mean()),
+        f"{prefix}_median_abs_error_rad": json_float(np.median(err)),
+        f"{prefix}_rms_error_rad": json_float(math.sqrt(float(np.mean(err * err)))),
+        f"{prefix}_max_abs_error_rad": json_float(err.max()),
+    }
+
+
+def map_grid_metrics(
+    cos_model: Any,
+    sin_model: Any,
+    grid_size: int,
+) -> dict[str, Any]:
+    grid = np.linspace(0.0, TAU, grid_size, endpoint=False)
+    step = TAU / float(grid_size)
+    map_grid = np.mod(
+        np.arctan2(predict_vector(sin_model, grid), predict_vector(cos_model, grid)),
+        TAU,
+    )
+    map_plus = np.mod(
+        np.arctan2(
+            predict_vector(sin_model, np.mod(grid + step, TAU)),
+            predict_vector(cos_model, np.mod(grid + step, TAU)),
+        ),
+        TAU,
+    )
+    map_minus = np.mod(
+        np.arctan2(
+            predict_vector(sin_model, np.mod(grid - step, TAU)),
+            predict_vector(cos_model, np.mod(grid - step, TAU)),
+        ),
+        TAU,
+    )
+    deriv = angle_delta(map_plus, map_minus) / (2.0 * step)
+    curvature = (np.roll(deriv, -1) - np.roll(deriv, 1)) / (2.0 * step)
+    defect = np.abs(np.abs(deriv) - 1.0)
+
+    closed = np.concatenate([map_grid, map_grid[:1]])
+    winding = float(angle_delta(closed[1:], closed[:-1]).sum() / TAU)
+    winding_round = int(np.rint(winding))
+    if winding_round > 0:
+        winding_sign = 1
+    elif winding_round < 0:
+        winding_sign = -1
+    else:
+        winding_sign = 0
+
+    abs_curvature = np.abs(curvature)
+    return {
+        "isometry_defect_mean": json_float(defect.mean()),
+        "isometry_defect_rms": json_float(math.sqrt(float(np.mean(defect * defect)))),
+        "isometry_defect_max": json_float(defect.max()),
+        "derivative_abs_mean": json_float(np.abs(deriv).mean()),
+        "derivative_mean": json_float(deriv.mean()),
+        "curvature_abs_mean": json_float(abs_curvature.mean()),
+        "curvature_abs_rms": json_float(math.sqrt(float(np.mean(curvature * curvature)))),
+        "curvature_abs_max": json_float(abs_curvature.max()),
+        "winding_number": winding,
+        "winding_number_round": winding_round,
+        "winding_number_sign": winding_sign,
+    }
 
 
 def fit_layer_chart(
@@ -161,7 +256,8 @@ def fit_layer_chart(
     seed: int,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     t0 = time.time()
-    gamfit = worker_gamfit()
+    import gamfit
+
     acts = np.load(Path(bank) / "activations.npy", mmap_mode="r")
     x = standardize_layer(acts, layer)
     model = gamfit.sae_manifold_fit(
@@ -197,90 +293,141 @@ def fit_transport(
     layer_next: int,
     basis_dim: int,
     grid_size: int,
-) -> dict[str, Any]:
+    train_idx: np.ndarray,
+    eval_idx: np.ndarray,
+    map_kind: str,
+) -> TransportFit:
     t0 = time.time()
-    gamfit = worker_gamfit()
+    import gamfit
+
     data = {
-        "theta": theta_current,
-        "cos_next": np.cos(theta_next),
-        "sin_next": np.sin(theta_next),
+        "theta": theta_current[train_idx],
+        "cos_next": np.cos(theta_next[train_idx]),
+        "sin_next": np.sin(theta_next[train_idx]),
     }
     smooth = f"s(theta, periodic=true, k={basis_dim}, period={TAU}, origin=0)"
     cos_model = gamfit.fit(data, f"cos_next ~ {smooth}", family="gaussian")
     sin_model = gamfit.fit(data, f"sin_next ~ {smooth}", family="gaussian")
 
-    pred_cos = predict_vector(cos_model, theta_current)
-    pred_sin = predict_vector(sin_model, theta_current)
-    mapped = np.mod(np.arctan2(pred_sin, pred_cos), TAU)
-    corr = circular_corr(mapped, theta_next)
-
-    grid = np.linspace(0.0, TAU, grid_size, endpoint=False)
-    eps = 1e-3
-    plus = np.mod(grid + eps, TAU)
-    minus = np.mod(grid - eps, TAU)
-    map_grid = np.mod(
-        np.arctan2(predict_vector(sin_model, grid), predict_vector(cos_model, grid)),
-        TAU,
+    fit = TransportFit(
+        layer_current=layer_current,
+        layer_next=layer_next,
+        cos_model=cos_model,
+        sin_model=sin_model,
+        entry={},
     )
-    map_plus = np.mod(
-        np.arctan2(predict_vector(sin_model, plus), predict_vector(cos_model, plus)),
-        TAU,
-    )
-    map_minus = np.mod(
-        np.arctan2(predict_vector(sin_model, minus), predict_vector(cos_model, minus)),
-        TAU,
-    )
-    deriv = angle_delta(map_plus, map_minus) / (2.0 * eps)
-    defect = np.abs(np.abs(deriv) - 1.0)
-
-    closed = np.concatenate([map_grid, map_grid[:1]])
-    winding = float(angle_delta(closed[1:], closed[:-1]).sum() / TAU)
-    winding_round = int(np.rint(winding))
-    if winding_round > 0:
-        winding_sign = 1
-    elif winding_round < 0:
-        winding_sign = -1
-    else:
-        winding_sign = 0
-
+    train_mapped = predict_map(fit, theta_current[train_idx])
+    eval_mapped = predict_map(fit, theta_current[eval_idx])
     cos_summary = cos_model.summary()
     sin_summary = sin_model.summary()
-    radius = np.sqrt(pred_cos * pred_cos + pred_sin * pred_sin)
-    return {
+    eval_cos = predict_vector(cos_model, theta_current[eval_idx])
+    eval_sin = predict_vector(sin_model, theta_current[eval_idx])
+    radius = np.sqrt(eval_cos * eval_cos + eval_sin * eval_sin)
+    entry = {
         "layer_pair": [layer_current, layer_next],
+        "map_kind": map_kind,
+        "pair_stride": layer_next - layer_current,
         "seconds": time.time() - t0,
         "basis_dim": basis_dim,
         "grid_size": grid_size,
-        "mapped_actual_circular_corr": corr,
-        "abs_mapped_actual_circular_corr": abs(corr),
-        "isometry_defect_mean": json_float(defect.mean()),
-        "isometry_defect_rms": json_float(math.sqrt(float(np.mean(defect * defect)))),
-        "isometry_defect_max": json_float(defect.max()),
-        "derivative_abs_mean": json_float(np.abs(deriv).mean()),
-        "derivative_mean": json_float(deriv.mean()),
-        "winding_number": winding,
-        "winding_number_round": winding_round,
-        "winding_number_sign": winding_sign,
+        **angle_error_summary("train", train_mapped, theta_next[train_idx]),
+        **angle_error_summary("heldout", eval_mapped, theta_next[eval_idx]),
+        **map_grid_metrics(cos_model, sin_model, grid_size),
         "predicted_radius_mean": json_float(radius.mean()),
         "predicted_radius_min": json_float(radius.min()),
         "cos_reml_score": json_float(cos_summary["reml_score"]),
         "sin_reml_score": json_float(sin_summary["reml_score"]),
     }
+    fit.entry = entry
+    return fit
 
 
-def write_profile(prefix: Path, transports: list[dict[str, Any]]) -> None:
+def composition_entry(
+    left: TransportFit,
+    middle: TransportFit,
+    direct: TransportFit,
+    theta_source: np.ndarray,
+    theta_target: np.ndarray,
+    eval_idx: np.ndarray,
+    grid_size: int,
+) -> dict[str, Any]:
+    t0 = time.time()
+    heldout_source = theta_source[eval_idx]
+    heldout_target = theta_target[eval_idx]
+    direct_heldout = predict_map(direct, heldout_source)
+    composed_heldout = predict_map(middle, predict_map(left, heldout_source))
+    residual = circular_abs_error(direct_heldout, composed_heldout)
+
+    grid = np.linspace(0.0, TAU, grid_size, endpoint=False)
+    direct_grid = predict_map(direct, grid)
+    composed_grid = predict_map(middle, predict_map(left, grid))
+    grid_residual = circular_abs_error(direct_grid, composed_grid)
+
+    return {
+        "layer_triple": [
+            left.layer_current,
+            left.layer_next,
+            middle.layer_next,
+        ],
+        "direct_layer_pair": [
+            direct.layer_current,
+            direct.layer_next,
+        ],
+        "seconds": time.time() - t0,
+        **angle_error_summary(
+            "direct_heldout",
+            direct_heldout,
+            heldout_target,
+        ),
+        **angle_error_summary(
+            "composed_heldout",
+            composed_heldout,
+            heldout_target,
+        ),
+        "heldout_direct_composed_circular_corr": json_float(
+            circular_corr(direct_heldout, composed_heldout)
+        ),
+        "heldout_composition_residual_mean_rad": json_float(residual.mean()),
+        "heldout_composition_residual_median_rad": json_float(np.median(residual)),
+        "heldout_composition_residual_rms_rad": json_float(
+            math.sqrt(float(np.mean(residual * residual)))
+        ),
+        "heldout_composition_residual_max_rad": json_float(residual.max()),
+        "grid_composition_residual_mean_rad": json_float(grid_residual.mean()),
+        "grid_composition_residual_rms_rad": json_float(
+            math.sqrt(float(np.mean(grid_residual * grid_residual)))
+        ),
+        "grid_composition_residual_max_rad": json_float(grid_residual.max()),
+    }
+
+
+def write_profile(
+    prefix: Path,
+    transports: list[dict[str, Any]],
+    compositions: list[dict[str, Any]],
+) -> None:
     prefix.parent.mkdir(parents=True, exist_ok=True)
+    adjacent = [
+        item
+        for item in transports
+        if item.get("status") == "ok" and item.get("map_kind") == "adjacent"
+    ]
+    adjacent.sort(key=lambda item: item["layer_pair"])
     rows = [
         {
             "from_layer": item["layer_pair"][0],
             "to_layer": item["layer_pair"][1],
+            "heldout_mean_abs_error_rad": item["heldout_mean_abs_error_rad"],
             "isometry_defect_mean": item["isometry_defect_mean"],
             "isometry_defect_rms": item["isometry_defect_rms"],
             "isometry_defect_max": item["isometry_defect_max"],
+            "curvature_abs_mean": item["curvature_abs_mean"],
+            "curvature_abs_rms": item["curvature_abs_rms"],
+            "curvature_abs_max": item["curvature_abs_max"],
             "winding_number": item["winding_number"],
-            "mapped_actual_circular_corr": item["mapped_actual_circular_corr"],
+            "heldout_circular_corr": item["heldout_circular_corr"],
         }
-        for item in transports
+        for item in adjacent
     ]
     csv_path = prefix.with_suffix(".csv")
     with csv_path.open("w", newline="") as f:
@@ -288,20 +435,73 @@ def write_profile(prefix: Path, transports: list[dict[str, Any]]) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
+    comp_rows = [
+        {
+            "from_layer": item["layer_triple"][0],
+            "middle_layer": item["layer_triple"][1],
+            "to_layer": item["layer_triple"][2],
+            "heldout_composition_residual_mean_rad": item[
+                "heldout_composition_residual_mean_rad"
+            ],
+            "heldout_composition_residual_rms_rad": item[
+                "heldout_composition_residual_rms_rad"
+            ],
+            "grid_composition_residual_mean_rad": item[
+                "grid_composition_residual_mean_rad"
+            ],
+        }
+        for item in compositions
+        if item.get("status") == "ok"
+    ]
+    comp_csv_path = prefix.with_name(prefix.name + "_composition").with_suffix(".csv")
+    with comp_csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(comp_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(comp_rows)
+
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     x = [0.5 * (row["from_layer"] + row["to_layer"]) for row in rows]
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(x, [row["isometry_defect_mean"] for row in rows], marker="o", label="mean")
-    ax.plot(x, [row["isometry_defect_rms"] for row in rows], marker="s", label="rms")
-    ax.set_xlabel("layer-pair midpoint")
-    ax.set_ylabel("isometry defect | |dh/dtheta| - 1 |")
-    ax.set_title("Layer transport isometry defect")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
+    x_comp = [row["middle_layer"] for row in comp_rows]
+    fig, axes = plt.subplots(2, 1, figsize=(8.5, 7.5), sharex=False)
+    axes[0].plot(
+        x,
+        [row["curvature_abs_mean"] for row in rows],
+        marker="o",
+        label="mean |d2h/dtheta2|",
+    )
+    axes[0].plot(
+        x,
+        [row["isometry_defect_mean"] for row in rows],
+        marker="s",
+        label="mean ||dh/dtheta|-1|",
+    )
+    axes[0].set_xlabel("adjacent layer-pair midpoint")
+    axes[0].set_ylabel("grid diagnostic")
+    axes[0].set_title("Adjacent transport curvature and isometry defect")
+    axes[0].grid(True, alpha=0.25)
+    axes[0].legend()
+
+    axes[1].plot(
+        x_comp,
+        [row["heldout_composition_residual_mean_rad"] for row in comp_rows],
+        marker="o",
+        label="held-out mean",
+    )
+    axes[1].plot(
+        x_comp,
+        [row["heldout_composition_residual_rms_rad"] for row in comp_rows],
+        marker="s",
+        label="held-out rms",
+    )
+    axes[1].set_xlabel("middle layer in l -> l+1 -> l+2")
+    axes[1].set_ylabel("composition residual (rad)")
+    axes[1].set_title("Functoriality residual: direct vs composed two-hop map")
+    axes[1].grid(True, alpha=0.25)
+    axes[1].legend()
     fig.tight_layout()
     fig.savefig(prefix.with_suffix(".png"), dpi=160)
     plt.close(fig)
@@ -324,6 +524,11 @@ def main() -> None:
     profile_prefix = Path(args.profile_prefix)
     acts, hue = load_bank(bank)
     layers = parse_layers(args.layers, int(acts.shape[1]))
+    train_idx, eval_idx = deterministic_split(
+        int(acts.shape[0]),
+        DEFAULT_EVAL_FRACTION,
+        args.seed,
+    )
     report: dict[str, Any] = {
         "bank": str(bank),
         "activation_shape": [int(v) for v in acts.shape],
@@ -332,8 +537,12 @@ def main() -> None:
         "seed": args.seed,
         "transport_basis_dim": args.transport_k,
         "grid_size": args.grid_size,
+        "eval_fraction": DEFAULT_EVAL_FRACTION,
+        "train_n": int(train_idx.shape[0]),
+        "heldout_n": int(eval_idx.shape[0]),
         "layer_fits": [],
         "transports": [],
+        "composition_tests": [],
         "started_at_unix": time.time(),
     }
     print(
@@ -344,101 +553,128 @@ def main() -> None:
     write_report(out, report)
 
     theta_by_layer: dict[int, np.ndarray] = {}
-    chart_failed = False
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=min(len(layers), 4)
-    ) as executor:
-        chart_futures = {}
-        for layer in layers:
-            print(f"[chart] fitting layer {layer}", flush=True)
-            future = executor.submit(
-                fit_layer_chart,
+    for layer in layers:
+        print(f"[chart] fitting layer {layer}", flush=True)
+        try:
+            theta, entry = fit_layer_chart(
                 str(bank),
                 hue,
                 layer,
                 args.n_iter,
                 args.seed + layer,
             )
-            chart_futures[future] = layer
-
-        for future in concurrent.futures.as_completed(chart_futures):
-            layer = chart_futures[future]
-            try:
-                theta, entry = future.result()
-            except Exception as exc:
-                chart_failed = True
-                entry = {
-                    "layer": layer,
-                    "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "traceback": traceback.format_exc()[-4000:],
-                }
-            else:
-                entry["status"] = "ok"
-                theta_by_layer[layer] = theta
+        except Exception as exc:
+            entry = {
+                "layer": layer,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc()[-4000:],
+            }
             report["layer_fits"].append(entry)
             write_report(out, report)
-            if entry["status"] == "ok":
-                print(
-                    f"[chart] layer {layer} corr={entry['hue_circular_corr']:.4f} "
-                    f"r2={entry['reconstruction_r2']} {entry['seconds']:.1f}s",
-                    flush=True,
-                )
-            else:
-                print(f"[chart] layer {layer} status=error", flush=True)
-    if chart_failed:
-        raise RuntimeError("one or more layer chart fits failed")
+            print(f"[chart] layer {layer} status=error", flush=True)
+            raise
+        entry["status"] = "ok"
+        theta_by_layer[layer] = theta
+        report["layer_fits"].append(entry)
+        report["layer_fits"].sort(key=lambda item: item["layer"])
+        write_report(out, report)
+        print(
+            f"[chart] layer {layer} corr={entry['hue_circular_corr']:.4f} "
+            f"r2={entry['reconstruction_r2']} {entry['seconds']:.1f}s",
+            flush=True,
+        )
 
-    pairs = list(zip(layers[:-1], layers[1:]))
-    transport_failed = False
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=min(len(pairs), 4)
-    ) as executor:
-        transport_futures = {}
-        for left, right in pairs:
-            print(f"[transport] fitting {left}->{right}", flush=True)
-            future = executor.submit(
-                fit_transport,
+    adjacent_pairs = list(zip(layers[:-1], layers[1:]))
+    twohop_pairs = list(zip(layers[:-2], layers[2:]))
+    transport_pairs = [
+        ("adjacent", left, right)
+        for left, right in adjacent_pairs
+    ] + [
+        ("direct_twohop", left, right)
+        for left, right in twohop_pairs
+    ]
+    fits: dict[tuple[int, int], TransportFit] = {}
+    for map_kind, left, right in transport_pairs:
+        print(f"[transport] fitting {left}->{right} kind={map_kind}", flush=True)
+        try:
+            fit = fit_transport(
                 theta_by_layer[left],
                 theta_by_layer[right],
                 left,
                 right,
                 args.transport_k,
                 args.grid_size,
+                train_idx,
+                eval_idx,
+                map_kind,
             )
-            transport_futures[future] = (left, right)
-
-        for future in concurrent.futures.as_completed(transport_futures):
-            left, right = transport_futures[future]
-            try:
-                entry = future.result()
-            except Exception as exc:
-                transport_failed = True
-                entry = {
-                    "layer_pair": [left, right],
-                    "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "traceback": traceback.format_exc()[-4000:],
-                }
-            else:
-                entry["status"] = "ok"
+        except Exception as exc:
+            entry = {
+                "layer_pair": [left, right],
+                "map_kind": map_kind,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc()[-4000:],
+            }
             report["transports"].append(entry)
             write_report(out, report)
-            if entry["status"] == "ok":
-                print(
-                    f"[transport] {left}->{right} "
-                    f"corr={entry['mapped_actual_circular_corr']:.4f} "
-                    f"defect_mean={entry['isometry_defect_mean']:.4f} "
-                    f"winding={entry['winding_number']:.3f} {entry['seconds']:.1f}s",
-                    flush=True,
-                )
-            else:
-                print(f"[transport] {left}->{right} status=error", flush=True)
-    if transport_failed:
-        raise RuntimeError("one or more transport fits failed")
+            print(f"[transport] {left}->{right} status=error", flush=True)
+            raise
+        entry = fit.entry
+        entry["status"] = "ok"
+        fits[(left, right)] = fit
+        report["transports"].append(entry)
+        report["transports"].sort(
+            key=lambda item: (item["layer_pair"][0], item["layer_pair"][1])
+        )
+        write_report(out, report)
+        print(
+            f"[transport] {left}->{right} heldout_mae="
+            f"{entry['heldout_mean_abs_error_rad']:.4f} curvature="
+            f"{entry['curvature_abs_mean']:.4f} winding="
+            f"{entry['winding_number']:.3f} {entry['seconds']:.1f}s",
+            flush=True,
+        )
 
-    write_profile(profile_prefix, report["transports"])
+    for left, middle, right in zip(layers[:-2], layers[1:-1], layers[2:]):
+        print(f"[composition] testing {left}->{middle}->{right}", flush=True)
+        try:
+            entry = composition_entry(
+                fits[(left, middle)],
+                fits[(middle, right)],
+                fits[(left, right)],
+                theta_by_layer[left],
+                theta_by_layer[right],
+                eval_idx,
+                args.grid_size,
+            )
+        except Exception as exc:
+            entry = {
+                "layer_triple": [left, middle, right],
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc()[-4000:],
+            }
+            report["composition_tests"].append(entry)
+            write_report(out, report)
+            print(f"[composition] {left}->{middle}->{right} status=error", flush=True)
+            raise
+        entry["status"] = "ok"
+        report["composition_tests"].append(entry)
+        write_report(out, report)
+        print(
+            f"[composition] {left}->{middle}->{right} residual_mean="
+            f"{entry['heldout_composition_residual_mean_rad']:.4f} "
+            f"residual_rms={entry['heldout_composition_residual_rms_rad']:.4f}",
+            flush=True,
+        )
+
+    write_profile(profile_prefix, report["transports"], report["composition_tests"])
     report["profile_csv"] = str(profile_prefix.with_suffix(".csv"))
+    report["composition_csv"] = str(
+        profile_prefix.with_name(profile_prefix.name + "_composition").with_suffix(".csv")
+    )
     report["profile_png"] = str(profile_prefix.with_suffix(".png"))
     report["finished_at_unix"] = time.time()
     report["seconds"] = report["finished_at_unix"] - report["started_at_unix"]
