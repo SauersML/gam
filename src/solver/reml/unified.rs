@@ -18078,12 +18078,7 @@ mod tests {
 
     #[test]
     fn xt_projected_kernel_diagonal_iterator_matches_scalar_reference_bitwise() {
-        let u_s = array![
-            [0.8_f64, -0.2],
-            [0.1, 0.9],
-            [0.5, 0.3],
-            [-0.4, 0.6]
-        ];
+        let u_s = array![[0.8_f64, -0.2], [0.1, 0.9], [0.5, 0.3], [-0.4, 0.6]];
         let h_proj_inverse = array![[1.6_f64, -0.25], [-0.25, 2.1]];
         let subspace = PenaltySubspaceTrace {
             u_s: u_s.clone(),

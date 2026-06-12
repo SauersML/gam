@@ -2093,7 +2093,7 @@ pub struct ExternalOptimOptions {
     /// Internal lifecycle knob for fits whose result will be immediately
     /// superseded. Keeps ordinary inference work but skips the live-objective
     /// rho posterior certificate/escalation until the returned model is known.
-    pub(crate) skip_rho_posterior_inference: bool,
+    pub skip_rho_posterior_inference: bool,
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
@@ -5133,7 +5133,7 @@ pub struct FitOptions {
     /// Internal lifecycle knob for fits whose result will be immediately
     /// superseded. Keeps ordinary inference work but skips the live-objective
     /// rho posterior certificate/escalation until the returned model is known.
-    pub(crate) skip_rho_posterior_inference: bool,
+    pub skip_rho_posterior_inference: bool,
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
