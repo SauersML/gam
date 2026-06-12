@@ -3336,16 +3336,17 @@ impl FittedModel {
             // coefficients, it is not a scale amplitude, and counting it would
             // double-charge the spectrum.
             let read_lambda = |global_index: usize| -> Result<f64, FittedModelError> {
-                lambdas.get(global_index).copied().ok_or_else(|| {
-                    FittedModelError::SchemaMismatch {
+                lambdas
+                    .get(global_index)
+                    .copied()
+                    .ok_or_else(|| FittedModelError::SchemaMismatch {
                         reason: format!(
                             "measure-jet term '{}': penalty global index {global_index} out \
                             of bounds for {} fitted lambdas",
                             term.name,
                             lambdas.len()
                         ),
-                    }
-                })
+                    })
             };
             let mut per_scale: Vec<(usize, f64)> = Vec::new();
             let mut fused: Option<f64> = None;
@@ -3443,7 +3444,10 @@ impl FittedModel {
                 &frozen.eps_band,
             )
             .map_err(|e| FittedModelError::SchemaMismatch {
-                reason: format!("measure-jet term '{}': support curve failed: {e}", term.name),
+                reason: format!(
+                    "measure-jet term '{}': support curve failed: {e}",
+                    term.name
+                ),
             })?;
             let total_mass = frozen.masses.sum();
             for i in 0..data.nrows() {

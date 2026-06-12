@@ -1883,10 +1883,7 @@ mod tests {
         let fast = householder_drop_first_apply(&x, &u);
         let dense = x.dot(&z);
         for (a, b) in fast.iter().zip(dense.iter()) {
-            assert!(
-                (a - b).abs() <= 1e-12,
-                "structured apply drift: {a} vs {b}"
-            );
+            assert!((a - b).abs() <= 1e-12, "structured apply drift: {a} vs {b}");
         }
     }
 

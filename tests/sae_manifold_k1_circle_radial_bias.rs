@@ -232,8 +232,12 @@ fn sae_k1_ibp_circle_has_no_radial_shrinkage() {
         "K=1 IBP circle (eb_optimal_lambda~{eb_optimal_lambda:.3e}):\n  \
          low-seed (logit 0, gate0=0.5):  mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}\n  \
          high-seed(logit 4, gate0~1.0):  mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}",
-        low.mean_zeta, low.radius_ratio, low.lambda_smooth,
-        high.mean_zeta, high.radius_ratio, high.lambda_smooth,
+        low.mean_zeta,
+        low.radius_ratio,
+        low.lambda_smooth,
+        high.mean_zeta,
+        high.radius_ratio,
+        high.lambda_smooth,
     );
 
     // Permanent gate: from the fix seed the ring must sit within 1% of the data
