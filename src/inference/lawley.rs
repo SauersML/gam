@@ -657,8 +657,14 @@ mod tests {
                 shift.abs() < 1e-13,
                 "Gaussian known-variance Δε must be 0; got {shift}"
             );
-            let c = lawley_lr_bartlett_factor(x.view(), &kappas, Some(s_pen.view()), k - q..k, q as f64)
-                .expect("factor");
+            let c = lawley_lr_bartlett_factor(
+                x.view(),
+                &kappas,
+                Some(s_pen.view()),
+                k - q..k,
+                q as f64,
+            )
+            .expect("factor");
             assert!(
                 (c - 1.0).abs() < 1e-13,
                 "Gaussian known-variance Bartlett factor must be exactly 1; got {c}"
@@ -751,7 +757,11 @@ mod tests {
                     pmf *= mu / (1.0 - mu) * (n - s + 1) as f64 / s as f64;
                 }
                 let s_f = s as f64;
-                let t1 = if s == 0 { 0.0 } else { s_f * (s_f / (nf * mu)).ln() };
+                let t1 = if s == 0 {
+                    0.0
+                } else {
+                    s_f * (s_f / (nf * mu)).ln()
+                };
                 let t2 = if s == n {
                     0.0
                 } else {
@@ -792,13 +802,12 @@ mod tests {
         }
         let mut s_pen = Array2::<f64>::zeros((2, 2));
         s_pen[[1, 1]] = 0.6;
-        let shift = lawley_lr_mean_shift(x.view(), &kappas, Some(s_pen.view()), 1..2)
-            .expect("shift");
+        let shift =
+            lawley_lr_mean_shift(x.view(), &kappas, Some(s_pen.view()), 1..2).expect("shift");
         let eps_full = lawley_epsilon(x.view(), &kappas, Some(s_pen.view())).expect("ε_full");
         let x_null = x.slice(ndarray::s![.., 0..1]).to_owned();
         let s_null = s_pen.slice(ndarray::s![0..1, 0..1]).to_owned();
-        let eps_null =
-            lawley_epsilon(x_null.view(), &kappas, Some(s_null.view())).expect("ε_null");
+        let eps_null = lawley_epsilon(x_null.view(), &kappas, Some(s_null.view())).expect("ε_null");
         assert!(
             (shift - (eps_full - eps_null)).abs() < 1e-14,
             "Δε = {shift} must equal ε_full − ε_null = {}",

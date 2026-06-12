@@ -21,9 +21,8 @@
 use gam::terms::CurvatureWalkReport;
 use gam::terms::latent_coord::LatentManifold;
 use gam::terms::{
-    AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho,
-    SaeManifoldTerm,
+    AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
+    SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
 };
 use ndarray::{Array1, Array2, Array3, s};
 use std::sync::Arc;
@@ -80,7 +79,10 @@ fn planted_symmetric_response() -> Array2<f64> {
     for i in 0..N {
         let pair_idx = (i / 2) as f64;
         let t = pair_idx / half as f64; // same ladder for both planes
-        let (c, s_) = ((2.0 * std::f64::consts::PI * t).cos(), (2.0 * std::f64::consts::PI * t).sin());
+        let (c, s_) = (
+            (2.0 * std::f64::consts::PI * t).cos(),
+            (2.0 * std::f64::consts::PI * t).sin(),
+        );
         let frame = if i % 2 == 0 { &u_a } else { &u_b };
         for col in 0..P {
             z[[i, col]] = frame[[col, 0]] * c + frame[[col, 1]] * s_;

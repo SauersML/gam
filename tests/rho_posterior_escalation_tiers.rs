@@ -11,9 +11,9 @@
 //! `Vb(ρ̂)` when all mixture weight concentrates at `ρ̂`.
 
 use gam::inference::rho_posterior::{
-    RhoCertificate, RhoPosteriorEscalation, TIER1_MAX_DIM, TIER2_MAX_DIM,
-    escalate_rho_posterior, mixture_coefficient_covariance, rho_posterior_certificate,
-    rho_posterior_nuts, rho_posterior_quadrature,
+    RhoCertificate, RhoPosteriorEscalation, TIER1_MAX_DIM, TIER2_MAX_DIM, escalate_rho_posterior,
+    mixture_coefficient_covariance, rho_posterior_certificate, rho_posterior_nuts,
+    rho_posterior_quadrature,
 };
 use ndarray::{Array1, Array2, array};
 
