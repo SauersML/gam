@@ -198,7 +198,8 @@ fn factorial_f64(n: usize) -> f64 {
 ///   by Temme's small-x series or Steed's CF2 large-x continued fraction,
 ///   then use the stable upward recurrence to return K_ν.
 pub fn bessel_k(nu: f64, x: f64) -> f64 {
-    assert!(x > 0.0, "bessel_k requires x > 0");
+    assert!(x > 0.0 && x.is_finite(), "bessel_k requires finite x > 0");
+    assert!(nu.is_finite(), "bessel_k requires finite ν");
     let nu_abs = nu.abs(); // K_{-ν} = K_ν
 
     // Half-integer fast path.
@@ -306,8 +307,16 @@ fn bessel_k_temme(mu: f64, x: f64) -> (f64, f64) {
             return (sum, sum1 * 2.0 / x);
         }
     }
-    // SAFETY: the selected Temme branch must converge on the `bessel_k_pair`
-    // domain; emitting any finite substitute would corrupt the penalty matrix.
+    // SAFETY: Temme's series converges geometrically for |μ| ≤ 1/2 and
+    // 0 < x ≤ 2 (the reduced-order, small-x branch entered by
+    // `bessel_k_bessik`). Public entry `bessel_k` asserts finite ν and
+    // 0 < x finite, and `nl = (|ν| + 1/2).floor()` produces μ = |ν| − nl
+    // in [−1/2, 1/2). With BESSEL_K_EPS = 1e-15 the term ratio
+    // |del_{i+1}/del_i| ~ (x/2)² / i² drops below ε within ~40
+    // iterations for x ≤ 2; BESSEL_K_MAX_ITER = 10_000 is an
+    // overdetermined defensive cap whose only reachable trigger would
+    // be invariant violation upstream. Emitting any finite substitute
+    // here would silently corrupt the penalty matrix.
     panic!("bessel_k Temme series failed to converge for mu={mu} x={x}");
 }
 
@@ -345,8 +354,17 @@ fn bessel_k_steed_cf2(mu: f64, x: f64) -> (f64, f64) {
             return (rkmu, rk1);
         }
     }
-    // SAFETY: the selected Steed CF2 branch must converge on the `bessel_k_pair`
-    // domain; emitting any finite substitute would corrupt the penalty matrix.
+    // SAFETY: Steed's CF2 continued fraction for K_μ at x > 2 with
+    // |μ| ≤ 1/2 (the reduced-order, large-x branch entered by
+    // `bessel_k_bessik`) is the classical NR §6.7 algorithm, whose
+    // convergence is uniform on this domain; with x > 2, |a_i| grows
+    // linearly while |b_i| grows like x + i, so the modified Lentz
+    // tail shrinks as ~(x+i)^{-1} per step. BESSEL_K_EPS = 1e-15 is
+    // reached in well under 100 iterations for x up to 100;
+    // BESSEL_K_MAX_ITER = 10_000 is a defensive cap whose only
+    // reachable trigger would be invariant violation upstream
+    // (caller-asserted finite ν and 0 < x finite). Emitting any finite
+    // substitute here would silently corrupt the penalty matrix.
     panic!("bessel_k Steed CF2 failed to converge for mu={mu} x={x}");
 }
 

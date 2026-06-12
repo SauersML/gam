@@ -874,6 +874,13 @@ mod tests {
         );
     }
 
+    fn beta_fisher_cross_info_mu_phi(mu: f64, phi: f64) -> f64 {
+        let a = mu * phi;
+        let b = (1.0 - mu) * phi;
+        phi * (mu * crate::families::jet_tower::trigamma_derivative_stack(a)[0]
+            - (1.0 - mu) * crate::families::jet_tower::trigamma_derivative_stack(b)[0])
+    }
+
     #[test]
     fn beta_tower_mixed_channel_matches_cross_information_formula() {
         let mu = 0.1;
