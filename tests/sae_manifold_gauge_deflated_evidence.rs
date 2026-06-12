@@ -1,6 +1,6 @@
 use faer::Side as FaerSide;
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
-use gam::solver::outer_strategy::OuterProblem;
+use gam::solver::{outer_strategy::OuterProblem, seeding::SeedConfig};
 use gam::terms::latent_coord::LatentManifold;
 use gam::terms::sae_manifold::sae_pca_seed_initial_coords;
 use gam::terms::{
@@ -107,6 +107,9 @@ fn run_outer_fit(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> SaeMani
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![Array1::zeros(1)]);
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
+    let mut seed_config = SeedConfig::default();
+    seed_config.max_seeds = 1;
+    seed_config.seed_budget = 1;
     let mut objective = SaeManifoldOuterObjective::new(
         term,
         z.clone(),
@@ -118,6 +121,7 @@ fn run_outer_fit(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> SaeMani
         1.0e-6,
     );
     OuterProblem::new(n_params)
+        .with_seed_config(seed_config)
         .with_initial_rho(init_rho_flat)
         .with_max_iter(1)
         .run(&mut objective, label)
