@@ -2096,7 +2096,9 @@ pub trait OuterObjective {
         &mut self,
         rho: &Array1<f64>,
     ) -> Result<Option<f64>, EstimationError> {
-        std::hint::black_box(rho.len());
+        if rho.is_empty() {
+            return Ok(None);
+        }
         Ok(None)
     }
 
