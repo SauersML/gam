@@ -561,11 +561,11 @@ const SAE_ATOM_ACTIVE_MASS_FLOOR: f64 = 1.0e-3;
 const SAE_ATOM_COLLAPSE_RESEED_BUDGET: usize = 1;
 
 /// Final fitted-data explained-variance floor for the reconstruction-collapse
-/// guard (#1023). This is deliberately a near-zero threshold: ordinary
+/// guard (#1023). This is deliberately an effectively-zero threshold: ordinary
 /// under-fitting is a model-quality issue, but returning a K>=1 active SAE whose
 /// fitted matrix is indistinguishable from the column mean is a structural
 /// collapse and must enter the #976 CollapseEvent ledger.
-const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.05;
+const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.10;
 const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
 const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
 
