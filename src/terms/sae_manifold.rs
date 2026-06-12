@@ -7558,7 +7558,7 @@ impl SaeManifoldTerm {
         }
         let mut total_inner_iter = inner_max_iter;
         let accepted_base_refine_iter = inner_max_iter.max(1).saturating_mul(16).max(64);
-        let value_probe_base_refine_iter = inner_max_iter.max(1).saturating_mul(6).max(24);
+        let value_probe_base_refine_iter = inner_max_iter.max(1).saturating_mul(4).max(16);
         let base_refine_iter = if refine_progress_extension {
             accepted_base_refine_iter
         } else {
@@ -7641,8 +7641,6 @@ impl SaeManifoldTerm {
                             progress_refine_iter,
                             previous_refine_grad_norm,
                             grad_norm,
-                            grad_tolerance,
-                            step_tolerance,
                             saw_refine_progress,
                         );
                         if total_inner_iter >= refine_limit {
@@ -7705,8 +7703,6 @@ impl SaeManifoldTerm {
                 progress_refine_iter,
                 previous_refine_grad_norm,
                 grad_norm,
-                grad_tolerance,
-                step_tolerance,
                 saw_refine_progress,
             );
             if total_inner_iter >= refine_limit {
@@ -7743,26 +7739,20 @@ impl SaeManifoldTerm {
         progress_refine_iter: usize,
         previous_grad_norm: Option<f64>,
         grad_norm: f64,
-        grad_tolerance: f64,
-        step_tolerance: f64,
         saw_refine_progress: bool,
     ) -> usize {
         // Flat affine-gauge valleys can keep crawling productively after the
         // historical base budget. Extend only when the measured KKT residual has
-        // shown a real round-to-round drop and remains in the stationarity-scale
-        // work window; true stalls end at the base work budget (#968).
+        // shown a real finite round-to-round drop; true stalls end at the base
+        // work budget (#968/#1029). Value-order probes pass the base budget as
+        // their progress budget, so this branch cannot make probes expensive.
         if total_inner_iter < base_refine_iter {
             return base_refine_iter;
         }
         let making_progress =
             saw_refine_progress || Self::refine_round_made_progress(previous_grad_norm, grad_norm);
-        let work_window = (1.0e3 * grad_tolerance).max(1.0e3 * step_tolerance);
-        if making_progress {
-            if grad_norm.is_finite() && grad_norm <= work_window {
-                progress_refine_iter
-            } else {
-                base_refine_iter
-            }
+        if making_progress && grad_norm.is_finite() {
+            progress_refine_iter
         } else {
             base_refine_iter
         }
@@ -7770,7 +7760,7 @@ impl SaeManifoldTerm {
 
     fn refine_round_made_progress(previous_grad_norm: Option<f64>, grad_norm: f64) -> bool {
         previous_grad_norm.is_some_and(|prev| {
-            prev.is_finite() && grad_norm.is_finite() && grad_norm <= 0.9 * prev
+            prev.is_finite() && grad_norm.is_finite() && grad_norm < prev
         })
     }
 
@@ -14262,48 +14252,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.current_rho = self.baseline_rho.clone();
         self.last_loss = None;
         self.seeded_beta = None;
-    }
-
-    fn accept_seed_without_outer_iterations(
-        &mut self,
-        rho: &Array1<f64>,
-    ) -> Result<Option<f64>, EstimationError> {
-        if self.baseline_term.k_atoms() != 1 {
-            return Ok(None);
-        }
-        let baseline_flat = self.baseline_rho.to_flat();
-        if baseline_flat.len() != rho.len()
-            || baseline_flat
-                .iter()
-                .zip(rho.iter())
-                .any(|(a, b)| a.to_bits() != b.to_bits())
-        {
-            return Ok(None);
-        }
-        let fitted = self.baseline_term.fitted();
-        let Some(seed_ev) = reconstruction_explained_variance(self.target.view(), fitted.view())
-        else {
-            return Ok(None);
-        };
-        if seed_ev < SAE_PRISTINE_SEED_EV_RETAIN_FLOOR {
-            return Ok(None);
-        }
-        self.term = self.baseline_term.clone();
-        self.current_rho = self.baseline_rho.clone();
-        self.last_loss = Some(
-            self.term
-                .loss(self.target.view(), &self.current_rho)
-                .map_err(EstimationError::RemlOptimizationFailed)?,
-        );
-        self.term
-            .penalized_objective_total(
-                self.target.view(),
-                &self.current_rho,
-                self.registry.as_ref(),
-                1.0,
-            )
-            .map(Some)
-            .map_err(EstimationError::RemlOptimizationFailed)
     }
 
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
