@@ -7,30 +7,31 @@
 //! fixed orthonormal linear map plus small ambient coordinate noise. The
 //! response is a trend in arc-length, continuous at the junction, with a
 //! slope change onto strand C. Training deletes the middle third of strand B
-//! (the gap). Five tests gate five contracts, 1:1 and in file order:
+//! (the gap). One integrated gate checks five contracts in file order, sharing
+//! fitted models where the contracts intentionally use the same data-generating
+//! process:
 //!
-//! 1. **Truth recovery off-gap** (`measure_jet_recovers_web_signal_vs_truth`):
+//! 1. **Truth recovery off-gap**:
 //!    at d = 8 ambient with 1-D intrinsic structure, the measure-learned
 //!    geometry must recover the strand signal within 2.5× the observation
 //!    noise, and match-or-beat the geometry-blind Duchon smoother on the same
 //!    eight ambient columns (×1.10 flake guard — the jet term should
 //!    genuinely win here, the guard only absorbs seed luck).
-//! 2. **Support diagnostic** (`measure_jet_support_curve_flags_off_web_queries`):
+//! 2. **Support diagnostic**:
 //!    the support curve must be computable from the FITTED model alone and
 //!    must separate an on-web query from a far off-web query at the finest
 //!    band scale.
-//! 3. **Gap bridging with the trend, not the mean**
-//!    (`measure_jet_bridges_gap_with_trend_not_mean`): inside the deleted
+//! 3. **Gap bridging with the trend, not the mean**: inside the deleted
 //!    stretch of strand B the fit must continue the flank-attested slope
 //!    (same sign, within 60% of truth) rather than collapse toward the
 //!    global training mean. This is the no-mass-term/N2 contract observed
 //!    end to end through REML.
-//! 4. **GLM composition** (`measure_jet_poisson_intensity_on_web`): the same
-//!    web with a Poisson count response — the measure-jet penalty must
+//! 4. **GLM composition**: the same web with a Poisson count response — the
+//!    measure-jet penalty must
 //!    compose with PIRLS/REML for a non-gaussian family and recover the
 //!    log-intensity off-gap.
-//! 5. **Interval honesty** (`measure_jet_interval_coverage_on_web`): 95%
-//!    pointwise bands built from the fit's smoothing-corrected coefficient
+//! 5. **Interval honesty**: 95% pointwise bands built from the fit's
+//!    smoothing-corrected coefficient
 //!    covariance Vp must approximately cover the true mean at held-out
 //!    on-web points.
 
@@ -231,16 +232,14 @@ fn ambient_matrix(data: &gam::data::EncodedDataset, test: &[WebPoint]) -> Array2
     m
 }
 
-/// Fit and evaluate the LINEAR PREDICTOR η = X·β at the test points (for the
-/// gaussian arm η is the mean; for poisson/log it is the log-intensity —
-/// applying the frozen design to β never passes through the inverse link).
-fn fit_and_predict(
-    formula: &str,
+/// Evaluate the LINEAR PREDICTOR η = X·β at the test points (for the gaussian
+/// arm η is the mean; for poisson/log it is the log-intensity — applying the
+/// frozen design to β never passes through the inverse link).
+fn predict_with_fit(
+    fit: &gam::StandardFitResult,
     data: &gam::data::EncodedDataset,
     test: &[WebPoint],
-    family: &str,
 ) -> Vec<f64> {
-    let fit = fit_web(formula, data, family);
     let m = ambient_matrix(data, test);
     let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
         .expect("rebuild design from frozen spec");
@@ -291,20 +290,27 @@ fn pointwise_se(design: ArrayView2<'_, f64>, cov: &Array2<f64>) -> Vec<f64> {
         .collect()
 }
 
-/// Contract 1 — truth recovery off-gap: with d = 8 ambient columns and 1-D
-/// intrinsic structure, the fit must resolve the strand signal to within
-/// 2.5× the observation noise (PRIMARY), and match-or-beat the
-/// geometry-blind Duchon baseline on the same columns (SECONDARY, ×1.10
-/// flake guard for seed luck only).
+/// Integrated quality gate: one gaussian measure-jet fit feeds the four
+/// gaussian contracts, one Duchon fit supplies the mature baseline, and one
+/// Poisson measure-jet fit gates PIRLS/REML composition. This keeps the suite
+/// honest and removes the old harness shape that launched five independent
+/// threaded REML fits over the same web fixture.
 #[test]
-fn measure_jet_recovers_web_signal_vs_truth() {
+fn measure_jet_web_quality_contracts() {
     init_parallelism();
     let train_points = sample_web(400, 41, true);
     let data = encode_training(&train_points, 42);
+    let jet_fit = fit_web(MJS_FORMULA, &data, "gaussian");
+
+    // Contract 1 — truth recovery off-gap: with d = 8 ambient columns and 1-D
+    // intrinsic structure, the fit must resolve the strand signal to within
+    // 2.5× the observation noise (PRIMARY), and match-or-beat the
+    // geometry-blind Duchon baseline on the same columns (SECONDARY, ×1.10
+    // flake guard for seed luck only).
     // Held-out web draws OUTSIDE the gap (the gap has its own gate below).
     let test: Vec<WebPoint> = sample_web(140, 43, true);
 
-    let jet_pred = fit_and_predict(MJS_FORMULA, &data, &test, "gaussian");
+    let jet_pred = predict_with_fit(&jet_fit, &data, &test);
     let jet_rmse = rmse_vs_truth(&jet_pred, &test, 1.0);
 
     // PRIMARY — truth recovery: the measure-learned geometry must resolve
@@ -317,27 +323,21 @@ fn measure_jet_recovers_web_signal_vs_truth() {
 
     // SECONDARY — match-or-beat the geometry-blind mature in-crate smoother
     // on the same eight ambient columns (×1.10 flake guard only).
-    let duchon_pred = fit_and_predict(DUCHON_FORMULA, &data, &test, "gaussian");
+    let duchon_fit = fit_web(DUCHON_FORMULA, &data, "gaussian");
+    let duchon_pred = predict_with_fit(&duchon_fit, &data, &test);
     let duchon_rmse = rmse_vs_truth(&duchon_pred, &test, 1.0);
     assert!(
         jet_rmse <= 1.10 * duchon_rmse,
         "measure-jet must match-or-beat geometry-blind Duchon at d=8: jet {jet_rmse:.4} vs duchon {duchon_rmse:.4}"
     );
-}
 
-/// Contract 2 — support diagnostic: computable from the FITTED model alone
-/// (frozen nodes + masses + band ride the replay contract) and must separate
-/// an on-web query from a far off-web query at the finest band scale — the
-/// on-web-ness label every prediction ships with.
-#[test]
-fn measure_jet_support_curve_flags_off_web_queries() {
-    init_parallelism();
-    let train_points = sample_web(400, 41, true);
-    let data = encode_training(&train_points, 42);
-    let fit = fit_web(MJS_FORMULA, &data, "gaussian");
+    // Contract 2 — support diagnostic: computable from the FITTED model alone
+    // (frozen nodes + masses + band ride the replay contract) and must separate
+    // an on-web query from a far off-web query at the finest band scale — the
+    // on-web-ness label every prediction ships with.
     // Dig the frozen measure-jet term out of the resolved collection: the
     // freeze step must have pinned nodes, masses, and band.
-    let (spec, scales) = fit
+    let (spec, scales) = jet_fit
         .resolvedspec
         .smooth_terms
         .iter()
@@ -384,17 +384,11 @@ fn measure_jet_support_curve_flags_off_web_queries() {
         curves[(0, 0)],
         curves[(1, 0)]
     );
-}
 
-/// Contract 3 — gap bridging: inside the deleted stretch of strand B the fit
-/// must continue the flank-attested slope (same sign, within 60% of truth)
-/// rather than collapse toward the global training mean — the
-/// no-mass-term/N2 contract observed end to end through REML.
-#[test]
-fn measure_jet_bridges_gap_with_trend_not_mean() {
-    init_parallelism();
-    let train_points = sample_web(400, 41, true);
-    let data = encode_training(&train_points, 42);
+    // Contract 3 — gap bridging: inside the deleted stretch of strand B the fit
+    // must continue the flank-attested slope (same sign, within 60% of truth)
+    // rather than collapse toward the global training mean — the
+    // no-mass-term/N2 contract observed end to end through REML.
     // Test points INSIDE the strand-B gap (kept only at test time).
     let in_gap: Vec<WebPoint> = sample_web(400, 44, false)
         .into_iter()
@@ -402,7 +396,7 @@ fn measure_jet_bridges_gap_with_trend_not_mean() {
         .collect();
     assert!(in_gap.len() >= 60, "gap sample unexpectedly thin");
 
-    let pred = fit_and_predict(MJS_FORMULA, &data, &in_gap, "gaussian");
+    let pred = predict_with_fit(&jet_fit, &data, &in_gap);
 
     // Fitted slope across the gap: least-squares regression of prediction on
     // arc-length (= t along B), compared to the flank-attested truth slope.
@@ -442,26 +436,23 @@ fn measure_jet_bridges_gap_with_trend_not_mean() {
         mad_pred >= 0.5 * mad_truth,
         "gap predictions collapse toward the training mean: MAD {mad_pred:.3} vs truth MAD {mad_truth:.3}"
     );
-}
 
-/// Contract 4 — GLM composition: the measure-jet penalty must compose with PIRLS/REML for a
-/// non-gaussian family. Same Y-web geometry, count response
-/// y ~ Poisson(exp(η)) with η = POISSON_ETA_SCALE · (arc-length truth), scored
-/// on the η (log-intensity) scale at held-out off-gap points — applying the
-/// frozen design to β yields η directly, the same scale the truth lives on
-/// (the convention every non-gaussian quality test in this suite uses).
-#[test]
-fn measure_jet_poisson_intensity_on_web() {
-    init_parallelism();
+    // Contract 4 — GLM composition: the measure-jet penalty must compose with
+    // PIRLS/REML for a non-gaussian family. Same Y-web geometry, count response
+    // y ~ Poisson(exp(η)) with η = POISSON_ETA_SCALE · (arc-length truth),
+    // scored on the η (log-intensity) scale at held-out off-gap points —
+    // applying the frozen design to β yields η directly, the same scale the
+    // truth lives on (the convention every non-gaussian quality test in this
+    // suite uses).
     // Same geometry seed as the gaussian arms; counts get their own stream.
-    let train_points = sample_web(400, 41, true); // ~1.07k rows after the gap cut (≤ 1500)
-    let data = encode_poisson_training(&train_points, 45);
+    let poisson_data = encode_poisson_training(&train_points, 45);
     // Held-out web draws OUTSIDE the gap (gap extrapolation is gated by the
     // gaussian bridge test; this gate isolates the GLM composition).
-    let test: Vec<WebPoint> = sample_web(140, 43, true);
+    let poisson_test: Vec<WebPoint> = sample_web(140, 43, true);
 
-    let pred = fit_and_predict(MJS_FORMULA, &data, &test, "poisson");
-    let eta_rmse = rmse_vs_truth(&pred, &test, POISSON_ETA_SCALE);
+    let poisson_fit = fit_web(MJS_FORMULA, &poisson_data, "poisson");
+    let poisson_pred = predict_with_fit(&poisson_fit, &poisson_data, &poisson_test);
+    let eta_rmse = rmse_vs_truth(&poisson_pred, &poisson_test, POISSON_ETA_SCALE);
 
     // Bound: η ∈ [0, 1.5] ⇒ μ = e^η ∈ [1, ~4.5]; the per-observation Fisher
     // information on the η scale is μ, so the raw per-point η noise is
@@ -475,45 +466,38 @@ fn measure_jet_poisson_intensity_on_web() {
         eta_rmse <= 0.5,
         "measure-jet poisson log-intensity recovery too weak: η-RMSE {eta_rmse:.4} vs bound 0.5"
     );
-}
 
-/// Contract 5 — interval honesty: pointwise 95% bands from the fit's PUBLIC
-/// smoothing-corrected coefficient covariance Vp (`beta_covariance_corrected`,
-/// the mgcv `predict(se.fit = TRUE)` analog used across the CI quality suite)
-/// must approximately cover the TRUE mean at held-out on-web points.
-#[test]
-fn measure_jet_interval_coverage_on_web() {
-    init_parallelism();
-    let train_points = sample_web(400, 41, true);
-    let data = encode_training(&train_points, 42);
+    // Contract 5 — interval honesty: pointwise 95% bands from the fit's PUBLIC
+    // smoothing-corrected coefficient covariance Vp (`beta_covariance_corrected`,
+    // the mgcv `predict(se.fit = TRUE)` analog used across the CI quality suite)
+    // must approximately cover the TRUE mean at held-out on-web points.
     // Held-out ON-WEB points outside the gap: coverage is a claim about
     // interpolation honesty; gap extrapolation has its own (bias) gate.
-    let test: Vec<WebPoint> = sample_web(140, 46, true);
+    let coverage_test: Vec<WebPoint> = sample_web(140, 46, true);
 
-    let fit = fit_web(MJS_FORMULA, &data, "gaussian");
-    let m = ambient_matrix(&data, &test);
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
+    let m = ambient_matrix(&data, &coverage_test);
+    let design = build_term_collection_design(m.view(), &jet_fit.resolvedspec)
         .expect("rebuild design from frozen spec");
-    let pred = design.design.apply(&fit.fit.beta);
+    let pred = design.design.apply(&jet_fit.fit.beta);
     let dense = design.design.to_dense();
 
     // Vp propagates smoothing-parameter uncertainty into the band; it is the
     // covariance the rest of the CI quality suite gates coverage on. If the
     // measure-jet path fails to populate it, that is an honest red, not a
     // reason to fall back to a weaker object.
-    let vp = fit
+    let vp = jet_fit
         .fit
         .beta_covariance_corrected()
         .expect("standard gaussian fit exposes the smoothing-corrected covariance Vp");
     let se = pointwise_se(dense.view(), vp);
 
     let mut hits = 0usize;
-    for ((p, s), q) in pred.iter().zip(se.iter()).zip(test.iter()) {
+    for ((p, s), q) in pred.iter().zip(se.iter()).zip(coverage_test.iter()) {
         if q.truth >= p - Z_95 * s && q.truth <= p + Z_95 * s {
             hits += 1;
         }
     }
-    let coverage = hits as f64 / test.len() as f64;
+    let coverage = hits as f64 / coverage_test.len() as f64;
 
     // Window [0.85, 0.995] around the 0.95 nominal: all ~390 trials share ONE
     // fitted curve and ONE noise draw, so they are strongly correlated and the
@@ -528,6 +512,6 @@ fn measure_jet_interval_coverage_on_web() {
         (0.85..=0.995).contains(&coverage),
         "measure-jet 95% interval coverage {coverage:.4} outside the honest window [0.85, 0.995] \
          ({hits}/{} held-out on-web points)",
-        test.len()
+        coverage_test.len()
     );
 }

@@ -13186,6 +13186,13 @@ impl SaeManifoldOuterObjective {
         }
     }
 
+    fn is_recoverable_value_probe_refusal(err: &str) -> bool {
+        err.contains("inner solve did not converge at fixed ρ")
+            || err.contains(
+                "undamped evidence factorization hit a non-PD per-row H_tt block before KKT",
+            )
+    }
+
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
     /// the cached ρ / loss and (optionally) priming the inner solve from a
     /// seeded β. Returns `(cost, β̂)`.
@@ -13378,9 +13385,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // before any derivative consumption, and a probe value — when one is
         // returned at all — is converged to the same KKT/step tolerance as
         // the full-budget path, so all ranked comparisons stay in one measure.
-        self.evaluate_with_refine_policy(rho.view(), false)
-            .map(|(cost, _beta)| cost)
-            .map_err(EstimationError::RemlOptimizationFailed)
+        match self.evaluate_with_refine_policy(rho.view(), false) {
+            Ok((cost, _beta)) => Ok(cost),
+            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => Ok(f64::INFINITY),
+            Err(err) => Err(EstimationError::RemlOptimizationFailed(err)),
+        }
     }
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
@@ -13434,9 +13443,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
     ) -> Result<OuterEval, EstimationError> {
         match order {
             OuterEvalOrder::Value => {
-                let (cost, _beta_hat) = self
-                    .evaluate_with_refine_policy(rho.view(), false)
-                    .map_err(EstimationError::RemlOptimizationFailed)?;
+                let (cost, _beta_hat) = match self.evaluate_with_refine_policy(rho.view(), false) {
+                    Ok(evaluated) => evaluated,
+                    Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                        return Ok(OuterEval::infeasible(rho.len()));
+                    }
+                    Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
+                };
                 Ok(OuterEval {
                     cost,
                     gradient: Array1::zeros(rho.len()),
@@ -15769,6 +15782,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sae_value_probe_refusal_classification_is_inner_only() {
+        assert!(
+            SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
+                "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ"
+            )
+        );
+        assert!(
+            SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
+                "SaeManifoldTerm::reml_criterion: undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity"
+            )
+        );
+        assert!(
+            !SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
+                "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count changed"
+            )
+        );
     }
 
     #[test]
