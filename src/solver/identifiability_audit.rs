@@ -1030,65 +1030,28 @@ fn audit_identifiability_impl(
     for &joint_col in &demoted_joint_cols {
         let (block_idx, local_col) = locate_block_column(&col_offsets, joint_col)?;
         let raw_block_name = specs[block_idx].name.clone();
-        let raw_priority = block_priority_for_attribution
-            .get(raw_block_name.as_str())
-            .copied()
-            .unwrap_or(DEFAULT_GAUGE_PRIORITY);
-        // RRQR sometimes pivots so the demoted column belongs to the higher-
-        // priority side of a cross-block alias (numerical tie-breaking can
-        // flip the canonical participant). The re-attribution below moves
-        // that drop to the lower-priority partner. But it must not fire when
-        // RRQR has already demoted the lower-priority side of some alias
-        // pair: in a `high > mid > low` chain where both `mid.col` and
-        // `low.col` are demoted, transferring `mid.col`'s drop to `low`
-        // would double-attribute to `low` and leave `mid` looking kept. Skip
-        // re-attribution whenever the raw demoted column is already the
-        // lower-priority participant of some alias pair.
-        let raw_is_canonical_lower_side = aliased_pairs.iter().any(|pair| {
-            let raw_is_a = pair.block_a == raw_block_name && pair.direction_a == local_col;
-            let raw_is_b = pair.block_b == raw_block_name && pair.direction_b == local_col;
-            if !(raw_is_a || raw_is_b) {
-                return false;
-            }
-            let other_priority = if raw_is_a {
-                block_priority_for_attribution
-                    .get(pair.block_b.as_str())
-                    .copied()
-                    .unwrap_or(DEFAULT_GAUGE_PRIORITY)
-            } else {
-                block_priority_for_attribution
+        let best_pair = aliased_pairs
+            .iter()
+            .filter(|pair| {
+                (pair.block_a == raw_block_name && pair.direction_a == local_col)
+                    || (pair.block_b == raw_block_name && pair.direction_b == local_col)
+            })
+            .filter(|pair| {
+                let pa = block_priority_for_attribution
                     .get(pair.block_a.as_str())
                     .copied()
-                    .unwrap_or(DEFAULT_GAUGE_PRIORITY)
-            };
-            other_priority > raw_priority
-        });
-        let best_pair = if raw_is_canonical_lower_side {
-            None
-        } else {
-            aliased_pairs
-                .iter()
-                .filter(|pair| {
-                    (pair.block_a == raw_block_name && pair.direction_a == local_col)
-                        || (pair.block_b == raw_block_name && pair.direction_b == local_col)
-                })
-                .filter(|pair| {
-                    let pa = block_priority_for_attribution
-                        .get(pair.block_a.as_str())
-                        .copied()
-                        .unwrap_or(DEFAULT_GAUGE_PRIORITY);
-                    let pb = block_priority_for_attribution
-                        .get(pair.block_b.as_str())
-                        .copied()
-                        .unwrap_or(DEFAULT_GAUGE_PRIORITY);
-                    pa != pb
-                })
-                .max_by(|a, b| {
-                    a.overlap
-                        .partial_cmp(&b.overlap)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-        };
+                    .unwrap_or(DEFAULT_GAUGE_PRIORITY);
+                let pb = block_priority_for_attribution
+                    .get(pair.block_b.as_str())
+                    .copied()
+                    .unwrap_or(DEFAULT_GAUGE_PRIORITY);
+                pa != pb
+            })
+            .max_by(|a, b| {
+                a.overlap
+                    .partial_cmp(&b.overlap)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         let (block_name, drop_local_col, reason) = if let Some(pair) = best_pair {
             let pa = block_priority_for_attribution
                 .get(pair.block_a.as_str())

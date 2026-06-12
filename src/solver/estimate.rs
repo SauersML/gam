@@ -65,6 +65,12 @@ use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Exact REML outer Hessians are pairwise in the smoothing coordinates. At or
+/// above this dimension the per-eval eigensolve/reparameterization work
+/// dominates wall-clock for spectral multi-penalty smooths; analytic-gradient
+/// BFGS reaches the same optimum with lower total work. Low-dimensional classic
+/// fits keep exact second-order geometry.
+const REML_SECOND_ORDER_RHO_CAP: usize = 4;
 /// Continuation prewarm is a seed-polishing pass, not part of the REML
 /// objective. It can be useful for tiny rho spaces where one or two warm
 /// solves amortize, but it scales with the number of starts and runs full
@@ -3883,7 +3889,14 @@ where
         // and their gradient is not on an O(n) scale.
         let gaussian_identity = matches!(cfg.link_function(), LinkFunction::Identity);
         let n_obs = y_o.len();
+        let prefer_gradient_only = k >= REML_SECOND_ORDER_RHO_CAP;
         let continuation_prewarm = k < REML_CONTINUATION_PREWARM_RHO_CAP;
+        if prefer_gradient_only {
+            log::info!(
+                "[OUTER] rho_dim {k} reaches exact REML Hessian budget \
+                   ({REML_SECOND_ORDER_RHO_CAP}); routing analytic-gradient quasi-Newton"
+            );
+        }
         if !continuation_prewarm {
             log::info!(
                 "[OUTER] rho_dim {k} reaches continuation-prewarm budget \
@@ -3897,6 +3910,7 @@ where
             } else {
                 DeclaredHessianForm::Unavailable
             })
+            .with_prefer_gradient_only(prefer_gradient_only)
             .with_continuation_prewarm(continuation_prewarm)
             .with_barrier(
                 crate::solver::estimate::reml::unified::BarrierConfig::from_constraints(
@@ -4143,7 +4157,14 @@ where
             DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
         };
         let initial_link_kind = cfg.link_kind.clone();
+        let prefer_gradient_only = theta_dim >= REML_SECOND_ORDER_RHO_CAP;
         let continuation_prewarm = theta_dim < REML_CONTINUATION_PREWARM_RHO_CAP;
+        if prefer_gradient_only {
+            log::info!(
+                "[OUTER] theta_dim {theta_dim} reaches exact REML Hessian budget \
+                   ({REML_SECOND_ORDER_RHO_CAP}); routing analytic-gradient quasi-Newton"
+            );
+        }
         if !continuation_prewarm {
             log::info!(
                 "[OUTER] theta_dim {theta_dim} reaches continuation-prewarm budget \
@@ -4153,6 +4174,7 @@ where
         let problem = OuterProblem::new(theta_dim)
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Either)
+            .with_prefer_gradient_only(prefer_gradient_only)
             .with_continuation_prewarm(continuation_prewarm)
             .with_psi_dim(mixture_dim + sas_dim)
             .with_barrier(

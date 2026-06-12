@@ -181,8 +181,6 @@ pub(crate) fn stable_hybrid_duchon_radial(
     accum.iter().map(|acc| inv_beta * acc.sum()).collect()
 }
 
-const EULER_GAMMA: f64 = 0.577_215_664_901_532_9_f64;
-
 fn factorial_f64(n: usize) -> f64 {
     let mut acc = 1.0_f64;
     for k in 2..=n {
@@ -196,16 +194,14 @@ fn factorial_f64(n: usize) -> f64 {
 /// Algorithm:
 /// - Half-integer ν = n + 1/2 (n ≥ 0): closed-form polynomial × √(π/(2x))·e^{-x}.
 ///   K_{-ν}(x) = K_ν(x) handles the negative half-integer case.
-/// - Otherwise:
-///   * For small x (≤ 2): series expansion via I_{|ν|}, I_{-|ν|}
-///     (or integer-ν series with digamma terms when |ν| is a non-negative integer).
-///   * For large x (> 2): asymptotic Hankel expansion
-///     K_ν(x) ~ √(π/(2x)) e^{-x} Σ a_k(ν)/x^k summed until terms increase.
+/// - Otherwise: reduce the order to μ ∈ [-1/2, 1/2], evaluate K_μ and K_{μ+1}
+///   by Temme's small-x series or Steed's CF2 large-x continued fraction,
+///   then use the stable upward recurrence to return K_ν.
 pub fn bessel_k(nu: f64, x: f64) -> f64 {
     assert!(x > 0.0, "bessel_k requires x > 0");
     let nu_abs = nu.abs(); // K_{-ν} = K_ν
 
-    // Half-integer fast path
+    // Half-integer fast path.
     let two_nu = 2.0 * nu_abs;
     let n_round = two_nu.round();
     if (two_nu - n_round).abs() < 1e-12 && (n_round as i64) % 2 == 1 {
@@ -213,11 +209,47 @@ pub fn bessel_k(nu: f64, x: f64) -> f64 {
         return bessel_k_half_integer(n, x);
     }
 
-    if x <= 2.0 {
-        bessel_k_small_x(nu_abs, x)
+    bessel_k_bessik(nu_abs, x)
+}
+
+const BESSEL_K_EPS: f64 = 1.0e-15;
+const BESSEL_K_MAX_ITER: usize = 10_000;
+const BESSEL_K_CHEB_C1: [f64; 7] = [
+    -1.142_022_680_371_168,
+    6.516_511_267_073_7e-3,
+    3.087_090_173_086e-4,
+    -3.470_626_964_9e-6,
+    6.943_766_4e-9,
+    3.677_95e-11,
+    -1.356e-13,
+];
+const BESSEL_K_CHEB_C2: [f64; 8] = [
+    1.843_740_587_300_905,
+    -7.685_284_084_478_67e-2,
+    1.271_927_136_654_6e-3,
+    -4.971_736_704_2e-6,
+    -3.312_611_98e-8,
+    2.423_096e-10,
+    -1.702e-13,
+    -1.49e-15,
+];
+
+fn bessel_k_bessik(nu: f64, x: f64) -> f64 {
+    let nl = (nu + 0.5).floor() as usize;
+    let mu = nu - nl as f64;
+    let (mut rkmu, mut rk1) = if x <= 2.0 {
+        bessel_k_temme(mu, x)
     } else {
-        bessel_k_asymptotic(nu_abs, x)
+        bessel_k_steed_cf2(mu, x)
+    };
+
+    for j in 1..=nl {
+        let order = mu + j as f64;
+        let rk_next = rk1 * (2.0 * order) / x + rkmu;
+        rkmu = rk1;
+        rk1 = rk_next;
     }
+    rkmu
 }
 
 /// K_{n+1/2}(x) = √(π/(2x)) · e^{-x} · Σ_{k=0}^{n} (n+k)! / (k!(n-k)!) · (2x)^{-k}.
@@ -232,22 +264,6 @@ fn bessel_k_half_integer(n: usize, x: f64) -> f64 {
         sum += num / den / two_x.powi(k as i32);
     }
     pref * sum
-}
-
-/// Small-x series for K_ν(x), 0 < x ≤ 2.
-///
-/// Non-integer ν: K_ν(x) = π/(2 sin πν) · (I_{-ν}(x) - I_ν(x)).
-/// Integer ν = m: limit form using digamma and finite sum
-/// (Abramowitz & Stegun 9.6.11).
-fn bessel_k_small_x(nu: f64, x: f64) -> f64 {
-    // detect integer ν
-    let n_round = nu.round();
-    if (nu - n_round).abs() < 1e-12 {
-        return bessel_k_integer_series(n_round as usize, x);
-    }
-    let i_pos = bessel_i_series(nu, x);
-    let i_neg = bessel_i_series(-nu, x);
-    std::f64::consts::PI / (2.0 * (std::f64::consts::PI * nu).sin()) * (i_neg - i_pos)
 }
 
 /// I_ν(x) = (x/2)^ν Σ_{k=0}^∞ (x²/4)^k / (k! Γ(ν+k+1))
@@ -268,79 +284,105 @@ fn bessel_i_series(nu: f64, x: f64) -> f64 {
     prefix * sum
 }
 
-/// Integer-order ν = m series (A&S 9.6.11).
-/// K_m(x) = (1/2)·(x/2)^{-m} · Σ_{k=0}^{m-1} (m-k-1)!/k! · (-x²/4)^k
-///       + (-1)^{m+1} ln(x/2) · I_m(x)
-///       + (-1)^m · (1/2) · (x/2)^m · Σ_{k=0}^∞ (ψ(k+1)+ψ(m+k+1)) · (x²/4)^k / (k! (m+k)!)
-fn bessel_k_integer_series(m: usize, x: f64) -> f64 {
+fn bessel_k_temme(mu: f64, x: f64) -> (f64, f64) {
     let half_x = 0.5 * x;
-    let half_x_sq = half_x * half_x;
+    let mu2 = mu * mu;
+    let pimu = std::f64::consts::PI * mu;
+    let fact = if pimu.abs() < BESSEL_K_EPS {
+        1.0
+    } else {
+        pimu / pimu.sin()
+    };
+    let dlog = -half_x.ln();
+    let sigma = mu * dlog;
+    let fact2 = if sigma.abs() < BESSEL_K_EPS {
+        1.0
+    } else {
+        sigma.sinh() / sigma
+    };
+    let (gam1, gam2, gampl, gammi) = bessel_k_beschb(mu);
+    let mut ff = fact * (gam1 * sigma.cosh() + gam2 * fact2 * dlog);
+    let mut sum = ff;
+    let exp_sigma = sigma.exp();
+    let mut p = 0.5 * exp_sigma / gampl;
+    let mut q = 0.5 / (exp_sigma * gammi);
+    let mut c = 1.0_f64;
+    let d = half_x * half_x;
+    let mut sum1 = p;
 
-    // Finite polynomial part
-    let mut finite = 0.0_f64;
-    if m >= 1 {
-        let mut term = factorial_f64(m - 1); // k=0: (m-1)!/0! · 1
-        finite += term;
-        for k in 1..m {
-            // term_{k} = (m-k-1)!/k! · (-x²/4)^k
-            // ratio: term_k/term_{k-1} = -(x²/4)/(k · (m-k))
-            term *= -half_x_sq / (k as f64 * (m - k) as f64);
-            finite += term;
+    for i in 1..=BESSEL_K_MAX_ITER {
+        let i_f = i as f64;
+        ff = (i_f * ff + p + q) / (i_f * i_f - mu2);
+        c *= d / i_f;
+        p /= i_f - mu;
+        q /= i_f + mu;
+        let del = c * ff;
+        sum += del;
+        let del1 = c * (p - i_f * ff);
+        sum1 += del1;
+        if del.abs() < BESSEL_K_EPS * sum.abs() {
+            return (sum, sum1 * 2.0 / x);
         }
-        finite *= 0.5 * half_x.powi(-(m as i32));
     }
-
-    // Logarithmic part
-    let i_m = bessel_i_series(m as f64, x);
-    let sign_log = if m.is_multiple_of(2) { -1.0 } else { 1.0 };
-    let log_part = sign_log * half_x.ln() * i_m;
-
-    // Series with digamma sums
-    // ψ(k+1) = -γ + H_k where H_k = Σ_{j=1}^k 1/j
-    // ψ(m+k+1) = -γ + H_{m+k}
-    let mut harmonic_k = 0.0_f64;
-    let mut harmonic_mk = (1..=m).map(|j| 1.0 / j as f64).sum::<f64>();
-    let mut term_factor = 1.0 / factorial_f64(m); // (x²/4)^0 / (0! m!)
-    let mut series_sum = (-2.0 * EULER_GAMMA + harmonic_k + harmonic_mk) * term_factor;
-    for k in 1..200 {
-        harmonic_k += 1.0 / k as f64;
-        harmonic_mk += 1.0 / (m + k) as f64;
-        term_factor *= half_x_sq / (k as f64 * (m + k) as f64);
-        let psi_sum = -2.0 * EULER_GAMMA + harmonic_k + harmonic_mk;
-        let inc = psi_sum * term_factor;
-        series_sum += inc;
-        if inc.abs() < 1e-18 * series_sum.abs().max(1e-300) {
-            break;
-        }
-    }
-    let sign_m = if m.is_multiple_of(2) { 1.0 } else { -1.0 };
-    let series_part = sign_m * 0.5 * half_x.powi(m as i32) * series_sum;
-
-    finite + log_part + series_part
+    panic!("bessel_k Temme series failed to converge for mu={mu} x={x}");
 }
 
-/// Asymptotic expansion for large x:
-/// K_ν(x) ~ √(π/(2x)) e^{-x} Σ_{k=0}^∞ a_k(ν)/x^k
-/// a_0 = 1, a_k = (4ν² - 1²)(4ν² - 3²)…(4ν² - (2k-1)²) / (k! · 8^k).
-/// Sum until the smallest term, then return.
-fn bessel_k_asymptotic(nu: f64, x: f64) -> f64 {
-    let mu = 4.0 * nu * nu;
-    let mut term = 1.0_f64;
-    let mut sum = 1.0_f64;
-    let mut prev_abs = f64::INFINITY;
-    for k in 1..50 {
-        let two_k_minus_1 = (2 * k - 1) as f64;
-        term *= (mu - two_k_minus_1 * two_k_minus_1) / (k as f64 * 8.0 * x);
-        if term.abs() > prev_abs {
-            break; // diverged: stop before adding
-        }
-        sum += term;
-        prev_abs = term.abs();
-        if term.abs() < 1e-16 * sum.abs() {
-            break;
+fn bessel_k_steed_cf2(mu: f64, x: f64) -> (f64, f64) {
+    let mut b = 2.0 * (1.0 + x);
+    let mut d = 1.0 / b;
+    let mut delh = d;
+    let mut h = delh;
+    let mut q1 = 0.0_f64;
+    let mut q2 = 1.0_f64;
+    let a1 = 0.25 - mu * mu;
+    let mut q = a1;
+    let mut c = a1;
+    let mut a = -a1;
+    let mut s = 1.0 + q * delh;
+
+    for i in 2..=BESSEL_K_MAX_ITER {
+        let i_f = i as f64;
+        a -= 2.0 * (i_f - 1.0);
+        c = -a * c / i_f;
+        let qnew = (q1 - b * q2) / a;
+        q1 = q2;
+        q2 = qnew;
+        q += c * qnew;
+        b += 2.0;
+        d = 1.0 / (b + a * d);
+        delh *= b * d - 1.0;
+        h += delh;
+        let dels = q * delh;
+        s += dels;
+        if dels.abs() < BESSEL_K_EPS * s.abs() {
+            h *= a1;
+            let rkmu = (std::f64::consts::PI / (2.0 * x)).sqrt() * (-x).exp() / s;
+            let rk1 = rkmu * (mu + x + 0.5 - h) / x;
+            return (rkmu, rk1);
         }
     }
-    (std::f64::consts::PI / (2.0 * x)).sqrt() * (-x).exp() * sum
+    panic!("bessel_k Steed CF2 failed to converge for mu={mu} x={x}");
+}
+
+fn bessel_k_beschb(mu: f64) -> (f64, f64, f64, f64) {
+    let xx = 8.0 * mu * mu - 1.0;
+    let gam1 = chebyshev_eval_minus1_to_1(&BESSEL_K_CHEB_C1, xx);
+    let gam2 = chebyshev_eval_minus1_to_1(&BESSEL_K_CHEB_C2, xx);
+    let gampl = gam2 - mu * gam1;
+    let gammi = gam2 + mu * gam1;
+    (gam1, gam2, gampl, gammi)
+}
+
+fn chebyshev_eval_minus1_to_1(coeffs: &[f64], x: f64) -> f64 {
+    let mut d = 0.0_f64;
+    let mut dd = 0.0_f64;
+    let y2 = 2.0 * x;
+    for j in (1..coeffs.len()).rev() {
+        let previous_d = d;
+        d = y2 * d - dd + coeffs[j];
+        dd = previous_d;
+    }
+    x * d - dd + 0.5 * coeffs[0]
 }
 
 /// Riesz kernel R_j^d(r) = F^{-1}{|ρ|^{-2j}}(r) for r > 0.
@@ -420,6 +462,9 @@ fn log_riesz_finite_part_shift(d: usize, n: usize) -> f64 {
 /// Matérn building block M_ℓ^d(r; κ) = F^{-1}{(|ρ|² + κ²)^{-ℓ}}(r) for r > 0, κ > 0.
 ///
 /// M_ℓ^d(r; κ) = κ^{d/2 - ℓ} / ((2π)^{d/2} · 2^{ℓ-1} · Γ(ℓ)) · r^{ℓ - d/2} · K_{ℓ - d/2}(κr).
+///
+/// For r > 0, K_ν is evaluated by the Temme/Steed order-reduced algorithm used
+/// by `bessel_k`, with the half-integer closed form retained where applicable.
 ///
 /// For r → 0, returns the small-arg limit using K_ν(x) ~ Γ(|ν|)/2 · (x/2)^{-|ν|}
 /// (ν ≠ 0) or the log limit (ν = 0).
@@ -2670,4 +2715,80 @@ pub fn psi_kappa_mixed_derivative(
     let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
     let big_j = eta.iter().sum::<f64>().exp();
     (bundle.d2_eta_kappa[k] - bundle.d_kappa) / big_j
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bessel_i_series, bessel_k, bessel_k_half_integer};
+
+    fn assert_relative_close(actual: f64, expected: f64, rel_tol: f64) {
+        let scale = expected.abs();
+        let diff = (actual - expected).abs();
+        assert!(
+            diff <= rel_tol * scale,
+            "actual={actual} expected={expected} diff={diff} rel_tol={rel_tol}"
+        );
+    }
+
+    #[test]
+    fn bessel_k_matches_classic_k0_k1_values() {
+        assert_relative_close(bessel_k(0.0, 1.0), 0.421_024_438_240_708_34, 1e-12);
+        assert_relative_close(bessel_k(1.0, 1.0), 0.601_907_230_197_234_6, 1e-12);
+    }
+
+    #[test]
+    fn bessel_k_large_order_at_moderate_x_matches_reference() {
+        assert_relative_close(bessel_k(10.0, 3.0), 2_459.6, 1e-3);
+    }
+
+    #[test]
+    fn bessel_k_half_integer_formula_and_nearby_orders_are_continuous() {
+        for x in [0.5, 1.5, 3.0, 10.0] {
+            let closed_form = bessel_k_half_integer(2, x);
+            assert_relative_close(bessel_k(2.5, x), closed_form, 1e-14);
+            assert_relative_close(bessel_k(2.5 - 1e-9, x), closed_form, 1e-6);
+            assert_relative_close(bessel_k(2.5 + 1e-9, x), closed_form, 1e-6);
+        }
+    }
+
+    #[test]
+    fn bessel_k_satisfies_order_recurrence() {
+        for nu in [0.3, 1.7, 6.2, 11.4] {
+            for x in [0.5, 1.9, 2.1, 3.0, 8.0, 25.0] {
+                let k_next = bessel_k(nu + 1.0, x);
+                let residual =
+                    k_next - bessel_k(nu - 1.0, x) - (2.0 * nu / x) * bessel_k(nu, x);
+                assert!(
+                    residual.abs() <= 1e-10 * k_next.abs(),
+                    "nu={nu} x={x} residual={residual} k_next={k_next}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bessel_i_k_wronskian_holds_for_small_x() {
+        for nu in [0.0, 0.3, 1.7, 6.2] {
+            for x in [0.5, 1.0, 1.9, 2.0] {
+                let lhs = bessel_i_series(nu, x) * bessel_k(nu + 1.0, x)
+                    + bessel_i_series(nu + 1.0, x) * bessel_k(nu, x);
+                let expected = 1.0 / x;
+                assert_relative_close(lhs, expected, 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn bessel_k_is_continuous_across_x_equals_two_dispatch() {
+        for nu in [0.3, 4.6] {
+            let left = bessel_k(nu, 2.0 - 1e-9);
+            let right = bessel_k(nu, 2.0 + 1e-9);
+            let diff = (left - right).abs();
+            let scale = left.abs().max(right.abs()).max(1.0);
+            assert!(
+                diff <= 1e-8 * scale,
+                "nu={nu} left={left} right={right} diff={diff}"
+            );
+        }
+    }
 }
