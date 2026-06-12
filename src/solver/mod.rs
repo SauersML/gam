@@ -27,6 +27,7 @@ pub(crate) mod riemannian_retraction;
 pub mod row_measure;
 pub mod seeding;
 pub mod sensitivity;
+pub mod psi_gram_tensor;
 pub mod spline_scan;
 pub(crate) mod startup_stats;
 pub mod streaming_border;
