@@ -18188,7 +18188,22 @@ fn run_exact_joint_spatial_optimization(
             "[{label}] analytic outer Hessian unavailable for family/design; routing without second-order geometry (coord_dim={coord_dim})"
         );
     }
-    let prefer_gradient_only = false;
+    // Second-order outer routing is COST-AWARE here, mirroring the n-block
+    // path's work-budget policy: the exact joint outer Hessian materializes
+    // pairwise hyper operators for every (θ_i, θ_j), so its per-eval cost
+    // grows quadratically in θ-dim (profiled: TauTauPairHyperOperator::
+    // mul_vec dominates wall-clock for spectral-mode measure-jet terms,
+    // whose per-scale candidates push θ-dim to ~9–11). Past the pair
+    // budget, gradient-only quasi-Newton is convergent to the same optimum
+    // and strictly cheaper per eval — the n-block path documents the same
+    // trade; below it, exact second-order keeps the ARC/TR-CG geometry.
+    let prefer_gradient_only = theta_dim > EXACT_JOINT_SECOND_ORDER_THETA_CAP;
+    if prefer_gradient_only {
+        log::info!(
+            "[{label}] joint θ-dim {theta_dim} exceeds the exact pair-Hessian budget \
+             ({EXACT_JOINT_SECOND_ORDER_THETA_CAP}); routing gradient-only quasi-Newton"
+        );
+    }
 
     log::trace!(
         "[{}] starting analytic optimization: rho_dim={}, coord_dim={}, dims_per_term={:?}",
@@ -20276,6 +20291,14 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
         | ResponseFamily::Gamma => crate::seeding::SeedRiskProfile::GeneralizedLinear,
     }
 }
+
+/// Joint-θ dimension above which the single-block exact-joint driver routes
+/// gradient-only: the exact outer Hessian builds θ(θ+1)/2 pairwise hyper
+/// operators, so per-eval cost grows quadratically in θ-dim — profiled to
+/// dominate wall-clock at spectral-mode measure-jet candidate counts
+/// (θ ≈ 9–11), while θ ≤ 8 (classic Matérn κ/η fits) keeps cheap exact
+/// second-order geometry.
+const EXACT_JOINT_SECOND_ORDER_THETA_CAP: usize = 8;
 
 pub(crate) fn exact_joint_multistart_outer_problem(
     theta0: &Array1<f64>,
