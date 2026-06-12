@@ -583,6 +583,53 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
         )
     };
 
+    // Measure-jet scale spectrum: one compact line per term (only if present)
+    let measure_jet_section = if input.measure_jet_spectra.is_empty() {
+        String::new()
+    } else {
+        let lines = input
+            .measure_jet_spectra
+            .iter()
+            .map(|r| {
+                let band = format!(
+                    "band {}..{} ({} scales, \u{2113}={})",
+                    fmt_num(r.eps_min),
+                    fmt_num(r.eps_max),
+                    r.n_scales,
+                    fmt_num(r.length_scale),
+                );
+                let tail = if r.per_scale.is_empty() {
+                    format!("fused penalty, spec order s={:.2}", r.spec_order_s)
+                } else {
+                    let lams = r
+                        .per_scale
+                        .iter()
+                        .map(|&(_, lam)| format!("{lam:.3e}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let implied = r
+                        .implied_order
+                        .map(|s| format!("implied order s\u{0302}\u{2248}{s:.2}"))
+                        .unwrap_or_else(|| "implied order \u{2014}".to_string());
+                    format!(
+                        "&lambda;<sub>\u{2113}</sub> = [{lams}], {implied} (spec s={:.2})",
+                        r.spec_order_s
+                    )
+                };
+                format!(
+                    "<p class=\"mono\">{}: measure-jet {band}, {tail}</p>",
+                    esc(&r.term_name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<section class=\"card\" id=\"sec-mjet-spectrum\">\n\
+             <h2>Measure-Jet Scale Spectrum</h2>\n\
+             {lines}\n</section>"
+        )
+    };
+
     // Diagnostics plots grid
     let diagnostics_section = if input.diagnostics.is_some() {
         let has_cal = input
