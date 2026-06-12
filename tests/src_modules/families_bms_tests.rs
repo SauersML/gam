@@ -1395,17 +1395,24 @@ fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
     let eta_grid = [-8.0, -6.5, -2.0, -0.4, 0.0, 0.75, 2.25, 6.0, 8.0];
     let g_grid = [-1.4, -0.55, 0.0, 0.8, 1.7];
     let z_grid = [-2.25, -0.35, 0.4, 2.1];
-    // Fourth-order chains at the eta=-6.5 / scale=0.7 corner are
-    // ill-conditioned as EXPRESSIONS (kappa ~ 1e6-1e7: large powers of eta
-    // against near-cancelling probit ratios), so two exact paths with
-    // different contraction orders (hand chain vs tower; arm64 vs x86_64
-    // FMA) can only be expected to agree to ~kappa*eps ~ 1e-9; observed
-    // worst cases: 1.4e-11 (arm64), 8.9e-10 (x86_64). 1e-8 sits 10x above
-    // that conditioning floor and 100x below the dropped-term signal
-    // (>=1e-6) this witness exists to catch.
-    let tol = 1.0e-8;
+    // Per-regime bounds (same construction as the CTN endpoint oracle): the
+    // 3rd/4th-order chains are ill-conditioned EXPRESSIONS in the saturation
+    // tail — at |eta| >= 6 the signed argument reaches |m| ~ 9-13 where the
+    // Mills-ratio derivative stack has kappa ~ 1e7-1e9, so two exact paths
+    // with different contraction orders (hand chain vs tower; arm64 vs
+    // x86_64 FMA) can only agree to ~kappa*eps; observed tail worst cases:
+    // 1.4e-11 (arm64), 1.2e-8 (x86_64). Interior rows are well-conditioned
+    // and stay pinned tight. Both regimes remain well below the >=1e-6
+    // dropped-term signal this witness exists to catch.
+    let interior_tol = 1.0e-11;
+    let tail_tol = 1.0e-7;
 
     for eta in eta_grid {
+        let tol = if eta.abs() >= 6.0 {
+            tail_tol
+        } else {
+            interior_tol
+        };
         let marginal = bernoulli_marginal_link_map(&link, eta).expect("marginal map");
         for g in g_grid {
             for z in z_grid {
