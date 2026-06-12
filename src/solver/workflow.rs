@@ -6403,6 +6403,7 @@ fn smooth_basis_feature_cols_for_latent(
         | crate::smooth::SmoothBasisSpec::Sphere { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::ConstantCurvature { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::Matern { feature_cols, .. }
+        | crate::smooth::SmoothBasisSpec::MeasureJet { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::Duchon { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::Pca { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
@@ -6482,6 +6483,7 @@ fn natural_latent_manifold_for_basis(
         // κ-aware latent seed/retraction is part of the later ψ-channel stage.
         | crate::smooth::SmoothBasisSpec::ConstantCurvature { .. }
         | crate::smooth::SmoothBasisSpec::Matern { .. }
+        | crate::smooth::SmoothBasisSpec::MeasureJet { .. }
         | crate::smooth::SmoothBasisSpec::Duchon { .. }
         | crate::smooth::SmoothBasisSpec::Pca { .. }
         | crate::smooth::SmoothBasisSpec::FactorSmooth { .. } => LatentManifold::Euclidean,

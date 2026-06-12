@@ -34,8 +34,8 @@ use std::path::PathBuf;
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::terms::basis::{
     BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, ConstantCurvatureBasisSpec, DuchonBasisSpec,
-    DuchonNullspaceOrder, MaternBasisSpec, MaternNu, OneDimensionalBoundary, SphereMethod,
-    SphericalSplineBasisSpec, ThinPlateBasisSpec,
+    DuchonNullspaceOrder, MaternBasisSpec, MaternNu, MeasureJetBasisSpec, OneDimensionalBoundary,
+    SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
 };
 use crate::terms::smooth::{
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec, TermCollectionSpec, parse_shape_constraint,
@@ -166,6 +166,7 @@ fn smooth_basis_feature_cols(basis: &SmoothBasisSpec) -> Option<Vec<usize>> {
         | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::ConstantCurvature { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
+        | SmoothBasisSpec::MeasureJet { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => Some(feature_cols.clone()),
@@ -243,6 +244,12 @@ fn apply_kind_specific(
         | ("mkappa", SmoothBasisSpec::ConstantCurvature { spec, .. }) => {
             apply_constant_curvature(spec, descriptor, symbol)
         }
+        ("measurejet", SmoothBasisSpec::MeasureJet { spec, .. })
+        | ("mjs", SmoothBasisSpec::MeasureJet { spec, .. })
+        | ("measure_jet", SmoothBasisSpec::MeasureJet { spec, .. })
+        | ("web", SmoothBasisSpec::MeasureJet { spec, .. }) => {
+            apply_measure_jet(spec, descriptor, symbol)
+        }
         ("bspline", SmoothBasisSpec::BSpline1D { spec, .. })
         | ("periodic", SmoothBasisSpec::BSpline1D { spec, .. })
         | ("bc", SmoothBasisSpec::BSpline1D { spec, .. }) => {
@@ -274,6 +281,7 @@ fn smooth_basis_kind_name(basis: &SmoothBasisSpec) -> &'static str {
         SmoothBasisSpec::ThinPlate { .. } => "thin_plate",
         SmoothBasisSpec::Sphere { .. } => "sphere",
         SmoothBasisSpec::ConstantCurvature { .. } => "constant_curvature",
+        SmoothBasisSpec::MeasureJet { .. } => "measurejet",
         SmoothBasisSpec::Matern { .. } => "matern",
         SmoothBasisSpec::Duchon { .. } => "duchon",
         SmoothBasisSpec::Pca { .. } => "pca",
@@ -495,6 +503,70 @@ fn apply_constant_curvature(
             return Err(format!("smooths[{symbol:?}].kappa must be finite"));
         }
         spec.kappa = kappa;
+    }
+    if let Some(ls) = descriptor.get("length_scale").and_then(JsonValue::as_f64) {
+        if !(ls.is_finite() && ls > 0.0) {
+            return Err(format!(
+                "smooths[{symbol:?}].length_scale must be a positive finite number"
+            ));
+        }
+        spec.length_scale = ls;
+    }
+    if let Some(double_penalty) = descriptor
+        .get("double_penalty")
+        .and_then(JsonValue::as_bool)
+    {
+        spec.double_penalty = double_penalty;
+    }
+    Ok(())
+}
+
+fn apply_measure_jet(
+    spec: &mut MeasureJetBasisSpec,
+    descriptor: &serde_json::Map<String, JsonValue>,
+    symbol: &str,
+) -> Result<(), String> {
+    if let Some(centers_val) = descriptor.get("centers") {
+        let centers = parse_2d_array(centers_val, "centers", symbol)?;
+        if centers.nrows() < 3 {
+            return Err(format!(
+                "smooths[{symbol:?}].centers must contain at least 3 rows for MeasureJet"
+            ));
+        }
+        spec.center_strategy = CenterStrategy::UserProvided(centers);
+    } else if let Some(n) = descriptor.get("n_centers").and_then(JsonValue::as_u64) {
+        let n = n as usize;
+        if n < 3 {
+            return Err(format!(
+                "smooths[{symbol:?}].n_centers must be at least 3 for MeasureJet"
+            ));
+        }
+        spec.center_strategy = CenterStrategy::FarthestPoint { num_centers: n };
+    }
+    if let Some(s) = descriptor.get("s").and_then(JsonValue::as_f64) {
+        if !(s.is_finite() && s > 0.0 && s < 2.0) {
+            return Err(format!(
+                "smooths[{symbol:?}].s must lie in (0, 2) for the measure-jet affine-jet energy"
+            ));
+        }
+        spec.order_s = s;
+    }
+    if let Some(alpha) = descriptor.get("alpha").and_then(JsonValue::as_f64) {
+        if !alpha.is_finite() {
+            return Err(format!("smooths[{symbol:?}].alpha must be finite"));
+        }
+        spec.alpha = alpha;
+    }
+    if let Some(tau) = descriptor.get("tau").and_then(JsonValue::as_f64) {
+        if !(tau.is_finite() && tau >= 0.0) {
+            return Err(format!(
+                "smooths[{symbol:?}].tau must be a finite nonnegative number"
+            ));
+        }
+        spec.tau0 = tau;
+    }
+    if let Some(n) = descriptor.get("scales").and_then(JsonValue::as_u64) {
+        spec.num_scales = n as usize;
     }
     if let Some(ls) = descriptor.get("length_scale").and_then(JsonValue::as_f64) {
         if !(ls.is_finite() && ls > 0.0) {

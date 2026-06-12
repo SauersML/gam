@@ -2526,6 +2526,27 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
+            "mjs" | "measurejet" | "measure_jet" | "web" => {
+                // Measure-jet spline smooth: multiscale local-jet-residual
+                // energy of the empirical measure, for responses varying
+                // along an unknown low-dimensional set (filament webs,
+                // sheets) inside a higher-dimensional ambient space. All
+                // aliases dispatch through the identical `type=measurejet`
+                // route, mirroring the sphere/curvature alias rule.
+                if vars.is_empty() {
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("{name}() requires at least one variable: {raw}"),
+                    }
+                    .into());
+                }
+                options.insert("type".to_string(), "measurejet".to_string());
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
             "curv" | "curvature" | "constant_curvature" | "mkappa" => {
                 // Constant-curvature (M_κ) geodesic-kernel smooth (#944): the
                 // κ-generic sibling of sphere()/s2(), interpolating

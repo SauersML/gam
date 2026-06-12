@@ -1994,9 +1994,13 @@ fn collect_smooth_extrapolation_axes(
         }
         // Radial bases with a bounded out-of-hull contract: Duchon / thin-plate
         // are linear outside the data span (natural-spline boundary conditions),
-        // Matérn reverts to its mean as the kernel decays.
+        // Matérn reverts to its mean as the kernel decays. Measure-jet shares
+        // the Matérn contract (Gaussian representers decay to the parametric
+        // layer off the data support) — and off-web queries are exactly the
+        // ones its support diagnostic must see unclipped.
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
+        | SmoothBasisSpec::MeasureJet { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. } => {
             for &c in feature_cols {
                 push(c, out);

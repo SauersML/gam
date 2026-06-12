@@ -7371,6 +7371,7 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
         | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::ConstantCurvature { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
+        | SmoothBasisSpec::MeasureJet { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
@@ -8004,6 +8005,7 @@ fn spatial_basiswarning_family_and_cols_basis(
             Some(("constant_curvature", feature_cols))
         }
         SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
+        SmoothBasisSpec::MeasureJet { feature_cols, .. } => Some(("measurejet", feature_cols)),
         SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
         SmoothBasisSpec::BSpline1D { .. }
         | SmoothBasisSpec::Pca { .. }
