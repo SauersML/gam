@@ -277,40 +277,6 @@ impl FrameProjection {
         }
     }
 
-    pub(crate) fn project_row_jacobian_for_atom(
-        &self,
-        atom: usize,
-        jac: ArrayView2<'_, f64>,
-    ) -> Array2<f64> {
-        let q = jac.nrows();
-        let r = self.ranks[atom];
-        let mut out = Array2::<f64>::zeros((q, r));
-        match &self.frames[atom] {
-            None => {
-                assert_eq!(r, self.p);
-                for row in 0..q {
-                    for output in 0..self.p {
-                        out[[row, output]] = jac[[row, output]];
-                    }
-                }
-            }
-            Some(uk) => {
-                for row in 0..q {
-                    for output in 0..self.p {
-                        let value = jac[[row, output]];
-                        if value == 0.0 {
-                            continue;
-                        }
-                        for frame_col in 0..r {
-                            out[[row, frame_col]] += value * uk[[output, frame_col]];
-                        }
-                    }
-                }
-            }
-        }
-        out
-    }
-
     pub(crate) fn output_variance(
         &self,
         atom: usize,
