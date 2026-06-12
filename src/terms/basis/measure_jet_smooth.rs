@@ -350,12 +350,18 @@ pub fn measure_jet_band(
     })
 }
 
-/// Per-center masses of the empirical measure: nearest-center assignment
-/// fractions of the data rows (deterministic tie-break: lowest center index).
-pub fn measure_jet_center_masses(
+/// First-moment-exact quadrature of the empirical measure on the cell
+/// partition induced by the seed centers: nearest-center assignment
+/// (deterministic tie-break: lowest center index) yields per-cell masses,
+/// and each cell's quadrature NODE is its mass-weighted barycenter — so the
+/// lumped measure matches μ's zeroth AND first moments per cell, one order
+/// better than placing the mass at the seed point. Empty cells keep their
+/// seed coordinates with zero mass (the assembly skips them; their
+/// representer columns remain valid).
+pub fn measure_jet_quadrature_nodes(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
-) -> Result<Array1<f64>, BasisError> {
+) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
     if data.ncols() != centers.ncols() {
         crate::bail_dim_basis!(
             "measure-jet mass assignment dimension mismatch: data d={} centers d={}",
@@ -367,6 +373,7 @@ pub fn measure_jet_center_masses(
     validate_finite_points(centers, "centers")?;
     let n = data.nrows();
     let m = centers.nrows();
+    let d = centers.ncols();
     if n == 0 || m == 0 {
         crate::bail_invalid_basis!("measure-jet mass assignment needs nonempty data and centers");
     }
@@ -391,11 +398,33 @@ pub fn measure_jet_center_masses(
         })
         .collect();
     let mut masses = Array1::<f64>::zeros(m);
+    let mut nodes = centers.to_owned();
+    let mut sums = Array2::<f64>::zeros((m, d));
     let unit = 1.0 / n as f64;
-    for j in assignments {
+    for (i, &j) in assignments.iter().enumerate() {
         masses[j] += unit;
+        for k in 0..d {
+            sums[(j, k)] += data[(i, k)];
+        }
     }
-    Ok(masses)
+    for j in 0..m {
+        let count = masses[j] * n as f64;
+        if count > 0.0 {
+            for k in 0..d {
+                nodes[(j, k)] = sums[(j, k)] / count;
+            }
+        }
+    }
+    Ok((nodes, masses))
+}
+
+/// Per-center masses of the empirical measure (the zeroth-moment half of
+/// [`measure_jet_quadrature_nodes`]; single assignment source).
+pub fn measure_jet_center_masses(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+) -> Result<Array1<f64>, BasisError> {
+    measure_jet_quadrature_nodes(data, centers).map(|(_, masses)| masses)
 }
 
 /// THE single assembly source: walk every (scale, outer-net center) local
@@ -882,19 +911,23 @@ pub fn build_measure_jet_basis(
         crate::bail_invalid_basis!("measure-jet smooth needs at least one feature column");
     }
     validate_finite_points(data, "data")?;
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let m = centers.nrows();
+    let seed_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let m = seed_centers.nrows();
     if m < 3 {
         return Err(BasisError::InsufficientColumnsForConstraint { found: m });
     }
-    let length_scale = realized_measure_jet_length_scale(centers.view(), spec.length_scale)?;
     let order_s = if spec.order_s == 0.0 {
         MEASURE_JET_DEFAULT_ORDER_S
     } else {
         spec.order_s
     };
-    // Fit-time quadrature, or the frozen replay (predict / ψ-trial path).
-    let (masses, eps_band, log_step) = match &spec.frozen_quadrature {
+    // Quadrature realization. Fit path: the realized nodes are the cell
+    // BARYCENTERS of the seed partition (first-moment-exact lumping of μ —
+    // see `measure_jet_quadrature_nodes`), so the metadata's `centers` are
+    // already the realized nodes and the frozen path (predict / ψ-trial,
+    // `CenterStrategy::UserProvided`) replays them verbatim with the frozen
+    // masses + band.
+    let (centers, masses, eps_band, log_step) = match &spec.frozen_quadrature {
         Some(frozen) => {
             if frozen.masses.len() != m {
                 crate::bail_dim_basis!(
@@ -911,14 +944,20 @@ pub fn build_measure_jet_basis(
             } else {
                 std::f64::consts::LN_2
             };
-            (frozen.masses.clone(), frozen.eps_band.clone(), log_step)
+            (
+                seed_centers,
+                frozen.masses.clone(),
+                frozen.eps_band.clone(),
+                log_step,
+            )
         }
         None => {
-            let band = measure_jet_band(centers.view(), spec.num_scales)?;
-            let masses = measure_jet_center_masses(data, centers.view())?;
-            (masses, band.eps, band.log_step)
+            let (nodes, masses) = measure_jet_quadrature_nodes(data, seed_centers.view())?;
+            let band = measure_jet_band(nodes.view(), spec.num_scales)?;
+            (nodes, masses, band.eps, band.log_step)
         }
     };
+    let length_scale = realized_measure_jet_length_scale(centers.view(), spec.length_scale)?;
     let band = MeasureJetBand {
         eps: eps_band.clone(),
         log_step,
@@ -1263,6 +1302,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Quadrature nodes must be the mass-weighted cell barycenters
+    /// (first-moment-exact lumping), with empty cells keeping their seed
+    /// coordinates at zero mass.
+    #[test]
+    fn quadrature_nodes_are_cell_barycenters() {
+        // Two tight groups around (0,0) and (10,10); a third seed far away
+        // captures nothing.
+        let data = array![
+            [0.0, 0.2],
+            [0.4, -0.2],
+            [0.2, 0.0],
+            [9.8, 10.1],
+            [10.2, 9.9],
+        ];
+        let seeds = array![[0.1, 0.1], [10.0, 10.0], [-50.0, -50.0]];
+        let (nodes, masses) =
+            measure_jet_quadrature_nodes(data.view(), seeds.view()).expect("quadrature nodes");
+        assert!((masses.sum() - 1.0).abs() <= 1e-15, "masses must sum to 1");
+        assert!((masses[0] - 0.6).abs() <= 1e-15);
+        assert!((masses[1] - 0.4).abs() <= 1e-15);
+        assert_eq!(masses[2], 0.0);
+        // Cell 0 barycenter = mean of the three assigned rows.
+        assert!((nodes[(0, 0)] - 0.2).abs() <= 1e-12);
+        assert!((nodes[(0, 1)] - 0.0).abs() <= 1e-12);
+        // Cell 1 barycenter.
+        assert!((nodes[(1, 0)] - 10.0).abs() <= 1e-12);
+        assert!((nodes[(1, 1)] - 10.0).abs() <= 1e-12);
+        // Empty cell keeps its seed coordinates.
+        assert_eq!(nodes[(2, 0)], -50.0);
+        assert_eq!(nodes[(2, 1)], -50.0);
     }
 
     /// Freeze→replay: rebuilding from the first build's frozen transform and
