@@ -2352,7 +2352,13 @@ fn factor_gauge_deflated_evidence_row(
             continue;
         }
         let curvature = row_gauge_curvature(row, d, gauge)?;
-        if curvature > GAUGE_RAYLEIGH_EPS * max_diag * norm_sq {
+        // Two-sided gauge qualification: a true orbit direction has Rayleigh
+        // quotient ~ 0 from EITHER side (the observed failures sit at ~ -1e-10).
+        // Strongly NEGATIVE curvature is genuine indefiniteness (e.g. the raw
+        // assignment-prior logit curvature off-optimum), not a gauge — deflating
+        // it would mask a real non-PD block and bias the evidence. Only
+        // |g^T H g| <= eps * scale * |g|^2 qualifies.
+        if curvature.abs() > GAUGE_RAYLEIGH_EPS * max_diag * norm_sq {
             continue;
         }
         let mut direction = gauge.clone();
