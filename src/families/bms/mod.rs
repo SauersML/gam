@@ -1110,14 +1110,25 @@ fn weighted_ridge_sandwich_cov(
     // Jacobi (symmetric diagonal) preconditioning. When the conditioning basis
     // spans many orders of magnitude — a power-9 Duchon RBF over 16 standardized
     // PCs produces columns differing by ~30 decades — `M` and `meat` live on
-    // wildly different per-column scales, and `M⁺ meat M⁺` multiplies a near-null
-    // eigenvalue gap straight through the f64 range even after the pseudo-inverse
-    // drops the rank-deficient directions. Rescale by `D = diag(√M_jj)` so the
-    // preconditioned normal matrix `M̃ = D⁻¹ M D⁻¹` has unit diagonal, invert
-    // there, and map back: `cov = D⁻¹ (M̃⁺ meat̃ M̃⁺) D⁻¹` with `meat̃ = D⁻¹ meat
-    // D⁻¹`. Algebraically identical to `M⁺ meat M⁺` (the scaling cancels), but
-    // every intermediate stays O(1). `M_jj` is strictly positive (the relative
-    // ridge floors every diagonal), so the scale is always finite.
+    // wildly different per-column scales, and the eigendecomposition behind
+    // `M⁺ meat M⁺` loses all accuracy: the relative truncation tolerance is set
+    // by `λ_max(M)` (dominated by the largest-scale column), so a genuinely
+    // identified small-scale direction can be dropped while a near-null one is
+    // kept, and the surviving `1/λ` then multiplies the huge `meat` straight
+    // through the f64 range. Precondition by `D = diag(√M_jj)`. Because the ridge
+    // penalty diagonal is built as the weighted Gram diagonal itself
+    // (`penalty_jj = Σ_i w_i a_ij² = (AᵀWA)_jj`), `M_jj = (1+ρ)(AᵀWA)_jj`, so
+    // `M̃ = D⁻¹ M D⁻¹` has EXACT unit diagonal and `M̃ = C + (ρ/(1+ρ))·I` with
+    // `C` the basis correlation matrix (PSD). Hence `λ_min(M̃) ≥ ρ/(1+ρ) ≈ 1e-8`
+    // even for a fully collinear basis, which clears the pseudo-inverse's
+    // relative tolerance `≈ 1e-10·λ_max(M̃)` for the conditioning widths that
+    // occur here: no direction is spuriously dropped, so `M̃⁺ = M̃⁻¹ = D M⁻¹ D`
+    // and `cov = D⁻¹ (M̃⁻¹ meat̃ M̃⁻¹) D⁻¹ = M⁻¹ meat M⁻¹` EXACTLY — the scaling
+    // cancels, this is the same sandwich, only computed on a well-conditioned
+    // matrix. (Should a pure-ridge direction ever fall under tolerance at very
+    // large width, dropping it is the correct scale-invariant identifiability
+    // call.) `meat̃ = D⁻¹ meat D⁻¹`; `M_jj > 0` (Gram diagonal floored positive)
+    // so `D` is always finite and invertible.
     let scale: Vec<f64> = (0..p)
         .map(|j| 1.0 / m_sym[[j, j]].max(f64::MIN_POSITIVE).sqrt())
         .collect();
