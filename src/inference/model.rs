@@ -3616,12 +3616,12 @@ impl FittedModel {
     /// `predict` replays the training Gaussian bridge bit-for-bit.
     pub fn saved_spline_scan(
         &self,
-    ) -> Result<Option<(&str, crate::solver::spline_scan::CubicSplineScanFit)>, FittedModelError>
+    ) -> Result<Option<(&str, crate::solver::spline_scan::SplineScanFit)>, FittedModelError>
     {
         let Some(saved) = self.spline_scan.as_ref() else {
             return Ok(None);
         };
-        let fit = crate::solver::spline_scan::CubicSplineScanFit::from_state(&saved.state)
+        let fit = crate::solver::spline_scan::SplineScanFit::from_state(&saved.state)
             .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
         Ok(Some((saved.feature_column.as_str(), fit)))
     }
@@ -3686,7 +3686,7 @@ impl FittedModel {
                         .to_string(),
                 });
             }
-            crate::solver::spline_scan::CubicSplineScanFit::from_state(&scan.state)
+            crate::solver::spline_scan::SplineScanFit::from_state(&scan.state)
                 .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
             // A scan model carries NO dense design, so the dense-path
             // requirements below (resolved_termspec, fit_result finiteness,
@@ -4425,7 +4425,7 @@ mod tests {
         let y: Vec<f64> = x.iter().map(|&v| (4.0 * v).sin() + 0.1 * v).collect();
         let w = vec![1.0_f64; x.len()];
         let fit =
-            crate::solver::spline_scan::fit_cubic_spline_scan(&x, &y, &w, 2).expect("scan fit");
+            crate::solver::spline_scan::fit_spline_scan(&x, &y, &w, 2).expect("scan fit");
         let make_payload = || {
             crate::inference::model_payload_builders::assemble_spline_scan_payload(
                 "y ~ s(x)".to_string(),

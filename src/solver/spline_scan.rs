@@ -368,7 +368,7 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
 
 /// Fitted exact smoothing-spline posterior on the pooled knots.
 #[derive(Clone, Debug)]
-pub struct CubicSplineScanFit {
+pub struct SplineScanFit {
     /// Smoothing-spline order `m` (penalize `∫(f^{(m)})²`); state dimension.
     /// `m = 1` is the random-walk/linear smoother, `m = 2` the cubic smoother.
     pub order: usize,
@@ -492,14 +492,14 @@ fn concentrated_criterion(
 
 /// Fit at a FIXED `log λ` and order `m ∈ {1, 2}`, σ² either supplied or
 /// profiled.
-pub fn fit_cubic_spline_scan_at(
+pub fn fit_spline_scan_at(
     x: &[f64],
     y: &[f64],
     w: &[f64],
     log_lambda: f64,
     sigma2: Option<f64>,
     order: usize,
-) -> Result<CubicSplineScanFit, String> {
+) -> Result<SplineScanFit, String> {
     if order == 0 || order > MAX_ORDER {
         return Err(format!(
             "spline scan: order must be in 1..={MAX_ORDER}, got {order}"
@@ -610,7 +610,7 @@ pub fn fit_cubic_spline_scan_at(
         .map(|s| if order >= 2 { s[1] } else { 0.0 })
         .collect();
     let var: Vec<f64> = sm_cov.iter().map(|p| p[0][0] * sigma2).collect();
-    Ok(CubicSplineScanFit {
+    Ok(SplineScanFit {
         order,
         knots,
         mean,
@@ -630,12 +630,12 @@ pub fn fit_cubic_spline_scan_at(
 /// Fit with `log λ` selected by the concentrated diffuse REML criterion:
 /// deterministic coarse grid then golden-section refinement (no RNG, no
 /// iteration-count sensitivity — same data ⇒ same fit).
-pub fn fit_cubic_spline_scan(
+pub fn fit_spline_scan(
     x: &[f64],
     y: &[f64],
     w: &[f64],
     order: usize,
-) -> Result<CubicSplineScanFit, String> {
+) -> Result<SplineScanFit, String> {
     if order == 0 || order > MAX_ORDER {
         return Err(format!(
             "spline scan: order must be in 1..={MAX_ORDER}, got {order}"
@@ -677,10 +677,10 @@ pub fn fit_cubic_spline_scan(
             f1 = crit(x1)?;
         }
     }
-    fit_cubic_spline_scan_at(x, y, w, 0.5 * (lo + hi), None, order)
+    fit_spline_scan_at(x, y, w, 0.5 * (lo + hi), None, order)
 }
 
-/// Lossless serializable snapshot of a [`CubicSplineScanFit`] (#1034).
+/// Lossless serializable snapshot of a [`SplineScanFit`] (#1034).
 ///
 /// Carries exactly the smoother state the Gaussian-bridge `predict` replays:
 /// pooled knots, smoothed `(f, f′)` states, smoothed state covariances
@@ -716,7 +716,7 @@ fn default_spline_scan_order() -> usize {
     2
 }
 
-impl CubicSplineScanFit {
+impl SplineScanFit {
     /// Snapshot the full smoother state for persistence (#1034).
     pub fn to_state(&self) -> SplineScanState {
         let mut state = Vec::with_capacity(2 * self.knots.len());
@@ -993,11 +993,11 @@ mod tests {
             })
             .collect();
         let w: Vec<f64> = (0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)).collect();
-        let fit = fit_cubic_spline_scan(&x, &y, &w, 2).expect("scan fit");
+        let fit = fit_spline_scan(&x, &y, &w, 2).expect("scan fit");
 
         let json = serde_json::to_string(&fit.to_state()).expect("serialize state");
         let state: SplineScanState = serde_json::from_str(&json).expect("deserialize state");
-        let restored = CubicSplineScanFit::from_state(&state).expect("restore fit");
+        let restored = SplineScanFit::from_state(&state).expect("restore fit");
 
         assert_eq!(fit.knots, restored.knots);
         assert_eq!(fit.mean, restored.mean);
@@ -1023,13 +1023,13 @@ mod tests {
         // Corrupt payloads fail loudly, not inside a later predict.
         let mut bad = fit.to_state();
         bad.cov.truncate(bad.cov.len() - 1);
-        CubicSplineScanFit::from_state(&bad).expect_err("length mismatch must error");
+        SplineScanFit::from_state(&bad).expect_err("length mismatch must error");
         let mut bad = fit.to_state();
         bad.sigma2 = -1.0;
-        CubicSplineScanFit::from_state(&bad).expect_err("non-positive sigma2 must error");
+        SplineScanFit::from_state(&bad).expect_err("non-positive sigma2 must error");
         let mut bad = fit.to_state();
         bad.knots[2] = bad.knots[1];
-        CubicSplineScanFit::from_state(&bad).expect_err("non-increasing knots must error");
+        SplineScanFit::from_state(&bad).expect_err("non-increasing knots must error");
     }
 
     /// Dense order-1 (random-walk / linear smoothing spline) posterior of the
@@ -1104,7 +1104,7 @@ mod tests {
             .map(|(i, &xi)| 2.0 * xi + 0.4 * (5.0 * xi).sin() + 0.05 * ((i * 13 % 7) as f64 - 3.0))
             .collect();
         let w = vec![1.0_f64; n];
-        let fit = fit_cubic_spline_scan(&x, &y, &w, 1).expect("order-1 scan fit");
+        let fit = fit_spline_scan(&x, &y, &w, 1).expect("order-1 scan fit");
         assert_eq!(fit.order, 1);
 
         let (mean, var) = dense_rw_truth(&x, &y, &w, fit.log_lambda);
