@@ -1495,6 +1495,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         // existing `COV_MAX_P=5000` diagonal-fallback guard in
         // `solver/estimate.rs::3252` already caps the cost on huge models.
         compute_inference: true,
+        skip_rho_posterior_inference: false,
         max_iter: fit_max_iter,
         tol: fit_tol,
         nullspace_dims: vec![],
@@ -1572,6 +1573,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 // Always compute inference so `predict --uncertainty` works
                 // for Gaussian fits too (see comment near the other compute_inference site).
                 compute_inference: true,
+                skip_rho_posterior_inference: false,
                 max_iter: fit_max_iter,
                 tol: fit_tol,
                 nullspace_dims: design.nullspace_dims.clone(),
@@ -4352,6 +4354,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             sas_link: None,
             optimize_sas: false,
             compute_inference: false,
+            skip_rho_posterior_inference: false,
             max_iter: 80,
             tol: 1e-6,
             nullspace_dims: design.nullspace_dims.clone(),

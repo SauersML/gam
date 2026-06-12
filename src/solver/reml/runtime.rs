@@ -6420,6 +6420,16 @@ impl<'a> RemlState<'a> {
         {
             return;
         }
+        // Disk persistence is a process-recovery checkpoint, not part of the
+        // REML objective. The in-memory warm start is updated on every
+        // successful PIRLS solve above; writing JSON/bin records here on every
+        // outer trial puts filesystem eviction scans directly in the optimizer
+        // hot loop. Checkpoint sparsely so long fits remain recoverable while
+        // ordinary fits and posterior probes stay CPU-bound.
+        let eval_count = *self.arena.cost_eval_count.read().unwrap();
+        if eval_count % 1024 != 0 {
+            return;
+        }
         let Some(key) = self.persistent_warm_start_cache_key() else {
             return;
         };
