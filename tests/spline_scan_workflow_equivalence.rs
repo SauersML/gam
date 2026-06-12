@@ -335,8 +335,18 @@ fn spline_scan_million_row_fit_scales_linearly_and_recovers_truth() {
 /// #1034 item 2 end-to-end: the order-1 (random-walk/linear) smoothing spline
 /// routes through the formula → detection → exact O(n) scan → predict pipeline.
 /// Detection must fire, the fit must carry `order == 1`, and the scan must
-/// recover the known smooth truth at least as well as the dense reduced-rank
-/// path on the identical formula (#904 self-truth, dense = match-or-beat).
+/// recover the known smooth truth (#904 self-constructed truth, PRIMARY).
+///
+/// NO match-or-beat against the dense path here, deliberately: the dense
+/// formula fit is a DIFFERENT estimator — a reduced-rank (~40-knot) degree-1
+/// B-spline with the UNWEIGHTED first-difference penalty, vs the scan's exact
+/// full-knot spacing-weighted random-walk spline (`λ∫f′²`). For a smooth
+/// truth the rank reduction acts as extra regularization and can legitimately
+/// win on MSE; #904 reserves match-or-beat for references computing the SAME
+/// estimand. Exactness of the scan's own estimand is gated by the dense
+/// random-walk joint-precision oracle in the unit tests. A wide catastrophe
+/// guard (≤ 5× dense MSE) remains to catch silent λ-selection collapse
+/// (#1023 class) without asserting cross-estimator dominance.
 #[test]
 fn order_one_scan_routes_and_recovers_truth_vs_dense() {
     init_parallelism();
@@ -377,16 +387,19 @@ fn order_one_scan_routes_and_recovers_truth_vs_dense() {
     }
     let scan_mse = scan_sse / grid.len() as f64;
     let dense_mse = dense_sse / grid.len() as f64;
-    // The order-1 smoother is piecewise-linear, so it tracks the curved truth
-    // a little more coarsely than the cubic arm — but still resolves it well
-    // under the noise variance and must not be beaten by the dense m=1 path.
+    // PRIMARY — the order-1 smoother is piecewise-linear, so it tracks the
+    // curved truth more coarsely than the cubic arm, but must still resolve
+    // it well under the noise variance.
     assert!(
         scan_mse < 0.02,
         "m=1 scan fails absolute truth recovery: MSE={scan_mse}"
     );
+    // Catastrophe guard only (see header): different estimators, so no
+    // dominance claim — but a silent λ-selection collapse would blow far
+    // past 5× the reduced-rank fit.
     assert!(
-        scan_mse <= 1.10 * dense_mse + 1e-12,
-        "m=1 scan worse than dense path: scan MSE={scan_mse}, dense MSE={dense_mse}"
+        scan_mse <= 5.0 * dense_mse + 1e-12,
+        "m=1 scan catastrophically worse than the reduced-rank fit: scan MSE={scan_mse}, dense MSE={dense_mse}"
     );
 }
 
