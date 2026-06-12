@@ -827,8 +827,26 @@ pub fn measure_jet_scale_spectrum(
             centers.nrows()
         );
     }
+    let forms = measure_jet_energy_forms_per_scale(centers, masses, band, order_s, alpha, tau0)?;
+    let v = values.to_owned();
+    Ok(forms.iter().map(|q_l| v.dot(&q_l.dot(&v))).collect())
+}
+
+/// The per-scale energy forms `Q_ℓ` (each m × m, symmetric PSD), with
+/// `Σ_ℓ Q_ℓ = Q` exactly (same blocks, one-hot weights). These are the
+/// spectral-split carriers: emitted as separate penalty candidates they let
+/// the multi-penalty REML engine learn per-level amplitudes λ_ℓ directly —
+/// scale adaptivity at ρ-speed with no rebuild and no new optimizer code.
+pub fn measure_jet_energy_forms_per_scale(
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+    band: &MeasureJetBand,
+    order_s: f64,
+    alpha: f64,
+    tau0: f64,
+) -> Result<Vec<Array2<f64>>, BasisError> {
     let n_scales = band.eps.len();
-    let forms = assemble_weighted_forms(
+    assemble_weighted_forms(
         centers,
         masses,
         band,
@@ -846,9 +864,7 @@ pub fn measure_jet_scale_spectrum(
                 };
             }
         },
-    )?;
-    let v = values.to_owned();
-    Ok(forms.iter().map(|q_l| v.dot(&q_l.dot(&v))).collect())
+    )
 }
 
 /// The support diagnostic `ε ↦ q_ε(x★)`: kernel mass of the (frozen) center
@@ -1031,14 +1047,6 @@ pub fn build_measure_jet_basis(
         eps: eps_band.clone(),
         log_step,
     };
-    let q_form = measure_jet_energy_form(
-        centers.view(),
-        masses.view(),
-        &band,
-        order_s,
-        spec.alpha,
-        spec.tau0,
-    )?;
     // Realized-design constraint transform: uniform coefficient sum-to-zero
     // at fit time; the frozen composed `z · z_parametric` at predict time
     // (#532 pattern — see MeasureJetIdentifiability).
