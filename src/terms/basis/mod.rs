@@ -22,7 +22,7 @@ use ndarray::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -13428,105 +13428,196 @@ fn duchon_polyharmonic_operator_block_jets(
     Ok((q, t, t_r, t_rr))
 }
 
-/// Unified radial jet for one scaled Matérn/Bessel-K family
-///   coeff * r^mu * K_|mu|(kappa r).
+/// Shared Bessel-K ladder for one evaluation point `z = κ·r`.
 ///
-/// Returns (g, g', g'', g''', g'''') from a single consistent evaluation.
-/// The actual Duchon block jet and the stable operator jets for q/t reuse this
-/// same helper with different `(coeff, mu)` pairs, so they share the exact same
-/// Bessel evaluations and recurrence algebra.
-///
-/// Uses the exact recurrence derived from d/dr[r^ν K_ν(κr)] and the
-/// Bessel identity dK_ν/dz = −K_{ν−1}(z) − (ν/z)K_ν(z), which gives
-/// the cancellation pattern:
-///
-///   g^(0) = c · r^ν · K_ν(z)
-///   g^(1) = −c · κ · r^ν · K_{ν−1}(z)
-///   g^(2) = c·κ² r^ν K_{ν−2} − c·κ r^{ν−1} K_{ν−1}
-///   g^(3) = 3c·κ² r^{ν−1} K_{ν−2} − c·κ³ r^ν K_{ν−3}
-///   g^(4) = 3c·κ² r^{ν−2} K_{ν−2} − 6c·κ³ r^{ν−1} K_{ν−3} + c·κ⁴ r^ν K_{ν−4}
-#[inline(always)]
-fn duchon_matern_family_radial_derivative(
-    r: f64,
-    kappa: f64,
-    coeff: f64,
-    mu: f64,
-    derivative_order: usize,
-) -> Result<f64, BasisError> {
-    if !r.is_finite() || r < 0.0 {
-        crate::bail_invalid_basis!("Duchon Matérn-family distance must be finite and non-negative");
-    }
-    if !kappa.is_finite() || kappa <= 0.0 {
-        crate::bail_invalid_basis!("Duchon Matérn-family kappa must be finite and positive");
-    }
-    if r <= 0.0 && derivative_order == 0 && mu > 0.0 {
-        return Ok(coeff * 2.0_f64.powf(mu - 1.0) * gamma_lanczos(mu) * kappa.powf(-mu));
-    }
-    if r <= 0.0 {
-        return Ok(0.0);
-    }
-
-    let z = (kappa * r).max(1e-300);
-    let mut terms = vec![DuchonMaternDerivativeTerm {
-        coeff,
-        kappa_power: 0,
-        r_power: mu,
-        bessel_order: mu,
-    }];
-
-    for _ in 0..derivative_order {
-        let mut next_terms = Vec::with_capacity(terms.len() * 2);
-        for term in terms {
-            let stay_coeff = term.coeff * (term.r_power - term.bessel_order);
-            if stay_coeff != 0.0 {
-                next_terms.push(DuchonMaternDerivativeTerm {
-                    coeff: stay_coeff,
-                    kappa_power: term.kappa_power,
-                    r_power: term.r_power - 1.0,
-                    bessel_order: term.bessel_order,
-                });
-            }
-            next_terms.push(DuchonMaternDerivativeTerm {
-                coeff: -term.coeff,
-                kappa_power: term.kappa_power + 1,
-                r_power: term.r_power,
-                bessel_order: term.bessel_order - 1.0,
-            });
-        }
-        terms = next_terms;
-    }
-
-    let mut value = KahanSum::default();
-    for term in terms {
-        if term.coeff == 0.0 {
-            continue;
-        }
-        let k_term = bessel_k_real_half_integer_or_integer(term.bessel_order.abs(), z)?;
-        value.add(term.coeff * kappa.powi(term.kappa_power as i32) * r.powf(term.r_power) * k_term);
-    }
-    Ok(value.sum())
+/// Every Matérn partial-fraction block and every term of its radial
+/// derivative lattice consumes `K_ν(z)` at orders from ONE parity class
+/// (integer when the covariate dimension is even, half-integer when odd),
+/// differing by integers — and all at the SAME `z`. The previous code
+/// restarted the `K₀/K₁` (or closed-form half-integer) seed evaluation and
+/// the upward recurrence inside every per-term Bessel call: hundreds of
+/// redundant seed+recurrence runs per `(row, center)` pair, which the #979
+/// CTN stage-1 stack profile showed to be the dominant cost of every Duchon
+/// κ-trial at scale. One ladder per point replaces all of them: two seed
+/// evaluations plus the standard upward recurrence
+/// `K_{ν+1}(z) = K_{ν−1}(z) + (2ν/z)·K_ν(z)`, which is the numerically
+/// STABLE direction for `K` (it grows with ν). For integer orders this is
+/// arithmetic-identical to the old per-call `bessel_k_integer_order`, which
+/// ran the same seeds and recurrence internally; for half-integer orders the
+/// recurrence is exact and replaces the per-order closed-form sum.
+struct BesselKLadder {
+    /// `values[i] = K_{base + i}(z)` with `base ∈ {0, ½}`.
+    values: SmallVec<[f64; 16]>,
+    half_integer: bool,
 }
 
-#[inline(always)]
-fn duchon_matern_family_jet4(
+impl BesselKLadder {
+    fn build(z: f64, half_integer: bool, max_order_steps: usize) -> Self {
+        let zz = z.max(1e-300);
+        let mut values: SmallVec<[f64; 16]> = SmallVec::with_capacity(max_order_steps + 2);
+        if half_integer {
+            // K_{1/2}(z) = √(π/(2z))·e^{−z};  K_{3/2}(z) = K_{1/2}(z)·(1 + 1/z).
+            let k_half = (std::f64::consts::PI / (2.0 * zz)).sqrt() * (-zz).exp();
+            values.push(k_half);
+            values.push(k_half * (1.0 + 1.0 / zz));
+        } else {
+            values.push(bessel_k0_stable(zz));
+            values.push(bessel_k1_stable(zz));
+        }
+        let base = if half_integer { 0.5 } else { 0.0 };
+        for i in 1..max_order_steps {
+            let nu = base + i as f64;
+            let next = values[i - 1] + 2.0 * nu * values[i] / zz;
+            values.push(next);
+        }
+        Self {
+            values,
+            half_integer,
+        }
+    }
+
+    /// `K_{|order|}(z)` from the ladder (`K_{−ν} = K_ν`).
+    #[inline]
+    fn k_abs(&self, order_abs: f64) -> f64 {
+        let base = if self.half_integer { 0.5 } else { 0.0 };
+        let idx = (order_abs - base).round() as usize;
+        self.values[idx]
+    }
+}
+
+/// Radial-derivative jets of the Matérn family `coeff·r^μ·K_μ(κr)` up to
+/// order `max_j ≤ 4`, evaluated against a shared [`BesselKLadder`].
+///
+/// Exact recurrence derived from `d/dr[r^ν K_ν(κr)]` and the Bessel identity
+/// `dK_ν/dz = −K_{ν−1}(z) − (ν/z)K_ν(z)`:
+///
+///   g⁽⁰⁾ = c · r^ν · K_ν(z)
+///   g⁽¹⁾ = −c · κ · r^ν · K_{ν−1}(z)
+///   g⁽²⁾ = c·κ² r^ν K_{ν−2} − c·κ r^{ν−1} K_{ν−1}, ...
+///
+/// Same derivative lattice as the per-order reference implementation
+/// `duchon_matern_family_radial_derivative_reference` (kept in the test
+/// module as the equivalence oracle)
+/// (term-for-term, in the same order), but: (a) the lattice is expanded
+/// incrementally once instead of rebuilt from scratch per derivative order,
+/// (b) terms live in a fixed-capacity stack buffer instead of per-call heap
+/// `Vec`s (≤ 2^max_j ≤ 16 terms), and (c) every Bessel factor is an indexed
+/// ladder read instead of a fresh seed+recurrence evaluation. Only orders
+/// `0..=max_j` are computed — the q-family consumes order 0 only and the
+/// t-family orders ≤ 2, where the old path always expanded to order 4 and
+/// discarded the tail.
+fn duchon_matern_family_jets_with_ladder(
     r: f64,
     kappa: f64,
     coeff: f64,
     mu: f64,
-) -> Result<(f64, f64, f64, f64, f64), BasisError> {
-    if !r.is_finite() || r < 0.0 {
-        crate::bail_invalid_basis!("Duchon Matérn-family distance must be finite and non-negative");
+    max_j: usize,
+    ladder: &BesselKLadder,
+    out: &mut [f64],
+) -> Result<(), BasisError> {
+    if max_j > 4 || out.len() <= max_j {
+        crate::bail_invalid_basis!(
+            "Duchon Matérn-family ladder jets support derivative orders 0..=4 with an output slot per order"
+        );
     }
-    if !kappa.is_finite() || kappa <= 0.0 {
-        crate::bail_invalid_basis!("Duchon Matérn-family kappa must be finite and positive");
+    if r <= 0.0 {
+        out[..=max_j].fill(0.0);
+        if mu > 0.0 {
+            out[0] = coeff * 2.0_f64.powf(mu - 1.0) * gamma_lanczos(mu) * kappa.powf(-mu);
+        }
+        return Ok(());
     }
-    Ok((
-        duchon_matern_family_radial_derivative(r, kappa, coeff, mu, 0)?,
-        duchon_matern_family_radial_derivative(r, kappa, coeff, mu, 1)?,
-        duchon_matern_family_radial_derivative(r, kappa, coeff, mu, 2)?,
-        duchon_matern_family_radial_derivative(r, kappa, coeff, mu, 3)?,
-        duchon_matern_family_radial_derivative(r, kappa, coeff, mu, 4)?,
-    ))
+    let mut terms: SmallVec<[DuchonMaternDerivativeTerm; 16]> =
+        smallvec![DuchonMaternDerivativeTerm {
+            coeff,
+            kappa_power: 0,
+            r_power: mu,
+            bessel_order: mu,
+        }];
+    for (j, slot) in out.iter_mut().enumerate().take(max_j + 1) {
+        if j > 0 {
+            let mut next: SmallVec<[DuchonMaternDerivativeTerm; 16]> =
+                SmallVec::with_capacity(terms.len() * 2);
+            for term in &terms {
+                let stay_coeff = term.coeff * (term.r_power - term.bessel_order);
+                if stay_coeff != 0.0 {
+                    next.push(DuchonMaternDerivativeTerm {
+                        coeff: stay_coeff,
+                        kappa_power: term.kappa_power,
+                        r_power: term.r_power - 1.0,
+                        bessel_order: term.bessel_order,
+                    });
+                }
+                next.push(DuchonMaternDerivativeTerm {
+                    coeff: -term.coeff,
+                    kappa_power: term.kappa_power + 1,
+                    r_power: term.r_power,
+                    bessel_order: term.bessel_order - 1.0,
+                });
+            }
+            terms = next;
+        }
+        let mut value = KahanSum::default();
+        for term in &terms {
+            if term.coeff == 0.0 {
+                continue;
+            }
+            value.add(
+                term.coeff
+                    * kappa.powi(term.kappa_power as i32)
+                    * r.powf(term.r_power)
+                    * ladder.k_abs(term.bessel_order.abs()),
+            );
+        }
+        *slot = value.sum();
+    }
+    Ok(())
+}
+
+/// Maximum ladder steps (`K_base ..= K_{base+steps}`) needed by the q/t
+/// operator families of Matérn block `n` in dimension `k_dim`: the q-family
+/// reads `K_{|ν−1|}` and the t-family `K_{|ν−2−j|}` for `j ≤ 2`, ν = n − d/2.
+fn duchon_matern_block_max_ladder_steps(n_order: usize, k_dim: usize) -> usize {
+    let nu = n_order as f64 - 0.5 * k_dim as f64;
+    let candidates = [
+        (nu - 1.0).abs(),
+        (nu - 2.0).abs(),
+        (nu - 3.0).abs(),
+        (nu - 4.0).abs(),
+    ];
+    let max_abs = candidates.iter().copied().fold(0.0_f64, f64::max);
+    max_abs.floor() as usize + 1
+}
+
+fn duchon_matern_operator_block_jets_with_ladder(
+    r: f64,
+    kappa: f64,
+    n_order: usize,
+    k_dim: usize,
+    ladder: &BesselKLadder,
+) -> Result<(f64, f64, f64, f64), BasisError> {
+    if r <= 0.0 {
+        return Ok((0.0, 0.0, 0.0, 0.0));
+    }
+    let n = n_order as f64;
+    let k_half = 0.5 * k_dim as f64;
+    let nu = n - k_half;
+    let c = kappa.powf(k_half - n)
+        / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
+
+    let mut q_out = [0.0_f64; 1];
+    duchon_matern_family_jets_with_ladder(r, kappa, -c * kappa, nu - 1.0, 0, ladder, &mut q_out)?;
+    let mut t_out = [0.0_f64; 3];
+    duchon_matern_family_jets_with_ladder(
+        r,
+        kappa,
+        c * kappa * kappa,
+        nu - 2.0,
+        2,
+        ladder,
+        &mut t_out,
+    )?;
+    Ok((q_out[0], t_out[0], t_out[1], t_out[2]))
 }
 
 #[inline(always)]
@@ -13545,16 +13636,12 @@ fn duchon_matern_operator_block_jets(
     if r <= 0.0 {
         return Ok((0.0, 0.0, 0.0, 0.0));
     }
-
-    let n = n_order as f64;
-    let k_half = 0.5 * k_dim as f64;
-    let nu = n - k_half;
-    let c = kappa.powf(k_half - n)
-        / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
-
-    let (q, _, _, _, _) = duchon_matern_family_jet4(r, kappa, -c * kappa, nu - 1.0)?;
-    let (t, t_r, t_rr, _, _) = duchon_matern_family_jet4(r, kappa, c * kappa * kappa, nu - 2.0)?;
-    Ok((q, t, t_r, t_rr))
+    let ladder = BesselKLadder::build(
+        kappa * r,
+        !k_dim.is_multiple_of(2),
+        duchon_matern_block_max_ladder_steps(n_order, k_dim),
+    );
+    duchon_matern_operator_block_jets_with_ladder(r, kappa, n_order, k_dim, &ladder)
 }
 
 #[inline(always)]
@@ -17972,15 +18059,32 @@ fn duchon_regularized_operator_core(
         t_r_sum.add(coeff * t_r);
         t_rr_sum.add(coeff * t_rr);
     }
-    for (n, coeff) in coeffs.b.iter().enumerate().skip(1) {
-        if *coeff == 0.0 {
-            continue;
+    // One Bessel-K ladder at z = κ·r serves every Matérn block and every
+    // term of their derivative lattices (see [`BesselKLadder`]); the old
+    // per-term Bessel calls restarted the seed+recurrence hundreds of times
+    // per evaluation point.
+    let max_ladder_steps = coeffs
+        .b
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, coeff)| **coeff != 0.0)
+        .map(|(n, _)| duchon_matern_block_max_ladder_steps(n, k_dim))
+        .max();
+    if let Some(max_ladder_steps) = max_ladder_steps {
+        let ladder =
+            BesselKLadder::build(kappa * r_eval, !k_dim.is_multiple_of(2), max_ladder_steps);
+        for (n, coeff) in coeffs.b.iter().enumerate().skip(1) {
+            if *coeff == 0.0 {
+                continue;
+            }
+            let (q, t, t_r, t_rr) =
+                duchon_matern_operator_block_jets_with_ladder(r_eval, kappa, n, k_dim, &ladder)?;
+            q_sum.add(coeff * q);
+            t_sum.add(coeff * t);
+            t_r_sum.add(coeff * t_r);
+            t_rr_sum.add(coeff * t_rr);
         }
-        let (q, t, t_r, t_rr) = duchon_matern_operator_block_jets(r_eval, kappa, n, k_dim)?;
-        q_sum.add(coeff * q);
-        t_sum.add(coeff * t);
-        t_r_sum.add(coeff * t_r);
-        t_rr_sum.add(coeff * t_rr);
     }
     Ok(DuchonRegularizedOperatorCore {
         q: q_sum.sum(),
@@ -26310,6 +26414,98 @@ mod tests {
     use ndarray::{Array1, Array2, array};
     use num_dual::{DualNum, second_derivative};
     use std::sync::Arc;
+
+    /// Per-order reference for the Matérn-family radial derivatives — the
+    /// readable one-term-lattice-per-call form the shared-ladder production
+    /// path (`duchon_matern_family_jets_with_ladder`) replaced. Kept as the
+    /// equivalence oracle: identical lattice expansion, but every Bessel
+    /// factor is an independent fresh evaluation.
+    fn duchon_matern_family_radial_derivative_reference(
+        r: f64,
+        kappa: f64,
+        coeff: f64,
+        mu: f64,
+        derivative_order: usize,
+    ) -> Result<f64, BasisError> {
+        if r <= 0.0 && derivative_order == 0 && mu > 0.0 {
+            return Ok(coeff * 2.0_f64.powf(mu - 1.0) * gamma_lanczos(mu) * kappa.powf(-mu));
+        }
+        if r <= 0.0 {
+            return Ok(0.0);
+        }
+        let z = (kappa * r).max(1e-300);
+        let mut terms = vec![DuchonMaternDerivativeTerm {
+            coeff,
+            kappa_power: 0,
+            r_power: mu,
+            bessel_order: mu,
+        }];
+        for _ in 0..derivative_order {
+            let mut next_terms = Vec::with_capacity(terms.len() * 2);
+            for term in terms {
+                let stay_coeff = term.coeff * (term.r_power - term.bessel_order);
+                if stay_coeff != 0.0 {
+                    next_terms.push(DuchonMaternDerivativeTerm {
+                        coeff: stay_coeff,
+                        kappa_power: term.kappa_power,
+                        r_power: term.r_power - 1.0,
+                        bessel_order: term.bessel_order,
+                    });
+                }
+                next_terms.push(DuchonMaternDerivativeTerm {
+                    coeff: -term.coeff,
+                    kappa_power: term.kappa_power + 1,
+                    r_power: term.r_power,
+                    bessel_order: term.bessel_order - 1.0,
+                });
+            }
+            terms = next_terms;
+        }
+        let mut value = KahanSum::default();
+        for term in terms {
+            if term.coeff == 0.0 {
+                continue;
+            }
+            let k_term = bessel_k_real_half_integer_or_integer(term.bessel_order.abs(), z)?;
+            value
+                .add(term.coeff * kappa.powi(term.kappa_power as i32) * r.powf(term.r_power) * k_term);
+        }
+        Ok(value.sum())
+    }
+
+    #[test]
+    fn shared_ladder_matern_jets_match_per_order_reference() {
+        // Integer (even d) and half-integer (odd d) parity classes, across
+        // representative (r, κ, μ) values including large-|ν| orders.
+        for &half_integer in &[false, true] {
+            let base = if half_integer { 0.5 } else { 0.0 };
+            for &mu_steps in &[1.0_f64, -2.0, -6.5_f64.floor()] {
+                let mu = mu_steps + base - 1.0;
+                for &r in &[1e-4_f64, 0.03, 0.7, 2.5, 9.0] {
+                    for &kappa in &[0.2_f64, 1.0, 7.0] {
+                        let max_steps = (mu.abs() + 5.0).ceil() as usize + 1;
+                        let ladder = BesselKLadder::build(kappa * r, half_integer, max_steps);
+                        let mut out = [0.0_f64; 5];
+                        duchon_matern_family_jets_with_ladder(
+                            r, kappa, 1.37, mu, 4, &ladder, &mut out,
+                        )
+                        .expect("ladder jets");
+                        for (j, &ladder_value) in out.iter().enumerate() {
+                            let reference = duchon_matern_family_radial_derivative_reference(
+                                r, kappa, 1.37, mu, j,
+                            )
+                            .expect("reference jets");
+                            let scale = reference.abs().max(ladder_value.abs()).max(1e-280);
+                            assert!(
+                                (ladder_value - reference).abs() <= 1e-11 * scale,
+                                "ladder vs reference mismatch: half_int={half_integer} mu={mu} r={r} kappa={kappa} j={j}: {ladder_value:e} vs {reference:e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Test helper that aborts the run with an "expected Duchon metadata"
     /// message. Defined once so the test bodies do not have to spell out
