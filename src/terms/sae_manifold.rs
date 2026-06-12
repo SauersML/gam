@@ -13301,8 +13301,9 @@ impl SaeManifoldOuterObjective {
     ///    `η = 1` solution; the report is recorded and the call returns
     ///    `Ok(true)`.
     ///
-    /// The walk runs at the seed's entry ρ (`baseline_rho`), orthogonal to the
-    /// ρ-anneal; the outer engine still moves ρ afterward from this warm state.
+    /// The direct helper walks at the construction entry ρ (`baseline_rho`);
+    /// the outer seed loop uses `run_curvature_homotopy_entry_at_rho` so every
+    /// generated candidate gets its own entry solve before the ρ-anneal.
     pub fn run_curvature_homotopy_entry(&mut self) -> Result<bool, String> {
         let rho = self.baseline_rho.clone();
         self.run_curvature_homotopy_entry_at_rho(&rho)
@@ -13819,8 +13820,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
     /// The SAE-manifold objective has a certified anchor (#1007): its `η = 0`
     /// Eckart-Young linear relaxation is convex with a global optimum certified
     /// by [`linear_span_anchor`]. Run the predictor-corrector `η`-walk from that
-    /// anchor in place of blind multistart. On arrival the inner state is warm
-    /// at the certified `η = 1` solution and the seed cascade is bypassed; on a
+    /// anchor before blind multistart. On arrival the inner state is warm
+    /// at the certified `η = 1` solution for the active seed; on a
     /// degenerate anchor or a detected bifurcation the term is left at the full
     /// basis (`η = 1`) and the documented cascade takes over — the outcome is
     /// recorded on the fit payload either way.
