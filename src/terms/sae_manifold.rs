@@ -13151,11 +13151,23 @@ impl SaeManifoldOuterObjective {
             total_correctors += 1;
 
             // Pivot invariant: min pivot ≥ √eps · max(diag_scale, 1), the same
-            // safe-SPD floor the inner solver uses.
+            // safe-SPD floor the inner solver uses — measured ON THE GAUGE
+            // QUOTIENT. A closed-form gauge null (affine chart freedom, circle
+            // rotation) is constant along the entire η-walk, so it can never
+            // signal a branch bifurcation; only a NON-gauge pivot collapse can.
+            // Without this discrimination the walk dies at η≈0 on any fixture
+            // whose ambient dimension is small enough for the gauge directions
+            // to dominate (every p=2 atlas tile), and the fit pays for the full
+            // seed cascade instead. `outer_gradient_arrow_solver` succeeds iff
+            // the sub-floor pivots are explained by the closed-form gauge span
+            // (the same Faddeev-Popov deflation the gradient lane uses) and
+            // errs honestly otherwise, which is exactly the verdict needed.
             let pivot = arrow_factor_min_pivot(&cache).min_pivot.unwrap_or(0.0);
             let diag_scale = arrow_factor_max_pivot(&cache).unwrap_or(1.0);
             let floor = f64::EPSILON.sqrt() * diag_scale.max(1.0);
-            if !(pivot.is_finite() && pivot >= floor) {
+            let pivot_deficit_is_gauge = !(pivot.is_finite() && pivot >= floor)
+                && self.term.outer_gradient_arrow_solver(&cache).is_ok();
+            if !(pivot.is_finite() && pivot >= floor) && !pivot_deficit_is_gauge {
                 if eta_step > CURVATURE_WALK_MIN_ETA_STEP {
                     eta_step *= 0.5;
                     step_halvings += 1;
@@ -15084,7 +15096,6 @@ mod tests {
     use crate::linalg::faer_ndarray::fast_ata;
 
     use super::*;
-    use crate::linalg::faer_ndarray::fast_ata;
     use crate::solver::arrow_schur::{
         ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics,
     };
