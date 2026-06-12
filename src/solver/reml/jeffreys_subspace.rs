@@ -1347,7 +1347,13 @@ where
     }
     let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
     // Ḋ = Z_Jᵀ (∂H_joint) Z_J, the reduced perturbation of the reduced information.
-    let dbar = z_j.t().dot(&pert_h.dot(&z_j)); // m x m
+    let dbar_raw = z_j.t().dot(&pert_h.dot(&z_j)); // m x m
+    let mut dbar = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        for j in 0..m {
+            dbar[[i, j]] = 0.5 * (dbar_raw[[i, j]] + dbar_raw[[j, i]]);
+        }
+    }
 
     // EXACT DERIVATIVE OF THE DIVIDED-DIFFERENCE CURVATURE (value↔drift
     // consistency, gam#979). The value path builds
@@ -1450,7 +1456,13 @@ where
                 hdot_a.ncols()
             ));
         }
-        let d_a = z_j.t().dot(&hdot_a.dot(&z_j)); // Z_Jᵀ ∂_a H Z_J
+        let d_a_raw = z_j.t().dot(&hdot_a.dot(&z_j)); // Z_Jᵀ ∂_a H Z_J
+        let mut d_a = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                d_a[[i, j]] = 0.5 * (d_a_raw[[i, j]] + d_a_raw[[j, i]]);
+            }
+        }
         let a_a = evecs.t().dot(&d_a).dot(&evecs); // Ṽ_a
 
         let pert_hdot_a = match pert_hessian_dir(&axis)? {
@@ -1464,7 +1476,13 @@ where
                 pert_hdot_a.ncols()
             ));
         }
-        let d_a_pert = z_j.t().dot(&pert_hdot_a.dot(&z_j)); // Z_Jᵀ (∂Hdot[e_a]) Z_J
+        let d_a_pert_raw = z_j.t().dot(&pert_hdot_a.dot(&z_j)); // Z_Jᵀ (∂Hdot[e_a]) Z_J
+        let mut d_a_pert = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                d_a_pert[[i, j]] = 0.5 * (d_a_pert_raw[[i, j]] + d_a_pert_raw[[j, i]]);
+            }
+        }
 
         // δṼ_a = Vᵀ (∂D_a) V + Ṽ_a C − C Ṽ_a.
         let da_a = evecs.t().dot(&d_a_pert).dot(&evecs) + &a_a.dot(&rotation) - &rotation.dot(&a_a);

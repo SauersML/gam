@@ -3629,7 +3629,8 @@ pub fn non_affine_ladder_cert_histogram() -> (Vec<(usize, u64)>, u64) {
         .enumerate()
         .map(|(i, &n)| (n, NON_AFFINE_LADDER_CERT_COUNTS[i].load(Ordering::Relaxed)))
         .collect();
-    let terminal = NON_AFFINE_LADDER_CERT_COUNTS[NON_AFFINE_LADDER_RUNGS.len()].load(Ordering::Relaxed);
+    let terminal =
+        NON_AFFINE_LADDER_CERT_COUNTS[NON_AFFINE_LADDER_RUNGS.len()].load(Ordering::Relaxed);
     (per_rung, terminal)
 }
 

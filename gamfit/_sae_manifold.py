@@ -817,18 +817,66 @@ class ManifoldSAE:
     def predict(self, X: Any) -> np.ndarray:
         return self.reconstruct(X)
 
-    def encode(self, X: Any, *, t_init: Any = None, a_init: Any = None) -> np.ndarray:
+    def distill_encoder(self, X: Any, **kwargs: Any) -> Any:
+        """Train a post-hoc torch MLP encoder from exact OOS latent solves."""
+        from .distill import distill_encoder
+
+        return distill_encoder(self, X, **kwargs)
+
+    def encode(
+        self,
+        X: Any,
+        *,
+        t_init: Any = None,
+        a_init: Any = None,
+        encoder: Any = None,
+        return_stats: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, dict[str, Any]]:
         """Out-of-sample per-token assignments ``a*`` of shape ``(N, K)``.
 
         Runs the frozen-decoder OOS solve on ``X`` and returns the converged
         assignment matrix. On training ``X`` (matched bit-exactly) the cached
         fit assignments are returned without re-solving. ``t_init`` / ``a_init``
-        warm-start the refinement (#357)."""
+        warm-start the refinement (#357).
+
+        Passing ``encoder=fit.distill_encoder(...)`` runs the distilled encoder
+        first, accepts only rows matching the exact warm-started solve within the
+        encoder's calibrated gate, and reports rowwise fallback accounting when
+        ``return_stats=True``. The exact solve remains the teacher and fallback;
+        the encoder never defines the feature map.
+        """
         x = _as_2d_float(X, "X")
+        if encoder is not None:
+            if t_init is not None or a_init is not None:
+                raise ValueError("encode(..., encoder=...) cannot also take t_init or a_init")
+            from .distill import encode_with_fallback
+
+            encoded, stats = encode_with_fallback(self, x, encoder)
+            if return_stats:
+                return encoded, stats.to_dict()
+            return encoded
         if t_init is None and a_init is None and x.shape == self.training_data.shape and np.allclose(x, self.training_data):
-            return self.assignments.copy()
+            encoded = self.assignments.copy()
+            if return_stats:
+                return encoded, {
+                    "rows": int(encoded.shape[0]),
+                    "accepted_rows": 0,
+                    "fallback_rows": 0,
+                    "fallback_rate": 0.0,
+                    "exact_probe_rows": 0,
+                }
+            return encoded
         payload = self._oos_payload(x, t_init=t_init, a_init=a_init)
-        return np.asarray(payload["assignments_z"], dtype=float)
+        encoded = np.asarray(payload["assignments_z"], dtype=float)
+        if return_stats:
+            return encoded, {
+                "rows": int(encoded.shape[0]),
+                "accepted_rows": 0,
+                "fallback_rows": int(encoded.shape[0]),
+                "fallback_rate": 1.0,
+                "exact_probe_rows": int(encoded.shape[0]),
+            }
+        return encoded
 
     def converged_latents(self, X: Any | None = None, *, t_init: Any = None, a_init: Any = None) -> dict[str, Any]:
         """Converged supervision targets for an amortized encoder (#357).

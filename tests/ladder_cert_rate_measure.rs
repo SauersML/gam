@@ -12,7 +12,9 @@
 mod margslope_flex_equivalence;
 
 use gam::families::cubic_cell_kernel::non_affine_ladder_cert_histogram;
-use margslope_flex_equivalence::{build_large_scale_shape_problem, cycle_capped_options, fit_problem};
+use margslope_flex_equivalence::{
+    build_large_scale_shape_problem, cycle_capped_options, fit_problem,
+};
 
 #[test]
 fn report_non_affine_ladder_cert_distribution_on_flex_path() {

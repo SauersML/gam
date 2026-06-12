@@ -305,6 +305,7 @@ from ._sae_benchmark import (
     run_benchmark as sae_benchmark,
     sweep as sweep_sae_benchmark,
 )
+from .distill import DistilledEncoder, EncoderFallbackStats
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
 from ._validation import FormulaValidation

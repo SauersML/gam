@@ -29,7 +29,9 @@
 //! splitmix64 + Box–Muller stream, so the same fit yields the same `k̂` every
 //! run.
 
+use crate::estimate::EstimationError;
 use crate::inference::psis::pareto_smooth_weights;
+use crate::solver::outer_strategy::OuterObjective;
 use ndarray::{Array1, Array2};
 
 /// Reliability tier read off the Pareto tail-shape `k̂` of the `ρ`-importance
@@ -76,6 +78,30 @@ pub struct RhoPosteriorCertificate {
     /// Kish effective sample size `(Σw)² / Σw²` — how many of the `M` draws are
     /// "really" contributing after importance weighting.
     pub effective_sample_size: f64,
+}
+
+/// One deterministic Tier-1 quadrature node for `π(ρ|y)`.
+#[derive(Debug, Clone)]
+pub struct RhoQuadratureNode {
+    /// Smoothing parameters at this node.
+    pub rho: Array1<f64>,
+    /// Normalized node probability after reweighting the Gaussian proposal by the
+    /// exact profiled criterion.
+    pub weight: f64,
+    /// Normalized log node probability.
+    pub log_weight: f64,
+    /// Exact profiled criterion value at the node.
+    pub cost: f64,
+    /// Exact profiled outer gradient at the node.
+    pub gradient: Array1<f64>,
+}
+
+/// Tier-1 higher-order Laplace/quadrature approximation to `π(ρ|y)`.
+#[derive(Debug, Clone)]
+pub struct RhoQuadratureMixture {
+    pub nodes: Vec<RhoQuadratureNode>,
+    pub effective_sample_size: f64,
+    pub max_gradient_norm: f64,
 }
 
 const DEFAULT_M: usize = 64;
@@ -176,6 +202,194 @@ fn whitening_factor_from_outer_hessian(outer_hessian: &Array2<f64>) -> Option<Ar
         }
     }
     Some(l_inv)
+}
+
+fn symmetrize_in_place(a: &mut Array2<f64>) {
+    let n = a.nrows();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let v = 0.5 * (a[[i, j]] + a[[j, i]]);
+            a[[i, j]] = v;
+            a[[j, i]] = v;
+        }
+    }
+}
+
+/// Estimate the local outer Hessian by central differencing the profiled-exact
+/// `OuterObjective::eval` gradient.
+///
+/// This is for objectives such as the SAE REML surface that expose exact
+/// gradients but not a dense Hessian. The criterion values are never
+/// finite-differenced; only the exact profiled gradient is sampled.
+pub fn rho_hessian_from_profiled_exact_gradient(
+    objective: &mut dyn OuterObjective,
+    rho_hat: &Array1<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    let k = rho_hat.len();
+    let mut hessian = Array2::<f64>::zeros((k, k));
+    if k == 0 {
+        return Ok(hessian);
+    }
+    let base_step = 1.0e-4;
+    for j in 0..k {
+        let step = base_step * rho_hat[j].abs().max(1.0);
+        let mut plus = rho_hat.clone();
+        let mut minus = rho_hat.clone();
+        plus[j] += step;
+        minus[j] -= step;
+        let gp = objective.eval(&plus)?.gradient;
+        let gm = objective.eval(&minus)?.gradient;
+        if gp.len() != k || gm.len() != k {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "rho_hessian_from_profiled_exact_gradient: gradient length mismatch: expected {k}, got {} and {}",
+                gp.len(),
+                gm.len()
+            )));
+        }
+        for i in 0..k {
+            hessian[[i, j]] = (gp[i] - gm[i]) / (2.0 * step);
+        }
+    }
+    symmetrize_in_place(&mut hessian);
+    Ok(hessian)
+}
+
+fn standard_normal_gh_rule(nodes_per_axis: usize) -> Option<&'static [(f64, f64)]> {
+    match nodes_per_axis {
+        3 => Some(&[
+            (-1.732_050_807_568_877_2, 1.0 / 6.0),
+            (0.0, 2.0 / 3.0),
+            (1.732_050_807_568_877_2, 1.0 / 6.0),
+        ]),
+        _ => None,
+    }
+}
+
+fn enumerate_gh_product(
+    dim: usize,
+    rule: &[(f64, f64)],
+    axis: usize,
+    z: &mut Array1<f64>,
+    log_w: f64,
+    out: &mut Vec<(Array1<f64>, f64)>,
+) {
+    if axis == dim {
+        out.push((z.clone(), log_w));
+        return;
+    }
+    for &(node, weight) in rule {
+        z[axis] = node;
+        enumerate_gh_product(dim, rule, axis + 1, z, log_w + weight.ln(), out);
+    }
+}
+
+/// Tier-1 deterministic higher-order Laplace quadrature over `ρ`.
+///
+/// The input Hessian defines the local Gaussian proposal around `rho_hat`; each
+/// Gauss-Hermite node is reweighted by the exact profiled criterion,
+/// `exp(-V(ρ_node) + V(ρ_hat) + 0.5 ||z||²)`, and stores the exact profiled
+/// gradient from `OuterObjective::eval`.
+pub fn rho_posterior_tier1_quadrature(
+    objective: &mut dyn OuterObjective,
+    rho_hat: &Array1<f64>,
+    outer_hessian: &Array2<f64>,
+    nodes_per_axis: usize,
+) -> Result<RhoQuadratureMixture, EstimationError> {
+    let k = rho_hat.len();
+    if k == 0 || outer_hessian.nrows() != k || outer_hessian.ncols() != k {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "rho_posterior_tier1_quadrature: rho/Hessian shape mismatch".to_string(),
+        ));
+    }
+    if k > 4 {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "rho_posterior_tier1_quadrature: product quadrature is capped at K<=4, got {k}"
+        )));
+    }
+    let rule = standard_normal_gh_rule(nodes_per_axis).ok_or_else(|| {
+        EstimationError::RemlOptimizationFailed(format!(
+            "rho_posterior_tier1_quadrature: unsupported nodes_per_axis {nodes_per_axis}"
+        ))
+    })?;
+    let l_inv = whitening_factor_from_outer_hessian(outer_hessian).ok_or_else(|| {
+        EstimationError::RemlOptimizationFailed(
+            "rho_posterior_tier1_quadrature: outer Hessian is not positive definite".to_string(),
+        )
+    })?;
+    let cost_hat = objective.eval_cost(rho_hat)?;
+    if !cost_hat.is_finite() {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "rho_posterior_tier1_quadrature: non-finite criterion at rho_hat".to_string(),
+        ));
+    }
+
+    let mut product_nodes = Vec::new();
+    enumerate_gh_product(
+        k,
+        rule,
+        0,
+        &mut Array1::<f64>::zeros(k),
+        0.0,
+        &mut product_nodes,
+    );
+    let mut raw_nodes = Vec::with_capacity(product_nodes.len());
+    let mut max_log_weight = f64::NEG_INFINITY;
+    for (z, log_base_weight) in product_nodes {
+        let mut rho = rho_hat.clone();
+        for i in 0..k {
+            let mut acc = 0.0;
+            for j in 0..k {
+                acc += l_inv[[i, j]] * z[j];
+            }
+            rho[i] += acc;
+        }
+        let eval = objective.eval(&rho)?;
+        let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
+        let log_weight = log_base_weight - eval.cost + cost_hat + half_norm_sq;
+        if log_weight.is_finite() {
+            max_log_weight = max_log_weight.max(log_weight);
+        }
+        raw_nodes.push((rho, eval.cost, eval.gradient, log_weight));
+    }
+    if !max_log_weight.is_finite() {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "rho_posterior_tier1_quadrature: all quadrature nodes were non-finite".to_string(),
+        ));
+    }
+    let mut total = 0.0;
+    let mut scaled = Vec::with_capacity(raw_nodes.len());
+    for (_, _, _, log_weight) in &raw_nodes {
+        let w = (*log_weight - max_log_weight).exp();
+        total += w;
+        scaled.push(w);
+    }
+    if !(total.is_finite() && total > 0.0) {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "rho_posterior_tier1_quadrature: non-positive normalized mass".to_string(),
+        ));
+    }
+
+    let mut nodes = Vec::with_capacity(raw_nodes.len());
+    let mut sum_sq = 0.0;
+    let mut max_gradient_norm = 0.0_f64;
+    for ((rho, cost, gradient, log_weight), scaled_weight) in raw_nodes.into_iter().zip(scaled) {
+        let weight = scaled_weight / total;
+        sum_sq += weight * weight;
+        let grad_norm = gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+        max_gradient_norm = max_gradient_norm.max(grad_norm);
+        nodes.push(RhoQuadratureNode {
+            rho,
+            weight,
+            log_weight: log_weight - max_log_weight - total.ln(),
+            cost,
+            gradient,
+        });
+    }
+    Ok(RhoQuadratureMixture {
+        nodes,
+        effective_sample_size: if sum_sq > 0.0 { 1.0 / sum_sq } else { 0.0 },
+        max_gradient_norm,
+    })
 }
 
 /// Compute the Tier-0 PSIS `ρ`-certificate.

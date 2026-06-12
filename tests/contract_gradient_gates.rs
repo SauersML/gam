@@ -1,0 +1,584 @@
+use std::sync::{Arc, RwLock};
+
+use gam::custom_family::{BlockWorkingSet, CustomFamily, ParameterBlockSpec, ParameterBlockState};
+use gam::estimate::{
+    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
+};
+use gam::families::gamlss::GaussianLocationScaleFamily;
+use gam::matrix::DesignMatrix;
+use gam::resource::ResourcePolicy;
+use gam::smooth::BlockwisePenalty;
+use gam::terms::sae_manifold::EuclideanPatchEvaluator;
+use gam::terms::{
+    AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
+    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use ndarray::{Array1, Array2, array};
+
+const FD_STEP: f64 = 1.0e-6;
+const OUTER_FD_STEP: f64 = 1.0e-5;
+const REL_TOL: f64 = 1.0e-5;
+const REL_FLOOR: f64 = 1.0e-8;
+
+struct GradientChannel {
+    name: &'static str,
+    analytic: Vec<f64>,
+    fd: Vec<f64>,
+}
+
+struct ContractRow {
+    name: &'static str,
+    run: fn() -> Vec<GradientChannel>,
+}
+
+fn assert_channel(row: &str, channel: &GradientChannel) {
+    assert_eq!(
+        channel.analytic.len(),
+        channel.fd.len(),
+        "{row}/{} length mismatch",
+        channel.name
+    );
+    for idx in 0..channel.analytic.len() {
+        let analytic = channel.analytic[idx];
+        let fd = channel.fd[idx];
+        assert!(
+            analytic.is_finite() && fd.is_finite(),
+            "{row}/{}[{idx}] non-finite: analytic={analytic:.12e} fd={fd:.12e}",
+            channel.name
+        );
+        let rel = (analytic - fd).abs() / analytic.abs().max(fd.abs()).max(REL_FLOOR);
+        assert!(
+            rel < REL_TOL,
+            "{row}/{}[{idx}] gradient is not the differential of the value: \
+             analytic={analytic:.12e} fd={fd:.12e} rel={rel:.3e}",
+            channel.name
+        );
+    }
+}
+
+#[test]
+fn gradient_is_differential_contract_gate() {
+    let rows = [
+        ContractRow {
+            name: "sae/euclidean-line",
+            run: sae_euclidean_line_row,
+        },
+        ContractRow {
+            name: "sae/k2-periodic-overlap",
+            run: sae_k2_periodic_overlap_row,
+        },
+        ContractRow {
+            name: "glm-reml/duchon-901-rank-deficient",
+            run: glm_reml_outer_row,
+        },
+        ContractRow {
+            name: "gamlss/gaussian-dispersion",
+            run: gamlss_gaussian_dispersion_row,
+        },
+    ];
+
+    for row in rows {
+        let channels = (row.run)();
+        assert!(
+            !channels.is_empty(),
+            "{} must report at least one gradient channel",
+            row.name
+        );
+        for channel in channels {
+            assert_channel(row.name, &channel);
+        }
+    }
+}
+
+fn warm_sae(term: &mut SaeManifoldTerm, z: &Array2<f64>, rho: &mut SaeManifoldRho) {
+    for step in 0..4 {
+        let loss = term
+            .run_joint_fit_arrow_schur(z.view(), rho, None, 1, 1.0, 1.0e-6, 1.0e-6)
+            .unwrap_or_else(|err| panic!("SAE warm step {step} failed: {err}"));
+        assert!(
+            loss.total().is_finite(),
+            "SAE warm step {step} returned non-finite loss"
+        );
+    }
+}
+
+fn sae_value(term: &SaeManifoldTerm, z: &Array2<f64>, rho: &SaeManifoldRho) -> f64 {
+    term.penalized_objective_total(z.view(), rho, None, 1.0)
+        .expect("SAE penalized objective")
+}
+
+fn set_coord(term: &mut SaeManifoldTerm, atom: usize, row: usize, axis: usize, value: f64) {
+    let mut coords = term.assignment.coords[atom].as_matrix();
+    coords[[row, axis]] = value;
+    term.assignment.coords[atom].set_flat(Array1::from_iter(coords.iter().copied()).view());
+    term.atoms[atom]
+        .refresh_basis(coords.view())
+        .expect("refresh perturbed SAE coordinates");
+}
+
+fn sae_euclidean_line_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    let n = 72usize;
+    let p = 6usize;
+    let mut coords = Array2::<f64>::zeros((n, 1));
+    let mut z = Array2::<f64>::zeros((n, p));
+    for row in 0..n {
+        let u = -1.0 + 2.0 * row as f64 / (n as f64 - 1.0);
+        coords[[row, 0]] = 2.5 + 3.0 * u;
+        for col in 0..p {
+            let phase = (row * (col + 3)) as f64;
+            z[[row, col]] = 0.08 * ((col % 3) as f64 - 1.0)
+                + (0.35 + 0.07 * col as f64) * u
+                + 0.04 * (phase.sin() + 0.5 * (0.37 * phase).cos());
+        }
+    }
+
+    let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2).expect("evaluator"));
+    let (phi, jet) = evaluator.evaluate(coords.view()).expect("basis");
+    let m = phi.ncols();
+    let smooth_penalty =
+        gam::basis::create_difference_penalty_matrix(m, 2, None).expect("roughness penalty");
+    let atom = SaeManifoldAtom::new(
+        "contract-line",
+        SaeAtomBasisKind::EuclideanPatch,
+        1,
+        phi,
+        jet,
+        Array2::<f64>::zeros((m, p)),
+        smooth_penalty,
+    )
+    .expect("atom")
+    .with_basis_second_jet(evaluator);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![LatentManifold::Euclidean],
+        AssignmentMode::softmax(1.0),
+    )
+    .expect("assignment");
+    let term = SaeManifoldTerm::new(vec![atom], assignment).expect("term");
+    let rho = SaeManifoldRho::new(0.0, (0.01_f64).ln(), vec![Array1::<f64>::zeros(1)]);
+    (term, z, rho)
+}
+
+fn sae_euclidean_line_row() -> Vec<GradientChannel> {
+    let (mut term, z, mut rho) = sae_euclidean_line_fixture();
+    warm_sae(&mut term, &z, &mut rho);
+    let sys = term
+        .assemble_arrow_schur(z.view(), &rho, None)
+        .expect("SAE line assemble");
+    assert_eq!(
+        sys.k,
+        term.beta_dim(),
+        "line row must stay in full beta coordinates"
+    );
+
+    let coord_probes = [3usize, 35, 68];
+    let mut coord_an = Vec::new();
+    let mut coord_fd = Vec::new();
+    for row in coord_probes {
+        let base = term.assignment.coords[0].as_matrix()[[row, 0]];
+        coord_an.push(sys.rows[row].gt[0]);
+        let mut plus = term.clone();
+        set_coord(&mut plus, 0, row, 0, base + FD_STEP);
+        let mut minus = term.clone();
+        set_coord(&mut minus, 0, row, 0, base - FD_STEP);
+        coord_fd.push((sae_value(&plus, &z, &rho) - sae_value(&minus, &z, &rho)) / (2.0 * FD_STEP));
+    }
+
+    let decoder_probes = [(0usize, 0usize), (1, 2), (2, 5)];
+    let mut decoder_an = Vec::new();
+    let mut decoder_fd = Vec::new();
+    let p = term.output_dim();
+    for (basis_col, out_col) in decoder_probes {
+        let beta_idx = basis_col * p + out_col;
+        let base = term.atoms[0].decoder_coefficients[[basis_col, out_col]];
+        decoder_an.push(sys.gb[beta_idx]);
+        let mut plus = term.clone();
+        plus.atoms[0].decoder_coefficients[[basis_col, out_col]] = base + FD_STEP;
+        let mut minus = term.clone();
+        minus.atoms[0].decoder_coefficients[[basis_col, out_col]] = base - FD_STEP;
+        decoder_fd
+            .push((sae_value(&plus, &z, &rho) - sae_value(&minus, &z, &rho)) / (2.0 * FD_STEP));
+    }
+
+    vec![
+        GradientChannel {
+            name: "coords",
+            analytic: coord_an,
+            fd: coord_fd,
+        },
+        GradientChannel {
+            name: "decoder",
+            analytic: decoder_an,
+            fd: decoder_fd,
+        },
+    ]
+}
+
+fn softmax2(logit0: f64, logit1: f64, temperature: f64) -> [f64; 2] {
+    let m = logit0.max(logit1);
+    let e0 = ((logit0 - m) / temperature).exp();
+    let e1 = ((logit1 - m) / temperature).exp();
+    let denom = e0 + e1;
+    [e0 / denom, e1 / denom]
+}
+
+fn sae_k2_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    let n = 36usize;
+    let p = 3usize;
+    let m = 3usize;
+    let temperature = 0.9;
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).expect("periodic evaluator"));
+    let weights = [
+        [
+            [0.10, -0.05, 0.03],
+            [0.35, -0.20, 0.12],
+            [-0.16, 0.18, 0.08],
+        ],
+        [
+            [-0.08, 0.04, 0.06],
+            [0.22, 0.10, -0.18],
+            [0.11, -0.24, 0.15],
+        ],
+    ];
+    let mut logits = Array2::<f64>::zeros((n, 2));
+    let mut coords = vec![Array2::<f64>::zeros((n, 1)), Array2::<f64>::zeros((n, 1))];
+    let mut target = Array2::<f64>::zeros((n, p));
+    for row in 0..n {
+        let phase = (row as f64 + 0.35) / n as f64;
+        coords[0][[row, 0]] = phase;
+        coords[1][[row, 0]] = (phase + 0.21).fract();
+        logits[[row, 0]] = if row % 2 == 0 { 0.8 } else { -0.6 };
+        let assignments = softmax2(logits[[row, 0]], logits[[row, 1]], temperature);
+        for atom in 0..2 {
+            let theta = std::f64::consts::TAU * coords[atom][[row, 0]];
+            let basis = [1.0, theta.sin(), theta.cos()];
+            for out_col in 0..p {
+                for basis_col in 0..m {
+                    target[[row, out_col]] +=
+                        assignments[atom] * basis[basis_col] * weights[atom][basis_col][out_col];
+                }
+            }
+        }
+    }
+
+    let mut atoms = Vec::new();
+    for atom_idx in 0..2 {
+        let (phi, jet) = evaluator
+            .evaluate(coords[atom_idx].view())
+            .expect("periodic basis");
+        let decoder = Array2::from_shape_fn((m, p), |(basis_col, out_col)| {
+            weights[atom_idx][basis_col][out_col]
+        });
+        atoms.push(
+            SaeManifoldAtom::new(
+                format!("k2_{atom_idx}"),
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi,
+                jet,
+                decoder,
+                Array2::<f64>::eye(m),
+            )
+            .expect("periodic atom")
+            .with_basis_second_jet(evaluator.clone()),
+        );
+    }
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        coords,
+        vec![LatentManifold::Circle { period: 1.0 }; 2],
+        AssignmentMode::softmax(temperature),
+    )
+    .expect("K2 assignment");
+    let term = SaeManifoldTerm::new(atoms, assignment).expect("K2 term");
+    let rho = SaeManifoldRho::new(-6.0, -6.0, vec![array![-6.0], array![-6.0]]);
+    (term, target, rho)
+}
+
+fn sae_k2_periodic_overlap_row() -> Vec<GradientChannel> {
+    let (mut term, z, mut rho) = sae_k2_fixture();
+    warm_sae(&mut term, &z, &mut rho);
+    let sys = term
+        .assemble_arrow_schur(z.view(), &rho, None)
+        .expect("SAE K2 assemble");
+
+    let mut logit_an = Vec::new();
+    let mut logit_fd = Vec::new();
+    for row in [0usize, 11, 28] {
+        logit_an.push(sys.rows[row].gt[0]);
+        let mut plus = term.clone();
+        plus.assignment.logits[[row, 0]] += FD_STEP;
+        let mut minus = term.clone();
+        minus.assignment.logits[[row, 0]] -= FD_STEP;
+        logit_fd.push((sae_value(&plus, &z, &rho) - sae_value(&minus, &z, &rho)) / (2.0 * FD_STEP));
+    }
+
+    let mut coord_an = Vec::new();
+    let mut coord_fd = Vec::new();
+    for (row, atom, local_pos) in [(4usize, 0usize, 1usize), (17, 1, 2), (31, 0, 1)] {
+        let base = term.assignment.coords[atom].as_matrix()[[row, 0]];
+        coord_an.push(sys.rows[row].gt[local_pos]);
+        let mut plus = term.clone();
+        set_coord(&mut plus, atom, row, 0, base + FD_STEP);
+        let mut minus = term.clone();
+        set_coord(&mut minus, atom, row, 0, base - FD_STEP);
+        coord_fd.push((sae_value(&plus, &z, &rho) - sae_value(&minus, &z, &rho)) / (2.0 * FD_STEP));
+    }
+
+    let mut decoder_an = Vec::new();
+    let mut decoder_fd = Vec::new();
+    let p = term.output_dim();
+    let per_atom_beta = term.atoms[0].decoder_coefficients.len();
+    for (atom, basis_col, out_col) in [(0usize, 1usize, 1usize), (1, 2, 2), (1, 0, 0)] {
+        let beta_idx = atom * per_atom_beta + basis_col * p + out_col;
+        let base = term.atoms[atom].decoder_coefficients[[basis_col, out_col]];
+        decoder_an.push(sys.gb[beta_idx]);
+        let mut plus = term.clone();
+        plus.atoms[atom].decoder_coefficients[[basis_col, out_col]] = base + FD_STEP;
+        let mut minus = term.clone();
+        minus.atoms[atom].decoder_coefficients[[basis_col, out_col]] = base - FD_STEP;
+        decoder_fd
+            .push((sae_value(&plus, &z, &rho) - sae_value(&minus, &z, &rho)) / (2.0 * FD_STEP));
+    }
+
+    vec![
+        GradientChannel {
+            name: "logits",
+            analytic: logit_an,
+            fd: logit_fd,
+        },
+        GradientChannel {
+            name: "coords",
+            analytic: coord_an,
+            fd: coord_fd,
+        },
+        GradientChannel {
+            name: "decoder",
+            analytic: decoder_an,
+            fd: decoder_fd,
+        },
+    ]
+}
+
+fn second_difference_penalty(k: usize) -> Array2<f64> {
+    let mut d = Array2::<f64>::zeros((k - 2, k));
+    for i in 0..(k - 2) {
+        d[[i, i]] = 1.0;
+        d[[i, i + 1]] = -2.0;
+        d[[i, i + 2]] = 1.0;
+    }
+    d.t().dot(&d)
+}
+
+fn glm_reml_outer_row() -> Vec<GradientChannel> {
+    let n = 96usize;
+    let k = 6usize;
+    let p = 1 + 2 * k;
+    let mut x = Array2::<f64>::zeros((n, p));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        x[[i, 0]] = 1.0;
+        let z = -1.0 + 2.0 * i as f64 / (n as f64 - 1.0);
+        let mut acc = 1.0;
+        for j in 0..k {
+            acc *= z;
+            x[[i, 1 + j]] = acc;
+            x[[i, 1 + k + j]] = acc + 1.0e-3 * ((i + j) as f64).sin();
+        }
+        y[i] = 0.4 + (std::f64::consts::PI * z).sin() + 0.05 * (7.0 * z).cos();
+    }
+    let weights = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let penalties = vec![
+        BlockwisePenalty::new(1..(1 + k), second_difference_penalty(k)),
+        BlockwisePenalty::new((1 + k)..p, second_difference_penalty(k)),
+    ];
+    let opts = ExternalOptimOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ),
+        compute_inference: true,
+        max_iter: 300,
+        tol: 1.0e-12,
+        nullspace_dims: vec![2, 2],
+        linear_constraints: None,
+        firth_bias_reduction: None,
+        penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    };
+    let rho = array![0.15, 0.1501];
+    let analytic = evaluate_externalgradient(
+        y.view(),
+        weights.view(),
+        x.clone(),
+        offset.view(),
+        &penalties,
+        &opts,
+        &rho,
+    )
+    .expect("GLM REML gradient");
+    let mut fd = Vec::new();
+    for j in 0..rho.len() {
+        let mut plus = rho.clone();
+        plus[j] += OUTER_FD_STEP;
+        let mut minus = rho.clone();
+        minus[j] -= OUTER_FD_STEP;
+        let fp = evaluate_externalcost_andridge(
+            y.view(),
+            weights.view(),
+            x.clone(),
+            offset.view(),
+            &penalties,
+            &opts,
+            &plus,
+        )
+        .expect("GLM REML f+")
+        .0;
+        let fm = evaluate_externalcost_andridge(
+            y.view(),
+            weights.view(),
+            x.clone(),
+            offset.view(),
+            &penalties,
+            &opts,
+            &minus,
+        )
+        .expect("GLM REML f-")
+        .0;
+        fd.push((fp - fm) / (2.0 * OUTER_FD_STEP));
+    }
+    vec![GradientChannel {
+        name: "rho",
+        analytic: analytic.to_vec(),
+        fd,
+    }]
+}
+
+fn spec_without_penalty(name: &str, design: Array2<f64>) -> ParameterBlockSpec {
+    let n = design.nrows();
+    ParameterBlockSpec {
+        name: name.to_string(),
+        design: DesignMatrix::from(design),
+        offset: Array1::zeros(n),
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }
+}
+
+fn gamlss_gaussian_dispersion_row() -> Vec<GradientChannel> {
+    let n = 32usize;
+    let mut x_mu = Array2::<f64>::zeros((n, 2));
+    let mut x_ls = Array2::<f64>::zeros((n, 2));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let t = -1.0 + 2.0 * i as f64 / (n as f64 - 1.0);
+        x_mu[[i, 0]] = 1.0;
+        x_mu[[i, 1]] = t;
+        x_ls[[i, 0]] = 1.0;
+        x_ls[[i, 1]] = t * t - 1.0 / 3.0;
+        let mu = 0.3 + 0.7 * t;
+        let log_sigma = -0.25_f64 + 0.2 * (t * t - 1.0 / 3.0);
+        y[i] = mu + log_sigma.exp() * (0.35 * (5.0 * t).sin() + 0.12 * (11.0 * t).cos());
+    }
+    let specs = vec![
+        spec_without_penalty("mu", x_mu.clone()),
+        spec_without_penalty("log_sigma", x_ls.clone()),
+    ];
+    let family = GaussianLocationScaleFamily {
+        y,
+        weights: Array1::ones(n),
+        mu_design: Some(specs[GaussianLocationScaleFamily::BLOCK_MU].design.clone()),
+        log_sigma_design: Some(
+            specs[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA]
+                .design
+                .clone(),
+        ),
+        policy: ResourcePolicy::default_library(),
+        cached_row_scalars: RwLock::new(None),
+    };
+    let beta_mu = array![0.25, 0.55];
+    let beta_ls = array![-0.35, 0.18];
+    let states = vec![
+        ParameterBlockState {
+            beta: beta_mu.clone(),
+            eta: x_mu.dot(&beta_mu),
+        },
+        ParameterBlockState {
+            beta: beta_ls.clone(),
+            eta: x_ls.dot(&beta_ls),
+        },
+    ];
+    let eval = family.evaluate(&states).expect("GAMLSS fixed-state eval");
+    let analytic_mu = match &eval.blockworking_sets[GaussianLocationScaleFamily::BLOCK_MU] {
+        BlockWorkingSet::Diagonal {
+            working_response,
+            working_weights,
+        } => x_mu
+            .t()
+            .dot(&(working_weights * &(working_response - &states[0].eta))),
+        BlockWorkingSet::ExactNewton { gradient, .. } => gradient.clone(),
+    };
+    let analytic_ls = match &eval.blockworking_sets[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA] {
+        BlockWorkingSet::Diagonal {
+            working_response,
+            working_weights,
+        } => x_ls
+            .t()
+            .dot(&(working_weights * &(working_response - &states[1].eta))),
+        BlockWorkingSet::ExactNewton { gradient, .. } => gradient.clone(),
+    };
+    let value_at = |flat: &Array1<f64>| -> f64 {
+        let mu_beta = flat.slice(ndarray::s![0..2]).to_owned();
+        let ls_beta = flat.slice(ndarray::s![2..4]).to_owned();
+        let trial_states = vec![
+            ParameterBlockState {
+                beta: mu_beta.clone(),
+                eta: x_mu.dot(&mu_beta),
+            },
+            ParameterBlockState {
+                beta: ls_beta.clone(),
+                eta: x_ls.dot(&ls_beta),
+            },
+        ];
+        family
+            .log_likelihood_only(&trial_states)
+            .expect("GAMLSS fixed-state log-likelihood")
+    };
+    let beta = array![beta_mu[0], beta_mu[1], beta_ls[0], beta_ls[1]];
+    let mut fd = Vec::new();
+    for j in 0..beta.len() {
+        let mut plus = beta.clone();
+        plus[j] += FD_STEP;
+        let mut minus = beta.clone();
+        minus[j] -= FD_STEP;
+        fd.push((value_at(&plus) - value_at(&minus)) / (2.0 * FD_STEP));
+    }
+    vec![
+        GradientChannel {
+            name: "mu-beta",
+            analytic: analytic_mu.to_vec(),
+            fd: fd[0..2].to_vec(),
+        },
+        GradientChannel {
+            name: "log-sigma-beta",
+            analytic: analytic_ls.to_vec(),
+            fd: fd[2..4].to_vec(),
+        },
+    ]
+}
