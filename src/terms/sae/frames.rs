@@ -270,8 +270,12 @@ impl FrameProjection {
         match &self.frames[atom] {
             None => out[c_base + output] += value,
             Some(uk) => {
-                for j in 0..self.ranks[atom] {
-                    out[c_base + j] += value * uk[[output, j]];
+                let rank = self.ranks[atom];
+                let frame_row = uk.row(output);
+                let frame_slice = frame_row.as_slice().expect("frame rows are contiguous");
+                let out_slice = &mut out[c_base..c_base + rank];
+                for (slot, &u) in out_slice.iter_mut().zip(frame_slice.iter()) {
+                    *slot += value * u;
                 }
             }
         }

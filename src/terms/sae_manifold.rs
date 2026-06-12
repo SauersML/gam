@@ -5469,16 +5469,20 @@ impl SaeManifoldTerm {
             // Build the per-row Arrow-Schur block at the row's active dim.
             let mut block = ArrowRowBlock::new(q_row, row_htbeta_dim);
             for a in 0..q_row {
-                let mut g = 0.0;
-                for k in 0..w_dim {
-                    g += jac_white[a * w_dim + k] * error_white[k];
-                }
+                let jac_a = &jac_white[a * w_dim..(a + 1) * w_dim];
+                let g = jac_a
+                    .iter()
+                    .zip(error_white.iter())
+                    .map(|(&j, &e)| j * e)
+                    .sum::<f64>();
                 block.gt[a] += g;
                 for b in 0..q_row {
-                    let mut h = 0.0;
-                    for k in 0..w_dim {
-                        h += jac_white[a * w_dim + k] * jac_white[b * w_dim + k];
-                    }
+                    let jac_b = &jac_white[b * w_dim..(b + 1) * w_dim];
+                    let h = jac_a
+                        .iter()
+                        .zip(jac_b.iter())
+                        .map(|(&ja, &jb)| ja * jb)
+                        .sum::<f64>();
                     block.htt[[a, b]] += h;
                 }
             }
