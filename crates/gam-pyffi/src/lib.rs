@@ -11929,9 +11929,8 @@ fn sae_manifold_fit_minimal<'py>(
     // cannot escape that fixed point. Seed JumpReLU runs a fixed margin
     // ABOVE the configured threshold so every atom starts active relative to
     // its cut and the fit can learn which atoms to prune. Softmax
-    // (translation-invariant) and IBP-MAP (uses sigmoid prior with
-    // stick-breaking) are unaffected by a uniform logit shift, so zero
-    // remains the natural init for those.
+    // (translation-invariant) remains neutral at zero, while IBP-MAP uses the
+    // zero seed except for its degenerate K=1 gate handled below.
     // Warm-start logits (issue #357): a caller-supplied `(N, K)` assignment
     // logit seed (from an amortized encoder) replaces the cold-start init.
     // When absent we fall back to the documented zero / JumpReLU-positive init
@@ -11964,6 +11963,20 @@ fn sae_manifold_fit_minimal<'py>(
                 (n_obs, k_atoms),
                 jumprelu_threshold + SAE_JUMPRELU_SEED_MARGIN,
             )
+        }
+        None if k_atoms == 1 && assignment_kind == "ibp_map" => {
+            // At K=1 the IBP stick-breaking prior is degenerate (pi_0 == 1), so the
+            // gate zeta = sigma(logit/tau) is a free multiplicative scalar on the
+            // reconstruction with no competing atom and no sparsity pressure. A zero
+            // seed starts it at sigma(0)=0.5 -- a 50% radial seed contraction the
+            // joint fit must climb back from against a vanishing sigmoid gradient,
+            // landing the ring inside the data (#1023). Seed the single atom
+            // "present" so zeta starts ~1; the gate stays free to fall if the atom is
+            // genuinely vacuous (the post-fit EV collapse guard, not zeta->0, flags
+            // that, so part-3 collapse detection is unaffected). Temperature-robust:
+            // seed logit = c*tau so zeta = sigma(c) is independent of tau.
+            const SAE_IBP_K1_PRESENT_GATE_LOGIT: f64 = 6.0;
+            Array2::<f64>::from_elem((n_obs, k_atoms), SAE_IBP_K1_PRESENT_GATE_LOGIT * tau)
         }
         None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
