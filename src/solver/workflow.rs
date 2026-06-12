@@ -4273,7 +4273,7 @@ pub fn fit_from_formula(
 
 /// Inputs extracted by [`spline_scan_fast_path`] for the exact O(n)
 /// state-space cubic-smoothing-spline scan
-/// ([`crate::solver::spline_scan::fit_cubic_spline_scan`]).
+/// ([`crate::solver::spline_scan::fit_spline_scan`]).
 pub struct SplineScanInputs {
     /// Abscissae of the single 1-D smooth (training rows of its feature column).
     pub x: Vec<f64>,
@@ -4425,9 +4425,9 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
 /// Materializes the formula exactly like [`fit_from_formula`], then runs the
 /// [`spline_scan_fast_path`] detection on the resulting standard request.
 /// When detection fires the fit is routed through
-/// [`crate::solver::spline_scan::fit_cubic_spline_scan`] — the exact diffuse
+/// [`crate::solver::spline_scan::fit_spline_scan`] — the exact diffuse
 /// REML Kalman/RTS scan — and the full in-memory posterior
-/// ([`crate::solver::spline_scan::CubicSplineScanFit`]: knots, smoothed
+/// ([`crate::solver::spline_scan::SplineScanFit`]: knots, smoothed
 /// states, pointwise variances, lag-one gains, σ², log λ, exact EDF, and an
 /// exact `predict`) is returned. `Ok(None)` means the model is not the
 /// scan-eligible shape and the caller should use the dense
@@ -4438,7 +4438,7 @@ pub fn fit_spline_scan_from_formula(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
-) -> Result<Option<crate::solver::spline_scan::CubicSplineScanFit>, WorkflowError> {
+) -> Result<Option<crate::solver::spline_scan::SplineScanFit>, WorkflowError> {
     let mat = materialize(formula, data, config)?;
     let FitRequest::Standard(request) = mat.request else {
         return Ok(None);
@@ -4446,7 +4446,7 @@ pub fn fit_spline_scan_from_formula(
     let Some(inputs) = spline_scan_fast_path(&request) else {
         return Ok(None);
     };
-    crate::solver::spline_scan::fit_cubic_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
+    crate::solver::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
         .map(Some)
         .map_err(|reason| WorkflowError::IntegrationFailed { reason })
 }

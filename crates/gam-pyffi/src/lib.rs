@@ -25083,7 +25083,7 @@ fn fit_dataset_impl(
             // structural; every other shape falls through to the dense fit
             // below. Mirrors the CLI run_fit path so CLI and FFI saves agree.
             if let Some(inputs) = gam::spline_scan_fast_path(&standard_request) {
-                let scan = gam::solver::spline_scan::fit_cubic_spline_scan(
+                let scan = gam::solver::spline_scan::fit_spline_scan(
                     &inputs.x,
                     &inputs.y,
                     &inputs.w,

@@ -5,7 +5,7 @@
 //! elimination written in-test). No approximation tolerance budget: the two
 //! paths compute the same Gaussian, so agreement is at solver roundoff.
 
-use gam::solver::spline_scan::{fit_cubic_spline_scan, fit_cubic_spline_scan_at};
+use gam::solver::spline_scan::{fit_spline_scan, fit_spline_scan_at};
 
 /// Dense in-test Gaussian elimination solve A·X = B (partial pivoting).
 fn dense_solve(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
@@ -173,7 +173,7 @@ fn test_data() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
 fn scan_matches_dense_exact_posterior_at_fixed_lambda() {
     let (x, y, w) = test_data();
     for &log_lambda in &[-2.0_f64, 1.5, 5.0] {
-        let scan = fit_cubic_spline_scan_at(&x, &y, &w, log_lambda, Some(1.0), 2)
+        let scan = fit_spline_scan_at(&x, &y, &w, log_lambda, Some(1.0), 2)
             .expect("scan fit at fixed lambda");
         let truth = dense_truth(&x, &y, &w, log_lambda);
         for t in 0..x.len() {
@@ -200,8 +200,8 @@ fn scan_matches_dense_exact_posterior_at_fixed_lambda() {
 fn scan_restricted_loglik_differences_match_dense_reml() {
     let (x, y, w) = test_data();
     let (ll_a, ll_b) = (-1.0_f64, 3.0_f64);
-    let scan_a = fit_cubic_spline_scan_at(&x, &y, &w, ll_a, Some(1.0), 2).expect("scan a");
-    let scan_b = fit_cubic_spline_scan_at(&x, &y, &w, ll_b, Some(1.0), 2).expect("scan b");
+    let scan_a = fit_spline_scan_at(&x, &y, &w, ll_a, Some(1.0), 2).expect("scan a");
+    let scan_b = fit_spline_scan_at(&x, &y, &w, ll_b, Some(1.0), 2).expect("scan b");
     let dense_a = dense_truth(&x, &y, &w, ll_a);
     let dense_b = dense_truth(&x, &y, &w, ll_b);
     // With σ² fixed at 1 the scan criterion is −½(Σ log F + Σ v²/F); both
@@ -217,7 +217,7 @@ fn scan_restricted_loglik_differences_match_dense_reml() {
 #[test]
 fn scan_bridges_gap_and_grows_variance() {
     let (x, y, w) = test_data();
-    let fit = fit_cubic_spline_scan(&x, &y, &w, 2).expect("REML-selected scan fit");
+    let fit = fit_spline_scan(&x, &y, &w, 2).expect("REML-selected scan fit");
     // The hole (0.45, 0.7) — the bridge must pass smoothly between the flanks
     // (no sag to the data mean) and the variance must peak inside the gap.
     let (m_mid, v_mid) = fit.predict(0.575).expect("gap midpoint");

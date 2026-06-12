@@ -322,7 +322,7 @@ fn truncate_marginal_slope_influence_absorber(
 pub fn assemble_spline_scan_payload(
     formula: String,
     feature_column: String,
-    fit: &crate::solver::spline_scan::CubicSplineScanFit,
+    fit: &crate::solver::spline_scan::SplineScanFit,
     data_schema: DataSchema,
     training_headers: Vec<String>,
     training_feature_ranges: Vec<(f64, f64)>,

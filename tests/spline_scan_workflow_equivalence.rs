@@ -279,7 +279,7 @@ fn spline_scan_million_row_fit_scales_linearly_and_recovers_truth() {
     init_parallelism();
     let cfg = gaussian_config();
 
-    let time_fit = |n: usize| -> (f64, gam::solver::spline_scan::CubicSplineScanFit) {
+    let time_fit = |n: usize| -> (f64, gam::solver::spline_scan::SplineScanFit) {
         let (x, y) = training_xy(n);
         let data = encode_xy(&x, &y);
         let start = std::time::Instant::now();

@@ -1624,7 +1624,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         // same penalized posterior at O(n) per λ-trial instead of the dense
         // design/Gram route — and persists the smoother state directly.
         if let Some(inputs) = gam::spline_scan_fast_path(&standard_request) {
-            let scan = gam::solver::spline_scan::fit_cubic_spline_scan(
+            let scan = gam::solver::spline_scan::fit_spline_scan(
                 &inputs.x,
                 &inputs.y,
                 &inputs.w,
