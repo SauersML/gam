@@ -53,7 +53,13 @@ pub const PSI_GRAM_CERT_RTOL: f64 = 1.0e-12;
 pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
 
 /// Node-count escalation ladder for the expansion build (degree = nodes − 1).
-pub const PSI_GRAM_NODE_LADDER: [usize; 3] = [9, 17, 33];
+///
+/// The top rung sizes to WIDE trial windows: Chebyshev coefficients of the
+/// Matérn-type channels decay like Bessel `I_d(σ)` with `σ ≈ s_max·halfwidth`
+/// (s = κr), which only drops below the 1e-12 tail tolerance for `d ≳ 2σ` —
+/// e.g. σ ≈ 9 (s_max ≈ 8, ±1.1 window) needs degree ≳ 40, so 33 nodes refuse
+/// and 65 certify. Node counts stay trivially cheap (one design eval each).
+pub const PSI_GRAM_NODE_LADDER: [usize; 4] = [9, 17, 33, 65];
 
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
