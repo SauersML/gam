@@ -42,11 +42,12 @@
 //!   `mass_i · q_i^(1−2α)` realizes `dμ(x)/q_ε(x)^(2α−1)`; `α = 1` (default)
 //!   removes the sampling-density dependence of the limiting energy, `α = 0`
 //!   penalizes density-weighted roughness.
-//! - **Frozen-quadrature replay.** The penalty depends on the FIT data
-//!   through center masses and the realized band. The freeze step persists
-//!   both ([`MeasureJetFrozenQuadrature`]) so predict-time (and future
-//!   per-ψ-trial) rebuilds replay the exact fit-time penalty instead of
-//!   recomputing it from predict rows.
+//! - **Frozen-quadrature replay.** The penalty and extrapolation diagnostic
+//!   depend on the FIT data through center masses, the realized band, on-web
+//!   support anchors, and penalty normalization scales. The freeze step
+//!   persists all of them ([`MeasureJetFrozenQuadrature`]) so predict-time
+//!   rebuilds replay the exact fit-time penalty instead of recomputing it from
+//!   predict rows.
 //! - **Single assembly source.** Every quadratic form this module emits —
 //!   the energy, its (s, α) jets, the per-scale spectrum — is produced by
 //!   ONE workhorse ([`assemble_weighted_forms`]) that walks the local
@@ -171,6 +172,18 @@ pub struct MeasureJetFrozenQuadrature {
     pub masses: Array1<f64>,
     /// Realized geometric scale band `ε_0 < … < ε_{L−1}`.
     pub eps_band: Vec<f64>,
+    /// Per-scale on-web support anchor
+    /// `q̄_ℓ = (Σ_i m_i q_ℓ(c_i)) / (Σ_i m_i)`.
+    pub support_means: Vec<f64>,
+    /// Frobenius scales of the emitted per-level normalized penalties. Empty in
+    /// fused mode, where the band emits one primary penalty instead.
+    pub penalty_normalization_scales: Vec<f64>,
+    /// Frobenius scales of the raw per-level forms before the arbitrary Mellin
+    /// `log_step · ε_ℓ^(-2s0)` gauge is folded in.
+    pub raw_penalty_normalization_scales: Vec<f64>,
+    /// Frobenius scale of the single fused primary penalty. `None` in per-level
+    /// mode.
+    pub fused_penalty_normalization_scale: Option<f64>,
 }
 
 /// Measure-jet smooth configuration (`mjs(x0, …, xd)`).
@@ -984,6 +997,36 @@ pub fn measure_jet_support_curve(
     Ok(out)
 }
 
+fn measure_jet_support_means(
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+    eps_band: &[f64],
+) -> Result<Vec<f64>, BasisError> {
+    let total_mass = masses.sum();
+    if !(total_mass.is_finite() && total_mass > 0.0) {
+        crate::bail_invalid_basis!(
+            "measure-jet support means need positive finite total mass; got {total_mass}"
+        );
+    }
+    let support = measure_jet_support_curve(centers, centers, masses, eps_band)?;
+    let mut means = vec![0.0_f64; eps_band.len()];
+    for (i, row) in support.rows().into_iter().enumerate() {
+        let mass = masses[i];
+        for (mean, &q) in means.iter_mut().zip(row.iter()) {
+            *mean += mass * q;
+        }
+    }
+    for mean in &mut means {
+        *mean /= total_mass;
+        if !(*mean).is_finite() || *mean <= 0.0 {
+            crate::bail_invalid_basis!(
+                "measure-jet support mean must be positive and finite; got {mean}"
+            );
+        }
+    }
+    Ok(means)
+}
+
 /// Gaussian representer features `exp(−‖x − c‖²/(2ℓ²))` (n × m).
 pub fn measure_jet_design_matrix(
     data: ArrayView2<'_, f64>,
@@ -1084,7 +1127,7 @@ fn realize_measure_jet_geometry(
     // see `measure_jet_quadrature_nodes`), so the metadata's `centers` are
     // already the realized nodes and the frozen path (predict / ψ-trial,
     // `CenterStrategy::UserProvided`) replays them verbatim with the frozen
-    // masses + band.
+    // masses, band, support anchors, and normalization scales.
     let (centers, masses, eps_band, log_step) = match &spec.frozen_quadrature {
         Some(frozen) => {
             if frozen.masses.len() != m {
@@ -1194,6 +1237,7 @@ pub fn build_measure_jet_basis(
     let design = crate::matrix::DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
         constrained_design,
     ));
+    let support_means = measure_jet_support_means(centers.view(), masses.view(), &eps_band)?;
     // Spectral/geometric split. With the auto order sentinel (order_s == 0.0)
     // the term emits one candidate PER scale: the multi-penalty REML engine
     // then learns the level amplitudes λ_ℓ directly — scale adaptivity at
@@ -1207,6 +1251,9 @@ pub fn build_measure_jet_basis(
     // marker: a replay MUST re-enter the same mode or the penalty count
     // desyncs (the gam#860 trap class).
     let mut candidates = Vec::new();
+    let mut penalty_normalization_scales = Vec::new();
+    let mut raw_penalty_normalization_scales = Vec::new();
+    let mut fused_penalty_normalization_scale = None;
     if per_level {
         let forms = measure_jet_energy_forms_per_scale(
             centers.view(),
@@ -1219,6 +1266,9 @@ pub fn build_measure_jet_basis(
         for (level, q_l) in forms.into_iter().enumerate() {
             let s_l = kz.t().dot(&q_l).dot(&kz);
             let (s_norm, c_l) = normalize_penalty(&((&s_l + &s_l.t()) * 0.5));
+            let scale_weight = log_step * eps_band[level].powf(-2.0 * order_s);
+            penalty_normalization_scales.push(c_l);
+            raw_penalty_normalization_scales.push(c_l / scale_weight);
             candidates.push(PenaltyCandidate {
                 matrix: s_norm,
                 nullspace_dim_hint: 0,
@@ -1239,6 +1289,7 @@ pub fn build_measure_jet_basis(
         )?;
         let penalty = kz.t().dot(&q_form).dot(&kz);
         let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
+        fused_penalty_normalization_scale = Some(c_primary);
         candidates.push(PenaltyCandidate {
             matrix: penalty_norm,
             nullspace_dim_hint: 0,
@@ -1280,6 +1331,10 @@ pub fn build_measure_jet_basis(
             alpha: spec.alpha,
             tau0: spec.tau0,
             masses,
+            support_means,
+            penalty_normalization_scales,
+            raw_penalty_normalization_scales,
+            fused_penalty_normalization_scale,
             constraint_transform: Some(z),
         },
         kronecker_factored: None,
@@ -1896,6 +1951,10 @@ mod tests {
             length_scale,
             eps_band,
             masses,
+            support_means,
+            penalty_normalization_scales,
+            raw_penalty_normalization_scales,
+            fused_penalty_normalization_scale,
             constraint_transform,
             ..
         } = &first.metadata
@@ -1916,6 +1975,10 @@ mod tests {
             frozen_quadrature: Some(MeasureJetFrozenQuadrature {
                 masses: masses.clone(),
                 eps_band: eps_band.clone(),
+                support_means: support_means.clone(),
+                penalty_normalization_scales: penalty_normalization_scales.clone(),
+                raw_penalty_normalization_scales: raw_penalty_normalization_scales.clone(),
+                fused_penalty_normalization_scale: *fused_penalty_normalization_scale,
             }),
         };
         (data, frozen)
@@ -2105,6 +2168,10 @@ mod tests {
             alpha,
             tau0,
             masses,
+            support_means,
+            penalty_normalization_scales,
+            raw_penalty_normalization_scales,
+            fused_penalty_normalization_scale,
             constraint_transform,
             ..
         } = &first.metadata
@@ -2125,6 +2192,10 @@ mod tests {
             frozen_quadrature: Some(MeasureJetFrozenQuadrature {
                 masses: masses.clone(),
                 eps_band: eps_band.clone(),
+                support_means: support_means.clone(),
+                penalty_normalization_scales: penalty_normalization_scales.clone(),
+                raw_penalty_normalization_scales: raw_penalty_normalization_scales.clone(),
+                fused_penalty_normalization_scale: *fused_penalty_normalization_scale,
             }),
         };
         // Per-level (auto-sentinel) mode: one candidate per band scale plus

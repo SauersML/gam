@@ -53,7 +53,7 @@ use std::path::Path;
 /// Do NOT bump for purely additive `Option<T>` fields that the save-time
 /// invariant (`validate_for_persistence`) does not yet require. Those are
 /// forward-compatible.
-pub const MODEL_PAYLOAD_VERSION: u32 = 6;
+pub const MODEL_PAYLOAD_VERSION: u32 = 7;
 
 /// Schema-free saved-model metadata keyed by stable group id.
 ///
@@ -3237,8 +3237,8 @@ impl FittedModel {
     }
 
     /// V∞ §5 coverage floor for the measure-jet extrapolation variance: a
-    /// band level "covers" a query once its kernel mass reaches this
-    /// fraction of the total quadrature mass. Magic-by-default (no dial):
+    /// band level "covers" a query once its kernel mass reaches this fraction
+    /// of that level's web-averaged support. Magic-by-default (no dial):
     /// 0.05 keeps the ε★ gate's bounded discontinuity at ≤ 5 % of the
     /// spectrum's total prior ignorance (see the monotonicity theorem in
     /// `terms/basis/measure_jet_predict.rs`) while still refusing credit
@@ -3277,7 +3277,7 @@ impl FittedModel {
         data: ndarray::ArrayView2<'_, f64>,
         col_map: &HashMap<String, usize>,
     ) -> Result<Option<Array1<f64>>, FittedModelError> {
-        use crate::basis::{CenterStrategy, PenaltySource};
+        use crate::basis::{CenterStrategy, MeasureJetExtrapolationSpectrum, PenaltySource};
         use crate::smooth::{SmoothBasisSpec, build_term_collection_design};
         let Some(saved_spec) = self.resolved_termspec.as_ref() else {
             return Ok(None);
@@ -3322,9 +3322,10 @@ impl FittedModel {
             }
         })?;
         let lambdas = &fit.lambdas;
-        // λ̂ are precisions of the φ̂-free penalized criterion, so λ̂⁻¹ sits on
-        // H⁻¹'s scale; multiplying by the coefficient-covariance scale puts
-        // Var_extrap on the same η-variance scale as Vp.
+        // λ̂ are fitted on Frobenius-normalized penalties. The term loop
+        // unnormalizes them to physical precisions before pricing; multiplying
+        // by the coefficient-covariance scale puts Var_extrap on the same
+        // η-variance scale as Vp.
         let phi_scale = fit.coefficient_covariance_scale();
         let mut total = Array1::<f64>::zeros(data.nrows());
         let mut contributed = false;
@@ -3350,8 +3351,8 @@ impl FittedModel {
             let n_levels = frozen.eps_band.len();
             // λ̂ per level from the replayed layout: per-scale candidates carry
             // `PenaltySource::Other("measure_jet_scale_ℓ")`; fused
-            // (pinned-order) mode carries a single Primary reused for every
-            // level. The DoublePenaltyNullspace ridge is EXCLUDED — it shrinks
+            // (pinned-order) mode carries one Primary charged once for the
+            // whole band. The DoublePenaltyNullspace ridge is EXCLUDED — it shrinks
             // coefficients, it is not a scale amplitude, and counting it would
             // double-charge the spectrum.
             let read_lambda = |global_index: usize| -> Result<f64, FittedModelError> {
@@ -3394,7 +3395,8 @@ impl FittedModel {
                     _ => {}
                 }
             }
-            let lambda_hat: Vec<f64> = if per_scale.is_empty() {
+            let mut lambda_phys = Vec::with_capacity(n_levels);
+            let spectrum = if per_scale.is_empty() {
                 let Some(lam) = fused else {
                     log::warn!(
                         "measure-jet term '{}' has no fitted amplitude in the penalty \
@@ -3403,7 +3405,15 @@ impl FittedModel {
                     );
                     continue;
                 };
-                vec![lam; n_levels]
+                let Some(c) = frozen.fused_penalty_normalization_scale else {
+                    log::warn!(
+                        "measure-jet term '{}' is missing the fused penalty normalization scale; \
+                        skipping its extrapolation variance",
+                        term.name
+                    );
+                    continue;
+                };
+                MeasureJetExtrapolationSpectrum::Fused(lam / c)
             } else {
                 per_scale.sort_by_key(|&(level, _)| level);
                 let levels_complete = per_scale.len() == n_levels
@@ -3421,7 +3431,22 @@ impl FittedModel {
                     );
                     continue;
                 }
-                per_scale.iter().map(|&(_, lam)| lam).collect()
+                if frozen.penalty_normalization_scales.len() != n_levels {
+                    log::warn!(
+                        "measure-jet term '{}': {} frozen penalty normalization scales for {} \
+                        band scales; skipping its extrapolation variance",
+                        term.name,
+                        frozen.penalty_normalization_scales.len(),
+                        n_levels
+                    );
+                    continue;
+                }
+                lambda_phys.extend(
+                    per_scale
+                        .iter()
+                        .map(|&(level, lam)| lam / frozen.penalty_normalization_scales[level]),
+                );
+                MeasureJetExtrapolationSpectrum::PerLevel(&lambda_phys)
             };
             // Query rows in the frozen geometry's coordinates: select the
             // term's axes and replay the per-axis standardization exactly as
@@ -3468,13 +3493,12 @@ impl FittedModel {
                     term.name
                 ),
             })?;
-            let total_mass = frozen.masses.sum();
             for i in 0..data.nrows() {
                 let v = crate::basis::measure_jet_extrapolation_variance(
                     support.row(i),
                     &frozen.eps_band,
-                    total_mass,
-                    &lambda_hat,
+                    &frozen.support_means,
+                    spectrum,
                     Self::MEASURE_JET_COVERAGE_FLOOR,
                 )
                 .map_err(|e| FittedModelError::SchemaMismatch {
