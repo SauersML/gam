@@ -6971,8 +6971,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                         else {
                             continue;
                         };
-                        let (Some(&eps_min), Some(&eps_max)) =
-                            (eps_band.first(), eps_band.last())
+                        let (Some(&eps_min), Some(&eps_max)) = (eps_band.first(), eps_band.last())
                         else {
                             continue;
                         };

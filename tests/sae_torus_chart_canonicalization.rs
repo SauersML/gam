@@ -99,20 +99,14 @@ fn torus_point(s: [f64; 2], frame: &Array2<f64>) -> Vec<f64> {
     let a1 = std::f64::consts::TAU * s[1];
     let raw = [a0.cos(), a0.sin(), a1.cos(), a1.sin()];
     (0..P)
-        .map(|i| {
-            raw.iter()
-                .enumerate()
-                .map(|(j, v)| frame[[i, j]] * v)
-                .sum()
-        })
+        .map(|i| raw.iter().enumerate().map(|(j, v)| frame[[i, j]] * v).sum())
         .collect()
 }
 
 fn psi_a(t: [f64; 2]) -> [f64; 2] {
     let tau = std::f64::consts::TAU;
     [
-        t[0]
-            + 0.020 * (tau * t[0]).sin()
+        t[0] + 0.020 * (tau * t[0]).sin()
             + 0.014 * (tau * t[1]).cos()
             + 0.012 * (tau * (t[0] + t[1])).sin(),
         t[1] - 0.016 * (tau * t[0]).cos()
@@ -125,16 +119,12 @@ fn dpsi_a(t: [f64; 2]) -> [[f64; 2]; 2] {
     let tau = std::f64::consts::TAU;
     [
         [
-            1.0 + 0.020 * tau * (tau * t[0]).cos()
-                + 0.012 * tau * (tau * (t[0] + t[1])).cos(),
-            -0.014 * tau * (tau * t[1]).sin()
-                + 0.012 * tau * (tau * (t[0] + t[1])).cos(),
+            1.0 + 0.020 * tau * (tau * t[0]).cos() + 0.012 * tau * (tau * (t[0] + t[1])).cos(),
+            -0.014 * tau * (tau * t[1]).sin() + 0.012 * tau * (tau * (t[0] + t[1])).cos(),
         ],
         [
-            0.016 * tau * (tau * t[0]).sin()
-                - 0.010 * tau * (tau * (t[0] - t[1])).sin(),
-            1.0 + 0.018 * tau * (tau * t[1]).cos()
-                + 0.010 * tau * (tau * (t[0] - t[1])).sin(),
+            0.016 * tau * (tau * t[0]).sin() - 0.010 * tau * (tau * (t[0] - t[1])).sin(),
+            1.0 + 0.018 * tau * (tau * t[1]).cos() + 0.010 * tau * (tau * (t[0] - t[1])).sin(),
         ],
     ]
 }
@@ -145,9 +135,7 @@ fn psi_b(t: [f64; 2]) -> [f64; 2] {
         t[0] - 0.018 * (tau * (t[0] - t[1])).cos()
             + 0.015 * (tau * t[1]).sin()
             + 0.011 * (tau * t[0]).cos(),
-        t[1]
-            + 0.019 * (tau * (t[0] + t[1])).sin()
-            - 0.013 * (tau * t[1]).cos()
+        t[1] + 0.019 * (tau * (t[0] + t[1])).sin() - 0.013 * (tau * t[1]).cos()
             + 0.012 * (tau * t[0]).sin(),
     ]
 }
@@ -156,16 +144,12 @@ fn dpsi_b(t: [f64; 2]) -> [[f64; 2]; 2] {
     let tau = std::f64::consts::TAU;
     [
         [
-            1.0 + 0.018 * tau * (tau * (t[0] - t[1])).sin()
-                - 0.011 * tau * (tau * t[0]).sin(),
-            -0.018 * tau * (tau * (t[0] - t[1])).sin()
-                + 0.015 * tau * (tau * t[1]).cos(),
+            1.0 + 0.018 * tau * (tau * (t[0] - t[1])).sin() - 0.011 * tau * (tau * t[0]).sin(),
+            -0.018 * tau * (tau * (t[0] - t[1])).sin() + 0.015 * tau * (tau * t[1]).cos(),
         ],
         [
-            0.019 * tau * (tau * (t[0] + t[1])).cos()
-                + 0.012 * tau * (tau * t[0]).cos(),
-            1.0 + 0.019 * tau * (tau * (t[0] + t[1])).cos()
-                + 0.013 * tau * (tau * t[1]).sin(),
+            0.019 * tau * (tau * (t[0] + t[1])).cos() + 0.012 * tau * (tau * t[0]).cos(),
+            1.0 + 0.019 * tau * (tau * (t[0] + t[1])).cos() + 0.013 * tau * (tau * t[1]).sin(),
         ],
     ]
 }

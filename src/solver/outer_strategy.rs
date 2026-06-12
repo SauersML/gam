@@ -6803,9 +6803,8 @@ fn run_outer_with_plan(
             None => false,
         };
         if curvature_entry_refused && continuation_path.is_none() {
-            let msg =
-                "curvature-homotopy entry refused seed; deferring to remaining seed cascade"
-                    .to_string();
+            let msg = "curvature-homotopy entry refused seed; deferring to remaining seed cascade"
+                .to_string();
             log::warn!("[OUTER] {context}: rejecting seed {seed_idx} (curvature): {msg}");
             rejection_reasons.push((seed_idx, "validation", msg));
             continue 'seed_attempts;

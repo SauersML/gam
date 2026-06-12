@@ -167,7 +167,11 @@ fn encode_poisson_training(points: &[WebPoint], seed: u64) -> gam::data::Encoded
     encode_recordswith_inferred_schema(headers, rows).expect("encode poisson web dataset")
 }
 
-fn fit_web(formula: &str, data: &gam::data::EncodedDataset, family: &str) -> gam::StandardFitResult {
+fn fit_web(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    family: &str,
+) -> gam::StandardFitResult {
     let cfg = FitConfig {
         family: Some(family.to_string()),
         ..FitConfig::default()
@@ -387,10 +391,8 @@ fn measure_jet_bridges_gap_with_trend_not_mean() {
     // the training mean at least half as strongly as the truth does (a
     // mean-reverting bridge scores near zero here).
     let y_col = data.column_map()["y"];
-    let train_mean =
-        data.values.column(y_col).sum() / data.values.nrows() as f64;
-    let mad_pred =
-        pred.iter().map(|p| (p - train_mean).abs()).sum::<f64>() / n;
+    let train_mean = data.values.column(y_col).sum() / data.values.nrows() as f64;
+    let mad_pred = pred.iter().map(|p| (p - train_mean).abs()).sum::<f64>() / n;
     let mad_truth = in_gap
         .iter()
         .map(|p| (p.truth - train_mean).abs())

@@ -15,10 +15,10 @@ use crate::basis::{
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
     MaternNu, MeasureJetBasisSpec, MeasureJetIdentifiability, OneDimensionalBoundary,
-    SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
-    SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
-    auto_spatial_center_strategy, default_num_centers, default_spatial_center_strategy,
-    default_spherical_harmonic_degree, plan_spatial_basis,
+    SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
+    SphericalSplineIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy,
+    default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
+    plan_spatial_basis,
 };
 use crate::inference::data::{DataError, EncodedDataset as Dataset};
 use crate::inference::formula_dsl::{

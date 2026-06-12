@@ -2427,6 +2427,18 @@ fn factor_one_row(
     row_idx: usize,
     tolerate_ill_conditioning: bool,
 ) -> Result<Array2<f64>, ArrowSchurError> {
+    factor_one_row_result(row, ridge_t, d, row_idx, tolerate_ill_conditioning, &[])
+        .map(|result| result.factor)
+}
+
+fn factor_one_row_result(
+    row: &ArrowRowBlock,
+    ridge_t: f64,
+    d: usize,
+    row_idx: usize,
+    tolerate_ill_conditioning: bool,
+    row_gauges: &[Array1<f64>],
+) -> Result<ArrowRowFactorResult, ArrowSchurError> {
     // Dimension mismatches in caller-supplied row blocks must surface as a
     // typed error rather than aborting the process. The BA/SAE assembler can
     // mis-size a row (for instance when latent_dim disagrees between the
@@ -2495,7 +2507,10 @@ fn factor_one_row(
                 // factor is genuinely PD, so its diagonal gives an exact log|S|
                 // and an inaccurate Δβ would be discarded anyway.
                 if tolerate_ill_conditioning {
-                    break factor;
+                    break ArrowRowFactorResult {
+                        factor,
+                        gauge_deflated_directions: 0,
+                    };
                 }
                 // Diagonal-ratio condition-number proxy κ(LLᵀ) ≈
                 // (max L_ii / min L_ii)², vs the dimension-scaled Higham
@@ -2505,7 +2520,10 @@ fn factor_one_row(
                 // over-threshold block is regularised further rather than used.
                 let kappa_est = cholesky_factor_kappa_estimate(&factor);
                 if cholesky_factor_passes_safe_inversion(&factor, d, diag_scale, kappa_est) {
-                    break factor;
+                    break ArrowRowFactorResult {
+                        factor,
+                        gauge_deflated_directions: 0,
+                    };
                 }
                 let next = if ridge_eff > 0.0 {
                     ridge_eff * RIDGE_GROWTH_FACTOR
@@ -2529,6 +2547,19 @@ fn factor_one_row(
                 // genuinely non-PD block at the base ridge must surface as
                 // an error here, not be quietly conditioned.
                 if tolerate_ill_conditioning {
+                    if ridge_t == 0.0 {
+                        if let Some(deflated) =
+                            factor_gauge_deflated_evidence_row(row, d, row_gauges)
+                        {
+                            // Faddeev-Popov row-gauge deflation: only the
+                            // closed-form orbit direction gets stiffness
+                            // kappa = max_diag. The log|H| contribution for
+                            // each deflated direction is therefore log(kappa),
+                            // constant in theta and rho, so criterion
+                            // derivatives remain exact on the quotient.
+                            return Ok(deflated);
+                        }
+                    }
                     return Err(ArrowSchurError::PerRowFactorFailed {
                         row: row_idx,
                         reason: format!(
@@ -4872,6 +4903,14 @@ pub struct ArrowFactorCache {
     /// Zero-valued (default) when the selected mode did not use PCG
     /// (i.e. `Direct` or `SqrtBA`).
     pub pcg_diagnostics: PcgDiagnostics,
+    /// Number of row-local gauge directions stiffened in an undamped evidence
+    /// factorization.
+    ///
+    /// Each direction contributes `log(kappa)` to the row-block logdet through
+    /// the returned Cholesky factor. Because `kappa` is the row diagonal scale
+    /// selected at the factorization site and the direction is a gauge orbit,
+    /// this is a theta/rho-constant Faddeev-Popov normalizer on the quotient.
+    pub gauge_deflated_directions: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5430,15 +5469,17 @@ pub fn solve_arrow_newton_step_with_options(
     // can alias htt_factors directly; otherwise pay a second per-row
     // Cholesky (O(N d³), same complexity class as the Newton solve).
     let htt_factors = step.htt_factors;
-    let htt_factors_undamped = if ridge_t == 0.0 {
-        ArrowUndampedFactors::SameAsDamped
+    let (htt_factors_undamped, gauge_deflated_directions) = if ridge_t == 0.0 {
+        (
+            ArrowUndampedFactors::SameAsDamped,
+            step.gauge_deflated_directions,
+        )
     } else {
-        ArrowUndampedFactors::Owned(backend.factor_blocks(
-            &sys.rows,
-            0.0,
-            sys.d,
-            options.tolerate_ill_conditioning,
-        )?)
+        let undamped = factor_blocks_for_system(sys, 0.0, options, &backend)?;
+        (
+            ArrowUndampedFactors::Owned(undamped.factors),
+            undamped.gauge_deflated_directions,
+        )
     };
     let cache = ArrowFactorCache {
         htt_factors,
@@ -5455,6 +5496,7 @@ pub fn solve_arrow_newton_step_with_options(
         manifold_mode_fingerprint: sys.manifold_mode_fingerprint,
         row_hessian_fingerprint: sys.current_row_hessian_fingerprint(),
         pcg_diagnostics: step.pcg_diagnostics,
+        gauge_deflated_directions,
     };
     Ok((step.delta_t, step.delta_beta, cache))
 }
@@ -6068,6 +6110,49 @@ struct ArrowNewtonStepArtifacts {
     htt_factors: ArrowFactorSlab,
     schur_factor: Option<Array2<f64>>,
     pcg_diagnostics: PcgDiagnostics,
+    gauge_deflated_directions: usize,
+}
+
+struct ArrowBlockFactorization {
+    factors: ArrowFactorSlab,
+    gauge_deflated_directions: usize,
+}
+
+fn factor_blocks_for_system<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    options: &ArrowSolveOptions,
+    backend: &B,
+) -> Result<ArrowBlockFactorization, ArrowSchurError> {
+    let Some(deflation) = sys.row_gauge_deflation.as_ref() else {
+        return Ok(ArrowBlockFactorization {
+            factors: backend.factor_blocks(
+                &sys.rows,
+                ridge_t,
+                sys.d,
+                options.tolerate_ill_conditioning,
+            )?,
+            gauge_deflated_directions: 0,
+        });
+    };
+    let mut blocks = Vec::with_capacity(sys.rows.len());
+    let mut count = 0usize;
+    for (row_idx, row) in sys.rows.iter().enumerate() {
+        let result = factor_one_row_result(
+            row,
+            ridge_t,
+            sys.row_dims[row_idx],
+            row_idx,
+            options.tolerate_ill_conditioning,
+            deflation.row(row_idx),
+        )?;
+        count += result.gauge_deflated_directions;
+        blocks.push(result.factor);
+    }
+    Ok(ArrowBlockFactorization {
+        factors: ArrowFactorSlab::from_blocks(blocks),
+        gauge_deflated_directions: count,
+    })
 }
 
 enum MixedPrecisionAttempt {
@@ -6532,6 +6617,7 @@ fn solve_arrow_newton_step_artifacts(
             htt_factors: ArrowFactorSlab::from_blocks(Vec::new()),
             schur_factor,
             pcg_diagnostics: PcgDiagnostics::default(),
+            gauge_deflated_directions: 0,
         });
     }
     let backend = CpuBatchedBlockSolver;
@@ -6539,8 +6625,9 @@ fn solve_arrow_newton_step_artifacts(
     // 1. BA point elimination: per-row Cholesky factors of
     // (H_tt^(i) + ridge_t · I).  `factor_blocks` reads the actual row
     // dimension from `row.htt.nrows()` so heterogeneous systems work.
-    let htt_factors =
-        backend.factor_blocks(&sys.rows, ridge_t, sys.d, options.tolerate_ill_conditioning)?;
+    let block_factorization = factor_blocks_for_system(sys, ridge_t, options, &backend)?;
+    let htt_factors = block_factorization.factors;
+    let gauge_deflated_directions = block_factorization.gauge_deflated_directions;
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
@@ -6578,6 +6665,7 @@ fn solve_arrow_newton_step_artifacts(
                             htt_factors,
                             schur_factor: Some(schur_factor),
                             pcg_diagnostics,
+                            gauge_deflated_directions,
                         });
                     }
                     MixedPrecisionAttempt::Fallback { reason } => {
@@ -6616,6 +6704,7 @@ fn solve_arrow_newton_step_artifacts(
                             htt_factors,
                             schur_factor: Some(schur_factor),
                             pcg_diagnostics,
+                            gauge_deflated_directions,
                         });
                     }
                     MixedPrecisionAttempt::Fallback { reason } => {
@@ -6671,6 +6760,7 @@ fn solve_arrow_newton_step_artifacts(
                             htt_factors,
                             schur_factor: None,
                             pcg_diagnostics: diag,
+                            gauge_deflated_directions,
                         });
                     }
                 }
@@ -6702,6 +6792,7 @@ fn solve_arrow_newton_step_artifacts(
         htt_factors,
         schur_factor,
         pcg_diagnostics,
+        gauge_deflated_directions,
     })
 }
 
@@ -7006,6 +7097,7 @@ fn solve_arrow_newton_step_cross_row(
         htt_factors: precond.htt_factors,
         schur_factor: Some(precond.schur_factor),
         pcg_diagnostics: diag,
+        gauge_deflated_directions: 0,
     })
 }
 

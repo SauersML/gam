@@ -488,7 +488,11 @@ fn canonicalize_for_identifiability_inner(
                 .as_ref()
                 .map(|cb| cb.n_outputs())
                 .unwrap_or(1);
-            let jac_nrows = if use_channel_aware { n_rows * k } else { n_rows };
+            let jac_nrows = if use_channel_aware {
+                n_rows * k
+            } else {
+                n_rows
+            };
             let p = spec.design.ncols();
             let zeros = vec![0.0f64; p];
             let state = FamilyLinearizationState {

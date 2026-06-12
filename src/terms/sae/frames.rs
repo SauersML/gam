@@ -372,7 +372,6 @@ impl FrameProjection {
     }
 }
 
-
 /// Relative spectral cutoff used when the Grassmann-frame factorization decides
 /// the effective column rank `r` of an atom's decoder `B_k` (issue #972). A
 /// singular value of `B_k` below `cutoff · σ_max` carries `< (σ/σ_max)²` of the
@@ -460,7 +459,10 @@ impl GrassmannFrame {
     /// (largest-magnitude entry per column non-negative) so the span serializes
     /// deterministically. The caller guarantees `U` is already column-orthonormal
     /// and its columns are ordered by descending singular value.
-    pub(crate) fn from_oriented(mut frame: Array2<f64>, gauge_singular_values: Array1<f64>) -> Self {
+    pub(crate) fn from_oriented(
+        mut frame: Array2<f64>,
+        gauge_singular_values: Array1<f64>,
+    ) -> Self {
         let (p, r) = frame.dim();
         for col in 0..r {
             // Sign-fix: make the largest-magnitude entry of each column
@@ -672,7 +674,6 @@ impl GrassmannCrossMoment {
         GrassmannFrame::polar_update(self.moment.view())
     }
 }
-
 
 /// Verification helper (issue #972): recover the planted low-rank column span of
 /// an atom by polaring the decoder-target cross-moment and report the largest

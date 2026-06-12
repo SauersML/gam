@@ -660,11 +660,11 @@ where
     };
 
     let n_scales = band.eps.len();
-    let parallel_ok =
-        m.saturating_mul(m)
-            .saturating_mul(n_scales)
-            .saturating_mul(n_forms)
-            <= MEASURE_JET_PARALLEL_FORM_BUDGET_DOUBLES;
+    let parallel_ok = m
+        .saturating_mul(m)
+        .saturating_mul(n_scales)
+        .saturating_mul(n_forms)
+        <= MEASURE_JET_PARALLEL_FORM_BUDGET_DOUBLES;
     let per_scale: Vec<Vec<Array2<f64>>> = if parallel_ok {
         band.eps
             .par_iter()
@@ -686,10 +686,7 @@ where
         }
     }
     // Numerical symmetrization (every analytic form here is symmetric).
-    Ok(totals
-        .into_iter()
-        .map(|t| (&t + &t.t()) * 0.5)
-        .collect())
+    Ok(totals.into_iter().map(|t| (&t + &t.t()) * 0.5).collect())
 }
 
 /// The multiscale jet-residual energy `Q` (m × m, symmetric PSD) on the
@@ -1270,7 +1267,12 @@ pub fn build_measure_jet_basis_psi_derivatives(
     let (n_coords, pairs, raw): (
         usize,
         Vec<(usize, usize)>,
-        Vec<(Array2<f64>, Vec<Array2<f64>>, Vec<Array2<f64>>, Vec<Array2<f64>>)>,
+        Vec<(
+            Array2<f64>,
+            Vec<Array2<f64>>,
+            Vec<Array2<f64>>,
+            Vec<Array2<f64>>,
+        )>,
     ) = if geom.per_level {
         let l_count = band.eps.len();
         // Six forms per scale: value, ∂α, ∂α², ∂lnτ, ∂lnτ², ∂α∂lnτ — same
@@ -1386,11 +1388,8 @@ pub fn build_measure_jet_basis_psi_derivatives(
             pair_crosses.push(zero_p());
         }
     }
-    let pair_index: Vec<((usize, usize), Vec<Array2<f64>>)> = pairs
-        .iter()
-        .copied()
-        .zip(crosses.into_iter())
-        .collect();
+    let pair_index: Vec<((usize, usize), Vec<Array2<f64>>)> =
+        pairs.iter().copied().zip(crosses.into_iter()).collect();
     let provider = AnisoPenaltyCrossProvider::new(move |a, b| {
         pair_index
             .iter()
@@ -1403,8 +1402,12 @@ pub fn build_measure_jet_basis_psi_derivatives(
             })
     });
     Ok(AnisoBasisPsiDerivatives {
-        design_first: (0..n_coords).map(|_| Array2::<f64>::zeros((n, p))).collect(),
-        design_second_diag: (0..n_coords).map(|_| Array2::<f64>::zeros((n, p))).collect(),
+        design_first: (0..n_coords)
+            .map(|_| Array2::<f64>::zeros((n, p)))
+            .collect(),
+        design_second_diag: (0..n_coords)
+            .map(|_| Array2::<f64>::zeros((n, p)))
+            .collect(),
         design_second_cross: Vec::new(),
         design_second_cross_pairs: Vec::new(),
         penalties_first,
@@ -1530,7 +1533,11 @@ mod tests {
         let m = 24usize;
         let centers = Array2::<f64>::from_shape_fn((m, 2), |(i, k)| {
             let t = i as f64 / (m as f64 - 1.0);
-            if k == 0 { t * 4.0 } else { 0.3 * (t * 4.0).sin() }
+            if k == 0 {
+                t * 4.0
+            } else {
+                0.3 * (t * 4.0).sin()
+            }
         });
         let masses = Array1::<f64>::from_elem(m, 1.0 / m as f64);
         let band = band_for(&centers);
@@ -1564,7 +1571,10 @@ mod tests {
         // Base form must equal the plain assembly bit-for-bit (same walk).
         let q_plain = q_at(s0, a0);
         for (a, b) in jets.q.iter().zip(q_plain.iter()) {
-            assert!((a - b).abs() <= 1e-14 * (1.0 + b.abs()), "Q drift {a} vs {b}");
+            assert!(
+                (a - b).abs() <= 1e-14 * (1.0 + b.abs()),
+                "Q drift {a} vs {b}"
+            );
         }
         let lt0 = tau.ln();
         let q_at_lt = |lt: f64| {
@@ -1606,15 +1616,8 @@ mod tests {
             }),
             ("d2q_ds_dlogtau", &jets.d2q_ds_dlogtau, {
                 let f = |s: f64, lt: f64| {
-                    measure_jet_energy_form(
-                        centers.view(),
-                        masses.view(),
-                        &band,
-                        s,
-                        a0,
-                        lt.exp(),
-                    )
-                    .expect("energy form")
+                    measure_jet_energy_form(centers.view(), masses.view(), &band, s, a0, lt.exp())
+                        .expect("energy form")
                 };
                 let pp = f(s0 + h, lt0 + h);
                 let pm = f(s0 + h, lt0 - h);
@@ -1624,15 +1627,8 @@ mod tests {
             }),
             ("d2q_dalpha_dlogtau", &jets.d2q_dalpha_dlogtau, {
                 let f = |a: f64, lt: f64| {
-                    measure_jet_energy_form(
-                        centers.view(),
-                        masses.view(),
-                        &band,
-                        s0,
-                        a,
-                        lt.exp(),
-                    )
-                    .expect("energy form")
+                    measure_jet_energy_form(centers.view(), masses.view(), &band, s0, a, lt.exp())
+                        .expect("energy form")
                 };
                 let pp = f(a0 + h, lt0 + h);
                 let pm = f(a0 + h, lt0 - h);
@@ -1733,7 +1729,11 @@ mod tests {
         let n = 40usize;
         let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
             let t = i as f64 / (n as f64 - 1.0);
-            if k == 0 { t * 3.0 } else { 0.4 * (t * 3.0).sin() }
+            if k == 0 {
+                t * 3.0
+            } else {
+                0.4 * (t * 3.0).sin()
+            }
         });
         let spec = MeasureJetBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 14 },
@@ -1809,15 +1809,19 @@ mod tests {
     #[test]
     fn psi_producer_matches_fd_per_level_mode() {
         let (data, frozen) = frozen_spec_fixture(0.0);
-        let derivs = build_measure_jet_basis_psi_derivatives(data.view(), &frozen)
-            .expect("psi derivatives");
+        let derivs =
+            build_measure_jet_basis_psi_derivatives(data.view(), &frozen).expect("psi derivatives");
         let l_count = frozen
             .frozen_quadrature
             .as_ref()
             .expect("frozen quadrature")
             .eps_band
             .len();
-        assert_eq!(derivs.penalties_first.len(), 2, "per-level coords are (α, lnτ)");
+        assert_eq!(
+            derivs.penalties_first.len(),
+            2,
+            "per-level coords are (α, lnτ)"
+        );
         assert_eq!(derivs.penalties_first[0].len(), l_count + 1);
         assert_eq!(derivs.penalties_cross_pairs, vec![(0, 1)]);
         let pen_at = |alpha: f64, tau0: f64| {
@@ -1836,7 +1840,11 @@ mod tests {
         let am = pen_at(a0 - h, t0);
         let tp = pen_at(a0, t0 * h.exp());
         let tm = pen_at(a0, t0 * (-h).exp());
-        assert_eq!(ap.len(), l_count + 1, "fixture must keep every scale active");
+        assert_eq!(
+            ap.len(),
+            l_count + 1,
+            "fixture must keep every scale active"
+        );
         for level in 0..l_count {
             let fd_alpha = (&ap[level] - &am[level]) / (2.0 * h);
             let fd_tau = (&tp[level] - &tm[level]) / (2.0 * h);
@@ -1888,9 +1896,13 @@ mod tests {
     #[test]
     fn psi_producer_matches_fd_fused_mode() {
         let (data, frozen) = frozen_spec_fixture(1.3);
-        let derivs = build_measure_jet_basis_psi_derivatives(data.view(), &frozen)
-            .expect("psi derivatives");
-        assert_eq!(derivs.penalties_first.len(), 3, "fused coords are (s, α, lnτ)");
+        let derivs =
+            build_measure_jet_basis_psi_derivatives(data.view(), &frozen).expect("psi derivatives");
+        assert_eq!(
+            derivs.penalties_first.len(),
+            3,
+            "fused coords are (s, α, lnτ)"
+        );
         assert_eq!(derivs.penalties_first[0].len(), 2, "primary + ridge");
         let pen_at = |s: f64| {
             let trial = MeasureJetBasisSpec {
