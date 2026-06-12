@@ -231,7 +231,11 @@ impl Default for MeasureJetBasisSpec {
         Self {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 50 },
             order_s: 0.0,
-            alpha: 1.0,
+            // Density-free limiting energy: the local contribution scales as
+            // ρ^{3−2α}, so α = 3/2 cancels the sampling density exactly
+            // (α = 1 weighted the roughness by ρ; see the module-header
+            // derivation).
+            alpha: 1.5,
             tau0: 1e-3,
             num_scales: 0,
             length_scale: 0.0,
