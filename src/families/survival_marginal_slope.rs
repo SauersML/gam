@@ -14119,61 +14119,36 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
             return None;
         }
         let n_rows = self.family.n;
-        let rank = factor.ncols();
-        if rank == 0 {
-            return Some(Array2::<f64>::zeros((n_rows, 0)));
-        }
+        // Whole-projection build: each axis uses the batched design matvec
+        // (`fast_ab` on dense, one operator `dot` per column on operator-backed
+        // designs).
+        Some(self.assemble_jf(factor, n_rows, |design, factor_block| {
+            survival_axis_jf_via_design(design, factor_block, n_rows)
+        }))
+    }
 
-        let f_time = factor.slice(s![self.slices.time.clone(), ..]);
-        let f_marginal = factor.slice(s![self.slices.marginal.clone(), ..]);
-        let f_logslope = factor.slice(s![self.slices.logslope.clone(), ..]);
-
-        // Assemble the (n × 4·rank) projection holding at most one `n × rank`
-        // transient alive at a time (plus the reused marginal block), rather
-        // than all five axis projections simultaneously. At large scale each
-        // `n × rank` block is hundreds of MiB; materializing five at once on
-        // top of the output was the bulk of the survival outer-loop memory
-        // spike. The marginal block feeds both the entry and exit axes, so it
-        // is computed once and dropped after; every other axis projection is a
-        // statement-scoped temporary freed before the next is built. (For
-        // shapes where even the 4·rank output would blow the materialization
-        // budget, the trace path streams and never calls this builder.)
-        let mut jf = Array2::<f64>::zeros((n_rows, 4 * rank));
-        {
-            let jf_marginal =
-                survival_axis_jf_via_design(&self.family.marginal_design, f_marginal, n_rows);
-            {
-                let mut axis0 = jf.slice_mut(s![.., 0..rank]);
-                axis0.assign(&survival_axis_jf_via_design(
-                    &self.family.design_entry,
-                    f_time,
-                    n_rows,
-                ));
-                axis0 += &jf_marginal;
-            }
-            {
-                let mut axis1 = jf.slice_mut(s![.., rank..2 * rank]);
-                axis1.assign(&survival_axis_jf_via_design(
-                    &self.family.design_exit,
-                    f_time,
-                    n_rows,
-                ));
-                axis1 += &jf_marginal;
-            }
+    fn jacobian_action_matrix_rows(
+        &self,
+        factor: ArrayView2<'_, f64>,
+        start: usize,
+        end: usize,
+    ) -> Array2<f64> {
+        if factor.nrows() != self.slices.total {
+            // Shape contract broken (the tiled trace always passes the
+            // coefficient-width factor, so this is defensive only): fall back
+            // to the exact generic per-row build over the range.
+            return crate::families::row_kernel::row_kernel_jacobian_action_matrix_generic_rows(
+                self, factor, start, end,
+            );
         }
-        jf.slice_mut(s![.., 2 * rank..3 * rank])
-            .assign(&survival_axis_jf_via_design(
-                &self.family.design_derivative_exit,
-                f_time,
-                n_rows,
-            ));
-        jf.slice_mut(s![.., 3 * rank..4 * rank])
-            .assign(&survival_axis_jf_via_design(
-                &self.family.logslope_design,
-                f_logslope,
-                n_rows,
-            ));
-        Some(jf)
+        // Block-tiled build for one row-tile: dense designs slice to a
+        // contiguous row block and GEMM (`fast_ab`), operator/sparse designs
+        // fall to a row-local dot over the range. Bounds peak memory to the
+        // tile while keeping BLAS-3 on the materialized designs.
+        let b = end.saturating_sub(start);
+        self.assemble_jf(factor, b, |design, factor_block| {
+            survival_axis_jf_via_design_rows(design, factor_block, start, end)
+        })
     }
 
     fn jacobian_transpose_action(&self, row: usize, v: &[f64; 4], out: &mut [f64]) {
@@ -14283,6 +14258,51 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     }
 }
 
+impl SurvivalMarginalSlopeRowKernel {
+    /// Assemble the `(n_out × 4·rank)` joint Jacobian-action projection `Jᵢ · F`
+    /// from the four primary axes — `[entry+marginal | exit+marginal |
+    /// derivative | logslope]` — given a per-axis builder `axis(design,
+    /// factor_block)` that produces that design's `n_out × rank` contribution.
+    /// The whole-projection path passes the batched builder; the block-tiled
+    /// path passes the row-range builder. Either way at most one axis transient
+    /// is alive at a time: the marginal block feeds both the entry and exit
+    /// axes, so it is built once and dropped, and every other axis is a
+    /// statement-scoped temporary — keeping the assembly peak at
+    /// `output + one n_out×rank block` rather than five blocks at once.
+    fn assemble_jf<F>(&self, factor: ArrayView2<'_, f64>, n_out: usize, axis: F) -> Array2<f64>
+    where
+        F: Fn(&DesignMatrix, ArrayView2<'_, f64>) -> Array2<f64>,
+    {
+        let rank = factor.ncols();
+        if rank == 0 {
+            return Array2::<f64>::zeros((n_out, 0));
+        }
+        let f_time = factor.slice(s![self.slices.time.clone(), ..]);
+        let f_marginal = factor.slice(s![self.slices.marginal.clone(), ..]);
+        let f_logslope = factor.slice(s![self.slices.logslope.clone(), ..]);
+
+        let mut jf = Array2::<f64>::zeros((n_out, 4 * rank));
+        {
+            let jf_marginal = axis(&self.family.marginal_design, f_marginal);
+            {
+                let mut axis0 = jf.slice_mut(s![.., 0..rank]);
+                axis0.assign(&axis(&self.family.design_entry, f_time));
+                axis0 += &jf_marginal;
+            }
+            {
+                let mut axis1 = jf.slice_mut(s![.., rank..2 * rank]);
+                axis1.assign(&axis(&self.family.design_exit, f_time));
+                axis1 += &jf_marginal;
+            }
+        }
+        jf.slice_mut(s![.., 2 * rank..3 * rank])
+            .assign(&axis(&self.family.design_derivative_exit, f_time));
+        jf.slice_mut(s![.., 3 * rank..4 * rank])
+            .assign(&axis(&self.family.logslope_design, f_logslope));
+        jf
+    }
+}
+
 fn survival_axis_jf_via_design(
     design: &DesignMatrix,
     factor_block: ArrayView2<'_, f64>,
@@ -14300,6 +14320,42 @@ fn survival_axis_jf_via_design(
             for c in 0..rank {
                 let result = design.dot(&factor.column(c).to_owned());
                 out.column_mut(c).assign(&result);
+            }
+            out
+        }
+    }
+}
+
+/// Row-range analogue of [`survival_axis_jf_via_design`]: one design's
+/// `(end-start) × rank` Jacobian-action block over rows `[start, end)`. Dense
+/// designs slice to a contiguous row block and GEMM via `fast_ab` (BLAS-3,
+/// zero-copy slice); sparse/operator designs fall to a row-local
+/// `dot_row_view` over the range (each entry touches only its own row, so
+/// tiling never re-walks the full operator). Used by the block-tiled trace to
+/// hold one row-tile at a time instead of the whole `n × rank` projection.
+fn survival_axis_jf_via_design_rows(
+    design: &DesignMatrix,
+    factor_block: ArrayView2<'_, f64>,
+    start: usize,
+    end: usize,
+) -> Array2<f64> {
+    let b = end.saturating_sub(start);
+    let rank = factor_block.ncols();
+    if rank == 0 {
+        return Array2::<f64>::zeros((b, 0));
+    }
+    let factor = factor_block.as_standard_layout().into_owned();
+    match design.as_dense_ref() {
+        Some(dense) => {
+            let block = dense.slice(s![start..end, ..]);
+            fast_ab(&block, &factor)
+        }
+        None => {
+            let mut out = Array2::<f64>::zeros((b, rank));
+            for (i, row) in (start..end).enumerate() {
+                for c in 0..rank {
+                    out[[i, c]] = design.dot_row_view(row, factor.column(c));
+                }
             }
             out
         }

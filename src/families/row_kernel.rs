@@ -34,26 +34,49 @@ use std::sync::Arc;
 const ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS: usize = 100_000;
 const ARROW_ROW_CHUNK: usize = 256;
 
-/// Byte budget for materializing the dense `J·F` projection (`n × K·rank`
-/// f64) that the cached trace fast path builds and caches. Aligned with
-/// `ResourcePolicy`'s default single-materialization budget (1 GiB). When the
-/// projection would exceed this, `trace_projected_factor[_cached]` instead
-/// streams the trace row-by-row — recomputing each row's `Jᵣ·F` on the fly and
-/// consuming it immediately — so peak memory stays O(rank) regardless of `n`.
-/// Without this gate a 320K-row survival fit with rank ~1000 materializes a
-/// ~10 GiB `J·F` (the family override additionally holds several `n × rank`
-/// transients during assembly), OOM-killing the host mid outer-iteration.
+/// Byte budget above which the full dense `J·F` projection (`n × K·rank` f64)
+/// is no longer materialized-and-cached whole. Aligned with `ResourcePolicy`'s
+/// default single-materialization budget (1 GiB). Below it, the cached fast
+/// path builds the whole projection once and reuses it across the many trace
+/// calls that share one factor within an outer iteration (the cross-call
+/// amortization the cache exists for). Above it, the trace switches to the
+/// block-tiled path — same BLAS-3 GEMM, but produced and consumed one row-tile
+/// at a time so peak memory is one tile, not the whole `n × K·rank` (a 320K-row
+/// fit at rank ~1000 would otherwise pin ~10 GiB and OOM the host).
 const JF_MATERIALIZATION_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Working-set budget for a single `J·F` row-tile in the block-tiled trace.
+/// 256 MiB matches `ResourcePolicy::analytic_operator_required`'s strict
+/// single-materialization budget: large enough that each tile's GEMM amortizes
+/// well and the reused factor stays hot, small enough to bound peak resident
+/// memory regardless of `n`.
+const JF_TILE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Whether the dense `n_rows × K·rank` f64 `J·F` projection would exceed
 /// [`JF_MATERIALIZATION_BUDGET_BYTES`]. Saturating so the product can never
 /// wrap on pathological dimensions (a wrap would falsely report "fits").
 fn jf_projection_exceeds_budget<const K: usize>(n_rows: usize, rank: usize) -> bool {
+    jf_projection_bytes::<K>(n_rows, rank) > JF_MATERIALIZATION_BUDGET_BYTES
+}
+
+/// Bytes of a dense `n_rows × K·rank` f64 projection (saturating).
+#[inline]
+fn jf_projection_bytes<const K: usize>(n_rows: usize, rank: usize) -> usize {
     n_rows
         .saturating_mul(K)
         .saturating_mul(rank)
         .saturating_mul(std::mem::size_of::<f64>())
-        > JF_MATERIALIZATION_BUDGET_BYTES
+}
+
+/// Row-tile height for the block-tiled trace: the largest multiple of
+/// [`ARROW_ROW_CHUNK`] whose `tile × K·rank` f64 projection fits
+/// [`JF_TILE_BUDGET_BYTES`] (floored at one chunk so progress is always made).
+/// A multiple of the chunk keeps the per-tile deterministic sub-chunk
+/// summation associatively identical to the whole-projection path.
+fn jf_tile_rows<const K: usize>(rank: usize) -> usize {
+    let per_row = (K.saturating_mul(rank)).max(1) * std::mem::size_of::<f64>();
+    let max_rows = (JF_TILE_BUDGET_BYTES / per_row).max(1);
+    (max_rows / ARROW_ROW_CHUNK).max(1) * ARROW_ROW_CHUNK
 }
 
 #[inline]
@@ -399,6 +422,22 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     fn jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
         Some(row_kernel_jacobian_action_matrix_generic(self, factor))
     }
+
+    /// Row-range analogue of [`Self::jacobian_action_matrix`]: `Jᵢ · F` for the
+    /// half-open row range `[start, end)`, returned as an `((end-start) ×
+    /// stride)` dense block. Used by the block-tiled trace to bound peak memory
+    /// to one tile while keeping the structured BLAS-3 path: a kernel that
+    /// overrides `jacobian_action_matrix` with a GEMM should override this with
+    /// the same GEMM restricted to a contiguous slice of its design rows. The
+    /// default is the exact generic per-row build over the range.
+    fn jacobian_action_matrix_rows(
+        &self,
+        factor: ArrayView2<'_, f64>,
+        start: usize,
+        end: usize,
+    ) -> Array2<f64> {
+        row_kernel_jacobian_action_matrix_generic_rows(self, factor, start, end)
+    }
 }
 
 fn row_kernel_jacobian_action_matrix_generic<const K: usize>(
@@ -423,6 +462,48 @@ fn row_kernel_jacobian_action_matrix_generic<const K: usize>(
         .par_chunks_mut(stride)
         .enumerate()
         .for_each(|(row, jf_row)| {
+            for k_col in 0..rank {
+                let f_slice = f_t
+                    .row(k_col)
+                    .to_slice()
+                    .expect("standard-layout row must be contiguous");
+                let vec_k = kern.jacobian_action(row, f_slice);
+                for k in 0..K {
+                    jf_row[k * rank + k_col] = vec_k[k];
+                }
+            }
+        });
+    jf
+}
+
+/// Generic per-row `Jᵢ · F` over the half-open row range `[start, end)`.
+/// Identical math to [`row_kernel_jacobian_action_matrix_generic`] restricted
+/// to a row slice; `jf_row[local]` corresponds to global row `start + local`.
+pub(crate) fn row_kernel_jacobian_action_matrix_generic_rows<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+    factor: ArrayView2<'_, f64>,
+    start: usize,
+    end: usize,
+) -> Array2<f64> {
+    assert_eq!(
+        factor.nrows(),
+        kern.n_coefficients(),
+        "row-kernel JF factor row count must match coefficient dimension"
+    );
+    let rank = factor.ncols();
+    let stride = K * rank;
+    let b = end.saturating_sub(start);
+    let mut jf = Array2::<f64>::zeros((b, stride));
+    if b == 0 || rank == 0 {
+        return jf;
+    }
+    let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
+    jf.as_slice_mut()
+        .expect("row-major JF matrix must be contiguous")
+        .par_chunks_mut(stride)
+        .enumerate()
+        .for_each(|(local, jf_row)| {
+            let row = start + local;
             for k_col in 0..rank {
                 let f_slice = f_t
                     .row(k_col)
@@ -892,7 +973,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
             return 0.0;
         }
         if jf_projection_exceeds_budget::<K>(n_rows, rank) {
-            return self.trace_projected_factor_streaming(factor);
+            return self.trace_projected_factor_tiled(factor);
         }
         let jf = self.compute_jf(factor);
         self.trace_projected_factor_with_jf(factor, jf.view())
@@ -918,7 +999,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
             return 0.0;
         }
         if jf_projection_exceeds_budget::<K>(n_rows, rank) {
-            return self.trace_projected_factor_streaming(factor);
+            return self.trace_projected_factor_tiled(factor);
         }
         let jf = self.cached_jf(factor, cache);
         self.trace_projected_factor_with_jf(factor, jf.view())
@@ -1201,55 +1282,68 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
         })
     }
 
-    /// Memory-bounded trace for large-scale shapes: the same
-    /// `tr(FᵀBF) = Σ_r Σ_k (Jᵣ·F[:,k])ᵀ Tᵣ (Jᵣ·F[:,k])` as
-    /// [`Self::trace_projected_factor_with_jf`], but the per-row `Jᵣ·F[:,k]`
-    /// is recomputed on the fly via `jacobian_action` instead of read from a
-    /// prebuilt `n × K·rank` projection. Peak memory is O(rank) (the
-    /// transposed factor's contiguous columns) rather than O(n·K·rank), so a
-    /// 320K-row fit at large rank no longer pins ~10 GiB. The expensive
-    /// per-row work (`row_third_contracted`) is identical and computed once
-    /// per row; only the cheap jacobian projection is no longer batched into
-    /// a GEMM, which is the deliberate compute-for-memory trade taken solely
-    /// when the dense projection would blow the materialization budget.
-    fn trace_projected_factor_streaming(&self, factor: &Array2<f64>) -> f64 {
+    /// Memory-bounded trace for large-scale shapes — the block-tiled form of
+    /// [`Self::trace_projected_factor_with_jf`] computing the identical
+    /// `tr(FᵀBF) = Σ_r Σ_k (Jᵣ·F[:,k])ᵀ Tᵣ (Jᵣ·F[:,k])`. Rather than build and
+    /// cache the whole `n × K·rank` projection, it walks contiguous row-tiles:
+    /// each tile's `J·F` slice is produced by the same structured BLAS-3 GEMM
+    /// ([`RowKernel::jacobian_action_matrix_rows`]), consumed immediately by the
+    /// per-row jet contraction, then dropped — so peak memory is one tile
+    /// (≤ [`JF_TILE_BUDGET_BYTES`]) regardless of `n`, while the GEMM throughput
+    /// and cache-blocking of the fast path are preserved. Tiles are a multiple
+    /// of [`ARROW_ROW_CHUNK`] and summed in order, so the result is
+    /// associatively identical to the whole-projection path.
+    fn trace_projected_factor_tiled(&self, factor: &Array2<f64>) -> f64 {
         let rank = factor.ncols();
         let n_rows = self.kern.n_rows();
         let direction = self.direction.as_slice();
-        // Contiguous columns of F: row `k_col` of `f_t` is `F[:, k_col]`.
-        let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
+        let tile = jf_tile_rows::<K>(rank);
 
-        deterministic_chunked_sum(n_rows, |chunk_idx| -> f64 {
-            let start = chunk_idx * ARROW_ROW_CHUNK;
-            let end = (start + ARROW_ROW_CHUNK).min(n_rows);
-            let mut chunk_total = 0.0_f64;
-            for row in start..end {
-                let dir_k = self.kern.jacobian_action(row, direction);
-                let third = self
-                    .kern
-                    .row_third_contracted(row, &dir_k)
-                    .expect("row-kernel third contraction should succeed for validated directions");
-                let mut row_total = 0.0_f64;
-                for k_col in 0..rank {
-                    let f_col = f_t
-                        .row(k_col)
+        let mut total = 0.0_f64;
+        let mut tile_start = 0;
+        while tile_start < n_rows {
+            let tile_end = (tile_start + tile).min(n_rows);
+            let jf = self
+                .kern
+                .jacobian_action_matrix_rows(factor.view(), tile_start, tile_end);
+            let b = tile_end - tile_start;
+            total += deterministic_chunked_sum(b, |chunk_idx| -> f64 {
+                let start = chunk_idx * ARROW_ROW_CHUNK;
+                let end = (start + ARROW_ROW_CHUNK).min(b);
+                let mut chunk_total = 0.0_f64;
+                for local in start..end {
+                    let row = tile_start + local;
+                    let dir_k = self.kern.jacobian_action(row, direction);
+                    let third = self.kern.row_third_contracted(row, &dir_k).expect(
+                        "row-kernel third contraction should succeed for validated directions",
+                    );
+                    let jf_slice = jf
+                        .row(local)
                         .to_slice()
-                        .expect("standard-layout factor row must be contiguous");
-                    let vec_k = self.kern.jacobian_action(row, f_col);
-                    let mut quad = 0.0_f64;
-                    for a in 0..K {
-                        let mut t_dot = 0.0_f64;
-                        for b in 0..K {
-                            t_dot += third[a][b] * vec_k[b];
+                        .expect("J·F tile is built standard-layout (row-major)");
+                    let mut row_total = 0.0_f64;
+                    for k_col in 0..rank {
+                        let mut vec_k = [0.0_f64; K];
+                        for k in 0..K {
+                            vec_k[k] = jf_slice[k * rank + k_col];
                         }
-                        quad += vec_k[a] * t_dot;
+                        let mut quad = 0.0_f64;
+                        for a in 0..K {
+                            let mut t_dot = 0.0_f64;
+                            for b2 in 0..K {
+                                t_dot += third[a][b2] * vec_k[b2];
+                            }
+                            quad += vec_k[a] * t_dot;
+                        }
+                        row_total += quad;
                     }
-                    row_total += quad;
+                    chunk_total += row_total;
                 }
-                chunk_total += row_total;
-            }
-            chunk_total
-        })
+                chunk_total
+            });
+            tile_start = tile_end;
+        }
+        total
     }
 }
 
@@ -1319,7 +1413,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
             return 0.0;
         }
         if jf_projection_exceeds_budget::<K>(n_rows, rank) {
-            return self.trace_projected_factor_streaming(factor);
+            return self.trace_projected_factor_tiled(factor);
         }
         let jf = self.compute_jf(factor);
         self.trace_projected_factor_with_jf(factor, jf.view())
@@ -1340,7 +1434,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
             return 0.0;
         }
         if jf_projection_exceeds_budget::<K>(n_rows, rank) {
-            return self.trace_projected_factor_streaming(factor);
+            return self.trace_projected_factor_tiled(factor);
         }
         let jf = self.cached_jf(factor, cache);
         self.trace_projected_factor_with_jf(factor, jf.view())
@@ -1430,49 +1524,66 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
     }
 
     /// Memory-bounded trace — second-derivative analogue of
-    /// [`RowKernelDirectionalDerivativeOperator::trace_projected_factor_streaming`].
-    /// Recomputes each row's `Jᵣ·F[:,k]` on the fly instead of reading a
-    /// prebuilt `n × K·rank` projection, holding the per-row
-    /// `row_fourth_contracted` jet once per row. Peak memory O(rank); taken
-    /// only when the dense projection would exceed the materialization budget.
-    fn trace_projected_factor_streaming(&self, factor: &Array2<f64>) -> f64 {
+    /// [`RowKernelDirectionalDerivativeOperator::trace_projected_factor_tiled`].
+    /// Walks contiguous row-tiles, producing each tile's `J·F` slice by the
+    /// structured BLAS-3 GEMM ([`RowKernel::jacobian_action_matrix_rows`]) and
+    /// consuming it with the per-row `row_fourth_contracted` jet before
+    /// dropping it. Peak memory one tile (≤ [`JF_TILE_BUDGET_BYTES`]); tiles are
+    /// a multiple of [`ARROW_ROW_CHUNK`] and summed in order, so the result is
+    /// associatively identical to the whole-projection path.
+    fn trace_projected_factor_tiled(&self, factor: &Array2<f64>) -> f64 {
         let rank = factor.ncols();
         let n_rows = self.kern.n_rows();
         let direction_u = self.direction_u.as_slice();
         let direction_v = self.direction_v.as_slice();
-        let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
+        let tile = jf_tile_rows::<K>(rank);
 
-        deterministic_chunked_sum(n_rows, |chunk_idx| -> f64 {
-            let start = chunk_idx * ARROW_ROW_CHUNK;
-            let end = (start + ARROW_ROW_CHUNK).min(n_rows);
-            let mut chunk_total = 0.0_f64;
-            for row in start..end {
-                let dir_u = self.kern.jacobian_action(row, direction_u);
-                let dir_v = self.kern.jacobian_action(row, direction_v);
-                let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
-                    "row-kernel fourth contraction should succeed for validated directions",
-                );
-                let mut row_total = 0.0_f64;
-                for k_col in 0..rank {
-                    let f_col = f_t
-                        .row(k_col)
+        let mut total = 0.0_f64;
+        let mut tile_start = 0;
+        while tile_start < n_rows {
+            let tile_end = (tile_start + tile).min(n_rows);
+            let jf = self
+                .kern
+                .jacobian_action_matrix_rows(factor.view(), tile_start, tile_end);
+            let b = tile_end - tile_start;
+            total += deterministic_chunked_sum(b, |chunk_idx| -> f64 {
+                let start = chunk_idx * ARROW_ROW_CHUNK;
+                let end = (start + ARROW_ROW_CHUNK).min(b);
+                let mut chunk_total = 0.0_f64;
+                for local in start..end {
+                    let row = tile_start + local;
+                    let dir_u = self.kern.jacobian_action(row, direction_u);
+                    let dir_v = self.kern.jacobian_action(row, direction_v);
+                    let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
+                        "row-kernel fourth contraction should succeed for validated directions",
+                    );
+                    let jf_slice = jf
+                        .row(local)
                         .to_slice()
-                        .expect("standard-layout factor row must be contiguous");
-                    let vec_k = self.kern.jacobian_action(row, f_col);
-                    let mut quad = 0.0_f64;
-                    for a in 0..K {
-                        let mut t_dot = 0.0_f64;
-                        for b in 0..K {
-                            t_dot += fourth[a][b] * vec_k[b];
+                        .expect("J·F tile is built standard-layout (row-major)");
+                    let mut row_total = 0.0_f64;
+                    for k_col in 0..rank {
+                        let mut vec_k = [0.0_f64; K];
+                        for k in 0..K {
+                            vec_k[k] = jf_slice[k * rank + k_col];
                         }
-                        quad += vec_k[a] * t_dot;
+                        let mut quad = 0.0_f64;
+                        for a in 0..K {
+                            let mut t_dot = 0.0_f64;
+                            for b2 in 0..K {
+                                t_dot += fourth[a][b2] * vec_k[b2];
+                            }
+                            quad += vec_k[a] * t_dot;
+                        }
+                        row_total += quad;
                     }
-                    row_total += quad;
+                    chunk_total += row_total;
                 }
-                chunk_total += row_total;
-            }
-            chunk_total
-        })
+                chunk_total
+            });
+            tile_start = tile_end;
+        }
+        total
     }
 }
 
