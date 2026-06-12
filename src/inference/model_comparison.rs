@@ -1,6 +1,6 @@
 //! Honest, calibrated model comparison computed from machinery already present
 //! at the fit optimum — exact smoothing-corrected conditional AIC and zero-refit
-//! PSIS-LOO (issue #946).
+//! ALO elpd with an influence diagnostic (issue #946).
 //!
 //! Every consumer (the topology race, the SAE fit payload, the `compare`
 //! entry point) reads the same two channels:
@@ -16,11 +16,12 @@
 //!   so the correction is the first exact instance of this estimator — not the
 //!   approximation mgcv must use, and not the omission most software ships.
 //!
-//! * **PSIS-LOO elpd.** Pointwise log predictive densities evaluated at the
+//! * **ALO elpd.** Pointwise log predictive densities evaluated at the
 //!   ALO-corrected leave-one-out predictions (no refits — the ALO solves reuse
-//!   the fit's factored Hessian), Pareto-smoothed with the Zhang–Stephens
-//!   tail-shape `k̂` reliability diagnostic ([`crate::inference::psis`]). This is
-//!   the `loo`-package estimator computed without re-fitting the model.
+//!   the fit's factored Hessian). The summed elpd is exactly
+//!   `Σᵢ ℓ(yᵢ|η̃₋ᵢ)`. A Pareto tail fit of the cross-observation fitted-vs-ALO
+//!   ratio distribution is reported only as an influence diagnostic; it is not
+//!   draw-wise PSIS-LOO and does not alter the pointwise contributions.
 //!
 //! Both channels are *corroboration*: they ride alongside the evidence headline
 //! a race already produces, never replacing it.
@@ -31,23 +32,21 @@ use crate::inference::psis::pareto_smooth_weights;
 use crate::types::{GlmLikelihoodSpec, LikelihoodSpec};
 use ndarray::{Array1, ArrayView1, ArrayView2};
 
-/// PSIS-LOO predictive-accuracy summary at zero refit cost.
+/// ALO predictive-accuracy summary at zero refit cost.
 #[derive(Debug, Clone)]
-pub struct PsisLoo {
-    /// Expected log pointwise predictive density (the `loo` `elpd_loo`),
-    /// `Σᵢ log( Σ_s w_{si} p(yᵢ|·) / Σ_s w_{si} )` with the single-fit ALO
-    /// importance ratios; here the per-point sum collapses to the smoothed
-    /// pointwise contribution.
+pub struct AloElpd {
+    /// Expected log pointwise predictive density, `Σᵢ ℓ(yᵢ|η̃₋ᵢ)`.
     pub elpd: f64,
-    /// Standard error of `elpd`, `√(n · Var(pointwise))` — the `loo`-package
-    /// estimator.
+    /// Standard error of `elpd`, `√(n · Var(pointwise))`.
     pub se: f64,
-    /// Per-observation elpd contributions (length `n`).
+    /// Per-observation ALO elpd contributions (length `n`).
     pub pointwise: Array1<f64>,
-    /// Largest Pareto tail-shape `k̂` over the importance weights. Values above
-    /// `0.7` mean the corresponding LOO estimates are unreliable.
+    /// GPD tail-shape `k̂` of the cross-observation fitted-vs-ALO ratio
+    /// distribution. This is an influence diagnostic, not a PSIS-LOO reliability
+    /// diagnostic.
     pub k_hat_max: f64,
-    /// Number of observations whose `k̂` exceeds the `0.7` reliability cutoff.
+    /// Number of tail observations flagged when the influence diagnostic exceeds
+    /// the `0.7` heavy-tail cutoff.
     pub n_k_bad: usize,
 }
 
@@ -84,9 +83,9 @@ pub struct ModelComparison {
     pub aic_conditional: f64,
     /// `−2·ℓ + 2·edf_corrected` (Wood–Pya–Säfken).
     pub aic_corrected: f64,
-    /// Zero-refit PSIS-LOO predictive comparison, when ALO diagnostics and the
-    /// per-row family kernel are available.
-    pub loo: Option<PsisLoo>,
+    /// Zero-refit ALO predictive comparison, when ALO diagnostics and the per-row
+    /// family kernel are available.
+    pub loo: Option<AloElpd>,
 }
 
 /// Exact Wood–Pya–Säfken corrected effective degrees of freedom.
@@ -150,23 +149,28 @@ fn wps_correction_term(
     if trace.is_finite() { trace } else { 0.0 }
 }
 
-/// PSIS-LOO from ALO-corrected leave-one-out predictions.
+/// ALO elpd from ALO-corrected leave-one-out predictions.
 ///
 /// `loglik_fitted` and `loglik_loo` are the per-observation log predictive
 /// densities at the *fitted* (`η̂`) and *ALO leave-one-out* (`η̃₋ᵢ`) linear
-/// predictors respectively. The raw importance ratio for observation `i` is
+/// predictors respectively. The returned elpd is the honest ALO estimand
+/// `Σᵢ loglik_loo[i]`; each pointwise contribution is exactly `loglik_loo[i]`.
+///
+/// The raw fitted-vs-ALO ratio for observation `i` is
 /// `r_i = exp(ℓ(yᵢ|η̂ᵢ) − ℓ(yᵢ|η̃₋ᵢ))` — large where dropping `i` would have
-/// moved the fit a lot, exactly the points PSIS smooths. We Pareto-smooth the
-/// ratio vector, read back the per-point `k̂` from the tail fit, and report the
-/// smoothed pointwise LOO densities `ℓ(yᵢ|η̃₋ᵢ) + log(r̃_i / r_i)` re-centred so
-/// the smoothing only adjusts the heavy tail.
+/// moved the fit a lot. We fit a GPD tail to this cross-observation ratio vector
+/// only to report an influence diagnostic: `k_hat_max` is the fitted tail shape
+/// and `n_k_bad` is the tail count when `k̂ > 0.7`. This is not draw-wise
+/// PSIS-LOO: there is no posterior-draw dimension, the Pareto fit is across
+/// observations, and the diagnostic never changes elpd.
 ///
 /// Returns `None` when the inputs are degenerate (non-finite, mismatched
-/// lengths, or too few points for a tail fit).
-pub fn psis_loo(
+/// lengths, or empty). If the influence tail fit is unavailable, `k_hat_max` is
+/// `NaN` and `n_k_bad` is zero.
+pub fn alo_elpd(
     loglik_fitted: ArrayView1<'_, f64>,
     loglik_loo: ArrayView1<'_, f64>,
-) -> Option<PsisLoo> {
+) -> Option<AloElpd> {
     let n = loglik_loo.len();
     if n == 0 || loglik_fitted.len() != n {
         return None;
@@ -178,9 +182,9 @@ pub fn psis_loo(
     {
         return None;
     }
-    // Raw importance ratios r_i = p(y_i|η̂_i) / p(y_i|η̃₋ᵢ) = exp(ℓ̂ - ℓ₋ᵢ).
-    // Stabilize by subtracting the max log-ratio before exponentiating (a
-    // constant shift cancels in the smoothed/raw quotient below).
+    // Cross-observation influence ratios r_i = p(y_i|η̂_i) / p(y_i|η̃₋ᵢ).
+    // Stabilize by subtracting the max log-ratio before exponentiating; the
+    // multiplicative constant does not change the fitted GPD shape.
     let log_ratio: Array1<f64> = &loglik_fitted.to_owned() - &loglik_loo.to_owned();
     let max_lr = log_ratio.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if !max_lr.is_finite() {
@@ -188,40 +192,19 @@ pub fn psis_loo(
     }
     let raw: Vec<f64> = log_ratio.iter().map(|&lr| (lr - max_lr).exp()).collect();
 
-    let pointwise: Array1<f64>;
     let (k_hat_max, n_k_bad);
     match pareto_smooth_weights(&raw) {
         Some(psis) => {
-            // Smoothed pointwise LOO density: shift each ℓ₋ᵢ by the log-correction
-            // the tail smoothing applied to its importance ratio. Non-tail points
-            // are bit-identical (smoothed == raw → zero shift).
-            let mut pw = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let r = raw[i];
-                let rs = psis.smoothed[i];
-                let shift = if r > 0.0 && rs > 0.0 {
-                    (rs / r).ln()
-                } else {
-                    0.0
-                };
-                pw[i] = loglik_loo[i] + shift;
-            }
-            pointwise = pw;
-            // Single-fit ALO gives one importance weight per point; the tail fit
-            // produces one k̂. Report it for every tail point and flag the count
-            // above the 0.7 reliability cutoff.
             k_hat_max = psis.k_hat;
             n_k_bad = if psis.k_hat > 0.7 { psis.tail_count } else { 0 };
         }
         None => {
-            // Too few points / degenerate tail: report the unsmoothed LOO
-            // densities and an undefined k̂ rather than fabricating a tail fit.
-            pointwise = loglik_loo.to_owned();
             k_hat_max = f64::NAN;
             n_k_bad = 0;
         }
     }
 
+    let pointwise = loglik_loo.to_owned();
     let elpd: f64 = pointwise.iter().sum();
     let mean = elpd / n as f64;
     let var = pointwise
@@ -230,7 +213,7 @@ pub fn psis_loo(
         .sum::<f64>()
         / n as f64;
     let se = (n as f64 * var).sqrt();
-    Some(PsisLoo {
+    Some(AloElpd {
         elpd,
         se,
         pointwise,
@@ -240,7 +223,7 @@ pub fn psis_loo(
 }
 
 /// Result of comparing two fits on the same response: the paired predictive
-/// difference with its standard error (the `loo`-package estimator) plus the
+/// difference with its standard error plus the
 /// corrected-AIC gap. Both differences are oriented `a − b`: positive `delta_elpd`
 /// favours `a`, negative `delta_aic_corrected` favours `a`.
 #[derive(Debug, Clone)]
@@ -259,7 +242,7 @@ pub struct ComparisonReport {
 }
 
 /// Paired comparison of two fits. The predictive difference is paired
-/// row-by-row (the `loo` estimator), so the two fits must have been computed on
+/// row-by-row, so the two fits must have been computed on
 /// the same response in the same order; we refuse the paired difference when the
 /// observation counts disagree and surface only the AIC gap.
 pub fn compare(a: &ModelComparison, b: &ModelComparison) -> ComparisonReport {
@@ -293,7 +276,7 @@ pub fn compare(a: &ModelComparison, b: &ModelComparison) -> ComparisonReport {
 /// optional ALO diagnostics.
 ///
 /// The corrected-AIC channel is always populated (it needs only fit-retained
-/// fields). The PSIS-LOO channel is populated when `alo` is supplied and the
+/// fields). The ALO elpd channel is populated when `alo` is supplied and the
 /// fit carries an engine-level family: the leave-one-out linear predictors are
 /// the ALO `eta_tilde`, mapped through the family inverse link to means and
 /// scored by the per-row family log-likelihood kernel.
@@ -321,7 +304,7 @@ pub fn model_comparison_from_unified(
 
     let loo = alo.and_then(|alo| {
         let spec = fit.likelihood_family.clone()?;
-        psis_loo_from_family(
+        alo_elpd_from_family(
             y,
             eta_hat,
             alo.eta_tilde.view(),
@@ -340,17 +323,18 @@ pub fn model_comparison_from_unified(
     }
 }
 
-/// PSIS-LOO for an engine-level family: map the fitted and ALO leave-one-out
+/// ALO elpd for an engine-level family: map the fitted and ALO leave-one-out
 /// linear predictors through the family inverse link, score both with the
-/// per-row log-likelihood kernel, and Pareto-smooth.
-pub fn psis_loo_from_family(
+/// per-row log-likelihood kernel, and compute the ALO elpd plus influence
+/// diagnostic.
+pub fn alo_elpd_from_family(
     y: ArrayView1<'_, f64>,
     eta_hat: ArrayView1<'_, f64>,
     eta_loo: ArrayView1<'_, f64>,
     prior_weights: ArrayView1<'_, f64>,
     spec: &LikelihoodSpec,
     scale: crate::types::LikelihoodScaleMetadata,
-) -> Option<PsisLoo> {
+) -> Option<AloElpd> {
     use crate::families::strategy::{FamilyStrategy, strategy_for_spec};
     use crate::pirls::pointwise_loglikelihood_omitting_constants;
 
@@ -367,7 +351,7 @@ pub fn psis_loo_from_family(
     };
     let ll_hat = pointwise_loglikelihood_omitting_constants(y, &mu_hat, &glm, prior_weights);
     let ll_loo = pointwise_loglikelihood_omitting_constants(y, &mu_loo, &glm, prior_weights);
-    psis_loo(ll_hat.view(), ll_loo.view())
+    alo_elpd(ll_hat.view(), ll_loo.view())
 }
 
 #[cfg(test)]
@@ -396,11 +380,11 @@ mod tests {
     }
 
     #[test]
-    fn psis_loo_elpd_sums_pointwise_and_flags_no_tail() {
+    fn alo_elpd_sums_pointwise_and_flags_no_tail() {
         // Identical fitted and LOO log-densities → all importance ratios 1,
-        // smoothing is a no-op, elpd = Σ ℓ₋ᵢ.
+        // elpd = Σ ℓ₋ᵢ.
         let ll: Array1<f64> = array![-1.0, -2.0, -0.5, -1.5, -0.8, -1.2, -0.9, -1.1, -0.7, -1.3];
-        let loo = psis_loo(ll.view(), ll.view()).expect("psis-loo");
+        let loo = alo_elpd(ll.view(), ll.view()).expect("alo elpd");
         let expected: f64 = ll.iter().sum();
         assert!((loo.elpd - expected).abs() < 1e-9);
         assert_eq!(loo.pointwise.len(), ll.len());
@@ -409,14 +393,56 @@ mod tests {
     }
 
     #[test]
-    fn psis_loo_penalizes_loo_drop_relative_to_fitted() {
-        // LOO densities strictly below fitted → positive log-ratios → elpd < fitted total.
-        let n = 40;
-        let ll_hat: Array1<f64> = Array1::from_elem(n, -1.0);
-        let ll_loo: Array1<f64> = Array1::from_elem(n, -1.5);
-        let loo = psis_loo(ll_hat.view(), ll_loo.view()).expect("psis-loo");
-        // With constant ratios the smoothing is a no-op and elpd = Σ ℓ₋ᵢ = -60.
-        assert!((loo.elpd - (-1.5 * n as f64)).abs() < 1e-6);
+    fn alo_elpd_pointwise_is_local_to_alo_loglikelihoods() {
+        let ll_loo: Array1<f64> = array![
+            -1.0, -1.1, -1.2, -1.3, -1.4, -1.5, -1.6, -1.7, -1.8, -1.9, -2.0, -2.1
+        ];
+        let ll_hat = ll_loo.clone();
+        let mut ll_hat_perturbed = ll_loo.clone();
+        ll_hat_perturbed[7] += 10.0;
+
+        let base = alo_elpd(ll_hat.view(), ll_loo.view()).expect("alo elpd");
+        let perturbed = alo_elpd(ll_hat_perturbed.view(), ll_loo.view()).expect("alo elpd");
+
+        for i in 0..ll_loo.len() {
+            assert_eq!(base.pointwise[i], ll_loo[i]);
+            assert_eq!(perturbed.pointwise[i], ll_loo[i]);
+            if i != 7 {
+                assert_eq!(base.pointwise[i], perturbed.pointwise[i]);
+            }
+        }
+        assert_eq!(perturbed.elpd, base.elpd);
+    }
+
+    fn gpd_sample(u: f64, k: f64, sigma: f64) -> f64 {
+        sigma * ((1.0 - u).powf(-k) - 1.0) / k
+    }
+
+    #[test]
+    fn alo_elpd_influence_diagnostic_fires_on_heavy_tailed_ratios() {
+        let mut ratios = vec![1.0; 200];
+        for i in 1..=120 {
+            let u = (i as f64 - 0.5) / 120.0;
+            ratios.push(1.0 + gpd_sample(u, 1.2, 0.5));
+        }
+        let ll_loo: Array1<f64> = Array1::from_elem(ratios.len(), -1.0);
+        let ll_hat: Array1<f64> = Array1::from_iter(
+            ll_loo.iter().zip(ratios.iter()).map(|(&ll, &ratio)| ll + ratio.ln()),
+        );
+
+        let loo = alo_elpd(ll_hat.view(), ll_loo.view()).expect("alo elpd");
+
+        assert_eq!(loo.pointwise, ll_loo);
+        assert!((loo.elpd - -(ratios.len() as f64)).abs() < 1e-12);
+        assert!(
+            loo.k_hat_max > 0.7,
+            "heavy fitted-vs-ALO ratio tail should fire influence diagnostic; got k_hat={}",
+            loo.k_hat_max
+        );
+        assert!(
+            loo.n_k_bad > 0,
+            "heavy fitted-vs-ALO ratio tail should count influential tail observations"
+        );
     }
 
     #[test]
@@ -429,7 +455,7 @@ mod tests {
             },
             aic_conditional: aic,
             aic_corrected: aic,
-            loo: Some(PsisLoo {
+            loo: Some(AloElpd {
                 elpd: pw.iter().sum(),
                 se: 0.0,
                 pointwise: pw,
@@ -457,7 +483,7 @@ mod tests {
             },
             aic_conditional: 0.0,
             aic_corrected: 5.0,
-            loo: Some(PsisLoo {
+            loo: Some(AloElpd {
                 elpd: pw.iter().sum(),
                 se: 0.0,
                 pointwise: pw,

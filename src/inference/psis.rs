@@ -3,17 +3,19 @@
 //! The implementation is intentionally self-contained: it estimates the
 //! generalized-Pareto tail shape `k` from the largest positive weights and
 //! replaces only that empirical tail by monotone GPD expected quantiles.  The
-//! returned `k_hat` is the same stability diagnostic used by PSIS-LOO: values
-//! near zero indicate light tails, `k > 0.5` indicates that the
-//! importance-sampling variance is infinite, and `k > 0.7` is the standard
-//! reliability cutoff beyond which the estimate is untrustworthy.
+//! returned `k_hat` has the usual GPD tail interpretation: values near zero
+//! indicate light tails, `k > 0.5` indicates that the fitted tail has infinite
+//! variance, and larger values mark increasingly unstable upper tails. Consumers
+//! decide whether that tail is a draw-wise PSIS reliability diagnostic or another
+//! influence diagnostic based on what the supplied weights represent.
 //!
 //! The shape is recovered with the Zhang–Stephens (2009) empirical-Bayes
-//! profile estimator — the same fit `loo`/ArviZ use for the PSIS-LOO `k_hat`.
+//! profile estimator — the same GPD tail fit used by `loo`/ArviZ for draw-wise
+//! PSIS diagnostics.
 //! Crucially it is consistent across the entire `k ∈ (−∞, ∞)` range, including
 //! the dangerous `k ≥ 0.5` regime where the GPD variance is infinite and the
 //! older method-of-moments form `k = ½(1 − μ²/Var)` is structurally capped
-//! below `0.5` and so cannot fire the reliability gate.
+//! below `0.5` and so cannot fire a heavy-tail gate.
 
 #[derive(Debug, Clone)]
 pub struct PsisResult {
