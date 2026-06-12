@@ -2090,6 +2090,10 @@ pub struct ExternalOptimOptions {
     pub sas_link: Option<SasLinkSpec>,
     pub optimize_sas: bool,
     pub compute_inference: bool,
+    /// Internal lifecycle knob for fits whose result will be immediately
+    /// superseded. Keeps ordinary inference work but skips the live-objective
+    /// rho posterior certificate/escalation until the returned model is known.
+    pub(crate) skip_rho_posterior_inference: bool,
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
@@ -4911,11 +4915,15 @@ where
         // certificate runs against the SAME objective the fit converged on, so
         // its criterion is the fit's own bit-for-bit (no retain/rebuild). Absent
         // when there are no smoothing parameters or the outer Hessian is
-        // unavailable; never fatal. When the certificate reads Escalate, the
-        // auto-selected escalation tier (quadrature for K≤4, NUTS over ρ for
-        // K≤16, honest Unavailable beyond) runs at this same live seam.
-        (rho_posterior_certificate, rho_posterior_escalation) =
-            reml_state.rho_posterior_inference(&final_rho, None);
+        // unavailable; never fatal. Superseded intermediate fits skip this block
+        // and the caller must refit with a live objective before returning that
+        // model. When the certificate reads Escalate, the auto-selected escalation
+        // tier (quadrature for K≤4, NUTS over ρ for K≤16, honest Unavailable
+        // beyond) runs at this same live seam.
+        if !opts.skip_rho_posterior_inference {
+            (rho_posterior_certificate, rho_posterior_escalation) =
+                reml_state.rho_posterior_inference(&final_rho, None);
+        }
 
         // Standard errors: prefer the diagonal of the full inverse when
         // available; otherwise use the factorised Hessian from the EDF pass
@@ -5122,6 +5130,10 @@ pub struct FitOptions {
     pub sas_link: Option<SasLinkSpec>,
     pub optimize_sas: bool,
     pub compute_inference: bool,
+    /// Internal lifecycle knob for fits whose result will be immediately
+    /// superseded. Keeps ordinary inference work but skips the live-objective
+    /// rho posterior certificate/escalation until the returned model is known.
+    pub(crate) skip_rho_posterior_inference: bool,
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
@@ -5171,6 +5183,7 @@ impl Default for FitOptions {
             sas_link: None,
             optimize_sas: false,
             compute_inference: true,
+            skip_rho_posterior_inference: false,
             max_iter: 100,
             tol: 1e-6,
             nullspace_dims: Vec::new(),
@@ -7449,6 +7462,7 @@ where
         sas_link: effective_sas_link,
         optimize_sas: opts.optimize_sas,
         compute_inference: opts.compute_inference,
+        skip_rho_posterior_inference: opts.skip_rho_posterior_inference,
         max_iter: opts.max_iter,
         tol: opts.tol,
         nullspace_dims,
@@ -8876,6 +8890,7 @@ mod estimate_policy_tests {
             }),
             optimize_sas: true,
             compute_inference: true,
+            skip_rho_posterior_inference: false,
             max_iter: 80,
             tol: 1e-7,
             nullspace_dims: vec![1],
@@ -9113,6 +9128,7 @@ mod estimate_policy_tests {
             }),
             optimize_sas: true,
             compute_inference: true,
+            skip_rho_posterior_inference: false,
             max_iter: 80,
             tol: 1e-7,
             nullspace_dims: vec![1],
@@ -9281,6 +9297,7 @@ mod estimate_policy_tests {
             }),
             optimize_sas: true,
             compute_inference: true,
+            skip_rho_posterior_inference: false,
             max_iter: 80,
             tol: 1e-7,
             nullspace_dims: vec![1],

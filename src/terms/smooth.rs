@@ -12588,6 +12588,7 @@ fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign
         sas_link: options.sas_link,
         optimize_sas: options.optimize_sas,
         compute_inference: options.compute_inference,
+        skip_rho_posterior_inference: options.skip_rho_posterior_inference,
         max_iter: options.max_iter,
         tol: options.tol,
         nullspace_dims: design.nullspace_dims.clone(),
@@ -12605,6 +12606,12 @@ fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign
             .iter()
             .find_map(|t| t.kronecker_factored.clone()),
     }
+}
+
+fn superseded_fit_options(options: &FitOptions) -> FitOptions {
+    let mut fit_options = options.clone();
+    fit_options.skip_rho_posterior_inference = true;
+    fit_options
 }
 
 #[derive(Clone)]
@@ -15688,6 +15695,7 @@ fn external_opts_for_design(
         sas_link: options.sas_link,
         optimize_sas: options.optimize_sas,
         compute_inference: options.compute_inference,
+        skip_rho_posterior_inference: options.skip_rho_posterior_inference,
         max_iter: options.max_iter,
         tol: options.tol,
         nullspace_dims: design.nullspace_dims.clone(),
@@ -18001,13 +18009,6 @@ fn try_exact_joint_spatial_length_scale_optimization(
     )?;
 
     let baseline_score = fit_score(&best.fit);
-    let baseline_result = FittedTermCollectionWithSpec {
-        fit: best.fit.clone(),
-        design: best.design.clone(),
-        resolvedspec: resolvedspec.clone(),
-        adaptive_diagnostics: best.adaptive_diagnostics.clone(),
-    };
-
     // Compare the joint optimizer's certified cost (final_value at theta*)
     // against the baseline. Tolerance ≥ options.tol because both endpoints
     // are outer-BFGS approximations accurate to options.tol; a tighter
@@ -18020,6 +18021,22 @@ fn try_exact_joint_spatial_length_scale_optimization(
             baseline_score,
             accept_tol,
         );
+        let baseline = fit_term_collection_forspecwith_heuristic_lambdas(
+            data,
+            y,
+            weights,
+            offset,
+            resolvedspec,
+            best.fit.lambdas.as_slice(),
+            family,
+            options,
+        )?;
+        let baseline_result = FittedTermCollectionWithSpec {
+            fit: baseline.fit,
+            design: baseline.design,
+            resolvedspec: resolvedspec.clone(),
+            adaptive_diagnostics: baseline.adaptive_diagnostics,
+        };
         return Ok(Some(baseline_result));
     }
 
@@ -21742,6 +21759,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         );
     }
 
+    let baseline_options = superseded_fit_options(options);
     let best = fit_term_collection_forspec(
         data,
         y.view(),
@@ -21749,7 +21767,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         offset.view(),
         &resolvedspec,
         family.clone(),
-        options,
+        &baseline_options,
     )?;
     resolvedspec = freeze_term_collection_from_design(&resolvedspec, &best.design)?;
     // The freeze step can rewrite a term's basis variant — most notably when
@@ -21766,42 +21784,51 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // into the spec so the optimizer starts from the geometry-informed η values
     // rather than the zero sentinel from --scale-dimensions.
     sync_aniso_contrasts_from_metadata(&mut resolvedspec, &best.design.smooth);
+    if spatial_terms.is_empty() {
+        let fitted = fit_term_collection_forspecwith_heuristic_lambdas(
+            data,
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &resolvedspec,
+            best.fit.lambdas.as_slice(),
+            family,
+            options,
+        )?;
+        return Ok(FittedTermCollectionWithSpec {
+            fit: fitted.fit,
+            design: fitted.design,
+            resolvedspec,
+            adaptive_diagnostics: fitted.adaptive_diagnostics,
+        });
+    }
     let initial_score = fit_score(&best.fit);
     if !initial_score.is_finite() {
         log::debug!("[spatial-kappa] initial profiled score is non-finite");
     }
-    if !spatial_terms.is_empty() {
-        let exact_joint = require_successful_spatial_optimization_result(
-            initial_score,
-            try_exact_joint_spatial_length_scale_optimization(
-                data,
-                y.view(),
-                weights.view(),
-                offset.view(),
-                &resolvedspec,
-                &best,
-                family,
-                options,
-                kappa_options,
-                &spatial_terms,
-            )
-            .map(|opt| {
-                opt.map(|fit| {
-                    let score = fit_score(&fit.fit);
-                    (fit, score)
-                })
-            }),
-        )?;
-        log_spatial_aniso_scales(&exact_joint.resolvedspec);
-        return Ok(exact_joint);
-    }
-
-    Ok(FittedTermCollectionWithSpec {
-        fit: best.fit,
-        design: best.design,
-        resolvedspec,
-        adaptive_diagnostics: best.adaptive_diagnostics,
-    })
+    let exact_joint = require_successful_spatial_optimization_result(
+        initial_score,
+        try_exact_joint_spatial_length_scale_optimization(
+            data,
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &resolvedspec,
+            &best,
+            family,
+            options,
+            kappa_options,
+            &spatial_terms,
+        )
+        .map(|opt| {
+            opt.map(|fit| {
+                let score = fit_score(&fit.fit);
+                (fit, score)
+            })
+        }),
+    )?;
+    log_spatial_aniso_scales(&exact_joint.resolvedspec);
+    Ok(exact_joint)
 }
 
 #[cfg(test)]
@@ -21837,6 +21864,22 @@ mod tests {
                 boundary: OneDimensionalBoundary::Open,
             },
         }
+    }
+
+    #[test]
+    fn superseded_fit_options_skip_only_rho_posterior_inference() {
+        let options = FitOptions {
+            compute_inference: true,
+            max_iter: 17,
+            ..FitOptions::default()
+        };
+
+        let superseded = superseded_fit_options(&options);
+
+        assert!(superseded.compute_inference);
+        assert!(superseded.skip_rho_posterior_inference);
+        assert_eq!(superseded.max_iter, 17);
+        assert!(!options.skip_rho_posterior_inference);
     }
 
     fn structural_shape_hex(spec: &TermCollectionSpec) -> String {
