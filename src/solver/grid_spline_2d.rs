@@ -224,27 +224,28 @@ pub struct GridSpline2dDesign {
     gram_band: Vec<f64>,
     /// Upper band of the exact anisotropic biharmonic penalty `S`.
     pen_band: Vec<f64>,
-    /// `X'Wy`.
-    rhs: Vec<f64>,
-    /// `y'Wy`, for the profiled-σ² residual quadratic.
-    ytwy: f64,
+    /// `X'Wy_d`, one length-`p` vector per response dimension. The design
+    /// (gram and penalty bands) is shared across dimensions; only these
+    /// right-hand sides and the response cross-moments are per-dimension.
+    rhs: Vec<Vec<f64>>,
+    /// Response cross-moments `y_d'W y_e` (`D × D` row-major), for the
+    /// profiled-σ² residual quadratics and the residual cross-covariance.
+    cross_moments: Vec<f64>,
     n_obs: usize,
 }
 
-/// Internal solve product at one λ.
+/// Internal solve product at one λ (all response dimensions share the factor).
 struct Solved {
     chol: Vec<f64>,
     logdet: f64,
-    coeff: Vec<f64>,
-    /// Penalized residual quadratic `y'Wy − c'X'Wy` =
+    coeffs: Vec<Vec<f64>>,
+    /// Per dimension: penalized residual quadratic `y'Wy − c'X'Wy` =
     /// `‖√W(y − Xc)‖² + λ c'Sc` at the minimizer.
-    rss_pen: f64,
+    rss_pen: Vec<f64>,
 }
 
 impl GridSpline2dDesign {
-    /// One streaming pass over the rows plus the exact per-cell quadrature
-    /// assembly of the penalty. `k` is the number of cells per axis;
-    /// `metric = [a1, a2]` is the diagonal anisotropy of the biharmonic form.
+    /// Single-response entry: see [`Self::build_multi`].
     pub fn build(
         x1: &[f64],
         x2: &[f64],
@@ -253,14 +254,41 @@ impl GridSpline2dDesign {
         k: usize,
         metric: [f64; 2],
     ) -> Result<Self, String> {
+        Self::build_multi(x1, x2, &[y], w, k, metric)
+    }
+
+    /// One streaming pass over the rows plus the exact per-cell quadrature
+    /// assembly of the penalty. `k` is the number of cells per axis;
+    /// `metric = [a1, a2]` is the diagonal anisotropy of the biharmonic form.
+    /// `responses` holds one length-`n` response per dimension; the design,
+    /// penalty, and the REML-shared λ are common to all dimensions (one
+    /// surface smoothness), only the right-hand sides differ.
+    pub fn build_multi(
+        x1: &[f64],
+        x2: &[f64],
+        responses: &[&[f64]],
+        w: &[f64],
+        k: usize,
+        metric: [f64; 2],
+    ) -> Result<Self, String> {
         let n = x1.len();
-        if x2.len() != n || y.len() != n || w.len() != n {
+        if responses.is_empty() {
+            return Err("grid spline 2d: no response dimensions supplied".to_string());
+        }
+        if x2.len() != n || w.len() != n {
             return Err(format!(
-                "grid spline 2d: length mismatch x1={n}, x2={}, y={}, w={}",
+                "grid spline 2d: length mismatch x1={n}, x2={}, w={}",
                 x2.len(),
-                y.len(),
                 w.len()
             ));
+        }
+        for (d, y) in responses.iter().enumerate() {
+            if y.len() != n {
+                return Err(format!(
+                    "grid spline 2d: response dimension {d} has length {} != {n}",
+                    y.len()
+                ));
+            }
         }
         if n <= PENALTY_NULLITY {
             return Err(format!(
@@ -282,15 +310,20 @@ impl GridSpline2dDesign {
             ));
         }
         for i in 0..n {
-            if !(x1[i].is_finite() && x2[i].is_finite() && y[i].is_finite()) || !(w[i] > 0.0) {
+            if !(x1[i].is_finite() && x2[i].is_finite()) || !(w[i] > 0.0) || !w[i].is_finite() {
                 return Err(format!(
                     "grid spline 2d: non-finite or non-positive input at row {i} \
-                     (x1={}, x2={}, y={}, w={})",
-                    x1[i], x2[i], y[i], w[i]
+                     (x1={}, x2={}, w={})",
+                    x1[i], x2[i], w[i]
                 ));
             }
-            if !w[i].is_finite() {
-                return Err(format!("grid spline 2d: non-finite weight at row {i}"));
+            for (d, y) in responses.iter().enumerate() {
+                if !y[i].is_finite() {
+                    return Err(format!(
+                        "grid spline 2d: non-finite response at row {i}, dimension {d} ({})",
+                        y[i]
+                    ));
+                }
             }
         }
         let mut axes = [Axis {
@@ -317,27 +350,38 @@ impl GridSpline2dDesign {
         let p = m_axis * m_axis;
         let band_half = 3 * m_axis + 3;
         let stride = band_half + 1;
+        let n_dims = responses.len();
         let mut gram_band = vec![0.0_f64; p * stride];
-        let mut rhs = vec![0.0_f64; p];
-        let mut ytwy = 0.0_f64;
+        let mut rhs = vec![vec![0.0_f64; p]; n_dims];
+        let mut cross_moments = vec![0.0_f64; n_dims * n_dims];
 
-        // ── ONE streaming pass: scatter-add X'WX (upper band) and X'Wy ──
+        // ── ONE streaming pass: scatter-add X'WX (upper band) and X'Wy_d ──
         // Each row touches exactly 16 basis entries with strictly increasing
         // flat indices, so the in-row pair loop (a ≤ b) lands directly in the
-        // upper band: O(n·16²) total work.
+        // upper band: O(n·(16² + 16·D)) total work.
         for i in 0..n {
             let (idx, val) = basis_row(&axes, m_axis, x1[i], x2[i]);
             let wi = w[i];
-            for e in 0..16 {
-                rhs[idx[e]] += wi * y[i] * val[e];
+            for (d, y) in responses.iter().enumerate() {
+                let wy = wi * y[i];
+                for e in 0..16 {
+                    rhs[d][idx[e]] += wy * val[e];
+                }
+                for (e, ye) in responses.iter().enumerate().skip(d) {
+                    cross_moments[d * n_dims + e] += wy * ye[i];
+                }
             }
-            ytwy += wi * y[i] * y[i];
             for a in 0..16 {
                 let base = idx[a] * stride - idx[a];
                 let wa = wi * val[a];
                 for b in a..16 {
                     gram_band[base + idx[b]] += wa * val[b];
                 }
+            }
+        }
+        for d in 0..n_dims {
+            for e in 0..d {
+                cross_moments[d * n_dims + e] = cross_moments[e * n_dims + d];
             }
         }
 
@@ -409,7 +453,7 @@ impl GridSpline2dDesign {
             gram_band,
             pen_band,
             rhs,
-            ytwy,
+            cross_moments,
             n_obs: n,
         })
     }
@@ -483,36 +527,49 @@ impl GridSpline2dDesign {
         }
         let mut a = self.dense_system(log_lambda.exp());
         let logdet = cholesky_logdet(&mut a, self.p)?;
-        let coeff = chol_solve(&a, self.p, &self.rhs);
-        let mut quad = 0.0;
-        for g in 0..self.p {
-            quad += self.rhs[g] * coeff[g];
+        let n_dims = self.rhs.len();
+        let mut coeffs = Vec::with_capacity(n_dims);
+        let mut rss_pen = Vec::with_capacity(n_dims);
+        for (d, rhs) in self.rhs.iter().enumerate() {
+            let coeff = chol_solve(&a, self.p, rhs);
+            let mut quad = 0.0;
+            for g in 0..self.p {
+                quad += rhs[g] * coeff[g];
+            }
+            rss_pen.push(self.cross_moments[d * n_dims + d] - quad);
+            coeffs.push(coeff);
         }
         Ok(Solved {
             chol: a,
             logdet,
-            coeff,
-            rss_pen: self.ytwy - quad,
+            coeffs,
+            rss_pen,
         })
     }
 
-    /// Profiled-σ² REML criterion at `log λ`, up to λ- and data-independent
-    /// additive constants (differences across λ are exact REML differences).
+    /// Profiled-σ² REML criterion at `log λ`, pooled across the response
+    /// dimensions sharing the design and λ, up to λ- and data-independent
+    /// additive constants (differences across λ are exact REML differences):
+    ///   `−½ Σ_d [ log|X'WX+λS| − r·log λ + (n−3)·log σ̂²_d(λ) ]`.
     fn criterion(&self, log_lambda: f64) -> Result<f64, String> {
         let solved = self.solve_at(log_lambda)?;
-        if !(solved.rss_pen > 0.0) {
-            return Err(format!(
-                "grid spline 2d: degenerate penalized residual {}",
-                solved.rss_pen
-            ));
-        }
         let dof = (self.n_obs - PENALTY_NULLITY) as f64;
-        let sigma2 = solved.rss_pen / dof;
         let r = (self.p - PENALTY_NULLITY) as f64;
-        Ok(-0.5 * (solved.logdet - r * log_lambda + dof * sigma2.ln()))
+        let shared = solved.logdet - r * log_lambda;
+        let mut v = 0.0;
+        for &rss in &solved.rss_pen {
+            if !(rss > 0.0) {
+                return Err(format!(
+                    "grid spline 2d: degenerate penalized residual {rss}"
+                ));
+            }
+            v += shared + dof * (rss / dof).ln();
+        }
+        Ok(-0.5 * v)
     }
 
-    /// Fit at a FIXED `log λ`, with σ² either supplied or profiled.
+    /// Fit at a FIXED `log λ`, with σ² either supplied (applied to every
+    /// response dimension) or profiled per dimension.
     pub fn fit_at(
         &self,
         log_lambda: f64,
@@ -520,33 +577,41 @@ impl GridSpline2dDesign {
     ) -> Result<GridSpline2dFit, String> {
         let solved = self.solve_at(log_lambda)?;
         let dof = (self.n_obs - PENALTY_NULLITY) as f64;
-        let sigma2 = match sigma2 {
-            Some(s) => {
-                if !(s.is_finite() && s > 0.0) {
-                    return Err(format!("grid spline 2d: invalid sigma2 {s}"));
+        let mut sigma2_dims = Vec::with_capacity(solved.rss_pen.len());
+        for &rss in &solved.rss_pen {
+            match sigma2 {
+                Some(s) => {
+                    if !(s.is_finite() && s > 0.0) {
+                        return Err(format!("grid spline 2d: invalid sigma2 {s}"));
+                    }
+                    sigma2_dims.push(s);
                 }
-                s
-            }
-            None => {
-                if !(solved.rss_pen > 0.0) {
-                    return Err(format!(
-                        "grid spline 2d: degenerate penalized residual {}",
-                        solved.rss_pen
-                    ));
+                None => {
+                    if !(rss > 0.0) {
+                        return Err(format!(
+                            "grid spline 2d: degenerate penalized residual {rss}"
+                        ));
+                    }
+                    sigma2_dims.push(rss / dof);
                 }
-                solved.rss_pen / dof
             }
-        };
+        }
         // Full restricted log-likelihood at this (λ, σ²) up to λ- and σ-free
-        // constants: at the profiled σ̂² the quadratic collapses to the λ-free
-        // constant `dof`, matching `criterion` up to that constant.
+        // constants, pooled across dimensions: at the profiled σ̂²_d the
+        // quadratic collapses to the λ-free constant `dof` per dimension,
+        // matching `criterion` up to that constant.
         let r = (self.p - PENALTY_NULLITY) as f64;
-        let restricted_loglik = -0.5
-            * (solved.logdet - r * log_lambda + dof * sigma2.ln() + solved.rss_pen / sigma2);
+        let mut restricted_loglik = 0.0;
+        for (d, &rss) in solved.rss_pen.iter().enumerate() {
+            restricted_loglik -= 0.5
+                * (solved.logdet - r * log_lambda
+                    + dof * sigma2_dims[d].ln()
+                    + rss / sigma2_dims[d]);
+        }
         Ok(GridSpline2dFit {
-            coeff: solved.coeff,
+            coeffs: solved.coeffs,
             log_lambda,
-            sigma2,
+            sigma2: sigma2_dims,
             restricted_loglik,
             chol: solved.chol,
             axes: self.axes,

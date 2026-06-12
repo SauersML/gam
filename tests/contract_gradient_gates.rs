@@ -486,6 +486,767 @@ fn glm_reml_outer_row() -> Vec<GradientChannel> {
     }]
 }
 
+fn glm_reml_binomial_noncanonical_outer_row() -> Vec<GradientChannel> {
+    let n = 96usize;
+    let k = 6usize;
+    let p = 1 + 2 * k;
+    let mut x = Array2::<f64>::zeros((n, p));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        x[[i, 0]] = 1.0;
+        let z = -1.0 + 2.0 * i as f64 / (n as f64 - 1.0);
+        let mut acc = 1.0;
+        for j in 0..k {
+            acc *= z;
+            x[[i, 1 + j]] = acc;
+            x[[i, 1 + k + j]] = acc + 1.0e-3 * ((i + j) as f64).sin();
+        }
+        y[i] = if (std::f64::consts::PI * z).sin() + 0.3 * (3.0 * z).cos() > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let weights = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let penalties = vec![
+        BlockwisePenalty::new(1..(1 + k), second_difference_penalty(k)),
+        BlockwisePenalty::new((1 + k)..p, second_difference_penalty(k)),
+    ];
+    let opts = ExternalOptimOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Probit),
+        ),
+        compute_inference: true,
+        max_iter: 300,
+        tol: 1.0e-12,
+        nullspace_dims: vec![2, 2],
+        linear_constraints: None,
+        firth_bias_reduction: None,
+        penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    };
+    let rho = array![0.2, 0.25];
+    let analytic = evaluate_externalgradient(
+        y.view(),
+        weights.view(),
+        x.clone(),
+        offset.view(),
+        &penalties,
+        &opts,
+        &rho,
+    )
+    .expect("binomial noncanonical GLM REML gradient");
+    let mut fd = Vec::new();
+    for j in 0..rho.len() {
+        let mut plus = rho.clone();
+        plus[j] += OUTER_FD_STEP;
+        let mut minus = rho.clone();
+        minus[j] -= OUTER_FD_STEP;
+        let fp = evaluate_externalcost_andridge(
+            y.view(),
+            weights.view(),
+            x.clone(),
+            offset.view(),
+            &penalties,
+            &opts,
+            &plus,
+        )
+        .expect("binomial noncanonical GLM REML f+")
+        .0;
+        let fm = evaluate_externalcost_andridge(
+            y.view(),
+            weights.view(),
+            x.clone(),
+            offset.view(),
+            &penalties,
+            &opts,
+            &minus,
+        )
+        .expect("binomial noncanonical GLM REML f-")
+        .0;
+        fd.push((fp - fm) / (2.0 * OUTER_FD_STEP));
+    }
+    vec![GradientChannel {
+        name: "rho",
+        analytic: analytic.to_vec(),
+        fd,
+    }]
+}
+
+#[derive(Clone)]
+struct PenalizedQuadraticFamily {
+    target: Array1<f64>,
+}
+
+impl CustomFamily for PenalizedQuadraticFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta = &block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta;
+        if beta.len() != self.target.len() {
+            return Err("beta/target dimension mismatch".to_string());
+        }
+        let resid = beta - &self.target;
+        let nll = 0.5 * resid.iter().map(|r| r * r).sum::<f64>();
+        let m = beta.len();
+        Ok(FamilyEvaluation {
+            log_likelihood: -nll,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: resid.mapv(|r| -r),
+                hessian: SymmetricMatrix::Dense(Array2::<f64>::eye(m)),
+            }],
+        })
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        let m = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta
+            .len();
+        Ok(Some(Array2::<f64>::eye(m)))
+    }
+
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
+    fn exact_newton_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        direction: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_idx != 0 {
+            return Ok(None);
+        }
+        let m = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta
+            .len();
+        if direction.len() != m {
+            return Err("direction dimension mismatch".to_string());
+        }
+        Ok(Some(Array2::<f64>::zeros((m, m))))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        direction: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let m = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta
+            .len();
+        if direction.len() != m {
+            return Err("direction dimension mismatch".to_string());
+        }
+        Ok(Some(Array2::<f64>::zeros((m, m))))
+    }
+}
+
+fn penalized_quadratic_specs(
+    target: &Array1<f64>,
+    penalty: Array2<f64>,
+) -> Vec<ParameterBlockSpec> {
+    let m = target.len();
+    vec![ParameterBlockSpec {
+        name: "penalized-quadratic".to_string(),
+        design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::eye(m))),
+        offset: Array1::<f64>::zeros(m),
+        penalties: vec![PenaltyMatrix::Dense(penalty)],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: Array1::<f64>::zeros(1),
+        initial_beta: Some(Array1::<f64>::zeros(m)),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }]
+}
+
+fn custom_family_opts() -> BlockwiseFitOptions {
+    BlockwiseFitOptions {
+        use_remlobjective: true,
+        compute_covariance: false,
+        ridge_floor: 1e-12,
+        inner_tol: 1e-10,
+        ..BlockwiseFitOptions::default()
+    }
+}
+
+fn survival_single_block_model(active_lambda: f64) -> WorkingModelSurvival {
+    let age_entry: Array1<f64> = Array1::from(vec![
+        30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 32.0, 37.0, 42.0, 47.0, 52.0, 57.0, 62.0, 34.0,
+        39.0, 44.0, 49.0, 54.0, 59.0,
+    ]);
+    let age_exit: Array1<f64> = Array1::from(vec![
+        45.0, 48.0, 55.0, 58.0, 62.0, 66.0, 68.0, 47.0, 52.0, 53.0, 55.0, 60.0, 63.0, 70.0, 48.0,
+        51.0, 58.0, 62.0, 66.0, 69.0,
+    ]);
+    let event_target = Array1::from(vec![
+        1u8, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+    ]);
+    let n = age_entry.len();
+    let event_competing = Array1::<u8>::zeros(n);
+    let sampleweight = Array1::from_elem(n, 1.0_f64);
+    let ln_age_mean: f64 = {
+        let mut sum = 0.0;
+        for i in 0..n {
+            sum += age_entry[i].ln() + age_exit[i].ln();
+        }
+        sum / (2.0 * n as f64)
+    };
+    let mut x_entry = Array2::<f64>::zeros((n, 2));
+    let mut x_exit = Array2::<f64>::zeros((n, 2));
+    let mut x_derivative = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        x_entry[[i, 0]] = 1.0;
+        x_exit[[i, 0]] = 1.0;
+        x_entry[[i, 1]] = age_entry[i].ln() - ln_age_mean;
+        x_exit[[i, 1]] = age_exit[i].ln() - ln_age_mean;
+        x_derivative[[i, 0]] = 0.0;
+        x_derivative[[i, 1]] = 1.0 / age_exit[i];
+    }
+    let penalties = PenaltyBlocks::new(vec![
+        PenaltyBlock {
+            matrix: array![[3.0]],
+            lambda: 0.0,
+            range: 0..1,
+            nullspace_dim: 0,
+        },
+        PenaltyBlock {
+            matrix: array![[2.5]],
+            lambda: active_lambda,
+            range: 1..2,
+            nullspace_dim: 0,
+        },
+    ]);
+    WorkingModelSurvival::from_engine_inputs(
+        SurvivalEngineInputs {
+            age_entry: age_entry.view(),
+            age_exit: age_exit.view(),
+            event_target: event_target.view(),
+            event_competing: event_competing.view(),
+            sampleweight: sampleweight.view(),
+            x_entry: x_entry.view(),
+            x_exit: x_exit.view(),
+            x_derivative: x_derivative.view(),
+            monotonicity_constraint_rows: None,
+            monotonicity_constraint_offsets: None,
+        },
+        penalties,
+        MonotonicityPenalty { tolerance: 1e-8 },
+        SurvivalSpec::Net,
+    )
+    .expect("construct single-block survival LAML FD model")
+}
+
+fn survival_laml_net_single_block_row() -> Vec<GradientChannel> {
+    let model = survival_single_block_model(1.0);
+    let beta0 = array![-2.5_f64, 1.0];
+    let rho = array![0.3];
+    let rho_slice = rho.as_slice().expect("contiguous rho");
+    let analytic = model
+        .evaluate_survival_lamlcost_and_gradient(rho_slice, &beta0)
+        .expect("survival LAML analytic gradient")
+        .1;
+    let mut fd = Vec::new();
+    for j in 0..rho.len() {
+        let mut plus = rho.clone();
+        plus[j] += OUTER_FD_STEP;
+        let plus_slice = plus.as_slice().expect("contiguous rho+");
+        let mut minus = rho.clone();
+        minus[j] -= OUTER_FD_STEP;
+        let minus_slice = minus.as_slice().expect("contiguous rho-");
+        let fp = model
+            .evaluate_survival_lamlcost_and_gradient(plus_slice, &beta0)
+            .expect("survival LAML f+")
+            .0;
+        let fm = model
+            .evaluate_survival_lamlcost_and_gradient(minus_slice, &beta0)
+            .expect("survival LAML f-")
+            .0;
+        fd.push((fp - fm) / (2.0 * OUTER_FD_STEP));
+    }
+    vec![GradientChannel {
+        name: "rho",
+        analytic: analytic.to_vec(),
+        fd,
+    }]
+}
+
+fn distinct_diag_penalty(m: usize) -> Array2<f64> {
+    let mut s = Array2::<f64>::zeros((m, m));
+    for j in 0..m {
+        s[[j, j]] = 1.0 + j as f64;
+    }
+    s
+}
+
+fn custom_family_joint_laml_penalized_quadratic_row() -> Vec<GradientChannel> {
+    let target = array![0.5_f64, -0.3, 0.8, 0.1];
+    let family = PenalizedQuadraticFamily {
+        target: target.clone(),
+    };
+    let specs = penalized_quadratic_specs(&target, distinct_diag_penalty(target.len()));
+    let opts = custom_family_opts();
+    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
+    let rho = array![0.4];
+    let analytic = evaluate_custom_family_joint_hyper(
+        &family,
+        &specs,
+        &opts,
+        &rho,
+        &derivative_blocks,
+        None,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("custom-family joint LAML gradient")
+    .gradient;
+    let mut fd = Vec::new();
+    for j in 0..rho.len() {
+        let mut plus = rho.clone();
+        plus[j] += OUTER_FD_STEP;
+        let fp = evaluate_custom_family_joint_hyper(
+            &family,
+            &specs,
+            &opts,
+            &plus,
+            &derivative_blocks,
+            None,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("custom-family joint LAML f+")
+        .objective;
+        let mut minus = rho.clone();
+        minus[j] -= OUTER_FD_STEP;
+        let fm = evaluate_custom_family_joint_hyper(
+            &family,
+            &specs,
+            &opts,
+            &minus,
+            &derivative_blocks,
+            None,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("custom-family joint LAML f-")
+        .objective;
+        fd.push((fp - fm) / (2.0 * OUTER_FD_STEP));
+    }
+    vec![GradientChannel {
+        name: "rho",
+        analytic: analytic.to_vec(),
+        fd,
+    }]
+}
+
+fn glm_reml_binomial_noncanonical_outer_row() -> Vec<GradientChannel> {
+    let n = 96usize;
+    let k = 6usize;
+    let p = 1 + 2 * k;
+    let mut x = Array2::<f64>::zeros((n, p));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        x[[i, 0]] = 1.0;
+        let z = -1.0 + 2.0 * i as f64 / (n as f64 - 1.0);
+        let mut acc = 1.0;
+        for j in 0..k {
+            acc *= z;
+            x[[i, 1 + j]] = acc;
+            x[[i, 1 + k + j]] = acc + 1.0e-3 * ((i + j) as f64).sin();
+        }
+        y[i] = if (std::f64::consts::PI * z).sin() + 0.3 * (3.0 * z).cos() > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let weights = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let penalties = vec![
+        BlockwisePenalty::new(1..(1 + k), second_difference_penalty(k)),
+        BlockwisePenalty::new((1 + k)..p, second_difference_penalty(k)),
+    ];
+    let opts = ExternalOptimOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Probit),
+        ),
+        compute_inference: true,
+        max_iter: 300,
+        tol: 1.0e-12,
+        nullspace_dims: vec![2, 2],
+        linear_constraints: None,
+        firth_bias_reduction: None,
+        penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    };
+    let rho = array![0.2, 0.25];
+    let analytic = evaluate_externalgradient(
+        y.view(),
+        weights.view(),
+        x.clone(),
+        offset.view(),
+        &penalties,
+        &opts,
+        &rho,
+    )
+    .expect("binomial GLM REML gradient");
+    let mut fd = Vec::new();
+    for j in 0..rho.len() {
+        let mut plus = rho.clone();
+        plus[j] += OUTER_FD_STEP;
+        let mut minus = rho.clone();
+        minus[j] -= OUTER_FD_STEP;
+        let fp = evaluate_externalcost_andridge(
+            y.view(),
+            weights.view(),
+            x.clone(),
+            offset.view(),
+            &penalties,
+            &opts,
+            &plus,
+        )
+        .expect("binomial GLM REML f+")
+        .0;
+        let fm = evaluate_externalcost_andridge(
+            y.view(),
+            weights.view(),
+            x.clone(),
+            offset.view(),
+            &penalties,
+            &opts,
+            &minus,
+        )
+        .expect("binomial GLM REML f-")
+        .0;
+        fd.push((fp - fm) / (2.0 * OUTER_FD_STEP));
+    }
+    vec![GradientChannel {
+        name: "rho",
+        analytic: analytic.to_vec(),
+        fd,
+    }]
+}
+
+/// 20-subject net-survival fixture: intercept + a single penalized,
+/// mean-centred log-age time covariate (positive exit derivative). Mirrors
+/// the in-crate `laml_fd_test_model` fixture: large enough that the
+/// observed-information Hessian is well-conditioned at the mode, so the
+/// inner PIRLS reaches the tight shim tolerance and V(ρ) is FD-smooth.
+/// The first block (λ = 0) is an inactive prefix; only block 1 is active,
+/// so the active-block ρ vector has length 1.
+fn survival_single_block_model(active_lambda: f64) -> WorkingModelSurvival {
+    let age_entry: Array1<f64> = Array1::from(vec![
+        30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 32.0, 37.0, 42.0, 47.0, 52.0, 57.0, 62.0, 34.0,
+        39.0, 44.0, 49.0, 54.0, 59.0,
+    ]);
+    let age_exit: Array1<f64> = Array1::from(vec![
+        45.0, 48.0, 55.0, 58.0, 62.0, 66.0, 68.0, 47.0, 52.0, 53.0, 55.0, 60.0, 63.0, 70.0, 48.0,
+        51.0, 58.0, 62.0, 66.0, 69.0,
+    ]);
+    let event_target = Array1::from(vec![
+        1u8, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+    ]);
+    let n = age_entry.len();
+    let event_competing = Array1::<u8>::zeros(n);
+    let sampleweight = Array1::from_elem(n, 1.0_f64);
+    let ln_age_mean: f64 = {
+        let mut sum = 0.0;
+        for i in 0..n {
+            sum += age_entry[i].ln() + age_exit[i].ln();
+        }
+        sum / (2.0 * n as f64)
+    };
+    let mut x_entry = Array2::<f64>::zeros((n, 2));
+    let mut x_exit = Array2::<f64>::zeros((n, 2));
+    let mut x_derivative = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        x_entry[[i, 0]] = 1.0;
+        x_exit[[i, 0]] = 1.0;
+        x_entry[[i, 1]] = age_entry[i].ln() - ln_age_mean;
+        x_exit[[i, 1]] = age_exit[i].ln() - ln_age_mean;
+        x_derivative[[i, 0]] = 0.0;
+        x_derivative[[i, 1]] = 1.0 / age_exit[i];
+    }
+    let penalties = PenaltyBlocks::new(vec![
+        PenaltyBlock {
+            matrix: array![[3.0]],
+            lambda: 0.0,
+            range: 0..1,
+            nullspace_dim: 0,
+        },
+        PenaltyBlock {
+            matrix: array![[2.5]],
+            lambda: active_lambda,
+            range: 1..2,
+            nullspace_dim: 0,
+        },
+    ]);
+    WorkingModelSurvival::from_engine_inputs(
+        SurvivalEngineInputs {
+            age_entry: age_entry.view(),
+            age_exit: age_exit.view(),
+            event_target: event_target.view(),
+            event_competing: event_competing.view(),
+            sampleweight: sampleweight.view(),
+            x_entry: x_entry.view(),
+            x_exit: x_exit.view(),
+            x_derivative: x_derivative.view(),
+            monotonicity_constraint_rows: None,
+            monotonicity_constraint_offsets: None,
+        },
+        penalties,
+        MonotonicityPenalty { tolerance: 1e-8 },
+        SurvivalSpec::Net,
+    )
+    .expect("construct single-block survival LAML FD model")
+}
+
+fn survival_laml_net_single_block_row() -> Vec<GradientChannel> {
+    let model = survival_single_block_model(1.0);
+    let beta0 = array![-2.5_f64, 1.0];
+    let rho = array![0.3];
+    let analytic = model
+        .evaluate_survival_lamlcost_and_gradient(rho.as_slice().expect("contiguous rho"), &beta0)
+        .expect("survival LAML analytic gradient evaluation should succeed")
+        .1;
+    let mut fd = Vec::new();
+    for j in 0..rho.len() {
+        let mut plus = rho.clone();
+        plus[j] += OUTER_FD_STEP;
+        let mut minus = rho.clone();
+        minus[j] -= OUTER_FD_STEP;
+        let fp = model
+            .evaluate_survival_lamlcost_and_gradient(
+                plus.as_slice().expect("contiguous rho"),
+                &beta0,
+            )
+            .expect("survival LAML f+")
+            .0;
+        let fm = model
+            .evaluate_survival_lamlcost_and_gradient(
+                minus.as_slice().expect("contiguous rho"),
+                &beta0,
+            )
+            .expect("survival LAML f-")
+            .0;
+        fd.push((fp - fm) / (2.0 * OUTER_FD_STEP));
+    }
+    vec![GradientChannel {
+        name: "rho",
+        analytic: analytic.to_vec(),
+        fd,
+    }]
+}
+
+/// A penalized multi-coefficient quadratic family. With a single penalty
+/// block of dimension `m`, the LAML objective is
+///     V(ρ) = ½‖β̂−c‖² + ½λ β̂ᵀSβ̂ + ½ log|H| − ½ log|λ S|₊ − ½(m−ν)ρ,
+/// where H = I + λS and `c` is a per-coefficient target. The `½ log|H|`
+/// term is genuinely ρ-dependent and non-separable across the eigenbasis
+/// of S, so it exercises the same matrix-function-of-ρ machinery whose
+/// value↔gradient drift is the bug class under test.
+#[derive(Clone)]
+struct PenalizedQuadraticFamily {
+    target: Array1<f64>,
+}
+
+impl CustomFamily for PenalizedQuadraticFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta = &block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta;
+        if beta.len() != self.target.len() {
+            return Err("beta/target dimension mismatch".to_string());
+        }
+        let resid = beta - &self.target;
+        let nll = 0.5 * resid.iter().map(|r| r * r).sum::<f64>();
+        let m = beta.len();
+        Ok(FamilyEvaluation {
+            log_likelihood: -nll,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: resid.mapv(|r| -r),
+                hessian: SymmetricMatrix::Dense(Array2::<f64>::eye(m)),
+            }],
+        })
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        let m = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta
+            .len();
+        Ok(Some(Array2::<f64>::eye(m)))
+    }
+
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
+    fn exact_newton_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        direction: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_idx != 0 {
+            return Ok(None);
+        }
+        let m = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta
+            .len();
+        if direction.len() != m {
+            return Err("direction dimension mismatch".to_string());
+        }
+        // The Hessian is the constant identity ⇒ its directional
+        // derivative w.r.t. β is the zero matrix.
+        Ok(Some(Array2::<f64>::zeros((m, m))))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        direction: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let m = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta
+            .len();
+        if direction.len() != m {
+            return Err("direction dimension mismatch".to_string());
+        }
+        Ok(Some(Array2::<f64>::zeros((m, m))))
+    }
+}
+
+fn penalized_quadratic_specs(
+    target: &Array1<f64>,
+    penalty: Array2<f64>,
+) -> Vec<ParameterBlockSpec> {
+    let m = target.len();
+    vec![ParameterBlockSpec {
+        name: "penalized-quadratic".to_string(),
+        design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::eye(m))),
+        offset: Array1::<f64>::zeros(m),
+        penalties: vec![PenaltyMatrix::Dense(penalty)],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: Array1::<f64>::zeros(1),
+        initial_beta: Some(Array1::<f64>::zeros(m)),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }]
+}
+
+fn custom_family_opts() -> BlockwiseFitOptions {
+    BlockwiseFitOptions {
+        use_remlobjective: true,
+        compute_covariance: false,
+        ridge_floor: 1e-12,
+        inner_tol: 1e-10,
+        ..BlockwiseFitOptions::default()
+    }
+}
+
+fn distinct_diag_penalty(m: usize) -> Array2<f64> {
+    let mut s = Array2::<f64>::zeros((m, m));
+    for j in 0..m {
+        s[[j, j]] = 1.0 + j as f64;
+    }
+    s
+}
+
+fn custom_family_joint_laml_penalized_quadratic_row() -> Vec<GradientChannel> {
+    let target = array![0.5_f64, -0.3, 0.8, 0.1];
+    let family = PenalizedQuadraticFamily {
+        target: target.clone(),
+    };
+    let specs = penalized_quadratic_specs(&target, distinct_diag_penalty(target.len()));
+    let opts = custom_family_opts();
+    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
+    let rho = array![0.4];
+    let analytic = evaluate_custom_family_joint_hyper(
+        &family,
+        &specs,
+        &opts,
+        &rho,
+        &derivative_blocks,
+        None,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("custom-family joint LAML gradient eval")
+    .gradient;
+    let mut fd = Vec::new();
+    for j in 0..rho.len() {
+        let mut plus = rho.clone();
+        plus[j] += OUTER_FD_STEP;
+        let mut minus = rho.clone();
+        minus[j] -= OUTER_FD_STEP;
+        let fp = evaluate_custom_family_joint_hyper(
+            &family,
+            &specs,
+            &opts,
+            &plus,
+            &derivative_blocks,
+            None,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("custom-family joint LAML f+")
+        .objective;
+        let fm = evaluate_custom_family_joint_hyper(
+            &family,
+            &specs,
+            &opts,
+            &minus,
+            &derivative_blocks,
+            None,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("custom-family joint LAML f-")
+        .objective;
+        fd.push((fp - fm) / (2.0 * OUTER_FD_STEP));
+    }
+    vec![GradientChannel {
+        name: "rho",
+        analytic: analytic.to_vec(),
+        fd,
+    }]
+}
+
 fn spec_without_penalty(name: &str, design: Array2<f64>) -> ParameterBlockSpec {
     let n = design.nrows();
     ParameterBlockSpec {
