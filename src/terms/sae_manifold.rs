@@ -52,7 +52,7 @@ use crate::terms::sae_optimality_certificate::{
 };
 
 use crate::linalg::faer_ndarray::{
-    FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_abt, fast_ata, fast_atb,
+    FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb,
 };
 use crate::linalg::triangular::cholesky_solve_vector;
 use crate::solver::arrow_schur::{
@@ -13249,13 +13249,13 @@ impl SaeManifoldOuterObjective {
     ///
     /// All ρ coords are log-quantities, so the engine's additive step
     /// `rho_new = rho + step` IS the multiplicative FS update. Per coord:
-    /// - ARD axis (k,j): `α_new = n / (‖t_kj‖² + tr_kj(H⁻¹))`,
+    /// - ARD axis (k,j): `α_new = φ̂ n / (‖t_kj‖² + tr_kj(H⁻¹))`,
     ///   `step = ln α_new − log_ard[k][j]`. The `tr_kj(H⁻¹)` posterior
     ///   variance (from the selected-inverse latent diagonal) is exactly the
     ///   term the deleted `α=n/‖t‖²` rule dropped, so α cannot collapse on a
     ///   degenerate axis: as `‖t‖²→0`, `tr_kj(H⁻¹)→1/α` bounds the
     ///   denominator and the fixed point has a finite root.
-    /// - λ_smooth: `λ_new = [p·Σ_k rank S_k − tr(S_β⁻¹ M)] / βᵀ(⊕S_k⊗I_p)β`
+    /// - λ_smooth: `λ_new = φ̂[p·Σ_k rank S_k − tr(S_β⁻¹ M)] / βᵀ(⊕S_k⊗I_p)β`
     ///   (Wood-Fasiolo EFS), `step = ln λ_new − log_lambda_smooth`.
     /// - λ_sparse: 0.0 — the assignment-sparsity priors (softmax entropy,
     ///   gated L1, IBP) are non-quadratic, so no Gaussian-logdet FS fixed
@@ -13278,6 +13278,10 @@ impl SaeManifoldOuterObjective {
             self.ridge_beta,
         )?;
         self.current_rho = rho.clone();
+        let dispersion = self
+            .term
+            .reconstruction_dispersion(&loss, &cache, &rho)
+            .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: dispersion: {e}"))?;
         self.last_loss = Some(loss);
 
         let n_obs = self.term.n_obs() as f64;
@@ -13308,13 +13312,14 @@ impl SaeManifoldOuterObjective {
             .term
             .decoder_smoothness_effective_dof(&cache, lambda_smooth)
             .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: smooth dof: {e}"))?;
-        // λ_new = (penalty_rank − effective_dof) / penalty_energy. The
-        // numerator is the unpenalised-direction count; guard the FS ratio
-        // against a vanishing penalty energy or a non-positive numerator
-        // (which can occur transiently far from the optimum) by holding
+        // λ_new = φ̂ · (penalty_rank − effective_dof) / penalty_energy. The
+        // dispersion factor makes the update target the dimensionless effective
+        // stiffness λ/φ̂ instead of an absolute output-unit penalty weight.
+        // Guard the FS ratio against a vanishing penalty energy or a non-positive
+        // numerator (which can occur transiently far from the optimum) by holding
         // λ_smooth fixed (step 0) — the cost path still moves it then.
         if quad > 0.0 && rank_total - eff_dof > 0.0 && lambda_smooth > 0.0 {
-            let lambda_new = (rank_total - eff_dof) / quad;
+            let lambda_new = dispersion * (rank_total - eff_dof) / quad;
             if lambda_new.is_finite() && lambda_new > 0.0 {
                 steps[1] = lambda_new.ln() - rho.log_lambda_smooth;
             }
@@ -13327,7 +13332,7 @@ impl SaeManifoldOuterObjective {
             for j in 0..d {
                 let denom = sumsq[k][j] + traces[k][j];
                 if denom > 0.0 {
-                    let alpha_new = n_obs / denom;
+                    let alpha_new = dispersion * n_obs / denom;
                     if alpha_new.is_finite() && alpha_new > 0.0 {
                         steps[cursor + j] = alpha_new.ln() - axis_logard[j];
                     }
@@ -16220,6 +16225,7 @@ mod tests {
             for &sigma in &[0.02_f64, 0.05, 0.18] {
                 let z = planted_circle_data(n, sigma);
                 let (term, seed_dispersion) = planted_circle_seed_term(z.view());
+                let seed_ev = global_ev(z.view(), term.fitted().view());
                 let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
                     .seed_scaled_by_dispersion(seed_dispersion)
                     .unwrap();
@@ -16230,8 +16236,8 @@ mod tests {
                     z.clone(),
                     None,
                     init_rho,
-                    20,
-                    0.5,
+                    50,
+                    0.04,
                     1.0e-6,
                     1.0e-6,
                 );
@@ -16239,12 +16245,16 @@ mod tests {
                     .with_initial_rho(init_rho_flat)
                     .run(&mut objective, "SAE planted circle dimensionless seed")
                     .unwrap();
-                let (fitted_term, _rho, _loss) = objective.into_fitted();
+                let (fitted_term, rho, _loss) = objective.into_fitted();
                 let fitted = fitted_term.fitted();
                 let ev = global_ev(z.view(), fitted.view());
                 assert!(
                     ev > 0.95,
-                    "planted circle n={n} sigma={sigma} EV={ev:.4} should exceed 0.95"
+                    "planted circle n={n} sigma={sigma} seed_ev={seed_ev:.4} seed_phi={seed_dispersion:.3e} \
+                     final_rho=({:.3}, {:.3}, {:?}) EV={ev:.4} should exceed 0.95",
+                    rho.log_lambda_sparse,
+                    rho.log_lambda_smooth,
+                    rho.log_ard
                 );
                 assert!(
                     fitted_term.collapse_events().is_empty(),
