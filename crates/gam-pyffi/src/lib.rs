@@ -9776,15 +9776,11 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("atom_active_mask", active_mask)?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
     out.set_item("reml_score", loss.evidence_proxy())?;
-    out.set_item(
-        "log_alpha",
-        alpha.ln()
-            + if learnable_alpha {
-                rho.log_lambda_sparse
-            } else {
-                0.0
-            },
-    )?;
+    let reported_log_alpha = match term.assignment.mode {
+        gam::terms::sae_manifold::AssignmentMode::IBPMap { alpha, .. } => alpha.ln(),
+        _ => alpha.ln(),
+    };
+    out.set_item("log_alpha", reported_log_alpha)?;
     out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
     out.set_item("log_ard", log_ard_py)?;
     out.set_item("assignment_prior", assignment_kind)?;

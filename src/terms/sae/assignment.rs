@@ -5,7 +5,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::terms::analytic_penalties::{
     AnalyticPenalty, IBPAssignmentPenalty, IbpHessianDiagThirdChannels,
-    SoftmaxAssignmentSparsityPenalty,
+    SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 use crate::terms::sae_manifold::SaeManifoldRho;
@@ -159,6 +159,21 @@ impl AssignmentMode {
         }
         Ok(())
     }
+
+    pub(crate) fn resolved_ibp_alpha(&self, rho: &SaeManifoldRho) -> Option<f64> {
+        match *self {
+            AssignmentMode::IBPMap {
+                alpha,
+                learnable_alpha,
+                ..
+            } => Some(if learnable_alpha {
+                resolve_learnable_weight(alpha, rho.log_lambda_sparse)
+            } else {
+                alpha
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Per-row latent assignment state.
@@ -275,6 +290,22 @@ impl SaeAssignment {
     }
 
     pub fn try_assignments_row(&self, row: usize) -> Result<Array1<f64>, String> {
+        self.try_assignments_row_with_alpha(row, None)
+    }
+
+    pub(crate) fn try_assignments_row_for_rho(
+        &self,
+        row: usize,
+        rho: &SaeManifoldRho,
+    ) -> Result<Array1<f64>, String> {
+        self.try_assignments_row_with_alpha(row, self.mode.resolved_ibp_alpha(rho))
+    }
+
+    fn try_assignments_row_with_alpha(
+        &self,
+        row: usize,
+        resolved_ibp_alpha: Option<f64>,
+    ) -> Result<Array1<f64>, String> {
         validate_finite_logits(self.logits.row(row), row)?;
         // Only Softmax collapses to a fixed assignment at K==1: its
         // assignment_coord_dim is K-1 = 0, so there is no free logit. IBPMap and
@@ -290,12 +321,47 @@ impl SaeAssignment {
             }
             AssignmentMode::IBPMap {
                 temperature, alpha, ..
-            } => Ok(ibp_map_row(self.logits.row(row), temperature, alpha)),
+            } => Ok(ibp_map_row(
+                self.logits.row(row),
+                temperature,
+                resolved_ibp_alpha.unwrap_or(alpha),
+            )),
             AssignmentMode::JumpReLU {
                 temperature,
                 threshold,
             } => Ok(jumprelu_row(self.logits.row(row), temperature, threshold)),
         }
+    }
+
+    pub(crate) fn persist_resolved_ibp_alpha(&mut self, rho: &SaeManifoldRho) -> bool {
+        let AssignmentMode::IBPMap {
+            temperature,
+            alpha,
+            learnable_alpha: true,
+        } = self.mode
+        else {
+            return false;
+        };
+        let resolved_alpha = resolve_learnable_weight(alpha, rho.log_lambda_sparse);
+        self.mode = AssignmentMode::IBPMap {
+            temperature,
+            alpha: resolved_alpha,
+            learnable_alpha: false,
+        };
+        true
+    }
+
+    pub(crate) fn assignments_for_rho(&self, rho: &SaeManifoldRho) -> Result<Array2<f64>, String> {
+        let n = self.n_obs();
+        let k = self.k_atoms();
+        let mut out = Array2::<f64>::zeros((n, k));
+        for row in 0..n {
+            let a = self.try_assignments_row_for_rho(row, rho)?;
+            for atom in 0..k {
+                out[[row, atom]] = a[atom];
+            }
+        }
+        Ok(out)
     }
 
     /// Flatten extension coordinates in row-major SAE layout:
@@ -827,20 +893,49 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
             alpha,
             learnable_alpha,
         } => {
-            if learnable_alpha {
-                return Ok(Array1::<f64>::zeros(target.len()));
-            }
             let mut penalty = IBPAssignmentPenalty::new(
                 assignment.k_atoms(),
                 alpha,
                 temperature,
                 learnable_alpha,
             );
-            penalty.weight = rho.lambda_sparse();
-            penalty
-                .hessian_diag(target.view(), Array1::<f64>::zeros(0).view())
-                .ok_or_else(|| "IBP assignment log-strength hessian diag unavailable".to_string())
+            if learnable_alpha {
+                let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse]);
+                Ok(penalty.hessian_diag_log_alpha_derivative(target.view(), rho_view.view()))
+            } else {
+                penalty.weight = rho.lambda_sparse();
+                penalty
+                    .hessian_diag(target.view(), Array1::<f64>::zeros(0).view())
+                    .ok_or_else(|| {
+                        "IBP assignment log-strength hessian diag unavailable".to_string()
+                    })
+            }
         }
+    }
+}
+
+pub(crate) fn assignment_prior_log_strength_target_mixed(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+) -> Result<Array1<f64>, String> {
+    for row in 0..assignment.n_obs() {
+        validate_finite_logits(assignment.logits.row(row), row)?;
+    }
+    let target = flat_logits(assignment.logits.view());
+    if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
+        return Ok(Array1::<f64>::zeros(target.len()));
+    }
+    match assignment.mode {
+        AssignmentMode::IBPMap {
+            temperature,
+            alpha,
+            learnable_alpha: true,
+        } => {
+            let penalty = IBPAssignmentPenalty::new(assignment.k_atoms(), alpha, temperature, true);
+            let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse]);
+            Ok(penalty.log_alpha_target_mixed_derivative(target.view(), rho_view.view()))
+        }
+        _ => Ok(assignment_prior_grad_hdiag(assignment, rho)?.0),
     }
 }
 

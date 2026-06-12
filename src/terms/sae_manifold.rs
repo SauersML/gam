@@ -4153,6 +4153,7 @@ impl SaeManifoldTerm {
     fn refresh_active_frames_from_data(
         &mut self,
         target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
     ) -> Result<usize, String> {
         let n = self.n_obs();
         let p = self.output_dim();
@@ -4163,7 +4164,7 @@ impl SaeManifoldTerm {
         // Per-row assignments and per-(row, atom) decoded outputs, computed once.
         let mut assignments = Vec::with_capacity(n);
         for row in 0..n {
-            assignments.push(self.assignment.try_assignments_row(row)?);
+            assignments.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
         }
         let mut decoded = Array3::<f64>::zeros((n, k_atoms, p));
         let mut dbuf = vec![0.0_f64; p];
@@ -4389,6 +4390,7 @@ impl SaeManifoldTerm {
     pub fn refit_decoder_least_squares_at_current_state(
         &mut self,
         target: ArrayView2<'_, f64>,
+        rho: Option<&SaeManifoldRho>,
     ) -> Result<(), String> {
         let n = self.n_obs();
         let p = self.output_dim();
@@ -4403,7 +4405,10 @@ impl SaeManifoldTerm {
         let m_total = self.beta_dim() / p;
         let mut design = Array2::<f64>::zeros((n, m_total));
         for row in 0..n {
-            let assignments = self.assignment.try_assignments_row(row)?;
+            let assignments = match rho {
+                Some(rho) => self.assignment.try_assignments_row_for_rho(row, rho)?,
+                None => self.assignment.try_assignments_row(row)?,
+            };
             for atom_idx in 0..k_atoms {
                 let atom = &self.atoms[atom_idx];
                 let weight = assignments[atom_idx];
@@ -4440,6 +4445,14 @@ impl SaeManifoldTerm {
     }
 
     pub fn try_fitted(&self) -> Result<Array2<f64>, String> {
+        self.try_fitted_with_rho(None)
+    }
+
+    pub(crate) fn try_fitted_for_rho(&self, rho: &SaeManifoldRho) -> Result<Array2<f64>, String> {
+        self.try_fitted_with_rho(Some(rho))
+    }
+
+    fn try_fitted_with_rho(&self, rho: Option<&SaeManifoldRho>) -> Result<Array2<f64>, String> {
         let n = self.n_obs();
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
@@ -4448,7 +4461,10 @@ impl SaeManifoldTerm {
         // allocating a fresh `Array1<f64>` of length p per call.
         let mut g_buf = vec![0.0_f64; p];
         for row in 0..n {
-            let a = self.assignment.try_assignments_row(row)?;
+            let a = match rho {
+                Some(rho) => self.assignment.try_assignments_row_for_rho(row, rho)?,
+                None => self.assignment.try_assignments_row(row)?,
+            };
             for atom_idx in 0..k_atoms {
                 self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
                 let a_k = a[atom_idx];
@@ -4495,7 +4511,7 @@ impl SaeManifoldTerm {
                 target.dim()
             ));
         }
-        let fitted = self.try_fitted()?;
+        let fitted = self.try_fitted_for_rho(rho)?;
         let mut data_fit = 0.0_f64;
         // The likelihood whitens through the RowMetric **only** when the metric
         // is a genuinely estimated noise model (`metric.whitens_likelihood()`,
@@ -5066,10 +5082,12 @@ impl SaeManifoldTerm {
                     Some((k_active_cap, relative_cutoff)) => {
                         // Build per-row dense assignments once to derive the
                         // active set; the row loop re-derives `assignments`
-                        // (cheap softmax) and reuses these active sets.
+                        // (cheap gate map at the same rho) and reuses these
+                        // active sets.
                         let mut assignments_all = Vec::with_capacity(n);
                         for row in 0..n {
-                            assignments_all.push(self.assignment.try_assignments_row(row)?);
+                            assignments_all
+                                .push(self.assignment.try_assignments_row_for_rho(row, rho)?);
                         }
                         // Absolute cutoff = relative_cutoff · max row peak, so a
                         // single threshold drops sub-1e-3 mass across all rows.
@@ -5215,10 +5233,15 @@ impl SaeManifoldTerm {
         let mu_offsets: Vec<usize> = beta_offsets.iter().map(|&off| off / p).collect();
         let mut g_blocks: std::collections::BTreeMap<(usize, usize), Array2<f64>> =
             std::collections::BTreeMap::new();
-        // Stick-breaking prior for IBP-MAP depends only on (k_atoms, alpha)
-        // which are constant across rows; precompute once.
+        // Stick-breaking prior for IBP-MAP depends only on (k_atoms, alpha_eff)
+        // which are constant across rows for the current rho; precompute once.
         let ibp_prior_vec = match self.assignment.mode {
-            AssignmentMode::IBPMap { alpha, .. } => {
+            AssignmentMode::IBPMap { .. } => {
+                let alpha = self
+                    .assignment
+                    .mode
+                    .resolved_ibp_alpha(rho)
+                    .ok_or_else(|| "IBP assignment alpha resolution failed".to_string())?;
                 Some(ibp_stick_breaking_prior(k_atoms, alpha).to_vec())
             }
             _ => None,
@@ -5249,7 +5272,7 @@ impl SaeManifoldTerm {
             .map(|coord| coord.effective_axis_periods())
             .collect();
         for row in 0..n {
-            let assignments = self.assignment.try_assignments_row(row)?;
+            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
             // Reconstruction uses the row's active support: for the dense
             // full-support layout this is all atoms (exact); for a compact
             // layout the dropped atoms carry negligible `O(a)` reconstruction
@@ -5470,28 +5493,22 @@ impl SaeManifoldTerm {
             // For dense layout: position `atom_idx` directly.
             //
             // H-consistency note (#1006 audit). This `assignment_hdiag` is the
-            // assignment penalty's EXACT `hessian_diag` (softmax-sparsity, IBP-MAP
-            // empirical-π, or JumpReLU sigmoid surrogate), added RAW — unlike the ARD
-            // coordinate curvature (`prior.hess.max(0.0)` below) and the
-            // decoder-tier penalties (`psd_majorizer_diag`), it is NOT majorized.
-            // That diagonal CAN be negative (the softmax `(1−2z)`-type logit
-            // curvature, IBP `score·(1−2z)` term, and JumpReLU above its
-            // threshold), so the assembled `H_tt` is
-            // Gauss-Newton (PSD) + majorized ARD (PSD) + raw-assignment-prior
-            // (indefinite) and is therefore NOT guaranteed PD off the optimum.
-            // This refutes the "pure GN+majorizer cannot be non-PD" premise: the
-            // genuine non-PD the evidence factorization reports
-            // (`arrow_schur.rs` "evidence mode preserves the genuine Cholesky")
-            // comes from this un-majorized term, not from any divergence between
-            // the Newton-solve H and the evidence H. Both paths factor THIS one
-            // assembled block (single source of truth); they differ only in ridge
-            // policy — Newton conditions a non-PD block, evidence refuses to (a
-            // silent ridge would shift the reported log-det). At the converged
-            // optimum `H_tt` is PD, where the evidence factor is taken. Because
-            // the criterion's log|H| and the Γ adjoint (`logdet_theta_adjoint`)
-            // both differentiate THIS raw diagonal — `hessian_diag` and its exact
-            // logit third channels `hessian_diag_logit_third_channels`,
-            // #1006 — value and gradient stay on the same branch with no desync.
+            // assignment channel's raw diagonal curvature, added un-majorized. It
+            // is exact for JumpReLU and exact within each IBP row/column diagonal,
+            // but it is a deliberate diagonal approximation for two full-Hessian
+            // structures that the current factorization does not yet carry (#1038):
+            //
+            //   * softmax entropy has dense within-row Hessian
+            //     H_kj = (λ/τ²) a_k[δ_kj(m-L_k-1) + a_j(L_k+L_j+1-2m)];
+            //     this block stores only its diagonal.
+            //   * IBP empirical-π has cross-row rank-one terms per column
+            //     H_(i,k),(j,k) = w score_derivative_k z'_ik z'_jk for i != j;
+            //     this row-local block stores only the diagonal/self-row part.
+            //
+            // The criterion's log|H| and Γ adjoint differentiate this same
+            // assembled diagonal/quasi-Laplace Hessian, so value and gradient stay
+            // on one branch. A future dense-row softmax or IBP Woodbury correction
+            // must update both assembly and the θ-adjoint together.
             let assignment_base = row * k_atoms;
             if let Some(ref layout) = row_layout {
                 let active = &layout.active_atoms[row];
@@ -7541,6 +7558,184 @@ impl SaeManifoldTerm {
         Ok(0.5 * trace)
     }
 
+    fn learnable_ibp_forward_alpha_data_derivative(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+    ) -> Result<f64, String> {
+        let AssignmentMode::IBPMap {
+            temperature: _,
+            learnable_alpha: true,
+            ..
+        } = self.assignment.mode
+        else {
+            return Ok(0.0);
+        };
+        let alpha = self
+            .assignment
+            .mode
+            .resolved_ibp_alpha(rho)
+            .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
+        let k_atoms = self.k_atoms();
+        let prior = ibp_stick_breaking_prior(k_atoms, alpha);
+        let mut dprior = Array1::<f64>::zeros(k_atoms);
+        for k in 0..k_atoms {
+            dprior[k] = prior[k] * k as f64 / (alpha + 1.0);
+        }
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let row_loss_w = self.row_loss_weights.as_deref();
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        let mut decoded = vec![0.0_f64; p];
+        let mut fitted = Array1::<f64>::zeros(p);
+        let mut f_rho = Array1::<f64>::zeros(p);
+        let mut residual = Array1::<f64>::zeros(p);
+        let mut total = 0.0_f64;
+        for row in 0..n {
+            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            fitted.fill(0.0);
+            f_rho.fill(0.0);
+            for k in 0..k_atoms {
+                self.atoms[k].fill_decoded_row(row, &mut decoded);
+                let sigma = assignments[k] / prior[k];
+                let da_rho = sigma * dprior[k];
+                for out_col in 0..p {
+                    fitted[out_col] += assignments[k] * decoded[out_col];
+                    f_rho[out_col] += da_rho * decoded[out_col];
+                }
+            }
+            for out_col in 0..p {
+                residual[out_col] = fitted[out_col] - target[[row, out_col]];
+            }
+            let residual_metric = match self.row_metric.as_ref() {
+                Some(metric) if whitens => metric.apply_metric_row(row, residual.view()),
+                _ => residual.to_vec(),
+            };
+            let row_weight = row_loss_w.map_or(1.0, |w| w[row]);
+            let mut row_dot = 0.0_f64;
+            for out_col in 0..p {
+                row_dot += residual_metric[out_col] * f_rho[out_col];
+            }
+            total += row_weight * row_dot;
+        }
+        Ok(total)
+    }
+
+    fn add_learnable_ibp_forward_alpha_data_rhs(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        t: &mut Array1<f64>,
+        beta: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let AssignmentMode::IBPMap {
+            temperature,
+            learnable_alpha: true,
+            ..
+        } = self.assignment.mode
+        else {
+            return Ok(());
+        };
+        let alpha = self
+            .assignment
+            .mode
+            .resolved_ibp_alpha(rho)
+            .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
+        let k_atoms = self.k_atoms();
+        let p = self.output_dim();
+        let prior = ibp_stick_breaking_prior(k_atoms, alpha);
+        let mut dprior = Array1::<f64>::zeros(k_atoms);
+        for k in 0..k_atoms {
+            dprior[k] = prior[k] * k as f64 / (alpha + 1.0);
+        }
+        let inv_tau = 1.0 / temperature;
+        let row_loss_w = self.row_loss_weights.as_deref();
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        let border = self.border_channels_for_cache(cache)?;
+        let mut decoded_rows = vec![vec![0.0_f64; p]; k_atoms];
+        let mut decoded_deriv = vec![0.0_f64; p];
+        let mut fitted = Array1::<f64>::zeros(p);
+        let mut f_rho = Array1::<f64>::zeros(p);
+        let mut residual = Array1::<f64>::zeros(p);
+        for row in 0..self.n_obs() {
+            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            fitted.fill(0.0);
+            f_rho.fill(0.0);
+            for k in 0..k_atoms {
+                self.atoms[k].fill_decoded_row(row, &mut decoded_rows[k]);
+                let sigma = assignments[k] / prior[k];
+                let da_rho = sigma * dprior[k];
+                for out_col in 0..p {
+                    fitted[out_col] += assignments[k] * decoded_rows[k][out_col];
+                    f_rho[out_col] += da_rho * decoded_rows[k][out_col];
+                }
+            }
+            for out_col in 0..p {
+                residual[out_col] = fitted[out_col] - target[[row, out_col]];
+            }
+            let residual_metric = match self.row_metric.as_ref() {
+                Some(metric) if whitens => metric.apply_metric_row(row, residual.view()),
+                _ => residual.to_vec(),
+            };
+            let f_metric = match self.row_metric.as_ref() {
+                Some(metric) if whitens => metric.apply_metric_row(row, f_rho.view()),
+                _ => f_rho.to_vec(),
+            };
+            let row_weight = row_loss_w.map_or(1.0, |w| w[row]);
+            let row_vars = self.row_vars_for_cache_row(row, cache)?;
+            let row_base = cache.row_offsets[row];
+            for (pos, var) in row_vars.iter().enumerate() {
+                let mut contribution = 0.0_f64;
+                match *var {
+                    SaeLocalRowVar::Logit { atom } => {
+                        let sigma = assignments[atom] / prior[atom];
+                        let sigma_jac = sigma * (1.0 - sigma) * inv_tau;
+                        let da_dl = sigma_jac * prior[atom];
+                        let d_da_rho_dl = sigma_jac * dprior[atom];
+                        for out_col in 0..p {
+                            contribution += da_dl * decoded_rows[atom][out_col] * f_metric[out_col];
+                            contribution += d_da_rho_dl
+                                * decoded_rows[atom][out_col]
+                                * residual_metric[out_col];
+                        }
+                    }
+                    SaeLocalRowVar::Coord { atom, axis } => {
+                        let sigma = assignments[atom] / prior[atom];
+                        let da_rho = sigma * dprior[atom];
+                        self.atoms[atom].fill_decoded_derivative_row(row, axis, &mut decoded_deriv);
+                        for out_col in 0..p {
+                            contribution +=
+                                assignments[atom] * decoded_deriv[out_col] * f_metric[out_col];
+                            contribution +=
+                                da_rho * decoded_deriv[out_col] * residual_metric[out_col];
+                        }
+                    }
+                }
+                t[row_base + pos] += row_weight * contribution;
+            }
+            for channel in &border {
+                let phi = self.atoms[channel.atom].basis_values[[row, channel.basis_col]];
+                let sigma = assignments[channel.atom] / prior[channel.atom];
+                let da_rho = sigma * dprior[channel.atom];
+                let mut contribution = 0.0_f64;
+                for out_col in 0..p {
+                    let output = channel.output[out_col];
+                    contribution += assignments[channel.atom] * phi * output * f_metric[out_col];
+                    contribution += da_rho * phi * output * residual_metric[out_col];
+                }
+                beta[channel.index] += row_weight * contribution;
+            }
+        }
+        Ok(())
+    }
+
     fn border_channels_for_cache(
         &self,
         cache: &ArrowFactorCache,
@@ -7672,6 +7867,7 @@ impl SaeManifoldTerm {
 
     fn gate_derivatives_for_row(
         &self,
+        rho: &SaeManifoldRho,
         row: usize,
         assignments: ArrayView1<'_, f64>,
         vars: &[SaeLocalRowVar],
@@ -7716,7 +7912,12 @@ impl SaeManifoldTerm {
             AssignmentMode::IBPMap {
                 temperature, alpha, ..
             } => {
-                let prior = ibp_stick_breaking_prior(k_atoms, alpha);
+                let effective_alpha = self
+                    .assignment
+                    .mode
+                    .resolved_ibp_alpha(rho)
+                    .unwrap_or(alpha);
+                let prior = ibp_stick_breaking_prior(k_atoms, effective_alpha);
                 let inv_tau = 1.0 / temperature;
                 for (idx, var) in vars.iter().enumerate() {
                     let SaeLocalRowVar::Logit { atom } = *var else {
@@ -7773,6 +7974,7 @@ impl SaeManifoldTerm {
 
     fn row_jets_for_logdet(
         &self,
+        rho: &SaeManifoldRho,
         row: usize,
         vars: Vec<SaeLocalRowVar>,
         assignments: ArrayView1<'_, f64>,
@@ -7786,7 +7988,7 @@ impl SaeManifoldTerm {
             .row_loss_weights
             .as_deref()
             .map_or(1.0, |w| w[row].sqrt());
-        let (dz, d2z) = self.gate_derivatives_for_row(row, assignments, &vars)?;
+        let (dz, d2z) = self.gate_derivatives_for_row(rho, row, assignments, &vars)?;
 
         let mut decoded = vec![vec![0.0_f64; p]; k_atoms];
         let mut d1: Vec<Vec<Vec<f64>>> = self
@@ -8067,6 +8269,7 @@ impl SaeManifoldTerm {
     pub fn outer_rho_gradient_ift_rhs(
         &self,
         rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
         j: usize,
         cache: &ArrowFactorCache,
     ) -> Result<SaeArrowVector, String> {
@@ -8079,7 +8282,8 @@ impl SaeManifoldTerm {
         let mut t = Array1::<f64>::zeros(cache.delta_t_len());
         let mut beta = Array1::<f64>::zeros(cache.k);
         if j == 0 {
-            let (assignment_grad, _) = assignment_prior_grad_hdiag(&self.assignment, rho)?;
+            let assignment_grad =
+                assignment_prior_log_strength_target_mixed(&self.assignment, rho)?;
             let k_atoms = self.k_atoms();
             let assignment_dim = self.assignment.assignment_coord_dim();
             for row in 0..self.n_obs() {
@@ -8098,6 +8302,7 @@ impl SaeManifoldTerm {
                     }
                 }
             }
+            self.add_learnable_ibp_forward_alpha_data_rhs(rho, target, cache, &mut t, &mut beta)?;
         } else if j == 1 {
             let lambda = rho.lambda_smooth();
             let frames_active = self.last_frames_active && cache.k == self.factored_border_dim();
@@ -8196,11 +8401,11 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        // Exact IBP `hessian_diag` logit third-derivative channels (#1006), built
-        // once on the same penalty configuration the assembly uses. `None` for
-        // non-IBP modes. The cross-row empirical-`M_k` channel needs the per-row
-        // selected-inverse diagonals collected during the row loop, so it is
-        // distributed column-wise afterwards.
+        // IBP `hessian_diag` logit third-derivative channels (#1006), exact for
+        // the diagonal/quasi-Laplace assignment curvature this assembly actually
+        // factors. The full IBP Hessian also has per-column cross-row rank-one
+        // terms; those are omitted from H and therefore from this adjoint until
+        // the evidence factor grows the matching Woodbury correction.
         let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho)?;
         let k_atoms = self.k_atoms();
         // Per active logit position: (row i, column k, global t-index,
@@ -8211,9 +8416,15 @@ impl SaeManifoldTerm {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
             let vars = self.row_vars_for_cache_row(row, cache)?;
-            let assignments = self.assignment.try_assignments_row(row)?;
-            let jets =
-                self.row_jets_for_logdet(row, vars, assignments.view(), &second_jets, &border)?;
+            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            let jets = self.row_jets_for_logdet(
+                rho,
+                row,
+                vars,
+                assignments.view(),
+                &second_jets,
+                &border,
+            )?;
 
             let mut inv_vv = Array2::<f64>::zeros((q, q));
             let mut inv_vbeta = Array2::<f64>::zeros((q, cache.k));
@@ -8337,6 +8548,7 @@ impl SaeManifoldTerm {
     /// implicit-state third-order correction.
     pub(crate) fn analytic_outer_rho_gradient_components(
         &self,
+        target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
@@ -8348,7 +8560,8 @@ impl SaeManifoldTerm {
         let mut occam = Array1::<f64>::zeros(n_params);
         let mut third_order_correction = Array1::<f64>::zeros(n_params);
 
-        explicit[0] = assignment_prior_log_strength_derivative(&self.assignment, rho);
+        explicit[0] = assignment_prior_log_strength_derivative(&self.assignment, rho)
+            + self.learnable_ibp_forward_alpha_data_derivative(rho, target)?;
         logdet_trace[0] = self.assignment_log_strength_hessian_trace(rho, cache, solver)?;
 
         explicit[1] = loss.smoothness;
@@ -8373,7 +8586,7 @@ impl SaeManifoldTerm {
 
         let gamma = self.logdet_theta_adjoint(rho, cache, solver)?;
         for coord in 0..n_params {
-            let rhs = self.outer_rho_gradient_ift_rhs(rho, coord, cache)?;
+            let rhs = self.outer_rho_gradient_ift_rhs(rho, target, coord, cache)?;
             let solved = solver.solve(rhs.t.view(), rhs.beta.view()).map_err(|err| {
                 format!("analytic_outer_rho_gradient_components: full_inverse_apply: {err}")
             })?;
@@ -8403,12 +8616,13 @@ impl SaeManifoldTerm {
     /// the crate-private `DeflatedArrowSolver`.
     pub fn analytic_outer_rho_gradient_at_converged(
         &self,
+        target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
     ) -> Result<SaeOuterRhoGradientComponents, String> {
         let solver = self.outer_gradient_arrow_solver(cache)?;
-        self.analytic_outer_rho_gradient_components(rho, loss, cache, &solver)
+        self.analytic_outer_rho_gradient_components(target, rho, loss, cache, &solver)
     }
 
     /// Compose the SAE LAML criterion as a sum of atoms (#931 SAE pilot).
@@ -8459,7 +8673,7 @@ impl SaeManifoldTerm {
 
         let solver = self.outer_gradient_arrow_solver(&cache)?;
         let components =
-            self.analytic_outer_rho_gradient_components(rho, &loss, &cache, &solver)?;
+            self.analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &solver)?;
         Ok(SaeCriterion::assemble(
             data_fit_priors_value,
             log_det,
@@ -9801,7 +10015,10 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    fn canonicalize_affine_gauge_after_accept(&mut self) -> Result<(), String> {
+    fn canonicalize_affine_gauge_after_accept(
+        &mut self,
+        rho: Option<&SaeManifoldRho>,
+    ) -> Result<(), String> {
         for atom_idx in 0..self.k_atoms() {
             if !matches!(
                 self.atoms[atom_idx].basis_kind,
@@ -9809,12 +10026,16 @@ impl SaeManifoldTerm {
             ) {
                 continue;
             }
-            self.canonicalize_atom_affine_gauge(atom_idx)?;
+            self.canonicalize_atom_affine_gauge(atom_idx, rho)?;
         }
         Ok(())
     }
 
-    fn canonicalize_atom_affine_gauge(&mut self, atom_idx: usize) -> Result<(), String> {
+    fn canonicalize_atom_affine_gauge(
+        &mut self,
+        atom_idx: usize,
+        rho: Option<&SaeManifoldRho>,
+    ) -> Result<(), String> {
         let n = self.n_obs();
         let d = self.assignment.coords[atom_idx].latent_dim();
         if n == 0 || d == 0 {
@@ -9824,7 +10045,7 @@ impl SaeManifoldTerm {
             return Ok(());
         };
         let coords = self.assignment.coords[atom_idx].as_matrix();
-        let weights = self.atom_affine_gauge_weights(atom_idx)?;
+        let weights = self.atom_affine_gauge_weights(atom_idx, rho)?;
         let weight_sum: f64 = weights.iter().sum();
         if !(weight_sum.is_finite() && weight_sum > 0.0) {
             return Ok(());
@@ -9923,11 +10144,18 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    fn atom_affine_gauge_weights(&self, atom_idx: usize) -> Result<Array1<f64>, String> {
+    fn atom_affine_gauge_weights(
+        &self,
+        atom_idx: usize,
+        rho: Option<&SaeManifoldRho>,
+    ) -> Result<Array1<f64>, String> {
         let n = self.n_obs();
         let mut weights = Array1::<f64>::zeros(n);
         for row in 0..n {
-            let assignments = self.assignment.try_assignments_row(row)?;
+            let assignments = match rho {
+                Some(rho) => self.assignment.try_assignments_row_for_rho(row, rho)?,
+                None => self.assignment.try_assignments_row(row)?,
+            };
             let mut w = assignments[atom_idx].max(0.0);
             if let Some(row_weights) = self.row_loss_weights.as_ref() {
                 w *= row_weights[row].max(0.0);
@@ -10713,8 +10941,12 @@ impl SaeManifoldTerm {
     /// `(gates, coords, decoder)` state against `target`, in the term's native
     /// `(n, p)` layout. The curvature-homotopy predictor (#1007) contracts this
     /// against `∂Φ/∂η` to form the data-fit half of `∂g_β/∂η`.
-    fn reconstruction_residual(&self, target: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-        let fitted = self.try_fitted()?;
+    fn reconstruction_residual(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<Array2<f64>, String> {
+        let fitted = self.try_fitted_for_rho(rho)?;
         if fitted.dim() != target.dim() {
             return Err(format!(
                 "SaeManifoldTerm::reconstruction_residual: fitted {:?} != target {:?}",
@@ -10790,16 +11022,17 @@ impl SaeManifoldTerm {
     fn curvature_beta_gradient_eta_derivative(
         &self,
         target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
     ) -> Result<Array1<f64>, String> {
         let n = self.n_obs();
         let p = self.output_dim();
         let offsets = self.beta_offsets();
-        let residual = self.reconstruction_residual(target)?;
+        let residual = self.reconstruction_residual(target, rho)?;
         let dphi_deta = self.curvature_basis_eta_derivatives()?;
         // ∂fitted_i/∂η = Σ_{k'} a_ik' (dΦ_{k'}[i,:]) · B_{k'}.
         let mut dfitted = Array2::<f64>::zeros((n, p));
         for row in 0..n {
-            let a = self.assignment.try_assignments_row(row)?;
+            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -10821,7 +11054,7 @@ impl SaeManifoldTerm {
         // ∂g_β/∂η[k,μ,c] = Σ_i a_ik (dΦ_k[i,μ] r_i[c] + Φ^η_k[i,μ] dfitted_i[c]).
         let mut out = Array1::<f64>::zeros(self.beta_dim());
         for row in 0..n {
-            let a = self.assignment.try_assignments_row(row)?;
+            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -10855,7 +11088,11 @@ impl SaeManifoldTerm {
     /// keep-or-kill decision belongs to the evidence-gated structure search,
     /// not to an inner-loop heuristic. Observable events, never silent deaths,
     /// never fit errors.
-    fn enforce_active_mass_guard(&mut self, iteration: usize) -> Result<(), String> {
+    fn enforce_active_mass_guard(
+        &mut self,
+        iteration: usize,
+        rho: Option<&SaeManifoldRho>,
+    ) -> Result<(), String> {
         let n = self.n_obs();
         let k = self.k_atoms();
         if n == 0 || k == 0 {
@@ -10863,10 +11100,11 @@ impl SaeManifoldTerm {
         }
         let mut max_mass = vec![0.0_f64; k];
         for row in 0..n {
-            let a = self
-                .assignment
-                .try_assignments_row(row)
-                .map_err(|e| format!("SaeManifoldTerm::enforce_active_mass_guard: {e}"))?;
+            let a = match rho {
+                Some(rho) => self.assignment.try_assignments_row_for_rho(row, rho),
+                None => self.assignment.try_assignments_row(row),
+            }
+            .map_err(|e| format!("SaeManifoldTerm::enforce_active_mass_guard: {e}"))?;
             for atom in 0..k {
                 if a[atom] > max_mass[atom] {
                     max_mass[atom] = a[atom];
@@ -11466,7 +11704,7 @@ impl SaeManifoldTerm {
         // collapses again mid-fit goes Terminal, which is the structure
         // search's signal, not the inner loop's. Genuinely degenerate bases
         // (zero rows regardless of gates) still fail the audit — correctly.
-        self.enforce_active_mass_guard(0)?;
+        self.enforce_active_mass_guard(0, Some(rho))?;
         // ── Pre-fit decoder identifiability audit ──────────────────────────
         //
         // Each decoder atom `k` contributes `η_i += a_ik · Φ_k(t_ik) · B_k`,
@@ -11710,7 +11948,7 @@ impl SaeManifoldTerm {
             let accepted_snapshot = self.snapshot_mutable_state();
             let accepted_total =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
-            self.canonicalize_affine_gauge_after_accept()?;
+            self.canonicalize_affine_gauge_after_accept(Some(rho))?;
             let canonical_total =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
             if !(canonical_total.is_finite() && canonical_total <= accepted_total) {
@@ -11722,7 +11960,7 @@ impl SaeManifoldTerm {
             // CollapseEvent. Runs post-acceptance so it never perturbs a
             // line-search trial, and any re-seed is simply the next
             // iteration's starting state.
-            self.enforce_active_mass_guard(outer_iteration)?;
+            self.enforce_active_mass_guard(outer_iteration, Some(rho))?;
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step
             // (lifted through the OLD frames in `apply_newton_step`), re-polar each
@@ -11735,7 +11973,7 @@ impl SaeManifoldTerm {
             // accepted outer iteration is a sensible cadence (the issue's
             // streaming-polar fixed point).
             if self.frames_active() {
-                self.refresh_active_frames_from_data(target)
+                self.refresh_active_frames_from_data(target, rho)
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             }
         }
@@ -12707,13 +12945,13 @@ impl SaeManifoldOuterObjective {
         } else {
             (term, loss)
         };
-        if let (Ok(seed_fit), Ok(returned_fit)) =
-            (pristine_seed_term.try_fitted(), fitted.try_fitted())
-            && let (Some(seed_ev), Some(returned_ev)) = (
-                reconstruction_explained_variance(target.view(), seed_fit.view()),
-                reconstruction_explained_variance(target.view(), returned_fit.view()),
-            )
-            && seed_ev >= SAE_PRISTINE_SEED_EV_RETAIN_FLOOR
+        if let (Ok(seed_fit), Ok(returned_fit)) = (
+            pristine_seed_term.try_fitted_for_rho(&pristine_seed_rho),
+            fitted.try_fitted_for_rho(&fitted_rho),
+        ) && let (Some(seed_ev), Some(returned_ev)) = (
+            reconstruction_explained_variance(target.view(), seed_fit.view()),
+            reconstruction_explained_variance(target.view(), returned_fit.view()),
+        ) && seed_ev >= SAE_PRISTINE_SEED_EV_RETAIN_FLOOR
             && returned_ev < SAE_PRISTINE_SEED_EV_RETAIN_FLOOR
             && returned_ev + SAE_FINAL_EV_DEGRADATION_TOL < seed_ev
             && let Ok(seed_loss) = pristine_seed_term.loss(target.view(), &pristine_seed_rho)
@@ -12734,6 +12972,9 @@ impl SaeManifoldOuterObjective {
             fitted.canonicalize_charts_post_fit(target.view(), &fitted_rho, registry.as_ref())
         {
             log::debug!("into_fitted: chart canonicalization refused: {err}");
+        }
+        if fitted.assignment.persist_resolved_ibp_alpha(&fitted_rho) {
+            fitted_rho.log_lambda_sparse = 0.0;
         }
         (fitted, fitted_rho, fitted_loss)
     }
@@ -12782,9 +13023,13 @@ impl SaeManifoldOuterObjective {
             self.ridge_beta,
         )?;
         let solver = self.term.outer_gradient_arrow_solver(&cache)?;
-        let components = self
-            .term
-            .analytic_outer_rho_gradient_components(&rho_hat, &loss_hat, &cache, &solver)?;
+        let components = self.term.analytic_outer_rho_gradient_components(
+            self.target.view(),
+            &rho_hat,
+            &loss_hat,
+            &cache,
+            &solver,
+        )?;
         let grad = components.gradient_with_available_correction();
         let grad_norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
         let analytic_directional: f64 = grad.iter().zip(dir.iter()).map(|(g, d)| g * d).sum();
@@ -12984,7 +13229,7 @@ impl SaeManifoldOuterObjective {
             // the corrector simply opens from the previous η's converged β.
             if let Ok(dg_beta) = self
                 .term
-                .curvature_beta_gradient_eta_derivative(self.target.view())
+                .curvature_beta_gradient_eta_derivative(self.target.view(), &rho)
                 && dg_beta.len() == last_cache.k
             {
                 let w_t = Array1::<f64>::zeros(last_cache.delta_t_len());
@@ -13093,7 +13338,7 @@ impl SaeManifoldOuterObjective {
         }
         self.set_isometry_homotopy_weight(1.0, &isometry_targets);
         if arrived
-            && let Ok(before_fit) = self.term.try_fitted()
+            && let Ok(before_fit) = self.term.try_fitted_for_rho(&rho)
             && let Some(before_ev) =
                 reconstruction_explained_variance(self.target.view(), before_fit.view())
             && before_ev < 0.9
@@ -13101,17 +13346,19 @@ impl SaeManifoldOuterObjective {
             let snapshot = self.term.snapshot_mutable_state();
             let accepted_polish = self
                 .term
-                .refit_decoder_least_squares_at_current_state(self.target.view())
+                .refit_decoder_least_squares_at_current_state(self.target.view(), Some(&rho))
                 .and_then(|()| {
                     self.term
                         .seed_coords_by_decoder_projection(self.target.view(), 256)
                 })
                 .and_then(|()| {
-                    self.term
-                        .refit_decoder_least_squares_at_current_state(self.target.view())
+                    self.term.refit_decoder_least_squares_at_current_state(
+                        self.target.view(),
+                        Some(&rho),
+                    )
                 })
                 .and_then(|()| {
-                    let after_fit = self.term.try_fitted()?;
+                    let after_fit = self.term.try_fitted_for_rho(&rho)?;
                     let Some(after_ev) =
                         reconstruction_explained_variance(self.target.view(), after_fit.view())
                     else {
@@ -13182,9 +13429,13 @@ impl SaeManifoldOuterObjective {
         }
     }
 
-    fn add_fit_data_collapse_penalty(&mut self, cost: f64) -> Result<f64, String> {
-        let fitted = self.term.try_fitted()?;
-        let assignments = self.term.assignment.assignments();
+    fn add_fit_data_collapse_penalty(
+        &mut self,
+        cost: f64,
+        rho: &SaeManifoldRho,
+    ) -> Result<f64, String> {
+        let fitted = self.term.try_fitted_for_rho(rho)?;
+        let assignments = self.term.assignment.assignments_for_rho(rho)?;
         let collapsed = self.term.record_fit_data_collapse_if_needed(
             self.target.view(),
             fitted.view(),
@@ -13237,10 +13488,10 @@ impl SaeManifoldOuterObjective {
             self.ridge_beta,
             refine_progress_extension,
         )?;
+        let beta_hat = self.term.flatten_beta();
+        let cost = self.add_fit_data_collapse_penalty(cost, &rho)?;
         self.current_rho = rho;
         self.last_loss = Some(loss);
-        let beta_hat = self.term.flatten_beta();
-        let cost = self.add_fit_data_collapse_penalty(cost)?;
         Ok((cost, beta_hat))
     }
 
@@ -13344,7 +13595,7 @@ impl SaeManifoldOuterObjective {
         }
 
         let beta_hat = self.term.flatten_beta();
-        let cost = self.add_fit_data_collapse_penalty(cost)?;
+        let cost = self.add_fit_data_collapse_penalty(cost, &rho)?;
         Ok(EfsEval {
             cost,
             steps,
@@ -13431,15 +13682,21 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .map_err(EstimationError::RemlOptimizationFailed)?;
         let components = self
             .term
-            .analytic_outer_rho_gradient_components(&rho_state, &loss, &cache, &solver)
+            .analytic_outer_rho_gradient_components(
+                self.target.view(),
+                &rho_state,
+                &loss,
+                &cache,
+                &solver,
+            )
             .map_err(EstimationError::RemlOptimizationFailed)?;
         let gradient = components.gradient_with_available_correction();
-        self.current_rho = rho_state;
-        self.last_loss = Some(loss);
         let beta_hat = self.term.flatten_beta();
         let cost = self
-            .add_fit_data_collapse_penalty(cost)
+            .add_fit_data_collapse_penalty(cost, &rho_state)
             .map_err(EstimationError::RemlOptimizationFailed)?;
+        self.current_rho = rho_state;
+        self.last_loss = Some(loss);
         Ok(OuterEval {
             cost,
             gradient,
@@ -15547,7 +15804,7 @@ mod tests {
         };
 
         slam(&mut term);
-        term.enforce_active_mass_guard(0).expect("guard runs");
+        term.enforce_active_mass_guard(0, None).expect("guard runs");
         assert_eq!(term.collapse_events().len(), 1);
         let ev = term.collapse_events()[0];
         assert_eq!(ev.atom, 1);
@@ -15559,14 +15816,14 @@ mod tests {
         let masses = term.assignment.assignments();
         let max1 = (0..n).map(|r| masses[[r, 1]]).fold(0.0_f64, f64::max);
         assert!(max1 > SAE_ATOM_ACTIVE_MASS_FLOOR);
-        term.enforce_active_mass_guard(1).expect("guard runs");
+        term.enforce_active_mass_guard(1, None).expect("guard runs");
         assert_eq!(term.collapse_events().len(), 1);
 
         // Second collapse: budget exhausted ⇒ terminal, recorded exactly once
         // across repeated checks; the logits are left to the objective.
         slam(&mut term);
-        term.enforce_active_mass_guard(2).expect("guard runs");
-        term.enforce_active_mass_guard(3).expect("guard runs");
+        term.enforce_active_mass_guard(2, None).expect("guard runs");
+        term.enforce_active_mass_guard(3, None).expect("guard runs");
         let terminals: Vec<_> = term
             .collapse_events()
             .iter()
@@ -18290,7 +18547,7 @@ mod tests {
         let mut term = SaeManifoldTerm::new(vec![atom], assignment)?;
         let before = term.fitted();
 
-        term.canonicalize_affine_gauge_after_accept()?;
+        term.canonicalize_affine_gauge_after_accept(None)?;
 
         let after = term.fitted();
         let max_abs = before
@@ -20092,7 +20349,7 @@ mod tests {
         let old_smooth_penalty = term.atoms[0].smooth_penalty.clone();
         let old_decoder = term.atoms[0].decoder_coefficients.clone();
 
-        term.canonicalize_atom_affine_gauge(0).unwrap();
+        term.canonicalize_atom_affine_gauge(0, None).unwrap();
         let after = term.decoder_smoothness_quadratic_form();
         let invariant_gap = (after - before).abs() / before.abs().max(1.0);
         assert!(
@@ -21230,6 +21487,7 @@ mod tests {
                     .expect("assignments row");
                 let jets = term
                     .row_jets_for_logdet(
+                        &rho,
                         row,
                         vars.clone(),
                         assignments.view(),
