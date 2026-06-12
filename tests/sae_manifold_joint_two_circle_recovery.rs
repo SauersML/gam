@@ -672,14 +672,16 @@ fn build_objective(truth: &Truth, z: &Array2<f64>) -> SaeManifoldOuterObjective 
 }
 
 fn dimensionless_entry_rho(term: &SaeManifoldTerm, z: &Array2<f64>) -> SaeManifoldRho {
-    let _seed_dispersion = term
+    let seed_dispersion = term
         .seed_reconstruction_dispersion(z.view())
         .expect("seed reconstruction dispersion");
     let mut rho = SaeManifoldRho::new(
         SPARSITY.ln(),
         SMOOTHNESS.ln(),
         vec![Array1::<f64>::zeros(0); K],
-    );
+    )
+    .seed_scaled_by_dispersion(seed_dispersion)
+    .expect("dimensionless SAE entry rho");
     rho.log_lambda_sparse += 1.0;
     rho
 }
