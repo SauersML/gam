@@ -1,4 +1,4 @@
-use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
+use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::solver::gaussian_reml::gaussian_reml_multi_closed_form_with_cache;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
@@ -387,13 +387,11 @@ fn solve_active_coefficients(
         }
         system[[i, i]] += code_ridge;
     }
-    let factor = FaerArrayView::new(&system)
-        .as_ref()
+    let factor = system
         .cholesky(Side::Lower)
         .map_err(|err| format!("linear_dictionary_fit sparse-code solve failed: {err}"))?;
     let mut solution = rhs;
-    let mut solution_view = crate::faer_ndarray::array2_to_matmut(&mut solution);
-    factor.solve_in_place(solution_view.as_mut());
+    factor.solve_mat_in_place(&mut solution);
     Ok(solution.column(0).to_owned())
 }
 
