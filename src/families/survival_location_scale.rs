@@ -2693,6 +2693,8 @@ impl SurvivalLocationScaleFamily {
     /// `(h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry,
     ///   eta_t_deriv_exit, eta_ls_deriv_exit, etaw)`.
     ///
+    /// The time block eta is stored as `[exit; entry; derivative_exit]` to
+    /// match the stacked design, but callers consume `(entry, exit, deriv)`.
     /// For time-invariant blocks, `eta_t_entry == eta_t_exit` and likewise for ls.
     /// For time-varying threshold/log-sigma blocks, the block eta is 3n long:
     /// `[exit; entry; derivative_exit]`.
@@ -2814,8 +2816,8 @@ impl SurvivalLocationScaleFamily {
             .into());
         }
         Ok((
-            eta_time.slice(s![0..n]),
             eta_time.slice(s![n..2 * n]),
+            eta_time.slice(s![0..n]),
             eta_time.slice(s![2 * n..3 * n]),
             eta_t_exit,
             eta_ls_exit,
