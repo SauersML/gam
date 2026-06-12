@@ -11,7 +11,8 @@ use ndarray::{Array2, ArrayView1};
 
 use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy, DuchonBasisSpec,
+    BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy,
+    ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
     MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
@@ -1206,6 +1207,10 @@ pub(crate) fn canonicalize_smooth_type(raw: &str) -> &str {
         // matches gamfit's `"matern"` exactly (same kernel-Gram identity,
         // same REML route).
         "gp" => "matern",
+        // Constant-curvature (M_κ) geodesic-kernel smooth (#944). All aliases
+        // collapse to one canonical type so `bs="curv"`/`bs="mkappa"` cannot
+        // diverge from `curv(...)`.
+        "curv" | "constant_curvature" | "mkappa" => "curvature",
         other => other,
     }
 }
@@ -1972,6 +1977,65 @@ pub fn build_smooth_basis(
                     max_degree,
                     wahba_kernel,
                     identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+                },
+            })
+        }
+        "curvature" => {
+            // Constant-curvature (M_κ) geodesic-kernel smooth (#944): the
+            // κ-generic sibling of the intrinsic S² smooth above. The feature
+            // columns are κ-stereographic chart coordinates; `kappa=` is the
+            // fixed sectional curvature (default 0 = flat), and the geometry
+            // comes from `geometry::constant_curvature::ConstantCurvature`.
+            validate_known_options(
+                "curvature",
+                options,
+                &[
+                    "type",
+                    "bs",
+                    "by",
+                    "centers",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "knots",
+                    "kappa",
+                    "length_scale",
+                    "double_penalty",
+                    "id",
+                    "__by_col",
+                ],
+            )?;
+            let kappa = option_f64(options, "kappa").unwrap_or(0.0);
+            if !kappa.is_finite() {
+                return Err("curvature smooth requires a finite kappa".to_string());
+            }
+            let length_scale = option_f64(options, "length_scale").unwrap_or(0.0);
+            if !length_scale.is_finite() || length_scale < 0.0 {
+                return Err(format!(
+                    "curvature smooth length_scale must be positive (or omitted for auto); got {length_scale}"
+                ));
+            }
+            let centers = parse_countwith_basis_alias(
+                options,
+                "centers",
+                default_num_centers(ds.values.nrows(), cols.len()),
+            )?;
+            if centers < 2 {
+                return Err("curvature smooth requires at least 2 centers".to_string());
+            }
+            Ok(SmoothBasisSpec::ConstantCurvature {
+                feature_cols: cols.to_vec(),
+                spec: ConstantCurvatureBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint {
+                        num_centers: centers,
+                    },
+                    kappa,
+                    // 0.0 sentinel = κ-independent auto initialization in the
+                    // basis builder (median chart center spacing, doubled).
+                    length_scale,
+                    double_penalty: smooth_double_penalty,
+                    identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
                 },
             })
         }

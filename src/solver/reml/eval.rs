@@ -541,24 +541,56 @@ impl<'a> RemlState<'a> {
     /// (`criterion(ρ̂) == reml_score`), so no fingerprint reconciliation is
     /// needed — there is exactly one objective.
     ///
-    /// Returns `None` when there are no smoothing parameters (`K == 0`), the
-    /// outer Hessian at `final_rho` is unavailable, or the criterion is
-    /// infeasible at `ρ̂` — the diagnostic is simply absent, never an error.
-    pub(crate) fn tier0_rho_certificate(
+    /// Returns `(None, None)` when there are no smoothing parameters
+    /// (`K == 0`), the outer Hessian at `final_rho` is unavailable, or the
+    /// criterion is infeasible at `ρ̂` — the diagnostic is simply absent, never
+    /// an error.
+    ///
+    /// When the certificate reads [`Escalate`], the escalation tiers (#938) run
+    /// HERE, against the same live objective — Tier 1 quadrature for `K ≤ 4`,
+    /// Tier 2 NUTS with the exact LAML `ρ`-gradient ([`Self::compute_gradient`])
+    /// for `K ≤ 16`, honest `Unavailable` beyond. Post-hoc escalation after the
+    /// `RemlState` is gone would need an owned rebuild recipe; running at the
+    /// live seam avoids that entirely.
+    ///
+    /// [`Escalate`]: crate::inference::rho_posterior::RhoCertificate::Escalate
+    pub(crate) fn rho_posterior_inference(
         &self,
         final_rho: &Array1<f64>,
         n_samples: Option<usize>,
-    ) -> Option<crate::inference::rho_posterior::RhoPosteriorCertificate> {
+    ) -> (
+        Option<crate::inference::rho_posterior::RhoPosteriorCertificate>,
+        Option<crate::inference::rho_posterior::RhoPosteriorEscalation>,
+    ) {
+        use crate::inference::rho_posterior::{
+            RhoCertificate, escalate_rho_posterior, rho_posterior_certificate,
+        };
         if final_rho.is_empty() {
-            return None;
+            return (None, None);
         }
-        let outer_hessian = self.compute_lamlhessian_consistent(final_rho).ok()?;
-        crate::inference::rho_posterior::rho_posterior_certificate(
+        let Ok(outer_hessian) = self.compute_lamlhessian_consistent(final_rho) else {
+            return (None, None);
+        };
+        let certificate = rho_posterior_certificate(
             final_rho,
             &outer_hessian,
             |rho| self.compute_cost(rho).ok(),
             n_samples,
-        )
+        );
+        let escalation = match certificate.as_ref().map(|c| c.certificate) {
+            Some(RhoCertificate::Escalate) => Some(escalate_rho_posterior(
+                final_rho,
+                &outer_hessian,
+                |rho| self.compute_cost(rho).ok(),
+                |rho| {
+                    let cost = self.compute_cost(rho).ok()?;
+                    let gradient = self.compute_gradient(rho).ok()?;
+                    Some((cost, gradient))
+                },
+            )),
+            _ => None,
+        };
+        (certificate, escalation)
     }
 
     pub(crate) fn compute_smoothing_correction_auto(

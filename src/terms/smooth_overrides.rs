@@ -33,9 +33,9 @@ use std::path::PathBuf;
 
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::terms::basis::{
-    BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
-    MaternBasisSpec, MaternNu, OneDimensionalBoundary, SphereMethod, SphericalSplineBasisSpec,
-    ThinPlateBasisSpec,
+    BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, ConstantCurvatureBasisSpec,
+    DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, MaternNu, OneDimensionalBoundary,
+    SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
 };
 use crate::terms::smooth::{
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec, TermCollectionSpec, parse_shape_constraint,
@@ -458,6 +458,51 @@ fn apply_sphere(
                 ));
             }
         }
+    }
+    if let Some(double_penalty) = descriptor
+        .get("double_penalty")
+        .and_then(JsonValue::as_bool)
+    {
+        spec.double_penalty = double_penalty;
+    }
+    Ok(())
+}
+
+fn apply_constant_curvature(
+    spec: &mut ConstantCurvatureBasisSpec,
+    descriptor: &serde_json::Map<String, JsonValue>,
+    symbol: &str,
+) -> Result<(), String> {
+    if let Some(centers_val) = descriptor.get("centers") {
+        let centers = parse_2d_array(centers_val, "centers", symbol)?;
+        if centers.nrows() < 2 {
+            return Err(format!(
+                "smooths[{symbol:?}].centers must contain at least 2 rows for ConstantCurvature"
+            ));
+        }
+        spec.center_strategy = CenterStrategy::UserProvided(centers);
+    } else if let Some(n) = descriptor.get("n_centers").and_then(JsonValue::as_u64) {
+        let n = n as usize;
+        if n < 2 {
+            return Err(format!(
+                "smooths[{symbol:?}].n_centers must be at least 2 for ConstantCurvature"
+            ));
+        }
+        spec.center_strategy = CenterStrategy::FarthestPoint { num_centers: n };
+    }
+    if let Some(kappa) = descriptor.get("kappa").and_then(JsonValue::as_f64) {
+        if !kappa.is_finite() {
+            return Err(format!("smooths[{symbol:?}].kappa must be finite"));
+        }
+        spec.kappa = kappa;
+    }
+    if let Some(ls) = descriptor.get("length_scale").and_then(JsonValue::as_f64) {
+        if !(ls.is_finite() && ls > 0.0) {
+            return Err(format!(
+                "smooths[{symbol:?}].length_scale must be a positive finite number"
+            ));
+        }
+        spec.length_scale = ls;
     }
     if let Some(double_penalty) = descriptor
         .get("double_penalty")
