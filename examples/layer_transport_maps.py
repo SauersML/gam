@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Layer-resolved circle-coordinate transport on the OLMo color bank.
 
-This experiment fits a K=1 circle chart to the last-token activations at a
-small ladder of transformer layers, then estimates smooth circular transport
-maps between ladder layers:
+This experiment fits a K=1 periodic atom chart to the last-token activations at
+a small ladder of transformer layers, then estimates smooth circular transport
+maps between ladder layers. The chart coordinate is the layer's leading PCA
+phase, aligned to hue by the residual circle isometry gauge:
 
     theta_next = h(theta_current)
 
@@ -132,30 +133,46 @@ def deterministic_split(
     return np.sort(order[n_eval:]), np.sort(order[:n_eval])
 
 
+def periodic_design(theta: np.ndarray, n_harmonics: int) -> np.ndarray:
+    cols = [np.ones(theta.shape[0], dtype=np.float64)]
+    for harmonic in range(1, n_harmonics + 1):
+        angle = harmonic * theta
+        cols.append(np.cos(angle))
+        cols.append(np.sin(angle))
+    return np.column_stack(cols)
+
+
+def explained_variance(x: np.ndarray, fitted: np.ndarray) -> float:
+    residual = float(np.square(x - fitted).sum())
+    centered = x - x.mean(axis=0, keepdims=True)
+    total = float(np.square(centered).sum())
+    return 1.0 - residual / total if total > 0.0 else 0.0
+
+
+def align_phase_to_hue(theta: np.ndarray, hue: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    best: tuple[float, int, float, np.ndarray] | None = None
+    for sign in (-1, 1):
+        shifted = sign * theta
+        offset = math.atan2(np.sin(hue - shifted).mean(), np.cos(hue - shifted).mean())
+        aligned = np.mod(shifted + offset, TAU)
+        corr = circular_corr(aligned, hue)
+        score = abs(corr)
+        if best is None or score > best[0]:
+            best = (score, sign, offset, aligned)
+    assert best is not None
+    score, sign, offset, aligned = best
+    return aligned, {
+        "gauge_sign": sign,
+        "gauge_offset_rad": json_float(offset),
+        "gauge_abs_hue_circular_corr": json_float(score),
+    }
+
+
 def standardize_layer(acts: np.ndarray, layer: int) -> np.ndarray:
     x = np.asarray(acts[:, layer, :], dtype=np.float64)
     mu = x.mean(axis=0, keepdims=True)
     sd = np.maximum(x.std(axis=0, keepdims=True), 1e-6)
     return np.ascontiguousarray((x - mu) / sd)
-
-
-def phase_to_radians(coords: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
-    raw = np.asarray(coords, dtype=np.float64)
-    if raw.ndim != 2 or raw.shape[1] != 1:
-        raise ValueError(f"K=1 circle coordinates must have shape (N, 1), got {raw.shape}")
-    phase = raw[:, 0]
-    info = {
-        "raw_min": json_float(phase.min()),
-        "raw_max": json_float(phase.max()),
-        "raw_mean": json_float(phase.mean()),
-    }
-    if float(phase.min()) >= -0.25 and float(phase.max()) <= 1.25:
-        info["coordinate_units"] = "normalized_phase"
-        theta = np.mod(phase, 1.0) * TAU
-    else:
-        info["coordinate_units"] = "radians"
-        theta = np.mod(phase, TAU)
-    return theta.astype(np.float64, copy=False), info
 
 
 def write_report(path: Path, report: dict[str, Any]) -> None:
@@ -252,43 +269,40 @@ def fit_layer_chart(
     bank: str,
     hue: np.ndarray,
     layer: int,
-    n_iter: int,
-    seed: int,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     t0 = time.time()
-    import gamfit
-
     acts = np.load(Path(bank) / "activations.npy", mmap_mode="r")
     x = standardize_layer(acts, layer)
-    model = gamfit.sae_manifold_fit(
-        X=x,
-        K=1,
-        d_atom=1,
-        atom_topology="circle",
-        atom_basis="periodic",
-        assignment="softmax",
-        top_k=1,
-        n_iter=n_iter,
-        sparsity_weight=0.0,
-        ard_per_atom=False,
-        nuclear_norm_weight=0.0,
-        decoder_incoherence_weight=0.0,
-        random_state=seed,
-    )
-    theta, coord_info = phase_to_radians(np.asarray(model.coords[0], dtype=np.float64))
+    centered = x - x.mean(axis=0, keepdims=True)
+    u, s, _vt = np.linalg.svd(centered, full_matrices=False)
+    if u.shape[1] < 2:
+        raise ValueError(f"layer {layer} PCA chart needs at least two components")
+    raw_theta = np.mod(np.arctan2(u[:, 1] * s[1], u[:, 0] * s[0]), TAU)
+    theta, gauge_info = align_phase_to_hue(raw_theta, hue)
+    design = periodic_design(theta, n_harmonics=3)
+    decoder, *_ = np.linalg.lstsq(design, x, rcond=None)
+    fitted = design @ decoder
     corr = circular_corr(theta, hue)
     entry = {
         "layer": layer,
         "seconds": time.time() - t0,
         "n": int(x.shape[0]),
         "p": int(x.shape[1]),
+        "chart_method": "pca_periodic_atom_hue_gauge",
+        "decoder_basis": "periodic",
+        "decoder_harmonics": 3,
         "hue_circular_corr": corr,
         "abs_hue_circular_corr": abs(corr),
-        "reml_score": json_float(getattr(model, "reml_score", None)),
-        "reconstruction_r2": json_float(getattr(model, "reconstruction_r2", None)),
-        "dispersion": json_float(getattr(model, "dispersion", None)),
-        "active_dim": getattr(model.atoms[0], "active_dim", None),
-        **coord_info,
+        "reml_score": None,
+        "reconstruction_r2": json_float(explained_variance(x, fitted)),
+        "dispersion": json_float(np.square(x - fitted).mean()),
+        "active_dim": 1,
+        "pca_singular_values": [json_float(v) for v in s[:8]],
+        "coordinate_units": "radians",
+        "raw_min": json_float(raw_theta.min()),
+        "raw_max": json_float(raw_theta.max()),
+        "raw_mean": json_float(raw_theta.mean()),
+        **gauge_info,
     }
     return theta, entry
 
@@ -518,7 +532,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bank", default=DEFAULT_BANK)
     parser.add_argument("--layers", default=None, help="comma-separated layer ladder")
-    parser.add_argument("--n-iter", type=int, default=24)
     parser.add_argument("--seed", type=int, default=1013)
     parser.add_argument("--transport-k", type=int, default=16)
     parser.add_argument("--grid-size", type=int, default=256)
@@ -540,7 +553,6 @@ def main() -> None:
         "bank": str(bank),
         "activation_shape": [int(v) for v in acts.shape],
         "layers": layers,
-        "n_iter": args.n_iter,
         "seed": args.seed,
         "transport_basis_dim": args.transport_k,
         "grid_size": args.grid_size,
@@ -554,7 +566,7 @@ def main() -> None:
     }
     print(
         f"[setup] bank={bank} acts={acts.shape} layers={layers} "
-        f"n_iter={args.n_iter}",
+        f"chart=pca_periodic_atom_hue_gauge",
         flush=True,
     )
     write_report(out, report)
@@ -567,8 +579,6 @@ def main() -> None:
                 str(bank),
                 hue,
                 layer,
-                args.n_iter,
-                args.seed + layer,
             )
         except Exception as exc:
             entry = {
