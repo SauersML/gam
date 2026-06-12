@@ -248,7 +248,9 @@ pub fn accumulate_moment_table(
     let n = coords.nrows();
     let d = coords.ncols();
     if d == 0 {
-        crate::bail_invalid_basis!("measure-jet moment accumulation needs at least one coordinate axis");
+        crate::bail_invalid_basis!(
+            "measure-jet moment accumulation needs at least one coordinate axis"
+        );
     }
     if center.len() != d {
         crate::bail_dim_basis!(
@@ -361,8 +363,7 @@ pub fn recenter_moment_table(
         let mut out = Array2::<f64>::zeros((d, d));
         for k in 0..d {
             for l in 0..d {
-                out[(k, l)] = ((src[(k, l)] + delta[k] * t.m1[(ch, l)])
-                    + t.m1[(ch, k)] * delta[l])
+                out[(k, l)] = ((src[(k, l)] + delta[k] * t.m1[(ch, l)]) + t.m1[(ch, k)] * delta[l])
                     + (delta[k] * delta[l]) * t.m0[ch];
             }
         }
@@ -472,7 +473,9 @@ pub fn jet_sufficient_stats(
 ) -> Result<MeasureJetJetStats, BasisError> {
     let (n_channels, d) = validate_table_shape(t, "t")?;
     if !(eps.is_finite() && eps > 0.0) {
-        crate::bail_invalid_basis!("measure-jet jet stats need a finite positive scale eps; got {eps}");
+        crate::bail_invalid_basis!(
+            "measure-jet jet stats need a finite positive scale eps; got {eps}"
+        );
     }
     if channel >= n_channels {
         crate::bail_invalid_basis!(
@@ -873,11 +876,9 @@ mod tests {
         // even needed; pin that and the bitwise agreement.
         assert_tables_bit_identical(&merged, &single);
         // Merging the identity is a no-op.
-        let with_zero = merge_moment_tables(
-            &merged,
-            &MeasureJetMomentTable::zero(centers[0].clone(), 2),
-        )
-        .expect("merge with identity");
+        let with_zero =
+            merge_moment_tables(&merged, &MeasureJetMomentTable::zero(centers[0].clone(), 2))
+                .expect("merge with identity");
         assert_tables_bit_identical(&with_zero, &merged);
     }
 }

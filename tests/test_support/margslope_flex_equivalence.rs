@@ -32,7 +32,6 @@ use std::time::{Duration, Instant};
 
 pub const LARGE_SCALE_SHAPE_SEED: u64 = 0xB10B_AA1C_F13E_2026;
 pub const LARGE_SCALE_SHAPE_PC_DIM: usize = 16;
-pub const DEFAULT_REPRO_N: usize = 50_000;
 
 #[derive(Clone)]
 pub struct LargeScaleShapeProblem {
