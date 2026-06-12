@@ -2281,6 +2281,49 @@ fn residual_gauge_inner(
     // the union.
     verdicts.extend(exact_verdicts);
 
+    // #1019 — post-fit arc-length chart canonicalization records: for every
+    // canonicalized d = 1 atom the continuous chart (reparameterization)
+    // freedom is pinned BY CONSTRUCTION (the unit-speed representative of the
+    // Diff(M) orbit was selected post-fit, image-frozen), so the certificate
+    // records it pinned with the PinnedByCanonicalization provenance —
+    // distinct from curvature/penalty pinning, since no objective resistance
+    // was measured — and names the surviving FINITE isometry group of the
+    // reference manifold. The group's continuous part (the circle's U(1)
+    // shift) is still enumerated and curvature-tested above; this record is
+    // the chart-freedom downgrade itself.
+    let mut canonicalized_charts = 0usize;
+    for atom in &model.atoms {
+        if !atom.chart_canonicalized {
+            continue;
+        }
+        let residual_group = match &atom.topology {
+            AtomTopology::Circle | AtomTopology::Torus { latent_dim: 1 } => {
+                "O(2) on S¹ (rotation + reflection)"
+            }
+            AtomTopology::EuclideanPatch { latent_dim: 1 } => {
+                "reflection + translation of the unit interval"
+            }
+            // Canonicalization is only ever applied to d = 1 charts; a flag
+            // on any other topology is structurally inconsistent and must not
+            // fabricate a record.
+            _ => continue,
+        };
+        canonicalized_charts += 1;
+        verdicts.push(GeneratorVerdict {
+            family: GeneratorFamily::ChartReparameterization,
+            description: format!(
+                "{}: chart pinned to arc length by post-fit canonicalization; \
+                 residual chart freedom = {residual_group}",
+                atom.name
+            ),
+            unpinned: false,
+            generator_norm: 0.0,
+            pinned_energy_fraction: 1.0,
+            lowering_error_scale: 0.0,
+            provenance: VerdictProvenance::PinnedByCanonicalization,
+        });
+    }
+
     let residual_gauge_dim = verdicts.iter().filter(|v| v.unpinned).count();
 
     // Sym(F)-triviality under any output-Fisher provenance — same-position
@@ -2317,6 +2360,14 @@ fn residual_gauge_inner(
             ""
         },
     );
+    let summary = if canonicalized_charts > 0 {
+        format!(
+            "{summary}; {canonicalized_charts} chart(s) pinned to arc length by post-fit \
+             canonicalization (residual chart freedom = finite isometry group)"
+        )
+    } else {
+        summary
+    };
 
     Ok(ResidualGaugeReport {
         metric_provenance,

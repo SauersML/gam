@@ -38,6 +38,7 @@ fn identity_patch_atom() -> FittedAtom {
         // purely by the data + isometry penalty, which is what we want to test.
         ard_variances: None,
         lowering_error: 0.0,
+        chart_canonicalized: false,
     }
 }
 
@@ -245,6 +246,7 @@ fn equal_ard_axes_name_the_rotation_subgroup_of_exactly_the_right_dimension() {
             frame: Array2::<f64>::eye(3),
             ard_variances: Some(ard),
             lowering_error: 0.0,
+            chart_canonicalized: false,
         }],
         jacobian_rows: Vec::new(),
         isometry_penalty_root: Array2::<f64>::zeros((0, 9)),
