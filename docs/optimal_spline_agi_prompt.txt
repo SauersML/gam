@@ -36,51 +36,54 @@ below is itself a habit in disguise, demote it and say why.
 
 NEEDS:
 
-  N1. SMOOTHING, NOT INTERPOLATION. The data is noisy; shrinkage is
-      essential. But the family must be rich enough to reach
-      interpolation in its unpenalized limit — richness with a
-      governor, not a small model.
+  N1. RESIST NOISE, DON'T CHASE POINTS. The data is noisy; the fit
+      must not interpolate individual observations. But the family
+      must be rich enough to reach interpolation in its unpenalized
+      limit — richness with a governor, not a small model.
 
-  N2. A CONTINUOUS COMPLEXITY DIAL. One (or few) parameters moving
-      the fit continuously from maximally simple to maximally
-      flexible, differentiable along the way, with a well-defined
-      effective degrees of freedom, selectable by marginal
-      likelihood. This dial is the most load-bearing property in
-      practice: the surrounding model optimizes over it, so the fit
-      must be smooth and differentiable as a function of the dial,
-      not just of the data.
+  N2. BRIDGE GAPS, DON'T SAG. Where data thins out between regions
+      that have data, the fit must follow continuity from the flanks
+      — pass smoothly between its neighbors — not revert toward a
+      global mean. (If A and C are high and sparse B lies between
+      them, the estimate at B is high, even when most of the data
+      lives elsewhere at low values.) Mean reversion in gaps is a
+      bias imposed by stationarity assumptions, not something the
+      data asked for. The same applies to trends: genuine
+      large-scale structure must not be shrunk away. N1 and N2
+      together: shrink against noise pointwise, never toward the
+      mean across gaps.
 
-  N3. EQUIVARIANCE TO THE MEANINGLESS. Changing the units of a
-      covariate, or applying any per-axis affine map, must not
-      change predictions (or must map them predictably). Full
-      rotation invariance is appropriate only when the covariates
-      are genuinely geometric; treat it as an option the user
-      declares, not a foundation. (Radial bases were a means to
-      rotation invariance plus scattered-data convenience — a means,
-      never the need.)
+  N3. AS SMOOTH AS THE DATA ALLOWS. The prior favors smoothness; the
+      data chooses the level, through a continuous dial that is
+      differentiable (the surrounding model optimizes over it by
+      marginal likelihood) with a well-defined effective degrees of
+      freedom. This dial is the most load-bearing property in
+      practice. Spatially varying smoothness is optional — worth
+      having only if it costs nearly nothing.
 
-  N4. DECLARED UNPENALIZED STRUCTURE. Low-order trends (constants,
-      linear drift, the user's choice) must be estimable without
-      shrinkage bias when the user so declares. Hidden bias against
-      large-scale structure is a known failure of some classical
-      choices; do not reproduce it.
+  N4. LEARNED GEOMETRY. Invariance to meaningless transformations
+      (units, per-axis affine maps) is the floor. Beyond it, the
+      metric in which "near" and "smooth" are measured must itself
+      be learnable — per-axis scales at minimum. Isotropy in the
+      learned metric is a sensible default symmetry, not dogma.
 
-  N5. HONEST UNCERTAINTY. Full uncertainty for any linear functional
-      of the fit (values, derivatives, integrals, contrasts), valid
-      under the declared assumptions, cheap enough to use routinely.
-      Off the data's support: uncertainty must grow and predictions
-      must revert to the declared unpenalized structure — never
-      silently explode, never silently stay confident.
+  N5. UQ-COMPATIBLE. The construction must not obstruct honest
+      uncertainty: valid uncertainty for any linear functional of
+      the fit (values, derivatives, integrals, contrasts) must be
+      obtainable downstream at reasonable cost, accounting for any
+      data-dependent choices the method makes along the way
+      (discrete selection silently poisons naive intervals). Where
+      data is absent, uncertainty grows — never silently confident
+      off-support.
 
-  N6. COMPOSABILITY. The term must live inside penalized likelihoods
+  N6. COMPOSABLE. The term must live inside penalized likelihoods
       with other terms; admit non-Gaussian likelihoods; respect
       identifiability constraints; expose derivatives with respect
-      to inputs, coefficients, and hyperparameters. Note: linearity
-      in coefficients is what currently buys all of this at once
-      (exact Gaussian inference, closed-form uncertainty, tractable
-      hyperparameter derivatives). You may abandon it — but then you
-      must replace everything it silently purchases, and say so
-      explicitly.
+      to inputs, coefficients, and hyperparameters. (For
+      calibration: linearity in coefficients is what currently buys
+      exact Gaussian inference, closed-form uncertainty, and
+      tractable hyperparameter derivatives at once. Abandon it
+      knowingly, replacing what it buys.)
 
   N7. KNOWN ERROR. Every output must come with known accuracy:
       either an a-priori theorem covering all inputs the method
@@ -92,12 +95,6 @@ NEEDS:
       that no a-priori bound sees. Methods that are honest about
       this tend to need the certificate. Methods exact by
       construction need nothing.)
-
-  N8. ADAPTIVITY (the unmet need). Smoothness that can vary over the
-      input space, without losing N2, N5, or selection by marginal
-      likelihood. Classical splines fail this with one global dial.
-      If your construction makes adaptivity native rather than
-      bolted on, that alone may justify it.
 
 HABITS (inherited, discardable without argument):
 
@@ -160,7 +157,7 @@ The habits list above is explicitly discardable. Beyond that: you may
 redefine the estimand, the noise model, the notion of smoothness, the
 notion of evaluation, or the boundary between "model" and "algorithm"
 — provided you state what you changed and show the replacement still
-serves needs N1–N8. If the best object is adaptive, randomized,
+serves needs N1–N7. If the best object is adaptive, randomized,
 implicit, defined only through an algorithm, or stranger than that:
 fine. The needs are the only contract.
 
