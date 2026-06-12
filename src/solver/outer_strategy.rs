@@ -6763,11 +6763,12 @@ fn run_outer_with_plan(
         // per accepted seed entry right after `reset`, so cross-seed state
         // hygiene is unchanged (#1003): `reset` restores the pristine `η = 1`
         // baseline before each walk.
-        match obj.curvature_homotopy_entry(seed) {
+        let curvature_entry_refused = match obj.curvature_homotopy_entry(seed) {
             Some(Ok(arrived)) => {
                 log::info!(
                     "[OUTER] {context}: curvature-homotopy entry seed {seed_idx} arrived={arrived}"
                 );
+                !arrived
             }
             Some(Err(err)) => {
                 // A hard anchor-construction failure is not a feasibility gate:
@@ -6777,8 +6778,17 @@ fn run_outer_with_plan(
                      deferring to seed cascade"
                 );
                 obj.reset();
+                false
             }
-            None => {}
+            None => false,
+        };
+        if curvature_entry_refused && continuation_path.is_none() {
+            let msg =
+                "curvature-homotopy entry refused seed; deferring to remaining seed cascade"
+                    .to_string();
+            log::warn!("[OUTER] {context}: rejecting seed {seed_idx} (curvature): {msg}");
+            rejection_reasons.push((seed_idx, "validation", msg));
+            continue 'seed_attempts;
         }
         if let Some(seed_cost) = obj.accept_seed_without_outer_iterations(seed)? {
             started_seeds += 1;
