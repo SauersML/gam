@@ -25,6 +25,7 @@ pub(crate) mod riemannian_retraction;
 pub mod row_measure;
 pub mod seeding;
 pub mod sensitivity;
+pub mod spline_scan;
 pub(crate) mod startup_stats;
 pub mod streaming_border;
 pub mod structure_harvest;
