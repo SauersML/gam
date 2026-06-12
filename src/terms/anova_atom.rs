@@ -860,6 +860,9 @@ fn binding_wald_test(
         nullspace_dim: 0,
         residual_df,
         scale,
+        // #939: the gauge-projected interaction block has no per-row family
+        // cumulant substrate at this call site; first-order reporting only.
+        known_scale_lr_mean_shift: None,
     })
 }
 
@@ -922,6 +925,8 @@ fn joint_binding_wald_test(
         nullspace_dim: 0,
         residual_df,
         scale,
+        // #939: no per-row family cumulant substrate at this call site.
+        known_scale_lr_mean_shift: None,
     })
 }
 
