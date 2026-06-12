@@ -3756,11 +3756,12 @@ impl SaeManifoldTerm {
     /// `add_sae_analytic_penalty_contributions` is total (no runtime
     /// "unsupported penalty" fallthrough, no per-call K-gating):
     ///
-    /// 1. Every Psi-tier penalty is either a logit-target penalty
-    ///    (`IBPAssignment`, `SoftmaxAssignmentSparsity`) or in
-    ///    [`sae_penalty_is_row_block_supported`], or `NuclearNorm` (which is
-    ///    redirected to the per-atom decoder (β) block rather than the coord
-    ///    "t" row block). Penalty kinds with cross-row structure
+    /// 1. Every Psi-tier penalty is either in [`sae_penalty_is_row_block_supported`],
+    ///    or `NuclearNorm` (which is redirected to the per-atom decoder (β) block
+    ///    rather than the coord "t" row block). Assignment sparsity penalties
+    ///    (`IBPAssignment`, `SoftmaxAssignmentSparsity`) are refused because the SAE
+    ///    term already owns them through its built-in assignment path
+    ///    (`loss.assignment_sparsity`). Penalty kinds with cross-row structure
     ///    (`TotalVariation`, `Monotonicity`, `BlockSparsity`,
     ///    `IvaeRidgeMeanGauge`, `Orthogonality`, `NestedPrefix`,
     ///    `SheafConsistency`) cannot be expressed in the SAE row-block layout
@@ -3785,13 +3786,17 @@ impl SaeManifoldTerm {
             if penalty.tier() != PenaltyTier::Psi {
                 continue;
             }
-            let is_logit = matches!(
+            if matches!(
                 penalty,
                 AnalyticPenaltyKind::IBPAssignment(_)
                     | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
-            );
-            if is_logit {
-                continue;
+            ) {
+                return Err(format!(
+                    "SAE-manifold term refuses analytic penalty {:?}: assignment sparsity \
+                     is owned by the built-in SAE assignment path (loss.assignment_sparsity). \
+                     Registering it would double-count the objective and gradient",
+                    penalty.name()
+                ));
             }
             // NuclearNorm is redirected to the per-atom decoder (β) block in
             // `add_sae_beta_penalty` (it penalizes each atom's decoder matrix
@@ -4534,7 +4539,6 @@ impl SaeManifoldTerm {
         }
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
         let layout = registry.rho_layout();
-        let logits_flat = flat_logits(self.assignment.logits.view());
         let beta = self.flatten_beta();
         let mut value = 0.0_f64;
         for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(layout.iter()) {
@@ -4553,13 +4557,7 @@ impl SaeManifoldTerm {
             }
             match tier {
                 PenaltyTier::Psi => {
-                    if matches!(
-                        penalty,
-                        AnalyticPenaltyKind::IBPAssignment(_)
-                            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
-                    ) {
-                        value += penalty.value(logits_flat.view(), rho_local);
-                    } else if let AnalyticPenaltyKind::NuclearNorm(base) = penalty {
+                    if let AnalyticPenaltyKind::NuclearNorm(base) = penalty {
                         for (per_atom, start, end) in self.live_nuclear_norm_penalties(base) {
                             value += penalty_scale
                                 * per_atom.value(beta.slice(s![start..end]), rho_local);
@@ -8726,7 +8724,6 @@ impl SaeManifoldTerm {
     ) -> Result<SaeBetaPenaltyAssembly, ArrowSchurError> {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
         let layout = registry.rho_layout();
-        let logits_flat = flat_logits(self.assignment.logits.view());
         let beta = self.flatten_beta();
         let mut beta_assembly = SaeBetaPenaltyAssembly::default();
         for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(layout.iter()) {
@@ -8752,19 +8749,7 @@ impl SaeManifoldTerm {
             }
             match tier {
                 PenaltyTier::Psi => {
-                    if matches!(
-                        penalty,
-                        AnalyticPenaltyKind::IBPAssignment(_)
-                            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
-                    ) {
-                        self.add_sae_logit_penalty(
-                            sys,
-                            penalty,
-                            logits_flat.view(),
-                            rho_local,
-                            row_layout,
-                        );
-                    } else if matches!(penalty, AnalyticPenaltyKind::NuclearNorm(_)) {
+                    if matches!(penalty, AnalyticPenaltyKind::NuclearNorm(_)) {
                         // NuclearNorm is a Psi-tier penalty but it targets each
                         // atom's decoder (β) matrix singular spectrum, not the
                         // coord "t" row block. Route it to the β tier so it
@@ -14069,8 +14054,6 @@ fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {
             | AnalyticPenaltyKind::TopKActivation(_)
             | AnalyticPenaltyKind::JumpReLU(_)
             | AnalyticPenaltyKind::Sparsity(_)
-            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
-            | AnalyticPenaltyKind::IBPAssignment(_)
             | AnalyticPenaltyKind::RowPrecisionPrior(_)
             | AnalyticPenaltyKind::ParametricRowPrecisionPrior(_)
             | AnalyticPenaltyKind::ScadMcp(_)
@@ -14155,8 +14138,6 @@ pub fn sae_row_block_penalty_kinds() -> &'static [&'static str] {
         "top_k_activation",
         "jumprelu",
         "sparsity",
-        "softmax_assignment_sparsity",
-        "ibp_assignment",
         "row_precision_prior",
         "parametric_row_precision_prior",
         "scad_mcp",
@@ -18642,6 +18623,55 @@ mod tests {
     }
 
     #[test]
+    fn sae_registry_refuses_assignment_sparsity_penalties() {
+        let n = 3usize;
+        let k = 2usize;
+        let logits = Array2::<f64>::zeros((n, k));
+        let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+        let manifolds = vec![LatentManifold::Circle { period: 1.0 }; k];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coords,
+            manifolds,
+            AssignmentMode::softmax(0.7),
+        )
+        .expect("valid assignment");
+        let atoms: Vec<SaeManifoldAtom> = (0..k)
+            .map(|atom_idx| {
+                SaeManifoldAtom::new(
+                    format!("periodic_{atom_idx}"),
+                    SaeAtomBasisKind::Periodic,
+                    1,
+                    Array2::<f64>::ones((n, 1)),
+                    Array3::<f64>::zeros((n, 1, 1)),
+                    Array2::<f64>::zeros((1, 1)),
+                    Array2::<f64>::eye(1),
+                )
+                .expect("valid atom")
+            })
+            .collect();
+        let term = SaeManifoldTerm::new(atoms, assignment).expect("valid SAE term");
+
+        let mut softmax_registry = AnalyticPenaltyRegistry::new();
+        softmax_registry.push(AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(
+            crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(k, 0.7),
+        )));
+        let softmax_err = term
+            .validate_analytic_penalty_registry(&softmax_registry)
+            .expect_err("SAE registry must reject softmax assignment sparsity");
+        assert!(softmax_err.contains("assignment sparsity"));
+
+        let mut ibp_registry = AnalyticPenaltyRegistry::new();
+        ibp_registry.push(AnalyticPenaltyKind::IBPAssignment(Arc::new(
+            crate::terms::analytic_penalties::IBPAssignmentPenalty::new(k, 1.2, 0.7, false),
+        )));
+        let ibp_err = term
+            .validate_analytic_penalty_registry(&ibp_registry)
+            .expect_err("SAE registry must reject IBP assignment sparsity");
+        assert!(ibp_err.contains("assignment sparsity"));
+    }
+
+    #[test]
     fn ibp_fixed_alpha_assignment_value_matches_logit_gradient_fd() {
         let n = 4usize;
         let k = 3usize;
@@ -18756,7 +18786,10 @@ mod tests {
             } else {
                 0.0
             };
-            assert!(entry.is_finite(), "JumpReLU hessian_diag must be finite at index {idx}");
+            assert!(
+                entry.is_finite(),
+                "JumpReLU hessian_diag must be finite at index {idx}"
+            );
             saw_negative |= entry < 0.0;
             assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
         }
