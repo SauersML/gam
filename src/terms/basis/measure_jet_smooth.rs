@@ -226,11 +226,14 @@ pub struct MeasureJetBand {
     pub log_step: f64,
 }
 
-/// The energy and its exact (s, α) hyperparameter jets — six symmetric m×m
-/// forms scattered from the SAME local residual blocks in one pass. Both
-/// dials enter only through per-block log-weights, so the jets are exact by
-/// construction (FD-gated in this module's tests), and the future ψ-channel
-/// consumes them with zero design drift.
+/// The energy and its exact hyperparameter jets in all three dials —
+/// `(s, α, ψ_τ = ln τ)` — ten symmetric m×m forms scattered from the SAME
+/// local residual blocks in one pass. `s` and `α` enter only through
+/// per-block log-weights; `ln τ` enters through the resolvent of the ridged
+/// local Gram (`∂R/∂τ = B·M²·Bᵀ/q`, `∂²R/∂τ² = −2·B·M³·Bᵀ/q` with
+/// `M = (G + τI)⁻¹`), also closed-form. All ten are exact by construction
+/// (FD-gated in this module's tests), and the ψ-channel consumes them with
+/// zero design drift.
 pub struct MeasureJetEnergyJets {
     pub q: Array2<f64>,
     pub dq_ds: Array2<f64>,
@@ -238,6 +241,10 @@ pub struct MeasureJetEnergyJets {
     pub dq_dalpha: Array2<f64>,
     pub d2q_dalpha2: Array2<f64>,
     pub d2q_ds_dalpha: Array2<f64>,
+    pub dq_dlogtau: Array2<f64>,
+    pub d2q_dlogtau2: Array2<f64>,
+    pub d2q_ds_dlogtau: Array2<f64>,
+    pub d2q_dalpha_dlogtau: Array2<f64>,
 }
 
 fn validate_finite_points(points: ArrayView2<'_, f64>, what: &str) -> Result<(), BasisError> {
@@ -435,8 +442,11 @@ pub fn measure_jet_center_masses(
 ///
 /// Per block the closure receives `(scale_idx, eps, q, base)` where `base`
 /// is the fully-assembled outer weight
-/// `log_step · ε^(−2s) · net_mass_i · q^(1−2α)`, and writes one scalar
-/// multiplier per requested form.
+/// `log_step · ε^(−2s) · net_mass_i · q^(1−2α)`, and writes, per requested
+/// form, one weight triple `[w_R, w_2, w_3]` against the three block
+/// channels `R = CᵀWC − B·M·Bᵀ/q`, `B·M²·Bᵀ/q`, and `B·M³·Bᵀ/q`
+/// (`M = (G + τI)⁻¹`) — the resolvent powers carrying the exact ln-τ jets.
+/// Channels 2 and 3 are only computed when `channels` requests them.
 ///
 /// The outer sum over centers is coarsened per scale to a deterministic
 /// ε/2-net with nearest-member mass aggregation (the outer Riemann sum needs
@@ -452,15 +462,18 @@ fn assemble_weighted_forms<F>(
     alpha: f64,
     tau0: f64,
     n_forms: usize,
+    channels: usize,
     weights: &F,
 ) -> Result<Vec<Array2<f64>>, BasisError>
 where
-    F: Fn(usize, f64, f64, f64, &mut [f64]) + Sync,
+    F: Fn(usize, f64, f64, f64, &mut [[f64; 3]]) + Sync,
 {
     let m = centers.nrows();
     let d = centers.ncols();
-    if n_forms == 0 {
-        crate::bail_invalid_basis!("measure-jet assembly needs at least one output form");
+    if n_forms == 0 || !(1..=3).contains(&channels) {
+        crate::bail_invalid_basis!(
+            "measure-jet assembly needs at least one output form and 1..=3 block channels"
+        );
     }
     if masses.len() != m {
         crate::bail_dim_basis!(
@@ -528,7 +541,7 @@ where
                 net_mass[best_o] += masses[i];
             }
         }
-        let mut wbuf = vec![0.0_f64; n_forms];
+        let mut wbuf = vec![[0.0_f64; 3]; n_forms];
         for &i in &outer {
             // Local neighbor set (always includes i itself).
             let mut idx: Vec<usize> = Vec::new();
@@ -601,18 +614,42 @@ where
             }
             let m_inv = vm.dot(&evecs.t());
             let bm = b.dot(&m_inv);
+            // Resolvent powers for the ln-τ jets, computed only on request:
+            // B·M²·Bᵀ/q (first τ-derivative channel) and B·M³·Bᵀ/q (second).
+            let bm2 = if channels >= 2 {
+                let mut vm2 = evecs.clone();
+                for (k, mut col) in vm2.axis_iter_mut(Axis(1)).enumerate() {
+                    col.mapv_inplace(|v| v * inv_diag[k] * inv_diag[k]);
+                }
+                Some(b.dot(&vm2.dot(&evecs.t())))
+            } else {
+                None
+            };
+            let bm3 = if channels >= 3 {
+                let mut vm3 = evecs.clone();
+                for (k, mut col) in vm3.axis_iter_mut(Axis(1)).enumerate() {
+                    col.mapv_inplace(|v| v * inv_diag[k] * inv_diag[k] * inv_diag[k]);
+                }
+                Some(b.dot(&vm3.dot(&evecs.t())))
+            } else {
+                None
+            };
             let base = scale_weight * net_mass[i] * q.powf(1.0 - 2.0 * alpha);
             weights(scale_idx, eps, q, base, &mut wbuf);
-            // Scatter-add wbuf[k] · (W − w·wᵀ/q − B·M·Bᵀ/q) into each form.
+            // Scatter-add Σ_k wbuf[k]·[R | B·M²·Bᵀ/q | B·M³·Bᵀ/q] into each form.
             for (a, &ja) in idx.iter().enumerate() {
                 let bma = bm.row(a);
                 for (c, &jc) in idx.iter().enumerate() {
-                    let mut val = -w[a] * w[c] / q - bma.dot(&b.row(c)) / q;
+                    let b_c = b.row(c);
+                    let mut val_r = -w[a] * w[c] / q - bma.dot(&b_c) / q;
                     if a == c {
-                        val += w[a];
+                        val_r += w[a];
                     }
+                    let val_2 = bm2.as_ref().map_or(0.0, |m2| m2.row(a).dot(&b_c) / q);
+                    let val_3 = bm3.as_ref().map_or(0.0, |m3| m3.row(a).dot(&b_c) / q);
                     for (k, out_k) in out.iter_mut().enumerate() {
-                        out_k[(ja, jc)] += wbuf[k] * val;
+                        let wk = wbuf[k];
+                        out_k[(ja, jc)] += wk[0] * val_r + wk[1] * val_2 + wk[2] * val_3;
                     }
                 }
             }
@@ -683,22 +720,29 @@ pub fn measure_jet_energy_form(
         alpha,
         tau0,
         1,
-        &|_, _, _, base, out: &mut [f64]| out[0] = base,
+        1,
+        &|_, _, _, base, out: &mut [[f64; 3]]| out[0] = [base, 0.0, 0.0],
     )?;
     Ok(forms.swap_remove(0))
 }
 
-/// The energy together with its exact first and second (s, α) jets — the
-/// measure-jet ψ-channel feedstock. Both dials enter only through the
-/// per-block log-weights, so with `g_s = −2 ln ε` and `g_α = −2 ln q`:
+/// The energy together with its exact first and second jets in all three
+/// dials `(s, α, ψ_τ = ln τ)` — the complete measure-jet ψ-channel
+/// feedstock. With `g_s = −2 ln ε`, `g_α = −2 ln q`, `M = (G + τI)⁻¹`:
 ///
 /// ```text
-///   ∂Q/∂s = Σ g_s·w·R,   ∂²Q/∂s² = Σ g_s²·w·R,
-///   ∂Q/∂α = Σ g_α·w·R,   ∂²Q/∂α² = Σ g_α²·w·R,   ∂²Q/∂s∂α = Σ g_s·g_α·w·R,
+///   ∂Q/∂s   = Σ g_s·w·R,        ∂²Q/∂s²   = Σ g_s²·w·R,
+///   ∂Q/∂α   = Σ g_α·w·R,        ∂²Q/∂α²   = Σ g_α²·w·R,
+///   ∂²Q/∂s∂α = Σ g_s·g_α·w·R,
+///   ∂Q/∂ψ_τ  = Σ w·τ·BM²Bᵀ/q,
+///   ∂²Q/∂ψ_τ² = Σ w·(τ·BM²Bᵀ − 2τ²·BM³Bᵀ)/q,
+///   ∂²Q/∂s∂ψ_τ = Σ g_s·w·τ·BM²Bᵀ/q,   ∂²Q/∂α∂ψ_τ = Σ g_α·w·τ·BM²Bᵀ/q,
 /// ```
 ///
-/// scattered from the SAME residual blocks as `Q` in one pass (no second
-/// assembly that could drift). FD-gated in this module's tests.
+/// all scattered from the SAME local blocks as `Q` in one pass (no second
+/// assembly that could drift). FD-gated in this module's tests. Requires
+/// `tau0 > 0` (the ln-τ channel is undefined in the τ = 0 pseudo-inverse
+/// oracle mode).
 pub fn measure_jet_energy_form_with_jets(
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
@@ -707,6 +751,13 @@ pub fn measure_jet_energy_form_with_jets(
     alpha: f64,
     tau0: f64,
 ) -> Result<MeasureJetEnergyJets, BasisError> {
+    if !(tau0.is_finite() && tau0 > 0.0) {
+        crate::bail_invalid_basis!(
+            "measure-jet jets need tau0 > 0 (the ln-τ channel is undefined at the τ = 0 \
+             pseudo-inverse oracle mode); got {tau0}"
+        );
+    }
+    let t = tau0;
     let mut forms = assemble_weighted_forms(
         centers,
         masses,
@@ -714,24 +765,33 @@ pub fn measure_jet_energy_form_with_jets(
         order_s,
         alpha,
         tau0,
-        6,
-        &|_, eps: f64, q: f64, base: f64, out: &mut [f64]| {
+        10,
+        3,
+        &|_, eps: f64, q: f64, base: f64, out: &mut [[f64; 3]]| {
             let gs = -2.0 * eps.ln();
             let ga = -2.0 * q.max(f64::MIN_POSITIVE).ln();
-            out[0] = base;
-            out[1] = gs * base;
-            out[2] = gs * gs * base;
-            out[3] = ga * base;
-            out[4] = ga * ga * base;
-            out[5] = gs * ga * base;
+            out[0] = [base, 0.0, 0.0];
+            out[1] = [gs * base, 0.0, 0.0];
+            out[2] = [gs * gs * base, 0.0, 0.0];
+            out[3] = [ga * base, 0.0, 0.0];
+            out[4] = [ga * ga * base, 0.0, 0.0];
+            out[5] = [gs * ga * base, 0.0, 0.0];
+            out[6] = [0.0, t * base, 0.0];
+            out[7] = [0.0, t * base, -2.0 * t * t * base];
+            out[8] = [0.0, gs * t * base, 0.0];
+            out[9] = [0.0, ga * t * base, 0.0];
         },
     )?;
-    let d2q_ds_dalpha = forms.pop().expect("six assembled forms");
-    let d2q_dalpha2 = forms.pop().expect("six assembled forms");
-    let dq_dalpha = forms.pop().expect("six assembled forms");
-    let d2q_ds2 = forms.pop().expect("six assembled forms");
-    let dq_ds = forms.pop().expect("six assembled forms");
-    let q = forms.pop().expect("six assembled forms");
+    let d2q_dalpha_dlogtau = forms.pop().expect("ten assembled forms");
+    let d2q_ds_dlogtau = forms.pop().expect("ten assembled forms");
+    let d2q_dlogtau2 = forms.pop().expect("ten assembled forms");
+    let dq_dlogtau = forms.pop().expect("ten assembled forms");
+    let d2q_ds_dalpha = forms.pop().expect("ten assembled forms");
+    let d2q_dalpha2 = forms.pop().expect("ten assembled forms");
+    let dq_dalpha = forms.pop().expect("ten assembled forms");
+    let d2q_ds2 = forms.pop().expect("ten assembled forms");
+    let dq_ds = forms.pop().expect("ten assembled forms");
+    let q = forms.pop().expect("ten assembled forms");
     Ok(MeasureJetEnergyJets {
         q,
         dq_ds,
@@ -739,6 +799,10 @@ pub fn measure_jet_energy_form_with_jets(
         dq_dalpha,
         d2q_dalpha2,
         d2q_ds_dalpha,
+        dq_dlogtau,
+        d2q_dlogtau2,
+        d2q_ds_dlogtau,
+        d2q_dalpha_dlogtau,
     })
 }
 
@@ -772,9 +836,14 @@ pub fn measure_jet_scale_spectrum(
         alpha,
         tau0,
         n_scales,
-        &|scale_idx, _, _, base, out: &mut [f64]| {
+        1,
+        &|scale_idx, _, _, base, out: &mut [[f64; 3]]| {
             for (k, slot) in out.iter_mut().enumerate() {
-                *slot = if k == scale_idx { base } else { 0.0 };
+                *slot = if k == scale_idx {
+                    [base, 0.0, 0.0]
+                } else {
+                    [0.0, 0.0, 0.0]
+                };
             }
         },
     )?;
@@ -1193,8 +1262,13 @@ mod tests {
         for (a, b) in jets.q.iter().zip(q_plain.iter()) {
             assert!((a - b).abs() <= 1e-14 * (1.0 + b.abs()), "Q drift {a} vs {b}");
         }
+        let lt0 = tau.ln();
+        let q_at_lt = |lt: f64| {
+            measure_jet_energy_form(centers.view(), masses.view(), &band, s0, a0, lt.exp())
+                .expect("energy form")
+        };
         let h = 1e-5;
-        let checks: [(&str, &Array2<f64>, Array2<f64>); 5] = [
+        let checks: [(&str, &Array2<f64>, Array2<f64>); 9] = [
             ("dq_ds", &jets.dq_ds, {
                 let (p, m_) = (q_at(s0 + h, a0), q_at(s0 - h, a0));
                 (&p - &m_) / (2.0 * h)
@@ -1216,6 +1290,50 @@ mod tests {
                 let pm = q_at(s0 + h, a0 - h);
                 let mp = q_at(s0 - h, a0 + h);
                 let mm = q_at(s0 - h, a0 - h);
+                (&(&pp - &pm) - &(&mp - &mm)) / (4.0 * h * h)
+            }),
+            ("dq_dlogtau", &jets.dq_dlogtau, {
+                let (p, m_) = (q_at_lt(lt0 + h), q_at_lt(lt0 - h));
+                (&p - &m_) / (2.0 * h)
+            }),
+            ("d2q_dlogtau2", &jets.d2q_dlogtau2, {
+                let (p, c, m_) = (q_at_lt(lt0 + h), q_at_lt(lt0), q_at_lt(lt0 - h));
+                (&(&p + &m_) - &(&c * 2.0)) / (h * h)
+            }),
+            ("d2q_ds_dlogtau", &jets.d2q_ds_dlogtau, {
+                let f = |s: f64, lt: f64| {
+                    measure_jet_energy_form(
+                        centers.view(),
+                        masses.view(),
+                        &band,
+                        s,
+                        a0,
+                        lt.exp(),
+                    )
+                    .expect("energy form")
+                };
+                let pp = f(s0 + h, lt0 + h);
+                let pm = f(s0 + h, lt0 - h);
+                let mp = f(s0 - h, lt0 + h);
+                let mm = f(s0 - h, lt0 - h);
+                (&(&pp - &pm) - &(&mp - &mm)) / (4.0 * h * h)
+            }),
+            ("d2q_dalpha_dlogtau", &jets.d2q_dalpha_dlogtau, {
+                let f = |a: f64, lt: f64| {
+                    measure_jet_energy_form(
+                        centers.view(),
+                        masses.view(),
+                        &band,
+                        s0,
+                        a,
+                        lt.exp(),
+                    )
+                    .expect("energy form")
+                };
+                let pp = f(a0 + h, lt0 + h);
+                let pm = f(a0 + h, lt0 - h);
+                let mp = f(a0 - h, lt0 + h);
+                let mm = f(a0 - h, lt0 - h);
                 (&(&pp - &pm) - &(&mp - &mm)) / (4.0 * h * h)
             }),
         ];
