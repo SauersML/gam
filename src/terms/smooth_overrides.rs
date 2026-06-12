@@ -244,8 +244,8 @@ fn apply_kind_specific(
         | ("mkappa", SmoothBasisSpec::ConstantCurvature { spec, .. }) => {
             apply_constant_curvature(spec, descriptor, symbol)
         }
-        ("measurejet", SmoothBasisSpec::MeasureJet { spec, .. })
-        | ("mjs", SmoothBasisSpec::MeasureJet { spec, .. })
+        ("mjs", SmoothBasisSpec::MeasureJet { spec, .. })
+        | ("measurejet", SmoothBasisSpec::MeasureJet { spec, .. })
         | ("measure_jet", SmoothBasisSpec::MeasureJet { spec, .. })
         | ("web", SmoothBasisSpec::MeasureJet { spec, .. }) => {
             apply_measure_jet(spec, descriptor, symbol)

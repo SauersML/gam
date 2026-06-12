@@ -1274,8 +1274,8 @@ impl TermCollectionSpec {
                         ))
                         .into());
                     }
-                    // The penalty depends on the FIT data through masses and
-                    // band; a frozen term must carry them for exact replay.
+                    // Exact replay needs the fit-data penalty quadrature
+                    // (masses + band contract: `BasisMetadata::MeasureJet`).
                     if spec.frozen_quadrature.is_none() {
                         return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: MeasureJet frozen_quadrature (masses + band) is missing",
@@ -3103,16 +3103,10 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
         return true;
     }
 
-    // Measure-jet: the geometry dials (α, lnτ[, s]) are penalty-only ψ
-    // coordinates with zero design drift, produced by
-    // `build_measure_jet_basis_psi_derivatives` on the SAME realized
-    // geometry as the fit-time candidates and FD-gated end to end. The
-    // ln-τ channel needs a positive ridge, so τ = 0 (the pseudo-inverse
-    // oracle mode) keeps the term out of the outer ψ vector entirely.
-    if let Some(term) = spec.smooth_terms.get(term_idx)
-        && let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &term.basis
-    {
-        return mj.tau0 > 0.0;
+    // Measure-jet geometry dials are outer ψ coordinates; enrollment is
+    // owned by `measure_jet_enrolls_psi`.
+    if let Some(mj) = measure_jet_term_spec(spec, term_idx) {
+        return measure_jet_enrolls_psi(mj);
     }
     get_spatial_length_scale(spec, term_idx).is_some()
 }
@@ -3129,6 +3123,16 @@ fn measure_jet_term_spec(
             SmoothBasisSpec::MeasureJet { spec, .. } => Some(spec),
             _ => None,
         })
+}
+
+/// Single source for measure-jet outer-ψ enrollment: the lnτ dial is
+/// undefined in the τ = 0 pseudo-inverse oracle mode (see
+/// `build_measure_jet_basis_psi_derivatives`), so only a positive ridge
+/// enrolls the dial group. `spatial_term_supports_hyper_optimization` and
+/// `spatial_term_uses_per_axis_psi` both defer here so the θ-layout
+/// sources cannot disagree.
+fn measure_jet_enrolls_psi(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
+    mj.tau0 > 0.0
 }
 
 /// Measure-jet ψ dial boxes. The dials are NOT log-kernel-scales, so the
@@ -3234,25 +3238,19 @@ fn set_measure_jet_psi_dials(
     let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
         crate::bail_invalid_estim!("measure-jet ψ write-back: term index {term_idx} out of range");
     };
-    let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &mut term.basis else {
-        crate::bail_invalid_estim!(
-            "measure-jet ψ write-back targeted a non-measure-jet term ({term_idx})"
-        );
-    };
-    apply_measure_jet_psi(mj, psi)
+    set_single_term_measure_jet_psi_dials(term, psi)
 }
 
-/// Single-term variant for the cached per-trial build spec. Returns the
-/// same moved flag as the collection-level setter; the realizer caller has
-/// already change-checked at the collection level and rebuilds regardless.
+/// Single-term dial write-back: the shared match+apply core, also used
+/// directly on the cached per-trial build spec (whose caller has already
+/// change-checked at the collection level and rebuilds regardless of the
+/// moved flag).
 fn set_single_term_measure_jet_psi_dials(
     term: &mut SmoothTermSpec,
     psi: &[f64],
 ) -> Result<bool, EstimationError> {
     let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &mut term.basis else {
-        crate::bail_invalid_estim!(
-            "measure-jet ψ write-back targeted a non-measure-jet build spec"
-        );
+        crate::bail_invalid_estim!("measure-jet ψ write-back targeted a non-measure-jet term");
     };
     apply_measure_jet_psi(mj, psi)
 }
@@ -7375,19 +7373,17 @@ fn build_single_local_smooth_term(
                 );
             }
             let mut x = select_columns(data, feature_cols)?;
-            // Matern-style per-axis standardization: the measure-jet geometry
-            // (band, masses, local Grams) is built in standardized coordinates
-            // so no ambient axis dominates by units; the realized σ vector is
+            // Matern-style per-axis standardization; the realized σ vector is
             // persisted into the metadata for predict-time replay.
             //
-            // Length-scale round-trip contract (the Duchon double-compensation
-            // trap, resolved differently here): `input_scales: Some` marks the
-            // REPLAY path — the frozen spec's length_scale is already the
-            // realized post-standardization value, so it passes through
-            // verbatim. On the fresh path an explicit user length_scale is in
+            // Length-scale round-trip contract (owning statement; the freeze
+            // and frozen-validation arms reference it): `input_scales: Some`
+            // marks the REPLAY path — the frozen length_scale is already the
+            // realized post-standardization value and passes through
+            // verbatim. Fresh path: an explicit user length_scale is in
             // ORIGINAL coordinates and gets the σ_geom compensation; the 0.0
             // auto sentinel passes through (auto-derivation runs inside the
-            // builder, post-standardization, and needs no compensation).
+            // builder, post-standardization).
             let (scales, length_scale_eff) = if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
                 (Some(s.clone()), spec.length_scale)
@@ -15814,12 +15810,11 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             build_matern_basis_log_kappa_aniso_derivatives(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        // Measure-jet: the grouped dial coordinates (α, lnτ[, s]) ride the
-        // same per-axis carrier. The producer runs on the FROZEN spec
-        // (UserProvided barycenter nodes + frozen quadrature + frozen
-        // transform — the driver runs post-freeze), so per-trial derivative
-        // rebuilds move only the dials; design drift is identically zero and
-        // the penalty jets share the fit-time candidate normalization.
+        // Measure-jet: the grouped dial coordinates ride the same per-axis
+        // carrier. The producer runs on the FROZEN spec (the driver runs
+        // post-freeze), so per-trial rebuilds move only the dials; the
+        // coordinate layout, zero design drift, and shared candidate
+        // normalization are owned by `build_measure_jet_basis_psi_derivatives`.
         SmoothBasisSpec::MeasureJet {
             feature_cols,
             spec,
@@ -16021,7 +16016,7 @@ fn try_build_spatial_term_log_kappa_derivative(
         // (`try_build_spatial_term_log_kappa_aniso_derivativeinfos`):
         // `spatial_term_uses_per_axis_psi` is true for every enrolled
         // measure-jet term, so this isotropic path only sees unenrolled
-        // (τ = 0 oracle-mode) terms, which expose no ψ bundle.
+        // terms (`measure_jet_enrolls_psi` = false), which expose no ψ bundle.
         SmoothBasisSpec::MeasureJet { .. } => return Ok(None),
         SmoothBasisSpec::Matern {
             feature_cols,
@@ -17042,10 +17037,10 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
 fn spatial_term_uses_per_axis_psi(resolvedspec: &TermCollectionSpec, term_idx: usize) -> bool {
     // Measure-jet enrolls a multi-coordinate DIAL group (α, lnτ[, s]) —
     // grouped like per-axis anisotropy in the θ layout, but the coordinates
-    // are geometry dials, not axis scales. Same eligibility condition as
-    // `spatial_term_supports_hyper_optimization` so the layout sources agree.
+    // are geometry dials, not axis scales. Enrollment is owned by
+    // `measure_jet_enrolls_psi`.
     if let Some(mj) = measure_jet_term_spec(resolvedspec, term_idx) {
-        return mj.tau0 > 0.0;
+        return measure_jet_enrolls_psi(mj);
     }
     let Some(d) = get_spatial_feature_dim(resolvedspec, term_idx) else {
         return false;
@@ -17078,8 +17073,8 @@ pub(crate) fn spatial_dims_per_term(
         .iter()
         .map(|&term_idx| {
             if let Some(mj) = measure_jet_term_spec(resolvedspec, term_idx) {
-                // Dial group, not per-axis anisotropy: 2 in per-level mode
-                // (α, lnτ), 3 in fused mode (s, α, lnτ).
+                // Dial group, not per-axis anisotropy; layout owned by
+                // `measure_jet_psi_dim`.
                 measure_jet_psi_dim(mj)
             } else if spatial_term_uses_per_axis_psi(resolvedspec, term_idx) {
                 get_spatial_feature_dim(resolvedspec, term_idx).unwrap_or(1)
@@ -18188,15 +18183,11 @@ fn run_exact_joint_spatial_optimization(
             "[{label}] analytic outer Hessian unavailable for family/design; routing without second-order geometry (coord_dim={coord_dim})"
         );
     }
-    // Second-order outer routing is COST-AWARE here, mirroring the n-block
-    // path's work-budget policy: the exact joint outer Hessian materializes
-    // pairwise hyper operators for every (θ_i, θ_j), so its per-eval cost
-    // grows quadratically in θ-dim (profiled: TauTauPairHyperOperator::
-    // mul_vec dominates wall-clock for spectral-mode measure-jet terms,
-    // whose per-scale candidates push θ-dim to ~9–11). Past the pair
-    // budget, gradient-only quasi-Newton is convergent to the same optimum
-    // and strictly cheaper per eval — the n-block path documents the same
-    // trade; below it, exact second-order keeps the ARC/TR-CG geometry.
+    // Cost-aware second-order routing, mirroring the n-block path's
+    // work-budget policy: past the pair budget gradient-only quasi-Newton
+    // converges to the same optimum strictly cheaper per eval; below it,
+    // exact second-order keeps the ARC/TR-CG geometry. The budget's
+    // derivation is owned by `EXACT_JOINT_SECOND_ORDER_THETA_CAP`.
     let prefer_gradient_only = theta_dim > EXACT_JOINT_SECOND_ORDER_THETA_CAP;
     if prefer_gradient_only {
         log::info!(
@@ -18680,19 +18671,17 @@ fn freeze_smooth_basis_from_metadata(
             },
         ) => {
             s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
-            // Pin every realized hyperparameter so auto sentinels cannot
-            // re-derive geometry from predict rows. The replay dispatch
-            // consumes length_scale VERBATIM (`input_scales: Some` marks the
-            // replay path — no σ_geom re-compensation; see the build
-            // dispatch's round-trip contract).
+            // Pin the realized geometry so auto sentinels cannot re-derive it
+            // from predict rows. Field semantics are owned elsewhere:
+            // length_scale replays VERBATIM (build dispatch round-trip
+            // contract); order_s is the sentinel-preserving mode marker and
+            // masses + eps_band are the fit-data penalty quadrature (both
+            // `BasisMetadata::MeasureJet`).
             s.length_scale = *length_scale;
             s.order_s = *order_s;
             s.alpha = *alpha;
             s.tau0 = *tau0;
             s.num_scales = eps_band.len();
-            // The penalty depends on the FIT data through masses + band;
-            // freeze both so the rebuilt penalty is the one the coefficients
-            // were estimated under.
             s.frozen_quadrature = Some(MeasureJetFrozenQuadrature {
                 masses: masses.clone(),
                 eps_band: eps_band.clone(),
@@ -19658,9 +19647,9 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             ))
             .into());
         }
-        // Measure-jet terms carry DIAL coordinates (α, lnτ[, s]) rather than
-        // κ/length-scale ψ; the κ-translation below would misread them as
-        // log-scales and corrupt the geometry. Route through the dial setter.
+        // Measure-jet ψ slots are dial coordinates, not log-κ (dial docs:
+        // the MEASURE_JET_PSI_* bounds block); route through the dial setter
+        // so the κ-translation below never misreads them as log-scales.
         let measure_jet_term = measure_jet_term_spec(&self.spec, term_idx).is_some();
         let mut next_length_scale = None;
         let mut next_aniso: Option<Vec<f64>> = None;
@@ -20293,11 +20282,12 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
 }
 
 /// Joint-θ dimension above which the single-block exact-joint driver routes
-/// gradient-only: the exact outer Hessian builds θ(θ+1)/2 pairwise hyper
-/// operators, so per-eval cost grows quadratically in θ-dim — profiled to
-/// dominate wall-clock at spectral-mode measure-jet candidate counts
-/// (θ ≈ 9–11), while θ ≤ 8 (classic Matérn κ/η fits) keeps cheap exact
-/// second-order geometry.
+/// gradient-only (this doc owns the derivation; the routing site only
+/// compares against it). The exact outer Hessian builds θ(θ+1)/2 pairwise
+/// hyper operators, so per-eval cost grows quadratically in θ-dim —
+/// profiled: `TauTauPairHyperOperator::mul_vec` dominates wall-clock at
+/// spectral-mode measure-jet candidate counts (θ ≈ 9–11), while θ ≤ 8
+/// (classic Matérn κ/η fits) keeps cheap exact second-order geometry.
 const EXACT_JOINT_SECOND_ORDER_THETA_CAP: usize = 8;
 
 pub(crate) fn exact_joint_multistart_outer_problem(

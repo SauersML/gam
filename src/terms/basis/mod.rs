@@ -2555,13 +2555,16 @@ pub enum BasisMetadata {
         constraint_transform: Option<Array2<f64>>,
     },
     /// Measure-jet spline smooth: multiscale local-jet-residual energy of the
-    /// empirical measure, quadratured on the center set. The penalty depends
-    /// on the FIT data through `masses` and the realized `eps_band`, so both
-    /// are persisted and replayed verbatim by predict-time (and future
-    /// per-ψ-trial) rebuilds — recomputing either from predict rows would
-    /// change the penalty the coefficients were estimated under.
-    /// `constraint_transform` is the composed `z · z_parametric` frozen by
-    /// the global identifiability pipeline (#532 pattern).
+    /// empirical measure, quadratured on the center set. `centers` are the
+    /// REALIZED barycenter nodes; `order_s` stores the spec's order sentinel
+    /// verbatim as the mode marker (0.0 = per-level/spectral, > 0 = fused
+    /// pin — persisting a realized default would flip the rebuilt mode). The
+    /// penalty depends on the FIT data through `masses` and the realized
+    /// `eps_band`, so both are persisted and replayed verbatim by
+    /// predict-time (and per-ψ-trial) rebuilds — recomputing either from
+    /// predict rows would change the penalty the coefficients were estimated
+    /// under. `constraint_transform` is the composed `z · z_parametric`
+    /// frozen by the global identifiability pipeline (#532 pattern).
     MeasureJet {
         centers: Array2<f64>,
         input_scales: Option<Vec<f64>>,
