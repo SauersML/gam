@@ -427,6 +427,16 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         true
     }
 
+    fn output_channel_assignment(
+        &self,
+        specs: &[crate::families::custom_family::ParameterBlockSpec],
+    ) -> Option<Vec<usize>> {
+        if specs.len() != self.blocks.len() {
+            return Some((0..self.blocks.len()).collect());
+        }
+        Some((0..specs.len()).collect())
+    }
+
     fn coefficient_hessian_cost(
         &self,
         specs: &[crate::families::custom_family::ParameterBlockSpec],
