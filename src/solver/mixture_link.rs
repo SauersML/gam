@@ -1611,17 +1611,12 @@ fn beta_reg_logistic(a: f64, b: f64, logistic: LogisticU) -> f64 {
 }
 
 #[inline]
-fn beta_reg_with_shape_partials_logistic(
-    a: f64,
-    b: f64,
-    logistic: LogisticU,
-) -> (f64, f64, f64) {
+fn beta_reg_with_shape_partials_logistic(a: f64, b: f64, logistic: LogisticU) -> (f64, f64, f64) {
     if logistic.ln_u.is_nan() || logistic.ln_one_minus_u.is_nan() {
         return (f64::NAN, f64::NAN, f64::NAN);
     }
     if logistic.use_upper_tail {
-        let (tail, dtail_db, dtail_da) =
-            beta_reg_with_shape_partials(b, a, logistic.one_minus_u);
+        let (tail, dtail_db, dtail_da) = beta_reg_with_shape_partials(b, a, logistic.one_minus_u);
         (1.0 - tail, -dtail_da, -dtail_db)
     } else {
         beta_reg_with_shape_partials(a, b, logistic.u)
@@ -2728,9 +2723,9 @@ mod tests {
 
     #[test]
     fn beta_logistic_left_tail_uses_unclamped_log_space() {
-        let eta = -40.0;
-        let delta = 0.2;
-        let epsilon = -0.1;
+        let eta = -40.0_f64;
+        let delta = 0.2_f64;
+        let epsilon = -0.1_f64;
         let a = (delta - epsilon).exp();
         let b = (delta + epsilon).exp();
         let expected_mu = beta_reg(a, b, eta.exp());
