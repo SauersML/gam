@@ -2,7 +2,8 @@
 //!
 //! Split-conformal (and its heteroscedastic generalization, conformalized
 //! scale regression — Romano, Patterson & Candès 2019) turns any point
-//! predictor into intervals with *finite-sample marginal coverage*
+//! predictor into intervals with *finite-sample marginal coverage* on a
+//! genuinely held-out calibration fold:
 //!
 //!   P(Y ∈ interval) ≥ 1 − α
 //!
@@ -11,10 +12,14 @@
 //!
 //! # The math
 //!
-//! Given held-out residuals `r_i` and strictly-positive per-point scales
-//! `s_i`, form nonconformity scores
+//! Given held-out residuals `r_i` and nonnegative raw per-point scales
+//! `s_i`, first apply the shared effective-scale map
 //!
-//!   e_i = |r_i| / s_i.
+//!   s_eff(x) = max(s(x), f64::MIN_POSITIVE),
+//!
+//! after rejecting non-finite or negative scales. Then form nonconformity scores
+//!
+//!   e_i = |r_i| / s_eff_i.
 //!
 //! The conformal multiplier is the EXACT order statistic
 //!
@@ -24,9 +29,9 @@
 //! certify coverage at the requested level, so the only honest interval is
 //! the unbounded one (never a silently under-covering finite interval). The
 //! calibrated interval for a test point with point prediction `μ̂(x)` and
-//! scale `s(x)` is
+//! raw scale `s(x)` is
 //!
-//!   μ̂(x) ± q̂ · s(x).
+//!   μ̂(x) ± q̂ · s_eff(x).
 //!
 //! With `s_i ≡ 1` this is classic absolute-residual split conformal; with
 //! heteroscedastic `s_i` it is conformalized scale regression.
@@ -47,8 +52,9 @@
 //!   were NOT used to fit the model — a genuinely held-out, labeled fold — the
 //!   fitted predictor is already independent of every calibration point, so no
 //!   leave-one-out correction is needed. The score is the plain held-out
-//!   residual `r_i = y_cal_i − μ̂(x_cal_i)` normalized by the model's
-//!   predict-time response-scale SE `s(x_cal_i)`. This is
+//!   residual `r_i = y_cal_i − μ̂(x_cal_i)` normalized by the effective scale
+//!   derived from the model's predict-time response-scale SE `s(x_cal_i)`.
+//!   This is
 //!   [`ConformalCalibrator::from_held_out_fold`], driven by
 //!   [`crate::inference::predict::predict_full_uncertainty_conformal`] over a
 //!   [`crate::inference::predict::ConformalCalibrationFold`]. The fold carries
@@ -56,10 +62,12 @@
 //!   rows.
 //! * **In-sample (no held-out fold available).** When the only data are the
 //!   training set, [`ConformalCalibrator::from_fit`] uses the
-//!   approximate-leave-one-out diagnostics in [`crate::inference::alo`] (whose
-//!   `eta_tilde` gives genuine held-out linear predictors and whose `se_bayes`
-//!   gives the per-point posterior SE) to manufacture leave-one-out residuals
-//!   from the training rows.
+//!   first-order approximate-leave-one-out diagnostics in
+//!   [`crate::inference::alo`] to manufacture leave-one-out residuals from the
+//!   training rows. This is a calibrated heuristic: it inherits the split
+//!   conformal finite-sample guarantee only to the extent that the approximate
+//!   ALO scores match true leave-one-out exchangeable scores; there is no
+//!   separate distribution-free finite-sample theorem for the approximation.
 //!
 //! Either way the predict path consumes `q̂` through the opt-in
 //! `conformal_level` field on
@@ -69,24 +77,26 @@
 //!
 //! # Response scale vs. link scale
 //!
-//! The interval the caller consumes is on the *response* scale (`μ̂ ± q̂·s`),
-//! and the coverage guarantee is a statement about `Y` on the response scale.
-//! We therefore build the calibration scores on the response scale:
+//! The interval the caller consumes is on the *response* scale
+//! (`μ̂ ± q̂·s_eff`), and the held-out split-conformal coverage guarantee is a
+//! statement about `Y` on the response scale. We therefore build the
+//! calibration scores on the response scale:
 //!
 //!   r_i = y_i − g⁻¹(η̃_i)
 //!
 //! where `η̃_i` is the leave-one-out linear predictor and `g⁻¹` the family
 //! inverse link, and the per-point scale is the response-scale SE
-//! `s_i = |dμ/dη|·se_bayes_i`. At predict time the matching scale `s(x)` is
+//! `s_i = |dμ/dη|·se_bayes_i`. At predict time the matching raw scale `s(x)` is
 //! the response-scale standard error the predict engine already produces
-//! (`mean_standard_error`). Calibration and prediction thus draw their scale
-//! from the *same* source, which is exactly what conformalized scale
-//! regression requires. For Gaussian-identity the response scale is exact;
-//! for the monotone links gam fits (logit/probit/cloglog/log) the response
-//! map is monotone so the symmetric `±q̂·s(x)` interval is well defined, and
-//! it is finally clamped to the family support — keeping the guarantee about
-//! `Y` directly rather than relying on a delta-method linearization that the
-//! coverage proof does not need.
+//! (`mean_standard_error`), passed through the same effective-scale map.
+//! Calibration and prediction thus draw their scale from the *same* source and
+//! transform it identically, which is exactly what conformalized scale
+//! regression requires. For Gaussian-identity the response scale is exact; for
+//! the monotone links gam fits (logit/probit/cloglog/log) the response map is
+//! monotone so the symmetric `±q̂·s_eff(x)` interval is well defined, and it is
+//! finally clamped to the family support — keeping the held-out split guarantee
+//! about `Y` directly rather than relying on a delta-method linearization that
+//! the coverage proof does not need.
 
 use crate::estimate::{EstimationError, UnifiedFitResult};
 use crate::families::strategy::FamilyStrategy;
@@ -98,13 +108,23 @@ use crate::types::{LikelihoodSpec, LinkFunction};
 use crate::util::quantile::order_statistic;
 use ndarray::{Array1, Array2, ArrayView1};
 
-/// The conformal nonconformity scores `e_i = |r_i| / s_i` for held-out
-/// residuals `r_i` and strictly-positive per-point scales `s_i`.
+fn effective_scale(scale: f64, idx: usize, role: &str) -> Result<f64, EstimationError> {
+    if !(scale.is_finite() && scale >= 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{role}[{idx}] must be finite and nonnegative, got {scale}"
+        )));
+    }
+    Ok(scale.max(f64::MIN_POSITIVE))
+}
+
+/// The conformal nonconformity scores `e_i = |r_i| / s_eff_i` for held-out
+/// residuals `r_i` and nonnegative per-point raw scales `s_i`.
 ///
-/// Validates that the two slices have equal length, that every scale is
-/// finite and strictly positive, and that every residual is finite. Returns
-/// an `EstimationError::InvalidInput` otherwise — never a silently degenerate
-/// score vector.
+/// Validates that the two slices have equal length, that every raw scale is
+/// finite and nonnegative, and that every residual is finite. Zero raw scales
+/// are mapped to `f64::MIN_POSITIVE` by the same effective-scale transform used
+/// at prediction time. Returns an `EstimationError::InvalidInput` otherwise —
+/// never a silently degenerate score vector.
 pub fn nonconformity_scores(
     residuals: ArrayView1<'_, f64>,
     scales: ArrayView1<'_, f64>,
@@ -129,12 +149,8 @@ pub fn nonconformity_scores(
                 "conformal residual[{idx}] must be finite, got {r}"
             )));
         }
-        if !(s.is_finite() && s > 0.0) {
-            return Err(EstimationError::InvalidInput(format!(
-                "conformal scale[{idx}] must be finite and strictly positive, got {s}"
-            )));
-        }
-        scores[idx] = r.abs() / s;
+        let s_eff = effective_scale(s, idx, "conformal scale")?;
+        scores[idx] = r.abs() / s_eff;
     }
     Ok(scores)
 }
@@ -212,7 +228,7 @@ impl ConformalCalibrator {
     }
 
     /// Build a calibrator directly from held-out residuals and per-point
-    /// scales. This is the pure core both [`ConformalCalibrator::from_fit`]
+    /// raw scales. This is the pure core both [`ConformalCalibrator::from_fit`]
     /// and the e2e tests route through.
     pub fn from_residuals_and_scales(
         residuals: ArrayView1<'_, f64>,
@@ -238,12 +254,13 @@ impl ConformalCalibrator {
     ///
     ///   r_i = y_cal_i − μ̂(x_cal_i),
     ///
-    /// normalized (for conformalized scale regression) by the model's own
-    /// predict-time response-scale standard error `s_i = s(x_cal_i)` — the
-    /// SAME scale source applied at test time by
+    /// normalized (for conformalized scale regression) by the effective scale
+    /// derived from the model's own predict-time response-scale standard error
+    /// `s_i = s(x_cal_i)` — the SAME scale source and transform applied at test
+    /// time by
     /// [`Self::apply_to_uncertainty_result`]. With those scores the exact
     /// order-statistic multiplier `q̂` gives finite-sample marginal coverage
-    /// `P(Y ∈ μ̂(x) ± q̂·s(x)) ≥ 1 − α` (Vovk et al.; Romano, Patterson &
+    /// `P(Y ∈ μ̂(x) ± q̂·s_eff(x)) ≥ 1 − α` (Vovk et al.; Romano, Patterson &
     /// Candès 2019), provided the calibration and test points are exchangeable
     /// — which they are for an i.i.d. held-out fold.
     ///
@@ -273,21 +290,24 @@ impl ConformalCalibrator {
         let mut scales = Array1::<f64>::zeros(n);
         for i in 0..n {
             residuals[i] = y_cal[i] - mu_cal[i];
-            // Floor the per-point response-scale SE to a tiny positive value so
-            // a degenerate (zero-SE) calibration point does not void the |r|/s
-            // score; `from_residuals_and_scales` re-validates strict positivity.
-            scales[i] = scale_cal[i].max(f64::MIN_POSITIVE);
+            scales[i] = effective_scale(scale_cal[i], i, "conformal calibration scale")?;
         }
         Self::from_residuals_and_scales(residuals.view(), scales.view(), alpha)
     }
 
     /// Build a calibrator from a fitted model and its training data.
     ///
-    /// Computes approximate-leave-one-out diagnostics (held-out linear
-    /// predictors `η̃_i` and per-point posterior SE `se_bayes_i`), maps both
-    /// onto the response scale through the fitted family's inverse link, forms
-    /// the response-scale held-out residuals `r_i = y_i − g⁻¹(η̃_i)` and scales
-    /// `s_i = |dμ/dη(η̃_i)| · se_bayes_i`, and returns the resulting `q̂`.
+    /// Computes first-order approximate-leave-one-out diagnostics (held-out
+    /// linear predictors `η̃_i` and per-point posterior SE `se_bayes_i`), maps
+    /// both onto the response scale through the fitted family's inverse link,
+    /// forms the response-scale held-out residuals `r_i = y_i − g⁻¹(η̃_i)` and
+    /// scales `s_i = |dμ/dη(η̃_i)| · se_bayes_i`, applies the shared
+    /// effective-scale transform, and returns the resulting `q̂`.
+    ///
+    /// This ALO path is a calibrated heuristic. It has the split-conformal
+    /// finite-sample marginal coverage guarantee only insofar as these
+    /// first-order ALO scores match true leave-one-out exchangeable scores; it
+    /// is not itself a distribution-free finite-sample guarantee.
     ///
     /// `design`, `offset`, `phi` mirror the arguments
     /// [`compute_alo_diagnostics_from_unified`] requires; `eta` is the fitted
@@ -323,24 +343,28 @@ impl ConformalCalibrator {
             // Response-scale held-out residual.
             residuals[i] = y[i] - mu_tilde;
             // Response-scale held-out SE: |dμ/dη| · se_bayes (delta method on
-            // the held-out posterior SE). Floored to a tiny positive value so a
-            // genuinely flat link region does not produce a zero scale that
-            // would void the |r|/s score; `from_residuals_and_scales` then
-            // re-validates strict positivity.
+            // the held-out posterior SE), then the same effective-scale map
+            // used by the prediction interval.
             let dmu_deta = jet.d1.abs();
-            let scale = (dmu_deta * alo.se_bayes[i]).max(f64::MIN_POSITIVE);
+            let scale = effective_scale(
+                dmu_deta * alo.se_bayes[i],
+                i,
+                "conformal ALO response-scale SE",
+            )?;
             scales[i] = scale;
         }
         Self::from_residuals_and_scales(residuals.view(), scales.view(), alpha)
     }
 
-    /// Calibrated response-scale interval `μ̂(x) ± q̂·s(x)`, clamped to the
+    /// Calibrated response-scale interval `μ̂(x) ± q̂·s_eff(x)`, clamped to the
     /// family support `bounds`.
     ///
-    /// `mean` is the point prediction `μ̂(x)` and `scale` the response-scale SE
-    /// `s(x)` at each test point. When `q̂ = +∞` the interval is unbounded
-    /// (`(−∞, +∞)`, then clamped to the support) — the honest answer when the
-    /// calibration set could not certify coverage.
+    /// `mean` is the point prediction `μ̂(x)` and `scale` the raw response-scale
+    /// SE `s(x)` at each test point. Each raw scale must be finite and
+    /// nonnegative; zero is mapped to `f64::MIN_POSITIVE`, exactly as in
+    /// calibration. When `q̂ = +∞` the interval is unbounded (`(−∞, +∞)`, then
+    /// clamped to the support) — the honest answer when the calibration set
+    /// could not certify coverage.
     pub fn calibrated_interval(
         &self,
         mean: &Array1<f64>,
@@ -358,8 +382,9 @@ impl ConformalCalibrator {
         let mut lower = Array1::<f64>::zeros(mean.len());
         let mut upper = Array1::<f64>::zeros(mean.len());
         for i in 0..mean.len() {
-            let half = self.q_hat * scale[i];
-            // q̂·s with q̂ = +∞ yields ±∞; bounds.clamp_value then maps that
+            let s_eff = effective_scale(scale[i], i, "conformal prediction scale")?;
+            let half = self.q_hat * s_eff;
+            // q̂·s_eff with q̂ = +∞ yields ±∞; bounds.clamp_value then maps that
             // onto the support (or leaves it unbounded).
             lower[i] = bounds.clamp_value(mean[i] - half);
             upper[i] = bounds.clamp_value(mean[i] + half);
@@ -400,12 +425,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nonpositive_scale() {
+    fn floors_zero_scale_and_rejects_invalid_scale() {
         let r = array![1.0, 2.0];
         let s = array![1.0, 0.0];
-        assert!(nonconformity_scores(r.view(), s.view()).is_err());
-        let s2 = array![1.0, -1.0];
-        assert!(nonconformity_scores(r.view(), s2.view()).is_err());
+        let e = nonconformity_scores(r.view(), s.view()).expect("zero scale is floored");
+        assert_eq!(e[0], 1.0);
+        assert_eq!(e[1], 2.0 / f64::MIN_POSITIVE);
+
+        let negative = array![1.0, -1.0];
+        assert!(nonconformity_scores(r.view(), negative.view()).is_err());
+        let nonfinite = array![1.0, f64::NAN];
+        assert!(nonconformity_scores(r.view(), nonfinite.view()).is_err());
     }
 
     #[test]
@@ -483,5 +513,42 @@ mod tests {
             .expect("interval");
         assert!(lo_c.iter().all(|&v| v >= 0.0));
         assert!(hi_c.iter().all(|&v| v <= 1.0));
+    }
+
+    #[test]
+    fn zero_scale_uses_same_effective_scale_for_calibration_and_prediction() {
+        let calib = ConformalCalibrator::from_held_out_fold(
+            array![1.0].view(),
+            array![0.0].view(),
+            array![0.0].view(),
+            0.5,
+        )
+        .expect("zero calibration scale is floored");
+        assert_eq!(calib.q_hat(), 1.0 / f64::MIN_POSITIVE);
+
+        let mean = array![10.0];
+        let scale = array![0.0];
+        let (lo, hi) = calib
+            .calibrated_interval(&mean, &scale, ResponseBounds::UNBOUNDED)
+            .expect("zero prediction scale is floored");
+        assert!((lo[0] - 9.0).abs() < 1e-12);
+        assert!((hi[0] - 11.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn calibrated_interval_rejects_negative_prediction_scale() {
+        let calib = ConformalCalibrator::from_residuals_and_scales(
+            array![1.0].view(),
+            array![1.0].view(),
+            0.5,
+        )
+        .expect("valid");
+        let mean = array![0.0];
+        let scale = array![-0.1];
+        assert!(
+            calib
+                .calibrated_interval(&mean, &scale, ResponseBounds::UNBOUNDED)
+                .is_err()
+        );
     }
 }
