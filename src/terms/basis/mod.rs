@@ -4288,20 +4288,60 @@ impl StreamingRadialState {
         // global rayon pool — every outer worker blocks on the OnceLock
         // while the one that won the race tries to schedule child tasks no
         // worker is free to pick up (see `feedback_oncelock_rayon_deadlock`).
-        // The serial sweep is ~100 ms at large-scale shapes (n ≈ 2e5,
-        // n_knots ≈ 10), amortized once over many subsequent O(1) reads.
+        //
+        // The serial sweep is only affordable when the per-pair radial
+        // evaluation is cheap. For the 16-D power-9 hybrid Duchon kernel a
+        // single exact `eval_design_triplet` costs tens of microseconds
+        // across its partial-fraction blocks, and at the large-scale
+        // conditional-PGS shape (n·k ≈ 480k pairs) this loop was ~15–20 s
+        // of single-threaded work per κ-trial — the dominant cost of the
+        // whole CTN stage-1 fit (#979; the cost model in the previous
+        // version of this comment assumed a cheap kernel). For large sweeps
+        // we therefore build a certified 1-D Chebyshev radial profile once
+        // (a few hundred exact evaluations, see `radial_profile`) from a
+        // distance-only pre-pass over the radius range, and answer per-pair
+        // queries with a Clenshaw contraction; out-of-range or uncertified
+        // cases fall back to the exact evaluator per pair.
+        let pair_radius = |i: usize, j: usize| -> f64 {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                // Streaming constructors set n=data.nrows(), n_knots=centers.nrows(),
+                // and require dim=data.ncols()=centers.ncols(); the loop ranges
+                // therefore keep both uget reads in-bounds.
+                let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) }; // SAFETY: bounds per the comment immediately above
+                r2 += metric_weights[a] * h * h;
+            }
+            r2.sqrt()
+        };
+        let profile = if total >= RADIAL_PROFILE_MIN_PAIRS {
+            let mut r_lo = f64::INFINITY;
+            let mut r_hi = 0.0_f64;
+            for i in 0..n {
+                for j in 0..n_knots {
+                    let r = pair_radius(i, j);
+                    if r > 0.0 {
+                        r_lo = r_lo.min(r);
+                        r_hi = r_hi.max(r);
+                    }
+                }
+            }
+            if r_lo.is_finite() && r_hi > r_lo {
+                radial_profile::RadialProfile::build(&self.radial_kind, r_lo, r_hi)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         for i in 0..n {
             let row_off = i * n_knots;
             for j in 0..n_knots {
-                let mut r2 = 0.0_f64;
-                for a in 0..dim {
-                    // Streaming constructors set n=data.nrows(), n_knots=centers.nrows(),
-                    // and require dim=data.ncols()=centers.ncols(); the loop ranges
-                    // therefore keep both uget reads in-bounds.
-                    let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) }; // SAFETY: bounds per the comment immediately above
-                    r2 += metric_weights[a] * h * h;
-                }
-                match self.radial_kind.eval_design_triplet(r2.sqrt()) {
+                let r = pair_radius(i, j);
+                let triplet = match profile.as_ref() {
+                    Some(profile) => profile.eval_or_exact(&self.radial_kind, r),
+                    None => self.radial_kind.eval_design_triplet(r),
+                };
+                match triplet {
                     Ok((pv, qv, tv)) => {
                         phi[row_off + j] = pv;
                         q[row_off + j] = qv;
@@ -7014,12 +7054,49 @@ fn build_aniso_design_psi_derivatives_shared(
     // as "radial scalar evaluation failed" hid both the cause and the
     // recoverability.
     let first_err: std::sync::Mutex<Option<BasisError>> = std::sync::Mutex::new(None);
+    // For large sweeps, replace per-pair exact radial evaluation with a
+    // certified 1-D Chebyshev profile built once from a distance-only
+    // pre-pass over the radius range (see `radial_profile`): at the 16-D
+    // power-9 hybrid Duchon configuration a single exact triplet costs tens
+    // of microseconds across its partial-fraction blocks, and this n·k
+    // sweep was the dominant per-κ-trial cost of large-scale fits (#979).
+    // Out-of-range radii and uncertified builds fall back to the exact
+    // evaluator per pair.
+    let profile = if nk >= RADIAL_PROFILE_MIN_PAIRS {
+        let mut r_lo = f64::INFINITY;
+        let mut r_hi = 0.0_f64;
+        let mut drb = vec![0.0; dim];
+        let mut cb = vec![0.0; dim];
+        for i in 0..n {
+            for a in 0..dim {
+                drb[a] = data[[i, a]];
+            }
+            for j in 0..k {
+                for a in 0..dim {
+                    cb[a] = centers[[j, a]];
+                }
+                let (r, _) = aniso_distance_and_components(&drb, &cb, eta);
+                if r > 0.0 {
+                    r_lo = r_lo.min(r);
+                    r_hi = r_hi.max(r);
+                }
+            }
+        }
+        if r_lo.is_finite() && r_hi > r_lo {
+            radial_profile::RadialProfile::build(&radial_kind, r_lo, r_hi)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     {
         let pp = SendPtr(phi_values.as_mut_ptr());
         let qp = SendPtr(q_values.as_mut_ptr());
         let tp = SendPtr(t_values.as_mut_ptr());
         let ap = SendPtr(axis_components.as_mut_ptr());
         let ferr = &first_err;
+        let profile_ref = profile.as_ref();
         (0..nc).into_par_iter().for_each(move |ci| {
             let start = ci * cs;
             let end = start.saturating_add(cs).min(n);
@@ -7034,7 +7111,11 @@ fn build_aniso_design_psi_derivatives_shared(
                         cb[a] = centers[[j, a]];
                     }
                     let (r, sv) = aniso_distance_and_components(&drb, &cb, eta);
-                    let (phi, q, t) = match radial_kind.eval_design_triplet(r) {
+                    let triplet = match profile_ref {
+                        Some(profile) => profile.eval_or_exact(&radial_kind, r),
+                        None => radial_kind.eval_design_triplet(r),
+                    };
+                    let (phi, q, t) = match triplet {
                         Ok(p) => p,
                         Err(e) => {
                             let mut slot = ferr.lock().unwrap_or_else(|p| p.into_inner());
@@ -7183,12 +7264,49 @@ fn build_scalar_design_psi_derivatives_shared(
     let cs = IMPLICIT_MATVEC_CHUNK_SIZE;
     let nc = n.div_ceil(cs);
     let first_err: std::sync::Mutex<Option<BasisError>> = std::sync::Mutex::new(None);
+    // Same certified radial-profile amortization as the per-axis sweep
+    // above: one distance-only pre-pass for the radius range, one profile
+    // build, Clenshaw per pair, exact fallback out of range (#979).
+    let pair_r = |i: usize, j: usize, drb: &mut [f64], cb: &mut [f64]| -> f64 {
+        if let Some(eta) = fixed_eta {
+            for a in 0..dim {
+                drb[a] = data[[i, a]];
+                cb[a] = centers[[j, a]];
+            }
+            aniso_distance_and_components(drb, cb, eta).0
+        } else {
+            stable_euclidean_norm((0..dim).map(|a| data[[i, a]] - centers[[j, a]]))
+        }
+    };
+    let profile = if nk >= RADIAL_PROFILE_MIN_PAIRS {
+        let mut r_lo = f64::INFINITY;
+        let mut r_hi = 0.0_f64;
+        let mut drb = vec![0.0; dim];
+        let mut cb = vec![0.0; dim];
+        for i in 0..n {
+            for j in 0..k {
+                let r = pair_r(i, j, &mut drb, &mut cb);
+                if r > 0.0 {
+                    r_lo = r_lo.min(r);
+                    r_hi = r_hi.max(r);
+                }
+            }
+        }
+        if r_lo.is_finite() && r_hi > r_lo {
+            radial_profile::RadialProfile::build(&radial_kind, r_lo, r_hi)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     {
         let pp = SendPtr(phi_values.as_mut_ptr());
         let qp = SendPtr(q_values.as_mut_ptr());
         let tp = SendPtr(t_values.as_mut_ptr());
         let ap = SendPtr(axis_components.as_mut_ptr());
         let ferr = &first_err;
+        let profile_ref = profile.as_ref();
         (0..nc).into_par_iter().for_each(move |ci| {
             let start = ci * cs;
             let end = start.saturating_add(cs).min(n);
@@ -7211,7 +7329,11 @@ fn build_scalar_design_psi_derivatives_shared(
                             stable_euclidean_norm((0..dim).map(|a| data[[i, a]] - centers[[j, a]]));
                         (r, r * r)
                     };
-                    let (phi, q, t) = match radial_kind.eval_design_triplet(r) {
+                    let triplet = match profile_ref {
+                        Some(profile) => profile.eval_or_exact(&radial_kind, r),
+                        None => radial_kind.eval_design_triplet(r),
+                    };
+                    let (phi, q, t) = match triplet {
                         Ok(p) => p,
                         Err(e) => {
                             let mut slot = ferr.lock().unwrap_or_else(|p| p.into_inner());
@@ -12953,6 +13075,14 @@ fn bessel_k1_small_series(x: f64) -> f64 {
 
 const DUCHON_DERIVATIVE_R_FLOOR_REL: f64 = 1e-5;
 const DUCHON_COLLISION_TAYLOR_REL: f64 = 1e-4;
+
+/// Minimum `(row, center)` pair count before a radial design sweep builds a
+/// certified [`radial_profile::RadialProfile`] instead of evaluating every
+/// pair exactly. The profile build costs a few hundred exact jet
+/// evaluations, so it only pays for itself when the sweep reuses it well
+/// beyond that; below the threshold the exact path keeps small fits
+/// bit-identical to the pre-profile behavior.
+const RADIAL_PROFILE_MIN_PAIRS: usize = 16_384;
 
 #[inline(always)]
 fn duchon_p_from_nullspace_order(order: DuchonNullspaceOrder) -> usize {
@@ -26381,6 +26511,7 @@ pub fn evaluate_bspline_fourth_derivative_scalar(
 /// Riesz kernel:  R_j^d(r) = F^{-1}{|ρ|^{-2j}}(r).
 /// Matérn block:  M_ℓ^d(r; κ) = F^{-1}{(|ρ|² + κ²)^{-ℓ}}(r).
 pub mod closed_form_penalty;
+pub mod radial_profile;
 
 // Unit tests are crucial for a mathematical library like this.
 #[cfg(test)]
@@ -26443,8 +26574,9 @@ mod tests {
                 continue;
             }
             let k_term = bessel_k_real_half_integer_or_integer(term.bessel_order.abs(), z)?;
-            value
-                .add(term.coeff * kappa.powi(term.kappa_power as i32) * r.powf(term.r_power) * k_term);
+            value.add(
+                term.coeff * kappa.powi(term.kappa_power as i32) * r.powf(term.r_power) * k_term,
+            );
         }
         Ok(value.sum())
     }
