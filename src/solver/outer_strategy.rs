@@ -5376,7 +5376,7 @@ impl OuterProblem {
                     );
                     let mut result =
                         OuterResult::new(rho, final_value, iterations, true, plan_used);
-                    result.rho_uncertainty_certificate = Some(compute_rho_uncertainty_certificate(
+                    result.rho_uncertainty_diagnostic = Some(compute_rho_uncertainty_diagnostic(
                         obj, &config, context, &result,
                     ));
                     return Ok(result);
@@ -5585,11 +5585,11 @@ pub struct OuterResult {
     /// when an audit probe failed to evaluate. Populated once by
     /// [`run_outer`] after the solver ladder returns, outside all hot loops.
     pub criterion_certificate: Option<CriterionCertificate>,
-    /// Post-fit PSIS certificate for whether smoothing-parameter uncertainty
-    /// makes plug-in REML/LAML intervals unreliable. Populated once by
-    /// [`run_outer`] when the exact rho Hessian is cheap enough to use.
-    pub rho_uncertainty_certificate:
-        Option<crate::inference::rho_uncertainty::RhoUncertaintyCertificate>,
+    /// Post-fit PSIS diagnostic for whether sampled smoothing-parameter weights
+    /// show evidence that plug-in REML/LAML intervals are unreliable. Populated
+    /// once by [`run_outer`] when the exact rho Hessian is cheap enough to use.
+    pub rho_uncertainty_diagnostic:
+        Option<crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic>,
 }
 
 impl OuterResult {
@@ -5612,7 +5612,7 @@ impl OuterResult {
             operator_trust_radius: None,
             operator_stop_reason: None,
             criterion_certificate: None,
-            rho_uncertainty_certificate: None,
+            rho_uncertainty_diagnostic: None,
         }
     }
 
@@ -5945,12 +5945,12 @@ fn audit_first_order_optimality(
     Some(certificate)
 }
 
-fn compute_rho_uncertainty_certificate(
+fn compute_rho_uncertainty_diagnostic(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     context: &str,
     result: &OuterResult,
-) -> crate::inference::rho_uncertainty::RhoUncertaintyCertificate {
+) -> crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic {
     let cap = obj.capability();
     let layout = cap.theta_layout();
     let rho_dim = layout.rho_dim();
@@ -5959,10 +5959,10 @@ fn compute_rho_uncertainty_certificate(
         problem_size: config.rho_uncertainty_problem_size,
     };
     if let Err(reason) = crate::inference::rho_uncertainty::cost_gate_allows(rho_dim, gate) {
-        return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(reason, 0);
+        return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(reason, 0);
     }
     if result.rho.len() != layout.n_params {
-        return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(
+        return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
             format!(
                 "final outer point length {} does not match objective dimension {}",
                 result.rho.len(),
@@ -5975,7 +5975,7 @@ fn compute_rho_uncertainty_certificate(
     let final_eval = match obj.eval_with_order(&result.rho, OuterEvalOrder::ValueGradientHessian) {
         Ok(eval) => eval,
         Err(err) => {
-            return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(
+            return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
                 format!("final exact Hessian evaluation failed: {err}"),
                 1,
             );
@@ -5984,20 +5984,20 @@ fn compute_rho_uncertainty_certificate(
     let hessian = match final_eval.hessian.materialize_dense() {
         Ok(Some(hessian)) => hessian,
         Ok(None) => {
-            return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(
+            return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
                 "exact outer Hessian unavailable at fitted rho",
                 1,
             );
         }
         Err(message) => {
-            return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(
+            return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
                 format!("exact outer Hessian materialization failed: {message}"),
                 1,
             );
         }
     };
     if hessian.nrows() != layout.n_params || hessian.ncols() != layout.n_params {
-        return crate::inference::rho_uncertainty::RhoUncertaintyCertificate::skipped(
+        return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
             format!(
                 "exact outer Hessian shape {}x{} does not match objective dimension {}",
                 hessian.nrows(),
@@ -6017,7 +6017,7 @@ fn compute_rho_uncertainty_certificate(
     let theta_hat = result.rho.clone();
     let cost_hat = final_eval.cost;
     let final_beta_hint = final_eval.inner_beta_hint.clone();
-    let certificate = {
+    let diagnostic = {
         let mut served_hat_cost = false;
         let mut criterion = |rho: &Array1<f64>| -> Option<f64> {
             let is_hat = rho.len() == rho_hat.len()
@@ -6040,7 +6040,7 @@ fn compute_rho_uncertainty_certificate(
             }
             obj.eval_cost(&theta).ok()
         };
-        crate::inference::rho_uncertainty::rho_uncertainty_certificate(
+        crate::inference::rho_uncertainty::rho_uncertainty_diagnostic(
             &rho_hat,
             &hessian_rho,
             gate,
@@ -6051,31 +6051,31 @@ fn compute_rho_uncertainty_certificate(
         && let Err(err) = obj.seed_inner_state(beta)
     {
         log::debug!(
-            "[RHO uncertainty] {context}: final inner-state restore skipped after certificate ({err})"
+            "[RHO uncertainty] {context}: final inner-state restore skipped after diagnostic ({err})"
         );
     }
-    match &certificate.verdict {
-        crate::inference::rho_uncertainty::RhoUncertaintyVerdict::CertifiedAdequate => {
+    match &diagnostic.status {
+        crate::inference::rho_uncertainty::RhoUncertaintyStatus::NoEvidenceOfHeavyTails => {
             log::info!(
-                "[RHO uncertainty] {context}: certified adequate k_hat={:.3} evals={}",
-                certificate.k_hat.unwrap_or(f64::NAN),
-                certificate.n_evaluations,
+                "[RHO uncertainty] {context}: no heavy-tail evidence at sampled rho proposals k_hat={:.3} evals={}",
+                diagnostic.k_hat.unwrap_or(f64::NAN),
+                diagnostic.n_evaluations,
             );
         }
-        crate::inference::rho_uncertainty::RhoUncertaintyVerdict::RhoUncertaintyMatters {
+        crate::inference::rho_uncertainty::RhoUncertaintyStatus::HeavyTailsDetected {
             k_hat,
         } => {
             log::warn!(
-                "[RHO uncertainty] {context}: rho uncertainty matters k_hat={:.3} evals={}",
+                "[RHO uncertainty] {context}: heavy rho-importance tail detected k_hat={:.3} evals={}",
                 k_hat,
-                certificate.n_evaluations,
+                diagnostic.n_evaluations,
             );
         }
-        crate::inference::rho_uncertainty::RhoUncertaintyVerdict::Skipped { reason } => {
+        crate::inference::rho_uncertainty::RhoUncertaintyStatus::Skipped { reason } => {
             log::info!("[RHO uncertainty] {context}: skipped ({reason})");
         }
     }
-    certificate
+    diagnostic
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6120,7 +6120,7 @@ fn run_outer(
     // is warm-start residue O(h) from the optimum — every caller recovers
     // its fitted state from `result.rho`, not from last-eval residue.
     result.criterion_certificate = audit_first_order_optimality(obj, config, context, &result);
-    result.rho_uncertainty_certificate = Some(compute_rho_uncertainty_certificate(
+    result.rho_uncertainty_diagnostic = Some(compute_rho_uncertainty_diagnostic(
         obj, config, context, &result,
     ));
     Ok(result)
@@ -8157,7 +8157,7 @@ mod tests {
     }
 
     #[test]
-    fn rho_uncertainty_certificate_does_not_change_outer_solution() {
+    fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         let center = array![0.25];
         let seed_config = crate::seeding::SeedConfig {
             max_seeds: 1,
@@ -8172,7 +8172,7 @@ mod tests {
             .with_problem_size(8, 3);
         let config = problem.config();
 
-        let mut without_certificate = problem.build_objective(
+        let mut without_diagnostic = problem.build_objective(
             (),
             {
                 let center = center.clone();
@@ -8196,7 +8196,7 @@ mod tests {
             None::<fn(&mut ())>,
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
-        let mut with_certificate = problem.build_objective(
+        let mut with_diagnostic = problem.build_objective(
             (),
             {
                 let center = center.clone();
@@ -8222,22 +8222,22 @@ mod tests {
         );
 
         let baseline = run_outer_uncertified(
-            &mut without_certificate,
+            &mut without_diagnostic,
             &config,
-            "rho-certificate-baseline",
+            "rho-diagnostic-baseline",
         )
         .expect("baseline outer run");
-        let certified = run_outer(&mut with_certificate, &config, "rho-certificate-certified")
-            .expect("certified outer run");
+        let diagnosed = run_outer(&mut with_diagnostic, &config, "rho-diagnostic-run")
+            .expect("diagnostic outer run");
 
-        assert_eq!(baseline.rho, certified.rho);
+        assert_eq!(baseline.rho, diagnosed.rho);
         assert_eq!(
             baseline.final_value.to_bits(),
-            certified.final_value.to_bits()
+            diagnosed.final_value.to_bits()
         );
-        assert_eq!(baseline.iterations, certified.iterations);
-        assert_eq!(baseline.final_grad_norm, certified.final_grad_norm);
-        assert!(certified.rho_uncertainty_certificate.is_some());
+        assert_eq!(baseline.iterations, diagnosed.iterations);
+        assert_eq!(baseline.final_grad_norm, diagnosed.final_grad_norm);
+        assert!(diagnosed.rho_uncertainty_diagnostic.is_some());
     }
 
     /// The desync bug genus (#748/#752/#901): the gradient path optimizes a
