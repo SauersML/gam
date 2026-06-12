@@ -357,6 +357,12 @@ pub fn measure_jet_center_masses(
 ///
 /// with `(G + τI)⁻¹` realized through the symmetric eigendecomposition
 /// (pseudo-inverse with relative threshold when `τ = 0`).
+///
+/// The outer sum over centers is coarsened per scale to a deterministic
+/// ε/2-net with nearest-member mass aggregation (the outer Riemann sum needs
+/// resolution ε, not the center-spacing floor), so each scale's cost sits at
+/// its own level and the band totals ~O(m²·d) instead of O(L·m³). The inner
+/// (local-fit) quadrature always uses the full center set.
 pub fn measure_jet_energy_form(
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
@@ -403,10 +409,46 @@ pub fn measure_jet_energy_form(
             let cutoff2 = (MEASURE_JET_PROFILE_CUTOFF * eps) * (MEASURE_JET_PROFILE_CUTOFF * eps);
             let inv_two_eps2 = 1.0 / (2.0 * eps * eps);
             let scale_weight = band.log_step * eps.powf(-2.0 * order_s);
+            // Outer-quadrature coarsening: the outer integral ∫·dμ(x) at
+            // scale ε needs quadrature resolution ε, not the center-spacing
+            // floor. A greedy ε/2-net over the centers (fixed index order —
+            // deterministic) carries the outer points, with every center's
+            // mass aggregated to its nearest net member (lowest-index tie
+            // break). The inner integral keeps the FULL center quadrature,
+            // so the local residual identities (exact constant
+            // annihilation, PSD) are untouched; only the outer Riemann sum
+            // is matched to the resolution it integrates at. This keeps
+            // each scale's cost at its own level — the band totals
+            // ~O(m²·d) instead of O(L·m³).
+            let net_radius2 = 0.25 * eps * eps;
+            let mut outer: Vec<usize> = Vec::new();
             for i in 0..m {
                 if masses[i] <= 0.0 {
                     continue;
                 }
+                let covered = outer.iter().any(|&o| dist2[(i, o)] <= net_radius2);
+                if !covered {
+                    outer.push(i);
+                }
+            }
+            let mut net_mass = vec![0.0_f64; m];
+            for i in 0..m {
+                if masses[i] <= 0.0 {
+                    continue;
+                }
+                let mut best = f64::INFINITY;
+                let mut best_o = usize::MAX;
+                for &o in &outer {
+                    if dist2[(i, o)] < best {
+                        best = dist2[(i, o)];
+                        best_o = o;
+                    }
+                }
+                if best_o != usize::MAX {
+                    net_mass[best_o] += masses[i];
+                }
+            }
+            for &i in &outer {
                 // Local neighbor set (always includes i itself).
                 let mut idx: Vec<usize> = Vec::new();
                 for j in 0..m {
@@ -478,7 +520,7 @@ pub fn measure_jet_energy_form(
                 }
                 let m_inv = vm.dot(&evecs.t());
                 let bm = b.dot(&m_inv);
-                let coef = scale_weight * masses[i] * q.powf(1.0 - 2.0 * alpha);
+                let coef = scale_weight * net_mass[i] * q.powf(1.0 - 2.0 * alpha);
                 // Scatter-add coef · (W − w·wᵀ/q − B·M·Bᵀ/q) into Q.
                 for (a, &ja) in idx.iter().enumerate() {
                     let bma = bm.row(a);
