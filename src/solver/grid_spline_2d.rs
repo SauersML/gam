@@ -161,7 +161,7 @@ fn basis_row(axes: &[Axis; 2], m_axis: usize, x1: f64, x2: f64) -> ([usize; 16],
 /// Dense lower-Cholesky in place (row-major `p×p`); returns the exact
 /// `log det` (twice the log of the pivot products). The strict upper triangle
 /// is zeroed so the buffer is exactly `L` afterwards.
-fn cholesky_logdet(a: &mut [f64], p: usize) -> Result<f64, String> {
+pub(crate) fn cholesky_logdet(a: &mut [f64], p: usize) -> Result<f64, String> {
     let mut logdet = 0.0;
     for j in 0..p {
         let mut s = a[j * p + j];
@@ -193,7 +193,7 @@ fn cholesky_logdet(a: &mut [f64], p: usize) -> Result<f64, String> {
 }
 
 /// Solve `L Lᵀ x = b` from the stored lower factor.
-fn chol_solve(l: &[f64], p: usize, b: &[f64]) -> Vec<f64> {
+pub(crate) fn chol_solve(l: &[f64], p: usize, b: &[f64]) -> Vec<f64> {
     let mut z = b.to_vec();
     for i in 0..p {
         let mut s = z[i];
