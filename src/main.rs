@@ -9139,8 +9139,6 @@ fn build_model_summary(
             ref_df,
             chi_sq: chi_sq_opt,
             pvalue,
-            pvalue_corrected: None,
-            bartlett_factor: None,
             continuous_order: None,
             basis_note: None,
         });
@@ -9169,10 +9167,6 @@ fn build_model_summary(
                     } else {
                         SmoothTestScale::Known
                     },
-                    // The summary path does not propagate the per-row family
-                    // cumulant substrate needed for the Lawley shift; report
-                    // first-order p only (#939).
-                    known_scale_lr_mean_shift: None,
                 })
             })
         } else {
@@ -9184,8 +9178,6 @@ fn build_model_summary(
             .map(|test| test.ref_df)
             .unwrap_or(edf.max(0.0));
         let pvalue = smooth_test.as_ref().map(|test| test.p_value);
-        let pvalue_corrected = smooth_test.as_ref().and_then(|test| test.p_value_corrected);
-        let bartlett_factor = smooth_test.as_ref().and_then(|test| test.bartlett_factor);
         let continuous_order = if k == 3
             && term_penalty_start + 2 < fit.lambdas.len()
             && term_penalty_start + 2 < design.penaltyinfo.len()
@@ -9235,8 +9227,6 @@ fn build_model_summary(
             ref_df,
             chi_sq: chi_sq_opt,
             pvalue,
-            pvalue_corrected,
-            bartlett_factor,
             continuous_order,
             basis_note,
         });
