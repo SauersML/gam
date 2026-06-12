@@ -567,6 +567,8 @@ const SAE_ATOM_COLLAPSE_RESEED_BUDGET: usize = 1;
 /// collapse and must enter the #976 CollapseEvent ledger.
 const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.10;
 const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
+const SAE_PRISTINE_SEED_EV_RETAIN_FLOOR: f64 = 0.95;
+const SAE_FINAL_EV_DEGRADATION_TOL: f64 = 1.0e-3;
 const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
 
 /// Reactivation band width (in units of the JumpReLU temperature `τ`) below the
@@ -13255,6 +13257,42 @@ impl SaeManifoldTerm {
     }
 }
 
+fn reconstruction_explained_variance(
+    target: ArrayView2<'_, f64>,
+    fitted: ArrayView2<'_, f64>,
+) -> Option<f64> {
+    if target.dim() != fitted.dim() {
+        return None;
+    }
+    let (n, p) = target.dim();
+    if n == 0 || p == 0 {
+        return None;
+    }
+    let mut means = vec![0.0_f64; p];
+    for col in 0..p {
+        let mut acc = 0.0;
+        for row in 0..n {
+            acc += target[[row, col]];
+        }
+        means[col] = acc / n as f64;
+    }
+    let mut ssr = 0.0_f64;
+    let mut sst = 0.0_f64;
+    for row in 0..n {
+        for col in 0..p {
+            let residual = target[[row, col]] - fitted[[row, col]];
+            ssr += residual * residual;
+            let centered = target[[row, col]] - means[col];
+            sst += centered * centered;
+        }
+    }
+    if ssr.is_finite() && sst.is_finite() && sst > f64::MIN_POSITIVE {
+        Some(1.0 - ssr / sst)
+    } else {
+        None
+    }
+}
+
 /// Outer REML objective for the SAE-manifold term.
 ///
 /// Routes the SAE's smoothing hyperparameters ρ
@@ -13332,6 +13370,7 @@ impl SaeManifoldOuterObjective {
             target,
             registry,
             current_rho,
+            baseline_rho,
             inner_max_iter,
             learning_rate,
             ridge_ext_coord,
@@ -13339,6 +13378,9 @@ impl SaeManifoldOuterObjective {
             last_loss,
             ..
         } = self;
+        let pristine_seed_term = baseline_term.clone();
+        let pristine_seed_rho = baseline_rho.clone();
+        let mut fitted_rho = current_rho;
         let loss = last_loss.unwrap_or_else(|| SaeManifoldLoss {
             data_fit: 0.0,
             assignment_sparsity: 0.0,
@@ -13360,8 +13402,8 @@ impl SaeManifoldOuterObjective {
         // optimum), so this is a no-op there and never weakens the criterion;
         // for a drifted fit it recovers the routed solution the seed reached.
         let settled_objective =
-            term.penalized_objective_total(target.view(), &current_rho, registry.as_ref(), 1.0);
-        let mut rho_seed = current_rho.clone();
+            term.penalized_objective_total(target.view(), &fitted_rho, registry.as_ref(), 1.0);
+        let mut rho_seed = fitted_rho.clone();
         let seed_solve = match baseline_term.streaming_plan().admitted_or_error(
             baseline_term.n_obs(),
             baseline_term.output_dim(),
@@ -13397,7 +13439,7 @@ impl SaeManifoldOuterObjective {
         if let (Ok(settled_total), Ok(_)) = (&settled_objective, &seed_solve) {
             let seed_total = baseline_term.penalized_objective_total(
                 target.view(),
-                &current_rho,
+                &fitted_rho,
                 registry.as_ref(),
                 1.0,
             );
@@ -13405,12 +13447,27 @@ impl SaeManifoldOuterObjective {
                 seed_won = seed_total.is_finite() && seed_total < *settled_total;
             }
         }
-        let (mut fitted, fitted_loss) = if seed_won {
+        let (mut fitted, mut fitted_loss) = if seed_won {
             let seed_loss = seed_solve.expect("seed_won implies seed_solve is Ok");
             (baseline_term, seed_loss)
         } else {
             (term, loss)
         };
+        if let (Ok(seed_fit), Ok(returned_fit)) =
+            (pristine_seed_term.try_fitted(), fitted.try_fitted())
+            && let (Some(seed_ev), Some(returned_ev)) = (
+                reconstruction_explained_variance(target.view(), seed_fit.view()),
+                reconstruction_explained_variance(target.view(), returned_fit.view()),
+            )
+            && seed_ev >= SAE_PRISTINE_SEED_EV_RETAIN_FLOOR
+            && returned_ev < SAE_PRISTINE_SEED_EV_RETAIN_FLOOR
+            && returned_ev + SAE_FINAL_EV_DEGRADATION_TOL < seed_ev
+            && let Ok(seed_loss) = pristine_seed_term.loss(target.view(), &pristine_seed_rho)
+        {
+            fitted = pristine_seed_term;
+            fitted_rho = pristine_seed_rho;
+            fitted_loss = seed_loss;
+        }
         // #1019 stage 1 — the post-fit assembly seam: canonicalize every
         // eligible d = 1 atom's chart to its arc-length (unit-speed)
         // representative BEFORE the fitted term is handed to the payload /
@@ -13420,12 +13477,12 @@ impl SaeManifoldOuterObjective {
         // an error here is a refused canonicalization, not a broken fit.
         if let Err(err) = fitted.canonicalize_unit_speed_charts_post_fit(
             target.view(),
-            &current_rho,
+            &fitted_rho,
             registry.as_ref(),
         ) {
             log::debug!("into_fitted: unit-speed chart canonicalization refused: {err}");
         }
-        (fitted, current_rho, fitted_loss)
+        (fitted, fitted_rho, fitted_loss)
     }
 
     /// First-order optimality certificate for this fit (#934).
