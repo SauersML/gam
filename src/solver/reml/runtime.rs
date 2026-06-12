@@ -5467,6 +5467,7 @@ impl<'a> RemlState<'a> {
             persistent_latent_values_cache: RwLock::new(PersistentLatentValuesCache::default()),
             analytic_penalty_registry_fingerprint: 0,
             persistent_warm_start_loaded: AtomicBool::new(false),
+            persistent_warm_start_store_suppression: AtomicUsize::new(0),
         })
     }
 
@@ -5519,6 +5520,8 @@ impl<'a> RemlState<'a> {
         *self.persistent_warm_start_key.write().unwrap() = None;
         self.persistent_warm_start_loaded
             .store(false, Ordering::Relaxed);
+        self.persistent_warm_start_store_suppression
+            .store(0, Ordering::Relaxed);
         self.cache_manager.clear_eval_and_factor_caches();
         self.cache_manager.pirls_cache.write().unwrap().clear();
         // The new surface has a different design / penalty system /
@@ -6410,6 +6413,13 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return;
         }
+        if self
+            .persistent_warm_start_store_suppression
+            .load(Ordering::Relaxed)
+            > 0
+        {
+            return;
+        }
         let Some(key) = self.persistent_warm_start_cache_key() else {
             return;
         };
@@ -6449,6 +6459,20 @@ impl<'a> RemlState<'a> {
         if let Err(err) = store_record(&record) {
             log::warn!("[warm-start-cache] failed to persist warm start: {err}");
         }
+    }
+
+    pub(crate) fn without_persistent_warm_start_store<T>(&self, f: impl FnOnce() -> T) -> T {
+        struct StoreSuppressionGuard<'a>(&'a AtomicUsize);
+        impl Drop for StoreSuppressionGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        self.persistent_warm_start_store_suppression
+            .fetch_add(1, Ordering::Relaxed);
+        let _guard = StoreSuppressionGuard(&self.persistent_warm_start_store_suppression);
+        f()
     }
 
     /// Predict β at `new_rho` via the implicit-function-theorem first-order
