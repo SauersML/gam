@@ -3,13 +3,11 @@
 //! Extracted from `gamlss.rs` (issue #780); this module now owns the
 //! dispersion-channel joint-curvature corrections.
 
+use super::weighted_design_products::{mirror_upper_to_lower, xt_diag_x_design, xt_diag_y_design};
 use super::{
     BlockwiseTermFitResult, GamlssLambdaLayout, LOCATION_SCALE_N_OUTPUTS,
     LocationScaleFamilyBuilder, build_location_scale_block, fit_location_scale_terms,
     identity_penalty, solve_penalizedweighted_projection,
-};
-use super::weighted_design_products::{
-    mirror_upper_to_lower, xt_diag_x_design, xt_diag_y_design,
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -184,21 +182,8 @@ fn dispersion_beta_nll_tower(
     -loglik * wi
 }
 
-#[cfg(test)]
-fn beta_fisher_cross_info_mu_phi(mu: f64, phi: f64) -> f64 {
-    let a = mu * phi;
-    let b = (1.0 - mu) * phi;
-    phi * (mu * crate::families::jet_tower::trigamma_derivative_stack(a)[0]
-        - (1.0 - mu) * crate::families::jet_tower::trigamma_derivative_stack(b)[0])
-}
-
 #[inline]
-fn beta_observed_cross_weight_eta(
-    yi: f64,
-    mu: f64,
-    phi: f64,
-    wi: f64,
-) -> f64 {
+fn beta_observed_cross_weight_eta(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
     let q = (mu * (1.0 - mu)).max(1e-12);
     let tower = dispersion_beta_nll_tower(yi, mu, phi, wi);
     q * phi * tower.h[0][1]
@@ -527,13 +512,7 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         };
 
         let cross_weights = Array1::from_shape_fn(n, |i| {
-            dispersion_row_cross_weight(
-                self.kind,
-                self.y[i],
-                eta_mu[i],
-                eta_d[i],
-                self.weights[i],
-            )
+            dispersion_row_cross_weight(self.kind, self.y[i], eta_mu[i], eta_d[i], self.weights[i])
         });
         let mean_spec = &specs[Self::BLOCK_MEAN];
         let disp_spec = &specs[Self::BLOCK_DISP];
@@ -566,8 +545,7 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         let total = p_mean + p_disp;
         let mut h = Array2::<f64>::zeros((total, total));
         h.slice_mut(s![0..p_mean, 0..p_mean]).assign(&h_mean);
-        h.slice_mut(s![0..p_mean, p_mean..total])
-            .assign(&h_cross);
+        h.slice_mut(s![0..p_mean, p_mean..total]).assign(&h_cross);
         h.slice_mut(s![p_mean..total, p_mean..total])
             .assign(&h_disp);
         mirror_upper_to_lower(&mut h);
@@ -880,6 +858,13 @@ pub fn fit_dispersion_glm_location_scale_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn beta_fisher_cross_info_mu_phi(mu: f64, phi: f64) -> f64 {
+        let a = mu * phi;
+        let b = (1.0 - mu) * phi;
+        phi * (mu * crate::families::jet_tower::trigamma_derivative_stack(a)[0]
+            - (1.0 - mu) * crate::families::jet_tower::trigamma_derivative_stack(b)[0])
+    }
 
     fn assert_close(label: &str, got: f64, want: f64, tol: f64) {
         assert!(

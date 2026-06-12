@@ -324,6 +324,8 @@ fn bessel_k_temme(mu: f64, x: f64) -> (f64, f64) {
             return (sum, sum1 * 2.0 / x);
         }
     }
+    // SAFETY: the selected Temme branch must converge on the `bessel_k_pair`
+    // domain; emitting any finite substitute would corrupt the penalty matrix.
     panic!("bessel_k Temme series failed to converge for mu={mu} x={x}");
 }
 
@@ -361,6 +363,8 @@ fn bessel_k_steed_cf2(mu: f64, x: f64) -> (f64, f64) {
             return (rkmu, rk1);
         }
     }
+    // SAFETY: the selected Steed CF2 branch must converge on the `bessel_k_pair`
+    // domain; emitting any finite substitute would corrupt the penalty matrix.
     panic!("bessel_k Steed CF2 failed to converge for mu={mu} x={x}");
 }
 
@@ -2756,8 +2760,7 @@ mod tests {
         for nu in [0.3, 1.7, 6.2, 11.4] {
             for x in [0.5, 1.9, 2.1, 3.0, 8.0, 25.0] {
                 let k_next = bessel_k(nu + 1.0, x);
-                let residual =
-                    k_next - bessel_k(nu - 1.0, x) - (2.0 * nu / x) * bessel_k(nu, x);
+                let residual = k_next - bessel_k(nu - 1.0, x) - (2.0 * nu / x) * bessel_k(nu, x);
                 assert!(
                     residual.abs() <= 1e-10 * k_next.abs(),
                     "nu={nu} x={x} residual={residual} k_next={k_next}"
