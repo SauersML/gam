@@ -79,6 +79,12 @@ const REML_SECOND_ORDER_RHO_CAP: usize = 8;
 /// directly from the seed lattice; the optimizer's own line search owns
 /// globalization.
 const REML_CONTINUATION_PREWARM_RHO_CAP: usize = 4;
+/// Above this rho dimension, startup work must be linear in "one real solve",
+/// not "rank a seed lattice with capped PIRLS solves". The heuristic seed is
+/// deterministic and already centered on the current penalty scale; BFGS/ARC
+/// globalizes from there. Low-dimensional classic smooths keep screening
+/// because the extra probes are cheap and sometimes useful.
+const REML_SEED_SCREENING_RHO_CAP: usize = 4;
 
 /// Programmatic prior mean for a coefficient penalty block.
 ///
@@ -3543,6 +3549,20 @@ where
 
 fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedConfig {
     let gaussian = matches!(link, LinkFunction::Identity);
+    if k >= REML_SEED_SCREENING_RHO_CAP {
+        return SeedConfig {
+            bounds: (-12.0, 12.0),
+            max_seeds: 1,
+            seed_budget: 1,
+            risk_profile: if gaussian {
+                SeedRiskProfile::Gaussian
+            } else {
+                SeedRiskProfile::GeneralizedLinear
+            },
+            screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
+            num_auxiliary_trailing: 0,
+        };
+    }
     SeedConfig {
         bounds: (-12.0, 12.0),
         max_seeds: if gaussian && k <= 4 {
@@ -4129,6 +4149,10 @@ where
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
         let mut reml_seed_config_mix = reml_seed_config;
         reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
+        if theta_dim >= REML_SEED_SCREENING_RHO_CAP {
+            reml_seed_config_mix.max_seeds = 1;
+            reml_seed_config_mix.seed_budget = 1;
+        }
         use crate::solver::outer_strategy::{
             DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
         };
@@ -8047,6 +8071,17 @@ mod estimate_policy_tests {
             cfg.seed_budget, 1,
             "standard Gaussian REML should fully optimize the best screened start by default"
         );
+    }
+
+    #[test]
+    fn high_dimensional_external_reml_skips_seed_screening() {
+        let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, LinkFunction::Identity);
+        assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
+        assert_eq!(
+            cfg.max_seeds, 1,
+            "moderate/high-dimensional REML should start from the deterministic seed directly"
+        );
+        assert_eq!(cfg.seed_budget, 1);
     }
 
     #[test]
