@@ -49,7 +49,9 @@ pub use measure_jet_moments::{
     MeasureJetJetStats, MeasureJetMomentTable, accumulate_moment_table, jet_sufficient_stats,
     merge_moment_tables, recenter_moment_table,
 };
-pub use measure_jet_predict::measure_jet_extrapolation_variance;
+pub use measure_jet_predict::{
+    MeasureJetExtrapolationSpectrum, measure_jet_extrapolation_variance,
+};
 pub use measure_jet_smooth::{
     MeasureJetBand, MeasureJetBasisSpec, MeasureJetEnergyJets, MeasureJetFrozenQuadrature,
     MeasureJetIdentifiability, build_measure_jet_basis, build_measure_jet_basis_psi_derivatives,
@@ -2559,8 +2561,9 @@ pub enum BasisMetadata {
     /// REALIZED barycenter nodes; `order_s` stores the spec's order sentinel
     /// verbatim as the mode marker (0.0 = per-level/spectral, > 0 = fused
     /// pin — persisting a realized default would flip the rebuilt mode). The
-    /// penalty depends on the FIT data through `masses` and the realized
-    /// `eps_band`, so both are persisted and replayed verbatim by
+    /// penalty depends on the FIT data through `masses`, the realized
+    /// `eps_band`, the support anchors, and the normalization scales, so all
+    /// are persisted and replayed verbatim by
     /// predict-time (and per-ψ-trial) rebuilds — recomputing either from
     /// predict rows would change the penalty the coefficients were estimated
     /// under. `constraint_transform` is the composed `z · z_parametric`
@@ -2574,6 +2577,10 @@ pub enum BasisMetadata {
         alpha: f64,
         tau0: f64,
         masses: Array1<f64>,
+        support_means: Vec<f64>,
+        penalty_normalization_scales: Vec<f64>,
+        raw_penalty_normalization_scales: Vec<f64>,
+        fused_penalty_normalization_scale: Option<f64>,
         constraint_transform: Option<Array2<f64>>,
     },
     Matern {

@@ -1034,6 +1034,32 @@ fn default_random_effect_penalized() -> bool {
     true
 }
 
+fn validate_measure_jet_positive_vec_len(
+    label: &str,
+    term_name: &str,
+    field: &str,
+    values: &[f64],
+    expected: usize,
+) -> Result<(), String> {
+    if values.len() != expected {
+        return Err(SmoothError::invalid_config(format!(
+            "{label} term '{term_name}' frozen MeasureJet {field} has length {}, expected {expected}",
+            values.len()
+        ))
+        .into());
+    }
+    if values
+        .iter()
+        .any(|value| !(value.is_finite() && *value > 0.0))
+    {
+        return Err(SmoothError::invalid_config(format!(
+            "{label} term '{term_name}' frozen MeasureJet {field} values must be positive and finite"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TermCollectionSpec {
     pub linear_terms: Vec<LinearTermSpec>,
@@ -1260,9 +1286,19 @@ impl TermCollectionSpec {
                     }
                 }
                 SmoothBasisSpec::MeasureJet { spec, .. } => {
-                    if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
+                    let centers = match &spec.center_strategy {
+                        CenterStrategy::UserProvided(centers) => centers,
+                        _ => {
+                            return Err(SmoothError::invalid_config(format!(
+                                "{label} term '{}' is not frozen: MeasureJet centers must be UserProvided",
+                                st.name
+                            ))
+                            .into());
+                        }
+                    };
+                    if centers.nrows() == 0 {
                         return Err(SmoothError::invalid_config(format!(
-                            "{label} term '{}' is not frozen: MeasureJet centers must be UserProvided",
+                            "{label} term '{}' is not frozen: MeasureJet centers are empty",
                             st.name
                         ))
                         .into());
@@ -1274,14 +1310,117 @@ impl TermCollectionSpec {
                         ))
                         .into());
                     }
-                    // Exact replay needs the fit-data penalty quadrature
-                    // (masses + band contract: `BasisMetadata::MeasureJet`).
-                    if spec.frozen_quadrature.is_none() {
+                    // Exact replay needs the fit-data penalty quadrature and
+                    // normalization payload (`BasisMetadata::MeasureJet`).
+                    let frozen = spec.frozen_quadrature.as_ref().ok_or_else(|| {
+                        SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: MeasureJet frozen_quadrature payload is missing",
+                            st.name
+                        ))
+                    })?;
+                    if frozen.masses.len() != centers.nrows() {
                         return Err(SmoothError::invalid_config(format!(
-                            "{label} term '{}' is not frozen: MeasureJet frozen_quadrature (masses + band) is missing",
+                            "{label} term '{}' frozen MeasureJet has {} masses for {} centers",
+                            st.name,
+                            frozen.masses.len(),
+                            centers.nrows()
+                        ))
+                        .into());
+                    }
+                    let total_mass = frozen.masses.sum();
+                    if frozen
+                        .masses
+                        .iter()
+                        .any(|mass| !(mass.is_finite() && *mass >= 0.0))
+                        || !(total_mass.is_finite() && total_mass > 0.0)
+                    {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' frozen MeasureJet masses must be finite, nonnegative, and have positive total mass",
                             st.name
                         ))
                         .into());
+                    }
+                    let n_levels = frozen.eps_band.len();
+                    if n_levels == 0
+                        || frozen
+                            .eps_band
+                            .iter()
+                            .any(|eps| !(eps.is_finite() && *eps > 0.0))
+                    {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' frozen MeasureJet eps_band must be nonempty, finite, and positive",
+                            st.name
+                        ))
+                        .into());
+                    }
+                    for (idx, pair) in frozen.eps_band.windows(2).enumerate() {
+                        if pair[1] <= pair[0] {
+                            return Err(SmoothError::invalid_config(format!(
+                                "{label} term '{}' frozen MeasureJet eps_band is not strictly ascending at {idx}: {} then {}",
+                                st.name,
+                                pair[0],
+                                pair[1]
+                            ))
+                            .into());
+                        }
+                    }
+                    validate_measure_jet_positive_vec_len(
+                        label,
+                        &st.name,
+                        "support_means",
+                        &frozen.support_means,
+                        n_levels,
+                    )?;
+                    let per_level = spec.order_s == 0.0;
+                    if per_level {
+                        validate_measure_jet_positive_vec_len(
+                            label,
+                            &st.name,
+                            "penalty_normalization_scales",
+                            &frozen.penalty_normalization_scales,
+                            n_levels,
+                        )?;
+                        validate_measure_jet_positive_vec_len(
+                            label,
+                            &st.name,
+                            "raw_penalty_normalization_scales",
+                            &frozen.raw_penalty_normalization_scales,
+                            n_levels,
+                        )?;
+                        if frozen.fused_penalty_normalization_scale.is_some() {
+                            return Err(SmoothError::invalid_config(format!(
+                                "{label} term '{}' per-level MeasureJet must not carry a fused penalty normalization scale",
+                                st.name
+                            ))
+                            .into());
+                        }
+                    } else {
+                        if !frozen.penalty_normalization_scales.is_empty()
+                            || !frozen.raw_penalty_normalization_scales.is_empty()
+                        {
+                            return Err(SmoothError::invalid_config(format!(
+                                "{label} term '{}' fused MeasureJet must not carry per-level penalty normalization scales",
+                                st.name
+                            ))
+                            .into());
+                        }
+                        match frozen.fused_penalty_normalization_scale {
+                            Some(scale) if scale.is_finite() && scale > 0.0 => {}
+                            Some(scale) => {
+                                return Err(SmoothError::invalid_config(format!(
+                                    "{label} term '{}' fused MeasureJet penalty normalization scale must be positive and finite, got {scale}",
+                                    st.name
+                                ))
+                                .into());
+                            }
+                            None => {
+                                return Err(SmoothError::invalid_config(format!(
+                                    "{label} term '{}' fused MeasureJet is missing its penalty normalization scale",
+                                    st.name
+                                ))
+                                .into());
+                            }
+                        }
                     }
                 }
                 SmoothBasisSpec::Matern { spec, .. } => {
@@ -9732,6 +9871,10 @@ fn with_identifiability_transform(
             alpha,
             tau0,
             masses,
+            support_means,
+            penalty_normalization_scales,
+            raw_penalty_normalization_scales,
+            fused_penalty_normalization_scale,
             constraint_transform,
         } => Ok(BasisMetadata::MeasureJet {
             centers: centers.clone(),
@@ -9742,6 +9885,10 @@ fn with_identifiability_transform(
             alpha: *alpha,
             tau0: *tau0,
             masses: masses.clone(),
+            support_means: support_means.clone(),
+            penalty_normalization_scales: penalty_normalization_scales.clone(),
+            raw_penalty_normalization_scales: raw_penalty_normalization_scales.clone(),
+            fused_penalty_normalization_scale: *fused_penalty_normalization_scale,
             constraint_transform: compose_identifiability_transforms(
                 constraint_transform.as_ref(),
                 transform,
@@ -18667,6 +18814,10 @@ fn freeze_smooth_basis_from_metadata(
                 alpha,
                 tau0,
                 masses,
+                support_means,
+                penalty_normalization_scales,
+                raw_penalty_normalization_scales,
+                fused_penalty_normalization_scale,
                 constraint_transform,
             },
         ) => {
@@ -18685,6 +18836,10 @@ fn freeze_smooth_basis_from_metadata(
             s.frozen_quadrature = Some(MeasureJetFrozenQuadrature {
                 masses: masses.clone(),
                 eps_band: eps_band.clone(),
+                support_means: support_means.clone(),
+                penalty_normalization_scales: penalty_normalization_scales.clone(),
+                raw_penalty_normalization_scales: raw_penalty_normalization_scales.clone(),
+                fused_penalty_normalization_scale: *fused_penalty_normalization_scale,
             });
             // #532 pattern: freeze the composed `z · z_parametric` so the
             // rebuild replays the fit-time realized transform verbatim.

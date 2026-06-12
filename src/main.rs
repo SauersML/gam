@@ -7063,10 +7063,9 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 // the per-scale fitted λ̂_ℓ and implied order when the term
                 // carries one non-ridge λ per band scale (per-scale-candidate
                 // mode); a single fused jet-energy penalty reports only the
-                // band and the spec's order. Same penalty-cursor convention
-                // as `build_model_summary` (random effects first, then smooth
-                // terms in design order) and the same λ = λ̃ / c unscaling as
-                // the continuous-order diagnostics above.
+                // band and the spec's order. The implied-order diagnostic uses
+                // λ_raw = λ̃ / ||S_raw,ℓ||_F, before the arbitrary Mellin
+                // ε_ℓ^(-2s0)·log_step gauge is folded into the fit-time forms.
                 {
                     let mut penalty_cursor = design.random_effect_ranges.len();
                     for term in &design.smooth.terms {
@@ -7077,6 +7076,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                             eps_band,
                             length_scale,
                             order_s,
+                            raw_penalty_normalization_scales,
                             ..
                         } = &term.metadata
                         else {
@@ -7086,30 +7086,40 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                         else {
                             continue;
                         };
-                        let mut scale_lambdas = Vec::new();
+                        let mut scale_lambdas = vec![None; eps_band.len()];
                         for idx in term_penalty_start..term_penalty_start + k {
                             let (Some(info), Some(&lambda_tilde)) =
                                 (design.penaltyinfo.get(idx), fit.lambdas.get(idx))
                             else {
                                 break;
                             };
-                            if matches!(
-                                info.penalty.source,
-                                gam::basis::PenaltySource::DoublePenaltyNullspace
-                            ) {
+                            let gam::basis::PenaltySource::Other(label) = &info.penalty.source
+                            else {
                                 continue;
-                            }
-                            let c = info.penalty.normalization_scale;
-                            if c.is_finite() && c > 0.0 {
-                                scale_lambdas.push(lambda_tilde / c);
+                            };
+                            let Some(level_txt) = label.strip_prefix("measure_jet_scale_") else {
+                                continue;
+                            };
+                            let Ok(level) = level_txt.parse::<usize>() else {
+                                continue;
+                            };
+                            let Some(&c_raw) = raw_penalty_normalization_scales.get(level) else {
+                                continue;
+                            };
+                            if level < scale_lambdas.len() && c_raw.is_finite() && c_raw > 0.0 {
+                                scale_lambdas[level] = Some(lambda_tilde / c_raw);
                             }
                         }
                         // Per-scale-candidate mode ⇔ exactly one non-ridge λ
                         // per band scale, and at least two scales (one point
                         // has no slope to regress).
                         let per_scale: Vec<(f64, f64)> =
-                            if scale_lambdas.len() == eps_band.len() && eps_band.len() >= 2 {
-                                eps_band.iter().copied().zip(scale_lambdas).collect()
+                            if scale_lambdas.iter().all(Option::is_some) && eps_band.len() >= 2 {
+                                eps_band
+                                    .iter()
+                                    .copied()
+                                    .zip(scale_lambdas.into_iter().flatten())
+                                    .collect()
                             } else {
                                 Vec::new()
                             };
@@ -8463,7 +8473,7 @@ fn measure_jet_spectrum_rows_from_spec(
     rows
 }
 
-/// Implied continuous order from a measure-jet per-scale λ spectrum:
+/// Implied continuous order from a measure-jet raw-form per-scale λ spectrum:
 /// ŝ = −½ · (least-squares slope of ln λ̂_ℓ on ln ε_ℓ). `None` unless at
 /// least two scales carry finite positive (ε_ℓ, λ̂_ℓ) and the band has
 /// nonzero log-spread.
