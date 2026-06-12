@@ -2088,6 +2088,19 @@ pub trait OuterObjective {
         }
         None
     }
+
+    /// Re-install the selected outer result into the mutable objective before
+    /// callers consume objective-owned fitted state. Optimizers may evaluate
+    /// rejected trial points after the best point was found; without this final
+    /// synchronization, stateful objectives can report the last trial fit rather
+    /// than the returned `OuterResult::rho`.
+    fn finalize_outer_result(
+        &mut self,
+        rho: &Array1<f64>,
+        _plan: &OuterPlan,
+    ) -> Result<(), EstimationError> {
+        self.eval_cost(rho).map(|_| ())
+    }
 }
 
 // ─── Persistent warm-start checkpoint plumbing ────────────────────────
@@ -7762,7 +7775,12 @@ fn run_outer_with_plan(
         }
     }
 
-    best.ok_or_else(|| {
+    if let Some(result) = best {
+        obj.finalize_outer_result(&result.rho, &result.plan_used)?;
+        return Ok(result);
+    }
+
+    Err({
         // Drain any remaining unclassified entries in `rejection_reasons`
         // into the structured mirror so the final accounting reflects
         // every observed failure regardless of which loop branch pushed
