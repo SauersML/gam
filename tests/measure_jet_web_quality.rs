@@ -202,6 +202,74 @@ fn measure_jet_recovers_web_signal_vs_truth() {
     );
 }
 
+/// The support diagnostic must be computable from the FITTED model alone
+/// (frozen nodes + masses + band ride the replay contract) and must separate
+/// an on-web query from a far off-web query at the finest band scale — the
+/// on-web-ness label every prediction ships with.
+#[test]
+fn measure_jet_support_curve_flags_off_web_queries() {
+    init_parallelism();
+    let train_points = sample_web(400, 41, true);
+    let data = encode_training(&train_points, 42);
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(MJS_FORMULA, &data, &cfg).expect("web fit succeeded");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
+    // Dig the frozen measure-jet term out of the resolved collection: the
+    // freeze step must have pinned nodes, masses, and band.
+    let (spec, scales) = fit
+        .resolvedspec
+        .smooth_terms
+        .iter()
+        .find_map(|st| match &st.basis {
+            gam::smooth::SmoothBasisSpec::MeasureJet {
+                spec, input_scales, ..
+            } => Some((spec.clone(), input_scales.clone())),
+            _ => None,
+        })
+        .expect("fitted model carries a measure-jet term");
+    let gam::basis::CenterStrategy::UserProvided(centers) = &spec.center_strategy else {
+        panic!("frozen measure-jet term must pin its quadrature nodes")
+    };
+    let frozen = spec
+        .frozen_quadrature
+        .as_ref()
+        .expect("frozen measure-jet term must carry its fit-time quadrature");
+    // One on-web query (mid strand A, no coordinate noise) and one query far
+    // off the web, both standardized exactly as the dispatch standardizes
+    // training rows.
+    let e = embedding();
+    let (z_on, _) = latent_point(0, 0.5);
+    let mut queries = Array2::<f64>::zeros((2, AMBIENT_D));
+    for k in 0..AMBIENT_D {
+        queries[(0, k)] = e[k][0] * z_on[0] + e[k][1] * z_on[1];
+        queries[(1, k)] = 5.0;
+    }
+    if let Some(s) = &scales {
+        for k in 0..AMBIENT_D {
+            queries[(0, k)] /= s[k];
+            queries[(1, k)] /= s[k];
+        }
+    }
+    let curves = gam::basis::measure_jet_support_curve(
+        queries.view(),
+        centers.view(),
+        frozen.masses.view(),
+        &frozen.eps_band,
+    )
+    .expect("support curve from frozen model");
+    assert!(
+        curves[(0, 0)] > 10.0 * curves[(1, 0)],
+        "fine-scale support must separate on-web from off-web: on {:.3e} vs off {:.3e}",
+        curves[(0, 0)],
+        curves[(1, 0)]
+    );
+}
+
 #[test]
 fn measure_jet_bridges_gap_with_trend_not_mean() {
     init_parallelism();
