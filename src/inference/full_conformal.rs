@@ -44,10 +44,12 @@
 //!   was actually refit. Validity is proven in the test module by FULL
 //!   ENUMERATION of every Bernoulli dataset at small n (exact coverage
 //!   ≥ 1 − α as a theorem check, not a simulation).
-//! - **Layer 2 — continuous GLM (contract below):** certified
-//!   predictor–corrector homotopy in `z` — exact at corrector points
-//!   because each correction is a Newton solve of the SAME symmetric KKT
-//!   system a cold fit would solve.
+//! - **Layer 2 — continuous GLM (implemented below, certified):**
+//!   predictor–corrector homotopy in `z` ([`GlmHomotopyFullConformal`]) —
+//!   exact at corrector points because each correction is a Newton solve of
+//!   the SAME symmetric KKT system a cold fit would solve, with the step
+//!   size CERTIFIED by a computed third-derivative contraction bound and a
+//!   cold-refit fallback whenever the certificate refuses.
 //! - **Layer 3 (the research core, contract below):** the smoothing
 //!   response dρ̂/dz through the exact outer IFT — the first full-conformal
 //!   procedure that re-selects smoothing per candidate — plus the
@@ -91,7 +93,7 @@
 //! interval list as-is, ±∞ endpoints included — same honesty convention as
 //! the split module's `+∞` multiplier.
 //!
-//! # Layer 2 contract: GLM homotopy (delegate, formulas fixed here)
+//! # Layer 2: GLM homotopy (implemented below)
 //!
 //! `β̂(z)` solves the augmented penalized score equation
 //! `F(β; z) = Σ_i x_i (μ(η_i) − y_i) + x_*(μ(η_*) − z) + Sλβ = 0`

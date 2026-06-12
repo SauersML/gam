@@ -46,6 +46,16 @@ pub struct SmoothTestInput<'a> {
     pub nullspace_dim: usize,
     pub residual_df: f64,
     pub scale: SmoothTestScale,
+    /// Lawley (1956) second-order LR mean shift `Δε = ε_k − ε_{k−q}` for the
+    /// tested block (issue #939), from
+    /// [`crate::inference::lawley::lawley_lr_mean_shift`] evaluated on the
+    /// family cumulant jets at the fit. When present, the `Known`-scale branch
+    /// reports the Bartlett-corrected p-value (`c = 1 + Δε/ref_df`, the factor
+    /// completed with the same trace-corrected reference d.f. the χ² tail
+    /// uses) alongside the first-order one. Ignored by the `Estimated` branch,
+    /// which has its own closed-form conjugate factor. `None` ⇒ first-order
+    /// only.
+    pub known_scale_lr_mean_shift: Option<f64>,
 }
 
 /// Output of `wood_smooth_test`: the Wald statistic
@@ -61,8 +71,9 @@ pub struct SmoothTestResult {
     /// — never replacing — the first-order `p_value` (issue #939). Populated for
     /// the estimated-scale (Gaussian-linear / penalized-quadratic conjugate)
     /// branch, where the exact Bartlett factor is a closed form of the reference
-    /// and residual degrees of freedom; `None` for the known-scale branch, where
-    /// the analytic factor needs the family cumulant towers (not yet assembled).
+    /// and residual degrees of freedom, and for the known-scale branch when the
+    /// caller supplies the Lawley LR mean shift from the family cumulant jets
+    /// (`SmoothTestInput::known_scale_lr_mean_shift`).
     pub p_value_corrected: Option<f64>,
     /// The Bartlett factor `c = E[W]/d` used for `p_value_corrected`. Its
     /// distance from `1` is the per-test diagnostic the field lacks: how far
@@ -129,6 +140,25 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
     let p_value = match input.scale {
         SmoothTestScale::Known => {
             let dist = ChiSquared::new(ref_df).ok()?;
+            // Second-order Bartlett correction for the known-scale branch
+            // (#939). Lawley (1956): E[W] = d + Δε + O(n⁻²) with Δε =
+            // ε_k − ε_{k−q} assembled by the caller from the exact family
+            // cumulant jets (`crate::inference::lawley`), so the factor is
+            // c = E[W]/d = 1 + Δε/d with d the same trace-corrected reference
+            // d.f. the χ² tail uses. Degenerate factors (non-finite, ≤ 0) fall
+            // back to first-order-only reporting inside `bartlett_correct`.
+            // Reported alongside, never replacing, the first-order p-value.
+            if let Some(shift) = input.known_scale_lr_mean_shift {
+                if shift.is_finite() {
+                    let c = 1.0 + shift / ref_df;
+                    if let Some(corr) =
+                        crate::inference::higher_order::bartlett_correct(statistic, ref_df, c)
+                    {
+                        p_value_corrected = Some(corr.corrected_p_value);
+                        bartlett_factor = Some(corr.factor);
+                    }
+                }
+            }
             1.0 - dist.cdf(statistic)
         }
         SmoothTestScale::Estimated => {
@@ -253,6 +283,7 @@ mod tests {
             nullspace_dim: 0,
             residual_df: 20.0,
             scale: SmoothTestScale::Known,
+            known_scale_lr_mean_shift: None,
         })
         .expect("smooth test");
         assert!((out.ref_df - 1.8).abs() < 1e-12);
@@ -284,6 +315,7 @@ mod tests {
                 nullspace_dim: 0,
                 residual_df: 50.0,
                 scale: SmoothTestScale::Estimated,
+                known_scale_lr_mean_shift: None,
             })
             .expect("smooth test")
         };

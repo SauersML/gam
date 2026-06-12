@@ -627,6 +627,206 @@ mod tests {
         }
     }
 
+    /// CERTIFICATION FIXTURE 1 (#939, Gaussian known variance): every third and
+    /// fourth expected cumulant and every η-derivative of the curvature vanish
+    /// (ℓᵢ = −½(yᵢ−ηᵢ)²/φ is exactly quadratic), so ε_k = ε_{k−q} = 0 and the
+    /// Lawley LR Bartlett factor is EXACTLY 1 at every n — the χ²_q reference
+    /// is already exact and the machinery must not touch it.
+    #[test]
+    fn gaussian_known_variance_lr_factor_is_exactly_one() {
+        let n = 20;
+        let k = 3;
+        let mut x = Array2::<f64>::zeros((n, k));
+        for i in 0..n {
+            let z = i as f64 / n as f64;
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = (5.0 * z).sin();
+            x[[i, 2]] = z - 0.5;
+        }
+        let kappas = vec![
+            RowExpectedJets::gaussian_identity(1.7)
+                .kappas()
+                .expect("gaussian kappas");
+            n
+        ];
+        let s_pen = Array2::<f64>::eye(k) * 0.4;
+        for q in [1usize, 2] {
+            let shift = lawley_lr_mean_shift(x.view(), &kappas, Some(s_pen.view()), k - q..k)
+                .expect("shift");
+            assert!(
+                shift.abs() < 1e-13,
+                "Gaussian known-variance Δε must be 0; got {shift}"
+            );
+            let c = lawley_lr_bartlett_factor(x.view(), &kappas, Some(s_pen.view()), k - q..k, q as f64)
+                .expect("factor");
+            assert!(
+                (c - 1.0).abs() < 1e-13,
+                "Gaussian known-variance Bartlett factor must be exactly 1; got {c}"
+            );
+        }
+    }
+
+    /// CERTIFICATION FIXTURE 2 (#939, Exponential rate, scalar MLE): exact
+    /// analytic Bartlett factor `c = 1 + 1/(6n)`.
+    ///
+    /// Derivation. yᵢ ~ Exp(rate θ), ℓ(θ) = n·log θ − θ·Σyᵢ, θ̂ = 1/ȳ. The LR
+    /// statistic for H₀: θ = θ₀ at the truth is
+    ///   W = 2[ℓ(θ̂) − ℓ(θ₀)] = 2n(θ₀ȳ − 1 − log(θ₀ȳ)).
+    /// With T = θ₀·Σyᵢ ~ Gamma(n, 1): E[T] = n, E[log T] = ψ(n), so
+    ///   E[W] = 2(E[T] − n) + 2n(log n − E[log T]) = 2n(log n − ψ(n))   (exact).
+    /// The digamma expansion ψ(n) = log n − 1/(2n) − 1/(12n²) + O(n⁻⁴) gives
+    ///   E[W] = 1 + 1/(6n) + O(n⁻³)  ⇒  c = 1 + 1/(6n).
+    /// The tested block is the whole (intercept-only) design — a fully
+    /// specified null, ε₀ = 0 — and the factor must match both the analytic
+    /// 1 + 1/(6n) (to machine precision) and the exact digamma mean (to O(n⁻²)).
+    #[test]
+    fn exponential_rate_lr_factor_is_one_plus_one_sixth_n() {
+        let eta = -0.7; // ε is reparametrization-invariant; any η works.
+        for &n in &[8usize, 16, 32] {
+            let jets = RowExpectedJets::gamma_log(eta, 1.0);
+            let kappas = vec![jets.kappas().expect("exponential kappas"); n];
+            let x = intercept_design(n);
+            let c = lawley_lr_bartlett_factor(x.view(), &kappas, None, 0..1, 1.0).expect("factor");
+            let analytic = 1.0 + 1.0 / (6.0 * n as f64);
+            assert!(
+                (c - analytic).abs() < 1e-12,
+                "n={n}: factor {c} vs analytic 1 + 1/(6n) = {analytic}"
+            );
+            let exact_mean = 2.0 * n as f64 * ((n as f64).ln() - digamma_integer(n));
+            assert!(
+                (exact_mean - c).abs() < 0.6 / (n * n) as f64,
+                "n={n}: |E[W] − c| = {} is not O(n⁻²)",
+                (exact_mean - c).abs()
+            );
+        }
+    }
+
+    /// CERTIFICATION FIXTURE 3 (#939, Bernoulli/logit, scalar MLE): analytic
+    /// Lawley shift `ε = (1 − u)/(6nu)`, `u = μ(1−μ)`, certified against the
+    /// exact binomial pmf mean of W.
+    ///
+    /// Hand derivation of ε from the row-pair form (module docs), intercept-only
+    /// design (h_i = E_ij = 1/(nu)), canonical link (κ₃ = κ₂′, κ₄ = κ₃′), with
+    /// u = μ(1−μ), u′ = u(1−2μ), u″ = u(1−2μ)² − 2u² = u(1−6u) (since
+    /// (1−2μ)² = 1−4u):
+    ///   κ₂ = −u, κ₂′ = κ₃ = −u′, κ₂″ = κ₃′ = κ₄ = −u″
+    ///   a_i  = κ₄/4 − κ₃′ + κ₂″ = −u″/4
+    ///   λ₄   = n·(−u″/4)·(1/(nu))² = −u″/(4nu²)
+    ///   b6   = κ₃²/6 − κ₃κ₂′ + κ₂′² = u′²/6,   b4 = u′²/4
+    ///   λ₆   = −n²·(1/(nu))³·(u′²/6 + u′²/4) = −5u′²/(12nu³)
+    ///   ε    = λ₄ − λ₆ = [−3(1−6u) + 5(1−4u)]/(12nu) = (1 − u)/(6nu).
+    /// Cross-check: Poisson has u = u′ = u″ = μ ⇒ ε = (5/12 − 1/4)/(nμ) =
+    /// 1/(6nμ), the classical value asserted in the Poisson fixture above.
+    /// Exact certification: S = Σyᵢ ~ Binomial(n, μ₀), W(S) = 2[S·log(S/(nμ₀))
+    /// + (n−S)·log((n−S)/(n(1−μ₀)))] (0·log 0 = 0); |E[W] − 1 − ε| must be
+    /// O(n⁻²) (numerically ≈ 1.5/n² at μ₀ = 0.3) and shrink with n.
+    #[test]
+    fn bernoulli_logit_intercept_factor_matches_exact_pmf_mean() {
+        let mu: f64 = 0.3;
+        let u = mu * (1.0 - mu);
+        let eta = (mu / (1.0 - mu)).ln();
+        let mut residual_prev = f64::INFINITY;
+        for &n in &[24usize, 48, 96] {
+            let jets = RowExpectedJets::binomial_logit(eta);
+            let kappas = vec![jets.kappas().expect("bernoulli kappas"); n];
+            let x = intercept_design(n);
+            let shift = lawley_lr_mean_shift(x.view(), &kappas, None, 0..1).expect("Δε");
+            let analytic = (1.0 - u) / (6.0 * n as f64 * u);
+            assert!(
+                (shift - analytic).abs() < 1e-12,
+                "n={n}: Δε = {shift} vs analytic (1−u)/(6nu) = {analytic}"
+            );
+            let c = lawley_lr_bartlett_factor(x.view(), &kappas, None, 0..1, 1.0).expect("factor");
+            assert!(
+                (c - (1.0 + analytic)).abs() < 1e-12,
+                "n={n}: factor {c} vs 1 + ε = {}",
+                1.0 + analytic
+            );
+            // Exact E[W] by binomial pmf summation.
+            let nf = n as f64;
+            let mut pmf = (1.0 - mu).powi(n as i32); // P(S = 0)
+            let mut exact_mean = 0.0;
+            for s in 0..=n {
+                if s > 0 {
+                    pmf *= mu / (1.0 - mu) * (n - s + 1) as f64 / s as f64;
+                }
+                let s_f = s as f64;
+                let t1 = if s == 0 { 0.0 } else { s_f * (s_f / (nf * mu)).ln() };
+                let t2 = if s == n {
+                    0.0
+                } else {
+                    (nf - s_f) * ((nf - s_f) / (nf * (1.0 - mu))).ln()
+                };
+                exact_mean += pmf * 2.0 * (t1 + t2);
+            }
+            let residual = (exact_mean - 1.0 - shift).abs();
+            assert!(
+                residual < 2.5 / (n * n) as f64,
+                "n={n}: |E[W] − 1 − ε| = {residual} is not O(n⁻²)"
+            );
+            assert!(
+                residual < residual_prev,
+                "n={n}: residual {residual} did not shrink from {residual_prev}"
+            );
+            residual_prev = residual;
+        }
+    }
+
+    /// The mean shift is exactly `ε_full − ε_nuisance` with the tested columns
+    /// (and the matching penalty rows/columns) dropped from the nuisance model.
+    #[test]
+    fn mean_shift_is_full_minus_nuisance_epsilon() {
+        let n = 19;
+        let mut x = Array2::<f64>::zeros((n, 2));
+        let mut kappas = Vec::with_capacity(n);
+        for i in 0..n {
+            let z = i as f64 / n as f64;
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = z - 0.5;
+            let eta = 0.3 - 0.8 * (z - 0.5);
+            kappas.push(
+                RowExpectedJets::binomial_logit(eta)
+                    .kappas()
+                    .expect("binomial kappas"),
+            );
+        }
+        let mut s_pen = Array2::<f64>::zeros((2, 2));
+        s_pen[[1, 1]] = 0.6;
+        let shift = lawley_lr_mean_shift(x.view(), &kappas, Some(s_pen.view()), 1..2)
+            .expect("shift");
+        let eps_full = lawley_epsilon(x.view(), &kappas, Some(s_pen.view())).expect("ε_full");
+        let x_null = x.slice(ndarray::s![.., 0..1]).to_owned();
+        let s_null = s_pen.slice(ndarray::s![0..1, 0..1]).to_owned();
+        let eps_null =
+            lawley_epsilon(x_null.view(), &kappas, Some(s_null.view())).expect("ε_null");
+        assert!(
+            (shift - (eps_full - eps_null)).abs() < 1e-14,
+            "Δε = {shift} must equal ε_full − ε_null = {}",
+            eps_full - eps_null
+        );
+        // Weighted rows: doubling every weight must equal doubling n by row
+        // duplication — certified through the linear scaling of the cumulants.
+        let kappas_w: Vec<RowKappas> = kappas.iter().map(|r| r.weighted(2.0)).collect();
+        let mut x2 = Array2::<f64>::zeros((2 * n, 2));
+        let mut kappas2 = Vec::with_capacity(2 * n);
+        for i in 0..n {
+            for rep in 0..2 {
+                let row = 2 * i + rep;
+                x2[[row, 0]] = x[[i, 0]];
+                x2[[row, 1]] = x[[i, 1]];
+                kappas2.push(kappas[i]);
+            }
+        }
+        let shift_w = lawley_lr_mean_shift(x.view(), &kappas_w, Some(s_pen.view()), 1..2)
+            .expect("weighted shift");
+        let shift_dup = lawley_lr_mean_shift(x2.view(), &kappas2, Some(s_pen.view()), 1..2)
+            .expect("duplicated shift");
+        assert!(
+            (shift_w - shift_dup).abs() < 1e-12 * (1.0 + shift_dup.abs()),
+            "weight-2 rows ({shift_w}) must equal duplicated rows ({shift_dup})"
+        );
+    }
+
     #[test]
     fn row_pair_reduction_matches_index_oracle() {
         // Non-canonical rows (gamma/log at varying η) on a k=3 design: the
