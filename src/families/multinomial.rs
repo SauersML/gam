@@ -722,6 +722,15 @@ fn scale_multinomial_formula_penalty(penalty: PenaltyMatrix) -> PenaltyMatrix {
 /// near-simplex-boundary solve can certify a stationary point instead of being
 /// declared non-converged after only `max_iter` cycles (#715).
 ///
+/// The Jeffreys/Firth proper prior is engaged CONDITIONALLY: attempt 1 runs
+/// the unbiased penalized-REML criterion; only on separation evidence (a
+/// failed solve, a non-finite logit, or a saturated `|η| ≥ 25` logit — see
+/// [`multinomial_formula_separation_evidence`]) is the fit re-solved once with
+/// the full-span Firth prior armed, which bounds the penalty-null directions
+/// no smoothing parameter can (`S v = 0` ⇒ `(H + S_λ) v = H v → 0` under
+/// softmax saturation, the #715 real-data "all REML startup seeds rejected"
+/// mechanism).
+///
 /// The categorical response column is recognised via the dataset schema
 /// (`ColumnKindTag::Categorical`); reference class = last level. Returns a
 /// [`MultinomialSavedModel`] that can be serialised to bytes for the Python
