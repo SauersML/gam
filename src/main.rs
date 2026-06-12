@@ -50,9 +50,9 @@ use gam::inference::model_payload_builders::{
     SurvivalMarginalSlopeInputs, SurvivalTimewiggle, SurvivalTimewiggleBeta,
     SurvivalTransformationInputs, TransformationNormalInputs,
     assemble_bernoulli_marginal_slope_payload, assemble_latent_window_payload,
-    assemble_location_scale_payload, assemble_survival_location_scale_payload,
-    assemble_survival_marginal_slope_payload, assemble_survival_transformation_payload,
-    assemble_transformation_normal_payload,
+    assemble_location_scale_payload, assemble_spline_scan_payload,
+    assemble_survival_location_scale_payload, assemble_survival_marginal_slope_payload,
+    assemble_survival_transformation_payload, assemble_transformation_normal_payload,
 };
 use gam::inference::predict::input::build_predict_input_for_model;
 use gam::inference::predict::linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
@@ -1600,7 +1600,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             ds.values.nrows(),
             family
         );
-        let fitted = match fit_model(FitRequest::Standard(StandardFitRequest {
+        let standard_request = StandardFitRequest {
             data: ds.values.to_owned(),
             y: y.clone(),
             weights: weights.clone(),
@@ -1618,7 +1618,57 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             penalty_block_gamma_priors: Vec::new(),
             latent_coord: None,
             _marker: std::marker::PhantomData,
-        })) {
+        };
+        // Exact O(n) spline-scan fast path (#1030/#1034): a single 1-D
+        // Gaussian cubic smooth routes through the state-space scan — the
+        // same penalized posterior at O(n) per λ-trial instead of the dense
+        // design/Gram route — and persists the smoother state directly.
+        if let Some(inputs) = gam::spline_scan_fast_path(&standard_request) {
+            let scan =
+                gam::solver::spline_scan::fit_cubic_spline_scan(&inputs.x, &inputs.y, &inputs.w)
+                    .map_err(|e| format!("spline-scan fit failed: {e}"))?;
+            log::info!(
+                "[PHASE] spline-scan fit end elapsed={:.3}s",
+                phase_start.elapsed().as_secs_f64()
+            );
+            let feature_col = match &spec.smooth_terms[0].basis {
+                gam::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => *feature_col,
+                other => {
+                    return Err(format!(
+                        "internal error: spline-scan detection accepted a non-1D basis {other:?}"
+                    ));
+                }
+            };
+            let feature_column = ds.headers.get(feature_col).cloned().ok_or_else(|| {
+                format!("internal error: spline-scan feature column {feature_col} has no header")
+            })?;
+            cli_out!(
+                "spline-scan fit | knots={} | edf={:.3} | sigma2={:.6e} | log_lambda={:.4} | reml={:.6e}",
+                scan.knots.len(),
+                scan.edf(),
+                scan.sigma2,
+                scan.log_lambda,
+                scan.restricted_loglik,
+            );
+            progress.advance_workflow(4);
+            if let Some(out) = args.out {
+                progress.set_stage("fit", "writing fitted model");
+                let payload = assemble_spline_scan_payload(
+                    formula_text,
+                    feature_column,
+                    &scan,
+                    ds.schema.clone(),
+                    ds.headers.clone(),
+                    ds.feature_ranges(),
+                );
+                write_payload_json(&out, payload)?;
+                progress.advance_workflow(5);
+            }
+            emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
+            progress.finish_progress("fit complete");
+            return Ok(());
+        }
+        let fitted = match fit_model(FitRequest::Standard(standard_request)) {
             Ok(FitResult::Standard(result)) => {
                 log::info!(
                     "[PHASE] standard-GAM fit end elapsed={:.3}s",
@@ -2981,6 +3031,9 @@ fn run_predict_model(
             predict_noise_offset,
         );
     }
+    if model.spline_scan.is_some() {
+        return run_predict_spline_scan(progress, args, model, data, col_map);
+    }
 
     let predictor = model.predictor().ok_or_else(|| {
         format!(
@@ -3005,6 +3058,61 @@ fn validate_level(level: f64) -> Result<(), String> {
     if !(level.is_finite() && level > 0.0 && level < 1.0) {
         return Err(format!("--level must be in (0,1), got {level}"));
     }
+    Ok(())
+}
+
+/// Predict for a spline-scan saved model (#1030/#1034): replay the exact
+/// Gaussian bridge at each query abscissa — no design matrix, O(log m) per
+/// row. The link is identity so η == mean; SEs and intervals come from the
+/// exact smoothing-spline posterior variance of the mean.
+fn run_predict_spline_scan(
+    progress: &mut gam::visualizer::VisualizerSession,
+    args: &PredictArgs,
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+) -> Result<(), String> {
+    let (column, fit) = model
+        .saved_spline_scan()
+        .map_err(String::from)?
+        .ok_or_else(|| "internal error: spline-scan predict on a dense model".to_string())?;
+    let col = *col_map.get(column).ok_or_else(|| {
+        format!("prediction data is missing the model's feature column '{column}'")
+    })?;
+    let n = data.nrows();
+    let mut mean = Array1::<f64>::zeros(n);
+    let mut se = Array1::<f64>::zeros(n);
+    for (i, &x) in data.column(col).iter().enumerate() {
+        let (m, v) = fit
+            .predict(x)
+            .map_err(|e| format!("spline-scan predict failed at row {i}: {e}"))?;
+        mean[i] = m;
+        se[i] = v.max(0.0).sqrt();
+    }
+    progress.advance_workflow(3);
+    progress.advance_workflow(4);
+    progress.set_stage("predict", "writing predictions");
+    let (se_opt, mean_lo, mean_hi) = if args.uncertainty {
+        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+        let lo = Array1::from_iter(mean.iter().zip(se.iter()).map(|(m, s)| m - z * s));
+        let hi = Array1::from_iter(mean.iter().zip(se.iter()).map(|(m, s)| m + z * s));
+        (Some(se.clone()), Some(lo), Some(hi))
+    } else {
+        (None, None, None)
+    };
+    write_prediction_csv(
+        &args.out,
+        mean.view(),
+        mean.view(),
+        se_opt.as_ref().map(|a| a.view()),
+        mean_lo.as_ref().map(|a| a.view()),
+        mean_hi.as_ref().map(|a| a.view()),
+    )?;
+    cli_out!(
+        "wrote predictions: {} (rows={})",
+        args.out.display(),
+        mean.len()
+    );
     Ok(())
 }
 
