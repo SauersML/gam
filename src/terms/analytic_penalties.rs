@@ -2452,6 +2452,123 @@ impl IBPAssignmentPenalty {
             m_channel,
         }
     }
+
+    /// Mixed derivative `∂/∂ℓ_ik [∂F/∂ρ_alpha]` for learnable-alpha IBP.
+    ///
+    /// This differentiates the implemented energy in [`Self::value`]. At the
+    /// empirical-π interior, the BCE and `(a-1) log π` implicit-π terms cancel in
+    /// `∂F/∂a`, leaving the normalized Beta(a,1) channel. At the probability
+    /// clamp, the same zero-π-Jacobian convention as [`Self::grad_target`] and
+    /// [`Self::hessian_diag`] applies.
+    #[must_use]
+    pub fn log_alpha_target_mixed_derivative(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(target.len());
+        if !self.learnable_alpha {
+            return out;
+        }
+        let alpha = self.resolved_alpha(rho);
+        let a = alpha / self.k_max as f64;
+        let tau = self.concrete_temperature();
+        let z = self.concrete_logits(target);
+        let pi = self.pi_map(z.view(), alpha);
+        let n = z.len() / self.k_max;
+        let denom = (n as f64 + a - 1.0).max(IBP_COUNT_DENOM_FLOOR);
+        let mut active_mass = Array1::<f64>::zeros(self.k_max);
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                active_mass[k] += z[start + k];
+            }
+        }
+        let mut pi_jac = Array1::<f64>::zeros(self.k_max);
+        for k in 0..self.k_max {
+            let raw = (active_mass[k] + a - 1.0) / denom;
+            if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
+                pi_jac[k] = 1.0 / denom;
+            }
+        }
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                let zk = z[start + k];
+                let z_jac = zk * (1.0 - zk) / tau;
+                let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
+                out[start + k] = -self.weight * a * pi_jac[k] * z_jac / pk;
+            }
+        }
+        out
+    }
+
+    /// `∂ hessian_diag / ∂ρ_alpha` for learnable-alpha IBP.
+    ///
+    /// The SAE log-det trace differentiates the diagonal returned by
+    /// [`Self::hessian_diag`]. This channel differentiates that exact diagonal
+    /// with respect to the learnable-alpha log-coordinate while holding logits
+    /// fixed. IBP columns remain independent, so within-row off-diagonals are zero.
+    #[must_use]
+    pub fn hessian_diag_log_alpha_derivative(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(target.len());
+        if !self.learnable_alpha {
+            return out;
+        }
+        let alpha = self.resolved_alpha(rho);
+        let a = alpha / self.k_max as f64;
+        let tau = self.concrete_temperature();
+        let inv_tau = 1.0 / tau;
+        let inv_tau2 = inv_tau * inv_tau;
+        let z = self.concrete_logits(target);
+        let pi = self.pi_map(z.view(), alpha);
+        let n = z.len() / self.k_max;
+        let denom = (n as f64 + a - 1.0).max(IBP_COUNT_DENOM_FLOOR);
+        let mut active_mass = Array1::<f64>::zeros(self.k_max);
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                active_mass[k] += z[start + k];
+            }
+        }
+        let mut d_score = Array1::<f64>::zeros(self.k_max);
+        let mut d_score_derivative = Array1::<f64>::zeros(self.k_max);
+        for k in 0..self.k_max {
+            let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
+            let mass = active_mass[k];
+            let raw = (mass + a - 1.0) / denom;
+            if raw <= IBP_INTERIOR_TOL || raw >= 1.0 - IBP_INTERIOR_TOL {
+                continue;
+            }
+            let one_minus = 1.0 - pk;
+            let dpi_da = (n as f64 - mass) / (denom * denom);
+            let dpi_drho = a * dpi_da;
+            let d_score_dpi = -1.0 / pk - 1.0 / one_minus;
+            d_score[k] = d_score_dpi * dpi_drho;
+
+            let inv_p = 1.0 / pk;
+            let inv_q = 1.0 / one_minus;
+            let a_channel = inv_p + inv_q;
+            let d_a_channel_da = dpi_da * (-inv_p * inv_p + inv_q * inv_q);
+            let d_score_derivative_da = a_channel / (denom * denom) - d_a_channel_da / denom;
+            d_score_derivative[k] = a * d_score_derivative_da;
+        }
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                let zk = z[start + k];
+                let z_jac = zk * (1.0 - zk) * inv_tau;
+                let z_second = zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
+                out[start + k] =
+                    self.weight * (d_score_derivative[k] * z_jac * z_jac + d_score[k] * z_second);
+            }
+        }
+        out
+    }
 }
 
 /// Exact logit third-derivative channels of [`IBPAssignmentPenalty::hessian_diag`]
@@ -9614,6 +9731,46 @@ mod tests {
             / (2.0 * step);
 
         assert_abs_diff_eq!(grad[0], fd, epsilon = 2.0e-7);
+    }
+
+    #[test]
+    fn ibp_assignment_learnable_alpha_mixed_log_alpha_target_matches_fd() {
+        let pen = IBPAssignmentPenalty::new(2, 2.0, 0.9, true);
+        let t = array![0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5];
+        let rho = array![0.15_f64];
+        let analytic = pen.log_alpha_target_mixed_derivative(t.view(), rho.view());
+        let step = 1.0e-6_f64;
+        for i in 0..t.len() {
+            let mut tp = t.clone();
+            let mut tm = t.clone();
+            tp[i] += step;
+            tm[i] -= step;
+            let gp = pen.grad_rho(tp.view(), rho.view())[0];
+            let gm = pen.grad_rho(tm.view(), rho.view())[0];
+            let fd = (gp - gm) / (2.0 * step);
+            assert_abs_diff_eq!(analytic[i], fd, epsilon = 2.0e-7);
+        }
+    }
+
+    #[test]
+    fn ibp_assignment_learnable_alpha_hdiag_log_alpha_derivative_matches_fd() {
+        let pen = IBPAssignmentPenalty::new(2, 2.0, 0.9, true);
+        let t = array![0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5];
+        let rho = array![0.15_f64];
+        let analytic = pen.hessian_diag_log_alpha_derivative(t.view(), rho.view());
+        let step = 1.0e-6_f64;
+        let rho_plus = array![rho[0] + step];
+        let rho_minus = array![rho[0] - step];
+        let hp = pen
+            .hessian_diag(t.view(), rho_plus.view())
+            .expect("IBP hessian diag exists");
+        let hm = pen
+            .hessian_diag(t.view(), rho_minus.view())
+            .expect("IBP hessian diag exists");
+        for i in 0..t.len() {
+            let fd = (hp[i] - hm[i]) / (2.0 * step);
+            assert_abs_diff_eq!(analytic[i], fd, epsilon = 2.0e-7);
+        }
     }
 
     #[test]
