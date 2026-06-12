@@ -90,6 +90,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
 use crate::faer_ndarray::FaerEigh;
+use crate::solver::grid_spline_2d::GridSpline2dDesign;
 use crate::inference::smooth_test::{
     SmoothTestInput, SmoothTestResult, SmoothTestScale, wood_smooth_test,
 };

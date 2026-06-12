@@ -6793,6 +6793,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     let mut diagnostics = None;
     let mut smooth_plots = Vec::new();
     let mut continuous_order = Vec::new();
+    let mut measure_jet_spectra = Vec::new();
     let mut alo_data = None;
     let mut n_obs = None;
     let mut r_squared = None;
@@ -6947,6 +6948,75 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     }
                 }
 
+                // Measure-jet scale spectrum: realized band per term, plus
+                // the per-scale fitted λ̂_ℓ and implied order when the term
+                // carries one non-ridge λ per band scale (per-scale-candidate
+                // mode); a single fused jet-energy penalty reports only the
+                // band and the spec's order. Same penalty-cursor convention
+                // as `build_model_summary` (random effects first, then smooth
+                // terms in design order) and the same λ = λ̃ / c unscaling as
+                // the continuous-order diagnostics above.
+                {
+                    let mut penalty_cursor = design.random_effect_ranges.len();
+                    for term in &design.smooth.terms {
+                        let k = term.penalties_local.len();
+                        let term_penalty_start = penalty_cursor;
+                        penalty_cursor += k;
+                        let gam::basis::BasisMetadata::MeasureJet {
+                            eps_band,
+                            length_scale,
+                            order_s,
+                            ..
+                        } = &term.metadata
+                        else {
+                            continue;
+                        };
+                        let (Some(&eps_min), Some(&eps_max)) =
+                            (eps_band.first(), eps_band.last())
+                        else {
+                            continue;
+                        };
+                        let mut scale_lambdas = Vec::new();
+                        for idx in term_penalty_start..term_penalty_start + k {
+                            let (Some(info), Some(&lambda_tilde)) =
+                                (design.penaltyinfo.get(idx), fit.lambdas.get(idx))
+                            else {
+                                break;
+                            };
+                            if matches!(
+                                info.penalty.source,
+                                gam::basis::PenaltySource::DoublePenaltyNullspace
+                            ) {
+                                continue;
+                            }
+                            let c = info.penalty.normalization_scale;
+                            if c.is_finite() && c > 0.0 {
+                                scale_lambdas.push(lambda_tilde / c);
+                            }
+                        }
+                        // Per-scale-candidate mode ⇔ exactly one non-ridge λ
+                        // per band scale, and at least two scales (one point
+                        // has no slope to regress).
+                        let per_scale: Vec<(f64, f64)> =
+                            if scale_lambdas.len() == eps_band.len() && eps_band.len() >= 2 {
+                                eps_band.iter().copied().zip(scale_lambdas).collect()
+                            } else {
+                                Vec::new()
+                            };
+                        let implied_order = measure_jet_implied_order(&per_scale);
+                        measure_jet_spectra.push(report::MeasureJetSpectrumRow {
+                            term_name: term.name.clone(),
+                            eps_min,
+                            eps_max,
+                            n_scales: eps_band.len(),
+                            length_scale: *length_scale,
+                            spec_order_s: *order_s,
+                            per_scale,
+                            implied_order,
+                        });
+                    }
+                }
+
                 // Residual QQ data
                 let residuals: Vec<f64> =
                     y.iter().zip(pred.mean.iter()).map(|(o, p)| o - p).collect();
@@ -7072,6 +7142,14 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         progress.advance_workflow(2);
     }
 
+    // The realized band is frozen onto the saved spec, so the measure-jet
+    // spectrum line still prints when the report runs without a dataset (or
+    // for model classes that skip the design rebuild). Per-scale λ̂_ℓ need the
+    // rebuilt penalty layout, so only band + spec order are available here.
+    if measure_jet_spectra.is_empty() {
+        measure_jet_spectra = measure_jet_spectrum_rows_from_spec(model.resolved_termspec.as_ref());
+    }
+
     progress.set_stage("report", "generating html");
     let input = report::ReportInput {
         model_path: args.model.display().to_string(),
@@ -7107,6 +7185,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         edf_blocks,
         continuous_order,
         anisotropic_scales: build_anisotropic_scales_rows(model.resolved_termspec.as_ref()),
+        measure_jet_spectra,
         diagnostics,
         smooth_plots,
         alo: alo_data,
@@ -8237,6 +8316,66 @@ fn build_anisotropic_scales_rows(
         });
     }
     rows
+}
+
+/// Build measure-jet spectrum report rows from a saved (frozen) spec alone:
+/// realized band + spec order, no per-scale λ̂s (those need the rebuilt
+/// design's penalty layout). Used when the report runs without a dataset.
+fn measure_jet_spectrum_rows_from_spec(
+    spec: Option<&TermCollectionSpec>,
+) -> Vec<report::MeasureJetSpectrumRow> {
+    let Some(spec) = spec else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for term in &spec.smooth_terms {
+        let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &term.basis else {
+            continue;
+        };
+        let Some(frozen) = mj.frozen_quadrature.as_ref() else {
+            continue;
+        };
+        let (Some(&eps_min), Some(&eps_max)) = (frozen.eps_band.first(), frozen.eps_band.last())
+        else {
+            continue;
+        };
+        rows.push(report::MeasureJetSpectrumRow {
+            term_name: term.name.clone(),
+            eps_min,
+            eps_max,
+            n_scales: frozen.eps_band.len(),
+            length_scale: mj.length_scale,
+            spec_order_s: mj.order_s,
+            per_scale: Vec::new(),
+            implied_order: None,
+        });
+    }
+    rows
+}
+
+/// Implied continuous order from a measure-jet per-scale λ spectrum:
+/// ŝ = −½ · (least-squares slope of ln λ̂_ℓ on ln ε_ℓ). `None` unless at
+/// least two scales carry finite positive (ε_ℓ, λ̂_ℓ) and the band has
+/// nonzero log-spread.
+fn measure_jet_implied_order(per_scale: &[(f64, f64)]) -> Option<f64> {
+    let pts: Vec<(f64, f64)> = per_scale
+        .iter()
+        .filter(|&&(eps, lam)| eps.is_finite() && eps > 0.0 && lam.is_finite() && lam > 0.0)
+        .map(|&(eps, lam)| (eps.ln(), lam.ln()))
+        .collect();
+    if pts.len() < 2 {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let xbar = pts.iter().map(|p| p.0).sum::<f64>() / n;
+    let ybar = pts.iter().map(|p| p.1).sum::<f64>() / n;
+    let sxx = pts.iter().map(|p| (p.0 - xbar).powi(2)).sum::<f64>();
+    if sxx <= 0.0 {
+        return None;
+    }
+    let sxy = pts.iter().map(|p| (p.0 - xbar) * (p.1 - ybar)).sum::<f64>();
+    let s_hat = -0.5 * (sxy / sxx);
+    s_hat.is_finite().then_some(s_hat)
 }
 
 /// Print learned per-axis spatial anisotropy for spatial terms to stdout.

@@ -213,10 +213,10 @@ fn warped_circle_chart_canonicalizes_to_unit_speed_full_span() {
         max_before / min_before
     );
 
-    term.canonicalize_unit_speed_charts_post_fit(z.view(), &rho, None)
+    term.canonicalize_charts_post_fit(z.view(), &rho, None)
         .expect("canonicalization pass");
     assert!(
-        term.atoms[0].unit_speed_canonicalized,
+        term.atoms[0].chart_canonicalized,
         "the planted circle atom must be canonicalized (exact harmonic closure)"
     );
 
@@ -257,9 +257,9 @@ fn circle_canonicalization_freezes_the_image() {
         "the plant must reconstruct the circle nearly perfectly; got EV {ev_before}"
     );
 
-    term.canonicalize_unit_speed_charts_post_fit(z.view(), &rho, None)
+    term.canonicalize_charts_post_fit(z.view(), &rho, None)
         .expect("canonicalization pass");
-    assert!(term.atoms[0].unit_speed_canonicalized);
+    assert!(term.atoms[0].chart_canonicalized);
 
     // (b) Image invariance: reconstruction EV unchanged within 1e-8 — the
     // canonicalization moved the chart, never the curve.
@@ -273,9 +273,9 @@ fn circle_canonicalization_freezes_the_image() {
 #[test]
 fn certificate_reports_chart_pinned_by_canonicalization_with_finite_group() {
     let (mut term, z, rho) = planted_warped_circle();
-    term.canonicalize_unit_speed_charts_post_fit(z.view(), &rho, None)
+    term.canonicalize_charts_post_fit(z.view(), &rho, None)
         .expect("canonicalization pass");
-    assert!(term.atoms[0].unit_speed_canonicalized);
+    assert!(term.atoms[0].chart_canonicalized);
 
     // (c) The residual-gauge certificate downgrades the atom's chart freedom
     // to the finite isometry group, with the canonicalization provenance —
@@ -435,10 +435,10 @@ fn warped_interval_chart_canonicalizes_to_unit_speed_unit_span() {
     );
     let ev_before = reconstruction_ev(&term, &z);
 
-    term.canonicalize_unit_speed_charts_post_fit(z.view(), &rho, None)
+    term.canonicalize_charts_post_fit(z.view(), &rho, None)
         .expect("canonicalization pass");
     assert!(
-        term.atoms[0].unit_speed_canonicalized,
+        term.atoms[0].chart_canonicalized,
         "the straight-segment atom must canonicalize exactly (monomial closure)"
     );
 
