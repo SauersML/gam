@@ -1,0 +1,358 @@
+//! Predict-side measure-jet honesty: the closed-form extrapolation variance
+//! of V∞ §5 (`docs/measure_jet_v_infinity.md`), slice 3.
+//!
+//! V0's Gaussian representers decay off-support toward the parametric
+//! backbone with SMALL Vp — confident reversion, which the honesty contract
+//! forbids. The structural fix prices ignorance off the web from the SAME
+//! fitted spectrum that smooths on it: every band level ℓ carries a fitted
+//! amplitude λ̂_ℓ (prior precision of the level's innovations), and a query
+//! that the level-ℓ kernel mass does not cover simply has an UNKNOWN level-ℓ
+//! innovation — prior variance λ̂_ℓ⁻¹, collected in full.
+//!
+//! # The formula (and its algebraic relation to §5)
+//!
+//! With `a_ℓ(x★) = min(q_ℓ(x★)/total_mass, 1)` the normalized kernel-mass
+//! fraction at scale ℓ (a smooth on-web-ness weight in `[0, 1]`) and
+//! `ℓ★ = min{ℓ : q_ℓ(x★) ≥ coverage_floor · total_mass}` the first covering
+//! level (ε★ = ε_{ℓ★}),
+//!
+//! ```text
+//!   Var_extrap(x★) = Σ_{ℓ < ℓ★} λ̂_ℓ⁻¹  +  Σ_{ℓ ≥ ℓ★} (1 − a_ℓ(x★)) · λ̂_ℓ⁻¹
+//!                  = Σ_ℓ λ̂_ℓ⁻¹  −  Σ_{ℓ: ε_ℓ ≥ ε★} a_ℓ(x★) · λ̂_ℓ⁻¹ .
+//! ```
+//!
+//! The second line is the §5 statement: the total prior ignorance of the
+//! spectrum minus the part the query's coverage recovers — the recovered sum
+//! runs over the covered levels `ε_ℓ ≥ ε★` exactly as written in the charter.
+//! On-web queries (ε★ = ε_0, a_ℓ ≈ 1 everywhere) recover the full spectrum
+//! and pay ≈ 0 extra; far-off queries recover (almost) nothing and pay the
+//! full Σ_ℓ λ̂_ℓ⁻¹. Levels FINER than the first covering scale get no credit
+//! for stray sub-floor kernel mass: below ε★ the prediction is a jet
+//! extension, not an interpolation, so those innovations are charged as pure
+//! ignorance.
+//!
+//! # Never-covered convention
+//!
+//! If no band level clears the coverage floor (ε★ lies past the band), the
+//! covered set is EMPTY: every level contributes its full λ̂_ℓ⁻¹ and
+//! `Var_extrap = Σ_ℓ λ̂_ℓ⁻¹` — the variance saturates at the spectrum's total
+//! prior ignorance instead of growing without bound, which is the honest
+//! statement: the model's coefficient prior is the only information it ever
+//! claimed about such a point.
+//!
+//! # Monotonicity (the distance-honesty theorem)
+//!
+//! Claim: if `q ≤ q′` pointwise (the support row of the farther query is
+//! nowhere larger), then `Var_extrap(q) ≥ Var_extrap(q′)`.
+//!
+//! Proof. `{ℓ : q_ℓ ≥ c} ⊆ {ℓ : q′_ℓ ≥ c}` for the floor `c`, so
+//! `ℓ★(q) ≥ ℓ★(q′)`. Compare the per-level weights `w_ℓ`:
+//! - `ℓ < ℓ★(q′)`: both weights are 1;
+//! - `ℓ ≥ ℓ★(q)`: `w_ℓ(q) = 1 − a_ℓ(q) ≥ 1 − a_ℓ(q′) = w_ℓ(q′)`;
+//! - `ℓ★(q′) ≤ ℓ < ℓ★(q)`: `w_ℓ(q) = 1 ≥ 1 − a_ℓ(q′) = w_ℓ(q′)`.
+//! Every weight is no smaller and every `λ̂_ℓ⁻¹ > 0`, so the sum is no
+//! smaller. ∎
+//!
+//! Since the Gaussian kernel mass `q_ℓ(x★)` is pointwise nonincreasing as
+//! `x★` recedes from every center simultaneously, intervals widen
+//! monotonically with distance from the web. The ε★ gate introduces the only
+//! discontinuity, and it is bounded: a level crossing the floor changes its
+//! weight by at most `a_ℓ ≤ coverage_floor`, so the total jump is at most
+//! `coverage_floor · Σ_ℓ λ̂_ℓ⁻¹` and vanishes as the floor tightens.
+//!
+//! # Units
+//!
+//! The result is on the scale of `λ̂⁻¹`: whatever normalization the caller's
+//! amplitudes carry (for the fitted per-scale candidates this is the
+//! Frobenius-normalized penalty scale, times the family dispersion on the
+//! η-variance side) is the caller's contract — this function is the pure
+//! spectrum-side kernel, microseconds and solve-free by construction.
+
+use ndarray::ArrayView1;
+
+use super::BasisError;
+
+/// V∞ §5: closed-form extrapolation variance at a query — the price of
+/// ignorance off the web, read from the fitted spectrum. `ε★` = the first
+/// covering scale (smallest band scale at which the query's kernel mass
+/// clears `coverage_floor` × total mass); levels finer than `ε★` contribute
+/// their full prior variance `λ̂_ℓ⁻¹`, levels from `ε★` up contribute the
+/// uncovered fraction `(1 − a_ℓ(x★)) · λ̂_ℓ⁻¹` with
+/// `a_ℓ(x★) = min(q_ℓ(x★)/total_mass, 1)` the smooth on-web-ness weight.
+/// Equivalently (see the module docs) the total prior ignorance
+/// `Σ_ℓ λ̂_ℓ⁻¹` minus the §5 coverage-recovered sum
+/// `Σ_{ℓ: ε_ℓ ≥ ε★} a_ℓ(x★)/λ̂_ℓ`. On-web queries (ε★ = ε_0, a ≈ 1) pay
+/// ≈ 0 extra; queries never covered by the band pay `Σ_ℓ λ̂_ℓ⁻¹` exactly —
+/// intervals widen monotonically with distance (theorem in the module docs).
+///
+/// Inputs: `support_row` = `q_ℓ(x★)` per band scale (one row of
+/// [`super::measure_jet_support_curve`]), `eps_band` the realized ascending
+/// band, `total_mass` = Σ masses (≈ 1 for the standard quadrature),
+/// `lambda_hat` the fitted per-scale amplitudes, `coverage_floor` ∈ (0, 1)
+/// (e.g. 0.05).
+pub fn measure_jet_extrapolation_variance(
+    support_row: ArrayView1<'_, f64>,
+    eps_band: &[f64],
+    total_mass: f64,
+    lambda_hat: &[f64],
+    coverage_floor: f64,
+) -> Result<f64, BasisError> {
+    let n_levels = eps_band.len();
+    if n_levels == 0 {
+        crate::bail_invalid_basis!("measure-jet extrapolation variance needs a nonempty band");
+    }
+    if support_row.len() != n_levels || lambda_hat.len() != n_levels {
+        crate::bail_dim_basis!(
+            "measure-jet extrapolation variance needs one support value and one amplitude per \
+             band scale: {} support values, {} amplitudes, {} scales",
+            support_row.len(),
+            lambda_hat.len(),
+            n_levels
+        );
+    }
+    for (l, pair) in eps_band.windows(2).enumerate() {
+        if pair[1] <= pair[0] {
+            crate::bail_invalid_basis!(
+                "measure-jet band must be strictly ascending: eps[{l}] = {} vs eps[{}] = {}",
+                pair[0],
+                l + 1,
+                pair[1]
+            );
+        }
+    }
+    if eps_band.iter().any(|e| !(e.is_finite() && *e > 0.0)) {
+        crate::bail_invalid_basis!("measure-jet band scales must be finite and positive");
+    }
+    if support_row.iter().any(|q| !(q.is_finite() && *q >= 0.0)) {
+        crate::bail_invalid_basis!(
+            "measure-jet support row must be finite and nonnegative (kernel masses)"
+        );
+    }
+    if lambda_hat.iter().any(|l| !(l.is_finite() && *l > 0.0)) {
+        crate::bail_invalid_basis!(
+            "measure-jet per-scale amplitudes must be finite and positive (fitted precisions)"
+        );
+    }
+    if !(total_mass.is_finite() && total_mass > 0.0) {
+        crate::bail_invalid_basis!(
+            "measure-jet extrapolation variance needs a positive finite total mass; got {total_mass}"
+        );
+    }
+    if !(coverage_floor.is_finite() && coverage_floor > 0.0 && coverage_floor < 1.0) {
+        crate::bail_invalid_basis!(
+            "measure-jet coverage floor must lie strictly in (0, 1); got {coverage_floor}"
+        );
+    }
+    // First covering level ℓ★ (never-covered convention: ℓ★ = L, empty
+    // covered set, every level charged in full).
+    let threshold = coverage_floor * total_mass;
+    let first_covering = support_row
+        .iter()
+        .position(|q| *q >= threshold)
+        .unwrap_or(n_levels);
+    let mut variance = 0.0_f64;
+    for (l, (&q, &lam)) in support_row.iter().zip(lambda_hat.iter()).enumerate() {
+        let weight = if l < first_covering {
+            1.0
+        } else {
+            1.0 - (q / total_mass).min(1.0)
+        };
+        variance += weight / lam;
+    }
+    Ok(variance)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{Array1, arr1};
+
+    /// Shared deterministic fixture: a 5-level dyadic band with a
+    /// non-constant fitted spectrum.
+    fn band() -> Vec<f64> {
+        vec![0.05, 0.1, 0.2, 0.4, 0.8]
+    }
+
+    fn lambdas() -> Vec<f64> {
+        vec![40.0, 11.0, 3.5, 1.25, 0.6]
+    }
+
+    const FLOOR: f64 = 0.05;
+    const TOTAL: f64 = 1.0;
+
+    fn total_ignorance(lams: &[f64]) -> f64 {
+        lams.iter().map(|l| 1.0 / l).sum()
+    }
+
+    /// The exact single-unit-mass support curve at distance `d`:
+    /// q_ℓ(d) = total · exp(−d²/(2ε_ℓ²)) — the physical family the support
+    /// diagnostic produces for a one-center web.
+    fn support_at_distance(d: f64, eps: &[f64]) -> Array1<f64> {
+        Array1::from_iter(
+            eps.iter()
+                .map(|e| TOTAL * (-d * d / (2.0 * e * e)).exp()),
+        )
+    }
+
+    /// (a) Monotone in distance: along the exact kernel-mass family the
+    /// support row is pointwise nonincreasing in d, so the variance must be
+    /// nondecreasing — including across every coverage-floor crossing in the
+    /// sweep.
+    #[test]
+    fn extrapolation_variance_is_monotone_in_distance() {
+        let eps = band();
+        let lams = lambdas();
+        let mut prev = -1.0_f64;
+        // 0 → 6 in steps of 0.015: spans on-web through far-off, crossing
+        // the floor at every band level along the way.
+        for step in 0..400 {
+            let d = 0.015 * step as f64;
+            let row = support_at_distance(d, &eps);
+            let v = measure_jet_extrapolation_variance(row.view(), &eps, TOTAL, &lams, FLOOR)
+                .expect("valid inputs");
+            assert!(
+                v >= prev,
+                "variance decreased with distance: V({d:.3}) = {v:.12} < {prev:.12}"
+            );
+            prev = v;
+        }
+        // And the saturation: the far end of the sweep reaches the full
+        // prior ignorance (never-covered convention).
+        assert!(
+            (prev - total_ignorance(&lams)).abs() <= 1e-12,
+            "far-field variance must saturate at Σ 1/λ̂: got {prev}"
+        );
+    }
+
+    /// (a′) Pointwise domination, no geometric family assumed: a support row
+    /// that is pointwise smaller never yields smaller variance — exercised
+    /// on a NON-monotone-in-ℓ row pair as well.
+    #[test]
+    fn extrapolation_variance_is_monotone_under_pointwise_domination() {
+        let eps = band();
+        let lams = lambdas();
+        let rows = [
+            arr1(&[0.9, 0.95, 0.99, 1.0, 1.0]),
+            arr1(&[0.02, 0.3, 0.06, 0.8, 0.97]),
+            arr1(&[0.0, 0.0, 0.04, 0.2, 0.6]),
+            arr1(&[0.04, 0.04, 0.04, 0.04, 0.049]),
+        ];
+        for row in &rows {
+            for shrink in [1.0, 0.9, 0.7, 0.3, 0.0] {
+                let smaller = row.mapv(|q| shrink * q);
+                let v_big =
+                    measure_jet_extrapolation_variance(row.view(), &eps, TOTAL, &lams, FLOOR)
+                        .expect("valid inputs");
+                let v_small =
+                    measure_jet_extrapolation_variance(smaller.view(), &eps, TOTAL, &lams, FLOOR)
+                        .expect("valid inputs");
+                assert!(
+                    v_small >= v_big,
+                    "pointwise-smaller support gave smaller variance: {v_small} < {v_big} \
+                     (row {row:?}, shrink {shrink})"
+                );
+            }
+        }
+    }
+
+    /// (b) On-web limit: full kernel mass at every scale prices ZERO extra
+    /// variance; near-full mass prices at most the uncovered fraction of the
+    /// total prior ignorance.
+    #[test]
+    fn extrapolation_variance_vanishes_on_web() {
+        let eps = band();
+        let lams = lambdas();
+        let full = Array1::from_elem(eps.len(), TOTAL);
+        let v_full = measure_jet_extrapolation_variance(full.view(), &eps, TOTAL, &lams, FLOOR)
+            .expect("valid inputs");
+        assert_eq!(v_full, 0.0, "full coverage must price zero extra variance");
+
+        let near = Array1::from_elem(eps.len(), 0.97 * TOTAL);
+        let v_near = measure_jet_extrapolation_variance(near.view(), &eps, TOTAL, &lams, FLOOR)
+            .expect("valid inputs");
+        let budget = total_ignorance(&lams);
+        assert!(
+            v_near <= 0.05 * budget,
+            "near-full coverage must price a small fraction of Σ 1/λ̂: {v_near} vs budget {budget}"
+        );
+    }
+
+    /// (c) Off-web limit: zero support everywhere (never covered) collects
+    /// the spectrum's total prior ignorance Σ 1/λ̂ EXACTLY.
+    #[test]
+    fn extrapolation_variance_saturates_off_web() {
+        let eps = band();
+        let lams = lambdas();
+        let zero = Array1::<f64>::zeros(eps.len());
+        let v = measure_jet_extrapolation_variance(zero.view(), &eps, TOTAL, &lams, FLOOR)
+            .expect("valid inputs");
+        assert_eq!(
+            v,
+            total_ignorance(&lams),
+            "never-covered query must pay Σ 1/λ̂ exactly"
+        );
+    }
+
+    /// (d) Spectrum scaling: doubling every fitted amplitude halves the
+    /// variance — the λ̂⁻¹ pricing is exact, in every coverage regime.
+    #[test]
+    fn extrapolation_variance_halves_when_amplitudes_double() {
+        let eps = band();
+        let lams = lambdas();
+        let doubled: Vec<f64> = lams.iter().map(|l| 2.0 * l).collect();
+        // Mixed regime: some levels below the floor, some covered partially,
+        // some fully — both weight branches exercised.
+        let rows = [
+            support_at_distance(0.35, &eps),
+            Array1::<f64>::zeros(eps.len()),
+            Array1::from_elem(eps.len(), 0.5),
+        ];
+        for row in &rows {
+            let v1 = measure_jet_extrapolation_variance(row.view(), &eps, TOTAL, &lams, FLOOR)
+                .expect("valid inputs");
+            let v2 = measure_jet_extrapolation_variance(row.view(), &eps, TOTAL, &doubled, FLOOR)
+                .expect("valid inputs");
+            assert!(
+                (2.0 * v2 - v1).abs() <= 1e-15 * v1.max(1.0),
+                "doubling λ̂ must halve the variance: {v1} vs 2×{v2}"
+            );
+        }
+    }
+
+    /// Convention pin: the ε★ gate. Sub-floor mass at every level is
+    /// never-covered (full Σ 1/λ̂, no credit for stray mass); the moment ONE
+    /// level clears the floor, that level and every coarser one switch to
+    /// the smooth uncovered-fraction weight while finer levels stay fully
+    /// charged.
+    #[test]
+    fn extrapolation_variance_gate_convention() {
+        let eps = band();
+        let lams = lambdas();
+        let sub_floor = Array1::from_elem(eps.len(), 0.049 * TOTAL);
+        let v_sub = measure_jet_extrapolation_variance(sub_floor.view(), &eps, TOTAL, &lams, FLOOR)
+            .expect("valid inputs");
+        assert_eq!(
+            v_sub,
+            total_ignorance(&lams),
+            "sub-floor mass earns no credit: full Σ 1/λ̂"
+        );
+
+        // Coverage exactly at the floor on the coarsest level only.
+        let mut at_floor = sub_floor.clone();
+        at_floor[eps.len() - 1] = FLOOR * TOTAL;
+        let v_floor = measure_jet_extrapolation_variance(at_floor.view(), &eps, TOTAL, &lams, FLOOR)
+            .expect("valid inputs");
+        let expected: f64 = lams[..eps.len() - 1].iter().map(|l| 1.0 / l).sum::<f64>()
+            + (1.0 - FLOOR) / lams[eps.len() - 1];
+        assert!(
+            (v_floor - expected).abs() <= 1e-15,
+            "floor-clearing coarsest level must take weight 1 − a: {v_floor} vs {expected}"
+        );
+        // The gate's discontinuity is bounded by the documented
+        // coverage_floor · Σ 1/λ̂ budget.
+        assert!(
+            v_sub - v_floor <= FLOOR * total_ignorance(&lams) + 1e-15,
+            "gate jump exceeds the documented coverage_floor bound"
+        );
+    }
+}
