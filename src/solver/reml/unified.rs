@@ -5102,14 +5102,7 @@ impl PenaltySubspaceTrace {
         // left = H_proj⁻¹ · R_A ;  right = H_proj⁻¹ · R_B ;  tr(left · right).
         let left = self.h_proj_inverse.dot(ra);
         let right = self.h_proj_inverse.dot(rb);
-        let r = left.nrows();
-        let mut trace = 0.0;
-        for i in 0..r {
-            for j in 0..r {
-                trace += left[[i, j]] * right[[j, i]];
-            }
-        }
-        trace
+        trace_matrix_product(&left, &right)
     }
 
     /// Reduce a `HyperOperator` `A` to its `r × r` projection
@@ -14371,9 +14364,20 @@ impl DenseSpectralOperator {
     #[inline]
     fn trace_hinv_product_cross_rotated(&self, a_rot: &Array2<f64>, b_rot: &Array2<f64>) -> f64 {
         let mut result = 0.0;
-        for a in 0..self.n_dim {
-            for b in 0..self.n_dim {
-                result += self.hinv_cross_kernel[[a, b]] * a_rot[[a, b]] * b_rot[[b, a]];
+        for ((kernel_row, a_row), b_col) in self
+            .hinv_cross_kernel
+            .rows()
+            .into_iter()
+            .zip(a_rot.rows().into_iter())
+            .zip(b_rot.columns().into_iter())
+        {
+            for ((kernel, a_value), b_value) in kernel_row
+                .iter()
+                .copied()
+                .zip(a_row.iter().copied())
+                .zip(b_col.iter().copied())
+            {
+                result += kernel * a_value * b_value;
             }
         }
         result
@@ -14416,9 +14420,13 @@ impl DenseSpectralOperator {
     #[inline]
     fn trace_projected_cross(&self, left: &Array2<f64>, right: &Array2<f64>) -> f64 {
         let mut result = 0.0;
-        for a in 0..left.nrows() {
-            for b in 0..left.ncols() {
-                result += left[[a, b]] * right[[b, a]];
+        for (left_row, right_col) in left.rows().into_iter().zip(right.columns().into_iter()) {
+            for (left_value, right_value) in left_row
+                .iter()
+                .copied()
+                .zip(right_col.iter().copied())
+            {
+                result += left_value * right_value;
             }
         }
         result
@@ -14431,9 +14439,20 @@ impl DenseSpectralOperator {
         h_j_rot: &Array2<f64>,
     ) -> f64 {
         let mut result = 0.0;
-        for a in 0..self.n_dim {
-            for b in 0..self.n_dim {
-                result += self.logdet_hessian_kernel[[a, b]] * h_i_rot[[a, b]] * h_j_rot[[b, a]];
+        for ((kernel_row, h_i_row), h_j_col) in self
+            .logdet_hessian_kernel
+            .rows()
+            .into_iter()
+            .zip(h_i_rot.rows().into_iter())
+            .zip(h_j_rot.columns().into_iter())
+        {
+            for ((kernel, h_i_value), h_j_value) in kernel_row
+                .iter()
+                .copied()
+                .zip(h_i_row.iter().copied())
+                .zip(h_j_col.iter().copied())
+            {
+                result += kernel * h_i_value * h_j_value;
             }
         }
         result
@@ -18052,6 +18071,70 @@ mod tests {
             }
             assert_eq!(got[i].to_bits(), reference.to_bits());
         }
+    }
+
+    #[test]
+    fn projected_logdet_cross_reduced_uses_trace_product_reference() {
+        let kernel = PenaltySubspaceTrace {
+            u_s: Array2::<f64>::eye(3),
+            h_proj_inverse: array![[1.4, 0.2, -0.1], [0.2, 1.9, 0.3], [-0.1, 0.3, 1.6]],
+        };
+        let ra = Array2::from_shape_fn((3, 3), |(i, j)| {
+            ((i as f64 + 0.6) * 0.22 - (j as f64 + 0.3) * 0.35).sin()
+        });
+        let rb = Array2::from_shape_fn((3, 3), |(i, j)| {
+            ((i as f64 + 0.1) * 0.41 + (j as f64 + 0.8) * 0.18).cos()
+        });
+        let left = kernel.h_proj_inverse.dot(&ra);
+        let right = kernel.h_proj_inverse.dot(&rb);
+        let mut reference = 0.0;
+        for i in 0..left.nrows() {
+            for j in 0..left.ncols() {
+                reference += left[[i, j]] * right[[j, i]];
+            }
+        }
+
+        let got = kernel.trace_projected_logdet_cross_reduced(&ra, &rb);
+        assert_eq!(got.to_bits(), reference.to_bits());
+    }
+
+    #[test]
+    fn dense_spectral_rotated_cross_kernels_match_scalar_references_bitwise() {
+        let h = array![[3.5, 0.4, -0.2], [0.4, 2.8, 0.3], [-0.2, 0.3, 2.2]];
+        let op = DenseSpectralOperator::from_symmetric(&h).expect("spd fixture");
+        let a_rot = Array2::from_shape_fn((3, 3), |(i, j)| {
+            ((i as f64 + 0.2) * 0.31 + (j as f64 + 0.9) * 0.27).sin()
+        });
+        let b_rot = Array2::from_shape_fn((3, 3), |(i, j)| {
+            ((i as f64 + 0.7) * 0.17 - (j as f64 + 0.4) * 0.43).cos()
+        });
+
+        let mut hinv_reference = 0.0;
+        let mut logdet_reference = 0.0;
+        let mut projected_reference = 0.0;
+        for i in 0..op.n_dim {
+            for j in 0..op.n_dim {
+                hinv_reference += op.hinv_cross_kernel[[i, j]] * a_rot[[i, j]] * b_rot[[j, i]];
+                logdet_reference +=
+                    op.logdet_hessian_kernel[[i, j]] * a_rot[[i, j]] * b_rot[[j, i]];
+                projected_reference += a_rot[[i, j]] * b_rot[[j, i]];
+            }
+        }
+
+        assert_eq!(
+            op.trace_hinv_product_cross_rotated(&a_rot, &b_rot)
+                .to_bits(),
+            hinv_reference.to_bits()
+        );
+        assert_eq!(
+            op.trace_logdet_hessian_cross_rotated(&a_rot, &b_rot)
+                .to_bits(),
+            logdet_reference.to_bits()
+        );
+        assert_eq!(
+            op.trace_projected_cross(&a_rot, &b_rot).to_bits(),
+            projected_reference.to_bits()
+        );
     }
 
     // ─── Batched kernel-trace factor must reproduce the exact kernel ─────
