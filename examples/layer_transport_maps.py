@@ -265,7 +265,14 @@ def fit_layer_chart(
         K=1,
         d_atom=1,
         atom_topology="circle",
+        atom_basis="periodic",
+        assignment="softmax",
+        top_k=1,
         n_iter=n_iter,
+        sparsity_weight=0.0,
+        ard_per_atom=False,
+        nuclear_norm_weight=0.0,
+        decoder_incoherence_weight=0.0,
         random_state=seed,
     )
     theta, coord_info = phase_to_radians(np.asarray(model.coords[0], dtype=np.float64))
