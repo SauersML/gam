@@ -3664,6 +3664,22 @@ impl FittedModel {
             }
             crate::solver::spline_scan::CubicSplineScanFit::from_state(&scan.state)
                 .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
+            // A scan model carries NO dense design, so the dense-path
+            // requirements below (resolved_termspec, fit_result finiteness,
+            // family-specific blocks) do not apply. Enforce only the metadata
+            // predict actually consumes — the feature column resolves against
+            // training_headers / data_schema — then accept.
+            if self.data_schema.is_none() {
+                return Err(FittedModelError::MissingField {
+                    reason: "spline-scan model is missing data_schema; refit".to_string(),
+                });
+            }
+            if self.training_headers.is_none() {
+                return Err(FittedModelError::MissingField {
+                    reason: "spline-scan model is missing training_headers; refit".to_string(),
+                });
+            }
+            return Ok(());
         } else if self.fit_result.is_none() {
             return Err(FittedModelError::MissingField {
                 reason: "model is missing canonical fit_result payload; refit".to_string(),
