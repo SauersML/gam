@@ -290,6 +290,8 @@ pub struct CubicSplineScanFit {
     rts_gain: Vec<Mat2>,
     /// q = 1/λ used by the pass (unit-σ² scale).
     q: f64,
+    /// Pooled observation weight per knot (sum of tied raw weights).
+    node_weight: Vec<f64>,
 }
 
 /// Pool tied abscissae and validate inputs. Returns nodes plus the within-tie
@@ -476,6 +478,7 @@ pub fn fit_cubic_spline_scan_at(
         smoothed_cov: sm_cov,
         rts_gain: gains,
         q,
+        node_weight: nodes.iter().map(|n| n.w).collect(),
     })
 }
 
@@ -597,6 +600,27 @@ impl CubicSplineScanFit {
         cov = mat_add(&cov, &mat_add(&cab, &mat_t(&cab)));
         symmetrize(&mut cov);
         Ok((mean_s[0], cov[0][0] * self.sigma2))
+    }
+
+    /// Exact effective degrees of freedom of the fitted smoother.
+    ///
+    /// For a Gaussian smoother the influence (hat) matrix is
+    /// `S = Cov_post · W / σ²` (posterior mean is linear in `y` with that
+    /// exact coefficient matrix), so
+    /// `EDF = tr(S) = tr(W · Cov_post) / σ² = Σ_t w_t · Var_smoothed(f_t) / σ²`.
+    /// This is the standard Gaussian-process identity — no second smoother
+    /// pass and no approximation. Tied abscissae pool exactly: each raw row
+    /// `i` in tie-group `k` contributes `∂f̂(x_k)/∂y_i = C̃_kk · w_i` (the
+    /// pooled mean `ȳ_k` is precision-weighted), so the raw-row trace
+    /// `Σ_i w_i · C̃_{k(i),k(i)}` collapses to `Σ_k W_k · C̃_kk` with the
+    /// pooled weights `W_k`. `smoothed_cov` is stored at unit-σ² scale
+    /// (`C̃ = Cov_post / σ²`), so the σ² factors cancel exactly.
+    pub fn edf(&self) -> f64 {
+        self.node_weight
+            .iter()
+            .zip(self.smoothed_cov.iter())
+            .map(|(w, c)| w * c[0][0])
+            .sum()
     }
 
     /// Posterior `(mean, variance)` of the derivative `f′` at a knot index.
