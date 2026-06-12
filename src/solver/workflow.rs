@@ -6231,6 +6231,7 @@ fn smooth_basis_feature_cols_for_latent(
         crate::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => Some(vec![*feature_col]),
         crate::smooth::SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::Sphere { feature_cols, .. }
+        | crate::smooth::SmoothBasisSpec::ConstantCurvature { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::Matern { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::Duchon { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::Pca { feature_cols, .. }
@@ -6305,6 +6306,11 @@ fn natural_latent_manifold_for_basis(
             natural_latent_manifold_for_basis(inner, d)
         }
         crate::smooth::SmoothBasisSpec::ThinPlate { .. }
+        // ConstantCurvature: the chart coordinates are Euclidean-valued (any
+        // finite point for κ ≥ 0; the latent optimizer's chart-validity is the
+        // term's own concern), so the latent retraction stays Euclidean. A
+        // κ-aware latent seed/retraction is part of the later ψ-channel stage.
+        | crate::smooth::SmoothBasisSpec::ConstantCurvature { .. }
         | crate::smooth::SmoothBasisSpec::Matern { .. }
         | crate::smooth::SmoothBasisSpec::Duchon { .. }
         | crate::smooth::SmoothBasisSpec::Pca { .. }

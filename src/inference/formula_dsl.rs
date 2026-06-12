@@ -2526,6 +2526,26 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
+            "curv" | "curvature" | "constant_curvature" | "mkappa" => {
+                // Constant-curvature (M_κ) geodesic-kernel smooth (#944): the
+                // κ-generic sibling of sphere()/s2(), interpolating
+                // S^d → ℝ^d → H^d through `kappa=` (default 0 = flat). All
+                // four aliases must dispatch through the identical
+                // `type=curvature` route, mirroring the sphere alias rule.
+                if vars.is_empty() {
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("{name}() requires at least one variable: {raw}"),
+                    }
+                    .into());
+                }
+                options.insert("type".to_string(), "curvature".to_string());
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
             "matern" => {
                 if vars.is_empty() {
                     return Err(FormulaDslError::InvalidArgument {

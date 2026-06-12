@@ -2020,8 +2020,12 @@ fn collect_smooth_extrapolation_axes(
         }
         // Sphere: latitude is clipped to manifold bounds, longitude is periodic —
         // both handled elsewhere with non-plateau semantics. Pca: no extrapolation
-        // contract, stays clipped.
-        SmoothBasisSpec::Sphere { .. } | SmoothBasisSpec::Pca { .. } => {}
+        // contract, stays clipped. ConstantCurvature: chart coordinates must stay
+        // inside the κ-stereographic chart (open ball for κ < 0), so clipping new
+        // data to the training range is the safe out-of-hull behavior.
+        SmoothBasisSpec::Sphere { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Pca { .. } => {}
     }
 }
 
@@ -4120,6 +4124,7 @@ mod tests {
                 survival_link_wiggle_degree: None,
                 criterion_certificate: None,
                 rho_posterior_certificate: None,
+                rho_posterior_escalation: None,
             },
             inner_cycles: 0,
         }
