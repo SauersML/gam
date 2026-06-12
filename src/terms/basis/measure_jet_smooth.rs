@@ -88,6 +88,10 @@
 //! factorization) replaces this module's REALIZATION without touching the
 //! estimand: the analysis-form energy above is the definition, everything
 //! else is certified quadrature of it.
+//! The long-form home for the ladder and the substrate contracts is the V∞
+//! charter (`docs/measure_jet_v_infinity.md`); its §2 moment substrate is
+//! `measure_jet_moments.rs`, its §5 extrapolation pricing
+//! `measure_jet_predict.rs`.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use rayon::prelude::*;
@@ -102,7 +106,7 @@ use super::{
     BasisMetadata, CenterStrategy, PenaltyCandidate, PenaltySource,
     filter_active_penalty_candidates_with_ops, normalize_penalty,
     normalize_penalty_cross_psi_derivative, normalize_penaltywith_psi_derivatives,
-    select_centers_by_strategy,
+    select_centers_by_strategy, trace_of_product,
 };
 
 /// Truncation radius of the Gaussian profile in units of the scale ε: weights
@@ -300,11 +304,13 @@ fn householder_drop_first_apply(x: &Array2<f64>, u: &Array1<f64>) -> Array2<f64>
 /// Pairwise squared distances `‖a_i − b_j‖²` via the GEMM identity
 /// `‖a − b‖² = ‖a‖² + ‖b‖² − 2·aᵀb`: one (n×d)·(d×m) matrix product carries
 /// every FMA at tile speed instead of n·m scalar distance loops — the
-/// machine-native form of this kernel (every hot pass in the build is this
-/// one operation in disguise). The cancellation error near-coincident
-/// points pay is O(ε_f64·‖x‖²) ABSOLUTE, harmless under a Gaussian profile
-/// (the kernel is flat at d ≈ 0); clamped at zero so roundoff cannot emit
-/// tiny negatives.
+/// machine-native form of this kernel, and the module's ONLY distance
+/// source (representer design, support curve, and the center-pair geometry:
+/// band floor, median spacing, ε/2-net, neighbor cutoffs). The cancellation
+/// error near-coincident points pay is O(ε_f64·‖x‖²) ABSOLUTE, harmless
+/// under a Gaussian profile (the kernel is flat at d ≈ 0); clamped at zero
+/// so roundoff cannot emit tiny negatives (the a = b diagonal therefore
+/// lands at roundoff scale, not an exact 0 — no caller pins it).
 fn pairwise_sq_dists(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
     let an: Vec<f64> = a.outer_iter().map(|r| r.dot(&r)).collect();
     let bn: Vec<f64> = b.outer_iter().map(|r| r.dot(&r)).collect();
@@ -332,24 +338,6 @@ fn validate_finite_points(points: ArrayView2<'_, f64>, what: &str) -> Result<(),
         }
     }
     Ok(())
-}
-
-/// Squared Euclidean distances between all center pairs (m × m, symmetric).
-fn center_pairwise_dist2(centers: ArrayView2<'_, f64>) -> Array2<f64> {
-    let m = centers.nrows();
-    let mut d2 = Array2::<f64>::zeros((m, m));
-    for i in 0..m {
-        for j in (i + 1)..m {
-            let mut s = 0.0_f64;
-            for k in 0..centers.ncols() {
-                let dlt = centers[(i, k)] - centers[(j, k)];
-                s += dlt * dlt;
-            }
-            d2[(i, j)] = s;
-            d2[(j, i)] = s;
-        }
-    }
-    d2
 }
 
 /// Median nearest-OTHER-center distance — the resolution floor of the center
@@ -391,7 +379,7 @@ pub fn measure_jet_band(
     num_scales: usize,
 ) -> Result<MeasureJetBand, BasisError> {
     validate_finite_points(centers, "centers")?;
-    let dist2 = center_pairwise_dist2(centers);
+    let dist2 = pairwise_sq_dists(centers, centers);
     let eps_min = median_nearest_center_spacing(&dist2)?;
     // Half the bounding-box diagonal: a cheap, deterministic diameter proxy.
     let d = centers.ncols();
@@ -585,7 +573,7 @@ where
     if masses.iter().any(|v| !(v.is_finite() && *v >= 0.0)) {
         crate::bail_invalid_basis!("measure-jet energy needs finite nonnegative center masses");
     }
-    let dist2 = center_pairwise_dist2(centers);
+    let dist2 = pairwise_sq_dists(centers, centers);
 
     // One block of `n_forms` m×m accumulators per scale. Each scale's center
     // loop is sequential and the cross-scale sum below runs in band order,
@@ -694,33 +682,21 @@ where
                     0.0
                 };
             }
-            // M = V·diag(inv)·Vᵀ, then the projected block B·M·Bᵀ/q.
-            let mut vm = evecs.clone();
-            for (k, mut col) in vm.axis_iter_mut(Axis(1)).enumerate() {
-                col.mapv_inplace(|v| v * inv_diag[k]);
-            }
-            let m_inv = vm.dot(&evecs.t());
-            let bm = b.dot(&m_inv);
-            // Resolvent powers for the ln-τ jets, computed only on request:
-            // B·M²·Bᵀ/q (first τ-derivative channel) and B·M³·Bᵀ/q (second).
-            let bm2 = if channels >= 2 {
-                let mut vm2 = evecs.clone();
-                for (k, mut col) in vm2.axis_iter_mut(Axis(1)).enumerate() {
-                    col.mapv_inplace(|v| v * inv_diag[k] * inv_diag[k]);
+            // ONE resolvent-power kernel `M^p = V·diag(inv_diag^p)·Vᵀ`
+            // (`M = (G + τI)⁻¹`) serves the value channel (p = 1) and the
+            // ln-τ jet channels `B·M²·Bᵀ/q`, `B·M³·Bᵀ/q` — the latter two
+            // computed only on request.
+            let m_power = |power: i32| -> Array2<f64> {
+                let mut vm = evecs.clone();
+                for (k, mut col) in vm.axis_iter_mut(Axis(1)).enumerate() {
+                    let s = inv_diag[k].powi(power);
+                    col.mapv_inplace(|v| v * s);
                 }
-                Some(b.dot(&vm2.dot(&evecs.t())))
-            } else {
-                None
+                vm.dot(&evecs.t())
             };
-            let bm3 = if channels >= 3 {
-                let mut vm3 = evecs.clone();
-                for (k, mut col) in vm3.axis_iter_mut(Axis(1)).enumerate() {
-                    col.mapv_inplace(|v| v * inv_diag[k] * inv_diag[k] * inv_diag[k]);
-                }
-                Some(b.dot(&vm3.dot(&evecs.t())))
-            } else {
-                None
-            };
+            let bm = b.dot(&m_power(1));
+            let bm2 = (channels >= 2).then(|| b.dot(&m_power(2)));
+            let bm3 = (channels >= 3).then(|| b.dot(&m_power(3)));
             let base = scale_weight * net_mass[i] * q.powf(1.0 - 2.0 * alpha);
             weights(scale_idx, eps, q, base, &mut wbuf);
             // Scatter-add Σ_k wbuf[k]·[R | B·M²·Bᵀ/q | B·M³·Bᵀ/q] into each form.
@@ -912,8 +888,10 @@ pub fn measure_jet_scale_spectrum(
         );
     }
     let forms = measure_jet_energy_forms_per_scale(centers, masses, band, order_s, alpha, tau0)?;
-    let v = values.to_owned();
-    Ok(forms.iter().map(|q_l| v.dot(&q_l.dot(&v))).collect())
+    Ok(forms
+        .iter()
+        .map(|q_l| values.dot(&q_l.dot(&values)))
+        .collect())
 }
 
 /// The per-scale energy forms `Q_ℓ` (each m × m, symmetric PSD), with
@@ -1054,7 +1032,7 @@ pub fn realized_measure_jet_length_scale(
             "measure-jet length_scale must be positive (or 0.0 for auto); got {spec_length_scale}"
         );
     }
-    let dist2 = center_pairwise_dist2(centers);
+    let dist2 = pairwise_sq_dists(centers, centers);
     let spacing = median_nearest_center_spacing(&dist2)?;
     Ok(MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR * spacing)
 }
@@ -1453,17 +1431,25 @@ pub fn build_measure_jet_basis_psi_derivatives(
     // through the on-demand provider.
     let mut crosses: Vec<Vec<Array2<f64>>> = (0..pairs.len()).map(|_| Vec::new()).collect();
     for (s_raw, firsts, seconds, cross_raw) in &raw {
-        // The normalized value's Frobenius scale anchors every derivative of
-        // this candidate; the per-coordinate helper recomputes the identical
-        // c, so each coordinate's normalized first/second stay coherent with
-        // the fit-time candidate.
-        let mut c_for_cross = 0.0_f64;
+        // ONE Frobenius scale per candidate, fixed up front from `s_raw`
+        // alone: c anchors the value and every derivative of this candidate.
+        // `normalize_penaltywith_psi_derivatives` recomputes the identical c
+        // per coordinate (same trace_of_product + sqrt on the same `s_raw`),
+        // and its degenerate convention is mirrored here: ‖S‖_F ≤ 1e-12 (or
+        // non-finite) reports scale 1.0 — the value passes through unscaled,
+        // and the cross helper receives that same 1.0, never a collapsed
+        // near-zero scale.
+        let fro = trace_of_product(s_raw, s_raw).sqrt();
+        let c = if fro.is_finite() && fro > 1e-12 {
+            fro
+        } else {
+            1.0
+        };
         for coord in 0..n_coords {
-            let (_, s_first, s_second, c) =
+            let (_, s_first, s_second, _) =
                 normalize_penaltywith_psi_derivatives(s_raw, &firsts[coord], &seconds[coord]);
             penalties_first[coord].push(s_first);
             penalties_second_diag[coord].push(s_second);
-            c_for_cross = c;
         }
         for (pair_idx, &(a, b)) in pairs.iter().enumerate() {
             crosses[pair_idx].push(normalize_penalty_cross_psi_derivative(
@@ -1471,7 +1457,7 @@ pub fn build_measure_jet_basis_psi_derivatives(
                 &firsts[a],
                 &firsts[b],
                 &cross_raw[pair_idx],
-                c_for_cross,
+                c,
             ));
         }
     }

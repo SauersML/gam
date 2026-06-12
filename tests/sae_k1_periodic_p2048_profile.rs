@@ -13,6 +13,7 @@
 //! Run on MSI:
 //!   msi_probe.sh --test sae_k1_periodic_p2048_profile -- --nocapture
 
+use faer::Side as FaerSide;
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use gam::solver::outer_strategy::OuterProblem;
 use gam::solver::seeding::SeedConfig;
@@ -22,7 +23,6 @@ use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
 };
-use faer::Side as FaerSide;
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
 use std::time::Instant;
@@ -72,10 +72,7 @@ fn build_term(z: ArrayView2<'_, f64>) -> SaeManifoldTerm {
     }
     let z_owned = z.to_owned();
     let xtz = fast_atb(&phi, &z_owned);
-    let decoder = xtx
-        .cholesky(FaerSide::Lower)
-        .unwrap()
-        .solve_mat(&xtz);
+    let decoder = xtx.cholesky(FaerSide::Lower).unwrap().solve_mat(&xtz);
     let atom = SaeManifoldAtom::new(
         "circle",
         SaeAtomBasisKind::Periodic,
@@ -190,6 +187,9 @@ fn profile_k1_periodic_high_p_phase_breakdown() {
             cold.is_ok()
         );
 
-        assert!(ev >= 0.90, "p={p}: profiling fit should still recover the circle, EV={ev:.4}");
+        assert!(
+            ev >= 0.90,
+            "p={p}: profiling fit should still recover the circle, EV={ev:.4}"
+        );
     }
 }
