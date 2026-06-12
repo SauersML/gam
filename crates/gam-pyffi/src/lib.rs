@@ -25073,7 +25073,10 @@ fn fit_dataset_impl(
             // below. Mirrors the CLI run_fit path so CLI and FFI saves agree.
             if let Some(inputs) = gam::spline_scan_fast_path(&standard_request) {
                 let scan = gam::solver::spline_scan::fit_cubic_spline_scan(
-                    &inputs.x, &inputs.y, &inputs.w,
+                    &inputs.x,
+                    &inputs.y,
+                    &inputs.w,
+                    inputs.order,
                 )
                 .map_err(|reason| gam::WorkflowError::IntegrationFailed { reason })?;
                 let feature_col = match &standard_request.spec.smooth_terms[0].basis {

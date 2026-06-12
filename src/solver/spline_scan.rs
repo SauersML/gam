@@ -812,6 +812,7 @@ impl CubicSplineScanFit {
             .collect();
         let sigma2 = state.sigma2;
         Ok(Self {
+            order,
             knots: state.knots.clone(),
             mean: smoothed_state.iter().map(|s| s[0]).collect(),
             deriv: smoothed_state.iter().map(|s| s[1]).collect(),
@@ -985,7 +986,7 @@ mod tests {
             })
             .collect();
         let w: Vec<f64> = (0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)).collect();
-        let fit = fit_cubic_spline_scan(&x, &y, &w).expect("scan fit");
+        let fit = fit_cubic_spline_scan(&x, &y, &w, 2).expect("scan fit");
 
         let json = serde_json::to_string(&fit.to_state()).expect("serialize state");
         let state: SplineScanState = serde_json::from_str(&json).expect("deserialize state");
@@ -1022,5 +1023,106 @@ mod tests {
         let mut bad = fit.to_state();
         bad.knots[2] = bad.knots[1];
         CubicSplineScanFit::from_state(&bad).expect_err("non-increasing knots must error");
+    }
+
+    /// Dense order-1 (random-walk / linear smoothing spline) posterior of the
+    /// SAME intrinsic prior the order-1 scan integrates: improper level on
+    /// `f_0`, increments `f_{t+1}−f_t ~ N(0, q·δ_t)`, observations `y_t` with
+    /// precision `w_t` (unit σ²). Solve the tridiagonal precision densely and
+    /// compare to the scan — the exact-equivalence gate for the new m=1 path.
+    fn dense_rw_truth(x: &[f64], y: &[f64], w: &[f64], log_lambda: f64) -> (Vec<f64>, Vec<f64>) {
+        let n = x.len();
+        let q = (-log_lambda).exp();
+        let mut prec = vec![vec![0.0_f64; n]; n];
+        let mut rhs = vec![0.0_f64; n];
+        for t in 0..n {
+            prec[t][t] += w[t];
+            rhs[t] += w[t] * y[t];
+        }
+        for t in 0..n - 1 {
+            let p = 1.0 / (q * (x[t + 1] - x[t]));
+            prec[t][t] += p;
+            prec[t + 1][t + 1] += p;
+            prec[t][t + 1] -= p;
+            prec[t + 1][t] -= p;
+        }
+        // Dense inverse via Gauss-Jordan (small n in the test).
+        let mut aug = prec.clone();
+        let mut inv = vec![vec![0.0_f64; n]; n];
+        for i in 0..n {
+            inv[i][i] = 1.0;
+        }
+        for col in 0..n {
+            let piv = (col..n)
+                .max_by(|&a, &b| aug[a][col].abs().total_cmp(&aug[b][col].abs()))
+                .unwrap();
+            aug.swap(col, piv);
+            inv.swap(col, piv);
+            let d = aug[col][col];
+            for k in 0..n {
+                aug[col][k] /= d;
+                inv[col][k] /= d;
+            }
+            for r in 0..n {
+                if r == col {
+                    continue;
+                }
+                let f = aug[r][col];
+                if f == 0.0 {
+                    continue;
+                }
+                for k in 0..n {
+                    aug[r][k] -= f * aug[col][k];
+                    inv[r][k] -= f * inv[col][k];
+                }
+            }
+        }
+        let mean: Vec<f64> = (0..n)
+            .map(|i| (0..n).map(|j| inv[i][j] * rhs[j]).sum())
+            .collect();
+        let var: Vec<f64> = (0..n).map(|i| inv[i][i]).collect();
+        (mean, var)
+    }
+
+    /// The order-1 scan must reproduce the dense random-walk posterior exactly
+    /// (mean, pointwise variance, and the EDF identity tr(S)=Σ w_t·Var_t/σ²) at
+    /// the scan's own selected λ — the #1034-item-2 correctness gate.
+    #[test]
+    fn order_one_scan_matches_dense_random_walk_posterior() {
+        let n = 30usize;
+        let x: Vec<f64> = (0..n).map(|i| i as f64 / (n as f64 - 1.0)).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, &xi)| 2.0 * xi + 0.4 * (5.0 * xi).sin() + 0.05 * ((i * 13 % 7) as f64 - 3.0))
+            .collect();
+        let w = vec![1.0_f64; n];
+        let fit = fit_cubic_spline_scan(&x, &y, &w, 1).expect("order-1 scan fit");
+        assert_eq!(fit.order, 1);
+
+        let (mean, var) = dense_rw_truth(&x, &y, &w, fit.log_lambda);
+        for t in 0..n {
+            assert!(
+                (fit.mean[t] - mean[t]).abs() <= 1e-7 * mean[t].abs().max(1e-3),
+                "order-1 mean mismatch at {t}: scan={} dense={}",
+                fit.mean[t],
+                mean[t]
+            );
+            let se_scan = fit.var[t].sqrt();
+            let se_dense = (var[t] * fit.sigma2).sqrt();
+            assert!(
+                (se_scan - se_dense).abs() <= 1e-7 * se_dense.max(1e-12),
+                "order-1 SE mismatch at {t}: scan={se_scan} dense={se_dense}"
+            );
+        }
+        // EDF identity against the dense posterior variance diagonal.
+        let dense_edf: f64 = w.iter().zip(var.iter()).map(|(wt, vt)| wt * vt).sum();
+        assert!(
+            (fit.edf() - dense_edf).abs() <= 1e-7 * dense_edf.max(1e-12),
+            "order-1 EDF mismatch: scan={} dense={dense_edf}",
+            fit.edf()
+        );
+        // Order-1 derivative state is structurally absent.
+        assert!(fit.deriv.iter().all(|&d| d == 0.0));
     }
 }
