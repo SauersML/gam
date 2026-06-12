@@ -196,6 +196,8 @@ def main():
             ax.scatter(x[:, 0], x[:, 1], c=colors, s=9, alpha=0.55)
         else:
             ax.scatter(x[:, 0], x[:, 1], s=9, alpha=0.5, color="tab:blue")
+        if res["status"] == "ok" and res["ev"] < 0.95:
+            res["status"] = "low-ev"
         if res["status"] == "ok":
             fitted = res["fitted"]
             groups = (
@@ -214,6 +216,8 @@ def main():
                     pts = np.vstack([pts, pts[:1]])
                 ax.plot(pts[:, 0], pts[:, 1], "r-", lw=2)
             ax.set_title(f"{name}\nEV={res['ev']:.4f}  {res['seconds']:.0f}s", color="darkgreen")
+        elif res["status"] == "low-ev":
+            ax.set_title(f"{name}\nLOW QUALITY: EV={res['ev']:.4f}  {res['seconds']:.0f}s", color="darkorange")
         elif res["status"] == "timeout":
             ax.set_title(f"{name}\nTIMEOUT >{args.timeout:.0f}s", color="darkred")
         else:
