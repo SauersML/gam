@@ -1395,13 +1395,15 @@ fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
     let eta_grid = [-8.0, -6.5, -2.0, -0.4, 0.0, 0.75, 2.25, 6.0, 8.0];
     let g_grid = [-1.4, -0.55, 0.0, 0.8, 1.7];
     let z_grid = [-2.25, -0.35, 0.4, 2.1];
-    // Fourth-order tail entries (eta=-6.5, scale=0.7) compare two
-    // differently-associated exact computations through per-libm probit
-    // stacks; observed envelope is ~1.4e-11 on arm64 and ~7.9e-11 on x86_64
-    // (FMA/contraction differences). 5e-10 bounds the cross-architecture
-    // association noise while staying four orders below any real formula
-    // drift (a dropped term misses by >=1e-6).
-    let tol = 5.0e-10;
+    // Fourth-order chains at the eta=-6.5 / scale=0.7 corner are
+    // ill-conditioned as EXPRESSIONS (kappa ~ 1e6-1e7: large powers of eta
+    // against near-cancelling probit ratios), so two exact paths with
+    // different contraction orders (hand chain vs tower; arm64 vs x86_64
+    // FMA) can only be expected to agree to ~kappa*eps ~ 1e-9; observed
+    // worst cases: 1.4e-11 (arm64), 8.9e-10 (x86_64). 1e-8 sits 10x above
+    // that conditioning floor and 100x below the dropped-term signal
+    // (>=1e-6) this witness exists to catch.
+    let tol = 1.0e-8;
 
     for eta in eta_grid {
         let marginal = bernoulli_marginal_link_map(&link, eta).expect("marginal map");
