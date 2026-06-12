@@ -169,23 +169,22 @@ impl PenaltyMatrix {
         }
     }
 
-    /// Compute S * v using the Kronecker vec trick when factored:
-    ///   (A ⊗ B) vec(V) = vec(B V Aᵀ)
-    /// where V = reshape(v, (p_right, p_left)).
+    /// Compute S * v using the row-major Kronecker vec trick when factored:
+    ///   (A ⊗ B) vec_rm(V) = vec_rm(A V Bᵀ)
+    /// where V = reshape(v, (p_left, p_right)).
     pub fn dot(&self, v: &Array1<f64>) -> Array1<f64> {
         match self {
             Self::Dense(m) => m.dot(v),
             Self::KroneckerFactored { left, right } => {
                 let p_left = left.nrows();
                 let p_right = right.nrows();
-                // v is (p_left * p_right,).  Reshape as (p_right, p_left).
+                // v is ordered by i_left * p_right + i_right.
                 let v_mat =
-                    ndarray::ArrayView2::from_shape((p_right, p_left), v.as_slice().unwrap())
+                    ndarray::ArrayView2::from_shape((p_left, p_right), v.as_slice().unwrap())
                         .unwrap();
-                // result = B V A' then flatten.
-                let bv = right.dot(&v_mat);
-                let bva = bv.dot(&left.t());
-                Array1::from_iter(bva.iter().copied())
+                let avbt = left.dot(&v_mat).dot(&right.t());
+                let standard = avbt.as_standard_layout();
+                Array1::from_iter(standard.iter().copied())
             }
             Self::Blockwise {
                 local,
@@ -28139,6 +28138,59 @@ mod tests {
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
+
+    fn assert_kronecker_factored_matches_dense(
+        left: Array2<f64>,
+        right: Array2<f64>,
+        vectors: Vec<Array1<f64>>,
+    ) {
+        let penalty = PenaltyMatrix::KroneckerFactored { left, right };
+        let dense = penalty.to_dense();
+        for v in vectors {
+            let factored_dot = penalty.dot(&v);
+            let dense_dot = dense.dot(&v);
+            for i in 0..v.len() {
+                assert!(
+                    (factored_dot[i] - dense_dot[i]).abs() <= 1.0e-14,
+                    "Kronecker dot mismatch at component {i}: factored={}, dense={}",
+                    factored_dot[i],
+                    dense_dot[i],
+                );
+            }
+
+            let factored_quad = penalty.quadratic_form(&v);
+            let dense_quad = v.dot(&dense_dot);
+            assert!(
+                (factored_quad - dense_quad).abs() <= 1.0e-14,
+                "Kronecker quadratic form mismatch: factored={factored_quad}, dense={dense_quad}",
+            );
+        }
+    }
+
+    #[test]
+    fn kronecker_factored_dot_and_quadratic_form_match_dense_row_major_operator() {
+        let left_diag = array![[10.0, 0.0], [0.0, 100.0]];
+        let right_diag = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]];
+        let mut diag_vectors = Vec::new();
+        for i in 0..6 {
+            let mut v = Array1::<f64>::zeros(6);
+            v[i] = 1.0;
+            diag_vectors.push(v);
+        }
+        diag_vectors.push(array![0.25, -1.5, 2.0, 0.75, -0.5, 3.25]);
+        assert_kronecker_factored_matches_dense(left_diag, right_diag, diag_vectors);
+
+        let left_nondiag = array![[1.0, 2.0], [3.0, 4.0]];
+        let right_nondiag = array![[0.0, 1.0], [1.0, 0.0]];
+        let mut nondiag_vectors = Vec::new();
+        for i in 0..4 {
+            let mut v = Array1::<f64>::zeros(4);
+            v[i] = 1.0;
+            nondiag_vectors.push(v);
+        }
+        nondiag_vectors.push(array![1.25, -0.75, 2.5, -3.0]);
+        assert_kronecker_factored_matches_dense(left_nondiag, right_nondiag, nondiag_vectors);
+    }
 
     /// The marker-free coupled-joint-Hessian gate (#727, #729) trusts a family
     /// that returns a genuinely coupled joint Hessian — nonzero off-diagonal
