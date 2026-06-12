@@ -52,7 +52,7 @@ use crate::terms::sae_optimality_certificate::{
 };
 
 use crate::linalg::faer_ndarray::{
-    FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb,
+    FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_abt, fast_ata, fast_atb,
 };
 use crate::linalg::triangular::cholesky_solve_vector;
 use crate::solver::arrow_schur::{
@@ -550,6 +550,13 @@ const SAE_ATOM_ACTIVE_MASS_FLOOR: f64 = 1.0e-3;
 /// as a terminal collapse event and left for the structure-search death move
 /// to adjudicate — re-seeding in a loop would fight the optimizer.
 const SAE_ATOM_COLLAPSE_RESEED_BUDGET: usize = 1;
+
+/// Final fitted-data explained-variance floor for the reconstruction-collapse
+/// guard (#1023). This is deliberately a near-zero threshold: ordinary
+/// under-fitting is a model-quality issue, but returning a K>=1 active SAE whose
+/// fitted matrix is indistinguishable from the column mean is a structural
+/// collapse and must enter the #976 CollapseEvent ledger.
+const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.05;
 
 /// Reactivation band width (in units of the JumpReLU temperature `τ`) below the
 /// hard gate threshold. The forward gate value is hard-zero strictly below
@@ -2321,6 +2328,30 @@ impl SaeManifoldRho {
             log_lambda_smooth,
             log_ard,
         }
+    }
+
+    /// Shift every scale-coupled penalty seed by the profiled reconstruction
+    /// dispersion scale. SAE's Gaussian data-fit term is in squared output
+    /// units, while `lambda_sparse`, `lambda_smooth`, and ARD precisions are
+    /// absolute penalty weights; adding `log(phi_seed)` makes the seeded
+    /// effective stiffness `lambda / phi_seed` dimensionless.
+    pub fn seed_scaled_by_dispersion(&self, dispersion: f64) -> Result<Self, String> {
+        if !(dispersion.is_finite() && dispersion > 0.0) {
+            return Err(format!(
+                "SaeManifoldRho::seed_scaled_by_dispersion: dispersion must be finite and \
+                 positive; got {dispersion}"
+            ));
+        }
+        let shift = dispersion.ln();
+        let mut scaled = self.clone();
+        scaled.log_lambda_sparse += shift;
+        scaled.log_lambda_smooth += shift;
+        for atom in &mut scaled.log_ard {
+            for value in atom.iter_mut() {
+                *value += shift;
+            }
+        }
+        Ok(scaled)
     }
 
     pub fn lambda_sparse(&self) -> f64 {
@@ -7470,7 +7501,7 @@ impl SaeManifoldTerm {
         }
 
         let full_len = cache.delta_t_len() + cache.k;
-        let mut quotient_gauges = Vec::new();
+        let mut raw_gauges = Vec::new();
         for gauge in self.dense_step_gauge_vectors()? {
             if gauge.len() != full_len {
                 continue;
@@ -7479,30 +7510,15 @@ impl SaeManifoldTerm {
             if !(norm_sq.is_finite() && norm_sq > 1.0e-24) {
                 continue;
             }
-            let h_gauge = match apply_cached_arrow_hessian(
-                cache,
-                gauge.slice(s![..cache.delta_t_len()]),
-                gauge.slice(s![cache.delta_t_len()..]),
-            ) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let h_flat = flatten_arrow_parts(h_gauge.t.view(), h_gauge.beta.view());
-            let rayleigh = gauge.dot(&h_flat) / norm_sq;
-            if rayleigh.is_finite()
-                && rayleigh >= 0.0
-                && rayleigh <= SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR * max_pivot
-            {
-                quotient_gauges.push(gauge);
-            }
+            raw_gauges.push(gauge);
         }
-        if quotient_gauges.is_empty() {
+        if raw_gauges.is_empty() {
             return Err(conditioning_err);
         }
 
-        let mut orthonormal: Vec<Array1<f64>> = Vec::new();
-        for mut gauge in quotient_gauges {
-            for basis in &orthonormal {
+        let mut gauge_span: Vec<Array1<f64>> = Vec::new();
+        for mut gauge in raw_gauges {
+            for basis in &gauge_span {
                 let coeff = gauge.dot(basis);
                 for i in 0..gauge.len() {
                     gauge[i] -= coeff * basis[i];
@@ -7516,7 +7532,61 @@ impl SaeManifoldTerm {
             for value in gauge.iter_mut() {
                 *value *= inv_norm;
             }
-            orthonormal.push(gauge);
+            gauge_span.push(gauge);
+        }
+        if gauge_span.is_empty() {
+            return Err(conditioning_err);
+        }
+
+        let span_rank = gauge_span.len();
+        let mut h_span = Array2::<f64>::zeros((span_rank, span_rank));
+        for col in 0..span_rank {
+            let h_gauge = match apply_cached_arrow_hessian(
+                cache,
+                gauge_span[col].slice(s![..cache.delta_t_len()]),
+                gauge_span[col].slice(s![cache.delta_t_len()..]),
+            ) {
+                Ok(value) => value,
+                Err(_) => return Err(conditioning_err),
+            };
+            let h_flat = flatten_arrow_parts(h_gauge.t.view(), h_gauge.beta.view());
+            for row in 0..span_rank {
+                h_span[[row, col]] = gauge_span[row].dot(&h_flat);
+            }
+        }
+        for row in 0..span_rank {
+            for col in 0..row {
+                let sym = 0.5 * (h_span[[row, col]] + h_span[[col, row]]);
+                h_span[[row, col]] = sym;
+                h_span[[col, row]] = sym;
+            }
+        }
+        let (evals, evecs) = h_span
+            .eigh(Side::Lower)
+            .map_err(|_| conditioning_err.clone())?;
+        let gauge_floor = SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR * max_pivot;
+        let mut orthonormal: Vec<Array1<f64>> = Vec::new();
+        for eig_idx in 0..evals.len() {
+            let rayleigh = evals[eig_idx];
+            if !(rayleigh.is_finite() && rayleigh <= gauge_floor) {
+                continue;
+            }
+            let mut direction = Array1::<f64>::zeros(full_len);
+            for basis_idx in 0..span_rank {
+                let coeff = evecs[[basis_idx, eig_idx]];
+                for row in 0..full_len {
+                    direction[row] += coeff * gauge_span[basis_idx][row];
+                }
+            }
+            let norm_sq = direction.iter().map(|v| v * v).sum::<f64>();
+            if !(norm_sq.is_finite() && norm_sq > 1.0e-24) {
+                continue;
+            }
+            let inv_norm = norm_sq.sqrt().recip();
+            for value in direction.iter_mut() {
+                *value *= inv_norm;
+            }
+            orthonormal.push(direction);
         }
         if orthonormal.is_empty() {
             return Err(conditioning_err);
@@ -10777,6 +10847,92 @@ impl SaeManifoldTerm {
     /// as a death trigger.
     pub fn record_collapse_event(&mut self, event: CollapseEvent) {
         self.collapse_events.push(event);
+    }
+
+    /// #1023 final fitted-data guard: a fit with material active atoms whose
+    /// fitted matrix explains essentially none of the training variation is a
+    /// structural collapse, not a quiet success. Record terminal CollapseEvents
+    /// so the #976 structure-search layer and payload ledger see the outcome.
+    pub fn record_fit_data_collapse_if_needed(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        fitted: ArrayView2<'_, f64>,
+        assignments: ArrayView2<'_, f64>,
+        iteration: usize,
+    ) -> Result<bool, String> {
+        if target.dim() != fitted.dim() {
+            return Err(format!(
+                "SaeManifoldTerm::record_fit_data_collapse_if_needed: target {:?} != fitted {:?}",
+                target.dim(),
+                fitted.dim()
+            ));
+        }
+        let (n, p) = target.dim();
+        if assignments.dim() != (n, self.k_atoms()) {
+            return Err(format!(
+                "SaeManifoldTerm::record_fit_data_collapse_if_needed: assignments {:?} != ({}, {})",
+                assignments.dim(),
+                n,
+                self.k_atoms()
+            ));
+        }
+        if n == 0 || p == 0 || self.k_atoms() == 0 {
+            return Ok(false);
+        }
+
+        let mut means = vec![0.0_f64; p];
+        for col in 0..p {
+            let mut acc = 0.0;
+            for row in 0..n {
+                acc += target[[row, col]];
+            }
+            means[col] = acc / n as f64;
+        }
+        let mut ssr = 0.0_f64;
+        let mut sst = 0.0_f64;
+        for row in 0..n {
+            for col in 0..p {
+                let r = target[[row, col]] - fitted[[row, col]];
+                ssr += r * r;
+                let centered = target[[row, col]] - means[col];
+                sst += centered * centered;
+            }
+        }
+        if !(ssr.is_finite() && sst.is_finite()) || sst <= f64::MIN_POSITIVE {
+            return Ok(false);
+        }
+        let ev = 1.0 - ssr / sst;
+        if !(ev.is_finite() && ev <= SAE_FIT_DATA_COLLAPSE_EV_FLOOR) {
+            return Ok(false);
+        }
+
+        let mut recorded = false;
+        for atom in 0..self.k_atoms() {
+            let active_mass = assignments
+                .column(atom)
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max);
+            if active_mass <= 1.0e-8 {
+                continue;
+            }
+            let already_terminal = self
+                .collapse_events
+                .iter()
+                .any(|e| e.atom == atom && e.action == CollapseAction::Terminal);
+            if already_terminal {
+                continue;
+            }
+            self.collapse_events.push(CollapseEvent {
+                iteration,
+                atom,
+                max_active_mass: ev,
+                floor: SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
+                action: CollapseAction::Terminal,
+            });
+            recorded = true;
+        }
+        Ok(recorded)
     }
 
     /// Set the curvature-homotopy dial `η ∈ [0, 1]` on every atom (#1007). At
@@ -15901,6 +16057,202 @@ mod tests {
             term.collapse_events().iter().all(|e| e.atom == 1),
             "the healthy atom must never be flagged"
         );
+    }
+
+    #[test]
+    fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() {
+        let rho = SaeManifoldRho::new(0.7_f64.ln(), 1.3_f64.ln(), vec![array![0.2, -0.4]]);
+        let dispersion = 0.05_f64 * 0.05;
+        let scaled = rho.seed_scaled_by_dispersion(dispersion).unwrap();
+        let shift = dispersion.ln();
+
+        assert_abs_diff_eq!(
+            scaled.log_lambda_sparse,
+            rho.log_lambda_sparse + shift,
+            epsilon = 1.0e-14
+        );
+        assert_abs_diff_eq!(
+            scaled.log_lambda_smooth,
+            rho.log_lambda_smooth + shift,
+            epsilon = 1.0e-14
+        );
+        assert_abs_diff_eq!(
+            scaled.log_ard[0][0],
+            rho.log_ard[0][0] + shift,
+            epsilon = 1.0e-14
+        );
+        assert_abs_diff_eq!(
+            scaled.log_ard[0][1],
+            rho.log_ard[0][1] + shift,
+            epsilon = 1.0e-14
+        );
+    }
+
+    #[test]
+    fn fit_data_collapse_records_terminal_event_for_active_atom() {
+        let coords = array![[0.0], [0.25], [0.5], [0.75]];
+        let (phi, jet) = periodic_basis(&coords);
+        let atom = SaeManifoldAtom::new(
+            "circle",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            Array2::<f64>::zeros((3, 2)),
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((4, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = array![[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]];
+        let fitted = Array2::<f64>::zeros(target.dim());
+        let assignments = Array2::<f64>::ones((4, 1));
+
+        let recorded = term
+            .record_fit_data_collapse_if_needed(target.view(), fitted.view(), assignments.view(), 7)
+            .unwrap();
+
+        assert!(recorded);
+        let terminals: Vec<_> = term
+            .collapse_events()
+            .iter()
+            .filter(|event| event.action == CollapseAction::Terminal)
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].atom, 0);
+        assert_eq!(terminals[0].iteration, 7);
+        assert!(terminals[0].max_active_mass <= SAE_FIT_DATA_COLLAPSE_EV_FLOOR);
+    }
+
+    fn deterministic_circle_noise(row: usize, col: usize) -> f64 {
+        let x = (row as f64 + 1.0) * 12.9898 + (col as f64 + 1.0) * 78.233;
+        (x.sin() * 43758.5453).sin()
+    }
+
+    fn planted_circle_data(n: usize, sigma: f64) -> Array2<f64> {
+        let mut z = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let theta = std::f64::consts::TAU * row as f64 / n as f64;
+            z[[row, 0]] = theta.cos() + sigma * deterministic_circle_noise(row, 0);
+            z[[row, 1]] = theta.sin() + sigma * deterministic_circle_noise(row, 1);
+        }
+        z
+    }
+
+    fn global_ev(target: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> f64 {
+        let (n, p) = target.dim();
+        let mut means = vec![0.0_f64; p];
+        for col in 0..p {
+            for row in 0..n {
+                means[col] += target[[row, col]];
+            }
+            means[col] /= n as f64;
+        }
+        let mut ssr = 0.0_f64;
+        let mut sst = 0.0_f64;
+        for row in 0..n {
+            for col in 0..p {
+                let r = target[[row, col]] - fitted[[row, col]];
+                ssr += r * r;
+                let centered = target[[row, col]] - means[col];
+                sst += centered * centered;
+            }
+        }
+        1.0 - ssr / sst.max(1.0e-300)
+    }
+
+    fn planted_circle_seed_term(z: ArrayView2<'_, f64>) -> (SaeManifoldTerm, f64) {
+        let n = z.nrows();
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let seed_coords =
+            sae_pca_seed_initial_coords(z, &[SaeAtomBasisKind::Periodic], &[1]).unwrap();
+        let coords = seed_coords.slice(s![0, .., 0..1]).to_owned();
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let mut xtx = fast_ata(&phi);
+        for i in 0..xtx.nrows() {
+            xtx[[i, i]] += 1.0e-10;
+        }
+        let xtz = fast_atb(&phi, &z.to_owned());
+        let decoder = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
+        let seed_fitted = phi.dot(&decoder);
+        let mut rss = 0.0_f64;
+        for row in 0..n {
+            for col in 0..z.ncols() {
+                let r = z[[row, col]] - seed_fitted[[row, col]];
+                rss += r * r;
+            }
+        }
+        let seed_dispersion = (rss / (n * z.ncols()) as f64).max(1.0e-12);
+        let atom = SaeManifoldAtom::new(
+            "circle",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(evaluator);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        (
+            SaeManifoldTerm::new(vec![atom], assignment).unwrap(),
+            seed_dispersion,
+        )
+    }
+
+    #[test]
+    fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionless_rho_seed() {
+        for &n in &[40usize, 250usize] {
+            for &sigma in &[0.02_f64, 0.05, 0.18] {
+                let z = planted_circle_data(n, sigma);
+                let (term, seed_dispersion) = planted_circle_seed_term(z.view());
+                let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
+                    .seed_scaled_by_dispersion(seed_dispersion)
+                    .unwrap();
+                let init_rho_flat = init_rho.to_flat();
+                let n_params = init_rho_flat.len();
+                let mut objective = SaeManifoldOuterObjective::new(
+                    term,
+                    z.clone(),
+                    None,
+                    init_rho,
+                    20,
+                    0.5,
+                    1.0e-6,
+                    1.0e-6,
+                );
+                crate::solver::outer_strategy::OuterProblem::new(n_params)
+                    .with_initial_rho(init_rho_flat)
+                    .run(&mut objective, "SAE planted circle dimensionless seed")
+                    .unwrap();
+                let (fitted_term, _rho, _loss) = objective.into_fitted();
+                let fitted = fitted_term.fitted();
+                let ev = global_ev(z.view(), fitted.view());
+                assert!(
+                    ev > 0.95,
+                    "planted circle n={n} sigma={sigma} EV={ev:.4} should exceed 0.95"
+                );
+                assert!(
+                    fitted_term.collapse_events().is_empty(),
+                    "healthy planted circle fit should not record collapse events: {:?}",
+                    fitted_term.collapse_events()
+                );
+            }
+        }
     }
 
     #[test]
