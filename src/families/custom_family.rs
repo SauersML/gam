@@ -1645,6 +1645,9 @@ impl OuterDerivativePolicy {
     ) -> crate::solver::outer_strategy::OuterEvalOrder {
         use crate::solver::outer_strategy::OuterEvalOrder;
         match requested {
+            // Value-only is universal: every policy can evaluate the bare
+            // objective, so the request passes through unclamped.
+            OuterEvalOrder::Value => OuterEvalOrder::Value,
             OuterEvalOrder::ValueAndGradient => OuterEvalOrder::ValueAndGradient,
             OuterEvalOrder::ValueGradientHessian => {
                 if matches!(
