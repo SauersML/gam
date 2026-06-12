@@ -1107,11 +1107,40 @@ fn weighted_ridge_sandwich_cov(
     // accumulated in the AᵀWA assembly.
     let mut m_sym = normal_matrix.clone();
     crate::linalg::matrix::symmetrize_in_place(&mut m_sym);
+    // Jacobi (symmetric diagonal) preconditioning. When the conditioning basis
+    // spans many orders of magnitude — a power-9 Duchon RBF over 16 standardized
+    // PCs produces columns differing by ~30 decades — `M` and `meat` live on
+    // wildly different per-column scales, and `M⁺ meat M⁺` multiplies a near-null
+    // eigenvalue gap straight through the f64 range even after the pseudo-inverse
+    // drops the rank-deficient directions. Rescale by `D = diag(√M_jj)` so the
+    // preconditioned normal matrix `M̃ = D⁻¹ M D⁻¹` has unit diagonal, invert
+    // there, and map back: `cov = D⁻¹ (M̃⁺ meat̃ M̃⁺) D⁻¹` with `meat̃ = D⁻¹ meat
+    // D⁻¹`. Algebraically identical to `M⁺ meat M⁺` (the scaling cancels), but
+    // every intermediate stays O(1). `M_jj` is strictly positive (the relative
+    // ridge floors every diagonal), so the scale is always finite.
+    let scale: Vec<f64> = (0..p)
+        .map(|j| 1.0 / m_sym[[j, j]].max(f64::MIN_POSITIVE).sqrt())
+        .collect();
+    let mut m_scaled = m_sym;
+    let mut meat_scaled = meat;
+    for i in 0..p {
+        for j in 0..p {
+            let s = scale[i] * scale[j];
+            m_scaled[[i, j]] *= s;
+            meat_scaled[[i, j]] *= s;
+        }
+    }
     let (_rank, m_pinv) =
-        crate::linalg::utils::block_penalty_rank_and_pinv(&m_sym).map_err(|e| {
+        crate::linalg::utils::block_penalty_rank_and_pinv(&m_scaled).map_err(|e| {
             format!("conditional latent calibration sandwich pseudo-inverse failed: {e}")
         })?;
-    let cov = m_pinv.dot(&meat).dot(&m_pinv);
+    let mut cov = m_pinv.dot(&meat_scaled).dot(&m_pinv);
+    // Undo the symmetric scaling: cov_raw = D⁻¹ cov_scaled D⁻¹.
+    for i in 0..p {
+        for j in 0..p {
+            cov[[i, j]] *= scale[i] * scale[j];
+        }
+    }
     if cov.iter().any(|v| !v.is_finite()) {
         return Err("conditional latent calibration sandwich covariance is non-finite".to_string());
     }
