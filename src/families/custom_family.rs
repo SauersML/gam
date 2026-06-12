@@ -14701,11 +14701,41 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let coupled_exact_joint_required = specs.len() >= 2
         && !family.likelihood_blocks_uncoupled()
         && (family.has_explicit_joint_hessian() || has_workspace_source);
-    // Multi-block families have always taken the joint path when an exact
-    // joint Hessian is available. Single-block families also take it when a
-    // coefficient-Hessian workspace is wired; dense vs. operator form is a
-    // later representation choice, not a cache-construction gate.
-    let use_joint_newton = has_joint_exacthessian && (specs.len() >= 2 || has_workspace_source);
+    // When the family declares its likelihood blocks UNCOUPLED
+    // (`∂²L/∂β_a∂β_b = 0` for every a ≠ b) the joint penalized objective is
+    // fully separable across blocks: the joint Hessian is exactly
+    // block-diagonal and each block carries only its own penalty. On a
+    // separable objective block-coordinate descent solves each block's
+    // (possibly inequality-constrained) subproblem to its own exact optimum —
+    // it IS the joint solve, and each block gets its OWN trust radius, its OWN
+    // active-set QP, and its OWN KKT certificate.
+    //
+    // Forcing the coupled joint-Newton onto such a problem instead couples two
+    // independent blocks under ONE shared trust radius and ONE concatenated
+    // KKT residual. That is actively harmful when the blocks differ sharply in
+    // conditioning — the competing-risks twin time-basis fit (#1025) is the
+    // canonical case: two cause-specific baselines share the same I-spline
+    // evaluated at the same event times, but one cause sits near its
+    // monotonicity-constraint boundary with an O(1e5) hazard-derivative
+    // gradient while the other is interior. The shared globalization cannot
+    // satisfy both blocks' KKT conditions at once; the joint residual stalls
+    // far above tolerance, the inner solve burns its whole cycle budget on
+    // every outer ρ-eval, and the fit only survives by falling through to the
+    // block-coordinate path anyway (which then converges in a handful of
+    // cycles). Route uncoupled multi-block specs straight to that exact
+    // separable path. `coupled_exact_joint_required` is already gated the same
+    // way (uncoupled families are designed to fall through to blockwise), so
+    // this only stops the engine from attempting — and grinding on — a joint
+    // solve it was never required to run.
+    //
+    // Single-block families and genuinely coupled multi-block families are
+    // unaffected: the former never had cross-block coupling to begin with, the
+    // latter still take the joint path (their objective is NOT separable, so
+    // block-coordinate descent would drop the cross-block ∂²L/∂β_a∂β_b
+    // curvature).
+    let blocks_separable = specs.len() >= 2 && family.likelihood_blocks_uncoupled();
+    let use_joint_newton =
+        has_joint_exacthessian && (specs.len() >= 2 || has_workspace_source) && !blocks_separable;
     let joint_workspace_requested = use_joint_newton && has_workspace_source;
     let inner_tol = options.inner_tol;
     let inner_max_cycles_base = options.inner_max_cycles;
