@@ -1944,6 +1944,23 @@ pub trait BatchedBlockSolver {
     fn block_gemm_subtract(&self, schur: &mut Array2<f64>, left: &Array2<f64>, right: &Array2<f64>);
 }
 
+#[derive(Debug, Clone)]
+pub struct ArrowRowGaugeDeflation {
+    pub directions: Arc<[Vec<Array1<f64>>]>,
+}
+
+impl ArrowRowGaugeDeflation {
+    pub fn new(directions: Vec<Vec<Array1<f64>>>) -> Self {
+        Self {
+            directions: Arc::from(directions.into_boxed_slice()),
+        }
+    }
+
+    fn row(&self, row: usize) -> &[Array1<f64>] {
+        self.directions.get(row).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
 /// Current CPU implementation of the BA batched block interface.
 ///
 /// It is intentionally plain Rust loops because `d` is tiny. The trait shape,
@@ -2052,6 +2069,12 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ArrowRowFactorResult {
+    factor: Array2<f64>,
+    gauge_deflated_directions: usize,
 }
 
 /// Attempt the per-row block factorization as one device batch spread across
@@ -2290,6 +2313,82 @@ fn factor_row_block_cholesky_fixed<const D: usize>(
         }
     }
     Ok(out)
+}
+
+fn row_gauge_curvature(row: &ArrowRowBlock, d: usize, gauge: &Array1<f64>) -> Option<f64> {
+    if gauge.len() != d {
+        return None;
+    }
+    let mut acc = 0.0_f64;
+    for i in 0..d {
+        let gi = gauge[i];
+        for j in 0..d {
+            acc += gi * row.htt[[i, j]] * gauge[j];
+        }
+    }
+    if acc.is_finite() { Some(acc) } else { None }
+}
+
+fn factor_gauge_deflated_evidence_row(
+    row: &ArrowRowBlock,
+    d: usize,
+    gauges: &[Array1<f64>],
+) -> Option<ArrowRowFactorResult> {
+    const GAUGE_RAYLEIGH_EPS: f64 = 1.0e-8;
+    if gauges.is_empty() {
+        return None;
+    }
+    let max_diag = row_block_diag_scale(row, d);
+    if !(max_diag.is_finite() && max_diag > 0.0) {
+        return None;
+    }
+    let mut basis: Vec<Array1<f64>> = Vec::new();
+    for gauge in gauges {
+        if gauge.len() != d {
+            continue;
+        }
+        let norm_sq = gauge.iter().map(|&v| v * v).sum::<f64>();
+        if !(norm_sq.is_finite() && norm_sq > 1.0e-24) {
+            continue;
+        }
+        let curvature = row_gauge_curvature(row, d, gauge)?;
+        if curvature > GAUGE_RAYLEIGH_EPS * max_diag * norm_sq {
+            continue;
+        }
+        let mut direction = gauge.clone();
+        for existing in &basis {
+            let coeff = direction.dot(existing);
+            for idx in 0..d {
+                direction[idx] -= coeff * existing[idx];
+            }
+        }
+        let residual_norm_sq = direction.iter().map(|&v| v * v).sum::<f64>();
+        if !(residual_norm_sq.is_finite() && residual_norm_sq > 1.0e-24) {
+            continue;
+        }
+        let inv_norm = residual_norm_sq.sqrt().recip();
+        for value in direction.iter_mut() {
+            *value *= inv_norm;
+        }
+        basis.push(direction);
+    }
+    if basis.is_empty() {
+        return None;
+    }
+
+    let mut deflated = row.htt.clone();
+    for direction in &basis {
+        for i in 0..d {
+            for j in 0..d {
+                deflated[[i, j]] += max_diag * direction[i] * direction[j];
+            }
+        }
+    }
+    let factor = cholesky_lower(&deflated).ok()?;
+    Some(ArrowRowFactorResult {
+        factor,
+        gauge_deflated_directions: basis.len(),
+    })
 }
 
 fn cholesky_solve_vector_fixed<const D: usize>(
@@ -2917,6 +3016,15 @@ pub struct ArrowSchurSystem {
     /// instead of the exact one-shot Schur elimination. When empty, the system
     /// is purely row-block-diagonal and the exact Schur path is unchanged.
     pub cross_row_penalties: Vec<CrossRowLatentPenalty>,
+    /// Optional row-local gauge directions for evidence-only Faddeev-Popov
+    /// deflation of an otherwise non-PD `H_tt` row block.
+    ///
+    /// These vectors live in each row's actual chart block, so compact SAE rows
+    /// and dense rows share the same factorization path. Ordinary Newton solves
+    /// ignore them; only undamped evidence factors with
+    /// `tolerate_ill_conditioning` set may stiffen a gauge-explained row
+    /// direction.
+    pub row_gauge_deflation: Option<ArrowRowGaugeDeflation>,
 }
 
 impl Clone for ArrowSchurSystem {
@@ -2941,6 +3049,7 @@ impl Clone for ArrowSchurSystem {
             penalty_op: self.penalty_op.clone(),
             device_sae_pcg: self.device_sae_pcg.clone(),
             cross_row_penalties: self.cross_row_penalties.clone(),
+            row_gauge_deflation: self.row_gauge_deflation.clone(),
         }
     }
 }
@@ -3018,6 +3127,7 @@ impl ArrowSchurSystem {
             penalty_op: None,
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
+            row_gauge_deflation: None,
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -3067,6 +3177,7 @@ impl ArrowSchurSystem {
             penalty_op: None,
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
+            row_gauge_deflation: None,
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -3122,6 +3233,7 @@ impl ArrowSchurSystem {
             penalty_op,
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
+            row_gauge_deflation: None,
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -3183,6 +3295,7 @@ impl ArrowSchurSystem {
             penalty_op: None,
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
+            row_gauge_deflation: None,
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -3243,9 +3356,14 @@ impl ArrowSchurSystem {
             penalty_op: None,
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
+            row_gauge_deflation: None,
         };
         sys.refresh_row_hessian_fingerprint();
         sys
+    }
+
+    pub fn set_row_gauge_deflation(&mut self, deflation: ArrowRowGaugeDeflation) {
+        self.row_gauge_deflation = Some(deflation);
     }
 
     /// Number of BA point/latent rows `N`.
