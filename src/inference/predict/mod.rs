@@ -7301,6 +7301,7 @@ mod tests {
             beta_standard_errors_corrected: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
+            weighted_gram: None,
             bias_correction_beta,
         };
         UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {

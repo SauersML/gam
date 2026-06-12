@@ -792,6 +792,45 @@ fn map_hessian_to_original_basis(
     Ok(h)
 }
 
+/// Project a symmetric matrix onto the positive-semidefinite cone in place by
+/// clamping any negative eigenvalues to zero. Used to snap the eigensolver /
+/// catastrophic-cancellation roundoff in the reconstructed weighted Gram
+/// `X'WX = H − S(λ)` back to PSD, so the Wood–Pya–Säfken correction
+/// `tr(X'WX·Σ_ρ)` is a genuine non-negative trace of two PSD factors (#1027).
+///
+/// When every eigenvalue is already non-negative the matrix is left untouched
+/// (no reconstruction error introduced). If the eigensolver fails the matrix is
+/// left as-is — the caller's `enforce_symmetry` has already cleaned asymmetry,
+/// and a failed eigendecomposition here is not worth aborting an otherwise-good
+/// fit over.
+fn psd_floor_in_place(matrix: &mut Array2<f64>) {
+    let p = matrix.nrows();
+    if p == 0 || matrix.ncols() != p {
+        return;
+    }
+    let Ok((eigenvalues, eigenvectors)) = matrix.eigh(faer::Side::Lower) else {
+        return;
+    };
+    if eigenvalues.iter().all(|lam| *lam >= 0.0) {
+        return;
+    }
+    let mut result = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        let eig = eigenvalues[i].max(0.0);
+        if eig == 0.0 {
+            continue;
+        }
+        let v = eigenvectors.column(i);
+        for j in 0..p {
+            let vj = eig * v[j];
+            for k in 0..p {
+                result[[j, k]] += vj * v[k];
+            }
+        }
+    }
+    *matrix = result;
+}
+
 /// Strictly-positive floor on a reported dispersion / scale parameter `φ`.
 /// Every GLM family resolves `φ` to a non-negative quantity, but downstream
 /// consumers (covariance scaling, deviance ratios) divide by it, so it is
@@ -4513,6 +4552,7 @@ where
     let mut beta_standard_errors_corrected = None;
     let mut beta_covariance_frequentist = None;
     let mut coefficient_influence = None;
+    let mut weighted_gram = None;
     // Factorization of stabilized Hessian in transformed basis, reused for
     // SE computation via solve-on-demand after dispersion is determined.
     let mut edf_factor: Option<Box<dyn FactorizedSystem>> = None;
@@ -4749,9 +4789,22 @@ where
                 scaled_covariance(h_inv.clone(), cov_scale),
             ));
 
-            // Frequentist covariance Ve = F H⁻¹ φ and influence matrix F = H⁻¹ X'WX.
-            // Both require the full unscaled inverse; computed in original basis.
-            let mut s_mat = Array2::<f64>::zeros((p_cov, p_cov));
+            // Frequentist covariance Ve = F H⁻¹ φ, influence matrix F = H⁻¹ X'WX,
+            // and the weighted Gram X'WX itself. All require the full unscaled
+            // inverse; all are computed in the ORIGINAL coefficient basis.
+            //
+            // The λ-weighted penalty S(λ) is assembled from the canonical penalty
+            // blocks, which live in the REPARAMETERIZED basis (post-`Qs`): each
+            // block sits at its transformed `col_range`. But `penalized_hessian`
+            // (H) and `h_inv = H⁻¹` are stored in the ORIGINAL basis as
+            // `Qs·H_t·Qs'`, so the penalty H actually carries is `S = Qs·S_t·Qs'`.
+            // Assembling `S_t` and pairing it with an original-basis `h_inv` (the
+            // historical defect, #1027) mismatched the bases: `F`, `Ve`, and the
+            // reconstructed weighted Gram were none of them the matrices they
+            // claimed to be — `H·F` came out asymmetric and indefinite, driving
+            // the Wood–Pya–Säfken ρ-uncertainty EDF correction negative. Rotate
+            // `S_t` back into the original basis before use.
+            let mut s_transformed = Array2::<f64>::zeros((p_cov, p_cov));
             for (kk, cp) in pirls_res
                 .reparam_result
                 .canonical_transformed
@@ -4766,18 +4819,42 @@ where
                 let lam = lambdas[kk];
                 for i in 0..cp.block_dim() {
                     for j in 0..cp.block_dim() {
-                        s_mat[[r.start + i, r.start + j]] += lam * local[[i, j]];
+                        s_transformed[[r.start + i, r.start + j]] += lam * local[[i, j]];
                     }
                 }
             }
+            let qs = &pirls_res.reparam_result.qs;
+            let mut s_penalty = qs.dot(&s_transformed).dot(&qs.t());
+            enforce_symmetry(&mut s_penalty);
+
+            // Influence matrix F = H⁻¹·X'WX = I − H⁻¹·S(λ). This is the EDF matrix;
+            // it is NOT symmetric (a product of two symmetric matrices generally
+            // isn't), so it must not be symmetrized — doing so corrupts both
+            // F itself (consumed by Wood's smooth test) and the frequentist
+            // covariance Ve built from it. The `I − H⁻¹S` form is well-scaled
+            // (entries → 0 in heavily-penalized directions) and avoids forming
+            // the cancellation-prone `H − S` explicitly.
             let mut f_mat = Array2::<f64>::eye(p_cov);
-            f_mat -= &h_inv.dot(&s_mat);
-            enforce_symmetry(&mut f_mat);
+            f_mat -= &h_inv.dot(&s_penalty);
             let mut ve = f_mat.dot(h_inv);
             ve *= cov_scale;
             enforce_symmetry(&mut ve);
+
+            // Genuine weighted Gram X'WX = H − S(λ), in the original basis — the
+            // symmetric PSD curvature the WPS corrected EDF needs as
+            // `tr(X'WX·Σ_ρ)`. We form it explicitly (rather than reconstructing it
+            // downstream as `H·F`, which the non-symmetry of F and any ridge in
+            // `h_inv` both break) and snap eigensolver/cancellation roundoff back
+            // to the PSD cone — the same treatment `Σ_ρ` itself receives. With
+            // both factors exactly PSD, the correction `tr(X'WX·Σ_ρ) ≥ 0` holds by
+            // construction, never dropping the corrected EDF below the conditional.
+            let mut xwx = &penalized_hessian - &s_penalty;
+            enforce_symmetry(&mut xwx);
+            psd_floor_in_place(&mut xwx);
+
             coefficient_influence = Some(f_mat);
             beta_covariance_frequentist = Some(ve);
+            weighted_gram = Some(xwx);
         }
 
         // Smoothing-parameter correction (first-order delta + optional cubature).
@@ -4917,6 +4994,7 @@ where
         beta_standard_errors_corrected,
         beta_covariance_frequentist,
         coefficient_influence,
+        weighted_gram,
         bias_correction_beta,
     });
 
@@ -5226,6 +5304,13 @@ pub struct FitInference {
     /// Coefficient-space influence matrix F = H⁻¹ X'WX. Its trace is the total EDF.
     #[serde(default)]
     pub coefficient_influence: Option<Array2<f64>>,
+    /// Weighted Gram `X'WX = H − S(λ)` in the original coefficient basis — the
+    /// symmetric PSD curvature, snapped to the PSD cone. The Wood–Pya–Säfken
+    /// corrected EDF reads this directly as `tr(X'WX·Σ_ρ)`; storing it (rather
+    /// than reconstructing `H·F` downstream) keeps that correction non-negative
+    /// regardless of conditioning (#1027).
+    #[serde(default)]
+    pub weighted_gram: Option<Array2<f64>>,
     /// O(n⁻¹) frequentist bias-correction vector b̂ = H⁻¹ S(λ̂) β̂ in the
     /// original (untransformed) coefficient basis. Predictions apply
     /// η̂_BC(x) = η̂(x) + s_*(x)^T b̂ to remove first-order shrinkage bias.
@@ -6227,6 +6312,14 @@ impl UnifiedFitResult {
         self.inference
             .as_ref()
             .and_then(|inf| inf.coefficient_influence.as_ref())
+    }
+
+    /// Get the weighted Gram `X'WX = H − S(λ)` (original basis, PSD-floored) if
+    /// available. The Wood–Pya–Säfken corrected EDF consumes it directly.
+    pub fn weighted_gram(&self) -> Option<&Array2<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.weighted_gram.as_ref())
     }
 
     /// Dispersion used to scale covariance matrices.
@@ -8481,6 +8574,7 @@ mod estimate_policy_tests {
                 beta_standard_errors_corrected: Some(array![1.2_f64.sqrt(), 2.2_f64.sqrt()]),
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
+                weighted_gram: None,
                 bias_correction_beta: None,
             }),
             fitted_link: FittedLinkState::Standard(None),

@@ -2501,6 +2501,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             beta_standard_errors_corrected: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
+            weighted_gram: None,
             bias_correction_beta: None,
         }),
         fitted_link: FittedLinkState::Standard(Some(StandardLink::Logit)),
