@@ -193,12 +193,39 @@ impl Fingerprinter {
     /// [`Fingerprinter::write_f64`] contract (so `-0.0` is normalized to
     /// `+0.0`). Canonical home for the byte-identical `len`-then-each-`f64`
     /// hashing that previously lived as module-local `hash_f64_slice` /
-    /// `hash_vector` copies in `solver/latent_cache`. Use this — not
-    /// [`Fingerprinter::absorb_f64_slice`], whose bulk path does **not**
-    /// normalize signed zero — wherever warm-start keys depend on that
-    /// normalization.
+    /// `hash_vector` copies in `solver/latent_cache`. Uses a bulk byte path
+    /// only when it can emit exactly the same bytes as the element-wise
+    /// normalizing protocol.
     pub fn write_f64_slice(&mut self, values: &[f64]) {
         self.write_usize(values.len());
+        self.write_f64_slice_payload(values);
+    }
+
+    fn write_f64_slice_payload(&mut self, values: &[f64]) {
+        #[cfg(target_endian = "little")]
+        {
+            let needs_normalization = values
+                .iter()
+                .any(|&value| value.is_nan() || (value == 0.0 && value.is_sign_negative()));
+            if !needs_normalization {
+                // SAFETY: values.as_ptr() is valid for values.len() contiguous
+                // f64s, f64 has no padding, and reborrowing as bytes is confined
+                // to this update call. Little-endian storage matches write_f64's
+                // to_bits().to_le_bytes() byte stream for non-normalized values.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        values.as_ptr() as *const u8,
+                        std::mem::size_of_val(values),
+                    )
+                };
+                self.h.update(bytes);
+                return;
+            }
+        }
+        self.write_f64_slice_payload_slow(values);
+    }
+
+    fn write_f64_slice_payload_slow(&mut self, values: &[f64]) {
         for &value in values {
             self.write_f64(value);
         }
@@ -364,6 +391,46 @@ mod tests {
         b.absorb_str(b"f", "binomial");
         b.absorb_f64_2d(b"x", 2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(a.finalize(), b.finalize());
+    }
+
+    #[test]
+    fn write_f64_slice_bulk_matches_element_protocol() {
+        fn pseudo_random_values(n: usize) -> Vec<f64> {
+            let mut state = 0x4d59_5df4_d0f3_3173_u64;
+            let mut values = Vec::with_capacity(n);
+            for idx in 0..n {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let mantissa = state >> 12;
+                let unit = f64::from_bits(0x3ff0_0000_0000_0000 | mantissa) - 1.0;
+                values.push((unit - 0.5) * ((idx % 17) as f64 + 1.0));
+            }
+            values
+        }
+
+        fn fast_key(values: &[f64]) -> Fingerprint {
+            let mut fp = Fingerprinter::new();
+            fp.write_str("write_f64_slice_bulk_matches_element_protocol");
+            fp.write_f64_slice(values);
+            fp.finalize()
+        }
+
+        fn slow_key(values: &[f64]) -> Fingerprint {
+            let mut fp = Fingerprinter::new();
+            fp.write_str("write_f64_slice_bulk_matches_element_protocol");
+            fp.write_usize(values.len());
+            fp.write_f64_slice_payload_slow(values);
+            fp.finalize()
+        }
+
+        let clean = pseudo_random_values(257);
+        assert_eq!(fast_key(&clean), slow_key(&clean));
+
+        let mut normalized = clean.clone();
+        normalized[7] = -0.0;
+        normalized[113] = f64::from_bits(0x7ff8_0000_0000_0042);
+        assert_eq!(fast_key(&normalized), slow_key(&normalized));
     }
 
     #[test]
