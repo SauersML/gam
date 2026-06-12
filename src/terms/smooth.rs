@@ -4,11 +4,12 @@ use crate::basis::{
     BasisOptions, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, BasisWorkspace,
     CenterStrategy, CenterStrategyKind, ConstantCurvatureBasisSpec,
     ConstantCurvatureIdentifiability, Dense, DuchonBasisSpec, KnotSource, KroneckerFactoredBasis,
-    MaternBasisSpec, MaternIdentifiability, OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo,
+    MaternBasisSpec, MaternIdentifiability, MeasureJetBasisSpec, MeasureJetFrozenQuadrature,
+    MeasureJetIdentifiability, OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo,
     PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
     SphericalSplineIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
     build_bspline_basis_1d, build_constant_curvature_basis, build_duchon_basis,
-    build_duchon_basiswithworkspace, build_matern_basis,
+    build_duchon_basiswithworkspace, build_matern_basis, build_measure_jet_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
     build_spherical_spline_basis, build_thin_plate_basis,
@@ -414,6 +415,17 @@ pub enum SmoothBasisSpec {
     Matern {
         feature_cols: Vec<usize>,
         spec: MaternBasisSpec,
+        #[serde(default)]
+        input_scales: Option<Vec<f64>>,
+    },
+    /// Measure-jet spline smooth: multiscale local-jet-residual energy of the
+    /// empirical measure (centers as μ-quadrature, masses as μ-weights — no
+    /// graph, mesh, or neighbor set inside the statistical object). The
+    /// feature columns are ambient coordinates of data concentrated near an
+    /// unknown low-dimensional, possibly stratified set.
+    MeasureJet {
+        feature_cols: Vec<usize>,
+        spec: MeasureJetBasisSpec,
         #[serde(default)]
         input_scales: Option<Vec<f64>>,
     },
@@ -1243,6 +1255,31 @@ impl TermCollectionSpec {
                         .into());
                     }
                 }
+                SmoothBasisSpec::MeasureJet { spec, .. } => {
+                    if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: MeasureJet centers must be UserProvided",
+                            st.name
+                        ))
+                        .into());
+                    }
+                    if !(spec.length_scale.is_finite() && spec.length_scale > 0.0) {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: MeasureJet length_scale must be the realized positive value",
+                            st.name
+                        ))
+                        .into());
+                    }
+                    // The penalty depends on the FIT data through masses and
+                    // band; a frozen term must carry them for exact replay.
+                    if spec.frozen_quadrature.is_none() {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: MeasureJet frozen_quadrature (masses + band) is missing",
+                            st.name
+                        ))
+                        .into());
+                    }
+                }
                 SmoothBasisSpec::Matern { spec, .. } => {
                     if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
                         return Err(SmoothError::invalid_config(format!(
@@ -1456,6 +1493,7 @@ where
         | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::ConstantCurvature { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
+        | SmoothBasisSpec::MeasureJet { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
@@ -7135,6 +7173,57 @@ fn build_single_local_smooth_term(
             let x = select_columns(data, feature_cols)?;
             build_constant_curvature_basis(x.view(), spec)?
         }
+        SmoothBasisSpec::MeasureJet {
+            feature_cols,
+            spec,
+            input_scales,
+        } => {
+            if term.shape != ShapeConstraint::None {
+                crate::bail_invalid_basis!(
+                    "ShapeConstraint::{:?} for term '{}' is not supported on measure-jet smooths",
+                    term.shape,
+                    term.name
+                );
+            }
+            let mut x = select_columns(data, feature_cols)?;
+            // Matern-style per-axis standardization: the measure-jet geometry
+            // (band, masses, local Grams) is built in standardized coordinates
+            // so no ambient axis dominates by units; the realized σ vector is
+            // persisted into the metadata for predict-time replay.
+            //
+            // Length-scale round-trip contract (the Duchon double-compensation
+            // trap, resolved differently here): `input_scales: Some` marks the
+            // REPLAY path — the frozen spec's length_scale is already the
+            // realized post-standardization value, so it passes through
+            // verbatim. On the fresh path an explicit user length_scale is in
+            // ORIGINAL coordinates and gets the σ_geom compensation; the 0.0
+            // auto sentinel passes through (auto-derivation runs inside the
+            // builder, post-standardization, and needs no compensation).
+            let (scales, length_scale_eff) = if let Some(s) = input_scales {
+                apply_input_standardization(&mut x, s);
+                (Some(s.clone()), spec.length_scale)
+            } else if let Some(s) = compute_spatial_input_scales(x.view()) {
+                apply_input_standardization(&mut x, &s);
+                let l_eff = if spec.length_scale > 0.0 {
+                    compensate_length_scale_for_standardization(spec.length_scale, &s)
+                } else {
+                    spec.length_scale
+                };
+                (Some(s), l_eff)
+            } else {
+                (None, spec.length_scale)
+            };
+            let mut spec_local = spec.clone();
+            spec_local.length_scale = length_scale_eff;
+            let mut result = build_measure_jet_basis(x.view(), &spec_local)?;
+            if let BasisMetadata::MeasureJet {
+                input_scales: ms, ..
+            } = &mut result.metadata
+            {
+                *ms = scales;
+            }
+            result
+        }
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
@@ -8294,6 +8383,7 @@ fn smooth_basis_feature_cols(basis: &SmoothBasisSpec) -> Vec<usize> {
         | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::ConstantCurvature { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
+        | SmoothBasisSpec::MeasureJet { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
@@ -8330,6 +8420,7 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::Duchon { .. } => 5,
         SmoothBasisSpec::Pca { .. } => 6,
         SmoothBasisSpec::ConstantCurvature { .. } => 8,
+        SmoothBasisSpec::MeasureJet { .. } => 9,
         SmoothBasisSpec::BySmooth { smooth, .. } => smooth_basis_family_rank(&SmoothTermSpec {
             name: term.name.clone(),
             basis: (**smooth).clone(),
@@ -8373,6 +8464,13 @@ fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
                 || matches!(
                     spec.identifiability,
                     ConstantCurvatureIdentifiability::FrozenTransform { .. }
+                )
+        }
+        SmoothBasisSpec::MeasureJet { spec, .. } => {
+            matches!(spec.center_strategy, CenterStrategy::UserProvided(_))
+                || matches!(
+                    spec.identifiability,
+                    MeasureJetIdentifiability::FrozenTransform { .. }
                 )
         }
         SmoothBasisSpec::Matern { spec, .. } => matches!(
@@ -9325,6 +9423,14 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
             spec.identifiability,
             ConstantCurvatureIdentifiability::CenterSumToZero
         ),
+        // Measure-jet representer: identical #531 collision class — Gaussian
+        // RBF columns times the center-space sum-to-zero `z` still span the
+        // constant on the data rows, so `z` must absorb the parametric
+        // orthogonalization (#532).
+        SmoothBasisSpec::MeasureJet { spec, .. } => matches!(
+            spec.identifiability,
+            MeasureJetIdentifiability::CenterSumToZero
+        ),
         SmoothBasisSpec::BSpline1D { .. }
         | SmoothBasisSpec::TensorBSpline { .. }
         | SmoothBasisSpec::Pca { .. }
@@ -9427,6 +9533,30 @@ fn with_identifiability_transform(
             centers: centers.clone(),
             kappa: *kappa,
             length_scale: *length_scale,
+            constraint_transform: compose_identifiability_transforms(
+                constraint_transform.as_ref(),
+                transform,
+            )?,
+        }),
+        BasisMetadata::MeasureJet {
+            centers,
+            input_scales,
+            length_scale,
+            eps_band,
+            order_s,
+            alpha,
+            tau0,
+            masses,
+            constraint_transform,
+        } => Ok(BasisMetadata::MeasureJet {
+            centers: centers.clone(),
+            input_scales: input_scales.clone(),
+            length_scale: *length_scale,
+            eps_band: eps_band.clone(),
+            order_s: *order_s,
+            alpha: *alpha,
+            tau0: *tau0,
+            masses: masses.clone(),
             constraint_transform: compose_identifiability_transforms(
                 constraint_transform.as_ref(),
                 transform,
@@ -15680,6 +15810,10 @@ fn try_build_spatial_term_log_kappa_derivative(
         // foundation); the κ-as-ψ derivative channel is a later stage, so there
         // is no log-κ derivative bundle to expose here yet.
         SmoothBasisSpec::ConstantCurvature { .. } => return Ok(None),
+        // Measure-jet smooths hold (s, α, τ) fixed at construction; their
+        // analytic ψ-channels (log-weight factors through the fixed geometry —
+        // see the module ψ-contract) are a later stage.
+        SmoothBasisSpec::MeasureJet { .. } => return Ok(None),
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
@@ -18291,6 +18425,52 @@ fn freeze_smooth_basis_from_metadata(
                 },
                 None => ConstantCurvatureIdentifiability::CenterSumToZero,
             };
+        }
+        (
+            SmoothBasisSpec::MeasureJet {
+                spec: s,
+                input_scales,
+                ..
+            },
+            BasisMetadata::MeasureJet {
+                centers,
+                input_scales: meta_scales,
+                length_scale,
+                eps_band,
+                order_s,
+                alpha,
+                tau0,
+                masses,
+                constraint_transform,
+            },
+        ) => {
+            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            // Pin every realized hyperparameter so auto sentinels cannot
+            // re-derive geometry from predict rows. The replay dispatch
+            // consumes length_scale VERBATIM (`input_scales: Some` marks the
+            // replay path — no σ_geom re-compensation; see the build
+            // dispatch's round-trip contract).
+            s.length_scale = *length_scale;
+            s.order_s = *order_s;
+            s.alpha = *alpha;
+            s.tau0 = *tau0;
+            s.num_scales = eps_band.len();
+            // The penalty depends on the FIT data through masses + band;
+            // freeze both so the rebuilt penalty is the one the coefficients
+            // were estimated under.
+            s.frozen_quadrature = Some(MeasureJetFrozenQuadrature {
+                masses: masses.clone(),
+                eps_band: eps_band.clone(),
+            });
+            // #532 pattern: freeze the composed `z · z_parametric` so the
+            // rebuild replays the fit-time realized transform verbatim.
+            s.identifiability = match constraint_transform {
+                Some(z) => MeasureJetIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                },
+                None => MeasureJetIdentifiability::CenterSumToZero,
+            };
+            *input_scales = meta_scales.clone();
         }
         (
             SmoothBasisSpec::Matern {
@@ -21463,6 +21643,7 @@ mod tests {
                 | SmoothBasisSpec::Sphere { feature_cols, .. }
                 | SmoothBasisSpec::ConstantCurvature { feature_cols, .. }
                 | SmoothBasisSpec::Matern { feature_cols, .. }
+                | SmoothBasisSpec::MeasureJet { feature_cols, .. }
                 | SmoothBasisSpec::Duchon { feature_cols, .. }
                 | SmoothBasisSpec::Pca { feature_cols, .. }
                 | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {

@@ -2554,7 +2554,7 @@ pub enum BasisMetadata {
     /// the global identifiability pipeline (#532 pattern).
     MeasureJet {
         centers: Array2<f64>,
-        input_scales: Option<Array1<f64>>,
+        input_scales: Option<Vec<f64>>,
         length_scale: f64,
         eps_band: Vec<f64>,
         order_s: f64,
