@@ -33,6 +33,7 @@ pub struct ReportInput {
     pub edf_blocks: Vec<EdfBlockRow>,
     pub continuous_order: Vec<ContinuousOrderRow>,
     pub anisotropic_scales: Vec<AnisotropicScalesRow>,
+    pub measure_jet_spectra: Vec<MeasureJetSpectrumRow>,
     pub diagnostics: Option<DiagnosticsInput>,
     pub smooth_plots: Vec<SmoothPlotData>,
     pub alo: Option<AloData>,
@@ -84,6 +85,25 @@ pub struct AnisotropicScalesRow {
     pub global_length_scale: Option<f64>,
     /// Per-axis: (axis_index, eta, per_axis_length_scale, per_axis_kappa)
     pub axes: Vec<(usize, f64, Option<f64>, Option<f64>)>,
+}
+
+/// Measure-jet scale spectrum row: the realized multiscale band of one
+/// measure-jet term, plus — in per-scale-candidate mode — the fitted
+/// physical λ̂_ℓ per scale and the implied continuous order
+/// ŝ = −½ · (least-squares slope of ln λ̂_ℓ on ln ε_ℓ). `per_scale` empty
+/// means the term carries a single fused jet-energy penalty, so only the
+/// band and the spec's order are shown. main.rs computes everything; this
+/// row stays plain data like the rest of the file.
+pub struct MeasureJetSpectrumRow {
+    pub term_name: String,
+    pub eps_min: f64,
+    pub eps_max: f64,
+    pub n_scales: usize,
+    pub length_scale: f64,
+    pub spec_order_s: f64,
+    /// Per-scale (ε_ℓ, physical λ̂_ℓ) pairs, ascending in ε; empty = fused.
+    pub per_scale: Vec<(f64, f64)>,
+    pub implied_order: Option<f64>,
 }
 
 pub struct DiagnosticsInput {
