@@ -297,6 +297,34 @@ fn householder_drop_first_apply(x: &Array2<f64>, u: &Array1<f64>) -> Array2<f64>
     out
 }
 
+/// Pairwise squared distances `‖a_i − b_j‖²` via the GEMM identity
+/// `‖a − b‖² = ‖a‖² + ‖b‖² − 2·aᵀb`: one (n×d)·(d×m) matrix product carries
+/// every FMA at tile speed instead of n·m scalar distance loops — the
+/// machine-native form of this kernel (every hot pass in the build is this
+/// one operation in disguise). The cancellation error near-coincident
+/// points pay is O(ε_f64·‖x‖²) ABSOLUTE, harmless under a Gaussian profile
+/// (the kernel is flat at d ≈ 0); clamped at zero so roundoff cannot emit
+/// tiny negatives.
+fn pairwise_sq_dists(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
+    let an: Vec<f64> = a.outer_iter().map(|r| r.dot(&r)).collect();
+    let bn: Vec<f64> = b.outer_iter().map(|r| r.dot(&r)).collect();
+    let mut g = a.dot(&b.t());
+    g.axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut row)| {
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = (an[i] + bn[j] - 2.0 * *v).max(0.0);
+            }
+        });
+    g
+}
+
+/// Row-block size for streaming GEMM passes that must not materialize the
+/// full n×m distance matrix (nearest-node assignment): 64Ki rows × m ≤ a
+/// few hundred MB of transient per block, GEMM-speed throughout.
+const MEASURE_JET_ASSIGN_BLOCK_ROWS: usize = 65_536;
+
 fn validate_finite_points(points: ArrayView2<'_, f64>, what: &str) -> Result<(), BasisError> {
     for (i, row) in points.outer_iter().enumerate() {
         if row.iter().any(|v| !v.is_finite()) {
@@ -434,24 +462,35 @@ pub fn measure_jet_quadrature_nodes(
     if n == 0 || m == 0 {
         crate::bail_invalid_basis!("measure-jet mass assignment needs nonempty data and centers");
     }
+    // Nearest-node assignment in streamed GEMM blocks: argmin_j ‖x−c_j‖² =
+    // argmin_j (‖c_j‖² − 2·xᵀc_j), so each block is one (rows×d)·(d×m)
+    // product plus a row-wise argmin — tile-speed FMAs, O(block·m) transient
+    // memory, deterministic ties to the lowest center index.
+    let cn: Vec<f64> = centers.outer_iter().map(|r| r.dot(&r)).collect();
     let assignments: Vec<usize> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let row = data.row(i);
-            let mut best_j = 0usize;
-            let mut best = f64::INFINITY;
-            for (j, c) in centers.outer_iter().enumerate() {
-                let mut s = 0.0_f64;
-                for k in 0..row.len() {
-                    let dlt = row[k] - c[k];
-                    s += dlt * dlt;
-                }
-                if s < best {
-                    best = s;
-                    best_j = j;
-                }
-            }
-            best_j
+        .step_by(MEASURE_JET_ASSIGN_BLOCK_ROWS)
+        .flat_map(|start| {
+            let end = (start + MEASURE_JET_ASSIGN_BLOCK_ROWS).min(n);
+            let g = data
+                .slice(ndarray::s![start..end, ..])
+                .dot(&centers.t());
+            let block: Vec<usize> = g
+                .axis_iter(Axis(0))
+                .into_par_iter()
+                .map(|row| {
+                    let mut best_j = 0usize;
+                    let mut best = f64::INFINITY;
+                    for (j, &gij) in row.iter().enumerate() {
+                        let s = cn[j] - 2.0 * gij;
+                        if s < best {
+                            best = s;
+                            best_j = j;
+                        }
+                    }
+                    best_j
+                })
+                .collect();
+            block
         })
         .collect();
     let mut masses = Array1::<f64>::zeros(m);
@@ -948,22 +987,20 @@ pub fn measure_jet_support_curve(
     validate_finite_points(centers, "centers")?;
     let nq = queries.nrows();
     let nl = eps_band.len();
+    // Distances once (GEMM), then every band scale reads the same d² row —
+    // an L-fold saving over per-scale distance recomputation.
+    let d2 = pairwise_sq_dists(queries, centers);
     let mut out = Array2::<f64>::zeros((nq, nl));
     out.axis_iter_mut(Axis(0))
         .into_par_iter()
         .enumerate()
         .for_each(|(qi, mut row)| {
-            let x = queries.row(qi);
+            let d2_row = d2.row(qi);
             for (li, &eps) in eps_band.iter().enumerate() {
                 let inv_two_eps2 = 1.0 / (2.0 * eps * eps);
                 let mut acc = 0.0_f64;
-                for (j, c) in centers.outer_iter().enumerate() {
-                    let mut s = 0.0_f64;
-                    for k in 0..c.len() {
-                        let dlt = x[k] - c[k];
-                        s += dlt * dlt;
-                    }
-                    acc += masses[j] * (-s * inv_two_eps2).exp();
+                for (j, &dd) in d2_row.iter().enumerate() {
+                    acc += masses[j] * (-dd * inv_two_eps2).exp();
                 }
                 row[li] = acc;
             }
@@ -992,19 +1029,13 @@ pub fn measure_jet_design_matrix(
     validate_finite_points(data, "data")?;
     validate_finite_points(centers, "centers")?;
     let inv_two_l2 = 1.0 / (2.0 * length_scale * length_scale);
-    let mut out = Array2::<f64>::zeros((data.nrows(), centers.nrows()));
+    // One GEMM for every distance, then the Gaussian applied in place — the
+    // n×m allocation IS the output, no transient copy.
+    let mut out = pairwise_sq_dists(data, centers);
     out.axis_iter_mut(Axis(0))
         .into_par_iter()
-        .enumerate()
-        .for_each(|(i, mut row)| {
-            for (j, c) in centers.outer_iter().enumerate() {
-                let mut s = 0.0_f64;
-                for k in 0..c.len() {
-                    let dlt = data[(i, k)] - c[k];
-                    s += dlt * dlt;
-                }
-                row[j] = (-s * inv_two_l2).exp();
-            }
+        .for_each(|mut row| {
+            row.mapv_inplace(|d2| (-d2 * inv_two_l2).exp());
         });
     Ok(out)
 }
