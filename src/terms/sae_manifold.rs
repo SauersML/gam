@@ -14295,7 +14295,25 @@ impl OuterObjective for SaeManifoldOuterObjective {
     /// handling flips from REJECT to DEMOTE-WITH-REASON so the candidate set
     /// never empties on a structural diagnosis.
     fn requires_continuation_path_entry(&self) -> bool {
-        self.term.k_atoms() >= 2
+        // K >= 2: routing multimodality makes blind multistart hopeless — the
+        // certified walk is the entry of record. K = 1 with a curved-capable
+        // chart (duchon / euclidean patch): the Eckart-Young LINEAR optimum is
+        // a genuine local minimum (a straight line through an arc), and cold
+        // seeds converge INTO it — the walk exists precisely to track from
+        // that anchor into the curved branch, and with the gauge-quotient
+        // pivot invariant it arrives in a handful of legs, replacing the
+        // 12-seed cascade outright. K = 1 periodic atoms keep the cascade:
+        // their circular topology is baked into the basis, so the linear
+        // basin is not an attractor for them and the walk buys nothing.
+        if self.term.k_atoms() >= 2 {
+            return true;
+        }
+        self.term.atoms.iter().any(|atom| {
+            matches!(
+                atom.basis_kind,
+                SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch
+            )
+        })
     }
 
     /// The SAE-manifold objective has a certified anchor (#1007): its `η = 0`
