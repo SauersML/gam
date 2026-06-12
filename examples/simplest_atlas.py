@@ -179,9 +179,17 @@ def main():
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 4.5 * n_rows))
     for ax in axes.ravel()[n_tiles:]:
         ax.set_visible(False)
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Tiles run in their own subprocesses already (hard timeout); a small
+    # thread pool just overlaps them: the atlas costs max(tile) not sum(tile).
+    # Three at a time keeps peak RSS trivial at these shapes.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {name: pool.submit(run_tile, name, args.seed, args.timeout) for name, _ in TILES}
+    results = {name: fut.result() for name, fut in futures.items()}
     for ax, (name, _) in zip(axes.ravel(), TILES):
         print(f"[atlas] {name} ...", flush=True)
-        res = run_tile(name, args.seed, args.timeout)
+        res = results[name]
         x = res["x"]
         if res.get("hard") is not None:
             colors = np.where(res["hard"] == res["hard"][0], "tab:blue", "tab:orange")
