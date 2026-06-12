@@ -14,7 +14,8 @@ use crate::basis::{
     BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy,
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
-    MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
+    MaternNu, MeasureJetBasisSpec, MeasureJetIdentifiability, OneDimensionalBoundary,
+    SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
     auto_spatial_center_strategy, default_num_centers, default_spatial_center_strategy,
     default_spherical_harmonic_degree, plan_spatial_basis,
@@ -1211,6 +1212,10 @@ pub(crate) fn canonicalize_smooth_type(raw: &str) -> &str {
         // collapse to one canonical type so `bs="curv"`/`bs="mkappa"` cannot
         // diverge from `curv(...)`.
         "curv" | "constant_curvature" | "mkappa" => "curvature",
+        // Measure-jet spline: multiscale local-jet-residual energy of the
+        // empirical measure. No mgcv equivalent (mgcv has no measure-learned
+        // geometry smooth), so no mgcv alias is mapped.
+        "mjs" | "measure_jet" | "web" => "measurejet",
         other => other,
     }
 }
@@ -2037,6 +2042,88 @@ pub fn build_smooth_basis(
                     double_penalty: smooth_double_penalty,
                     identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
                 },
+            })
+        }
+        "measurejet" => {
+            // Measure-jet spline: multiscale local-jet-residual energy of the
+            // empirical measure. The feature columns are ambient coordinates
+            // of data concentrated near an unknown low-dimensional set; the
+            // geometry (centers, masses, scale band) is read off the measure
+            // at build time — magic by default, every option optional.
+            validate_known_options(
+                "measurejet",
+                options,
+                &[
+                    "type",
+                    "bs",
+                    "by",
+                    "centers",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "knots",
+                    "s",
+                    "alpha",
+                    "tau",
+                    "scales",
+                    "length_scale",
+                    "double_penalty",
+                    "id",
+                    "__by_col",
+                ],
+            )?;
+            let order_s = option_f64(options, "s").unwrap_or(0.0);
+            // 0.0 = auto sentinel; explicit values must sit inside the
+            // admissible order interval of the affine-jet (r = 2) energy.
+            if !(order_s.is_finite() && (order_s == 0.0 || (order_s > 0.0 && order_s < 2.0))) {
+                return Err(format!(
+                    "measurejet smooth s must lie in (0, 2) (or be omitted for auto); got {order_s}"
+                ));
+            }
+            let alpha = option_f64(options, "alpha").unwrap_or(1.0);
+            if !alpha.is_finite() {
+                return Err("measurejet smooth requires a finite alpha".to_string());
+            }
+            let tau0 = option_f64(options, "tau").unwrap_or(1e-3);
+            if !(tau0.is_finite() && tau0 >= 0.0) {
+                return Err(format!(
+                    "measurejet smooth tau must be finite and nonnegative; got {tau0}"
+                ));
+            }
+            let num_scales = option_usize(options, "scales").unwrap_or(0);
+            let length_scale = option_f64(options, "length_scale").unwrap_or(0.0);
+            if !length_scale.is_finite() || length_scale < 0.0 {
+                return Err(format!(
+                    "measurejet smooth length_scale must be positive (or omitted for auto); got {length_scale}"
+                ));
+            }
+            let centers = parse_countwith_basis_alias(
+                options,
+                "centers",
+                default_num_centers(ds.values.nrows(), cols.len()),
+            )?;
+            if centers < 3 {
+                return Err("measurejet smooth requires at least 3 centers".to_string());
+            }
+            Ok(SmoothBasisSpec::MeasureJet {
+                feature_cols: cols.to_vec(),
+                spec: MeasureJetBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint {
+                        num_centers: centers,
+                    },
+                    order_s,
+                    alpha,
+                    tau0,
+                    num_scales,
+                    // 0.0 sentinel = auto initialization in the basis builder
+                    // (median nearest-center spacing, doubled).
+                    length_scale,
+                    double_penalty: smooth_double_penalty,
+                    identifiability: MeasureJetIdentifiability::CenterSumToZero,
+                    frozen_quadrature: None,
+                },
+                input_scales: None,
             })
         }
         "matern" => {
