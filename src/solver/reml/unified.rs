@@ -5166,15 +5166,18 @@ impl PenaltySubspaceTrace {
             // Z_chunk = rows · U_S  ((end-start) × r).
             let z_chunk = crate::faer_ndarray::fast_ab(&rows, &self.u_s);
             // h_i = Σ_{a,b} Z_{ia} (H_proj⁻¹)_{ab} Z_{ib}.
-            for i in 0..(end - start) {
-                let row_z = z_chunk.row(i);
+            for (i, row_z) in z_chunk.outer_iter().enumerate() {
                 let mut acc = 0.0;
-                for a in 0..r {
+                for (z_a, h_row) in row_z
+                    .iter()
+                    .copied()
+                    .zip(self.h_proj_inverse.rows().into_iter())
+                {
                     let mut inner = 0.0;
-                    for b in 0..r {
-                        inner += self.h_proj_inverse[[a, b]] * row_z[b];
+                    for (h_value, z_b) in h_row.iter().copied().zip(row_z.iter().copied()) {
+                        inner += h_value * z_b;
                     }
-                    acc += row_z[a] * inner;
+                    acc += z_a * inner;
                 }
                 h[start + i] = acc;
             }
@@ -14421,10 +14424,7 @@ impl DenseSpectralOperator {
     fn trace_projected_cross(&self, left: &Array2<f64>, right: &Array2<f64>) -> f64 {
         let mut result = 0.0;
         for (left_row, right_col) in left.rows().into_iter().zip(right.columns().into_iter()) {
-            for (left_value, right_value) in left_row
-                .iter()
-                .copied()
-                .zip(right_col.iter().copied())
+            for (left_value, right_value) in left_row.iter().copied().zip(right_col.iter().copied())
             {
                 result += left_value * right_value;
             }
@@ -17987,7 +17987,10 @@ mod tests {
             }
         }
 
-        assert_eq!(trace_matrix_product(&left, &right).to_bits(), reference.to_bits());
+        assert_eq!(
+            trace_matrix_product(&left, &right).to_bits(),
+            reference.to_bits()
+        );
     }
 
     #[test]
@@ -18068,6 +18071,40 @@ mod tests {
             let mut reference = 0.0;
             for j in 0..x.ncols() {
                 reference += x[[i, j]] * solved[[j, i]];
+            }
+            assert_eq!(got[i].to_bits(), reference.to_bits());
+        }
+    }
+
+    #[test]
+    fn xt_projected_kernel_diagonal_iterator_matches_scalar_reference_bitwise() {
+        let u_s = array![
+            [0.8_f64, -0.2],
+            [0.1, 0.9],
+            [0.5, 0.3],
+            [-0.4, 0.6]
+        ];
+        let h_proj_inverse = array![[1.6_f64, -0.25], [-0.25, 2.1]];
+        let subspace = PenaltySubspaceTrace {
+            u_s: u_s.clone(),
+            h_proj_inverse: h_proj_inverse.clone(),
+        };
+        let x = Array2::from_shape_fn((5, 4), |(i, j)| {
+            ((i as f64 + 0.3) * 0.19 - (j as f64 + 0.6) * 0.37).sin()
+        });
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone()));
+
+        let got = subspace.xt_projected_kernel_x_diagonal(&design);
+        let z = crate::faer_ndarray::fast_ab(&x, &u_s);
+        for i in 0..x.nrows() {
+            let row_z = z.row(i);
+            let mut reference = 0.0;
+            for a in 0..h_proj_inverse.nrows() {
+                let mut inner = 0.0;
+                for b in 0..h_proj_inverse.ncols() {
+                    inner += h_proj_inverse[[a, b]] * row_z[b];
+                }
+                reference += row_z[a] * inner;
             }
             assert_eq!(got[i].to_bits(), reference.to_bits());
         }
