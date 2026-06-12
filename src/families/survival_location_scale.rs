@@ -1532,6 +1532,7 @@ pub fn survival_fit_from_parts(
             survival_link_wiggle_degree: link_wiggle_degree,
             criterion_certificate: None,
             rho_posterior_certificate: None,
+            rho_posterior_escalation: None,
         },
         inner_cycles: 0,
     })
