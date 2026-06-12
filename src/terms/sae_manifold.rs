@@ -5373,6 +5373,55 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    pub fn refit_decoder_least_squares_at_current_state(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+    ) -> Result<(), String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::refit_decoder_least_squares_at_current_state: target shape {:?} != ({n}, {p})",
+                target.dim()
+            ));
+        }
+        let k_atoms = self.k_atoms();
+        let offsets = self.beta_offsets();
+        let m_total = self.beta_dim() / p;
+        let mut design = Array2::<f64>::zeros((n, m_total));
+        for row in 0..n {
+            let assignments = self.assignment.try_assignments_row(row)?;
+            for atom_idx in 0..k_atoms {
+                let atom = &self.atoms[atom_idx];
+                let weight = assignments[atom_idx];
+                let m = atom.basis_size();
+                let off = offsets[atom_idx] / p;
+                for basis_col in 0..m {
+                    design[[row, off + basis_col]] = weight * atom.basis_values[[row, basis_col]];
+                }
+            }
+        }
+        let beta = solve_design_least_squares(design.view(), target)?;
+        if beta.dim() != (m_total, p) {
+            return Err(format!(
+                "SaeManifoldTerm::refit_decoder_least_squares_at_current_state: beta shape {:?} != ({m_total}, {p})",
+                beta.dim()
+            ));
+        }
+        for atom_idx in 0..k_atoms {
+            let m = self.atoms[atom_idx].basis_size();
+            let off = offsets[atom_idx] / p;
+            for basis_col in 0..m {
+                for out_col in 0..p {
+                    self.atoms[atom_idx].decoder_coefficients[[basis_col, out_col]] =
+                        beta[[off + basis_col, out_col]];
+                }
+            }
+            self.atoms[atom_idx].refresh_intrinsic_smooth_penalty();
+        }
+        Ok(())
+    }
+
     pub fn fitted(&self) -> Array2<f64> {
         self.try_fitted().expect("assignment logits must be finite")
     }
@@ -13823,6 +13872,39 @@ impl SaeManifoldOuterObjective {
             self.term.set_homotopy_eta(1.0).ok();
         }
         self.set_isometry_homotopy_weight(1.0, &isometry_targets);
+        if arrived
+            && let Ok(before_fit) = self.term.try_fitted()
+            && let Some(before_ev) =
+                reconstruction_explained_variance(self.target.view(), before_fit.view())
+            && before_ev < 0.9
+        {
+            let snapshot = self.term.snapshot_mutable_state();
+            let accepted_polish = self
+                .term
+                .refit_decoder_least_squares_at_current_state(self.target.view())
+                .and_then(|()| {
+                    let after_fit = self.term.try_fitted()?;
+                    let Some(after_ev) =
+                        reconstruction_explained_variance(self.target.view(), after_fit.view())
+                    else {
+                        return Err(
+                            "curvature-homotopy decoder LSQ polish produced no EV".to_string()
+                        );
+                    };
+                    if after_ev >= 0.9 && after_ev > before_ev {
+                        self.term.loss(self.target.view(), &rho)
+                    } else {
+                        Err(format!(
+                            "curvature-homotopy decoder LSQ polish refused: EV {after_ev:.6} \
+                             did not clear 0.9 from {before_ev:.6}"
+                        ))
+                    }
+                });
+            match accepted_polish {
+                Ok(loss) => self.last_loss = Some(loss),
+                Err(_) => self.term.restore_mutable_state(&snapshot),
+            }
+        }
         let collapse_events = self.term.collapse_events().len();
         self.term.set_curvature_walk_report(CurvatureWalkReport {
             arrived,
