@@ -5161,6 +5161,17 @@ pub struct PredictUncertaintyOptions {
     pub predictor_x_for_corrections: Option<Array2<f64>>,
     /// Per-axis training support, paired with `predictor_x_for_corrections`.
     pub training_support: Option<TrainingSupport>,
+    /// V∞ §5 distance-honest seam: per-row extrapolation variance on the
+    /// η scale (already φ̂-scaled), ADDED to Var(η_i) after the
+    /// multiplicative inflations: Var_total = Var_Vp·inflation + Var_extrap.
+    /// Populated by the predict pipeline for fits carrying measure-jet
+    /// terms (frozen nodes/masses/band + fitted per-scale amplitudes) via
+    /// `FittedModel::measure_jet_extrapolation_variance`; None elsewhere.
+    /// Interaction with `ood_inflation`: when this is `Some`, the additive
+    /// term already prices off-support departure from the fitted spectrum,
+    /// so the heuristic multiplicative OOD inflation is skipped (with a
+    /// warning) to avoid double-counting the same distance signal.
+    pub extrapolation_variance: Option<Array1<f64>>,
     /// Per-row Edgeworth skewness κ₃ estimate (length = batch size). When
     /// None, Edgeworth correction reduces to the standard symmetric
     /// quantile (no-op).
@@ -5206,6 +5217,7 @@ impl Default for PredictUncertaintyOptions {
             multi_point_joint: false,
             predictor_x_for_corrections: None,
             training_support: None,
+            extrapolation_variance: None,
             eta_skewness_for_corrections: None,
             joint_query_count: None,
             boundary_alpha: 0.25,
@@ -5900,8 +5912,24 @@ where
     // Variance inflation (boundary + OOD). Both are per-row multipliers
     // ≥ 1 applied to Var(η_i); they propagate through to eta_se and
     // observation intervals consistently.
+    //
+    // Double-count guard (V∞ §5): when the caller supplies the additive
+    // measure-jet `extrapolation_variance`, that term already prices the
+    // off-support departure from the fitted spectrum. Stacking the heuristic
+    // multiplicative OOD inflation on top would charge the same distance
+    // signal twice, so the principled additive term wins and the multiplier
+    // is skipped. Boundary correction is unaffected: it prices a different,
+    // within-support edge effect.
+    let ood_inflation_active = options.ood_inflation && options.extrapolation_variance.is_none();
+    if options.ood_inflation && !ood_inflation_active {
+        log::warn!(
+            "predict_gamwith_uncertainty: ood_inflation is enabled but an additive \
+            extrapolation_variance is supplied; skipping the multiplicative OOD \
+            inflation to avoid double-counting off-support uncertainty"
+        );
+    }
     let mut variance_inflation = Array1::<f64>::ones(n_rows);
-    if (options.boundary_correction || options.ood_inflation)
+    if (options.boundary_correction || ood_inflation_active)
         && let (Some(predictor_x), Some(support)) = (
             options.predictor_x_for_corrections.as_ref(),
             options.training_support.as_ref(),
@@ -5922,7 +5950,7 @@ where
                     options.boundary_band_fraction,
                 );
             }
-            if options.ood_inflation {
+            if ood_inflation_active {
                 factor *= ood_variance_inflation_factor(
                     row,
                     support.axis_min.view(),
@@ -5933,7 +5961,7 @@ where
             variance_inflation[i] = factor;
         }
     }
-    let etavar = if variance_inflation.iter().all(|&f| f == 1.0) {
+    let mut etavar = if variance_inflation.iter().all(|&f| f == 1.0) {
         etavar_raw.clone()
     } else {
         Array1::from_iter(
@@ -5943,6 +5971,24 @@ where
                 .map(|(&v, &f)| v * f),
         )
     };
+    // V∞ §5 distance-honest seam: the per-row extrapolation variance is
+    // ADDED after the multiplicative inflations —
+    // Var_total = Var_Vp·inflation + Var_extrap — so far-off-support rows
+    // widen by the spectrum's priced ignorance instead of reverting
+    // confidently to the parametric backbone. Flows from here into
+    // `eta_standard_error` AND the per-row `etavar[i]` consumed by the
+    // mean-scale SE / observation band below, so the fusion propagates to
+    // every reported interval.
+    if let Some(extra) = options.extrapolation_variance.as_ref() {
+        if extra.len() != n_rows {
+            return Err(EstimationError::InvalidInput(format!(
+                "extrapolation_variance length {} does not match prediction batch {}",
+                extra.len(),
+                n_rows
+            )));
+        }
+        etavar += extra;
+    }
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
 
     // Per-row z multipliers. Joint adjustment widens the central level
@@ -7049,6 +7095,89 @@ mod tests {
         assert!(out.mean_lower[0] <= out.mean_upper[0]);
         assert!((0.0..=1.0).contains(&out.mean_lower[0]));
         assert!((0.0..=1.0).contains(&out.mean_upper[0]));
+    }
+
+    /// V∞ §5 fusion point: a supplied per-row `extrapolation_variance` is
+    /// ADDED to Var(η_i) after the multiplicative inflations, so
+    /// `eta_standard_error` (and the mean-scale SE, which reads the same
+    /// fused `etavar`) widens exactly by the additive term — and a
+    /// batch-length mismatch is a hard error, never a silent truncation.
+    #[test]
+    fn extrapolation_variance_adds_to_eta_variance_after_inflations() {
+        let x = array![[1.0], [1.0]];
+        let beta = array![0.5];
+        let offset = array![0.0, 0.0];
+        let covariance = Array2::from_diag(&array![0.16]);
+        let fit = test_fit_with_covariance(beta.clone(), covariance);
+        let base_options = PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            mean_interval_method: MeanIntervalMethod::TransformEta,
+            includeobservation_interval: false,
+            apply_bias_correction: false,
+            edgeworth_one_sided: false,
+            boundary_correction: false,
+            ood_inflation: false,
+            multi_point_joint: false,
+            ..PredictUncertaintyOptions::default()
+        };
+        let options_fused = PredictUncertaintyOptions {
+            // Row 0 stays on-support (zero extra), row 1 pays 0.09 on the
+            // η-variance scale: Var_total = 0.16 + 0.09 = 0.25 → SE 0.5.
+            extrapolation_variance: Some(array![0.0, 0.09]),
+            ..base_options.clone()
+        };
+
+        let baseline = predict_gamwith_uncertainty(
+            x.clone(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodSpec::gaussian_identity(),
+            &fit,
+            &base_options,
+        )
+        .expect("baseline gaussian uncertainty");
+        let fused = predict_gamwith_uncertainty(
+            x.clone(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodSpec::gaussian_identity(),
+            &fit,
+            &options_fused,
+        )
+        .expect("fused gaussian uncertainty");
+
+        assert!((baseline.eta_standard_error[0] - 0.4).abs() <= 1e-12);
+        assert!((baseline.eta_standard_error[1] - 0.4).abs() <= 1e-12);
+        // On-support row untouched; off-support row widened additively.
+        assert!((fused.eta_standard_error[0] - 0.4).abs() <= 1e-12);
+        assert!((fused.eta_standard_error[1] - 0.5).abs() <= 1e-12);
+        // The mean-scale SE consumes the SAME fused etavar (identity link:
+        // mean SE == eta SE), so the fusion propagates beyond the η scale.
+        assert!((fused.mean_standard_error[1] - 0.5).abs() <= 1e-12);
+        // Intervals widen with the fused SE.
+        assert!(
+            fused.mean_upper[1] - fused.mean_lower[1]
+                > baseline.mean_upper[1] - baseline.mean_lower[1]
+        );
+
+        let options_mismatched = PredictUncertaintyOptions {
+            extrapolation_variance: Some(array![0.09]),
+            ..base_options
+        };
+        let err = predict_gamwith_uncertainty(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodSpec::gaussian_identity(),
+            &fit,
+            &options_mismatched,
+        )
+        .expect_err("length mismatch must be rejected");
+        assert!(
+            err.to_string().contains("extrapolation_variance length"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
