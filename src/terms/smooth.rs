@@ -504,6 +504,7 @@ impl SmoothBasisSpec {
             | Self::Sphere { .. }
             | Self::ConstantCurvature { .. }
             | Self::Matern { .. }
+            | Self::MeasureJet { .. }
             | Self::Duchon { .. } => RADIAL_FLOOR,
             Self::Pca { basis_matrix, .. } => basis_matrix.ncols().max(1),
             Self::TensorBSpline { spec, .. } => {
@@ -583,6 +584,7 @@ impl SmoothBasisSpec {
             Self::Sphere { .. } => "sphere",
             Self::ConstantCurvature { .. } => "constant_curvature",
             Self::Matern { .. } => "matern",
+            Self::MeasureJet { .. } => "measurejet",
             Self::Duchon { .. } => "duchon",
             Self::Pca { .. } => "pca",
             Self::TensorBSpline { .. } => "tensor_bspline",
@@ -604,6 +606,7 @@ impl SmoothBasisSpec {
             | Self::Sphere { feature_cols, .. }
             | Self::ConstantCurvature { feature_cols, .. }
             | Self::Matern { feature_cols, .. }
+            | Self::MeasureJet { feature_cols, .. }
             | Self::Duchon { feature_cols, .. }
             | Self::Pca { feature_cols, .. }
             | Self::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
