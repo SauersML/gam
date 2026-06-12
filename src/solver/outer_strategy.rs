@@ -2089,6 +2089,17 @@ pub trait OuterObjective {
         None
     }
 
+    /// Let an objective declare that a seed is already a terminal outer result.
+    /// Used for objectives with a certified high-quality construction seed where
+    /// the generic rho optimizer can only degrade the fitted state.
+    fn accept_seed_without_outer_iterations(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<Option<f64>, EstimationError> {
+        let _ = rho.len();
+        Ok(None)
+    }
+
     /// Re-install the selected outer result into the mutable objective before
     /// callers consume objective-owned fitted state. Optimizers may evaluate
     /// rejected trial points after the best point was found; without this final
@@ -6619,6 +6630,14 @@ fn run_outer_with_plan(
                 obj.reset();
             }
             None => {}
+        }
+        if let Some(seed_cost) = obj.accept_seed_without_outer_iterations(seed)? {
+            started_seeds += 1;
+            let candidate = OuterResult::new(seed.clone(), seed_cost, 0, true, *the_plan);
+            if candidate_improves_best(&candidate, best.as_ref()) {
+                best = Some(candidate);
+            }
+            break;
         }
         // Magic-by-default continuation pre-warm. On hard fits this
         // walks ρ from an oversmoothing ρ₀ down to `seed`, leaving the
