@@ -14,20 +14,19 @@
 //! curvature, so the `d × d` block (here `d = 1`) goes to a numerical zero. At
 //! high `p` with concentrated harmonics this happens generically at some rows.
 //!
-//! These tests:
-//!   1. `high_dim_circle_inner_evidence_dies_with_gauge_pivot` — plant a clean
-//!      circle in `p ∈ {512, 2048}` and drive the production `reml_criterion`;
-//!      TODAY this returns the non-PD-pivot error verbatim (the gate the fix
-//!      must flip to a high-EV fit). Recorded as the red repro.
-//!   2. `radial_residual_row_htt_is_gauge_explained` — assemble the arrow-Schur
-//!      system at a row whose residual is engineered radial and confirm the
-//!      failing direction IS the gauge direction: the `d = 1` tangent block
-//!      `H_tt^(i)` is `≤ eps · max_diag`, i.e. gauge-explained per the #1037
-//!      test, NOT generic corruption. This is the evidence that the principled
-//!      fix (Faddeev–Popov deflation of the row-restricted orbit, contributing
-//!      a θ/ρ-constant `log κ` to the Laplace normalizer) is sound.
+//! `high_dim_circle_inner_evidence_dies_with_gauge_pivot` plants a clean circle
+//! in `p ∈ {512, 2048}` and drives the production `reml_criterion`. Before the
+//! #1037 fix this returned the non-PD-pivot error verbatim; after it, the fit
+//! must reach EV ≥ 0.95 AND must have recorded at least one gauge-deflated
+//! evidence direction — proving the radial-residual gauge zero really surfaced
+//! mid-solve and was stiffened (Faddeev–Popov, contributing a θ/ρ-constant
+//! `log κ` to the Laplace normalizer) rather than rejected. The gauge zero is
+//! an OFF-OPTIMUM transient — it appears on the inner Newton trajectory, not at
+//! the cold planted seed — so the only faithful probe is to drive the full
+//! inner solve and observe the recorded deflation count; a static assembly at
+//! the seed does not exhibit it.
 
-use gam::linalg::faer_ndarray::{FaerCholesky, FaerEigh};
+use gam::linalg::faer_ndarray::FaerCholesky;
 use gam::terms::latent_coord::LatentManifold;
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
@@ -140,8 +139,20 @@ fn high_dim_circle_inner_evidence_dies_with_gauge_pivot() {
         let result = term.reml_criterion(z.view(), &rho, None, 25, 1.0, 0.0, 0.0);
 
         match result {
-            Ok((cost, _loss)) => {
-                // POST-FIX path: the fit must reconstruct the circle.
+            Ok((cost, loss)) => {
+                // POST-FIX path: the fit must reconstruct the circle AND it must
+                // have reached the optimum THROUGH the #1037 gauge-deflated
+                // evidence factorization — i.e. the radial-residual gauge zero
+                // really did surface mid-solve and was stiffened (Faddeev–Popov)
+                // rather than rejected. A success with zero deflations would mean
+                // the planted geometry no longer exercises the pivot this test
+                // exists to guard, so the gate would be vacuous.
+                assert!(
+                    loss.evidence_gauge_deflated_directions > 0,
+                    "p={p}: the fit succeeded but recorded 0 gauge-deflated evidence directions — \
+                     the #1037 gauge orbit was never exercised, so this repro no longer guards \
+                     the pivot. Revisit the planted geometry."
+                );
                 let fitted = term.fitted();
                 let mut num = 0.0_f64;
                 let mut den = 0.0_f64;
@@ -180,70 +191,3 @@ fn high_dim_circle_inner_evidence_dies_with_gauge_pivot() {
     }
 }
 
-/// Diagnosis: confirm the failing direction is gauge-explained. At the planted
-/// (zero-residual) circle every row's reconstruction is radial, so the single
-/// tangential phase-shift curvature entry `H_tt^(i)` (d=1) is a numerical zero
-/// relative to the block-diagonal scale — exactly the #1037 gauge-explained
-/// test `g_i^T H_tt g_i ≤ eps · max_diag · |g_i|^2` with `g_i = [1]`.
-#[test]
-fn radial_residual_row_htt_is_gauge_explained() {
-    let n = 150;
-    let p = 512;
-    let z = planted_high_dim_circle(n, p, 0x1037);
-    let mut term = build_k1_circle_term(&z);
-    let rho = SaeManifoldRho::new(
-        (1.0e-3_f64).ln(),
-        (1.0e-3_f64).ln(),
-        vec![Array1::from_elem(1, (1.0e-3_f64).ln())],
-    );
-
-    let sys = term
-        .assemble_arrow_schur(z.view(), &rho, None)
-        .expect("arrow-Schur assembly at the planted seed");
-
-    // Block-diagonal scale = the largest per-row H_tt diagonal across all rows:
-    // the natural curvature unit the near-zero direction is measured against.
-    let mut max_diag = 0.0_f64;
-    for row in &sys.rows {
-        for ax in 0..row.htt.nrows() {
-            max_diag = max_diag.max(row.htt[[ax, ax]].abs());
-        }
-    }
-    assert!(
-        max_diag > 0.0,
-        "expected non-trivial per-row curvature somewhere; max_diag={max_diag}"
-    );
-
-    // For each per-row `H_tt^(i)` block, the SMALLEST eigenvalue is the flattest
-    // curvature direction in that row's chart. A gauge-explained row has a
-    // near-zero (or slightly negative, at the numerical-zero scale of the
-    // autopsy's -6e-11) minimum eigenvalue relative to `max_diag`: the orbit
-    // direction the #1037 Faddeev–Popov deflation must stiffen rather than the
-    // evidence factor reject. Count those rows and report the flattest one.
-    let eps = 1.0e-6_f64;
-    let mut near_zero_rows = 0usize;
-    let mut min_ratio = f64::INFINITY;
-    for row in &sys.rows {
-        let (evals, _vecs) = row
-            .htt
-            .eigh(faer::Side::Lower)
-            .expect("per-row H_tt eigendecomposition");
-        let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
-        let ratio = lambda_min / max_diag;
-        min_ratio = min_ratio.min(ratio);
-        // Gauge-explained: the flat direction's curvature is a numerical zero
-        // (|λ_min| ≤ eps·max_diag), i.e. neither materially positive nor a real
-        // negative curvature well — exactly the radial-residual orbit zero.
-        if lambda_min <= eps * max_diag {
-            near_zero_rows += 1;
-        }
-    }
-
-    assert!(
-        near_zero_rows > 0,
-        "expected ≥1 row whose flattest H_tt curvature is a numerical zero \
-         (λ_min ≤ {eps}·max_diag) — the gauge orbit the #1037 deflation targets; none found \
-         (min ratio={min_ratio:.3e}, max_diag={max_diag:.3e}). If this fails the planted \
-         geometry no longer produces the gauge zero and the repro must be revisited."
-    );
-}
