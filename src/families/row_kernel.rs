@@ -34,6 +34,28 @@ use std::sync::Arc;
 const ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS: usize = 100_000;
 const ARROW_ROW_CHUNK: usize = 256;
 
+/// Byte budget for materializing the dense `J·F` projection (`n × K·rank`
+/// f64) that the cached trace fast path builds and caches. Aligned with
+/// `ResourcePolicy`'s default single-materialization budget (1 GiB). When the
+/// projection would exceed this, `trace_projected_factor[_cached]` instead
+/// streams the trace row-by-row — recomputing each row's `Jᵣ·F` on the fly and
+/// consuming it immediately — so peak memory stays O(rank) regardless of `n`.
+/// Without this gate a 320K-row survival fit with rank ~1000 materializes a
+/// ~10 GiB `J·F` (the family override additionally holds several `n × rank`
+/// transients during assembly), OOM-killing the host mid outer-iteration.
+const JF_MATERIALIZATION_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Whether the dense `n_rows × K·rank` f64 `J·F` projection would exceed
+/// [`JF_MATERIALIZATION_BUDGET_BYTES`]. Saturating so the product can never
+/// wrap on pathological dimensions (a wrap would falsely report "fits").
+fn jf_projection_exceeds_budget<const K: usize>(n_rows: usize, rank: usize) -> bool {
+    n_rows
+        .saturating_mul(K)
+        .saturating_mul(rank)
+        .saturating_mul(std::mem::size_of::<f64>())
+        > JF_MATERIALIZATION_BUDGET_BYTES
+}
+
 #[inline]
 fn arrow_row_chunk_count(n_rows: usize) -> usize {
     if n_rows == 0 {
@@ -869,6 +891,9 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         if rank == 0 || n_rows == 0 {
             return 0.0;
         }
+        if jf_projection_exceeds_budget::<K>(n_rows, rank) {
+            return self.trace_projected_factor_streaming(factor);
+        }
         let jf = self.compute_jf(factor);
         self.trace_projected_factor_with_jf(factor, jf.view())
     }
@@ -891,6 +916,9 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         let n_rows = self.kern.n_rows();
         if rank == 0 || n_rows == 0 {
             return 0.0;
+        }
+        if jf_projection_exceeds_budget::<K>(n_rows, rank) {
+            return self.trace_projected_factor_streaming(factor);
         }
         let jf = self.cached_jf(factor, cache);
         self.trace_projected_factor_with_jf(factor, jf.view())
@@ -1172,6 +1200,57 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
             chunk_total
         })
     }
+
+    /// Memory-bounded trace for large-scale shapes: the same
+    /// `tr(FᵀBF) = Σ_r Σ_k (Jᵣ·F[:,k])ᵀ Tᵣ (Jᵣ·F[:,k])` as
+    /// [`Self::trace_projected_factor_with_jf`], but the per-row `Jᵣ·F[:,k]`
+    /// is recomputed on the fly via `jacobian_action` instead of read from a
+    /// prebuilt `n × K·rank` projection. Peak memory is O(rank) (the
+    /// transposed factor's contiguous columns) rather than O(n·K·rank), so a
+    /// 320K-row fit at large rank no longer pins ~10 GiB. The expensive
+    /// per-row work (`row_third_contracted`) is identical and computed once
+    /// per row; only the cheap jacobian projection is no longer batched into
+    /// a GEMM, which is the deliberate compute-for-memory trade taken solely
+    /// when the dense projection would blow the materialization budget.
+    fn trace_projected_factor_streaming(&self, factor: &Array2<f64>) -> f64 {
+        let rank = factor.ncols();
+        let n_rows = self.kern.n_rows();
+        let direction = self.direction.as_slice();
+        // Contiguous columns of F: row `k_col` of `f_t` is `F[:, k_col]`.
+        let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
+
+        deterministic_chunked_sum(n_rows, |chunk_idx| -> f64 {
+            let start = chunk_idx * ARROW_ROW_CHUNK;
+            let end = (start + ARROW_ROW_CHUNK).min(n_rows);
+            let mut chunk_total = 0.0_f64;
+            for row in start..end {
+                let dir_k = self.kern.jacobian_action(row, direction);
+                let third = self
+                    .kern
+                    .row_third_contracted(row, &dir_k)
+                    .expect("row-kernel third contraction should succeed for validated directions");
+                let mut row_total = 0.0_f64;
+                for k_col in 0..rank {
+                    let f_col = f_t
+                        .row(k_col)
+                        .to_slice()
+                        .expect("standard-layout factor row must be contiguous");
+                    let vec_k = self.kern.jacobian_action(row, f_col);
+                    let mut quad = 0.0_f64;
+                    for a in 0..K {
+                        let mut t_dot = 0.0_f64;
+                        for b in 0..K {
+                            t_dot += third[a][b] * vec_k[b];
+                        }
+                        quad += vec_k[a] * t_dot;
+                    }
+                    row_total += quad;
+                }
+                chunk_total += row_total;
+            }
+            chunk_total
+        })
+    }
 }
 
 struct RowKernelSecondDirectionalDerivativeOperator<const K: usize, T: RowKernel<K>> {
@@ -1239,6 +1318,9 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         if rank == 0 || n_rows == 0 {
             return 0.0;
         }
+        if jf_projection_exceeds_budget::<K>(n_rows, rank) {
+            return self.trace_projected_factor_streaming(factor);
+        }
         let jf = self.compute_jf(factor);
         self.trace_projected_factor_with_jf(factor, jf.view())
     }
@@ -1256,6 +1338,9 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         let n_rows = self.kern.n_rows();
         if rank == 0 || n_rows == 0 {
             return 0.0;
+        }
+        if jf_projection_exceeds_budget::<K>(n_rows, rank) {
+            return self.trace_projected_factor_streaming(factor);
         }
         let jf = self.cached_jf(factor, cache);
         self.trace_projected_factor_with_jf(factor, jf.view())
@@ -1328,6 +1413,52 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
                     for k in 0..K {
                         vec_k[k] = jf_slice[k * rank + k_col];
                     }
+                    let mut quad = 0.0_f64;
+                    for a in 0..K {
+                        let mut t_dot = 0.0_f64;
+                        for b in 0..K {
+                            t_dot += fourth[a][b] * vec_k[b];
+                        }
+                        quad += vec_k[a] * t_dot;
+                    }
+                    row_total += quad;
+                }
+                chunk_total += row_total;
+            }
+            chunk_total
+        })
+    }
+
+    /// Memory-bounded trace — second-derivative analogue of
+    /// [`RowKernelDirectionalDerivativeOperator::trace_projected_factor_streaming`].
+    /// Recomputes each row's `Jᵣ·F[:,k]` on the fly instead of reading a
+    /// prebuilt `n × K·rank` projection, holding the per-row
+    /// `row_fourth_contracted` jet once per row. Peak memory O(rank); taken
+    /// only when the dense projection would exceed the materialization budget.
+    fn trace_projected_factor_streaming(&self, factor: &Array2<f64>) -> f64 {
+        let rank = factor.ncols();
+        let n_rows = self.kern.n_rows();
+        let direction_u = self.direction_u.as_slice();
+        let direction_v = self.direction_v.as_slice();
+        let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
+
+        deterministic_chunked_sum(n_rows, |chunk_idx| -> f64 {
+            let start = chunk_idx * ARROW_ROW_CHUNK;
+            let end = (start + ARROW_ROW_CHUNK).min(n_rows);
+            let mut chunk_total = 0.0_f64;
+            for row in start..end {
+                let dir_u = self.kern.jacobian_action(row, direction_u);
+                let dir_v = self.kern.jacobian_action(row, direction_v);
+                let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
+                    "row-kernel fourth contraction should succeed for validated directions",
+                );
+                let mut row_total = 0.0_f64;
+                for k_col in 0..rank {
+                    let f_col = f_t
+                        .row(k_col)
+                        .to_slice()
+                        .expect("standard-layout factor row must be contiguous");
+                    let vec_k = self.kern.jacobian_action(row, f_col);
                     let mut quad = 0.0_f64;
                     for a in 0..K {
                         let mut t_dot = 0.0_f64;

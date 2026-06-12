@@ -14128,30 +14128,51 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         let f_marginal = factor.slice(s![self.slices.marginal.clone(), ..]);
         let f_logslope = factor.slice(s![self.slices.logslope.clone(), ..]);
 
-        let jf_entry = survival_axis_jf_via_design(&self.family.design_entry, f_time, n_rows);
-        let jf_exit = survival_axis_jf_via_design(&self.family.design_exit, f_time, n_rows);
-        let jf_derivative =
-            survival_axis_jf_via_design(&self.family.design_derivative_exit, f_time, n_rows);
-        let jf_marginal =
-            survival_axis_jf_via_design(&self.family.marginal_design, f_marginal, n_rows);
-        let jf_logslope =
-            survival_axis_jf_via_design(&self.family.logslope_design, f_logslope, n_rows);
-
+        // Assemble the (n × 4·rank) projection holding at most one `n × rank`
+        // transient alive at a time (plus the reused marginal block), rather
+        // than all five axis projections simultaneously. At large scale each
+        // `n × rank` block is hundreds of MiB; materializing five at once on
+        // top of the output was the bulk of the survival outer-loop memory
+        // spike. The marginal block feeds both the entry and exit axes, so it
+        // is computed once and dropped after; every other axis projection is a
+        // statement-scoped temporary freed before the next is built. (For
+        // shapes where even the 4·rank output would blow the materialization
+        // budget, the trace path streams and never calls this builder.)
         let mut jf = Array2::<f64>::zeros((n_rows, 4 * rank));
         {
-            let mut axis0 = jf.slice_mut(s![.., 0..rank]);
-            axis0.assign(&jf_entry);
-            axis0 += &jf_marginal;
-        }
-        {
-            let mut axis1 = jf.slice_mut(s![.., rank..2 * rank]);
-            axis1.assign(&jf_exit);
-            axis1 += &jf_marginal;
+            let jf_marginal =
+                survival_axis_jf_via_design(&self.family.marginal_design, f_marginal, n_rows);
+            {
+                let mut axis0 = jf.slice_mut(s![.., 0..rank]);
+                axis0.assign(&survival_axis_jf_via_design(
+                    &self.family.design_entry,
+                    f_time,
+                    n_rows,
+                ));
+                axis0 += &jf_marginal;
+            }
+            {
+                let mut axis1 = jf.slice_mut(s![.., rank..2 * rank]);
+                axis1.assign(&survival_axis_jf_via_design(
+                    &self.family.design_exit,
+                    f_time,
+                    n_rows,
+                ));
+                axis1 += &jf_marginal;
+            }
         }
         jf.slice_mut(s![.., 2 * rank..3 * rank])
-            .assign(&jf_derivative);
+            .assign(&survival_axis_jf_via_design(
+                &self.family.design_derivative_exit,
+                f_time,
+                n_rows,
+            ));
         jf.slice_mut(s![.., 3 * rank..4 * rank])
-            .assign(&jf_logslope);
+            .assign(&survival_axis_jf_via_design(
+                &self.family.logslope_design,
+                f_logslope,
+                n_rows,
+            ));
         Some(jf)
     }
 
