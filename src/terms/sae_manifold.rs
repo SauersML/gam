@@ -8989,50 +8989,6 @@ impl SaeManifoldTerm {
         Ok(AnalyticPenaltyKind::Isometry(Arc::new(corrected)))
     }
 
-    fn add_sae_logit_penalty(
-        &self,
-        sys: &mut ArrowSchurSystem,
-        penalty: &AnalyticPenaltyKind,
-        target: ArrayView1<'_, f64>,
-        rho_local: ArrayView1<'_, f64>,
-        row_layout: Option<&SaeRowLayout>,
-    ) {
-        let n = self.n_obs();
-        let k = self.k_atoms();
-        let assignment_dim = self.assignment.assignment_coord_dim();
-        let grad = penalty.grad_target(target, rho_local);
-        for row in 0..n {
-            if let Some(layout) = row_layout {
-                for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
-                    sys.rows[row].gt[pos] += grad[row * k + atom];
-                }
-            } else {
-                for free_idx in 0..assignment_dim {
-                    sys.rows[row].gt[free_idx] += grad[row * k + free_idx];
-                }
-            }
-        }
-        // The ArrowSchur `htt` block is the Newton / PIRLS curvature operator and
-        // must stay PSD. Nonconvex sparsifiers (log, JumpReLU) have an indefinite
-        // true Hessian, so we accumulate the PSD majorizer here — never the exact
-        // `hessian_diag`, which goes negative and would destroy the solve's
-        // positive-definiteness. Convex penalties' majorizer equals their exact
-        // Hessian, so this is exact for them.
-        if let Some(diag) = penalty.psd_majorizer_diag(target, rho_local) {
-            for row in 0..n {
-                if let Some(layout) = row_layout {
-                    for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
-                        sys.rows[row].htt[[pos, pos]] += diag[row * k + atom];
-                    }
-                } else {
-                    for free_idx in 0..assignment_dim {
-                        sys.rows[row].htt[[free_idx, free_idx]] += diag[row * k + free_idx];
-                    }
-                }
-            }
-        }
-    }
-
     fn add_sae_coord_penalty(
         &self,
         sys: &mut ArrowSchurSystem,
@@ -9102,7 +9058,8 @@ impl SaeManifoldTerm {
         }
         // `htt` is the PSD Newton / PIRLS curvature block: accumulate the PSD
         // majorizer (exact for convex penalties), not the indefinite exact
-        // Hessian, for the same reason as `add_sae_logit_penalty` above.
+        // Hessian, for the same PSD-Newton reason used throughout the analytic
+        // penalty assembly.
         if let Some(diag) = penalty.psd_majorizer_diag(target, rho_local) {
             for row in 0..n {
                 if let Some(row_off) =
