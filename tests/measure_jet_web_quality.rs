@@ -61,7 +61,9 @@ const POISSON_ETA_SCALE: f64 = 0.5;
 /// Two-sided 95% normal quantile, qnorm(0.975).
 const Z_95: f64 = 1.959963984540054;
 /// All eight ambient columns handed to the measure-jet term.
-const MJS_FORMULA: &str = "y ~ mjs(x0, x1, x2, x3, x4, x5, x6, x7)";
+const MJS_PREDICTIVE_FORMULA: &str =
+    "y ~ mjs(x0, x1, x2, x3, x4, x5, x6, x7, centers=24, scales=3)";
+const MJS_INTERVAL_FORMULA: &str = "y ~ mjs(x0, x1, x2, x3, x4, x5, x6, x7, centers=36)";
 /// Geometry-blind mature in-crate baseline on the same ambient columns.
 const DUCHON_FORMULA: &str = "y ~ duchon(x0, x1, x2, x3, x4, x5, x6, x7)";
 
@@ -291,17 +293,18 @@ fn pointwise_se(design: ArrayView2<'_, f64>, cov: &Array2<f64>) -> Vec<f64> {
         .collect()
 }
 
-/// Integrated quality gate: one gaussian measure-jet fit feeds the four
-/// gaussian contracts, one Duchon fit supplies the mature baseline, and one
-/// Poisson measure-jet fit gates PIRLS/REML composition. This keeps the suite
-/// honest and removes the old harness shape that launched five independent
-/// threaded REML fits over the same web fixture.
+/// Integrated quality gate: one predictive gaussian measure-jet fit feeds the
+/// truth/support/bridge contracts, one Duchon fit supplies the mature baseline,
+/// one Poisson measure-jet fit gates PIRLS/REML composition, and one
+/// interval-resolution measure-jet fit gates covariance coverage. This keeps
+/// the suite honest and removes the old harness shape that launched five
+/// independent threaded REML fits over the same web fixture.
 #[test]
 fn measure_jet_web_quality_contracts() {
     init_parallelism();
     let train_points = sample_web(400, 41, true);
     let data = encode_training(&train_points, 42);
-    let jet_fit = fit_web(MJS_FORMULA, &data, "gaussian");
+    let jet_fit = fit_web(MJS_PREDICTIVE_FORMULA, &data, "gaussian");
 
     // Contract 1 — truth recovery off-gap: with d = 8 ambient columns and 1-D
     // intrinsic structure, the fit must resolve the strand signal to within
@@ -451,7 +454,7 @@ fn measure_jet_web_quality_contracts() {
     // gaussian bridge test; this gate isolates the GLM composition).
     let poisson_test: Vec<WebPoint> = sample_web(140, 43, true);
 
-    let poisson_fit = fit_web(MJS_FORMULA, &poisson_data, "poisson");
+    let poisson_fit = fit_web(MJS_PREDICTIVE_FORMULA, &poisson_data, "poisson");
     let poisson_pred = predict_with_fit(&poisson_fit, &poisson_data, &poisson_test);
     let eta_rmse = rmse_vs_truth(&poisson_pred, &poisson_test, POISSON_ETA_SCALE);
 
@@ -476,17 +479,18 @@ fn measure_jet_web_quality_contracts() {
     // interpolation honesty; gap extrapolation has its own (bias) gate.
     let coverage_test: Vec<WebPoint> = sample_web(140, 46, true);
 
+    let interval_fit = fit_web(MJS_INTERVAL_FORMULA, &data, "gaussian");
     let m = ambient_matrix(&data, &coverage_test);
-    let design = build_term_collection_design(m.view(), &jet_fit.resolvedspec)
+    let design = build_term_collection_design(m.view(), &interval_fit.resolvedspec)
         .expect("rebuild design from frozen spec");
-    let pred = design.design.apply(&jet_fit.fit.beta);
+    let pred = design.design.apply(&interval_fit.fit.beta);
     let dense = design.design.to_dense();
 
     // Vp propagates smoothing-parameter uncertainty into the band; it is the
     // covariance the rest of the CI quality suite gates coverage on. If the
     // measure-jet path fails to populate it, that is an honest red, not a
     // reason to fall back to a weaker object.
-    let vp = jet_fit
+    let vp = interval_fit
         .fit
         .beta_covariance_corrected()
         .expect("standard gaussian fit exposes the smoothing-corrected covariance Vp");
