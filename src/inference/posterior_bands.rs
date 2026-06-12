@@ -21,10 +21,10 @@ pub struct PosteriorPredictBandsPayload {
 
 /// Posterior eta matrix (n_draws x n_rows) -> per-row bands.
 ///
-/// Handles empty draws gracefully and uses link-scale quantiles for the
-/// response-scale credible bounds (monotone inverse link preserves
-/// quantiles). The response-scale **point estimate** is the posterior mean of
-/// the response-scale draws — i.e. `E[g^{-1}(eta)]`, **not** `g^{-1}(E[eta])`.
+/// Requires at least one posterior draw and uses link-scale quantiles for the
+/// response-scale credible bounds (monotone inverse link preserves quantiles).
+/// The response-scale **point estimate** is the posterior mean of the
+/// response-scale draws — i.e. `E[g^{-1}(eta)]`, **not** `g^{-1}(E[eta])`.
 /// For nonlinear inverse links (logit, log, probit, cloglog) the two differ
 /// by Jensen's inequality, and consumers of the `"mean"` field expect the
 /// former (it should equal the per-row posterior mean of `predict_draws`'
@@ -42,43 +42,36 @@ pub fn eta_bands_from_matrix(
     let alpha = (1.0 - level) / 2.0;
     let n_draws = eta.nrows();
     let n_rows = eta.ncols();
-    let (eta_mean, eta_lower, eta_upper, response_mean) = if n_draws == 0 {
-        (
-            vec![0.0; n_rows],
-            vec![0.0; n_rows],
-            vec![0.0; n_rows],
-            vec![0.0; n_rows],
-        )
-    } else {
-        let mut means = vec![0.0_f64; n_rows];
-        let mut lower = vec![0.0_f64; n_rows];
-        let mut upper = vec![0.0_f64; n_rows];
-        let mut response = vec![0.0_f64; n_rows];
-        let mut column = vec![0.0_f64; n_draws];
-        let inv_n = 1.0 / n_draws as f64;
-        for j in 0..n_rows {
-            for k in 0..n_draws {
-                column[k] = eta[[k, j]];
-            }
-            let mut sum = 0.0_f64;
-            for v in &column {
-                sum += *v;
-            }
-            means[j] = sum * inv_n;
-            // Response-scale posterior mean: average inv-link draws, not
-            // inv-link of the eta mean. See doc comment above.
-            let response_draws = apply_inverse_link_vec(&column, family_kind)?;
-            let mut rsum = 0.0_f64;
-            for v in &response_draws {
-                rsum += *v;
-            }
-            response[j] = rsum * inv_n;
-            column.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-            lower[j] = quantile_from_sorted(&column, alpha);
-            upper[j] = quantile_from_sorted(&column, 1.0 - alpha);
+    if n_draws == 0 {
+        return Err("posterior bands unavailable: zero draws".to_string());
+    }
+    let mut eta_mean = vec![0.0_f64; n_rows];
+    let mut eta_lower = vec![0.0_f64; n_rows];
+    let mut eta_upper = vec![0.0_f64; n_rows];
+    let mut response_mean = vec![0.0_f64; n_rows];
+    let mut column = vec![0.0_f64; n_draws];
+    let inv_n = 1.0 / n_draws as f64;
+    for j in 0..n_rows {
+        for k in 0..n_draws {
+            column[k] = eta[[k, j]];
         }
-        (means, lower, upper, response)
-    };
+        let mut sum = 0.0_f64;
+        for v in &column {
+            sum += *v;
+        }
+        eta_mean[j] = sum * inv_n;
+        // Response-scale posterior mean: average inv-link draws, not
+        // inv-link of the eta mean. See doc comment above.
+        let response_draws = apply_inverse_link_vec(&column, family_kind)?;
+        let mut rsum = 0.0_f64;
+        for v in &response_draws {
+            rsum += *v;
+        }
+        response_mean[j] = rsum * inv_n;
+        column.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        eta_lower[j] = quantile_from_sorted(&column, alpha);
+        eta_upper[j] = quantile_from_sorted(&column, 1.0 - alpha);
+    }
     let mean_lower = apply_inverse_link_vec(&eta_lower, family_kind)?;
     let mean_upper = apply_inverse_link_vec(&eta_upper, family_kind)?;
     Ok((
@@ -161,7 +154,7 @@ mod tests {
         let level = 0.80; // alpha = 0.10 each tail
         let alpha = (1.0 - level) / 2.0;
 
-        let (eta_mean, eta_lower, eta_upper, mean, _mean_lower, _mean_upper) =
+        let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
             eta_bands_from_matrix(eta.view(), "log", level).expect("bands");
 
         for j in 0..2 {
@@ -191,6 +184,14 @@ mod tests {
                 (eta_upper[j] - hi).abs() < 1e-12,
                 "upper band must be shared linear quantile col {j}"
             );
+            assert!(
+                eta_lower[j] <= eta_mean[j] && eta_mean[j] <= eta_upper[j],
+                "eta mean must sit inside nonzero interval col {j}"
+            );
+            assert!(
+                mean_lower[j] <= mean[j] && mean[j] <= mean_upper[j],
+                "response mean must sit inside nonzero interval col {j}"
+            );
         }
 
         // Jensen gap is real and oriented: for the skewed column the
@@ -202,24 +203,12 @@ mod tests {
         );
     }
 
-    /// Empty draws degrade to all-zero bands without panicking, matching
-    /// the documented graceful-degradation contract.
     #[test]
-    fn empty_draws_yield_zero_bands() {
+    fn empty_draws_reject_posterior_bands() {
         let eta = Array2::<f64>::zeros((0, 3));
-        let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
-            eta_bands_from_matrix(eta.view(), "identity", 0.95).expect("bands");
-        for v in [
-            &eta_mean,
-            &eta_lower,
-            &eta_upper,
-            &mean,
-            &mean_lower,
-            &mean_upper,
-        ] {
-            assert_eq!(v.len(), 3);
-            assert!(v.iter().all(|x| *x == 0.0));
-        }
+        let err = eta_bands_from_matrix(eta.view(), "identity", 0.95)
+            .expect_err("zero draws must fail");
+        assert!(err.contains("zero draws"));
     }
 
     /// The posterior response-scale band path is a PUBLIC consumer of the log
