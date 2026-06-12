@@ -1105,6 +1105,9 @@ impl<'a> RemlState<'a> {
             } else {
                 order
             } {
+                crate::solver::outer_strategy::OuterEvalOrder::Value => {
+                    super::unified::EvalMode::ValueOnly
+                }
                 crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => {
                     super::unified::EvalMode::ValueAndGradient
                 }

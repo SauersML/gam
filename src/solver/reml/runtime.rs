@@ -265,6 +265,53 @@ fn transformed_penalty_matvec(
     out
 }
 
+impl EvalShared {
+    /// Canonical penalty scores `S_k β̂` at this bundle's inner mode
+    /// `β̂ = pirls_result.beta_transformed`, computed once per inner solution
+    /// and shared by every assemble call on the same bundle (exact hoist —
+    /// see the field doc on `penalty_scores_at_mode`).
+    ///
+    /// `canonical_penalties` must be the owning `RemlState`'s fixed
+    /// `canonical_penalties` slice; on a cache hit the stored length is
+    /// checked against it so a frame mismatch fails loudly instead of
+    /// silently feeding stale scores.
+    fn canonical_penalty_scores_at_mode(
+        &self,
+        canonical_penalties: &[crate::construction::CanonicalPenalty],
+    ) -> Result<Arc<Vec<Array1<f64>>>, EstimationError> {
+        if let Some(scores) = self.penalty_scores_at_mode.get() {
+            if scores.len() != canonical_penalties.len() {
+                return Err(EstimationError::LayoutError(format!(
+                    "shared penalty-score cache mismatch: cached {} score vectors, \
+                     requested {} canonical penalties",
+                    scores.len(),
+                    canonical_penalties.len()
+                )));
+            }
+            return Ok(Arc::clone(scores));
+        }
+        let beta_hat = self.pirls_result.beta_transformed.as_ref();
+        let scores = Arc::new(
+            canonical_penalties
+                .iter()
+                .map(|pen| transformed_penalty_matvec(pen, beta_hat))
+                .collect::<Vec<_>>(),
+        );
+        match self.penalty_scores_at_mode.set(Arc::clone(&scores)) {
+            Ok(()) => Ok(scores),
+            // A concurrent caller initialized the cell first; both vectors
+            // were built from identical inputs (same β̂, same penalties) —
+            // return the canonical winner so every consumer holds literally
+            // the same allocation.
+            Err(_) => Ok(Arc::clone(
+                self.penalty_scores_at_mode
+                    .get()
+                    .expect("OnceLock set raced, so it is initialized"),
+            )),
+        }
+    }
+}
+
 static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, (f64, u64)>>> = OnceLock::new();
 static OUTER_IFT_RESIDUAL_ENERGY_ITER: AtomicU64 = AtomicU64::new(0);
 
@@ -1751,7 +1798,9 @@ struct Gam784BlockTarget<'t> {
     /// Dispersion φ used to scale the deviance into a log-likelihood.
     phi: f64,
     /// Penalty scores `S_k β̂` per canonical penalty (unscaled by λ_k).
-    penalty_scores: Vec<Array1<f64>>,
+    /// Shared from the eval bundle's once-per-inner-solution cache
+    /// (`EvalShared::canonical_penalty_scores_at_mode`).
+    penalty_scores: Arc<Vec<Array1<f64>>>,
     /// `λ_k = e^{ρ_k}` per canonical penalty, aligned with `penalty_scores`.
     lambdas: Vec<f64>,
     /// Deviance at the base mode.
@@ -4052,12 +4101,13 @@ impl<'a> RemlState<'a> {
         }
 
         // Penalty scores S_k β̂ (canonical basis) and λ_k = e^{ρ_k}.
-        let beta_hat = pirls_result.beta_transformed.as_ref().clone();
-        let penalty_scores: Vec<Array1<f64>> = self
-            .canonical_penalties
-            .iter()
-            .map(|pen| transformed_penalty_matvec(pen, &beta_hat))
-            .collect();
+        // Computed once per inner solution on the eval bundle and reused
+        // across every assemble call sharing this bundle: β̂ =
+        // `pirls_result.beta_transformed` is fixed inside the bundle's
+        // `Arc<PirlsResult>` and `self.canonical_penalties` is fixed for the
+        // `RemlState`, so the vectors are ρ- and mode-invariant (exact hoist,
+        // identical values for every consumer).
+        let penalty_scores = bundle.canonical_penalty_scores_at_mode(&self.canonical_penalties)?;
         let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
 
         // Dispersion φ used to turn deviance into log-likelihood.
@@ -11139,7 +11189,12 @@ impl<'a> RemlState<'a> {
         };
 
         let decision = match order {
-            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => None,
+            // Value-only requests ride the gradient path: this evaluator's
+            // assembly contract requires a gradient (see the `result.gradient`
+            // demand below), so the cheapest honest fulfilment of a value-only
+            // order here is value+gradient with the Hessian skipped.
+            crate::solver::outer_strategy::OuterEvalOrder::Value
+            | crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => None,
             crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian => {
                 if allow_second_order {
                     Some(self.selecthessian_strategy_policy(&bundle))
