@@ -7220,6 +7220,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator,
             firth_dense_operator_original: None,
             penalty_pseudologdet: std::sync::OnceLock::new(),
+            penalty_scores_at_mode: std::sync::OnceLock::new(),
         })
     }
 
@@ -7352,6 +7353,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator: None,
             firth_dense_operator_original,
             penalty_pseudologdet: std::sync::OnceLock::new(),
+            penalty_scores_at_mode: std::sync::OnceLock::new(),
         })
     }
 

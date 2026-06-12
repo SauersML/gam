@@ -7,7 +7,7 @@ use crate::solver::outer_strategy::OuterEval;
 use crate::solver::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use crate::terms::basis::LocalDesignJacobianProvider;
 use crate::types::SasLinkState;
-use ndarray::{Array2, s};
+use ndarray::{Array1, Array2, s};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
@@ -4105,6 +4105,19 @@ pub(crate) struct EvalShared {
     /// factorizes the canonical-TRANSFORMED, possibly constraint-projected
     /// penalties, a genuinely different matrix, not a duplicate of this one.)
     penalty_pseudologdet: std::sync::OnceLock<Arc<penalty_logdet::PenaltyPseudologdet>>,
+    /// Per-evaluation-point cache of the canonical penalty score vectors
+    /// `S_k β̂` evaluated at this bundle's inner mode `β̂ =
+    /// pirls_result.beta_transformed` (unscaled by λ_k). These depend ONLY
+    /// on the inner solution carried by this bundle and the `RemlState`'s
+    /// fixed `canonical_penalties` — never on which ρ-coordinate or eval
+    /// mode the assembly is running — so they are computed exactly once per
+    /// inner solution and shared by every assemble call that reuses the
+    /// bundle (cost + gradient evaluations at the same ρ, EFS, synthetic-ext
+    /// value probes). Exact hoist, not an approximation: every consumer sees
+    /// literally the same vectors it previously recomputed. Initialized via
+    /// plain ndarray matvecs (no rayon inside the `OnceLock` closure — the
+    /// `get_or_init`+`into_par_iter` deadlock trap does not apply).
+    penalty_scores_at_mode: std::sync::OnceLock<Arc<Vec<Array1<f64>>>>,
 }
 
 impl EvalShared {
