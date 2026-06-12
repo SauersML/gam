@@ -2725,6 +2725,28 @@ struct OuterFirstOrderBridge<'a> {
     /// log their distance from this reference so hidden backtracking work is
     /// visible in STAGE traces.
     last_value_grad_rho: Option<Array1<f64>>,
+    /// Exact memo for recent line-search value probes. BFGS can re-query the
+    /// same rejected trial when switching Wolfe strategies; the SAE inner solve
+    /// behind a Value probe is deterministic, so serving an identical rho from
+    /// this memo preserves the objective while avoiding duplicate refinement
+    /// work.
+    value_probe_cache: Vec<ValueProbeCacheEntry>,
+}
+
+const VALUE_PROBE_CACHE_CAPACITY: usize = 256;
+const VALUE_PROBE_REJECT_COST_FLOOR: f64 = 1.0e11;
+
+#[derive(Clone)]
+struct ValueProbeCacheEntry {
+    rho: Array1<f64>,
+    outcome: CachedValueProbeOutcome,
+}
+
+#[derive(Clone)]
+enum CachedValueProbeOutcome {
+    Cost(f64),
+    Recoverable(String),
+    Fatal(String),
 }
 
 fn trial_rho_distance(reference: Option<&Array1<f64>>, trial: &Array1<f64>) -> f64 {
@@ -2743,6 +2765,73 @@ fn trial_rho_distance(reference: Option<&Array1<f64>>, trial: &Array1<f64>) -> f
         })
         .sum::<f64>()
         .sqrt()
+}
+
+fn same_outer_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+fn cached_value_probe_result(outcome: &CachedValueProbeOutcome) -> Result<f64, ObjectiveEvalError> {
+    match outcome {
+        CachedValueProbeOutcome::Cost(cost) => Ok(*cost),
+        CachedValueProbeOutcome::Recoverable(message) => {
+            Err(ObjectiveEvalError::recoverable(message.clone()))
+        }
+        CachedValueProbeOutcome::Fatal(message) => Err(ObjectiveEvalError::Fatal {
+            message: message.clone(),
+        }),
+    }
+}
+
+fn cache_value_probe_result(result: &Result<f64, ObjectiveEvalError>) -> CachedValueProbeOutcome {
+    match result {
+        Ok(cost) => CachedValueProbeOutcome::Cost(*cost),
+        Err(ObjectiveEvalError::Recoverable { message }) => {
+            CachedValueProbeOutcome::Recoverable(message.clone())
+        }
+        Err(ObjectiveEvalError::Fatal { message }) => {
+            CachedValueProbeOutcome::Fatal(message.clone())
+        }
+    }
+}
+
+fn value_probe_outcome_label(outcome: &CachedValueProbeOutcome) -> &'static str {
+    match outcome {
+        CachedValueProbeOutcome::Cost(_) => "cost",
+        CachedValueProbeOutcome::Recoverable(_) => "recoverable",
+        CachedValueProbeOutcome::Fatal(_) => "fatal",
+    }
+}
+
+fn value_probe_reject_outcome(outcome: &CachedValueProbeOutcome) -> bool {
+    match outcome {
+        CachedValueProbeOutcome::Cost(cost) => *cost >= VALUE_PROBE_REJECT_COST_FLOOR,
+        CachedValueProbeOutcome::Recoverable(_) | CachedValueProbeOutcome::Fatal(_) => true,
+    }
+}
+
+fn remember_value_probe(
+    cache: &mut Vec<ValueProbeCacheEntry>,
+    rho: &Array1<f64>,
+    outcome: CachedValueProbeOutcome,
+) {
+    if let Some(entry) = cache
+        .iter_mut()
+        .find(|entry| same_outer_point(&entry.rho, rho))
+    {
+        entry.outcome = outcome;
+        return;
+    }
+    if cache.len() == VALUE_PROBE_CACHE_CAPACITY {
+        cache.remove(0);
+    }
+    cache.push(ValueProbeCacheEntry {
+        rho: rho.clone(),
+        outcome,
+    });
 }
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
@@ -2769,25 +2858,73 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
             .validate_point_len(x, "outer eval_cost failed")?;
         let trial_rho_distance = trial_rho_distance(self.last_value_grad_rho.as_ref(), x);
         let stage_start = std::time::Instant::now();
+        if let Some(entry) = self
+            .value_probe_cache
+            .iter()
+            .find(|entry| same_outer_point(&entry.rho, x))
+        {
+            let outcome_label = value_probe_outcome_label(&entry.outcome);
+            log::info!(
+                "[STAGE] outer eval start order=Value dim={} trial_rho_distance={:.3e} (first-order bridge, iter={}, cached=true)",
+                x.len(),
+                trial_rho_distance,
+                self.iter_count
+            );
+            match &entry.outcome {
+                CachedValueProbeOutcome::Cost(cost) => log::info!(
+                    "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, iter={}, cached=true)",
+                    stage_start.elapsed().as_secs_f64(),
+                    cost,
+                    trial_rho_distance,
+                    self.iter_count
+                ),
+                CachedValueProbeOutcome::Recoverable(_) | CachedValueProbeOutcome::Fatal(_) => {
+                    log::info!(
+                        "[STAGE] outer eval end order=Value elapsed={:.3}s outcome={} trial_rho_distance={:.3e} (first-order bridge, iter={}, cached=true)",
+                        stage_start.elapsed().as_secs_f64(),
+                        outcome_label,
+                        trial_rho_distance,
+                        self.iter_count
+                    );
+                }
+            }
+            return cached_value_probe_result(&entry.outcome);
+        }
         log::info!(
             "[STAGE] outer eval start order=Value dim={} trial_rho_distance={:.3e} (first-order bridge, iter={})",
             x.len(),
             trial_rho_distance,
             self.iter_count
         );
-        let eval = self
+        let result = self
             .obj
             .eval_with_order(x, OuterEvalOrder::Value)
-            .map_err(|err| into_objective_error("outer eval_cost failed", err))?;
-        let cost = finite_cost_or_error("outer eval_cost failed", eval.cost)?;
-        log::info!(
-            "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, iter={})",
-            stage_start.elapsed().as_secs_f64(),
-            cost,
-            trial_rho_distance,
-            self.iter_count
-        );
-        Ok(cost)
+            .map_err(|err| into_objective_error("outer eval_cost failed", err))
+            .and_then(|eval| finite_cost_or_error("outer eval_cost failed", eval.cost));
+        let cached_outcome = cache_value_probe_result(&result);
+        remember_value_probe(&mut self.value_probe_cache, x, cached_outcome);
+        match &result {
+            Ok(cost) => log::info!(
+                "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, iter={})",
+                stage_start.elapsed().as_secs_f64(),
+                cost,
+                trial_rho_distance,
+                self.iter_count
+            ),
+            Err(ObjectiveEvalError::Recoverable { .. }) => log::info!(
+                "[STAGE] outer eval end order=Value elapsed={:.3}s outcome=recoverable trial_rho_distance={:.3e} (first-order bridge, iter={})",
+                stage_start.elapsed().as_secs_f64(),
+                trial_rho_distance,
+                self.iter_count
+            ),
+            Err(ObjectiveEvalError::Fatal { .. }) => log::info!(
+                "[STAGE] outer eval end order=Value elapsed={:.3}s outcome=fatal trial_rho_distance={:.3e} (first-order bridge, iter={})",
+                stage_start.elapsed().as_secs_f64(),
+                trial_rho_distance,
+                self.iter_count
+            ),
+        }
+        result
     }
 }
 
@@ -2861,6 +2998,8 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             self.last_g_norm = Some(g_norm);
         }
         self.last_value_grad_rho = Some(x.clone());
+        self.value_probe_cache
+            .retain(|entry| value_probe_reject_outcome(&entry.outcome));
         log::info!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge, iter={})",
             stage_start.elapsed().as_secs_f64(),
@@ -7455,6 +7594,7 @@ fn run_outer_with_plan(
                         g_norm_initial: None,
                         last_g_norm: None,
                         last_value_grad_rho: None,
+                        value_probe_cache: Vec::new(),
                     };
                     // Hand the precomputed (cost, gradient) seed eval to
                     // `opt::Bfgs` so its first internal `eval_grad` call is
@@ -8939,6 +9079,7 @@ mod tests {
             g_norm_initial: None,
             last_g_norm: None,
             last_value_grad_rho: None,
+            value_probe_cache: Vec::new(),
         };
 
         let first = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])

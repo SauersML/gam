@@ -875,6 +875,7 @@ pub fn torus_isometry_flow_reparameterization(
         // test: only strict-descent, fold-free candidates are ever taken.
         let mut rejects = 0usize;
         let mut accepted_step = false;
+        let mut converged = false;
         let mut step_norm_sq = 0.0_f64;
         while rejects < TORUS_FLOW_GN_MAX_REJECTS {
             let mut damped = jtj.clone();
@@ -898,8 +899,7 @@ pub fn torus_isometry_flow_reparameterization(
                 candidate[k] += delta[[k, 0]];
                 step_norm_sq += delta[[k, 0]] * delta[[k, 0]];
             }
-            let folded =
-                basis.min_jacobian_det_on_grid(&candidate) <= TORUS_FLOW_DIFFEO_MIN_DET;
+            let folded = basis.min_jacobian_det_on_grid(&candidate) <= TORUS_FLOW_DIFFEO_MIN_DET;
             let candidate_state = if folded {
                 None
             } else {
@@ -915,7 +915,7 @@ pub fn torus_isometry_flow_reparameterization(
                     lambda = (lambda / 10.0).max(1.0e-12);
                     if improvement <= 1.0e-14 * (1.0 + state.defect) {
                         // Converged: the accepted step no longer moves E.
-                        rejects = TORUS_FLOW_GN_MAX_REJECTS;
+                        converged = true;
                     }
                     break;
                 }
@@ -926,6 +926,9 @@ pub fn torus_isometry_flow_reparameterization(
             }
         }
         if !accepted_step {
+            break;
+        }
+        if converged {
             break;
         }
         let theta_norm_sq: f64 = theta.iter().map(|v| v * v).sum();
@@ -946,8 +949,7 @@ pub fn torus_isometry_flow_reparameterization(
     }
 
     // ── Decoder transport on the Nyquist-oversampled audit grid ─────────────
-    let axis_nodes =
-        TORUS_TRANSPORT_MIN_NODES_PER_AXIS.max(3 * (m as f64).sqrt().ceil() as usize);
+    let axis_nodes = TORUS_TRANSPORT_MIN_NODES_PER_AXIS.max(3 * (m as f64).sqrt().ceil() as usize);
     let grid_rows = axis_nodes * axis_nodes;
     let mut grid = Array2::<f64>::zeros((grid_rows, 2));
     let mut new_grid = Array2::<f64>::zeros((grid_rows, 2));
