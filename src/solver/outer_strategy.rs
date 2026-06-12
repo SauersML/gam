@@ -2094,11 +2094,7 @@ pub trait OuterObjective {
     /// rejected trial points after the best point was found; without this final
     /// synchronization, stateful objectives can report the last trial fit rather
     /// than the returned `OuterResult::rho`.
-    fn finalize_outer_result(
-        &mut self,
-        rho: &Array1<f64>,
-        _plan: &OuterPlan,
-    ) -> Result<(), EstimationError> {
+    fn finalize_outer_result(&mut self, rho: &Array1<f64>) -> Result<(), EstimationError> {
         self.eval_cost(rho).map(|_| ())
     }
 }
@@ -7776,7 +7772,7 @@ fn run_outer_with_plan(
     }
 
     if let Some(result) = best {
-        obj.finalize_outer_result(&result.rho, &result.plan_used)?;
+        obj.finalize_outer_result(&result.rho)?;
         return Ok(result);
     }
 
