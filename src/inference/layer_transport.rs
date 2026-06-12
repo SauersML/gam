@@ -887,8 +887,8 @@ pub struct CompositionDefectReport {
     pub max_abs_defect: f64,
     /// `max_t |d(t)| / band(t)` against the composed pointwise bands.
     pub max_studentized_defect: f64,
-    /// Šidák tail bound for the max studentized defect with the defect
-    /// smooth's EDF as the effective number of independent looks.
+    /// Bonferroni p-value bound for the max studentized defect over all tested
+    /// grid points.
     pub max_studentized_p_value: f64,
     /// EDF of the variance-weighted REML defect smooth.
     pub defect_edf: f64,
@@ -1035,13 +1035,12 @@ pub fn composition_defect(
     })
     .ok_or_else(|| "composition defect smooth test degenerated".to_string())?;
 
-    // Šidák bound for the max studentized defect: the defect smooth's EDF is
-    // the effective number of independent looks along the grid.
+    // Bonferroni bound for the max studentized defect over the actual grid:
+    // valid for arbitrary dependence among the tested pointwise contrasts.
     let normal =
         Normal::new(0.0, 1.0).map_err(|e| format!("standard normal construction failed: {e}"))?;
     let pointwise = (2.0 * (1.0 - normal.cdf(max_z))).clamp(0.0, 1.0);
-    let effective_looks = fit.edf.ceil().max(1.0);
-    let max_studentized_p_value = (1.0 - (1.0 - pointwise).powf(effective_looks)).clamp(0.0, 1.0);
+    let max_studentized_p_value = (n_grid as f64 * pointwise).min(1.0);
 
     Ok(CompositionDefectReport {
         n_grid,
