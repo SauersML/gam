@@ -4689,4 +4689,8 @@ pub(crate) struct RemlState<'a> {
     pub(crate) analytic_penalty_registry_fingerprint: u64,
     /// Ensures the process attempts at most one disk restore per surface.
     pub(crate) persistent_warm_start_loaded: AtomicBool,
+    /// Scoped counter disabling disk writes from cost-only posterior/probe
+    /// evaluations. In-memory warm starts still update; only JSON/bin
+    /// persistence and eviction sweeps are suppressed.
+    pub(crate) persistent_warm_start_store_suppression: AtomicUsize,
 }
