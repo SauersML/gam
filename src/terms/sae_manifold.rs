@@ -14538,6 +14538,60 @@ mod tests {
         assert_eta_one_parity(&euclidean, duchon_coords.view(), total_cols - linear_cols);
     }
 
+    /// Minimal K=1 term for direct unit tests of term-state machinery that does
+    /// not depend on a real fit (e.g. the gauge-deflation count guard).
+    fn trivial_k1_euclidean_term() -> SaeManifoldTerm {
+        let n = 4usize;
+        let p = 3usize;
+        let atom = SaeManifoldAtom::new(
+            "atom0",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            Array2::<f64>::ones((n, 2)),
+            Array3::<f64>::zeros((n, 2, 1)),
+            Array2::<f64>::zeros((2, p)),
+            Array2::<f64>::eye(2),
+        )
+        .unwrap();
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![Array2::<f64>::zeros((n, 1))],
+            vec![LatentManifold::Euclidean],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        SaeManifoldTerm::new(vec![atom], assignment).unwrap()
+    }
+
+    /// The #1037 quotient-dimension guard: the recorded count of gauge-deflated
+    /// evidence directions must be CONSTANT across a single optimization. The
+    /// first observation pins the expected count; a later observation that
+    /// matches is a no-op; a later observation that DIFFERS is a structural
+    /// quotient-dimension change and must error loudly (comparing Laplace
+    /// normalizers across a changed null-space is meaningless).
+    #[test]
+    fn evidence_gauge_deflation_count_guard_pins_then_rejects_change() {
+        let mut term = trivial_k1_euclidean_term();
+        assert!(term.expected_evidence_gauge_deflated_directions.is_none());
+
+        // First observation pins the expected count.
+        term.record_evidence_gauge_deflation_count(2).unwrap();
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(2));
+
+        // A matching later observation is a no-op (still Ok, count unchanged).
+        term.record_evidence_gauge_deflation_count(2).unwrap();
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(2));
+
+        // A DIFFERENT later observation is a structural event → loud error.
+        let err = term
+            .record_evidence_gauge_deflation_count(3)
+            .expect_err("a changed deflation count must error");
+        assert!(
+            err.contains("deflation count changed"),
+            "guard must report the quotient-dimension change explicitly; got: {err}"
+        );
+    }
+
     #[test]
     fn linear_span_anchor_recovers_planted_two_plane_configuration() {
         let n = 4usize;
