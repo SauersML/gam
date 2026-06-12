@@ -164,7 +164,7 @@ impl PerAtomEfsResult {
             operator_trust_radius: None,
             operator_stop_reason: None,
             criterion_certificate: None,
-            rho_uncertainty_certificate: None,
+            rho_uncertainty_diagnostic: None,
         }
     }
 }

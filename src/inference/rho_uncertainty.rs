@@ -1,12 +1,14 @@
-//! PSIS certificate for marginal smoothing-parameter uncertainty.
+//! PSIS diagnostic for marginal smoothing-parameter uncertainty.
 //!
-//! The diagnostic answers whether fixed-`ρ` REML/LAML intervals can be trusted
-//! on the fitted problem. It treats the exact outer Hessian at `ρ_hat` as a
-//! Laplace proposal, evaluates the exact profiled criterion at deterministic
-//! proposal draws, and uses the existing PSIS tail fit to classify the
-//! importance-ratio tail.
+//! The diagnostic treats the exact outer Hessian at `rho_hat` as a Laplace
+//! proposal, evaluates the exact profiled criterion at a deterministic finite
+//! set of proposal draws, and fits a GPD tail to the resulting importance
+//! weights. A large `k_hat` is evidence that fixed-`rho` REML/LAML intervals are
+//! inadequate for this fit; a small `k_hat` is only absence of heavy-tail
+//! evidence at the probed points, not a proof about unprobed tails. A criterion
+//! closure can agree with the Gaussian proposal at every deterministic draw and
+//! still have catastrophic heavier tails elsewhere.
 
-use crate::inference::certificates::{Certificate, Claim, Evidence, Verdict};
 use crate::inference::psis::{MIN_TAIL_COUNT, pareto_smooth_weights};
 use ndarray::{Array1, Array2};
 
@@ -15,16 +17,16 @@ const MAX_AUTO_RHO_DIM: usize = 4;
 const MAX_AUTO_WORK_UNITS: usize = 2_000_000;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RhoUncertaintyCertificate {
+pub struct RhoUncertaintyDiagnostic {
     pub k_hat: Option<f64>,
     pub n_evaluations: usize,
-    pub verdict: RhoUncertaintyVerdict,
+    pub status: RhoUncertaintyStatus,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum RhoUncertaintyVerdict {
-    CertifiedAdequate,
-    RhoUncertaintyMatters { k_hat: f64 },
+pub enum RhoUncertaintyStatus {
+    NoEvidenceOfHeavyTails,
+    HeavyTailsDetected { k_hat: f64 },
     Skipped { reason: String },
 }
 
@@ -49,61 +51,14 @@ impl Default for RhoUncertaintyCostGate {
     }
 }
 
-impl RhoUncertaintyCertificate {
+impl RhoUncertaintyDiagnostic {
     pub fn skipped(reason: impl Into<String>, n_evaluations: usize) -> Self {
         Self {
             k_hat: None,
             n_evaluations,
-            verdict: RhoUncertaintyVerdict::Skipped {
+            status: RhoUncertaintyStatus::Skipped {
                 reason: reason.into(),
             },
-        }
-    }
-
-    pub fn is_certified_adequate(&self) -> bool {
-        matches!(self.verdict, RhoUncertaintyVerdict::CertifiedAdequate)
-    }
-}
-
-impl Certificate for RhoUncertaintyCertificate {
-    fn claim(&self) -> Claim {
-        Claim::new(
-            "rho-uncertainty",
-            "the Laplace approximation over smoothing parameters has a light \
-             enough importance-ratio tail that plug-in REML/LAML intervals are \
-             adequate for this fit",
-        )
-    }
-
-    fn evidence(&self) -> Evidence {
-        let mut evidence = Evidence::new();
-        evidence.insert("n_evaluations", self.n_evaluations.into());
-        match self.k_hat {
-            Some(k_hat) if k_hat.is_finite() => {
-                evidence.insert("k_hat", k_hat.into());
-            }
-            _ => {
-                evidence.insert("k_hat", "n/a".into());
-            }
-        }
-        evidence.insert(
-            "verdict",
-            match &self.verdict {
-                RhoUncertaintyVerdict::CertifiedAdequate => "certified-adequate".into(),
-                RhoUncertaintyVerdict::RhoUncertaintyMatters { .. } => {
-                    "rho-uncertainty-matters".into()
-                }
-                RhoUncertaintyVerdict::Skipped { reason } => format!("skipped: {reason}").into(),
-            },
-        );
-        evidence
-    }
-
-    fn verdict(&self) -> Verdict {
-        match self.verdict {
-            RhoUncertaintyVerdict::CertifiedAdequate => Verdict::Certified,
-            RhoUncertaintyVerdict::RhoUncertaintyMatters { .. } => Verdict::Insufficient,
-            RhoUncertaintyVerdict::Skipped { .. } => Verdict::Unavailable,
         }
     }
 }
@@ -114,7 +69,7 @@ pub fn cost_gate_allows(rho_dim: usize, gate: RhoUncertaintyCostGate) -> Result<
     }
     if rho_dim > MAX_AUTO_RHO_DIM {
         return Err(format!(
-            "rho dimension {rho_dim} exceeds automatic PSIS certificate limit {MAX_AUTO_RHO_DIM}"
+            "rho dimension {rho_dim} exceeds automatic PSIS diagnostic limit {MAX_AUTO_RHO_DIM}"
         ));
     }
     let sample_count = gate.sample_count.max(2 * MIN_TAIL_COUNT);
@@ -127,7 +82,7 @@ pub fn cost_gate_allows(rho_dim: usize, gate: RhoUncertaintyCostGate) -> Result<
         .saturating_mul(p.max(1));
     if work_units > MAX_AUTO_WORK_UNITS {
         return Err(format!(
-            "estimated certificate cost {work_units} work units exceeds automatic limit {MAX_AUTO_WORK_UNITS} \
+            "estimated diagnostic cost {work_units} work units exceeds automatic limit {MAX_AUTO_WORK_UNITS} \
              (M={sample_count}, K={rho_dim}, n={}, p={})",
             gate.problem_size.n_obs.unwrap_or(0),
             gate.problem_size.p_coefficients.unwrap_or(0),
@@ -136,22 +91,22 @@ pub fn cost_gate_allows(rho_dim: usize, gate: RhoUncertaintyCostGate) -> Result<
     Ok(sample_count)
 }
 
-pub fn rho_uncertainty_certificate<F>(
+pub fn rho_uncertainty_diagnostic<F>(
     rho_hat: &Array1<f64>,
     outer_hessian_rho: &Array2<f64>,
     gate: RhoUncertaintyCostGate,
     mut criterion: F,
-) -> RhoUncertaintyCertificate
+) -> RhoUncertaintyDiagnostic
 where
     F: FnMut(&Array1<f64>) -> Option<f64>,
 {
     let rho_dim = rho_hat.len();
     let sample_count = match cost_gate_allows(rho_dim, gate) {
         Ok(sample_count) => sample_count,
-        Err(reason) => return RhoUncertaintyCertificate::skipped(reason, 0),
+        Err(reason) => return RhoUncertaintyDiagnostic::skipped(reason, 0),
     };
     if outer_hessian_rho.nrows() != rho_dim || outer_hessian_rho.ncols() != rho_dim {
-        return RhoUncertaintyCertificate::skipped(
+        return RhoUncertaintyDiagnostic::skipped(
             format!(
                 "outer rho Hessian shape {}x{} does not match K={rho_dim}",
                 outer_hessian_rho.nrows(),
@@ -161,10 +116,10 @@ where
         );
     }
     let Some(cost_hat) = criterion(rho_hat).filter(|value| value.is_finite()) else {
-        return RhoUncertaintyCertificate::skipped("criterion was not finite at rho_hat", 1);
+        return RhoUncertaintyDiagnostic::skipped("criterion was not finite at rho_hat", 1);
     };
     let Some(proposal_factor) = proposal_factor_from_hessian(outer_hessian_rho) else {
-        return RhoUncertaintyCertificate::skipped(
+        return RhoUncertaintyDiagnostic::skipped(
             "outer rho Hessian was not positive definite",
             1,
         );
@@ -191,7 +146,7 @@ where
         .filter(|value| value.is_finite())
         .fold(f64::NEG_INFINITY, f64::max);
     if !max_log_weight.is_finite() {
-        return RhoUncertaintyCertificate::skipped(
+        return RhoUncertaintyDiagnostic::skipped(
             "all proposal draws had non-finite criterion values",
             n_evaluations,
         );
@@ -217,28 +172,28 @@ where
         && max_weight > 0.0
         && (max_weight - min_weight) <= 1e-12 * max_weight.max(1.0)
     {
-        return RhoUncertaintyCertificate {
+        return RhoUncertaintyDiagnostic {
             k_hat: Some(0.0),
             n_evaluations,
-            verdict: RhoUncertaintyVerdict::CertifiedAdequate,
+            status: RhoUncertaintyStatus::NoEvidenceOfHeavyTails,
         };
     }
     let Some(psis) = pareto_smooth_weights(&weights) else {
-        return RhoUncertaintyCertificate::skipped(
+        return RhoUncertaintyDiagnostic::skipped(
             "PSIS tail fit failed for rho-importance weights",
             n_evaluations,
         );
     };
     let k_hat = psis.k_hat;
-    let verdict = if k_hat < 0.5 {
-        RhoUncertaintyVerdict::CertifiedAdequate
+    let status = if k_hat < 0.5 {
+        RhoUncertaintyStatus::NoEvidenceOfHeavyTails
     } else {
-        RhoUncertaintyVerdict::RhoUncertaintyMatters { k_hat }
+        RhoUncertaintyStatus::HeavyTailsDetected { k_hat }
     };
-    RhoUncertaintyCertificate {
+    RhoUncertaintyDiagnostic {
         k_hat: Some(k_hat),
         n_evaluations,
-        verdict,
+        status,
     }
 }
 
@@ -367,10 +322,10 @@ mod tests {
     }
 
     #[test]
-    fn near_gaussian_target_certifies_adequate() {
+    fn near_gaussian_target_has_no_heavy_tail_evidence_at_probe_points() {
         let rho_hat = array![0.2, -0.3];
         let hessian = array![[2.5, 0.2], [0.2, 1.8]];
-        let cert = rho_uncertainty_certificate(
+        let diagnostic = rho_uncertainty_diagnostic(
             &rho_hat,
             &hessian,
             RhoUncertaintyCostGate {
@@ -383,11 +338,15 @@ mod tests {
             gaussian_criterion(rho_hat.clone(), hessian.clone()),
         );
         assert!(
-            matches!(cert.verdict, RhoUncertaintyVerdict::CertifiedAdequate),
-            "near-Gaussian rho posterior should certify, got {cert:?}"
+            matches!(
+                diagnostic.status,
+                RhoUncertaintyStatus::NoEvidenceOfHeavyTails
+            ),
+            "near-Gaussian rho posterior should not show heavy-tail evidence at the probe \
+             points, got {diagnostic:?}"
         );
         assert!(
-            cert.k_hat.expect("k_hat") < 0.5,
+            diagnostic.k_hat.expect("k_hat") < 0.5,
             "near-Gaussian target should have k_hat below 0.5"
         );
     }
@@ -403,13 +362,13 @@ mod tests {
                 p_coefficients: Some(4),
             },
         };
-        let gaussian = rho_uncertainty_certificate(
+        let gaussian = rho_uncertainty_diagnostic(
             &rho_hat,
             &hessian,
             gate,
             gaussian_criterion(rho_hat.clone(), hessian.clone()),
         );
-        let weak = rho_uncertainty_certificate(&rho_hat, &hessian, gate, |rho| {
+        let weak = rho_uncertainty_diagnostic(&rho_hat, &hessian, gate, |rho| {
             Some((1.0 + rho[0] * rho[0]).ln())
         });
         assert!(
@@ -419,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn certificate_is_bit_deterministic() {
+    fn diagnostic_is_bit_deterministic() {
         let rho_hat = array![0.7];
         let hessian = array![[1.4]];
         let gate = RhoUncertaintyCostGate {
@@ -429,13 +388,13 @@ mod tests {
                 p_coefficients: Some(9),
             },
         };
-        let a = rho_uncertainty_certificate(
+        let a = rho_uncertainty_diagnostic(
             &rho_hat,
             &hessian,
             gate,
             gaussian_criterion(rho_hat.clone(), hessian.clone()),
         );
-        let b = rho_uncertainty_certificate(
+        let b = rho_uncertainty_diagnostic(
             &rho_hat,
             &hessian,
             gate,
@@ -454,15 +413,15 @@ mod tests {
             [0.0, 0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 0.0, 1.0],
         ];
-        let cert = rho_uncertainty_certificate(
+        let diagnostic = rho_uncertainty_diagnostic(
             &rho_hat,
             &hessian,
             RhoUncertaintyCostGate::default(),
             |_| Some(0.0),
         );
         assert!(matches!(
-            cert.verdict,
-            RhoUncertaintyVerdict::Skipped { .. }
+            diagnostic.status,
+            RhoUncertaintyStatus::Skipped { .. }
         ));
     }
 }
