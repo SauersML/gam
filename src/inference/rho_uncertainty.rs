@@ -119,10 +119,7 @@ where
         return RhoUncertaintyDiagnostic::skipped("criterion was not finite at rho_hat", 1);
     };
     let Some(proposal_factor) = proposal_factor_from_hessian(outer_hessian_rho) else {
-        return RhoUncertaintyDiagnostic::skipped(
-            "outer rho Hessian was not positive definite",
-            1,
-        );
+        return RhoUncertaintyDiagnostic::skipped("outer rho Hessian was not positive definite", 1);
     };
 
     let mut rng = DeterministicNormal::new(seed_from_problem(rho_hat, gate.problem_size));

@@ -19,9 +19,7 @@ pub fn credible_interval(
         ));
     }
     if n_draws == 0 {
-        return Err(
-            "posterior_credible_interval requires at least one posterior draw".to_string(),
-        );
+        return Err("posterior_credible_interval requires at least one posterior draw".to_string());
     }
     let alpha = (1.0 - level) / 2.0;
     let mut out = Vec::with_capacity(2 * n_coeffs);
