@@ -135,9 +135,13 @@ fn run_production_fit(z: &Array2<f64>, seed_logit: f64) -> (SaeManifoldTerm, Sae
     let seed_dispersion = term
         .seed_reconstruction_dispersion(z.view())
         .expect("seed reconstruction dispersion");
-    let init_rho = SaeManifoldRho::new(SPARSITY.ln(), SMOOTHNESS.ln(), vec![Array1::<f64>::zeros(0)])
-        .seed_scaled_by_dispersion(seed_dispersion)
-        .expect("dimensionless seed scaling");
+    let init_rho = SaeManifoldRho::new(
+        SPARSITY.ln(),
+        SMOOTHNESS.ln(),
+        vec![Array1::<f64>::zeros(0)],
+    )
+    .seed_scaled_by_dispersion(seed_dispersion)
+    .expect("dimensionless seed scaling");
     let init_flat = init_rho.to_flat();
     let n_params = init_flat.len();
     let mut objective = SaeManifoldOuterObjective::new(
