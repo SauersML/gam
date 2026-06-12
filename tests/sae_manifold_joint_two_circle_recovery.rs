@@ -681,6 +681,8 @@ fn dimensionless_entry_rho(term: &SaeManifoldTerm, z: &Array2<f64>) -> SaeManifo
         SMOOTHNESS.ln(),
         vec![Array1::<f64>::zeros(0); K],
     )
+    .seed_scaled_by_dispersion(seed_dispersion)
+    .expect("dimensionless seed scaling by the profiled reconstruction dispersion")
 }
 
 #[test]
