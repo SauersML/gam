@@ -35,6 +35,7 @@ class LinearDictionaryFit:
     converged: bool
     assignment: str
     top_k: int
+    code_ridge: float
     training_data: np.ndarray
 
     def reconstruct(self, assignments: Any | None = None) -> np.ndarray:
@@ -59,10 +60,9 @@ class LinearDictionaryFit:
         scores = x @ self.atoms.T
         gram = self.atoms @ self.atoms.T
         codes = np.zeros((x.shape[0], self.atoms.shape[0]), dtype=np.float64)
-        ridge = 1.0e-8
         for row in range(x.shape[0]):
             active = np.argpartition(np.abs(scores[row]), -k_active)[-k_active:]
-            system = gram[np.ix_(active, active)] + ridge * np.eye(k_active)
+            system = gram[np.ix_(active, active)] + self.code_ridge * np.eye(k_active)
             codes[row, active] = np.linalg.solve(system, scores[row, active])
         return np.ascontiguousarray(codes)
 
@@ -101,6 +101,7 @@ def linear_dictionary_fit(
         converged=bool(data["converged"]),
         assignment=str(data["assignment"]),
         top_k=int(data["top_k"]),
+        code_ridge=float(code_ridge),
         training_data=x,
     )
 
