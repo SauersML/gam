@@ -2357,7 +2357,9 @@ fn factor_gauge_deflated_evidence_row(
         // Strongly NEGATIVE curvature is genuine indefiniteness (e.g. the raw
         // assignment-prior logit curvature off-optimum), not a gauge — deflating
         // it would mask a real non-PD block and bias the evidence. Only
-        // |g^T H g| <= eps * scale * |g|^2 qualifies.
+        // |g^T H g| <= eps * scale * |g|^2 qualifies (the absolute value is what
+        // makes this two-sided: a large-magnitude curvature of EITHER sign is
+        // disqualified, so only a genuine near-null orbit is deflated).
         if curvature.abs() > GAUGE_RAYLEIGH_EPS * max_diag * norm_sq {
             continue;
         }
@@ -2382,11 +2384,30 @@ fn factor_gauge_deflated_evidence_row(
         return None;
     }
 
+    // Faddeev-Popov stiffening of the orbit, at UNIT stiffness kappa = 1.0
+    // (NOT max_diag). The direction is already unit-normalized, so each deflated
+    // direction contributes exactly +1 to that eigenvalue of `deflated`, hence
+    // log(1) = 0 to log|H|. This is the codebase's quotient PSEUDO-DETERMINANT
+    // convention (cf. `PenaltyPseudologdet`, which evaluates log|S| over the
+    // non-degenerate subspace and drops the kernel): the gauge orbit is a
+    // genuine null direction of the criterion, so it must contribute NOTHING to
+    // the Laplace normalizer. A theta/rho-dependent kappa (e.g. max_diag) would
+    // inject a spurious log(kappa(theta,rho)) into the evidence and bias the
+    // REML rho-gradient whenever a deflated direction survives to the optimum —
+    // holding the deflated COUNT fixed across the solve does NOT make the VALUE
+    // theta/rho-constant. kappa = 1.0 is exactly zero-derivative by
+    // construction. The quotient-complement solve is identical either way, so
+    // evidence-mode exactness on the non-degenerate subspace is preserved.
+    // `max_diag` stays ONLY in the qualification threshold above, where it is
+    // the curvature unit the orbit's near-zero Rayleigh quotient is measured
+    // against — never in the stiffness. (d <= 3 blocks; kappa = 1 against large
+    // other-direction curvature is a condition number the Cholesky handles
+    // trivially.)
     let mut deflated = row.htt.clone();
     for direction in &basis {
         for i in 0..d {
             for j in 0..d {
-                deflated[[i, j]] += max_diag * direction[i] * direction[j];
+                deflated[[i, j]] += direction[i] * direction[j];
             }
         }
     }
@@ -2558,11 +2579,13 @@ fn factor_one_row_result(
                             factor_gauge_deflated_evidence_row(row, d, row_gauges)
                         {
                             // Faddeev-Popov row-gauge deflation: only the
-                            // closed-form orbit direction gets stiffness
-                            // kappa = max_diag. The log|H| contribution for
-                            // each deflated direction is therefore log(kappa),
-                            // constant in theta and rho, so criterion
-                            // derivatives remain exact on the quotient.
+                            // closed-form orbit direction is stiffened, at UNIT
+                            // stiffness kappa = 1.0, so each deflated direction
+                            // contributes log(1) = 0 to log|H| — the quotient
+                            // pseudo-determinant convention (the gauge orbit is a
+                            // criterion null direction, contributing nothing to
+                            // the Laplace normalizer). Zero theta/rho dependence,
+                            // so criterion derivatives stay exact on the quotient.
                             return Ok(deflated);
                         }
                     }
@@ -4912,10 +4935,11 @@ pub struct ArrowFactorCache {
     /// Number of row-local gauge directions stiffened in an undamped evidence
     /// factorization.
     ///
-    /// Each direction contributes `log(kappa)` to the row-block logdet through
-    /// the returned Cholesky factor. Because `kappa` is the row diagonal scale
-    /// selected at the factorization site and the direction is a gauge orbit,
-    /// this is a theta/rho-constant Faddeev-Popov normalizer on the quotient.
+    /// Each direction is stiffened at UNIT stiffness `kappa = 1.0`, so it
+    /// contributes `log(1) = 0` to the row-block logdet through the returned
+    /// Cholesky factor: the gauge orbit is a criterion null direction and adds
+    /// nothing to the Laplace normalizer (the quotient pseudo-determinant
+    /// convention, cf. `PenaltyPseudologdet`). Zero theta/rho dependence.
     pub gauge_deflated_directions: usize,
 }
 
