@@ -132,8 +132,7 @@ impl PsiGramTensor {
             return None;
         }
         for &m in PSI_GRAM_NODE_LADDER.iter() {
-            let Some(candidate) =
-                Self::build_at(&mut eval_design, weights, z, psi_lo, psi_hi, m)
+            let Some(candidate) = Self::build_at(&mut eval_design, weights, z, psi_lo, psi_hi, m)
             else {
                 // An exact evaluation failed or was non-finite somewhere in
                 // the window — no larger rung can fix that.
@@ -223,7 +222,7 @@ impl PsiGramTensor {
         for ((slot, &w), &zv) in wz.iter_mut().zip(weights.iter()).zip(z.iter()) {
             *slot = w * zv;
         }
-        let mut gram = Vec::with_capacity(m * m);
+        let mut gram: Vec<Array2<f64>> = Vec::with_capacity(m * m);
         let mut rhs = Vec::with_capacity(m);
         for d in 0..m {
             for e in 0..m {

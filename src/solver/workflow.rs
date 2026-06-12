@@ -6674,6 +6674,7 @@ fn materialize_standard<'a>(
         sas_link: None,
         optimize_sas: false,
         compute_inference: true,
+        skip_rho_posterior_inference: false,
         max_iter: config.outer_max_iter.unwrap_or(200),
         // Outer REML/LAML smoothing-selection tolerance. The outer convergence
         // test (`outer_gradient_tolerance`) uses a `rel_cost` criterion whose
