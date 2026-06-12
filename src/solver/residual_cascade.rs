@@ -548,7 +548,8 @@ impl Core {
         let steps = SLQ_LANCZOS_STEPS.min(m);
         let mut basis: Vec<Vec<f64>> = Vec::with_capacity(steps);
         for probe in 0..SLQ_PROBES {
-            let mut rng = SplitMix64::new(RNG_SEED ^ (probe as u64).wrapping_mul(0xD134_2543_DE82_EF95));
+            let mut rng =
+                SplitMix64::new(RNG_SEED ^ (probe as u64).wrapping_mul(0xD134_2543_DE82_EF95));
             let mut q = vec![0.0; m];
             for qj in q.iter_mut() {
                 *qj = rng.next_sign();

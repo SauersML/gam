@@ -304,8 +304,7 @@ impl GridSpline2dDesign {
                  (k+3)² coefficients — see module sizing contract), got {k}"
             ));
         }
-        if !(metric[0].is_finite() && metric[0] > 0.0 && metric[1].is_finite() && metric[1] > 0.0)
-        {
+        if !(metric[0].is_finite() && metric[0] > 0.0 && metric[1].is_finite() && metric[1] > 0.0) {
             return Err(format!(
                 "grid spline 2d: metric diagonal must be finite and positive, got [{}, {}]",
                 metric[0], metric[1]
@@ -551,7 +550,9 @@ impl GridSpline2dDesign {
 
     fn solve_at(&self, log_lambda: f64) -> Result<Solved, String> {
         if !log_lambda.is_finite() {
-            return Err(format!("grid spline 2d: non-finite log lambda {log_lambda}"));
+            return Err(format!(
+                "grid spline 2d: non-finite log lambda {log_lambda}"
+            ));
         }
         let mut a = self.dense_system(log_lambda.exp());
         let logdet = cholesky_logdet(&mut a, self.p)?;
@@ -598,11 +599,7 @@ impl GridSpline2dDesign {
 
     /// Fit at a FIXED `log λ`, with σ² either supplied (applied to every
     /// response dimension) or profiled per dimension.
-    pub fn fit_at(
-        &self,
-        log_lambda: f64,
-        sigma2: Option<f64>,
-    ) -> Result<GridSpline2dFit, String> {
+    pub fn fit_at(&self, log_lambda: f64, sigma2: Option<f64>) -> Result<GridSpline2dFit, String> {
         let solved = self.solve_at(log_lambda)?;
         let dof = (self.n_obs - PENALTY_NULLITY) as f64;
         let mut sigma2_dims = Vec::with_capacity(solved.rss_pen.len());
@@ -760,8 +757,8 @@ impl GridSpline2dDesign {
                     ce_rhsd += fit.coeffs[e][g] * self.rhs[d][g];
                 }
                 let quad = self.gram_quadratic(&fit.coeffs[d], &fit.coeffs[e]);
-                let v = (self.cross_moments[d * n_dims + e] - cd_rhse - ce_rhsd + quad)
-                    / residual_df;
+                let v =
+                    (self.cross_moments[d * n_dims + e] - cd_rhse - ce_rhsd + quad) / residual_df;
                 residual_cross_cov[d * n_dims + e] = v;
                 residual_cross_cov[e * n_dims + d] = v;
             }

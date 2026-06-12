@@ -333,9 +333,7 @@ impl BlockEffectiveJacobian for LogslopeJacobianImpl {
 
         let n = self.phi.nrows();
         let rows = rows.start.min(n)..rows.end.min(n);
-        let full = analytical_logslope_jacobian(
-            &self.phi, state.beta, q0, q1, qd1, z, self.s_f,
-        );
+        let full = analytical_logslope_jacobian(&self.phi, state.beta, q0, q1, qd1, z, self.s_f);
         // `full` is channel-major: rows [0..n) = η0, [n..2n) = η1, [2n..3n) = ad1.
         // Re-stack the requested row range per channel into the same channel-major
         // layout, matching the trait's `effective_jacobian_rows` contract.

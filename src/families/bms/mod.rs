@@ -1107,9 +1107,10 @@ fn weighted_ridge_sandwich_cov(
     // accumulated in the AᵀWA assembly.
     let mut m_sym = normal_matrix.clone();
     crate::linalg::matrix::symmetrize_in_place(&mut m_sym);
-    let (_rank, m_pinv) = crate::linalg::utils::block_penalty_rank_and_pinv(&m_sym).map_err(
-        |e| format!("conditional latent calibration sandwich pseudo-inverse failed: {e}"),
-    )?;
+    let (_rank, m_pinv) =
+        crate::linalg::utils::block_penalty_rank_and_pinv(&m_sym).map_err(|e| {
+            format!("conditional latent calibration sandwich pseudo-inverse failed: {e}")
+        })?;
     let cov = m_pinv.dot(&meat).dot(&m_pinv);
     if cov.iter().any(|v| !v.is_finite()) {
         return Err("conditional latent calibration sandwich covariance is non-finite".to_string());

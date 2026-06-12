@@ -6996,13 +6996,8 @@ fn weighted_ridge_sandwich_cov_is_finite_on_rank_deficient_normal_matrix() {
     normal_matrix[[0, 0]] *= 1.0 + AUTO_Z_CONDITIONAL_RIDGE_REL;
     normal_matrix[[1, 1]] *= 1.0 + AUTO_Z_CONDITIONAL_RIDGE_REL;
 
-    let cov = weighted_ridge_sandwich_cov(
-        basis.view(),
-        &residuals,
-        weights.view(),
-        &normal_matrix,
-    )
-    .expect("rank-deficient normal matrix must yield a finite sandwich via pseudo-inverse");
+    let cov = weighted_ridge_sandwich_cov(basis.view(), &residuals, weights.view(), &normal_matrix)
+        .expect("rank-deficient normal matrix must yield a finite sandwich via pseudo-inverse");
 
     assert_eq!(cov.dim(), (2, 2));
     assert!(

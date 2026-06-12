@@ -50,8 +50,7 @@ use crate::solver::arrow_schur::{
 use crate::terms::analytic_penalties::{
     AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DecoderIncoherencePenalty,
     IbpHessianDiagThirdChannels, IsometryPenalty, MechanismSparsityPenalty, NuclearNormPenalty,
-    PenaltyTier, PsiSlice, WeightField,
-    resolve_learnable_weight,
+    PenaltyTier, PsiSlice, WeightField, resolve_learnable_weight,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 use crate::terms::sae_criterion_atoms::SaeCriterion;
@@ -65,7 +64,7 @@ use crate::linalg::faer_ndarray::{
 };
 use crate::linalg::triangular::cholesky_solve_vector;
 use crate::solver::arrow_schur::{
-    ArrowFactorCache, arrow_factor_max_pivot, arrow_factor_min_pivot,
+    ArrowFactorCache, ArrowRowGaugeDeflation, arrow_factor_max_pivot, arrow_factor_min_pivot,
     solve_arrow_newton_step_with_options,
 };
 use crate::solver::estimate::EstimationError;
@@ -725,9 +724,9 @@ fn bessel_i1(x: f64) -> f64 {
     if x < 0.0 { -value } else { value }
 }
 
+pub use crate::terms::sae::assignment::*;
 pub use crate::terms::sae::basis::*;
 pub use crate::terms::sae::frames::*;
-pub use crate::terms::sae::assignment::*;
 /// One manifold atom.
 ///
 /// `basis_values` is `Phi_k(t_{ik})`, shape `(N, M_k)`.
@@ -1710,6 +1709,7 @@ pub struct SaeManifoldLoss {
     pub assignment_sparsity: f64,
     pub smoothness: f64,
     pub ard: f64,
+    pub evidence_gauge_deflated_directions: usize,
 }
 
 impl SaeManifoldLoss {
@@ -2826,6 +2826,11 @@ pub struct SaeManifoldTerm {
     /// / collapse outcome is observable — never a silent fallback. Cleared by
     /// the objective's `reset` so each seed's walk reports only its own run.
     curvature_walk_report: Option<CurvatureWalkReport>,
+    /// Deflated row-gauge direction count established by the first undamped
+    /// evidence factorization in the current optimization. A later change means
+    /// the quotient dimension changed mid-solve, which is a structural event and
+    /// must not be hidden inside the Laplace normalizer.
+    expected_evidence_gauge_deflated_directions: Option<usize>,
 }
 
 impl Clone for SaeManifoldTerm {
@@ -2842,6 +2847,8 @@ impl Clone for SaeManifoldTerm {
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             certificate_dispersion: self.certificate_dispersion,
             curvature_walk_report: self.curvature_walk_report.clone(),
+            expected_evidence_gauge_deflated_directions: self
+                .expected_evidence_gauge_deflated_directions,
         }
     }
 }
@@ -2924,6 +2931,7 @@ impl SaeManifoldTerm {
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             certificate_dispersion: None,
             curvature_walk_report: None,
+            expected_evidence_gauge_deflated_directions: None,
         })
     }
 
@@ -3499,8 +3507,7 @@ impl SaeManifoldTerm {
                 // finite isometry group with PinnedByCanonicalization
                 // provenance.
                 chart_canonicalized: atom.chart_canonicalized
-                    && (d == 1
-                        || (d == 2 && matches!(atom.basis_kind, SaeAtomBasisKind::Torus))),
+                    && (d == 1 || (d == 2 && matches!(atom.basis_kind, SaeAtomBasisKind::Torus))),
             });
             atom_offsets.push(cursor);
             atom_axis_dim.push(d);
@@ -4507,6 +4514,7 @@ impl SaeManifoldTerm {
             assignment_sparsity,
             smoothness,
             ard,
+            evidence_gauge_deflated_directions: 0,
         })
     }
 
@@ -5968,6 +5976,9 @@ impl SaeManifoldTerm {
             sys.set_penalty_op(Arc::new(CompositePenaltyOp { k: beta_dim, ops }));
             self.reclaim_border_hbb_workspace(&mut sys);
         }
+        if let Some(deflation) = self.row_gauge_deflation_for_layout(row_layout.as_ref()) {
+            sys.set_row_gauge_deflation(deflation);
+        }
         // Store the active-set layout for `apply_newton_step`.
         self.last_row_layout = row_layout;
         // Record whether `delta_beta` from this system is a factored ΔC (needs a
@@ -6429,6 +6440,8 @@ impl SaeManifoldTerm {
             &options,
             refine_progress_extension,
         )?;
+        self.record_evidence_gauge_deflation_count(cache.gauge_deflated_directions)?;
+        loss.evidence_gauge_deflated_directions = cache.gauge_deflated_directions;
         let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
             "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
              ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
@@ -6466,6 +6479,21 @@ impl SaeManifoldTerm {
 
         let v = loss.total() + extra_penalty_energy + 0.5 * log_det - occam;
         Ok((v, loss, cache))
+    }
+
+    fn record_evidence_gauge_deflation_count(&mut self, count: usize) -> Result<(), String> {
+        match self.expected_evidence_gauge_deflated_directions {
+            Some(expected) if expected != count => Err(format!(
+                "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count changed \
+                 within one optimization (expected {expected}, got {count}); this is a structural \
+                 quotient-dimension event, refusing to compare Laplace normalizers"
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.expected_evidence_gauge_deflated_directions = Some(count);
+                Ok(())
+            }
+        }
     }
 
     fn is_undamped_evidence_row_non_pd(err: &ArrowSchurError) -> bool {
@@ -6730,9 +6758,8 @@ impl SaeManifoldTerm {
     }
 
     fn refine_round_made_progress(previous_grad_norm: Option<f64>, grad_norm: f64) -> bool {
-        previous_grad_norm.is_some_and(|prev| {
-            prev.is_finite() && grad_norm.is_finite() && grad_norm < prev
-        })
+        previous_grad_norm
+            .is_some_and(|prev| prev.is_finite() && grad_norm.is_finite() && grad_norm < prev)
     }
 
     fn outer_gradient_arrow_solver<'a>(
@@ -10417,6 +10444,85 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
+    fn row_gauge_deflation_for_layout(
+        &self,
+        row_layout: Option<&SaeRowLayout>,
+    ) -> Option<ArrowRowGaugeDeflation> {
+        let n = self.n_obs();
+        let mut rows: Vec<Vec<Array1<f64>>> = Vec::with_capacity(n);
+        for row in 0..n {
+            let q_row = match row_layout {
+                Some(layout) => layout.row_q_active(row),
+                None => self.assignment.row_block_dim(),
+            };
+            rows.push(Vec::with_capacity(self.k_atoms().min(4)));
+            match row_layout {
+                Some(layout) => {
+                    for (active_pos, &atom_idx) in layout.active_atoms[row].iter().enumerate() {
+                        let start = layout.coord_starts[row][active_pos];
+                        self.push_atom_row_gauge_deflations(
+                            &mut rows[row],
+                            row,
+                            atom_idx,
+                            start,
+                            q_row,
+                        );
+                    }
+                }
+                None => {
+                    let coord_offsets = self.assignment.coord_offsets();
+                    for atom_idx in 0..self.k_atoms() {
+                        self.push_atom_row_gauge_deflations(
+                            &mut rows[row],
+                            row,
+                            atom_idx,
+                            coord_offsets[atom_idx],
+                            q_row,
+                        );
+                    }
+                }
+            }
+        }
+        if rows.iter().all(Vec::is_empty) {
+            None
+        } else {
+            Some(ArrowRowGaugeDeflation::new(rows))
+        }
+    }
+
+    fn push_atom_row_gauge_deflations(
+        &self,
+        row_dirs: &mut Vec<Array1<f64>>,
+        row: usize,
+        atom_idx: usize,
+        coord_start: usize,
+        q_row: usize,
+    ) {
+        let d = self.assignment.coords[atom_idx].latent_dim();
+        match self.atoms[atom_idx].basis_kind {
+            SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Duchon => {
+                for axis in 0..d {
+                    let mut translation = Array1::<f64>::zeros(q_row);
+                    translation[coord_start + axis] = 1.0;
+                    row_dirs.push(translation);
+
+                    let coord_value = self.assignment.coords[atom_idx].as_matrix()[[row, axis]];
+                    let mut scale = Array1::<f64>::zeros(q_row);
+                    scale[coord_start + axis] = coord_value;
+                    row_dirs.push(scale);
+                }
+            }
+            SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => {
+                for axis in 0..d {
+                    let mut phase = Array1::<f64>::zeros(q_row);
+                    phase[coord_start + axis] = 1.0;
+                    row_dirs.push(phase);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn dense_step_gauge_vector_from_field(
         &self,
         atom_idx: usize,
@@ -12037,6 +12143,7 @@ impl SaeManifoldTerm {
             assignment_sparsity: 0.0,
             smoothness: 0.0,
             ard: 0.0,
+            evidence_gauge_deflated_directions: 0,
         };
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
@@ -12342,6 +12449,7 @@ impl SaeManifoldTerm {
             assignment_sparsity,
             smoothness,
             ard,
+            evidence_gauge_deflated_directions: 0,
         })
     }
 
@@ -12389,6 +12497,7 @@ impl SaeManifoldTerm {
                 assignment_sparsity,
                 smoothness,
                 ard,
+                evidence_gauge_deflated_directions: 0,
             },
             total,
         ))
@@ -12472,7 +12581,7 @@ pub struct SaeManifoldOuterObjective {
 
 impl SaeManifoldOuterObjective {
     pub fn new(
-        term: SaeManifoldTerm,
+        mut term: SaeManifoldTerm,
         target: Array2<f64>,
         registry: Option<AnalyticPenaltyRegistry>,
         init_rho: SaeManifoldRho,
@@ -12481,6 +12590,7 @@ impl SaeManifoldOuterObjective {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Self {
+        term.expected_evidence_gauge_deflated_directions = None;
         let baseline_term = term.clone();
         let baseline_rho = init_rho.clone();
         Self {
@@ -12524,6 +12634,7 @@ impl SaeManifoldOuterObjective {
             assignment_sparsity: 0.0,
             smoothness: 0.0,
             ard: 0.0,
+            evidence_gauge_deflated_directions: 0,
         });
         // Basin guard against the multi-atom routing-collapse failure mode
         // (#629 #630). The outer ρ cascade mutates `term` cumulatively across
@@ -14301,7 +14412,6 @@ pub fn refresh_isometry_caches_from_term(
     }
     Ok(refreshed_with_second)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -19291,6 +19401,7 @@ mod tests {
             manifold_mode_fingerprint: 0,
             row_hessian_fingerprint: 0,
             pcg_diagnostics: PcgDiagnostics::default(),
+            gauge_deflated_directions: 0,
         }
     }
 
@@ -19315,6 +19426,7 @@ mod tests {
             manifold_mode_fingerprint: 0,
             row_hessian_fingerprint: 0,
             pcg_diagnostics: PcgDiagnostics::default(),
+            gauge_deflated_directions: 0,
         }
     }
 

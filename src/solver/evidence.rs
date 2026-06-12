@@ -2907,6 +2907,7 @@ mod tests {
             manifold_mode_fingerprint: 0,
             row_hessian_fingerprint: 0,
             pcg_diagnostics: crate::solver::arrow_schur::PcgDiagnostics::default(),
+            gauge_deflated_directions: 0,
         }
     }
 

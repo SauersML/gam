@@ -249,7 +249,10 @@ fn streaming_band_assembly_matches_dense_oracle() {
     let mut checks: Vec<[f64; 2]> = (0..12)
         .map(|i| {
             let t = i as f64 / 11.0;
-            [lo[0] + (hi[0] - lo[0]) * t, lo[1] + (hi[1] - lo[1]) * (1.0 - t)]
+            [
+                lo[0] + (hi[0] - lo[0]) * t,
+                lo[1] + (hi[1] - lo[1]) * (1.0 - t),
+            ]
         })
         .collect();
     checks.push([lo[0] - 0.05, hi[1] + 0.03]);
@@ -409,7 +412,9 @@ fn assembled_penalty_matches_closed_form_quadratic_energy() {
     // exactly. A dropped mixed term misses this by exactly 2·a1·a2·Area.
     let area = (hi[0] - lo[0]) * (hi[1] - lo[1]);
     let j_closed = (4.0 * a[0] * a[0] + 2.0 * a[0] * a[1] + 4.0 * a[1] * a[1]) * area;
-    let j_assembled = design.penalty_value(&coeff).expect("penalty quadratic form");
+    let j_assembled = design
+        .penalty_value(&coeff)
+        .expect("penalty quadratic form");
     assert!(
         (j_assembled - j_closed).abs() <= 1e-8 * j_closed,
         "assembled biharmonic energy {j_assembled} != closed form {j_closed} \

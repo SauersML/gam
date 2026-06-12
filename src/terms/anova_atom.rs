@@ -90,10 +90,10 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
 use crate::faer_ndarray::FaerEigh;
-use crate::solver::grid_spline_2d::GridSpline2dDesign;
 use crate::inference::smooth_test::{
     SmoothTestInput, SmoothTestResult, SmoothTestScale, wood_smooth_test,
 };
+use crate::solver::grid_spline_2d::GridSpline2dDesign;
 
 /// Interaction energy fraction at or below which the interaction block is
 /// energetically negligible and lossless fission is on the table. A
@@ -706,14 +706,13 @@ pub fn fit_pair_surface(
             })
         }
         Err(grid_err) => {
-            let surface = fit_tensor_surface(phi_a.view(), phi_b.view(), responses).map_err(
-                |dense_err| {
+            let surface =
+                fit_tensor_surface(phi_a.view(), phi_b.view(), responses).map_err(|dense_err| {
                     format!(
                         "fit_pair_surface: grid engine degenerated ({grid_err}) and the dense \
                          ridge fallback failed too ({dense_err})"
                     )
-                },
-            )?;
+                })?;
             Ok(PairSurfaceFit {
                 phi_a,
                 phi_b,
