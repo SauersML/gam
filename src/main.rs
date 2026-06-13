@@ -1807,6 +1807,34 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         set_training_feature_metadata_from_dataset(&mut payload, &ds);
         payload.resolved_termspec = Some(saved_termspec);
         payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
+        // Populate the exact Gaussian jackknife+ substrate (#1098) when the fit
+        // is a standard Gaussian-identity model with unit prior weights and the
+        // converged penalized Hessian M = X'X + S(λ) is available from the
+        // FitGeometry.  The exchangeability proof requires unit weights — a
+        // non-unit weight makes the test row non-exchangeable with training rows.
+        // When all conditions hold the substrate is factored once here; predict
+        // calls GaussianJackknifePlusStats::interval per test point in O(p)
+        // from the precomputed LOO quantities.
+        if family.is_gaussian_identity() {
+            if let Some(geo) = fit.geometry.as_ref() {
+                let m = &geo.penalized_hessian.0;
+                let x_dense = design.design.to_dense();
+                match gam::inference::full_conformal::GaussianJackknifePlusStats::from_design_unit_weight_normal_matrix(
+                    &x_dense,
+                    &y,
+                    &weights,
+                    m,
+                ) {
+                    Ok(stats) => {
+                        payload.gaussian_jackknife_plus = Some(stats);
+                    }
+                    Err(_) => {
+                        // Non-unit weights or other precondition failure: silently skip.
+                        // predict falls back to the posterior band as documented.
+                    }
+                }
+            }
+        }
         set_saved_offset_columns(
             &mut payload,
             fit_config.offset_column.clone(),
