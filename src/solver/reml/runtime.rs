@@ -10985,45 +10985,44 @@ impl<'a> RemlState<'a> {
         let pirls_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = std::time::Instant::now();
-        let (ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv) =
-            if !hyper_dirs.is_empty() {
-                if mode == super::unified::EvalMode::ValueGradientHessian {
-                    let (coords, epf, repf, fixed_drift_deriv) =
-                        self.build_tau_unified_objects_from_bundle(rho, &bundle, hyper_dirs)?;
-                    (coords, Some(epf), Some(repf), fixed_drift_deriv)
-                } else if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-                    (
-                        self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs, false)?,
-                        None,
-                        None,
-                        None,
-                    )
-                } else if matches!(
-                    bundle.pirls_result.coordinate_frame,
-                    pirls::PirlsCoordinateFrame::TransformedQs
-                ) && self
-                    .active_constraint_free_basis(bundle.pirls_result.as_ref())
-                    .is_none()
-                {
-                    (
-                        self.build_tau_hyper_coords_original_basis(
-                            rho, &bundle, hyper_dirs, false,
-                        )?,
-                        None,
-                        None,
-                        None,
-                    )
-                } else {
-                    (
-                        self.build_tau_hyper_coords(rho, &bundle, hyper_dirs, false)?,
-                        None,
-                        None,
-                        None,
-                    )
-                }
+        let (ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv) = if !hyper_dirs
+            .is_empty()
+        {
+            if mode == super::unified::EvalMode::ValueGradientHessian {
+                let (coords, epf, repf, fixed_drift_deriv) =
+                    self.build_tau_unified_objects_from_bundle(rho, &bundle, hyper_dirs)?;
+                (coords, Some(epf), Some(repf), fixed_drift_deriv)
+            } else if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+                (
+                    self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs, false)?,
+                    None,
+                    None,
+                    None,
+                )
+            } else if matches!(
+                bundle.pirls_result.coordinate_frame,
+                pirls::PirlsCoordinateFrame::TransformedQs
+            ) && self
+                .active_constraint_free_basis(bundle.pirls_result.as_ref())
+                .is_none()
+            {
+                (
+                    self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs, false)?,
+                    None,
+                    None,
+                    None,
+                )
             } else {
-                (Vec::new(), None, None, None)
-            };
+                (
+                    self.build_tau_hyper_coords(rho, &bundle, hyper_dirs, false)?,
+                    None,
+                    None,
+                    None,
+                )
+            }
+        } else {
+            (Vec::new(), None, None, None)
+        };
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = std::time::Instant::now();
         let mut assembly = self.build_auto_assembly(rho, &bundle, mode)?;

@@ -1454,45 +1454,42 @@ impl<'a> RemlState<'a> {
         // Note: implicit-operator storage of the slab is irrelevant here — the
         // tensor branch replaces the design-derivative entirely with k-space
         // objects, so it covers both dense and implicit ∂X/∂ψ representations.
-        let tensor_psi_deriv: Option<(Array2<f64>, Array1<f64>)> = if !for_hessian
-            && is_gaussian_identity
-            && psi_dim == 1
-            && firth_op.is_none()
-        {
-            self.gaussian_psi_gram_deriv().and_then(|deriv| {
-                let (dgram_c, drhs_c) = deriv.as_ref();
-                // Conditioned frame width must match the transformed-design's
-                // pre-projection width (qs is p_full × p_full). beta_eval lives
-                // in the free frame (after Qs and optional free basis Z).
-                let p_full = reparam_result.qs.nrows();
-                if dgram_c.nrows() != p_full
-                    || dgram_c.ncols() != p_full
-                    || drhs_c.len() != p_full
-                {
-                    return None;
-                }
-                // Forward transform W = qs · Z (free_basis optional): a fixed,
-                // ψ-invariant column map within this eval, so
-                //   ∂G_t/∂ψ = Wᵀ (∂G_c/∂ψ) W,  ∂b_t/∂ψ = Wᵀ (∂b_c/∂ψ)
-                // is EXACT (matches the slab path's
-                //   X_{τ,t} = X_{τ,c} · W  ⇒  X_{τ,t}ᵀWX_t + X_tᵀWX_{τ,t}
-                //                          = Wᵀ(X_{τ,c}ᵀWX_c + X_cᵀWX_{τ,c})W).
-                let g_qs = reparam_result.qs.t().dot(dgram_c).dot(&reparam_result.qs);
-                let b_qs = reparam_result.qs.t().dot(drhs_c);
-                let (dgram_t, drhs_t) = if let Some(z) = free_basis_opt.as_ref() {
-                    (z.t().dot(&g_qs).dot(z), z.t().dot(&b_qs))
-                } else {
-                    (g_qs, b_qs)
-                };
-                if dgram_t.nrows() == p_dim && drhs_t.len() == p_dim {
-                    Some((dgram_t, drhs_t))
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
+        let tensor_psi_deriv: Option<(Array2<f64>, Array1<f64>)> =
+            if !for_hessian && is_gaussian_identity && psi_dim == 1 && firth_op.is_none() {
+                self.gaussian_psi_gram_deriv().and_then(|deriv| {
+                    let (dgram_c, drhs_c) = deriv.as_ref();
+                    // Conditioned frame width must match the transformed-design's
+                    // pre-projection width (qs is p_full × p_full). beta_eval lives
+                    // in the free frame (after Qs and optional free basis Z).
+                    let p_full = reparam_result.qs.nrows();
+                    if dgram_c.nrows() != p_full
+                        || dgram_c.ncols() != p_full
+                        || drhs_c.len() != p_full
+                    {
+                        return None;
+                    }
+                    // Forward transform W = qs · Z (free_basis optional): a fixed,
+                    // ψ-invariant column map within this eval, so
+                    //   ∂G_t/∂ψ = Wᵀ (∂G_c/∂ψ) W,  ∂b_t/∂ψ = Wᵀ (∂b_c/∂ψ)
+                    // is EXACT (matches the slab path's
+                    //   X_{τ,t} = X_{τ,c} · W  ⇒  X_{τ,t}ᵀWX_t + X_tᵀWX_{τ,t}
+                    //                          = Wᵀ(X_{τ,c}ᵀWX_c + X_cᵀWX_{τ,c})W).
+                    let g_qs = reparam_result.qs.t().dot(dgram_c).dot(&reparam_result.qs);
+                    let b_qs = reparam_result.qs.t().dot(drhs_c);
+                    let (dgram_t, drhs_t) = if let Some(z) = free_basis_opt.as_ref() {
+                        (z.t().dot(&g_qs).dot(z), z.t().dot(&b_qs))
+                    } else {
+                        (g_qs, b_qs)
+                    };
+                    if dgram_t.nrows() == p_dim && drhs_t.len() == p_dim {
+                        Some((dgram_t, drhs_t))
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
 
         let mut coords = Vec::with_capacity(psi_dim);
 
@@ -1546,8 +1543,8 @@ impl<'a> RemlState<'a> {
                 let s_tau_beta = s_tau_j.dot(&beta_eval);
                 let g_j = drhs_t - &dgram_beta - &s_tau_beta;
                 let quad_g = beta_eval.dot(&dgram_beta);
-                let a_j = -(drhs_t.dot(&beta_eval) - 0.5 * quad_g)
-                    + 0.5 * beta_eval.dot(&s_tau_beta);
+                let a_j =
+                    -(drhs_t.dot(&beta_eval) - 0.5 * quad_g) + 0.5 * beta_eval.dot(&s_tau_beta);
                 let mut b_j = dgram_t.clone();
                 b_j += &s_tau_j;
                 let ld_s_j = penalty_logdet.tau_gradient_component(&s_tau_j);

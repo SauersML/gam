@@ -20681,7 +20681,9 @@ where
     // Fast path: kappa disabled or no spatial terms — build designs once.
     // -----------------------------------------------------------------------
     if joint_setup.auxiliary_dim() == 0 && (!kappa_options.enabled || log_kappa_dim == 0) {
-        log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] taking FAST path (no outer theta optimization in this driver)");
+        log::warn!(
+            "[OUTER-FD-AUDIT/spatial-exact-joint] taking FAST path (no outer theta optimization in this driver)"
+        );
         let (designs, resolved_specs) = build_term_collection_designs_and_freeze_joint(
             data, block_specs,
         )
@@ -21002,11 +21004,17 @@ where
                 } else if i < rho_dim_audit + (psi_dim_audit - aux_dim_audit) {
                     format!("psi_kappa[{}]", i - rho_dim_audit)
                 } else {
-                    format!("aux[{}]", i - rho_dim_audit - (psi_dim_audit - aux_dim_audit))
+                    format!(
+                        "aux[{}]",
+                        i - rho_dim_audit - (psi_dim_audit - aux_dim_audit)
+                    )
                 }
             };
             crate::solver::outer_strategy::outer_gradient_fd_audit(
-                &theta0, 1e-4, label, &mut eval_at,
+                &theta0,
+                1e-4,
+                label,
+                &mut eval_at,
             )
         })();
         match audit {
@@ -25893,7 +25901,11 @@ mod tests {
         let spatial_terms = spatial_length_scale_term_indices(&frozen);
         assert_eq!(spatial_terms.len(), 1, "expect a single spatial term");
         let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
-        assert_eq!(dims_per_term, vec![1], "expect one log-scale axis (coord_dim == 1)");
+        assert_eq!(
+            dims_per_term,
+            vec![1],
+            "expect one log-scale axis (coord_dim == 1)"
+        );
         let rho_dim = frozen_design.penalties.len();
         assert!(rho_dim >= 1, "expect at least one penalty block");
 
@@ -26075,6 +26087,26 @@ mod tests {
                 );
 
                 assert_eq!(grad_s.len(), grad_t.len(), "gradient dimension mismatch");
+
+                // Arbiter for the ψ component: a central finite difference of
+                // the cost along ψ tells us WHICH lane carries the exact
+                // gradient (the cross-lane equality alone cannot). We FD the
+                // streamed cost (the reference whose analytic ψ-gradient is
+                // FD-verified by the `iso_kappa_duchon_*_fd` pins). If the
+                // streamed analytic ψ-gradient tracks this FD but the tensor
+                // one does not, the tensor's ∂(XᵀWX)/∂ψ install is the culprit.
+                let psi_j = rho_dim;
+                let fd_h = 1e-6;
+                let mut theta_p = theta.clone();
+                theta_p[psi_j] = psi + fd_h;
+                let mut theta_m = theta.clone();
+                theta_m[psi_j] = psi - fd_h;
+                let (cost_sp, _) = eval_one(&mut streamed_eval, &mut stream_cache, &theta_p);
+                let (cost_sm, _) = eval_one(&mut streamed_eval, &mut stream_cache, &theta_m);
+                let fd_psi = (cost_sp - cost_sm) / (2.0 * fd_h);
+                let stream_psi_fd_err = (grad_s[psi_j] - fd_psi).abs();
+                let tensor_psi_fd_err = (grad_t[psi_j] - fd_psi).abs();
+
                 for j in 0..grad_s.len() {
                     let gabs = (grad_s[j] - grad_t[j]).abs();
                     let gtol = 1e-7 * (1.0 + grad_s[j].abs());
@@ -26082,7 +26114,10 @@ mod tests {
                     assert!(
                         gabs <= gtol,
                         "REML gradient[{j}] diverges between lanes at ψ={psi:.4}, \
-                         ρ={:+.2}: streamed={:+.12e}, tensor={:+.12e}, |Δ|={gabs:.3e}",
+                         ρ={:+.2}: streamed={:+.12e}, tensor={:+.12e}, |Δ|={gabs:.3e}\n  \
+                         ψ-component FD arbiter (central, h={fd_h:.0e}): fd={fd_psi:+.9e}, \
+                         streamed_err={stream_psi_fd_err:.3e}, tensor_err={tensor_psi_fd_err:.3e} \
+                         (whichever lane's err is larger carries the wrong ψ-gradient)",
                         rho[0],
                         grad_s[j],
                         grad_t[j],

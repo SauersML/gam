@@ -3252,11 +3252,16 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 // second per-trial n-pass. Same conditioned column frame as the
                 // installed Gram; the hyper-coord builder applies the per-eval
                 // Qs/free-basis transform. Failure here just keeps the slab
-                // gradient path (still correct, only slower).
-                if self.reml_state.install_gaussian_psi_gram_deriv(Arc::new((
-                    tensor.dgram_dpsi(psi),
-                    tensor.drhs_dpsi(psi),
-                ))) {
+                // gradient path (still correct, only slower). Only install on
+                // the certified gradient SUB-window: near the ψ-window edges the
+                // Chebyshev derivative reconstruction (T_d′ ∼ d²) is not
+                // bit-tight, so those trials keep the exact slab gradient.
+                if tensor.contains_for_gradient(psi)
+                    && self.reml_state.install_gaussian_psi_gram_deriv(Arc::new((
+                        tensor.dgram_dpsi(psi),
+                        tensor.drhs_dpsi(psi),
+                    )))
+                {
                     log::debug!(
                         "[psi-gram-tensor] installed n-free ψ-gradient derivatives at psi={psi:.6}"
                     );
