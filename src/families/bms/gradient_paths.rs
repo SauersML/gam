@@ -1374,6 +1374,161 @@ pub(super) fn rigid_standard_normal_row_kernel(
     Ok((tower.v, tower.g, tower.h))
 }
 
+/// Mixed `(primary, z)` second derivative of the rigid standard-normal row
+/// negative log-likelihood: the per-row 2-vector
+/// `[∂²ℓ/∂q∂z, ∂²ℓ/∂g∂z]` in the primary coordinates `(q = marginal η,
+/// g = slope)`, evaluated at this row's converged `(q, g)` and calibrated
+/// latent score `z = ζ`.
+///
+/// This is the #1028 Murphy–Topel generated-regressor channel: `score_β,i =
+/// ∂ℓ_i/∂β = J_iᵀ·(∂ℓ_i/∂(q,g))`, so the per-row slope-score sensitivity to the
+/// calibrated score is `s_i = ∂score_β,i/∂ζ_i = J_iᵀ·(∂²ℓ_i/∂(q,g)∂ζ_i)`, and the
+/// primary 2-vector returned here is exactly `∂²ℓ_i/∂(q,g)∂ζ_i`. The block-level
+/// contraction `J_iᵀ` (marginal+logslope design rows) is applied by the caller.
+///
+/// It is computed by seeding `z` as a THIRD jet variable (index 2) in the SAME
+/// `Tower4` the value/gradient/Hessian path uses (#932 row-jet machinery): the
+/// rigid standard-normal observed index is `η = q·c(g) + g·(s·z)` with
+/// `c(g) = √(1 + (s·g)²)`, `s = probit_scale`, and `ℓ = −w·log Φ(sign·η)`. The
+/// converged-frame mixed partials are then the off-diagonal Hessian entries
+/// `tower.h[q][z]` and `tower.h[g][z]`, read off in one composition — the only
+/// extra cost over the production `Tower4<2>` evaluation is the third jet axis.
+#[inline]
+pub(super) fn rigid_standard_normal_mixed_z_sensitivity(
+    marginal: BernoulliMarginalLinkMap,
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<[f64; 2], String> {
+    // Three jet axes: q = marginal η (0), g = slope (1), z = latent score (2).
+    let mut q = Tower4::<3>::constant(marginal.q);
+    q.g[0] = marginal.q1;
+    q.h[0][0] = marginal.q2;
+    q.t3[0][0][0] = marginal.q3;
+    q.t4[0][0][0][0] = marginal.q4;
+    let slope = Tower4::<3>::variable(g, 1);
+    let z_var = Tower4::<3>::variable(z, 2);
+    let observed_logslope = slope * probit_scale;
+    let c = (observed_logslope * observed_logslope + 1.0).sqrt();
+    // η = q·c + g·(s·z): z enters linearly through the slope×z product, so the
+    // mixed (q,z)/(g,z) curvature is carried entirely by the unary NLL chain and
+    // the η-bilinear, exactly as in the Tower4<2> production path.
+    let eta = q * c + slope * (z_var * probit_scale);
+    let signed = eta * (2.0 * y - 1.0);
+    let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(signed.v);
+    if !logcdf.is_finite() {
+        return Err(format!(
+            "rigid probit mixed-z sensitivity: non-finite log Φ at q={}, g={g}, z={z}, y={y}",
+            marginal.q
+        ));
+    }
+    let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(signed.v, w)?;
+    let tower = signed.compose_unary([-w * logcdf, k1, k2, k3, k4]);
+    let s_q = tower.h[0][2];
+    let s_g = tower.h[1][2];
+    if !(s_q.is_finite() && s_g.is_finite()) {
+        return Err(format!(
+            "rigid probit mixed-z sensitivity: non-finite ∂²ℓ/∂(q,g)∂z = [{s_q}, {s_g}] at q={}, g={g}, z={z}",
+            marginal.q
+        ));
+    }
+    Ok([s_q, s_g])
+}
+
+/// Assemble the #1028 Murphy–Topel slope-score sensitivity matrix
+/// `score_zeta_sensitivity` (`n × p_β`, row `i` = `s_i = ∂score_β,i/∂ζ_i`) for
+/// the rigid standard-normal BMS kernel — the kernel the conditional
+/// location-scale gate ALWAYS selects (`LatentMeasureKind::StandardNormal`).
+///
+/// For each row `i` the primary 2-vector `∂²ℓ_i/∂(q,g)∂ζ_i` is read off the
+/// z-augmented row jet ([`rigid_standard_normal_mixed_z_sensitivity`]) at the
+/// converged marginal index `q_i` (`marginal_eta[i]`) and slope `g_i`
+/// (`slope_eta[i]`) and calibrated score `ζ_i` (`z[i]`), then contracted through
+/// the block Jacobian `J_iᵀ` (the same marginal+logslope design-row scatter the
+/// row kernel exposes via `jacobian_transpose_action`):
+///
+/// ```text
+///   s_i[marginal_range]  = (∂²ℓ_i/∂q∂ζ_i) · marginal_design.row(i)
+///   s_i[logslope_range]  = (∂²ℓ_i/∂g∂ζ_i) · logslope_design.row(i)
+/// ```
+///
+/// `logslope_design` MUST be the reduced-basis design `G·T` actually fitted
+/// (so `p_β = p_marginal + r` matches the reduced-frame `covariance_conditional`
+/// the correction inflates). The aux deviation blocks (score_warp / link_dev),
+/// when present, occupy the trailing columns of `p_beta` and are left zero here:
+/// the rigid standard-normal kernel carries no deviation z-dependence, and the
+/// conditional gate's canonical (non-flex) kernel has no such blocks — the
+/// caller wires the correction only when `p_beta == p_marginal + p_logslope`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn rigid_standard_normal_score_zeta_sensitivity(
+    base_link: &InverseLink,
+    marginal_eta: &Array1<f64>,
+    slope_eta: &Array1<f64>,
+    z: &Array1<f64>,
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    probit_scale: f64,
+    marginal_design: ArrayView2<'_, f64>,
+    logslope_design: ArrayView2<'_, f64>,
+    p_beta: usize,
+) -> Result<Array2<f64>, String> {
+    let n = marginal_eta.len();
+    let p_m = marginal_design.ncols();
+    let r = logslope_design.ncols();
+    if slope_eta.len() != n
+        || z.len() != n
+        || y.len() != n
+        || weights.len() != n
+        || marginal_design.nrows() != n
+        || logslope_design.nrows() != n
+    {
+        return Err(format!(
+            "score_zeta_sensitivity row mismatch: marginal_eta={n}, slope_eta={}, z={}, y={}, \
+             weights={}, marginal_design rows={}, logslope_design rows={}",
+            slope_eta.len(),
+            z.len(),
+            y.len(),
+            weights.len(),
+            marginal_design.nrows(),
+            logslope_design.nrows()
+        ));
+    }
+    if p_m + r > p_beta {
+        return Err(format!(
+            "score_zeta_sensitivity width overflow: marginal({p_m}) + logslope({r}) > p_beta({p_beta})"
+        ));
+    }
+    let mut s = Array2::<f64>::zeros((n, p_beta));
+    for i in 0..n {
+        let marginal = bernoulli_marginal_link_map(base_link, marginal_eta[i])?;
+        let [s_q, s_g] = rigid_standard_normal_mixed_z_sensitivity(
+            marginal,
+            slope_eta[i],
+            z[i],
+            y[i],
+            weights[i],
+            probit_scale,
+        )?;
+        // J_iᵀ scatter into the reduced-frame coordinates: marginal block first,
+        // then the reduced logslope block.
+        if s_q != 0.0 {
+            let m_row = marginal_design.row(i);
+            for (j, &mij) in m_row.iter().enumerate() {
+                s[[i, j]] = s_q * mij;
+            }
+        }
+        if s_g != 0.0 {
+            let g_row = logslope_design.row(i);
+            for (j, &gij) in g_row.iter().enumerate() {
+                s[[i, p_m + j]] = s_g * gij;
+            }
+        }
+    }
+    Ok(s)
+}
+
 #[inline]
 pub(super) fn rigid_standard_normal_third_full(
     marginal: BernoulliMarginalLinkMap,
