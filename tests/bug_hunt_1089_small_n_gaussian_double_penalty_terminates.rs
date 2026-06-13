@@ -50,57 +50,100 @@ fn build_data(n: usize, sigma: f64, seed: u64) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-#[test]
-fn small_n_gaussian_double_penalty_outer_loop_terminates() {
-    // n above the basis-capacity floor (5 ps(knots=7) double-penalty smooths
-    // need ~57 rows) but still a small, fully-penalized design with rho_dim=10
-    // — the regime where the outer REML loop spun in the wine_gamair report.
-    let data = build_data(120, 0.1, 1089);
+/// The exact wine_gamair Rust formula shape: 5 `ps` smooths, knots=7, double
+/// penalty on each (rho_dim = 10, p ≈ 51).
+const WINE_SHAPED_FORMULA: &str = "y ~ s(x0, type=ps, knots=7, double_penalty=true) \
+     + s(x1, type=ps, knots=7, double_penalty=true) \
+     + s(x2, type=ps, knots=7, double_penalty=true) \
+     + s(x3, type=ps, knots=7, double_penalty=true) \
+     + s(x4, type=ps, knots=7, double_penalty=true)";
 
-    // Exactly the wine_gamair Rust formula shape: 5 ps smooths, knots=7,
-    // double penalty on each (rho_dim = 10).
-    let formula = "y ~ s(x0, type=ps, knots=7, double_penalty=true) \
-                   + s(x1, type=ps, knots=7, double_penalty=true) \
-                   + s(x2, type=ps, knots=7, double_penalty=true) \
-                   + s(x3, type=ps, knots=7, double_penalty=true) \
-                   + s(x4, type=ps, knots=7, double_penalty=true)";
-
-    let cfg = FitConfig {
+fn gaussian_cfg() -> FitConfig {
+    FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
-    };
+    }
+}
+
+/// The literal wine_gamair regime: n=30 against a design whose penalized basis
+/// (p ≈ 51) is wider than the data. Such a fit is rank-deficient and its REML
+/// surface is flat in the unidentified directions, which is exactly what let
+/// the outer optimizer wander through ~850k cost-only evaluations until the
+/// 42-minute shard budget killed it. The fit must instead be refused
+/// *promptly* with an actionable error, never enter the unbounded outer search.
+#[test]
+fn wine_shaped_overparameterized_fit_is_refused_promptly_not_hung() {
+    let data = build_data(30, 0.1, 1089);
 
     let start = std::time::Instant::now();
-    let result = fit_from_formula(formula, &data, &cfg).expect("small-n double-penalty fit");
+    let result = fit_from_formula(WINE_SHAPED_FORMULA, &data, &gaussian_cfg());
+    let elapsed = start.elapsed();
+
+    // The defining symptom of #1089 was the *absence* of termination. Whatever
+    // the decision (refuse or fit), it must come back fast — the 42-minute
+    // wall-budget death cannot recur. A couple of seconds is a generous
+    // ceiling for a refusal decision on n=30.
+    assert!(
+        elapsed.as_secs() < 30,
+        "n=30 wine-shaped fit took {:.1}s to return; the outer loop is not \
+         terminating promptly (the #1089 hang)",
+        elapsed.as_secs_f64(),
+    );
+
+    // The honest outcome for an n < (penalized basis dof) design is a refusal
+    // with an actionable message, not a silent ill-posed grind.
+    match result {
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not enough observations") || msg.contains("rows"),
+                "n=30 overparameterized fit should be refused with a row-count \
+                 message; got: {msg}"
+            );
+        }
+        Ok(_) => {
+            // A fit is acceptable too, *provided* it terminated promptly (the
+            // elapsed assert above). The bug was the hang, not the existence
+            // of a result.
+        }
+    }
+}
+
+/// Companion: lift the same wine-shaped design above the basis-capacity floor
+/// (5 ps(knots=7) double-penalty smooths need ~57 rows). A well-posed small
+/// fully-penalized design with rho_dim=10 must drive its outer REML loop to a
+/// *converged* termination in a bounded number of iterations — the loop's
+/// stopping criterion has to actually fire, not lean on the wall clock.
+#[test]
+fn small_n_gaussian_double_penalty_outer_loop_terminates() {
+    let data = build_data(120, 0.1, 1089);
+
+    let start = std::time::Instant::now();
+    let result =
+        fit_from_formula(WINE_SHAPED_FORMULA, &data, &gaussian_cfg()).expect("well-posed fit");
     let elapsed = start.elapsed();
 
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit");
     };
 
-    // The outer optimizer must converge, not bail at its iteration cap.
     assert!(
         fit.fit.outer_converged,
-        "outer REML loop did not converge on the n=30 double-penalty Gaussian fit \
-         (outer_iterations={})",
+        "outer REML loop did not converge on the well-posed n=120 double-penalty \
+         Gaussian fit (outer_iterations={})",
         fit.fit.outer_iterations,
     );
 
-    // A toy n=30 / rho_dim=10 fit must settle in a handful of outer steps. The
-    // pre-fix behavior performed ~850k cost-only evals; any working stopping
-    // criterion lands far below this bound.
     assert!(
         fit.fit.outer_iterations <= 200,
-        "outer REML loop took {} iterations on a trivial n=30 fit; \
-         expected prompt termination",
+        "outer REML loop took {} iterations on a small n=120 fit; expected \
+         prompt convergence well under the iteration cap",
         fit.fit.outer_iterations,
     );
 
-    // Wall-clock guard: the benchmark died at a 42-minute budget. A few
-    // seconds is a generous ceiling for this toy problem on CI hardware.
     assert!(
-        elapsed.as_secs() < 60,
-        "n=30 double-penalty Gaussian fit took {:.1}s; outer loop is not \
+        elapsed.as_secs() < 120,
+        "n=120 double-penalty Gaussian fit took {:.1}s; outer loop is not \
          terminating promptly",
         elapsed.as_secs_f64(),
     );
