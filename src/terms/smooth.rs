@@ -20681,7 +20681,9 @@ where
     // Fast path: kappa disabled or no spatial terms — build designs once.
     // -----------------------------------------------------------------------
     if joint_setup.auxiliary_dim() == 0 && (!kappa_options.enabled || log_kappa_dim == 0) {
-        log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] taking FAST path (no outer theta optimization in this driver)");
+        log::warn!(
+            "[OUTER-FD-AUDIT/spatial-exact-joint] taking FAST path (no outer theta optimization in this driver)"
+        );
         let (designs, resolved_specs) = build_term_collection_designs_and_freeze_joint(
             data, block_specs,
         )
@@ -21002,11 +21004,17 @@ where
                 } else if i < rho_dim_audit + (psi_dim_audit - aux_dim_audit) {
                     format!("psi_kappa[{}]", i - rho_dim_audit)
                 } else {
-                    format!("aux[{}]", i - rho_dim_audit - (psi_dim_audit - aux_dim_audit))
+                    format!(
+                        "aux[{}]",
+                        i - rho_dim_audit - (psi_dim_audit - aux_dim_audit)
+                    )
                 }
             };
             crate::solver::outer_strategy::outer_gradient_fd_audit(
-                &theta0, 1e-4, label, &mut eval_at,
+                &theta0,
+                1e-4,
+                label,
+                &mut eval_at,
             )
         })();
         match audit {
@@ -25893,7 +25901,11 @@ mod tests {
         let spatial_terms = spatial_length_scale_term_indices(&frozen);
         assert_eq!(spatial_terms.len(), 1, "expect a single spatial term");
         let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
-        assert_eq!(dims_per_term, vec![1], "expect one log-scale axis (coord_dim == 1)");
+        assert_eq!(
+            dims_per_term,
+            vec![1],
+            "expect one log-scale axis (coord_dim == 1)"
+        );
         let rho_dim = frozen_design.penalties.len();
         assert!(rho_dim >= 1, "expect at least one penalty block");
 

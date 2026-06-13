@@ -112,9 +112,11 @@ impl OuterGradientFdAudit {
 
     /// Worst per-coordinate analytic−FD gap and its component.
     pub fn worst_component(&self) -> Option<&OuterGradientFdComponent> {
-        self.components
-            .iter()
-            .max_by(|a, b| a.abs_gap().partial_cmp(&b.abs_gap()).unwrap_or(std::cmp::Ordering::Equal))
+        self.components.iter().max_by(|a, b| {
+            a.abs_gap()
+                .partial_cmp(&b.abs_gap())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// Smallest-magnitude outer-Hessian eigenvalue (flatness proxy).
@@ -138,7 +140,12 @@ impl OuterGradientFdAudit {
                 .unwrap_or_else(|| "n/a".to_string());
             log::warn!(
                 "[OUTER-FD-AUDIT/{context}] block={} i={} analytic={:.6e} fd={:.6e} gap={:.3e} ratio={}",
-                c.block, c.index, c.analytic, c.fd, c.abs_gap(), ratio
+                c.block,
+                c.index,
+                c.analytic,
+                c.fd,
+                c.abs_gap(),
+                ratio
             );
         }
         if !self.hessian_eigenvalues.is_empty() {
@@ -157,14 +164,13 @@ impl OuterGradientFdAudit {
             Some(w) if w.abs_gap() > 1e-3 && w.abs_gap() > 1e-3 * w.fd.abs().max(1.0) => {
                 log::warn!(
                     "[OUTER-FD-AUDIT/{context}] VERDICT=DESYNC worst_block={} worst_i={} gap={:.3e} (analytic gradient disagrees with FD of the criterion: fix the derivative)",
-                    w.block, w.index, w.abs_gap()
+                    w.block,
+                    w.index,
+                    w.abs_gap()
                 );
             }
             _ => {
-                let flat = self
-                    .min_abs_eigenvalue()
-                    .map(|m| m < 1e-6)
-                    .unwrap_or(false);
+                let flat = self.min_abs_eigenvalue().map(|m| m < 1e-6).unwrap_or(false);
                 if flat {
                     log::warn!(
                         "[OUTER-FD-AUDIT/{context}] VERDICT=FLATNESS min_abs_eig={:.3e} (analytic≈FD but the outer Hessian is near-singular: weak identifiability, fix termination not the gradient)",
