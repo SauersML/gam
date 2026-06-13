@@ -394,14 +394,20 @@ pub(super) fn dispersion_row_kernel(
                 // Exact point mass P(Y=0) = exp(−μ^{2−p}/(φ(2−p))) (1 < p < 2).
                 let c = mu.powf(two_minus_p) / two_minus_p;
                 let loglik = wi * (-c / phi);
-                // ∂ℓ/∂φ = c/φ²; chain to η_d = −log φ.
+                // ∂ℓ/∂φ = c/φ²; chain to η_d = −log φ (so φ = exp(−η_d)).
                 let s_phi = c / (phi * phi);
                 let s_eta = -phi * s_phi;
-                // −∂²ℓ/∂φ² = 2c/φ³ ⇒ Fisher information wrt η_d is 2c/φ. The
-                // working response divides by this per-row curvature so the
-                // prior weight cancels (and a zero-prior-weight row stays
-                // excluded via `disp_weight = 0`).
-                let curvature_eta = (2.0 * c / phi).max(DISPERSION_MIN_CURVATURE);
+                // NLL(η_d) = c·exp(η_d) at y=0, so ∂²NLL/∂η_d² = c·exp(η_d) = c/φ.
+                // Equivalently, the full chain rule gives
+                //   ∂²NLL/∂η_d² = φ²·(2c/φ³) + φ·(−c/φ²) = 2c/φ − c/φ = c/φ,
+                // where the second term is the ∂²φ/∂η_d²·(∂NLL/∂φ) correction
+                // that the Fisher-information shortcut (which drops the first-order
+                // score term via E[score]=0) would have absorbed but which is
+                // non-zero in the observed-information computation. The working
+                // response divides by this per-row curvature so the prior weight
+                // cancels (and a zero-prior-weight row stays excluded via
+                // `disp_weight = 0`).
+                let curvature_eta = (c / phi).max(DISPERSION_MIN_CURVATURE);
                 let disp_weight = wi * curvature_eta;
                 let disp_response = ed + s_eta / curvature_eta;
                 DispersionRowKernel {
