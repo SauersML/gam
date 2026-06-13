@@ -1013,8 +1013,9 @@ fn validate_location_scale_saved_fit(
         // Gaussian and dispersion (#913) location-scale both predict the mean
         // through the Location block; the binomial threshold-scale class reads
         // the Threshold block instead.
-        PredictModelClass::GaussianLocationScale
-        | PredictModelClass::DispersionLocationScale => gaussian_location_scale_mean_beta(fit),
+        PredictModelClass::GaussianLocationScale | PredictModelClass::DispersionLocationScale => {
+            gaussian_location_scale_mean_beta(fit)
+        }
         PredictModelClass::BinomialLocationScale => binomial_location_scale_threshold_beta(fit),
         _ => None,
     }
@@ -3335,36 +3336,36 @@ impl FittedModel {
         let runtime = self
             .saved_prediction_runtime()
             .map_err(|err| format!("bernoulli marginal-slope predictor runtime: {err}"))?;
-        let unified = self
-            .unified()
-            .ok_or_else(|| "bernoulli marginal-slope predictor requires a unified fit".to_string())?;
+        let unified = self.unified().ok_or_else(|| {
+            "bernoulli marginal-slope predictor requires a unified fit".to_string()
+        })?;
         let payload = self.payload();
-        let z_column = payload
-            .z_column
-            .clone()
-            .ok_or_else(|| "bernoulli marginal-slope predictor requires a saved z column".to_string())?;
+        let z_column = payload.z_column.clone().ok_or_else(|| {
+            "bernoulli marginal-slope predictor requires a saved z column".to_string()
+        })?;
         BernoulliMarginalSlopePredictor::from_unified(
             unified,
             z_column,
-            payload
-                .latent_z_normalization
-                .ok_or_else(|| "marginal-slope predictor requires saved latent-z normalization".to_string())?,
-            payload
-                .latent_measure
-                .clone()
-                .ok_or_else(|| "marginal-slope predictor requires a saved latent measure".to_string())?,
-            payload
-                .marginal_baseline
-                .ok_or_else(|| "marginal-slope predictor requires a saved marginal baseline".to_string())?,
-            payload
-                .logslope_baseline
-                .ok_or_else(|| "marginal-slope predictor requires a saved logslope baseline".to_string())?,
+            payload.latent_z_normalization.ok_or_else(|| {
+                "marginal-slope predictor requires saved latent-z normalization".to_string()
+            })?,
+            payload.latent_measure.clone().ok_or_else(|| {
+                "marginal-slope predictor requires a saved latent measure".to_string()
+            })?,
+            payload.marginal_baseline.ok_or_else(|| {
+                "marginal-slope predictor requires a saved marginal baseline".to_string()
+            })?,
+            payload.logslope_baseline.ok_or_else(|| {
+                "marginal-slope predictor requires a saved logslope baseline".to_string()
+            })?,
             self.resolved_inverse_link()
                 .map_err(|err| format!("marginal-slope predictor inverse link: {err}"))?
                 .unwrap_or(InverseLink::Standard(StandardLink::Probit)),
             self.family_state
                 .frailty()
-                .ok_or_else(|| "marginal-slope predictor requires a saved frailty spec".to_string())?
+                .ok_or_else(|| {
+                    "marginal-slope predictor requires a saved frailty spec".to_string()
+                })?
                 .clone(),
             runtime.score_warp,
             runtime.link_deviation,

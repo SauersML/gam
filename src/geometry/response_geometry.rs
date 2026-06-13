@@ -39,9 +39,9 @@ fn parse_kv(inner: &str) -> Result<Vec<(String, String)>, String> {
         if piece.is_empty() {
             continue;
         }
-        let (k, v) = piece.split_once('=').ok_or_else(|| {
-            format!("response_geometry parameter {piece:?} must be key=value")
-        })?;
+        let (k, v) = piece
+            .split_once('=')
+            .ok_or_else(|| format!("response_geometry parameter {piece:?} must be key=value"))?;
         out.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
     }
     Ok(out)
@@ -92,9 +92,7 @@ impl ResponseManifold {
                 let k = k.ok_or_else(|| "response_geometry='grassmann' requires k".to_string())?;
                 let n = n.ok_or_else(|| "response_geometry='grassmann' requires n".to_string())?;
                 if k == 0 || n == 0 || k > n {
-                    return Err(
-                        "response_geometry='grassmann' requires 1 <= k <= n".to_string()
-                    );
+                    return Err("response_geometry='grassmann' requires 1 <= k <= n".to_string());
                 }
                 Ok(Self::Grassmann { k, n })
             }
@@ -148,9 +146,9 @@ impl ResponseManifold {
         let (head, params) = match lowered.split_once('(') {
             Some((h, rest)) => {
                 let rest = rest.trim_end();
-                let inner = rest.strip_suffix(')').ok_or_else(|| {
-                    format!("response_geometry {label:?}: missing closing ')'")
-                })?;
+                let inner = rest
+                    .strip_suffix(')')
+                    .ok_or_else(|| format!("response_geometry {label:?}: missing closing ')'"))?;
                 (h.trim().to_string(), parse_kv(inner)?)
             }
             None => (lowered.clone(), Vec::new()),
@@ -254,12 +252,10 @@ impl ResponseManifold {
     fn riemannian(&self) -> Option<Box<dyn RiemannianManifold>> {
         match self {
             Self::Spd { n } => Some(Box::new(SpdManifold::new(*n))),
-            Self::Grassmann { k, n } => {
-                GrassmannManifold::new(*k, *n).ok().map(|m| Box::new(m) as _)
-            }
-            Self::Stiefel { k, n } => {
-                StiefelManifold::new(*k, *n).ok().map(|m| Box::new(m) as _)
-            }
+            Self::Grassmann { k, n } => GrassmannManifold::new(*k, *n)
+                .ok()
+                .map(|m| Box::new(m) as _),
+            Self::Stiefel { k, n } => StiefelManifold::new(*k, *n).ok().map(|m| Box::new(m) as _),
             Self::Poincare { .. } => None,
         }
     }
@@ -571,11 +567,11 @@ pub fn response_frechet_mean(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array2};
+    use ndarray::{Array2, array};
 
     fn round_trip(manifold: ResponseManifold, values: Array2<f64>) {
-        let base = response_frechet_mean(manifold, values.view(), None, 1e-12, 500)
-            .expect("frechet mean");
+        let base =
+            response_frechet_mean(manifold, values.view(), None, 1e-12, 500).expect("frechet mean");
         let tangent = response_log_map(manifold, values.view(), base.view()).expect("log map");
         let back = response_exp_map(manifold, tangent.view(), base.view()).expect("exp map");
         for row in 0..values.nrows() {
@@ -604,32 +600,20 @@ mod tests {
     #[test]
     fn grassmann_round_trip_and_mean() {
         // Gr(1, 3): unit columns (lines through the origin), n·k = 3 flat.
-        let values = array![
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.6, 0.8, 0.0],
-        ];
+        let values = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.6, 0.8, 0.0],];
         round_trip(ResponseManifold::Grassmann { k: 1, n: 3 }, values);
     }
 
     #[test]
     fn stiefel_round_trip_and_mean() {
         // St(1, 3): unit 1-frames in ℝ³ (== sphere S²).
-        let values = array![
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.6, 0.8],
-        ];
+        let values = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.6, 0.8],];
         round_trip(ResponseManifold::Stiefel { k: 1, n: 3 }, values);
     }
 
     #[test]
     fn poincare_round_trip_and_mean() {
-        let values = array![
-            [0.1, 0.2],
-            [-0.3, 0.1],
-            [0.2, -0.25],
-        ];
+        let values = array![[0.1, 0.2], [-0.3, 0.1], [0.2, -0.25],];
         round_trip(
             ResponseManifold::Poincare {
                 dim: 2,
@@ -643,9 +627,7 @@ mod tests {
     fn resolver_rejects_bad_shapes() {
         assert!(ResponseManifold::resolve("grassmann", Some(2), Some(3), None, None).is_err());
         assert!(ResponseManifold::resolve("spd", None, None, None, None).is_err());
-        assert!(
-            ResponseManifold::resolve("poincare", None, None, Some(2), Some(1.0)).is_err()
-        );
+        assert!(ResponseManifold::resolve("poincare", None, None, Some(2), Some(1.0)).is_err());
         assert!(ResponseManifold::resolve("nonsense", None, None, None, None).is_err());
         assert_eq!(
             ResponseManifold::resolve("spd", Some(3), None, None, None).unwrap(),
@@ -711,10 +693,7 @@ mod tests {
                 "stiefel(k=1)",
                 array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.6, 0.8]],
             ),
-            (
-                "poincare",
-                array![[0.1, 0.2], [-0.3, 0.1], [0.2, -0.25]],
-            ),
+            ("poincare", array![[0.1, 0.2], [-0.3, 0.1], [0.2, -0.25]]),
         ];
         for (label, values) in cases {
             let (tangent, base, canonical) =

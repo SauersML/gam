@@ -481,8 +481,7 @@ fn alo_matches_true_loo_small_n_binomial_refit() {
         let denom = (1.0 - wi * h_i).max(1e-12);
         one_step[i] = eta_hat[i] + h_i * ell_prime / denom;
     }
-    let (rmse_one_step, _, _, _) =
-        loo_compare(&one_step, &alo.se_sandwich, &loo_pred, &naive_se);
+    let (rmse_one_step, _, _, _) = loo_compare(&one_step, &alo.se_sandwich, &loo_pred, &naive_se);
 
     let (rmse_pred, max_abs_pred, rmse_se, max_abs_se) =
         loo_compare(&alo.eta_tilde, &alo.se_sandwich, &loo_pred, &naive_se);

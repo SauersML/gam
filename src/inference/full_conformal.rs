@@ -3633,7 +3633,9 @@ mod tests {
         // stream without a second mutable borrow of a captured `unif` closure.
         let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
         let unif = |state: &mut u64| {
-            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((*state >> 11) as f64) / ((1u64 << 53) as f64)
         };
         // Box–Muller standard normal.
@@ -3679,7 +3681,10 @@ mod tests {
             }
             let y_star = eta_star + sigma * normal(&mut state);
             let itv = stats.interval(&x_star, alpha).expect("coverage interval");
-            assert!(itv.certifies_finite(), "coverage trial produced infinite width");
+            assert!(
+                itv.certifies_finite(),
+                "coverage trial produced infinite width"
+            );
             if y_star >= itv.lo && y_star <= itv.hi {
                 covered += 1;
             }

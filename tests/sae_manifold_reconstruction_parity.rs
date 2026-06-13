@@ -135,7 +135,10 @@ fn planted_frames(k: usize, p: usize) -> Vec<Array2<f64>> {
             }
         }
         let nrm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        assert!(nrm > 1.0e-9, "planted ambient basis rank-deficient at col {j}");
+        assert!(
+            nrm > 1.0e-9,
+            "planted ambient basis rank-deficient at col {j}"
+        );
         for i in 0..p {
             q[[i, j]] = v[i] / nrm;
         }
@@ -159,7 +162,9 @@ fn planted_truth(k: usize, n: usize) -> Truth {
     let mut theta = vec![vec![0.0; n]; k];
     let mut active = vec![vec![false; n]; k];
     let mut amp = vec![vec![0.0; n]; k];
-    let radii: Vec<f64> = (0..k).map(|a| 1.0 + 0.1 * (a as f64 / k.max(1) as f64)).collect();
+    let radii: Vec<f64> = (0..k)
+        .map(|a| 1.0 + 0.1 * (a as f64 / k.max(1) as f64))
+        .collect();
     let n_active_target = ((PLANTED_ACTIVE_MASS * n as f64).round() as usize).max(8);
     for a in 0..k {
         let stride = 0.045 + 0.0007 * (a as f64);
@@ -181,7 +186,14 @@ fn planted_truth(k: usize, n: usize) -> Truth {
             };
         }
     }
-    Truth { k, n, theta, active, amp, radii }
+    Truth {
+        k,
+        n,
+        theta,
+        active,
+        amp,
+        radii,
+    }
 }
 
 /// Planted response Z = Σ_a gate_a · amp_a · r_a (cosθ u_a1 + sinθ u_a2) + noise.
@@ -365,7 +377,12 @@ struct Slot {
 /// Build the cold term for an arbitrary slot list, through the production cold
 /// IBP-MAP routing seed + weighted-LSQ decoder init (identical to the recovery
 /// pins, generalized over heterogeneous atom bases).
-fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>, p: usize, slots: &[Slot]) -> SaeManifoldTerm {
+fn build_cold_term(
+    truth: &Truth,
+    z: ArrayView2<'_, f64>,
+    p: usize,
+    slots: &[Slot],
+) -> SaeManifoldTerm {
     let n = truth.n;
     let k_atoms = slots.len();
     assert_eq!(z.ncols(), p);
@@ -404,8 +421,7 @@ fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>, p: usize, slots: &[Slo
         }
     }
 
-    let mut logits =
-        residual_seed_logits(basis_values.view(), &basis_sizes, z, RESIDUAL_SEED_GAIN);
+    let mut logits = residual_seed_logits(basis_values.view(), &basis_sizes, z, RESIDUAL_SEED_GAIN);
     // Shatter arm: bias each linear secant's seed logit toward the arc segment it
     // owns, so the K·S linear atoms tile their circle's angle range instead of
     // all collapsing onto the same diameter. A circular bump on |θ − center|.
@@ -430,10 +446,13 @@ fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>, p: usize, slots: &[Slo
         let m_k = slot.kind.basis_size();
         let b = decoder.slice(s![ai, 0..m_k, ..]).to_owned();
         let atom = SaeManifoldAtom::new(
-            format!("{}_{ai}", match slot.kind {
-                Kind::Circle => "circle",
-                Kind::Linear => "linear",
-            }),
+            format!(
+                "{}_{ai}",
+                match slot.kind {
+                    Kind::Circle => "circle",
+                    Kind::Linear => "linear",
+                }
+            ),
             slot.kind.basis_kind(),
             1,
             phi_k[ai].clone(),
@@ -466,8 +485,11 @@ fn run_production_fit(
 ) -> SaeManifoldTerm {
     let k_atoms = slots.len();
     let term = build_cold_term(truth, z.view(), p, slots);
-    let init_rho =
-        SaeManifoldRho::new(SPARSITY.ln(), SMOOTHNESS.ln(), vec![Array1::<f64>::zeros(0); k_atoms]);
+    let init_rho = SaeManifoldRho::new(
+        SPARSITY.ln(),
+        SMOOTHNESS.ln(),
+        vec![Array1::<f64>::zeros(0); k_atoms],
+    );
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
     let mut objective = SaeManifoldOuterObjective::new(
@@ -481,7 +503,9 @@ fn run_production_fit(
         RIDGE_BETA,
     );
     let problem = OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
-    problem.run(&mut objective, label).expect("outer cascade must complete");
+    problem
+        .run(&mut objective, label)
+        .expect("outer cascade must complete");
     let (fitted_term, _rho, _loss) = objective.into_fitted();
     fitted_term
 }
@@ -514,14 +538,24 @@ fn reconstruction_ev(z: &Array2<f64>, fitted: &Array2<f64>) -> f64 {
 /// One curved atom per circle: the SAE-manifold dictionary at matched K.
 fn curved_slots(k: usize) -> Vec<Slot> {
     (0..k)
-        .map(|c| Slot { circle: c, kind: Kind::Circle, seg_center: 0.0, seg_halfwidth: 0.5 })
+        .map(|c| Slot {
+            circle: c,
+            kind: Kind::Circle,
+            seg_center: 0.0,
+            seg_halfwidth: 0.5,
+        })
         .collect()
 }
 
 /// One linear atom per circle: the pure-linear SAE baseline at matched K.
 fn linear_matched_slots(k: usize) -> Vec<Slot> {
     (0..k)
-        .map(|c| Slot { circle: c, kind: Kind::Linear, seg_center: 0.0, seg_halfwidth: 0.5 })
+        .map(|c| Slot {
+            circle: c,
+            kind: Kind::Linear,
+            seg_center: 0.0,
+            seg_halfwidth: 0.5,
+        })
         .collect()
 }
 
@@ -533,7 +567,12 @@ fn linear_shatter_slots(k: usize, shards: usize) -> Vec<Slot> {
     for c in 0..k {
         for s in 0..shards {
             let center = (s as f64 + 0.5) / shards as f64;
-            slots.push(Slot { circle: c, kind: Kind::Linear, seg_center: center, seg_halfwidth: halfwidth });
+            slots.push(Slot {
+                circle: c,
+                kind: Kind::Linear,
+                seg_center: center,
+                seg_halfwidth: halfwidth,
+            });
         }
     }
     slots
@@ -562,8 +601,13 @@ fn sae_reconstruction_parity_curved_beats_linear_and_shatter_budget_recovers() {
 
     let curved = run_production_fit(&truth, &z, p, &curved_slots(k), "parity-curved-K");
     let linear_k = run_production_fit(&truth, &z, p, &linear_matched_slots(k), "parity-linear-K");
-    let linear_shatter =
-        run_production_fit(&truth, &z, p, &linear_shatter_slots(k, shards), "parity-linear-shatter");
+    let linear_shatter = run_production_fit(
+        &truth,
+        &z,
+        p,
+        &linear_shatter_slots(k, shards),
+        "parity-linear-shatter",
+    );
 
     let ev_curved = reconstruction_ev(&z, &curved.fitted());
     let ev_linear_k = reconstruction_ev(&z, &linear_k.fitted());
@@ -571,14 +615,25 @@ fn sae_reconstruction_parity_curved_beats_linear_and_shatter_budget_recovers() {
 
     println!("=== #1026 reconstruction parity (production engine, planted K-circle DGP) ===");
     println!("K={k} circles, p={p} ambient, N={n}, Θ=2π/circle, noise≈4% of signal scale");
-    println!("shatter budget = {shards} linear secants/circle (targets ε≈{eps_used:.4}, N(ε)≈π/√(2ε)≈{:.1})",
-        std::f64::consts::PI / (2.0 * eps_used).sqrt());
+    println!(
+        "shatter budget = {shards} linear secants/circle (targets ε≈{eps_used:.4}, N(ε)≈π/√(2ε)≈{:.1})",
+        std::f64::consts::PI / (2.0 * eps_used).sqrt()
+    );
     println!("reconstruction EV (1 − SSR/SST):");
     println!("  CURVED   (K={k} periodic atoms)          EV = {ev_curved:.6}");
     println!("  LINEAR   (K={k} linear atoms, matched)   EV = {ev_linear_k:.6}");
-    println!("  LINEAR   (K·{shards}={} linear secants)   EV = {ev_linear_shatter:.6}", k * shards);
-    println!("  curved − linear(matched K) margin       = {:.6}", ev_curved - ev_linear_k);
-    println!("  curved − linear(shatter budget) margin  = {:.6}", ev_curved - ev_linear_shatter);
+    println!(
+        "  LINEAR   (K·{shards}={} linear secants)   EV = {ev_linear_shatter:.6}",
+        k * shards
+    );
+    println!(
+        "  curved − linear(matched K) margin       = {:.6}",
+        ev_curved - ev_linear_k
+    );
+    println!(
+        "  curved − linear(shatter budget) margin  = {:.6}",
+        ev_curved - ev_linear_shatter
+    );
 
     // (1) CURVED match-or-beats LINEAR at matched K — by a wide margin. One
     //     periodic atom captures a full circle; one linear atom captures only a

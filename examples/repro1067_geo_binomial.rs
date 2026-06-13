@@ -79,7 +79,11 @@ fn build(n: usize, n_pcs: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
         } else {
             eta += rng.normal(0.0, 0.08);
         }
-        y[i] = if rng.bernoulli(sigmoid(eta)) { 1.0 } else { 0.0 };
+        y[i] = if rng.bernoulli(sigmoid(eta)) {
+            1.0
+        } else {
+            0.0
+        };
         let lat_s = lat / 90.0;
         let lon_s = lon / 180.0;
         for j in 0..n_pcs {

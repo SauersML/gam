@@ -53,7 +53,11 @@ fn simulate_2d_binomial(n: usize) -> (Array2<f64>, Array1<f64>) {
         // Smooth spatial logit field.
         let eta = 0.9 * (0.8 * p1).sin() + 0.6 * (0.7 * p2).cos() - 0.3 * p1 * p2;
         let prob = 1.0 / (1.0 + (-eta).exp());
-        y[i] = if rng.random_range(0.0..1.0) < prob { 1.0 } else { 0.0 };
+        y[i] = if rng.random_range(0.0..1.0) < prob {
+            1.0
+        } else {
+            0.0
+        };
     }
     (x, y)
 }

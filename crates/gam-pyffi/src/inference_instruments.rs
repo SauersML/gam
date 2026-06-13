@@ -157,11 +157,7 @@ pub(crate) fn log_e_from_p_value(p_value: f64) -> PyResult<f64> {
 
 /// Build the per-row expected cumulants for a one-predictor-channel GLM family
 /// at linear predictor `eta` (canonical closed-form jets; issue #939).
-fn row_kappas_for_family(
-    family: &str,
-    eta: f64,
-    dispersion: f64,
-) -> PyResult<RowKappas> {
+fn row_kappas_for_family(family: &str, eta: f64, dispersion: f64) -> PyResult<RowKappas> {
     let jets: RowExpectedJets = match family {
         "gaussian" => RowExpectedJets::gaussian_identity(dispersion),
         "poisson" => RowExpectedJets::poisson_log(eta),
@@ -277,8 +273,14 @@ pub(crate) fn lawley_bartlett_factor<'py>(
         let dist = ChiSquared::new(ref_df)
             .map_err(|e| py_value_error(format!("lawley_bartlett: χ²_{ref_df} invalid: {e}")))?;
         out.set_item("corrected_statistic", corrected)?;
-        out.set_item("p_value_corrected", (1.0 - dist.cdf(corrected)).clamp(0.0, 1.0))?;
-        out.set_item("p_value_uncorrected", (1.0 - dist.cdf(stat)).clamp(0.0, 1.0))?;
+        out.set_item(
+            "p_value_corrected",
+            (1.0 - dist.cdf(corrected)).clamp(0.0, 1.0),
+        )?;
+        out.set_item(
+            "p_value_uncorrected",
+            (1.0 - dist.cdf(stat)).clamp(0.0, 1.0),
+        )?;
     }
     Ok(out)
 }
@@ -551,7 +553,10 @@ mod tests {
         let report = debias_with_dense_hessian(&input, h.view()).expect("debiased report");
 
         assert!(report.theta_onestep.is_finite(), "debiased estimate finite");
-        assert!(report.se.is_finite() && report.se > 0.0, "SE finite & positive");
+        assert!(
+            report.se.is_finite() && report.se > 0.0,
+            "SE finite & positive"
+        );
 
         let truth = gradient.dot(&beta_truth);
         let plugin_bias = (report.theta_plugin - truth).abs();
@@ -583,11 +588,15 @@ mod tests {
         // c = 1 + ε_n/1 = 1 + 1/(6n) (the module's certified fixture).
         for &n in &[8usize, 32] {
             let eta = 0.4;
-            let kappas =
-                vec![RowExpectedJets::gamma_log(eta, 1.0).kappas().expect("kappas"); n];
+            let kappas = vec![
+                RowExpectedJets::gamma_log(eta, 1.0)
+                    .kappas()
+                    .expect("kappas");
+                n
+            ];
             let x = Array2::<f64>::ones((n, 1));
-            let factor = lawley_lr_bartlett_factor(x.view(), &kappas, None, 0..1, 1.0)
-                .expect("factor");
+            let factor =
+                lawley_lr_bartlett_factor(x.view(), &kappas, None, 0..1, 1.0).expect("factor");
             let expected = 1.0 + 1.0 / (6.0 * n as f64);
             assert!(
                 (factor - expected).abs() < 1e-10,

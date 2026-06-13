@@ -1,5 +1,6 @@
 use csv::StringRecord;
 use faer::Side;
+use gam::DispersionLocationScaleFitResult;
 use gam::basis::create_duchon_basis_1d_derivative_dense;
 use gam::estimate::{
     BlockRole, EstimationError, ExternalOptimOptions,
@@ -17,7 +18,6 @@ use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_like
 use gam::families::survival_predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
-use gam::DispersionLocationScaleFitResult;
 use gam::gamlss::{
     BinomialLocationScaleFitResult, DispersionFamilyKind, GaussianLocationScaleFitResult,
 };
@@ -9627,8 +9627,8 @@ fn sae_manifold_fit_inner<'py>(
     // left contested — without re-running any fitting. Valid at this (or any)
     // data-dependent stopping time because each claim is an e-process.
     let structure_certificate = structure_ledger.certify(0.05);
-    let certificate_json = serde_json::to_string(&structure_certificate)
-        .map_err(serde_json_error_to_pyerr)?;
+    let certificate_json =
+        serde_json::to_string(&structure_certificate).map_err(serde_json_error_to_pyerr)?;
     out.set_item("structure_certificate", certificate_json)?;
     Ok(out.unbind())
 }
@@ -9788,7 +9788,10 @@ fn sae_hybrid_split_dict<'py>(
             HybridAtomParam::Curved { latent_dim } => format!("curved(d={latent_dim})"),
         };
         a.set_item("parameterization", param)?;
-        a.set_item("negative_log_evidence", verdict.choice.negative_log_evidence)?;
+        a.set_item(
+            "negative_log_evidence",
+            verdict.choice.negative_log_evidence,
+        )?;
         a.set_item("num_parameters", verdict.choice.num_parameters)?;
         a.set_item(
             "curved_evidence_margin",
@@ -19489,7 +19492,6 @@ fn rg_resolve_simplex_coord_label(kind: &str, coordinates: Option<&str>) -> Stri
         }
     }
 }
-
 
 /// Consolidated response-geometry log map: pick the base point (intrinsic
 /// Fréchet mean when none is supplied, else the projected/closed input base),
@@ -31114,12 +31116,7 @@ fn build_standard_payload(
     // while the training design + response are still in hand. `None` for any
     // ineligible model; predict falls back to the model-based band.
     let jackknife_plus_stats = gaussian_jackknife_plus_stats_for_standard_fit(
-        &formula,
-        dataset,
-        fit_config,
-        &family,
-        &saved_fit,
-        design,
+        &formula, dataset, fit_config, &family, &saved_fit, design,
     );
     let mut payload = FittedModelPayload::new(
         MODEL_PAYLOAD_VERSION,

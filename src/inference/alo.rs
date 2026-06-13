@@ -406,9 +406,11 @@ fn compute_alo_diagnostics_from_pirls_inner(
     let inv_link_for_closure = base.likelihood.spec.link.clone();
     let score_curvature_closure = canonical_scale.as_ref().map(|scale| {
         move |i: usize, eta: f64| -> (f64, f64) {
-            let (mu, dmu) =
-                crate::mixture_link::inverse_link_mu_d1_for_inverse_link(&inv_link_for_closure, eta)
-                    .unwrap_or((f64::NAN, f64::NAN));
+            let (mu, dmu) = crate::mixture_link::inverse_link_mu_d1_for_inverse_link(
+                &inv_link_for_closure,
+                eta,
+            )
+            .unwrap_or((f64::NAN, f64::NAN));
             let c_i = scale[i];
             (c_i * (mu - y[i]), c_i * dmu)
         }

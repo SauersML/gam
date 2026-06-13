@@ -27,7 +27,9 @@
 //! the ground truth here is the exact null distribution of the LR statistic.
 
 use gam::smooth::smooth_term_lr_inference_forspec;
-use gam::{FitConfig, FitRequest, encode_recordswith_inferred_schema, init_parallelism, materialize};
+use gam::{
+    FitConfig, FitRequest, encode_recordswith_inferred_schema, init_parallelism, materialize,
+};
 
 use csv::StringRecord;
 use rand::RngExt;
@@ -60,9 +62,7 @@ fn null_replicate(n: usize, seed: u64) -> gam::data::EncodedDataset {
 
 /// Run the per-term LR + Bartlett driver on one replicate and return the single
 /// `s(z)` smooth-term report.
-fn run_one(
-    data: &gam::data::EncodedDataset,
-) -> Option<gam::smooth::SmoothTermLrInference> {
+fn run_one(data: &gam::data::EncodedDataset) -> Option<gam::smooth::SmoothTermLrInference> {
     let cfg = FitConfig {
         family: Some("poisson".to_string()),
         ..FitConfig::default()

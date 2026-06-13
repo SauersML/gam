@@ -1638,9 +1638,9 @@ impl SphereBoostFlowBasis {
         let (s, c) = (lat.sin(), lat.cos());
         let (cl, sl) = (lon.cos(), lon.sin());
         [
-            [c, 0.0],                  // K_z
-            [s * cl, -sl / c],         // K_x
-            [s * sl, cl / c],          // K_y
+            [c, 0.0],          // K_z
+            [s * cl, -sl / c], // K_x
+            [s * sl, cl / c],  // K_y
         ]
     }
 
@@ -1673,8 +1673,7 @@ impl SphereBoostFlowBasis {
         for i in 0..nodes {
             let lat = lat_lo + (lat_hi - lat_lo) * i as f64 / (nodes - 1) as f64;
             for j in 0..nodes {
-                let lon = -std::f64::consts::PI
-                    + std::f64::consts::TAU * j as f64 / nodes as f64;
+                let lon = -std::f64::consts::PI + std::f64::consts::TAU * j as f64 / nodes as f64;
                 let jac = Self::mode_jacobians([lat, lon]);
                 let mut a = [[1.0_f64, 0.0], [0.0, 1.0]];
                 for (k, dv) in jac.iter().enumerate() {
@@ -1839,14 +1838,9 @@ pub fn sphere_isometry_flow_reparameterization(
 
     // ── Damped Gauss–Newton over the 3 boost coefficients ───────────────────
     let q = 3usize;
-    let Some(minimization) = sphere_minimize_boost_defect(
-        &ghat,
-        ghat_norm_sq,
-        row_coords,
-        q,
-        lat_lo,
-        lat_hi,
-    ) else {
+    let Some(minimization) =
+        sphere_minimize_boost_defect(&ghat, ghat_norm_sq, row_coords, q, lat_lo, lat_hi)
+    else {
         return Ok(None);
     };
     let theta = minimization.theta;
@@ -1866,8 +1860,7 @@ pub fn sphere_isometry_flow_reparameterization(
         for j in 0..axis_nodes {
             let idx = i * axis_nodes + j;
             let lat = lat_lo + (lat_hi - lat_lo) * i as f64 / (axis_nodes - 1) as f64;
-            let lon =
-                -std::f64::consts::PI + std::f64::consts::TAU * j as f64 / axis_nodes as f64;
+            let lon = -std::f64::consts::PI + std::f64::consts::TAU * j as f64 / axis_nodes as f64;
             grid[[idx, 0]] = lat;
             grid[[idx, 1]] = lon;
             let mapped = SphereBoostFlowBasis::map_point(&theta, [lat, lon]);

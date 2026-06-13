@@ -1482,10 +1482,7 @@ fn build_gaussian_mean_and_scale_blocks(
     // zero penalized dimensions. Trace-based rank is exact for a symmetric
     // idempotent matrix (rounded to the nearest integer to absorb floating-point
     // rounding in the eigendecomposition).
-    let shrinkage_rank = (0..p_noise)
-        .map(|i| shrinkage[[i, i]])
-        .sum::<f64>()
-        .round() as usize;
+    let shrinkage_rank = (0..p_noise).map(|i| shrinkage[[i, i]]).sum::<f64>().round() as usize;
     log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(shrinkage));
     let mut log_sigma_nullspace_dims = noise_design.nullspace_dims.clone();
     // The null-space projector penalizes a rank-`shrinkage_rank` subspace, so

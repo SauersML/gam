@@ -263,7 +263,12 @@ fn spherical_truth_recovers_positive_kappa_and_rejects_flat() {
     let inf = fit_and_infer(&feats, &y);
     eprintln!(
         "[spherical] κ̂={:.4} CI=[{:.4}, {:.4}] verdict={:?} flat_p={:.4} lr={:.4}",
-        inf.kappa_hat, inf.ci.ci_lo, inf.ci.ci_hi, inf.ci.verdict, inf.flatness.p_value, inf.flatness.lr_stat
+        inf.kappa_hat,
+        inf.ci.ci_lo,
+        inf.ci.ci_hi,
+        inf.ci.verdict,
+        inf.flatness.p_value,
+        inf.flatness.lr_stat
     );
     assert!(
         inf.kappa_hat > 0.0,
@@ -288,7 +293,12 @@ fn flat_truth_does_not_reject_flatness() {
     let inf = fit_and_infer(&feats, &y);
     eprintln!(
         "[flat] κ̂={:.4} CI=[{:.4}, {:.4}] verdict={:?} flat_p={:.4} lr={:.4}",
-        inf.kappa_hat, inf.ci.ci_lo, inf.ci.ci_hi, inf.ci.verdict, inf.flatness.p_value, inf.flatness.lr_stat
+        inf.kappa_hat,
+        inf.ci.ci_lo,
+        inf.ci.ci_hi,
+        inf.ci.verdict,
+        inf.flatness.p_value,
+        inf.flatness.lr_stat
     );
     // Correct size: flat data must NOT be spuriously called curved.
     assert!(
@@ -311,7 +321,12 @@ fn hyperbolic_truth_recovers_negative_kappa_and_rejects_flat() {
     let inf = fit_and_infer(&feats, &y);
     eprintln!(
         "[hyperbolic] κ̂={:.4} CI=[{:.4}, {:.4}] verdict={:?} flat_p={:.4} lr={:.4}",
-        inf.kappa_hat, inf.ci.ci_lo, inf.ci.ci_hi, inf.ci.verdict, inf.flatness.p_value, inf.flatness.lr_stat
+        inf.kappa_hat,
+        inf.ci.ci_lo,
+        inf.ci.ci_hi,
+        inf.ci.verdict,
+        inf.flatness.p_value,
+        inf.flatness.lr_stat
     );
     assert!(
         inf.kappa_hat < 0.0,

@@ -25,6 +25,7 @@
 //!      signal range AND strictly better than a deliberately-wrong
 //!      Gaussian-identity fit scored on the same eta-recovery metric.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::types::{InverseLink, ResponseColumnKind, ResponseFamily, StandardLink};
@@ -32,7 +33,6 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     resolve_family,
 };
-use csv::StringRecord;
 use ndarray::{Array2, array};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -239,10 +239,7 @@ fn auto_fit_on_counts_recovers_log_intensity() {
     // log-intensity estimate is log(mu). Guard the log against the identity
     // model's unconstrained (possibly non-positive) fitted mean.
     let gauss_mu: Vec<f64> = gauss_design.design.apply(&gauss_fit.fit.beta).to_vec();
-    let gauss_eta: Vec<f64> = gauss_mu
-        .iter()
-        .map(|m| m.max(1e-6).ln())
-        .collect();
+    let gauss_eta: Vec<f64> = gauss_mu.iter().map(|m| m.max(1e-6).ln()).collect();
 
     // Score both on centered eta-recovery (eta is identifiable up to an
     // additive constant; the SHAPE lives in the centered vector).

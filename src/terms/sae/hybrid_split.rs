@@ -337,8 +337,8 @@ mod tests {
             Some(0.0),
         )
         .expect("straight image yields a candidate pair");
-        let choice = crate::solver::evidence::select_hybrid_atom(&[linear, curved])
-            .expect("non-empty slot");
+        let choice =
+            crate::solver::evidence::select_hybrid_atom(&[linear, curved]).expect("non-empty slot");
         assert!(
             choice.param.is_linear(),
             "a straight image must keep the linear special case (Θ = 0 dominance floor)"
@@ -361,14 +361,9 @@ mod tests {
             decoded[[i, 1]] = theta.sin();
         }
         // Small curved parameter price so the curved candidate is competitive.
-        let (linear, curved) = build_atom_candidates(
-            coords.view(),
-            weights.view(),
-            decoded.view(),
-            6,
-            Some(PI),
-        )
-        .expect("turning image yields a candidate pair");
+        let (linear, curved) =
+            build_atom_candidates(coords.view(), weights.view(), decoded.view(), 6, Some(PI))
+                .expect("turning image yields a candidate pair");
         // Linear candidate must have a strictly positive data-fit residual: a
         // straight line cannot reconstruct a half circle.
         assert!(
@@ -376,8 +371,8 @@ mod tests {
                 || linear.negative_log_evidence.is_finite(),
             "linear candidate must carry a real deviance"
         );
-        let choice = crate::solver::evidence::select_hybrid_atom(&[linear, curved])
-            .expect("non-empty slot");
+        let choice =
+            crate::solver::evidence::select_hybrid_atom(&[linear, curved]).expect("non-empty slot");
         assert_eq!(
             choice.param,
             crate::solver::evidence::HybridAtomParam::Curved { latent_dim: 1 },

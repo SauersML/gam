@@ -16913,8 +16913,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                          per_block_resid=[{block_resid_sig}] H_pen: lambda_max={max_abs:.3e} lambda_min_abs={min_abs:.3e} \
                          cond={:.3e} resid_curvature(Rayleigh)={resid_curvature:.3e} resid_curv_over_lambda_max={:.3e} \
                          trust_radius={joint_trust_radius:.3e}",
-                        if min_abs > 0.0 { max_abs / min_abs } else { f64::INFINITY },
-                        if max_abs > 0.0 { resid_curvature / max_abs } else { f64::NAN },
+                        if min_abs > 0.0 {
+                            max_abs / min_abs
+                        } else {
+                            f64::INFINITY
+                        },
+                        if max_abs > 0.0 {
+                            resid_curvature / max_abs
+                        } else {
+                            f64::NAN
+                        },
                     );
                 }
             }
@@ -17090,8 +17098,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // objective to also be flat (`objective_change ≤ objective_tol`)
             // confirms we are AT the plateau, not one big step away from it.
             if objective_change <= objective_tol
-                && let Some(decrement) =
-                    joint_spectrum.as_ref().map(|spectrum| spectrum.newton_decrement())
+                && let Some(decrement) = joint_spectrum
+                    .as_ref()
+                    .map(|spectrum| spectrum.newton_decrement())
                 && decrement.is_finite()
                 && decrement <= objective_tol
             {

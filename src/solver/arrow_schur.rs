@@ -8406,7 +8406,11 @@ impl SaeResidentReducedSchur {
         if p == 0 || data.a_phi.len() != n || data.local_jac.len() != n {
             return None;
         }
-        let empty = || ResidentRowFactor { di: 0, l: Vec::new(), y: Vec::new() };
+        let empty = || ResidentRowFactor {
+            di: 0,
+            l: Vec::new(),
+            y: Vec::new(),
+        };
         let build_row = |row: usize| -> ResidentRowFactor {
             let di = sys.row_dims[row];
             let jac = &data.local_jac[row];
@@ -8429,16 +8433,19 @@ impl SaeResidentReducedSchur {
             // strides, so the hot loop can index `r*p + c` directly).
             let l_flat: Vec<f64> = l_i.iter().copied().collect();
             let y_flat: Vec<f64> = y.iter().copied().collect();
-            ResidentRowFactor { di, l: l_flat, y: y_flat }
+            ResidentRowFactor {
+                di,
+                l: l_flat,
+                y: y_flat,
+            }
         };
-        let rows: Vec<ResidentRowFactor> = if n >= SCHUR_MATVEC_PARALLEL_ROW_MIN
-            && rayon::current_thread_index().is_none()
-        {
-            use rayon::prelude::*;
-            (0..n).into_par_iter().map(build_row).collect()
-        } else {
-            (0..n).map(build_row).collect()
-        };
+        let rows: Vec<ResidentRowFactor> =
+            if n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
+                use rayon::prelude::*;
+                (0..n).into_par_iter().map(build_row).collect()
+            } else {
+                (0..n).map(build_row).collect()
+            };
         Some(Self {
             p,
             rows,
@@ -8594,7 +8601,15 @@ fn schur_matvec<B: BatchedBlockSolver + Sync>(
                 } else {
                     let mut local = Array1::<f64>::zeros(sys.d);
                     for i in idxs {
-                        schur_matvec_row_into(sys, htt_factors, x, backend, i, &mut local, &mut acc);
+                        schur_matvec_row_into(
+                            sys,
+                            htt_factors,
+                            x,
+                            backend,
+                            i,
+                            &mut local,
+                            &mut acc,
+                        );
                     }
                 }
                 acc
@@ -12098,8 +12113,24 @@ mod tests {
         // path must be bit-identical.
         let mut out_a = Array1::<f64>::zeros(k);
         let mut out_b = Array1::<f64>::zeros(k);
-        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_a, &backend, None);
-        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_b, &backend, None);
+        schur_matvec(
+            &sys,
+            &htt_factors,
+            ridge_beta,
+            &x,
+            &mut out_a,
+            &backend,
+            None,
+        );
+        schur_matvec(
+            &sys,
+            &htt_factors,
+            ridge_beta,
+            &x,
+            &mut out_b,
+            &backend,
+            None,
+        );
         for a in 0..k {
             assert_eq!(
                 out_a[a].to_bits(),
@@ -12172,11 +12203,27 @@ mod tests {
         let seq_elapsed = t_seq.elapsed();
 
         let mut out_par = Array1::<f64>::zeros(k);
-        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_par, &backend, None); // warm
+        schur_matvec(
+            &sys,
+            &htt_factors,
+            ridge_beta,
+            &x,
+            &mut out_par,
+            &backend,
+            None,
+        ); // warm
         sink += out_par[0];
         let t_par = std::time::Instant::now();
         for _ in 0..calls {
-            schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_par, &backend, None);
+            schur_matvec(
+                &sys,
+                &htt_factors,
+                ridge_beta,
+                &x,
+                &mut out_par,
+                &backend,
+                None,
+            );
             sink += out_par[0];
         }
         let par_elapsed = t_par.elapsed();
@@ -12333,7 +12380,15 @@ mod tests {
 
         // Generic path (no resident operator).
         let mut out_generic = Array1::<f64>::zeros(k);
-        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_generic, &backend, None);
+        schur_matvec(
+            &sys,
+            &htt_factors,
+            ridge_beta,
+            &x,
+            &mut out_generic,
+            &backend,
+            None,
+        );
 
         // Resident path: stage G_i once, then matvec.
         let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend)
@@ -12419,7 +12474,9 @@ mod tests {
             let g_dense = l.t().dot(&y); // p×p
 
             // A non-trivial gather vector g (length p).
-            let g_vec: Vec<f64> = (0..p).map(|j| 0.4 * ((row + j) as f64 * 0.11).sin() - 0.07).collect();
+            let g_vec: Vec<f64> = (0..p)
+                .map(|j| 0.4 * ((row + j) as f64 * 0.11).sin() - 0.07)
+                .collect();
             // Dense reference: prod_ref = G_i · g.
             let mut prod_ref = vec![0.0_f64; p];
             for r in 0..p {
@@ -12442,7 +12499,10 @@ mod tests {
                     prod[j] += lrow[j] * w[r];
                 }
             }
-            let scale = prod_ref.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+            let scale = prod_ref
+                .iter()
+                .fold(0.0_f64, |m, &v| m.max(v.abs()))
+                .max(1.0);
             for j in 0..p {
                 let rel = (prod[j] - prod_ref[j]).abs() / scale;
                 assert!(
@@ -12544,6 +12604,9 @@ mod tests {
             dense_f64 as f64 * 8.0 / (1024.0 * 1024.0),
             dense_f64 as f64 / factored_f64.max(1) as f64,
         );
-        assert!(gen_total > 0.0 && res_total > 0.0, "timings must be positive");
+        assert!(
+            gen_total > 0.0 && res_total > 0.0,
+            "timings must be positive"
+        );
     }
 }

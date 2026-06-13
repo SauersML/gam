@@ -556,8 +556,8 @@ fn cascade_beats_direct_solve_and_scales_near_linearly() {
     for &(n, seed) in &[(12_000usize, 0x1032_0F02_u64), (48_000, 0x1032_0F03)] {
         let (ax, yy, ww) = sample(2, n, 0.1, seed);
         let xr = axis_refs(&ax);
-        let d = ResidualCascadeDesign::build(&xr, &yy, &ww, &[1.0, 1.0], 2.0, levels)
-            .expect("build");
+        let d =
+            ResidualCascadeDesign::build(&xr, &yy, &ww, &[1.0, 1.0], 2.0, levels).expect("build");
         let warm = d.fit_at(log_lambda, None).expect("warm");
         assert!(
             warm.certificate.solve_rel_residual <= 1e-9,
