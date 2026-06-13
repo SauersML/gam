@@ -198,10 +198,73 @@ fn mat_inv(a: &Mat2, m: usize, what: &str) -> Result<Mat2, String> {
 }
 
 /// Inverse of a general dense `d × d` SPD matrix via Gauss–Jordan elimination
-/// with partial pivoting. Used once per fit by the leading-block diffuse
+/// with partial pivoting, symmetric diagonal (Jacobi) equilibration, and one
+/// iterative-refinement step. Used once per fit by the leading-block diffuse
 /// smoother (dimension `(order−1)·order ≤ 6`), so clarity over speed — it is
 /// NOT on the hot REML grid path (that runs only `run_filter`).
+///
+/// Equilibration matters at order `m ≥ 3`: the IWP process noise `Q(δ)` scales
+/// the `f^{(k)}` state components by `δ^{2m−1}` down to `δ`, so its inverse
+/// `(qQ)⁻¹` — and hence the leading-block precision `Λ` — spans many orders of
+/// magnitude (the f-component carries the `O(w)` observation term, the
+/// high-derivative components carry `O(1/(qδ^{2m−1}))` penalty mass). A bare
+/// Gauss–Jordan inverse of such a `Λ` loses `≈ ε·κ(Λ)` digits, which at heavy
+/// smoothing (small `q`) would corrupt the quintic's leading smoothed nodes.
+/// Rescaling to unit diagonal (`Λ̃ = SΛS`, `s_i = 1/√Λ_ii`) collapses that
+/// scale disparity before the elimination, then `Λ⁻¹ = S Λ̃⁻¹ S`.
 fn dense_spd_inverse(a: &[Vec<f64>], what: &str) -> Result<Vec<Vec<f64>>, String> {
+    let d = a.len();
+    // Jacobi equilibration scale s_i = 1/√Λ_ii (Λ SPD ⇒ Λ_ii > 0).
+    let s: Vec<f64> = (0..d)
+        .map(|i| {
+            let dii = a[i][i];
+            if dii.is_finite() && dii > 0.0 {
+                1.0 / dii.sqrt()
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    let a_s: Vec<Vec<f64>> = (0..d)
+        .map(|i| (0..d).map(|j| s[i] * a[i][j] * s[j]).collect())
+        .collect();
+    // Gauss–Jordan inverse of the equilibrated matrix.
+    let mut inv_s = gauss_jordan_inverse(&a_s, what)?;
+    // One iterative-refinement step against the equilibrated system:
+    // X ← X + X·(I − Λ̃·X), reducing the residual to near machine precision.
+    let mut resid = vec![vec![0.0_f64; d]; d]; // R = I − Λ̃·X
+    for i in 0..d {
+        for j in 0..d {
+            let mut ax = 0.0;
+            for k in 0..d {
+                ax += a_s[i][k] * inv_s[k][j];
+            }
+            resid[i][j] = f64::from(u8::from(i == j)) - ax;
+        }
+    }
+    let mut delta = vec![vec![0.0_f64; d]; d]; // ΔX = X·R
+    for i in 0..d {
+        for j in 0..d {
+            let mut acc = 0.0;
+            for k in 0..d {
+                acc += inv_s[i][k] * resid[k][j];
+            }
+            delta[i][j] = acc;
+        }
+    }
+    for i in 0..d {
+        for j in 0..d {
+            inv_s[i][j] += delta[i][j];
+        }
+    }
+    // Un-equilibrate: Λ⁻¹ = S·Λ̃⁻¹·S.
+    Ok((0..d)
+        .map(|i| (0..d).map(|j| s[i] * inv_s[i][j] * s[j]).collect())
+        .collect())
+}
+
+/// Gauss–Jordan inverse with partial pivoting (helper for `dense_spd_inverse`).
+fn gauss_jordan_inverse(a: &[Vec<f64>], what: &str) -> Result<Vec<Vec<f64>>, String> {
     let d = a.len();
     let mut aug = a.to_vec();
     let mut inv = vec![vec![0.0_f64; d]; d];
