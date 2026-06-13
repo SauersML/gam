@@ -4523,7 +4523,7 @@ impl SaeManifoldTerm {
         // Cache each row's assignment weights once, then subtract a single
         // atom's decoded contribution per LOAO pass instead of reassembling the
         // whole dictionary k times.
-        let mut weights: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut weights: Vec<Array1<f64>> = Vec::with_capacity(n);
         for row in 0..n {
             weights.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
         }
