@@ -333,11 +333,14 @@ impl SheafConsistencyPenalty {
     }
 
     /// Hessian diagonal `diag(weight · L)`. Independent of `s` because `L` is
-    /// constant. Each entry `i ∈ [stalk_offsets[v], stalk_offsets[v+1])`
-    /// gets contributions from every edge incident to `v`:
+    /// constant. For a **distinct-vertex** edge `(u, v)` (`u ≠ v`) the coboundary
+    /// `C = [R_uv | −R_vu]` acts on disjoint stalk blocks, so
     ///   * tail (u-side): `Σ_j R_uv[j, i_local]²`
-    ///   * head (v-side, single-restriction edges): `1.0` per incident edge
-    ///   * head (v-side, paired edges): `Σ_j R_vu[j, i_local]²`
+    ///   * head (v-side, single-restriction): `1.0` per incident edge
+    ///   * head (v-side, paired): `Σ_j R_vu[j, i_local]²`
+    /// For a **self-loop** edge `(u, u)` both sides share one block and the
+    /// coboundary collapses to `(R_uv − R_vu)·s_u`, so the correct contribution
+    /// is `colnorm²(R_uv − R_vu)` — NOT the sum of the two separate norms.
     pub fn hessian_diag(&self, s: ArrayView1<'_, f64>) -> Array1<f64> {
         assert_eq!(
             s.len(),
@@ -350,34 +353,69 @@ impl SheafConsistencyPenalty {
         let mut diag = Array1::<f64>::zeros(self.total_dim());
         for (e, &(u, v)) in self.edges.iter().enumerate() {
             let restriction = &self.restrictions[e];
-            // u-side: column i of R_uv squared, summed over rows.
             let u_start = self.stalk_offsets[u];
-            let r_uv = &restriction.r_uv;
-            for col in 0..r_uv.ncols() {
-                let mut s2 = 0.0;
-                for row in 0..r_uv.nrows() {
-                    let a = r_uv[[row, col]];
-                    s2 += a * a;
-                }
-                diag[u_start + col] += s2;
-            }
-            // v-side
             let v_start = self.stalk_offsets[v];
-            match &restriction.r_vu {
-                Some(r_vu) => {
-                    for col in 0..r_vu.ncols() {
-                        let mut s2 = 0.0;
-                        for row in 0..r_vu.nrows() {
-                            let a = r_vu[[row, col]];
-                            s2 += a * a;
+            let r_uv = &restriction.r_uv;
+
+            if u == v {
+                // Self-loop: δ(s)[e] = (R_uv − R_vu)·s_u, so the edge's
+                // contribution to diag(L) is colnorm²(R_uv − R_vu), NOT the
+                // sum of the two separate squared column norms (which would
+                // double-count on the shared stalk block). The distinct-vertex
+                // path below is not reached for self-loops.
+                match &restriction.r_vu {
+                    Some(r_vu) => {
+                        for col in 0..r_uv.ncols() {
+                            let mut s2 = 0.0;
+                            for row in 0..r_uv.nrows() {
+                                let diff = r_uv[[row, col]] - r_vu[[row, col]];
+                                s2 += diff * diff;
+                            }
+                            diag[u_start + col] += s2;
                         }
-                        diag[v_start + col] += s2;
+                    }
+                    None => {
+                        // r_vu = I; contribution is colnorm²(R_uv − I).
+                        let d = self.stalk_dims[u];
+                        for col in 0..d {
+                            let mut s2 = 0.0;
+                            for row in 0..r_uv.nrows() {
+                                let identity_entry = if row == col { 1.0 } else { 0.0 };
+                                let diff = r_uv[[row, col]] - identity_entry;
+                                s2 += diff * diff;
+                            }
+                            diag[u_start + col] += s2;
+                        }
                     }
                 }
-                None => {
-                    let d_v = self.stalk_dims[v];
-                    for col in 0..d_v {
-                        diag[v_start + col] += 1.0;
+            } else {
+                // Distinct-vertex path: u_start ≠ v_start, so u-side and v-side
+                // accumulations land on disjoint index ranges. Diagonal of Cᵀ C
+                // with C = [R_uv | −R_vu] decomposes cleanly into the two blocks.
+                for col in 0..r_uv.ncols() {
+                    let mut s2 = 0.0;
+                    for row in 0..r_uv.nrows() {
+                        let a = r_uv[[row, col]];
+                        s2 += a * a;
+                    }
+                    diag[u_start + col] += s2;
+                }
+                match &restriction.r_vu {
+                    Some(r_vu) => {
+                        for col in 0..r_vu.ncols() {
+                            let mut s2 = 0.0;
+                            for row in 0..r_vu.nrows() {
+                                let a = r_vu[[row, col]];
+                                s2 += a * a;
+                            }
+                            diag[v_start + col] += s2;
+                        }
+                    }
+                    None => {
+                        let d_v = self.stalk_dims[v];
+                        for col in 0..d_v {
+                            diag[v_start + col] += 1.0;
+                        }
                     }
                 }
             }
