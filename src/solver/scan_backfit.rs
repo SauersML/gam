@@ -152,12 +152,7 @@ fn row_knot_map(x: &[f64]) -> (Vec<usize>, usize) {
     (map, if started { knot + 1 } else { 0 })
 }
 
-fn validate_inputs(
-    xs: &[&[f64]],
-    y: &[f64],
-    w: &[f64],
-    orders: &[usize],
-) -> Result<(), String> {
+fn validate_inputs(xs: &[&[f64]], y: &[f64], w: &[f64], orders: &[usize]) -> Result<(), String> {
     let k = xs.len();
     if k == 0 {
         return Err("scan backfit: at least one term required".to_string());
@@ -414,8 +409,7 @@ fn finalize(
             }
             residual.push(y[i] - others);
         }
-        let fit =
-            fit_spline_scan_at(xs[j], &residual, w, log_lambdas[j], Some(sigma2), orders[j])?;
+        let fit = fit_spline_scan_at(xs[j], &residual, w, log_lambdas[j], Some(sigma2), orders[j])?;
         let (map, _) = &maps[j];
         // The component values stem from the storing sweep above; the refit on
         // the SAME residual at the SAME λ reproduces them bit-for-bit, so the
@@ -1038,7 +1032,11 @@ mod tests {
         let mut x2 = Vec::with_capacity(n);
         let mut x3 = Vec::with_capacity(n);
         let mut y = Vec::with_capacity(n);
-        let mut t = vec![Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
+        let mut t = vec![
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        ];
         let w = vec![1.0_f64; n];
         for _ in 0..n {
             let u1 = lcg_noise(&mut state) + 0.5;

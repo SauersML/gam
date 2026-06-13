@@ -264,8 +264,7 @@ fn scan_routed_observation_interval_matches_dense_predictive_band() {
 
     // Same z the FFI scan arm uses (two-sided 95%).
     let level = 0.95_f64;
-    let z = gam::probability::standard_normal_quantile(0.5 + level * 0.5)
-        .expect("normal quantile");
+    let z = gam::probability::standard_normal_quantile(0.5 + level * 0.5).expect("normal quantile");
     assert!(fit.sigma2 > 0.0, "profiled σ² must be strictly positive");
 
     for t in 0..fit.knots.len() {

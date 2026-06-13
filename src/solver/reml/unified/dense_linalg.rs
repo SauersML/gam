@@ -76,7 +76,11 @@ pub(crate) fn dense_transpose_matvec_scaled_add_into(
 }
 
 #[inline]
-pub(crate) fn dense_bilinear(matrix: &Array2<f64>, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
+pub(crate) fn dense_bilinear(
+    matrix: &Array2<f64>,
+    v: ArrayView1<'_, f64>,
+    u: ArrayView1<'_, f64>,
+) -> f64 {
     assert_eq!(matrix.ncols(), v.len());
     assert_eq!(matrix.nrows(), u.len());
     let mut total = 0.0;
@@ -86,7 +90,10 @@ pub(crate) fn dense_bilinear(matrix: &Array2<f64>, v: ArrayView1<'_, f64>, u: Ar
     total
 }
 
-pub(crate) fn design_matrix_apply_view(design: &DesignMatrix, vector: ArrayView1<'_, f64>) -> Array1<f64> {
+pub(crate) fn design_matrix_apply_view(
+    design: &DesignMatrix,
+    vector: ArrayView1<'_, f64>,
+) -> Array1<f64> {
     let mut output = Array1::<f64>::zeros(design.nrows());
     design_matrix_apply_view_into(design, vector, output.view_mut());
     output

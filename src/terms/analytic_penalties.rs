@@ -9817,11 +9817,7 @@ mod tests {
             }
         }
         let v = array![0.2_f64, -0.5, 0.7, -0.3];
-        let hv = pen.hvp(
-            Array1::from_vec(full.clone()).view(),
-            rho.view(),
-            v.view(),
-        );
+        let hv = pen.hvp(Array1::from_vec(full.clone()).view(), rho.view(), v.view());
         for i in 0..4 {
             let acc: f64 = (0..4).map(|j| h[[i, j]] * v[j]).sum();
             assert_abs_diff_eq!(acc, hv[i], epsilon = 1e-9);
@@ -9926,9 +9922,8 @@ mod tests {
                     if i == j {
                         continue;
                     }
-                    let analytic = ch.cross_row_d[col]
-                        * ch.z_jac[i * k + col]
-                        * ch.z_jac[j * k + col];
+                    let analytic =
+                        ch.cross_row_d[col] * ch.z_jac[i * k + col] * ch.z_jac[j * k + col];
                     let fd = mixed_fd(i * k + col, j * k + col);
                     let err = (analytic - fd).abs();
                     if err > max_err {

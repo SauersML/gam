@@ -889,7 +889,9 @@ impl GridSpline2dFit {
                     cells + 3
                 ));
             }
-            if !(state.axis_lo[a].is_finite() && state.axis_h[a].is_finite() && state.axis_h[a] > 0.0)
+            if !(state.axis_lo[a].is_finite()
+                && state.axis_h[a].is_finite()
+                && state.axis_h[a] > 0.0)
             {
                 return Err(format!(
                     "grid spline 2d state: axis {a} must have finite lo and positive h, got lo={}, h={}",

@@ -1609,8 +1609,12 @@ pub fn sphere_chart_isometry_defect(
     // extraction to the torus / patch paths (axis 0 = lat, axis 1 = lon), via
     // the shared helper. The sphere reference below differs (diag(1, cos²lat)
     // vs flat I), so only the extraction is shared, not the normalization.
-    let Some((g_rows, g_bar)) =
-        extract_pullback_metric_d2("sphere_chart_isometry_defect", evaluator, decoder, row_coords)?
+    let Some((g_rows, g_bar)) = extract_pullback_metric_d2(
+        "sphere_chart_isometry_defect",
+        evaluator,
+        decoder,
+        row_coords,
+    )?
     else {
         return Ok(None);
     };

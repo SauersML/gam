@@ -320,7 +320,13 @@ mod tests {
         design.t().dot(&wd)
     }
 
-    fn exact_weighted_xty(psi: f64, n: usize, k: usize, w: &Array1<f64>, z: &Array1<f64>) -> Array1<f64> {
+    fn exact_weighted_xty(
+        psi: f64,
+        n: usize,
+        k: usize,
+        w: &Array1<f64>,
+        z: &Array1<f64>,
+    ) -> Array1<f64> {
         let design = synth_design(psi, n, k).unwrap();
         let mut out = Array1::<f64>::zeros(k);
         for i in 0..n {
@@ -352,7 +358,10 @@ mod tests {
             assert!(tensor.contains(psi));
             let assembled = tensor.gram_at(psi);
             let exact = exact_weighted_gram(psi, n, k, &w);
-            let scale = exact.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-300);
+            let scale = exact
+                .iter()
+                .fold(0.0_f64, |a, &v| a.max(v.abs()))
+                .max(1e-300);
             for (a, b) in assembled.iter().zip(exact.iter()) {
                 assert!(
                     (a - b).abs() <= 1e-9 * scale,
@@ -363,7 +372,10 @@ mod tests {
 
             let rhs = tensor.rhs_at(psi);
             let exact_rhs = exact_weighted_xty(psi, n, k, &w, &z);
-            let rscale = exact_rhs.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-300);
+            let rscale = exact_rhs
+                .iter()
+                .fold(0.0_f64, |a, &v| a.max(v.abs()))
+                .max(1e-300);
             for (a, b) in rhs.iter().zip(exact_rhs.iter()) {
                 assert!(
                     (a - b).abs() <= 1e-9 * rscale,
@@ -453,45 +465,53 @@ mod tests {
         let z = working_z(n);
 
         // Empty weights → None.
-        assert!(FrozenWeightGramTensor::build(
-            |psi| synth_design(psi, n, k),
-            Array1::<f64>::zeros(0).view(),
-            Array1::<f64>::zeros(0).view(),
-            -0.3,
-            0.3,
-        )
-        .is_none());
+        assert!(
+            FrozenWeightGramTensor::build(
+                |psi| synth_design(psi, n, k),
+                Array1::<f64>::zeros(0).view(),
+                Array1::<f64>::zeros(0).view(),
+                -0.3,
+                0.3,
+            )
+            .is_none()
+        );
 
         // Negative weight → None (not a valid Fisher weight).
         let mut w_neg = w.clone();
         w_neg[1] = -0.1;
-        assert!(FrozenWeightGramTensor::build(
-            |psi| synth_design(psi, n, k),
-            w_neg.view(),
-            z.view(),
-            -0.3,
-            0.3,
-        )
-        .is_none());
+        assert!(
+            FrozenWeightGramTensor::build(
+                |psi| synth_design(psi, n, k),
+                w_neg.view(),
+                z.view(),
+                -0.3,
+                0.3,
+            )
+            .is_none()
+        );
 
         // Mismatched z length → None.
-        assert!(FrozenWeightGramTensor::build(
-            |psi| synth_design(psi, n, k),
-            w.view(),
-            Array1::<f64>::zeros(n - 1).view(),
-            -0.3,
-            0.3,
-        )
-        .is_none());
+        assert!(
+            FrozenWeightGramTensor::build(
+                |psi| synth_design(psi, n, k),
+                w.view(),
+                Array1::<f64>::zeros(n - 1).view(),
+                -0.3,
+                0.3,
+            )
+            .is_none()
+        );
 
         // Degenerate window → None.
-        assert!(FrozenWeightGramTensor::build(
-            |psi| synth_design(psi, n, k),
-            w.view(),
-            z.view(),
-            0.3,
-            0.3,
-        )
-        .is_none());
+        assert!(
+            FrozenWeightGramTensor::build(
+                |psi| synth_design(psi, n, k),
+                w.view(),
+                z.view(),
+                0.3,
+                0.3,
+            )
+            .is_none()
+        );
     }
 }

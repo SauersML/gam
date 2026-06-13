@@ -10029,8 +10029,8 @@ fn murphy_topel_test_calibration() -> LatentZConditionalCalibration {
     // Mean-and-variance conditional calibration over a single conditioning
     // covariate a(C) (basis_ncols = 1), so θ₁ = (mean_coeffs[2], var_coeffs[2]).
     LatentZConditionalCalibration {
-        mean_coeffs: vec![0.1, 0.4],   // m(C) = 0.1 + 0.4·a
-        var_coeffs: vec![1.2, 0.3],    // v(C) = max(1.2 + 0.3·a, floor)
+        mean_coeffs: vec![0.1, 0.4], // m(C) = 0.1 + 0.4·a
+        var_coeffs: vec![1.2, 0.3],  // v(C) = max(1.2 + 0.3·a, floor)
         basis_ncols: 1,
         var_floor: 0.05,
         global_var: 1.0,
@@ -10253,10 +10253,8 @@ fn score_zeta_sensitivity_equals_jacobian_transpose_of_mixed_z_partial() {
     let n = 4usize;
     let p_m = 2usize;
     let r = 2usize;
-    let marginal_design =
-        ndarray::array![[1.0, 0.3], [1.0, -0.6], [1.0, 0.9], [1.0, -0.2]];
-    let logslope_design =
-        ndarray::array![[0.4, -0.1], [0.7, 0.2], [-0.3, 0.8], [0.5, -0.5]];
+    let marginal_design = ndarray::array![[1.0, 0.3], [1.0, -0.6], [1.0, 0.9], [1.0, -0.2]];
+    let logslope_design = ndarray::array![[0.4, -0.1], [0.7, 0.2], [-0.3, 0.8], [0.5, -0.5]];
     let marginal_eta = ndarray::array![0.2, -0.5, 0.7, -0.1];
     let slope_eta = ndarray::array![0.3, 0.8, -0.4, 1.1];
     let z = ndarray::array![0.6, -0.9, 0.25, 1.3];
@@ -10324,7 +10322,10 @@ fn score_zeta_sensitivity_equals_jacobian_transpose_of_mixed_z_partial() {
         .generated_regressor_correction(
             s.view(),
             z.view(),
-            marginal_design.slice(ndarray::s![.., 1..]).to_owned().view(),
+            marginal_design
+                .slice(ndarray::s![.., 1..])
+                .to_owned()
+                .view(),
             vb.view(),
         )
         .expect("assemble correction");
@@ -10448,9 +10449,7 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
 
     for _ in 0..reps {
         // --- draw z with a genuine conditional mean shift on C ---
-        let z = Array1::from_iter(
-            (0..n).map(|i| gamma * c[i] + z_noise_sd * rng.next_normal()),
-        );
+        let z = Array1::from_iter((0..n).map(|i| gamma * c[i] + z_noise_sd * rng.next_normal()));
         let weights = Array1::ones(n);
 
         // --- STAGE 1: production conditional location calibration (the gate) ---
@@ -10463,9 +10462,7 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
 
         // --- STAGE 2: Gaussian slope on the generated regressor ζ ---
         // y = β·ζ + ε, ε ~ N(0,σ²).
-        let y = Array1::from_iter(
-            (0..n).map(|i| beta_true * zeta[i] + sigma * rng.next_normal()),
-        );
+        let y = Array1::from_iter((0..n).map(|i| beta_true * zeta[i] + sigma * rng.next_normal()));
         let s_zz: f64 = zeta.iter().map(|&z| z * z).sum();
         let s_zy: f64 = zeta.iter().zip(y.iter()).map(|(&z, &yy)| z * yy).sum();
         let beta_hat = s_zy / s_zz;

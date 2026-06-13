@@ -225,7 +225,11 @@ fn fitted_competing_risks_total_probability_identity_holds_across_time_grid() {
 
     let assembled = assemble_competing_risks_cif(times.view(), cumulative.view())
         .expect("assemble fitted competing-risks CIF");
-    assert_eq!(assembled.cif.len(), cause_count, "one CIF surface per cause");
+    assert_eq!(
+        assembled.cif.len(),
+        cause_count,
+        "one CIF surface per cause"
+    );
     assert_eq!(
         assembled.overall_survival.dim(),
         (n, n_times),
