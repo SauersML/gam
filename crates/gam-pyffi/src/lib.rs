@@ -26475,7 +26475,7 @@ fn generative_replicates_impl(
         gam::types::ResponseFamily::Tweedie { .. } => {
             fit.likelihood_scale.fixed_phi().or(Some(1.0))
         }
-        gam::types::ResponseFamily::NegativeBinomial { theta } => Some(*theta),
+        gam::types::ResponseFamily::NegativeBinomial { theta, .. } => Some(*theta),
         gam::types::ResponseFamily::Beta { phi } => {
             fit.likelihood_scale.fixed_phi().or(Some(*phi))
         }
