@@ -862,3 +862,53 @@ fn smoothness_ceiling_forces_refinement_and_certifies_residual_bias() {
         "refinement failed to resolve the high-frequency truth: rmse {rmse}"
     );
 }
+
+/// Quasi-uniformity guard gate (#1032, caveat 2). The BPX n-independent CG
+/// iteration bound rests on the metric-scaled net being quasi-uniform; a
+/// near-degenerate metric (the cloud collapsed onto a sheet in `z`) breaks it.
+/// The guard must DETECT this from the metric-scaled aspect ratio up front and
+/// refuse the iterative solve — so the auto-route falls back to the dense
+/// kernel BEFORE paying an unbounded CG — while leaving the well-conditioned
+/// (isotropic) case certified. We assert both directions: the benign metric
+/// certifies and fits; the collapsed metric is rejected by the guard.
+#[test]
+fn quasi_uniformity_guard_rejects_degenerate_metric_keeps_benign() {
+    let (axes, y, w) = sample(2, 1200, 0.05, 0xCA5_CADE);
+    let xs = axis_refs(&axes);
+
+    // Benign: an isotropic unit metric leaves the cloud quasi-uniform in z.
+    let design_ok = ResidualCascadeDesign::build(&xs, &y, &w, &[1.0, 1.0], 2.0, 2)
+        .expect("benign design build");
+    assert!(
+        design_ok.quasi_uniformity_certified(),
+        "isotropic unit metric must certify; aspect_ratio={}",
+        design_ok.metric_scaled_aspect_ratio()
+    );
+    assert!(
+        design_ok.metric_scaled_aspect_ratio() < 5.0,
+        "unit-metric uniform cloud should be nearly isotropic, got aspect_ratio={}",
+        design_ok.metric_scaled_aspect_ratio()
+    );
+    // The full magic-default fit succeeds on the benign metric.
+    fit_residual_cascade(&xs, &y, &w, &[1.0, 1.0], 2.0).expect("benign cascade fit");
+
+    // Degenerate: scale axis 1 down by 1e5, collapsing the metric-scaled cloud
+    // onto axis 0. The aspect ratio blows past the ceiling and the guard fires.
+    let collapse = [1.0, 1.0e-5];
+    let design_bad = ResidualCascadeDesign::build(&xs, &y, &w, &collapse, 2.0, 2)
+        .expect("degenerate design still builds (the guard, not build, rejects)");
+    assert!(
+        !design_bad.quasi_uniformity_certified(),
+        "a 1e5-anisotropic metric must FAIL the quasi-uniformity certificate; \
+         aspect_ratio={}",
+        design_bad.metric_scaled_aspect_ratio()
+    );
+    // The full magic-default fit refuses the degenerate metric with the guard
+    // message (the auto-route reads this as "fall back to dense").
+    let err = fit_residual_cascade(&xs, &y, &w, &collapse, 2.0)
+        .expect_err("degenerate metric must be refused by the quasi-uniformity guard");
+    assert!(
+        err.contains("quasi-uniformity"),
+        "expected the quasi-uniformity guard to reject, got: {err}"
+    );
+}
