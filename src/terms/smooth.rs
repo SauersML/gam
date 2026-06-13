@@ -3271,17 +3271,14 @@ fn measure_jet_term_spec(
 /// `spatial_term_uses_per_axis_psi` both defer here so the θ-layout
 /// sources cannot disagree.
 fn measure_jet_enrolls_psi(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
-    // ψ dials enroll in BOTH modes (#1041): Matérn/Duchon get their
-    // length-scale REML-learned through the spatial-joint loop, so a
-    // SIMPLE-mode measure-jet term with frozen dials competes with a
-    // learned-bandwidth baseline and systematically under-fits (measured
-    // 1.68× truth-RMSE vs matern on the parity fixture). What rides the RICH
-    // center-count threshold is only the per-scale spectral SPLIT — the
-    // design-width multiplication that was #1039's profiled cost. SIMPLE mode
-    // keeps the single fused penalty (width 1×k, Duchon/Matérn's footprint)
-    // while learning the fused `(s, α, lnτ)` dials. The lnτ channel needs a
-    // positive ridge because the retained coordinate is ln τ.
-    mj.tau0 > 0.0
+    // ψ dials ride RICH mode only: the per-scale spectral split and the
+    // (α, lnτ) dials are auto-enabled together, at the same center-count
+    // threshold the basis builder uses (single source: `measure_jet_rich_mode`).
+    // SIMPLE-mode terms (small center counts, or a pinned explicit order)
+    // stay at one fused penalty with fixed dials — Duchon/Matérn's outer
+    // footprint — so they never inflate the family's O(n) per-row evaluation
+    // count (#1039). The lnτ channel additionally needs a positive ridge.
+    mj.tau0 > 0.0 && measure_jet_term_enrolls_rich(mj)
 }
 
 /// Realized RICH-mode decision for a measure-jet spec, resolving the center
@@ -3302,14 +3299,11 @@ const MEASURE_JET_PSI_S_BOUNDS: (f64, f64) = (0.05, 1.95);
 const MEASURE_JET_PSI_ALPHA_BOUNDS: (f64, f64) = (-1.0, 3.0);
 const MEASURE_JET_PSI_LN_TAU_BOUNDS: (f64, f64) = (-18.420680743952367, 4.605170185988092);
 
-/// Is this measure-jet term in fused mode? Builder-aligned single source: a
-/// term is fused exactly when it is NOT rich-realized (`measure_jet_rich_mode`
-/// over the realized center count). The old `order_s > 0` proxy diverged from
-/// the builder on auto-order SIMPLE terms (`order_s == 0`, small centers):
-/// the build was fused while the ψ layout said spectral — the inconsistency
-/// that forced SIMPLE mode to disable dials entirely (#1041).
+/// Is this measure-jet term in fused (pinned-order) mode? The `order_s`
+/// sentinel is the spectral/fused mode marker (see the basis module docs).
+/// Only consulted for terms that enroll ψ (RICH mode), where `order_s == 0`.
 fn measure_jet_is_fused(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
-    !measure_jet_term_enrolls_rich(mj)
+    mj.order_s > 0.0
 }
 
 /// ψ dimension of a measure-jet term: fused mode carries (s, α, lnτ);
@@ -3320,18 +3314,11 @@ fn measure_jet_psi_dim(mj: &crate::basis::MeasureJetBasisSpec) -> usize {
     if measure_jet_is_fused(mj) { 3 } else { 2 }
 }
 
-/// Seed ψ from the term's realized dials, in producer coordinate order. The
-/// `s` seed uses the REALIZED order (auto-sentinel `order_s == 0` resolves to
-/// the builder's default), never the raw spec value — seeding `s = 0` would
-/// start outside the admissible order box.
+/// Seed ψ from the term's realized dials, in producer coordinate order.
 fn measure_jet_psi_seed(mj: &crate::basis::MeasureJetBasisSpec) -> Vec<f64> {
     let ln_tau = mj.tau0.max(f64::MIN_POSITIVE).ln();
     if measure_jet_is_fused(mj) {
-        vec![
-            crate::basis::measure_jet_realized_order_s(mj),
-            mj.alpha,
-            ln_tau,
-        ]
+        vec![mj.order_s, mj.alpha, ln_tau]
     } else {
         vec![mj.alpha, ln_tau]
     }
