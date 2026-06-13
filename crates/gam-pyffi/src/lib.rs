@@ -26384,7 +26384,7 @@ fn generative_replicates(
     n_draws: usize,
     seed: u64,
 ) -> PyResult<PyObject> {
-    let result = py.allow_threads(|| {
+    let result = py.detach(|| {
         generative_replicates_impl(&model_bytes, headers, rows, n_draws, seed)
     });
     match result {
