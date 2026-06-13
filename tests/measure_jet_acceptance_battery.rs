@@ -1,7 +1,7 @@
 //! V∞ estimand-level acceptance battery (docs/measure_jet_v_infinity.md §7),
 //! landed against the CURRENT public measure-jet surface
 //! (`gam::basis::measure_jet_*`). These gates restate the charter's §7
-//! contracts as properties of the SHIPPED V0/SIMPLE realization — they do not
+//! contracts as properties of the SHIPPED V0/single-scale realization — they do not
 //! wait for the unlanded jet-frame basis (charter §8 slice 4). Every bound is
 //! a principled ceiling derived below from the energy/variance structure, not
 //! a tuned threshold, and the geometry is fully deterministic (no RNG).
@@ -10,7 +10,7 @@
 //!
 //!  §7.1 — exact affine pass-through at the DEFAULT settings
 //!         (`exact_affine_passes_through_at_default_tau`). The realized term
-//!         today is the SIMPLE/RICH energy of `measure_jet_energy_form`, not
+//!         today is the single-scale/multiscale energy of `measure_jet_energy_form`, not
 //!         the §1 unpenalized-head frame basis, so machine-exact affine
 //!         pass-through requires that future frame block. The strongest
 //!         property the current energy gives is asserted: an ambient-affine
@@ -29,8 +29,8 @@
 //!         `build_measure_jet_basis` geometry and the public
 //!         `measure_jet_support_curve` / `measure_jet_extrapolation_variance`.
 //!
-//!  §7.3 — near-miss strand decoupling, re-verified under the SIMPLE-mode
-//!         default (`near_miss_decoupling_holds_in_simple_mode`): two parallel
+//!  §7.3 — near-miss strand decoupling, re-verified under the single-scale-mode
+//!         default (`near_miss_decoupling_holds_in_single_scale_mode`): two parallel
 //!         strands at a near-miss separation pay at most the τ-ridge toll for
 //!         the cross-strand value offset — ≤ 1e-2× the checkerboard energy —
 //!         because the offset is ambient-affine on the support.
@@ -282,11 +282,11 @@ fn support_domination_variance_monotone() {
 }
 
 // ===========================================================================
-// Gate §7.3 — near-miss strand decoupling under the SIMPLE-mode default.
+// Gate §7.3 — near-miss strand decoupling under the single-scale-mode default.
 // ===========================================================================
 
-/// Centers per parallel strand (kept well under the RICH-mode threshold of 64
-/// so the SIMPLE-mode default energy is exercised).
+/// Centers per parallel strand (kept well under the multiscale-mode threshold of 64
+/// so the single-scale-mode default energy is exercised).
 const NM_M1: usize = 20;
 /// Along-strand center spacing.
 const NM_H: f64 = 0.25;
@@ -319,14 +319,14 @@ fn parallel_strand_centers() -> (Array2<f64>, Array1<f64>) {
 }
 
 /// §7.3. Two parallel strands at a near-miss separation, evaluated with the
-/// SIMPLE-mode default energy (default τ = 1e-3). The cross-strand two-level
+/// single-scale-mode default energy (default τ = 1e-3). The cross-strand two-level
 /// offset (c1 on strand 1, c2 on strand 2) equals the ambient-affine function
 /// c1 + (c2−c1)·y/δ on the support {y = 0} ∪ {y = δ}, so it lives in the local
 /// affine span and the energy charges it only the τ-ridge toll — ≤ 1e-2× the
 /// checkerboard energy, which pays the full multiscale residual. Re-verifies
 /// the §7.3 affine-order decoupling under the new default.
 #[test]
-fn near_miss_decoupling_holds_in_simple_mode() {
+fn near_miss_decoupling_holds_in_single_scale_mode() {
     let (centers, masses) = parallel_strand_centers();
     let m = 2 * NM_M1;
     let band = measure_jet_band(centers.view(), 0).expect("auto band over parallel strands");
@@ -351,7 +351,7 @@ fn near_miss_decoupling_holds_in_simple_mode() {
         if parity % 2 == 0 { 1.0 } else { -1.0 }
     });
 
-    // SIMPLE-mode default τ: only the affine-order ridge toll may survive.
+    // single-scale-mode default τ: only the affine-order ridge toll may survive.
     let q_default = measure_jet_energy_form(
         centers.view(),
         masses.view(),
@@ -374,12 +374,12 @@ fn near_miss_decoupling_holds_in_simple_mode() {
     );
     assert!(
         e_offset <= NM_DECOUPLE_RATIO * e_checker,
-        "parallel-strand value offset is not decoupled at affine order in SIMPLE mode: \
+        "parallel-strand value offset is not decoupled at affine order in single-scale mode: \
          vᵀQv = {e_offset:.3e} vs {NM_DECOUPLE_RATIO:.0e} × checkerboard {e_checker:.3e}"
     );
 
     // τ = 0 floor check: the offset lives EXACTLY in the local affine span, so
-    // the SIMPLE-mode coupling above is genuinely the ridge toll, not a small
+    // the single-scale-mode coupling above is genuinely the ridge toll, not a small
     // residual that happens to clear the ratio.
     let q_unridged =
         measure_jet_energy_form(centers.view(), masses.view(), &band, ORDER_S, ALPHA, 0.0)

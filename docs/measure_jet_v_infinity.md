@@ -14,15 +14,15 @@ Moment tables feed exactly the frozen-weight polynomial couplings they store;
 moving Gaussian transforms such as support curves and Gaussian Gram products
 are separate kernel evaluations or controlled approximations.
 
-**Realized default today (the SIMPLE/RICH auto-split, #1039).** The shipped
+**Realized default today (the single-scale/multiscale auto-split, #1039).** The shipped
 V0 term auto-selects its outer footprint from the realized center count
-(`measure_jet_rich_mode`): below ~64 centers it runs SIMPLE — one fused
+(`measure_jet_multiscale_mode`): below ~64 centers it runs single-scale — one fused
 jet-energy penalty at the auto order, no `(s, α, lnτ)` ψ dials, the same
 one-λ outer footprint as Duchon/Matérn (Duchon-class cost). The per-scale
-spectral split and the ψ dials described below are the RICH-mode
+spectral split and the ψ dials described below are the multiscale-mode
 realization, auto-enabled only at large center counts where a spectrum is
-identifiable. The per-level candidate structure is the RICH realization, not
-a universal default; the V∞ frame below generalizes the RICH path.
+identifiable. The per-level candidate structure is the multiscale realization, not
+a universal default; the V∞ frame below generalizes the multiscale path.
 
 ## 1. Function space: the jet frame is the model
 
@@ -37,8 +37,8 @@ a universal default; the V∞ frame below generalizes the RICH path.
   exact ambient-affine pass-through: penalties price innovations, never the
   trend. Kills the old O(τ) affine toll structurally.
 - Prior diagonal by coordinates: independent whitened innovations,
-  per-level variances λ_ℓ⁻¹ (the RICH per-scale-candidate mode made
-  structural; the SIMPLE default fuses these into one penalty — see the
+  per-level variances λ_ℓ⁻¹ (the multiscale per-scale-candidate mode made
+  structural; the single-scale default fuses these into one penalty — see the
   auto-split note above).
 - License: frame equivalence A·J_s ≤ Σ_ℓ ε_ℓ^{−2s}‖d_ℓ‖² ≤ B·J_s, with A, B
   ESTIMATED at runtime (Lanczos probes on the whitened operator) — every
@@ -160,8 +160,8 @@ and interval become one statement.
 3. §5 extrapolation-variance seam: pure function + predict-side wiring
    plan; fuse when the frame basis lands.
 4. Jet-frame basis mode (per-level nets → atoms, lifting, unpenalized
-   head) behind the same `mjs()` surface; the RICH per-level candidates
-   become the structural diagonal (the SIMPLE default stays one fused
+   head) behind the same `mjs()` surface; the multiscale per-level candidates
+   become the structural diagonal (the single-scale default stays one fused
    penalty); V0 representer path retired the moment the frame path passes
    every existing gate (no parallel layers kept).
 5. Arrow/Schur whitened solver wiring; spectral identities; certificates.
