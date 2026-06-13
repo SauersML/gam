@@ -30,6 +30,7 @@ use pyo3::types::PyDict;
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 
 use gam::inference::lawley::{RowExpectedJets, RowKappas, lawley_lr_bartlett_factor};
+use gam::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use gam::inference::structure_evidence::{
     AtomBirthGate, GateVerdict, e_benjamini_hochberg, log_e_from_p_calibrator,
     split_likelihood_log_e_value,
@@ -282,6 +283,164 @@ pub(crate) fn lawley_bartlett_factor<'py>(
     Ok(out)
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// #1055 — Riesz-representer debiased functional
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Resolve a named estimand + its design payload into the linear functional
+/// gradient `g = dθ/dβ` consumed by the Riesz representer.
+///
+/// `target` selects one of the closed-form Layer-1 functionals of
+/// [`SmoothFunctional`]:
+/// * `"point"` — `m(x₀)`: needs `design_row` (the prediction row at `x₀`).
+/// * `"contrast"` — `m(x_a) − m(x_b)`: needs `design_row` (= `x_a`) and
+///   `design_row_b` (= `x_b`).
+/// * `"average_derivative"` — `mean_i w_i · ∂m(x_i)/∂x_j`: needs
+///   `design_matrix` (the derivative-basis rows) and optional `weights`.
+/// * `"average_value"` — `mean_i w_i · m(x_i)`: needs `design_matrix` (the
+///   value-basis rows) and optional `weights`.
+/// * `"linear"` — a caller-supplied functional gradient directly in
+///   `design_row`.
+fn riesz_functional_gradient(
+    target: &str,
+    design_row: Option<&Array1<f64>>,
+    design_row_b: Option<&Array1<f64>>,
+    design_matrix: Option<&ndarray::Array2<f64>>,
+    weights: Option<&Array1<f64>>,
+) -> PyResult<Array1<f64>> {
+    let need_row = |name: &str, value: Option<&Array1<f64>>| {
+        value.ok_or_else(|| {
+            py_value_error(format!(
+                "debiased_functional: target {target:?} requires `{name}`"
+            ))
+        })
+    };
+    let functional = match target {
+        "point" => SmoothFunctional::PointEvaluation {
+            design_row: need_row("design_row", design_row)?.view(),
+        },
+        "linear" => SmoothFunctional::Linear {
+            gradient: need_row("design_row", design_row)?.view(),
+        },
+        "contrast" => SmoothFunctional::Contrast {
+            design_row_a: need_row("design_row", design_row)?.view(),
+            design_row_b: need_row("design_row_b", design_row_b)?.view(),
+        },
+        "average_derivative" => {
+            let rows = design_matrix.ok_or_else(|| {
+                py_value_error(
+                    "debiased_functional: target \"average_derivative\" requires `design_matrix`",
+                )
+            })?;
+            SmoothFunctional::AverageDerivative {
+                derivative_design: rows.view(),
+                weights: weights.map(|w| w.view()),
+            }
+        }
+        "average_value" => {
+            let rows = design_matrix.ok_or_else(|| {
+                py_value_error(
+                    "debiased_functional: target \"average_value\" requires `design_matrix`",
+                )
+            })?;
+            SmoothFunctional::AverageValue {
+                value_design: rows.view(),
+                weights: weights.map(|w| w.view()),
+            }
+        }
+        other => {
+            return Err(py_value_error(format!(
+                "debiased_functional: unknown target {other:?}; expected one of \
+                 \"point\", \"contrast\", \"average_derivative\", \"average_value\", \"linear\""
+            )));
+        }
+    };
+    functional.gradient().map_err(py_value_error)
+}
+
+/// Riesz-representer debiased / Neyman-orthogonal estimate of a smooth
+/// functional of a fitted model (issue #1055). This surfaces the previously
+/// unreachable `src/inference/riesz.rs` engine: the orthogonal correction is
+/// always on (it strictly improves coverage under regularization), so there is
+/// no flag.
+///
+/// The debiasing solves the Riesz representer `α = H⁻¹ g` against the *penalized*
+/// fitted Hessian `H`, returns the penalty-debiased one-step estimate
+/// `θ̂ = gᵀβ̂ + αᵀ(S β̂)`, and the influence-function plug-in standard error
+/// `SE = sd(ψ)/√n` with `ψ_i = −n·s_iᵀα` (own-observation removed analytically
+/// when `leverage` is supplied).
+///
+/// Inputs (all in the fitted coefficient basis):
+/// * `beta` — fitted coefficients `β̂` (length `p`).
+/// * `penalized_hessian` — the `p × p` penalized fitted Hessian `H` (SPD).
+/// * `row_scores` — per-row score contributions `s_i = ∂nll_i/∂β` (`n × p`).
+/// * `penalty_beta` — penalty gradient `S β̂` (length `p`).
+/// * `target` — the named estimand (see [`riesz_functional_gradient`]).
+/// * `design_row`, `design_row_b`, `design_matrix`, `weights` — the design
+///   payload the chosen `target` consumes.
+/// * `leverage` — optional ALO leverages `h_ii` for exact own-observation
+///   removal in the influence values.
+///
+/// Returns `{"theta_plugin", "theta_debiased", "se", "penalty_bias", "ci_lower",
+/// "ci_upper"}` (95% normal CI on the debiased estimate).
+#[pyfunction]
+#[pyo3(signature = (
+    beta, penalized_hessian, row_scores, penalty_beta, target,
+    design_row = None, design_row_b = None, design_matrix = None,
+    weights = None, leverage = None
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn debiased_functional<'py>(
+    py: Python<'py>,
+    beta: numpy::PyReadonlyArray1<'py, f64>,
+    penalized_hessian: numpy::PyReadonlyArray2<'py, f64>,
+    row_scores: numpy::PyReadonlyArray2<'py, f64>,
+    penalty_beta: numpy::PyReadonlyArray1<'py, f64>,
+    target: &str,
+    design_row: Option<numpy::PyReadonlyArray1<'py, f64>>,
+    design_row_b: Option<numpy::PyReadonlyArray1<'py, f64>>,
+    design_matrix: Option<numpy::PyReadonlyArray2<'py, f64>>,
+    weights: Option<numpy::PyReadonlyArray1<'py, f64>>,
+    leverage: Option<numpy::PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let beta = beta.as_array().to_owned();
+    let hessian = penalized_hessian.as_array().to_owned();
+    let scores = row_scores.as_array().to_owned();
+    let penalty_beta = penalty_beta.as_array().to_owned();
+    let design_row = design_row.map(|a| a.as_array().to_owned());
+    let design_row_b = design_row_b.map(|a| a.as_array().to_owned());
+    let design_matrix = design_matrix.map(|a| a.as_array().to_owned());
+    let weights = weights.map(|a| a.as_array().to_owned());
+    let leverage = leverage.map(|a| a.as_array().to_owned());
+
+    let gradient = riesz_functional_gradient(
+        target,
+        design_row.as_ref(),
+        design_row_b.as_ref(),
+        design_matrix.as_ref(),
+        weights.as_ref(),
+    )?;
+
+    let input = RieszInput {
+        beta: beta.view(),
+        functional_gradient: gradient.view(),
+        row_scores: scores.view(),
+        penalty_beta: penalty_beta.view(),
+        leverage: leverage.as_ref().map(|l| l.view()),
+    };
+    let report = debias_with_dense_hessian(&input, hessian.view()).map_err(py_value_error)?;
+
+    let half_width = 1.959_963_984_540_054 * report.se;
+    let out = PyDict::new(py);
+    out.set_item("theta_plugin", report.theta_plugin)?;
+    out.set_item("theta_debiased", report.theta_onestep)?;
+    out.set_item("se", report.se)?;
+    out.set_item("penalty_bias", report.penalty_bias)?;
+    out.set_item("ci_lower", report.theta_onestep - half_width)?;
+    out.set_item("ci_upper", report.theta_onestep + half_width)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +476,95 @@ mod tests {
     }
 
     #[test]
+    fn debiased_functional_seam_returns_finite_estimate_and_se_on_a_fit() {
+        // A genuine penalized least-squares fit (the same regime the engine's
+        // own oracle test uses), driven through the #1055 pyffi seam helper
+        // `riesz_functional_gradient` + `debias_with_dense_hessian`. Asserts the
+        // surfaced debiased path yields a finite estimate and SE, and that the
+        // weighted-average-derivative target recovers the truth better than the
+        // (oversmoothed) plug-in.
+        let n = 80usize;
+        let p = 3usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut derivative_design = Array2::<f64>::zeros((n, p));
+        let mut weights = Array1::<f64>::zeros(n);
+        let beta_truth = ndarray::array![0.2, -0.4, 2.5];
+        for row in 0..n {
+            let z = row as f64 / (n - 1) as f64;
+            x[[row, 0]] = 1.0;
+            x[[row, 1]] = z;
+            x[[row, 2]] = z * z;
+            derivative_design[[row, 1]] = 1.0;
+            derivative_design[[row, 2]] = 2.0 * z;
+            weights[row] = 1.0 + 4.0 * z;
+        }
+        let y = x.dot(&beta_truth);
+        let mut penalty = Array2::<f64>::zeros((p, p));
+        penalty[[2, 2]] = 0.1;
+        let h = &x.t().dot(&x) + &penalty;
+        let rhs = x.t().dot(&y);
+        // Solve H β = rhs via the engine-side Cholesky path used by the seam.
+        let factor = {
+            use gam::faer_ndarray::FaerCholesky;
+            h.cholesky(faer::Side::Lower).expect("SPD")
+        };
+        let sensitivity = gam::solver::sensitivity::FitSensitivity::from_faer_cholesky(&factor, p);
+        let beta_hat = sensitivity.apply(&rhs);
+        let mu = x.dot(&beta_hat);
+        let mut row_scores = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            let residual = mu[row] - y[row];
+            for col in 0..p {
+                row_scores[[row, col]] = x[[row, col]] * residual;
+            }
+        }
+        let penalty_beta = penalty.dot(&beta_hat);
+
+        let gradient = riesz_functional_gradient(
+            "average_derivative",
+            None,
+            None,
+            Some(&derivative_design),
+            Some(&weights),
+        )
+        .expect("seam builds average-derivative gradient");
+
+        let input = RieszInput {
+            beta: beta_hat.view(),
+            functional_gradient: gradient.view(),
+            row_scores: row_scores.view(),
+            penalty_beta: penalty_beta.view(),
+            leverage: None,
+        };
+        let report = debias_with_dense_hessian(&input, h.view()).expect("debiased report");
+
+        assert!(report.theta_onestep.is_finite(), "debiased estimate finite");
+        assert!(report.se.is_finite() && report.se > 0.0, "SE finite & positive");
+
+        let truth = gradient.dot(&beta_truth);
+        let plugin_bias = (report.theta_plugin - truth).abs();
+        let debiased_bias = (report.theta_onestep - truth).abs();
+        assert!(
+            debiased_bias <= plugin_bias + 1e-12,
+            "orthogonal correction must not worsen bias: plugin={plugin_bias:.3e}, debiased={debiased_bias:.3e}"
+        );
+
+        // The point-evaluation and contrast targets must also yield finite gradients.
+        let row0 = x.row(0).to_owned();
+        let row1 = x.row(1).to_owned();
+        let g_point = riesz_functional_gradient("point", Some(&row0), None, None, None)
+            .expect("point gradient");
+        assert_eq!(g_point.len(), p);
+        let g_contrast =
+            riesz_functional_gradient("contrast", Some(&row0), Some(&row1), None, None)
+                .expect("contrast gradient");
+        assert_eq!(g_contrast.len(), p);
+
+        // Unknown target is a clean error, not a panic.
+        assert!(riesz_functional_gradient("bogus", None, None, None, None).is_err());
+    }
+
+    #[test]
     fn lawley_factor_recovers_exponential_one_over_six_n() {
         // Exponential (Gamma-log, φ=1), intercept-only, tested = the intercept:
         // the null model has no parameters so ε_0 = 0 and the factor is
@@ -346,5 +594,6 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(e_bh_dictionary_certificate, module)?)?;
     module.add_function(wrap_pyfunction!(log_e_from_p_value, module)?)?;
     module.add_function(wrap_pyfunction!(lawley_bartlett_factor, module)?)?;
+    module.add_function(wrap_pyfunction!(debiased_functional, module)?)?;
     Ok(())
 }
