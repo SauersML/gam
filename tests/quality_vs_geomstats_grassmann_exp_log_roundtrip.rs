@@ -340,7 +340,12 @@ from geomstats.geometry.grassmannian import Grassmannian
 N, K, NCASES = {n}, {k}, {ncases}
 base = np.asarray(df["base_flat"], dtype=float).reshape(NCASES, N, K)
 tang = np.asarray(df["tangent_flat"], dtype=float).reshape(NCASES, N, K)
-truth = np.asarray(df["truth_sigma"], dtype=float).reshape(NCASES, K)  # analytic σ
+# truth_sigma carries NCASES*K analytic singular values, but the ragged-CSV
+# harness pads this shorter column with a NaN tail out to the length of the
+# NCASES*N*K base/tangent columns. Take the finite NCASES*K prefix (the harness
+# contract: a short column's surplus tail is NaN and must be sliced/masked off
+# on the reference side) before reshaping, else reshape sees the padded length.
+truth = np.asarray(df["truth_sigma"], dtype=float)[: NCASES * K].reshape(NCASES, K)  # analytic σ
 
 space = Grassmannian(N, K)
 metric = space.metric
