@@ -23759,6 +23759,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(predict_table_conformal, module)?)?;
     // #1054: exact Gaussian jackknife+ conformal intervals (no calibration fold).
     module.add_function(wrap_pyfunction!(predict_table_jackknife_plus, module)?)?;
+    // #1057: posterior-predictive replicate sampling from the fitted model.
+    module.add_function(wrap_pyfunction!(generative_replicates, module)?)?;
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
     module.add_function(wrap_pyfunction!(competing_risks_cif, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -26355,6 +26357,141 @@ fn predict_table_jackknife_plus(
     detach_py_result(py, "predict_table_jackknife_plus", move || {
         predict_table_jackknife_plus_impl(&model_bytes, headers, rows, conformal_level)
     })
+}
+
+/// #1057 Posterior-predictive replicate sampling — `model.sample_replicates`.
+///
+/// Draws `n_draws` synthetic response vectors from the fitted predictive
+/// distribution via `gam::inference::generative`:
+///   1. Run the plug-in predictor to get `mean` (response scale).
+///   2. Derive the `NoiseModel` from the saved `LikelihoodSpec` + fitted
+///      dispersion (`standard_deviation` / `likelihood_scale`).
+///   3. Call `sampleobservation_replicates` with a seeded `StdRng`.
+///
+/// Returns a row-major flat `Vec<f64>` of shape `(n_draws, n_rows)` plus the
+/// two dimensions, so the Python side can reshape into a numpy array without
+/// a copy. Survives any family supported by `NoiseModel::from_likelihood`
+/// (Gaussian, Poisson, Bernoulli, Gamma, Beta, NegBin, Tweedie). Survival /
+/// transformation-normal / scan-routed models are rejected early with a clear
+/// error — they are not Gauss GLMs and `generativespec_from_predict` does not
+/// cover them.
+#[pyfunction]
+fn generative_replicates(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    n_draws: usize,
+    seed: u64,
+) -> PyResult<PyObject> {
+    let result = py.allow_threads(|| {
+        generative_replicates_impl(&model_bytes, headers, rows, n_draws, seed)
+    });
+    match result {
+        Ok((flat, n_rows)) => {
+            let arr = ndarray::Array2::<f64>::from_shape_vec((n_draws, n_rows), flat)
+                .map_err(|e| py_value_error(format!("generative_replicates reshape: {e}")))?;
+            Ok(arr.into_pyarray(py).into_any().unbind())
+        }
+        Err(e) => Err(py_value_error(e)),
+    }
+}
+
+fn generative_replicates_impl(
+    model_bytes: &[u8],
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    n_draws: usize,
+    seed: u64,
+) -> Result<(Vec<f64>, usize), String> {
+    use gam::inference::generative::{generativespec_from_predict, sampleobservation_replicates};
+    use rand::SeedableRng;
+    let model = load_model_impl(model_bytes)?;
+    // Only standard GAM models have a dense predictor + UnifiedFitResult.
+    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
+        return Err(format!(
+            "sample_replicates supports only standard GAM models; got '{}'. \
+             Use the appropriate posterior sampling method for this model class.",
+            prediction_model_class_label(&model)
+        ));
+    }
+    // Scan-routed models: no dense predictor, no family-based noise model.
+    if scan_introspection(&model)
+        .map_err(String::from)?
+        .is_some()
+    {
+        return Err(
+            "sample_replicates is not yet supported for exact O(n) scan models; \
+             refit with double_penalty=true to obtain the standard B-spline model."
+                .to_string(),
+        );
+    }
+    let family = model_likelihood_spec(&model);
+    // Reject families generativespec_from_predict cannot handle (custom /
+    // survival-parametric / latent-cloglog). They require a different noise
+    // model path not yet covered by the built-in generative engine.
+    match &family.response {
+        gam::types::ResponseFamily::Gaussian
+        | gam::types::ResponseFamily::Binomial
+        | gam::types::ResponseFamily::Poisson
+        | gam::types::ResponseFamily::NegativeBinomial { .. }
+        | gam::types::ResponseFamily::Beta { .. }
+        | gam::types::ResponseFamily::Gamma
+        | gam::types::ResponseFamily::Tweedie { .. } => {}
+        other => {
+            return Err(format!(
+                "sample_replicates does not yet support the '{}' family; \
+                 supported families: gaussian, binomial, poisson, negbin, \
+                 beta, gamma, tweedie",
+                format!("{other:?}")
+            ));
+        }
+    }
+    let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
+    let col_map = dataset.column_map();
+    let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
+    let offset_noise =
+        resolve_offset_column(&dataset, &col_map, model.noise_offset_column.as_deref())?;
+    let predict_input = build_predict_input_for_model(
+        &model,
+        dataset.values.view(),
+        &col_map,
+        model.training_headers.as_ref(),
+        &offset,
+        &offset_noise,
+        false,
+    )?;
+    let predictor = model
+        .predictor()
+        .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
+    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let prediction = predictor
+        .predict_plugin_response(&predict_input)
+        .map_err(|e| format!("generative_replicates: prediction failed: {e}"))?;
+    let n_rows = prediction.mean.len();
+    // Extract the fitted dispersion parameter — the same mapping as
+    // `family_noise_parameter` in main.rs.
+    let gaussian_scale = match &family.response {
+        gam::types::ResponseFamily::Tweedie { .. } => {
+            fit.likelihood_scale.fixed_phi().or(Some(1.0))
+        }
+        gam::types::ResponseFamily::NegativeBinomial { theta } => Some(*theta),
+        gam::types::ResponseFamily::Beta { phi } => {
+            fit.likelihood_scale.fixed_phi().or(Some(*phi))
+        }
+        gam::types::ResponseFamily::Gamma => fit
+            .likelihood_scale
+            .gamma_shape()
+            .or(Some(fit.standard_deviation)),
+        _ => Some(fit.standard_deviation),
+    };
+    // Build the generative specification (mean + noise model).
+    let spec = generativespec_from_predict(prediction, family, gaussian_scale)
+    .map_err(|e| format!("generative_replicates: spec error: {e}"))?;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let draws = sampleobservation_replicates(&spec, n_draws, &mut rng)
+        .map_err(|e| format!("generative_replicates: sampling failed: {e}"))?;
+    Ok((draws.into_raw_vec_and_offset().0, n_rows))
 }
 
 fn columns_to_array(columns: BTreeMap<String, Vec<f64>>) -> Result<Array2<f64>, String> {
