@@ -69,8 +69,8 @@ use std::sync::Arc;
 
 mod numeric_guards;
 use numeric_guards::{
-    StableDifference, compensated_difference, safe_hadamard_product, safe_linear_combo2_arrays,
-    safe_product, safe_product3, safe_sum2, safe_sum3, sanitize_survival_weight_vector, softplus,
+    compensated_difference, safe_hadamard_product, safe_linear_combo2_arrays, safe_product,
+    safe_product3, safe_sum2, safe_sum3, sanitize_survival_weight_vector, softplus,
 };
 
 const SURVIVAL_ROW_PARALLEL_THRESHOLD: usize = 256;
