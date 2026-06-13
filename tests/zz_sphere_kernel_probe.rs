@@ -3,6 +3,7 @@
 //! `quality_vs_scipy_sphere_geodesic_consistency`. Not a quality gate — printed
 //! diagnostics only. Deleted once the kernel choice is settled.
 
+use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
 use ndarray::Array2;
