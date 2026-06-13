@@ -401,6 +401,77 @@ class Model:
         payload = json.loads(raw)
         return list(payload.get("smooth_terms", []))
 
+    def debiased_functional(
+        self,
+        data: Any,
+        target: str,
+        *,
+        x0: dict[str, Any] | None = None,
+        x1: dict[str, Any] | None = None,
+        weights: list[float] | None = None,
+    ) -> dict[str, float]:
+        """Riesz-representer debiased / Neyman-orthogonal estimate of a smooth
+        functional (#1055).
+
+        Computes a second-order-accurate point estimate of a smooth functional
+        ``θ = g(m)`` using the Riesz-representer one-step bias correction —
+        the standard Neyman-orthogonal / doubly-robust estimator for penalized
+        regression functionals. The orthogonal correction is always applied
+        (it strictly improves coverage under regularization; no flag).
+
+        Currently restricted to Gaussian/identity-link models (exact per-row
+        score contributions). For other families supply raw arrays via the
+        low-level ``gamfit._rust.debiased_functional(...)`` call.
+
+        Parameters
+        ----------
+        data : table-like
+            The **training** data used to fit this model, in any format
+            accepted by :meth:`predict`. Required to reconstruct the per-row
+            score contributions ``∂nll_i/∂β``.
+        target : str
+            The named functional estimand:
+
+            * ``"point"`` — ``m(x0)``, the smooth evaluated at a query point.
+              Requires ``x0``.
+            * ``"contrast"`` — ``m(x0) − m(x1)`` (a treatment contrast).
+              Requires ``x0`` and ``x1``.
+            * ``"average_value"`` — ``mean_i w_i m(x_i)`` over training rows.
+              Optional ``weights``.
+            * ``"average_derivative"`` — ``mean_i w_i (∂m/∂x)(x_i)`` over
+              training rows. Optional ``weights``.
+        x0, x1 : dict or None
+            Query-point column dicts for ``"point"`` and ``"contrast"``
+            targets.  Keys must match the model's predictor column names.
+        weights : list of float or None
+            Per-row importance weights for ``"average_value"`` /
+            ``"average_derivative"`` (length == number of training rows).
+
+        Returns
+        -------
+        dict
+            ``theta_plugin`` (plug-in estimate without debiasing),
+            ``theta_debiased`` (Neyman-orthogonal one-step estimate),
+            ``se`` (influence-function standard error),
+            ``penalty_bias`` (estimated regularization bias removed),
+            ``ci_lower`` / ``ci_upper`` (95% normal-approximation CI).
+        """
+        headers, rows, _ = normalize_table(data)
+        spec: dict[str, Any] = {"target": target}
+        if x0 is not None:
+            spec["x0"] = {k: v for k, v in x0.items()}
+        if x1 is not None:
+            spec["x1"] = {k: v for k, v in x1.items()}
+        if weights is not None:
+            spec["weights"] = list(weights)
+        try:
+            raw = rust_module().model_debiased_functional_json(
+                self._model_bytes, headers, rows, json.dumps(spec)
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        return dict(json.loads(raw))
+
     def report(self, path: str | Path | None = None) -> str:
         """Generate a standalone HTML report of the fitted model."""
         try:
