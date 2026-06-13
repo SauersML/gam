@@ -1980,6 +1980,17 @@ pub fn arrow_log_det_from_cache(cache: &ArrowFactorCache) -> Option<f64> {
     }
     // Schur block: log|A| = 2 Σ log diag(L_schur).
     acc += 2.0 * log_det_from_chol_lower(schur.view());
+    // #1038 cross-row IBP: when the cache carries an exact rank-`R` Woodbury,
+    // the per-row + Schur factors above are of the NO-SELF base `H₀'`, so the
+    // exact `log det H_full = log det H₀' + log det(I_R + D Uᵀ H₀'⁻¹ U)`. The
+    // correction is zero (no-op) for every non-IBP cache.
+    let woodbury_correction = cache.cross_row_woodbury_log_det();
+    if !woodbury_correction.is_finite() {
+        // A non-PD capacitance (negative determinant) is a value↔gradient
+        // desync the evidence must reject loudly, not paper over.
+        return None;
+    }
+    acc += woodbury_correction;
     Some(acc)
 }
 
