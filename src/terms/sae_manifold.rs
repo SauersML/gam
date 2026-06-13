@@ -12767,6 +12767,33 @@ impl SaeManifoldTerm {
             for &v in delta_beta.iter() {
                 step_norm_sq += v * v;
             }
+            // #1051 — gauge/null-aware stationarity. A rank-deficient (or merely
+            // weakly-identified) decoder column makes the inner optimum a FLAT
+            // VALLEY: the Newton step keeps crawling along the unidentified
+            // direction with a tiny-but-nonzero gradient, so neither the raw
+            // gradient nor the Armijo decrease ever clears tolerance and the
+            // solve burns its whole budget making cosmetic progress (the 122 s
+            // line fit). Project the step out of the chart-gauge orbit AND the
+            // decoder β-null; when the IDENTIFIED-direction motion is below the
+            // step tolerance the iterate is stationary on the quotient manifold —
+            // ranking the Laplace criterion there is correct, and continuing
+            // only chases gauge freedom. This mirrors the quotient convergence
+            // `reml_criterion`'s undamped-evidence loop already applies, so the
+            // inner solve and the criterion agree on "converged".
+            if delta_ext_coord.len() == self.n_obs() * self.assignment.row_block_dim()
+                && delta_beta.len() == self.beta_dim()
+            {
+                let quotient_step_norm_sq = self.quotient_newton_step_norm_sq(
+                    delta_ext_coord.view(),
+                    delta_beta.view(),
+                    step_norm_sq,
+                    rho.lambda_smooth(),
+                )?;
+                let step_tolerance = SAE_MANIFOLD_INNER_STEP_REL_TOL * self.inner_iterate_scale();
+                if quotient_step_norm_sq.sqrt() <= step_tolerance {
+                    break;
+                }
+            }
             let directional_decrease_floor = SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR
                 * grad_norm_sq.sqrt()
                 * step_norm_sq.sqrt();
