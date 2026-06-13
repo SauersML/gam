@@ -9955,6 +9955,8 @@ fn sae_manifold_fit_ibp<'py>(
         None,
         None,
         None,
+        // No per-row design-honesty weights on this convenience IBP entry point.
+        None,
     )
 }
 
