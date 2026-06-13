@@ -73,7 +73,7 @@ fn weibull_draw(u: f64, shape: f64, scale: f64) -> f64 {
 /// cause-specific hazards above, censoring C ~ Exp(mean 8); observed
 /// (min(T1, T2, C), cause indicator 0/1/2).
 fn simulate() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut state: u64 = 0x51025_1025_2026_0612;
+    let mut state: u64 = 0x1025_1025_2026_0612;
     let mut time = Vec::with_capacity(N);
     let mut event = Vec::with_capacity(N);
     let mut xs = Vec::with_capacity(N);
