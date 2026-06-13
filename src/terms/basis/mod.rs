@@ -42,8 +42,8 @@ mod sphere_spectral;
 
 pub use constant_curvature_smooth::{
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, build_constant_curvature_basis,
-    constant_curvature_kernel_kappa_jets, constant_curvature_kernel_matrix,
-    realized_constant_curvature_length_scale,
+    build_constant_curvature_basis_kappa_derivatives, constant_curvature_kernel_kappa_jets,
+    constant_curvature_kernel_matrix, realized_constant_curvature_length_scale,
 };
 pub use measure_jet_moments::{
     MeasureJetJetStats, MeasureJetMomentTable, accumulate_moment_table, jet_sufficient_stats,
