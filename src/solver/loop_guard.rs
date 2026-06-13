@@ -340,6 +340,25 @@ impl RejectEscalator {
     }
 }
 
+/// Convergence-truthfulness invariant for an inner-solve terminal verdict
+/// (gam#1040).
+///
+/// An inner Newton/PIRLS solve may only report `converged = true` if it
+/// actually certified a stationarity point on a FINITE residual. A
+/// certificate exit that fires on a cycle where the head-of-cycle KKT norm was
+/// non-finite (so the running `min_certified_residual` is left at its `inf`
+/// sentinel) would otherwise emit `converged=true … best_residual_inf=inf` — a
+/// self-contradicting status: a convergence claim with no finite residual
+/// behind it. This predicate is the single source of truth for that gate:
+/// `converged` survives iff a finite certified residual is on record. When it
+/// returns `false` while the solver believed it converged, the caller must
+/// downgrade to non-converged so the outer optimizer rejects the evaluation
+/// rather than consuming a phantom optimum.
+#[inline]
+pub fn inner_convergence_is_truthful(converged: bool, min_certified_residual: f64) -> bool {
+    !converged || min_certified_residual.is_finite()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +556,25 @@ mod tests {
                 "a 1%-per-cycle relative descent must never register as flat"
             );
         }
+    }
+
+    /// A certificate exit must never report `converged=true` while the only
+    /// residual on record is the non-finite `inf` sentinel — the gam#1040
+    /// inner-report truthfulness violation. The predicate downgrades exactly
+    /// that case and leaves every genuinely-certified exit untouched.
+    #[test]
+    fn inner_convergence_truthfulness_rejects_converged_with_nonfinite_residual() {
+        // converged with a finite certified residual: honest, survives.
+        assert!(inner_convergence_is_truthful(true, 8.0e-6));
+        assert!(inner_convergence_is_truthful(true, 0.0));
+        // converged with NO finite certified residual (the cycle-1 certificate
+        // exit symptom: best_residual_inf=inf): a truthfulness violation.
+        assert!(!inner_convergence_is_truthful(true, f64::INFINITY));
+        assert!(!inner_convergence_is_truthful(true, f64::NAN));
+        // non-converged exits are always truthful regardless of the residual
+        // sentinel — the report says "not converged", no contradiction.
+        assert!(inner_convergence_is_truthful(false, f64::INFINITY));
+        assert!(inner_convergence_is_truthful(false, 1.0e-3));
     }
 
     /// The shared predicates pin the exact reweight.rs semantics they
