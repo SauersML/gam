@@ -310,9 +310,11 @@ impl ResponseManifold {
             Self::Poincare { curvature, .. } => {
                 crate::geometry::poincare::log_map(base, value, *curvature)
             }
-            _ => self
+            // ConstantCurvature implements RiemannianManifold::log_map directly.
+            Self::ConstantCurvature { .. } | Self::Spd { .. } | Self::Grassmann { .. }
+            | Self::Stiefel { .. } => self
                 .riemannian()
-                .expect("matrix response manifold")
+                .expect("riemannian response manifold")
                 .log_map(base, value),
         }
     }
@@ -327,16 +329,18 @@ impl ResponseManifold {
             Self::Poincare { curvature, .. } => {
                 crate::geometry::poincare::exp_map(base, tangent, *curvature)
             }
-            _ => self
+            Self::ConstantCurvature { .. } | Self::Spd { .. } | Self::Grassmann { .. }
+            | Self::Stiefel { .. } => self
                 .riemannian()
-                .expect("matrix response manifold")
+                .expect("riemannian response manifold")
                 .exp_map(base, tangent),
         }
     }
 
     /// Squared metric norm `‖v‖²_base` of a tangent at `base`. Used by the
     /// Karcher iteration's stationarity test. Poincaré uses the conformal
-    /// factor squared; the matrix manifolds use the trait metric tensor.
+    /// factor squared; the matrix manifolds and ConstantCurvature use the trait
+    /// metric tensor.
     fn sq_metric_norm(
         &self,
         base: ArrayView1<'_, f64>,
@@ -347,10 +351,11 @@ impl ResponseManifold {
                 let lam = crate::geometry::poincare::conformal_factor(base, *curvature)?;
                 Ok(lam * lam * v.iter().map(|x| x * x).sum::<f64>())
             }
-            _ => {
+            Self::ConstantCurvature { .. } | Self::Spd { .. } | Self::Grassmann { .. }
+            | Self::Stiefel { .. } => {
                 let g = self
                     .riemannian()
-                    .expect("matrix response manifold")
+                    .expect("riemannian response manifold")
                     .metric_tensor(base)?;
                 let gv = g.dot(&v);
                 Ok(v.dot(&gv).max(0.0))
