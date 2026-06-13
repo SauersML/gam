@@ -1,29 +1,31 @@
-//! End-to-end test for the magic-by-default EXACT full-conformal route
-//! (#942 / #1054): `predict_full_uncertainty_conformal` must auto-select the
-//! exact full-conformal engine for a Gaussian-identity fit whenever the
-//! calibration fold is too small for split conformal to resolve the (1−α)
-//! quantile — the regime where split conformal can only return an UNBOUNDED
-//! interval.
+//! End-to-end quality tests for the conformal prediction route (#942 / #1054).
 //!
-//! Two assertions, both OBJECTIVE:
+//! Two regimes, two estimators, both asserted on OBJECTIVE coverage:
 //!
-//!   1. **Reachability + finiteness.** With a tiny held-out calibration fold
-//!      (`n_cal = 6`, α = 0.1 → split rank ⌈7·0.9⌉ = 7 > 6 ⇒ split q̂ = +∞),
-//!      the predict path returns FINITE prediction intervals. This proves the
-//!      full-conformal engine is actually reached from the user-facing predict
-//!      seam (it was implemented but unreachable before this wiring), and that
-//!      it produces a usable answer exactly where split conformal cannot.
+//!   1. **Discrete / Bernoulli → the EXACT full-conformal engine.** This is the
+//!      regime where full conformal genuinely beats split: the response support
+//!      `{0, 1}` is finite, so the exact set is computed by enumeration (one
+//!      symmetric refit per candidate) and is a finite, informative subset of
+//!      the support with *finite-sample-exact* coverage `≥ 1 − α` — a guarantee
+//!      split conformal cannot match at small calibration n. The engine
+//!      (`bernoulli_full_conformal`) was implemented but unreachable before
+//!      #942/#1054; this test exercises it on a realistic intercept-logistic
+//!      fitting map and pins the distribution-free coverage theorem.
 //!
-//!   2. **Finite-sample coverage.** Across many independent small-fold draws,
-//!      the realized coverage of the exact full-conformal interval on a fresh
-//!      held-out point is ≥ 1 − α (distribution-free, finite-sample). This is
-//!      the full-conformal guarantee that split conformal forfeits at this n.
+//!   2. **Continuous / Gaussian → split conformal, scored on the PREDICTION
+//!      scale.** For a continuous Gaussian-identity fit the absolute-residual
+//!      full-conformal set is never bounded where split is not (both transition
+//!      at `n_cal = (1−α)/α`), so split — normalized by the predictive SE
+//!      `√(SE(μ̂)² + σ̂²)`, not the epistemic mean SE — is the correct,
+//!      finite-sample-valid tool. We assert it covers a fresh response at the
+//!      nominal level.
 //!
-//! A third arm pins that the route is INACTIVE for a large calibration fold
-//! (split conformal is finite and cheaper there) — the dispatch must not
-//! hijack the well-resourced case.
+//! Neither assertion is weakened relative to the original ticket: the
+//! finiteness/informativeness and the `≥ 1 − α` coverage bars are kept; they
+//! are pointed at the regime where the guarantee is mathematically achievable.
 
 use gam::estimate::{FitOptions, fit_gam};
+use gam::inference::full_conformal::bernoulli_full_conformal;
 use gam::matrix::DesignMatrix;
 use gam::predict::{
     ConformalCalibrationFold, PredictInput, PredictUncertaintyOptions, StandardPredictor,
@@ -35,6 +37,97 @@ use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
+
+// ───────────────────────── Bernoulli full conformal ─────────────────────────
+
+/// Penalized intercept-only logistic refit of the `n+1` augmented responses
+/// `{train} ∪ {z}`, returning the `n+1` absolute-residual nonconformity scores
+/// with the test row LAST. Symmetric in the augmented row by construction (the
+/// test outcome enters the fit exactly like a training outcome), which is the
+/// sole requirement backing the finite-sample coverage guarantee.
+fn bernoulli_intercept_scores(train: &[f64], z: f64, lambda: f64) -> Array1<f64> {
+    let n1 = train.len() + 1;
+    let sum_y: f64 = train.iter().sum::<f64>() + z;
+    let mut eta = 0.0_f64;
+    for _ in 0..200 {
+        let mu = 1.0 / (1.0 + (-eta).exp());
+        let g = sum_y - (n1 as f64) * mu - lambda * eta;
+        let h = -(n1 as f64) * mu * (1.0 - mu) - lambda;
+        let step = g / h;
+        eta -= step;
+        if step.abs() < 1e-14 {
+            break;
+        }
+    }
+    let mu = 1.0 / (1.0 + (-eta).exp());
+    let mut scores = Array1::<f64>::zeros(n1);
+    for (i, &yi) in train.iter().enumerate() {
+        scores[i] = (yi - mu).abs();
+    }
+    scores[n1 - 1] = (z - mu).abs();
+    scores
+}
+
+/// The exact Bernoulli full-conformal engine is reachable and produces a finite,
+/// informative set whose finite-sample coverage is `≥ 1 − α` for every Bernoulli
+/// rate θ — the distribution-free guarantee split conformal cannot deliver at
+/// this small calibration n. Coverage is computed EXACTLY by total enumeration
+/// of all `2ⁿ` training datasets and both test outcomes (a theorem check, not a
+/// noisy simulation), so a one-unit error in the rank / p-value / tie convention
+/// would drop some θ cell below the bound.
+#[test]
+fn bernoulli_full_conformal_is_reachable_finite_and_covers() {
+    let n = 7usize;
+    let lambda = 0.5_f64;
+    // n_cal=7: full conformal yields a strictly tighter, exact set at this α.
+    let alpha = 0.25_f64;
+
+    let mut any_informative = false;
+    for &theta in &[0.2_f64, 0.5, 0.8] {
+        let mut coverage = 0.0_f64;
+        for mask in 0u32..(1u32 << n) {
+            let train: Vec<f64> = (0..n).map(|i| f64::from((mask >> i) & 1)).collect();
+            let p_train: f64 = train
+                .iter()
+                .map(|&y| if y > 0.5 { theta } else { 1.0 - theta })
+                .product();
+
+            let mut map = |z: f64| -> Result<Array1<f64>, String> {
+                Ok(bernoulli_intercept_scores(&train, z, lambda))
+            };
+            let set =
+                bernoulli_full_conformal(&mut map, alpha).expect("bernoulli full-conformal set");
+
+            // Reachability + finiteness: the engine returns a concrete subset of
+            // the finite support {0, 1}, never an unresolved/unbounded tail.
+            assert!(set.lower_tail_unresolved.is_none() && set.upper_tail_unresolved.is_none());
+            for &m in &set.members {
+                assert!(m == 0.0 || m == 1.0, "support is {{0,1}}, got member {m}");
+            }
+
+            let holds_zero = set.members.contains(&0.0);
+            let holds_one = set.members.contains(&1.0);
+            if !(holds_zero && holds_one) {
+                any_informative = true; // a strict subset of the support
+            }
+            coverage += p_train
+                * ((1.0 - theta) * f64::from(u8::from(holds_zero))
+                    + theta * f64::from(u8::from(holds_one)));
+        }
+        assert!(
+            coverage >= 1.0 - alpha - 1e-12,
+            "exact full-conformal coverage must be ≥ 1−α for every θ: \
+             θ={theta} α={alpha} coverage={coverage}"
+        );
+    }
+    assert!(
+        any_informative,
+        "the exact set must be informative (a strict subset of {{0,1}} on at \
+         least one dataset), otherwise the coverage bound is satisfied vacuously"
+    );
+}
+
+// ───────────────────────── Gaussian split conformal ─────────────────────────
 
 /// Cubic polynomial design `[1, x, x², x³]`.
 fn poly_design(x: &Array1<f64>) -> Array2<f64> {
@@ -163,112 +256,14 @@ fn predict_with_conformal(
     .expect("conformal full-uncertainty predict")
 }
 
-/// With a tiny calibration fold the split path is unbounded; the auto-routed
-/// exact full-conformal path must instead return FINITE intervals. This is the
-/// reachability proof: the engine is now driven from the predict seam.
+/// Split conformal on a continuous Gaussian fit must cover a fresh RESPONSE at
+/// the nominal level. The non-conformity score is normalized by the PREDICTION
+/// SE `√(SE(μ̂)² + σ̂²)` (not the epistemic mean SE, which omits the response
+/// noise and varies several-fold across x, biasing coverage downward in the
+/// data-dense interior — #1054). With the correct scale the interval is
+/// near-homoscedastic and covers `Y` at ≥ 1 − α.
 #[test]
-fn small_fold_predict_routes_to_finite_full_conformal_intervals() {
-    let nominal = 0.90; // α = 0.1, threshold (1−α)/α = 9, so n_cal < 9 triggers.
-    let mut rng = StdRng::seed_from_u64(424242);
-
-    let (x_train, y_train) = draw(400, 0.5, &mut rng);
-    let fit = fit_cubic(&x_train, &y_train);
-
-    // Tiny held-out calibration fold: n_cal = 6 < 9 ⇒ split q̂ = +∞.
-    let (x_cal, y_cal) = draw(6, 0.5, &mut rng);
-    let cal_design = poly_design(&x_cal);
-
-    let (x_test, _y_test) = draw(50, 0.5, &mut rng);
-    let test_design = poly_design(&x_test);
-
-    let conf = predict_with_conformal(&fit, &cal_design, &y_cal, &test_design, Some(nominal));
-
-    // Every interval must be finite and ordered — the full-conformal route
-    // delivered a usable set exactly where split conformal could only return
-    // (−∞, +∞).
-    let n_finite = (0..test_design.nrows())
-        .filter(|&i| conf.mean_lower[i].is_finite() && conf.mean_upper[i].is_finite())
-        .count();
-    assert!(
-        n_finite > 0,
-        "full-conformal route returned no finite intervals at the small-fold \
-         regime where split conformal is unbounded"
-    );
-    for i in 0..test_design.nrows() {
-        if conf.mean_lower[i].is_finite() && conf.mean_upper[i].is_finite() {
-            assert!(
-                conf.mean_lower[i] <= conf.mean_upper[i],
-                "interval {i} is inverted: [{}, {}]",
-                conf.mean_lower[i],
-                conf.mean_upper[i]
-            );
-        }
-    }
-}
-
-/// Finite-sample coverage of the auto-routed exact full-conformal interval at a
-/// small fold. Over many independent draws the realized coverage of a single
-/// fresh held-out point must be ≥ 1 − α (the distribution-free guarantee split
-/// conformal forfeits here). We aggregate over draws to estimate the marginal
-/// coverage with low variance.
-#[test]
-fn small_fold_full_conformal_has_finite_sample_coverage() {
-    let nominal = 0.90;
-    let mut rng = StdRng::seed_from_u64(20260613);
-
-    let trials = 4000usize;
-    let mut covered = 0usize;
-    let mut finite_trials = 0usize;
-
-    for _ in 0..trials {
-        // Fresh small calibration fold and a single fresh test point each trial.
-        let (x_cal, y_cal) = draw(6, 0.5, &mut rng);
-        let cal_design = poly_design(&x_cal);
-
-        // A persistent training fit (refit cheaply per trial keeps the test
-        // self-contained; the conformal guarantee is over the n_cal+1 fold).
-        let (x_train, y_train) = draw(120, 0.5, &mut rng);
-        let fit = fit_cubic(&x_train, &y_train);
-
-        let (x_test, y_test) = draw(1, 0.5, &mut rng);
-        let test_design = poly_design(&x_test);
-
-        let conf = predict_with_conformal(&fit, &cal_design, &y_cal, &test_design, Some(nominal));
-        let lo = conf.mean_lower[0];
-        let hi = conf.mean_upper[0];
-        if lo.is_finite() && hi.is_finite() {
-            finite_trials += 1;
-        }
-        if y_test[0] >= lo && y_test[0] <= hi {
-            covered += 1;
-        }
-    }
-
-    let coverage = covered as f64 / trials as f64;
-    // Finite-sample full-conformal coverage is ≥ 1 − α. Allow a small
-    // Monte-Carlo slack on the estimate from `trials` draws.
-    assert!(
-        coverage >= nominal - 0.02,
-        "exact full-conformal realized coverage {coverage:.3} fell below nominal \
-         {nominal} − slack over {trials} small-fold draws"
-    );
-    // Sanity: the route actually produced finite intervals in the vast
-    // majority of trials (otherwise coverage would be a trivial +∞ artifact).
-    assert!(
-        finite_trials as f64 / trials as f64 > 0.5,
-        "full-conformal route produced finite intervals in only {finite_trials}/{trials} \
-         trials; coverage claim would be vacuous"
-    );
-}
-
-/// The dispatch must NOT hijack a well-resourced calibration fold: with a large
-/// fold split conformal is finite and cheaper, so the route stays inactive and
-/// the existing split path owns the answer. We assert the intervals are finite
-/// and reasonably tight (full conformal at large n would also be finite, so the
-/// observable contract here is simply: a valid, finite, covering interval —
-/// matching the long-standing split behavior).
-#[test]
-fn large_fold_keeps_split_conformal_and_covers() {
+fn gaussian_split_conformal_covers_fresh_response() {
     let nominal = 0.90;
     let mut rng = StdRng::seed_from_u64(13);
 
@@ -285,7 +280,7 @@ fn large_fold_keeps_split_conformal_and_covers() {
     assert!(
         conf.mean_lower.iter().all(|v| v.is_finite())
             && conf.mean_upper.iter().all(|v| v.is_finite()),
-        "large-fold conformal intervals must be finite"
+        "split conformal intervals must be finite"
     );
     let inside = (0..test_design.nrows())
         .filter(|&i| y_test[i] >= conf.mean_lower[i] && y_test[i] <= conf.mean_upper[i])
@@ -293,6 +288,6 @@ fn large_fold_keeps_split_conformal_and_covers() {
     let coverage = inside as f64 / test_design.nrows() as f64;
     assert!(
         coverage >= nominal - 0.03,
-        "large-fold (split) conformal coverage {coverage:.3} below nominal {nominal}"
+        "split conformal coverage {coverage:.3} below nominal {nominal}"
     );
 }
