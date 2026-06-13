@@ -20956,10 +20956,13 @@ where
     // (n, θ_dim) — no flag.
     const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
     const OUTER_FD_AUDIT_MAX_THETA_DIM: usize = 32;
-    if analytic_joint_gradient_available
+    let outer_fd_audit_eligible = analytic_joint_gradient_available
         && n_total <= OUTER_FD_AUDIT_MAX_N
-        && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM
-    {
+        && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM;
+    log::warn!(
+        "[OUTER-FD-AUDIT/spatial-exact-joint] gate eligible={outer_fd_audit_eligible} analytic_grad={analytic_joint_gradient_available} n_total={n_total} theta_dim={theta_dim} rho_dim={rho_dim} psi_dim={psi_dim}"
+    );
+    if outer_fd_audit_eligible {
         let audit = (|| -> Result<crate::solver::outer_strategy::OuterGradientFdAudit, String> {
             let mut eval_at = |theta: &Array1<f64>,
                                mode: crate::solver::estimate::reml::unified::EvalMode|
