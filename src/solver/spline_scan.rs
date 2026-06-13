@@ -82,8 +82,9 @@ const MAX_ORDER: usize = 3;
 
 /// Row-major `m × m` matrix stored in a fixed `MAX_ORDER`-capacity buffer; only
 /// the top-left `m × m` block is meaningful. Generalizing the order-2 cubic
-/// scan to order `m ∈ {1, 2}` (#1034 item 2) keeps the allocation-free fixed
-/// storage of the hot filter loop while letting `m` vary at runtime.
+/// scan to order `m ∈ {1, 2, 3}` (#1034 item 2, #1044) keeps the
+/// allocation-free fixed storage of the hot filter loop while letting `m` vary
+/// at runtime.
 type Mat2 = [[f64; MAX_ORDER]; MAX_ORDER];
 type Vec2 = [f64; MAX_ORDER];
 
