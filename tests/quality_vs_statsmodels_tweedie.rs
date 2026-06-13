@@ -222,10 +222,43 @@ emit("eta", np.asarray(eta, dtype=float))
          pearson(eta)={corr_eta:.5}"
     );
 
-    // ---- offset verification: differencing the with/without-offset fits ---
-    // Refit WITHOUT the linear(offset) term; the difference in fitted η must be
-    // the offset term's additive log-link contribution, hence aligned with the
-    // offset column itself.
+    // ---- offset verification: WITHIN-FIT term contribution -----------------
+    // The `linear(offset)` term's contribution to η is exactly its own design
+    // column times its fitted coefficient, `β_off · offset_col`. We read the
+    // offset term's global column range from the frozen design's `linear_ranges`
+    // (it is the single linear term, so a 1-wide block) and isolate that column's
+    // contribution by applying β restricted to that range. This is the term's
+    // genuine additive, log-scale effect — read off the SAME fit, with no second
+    // model. (The earlier approach differenced a with-offset fit against a
+    // separately-refit no-offset model; because dropping the term re-runs REML
+    // and re-selects the two smooths, the difference picked up x1/x2-dependent
+    // smooth re-adjustment that is orthogonal to the offset, so its correlation
+    // with the offset column sat below 1 for reasons unrelated to the offset
+    // wiring. The within-fit contribution has no such confound.)
+    let (off_name, off_range) = design
+        .linear_ranges
+        .iter()
+        .find(|(name, _)| name == "offset")
+        .map(|(name, range)| (name.clone(), range.clone()))
+        .expect("frozen design must expose the linear(offset) term column range");
+    assert_eq!(
+        off_range.len(),
+        1,
+        "the linear(offset) term must occupy exactly one design column, got {} for '{off_name}'",
+        off_range.len()
+    );
+    let off_col = off_range.start;
+    let beta_off = fit.fit.beta[off_col];
+    // Contribution of just the offset term: apply β with every coordinate except
+    // the offset column zeroed, so the result is β_off · (offset design column).
+    let mut beta_off_only = Array1::<f64>::zeros(ncols);
+    beta_off_only[off_col] = beta_off;
+    let offset_contrib: Vec<f64> = design.design.apply(&beta_off_only).to_vec();
+    let off_align = pearson(&offset_contrib, &offset);
+
+    // Does the offset term do real work? Refit WITHOUT it and compare truth
+    // recovery: the truth has μ ∝ o, so a model that drops the offset cannot
+    // represent that multiplicative factor and must recover the truth worse.
     let no_off = fit_from_formula("y ~ s(x1, k=4) + s(x2, k=4)", &ds, &cfg)
         .expect("gam tweedie fit without offset");
     let FitResult::Standard(fit_no) = no_off else {
@@ -234,13 +267,12 @@ emit("eta", np.asarray(eta, dtype=float))
     let design_no = build_term_collection_design(grid.view(), &fit_no.resolvedspec)
         .expect("rebuild no-offset gam design");
     let eta_no: Vec<f64> = design_no.design.apply(&fit_no.fit.beta).to_vec();
-    let offset_contrib: Vec<f64> = gam_eta
-        .iter()
-        .zip(eta_no.iter())
-        .map(|(a, b)| a - b)
-        .collect();
-    let off_align = pearson(&offset_contrib, &offset);
-    eprintln!("[tweedie offset] pearson(eta_with - eta_without, offset) = {off_align:.4}");
+    let mu_no: Vec<f64> = eta_no.iter().map(|e| e.exp()).collect();
+    let gam_err_no_offset = rmse(&mu_no, &mu_true);
+    eprintln!(
+        "[tweedie offset] beta_off={beta_off:.4} pearson(beta_off*offset_col, offset)={off_align:.6} \
+         rmse(mu,truth): with_offset={gam_err:.4} without_offset={gam_err_no_offset:.4}"
+    );
 
     // (1) PRIMARY — TRUTH RECOVERY: gam's fitted mean recovers the simulated
     // ground-truth mean to within the irreducible Tweedie noise floor. A
@@ -259,12 +291,34 @@ emit("eta", np.asarray(eta, dtype=float))
         "gam less accurate than statsmodels on truth recovery: \
          rmse(mu_gam,truth)={gam_err:.4} > 1.10 * rmse(mu_sm,truth)={sm_err:.4}"
     );
-    // (3) STRUCTURE — the linear(offset) term must additively encode the offset
-    // on the log scale: removing it shifts η by a contribution co-linear with
-    // `offset`. Asserted directly on gam's own fits, no reference involved.
+    // (3) STRUCTURE — the linear(offset) term additively encodes the offset on
+    // the log scale. Within the fit, its contribution is β_off · offset_col,
+    // which is collinear with the raw offset by construction; checking pearson≈1
+    // verifies the coefficient is wired to the offset column (a transposed or
+    // dropped column would break collinearity). Asserted on gam's own fit, no
+    // reference involved. The offset is a free linear coefficient (unpenalized),
+    // so the only thing that can degrade collinearity here is a layout/wiring
+    // mismatch — exactly the failure class this guards.
     assert!(
-        off_align > 0.95,
-        "linear(offset) contribution not aligned with offset column: pearson={off_align:.4}"
+        off_align > 0.999,
+        "linear(offset) contribution not collinear with offset column: pearson={off_align:.6} \
+         (within-fit β_off·offset_col must align with the offset)"
+    );
+    // The truth is μ ∝ o, so on the log-mean scale larger offset ⇒ larger mean:
+    // the fitted offset coefficient must be positive (correct multiplicative
+    // direction), not shrunk to ~0 or wrong-signed.
+    assert!(
+        beta_off > 0.0,
+        "linear(offset) coefficient must be positive for μ ∝ o truth, got β_off={beta_off:.4}"
+    );
+    // The offset must do real work: a model without it cannot represent the
+    // multiplicative o factor and recovers the truth strictly worse. This is the
+    // objective, refit-robust replacement for the old cross-fit pearson — it
+    // confirms the offset term is actually carrying the offset's effect.
+    assert!(
+        gam_err < gam_err_no_offset,
+        "dropping linear(offset) should worsen truth recovery (μ ∝ o), but \
+         with_offset rmse={gam_err:.4} >= without_offset rmse={gam_err_no_offset:.4}"
     );
 }
 
