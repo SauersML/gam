@@ -9888,6 +9888,70 @@ mod tests {
     }
 
     #[test]
+    fn ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian() {
+        // #1038: the exact IBP Hessian couples DIFFERENT rows within a column
+        // through the plug-in empirical mass `M_k = Σ_i z_ik`:
+        //   ∂²(value)/∂ℓ_ik ∂ℓ_jk = w · s'_k · z'_ik · z'_jk   (the cross-row
+        // rank-one block, including i=j). `cross_row_d[k] = w·s'_k` and
+        // `z_jac[i*K+k] = z'_ik`, so the analytic product must reproduce the
+        // central-difference second derivative of `value` for every (i≠j) pair.
+        let pen = IBPAssignmentPenalty::new(3, 5.0, 0.85, false);
+        // 4 rows × 3 columns; row-major (N, K).
+        let t = array![
+            0.3_f64, -0.2, 0.6, 0.5, 0.1, -0.4, -0.1, 0.7, 0.2, 0.4, -0.3, 0.8
+        ];
+        let rho = Array1::<f64>::zeros(0);
+        let k = pen.k_max;
+        let n = t.len() / k;
+        let ch = pen.hessian_diag_logit_third_channels(t.view(), rho.view());
+        let eps = 1.0e-5;
+        let mut max_err = 0.0_f64;
+        // Mixed second derivative via 4-point central difference on `value`.
+        let mixed_fd = |a: usize, b: usize| -> f64 {
+            let bump = |sa: f64, sb: f64| -> Array1<f64> {
+                let mut tt = t.clone();
+                tt[a] += sa * eps;
+                tt[b] += sb * eps;
+                tt
+            };
+            (pen.value(bump(1.0, 1.0).view(), rho.view())
+                - pen.value(bump(1.0, -1.0).view(), rho.view())
+                - pen.value(bump(-1.0, 1.0).view(), rho.view())
+                + pen.value(bump(-1.0, -1.0).view(), rho.view()))
+                / (4.0 * eps * eps)
+        };
+        for col in 0..k {
+            for i in 0..n {
+                for j in 0..n {
+                    if i == j {
+                        continue;
+                    }
+                    let analytic = ch.cross_row_d[col]
+                        * ch.z_jac[i * k + col]
+                        * ch.z_jac[j * k + col];
+                    let fd = mixed_fd(i * k + col, j * k + col);
+                    let err = (analytic - fd).abs();
+                    if err > max_err {
+                        max_err = err;
+                    }
+                    assert_abs_diff_eq!(analytic, fd, epsilon = 5.0e-5);
+                }
+            }
+        }
+        // Distinct columns do NOT couple cross-row (independent stick-breaking
+        // masses): the analytic model predicts zero, and the FD must agree.
+        let mixed_distinct = mixed_fd(0 * k + 0, 1 * k + 1);
+        assert!(
+            mixed_distinct.abs() < 5.0e-5,
+            "distinct-column cross-row coupling must vanish; got {mixed_distinct:.3e}"
+        );
+        assert!(
+            max_err < 5.0e-5,
+            "IBP cross-row Woodbury d·z'·z' vs FD max abs error = {max_err:.3e}"
+        );
+    }
+
+    #[test]
     fn ibp_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
         let pen = IBPAssignmentPenalty::new(3, 6.0, 0.8, true);
         let t = array![
