@@ -18117,6 +18117,54 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 && tr_clamped_during_stall
                 && all_block_stationarity_small
             {
+                // Penalty-null-space certificate at the STALL exit (gam#1040).
+                // The survival marginal-slope joint block carries free gauge
+                // directions (the #892 flexible-regime warp family) with no
+                // curvature and no constraint: the optimizer drifts along them
+                // with zero objective change, the Newton step never shrinks to
+                // step_tol (nothing pins it), so the constrained-stationary
+                // certificate's step-exhausted precondition is UNSATISFIABLE
+                // and every full-budget solve used to exit here unconverged —
+                // the outer REML then rejects ρ-evaluation after ρ-evaluation
+                // and cycles for hours (#1040: matern/duchon/measure-jet all
+                // time out; binary-MS, which has no such direction, fits in
+                // seconds). Stationarity on the identifiable subspace is the
+                // honest convergence statement: if the projected residual's
+                // component in the RANGE of H_pen is at tolerance, the stalled
+                // mass lives in ker(H_pen) — exactly what the outer IFT
+                // projects out before the envelope correction (gam#553) — and
+                // the iterate is accepted. A residual with genuine range-space
+                // mass (a real defect) still exits unconverged below.
+                if objective_change <= objective_tol
+                    && let Some(range_residual) = projected_residual_range_space_inf(
+                        &projected_residual_vec,
+                        &joint_hessian_source,
+                        &ranges,
+                        &s_lambdas,
+                        ridge,
+                        options.ridge_policy,
+                        total_p,
+                    )
+                    && range_residual <= 4.0 * residual_tol
+                {
+                    log::info!(
+                        "[PIRLS/joint-Newton convergence] cycle {:>3} | residual-stall range-space certificate (gam#1040): \
+                         total projected residual={:.3e} > tol={:.3e} stalled for {} cycles, but its range-space component={:.3e} \
+                         ≤ 4×tol={:.3e} and |Δobjective|={:.3e} ≤ obj_tol={:.3e}; the stalled mass is a free \
+                         ker(H_pen) gauge direction the outer IFT pseudo-inverse projects out — accepting as stationary \
+                         on the identifiable subspace.",
+                        cycle,
+                        residual,
+                        residual_tol,
+                        cycles_since_residual_improved,
+                        range_residual,
+                        4.0 * residual_tol,
+                        objective_change,
+                        objective_tol,
+                    );
+                    converged = true;
+                    break;
+                }
                 let last_math_summary = last_joint_math
                     .as_ref()
                     .map(|math| {
