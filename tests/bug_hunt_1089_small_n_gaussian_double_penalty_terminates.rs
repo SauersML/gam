@@ -65,48 +65,53 @@ fn gaussian_cfg() -> FitConfig {
     }
 }
 
-/// The literal wine_gamair regime: n=30 against a design whose penalized basis
-/// (p ≈ 51) is wider than the data. Such a fit is rank-deficient and its REML
-/// surface is flat in the unidentified directions, which is exactly what let
-/// the outer optimizer wander through ~850k cost-only evaluations until the
-/// 42-minute shard budget killed it. The fit must instead be refused
-/// *promptly* with an actionable error, never enter the unbounded outer search.
+/// The literal wine_gamair regime: n=30 against five `select=TRUE`
+/// (double-penalty) `ps` smooths whose summed basis (p ≈ 51) is wider than the
+/// data. mgcv fits this exact shape in milliseconds because the shrinkage
+/// penalties — not the data — set the effective rank; gam must do the same.
+/// The pre-fix behavior was the opposite extreme: the outer REML optimizer
+/// wandered the flat overparameterized surface through ~850k cost-only
+/// evaluations until the 42-minute shard budget killed it (#1089).
+///
+/// The fix recognizes that a double-penalized basis needs no unpenalized
+/// data identification, so the capacity gate admits the fit, and the bounded
+/// outer loop drives it to a converged optimum promptly.
 #[test]
-fn wine_shaped_overparameterized_fit_is_refused_promptly_not_hung() {
+fn wine_shaped_double_penalty_fit_converges_promptly() {
     let data = build_data(30, 0.1, 1089);
 
     let start = std::time::Instant::now();
-    let result = fit_from_formula(WINE_SHAPED_FORMULA, &data, &gaussian_cfg());
+    let result =
+        fit_from_formula(WINE_SHAPED_FORMULA, &data, &gaussian_cfg()).expect("n=30 wine-shaped fit");
     let elapsed = start.elapsed();
 
-    // The defining symptom of #1089 was the *absence* of termination. Whatever
-    // the decision (refuse or fit), it must come back fast — the 42-minute
-    // wall-budget death cannot recur. A couple of seconds is a generous
-    // ceiling for a refusal decision on n=30.
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit");
+    };
+
+    // The defining symptom of #1089 was the absence of termination. The fit
+    // must converge in a bounded number of outer steps, not bail at the cap.
     assert!(
-        elapsed.as_secs() < 30,
-        "n=30 wine-shaped fit took {:.1}s to return; the outer loop is not \
-         terminating promptly (the #1089 hang)",
-        elapsed.as_secs_f64(),
+        fit.fit.outer_converged,
+        "n=30 wine-shaped double-penalty fit did not converge \
+         (outer_iterations={})",
+        fit.fit.outer_iterations,
+    );
+    assert!(
+        fit.fit.outer_iterations <= 200,
+        "outer REML loop took {} iterations on the n=30 wine-shaped fit; \
+         expected prompt convergence under the iteration cap",
+        fit.fit.outer_iterations,
     );
 
-    // The honest outcome for an n < (penalized basis dof) design is a refusal
-    // with an actionable message, not a silent ill-posed grind.
-    match result {
-        Err(err) => {
-            let msg = err.to_string();
-            assert!(
-                msg.contains("not enough observations") || msg.contains("rows"),
-                "n=30 overparameterized fit should be refused with a row-count \
-                 message; got: {msg}"
-            );
-        }
-        Ok(_) => {
-            // A fit is acceptable too, *provided* it terminated promptly (the
-            // elapsed assert above). The bug was the hang, not the existence
-            // of a result.
-        }
-    }
+    // The 42-minute wall-budget death cannot recur: a trivial n=30 fit must
+    // return in seconds, not minutes.
+    assert!(
+        elapsed.as_secs() < 60,
+        "n=30 wine-shaped fit took {:.1}s; the outer loop is not terminating \
+         promptly (the #1089 hang)",
+        elapsed.as_secs_f64(),
+    );
 }
 
 /// Companion: lift the same wine-shaped design above the basis-capacity floor
