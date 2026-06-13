@@ -26665,6 +26665,7 @@ fn nuts_method_label(model: &FittedModel) -> &'static str {
         PredictModelClass::GaussianLocationScale
         | PredictModelClass::BinomialLocationScale
         | PredictModelClass::BernoulliMarginalSlope
+        | PredictModelClass::DispersionLocationScale
         | PredictModelClass::TransformationNormal => "laplace",
     }
 }
