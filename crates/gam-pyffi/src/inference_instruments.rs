@@ -355,7 +355,9 @@ fn riesz_functional_gradient(
             )));
         }
     };
-    functional.gradient().map_err(py_value_error)
+    functional
+        .gradient()
+        .map_err(|err| py_value_error(format!("debiased_functional: {err}")))
 }
 
 /// Riesz-representer debiased / Neyman-orthogonal estimate of a smooth
@@ -428,7 +430,8 @@ pub(crate) fn debiased_functional<'py>(
         penalty_beta: penalty_beta.view(),
         leverage: leverage.as_ref().map(|l| l.view()),
     };
-    let report = debias_with_dense_hessian(&input, hessian.view()).map_err(py_value_error)?;
+    let report = debias_with_dense_hessian(&input, hessian.view())
+        .map_err(|err| py_value_error(format!("debiased_functional: {err}")))?;
 
     let half_width = 1.959_963_984_540_054 * report.se;
     let out = PyDict::new(py);
