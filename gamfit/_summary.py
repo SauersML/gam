@@ -34,6 +34,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "lambdas",
     "coefficients",
     "smooth_terms",
+    "curvature_estimands",
     "covariance_kind",
     "covariance_n",
     "covariance_flat",
@@ -128,6 +129,11 @@ class Summary:
     lambdas: list[float] = field(default_factory=list)
     coefficients: list[dict[str, Any]] = field(default_factory=list)
     smooth_terms: list[dict[str, Any]] = field(default_factory=list)
+    #: Fitted curvature κ̂ point estimates for any ``curv(...)`` constant-curvature
+    #: smooths (#944): one dict per term with ``name``, ``term_idx``,
+    #: ``kappa_hat``, and a sign-of-κ̂ ``geometry`` tag. The profile CI and the
+    #: κ = 0 flatness p-value (which need a refit) come from ``Model.curvature``.
+    curvature_estimands: list[dict[str, Any]] = field(default_factory=list)
     covariance_kind: str | None = None
     covariance_n: int | None = None
     covariance_flat: list[float] | None = None

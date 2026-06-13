@@ -66,6 +66,16 @@ pub enum AutoTopologyKind {
     Sphere,
     Torus,
     Cylinder,
+    /// Constant-curvature space form `M_κ` with the sectional curvature κ
+    /// ESTIMATED (#944 stage 4). This single candidate replaces the family of
+    /// fixed simply-connected constant-curvature geometries — `Euclidean`
+    /// (κ = 0), `Sphere` (κ > 0), and the hyperbolic disk (κ < 0) — which are
+    /// all the same `S^d ← ℝ^d → H^d` manifold at different κ. Rather than
+    /// racing those as separate discrete candidates, the curvature is fitted as
+    /// a continuous estimand (`curv(...)`), so the topology stack only has to
+    /// adjudicate genuinely non-homotopic candidates (`Circle`/`Torus`/
+    /// `Cylinder`/discrete rungs). "Within a candidate, curvature is estimated."
+    ConstantCurvature,
     /// Discrete `k`-component Gaussian-mixture rung (Object 3a / WP-C). Not a
     /// smooth manifold: a finite-parameter clustered density. Its presence in a
     /// race triggers cross-class stacking adjudication.
@@ -95,6 +105,7 @@ impl AutoTopologyKind {
             AutoTopologyKind::Sphere => "sphere",
             AutoTopologyKind::Torus => "torus",
             AutoTopologyKind::Cylinder => "cylinder",
+            AutoTopologyKind::ConstantCurvature => "constant_curvature",
             AutoTopologyKind::Mixture { .. } => "mixture",
             AutoTopologyKind::Union { structure } => structure.as_str(),
         }

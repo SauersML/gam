@@ -451,6 +451,14 @@ struct PredictionPayload {
     /// The shaper consults it alongside `model_class` to disambiguate the
     /// Bernoulli marginal-slope path from the survival marginal-slope variant.
     family: String,
+    /// Provenance of the returned prediction interval (#942). Present only when
+    /// an interval was requested. `"jackknife+ (distribution-free, finite-sample
+    /// ≥level coverage)"` when the exact Gaussian-identity jackknife+ magic ran;
+    /// `"model-based (Gaussian posterior)"` when the eligibility gate fell back
+    /// to the model's credible/predictive band. `None` (omitted) for point-only
+    /// predictions or model classes that do not carry the field yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interval_method: Option<String>,
 }
 
 /// JSON wire format for NUTS posterior draws.
@@ -9525,6 +9533,14 @@ fn sae_manifold_fit_inner<'py>(
         "residual_gauge",
         sae_residual_gauge_dict(py, &fit_diagnostics.residual_gauge)?,
     )?;
+    // #1026 — the load-bearing curved-vs-linear hybrid-split verdict: per d=1
+    // atom, whether its fitted curved image beats its straight (linear
+    // special-case) secant on the common Laplace evidence scale. Present
+    // whenever the post-fit pass adjudicated at least one eligible atom; absent
+    // for dictionaries with no eligible d=1 atom (nothing to split).
+    if let Some(report) = term.hybrid_split_report() {
+        out.set_item("hybrid_split", sae_hybrid_split_dict(py, report)?)?;
+    }
     if let Some(report) = &fit_diagnostics.incoherence_report {
         out.set_item(
             "incoherence_report",
@@ -9692,6 +9708,53 @@ fn certificate_ledger_dict<'py>(
     }
     out.set_item("claims", claims)?;
     Ok(out)
+}
+
+/// Build the result-dict entry for the #1026 hybrid curved-vs-linear split
+/// ([`gam::terms::sae::hybrid_split::SaeHybridSplitReport`]). One per-atom
+/// verdict (curved vs linear, the evidence margin, the fitted turning Θ that
+/// decided it) plus the dictionary-level aggregates the EV-vs-Θ frontier reports
+/// against. Honest by construction: a curved atom that does not beat its straight
+/// secant on evidence is reported as collapsed to the linear tail.
+fn sae_hybrid_split_dict<'py>(
+    py: Python<'py>,
+    report: &gam::terms::sae::hybrid_split::SaeHybridSplitReport,
+) -> PyResult<Bound<'py, PyDict>> {
+    use gam::solver::evidence::HybridAtomParam;
+    let d = PyDict::new(py);
+    d.set_item("curved_atom_count", report.selection.curved_atom_count)?;
+    d.set_item("linear_atom_count", report.selection.linear_atom_count())?;
+    d.set_item(
+        "total_negative_log_evidence",
+        report.selection.total_negative_log_evidence,
+    )?;
+    d.set_item("total_parameters", report.selection.total_parameters)?;
+    d.set_item("is_pure_linear", report.selection.is_pure_linear())?;
+    d.set_item("is_pure_curved", report.selection.is_pure_curved())?;
+    let atoms = PyList::empty(py);
+    for verdict in &report.verdicts {
+        let a = PyDict::new(py);
+        a.set_item("atom", &verdict.atom_name)?;
+        a.set_item("kept_curved", verdict.kept_curved)?;
+        let param = match verdict.choice.param {
+            HybridAtomParam::Linear => "linear".to_string(),
+            HybridAtomParam::Curved { latent_dim } => format!("curved(d={latent_dim})"),
+        };
+        a.set_item("parameterization", param)?;
+        a.set_item("negative_log_evidence", verdict.choice.negative_log_evidence)?;
+        a.set_item("num_parameters", verdict.choice.num_parameters)?;
+        a.set_item(
+            "curved_evidence_margin",
+            verdict.choice.curved_evidence_margin,
+        )?;
+        match verdict.choice.curved_turning {
+            Some(theta) => a.set_item("fitted_turning", theta)?,
+            None => a.set_item("fitted_turning", py.None())?,
+        }
+        atoms.append(a)?;
+    }
+    d.set_item("atoms", atoms)?;
+    Ok(d)
 }
 
 /// Build the result-dict entry for the residual-gauge certificate
@@ -23534,6 +23597,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(posterior_trace_selection_json, module)?)?;
     module.add_function(wrap_pyfunction!(apply_inverse_link_array, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
+    module.add_function(wrap_pyfunction!(curvature_inference_json, module)?)?;
     module.add_function(wrap_pyfunction!(summary_payload_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(smoothing_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(model_group_metadata, module)?)?;
@@ -28108,6 +28172,145 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     serde_json::to_string(&payload).map_err(|err| format!("failed to serialize summary: {err}"))
 }
 
+/// One `curv(...)` term's #944 report, JSON-serialized for the Python surface.
+#[derive(Serialize)]
+struct CurvatureInferenceRow {
+    name: String,
+    term_idx: usize,
+    kappa_hat: f64,
+    ci_lo: f64,
+    ci_hi: f64,
+    /// `true` when the CI is left-open at the κ chart bound (profile too flat to
+    /// close the lower endpoint).
+    lo_at_bound: bool,
+    /// `true` when the CI is right-open at the κ chart bound.
+    hi_at_bound: bool,
+    /// Sign-of-CI geometry verdict: `"spherical"`, `"hyperbolic"`, `"flat"`, or
+    /// `"indistinguishable"` (CI straddles 0).
+    verdict: &'static str,
+    /// LR statistic `2[V_p(0) − V_p(κ̂)] ≥ 0` for the interior κ = 0 test.
+    flatness_lr_stat: f64,
+    /// p-value of the κ = 0 flatness test against the interior χ²₁ reference
+    /// (no half-χ² boundary correction — κ = 0 is interior to S^d ← ℝ^d → H^d).
+    flatness_p_value: f64,
+}
+
+#[derive(Serialize)]
+struct CurvatureInferencePayload {
+    level: f64,
+    curvature_terms: Vec<CurvatureInferenceRow>,
+}
+
+fn curvature_verdict_label(v: gam::geometry::CurvatureVerdict) -> &'static str {
+    match v {
+        gam::geometry::CurvatureVerdict::Spherical => "spherical",
+        gam::geometry::CurvatureVerdict::Hyperbolic => "hyperbolic",
+        gam::geometry::CurvatureVerdict::Flat => "flat",
+        gam::geometry::CurvatureVerdict::Indistinguishable => "indistinguishable",
+    }
+}
+
+/// #944: re-profile `V_p(κ)` for every `curv(...)` smooth and emit κ̂ + profile
+/// CI + κ = 0 flatness test. The κ̂ lives in the saved (fitted) spec; the data
+/// supply the responses/weights/offset the per-κ profile refits read. We
+/// materialize a Standard fit request from the model's training formula + data,
+/// then swap in the model's fitted spec and family so the profile oracle refits
+/// at the EXACT estimand the model was fitted under — only κ moves.
+fn curvature_inference_json_impl(
+    model_bytes: &[u8],
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    level: f64,
+) -> Result<String, String> {
+    use gam::smooth::SmoothBasisSpec;
+    if !(level.is_finite() && level > 0.0 && level < 1.0) {
+        return Err(format!(
+            "curvature_inference: confidence level must be in (0, 1), got {level}"
+        ));
+    }
+    let model = load_model_impl(model_bytes)?;
+    let formula = model.payload().formula.clone();
+    let spec = model
+        .payload()
+        .resolved_termspec
+        .as_ref()
+        .ok_or_else(|| {
+            "curvature_inference requires the saved resolved_termspec (carries κ̂); refit"
+                .to_string()
+        })?
+        .clone();
+    // Fast bail: no constant-curvature term ⇒ empty report (no refit, no data
+    // materialization needed).
+    let has_curv = spec
+        .smooth_terms
+        .iter()
+        .any(|t| matches!(t.basis, SmoothBasisSpec::ConstantCurvature { .. }));
+    if !has_curv {
+        let payload = CurvatureInferencePayload {
+            level,
+            curvature_terms: Vec::new(),
+        };
+        return serde_json::to_string(&payload)
+            .map_err(|err| format!("failed to serialize curvature inference: {err}"));
+    }
+
+    // Materialize responses/weights/offset/options from the training data under
+    // the model's own family. We replace the materialized (default-κ) spec with
+    // the FITTED spec so the V_p oracle profiles around κ̂ — only κ moves.
+    let dataset = dataset_with_inferred_schema(headers, rows)?;
+    let (fit_config, _table_kind) = parse_fit_config(None)?;
+    let materialized = materialize(&formula, &dataset, &fit_config)?;
+    let standard = match materialized.request {
+        FitRequest::Standard(request) => request,
+        _ => {
+            return Err(
+                "curvature_inference: only standard (non marginal-slope / non survival) \
+                 models carry a profileable κ; this model uses a specialized fit request"
+                    .to_string(),
+            );
+        }
+    };
+
+    let family = model.likelihood();
+    let mut terms_out = Vec::<CurvatureInferenceRow>::new();
+    for (term_idx, term) in spec.smooth_terms.iter().enumerate() {
+        if !matches!(term.basis, SmoothBasisSpec::ConstantCurvature { .. }) {
+            continue;
+        }
+        let report = gam::smooth::curvature_inference_forspec(
+            standard.data.view(),
+            standard.y.view(),
+            standard.weights.view(),
+            standard.offset.view(),
+            &spec,
+            term_idx,
+            family.clone(),
+            &standard.options,
+            level,
+        )
+        .map_err(|e| format!("curvature_inference for term {term_idx}: {e}"))?;
+        terms_out.push(CurvatureInferenceRow {
+            name: term.name.clone(),
+            term_idx,
+            kappa_hat: report.kappa_hat,
+            ci_lo: report.ci.ci_lo,
+            ci_hi: report.ci.ci_hi,
+            lo_at_bound: report.ci.lo_at_bound,
+            hi_at_bound: report.ci.hi_at_bound,
+            verdict: curvature_verdict_label(report.ci.verdict),
+            flatness_lr_stat: report.flatness.lr_stat,
+            flatness_p_value: report.flatness.p_value,
+        });
+    }
+
+    let payload = CurvatureInferencePayload {
+        level,
+        curvature_terms: terms_out,
+    };
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize curvature inference: {err}"))
+}
+
 fn check_json_impl(
     model_bytes: &[u8],
     headers: Vec<String>,
@@ -30623,6 +30826,67 @@ fn compute_null_space_metadata(
     }
 }
 
+/// Precompute the exact Gaussian-identity jackknife+ statistics (#942) at fit
+/// time, *iff* the model is eligible: a standard Gaussian-identity GLM with unit
+/// prior weights (no `weight_column`), an offset-free primary predictor (an
+/// offset shifts η but the jackknife+ residuals are formed on the response, so
+/// it would have to be threaded into the design; out of scope here), and a
+/// fitted penalized Hessian `M = XᵀX + Sλ` available. Returns `None` (never an
+/// error) for any ineligible model — predict then falls back to the model-based
+/// band with honest provenance.
+///
+/// The penalized Hessian stored in `FitGeometry` *is* `M` for this family
+/// (unit working weights, dispersion-unscaled), so the substrate replays the
+/// exact normal matrix the fit used — no penalty re-derivation.
+fn gaussian_jackknife_plus_stats_for_standard_fit(
+    formula: &str,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    family: &LikelihoodSpec,
+    saved_fit: &gam::estimate::UnifiedFitResult,
+    design: &TermCollectionDesign,
+) -> Option<gam::inference::full_conformal::GaussianJackknifePlusStats> {
+    if !matches!(family.response, ResponseFamily::Gaussian) {
+        return None;
+    }
+    if !matches!(family.link, InverseLink::Identity) {
+        return None;
+    }
+    if fit_config.weight_column.is_some() {
+        return None;
+    }
+    if fit_config.offset_column.is_some() {
+        return None;
+    }
+    // A wiggle-augmented link breaks the Gaussian-identity closed form.
+    if fit_config.flexible_link {
+        return None;
+    }
+    let response_name = response_column_name(formula)?;
+    let col_map = dataset.column_map();
+    let response_col = *col_map.get(&response_name)?;
+    let y = dataset.values.column(response_col).to_owned();
+    let x = design.design.try_to_dense_arc("jackknife+ design").ok()?;
+    if x.nrows() != y.len() {
+        return None;
+    }
+    let m = saved_fit.penalized_hessian()?;
+    if m.nrows() != x.ncols() || m.ncols() != x.ncols() {
+        return None;
+    }
+    let weights = Array1::<f64>::ones(y.len());
+    // `from_design_unit_weight_normal_matrix` re-validates unit weights and the
+    // shapes; any internal degeneracy (e.g. a leverage-one row) returns Err,
+    // which we swallow to `None` — predict stays valid, just without the magic.
+    gam::inference::full_conformal::GaussianJackknifePlusStats::from_design_unit_weight_normal_matrix(
+        x.as_ref(),
+        &y,
+        &weights,
+        m,
+    )
+    .ok()
+}
+
 fn build_standard_payload(
     formula: String,
     dataset: &EncodedDataset,
@@ -30650,6 +30914,18 @@ fn build_standard_payload(
     let family_link = family.link_function();
     let family_inverse_link = family.link.clone();
     let family_name = family.name().to_string();
+    // #942 MAGIC: precompute the exact Gaussian-identity jackknife+ substrate
+    // (distribution-free, finite-sample ≥level coverage with no held-out fold)
+    // while the training design + response are still in hand. `None` for any
+    // ineligible model; predict falls back to the model-based band.
+    let jackknife_plus_stats = gaussian_jackknife_plus_stats_for_standard_fit(
+        &formula,
+        dataset,
+        fit_config,
+        &family,
+        &saved_fit,
+        design,
+    );
     let mut payload = FittedModelPayload::new(
         MODEL_PAYLOAD_VERSION,
         formula,
@@ -30674,6 +30950,7 @@ fn build_standard_payload(
     payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
+    payload.gaussian_jackknife_plus = jackknife_plus_stats;
     Ok(payload)
 }
 
@@ -31158,6 +31435,67 @@ fn build_binomial_location_scale_ffi_payload(
         LocationScaleResponse::Binomial {
             link: link_kind,
             noise_transform: &binomial_noise_transform,
+        },
+        SavedModelSourceMetadata {
+            training_headers: dataset.headers.clone(),
+            training_feature_ranges: Some(dataset.feature_ranges()),
+            offset_column: fit_config.offset_column.clone(),
+            noise_offset_column: fit_config.noise_offset_column.clone(),
+        },
+    )
+}
+
+/// Assemble the saved-model payload for a genuine-dispersion location-scale fit
+/// (#913): NegativeBinomial / Gamma / Beta / Tweedie with a `noise_formula` on
+/// the overdispersion channel. Mirrors the CLI dispersion save path
+/// (`assemble_location_scale_payload` + `LocationScaleResponse::Dispersion`),
+/// deriving the persisted likelihood and mean base-link from the single
+/// source of truth on [`DispersionFamilyKind`]. The log-precision block
+/// coefficients ride in `beta_noise`; there is no link-wiggle and no response
+/// standardization for these families.
+fn build_dispersion_location_scale_ffi_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    kind: DispersionFamilyKind,
+    ls_result: DispersionLocationScaleFitResult,
+) -> Result<FittedModelPayload, String> {
+    let frozen_meanspec = freeze_term_collection_from_design(
+        &ls_result.fit.meanspec_resolved,
+        &ls_result.fit.mean_design,
+    )
+    .map_err(|err| format!("failed to freeze dispersion location-scale mean spec: {err}"))?;
+    let frozen_noisespec = freeze_term_collection_from_design(
+        &ls_result.fit.noisespec_resolved,
+        &ls_result.fit.noise_design,
+    )
+    .map_err(|err| format!("failed to freeze dispersion location-scale noise spec: {err}"))?;
+
+    let noise_formula = fit_config
+        .noise_formula
+        .clone()
+        .ok_or_else(|| "dispersion location-scale requires noise_formula".to_string())?;
+
+    let fit = ls_result.fit.fit;
+    let scale_beta = fit
+        .block_by_role(BlockRole::Scale)
+        .map(|block| block.beta.to_vec());
+
+    assemble_location_scale_payload(
+        LocationScaleInputs {
+            formula,
+            data_schema: dataset.schema.clone(),
+            noise_formula,
+            resolved_termspec: frozen_meanspec,
+            resolved_termspec_noise: frozen_noisespec,
+            fit_result: fit,
+            beta_noise: scale_beta,
+            wiggle: None,
+        },
+        LocationScaleResponse::Dispersion {
+            likelihood: kind.likelihood_spec(),
+            base_link: kind.base_link(),
+            family_tag: kind.family_tag(),
         },
         SavedModelSourceMetadata {
             training_headers: dataset.headers.clone(),
