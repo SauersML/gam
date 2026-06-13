@@ -173,9 +173,9 @@ def main() -> None:
 
         # Feed into cumulative gate (shard = this checkpoint)
         gate.absorb_shard(ll_alt, ll_null)
-        log_e = float(gate.log_e_value)
-        verdict = str(gate.verdict)
-        certified = bool(gate.certified)
+        log_e = float(gate.log_e_value())
+        verdict = str(gate.verdict())
+        certified = bool(gate.certified())
         cumulative_log_e.append(dict(
             ckpt=ckpt, log_e=log_e, verdict=verdict, certified=certified,
             ll_alt=float(ll_alt), ll_null=float(ll_null),

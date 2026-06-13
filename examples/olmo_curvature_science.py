@@ -67,21 +67,27 @@ def fit_curvature(Z: np.ndarray, label: str) -> dict:
 
     t0 = time.time()
     try:
-        m = gamfit.Model(formula, data=df, family="gaussian")
-        m.fit()
-        result = m.curvature(df)
+        m = gamfit.fit(df, formula, family="gaussian")
+        curv_list = m.curvature(df)
+        # curvature() returns a list of per-curv()-term dicts
+        # We use the first term (we only have one curv() block)
+        result = curv_list[0] if curv_list else {}
         elapsed = time.time() - t0
-        print(f"  [{label}] done in {elapsed:.1f}s  κ̂={result['kappa_hat']:.4f} "
-              f"CI=[{result['ci_lo']:.4f},{result['ci_hi']:.4f}] "
-              f"verdict={result['verdict']}", flush=True)
+        khat = float(result.get("kappa_hat", float("nan")))
+        ci_lo = float(result.get("ci_lo", float("nan")))
+        ci_hi = float(result.get("ci_hi", float("nan")))
+        verdict = str(result.get("verdict", "unknown"))
+        print(f"  [{label}] done in {elapsed:.1f}s  κ̂={khat:.4f} "
+              f"CI=[{ci_lo:.4f},{ci_hi:.4f}] verdict={verdict}", flush=True)
         return dict(
             label=label,
             n=n, d=d,
-            kappa_hat=float(result["kappa_hat"]),
-            ci_lo=float(result["ci_lo"]),
-            ci_hi=float(result["ci_hi"]),
-            verdict=str(result["verdict"]),
-            flatness_lr_pvalue=float(result.get("flatness_lr_pvalue", float("nan"))),
+            kappa_hat=khat,
+            ci_lo=ci_lo,
+            ci_hi=ci_hi,
+            verdict=verdict,
+            flatness_lr_pvalue=float(result.get("flatness_p_value",
+                                                 result.get("flatness_lr_pvalue", float("nan")))),
             elapsed=elapsed,
             error=None,
         )
