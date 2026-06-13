@@ -427,8 +427,8 @@ fn centers_mean_geodesic_distance_jet(
     let mut cnt = 0.0_f64;
     for i in 0..m {
         for j in (i + 1)..m {
-            let (d, d1, d2) =
-                distance_kappa_jet(&manifold, centers.row(i), centers.row(j)).map_err(|e| {
+            let (d, d1, d2) = distance_kappa_jet(&manifold, centers.row(i), centers.row(j))
+                .map_err(|e| {
                     BasisError::InvalidInput(format!(
                         "constant-curvature center geodesic κ-jet failed at ({i},{j}): {e}"
                     ))
@@ -440,9 +440,7 @@ fn centers_mean_geodesic_distance_jet(
         }
     }
     if cnt <= 0.0 {
-        crate::bail_invalid_basis!(
-            "constant-curvature geodesic scale needs at least two centers"
-        );
+        crate::bail_invalid_basis!("constant-curvature geodesic scale needs at least two centers");
     }
     Ok((s / cnt, s1 / cnt, s2 / cnt))
 }
@@ -534,8 +532,7 @@ pub fn build_constant_curvature_basis(
         }
     };
     let penalty = z.t().dot(&raw_penalty).dot(&z);
-    let raw_design =
-        constant_curvature_kernel_matrix(data, centers.view(), spec.kappa, ell_eff)?;
+    let raw_design = constant_curvature_kernel_matrix(data, centers.view(), spec.kappa, ell_eff)?;
     let design = crate::matrix::DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
         raw_design.dot(&z),
     ));
@@ -800,8 +797,8 @@ mod tests {
         let weights = Array1::<f64>::ones(centers.nrows());
         let z = weighted_coefficient_sum_to_zero_transform(weights.view()).unwrap();
         let logdet_norm_penalty = |kappa: f64, ell: f64| -> f64 {
-            let k =
-                constant_curvature_kernel_matrix(centers.view(), centers.view(), kappa, ell).unwrap();
+            let k = constant_curvature_kernel_matrix(centers.view(), centers.view(), kappa, ell)
+                .unwrap();
             let s_raw = symmetrize(&z.t().dot(&k).dot(&z));
             let (s_norm, _c) = normalize_penalty(&s_raw);
             let sym = symmetrize(&s_norm);
@@ -857,18 +854,22 @@ mod tests {
         //   (b) log|S_raw(κ)/c₀|_+     (frozen-c₀ normalization at κ=0)
         // Both should be κ-IDENTIFYING (a real interior optimum), not monotone.
         let logdet_raw = |kappa: f64, ell: f64, c0: f64| -> f64 {
-            let k =
-                constant_curvature_kernel_matrix(centers.view(), centers.view(), kappa, ell).unwrap();
+            let k = constant_curvature_kernel_matrix(centers.view(), centers.view(), kappa, ell)
+                .unwrap();
             let s_raw = symmetrize(&z.t().dot(&k).dot(&z));
             let scaled = s_raw.mapv(|v| v / c0);
             let (evals, _v) = FaerEigh::eigh(&scaled, faer::Side::Lower).unwrap();
             let max = evals.iter().cloned().fold(0.0_f64, f64::max);
             let tol = max * 1e-9;
-            evals.iter().filter(|&&e| e > tol).map(|&e| e.ln()).sum::<f64>()
+            evals
+                .iter()
+                .filter(|&&e| e > tol)
+                .map(|&e| e.ln())
+                .sum::<f64>()
         };
         // c₀ = ‖S_raw(κ=0)‖_F at frozen ℓ.
-        let k0 =
-            constant_curvature_kernel_matrix(centers.view(), centers.view(), 0.0, ell_frozen).unwrap();
+        let k0 = constant_curvature_kernel_matrix(centers.view(), centers.view(), 0.0, ell_frozen)
+            .unwrap();
         let s_raw0 = symmetrize(&z.t().dot(&k0).dot(&z));
         let c0 = s_raw0.iter().map(|v| v * v).sum::<f64>().sqrt();
         let r_neg = logdet_raw(-2.0, ell_frozen, c0);

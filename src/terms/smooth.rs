@@ -1,7 +1,6 @@
 use crate::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions,
-    BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError, BasisMetadata,
-    BasisPsiDerivativeResult,
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
+    BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeResult,
     BasisPsiSecondDerivativeResult, BasisWorkspace, CenterStrategy, CenterStrategyKind,
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, DuchonBasisSpec,
     KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability, MeasureJetBasisSpec,
@@ -21598,7 +21597,11 @@ pub fn curvature_inference_forspec(
             return Err(format!("V_p probed a non-finite κ = {kappa}"));
         }
         let mut probe_spec = resolvedspec.clone();
-        match probe_spec.smooth_terms.get_mut(term_idx).map(|t| &mut t.basis) {
+        match probe_spec
+            .smooth_terms
+            .get_mut(term_idx)
+            .map(|t| &mut t.basis)
+        {
             Some(SmoothBasisSpec::ConstantCurvature { spec, .. }) => spec.kappa = kappa,
             _ => {
                 return Err(format!(
@@ -21621,7 +21624,9 @@ pub fn curvature_inference_forspec(
         if score.is_finite() {
             Ok(score)
         } else {
-            Err(format!("V_p fixed-κ fit at κ={kappa} returned a non-finite score"))
+            Err(format!(
+                "V_p fixed-κ fit at κ={kappa} returned a non-finite score"
+            ))
         }
     };
 
@@ -21638,9 +21643,8 @@ pub fn curvature_inference_forspec(
         &v_p, kappa_hat, v_pp, kappa_min, kappa_max, level, 1e-4,
     )
     .map_err(EstimationError::InvalidInput)?;
-    let flatness =
-        crate::geometry::curvature_estimand::flatness_lr_test(&v_p, kappa_hat)
-            .map_err(EstimationError::InvalidInput)?;
+    let flatness = crate::geometry::curvature_estimand::flatness_lr_test(&v_p, kappa_hat)
+        .map_err(EstimationError::InvalidInput)?;
 
     Ok(CurvatureInference {
         term_idx,
@@ -21864,9 +21868,11 @@ pub fn smooth_term_lr_inference_forspec(
         let mut statistic_corrected = statistic_lr;
         let mut p_corrected = p_uncorrected;
         let mut correction = SmoothLrCorrection::None;
-        if let (Some(eta), true, true) =
-            (eta_null.as_ref(), statistic_lr.is_finite(), n <= LAWLEY_PAIR_MATRIX_MAX_ROWS)
-        {
+        if let (Some(eta), true, true) = (
+            eta_null.as_ref(),
+            statistic_lr.is_finite(),
+            n <= LAWLEY_PAIR_MATRIX_MAX_ROWS,
+        ) {
             let kappas: Option<Vec<_>> = (0..n)
                 .map(|i| {
                     known_scale_expected_jets_with_dispersion(&family, eta[i], family_disp)
@@ -21948,10 +21954,10 @@ fn wood_reference_df(influence: Option<&Array2<f64>>, coeff_range: &Range<usize>
 mod tests {
     use super::*;
     use crate::basis::{
-        BSplineBasisSpec, BSplineEndpointBoundaryCondition, BSplineIdentifiability, BSplineKnotSpec,
-        BasisOptions, CenterStrategy,
-        Dense, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource,
-        MaternBasisSpec, MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
+        BSplineBasisSpec, BSplineEndpointBoundaryCondition, BSplineIdentifiability,
+        BSplineKnotSpec, BasisOptions, CenterStrategy, Dense, DuchonBasisSpec,
+        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource, MaternBasisSpec,
+        MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
     };
     use crate::estimate::AdaptiveRegularizationOptions;
     use crate::faer_ndarray::{FaerEigh, FaerSvd};

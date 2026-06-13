@@ -202,10 +202,7 @@ impl AutoTopologyKind {
     /// [`ConstantCurvature`](AutoTopologyKind::ConstantCurvature) candidate is
     /// itself the fusion target, not a member to be fused.
     pub const fn is_fixed_constant_curvature_form(self) -> bool {
-        matches!(
-            self,
-            AutoTopologyKind::Euclidean | AutoTopologyKind::Sphere
-        )
+        matches!(self, AutoTopologyKind::Euclidean | AutoTopologyKind::Sphere)
     }
 
     /// #944 stage 4 — "within a candidate, curvature is estimated." Collapse the

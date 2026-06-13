@@ -283,7 +283,8 @@ fn large_fold_keeps_split_conformal_and_covers() {
 
     let conf = predict_with_conformal(&fit, &cal_design, &y_cal, &test_design, Some(nominal));
     assert!(
-        conf.mean_lower.iter().all(|v| v.is_finite()) && conf.mean_upper.iter().all(|v| v.is_finite()),
+        conf.mean_lower.iter().all(|v| v.is_finite())
+            && conf.mean_upper.iter().all(|v| v.is_finite()),
         "large-fold conformal intervals must be finite"
     );
     let inside = (0..test_design.nrows())

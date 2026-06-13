@@ -7208,9 +7208,9 @@ impl SaeManifoldTerm {
                     || captured_fraction < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION);
             previous_loss_total = new_loss_total;
             if stalled && refine_rounds >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
-                let stationary_sys =
-                    self.assemble_arrow_schur(target, rho_fixed, registry)
-                        .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
+                let stationary_sys = self
+                    .assemble_arrow_schur(target, rho_fixed, registry)
+                    .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
                 if let Ok((_dt, _db, stationary_cache)) =
                     solve_arrow_newton_step_with_options(&stationary_sys, 0.0, 0.0, options)
                 {

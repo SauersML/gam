@@ -7391,7 +7391,11 @@ mod tests {
             latent_z_conditional_calibration: None,
         };
         let theta = predictor.theta();
-        assert_eq!(theta.len(), 2, "rigid marginal-slope θ is [marginal | logslope]");
+        assert_eq!(
+            theta.len(),
+            2,
+            "rigid marginal-slope θ is [marginal | logslope]"
+        );
         let input = PredictInput {
             design: DesignMatrix::from(array![[1.0], [1.0], [1.0]]),
             offset: array![0.0, 0.05, -0.10],
@@ -7446,9 +7450,15 @@ mod tests {
             let lo = normal_cdf(eta[i] - z * se_oracle).clamp(0.0, 1.0);
             let hi = normal_cdf(eta[i] + z * se_oracle).clamp(0.0, 1.0);
             let mean = normal_cdf(eta[i]);
-            assert!(lo <= mean + 1e-12 && hi >= mean - 1e-12, "row {i}: band brackets mean");
+            assert!(
+                lo <= mean + 1e-12 && hi >= mean - 1e-12,
+                "row {i}: band brackets mean"
+            );
             assert!((0.0..=1.0).contains(&lo) && (0.0..=1.0).contains(&hi));
-            assert!(hi - lo > 0.0, "row {i}: TransformEta band has positive width");
+            assert!(
+                hi - lo > 0.0,
+                "row {i}: TransformEta band has positive width"
+            );
         }
     }
 

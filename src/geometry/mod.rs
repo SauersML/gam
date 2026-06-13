@@ -38,7 +38,7 @@ pub use manifold::{GeometryError, GeometryResult, ManifoldSpec, RiemannianManifo
 pub use optimizer::{RiemannianLBFGS, RiemannianObjective, RiemannianTrustRegion};
 pub use product::ProductManifold;
 pub use response_geometry::{
-    response_exp_map, response_frechet_mean, response_log_map, ResponseManifold,
+    ResponseManifold, response_exp_map, response_frechet_mean, response_log_map,
 };
 pub use spd::{SpdManifold, spd_frechet_mean};
 pub use sphere::SphereManifold;

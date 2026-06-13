@@ -64,8 +64,8 @@ fn probe_one(basis: &str, d: usize, ds: &gam::data::EncodedDataset) {
         ..FitConfig::default()
     };
     let start = Instant::now();
-    let res = fit_from_formula(&formula, ds, &cfg)
-        .unwrap_or_else(|e| panic!("gam fit '{formula}': {e}"));
+    let res =
+        fit_from_formula(&formula, ds, &cfg).unwrap_or_else(|e| panic!("gam fit '{formula}': {e}"));
     let total = start.elapsed().as_secs_f64();
     let FitResult::Standard(fit) = res else {
         panic!("expected standard fit for '{formula}'");

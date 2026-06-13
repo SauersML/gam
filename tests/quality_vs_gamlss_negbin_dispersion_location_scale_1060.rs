@@ -104,7 +104,10 @@ fn gam_negbin_dispersion_location_scale_recovers_theta_surface_vs_gamlss() {
     let x: Vec<f64> = (0..n)
         .map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0))
         .collect();
-    let y: Vec<f64> = x.iter().map(|&xi| rng.negbin(mu_true(xi), theta_true(xi))).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|&xi| rng.negbin(mu_true(xi), theta_true(xi)))
+        .collect();
 
     // ---- gam dispersion location-scale fit (noise_formula on theta) ---------
     let headers = vec!["x".to_string(), "y".to_string()];
