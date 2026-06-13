@@ -845,6 +845,17 @@ pub struct DeviceSaePcgData {
     pub sparse_g_blocks: Vec<SparseGBlock>,
 }
 
+impl DeviceSaePcgData {
+    /// Snapshot the per-row active-atom support `a_phi` into a shared `Arc<[…]>`
+    /// for the CPU residency operator ([`SaeResidentReducedSchur`]). Cloned once
+    /// per CG-solve build (cost `O(Σ_i m_i)`, dwarfed by the per-row factor solves
+    /// in the same build), so the resident matvec borrows the index lists without
+    /// re-cloning them on every CG iteration.
+    fn a_phi_shared(&self) -> Arc<[Vec<(usize, f64)>]> {
+        Arc::from(self.a_phi.clone().into_boxed_slice())
+    }
+}
+
 impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
     fn dim(&self) -> usize {
         self.k
@@ -8309,6 +8320,155 @@ fn step_inside_trust_region(
 /// contributions are the matvec's whole cost and parallelize cleanly.
 const SCHUR_MATVEC_PARALLEL_ROW_MIN: usize = 256;
 
+/// Device-residency CPU analogue for the SAE reduced-Schur matvec (#1017).
+///
+/// In the production SAE joint fit the per-row cross-block factors as
+/// `H_tβ^(i) = L_i P_i`, where `L_i` (`q_i × p`) is the row's local
+/// assignment/coordinate Jacobian and `P_i` (`p × K`, sparse) gathers the
+/// active atoms' decoder blocks (`P_i x = Σ_s φ_s · x[base_s .. base_s+p]`).
+/// The reduced-Schur point-elimination contribution of one row is therefore
+///
+/// ```text
+/// S_i x = H_βt^(i) (H_tt^(i)+ρ_t I)⁻¹ H_tβ^(i) x
+///       = P_iᵀ · [ L_iᵀ (H_tt^(i)+ρ_t I)⁻¹ L_i ] · P_i x
+///       = P_iᵀ G_i (P_i x),      G_i := L_iᵀ (H_tt^(i)+ρ_t I)⁻¹ L_i   (p×p).
+/// ```
+///
+/// The `p × p` block `G_i` depends only on the assembled per-row blocks and the
+/// (already-computed, solve-stable) `H_tt` factor — NOT on the CG iterate `x`.
+/// The generic [`schur_matvec`] re-walks `apply_jbeta → apply_l → solve(d×d) →
+/// apply_l_t → scatter` on every CG iteration; this object **stages `G_i` once
+/// per CG solve** (the "upload X once" residency mechanism, applied on CPU to
+/// the matvec rather than a dense factorization), turning each subsequent
+/// matvec into a sparse gather → one `p×p` GEMV → sparse scatter, with no
+/// per-iteration triangular solve and no operator-closure re-walk.
+///
+/// Numerically identical to the generic path up to floating-point reassociation
+/// (it differentiates and accumulates the SAME quotient), so the criterion
+/// ranking across topology candidates cannot move — the #1017 verification gate.
+struct SaeResidentReducedSchur {
+    /// Decoder output dimension `p` (the side length of every `G_i`).
+    p: usize,
+    /// Per-row resident `G_i` (`p×p`). A row with empty active support gets a
+    /// zero-sized block and is skipped in the matvec.
+    g_rows: Vec<Array2<f64>>,
+    /// Per-row active atom support `(β-block base index, φ weight)`, shared with
+    /// the assembler's [`DeviceSaePcgData`] (no re-clone of the index lists).
+    a_phi: Arc<[Vec<(usize, f64)>]>,
+}
+
+impl SaeResidentReducedSchur {
+    /// Stage the per-row `G_i = L_iᵀ (H_tt^(i)+ρ_t I)⁻¹ L_i` blocks once, from
+    /// the SAE structure (`DeviceSaePcgData`: `p`, per-row `a_phi`, per-row
+    /// row-major `local_jac` = `L_i`) and the already-factored `H_tt` slab.
+    ///
+    /// Returns `None` when the structure does not match (degenerate `p`, row
+    /// count mismatch) so the caller falls back to the generic matvec. Row
+    /// builds are independent and run under the same deterministic rayon
+    /// discipline as the matvec (each `G_i` is self-contained — no cross-row
+    /// reduction — so there is no ordering subtlety).
+    /// `ridge_t` is NOT a parameter: it is already folded into the factored
+    /// blocks `htt_factors` carry (they factor `H_tt^(i) + ridge_t·I` — see
+    /// `factor_blocks`), so solving against the factor yields `(H_tt^(i)+ρ_t I)⁻¹`
+    /// exactly. The residency block is a pure function of the factor and `L_i`.
+    fn build<B: BatchedBlockSolver + Sync>(
+        sys: &ArrowSchurSystem,
+        htt_factors: &ArrowFactorSlab,
+        backend: &B,
+    ) -> Option<Self> {
+        let data = sys.device_sae_pcg.as_ref()?;
+        let p = data.p;
+        let n = sys.rows.len();
+        if p == 0 || data.a_phi.len() != n || data.local_jac.len() != n {
+            return None;
+        }
+        let build_row = |row: usize| -> Array2<f64> {
+            let di = sys.row_dims[row];
+            let jac = &data.local_jac[row];
+            // q_i = len/p; must match the row's latent dimension di.
+            if p == 0 || jac.len() != di * p || di == 0 {
+                return Array2::<f64>::zeros((0, 0));
+            }
+            // L_i as a (q_i × p) = (di × p) matrix (row-major in `local_jac`).
+            let l_i = match ArrayView2::from_shape((di, p), jac.as_slice()) {
+                Ok(v) => v.to_owned(),
+                Err(_) => return Array2::<f64>::zeros((0, 0)),
+            };
+            // Solve (H_tt+ρ_t I) Y = L_i for Y (di × p): one batched back-solve
+            // over the p columns against the cached factor.
+            let y = backend.solve_block_matrix(htt_factors.factor(row), l_i.view());
+            // G_i = L_iᵀ Y  (p × p), symmetric PSD.
+            l_i.t().dot(&y)
+        };
+        let g_rows: Vec<Array2<f64>> = if n >= SCHUR_MATVEC_PARALLEL_ROW_MIN
+            && rayon::current_thread_index().is_none()
+        {
+            use rayon::prelude::*;
+            (0..n).into_par_iter().map(build_row).collect()
+        } else {
+            (0..n).map(build_row).collect()
+        };
+        Some(Self {
+            p,
+            g_rows,
+            a_phi: data.a_phi_shared(),
+        })
+    }
+
+    /// Accumulate one row's `S_i x = P_iᵀ G_i (P_i x)` into `acc` (length `K`).
+    /// `gather`/`scatter_scratch` are caller-owned length-`p` buffers reused
+    /// across rows to keep the hot loop allocation-free.
+    #[inline]
+    fn row_into(
+        &self,
+        row: usize,
+        x: &Array1<f64>,
+        acc: &mut Array1<f64>,
+        gather: &mut [f64],
+        prod: &mut [f64],
+    ) {
+        let g = &self.g_rows[row];
+        if g.is_empty() {
+            return;
+        }
+        let p = self.p;
+        let support = &self.a_phi[row];
+        if support.is_empty() {
+            return;
+        }
+        // P_i x = Σ_s φ_s · x[base_s .. base_s+p]   (length p).
+        for v in gather.iter_mut() {
+            *v = 0.0;
+        }
+        for &(base, phi) in support {
+            if phi == 0.0 {
+                continue;
+            }
+            for j in 0..p {
+                gather[j] += phi * x[base + j];
+            }
+        }
+        // prod = G_i · (P_i x)   (p×p GEMV).
+        for r in 0..p {
+            let mut s = 0.0_f64;
+            let row_r = g.row(r);
+            for c in 0..p {
+                s += row_r[c] * gather[c];
+            }
+            prod[r] = s;
+        }
+        // acc += P_iᵀ prod = scatter φ_s · prod into base_s blocks.
+        for &(base, phi) in support {
+            if phi == 0.0 {
+                continue;
+            }
+            for j in 0..p {
+                acc[base + j] += phi * prod[j];
+            }
+        }
+    }
+}
+
 fn schur_matvec<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
@@ -8316,6 +8476,23 @@ fn schur_matvec<B: BatchedBlockSolver + Sync>(
     x: &Array1<f64>,
     out: &mut Array1<f64>,
     backend: &B,
+) {
+    schur_matvec_resident(sys, htt_factors, ridge_beta, x, out, backend, None)
+}
+
+/// [`schur_matvec`] with an optional pre-staged SAE residency operator. When
+/// `resident` is `Some`, the per-row point-elimination term is applied through
+/// the resident `p×p` blocks (#1017 CPU residency); otherwise it falls back to
+/// the generic per-row `apply → solve → transpose` path. Both routes accumulate
+/// the SAME reduced operator `S = H_ββ + ρ_β I − Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i)`.
+fn schur_matvec_resident<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    x: &Array1<f64>,
+    out: &mut Array1<f64>,
+    backend: &B,
+    resident: Option<&SaeResidentReducedSchur>,
 ) {
     // `steihaug_cg` reuses one output buffer across iterations and requires
     // `matvec` to ASSIGN every entry of `out` (the contract `dense_matvec`
@@ -8349,6 +8526,7 @@ fn schur_matvec<B: BatchedBlockSolver + Sync>(
     // oversubscription — the same guard `HyperOperator::mul_mat` uses.
     let parallel =
         sys.rows.len() >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    let p = resident.map(|r| r.p).unwrap_or(0);
     if parallel {
         use rayon::prelude::*;
         const CHUNK: usize = 64;
@@ -8358,9 +8536,19 @@ fn schur_matvec<B: BatchedBlockSolver + Sync>(
             .chunks(CHUNK)
             .map(|idxs| {
                 let mut acc = Array1::<f64>::zeros(k);
-                let mut local = Array1::<f64>::zeros(sys.d);
-                for i in idxs {
-                    schur_matvec_row_into(sys, htt_factors, x, backend, i, &mut local, &mut acc);
+                if let Some(res) = resident {
+                    // Resident path: each matvec is gather → p×p GEMV → scatter,
+                    // reading only the pre-staged `G_i` (no per-iteration solve).
+                    let mut gather = vec![0.0_f64; p];
+                    let mut prod = vec![0.0_f64; p];
+                    for i in idxs {
+                        res.row_into(i, x, &mut acc, &mut gather, &mut prod);
+                    }
+                } else {
+                    let mut local = Array1::<f64>::zeros(sys.d);
+                    for i in idxs {
+                        schur_matvec_row_into(sys, htt_factors, x, backend, i, &mut local, &mut acc);
+                    }
                 }
                 acc
             })
@@ -8370,6 +8558,16 @@ fn schur_matvec<B: BatchedBlockSolver + Sync>(
             for a in 0..k {
                 out[a] -= acc[a];
             }
+        }
+    } else if let Some(res) = resident {
+        let mut acc = Array1::<f64>::zeros(k);
+        let mut gather = vec![0.0_f64; p];
+        let mut prod = vec![0.0_f64; p];
+        for i in 0..sys.rows.len() {
+            res.row_into(i, x, &mut acc, &mut gather, &mut prod);
+        }
+        for a in 0..k {
+            out[a] -= acc[a];
         }
     } else {
         // Allocate scratch at max_d; per-row slice is `..di`.
@@ -9132,6 +9330,16 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     gpu_matvec: Option<&GpuSchurMatvec>,
     metric_weights: Option<&MetricWeights>,
 ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
+    // #1017 CPU residency: stage the per-row reduced-Schur `p×p` blocks once, up
+    // front, when the SAE structure is installed and the matvec runs on host
+    // (CPU). The GPU matvec carries its own residency, so skip when it is engaged.
+    // The same staged operator is reused across the whole preconditioner ladder
+    // (Jacobi → ClusterJacobi → AdditiveSchwarz) — built once, not per tier.
+    let resident = if gpu_matvec.is_none() {
+        SaeResidentReducedSchur::build(sys, htt_factors, backend)
+    } else {
+        None
+    };
     let jacobi = JacobiPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend)?;
     let (x0, diag0) = run_pcg_with_preconditioner(
         sys,
@@ -9144,6 +9352,7 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
         backend,
         gpu_matvec,
         metric_weights,
+        resident.as_ref(),
     )?;
     if sys.k <= PRECOND_ESCALATE_K_THRESHOLD || diag0.stopping_reason != PcgStopReason::MaxIter {
         return Ok((x0, diag0));
@@ -9161,6 +9370,7 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
         backend,
         gpu_matvec,
         metric_weights,
+        resident.as_ref(),
     )?;
     if diag1.stopping_reason != PcgStopReason::MaxIter {
         return Ok((x1, diag1));
@@ -9178,6 +9388,7 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
         backend,
         gpu_matvec,
         metric_weights,
+        resident.as_ref(),
     )?;
     // All three preconditioner tiers (Jacobi -> ClusterJacobi ->
     // AdditiveSchwarz) exhausted their iteration budget without driving the
@@ -9212,6 +9423,7 @@ fn run_pcg_with_preconditioner<ApplyPrec, B: BatchedBlockSolver + Sync>(
     backend: &B,
     gpu_matvec: Option<&GpuSchurMatvec>,
     metric_weights: Option<&MetricWeights>,
+    resident: Option<&SaeResidentReducedSchur>,
 ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError>
 where
     ApplyPrec: FnMut(&Array1<f64>) -> Array1<f64>,
@@ -9234,7 +9446,7 @@ where
     } else {
         steihaug_cg(
             rhs,
-            |p, out| schur_matvec(sys, htt_factors, ridge_beta, p, out, backend),
+            |p, out| schur_matvec_resident(sys, htt_factors, ridge_beta, p, out, backend, resident),
             apply_prec,
             max_iters,
             tol,
