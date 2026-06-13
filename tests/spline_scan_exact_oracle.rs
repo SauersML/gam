@@ -1,9 +1,18 @@
 //! Oracle: the O(n) state-space spline scan must reproduce, to near machine
-//! precision, the EXACT dense posterior of the same intrinsic order-2 prior —
+//! precision, the EXACT dense posterior of the same intrinsic order-`m` prior —
 //! self-constructed truth (#904), solved here by independent dense linear
 //! algebra (joint state precision assembled from the Markov form, Gaussian
 //! elimination written in-test). No approximation tolerance budget: the two
 //! paths compute the same Gaussian, so agreement is at solver roundoff.
+//!
+//! The dense truth is order-general: for any `m` it assembles the joint
+//! `m·n`-dimensional state precision from the order-`m` transition `F`, the
+//! IWP process noise `Q(δ)`, and the per-increment design `T = [−F  I]`. It is
+//! exercised at the cubic `m = 2` and quintic `m = 3` orders — the quintic
+//! being the de Jong exact diffuse backward smoother landed by #1044, whose two
+//! partially-diffuse leading nodes (0 and 1) are precisely where a wrong
+//! diffuse smoother would silently corrupt the posterior. The SD-unit gate
+//! below would show any such error at six orders of magnitude above roundoff.
 
 use gam::solver::spline_scan::{fit_spline_scan, fit_spline_scan_at};
 
@@ -108,9 +117,39 @@ fn dense_logdet(a: &[Vec<f64>]) -> f64 {
     logdet
 }
 
-/// Dense exact posterior of the SAME intrinsic order-2 Markov prior, built
-/// independently: joint precision over states (f_t, f'_t), improper (zero)
-/// prior on the first state = the diffuse null space.
+/// `k!`.
+fn factorial(k: usize) -> f64 {
+    (1..=k).map(|v| v as f64).product::<f64>().max(1.0)
+}
+
+/// Order-`m` IWP transition `F(δ)`: `F[i][j] = δ^{j−i}/(j−i)!` for `j ≥ i`.
+fn transition_dense(delta: f64, m: usize) -> Vec<Vec<f64>> {
+    let mut f = vec![vec![0.0_f64; m]; m];
+    for i in 0..m {
+        for j in i..m {
+            f[i][j] = delta.powi((j - i) as i32) / factorial(j - i);
+        }
+    }
+    f
+}
+
+/// Order-`m` IWP process noise scaled by `q`:
+/// `Q[i][j] = q·δ^{2m−1−i−j}/((m−1−i)!(m−1−j)!(2m−1−i−j))`.
+fn process_noise_dense(delta: f64, q: f64, m: usize) -> Vec<Vec<f64>> {
+    let mut out = vec![vec![0.0_f64; m]; m];
+    for i in 0..m {
+        for j in 0..m {
+            let p = 2 * m - 1 - i - j;
+            out[i][j] =
+                q * delta.powi(p as i32) / (factorial(m - 1 - i) * factorial(m - 1 - j) * p as f64);
+        }
+    }
+    out
+}
+
+/// Dense exact posterior of the SAME intrinsic order-`m` Markov prior, built
+/// independently: joint precision over states `(f_t, f'_t, …, f^{(m−1)}_t)`,
+/// improper (zero) prior on the leading null space.
 struct DenseTruth {
     mean: Vec<f64>,
     var: Vec<f64>,
@@ -119,49 +158,61 @@ struct DenseTruth {
     reml: f64,
 }
 
-fn dense_truth(x: &[f64], y: &[f64], w: &[f64], log_lambda: f64) -> DenseTruth {
-    let m = x.len();
+fn dense_truth(x: &[f64], y: &[f64], w: &[f64], log_lambda: f64, order: usize) -> DenseTruth {
+    let nk = x.len();
     let q = (-log_lambda).exp();
-    let dim = 2 * m;
+    let dim = order * nk;
     let mut prior = vec![vec![0.0_f64; dim]; dim];
-    // Markov increments: (α_{t+1} − F α_t)ᵀ (q·Q(δ))⁻¹ (α_{t+1} − F α_t).
-    for t in 0..m - 1 {
+    // Markov increments: (α_{t+1} − F α_t)ᵀ (q·Q(δ))⁻¹ (α_{t+1} − F α_t), with
+    // T = [−F  I] acting on (α_t, α_{t+1}) (block columns order·t … order·(t+2)).
+    for t in 0..nk - 1 {
         let d = x[t + 1] - x[t];
-        let (d2, d3) = (d * d, d * d * d);
-        // Q = q·[[d³/3, d²/2],[d²/2, d]];  Q⁻¹ via 2×2 inverse.
-        let (a, b, c) = (q * d3 / 3.0, q * d2 / 2.0, q * d);
-        let det = a * c - b * b;
-        let qi = [[c / det, -b / det], [-b / det, a / det]];
-        // Rows of T = [−F  I] acting on (α_t, α_{t+1}); F = [[1,d],[0,1]].
-        // Column layout: [f_t, f'_t, f_{t+1}, f'_{t+1}].
-        let trows = [[-1.0, -d, 1.0, 0.0], [0.0, -1.0, 0.0, 1.0]];
-        for r1 in 0..2 {
-            for r2 in 0..2 {
+        let f = transition_dense(d, order);
+        let qq = process_noise_dense(d, q, order);
+        // Q⁻¹ via the in-test dense solve against the identity.
+        let eye_o: Vec<Vec<f64>> = (0..order)
+            .map(|i| (0..order).map(|j| f64::from(u8::from(i == j))).collect())
+            .collect();
+        let qi = dense_solve(&qq, &eye_o);
+        // T[r][c]: columns 0..order are −F[r][·]; columns order..2·order are I.
+        let trow = |r: usize, c: usize| -> f64 {
+            if c < order {
+                -f[r][c]
+            } else if c - order == r {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        for r1 in 0..order {
+            for r2 in 0..order {
                 let coef = qi[r1][r2];
                 if coef == 0.0 {
                     continue;
                 }
-                for c1 in 0..4 {
-                    if trows[r1][c1] == 0.0 {
+                for c1 in 0..2 * order {
+                    let ta = trow(r1, c1);
+                    if ta == 0.0 {
                         continue;
                     }
-                    for c2 in 0..4 {
-                        if trows[r2][c2] == 0.0 {
+                    for c2 in 0..2 * order {
+                        let tb = trow(r2, c2);
+                        if tb == 0.0 {
                             continue;
                         }
-                        prior[2 * t + c1][2 * t + c2] += trows[r1][c1] * coef * trows[r2][c2];
+                        prior[order * t + c1][order * t + c2] += ta * coef * tb;
                     }
                 }
             }
         }
     }
-    // Posterior precision and RHS: observations on the f components.
+    // Posterior precision and RHS: observations on the f components (local 0).
     let mut lambda = prior.clone();
     let mut rhs = vec![vec![0.0_f64]; dim];
     let mut ytwy = 0.0;
-    for t in 0..m {
-        lambda[2 * t][2 * t] += w[t];
-        rhs[2 * t][0] = w[t] * y[t];
+    for t in 0..nk {
+        lambda[order * t][order * t] += w[t];
+        rhs[order * t][0] = w[t] * y[t];
         ytwy += w[t] * y[t] * y[t];
     }
     let mean_full = dense_solve(&lambda, &rhs);
@@ -170,14 +221,14 @@ fn dense_truth(x: &[f64], y: &[f64], w: &[f64], log_lambda: f64) -> DenseTruth {
         .map(|i| (0..dim).map(|j| f64::from(u8::from(i == j))).collect())
         .collect();
     let cov = dense_solve(&lambda, &eye);
-    let mean: Vec<f64> = (0..m).map(|t| mean_full[2 * t][0]).collect();
-    let var: Vec<f64> = (0..m).map(|t| cov[2 * t][2 * t]).collect();
-    // Restricted loglik (σ²=1, up to λ-free constant):
-    //   logdet⁺(prior) = (2m−2)·log(q⁻¹)·(−1) + const  — prior ∝ q⁻¹·K₀ of
-    //   rank 2m−2, so logdet⁺ = (2m−2)·ln(1/q) + logdet⁺(K₀); the K₀ part is
-    //   λ-free and dropped (the test compares DIFFERENCES across λ).
+    let mean: Vec<f64> = (0..nk).map(|t| mean_full[order * t][0]).collect();
+    let var: Vec<f64> = (0..nk).map(|t| cov[order * t][order * t]).collect();
+    // Restricted loglik (σ²=1, up to λ-free constant): the prior ∝ q⁻¹·K₀ has
+    // rank (nk−1)·order (each of the nk−1 increments contributes a rank-`order`
+    // T'Q⁻¹T block), so logdet⁺(prior) = (nk−1)·order·ln(1/q) + logdet⁺(K₀);
+    // the K₀ part is λ-free and dropped (the test compares DIFFERENCES over λ).
     let rt_lam_r: f64 = (0..dim).map(|i| rhs[i][0] * mean_full[i][0]).sum();
-    let reml = 0.5 * (2 * m - 2) as f64 * (1.0 / q).ln()
+    let reml = 0.5 * ((nk - 1) * order) as f64 * (1.0 / q).ln()
         - 0.5 * dense_logdet(&lambda)
         - 0.5 * (ytwy - rt_lam_r);
     DenseTruth { mean, var, reml }
