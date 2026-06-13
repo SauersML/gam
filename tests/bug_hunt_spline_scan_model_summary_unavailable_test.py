@@ -90,15 +90,15 @@ def test_scan_model_predicts_and_summarizes(degree, penalty_order, order):
     # evidence(): a finite REML/LAML cost on the comparison scale.
     assert np.isfinite(float(model.evidence))
 
-    # term_blocks(): exactly one contiguous coefficient block for the smooth.
-    blocks = model.term_blocks()
+    # term_blocks: exactly one contiguous coefficient block for the smooth.
+    blocks = model.term_blocks
     assert len(blocks) >= 1
     total = 0
     for blk in blocks:
-        start, end = blk[2], blk[3]
-        assert 0 <= start <= end
-        total += end - start
+        assert 0 <= blk.start <= blk.end
+        total += blk.end - blk.start
     assert total >= 1
+    assert any(blk.kind == "smooth" for blk in blocks)
 
     # diagnose(): scores the fit on held-out data (routes through summary()).
     diag = model.diagnose(df)
