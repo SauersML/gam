@@ -18176,6 +18176,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         objective_change,
                         objective_tol,
                     );
+                    // Record the residual this exit actually certified on
+                    // (#1040 inner-report truthfulness): the converged status is
+                    // earned by `range_residual ≤ 4×tol` on the identifiable
+                    // subspace, so the terminal line must report that finite
+                    // certified residual — not the `inf` stall-tracker sentinel,
+                    // which a cycle-1 certificate exit (head KKT non-finite, so
+                    // the head-of-cycle `min` update was skipped) would otherwise
+                    // leave unset, printing `converged=true … best_residual_inf=inf`.
+                    if range_residual.is_finite() {
+                        min_certified_residual = min_certified_residual.min(range_residual);
+                    }
                     converged = true;
                     break;
                 }
@@ -18237,6 +18248,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     "[JN-EXIT] cycle={cycle} reason=plateau_objective_flat residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} consecutive_flat={} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
                     obj_flat_streak.streak(),
                 );
+                // This branch certifies on `residual ≤ residual_tol`; record it
+                // so the terminal line reports the finite certified residual
+                // rather than the `inf` stall sentinel (#1040 truthfulness).
+                if residual.is_finite() {
+                    min_certified_residual = min_certified_residual.min(residual);
+                }
                 converged = true;
                 break;
             }
@@ -18285,6 +18302,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     obj_flat_streak.streak(),
                     4.0 * residual_tol,
                 );
+                // Certified on `range_residual ≤ 4×tol`; record it so the
+                // terminal report carries this finite certified residual
+                // instead of the `inf` stall sentinel (#1040 truthfulness).
+                if range_residual.is_finite() {
+                    min_certified_residual = min_certified_residual.min(range_residual);
+                }
                 converged = true;
                 break;
             }
@@ -18330,6 +18353,31 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // when per-cycle INFO is filtered out; a clean convergence is INFO.
         {
             let budget_exhausted = cycles_done >= inner_max_cycles;
+            // Hard convergence-truthfulness invariant (#1040): a converged exit
+            // is, by construction, certified on a finite stationarity residual
+            // ≤ tol (every `converged = true` path above is gated on a finite
+            // residual / range-space check and records it into
+            // `min_certified_residual`). If — through any path — `converged` is
+            // set without a finite certified residual on record, the solve has
+            // NOT actually certified convergence; reporting `converged=true …
+            // best_residual_inf=inf` is the self-contradicting status #1040
+            // flags. The honest status is then non-converged: downgrade it so
+            // the outer REML/LAML evaluation rejects this ρ rather than
+            // consuming a phantom optimum certified on no finite residual.
+            if !crate::solver::loop_guard::inner_convergence_is_truthful(
+                converged,
+                min_certified_residual,
+            ) {
+                log::warn!(
+                    "[PIRLS/joint-Newton terminal] cycle {cycles_done}/{inner_max_cycles}: a converged \
+                     exit fired without any finite certified stationarity residual on record \
+                     (min_certified_residual is non-finite) — this would report \
+                     converged=true with best_residual_inf=inf, a convergence-truthfulness \
+                     violation (#1040). Downgrading to non-converged so the outer optimizer \
+                     rejects this evaluation."
+                );
+                converged = false;
+            }
             let terminator = if converged {
                 "KKT/certificate-converged"
             } else if budget_exhausted {
