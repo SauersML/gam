@@ -1353,6 +1353,24 @@ mod sphere_defect_tests {
             }
             Ok((phi, jet))
         }
+
+        // This mock supplies only the first jet that the chart-defect test
+        // exercises; it carries no analytic second/third jet, so it declares
+        // that capability absent (`None`) per the trait contract rather than
+        // fabricating one.
+        fn second_jet_dyn(
+            &self,
+            _coords: ArrayView2<'_, f64>,
+        ) -> Option<Result<ndarray::Array4<f64>, String>> {
+            None
+        }
+
+        fn third_jet_dyn(
+            &self,
+            _coords: ArrayView2<'_, f64>,
+        ) -> Option<Result<ndarray::Array5<f64>, String>> {
+            None
+        }
     }
 
     fn coords(lats: &[f64]) -> Array2<f64> {
