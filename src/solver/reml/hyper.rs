@@ -1451,10 +1451,12 @@ impl<'a> RemlState<'a> {
         // is replaced. Eligible only for Gaussian-identity, a single ψ
         // coordinate, no implicit-operator/Firth complications, and matching
         // conditioned width.
+        // Note: implicit-operator storage of the slab is irrelevant here — the
+        // tensor branch replaces the design-derivative entirely with k-space
+        // objects, so it covers both dense and implicit ∂X/∂ψ representations.
         let tensor_psi_deriv: Option<(Array2<f64>, Array1<f64>)> = if !for_hessian
             && is_gaussian_identity
             && psi_dim == 1
-            && !any_has_implicit
             && firth_op.is_none()
         {
             self.gaussian_psi_gram_deriv().and_then(|deriv| {
