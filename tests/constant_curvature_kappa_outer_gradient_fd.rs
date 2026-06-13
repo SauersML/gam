@@ -164,7 +164,13 @@ fn constant_curvature_kappa_outer_gradient_matches_fd() {
         },
         ..FitConfig::default()
     };
-    let _ = gam::fit_from_formula(formula, &data, &config);
+    // The outer FD audit fires at θ₀ DURING the fit, before the (capped) outer
+    // loop, so the fit's own success/failure is irrelevant to this gate — what
+    // we assert is the captured audit. Surface the outcome for diagnostics.
+    match gam::fit_from_formula(formula, &data, &config) {
+        Ok(_) => eprintln!("[FD-DIAG] constant-curvature fit returned Ok"),
+        Err(e) => eprintln!("[FD-DIAG] constant-curvature fit returned Err (audit still ran): {e}"),
+    }
 
     let lines = CAPTURE.lock().unwrap().clone();
     // The κ coordinate must have been enrolled: the gate line reports psi_dim≥1.
