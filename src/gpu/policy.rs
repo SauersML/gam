@@ -155,6 +155,124 @@ impl GpuDispatchPolicy {
     const fn xtwy_flops(&self, n: usize, px: usize, q: usize) -> u128 {
         2u128 * (n as u128) * (px as u128) * (q as u128)
     }
+
+    /// Minimum total CG-amortised matvec flops below which the host↔device
+    /// transfer of the row frames + CG vectors is not repaid by the device
+    /// matvec, so the reduced-Schur PCG hot loop stays on the CPU.
+    ///
+    /// The dense-Direct path keys on `dense_reduction_flops_min` (a single big
+    /// factorization). The matrix-free SAE matvec is different: no single apply
+    /// trips that floor (each is a stack of `n` tiny `d×d` solves + sparse
+    /// `m·k` gather/scatter), but the *whole CG solve* runs the apply
+    /// `O(cg_iters)` times over the same resident frames. The device wins when
+    /// the **summed** matvec work over the solve exceeds the one-time staging
+    /// cost — so the gate keys on `cg_iters · per_apply_flops`, not one apply.
+    ///
+    /// Set one order of magnitude below the dense floor: the matvec frames stay
+    /// resident across CG iterations (uploaded once), so the per-flop transfer
+    /// amortization is `1/cg_iters` of a cold dense launch, and the breakeven
+    /// drops accordingly.
+    pub const MATVEC_OFFLOAD_FLOPS_MIN: u128 = 10_000_000;
+
+    /// Conservative seed for the reduced-Schur PCG iteration count when the
+    /// caller cannot supply a measured budget. InexactPCG on an SAE β-block of
+    /// width `k` converges in `O(√κ)` iterations; this floor keeps the work
+    /// estimate honest (≥ this many applies) without over-claiming a tight
+    /// solve. Used only to amortise the staging cost in the work estimate.
+    pub const MATVEC_OFFLOAD_MIN_CG_ITERS: usize = 8;
+
+    /// Per-apply flop estimate for one reduced-Schur matvec `S·x` of a
+    /// matrix-free SAE Kronecker system, as a pure function of the system shape.
+    ///
+    /// Per row block `i` the apply does: a sparse forward gather
+    /// `v_i = H_tβ^(i)·x` (`≈ 2·m_i·k`, modelled by the per-row latent depth
+    /// `d` as the M-frame width), a `d×d` triangular solve through the cached
+    /// Cholesky factor (`≈ d²`), and a sparse transpose scatter
+    /// `H_βt^(i)·w_i` (`≈ 2·m_i·k`). Summed over `n` homogeneous rows and
+    /// folding the gather/scatter into the dominant `d·k` cross term, the apply
+    /// is `≈ n·(2·d·k + d²)`. This is the `n × p × M`-flavoured batched work the
+    /// charter names — keyed on the *frame depth* `d` (M) and border width `k`
+    /// (p), not row count alone, so LLM shapes (few rows, wide `k`, modest `d`)
+    /// register the real arithmetic the row-count gate misses.
+    const fn reduced_schur_matvec_flops(n: usize, k: usize, d: usize) -> u128 {
+        let n = n as u128;
+        let k = k as u128;
+        let d = d as u128;
+        // 2·d·k cross-block apply (forward + transpose) + d² per-row solve.
+        n.saturating_mul(2u128.saturating_mul(d).saturating_mul(k).saturating_add(d * d))
+    }
+
+    /// Work-based admission for offloading the **reduced-Schur PCG matvec**
+    /// (the InexactPCG hot loop for matrix-free SAE β-blocks) to the device.
+    ///
+    /// This is the Phase-1 (#1017) re-keying: the dense gates key on row count
+    /// (`xtwx_n_min`, `row_kernel_min_n` at 50k) or a single big-factorization
+    /// flop floor, neither of which the SAE LLM shape trips — `(n≈2000) ×
+    /// (k≈2048) × (d≈8)` is *thousands of small dense ops*, no single op large,
+    /// so the row-count gate keeps the whole fit on one CPU core. Here the gate
+    /// is the **total batched work over the CG solve**:
+    ///
+    /// ```text
+    /// estimated_device_flops = cg_iters · per_apply_flops(n, k, d)
+    /// should_offload = estimated_device_flops ≥ T_breakeven
+    /// ```
+    ///
+    /// where `T_breakeven = MATVEC_OFFLOAD_FLOPS_MIN` accounts for the
+    /// host↔device staging of the row frames + CG vectors amortised over the
+    /// `cg_iters` applies that reuse the resident frames (so the per-flop
+    /// transfer cost is `1/cg_iters` of a cold launch, an order of magnitude
+    /// below the dense-Direct floor).
+    ///
+    /// Pure function of the shape: no device needed to evaluate, so it is unit-
+    /// testable. The caller still falls back to the bit-identical CPU matvec
+    /// whenever the backend build declines, so admitting a shape never changes
+    /// the numerics — only where the `Σ_i Y_iᵀ(Y_i x)` flops execute.
+    ///
+    /// * `n`        — number of row blocks (SAE observations / latent rows).
+    /// * `k`        — border β width (the SAE decoder atom count `K`).
+    /// * `d`        — per-row latent / active-frame depth (the M dimension).
+    /// * `cg_iters` — expected PCG iteration budget; the per-apply work is
+    ///   multiplied by this because the frames stay resident across iterations.
+    ///   Pass [`Self::MATVEC_OFFLOAD_MIN_CG_ITERS`] when no measured budget is
+    ///   available; a tighter (smaller) value only makes the gate stricter.
+    ///
+    /// ## Call site to re-key (owned by the arrow-Schur engine, not this file)
+    ///
+    /// `crate::solver::arrow_schur::maybe_inject_gpu_schur_matvec` currently
+    /// gates the InexactPCG reduced-Schur matvec injection on
+    /// `dense_hessian_work_target_is_gpu(sys.rows.len(), sys.k)` — the
+    /// **dense-Direct** flop floor keyed on `(n, k)` only, which ignores the
+    /// per-row frame depth `d` (the SAE active-set / M dimension) and the
+    /// `cg_iters` amortization that makes the resident matvec profitable. It
+    /// should instead call
+    /// `reduced_schur_matvec_should_offload(sys.rows.len(), sys.k, sys.d,
+    /// options.pcg.max_iterations.min(options.trust_region.max_iterations))`,
+    /// where `sys.d` is the system's max per-row latent depth and the iteration
+    /// budget is the same `max_iterations` the PCG loop is launched with a few
+    /// lines below. `try_device_arrow_direct` (the **dense** Direct point
+    /// solve) correctly keeps `dense_hessian_work_target_is_gpu` — that path is
+    /// a single large factorization, not the amortised matvec, so its gate is
+    /// the right one and must not be changed.
+    pub const fn reduced_schur_matvec_should_offload(
+        &self,
+        n: usize,
+        k: usize,
+        d: usize,
+        cg_iters: usize,
+    ) -> bool {
+        if n == 0 || k == 0 || d == 0 || cg_iters == 0 {
+            return false;
+        }
+        // The border width must clear the device-loop floor: below it the per-
+        // apply launch latency (one kernel sequence per matvec) dominates any
+        // arithmetic regardless of how many CG iterations run.
+        if k < Self::DEVICE_LOOP_MIN_P {
+            return false;
+        }
+        let per_apply = Self::reduced_schur_matvec_flops(n, k, d);
+        let total = per_apply.saturating_mul(cg_iters as u128);
+        total >= Self::MATVEC_OFFLOAD_FLOPS_MIN
+    }
 }
 
 /// Which `(response, link)` family the Stage 3.3 device-resident PIRLS loop
@@ -328,5 +446,97 @@ mod refinement_policy_tests {
             ..Default::default()
         };
         assert!(!pol.iterative_refinement_should_attempt(1024));
+    }
+}
+
+#[cfg(test)]
+mod reduced_schur_matvec_offload_tests {
+    use super::*;
+
+    /// The LLM/SAE shape the whole #1017 Phase-1 re-keying targets: a few
+    /// thousand row blocks, a *wide* border (decoder atom count in the
+    /// thousands), a modest per-row frame depth, and a realistic CG budget.
+    /// The row-count gate (50k) and the dense-Direct flop floor both miss this
+    /// "thousands of tiny dense ops" shape; the work-amortised matvec gate must
+    /// fire on it.
+    #[test]
+    fn admits_llm_sae_matvec_shape() {
+        let pol = GpuDispatchPolicy::default();
+        // n≈2000 rows, k≈2048 atoms, M≈8 frame depth — n is far below the 50k
+        // row gate, yet the summed CG matvec work is large.
+        assert!(pol.reduced_schur_matvec_should_offload(
+            2_000,
+            2_048,
+            8,
+            GpuDispatchPolicy::MATVEC_OFFLOAD_MIN_CG_ITERS,
+        ));
+        // The same shape would be rejected by the row-count-style dense gate,
+        // confirming the re-keying is what admits it.
+        assert!(!pol.dense_hessian_work_target_is_gpu(2_000, 8));
+    }
+
+    /// Even with only a single conservative CG iteration the wide LLM border
+    /// clears the breakeven (the per-apply work alone is ~3.3e7 flops > 1e7),
+    /// so the gate is not relying on an inflated iteration count.
+    #[test]
+    fn admits_llm_shape_with_one_cg_iter() {
+        let pol = GpuDispatchPolicy::default();
+        assert!(pol.reduced_schur_matvec_should_offload(2_000, 2_048, 8, 1));
+    }
+
+    /// Tiny shapes where the host↔device transfer dominates must stay on the
+    /// CPU: a handful of rows, a narrow border, shallow frames. The summed
+    /// matvec work is orders of magnitude below the staging breakeven.
+    #[test]
+    fn rejects_tiny_shape_where_transfer_dominates() {
+        let pol = GpuDispatchPolicy::default();
+        assert!(!pol.reduced_schur_matvec_should_offload(
+            30,
+            8,
+            2,
+            GpuDispatchPolicy::MATVEC_OFFLOAD_MIN_CG_ITERS,
+        ));
+        // The 300×8 shape the production seam tests use as the "stay CPU"
+        // canary is rejected here too.
+        assert!(!pol.reduced_schur_matvec_should_offload(300, 8, 4, 16));
+    }
+
+    /// A narrow border (k below the device-loop floor) is rejected regardless
+    /// of how much row/iteration work is piled on: per-apply launch latency
+    /// dominates a sub-`DEVICE_LOOP_MIN_P` border.
+    #[test]
+    fn rejects_narrow_border_even_with_huge_row_count() {
+        let pol = GpuDispatchPolicy::default();
+        let narrow = GpuDispatchPolicy::DEVICE_LOOP_MIN_P - 1;
+        assert!(!pol.reduced_schur_matvec_should_offload(1_000_000, narrow, 64, 64));
+    }
+
+    /// Degenerate dimensions are never offloaded (no work, or no solve).
+    #[test]
+    fn rejects_degenerate_dimensions() {
+        let pol = GpuDispatchPolicy::default();
+        assert!(!pol.reduced_schur_matvec_should_offload(0, 2_048, 8, 8));
+        assert!(!pol.reduced_schur_matvec_should_offload(2_000, 0, 8, 8));
+        assert!(!pol.reduced_schur_matvec_should_offload(2_000, 2_048, 0, 8));
+        assert!(!pol.reduced_schur_matvec_should_offload(2_000, 2_048, 8, 0));
+    }
+
+    /// The gate is monotone in the CG budget: once a shape is admitted at a
+    /// given iteration count it stays admitted for any larger count (more
+    /// applies over the same resident frames only improves amortization), and
+    /// a borderline shape crosses the breakeven as iterations grow.
+    #[test]
+    fn monotone_in_cg_iters() {
+        let pol = GpuDispatchPolicy::default();
+        // A border at the floor with shallow frames and few rows: per-apply
+        // work ~ n·(2·d·k + d²). Choose a shape that is below breakeven at 1
+        // iter but above it once enough iterations accumulate.
+        let (n, k, d) = (200usize, GpuDispatchPolicy::DEVICE_LOOP_MIN_P, 4usize);
+        // per_apply ≈ 200·(2·4·32 + 16) = 200·272 = 54_400 flops.
+        assert!(!pol.reduced_schur_matvec_should_offload(n, k, d, 1));
+        // Once the summed work clears 1e7 the gate fires; ~184 iters here.
+        assert!(pol.reduced_schur_matvec_should_offload(n, k, d, 1_000));
+        // Monotonicity: admitted at 1_000 ⇒ admitted at every larger budget.
+        assert!(pol.reduced_schur_matvec_should_offload(n, k, d, 5_000));
     }
 }
