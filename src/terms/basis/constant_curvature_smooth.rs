@@ -269,6 +269,79 @@ pub fn constant_curvature_kernel_kappa_jets(
     Ok((value, dk, dkk))
 }
 
+/// `(K, ∂K/∂κ, ∂²K/∂κ²)` of the raw kernel matrix when the kernel uses the
+/// κ-INVARIANT effective length `L(κ) = ℓ_ref·s(κ)/s₀` (the #1059 fix). Both the
+/// geodesic distance `d_κ` and the length `L(κ)` move with κ, so the exponent is
+/// the quotient `q = d/L` and the chain rule carries both jets:
+///
+/// ```text
+///   q  = d / L
+///   q′ = d′/L − d·L′/L²
+///   q″ = d″/L − 2 d′ L′/L² − d L″/L² + 2 d (L′)²/L³
+///   K = e^{−q},  K′ = −q′K,  K″ = ((q′)² − q″) K
+/// ```
+///
+/// `l_jet = (L, L′, L″)` is the effective-length κ-jet from
+/// [`constant_curvature_effective_length_jet`]; at κ = 0 it reduces to the
+/// fixed-ℓ jets (`L′ = L″` terms vanish only if the geometry is flat, but the
+/// formula is exact for all κ).
+fn constant_curvature_kernel_kappa_jets_scaled(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    kappa: f64,
+    l_jet: (f64, f64, f64),
+) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), BasisError> {
+    if data.ncols() != centers.ncols() {
+        crate::bail_dim_basis!(
+            "constant-curvature scaled kernel-jet dimension mismatch: data d={} centers d={}",
+            data.ncols(),
+            centers.ncols()
+        );
+    }
+    let (l, l1, l2) = l_jet;
+    if !(l.is_finite() && l > 0.0) {
+        crate::bail_invalid_basis!(
+            "constant-curvature scaled kernel jets need a positive finite effective length; got {l}"
+        );
+    }
+    validate_chart_points(data, kappa, "data")?;
+    validate_chart_points(centers, kappa, "centers")?;
+    let manifold = ConstantCurvature::new(data.ncols(), kappa);
+    let n = data.nrows();
+    let m = centers.nrows();
+    let mut value = Array2::<f64>::zeros((n, m));
+    let mut dk = Array2::<f64>::zeros((n, m));
+    let mut dkk = Array2::<f64>::zeros((n, m));
+    let rows: Vec<(usize, Vec<(f64, f64, f64)>)> = (0..n)
+        .into_par_iter()
+        .map(|i| -> Result<(usize, Vec<(f64, f64, f64)>), BasisError> {
+            let mut row = Vec::with_capacity(m);
+            for (j, c) in centers.outer_iter().enumerate() {
+                let (d, d1, d2) = distance_kappa_jet(&manifold, data.row(i), c).map_err(|e| {
+                    BasisError::InvalidInput(format!(
+                        "constant-curvature scaled distance κ-jet failed at (row {i}, center {j}): {e}"
+                    ))
+                })?;
+                let q = d / l;
+                let q1 = d1 / l - d * l1 / (l * l);
+                let q2 = d2 / l - 2.0 * d1 * l1 / (l * l) - d * l2 / (l * l)
+                    + 2.0 * d * l1 * l1 / (l * l * l);
+                let k = (-q).exp();
+                row.push((k, -q1 * k, (q1 * q1 - q2) * k));
+            }
+            Ok((i, row))
+        })
+        .collect::<Result<Vec<_>, BasisError>>()?;
+    for (i, row) in rows {
+        for (j, (k, k1, k2)) in row.into_iter().enumerate() {
+            value[(i, j)] = k;
+            dk[(i, j)] = k1;
+            dkk[(i, j)] = k2;
+        }
+    }
+    Ok((value, dk, dkk))
+}
+
 /// Resolve the realized kernel range ℓ. An explicit positive `spec_length_scale`
 /// is used verbatim; the `0.0` sentinel auto-initializes from the median
 /// pairwise CHART distance among the centers, doubled to match the κ = 0
@@ -315,6 +388,100 @@ pub fn realized_constant_curvature_length_scale(
     Ok(median)
 }
 
+/// Mean pairwise CHART distance `2‖c_i − c_j‖` among centers — the κ = 0 gauge
+/// reference scale `s₀ = mean d₀`. Used to anchor the κ-invariant resolution
+/// rescale so that, at κ = 0, the effective length equals the realized ℓ.
+fn centers_mean_chart_distance(centers: ArrayView2<'_, f64>) -> f64 {
+    let m = centers.nrows();
+    let mut sum = 0.0_f64;
+    let mut cnt = 0.0_f64;
+    for i in 0..m {
+        for j in (i + 1)..m {
+            let mut s = 0.0_f64;
+            for k in 0..centers.ncols() {
+                let dlt = centers[(i, k)] - centers[(j, k)];
+                s += dlt * dlt;
+            }
+            sum += 2.0 * s.sqrt();
+            cnt += 1.0;
+        }
+    }
+    if cnt > 0.0 { sum / cnt } else { 0.0 }
+}
+
+/// Mean pairwise GEODESIC distance among centers at curvature κ, with its first
+/// and second κ-derivatives: `(s, s′, s″)` where `s(κ) = mean_{i<j} d_κ(c_i,c_j)`.
+/// Each pair's `(d, d′, d″)` comes from the exact `distance_kappa_jet`, so the
+/// mean (a smooth, every-pair average — unlike the median) and its derivatives
+/// are exact. This is the geometry-side scale that makes the kernel resolution
+/// κ-invariant (see [`constant_curvature_effective_length_jet`]).
+fn centers_mean_geodesic_distance_jet(
+    centers: ArrayView2<'_, f64>,
+    kappa: f64,
+) -> Result<(f64, f64, f64), BasisError> {
+    let m = centers.nrows();
+    let manifold = ConstantCurvature::new(centers.ncols(), kappa);
+    let mut s = 0.0_f64;
+    let mut s1 = 0.0_f64;
+    let mut s2 = 0.0_f64;
+    let mut cnt = 0.0_f64;
+    for i in 0..m {
+        for j in (i + 1)..m {
+            let (d, d1, d2) =
+                distance_kappa_jet(&manifold, centers.row(i), centers.row(j)).map_err(|e| {
+                    BasisError::InvalidInput(format!(
+                        "constant-curvature center geodesic κ-jet failed at ({i},{j}): {e}"
+                    ))
+                })?;
+            s += d;
+            s1 += d1;
+            s2 += d2;
+            cnt += 1.0;
+        }
+    }
+    if cnt <= 0.0 {
+        crate::bail_invalid_basis!(
+            "constant-curvature geodesic scale needs at least two centers"
+        );
+    }
+    Ok((s / cnt, s1 / cnt, s2 / cnt))
+}
+
+/// Effective kernel length `L(κ)` and its κ-jet `(L, L′, L″)`.
+///
+/// THE κ-IDENTIFICATION FIX (#1059 follow-up). A κ-FROZEN length makes the
+/// geodesic-exponential kernel's *resolution* drift with κ: spherical (κ>0)
+/// geometries compress geodesic distances, so a fixed ℓ silently broadens the
+/// kernel and inflates the effective smoothness, letting the REML criterion buy
+/// a lower deviance by cranking κ up — κ then rails to the chart bound for
+/// every truth instead of being identified. We remove that confound by tying
+/// the kernel length to the geometry's own scale:
+///
+/// ```text
+///   L(κ) = ℓ_ref · s(κ) / s₀,   s(κ) = mean center geodesic distance at κ,
+///                                s₀   = mean center chart distance (κ = 0 gauge)
+/// ```
+///
+/// so `d_κ / L(κ)` keeps the typical center-pair kernel value κ-invariant. At
+/// κ = 0, `s(0) = s₀` (the κ = 0 gauge has `d₀ = 2‖Δ‖`), so `L(0) = ℓ_ref` and
+/// the construction is unchanged at the flat point. The returned jet feeds the
+/// kernel κ-derivatives through the quotient `q = d/L` chain rule.
+fn constant_curvature_effective_length_jet(
+    centers: ArrayView2<'_, f64>,
+    ell_ref: f64,
+    kappa: f64,
+) -> Result<(f64, f64, f64), BasisError> {
+    let s0 = centers_mean_chart_distance(centers);
+    if !(s0.is_finite() && s0 > 0.0) {
+        crate::bail_invalid_basis!(
+            "constant-curvature effective length: degenerate centers (mean chart distance {s0})"
+        );
+    }
+    let (s, s1, s2) = centers_mean_geodesic_distance_jet(centers, kappa)?;
+    let inv = ell_ref / s0;
+    Ok((inv * s, inv * s1, inv * s2))
+}
+
 /// Build the constant-curvature reproducing-kernel smooth: realized design
 /// `K_κ(data, centers)·z`, RKHS penalty `zᵀ K_κ(centers, centers) z`, and the
 /// replayable [`BasisMetadata::ConstantCurvature`]. Structure mirrors the
@@ -338,9 +505,15 @@ pub fn build_constant_curvature_basis(
         });
     }
     validate_chart_points(centers.view(), spec.kappa, "centers")?;
+    // ℓ_ref is the κ = 0 reference length (auto = mean chart spacing, or the
+    // user/frozen value); the kernel uses the κ-invariant effective length
+    // L(κ) = ℓ_ref·s(κ)/s₀ so changing κ moves the geometry, not the kernel
+    // resolution (the #1059 curvature-identification fix). At κ = 0, L = ℓ_ref.
     let length_scale = realized_constant_curvature_length_scale(centers.view(), spec.length_scale)?;
+    let (ell_eff, _, _) =
+        constant_curvature_effective_length_jet(centers.view(), length_scale, spec.kappa)?;
     let raw_penalty =
-        constant_curvature_kernel_matrix(centers.view(), centers.view(), spec.kappa, length_scale)?;
+        constant_curvature_kernel_matrix(centers.view(), centers.view(), spec.kappa, ell_eff)?;
     // Realized-design constraint transform: uniform coefficient sum-to-zero at
     // fit time; the frozen composed `z · z_parametric` at predict time (#532
     // pattern — see ConstantCurvatureIdentifiability).
@@ -362,7 +535,7 @@ pub fn build_constant_curvature_basis(
     };
     let penalty = z.t().dot(&raw_penalty).dot(&z);
     let raw_design =
-        constant_curvature_kernel_matrix(data, centers.view(), spec.kappa, length_scale)?;
+        constant_curvature_kernel_matrix(data, centers.view(), spec.kappa, ell_eff)?;
     let design = crate::matrix::DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
         raw_design.dot(&z),
     ));
@@ -508,21 +681,27 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
         }
     };
 
+    // Effective-length κ-jet L(κ) = ℓ_ref·s(κ)/s₀ (the κ-invariant-resolution
+    // fix). The kernel exponent is q = d/L with BOTH d and L moving in κ, so the
+    // kernel κ-jets carry the full quotient chain rule — see
+    // `constant_curvature_kernel_kappa_jets_scaled`.
+    let l_jet = constant_curvature_effective_length_jet(centers.view(), length_scale, spec.kappa)?;
+
     // Design κ-jets: X = K(data, centers)·z, so the κ-derivatives are the
     // kernel κ-jets right-multiplied by the κ-fixed `z`.
     let (_k_dc, dk_dc, dkk_dc) =
-        constant_curvature_kernel_kappa_jets(data, centers.view(), spec.kappa, length_scale)?;
+        constant_curvature_kernel_kappa_jets_scaled(data, centers.view(), spec.kappa, l_jet)?;
     let design_first = dk_dc.dot(&z);
     let design_second_diag = dkk_dc.dot(&z);
 
     // Penalty κ-jets: S_raw = symm(zᵀ K(centers,centers) z). Rebuild the value
     // penalty (and its normalization constant) from the SAME path the value
     // builder used so the quotient-rule normalization derivatives are exact.
-    let (k_cc, dk_cc, dkk_cc) = constant_curvature_kernel_kappa_jets(
+    let (k_cc, dk_cc, dkk_cc) = constant_curvature_kernel_kappa_jets_scaled(
         centers.view(),
         centers.view(),
         spec.kappa,
-        length_scale,
+        l_jet,
     )?;
     let s_raw = symmetrize(&z.t().dot(&k_cc).dot(&z));
     let s_raw_first = symmetrize(&z.t().dot(&dk_cc).dot(&z));
