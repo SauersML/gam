@@ -171,8 +171,11 @@ impl AutoTopologyKind {
             "sphere" | "s2" => Ok(AutoTopologyKind::Sphere),
             "torus" => Ok(AutoTopologyKind::Torus),
             "cylinder" => Ok(AutoTopologyKind::Cylinder),
+            "constant_curvature" | "curv" | "curvature" | "mkappa" | "m_kappa" => {
+                Ok(AutoTopologyKind::ConstantCurvature)
+            }
             other => Err(format!(
-                "topology candidate must be euclidean, circle, sphere, torus, cylinder, mixture[_k{{n}}], or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
+                "topology candidate must be euclidean, circle, sphere, torus, cylinder, constant_curvature, mixture[_k{{n}}], or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
             )),
         }
     }
@@ -185,6 +188,76 @@ impl AutoTopologyKind {
             AutoTopologyKind::Torus,
             AutoTopologyKind::Cylinder,
         ]
+    }
+
+    /// `true` iff this candidate is a FIXED member of the simply-connected
+    /// constant-curvature space-form family `M_κ` — the geometries that differ
+    /// only by their (fixed) sectional curvature κ and are therefore the *same*
+    /// continuous `S^d ← ℝ^d → H^d` manifold at different κ:
+    ///   * [`Euclidean`](AutoTopologyKind::Euclidean) — κ = 0,
+    ///   * [`Sphere`](AutoTopologyKind::Sphere) — κ > 0.
+    /// (`Circle`/`Torus`/`Cylinder` are NOT in this family: they are not
+    /// simply connected — distinct topology, not distinct curvature — so they
+    /// must keep racing as separate candidates.) The fitted-κ
+    /// [`ConstantCurvature`](AutoTopologyKind::ConstantCurvature) candidate is
+    /// itself the fusion target, not a member to be fused.
+    pub const fn is_fixed_constant_curvature_form(self) -> bool {
+        matches!(
+            self,
+            AutoTopologyKind::Euclidean | AutoTopologyKind::Sphere
+        )
+    }
+
+    /// #944 stage 4 — "within a candidate, curvature is estimated." Collapse the
+    /// fixed constant-curvature space forms in a candidate set into ONE
+    /// [`ConstantCurvature`](AutoTopologyKind::ConstantCurvature) candidate whose
+    /// κ is fitted, so the discrete topology stack only adjudicates genuinely
+    /// non-homotopic candidates. Magic by default: the fusion fires exactly when
+    /// the set contains **≥ 2** fixed constant-curvature forms (e.g. both
+    /// `Euclidean` and `Sphere`) — a single such form is left untouched (there
+    /// is nothing to estimate κ *across*), and a set already carrying an
+    /// explicit `ConstantCurvature` candidate simply has its redundant fixed
+    /// forms removed.
+    ///
+    /// Order is preserved and otherwise stable: the fused `ConstantCurvature`
+    /// candidate takes the position of the first fixed form it replaces; all
+    /// non-family candidates (`Circle`/`Torus`/`Cylinder`/`Mixture`/`Union`) and
+    /// any duplicates keep their relative order. Idempotent.
+    pub fn fuse_constant_curvature_family(candidates: &[Self]) -> Vec<Self> {
+        let already_has_cc = candidates
+            .iter()
+            .any(|c| matches!(c, AutoTopologyKind::ConstantCurvature));
+        let fixed_form_count = candidates
+            .iter()
+            .filter(|c| c.is_fixed_constant_curvature_form())
+            .count();
+        // Fuse when ≥2 fixed forms are present, OR when an explicit
+        // ConstantCurvature candidate already subsumes ≥1 redundant fixed form.
+        let should_fuse = fixed_form_count >= 2 || (already_has_cc && fixed_form_count >= 1);
+        if !should_fuse {
+            return candidates.to_vec();
+        }
+        let mut out = Vec::with_capacity(candidates.len());
+        let mut emitted_cc = false;
+        for &c in candidates {
+            if c.is_fixed_constant_curvature_form() {
+                // Replace the first fixed form by the fitted-κ candidate (unless
+                // an explicit one already exists); drop the rest.
+                if !already_has_cc && !emitted_cc {
+                    out.push(AutoTopologyKind::ConstantCurvature);
+                    emitted_cc = true;
+                }
+                continue;
+            }
+            if matches!(c, AutoTopologyKind::ConstantCurvature) {
+                if emitted_cc {
+                    continue; // collapse duplicate CC candidates
+                }
+                emitted_cc = true;
+            }
+            out.push(c);
+        }
+        out
     }
 
     /// The full discrete-mixture rung: one candidate per `k` in

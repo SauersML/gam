@@ -88,6 +88,12 @@ const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 /// direction, or reject the trial rho as numerically singular.
 const SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR: f64 = 1.0e-12;
 const SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR: f64 = 1.0e-8;
+/// Relative spectral cutoff below which a penalised decoder β-curvature
+/// eigenvalue (`G_k + λ_smooth·S_k`) is treated as a genuine flat direction of
+/// the joint inner Hessian — the rank-deficient-decoder null quotiented out of
+/// the inner convergence measure and deflated in the outer gradient (#1051).
+/// Matches the `1e-9` relative rank cutoff used across the codebase.
+const SAE_DECODER_BETA_NULL_RELATIVE_FLOOR: f64 = 1.0e-9;
 
 /// Largest decoder (`β`) block dimension for which the outer-gradient
 /// conditioning path may additionally probe the β coordinate basis for a
@@ -11354,6 +11360,7 @@ impl SaeManifoldTerm {
         delta_ext_coord: ArrayView1<'_, f64>,
         delta_beta: ArrayView1<'_, f64>,
         raw_step_norm_sq: f64,
+        penalized_gram_scale: f64,
     ) -> Result<f64, String> {
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
@@ -11370,8 +11377,17 @@ impl SaeManifoldTerm {
             residual[beta_base + i] = delta_beta[i];
         }
 
+        // Quotient out BOTH the chart reparametrisation orbit AND the
+        // rank-deficient decoder β-null (#1051): along either the penalised
+        // joint objective is flat, so the undamped Newton step there is gauge
+        // freedom, not un-converged motion. Measuring convergence on the raw
+        // step would reject a stationary line / low-rank fit forever.
         let mut orthonormal: Vec<Array1<f64>> = Vec::new();
-        for mut gauge in self.dense_step_gauge_vectors()? {
+        let gauges = self
+            .dense_step_gauge_vectors()?
+            .into_iter()
+            .chain(self.decoder_beta_null_directions(penalized_gram_scale)?);
+        for mut gauge in gauges {
             for basis in &orthonormal {
                 let coeff = gauge.dot(basis);
                 for i in 0..gauge.len() {
