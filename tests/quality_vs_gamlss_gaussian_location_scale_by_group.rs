@@ -237,15 +237,19 @@ fn gam_location_scale_by_group_matches_gamlss() {
         ],
         r#"
         suppressPackageStartupMessages(library(gamlss))
-        suppressPackageStartupMessages(library(gamlss.add))
         df$g <- factor(ifelse(df$g < 0.5, "A", "B"), levels = c("A", "B"))
         gridx <- df$gridx[1:100]
         gA <- gridx[1:50]
         gB <- gridx[51:100]
 
+        # Smooth mean AND smooth log-sigma via gamlss's native penalized
+        # B-spline `pb()` (REML-selected lambda). This is the canonical GAMLSS
+        # smoother and lives in base `gamlss`; the earlier `ga(~ s(x))` form
+        # required the separate `gamlss.add` package (unavailable here) and
+        # produced the "cannot coerce class 'function' to a data.frame" error.
         fit_one <- function(sub, grid) {
-          m <- gamlss(y ~ ga(~ s(x, bs = "tp")),
-                      sigma.formula = ~ ga(~ s(x, bs = "tp")),
+          m <- gamlss(y ~ pb(x),
+                      sigma.formula = ~ pb(x),
                       family = NO(), data = sub,
                       control = gamlss.control(trace = FALSE))
           nd <- data.frame(x = grid)
