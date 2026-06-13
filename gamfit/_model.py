@@ -58,7 +58,8 @@ class Model:
         self,
         data: Any,
         *,
-        interval: float | None = None,
+        interval: float | str | None = None,
+        conformal_level: float = 0.9,
         covariance_mode: str | None = None,
         observation_interval: bool = False,
         return_type: str | None = None,
@@ -73,7 +74,7 @@ class Model:
             (``pandas.DataFrame``, ``pyarrow.Table``, ``polars.DataFrame``,
             ``dict`` of columns, ``list`` of record dicts, ...). Columns must
             cover every predictor referenced by the fitted formula.
-        interval : float or None, default None
+        interval : float, "conformal", or None, default None
             Single uncertainty knob. ``None`` returns the point prediction(s)
             only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
             uncertainty decomposition at that pointwise coverage; the output
@@ -83,6 +84,18 @@ class Model:
             collapsed the previous overlapping ``with_uncertainty`` boolean
             into this single flag (use ``interval=0.95`` for the SE-only
             case).
+
+            Pass ``interval="conformal"`` to use exact distribution-free
+            jackknife+ prediction intervals (Barber et al. 2021) — no
+            held-out calibration fold is required. The coverage level is
+            controlled by ``conformal_level`` (default ``0.9``). This path
+            requires a Gaussian-identity model fitted without prior weights,
+            offsets, or a link wiggle; use :meth:`predict_conformal` for
+            split-conformal intervals on other families.
+        conformal_level : float, default 0.9
+            Target marginal coverage in ``(0, 1)`` when ``interval="conformal"``
+            (e.g. ``0.95`` for a 95% interval). Ignored when ``interval`` is a
+            float or ``None``.
         covariance_mode : {"conditional", "smoothing", "required"}, optional
             Posterior covariance source for the interval (CLI<->Python parity
             with ``gam predict --covariance-mode``). ``"conditional"`` uses the
@@ -159,6 +172,29 @@ class Model:
         """
         headers, rows, table_kind = normalize_table(data)
         row_ids = extract_row_ids(headers, rows, id_column)
+        # #1054: interval='conformal' routes to the exact Gaussian jackknife+
+        # path (no held-out fold needed, finite-sample ≥conformal_level
+        # marginal coverage). The returned JSON has the same column schema as
+        # the model-based predict path so shape_predict_response is unchanged.
+        if interval == "conformal":
+            try:
+                raw = rust_module().predict_table_jackknife_plus(
+                    self._model_bytes, headers, rows, conformal_level
+                )
+            except Exception as exc:
+                raise map_exception(exc) from exc
+            return shape_predict_response(
+                raw,
+                headers=headers,
+                rows=rows,
+                table_kind=table_kind,
+                training_table_kind=self._training_table_kind,
+                interval=conformal_level,
+                return_type=return_type,
+                id_column=id_column,
+                row_ids=row_ids,
+                restore=restore_output_table,
+            )
         opts_json = rust_module().build_model_predict_payload_json(
             self._model_bytes,
             headers,
