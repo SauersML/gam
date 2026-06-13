@@ -1196,7 +1196,11 @@ fn realize_measure_jet_geometry(
     if m < 3 {
         return Err(BasisError::InsufficientColumnsForConstraint { found: m });
     }
-    let order_s = measure_jet_realized_order_s(spec);
+    let order_s = if spec.order_s == 0.0 {
+        MEASURE_JET_DEFAULT_ORDER_S
+    } else {
+        spec.order_s
+    };
     // Quadrature realization. Fit path: the realized nodes are the cell
     // BARYCENTERS of the seed partition (first-moment-exact lumping of μ —
     // see `measure_jet_quadrature_nodes`), so the metadata's `centers` are
@@ -1286,20 +1290,6 @@ fn realize_measure_jet_geometry(
 /// ψ-dimension cannot disagree.
 pub fn measure_jet_rich_mode(spec: &MeasureJetBasisSpec, center_count: usize) -> bool {
     spec.order_s == 0.0 && center_count >= MEASURE_JET_RICH_MODE_MIN_CENTERS
-}
-
-/// Realized fused-energy order `s` for a spec: the `order_s == 0.0` auto
-/// sentinel resolves to [`MEASURE_JET_DEFAULT_ORDER_S`] — the same rule the
-/// builder applies, exported so the outer engine's ψ seed starts the `s` dial
-/// at the order the basis was actually built with (an auto-mode SIMPLE term
-/// enrolls the fused `(s, α, lnτ)` dials; seeding `s = 0` would start outside
-/// the admissible order interval).
-pub fn measure_jet_realized_order_s(spec: &MeasureJetBasisSpec) -> f64 {
-    if spec.order_s == 0.0 {
-        MEASURE_JET_DEFAULT_ORDER_S
-    } else {
-        spec.order_s
-    }
 }
 
 /// Build the measure-jet smooth: Gaussian representer design `K(data,
