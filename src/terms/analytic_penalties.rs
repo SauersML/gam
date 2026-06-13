@@ -2525,11 +2525,27 @@ impl IBPAssignmentPenalty {
             }
         }
 
+        // #1038 cross-row Woodbury: per column `k`, the EXACT IBP Hessian has the
+        // rank-one cross-row block `H_(i,k),(j,k) += w·s'_k·z'_ik·z'_jk` (for all
+        // `i,j`, including `i=j`). `cross_row_d[k] = w·s'_k = w·score_derivative_k`
+        // is its scalar `D`-coefficient; `z_jac` already holds `u_k`'s entries
+        // `z'_ik`. The consumer subtracts the `i=j` self term from `H₀` (the
+        // assembled diagonal carries it) and adds the FULL rank-one via the
+        // determinant lemma, so value/logdet/adjoint all differentiate one
+        // operator. Built from the SAME `(score_derivative, z_jac)` source as the
+        // diagonal `hessian_diag` and the `m_channel`/`local_logit_third` third
+        // tensor — the issue's one-operator non-negotiable.
+        let mut cross_row_d = Array1::<f64>::zeros(self.k_max);
+        for k in 0..self.k_max {
+            cross_row_d[k] = self.weight * score_derivative[k];
+        }
+
         IbpHessianDiagThirdChannels {
             k_max: self.k_max,
             z_jac,
             local_logit_third,
             m_channel,
+            cross_row_d,
         }
     }
 
@@ -2666,6 +2682,12 @@ pub struct IbpHessianDiagThirdChannels {
     /// selected-inverse diagonal per column, then distribute `C_k·J_wk` to every
     /// row `w` (row-major `N·K`).
     pub m_channel: Array1<f64>,
+    /// `cross_row_d[k] = w·s'_k`: the scalar `D`-coefficient of the per-column
+    /// cross-row rank-one Hessian block `H_(i,k),(j,k) = w·s'_k·z'_ik·z'_jk`
+    /// (#1038). Paired with `u_k = z_jac[·,k]` this is the exact column-`k`
+    /// Woodbury update `d_k·u_k·u_kᵀ` (full outer product, `i=j` included).
+    /// Length `K`.
+    pub cross_row_d: Array1<f64>,
 }
 
 impl AnalyticPenalty for IBPAssignmentPenalty {
