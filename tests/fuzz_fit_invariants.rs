@@ -267,7 +267,6 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
 
     // I2 finite predictions on training rows. Rebuild the predict design from
     // the frozen resolved spec over the SAME predictor columns the fit saw.
-    let ncols = shape.ncols;
     // Recover predictor columns by re-reading them deterministically: rebuild
     // the same data and pull the encoded predictor matrix shape. We construct
     // the predict matrix directly from the regenerated columns.
