@@ -17846,6 +17846,72 @@ fn run_exact_joint_spatial_optimization(
         }
     }
 
+    // ── Discriminating outer-gradient FD audit (issue #1040 / #944 merge gate) ──
+    //
+    // At θ₀, central-difference the outer criterion component-by-component and
+    // compare it to the analytic outer gradient that drives this single-block
+    // joint optimizer. This forks the two failure modes of a non-terminating
+    // outer loop — an objective↔gradient DESYNC (analytic ≠ FD) vs weak
+    // identifiability (analytic ≈ FD but a near-singular outer Hessian) — and is
+    // the standing merge gate for any design-moving ψ-coordinate, including the
+    // #944 raw-κ constant-curvature coordinate (labelled `psi_kappa[..]`).
+    //
+    // Gated strictly to diagnostic-sized problems (auto-derived from the
+    // realized (n, θ_dim), no flag) so it never taxes a production fit. The
+    // same gate the n-block driver uses.
+    const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
+    const OUTER_FD_AUDIT_MAX_THETA_DIM: usize = 32;
+    let n_total = data.nrows();
+    let outer_fd_audit_eligible = analytic_outer_hessian_available
+        && n_total <= OUTER_FD_AUDIT_MAX_N
+        && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM;
+    log::warn!(
+        "[OUTER-FD-AUDIT/spatial-exact-joint] gate eligible={outer_fd_audit_eligible} \
+         analytic_grad={analytic_outer_hessian_available} n_total={n_total} \
+         theta_dim={theta_dim} rho_dim={rho_dim} psi_dim={coord_dim}"
+    );
+    if outer_fd_audit_eligible {
+        let audit = (|| -> Result<crate::solver::outer_strategy::OuterGradientFdAudit, String> {
+            let mut eval_at = |theta: &Array1<f64>,
+                               mode: crate::solver::estimate::reml::unified::EvalMode|
+             -> Result<
+                (
+                    f64,
+                    Array1<f64>,
+                    crate::solver::outer_strategy::HessianResult,
+                ),
+                String,
+            > {
+                use crate::solver::estimate::reml::unified::EvalMode;
+                let order = if matches!(mode, EvalMode::ValueGradientHessian) {
+                    OuterEvalOrder::ValueGradientHessian
+                } else {
+                    OuterEvalOrder::ValueOnly
+                };
+                ctx.eval_full(theta, order, analytic_outer_hessian_available)
+                    .map_err(|e| format!("fd-audit eval_full: {e}"))
+            };
+            let rho_dim_audit = rho_dim;
+            let label_fn = move |i: usize| -> String {
+                if i < rho_dim_audit {
+                    format!("rho[{i}]")
+                } else {
+                    format!("psi_kappa[{}]", i - rho_dim_audit)
+                }
+            };
+            crate::solver::outer_strategy::outer_gradient_fd_audit(
+                theta0,
+                1e-4,
+                label_fn,
+                &mut eval_at,
+            )
+        })();
+        match audit {
+            Ok(audit) => audit.log_verdict("spatial-exact-joint"),
+            Err(e) => log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] skipped: {e}"),
+        }
+    }
+
     let problem = exact_joint_multistart_outer_problem(
         theta0,
         lower,
