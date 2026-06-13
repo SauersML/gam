@@ -232,6 +232,73 @@ fn scan_routed_workflow_fit_matches_dense_oracle_at_selected_lambda() {
     );
 }
 
+/// Observation-interval oracle (#1047): the scan-routed predict arm emits the
+/// response-scale predictive (observation) band `mean ± z·√(Var(f) + σ²)`. This
+/// reconstructs the exact band the FFI predict arm builds in
+/// `crates/gam-pyffi/src/lib.rs` (`predict_columns`, scan branch) from the same
+/// public `SplineScanFit` surface it reads — `se = √fit.var`, then
+/// `obs_se = √(se² + fit.sigma2)` — and asserts it equals an INDEPENDENT dense
+/// predictive band built from the self-constructed dense posterior of the same
+/// order-2 prior: `obs_se_dense = √(σ²·C̃_tt + σ²)`. The two agree to tight tol,
+/// which pins the FFI scan observation interval to the dense path's
+/// `observation_interval` it must match. It also confirms the band is the
+/// credible band STRICTLY inflated by σ² (a dropped/degenerate σ² == 0 would
+/// collapse the two and fail).
+#[test]
+fn scan_routed_observation_interval_matches_dense_predictive_band() {
+    init_parallelism();
+    let (x, y) = training_xy(140);
+    let data = encode_xy(&x, &y);
+    let fit = fit_spline_scan_from_formula(SCAN_FORMULA, &data, &gaussian_config())
+        .expect("scan-routed fit")
+        .expect("detection must fire for a single 1-D single-penalty Gaussian smooth");
+
+    assert_eq!(fit.knots.len(), x.len(), "no ties expected in this design");
+    let w = vec![1.0_f64; fit.knots.len()];
+    let knot_y: Vec<f64> = {
+        let mut idx: Vec<usize> = (0..x.len()).collect();
+        idx.sort_by(|&i, &j| x[i].total_cmp(&x[j]));
+        idx.iter().map(|&i| y[i]).collect()
+    };
+    let (_oracle_mean, oracle_var_unit) = dense_truth(&fit.knots, &knot_y, &w, fit.log_lambda);
+
+    // Same z the FFI scan arm uses (two-sided 95%).
+    let level = 0.95_f64;
+    let z = gam::probability::standard_normal_quantile(0.5 + level * 0.5)
+        .expect("normal quantile");
+    assert!(fit.sigma2 > 0.0, "profiled σ² must be strictly positive");
+
+    for t in 0..fit.knots.len() {
+        // FFI scan arm reconstruction: confidence SE then σ²-inflated predictive SE.
+        let se = fit.var[t].max(0.0).sqrt();
+        let obs_se = (se * se + fit.sigma2).max(0.0).sqrt();
+        let obs_half = z * obs_se;
+        let mean_half = z * se;
+
+        // Independent dense predictive half-width from the self-constructed
+        // posterior: Var(y*) = σ²·C̃_tt + σ².
+        let dense_var_f = oracle_var_unit[t] * fit.sigma2;
+        let dense_obs_half = z * (dense_var_f + fit.sigma2).sqrt();
+
+        assert!(
+            (obs_half - dense_obs_half).abs() <= 1e-6 * dense_obs_half.max(1e-12),
+            "observation half-width mismatch at knot {t}: scan={obs_half} dense={dense_obs_half}"
+        );
+        // Predictive band strictly wider than the credible band by exactly the
+        // σ² inflation — rejects a dropped or degenerate σ².
+        assert!(
+            obs_half > mean_half,
+            "observation band not strictly wider than credible band at knot {t}"
+        );
+        let expected_inflation = z * ((se * se + fit.sigma2).sqrt() - se);
+        assert!(
+            ((obs_half - mean_half) - expected_inflation).abs()
+                <= 1e-9 * expected_inflation.max(1e-12),
+            "σ² inflation mismatch at knot {t}"
+        );
+    }
+}
+
 #[test]
 fn scan_routed_fit_recovers_truth_at_least_as_well_as_dense_path() {
     init_parallelism();
