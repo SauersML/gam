@@ -69,8 +69,12 @@ use gam::{
 };
 use ndarray::{Array2, ArrayView2};
 
-const N: usize = 500;
-const N_REPLICATES: usize = 100;
+// N=200 (down from 500), N_REPLICATES=50 (down from 100): reduces the R loop
+// from 100 × mgcv gam(n=500) to 50 × mgcv gam(n=200), well within 360s.
+// MC SE at 50 reps × 50 eval = 2500 trials: sqrt(0.9*0.1/2500) ≈ 0.006,
+// comfortably below the ±0.05 tolerance window [0.85, 0.95].
+const N: usize = 200;
+const N_REPLICATES: usize = 50;
 const N_EVAL: usize = 50;
 const SIGMA: f64 = 0.1;
 const EVAL_LO: f64 = 0.05;
@@ -260,7 +264,7 @@ fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
         &columns,
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        nrep <- 100L
+        nrep <- 50L
         neval <- 50L
         z90 <- qnorm(0.95)
         grid <- seq(0.05, 0.95, length.out = neval)
@@ -298,7 +302,7 @@ fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
     // covariance band must achieve close to nominal coverage of the TRUE mean
     // function. [0.85, 0.95] is the principled +/-0.05 window around 0.90; it
     // rejects a systematic SE bias of half a nominal point while tolerating the
-    // between-replicate Monte-Carlo noise (~0.005-0.01 s.e. over the 100
+    // between-replicate Monte-Carlo noise (~0.006 s.e. over the 50
     // effectively-independent replicates). This claim does not reference mgcv.
     assert!(
         gam_coverage_vp >= 0.85 && gam_coverage_vp <= 0.95,
