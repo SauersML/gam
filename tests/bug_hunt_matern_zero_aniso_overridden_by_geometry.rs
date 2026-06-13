@@ -184,15 +184,15 @@ fn matern_design_is_continuous_through_zero_anisotropy() {
     );
 }
 
-/// The same guarantee across every supported smoothness ν: explicit [0,0] is
-/// isotropic for ν ∈ {1/2, 3/2, 5/2, 7/2, 9/2}.
+/// The same guarantee across smoothness ν: explicit [0,0] is isotropic for
+/// ν ∈ {3/2, 5/2, 7/2, 9/2}. (ν=1/2 has a singular Laplacian at collocation for
+/// d>1 and is not buildable with these centers, independent of anisotropy.)
 #[test]
 fn explicit_zero_aniso_is_isotropic_across_nu() {
     let centers = array![[0.0, 0.0], [30.0, 0.3], [15.0, 0.1], [45.0, 0.5]];
     let points = array![[5.0, 0.2], [22.0, 0.05], [40.0, 0.4]];
     let ls = 2.0;
     for nu in [
-        MaternNu::Half,
         MaternNu::ThreeHalves,
         MaternNu::FiveHalves,
         MaternNu::SevenHalves,
