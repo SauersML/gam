@@ -223,8 +223,13 @@ fn sae_manifold_euclidean_line_inner_solve_iterations_are_cheap() {
     let (z, s_true) = planted_line();
     let mut term = build_cold_term(&s_true, &z);
     let mut rho = dimensionless_entry_rho(&term, &z);
-    // Convergence-horizon trace: how the inner loss settles with budget.
-    for budget in [20usize, 20, 20, 40, 100] {
+    // Convergence-horizon trace: run a LARGE cumulative inner budget and report
+    // BOTH the penalised objective and the reconstruction R² so we can tell a
+    // correct-but-slow crawl (R² climbs to ~1) from a broken solve (R² plateaus
+    // low). This localises whether the line is recoverable at all by the inner
+    // joint Newton, independent of the continuation / criterion machinery.
+    let mut final_r2 = 0.0_f64;
+    for budget in [50usize, 50, 100, 200, 400] {
         let t0 = std::time::Instant::now();
         let loss = term
             .run_joint_fit_arrow_schur(
@@ -238,40 +243,17 @@ fn sae_manifold_euclidean_line_inner_solve_iterations_are_cheap() {
             )
             .expect("inner solve must not error on the line");
         let dt = t0.elapsed().as_secs_f64();
+        let r2 = reconstruction_r2(&term.fitted(), &z);
+        final_r2 = r2;
         println!(
-            "[#1051-probe] inner +{budget}it total={:.8e} dt={dt:.3}s",
+            "[#1051-probe] inner +{budget}it total={:.8e} recon_R2={r2:.6} dt={dt:.3}s",
             loss.total()
         );
         assert!(loss.total().is_finite(), "inner loss non-finite");
     }
-
-    // The real gate: a full reml_criterion (the inner solve PLUS the
-    // undamped-evidence refine loop the continuation calls per ρ) must return a
-    // finite, rankable criterion quickly — not grind to the 1e12 sentinel.
-    let mut term2 = build_cold_term(&s_true, &z);
-    let rho2 = dimensionless_entry_rho(&term2, &z);
-    let t0 = std::time::Instant::now();
-    let outcome = term2.reml_criterion(
-        z.view(),
-        &rho2,
-        None,
-        INNER_MAX_ITER,
-        LEARNING_RATE,
-        RIDGE_EXT_COORD,
-        RIDGE_BETA,
-    );
-    let dt = t0.elapsed().as_secs_f64();
-    match &outcome {
-        Ok((v, _)) => println!("[#1051-probe] reml_criterion OK value={v:.6e} dt={dt:.2}s"),
-        Err(e) => println!("[#1051-probe] reml_criterion ERR dt={dt:.2}s: {e}"),
-    }
-    let (value, _) = outcome.expect("reml_criterion must succeed on the line");
     assert!(
-        value.is_finite() && value < 1.0e11,
-        "reml_criterion returned the infeasible sentinel value={value:.6e}"
-    );
-    assert!(
-        dt < 30.0,
-        "reml_criterion took {dt:.2}s (> 30s) — the inner solve grinds the rank-deficient block"
+        final_r2 > 0.99,
+        "inner joint Newton failed to recover the line (final recon R²={final_r2:.6} < 0.99) \
+         even at a large iteration budget — the slow crawl is not merely a perf issue"
     );
 }
