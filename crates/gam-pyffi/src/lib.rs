@@ -25750,6 +25750,20 @@ fn predict_table_conformal_impl(
     options_json: Option<&str>,
 ) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
+    // Split-conformal calibration is built on the dense predictor + fit_result,
+    // neither of which a scan-routed model carries. Point and posterior-interval
+    // prediction (the scan-aware predict path) work for these models, so direct
+    // users there rather than failing with the cryptic missing-resolved_termspec
+    // error (#1046).
+    if let Some(scan) = scan_introspection(&model)? {
+        return Err(format!(
+            "{} is fit by the exact O(n) state-space spline scan, which does not \
+             carry the dense predictor split-conformal calibration needs. Use \
+             predict(..., interval=<level>) for posterior intervals (scan-aware), \
+             or refit with double_penalty=true for conformal intervals.",
+            scan_smooth_label(&scan)
+        ));
+    }
     let mut options = parse_predict_options(options_json)?;
     if !(conformal_level.is_finite() && conformal_level > 0.0 && conformal_level < 1.0) {
         return Err(format!(
@@ -27957,10 +27971,13 @@ struct ScanIntrospection {
     /// Selected smoothing parameter `λ` (always positive).
     lambda: f64,
     /// Diffuse REML expressed as a COST (lower is better): the negative
-    /// restricted log marginal likelihood, up to a λ-free additive constant.
-    /// On the same sign convention as the dense `reml_score`; the dropped
-    /// constant means cross-comparison with a *dense* fit is approximate, while
-    /// scan-vs-scan comparison is exact.
+    /// restricted log marginal likelihood, on the same sign convention as the
+    /// dense `reml_score`. It is exact up to the λ-free additive constant the
+    /// concentrated criterion drops, which is what makes it an exact criterion
+    /// for the smoother's own λ selection. That constant depends on (n, order,
+    /// knots), so it does NOT cancel when comparing different fits — treat this
+    /// as a within-fit quantity and prefer held-out predictive metrics for
+    /// cross-model comparison.
     reml_cost: f64,
     /// Gaussian deviance — the weighted residual sum of squares.
     deviance: f64,
