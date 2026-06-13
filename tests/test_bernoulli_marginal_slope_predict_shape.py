@@ -94,6 +94,82 @@ def test_bernoulli_marginal_slope_saved_kind_returns_1d_probabilities(
     np.testing.assert_allclose(arr, [0.2, 0.5, 0.8])
 
 
+def test_bernoulli_marginal_slope_interval_carries_clipped_bounds(
+    monkeypatch: Any,
+) -> None:
+    """Issue #1049: when an ``interval=`` request makes the Rust core emit
+    ``std_error`` + response-scale credible bounds, the marginal-slope shaper
+    must carry them into the table (it previously dropped everything but
+    ``mean``). The probability-scale bounds are clipped to ``[0, 1]`` with the
+    same map as the point ``mean``; ``std_error`` (the η-scale SE) is passed
+    through untouched."""
+
+    class _ClippingRust(_FakeRust):
+        @staticmethod
+        def marginal_slope_clip_probabilities(values: list[float]) -> list[float]:
+            return [min(1.0, max(0.0, v)) for v in values]
+
+    rust = _ClippingRust()
+    monkeypatch.setattr(_predict_shape, "rust_module", lambda: rust)
+
+    raw = _payload(
+        "marginal-slope",
+        "bernoulli-marginal-slope",
+        {
+            "linear_predictor": [-1.0, 0.0, 1.0],
+            # `mean` and the bounds are response-scale (probability) values; the
+            # bounds straddle [0, 1] to exercise the clip.
+            "mean": [0.16, 0.50, 0.84],
+            "std_error": [0.30, 0.20, 0.30],
+            "mean_lower": [-0.05, 0.42, 0.70],
+            "mean_upper": [0.40, 0.58, 1.10],
+        },
+    )
+
+    out = _predict_shape.shape_predict_response(
+        raw,
+        headers=[],
+        rows=[],
+        table_kind="pandas",
+        training_table_kind="pandas",
+        interval=0.95,
+        return_type="dict",
+        id_column=None,
+        row_ids=None,
+        restore=restore_output_table,
+    )
+
+    assert isinstance(out, dict)
+    assert set(out) == {"mean", "std_error", "mean_lower", "mean_upper"}
+    np.testing.assert_allclose(out["mean"], [0.16, 0.50, 0.84])
+    # std_error is the η-scale SE — untouched, not clipped.
+    np.testing.assert_allclose(out["std_error"], [0.30, 0.20, 0.30])
+    # Probability-scale bounds clipped into [0, 1].
+    np.testing.assert_allclose(out["mean_lower"], [0.0, 0.42, 0.70])
+    np.testing.assert_allclose(out["mean_upper"], [0.40, 0.58, 1.0])
+
+
+def test_bernoulli_marginal_slope_no_interval_stays_1d(monkeypatch: Any) -> None:
+    """Without an interval request the marginal-slope point payload is still a
+    bare 1-D probability vector even if the backend volunteered extra columns —
+    the #1049 fix only surfaces bounds, it does not flip the no-interval
+    shape."""
+    raw = _payload(
+        "marginal-slope",
+        "bernoulli-marginal-slope",
+        {
+            "linear_predictor": [-1.0, 0.0, 1.0],
+            "mean": [0.2, 0.5, 0.8],
+        },
+    )
+
+    out = _dispatch(monkeypatch, raw)
+
+    arr = np.asarray(out, dtype=float)
+    assert arr.shape == (3,)
+    np.testing.assert_allclose(arr, [0.2, 0.5, 0.8])
+
+
 def test_standard_gam_default_returns_1d_mean(monkeypatch: Any) -> None:
     """The default predict shape for a plain GAM is a 1-D ``ndarray``.
 
