@@ -48,6 +48,35 @@ fn reduced_laplace_nle(residual_objective: f64, log_det_h: f64) -> f64 {
     residual_objective + 0.5 * log_det_h
 }
 
+/// The fitted straight sub-model `γ̃(t) = b₀ + (t − t̄)·b₁` of one `d = 1` atom:
+/// the exact weighted least-squares line through the atom's OWN decoded image
+/// over its assigned rows. Carried on a verdict that selects LINEAR so the
+/// collapsed reconstruction can replace the curved decoded row with this straight
+/// image at any coordinate WITHOUT re-entering the (broken, #1051) outer fit —
+/// the coefficients are already realized inside the adjudication.
+#[derive(Clone, Debug)]
+pub struct AtomLinearImage {
+    /// The atom's slot index in the dictionary (so the collapsed assembly knows
+    /// which atom's decoded row to substitute).
+    pub atom_idx: usize,
+    /// The mass-weighted coordinate mean `t̄` the line is centered on.
+    pub t_bar: f64,
+    /// Per-output-channel intercept `b₀` (length `p`).
+    pub b0: Array1<f64>,
+    /// Per-output-channel slope `b₁` (length `p`).
+    pub b1: Array1<f64>,
+}
+
+impl AtomLinearImage {
+    /// Evaluate the straight sub-model `b₀ + (t − t̄)·b₁` into `out` (length `p`).
+    pub fn fill_row(&self, t: f64, out: &mut [f64]) {
+        let dt = t - self.t_bar;
+        for (j, slot) in out.iter_mut().enumerate() {
+            *slot = self.b0[j] + dt * self.b1[j];
+        }
+    }
+}
+
 /// One fitted `d = 1` atom's hybrid-split verdict, surfaced in the model output.
 #[derive(Clone, Debug)]
 pub struct AtomHybridVerdict {
@@ -58,6 +87,11 @@ pub struct AtomHybridVerdict {
     /// `true` iff the slot kept the CURVED parameterization (the fitted atom);
     /// `false` iff it yielded to the LINEAR special case (the straight tail).
     pub kept_curved: bool,
+    /// The fitted straight sub-model for this slot, present iff the verdict
+    /// selected LINEAR (`kept_curved == false`). The collapsed reconstruction
+    /// substitutes this for the atom's curved decoded image, making the verdict
+    /// load-bearing on the reconstruction rather than a passive diagnostic.
+    pub linear_image: Option<AtomLinearImage>,
 }
 
 /// The whole dictionary's hybrid-split report: one verdict per eligible `d = 1`
@@ -98,7 +132,7 @@ fn build_atom_candidates(
     decoded: ArrayView2<'_, f64>,
     curved_num_params: usize,
     fitted_turning: Option<f64>,
-) -> Option<(HybridAtomCandidate, HybridAtomCandidate)> {
+) -> Option<(HybridAtomCandidate, HybridAtomCandidate, (f64, Array1<f64>, Array1<f64>))> {
     let n = coords.len();
     let p = decoded.ncols();
     if n < MIN_ROWS_FOR_LINEAR_FIT || decoded.nrows() != n || weights.len() != n || p == 0 {
