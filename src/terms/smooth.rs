@@ -18048,8 +18048,26 @@ fn try_exact_joint_spatial_length_scale_optimization(
             family,
             options,
         )?;
+        // Stamp reml_score with the certified baseline score, exactly as the
+        // optimized branch stamps `joint_final_value` below. This refit is a
+        // β/inference harvester at the frozen baseline geometry (`best`'s
+        // lambdas + the frozen resolvedspec); the score that geometry was
+        // certified at is `baseline_score = fit_score(&best.fit)`. Its own
+        // re-derived `reml_score` drifts from that certified value because the
+        // harvest runs the full-inference option set (and re-runs the adaptive
+        // spatial overlay) rather than the superseded baseline path that
+        // produced `best`. The spatial-κ result gate
+        // (`require_successful_spatial_optimization_result`) compares the
+        // returned fit's `fit_score` against `fit_score(&best.fit)`; without
+        // this stamp a downward drift of a few REML units on the SAME geometry
+        // spuriously reads as "the optimizer made the score worse" and aborts
+        // an otherwise-valid fit. Stamping the certified score keeps the
+        // returned score consistent with the gate decision that selected this
+        // geometry, identical to the optimized branch.
+        let mut fit = baseline.fit;
+        fit.reml_score = baseline_score;
         let baseline_result = FittedTermCollectionWithSpec {
-            fit: baseline.fit,
+            fit,
             design: baseline.design,
             resolvedspec: resolvedspec.clone(),
             adaptive_diagnostics: baseline.adaptive_diagnostics,
