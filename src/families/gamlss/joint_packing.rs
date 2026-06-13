@@ -6,7 +6,10 @@
 use super::mirror_upper_to_lower;
 use ndarray::{Array1, Array2, s};
 
-pub(crate) fn gaussian_pack_joint_score(scoremu: &Array1<f64>, score_ls: &Array1<f64>) -> Array1<f64> {
+pub(crate) fn gaussian_pack_joint_score(
+    scoremu: &Array1<f64>,
+    score_ls: &Array1<f64>,
+) -> Array1<f64> {
     let pmu = scoremu.len();
     let p_ls = score_ls.len();
     let mut out = Array1::<f64>::zeros(pmu + p_ls);

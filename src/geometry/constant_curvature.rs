@@ -960,17 +960,13 @@ mod tests {
     #[test]
     fn exp_map_vjp_matches_finite_differences() {
         let h = 1e-6;
-        let cases: &[(ndarray::Array1<f64>, ndarray::Array1<f64>, ndarray::Array1<f64>)] = &[
-            (
-                array![0.2, -0.1],
-                array![0.12, 0.08],
-                array![1.0, -0.5],
-            ),
-            (
-                array![-0.15, 0.22],
-                array![-0.05, 0.11],
-                array![0.3, 0.7],
-            ),
+        let cases: &[(
+            ndarray::Array1<f64>,
+            ndarray::Array1<f64>,
+            ndarray::Array1<f64>,
+        )] = &[
+            (array![0.2, -0.1], array![0.12, 0.08], array![1.0, -0.5]),
+            (array![-0.15, 0.22], array![-0.05, 0.11], array![0.3, 0.7]),
         ];
         for &kappa in &[-1.3, -0.3, 0.0, 0.4, 1.1] {
             let m = ConstantCurvature::new(2, kappa);

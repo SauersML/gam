@@ -128,13 +128,12 @@ fn chart_coords(chart: Chart) -> Array2<f64> {
     for i in 0..LAT_GRID {
         // Sample the ROUND latitude on a uniform interior band, then map to the
         // chart latitude so every chart sees the same physical sphere band.
-        let lat_round =
-            lat_lo + (lat_hi - lat_lo) * (i as f64 + 0.5) / LAT_GRID as f64;
+        let lat_round = lat_lo + (lat_hi - lat_lo) * (i as f64 + 0.5) / LAT_GRID as f64;
         let lat_chart = inv_warp_lat(chart, lat_round);
         for j in 0..LON_GRID {
             let row = i * LON_GRID + j;
-            let lon = std::f64::consts::TAU * (j as f64 + 0.5) / LON_GRID as f64
-                - std::f64::consts::PI;
+            let lon =
+                std::f64::consts::TAU * (j as f64 + 0.5) / LON_GRID as f64 - std::f64::consts::PI;
             coords[[row, 0]] = lat_chart;
             coords[[row, 1]] = lon;
         }

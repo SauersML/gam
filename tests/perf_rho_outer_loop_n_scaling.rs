@@ -87,10 +87,7 @@ fn spec_2d() -> TermCollectionSpec {
         random_effect_terms: vec![],
         // Two independent penalised smooths → a real 2-D ρ outer search over a
         // FIXED (θ-invariant) design: the cache-eligible regime.
-        smooth_terms: vec![
-            bspline_smooth("f_u", 0),
-            bspline_smooth("f_v", 1),
-        ],
+        smooth_terms: vec![bspline_smooth("f_u", 0), bspline_smooth("f_v", 1)],
     }
 }
 
@@ -210,9 +207,7 @@ fn rho_outer_loop_is_n_independent() {
         // makes n-independent.
         let phase = (t_full - t_single).max(0.0);
         rho_phase.push(phase);
-        eprintln!(
-            "[rho-n-scaling] {n:>9}  {t_full:>11.4}  {t_single:>11.4}  {phase:>12.4}"
-        );
+        eprintln!("[rho-n-scaling] {n:>9}  {t_full:>11.4}  {t_single:>11.4}  {phase:>12.4}");
     }
 
     let first = rho_phase.first().copied().unwrap_or(0.0).max(1e-4);
