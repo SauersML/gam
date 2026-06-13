@@ -1195,7 +1195,8 @@ impl<'a> RemlState<'a> {
         let backend_label;
         let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             backend_label = "sparse_exact";
-            let ext_coords = self.build_tau_hyper_coords_sparse_exact(rho, bundle, hyper_dirs)?;
+            let ext_coords =
+                self.build_tau_hyper_coords_sparse_exact(rho, bundle, hyper_dirs, true)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks_sparse_exact(rho, bundle, hyper_dirs)?;
             let fixed_drift_deriv = if matches!(self.config.link_function(), LinkFunction::Identity)
@@ -1213,7 +1214,8 @@ impl<'a> RemlState<'a> {
             .is_none()
         {
             backend_label = "original_basis";
-            let ext_coords = self.build_tau_hyper_coords_original_basis(rho, bundle, hyper_dirs)?;
+            let ext_coords =
+                self.build_tau_hyper_coords_original_basis(rho, bundle, hyper_dirs, true)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks_original_basis(rho, bundle, hyper_dirs)?;
             let fixed_drift_deriv = if matches!(self.config.link_function(), LinkFunction::Identity)
@@ -1225,7 +1227,7 @@ impl<'a> RemlState<'a> {
             Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv))
         } else {
             backend_label = "generic";
-            let ext_coords = self.build_tau_hyper_coords(rho, bundle, hyper_dirs)?;
+            let ext_coords = self.build_tau_hyper_coords(rho, bundle, hyper_dirs, true)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks(rho, bundle, hyper_dirs)?;
             let fixed_drift_deriv = if matches!(self.config.link_function(), LinkFunction::Identity)
@@ -1275,6 +1277,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
+        for_hessian: bool,
     ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
         let psi_dim = hyper_dirs.len();
 
@@ -1438,6 +1441,57 @@ impl<'a> RemlState<'a> {
         )
         .map_err(EstimationError::InvalidInput)?;
 
+        // #1033b: when a certified ψ-Gram tensor has installed the
+        // conditioned-frame exact ψ-derivatives `(∂G/∂ψ, ∂b/∂ψ)` for the single
+        // design-moving Gaussian coordinate, transform them into THIS eval's
+        // (Qs, free-basis) frame once and let the j==0 coordinate build
+        // `a_j`/`g_j`/`B_j` from them — bypassing the n×k ∂X/∂ψ realization and
+        // its O(n·k) contractions (the second per-trial n-pass, #1033b). The
+        // penalty channel `S_τ` is unchanged: only the design-derivative half
+        // is replaced. Eligible only for Gaussian-identity, a single ψ
+        // coordinate, no implicit-operator/Firth complications, and matching
+        // conditioned width.
+        let tensor_psi_deriv: Option<(Array2<f64>, Array1<f64>)> = if !for_hessian
+            && is_gaussian_identity
+            && psi_dim == 1
+            && !any_has_implicit
+            && firth_op.is_none()
+        {
+            self.gaussian_psi_gram_deriv().and_then(|deriv| {
+                let (dgram_c, drhs_c) = deriv.as_ref();
+                // Conditioned frame width must match the transformed-design's
+                // pre-projection width (qs is p_full × p_full). beta_eval lives
+                // in the free frame (after Qs and optional free basis Z).
+                let p_full = reparam_result.qs.nrows();
+                if dgram_c.nrows() != p_full
+                    || dgram_c.ncols() != p_full
+                    || drhs_c.len() != p_full
+                {
+                    return None;
+                }
+                // Forward transform W = qs · Z (free_basis optional): a fixed,
+                // ψ-invariant column map within this eval, so
+                //   ∂G_t/∂ψ = Wᵀ (∂G_c/∂ψ) W,  ∂b_t/∂ψ = Wᵀ (∂b_c/∂ψ)
+                // is EXACT (matches the slab path's
+                //   X_{τ,t} = X_{τ,c} · W  ⇒  X_{τ,t}ᵀWX_t + X_tᵀWX_{τ,t}
+                //                          = Wᵀ(X_{τ,c}ᵀWX_c + X_cᵀWX_{τ,c})W).
+                let g_qs = reparam_result.qs.t().dot(dgram_c).dot(&reparam_result.qs);
+                let b_qs = reparam_result.qs.t().dot(drhs_c);
+                let (dgram_t, drhs_t) = if let Some(z) = free_basis_opt.as_ref() {
+                    (z.t().dot(&g_qs).dot(z), z.t().dot(&b_qs))
+                } else {
+                    (g_qs, b_qs)
+                };
+                if dgram_t.nrows() == p_dim && drhs_t.len() == p_dim {
+                    Some((dgram_t, drhs_t))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
         let mut coords = Vec::with_capacity(psi_dim);
 
         for j in 0..psi_dim {
@@ -1469,6 +1523,45 @@ impl<'a> RemlState<'a> {
                     Ok(acc)
                 },
             )?;
+
+            // #1033b: n-free Gaussian ψ-gradient from the certified tensor.
+            // For the single design-moving coordinate (j == 0) the three
+            // design-derivative objects reduce EXACTLY to the transformed
+            // tensor derivatives `∂G_t/∂ψ` (= dgram_t) and `∂b_t/∂ψ` (= drhs_t):
+            //   B_j = ∂G_t/∂ψ + S_τ
+            //   g_j = ∂b_t/∂ψ − (∂G_t/∂ψ)·β̂ − S_τ·β̂
+            //   a_j = −[∂b_t/∂ψ·β̂ − ½β̂ᵀ(∂G_t/∂ψ)β̂] + ½β̂ᵀS_τβ̂
+            // (the asymmetric XᵀWX_τ halves collapse because the a_j bilinear
+            // and quadratic forms both evaluate at β̂, where XᵀWX_τ contributes
+            // ½·∂G/∂ψ). `b_depends_on_beta = false` ⇒ no IFT cubic correction,
+            // so this matches the slab path bit-tight. tk_* (tau-tau Hessian
+            // inputs) are unused on this gradient-only path (`for_hessian`
+            // gates the tensor branch off when a Hessian is requested).
+            if j == 0
+                && let Some((dgram_t, drhs_t)) = tensor_psi_deriv.as_ref()
+            {
+                let dgram_beta = dgram_t.dot(&beta_eval);
+                let s_tau_beta = s_tau_j.dot(&beta_eval);
+                let g_j = drhs_t - &dgram_beta - &s_tau_beta;
+                let quad_g = beta_eval.dot(&dgram_beta);
+                let a_j = -(drhs_t.dot(&beta_eval) - 0.5 * quad_g)
+                    + 0.5 * beta_eval.dot(&s_tau_beta);
+                let mut b_j = dgram_t.clone();
+                b_j += &s_tau_j;
+                let ld_s_j = penalty_logdet.tau_gradient_component(&s_tau_j);
+                coords.push(super::unified::HyperCoord {
+                    a: a_j,
+                    g: -g_j,
+                    drift: super::unified::HyperCoordDrift::from_parts(Some(b_j), None),
+                    ld_s: ld_s_j,
+                    b_depends_on_beta: false,
+                    is_penalty_like: hyper_dirs[j].is_penalty_like,
+                    firth_g: None,
+                    tk_eta_fixed: None,
+                    tk_x_fixed: None,
+                });
+                continue;
+            }
 
             // --- a_j: fixed-β cost derivative (envelope term) ---
             // a_j = −u^T (X_{τ_j} β̂) + 0.5 β̂^T S_{τ_j} β̂  [− Φ_{τ_j}|_β for Firth]
@@ -1868,6 +1961,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
+        for_hessian: bool,
     ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
         let psi_dim = hyper_dirs.len();
 
@@ -1946,9 +2040,64 @@ impl<'a> RemlState<'a> {
             p_dim,
         )?;
 
+        // #1033b: conditioned-frame exact ψ-derivatives `(∂G/∂ψ, ∂b/∂ψ)`. In
+        // the original basis `self.x()` IS the conditioned design (the same
+        // frame the tensor was built in) and `beta_eval` is its coefficient
+        // vector, so the tensor pair maps directly with NO qs transform. The
+        // single Gaussian ψ coordinate then builds `a_j`/`g_j`/`B_j` from these
+        // k×k objects, retiring the per-trial n×k ∂X/∂ψ realization + its
+        // O(n·k) contractions (the operator's matvecs included). Disabled when
+        // a Hessian is requested (`for_hessian`) so exact tau-tau keeps slabs.
+        let tensor_psi_deriv: Option<(Array2<f64>, Array1<f64>)> = if !for_hessian
+            && is_gaussian_identity
+            && psi_dim == 1
+            && firth_op_original.is_none()
+        {
+            self.gaussian_psi_gram_deriv().and_then(|deriv| {
+                let (dgram_c, drhs_c) = deriv.as_ref();
+                if dgram_c.nrows() == p_dim && dgram_c.ncols() == p_dim && drhs_c.len() == p_dim {
+                    Some((dgram_c.clone(), drhs_c.clone()))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
         let mut coords = Vec::with_capacity(psi_dim);
-        for dir in hyper_dirs {
+        for (j, dir) in hyper_dirs.iter().enumerate() {
             let s_tau_j = dir.penalty_total_at(rho, p_dim)?;
+
+            // #1033b n-free Gaussian ψ-gradient (see build_tau_hyper_coords for
+            // the identity derivation; here the frame is the conditioned
+            // original basis, so dgram/drhs are used directly).
+            if j == 0
+                && let Some((dgram_t, drhs_t)) = tensor_psi_deriv.as_ref()
+            {
+                let dgram_beta = dgram_t.dot(&beta_eval);
+                let s_tau_beta = s_tau_j.dot(&beta_eval);
+                let g_j = drhs_t - &dgram_beta - &s_tau_beta;
+                let quad_g = beta_eval.dot(&dgram_beta);
+                let a_j =
+                    -(drhs_t.dot(&beta_eval) - 0.5 * quad_g) + 0.5 * beta_eval.dot(&s_tau_beta);
+                let mut b_j = dgram_t.clone();
+                b_j += &s_tau_j;
+                let ld_s_j = pld.tau_gradient_component(&s_tau_j);
+                coords.push(super::unified::HyperCoord {
+                    a: a_j,
+                    g: -g_j,
+                    drift: super::unified::HyperCoordDrift::from_parts(Some(b_j), None),
+                    ld_s: ld_s_j,
+                    b_depends_on_beta: false,
+                    is_penalty_like: dir.is_penalty_like,
+                    firth_g: None,
+                    tk_eta_fixed: None,
+                    tk_x_fixed: None,
+                });
+                continue;
+            }
+
             let x_tau_beta_j = dir.x_tau_original.forward_mul_original(&beta_eval)?;
             let weighted_x_tau_beta_j = &*w_diag * &x_tau_beta_j;
 
@@ -2093,11 +2242,12 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
+        for_hessian: bool,
     ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
         if bundle.sparse_exact.is_none() {
             crate::bail_invalid_estim!("missing sparse exact evaluation payload");
         }
-        self.build_tau_hyper_coords_original_basis(rho, bundle, hyper_dirs)
+        self.build_tau_hyper_coords_original_basis(rho, bundle, hyper_dirs, for_hessian)
     }
 
     /// Sparse-exact τ×τ and ρ×τ pair callbacks in original coordinates.
