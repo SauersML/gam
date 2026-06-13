@@ -19533,7 +19533,7 @@ mod tests {
         let delta_beta = gauge.slice(s![n_coord..]);
         let raw = gauge.iter().map(|v| v * v).sum::<f64>();
 
-        let quotient = term.quotient_newton_step_norm_sq(delta_t, delta_beta, raw)?;
+        let quotient = term.quotient_newton_step_norm_sq(delta_t, delta_beta, raw, 0.0)?;
 
         assert!(
             quotient <= raw.max(1.0) * 1.0e-20,
