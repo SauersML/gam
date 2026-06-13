@@ -127,6 +127,22 @@ use std::sync::Arc;
 /// proper prior to lean on.
 const MULTINOMIAL_FORMULA_RIDGE_FLOOR: f64 = 1.0e-4;
 
+/// Inner joint-Newton KKT tolerance for the multinomial formula path.
+///
+/// The softmax Fisher weight `W = diag(p) − ppᵀ` collapses on saturated rows,
+/// so near-separable fits (penguins, #715) reach the OBJECTIVE's f64 noise
+/// floor before the default `inner_tol = 1e-6` KKT target: measured on the
+/// penguins arm (standardized columns), the trust region collapses to 1e-12
+/// with per-attempt objective changes of ~+2e-9 on |obj| ≈ 1e2 (≈ 1e-11
+/// relative — pure rounding) while the KKT residual plateaus at 2.8e-5–9.4e-5
+/// against a scaled tolerance of ~1.9e-5. Demanding a residual below the
+/// floating-point noise floor is certifiable-never: every eval is rejected by
+/// the stall guard and the whole fit fails. `1e-5` certifies the measured
+/// plateaus while still resolving β to ~1e-6 in the relevant metric — the
+/// LAML criterion consumes β̂ with error O(residual²/curvature), far below
+/// any quantity the outer ρ-search can read.
+const MULTINOMIAL_FORMULA_INNER_TOL: f64 = 1.0e-5;
+
 /// Formula-adapter penalty calibration for multinomial softmax REML.
 ///
 /// The term builder's normalized penalties are calibrated on single-response
@@ -931,17 +947,16 @@ pub fn fit_penalized_multinomial_formula(
     // of cycles on the well-conditioned interior fits, so this is free there.
     // The caller's `max_iter` / `tol` become the OUTER controls they were always
     // meant to be (smoothing-parameter search depth / accuracy). The inner KKT
-    // target is kept no tighter than the outer accuracy can consume: a 1e-8
-    // inner residual below a 1e-5 outer tolerance asks the inner to over-resolve
-    // gradient components the outer optimizer never reads, so we floor `inner_tol`
-    // at the default and never demand more inner precision than `tol` implies.
+    // target is kept no tighter than the outer accuracy can consume — and no
+    // tighter than the softmax objective's f64 noise floor on near-separable
+    // fits (see `MULTINOMIAL_FORMULA_INNER_TOL`).
     let outer_max_iter = max_iter.max(1);
     let outer_tol = if tol.is_finite() && tol > 0.0 {
         tol
     } else {
         BlockwiseFitOptions::default().outer_tol
     };
-    let inner_tol = BlockwiseFitOptions::default().inner_tol.max(tol.max(0.0));
+    let inner_tol = MULTINOMIAL_FORMULA_INNER_TOL.max(tol.max(0.0));
 
     let options = BlockwiseFitOptions {
         inner_max_cycles: crate::custom_family::DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
