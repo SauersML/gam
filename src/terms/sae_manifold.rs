@@ -97,7 +97,7 @@ const SAE_DECODER_BETA_NULL_RELATIVE_FLOOR: f64 = 1.0e-9;
 
 /// Largest decoder (`β`) block dimension for which the outer-gradient
 /// conditioning path may additionally probe the β coordinate basis for a
-/// near-null subspace of the joint Hessian (issue #1051).
+/// near-null subspace of the joint Hessian (issue #1051, #1095).
 ///
 /// The closed-form gauge orbit ([`SaeManifoldTerm::dense_step_gauge_vectors`])
 /// only covers the *chart* reparametrisation freedom (constant + linear
@@ -109,11 +109,15 @@ const SAE_DECODER_BETA_NULL_RELATIVE_FLOOR: f64 = 1.0e-9;
 /// gauge of the *same* kind (a flat direction of the evidence quotient), so it
 /// is deflated identically — but only after the β basis is admitted as a
 /// deflation candidate. The dense `k×k` Rayleigh eigendecomposition that
-/// resolves it is `O(k³)`, so it is gated to small β blocks (the trivial-shape
-/// regime that exhibits the singularity); large-`p` LLM-scale fits keep the
-/// pure gauge-orbit path untouched (they reach low decoder rank through the
-/// Grassmann frame instead, see [`SaeManifoldAtom::maybe_activate_decoder_frame`]).
-const SAE_OUTER_GRADIENT_BETA_NULL_PROBE_MAX_DIM: usize = 64;
+/// resolves it is `O(k³)`, so it is gated to moderate β blocks; large-`p`
+/// LLM-scale fits keep the pure gauge-orbit path untouched (they reach low
+/// decoder rank through the Grassmann frame, which reduces the border width
+/// from `M·p` to `M·r` where `r ≪ p`, so `k ≤ M·r` is always small). PCA-
+/// reduced fits (p ≈ 32–128) with the Grassmann frame active can have
+/// `k = M·r` up to ~512 (e.g. m=8 basis fns, p=32, r=8 → k=64, but for
+/// m=16 → k=128, m=32 → k=256); 512 covers all typical small-atom PCA cases
+/// while keeping the O(k³) cost ≈ 0.13B ops — negligible next to the solve.
+const SAE_OUTER_GRADIENT_BETA_NULL_PROBE_MAX_DIM: usize = 512;
 
 /// Nominal curvature-homotopy `η` step (#1007): the tracker covers `η ∈ [0, 1]`
 /// in this many equal predictor-corrector waypoints when the branch is clean.
@@ -14491,31 +14495,28 @@ impl SaeManifoldOuterObjective {
             };
             total_correctors += 1;
 
-            // Pivot invariant: min pivot ≥ √eps · diag_scale (a purely relative
-            // floor, N-invariant — see #1095), the same safe-SPD check the
-            // inner solver uses — measured ON THE GAUGE QUOTIENT. A closed-form
-            // gauge null (affine chart freedom, circle rotation) is constant
-            // along the entire η-walk, so it can never signal a branch
-            // bifurcation; only a NON-gauge pivot collapse can. Without this
-            // discrimination the walk dies at η≈0 on any fixture whose ambient
-            // dimension is small enough for the gauge directions
-            // to dominate (every p=2 atlas tile), and the fit pays for the full
-            // seed cascade instead. `outer_gradient_arrow_solver` succeeds iff
-            // the sub-floor pivots are explained by the closed-form gauge span
-            // (the same Faddeev-Popov deflation the gradient lane uses) and
-            // errs honestly otherwise, which is exactly the verdict needed.
+            // Pivot invariant: min pivot ≥ eps · diag_scale, measured ON THE
+            // GAUGE QUOTIENT (#1095). The floor uses machine epsilon (not its
+            // square root) because the undamped cache is built with
+            // `with_ill_conditioning_tolerated()`, which accepts any
+            // positive-definite factor regardless of condition number.
+            // Sub-sqrt(eps) pivots are legitimately produced when N < beta_dim
+            // (small-N fits where the decoder Gram is rank-deficient) — this
+            // is NOT a branch bifurcation: the damped corrector already
+            // converged above, and genuine branch collapses are caught by
+            // corrector failure (the `Err` branch). Only a pivot numerically
+            // indistinguishable from zero in double precision (below
+            // eps * diag_scale) marks a true collapse of the smooth branch.
+            //
+            // A closed-form gauge null (affine chart freedom, circle rotation)
+            // is constant along the η-walk, so it can never signal a branch
+            // bifurcation; only a NON-gauge, data-supported pivot collapse can.
+            // `outer_gradient_arrow_solver` succeeds iff the sub-floor pivots
+            // are explained by gauge/null directions (Faddeev-Popov deflation)
+            // and errs honestly otherwise, which is exactly the verdict needed.
             let pivot = arrow_factor_min_pivot(&cache).min_pivot.unwrap_or(0.0);
             let diag_scale = arrow_factor_max_pivot(&cache).unwrap_or(1.0);
-            // #1095: the pivot floor must be PURELY RELATIVE to the Hessian
-            // scale so it remains tight on small-N datasets.  With `.max(1.0)`
-            // the floor becomes an absolute constant (√ε ≈ 1.5e-8) whenever
-            // `diag_scale < 1` — the per-sample normalised Hessian shrinks
-            // with N, so at N=180 legitimate pivots of ~4e-9 fall below
-            // the absolute floor even though pivot/diag_scale is healthy.
-            // Using the raw `diag_scale` (with the `unwrap_or(1.0)` guard
-            // already providing a non-zero default when no pivot is reported)
-            // keeps the floor dimensionless and N-invariant.
-            let floor = f64::EPSILON.sqrt() * diag_scale;
+            let floor = f64::EPSILON * diag_scale;
             let pivot_deficit_is_gauge = !(pivot.is_finite() && pivot >= floor)
                 && self.term.outer_gradient_arrow_solver(&cache).is_ok();
             if !(pivot.is_finite() && pivot >= floor) && !pivot_deficit_is_gauge {
