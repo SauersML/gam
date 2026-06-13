@@ -3533,8 +3533,9 @@ impl SaeManifoldTerm {
                 lowering_error,
                 // #1019: post-fit chart canonicalization (arc length for
                 // d = 1, isometry-flow for d = 2 torus, flat-reference
-                // isometry-flow for d = 2 free/patch atoms) pins the chart; the
-                // certificate downgrades this atom's chart freedom to the
+                // isometry-flow for d = 2 free/patch, round-sphere
+                // conformal-boost flow for d = 2 sphere atoms) pins the chart;
+                // the certificate downgrades this atom's chart freedom to the
                 // finite isometry group with PinnedByCanonicalization
                 // provenance.
                 chart_canonicalized: atom.chart_canonicalized
@@ -3545,6 +3546,7 @@ impl SaeManifoldTerm {
                                 SaeAtomBasisKind::Torus
                                     | SaeAtomBasisKind::Duchon
                                     | SaeAtomBasisKind::EuclideanPatch
+                                    | SaeAtomBasisKind::Sphere
                             ))),
             });
             atom_offsets.push(cursor);
@@ -4485,6 +4487,71 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
+    /// Per-atom **leave-one-atom-out (LOAO) explained-variance contribution**
+    /// (#1026): for each atom `k`, the drop in reconstruction explained variance
+    /// `ΔEV_k = EV(full) − EV(full ⊖ atom_k)` when that atom's contribution
+    /// `a[i,k]·g_k(coord[i,k])` is removed from the assembled reconstruction and
+    /// nothing else is refit. Because every atom adds linearly into the same
+    /// fitted reconstruction (`fitted[i] = Σ_k a[i,k]·g_k`), zeroing one atom is
+    /// the exact "this atom withheld" counterfactual, and the EV it was earning
+    /// is `EV(full) − EV(without k)`. This is the per-atom held-out EV
+    /// attribution the #1026 roadmap pairs with each atom's fitted turning `Θ`:
+    /// a `Θ ≈ 0` atom earning a large `ΔEV` is a linear-tail direction; a
+    /// high-`Θ` atom earning a large `ΔEV` is a genuine curved family carrying
+    /// reconstruction it would otherwise shatter into `N(ε) ≈ Θ/(2√(2ε))` linear
+    /// directions. Pure read-only diagnostic — never mutates any atom.
+    ///
+    /// Returns one `Option<f64>` per atom in atom order; `None` for an atom
+    /// whose ⊖-reconstruction EV is undefined (degenerate target variance), and
+    /// `None` for the whole vector if the full-reconstruction EV is undefined.
+    pub fn per_atom_loao_explained_variance(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<Vec<Option<f64>>, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::per_atom_loao_explained_variance: target {:?} != ({n}, {p})",
+                target.dim()
+            ));
+        }
+        let full = self.try_fitted_for_rho(rho)?;
+        let Some(ev_full) = reconstruction_explained_variance(target, full.view()) else {
+            return Ok(vec![None; k_atoms]);
+        };
+        // Cache each row's assignment weights once, then subtract a single
+        // atom's decoded contribution per LOAO pass instead of reassembling the
+        // whole dictionary k times.
+        let mut weights: Vec<Array1<f64>> = Vec::with_capacity(n);
+        for row in 0..n {
+            weights.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+        }
+        let mut g_buf = vec![0.0_f64; p];
+        let mut out = Vec::with_capacity(k_atoms);
+        for atom_idx in 0..k_atoms {
+            let mut without = full.clone();
+            for row in 0..n {
+                let a_k = weights[row][atom_idx];
+                if a_k == 0.0 {
+                    continue;
+                }
+                self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
+                let mut without_row = without.row_mut(row);
+                for out_col in 0..p {
+                    without_row[out_col] -= a_k * g_buf[out_col];
+                }
+            }
+            out.push(
+                reconstruction_explained_variance(target, without.view())
+                    .map(|ev_without| ev_full - ev_without),
+            );
+        }
+        Ok(out)
+    }
+
     pub fn loss(
         &self,
         target: ArrayView2<'_, f64>,
@@ -5003,24 +5070,26 @@ impl SaeManifoldTerm {
         // cross-row channels and leave this `None`. The block is gauge-null in
         // isolation (`H·𝟙 = 0`); it is only ever summed onto the gauge-breaking
         // data-fit row block before the Cholesky factor, never factored alone.
-        let softmax_dense: Option<(crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty, f64)> =
-            match self.assignment.mode {
-                AssignmentMode::Softmax {
-                    temperature,
-                    sparsity,
-                } if k_atoms > 1 => {
-                    let inv_tau = 1.0 / temperature;
-                    let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
-                    Some((
-                        crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
-                            k_atoms,
-                            temperature,
-                        ),
-                        scale,
-                    ))
-                }
-                _ => None,
-            };
+        let softmax_dense: Option<(
+            crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty,
+            f64,
+        )> = match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } if k_atoms > 1 => {
+                let inv_tau = 1.0 / temperature;
+                let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+                Some((
+                    crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                        k_atoms,
+                        temperature,
+                    ),
+                    scale,
+                ))
+            }
+            _ => None,
+        };
 
         // Decoder smoothness penalty: build one KroneckerPenaltyOp per atom
         // (structure = λ·S_k ⊗ I_p, offset = beta_offsets[k]) instead of
@@ -6180,8 +6249,7 @@ impl SaeManifoldTerm {
         //     (`row_vars_for_cache_row` maps `vars[atom] = Logit { atom }`). This
         //     pins the `U`-column convention bit-for-bit to the consumer.
         if let Some(channels) = ibp_assignment_third_channels(&self.assignment, rho)? {
-            let mut entries: Vec<(usize, usize, f64)> =
-                Vec::with_capacity(n * k_atoms);
+            let mut entries: Vec<(usize, usize, f64)> = Vec::with_capacity(n * k_atoms);
             for row in 0..n {
                 let start = row * k_atoms;
                 let g_base = sys.row_offsets[row];
@@ -7719,10 +7787,10 @@ impl SaeManifoldTerm {
             }
             let inv_tau = 1.0 / temperature;
             let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
-            let penalty =
-                crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
-                    k_atoms, temperature,
-                );
+            let penalty = crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                k_atoms,
+                temperature,
+            );
             // Softmax uses the reduced K−1 free-logit chart: only positions
             // 0..K−1 are free logit coordinates (last reference logit fixed), and
             // the reduced `∂H/∂ρ` over the free logits is the top-left
@@ -7735,17 +7803,18 @@ impl SaeManifoldTerm {
                 let row_base = cache.row_offsets[row];
                 let q = cache.row_dims[row];
                 let logit_dim = assignment_dim.min(q);
-                let row_logits: Vec<f64> =
-                    (0..k_atoms).map(|k| self.assignment.logits[[row, k]]).collect();
+                let row_logits: Vec<f64> = (0..k_atoms)
+                    .map(|k| self.assignment.logits[[row, k]])
+                    .collect();
                 // ∂H/∂ρ over this row's free-logit block (position j ↔ atom j).
                 let dh_rho = penalty.row_dense_hessian(&row_logits, scale);
                 for kj in 0..logit_dim {
                     let mut rhs_t = Array1::<f64>::zeros(total_t);
                     let rhs_beta = Array1::<f64>::zeros(cache.k);
                     rhs_t[row_base + kj] = 1.0;
-                    let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                        format!("assignment_log_strength_hessian_trace: {err}")
-                    })?;
+                    let solved = solver
+                        .solve(rhs_t.view(), rhs_beta.view())
+                        .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
                     for ki in 0..logit_dim {
                         // trace += (H⁻¹)_{ki,kj} · (∂H/∂ρ)_{kj,ki}; dh_rho symmetric.
                         trace += solved.t[row_base + ki] * dh_rho[[kj, ki]];
@@ -8693,9 +8762,11 @@ impl SaeManifoldTerm {
             // pair `(a,b)` below. The diagonal softmax case is therefore handled
             // here, NOT in `assignment_prior_hdiag_derivative_entry` (which returns
             // 0 for softmax to avoid double-counting).
-            let row_logits_softmax: Option<Vec<f64>> = softmax_dense_adjoint
-                .as_ref()
-                .map(|_| (0..k_atoms).map(|k| self.assignment.logits[[row, k]]).collect());
+            let row_logits_softmax: Option<Vec<f64>> = softmax_dense_adjoint.as_ref().map(|_| {
+                (0..k_atoms)
+                    .map(|k| self.assignment.logits[[row, k]])
+                    .collect()
+            });
             for w in 0..q {
                 let mut gamma = 0.0_f64;
                 let softmax_dh_w: Option<Array2<f64>> = match (
@@ -8712,8 +8783,11 @@ impl SaeManifoldTerm {
                     for b in 0..q {
                         let mut dh = sae_dot(&jets.second[a][w], &jets.first[b])
                             + sae_dot(&jets.first[a], &jets.second[b][w]);
-                        if let (Some(dh_w), SaeLocalRowVar::Logit { atom: atom_a }, SaeLocalRowVar::Logit { atom: atom_b }) =
-                            (softmax_dh_w.as_ref(), jets.vars[a], jets.vars[b])
+                        if let (
+                            Some(dh_w),
+                            SaeLocalRowVar::Logit { atom: atom_a },
+                            SaeLocalRowVar::Logit { atom: atom_b },
+                        ) = (softmax_dh_w.as_ref(), jets.vars[a], jets.vars[b])
                         {
                             dh += dh_w[[atom_a, atom_b]];
                         }
@@ -10466,6 +10540,7 @@ impl SaeManifoldTerm {
             UnitSpeed(CanonicalChartTopology),
             TorusFlow { period: f64 },
             PatchFlow,
+            SphereFlow,
         }
         let mut eligible: Vec<(usize, ChartPlan)> = Vec::new();
         for atom_idx in 0..self.k_atoms() {
@@ -10496,57 +10571,27 @@ impl SaeManifoldTerm {
                 (SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch, 2) => {
                     ChartPlan::PatchFlow
                 }
+                // #1019 sphere arm: d = 2 sphere atoms pin to the
+                // minimum-isometry-defect conformal-boost flow against the
+                // round-sphere reference. The pin is scoped to data away from
+                // the poles (the `1/cos lat` boost singularity — the residue of
+                // the hairy-ball obstruction); an at-pole chart is honestly
+                // refused by the reparameterization (Ok(false) → left as
+                // fitted) rather than pinned with a near-singular flow.
+                (SaeAtomBasisKind::Sphere, 2) => ChartPlan::SphereFlow,
                 // d = 1 never matches Sphere; Precomputed bases carry no
-                // evaluator semantics to re-express the image in; S² has no
-                // global pole-free flow basis (hairy ball), so sphere charts
-                // are honestly left as fitted.
+                // evaluator semantics to re-express the image in.
                 _ => continue,
             };
             eligible.push((atom_idx, plan));
         }
 
-        // #1019 sphere arm: d = 2 sphere atoms are NOT flow-pinned (no global
-        // pole-free flow basis — hairy ball), but the isometry DEFECT against the
-        // round-sphere reference metric is well-defined at the fitted chart and
-        // is exactly the issue's acceptance quantity. Measure and log it so the
-        // honest "left as fitted" sphere arm is MEASURABLE: a round-isometric
-        // (O(3)-representative) chart scores ≈ 0, a warped chart scores large.
-        // This never mutates the atom — it is a pure read-only diagnostic.
-        for atom_idx in 0..self.k_atoms() {
-            let atom = &self.atoms[atom_idx];
-            if !matches!(atom.basis_kind, SaeAtomBasisKind::Sphere)
-                || atom.latent_dim != 2
-                || atom.homotopy_eta != 1.0
-                || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim
-            {
-                continue;
-            }
-            let Some(evaluator) = atom.basis_evaluator.as_ref().cloned() else {
-                continue;
-            };
-            let coords = self.assignment.coords[atom_idx].as_matrix();
-            match crate::terms::sae_chart_canonicalization::sphere_chart_isometry_defect(
-                evaluator.as_ref(),
-                atom.decoder_coefficients.view(),
-                coords.view(),
-            ) {
-                Ok(Some(defect)) => log::info!(
-                    "[#1019] sphere atom '{}' chart isometry defect = {defect:.6e} \
-                     (round-sphere reference; 0 = O(3)-isometric, left as fitted — \
-                     no pole-free flow basis to pin)",
-                    atom.name
-                ),
-                Ok(None) => log::info!(
-                    "[#1019] sphere atom '{}' chart isometry defect unavailable \
-                     (degenerate or pole-singular chart); left as fitted",
-                    atom.name
-                ),
-                Err(err) => log::warn!(
-                    "[#1019] sphere atom '{}' chart isometry defect errored: {err}",
-                    atom.name
-                ),
-            }
-        }
+        // #1019 sphere arm: d = 2 sphere atoms are now first-class flow-pinned
+        // above (ChartPlan::SphereFlow → the round-sphere conformal-boost flow),
+        // so the isometry defect is the objective the pin descends rather than a
+        // read-only side log. Data inside the pole-band guard (the `1/cos lat`
+        // boost singularity — the scoped residue of the hairy-ball obstruction)
+        // is honestly refused by the reparameterization and left as fitted.
 
         // #1026 EV-vs-Θ measurement: log each d = 1 atom's fitted TURNING
         // `Θ = ∫κ ds` (integrated curvature of its decoded curve). A linear SAE
@@ -10557,6 +10602,20 @@ impl SaeManifoldTerm {
         // hybrid-vs-shatter signal: a Θ ≈ 0 atom that still earns EV is a linear
         // direction wearing a curved basis; a high-Θ atom earning EV is a genuine
         // curved family. Pure read-only diagnostic, never mutates the atom.
+        //
+        // The held-out EV half of the pair is the per-atom leave-one-atom-out
+        // (LOAO) explained-variance drop `ΔEV_k` (see
+        // [`Self::per_atom_loao_explained_variance`]): the EV lost when atom `k`
+        // is withheld from the assembled reconstruction. Logging `(Θ, ΔEV)`
+        // together per d = 1 atom is the discriminating EV-vs-Θ signal — a
+        // Θ ≈ 0 atom earning a large ΔEV is a linear-tail direction, a high-Θ
+        // atom earning a large ΔEV is a genuine curved family.
+        let loao_ev = self
+            .per_atom_loao_explained_variance(target, rho)
+            .unwrap_or_else(|err| {
+                log::warn!("[#1026] per-atom LOAO EV unavailable: {err}");
+                vec![None; self.k_atoms()]
+            });
         for atom_idx in 0..self.k_atoms() {
             let atom = &self.atoms[atom_idx];
             if atom.latent_dim != 1
@@ -10570,26 +10629,32 @@ impl SaeManifoldTerm {
             };
             let coords = self.assignment.coords[atom_idx].as_matrix();
             let row_coords = coords.column(0);
+            let dev = loao_ev
+                .get(atom_idx)
+                .copied()
+                .flatten()
+                .map_or_else(|| "unavailable".to_string(), |d| format!("{d:.6e}"));
             match crate::terms::sae_chart_canonicalization::d1_atom_fitted_turning(
                 evaluator.as_ref(),
                 atom.decoder_coefficients.view(),
                 row_coords,
             ) {
                 Ok(Some(theta)) => log::info!(
-                    "[#1026] atom '{}' fitted turning Θ = {theta:.6e} rad \
+                    "[#1026] atom '{}' fitted turning Θ = {theta:.6e} rad, \
+                     held-out ΔEV = {dev} \
                      (∫κ ds; 0 = linear-tail direction, 2π = full curved loop; \
-                     pair with held-out EV for the hybrid-vs-shatter signal)",
+                     Θ≈0 + large ΔEV = linear direction, high-Θ + large ΔEV = \
+                     genuine curved family — the hybrid-vs-shatter signal)",
                     atom.name
                 ),
                 Ok(None) => log::info!(
-                    "[#1026] atom '{}' fitted turning unavailable \
+                    "[#1026] atom '{}' fitted turning unavailable, held-out ΔEV = {dev} \
                      (no analytic second jet or degenerate curve)",
                     atom.name
                 ),
-                Err(err) => log::warn!(
-                    "[#1026] atom '{}' fitted turning errored: {err}",
-                    atom.name
-                ),
+                Err(err) => {
+                    log::warn!("[#1026] atom '{}' fitted turning errored: {err}", atom.name)
+                }
             }
         }
 
@@ -10615,6 +10680,7 @@ impl SaeManifoldTerm {
                     self.canonicalize_atom_torus_flow_chart(*atom_idx, *period)
                 }
                 ChartPlan::PatchFlow => self.canonicalize_atom_patch_flow_chart(*atom_idx),
+                ChartPlan::SphereFlow => self.canonicalize_atom_sphere_flow_chart(*atom_idx),
             };
             match outcome {
                 Ok(changed) => any_changed |= changed,
@@ -10870,6 +10936,89 @@ impl SaeManifoldTerm {
         {
             return Err(format!(
                 "SaeManifoldTerm::canonicalize_atom_patch_flow_chart: canonical basis {:?} / jet {:?} must match the fitted shapes {:?} / {:?}",
+                new_phi.dim(),
+                new_jet.dim(),
+                self.atoms[atom_idx].basis_values.dim(),
+                self.atoms[atom_idx].basis_jacobian.dim()
+            ));
+        }
+
+        // Per-row image-invariance gate: the audit grid certified the image at
+        // the transport nodes; this certifies it at the coordinates the fit
+        // actually sits on. Same honest-fallback contract as the torus path.
+        let old_fit = fast_ab(
+            &self.atoms[atom_idx].basis_values,
+            &self.atoms[atom_idx].decoder_coefficients,
+        );
+        let new_fit = fast_ab(&new_phi, &repar.new_decoder);
+        let mut fit_scale = 0.0_f64;
+        let mut max_abs = 0.0_f64;
+        for (a, b) in old_fit.iter().zip(new_fit.iter()) {
+            fit_scale = fit_scale.max(a.abs()).max(b.abs());
+            max_abs = max_abs.max((a - b).abs());
+        }
+        if !(fit_scale.is_finite() && max_abs.is_finite()) {
+            return Ok(false);
+        }
+        if fit_scale > 0.0 && max_abs > CHART_RECOMPOSITION_REL_TOL * fit_scale {
+            return Ok(false);
+        }
+
+        // Commit: canonical coordinates, basis, decoder, and the congruence-
+        // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as every other
+        // canonicalization path).
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
+        let flat = Array1::from_iter(new_coords.iter().copied());
+        self.assignment.coords[atom_idx].set_flat(flat.view());
+        let atom = &mut self.atoms[atom_idx];
+        atom.basis_values = new_phi;
+        atom.basis_jacobian = new_jet;
+        atom.decoder_coefficients = repar.new_decoder;
+        atom.smooth_penalty = transport_smooth_penalty_for_decoder(
+            repar.decoder_transport.view(),
+            old_smooth_penalty.view(),
+        )?;
+        atom.chart_canonicalized = true;
+        Ok(true)
+    }
+
+    /// Apply the minimum-isometry-defect conformal-boost flow reparameterization
+    /// against the round-sphere reference (#1019 sphere arm) to one eligible
+    /// `d = 2` sphere (`S²`) atom. Returns `Ok(true)` when the atom was
+    /// canonicalized, `Ok(false)` on an honest skip (degenerate or
+    /// already-canonical chart, data inside the pole-band guard, only
+    /// folded/non-improving flow candidates, basis not closed under the
+    /// reparameterization, or per-row image drift above tolerance).
+    fn canonicalize_atom_sphere_flow_chart(&mut self, atom_idx: usize) -> Result<bool, String> {
+        use crate::terms::sae_chart_canonicalization::{
+            CHART_RECOMPOSITION_REL_TOL, sphere_isometry_flow_reparameterization,
+        };
+        let n = self.n_obs();
+        if n == 0 {
+            return Ok(false);
+        }
+        let Some(evaluator) = self.atoms[atom_idx].basis_evaluator.as_ref().cloned() else {
+            return Ok(false);
+        };
+        let coords = self.assignment.coords[atom_idx].as_matrix();
+        let Some(repar) = sphere_isometry_flow_reparameterization(
+            evaluator.as_ref(),
+            self.atoms[atom_idx].decoder_coefficients.view(),
+            coords.view(),
+        )?
+        else {
+            return Ok(false);
+        };
+
+        // Per-row basis/jet at the canonical coordinates (eligibility pins
+        // `homotopy_eta == 1.0`, so the plain evaluate IS the dialed path).
+        let new_coords = repar.new_row_coords.clone();
+        let (new_phi, new_jet) = evaluator.evaluate(new_coords.view())?;
+        if new_phi.dim() != self.atoms[atom_idx].basis_values.dim()
+            || new_jet.dim() != self.atoms[atom_idx].basis_jacobian.dim()
+        {
+            return Err(format!(
+                "SaeManifoldTerm::canonicalize_atom_sphere_flow_chart: canonical basis {:?} / jet {:?} must match the fitted shapes {:?} / {:?}",
                 new_phi.dim(),
                 new_jet.dim(),
                 self.atoms[atom_idx].basis_values.dim(),
@@ -16201,6 +16350,73 @@ mod tests {
             vec![array![0.9_f64.ln()], array![1.1_f64.ln()]],
         );
         (term, target, rho)
+    }
+
+    /// #1026 — the per-atom **held-out EV attribution** that pairs with each
+    /// atom's fitted turning `Θ` to form the EV-vs-Θ discriminating signal.
+    ///
+    /// `per_atom_loao_explained_variance` returns, per atom, the explained
+    /// variance lost when that atom is withheld from the assembled
+    /// reconstruction (`ΔEV_k = EV(full) − EV(full ⊖ atom_k)`). With the target
+    /// set to the term's OWN full reconstruction the dictionary explains the
+    /// target exactly (`EV(full) = 1`), so every atom that genuinely carries
+    /// reconstruction must show a strictly positive ΔEV (removing it leaves a
+    /// residual), while an atom that contributes nothing (zero decoder) must
+    /// show ΔEV ≈ 0. This is the held-out half of the `(Θ, ΔEV)` pair the
+    /// post-fit pass logs: a high-`Θ` atom earning ΔEV is a genuine curved
+    /// family; a `Θ ≈ 0` atom earning ΔEV is a linear-tail direction.
+    #[test]
+    fn per_atom_loao_ev_attributes_each_load_bearing_atom() {
+        let (term, _target, rho) = small_two_atom_periodic_term();
+        // Target = the term's own full reconstruction ⇒ EV(full) = 1 exactly.
+        let target = term
+            .try_fitted_for_rho(&rho)
+            .expect("full reconstruction must assemble");
+        let ev_full = reconstruction_explained_variance(target.view(), target.view())
+            .expect("self-reconstruction EV defined");
+        assert!(
+            (ev_full - 1.0).abs() < 1e-12,
+            "target = full reconstruction ⇒ EV(full) = 1; got {ev_full}"
+        );
+
+        let dev = term
+            .per_atom_loao_explained_variance(target.view(), &rho)
+            .expect("LOAO EV must evaluate");
+        assert_eq!(dev.len(), term.k_atoms(), "one ΔEV per atom");
+
+        // Both periodic atoms genuinely carry reconstruction (nonzero decoders
+        // and nonzero assignment mass), so each must lose EV when withheld.
+        for (atom_idx, d) in dev.iter().enumerate() {
+            let d = d.unwrap_or_else(|| panic!("atom {atom_idx} ΔEV must be defined"));
+            assert!(
+                d > 1e-9,
+                "load-bearing atom {atom_idx} must earn positive held-out ΔEV; got {d:.3e}"
+            );
+            // ΔEV is bounded by EV(full) = 1 (an atom cannot carry more EV than
+            // the whole dictionary explains).
+            assert!(
+                d <= 1.0 + 1e-9,
+                "ΔEV for atom {atom_idx} cannot exceed EV(full)=1; got {d:.6e}"
+            );
+        }
+
+        // An atom withheld is the exact "this atom zeroed" counterfactual: with
+        // a zero decoder it carries no reconstruction, so its ΔEV must collapse
+        // to ~0 — the same Θ→0 dominance floor logic on the EV axis (no signal,
+        // no contribution), independent of the curved/linear question.
+        let mut dead_term = term.clone();
+        dead_term.atoms[1].decoder_coefficients.fill(0.0);
+        let dead_target = term
+            .try_fitted_for_rho(&rho)
+            .expect("reconstruction with the live atom-1 decoder");
+        let dead_dev = dead_term
+            .per_atom_loao_explained_variance(dead_target.view(), &rho)
+            .expect("LOAO EV must evaluate for the dead-atom term");
+        let d_dead = dead_dev[1].expect("dead atom ΔEV defined");
+        assert!(
+            d_dead.abs() < 1e-9,
+            "a zero-decoder atom carries no reconstruction ⇒ ΔEV ≈ 0; got {d_dead:.3e}"
+        );
     }
 
     /// #976 Layer-1 guard 2: a single Newton application cannot move a gate

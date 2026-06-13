@@ -4685,7 +4685,9 @@ pub fn residual_cascade_fast_path(
         .collect();
     let y: Vec<f64> = request.y.iter().copied().collect();
     let w: Vec<f64> = request.weights.iter().copied().collect();
-    if coords.iter().any(|axis| axis.iter().any(|v| !v.is_finite()))
+    if coords
+        .iter()
+        .any(|axis| axis.iter().any(|v| !v.is_finite()))
         || y.iter().any(|v| !v.is_finite())
     {
         return None;

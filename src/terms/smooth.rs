@@ -1,16 +1,15 @@
 use crate::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
-    BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeResult,
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
+    BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError, BasisMetadata,
+    BasisPsiDerivativeResult,
     BasisPsiSecondDerivativeResult, BasisWorkspace, CenterStrategy, CenterStrategyKind,
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, DuchonBasisSpec,
-    KroneckerFactoredBasis,
-    MaternBasisSpec, MaternIdentifiability, MeasureJetBasisSpec, MeasureJetFrozenQuadrature,
-    MeasureJetIdentifiability, OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo,
-    PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
+    KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability, MeasureJetBasisSpec,
+    MeasureJetFrozenQuadrature, MeasureJetIdentifiability, OneDimensionalBoundary,
+    PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
     SphericalSplineIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
     build_bspline_basis_1d, build_constant_curvature_basis,
-    build_constant_curvature_basis_kappa_derivatives,
-    build_duchon_basiswithworkspace,
+    build_constant_curvature_basis_kappa_derivatives, build_duchon_basiswithworkspace,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
     build_measure_jet_basis, build_measure_jet_basis_psi_derivatives, build_spherical_spline_basis,
@@ -71,21 +70,21 @@ mod input_standardization;
 mod shape_constraints;
 
 use bspline_boundary::bspline_boundary_linear_constraints;
+use coefficient_transforms::{
+    convex_divided_difference_transform_matrix, cumulative_exp, cumulative_sum_transform_matrix,
+    second_cumulative_exp,
+};
+pub use error::SmoothError;
+use input_standardization::{
+    apply_input_standardization, compensate_length_scale_for_standardization,
+    compensate_optional_length_scale_for_standardization, compute_spatial_input_scales,
+};
 use shape_constraints::{
     build_shape_constraint_design_1d, build_shape_linear_constraints_1d,
     linear_constraints_from_lower_bounds_global, merge_linear_constraints_global,
     shape_lower_bounds_local, shape_order_and_sign, shape_supports_basis,
     shape_uses_box_reparameterization,
 };
-use coefficient_transforms::{
-    convex_divided_difference_transform_matrix, cumulative_exp, cumulative_sum_transform_matrix,
-    second_cumulative_exp,
-};
-use input_standardization::{
-    apply_input_standardization, compensate_length_scale_for_standardization,
-    compensate_optional_length_scale_for_standardization, compute_spatial_input_scales,
-};
-pub use error::SmoothError;
 
 fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
     match strategy {
@@ -2805,6 +2804,15 @@ impl SpatialLogKappaCoords {
     ) -> Self {
         let mut out = Array1::<f64>::zeros(term_indices.len());
         for (slot, &term_idx) in term_indices.iter().enumerate() {
+            // Constant-curvature: the single ψ slot is the raw signed κ, seeded
+            // from the spec (default κ = 0). The −ln(length_scale) convention is
+            // log-κ semantics and must not touch the raw-κ coordinate; the κ
+            // window projection happens later via `clamp_to_bounds`. Mirrors the
+            // aniso constructor's κ branch.
+            if let Some(cc) = constant_curvature_term_spec(spec, term_idx) {
+                out[slot] = cc.kappa;
+                continue;
+            }
             let length_scale = get_spatial_length_scale(spec, term_idx)
                 .unwrap_or(options.min_length_scale)
                 .clamp(options.min_length_scale, options.max_length_scale);
@@ -3560,6 +3568,22 @@ fn set_constant_curvature_kappa(
     term_idx: usize,
     psi: &[f64],
 ) -> Result<bool, EstimationError> {
+    let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
+        crate::bail_invalid_estim!(
+            "constant-curvature κ write-back: term index {term_idx} out of range"
+        );
+    };
+    set_single_term_constant_curvature_kappa(term, psi)
+}
+
+/// Single-term κ write-back: the shared validate+apply core, also used directly
+/// on the cached per-trial build spec in the incremental realizer (whose caller
+/// has already change-checked at the collection level and rebuilds regardless
+/// of the moved flag). Mirrors [`set_single_term_measure_jet_psi_dials`].
+fn set_single_term_constant_curvature_kappa(
+    term: &mut SmoothTermSpec,
+    psi: &[f64],
+) -> Result<bool, EstimationError> {
     if psi.len() != 1 {
         crate::bail_invalid_estim!(
             "constant-curvature κ write-back expects exactly one value, got {}",
@@ -3572,11 +3596,6 @@ fn set_constant_curvature_kappa(
             "constant-curvature κ write-back produced a non-finite κ = {next_kappa}"
         );
     }
-    let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
-        crate::bail_invalid_estim!(
-            "constant-curvature κ write-back: term index {term_idx} out of range"
-        );
-    };
     let SmoothBasisSpec::ConstantCurvature { spec: cc, .. } = &mut term.basis else {
         crate::bail_invalid_estim!(
             "constant-curvature κ write-back targeted a non-constant-curvature term"
@@ -3641,6 +3660,13 @@ fn spatial_term_psi_bounds(
         -options.max_length_scale.ln(),
         -options.min_length_scale.ln(),
     );
+    // Constant-curvature: the ψ coordinate is the raw signed κ, so its window is
+    // the chart-feasible κ bracket, NOT a log-ℓ window. Mirrors the aniso bounds
+    // path's `constant_curvature_kappa_bounds` branch so the isotropic
+    // (non-aniso) seed clamp projects κ into the right interval.
+    if constant_curvature_term_spec(spec, term_idx).is_some() {
+        return constant_curvature_kappa_bounds(data, spec, term_idx);
+    }
     let Some(term) = spec.smooth_terms.get(term_idx) else {
         return fallback;
     };
@@ -19251,10 +19277,20 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         // the MEASURE_JET_PSI_* bounds block); route through the dial setter
         // so the κ-translation below never misreads them as log-scales.
         let measure_jet_term = measure_jet_term_spec(&self.spec, term_idx).is_some();
+        // Constant-curvature ψ is the raw signed curvature κ, NOT a log-scale;
+        // route through the κ setter so `spatial_term_psi_to_length_scale_and_aniso`
+        // never misreads it (and never hits the "no length scale" rejection).
+        let constant_curvature_term = constant_curvature_term_spec(&self.spec, term_idx).is_some();
         let mut next_length_scale = None;
         let mut next_aniso: Option<Vec<f64>> = None;
         if measure_jet_term {
             if !set_measure_jet_psi_dials(&mut self.spec, term_idx, psi)
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(false);
+            }
+        } else if constant_curvature_term {
+            if !set_constant_curvature_kappa(&mut self.spec, term_idx, psi)
                 .map_err(|e| e.to_string())?
             {
                 return Ok(false);
@@ -19308,6 +19344,13 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             // barycenter nodes, frozen quadrature + transform); only the
             // dials move per trial.
             set_single_term_measure_jet_psi_dials(&mut build_spec, psi)
+                .map_err(|e| e.to_string())?;
+        } else if constant_curvature_term {
+            // The cached build spec carries the κ-fixed geometry (UserProvided
+            // centers, frozen ℓ and constraint transform); only κ moves per
+            // trial, written through the raw-κ setter to match the collection
+            // write-back above.
+            set_single_term_constant_curvature_kappa(&mut build_spec, psi)
                 .map_err(|e| e.to_string())?;
         } else {
             if let Some(length_scale) = next_length_scale {
@@ -21346,9 +21389,9 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
 mod tests {
     use super::*;
     use crate::basis::{
-        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
-        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
-        MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
+        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy,
+        Dense, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource,
+        MaternBasisSpec, MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
     };
     use crate::estimate::AdaptiveRegularizationOptions;
     use crate::faer_ndarray::{FaerEigh, FaerSvd};

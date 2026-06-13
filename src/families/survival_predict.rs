@@ -1317,8 +1317,7 @@ fn evaluate_marginal_slope_row(
     // prediction — clamping keeps the CIF well-posed and monotone. Only a
     // non-finite derivative (a real numerical failure) is surfaced to the strict
     // validator below.
-    let eta_derivative =
-        marginal_slope_index_derivative_at_horizon(deta_dq_arr[0], qd_with_wiggle);
+    let eta_derivative = marginal_slope_index_derivative_at_horizon(deta_dq_arr[0], qd_with_wiggle);
     let (cum, haz) = probit_survival_hazard_components(eta, eta_derivative)?;
     Ok((eta, cum, haz))
 }
@@ -2941,12 +2940,21 @@ mod tests {
         let deta_dq = (1.0_f64 + 0.4 * 0.4).sqrt(); // rigid c = sqrt(1+sb^2) >= 1
         let qd_with_wiggle = -1.35e-3;
         let eta_t = marginal_slope_index_derivative_at_horizon(deta_dq, qd_with_wiggle);
-        assert_eq!(eta_t, 0.0, "negative extrapolation derivative must clamp to 0");
+        assert_eq!(
+            eta_t, 0.0,
+            "negative extrapolation derivative must clamp to 0"
+        );
         // Downstream validator now accepts it as a flat-hazard point.
         let (cum, hazard) = probit_survival_hazard_components(-0.563, eta_t)
             .expect("clamped flat-hazard prediction must validate");
-        assert!(cum >= 0.0, "cumulative hazard must be well-posed, got {cum}");
-        assert_eq!(hazard, 0.0, "clamped derivative gives zero instantaneous hazard");
+        assert!(
+            cum >= 0.0,
+            "cumulative hazard must be well-posed, got {cum}"
+        );
+        assert_eq!(
+            hazard, 0.0,
+            "clamped derivative gives zero instantaneous hazard"
+        );
     }
 
     #[test]
@@ -2955,9 +2963,15 @@ mod tests {
         // the chain factor), and a non-finite value is left for the strict
         // validator to reject as a real numerical failure rather than masked.
         let positive = marginal_slope_index_derivative_at_horizon(1.25, 0.8);
-        assert!((positive - 1.0).abs() <= 1e-15, "positive derivative scaled by chain factor");
+        assert!(
+            (positive - 1.0).abs() <= 1e-15,
+            "positive derivative scaled by chain factor"
+        );
         let nonfinite = marginal_slope_index_derivative_at_horizon(1.25, f64::NAN);
-        assert!(nonfinite.is_nan(), "non-finite derivative passes through unclamped");
+        assert!(
+            nonfinite.is_nan(),
+            "non-finite derivative passes through unclamped"
+        );
         assert!(
             probit_survival_hazard_components(0.5, nonfinite).is_err(),
             "non-finite derivative must still be rejected by the validator"

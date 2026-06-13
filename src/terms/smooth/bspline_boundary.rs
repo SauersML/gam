@@ -8,8 +8,8 @@
 //! by the parent so every call site is unchanged.
 
 use crate::basis::{
-    BSplineBoundaryConditions, BSplineEndpointBoundaryCondition, BasisMetadata, BasisOptions,
-    BasisError, Dense, KnotSource,
+    BSplineBoundaryConditions, BSplineEndpointBoundaryCondition, BasisError, BasisMetadata,
+    BasisOptions, Dense, KnotSource,
 };
 use crate::pirls::LinearInequalityConstraints;
 use ndarray::{Array1, Array2};

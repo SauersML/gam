@@ -103,12 +103,7 @@ fn fit_options() -> FitOptions {
 
 /// Outcome of one fit attempt: either the wall-clock seconds (converged) or the
 /// failure reason string (so the diagnostic can tabulate instead of aborting).
-fn run_fit(
-    n: usize,
-    kappa_enabled: bool,
-    aniso: bool,
-    bounds: (f64, f64),
-) -> Result<f64, String> {
+fn run_fit(n: usize, kappa_enabled: bool, aniso: bool, bounds: (f64, f64)) -> Result<f64, String> {
     let (x, y) = simulate_1d_gaussian(n);
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
