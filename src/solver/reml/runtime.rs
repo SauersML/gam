@@ -7024,23 +7024,52 @@ impl<'a> RemlState<'a> {
     /// `solve_penalized_least_squares_implicit` so the cache is only ever
     /// consulted where it is mathematically equivalent to streaming the
     /// dense `XᵀWX` from scratch.
-    pub(crate) fn gaussian_fixed_cache_if_eligible(
-        &self,
-    ) -> Option<Arc<crate::pirls::GaussianFixedCache>> {
-        // Static eligibility — these only depend on data the outer loop
-        // never mutates, so the gate is correct once and stays correct.
+    /// True iff this state satisfies the static Gaussian-identity
+    /// sufficient-statistic eligibility (the gate `gaussian_fixed_cache_if_eligible`
+    /// applies before building or returning a cache).
+    pub(crate) fn gaussian_fixed_cache_eligible(&self) -> bool {
         let spec = reml_spec(&self.config.likelihood);
         let family_ok = matches!(spec.response, ResponseFamily::Gaussian);
         let link_ok = matches!(
             self.config.link_kind,
             crate::types::InverseLink::Standard(StandardLink::Identity)
         );
-        if !family_ok
-            || !link_ok
-            || self.config.firth_bias_reduction
-            || self.coefficient_lower_bounds.is_some()
-            || self.linear_constraints.is_some()
+        family_ok
+            && link_ok
+            && !self.config.firth_bias_reduction
+            && self.coefficient_lower_bounds.is_none()
+            && self.linear_constraints.is_none()
+    }
+
+    /// Install an externally assembled Gaussian sufficient-statistic cache
+    /// (#1033b): the certified ψ-Gram tensor assembles `XᵀWX(ψ)/XᵀWy(ψ)/yᵀWy`
+    /// n-free per design-moving trial, and this hands it to the same slot the
+    /// streamed builder fills, so every consumer (dense PLS fast path, sparse
+    /// scatter, final accept-fit) picks it up via the read fast path.
+    /// Refuses (returns false) when the state is statically ineligible or the
+    /// shape disagrees with the current design — the caller then leaves the
+    /// streamed path to do its usual work.
+    pub(crate) fn install_gaussian_fixed_cache(
+        &self,
+        cache: Arc<crate::pirls::GaussianFixedCache>,
+    ) -> bool {
+        if !self.gaussian_fixed_cache_eligible()
+            || cache.xtwx_orig.nrows() != self.p
+            || cache.xtwx_orig.ncols() != self.p
+            || cache.xtwy_orig.len() != self.p
         {
+            return false;
+        }
+        *self.gaussian_fixed_cache.write().unwrap() = Some(cache);
+        true
+    }
+
+    pub(crate) fn gaussian_fixed_cache_if_eligible(
+        &self,
+    ) -> Option<Arc<crate::pirls::GaussianFixedCache>> {
+        // Static eligibility — these only depend on data the outer loop
+        // never mutates, so the gate is correct once and stays correct.
+        if !self.gaussian_fixed_cache_eligible() {
             return None;
         }
         // Fast path — already populated.

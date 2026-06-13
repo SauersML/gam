@@ -18408,6 +18408,51 @@ fn run_exact_joint_spatial_optimization(
         )?,
     };
 
+    // #1033b: single isotropic design-moving coordinate on a Gaussian-identity
+    // fit — build the certified Chebyshev-in-ψ Gram tensor ONCE over the
+    // optimizer's ψ window and hand it to the evaluator. Every in-window trial
+    // then receives its Gaussian sufficient statistics (XᵀWX(ψ), XᵀW(y−offset),
+    // (y−offset)ᵀW(y−offset)) assembled n-free instead of paying the per-trial
+    // O(n·p²) Gram re-stream after the design rebuild. Certification failure,
+    // non-identity column conditioning, off-window trials, or any other
+    // ineligibility silently keep the exact streamed path (same numbers, the
+    // tensor is certified to PSI_GRAM_SPOT_RTOL against the exact rebuild).
+    if coord_dim == 1 && family.is_gaussian_identity() {
+        let psi_lo = lower[rho_dim];
+        let psi_hi = upper[rho_dim];
+        let z = Array1::from_iter(y.iter().zip(offset.iter()).map(|(yi, oi)| yi - oi));
+        let cache = &mut ctx.cache;
+        let theta_probe_base = theta0.clone();
+        let tensor = crate::solver::psi_gram_tensor::PsiGramTensor::build(
+            |psi| -> Result<Array2<f64>, String> {
+                let mut theta_probe = theta_probe_base.clone();
+                theta_probe[rho_dim] = psi;
+                cache.ensure_theta(&theta_probe)?;
+                Ok(cache.design().design.to_dense())
+            },
+            weights,
+            z.view(),
+            psi_lo,
+            psi_hi,
+        );
+        if let Some(tensor) = tensor {
+            if ctx
+                .evaluator
+                .set_psi_gram_tensor(std::sync::Arc::new(tensor))
+            {
+                log::info!(
+                    "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
+                     in-window trials assemble Gaussian sufficient statistics n-free"
+                );
+            }
+        } else {
+            log::info!(
+                "[{label}] ψ-gram tensor did not certify over [{psi_lo:.3}, {psi_hi:.3}]; \
+                 keeping the exact per-trial path"
+            );
+        }
+    }
+
     let problem = exact_joint_multistart_outer_problem(
         theta0,
         lower,
