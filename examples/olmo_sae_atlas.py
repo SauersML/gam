@@ -262,7 +262,11 @@ def main() -> None:
         print(f"\n=== L25 qualia: {name} ===", flush=True)
         X_raw, prompts = load_l25(ckpt_dir)
         print(f"  shape {X_raw.shape} → PCA-{args.pca_dim}", flush=True)
-        res = fit_slice(X_raw, args.pca_dim, args.n_atoms, args.n_iter, args.seed)
+        try:
+            res = fit_slice(X_raw, args.pca_dim, args.n_atoms, args.n_iter, args.seed)
+        except Exception as exc:
+            print(f"  FAILED: {exc}", flush=True)
+            continue
         sides = [p.get("side", "-") for p in prompts]
         auc = exp_noexp_auc(res["Z"][:, 0], sides)
         print(f"  EV={res['ev']:.4f}  AUC={auc:.3f}  K={res['n_atoms']}  {res['seconds']:.1f}s",
@@ -304,7 +308,11 @@ def main() -> None:
         print(f"\n=== L44 color: {name} ===", flush=True)
         X_raw, prompts = load_l44_color(ckpt_dir)
         print(f"  shape {X_raw.shape} → PCA-{args.pca_dim}", flush=True)
-        res = fit_slice(X_raw, args.pca_dim, args.n_atoms, args.n_iter, args.seed)
+        try:
+            res = fit_slice(X_raw, args.pca_dim, args.n_atoms, args.n_iter, args.seed)
+        except Exception as exc:
+            print(f"  FAILED: {exc}", flush=True)
+            continue
         r2 = color_rgb_r2(res["Z"], prompts)
         print(f"  EV={res['ev']:.4f}  RGB-R²={r2:.3f}  K={res['n_atoms']}  {res['seconds']:.1f}s",
               flush=True)
