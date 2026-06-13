@@ -14404,16 +14404,18 @@ pub fn initial_aniso_contrasts(centers: ArrayView2<'_, f64>) -> Vec<f64> {
 /// design, to the `None` path through `η = 0`, and is continuous across it —
 /// `[1e-9, -1e-9]` and `[0, 0]` map to neighboring designs, not a jump.
 ///
-/// The Matérn forward design (`build_matern_basis`) and its input-location
-/// jet/Hessian (`matern_metric_weights`) both apply *this* transform, so the
-/// jet differentiates exactly the function the design evaluates (#437), and an
-/// explicit isotropic request reduces to the closed-form isotropic Matérn
-/// kernel rather than a data-driven anisotropic one (#1042).
+/// The Matérn input-location jet/Hessian (`matern_metric_weights`, the public
+/// `matern_input_location_first_jet`/`_hessian` FFI) and the `UserProvided`-center
+/// forward design both apply *this* transform, so the jet differentiates exactly
+/// the function the public design evaluates (#437), and an explicit isotropic
+/// request reduces to the closed-form isotropic Matérn kernel rather than a
+/// data-driven anisotropic one (#1042).
 ///
 /// Auto-initialization of `η` from knot-cloud geometry is a *separate* concern
-/// handled by [`auto_seed_aniso_contrasts`]; the Matérn metric is an optimized
-/// REML hyper-axis seeded explicitly by the pilot reseed, so its design must
-/// not silently reinterpret an all-zero η as a seeding sentinel.
+/// handled by [`auto_seed_aniso_contrasts`]; it is reserved for callers that
+/// opt into data-derived geometry (the κ-optimizer's data-driven center
+/// strategies and the pure-Duchon `scale_dims` path), selected by
+/// [`resolve_matern_forward_aniso`].
 fn centered_aniso_contrasts(aniso: Option<&[f64]>) -> Option<Vec<f64>> {
     use crate::terms::smooth::center_aniso_log_scales as center;
 
@@ -14427,17 +14429,19 @@ fn centered_aniso_contrasts(aniso: Option<&[f64]>) -> Option<Vec<f64>> {
 /// Auto-seed anisotropy contrasts from knot-cloud geometry for callers that use
 /// an all-zero vector as the "initialize me" sentinel.
 ///
-/// This is the **pure-Duchon `scale_dims` seeding path**, where `η` is a FIXED,
+/// Used by (a) the pure-Duchon `scale_dims` path, where `η` is a FIXED,
 /// geometry-derived basis parameter that is never enrolled as a REML hyper-axis
 /// (see `spatial_term_supports_hyper_optimization`): "standardize the geometry,
-/// then learn the smoothness." A non-zero (or absent) vector is honored
-/// verbatim (centered, exactly like [`centered_aniso_contrasts`]); only an
-/// *exactly* all-zero vector is replaced by `initial_aniso_contrasts(centers)`.
+/// then learn the smoothness"; and (b) the Matérn forward design when the term
+/// uses a **data-driven** center strategy, i.e. the κ-optimizer's seeding
+/// sentinel (the optimizer's analytic ψ-gradient is computed against the same
+/// auto-seeded design, so the pair stays consistent). A non-zero (or absent)
+/// vector is honored verbatim (centered, exactly like [`centered_aniso_contrasts`]);
+/// only an *exactly* all-zero vector is replaced by `initial_aniso_contrasts(centers)`.
 ///
-/// The Matérn forward path deliberately does NOT use this — its `η` is an
-/// optimized hyper-axis seeded by the pilot reseed, so its design must be a pure
-/// function of the supplied `η` ([`centered_aniso_contrasts`]); folding the
-/// geometry seed into the design build there made the map discontinuous at
+/// A `UserProvided`-center Matérn term does NOT use this — its geometry is fully
+/// caller-specified, so an explicit all-zero η must be honored literally; folding
+/// the geometry seed into that path made the public design discontinuous at
 /// `η = 0` and hijacked explicit isotropic requests (#1042).
 fn auto_seed_aniso_contrasts(
     centers: ArrayView2<'_, f64>,
@@ -14459,6 +14463,35 @@ fn auto_seed_aniso_contrasts(
         Some(center(eta))
     } else {
         Some(center(&contrasts))
+    }
+}
+
+/// Resolve the anisotropy contrasts the Matérn forward design build applies,
+/// dispatching on **who owns the spatial geometry**:
+///
+/// - `CenterStrategy::UserProvided` — the caller fully specifies the geometry,
+///   centers *and* metric. An explicit all-zero `η` is therefore an explicit
+///   isotropic request and is honored literally ([`centered_aniso_contrasts`]):
+///   the design reduces to the closed-form isotropic Matérn and varies
+///   continuously through `η = 0`. This is the public `matern_basis` FFI path
+///   (and its input-location jet), which previously got silently hijacked into a
+///   data-driven anisotropic kernel by the all-zero seeding sentinel (#1042).
+///
+/// - data-driven strategies (`FarthestPoint`, `EqualMass`, …) — the caller opts
+///   into deriving the spatial geometry *from the data cloud*, which includes
+///   seeding the anisotropy metric. An all-zero `η` is then the κ-optimizer's
+///   "initialize me from the knot-cloud spread" sentinel
+///   ([`auto_seed_aniso_contrasts`]). The optimizer's analytic ψ-gradient is
+///   built against this same auto-seeded design, so the value/gradient pair
+///   stays consistent and convergence is unchanged.
+fn resolve_matern_forward_aniso(
+    center_strategy: &CenterStrategy,
+    centers: ArrayView2<'_, f64>,
+    aniso: Option<&[f64]>,
+) -> Option<Vec<f64>> {
+    match center_strategy {
+        CenterStrategy::UserProvided(_) => centered_aniso_contrasts(aniso),
+        _ => auto_seed_aniso_contrasts(centers, aniso),
     }
 }
 
@@ -15909,7 +15942,11 @@ pub fn build_matern_basiswithworkspace(
     // periodic replication, the identifiability transform, and the penalty all
     // built from the same full-rank center subset. The contrasts used for the
     // rank Gram come from the selected centers so anisotropy is honored.
-    let reduce_aniso = centered_aniso_contrasts(spec.aniso_log_scales.as_deref());
+    let reduce_aniso = resolve_matern_forward_aniso(
+        &spec.center_strategy,
+        selected_centers.view(),
+        spec.aniso_log_scales.as_deref(),
+    );
     let original_centers = matern_rank_reduce_centers(
         data,
         &selected_centers,
@@ -15918,13 +15955,16 @@ pub fn build_matern_basiswithworkspace(
         reduce_aniso.as_deref(),
     )?;
     let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
-    // Center the supplied anisotropy contrasts (Σ η = 0) for the forward design.
-    // This is a pure function of the caller's η: an explicit all-zero vector is
-    // the isotropic metric, NOT a geometry-seeding sentinel — the Matérn metric
-    // is an optimized hyper-axis seeded explicitly by the pilot reseed, so the
-    // design must reduce to the isotropic kernel at η = 0 and be continuous
-    // through it (#1042).
-    let aniso = centered_aniso_contrasts(spec.aniso_log_scales.as_deref());
+    // Resolve the anisotropy contrasts for the forward design (see
+    // `resolve_matern_forward_aniso`): caller-owned `UserProvided` geometry
+    // honors an explicit all-zero η literally as the isotropic metric (#1042),
+    // while data-driven center strategies auto-seed η from the knot cloud — the
+    // κ-optimizer's seeding sentinel.
+    let aniso = resolve_matern_forward_aniso(
+        &spec.center_strategy,
+        centers.view(),
+        spec.aniso_log_scales.as_deref(),
+    );
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
     let identifiability_transform = z_opt.clone();
     let full_transform = z_opt.as_ref().map(|z| {
