@@ -2617,6 +2617,14 @@ impl GaussianJackknifePlusStats {
         self.beta.len()
     }
 
+    /// Full-model coefficient vector `β̂ = M⁻¹Xᵀy`. The plug-in mean at a
+    /// test point `x_*` is `x_*ᵀ β̂`. Exposed so the pyffi layer can emit the
+    /// `mean` / `linear_predictor` columns alongside the jackknife+ bounds
+    /// without re-running the predictor stack.
+    pub fn beta(&self) -> &Array1<f64> {
+        &self.beta
+    }
+
     /// Jackknife+ interval at one test row `x_*` and miscoverage `alpha`,
     /// returning the Barber et al. (2021) set with guarantee
     /// `P(Y_* ∈ Ĉ) ≥ 1 − 2·alpha`.
