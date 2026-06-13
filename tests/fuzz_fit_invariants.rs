@@ -271,7 +271,7 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
     // Recover predictor columns by re-reading them deterministically: rebuild
     // the same data and pull the encoded predictor matrix shape. We construct
     // the predict matrix directly from the regenerated columns.
-    let pred_matrix = training_predictor_matrix(shape.ncols, shape.family, n, degen, seed);
+    let pred_matrix = training_predictor_matrix(shape.ncols, n, degen, seed);
     match build_term_collection_design(pred_matrix.view(), &fit.resolvedspec) {
         Ok(design) => {
             let pred = design.design.apply(&fit.fit.beta).to_vec();
@@ -347,7 +347,6 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
 /// here uses the identical leading RNG sequence.
 fn training_predictor_matrix(
     ncols: usize,
-    _family: &str,
     n: usize,
     degen: Degeneracy,
     seed: u64,
