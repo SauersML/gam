@@ -30,6 +30,46 @@ _PUBLIC_ASSIGNMENT_KINDS: dict[str, str] = {
 }
 
 
+def _e_benjamini_hochberg(log_e_values: list[float], alpha: float) -> list[int]:
+    """e-BH confirmed set, mirroring `inference::structure_evidence::e_benjamini_hochberg`.
+
+    Sort claims by descending log e-value; confirm the prefix up to the largest
+    rank `k` whose k-th-largest log e-value clears `ln(m) - ln(alpha) - ln(k)`
+    (i.e. `e_(k) >= m / (alpha * k)`). FDR <= alpha over the confirmed set under
+    arbitrary dependence; valid at any stopping time.
+    """
+    import math
+
+    m = len(log_e_values)
+    if m == 0 or not (alpha > 0.0):
+        return []
+    order = sorted(range(m), key=lambda i: log_e_values[i], reverse=True)
+    k_star = 0
+    for rank0, idx in enumerate(order):
+        k = rank0 + 1
+        if log_e_values[idx] >= math.log(m) - math.log(alpha) - math.log(k):
+            k_star = rank0 + 1
+    return order[:k_star]
+
+
+def _structure_claim_label(kind: Any) -> str:
+    """Human-readable label for a serialized `ClaimKind` (serde-tagged enum)."""
+    if isinstance(kind, str):
+        return kind
+    if isinstance(kind, Mapping):
+        for tag, body in kind.items():
+            if tag == "AtomExists":
+                return f"atom {body['atom']} exists"
+            if tag == "BindingEdge":
+                return f"atoms {body['a']}-{body['b']} bound"
+            if tag == "GeometryKind":
+                return f"atom {body['atom']} geometry={body['kind']}"
+            if tag == "Custom":
+                return str(body.get("label", "custom"))
+            return f"{tag}:{body}"
+    return str(kind)
+
+
 def _canonical_assignment(value: str, label: str) -> str:
     name = str(value).strip().lower()
     canon = _ASSIGNMENT_KINDS.get(name)
@@ -387,6 +427,13 @@ class ManifoldSAE:
     # the same values for back-compat; this is the additive canonical surface.
     # ``None`` only for payloads predating the ledger.
     certificates: dict[str, Any] | None = None
+    # Anytime-valid structure certificate (#1058 / #984): the e-BH certificate
+    # over the structure-search ledger's per-claim e-processes at FDR level α.
+    # JSON string ``{"alpha": float, "entries": [{"kind": ..., "log_e": float,
+    # "steps": int, "confirmed": bool}, ...]}`` serialized by the Rust core.
+    # Surfaced via :meth:`structure_certificate`. ``None`` only for payloads
+    # predating the certificate.
+    structure_certificate_json: str | None = None
     # WP-D output-Fisher shard the fit installed (#980), retained so a follow-up
     # :meth:`steer` call can re-install ``RowMetric::OutputFisher`` and report the
     # path-integrated KL dose. The ``(n, p, r)`` factor stack ``U`` exactly as
@@ -575,7 +622,88 @@ class ManifoldSAE:
                 if payload.get("certificates") is None
                 else dict(payload["certificates"])
             ),
+            structure_certificate_json=(
+                None
+                if payload.get("structure_certificate") is None
+                else str(payload["structure_certificate"])
+            ),
         )
+
+    def structure_certificate(self, *, alpha: float | None = None) -> dict[str, Any]:
+        """Anytime-valid structure-discovery certificate (#1058 / #984).
+
+        Surfaces the e-BH certificate the structure search computed over the
+        ledger of structural claims (atom-exists / binding-edge / geometry-kind)
+        the fit proposed. Each claim carries an anytime-valid e-process, so the
+        e-value and the gated/contested verdict are valid at this (or any)
+        data-dependent stopping time — safe to peek.
+
+        Parameters
+        ----------
+        alpha : float, optional
+            FDR level to re-derive the gated set at. ``None`` (default) keeps the
+            level the fit certified at (α = 0.05). A different α only re-runs the
+            e-BH step over the stored per-claim e-values; it never refits.
+
+        Returns
+        -------
+        dict
+            ``{"alpha": float, "fdr_level": float, "n_confirmed": int,
+            "claims": [{"claim": str, "e_value": float, "log_e": float,
+            "steps": int, "confirmed": bool, "evidence_remaining_nats": float},
+            ...]}``. ``evidence_remaining_nats`` is the anytime-valid budget
+            ``max(0, ln(1/α) − log_e)`` — the additional log-evidence a probe
+            must accumulate before the claim crosses the confirmation threshold
+            (0 once already confirmed).
+        """
+        import json
+        import math
+
+        if self.structure_certificate_json is None:
+            raise ValueError(
+                "this fitted model carries no structure certificate (payload "
+                "predates #1058); refit to obtain one"
+            )
+        cert = json.loads(self.structure_certificate_json)
+        entries = list(cert.get("entries", []))
+        stored_alpha = float(cert.get("alpha", 0.05))
+        level = stored_alpha if alpha is None else float(alpha)
+        if not (0.0 < level < 1.0):
+            raise ValueError(f"alpha must lie in (0, 1); got {level}")
+        log_e = [float(e["log_e"]) for e in entries]
+        confirmed_idx = set(_e_benjamini_hochberg(log_e, level))
+        threshold = math.log(1.0 / level)
+        claims: list[dict[str, Any]] = []
+        for i, entry in enumerate(entries):
+            le = float(entry["log_e"])
+            claims.append(
+                {
+                    "claim": _structure_claim_label(entry["kind"]),
+                    "e_value": math.exp(le),
+                    "log_e": le,
+                    "steps": int(entry["steps"]),
+                    "confirmed": i in confirmed_idx,
+                    "evidence_remaining_nats": max(0.0, threshold - le),
+                }
+            )
+        return {
+            "alpha": level,
+            "fdr_level": level,
+            "n_confirmed": len(confirmed_idx),
+            "claims": claims,
+        }
+
+    def contested_claims(self, *, alpha: float | None = None) -> list[dict[str, Any]]:
+        """The structure claims the held-out data did NOT confirm (#1058).
+
+        Convenience filter over :meth:`structure_certificate`: returns only the
+        contested claims (the inputs to a diagnostic probe-design loop), each
+        with the anytime-valid ``evidence_remaining_nats`` budget that a probe
+        would have to accumulate to confirm it. These are demoted, never
+        rejected — they keep their evidence across future shards.
+        """
+        cert = self.structure_certificate(alpha=alpha)
+        return [c for c in cert["claims"] if not c["confirmed"]]
 
     def _periodic_top1_projection_payload(self, x: np.ndarray) -> dict[str, Any]:
         if (
@@ -1157,6 +1285,7 @@ class ManifoldSAE:
             "certificates": (
                 None if self.certificates is None else _jsonable(self.certificates)
             ),
+            "structure_certificate": self.structure_certificate_json,
         }
 
     def save(self, path: str | Path) -> None:
@@ -1250,6 +1379,11 @@ class ManifoldSAE:
                 None
                 if payload.get("incoherence_report") is None
                 else dict(payload["incoherence_report"])
+            ),
+            structure_certificate_json=(
+                None
+                if payload.get("structure_certificate") is None
+                else str(payload["structure_certificate"])
             ),
         )
 
