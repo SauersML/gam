@@ -17545,16 +17545,22 @@ impl<'d> SpatialJointContext<'d> {
             .ensure_theta(theta)
             .map_err(EstimationError::InvalidInput)?;
         let kind = self.kind;
-        // #1033: when a certified ψ-Gram tensor covers this trial's gradient
-        // sub-window, the Gaussian ψ-gradient HyperCoord is assembled n-free
-        // from the k-space derivatives `(∂G/∂ψ, ∂b/∂ψ)` inside the evaluator —
-        // the n×k ∂X/∂ψ slabs built below are redundant for that channel (they
-        // are empty placeholders on the production implicit-operator path and
-        // are never read in the tensor gradient branch). Surface this so the
-        // n-independence regression class is visible in the STAGE log instead
-        // of hiding in an unlogged per-trial design pass.
+        // #1033: when a certified ψ-Gram tensor covers this trial's ψ-window,
+        // the value and gradient channels can both be served n-free.  The value
+        // channel installs a `GaussianFixedCache` inside `prepare_eval_state`;
+        // the gradient channel assembles `(∂G/∂ψ, ∂b/∂ψ)` from k-space
+        // derivatives, making the n×k ∂X/∂ψ slabs below redundant.  Log both
+        // so the n-independence regression class is visible in the STAGE log
+        // instead of hiding in an unlogged per-trial design pass.
         if theta.len() == self.rho_dim + 1 {
             let psi = theta[self.rho_dim];
+            if self.evaluator.psi_gram_tensor_covers(psi) {
+                log::debug!(
+                    "[STAGE] {} eval_full at psi={psi:.6}: ψ-gram tensor covers the \
+                     value channel (GaussianFixedCache n-free)",
+                    kind.label(),
+                );
+            }
             if self.evaluator.psi_gram_tensor_covers_gradient(psi) {
                 log::debug!(
                     "[STAGE] {} eval_full at psi={psi:.6}: ψ-gram tensor serves the \
