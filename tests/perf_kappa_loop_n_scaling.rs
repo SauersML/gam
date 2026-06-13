@@ -204,27 +204,24 @@ fn kappa_iso_1d_n_threshold_sweep() {
 
 #[test]
 fn kappa_outer_loop_is_n_independent() {
-    // Pick the converging path discovered by the diagnostic. Placeholder uses
-    // the aniso path; the diagnostic decides which actually holds.
-    let (aniso, bounds) = (true, (1e-2, 1e2));
-    // Runtime gate (the sanctioned skip idiom, not `#[ignore]`): the κ outer
-    // loop is still blocked on the iso-1D convergence the companion diagnostic
-    // (`kappa_iso_1d_convergence_diagnostic`) attributes. Until the converging
-    // config is wired as the measurement path, a warm fit can fail to converge;
-    // when it does, report and skip the scaling assertion rather than failing
-    // CI on the known-open blocker. A converged warm fit also primes the shared
-    // caches the timed runs below reuse, so its elapsed time is logged.
-    let warm = match run_fit(1000, true, aniso, bounds) {
-        Ok(dt) => dt,
-        Err(reason) => {
-            eprintln!(
-                "[kappa-n-scaling] SKIP: warm κ fit did not converge ({reason}) — \
-                 blocked on iso-1D κ convergence (see kappa_iso_1d_convergence_diagnostic); \
-                 re-enable once the converging config is wired as the measurement path"
-            );
-            return;
-        }
-    };
+    // ISOTROPIC path (`aniso=false`, `aniso_log_scales=None`): the single
+    // design-moving coordinate ψ=log κ on a Gaussian-identity fit — exactly the
+    // `PsiGramTensor` eligibility (`coord_dim==1` ∧ Gaussian + identity). The
+    // tensor auto-installs over the optimizer's ψ window, so every in-window
+    // trial's `XᵀWX(ψ)`/`XᵀWz(ψ)` and ψ-gradient come from the k-space Chebyshev
+    // representation rather than an O(n) design re-stream. The aniso path
+    // (placeholder in the original draft) routes the per-axis optimizer that
+    // bypasses the tensor entirely, so it would NOT measure this lane. Now that
+    // the iso-1D κ outer converges across n (#1053/#1066/#1069 fixed, calibrated
+    // n-scaled profiled REML), this is the measurement path.
+    let (aniso, bounds) = (false, (1e-2, 1e2));
+    let warm = run_fit(1000, true, aniso, bounds).unwrap_or_else(|reason| {
+        panic!(
+            "[kappa-n-scaling] warm iso-κ fit failed ({reason}) — iso-1D κ \
+             convergence is fixed (#1053/#1066/#1069); a failure here is a real \
+             regression in the tensor-eligible isotropic length-scale optimizer"
+        )
+    });
     eprintln!("[kappa-n-scaling] warm-up fit primed caches in {warm:.4}s");
 
     let ns = [2_000usize, 8_000, 32_000];
