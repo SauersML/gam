@@ -6605,17 +6605,6 @@ impl UnifiedFitResult {
             })
     }
 
-    /// The weighted Gram `X'WX` in the original coefficient basis, stored at
-    /// fit time alongside the penalized Hessian. Combined with
-    /// [`Self::penalized_hessian`] it recovers the fitted penalty
-    /// `Sλ = H − X'WX` exactly (full-conformal needs the exact `Sλ`). `None`
-    /// for large-model fits that skip the dense Gram.
-    pub fn weighted_gram(&self) -> Option<&Array2<f64>> {
-        self.inference
-            .as_ref()
-            .and_then(|inf| inf.weighted_gram.as_ref())
-    }
-
     /// Get the penalized Hessian as the [`UnscaledPrecision`] newtype if
     /// available. Use this when constructing newtype-aware APIs (HMC
     /// whitening, sampling) so the dispersion convention is enforced at
