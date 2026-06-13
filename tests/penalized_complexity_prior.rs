@@ -53,6 +53,7 @@ fn fit_options(rho_prior: RhoPrior) -> FitOptions {
         sas_link: None,
         optimize_sas: false,
         compute_inference: false,
+        skip_rho_posterior_inference: false,
         max_iter: 100,
         tol: 1e-8,
         nullspace_dims: Vec::new(),
