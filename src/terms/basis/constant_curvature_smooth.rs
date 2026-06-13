@@ -898,4 +898,281 @@ mod tests {
         }
         eprintln!();
     }
+
+    // ===================================================================
+    //  WITNESS ORACLE — κ-identification theorem (#944 / #1059)
+    // ===================================================================
+    //
+    //  THEORY (derived by hand, this session).
+    //
+    //  The constant-curvature smooth realizes a Gaussian penalized fit whose
+    //  ONLY κ-moving pieces are (i) the design X(κ) = K_κ(data, centers)·z and
+    //  (ii) the RKHS penalty S_raw(κ) = zᵀ K_κ(centers,centers) z, both built
+    //  from the geodesic-exponential kernel exp(−d_κ/L(κ)). REML profiles the
+    //  smoothing parameter λ out, giving a 1-D profiled criterion V_p(κ).
+    //
+    //  Claim 1 (FROBENIUS GAUGE — confound #2 is NOT real). The live penalty is
+    //  the Frobenius-normalized S~ = S_raw/c, c = ‖S_raw‖_F, entering REML as
+    //  λ·S~ = (λ/c)·S_raw. Reparametrize μ = λ/c. The whole REML objective —
+    //  data fit, log|XᵀX + λS~| and the pseudo-logdet +r·log λ + log|S~|_+ —
+    //  depends on (λ, c) only through μ, because
+    //      log|λS~|_+ = r·log λ + log|S_raw|_+ − r·log c
+    //                 = r·log μ + log|S_raw|_+,
+    //  and the fit/curvature terms see only μ·S_raw. Hence the diagnostic
+    //  `log|S~|_+`-per-κ "Occam leak" −r·log‖S_raw(κ)‖_F is a PURE GAUGE that the
+    //  profiled-λ criterion cancels exactly. The κ-railing is therefore NOT a
+    //  penalty-normalization artifact; chasing it in `normalize_penalty` is a
+    //  dead end. Encoded below: V_p(κ) is invariant under S_raw → α·S_raw.
+    //
+    //  Claim 2 (IDENTIFICATION — the L(κ) fix is the cure). With a κ-FROZEN
+    //  length ℓ the kernel RESOLUTION drifts with κ (positive κ compresses
+    //  geodesic distances → narrower bumps → inflated effective DOF), so REML
+    //  buys deviance by railing κ to the +chart bound for EVERY truth — V_p is
+    //  monotone, κ unidentified. Tying the length to the DATA→center geodesic
+    //  scale, L(κ) = ℓ_ref·s_dc(κ)/s₀_dc, holds the typical design entry
+    //  d_κ(data,c)/L(κ) κ-invariant in MEAN, so only the distance-matrix SHAPE
+    //  (the genuine curvature signal: how data→center distances DISPERSE
+    //  relative to their mean as the geometry bends) moves V_p. Then V_p has an
+    //  interior minimum whose sign matches sign(κ⋆). Encoded below: argmin of
+    //  the profiled REML over a κ-grid lands on the correct SIDE of 0 for both a
+    //  hyperbolic (κ⋆<0) and a spherical (κ⋆>0) truth — and FAILS (rails to the
+    //  +bound) if the length is frozen instead of L(κ)-scaled.
+    //
+    //  Profiled Gaussian REML used by the oracle (closed form, ridge-stabilized
+    //  generalized eigenbasis): for response y (n), design B = X·(whitened),
+    //  penalty S (psd), REML deviance at smoothing λ is
+    //     D(λ) = (n−Mp)·log(rss/(n−Mp)) + log|BᵀB+λS| − log|λS|_+ ,
+    //  rss = ‖y − B β̂_λ‖², β̂_λ = (BᵀB+λS)⁻¹Bᵀy, Mp = nullity(S). We minimize
+    //  D over a dense log-λ grid (the inner profile) and over κ (the outer).
+
+    /// Closed-form profiled Gaussian-REML deviance min over a log-λ grid for a
+    /// dense design `b` (n×p) and symmetric psd penalty `s` (p×p). Returns
+    /// `min_λ D(λ)`. Self-contained so the oracle does not depend on the outer
+    /// solver wiring — it tests the CRITERION SHAPE the wiring profiles.
+    fn profiled_gaussian_reml_deviance(
+        b: &Array2<f64>,
+        y: &Array1<f64>,
+        s: &Array2<f64>,
+    ) -> f64 {
+        let n = b.nrows();
+        let p = b.ncols();
+        let btb = symmetrize(&b.t().dot(b));
+        let bty = b.t().dot(y);
+        // Penalty range/null split via eigendecomposition.
+        let (s_evals, _sv) = FaerEigh::eigh(&symmetrize(s), faer::Side::Lower).unwrap();
+        let s_max = s_evals.iter().cloned().fold(0.0_f64, f64::max).max(1e-300);
+        let s_tol = s_max * 1e-9;
+        let r = s_evals.iter().filter(|&&e| e > s_tol).count(); // rank
+        let m_p = p - r; // nullity
+        let dof = (n - m_p) as f64;
+        let mut best = f64::INFINITY;
+        // log-λ grid spanning the regimes that matter for the profile.
+        for k in -24i32..=24 {
+            let lam = (0.5 * f64::from(k)).exp();
+            let h = &btb + &(s.mapv(|v| v * lam));
+            let h = symmetrize(&h);
+            // β̂ = H⁻¹ Bᵀy via eigensolve (H spd: BᵀB psd + λS psd, +tiny ridge).
+            let h_ridge = &h + &(Array2::<f64>::eye(p) * (1e-10 * s_max.max(1.0)));
+            let (hv, hq) = FaerEigh::eigh(&symmetrize(&h_ridge), faer::Side::Lower).unwrap();
+            let qty = hq.t().dot(&bty);
+            let mut beta = Array1::<f64>::zeros(p);
+            let mut log_det_h = 0.0_f64;
+            for i in 0..p {
+                let ev = hv[i].max(1e-300);
+                log_det_h += ev.ln();
+                let coef = qty[i] / ev;
+                for j in 0..p {
+                    beta[j] += hq[(j, i)] * coef;
+                }
+            }
+            let resid = y - &b.dot(&beta);
+            let rss = resid.dot(&resid).max(1e-300);
+            // log|λS|_+ = r·log λ + log|S|_+ (sum of positive S eigenvalues).
+            let log_det_s_plus: f64 = s_evals
+                .iter()
+                .filter(|&&e| e > s_tol)
+                .map(|&e| e.ln())
+                .sum();
+            let log_det_lam_s = (r as f64) * lam.ln() + log_det_s_plus;
+            let dev = dof * (rss / dof).ln() + log_det_h - log_det_lam_s;
+            if dev < best {
+                best = dev;
+            }
+        }
+        best
+    }
+
+    /// Build the κ-scaled (`L(κ)`) constant-curvature design B = K_κ(data,c)·z
+    /// and penalty S~ = (zᵀK_κ(c,c)z)/‖·‖_F for a fixed center set, mirroring the
+    /// live `build_constant_curvature_basis` math.
+    fn oracle_design_and_penalty(
+        data: ArrayView2<'_, f64>,
+        centers: ArrayView2<'_, f64>,
+        ell_ref: f64,
+        kappa: f64,
+        frozen_length: bool,
+    ) -> (Array2<f64>, Array2<f64>) {
+        let weights = Array1::<f64>::ones(centers.nrows());
+        let z = weighted_coefficient_sum_to_zero_transform(weights.view()).unwrap();
+        let ell = if frozen_length {
+            ell_ref
+        } else {
+            constant_curvature_effective_length_jet(data, centers, ell_ref, kappa)
+                .unwrap()
+                .0
+        };
+        let k_dc = constant_curvature_kernel_matrix(data, centers, kappa, ell).unwrap();
+        let b = k_dc.dot(&z);
+        let k_cc = constant_curvature_kernel_matrix(centers, centers, kappa, ell).unwrap();
+        let s_raw = symmetrize(&z.t().dot(&k_cc).dot(&z));
+        let (s_norm, _c) = normalize_penalty(&s_raw);
+        (b, symmetrize(&s_norm))
+    }
+
+    /// Claim 1: the profiled REML criterion is INVARIANT under S → α·S (the
+    /// Frobenius normalization constant is pure gauge, absorbed by λ). This
+    /// proves the `log|S~|_+` "Occam leak" the diagnostic prints is NOT a real
+    /// κ-confound — so the κ fix correctly lives in the LENGTH, not the penalty
+    /// normalization.
+    #[test]
+    fn profiled_reml_is_invariant_to_penalty_frobenius_scale() {
+        let (data, centers) = oracle_disk_design_centers();
+        let ell_ref = realized_constant_curvature_length_scale(centers.view(), 0.0).unwrap();
+        // A reproducible response with curvature-shaped signal at κ = −1.
+        let y = oracle_response(data.view(), centers.view(), ell_ref, -1.0, 7);
+        for &kappa in &[-1.5_f64, -0.5, 0.0, 0.8, 1.5] {
+            let (b, s) =
+                oracle_design_and_penalty(data.view(), centers.view(), ell_ref, kappa, false);
+            let v0 = profiled_gaussian_reml_deviance(&b, &y, &s);
+            for &alpha in &[1e-3_f64, 37.0, 1e4] {
+                let s_scaled = s.mapv(|v| v * alpha);
+                let va = profiled_gaussian_reml_deviance(&b, &y, &s_scaled);
+                assert!(
+                    (v0 - va).abs() <= 1e-7 * (1.0 + v0.abs()),
+                    "profiled REML must be invariant to penalty scale α={alpha} at κ={kappa}: \
+                     V(S)={v0} vs V(αS)={va} — the Frobenius normalization is NOT gauge, \
+                     so confound #2 (−r·log‖S_raw‖_F) WOULD be real"
+                );
+            }
+        }
+    }
+
+    /// Claim 2: with the L(κ) data→center effective length, the profiled REML
+    /// criterion identifies the SIGN of the true curvature — argmin lands on the
+    /// correct side of 0 for BOTH a hyperbolic (κ⋆<0) and a spherical (κ⋆>0)
+    /// truth. The same grid with a κ-FROZEN length rails to the +bound for both
+    /// (the #944/#1059 unidentifiability), which the oracle also asserts so the
+    /// witness FAILS on the pre-fix code path.
+    #[test]
+    fn profiled_reml_identifies_curvature_sign_with_effective_length() {
+        let (data, centers) = oracle_disk_design_centers();
+        let ell_ref = realized_constant_curvature_length_scale(centers.view(), 0.0).unwrap();
+        let grid: Vec<f64> = (-30..=30).map(|i| f64::from(i) * 0.1).collect();
+
+        let argmin_sign = |kappa_true: f64, frozen: bool| -> (f64, f64) {
+            let y = oracle_response(data.view(), centers.view(), ell_ref, kappa_true, 11);
+            let mut best_k = f64::NAN;
+            let mut best_v = f64::INFINITY;
+            for &kappa in &grid {
+                let (b, s) = oracle_design_and_penalty(
+                    data.view(),
+                    centers.view(),
+                    ell_ref,
+                    kappa,
+                    frozen,
+                );
+                let v = profiled_gaussian_reml_deviance(&b, &y, &s);
+                if v < best_v {
+                    best_v = v;
+                    best_k = kappa;
+                }
+            }
+            (best_k, best_v)
+        };
+
+        // --- Hyperbolic truth κ⋆ = −2: L(κ) criterion must pick κ̂ < 0. ---
+        let (k_hyp, _) = argmin_sign(-2.0, false);
+        eprintln!("[κ-ident] L(κ): hyperbolic truth κ⋆=−2  → κ̂={k_hyp:.2}");
+        assert!(
+            k_hyp < 0.0,
+            "L(κ) profiled REML must identify NEGATIVE curvature for hyperbolic truth; got κ̂={k_hyp}"
+        );
+
+        // --- Spherical truth κ⋆ = +2: L(κ) criterion must pick κ̂ > 0. ---
+        let (k_sph, _) = argmin_sign(2.0, false);
+        eprintln!("[κ-ident] L(κ): spherical truth κ⋆=+2  → κ̂={k_sph:.2}");
+        assert!(
+            k_sph > 0.0,
+            "L(κ) profiled REML must identify POSITIVE curvature for spherical truth; got κ̂={k_sph}"
+        );
+
+        // --- WITNESS that the FROZEN length is broken: it rails the hyperbolic
+        // truth to the +bound (κ̂ at the top of the grid), i.e. wrong sign. This
+        // line FAILS on the pre-L(κ) code, documenting the bug the fix cures. ---
+        let (k_frozen_hyp, _) = argmin_sign(-2.0, true);
+        eprintln!("[κ-ident] frozen ℓ: hyperbolic truth κ⋆=−2 → κ̂={k_frozen_hyp:.2} (railing bug)");
+        assert!(
+            k_frozen_hyp > grid[grid.len() - 2],
+            "frozen-ℓ criterion is expected to RAIL hyperbolic truth to the +bound (the bug \
+             L(κ) fixes); if it no longer rails, the frozen-vs-scaled contrast is stale: κ̂={k_frozen_hyp}"
+        );
+    }
+
+    /// 8 data rows + 8 centers inside a disk of radius < 0.5 (valid in every
+    /// κ ∈ [−3, 3] chart). Data ≠ centers so the data→center scale is nontrivial.
+    fn oracle_disk_design_centers() -> (Array2<f64>, Array2<f64>) {
+        let centers = ndarray::array![
+            [0.10, 0.05],
+            [-0.20, 0.15],
+            [0.30, -0.10],
+            [-0.05, -0.25],
+            [0.22, 0.20],
+            [-0.30, -0.05],
+            [0.05, 0.30],
+            [-0.15, 0.10],
+        ];
+        // Deterministic pseudo-random data on a slightly wider disk.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // map to (−0.42, 0.42)
+            ((state >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 0.84
+        };
+        let n = 60usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            data[(i, 0)] = next();
+            data[(i, 1)] = next();
+        }
+        (data, centers)
+    }
+
+    /// A curvature-shaped Gaussian response: y = B(κ⋆)·β + ε with β a fixed
+    /// pseudo-random vector and ε small, so the SIGNAL geometry is κ⋆.
+    fn oracle_response(
+        data: ArrayView2<'_, f64>,
+        centers: ArrayView2<'_, f64>,
+        ell_ref: f64,
+        kappa_true: f64,
+        seed: u64,
+    ) -> Array1<f64> {
+        let (b, _s) =
+            oracle_design_and_penalty(data, centers, ell_ref, kappa_true, false);
+        let p = b.ncols();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ seed.wrapping_mul(0x1000_0000_1b3);
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let beta: Array1<f64> = (0..p).map(|_| next() * 2.0).collect();
+        let mut y = b.dot(&beta);
+        for v in y.iter_mut() {
+            *v += next() * 0.05;
+        }
+        y
+    }
 }
