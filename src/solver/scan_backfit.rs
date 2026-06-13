@@ -848,7 +848,7 @@ mod tests {
     fn per_sweep_scan_reml_matches_joint_reml_on_truth_recovery() {
         let n = 240usize;
         let sigma = 0.35;
-        let mut state = 0xj_seed_u64_placeholder;
+        let mut state = 0x5EED_5CA9_BACC_F177_u64;
         // Coarse distinct grids keep the dense REML dimension small.
         let g1 = 30usize;
         let g2 = 28usize;
