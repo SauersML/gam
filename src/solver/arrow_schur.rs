@@ -12148,4 +12148,260 @@ mod tests {
         // benchmark; the real signal is the printed numbers.
         assert!(par_per > 0.0 && seq_per > 0.0, "timings must be positive");
     }
+
+    /// Build an SAE-structured arrow system exercising the residency path: per
+    /// row a `q×q` SPD `H_tt`, a `q×p` local Jacobian `L_i`, and `m_i` active
+    /// atoms over `n_atoms` decoder blocks of width `p` (border `k = n_atoms·p`).
+    /// Installs BOTH the matrix-free Kronecker cross-block operator (the generic
+    /// matvec path: `H_tβ = L_i P_i`) AND the matching `DeviceSaePcgData` (the
+    /// residency path), so the two routes see the identical operator.
+    fn sae_structured_system(
+        n: usize,
+        q: usize,
+        p: usize,
+        n_atoms: usize,
+        m_active: usize,
+    ) -> (ArrowSchurSystem, Vec<Vec<(usize, f64)>>, Vec<Vec<f64>>) {
+        let k = n_atoms * p;
+        let mut sys = ArrowSchurSystem::new(n, q, k);
+        let mut a_phi: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n);
+        let mut local_jac: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            // SPD H_tt: diagonally dominant.
+            let mut htt = Array2::<f64>::zeros((q, q));
+            for r in 0..q {
+                for c in 0..q {
+                    let s = ((i + 1) * (r + 2) * (c + 3)) as f64;
+                    htt[[r, c]] = 0.1 * ((s % 5.0) - 2.0);
+                }
+            }
+            let mut sym = &htt + &htt.t();
+            for r in 0..q {
+                sym[[r, r]] = sym[[r, r]].abs() + (q as f64) + 3.0;
+            }
+            sys.rows[i].htt = sym;
+            sys.rows[i].gt = Array1::<f64>::zeros(q);
+            // L_i (q×p), row-major.
+            let mut jac = vec![0.0_f64; q * p];
+            for c in 0..q {
+                for j in 0..p {
+                    let s = ((i + 1) + 2 * (c + 1) + 3 * (j + 1)) as f64;
+                    jac[c * p + j] = 0.1 * ((s % 7.0) - 3.0);
+                }
+            }
+            local_jac.push(jac);
+            // m_active atoms per row, deterministic spread over n_atoms.
+            let mut support = Vec::with_capacity(m_active);
+            for s in 0..m_active {
+                let atom = ((i * 3 + s * 5) % n_atoms).min(n_atoms - 1);
+                let phi = 0.5 + 0.25 * (((i + s) % 4) as f64);
+                support.push((atom * p, phi));
+            }
+            a_phi.push(support);
+        }
+        // SPD H_ββ.
+        let mut hbb = Array2::<f64>::zeros((k, k));
+        for r in 0..k {
+            hbb[[r, r]] = (k as f64) + 4.0;
+        }
+        sys.hbb = hbb;
+        sys.gb = Array1::<f64>::zeros(k);
+        // Install the matrix-free Kronecker operator (H_tβ = L_i · P_i): forward
+        // gathers active atoms into a length-p vector then applies L_i; transpose
+        // is the exact adjoint. Mirrors src/terms/sae_manifold.rs:6028.
+        let a_phi_f = a_phi.clone();
+        let jac_f = local_jac.clone();
+        let a_phi_t = a_phi.clone();
+        let jac_t = local_jac.clone();
+        let p_f = p;
+        sys.set_row_htbeta_operator(
+            move |row, x, out| {
+                let mut u_p = vec![0.0_f64; p_f];
+                for &(base, phi) in &a_phi_f[row] {
+                    for j in 0..p_f {
+                        u_p[j] += phi * x[base + j];
+                    }
+                }
+                let jac = &jac_f[row];
+                let qi = jac.len() / p_f;
+                for c in 0..qi {
+                    let mut acc = 0.0;
+                    for j in 0..p_f {
+                        acc += jac[c * p_f + j] * u_p[j];
+                    }
+                    out[c] = acc;
+                }
+            },
+            move |row, v, out| {
+                let jac = &jac_t[row];
+                let qi = jac.len() / p_f;
+                let mut u_p = vec![0.0_f64; p_f];
+                for c in 0..qi {
+                    let vc = v[c];
+                    for j in 0..p_f {
+                        u_p[j] += jac[c * p_f + j] * vc;
+                    }
+                }
+                for &(base, phi) in &a_phi_t[row] {
+                    for j in 0..p_f {
+                        out[base + j] += phi * u_p[j];
+                    }
+                }
+            },
+        );
+        sys.set_device_sae_pcg_data(DeviceSaePcgData {
+            p,
+            beta_dim: k,
+            a_phi: a_phi.clone(),
+            local_jac: local_jac.clone(),
+            smooth_blocks: Vec::new(),
+            sparse_g_blocks: Vec::new(),
+        });
+        (sys, a_phi, local_jac)
+    }
+
+    /// The CPU-resident SAE reduced-Schur matvec (#1017) must compute the SAME
+    /// `S·x` as the generic per-row `apply → solve → transpose` path, up to f64
+    /// reassociation. This is the residency correctness gate: a resident matvec
+    /// that changed the reduced operator would change the Newton step and the
+    /// criterion ranking — a correctness regression, not a speedup.
+    #[test]
+    fn resident_sae_matvec_matches_generic() {
+        let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 96; // trips the parallel path
+        let q = 4usize;
+        let p = 6usize;
+        let n_atoms = 32usize;
+        let m_active = 5usize;
+        let (sys, _a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
+        let k = sys.k;
+        let backend = CpuBatchedBlockSolver;
+        let htt_factors = backend
+            .factor_blocks(&sys.rows, 0.0, q, false)
+            .expect("SPD per-row blocks must factor");
+        let ridge_beta = 1e-6;
+        let x = Array1::from_iter((0..k).map(|a| 0.2 * ((a as f64) * 0.013).cos() - 0.05));
+
+        // Generic path (no resident operator).
+        let mut out_generic = Array1::<f64>::zeros(k);
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_generic, &backend);
+
+        // Resident path: stage G_i once, then matvec.
+        let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend)
+            .expect("SAE structure must yield a resident operator");
+        let mut out_resident = Array1::<f64>::zeros(k);
+        schur_matvec_resident(
+            &sys,
+            &htt_factors,
+            ridge_beta,
+            &x,
+            &mut out_resident,
+            &backend,
+            Some(&resident),
+        );
+
+        let scale = out_generic
+            .iter()
+            .fold(0.0_f64, |m, &v| m.max(v.abs()))
+            .max(1.0);
+        for a in 0..k {
+            let rel = (out_resident[a] - out_generic[a]).abs() / scale;
+            assert!(
+                rel < 1e-10,
+                "resident vs generic SAE Schur matvec must agree at index {a}: \
+                 {} vs {} (rel {rel:e})",
+                out_resident[a],
+                out_generic[a]
+            );
+        }
+
+        // Determinism: rebuilding + re-applying is bit-identical run-to-run.
+        let resident2 = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend).unwrap();
+        let mut out_resident2 = Array1::<f64>::zeros(k);
+        schur_matvec_resident(
+            &sys,
+            &htt_factors,
+            ridge_beta,
+            &x,
+            &mut out_resident2,
+            &backend,
+            Some(&resident2),
+        );
+        for a in 0..k {
+            assert_eq!(
+                out_resident[a].to_bits(),
+                out_resident2[a].to_bits(),
+                "resident SAE matvec must be deterministic run-to-run at index {a}"
+            );
+        }
+    }
+
+    /// Wall-clock benchmark: generic per-row matvec vs the CPU-resident SAE
+    /// matvec (#1017) at an SAE-flavoured shape, amortised over a representative
+    /// CG-iteration count (the residency build is paid once, then N matvecs).
+    /// Ordinary test (ban gate forbids `#[ignore]`); run `--release --nocapture`.
+    #[test]
+    fn bench_resident_sae_matvec_speedup() {
+        let n = 1500usize;
+        let q = 4usize;
+        let p = 8usize;
+        let n_atoms = 256usize; // border k = 2048
+        let m_active = 6usize;
+        let (sys, _a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
+        let k = sys.k;
+        let backend = CpuBatchedBlockSolver;
+        let htt_factors = backend
+            .factor_blocks(&sys.rows, 0.0, q, false)
+            .expect("SPD per-row blocks must factor");
+        let ridge_beta = 1e-6;
+        let x = Array1::from_iter((0..k).map(|a| 0.3 * ((a as f64) * 0.017).sin() - 0.1));
+        let cg_iters = 30usize;
+        let mut sink = 0.0_f64;
+
+        // Generic: matvec re-walks apply/solve/transpose every iteration.
+        let mut out = Array1::<f64>::zeros(k);
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out, &backend); // warm
+        sink += out[0];
+        let t_gen = std::time::Instant::now();
+        for _ in 0..cg_iters {
+            schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out, &backend);
+            sink += out[0];
+        }
+        let gen_elapsed = t_gen.elapsed();
+
+        // Resident: stage once (timed into the total — honest amortisation),
+        // then cg_iters cheap matvecs.
+        let t_res = std::time::Instant::now();
+        let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend)
+            .expect("resident operator");
+        let mut outr = Array1::<f64>::zeros(k);
+        for _ in 0..cg_iters {
+            schur_matvec_resident(
+                &sys,
+                &htt_factors,
+                ridge_beta,
+                &x,
+                &mut outr,
+                &backend,
+                Some(&resident),
+            );
+            sink += outr[0];
+        }
+        let res_elapsed = t_res.elapsed();
+
+        let gen_total = gen_elapsed.as_secs_f64();
+        let res_total = res_elapsed.as_secs_f64();
+        println!(
+            "[#1017 SAE resident matvec, n={n} q={q} p={p} k={k} m={m_active}, \
+             {cg_iters} CG matvecs incl. 1 residency build, {} rayon threads]\n  \
+             generic:  {:.3} ms total ({:.3} ms/matvec)\n  resident: {:.3} ms total \
+             (build + {cg_iters} matvecs)\n  speedup:  {:.2}x  (sink {:.3e})",
+            rayon::current_num_threads(),
+            gen_total * 1e3,
+            gen_total / cg_iters as f64 * 1e3,
+            res_total * 1e3,
+            gen_total / res_total,
+            sink,
+        );
+        assert!(gen_total > 0.0 && res_total > 0.0, "timings must be positive");
+    }
 }
