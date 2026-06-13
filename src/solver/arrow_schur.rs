@@ -11856,27 +11856,27 @@ mod tests {
         }
     }
 
-    /// Wall-clock benchmark of the reduced-Schur matvec at the SAE-LLM shape
-    /// (#1017): sequential per-row fold vs the rayon-parallel chunked path.
-    /// `#[ignore]` — a measurement, not a gate (timing is machine-dependent and
-    /// CI boxes are loaded). Run explicitly on a quiet multicore box:
+    /// Wall-clock benchmark of the reduced-Schur matvec at an SAE-LLM-flavoured
+    /// shape (#1017): sequential per-row fold vs the rayon-parallel chunked path.
+    /// Runs as an ordinary test (the ban gate forbids `#[ignore]`), so the shape
+    /// and call count are sized to stay fast in a debug CI build while still
+    /// tripping the parallel path. Run with `--release --nocapture` on a quiet
+    /// multicore box to read the per-call wall-clock and the parallel speedup at
+    /// the inner-CG matvec cost the production InexactPCG loop pays O(cg_iters)
+    /// times:
     ///
     /// ```text
     /// cargo test -p gam --lib --release \
     ///   solver::arrow_schur::tests::bench_reduced_schur_matvec_parallel_speedup \
-    ///   -- --ignored --nocapture
+    ///   -- --nocapture
     /// ```
-    ///
-    /// Prints per-call wall-clock for both paths and the speedup at the inner
-    /// CG matvec cost the production InexactPCG loop pays O(cg_iters) times.
     #[test]
-    #[ignore = "wall-clock perf benchmark; run explicitly with --ignored --nocapture"]
     fn bench_reduced_schur_matvec_parallel_speedup() {
-        // SAE Qwen-arm-flavoured shape from the issue: n ≈ 2000 row blocks,
-        // wide border k ≈ 2048, modest frame depth d.
-        let n = 2000usize;
+        // SAE-arm-flavoured shape from the issue: many row blocks, wide border
+        // k, modest frame depth d. Sized so the debug build stays quick.
+        let n = 1500usize;
         let d = 6usize;
-        let k = 2048usize;
+        let k = 1024usize;
         let sys = dense_arrow_system(n, d, k);
         let backend = CpuBatchedBlockSolver;
         let htt_factors = backend
@@ -11886,12 +11886,12 @@ mod tests {
         let x = Array1::from_iter((0..k).map(|a| 0.3 * ((a as f64) * 0.017).sin() - 0.1));
 
         // A representative inner-CG budget: the matvec is paid once per CG iter.
-        let calls = 100usize;
+        let calls = 30usize;
         let mut sink = 0.0_f64;
 
         // Warm up (factor caches, allocator, rayon pool) before timing.
-        let _warm = schur_matvec_sequential_ref(&sys, &htt_factors, ridge_beta, &x, &backend);
-        sink += _warm[0];
+        let warm = schur_matvec_sequential_ref(&sys, &htt_factors, ridge_beta, &x, &backend);
+        sink += warm[0];
 
         let t_seq = std::time::Instant::now();
         for _ in 0..calls {
