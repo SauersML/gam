@@ -383,7 +383,8 @@ impl IndexConfig {
                 (usize::BITS - (n - 1).leading_zeros()) as usize
             }
         };
-        let bits = log2(num_atoms.max(2)).clamp(1, sketch_dim.max(1));
+        // Cap at 63: sign_signature packs bits into a u64, so bits_per_table must be ≤ 63.
+        let bits = log2(num_atoms.max(2)).clamp(1, sketch_dim.max(1).min(63));
         // Aim for ~constant per-bucket occupancy; a few tables recover recall
         // lost to any single table's quantization.
         let num_tables = log2(num_atoms.max(2)).clamp(4, 16);
@@ -405,6 +406,14 @@ impl SaeCandidateIndex {
         }
         if config.num_tables == 0 || config.bits_per_table == 0 {
             return Err("SaeCandidateIndex: num_tables and bits_per_table must be positive".into());
+        }
+        // sign_signature packs bits into a u64 with `1u64 << r` for r in 0..bits_per_table.
+        // Shifting by 64+ is a panic in debug and undefined behaviour in release; cap at 63.
+        if config.bits_per_table > 63 {
+            return Err(format!(
+                "SaeCandidateIndex: bits_per_table {} exceeds 63 (u64 signature limit)",
+                config.bits_per_table
+            ));
         }
         let num_atoms = sketch.num_atoms();
 

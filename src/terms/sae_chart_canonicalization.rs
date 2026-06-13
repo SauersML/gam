@@ -1948,7 +1948,14 @@ fn sphere_eval_boost_defect(
         // Whiten by L(lat̃) at the moved latitude.
         let mapped = SphereBoostFlowBasis::map_point(theta, t);
         let cos_lat_new = mapped[0].cos();
-        if !(cos_lat_new.is_finite() && cos_lat_new > 0.0) {
+        // Guard against the `1/cos lat` singularity in the lon component of the
+        // whitened Jacobian `Ã = L(lat̃)·Dφ`.  `cos(π/2)` in f64 is ~6.1e-17, not
+        // exactly 0, so a bare `> 0.0` lets a pole-adjacent row through and then
+        // multiplies `dphi[1, .]` by an effectively-zero factor, corrupting `Ã` and
+        // the GN system.  Mirror the floor used in `sphere_chart_isometry_defect`
+        // (`POLE_COS2_FLOOR = 1e-12` on cos²lat ↔ `|cos lat| > 1e-6`).
+        const SPHERE_EVAL_COS_FLOOR: f64 = 1.0e-6;
+        if !(cos_lat_new.is_finite() && cos_lat_new > SPHERE_EVAL_COS_FLOOR) {
             return None;
         }
         let a = [
