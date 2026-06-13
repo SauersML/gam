@@ -23,8 +23,11 @@ fn probe_rank_deficient_passes_guard() {
         .map(|_| {
             let x0: f64 = ux.sample(&mut rng);
             // x1..x4 collinear with x0 (tiny jitter) -> rank-deficient design.
-            let jit = || 1e-6 * ux.sample(&mut rng);
-            let xs = [x0, x0 + jit(), x0 + jit(), x0 + jit(), x0 + jit()];
+            let j1: f64 = 1e-6 * ux.sample(&mut rng);
+            let j2: f64 = 1e-6 * ux.sample(&mut rng);
+            let j3: f64 = 1e-6 * ux.sample(&mut rng);
+            let j4: f64 = 1e-6 * ux.sample(&mut rng);
+            let xs = [x0, x0 + j1, x0 + j2, x0 + j3, x0 + j4];
             let y = (1.3 * x0).sin() + noise.sample(&mut rng);
             let mut f: Vec<String> = xs.iter().map(|v| v.to_string()).collect();
             f.push(y.to_string());
