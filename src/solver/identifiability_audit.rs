@@ -1017,11 +1017,32 @@ fn audit_identifiability_impl(
     );
 
     // Attribute each demoted joint column back to its canonical gauge owner.
+    //
     // RRQR is priority-ordered, but column pivoting can still name the
     // higher-priority representative of a two-block alias. The model-space
     // redundancy is resolved by dropping the lower-priority participant, so
-    // distinct-priority aliases are re-attributed to that side; same-priority
-    // aliases remain attributed to the raw demoted column and are fatal below.
+    // when RRQR has named a *higher*-priority column we re-attribute to the
+    // lower-priority partner.  Same-priority aliases remain attributed to
+    // the raw demoted column and are fatal below.
+    //
+    // # ≥3-way alias correctness
+    //
+    // For a 3-block shared direction (e.g. [high=200, mid=150, low=80] with
+    // a common constant column), RRQR demotes the two lower-priority
+    // representatives (mid and low). The raw demoted column for mid is on
+    // the LOWER side of the (high, mid) alias pair and on the HIGHER side
+    // of the (mid, low) alias pair. A `max_by(overlap)` selection over
+    // matching distinct-priority pairs would tie-break to the *last* pair
+    // in iteration order and re-attribute the mid drop to low — which
+    // double-counts the low drop and leaves the mid loss unattributed.
+    //
+    // The correct rule: if the raw demoted column is already on the
+    // lower-priority side of at least one matching distinct-priority
+    // alias pair, RRQR's placement agrees with gauge ownership and the
+    // attribution stays on the raw block. Only when the raw column is on
+    // the higher-priority side of EVERY matching distinct-priority pair
+    // (RRQR named the canonical owner) do we re-attribute to the
+    // best-overlap partner's lower-priority side.
     let block_priority_for_attribution: std::collections::HashMap<&str, u8> = specs
         .iter()
         .map(|s| (s.name.as_str(), s.gauge_priority))
@@ -1030,29 +1051,9 @@ fn audit_identifiability_impl(
     for &joint_col in &demoted_joint_cols {
         let (block_idx, local_col) = locate_block_column(&col_offsets, joint_col)?;
         let raw_block_name = specs[block_idx].name.clone();
-        let best_pair = aliased_pairs
-            .iter()
-            .filter(|pair| {
-                (pair.block_a == raw_block_name && pair.direction_a == local_col)
-                    || (pair.block_b == raw_block_name && pair.direction_b == local_col)
-            })
-            .filter(|pair| {
-                let pa = block_priority_for_attribution
-                    .get(pair.block_a.as_str())
-                    .copied()
-                    .unwrap_or(DEFAULT_GAUGE_PRIORITY);
-                let pb = block_priority_for_attribution
-                    .get(pair.block_b.as_str())
-                    .copied()
-                    .unwrap_or(DEFAULT_GAUGE_PRIORITY);
-                pa != pb
-            })
-            .max_by(|a, b| {
-                a.overlap
-                    .partial_cmp(&b.overlap)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        let (block_name, drop_local_col, reason) = if let Some(pair) = best_pair {
+        let raw_priority = specs[block_idx].gauge_priority;
+
+        let pair_priorities = |pair: &AliasedPair| -> (u8, u8) {
             let pa = block_priority_for_attribution
                 .get(pair.block_a.as_str())
                 .copied()
@@ -1061,6 +1062,50 @@ fn audit_identifiability_impl(
                 .get(pair.block_b.as_str())
                 .copied()
                 .unwrap_or(DEFAULT_GAUGE_PRIORITY);
+            (pa, pb)
+        };
+        let matches_demoted = |pair: &AliasedPair| -> bool {
+            (pair.block_a == raw_block_name && pair.direction_a == local_col)
+                || (pair.block_b == raw_block_name && pair.direction_b == local_col)
+        };
+
+        // Does any matching distinct-priority alias pair place the raw
+        // demoted column on its LOWER-priority side? Then RRQR's choice
+        // already agrees with canonical gauge ownership.
+        let raw_already_lower = aliased_pairs
+            .iter()
+            .filter(|pair| matches_demoted(pair))
+            .any(|pair| {
+                let (pa, pb) = pair_priorities(pair);
+                if pa == pb {
+                    return false;
+                }
+                let other_priority = if pair.block_a == raw_block_name {
+                    pb
+                } else {
+                    pa
+                };
+                raw_priority < other_priority
+            });
+
+        let best_pair = if raw_already_lower {
+            None
+        } else {
+            aliased_pairs
+                .iter()
+                .filter(|pair| matches_demoted(pair))
+                .filter(|pair| {
+                    let (pa, pb) = pair_priorities(pair);
+                    pa != pb
+                })
+                .max_by(|a, b| {
+                    a.overlap
+                        .partial_cmp(&b.overlap)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        };
+        let (block_name, drop_local_col, reason) = if let Some(pair) = best_pair {
+            let (pa, pb) = pair_priorities(pair);
             let (lower_block, lower_col, lower_prio, higher_block, higher_col, higher_prio) =
                 if pa < pb {
                     (
@@ -1088,6 +1133,15 @@ fn audit_identifiability_impl(
                     "joint-design column {joint_col} (raw RRQR block '{raw_block_name}' local column {local_col}) demoted past joint RRQR rank tolerance {tol:.3e}; canonical gauge re-attributed the shared direction to lower-priority block '{lower_block}' local column {lower_col} (priority {lower_prio} < '{higher_block}' local column {higher_col}, priority {higher_prio}; overlap={overlap:.4})",
                     tol = joint_rank_tol,
                     overlap = pair.overlap,
+                ),
+            )
+        } else if raw_already_lower {
+            (
+                raw_block_name.clone(),
+                local_col,
+                format!(
+                    "joint-design column {joint_col} (block '{raw_block_name}' local column {local_col}, priority {raw_priority}) demoted past joint RRQR rank tolerance {tol:.3e}; canonical gauge keeps the attribution on this block — RRQR already named the lower-priority side of its alias",
+                    tol = joint_rank_tol,
                 ),
             )
         } else {
