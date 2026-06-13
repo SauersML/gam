@@ -1311,8 +1311,19 @@ fn chart_region(atom: &SaeManifoldAtom, center: Array1<f64>, radius: f64) -> Cha
         Duchon => {
             // r ranges over [‖t_c‖ − radius, ‖t_c‖ + radius] about the single
             // origin-anchored center used by the conservative radial bound.
+            //
+            // The lower bound must be `max(0, center_norm − radius)` — NOT floored
+            // at `radius`. When the chart contains the kernel center
+            // (`center_norm < radius`, true r_min = 0), flooring at `radius`
+            // would give a finite, NON-CONSERVATIVE `r_min`, causing the
+            // hessian_sup / third_sup formulas (which divide by r_min) to
+            // underestimate the Lipschitz constant and potentially grant a false
+            // Kantorovich certificate. Flooring at `f64::MIN_POSITIVE` instead
+            // correctly drives the formulas toward ∞, producing a very large L
+            // that will NEVER certify (rows route to the exact multi-start
+            // fallback) — conservative and sound.
             let center_norm = center.dot(&center).sqrt();
-            let r_min = (center_norm - radius).max(radius.max(f64::MIN_POSITIVE));
+            let r_min = (center_norm - radius).max(f64::MIN_POSITIVE);
             let r_max = center_norm + radius;
             region.with_radial_bounds(r_min, r_max)
         }
