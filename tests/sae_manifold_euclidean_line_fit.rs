@@ -208,37 +208,41 @@ fn sae_manifold_euclidean_line_fits_through_production_engine() {
     );
 }
 
-/// Fast diagnostic: a SINGLE `reml_criterion` evaluation at the cold entry ρ on
-/// the line term. Isolates the inner solve from the continuation walk so the
-/// non-convergence / singular-block mechanism surfaces in seconds, not minutes.
+/// Fast diagnostic: time a few raw inner Newton iterations at the cold entry ρ.
+/// Isolates the inner `run_joint_fit_arrow_schur` solve from the continuation
+/// walk and the undamped-evidence refine loop, so a per-iteration grind on the
+/// rank-deficient β block surfaces in seconds. Each of `n` iterations should be
+/// cheap; a single iteration taking many seconds localises the cost.
 #[test]
-fn sae_manifold_euclidean_line_single_reml_criterion_converges() {
+fn sae_manifold_euclidean_line_inner_solve_iterations_are_cheap() {
     let (z, s_true) = planted_line();
     let mut term = build_cold_term(&s_true, &z);
-    let rho = dimensionless_entry_rho(&term, &z);
-    let t0 = std::time::Instant::now();
-    let outcome = term.reml_criterion(
-        z.view(),
-        &rho,
-        None,
-        INNER_MAX_ITER,
-        LEARNING_RATE,
-        RIDGE_EXT_COORD,
-        RIDGE_BETA,
-    );
-    let dt = t0.elapsed().as_secs_f64();
-    match &outcome {
-        Ok((v, _loss)) => println!("[#1051-probe] reml_criterion OK value={v:.6e} dt={dt:.2}s"),
-        Err(e) => println!("[#1051-probe] reml_criterion ERR dt={dt:.2}s: {e}"),
+    let mut rho = dimensionless_entry_rho(&term, &z);
+    for n_iter in [1usize, 1, 1, 1, 1] {
+        let t0 = std::time::Instant::now();
+        let outcome = term.run_joint_fit_arrow_schur(
+            z.view(),
+            &mut rho,
+            None,
+            n_iter,
+            LEARNING_RATE,
+            RIDGE_EXT_COORD,
+            RIDGE_BETA,
+        );
+        let dt = t0.elapsed().as_secs_f64();
+        match &outcome {
+            Ok(loss) => println!(
+                "[#1051-probe] inner {n_iter}it OK total={:.6e} dt={dt:.3}s",
+                loss.total()
+            ),
+            Err(e) => println!("[#1051-probe] inner {n_iter}it ERR dt={dt:.3}s: {e}"),
+        }
+        let loss = outcome.expect("inner solve must not error on the line");
+        assert!(loss.total().is_finite(), "inner loss non-finite");
+        assert!(
+            dt < 10.0,
+            "one inner Newton iteration took {dt:.3}s (> 10s) — the inner solve grinds \
+             the rank-deficient β block per iteration"
+        );
     }
-    let (value, _loss) = outcome.expect("single reml_criterion eval must succeed on the line");
-    assert!(
-        value.is_finite() && value < 1.0e11,
-        "single reml_criterion at entry ρ returned the infeasible sentinel value={value:.6e}"
-    );
-    assert!(
-        dt < 30.0,
-        "single reml_criterion took {dt:.2}s (> 30s) — the inner solve is grinding the \
-         rank-deficient β block instead of converging"
-    );
 }
