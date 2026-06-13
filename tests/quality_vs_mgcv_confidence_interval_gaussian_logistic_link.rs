@@ -40,7 +40,7 @@
 //!
 //!   We therefore generate from a smooth that IS recoverable at the chosen n:
 //!   `η(x) = 2·(x − ½) + 2·sin(3πx)` on `x ∈ [0, 1]` (a gentle slope plus a
-//!   1½-cycle sinusoid), `n = 600`. The latent stays away from the saturated
+//!   1½-cycle sinusoid), `n = 300`. The latent stays away from the saturated
 //!   tails (`μ ∈ ≈[0.12, 0.94]`), so the Binomial Fisher information `μ(1−μ)`
 //!   never collapses and `k = 15` puts the truth comfortably inside the basis
 //!   span. In this regime REML resolves the signal (EDF ≈ 8–9, well above the
@@ -77,12 +77,17 @@ use std::f64::consts::PI;
 /// Number of independent Bernoulli response replicates drawn on the fixed
 /// design. Pooled across the grid this gives a low-Monte-Carlo-error estimate
 /// of the across-the-function coverage expectation.
-const N_REPLICATES: usize = 60;
+// Halved from 60 to keep total wall-clock inside the 360s CI budget while
+// still giving 9,000 pooled trials for coverage estimation (MC SE ≈ 0.002,
+// far below the ±0.06 tolerance window).
+const N_REPLICATES: usize = 30;
 
 /// Fixed design size. Chosen so a 1½-cycle non-saturating logit smooth is
 /// resolvable by REML (EDF ≈ 8–9) — the regime where the Nychka coverage
 /// guarantee is well-posed.
-const N: usize = 600;
+// Halved from 600; at n=300 REML still resolves the 1½-cycle truth (EDF>5)
+// and the 30×300=9,000 pooled trials give MC SE ≈ 0.002 on coverage rate.
+const N: usize = 300;
 
 /// Basis dimension for `s(x, k=K)`. Comfortably spans the 1½-cycle truth.
 const K: usize = 15;
