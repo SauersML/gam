@@ -27543,6 +27543,63 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         outer.seed_cached_beta(n_rho, specs, beta)
     });
 
+
+    // ── Discriminating outer-gradient FD audit (issue #1040) ──
+    //
+    // The survival marginal-slope (and every custom-family) outer ρ-REML loop
+    // is driven HERE by `problem.run`, with `outerobjectivegradienthessian_labeled`
+    // as the θ↦(V,∇V,H) evaluator. On a diagnostic-sized problem, central-
+    // difference the outer criterion component-by-component against the analytic
+    // gradient at the seed ρ₀ and report the outer-Hessian spectrum — the single
+    // test that forks a non-terminating outer loop into objective↔gradient
+    // DESYNC (analytic ≠ FD ⇒ the trust region chases a phantom descent forever)
+    // vs weak IDENTIFIABILITY (analytic ≈ FD but a ~0 outer-Hessian eigenvalue ⇒
+    // a flat valley). Gated to small problems so it never taxes a production fit.
+    {
+        const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
+        const OUTER_FD_AUDIT_MAX_RHO_DIM: usize = 32;
+        let audit_n = specs.iter().map(|s| s.design.nrows()).max().unwrap_or(0);
+        if n_rho >= 1 && n_rho <= OUTER_FD_AUDIT_MAX_RHO_DIM && audit_n <= OUTER_FD_AUDIT_MAX_N {
+            log::warn!(
+                "[OUTER-FD-AUDIT/custom-family] gate eligible n={audit_n} n_rho={n_rho} need_outer_hessian={need_outer_hessian}"
+            );
+            let mut eval_at = |rho: &Array1<f64>,
+                               mode: EvalMode|
+             -> Result<
+                (
+                    f64,
+                    Array1<f64>,
+                    crate::solver::outer_strategy::HessianResult,
+                ),
+                String,
+            > {
+                let e = outerobjectivegradienthessian_labeled(
+                    family,
+                    specs,
+                    &outer_options,
+                    &label_layout,
+                    rho,
+                    None,
+                    &rho_prior,
+                    mode,
+                )?;
+                if !e.inner_converged {
+                    return Err("inner solve did not converge at audit rho".to_string());
+                }
+                Ok((e.objective, e.gradient, e.outer_hessian))
+            };
+            match crate::solver::outer_strategy::outer_gradient_fd_audit(
+                &rho0,
+                1e-4,
+                |i| format!("rho[{i}]"),
+                &mut eval_at,
+            ) {
+                Ok(audit) => audit.log_verdict("custom-family"),
+                Err(e) => log::warn!("[OUTER-FD-AUDIT/custom-family] skipped: {e}"),
+            }
+        }
+    }
+
     let outer_result = problem.run(&mut obj, "custom family");
 
     let last_error_detail = obj
