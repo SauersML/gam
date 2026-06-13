@@ -111,8 +111,8 @@ fn build_dataset(n: usize, kappa: f64, radius: f64, seed: u64) -> gam::inference
     header.push_str(&body);
     let mut rdr = csv::ReaderBuilder::new().from_reader(header.as_bytes());
     let records: Vec<csv::StringRecord> = rdr.records().map(|r| r.unwrap()).collect();
-    let headers = csv::StringRecord::from(vec!["y", "x1", "x2"]);
-    encode_recordswith_inferred_schema(&headers, &records).expect("encode dataset")
+    let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
+    encode_recordswith_inferred_schema(headers, records).expect("encode dataset")
 }
 
 fn field(line: &str, key: &str) -> String {
