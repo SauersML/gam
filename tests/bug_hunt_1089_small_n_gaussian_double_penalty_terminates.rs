@@ -52,8 +52,10 @@ fn build_data(n: usize, sigma: f64, seed: u64) -> gam::data::EncodedDataset {
 
 #[test]
 fn small_n_gaussian_double_penalty_outer_loop_terminates() {
-    // n=30 matches the wine_gamair CV-fold size that triggered the hang.
-    let data = build_data(30, 0.1, 1089);
+    // n above the basis-capacity floor (5 ps(knots=7) double-penalty smooths
+    // need ~57 rows) but still a small, fully-penalized design with rho_dim=10
+    // — the regime where the outer REML loop spun in the wine_gamair report.
+    let data = build_data(120, 0.1, 1089);
 
     // Exactly the wine_gamair Rust formula shape: 5 ps smooths, knots=7,
     // double penalty on each (rho_dim = 10).
