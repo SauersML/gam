@@ -267,6 +267,9 @@ impl ResponseManifold {
             Self::Poincare { dim, curvature } => {
                 format!("poincare(dim={dim},curvature={curvature})")
             }
+            Self::ConstantCurvature { dim, kappa } => {
+                format!("constant_curvature(dim={dim},kappa={kappa})")
+            }
         }
     }
 
@@ -276,7 +279,7 @@ impl ResponseManifold {
         match self {
             Self::Spd { n } => n * n,
             Self::Grassmann { k, n } | Self::Stiefel { k, n } => n * k,
-            Self::Poincare { dim, .. } => *dim,
+            Self::Poincare { dim, .. } | Self::ConstantCurvature { dim, .. } => *dim,
         }
     }
 
@@ -290,6 +293,9 @@ impl ResponseManifold {
                 .ok()
                 .map(|m| Box::new(m) as _),
             Self::Stiefel { k, n } => StiefelManifold::new(*k, *n).ok().map(|m| Box::new(m) as _),
+            Self::ConstantCurvature { dim, kappa } => {
+                Some(Box::new(ConstantCurvature::new(*dim, *kappa)))
+            }
             Self::Poincare { .. } => None,
         }
     }
