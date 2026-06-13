@@ -4599,7 +4599,9 @@ pub fn residual_cascade_fast_path(
     // The Duchon spectral power `p + s` and the Matérn order set the requested
     // Sobolev smoothness; both clamp into the Wendland native window.
     let (feature_cols, requested_s) = match &term.basis {
-        crate::smooth::SmoothBasisSpec::Duchon { feature_cols, spec } => {
+        crate::smooth::SmoothBasisSpec::Duchon {
+            feature_cols, spec, ..
+        } => {
             // Pure-Duchon native order is `p + s` (kernel exponent 2(p+s)−d);
             // the multilevel frame targets the same continuum smoothness. `p`
             // is the polynomial nullspace degree, `s` the spectral power.
@@ -4610,7 +4612,9 @@ pub fn residual_cascade_fast_path(
             };
             (feature_cols, spec.power + p)
         }
-        crate::smooth::SmoothBasisSpec::Matern { feature_cols, spec } => {
+        crate::smooth::SmoothBasisSpec::Matern {
+            feature_cols, spec, ..
+        } => {
             // Matérn smoothness ν sets native Sobolev order ν + d/2; the cascade
             // frame represents up to (d+3)/2, so the clamp below applies the
             // ceiling. (d is known just below from feature_cols.)
