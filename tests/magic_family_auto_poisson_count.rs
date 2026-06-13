@@ -163,7 +163,7 @@ fn resolve_family_auto_binary_stays_binomial() {
     assert_eq!(
         resolved.response,
         ResponseFamily::Binomial,
-        "strictly {0,1} data must stay Binomial, not be captured by the count rule"
+        "strictly {{0,1}} data must stay Binomial, not be captured by the count rule"
     );
     assert_eq!(
         resolved.link,
