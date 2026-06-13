@@ -140,13 +140,21 @@ const MULTINOMIAL_FORMULA_PENALTY_SCALE: f64 = 0.5;
 /// Largest smoothing-parameter dimension where exact dense outer curvature is
 /// still worth paying for multinomial formula fits.
 ///
-/// `D = (K - 1) * n_terms`. Medium-size loaded models (`D <= 6`) use exact
-/// curvature so the optimizer does not wander into over-smoothed lambda caps
-/// on near-boundary softmax surfaces. Smooth-by-factor models with one global
-/// plus one per-level smooth already reach `D = 8` for `K = 3`, where the
-/// O(D^2) dense outer Hessian dominates runtime; those stay on the
-/// exact-gradient quasi-Newton route.
-const MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM: usize = 6;
+/// `D = (K - 1) * n_penalties`. Medium-size loaded models use exact curvature
+/// so the optimizer does not wander into over-smoothed lambda caps on
+/// near-boundary softmax surfaces. The threshold was originally calibrated at
+/// `D <= 6` when each `s()` term carried ONE penalty; the double-penalty
+/// migration (wiggliness + null-space shrinkage per term, mgcv `select=TRUE`
+/// semantics) doubled `D` for the SAME models, silently flipping the
+/// reference formula fits (2 smooths, K = 3: old `D = 4`, now `D = 8`) onto
+/// the gradient-only route — where the #715 quality arm showed every
+/// wiggliness ρ driven onto the ±10 box bound (smooths collapsed toward their
+/// polynomial null space, truth-RMSE behind VGAM). `12 = 2 × 6` preserves the
+/// original classification boundary under the doubled penalty count:
+/// smooth-by-factor models (one global plus one per-level smooth, old
+/// `D = 8`, now `D = 16` for `K = 3`) stay on the exact-gradient quasi-Newton
+/// route where the O(D^2) dense outer Hessian dominates runtime.
+const MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM: usize = 12;
 
 fn multinomial_formula_use_outer_hessian(total_rho_dim: usize) -> bool {
     total_rho_dim <= MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM
@@ -1165,17 +1173,27 @@ mod fisher_override_tests {
 
     #[test]
     fn formula_outer_route_uses_exact_curvature_for_medium_d() {
+        // The 2-smooth reference formula fit (K = 3, double-penalty terms) is
+        // D = (K-1) * 2 terms * 2 penalties = 8 and needs exact curvature to
+        // avoid over-smoothed lambda caps (#715 arm (a)).
         assert!(
-            multinomial_formula_use_outer_hessian(6),
-            "D=6 loaded multinomial fits need exact curvature to avoid over-smoothed lambda caps"
+            multinomial_formula_use_outer_hessian(8),
+            "D=8 loaded multinomial fits need exact curvature to avoid over-smoothed lambda caps"
+        );
+        assert!(
+            multinomial_formula_use_outer_hessian(12),
+            "D=12 (3 double-penalty smooth terms, K=3) stays on exact curvature"
         );
     }
 
     #[test]
-    fn formula_outer_route_uses_first_order_for_smooth_by_factor_d8() {
+    fn formula_outer_route_uses_first_order_for_smooth_by_factor_d16() {
+        // Smooth-by-factor (one global + one per-level smooth, K = 3) is
+        // D = 16 under double-penalty terms and must avoid the O(D^2) dense
+        // outer Hessian.
         assert!(
-            !multinomial_formula_use_outer_hessian(8),
-            "D=8 smooth-by-factor multinomial fits must avoid the O(D^2) dense outer Hessian"
+            !multinomial_formula_use_outer_hessian(16),
+            "D=16 smooth-by-factor multinomial fits must avoid the O(D^2) dense outer Hessian"
         );
     }
 
