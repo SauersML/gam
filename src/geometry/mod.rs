@@ -1,6 +1,7 @@
 pub mod circle;
 pub mod closure_family;
 pub mod constant_curvature;
+pub mod curvature_estimand;
 pub mod euclidean;
 pub mod grassmann;
 pub mod integrator;
@@ -23,6 +24,10 @@ pub use closure_family::{
 };
 pub use constant_curvature::{
     ConstantCurvature, distance_kappa_jet, exp_map_kappa_jet, log_map_kappa_jet,
+};
+pub use curvature_estimand::{
+    CurvatureVerdict, DesignCoordKappaJet, FlatnessTest, KappaProfileCi,
+    design_coord_kappa_derivative, flatness_lr_test, profile_ci_walk, wald_half_width,
 };
 pub use euclidean::EuclideanManifold;
 pub use grassmann::GrassmannManifold;
