@@ -110,25 +110,48 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          # Posit Public Package Manager serves Linux binaries -> fast installs.
+          # Posit Public Package Manager serves per-distro Linux BINARIES -> fast
+          # installs, but ONLY when the codename in the URL matches the runner's
+          # actual OS *and* its R minor. `ubuntu-latest` migrated jammy (22.04)
+          # -> noble (24.04): a hardcoded `/jammy/` path serves binaries built
+          # against jammy's R while the runner now ships noble's newer R, so every
+          # binary mismatches and install silently falls back to a source build
+          # that the old `try(silent=TRUE)` swallowed -> the "no package called
+          # 'tram'/'scoringrules'" + "dependency 'gsl' is not available" REF_ERRORs
+          # (#1071). Derive the codename from the live runner so the binary
+          # snapshot always matches the R that loads the packages.
+          . /etc/os-release
+          CODENAME="${VERSION_CODENAME:-noble}"
+          POSIT="https://packagemanager.posit.co/cran/__linux__/${CODENAME}/latest"
+          echo "Posit binary repo: $POSIT"
+          export POSIT CODENAME
           Rscript -e '
-            options(repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/jammy/latest"))
+            posit <- Sys.getenv("POSIT")
+            # Canonical source-capable CRAN as a SECOND repo so any package the
+            # distro binary snapshot lacks resolves from source instead of failing
+            # as "not available for this version of R".
+            options(repos = c(POSIT = posit, CRAN = "https://cloud.r-project.org"))
             pkgs <- c("mgcv","survival","gamlss","gamlss.dist","gamlss.cens",
                       "flexsurv","rstpm2","VGAM","nnet","MASS","ordinal","betareg",
                       "scam","splines2","cmprsk","lme4","nlme","fields","gss","GpGp",
-                      "quantreg","mlt","tram","basefun","loo","jsonlite",
+                      "gsl","quantreg","mlt","tram","basefun","loo","jsonlite",
                       "spheresmooth","Directional","nprotreg","compositions",
                       "robCompositions","scoringrules","gamboostLSS","mboost","bamlss",
                       "gamlss.add")
             for (p in pkgs) if (!requireNamespace(p, quietly=TRUE))
               try(install.packages(p), silent=TRUE)
-            # `scoringrules` is a pure-R CRAN package that is absent from the Posit
-            # jammy BINARY snapshot (the "there is no package called scoringrules"
-            # REF_ERROR in the issue). Retry it from SOURCE off canonical CRAN,
-            # where it is always available, so its CRPS reference test can run.
-            if (!requireNamespace("scoringrules", quietly=TRUE))
-              try(install.packages("scoringrules", type = "source",
-                                   repos = "https://cloud.r-project.org"), silent=TRUE)
+            # SECOND pass: anything still missing (a binary that mismatched the
+            # runner R, or a snapshot gap such as scoringrules / tram / gsl) is
+            # force-built from SOURCE off canonical CRAN, where every CRAN package
+            # is always available for the current R. This is the durable cure for
+            # the REF_ERRORs rather than papering over a distro/R-version skew.
+            missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly=TRUE)]
+            if (length(missing)) {
+              cat("retrying from SOURCE:", paste(missing, collapse=", "), "\n")
+              for (p in missing)
+                try(install.packages(p, type = "source",
+                                     repos = "https://cloud.r-project.org"), silent=TRUE)
+            }
             cat("installed R packages:\n")
             for (p in pkgs) cat(sprintf("  %-14s %s\n", p, requireNamespace(p, quietly=TRUE)))
           '
@@ -139,30 +162,39 @@ jobs:
           # available" + a dyn.load failure) and `fmesher`, so install those
           # first (gsl/graphviz system libs come from the apt step above).
           Rscript -e '
-            options(repos = c(getOption("repos"),
-                              CRAN = "https://packagemanager.posit.co/cran/__linux__/jammy/latest"))
+            options(repos = c(POSIT = Sys.getenv("POSIT"),
+                              CRAN = "https://cloud.r-project.org"))
             if (!requireNamespace("BiocManager", quietly=TRUE)) try(install.packages("BiocManager"), silent=TRUE)
             for (p in c("graph","Rgraphviz"))
               if (!requireNamespace(p, quietly=TRUE)) try(BiocManager::install(p, update=FALSE, ask=FALSE), silent=TRUE)
             for (p in c("fmesher","sp","foreach"))
               if (!requireNamespace(p, quietly=TRUE)) try(install.packages(p), silent=TRUE)
           '
+          # INLA's bundled native binary must match the runner OS. Map the live
+          # Ubuntu codename to the INLA "os" tag rather than hardcoding 22.04,
+          # which is wrong now that ubuntu-latest is noble (24.04).
+          case "$CODENAME" in
+            noble)  INLA_OS="Ubuntu-24.04" ;;
+            jammy)  INLA_OS="Ubuntu-22.04" ;;
+            focal)  INLA_OS="Ubuntu-20.04" ;;
+            *)      INLA_OS="Ubuntu-22.04" ;;
+          esac
+          export INLA_OS
           Rscript -e '
-            options(repos = c(getOption("repos"),
+            options(repos = c(POSIT = Sys.getenv("POSIT"),
                               INLA = "https://inla.r-inla-download.org/R/stable",
-                              CRAN = "https://packagemanager.posit.co/cran/__linux__/jammy/latest"))
+                              CRAN = "https://cloud.r-project.org"))
             if (!requireNamespace("INLA", quietly=TRUE))
               try(install.packages("INLA", dependencies=TRUE), silent=TRUE)
             # The R package installs fine; the failure mode in the issue is that
             # its BUNDLED native binaries (the `inla`/`fmesher` programs the R
             # layer shells/dyn.loads) do not match this runner, so the namespace
             # load aborts. INLA ships per-OS native builds; fetch the one matching
-            # this host non-interactively so the binary actually runs. Pin to the
-            # Ubuntu build that matches the jammy package snapshot we install from.
+            # this host non-interactively so the binary actually runs.
             if (requireNamespace("INLA", quietly=TRUE)) {
               try({
                 suppressMessages(library(INLA))
-                INLA::inla.binary.install(os = "Ubuntu-22.04")
+                INLA::inla.binary.install(os = Sys.getenv("INLA_OS"))
               }, silent = TRUE)
             }
             cat(sprintf("  %-14s %s\n", "INLA", requireNamespace("INLA", quietly=TRUE)))
