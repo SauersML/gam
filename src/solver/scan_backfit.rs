@@ -521,6 +521,52 @@ mod tests {
         log_lambdas: &[f64],
         orders: &[usize],
     ) -> (f64, Vec<Vec<f64>>) {
+        let asm = assemble_reduced(xs, y, w, log_lambdas, orders);
+        let mut h_red = asm.h_red;
+        let mut b_red = asm.b_red;
+        let gamma = solve_dense(&mut h_red, &mut b_red);
+        let zvec: Vec<f64> = (0..asm.dim)
+            .map(|r| (0..asm.red).map(|c| asm.z[r][c] * gamma[c]).sum())
+            .collect();
+        let n = y.len();
+        let k = xs.len();
+        let comps: Vec<Vec<f64>> = (0..k)
+            .map(|j| {
+                (0..n)
+                    .map(|i| zvec[asm.offs[j] + orders[j] * asm.maps[j][i]])
+                    .collect()
+            })
+            .collect();
+        (zvec[0], comps)
+    }
+
+    /// The constraint-reduced joint Gaussian system shared by [`dense_joint_truth`]
+    /// (which solves it) and [`joint_logdet_reduced`] (which takes its
+    /// log-determinant): one assembly, one source of truth, so the REML logdet
+    /// and the posterior mean cannot drift apart.
+    struct ReducedSystem {
+        /// Reduced Hessian `Zᵀ(penalty_precision + WᵀW)Z`, `red × red`, SPD.
+        h_red: Vec<Vec<f64>>,
+        /// Reduced RHS `Zᵀ WᵀY`, length `red`.
+        b_red: Vec<f64>,
+        /// Null-space basis `Z` (blockdiag intercept + per-term Householder),
+        /// `dim × red`.
+        z: Vec<Vec<f64>>,
+        /// Per-term state-block offsets into the full `dim` layout.
+        offs: Vec<usize>,
+        /// Per-term row→pooled-knot maps.
+        maps: Vec<Vec<usize>>,
+        dim: usize,
+        red: usize,
+    }
+
+    fn assemble_reduced(
+        xs: &[&[f64]],
+        y: &[f64],
+        w: &[f64],
+        log_lambdas: &[f64],
+        orders: &[usize],
+    ) -> ReducedSystem {
         let n = y.len();
         let k = xs.len();
         // Pooled knots + row maps (must mirror row_knot_map / pool_nodes).
@@ -681,18 +727,15 @@ mod tests {
             }
             b_red[r] = (0..dim).map(|t| z[t][r] * rhs[t]).sum();
         }
-        let gamma = solve_dense(&mut h_red, &mut b_red);
-        let zvec: Vec<f64> = (0..dim)
-            .map(|r| (0..red).map(|c| z[r][c] * gamma[c]).sum())
-            .collect();
-        let comps: Vec<Vec<f64>> = (0..k)
-            .map(|j| {
-                (0..n)
-                    .map(|i| zvec[offs[j] + orders[j] * maps[j][i]])
-                    .collect()
-            })
-            .collect();
-        (zvec[0], comps)
+        ReducedSystem {
+            h_red,
+            b_red,
+            z,
+            offs,
+            maps,
+            dim,
+            red,
+        }
     }
 
     /// Gauss-Jordan solve with partial pivoting (test-only dense helper).
@@ -973,7 +1016,14 @@ mod tests {
         log_lambdas: &[f64],
         orders: &[usize],
     ) -> f64 {
-        unimplemented!()
+        // The reduced Hessian is independent of the responses (it is
+        // `Zᵀ(penalty_precision + WᵀW)Z`), so a zero response vector assembles
+        // exactly the matrix `dense_joint_truth` factorizes. One source of
+        // truth via `assemble_reduced`, then its Cholesky log-determinant.
+        let n = xs.first().map_or(0, |x| x.len());
+        let y0 = vec![0.0_f64; n];
+        let mut h_red = assemble_reduced(xs, &y0, w, log_lambdas, orders).h_red;
+        cholesky_logdet(&mut h_red)
     }
 
     /// Truth-recovery e2e on a larger fixture: three terms (cubic, cubic,
