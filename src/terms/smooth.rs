@@ -633,12 +633,33 @@ impl SmoothBasisSpec {
     }
 }
 
-/// Lower bound on the number of basis columns produced by a 1D B-spline
-/// configuration. Used as the per-smooth row floor in
+/// Lower bound on the number of sample rows a 1D B-spline smooth needs for a
+/// well-posed *penalized* REML fit. Used as the per-smooth row floor in
 /// [`SmoothBasisSpec::min_sample_rows`].
+///
+/// For a *singly*-penalized smooth the floor is the full column count: the
+/// wiggliness penalty leaves the order-`m` polynomial trend unpenalized, and
+/// gam's original gate conservatively required enough rows for the whole basis.
+/// That conservative floor is kept here unchanged.
+///
+/// A *double*-penalized smooth (mgcv `select=TRUE`) is different: it adds a
+/// second penalty on the wiggliness penalty's null space, so even the
+/// polynomial trend is shrinkable toward zero and *nothing* in the basis
+/// requires unpenalized identification by the data — exactly the reasoning the
+/// `TensorBSpline` arm of [`SmoothBasisSpec::min_sample_rows`] already applies
+/// to a penalized tensor. Its honest floor is therefore a small stabilization
+/// constant, not the column count. This is what lets mgcv (and now gam) fit
+/// several `select=TRUE` smooths on a dataset whose row count is below the
+/// summed basis width (e.g. the n≈30 `wine_gamair` fold, 5 `ps` smooths,
+/// p≈51): the penalties, not the data, set the effective rank. The bounded
+/// outer REML loop still terminates, and the genuine n-vs-rank decision is
+/// owned downstream by the inner pivoted factorization. Without this, gam
+/// rejected the fit outright (or, before the gate existed, the outer REML loop
+/// wandered the flat overparameterized surface until the benchmark wall budget
+/// killed it — #1089).
 fn bspline_basis_min_rows(spec: &crate::terms::basis::BSplineBasisSpec) -> usize {
     use crate::terms::basis::BSplineKnotSpec;
-    let from_knots = match &spec.knotspec {
+    let columns = match &spec.knotspec {
         BSplineKnotSpec::Generate {
             num_internal_knots, ..
         } => *num_internal_knots + spec.degree + 1,
@@ -658,7 +679,16 @@ fn bspline_basis_min_rows(spec: &crate::terms::basis::BSplineBasisSpec) -> usize
         BSplineKnotSpec::Provided(knots) => knots.len().saturating_sub(spec.degree + 1).max(1),
         BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis,
     };
-    from_knots.max(spec.degree + 2)
+    let columns = columns.max(spec.degree + 2);
+
+    if spec.double_penalty {
+        // Fully shrinkable basis: only a small stabilization floor must be
+        // identified by the data, capped by the actual column count.
+        const DOUBLE_PENALTY_FLOOR: usize = 2;
+        DOUBLE_PENALTY_FLOOR.min(columns).max(1)
+    } else {
+        columns
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
