@@ -1286,7 +1286,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      decoder_incoherence_weight: float = 1.0,
                      top_k: int | None = None, t_init: Any = None, a_init: Any = None,
                      tau: float | None = None, jumprelu_threshold: float = 0.0,
-                     atom_basis: Any = None, fisher_factors: Any = None) -> ManifoldSAE:
+                     atom_basis: Any = None, fisher_factors: Any = None,
+                     weights: Any = None) -> ManifoldSAE:
     """Fit an SAE-manifold model.
 
     Parameters
@@ -1409,6 +1410,15 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         result's ``metric_provenance`` reports ``"OutputFisher"`` and the per-row
         ``fisher_mass_residual`` truncation diagnostic rides into the model.
         ``None`` (default) keeps the bit-identical Euclidean path.
+    weights
+        Optional per-row design-honesty reconstruction weights (#977): a
+        length-``N`` array of strictly positive ``√w`` multipliers, one per
+        observation. When supplied, each per-row reconstruction loss is scaled
+        by its weight in the inner joint fit and the outer ρ (smoothness /
+        sparsity / ARD) selection — the seam for honest fitting on a designed
+        corpus subsample or an importance-weighted training set. The vector is
+        self-normalized to mean 1 inside the core; a uniform or absent vector
+        is the bit-identical unweighted path (magic by default — no flag).
 
     Returns
     -------
@@ -1480,6 +1490,30 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # coerce here against the (n, p) response; ship the (n, p, r) U and the
     # optional (n,) mass_residual through the FFI. Absent ⇒ Euclidean path.
     fisher_shard = _normalize_fisher_factors(fisher_factors, n_obs, int(x.shape[1]))
+    # Per-row design-honesty reconstruction weights (#977). When supplied, the
+    # length-`n_obs` √w vector reweights every per-row reconstruction loss in
+    # the inner joint fit and the outer ρ selection (installed Rust-side via
+    # `SaeManifoldTerm::set_row_loss_weights`). Validate against the response
+    # row count here; a uniform / absent vector self-normalizes to the exact
+    # unweighted path. No flag — its presence is the switch (magic by default).
+    row_loss_weights_arr: np.ndarray | None
+    if weights is None:
+        row_loss_weights_arr = None
+    else:
+        row_loss_weights_arr = np.ascontiguousarray(
+            np.asarray(weights, dtype=float).reshape(-1)
+        )
+        if row_loss_weights_arr.shape[0] != n_obs:
+            raise ValueError(
+                "sae_manifold_fit: weights must have one entry per observation; "
+                f"got {row_loss_weights_arr.shape[0]} for n={n_obs}"
+            )
+        if not np.all(np.isfinite(row_loss_weights_arr)) or np.any(
+            row_loss_weights_arr <= 0.0
+        ):
+            raise ValueError(
+                "sae_manifold_fit: weights must be finite and strictly positive"
+            )
     dims = _dims(k_atoms, d_atom)
     # Eager d_atom validation (issue #184). A zero-dimensional atom carries
     # no manifold coordinate, contributes nothing to reconstruction, and
@@ -1697,6 +1731,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         fisher_factors=None if fisher_shard is None else fisher_shard[0],
         fisher_mass_residual=None if fisher_shard is None else fisher_shard[1],
         fisher_provenance=None if fisher_shard is None else fisher_shard[2],
+        row_loss_weights=row_loss_weights_arr,
     )
     payload_dict = dict(payload)
     model = ManifoldSAE.from_payload(
