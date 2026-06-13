@@ -978,23 +978,36 @@ fn cascade_state_rejects_corruption() {
 
     let mut bad = good.clone();
     bad.coeff.pop();
-    ResidualCascadeFit::from_state(&bad).expect_err("coeff length mismatch must error");
+    assert!(
+        ResidualCascadeFit::from_state(&bad).is_err(),
+        "coeff length mismatch must error"
+    );
 
     let mut bad = good.clone();
     bad.sigma2 = -1.0;
-    ResidualCascadeFit::from_state(&bad).expect_err("non-positive sigma2 must error");
+    assert!(
+        ResidualCascadeFit::from_state(&bad).is_err(),
+        "non-positive sigma2 must error"
+    );
 
     let mut bad = good.clone();
     bad.predict_chol.pop();
-    ResidualCascadeFit::from_state(&bad).expect_err("predict_chol size mismatch must error");
+    assert!(
+        ResidualCascadeFit::from_state(&bad).is_err(),
+        "predict_chol size mismatch must error"
+    );
 
     let mut bad = good.clone();
     bad.sobolev_s = 10.0;
-    ResidualCascadeFit::from_state(&bad).expect_err("out-of-window sobolev_s must error");
+    assert!(
+        ResidualCascadeFit::from_state(&bad).is_err(),
+        "out-of-window sobolev_s must error"
+    );
 
     let mut bad = good;
-    let m = bad.m as usize;
     bad.predict_chol[0] = 0.0;
-    let _ = m;
-    ResidualCascadeFit::from_state(&bad).expect_err("zero Cholesky pivot must error");
+    assert!(
+        ResidualCascadeFit::from_state(&bad).is_err(),
+        "zero Cholesky pivot must error"
+    );
 }
