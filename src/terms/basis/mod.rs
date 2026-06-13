@@ -13256,17 +13256,31 @@ fn bessel_k_integer_order(n: usize, z: f64) -> f64 {
 
 #[inline(always)]
 fn bessel_k_half_integer_order(l: usize, z: f64) -> f64 {
-    // K_{l+1/2}(z) = sqrt(pi/(2z)) exp(-z) * sum_{j=0}^l c_j (1/(2z))^j
-    // where c_j = (l+j)! / (j! (l-j)!).
+    // Exact closed-form seeds and the stable upward recurrence
+    //   K_{1/2}(z) = sqrt(π/(2z))·e^{−z},
+    //   K_{3/2}(z) = K_{1/2}(z)·(1 + 1/z),
+    //   K_{ν+1}(z) = K_{ν−1}(z) + (2ν/z)·K_ν(z)   (ν = 1/2 + m, m ≥ 1).
+    // Equivalent to the closed-form polynomial sum, but uses EXACT integer
+    // coefficients via the recurrence instead of approximate Lanczos-gamma
+    // values for `c_j = (l+j)!/(j!(l−j)!)`. The Lanczos approximation is
+    // accurate to ~1 ULP at integer arguments; that error gets amplified
+    // through catastrophic cancellation in derivative lattices of the
+    // r^μ·K_μ(κr) family. Matching the [`BesselKLadder`] arithmetic byte-
+    // for-byte also ensures the ladder/per-call paths agree exactly.
     let zz = z.max(1e-300);
-    let inv2z = 0.5 / zz;
-    let mut sum = 0.0_f64;
-    for j in 0..=l {
-        let coeff = gamma_lanczos((l + j + 1) as f64)
-            / (gamma_lanczos((j + 1) as f64) * gamma_lanczos((l - j + 1) as f64));
-        sum += coeff * inv2z.powi(j as i32);
+    let k_half = (std::f64::consts::PI / (2.0 * zz)).sqrt() * (-zz).exp();
+    if l == 0 {
+        return k_half;
     }
-    (std::f64::consts::PI / (2.0 * zz)).sqrt() * (-zz).exp() * sum
+    let mut km1 = k_half;
+    let mut k = k_half * (1.0 + 1.0 / zz);
+    for m in 1..l {
+        let nu = m as f64 + 0.5;
+        let kp1 = km1 + 2.0 * nu * k / zz;
+        km1 = k;
+        k = kp1;
+    }
+    k
 }
 
 #[inline(always)]
