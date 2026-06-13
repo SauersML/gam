@@ -52,7 +52,7 @@ use crate::py_value_error;
 /// that `alternative_prefit_loglik` is the (K+1)-atom dictionary fit on shards
 /// **before** this one, evaluated on this shard, and `null_sup_loglik` is the
 /// honest K-atom null refit on this shard.
-#[pyclass(name = "AtomBirthGate", module = "gam._rust")]
+#[pyclass(name = "AtomBirthGate", module = "gam_pyffi._rust")]
 pub(crate) struct PyAtomBirthGate {
     gate: AtomBirthGate,
 }
@@ -280,6 +280,61 @@ pub(crate) fn lawley_bartlett_factor<'py>(
         out.set_item("p_value_uncorrected", (1.0 - dist.cdf(stat)).clamp(0.0, 1.0))?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    #[test]
+    fn split_lr_log_e_is_the_likelihood_difference() {
+        // log E = ℓ_alt − sup ℓ_null; a calibrated null (alt = null sup) is 0.
+        assert!((split_likelihood_log_e(-10.0, -10.0)).abs() < 1e-15);
+        assert!((split_likelihood_log_e(-8.0, -10.0) - 2.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn e_bh_confirms_strong_evidence_and_drops_weak() {
+        // One overwhelming claim (log e huge) clears the e-BH threshold; a
+        // cluster of near-1 e-values (log e ≈ 0) does not.
+        let logs = vec![20.0_f64.ln() * 5.0, 0.01, -0.2, 0.0];
+        let confirmed = e_bh_dictionary_certificate(logs, 0.05);
+        assert_eq!(confirmed, vec![0]);
+    }
+
+    #[test]
+    fn gate_certifies_only_after_evidence_crosses_one_over_alpha() {
+        // alpha = 0.05 ⟹ threshold log(1/alpha) ≈ 2.996. Two shards each with
+        // log e = 2.0 compound to 4.0 > 2.996 ⟹ certified.
+        let mut gate = PyAtomBirthGate::new(0.05).expect("gate");
+        assert!(!gate.certified());
+        gate.absorb_shard(-8.0, -10.0); // log e = 2.0
+        assert!(!gate.certified());
+        gate.absorb_shard(-8.0, -10.0); // cumulative 4.0
+        assert!(gate.certified());
+        assert!((gate.log_e_value() - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn lawley_factor_recovers_exponential_one_over_six_n() {
+        // Exponential (Gamma-log, φ=1), intercept-only, tested = the intercept:
+        // the null model has no parameters so ε_0 = 0 and the factor is
+        // c = 1 + ε_n/1 = 1 + 1/(6n) (the module's certified fixture).
+        for &n in &[8usize, 32] {
+            let eta = 0.4;
+            let kappas =
+                vec![RowExpectedJets::gamma_log(eta, 1.0).kappas().expect("kappas"); n];
+            let x = Array2::<f64>::ones((n, 1));
+            let factor = lawley_lr_bartlett_factor(x.view(), &kappas, None, 0..1, 1.0)
+                .expect("factor");
+            let expected = 1.0 + 1.0 / (6.0 * n as f64);
+            assert!(
+                (factor - expected).abs() < 1e-10,
+                "n={n}: factor={factor} vs 1+1/(6n)={expected}"
+            );
+        }
+    }
 }
 
 /// Register the inference-instrument `#[pyfunction]`s and classes on the
