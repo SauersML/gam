@@ -179,19 +179,21 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
     .expect("curvature inference")
 }
 
-/// DIAGNOSTIC (#1059 follow-up): print the profiled criterion V_p(κ) and its
-/// deviance / penalty decomposition on a κ grid for each planted truth. The fix
-/// is correct iff argmin_κ V_p(κ) tracks the planted κ⋆ sign — i.e. V_p has an
-/// interior minimum near κ⋆, not a monotone slope to the +bound.
+/// The profiled criterion V_p(κ) must IDENTIFY the planted curvature: on a κ
+/// grid spanning the chart, argmin_κ V_p(κ) tracks the sign of the planted κ⋆.
+/// Before the #1059 curvature-identification fix the criterion was monotone in
+/// κ (railed to the +bound for every truth); this is the term-level regression
+/// gate for that fix. Prints the full V_p / deviance / penalty grid for
+/// diagnosis on failure.
 #[test]
-#[ignore = "diagnostic: prints V_p(κ) grid, not an assertion gate"]
-fn diag_vp_grid_vs_planted_kappa() {
+fn vp_grid_identifies_planted_kappa_sign() {
     use gam::smooth::SmoothBasisSpec;
     let options = FitOptions::default();
     let fixed_kappa = SpatialLengthScaleOptimizationOptions {
         enabled: false,
         ..SpatialLengthScaleOptimizationOptions::default()
     };
+    let grid = [-1.9_f64, -1.0, -0.5, 0.0, 0.5, 1.0, 1.9];
     for (label, kappa_star) in [("hyperbolic", -2.0), ("flat", 0.0), ("spherical", 2.0)] {
         let (feats, y) = dataset_on_m_kappa(600, kappa_star, 0.5, 0.05, 0xD1A6_0001);
         let n = y.len();
@@ -205,14 +207,15 @@ fn diag_vp_grid_vs_planted_kappa() {
         let weights = Array1::<f64>::ones(n);
         let offset = Array1::<f64>::zeros(n);
         eprintln!("=== {label} (κ⋆={kappa_star}) ===");
-        for kk in [-1.9, -1.0, -0.5, 0.0, 0.5, 1.0, 1.9] {
+        let mut best = (f64::INFINITY, f64::NAN);
+        for &kk in &grid {
             let mut spec = base_spec.clone();
             if let Some(SmoothBasisSpec::ConstantCurvature { spec: cc, .. }) =
                 spec.smooth_terms.get_mut(0).map(|t| &mut t.basis)
             {
                 cc.kappa = kk;
             }
-            match fit_term_collectionwith_spatial_length_scale_optimization(
+            let fit = fit_term_collectionwith_spatial_length_scale_optimization(
                 frame.view(),
                 y.clone(),
                 weights.clone(),
@@ -221,13 +224,35 @@ fn diag_vp_grid_vs_planted_kappa() {
                 LikelihoodSpec::gaussian_identity(),
                 &options,
                 &fixed_kappa,
-            ) {
-                Ok(fit) => eprintln!(
-                    "  κ={kk:+.2}  V_p={:.5}  dev={:.5}  pen={:.5}",
-                    fit.fit.reml_score, fit.fit.deviance, fit.fit.stable_penalty_term
-                ),
-                Err(e) => eprintln!("  κ={kk:+.2}  fit FAILED: {e}"),
+            )
+            .expect("fixed-κ fit");
+            eprintln!(
+                "  κ={kk:+.2}  V_p={:.5}  dev={:.5}  pen={:.5}",
+                fit.fit.reml_score, fit.fit.deviance, fit.fit.stable_penalty_term
+            );
+            if fit.fit.reml_score < best.0 {
+                best = (fit.fit.reml_score, kk);
             }
+        }
+        let argmin = best.1;
+        eprintln!("  argmin_κ V_p = {argmin:+.2}");
+        // Identification: the criterion's minimiser must have the same sign as
+        // the planted curvature (flat ⇒ near 0), NOT rail to the chart bound.
+        if kappa_star > 0.0 {
+            assert!(
+                argmin > 0.0,
+                "{label}: V_p must be minimised at κ>0 for spherical truth, got argmin={argmin}"
+            );
+        } else if kappa_star < 0.0 {
+            assert!(
+                argmin < 0.0,
+                "{label}: V_p must be minimised at κ<0 for hyperbolic truth, got argmin={argmin}"
+            );
+        } else {
+            assert!(
+                argmin.abs() <= 1.0,
+                "{label}: V_p for flat truth must be minimised near κ=0, got argmin={argmin}"
+            );
         }
     }
 }
