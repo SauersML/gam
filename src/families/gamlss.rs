@@ -1329,6 +1329,85 @@ fn identity_penalty(dim: usize) -> Array2<f64> {
     penalty
 }
 
+/// Orthogonal projector `P₀ = U₀U₀ᵀ` onto the joint null space of the supplied
+/// penalty blocks over a `dim`-column coefficient space.
+///
+/// Used as the log-σ *shrinkage* penalty for the Gaussian location-scale scale
+/// block. The smooth's own wiggliness penalty already governs its range space
+/// (the curvature directions REML trades off against fit); its null space —
+/// the constant + low-order polynomial log-σ trend that carries the dominant
+/// heteroscedastic signal — is left unpenalized and is only weakly identified
+/// in the coupled (μ, log σ) likelihood, which lets the inner Newton wander
+/// (#1073's "flat/ill-conditioned surface"). A *full-space* identity ridge
+/// fixed that instability but DOUBLE-penalized the range space: REML then drove
+/// the shrinkage λ up, crushing the genuine heteroscedastic curve back to a
+/// constant σ (the underfit this issue reports). Penalizing the null space
+/// ALONE keeps the weakly-identified polynomial trend from blowing up without
+/// touching the wiggliness directions the smooth penalty already controls —
+/// exactly mgcv's `select = TRUE` null-space penalty.
+///
+/// When the supplied penalties already span the whole space (null space empty),
+/// the projector is the zero matrix and the shrinkage term is inert; when there
+/// are no penalties at all (e.g. a purely parametric log-σ design), the null
+/// space is everything and this returns the identity — recovering the previous
+/// full-space ridge exactly where it was the right thing to do.
+fn penalty_nullspace_projector(penalties: &[PenaltyMatrix], dim: usize) -> Array2<f64> {
+    use crate::faer_ndarray::FaerEigh;
+    use faer::Side;
+
+    if dim == 0 {
+        return Array2::<f64>::zeros((0, 0));
+    }
+    // Combined penalty S = Σ_k S_k over the dim-column scale space. Each block
+    // penalty is already expressed on this space (the scale design's columns).
+    let mut combined = Array2::<f64>::zeros((dim, dim));
+    for pen in penalties {
+        let dense = pen.to_dense();
+        debug_assert_eq!(
+            dense.nrows(),
+            dim,
+            "scale penalty block dim {} != scale design cols {dim}",
+            dense.nrows()
+        );
+        if dense.nrows() == dim && dense.ncols() == dim {
+            combined += &dense;
+        }
+    }
+    // Symmetrize defensively (eigendecomposition assumes self-adjoint input).
+    let combined_sym = 0.5 * (&combined + &combined.t());
+    let (eigvals, eigvecs) = match combined_sym.eigh(Side::Lower) {
+        Ok(decomp) => decomp,
+        // A failed decomposition (degenerate / non-finite) should not silently
+        // drop the stabilizing shrinkage; fall back to the full-space ridge,
+        // which is the conservative (always-positive-definite) choice.
+        Err(_) => return identity_penalty(dim),
+    };
+    // Null space = eigenvectors whose eigenvalue is ≈ 0 relative to the largest.
+    // The combined wiggliness penalty's range-space eigenvalues are O(1) after
+    // basis normalization, so a relative floor cleanly separates the genuine
+    // null directions (constant / low-order polynomial) from the penalized
+    // curvature directions.
+    let max_eig = eigvals.iter().cloned().fold(0.0_f64, f64::max);
+    let tol = (max_eig * 1e-8).max(1e-12);
+    let mut projector = Array2::<f64>::zeros((dim, dim));
+    for (j, &lambda) in eigvals.iter().enumerate() {
+        if lambda <= tol {
+            let v = eigvecs.column(j);
+            // Accumulate v vᵀ into the projector.
+            for a in 0..dim {
+                let va = v[a];
+                if va == 0.0 {
+                    continue;
+                }
+                for b in 0..dim {
+                    projector[[a, b]] += va * v[b];
+                }
+            }
+        }
+    }
+    projector
+}
+
 fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectionDesign) {
     let p = design.design.ncols();
     design
@@ -1388,10 +1467,18 @@ fn build_gaussian_mean_and_scale_blocks(
         prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?;
     let p_noise = prepared_noise_design.ncols();
     let mut log_sigma_penalty_matrices = noise_design.penalties_as_penalty_matrix();
-    log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
+    // Shrinkage penalty on the scale block's *null space only* (mgcv
+    // `select = TRUE`): it stabilizes the weakly-identified constant/polynomial
+    // log-σ trend without double-penalizing the wiggliness directions the
+    // smooth penalty already governs. A full-space identity here over-shrinks
+    // the genuine heteroscedastic curve back to a constant σ (#1073).
+    let shrinkage = penalty_nullspace_projector(&log_sigma_penalty_matrices, p_noise);
+    let shrinkage_rank = (0..p_noise).filter(|&i| shrinkage[[i, i]] > 0.5).count();
+    log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(shrinkage));
     let mut log_sigma_nullspace_dims = noise_design.nullspace_dims.clone();
-    // Identity penalty penalizes the full log-sigma space -> nullspace 0.
-    log_sigma_nullspace_dims.push(0);
+    // The null-space projector penalizes a rank-`shrinkage_rank` subspace, so
+    // the remaining unpenalized directions number `p_noise − shrinkage_rank`.
+    log_sigma_nullspace_dims.push(p_noise.saturating_sub(shrinkage_rank));
     let mut noisespec = build_location_scale_block(
         "log_sigma",
         prepared_noise_design,
