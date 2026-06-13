@@ -321,6 +321,16 @@ fn transformation_normal_held_out_pit_is_uniform() {
     // (x_test, y_test) pairs. The transform is reconstructed from the fitted
     // coefficients; scipy.stats.norm supplies the exact normal CDF and
     // scipy.stats.kstest the KS distance of the held-out PITs from U(0, 1).
+    //
+    // The finite-support normalizer `Φ(upper) − Φ(lower)` must be evaluated in
+    // LOG space — exactly as gam's production PIT path does via
+    // `log_normal_cdf_diff` (`families/transformation_normal/endpoint_normalizer.rs`).
+    // On held-out covariates the reconstructed `(lower, upper)` endpoints can
+    // land far out in a single normal tail (e.g. both > 8), where the naive
+    // linear-space difference `norm.cdf(upper) − norm.cdf(lower)` underflows to
+    // exactly 0.0, turning `(Fh − Flo) / 0` into a NaN PIT and a NaN KS
+    // statistic. `norm.logcdf` plus a tail-reflected `log1mexp` correction keeps
+    // the mass representable, so the PIT is finite for every held-out row.
     let held = reconstruct_transform(&tn, &test_rows, &y_test);
     let r = run_python(
         &[
@@ -336,12 +346,47 @@ lo = np.asarray(df["lower"], dtype=float)
 hi = np.asarray(df["upper"], dtype=float)
 # Endpoint order is a hard precondition of the finite-support PIT.
 assert np.all(hi > lo), "transformation endpoints out of order"
-Fh = norm.cdf(h)
-Flo = norm.cdf(lo)
-Fhi = norm.cdf(hi)
-denom = Fhi - Flo
-u = np.clip((Fh - Flo) / denom, 1e-12, 1 - 1e-12)
+
+def log1mexp(x):
+    # log(1 - exp(-x)) for x > 0, stable across the whole range (Mächler 2012):
+    # the expm1 form near 0, the log1p form in the tail.
+    x = np.asarray(x, dtype=float)
+    return np.where(x > np.log(2.0), np.log1p(-np.exp(-x)), np.log(-np.expm1(-x)))
+
+def log_normal_cdf_diff(upper, lower):
+    # Stable log[Φ(upper) − Φ(lower)] for upper > lower, mirroring gam's
+    # `log_normal_cdf_diff`: reflect to the lower tail when `lower > 0` so the
+    # dominant `logcdf` term never sits in the saturated upper tail, then apply
+    # the log1mexp correction. Vectorized over the held-out rows.
+    upper = np.asarray(upper, dtype=float)
+    lower = np.asarray(lower, dtype=float)
+    refl = lower > 0.0
+    up = np.where(refl, -lower, upper)
+    lo_ = np.where(refl, -upper, lower)
+    log_up = norm.logcdf(up)
+    log_lo = norm.logcdf(lo_)
+    gap = log_up - log_lo
+    assert np.all(np.isfinite(gap) & (gap > 0.0)), "endpoint mass not representable"
+    return log_up + log1mexp(gap)
+
+# u = exp( log[Φ(h)−Φ(lower)] − log[Φ(upper)−Φ(lower)] ), with h clamped into
+# the finite support (h≤lower → u=0, h≥upper → u=1), exactly as the production
+# `transformation_normal_pit_score` defines the PIT.
+h_in = np.clip(h, lo, hi)
+log_den = log_normal_cdf_diff(hi, lo)
+at_lo = h_in <= lo
+at_hi = h_in >= hi
+interior = ~(at_lo | at_hi)
+u = np.empty_like(h_in)
+u[at_lo] = 0.0
+u[at_hi] = 1.0
+if np.any(interior):
+    log_num = log_normal_cdf_diff(h_in[interior], lo[interior])
+    u[interior] = np.exp(log_num - log_den[interior])
+assert np.all(np.isfinite(u)), "PIT produced non-finite values"
+u = np.clip(u, 1e-12, 1 - 1e-12)
 ks = kstest(u, "uniform")
+assert np.isfinite(ks.statistic), "KS statistic is non-finite"
 emit("ks", [float(ks.statistic)])
 emit("u_min", [float(u.min())])
 emit("u_max", [float(u.max())])
@@ -352,6 +397,16 @@ emit("u_mean", [float(u.mean())])
     let u_mean = r.scalar("u_mean");
     let u_min = r.scalar("u_min");
     let u_max = r.scalar("u_max");
+
+    // The held-out PIT and its KS distance must be FINITE before any uniformity
+    // claim is even meaningful. A NaN here is the concrete computation bug from
+    // issue #1078: the finite-support normalizer underflowed in linear space.
+    // The log-space PIT above must never reproduce it.
+    assert!(
+        ks.is_finite() && u_mean.is_finite() && u_min.is_finite() && u_max.is_finite(),
+        "held-out PIT / KS is non-finite (KS={ks}, u_mean={u_mean}, \
+         u_range=[{u_min},{u_max}]) — finite-support normalizer underflow regressed"
+    );
 
     // ---- (2) monotonicity: h' > 0 at 100 held-out support points ----------
     // Reuse the held-out covariate rows but draw fresh response values uniformly
