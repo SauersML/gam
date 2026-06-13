@@ -12529,6 +12529,74 @@ impl SaeManifoldTerm {
         Ok(last_loss)
     }
 
+    /// Relative β-block ridge floor that bounds the inner Newton step along a
+    /// **rank-deficient decoder direction** (#1051).
+    ///
+    /// A euclidean / Duchon patch fit to a shape that does not excite every
+    /// monomial column (a straight line under the degree-2 patch `[1, t, t²]`)
+    /// leaves a decoder direction with near-zero data curvature `G_k` that the
+    /// smoothing penalty `λ·S_k` also fails to cover at the current ρ. The
+    /// Schur β-pivot there is tiny-but-positive, so the undamped Newton step
+    /// `g/curvature` is enormous; the line search shrinks it to nothing and the
+    /// inner solve burns its whole budget without reducing ‖g‖ (the 122 s line
+    /// fit + `1e12` sentinel). The caller-nominal `ridge_beta = 1e-6` is
+    /// negligible against the `O(1e6)` identified-direction curvature, so it
+    /// does not bound the deficient step.
+    ///
+    /// We floor `ridge_beta` at `√εmach · (max β-block diagonal curvature)` so
+    /// the deficient direction acquires a curvature of order `√εmach` of the
+    /// block scale — large enough to bound its step, while a relative
+    /// `~1.5e-8` perturbation of the well-identified directions (whose curvature
+    /// is many orders larger) leaves them numerically unchanged. The floor is
+    /// the standard Levenberg-Marquardt resolution of an unidentified
+    /// least-squares nullspace: it pins the flat decoder direction at its
+    /// minimum norm without biasing the data-fit.
+    fn rank_deficient_beta_ridge_floor(&self, rho: &SaeManifoldRho, nominal: f64) -> f64 {
+        let p = self.output_dim();
+        if p == 0 || self.beta_dim() == 0 {
+            return nominal;
+        }
+        let mut grams = self.empty_decoder_gram_accumulator();
+        self.accumulate_decoder_gram(&mut grams);
+        let lambda_smooth = rho.lambda_smooth();
+        let mut max_diag = 0.0_f64;
+        let mut min_pos_diag = f64::INFINITY;
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let m = atom.basis_size();
+            if m == 0 || grams[atom_idx].dim() != (m, m) {
+                continue;
+            }
+            let penalty = &atom.smooth_penalty;
+            let penalty_ok = penalty.dim() == (m, m);
+            for i in 0..m {
+                let mut diag = grams[atom_idx][[i, i]];
+                if penalty_ok {
+                    diag += lambda_smooth * penalty[[i, i]];
+                }
+                if diag.is_finite() {
+                    max_diag = max_diag.max(diag);
+                    if diag > 0.0 {
+                        min_pos_diag = min_pos_diag.min(diag);
+                    }
+                }
+            }
+        }
+        if !(max_diag > 0.0) {
+            return nominal;
+        }
+        // Only floor when the β block is genuinely ill-conditioned (a deficient
+        // direction whose curvature is below the relative rank cutoff of the
+        // block scale). A full-rank, well-conditioned decoder keeps the nominal
+        // caller ridge bit-for-bit.
+        let conditioned =
+            min_pos_diag.is_finite() && min_pos_diag >= SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_diag;
+        if conditioned {
+            return nominal;
+        }
+        let floor = f64::EPSILON.sqrt() * max_diag;
+        nominal.max(floor)
+    }
+
     pub fn run_joint_fit_arrow_schur(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -12603,6 +12671,13 @@ impl SaeManifoldTerm {
             self.accumulate_decoder_gram(&mut grams);
             self.finalize_decoder_identifiability_audit(&grams, self.n_obs())?;
         }
+        // #1051 — bound the inner Newton step along a rank-deficient decoder
+        // direction. When the β block is well-conditioned this is exactly the
+        // caller-nominal `ridge_beta` (bit-for-bit); when a monomial column is
+        // unidentified by data AND uncovered by the penalty at this ρ, the
+        // relative √εmach floor pins that flat direction so the solve converges
+        // instead of grinding its iteration budget against an enormous step.
+        let ridge_beta = self.rank_deficient_beta_ridge_floor(rho, ridge_beta);
         for outer_iteration in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ρ (including the ARD precisions) is owned by the outer engine
