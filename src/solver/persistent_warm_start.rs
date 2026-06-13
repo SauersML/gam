@@ -25,7 +25,14 @@ pub(crate) fn cache_schema_tag() -> String {
     // is the intentional consequence of the unification, documented in
     // the commit that performs it. See `src/cache/key.rs` for the new
     // canonical hasher API.
-    "schema3-unified-fingerprinter-v1".to_string()
+    // Bumped to `v2` when the persistent warm-start key stopped hashing the
+    // θ-dependent, lazily-refreshed isometry Jacobian cache slots
+    // (`jacobian_cache` / `jacobian_second_cache` / `third_decoder_derivative`).
+    // Those snapshots made the key non-reproducible across identical repeat
+    // fits, so the outer `skip-outer-validation` warm hit was lost (#1048). The
+    // bump walls off any entries written under the old, drifting keys; they are
+    // simply never matched (and TTL-evicted) rather than aliasing.
+    "schema3-unified-fingerprinter-v2".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
