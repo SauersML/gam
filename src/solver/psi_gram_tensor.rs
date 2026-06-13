@@ -52,6 +52,19 @@ pub const PSI_GRAM_CERT_RTOL: f64 = 1.0e-12;
 /// Relative agreement required at the off-node Gram spot checks.
 pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
 
+/// Relative agreement required of the analytic ψ-DERIVATIVE `dgram_dpsi`
+/// against a high-order finite difference of the exactly rebuilt Gram, used to
+/// certify the interior gradient sub-window. The downstream outer REML gradient
+/// contracts `∂G/∂ψ` through `H⁻¹` and `β̂`, amplifying the absolute derivative
+/// error by `‖∂G/∂ψ‖·‖H⁻¹‖`; this rtol is set deep enough (≈4 orders below the
+/// 1e-7 outer-gradient bar, relative to the Gram-derivative scale) that even
+/// the amplified error stays bit-tight in the gradient lane.
+pub const PSI_GRAM_GRAD_SPOT_RTOL: f64 = 1.0e-11;
+
+/// Number of equispaced scan points (per side) used to locate the interior
+/// gradient sub-window where `dgram_dpsi` certifies.
+pub const PSI_GRAM_GRAD_SCAN_POINTS: usize = 64;
+
 /// Node-count escalation ladder for the expansion build (degree = nodes − 1).
 ///
 /// The top rung sizes to WIDE trial windows: Chebyshev coefficients of the
@@ -71,6 +84,19 @@ pub const PSI_GRAM_SPOT_POINTS: usize = 3;
 pub struct PsiGramTensor {
     psi_lo: f64,
     psi_hi: f64,
+    /// Interior sub-window `[grad_psi_lo, grad_psi_hi] ⊆ [psi_lo, psi_hi]` over
+    /// which the ANALYTIC ψ-derivative `dgram_dpsi` reproduces the exact design
+    /// derivative to [`PSI_GRAM_GRAD_SPOT_RTOL`] (#1033b gradient lane).
+    ///
+    /// The value reconstruction `gram_at` is certified over the FULL window
+    /// (`T_d ≤ 1` everywhere), but the derivative reconstruction amplifies the
+    /// coefficient-tail error by `T_d′ ∼ d²`, which blows up toward the window
+    /// endpoints (the classic Chebyshev endpoint phenomenon). The gradient lane
+    /// therefore only fires on this certified interior sub-window; near-edge
+    /// trials keep the exact per-trial slab gradient. `contains` (value lane)
+    /// still spans the full window.
+    grad_psi_lo: f64,
+    grad_psi_hi: f64,
     /// Number of Chebyshev coefficients (degree + 1).
     n_coeff: usize,
     k: usize,
@@ -158,8 +184,11 @@ impl PsiGramTensor {
                 // (Conflating this with EvalFailed would kill the ladder at
                 // its first — intentionally coarse — rung.)
                 BuildOutcome::TailNotCertified => continue,
-                BuildOutcome::Candidate(candidate) => {
+                BuildOutcome::Candidate(mut candidate) => {
                     if candidate.spot_check(&mut eval_design, weights) {
+                        // Narrow the gradient sub-window to the certified
+                        // interior (the value lane keeps the full window).
+                        candidate.certify_gradient_window(&mut eval_design, weights);
                         return Some(candidate);
                     }
                 }
@@ -266,6 +295,10 @@ impl PsiGramTensor {
         BuildOutcome::Candidate(Self {
             psi_lo,
             psi_hi,
+            // Provisional: `build` narrows these to the certified interior after
+            // the value spot-check passes (`certify_gradient_window`).
+            grad_psi_lo: psi_lo,
+            grad_psi_hi: psi_hi,
             n_coeff: m,
             k,
             gram,
@@ -307,9 +340,111 @@ impl PsiGramTensor {
         true
     }
 
+    /// Locate the largest centered interior interval where the analytic
+    /// derivative `dgram_dpsi` reproduces a central finite difference of the
+    /// exactly rebuilt Gram to [`PSI_GRAM_GRAD_SPOT_RTOL`], and store it as the
+    /// gradient sub-window. Scans inward symmetrically from both endpoints; the
+    /// value lane (`gram_at`) is unaffected. One-time cost: a handful of extra
+    /// exact design evals (each cheap under the radial profile).
+    fn certify_gradient_window(
+        &mut self,
+        eval_design: &mut impl FnMut(f64) -> Result<Array2<f64>, String>,
+        weights: ArrayView1<'_, f64>,
+    ) {
+        let span = self.psi_hi - self.psi_lo;
+        // 4th-order central stencil for the exact-derivative reference
+        //   G'(ψ) ≈ [G(ψ−2h) − 8G(ψ−h) + 8G(ψ+h) − G(ψ+2h)] / (12h)
+        // so the reference truncation is O(h⁴) — far below the tight rtol at a
+        // moderate step, letting the certificate measure the reconstruction
+        // error rather than the reference's own FD error.
+        let h = (span * 1e-3).max(1e-6);
+        let exact_dgram = |psi: f64,
+                           eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
+         -> Option<Array2<f64>> {
+            let weighted_gram = |p: f64,
+                                 eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
+             -> Option<Array2<f64>> {
+                let design = eval(p).ok()?;
+                let mut wd = design.clone();
+                for (mut row, &w) in wd.outer_iter_mut().zip(weights.iter()) {
+                    row.mapv_inplace(|v| v * w);
+                }
+                Some(design.t().dot(&wd))
+            };
+            let g_m2 = weighted_gram(psi - 2.0 * h, eval)?;
+            let g_m1 = weighted_gram(psi - h, eval)?;
+            let g_p1 = weighted_gram(psi + h, eval)?;
+            let g_p2 = weighted_gram(psi + 2.0 * h, eval)?;
+            Some((g_m2 - 8.0 * &g_m1 + 8.0 * &g_p1 - g_p2) / (12.0 * h))
+        };
+        // True when the analytic derivative matches the exact FD at `psi`.
+        let certifies = |me: &Self,
+                             psi: f64,
+                             eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
+         -> bool {
+            // Keep the 4th-order FD stencil (ψ ± 2h) strictly inside the window.
+            if psi - 2.0 * h <= me.psi_lo || psi + 2.0 * h >= me.psi_hi {
+                return false;
+            }
+            let Some(exact) = exact_dgram(psi, eval) else {
+                return false;
+            };
+            let analytic = me.dgram_dpsi(psi);
+            let scale = exact
+                .iter()
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                .max(1e-300);
+            analytic
+                .iter()
+                .zip(exact.iter())
+                .all(|(a, b)| (a - b).abs() <= PSI_GRAM_GRAD_SPOT_RTOL * scale)
+        };
+        // Scan inward from each endpoint to the first certified point.
+        let n = PSI_GRAM_GRAD_SCAN_POINTS;
+        let mut lo = self.psi_hi;
+        let mut hi = self.psi_lo;
+        let mut found = false;
+        for i in 0..=n {
+            let psi = self.psi_lo + span * (i as f64) / (n as f64);
+            if certifies(self, psi, eval_design) {
+                lo = psi;
+                found = true;
+                break;
+            }
+        }
+        for i in (0..=n).rev() {
+            let psi = self.psi_lo + span * (i as f64) / (n as f64);
+            if certifies(self, psi, eval_design) {
+                hi = psi;
+                break;
+            }
+        }
+        if found && hi > lo {
+            self.grad_psi_lo = lo;
+            self.grad_psi_hi = hi;
+        } else {
+            // No certified interior: disable the gradient lane entirely
+            // (empty sub-window) — callers keep the exact slab gradient.
+            self.grad_psi_lo = f64::NAN;
+            self.grad_psi_hi = f64::NAN;
+        }
+    }
+
     /// True when `psi` lies inside the certified window.
     pub fn contains(&self, psi: f64) -> bool {
         psi.is_finite() && psi >= self.psi_lo && psi <= self.psi_hi
+    }
+
+    /// True when `psi` lies inside the certified gradient sub-window — the
+    /// region where the analytic ψ-derivative is bit-tight against the exact
+    /// design derivative (#1033b). Outside it (near the window edges) callers
+    /// must keep the exact slab gradient.
+    pub fn contains_for_gradient(&self, psi: f64) -> bool {
+        psi.is_finite()
+            && self.grad_psi_lo.is_finite()
+            && self.grad_psi_hi.is_finite()
+            && psi >= self.grad_psi_lo
+            && psi <= self.grad_psi_hi
     }
 
     fn mapped(&self, psi: f64) -> f64 {

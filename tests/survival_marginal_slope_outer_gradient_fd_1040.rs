@@ -122,7 +122,11 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
     for _ in 0..N {
         pc1.push(clip(0.024 + 0.042 * next_gauss(&mut state), -0.34, 0.12));
         pc2.push(clip(0.081 + 0.030 * next_gauss(&mut state), -0.19, 0.15));
-        sex.push(if next_unit(&mut state) < 0.39 { 1.0 } else { 0.0 });
+        sex.push(if next_unit(&mut state) < 0.39 {
+            1.0
+        } else {
+            0.0
+        });
         prs_z.push(next_gauss(&mut state));
         let entry = clip(45.08 + 18.0 * next_gauss(&mut state), 1.55, 121.96);
         let followup = next_gamma_alpha_ge_one(&mut state, 1.7, 4.4) + 0.05;
