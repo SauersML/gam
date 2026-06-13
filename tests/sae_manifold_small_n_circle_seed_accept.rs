@@ -72,8 +72,12 @@ fn planted_small_circle() -> Array2<f64> {
 /// the production `sae_manifold_fit` hands the outer cascade.
 fn build_cold_circle_term(z: &Array2<f64>) -> SaeManifoldTerm {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(M).unwrap());
+    // Seed each row's angle from its ambient (axis-0, axis-1) projection — the
+    // cold PCA-plane angle the production seeder would recover — normalised to
+    // the unit period the Circle manifold expects.
     let coords = Array2::from_shape_fn((N, 1), |(i, _)| {
-        ((i as f64) * 0.061_803 + 0.13).rem_euclid(1.0)
+        let angle = z[[i, 1]].atan2(z[[i, 0]]);
+        (angle / std::f64::consts::TAU).rem_euclid(1.0)
     });
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let atom = SaeManifoldAtom::new(
