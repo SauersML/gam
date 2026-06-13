@@ -840,6 +840,123 @@ mod tests {
         }
     }
 
+    /// LEVEL/TILT truth-recovery gate (#1041). The deficit pattern flagged in
+    /// the 8-dataset benchmark — worst on pooled/pointwise risk (RMSE/Brier/R²)
+    /// but only mid-pack on calibration SLOPE — is the fingerprint of a biased
+    /// affine projection: a systematic shift in the recovered LEVEL `c₀` or a
+    /// TILT in the recovered gradient `g`. The local affine sufficient statistic
+    /// this module computes (`mean`, `G`, `cross`) is the exact object that
+    /// projection consumes, so a bias there would surface here.
+    ///
+    /// Construct a channel value that is EXACTLY affine in the coordinates,
+    /// `v(x) = c₀ + gᵀ(x − center)`, under ARBITRARY (non-symmetric) weights.
+    /// The weighted affine projection must then recover `(c₀, g)` with ZERO
+    /// residual — the curved/higher-order energy is empty, so any nonzero level
+    /// or tilt error is pure projection bias, not a smoothing artifact. We
+    /// assert this across SHRINKING kernel widths ε (concentrating the weights),
+    /// the regime where a level/tilt bias in the centered second moment `G` or
+    /// the centered cross `Bᵀv/q` would be amplified.
+    #[test]
+    fn affine_projection_recovers_level_and_tilt_without_bias() {
+        // Asymmetric, off-center point cloud so the weighted barycenter does
+        // NOT coincide with the reference center: this is exactly where a
+        // mis-centered (biased) projection would leak the level into the tilt
+        // and vice versa.
+        let pts = ndarray::array![
+            [0.10, -0.30],
+            [0.62, 0.05],
+            [-0.18, 0.44],
+            [0.37, 0.51],
+            [-0.46, -0.22],
+            [0.71, 0.33],
+            [0.05, 0.62],
+            [-0.33, 0.14],
+        ];
+        // Strictly positive, deliberately uneven masses (no symmetry to lean on).
+        let masses = ndarray::array![0.31, 0.07, 0.22, 0.05, 0.19, 0.11, 0.27, 0.13];
+        let center = ndarray::array![0.05, 0.10];
+        let m = pts.nrows();
+        let d = pts.ncols();
+
+        // Exact affine truth in ambient coordinates: level c0, gradient g.
+        let c0 = 1.37_f64;
+        let g = ndarray::array![-0.85_f64, 0.42_f64];
+        let mut v = Array1::<f64>::zeros(m);
+        for j in 0..m {
+            let mut acc = c0;
+            for k in 0..d {
+                acc += g[k] * (pts[(j, k)] - center[k]);
+            }
+            v[j] = acc;
+        }
+
+        let ones = Array1::<f64>::ones(m);
+        // Tighten the kernel across several scales: shrinking eps concentrates
+        // the Gaussian weights and amplifies any centering/projection bias.
+        for &eps in &[1.0_f64, 0.5, 0.25, 0.12, 0.06] {
+            let inv_two_eps2 = 1.0 / (2.0 * eps * eps);
+            let mut w = Array1::<f64>::zeros(m);
+            for j in 0..m {
+                let mut dist2 = 0.0_f64;
+                for k in 0..d {
+                    let dlt = pts[(j, k)] - center[k];
+                    dist2 += dlt * dlt;
+                }
+                w[j] = masses[j] * (-dist2 * inv_two_eps2).exp();
+            }
+
+            let table = accumulate_moment_table(
+                pts.view(),
+                w.view(),
+                &[ones.view(), v.view()],
+                center.view(),
+            )
+            .expect("moment table");
+            let stats = jet_sufficient_stats(&table, eps, 1).expect("affine jet stats");
+
+            // The weighted affine projection solves `G b̂ = cross` for the
+            // ε-scaled slope; the ambient gradient is b̂/ε and the recovered
+            // LEVEL is `mean − āᵀ b̂` (the weighted mean minus the slope's
+            // contribution at the weighted barycenter). For an exactly affine
+            // truth both must equal the truth with zero residual.
+            //
+            // Solve the 2×2 SPD system directly (no external solver) so the
+            // test pins the projection math, not a library inverse.
+            let g00 = stats.gram[(0, 0)];
+            let g01 = stats.gram[(0, 1)];
+            let g11 = stats.gram[(1, 1)];
+            let det = g00 * g11 - g01 * g01;
+            assert!(
+                det > 1e-10,
+                "centered slope Gram must stay nondegenerate at eps={eps}; det={det}"
+            );
+            let b0 = (g11 * stats.cross[0] - g01 * stats.cross[1]) / det;
+            let b1 = (-g01 * stats.cross[0] + g00 * stats.cross[1]) / det;
+            // Ambient gradient = scaled slope / eps (Φ rows are (x−c)/ε).
+            let grad = [b0 / eps, b1 / eps];
+
+            // Recovered weighted barycenter offset ā (ambient) = a_mean·ε.
+            // Level at the reference center = mean − gradᵀ·(barycenter − center)
+            //                               = mean − (b̂ᵀ ā).
+            let a_mean0 = table.m1[(0, 0)] / (stats.q * eps);
+            let a_mean1 = table.m1[(0, 1)] / (stats.q * eps);
+            let level = stats.mean - (b0 * a_mean0 + b1 * a_mean1);
+
+            // TILT: the recovered gradient must match the truth — no systematic
+            // rotation/scaling of the slope channel.
+            assert!(
+                (grad[0] - g[0]).abs() <= 1e-9 && (grad[1] - g[1]).abs() <= 1e-9,
+                "TILT bias at eps={eps}: recovered gradient {grad:?} vs truth {g:?}"
+            );
+            // LEVEL: the recovered intercept at the reference center must match
+            // the truth — no systematic offset of the reconstructed surface.
+            assert!(
+                (level - c0).abs() <= 1e-9,
+                "LEVEL bias at eps={eps}: recovered {level} vs truth {c0}"
+            );
+        }
+    }
+
     #[test]
     fn streaming_chunked_accumulation_matches_single_pass() {
         // Four chunks, each accumulated about its OWN center, merged in
