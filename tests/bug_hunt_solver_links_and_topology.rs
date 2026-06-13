@@ -166,6 +166,66 @@ fn topology_selector_picks_lowest_cost_and_returns_fit_metadata() {
 }
 
 #[test]
+fn topology_selector_parallel_matches_sequential_winner() {
+    // #1017 Phase 0: the driver-level parallel topology race must return the
+    // bit-identical winner to the sequential loop (results come back in input
+    // order, ranked through the same deterministic priority selector).
+    use gam::topology_selector::select_topology_with_fit_parallel;
+    let selector = TopologyAutoSelector::new(Some(vec![
+        AutoTopologyKind::Circle,
+        AutoTopologyKind::Sphere,
+        AutoTopologyKind::Torus,
+    ]));
+    let fit_one = |kind: AutoTopologyKind| {
+        Ok::<_, String>(match kind {
+            AutoTopologyKind::Circle => TopologyAutoFitEvidence {
+                topology_name: "circle".to_string(),
+                raw_reml: 10.0,
+                null_dim: 0.0,
+                null_space_logdet: None,
+                effective_dim: 2.0,
+                n_obs: 100,
+                fit_handle: 7_i32,
+            },
+            AutoTopologyKind::Sphere => TopologyAutoFitEvidence {
+                topology_name: "sphere".to_string(),
+                raw_reml: 20.0,
+                null_dim: 0.0,
+                null_space_logdet: None,
+                effective_dim: 2.0,
+                n_obs: 100,
+                fit_handle: 9_i32,
+            },
+            AutoTopologyKind::Torus => TopologyAutoFitEvidence {
+                topology_name: "torus".to_string(),
+                raw_reml: 15.0,
+                null_dim: 0.0,
+                null_space_logdet: None,
+                effective_dim: 2.0,
+                n_obs: 100,
+                fit_handle: 11_i32,
+            },
+            _ => unreachable!(),
+        })
+    };
+    let parallel = select_topology_with_fit_parallel(&selector, &fit_one)
+        .expect("parallel topology selection should succeed");
+    let sequential = select_topology_with_fit(&selector, fit_one)
+        .expect("sequential topology selection should succeed");
+    let pw = parallel.winner().expect("parallel winner");
+    let sw = sequential.winner().expect("sequential winner");
+    assert_eq!(
+        pw.topology_name, sw.topology_name,
+        "parallel and sequential topology races must agree on the winner"
+    );
+    assert_eq!(pw.topology_name, "circle", "circle (raw_reml 10) is best");
+    assert_eq!(
+        pw.fit_handle, sw.fit_handle,
+        "parallel race must preserve the winning fit metadata"
+    );
+}
+
+#[test]
 fn topology_selector_breaks_exact_ties_deterministically_by_candidate_order() {
     let selector = TopologyAutoSelector::new(Some(vec![
         AutoTopologyKind::Torus,
