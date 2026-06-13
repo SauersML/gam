@@ -7084,8 +7084,12 @@ impl SaeManifoldTerm {
                 ));
             }
             let step_norm = step_norm_sq.sqrt();
-            let quotient_step_norm_sq =
-                self.quotient_newton_step_norm_sq(delta_t.view(), delta_beta.view(), step_norm_sq)?;
+            let quotient_step_norm_sq = self.quotient_newton_step_norm_sq(
+                delta_t.view(),
+                delta_beta.view(),
+                step_norm_sq,
+                rho_fixed.lambda_smooth(),
+            )?;
             let quotient_step_norm = quotient_step_norm_sq.sqrt();
             if grad_norm <= grad_tolerance || quotient_step_norm <= step_tolerance {
                 return Ok(cache);
@@ -11243,6 +11247,106 @@ impl SaeManifoldTerm {
             }
         }
         1.0 + iterate_norm_sq.sqrt()
+    }
+
+    /// Full-length β-block flat directions left by a **rank-deficient decoder
+    /// design** (#1051).
+    ///
+    /// The chart gauge orbit ([`Self::dense_step_gauge_vectors`]) only spans the
+    /// per-latent-axis reparametrisation freedom — it never reaches a decoder
+    /// column-space deficiency. A euclidean / Duchon patch fit to a shape that
+    /// does not excite every monomial column (e.g. a straight line under the
+    /// degree-2 patch `[1, t, t²]`: the `t²` column carries no signal) leaves a
+    /// genuine flat direction in the β block: a vector `v` with `vᵀG_kv ≈ 0`
+    /// **and** `vᵀS_kv ≈ 0`, where `G_k` is the weighted data Gram and `S_k` the
+    /// smoothing penalty. Along such a `v` the penalised joint objective has no
+    /// curvature, so the undamped Newton step there is unbounded — the inner
+    /// solve's raw KKT residual and step never settle, and `reml_criterion`
+    /// rejects an otherwise-stationary fit as non-converged (the 122 s line-fit
+    /// stall + `1e12` sentinel).
+    ///
+    /// We identify exactly those directions as the joint null of `G_k + S_k`
+    /// (penalty already carries the `λ_smooth` weight installed by
+    /// `assemble_arrow_schur`, so a column the penalty regularises is NOT
+    /// flagged — only the truly unidentified-and-unpenalised directions are).
+    /// Each `M_k`-vector null direction is replicated across the `p` output
+    /// channels via the decoder's `⊗ I_p` Kronecker structure and lifted into
+    /// the full `(n·q + β)` coordinate so it can be quotiented out of the inner
+    /// convergence measure and deflated in the outer gradient identically to a
+    /// chart gauge.
+    fn decoder_beta_null_directions(
+        &self,
+        penalized_gram_scale: f64,
+    ) -> Result<Vec<Array1<f64>>, String> {
+        let p = self.output_dim();
+        let n = self.n_obs();
+        let q = self.assignment.row_block_dim();
+        let beta_dim = self.beta_dim();
+        let total_len = n * q + beta_dim;
+        if p == 0 || beta_dim == 0 {
+            return Ok(Vec::new());
+        }
+        let mut grams = self.empty_decoder_gram_accumulator();
+        self.accumulate_decoder_gram(&mut grams);
+        let beta_offsets = self.beta_offsets();
+        let mut out = Vec::new();
+        for atom_idx in 0..self.k_atoms() {
+            let m = self.atoms[atom_idx].basis_size();
+            if m == 0 {
+                continue;
+            }
+            // Penalised β-curvature of this atom's data-channel: `G_k + S_k`.
+            // `accumulate_decoder_gram` returns the unweighted data Gram and
+            // `smooth_penalty` already carries `λ_smooth`-equivalent weighting at
+            // the assembled ρ; `penalized_gram_scale` lets the caller match the
+            // exact relative weighting the Schur factor used so the null test is
+            // computed against the SAME operator whose pivots went singular.
+            let gram = &grams[atom_idx];
+            let penalty = &self.atoms[atom_idx].smooth_penalty;
+            if penalty.dim() != (m, m) {
+                continue;
+            }
+            let mut joint = Array2::<f64>::zeros((m, m));
+            for i in 0..m {
+                for j in 0..m {
+                    joint[[i, j]] = gram[[i, j]] + penalized_gram_scale * penalty[[i, j]];
+                }
+            }
+            // Symmetrise defensively before the eigendecomposition.
+            for i in 0..m {
+                for j in 0..i {
+                    let sym = 0.5 * (joint[[i, j]] + joint[[j, i]]);
+                    joint[[i, j]] = sym;
+                    joint[[j, i]] = sym;
+                }
+            }
+            let (evals, evecs) = joint
+                .eigh(Side::Lower)
+                .map_err(|e| format!("decoder_beta_null_directions: eigh failed: {e}"))?;
+            let max_eig = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+            if !(max_eig > 0.0) {
+                continue;
+            }
+            // A direction is genuinely flat (unidentified by data AND
+            // unpenalised) when its penalised curvature is below the standard
+            // relative spectral cutoff used across the codebase.
+            let null_floor = SAE_DECODER_BETA_NULL_RELATIVE_FLOOR * max_eig;
+            let beta_base = n * q + beta_offsets[atom_idx];
+            for eig_idx in 0..evals.len() {
+                if !(evals[eig_idx].is_finite() && evals[eig_idx] <= null_floor) {
+                    continue;
+                }
+                // One full-length lift per output channel (the `⊗ I_p` replica).
+                for out_col in 0..p {
+                    let mut dir = Array1::<f64>::zeros(total_len);
+                    for col in 0..m {
+                        dir[beta_base + col * p + out_col] = evecs[[col, eig_idx]];
+                    }
+                    out.push(dir);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn quotient_newton_step_norm_sq(
