@@ -133,6 +133,48 @@ def test_scan_summary_matches_dense_double_penalty_reference():
     assert rmse_scan <= 1.25 * rmse_dense
 
 
+def test_scan_design_matrix_gives_actionable_error():
+    """A scan model retains no dense design, so design_matrix() must fail with a
+    precise, actionable message (not the cryptic missing-resolved_termspec one)."""
+    df = _dataset()
+    model = _fit_scan(df, degree=3, penalty_order=2)
+    with pytest.raises(Exception) as exc:
+        model.design_matrix(df)
+    msg = str(exc.value).lower()
+    assert "spline scan" in msg
+    assert "double_penalty" in msg
+
+
+def test_scan_predict_conformal_gives_actionable_error():
+    """Split-conformal needs the dense predictor a scan model does not carry, so
+    predict_conformal() must fail with a precise message pointing to the
+    scan-aware posterior-interval path, not the cryptic resolved_termspec one."""
+    df = _dataset(n=200)
+    model = _fit_scan(df, degree=3, penalty_order=2)
+    tr, cal, te = df.iloc[:120], df.iloc[120:160], df.iloc[160:]
+    del tr
+    with pytest.raises(Exception) as exc:
+        model.predict_conformal(te, calibration=cal, conformal_level=0.9, return_type="dict")
+    msg = str(exc.value).lower()
+    assert "spline scan" in msg
+    assert "interval" in msg or "double_penalty" in msg
+
+
+def test_scan_predict_point_and_interval_still_work():
+    """The scan-aware predict path is unaffected: point predictions and
+    posterior intervals both work and bracket the mean."""
+    df = _dataset()
+    model = _fit_scan(df, degree=5, penalty_order=3)
+    out = model.predict(df, interval=0.9)
+    mean = np.asarray(out["mean"])
+    lower = np.asarray(out["mean_lower"])
+    upper = np.asarray(out["mean_upper"])
+    assert np.all(np.isfinite(mean))
+    assert np.all(lower <= mean + 1e-9)
+    assert np.all(mean <= upper + 1e-9)
+    assert np.all(upper >= lower)
+
+
 def test_scan_summary_survives_save_load_roundtrip(tmp_path):
     """A persisted-then-reloaded scan model must summarize identically — the
     summary path reconstructs from the saved `SplineScanFit`, so it must work
