@@ -2677,6 +2677,297 @@ pub fn cache_matches_system(cache: &ArrowFactorCache, sys: &ArrowSchurSystem) ->
 }
 
 // ---------------------------------------------------------------------------
+// #1026 hybrid curved + linear-tail dictionary split-selection
+// ---------------------------------------------------------------------------
+//
+// A linear SAE atom is the EXACT special case of a curved d=1 atom: the
+// euclidean-d=1-linear basis is one decoder direction (`γ(t) = t·b`, a straight
+// image with zero turning). So a dictionary whose atom set INCLUDES the linear
+// atom as a special case cannot lose to a pure-linear dictionary at matched
+// active budget — it strictly generalizes it. The only open question is, per
+// atom, whether paying for the curved parameterization buys enough likelihood
+// to beat the cheaper linear special case. This module adjudicates that split
+// by the SAME rank-aware Laplace evidence criterion the union/mixture rungs use
+// (`−V = NLE`, lower wins), so the fit selects the curved-vs-linear split by
+// evidence rather than fiat.
+//
+// ## The dominance floor (Θ → 0) and the curved ceiling (Θ large)
+//
+// The decision is structurally pinned by nesting. Because the linear fit is the
+// curved family restricted to its straight (`Θ = 0`) sub-model, the curved fit's
+// maximized likelihood is ALWAYS ≥ the linear fit's at the same rows. But the
+// curved atom pays a strictly larger free-parameter price `P_curved > P_linear`
+// (the extra basis coefficients beyond the single decoder direction), which the
+// rank-aware Laplace normalizer charges. Hence:
+//
+//   * Θ → 0 (a straight feature): the curved fit recovers no extra likelihood
+//     over its linear sub-model, so `NLE_curved ≥ NLE_linear` and LINEAR wins —
+//     the dominance floor. A curved atom "buys nothing on a straight feature."
+//   * Θ large (a genuinely turning feature): the curved fit captures curvature
+//     the linear secant cannot, lowering `NLE_curved` below `NLE_linear` by more
+//     than the parameter price, so CURVED wins.
+//
+// The crossover is governed by the documented shatter law: a linear SAE shatters
+// a feature of total turning Θ into `N(ε) ≈ Θ/(2√(2ε))` rank-1 directions at
+// relative reconstruction error ε, so the curved advantage scales as `Θ/√ε`. We
+// use the fitted turning Θ (`sae_chart_canonicalization::d1_atom_fitted_turning`)
+// as the decision FEATURE: it both (a) sharpens the evidence comparison into a
+// falsifiable per-atom prediction and (b) provides the exact-zero dominance
+// guard — when an atom's fitted turning is identically zero, the curved fit has
+// no curvature to price and the linear special case is selected by construction,
+// independent of finite-sample evidence noise.
+
+/// Which atom parameterization a hybrid-dictionary slot selects: a CURVED atom
+/// (a `latent_dim ≥ 1` curved basis whose decoded image may turn) or its LINEAR
+/// special case (the euclidean-d=1-linear atom — one straight decoder direction,
+/// `γ(t) = t·b`, fitted turning `Θ = 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HybridAtomParam {
+    /// The curved atom (`latent_dim ≥ 1`), priced at its full coefficient count.
+    Curved { latent_dim: usize },
+    /// The linear special case: one decoder direction, zero turning.
+    Linear,
+}
+
+impl HybridAtomParam {
+    /// Stable display name for logs and tests.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HybridAtomParam::Curved { .. } => "curved",
+            HybridAtomParam::Linear => "linear",
+        }
+    }
+
+    /// `true` iff this is the linear special case (the linear tail).
+    pub const fn is_linear(self) -> bool {
+        matches!(self, HybridAtomParam::Linear)
+    }
+}
+
+/// One fitted candidate parameterization for a single hybrid-dictionary atom
+/// slot, scored on the COMMON rank-aware Laplace scale (`−V = NLE`, lower wins,
+/// identical to the union/mixture rungs). The curved and linear candidates for
+/// the SAME slot are fit on the same rows, so their NLEs are directly
+/// comparable; the only structural difference is the curved candidate's larger
+/// free-parameter price.
+#[derive(Debug, Clone, Copy)]
+pub struct HybridAtomCandidate {
+    pub param: HybridAtomParam,
+    /// Rank-aware Laplace negative-log-evidence on the common scale (lower wins).
+    pub negative_log_evidence: f64,
+    /// Free-parameter count this candidate is charged for (the complexity price).
+    pub num_parameters: usize,
+    /// The candidate's fitted total turning `Θ = ∫κ ds` of its decoded curve, if
+    /// the basis admits an analytic second jet. `Some(0.0)` for a linear atom (a
+    /// straight image has no turning); `None` when the turning is honestly
+    /// unavailable (no second jet / degenerate curve) — never fabricated.
+    pub fitted_turning: Option<f64>,
+}
+
+impl HybridAtomCandidate {
+    /// A linear special-case candidate: exact zero turning by construction.
+    pub fn linear(negative_log_evidence: f64, num_parameters: usize) -> Self {
+        Self {
+            param: HybridAtomParam::Linear,
+            negative_log_evidence,
+            num_parameters,
+            fitted_turning: Some(0.0),
+        }
+    }
+
+    /// A curved candidate of the given latent dimension, with its fitted turning.
+    pub fn curved(
+        latent_dim: usize,
+        negative_log_evidence: f64,
+        num_parameters: usize,
+        fitted_turning: Option<f64>,
+    ) -> Self {
+        Self {
+            param: HybridAtomParam::Curved { latent_dim },
+            negative_log_evidence,
+            num_parameters,
+            fitted_turning,
+        }
+    }
+}
+
+/// The evidence-selected parameterization for one hybrid-dictionary atom slot:
+/// the winning candidate, plus the curved/linear NLEs that decided it (for the
+/// EV-vs-Θ diagnostic and the tie-break audit trail).
+#[derive(Debug, Clone, Copy)]
+pub struct HybridAtomChoice {
+    pub param: HybridAtomParam,
+    /// The winning candidate's NLE.
+    pub negative_log_evidence: f64,
+    /// The winning candidate's free-parameter price.
+    pub num_parameters: usize,
+    /// The curved candidate's fitted turning `Θ` (the decision feature). `None`
+    /// when no curved candidate offered an analytic turning.
+    pub curved_turning: Option<f64>,
+    /// `NLE_linear − NLE_curved`: the evidence margin the curved fit won (or lost,
+    /// if negative) over the linear special case at this slot. Positive ⇒ curved
+    /// bought more evidence than its parameter price; ≤ 0 ⇒ the dominance floor
+    /// keeps the linear tail.
+    pub curved_evidence_margin: f64,
+}
+
+/// Below this fitted turning the curved candidate is treated as straight: its
+/// curvature is numerically indistinguishable from zero, so the dominance floor
+/// (the linear special case is cheaper at equal likelihood) is enforced by
+/// construction rather than left to finite-sample evidence noise. This is the
+/// exact-zero guard from the `Θ → 0 ⇒ N(ε) → 0` limit of the shatter law, not a
+/// tunable knob: it is the curvature scale below which `‖γ' ∧ γ''‖` is at the
+/// floor of the Simpson quadrature for a genuinely straight image.
+pub const HYBRID_LINEAR_TURNING_FLOOR: f64 = 1e-9;
+
+/// Adjudicate the curved-vs-linear parameterization for ONE hybrid-dictionary
+/// atom slot by the common rank-aware Laplace evidence criterion.
+///
+/// Selection rule (all on the single `NLE = −V` scale, lower wins):
+///
+///  1. **Dominance floor (Θ → 0).** If the curved candidate's fitted turning is
+///     `Some(Θ)` with `Θ ≤ HYBRID_LINEAR_TURNING_FLOOR` and a linear candidate
+///     exists, select LINEAR. A straight curved fit recovers no likelihood the
+///     linear special case does not, and the linear atom is strictly cheaper, so
+///     it cannot lose — we enforce that exactly instead of trusting evidence
+///     noise at the floor.
+///  2. **Evidence comparison.** Otherwise select the candidate with the smaller
+///     `NLE`. Because the linear atom is the curved family's `Θ = 0` sub-model,
+///     the curved candidate can only win when its extra curvature lowers the NLE
+///     by MORE than its extra parameter price — the `Θ/√ε` crossover, decided
+///     here by the evidence numbers themselves, not by fiat.
+///  3. **Tie-break.** Exact NLE ties go to the cheaper (fewer-parameter)
+///     candidate — i.e. linear — preserving the strict-generalization guarantee
+///     that the hybrid never pays for curvature it does not need.
+///
+/// `candidates` must contain at most one linear and at most one curved candidate
+/// for the slot; returns `None` only if `candidates` is empty.
+pub fn select_hybrid_atom(candidates: &[HybridAtomCandidate]) -> Option<HybridAtomChoice> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let linear = candidates.iter().find(|c| c.param.is_linear());
+    let curved = candidates.iter().find(|c| !c.param.is_linear());
+    let curved_turning = curved.and_then(|c| c.fitted_turning);
+    let curved_evidence_margin = match (linear, curved) {
+        (Some(l), Some(c)) => l.negative_log_evidence - c.negative_log_evidence,
+        _ => 0.0,
+    };
+
+    // (1) Exact-zero dominance floor: a straight curved fit yields to the linear
+    // special case by construction.
+    if let (Some(l), Some(turning)) = (linear, curved_turning)
+        && turning <= HYBRID_LINEAR_TURNING_FLOOR
+    {
+        return Some(HybridAtomChoice {
+            param: l.param,
+            negative_log_evidence: l.negative_log_evidence,
+            num_parameters: l.num_parameters,
+            curved_turning,
+            curved_evidence_margin,
+        });
+    }
+
+    // (2)+(3) Evidence argmin with the cheaper candidate winning exact ties.
+    let mut best = candidates[0];
+    for cand in &candidates[1..] {
+        let better_evidence = cand.negative_log_evidence < best.negative_log_evidence;
+        let tied = cand.negative_log_evidence == best.negative_log_evidence;
+        let cheaper_on_tie = tied && cand.num_parameters < best.num_parameters;
+        if better_evidence || cheaper_on_tie {
+            best = *cand;
+        }
+    }
+    Some(HybridAtomChoice {
+        param: best.param,
+        negative_log_evidence: best.negative_log_evidence,
+        num_parameters: best.num_parameters,
+        curved_turning,
+        curved_evidence_margin,
+    })
+}
+
+/// The evidence-selected split for a whole hybrid dictionary: the per-atom
+/// curved-vs-linear choices and the dictionary-level aggregates the EV-vs-Θ
+/// frontier reports against.
+#[derive(Debug, Clone)]
+pub struct HybridSplitSelection {
+    /// One adjudicated choice per atom slot, in slot order.
+    pub atoms: Vec<HybridAtomChoice>,
+    /// `Σ NLE` across the selected per-atom parameterizations — the dictionary's
+    /// summed rank-aware Laplace negative-log-evidence (lower wins). Because each
+    /// slot picks the argmin, this is ≤ the pure-linear dictionary's summed NLE
+    /// at the same slots: the hybrid match-or-beats pure-linear by construction.
+    pub total_negative_log_evidence: f64,
+    /// `Σ P` across the selected parameterizations — the dictionary's total
+    /// free-parameter price (the matched-active-budget accounting).
+    pub total_parameters: usize,
+    /// Count of slots that selected the curved parameterization.
+    pub curved_atom_count: usize,
+}
+
+impl HybridSplitSelection {
+    /// Count of slots that selected the linear special case (the linear tail).
+    pub fn linear_atom_count(&self) -> usize {
+        self.atoms.len() - self.curved_atom_count
+    }
+
+    /// `true` iff every slot selected linear — the pure-linear limit, reached
+    /// when every feature is straight (all `Θ → 0`).
+    pub fn is_pure_linear(&self) -> bool {
+        self.curved_atom_count == 0 && !self.atoms.is_empty()
+    }
+
+    /// `true` iff every slot selected curved — the pure-curved limit, reached
+    /// when every feature turns enough to pay for curvature.
+    pub fn is_pure_curved(&self) -> bool {
+        self.curved_atom_count == self.atoms.len() && !self.atoms.is_empty()
+    }
+}
+
+/// Adjudicate the curved-vs-linear split across a whole hybrid dictionary by the
+/// common evidence criterion. `slots[i]` holds the curved/linear candidates for
+/// atom slot `i` (each scored on the same rows, on the common Laplace scale).
+///
+/// The result reduces EXACTLY to pure-linear when every slot's curved candidate
+/// has `Θ → 0` (the dominance floor fires everywhere) and to pure-curved when
+/// every slot's curved candidate wins the evidence comparison — the two limits
+/// the strict-generalization argument demands.
+///
+/// Returns an error only if some slot has no candidates to adjudicate (an empty
+/// dictionary slot is a caller bug, not a silent skip).
+pub fn select_hybrid_split(
+    slots: &[Vec<HybridAtomCandidate>],
+) -> Result<HybridSplitSelection, String> {
+    let mut atoms = Vec::with_capacity(slots.len());
+    let mut total_nle = 0.0_f64;
+    let mut total_parameters = 0usize;
+    let mut curved_atom_count = 0usize;
+    for (i, slot) in slots.iter().enumerate() {
+        let choice = select_hybrid_atom(slot)
+            .ok_or_else(|| format!("hybrid split slot {i} has no candidate parameterizations"))?;
+        if !choice.negative_log_evidence.is_finite() {
+            return Err(format!(
+                "hybrid split slot {i} selected a non-finite evidence ({})",
+                choice.negative_log_evidence
+            ));
+        }
+        if !choice.param.is_linear() {
+            curved_atom_count += 1;
+        }
+        total_nle += choice.negative_log_evidence;
+        total_parameters += choice.num_parameters;
+        atoms.push(choice);
+    }
+    Ok(HybridSplitSelection {
+        atoms,
+        total_negative_log_evidence: total_nle,
+        total_parameters,
+        curved_atom_count,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 //
 // These are type-level / structural tests: per the task contract we do
@@ -3206,5 +3497,194 @@ mod tests {
             Array1::from_vec(vec![3.0]),
         ];
         assert!(stacked_predictive_mean(&weights, &means).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // #1026 hybrid curved + linear-tail split-selection
+    // -----------------------------------------------------------------------
+
+    /// Build the two candidate parameterizations for one atom slot the way the
+    /// fit would: the linear special case (one decoder direction, `Θ = 0`,
+    /// `P_linear` params) and the curved candidate (`latent_dim` ≥ 1, more
+    /// params, fitted turning `theta`). The curved candidate's likelihood is the
+    /// linear likelihood MINUS `curved_loglik_gain` of NLE (curvature it captures
+    /// the secant cannot), so the nesting invariant `curved_loglik ≥ linear` is
+    /// honored: a straight feature has zero gain, a turning feature a positive
+    /// gain that grows with Θ. The rank-aware Laplace normalizer charges the
+    /// extra `½(P_curved − P_linear)·log(2π)` for the curved parameters, so the
+    /// evidence comparison is the real `Θ/√ε` crossover.
+    fn hybrid_slot(
+        linear_nle: f64,
+        p_linear: usize,
+        latent_dim: usize,
+        p_curved: usize,
+        theta: f64,
+        curved_loglik_gain: f64,
+    ) -> Vec<HybridAtomCandidate> {
+        let param_price = 0.5 * (p_curved as f64 - p_linear as f64) * (2.0 * std::f64::consts::PI).ln();
+        let curved_nle = linear_nle - curved_loglik_gain + param_price;
+        vec![
+            HybridAtomCandidate::linear(linear_nle, p_linear),
+            HybridAtomCandidate::curved(latent_dim, curved_nle, p_curved, Some(theta)),
+        ]
+    }
+
+    #[test]
+    fn hybrid_dominance_floor_selects_linear_when_turning_is_zero() {
+        // A perfectly straight curved fit (Θ = 0) gains no likelihood over its
+        // linear sub-model but pays more parameters → linear must win, by
+        // construction, even if finite-sample evidence noise nudged the curved
+        // NLE slightly below linear.
+        let slot = hybrid_slot(100.0, 2, 1, 5, 0.0, 0.0);
+        let choice = select_hybrid_atom(&slot).unwrap();
+        assert!(choice.param.is_linear());
+        assert_eq!(choice.param, HybridAtomParam::Linear);
+        // The exact-zero guard fires regardless of the evidence margin sign.
+        assert!(choice.curved_turning.unwrap() <= HYBRID_LINEAR_TURNING_FLOOR);
+    }
+
+    #[test]
+    fn hybrid_selects_curved_when_turning_pays_for_itself() {
+        // A genuinely turning feature (Θ = 2π, a full loop): the curved fit
+        // captures enough curvature that, even charged the extra-parameter price,
+        // its NLE drops below the linear secant's → curved wins.
+        let slot = hybrid_slot(100.0, 2, 1, 5, 2.0 * std::f64::consts::PI, 30.0);
+        let choice = select_hybrid_atom(&slot).unwrap();
+        assert_eq!(choice.param, HybridAtomParam::Curved { latent_dim: 1 });
+        // The curved fit won a strictly positive evidence margin.
+        assert!(choice.curved_evidence_margin > 0.0);
+    }
+
+    #[test]
+    fn hybrid_keeps_linear_when_curvature_doesnt_pay_its_price() {
+        // A barely-curved feature (small Θ): the curved fit recovers only a sliver
+        // of likelihood, not enough to cover the extra-parameter price → the
+        // dominance floor keeps the linear tail.
+        let slot = hybrid_slot(100.0, 2, 1, 5, 0.05, 0.1);
+        let choice = select_hybrid_atom(&slot).unwrap();
+        assert!(choice.param.is_linear());
+        assert!(choice.curved_evidence_margin <= 0.0);
+    }
+
+    #[test]
+    fn hybrid_tie_breaks_to_the_cheaper_linear_atom() {
+        // Exact NLE tie (above the turning floor so the evidence path decides):
+        // the cheaper linear atom wins, preserving strict generalization — the
+        // hybrid never pays for curvature it does not need.
+        let theta = 0.5; // above the floor → evidence path, not the exact guard
+        let nle = 42.0;
+        let slot = vec![
+            HybridAtomCandidate::linear(nle, 2),
+            HybridAtomCandidate::curved(1, nle, 5, Some(theta)),
+        ];
+        let choice = select_hybrid_atom(&slot).unwrap();
+        assert!(choice.param.is_linear());
+        assert_eq!(choice.num_parameters, 2);
+    }
+
+    #[test]
+    fn hybrid_split_reduces_to_pure_linear_when_all_features_are_straight() {
+        // Every slot's curved candidate has Θ → 0 (flat features everywhere): the
+        // dominance floor fires at every slot → the hybrid recovers the pure-
+        // linear dictionary exactly. This is the `all Θ → 0` limit (3).
+        let slots: Vec<Vec<HybridAtomCandidate>> = (0..6)
+            .map(|i| hybrid_slot(50.0 + i as f64, 2, 1, 5, 0.0, 0.0))
+            .collect();
+        let split = select_hybrid_split(&slots).unwrap();
+        assert!(split.is_pure_linear());
+        assert_eq!(split.curved_atom_count, 0);
+        assert_eq!(split.linear_atom_count(), 6);
+        // Summed NLE equals the pure-linear baseline (every slot chose linear).
+        let pure_linear: f64 = (0..6).map(|i| 50.0 + i as f64).sum();
+        assert!((split.total_negative_log_evidence - pure_linear).abs() < 1e-12);
+    }
+
+    #[test]
+    fn hybrid_split_reduces_to_pure_curved_when_every_feature_curves() {
+        // Every slot's feature turns enough (Θ = 2π, large likelihood gain) that
+        // curved beats linear everywhere → the pure-curved limit (3).
+        let slots: Vec<Vec<HybridAtomCandidate>> = (0..5)
+            .map(|i| hybrid_slot(80.0 + i as f64, 2, 1, 5, 2.0 * std::f64::consts::PI, 40.0))
+            .collect();
+        let split = select_hybrid_split(&slots).unwrap();
+        assert!(split.is_pure_curved());
+        assert_eq!(split.curved_atom_count, 5);
+        assert_eq!(split.linear_atom_count(), 0);
+    }
+
+    #[test]
+    fn hybrid_split_on_mixed_dictionary_picks_curved_for_circles_linear_for_directions() {
+        // Mixed synthetic: slots 0..3 are CIRCLE features (high turning Θ = 2π,
+        // the curved fit captures the loop), slots 3..7 are LINEAR DIRECTIONS
+        // (straight, Θ = 0). The evidence split must select curved for the
+        // circles and linear for the directions — and at matched actives the
+        // hybrid's summed evidence must be ≤ the pure-linear baseline (the
+        // strict-generalization, match-or-beat guarantee, (4)).
+        let mut slots: Vec<Vec<HybridAtomCandidate>> = Vec::new();
+        let mut pure_linear_baseline = 0.0_f64;
+        // Three circle features: a curved atom replaces ~10-30 linear secants, so
+        // the curved fit buys a large likelihood gain that dwarfs its param price.
+        for i in 0..3 {
+            let linear_nle = 120.0 + 3.0 * i as f64;
+            pure_linear_baseline += linear_nle;
+            slots.push(hybrid_slot(
+                linear_nle,
+                2,
+                1,
+                5,
+                2.0 * std::f64::consts::PI,
+                35.0,
+            ));
+        }
+        // Four straight linear directions: zero turning, the linear special case
+        // is optimal — a curved atom buys nothing and only costs parameters.
+        for i in 0..4 {
+            let linear_nle = 90.0 + 2.0 * i as f64;
+            pure_linear_baseline += linear_nle;
+            slots.push(hybrid_slot(linear_nle, 2, 1, 5, 0.0, 0.0));
+        }
+
+        let split = select_hybrid_split(&slots).unwrap();
+
+        // The first three (circles) chose curved; the last four (directions) chose
+        // linear.
+        for (idx, choice) in split.atoms.iter().enumerate() {
+            if idx < 3 {
+                assert_eq!(
+                    choice.param,
+                    HybridAtomParam::Curved { latent_dim: 1 },
+                    "circle slot {idx} should select curved"
+                );
+            } else {
+                assert!(
+                    choice.param.is_linear(),
+                    "direction slot {idx} should select linear"
+                );
+            }
+        }
+        assert_eq!(split.curved_atom_count, 3);
+        assert_eq!(split.linear_atom_count(), 4);
+
+        // EV at matched actives: the hybrid's summed negative-log-evidence is ≤
+        // the pure-linear dictionary's (lower NLE = higher evidence = the curved
+        // atoms strictly improved the circle slots, the linear slots are
+        // unchanged). The hybrid match-or-beats pure-linear by construction.
+        assert!(
+            split.total_negative_log_evidence <= pure_linear_baseline + 1e-9,
+            "hybrid NLE {} must be <= pure-linear baseline {}",
+            split.total_negative_log_evidence,
+            pure_linear_baseline
+        );
+        // And strictly better, because the curved circle slots paid off.
+        assert!(split.total_negative_log_evidence < pure_linear_baseline);
+    }
+
+    #[test]
+    fn hybrid_split_rejects_empty_slot() {
+        let slots = vec![
+            hybrid_slot(10.0, 2, 1, 5, 0.0, 0.0),
+            Vec::new(),
+        ];
+        assert!(select_hybrid_split(&slots).is_err());
     }
 }

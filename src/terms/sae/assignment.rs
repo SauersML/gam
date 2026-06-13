@@ -7,6 +7,7 @@ use crate::terms::analytic_penalties::{
     AnalyticPenalty, IBPAssignmentPenalty, IbpHessianDiagThirdChannels,
     SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight,
 };
+use crate::solver::evidence::{HybridAtomCandidate, HybridAtomChoice, select_hybrid_atom};
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 use crate::terms::sae_manifold::SaeManifoldRho;
 
@@ -1074,4 +1075,114 @@ pub(crate) fn ibp_assignment_third_channels(
         target.view(),
         rho_view.view(),
     )))
+}
+
+/// #1026 hybrid curved + linear-tail adjudication for one SAE atom slot.
+///
+/// A hybrid dictionary lets each atom slot be either a CURVED atom (its fitted
+/// `latent_dim ≥ 1` manifold chart, whose decoded image may turn) or its LINEAR
+/// special case (the euclidean-d=1-linear atom — one straight decoder direction,
+/// `γ(t) = t·b`, zero turning). The two are nested: the linear atom is exactly
+/// the curved family restricted to its straight sub-model, so a hybrid slot
+/// cannot lose to pure-linear at matched actives — it strictly generalizes it.
+///
+/// This is the single call the SAE fitter makes per atom to choose the split by
+/// EVIDENCE rather than fiat. It packages the atom's two already-fitted
+/// candidates — each scored on the COMMON rank-aware Laplace scale (`−V = NLE`,
+/// lower wins, identical to the union/mixture rungs) on the same rows — and
+/// routes them through [`select_hybrid_atom`]. The curved candidate's fitted
+/// turning `Θ` (from
+/// [`crate::terms::sae_chart_canonicalization::d1_atom_fitted_turning`]) enters
+/// as the decision feature: a `Θ → 0` atom yields to the cheaper linear tail by
+/// construction (the dominance floor — a curved atom buys nothing on a straight
+/// feature), a high-`Θ` atom takes the curved parameterization when its
+/// curvature lowers the NLE by more than its extra-parameter price (the `Θ/√ε`
+/// crossover).
+///
+/// `manifold` is the atom's fitted chart manifold; a non-curveable (already
+/// Euclidean-flat) chart can only present the linear candidate, which this
+/// helper enforces by ignoring any curved candidate offered for a flat chart —
+/// a flat chart has no curvature to price, so the linear special case is its
+/// only honest parameterization. Curveable charts present both candidates.
+///
+/// # Wiring into the fitter (the one call into `sae_manifold.rs`)
+///
+/// The post-fit pass in `sae_manifold.rs` already computes each d=1 atom's
+/// fitted turning `Θ` (the read-only EV-vs-Θ diagnostic). To make the split
+/// load-bearing, that pass supplies, per atom, the curved-candidate NLE +
+/// parameter count + `Θ` and the linear-candidate NLE + parameter count (both
+/// fitted on the atom's rows), and calls this helper; the returned
+/// [`HybridAtomChoice`] tells the fitter which parameterization to keep for that
+/// slot. The fitting of the two candidates lives in `sae_manifold.rs` (the
+/// manifold-chart fitter); the SELECTION/scoring lives here.
+pub fn select_hybrid_atom_parameterization(
+    manifold: &LatentManifold,
+    curved: Option<HybridAtomCandidate>,
+    linear: HybridAtomCandidate,
+) -> HybridAtomChoice {
+    // A flat (Euclidean) chart has no curvature to price: its only honest
+    // parameterization is the linear special case, so any curved candidate
+    // offered for it is dropped before the evidence comparison. Curveable charts
+    // (Circle / Sphere / Torus / curved products) present both candidates.
+    let curved = if manifold.is_euclidean() { None } else { curved };
+    let candidates: Vec<HybridAtomCandidate> = match curved {
+        Some(c) => vec![linear, c],
+        None => vec![linear],
+    };
+    // `candidates` is never empty (it always contains the linear candidate), so
+    // the selector always returns a choice.
+    select_hybrid_atom(&candidates).expect("hybrid atom slot always has the linear candidate")
+}
+
+#[cfg(test)]
+mod hybrid_split_tests {
+    use super::*;
+    use crate::solver::evidence::HybridAtomParam;
+
+    #[test]
+    fn flat_chart_drops_curved_candidate_and_keeps_linear() {
+        // A Euclidean chart has no curvature: even if a curved candidate with a
+        // lower NLE is offered, the helper drops it (a flat chart cannot honestly
+        // present a curved parameterization).
+        let linear = HybridAtomCandidate::linear(100.0, 2);
+        let curved = HybridAtomCandidate::curved(1, 1.0, 5, Some(2.0));
+        let choice =
+            select_hybrid_atom_parameterization(&LatentManifold::Euclidean, Some(curved), linear);
+        assert!(choice.param.is_linear());
+    }
+
+    #[test]
+    fn curveable_chart_selects_curved_when_turning_pays() {
+        // A Circle chart presents both candidates; a turning feature whose curved
+        // fit beats the linear secant on evidence selects curved.
+        let linear = HybridAtomCandidate::linear(100.0, 2);
+        let curved = HybridAtomCandidate::curved(
+            1,
+            70.0,
+            5,
+            Some(2.0 * std::f64::consts::PI),
+        );
+        let choice = select_hybrid_atom_parameterization(
+            &LatentManifold::Circle {
+                period: 2.0 * std::f64::consts::PI,
+            },
+            Some(curved),
+            linear,
+        );
+        assert_eq!(choice.param, HybridAtomParam::Curved { latent_dim: 1 });
+    }
+
+    #[test]
+    fn curveable_chart_falls_back_to_linear_when_no_curved_candidate() {
+        let linear = HybridAtomCandidate::linear(33.0, 2);
+        let choice = select_hybrid_atom_parameterization(
+            &LatentManifold::Circle {
+                period: 2.0 * std::f64::consts::PI,
+            },
+            None,
+            linear,
+        );
+        assert!(choice.param.is_linear());
+        assert_eq!(choice.num_parameters, 2);
+    }
 }
