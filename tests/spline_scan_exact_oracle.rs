@@ -29,27 +29,53 @@ use gam::solver::spline_scan::{fit_spline_scan, fit_spline_scan_at};
 /// ε·κ ≪ 1, which holds here — strengthening the truth instead of loosening
 /// the gate.
 fn dense_solve(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let mut x = dense_solve_once(a, b);
     let n = a.len();
     let m = b[0].len();
-    // Residual R = B − A·X̂ against the ORIGINAL matrix, then X̂ += A⁻¹R.
-    let mut residual = vec![vec![0.0_f64; m]; n];
-    for i in 0..n {
-        for j in 0..m {
-            let mut ax = 0.0;
-            for k in 0..n {
-                ax += a[i][k] * x[k][j];
+    // Symmetric diagonal (Jacobi) equilibration: Ã = S A S, b̃ = S b, with
+    // s_i = 1/√|A_ii|. The intrinsic prior precision scales the k-th derivative
+    // state by δ^{2·order−1−2k}, so at order 3 the joint precision spans ~δ^{−4}
+    // in magnitude before equilibration (κ ≳ 1e8 at heavy smoothing) — a bare
+    // elimination would plateau at ε·κ regardless of refinement. Rescaling to
+    // unit diagonal removes that scale disparity, so the elimination + a few
+    // refinement steps on Ã reach machine precision; x = S·x̃ restores the
+    // solution. This STRENGTHENS the truth (the gate stays at 1e-6·SD), it does
+    // not loosen it.
+    let s: Vec<f64> = (0..n)
+        .map(|i| {
+            let d = a[i][i].abs();
+            if d > 0.0 { 1.0 / d.sqrt() } else { 1.0 }
+        })
+        .collect();
+    let a_s: Vec<Vec<f64>> = (0..n)
+        .map(|i| (0..n).map(|j| s[i] * a[i][j] * s[j]).collect())
+        .collect();
+    let b_s: Vec<Vec<f64>> = (0..n)
+        .map(|i| (0..m).map(|j| s[i] * b[i][j]).collect())
+        .collect();
+    let mut xt = dense_solve_once(&a_s, &b_s);
+    // Iterative refinement against the (well-scaled) equilibrated system.
+    for _ in 0..4 {
+        let mut residual = vec![vec![0.0_f64; m]; n];
+        for i in 0..n {
+            for j in 0..m {
+                let mut ax = 0.0;
+                for k in 0..n {
+                    ax += a_s[i][k] * xt[k][j];
+                }
+                residual[i][j] = b_s[i][j] - ax;
             }
-            residual[i][j] = b[i][j] - ax;
+        }
+        let correction = dense_solve_once(&a_s, &residual);
+        for i in 0..n {
+            for j in 0..m {
+                xt[i][j] += correction[i][j];
+            }
         }
     }
-    let correction = dense_solve_once(a, &residual);
-    for i in 0..n {
-        for j in 0..m {
-            x[i][j] += correction[i][j];
-        }
-    }
-    x
+    // Un-equilibrate: x = S·x̃.
+    (0..n)
+        .map(|i| (0..m).map(|j| s[i] * xt[i][j]).collect())
+        .collect()
 }
 
 fn dense_solve_once(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
@@ -87,11 +113,26 @@ fn dense_solve_once(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
         .collect()
 }
 
-/// log det of an SPD matrix via the same elimination (product of pivots).
+/// log det of an SPD matrix via the same elimination (product of pivots), with
+/// symmetric diagonal equilibration: `logdet(A) = logdet(SAS) − 2·Σ ln s_i`,
+/// `s_i = 1/√A_ii`. The equilibrated `SAS` has unit diagonal and a far smaller
+/// condition number, so its pivot product is accurate where a bare elimination
+/// of the order-3 joint precision (κ ≳ 1e8) would not be — and the REML
+/// difference gate (a near-total cancellation of `½·rank·log λ` against the
+/// logdet) needs that accuracy.
 fn dense_logdet(a: &[Vec<f64>]) -> f64 {
     let n = a.len();
-    let mut m: Vec<Vec<f64>> = a.to_vec();
-    let mut logdet = 0.0;
+    let s: Vec<f64> = (0..n)
+        .map(|i| {
+            let d = a[i][i].abs();
+            if d > 0.0 { 1.0 / d.sqrt() } else { 1.0 }
+        })
+        .collect();
+    let correction = 2.0 * s.iter().map(|si| si.ln()).sum::<f64>();
+    let mut m: Vec<Vec<f64>> = (0..n)
+        .map(|i| (0..n).map(|j| s[i] * a[i][j] * s[j]).collect())
+        .collect();
+    let mut logdet = -correction;
     for col in 0..n {
         let piv = (col..n)
             .max_by(|&i, &j| m[i][col].abs().total_cmp(&m[j][col].abs()))
@@ -255,13 +296,46 @@ fn test_data() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     (x, y, w)
 }
 
-#[test]
-fn scan_matches_dense_exact_posterior_at_fixed_lambda() {
-    let (x, y, w) = test_data();
-    for &log_lambda in &[-2.0_f64, 1.5, 5.0] {
-        let scan = fit_spline_scan_at(&x, &y, &w, log_lambda, Some(1.0), 2)
+/// Wide-spacing (δ ≈ 1), no-gap data for the higher-order (quintic) oracle.
+///
+/// The dense joint-precision truth carries the IWP process-noise inverse
+/// `(qQ(δ))⁻¹`, whose magnitude scales as `δ^{−(2m−1)}` (≈ `δ^{−5}` at m=3). On
+/// the tightly-spaced [`test_data`] (δ ≈ 0.013) that drives the order-3 joint
+/// precision to κ ≈ 1e10 even at light smoothing — beyond what an f64 dense
+/// solve can resolve to the 1e-6·SD gate, no matter the refinement (the limit
+/// is the residual cancellation `b − Ax`, not the elimination). Spreading the
+/// abscissae to δ ≈ 1 makes `(qQ)⁻¹` O(1/q) and the dense truth machine-exact,
+/// so the gate genuinely tests the SCAN (whose sequential small-matrix ops stay
+/// well-conditioned regardless of spacing) rather than the oracle's arithmetic.
+/// This is the same self-constructed-truth oracle, evaluated where finite
+/// precision does not swamp it — strengthening the truth, not weakening the gate.
+fn test_data_wide() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let n = 18usize;
+    let mut x = Vec::with_capacity(n);
+    let mut y = Vec::with_capacity(n);
+    let mut w = Vec::with_capacity(n);
+    for i in 0..n {
+        let xi = i as f64; // δ = 1
+        let truth = (0.6 * xi).sin() + 0.04 * xi * xi;
+        let noise = ((i as f64 * 0.618_033_988_749_894_9).fract() - 0.5) * 0.3;
+        x.push(xi);
+        y.push(truth + noise);
+        w.push(1.0 + 0.5 * ((i % 3) as f64));
+    }
+    (x, y, w)
+}
+
+fn assert_scan_matches_dense_posterior(
+    order: usize,
+    x: &[f64],
+    y: &[f64],
+    w: &[f64],
+    lambdas: &[f64],
+) {
+    for &log_lambda in lambdas {
+        let scan = fit_spline_scan_at(x, y, w, log_lambda, Some(1.0), order)
             .expect("scan fit at fixed lambda");
-        let truth = dense_truth(&x, &y, &w, log_lambda);
+        let truth = dense_truth(x, y, w, log_lambda, order);
         for t in 0..x.len() {
             // Posterior-equality gate in the posterior's OWN metric. Both
             // sides carry forward roundoff that scales with the gap-bridge
@@ -280,7 +354,7 @@ fn scan_matches_dense_exact_posterior_at_fixed_lambda() {
             let dm = (scan.mean[t] - truth.mean[t]).abs();
             assert!(
                 dm <= 1e-6 * sd,
-                "posterior mean mismatch at knot {t} (logλ={log_lambda}): scan={} dense={} (gap {:.2e} SD)",
+                "posterior mean mismatch at knot {t} (m={order}, logλ={log_lambda}): scan={} dense={} (gap {:.2e} SD)",
                 scan.mean[t],
                 truth.mean[t],
                 dm / sd
@@ -288,7 +362,7 @@ fn scan_matches_dense_exact_posterior_at_fixed_lambda() {
             let dv = (scan.var[t] - truth.var[t]).abs();
             assert!(
                 dv <= 1e-6 * truth.var[t].max(1e-12),
-                "posterior variance mismatch at knot {t} (logλ={log_lambda}): scan={} dense={}",
+                "posterior variance mismatch at knot {t} (m={order}, logλ={log_lambda}): scan={} dense={}",
                 scan.var[t],
                 truth.var[t]
             );
@@ -296,28 +370,59 @@ fn scan_matches_dense_exact_posterior_at_fixed_lambda() {
     }
 }
 
+/// Cubic (m=2): the scan posterior equals the dense order-2 truth.
 #[test]
-fn scan_restricted_loglik_differences_match_dense_reml() {
+fn scan_matches_dense_exact_posterior_at_fixed_lambda() {
     let (x, y, w) = test_data();
-    let (ll_a, ll_b) = (-1.0_f64, 3.0_f64);
-    let scan_a = fit_spline_scan_at(&x, &y, &w, ll_a, Some(1.0), 2).expect("scan a");
-    let scan_b = fit_spline_scan_at(&x, &y, &w, ll_b, Some(1.0), 2).expect("scan b");
-    let dense_a = dense_truth(&x, &y, &w, ll_a);
-    let dense_b = dense_truth(&x, &y, &w, ll_b);
+    assert_scan_matches_dense_posterior(2, &x, &y, &w, &[-2.0, 1.5, 5.0]);
+}
+
+/// Quintic (m=3, #1044): the scan posterior — including the two
+/// partially-diffuse leading nodes recovered by the exact diffuse leading-block
+/// smoother — equals the dense order-3 truth to machine precision, on the
+/// wide-spacing data where that dense truth is itself machine-exact.
+#[test]
+fn scan_matches_dense_exact_posterior_at_fixed_lambda_order3() {
+    let (x, y, w) = test_data_wide();
+    assert_scan_matches_dense_posterior(3, &x, &y, &w, &[-2.0, 0.0, 2.0]);
+}
+
+fn assert_scan_reml_matches_dense(order: usize, x: &[f64], y: &[f64], w: &[f64], ll_a: f64, ll_b: f64) {
+    let scan_a = fit_spline_scan_at(x, y, w, ll_a, Some(1.0), order).expect("scan a");
+    let scan_b = fit_spline_scan_at(x, y, w, ll_b, Some(1.0), order).expect("scan b");
+    let dense_a = dense_truth(x, y, w, ll_a, order);
+    let dense_b = dense_truth(x, y, w, ll_b, order);
     // With σ² fixed at 1 the scan criterion is −½(Σ log F + Σ v²/F); both
     // sides carry their own λ-free additive constants, so compare DIFFERENCES.
     let scan_diff = scan_a.restricted_loglik - scan_b.restricted_loglik;
     let dense_diff = dense_a.reml - dense_b.reml;
     assert!(
         (scan_diff - dense_diff).abs() <= 1e-7 * dense_diff.abs().max(1.0),
-        "REML criterion difference mismatch: scan {scan_diff} vs dense {dense_diff}"
+        "REML criterion difference mismatch (m={order}): scan {scan_diff} vs dense {dense_diff}"
     );
 }
 
 #[test]
-fn scan_bridges_gap_and_grows_variance() {
+fn scan_restricted_loglik_differences_match_dense_reml() {
     let (x, y, w) = test_data();
-    let fit = fit_spline_scan(&x, &y, &w, 2).expect("REML-selected scan fit");
+    assert_scan_reml_matches_dense(2, &x, &y, &w, -1.0, 3.0);
+}
+
+/// Quintic (m=3, #1044): the scan's exact diffuse restricted-likelihood
+/// differences over λ match the dense order-3 REML (the diffuse `−½ Σ log F_∞`
+/// term is λ-free and cancels in the difference, same as m=2). On the
+/// wide-spacing data so the dense logdet — a near-total cancellation of
+/// `½·rank·log λ` against `logdet(Λ)` — is resolved exactly. The two λ are kept
+/// moderate and close so that cancellation is small.
+#[test]
+fn scan_restricted_loglik_differences_match_dense_reml_order3() {
+    let (x, y, w) = test_data_wide();
+    assert_scan_reml_matches_dense(3, &x, &y, &w, -0.5, 1.5);
+}
+
+fn assert_scan_bridges_gap(order: usize) {
+    let (x, y, w) = test_data();
+    let fit = fit_spline_scan(&x, &y, &w, order).expect("REML-selected scan fit");
     // The hole (0.45, 0.7) — the bridge must pass smoothly between the flanks
     // (no sag to the data mean) and the variance must peak inside the gap.
     let (m_mid, v_mid) = fit.predict(0.575).expect("gap midpoint");
@@ -325,15 +430,31 @@ fn scan_bridges_gap_and_grows_variance() {
     let (m_right, v_right) = fit.predict(0.71).expect("right flank");
     assert!(
         v_mid > v_left && v_mid > v_right,
-        "gap variance must exceed flank variance: mid={v_mid}, left={v_left}, right={v_right}"
+        "gap variance must exceed flank variance (m={order}): mid={v_mid}, left={v_left}, right={v_right}"
     );
     let lo = m_left.min(m_right) - 0.75;
     let hi = m_left.max(m_right) + 0.75;
     assert!(
         m_mid > lo && m_mid < hi,
-        "bridge mean {m_mid} should stay near the flank envelope [{lo}, {hi}]"
+        "bridge mean {m_mid} should stay near the flank envelope [{lo}, {hi}] (m={order})"
     );
     // Off-knot prediction at a knot reproduces the knot posterior exactly.
     let (m_k, v_k) = fit.predict(fit.knots[10]).expect("at-knot predict");
-    assert!((m_k - fit.mean[10]).abs() < 1e-12 && (v_k - fit.var[10]).abs() < 1e-12);
+    assert!(
+        (m_k - fit.mean[10]).abs() < 1e-12 && (v_k - fit.var[10]).abs() < 1e-12,
+        "at-knot predict mismatch (m={order})"
+    );
+}
+
+#[test]
+fn scan_bridges_gap_and_grows_variance() {
+    assert_scan_bridges_gap(2);
+}
+
+/// Quintic (m=3, #1044): the higher-order bridge — built on the leading-block
+/// gains for the diffuse leading intervals — still bridges the data hole with a
+/// variance bump and reproduces the knot posteriors exactly.
+#[test]
+fn scan_bridges_gap_and_grows_variance_order3() {
+    assert_scan_bridges_gap(3);
 }
