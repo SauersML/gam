@@ -29191,6 +29191,122 @@ mod tests {
         assert_close_matrix(&analytic_second, &fd_second, 1e-7, "expected d2I");
     }
 
+    /// Layer-5 deliverable (gam#979 / gam#1020): the Tier-B Jeffreys term built
+    /// on the EXPECTED Fisher information must NOT reward probit saturation,
+    /// whereas the OBSERVED-information Jeffreys term DOES — which is the long
+    /// quasi-flat descent valley that made the constrained-wiggle inner solve
+    /// walk `|β|→∞`.
+    ///
+    /// Mechanism. For probit `q ↦ Φ(q)`, drive the threshold predictor `η_t`
+    /// (hence `q`) into saturation. The OBSERVED per-row curvature
+    /// `−∂²ℓ/∂q² = w·(z·q′ + …)` carries the misclassification term that GROWS
+    /// like `q²` on rows the saturated mean gets wrong, so `½log det H_obs`
+    /// climbs without bound — Φ_obs rewards walking toward saturation. The
+    /// EXPECTED Fisher weight `w^F = φ(q)²/(p(1−p))` DECAYS as `q→±∞` (the
+    /// Gaussian pdf `φ` kills the numerator faster than `p(1−p)→0` shrinks the
+    /// denominator), so `½log det H_exp` is bounded above — Φ_exp has no valley.
+    ///
+    /// The assertion: across a saturation sweep, Φ on the expected information
+    /// stays bounded (and ultimately decreases), while Φ on the observed
+    /// information grows past it — the exact sign that the expected-information
+    /// hook removes the gam#979 saturation reward. Both Φ are evaluated through
+    /// the SAME `joint_jeffreys_term` value path on the FULL identifiable span
+    /// (`Z_J = I`), differing only in the information matrix consumed.
+    #[test]
+    fn expected_info_jeffreys_does_not_reward_probit_saturation() {
+        let base = binomial_location_scale_base_fixture();
+        let family = BinomialLocationScaleFamily {
+            y: base.y,
+            weights: base.weights,
+            link_kind: InverseLink::Standard(StandardLink::Probit),
+            threshold_design: Some(base.threshold_design.clone()),
+            log_sigma_design: Some(base.log_sigma_design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let specs = vec![base.threshold_spec, base.log_sigma_spec];
+        let x_t = specs[BinomialLocationScaleFamily::BLOCK_T]
+            .design
+            .as_dense_ref()
+            .expect("threshold dense design");
+        let x_ls = specs[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
+            .design
+            .as_dense_ref()
+            .expect("log-sigma dense design");
+        let total = x_t.ncols() + x_ls.ncols();
+        let z = Array2::<f64>::eye(total);
+
+        // Φ on a supplied information matrix at threshold β_t (log-σ fixed at 0,
+        // so σ = 1 and q = -β_t scans the probit argument across saturation).
+        let phi_on = |info: &Array2<f64>| -> f64 {
+            let (phi, _grad, _hphi) =
+                crate::estimate::reml::jeffreys_subspace::joint_jeffreys_term(
+                    info.view(),
+                    z.view(),
+                    |_axis: &Array1<f64>| Ok(None),
+                )
+                .expect("jeffreys term value");
+            phi
+        };
+        let states_at = |beta_t: f64| -> Vec<ParameterBlockState> {
+            let bt = Array1::from_elem(x_t.ncols(), beta_t);
+            let bls = Array1::zeros(x_ls.ncols());
+            vec![
+                ParameterBlockState {
+                    eta: x_t.dot(&bt),
+                    beta: bt,
+                },
+                ParameterBlockState {
+                    eta: x_ls.dot(&bls),
+                    beta: bls,
+                },
+            ]
+        };
+
+        // Sweep the threshold into deep probit saturation.
+        let betas = [1.0_f64, 2.0, 3.0, 4.0, 6.0, 8.0];
+        let mut phi_obs = Vec::with_capacity(betas.len());
+        let mut phi_exp = Vec::with_capacity(betas.len());
+        for &b in betas.iter() {
+            let states = states_at(b);
+            let obs = family
+                .exact_newton_joint_hessian_with_specs(&states, &specs)
+                .expect("observed hessian")
+                .expect("observed hessian available");
+            let exp = family
+                .joint_jeffreys_information_with_specs(&states, &specs)
+                .expect("expected information")
+                .expect("expected information available");
+            phi_obs.push(phi_on(&obs));
+            phi_exp.push(phi_on(&exp));
+        }
+
+        // (1) The expected-information Jeffreys term is BOUNDED across the sweep
+        // (no runaway reward); concretely it does not increase from its
+        // mild-saturation value to its deepest-saturation value — the valley is
+        // gone (decaying expected information).
+        let exp_first = phi_exp[0];
+        let exp_last = *phi_exp.last().expect("nonempty");
+        assert!(
+            exp_last <= exp_first + 1e-9,
+            "expected-info Jeffreys Φ rewarded saturation: Φ_exp went {exp_first:.6} → {exp_last:.6} \
+             across β_t {:?} (full sweep {phi_exp:?})",
+            betas
+        );
+
+        // (2) The observed-information Jeffreys term, in contrast, GROWS into
+        // saturation and overtakes the expected one — the genuine valley the
+        // layer-5 hook exists to remove. This makes the test a real
+        // discriminator: it fails if the family silently reverts to observed
+        // information.
+        let obs_last = *phi_obs.last().expect("nonempty");
+        assert!(
+            obs_last > exp_last + 0.5,
+            "observed-info Jeffreys Φ did not exhibit the saturation valley the \
+             expected-info hook removes: Φ_obs_last={obs_last:.6} vs Φ_exp_last={exp_last:.6} \
+             (Φ_obs sweep {phi_obs:?}, Φ_exp sweep {phi_exp:?})"
+        );
+    }
+
     #[test]
     fn binomial_location_scale_expected_info_contracted_trace_matches_second_directional() {
         let base = binomial_location_scale_base_fixture();
