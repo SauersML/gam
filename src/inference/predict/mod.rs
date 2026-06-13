@@ -5952,6 +5952,57 @@ where
 ///
 /// Shared by [`predict_gamwith_uncertainty`] and the posterior-mean drivers so
 /// the per-family observation-noise definition has a single source of truth.
+///
+/// Per-row conditional response (observation-noise) variance `Var(Y | μ)` on the
+/// response scale, the same per-family definition [`family_observation_band`]
+/// folds into its predictive band. Returns `None` for families without a
+/// closed-form conditional variance (`RoystonParmar`), exactly mirroring the
+/// band's `(None, None)` arm.
+///
+/// This is the noise term a *prediction* interval on `Y` must carry in addition
+/// to the epistemic mean SE: the conformal auto-route normalizes its
+/// nonconformity score by the predictive SE `√(SE(μ̂)² + Var(Y|μ))`, not the
+/// mean SE alone — normalizing by the (much smaller, x-varying) epistemic mean
+/// SE injects spurious heteroscedasticity and under-covers `Y` in the
+/// data-dense interior (#1054).
+pub(crate) fn family_response_variance<S>(
+    response: &ResponseFamily,
+    mean: &Array1<f64>,
+    source: &S,
+) -> Option<Array1<f64>>
+where
+    S: UncertaintyCovarianceSource + ?Sized,
+{
+    match response {
+        ResponseFamily::Gaussian => {
+            let obsvar = source.observation_standard_deviation().max(0.0).powi(2);
+            Some(Array1::from_elem(mean.len(), obsvar))
+        }
+        ResponseFamily::Poisson => Some(mean.mapv(|mu| mu.max(0.0))),
+        ResponseFamily::NegativeBinomial { theta, .. } => {
+            let theta = source.observation_theta().unwrap_or(*theta);
+            Some(mean.mapv(|mu| mu + mu.powi(2) / theta))
+        }
+        ResponseFamily::Tweedie { p } => {
+            let phi = source.observation_phi().unwrap_or(1.0);
+            Some(mean.mapv(|mu| phi * mu.powf(*p)))
+        }
+        ResponseFamily::Gamma => {
+            let phi = source.observation_phi().unwrap_or(1.0);
+            Some(mean.mapv(|mu| phi * mu.powi(2)))
+        }
+        ResponseFamily::Beta { phi } => {
+            let phi = source.observation_phi().unwrap_or(*phi);
+            Some(mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi)))
+        }
+        ResponseFamily::Binomial => Some(mean.mapv(|mu| {
+            let p = mu.clamp(0.0, 1.0);
+            p * (1.0 - p)
+        })),
+        ResponseFamily::RoystonParmar => None,
+    }
+}
+
 pub(crate) fn family_observation_band<S>(
     response: &ResponseFamily,
     eta: &Array1<f64>,
@@ -6591,15 +6642,55 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
         return Ok(result);
     }
 
+    // Split-conformal nonconformity must be scored on the PREDICTION scale, not
+    // the epistemic mean scale. The conformal interval covers a fresh response
+    // `Y`, whose spread is `√(SE(μ̂)² + Var(Y|μ))` — the same predictive SE the
+    // observation band uses. Normalizing by the mean SE alone (which omits the
+    // response-noise term and, for a smooth fit, is far smaller than the noise
+    // SD and varies several-fold across x) injects spurious heteroscedasticity
+    // and under-covers `Y` in the data-dense interior (#1054). When the family
+    // exposes no closed-form conditional variance (`RoystonParmar`) we fall back
+    // to the mean SE — the only available scale — which is exactly the prior
+    // behavior for that family.
+    let cal_scale =
+        predictive_standard_error(family, &cal_result.mean, &cal_result.mean_standard_error, fit);
+    let test_scale =
+        predictive_standard_error(family, &result.mean, &result.mean_standard_error, fit);
     let calibrator = crate::inference::conformal::ConformalCalibrator::from_held_out_fold(
         calibration.y,
         cal_result.mean.view(),
-        cal_result.mean_standard_error.view(),
+        cal_scale.view(),
         alpha,
     )?;
     let bounds = ResponseBounds::for_family(&family.response);
-    calibrator.apply_to_uncertainty_result(&mut result, bounds)?;
+    let (lower, upper) = calibrator.calibrated_interval(&result.mean, &test_scale, bounds)?;
+    result.mean_lower = lower;
+    result.mean_upper = upper;
     Ok(result)
+}
+
+/// Predictive (observation-scale) standard error `√(SE(μ̂)² + Var(Y|μ))` per row,
+/// the spread of a fresh response the conformal prediction interval must cover.
+/// Falls back to the epistemic mean SE when the family has no closed-form
+/// conditional response variance ([`family_response_variance`] returns `None`).
+fn predictive_standard_error<S>(
+    family: &LikelihoodSpec,
+    mean: &Array1<f64>,
+    mean_standard_error: &Array1<f64>,
+    source: &S,
+) -> Array1<f64>
+where
+    S: UncertaintyCovarianceSource + ?Sized,
+{
+    match family_response_variance(&family.response, mean, source) {
+        Some(response_var) => Array1::from_iter(
+            mean_standard_error
+                .iter()
+                .zip(response_var.iter())
+                .map(|(&se, &var)| (se.powi(2) + var.max(0.0)).max(0.0).sqrt()),
+        ),
+        None => mean_standard_error.clone(),
+    }
 }
 
 /// Attempt the exact Gaussian-identity full-conformal route. Returns `Ok(true)`
