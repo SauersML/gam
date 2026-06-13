@@ -11855,4 +11855,76 @@ mod tests {
             );
         }
     }
+
+    /// Wall-clock benchmark of the reduced-Schur matvec at the SAE-LLM shape
+    /// (#1017): sequential per-row fold vs the rayon-parallel chunked path.
+    /// `#[ignore]` — a measurement, not a gate (timing is machine-dependent and
+    /// CI boxes are loaded). Run explicitly on a quiet multicore box:
+    ///
+    /// ```text
+    /// cargo test -p gam --lib --release \
+    ///   solver::arrow_schur::tests::bench_reduced_schur_matvec_parallel_speedup \
+    ///   -- --ignored --nocapture
+    /// ```
+    ///
+    /// Prints per-call wall-clock for both paths and the speedup at the inner
+    /// CG matvec cost the production InexactPCG loop pays O(cg_iters) times.
+    #[test]
+    #[ignore = "wall-clock perf benchmark; run explicitly with --ignored --nocapture"]
+    fn bench_reduced_schur_matvec_parallel_speedup() {
+        // SAE Qwen-arm-flavoured shape from the issue: n ≈ 2000 row blocks,
+        // wide border k ≈ 2048, modest frame depth d.
+        let n = 2000usize;
+        let d = 6usize;
+        let k = 2048usize;
+        let sys = dense_arrow_system(n, d, k);
+        let backend = CpuBatchedBlockSolver;
+        let htt_factors = backend
+            .factor_blocks(&sys.rows, 0.0, d, false)
+            .expect("SPD per-row blocks must factor");
+        let ridge_beta = 1e-6;
+        let x = Array1::from_iter((0..k).map(|a| 0.3 * ((a as f64) * 0.017).sin() - 0.1));
+
+        // A representative inner-CG budget: the matvec is paid once per CG iter.
+        let calls = 100usize;
+        let mut sink = 0.0_f64;
+
+        // Warm up (factor caches, allocator, rayon pool) before timing.
+        let _warm = schur_matvec_sequential_ref(&sys, &htt_factors, ridge_beta, &x, &backend);
+        sink += _warm[0];
+
+        let t_seq = std::time::Instant::now();
+        for _ in 0..calls {
+            let out = schur_matvec_sequential_ref(&sys, &htt_factors, ridge_beta, &x, &backend);
+            sink += out[0];
+        }
+        let seq_elapsed = t_seq.elapsed();
+
+        let mut out_par = Array1::<f64>::zeros(k);
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_par, &backend); // warm
+        sink += out_par[0];
+        let t_par = std::time::Instant::now();
+        for _ in 0..calls {
+            schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_par, &backend);
+            sink += out_par[0];
+        }
+        let par_elapsed = t_par.elapsed();
+
+        let seq_per = seq_elapsed.as_secs_f64() / calls as f64;
+        let par_per = par_elapsed.as_secs_f64() / calls as f64;
+        let speedup = seq_per / par_per;
+        println!(
+            "[#1017 reduced-Schur matvec, n={n} d={d} k={k}, {calls} calls, \
+             {} rayon threads]\n  sequential: {:.3} ms/call\n  parallel:   {:.3} ms/call\n  \
+             speedup:    {:.2}x  (sink {:.3e})",
+            rayon::current_num_threads(),
+            seq_per * 1e3,
+            par_per * 1e3,
+            speedup,
+            sink,
+        );
+        // Loose floor so a single-core or heavily-loaded box does not flap the
+        // benchmark; the real signal is the printed numbers.
+        assert!(par_per > 0.0 && seq_per > 0.0, "timings must be positive");
+    }
 }
