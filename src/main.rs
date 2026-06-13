@@ -4284,6 +4284,21 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             model_class = model.predict_model_class()
         ));
     }
+    // A spline-scan model (a Standard fit routed through the exact O(n)
+    // smoother) keeps no dense design/Gram, and ALO leverage is defined off
+    // exactly that dense leave-one-out hat matrix — so it cannot be computed
+    // from the per-knot posterior. Surface a precise error rather than the
+    // cryptic missing-resolved_termspec one (#1046).
+    if model.spline_scan.is_some() {
+        return Err(
+            "diagnose --alo needs the dense leave-one-out leverage, which a \
+             spline-scan model does not retain (it stores only the per-knot \
+             posterior of the exact O(n) smoother). Use `gam report <model>` \
+             for its fitted quantities, or refit with double_penalty=true to \
+             obtain the dense fit ALO requires."
+                .to_string(),
+        );
+    }
     progress.set_stage("diagnose", "loading diagnostic dataset");
     let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
     require_dataset_rows("diagnose", &args.data, ds.values.nrows())?;
@@ -6833,6 +6848,72 @@ fn run_generate_unified(
     }
 }
 
+/// Render the report for a spline-scan model (#1046) from its reconstructed
+/// scalar quantities and the single smooth's EDF block, reusing the standard
+/// `report::write_report` renderer. A scan model retains no dense design/Gram,
+/// so there is no coefficient table or data-dependent diagnostics surface here
+/// — the headline EDF / λ / REML / deviance are recovered exactly from the
+/// saved `SplineScanFit`, matching the FFI `summary()` path.
+fn run_report_spline_scan(
+    mut progress: gam::visualizer::VisualizerSession,
+    args: &ReportArgs,
+    model: &SavedModel,
+    feature_column: &str,
+    scan: &gam::solver::spline_scan::SplineScanFit,
+) -> Result<(), String> {
+    progress.advance_workflow(1);
+    progress.set_stage("report", "generating html");
+    let mut notes = vec![format!(
+        "Exact O(n) state-space spline scan for s({feature_column}): \
+         λ={:.4e}, EDF={:.3}, knots={}. The smoother retains the per-knot \
+         posterior, not a dense design/Gram, so no coefficient table is shown.",
+        scan.lambda(),
+        scan.edf(),
+        scan.knots.len(),
+    )];
+    if args.data.is_some() {
+        notes.push(
+            "Data provided, but held-out diagnostics for spline-scan models are \
+             served through the Python diagnose() / predict() path; the CLI \
+             report shows the fitted scalar quantities only."
+                .to_string(),
+        );
+    }
+    let input = report::ReportInput {
+        model_path: args.model.display().to_string(),
+        family_name: model.likelihood().pretty_name().to_string(),
+        model_class: format!("{:?}", model.predict_model_class()),
+        formula: model.formula.clone(),
+        n_obs: Some(scan.n_obs()),
+        deviance: scan.deviance(),
+        reml_score: -scan.restricted_loglik,
+        iterations: 0,
+        convergence_status: "exact (state-space spline scan)".to_string(),
+        converged: true,
+        outer_gradient_norm: None,
+        criterion_certificate: None,
+        edf_total: scan.edf(),
+        r_squared: None,
+        coefficients: Vec::new(),
+        edf_blocks: vec![report::EdfBlockRow {
+            index: 0,
+            edf: scan.edf(),
+            role: Some("smooth".to_string()),
+        }],
+        continuous_order: Vec::new(),
+        anisotropic_scales: Vec::new(),
+        measure_jet_spectra: Vec::new(),
+        diagnostics: None,
+        smooth_plots: Vec::new(),
+        alo: None,
+        notes,
+    };
+    let out = report::write_report(&input, args.out.as_deref(), &args.model)?;
+    progress.finish_progress("report complete");
+    cli_out!("wrote report: {}", out.display());
+    Ok(())
+}
+
 fn run_report(args: ReportArgs) -> Result<(), String> {
     use gam::probability::standard_normal_quantile;
 
@@ -6841,6 +6922,17 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     progress.start_workflow("Report", report_total_steps);
     progress.set_stage("report", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
+    // Spline-scan model (#1030/#1034/#1046): no dense fit_result exists — the
+    // exact O(n) state-space smoother keeps only the per-knot posterior. Render
+    // the report from the reconstructed scalar quantities (the same EDF / λ /
+    // REML the fit log prints) and return, instead of demanding a dense fit.
+    if let Some((feature_column, scan)) = model
+        .saved_spline_scan()
+        .map_err(|e| e.to_string())?
+        .map(|(c, f)| (c.to_string(), f))
+    {
+        return run_report_spline_scan(progress, &args, &model, &feature_column, &scan);
+    }
     let family = model.likelihood();
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     progress.advance_workflow(1);
