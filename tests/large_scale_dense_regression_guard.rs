@@ -143,6 +143,7 @@ fn large_scale_dense_logit_regression_guard() {
             sas_link: None,
             optimize_sas: false,
             compute_inference: true,
+            skip_rho_posterior_inference: false,
             max_iter: 100,
             tol: 1e-6,
             nullspace_dims: vec![2, 2],

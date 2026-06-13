@@ -189,6 +189,7 @@ fn glm_opts(family: LikelihoodSpec, nullspace_dims: Vec<usize>) -> ExternalOptim
         optimize_sas: false,
         family,
         compute_inference: true,
+        skip_rho_posterior_inference: false,
         max_iter: INNER_MAX_ITER,
         tol: INNER_TOL,
         nullspace_dims,

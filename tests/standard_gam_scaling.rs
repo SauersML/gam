@@ -147,6 +147,7 @@ fn run_fit_with_k(n: usize, k: usize) -> (f64, usize, usize, bool) {
             sas_link: None,
             optimize_sas: false,
             compute_inference: true,
+            skip_rho_posterior_inference: false,
             max_iter: 100,
             tol: 1e-6,
             nullspace_dims: vec![2],

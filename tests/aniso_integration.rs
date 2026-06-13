@@ -107,6 +107,7 @@ fn aniso_matern_recovers_signal_axis() {
             sas_link: None,
             optimize_sas: false,
             compute_inference: false,
+            skip_rho_posterior_inference: false,
             max_iter: 30,
             tol: 1e-6,
             nullspace_dims: vec![],
