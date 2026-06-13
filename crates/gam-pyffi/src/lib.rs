@@ -17,7 +17,10 @@ use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_like
 use gam::families::survival_predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
-use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
+use gam::DispersionLocationScaleFitResult;
+use gam::gamlss::{
+    BinomialLocationScaleFitResult, DispersionFamilyKind, GaussianLocationScaleFitResult,
+};
 use gam::gaussian_reml::{
     GaussianRemlMultiBackwardProblem, build_gaussian_reml_eigen_cache_batched,
     gaussian_reml_blocks_orthogonal_shared_scale, gaussian_reml_free_b_score,
@@ -17083,6 +17086,28 @@ fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
     detach_py_result(py, "summary_json", move || summary_json_impl(&model_bytes))
 }
 
+/// #944 curvature-as-an-estimand report for every `curv(...)` constant-curvature
+/// smooth in a fitted model: κ̂, its profile-likelihood CI, the interior κ = 0
+/// likelihood-ratio flatness test, and the sign-of-CI geometry verdict.
+///
+/// Unlike `summary_json` (κ̂ only — a pure read), the CI and flatness test
+/// re-profile the criterion `V_p(κ)` and so need the model's training data
+/// (`headers`/`rows` for its training formula). The fitted κ̂ comes from the
+/// model's saved (frozen) `resolved_termspec`; the data only supply the
+/// responses/weights/offset the per-κ profile refits need.
+#[pyfunction]
+fn curvature_inference_json(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    level: Option<f64>,
+) -> PyResult<String> {
+    detach_py_result(py, "curvature_inference_json", move || {
+        curvature_inference_json_impl(&model_bytes, headers, rows, level.unwrap_or(0.95))
+    })
+}
+
 #[pyfunction]
 fn summary_payload_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
     let payload = detach_py_result(py, "summary_payload_from_model", move || {
@@ -26249,6 +26274,88 @@ fn posterior_predict_bands_table_impl(
         .map_err(|err| format!("failed to serialize posterior_predict_bands payload: {err}"))
 }
 
+/// Posterior predictive η matrix for a bernoulli marginal-slope model (#1049).
+///
+/// Unlike a standard GAM (`η = X·β`), the marginal-slope linear predictor is a
+/// nonlinear rigid-kernel map of the marginal + logslope coefficient blocks and
+/// the latent-z column. We propagate the full β-posterior through that map: for
+/// each saved Laplace draw `θ_k` (in the saved `[marginal | logslope |
+/// score_warp? | link_dev?]` block order) we evaluate the exact per-row final η
+/// via `BernoulliMarginalSlopePredictor::final_eta_from_theta`. The resulting
+/// `(n_draws × n_rows)` η matrix is collapsed by the shared eta→bands path with
+/// the probit inverse link (`μ = Φ(η)`), identical to the point predict path, so
+/// the credible band and the point predictor agree by construction.
+fn posterior_predict_marginal_slope_eta(
+    model: &FittedModel,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    samples_flat: Vec<f64>,
+    n_draws: usize,
+    n_coeffs: usize,
+) -> Result<String, String> {
+    let predictor = model.bernoulli_marginal_slope_predictor()?;
+    let theta_len = predictor.theta_len();
+    if n_coeffs != theta_len {
+        return Err(format!(
+            "posterior_predict coefficient count mismatch: samples have {n_coeffs} coefficients \
+             but the marginal-slope predictor consumes {theta_len} (marginal + logslope + any \
+             score-warp / link-deviation blocks). The posterior was likely produced from a \
+             different fit than this model; rerun model.sample(...) on the same model."
+        ));
+    }
+    let dataset = dataset_with_model_schema(model, &headers, &rows)?;
+    drop(rows);
+    drop(headers);
+    let col_map = dataset.column_map();
+    let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
+    let offset_noise =
+        resolve_offset_column(&dataset, &col_map, model.noise_offset_column.as_deref())?;
+    let predict_input = build_predict_input_for_model(
+        model,
+        dataset.values.view(),
+        &col_map,
+        model.training_headers.as_ref(),
+        &offset,
+        &offset_noise,
+        false,
+    )?;
+    let samples = Array2::<f64>::from_shape_vec((n_draws, n_coeffs), samples_flat)
+        .map_err(|err| format!("failed to reshape samples: {err}"))?;
+    // Per-draw final η. Each row of `samples` is one posterior draw of the full
+    // coefficient vector; map it through the marginal-slope kernel to its η
+    // surface over the prediction rows.
+    let mut eta_rows: Vec<Array1<f64>> = Vec::with_capacity(n_draws);
+    let mut n_rows = 0usize;
+    for k in 0..n_draws {
+        let theta = samples.row(k).to_owned();
+        let eta = predictor
+            .final_eta_from_theta(&predict_input, &theta)
+            .map_err(|err| format!("marginal-slope posterior predict draw {k}: {err}"))?;
+        if k == 0 {
+            n_rows = eta.len();
+        } else if eta.len() != n_rows {
+            return Err(format!(
+                "marginal-slope posterior predict draw {k} produced {} rows, expected {n_rows}",
+                eta.len()
+            ));
+        }
+        eta_rows.push(eta);
+    }
+    let mut eta_flat: Vec<f64> = Vec::with_capacity(n_draws * n_rows);
+    for eta in &eta_rows {
+        eta_flat.extend(eta.iter().copied());
+    }
+    let payload = PosteriorPredictPayload {
+        eta_flat,
+        n_draws,
+        n_rows,
+        model_class: prediction_model_class_label(model),
+        family_kind: family_link_kind(&model_likelihood_spec(model)).to_string(),
+    };
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize posterior_predict payload: {err}"))
+}
+
 fn posterior_predict_table_impl(
     model_bytes: &[u8],
     headers: Vec<String>,
@@ -26270,11 +26377,29 @@ fn posterior_predict_table_impl(
         ));
     }
     let model = load_model_impl(model_bytes)?;
+    // Bernoulli marginal-slope posterior predictive (#1049): η is not X·β —
+    // each draw must be mapped through the marginal-slope rigid kernel — so it
+    // gets its own per-draw eta path. The Laplace draws already exist
+    // (sample() works); we propagate the full β-posterior through the
+    // marginal-slope link to get a principled predictive η matrix.
+    if matches!(
+        model.predict_model_class(),
+        PredictModelClass::BernoulliMarginalSlope
+    ) {
+        return posterior_predict_marginal_slope_eta(
+            &model,
+            headers,
+            rows,
+            samples_flat,
+            n_draws,
+            n_coeffs,
+        );
+    }
     if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
         return Err(format!(
-            "posterior_predict currently supports only standard GAM models; got '{}'. \
-             Per-class posterior-predict paths for location-scale / marginal-slope / \
-             transformation-normal will be wired in a follow-up.",
+            "posterior_predict currently supports only standard GAM and bernoulli \
+             marginal-slope models; got '{}'. Per-class posterior-predict paths for \
+             location-scale / transformation-normal will be wired in a follow-up.",
             prediction_model_class_label(&model)
         ));
     }
