@@ -386,10 +386,21 @@ pub fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
 }
 
 /// Right-pad a vector with its last value, or 0.0 when empty.
+///
+/// `pad_to` is a *grow-only* helper used to lift a short column up to the common
+/// wire width of a ragged reference frame; the padded tail is never read by a
+/// correctly-sliced reference body. Asking it to *shrink* a column (target
+/// shorter than the source) is always a caller bug — it would silently drop the
+/// tail of real data — so this is a hard error with an actionable message rather
+/// than a quiet truncation. The usual culprit is padding a full-data column to a
+/// train-split width: pad every column to a single `n = max(len)` and slice each
+/// by its own semantic length inside the reference body instead.
 pub fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
     assert!(
         v.len() <= len,
-        "pad target {len} shorter than source {}",
+        "pad_to cannot shrink: source has {} rows but the pad target is {len} \
+         (a shorter target would drop real data). Pad every column to a common \
+         n = max(column length) and slice by semantic length in the reference body.",
         v.len()
     );
     let fill = v.last().copied().unwrap_or(0.0);
@@ -568,4 +579,47 @@ pub fn pearson(a: &[f64], b: &[f64]) -> f64 {
         sbb += db * db;
     }
     sab / (saa.sqrt() * sbb.sqrt()).max(1e-300)
+}
+
+#[cfg(test)]
+mod pad_to_tests {
+    use super::pad_to;
+
+    /// Regression for #1084: the exact shape that used to panic with the
+    /// inscrutable "pad target 490 shorter than source 654". A full-data column
+    /// (654 rows) padded down to a train-split width (490 rows) must still be a
+    /// hard error — silently dropping 164 rows of real data is never correct —
+    /// but now with an actionable message naming the cause and the fix.
+    #[test]
+    #[should_panic(expected = "pad_to cannot shrink")]
+    fn shrink_to_train_split_is_a_clear_error() {
+        let full = vec![1.0; 654];
+        let _ = pad_to(&full, 490);
+    }
+
+    /// The documented fix: padding both a full-data column and a train-split
+    /// column to a common `n = max(len)` yields equal-length columns whose
+    /// real-data prefixes are preserved, so a reference body can slice each by
+    /// its own semantic length. This is the consistent-split path #1084's
+    /// prostate test now follows.
+    #[test]
+    fn pad_full_and_train_to_common_n_is_consistent() {
+        let n = 654usize;
+        let n_train = 490usize;
+        let full: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let train: Vec<f64> = (0..n_train).map(|i| (1000 + i) as f64).collect();
+
+        let full_wire = pad_to(&full, n);
+        let train_wire = pad_to(&train, n);
+        assert_eq!(full_wire.len(), n);
+        assert_eq!(train_wire.len(), n);
+
+        // Real-data prefixes survive untouched.
+        assert_eq!(&full_wire[..n], &full[..]);
+        assert_eq!(&train_wire[..n_train], &train[..]);
+        // The padded tail repeats the last real value (never read by a body
+        // that slices by `n_train`), confirming no real data leaks past it.
+        assert_eq!(train_wire[n_train], train[n_train - 1]);
+        assert_eq!(train_wire[n - 1], train[n_train - 1]);
+    }
 }
