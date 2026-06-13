@@ -119,6 +119,31 @@ const LOG_LAMBDA_TOL: f64 = 1e-6;
 const CG_RTOL: f64 = 1e-10;
 const CG_MAX_ITERS: usize = 4000;
 
+/// Quasi-uniformity guard (issue #1032, caveat 2). The BPX n-independent CG
+/// iteration bound rests on the nested ε-nets being quasi-uniform *in the
+/// metric-scaled coordinates `z = diag(metric)·x` the bumps live in*. The
+/// greedy net guarantees covering ≤ h and separation ≥ h in `z` by
+/// construction, so the only way the BPX norm-equivalence constant blows up is
+/// when the metric is so anisotropic that the metric-scaled point cloud is
+/// effectively degenerate along a direction — the data collapses onto a lower
+/// dimension in `z`, the root covering radius `h₀ = ½·max_a range_a` swamps the
+/// collapsed axis, the level-`l` bumps overlap pathologically, and the
+/// preconditioner constant (hence the iteration count) grows without an
+/// n-independent bound. The realized symptom is `solve_iters` climbing toward
+/// [`CG_MAX_ITERS`]; this guard detects the *cause* up front from the
+/// metric-scaled per-axis spread so the auto-route can fall back to the dense
+/// kernel BEFORE paying an unbounded iterative solve, rather than discovering
+/// the blow-up only after `CG_MAX_ITERS` work.
+///
+/// Condition measure: the ratio of the largest to smallest metric-scaled
+/// per-axis standard deviation (a scale-free aspect ratio of the scaled
+/// cloud). Past this threshold the net is no longer quasi-uniform in every
+/// direction and the BPX bound is not trustworthy. Derived, not a knob: a
+/// `10³` aspect ratio means the collapsed axis carries <0.1% of the dominant
+/// axis's variation, at which point its bumps span the whole cloud and the
+/// multilevel hierarchy degenerates to a single ill-conditioned level.
+const QUASI_UNIFORMITY_MAX_ASPECT: f64 = 1.0e3;
+
 /// SLQ controls: fixed Rademacher probes (shared across λ trials) and the
 /// Lanczos depth per probe (full reorthogonalization; early exit on
 /// breakdown).
@@ -991,6 +1016,60 @@ impl ResidualCascadeDesign {
         self.core.levels.len()
     }
 
+    /// Aspect ratio of the metric-scaled point cloud: the ratio of the largest
+    /// to smallest per-axis standard deviation of the scaled coordinates `z`.
+    /// This is the metric-condition measure the quasi-uniformity guard (issue
+    /// #1032, caveat 2) keys on — see [`QUASI_UNIFORMITY_MAX_ASPECT`]. A value
+    /// near 1 is an isotropic (benign) cloud; a large value means the metric
+    /// has collapsed the data onto a lower-dimensional sheet in `z`, breaking
+    /// the BPX n-independent iteration bound.
+    pub fn metric_scaled_aspect_ratio(&self) -> f64 {
+        let dim = self.core.dim;
+        let n = self.core.z.len();
+        if dim == 0 || n == 0 {
+            return 1.0;
+        }
+        let mut mean = [0.0_f64; 3];
+        for p in &self.core.z {
+            for a in 0..dim {
+                mean[a] += p[a];
+            }
+        }
+        for m in mean.iter_mut().take(dim) {
+            *m /= n as f64;
+        }
+        let mut var = [0.0_f64; 3];
+        for p in &self.core.z {
+            for a in 0..dim {
+                let d = p[a] - mean[a];
+                var[a] += d * d;
+            }
+        }
+        let mut sd_lo = f64::INFINITY;
+        let mut sd_hi = 0.0_f64;
+        for v in var.iter().take(dim) {
+            let sd = (v / n as f64).sqrt();
+            sd_lo = sd_lo.min(sd);
+            sd_hi = sd_hi.max(sd);
+        }
+        if !(sd_lo > 0.0 && sd_lo.is_finite()) {
+            // A collapsed axis (zero scaled spread) is maximally degenerate.
+            return f64::INFINITY;
+        }
+        sd_hi / sd_lo
+    }
+
+    /// Quasi-uniformity certificate (issue #1032, caveat 2): `true` iff the
+    /// metric-scaled cloud is isotropic enough that the BPX n-independent CG
+    /// iteration bound is trustworthy. When this returns `false` the auto-route
+    /// MUST fall back to the dense kernel path rather than pay an iterative
+    /// solve whose iteration count is no longer n-independent — the CG residual
+    /// certificate would still *catch* a mis-solve at [`CG_MAX_ITERS`], but the
+    /// guard prevents the silent O(n·iters) blow-up up front.
+    pub fn quasi_uniformity_certified(&self) -> bool {
+        self.metric_scaled_aspect_ratio() <= QUASI_UNIFORMITY_MAX_ASPECT
+    }
+
     /// Total coefficient count (`dim + 1` polynomial + all centers).
     pub fn num_coeffs(&self) -> usize {
         self.core.m
@@ -1355,7 +1434,39 @@ pub fn fit_residual_cascade(
     let mut levels = INITIAL_LEVELS;
     loop {
         let design = ResidualCascadeDesign::build(xs, y, w, metric, sobolev_s, levels)?;
+        // Quasi-uniformity guard (issue #1032, caveat 2): if the metric has
+        // collapsed the cloud onto a near-degenerate sheet in scaled
+        // coordinates, the BPX iteration bound no longer holds. Refuse the
+        // iterative solve up front with a typed signal so the auto-route falls
+        // back to the dense kernel BEFORE paying an unbounded CG, rather than
+        // grinding to CG_MAX_ITERS. (The guard is checked at the root level
+        // only — refinement adds finer nets to the SAME scaled cloud, so the
+        // aspect ratio is invariant under added levels.)
+        if levels == INITIAL_LEVELS && !design.quasi_uniformity_certified() {
+            return Err(format!(
+                "residual cascade: metric-scaled aspect ratio {:.3e} exceeds the \
+                 quasi-uniformity ceiling {QUASI_UNIFORMITY_MAX_ASPECT:.0e}; the BPX \
+                 iteration bound is not trustworthy on this (near-degenerate) metric — \
+                 fall back to the dense kernel path",
+                design.metric_scaled_aspect_ratio()
+            ));
+        }
         let mut fit = design.fit_reml()?;
+        // Log the realized CG iteration count at this cascade depth (issue
+        // #1032 caveat: make the n-independence of the BPX bound visible, the
+        // way #1029 logs its line-search probes). `solve_iters` is 0 on the
+        // dense route (m ≤ DENSE_GRAM_MAX) and the realized PCG count on the
+        // iterative route; a count creeping toward CG_MAX_ITERS is the runtime
+        // tell that the quasi-uniformity guard's static aspect-ratio check was
+        // too lenient for this cloud.
+        eprintln!(
+            "residual_cascade: depth={levels} centers={} cg_iters={} \
+             solve_rel_residual={:.3e} aspect_ratio={:.3e}",
+            design.num_centers(),
+            fit.certificate.solve_iters,
+            fit.certificate.solve_rel_residual,
+            design.metric_scaled_aspect_ratio(),
+        );
         let gain = design.next_level_gain_bound(&fit)?;
         let tolerance = REFINE_TOL * fit.rss_pen;
         match gain {
