@@ -74,7 +74,6 @@ use coefficient_transforms::{
 use input_standardization::{
     apply_input_standardization, compensate_length_scale_for_standardization,
     compensate_optional_length_scale_for_standardization, compute_spatial_input_scales,
-    geometric_mean_scale,
 };
 pub use error::SmoothError;
 
