@@ -5,7 +5,6 @@
 //! box load, so they localize the d>=20 cliff even on a saturated node.
 
 use csv::StringRecord;
-use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
