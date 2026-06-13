@@ -27002,6 +27002,21 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     } else {
         FallbackPolicy::Automatic
     };
+    // Calibrate the outer solver to the n-scaled profiled REML/LAML objective.
+    // The profiled criterion is a sum over n observations, so |f| ~ O(n) for
+    // every family. Without this calibration the outer ARC/BFGS:
+    //   (a) uses a bare absolute gradient floor of `outer_tol ≈ 1e-5` — this
+    //       IS achievable at scale but forces the optimizer to iterate until
+    //       |g| ≤ 1e-5 even when |f| ~ 200 and τ·(1+|f|) ~ 2e-3 already
+    //       signals convergence in the relative-to-cost sense; and
+    //   (b) ARC's initial trust-region regularization `σ₀=1` and default
+    //       operator trust radius `τ₀=1` reference the wrong curvature
+    //       magnitude — the first ARC step overshoots when the Hessian is
+    //       O(n) and the trust radius is O(1).
+    // Mirroring the spatial exact-joint outer fix (#1053/#1066/#1069) and
+    // the primary REML outer (solver/estimate.rs) for the custom-family path.
+    let n_obs = specs.first().map(|s| s.design.nrows()).unwrap_or(0);
+    let p_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
@@ -27013,6 +27028,14 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_initial_rho(rho0.clone())
         .with_screen_initial_rho(options.screen_initial_rho)
+        // n-scaled profiled-criterion calibration: absolute gradient floor =
+        // max(outer_tol, n·1e-9), ARC σ₀ = 0.25, operator trust radius = 4.0.
+        // Mirrors the primary REML outer (solver/estimate.rs) and the spatial
+        // exact-joint path.
+        .with_objective_scale(if n_obs > 0 { Some(n_obs as f64) } else { None })
+        .with_problem_size(n_obs, p_total.max(1))
+        .with_arc_initial_regularization(if n_obs > 0 { Some(0.25) } else { None })
+        .with_operator_initial_trust_radius(if n_obs > 0 { Some(4.0) } else { None })
         // Per-coordinate ρ box bounds. The uniform ceiling of 10 is the
         // belt-and-suspenders cap: λ = exp(10) ≈ 22k is already extremely strong
         // shrinkage, and the bound keeps the optimizer out of the dead-flat

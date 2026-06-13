@@ -3164,6 +3164,15 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .is_some_and(|t| t.contains(psi))
     }
 
+    /// Return the most-recently converged inner β from the last PIRLS solve, if
+    /// it is finite and the right dimension. Used by `SpatialJointContext` to
+    /// warm-start successive outer evaluations instead of cold-starting PIRLS
+    /// from zero every iteration — especially important for GLM families (Poisson,
+    /// NB, Binomial) that cannot use the Gaussian Gram tensor n-free shortcut.
+    pub(crate) fn current_beta(&self) -> Option<Array1<f64>> {
+        self.reml_state.current_original_basis_beta()
+    }
+
     /// Install the n-free per-ψ Gaussian sufficient statistics from the certified
     /// ψ-Gram tensor (#1033b), when one is present and `theta`'s single ψ lies
     /// inside the certified window. Idempotent in ψ — must be called on EVERY
