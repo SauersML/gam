@@ -124,7 +124,7 @@ def fit_slice(
         X=Z,
         K=n_atoms,
         d_atom=2,
-        atom_topology="euclidean",
+        atom_topology="circle",
         n_iter=n_iter,
         random_state=seed,
         assignment="ibp_map",
@@ -237,8 +237,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default="/projects/standard/hsiehph/sauer354/olmo_data")
     parser.add_argument("--out_dir", default="/projects/standard/hsiehph/sauer354/olmo_data/plots")
-    parser.add_argument("--pca_dim", type=int, default=10)
-    parser.add_argument("--n_atoms", type=int, default=8)
+    parser.add_argument("--pca_dim", type=int, default=32,
+                        help="PCA components (32 recommended to condition inner block)")
+    parser.add_argument("--n_atoms", type=int, default=1,
+                        help="number of atoms (1 = dodge #1051 multi-atom timeout)")
     parser.add_argument("--n_iter", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
