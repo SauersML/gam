@@ -3020,6 +3020,18 @@ const VALUE_PROBE_REJECT_COST_FLOOR: f64 = 1.0e11;
 /// pure waste.
 const PROBE_REFUSAL_FATAL_THRESHOLD: usize = 150;
 
+/// Tighter probe-refusal threshold used when the bridge has never seen a
+/// `eval_grad` call of its own — i.e. the seed (cost, gradient) was supplied
+/// via `with_initial_sample` so `last_value_grad_rho` is `None` and every
+/// `trial_rho_distance` prints as NaN.  In this case the seed gradient is
+/// already confirmed feasible externally; if even the first line-search
+/// direction exhausts its Wolfe probes without success (≈ 20 probes), the
+/// neighborhood IS globally infeasible and further iterations just repeat
+/// the same expensive inner solve 150 more times.  One generous Wolfe
+/// budget (25 probes) is enough to confirm the failure; 13 seeds ×
+/// 150 probes × ~3 s each would otherwise cause an observed ~97 min hang.
+const PROBE_REFUSAL_FATAL_THRESHOLD_NAN_SEED: usize = 25;
+
 /// Sentinel prefix embedded in the [`ObjectiveEvalError::Fatal`] message the
 /// bridge returns when [`PROBE_REFUSAL_FATAL_THRESHOLD`] fires. The seed-loop
 /// runner matches this prefix and routes the failed seed to
@@ -3345,14 +3357,30 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                 // loop routes it as a rejected seed.
                 self.consecutive_probe_refusals =
                     self.consecutive_probe_refusals.saturating_add(1);
-                if self.iter_count == 0
-                    && self.consecutive_probe_refusals >= PROBE_REFUSAL_FATAL_THRESHOLD
-                {
+                // When the bridge seed (cost, gradient) was supplied via
+                // `with_initial_sample` the bridge's own `eval_grad` is
+                // never called, so `last_value_grad_rho` stays `None` and
+                // every `trial_rho_distance` prints as NaN.  The seed IS
+                // feasible (it was evaluated externally), but if every
+                // line-search probe is Recoverable from the very first
+                // direction, the neighbourhood is globally infeasible.
+                // Use the tighter NaN-seed threshold so the guard fires
+                // after one generous Wolfe budget instead of 150 probes
+                // (which, at ~3 s each × 13 seeds, would produce an
+                // observed ~97 min hang on real D=5120 LLM activations).
+                let threshold = if self.last_value_grad_rho.is_none() {
+                    PROBE_REFUSAL_FATAL_THRESHOLD_NAN_SEED
+                } else {
+                    PROBE_REFUSAL_FATAL_THRESHOLD
+                };
+                if self.iter_count == 0 && self.consecutive_probe_refusals >= threshold {
                     log::warn!(
                         "[OUTER] probe-refusal non-termination guard fired after {} consecutive \
-                         infeasible cost probes with no accepted gradient step; escalating to \
-                         Fatal to abort this seed (first-order bridge, iter={})",
+                         infeasible cost probes with no accepted gradient step \
+                         (nan_seed={}); escalating to Fatal to abort this seed \
+                         (first-order bridge, iter={})",
                         self.consecutive_probe_refusals,
+                        self.last_value_grad_rho.is_none(),
                         self.iter_count,
                     );
                     return Err(ObjectiveEvalError::Fatal {
