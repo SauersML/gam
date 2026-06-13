@@ -3533,8 +3533,9 @@ impl SaeManifoldTerm {
                 lowering_error,
                 // #1019: post-fit chart canonicalization (arc length for
                 // d = 1, isometry-flow for d = 2 torus, flat-reference
-                // isometry-flow for d = 2 free/patch atoms) pins the chart; the
-                // certificate downgrades this atom's chart freedom to the
+                // isometry-flow for d = 2 free/patch, round-sphere
+                // conformal-boost flow for d = 2 sphere atoms) pins the chart;
+                // the certificate downgrades this atom's chart freedom to the
                 // finite isometry group with PinnedByCanonicalization
                 // provenance.
                 chart_canonicalized: atom.chart_canonicalized
@@ -3545,6 +3546,7 @@ impl SaeManifoldTerm {
                                 SaeAtomBasisKind::Torus
                                     | SaeAtomBasisKind::Duchon
                                     | SaeAtomBasisKind::EuclideanPatch
+                                    | SaeAtomBasisKind::Sphere
                             ))),
             });
             atom_offsets.push(cursor);
@@ -10531,6 +10533,7 @@ impl SaeManifoldTerm {
             UnitSpeed(CanonicalChartTopology),
             TorusFlow { period: f64 },
             PatchFlow,
+            SphereFlow,
         }
         let mut eligible: Vec<(usize, ChartPlan)> = Vec::new();
         for atom_idx in 0..self.k_atoms() {
@@ -10561,57 +10564,27 @@ impl SaeManifoldTerm {
                 (SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch, 2) => {
                     ChartPlan::PatchFlow
                 }
+                // #1019 sphere arm: d = 2 sphere atoms pin to the
+                // minimum-isometry-defect conformal-boost flow against the
+                // round-sphere reference. The pin is scoped to data away from
+                // the poles (the `1/cos lat` boost singularity — the residue of
+                // the hairy-ball obstruction); an at-pole chart is honestly
+                // refused by the reparameterization (Ok(false) → left as
+                // fitted) rather than pinned with a near-singular flow.
+                (SaeAtomBasisKind::Sphere, 2) => ChartPlan::SphereFlow,
                 // d = 1 never matches Sphere; Precomputed bases carry no
-                // evaluator semantics to re-express the image in; S² has no
-                // global pole-free flow basis (hairy ball), so sphere charts
-                // are honestly left as fitted.
+                // evaluator semantics to re-express the image in.
                 _ => continue,
             };
             eligible.push((atom_idx, plan));
         }
 
-        // #1019 sphere arm: d = 2 sphere atoms are NOT flow-pinned (no global
-        // pole-free flow basis — hairy ball), but the isometry DEFECT against the
-        // round-sphere reference metric is well-defined at the fitted chart and
-        // is exactly the issue's acceptance quantity. Measure and log it so the
-        // honest "left as fitted" sphere arm is MEASURABLE: a round-isometric
-        // (O(3)-representative) chart scores ≈ 0, a warped chart scores large.
-        // This never mutates the atom — it is a pure read-only diagnostic.
-        for atom_idx in 0..self.k_atoms() {
-            let atom = &self.atoms[atom_idx];
-            if !matches!(atom.basis_kind, SaeAtomBasisKind::Sphere)
-                || atom.latent_dim != 2
-                || atom.homotopy_eta != 1.0
-                || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim
-            {
-                continue;
-            }
-            let Some(evaluator) = atom.basis_evaluator.as_ref().cloned() else {
-                continue;
-            };
-            let coords = self.assignment.coords[atom_idx].as_matrix();
-            match crate::terms::sae_chart_canonicalization::sphere_chart_isometry_defect(
-                evaluator.as_ref(),
-                atom.decoder_coefficients.view(),
-                coords.view(),
-            ) {
-                Ok(Some(defect)) => log::info!(
-                    "[#1019] sphere atom '{}' chart isometry defect = {defect:.6e} \
-                     (round-sphere reference; 0 = O(3)-isometric, left as fitted — \
-                     no pole-free flow basis to pin)",
-                    atom.name
-                ),
-                Ok(None) => log::info!(
-                    "[#1019] sphere atom '{}' chart isometry defect unavailable \
-                     (degenerate or pole-singular chart); left as fitted",
-                    atom.name
-                ),
-                Err(err) => log::warn!(
-                    "[#1019] sphere atom '{}' chart isometry defect errored: {err}",
-                    atom.name
-                ),
-            }
-        }
+        // #1019 sphere arm: d = 2 sphere atoms are now first-class flow-pinned
+        // above (ChartPlan::SphereFlow → the round-sphere conformal-boost flow),
+        // so the isometry defect is the objective the pin descends rather than a
+        // read-only side log. Data inside the pole-band guard (the `1/cos lat`
+        // boost singularity — the scoped residue of the hairy-ball obstruction)
+        // is honestly refused by the reparameterization and left as fitted.
 
         // #1026 EV-vs-Θ measurement: log each d = 1 atom's fitted TURNING
         // `Θ = ∫κ ds` (integrated curvature of its decoded curve). A linear SAE
@@ -10701,6 +10674,7 @@ impl SaeManifoldTerm {
                     self.canonicalize_atom_torus_flow_chart(*atom_idx, *period)
                 }
                 ChartPlan::PatchFlow => self.canonicalize_atom_patch_flow_chart(*atom_idx),
+                ChartPlan::SphereFlow => self.canonicalize_atom_sphere_flow_chart(*atom_idx),
             };
             match outcome {
                 Ok(changed) => any_changed |= changed,
@@ -10956,6 +10930,89 @@ impl SaeManifoldTerm {
         {
             return Err(format!(
                 "SaeManifoldTerm::canonicalize_atom_patch_flow_chart: canonical basis {:?} / jet {:?} must match the fitted shapes {:?} / {:?}",
+                new_phi.dim(),
+                new_jet.dim(),
+                self.atoms[atom_idx].basis_values.dim(),
+                self.atoms[atom_idx].basis_jacobian.dim()
+            ));
+        }
+
+        // Per-row image-invariance gate: the audit grid certified the image at
+        // the transport nodes; this certifies it at the coordinates the fit
+        // actually sits on. Same honest-fallback contract as the torus path.
+        let old_fit = fast_ab(
+            &self.atoms[atom_idx].basis_values,
+            &self.atoms[atom_idx].decoder_coefficients,
+        );
+        let new_fit = fast_ab(&new_phi, &repar.new_decoder);
+        let mut fit_scale = 0.0_f64;
+        let mut max_abs = 0.0_f64;
+        for (a, b) in old_fit.iter().zip(new_fit.iter()) {
+            fit_scale = fit_scale.max(a.abs()).max(b.abs());
+            max_abs = max_abs.max((a - b).abs());
+        }
+        if !(fit_scale.is_finite() && max_abs.is_finite()) {
+            return Ok(false);
+        }
+        if fit_scale > 0.0 && max_abs > CHART_RECOMPOSITION_REL_TOL * fit_scale {
+            return Ok(false);
+        }
+
+        // Commit: canonical coordinates, basis, decoder, and the congruence-
+        // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as every other
+        // canonicalization path).
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
+        let flat = Array1::from_iter(new_coords.iter().copied());
+        self.assignment.coords[atom_idx].set_flat(flat.view());
+        let atom = &mut self.atoms[atom_idx];
+        atom.basis_values = new_phi;
+        atom.basis_jacobian = new_jet;
+        atom.decoder_coefficients = repar.new_decoder;
+        atom.smooth_penalty = transport_smooth_penalty_for_decoder(
+            repar.decoder_transport.view(),
+            old_smooth_penalty.view(),
+        )?;
+        atom.chart_canonicalized = true;
+        Ok(true)
+    }
+
+    /// Apply the minimum-isometry-defect conformal-boost flow reparameterization
+    /// against the round-sphere reference (#1019 sphere arm) to one eligible
+    /// `d = 2` sphere (`S²`) atom. Returns `Ok(true)` when the atom was
+    /// canonicalized, `Ok(false)` on an honest skip (degenerate or
+    /// already-canonical chart, data inside the pole-band guard, only
+    /// folded/non-improving flow candidates, basis not closed under the
+    /// reparameterization, or per-row image drift above tolerance).
+    fn canonicalize_atom_sphere_flow_chart(&mut self, atom_idx: usize) -> Result<bool, String> {
+        use crate::terms::sae_chart_canonicalization::{
+            CHART_RECOMPOSITION_REL_TOL, sphere_isometry_flow_reparameterization,
+        };
+        let n = self.n_obs();
+        if n == 0 {
+            return Ok(false);
+        }
+        let Some(evaluator) = self.atoms[atom_idx].basis_evaluator.as_ref().cloned() else {
+            return Ok(false);
+        };
+        let coords = self.assignment.coords[atom_idx].as_matrix();
+        let Some(repar) = sphere_isometry_flow_reparameterization(
+            evaluator.as_ref(),
+            self.atoms[atom_idx].decoder_coefficients.view(),
+            coords.view(),
+        )?
+        else {
+            return Ok(false);
+        };
+
+        // Per-row basis/jet at the canonical coordinates (eligibility pins
+        // `homotopy_eta == 1.0`, so the plain evaluate IS the dialed path).
+        let new_coords = repar.new_row_coords.clone();
+        let (new_phi, new_jet) = evaluator.evaluate(new_coords.view())?;
+        if new_phi.dim() != self.atoms[atom_idx].basis_values.dim()
+            || new_jet.dim() != self.atoms[atom_idx].basis_jacobian.dim()
+        {
+            return Err(format!(
+                "SaeManifoldTerm::canonicalize_atom_sphere_flow_chart: canonical basis {:?} / jet {:?} must match the fitted shapes {:?} / {:?}",
                 new_phi.dim(),
                 new_jet.dim(),
                 self.atoms[atom_idx].basis_values.dim(),

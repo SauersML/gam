@@ -2299,6 +2299,7 @@ fn residual_gauge_inner(
     let mut canonicalized_charts = 0usize;
     let mut canonicalized_torus_charts = 0usize;
     let mut canonicalized_patch_charts = 0usize;
+    let mut canonicalized_sphere_charts = 0usize;
     for atom in &model.atoms {
         if !atom.chart_canonicalized {
             continue;
@@ -2336,9 +2337,21 @@ fn residual_gauge_inner(
                     "Isom(ℝ², flat) = O(2) ⋉ ℝ² (rotation + reflection + translation)",
                 )
             }
-            // Canonicalization only ever applies to d = 1 charts, d = 2 torus
-            // charts, and d = 2 free/patch charts; a flag on any other topology
-            // is structurally inconsistent and must not fabricate a record.
+            // #1019 sphere arm: d = 2 sphere (S²) charts are pinned post-fit to
+            // the round-sphere conformal-boost minimum-isometry-defect flow,
+            // which breaks the conformal (Möbius) moduli down to the round
+            // sphere's isometry group; the surviving chart freedom is O(3).
+            AtomTopology::Sphere => {
+                canonicalized_sphere_charts += 1;
+                (
+                    "the round-sphere conformal-boost isometry-flow canonical chart",
+                    "Isom(S², round) = O(3) (rotations + reflection)",
+                )
+            }
+            // Canonicalization only ever applies to d = 1 charts, d = 2 torus,
+            // d = 2 free/patch, and d = 2 sphere charts; a flag on any other
+            // topology is structurally inconsistent and must not fabricate a
+            // record.
             _ => continue,
         };
         verdicts.push(GeneratorVerdict {
@@ -2414,6 +2427,15 @@ fn residual_gauge_inner(
             "{summary}; {canonicalized_patch_charts} free/patch chart(s) pinned to the \
              flat-reference isometry-flow canonical chart by post-fit canonicalization \
              (residual chart freedom = Isom(ℝ², flat) = O(2) ⋉ ℝ²)"
+        )
+    } else {
+        summary
+    };
+    let summary = if canonicalized_sphere_charts > 0 {
+        format!(
+            "{summary}; {canonicalized_sphere_charts} sphere chart(s) pinned to the \
+             round-sphere conformal-boost isometry-flow canonical chart by post-fit \
+             canonicalization (residual chart freedom = Isom(S², round) = O(3))"
         )
     } else {
         summary
