@@ -2881,6 +2881,15 @@ pub struct SaeManifoldTerm {
     /// the quotient dimension changed mid-solve, which is a structural event and
     /// must not be hidden inside the Laplace normalizer.
     expected_evidence_gauge_deflated_directions: Option<usize>,
+    /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
+    /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
+    /// converges. Each eligible `d = 1` atom's fitted curved image is adjudicated
+    /// against its straight (linear special-case) sub-model on the common
+    /// rank-aware Laplace evidence scale. `None` until the post-fit pass runs (or
+    /// when no atom is eligible). Surfaced in the Python model output so a user
+    /// sees which atoms genuinely earn their curvature and which collapse to the
+    /// linear tail. Read via [`Self::hybrid_split_report`].
+    hybrid_split_report: Option<crate::terms::sae::hybrid_split::SaeHybridSplitReport>,
 }
 
 impl Clone for SaeManifoldTerm {
@@ -2899,6 +2908,7 @@ impl Clone for SaeManifoldTerm {
             curvature_walk_report: self.curvature_walk_report.clone(),
             expected_evidence_gauge_deflated_directions: self
                 .expected_evidence_gauge_deflated_directions,
+            hybrid_split_report: self.hybrid_split_report.clone(),
         }
     }
 }
@@ -2982,6 +2992,7 @@ impl SaeManifoldTerm {
             certificate_dispersion: None,
             curvature_walk_report: None,
             expected_evidence_gauge_deflated_directions: None,
+            hybrid_split_report: None,
         })
     }
 
@@ -4524,6 +4535,83 @@ impl SaeManifoldTerm {
     /// Returns one `Option<f64>` per atom in atom order; `None` for an atom
     /// whose ⊖-reconstruction EV is undefined (degenerate target variance), and
     /// `None` for the whole vector if the full-reconstruction EV is undefined.
+    /// #1026: the load-bearing curved-vs-linear hybrid-split verdict for the
+    /// fitted dictionary, or `None` until [`Self::canonicalize_charts_post_fit`]
+    /// has run (or when no `d = 1` atom is eligible). Surfaced in the Python model
+    /// output so the user sees which atoms genuinely earn their curvature.
+    pub fn hybrid_split_report(
+        &self,
+    ) -> Option<&crate::terms::sae::hybrid_split::SaeHybridSplitReport> {
+        self.hybrid_split_report.as_ref()
+    }
+
+    /// Build the #1026 curved-vs-linear hybrid-split report by adjudicating each
+    /// eligible `d = 1` atom's fitted curved image against its straight (linear
+    /// special-case) sub-model on the common rank-aware Laplace evidence scale.
+    ///
+    /// Both candidates reconstruct the SAME fitted decoded image over the SAME
+    /// assigned rows; the linear candidate's deviance is the exact penalized-LS
+    /// residual of the best straight line through those points (the collapsed
+    /// linear lane — closed form, NOT the broken euclidean outer fit path of
+    /// #1051). Eligible atoms are `d = 1` atoms with an installed evaluator at
+    /// the full curvature dial (`homotopy_eta == 1.0`) whose live coordinate dim
+    /// still matches the atom's latent dim.
+    pub fn compute_hybrid_split_report(
+        &self,
+        rho: &SaeManifoldRho,
+    ) -> Result<Option<crate::terms::sae::hybrid_split::SaeHybridSplitReport>, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        // Per-row assignment masses (once), so each atom's weighted straight-line
+        // fit uses the same row weighting the joint reconstruction loss does.
+        let mut weights: Vec<Array1<f64>> = Vec::with_capacity(n);
+        for row in 0..n {
+            weights.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+        }
+        let eligible: Vec<usize> = (0..self.k_atoms())
+            .filter(|&atom_idx| {
+                let atom = &self.atoms[atom_idx];
+                atom.latent_dim == 1
+                    && atom.basis_evaluator.is_some()
+                    && atom.homotopy_eta == 1.0
+                    && self.assignment.coords[atom_idx].latent_dim() == atom.latent_dim
+            })
+            .collect();
+        // Per-atom fitted decoded image at every row (the curved candidate's
+        // realized curve, which the linear candidate must approximate).
+        let coords_for = |atom_idx: usize| -> Array1<f64> {
+            self.assignment.coords[atom_idx]
+                .as_matrix()
+                .column(0)
+                .to_owned()
+        };
+        let weights_for = |atom_idx: usize| -> Array1<f64> {
+            Array1::from_iter((0..n).map(|row| weights[row][atom_idx]))
+        };
+        let decoded_for = |atom_idx: usize| -> Array2<f64> {
+            let mut decoded = Array2::<f64>::zeros((n, p));
+            let mut buf = vec![0.0_f64; p];
+            for row in 0..n {
+                self.atoms[atom_idx].fill_decoded_row(row, &mut buf);
+                for col in 0..p {
+                    decoded[[row, col]] = buf[col];
+                }
+            }
+            decoded
+        };
+        let manifold_for = |atom_idx: usize| -> crate::terms::latent_coord::LatentManifold {
+            self.assignment.coords[atom_idx].manifold().clone()
+        };
+        crate::terms::sae::hybrid_split::build_hybrid_split_report(
+            &self.atoms,
+            eligible.into_iter(),
+            coords_for,
+            weights_for,
+            decoded_for,
+            manifold_for,
+        )
+    }
+
     pub fn per_atom_loao_explained_variance(
         &self,
         target: ArrayView2<'_, f64>,
@@ -10694,6 +10782,34 @@ impl SaeManifoldTerm {
                 Err(err) => {
                     log::warn!("[#1026] atom '{}' fitted turning errored: {err}", atom.name)
                 }
+            }
+        }
+
+        // #1026 — make the curved-vs-linear split LOAD-BEARING. The Θ log above
+        // is the read-only diagnostic; here we adjudicate, per eligible d = 1
+        // atom, the fitted curved image against its straight (linear
+        // special-case) sub-model on the common rank-aware Laplace evidence
+        // scale and record the verdict. This is closed-form per atom (the
+        // collapsed linear lane — exact penalized LS through the fitted decoded
+        // points), so it does NOT re-enter the broken euclidean outer fit path
+        // (#1051): no continuation spine, no joint Hessian. The dictionary now
+        // honestly reports which atoms earn their curvature and which collapse to
+        // the linear tail.
+        match self.compute_hybrid_split_report(rho) {
+            Ok(report) => {
+                if let Some(report) = &report {
+                    log::info!(
+                        "[#1026] hybrid split: {} curved / {} linear atoms (Σ NLE = {:.6e})",
+                        report.selection.curved_atom_count,
+                        report.selection.linear_atom_count(),
+                        report.selection.total_negative_log_evidence,
+                    );
+                }
+                self.hybrid_split_report = report;
+            }
+            Err(err) => {
+                log::warn!("[#1026] hybrid split report unavailable: {err}");
+                self.hybrid_split_report = None;
             }
         }
 
