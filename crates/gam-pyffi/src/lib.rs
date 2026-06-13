@@ -156,6 +156,7 @@ use std::sync::Arc;
 mod benchmark_scores;
 mod competing_risks_decode;
 mod manifold_pyclasses;
+mod python_literal;
 mod summary_render;
 mod survival_surface_io;
 use benchmark_scores::{
@@ -163,6 +164,7 @@ use benchmark_scores::{
     benchmark_exp_saturated, benchmark_gaussian_logloss, benchmark_nagelkerke_r2,
     benchmark_nagelkerke_r2_with_null_mean,
 };
+use python_literal::{python_float_display, python_string_repr};
 use competing_risks_decode::{
     competing_risks_columns, competing_risks_numeric_list, competing_risks_string_list,
     set_optional_competing_risks_matrix, set_optional_competing_risks_vector,
@@ -1653,37 +1655,6 @@ fn extract_row_ids(
         row_ids.push(value.clone());
     }
     Ok(Some(row_ids))
-}
-
-fn python_string_repr(value: &str) -> String {
-    let quote = if value.contains('\'') && !value.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    let mut repr = String::with_capacity(value.len() + 2);
-    repr.push(quote);
-    for ch in value.chars() {
-        match ch {
-            '\\' => repr.push_str("\\\\"),
-            '\t' => repr.push_str("\\t"),
-            '\n' => repr.push_str("\\n"),
-            '\r' => repr.push_str("\\r"),
-            '\'' if quote == '\'' => repr.push_str("\\'"),
-            '"' if quote == '"' => repr.push_str("\\\""),
-            other => repr.push(other),
-        }
-    }
-    repr.push(quote);
-    repr
-}
-
-fn python_float_display(value: f64) -> String {
-    if value.is_finite() && value.fract() == 0.0 && value.abs() < 1.0e16 {
-        format!("{value:.1}")
-    } else {
-        value.to_string()
-    }
 }
 
 /// Training-time upper bound for the default survival surface grid, read from
