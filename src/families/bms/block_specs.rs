@@ -2552,20 +2552,37 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // is consumable wherever the slope information `G` (the per-row
     // `∂score_β/∂ζ_i` of the marginal/logslope blocks) is available.
     //
-    // The consumption point is DEFERRED out of this assembly: the second-stage
-    // covariance `solved_fit.beta_covariance()` is produced by the GENERIC
-    // `evaluate_custom_family_joint_hyper_efs_shared` engine (shared with the
-    // survival marginal-slope family), which applies `ζ` to the response BEFORE
-    // building the joint design and never surfaces its per-row response-score
-    // derivatives `∂score_β/∂ζ_i`. Forming `G` here would require either
-    // re-deriving those row-kernel derivatives at the converged `β` or threading
-    // `∂ζ/∂θ₁` through that engine — a cross-family refactor of the inner solve.
-    // Until that engine exposes `∂score_β/∂ζ`, the correction rides the stored
-    // first-stage quantities: a consumer with the converged slope design and the
-    // row-kernel response-score (the same `q`-channel derivative the influence
-    // absorber #461 already forms) builds `G = Σ_i (∂score_β/∂ζ_i) (∂ζ_i/∂θ₁)`,
-    // solves `H_β⁻¹ G` against `solved_fit`'s penalized Hessian, and ADDS
-    // `cal.generated_regressor_term(H_β⁻¹ G)` to the reported `beta_covariance`.
+    // ASSEMBLY READY, ONE ENGINE QUANTITY OUTSTANDING. The full correction is
+    // assembled by `LatentZConditionalCalibration::generated_regressor_correction`
+    // (mod.rs): given the per-row reduced-frame slope-score sensitivity to the
+    // calibrated score `s_i = ∂score_β,i/∂ζ_i` (an `n × p_β` matrix), it
+    //   1. builds `J_zeta` row-by-row via `zeta_theta1_jacobian_row` (exact-zero
+    //      on floored rows, so `G`'s support is the gate-fired rows),
+    //   2. accumulates `G = Σ_i s_i ⊗ (∂ζ_i/∂θ₁)` (`p_β × dim θ₁`),
+    //   3. forms `Vb·G = solved_fit.beta_covariance()·G` (the naive reduced-frame
+    //      covariance IS `H_β⁻¹`, so `H_β⁻¹ G = Vb·G`), and
+    //   4. returns `(Vb·G)·V₁·(Vb·G)ᵀ` (PSD ⇒ corrected slope SE strictly ≥
+    //      naive whenever the gate fires).
+    // So `V₁`, `∂ζ/∂θ₁`, the `Vb` frame, and the whole congruence are all
+    // available HERE — the only quantity the seam still lacks is `s_i`.
+    //
+    // `s_i = ∂²ℓ_i/∂β∂ζ_i = J_iᵀ·(∂²ℓ_i/∂η_i∂ζ_i)` is the mixed `(β, ζ)` second
+    // derivative of the warped row kernel contracted through the slope Jacobian
+    // `J_i`. The GENERIC `evaluate_custom_family_joint_hyper_efs_shared` engine
+    // (shared with survival marginal-slope) applies `ζ` to the response BEFORE
+    // building the joint design and does not yet surface the per-row 2-vector
+    // `∂²ℓ_i/∂η_i∂ζ_i`. That 2-vector is exactly the #932 RowNllProgram/Tower4
+    // z-jet channel — `z` is already a row-program input, so one extra mixed
+    // `(β-direction, z-direction)` jet channel reads off `∂²ℓ/∂β∂z` at the
+    // converged `β̂`; contract it with each block's `jacobian_transpose_action`
+    // (the same `J_iᵀ` the row kernel already exposes, marginal+logslope
+    // stacked) to get `s_i` in the reduced frame. REMAINING SEAM: thread that
+    // jet channel out of the shared engine as an `n × p_β` `score_zeta_sensitivity`
+    // and call
+    //   `cal.generated_regressor_correction(s, z_norm, marginal_design, vb)`,
+    // adding the result to `solved_fit`'s reported `beta_covariance`
+    // (ConditionalLocationScale branch only). Everything downstream of `s_i` is
+    // landed and unit-tested (`generated_regressor_correction_*`).
     let (latent_z_rank_int_calibration, latent_z_conditional_calibration) =
         match latent_z_calibration {
             LatentMeasureCalibration::None => (None, None),

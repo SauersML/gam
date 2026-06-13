@@ -1042,6 +1042,96 @@ impl LatentZConditionalCalibration {
         let v1 = self.theta1_covariance();
         hbeta_inv_g.dot(&v1).dot(&hbeta_inv_g.t())
     }
+
+    /// Assemble the full Murphy–Topel generated-regressor correction
+    /// `(Vb·G)·V₁·(Vb·G)ᵀ` for the second-stage slope covariance, given the ONE
+    /// engine-side quantity it cannot reconstruct post-fit: the per-row
+    /// reduced-frame slope-score sensitivity to the calibrated score,
+    /// `s_i = ∂score_β,i/∂ζ_i` (a `p_β`-vector in the joint flat-β reduced frame
+    /// `solved_fit.beta_covariance()` lives in). With `score_β,i = ∂ℓ_i/∂β`,
+    /// `s_i = ∂²ℓ_i/∂β∂ζ_i = J_iᵀ·(∂²ℓ_i/∂η_i∂ζ_i)` is the mixed `(β, ζ)`
+    /// second derivative of the warped row kernel contracted through the slope
+    /// design Jacobian `J_i` — exactly the #932 RowNllProgram/Tower4 z-jet
+    /// channel (`z` is already a row-program input; one extra mixed `(β, z)` jet
+    /// channel reads off `∂²ℓ/∂β∂z`). It must be evaluated at the converged `β̂`
+    /// in the SAME reduced frame as `vb`.
+    ///
+    /// Everything else is built here from the stored first-stage quantities and
+    /// the second-stage fit, dissolving the post-fit-reconstruction blocker:
+    ///   - `G = Σ_i s_i · (∂ζ_i/∂θ₁)ᵀ` (`p_β × dim θ₁`), the chain-rule outer
+    ///     product accumulated row-by-row with `∂ζ_i/∂θ₁ =
+    ///     `[`Self::zeta_theta1_jacobian_row`]`(z_i, a_row_i)` (exact-zero on
+    ///     floored rows, so floored rows contribute nothing — `G`'s support is
+    ///     the gate-fired rows);
+    ///   - `Vb·G = vb·G` since the naive second-stage covariance `vb` IS
+    ///     `H_β⁻¹` (the coordinator's `H_β⁻¹ G = Vb.dot(G)`);
+    ///   - the term `(Vb·G)·V₁·(Vb·G)ᵀ` via [`Self::generated_regressor_term`].
+    ///
+    /// `score_zeta_sensitivity` is `n × p_β` (row `i` = `s_i`); `z` is the
+    /// per-row normalized latent score (`n`); `a_block` is the marginal design
+    /// `n × basis_ncols` whose rows feed `zeta_theta1_jacobian_row`; `vb` is the
+    /// naive reduced-frame slope covariance `n_β × n_β`. The returned term is
+    /// PSD (a congruence of the PSD `V₁`), so adding it to `vb` makes the
+    /// corrected slope SE strictly ≥ the naive SE whenever the gate fires
+    /// (`G ≠ 0`) and exactly equal when every row is floored (`G = 0`).
+    pub fn generated_regressor_correction(
+        &self,
+        score_zeta_sensitivity: ArrayView2<'_, f64>,
+        z: ArrayView1<'_, f64>,
+        a_block: ArrayView2<'_, f64>,
+        vb: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let n = score_zeta_sensitivity.nrows();
+        let p_beta = score_zeta_sensitivity.ncols();
+        let dim_theta1 = self.theta1_dim();
+        if z.len() != n || a_block.nrows() != n {
+            return Err(format!(
+                "generated_regressor_correction row mismatch: score_zeta_sensitivity rows={n}, \
+                 z={}, a_block rows={}",
+                z.len(),
+                a_block.nrows()
+            ));
+        }
+        if a_block.ncols() != self.basis_ncols {
+            return Err(format!(
+                "generated_regressor_correction expects {} basis columns, got {}",
+                self.basis_ncols,
+                a_block.ncols()
+            ));
+        }
+        if vb.nrows() != p_beta || vb.ncols() != p_beta {
+            return Err(format!(
+                "generated_regressor_correction: vb must be {p_beta}×{p_beta}, got {}×{}",
+                vb.nrows(),
+                vb.ncols()
+            ));
+        }
+        // G = Σ_i s_i ⊗ (∂ζ_i/∂θ₁)  (p_β × dim θ₁). Floored rows yield a
+        // zero J_zeta row, so they drop out of the accumulation exactly.
+        let mut g = Array2::<f64>::zeros((p_beta, dim_theta1));
+        for i in 0..n {
+            let j_zeta_row = self.zeta_theta1_jacobian_row(z[i], a_block.row(i));
+            debug_assert_eq!(j_zeta_row.len(), dim_theta1);
+            let s_i = score_zeta_sensitivity.row(i);
+            // Skip the outer product when the row carries no first-stage
+            // sensitivity (all-zero J_zeta on a floored row) — pure savings,
+            // bit-identical to accumulating zeros.
+            if j_zeta_row.iter().all(|&v| v == 0.0) {
+                continue;
+            }
+            for (b, &s_b) in s_i.iter().enumerate() {
+                if s_b == 0.0 {
+                    continue;
+                }
+                for (k, &jz) in j_zeta_row.iter().enumerate() {
+                    g[[b, k]] += s_b * jz;
+                }
+            }
+        }
+        // Vb·G = H_β⁻¹·G (vb is the naive reduced-frame covariance).
+        let vb_g = vb.dot(&g);
+        Ok(self.generated_regressor_term(vb_g.view()))
+    }
 }
 
 /// First-stage robust (HC0) sandwich covariance of a weighted-ridge coefficient
