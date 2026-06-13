@@ -1606,7 +1606,9 @@ impl ResidualCascadeFit {
                     state.metric[a]
                 ));
             }
-            if !(state.z_range[a].is_finite() && state.z_range[a] > 0.0 && state.z_lo[a].is_finite())
+            if !(state.z_range[a].is_finite()
+                && state.z_range[a] > 0.0
+                && state.z_lo[a].is_finite())
             {
                 return Err(format!(
                     "residual cascade state: degenerate box on axis {a} (lo={}, range={})",

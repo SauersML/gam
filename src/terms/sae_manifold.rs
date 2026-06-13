@@ -5070,24 +5070,26 @@ impl SaeManifoldTerm {
         // cross-row channels and leave this `None`. The block is gauge-null in
         // isolation (`H·𝟙 = 0`); it is only ever summed onto the gauge-breaking
         // data-fit row block before the Cholesky factor, never factored alone.
-        let softmax_dense: Option<(crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty, f64)> =
-            match self.assignment.mode {
-                AssignmentMode::Softmax {
-                    temperature,
-                    sparsity,
-                } if k_atoms > 1 => {
-                    let inv_tau = 1.0 / temperature;
-                    let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
-                    Some((
-                        crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
-                            k_atoms,
-                            temperature,
-                        ),
-                        scale,
-                    ))
-                }
-                _ => None,
-            };
+        let softmax_dense: Option<(
+            crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty,
+            f64,
+        )> = match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } if k_atoms > 1 => {
+                let inv_tau = 1.0 / temperature;
+                let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+                Some((
+                    crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                        k_atoms,
+                        temperature,
+                    ),
+                    scale,
+                ))
+            }
+            _ => None,
+        };
 
         // Decoder smoothness penalty: build one KroneckerPenaltyOp per atom
         // (structure = λ·S_k ⊗ I_p, offset = beta_offsets[k]) instead of
@@ -6247,8 +6249,7 @@ impl SaeManifoldTerm {
         //     (`row_vars_for_cache_row` maps `vars[atom] = Logit { atom }`). This
         //     pins the `U`-column convention bit-for-bit to the consumer.
         if let Some(channels) = ibp_assignment_third_channels(&self.assignment, rho)? {
-            let mut entries: Vec<(usize, usize, f64)> =
-                Vec::with_capacity(n * k_atoms);
+            let mut entries: Vec<(usize, usize, f64)> = Vec::with_capacity(n * k_atoms);
             for row in 0..n {
                 let start = row * k_atoms;
                 let g_base = sys.row_offsets[row];
@@ -7786,10 +7787,10 @@ impl SaeManifoldTerm {
             }
             let inv_tau = 1.0 / temperature;
             let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
-            let penalty =
-                crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
-                    k_atoms, temperature,
-                );
+            let penalty = crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                k_atoms,
+                temperature,
+            );
             // Softmax uses the reduced K−1 free-logit chart: only positions
             // 0..K−1 are free logit coordinates (last reference logit fixed), and
             // the reduced `∂H/∂ρ` over the free logits is the top-left
@@ -7802,17 +7803,18 @@ impl SaeManifoldTerm {
                 let row_base = cache.row_offsets[row];
                 let q = cache.row_dims[row];
                 let logit_dim = assignment_dim.min(q);
-                let row_logits: Vec<f64> =
-                    (0..k_atoms).map(|k| self.assignment.logits[[row, k]]).collect();
+                let row_logits: Vec<f64> = (0..k_atoms)
+                    .map(|k| self.assignment.logits[[row, k]])
+                    .collect();
                 // ∂H/∂ρ over this row's free-logit block (position j ↔ atom j).
                 let dh_rho = penalty.row_dense_hessian(&row_logits, scale);
                 for kj in 0..logit_dim {
                     let mut rhs_t = Array1::<f64>::zeros(total_t);
                     let rhs_beta = Array1::<f64>::zeros(cache.k);
                     rhs_t[row_base + kj] = 1.0;
-                    let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                        format!("assignment_log_strength_hessian_trace: {err}")
-                    })?;
+                    let solved = solver
+                        .solve(rhs_t.view(), rhs_beta.view())
+                        .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
                     for ki in 0..logit_dim {
                         // trace += (H⁻¹)_{ki,kj} · (∂H/∂ρ)_{kj,ki}; dh_rho symmetric.
                         trace += solved.t[row_base + ki] * dh_rho[[kj, ki]];
@@ -8760,9 +8762,11 @@ impl SaeManifoldTerm {
             // pair `(a,b)` below. The diagonal softmax case is therefore handled
             // here, NOT in `assignment_prior_hdiag_derivative_entry` (which returns
             // 0 for softmax to avoid double-counting).
-            let row_logits_softmax: Option<Vec<f64>> = softmax_dense_adjoint
-                .as_ref()
-                .map(|_| (0..k_atoms).map(|k| self.assignment.logits[[row, k]]).collect());
+            let row_logits_softmax: Option<Vec<f64>> = softmax_dense_adjoint.as_ref().map(|_| {
+                (0..k_atoms)
+                    .map(|k| self.assignment.logits[[row, k]])
+                    .collect()
+            });
             for w in 0..q {
                 let mut gamma = 0.0_f64;
                 let softmax_dh_w: Option<Array2<f64>> = match (
@@ -8779,8 +8783,11 @@ impl SaeManifoldTerm {
                     for b in 0..q {
                         let mut dh = sae_dot(&jets.second[a][w], &jets.first[b])
                             + sae_dot(&jets.first[a], &jets.second[b][w]);
-                        if let (Some(dh_w), SaeLocalRowVar::Logit { atom: atom_a }, SaeLocalRowVar::Logit { atom: atom_b }) =
-                            (softmax_dh_w.as_ref(), jets.vars[a], jets.vars[b])
+                        if let (
+                            Some(dh_w),
+                            SaeLocalRowVar::Logit { atom: atom_a },
+                            SaeLocalRowVar::Logit { atom: atom_b },
+                        ) = (softmax_dh_w.as_ref(), jets.vars[a], jets.vars[b])
                         {
                             dh += dh_w[[atom_a, atom_b]];
                         }
@@ -10645,10 +10652,9 @@ impl SaeManifoldTerm {
                      (no analytic second jet or degenerate curve)",
                     atom.name
                 ),
-                Err(err) => log::warn!(
-                    "[#1026] atom '{}' fitted turning errored: {err}",
-                    atom.name
-                ),
+                Err(err) => {
+                    log::warn!("[#1026] atom '{}' fitted turning errored: {err}", atom.name)
+                }
             }
         }
 

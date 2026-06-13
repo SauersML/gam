@@ -9,7 +9,13 @@
 //! purely on `f64` scalars and depend on nothing else in the module.
 
 #[inline]
-pub(crate) fn hessian_coeff_fromobjective_q_terms(m1: f64, m2: f64, q_a: f64, q_b: f64, q_ab: f64) -> f64 {
+pub(crate) fn hessian_coeff_fromobjective_q_terms(
+    m1: f64,
+    m2: f64,
+    q_a: f64,
+    q_b: f64,
+    q_ab: f64,
+) -> f64 {
     // F = -sum ell, scalar q:
     //   H_ab = m2 * q_a q_b + m1 * q_ab.
     m2 * q_a * q_b + m1 * q_ab

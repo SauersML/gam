@@ -152,7 +152,9 @@ pub(crate) fn summary_render_coefficients_html(payload: &Bound<'_, PyDict>) -> P
     ))
 }
 
-pub(crate) fn summary_coefficient_columns(coefficients: &Bound<'_, PyList>) -> PyResult<Vec<String>> {
+pub(crate) fn summary_coefficient_columns(
+    coefficients: &Bound<'_, PyList>,
+) -> PyResult<Vec<String>> {
     let mut columns = Vec::new();
     for index in 0..coefficients.len() {
         let row_any = coefficients.get_item(index)?;

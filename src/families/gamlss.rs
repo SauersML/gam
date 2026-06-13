@@ -8484,7 +8484,6 @@ impl GaussianLocationScaleWiggleHessianRowPieces {
     }
 }
 
-
 pub struct GaussianLocationScaleWiggleFamily {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
