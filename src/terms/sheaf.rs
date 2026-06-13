@@ -789,6 +789,77 @@ mod tests {
     }
 
     #[test]
+    fn hessian_diag_matches_dense_laplacian_on_self_loop_paired() {
+        // Self-loop (0,0) with two distinct paired restrictions: the diagonal
+        // must equal diag(weight·L) built from the matrix-free operator, i.e.
+        // colnorm²(R_uv − R_vu), NOT colnorm²(R_uv) + colnorm²(R_vu).
+        let r_uv = array![[0.9_f64, 0.1], [-0.2, 0.7]];
+        let r_vu = array![[1.0_f64, 0.5], [-0.3, 0.8]];
+        let edges = vec![(0usize, 0usize)];
+        let restrictions = vec![EdgeRestriction::paired(r_uv, r_vu)];
+        let pen = SheafConsistencyPenalty::new(edges, restrictions, 0.7, vec![2]).expect("build");
+        let n = pen.total_dim();
+        let s = Array1::<f64>::zeros(n);
+        let diag = pen.hessian_diag(s.view());
+        let l = pen.dense_laplacian();
+        for i in 0..n {
+            assert_abs_diff_eq!(diag[i], 0.7 * l[[i, i]], epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn hessian_diag_matches_dense_laplacian_on_self_loop_single() {
+        // Self-loop (0,0) with a single-restriction edge: R_vu is the identity,
+        // so the coboundary is (R_uv − I)·s_0. The drop-cross-term bug would
+        // report colnorm²(R_uv) + 1 per column; the correct diagonal is
+        // colnorm²(R_uv − I). d_e == d_v == d_u = 2 (single-edge requirement).
+        // This single-restriction self-loop path is exercised by neither the
+        // committed repro (paired only) nor the landing fix's tests.
+        let r_uv = array![[1.0_f64, 2.0], [3.0, 4.0]];
+        let edges = vec![(0usize, 0usize)];
+        let restrictions = vec![EdgeRestriction::single(r_uv)];
+        let pen = SheafConsistencyPenalty::new(edges, restrictions, 1.3, vec![2]).expect("build");
+        let n = pen.total_dim();
+        let s = Array1::<f64>::zeros(n);
+        let diag = pen.hessian_diag(s.view());
+        let l = pen.dense_laplacian();
+        for i in 0..n {
+            assert_abs_diff_eq!(diag[i], 1.3 * l[[i, i]], epsilon = 1e-12);
+        }
+        // Spot the closed form: C = R_uv − I = [[0,2],[3,3]].
+        // col 0: 0² + 3² = 9; col 1: 2² + 3² = 13. ×weight 1.3 → [11.7, 16.9].
+        assert_abs_diff_eq!(diag[0], 1.3 * 9.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(diag[1], 1.3 * 13.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn hessian_diag_matches_dense_laplacian_mixed_self_loop_and_cross_edge() {
+        // A self-loop on vertex 0 AND a distinct edge (0,1) both touch vertex 0.
+        // The two edges' diagonal contributions must accumulate independently:
+        // the self-loop contributes colnorm²(R0 − R0b) on block 0, while the
+        // cross edge contributes colnorm²(R1_uv) on block 0 and colnorm²(R1_vu)
+        // on block 1. Checked against the operator-built dense Laplacian.
+        let r0_uv = array![[0.5_f64, -0.4], [0.3, 0.9]];
+        let r0_vu = array![[0.2_f64, 0.1], [-0.6, 0.7]];
+        let r1_uv = array![[1.1_f64, 0.2], [0.0, -0.5]];
+        let r1_vu = array![[0.8_f64, -0.1], [0.4, 1.0]];
+        let edges = vec![(0usize, 0usize), (0usize, 1usize)];
+        let restrictions = vec![
+            EdgeRestriction::paired(r0_uv, r0_vu),
+            EdgeRestriction::paired(r1_uv, r1_vu),
+        ];
+        let pen =
+            SheafConsistencyPenalty::new(edges, restrictions, 0.5, vec![2, 2]).expect("build");
+        let n = pen.total_dim();
+        let s = Array1::<f64>::zeros(n);
+        let diag = pen.hessian_diag(s.view());
+        let l = pen.dense_laplacian();
+        for i in 0..n {
+            assert_abs_diff_eq!(diag[i], 0.5 * l[[i, i]], epsilon = 1e-12);
+        }
+    }
+
+    #[test]
     fn single_restriction_edge_form() {
         // δs = R·s_0 − s_1 (single-restriction form). d_0 = 2, d_e = d_1 = 2.
         let r = array![[1.0_f64, 2.0], [3.0, 4.0]];
