@@ -627,7 +627,26 @@ fn canonicalize_for_identifiability_inner(
         return Err(CustomFamilyError::IdentifiabilityFailure { audit });
     }
 
-    let family_owned_geometry = specs.iter().any(|spec| spec.jacobian_callback.is_some());
+    // A block owns its effective geometry — and therefore its own raw-coordinate
+    // identifiability bookkeeping — when it carries EITHER a `jacobian_callback`
+    // (BMS marginal-slope, …: the family reconstructs the predictor from internal
+    // full-width designs the block `design` only seeds) OR a `stacked_design`
+    // (the survival location-scale / latent-survival time, threshold, and
+    // log-sigma blocks, whose solver eta is the `3·n`-row `[exit; entry; deriv]·β`
+    // operator and whose raw I-spline coordinates carry the family's warp-gauge
+    // lift `β_raw = z·β_reduced + affine_shift` (#892), its leading-fixed-column
+    // expansion, and its monotonicity constraint matrix `A·β ≥ b`). For both
+    // kinds the audit's per-column DROP is unrepresentable: dropping a raw column
+    // desynchronises the family's internal `z`/constraint/fixed-col layout (and
+    // the prediction-time design rebuilt at raw width) from the reduced β,
+    // tripping the family's own `eta length mismatch: got n, expected 3n`,
+    // `time-warp design mismatch`, and `violates represented linear constraint`
+    // shape checks (gam#1068). Keep every such block at its raw width with an
+    // identity gauge and let the Tier-B joint-Newton Jeffreys/Firth term add
+    // curvature on the weak directions WITHOUT any design surgery.
+    let family_owned_geometry = specs
+        .iter()
+        .any(|spec| spec.jacobian_callback.is_some() || spec.stacked_design.is_some());
     if family_owned_geometry && !audit.dropped_columns.is_empty() {
         let raw_widths: Vec<usize> = specs.iter().map(|spec| spec.design.ncols()).collect();
         let dropped_summary = audit
@@ -637,10 +656,11 @@ fn canonicalize_for_identifiability_inner(
             .collect::<Vec<_>>()
             .join(", ");
         log::info!(
-            "[CANON] width-preserving callback-owned geometry path: audit attributed \
+            "[CANON] width-preserving family-owned geometry path: audit attributed \
              dropped columns [{dropped_summary}], but at least one block owns its \
-             effective geometry via jacobian_callback; keeping raw block widths and \
-             deferring curvature on the weak directions to the robust/Firth path"
+             effective geometry via jacobian_callback or a multi-channel stacked_design; \
+             keeping raw block widths and deferring curvature on the weak directions to \
+             the robust/Firth path"
         );
         return Ok(CanonicalSpecs {
             reduced_specs: specs.to_vec(),
