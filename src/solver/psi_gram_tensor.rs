@@ -379,8 +379,8 @@ impl PsiGramTensor {
         };
         // True when the analytic derivative matches the exact FD at `psi`.
         let certifies = |me: &Self,
-                             psi: f64,
-                             eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
+                         psi: f64,
+                         eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
          -> bool {
             // Keep the 4th-order FD stencil (ψ ± 2h) strictly inside the window.
             if psi - 2.0 * h <= me.psi_lo || psi + 2.0 * h >= me.psi_hi {

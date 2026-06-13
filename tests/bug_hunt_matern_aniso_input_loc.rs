@@ -333,8 +333,9 @@ fn explicit_zero_aniso_jet_is_isotropic_and_matches_forward_fd() {
     let nu = MaternNu::ThreeHalves;
     let aniso = [0.0_f64, 0.0];
 
-    let jet_zero = matern_input_location_jet_nd(points.view(), centers.view(), ls, nu, Some(&aniso))
-        .expect("explicit-zero jet");
+    let jet_zero =
+        matern_input_location_jet_nd(points.view(), centers.view(), ls, nu, Some(&aniso))
+            .expect("explicit-zero jet");
     let jet_iso = matern_input_location_jet_nd(points.view(), centers.view(), ls, nu, None)
         .expect("isotropic (None) jet");
 
