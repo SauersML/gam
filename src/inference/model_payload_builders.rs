@@ -32,7 +32,7 @@ use crate::families::transformation_normal::TransformationNormalFamily;
 use crate::inference::model::{
     DataSchema, FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
-    SavedSplineScan, TransformationScoreCalibration,
+    SavedResidualCascade, SavedSplineScan, TransformationScoreCalibration,
 };
 use crate::smooth::TermCollectionSpec;
 use crate::types::{
@@ -347,6 +347,43 @@ pub fn assemble_spline_scan_payload(
     payload.data_schema = Some(data_schema);
     payload.set_training_feature_metadata(training_headers, training_feature_ranges);
     payload
+}
+
+/// Assemble the canonical residual-cascade payload (#1032).
+///
+/// The CLI and FFI save paths both route through here so the cascade on-disk
+/// contract cannot diverge between sources.  Mirrors `assemble_spline_scan_payload`
+/// but for d ∈ {2,3} scattered coordinates (the Wendland multilevel-frame state).
+pub fn assemble_residual_cascade_payload(
+    formula: String,
+    feature_columns: Vec<String>,
+    fit: &crate::solver::residual_cascade::ResidualCascadeFit,
+    data_schema: DataSchema,
+    training_headers: Vec<String>,
+    training_feature_ranges: Vec<(f64, f64)>,
+) -> Result<FittedModelPayload, String> {
+    let mut payload = FittedModelPayload::new(
+        MODEL_PAYLOAD_VERSION,
+        formula,
+        ModelKind::Standard,
+        FittedFamily::Standard {
+            likelihood: crate::types::LikelihoodSpec::gaussian_identity(),
+            link: None,
+            latent_cloglog_state: None,
+            mixture_state: None,
+            sas_state: None,
+        },
+        "gaussian".to_string(),
+    );
+    payload.residual_cascade = Some(SavedResidualCascade {
+        feature_columns,
+        state: fit.to_state().map_err(|e| {
+            format!("residual-cascade to_state failed during payload assembly: {e}")
+        })?,
+    });
+    payload.data_schema = Some(data_schema);
+    payload.set_training_feature_metadata(training_headers, training_feature_ranges);
+    Ok(payload)
 }
 
 /// Assemble the canonical Bernoulli marginal-slope payload.

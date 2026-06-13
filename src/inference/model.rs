@@ -78,6 +78,17 @@ pub struct SavedSplineScan {
     pub state: crate::solver::spline_scan::SplineScanState,
 }
 
+/// Saved multiresolution residual-cascade fit (#1032): the predict-time feature
+/// columns (d ∈ {2, 3}) plus the serializable cascade state that `from_state`
+/// rebuilds a predict-capable `ResidualCascadeFit` from. The cascade is a
+/// DIFFERENT posterior from the dense Duchon/Matérn term — never a silent swap.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedResidualCascade {
+    /// Training column names for the d ∈ {2, 3} scattered-smooth coordinates.
+    pub feature_columns: Vec<String>,
+    pub state: crate::solver::residual_cascade::ResidualCascadeState,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchemaColumn {
     pub name: String,
@@ -268,6 +279,13 @@ pub struct FittedModelPayload {
     /// payloads read as: not a scan model.
     #[serde(default)]
     pub spline_scan: Option<SavedSplineScan>,
+    /// O(n log n) multiresolution residual-cascade fit (#1032): the persisted
+    /// multilevel Wendland-frame state for a single scattered 2–3D Gaussian
+    /// smooth past the dense-kernel cliff. When `Some`, predictions replay the
+    /// cascade posterior; mutually exclusive with `spline_scan`/`fit_result`.
+    /// `#[serde(default)]` keeps forward-compatibility with older payloads.
+    #[serde(default)]
+    pub residual_cascade: Option<SavedResidualCascade>,
     #[serde(default)]
     pub data_schema: Option<DataSchema>,
     pub link: Option<InverseLink>,
@@ -652,6 +670,7 @@ impl FittedModelPayload {
             fit_result: None,
             unified: None,
             spline_scan: None,
+            residual_cascade: None,
             data_schema: None,
             link: None,
             mixture_link_param_covariance: None,
@@ -3763,6 +3782,27 @@ impl FittedModel {
         Ok(Some((saved.feature_column.as_str(), fit)))
     }
 
+    /// Restore the in-memory residual-cascade fit from a cascade-bearing
+    /// payload (#1032). `Ok(None)` for non-cascade models; the returned fit
+    /// replays the multilevel Wendland-frame posterior for the d ∈ {2, 3}
+    /// feature columns at each predict point.
+    pub fn saved_residual_cascade(
+        &self,
+    ) -> Result<
+        Option<(
+            &[String],
+            crate::solver::residual_cascade::ResidualCascadeFit,
+        )>,
+        FittedModelError,
+    > {
+        let Some(saved) = self.residual_cascade.as_ref() else {
+            return Ok(None);
+        };
+        let fit = crate::solver::residual_cascade::ResidualCascadeFit::from_state(&saved.state)
+            .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
+        Ok(Some((saved.feature_columns.as_slice(), fit)))
+    }
+
     pub fn random_effect_group_columns(&self) -> HashSet<String> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return HashSet::new();
@@ -3838,6 +3878,53 @@ impl FittedModel {
             if self.training_headers.is_none() {
                 return Err(FittedModelError::MissingField {
                     reason: "spline-scan model is missing training_headers; refit".to_string(),
+                });
+            }
+            return Ok(());
+        } else if let Some(cascade) = self.residual_cascade.as_ref() {
+            // Residual-cascade representation (#1032): a multilevel
+            // Wendland-frame model for a scattered d ∈ {2,3} Gaussian smooth.
+            // Exclusive with the dense representation and with the scan.
+            if self.spline_scan.is_some() || self.fit_result.is_some() || self.unified.is_some() {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "residual-cascade model must not also carry spline_scan / \
+                             fit_result / unified payloads; the representations are \
+                             mutually exclusive"
+                        .to_string(),
+                });
+            }
+            if self.model_kind != ModelKind::Standard
+                || self.family_state.likelihood() != LikelihoodSpec::gaussian_identity()
+            {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "residual-cascade representation requires a standard Gaussian-identity \
+                         model; got model_kind={:?}, likelihood={:?}",
+                        self.model_kind,
+                        self.family_state.likelihood()
+                    ),
+                });
+            }
+            if cascade.feature_columns.is_empty()
+                || !(2..=3).contains(&cascade.feature_columns.len())
+            {
+                return Err(FittedModelError::MissingField {
+                    reason: format!(
+                        "residual-cascade model needs 2 or 3 feature columns; got {}; refit",
+                        cascade.feature_columns.len()
+                    ),
+                });
+            }
+            crate::solver::residual_cascade::ResidualCascadeFit::from_state(&cascade.state)
+                .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
+            if self.data_schema.is_none() {
+                return Err(FittedModelError::MissingField {
+                    reason: "residual-cascade model is missing data_schema; refit".to_string(),
+                });
+            }
+            if self.training_headers.is_none() {
+                return Err(FittedModelError::MissingField {
+                    reason: "residual-cascade model is missing training_headers; refit".to_string(),
                 });
             }
             return Ok(());

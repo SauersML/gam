@@ -644,10 +644,36 @@ fn canonicalize_for_identifiability_inner(
     // shape checks (gam#1068). Keep every such block at its raw width with an
     // identity gauge and let the Tier-B joint-Newton Jeffreys/Firth term add
     // curvature on the weak directions WITHOUT any design surgery.
-    let family_owned_geometry = specs
+    // The veto is needed ONLY for the column that the audit would remove from a
+    // block that *owns* its geometry: dropping a raw column from such a block
+    // (a `jacobian_callback` block, or a `stacked_design` block carrying the
+    // family's `3·n`-row z-lift / leading-fixed-column / monotonicity layout)
+    // desynchronises that internal layout from the reduced β (#1068). A column
+    // dropped from a PLAIN-DENSE block — e.g. the survival location-scale
+    // threshold / log-σ blocks for a time-INVARIANT covariate, where
+    // `stacked_design` is `None` and the design is an ordinary covariate matrix —
+    // has no such hidden layout; the per-block selection-`T_i` reduction below
+    // already column-reduces `design` (and any `stacked_design`) consistently, so
+    // applying that drop is exactly the right move. Gating the whole pass on a
+    // GLOBAL "any block owns geometry" flag was too broad: with three aliased
+    // constants across the time/threshold/log_sigma blocks, the audit attributes
+    // the two surplus-constant drops to the lower-priority PLAIN threshold and
+    // log_sigma blocks, but the presence of the time block's `stacked_design`
+    // vetoed BOTH — leaving the joint design rank-deficient by two and letting the
+    // downstream solve collapse a genuine covariate direction (a time-invariant
+    // covariate's coefficient pinned to exactly 0; gam#1110). So veto only when a
+    // dropped column is attributed to a block that actually owns its geometry.
+    let owns_geometry = |name: &str| -> bool {
+        specs.iter().any(|spec| {
+            spec.name == name
+                && (spec.jacobian_callback.is_some() || spec.stacked_design.is_some())
+        })
+    };
+    let dropped_on_owned_block = audit
+        .dropped_columns
         .iter()
-        .any(|spec| spec.jacobian_callback.is_some() || spec.stacked_design.is_some());
-    if family_owned_geometry && !audit.dropped_columns.is_empty() {
+        .any(|drop| owns_geometry(&drop.block));
+    if dropped_on_owned_block {
         let raw_widths: Vec<usize> = specs.iter().map(|spec| spec.design.ncols()).collect();
         let dropped_summary = audit
             .dropped_columns
@@ -657,10 +683,10 @@ fn canonicalize_for_identifiability_inner(
             .join(", ");
         log::info!(
             "[CANON] width-preserving family-owned geometry path: audit attributed \
-             dropped columns [{dropped_summary}], but at least one block owns its \
-             effective geometry via jacobian_callback or a multi-channel stacked_design; \
-             keeping raw block widths and deferring curvature on the weak directions to \
-             the robust/Firth path"
+             dropped columns [{dropped_summary}], at least one of which falls on a block \
+             that owns its effective geometry via jacobian_callback or a multi-channel \
+             stacked_design; keeping raw block widths and deferring curvature on the weak \
+             directions to the robust/Firth path"
         );
         return Ok(CanonicalSpecs {
             reduced_specs: specs.to_vec(),

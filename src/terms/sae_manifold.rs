@@ -514,6 +514,18 @@ pub enum SaeAtomBasisKind {
     Sphere,
     Torus,
     EuclideanPatch,
+    /// Hyperbolic (Poincaré-ball) tangent patch at unit curvature `c = −1`.
+    ///
+    /// Shares the monomial decoder design of [`Self::EuclideanPatch`] — the
+    /// latent coordinate `t` is read as a tangent vector at the ball origin
+    /// (the wrapped / tangent parameterisation) and the decoder is the same
+    /// polynomial-in-`t` expansion — but its smoothness penalty is the
+    /// conformal-reweighted Dirichlet energy of the Poincaré metric
+    /// (`refresh_intrinsic_smooth_penalty` measures wiggle in *hyperbolic*
+    /// arc length via the `λ(p)` conformal factor). This makes an atom whose
+    /// feature density grows toward the ball boundary (exponential-volume /
+    /// tree-leaf hierarchy) the regime where it differs from the flat patch.
+    Poincare,
     Precomputed(String),
 }
 
@@ -573,7 +585,14 @@ impl SaeAtomBasisKind {
                     )
                 }
             }
-            Self::Duchon | Self::EuclideanPatch | Self::Precomputed(_) => LatentManifold::Euclidean,
+            // Poincaré tangent patch: the latent `t` is a tangent vector at the
+            // ball origin, optimised in the unconstrained tangent chart (the
+            // hyperbolic geometry enters through the penalty, not a constrained
+            // retraction), so it shares the Euclidean latent manifold.
+            Self::Duchon
+            | Self::EuclideanPatch
+            | Self::Poincare
+            | Self::Precomputed(_) => LatentManifold::Euclidean,
         }
     }
 
@@ -586,7 +605,10 @@ impl SaeAtomBasisKind {
             Self::Sphere if latent_dim == 2 => sphere_projection_seed_grid(resolution),
             Self::Sphere => None,
             Self::Torus => torus_projection_seed_grid(latent_dim, resolution),
-            Self::Duchon | Self::EuclideanPatch | Self::Precomputed(_) => None,
+            // The tangent latent of a Poincaré patch lies in the convex hull of
+            // its PCA seed exactly like the Euclidean patch, so no compact
+            // projection grid is needed.
+            Self::Duchon | Self::EuclideanPatch | Self::Poincare | Self::Precomputed(_) => None,
         }
     }
 }
@@ -1356,11 +1378,31 @@ impl SaeManifoldAtom {
         let mut act = vec![0.0_f64; m];
         let mut num = vec![0.0_f64; m];
         let mut deriv = vec![0.0_f64; p];
+        // Poincaré tangent patch: measure the decoded speed per unit of
+        // *hyperbolic* latent length rather than flat tangent length. A unit
+        // step in the tangent coordinate `t` covers hyperbolic distance
+        // `λ(p(t))` (the conformal factor at the ball point `p = exp₀(t)`), so
+        // the arc-length speed is `‖J‖ / λ` and the squared speed picks up a
+        // `1/λ²` factor. For the monomial patch (`d = 1`) the tangent coordinate
+        // is the linear monomial column (`Φ = [1, t, …]`, so column 1 is `t`).
+        let hyperbolic = matches!(self.basis_kind, SaeAtomBasisKind::Poincare);
+        let linear_col = if hyperbolic && m >= 2 { Some(1usize) } else { None };
         for row in 0..n {
             self.fill_decoded_derivative_row(row, 0, &mut deriv);
             let mut speed_sq = 0.0_f64;
             for &d in deriv.iter() {
                 speed_sq += d * d;
+            }
+            if let Some(col) = linear_col {
+                let t = self.basis_values[[row, col]];
+                // p = exp₀(t) at unit curvature c = −1: ‖p‖ = tanh(|t|), and
+                // λ(p) = 2 / (1 − ‖p‖²) = 2 / (1 − tanh²|t|) = 2·cosh²(t).
+                // speed_sq ← speed_sq / λ².  (cosh is even, so the sign of t
+                // does not matter.)
+                let lambda = 2.0 * t.cosh() * t.cosh();
+                if lambda.is_finite() && lambda > 0.0 {
+                    speed_sq /= lambda * lambda;
+                }
             }
             for col in 0..m {
                 let phi = self.basis_values[[row, col]];
@@ -3526,6 +3568,7 @@ impl SaeManifoldTerm {
                 (
                     SaeAtomBasisKind::Duchon
                     | SaeAtomBasisKind::EuclideanPatch
+                    | SaeAtomBasisKind::Poincare
                     | SaeAtomBasisKind::Precomputed(_),
                     _,
                 ) => AtomTopology::EuclideanPatch { latent_dim: d },
@@ -10720,7 +10763,9 @@ impl SaeManifoldTerm {
         for atom_idx in 0..self.k_atoms() {
             if !matches!(
                 self.atoms[atom_idx].basis_kind,
-                SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Duchon
+                SaeAtomBasisKind::EuclideanPatch
+                    | SaeAtomBasisKind::Duchon
+                    | SaeAtomBasisKind::Poincare
             ) {
                 continue;
             }
@@ -11657,7 +11702,11 @@ impl SaeManifoldTerm {
             let d = self.assignment.coords[atom_idx].latent_dim();
             let coords = self.assignment.coords[atom_idx].as_matrix();
             match self.atoms[atom_idx].basis_kind {
-                SaeAtomBasisKind::EuclideanPatch => {
+                // The Poincaré tangent patch shares the Euclidean patch's
+                // translation + scale gauge orbit on the tangent coordinate
+                // (the hyperbolic structure lives in the penalty, not the
+                // gauge), so it deflates the same step-gauge vectors.
+                SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => {
                     for axis in 0..d {
                         let mut field = Array2::<f64>::zeros((n, d));
                         field.column_mut(axis).fill(1.0);
@@ -11798,7 +11847,9 @@ impl SaeManifoldTerm {
         let d = self.assignment.coords[atom_idx].latent_dim();
         let mut tangent = vec![0.0_f64; self.output_dim()];
         match self.atoms[atom_idx].basis_kind {
-            SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Duchon => {
+            SaeAtomBasisKind::EuclideanPatch
+            | SaeAtomBasisKind::Duchon
+            | SaeAtomBasisKind::Poincare => {
                 for axis in 0..d {
                     self.atoms[atom_idx].fill_decoded_derivative_row(row, axis, &mut tangent);
                     if tangent.iter().map(|&v| v * v).sum::<f64>() <= 1.0e-24 {
