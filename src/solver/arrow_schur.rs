@@ -3256,6 +3256,7 @@ impl ArrowSchurSystem {
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
+            ibp_cross_row: None,
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -3306,6 +3307,7 @@ impl ArrowSchurSystem {
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
+            ibp_cross_row: None,
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -3362,6 +3364,7 @@ impl ArrowSchurSystem {
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
+            ibp_cross_row: None,
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -3424,6 +3427,7 @@ impl ArrowSchurSystem {
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
+            ibp_cross_row: None,
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -3485,6 +3489,7 @@ impl ArrowSchurSystem {
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
+            ibp_cross_row: None,
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -3492,6 +3497,20 @@ impl ArrowSchurSystem {
 
     pub fn set_row_gauge_deflation(&mut self, deflation: ArrowRowGaugeDeflation) {
         self.row_gauge_deflation = Some(deflation);
+    }
+
+    /// Register the exact cross-row IBP low-rank source (#1038). The assembly
+    /// passes the per-column `D`-coefficients (`cross_row_d`) and the `(global
+    /// latent index, atom, z'_ik)` entries built from `z_jac`; the factorization
+    /// then carries the exact rank-`R` Woodbury (value + log-determinant +
+    /// θ/ρ-adjoint) on the evidence cache. An empty source (`r == 0` or no
+    /// entries) is treated as absent so the row-block-diagonal path is unchanged.
+    pub fn set_ibp_cross_row_source(&mut self, source: IbpCrossRowSource) {
+        if source.r == 0 || source.entries.is_empty() {
+            self.ibp_cross_row = None;
+        } else {
+            self.ibp_cross_row = Some(source);
+        }
     }
 
     /// Number of BA point/latent rows `N`.
@@ -5009,6 +5028,47 @@ pub struct ArrowFactorCache {
     /// nothing to the Laplace normalizer (the quotient pseudo-determinant
     /// convention, cf. `PenaltyPseudologdet`). Zero theta/rho dependence.
     pub gauge_deflated_directions: usize,
+    /// Exact cross-row IBP rank-`R` Woodbury correction (#1038), present iff the
+    /// source system carried an [`IbpCrossRowSource`]. When set, the per-row
+    /// factors above are of the NO-SELF base `H₀'` (self term `d_k·z'_ik²`
+    /// downdated from each logit diagonal), and this carrier supplies the exact
+    /// rank-`R` correction so the value/curvature solve
+    /// ([`Self::full_inverse_apply`]), the evidence log-determinant
+    /// ([`Self::arrow_log_det`]), and the θ/ρ-adjoint all describe the same
+    /// `H_full = H₀' + U D Uᵀ`.
+    pub cross_row_woodbury: Option<CrossRowWoodbury>,
+}
+
+/// Materialized exact cross-row IBP Woodbury correction (#1038), built against
+/// an [`ArrowFactorCache`] whose per-row factors are the NO-SELF base `H₀'`.
+///
+/// Holds `U` (the `delta_t_len × R` arrow-`t` factor, β-part implicitly zero),
+/// `D = diag(d_k)`, and the **factored capacitance** `C = I_R + D·M`,
+/// `M = UᵀH₀'⁻¹U`, with `M` itself retained for the adjoint. The full inverse,
+/// log-determinant, and adjoint all reduce to one `R×R` solve on `C` plus the
+/// already-cached `H₀'⁻¹U` columns (`h0inv_u`).
+#[derive(Debug, Clone)]
+pub struct CrossRowWoodbury {
+    /// `U`: `delta_t_len × R`, column `k` supported on atom-`k` logit slots.
+    pub u: Array2<f64>,
+    /// `d_k`, length `R`.
+    pub d: Array1<f64>,
+    /// `H₀'⁻¹ U` (the `t`-block), `delta_t_len × R`.
+    pub h0inv_u: Array2<f64>,
+    /// `M = Uᵀ H₀'⁻¹ U`, `R × R` (symmetric). Retained for the θ/ρ-adjoint.
+    pub m: Array2<f64>,
+    /// Lower-Cholesky factor of the symmetrized capacitance
+    /// `C̃ = I_R + √D·M·√D`, where `√D = diag(√d_k)`. Because
+    /// `det(I_R + D M) = det(I_R + √D M √D)` and the solve of `I_R + D M`
+    /// reduces to a `√D`-scaled solve of `C̃`, keeping the SYMMETRIC factor lets
+    /// the same Cholesky serve the log-determinant, the inverse correction, and
+    /// the selected-inverse the adjoint needs. Requires `d_k > 0` (the IBP
+    /// `s'_k = score_derivative_k` curvature coefficient is positive on the
+    /// stick-breaking interior); when any `d_k ≤ 0` the carrier is not built and
+    /// the cross-row term is absent (documented at [`CrossRowWoodbury::build`]).
+    pub capacitance_factor: Array2<f64>,
+    /// `√d_k`, length `R` — the symmetrizing scale for the capacitance.
+    pub sqrt_d: Array1<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
