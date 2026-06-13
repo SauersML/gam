@@ -140,7 +140,16 @@ def test_bernoulli_marginal_slope_interval_carries_clipped_bounds(
     )
 
     assert isinstance(out, dict)
-    assert set(out) == {"mean", "std_error", "mean_lower", "mean_upper"}
+    assert set(out) == {
+        "linear_predictor",
+        "mean",
+        "std_error",
+        "mean_lower",
+        "mean_upper",
+    }
+    # linear_predictor is the η-scale point — passed through untouched so the
+    # band reconstructs as link^{-1}(η ± z·std_error).
+    np.testing.assert_allclose(out["linear_predictor"], [-1.0, 0.0, 1.0])
     np.testing.assert_allclose(out["mean"], [0.16, 0.50, 0.84])
     # std_error is the η-scale SE — untouched, not clipped.
     np.testing.assert_allclose(out["std_error"], [0.30, 0.20, 0.30])
