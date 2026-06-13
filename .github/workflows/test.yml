@@ -15,6 +15,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # #1072: the per-file integration loop ran `cargo {test,nextest run} --test
+  # <name>` once per tests/*.rs and recompiled the `gam` crate FROM SCRATCH every
+  # iteration (~3.5 min × 707 files ≈ 41 h vs the 6 h cap → only ~3% of tests ran
+  # before the job was cancelled). Root cause: the per-iteration deletion of
+  # target/debug/incremental/ corrupted cargo's incremental fingerprint and
+  # forced a full gam rebuild on the next `--test`. Disabling incremental
+  # entirely removes that corruption surface: gam's rlib is built ONCE (the
+  # --lib phase), then reused unchanged by every per-file `--test` link.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   fmt:
@@ -149,32 +158,44 @@ jobs:
           RUSTFLAGS: "-C link-arg=-Wl,--threads=1"
         run: |
           set -uo pipefail
-          # cargo test captures stdout/stderr by default and only re-prints
-          # it in the per-failure "failures:" section of tests that actually
-          # failed. That is what we want here: the forbidden-pattern grep
-          # below only fires when cargo test itself returned non-zero, and
-          # at that point the failed tests' captured output is already in
-          # /tmp/cargo-test.log via the failures: section. Passing tests
-          # that deliberately drive the solver into degenerate states (and
-          # the diagnostic eprintln!/log::warn! sites they exercise on the
-          # hot REML / PIRLS / joint-Newton paths) stay silent, so their
-          # output cannot accumulate on the runner's disk and exhaust it
-          # mid-link. That accumulation was the recurring "exit code 101 /
-          # LLVM ERROR: No space left on device" failure mode that this
-          # step kept reproducing every time a probe `eprintln!` got added
-          # anywhere in the hot solver paths.
+          # nextest captures each test's stdout/stderr and, with
+          # failure-output = "immediate-final" in .config/nextest.toml, re-prints
+          # it only for tests that FAILED (or were terminated by the per-test
+          # slow-timeout). That is what we want here: the forbidden-pattern grep
+          # below only fires when the test run returned non-zero, and at that
+          # point the failed tests' captured output is already in
+          # /tmp/cargo-test.log via that final failure block. Passing tests that
+          # deliberately drive the solver into degenerate states (and the
+          # diagnostic eprintln!/log::warn! sites they exercise on the hot
+          # REML / PIRLS / joint-Newton paths) stay silent
+          # (success-output = "never"), so their output cannot accumulate on the
+          # runner's disk and exhaust it mid-link. That accumulation was the
+          # recurring "exit code 101 / LLVM ERROR: No space left on device"
+          # failure mode that this step kept reproducing every time a probe
+          # `eprintln!` got added anywhere in the hot solver paths.
           # The CI assertions need line numbers from panic output, not full DWARF
           # debug sections in every integration-test binary. Dropping dev
-          # debuginfo removes the largest non-executable payload from the link
-          # and keeps the serialized link job practical on standard runners.
+          # debuginfo (--config profile.dev.debug=0) removes the largest
+          # non-executable payload from the link and keeps the serialized link
+          # job practical on standard runners.
           #
-          # Per-command wall-clock caps. Each tests/*.rs target is linked and
-          # run in isolation below, so these are the finest-grained caps
-          # available without changing the test harness itself. GNU timeout
-          # runs the command in its own process group by default, so an overrun
-          # kills cargo and the test executable it spawned instead of leaving a
-          # runaway test behind for later iterations.
-          INTEGRATION_TEST_TIMEOUT=300
+          # PER-TEST timeout: the primary hang catcher is nextest's per-test
+          # slow-timeout (period = 600s, terminate-after = 1) in
+          # .config/nextest.toml — a single `#[test]` that overruns is SIGKILLed
+          # and reported as a FAILURE naming that exact test. nextest builds each
+          # tests/*.rs binary (via --test <name>) and the --lib/--bins/--examples
+          # set in isolation below, exactly like the previous per-binary cargo
+          # test loop, so the serial-link + disk-prune discipline is unchanged.
+          #
+          # Per-binary wall-clock caps (GNU timeout) remain as an OUTER backstop
+          # around the whole nextest invocation for one binary: they bound a
+          # build/link hang or a pathological binary whose many fast tests sum
+          # past the budget, and are set comfortably above the 600s per-test cap
+          # so they never preempt nextest's finer-grained, better-named layer.
+          # GNU timeout runs the command in its own process group by default, so
+          # an overrun kills nextest and every test process it spawned instead of
+          # leaving a runaway test behind for later iterations.
+          INTEGRATION_TEST_TIMEOUT=1800
           LIB_TEST_TIMEOUT=1800
 
           run_capped() {
@@ -187,10 +208,20 @@ jobs:
             return "$status"
           }
 
+          # --build-jobs 1: serialize the link step (the OOM/Bus-error guard).
+          # --test-threads 1: run the binary's tests serially, matching the old
+          #   per-binary model and avoiding peak-RSS spikes from many solver
+          #   tests at once on the 16-GB runner.
+          # -P ci --config-file .config/nextest.toml: the per-test slow-timeout
+          #   profile. A timed-out or failed test makes nextest exit non-zero,
+          #   which run_capped propagates as a failure.
           run_cargo_test() {
             local cap="$1"; shift
             run_capped "$cap" \
-              cargo test --config profile.dev.debug=0 --all-features --jobs 1 "$@"
+              cargo nextest run \
+                --profile ci --config-file .config/nextest.toml \
+                --config profile.dev.debug=0 --all-features \
+                --build-jobs 1 --test-threads 1 "$@"
           }
 
           test_status=0
@@ -236,10 +267,13 @@ jobs:
             if ! run_cargo_test "$INTEGRATION_TEST_TIMEOUT" --test "$test_name"; then
               test_status=1
             fi
+            # Prune only the executed test EXECUTABLE to reclaim disk. Do NOT
+            # delete target/debug/incremental/ — that corrupted cargo's
+            # fingerprint and forced a full ~3.5min gam recompile every iteration
+            # (#1072). With CARGO_INCREMENTAL=0 there is no incremental dir to
+            # prune anyway; the gam rlib stays built-once and is reused.
             rm -f "target/debug/deps/${test_name}"-* \
-                  "target/debug/deps/${test_name//-/_}"-* \
-                  "target/debug/incremental/${test_name}"-* \
-                  "target/debug/incremental/${test_name//-/_}"-* || true
+                  "target/debug/deps/${test_name//-/_}"-* || true
             df -h /
           done
 
@@ -291,10 +325,15 @@ jobs:
           RUSTFLAGS: "-C link-arg=-Wl,--threads=1"
         run: |
           set -uo pipefail
+          # Run through nextest so each gam-pyffi `#[test]` gets the same
+          # per-test slow-timeout (600s, terminate-after) as the main suite; the
+          # GNU timeout below is the outer per-invocation backstop.
           PYFFI_TEST_TIMEOUT=1800
           timeout --kill-after=30s "${PYFFI_TEST_TIMEOUT}s" \
-            cargo test -p gam-pyffi --no-default-features \
-            --config profile.dev.debug=0 --jobs 1 2>&1 | tee -a /tmp/cargo-test.log
+            cargo nextest run -p gam-pyffi --no-default-features \
+            --profile ci --config-file .config/nextest.toml \
+            --config profile.dev.debug=0 \
+            --build-jobs 1 --test-threads 1 2>&1 | tee -a /tmp/cargo-test.log
           status="${PIPESTATUS[0]}"
           if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
             echo "::error::gam-pyffi tests exceeded ${PYFFI_TEST_TIMEOUT}s wall-clock cap and were killed."
