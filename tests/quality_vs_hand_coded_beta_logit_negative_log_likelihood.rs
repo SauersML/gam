@@ -797,15 +797,25 @@ fn beta_logit_custom_family_recovers_truth_and_generalises() {
         design1: design1_tr.clone(),
     };
 
-    // A tiny ridge keeps the inner Newton geometry well-conditioned without
-    // materially shrinking the 2-coefficient blocks.
+    // This is a PARAMETRIC maximum-likelihood recovery problem: the true η is
+    // exactly linear (α=softplus(A0+A1·x1), β=softplus(B0+B1·x2)) and the R
+    // baseline below is an UNPENALIZED MLE. The block ridge exists ONLY to keep
+    // the 2×2 inner-Newton geometry well-conditioned — it must not shrink the
+    // structural slopes that carry the truth signal. With a REML-OPTIMIZED ridge
+    // it does: on 2-coefficient blocks the REML objective has almost no
+    // likelihood curvature to oppose the penalty, so it drove λ up to ≈10–20
+    // (from the −4 seed), attenuating the slopes by 20–50% (b_beta1≈0.25 vs the
+    // true 0.50) and pushing truth-recovery RMSE over the bar. Fix the ridge at a
+    // tiny FIXED precision (λ=e^{-6}≈2.5e-3, removed from the REML coordinate) so
+    // it conditions the solve without biasing the MLE — gam then recovers the
+    // same near-unpenalized estimate the R `optim` baseline does.
     let make_spec = |name: &str, design: Array2<f64>| ParameterBlockSpec {
         name: name.to_string(),
         design: DesignMatrix::Dense(DenseDesignMatrix::from(design)),
         offset: Array1::<f64>::zeros(n_tr),
-        penalties: vec![PenaltyMatrix::Dense(Array2::eye(2))],
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(2)).with_fixed_log_lambda(-6.0)],
         nullspace_dims: vec![0],
-        initial_log_lambdas: Array1::from(vec![-4.0]),
+        initial_log_lambdas: Array1::from(vec![-6.0]),
         initial_beta: Some(Array1::from(vec![0.0, 0.0])),
         ..ParameterBlockSpec::defaults()
     };
