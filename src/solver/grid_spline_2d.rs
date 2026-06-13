@@ -817,7 +817,165 @@ pub struct GridSpline2dFit {
     m_axis: usize,
 }
 
+/// Serializable snapshot of a [`GridSpline2dFit`] (#1031 persistence
+/// prerequisite). The grid is deliberately NOT a formula fast path — it is an
+/// ANOVA pair component (#975 carve) — so there is no `FitResult` variant; this
+/// state is what the carve's persistence payload serializes and what
+/// `from_state` replays for an exact predict.
+///
+/// Predict needs the MEAN (`coeffs` + the 16-entry tensor basis row, which is a
+/// pure function of `axes`/`m_axis`) and the VARIANCE
+/// (`σ²·x'(X'WX+λS)⁻¹x` through the retained Cholesky factor `chol`). All of
+/// that — and nothing about the training rows — lives on the fit already, so the
+/// state is a verbatim snapshot: no design CSR, no re-factor on load.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GridSpline2dState {
+    /// Per response dimension: row-major coefficients `g = j1·(K+3) + j2`.
+    pub coeffs: Vec<Vec<f64>>,
+    pub log_lambda: f64,
+    /// Per response dimension: profiled (or supplied) observation variance σ².
+    pub sigma2: Vec<f64>,
+    pub restricted_loglik: f64,
+    /// Lower Cholesky factor of `X'WX + λS` (unit-σ² scale), `p × p` row-major —
+    /// the factored posterior precision the variance term solves against.
+    pub chol: Vec<f64>,
+    /// Per axis lower corner of the basis bounding box.
+    pub axis_lo: [f64; 2],
+    /// Per axis cell width `h = (hi − lo)/K`.
+    pub axis_h: [f64; 2],
+    /// Per axis cell count `K`.
+    pub axis_cells: [u64; 2],
+    /// Basis count per axis, `K + 3` (so `p = m_axis²`).
+    pub m_axis: u64,
+}
+
 impl GridSpline2dFit {
+    /// Snapshot the fit for persistence (#1031). Verbatim — every field
+    /// `predict` reads is copied; the training design is not retained on the fit
+    /// and is not needed for replay.
+    pub fn to_state(&self) -> GridSpline2dState {
+        GridSpline2dState {
+            coeffs: self.coeffs.clone(),
+            log_lambda: self.log_lambda,
+            sigma2: self.sigma2.clone(),
+            restricted_loglik: self.restricted_loglik,
+            chol: self.chol.clone(),
+            axis_lo: [self.axes[0].lo, self.axes[1].lo],
+            axis_h: [self.axes[0].h, self.axes[1].h],
+            axis_cells: [self.axes[0].cells as u64, self.axes[1].cells as u64],
+            m_axis: self.m_axis as u64,
+        }
+    }
+
+    /// Rebuild a predict-capable fit from a snapshot (#1031). Validates shape,
+    /// finiteness, positive cell widths/counts, positive σ², and that the basis
+    /// arithmetic is self-consistent (`m_axis = K + 3`, `chol` is `p × p`,
+    /// `coeffs`/`sigma2` agree on `D`), so a corrupt payload fails here rather
+    /// than inside a later `predict`. The restored fit replays the posterior
+    /// mean+variance bit-for-bit: `predict` reads only the snapshotted fields.
+    pub fn from_state(state: &GridSpline2dState) -> Result<Self, String> {
+        let m_axis = state.m_axis as usize;
+        let p = m_axis * m_axis;
+        for a in 0..2 {
+            let cells = state.axis_cells[a] as usize;
+            if cells == 0 {
+                return Err(format!(
+                    "grid spline 2d state: axis {a} must have at least one cell"
+                ));
+            }
+            if m_axis != cells + 3 {
+                return Err(format!(
+                    "grid spline 2d state: m_axis {m_axis} must equal K+3 = {} for axis {a}",
+                    cells + 3
+                ));
+            }
+            if !(state.axis_lo[a].is_finite() && state.axis_h[a].is_finite() && state.axis_h[a] > 0.0)
+            {
+                return Err(format!(
+                    "grid spline 2d state: axis {a} must have finite lo and positive h, got lo={}, h={}",
+                    state.axis_lo[a], state.axis_h[a]
+                ));
+            }
+        }
+        if state.chol.len() != p * p {
+            return Err(format!(
+                "grid spline 2d state: chol must be p×p = {p}² = {}, got {}",
+                p * p,
+                state.chol.len()
+            ));
+        }
+        let d = state.coeffs.len();
+        if d == 0 || state.sigma2.len() != d {
+            return Err(format!(
+                "grid spline 2d state: need ≥1 response dimension with matching σ² (coeffs D={d}, sigma2 D={})",
+                state.sigma2.len()
+            ));
+        }
+        for (dim, c) in state.coeffs.iter().enumerate() {
+            if c.len() != p {
+                return Err(format!(
+                    "grid spline 2d state: response dimension {dim} has {} coeffs, expected p = {p}",
+                    c.len()
+                ));
+            }
+        }
+        for (dim, &s2) in state.sigma2.iter().enumerate() {
+            if !(s2.is_finite() && s2 > 0.0) {
+                return Err(format!(
+                    "grid spline 2d state: response dimension {dim} has non-positive σ² = {s2}"
+                ));
+            }
+        }
+        for (i, v) in state
+            .chol
+            .iter()
+            .chain(state.coeffs.iter().flatten())
+            .enumerate()
+        {
+            if !v.is_finite() {
+                return Err(format!("grid spline 2d state: non-finite entry at {i}"));
+            }
+        }
+        // The diagonal of a lower Cholesky factor is strictly positive; a
+        // zero/negative pivot means the persisted factor is not a valid
+        // precision factor and `chol_solve` would divide by it.
+        for g in 0..p {
+            let piv = state.chol[g * p + g];
+            if !(piv.is_finite() && piv > 0.0) {
+                return Err(format!(
+                    "grid spline 2d state: non-positive Cholesky pivot {piv} at index {g}"
+                ));
+            }
+        }
+        if !(state.log_lambda.is_finite() && state.restricted_loglik.is_finite()) {
+            return Err(format!(
+                "grid spline 2d state: invalid scalars (log_lambda={}, restricted_loglik={})",
+                state.log_lambda, state.restricted_loglik
+            ));
+        }
+        let axes = [
+            Axis {
+                lo: state.axis_lo[0],
+                h: state.axis_h[0],
+                cells: state.axis_cells[0] as usize,
+            },
+            Axis {
+                lo: state.axis_lo[1],
+                h: state.axis_h[1],
+                cells: state.axis_cells[1] as usize,
+            },
+        ];
+        Ok(GridSpline2dFit {
+            coeffs: state.coeffs.clone(),
+            log_lambda: state.log_lambda,
+            sigma2: state.sigma2.clone(),
+            restricted_loglik: state.restricted_loglik,
+            chol: state.chol.clone(),
+            axes,
+            m_axis,
+        })
+    }
+
     /// Posterior `(mean, variance)` of response dimension `dim` at an
     /// arbitrary point: the 16-entry basis row dotted with the coefficients,
     /// and `σ̂²_dim·x'(X'WX+λS)⁻¹x` through the retained Cholesky factor.
@@ -875,4 +1033,105 @@ pub fn fit_grid_spline_2d_at(
     sigma2: Option<f64>,
 ) -> Result<GridSpline2dFit, String> {
     GridSpline2dDesign::build(x1, x2, y, w, k, metric)?.fit_at(log_lambda, sigma2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// State → JSON → from_state replays the posterior mean+variance bit-for-bit
+    /// at held-out points (the grid carries no training CSR, so the snapshot is
+    /// the whole predict-capable object). This is the #1031 persistence
+    /// prerequisite the ANOVA carve consumes.
+    #[test]
+    fn grid_spline_2d_state_roundtrip_reproduces_predict() {
+        let k = 8usize;
+        // A smooth multi-output surface on a scattered grid of points.
+        let mut x1 = Vec::new();
+        let mut x2 = Vec::new();
+        let mut y0 = Vec::new();
+        let mut y1 = Vec::new();
+        for i in 0..24 {
+            for j in 0..24 {
+                let a = i as f64 / 23.0;
+                let b = j as f64 / 23.0;
+                x1.push(a);
+                x2.push(b);
+                y0.push((2.5 * a).sin() * (1.7 * b).cos() + 0.3 * a * b);
+                y1.push(a * a - 0.5 * b + 0.2 * (3.0 * a * b).cos());
+            }
+        }
+        let n = x1.len();
+        let w = vec![1.0_f64; n];
+        let ys: Vec<&[f64]> = vec![&y0, &y1];
+        let fit = GridSpline2dDesign::build_multi(&x1, &x2, &ys, &w, k, [1.0, 1.0])
+            .expect("design")
+            .fit_reml()
+            .expect("fit");
+
+        let json = serde_json::to_string(&fit.to_state()).expect("serialize");
+        let state: GridSpline2dState = serde_json::from_str(&json).expect("deserialize");
+        let restored = GridSpline2dFit::from_state(&state).expect("restore");
+
+        // Held-out points, including one outside the box to exercise the
+        // boundary-cell polynomial extension.
+        let probes = [
+            (0.13, 0.77),
+            (0.41, 0.05),
+            (0.66, 0.92),
+            (0.99, 0.31),
+            (1.20, -0.10),
+        ];
+        for dim in 0..2 {
+            for &(p1, p2) in &probes {
+                let (m0, v0) = fit.predict(dim, p1, p2).expect("orig predict");
+                let (m1, v1) = restored.predict(dim, p1, p2).expect("restored predict");
+                assert!(
+                    (m0 - m1).abs() <= 1e-12 * (1.0 + m0.abs()),
+                    "mean drift dim={dim} at ({p1},{p2}): {m0} vs {m1}"
+                );
+                assert!(
+                    (v0 - v1).abs() <= 1e-12 * (1.0 + v0.abs()),
+                    "variance drift dim={dim} at ({p1},{p2}): {v0} vs {v1}"
+                );
+            }
+        }
+        assert!((fit.log_lambda - restored.log_lambda).abs() <= 0.0);
+        assert!((fit.restricted_loglik - restored.restricted_loglik).abs() <= 0.0);
+    }
+
+    /// Corrupt snapshots fail loudly in `from_state`, not inside a later predict.
+    #[test]
+    fn grid_spline_2d_state_rejects_corruption() {
+        let k = 6usize;
+        let n = 18usize;
+        let x1: Vec<f64> = (0..n).map(|i| i as f64 / (n - 1) as f64).collect();
+        let x2: Vec<f64> = (0..n).map(|i| (i as f64 * 0.37).fract()).collect();
+        let y: Vec<f64> = x1.iter().zip(&x2).map(|(&a, &b)| a + b).collect();
+        let w = vec![1.0_f64; n];
+        let fit = fit_grid_spline_2d(&x1, &x2, &y, &w, k, [1.0, 1.0]).expect("fit");
+
+        let good = fit.to_state();
+        let mut bad = good.clone();
+        bad.chol.pop();
+        GridSpline2dFit::from_state(&bad).expect_err("chol length mismatch must error");
+
+        let mut bad = good.clone();
+        bad.sigma2[0] = -1.0;
+        GridSpline2dFit::from_state(&bad).expect_err("non-positive σ² must error");
+
+        let mut bad = good.clone();
+        bad.m_axis += 1;
+        GridSpline2dFit::from_state(&bad).expect_err("m_axis ≠ K+3 must error");
+
+        let mut bad = good.clone();
+        bad.axis_h[0] = 0.0;
+        GridSpline2dFit::from_state(&bad).expect_err("non-positive cell width must error");
+
+        let mut bad = good;
+        let p = (bad.m_axis as usize) * (bad.m_axis as usize);
+        bad.chol[0] = 0.0;
+        let _ = p;
+        GridSpline2dFit::from_state(&bad).expect_err("zero Cholesky pivot must error");
+    }
 }
