@@ -186,20 +186,21 @@ fn build_atom_candidates(
     // Linear candidate parameter price: intercept + slope per output channel.
     let linear_num_params = 2 * p;
 
-    // Laplace logdet of the (weighted) design Gram for each candidate. For the
-    // straight-line sub-model the per-channel Gram is the 2×2 weighted moment
-    // matrix `[[Σw, Σw·t],[Σw·t, Σw·t²]]`, identical across channels (the design
-    // is shared), so its logdet is `p·log det(G₂)`. For the curved atom we use a
-    // proxy of `curved_num_params·log(w_sum)` — the same `log(effective sample
-    // size)` per parameter the rank-aware Laplace normalizer assigns, which keeps
-    // both candidates on one comparable scale (the curved atom pays a logdet term
-    // proportional to its larger parameter count, the matched-active-budget
-    // accounting the #1026 dominance argument prices).
-    let g2_det = w_sum * s_tt; // det([[Σw, Σw·t],[Σw·t̄, Σw·t²]]) = Σw·Σw(t−t̄)²
-    if !(g2_det > 0.0 && g2_det.is_finite()) {
+    // Laplace logdet of the (weighted) design Gram for each candidate.
+    //
+    // Both candidates are compared on the same per-parameter effective-sample-size
+    // scale: `num_params · log(w_sum)`. This is the only scale-invariant basis for
+    // comparison — using the raw `p · log(w_sum · s_tt)` for the linear candidate
+    // makes the adjudication coordinate-scale-dependent (multiplying `t` by a
+    // constant shifts `log(s_tt)` and moves the curved/linear crossover
+    // artificially). The informative content of the two-parameter linear fit versus
+    // the `M`-basis curved fit is fully captured by the parameter counts on a shared
+    // `log(w_sum)` scale; the within-atom spread `s_tt` is structural geometry that
+    // the curved atom's proxy also cannot price.
+    if !(w_sum > 0.0 && w_sum.is_finite()) {
         return None;
     }
-    let linear_log_det_h = (p as f64) * g2_det.ln();
+    let linear_log_det_h = (linear_num_params as f64) * w_sum.ln();
     let curved_log_det_h = (curved_num_params as f64) * w_sum.ln();
 
     // Both candidates carry zero explicit smoothing-penalty logdet here (the
