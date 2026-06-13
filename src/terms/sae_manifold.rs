@@ -15079,7 +15079,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.term.atoms.iter().any(|atom| {
             matches!(
                 atom.basis_kind,
-                SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch
+                SaeAtomBasisKind::Duchon
+                    | SaeAtomBasisKind::EuclideanPatch
+                    | SaeAtomBasisKind::Poincare
             )
         })
     }
