@@ -212,7 +212,11 @@ pub fn certificate_from_samples(s: &DirectionalSamples) -> CriterionCertificate 
         analytic_directional: s.analytic_directional,
         fd_error_bar,
         step: s.step,
-        well_posed: s.well_posed && s.plus_h.is_finite() && s.minus_h.is_finite(),
+        well_posed: s.well_posed
+            && s.plus_h.is_finite()
+            && s.minus_h.is_finite()
+            && s.plus_2h.is_finite()
+            && s.minus_2h.is_finite(),
     }
 }
 
@@ -341,6 +345,29 @@ mod tests {
         assert!(
             !cert.well_posed,
             "NaN value sample must flag not-well-posed"
+        );
+        assert!(!cert.passes(1.0), "not-well-posed never certifies");
+    }
+
+    /// A non-finite Richardson sample (`plus_2h` or `minus_2h`) also marks
+    /// the certificate not-well-posed — the error bar is meaningless if those
+    /// evaluations failed, even when the ±h samples are finite.
+    #[test]
+    fn nonfinite_richardson_sample_marks_not_well_posed() {
+        let samples = DirectionalSamples {
+            plus_h: 1.1,
+            minus_h: 0.9,
+            plus_2h: f64::NAN,
+            minus_2h: 0.8,
+            step: 1e-4,
+            grad_norm: 1.0,
+            analytic_directional: 1.0,
+            well_posed: true,
+        };
+        let cert = certificate_from_samples(&samples);
+        assert!(
+            !cert.well_posed,
+            "NaN Richardson sample must flag not-well-posed"
         );
         assert!(!cert.passes(1.0), "not-well-posed never certifies");
     }
