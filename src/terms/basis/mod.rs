@@ -12368,6 +12368,23 @@ fn matern_rank_reduce_centers(
     if rrqr.rank >= k {
         return Ok(centers.clone());
     }
+    // Rank 0 means the realized kernel design has no numerically independent
+    // columns at all: every center collapses to the same (near-constant) radial
+    // response on this data cloud at the chosen `length_scale`, so the Matérn
+    // term carries no usable signal. Emitting a 0-center basis here would leave a
+    // degenerate term whose 0-column design desyncs against its identifiability
+    // transform and silently corrupts the fit (#1090). Fail loudly with an
+    // actionable message instead — a length_scale this large relative to the data
+    // spread (or a near-degenerate coordinate cloud) needs the user to widen the
+    // domain, shrink the length scale, or drop the term.
+    if rrqr.rank == 0 {
+        crate::bail_invalid_basis!(
+            "Matérn smooth has data-supported numerical rank 0: all {k} center(s) are \
+             numerically collinear at length_scale={length_scale} on this data cloud, so the \
+             kernel basis is degenerate (no independent columns). Reduce length_scale, spread \
+             the coordinate cloud, or drop this term (#1090/#755)."
+        );
+    }
     let mut keep = rrqr.column_permutation[..rrqr.rank].to_vec();
     keep.sort_unstable();
     log::info!(
@@ -15986,18 +16003,36 @@ fn build_matern_basis_seeded(
     // periodic replication, the identifiability transform, and the penalty all
     // built from the same full-rank center subset. The contrasts used for the
     // rank Gram come from the selected centers so anisotropy is honored.
-    let reduce_aniso = resolve_matern_forward_aniso(
-        aniso_seed_mode,
-        selected_centers.view(),
-        spec.aniso_log_scales.as_deref(),
-    );
-    let original_centers = matern_rank_reduce_centers(
-        data,
-        &selected_centers,
-        spec.length_scale,
-        spec.nu,
-        reduce_aniso.as_deref(),
-    )?;
+    //
+    // The reduction depends on the realized kernel rank over *this* data cloud,
+    // so it must run exactly once — at the cold (train-time) build that also
+    // builds the identifiability transform over the surviving centers. A
+    // `FrozenTransform` build replays a fit whose centers (pinned `UserProvided`)
+    // and transform were already reduced and frozen mutually consistently; the
+    // prediction/replay data cloud is different (and often smaller or degenerate)
+    // and re-running RRQR here would prune to a *different* count (e.g. 16→0),
+    // leaving a stale N-row transform over a reduced-column basis and a hard
+    // "centers vs transform rows" dimension mismatch at predict time (#1090).
+    // When frozen, keep the pinned centers verbatim.
+    let original_centers = if matches!(
+        spec.identifiability,
+        MaternIdentifiability::FrozenTransform { .. }
+    ) {
+        selected_centers
+    } else {
+        let reduce_aniso = resolve_matern_forward_aniso(
+            aniso_seed_mode,
+            selected_centers.view(),
+            spec.aniso_log_scales.as_deref(),
+        );
+        matern_rank_reduce_centers(
+            data,
+            &selected_centers,
+            spec.length_scale,
+            spec.nu,
+            reduce_aniso.as_deref(),
+        )?
+    };
     let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
     // Resolve the anisotropy contrasts for the forward design (see
     // `resolve_matern_forward_aniso` / [`AnisoSeedMode`]): `Literal` honors an
@@ -32435,6 +32470,110 @@ mod tests {
                 PenaltySource::DoublePenaltyNullspace
             ));
         }
+    }
+
+    /// #1090: a FrozenTransform Matérn build replays a fit whose centers and
+    /// identifiability transform were already rank-reduced and frozen mutually
+    /// consistently at train time. The prediction/replay data cloud differs (and
+    /// can be degenerate), so re-running the #755 RRQR center reduction here would
+    /// prune the pinned centers to a *different* count, leaving a stale N-row
+    /// transform over a reduced-column basis and a hard "centers vs transform
+    /// rows" dimension mismatch. The frozen path must keep the pinned centers
+    /// verbatim and build cleanly on the degenerate cloud.
+    #[test]
+    fn matern_frozen_transform_skips_rank_reduction_on_degenerate_cloud() {
+        // Four well-separated centers; the transform is built over all four.
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let z = matern_identifiability_transform(
+            centers.view(),
+            &MaternIdentifiability::CenterSumToZero,
+        )
+        .expect("transform builds")
+        .expect("center sum-to-zero yields a transform");
+        let transform_rows = z.nrows();
+        assert_eq!(
+            transform_rows,
+            centers.nrows(),
+            "center sum-to-zero transform spans every center"
+        );
+        let spec = MaternBasisSpec {
+            periodic: None,
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            length_scale: 1.1,
+            nu: MaternNu::ThreeHalves,
+            include_intercept: false,
+            double_penalty: false,
+            identifiability: MaternIdentifiability::FrozenTransform {
+                transform: z.clone(),
+                nullspace_shrinkage_survived: Some(false),
+            },
+            aniso_log_scales: None,
+            nullspace_shrinkage_survived: None,
+        };
+        // Degenerate replay cloud: many rows packed into a near-singleton point
+        // at a length_scale that, under the cold RRQR reduction, would collapse
+        // the kernel design to a rank far below the four frozen centers. Without
+        // the #1090 fix the rebuild would re-reduce the pinned centers and then
+        // hit the frozen-transform row mismatch.
+        let n = 80usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = 0.5 + 1e-6 * t;
+            data[[i, 1]] = 0.5 + 1e-6 * t;
+        }
+        let out = build_matern_basis(data.view(), &spec)
+            .expect("frozen Matérn must replay on a degenerate cloud without re-reducing centers");
+        // The realized design width matches the frozen transform's column space,
+        // not some re-reduced count.
+        assert_eq!(
+            out.design.ncols(),
+            z.ncols(),
+            "frozen replay design width must equal the frozen transform's column space"
+        );
+        match &out.metadata {
+            BasisMetadata::Matern { centers: meta, .. } => assert_eq!(
+                meta.nrows(),
+                centers.nrows(),
+                "frozen replay must keep all {} pinned centers, not re-reduce them",
+                centers.nrows()
+            ),
+            other => panic!("expected Matérn metadata, got {other:?}"),
+        }
+    }
+
+    /// #1090 companion: a *cold* (non-frozen) Matérn whose data-supported rank is
+    /// 0 (every center numerically collinear at the chosen length_scale) must fail
+    /// loudly with an actionable error rather than emit a silent 0-center basis.
+    #[test]
+    fn matern_cold_zero_rank_cloud_fails_loudly() {
+        // Two centers separated by far less than the kernel can resolve, on a
+        // near-singleton data cloud → realized kernel rank 0.
+        let centers = array![[0.5, 0.5], [0.5 + 1e-9, 0.5 + 1e-9]];
+        let n = 40usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            data[[i, 0]] = 0.5 + 1e-12 * (i as f64);
+            data[[i, 1]] = 0.5 + 1e-12 * (i as f64);
+        }
+        let spec = MaternBasisSpec {
+            periodic: None,
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: 50.0,
+            nu: MaternNu::FiveHalves,
+            include_intercept: false,
+            double_penalty: false,
+            identifiability: MaternIdentifiability::None,
+            aniso_log_scales: None,
+            nullspace_shrinkage_survived: None,
+        };
+        let err = build_matern_basis(data.view(), &spec)
+            .expect_err("rank-0 Matérn cloud must fail loudly, not emit a degenerate basis");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("numerical rank 0"),
+            "expected a rank-0 degeneracy error, got: {msg}"
+        );
     }
 
     #[test]
