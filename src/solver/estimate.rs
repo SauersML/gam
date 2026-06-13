@@ -3137,6 +3137,18 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         }
     }
 
+    /// True when a certified ψ-Gram tensor is installed AND `psi` lies inside
+    /// its certified GRADIENT sub-window — i.e. the n-free k-space ψ-derivatives
+    /// `(∂G/∂ψ, ∂b/∂ψ)` will serve the Gaussian gradient HyperCoord, so the
+    /// caller's per-trial n×k ∂X/∂ψ slab is redundant (#1033). The value lane
+    /// (`contains`) spans the full window; the gradient lane is the narrower
+    /// interior where the Chebyshev derivative reconstruction is bit-tight.
+    pub(crate) fn psi_gram_tensor_covers_gradient(&self, psi: f64) -> bool {
+        self.psi_gram_tensor
+            .as_ref()
+            .is_some_and(|t| t.contains_for_gradient(psi))
+    }
+
     fn prepare_eval_state(
         &mut self,
         x: &DesignMatrix,
