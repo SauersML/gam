@@ -11,6 +11,7 @@ pub mod manifold;
 pub mod optimizer;
 pub mod poincare;
 pub mod product;
+pub mod response_geometry;
 pub mod simplex;
 pub mod spd;
 pub mod sphere;
@@ -36,6 +37,9 @@ pub use latent_seed::laplacian_eigenmap_coords;
 pub use manifold::{GeometryError, GeometryResult, ManifoldSpec, RiemannianManifold};
 pub use optimizer::{RiemannianLBFGS, RiemannianObjective, RiemannianTrustRegion};
 pub use product::ProductManifold;
+pub use response_geometry::{
+    response_exp_map, response_frechet_mean, response_log_map, ResponseManifold,
+};
 pub use spd::{SpdManifold, spd_frechet_mean};
 pub use sphere::SphereManifold;
 pub use stiefel::StiefelManifold;

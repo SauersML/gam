@@ -19477,11 +19477,6 @@ fn rg_resolve_simplex_coord_label(kind: &str, coordinates: Option<&str>) -> Stri
     }
 }
 
-fn rg_unknown_geometry(other: &str) -> String {
-    format!(
-        "response_geometry must be one of 'spherical', 'simplex', 'clr', or 'alr'; got {other:?}"
-    )
-}
 
 /// Consolidated response-geometry log map: pick the base point (intrinsic
 /// Fréchet mean when none is supplied, else the projected/closed input base),
@@ -19527,7 +19522,10 @@ fn rg_log_map_dispatch(
             )?;
             Ok((tangent, base_point, coord_label))
         }
-        other => Err(rg_unknown_geometry(other)),
+        // Curved matrix / hyperbolic response geometries (#1061): the math is in
+        // `gam::geometry` and the label-parsing + intrinsic-mean + batched-map
+        // routing lives in `response_geometry`. `reference` does not apply.
+        _ => gam::geometry::response_geometry::dispatch_log_map(values, &kind, base),
     }
 }
 
@@ -19549,7 +19547,8 @@ fn rg_exp_map_dispatch(
             let coord = gam::geometry::simplex::parse_simplex_coord(&coord_label)?;
             gam::geometry::simplex::simplex_exp_map(tangent, base, coord, reference)
         }
-        other => Err(rg_unknown_geometry(other)),
+        // Curved matrix / hyperbolic response geometries (#1061).
+        _ => gam::geometry::response_geometry::dispatch_exp_map(tangent, &kind, base),
     }
 }
 
