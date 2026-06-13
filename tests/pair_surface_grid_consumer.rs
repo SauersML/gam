@@ -357,8 +357,7 @@ fn pair_surface_grid_backend_matches_dense_oracle() {
         for e in 0..2 {
             let den = rcc[d][e] / residual_df;
             assert!(
-                (fit.surface.residual_cross_cov[[d, e]] - den).abs()
-                    <= 1e-7 * den.abs().max(1e-12),
+                (fit.surface.residual_cross_cov[[d, e]] - den).abs() <= 1e-7 * den.abs().max(1e-12),
                 "residual cross-covariance mismatch at ({d},{e}): consumer={} dense={den}",
                 fit.surface.residual_cross_cov[[d, e]]
             );
@@ -492,8 +491,7 @@ fn pair_surface_feeds_carve_additive_splits_bound_refuses() {
             fa += (fit.phi_a[[r, j]] - mean_a[j]) * plan.child_a[0].centered_coeffs[j];
             fb += (fit.phi_b[[r, j]] - mean_b[j]) * plan.child_b[0].centered_coeffs[j];
             for kk in 0..m {
-                parent +=
-                    fit.phi_a[[r, j]] * fit.surface.coeffs[0][[j, kk]] * fit.phi_b[[r, kk]];
+                parent += fit.phi_a[[r, j]] * fit.surface.coeffs[0][[j, kk]] * fit.phi_b[[r, kk]];
             }
         }
         max_gap = max_gap.max((parent - (fa + fb)).abs());
@@ -527,10 +525,7 @@ fn pair_surface_feeds_carve_additive_splits_bound_refuses() {
     let report_b = carve(&input_b, 0.05).expect("carve bound");
     let p_val = report_b.edge_p_value.expect("binding test must run");
     assert!(p_val < 1e-3, "planted binding must reject, p = {p_val}");
-    assert!(
-        report_b.fission.is_none(),
-        "bound surface must not fission"
-    );
+    assert!(report_b.fission.is_none(), "bound surface must not fission");
     assert!(report_b.interaction_fraction > 0.05);
 }
 
@@ -568,10 +563,7 @@ fn pair_surface_large_gridded_n_recovers_truth_end_to_end() {
     // prediction API, both response dimensions.
     const CHECKS: usize = 25;
     let true_var = NOISE_AMP * NOISE_AMP / 3.0;
-    for (d, truth) in [
-        (0usize, &truth0 as &dyn Fn(f64, f64) -> f64),
-        (1, &truth1),
-    ] {
+    for (d, truth) in [(0usize, &truth0 as &dyn Fn(f64, f64) -> f64), (1, &truth1)] {
         let mut mse = 0.0;
         for i in 0..CHECKS {
             let px1 = (i as f64 + 0.43) / CHECKS as f64;

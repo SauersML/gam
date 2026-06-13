@@ -818,50 +818,47 @@ pub fn fit_penalized_multinomial_formula(
     // columns are left alone (a penalty makes the rescaling non-equivalent),
     // and nothing is touched when explicit coefficient bounds/constraints
     // exist (those are stated in raw units).
-    let parametric_standardization: Vec<(usize, f64, f64)> = if design
-        .coefficient_lower_bounds
-        .is_some()
-        || design.linear_constraints.is_some()
-    {
-        Vec::new()
-    } else {
-        let p_total = x_dense.ncols();
-        let mut penalized = vec![false; p_total];
-        for bp in &design.penalties {
-            for col in bp.col_range.clone() {
-                if col < p_total {
-                    penalized[col] = true;
+    let parametric_standardization: Vec<(usize, f64, f64)> =
+        if design.coefficient_lower_bounds.is_some() || design.linear_constraints.is_some() {
+            Vec::new()
+        } else {
+            let p_total = x_dense.ncols();
+            let mut penalized = vec![false; p_total];
+            for bp in &design.penalties {
+                for col in bp.col_range.clone() {
+                    if col < p_total {
+                        penalized[col] = true;
+                    }
                 }
             }
-        }
-        let has_intercept = !design.intercept_range.is_empty();
-        let n_rows = x_dense.nrows().max(1) as f64;
-        let mut standardized = Vec::new();
-        for (_, range) in &design.linear_ranges {
-            for col in range.clone() {
-                if col >= p_total || penalized[col] {
-                    continue;
+            let has_intercept = !design.intercept_range.is_empty();
+            let n_rows = x_dense.nrows().max(1) as f64;
+            let mut standardized = Vec::new();
+            for (_, range) in &design.linear_ranges {
+                for col in range.clone() {
+                    if col >= p_total || penalized[col] {
+                        continue;
+                    }
+                    let column = x_dense.column(col);
+                    let mean = column.sum() / n_rows;
+                    let var = column.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n_rows;
+                    let scale = var.sqrt();
+                    // Skip near-constant or degenerate columns: no conditioning to
+                    // be gained and the back-map would divide by ~0.
+                    if !(scale.is_finite() && scale > 1e-8 * (mean.abs() + 1.0)) {
+                        continue;
+                    }
+                    // Centering shifts mass onto the intercept; without one the
+                    // shift is not representable, so scale only.
+                    let center = if has_intercept { mean } else { 0.0 };
+                    for v in x_dense.column_mut(col).iter_mut() {
+                        *v = (*v - center) / scale;
+                    }
+                    standardized.push((col, center, scale));
                 }
-                let column = x_dense.column(col);
-                let mean = column.sum() / n_rows;
-                let var = column.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n_rows;
-                let scale = var.sqrt();
-                // Skip near-constant or degenerate columns: no conditioning to
-                // be gained and the back-map would divide by ~0.
-                if !(scale.is_finite() && scale > 1e-8 * (mean.abs() + 1.0)) {
-                    continue;
-                }
-                // Centering shifts mass onto the intercept; without one the
-                // shift is not representable, so scale only.
-                let center = if has_intercept { mean } else { 0.0 };
-                for v in x_dense.column_mut(col).iter_mut() {
-                    *v = (*v - center) / scale;
-                }
-                standardized.push((col, center, scale));
             }
-        }
-        standardized
-    };
+            standardized
+        };
     // Preserve the per-smooth-term penalty block structure (#561): each smooth
     // term `t` contributes its own `P × P` penalty component (`Blockwise` with
     // `total_dim = P`, the term's local `S_t` embedded at its `col_range`), and

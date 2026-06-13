@@ -160,13 +160,7 @@ fn predict_dataset(x_eval: &[f64]) -> EncodedDataset {
     let headers = vec!["time".to_string(), "event".to_string(), "x".to_string()];
     let rows: Vec<StringRecord> = x_eval
         .iter()
-        .map(|&x| {
-            StringRecord::from(vec![
-                "1.0".to_string(),
-                "1".to_string(),
-                format!("{x:.12}"),
-            ])
-        })
+        .map(|&x| StringRecord::from(vec!["1.0".to_string(), "1".to_string(), format!("{x:.12}")]))
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode predict rows")
 }
@@ -300,8 +294,7 @@ fn joint_competing_risks_transformation_recovers_true_cause_specific_cifs() {
     // flipped or flattened covariate effect fails here even if pointwise RMSE
     // sneaks under the bound).
     let j_mid = 3; // t = 1.2
-    let true_gap_2 =
-        truth[(n_rows - 1) * grid.len() + j_mid][1] - truth[j_mid][1];
+    let true_gap_2 = truth[(n_rows - 1) * grid.len() + j_mid][1] - truth[j_mid][1];
     assert!(
         true_gap_2 > 0.05,
         "fixture sanity: true cause-2 incidence gap should be material, got {true_gap_2:.4}"

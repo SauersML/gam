@@ -15,8 +15,9 @@
 
 use csv::StringRecord;
 use gam::test_support::reference::{Column, pad_to, r_package_available, rmse, run_r};
-use gam::{FitConfig, encode_recordswith_inferred_schema, fit_spline_scan_from_formula,
-    init_parallelism};
+use gam::{
+    FitConfig, encode_recordswith_inferred_schema, fit_spline_scan_from_formula, init_parallelism,
+};
 use std::process::Command;
 
 /// Known smooth truth (same family as the scan workflow gates): curvature-rich
@@ -56,10 +57,7 @@ fn encode_xy(x: &[f64], y: &[f64]) -> gam::data::EncodedDataset {
 /// match-or-beat arm (`r_package_available` would panic on a missing binary
 /// before it could report the package as unavailable).
 fn rscript_available() -> bool {
-    Command::new("Rscript")
-        .arg("--version")
-        .output()
-        .is_ok()
+    Command::new("Rscript").arg("--version").output().is_ok()
 }
 
 #[test]
@@ -145,7 +143,11 @@ fn spline_scan_matches_or_beats_mgcv_on_truth_recovery() {
     );
     let mgcv_pred = r.vector("pred");
     let mgcv_edf = r.scalar("edf");
-    assert_eq!(mgcv_pred.len(), grid.len(), "mgcv grid-prediction length mismatch");
+    assert_eq!(
+        mgcv_pred.len(),
+        grid.len(),
+        "mgcv grid-prediction length mismatch"
+    );
     let mgcv_rmse = rmse(mgcv_pred, &truth);
 
     eprintln!(

@@ -93,7 +93,8 @@ fn dense_solve(l: &[f64], p: usize, b: &[f64]) -> Vec<f64> {
 
 /// Planted smooth: smooth, bounded, with genuine multiscale structure.
 fn truth(p: &[f64]) -> f64 {
-    let base = (2.0 * std::f64::consts::PI * p[0]).sin() * (2.0 * std::f64::consts::PI * p[1]).sin();
+    let base =
+        (2.0 * std::f64::consts::PI * p[0]).sin() * (2.0 * std::f64::consts::PI * p[1]).sin();
     match p.len() {
         2 => base,
         3 => base * (0.6 + 0.8 * p[2]),
@@ -102,12 +103,7 @@ fn truth(p: &[f64]) -> f64 {
 }
 
 /// Scattered d-D sample on the unit cube with mildly heterogeneous weights.
-fn sample(
-    dim: usize,
-    n: usize,
-    noise: f64,
-    seed: u64,
-) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f64>) {
+fn sample(dim: usize, n: usize, noise: f64, seed: u64) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f64>) {
     let mut rng = Rng(seed);
     let mut axes = vec![Vec::with_capacity(n); dim];
     let mut y = Vec::with_capacity(n);
@@ -282,7 +278,11 @@ fn cascade_matches_dense_penalized_oracle_3d() {
         3,
         350,
         0x1032_0007,
-        &[vec![0.3, 0.4, 0.5], vec![0.71, 0.18, 0.83], vec![0.05, 0.92, 0.27]],
+        &[
+            vec![0.3, 0.4, 0.5],
+            vec![0.71, 0.18, 0.83],
+            vec![0.05, 0.92, 0.27],
+        ],
     );
 }
 
@@ -605,7 +605,11 @@ fn cascade_matches_dense_wendland_kernel_solve() {
             let py = (j as f64 + 0.5) / grid as f64;
             let t = truth(&[px, py]);
             let row = row_at(px, py);
-            let kp: f64 = row.iter().zip(kernel_coeff.iter()).map(|(r, c)| r * c).sum();
+            let kp: f64 = row
+                .iter()
+                .zip(kernel_coeff.iter())
+                .map(|(r, c)| r * c)
+                .sum();
             sse_kernel += (kp - t) * (kp - t);
             let (cp, _) = fit.predict(&[px, py]).expect("predict");
             sse_cascade += (cp - t) * (cp - t);

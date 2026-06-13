@@ -3210,9 +3210,9 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         {
             let psi = theta[rho_dim];
             if tensor.contains(psi)
-                && self.reml_state.install_gaussian_fixed_cache(Arc::new(
-                    tensor.gaussian_fixed_cache_at(psi),
-                ))
+                && self
+                    .reml_state
+                    .install_gaussian_fixed_cache(Arc::new(tensor.gaussian_fixed_cache_at(psi)))
             {
                 log::debug!(
                     "[psi-gram-tensor] installed n-free Gaussian sufficient statistics at psi={psi:.6}"

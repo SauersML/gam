@@ -1968,7 +1968,11 @@ mod tests {
         let n = 60usize;
         let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
             let t = i as f64 / (n as f64 - 1.0);
-            if k == 0 { t * 3.0 } else { 0.4 * (t * 3.0).sin() }
+            if k == 0 {
+                t * 3.0
+            } else {
+                0.4 * (t * 3.0).sin()
+            }
         });
         // 8 centers — the issue's configuration — at the auto order sentinel.
         let spec = MeasureJetBasisSpec {
