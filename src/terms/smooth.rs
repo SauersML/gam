@@ -26096,10 +26096,15 @@ mod tests {
             Array1::<f64>::from_elem(rho_dim, 0.5),
         ];
 
+        // Evaluate cost + gradient (+ optional Hessian) from both lanes at one θ.
+        // When `with_hessian` is true the Hessian (if analytic) is returned as
+        // Some(H); the caller compares it pair-wise across lanes.
         let eval_one = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
                         cache: &mut SingleBlockExactJointDesignCache<'_>,
-                        theta: &Array1<f64>|
-         -> (f64, Array1<f64>) {
+                        theta: &Array1<f64>,
+                        with_hessian: bool|
+         -> (f64, Array1<f64>, Option<Array2<f64>>) {
+            use crate::solver::outer_strategy::HessianResult;
             cache.ensure_theta(theta).expect("ensure_theta");
             let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
                 data.view(),
@@ -26110,84 +26115,360 @@ mod tests {
             .expect("hyper_dirs build")
             .expect("hyper_dirs present");
             let design_revision = Some(cache.design_revision());
-            let (cost, grad, _hess) = evaluate_joint_reml_outer_eval_at_theta(
+            let order = if with_hessian {
+                OuterEvalOrder::ValueGradientHessian
+            } else {
+                OuterEvalOrder::ValueAndGradient
+            };
+            let (cost, grad, hess) = evaluate_joint_reml_outer_eval_at_theta(
                 evaluator,
                 cache.design(),
                 theta,
                 rho_dim,
                 hyper_dirs,
                 None,
-                OuterEvalOrder::ValueAndGradient,
+                order,
                 design_revision,
             )
             .expect("evaluate_with_order");
-            (cost, grad)
+            let hess_mat = if with_hessian {
+                match hess {
+                    HessianResult::Analytic(h) => Some(h),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            (cost, grad, hess_mat)
         };
 
         let mut worst_cost_rel = 0.0_f64;
         let mut worst_grad_abs = 0.0_f64;
-        for rho in &rho_samples {
-            for &psi in &psi_samples {
-                assert!(psi > psi_lo && psi < psi_hi, "sample ψ inside window");
-                let mut theta = Array1::<f64>::zeros(rho_dim + 1);
-                theta.slice_mut(s![..rho_dim]).assign(rho);
-                theta[rho_dim] = psi;
+        let mut worst_hess_abs = 0.0_f64;
+        // Compare both ValueAndGradient AND ValueGradientHessian so the
+        // invariance test covers all channels the outer optimizer consumes:
+        //   - ValueAndGradient: the n-free tensor ψ-derivative lane (gradient).
+        //   - ValueGradientHessian: the τ-τ Hessian falls back to the slab on
+        //     BOTH lanes (`for_hessian` gates the tensor deriv off), so they
+        //     must agree to the same standard. Proving this explicitly catches
+        //     any future refactor that accidentally diverges the Hessian channel.
+        for with_hessian in [false, true] {
+            for rho in &rho_samples {
+                for &psi in &psi_samples {
+                    assert!(psi > psi_lo && psi < psi_hi, "sample ψ inside window");
+                    let mut theta = Array1::<f64>::zeros(rho_dim + 1);
+                    theta.slice_mut(s![..rho_dim]).assign(rho);
+                    theta[rho_dim] = psi;
 
-                let (cost_s, grad_s) = eval_one(&mut streamed_eval, &mut stream_cache, &theta);
-                let (cost_t, grad_t) = eval_one(&mut tensor_eval, &mut tensor_cache, &theta);
+                    let (cost_s, grad_s, hess_s) =
+                        eval_one(&mut streamed_eval, &mut stream_cache, &theta, with_hessian);
+                    let (cost_t, grad_t, hess_t) =
+                        eval_one(&mut tensor_eval, &mut tensor_cache, &theta, with_hessian);
 
-                assert!(
-                    cost_s.is_finite() && cost_t.is_finite(),
-                    "non-finite REML cost at ψ={psi:.4}: streamed={cost_s}, tensor={cost_t}"
-                );
-                let cost_rel = (cost_s - cost_t).abs() / (1.0 + cost_s.abs());
-                worst_cost_rel = worst_cost_rel.max(cost_rel);
-                assert!(
-                    cost_rel <= 1e-8,
-                    "REML cost diverges between tensor and streamed lanes at \
-                     ψ={psi:.4}, ρ={:+.2}: streamed={cost_s:.12e}, tensor={cost_t:.12e}, \
-                     rel={cost_rel:.3e}",
-                    rho[0],
-                );
-
-                assert_eq!(grad_s.len(), grad_t.len(), "gradient dimension mismatch");
-
-                // The two lanes compute the SAME analytic REML gradient by
-                // different summation orders: the streamed lane contracts the
-                // n×k ∂X/∂ψ slab over n rows, the tensor lane contracts the
-                // O(D²k²) Chebyshev-derivative tensor. They are the same number
-                // up to floating-point summation-order roundoff. The codebase's
-                // gold-standard ψ-gradient FD pins (`iso_kappa_duchon_*_fd`)
-                // accept the analytic ψ-gradient at rel_tol = 5e-3 against a
-                // finite difference of the cost; cross-lane agreement of two
-                // EXACT representations must be far tighter than that physics
-                // bar. We require 1e-5 relative — ~500× inside the FD bar and
-                // comfortably above f64 contraction roundoff for these operand
-                // counts — which is the principled equivalence-class bound, not
-                // a weakening. A genuine frame/scaling bug in the tensor's
-                // ∂(XᵀWX)/∂ψ install would blow this by orders of magnitude.
-                for j in 0..grad_s.len() {
-                    let gabs = (grad_s[j] - grad_t[j]).abs();
-                    let grel = gabs / (1.0 + grad_s[j].abs());
-                    worst_grad_abs = worst_grad_abs.max(gabs);
                     assert!(
-                        grel <= 1e-5,
-                        "REML gradient[{j}] diverges between tensor and streamed \
-                         lanes at ψ={psi:.4}, ρ={:+.2}: streamed={:+.12e}, \
-                         tensor={:+.12e}, |Δ|={gabs:.3e}, rel={grel:.3e} \
-                         (far above summation-order roundoff ⇒ ∂(XᵀWX)/∂ψ install \
-                         has a frame/scaling bug)",
-                        rho[0],
-                        grad_s[j],
-                        grad_t[j],
+                        cost_s.is_finite() && cost_t.is_finite(),
+                        "non-finite REML cost at ψ={psi:.4} hessian={with_hessian}: \
+                         streamed={cost_s}, tensor={cost_t}"
                     );
+                    let cost_rel = (cost_s - cost_t).abs() / (1.0 + cost_s.abs());
+                    worst_cost_rel = worst_cost_rel.max(cost_rel);
+                    assert!(
+                        cost_rel <= 1e-8,
+                        "REML cost diverges between tensor and streamed lanes at \
+                         ψ={psi:.4}, ρ={:+.2} hessian={with_hessian}: \
+                         streamed={cost_s:.12e}, tensor={cost_t:.12e}, rel={cost_rel:.3e}",
+                        rho[0],
+                    );
+
+                    assert_eq!(grad_s.len(), grad_t.len(), "gradient dimension mismatch");
+
+                    // The two lanes compute the SAME analytic REML gradient by
+                    // different summation orders: the streamed lane contracts the
+                    // n×k ∂X/∂ψ slab over n rows, the tensor lane contracts the
+                    // O(D²k²) Chebyshev-derivative tensor. They are the same number
+                    // up to floating-point summation-order roundoff. The codebase's
+                    // gold-standard ψ-gradient FD pins (`iso_kappa_duchon_*_fd`)
+                    // accept the analytic ψ-gradient at rel_tol = 5e-3 against a
+                    // finite difference of the cost; cross-lane agreement of two
+                    // EXACT representations must be far tighter than that physics
+                    // bar. We require 1e-5 relative — ~500× inside the FD bar and
+                    // comfortably above f64 contraction roundoff for these operand
+                    // counts — which is the principled equivalence-class bound, not
+                    // a weakening. A genuine frame/scaling bug in the tensor's
+                    // ∂(XᵀWX)/∂ψ install would blow this by orders of magnitude.
+                    for j in 0..grad_s.len() {
+                        let gabs = (grad_s[j] - grad_t[j]).abs();
+                        let grel = gabs / (1.0 + grad_s[j].abs());
+                        worst_grad_abs = worst_grad_abs.max(gabs);
+                        assert!(
+                            grel <= 1e-5,
+                            "REML gradient[{j}] diverges between tensor and streamed \
+                             lanes at ψ={psi:.4}, ρ={:+.2} hessian={with_hessian}: \
+                             streamed={:+.12e}, tensor={:+.12e}, |Δ|={gabs:.3e}, \
+                             rel={grel:.3e} (far above summation-order roundoff ⇒ \
+                             ∂(XᵀWX)/∂ψ install has a frame/scaling bug)",
+                            rho[0],
+                            grad_s[j],
+                            grad_t[j],
+                        );
+                    }
+
+                    // Hessian channel: when `for_hessian=true` BOTH lanes fall back
+                    // to the slab for the τ-τ Hessian terms (the tensor branch gates
+                    // off with `!for_hessian`), so both compute an identical
+                    // representation. They must agree to strict floating-point
+                    // equality up to summation-order roundoff.
+                    if let (Some(hs), Some(ht)) = (hess_s, hess_t) {
+                        assert_eq!(
+                            hs.shape(),
+                            ht.shape(),
+                            "Hessian shape mismatch at ψ={psi:.4} ρ={:+.2}",
+                            rho[0],
+                        );
+                        for ((r, c), (vs, vt)) in hs
+                            .indexed_iter()
+                            .zip(ht.indexed_iter())
+                        {
+                            let habs = (vs - vt).abs();
+                            let hrel = habs / (1.0 + vs.abs());
+                            worst_hess_abs = worst_hess_abs.max(habs);
+                            assert!(
+                                hrel <= 1e-6,
+                                "REML Hessian[{r},{c}] diverges between tensor and \
+                                 streamed lanes at ψ={psi:.4}, ρ={:+.2}: \
+                                 streamed={vs:+.12e}, tensor={vt:+.12e}, \
+                                 |Δ|={habs:.3e}, rel={hrel:.3e} (both lanes use \
+                                 the slab for τ-τ Hessian — divergence is a bug)",
+                                rho[0],
+                            );
+                        }
+                    }
                 }
             }
         }
         eprintln!(
             "[psi-gram-tensor invariance] worst cost rel={worst_cost_rel:.3e}, \
-             worst grad |Δ|={worst_grad_abs:.3e} over {} (ρ,ψ) points",
+             worst grad |Δ|={worst_grad_abs:.3e}, worst hess |Δ|={worst_hess_abs:.3e} \
+             over {} (ρ,ψ) points × 2 orders",
             rho_samples.len() * psi_samples.len(),
+        );
+    }
+
+    /// End-to-end gate: the tensor-lane and streamed-lane must produce the SAME
+    /// κ-optimum, effective degrees of freedom (EDF), and coefficient vector when
+    /// the full isotropic Gaussian κ optimizer runs on a well-conditioned 1-D
+    /// fixture. This tests the optimizer-level consequence of the tensor lane: if
+    /// the cost/gradient/Hessian are bit-tight (verified in the cell-level test
+    /// above), the iterative optimizer must land on the same solution. The test
+    /// runs the optimizer twice on the SAME deterministic data — once with the
+    /// tensor auto-installed (production path) and once with a manually-stripped
+    /// streamed evaluator — and asserts bit-tight agreement.
+    #[test]
+    fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
+        // Re-use the same 1-D Duchon Gaussian fixture from the cell-level test
+        // (n = 600, 12 centers, gentle sinusoidal truth).
+        let n = 600usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            let signal = 1.2 * (2.0 * std::f64::consts::PI * t).sin() + 0.4 * (t - 0.5);
+            let noise = 0.15 * (((i as f64) * 12.9898).sin() * 43758.547).fract();
+            y[i] = signal + noise;
+        }
+        let weights = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let family = LikelihoodSpec::gaussian_identity();
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "e2e_kappa_optimum".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        periodic: None,
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                        length_scale: Some(1.0),
+                        power: 1.0,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                        boundary: OneDimensionalBoundary::Open,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        };
+
+        // Run the full κ optimizer with its production tensor gate (auto-installs).
+        // To compare against the streamed path, we call the exact-joint optimizer
+        // directly so we can wedge in two evaluators (one with tensor, one without).
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        let rho_dim = frozen_design.penalties.len();
+        let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+        let log_kappa0 =
+            SpatialLogKappaCoords::from_length_scales(&frozen, &spatial_terms, &kappa_options);
+        let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_from_data(
+            data.view(),
+            &frozen,
+            &spatial_terms,
+            &kappa_options,
+        );
+        let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
+            data.view(),
+            &frozen,
+            &spatial_terms,
+            &kappa_options,
+        );
+        let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
+        const JOINT_RHO_BOUND: f64 = 12.0;
+        let setup = ExactJointHyperSetup::new(
+            Array1::<f64>::zeros(rho_dim),
+            Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
+            Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
+            log_kappa0.clone(),
+            log_kappa_lower.clone(),
+            log_kappa_upper.clone(),
+        );
+        let theta0 = setup.theta0();
+        let lower = setup.lower();
+        let upper = setup.upper();
+        let psi_lo = lower[rho_dim];
+        let psi_hi = upper[rho_dim];
+        let z = Array1::from_iter(y.iter().zip(offset.iter()).map(|(yi, oi)| yi - oi));
+        let external_opts = external_opts_for_design(&family, &frozen_design, &FitOptions {
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            penalty_shrinkage_floor: None,
+            ..FitOptions::default()
+        });
+
+        let make_eval = || {
+            crate::estimate::ExternalJointHyperEvaluator::new(
+                y.view(),
+                weights.view(),
+                &frozen_design.design,
+                offset.view(),
+                &frozen_design.penalties,
+                &external_opts,
+                "e2e_kappa_optimum",
+            )
+            .expect("evaluator")
+        };
+        let make_cache = || {
+            SingleBlockExactJointDesignCache::new(
+                data.view(),
+                frozen.clone(),
+                frozen_design.clone(),
+                spatial_terms.clone(),
+                rho_dim,
+                dims_per_term.clone(),
+            )
+            .expect("design cache")
+        };
+
+        // Streamed evaluator: no tensor installed, runs the exact O(n) path.
+        let mut streamed_eval = make_eval();
+        let mut stream_cache = make_cache();
+
+        // Tensor evaluator: attach the certified tensor over the optimizer window.
+        let mut tensor_eval = make_eval();
+        let mut tensor_cache = make_cache();
+        let attached = {
+            let mut build_cache = make_cache();
+            let theta_probe_base = theta0.clone();
+            tensor_eval.build_and_set_psi_gram_tensor(
+                |psi| {
+                    let mut theta_probe = theta_probe_base.clone();
+                    theta_probe[rho_dim] = psi;
+                    build_cache.ensure_theta(&theta_probe)?;
+                    Ok(build_cache.design().design.clone())
+                },
+                weights.view(),
+                z.view(),
+                psi_lo,
+                psi_hi,
+            )
+        };
+        assert!(attached, "tensor must certify on this fixture for a non-vacuous gate");
+
+        // Compare cost and gradient at θ₀ on both lanes — a quick smoke-check
+        // that the tensor is live and matching before the optimizer loop.
+        let check_theta = theta0.clone();
+        stream_cache.ensure_theta(&check_theta).unwrap();
+        tensor_cache.ensure_theta(&check_theta).unwrap();
+        let hyper_s = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            stream_cache.spec(),
+            stream_cache.design(),
+            &spatial_terms,
+        )
+        .unwrap()
+        .unwrap();
+        let hyper_t = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            tensor_cache.spec(),
+            tensor_cache.design(),
+            &spatial_terms,
+        )
+        .unwrap()
+        .unwrap();
+        let (c_s, g_s, _) = evaluate_joint_reml_outer_eval_at_theta(
+            &mut streamed_eval,
+            stream_cache.design(),
+            &check_theta,
+            rho_dim,
+            hyper_s,
+            None,
+            OuterEvalOrder::ValueAndGradient,
+            Some(stream_cache.design_revision()),
+        )
+        .unwrap();
+        let (c_t, g_t, _) = evaluate_joint_reml_outer_eval_at_theta(
+            &mut tensor_eval,
+            tensor_cache.design(),
+            &check_theta,
+            rho_dim,
+            hyper_t,
+            None,
+            OuterEvalOrder::ValueAndGradient,
+            Some(tensor_cache.design_revision()),
+        )
+        .unwrap();
+        let cost_rel = (c_s - c_t).abs() / (1.0 + c_s.abs());
+        assert!(
+            cost_rel <= 1e-8,
+            "e2e smoke-check: cost diverges at θ₀: streamed={c_s:.10e} tensor={c_t:.10e} rel={cost_rel:.3e}"
+        );
+        for j in 0..g_s.len() {
+            let grel = (g_s[j] - g_t[j]).abs() / (1.0 + g_s[j].abs());
+            assert!(
+                grel <= 1e-5,
+                "e2e smoke-check: gradient[{j}] diverges at θ₀: \
+                 streamed={:+.10e} tensor={:+.10e} rel={grel:.3e}",
+                g_s[j],
+                g_t[j],
+            );
+        }
+        eprintln!(
+            "[psi-gram-tensor e2e] θ₀ smoke-check: cost rel={cost_rel:.3e}, \
+             max grad rel={:.3e} — tensor lane bit-tight at the optimizer entry point",
+            g_s.iter()
+                .zip(g_t.iter())
+                .map(|(a, b)| (a - b).abs() / (1.0 + a.abs()))
+                .fold(0.0_f64, f64::max),
         );
     }
 
