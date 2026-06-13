@@ -7342,12 +7342,25 @@ fn run_outer_with_plan(
             }
             None => false,
         };
-        if curvature_entry_refused && continuation_path.is_none() {
-            let msg = "curvature-homotopy entry refused seed; deferring to remaining seed cascade"
-                .to_string();
-            log::warn!("[OUTER] {context}: rejecting seed {seed_idx} (curvature): {msg}");
-            rejection_reasons.push((seed_idx, "validation", msg));
-            continue 'seed_attempts;
+        if curvature_entry_refused {
+            // A refused walk is NEVER a feasibility gate. By contract the walk
+            // leaves the term at the full `η = 1` basis (a degenerate anchor or
+            // a detected branch bifurcation), so the NORMAL seed cascade below
+            // — `accept_seed_without_outer_iterations`, the continuation
+            // pre-warm, and the direct solve at `seed` — takes over from the
+            // pristine cold state. Rejecting the seed here instead emptied the
+            // candidate set for objectives WITHOUT a continuation path (#1095:
+            // a periodic K=1 circle whose walk "buys nothing" and refuses on a
+            // small-N pivot bifurcation — `requires_continuation_path_entry` is
+            // false for periodic K=1, so every one of its seeds was rejected
+            // before any solver started). Reset to the baseline so the cascade
+            // opens each seed from its own cold default, exactly as a hard
+            // anchor-construction error already does above.
+            log::info!(
+                "[OUTER] {context}: curvature-homotopy entry refused seed {seed_idx}; deferring \
+                 to the seed cascade from the pristine baseline"
+            );
+            obj.reset();
         }
         if let Some(seed_cost) = obj.accept_seed_without_outer_iterations(seed)? {
             started_seeds += 1;
