@@ -9,9 +9,12 @@ name: Reference Quality Suite
 # this job provisions the full reference stack.
 #
 # Philosophy: a test whose assertion FAILS because gam genuinely diverges from
-# the mature reference is an honest, useful measurement, not something to paper
-# over. This job therefore RUNS every quality test and reports a pass/fail/
-# compile-error table, but does not gate the pipeline red on assertion failures.
+# the mature reference is an honest, useful measurement. This job RUNS every
+# quality test (no fail-fast — it collects EVERY failure and a pass/fail/
+# compile-error table), and THEN GATES the pipeline red if any test landed in a
+# gating bucket (METRIC_OFF/GAM_ERROR/TEST_ERROR/TIMEOUT/BUILDFAIL). REF_ERROR —
+# the reference R/Python environment failing, not gam — is reported but NOT
+# gated. Gating is what stops quality regressions from landing on main silently.
 
 on:
   # Periodic dashboard rather than per-commit: building+running 139 heavy
@@ -166,7 +169,7 @@ jobs:
           '
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -388,13 +391,45 @@ jobs:
             echo "| **total** | **$N** | |"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "pass=$pass metric_off=$metricoff gam_error=$gamerr ref_error=$referr test_error=$testerr timeout=$tmo build_fail=$bf (of $N)"
-          # Informational dashboard: divergences/timeouts are honest findings, not
-          # pipeline failures.
-          exit 0
+          # GATE the pipeline. The suite is the ONLY end-to-end measurement of gam
+          # quality vs the mature standard tools; if it cannot go red, every quality
+          # regression lands on main silently (the #1087 meta-bug). We ran ALL N
+          # tests above (no fail-fast — every failure is collected and streamed);
+          # now we exit non-zero if ANY test landed in a GATING bucket, after
+          # printing exactly which ones did and why.
+          #
+          # Gating buckets = genuine gam/test defects + honest quality misses:
+          #   METRIC_OFF  gam ran but a quality metric missed its bound
+          #   GAM_ERROR   gam fit crashed / refused / failed to converge
+          #   TEST_ERROR  test/harness setup defect
+          #   TIMEOUT     exceeded the per-test wall-clock cap
+          #   BUILDFAIL   did not compile
+          # NOT gated: REF_ERROR — the reference R/Python environment failed or is
+          # missing (not a gam result; tracked separately, #1070/#1071). It is
+          # reported below but never masks or triggers the gam-side gate.
+          gating=$((metricoff + gamerr + testerr + tmo + bf))
+          if [ "$gating" -gt 0 ]; then
+            echo ""
+            echo "::error::Reference Quality Suite FAILED: ${gating} test(s) in gating buckets (METRIC_OFF=${metricoff} GAM_ERROR=${gamerr} TEST_ERROR=${testerr} TIMEOUT=${tmo} BUILDFAIL=${bf}); REF_ERROR=${referr} not gated."
+            echo "----- gating failures (outcome  test  reason) -----"
+            # Reprint the offending rows from the TSV (skip header; field 2 = outcome).
+            awk -F'\t' 'NR>1 && $2!="PASS" && $2!="REF_ERROR" {printf "  %-11s %s\n    %s\n", $2, $4, $10}' "$RES"
+            echo "---------------------------------------------------"
+            {
+              echo ""
+              echo "### Gate: FAILED"
+              echo ""
+              echo "${gating} test(s) in gating buckets (METRIC_OFF/GAM_ERROR/TEST_ERROR/TIMEOUT/BUILDFAIL)."
+              echo "REF_ERROR (${referr}) is reference-environment, not gated."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Gate: PASSED — every test either met its quality bar or was a non-gated REF_ERROR (${referr})."
+          { echo ""; echo "### Gate: PASSED"; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload full quality report (always — survives timeout/cancel)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: quality-results
           # The WHOLE report dir: rich un-truncated TSV + JSONL + every per-test
