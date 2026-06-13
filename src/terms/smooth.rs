@@ -21002,11 +21002,17 @@ where
                 } else if i < rho_dim_audit + (psi_dim_audit - aux_dim_audit) {
                     format!("psi_kappa[{}]", i - rho_dim_audit)
                 } else {
-                    format!("aux[{}]", i - rho_dim_audit - (psi_dim_audit - aux_dim_audit))
+                    format!(
+                        "aux[{}]",
+                        i - rho_dim_audit - (psi_dim_audit - aux_dim_audit)
+                    )
                 }
             };
             crate::solver::outer_strategy::outer_gradient_fd_audit(
-                &theta0, 1e-4, label, &mut eval_at,
+                &theta0,
+                1e-4,
+                label,
+                &mut eval_at,
             )
         })();
         match audit {
