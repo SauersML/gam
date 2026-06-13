@@ -10187,3 +10187,177 @@ fn generated_regressor_correction_matches_explicit_g_accumulation() {
         }
     }
 }
+
+#[test]
+fn rigid_standard_normal_mixed_z_sensitivity_matches_central_difference_of_gradient() {
+    // #1028 engine quantity oracle: the per-row mixed (primary, z) partial
+    // `[∂²ℓ/∂q∂z, ∂²ℓ/∂g∂z]` read off the z-augmented row jet must equal the
+    // central finite-difference of the production row GRADIENT `[∂ℓ/∂q, ∂ℓ/∂g]`
+    // (`rigid_standard_normal_row_kernel`) in z. This pins the new jet channel
+    // against the same kernel value/gradient the fit consumes.
+    let link = bernoulli_marginal_slope_probit_link();
+    let probit_scale = 0.7;
+    let h = 1e-6;
+    // A sweep of converged-frame (marginal η, slope g), latent score z, label y.
+    let cases = [
+        (0.3_f64, 0.5_f64, 0.6_f64, 1.0_f64, 1.0_f64),
+        (-0.8, 0.9, -1.1, 0.0, 1.4),
+        (1.2, -0.4, 0.25, 1.0, 0.8),
+        (-0.2, 1.3, -0.7, 0.0, 1.0),
+        (0.05, 0.2, 1.8, 1.0, 0.5),
+    ];
+    for (marginal_eta, g, z, y, w) in cases {
+        let marginal = bernoulli_marginal_link_map(&link, marginal_eta).expect("marginal map");
+        let analytic =
+            rigid_standard_normal_mixed_z_sensitivity(marginal, g, z, y, w, probit_scale)
+                .expect("mixed-z sensitivity");
+
+        let grad_at = |z_val: f64| -> [f64; 2] {
+            let (_v, grad, _h) =
+                rigid_standard_normal_row_kernel(marginal, g, z_val, y, w, probit_scale)
+                    .expect("row kernel");
+            grad
+        };
+        let plus = grad_at(z + h);
+        let minus = grad_at(z - h);
+        let fd_q = (plus[0] - minus[0]) / (2.0 * h);
+        let fd_g = (plus[1] - minus[1]) / (2.0 * h);
+
+        assert!(
+            (analytic[0] - fd_q).abs() < 1e-5,
+            "∂²ℓ/∂q∂z mismatch at (q={marginal_eta}, g={g}, z={z}, y={y}): \
+             analytic={:.6e} fd={:.6e}",
+            analytic[0],
+            fd_q
+        );
+        assert!(
+            (analytic[1] - fd_g).abs() < 1e-5,
+            "∂²ℓ/∂g∂z mismatch at (q={marginal_eta}, g={g}, z={z}, y={y}): \
+             analytic={:.6e} fd={:.6e}",
+            analytic[1],
+            fd_g
+        );
+    }
+}
+
+#[test]
+fn score_zeta_sensitivity_equals_jacobian_transpose_of_mixed_z_partial() {
+    // The assembled `score_zeta_sensitivity` row `s_i` must be exactly the block
+    // Jacobian transpose `J_iᵀ` applied to the primary mixed-z 2-vector:
+    //   s_i[marginal_range] = (∂²ℓ/∂q∂z) · M_i,
+    //   s_i[logslope_range] = (∂²ℓ/∂g∂z) · G_i.
+    // This pins the reduced-frame contraction the seam feeds to
+    // `generated_regressor_correction`.
+    let link = bernoulli_marginal_slope_probit_link();
+    let probit_scale = 0.85;
+    let n = 4usize;
+    let p_m = 2usize;
+    let r = 2usize;
+    let marginal_design =
+        ndarray::array![[1.0, 0.3], [1.0, -0.6], [1.0, 0.9], [1.0, -0.2]];
+    let logslope_design =
+        ndarray::array![[0.4, -0.1], [0.7, 0.2], [-0.3, 0.8], [0.5, -0.5]];
+    let marginal_eta = ndarray::array![0.2, -0.5, 0.7, -0.1];
+    let slope_eta = ndarray::array![0.3, 0.8, -0.4, 1.1];
+    let z = ndarray::array![0.6, -0.9, 0.25, 1.3];
+    let y = ndarray::array![1.0, 0.0, 1.0, 0.0];
+    let weights = ndarray::array![1.0, 1.2, 0.8, 1.5];
+    let p_beta = p_m + r;
+
+    let s = rigid_standard_normal_score_zeta_sensitivity(
+        &link,
+        &marginal_eta,
+        &slope_eta,
+        &z,
+        &y,
+        &weights,
+        probit_scale,
+        marginal_design.view(),
+        logslope_design.view(),
+        p_beta,
+    )
+    .expect("assemble score_zeta_sensitivity");
+    assert_eq!(s.dim(), (n, p_beta));
+
+    for i in 0..n {
+        let marginal = bernoulli_marginal_link_map(&link, marginal_eta[i]).expect("marginal map");
+        let [s_q, s_g] = rigid_standard_normal_mixed_z_sensitivity(
+            marginal,
+            slope_eta[i],
+            z[i],
+            y[i],
+            weights[i],
+            probit_scale,
+        )
+        .expect("mixed-z sensitivity");
+        for j in 0..p_m {
+            let expected = s_q * marginal_design[[i, j]];
+            assert!(
+                (s[[i, j]] - expected).abs() < 1e-12,
+                "marginal contraction mismatch at row {i} col {j}: got={:.6e} expected={:.6e}",
+                s[[i, j]],
+                expected
+            );
+        }
+        for j in 0..r {
+            let expected = s_g * logslope_design[[i, j]];
+            assert!(
+                (s[[i, p_m + j]] - expected).abs() < 1e-12,
+                "logslope contraction mismatch at row {i} col {j}: got={:.6e} expected={:.6e}",
+                s[[i, p_m + j]],
+                expected
+            );
+        }
+    }
+
+    // End-to-end: the assembled s feeds the landed assembly and the corrected
+    // covariance strictly inflates the naive Vb diagonals whenever the row scores
+    // respond to ζ (G ≠ 0), and the term is PSD.
+    let cal = murphy_topel_test_calibration_basis2();
+    let vb = ndarray::array![
+        [0.8, 0.1, 0.0, 0.0],
+        [0.1, 0.6, 0.05, 0.0],
+        [0.0, 0.05, 0.5, 0.02],
+        [0.0, 0.0, 0.02, 0.4]
+    ];
+    let term = cal
+        .generated_regressor_correction(
+            s.view(),
+            z.view(),
+            marginal_design.slice(ndarray::s![.., 1..]).to_owned().view(),
+            vb.view(),
+        )
+        .expect("assemble correction");
+    // PSD.
+    use crate::faer_ndarray::FaerEigh;
+    let (evals, _) = term.eigh(faer::Side::Lower).expect("eig");
+    let min_eval = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+    assert!(
+        min_eval > -1e-9,
+        "generated-regressor term must be PSD; min eigenvalue {min_eval:.3e}"
+    );
+    // Strict inflation on at least one slope coordinate (the gate fired).
+    let max_diag = (0..p_beta).map(|i| term[[i, i]]).fold(0.0_f64, f64::max);
+    assert!(
+        max_diag > 1e-9,
+        "corrected SE must strictly exceed naive SE on a responding coordinate; \
+         max diagonal inflation {max_diag:.3e}"
+    );
+}
+
+// Calibration whose basis conditions on the slope covariate a(C) = marginal
+// design column 1 (basis_ncols = 1), matching the `score_zeta` test's
+// single-covariate conditioning span.
+fn murphy_topel_test_calibration_basis2() -> LatentZConditionalCalibration {
+    LatentZConditionalCalibration {
+        mean_coeffs: vec![0.05, 0.3],
+        var_coeffs: vec![1.1, 0.2],
+        basis_ncols: 1,
+        var_floor: 0.05,
+        global_var: 1.0,
+        post_mean: 0.0,
+        post_sd: 1.0,
+        mean_cov: ndarray::array![[0.02, 0.0], [0.0, 0.04]],
+        var_cov: ndarray::array![[0.03, 0.0], [0.0, 0.015]],
+    }
+}
