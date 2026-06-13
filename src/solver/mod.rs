@@ -28,6 +28,7 @@ pub mod psi_gram_tensor;
 pub mod residual_cascade;
 pub(crate) mod riemannian_retraction;
 pub mod row_measure;
+pub mod scan_backfit;
 pub mod seeding;
 pub mod sensitivity;
 pub mod spline_scan;
