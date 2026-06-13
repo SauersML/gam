@@ -11518,12 +11518,21 @@ mod tests {
             "cache log det H_full {cache_logdet} vs dense {dense_logdet}"
         );
 
-        // The Woodbury correction is exactly log det H_full − log det H₀'.
+        // The Woodbury correction is exactly log det H_full − log det H₀', where
+        // the factored base `H₀' = H_full − U D Uᵀ` has the WHOLE rank-`R` update
+        // removed — both the `i=j` self diagonal `d_k·z'_ik²` AND the `i≠j`
+        // cross-row off-diagonals `d_k·z'_ik·z'_jk`. (The per-row latent blocks the
+        // cache factors never carry cross-row coupling, so its base is exactly this
+        // `H₀'`; subtracting only the self diagonal would leave the cross terms in
+        // and compare the lemma correction against a different base.)
         let mut h0prime = h_full.clone();
         for k in 0..source.r {
             for i in 0..sys.rows.len() {
-                let g = i * sys.d + k;
-                h0prime[[g, g]] -= source.d[k] * zprime[i][k] * zprime[i][k];
+                let gi = i * sys.d + k;
+                for j in 0..sys.rows.len() {
+                    let gj = j * sys.d + k;
+                    h0prime[[gi, gj]] -= source.d[k] * zprime[i][k] * zprime[j][k];
+                }
             }
         }
         let l0 = cholesky_lower(&h0prime).expect("H₀' SPD");
