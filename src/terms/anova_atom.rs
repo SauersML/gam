@@ -93,7 +93,7 @@ use crate::faer_ndarray::FaerEigh;
 use crate::inference::smooth_test::{
     SmoothTestInput, SmoothTestResult, SmoothTestScale, wood_smooth_test,
 };
-use crate::solver::grid_spline_2d::GridSpline2dDesign;
+use crate::solver::grid_spline_2d::{GridSpline2dDesign, axis_basis_at};
 
 /// Interaction energy fraction at or below which the interaction block is
 /// energetically negligible and lossless fission is on the table. A
@@ -570,6 +570,57 @@ pub struct PairSurfaceFit {
     /// The carve product: coefficients, covariances, λ, EDF.
     pub surface: TensorSurfaceFit,
     pub backend: PairSurfaceBackend,
+    /// Lower corner of the per-axis uniform knot range (the data's
+    /// bounding box) — with [`Self::cell_widths`], everything needed to
+    /// rebuild a basis row at an arbitrary point.
+    pub lower_corner: [f64; 2],
+    /// Knot-cell width per axis.
+    pub cell_widths: [f64; 2],
+}
+
+impl PairSurfaceFit {
+    /// Posterior `(mean, variance)` of response dimension `dim` at an
+    /// arbitrary point, through the carve-facing posterior objects — valid
+    /// for BOTH backends, since both populate the same surface contract:
+    /// `mean = b₁ᵀ C_d b₂` and `variance = σ̂²_d · xᵀUx` with `U` the shared
+    /// scale-free coefficient covariance, `σ̂²_d` the residual variance at
+    /// `n − edf`, and `x` the 16-entry tensor basis row. Outside the data
+    /// bounding box the boundary cell's cubic polynomial extends (the grid
+    /// engine's convention).
+    pub fn predict(&self, dim: usize, x1: f64, x2: f64) -> Result<(f64, f64), String> {
+        let d_dims = self.surface.coeffs.len();
+        if dim >= d_dims {
+            return Err(format!(
+                "pair surface: response dimension {dim} out of range (D = {d_dims})"
+            ));
+        }
+        if !(x1.is_finite() && x2.is_finite()) {
+            return Err(format!(
+                "pair surface: non-finite prediction point ({x1}, {x2})"
+            ));
+        }
+        let m = self.phi_a.ncols();
+        let cells = m - 3;
+        let (j1, b1) = axis_basis_at(self.lower_corner[0], self.cell_widths[0], cells, x1);
+        let (j2, b2) = axis_basis_at(self.lower_corner[1], self.cell_widths[1], cells, x2);
+        let c = &self.surface.coeffs[dim];
+        let u = &self.surface.unit_covariance;
+        let mut mean = 0.0;
+        let mut quad = 0.0;
+        for i in 0..4 {
+            for j in 0..4 {
+                let v_ij = b1[i] * b2[j];
+                mean += v_ij * c[[j1 + i, j2 + j]];
+                let g_ij = (j1 + i) * m + (j2 + j);
+                for a in 0..4 {
+                    for b in 0..4 {
+                        quad += v_ij * b1[a] * b2[b] * u[[g_ij, (j1 + a) * m + (j2 + b)]];
+                    }
+                }
+            }
+        }
+        Ok((mean, self.surface.residual_cross_cov[[dim, dim]] * quad))
+    }
 }
 
 /// THE pair-component estimator (#1031): fit the Layer-B ANOVA pair
@@ -644,6 +695,8 @@ pub fn fit_pair_surface(
 
     // The factor bases on the sample — shared by both routes and by the
     // carve (one empirical measure end to end).
+    let lower_corner = design.lower_corner();
+    let cell_widths = design.cell_widths();
     let m = design.basis_per_axis();
     let mut phi_a = Array2::<f64>::zeros((n, m));
     let mut phi_b = Array2::<f64>::zeros((n, m));
@@ -703,6 +756,8 @@ pub fn fit_pair_surface(
                     residual_df: post.residual_df,
                 },
                 backend: PairSurfaceBackend::GridExact,
+                lower_corner,
+                cell_widths,
             })
         }
         Err(grid_err) => {
@@ -718,6 +773,8 @@ pub fn fit_pair_surface(
                 phi_b,
                 surface,
                 backend: PairSurfaceBackend::DenseRidge,
+                lower_corner,
+                cell_widths,
             })
         }
     }

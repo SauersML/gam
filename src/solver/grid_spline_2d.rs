@@ -139,6 +139,16 @@ impl Axis {
     }
 }
 
+/// The four active cubic B-spline values of one uniform axis `(lo, h, cells)`
+/// at `x`: `(first basis index, values)`, where `values[i]` weights basis
+/// `first + i` of the `cells + 3` axis splines. Outside `[lo, lo + cells·h]`
+/// the boundary cell's cubic polynomial extends — the single convention
+/// shared by fitting, prediction, and every consumer-rebuilt basis row.
+pub fn axis_basis_at(lo: f64, h: f64, cells: usize, x: f64) -> (usize, [f64; 4]) {
+    let (cell, u) = Axis { lo, h, cells }.locate(x);
+    (cell, bspline_value(u))
+}
+
 /// The 16 active tensor-basis entries `(flat index, value)` at `(x1, x2)`.
 /// Flat indices are strictly increasing across the returned arrays.
 #[inline]
@@ -506,8 +516,8 @@ impl GridSpline2dDesign {
         if !x.is_finite() {
             return Err(format!("grid spline 2d: non-finite axis-{axis} point {x}"));
         }
-        let (cell, u) = self.axes[axis].locate(x);
-        Ok((cell, bspline_value(u)))
+        let ax = self.axes[axis];
+        Ok(axis_basis_at(ax.lo, ax.h, ax.cells, x))
     }
 
     /// Exact penalty quadratic form `J(f) = c'Sc` of a coefficient vector —

@@ -3,6 +3,23 @@
 //! assembled dense penalized solve (same rows, same penalty, no shared
 //! code path past `basis_row`) and against data with a KNOWN planted
 //! signal — never against its own output.
+//!
+//! Gate map (one per claim the module header makes):
+//! - dense-oracle agreement in 2D and 3D (near-machine: the math is exact);
+//! - SLQ logdet vs the exact dense logdet, and invariance of the REML
+//!   λ-selection under the SLQ substitution (honest documented bounds: SLQ
+//!   is an estimator, but a deterministic one — fixed probes);
+//! - PCG iterative route: backward-error certificate honored and iteration
+//!   count n-independent (the operational content of the norm equivalence);
+//! - level-diagonal preconditioner conditioning bounded uniformly in depth
+//!   (the norm equivalence measured directly on small dense fixtures);
+//! - cascade vs a dense single-scale Wendland kernel solve on small n at
+//!   the native smoothness s = (d+3)/2 (the spec's norm-equivalence oracle);
+//! - posterior perturb-and-solve samples match the exact `σ̂²A⁻¹` moments;
+//! - gap behavior: the mean bridges instead of sagging and the posterior
+//!   variance grows into the gap;
+//! - truth recovery of the magic-default refinement loop with its
+//!   certificates.
 
 use gam::solver::residual_cascade::{LogdetMethod, ResidualCascadeDesign, fit_residual_cascade};
 
@@ -74,45 +91,69 @@ fn dense_solve(l: &[f64], p: usize, b: &[f64]) -> Vec<f64> {
     z
 }
 
-fn truth(x: f64, y: f64) -> f64 {
-    (2.0 * std::f64::consts::PI * x).sin() * (2.0 * std::f64::consts::PI * y).sin()
+/// Planted smooth: smooth, bounded, with genuine multiscale structure.
+fn truth(p: &[f64]) -> f64 {
+    let base = (2.0 * std::f64::consts::PI * p[0]).sin() * (2.0 * std::f64::consts::PI * p[1]).sin();
+    match p.len() {
+        2 => base,
+        3 => base * (0.6 + 0.8 * p[2]),
+        _ => unreachable!("truth: dim must be 2 or 3"),
+    }
 }
 
-/// Scattered 2-D sample with mildly heterogeneous weights.
-fn sample(n: usize, noise: f64, seed: u64) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+/// Scattered d-D sample on the unit cube with mildly heterogeneous weights.
+fn sample(
+    dim: usize,
+    n: usize,
+    noise: f64,
+    seed: u64,
+) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f64>) {
     let mut rng = Rng(seed);
-    let mut x1 = Vec::with_capacity(n);
-    let mut x2 = Vec::with_capacity(n);
+    let mut axes = vec![Vec::with_capacity(n); dim];
     let mut y = Vec::with_capacity(n);
     let mut w = Vec::with_capacity(n);
+    let mut p = vec![0.0_f64; dim];
     for i in 0..n {
-        let a = rng.uniform();
-        let b = rng.uniform();
-        x1.push(a);
-        x2.push(b);
-        y.push(truth(a, b) + noise * rng.normal());
+        for (a, axis) in axes.iter_mut().enumerate() {
+            p[a] = rng.uniform();
+            axis.push(p[a]);
+        }
+        y.push(truth(&p) + noise * rng.normal());
         w.push(if i % 7 == 0 { 0.5 } else { 1.0 });
     }
-    (x1, x2, y, w)
+    (axes, y, w)
 }
 
-/// The fitted coefficients, penalized residual, exact log-determinant and
-/// posterior variance must match a dense penalized least-squares oracle
-/// assembled independently from `basis_row` + `penalty_value` unit probes.
-#[test]
-fn cascade_matches_dense_penalized_oracle() {
-    let n = 400;
-    let (x1, x2, y, w) = sample(n, 0.1, 0x1032_0001);
-    let xs: Vec<&[f64]> = vec![&x1, &x2];
-    let design =
-        ResidualCascadeDesign::build(&xs, &y, &w, &[1.0, 1.0], 2.0, 2).expect("design build");
-    let m = design.num_coeffs();
-    assert!(m > 3, "cascade placed no bumps (m = {m})");
+fn axis_refs(axes: &[Vec<f64>]) -> Vec<&[f64]> {
+    axes.iter().map(|a| a.as_slice()).collect()
+}
 
-    // Independent dense assembly: X rows from basis_row, D from unit probes.
+fn point_at(axes: &[Vec<f64>], i: usize) -> Vec<f64> {
+    axes.iter().map(|a| a[i]).collect()
+}
+
+/// Independent dense assembly of `(X'WX + λD, X'Wy)` from `basis_row` and
+/// `penalty_value` unit probes only — no shared code path past the row map.
+struct DenseOracle {
+    m: usize,
+    x_dense: Vec<f64>,
+    l: Vec<f64>,
+    logdet: f64,
+    coeff: Vec<f64>,
+}
+
+fn dense_oracle(
+    design: &ResidualCascadeDesign,
+    axes: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    lambda: f64,
+) -> DenseOracle {
+    let n = y.len();
+    let m = design.num_coeffs();
     let mut x_dense = vec![0.0_f64; n * m];
     for i in 0..n {
-        for (c, v) in design.basis_row(&[x1[i], x2[i]]).expect("basis row") {
+        for (c, v) in design.basis_row(&point_at(axes, i)).expect("basis row") {
             x_dense[i * m + c] += v;
         }
     }
@@ -123,8 +164,6 @@ fn cascade_matches_dense_penalized_oracle() {
         *dj = design.penalty_value(&unit).expect("penalty probe");
         unit[j] = 0.0;
     }
-    let log_lambda = 0.5_f64;
-    let lambda = log_lambda.exp();
     let mut a = vec![0.0_f64; m * m];
     let mut b = vec![0.0_f64; m];
     for i in 0..n {
@@ -142,8 +181,31 @@ fn cascade_matches_dense_penalized_oracle() {
     for j in 0..m {
         a[j * m + j] += lambda * pen_diag[j];
     }
-    let (l, oracle_logdet) = dense_cholesky(&a, m);
-    let oracle_coeff = dense_solve(&l, m, &b);
+    let (l, logdet) = dense_cholesky(&a, m);
+    let coeff = dense_solve(&l, m, &b);
+    DenseOracle {
+        m,
+        x_dense,
+        l,
+        logdet,
+        coeff,
+    }
+}
+
+/// The fitted coefficients, penalized residual, exact log-determinant and
+/// posterior variance must match the dense penalized least-squares oracle —
+/// near machine precision, because the math claims exactness here.
+fn check_dense_oracle(dim: usize, n: usize, seed: u64, probes: &[Vec<f64>]) {
+    let (axes, y, w) = sample(dim, n, 0.1, seed);
+    let xs = axis_refs(&axes);
+    let metric = vec![1.0_f64; dim];
+    let design = ResidualCascadeDesign::build(&xs, &y, &w, &metric, 2.0, 2).expect("design build");
+    let m = design.num_coeffs();
+    assert!(m > dim + 1, "cascade placed no bumps (m = {m})");
+
+    let log_lambda = 0.5_f64;
+    let lambda = log_lambda.exp();
+    let oracle = dense_oracle(&design, &axes, &y, &w, lambda);
 
     let fit = design.fit_at(log_lambda, None).expect("fit_at");
     assert_eq!(fit.certificate.logdet_method, LogdetMethod::DenseExact);
@@ -152,10 +214,11 @@ fn cascade_matches_dense_penalized_oracle() {
         "uncertified solve: rel residual {}",
         fit.certificate.solve_rel_residual
     );
-    let scale = oracle_coeff
+    let scale = oracle
+        .coeff
         .iter()
         .fold(0.0_f64, |acc, &c| acc.max(c.abs()));
-    for (j, (&got, &want)) in fit.coeff.iter().zip(oracle_coeff.iter()).enumerate() {
+    for (j, (&got, &want)) in fit.coeff.iter().zip(oracle.coeff.iter()).enumerate() {
         assert!(
             (got - want).abs() <= 1e-7 * scale,
             "coefficient {j} diverges from dense oracle: {got} vs {want}"
@@ -165,15 +228,15 @@ fn cascade_matches_dense_penalized_oracle() {
     // Penalized residual and exact log-determinant against the oracle.
     let mut rss_pen = 0.0;
     for i in 0..n {
-        let row = &x_dense[i * m..(i + 1) * m];
+        let row = &oracle.x_dense[i * oracle.m..(i + 1) * oracle.m];
         let pred: f64 = row
             .iter()
-            .zip(oracle_coeff.iter())
+            .zip(oracle.coeff.iter())
             .map(|(r, c)| r * c)
             .sum();
         rss_pen += w[i] * (y[i] - pred) * (y[i] - pred);
     }
-    rss_pen += lambda * design.penalty_value(&oracle_coeff).expect("penalty");
+    rss_pen += lambda * design.penalty_value(&oracle.coeff).expect("penalty");
     assert!(
         (fit.rss_pen - rss_pen).abs() <= 1e-8 * rss_pen.max(1.0),
         "penalized residual mismatch: {} vs oracle {rss_pen}",
@@ -181,25 +244,46 @@ fn cascade_matches_dense_penalized_oracle() {
     );
     let logdet = design.logdet_exact(log_lambda).expect("logdet");
     assert!(
-        (logdet - oracle_logdet).abs() <= 1e-7 * oracle_logdet.abs().max(1.0),
-        "log-determinant mismatch: {logdet} vs oracle {oracle_logdet}"
+        (logdet - oracle.logdet).abs() <= 1e-7 * oracle.logdet.abs().max(1.0),
+        "log-determinant mismatch: {logdet} vs oracle {}",
+        oracle.logdet
     );
 
     // Posterior variance at probe points: σ̂²·x'A⁻¹x against the oracle.
-    for &(px, py) in &[(0.3, 0.4), (0.71, 0.18), (0.05, 0.92)] {
-        let mut row = vec![0.0_f64; m];
-        for (c, v) in design.basis_row(&[px, py]).expect("probe row") {
+    for probe in probes {
+        let mut row = vec![0.0_f64; oracle.m];
+        for (c, v) in design.basis_row(probe).expect("probe row") {
             row[c] += v;
         }
-        let sol = dense_solve(&l, m, &row);
+        let sol = dense_solve(&oracle.l, oracle.m, &row);
         let oracle_var: f64 =
             fit.sigma2 * row.iter().zip(sol.iter()).map(|(r, s)| r * s).sum::<f64>();
-        let (_, var) = fit.predict(&[px, py]).expect("predict");
+        let (_, var) = fit.predict(probe).expect("predict");
         assert!(
             (var - oracle_var).abs() <= 1e-7 * oracle_var.max(1e-12),
-            "posterior variance mismatch at ({px},{py}): {var} vs oracle {oracle_var}"
+            "posterior variance mismatch at {probe:?}: {var} vs oracle {oracle_var}"
         );
     }
+}
+
+#[test]
+fn cascade_matches_dense_penalized_oracle() {
+    check_dense_oracle(
+        2,
+        400,
+        0x1032_0001,
+        &[vec![0.3, 0.4], vec![0.71, 0.18], vec![0.05, 0.92]],
+    );
+}
+
+#[test]
+fn cascade_matches_dense_penalized_oracle_3d() {
+    check_dense_oracle(
+        3,
+        350,
+        0x1032_0007,
+        &[vec![0.3, 0.4, 0.5], vec![0.71, 0.18, 0.83], vec![0.05, 0.92, 0.27]],
+    );
 }
 
 /// Truth recovery (#904): the magic-default cascade on a planted smooth
@@ -209,8 +293,8 @@ fn cascade_matches_dense_penalized_oracle() {
 fn cascade_recovers_planted_smooth() {
     let n = 2500;
     let noise = 0.1;
-    let (x1, x2, y, w) = sample(n, noise, 0x1032_0002);
-    let xs: Vec<&[f64]> = vec![&x1, &x2];
+    let (axes, y, w) = sample(2, n, noise, 0x1032_0002);
+    let xs = axis_refs(&axes);
     let fit = fit_residual_cascade(&xs, &y, &w, &[1.0, 1.0], 2.0).expect("cascade fit");
 
     assert!(
@@ -234,7 +318,7 @@ fn cascade_recovers_planted_smooth() {
             let py = (j as f64 + 0.5) / grid as f64;
             let (mean, var) = fit.predict(&[px, py]).expect("predict");
             assert!(var > 0.0, "non-positive posterior variance at ({px},{py})");
-            let err = mean - truth(px, py);
+            let err = mean - truth(&[px, py]);
             sse += err * err;
         }
     }
@@ -248,5 +332,428 @@ fn cascade_recovers_planted_smooth() {
         "dishonest noise estimate: sigma2 {} for true {}",
         fit.sigma2,
         noise * noise
+    );
+}
+
+/// SLQ logdet vs the exact dense logdet across the λ range, and invariance
+/// of the coarse-grid REML λ-selection under the SLQ substitution. SLQ only
+/// estimates the small preconditioned remainder (the level-diagonal control
+/// variate carries the bulk exactly), and the probes are FIXED, so this is a
+/// deterministic, reproducible bound — honest, not exact: 1% relative plus a
+/// 0.5-nat absolute floor on the logdet, and the grid argmax may shift by at
+/// most one step.
+#[test]
+fn slq_logdet_tracks_exact_and_preserves_lambda_selection() {
+    let n = 600;
+    let (axes, y, w) = sample(2, n, 0.1, 0x1032_0003);
+    let xs = axis_refs(&axes);
+    let design = ResidualCascadeDesign::build(&xs, &y, &w, &[1.0, 1.0], 2.0, 3).expect("build");
+
+    for &ll in &[-6.0_f64, -3.0, 0.0, 3.0, 6.0] {
+        let exact = design.logdet_exact(ll).expect("exact logdet");
+        let slq = design.logdet_slq(ll).expect("slq logdet");
+        assert!(
+            (slq - exact).abs() <= 0.01 * exact.abs() + 0.5,
+            "SLQ logdet off at log-lambda {ll}: slq {slq} vs exact {exact}"
+        );
+    }
+
+    // λ-selection invariance over the same 25-point coarse grid fit_reml
+    // scans: substituting the SLQ logdet into the criterion must move the
+    // argmax by at most one grid step.
+    let grid = 25;
+    let (lo, hi) = (-18.0_f64, 18.0_f64);
+    let step = (hi - lo) / (grid - 1) as f64;
+    let mut best_exact = (0usize, f64::NEG_INFINITY);
+    let mut best_slq = (0usize, f64::NEG_INFINITY);
+    for i in 0..grid {
+        let ll = lo + step * i as f64;
+        let c_exact = design.criterion(ll).expect("criterion");
+        let exact = design.logdet_exact(ll).expect("exact logdet");
+        let slq = design.logdet_slq(ll).expect("slq logdet");
+        let c_slq = c_exact - 0.5 * (slq - exact);
+        if c_exact > best_exact.1 {
+            best_exact = (i, c_exact);
+        }
+        if c_slq > best_slq.1 {
+            best_slq = (i, c_slq);
+        }
+    }
+    assert!(
+        best_exact.0.abs_diff(best_slq.0) <= 1,
+        "SLQ shifted the REML grid argmax: exact at {}, slq at {}",
+        best_exact.0,
+        best_slq.0
+    );
+}
+
+/// The iterative route past the dense cap: the PCG backward-error
+/// certificate must be honored, and the iteration count must be
+/// n-independent — quadrupling n at fixed depth may not grow the count by
+/// more than a small additive slack. This is the operational content of the
+/// multilevel norm equivalence (#1032 spec: n-independent iters by design).
+#[test]
+fn pcg_route_certified_and_iteration_count_n_independent() {
+    let levels = 6;
+    let mut iter_counts = Vec::new();
+    for &(n, seed) in &[(12_000usize, 0x1032_0004_u64), (48_000, 0x1032_0005)] {
+        let (axes, y, w) = sample(2, n, 0.1, seed);
+        let xs = axis_refs(&axes);
+        let design =
+            ResidualCascadeDesign::build(&xs, &y, &w, &[1.0, 1.0], 2.0, levels).expect("build");
+        assert!(
+            design.num_coeffs() > 1536,
+            "fixture too small to engage the iterative route (m = {})",
+            design.num_coeffs()
+        );
+        let fit = design.fit_at(0.0, None).expect("fit_at");
+        assert_eq!(fit.certificate.logdet_method, LogdetMethod::Slq);
+        assert!(
+            fit.certificate.solve_rel_residual <= 1e-9,
+            "backward-error certificate violated at n {n}: {}",
+            fit.certificate.solve_rel_residual
+        );
+        assert!(
+            fit.certificate.solve_iters >= 1 && fit.certificate.solve_iters <= 200,
+            "PCG iteration count out of range at n {n}: {}",
+            fit.certificate.solve_iters
+        );
+        // A certified-route prediction must still hand back a positive
+        // variance through its own certified solve.
+        let (_, var) = fit.predict(&[0.4, 0.6]).expect("predict");
+        assert!(var > 0.0, "non-positive iterative-route variance {var}");
+        iter_counts.push(fit.certificate.solve_iters);
+    }
+    assert!(
+        iter_counts[1] <= iter_counts[0] + 10,
+        "PCG iterations grew with n: {} at 12k vs {} at 48k",
+        iter_counts[0],
+        iter_counts[1]
+    );
+}
+
+/// The level-diagonal preconditioner must condition the system uniformly in
+/// cascade depth — the norm equivalence measured directly: on a small dense
+/// fixture, cond(P^{-1/2}AP^{-1/2}) stays bounded and grows by at most a
+/// constant factor as the depth doubles twice.
+#[test]
+fn level_diagonal_preconditioner_conditions_uniformly_in_depth() {
+    let n = 800;
+    let (axes, y, w) = sample(2, n, 0.1, 0x1032_0006);
+    let xs = axis_refs(&axes);
+    let lambda = 1.0_f64;
+    let mut conds = Vec::new();
+    for levels in [2usize, 3, 4] {
+        let design =
+            ResidualCascadeDesign::build(&xs, &y, &w, &[1.0, 1.0], 2.0, levels).expect("build");
+        let oracle = dense_oracle(&design, &axes, &y, &w, lambda);
+        let m = oracle.m;
+        // Reconstruct A = L L' and form M = D^{-1/2} A D^{-1/2}.
+        let mut a = vec![0.0_f64; m * m];
+        for i in 0..m {
+            for j in 0..m {
+                let mut s = 0.0;
+                for t in 0..=i.min(j) {
+                    s += oracle.l[i * m + t] * oracle.l[j * m + t];
+                }
+                a[i * m + j] = s;
+            }
+        }
+        let d_inv_sqrt: Vec<f64> = (0..m).map(|j| 1.0 / a[j * m + j].sqrt()).collect();
+        let mut mmat = vec![0.0_f64; m * m];
+        for i in 0..m {
+            for j in 0..m {
+                mmat[i * m + j] = a[i * m + j] * d_inv_sqrt[i] * d_inv_sqrt[j];
+            }
+        }
+        // λmax by power iteration, λmin by inverse iteration on Cholesky(M).
+        let matvec = |mat: &[f64], v: &[f64], out: &mut [f64]| {
+            for i in 0..m {
+                let mut s = 0.0;
+                for j in 0..m {
+                    s += mat[i * m + j] * v[j];
+                }
+                out[i] = s;
+            }
+        };
+        let mut rng = Rng(0x1032_00C0);
+        let mut v: Vec<f64> = (0..m).map(|_| rng.normal()).collect();
+        let mut tmp = vec![0.0_f64; m];
+        let mut lam_max = 0.0;
+        for _ in 0..300 {
+            matvec(&mmat, &v, &mut tmp);
+            lam_max = tmp.iter().map(|x| x * x).sum::<f64>().sqrt();
+            for j in 0..m {
+                v[j] = tmp[j] / lam_max;
+            }
+        }
+        let (lm, _) = dense_cholesky(&mmat, m);
+        let mut u: Vec<f64> = (0..m).map(|_| rng.normal()).collect();
+        let mut inv_norm = 0.0;
+        for _ in 0..300 {
+            let s = dense_solve(&lm, m, &u);
+            inv_norm = s.iter().map(|x| x * x).sum::<f64>().sqrt();
+            for j in 0..m {
+                u[j] = s[j] / inv_norm;
+            }
+        }
+        let lam_min = 1.0 / inv_norm;
+        conds.push(lam_max / lam_min);
+    }
+    for (idx, &c) in conds.iter().enumerate() {
+        assert!(
+            c.is_finite() && c > 1.0 && c <= 2.0e4,
+            "preconditioned condition number out of range at depth index {idx}: {c} (all: {conds:?})"
+        );
+    }
+    assert!(
+        conds[2] <= 6.0 * conds[0].max(10.0),
+        "conditioning degrades with depth — norm equivalence violated: {conds:?}"
+    );
+}
+
+/// The spec's norm-equivalence oracle: on small n, at the Wendland-(3,1)
+/// native smoothness s = (d+3)/2, the multilevel cascade must recover the
+/// planted truth comparably to a DENSE single-scale Wendland kernel solve
+/// (all-points centers, identity prior, exact dense REML over the same λ
+/// grid). Equivalent norms admit constants, so the bound is a documented
+/// 1.5× factor on held-out truth RMSE — plus an absolute sanity gate that
+/// the dense reference itself works on this fixture.
+#[test]
+fn cascade_matches_dense_wendland_kernel_solve() {
+    let n = 240;
+    let noise = 0.05;
+    let (axes, y, w) = sample(2, n, noise, 0x1032_0008);
+    let xs = axis_refs(&axes);
+
+    // Dense single-scale Wendland kernel reference, assembled entirely
+    // in-test: columns = [1, x1, x2] + one bump of radius delta at every
+    // data point; D = I on the bump block; λ by exact REML on a coarse grid.
+    let wendland = |r: f64| {
+        if r >= 1.0 {
+            0.0
+        } else {
+            let v = 1.0 - r;
+            v * v * v * v * (4.0 * r + 1.0)
+        }
+    };
+    let delta = 0.25_f64;
+    let p0 = 3usize;
+    let m = p0 + n;
+    let row_at = |px: f64, py: f64| -> Vec<f64> {
+        let mut row = vec![0.0_f64; m];
+        row[0] = 1.0;
+        row[1] = 2.0 * px - 1.0;
+        row[2] = 2.0 * py - 1.0;
+        for j in 0..n {
+            let dx = px - axes[0][j];
+            let dy = py - axes[1][j];
+            row[p0 + j] = wendland((dx * dx + dy * dy).sqrt() / delta);
+        }
+        row
+    };
+    let mut x_dense = vec![0.0_f64; n * m];
+    for i in 0..n {
+        let row = row_at(axes[0][i], axes[1][i]);
+        x_dense[i * m..(i + 1) * m].copy_from_slice(&row);
+    }
+    let mut gram = vec![0.0_f64; m * m];
+    let mut b = vec![0.0_f64; m];
+    let mut ytwy = 0.0;
+    for i in 0..n {
+        let row = &x_dense[i * m..(i + 1) * m];
+        ytwy += w[i] * y[i] * y[i];
+        for j in 0..m {
+            b[j] += w[i] * row[j] * y[i];
+            for k in 0..m {
+                gram[j * m + k] += w[i] * row[j] * row[k];
+            }
+        }
+    }
+    let dof = (n - p0) as f64;
+    let mut best: Option<(f64, Vec<f64>)> = None;
+    for g in 0..25 {
+        let ll = -18.0 + 36.0 * g as f64 / 24.0;
+        let lambda = ll.exp();
+        let mut a = gram.clone();
+        for j in p0..m {
+            a[j * m + j] += lambda;
+        }
+        let (l, logdet) = dense_cholesky(&a, m);
+        let coeff = dense_solve(&l, m, &b);
+        let rss_pen = ytwy - coeff.iter().zip(b.iter()).map(|(c, r)| c * r).sum::<f64>();
+        if !(rss_pen > 0.0) {
+            continue;
+        }
+        let sigma2 = rss_pen / dof;
+        let crit = -0.5 * (logdet - (m - p0) as f64 * ll + dof * sigma2.ln());
+        if best.as_ref().is_none_or(|(bc, _)| crit > *bc) {
+            best = Some((crit, coeff));
+        }
+    }
+    let (_, kernel_coeff) = best.expect("kernel REML grid found no PD point");
+
+    // Cascade at the native smoothness for an apples-to-apples norm.
+    let fit = fit_residual_cascade(&xs, &y, &w, &[1.0, 1.0], 2.5).expect("cascade fit");
+
+    let grid = 30;
+    let mut sse_kernel = 0.0;
+    let mut sse_cascade = 0.0;
+    for i in 0..grid {
+        for j in 0..grid {
+            let px = (i as f64 + 0.5) / grid as f64;
+            let py = (j as f64 + 0.5) / grid as f64;
+            let t = truth(&[px, py]);
+            let row = row_at(px, py);
+            let kp: f64 = row.iter().zip(kernel_coeff.iter()).map(|(r, c)| r * c).sum();
+            sse_kernel += (kp - t) * (kp - t);
+            let (cp, _) = fit.predict(&[px, py]).expect("predict");
+            sse_cascade += (cp - t) * (cp - t);
+        }
+    }
+    let rmse_kernel = (sse_kernel / (grid * grid) as f64).sqrt();
+    let rmse_cascade = (sse_cascade / (grid * grid) as f64).sqrt();
+    assert!(
+        rmse_kernel <= 2.0 * noise,
+        "dense kernel reference failed its own sanity gate: rmse {rmse_kernel}"
+    );
+    assert!(
+        rmse_cascade <= 1.5 * rmse_kernel,
+        "cascade falls behind the dense kernel solve: {rmse_cascade} vs {rmse_kernel}"
+    );
+}
+
+/// Perturb-and-solve posterior samples have mean ĉ and covariance EXACTLY
+/// `σ̂²A⁻¹` in distribution; with 512 deterministic samples the empirical
+/// moments must match the dense-oracle moments within standard Monte-Carlo
+/// bounds (6σ on means, 40% on variances — sd of a 512-sample variance is
+/// ~6.3%, so this is a >6σ gate; the fixed seed makes it reproducible).
+#[test]
+fn posterior_samples_match_exact_moments() {
+    let n = 350;
+    let (axes, y, w) = sample(2, n, 0.1, 0x1032_0009);
+    let xs = axis_refs(&axes);
+    let design = ResidualCascadeDesign::build(&xs, &y, &w, &[1.0, 1.0], 2.0, 2).expect("build");
+    let log_lambda = 0.5_f64;
+    let fit = design.fit_at(log_lambda, None).expect("fit_at");
+    let oracle = dense_oracle(&design, &axes, &y, &w, log_lambda.exp());
+    let m = oracle.m;
+
+    // Exact posterior sd per coordinate: σ̂·sqrt((A⁻¹)_jj).
+    let mut sd = vec![0.0_f64; m];
+    let mut unit = vec![0.0_f64; m];
+    for j in 0..m {
+        unit[j] = 1.0;
+        let col = dense_solve(&oracle.l, m, &unit);
+        sd[j] = (fit.sigma2 * col[j]).sqrt();
+        unit[j] = 0.0;
+    }
+
+    let n_samples = 512usize;
+    let samples = fit.sample_coefficients(n_samples).expect("samples");
+    assert_eq!(samples.len(), n_samples);
+    let mut mean = vec![0.0_f64; m];
+    for s in &samples {
+        for j in 0..m {
+            mean[j] += s[j];
+        }
+    }
+    for mj in mean.iter_mut() {
+        *mj /= n_samples as f64;
+    }
+    let mut var = vec![0.0_f64; m];
+    for s in &samples {
+        for j in 0..m {
+            let d = s[j] - mean[j];
+            var[j] += d * d;
+        }
+    }
+    for vj in var.iter_mut() {
+        *vj /= (n_samples - 1) as f64;
+    }
+
+    let mc = 6.0 / (n_samples as f64).sqrt();
+    for j in 0..m {
+        assert!(
+            (mean[j] - fit.coeff[j]).abs() <= mc * sd[j] + 1e-12,
+            "sample mean off at coordinate {j}: {} vs mode {} (sd {})",
+            mean[j],
+            fit.coeff[j],
+            sd[j]
+        );
+        assert!(
+            (var[j] - sd[j] * sd[j]).abs() <= 0.4 * sd[j] * sd[j] + 1e-16,
+            "sample variance off at coordinate {j}: {} vs exact {}",
+            var[j],
+            sd[j] * sd[j]
+        );
+    }
+}
+
+/// Gap behavior (#1032 spec: "bridge-don't-sag mechanically visible"): with
+/// a 0.3-wide data void across the domain, the posterior mean must bridge
+/// the planted smooth (error at the gap center bounded well under the signal
+/// amplitude — a global-trend sag would miss the in-gap maximum by ≥0.3)
+/// while the posterior variance grows into the gap.
+#[test]
+fn gap_bridges_without_sagging_and_variance_grows() {
+    let n = 3000;
+    let noise = 0.05;
+    let mut rng = Rng(0x1032_000A);
+    let mut x1 = Vec::with_capacity(n);
+    let mut x2 = Vec::with_capacity(n);
+    let mut y = Vec::with_capacity(n);
+    let w = vec![1.0_f64; n];
+    // Smooth, amplitude-1, with its maximum INSIDE the gap: sagging toward a
+    // global trend is visibly wrong at the gap center.
+    let f = |a: f64, b: f64| (std::f64::consts::PI * a).sin() * (0.6 + 0.4 * b);
+    while x1.len() < n {
+        let a = rng.uniform();
+        if a > 0.35 && a < 0.65 {
+            continue;
+        }
+        let b = rng.uniform();
+        x1.push(a);
+        x2.push(b);
+        y.push(f(a, b) + noise * rng.normal());
+    }
+    let xs: Vec<&[f64]> = vec![&x1, &x2];
+    let fit = fit_residual_cascade(&xs, &y, &w, &[1.0, 1.0], 2.0).expect("cascade fit");
+
+    // Covered-region accuracy and variance baseline.
+    let mut covered_vars = Vec::new();
+    let mut sse_covered = 0.0;
+    let mut n_covered = 0usize;
+    for i in 0..20 {
+        for j in 0..10 {
+            let a = (i as f64 + 0.5) / 20.0;
+            if a > 0.35 && a < 0.65 {
+                continue;
+            }
+            let b = (j as f64 + 0.5) / 10.0;
+            let (mean, var) = fit.predict(&[a, b]).expect("predict");
+            let err = mean - f(a, b);
+            sse_covered += err * err;
+            covered_vars.push(var);
+            n_covered += 1;
+        }
+    }
+    let rmse_covered = (sse_covered / n_covered as f64).sqrt();
+    assert!(
+        rmse_covered <= 3.0 * noise,
+        "covered-region recovery too weak: rmse {rmse_covered}"
+    );
+    covered_vars.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_var = covered_vars[covered_vars.len() / 2];
+
+    let (gap_mean, gap_var) = fit.predict(&[0.5, 0.5]).expect("gap predict");
+    let gap_truth = f(0.5, 0.5);
+    assert!(
+        (gap_mean - gap_truth).abs() <= 0.25,
+        "gap bridge missed the planted smooth: mean {gap_mean} vs truth {gap_truth}"
+    );
+    assert!(
+        gap_var >= 1.5 * median_var,
+        "posterior variance failed to grow into the gap: {gap_var} vs covered median {median_var}"
     );
 }
