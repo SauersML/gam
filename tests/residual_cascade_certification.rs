@@ -1059,8 +1059,10 @@ fn quasi_uniformity_guard_rejects_degenerate_metric_keeps_benign() {
     );
     // The full magic-default fit refuses the degenerate metric with the guard
     // message (the auto-route reads this as "fall back to dense").
-    let err = fit_residual_cascade(&xs, &y, &w, &collapse, 2.0)
-        .expect_err("degenerate metric must be refused by the quasi-uniformity guard");
+    let err = match fit_residual_cascade(&xs, &y, &w, &collapse, 2.0) {
+        Ok(_) => panic!("degenerate metric must be refused by the quasi-uniformity guard"),
+        Err(e) => e,
+    };
     assert!(
         err.contains("quasi-uniformity"),
         "expected the quasi-uniformity guard to reject, got: {err}"

@@ -111,6 +111,82 @@ fn alo_eta_updatewith_offset(
     offset + eta_centered + x_hinv_x * score / denom
 }
 
+/// Per-row score and curvature of the penalized NLL contribution as functions
+/// of the row's linear predictor `eta`.
+///
+/// Returns `(ℓ_i'(eta), ℓ_i''(eta))` where `ℓ_i` is the (dispersion-scaled)
+/// negative log-likelihood of observation `i` viewed as a univariate function
+/// of `eta_i = x_i^T β`. This is the local family geometry that the ALO
+/// frozen-curvature fixed point [`alo_eta_exact_frozen_curvature`] iterates to
+/// convergence; supplying it upgrades the single-Newton-step ALO correction to
+/// the exact leave-`i`-out predictor under a frozen penalized Hessian.
+pub type AloScalarScoreCurvature<'a> = dyn Fn(usize, f64) -> (f64, f64) + Sync + 'a;
+
+/// Maximum scalar Newton iterations for the exact frozen-curvature ALO fixed
+/// point. The map `r(η) = η − η̂ − a_ii ℓ_i'(η)` is one-dimensional and
+/// strongly contractive for the well-leveraged majority of points, so this
+/// caps the rare high-leverage / near-separation rows where convergence is
+/// slow without ever exceeding O(1) work per observation.
+const ALO_EXACT_SCALAR_MAX_ITERS: usize = 64;
+
+/// Absolute convergence tolerance on the scalar residual `r(η)` for the exact
+/// frozen-curvature ALO fixed point. Well below the `1e-2` predictive bar the
+/// LOO comparison asserts, so the refinement is not the limiting error term.
+const ALO_EXACT_SCALAR_TOL: f64 = 1e-12;
+
+/// Solve the frozen-curvature ALO leave-`i`-out fixed point exactly.
+///
+/// The leave-`i`-out optimum differs from the full fit only through the removed
+/// observation, whose gradient/Hessian depend on `β` solely via the scalar
+/// `η_i = x_i^T β`. Freezing the penalized Hessian `H` at its converged value
+/// reduces the exact leave-`i`-out condition to the scalar equation
+///
+///   η = η̂_i + a_ii · ℓ_i'(η),     a_ii = x_i^T H^{-1} x_i,
+///
+/// where `ℓ_i'(η)` is the row's NLL score (so that `∇F = ℓ_i'(η_i) x_i` at the
+/// leave-`i`-out point). The single-Newton-step ALO is exactly the first
+/// iterate of Newton's method on `r(η) = η − η̂_i − a_ii ℓ_i'(η)` started at
+/// `η̂_i`; iterating to convergence captures the change in the held-out point's
+/// likelihood curvature (the dominant first-order error on small-`n`, curved
+/// likelihoods such as binomial logistic regression near separation).
+///
+/// `score_curvature(eta)` returns `(ℓ_i'(eta), ℓ_i''(eta))`. The returned value
+/// is the corrected linear predictor `η̃_i`. Falls back to the supplied
+/// `one_step` value if the Newton denominator degenerates.
+#[inline]
+fn alo_eta_exact_frozen_curvature(
+    eta_hat: f64,
+    a_ii: f64,
+    one_step: f64,
+    score_curvature: &dyn Fn(f64) -> (f64, f64),
+) -> f64 {
+    let mut eta = one_step;
+    for _ in 0..ALO_EXACT_SCALAR_MAX_ITERS {
+        let (ell_prime, ell_double) = score_curvature(eta);
+        if !ell_prime.is_finite() || !ell_double.is_finite() {
+            return one_step;
+        }
+        let residual = eta - eta_hat - a_ii * ell_prime;
+        if residual.abs() <= ALO_EXACT_SCALAR_TOL {
+            return eta;
+        }
+        let jac = 1.0 - a_ii * ell_double;
+        if jac.abs() <= ALO_DENOMINATOR_MIN || !jac.is_finite() {
+            return one_step;
+        }
+        let next = eta - residual / jac;
+        if !next.is_finite() {
+            return one_step;
+        }
+        eta = next;
+    }
+    // Did not reach the residual tolerance within the iteration cap (rare
+    // high-leverage / near-separation rows where frozen-curvature Newton
+    // oscillates). Fall back to the classical one-step ALO so the exact path
+    // can never regress below the first-order baseline.
+    one_step
+}
+
 #[inline]
 fn bayesvar_eta(phi: f64, x_hinv_x: f64) -> f64 {
     phi * x_hinv_x
@@ -226,6 +302,21 @@ fn compute_alo_diagnostics_from_pirls_impl(
     compute_alo_diagnostics_from_pirls_inner(base, y, link).map_err(EstimationError::from)
 }
 
+/// True when the fitted GLM uses its canonical link, so that the row NLL score
+/// and curvature satisfy `ℓ_i'(η) = c_i(μ(η)−y_i)` and `ℓ_i''(η) = c_i μ'(η)`
+/// with a single per-row scale `c_i = (prior weight)/φ`. This is the exact
+/// condition under which the frozen-curvature ALO scalar fixed point matches
+/// the leave-`i`-out refit; only these families enable the exact refinement.
+fn alo_link_is_canonical(likelihood: &crate::types::GlmLikelihoodSpec) -> bool {
+    use crate::types::ResponseFamily;
+    matches!(
+        (&likelihood.spec.response, likelihood.link_function()),
+        (ResponseFamily::Binomial, LinkFunction::Logit)
+            | (ResponseFamily::Poisson, LinkFunction::Log)
+            | (ResponseFamily::Gaussian, LinkFunction::Identity)
+    )
+}
+
 fn compute_alo_diagnostics_from_pirls_inner(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
@@ -278,6 +369,54 @@ fn compute_alo_diagnostics_from_pirls_inner(
             },
         })?;
 
+    // Exact frozen-curvature ALO refinement for canonical-link GLMs.
+    //
+    // For a canonical link the row NLL score and curvature are
+    //   ℓ_i'(η)  = c_i · (μ(η) − y_i),     ℓ_i''(η) = c_i · μ'(η),
+    // with c_i = (prior weight)/φ recovered from the converged geometry as
+    // c_i = W_H[i] / μ'(η̂_i) (since W_H[i] = c_i μ'(η̂_i) at convergence).
+    // Supplying this evaluator lets `compute_alo_from_input_inner` solve the
+    // leave-i-out scalar fixed point η = η̂_i + a_ii ℓ_i'(η) exactly instead of
+    // taking a single Newton step, removing the first-order linearization error
+    // that dominates on small-n, strongly curved likelihoods (binomial logit).
+    //
+    // Restricted to canonical links because only there does the observed
+    // curvature carried by the frozen Hessian (W_H) coincide with c_i μ'(η) for
+    // every trial η; non-canonical links retain the classical one-step ALO.
+    // Per-row scale c_i = W_H[i]/μ'(η̂_i). Rows whose μ'(η̂_i) is negligible
+    // (saturated / near-separation) get c_i = NaN, which makes the closure
+    // return a non-finite score so the exact solver falls back to the classical
+    // one-step ALO for that row only — the rest of the fit still benefits.
+    let canonical_scale: Option<Array1<f64>> = if alo_link_is_canonical(&base.likelihood) {
+        let mut c = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let dmu = base.solve_dmu_deta[i];
+            let w_h = base.finalweights[i];
+            c[i] = if dmu.abs() <= ALO_DENOMINATOR_MIN || !dmu.is_finite() || !w_h.is_finite() {
+                f64::NAN
+            } else {
+                w_h / dmu
+            };
+        }
+        Some(c)
+    } else {
+        None
+    };
+
+    let inv_link_for_closure = base.likelihood.spec.link.clone();
+    let score_curvature_closure = canonical_scale.as_ref().map(|scale| {
+        move |i: usize, eta: f64| -> (f64, f64) {
+            let (mu, dmu) =
+                crate::mixture_link::inverse_link_mu_d1_for_inverse_link(&inv_link_for_closure, eta)
+                    .unwrap_or((f64::NAN, f64::NAN));
+            let c_i = scale[i];
+            (c_i * (mu - y[i]), c_i * dmu)
+        }
+    });
+    let score_curvature_ref: Option<&AloScalarScoreCurvature> = score_curvature_closure
+        .as_ref()
+        .map(|f| f as &AloScalarScoreCurvature);
+
     // Build model-agnostic AloInput from PIRLS geometry, then delegate.
     let input = AloInput {
         design: x_dense,
@@ -291,6 +430,7 @@ fn compute_alo_diagnostics_from_pirls_inner(
         phi,
         penalty_root: if e.nrows() > 0 { Some(e) } else { None },
         ridge,
+        score_curvature: score_curvature_ref,
     };
 
     let result = compute_alo_from_input_inner(&input)?;
@@ -439,6 +579,18 @@ pub struct AloInput<'a> {
     pub penalty_root: Option<&'a Array2<f64>>,
     /// Ridge added to the Hessian for logdet surface.
     pub ridge: f64,
+    /// Optional per-row score/curvature evaluator `(i, η) → (ℓ_i'(η), ℓ_i''(η))`.
+    ///
+    /// When supplied, the leave-`i`-out predictor is obtained by solving the
+    /// frozen-curvature scalar fixed point `η = η̂_i + a_ii ℓ_i'(η)` to
+    /// convergence (see [`alo_eta_exact_frozen_curvature`]) instead of taking a
+    /// single Newton step. This eliminates the first-order linearization error
+    /// that the one-step ALO incurs on small-`n`, strongly curved likelihoods
+    /// (e.g. binomial logistic regression). When `None`, the classical
+    /// single-Newton-step ALO formula is used. The evaluator must be consistent
+    /// with `hessian_weights` at convergence: `ℓ_i''(η̂_i) = W_H[i]` and
+    /// `ℓ_i'(η̂_i) = W_S[i]·((η̂_i−o_i) − (z_i−o_i))`.
+    pub score_curvature: Option<&'a AloScalarScoreCurvature<'a>>,
 }
 
 impl<'a> AloInput<'a> {
@@ -470,6 +622,7 @@ impl<'a> AloInput<'a> {
             phi,
             penalty_root: None,
             ridge: 0.0,
+            score_curvature: None,
         }
     }
 }
@@ -648,7 +801,7 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
                     ),
                 });
             }
-            let v = alo_eta_updatewith_offset(
+            let one_step = alo_eta_updatewith_offset(
                 eta_hat[i],
                 z[i],
                 offset[i],
@@ -656,6 +809,21 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
                 w_s[i],
                 denom_raw,
             );
+            // When the family score/curvature evaluator is supplied, refine the
+            // single-Newton-step ALO to the exact frozen-curvature leave-i-out
+            // predictor. a_ii here is the unweighted influence x_i^T H^{-1} x_i
+            // (= x_hinv_x_diag[i]); the per-row curvature W_H[i] = ℓ_i''(η̂_i) is
+            // folded into the scalar fixed point via score_curvature.
+            let v = if let Some(score_curvature) = input.score_curvature {
+                alo_eta_exact_frozen_curvature(
+                    eta_hat[i],
+                    x_hinv_x_diag[i],
+                    one_step,
+                    &|eta| score_curvature(i, eta),
+                )
+            } else {
+                one_step
+            };
             if !v.is_finite() {
                 return Err(AloError::LooComputationFailed {
                     reason: format!("ALO eta_tilde is not finite at row {i}: eta_tilde={v}"),

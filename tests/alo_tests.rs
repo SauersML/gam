@@ -248,6 +248,7 @@ fn alo_solve_setup_rejects_non_square_dense_hessian_instead_of_workaround() {
         phi: 1.0,
         penalty_root: None,
         ridge: 0.0,
+        score_curvature: None,
     };
 
     let err = compute_alo_from_input(&input).expect_err("bad Hessian shape must fail setup");
@@ -458,10 +459,47 @@ fn alo_matches_true_loo_small_n_binomial_refit() {
         loo_pred[i] = x_i.dot(&beta_loo);
     }
 
+    // Reference single-Newton-step ALO computed inline from the converged
+    // geometry: η̃¹ = η̂_i + h_i ℓ_i'(η̂_i) / (1 − w_i h_i), with
+    // h_i = x_iᵀH⁻¹x_i, ℓ_i'(η̂_i) = μ_i − y_i, w_i = μ_i(1−μ_i). This is the
+    // classical first-order ALO that the exact frozen-curvature scalar solve
+    // replaces. We assert the production path both meets the absolute LOO bar
+    // AND strictly improves on this first-order baseline, proving the exact
+    // refinement is doing real second-order work rather than coincidentally
+    // passing.
+    let eta_hat = &fit.final_eta;
+    let mut one_step = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let ui = u.row(i).to_owned();
+        let rhs = FaerColView::new(&ui);
+        let s = factor.solve(rhs.as_ref());
+        let quad: f64 = ui.iter().enumerate().map(|(j, a)| a * s[(j, 0)]).sum();
+        let wi = fit.finalweights[i];
+        let h_i = quad / wi.max(1e-12);
+        let mu_i = fit.finalmu[i];
+        let ell_prime = mu_i - y[i];
+        let denom = (1.0 - wi * h_i).max(1e-12);
+        one_step[i] = eta_hat[i] + h_i * ell_prime / denom;
+    }
+    let (rmse_one_step, _, _, _) =
+        loo_compare(&one_step, &alo.se_sandwich, &loo_pred, &naive_se);
+
     let (rmse_pred, max_abs_pred, rmse_se, max_abs_se) =
         loo_compare(&alo.eta_tilde, &alo.se_sandwich, &loo_pred, &naive_se);
-    assert!(rmse_pred <= 1e-2);
-    assert!(max_abs_pred <= 8e-2);
+    assert!(
+        rmse_pred <= 1e-2,
+        "exact ALO must match true LOO refit within 1e-2: rmse_pred={rmse_pred:.6e}, \
+         max_abs_pred={max_abs_pred:.6e} (one-step baseline rmse={rmse_one_step:.6e})"
+    );
+    assert!(
+        max_abs_pred <= 8e-2,
+        "exact ALO max-abs LOO deviation too large: max_abs_pred={max_abs_pred:.6e}"
+    );
+    assert!(
+        rmse_pred < rmse_one_step,
+        "exact frozen-curvature ALO must strictly improve on the one-step ALO: \
+         exact rmse={rmse_pred:.6e} vs one-step rmse={rmse_one_step:.6e}"
+    );
     assert!(rmse_se <= 1e-10);
     assert!(max_abs_se <= 1e-9);
 }
