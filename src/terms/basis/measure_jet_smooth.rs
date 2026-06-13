@@ -239,9 +239,8 @@ pub struct MeasureJetBasisSpec {
     /// Representer (Gaussian RBF) range ℓ; `0.0` sentinel = auto
     /// (median nearest-center spacing × [`MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR`]).
     pub length_scale: f64,
-    /// Add a Marra-Wood select=TRUE shrinkage penalty on the jet-energy
-    /// penalty's null space (the pseudo-affine coefficient subspace) alongside
-    /// the jet-energy penalty itself.
+    /// Add an affine-preserving shrinkage penalty alongside the jet-energy
+    /// penalty.
     pub double_penalty: bool,
     /// Realized-design identifiability policy (see type docs).
     #[serde(default)]
@@ -369,21 +368,14 @@ fn symmetric_pseudoinverse(a: &Array2<f64>, label: &str) -> Result<Array2<f64>, 
     Ok(scaled.dot(&evecs.t()))
 }
 
-/// Projector (in the constrained Gaussian-coefficient space) ONTO the
-/// pseudo-affine subspace: the coefficient directions `b̂` that, pushed through
-/// the representer `K·z`, best reproduce the affine center functions `[1, c₁…c_d]`
-/// under the mass-weighted normal equations. These directions are precisely the
-/// null space of the jet-energy penalty `Q` (which annihilates locally-affine
-/// functions of the center coordinates), so they are the part of coefficient
-/// space the main penalty leaves untouched. As functions of `x` they are bumpy,
-/// bounded sums of Gaussians that revert to the mean off-support — not true
-/// affine trends — so leaving them unpenalised lets them overfit level/tilt.
-///
-/// Returning the projector `P = Σ_k dirₖ dirₖᵀ` (rather than its complement
-/// `I − P`) makes the double penalty a genuine Marra-Wood select=TRUE term: it
-/// penalises exactly the main penalty's null space, with its own REML amplitude
-/// so the pseudo-affine subspace is shrunk only as far as the data warrants.
-fn pseudo_affine_nullspace_projector(
+/// Affine-preserving shrinkage ridge `I − P_pseudoaffine` in the constrained
+/// Gaussian-coefficient space, where `P_pseudoaffine` projects onto the
+/// coefficient directions `b̂` that — pushed through the representer `K·z` — best
+/// reproduce the affine center functions `[1, c₁…c_d]` under the mass-weighted
+/// normal equations. The double penalty thus shrinks the wiggle space while
+/// preserving the (pseudo-)affine component, the measure-jet analogue of leaving
+/// a smooth's null space lightly damped.
+fn affine_preserving_coefficient_ridge(
     kz: &Array2<f64>,
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
@@ -393,7 +385,7 @@ fn pseudo_affine_nullspace_projector(
     let p = kz.ncols();
     if kz.nrows() != m || masses.len() != m {
         crate::bail_dim_basis!(
-            "measure-jet pseudo-affine projector shape mismatch: kz {:?}, centers {:?}, masses {}",
+            "measure-jet affine-preserving ridge shape mismatch: kz {:?}, centers {:?}, masses {}",
             kz.dim(),
             centers.dim(),
             masses.len()
@@ -407,7 +399,7 @@ fn pseudo_affine_nullspace_projector(
         row.mapv_inplace(|v| v * masses[i]);
     }
     let normal = kz.t().dot(&weighted_kz);
-    let normal_pinv = symmetric_pseudoinverse(&normal, "pseudo-affine projector normal")?;
+    let normal_pinv = symmetric_pseudoinverse(&normal, "affine ridge normal")?;
     let mut affine = Array2::<f64>::ones((m, d + 1));
     for i in 0..m {
         for k in 0..d {
@@ -423,12 +415,12 @@ fn pseudo_affine_nullspace_projector(
     let beta_gram = beta.t().dot(&beta);
     let (evals, evecs) = beta_gram.eigh(Side::Lower).map_err(|e| {
         BasisError::InvalidInput(format!(
-            "measure-jet pseudo-affine projector subspace eigendecomposition failed: {e}"
+            "measure-jet affine ridge subspace eigendecomposition failed: {e}"
         ))
     })?;
     let lam_max = evals.iter().fold(0.0_f64, |acc, v| acc.max((*v).max(0.0)));
     let rank_tol = MEASURE_JET_PSEUDOINVERSE_RTOL * ((d + 1).max(1) as f64) * lam_max;
-    let mut proj = Array2::<f64>::zeros((p, p));
+    let mut ridge = Array2::<f64>::eye(p);
     for k in 0..(d + 1) {
         let lam = evals[k].max(0.0);
         if lam <= rank_tol {
@@ -437,11 +429,11 @@ fn pseudo_affine_nullspace_projector(
         let dir = beta.dot(&evecs.column(k).to_owned()) / lam.sqrt();
         for r in 0..p {
             for c in 0..p {
-                proj[(r, c)] += dir[r] * dir[c];
+                ridge[(r, c)] -= dir[r] * dir[c];
             }
         }
     }
-    Ok((&proj + &proj.t()) * 0.5)
+    Ok((&ridge + &ridge.t()) * 0.5)
 }
 
 /// Pairwise squared distances `‖a_i − b_j‖²` via the GEMM identity
@@ -1437,17 +1429,7 @@ pub fn build_measure_jet_basis(
         });
     }
     if spec.double_penalty {
-        // #1041: the main jet-energy penalty Q annihilates the coefficient-space
-        // pseudo-affine subspace (center-affine directions), which map through the
-        // Gaussian representer into bumpy, bounded, mean-reverting functions — NOT
-        // true affine functions of x. Left unpenalised, REML cannot shrink them and
-        // they absorb noise as spurious level/tilt in-sample and revert to the mean
-        // off-support (the #1041 deficit fingerprint). The Marra-Wood select=TRUE
-        // double penalty must penalise exactly the NULL space of the main penalty,
-        // so this ridge is the projector ONTO the pseudo-affine subspace; with its
-        // own REML amplitude the subspace is shrunk only as much as the data
-        // supports a genuine trend.
-        let ridge = pseudo_affine_nullspace_projector(&kz, centers.view(), masses.view())?;
+        let ridge = affine_preserving_coefficient_ridge(&kz, centers.view(), masses.view())?;
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
             matrix: ridge_norm,
@@ -1508,7 +1490,7 @@ pub fn build_measure_jet_basis(
 /// normalization as the fit-time candidates
 /// (`normalize_penaltywith_psi_derivatives` + the cross rule), so criterion
 /// value and criterion derivative share one normalization — the #901 lesson
-/// made structural. The pseudo-affine null-space ridge candidate (when
+/// made structural. The affine-preserving ridge candidate (when
 /// `double_penalty` is on) carries identically-zero derivatives. The
 /// per-candidate layout follows the builder's ORIGINAL candidate order
 /// (scale candidates then ridge / primary then ridge); consumers align to
