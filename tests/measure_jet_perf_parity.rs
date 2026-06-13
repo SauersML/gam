@@ -118,10 +118,10 @@ fn measure_jet_simple_mode_is_speed_competitive() {
     let ds = build_dataset(N_TRAIN, SIGMA, TRAIN_SEED);
 
     let (matern_elapsed, matern_fit) = fit_and_time(MATERN_BODY, &ds);
-    let (duchon_elapsed, duchon_fit) = fit_and_time(DUCHON_BODY, &ds);
-    let (mjs_elapsed, mjs_fit) = fit_and_time(MJS_BODY, &ds);
     drop(matern_fit);
+    let (duchon_elapsed, duchon_fit) = fit_and_time(DUCHON_BODY, &ds);
     drop(duchon_fit);
+    let (mjs_elapsed, mjs_fit) = fit_and_time(MJS_BODY, &ds);
     drop(mjs_fit);
 
     let mjs_secs = mjs_elapsed.as_secs_f64();
