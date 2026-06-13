@@ -387,7 +387,14 @@ fn scan_matches_dense_exact_posterior_at_fixed_lambda_order3() {
     assert_scan_matches_dense_posterior(3, &x, &y, &w, &[-2.0, 0.0, 2.0]);
 }
 
-fn assert_scan_reml_matches_dense(order: usize, x: &[f64], y: &[f64], w: &[f64], ll_a: f64, ll_b: f64) {
+fn assert_scan_reml_matches_dense(
+    order: usize,
+    x: &[f64],
+    y: &[f64],
+    w: &[f64],
+    ll_a: f64,
+    ll_b: f64,
+) {
     let scan_a = fit_spline_scan_at(x, y, w, ll_a, Some(1.0), order).expect("scan a");
     let scan_b = fit_spline_scan_at(x, y, w, ll_b, Some(1.0), order).expect("scan b");
     let dense_a = dense_truth(x, y, w, ll_a, order);

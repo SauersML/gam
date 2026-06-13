@@ -278,7 +278,9 @@ fn gauss_jordan_inverse(a: &[Vec<f64>], what: &str) -> Result<Vec<Vec<f64>>, Str
             .unwrap();
         let p = aug[piv][col];
         if !(p.is_finite() && p.abs() > 0.0) {
-            return Err(format!("spline scan: singular {d}x{d} in {what} (pivot={p})"));
+            return Err(format!(
+                "spline scan: singular {d}x{d} in {what} (pivot={p})"
+            ));
         }
         aug.swap(col, piv);
         inv.swap(col, piv);
@@ -1347,8 +1349,16 @@ mod tests {
         for &xq in &[-0.2, 0.0, 0.013, 0.5, x[6], 0.987, 1.0, 1.3] {
             let (m0, v0) = fit.predict(xq).expect("predict original");
             let (m1, v1) = restored.predict(xq).expect("predict restored");
-            assert_eq!(m0.to_bits(), m1.to_bits(), "mean drift at x={xq} (m={order})");
-            assert_eq!(v0.to_bits(), v1.to_bits(), "variance drift at x={xq} (m={order})");
+            assert_eq!(
+                m0.to_bits(),
+                m1.to_bits(),
+                "mean drift at x={xq} (m={order})"
+            );
+            assert_eq!(
+                v0.to_bits(),
+                v1.to_bits(),
+                "variance drift at x={xq} (m={order})"
+            );
         }
 
         // Corrupt payloads fail loudly, not inside a later predict.
