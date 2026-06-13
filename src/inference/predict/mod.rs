@@ -6961,6 +6961,98 @@ mod tests {
     }
 
     #[test]
+    fn bernoulli_marginal_slope_point_state_emits_covariance_based_interval() {
+        // Issue #1049 oracle (Rust side): with a coefficient covariance set,
+        // the marginal-slope predictor's `point_state` must emit a non-empty
+        // η-scale SE and the matching response-scale `mean_se`, so the FFI's
+        // `predict(interval=)` path has bounds to surface. We independently
+        // reconstruct the η-scale SE from the analytic predictor gradient and
+        // the covariance (`se² = gᵀ Σ g`, i.e. the diagonal of `X Vp Xᵀ` on the
+        // η scale), and the TransformEta credible band the FFI emits
+        // (`Φ(η ± z·se)`), and assert both match to floating-point tolerance.
+        let predictor = BernoulliMarginalSlopePredictor {
+            beta_marginal: array![0.7],
+            beta_logslope: array![-0.4],
+            beta_score_warp: None,
+            beta_link_dev: None,
+            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+            z_column: "z".to_string(),
+            latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
+            latent_measure: LatentMeasureKind::StandardNormal,
+            baseline_marginal: 0.1,
+            baseline_logslope: -0.2,
+            // Joint covariance over θ = [β_marginal | β_logslope]; non-diagonal
+            // so the gradient cross term is genuinely exercised.
+            covariance: Some(array![[0.040, 0.010], [0.010, 0.090]]),
+            score_warp_runtime: None,
+            link_deviation_runtime: None,
+            gaussian_frailty_sd: None,
+            latent_z_calibration: None,
+            latent_z_conditional_calibration: None,
+        };
+        let theta = predictor.theta();
+        assert_eq!(theta.len(), 2, "rigid marginal-slope θ is [marginal | logslope]");
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0], [1.0], [1.0]]),
+            offset: array![0.0, 0.05, -0.10],
+            design_noise: Some(DesignMatrix::from(array![[1.0], [1.0], [1.0]])),
+            offset_noise: Some(array![0.0, -0.1, 0.2]),
+            auxiliary_scalar: Some(array![-0.3, 1.2, 0.4]),
+            auxiliary_matrix: None,
+        };
+
+        let state = predictor
+            .point_state(&input)
+            .expect("marginal-slope point_state should evaluate with a covariance");
+        let eta = state.eta.clone();
+        let eta_se = state
+            .eta_se
+            .as_ref()
+            .expect("issue #1049: covariance-backed point_state must emit an η-scale SE");
+        let mean_se = state
+            .mean_se
+            .as_ref()
+            .expect("issue #1049: covariance-backed point_state must emit a mean SE");
+
+        // Independent η-scale SE from the analytic gradient and covariance.
+        let cov = predictor.covariance.as_ref().unwrap();
+        let (_, grad) = predictor
+            .final_eta_and_gradient_from_theta(&input, &theta, true)
+            .expect("analytic gradient");
+        let grad = grad.expect("gradient rows");
+        for i in 0..eta.len() {
+            let g = grad.row(i).to_owned();
+            let cg = cov.dot(&g);
+            let var = g.dot(&cg);
+            let se_oracle = var.max(0.0).sqrt();
+            assert!(se_oracle > 0.0, "row {i} SE collapsed to zero");
+            assert!(
+                (eta_se[i] - se_oracle).abs() <= 1e-10,
+                "row {i}: η-SE {} != oracle gᵀΣg^{{1/2}} {}",
+                eta_se[i],
+                se_oracle
+            );
+            // mean_se = eta_se · φ(η) (probit delta method).
+            let mean_se_oracle = se_oracle * normal_pdf(eta[i]);
+            assert!(
+                (mean_se[i] - mean_se_oracle).abs() <= 1e-10,
+                "row {i}: mean-SE {} != eta_se·φ(η) {}",
+                mean_se[i],
+                mean_se_oracle
+            );
+            // The FFI surfaces the TransformEta band Φ(η ± z·se); reconstruct it
+            // and check ordering + the probability clip range. z = Φ⁻¹(0.975).
+            let z = crate::probability::standard_normal_quantile(0.975).unwrap();
+            let lo = normal_cdf(eta[i] - z * se_oracle).clamp(0.0, 1.0);
+            let hi = normal_cdf(eta[i] + z * se_oracle).clamp(0.0, 1.0);
+            let mean = normal_cdf(eta[i]);
+            assert!(lo <= mean + 1e-12 && hi >= mean - 1e-12, "row {i}: band brackets mean");
+            assert!((0.0..=1.0).contains(&lo) && (0.0..=1.0).contains(&hi));
+            assert!(hi - lo > 0.0, "row {i}: TransformEta band has positive width");
+        }
+    }
+
+    #[test]
     fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
         let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
