@@ -670,7 +670,13 @@ impl ResponseFamily {
     ///     producing a probability model the user never asked for.
     ///   * A strictly-binary numeric response (`Binary` kind, or `Numeric`
     ///     with only `{0, 1}` values) maps to `Binomial`.
-    ///   * Anything else maps to `Gaussian`.
+    ///   * A non-negative integer-valued count response (every value finite,
+    ///     `>= 0`, and within [`COUNT_INTEGER_TOL`] of an integer) that reaches
+    ///     beyond the binary `{0, 1}` window (i.e. carries at least one value
+    ///     `>= 2`) maps to `Poisson` (log link). This is the "magic-by-default"
+    ///     count detection: mgcv/statsmodels users expect `0,1,2,3,...` to fit a
+    ///     Poisson GLM, not an identity-link Gaussian.
+    ///   * Anything else (any fractional or negative value) maps to `Gaussian`.
     ///
     /// The fallback to `is_binary_response` inside the `Numeric` arm is what
     /// historically lived directly inside `resolve_family`; centralising the
@@ -694,7 +700,21 @@ impl ResponseFamily {
                                 || (*v - 1.0).abs() < BINOMIAL_BINARY_TOL)
                     });
                 if binary {
-                    Ok(Self::Binomial)
+                    return Ok(Self::Binomial);
+                }
+                // Count signature: every value finite, non-negative, and an
+                // integer within `COUNT_INTEGER_TOL`, with at least one value
+                // `>= 2` so it is not the (already-handled) binary case and not
+                // a degenerate all-zero column. A single fractional or negative
+                // value disqualifies the whole response, keeping continuous and
+                // signed data on the conservative Gaussian default.
+                let count = !y.is_empty()
+                    && y.iter().all(|v| {
+                        v.is_finite() && *v >= 0.0 && (*v - v.round()).abs() <= COUNT_INTEGER_TOL
+                    })
+                    && y.iter().any(|v| *v >= 2.0 - COUNT_INTEGER_TOL);
+                if count {
+                    Ok(Self::Poisson)
                 } else {
                     Ok(Self::Gaussian)
                 }
@@ -767,6 +787,17 @@ impl std::error::Error for ResponseSupportViolation {}
 /// same `1e-12` window; the support check shares this single threshold so the
 /// three layers agree on exactly which responses are admissible.
 pub const BINOMIAL_BINARY_TOL: f64 = 1.0e-12;
+
+/// Round tolerance for recognising an integer-valued (count) response.
+///
+/// `infer_from_response` classifies a numeric response as a Poisson count when
+/// every value is finite, non-negative, and within this window of its nearest
+/// non-negative integer. The threshold is looser than [`BINOMIAL_BINARY_TOL`]
+/// because count columns frequently arrive as `f64` round-trips of integers
+/// (CSV parse, integer→double promotion) that accumulate ULP-scale error well
+/// above `1e-12`; `1e-9` admits those without ever matching genuinely
+/// continuous data, whose fractional parts are O(1).
+pub const COUNT_INTEGER_TOL: f64 = 1.0e-9;
 
 /// Floor on the sample standard deviation of a Gaussian response.
 ///
