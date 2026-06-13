@@ -497,7 +497,7 @@ impl RiemannianManifold for ConstantCurvature {
         let scale = tau / n;
         let step = tangent_vec.mapv(|z| z * scale);
         let p = point.dot(&step); // ⟨x, step⟩
-        let xx = point.dot(point); // ‖x‖²
+        let xx = point.dot(&point); // ‖x‖²
         let ss = step.dot(&step); // ‖step‖²
         let a = 1.0 - 2.0 * k * p - k * ss;
         let b = 1.0 + k * xx; // = gauge
@@ -514,7 +514,7 @@ impl RiemannianManifold for ConstantCurvature {
 
         // ── Reverse. ────────────────────────────────────────────────────────
         let g = grad_output;
-        let yx = g.dot(point); // ḡ·x
+        let yx = g.dot(&point); // ḡ·x
         let ys = g.dot(&step); // ḡ·step
         let yy = g.dot(&y); // ḡ·y
         let inv_d = 1.0 / denom;
