@@ -34,14 +34,23 @@
 //!     S(t|x)     = exp( −exp( log Λ(t|x) ) ),
 //!
 //! where `β = [β_time (2 cols) | β_cov]`, `b(t) = [1, log t]`, and `c(x)` is the
-//! frozen covariate design (no covariate intercept — the baseline level lives in
-//! the time block). We reconstruct `S(t|x)` from the *actual fitted `β`* exactly
-//! as `survival_predict` assembles the exit predictor (`x_exit · β + offset`,
-//! offset = 0 for the Weibull-linear path: the derivative guard is 0 and the
-//! parametric target is folded into the linear time block), NOT from a
-//! `(t/scale)^shape` parametric shortcut. The fitted shape exponent `p` is the
-//! slope of `log Λ_0` in `log t`, i.e. `β_time[1]`. We never weaken the bars and
-//! never edit gam to pass.
+//! frozen covariate design. The engine ANCHOR-CENTERS the time design at the time
+//! anchor (`center_survival_time_designs_at_anchor`), which subtracts `b(anchor)`
+//! from every time row and so ZEROES the constant time column `b_0 ≡ 1` (it
+//! becomes `1 − 1 = 0`); its coefficient `β_time[0]` is therefore unidentified by
+//! the time block. The baseline LEVEL is consequently carried by the covariate
+//! design's intercept column, so the term-collection covariate design is
+//! `c(x) = [1, x1, x2]` (3 columns: intercept + the two covariates) and
+//! `β_cov = [intercept, γ_x1, γ_x2]`. We reconstruct `S(t|x)` from the *actual
+//! fitted `β`* exactly as `survival_predict` assembles the exit predictor
+//! (`x_exit · β + offset`, offset = 0 for the Weibull-linear path: the derivative
+//! guard is 0 and the parametric target is folded into the linear time block),
+//! NOT from a `(t/scale)^shape` parametric shortcut. Because `b_0 − b_0(anchor) =
+//! 0`, the reconstruction `β_cov·c(x) + Σ_k (b_k(t) − b_k(anchor))·β_time_k`
+//! reproduces the fitted `log Λ(t|x)` exactly: the covariate intercept supplies
+//! the baseline level and the centered `log t` column supplies the shape slope.
+//! The fitted shape exponent `p` is the slope of `log Λ_0` in `log t`, i.e.
+//! `β_time[1]`. We never weaken the bars and never edit gam to pass.
 
 use csv::StringRecord;
 use gam::families::survival_construction::{
@@ -139,8 +148,11 @@ fn gam_transformation_survival_prediction_grid_matches_scipy() {
     // time basis [1, log t] seeded by scale/shape). The formula carries the
     // explicit `survmodel(spec="transformation", distribution="weibull")` term
     // to declare intent; the library path resolves the likelihood mode from
-    // FitConfig. Two linear covariates x1, x2 are appended after the time
-    // basis, so beta = [time0, time1(=shape), gamma_x1, gamma_x2].
+    // FitConfig. The covariate term-collection design carries its own intercept
+    // (the anchor-centered time block zeroes its own constant column, so the
+    // baseline level lives in the covariate intercept), then the two linear
+    // covariates x1, x2, so beta = [time0(dead), time1(=shape), intercept,
+    // gamma_x1, gamma_x2] — 2 time columns then 3 covariate columns.
     let headers = vec![
         "t".to_string(),
         "d".to_string(),
@@ -194,10 +206,18 @@ fn gam_transformation_survival_prediction_grid_matches_scipy() {
     let beta_time: Array1<f64> = beta.slice(ndarray::s![..p_time]).to_owned();
     let gamma: Array1<f64> = beta.slice(ndarray::s![p_time..]).to_owned();
     let n_cov = gamma.len();
+    // The covariate term-collection design is `[1, x1, x2]`: the anchor-centered
+    // time block zeroes its own constant column `b_0 ≡ 1`, so the baseline level
+    // is carried by the covariate intercept, NOT the dead time-level coefficient.
+    // Hence the covariate block has 3 columns (intercept + x1 + x2) and the full
+    // coefficient vector is [time0(dead), time1(=shape), intercept, γ_x1, γ_x2].
+    // `gamma` is sliced from `beta` and dotted against the SAME 3-column covariate
+    // design rebuilt from `fit.resolvedspec` below, so the reconstruction stays
+    // exactly aligned with the fit.
     assert_eq!(
         n_cov,
-        2,
-        "expected 2 covariate coefficients (x1, x2) after the 2-col Weibull time basis; beta.len()={}",
+        3,
+        "expected 3 covariate coefficients (intercept, x1, x2) after the 2-col Weibull time basis; beta.len()={}",
         beta.len()
     );
     // The shape `p` of a Weibull RP baseline is the slope of log Λ_0 in log t,
