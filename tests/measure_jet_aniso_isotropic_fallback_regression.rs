@@ -114,9 +114,7 @@ fn assert_mjs_converges_and_recovers(d: usize, seed: u64) {
     // Before the fix this returned `Err(RemlOptimizationFailed("spatial kappa
     // optimization made REML score worse (... -> ...)"))`.
     let result = fit_from_formula(&formula, &data, &cfg).unwrap_or_else(|e| {
-        panic!(
-            "{d}-D measure-jet fit must converge, not abort on a spurious score-worse gate: {e}"
-        )
+        panic!("{d}-D measure-jet fit must converge, not abort on a spurious score-worse gate: {e}")
     });
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard fit result");

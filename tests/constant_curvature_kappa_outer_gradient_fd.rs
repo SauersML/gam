@@ -84,7 +84,12 @@ fn next_gauss(state: &mut u64) -> f64 {
 /// chart for the κ used here), plus a Gaussian response that is a smooth
 /// function of the M_κ geodesic distance to a fixed reference point — a signal
 /// the constant-curvature kernel can represent.
-fn build_dataset(n: usize, kappa: f64, radius: f64, seed: u64) -> gam::inference::data::EncodedDataset {
+fn build_dataset(
+    n: usize,
+    kappa: f64,
+    radius: f64,
+    seed: u64,
+) -> gam::inference::data::EncodedDataset {
     let mut st = seed;
     let manifold = ConstantCurvature::new(2, kappa);
     let reference = ndarray::array![0.0_f64, 0.0_f64];
@@ -111,8 +116,8 @@ fn build_dataset(n: usize, kappa: f64, radius: f64, seed: u64) -> gam::inference
     header.push_str(&body);
     let mut rdr = csv::ReaderBuilder::new().from_reader(header.as_bytes());
     let records: Vec<csv::StringRecord> = rdr.records().map(|r| r.unwrap()).collect();
-    let headers = csv::StringRecord::from(vec!["y", "x1", "x2"]);
-    encode_recordswith_inferred_schema(&headers, &records).expect("encode dataset")
+    let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
+    encode_recordswith_inferred_schema(headers, records).expect("encode dataset")
 }
 
 fn field(line: &str, key: &str) -> String {
@@ -248,7 +253,11 @@ fn kappa_zero_flatness_test_has_correct_size() {
     let v_p = |k: f64| -> Result<f64, String> { Ok(0.5 * a * k * k) };
 
     let test = flatness_lr_test(v_p, 0.0).expect("flatness LR");
-    assert!(test.lr_stat.abs() < 1e-12, "flat κ̂ ⇒ zero LR, got {}", test.lr_stat);
+    assert!(
+        test.lr_stat.abs() < 1e-12,
+        "flat κ̂ ⇒ zero LR, got {}",
+        test.lr_stat
+    );
     assert!(
         (test.p_value - 1.0).abs() < 1e-12,
         "interior χ²₁ p-value at LR=0 is 1.0, not the half-χ² 0.5; got {}",

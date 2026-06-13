@@ -3,11 +3,11 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+use crate::solver::evidence::{HybridAtomCandidate, HybridAtomChoice, select_hybrid_atom};
 use crate::terms::analytic_penalties::{
     AnalyticPenalty, IBPAssignmentPenalty, IbpHessianDiagThirdChannels,
     SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight,
 };
-use crate::solver::evidence::{HybridAtomCandidate, HybridAtomChoice, select_hybrid_atom};
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 use crate::terms::sae_manifold::SaeManifoldRho;
 
@@ -1124,7 +1124,11 @@ pub fn select_hybrid_atom_parameterization(
     // parameterization is the linear special case, so any curved candidate
     // offered for it is dropped before the evidence comparison. Curveable charts
     // (Circle / Sphere / Torus / curved products) present both candidates.
-    let curved = if manifold.is_euclidean() { None } else { curved };
+    let curved = if manifold.is_euclidean() {
+        None
+    } else {
+        curved
+    };
     let candidates: Vec<HybridAtomCandidate> = match curved {
         Some(c) => vec![linear, c],
         None => vec![linear],
@@ -1156,12 +1160,7 @@ mod hybrid_split_tests {
         // A Circle chart presents both candidates; a turning feature whose curved
         // fit beats the linear secant on evidence selects curved.
         let linear = HybridAtomCandidate::linear(100.0, 2);
-        let curved = HybridAtomCandidate::curved(
-            1,
-            70.0,
-            5,
-            Some(2.0 * std::f64::consts::PI),
-        );
+        let curved = HybridAtomCandidate::curved(1, 70.0, 5, Some(2.0 * std::f64::consts::PI));
         let choice = select_hybrid_atom_parameterization(
             &LatentManifold::Circle {
                 period: 2.0 * std::f64::consts::PI,

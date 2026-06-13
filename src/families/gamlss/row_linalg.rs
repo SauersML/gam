@@ -32,7 +32,10 @@ pub(crate) fn psd_clamp_2x2(a: f64, b: f64, d: f64) -> (f64, f64, f64, f64, f64,
     (lam1, lam2, u1_0, u1_1, u2_0, u2_1)
 }
 
-pub(crate) fn scale_matrix_rows(mat: &Array2<f64>, coeffs: &Array1<f64>) -> Result<Array2<f64>, String> {
+pub(crate) fn scale_matrix_rows(
+    mat: &Array2<f64>,
+    coeffs: &Array1<f64>,
+) -> Result<Array2<f64>, String> {
     if mat.nrows() != coeffs.len() {
         return Err(GamlssError::DimensionMismatch {
             reason: format!(

@@ -549,8 +549,7 @@ mod tests {
         let point = array![0.2, 0.15, -0.05];
 
         let jet = design_coord_kappa_derivative(&manifold, base.view(), point.view()).unwrap();
-        let (val, dk, dkk) =
-            log_map_kappa_jet(&manifold, base.view(), point.view()).unwrap();
+        let (val, dk, dkk) = log_map_kappa_jet(&manifold, base.view(), point.view()).unwrap();
         for i in 0..dim {
             assert!((jet.coord[i] - val[i]).abs() < 1e-14);
             assert!((jet.d_kappa[i] - dk[i]).abs() < 1e-14);

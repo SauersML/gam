@@ -96,7 +96,10 @@ pub(crate) fn competing_risks_string_list(
     Ok(out)
 }
 
-pub(crate) fn competing_risks_numeric_list(raw: Option<&serde_json::Value>, key: &str) -> PyResult<Vec<f64>> {
+pub(crate) fn competing_risks_numeric_list(
+    raw: Option<&serde_json::Value>,
+    key: &str,
+) -> PyResult<Vec<f64>> {
     let Some(value) = raw else {
         return Ok(Vec::new());
     };
@@ -113,7 +116,10 @@ pub(crate) fn competing_risks_numeric_list(raw: Option<&serde_json::Value>, key:
     Ok(out)
 }
 
-pub(crate) fn competing_risks_flattened_numbers(value: &serde_json::Value, key: &str) -> PyResult<Vec<f64>> {
+pub(crate) fn competing_risks_flattened_numbers(
+    value: &serde_json::Value,
+    key: &str,
+) -> PyResult<Vec<f64>> {
     let mut out = Vec::new();
     competing_risks_flatten_numbers_into(value, key, &mut out)?;
     Ok(out)
@@ -139,7 +145,10 @@ pub(crate) fn competing_risks_flatten_numbers_into(
     }
 }
 
-pub(crate) fn competing_risks_numeric_matrix(value: &serde_json::Value, key: &str) -> PyResult<Array2<f64>> {
+pub(crate) fn competing_risks_numeric_matrix(
+    value: &serde_json::Value,
+    key: &str,
+) -> PyResult<Array2<f64>> {
     match competing_risks_array_depth(value, key)? {
         1 => competing_risks_vector_as_matrix(value, key),
         2 => competing_risks_matrix2(value, key),
@@ -150,14 +159,20 @@ pub(crate) fn competing_risks_numeric_matrix(value: &serde_json::Value, key: &st
     }
 }
 
-pub(crate) fn competing_risks_vector_as_matrix(value: &serde_json::Value, key: &str) -> PyResult<Array2<f64>> {
+pub(crate) fn competing_risks_vector_as_matrix(
+    value: &serde_json::Value,
+    key: &str,
+) -> PyResult<Array2<f64>> {
     let values = competing_risks_numeric_list(Some(value), key)?;
     let n_rows = values.len();
     Array2::from_shape_vec((n_rows, 1), values)
         .map_err(|err| py_value_error(format!("failed to reshape {key}: {err}")))
 }
 
-pub(crate) fn competing_risks_matrix2(value: &serde_json::Value, key: &str) -> PyResult<Array2<f64>> {
+pub(crate) fn competing_risks_matrix2(
+    value: &serde_json::Value,
+    key: &str,
+) -> PyResult<Array2<f64>> {
     let rows = value
         .as_array()
         .ok_or_else(|| py_value_error(format!("{key} must be a JSON array")))?;
@@ -190,7 +205,10 @@ pub(crate) fn competing_risks_matrix2(value: &serde_json::Value, key: &str) -> P
         .map_err(|err| py_value_error(format!("failed to reshape {key}: {err}")))
 }
 
-pub(crate) fn competing_risks_stacked_matrix3(value: &serde_json::Value, key: &str) -> PyResult<Array2<f64>> {
+pub(crate) fn competing_risks_stacked_matrix3(
+    value: &serde_json::Value,
+    key: &str,
+) -> PyResult<Array2<f64>> {
     let matrices = value
         .as_array()
         .ok_or_else(|| py_value_error(format!("{key} must be a JSON array")))?;
@@ -256,4 +274,3 @@ pub(crate) fn competing_risks_number(value: &serde_json::Value, key: &str) -> Py
     }
     Ok(number)
 }
-

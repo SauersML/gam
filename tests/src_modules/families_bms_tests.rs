@@ -10029,8 +10029,8 @@ fn murphy_topel_test_calibration() -> LatentZConditionalCalibration {
     // Mean-and-variance conditional calibration over a single conditioning
     // covariate a(C) (basis_ncols = 1), so θ₁ = (mean_coeffs[2], var_coeffs[2]).
     LatentZConditionalCalibration {
-        mean_coeffs: vec![0.1, 0.4],   // m(C) = 0.1 + 0.4·a
-        var_coeffs: vec![1.2, 0.3],    // v(C) = max(1.2 + 0.3·a, floor)
+        mean_coeffs: vec![0.1, 0.4], // m(C) = 0.1 + 0.4·a
+        var_coeffs: vec![1.2, 0.3],  // v(C) = max(1.2 + 0.3·a, floor)
         basis_ncols: 1,
         var_floor: 0.05,
         global_var: 1.0,
@@ -10253,10 +10253,8 @@ fn score_zeta_sensitivity_equals_jacobian_transpose_of_mixed_z_partial() {
     let n = 4usize;
     let p_m = 2usize;
     let r = 2usize;
-    let marginal_design =
-        ndarray::array![[1.0, 0.3], [1.0, -0.6], [1.0, 0.9], [1.0, -0.2]];
-    let logslope_design =
-        ndarray::array![[0.4, -0.1], [0.7, 0.2], [-0.3, 0.8], [0.5, -0.5]];
+    let marginal_design = ndarray::array![[1.0, 0.3], [1.0, -0.6], [1.0, 0.9], [1.0, -0.2]];
+    let logslope_design = ndarray::array![[0.4, -0.1], [0.7, 0.2], [-0.3, 0.8], [0.5, -0.5]];
     let marginal_eta = ndarray::array![0.2, -0.5, 0.7, -0.1];
     let slope_eta = ndarray::array![0.3, 0.8, -0.4, 1.1];
     let z = ndarray::array![0.6, -0.9, 0.25, 1.3];
@@ -10324,7 +10322,10 @@ fn score_zeta_sensitivity_equals_jacobian_transpose_of_mixed_z_partial() {
         .generated_regressor_correction(
             s.view(),
             z.view(),
-            marginal_design.slice(ndarray::s![.., 1..]).to_owned().view(),
+            marginal_design
+                .slice(ndarray::s![.., 1..])
+                .to_owned()
+                .view(),
             vb.view(),
         )
         .expect("assemble correction");
@@ -10425,11 +10426,16 @@ impl SplitMix64 {
 #[test]
 fn murphy_topel_correction_matches_two_stage_sampling_variance() {
     let n = 300usize;
-    let reps = 4000usize;
+    let reps = 6000usize;
     let gamma = 0.9_f64; // true conditional-mean slope E[z|C] = γ·C
-    let beta_true = 0.7_f64; // true stage-2 slope
-    let sigma = 0.5_f64; // stage-2 residual sd (known)
-    let z_noise_sd = 0.6_f64; // idiosyncratic part of z (decorrelated from C)
+    // Stage-2 is made deliberately PRECISE (large slope, small residual) while
+    // stage-1 carries substantial idiosyncratic noise: this drives the
+    // generated-regressor relative inflation `≈ β²·V₁/σ²` up into the
+    // clearly-material (≳10% SE) regime, so the correction is unambiguously
+    // distinguishable from the naive SE rather than a sub-percent effect.
+    let beta_true = 1.5_f64; // true stage-2 slope
+    let sigma = 0.25_f64; // stage-2 residual sd (known)
+    let z_noise_sd = 1.0_f64; // idiosyncratic part of z (decorrelated from C)
 
     // Fixed conditioning covariate C (the "PC"): a centered grid, reused across
     // replicates so stage-1's design — and hence basis_ncols / the column
@@ -10448,9 +10454,7 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
 
     for _ in 0..reps {
         // --- draw z with a genuine conditional mean shift on C ---
-        let z = Array1::from_iter(
-            (0..n).map(|i| gamma * c[i] + z_noise_sd * rng.next_normal()),
-        );
+        let z = Array1::from_iter((0..n).map(|i| gamma * c[i] + z_noise_sd * rng.next_normal()));
         let weights = Array1::ones(n);
 
         // --- STAGE 1: production conditional location calibration (the gate) ---
@@ -10463,9 +10467,7 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
 
         // --- STAGE 2: Gaussian slope on the generated regressor ζ ---
         // y = β·ζ + ε, ε ~ N(0,σ²).
-        let y = Array1::from_iter(
-            (0..n).map(|i| beta_true * zeta[i] + sigma * rng.next_normal()),
-        );
+        let y = Array1::from_iter((0..n).map(|i| beta_true * zeta[i] + sigma * rng.next_normal()));
         let s_zz: f64 = zeta.iter().map(|&z| z * z).sum();
         let s_zy: f64 = zeta.iter().zip(y.iter()).map(|(&z, &yy)| z * yy).sum();
         let beta_hat = s_zy / s_zz;
@@ -10527,11 +10529,17 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
         "Murphy–Topel variance must be ≥ naive on every replicate (PSD correction)"
     );
 
-    // (1) The corrected SE must DIFFER from the naive SE — the naive single-stage
-    //     variance materially under-states the truth.
     let naive_se = naive_var_pred.sqrt();
     let mt_se = mt_var_pred.sqrt();
     let emp_se = emp_var.sqrt();
+    println!(
+        "[MT-oracle] naive_se={naive_se:.6} mt_se={mt_se:.6} emp_se={emp_se:.6} \
+         inflation_mt={:.4} inflation_emp={:.4} beta_mean={beta_mean:.5}",
+        mt_se / naive_se,
+        emp_se / naive_se,
+    );
+    // (1) The corrected SE must DIFFER from the naive SE — the naive single-stage
+    //     variance materially under-states the truth.
     assert!(
         mt_se > naive_se * 1.05,
         "Murphy–Topel SE must be meaningfully larger than the naive SE: \
@@ -10548,9 +10556,9 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
 
     // (3) The Murphy–Topel prediction MATCHES the empirical sampling variance to
     //     Monte-Carlo tolerance — the core acceptance criterion. Compare on the
-    //     SE scale with a relative band (≈8%: 4000 reps gives a few-percent MC
-    //     error on a variance, and the first-order Murphy–Topel expansion itself
-    //     carries O(1/n) slack).
+    //     SE scale with a relative band (6000 reps gives ≈2% MC error on the SE,
+    //     and the first-order Murphy–Topel expansion itself carries O(1/n) slack
+    //     that grows with the relative correction).
     let rel_err = (mt_se - emp_se).abs() / emp_se;
     assert!(
         rel_err < 0.08,

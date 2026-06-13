@@ -5161,11 +5161,7 @@ fn small_lu_factor(a: &Array2<f64>) -> Option<SmallLu> {
             }
         }
     }
-    Some(SmallLu {
-        lu,
-        piv,
-        perm_sign,
-    })
+    Some(SmallLu { lu, piv, perm_sign })
 }
 
 impl SmallLu {
@@ -5345,11 +5341,7 @@ impl CrossRowWoodbury {
     /// loudly rather than return a complex/`NaN` log-det.
     pub fn log_det(&self) -> Option<f64> {
         let (log_abs, sign) = self.log_det_correction();
-        if sign > 0.0 {
-            Some(log_abs)
-        } else {
-            None
-        }
+        if sign > 0.0 { Some(log_abs) } else { None }
     }
 
     /// `log det(I_R + D·M)`: the exact additive correction
@@ -8309,7 +8301,15 @@ fn step_inside_trust_region(
     !radius.is_finite() || metric_norm(step, metric_weights) <= radius
 }
 
-fn schur_matvec<B: BatchedBlockSolver>(
+/// Below this row count the per-row Schur loop stays sequential: the rayon
+/// fan-out (chunk dispatch + the deterministic per-chunk length-`K` reduction)
+/// costs more than it saves for the handful-of-rows arrow systems that dominate
+/// the non-SAE callers. Above it — the SAE LLM shape (`n` in the thousands,
+/// wide border `k`) that issue #1017 names — the per-row `H_βt (H_tt)⁻¹ H_tβ x`
+/// contributions are the matvec's whole cost and parallelize cleanly.
+const SCHUR_MATVEC_PARALLEL_ROW_MIN: usize = 256;
+
+fn schur_matvec<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
@@ -8337,25 +8337,90 @@ fn schur_matvec<B: BatchedBlockSolver>(
             out_slice[a] += ridge_beta * x_slice[a];
         }
     }
-    // Allocate scratch at max_d; per-row slice is `..di`.
-    let mut local = Array1::<f64>::zeros(sys.d);
-    let mut neg_contrib = Array1::<f64>::zeros(k);
-    for (i, row) in sys.rows.iter().enumerate() {
-        let di = sys.row_dims[i];
-        // H_tβ^(i) · x → local[..di], routed through sys.htbeta_matvec
-        // when the dense block is absent.
-        let mut local_i = local.slice_mut(ndarray::s![..di]).to_owned();
-        local_i.fill(0.0);
-        sys_htbeta_apply_row(sys, i, row, x.view(), &mut local_i);
-        let solved = backend.solve_block_vector(htt_factors.factor(i), local_i.view());
-        // H_βt^(i) · solved accumulates into neg_contrib (length k), then
-        // subtracted from out.  Routed through sys.htbeta_matvec when needed.
-        neg_contrib.fill(0.0);
-        sys_htbeta_accumulate_transpose(sys, i, row, solved.view(), &mut neg_contrib);
-        for a in 0..k {
-            out[a] -= neg_contrib[a];
+    // The reduced-Schur point-elimination term: `out -= Σ_i H_βt^(i) (H_tt^(i))⁻¹
+    // H_tβ^(i) x`. Each row contributes an independent length-`K` vector, so for
+    // the SAE LLM shape (#1017) this is the matvec's whole cost and is
+    // embarrassingly parallel. Run it under rayon over fixed row chunks, summing
+    // the per-chunk partials in chunk order so the f64 reduction is bit-identical
+    // run-to-run regardless of thread scheduling (the #1017 verification gate:
+    // the criterion ranking across topology candidates must not move). Stay
+    // sequential when already inside a rayon worker (the topology race fans
+    // candidates with `run_topology_race_parallel`) to avoid nested-rayon
+    // oversubscription — the same guard `HyperOperator::mul_mat` uses.
+    let parallel =
+        sys.rows.len() >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    if parallel {
+        use rayon::prelude::*;
+        const CHUNK: usize = 64;
+        let n = sys.rows.len();
+        let partials: Vec<Array1<f64>> = (0..n)
+            .into_par_iter()
+            .chunks(CHUNK)
+            .map(|idxs| {
+                let mut acc = Array1::<f64>::zeros(k);
+                let mut local = Array1::<f64>::zeros(sys.d);
+                for i in idxs {
+                    schur_matvec_row_into(sys, htt_factors, x, backend, i, &mut local, &mut acc);
+                }
+                acc
+            })
+            .collect();
+        // Deterministic ordered reduction: fold chunk partials left-to-right.
+        for acc in &partials {
+            for a in 0..k {
+                out[a] -= acc[a];
+            }
+        }
+    } else {
+        // Allocate scratch at max_d; per-row slice is `..di`.
+        let mut local = Array1::<f64>::zeros(sys.d);
+        let mut neg_contrib = Array1::<f64>::zeros(k);
+        for i in 0..sys.rows.len() {
+            neg_contrib.fill(0.0);
+            schur_matvec_row_into(
+                sys,
+                htt_factors,
+                x,
+                backend,
+                i,
+                &mut local,
+                &mut neg_contrib,
+            );
+            for a in 0..k {
+                out[a] -= neg_contrib[a];
+            }
         }
     }
+}
+
+/// Accumulate one row's reduced-Schur point-elimination contribution
+/// `H_βt^(i) (H_tt^(i))⁻¹ H_tβ^(i) x` (length `K`) into `acc`.
+///
+/// `local` is caller-owned `≥ sys.d`-length scratch (reused across rows to keep
+/// the hot loop allocation-free); only `..di` is touched. `acc` is **added to**,
+/// never cleared, so the caller controls whether contributions sum into a chunk
+/// partial (parallel path) or a per-row buffer (sequential path).
+#[inline]
+fn schur_matvec_row_into<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    x: &Array1<f64>,
+    backend: &B,
+    i: usize,
+    local: &mut Array1<f64>,
+    acc: &mut Array1<f64>,
+) {
+    let row = &sys.rows[i];
+    let di = sys.row_dims[i];
+    // H_tβ^(i) · x → local[..di], routed through sys.htbeta_matvec
+    // when the dense block is absent.
+    let mut local_i = local.slice_mut(ndarray::s![..di]).to_owned();
+    local_i.fill(0.0);
+    sys_htbeta_apply_row(sys, i, row, x.view(), &mut local_i);
+    let solved = backend.solve_block_vector(htt_factors.factor(i), local_i.view());
+    // H_βt^(i) · solved accumulates into acc (length k).  Routed through
+    // sys.htbeta_matvec when needed.
+    sys_htbeta_accumulate_transpose(sys, i, row, solved.view(), acc);
 }
 
 /// One per-term block factor for the block-Jacobi Schur preconditioner.
@@ -9056,7 +9121,7 @@ fn build_schur_scalar_inv<B: BatchedBlockSolver>(
 /// If PCG hits `MaxIter` and `k > PRECOND_ESCALATE_K_THRESHOLD`,
 /// escalates to `ClusterJacobi`; if still `MaxIter`, escalates to
 /// `AdditiveSchwarz { overlap: 1 }`.
-fn steihaug_pcg_auto<B: BatchedBlockSolver>(
+fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
@@ -9136,7 +9201,7 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver>(
 
 /// Run Steihaug-CG with a generic preconditioner closure.
 /// Routes matvec through GPU when `gpu_matvec` is set.
-fn run_pcg_with_preconditioner<ApplyPrec, B: BatchedBlockSolver>(
+fn run_pcg_with_preconditioner<ApplyPrec, B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
@@ -11650,5 +11715,144 @@ mod tests {
             err.is_err(),
             "streaming arrow log-det must refuse an IBP-active system"
         );
+    }
+
+    /// Build a dense-`htbeta` arrow system at an SAE-LLM-flavoured shape
+    /// (`n` row blocks × `d` latent coords × wide border `k`), with
+    /// deterministic well-conditioned per-row blocks and cross-blocks. This is
+    /// the shape the reduced-Schur matvec (#1017) walks O(cg_iters) times.
+    fn dense_arrow_system(n: usize, d: usize, k: usize) -> ArrowSchurSystem {
+        let mut sys = ArrowSchurSystem::new(n, d, k);
+        // Deterministic diagonally-dominant per-row H_tt and modest H_tβ.
+        for i in 0..n {
+            let mut htt = Array2::<f64>::zeros((d, d));
+            for r in 0..d {
+                for c in 0..d {
+                    let s = ((i + 1) * (r + 2) * (c + 3)) as f64;
+                    htt[[r, c]] = if r == c {
+                        4.0 + (s % 7.0)
+                    } else {
+                        0.1 * ((s % 5.0) - 2.0)
+                    };
+                }
+            }
+            // Symmetrize and ensure SPD by diagonal dominance.
+            let mut sym = &htt + &htt.t();
+            for r in 0..d {
+                sym[[r, r]] = sym[[r, r]].abs() + (d as f64) + 2.0;
+            }
+            sys.rows[i].htt = sym;
+            let mut htb = Array2::<f64>::zeros((d, k));
+            for r in 0..d {
+                for c in 0..k {
+                    let s = ((i + 1) * (r + 1) + 3 * (c + 1)) as f64;
+                    htb[[r, c]] = 0.05 * ((s % 11.0) - 5.0);
+                }
+            }
+            sys.rows[i].htbeta = htb;
+            sys.rows[i].gt = Array1::<f64>::zeros(d);
+        }
+        // SPD H_ββ: diagonally dominant.
+        let mut hbb = Array2::<f64>::zeros((k, k));
+        for r in 0..k {
+            for c in 0..k {
+                let s = ((r + 1) * (c + 1)) as f64;
+                hbb[[r, c]] = if r == c {
+                    (k as f64) + 6.0 + (s % 3.0)
+                } else {
+                    0.02 * ((s % 7.0) - 3.0)
+                };
+            }
+        }
+        sys.hbb = hbb;
+        sys.gb = Array1::<f64>::zeros(k);
+        sys
+    }
+
+    /// Sequential reference for the reduced-Schur matvec: the exact per-row fold
+    /// the `schur_matvec` sequential branch performs (used to compare the
+    /// parallel path against). Mirrors the production routine's H_ββ + ridge
+    /// prologue, then the per-row point-elimination subtraction in row order.
+    fn schur_matvec_sequential_ref<B: BatchedBlockSolver>(
+        sys: &ArrowSchurSystem,
+        htt_factors: &ArrowFactorSlab,
+        ridge_beta: f64,
+        x: &Array1<f64>,
+        backend: &B,
+    ) -> Array1<f64> {
+        let k = sys.k;
+        let mut out = Array1::<f64>::zeros(k);
+        {
+            let xs = x.as_slice().unwrap();
+            let os = out.as_slice_mut().unwrap();
+            sys.penalty_matvec_add(xs, os);
+            for a in 0..k {
+                os[a] += ridge_beta * xs[a];
+            }
+        }
+        let mut local = Array1::<f64>::zeros(sys.d);
+        let mut neg = Array1::<f64>::zeros(k);
+        for i in 0..sys.rows.len() {
+            neg.fill(0.0);
+            schur_matvec_row_into(sys, htt_factors, x, backend, i, &mut local, &mut neg);
+            for a in 0..k {
+                out[a] -= neg[a];
+            }
+        }
+        out
+    }
+
+    /// The parallel reduced-Schur matvec (rows ≥ `SCHUR_MATVEC_PARALLEL_ROW_MIN`)
+    /// must be (a) DETERMINISTIC run-to-run — bit-identical across repeated
+    /// invocations regardless of thread scheduling, the #1017 verification gate
+    /// that the criterion ranking across candidates cannot move; and (b)
+    /// numerically equal to the sequential per-row fold up to the ULP-level
+    /// reordering of an otherwise-identical sum (the chunk-partial reduction
+    /// reassociates the same row contributions, so it agrees with the per-row
+    /// fold to a tight relative tolerance, not bit-for-bit).
+    #[test]
+    fn parallel_schur_matvec_deterministic_and_matches_sequential() {
+        let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path
+        let d = 6usize;
+        let k = 96usize;
+        let sys = dense_arrow_system(n, d, k);
+        let backend = CpuBatchedBlockSolver;
+        let htt_factors = backend
+            .factor_blocks(&sys.rows, 0.0, d, false)
+            .expect("SPD per-row blocks must factor");
+        let ridge_beta = 1e-6;
+        let x = Array1::from_iter((0..k).map(|a| 0.3 * (a as f64).sin() - 0.1));
+
+        // (a) Determinism: two independent invocations of the live (parallel)
+        // path must be bit-identical.
+        let mut out_a = Array1::<f64>::zeros(k);
+        let mut out_b = Array1::<f64>::zeros(k);
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_a, &backend);
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_b, &backend);
+        for a in 0..k {
+            assert_eq!(
+                out_a[a].to_bits(),
+                out_b[a].to_bits(),
+                "parallel Schur matvec must be deterministic run-to-run at index {a}"
+            );
+        }
+
+        // (b) Equivalence with the sequential per-row fold within ULP-scale
+        // reassociation error.
+        let out_seq = schur_matvec_sequential_ref(&sys, &htt_factors, ridge_beta, &x, &backend);
+        let scale = out_seq
+            .iter()
+            .fold(0.0_f64, |m, &v| m.max(v.abs()))
+            .max(1.0);
+        for a in 0..k {
+            let rel = (out_a[a] - out_seq[a]).abs() / scale;
+            assert!(
+                rel < 1e-12,
+                "parallel vs sequential Schur matvec must agree to reassociation error \
+                 at index {a}: {} vs {} (rel {rel:e})",
+                out_a[a],
+                out_seq[a]
+            );
+        }
     }
 }
