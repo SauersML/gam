@@ -310,6 +310,14 @@ from .distill import DistilledEncoder, EncoderFallbackStats
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
 from ._validation import FormulaValidation
+from .structure_discovery import (
+    atom_birth_gate,
+    e_bh_dictionary_certificate,
+    log_e_from_p_value,
+    split_likelihood_log_e,
+)
+from .bartlett import lawley_bartlett_factor
+from .layer_transport import layer_transport_fit, layer_transport_ladder
 from .geometry import (
     CircleManifold,
     EuclideanManifold,
