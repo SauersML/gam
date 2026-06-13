@@ -173,6 +173,7 @@ fn large_scale_convergence_regression() {
             sas_link: None,
             optimize_sas: false,
             compute_inference: true,
+            skip_rho_posterior_inference: false,
             max_iter: 100,
             tol: 1e-6,
             // D_2 has a 2-d null space (constant + linear).

@@ -53,6 +53,7 @@ fn gaussian_opts(nullspace_dims: Vec<usize>) -> ExternalOptimOptions {
         optimize_sas: false,
         family: gaussian_identity_spec(),
         compute_inference: true,
+        skip_rho_posterior_inference: false,
         max_iter: INNER_MAX_ITER,
         tol: INNER_TOL,
         nullspace_dims,

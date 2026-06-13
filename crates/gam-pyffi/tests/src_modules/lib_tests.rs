@@ -517,6 +517,7 @@ fn gaussian_reml_fit_blocks_forward_native(
         sas_link: None,
         optimize_sas: false,
         compute_inference: true,
+        skip_rho_posterior_inference: false,
         max_iter: 200,
         tol: 1.0e-9,
         nullspace_dims: vec![0; s_list.len()],
@@ -1267,7 +1268,9 @@ fn sae_decoder_lsq_init_produces_nontrivial_seed() {
         z.view(),
         logits.view(),
         "ibp_map",
-        0.7,
+        1.0, // alpha (IBP concentration; canonical default)
+        0.7, // tau
+        0.0, // jumprelu_threshold (unused for ibp_map)
     )
     .expect("LSQ seed must succeed");
     assert_eq!(decoder.shape(), &[k, m, p]);
