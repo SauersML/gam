@@ -321,6 +321,13 @@ struct Core {
     /// Dense upper-triangular `X'WX` when `m ≤ DENSE_GRAM_MAX` (row-major
     /// m×m, lower mirror filled at solve time); None on the iterative route.
     dense_gram: Option<Vec<f64>>,
+    /// Predict-only factored precision: the lower Cholesky factor `L` of
+    /// `A = X'WX + λD` at the FIT's λ, populated only on a core rebuilt from a
+    /// persisted [`ResidualCascadeState`] (where the training CSR is dropped).
+    /// When present, `solve_coeff` replays the posterior-variance solve through
+    /// this factor instead of the absent training design; `None` on a
+    /// training-built core, which solves through `dense_gram`/PCG as usual.
+    predict_chol: Option<Vec<f64>>,
 }
 
 /// Solver route a fit took for its log-determinant.
@@ -385,6 +392,60 @@ pub struct ResidualCascadeFit {
     pub certificate: CascadeCertificate,
     /// Present when the fit came from the refinement loop.
     pub refinement: Option<RefinementCertificate>,
+}
+
+/// One resolution level's geometry in a persisted snapshot: the data needed to
+/// rebuild a [`Level`] (its lookup grid, bumps, and column block) without the
+/// training rows. Centers are flattened `dim`-major (`dim` floats per center).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LevelState {
+    pub h: f64,
+    pub delta: f64,
+    pub weight: f64,
+    pub col_offset: u64,
+    /// `dim·n_centers` scaled-coordinate floats, center-major.
+    pub centers: Vec<f64>,
+}
+
+/// Serializable snapshot of a [`ResidualCascadeFit`] (#1032 persistence
+/// prerequisite). Holds everything `predict` needs and NOTHING about the
+/// training rows:
+/// - MEAN: the nested geometry (`dim`/`metric`/box/`sobolev_s` + per-level
+///   centers/δ/weights/col-offsets) and the root polynomial layer are all that
+///   `basis_row_scaled`·`coeff` reads;
+/// - VARIANCE: the factored precision `predict_chol` — the lower Cholesky factor
+///   `L` of `A = X'WX + λD` at the fit's λ — which the posterior-variance solve
+///   `x'A⁻¹x` replays against (the training design that originally assembled `A`
+///   is dropped).
+///
+/// `from_state` rebuilds a predict-capable fit whose `Core` carries empty
+/// training CSR and `predict_chol = Some(L)`; `solve_coeff` then routes the
+/// variance solve through `L`. The reconstructed fit cannot be re-fit or
+/// resampled (it has no rows), only predicted from — exactly the persistence
+/// contract.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ResidualCascadeState {
+    pub dim: u64,
+    /// Per-axis metric scaling (length 3; trailing entries are 1 for `dim < 3`).
+    pub metric: [f64; 3],
+    pub z_lo: [f64; 3],
+    pub z_range: [f64; 3],
+    pub sobolev_s: f64,
+    pub levels: Vec<LevelState>,
+    /// Total column count `dim + 1 + Σ centers`.
+    pub m: u64,
+    /// `Σ_j log d_j` over penalized columns (kept so restored REML scalars stay
+    /// comparable across cascade depths).
+    pub pen_logdet_const: f64,
+    /// Posterior-mode coefficients (length `m`).
+    pub coeff: Vec<f64>,
+    pub log_lambda: f64,
+    pub sigma2: f64,
+    pub restricted_loglik: f64,
+    pub rss_pen: f64,
+    /// Lower Cholesky factor `L` of `A = X'WX + λD` at the fit's λ, `m × m`
+    /// row-major — the factored precision the variance solve replays through.
+    pub predict_chol: Vec<f64>,
 }
 
 impl Core {
@@ -659,11 +720,62 @@ impl Core {
         b: &[f64],
         warm: Option<&[f64]>,
     ) -> Result<(Vec<f64>, f64, usize), String> {
+        // A core rebuilt from a persisted state carries no training design, only
+        // the factored precision `L` of `A = X'WX + λD` at the fit's λ. Replay
+        // the solve through it (exact — predict always solves at that same λ).
+        if let Some(l) = &self.predict_chol {
+            return Ok((chol_solve(l, self.m, b), 0.0, 0));
+        }
         if let Some(mut a) = self.dense_system(lambda) {
             cholesky_logdet(&mut a, self.m)?;
             return Ok((chol_solve(&a, self.m, b), 0.0, 0));
         }
         self.pcg(lambda, b, warm)
+    }
+
+    /// Assemble the lower Cholesky factor `L` of `A = X'WX + λD` as a dense
+    /// `m × m` row-major matrix — the factored precision a persisted predict
+    /// replays its posterior-variance solve through. Uses the cached dense Gram
+    /// when present; otherwise scatters the CSR row outer products into the
+    /// upper triangle (one O(nnz·q) pass), the same assembly `build` uses under
+    /// the sizing cap, just without the cap. Factoring is O(m³) — paid once at
+    /// snapshot time, not per predict.
+    fn assemble_predict_factor(&self, lambda: f64) -> Result<Vec<f64>, String> {
+        let m = self.m;
+        let mut a = vec![0.0_f64; m * m];
+        if let Some(gram) = &self.dense_gram {
+            for i in 0..m {
+                for j in i..m {
+                    let v = gram[i * m + j];
+                    a[i * m + j] = v;
+                    a[j * m + i] = v;
+                }
+            }
+        } else {
+            for i in 0..self.w.len() {
+                let lo = self.row_ptr[i];
+                let hi = self.row_ptr[i + 1];
+                for ea in lo..hi {
+                    let ca = self.col_idx[ea] as usize;
+                    let va = self.w[i] * self.vals[ea];
+                    for eb in ea..hi {
+                        let cb = self.col_idx[eb] as usize;
+                        a[ca * m + cb] += va * self.vals[eb];
+                    }
+                }
+            }
+            // Mirror the upper triangle into the lower.
+            for i in 0..m {
+                for j in i + 1..m {
+                    a[j * m + i] = a[i * m + j];
+                }
+            }
+        }
+        for (i, d) in self.pen_diag.iter().enumerate() {
+            a[i * m + i] += lambda * d;
+        }
+        cholesky_logdet(&mut a, m)?;
+        Ok(a)
     }
 
     /// Penalized residual quadratic at a solution: `y'Wy − c'X'Wy`.
@@ -1007,6 +1119,7 @@ impl ResidualCascadeDesign {
                 pen_diag,
                 pen_logdet_const,
                 dense_gram,
+                predict_chol: None,
             }),
         })
     }
@@ -1416,6 +1529,249 @@ impl ResidualCascadeFit {
     /// Total coefficient count.
     pub fn num_coeffs(&self) -> usize {
         self.core.m
+    }
+
+    /// Snapshot the fit for persistence (#1032). Assembles the factored
+    /// precision `L` of `A = X'WX + λD` at the fit's λ (O(m³) once) and copies
+    /// the nested geometry + coefficients, dropping all training rows. The
+    /// resulting [`ResidualCascadeState`] is predict-complete: `from_state`
+    /// replays the posterior mean+variance bit-for-bit.
+    pub fn to_state(&self) -> Result<ResidualCascadeState, String> {
+        let core = &self.core;
+        let lambda = self.log_lambda.exp();
+        let predict_chol = core.assemble_predict_factor(lambda)?;
+        let dim = core.dim;
+        let levels = core
+            .levels
+            .iter()
+            .map(|level| {
+                let mut centers = Vec::with_capacity(level.centers.len() * dim);
+                for c in &level.centers {
+                    centers.extend_from_slice(&c[..dim]);
+                }
+                LevelState {
+                    h: level.h,
+                    delta: level.delta,
+                    weight: level.weight,
+                    col_offset: level.col_offset as u64,
+                    centers,
+                }
+            })
+            .collect();
+        Ok(ResidualCascadeState {
+            dim: dim as u64,
+            metric: core.metric,
+            z_lo: core.z_lo,
+            z_range: core.z_range,
+            sobolev_s: core.sobolev_s,
+            levels,
+            m: core.m as u64,
+            pen_logdet_const: core.pen_logdet_const,
+            coeff: self.coeff.clone(),
+            log_lambda: self.log_lambda,
+            sigma2: self.sigma2,
+            restricted_loglik: self.restricted_loglik,
+            rss_pen: self.rss_pen,
+            predict_chol,
+        })
+    }
+
+    /// Rebuild a predict-capable fit from a snapshot (#1032). Validates shape,
+    /// finiteness, the Sobolev/Wendland window, strictly-positive level weights
+    /// and box ranges, the column accounting (`m = dim+1 + Σ centers`, matching
+    /// `col_offset`s), positive σ², and that `predict_chol` is a valid `m × m`
+    /// lower factor (positive pivots) — so a corrupt payload fails here, not in
+    /// a later `predict`. The restored `Core` has empty training CSR and
+    /// `predict_chol = Some(L)`; its `predict` reads only geometry (mean) and
+    /// the factor (variance), replaying both exactly.
+    pub fn from_state(state: &ResidualCascadeState) -> Result<Self, String> {
+        let dim = state.dim as usize;
+        if !(dim == 2 || dim == 3) {
+            return Err(format!(
+                "residual cascade state: dim must be 2 or 3, got {dim}"
+            ));
+        }
+        if !(state.sobolev_s > dim as f64 / 2.0 && state.sobolev_s <= (dim as f64 + 3.0) / 2.0) {
+            return Err(format!(
+                "residual cascade state: sobolev_s {} outside the Wendland window ({}, {}]",
+                state.sobolev_s,
+                dim as f64 / 2.0,
+                (dim as f64 + 3.0) / 2.0
+            ));
+        }
+        for a in 0..dim {
+            if !(state.metric[a].is_finite() && state.metric[a] > 0.0) {
+                return Err(format!(
+                    "residual cascade state: metric axis {a} must be finite positive, got {}",
+                    state.metric[a]
+                ));
+            }
+            if !(state.z_range[a].is_finite() && state.z_range[a] > 0.0 && state.z_lo[a].is_finite())
+            {
+                return Err(format!(
+                    "residual cascade state: degenerate box on axis {a} (lo={}, range={})",
+                    state.z_lo[a], state.z_range[a]
+                ));
+            }
+        }
+        let m = state.m as usize;
+        let mut metric3 = [1.0_f64; 3];
+        metric3[..dim].copy_from_slice(&state.metric[..dim]);
+        let mut z_lo = [0.0_f64; 3];
+        let mut z_range = [1.0_f64; 3];
+        z_lo[..dim].copy_from_slice(&state.z_lo[..dim]);
+        z_range[..dim].copy_from_slice(&state.z_range[..dim]);
+
+        // Rebuild the levels and their lookup grids from the flattened centers,
+        // checking the column accounting matches the polynomial layer + blocks.
+        let mut levels = Vec::with_capacity(state.levels.len());
+        let mut net: Vec<[f64; 3]> = Vec::new();
+        let mut pen_diag = vec![0.0_f64; m];
+        let mut expected_offset = dim + 1;
+        for (li, ls) in state.levels.iter().enumerate() {
+            if !(ls.h.is_finite() && ls.h > 0.0 && ls.delta.is_finite() && ls.delta > 0.0) {
+                return Err(format!(
+                    "residual cascade state: level {li} has non-positive h/delta ({}, {})",
+                    ls.h, ls.delta
+                ));
+            }
+            if !(ls.weight.is_finite() && ls.weight > 0.0) {
+                return Err(format!(
+                    "residual cascade state: level {li} has non-positive prior weight {}",
+                    ls.weight
+                ));
+            }
+            if ls.centers.len() % dim != 0 {
+                return Err(format!(
+                    "residual cascade state: level {li} centers length {} not a multiple of dim {dim}",
+                    ls.centers.len()
+                ));
+            }
+            let n_centers = ls.centers.len() / dim;
+            let col_offset = ls.col_offset as usize;
+            if col_offset != expected_offset {
+                return Err(format!(
+                    "residual cascade state: level {li} col_offset {col_offset} ≠ expected {expected_offset}"
+                ));
+            }
+            let mut grid = HashGrid::new(ls.delta, dim);
+            let mut centers = Vec::with_capacity(n_centers);
+            for j in 0..n_centers {
+                let mut c = [0.0_f64; 3];
+                for a in 0..dim {
+                    let v = ls.centers[j * dim + a];
+                    if !v.is_finite() {
+                        return Err(format!(
+                            "residual cascade state: non-finite center coordinate at level {li}, center {j}"
+                        ));
+                    }
+                    c[a] = v;
+                }
+                grid.insert(j as u32, &c);
+                centers.push(c);
+                net.push(c);
+                let col = col_offset + j;
+                if col >= m {
+                    return Err(format!(
+                        "residual cascade state: level {li} column {col} exceeds m {m}"
+                    ));
+                }
+                pen_diag[col] = ls.weight;
+            }
+            expected_offset = col_offset + n_centers;
+            levels.push(Level {
+                h: ls.h,
+                delta: ls.delta,
+                weight: ls.weight,
+                centers,
+                col_offset,
+                grid,
+            });
+        }
+        if expected_offset != m {
+            return Err(format!(
+                "residual cascade state: column accounting mismatch (dim+1+Σcenters = {expected_offset} ≠ m {m})"
+            ));
+        }
+        if state.coeff.len() != m {
+            return Err(format!(
+                "residual cascade state: coeff length {} ≠ m {m}",
+                state.coeff.len()
+            ));
+        }
+        if state.predict_chol.len() != m * m {
+            return Err(format!(
+                "residual cascade state: predict_chol must be m×m = {m}² = {}, got {}",
+                m * m,
+                state.predict_chol.len()
+            ));
+        }
+        for (i, v) in state
+            .coeff
+            .iter()
+            .chain(state.predict_chol.iter())
+            .enumerate()
+        {
+            if !v.is_finite() {
+                return Err(format!("residual cascade state: non-finite entry at {i}"));
+            }
+        }
+        for g in 0..m {
+            let piv = state.predict_chol[g * m + g];
+            if !(piv.is_finite() && piv > 0.0) {
+                return Err(format!(
+                    "residual cascade state: non-positive Cholesky pivot {piv} at index {g}"
+                ));
+            }
+        }
+        if !(state.log_lambda.is_finite()
+            && state.sigma2.is_finite()
+            && state.sigma2 > 0.0
+            && state.restricted_loglik.is_finite()
+            && state.rss_pen.is_finite())
+        {
+            return Err(format!(
+                "residual cascade state: invalid scalars (log_lambda={}, sigma2={}, restricted_loglik={}, rss_pen={})",
+                state.log_lambda, state.sigma2, state.restricted_loglik, state.rss_pen
+            ));
+        }
+        let core = Core {
+            dim,
+            metric: metric3,
+            z_lo,
+            z_range,
+            sobolev_s: state.sobolev_s,
+            levels,
+            net,
+            m,
+            row_ptr: Vec::new(),
+            col_idx: Vec::new(),
+            vals: Vec::new(),
+            w: Vec::new(),
+            y: Vec::new(),
+            z: Vec::new(),
+            rhs: Vec::new(),
+            ytwy: 0.0,
+            gram_diag: Vec::new(),
+            pen_diag,
+            pen_logdet_const: state.pen_logdet_const,
+            dense_gram: None,
+            predict_chol: Some(state.predict_chol.clone()),
+        };
+        Ok(ResidualCascadeFit {
+            core: Arc::new(core),
+            coeff: state.coeff.clone(),
+            log_lambda: state.log_lambda,
+            sigma2: state.sigma2,
+            restricted_loglik: state.restricted_loglik,
+            rss_pen: state.rss_pen,
+            certificate: CascadeCertificate {
+                solve_rel_residual: 0.0,
+                solve_iters: 0,
+                logdet_method: LogdetMethod::DenseExact,
+            },
+            refinement: None,
+        })
     }
 }
 

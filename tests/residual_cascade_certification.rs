@@ -21,7 +21,10 @@
 //! - truth recovery of the magic-default refinement loop with its
 //!   certificates.
 
-use gam::solver::residual_cascade::{LogdetMethod, ResidualCascadeDesign, fit_residual_cascade};
+use gam::solver::residual_cascade::{
+    LogdetMethod, ResidualCascadeDesign, ResidualCascadeFit, ResidualCascadeState,
+    fit_residual_cascade,
+};
 
 /// SplitMix64 — deterministic test stream, no external RNG dependency.
 struct Rng(u64);
@@ -911,4 +914,87 @@ fn quasi_uniformity_guard_rejects_degenerate_metric_keeps_benign() {
         err.contains("quasi-uniformity"),
         "expected the quasi-uniformity guard to reject, got: {err}"
     );
+}
+
+/// Persistence round-trip (#1032 solver prerequisite): `to_state` → JSON →
+/// `from_state` rebuilds a predict-capable fit WITHOUT the training CSR (the
+/// reconstructed `Core` carries empty rows and the factored precision `L` of
+/// `X'WX+λD`), and that fit reproduces the original posterior mean AND variance
+/// at held-out points to solver roundoff. This is the prerequisite the
+/// inference lane flagged; the inference-side payload/predict-replay rides on
+/// top of this state type.
+#[test]
+fn cascade_state_roundtrip_reproduces_mean_and_variance() {
+    let n = 2000;
+    let noise = 0.1;
+    let (axes, y, w) = sample(2, n, noise, 0x1032_0042);
+    let xs = axis_refs(&axes);
+    let fit = fit_residual_cascade(&xs, &y, &w, &[1.0, 1.0], 2.0).expect("cascade fit");
+
+    let state = fit.to_state().expect("snapshot");
+    let json = serde_json::to_string(&state).expect("serialize state");
+    let restored_state: ResidualCascadeState =
+        serde_json::from_str(&json).expect("deserialize state");
+    let restored = ResidualCascadeFit::from_state(&restored_state).expect("restore fit");
+
+    assert_eq!(restored.num_coeffs(), fit.num_coeffs());
+    assert_eq!(restored.num_levels(), fit.num_levels());
+
+    // Held-out points across the domain; the restored fit must match mean+SE to
+    // solver roundoff (the factored precision is the SAME matrix the original
+    // assembled under the dense cap; the variance solve replays through it).
+    let grid = 17;
+    let mut max_mean_err = 0.0_f64;
+    let mut max_var_err = 0.0_f64;
+    for i in 0..grid {
+        for j in 0..grid {
+            let px = (i as f64 + 0.37) / grid as f64;
+            let py = (j as f64 + 0.61) / grid as f64;
+            let (m0, v0) = fit.predict(&[px, py]).expect("orig predict");
+            let (m1, v1) = restored.predict(&[px, py]).expect("restored predict");
+            max_mean_err = max_mean_err.max((m0 - m1).abs() / (1.0 + m0.abs()));
+            max_var_err = max_var_err.max((v0 - v1).abs() / (1.0 + v0.abs()));
+        }
+    }
+    assert!(
+        max_mean_err <= 1e-9,
+        "mean drift across round-trip: {max_mean_err}"
+    );
+    assert!(
+        max_var_err <= 1e-9,
+        "variance drift across round-trip: {max_var_err}"
+    );
+}
+
+/// A corrupt cascade snapshot fails loudly in `from_state`, never inside a
+/// later `predict`.
+#[test]
+fn cascade_state_rejects_corruption() {
+    let n = 800;
+    let (axes, y, w) = sample(2, n, 0.1, 0x1032_0043);
+    let xs = axis_refs(&axes);
+    let fit = fit_residual_cascade(&xs, &y, &w, &[1.0, 1.0], 2.0).expect("cascade fit");
+    let good = fit.to_state().expect("snapshot");
+
+    let mut bad = good.clone();
+    bad.coeff.pop();
+    ResidualCascadeFit::from_state(&bad).expect_err("coeff length mismatch must error");
+
+    let mut bad = good.clone();
+    bad.sigma2 = -1.0;
+    ResidualCascadeFit::from_state(&bad).expect_err("non-positive sigma2 must error");
+
+    let mut bad = good.clone();
+    bad.predict_chol.pop();
+    ResidualCascadeFit::from_state(&bad).expect_err("predict_chol size mismatch must error");
+
+    let mut bad = good.clone();
+    bad.sobolev_s = 10.0;
+    ResidualCascadeFit::from_state(&bad).expect_err("out-of-window sobolev_s must error");
+
+    let mut bad = good;
+    let m = bad.m as usize;
+    bad.predict_chol[0] = 0.0;
+    let _ = m;
+    ResidualCascadeFit::from_state(&bad).expect_err("zero Cholesky pivot must error");
 }
