@@ -1,0 +1,45 @@
+# cargo-nextest configuration.
+#
+# The motivating requirement is a PER-TEST-FUNCTION timeout in CI. Plain
+# `cargo test` can only be wrapped with a per-INVOCATION wall-clock cap (GNU
+# `timeout` around a whole `cargo test --test <binary>` run); a single hung
+# `#[test]` inside an otherwise-fast binary either burns the whole binary's
+# budget or — worse, when the binary holds many tests — never trips a useful
+# cap and the failure is attributed to the binary, not the offending test.
+#
+# nextest runs each test function as its own process and enforces
+# `slow-timeout` per test. With `terminate-after` set, a test that runs past
+# the period is SIGKILLed and reported as a FAILURE naming that exact test,
+# which is precisely the behavior CI needs to catch a hang.
+
+[profile.ci]
+# Per-test wall-clock cap.
+#
+# Choosing the period: the slowest legitimate single `#[test]` in this suite is
+# a REML/PIRLS or joint-Newton solver test on a moderately sized synthetic
+# problem, plus the reference-quality tests that shell out to R/mgcv/gamlss and
+# Python comparators. Those reference-comparison tests dominate the tail — a
+# single one can spend a couple of minutes inside the external tool. 600s gives
+# the slowest of these comfortable margin (observed worst-case single tests run
+# well under 5 min) while still terminating a genuine hang (an infinite solver
+# loop, a deadlock, a runaway line search) quickly enough to be useful and far
+# inside the 350-min job backstop. `terminate-after = 1` means: after the test
+# crosses 600s once, kill it immediately and fail it (rather than logging
+# repeated "slow" notices and letting it run unbounded).
+slow-timeout = { period = "600s", terminate-after = 1 }
+
+# Emit the live test list and final summary even on success so the CI
+# forbidden-pattern grep over the captured log has the per-test context, and so
+# a terminated (timed-out) test is clearly attributed by name in the output.
+status-level = "fail"
+final-status-level = "slow"
+
+# Do not stop the run on the first failure: CI must collect every failing test
+# (including the committed bug-repro regression tests) in one pass, mirroring
+# the old per-binary loop's no-fail-fast contract.
+fail-fast = false
+
+# Surface the captured stdout/stderr of failing (and timed-out) tests so the
+# forbidden runtime-error-signature grep in CI can classify the failure mode.
+failure-output = "immediate-final"
+success-output = "never"
