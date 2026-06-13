@@ -16768,6 +16768,64 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 beta_inf,
             );
 
+            // #1040 inner-conditioning probe. When the inner joint-Newton is
+            // grinding (residual stalled for several cycles, well above tol),
+            // dump the LIVE penalized-Hessian spectrum and the curvature seen
+            // by the projected residual's dominant direction. This is the
+            // measurement that distinguishes the survival marginal↔logslope
+            // weak-identifiability valley (residual mass sits on a near-null
+            // eigen-direction whose curvature is orders below the likelihood
+            // scale) from a genuine range-space defect, without relying on the
+            // post-loop budget-exhaustion report whose per-cycle Hessian source
+            // has already been dropped (it logs a NaN spectrum). Gated tightly
+            // so well-conditioned fits stay silent.
+            if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
+                && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
+                && residual.is_finite()
+                && residual > 4.0 * residual_tol
+                && let Ok(mut h_probe) = materialize_joint_hessian_source(
+                    &joint_hessian_source,
+                    total_p,
+                    "#1040 inner-conditioning probe",
+                )
+            {
+                let probe_ridge = if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                    ridge
+                } else {
+                    0.0
+                };
+                add_joint_penalty_to_matrix(&mut h_probe, &ranges, &s_lambdas, probe_ridge, None);
+                symmetrize_dense_in_place(&mut h_probe);
+                if let Ok((evals, evecs)) = FaerEigh::eigh(&h_probe, Side::Lower) {
+                    let max_abs = evals.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
+                    let min_abs = evals
+                        .iter()
+                        .map(|x: &f64| x.abs())
+                        .fold(f64::INFINITY, f64::min);
+                    // Rayleigh quotient of H_pen along the (normalized) projected
+                    // residual: the effective curvature the stall sits on.
+                    let r_norm = projected_residual_vec.dot(&projected_residual_vec).sqrt();
+                    let resid_curvature = if r_norm > 0.0 {
+                        let mut acc = 0.0_f64;
+                        for k in 0..evals.len() {
+                            let c = evecs.column(k).dot(&projected_residual_vec);
+                            acc += evals[k] * c * c;
+                        }
+                        acc / (r_norm * r_norm)
+                    } else {
+                        f64::NAN
+                    };
+                    log::info!(
+                        "[PIRLS/JN/#1040-cond] cycle={cycle} resid={residual:.3e} (tol={residual_tol:.3e}) \
+                         per_block_resid=[{block_resid_sig}] H_pen: lambda_max={max_abs:.3e} lambda_min_abs={min_abs:.3e} \
+                         cond={:.3e} resid_curvature(Rayleigh)={resid_curvature:.3e} resid_curv_over_lambda_max={:.3e} \
+                         trust_radius={joint_trust_radius:.3e}",
+                        if min_abs > 0.0 { max_abs / min_abs } else { f64::INFINITY },
+                        if max_abs > 0.0 { resid_curvature / max_abs } else { f64::NAN },
+                    );
+                }
+            }
+
             if verbose_cycle || near_convergence {
                 log::info!(
                     "[PIRLS/JN] cyc={:>3}/{} obj={:.6e} -loglik={:.6e} pen={:.3e} Δobj={:+.3e} |δ|∞={:.3e} accepted_|δ|∞={:.3e} resid={:.3e} (tol={:.3e}) obj_tol={:.3e} step_tol={:.3e} |β|∞={:.3e} attempts={} t={:.3}s",
