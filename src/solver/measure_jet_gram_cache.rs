@@ -1,7 +1,7 @@
 //! Sufficient-statistic caches for #1033 mechanism (a), the measure-jet
 //! fixed-design case.
 //!
-//! This module is for SIMPLE-mode measure jets where `dX/dpsi == 0`: the
+//! This module is for single-scale-mode measure jets where `dX/dpsi == 0`: the
 //! design matrix `X` is theta-invariant across the lambda/rho outer loop, while
 //! the penalty and, for GLM PIRLS, the scalar working-weight diagonal `W` may
 //! change. It is distinct from `GaussianFixedCache`, which covers only the

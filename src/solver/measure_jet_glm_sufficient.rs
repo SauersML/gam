@@ -1,7 +1,7 @@
 //! GLM fixed-design sufficient-statistic reuse for #1033 mechanism (a),
 //! extending the n-free lever from the Gaussian lane to non-Gaussian families.
 //!
-//! Scope: SIMPLE-mode measure jets where `dX/dpsi == 0`, i.e. the design matrix
+//! Scope: single-scale-mode measure jets where `dX/dpsi == 0`, i.e. the design matrix
 //! `X` is theta-invariant across the lambda/rho outer loop AND across the inner
 //! IRLS/PIRLS iterations. For non-Gaussian families the scalar working-weight
 //! diagonal `W` (and the working response `z`) genuinely change every IRLS step,

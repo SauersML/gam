@@ -3271,23 +3271,23 @@ fn measure_jet_term_spec(
 /// `spatial_term_uses_per_axis_psi` both defer here so the θ-layout
 /// sources cannot disagree.
 fn measure_jet_enrolls_psi(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
-    // ψ dials ride RICH mode only: the per-scale spectral split and the
+    // ψ dials ride multiscale mode only: the per-scale spectral split and the
     // (α, lnτ) dials are auto-enabled together, at the same center-count
-    // threshold the basis builder uses (single source: `measure_jet_rich_mode`).
-    // SIMPLE-mode terms (small center counts, or a pinned explicit order)
+    // threshold the basis builder uses (single source: `measure_jet_multiscale_mode`).
+    // single-scale-mode terms (small center counts, or a pinned explicit order)
     // stay at one fused penalty with fixed dials — Duchon/Matérn's outer
     // footprint — so they never inflate the family's O(n) per-row evaluation
     // count (#1039). The lnτ channel additionally needs a positive ridge.
-    mj.tau0 > 0.0 && measure_jet_term_enrolls_rich(mj)
+    mj.tau0 > 0.0 && measure_jet_term_enrolls_multiscale(mj)
 }
 
-/// Realized RICH-mode decision for a measure-jet spec, resolving the center
+/// Realized multiscale-mode decision for a measure-jet spec, resolving the center
 /// count from the (post-freeze) strategy. Single source for both ψ
 /// enrollment and the ψ-dimension so the θ-layout cannot drift from the
 /// builder's penalty count.
-fn measure_jet_term_enrolls_rich(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
+fn measure_jet_term_enrolls_multiscale(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
     crate::basis::center_strategy_num_centers(&mj.center_strategy)
-        .is_some_and(|m| crate::basis::measure_jet_rich_mode(mj, m))
+        .is_some_and(|m| crate::basis::measure_jet_multiscale_mode(mj, m))
 }
 
 /// Measure-jet ψ dial boxes. The dials are NOT log-kernel-scales, so the
@@ -3301,7 +3301,7 @@ const MEASURE_JET_PSI_LN_TAU_BOUNDS: (f64, f64) = (-18.420680743952367, 4.605170
 
 /// Is this measure-jet term in fused (pinned-order) mode? The `order_s`
 /// sentinel is the spectral/fused mode marker (see the basis module docs).
-/// Only consulted for terms that enroll ψ (RICH mode), where `order_s == 0`.
+/// Only consulted for terms that enroll ψ (multiscale mode), where `order_s == 0`.
 fn measure_jet_is_fused(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
     mj.order_s > 0.0
 }
