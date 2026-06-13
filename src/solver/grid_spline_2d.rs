@@ -120,7 +120,7 @@ fn bspline_d2(u: f64) -> [f64; 4] {
 }
 
 /// One uniform B-spline axis over `[lo, lo + cells·h]`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Axis {
     lo: f64,
     h: f64,
