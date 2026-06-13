@@ -669,5 +669,40 @@ mod tests {
         eprintln!(
             "[κ-collapse] geodesic ℓ: log|S~|_+ κ=-2 {gl_neg:.4} | κ=0 {gl_zero:.4} | κ=+2 {gl_pos:.4}"
         );
+
+        // CANDIDATE FIX: freeze the Frobenius normalization constant at κ=0 so
+        // the REML Occam term log|S_λ|_+ carries only the GENUINE roughness
+        // spectrum log|S_raw(κ)|_+ (minus a κ-independent constant), not the
+        // spurious −r·log‖S_raw(κ)‖_F leak. Compare:
+        //   (a) log|S_raw(κ)|_+        (un-normalized, true roughness Occam term)
+        //   (b) log|S_raw(κ)/c₀|_+     (frozen-c₀ normalization at κ=0)
+        // Both should be κ-IDENTIFYING (a real interior optimum), not monotone.
+        let logdet_raw = |kappa: f64, ell: f64, c0: f64| -> f64 {
+            let k =
+                constant_curvature_kernel_matrix(centers.view(), centers.view(), kappa, ell).unwrap();
+            let s_raw = symmetrize(&z.t().dot(&k).dot(&z));
+            let scaled = s_raw.mapv(|v| v / c0);
+            let (evals, _v) = FaerEigh::eigh(&scaled, faer::Side::Lower).unwrap();
+            let max = evals.iter().cloned().fold(0.0_f64, f64::max);
+            let tol = max * 1e-9;
+            evals.iter().filter(|&&e| e > tol).map(|&e| e.ln()).sum::<f64>()
+        };
+        // c₀ = ‖S_raw(κ=0)‖_F at frozen ℓ.
+        let k0 =
+            constant_curvature_kernel_matrix(centers.view(), centers.view(), 0.0, ell_frozen).unwrap();
+        let s_raw0 = symmetrize(&z.t().dot(&k0).dot(&z));
+        let c0 = s_raw0.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let r_neg = logdet_raw(-2.0, ell_frozen, c0);
+        let r_zero = logdet_raw(0.0, ell_frozen, c0);
+        let r_pos = logdet_raw(2.0, ell_frozen, c0);
+        eprintln!(
+            "[κ-collapse] frozen-c₀ log|S_raw/c₀|_+ (frozen ℓ): κ=-2 {r_neg:.4} | κ=0 {r_zero:.4} | κ=+2 {r_pos:.4}"
+        );
+        // Finer grid to see the shape of the un-normalized roughness Occam term.
+        eprint!("[κ-collapse] frozen-c₀ grid:");
+        for kk in [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0] {
+            eprint!(" κ={kk}:{:.4}", logdet_raw(kk, ell_frozen, c0));
+        }
+        eprintln!();
     }
 }
