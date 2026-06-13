@@ -199,7 +199,12 @@ impl GpuDispatchPolicy {
         let k = k as u128;
         let d = d as u128;
         // 2·d·k cross-block apply (forward + transpose) + d² per-row solve.
-        n.saturating_mul(2u128.saturating_mul(d).saturating_mul(k).saturating_add(d * d))
+        n.saturating_mul(
+            2u128
+                .saturating_mul(d)
+                .saturating_mul(k)
+                .saturating_add(d * d),
+        )
     }
 
     /// Work-based admission for offloading the **reduced-Schur PCG matvec**

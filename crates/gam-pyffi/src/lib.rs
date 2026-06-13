@@ -160,24 +160,22 @@ mod python_literal;
 mod sklearn_metadata;
 mod summary_render;
 mod survival_surface_io;
-use sklearn_metadata::sklearn_fit_metadata;
 use benchmark_scores::{
     benchmark_auc_score, benchmark_binary_logloss, benchmark_binary_logloss_eps,
     benchmark_exp_saturated, benchmark_gaussian_logloss, benchmark_nagelkerke_r2,
     benchmark_nagelkerke_r2_with_null_mean,
 };
-use python_literal::{python_float_display, python_string_repr};
 use competing_risks_decode::{
     competing_risks_columns, competing_risks_numeric_list, competing_risks_string_list,
     set_optional_competing_risks_matrix, set_optional_competing_risks_vector,
-};
-use summary_render::{
-    summary_html_escape, summary_render_coefficients_html, summary_render_value,
 };
 use manifold_pyclasses::{
     CircleManifold, EuclideanManifold, GrassmannManifold, ProductManifold, SpdManifold,
     SphereManifold, StiefelManifold, TorusManifold,
 };
+use python_literal::{python_float_display, python_string_repr};
+use sklearn_metadata::sklearn_fit_metadata;
+use summary_render::{summary_html_escape, summary_render_coefficients_html, summary_render_value};
 use survival_surface_io::{
     hazard_from_cumulative, interpolate_rows, interpolate_survival_surface, survival_block,
     survival_block_hazard, survival_chunk_iter_collect, survival_coerce_times,
@@ -25326,12 +25324,12 @@ fn predict_columns(
             // confidence band uses `se` alone; the observation band inflates by
             // σ². Identity link means no response-scale transform is needed.
             if options.observation_interval.unwrap_or(false) {
-                let obs_se: Vec<f64> =
-                    se.iter().map(|s| (s * s + fit.sigma2).max(0.0).sqrt()).collect();
-                let obs_lower: Vec<f64> =
-                    eta.iter().zip(&obs_se).map(|(m, s)| m - z * s).collect();
-                let obs_upper: Vec<f64> =
-                    eta.iter().zip(&obs_se).map(|(m, s)| m + z * s).collect();
+                let obs_se: Vec<f64> = se
+                    .iter()
+                    .map(|s| (s * s + fit.sigma2).max(0.0).sqrt())
+                    .collect();
+                let obs_lower: Vec<f64> = eta.iter().zip(&obs_se).map(|(m, s)| m - z * s).collect();
+                let obs_upper: Vec<f64> = eta.iter().zip(&obs_se).map(|(m, s)| m + z * s).collect();
                 columns.insert("observation_lower".to_string(), obs_lower);
                 columns.insert("observation_upper".to_string(), obs_upper);
             }

@@ -5161,11 +5161,7 @@ fn small_lu_factor(a: &Array2<f64>) -> Option<SmallLu> {
             }
         }
     }
-    Some(SmallLu {
-        lu,
-        piv,
-        perm_sign,
-    })
+    Some(SmallLu { lu, piv, perm_sign })
 }
 
 impl SmallLu {
@@ -5345,11 +5341,7 @@ impl CrossRowWoodbury {
     /// loudly rather than return a complex/`NaN` log-det.
     pub fn log_det(&self) -> Option<f64> {
         let (log_abs, sign) = self.log_det_correction();
-        if sign > 0.0 {
-            Some(log_abs)
-        } else {
-            None
-        }
+        if sign > 0.0 { Some(log_abs) } else { None }
     }
 
     /// `log det(I_R + D·M)`: the exact additive correction
@@ -8355,8 +8347,8 @@ fn schur_matvec<B: BatchedBlockSolver + Sync>(
     // sequential when already inside a rayon worker (the topology race fans
     // candidates with `run_topology_race_parallel`) to avoid nested-rayon
     // oversubscription — the same guard `HyperOperator::mul_mat` uses.
-    let parallel = sys.rows.len() >= SCHUR_MATVEC_PARALLEL_ROW_MIN
-        && rayon::current_thread_index().is_none();
+    let parallel =
+        sys.rows.len() >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
     if parallel {
         use rayon::prelude::*;
         const CHUNK: usize = 64;
@@ -11848,7 +11840,10 @@ mod tests {
         // (b) Equivalence with the sequential per-row fold within ULP-scale
         // reassociation error.
         let out_seq = schur_matvec_sequential_ref(&sys, &htt_factors, ridge_beta, &x, &backend);
-        let scale = out_seq.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+        let scale = out_seq
+            .iter()
+            .fold(0.0_f64, |m, &v| m.max(v.abs()))
+            .max(1.0);
         for a in 0..k {
             let rel = (out_a[a] - out_seq[a]).abs() / scale;
             assert!(

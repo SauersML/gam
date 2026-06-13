@@ -3522,7 +3522,8 @@ mod tests {
         theta: f64,
         curved_loglik_gain: f64,
     ) -> Vec<HybridAtomCandidate> {
-        let param_price = 0.5 * (p_curved as f64 - p_linear as f64) * (2.0 * std::f64::consts::PI).ln();
+        let param_price =
+            0.5 * (p_curved as f64 - p_linear as f64) * (2.0 * std::f64::consts::PI).ln();
         let curved_nle = linear_nle - curved_loglik_gain + param_price;
         vec![
             HybridAtomCandidate::linear(linear_nle, p_linear),
@@ -3682,10 +3683,7 @@ mod tests {
 
     #[test]
     fn hybrid_split_rejects_empty_slot() {
-        let slots = vec![
-            hybrid_slot(10.0, 2, 1, 5, 0.0, 0.0),
-            Vec::new(),
-        ];
+        let slots = vec![hybrid_slot(10.0, 2, 1, 5, 0.0, 0.0), Vec::new()];
         assert!(select_hybrid_split(&slots).is_err());
     }
 }

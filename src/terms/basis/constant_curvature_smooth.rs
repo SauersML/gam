@@ -66,9 +66,9 @@ use serde::{Deserialize, Serialize};
 use crate::geometry::constant_curvature::{ConstantCurvature, distance_kappa_jet};
 
 use super::{
-    BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeBundle, BasisPsiDerivativeResult,
-    BasisPsiSecondDerivativeResult, CenterStrategy, PenaltyCandidate, PenaltyInfo, PenaltySource,
-    filter_active_penalty_candidates_with_ops, normalize_penalty,
+    BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeBundle,
+    BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy, PenaltyCandidate,
+    PenaltyInfo, PenaltySource, filter_active_penalty_candidates_with_ops, normalize_penalty,
     normalize_penaltywith_psi_derivatives, select_centers_by_strategy,
     weighted_coefficient_sum_to_zero_transform,
 };
@@ -518,8 +518,12 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
     // Penalty κ-jets: S_raw = symm(zᵀ K(centers,centers) z). Rebuild the value
     // penalty (and its normalization constant) from the SAME path the value
     // builder used so the quotient-rule normalization derivatives are exact.
-    let (k_cc, dk_cc, dkk_cc) =
-        constant_curvature_kernel_kappa_jets(centers.view(), centers.view(), spec.kappa, length_scale)?;
+    let (k_cc, dk_cc, dkk_cc) = constant_curvature_kernel_kappa_jets(
+        centers.view(),
+        centers.view(),
+        spec.kappa,
+        length_scale,
+    )?;
     let s_raw = symmetrize(&z.t().dot(&k_cc).dot(&z));
     let s_raw_first = symmetrize(&z.t().dot(&dk_cc).dot(&z));
     let s_raw_second = symmetrize(&z.t().dot(&dkk_cc).dot(&z));

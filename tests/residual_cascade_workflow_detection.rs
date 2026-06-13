@@ -36,11 +36,7 @@ fn sample_2d(n: usize) -> gam::data::EncodedDataset {
             let b = ((i + 1) as f64 * sqrt2).fract();
             let t = (2.0 * std::f64::consts::PI * a).sin() * (2.0 * std::f64::consts::PI * b).sin();
             let noise = (((i + 3) as f64 * golden).fract() - 0.5) * 0.1;
-            StringRecord::from(vec![
-                a.to_string(),
-                b.to_string(),
-                (t + noise).to_string(),
-            ])
+            StringRecord::from(vec![a.to_string(), b.to_string(), (t + noise).to_string()])
         })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode dataset")
@@ -60,8 +56,8 @@ fn small_n_scattered_duchon_falls_through_to_dense() {
     // posterior — must NOT swap it. Falling through preserves the user's model.
     let data = sample_2d(800);
     let cfg = gaussian_config();
-    let routed = fit_residual_cascade_from_formula("y ~ duchon(x1, x2)", &data, &cfg)
-        .expect("materialize");
+    let routed =
+        fit_residual_cascade_from_formula("y ~ duchon(x1, x2)", &data, &cfg).expect("materialize");
     assert!(
         routed.is_none(),
         "a below-cliff scattered duchon must fall through to the dense path \
