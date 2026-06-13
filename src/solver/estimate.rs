@@ -3149,6 +3149,57 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .is_some_and(|t| t.contains_for_gradient(psi))
     }
 
+    /// Install the n-free per-ψ Gaussian sufficient statistics from the certified
+    /// ψ-Gram tensor (#1033b), when one is present and `theta`'s single ψ lies
+    /// inside the certified window. Idempotent in ψ — must be called on EVERY
+    /// trial (fast-path or slow-path) because the installed `GaussianFixedCache`
+    /// (and the conditioned-frame ψ-derivatives) are keyed to the current ψ, not
+    /// just to the design revision: on the design-revision fast path the design
+    /// did not change but ψ still moved, so the previous ψ's Gram would be stale.
+    ///
+    /// Off-window, multi-ψ, ineligible family, or shape mismatch all return
+    /// without installing — the streamed exact path runs unchanged.
+    fn install_psi_gram_statistics(&mut self, theta: &Array1<f64>, rho_dim: usize) {
+        let Some(tensor) = self.psi_gram_tensor.as_ref() else {
+            return;
+        };
+        if theta.len() != rho_dim + 1 {
+            return;
+        }
+        let psi = theta[rho_dim];
+        if !tensor.contains(psi) {
+            return;
+        }
+        // Clone the Arc handle so the immutable borrow of `self.psi_gram_tensor`
+        // is released before the `&mut self.reml_state` installs below.
+        let tensor = std::sync::Arc::clone(tensor);
+        if !self
+            .reml_state
+            .install_gaussian_fixed_cache(Arc::new(tensor.gaussian_fixed_cache_at(psi)))
+        {
+            return;
+        }
+        log::debug!(
+            "[psi-gram-tensor] installed n-free Gaussian sufficient statistics at psi={psi:.6}"
+        );
+        // Install the conditioned-frame exact ψ-derivatives so the Gaussian
+        // ψ-gradient HyperCoord is assembled from these k×k objects instead of
+        // the n×k ∂X/∂ψ slab — retiring the second per-trial n-pass. Only on the
+        // certified gradient SUB-window: near the ψ-window edges the Chebyshev
+        // derivative reconstruction (T_d′ ∼ d²) is not bit-tight, so those
+        // trials keep the exact slab gradient.
+        if tensor.contains_for_gradient(psi)
+            && self.reml_state.install_gaussian_psi_gram_deriv(Arc::new((
+                tensor.dgram_dpsi(psi),
+                tensor.drhs_dpsi(psi),
+            )))
+        {
+            log::debug!(
+                "[psi-gram-tensor] installed n-free ψ-gradient derivatives at psi={psi:.6}"
+            );
+        }
+    }
+
     fn prepare_eval_state(
         &mut self,
         x: &DesignMatrix,
@@ -3196,6 +3247,13 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             self.reml_state
                 .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
             self.reml_state.setwarm_start_original_beta(warm_start_beta);
+            // #1033b: the design did not change (fast path) but ψ moved, so the
+            // GaussianFixedCache and conditioned ψ-derivatives are keyed to the
+            // PREVIOUS ψ and must be re-installed for this trial's ψ from the
+            // certified tensor — otherwise the inner PLS reads a stale Gram. The
+            // slow path below clears + reinstalls these; the fast path skips
+            // `reset_surface` (which clears them), so we re-install here directly.
+            self.install_psi_gram_statistics(theta, rho_dim);
             return Ok(hyper_dirs);
         }
 
@@ -3243,43 +3301,9 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // #1033b: single design-moving ψ with a certified tensor — install the
         // n-free assembled Gaussian sufficient statistics so the inner PLS and
         // the sparse scatter skip the per-trial O(n·p²) Gram re-stream
-        // (`reset_surface` above just cleared the slot for the new design).
-        // Off-window, multi-ψ, ineligible family, or shape mismatch all fall
-        // through to the streamed builder unchanged.
-        if let Some(tensor) = self.psi_gram_tensor.as_ref()
-            && theta.len() == rho_dim + 1
-        {
-            let psi = theta[rho_dim];
-            if tensor.contains(psi)
-                && self
-                    .reml_state
-                    .install_gaussian_fixed_cache(Arc::new(tensor.gaussian_fixed_cache_at(psi)))
-            {
-                log::debug!(
-                    "[psi-gram-tensor] installed n-free Gaussian sufficient statistics at psi={psi:.6}"
-                );
-                // #1033b: install the conditioned-frame exact ψ-derivatives so
-                // the Gaussian ψ-gradient HyperCoord is assembled from these
-                // k×k objects instead of the n×k ∂X/∂ψ slab — retiring the
-                // second per-trial n-pass. Same conditioned column frame as the
-                // installed Gram; the hyper-coord builder applies the per-eval
-                // Qs/free-basis transform. Failure here just keeps the slab
-                // gradient path (still correct, only slower). Only install on
-                // the certified gradient SUB-window: near the ψ-window edges the
-                // Chebyshev derivative reconstruction (T_d′ ∼ d²) is not
-                // bit-tight, so those trials keep the exact slab gradient.
-                if tensor.contains_for_gradient(psi)
-                    && self.reml_state.install_gaussian_psi_gram_deriv(Arc::new((
-                        tensor.dgram_dpsi(psi),
-                        tensor.drhs_dpsi(psi),
-                    )))
-                {
-                    log::debug!(
-                        "[psi-gram-tensor] installed n-free ψ-gradient derivatives at psi={psi:.6}"
-                    );
-                }
-            }
-        }
+        // (`reset_surface` above just cleared the slot for the new design). Same
+        // installer the fast path uses, so both branches key the Gram to ψ.
+        self.install_psi_gram_statistics(theta, rho_dim);
         Ok(hyper_dirs)
     }
 
