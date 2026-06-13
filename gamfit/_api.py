@@ -904,7 +904,13 @@ def fit(
         turning the fit into a location-scale GAMLSS where both the mean and
         the residual spread vary smoothly with the covariates (e.g.
         ``"s(x)"``). Passing this is the request to estimate a non-constant
-        scale. Corresponds to the ``--predict-noise`` CLI path
+        scale. The family is magic-routed from ``family``: with the default
+        ``"gaussian"`` it models ``log σ``; with ``"binomial"`` it models the
+        latent-threshold scale; and with the genuine-dispersion mean families
+        ``"gamma"``, ``"beta"``, ``"nb"`` (negative-binomial) or ``"tweedie"``
+        the noise formula models that family's own overdispersion channel
+        (Gamma shape, Beta φ, NB θ, Tweedie 1/φ), giving a full dispersion
+        GAMLSS (#913). Corresponds to the ``--predict-noise`` CLI path
         (``FitConfig.noise_formula``).
     noise_offset:
         Name of a column supplying a fixed additive offset on the log-scale

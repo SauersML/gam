@@ -333,6 +333,36 @@ class Model:
             raise map_exception(exc) from exc
         return SchemaCheck.from_dict(payload)
 
+    def curvature(self, data: Any, *, level: float = 0.95) -> list[dict[str, Any]]:
+        """Curvature-as-an-estimand report for every ``curv(...)`` smooth (#944).
+
+        For each constant-curvature (``curv(...)``) smooth in the model this
+        returns the fitted signed sectional curvature ``kappa_hat``, its
+        profile-likelihood confidence interval ``(ci_lo, ci_hi)``, the geometry
+        ``verdict`` from the CI sign (``"spherical"`` / ``"hyperbolic"`` /
+        ``"flat"`` / ``"indistinguishable"``), and the interior :math:`\\kappa=0`
+        likelihood-ratio flatness test (``flatness_lr_stat``,
+        ``flatness_p_value`` — full :math:`\\chi^2_1`, since :math:`\\kappa=0`
+        is an interior point of the :math:`S^d \\leftarrow \\mathbb{R}^d \\to H^d`
+        family). This turns "we chose hyperbolic space" into
+        ":math:`\\hat\\kappa = -1.8` (95% CI ...), flat rejected at p = ...".
+
+        ``kappa_hat`` alone is also surfaced in :meth:`summary` with no refit;
+        the CI and flatness test re-profile the criterion over :math:`\\kappa`,
+        which is why they require the training ``data``.
+
+        Returns an empty list when the model has no ``curv(...)`` smooth.
+        """
+        headers, rows, _ = normalize_table(data)
+        try:
+            raw = rust_module().curvature_inference_json(
+                self._model_bytes, headers, rows, level
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        payload = json.loads(raw)
+        return list(payload.get("curvature_terms", []))
+
     def report(self, path: str | Path | None = None) -> str:
         """Generate a standalone HTML report of the fitted model."""
         try:

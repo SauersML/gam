@@ -487,6 +487,20 @@ pub struct FittedModelPayload {
     pub resolved_termspec_logslopes: Option<Vec<TermCollectionSpec>>,
     #[serde(default)]
     pub adaptive_regularization_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
+    /// Precomputed exact Gaussian-identity jackknife+ statistics (#942).
+    ///
+    /// Populated *only* for a standard Gaussian-identity model fit with unit
+    /// prior weights, where the closed-form Sherman–Morrison leave-one-out
+    /// substrate gives a distribution-free finite-sample (≥ level) prediction
+    /// interval with no held-out fold. When `Some`, `predict(interval=level)`
+    /// auto-routes through it (the MAGIC default); when `None` — any other
+    /// family/link, reweighted rows, or an older payload — predict falls back
+    /// to the model-based posterior band and labels the provenance honestly.
+    /// `#[serde(default)]` so pre-existing models deserialize as: no jackknife+
+    /// substrate available.
+    #[serde(default)]
+    pub gaussian_jackknife_plus:
+        Option<crate::inference::full_conformal::GaussianJackknifePlusStats>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -718,6 +732,7 @@ impl FittedModelPayload {
             resolved_termspec_logslope: None,
             resolved_termspec_logslopes: None,
             adaptive_regularization_diagnostics: None,
+            gaussian_jackknife_plus: None,
         }
     }
 
