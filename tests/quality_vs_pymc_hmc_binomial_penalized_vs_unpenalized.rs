@@ -694,7 +694,7 @@ with pm.Model() as model:
     pm.Potential("rough", -0.5 * pm.math.dot(beta, pm.math.dot(S, beta)))
     pm.Bernoulli("obs", logit_p=eta, observed=ytr)
     idata = pm.sample(
-        draws=1500, tune=1000, chains=4, cores=1,
+        draws=400, tune=500, chains=2, cores=1,
         target_accept=0.9, random_seed=20260529,
         progressbar=False, compute_convergence_checks=False,
     )
