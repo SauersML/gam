@@ -10361,3 +10361,200 @@ fn murphy_topel_test_calibration_basis2() -> LatentZConditionalCalibration {
         var_cov: ndarray::array![[0.03, 0.0], [0.0, 0.015]],
     }
 }
+
+/// Deterministic splitmix64 → standard-normal sampler for the Monte-Carlo
+/// oracle below (self-contained so the test carries no RNG dev-dependency and
+/// is bit-reproducible across machines).
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in (0, 1).
+    fn next_unit(&mut self) -> f64 {
+        // 53-bit mantissa, shifted off exact 0.
+        ((self.next_u64() >> 11) as f64 + 0.5) * (1.0 / 9_007_199_254_740_992.0)
+    }
+
+    /// Standard normal via Box–Muller (one draw per call).
+    fn next_normal(&mut self) -> f64 {
+        let u1 = self.next_unit();
+        let u2 = self.next_unit();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+}
+
+/// #1028 acceptance — full two-stage SAMPLING oracle for the Murphy–Topel
+/// generated-regressor SE correction.
+///
+/// The unit oracles above pin each algebraic piece (the mixed-z jet, the `Jᵀ`
+/// contraction, the `G` accumulation, the PSD congruence). What was still
+/// missing — and what the issue explicitly demands — is a check that the
+/// assembled term `(Vb·G)·V₁·(Vb·G)ᵀ` equals the ACTUAL first-stage
+/// uncertainty propagated through a real two-stage refit, and that the
+/// corrected SE differs from (strictly exceeds) the naive single-stage SE.
+///
+/// Construction (the canonical generated-regressor design, Pagan 1984):
+///   Stage 1 (estimated): the conditional location calibration
+///     `ζ_i = (z_i − m̂(C_i))/√v̂(C_i)` with `m̂`,`v̂` fit by the PRODUCTION
+///     stage-1 `fit_conditional_latent_calibration_if_needed` (so V₁ and
+///     `∂ζ/∂θ₁` are exactly the quantities the correction consumes).
+///   Stage 2 (estimated): a Gaussian linear slope on the generated regressor,
+///     `y_i = β·ζ_i + ε_i`, `ε ~ N(0,σ²)`. Its score is
+///     `score_β,i = (y_i − β ζ_i)·ζ_i/σ²`, so `∂score_β,i/∂ζ_i =
+///     (y_i − 2β ζ_i)/σ²`, the naive information is `H_β = Σ ζ_i²/σ²`, and
+///     `Vb = H_β⁻¹`. `G = Σ_i (∂score_β,i/∂ζ_i)·J_zeta[i,:]`.
+///
+/// Over many independent datasets resampled from the SAME true DGP (a real
+/// conditional shift `E[z|C]=γ·C`, so the gate fires), the empirical sampling
+/// variance of β̂ is the ground truth. The Murphy–Topel prediction
+/// `Vb + Vb·G·V₁·Gᵀ·Vb` must match it, and must strictly exceed the naive `Vb`
+/// (which under-covers because it ignores stage-1 uncertainty in ζ).
+#[test]
+fn murphy_topel_correction_matches_two_stage_sampling_variance() {
+    let n = 300usize;
+    let reps = 4000usize;
+    let gamma = 0.9_f64; // true conditional-mean slope E[z|C] = γ·C
+    let beta_true = 0.7_f64; // true stage-2 slope
+    let sigma = 0.5_f64; // stage-2 residual sd (known)
+    let z_noise_sd = 0.6_f64; // idiosyncratic part of z (decorrelated from C)
+
+    // Fixed conditioning covariate C (the "PC"): a centered grid, reused across
+    // replicates so stage-1's design — and hence basis_ncols / the column
+    // convention the seam relies on — is identical every draw.
+    let c = Array1::from_iter((0..n).map(|i| (i as f64) / (n as f64 - 1.0) * 2.0 - 1.0));
+    let a_block = c.clone().insert_axis(ndarray::Axis(1));
+
+    let mut rng = SplitMix64::new(0x1028_BEEF_C0DE_2026);
+    let mut beta_hats: Vec<f64> = Vec::with_capacity(reps);
+    // Accumulate the Murphy–Topel predicted variance across replicates and
+    // average it (it is itself a function of the random ζ̂, V̂₁); the analytic
+    // prediction we compare against is its mean over the sampling distribution.
+    let mut mt_var_acc = 0.0_f64;
+    let mut naive_var_acc = 0.0_f64;
+    let mut mt_ge_naive_count = 0usize;
+
+    for _ in 0..reps {
+        // --- draw z with a genuine conditional mean shift on C ---
+        let z = Array1::from_iter(
+            (0..n).map(|i| gamma * c[i] + z_noise_sd * rng.next_normal()),
+        );
+        let weights = Array1::ones(n);
+
+        // --- STAGE 1: production conditional location calibration (the gate) ---
+        let cal = fit_conditional_latent_calibration_if_needed(&z, &weights, a_block.view())
+            .expect("stage-1 gate must not error")
+            .expect("stage-1 conditional gate must fire on the conditional shift");
+        let zeta = cal
+            .apply(z.view(), a_block.view())
+            .expect("stage-1 calibration applies");
+
+        // --- STAGE 2: Gaussian slope on the generated regressor ζ ---
+        // y = β·ζ + ε, ε ~ N(0,σ²).
+        let y = Array1::from_iter(
+            (0..n).map(|i| beta_true * zeta[i] + sigma * rng.next_normal()),
+        );
+        let s_zz: f64 = zeta.iter().map(|&z| z * z).sum();
+        let s_zy: f64 = zeta.iter().zip(y.iter()).map(|(&z, &yy)| z * yy).sum();
+        let beta_hat = s_zy / s_zz;
+        beta_hats.push(beta_hat);
+
+        // Naive (single-stage) covariance Vb = σ²/Σζ² (1×1).
+        let vb_scalar = sigma * sigma / s_zz;
+        naive_var_acc += vb_scalar;
+
+        // --- Murphy–Topel prediction for THIS replicate ---
+        // G = Σ_i (∂score_β,i/∂ζ_i)·J_zeta[i,:],
+        //   ∂score_β,i/∂ζ_i = (y_i − 2β̂ ζ_i)/σ².
+        let dim_theta1 = cal.theta1_dim();
+        let mut g = Array1::<f64>::zeros(dim_theta1);
+        for i in 0..n {
+            let dscore_dzeta = (y[i] - 2.0 * beta_hat * zeta[i]) / (sigma * sigma);
+            let jz = cal.zeta_theta1_jacobian_row(z[i], a_block.row(i));
+            for k in 0..dim_theta1 {
+                g[k] += dscore_dzeta * jz[k];
+            }
+        }
+        let v1 = cal.theta1_covariance();
+        // Vb·G is the 1×dim_theta1 row vbg = vb_scalar · Gᵀ.
+        let vbg = g.mapv(|gk| vb_scalar * gk);
+        // correction = (Vb·G)·V₁·(Vb·G)ᵀ (scalar).
+        let correction: f64 = vbg.dot(&v1.dot(&vbg));
+        assert!(
+            correction >= -1e-12,
+            "per-replicate Murphy–Topel correction must be PSD (≥0); got {correction:.3e}"
+        );
+        let mt_var = vb_scalar + correction;
+        mt_var_acc += mt_var;
+        if mt_var >= vb_scalar {
+            mt_ge_naive_count += 1;
+        }
+    }
+
+    let mt_var_pred = mt_var_acc / reps as f64;
+    let naive_var_pred = naive_var_acc / reps as f64;
+
+    // Empirical sampling variance of β̂ (the ground truth).
+    let beta_mean: f64 = beta_hats.iter().sum::<f64>() / reps as f64;
+    let emp_var: f64 = beta_hats
+        .iter()
+        .map(|&b| (b - beta_mean) * (b - beta_mean))
+        .sum::<f64>()
+        / (reps as f64 - 1.0);
+
+    // The estimator must be (approximately) unbiased for β_true.
+    assert!(
+        (beta_mean - beta_true).abs() < 0.02,
+        "stage-2 slope estimate biased: mean β̂={beta_mean:.4}, true={beta_true}"
+    );
+
+    // The correction must be POSITIVE on every replicate (the gate fires
+    // everywhere; stage-1 carries real uncertainty into ζ).
+    assert_eq!(
+        mt_ge_naive_count, reps,
+        "Murphy–Topel variance must be ≥ naive on every replicate (PSD correction)"
+    );
+
+    // (1) The corrected SE must DIFFER from the naive SE — the naive single-stage
+    //     variance materially under-states the truth.
+    let naive_se = naive_var_pred.sqrt();
+    let mt_se = mt_var_pred.sqrt();
+    let emp_se = emp_var.sqrt();
+    assert!(
+        mt_se > naive_se * 1.05,
+        "Murphy–Topel SE must be meaningfully larger than the naive SE: \
+         mt_se={mt_se:.5} naive_se={naive_se:.5}"
+    );
+
+    // (2) The naive variance UNDER-covers the empirical truth (the failure the
+    //     correction exists to fix): empirical variance materially exceeds Vb.
+    assert!(
+        emp_var > naive_var_pred * 1.10,
+        "empirical Var(β̂) must exceed the naive single-stage Vb (generated-regressor \
+         uncertainty is real): emp_var={emp_var:.6e} naive={naive_var_pred:.6e}"
+    );
+
+    // (3) The Murphy–Topel prediction MATCHES the empirical sampling variance to
+    //     Monte-Carlo tolerance — the core acceptance criterion. Compare on the
+    //     SE scale with a relative band (≈8%: 4000 reps gives a few-percent MC
+    //     error on a variance, and the first-order Murphy–Topel expansion itself
+    //     carries O(1/n) slack).
+    let rel_err = (mt_se - emp_se).abs() / emp_se;
+    assert!(
+        rel_err < 0.08,
+        "Murphy–Topel-corrected SE must match the two-stage sampling SE: \
+         mt_se={mt_se:.6} emp_se={emp_se:.6} (naive_se={naive_se:.6}, rel_err={rel_err:.4})"
+    );
+}
