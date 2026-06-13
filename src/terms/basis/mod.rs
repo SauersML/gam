@@ -23309,8 +23309,7 @@ pub fn build_duchon_basiswithworkspace(
     // FIXED, geometry-derived basis parameter (never a REML hyper-axis), so the
     // all-zero auto-seed sentinel is the intended seeding mechanism here — unlike
     // the Matérn forward path, whose η is optimized and must be honored literally.
-    let aniso =
-        auto_seed_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
+    let aniso = auto_seed_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
     // The native reproducing-norm Gram penalty (`Primary`) is assembled from
     // kernel VALUES at the center pairs (K_CC), not from collocated D1/D2
     // derivative operators, so the build only requires the pointwise kernel to
