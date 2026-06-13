@@ -53,11 +53,13 @@ pub const PSI_GRAM_CERT_RTOL: f64 = 1.0e-12;
 pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
 
 /// Relative agreement required of the analytic ψ-DERIVATIVE `dgram_dpsi`
-/// against a central finite difference of the exactly rebuilt Gram, used to
-/// certify the interior gradient sub-window. Set an order tighter than the
-/// downstream outer-gradient comparison (1e-7 absolute) so the propagated
-/// derivative-reconstruction error stays bit-tight in the gradient lane.
-pub const PSI_GRAM_GRAD_SPOT_RTOL: f64 = 1.0e-9;
+/// against a high-order finite difference of the exactly rebuilt Gram, used to
+/// certify the interior gradient sub-window. The downstream outer REML gradient
+/// contracts `∂G/∂ψ` through `H⁻¹` and `β̂`, amplifying the absolute derivative
+/// error by `‖∂G/∂ψ‖·‖H⁻¹‖`; this rtol is set deep enough (≈4 orders below the
+/// 1e-7 outer-gradient bar, relative to the Gram-derivative scale) that even
+/// the amplified error stays bit-tight in the gradient lane.
+pub const PSI_GRAM_GRAD_SPOT_RTOL: f64 = 1.0e-11;
 
 /// Number of equispaced scan points (per side) used to locate the interior
 /// gradient sub-window where `dgram_dpsi` certifies.
@@ -350,9 +352,12 @@ impl PsiGramTensor {
         weights: ArrayView1<'_, f64>,
     ) {
         let span = self.psi_hi - self.psi_lo;
-        // Central-FD step for the exact-derivative reference: small relative to
-        // the window but comfortably above f64 cancellation at the Gram scale.
-        let h = (span * 1e-4).max(1e-7);
+        // 4th-order central stencil for the exact-derivative reference
+        //   G'(ψ) ≈ [G(ψ−2h) − 8G(ψ−h) + 8G(ψ+h) − G(ψ+2h)] / (12h)
+        // so the reference truncation is O(h⁴) — far below the tight rtol at a
+        // moderate step, letting the certificate measure the reconstruction
+        // error rather than the reference's own FD error.
+        let h = (span * 1e-3).max(1e-6);
         let exact_dgram = |psi: f64,
                            eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
          -> Option<Array2<f64>> {
@@ -366,17 +371,19 @@ impl PsiGramTensor {
                 }
                 Some(design.t().dot(&wd))
             };
-            let g_plus = weighted_gram(psi + h, eval)?;
-            let g_minus = weighted_gram(psi - h, eval)?;
-            Some((g_plus - g_minus) / (2.0 * h))
+            let g_m2 = weighted_gram(psi - 2.0 * h, eval)?;
+            let g_m1 = weighted_gram(psi - h, eval)?;
+            let g_p1 = weighted_gram(psi + h, eval)?;
+            let g_p2 = weighted_gram(psi + 2.0 * h, eval)?;
+            Some((g_m2 - 8.0 * &g_m1 + 8.0 * &g_p1 - g_p2) / (12.0 * h))
         };
         // True when the analytic derivative matches the exact FD at `psi`.
         let certifies = |me: &Self,
                              psi: f64,
                              eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
          -> bool {
-            // Keep the FD stencil strictly inside the value window.
-            if psi - h <= me.psi_lo || psi + h >= me.psi_hi {
+            // Keep the 4th-order FD stencil (ψ ± 2h) strictly inside the window.
+            if psi - 2.0 * h <= me.psi_lo || psi + 2.0 * h >= me.psi_hi {
                 return false;
             }
             let Some(exact) = exact_dgram(psi, eval) else {
