@@ -17940,6 +17940,11 @@ fn run_exact_joint_spatial_optimization(
         // Psi-axis BFGS cap: kappa / aniso-log-scale needs ~ln 2 per iter.
         Some(kappa_options.log_step.clamp(0.25, 1.0)),
         None,
+        // Calibrate the outer to the n-scaled profiled REML/LAML objective for
+        // every family — the iso-κ non-convergence cure (#1053 1-D Matérn,
+        // #1066 2-D binomial geo, #1069 GP/kriging). p = baseline design column
+        // count.
+        Some((data.nrows(), baseline_design.design.ncols())),
     );
 
     let eval_outer = |ctx: &mut &mut SpatialJointContext<'_>,
@@ -20042,6 +20047,27 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     bfgs_step_cap: Option<f64>,
     bfgs_step_cap_psi: Option<f64>,
     screening_cap: Option<Arc<AtomicUsize>>,
+    // `Some((n_obs, p_cols))` calibrates the outer solver to the n-scaled
+    // profiled REML/LAML criterion exactly as the primary REML outer
+    // (`solver/estimate.rs`) does. The profiled criterion is a sum over the n
+    // observations, so its magnitude is O(n) (|f| ~ thousands at n ~ 10³) for
+    // EVERY family — Gaussian, binomial, GP/kriging alike. A scale-blind outer
+    // takes the bare `tolerance` (≈1e-6) as the *absolute* projected-gradient
+    // floor, which is hopelessly tight against an n-scaled gradient: in-basin
+    // iterates (e.g. ‖g‖≈7e-2 at |f|≈17, or single-digit ‖g‖ at |f|≈1.3e3)
+    // never clear it and the fit bails at the iteration cap. Worse, ARC's
+    // trust-region reduction ratios and default initial regularization are
+    // referenced against the wrong curvature magnitude, so the first step can
+    // overshoot and diverge (the ‖g‖≈½|f| blow-ups in #1053/#1066). Threading
+    // the scale (→ absolute floor = max(tol, n·1e-9)) plus a warm ARC
+    // regularization (σ₀ = 0.25) and operator trust radius (4.0) makes the
+    // spatial exact-joint outer converge as robustly as the primary REML outer
+    // across 1-D Matérn (#1053), 2-D binomial geo (#1066), and GP/kriging
+    // (#1069). This is NOT a loosening of the `τ·(1+|f|)` REML acceptance gate
+    // — that relative-to-cost criterion is unchanged; only the nonsensical
+    // scale-free *absolute* floor and the solver's curvature reference are
+    // corrected. `None` preserves the prior scale-free calibration.
+    profiled_objective_size: Option<(usize, usize)>,
 ) -> crate::solver::outer_strategy::OuterProblem {
     let mut seed_heuristic = theta0.to_vec();
     for value in &mut seed_heuristic[..rho_dim] {
@@ -20078,6 +20104,20 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         })
         .with_rho_bound(12.0)
         .with_heuristic_lambdas(seed_heuristic);
+    if let Some((n_obs, p_cols)) = profiled_objective_size {
+        // Calibrate to the n-scaled profiled criterion (see the param doc):
+        // n-aware objective scale → sane absolute gradient floor + correct ARC
+        // reduction-ratio reference, plus a warm ARC regularization / operator
+        // trust radius that prevents the first-step overshoot. These are the
+        // knobs the spatial exact-joint path was missing relative to the
+        // primary REML outer; without them the iso-κ length-scale fit stalls or
+        // diverges as |f| grows with n (#1053 / #1066 / #1069).
+        problem = problem
+            .with_objective_scale(Some(n_obs as f64))
+            .with_problem_size(n_obs, p_cols)
+            .with_arc_initial_regularization(Some(0.25))
+            .with_operator_initial_trust_radius(Some(4.0));
+    }
     if let Some(screening_cap) = screening_cap {
         problem = problem
             .with_screening_cap(screening_cap)
@@ -20406,6 +20446,15 @@ where
         DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
     };
 
+    // Joint design width across blocks → the `p` reported to the outer solver's
+    // operator-vs-dense Hessian crossover. `n_total` is the load-bearing
+    // profiled-objective scale (see `exact_joint_multistart_outer_problem`).
+    let joint_p_cols: usize = boot_designs
+        .iter()
+        .map(|d| d.design.ncols())
+        .sum::<usize>()
+        .max(1);
+
     let problem = exact_joint_multistart_outer_problem(
         &theta0,
         &lower,
@@ -20433,6 +20482,9 @@ where
         // Psi-axis cap: kappa scale needs ~ln 2 per iter.
         Some(kappa_options.log_step.clamp(0.25, 1.0)),
         screening_cap.clone(),
+        // n-scaled profiled-criterion calibration for every family (#1053 /
+        // #1066 / #1069 iso-κ non-convergence cure).
+        Some((n_total, joint_p_cols)),
     );
 
     // Helper: collect specs and designs from cache into owned Vecs for closure calls.
@@ -21182,6 +21234,9 @@ fn try_exact_joint_latent_coord_optimization(
         Some(5.0),
         Some(0.5),
         None,
+        // n-scaled profiled-criterion calibration (same absolute-gradient-floor
+        // correction as the spatial paths; #1053 / #1066 / #1069).
+        Some((data.nrows(), best.design.design.ncols().max(1))),
     );
 
     let eval_outer = |ctx: &mut &mut LatentJointContext<'_>,
