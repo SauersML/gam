@@ -12215,6 +12215,60 @@ mod tests {
         }
     }
 
+    /// The dense `H_ββ` penalty-prologue GEMV parallelized over output rows at
+    /// the wide SAE border (`k ≥ SCHUR_PROLOGUE_PARALLEL_K_MIN`, #1017) must be
+    /// **bit-identical** to the serial prologue — unlike the per-row reduction,
+    /// the GEMV carries no reassociation: each `y[a] = Σ_b hbb[a,b]·x[b] + ridge·x[a]`
+    /// is computed in its entirety by one thread in the same `b` order whether
+    /// one core or many run, so distributing the `a`-rows across threads cannot
+    /// move a single bit. This pins the determinism/parity gate exactly at the
+    /// border width where the prologue stops being serial.
+    #[test]
+    fn parallel_penalty_prologue_bit_identical_to_serial() {
+        let k = 576usize; // ≥ SCHUR_PROLOGUE_PARALLEL_K_MIN: trips the parallel GEMV
+        assert!(
+            k >= SCHUR_PROLOGUE_PARALLEL_K_MIN,
+            "test border must exceed the prologue parallel threshold"
+        );
+        let d = 4usize;
+        // A handful of rows: small enough that the per-row loop stays sequential
+        // (rows < SCHUR_MATVEC_PARALLEL_ROW_MIN), isolating the prologue as the
+        // only parallelized stage so the bit-parity claim is about it alone.
+        let n = 8usize;
+        assert!(n < SCHUR_MATVEC_PARALLEL_ROW_MIN);
+        let sys = dense_arrow_system(n, d, k);
+        let ridge = 7.5e-3;
+        let x = Array1::from_iter((0..k).map(|a| 0.4 * (a as f64 * 0.31).cos() - 0.17));
+        let xs = x.as_slice().unwrap();
+
+        // Serial reference: penalty_matvec_add + ridge axpy into a zeroed buffer.
+        let mut serial = vec![0.0_f64; k];
+        sys.penalty_matvec_add(xs, &mut serial);
+        for a in 0..k {
+            serial[a] += ridge * xs[a];
+        }
+
+        // Parallel prologue (parallel=true engages the rayon dense GEMV at this k).
+        let mut par = vec![0.0_f64; k];
+        sys.penalty_ridge_prologue_into(xs, ridge, &mut par, true);
+        // And the serial branch of the same fn (parallel=false) for completeness.
+        let mut ser_branch = vec![0.0_f64; k];
+        sys.penalty_ridge_prologue_into(xs, ridge, &mut ser_branch, false);
+
+        for a in 0..k {
+            assert_eq!(
+                par[a].to_bits(),
+                serial[a].to_bits(),
+                "parallel penalty prologue must be bit-identical to serial at index {a}"
+            );
+            assert_eq!(
+                ser_branch[a].to_bits(),
+                serial[a].to_bits(),
+                "serial prologue branch must match the reference at index {a}"
+            );
+        }
+    }
+
     /// Wall-clock benchmark of the reduced-Schur matvec at an SAE-LLM-flavoured
     /// shape (#1017): sequential per-row fold vs the rayon-parallel chunked path.
     /// Runs as an ordinary test (the ban gate forbids `#[ignore]`), so the shape
