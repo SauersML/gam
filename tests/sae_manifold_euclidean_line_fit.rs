@@ -218,31 +218,55 @@ fn sae_manifold_euclidean_line_inner_solve_iterations_are_cheap() {
     let (z, s_true) = planted_line();
     let mut term = build_cold_term(&s_true, &z);
     let mut rho = dimensionless_entry_rho(&term, &z);
-    for n_iter in [1usize, 1, 1, 1, 1] {
+    // Convergence-horizon trace: how the inner loss settles with budget.
+    for budget in [20usize, 20, 20, 40, 100] {
         let t0 = std::time::Instant::now();
-        let outcome = term.run_joint_fit_arrow_schur(
-            z.view(),
-            &mut rho,
-            None,
-            n_iter,
-            LEARNING_RATE,
-            RIDGE_EXT_COORD,
-            RIDGE_BETA,
-        );
+        let loss = term
+            .run_joint_fit_arrow_schur(
+                z.view(),
+                &mut rho,
+                None,
+                budget,
+                LEARNING_RATE,
+                RIDGE_EXT_COORD,
+                RIDGE_BETA,
+            )
+            .expect("inner solve must not error on the line");
         let dt = t0.elapsed().as_secs_f64();
-        match &outcome {
-            Ok(loss) => println!(
-                "[#1051-probe] inner {n_iter}it OK total={:.6e} dt={dt:.3}s",
-                loss.total()
-            ),
-            Err(e) => println!("[#1051-probe] inner {n_iter}it ERR dt={dt:.3}s: {e}"),
-        }
-        let loss = outcome.expect("inner solve must not error on the line");
-        assert!(loss.total().is_finite(), "inner loss non-finite");
-        assert!(
-            dt < 10.0,
-            "one inner Newton iteration took {dt:.3}s (> 10s) — the inner solve grinds \
-             the rank-deficient β block per iteration"
+        println!(
+            "[#1051-probe] inner +{budget}it total={:.8e} dt={dt:.3}s",
+            loss.total()
         );
+        assert!(loss.total().is_finite(), "inner loss non-finite");
     }
+
+    // The real gate: a full reml_criterion (the inner solve PLUS the
+    // undamped-evidence refine loop the continuation calls per ρ) must return a
+    // finite, rankable criterion quickly — not grind to the 1e12 sentinel.
+    let mut term2 = build_cold_term(&s_true, &z);
+    let rho2 = dimensionless_entry_rho(&term2, &z);
+    let t0 = std::time::Instant::now();
+    let outcome = term2.reml_criterion(
+        z.view(),
+        &rho2,
+        None,
+        INNER_MAX_ITER,
+        LEARNING_RATE,
+        RIDGE_EXT_COORD,
+        RIDGE_BETA,
+    );
+    let dt = t0.elapsed().as_secs_f64();
+    match &outcome {
+        Ok((v, _)) => println!("[#1051-probe] reml_criterion OK value={v:.6e} dt={dt:.2}s"),
+        Err(e) => println!("[#1051-probe] reml_criterion ERR dt={dt:.2}s: {e}"),
+    }
+    let (value, _) = outcome.expect("reml_criterion must succeed on the line");
+    assert!(
+        value.is_finite() && value < 1.0e11,
+        "reml_criterion returned the infeasible sentinel value={value:.6e}"
+    );
+    assert!(
+        dt < 30.0,
+        "reml_criterion took {dt:.2}s (> 30s) — the inner solve grinds the rank-deficient block"
+    );
 }
