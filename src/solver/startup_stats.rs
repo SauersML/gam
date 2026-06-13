@@ -195,6 +195,19 @@ fn variant_tag(failure: &InnerFailure) -> FailureVariantTag {
     }
 }
 
+/// Signed order-of-magnitude bucket of the dominant diagnostic numeric:
+/// `sign` is the value's sign (`-1`/`0`/`+1`) and `order` is
+/// `floor(log10(|value|))`. Kept as two independent fields rather than a
+/// single packed int because the magnitude order is itself signed (a tiny
+/// pivot `-6e-11` has order `-11`), so folding the value's sign into it would
+/// be ambiguous — `-6e-11` and `-6e+11` must not collide. Two seeds match
+/// only when BOTH fields agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MagnitudeBucket {
+    pub sign: i32,
+    pub order: i32,
+}
+
 /// Generic cross-seed failure signature: the failure-variant discriminant
 /// paired with the signed order-of-magnitude bucket of the dominant
 /// pivot/KKT numeric parsed from the message. Two seeds that reject with the
@@ -205,7 +218,7 @@ fn variant_tag(failure: &InnerFailure) -> FailureVariantTag {
 /// a message with no parseable diagnostic numeric carries `None`, and a run
 /// of `None`-magnitude failures is NOT eligible for the generic bail (we
 /// refuse to call an unquantified failure structural).
-pub(crate) type GenericFailureSignature = (FailureVariantTag, Option<i32>);
+pub(crate) type GenericFailureSignature = (FailureVariantTag, Option<MagnitudeBucket>);
 
 /// Markers, in priority order, that precede the dominant diagnostic numeric
 /// in a bubbled inner-solver error. The first one present wins: the KKT/cert
@@ -262,19 +275,21 @@ fn parse_leading_f64(s: &str) -> Option<f64> {
 }
 
 /// Extract the dominant diagnostic magnitude bucket from a bubbled inner
-/// error: `signum(x) * floor(log10(|x|))` for the first dominant-numeric
-/// marker present. `None` when no marker yields a finite, non-zero value —
-/// such a failure has no quantified fingerprint and is excluded from the
-/// generic structural bail.
-pub(crate) fn dominant_magnitude_bucket(message: &str) -> Option<i32> {
+/// error: the value's sign and `floor(log10(|value|))` for the first
+/// dominant-numeric marker present. `None` when no marker yields a finite,
+/// non-zero value — such a failure has no quantified fingerprint and is
+/// excluded from the generic structural bail.
+pub(crate) fn dominant_magnitude_bucket(message: &str) -> Option<MagnitudeBucket> {
     let lower = message.to_ascii_lowercase();
     for marker in DOMINANT_NUMERIC_MARKERS {
         if let Some(pos) = lower.find(marker) {
             let tail = lower[pos + marker.len()..].trim_start();
             if let Some(value) = parse_leading_f64(tail) {
                 if value.is_finite() && value != 0.0 {
-                    let mag = value.abs().log10().floor() as i32;
-                    return Some(value.signum() as i32 * mag);
+                    return Some(MagnitudeBucket {
+                        sign: value.signum() as i32,
+                        order: value.abs().log10().floor() as i32,
+                    });
                 }
             }
         }
@@ -320,10 +335,10 @@ pub(crate) fn consecutive_generic_signature(
 }
 
 /// Render the generic structural-failure signature for the aggregated bail
-/// message: `"<variant>@1e<bucket>"`, e.g. `"budget_exhausted@1e3"` or
-/// `"cert_refused@-1e-11"`. The phrasing names the variant and the signed
-/// order of magnitude so two operators reading two failed fits can tell at a
-/// glance whether they hit the same blocker.
+/// message: `"<variant>@<sign>1e<order>"`, e.g. `"budget_exhausted@1e3"` or
+/// `"other@-1e-11"` (a negative pivot of order `1e-11`). The phrasing names
+/// the variant and the signed order of magnitude so two operators reading two
+/// failed fits can tell at a glance whether they hit the same blocker.
 pub(crate) fn generic_signature_label(sig: &GenericFailureSignature) -> String {
     let (tag, bucket) = sig;
     let variant = match tag {
@@ -335,8 +350,10 @@ pub(crate) fn generic_signature_label(sig: &GenericFailureSignature) -> String {
         FailureVariantTag::Other => "other",
     };
     match bucket {
-        Some(b) if *b < 0 => format!("{variant}@-1e{}", -b),
-        Some(b) => format!("{variant}@1e{b}"),
+        Some(b) => {
+            let sign = if b.sign < 0 { "-" } else { "" };
+            format!("{variant}@{sign}1e{}", b.order)
+        }
         None => format!("{variant}@<unquantified>"),
     }
 }
@@ -721,23 +738,27 @@ mod tests {
 
     #[test]
     fn dominant_magnitude_buckets_signed_order_of_magnitude() {
-        // Negative tiny pivot ~ -6e-11 → signed bucket -(-11) form: sign is
-        // negative, |x| order is 1e-11 so floor(log10)= -11 → -1 * 11.
+        // Negative tiny pivot ~ -6e-11 → sign=-1, order=floor(log10(6e-11))=-11.
         assert_eq!(
             dominant_magnitude_bucket("non-PD pivot=-6e-11; rest"),
-            Some(-11)
+            Some(MagnitudeBucket { sign: -1, order: -11 })
         );
-        // KKT residual stuck at 1e3 → +3.
+        // KKT residual stuck at 1e3 → sign=+1, order=3.
         assert_eq!(
             dominant_magnitude_bucket("residual=5.0e+03 > 4·tol=4.0e+03"),
-            Some(3)
+            Some(MagnitudeBucket { sign: 1, order: 3 })
         );
         // No parseable diagnostic numeric → None (unquantified).
         assert_eq!(dominant_magnitude_bucket("some opaque failure"), None);
         // residual= present but non-numeric falls through to the next marker.
         assert_eq!(
             dominant_magnitude_bucket("residual=stuck; |∇L-Sβ|=2.5e+05 vs tol"),
-            Some(5)
+            Some(MagnitudeBucket { sign: 1, order: 5 })
+        );
+        // A negative value of order 1e+11 must NOT collide with -6e-11.
+        assert_ne!(
+            dominant_magnitude_bucket("pivot=-6e-11"),
+            dominant_magnitude_bucket("pivot=-6e+11"),
         );
     }
 
@@ -746,9 +767,9 @@ mod tests {
         let rej = reml_nonpd(0, "-6e-11", "1.0e+03");
         let sig = generic_signature(&rej.failure);
         assert_eq!(sig.0, FailureVariantTag::Other);
-        // pivot= marker wins over |∇l-sβ|=: -6e-11 → -11.
-        assert_eq!(sig.1, Some(-11));
-        assert_eq!(generic_signature_label(&sig), "other@-1e11");
+        // pivot= marker wins over |∇l-sβ|=: -6e-11 → sign=-1, order=-11.
+        assert_eq!(sig.1, Some(MagnitudeBucket { sign: -1, order: -11 }));
+        assert_eq!(generic_signature_label(&sig), "other@-1e-11");
     }
 
     /// The #1036 structural class: three consecutive seeds reject with the
@@ -770,7 +791,13 @@ mod tests {
         let (sig, run) = consecutive_generic_signature(&rejections, 3)
             .expect("three identical pivot signatures must trigger the generic bail");
         assert_eq!(run, 3);
-        assert_eq!(sig, (FailureVariantTag::Other, Some(-11)));
+        assert_eq!(
+            sig,
+            (
+                FailureVariantTag::Other,
+                Some(MagnitudeBucket { sign: -1, order: -11 })
+            )
+        );
     }
 
     /// Control: genuine seed-luck. The trailing run of identical signatures is
@@ -806,7 +833,7 @@ mod tests {
             .expect("trailing run of three identical signatures must fire");
         assert_eq!(run, 3);
         assert_eq!(sig.0, FailureVariantTag::Other);
-        assert_eq!(sig.1, Some(-11));
+        assert_eq!(sig.1, Some(MagnitudeBucket { sign: -1, order: -11 }));
     }
 
     /// An unquantified failure run (no parseable pivot/KKT numeric) is never
@@ -840,12 +867,18 @@ mod tests {
     #[test]
     fn generic_signature_label_renders_signed_buckets() {
         assert_eq!(
-            generic_signature_label(&(FailureVariantTag::BudgetExhausted, Some(3))),
+            generic_signature_label(&(
+                FailureVariantTag::BudgetExhausted,
+                Some(MagnitudeBucket { sign: 1, order: 3 })
+            )),
             "budget_exhausted@1e3"
         );
         assert_eq!(
-            generic_signature_label(&(FailureVariantTag::CertRefused, Some(-11))),
-            "cert_refused@-1e11"
+            generic_signature_label(&(
+                FailureVariantTag::CertRefused,
+                Some(MagnitudeBucket { sign: -1, order: -11 })
+            )),
+            "cert_refused@-1e-11"
         );
         assert_eq!(
             generic_signature_label(&(FailureVariantTag::Other, None)),
