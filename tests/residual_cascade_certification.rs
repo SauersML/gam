@@ -761,3 +761,104 @@ fn gap_bridges_without_sagging_and_variance_grows() {
         "posterior variance failed to grow into the gap: {gap_var} vs covered median {median_var}"
     );
 }
+
+/// Caveat 1 (#1032 spec: the Wendland-(3,1) native-smoothness ceiling caps the
+/// recoverable Sobolev order). A deliberately high-frequency truth — finer than
+/// the `INITIAL_LEVELS` nets can resolve — must FORCE the magic-default
+/// refinement loop to add levels past `INITIAL_LEVELS = 3`, and the loop must
+/// terminate with the exact level-(L+1) gain bound as an HONEST upper bound on
+/// the remaining penalized-objective decrease: either the bound is certified
+/// below its tolerance (the discretization bias is provably spent), or the net /
+/// `MAX_LEVELS` cap is reached and the certificate reports `exhausted` with a
+/// finite bound that bounds the unresolved tail. Either way the recovered fit's
+/// in-domain error must be consistent with that certified residual — the
+/// certificate is the instrument that detects "adding a level still moves the
+/// functional", exactly as the spec requires (same certified-or-fallback
+/// discipline as radial_profile / the GL ladder).
+#[test]
+fn smoothness_ceiling_forces_refinement_and_certifies_residual_bias() {
+    // Four full cycles per axis: the level-0..2 nets (covering radius h0·2^-l
+    // with h0 ~ domain scale) are coarser than the half-period, so the coarse
+    // frame cannot represent this surface — the gain bound stays above tolerance
+    // until finer levels are appended.
+    let n = 6000;
+    let noise = 0.02;
+    let mut rng = Rng(0x1032_000C);
+    let mut x1 = Vec::with_capacity(n);
+    let mut x2 = Vec::with_capacity(n);
+    let mut y = Vec::with_capacity(n);
+    let w = vec![1.0_f64; n];
+    let k = 4.0 * std::f64::consts::PI;
+    let f = |a: f64, b: f64| (k * a).sin() * (k * b).cos();
+    for _ in 0..n {
+        let a = rng.uniform();
+        let b = rng.uniform();
+        x1.push(a);
+        x2.push(b);
+        y.push(f(a, b) + noise * rng.normal());
+    }
+    let xs: Vec<&[f64]> = vec![&x1, &x2];
+    // Sobolev order at the native ceiling (d/2, (d+3)/2] = (1, 2.5] for d=2.
+    let fit = fit_residual_cascade(&xs, &y, &w, &[1.0, 1.0], 2.0).expect("cascade fit");
+
+    // The refinement loop was forced past the initial depth to chase the
+    // high-frequency tail (INITIAL_LEVELS = 3 in residual_cascade.rs).
+    assert!(
+        fit.num_levels() > 3,
+        "high-frequency truth did not force refinement past INITIAL_LEVELS: levels {}",
+        fit.num_levels()
+    );
+
+    // The terminating certificate is an honest bound on the residual movement:
+    // a non-negative, finite level-(L+1) gain bound compared against its own
+    // tolerance. Converged ⇒ bound ≤ tol; capped ⇒ exhausted flag set.
+    let cert = fit.refinement.as_ref().expect("refinement certificate");
+    assert!(
+        cert.next_level_gain_bound.is_finite() && cert.next_level_gain_bound >= 0.0,
+        "refinement bound not a finite non-negative certificate: {}",
+        cert.next_level_gain_bound
+    );
+    assert!(cert.tolerance.is_finite() && cert.tolerance > 0.0);
+    if cert.exhausted {
+        // Capped before the bound passed: the certificate must still bound the
+        // unresolved tail relative to the penalized residual it was scaled by.
+        assert!(
+            cert.next_level_gain_bound <= fit.rss_pen,
+            "exhausted refinement reports a gain bound exceeding the penalized residual: {} vs {}",
+            cert.next_level_gain_bound,
+            fit.rss_pen
+        );
+    } else {
+        // Converged: one more level provably cannot move the objective by more
+        // than the tolerance — the discretization bias is certified spent.
+        assert!(
+            cert.next_level_gain_bound <= cert.tolerance,
+            "refinement claimed convergence but the gain bound exceeds tolerance: {} vs {}",
+            cert.next_level_gain_bound,
+            cert.tolerance
+        );
+    }
+
+    // The certified fit recovers the high-frequency surface on held-out truth:
+    // once refinement has run, the frame resolves the planted structure rather
+    // than under-fitting it to a coarse trend.
+    let grid = 50;
+    let mut sse = 0.0;
+    for i in 0..grid {
+        for j in 0..grid {
+            let px = (i as f64 + 0.5) / grid as f64;
+            let py = (j as f64 + 0.5) / grid as f64;
+            let (mean, var) = fit.predict(&[px, py]).expect("predict");
+            assert!(var > 0.0, "non-positive posterior variance at ({px},{py})");
+            let err = mean - f(px, py);
+            sse += err * err;
+        }
+    }
+    let rmse = (sse / (grid * grid) as f64).sqrt();
+    // The amplitude is 1; a coarse-trend under-fit would leave rmse ~ O(1).
+    // Resolving the surface drives it well below the signal scale.
+    assert!(
+        rmse < 0.2,
+        "refinement failed to resolve the high-frequency truth: rmse {rmse}"
+    );
+}
