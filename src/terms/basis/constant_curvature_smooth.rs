@@ -555,7 +555,7 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
 }
 
 #[cfg(test)]
-mod kappa_collapse_diagnostic {
+mod tests {
     use super::*;
 
     // Diagnostic (#1059 follow-up): show that a κ-FROZEN chart-scale length
