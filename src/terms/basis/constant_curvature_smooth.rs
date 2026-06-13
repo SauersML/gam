@@ -388,63 +388,6 @@ pub fn realized_constant_curvature_length_scale(
     Ok(median)
 }
 
-/// Mean pairwise CHART distance `2‖c_i − c_j‖` among centers — the κ = 0 gauge
-/// reference scale `s₀ = mean d₀`. Used to anchor the κ-invariant resolution
-/// rescale so that, at κ = 0, the effective length equals the realized ℓ.
-fn centers_mean_chart_distance(centers: ArrayView2<'_, f64>) -> f64 {
-    let m = centers.nrows();
-    let mut sum = 0.0_f64;
-    let mut cnt = 0.0_f64;
-    for i in 0..m {
-        for j in (i + 1)..m {
-            let mut s = 0.0_f64;
-            for k in 0..centers.ncols() {
-                let dlt = centers[(i, k)] - centers[(j, k)];
-                s += dlt * dlt;
-            }
-            sum += 2.0 * s.sqrt();
-            cnt += 1.0;
-        }
-    }
-    if cnt > 0.0 { sum / cnt } else { 0.0 }
-}
-
-/// Mean pairwise GEODESIC distance among centers at curvature κ, with its first
-/// and second κ-derivatives: `(s, s′, s″)` where `s(κ) = mean_{i<j} d_κ(c_i,c_j)`.
-/// Each pair's `(d, d′, d″)` comes from the exact `distance_kappa_jet`, so the
-/// mean (a smooth, every-pair average — unlike the median) and its derivatives
-/// are exact. This is the geometry-side scale that makes the kernel resolution
-/// κ-invariant (see [`constant_curvature_effective_length_jet`]).
-fn centers_mean_geodesic_distance_jet(
-    centers: ArrayView2<'_, f64>,
-    kappa: f64,
-) -> Result<(f64, f64, f64), BasisError> {
-    let m = centers.nrows();
-    let manifold = ConstantCurvature::new(centers.ncols(), kappa);
-    let mut s = 0.0_f64;
-    let mut s1 = 0.0_f64;
-    let mut s2 = 0.0_f64;
-    let mut cnt = 0.0_f64;
-    for i in 0..m {
-        for j in (i + 1)..m {
-            let (d, d1, d2) = distance_kappa_jet(&manifold, centers.row(i), centers.row(j))
-                .map_err(|e| {
-                    BasisError::InvalidInput(format!(
-                        "constant-curvature center geodesic κ-jet failed at ({i},{j}): {e}"
-                    ))
-                })?;
-            s += d;
-            s1 += d1;
-            s2 += d2;
-            cnt += 1.0;
-        }
-    }
-    if cnt <= 0.0 {
-        crate::bail_invalid_basis!("constant-curvature geodesic scale needs at least two centers");
-    }
-    Ok((s / cnt, s1 / cnt, s2 / cnt))
-}
-
 /// Mean GEODESIC distance over all `data`→`centers` pairs at curvature κ, with
 /// its first/second κ-derivatives `(s, s′, s″)`. Smooth (every-pair average) so
 /// the jet is exact via `distance_kappa_jet`. This is the scale that actually
@@ -752,7 +695,7 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
     // fix). The kernel exponent is q = d/L with BOTH d and L moving in κ, so the
     // kernel κ-jets carry the full quotient chain rule — see
     // `constant_curvature_kernel_kappa_jets_scaled`.
-    let l_jet = constant_curvature_effective_length_jet(centers.view(), length_scale, spec.kappa)?;
+    let l_jet = constant_curvature_effective_length_jet(data, centers.view(), length_scale, spec.kappa)?;
 
     // Design κ-jets: X = K(data, centers)·z, so the κ-derivatives are the
     // kernel κ-jets right-multiplied by the κ-fixed `z`.
