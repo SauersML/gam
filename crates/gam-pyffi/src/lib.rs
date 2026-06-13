@@ -17171,6 +17171,28 @@ fn curvature_inference_json(
     })
 }
 
+/// #1063 per-term LR significance report for every penalized smooth term:
+/// `statistic_lr`, `ref_df`, `bartlett_factor`, `statistic_corrected`,
+/// `p_value_uncorrected`, `p_value_corrected`, and `correction_provenance`
+/// (`"lawley_lr"` | `"none"`).
+///
+/// Unlike `summary_json` (Wood rank-truncated **Wald** χ²), this computes a
+/// genuine **likelihood-ratio** statistic by a constrained refit dropping each
+/// smooth term, then magic-Bartlett-corrects it with the exact Lawley factor.
+/// Needs the model's training data (`headers`/`rows`) for the per-term null
+/// refits, exactly as `curvature_inference_json` does.
+#[pyfunction]
+fn smooth_term_lr_inference_json(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> PyResult<String> {
+    detach_py_result(py, "smooth_term_lr_inference_json", move || {
+        smooth_term_lr_inference_json_impl(&model_bytes, headers, rows)
+    })
+}
+
 #[pyfunction]
 fn summary_payload_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
     let payload = detach_py_result(py, "summary_payload_from_model", move || {
@@ -23598,6 +23620,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(apply_inverse_link_array, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(curvature_inference_json, module)?)?;
+    module.add_function(wrap_pyfunction!(smooth_term_lr_inference_json, module)?)?;
     module.add_function(wrap_pyfunction!(summary_payload_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(smoothing_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(model_group_metadata, module)?)?;
@@ -28211,6 +28234,33 @@ struct CurvatureInferencePayload {
     curvature_terms: Vec<CurvatureInferenceRow>,
 }
 
+/// One penalized smooth term's #1063 per-term LR significance report,
+/// JSON-serialized for the Python surface.
+#[derive(Serialize)]
+struct SmoothTermLrRow {
+    name: String,
+    term_idx: usize,
+    /// Uncorrected likelihood-ratio statistic `W = 2(ℓ_full − ℓ_null) ≥ 0`.
+    statistic_lr: f64,
+    /// Reference d.f. `d` (Wood truncation `tr(F)²/tr(F²)`; same as the Wald row).
+    ref_df: f64,
+    /// Lawley LR Bartlett factor `c = 1 + Δε/d` (1.0 when uncorrected).
+    bartlett_factor: f64,
+    /// Bartlett-corrected statistic `W* = W / c`.
+    statistic_corrected: f64,
+    /// Uncorrected p-value `P(χ²_d > W)`.
+    p_value_uncorrected: f64,
+    /// Corrected p-value `P(χ²_d > W*)` — the magic-by-default reported value.
+    p_value_corrected: f64,
+    /// `"lawley_lr"` when the Bartlett correction was applied, else `"none"`.
+    correction_provenance: &'static str,
+}
+
+#[derive(Serialize)]
+struct SmoothTermLrPayload {
+    smooth_terms: Vec<SmoothTermLrRow>,
+}
+
 fn curvature_verdict_label(v: gam::geometry::CurvatureVerdict) -> &'static str {
     match v {
         gam::geometry::CurvatureVerdict::Spherical => "spherical",
@@ -28318,6 +28368,87 @@ fn curvature_inference_json_impl(
     };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize curvature inference: {err}"))
+}
+
+/// #1063: per-term likelihood-ratio significance for every penalized smooth term
+/// in a fitted model, Bartlett-corrected by default. The summary table reports
+/// Wood's rank-truncated **Wald** statistic, which the Lawley LR factor would
+/// correct wrongly under penalization; this entry computes a genuine LR
+/// statistic by a constrained refit (the smooth dropped) and corrects *that*.
+///
+/// Like `curvature_inference_json`, the honest LR needs the model's training
+/// data: we materialize a Standard fit request from the model's training formula
+/// + data, swap in the model's fitted (frozen) spec and family, then run the
+/// core LR + Bartlett driver. The fitted spec carries the exact estimand the
+/// model was fitted under.
+fn smooth_term_lr_inference_json_impl(
+    model_bytes: &[u8],
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> Result<String, String> {
+    let model = load_model_impl(model_bytes)?;
+    let formula = model.payload().formula.clone();
+    let spec = model
+        .payload()
+        .resolved_termspec
+        .as_ref()
+        .ok_or_else(|| {
+            "smooth_term_lr_inference requires the saved resolved_termspec; refit".to_string()
+        })?
+        .clone();
+    // Fast bail: no smooth terms ⇒ empty report (no refit, no data needed).
+    if spec.smooth_terms.is_empty() {
+        let payload = SmoothTermLrPayload {
+            smooth_terms: Vec::new(),
+        };
+        return serde_json::to_string(&payload)
+            .map_err(|err| format!("failed to serialize smooth-term LR inference: {err}"));
+    }
+
+    let dataset = dataset_with_inferred_schema(headers, rows)?;
+    let (fit_config, _table_kind) = parse_fit_config(None)?;
+    let materialized = materialize(&formula, &dataset, &fit_config)?;
+    let standard = match materialized.request {
+        FitRequest::Standard(request) => request,
+        _ => {
+            return Err(
+                "smooth_term_lr_inference: only standard (non marginal-slope / non survival) \
+                 models carry a per-term central-χ² LR; this model uses a specialized fit request"
+                    .to_string(),
+            );
+        }
+    };
+
+    let family = model.likelihood();
+    let reports = gam::smooth::smooth_term_lr_inference_forspec(
+        standard.data.view(),
+        standard.y.view(),
+        standard.weights.view(),
+        standard.offset.view(),
+        &spec,
+        family,
+        &standard.options,
+    )
+    .map_err(|e| format!("smooth_term_lr_inference: {e}"))?;
+
+    let smooth_terms = reports
+        .into_iter()
+        .map(|r| SmoothTermLrRow {
+            name: r.name,
+            term_idx: r.term_idx,
+            statistic_lr: r.statistic_lr,
+            ref_df: r.ref_df,
+            bartlett_factor: r.bartlett_factor,
+            statistic_corrected: r.statistic_corrected,
+            p_value_uncorrected: r.p_value_uncorrected,
+            p_value_corrected: r.p_value_corrected,
+            correction_provenance: r.correction.label(),
+        })
+        .collect::<Vec<_>>();
+
+    let payload = SmoothTermLrPayload { smooth_terms };
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize smooth-term LR inference: {err}"))
 }
 
 fn check_json_impl(

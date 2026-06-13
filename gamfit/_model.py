@@ -363,6 +363,44 @@ class Model:
         payload = json.loads(raw)
         return list(payload.get("curvature_terms", []))
 
+    def smooth_significance(self, data: Any) -> list[dict[str, Any]]:
+        """Per-term likelihood-ratio significance for every penalized smooth (#1063).
+
+        :meth:`summary` reports Wood's rank-truncated *Wald* statistic
+        :math:`T = \\hat\\beta'\\hat\\Sigma^- \\hat\\beta`. The exact Lawley /
+        Bartlett factor corrects the *likelihood-ratio* statistic, and under
+        penalization the Wald form is already a weighted :math:`\\chi^2` whose
+        second-order mean is not :math:`d + \\Delta\\varepsilon`, so dividing
+        :math:`T` by the LR factor would correct the wrong statistic. This method
+        instead computes a genuine per-term LR statistic
+        :math:`W = 2(\\ell_{\\text{full}} - \\ell_{\\text{null}})` by a
+        constrained refit dropping the smooth, then Bartlett-corrects *that*:
+        :math:`W^* = W / c`, :math:`c = 1 + \\Delta\\varepsilon / d`.
+
+        For each penalized (shape-unconstrained) smooth term it returns
+        ``statistic_lr`` (the raw :math:`W`), ``ref_df`` (the Wood truncation
+        :math:`d`, the same reference the Wald row uses), ``bartlett_factor``
+        :math:`c`, ``statistic_corrected`` :math:`W^*`, ``p_value_uncorrected``,
+        ``p_value_corrected`` (the magic-by-default value), and
+        ``correction_provenance`` — ``"lawley_lr"`` when the family carries
+        closed-form cumulant jets (gaussian / poisson / binomial / gamma) and the
+        null refit converged, else ``"none"`` (the uncorrected
+        :math:`\\chi^2_d` stands, never weakened).
+
+        Needs the training ``data`` for the per-term null refits, exactly as
+        :meth:`curvature` does. Returns an empty list when the model has no
+        penalized smooth term.
+        """
+        headers, rows, _ = normalize_table(data)
+        try:
+            raw = rust_module().smooth_term_lr_inference_json(
+                self._model_bytes, headers, rows
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        payload = json.loads(raw)
+        return list(payload.get("smooth_terms", []))
+
     def report(self, path: str | Path | None = None) -> str:
         """Generate a standalone HTML report of the fitted model."""
         try:
