@@ -8136,6 +8136,7 @@ fn run_outer_with_plan(
                             COST_STALL_WINDOW,
                             cost_stall_exit.clone(),
                         )),
+                        consecutive_probe_refusals: 0,
                     };
                     // Hand the precomputed (cost, gradient) seed eval to
                     // `opt::Bfgs` so its first internal `eval_grad` call is
@@ -9656,6 +9657,7 @@ mod tests {
             last_value_grad_rho: None,
             value_probe_cache: Vec::new(),
             cost_stall: None,
+            consecutive_probe_refusals: 0,
         };
 
         let first = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
