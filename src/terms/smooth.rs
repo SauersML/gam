@@ -20900,9 +20900,9 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
 mod tests {
     use super::*;
     use crate::basis::{
-        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
-        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
-        MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
+        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy,
+        DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource,
+        MaternBasisSpec, MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
     };
     use crate::estimate::AdaptiveRegularizationOptions;
     use crate::faer_ndarray::{FaerEigh, FaerSvd};
