@@ -6613,7 +6613,7 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
 ///     the designs materialize densely.
 /// Any ineligibility falls through to split conformal LOUDLY by returning
 /// `false`, never a silently-invalid set.
-fn try_gaussian_full_conformal<M: PredictableModel + ?Sized>(
+fn try_gaussian_full_conformal(
     result: &mut PredictUncertaintyResult,
     input: &PredictInput,
     fit: &UnifiedFitResult,
