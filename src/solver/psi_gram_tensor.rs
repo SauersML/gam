@@ -371,7 +371,7 @@ impl PsiGramTensor {
             Some((g_plus - g_minus) / (2.0 * h))
         };
         // True when the analytic derivative matches the exact FD at `psi`.
-        let mut certifies = |me: &Self,
+        let certifies = |me: &Self,
                              psi: f64,
                              eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
          -> bool {
