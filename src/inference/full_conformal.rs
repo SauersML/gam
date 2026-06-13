@@ -2311,6 +2311,135 @@ pub fn gaussian_jackknife_plus(
     jackknife_plus_interval(&loo_preds, &loo_resids, alpha)
 }
 
+/// Test-point-independent sufficient statistics for the exact penalized
+/// Gaussian-identity jackknife+, factored ONCE from `(X, y, Sλ)` so any number
+/// of test points reuse the single Cholesky of `M = XᵀX + Sλ`.
+///
+/// For each training row `i` the leave-one-out fit is the rank-one
+/// Sherman–Morrison downdate of `M`, giving (in closed form, no refits):
+///
+/// ```text
+///   vᵢ = M⁻¹ xᵢ                         (p-vector, one column of M⁻¹Xᵀ)
+///   hᵢ = xᵢᵀ vᵢ ,  cᵢ = rᵢ / (1 − hᵢ)   (signed LOO residual)
+///   Rᵢ = |cᵢ|                            (LOO absolute residual)
+/// ```
+///
+/// At a test point `x_*` the LOO prediction is then a single inner product per
+/// row, `μ̂₋ᵢ(x_*) = x_*ᵀβ̂ − (x_*ᵀvᵢ)·cᵢ`, so [`interval`](Self::interval) is
+/// `O(n·p)` after the `O(n·p²)` factorization here. This is the substrate the
+/// `predict(interval=level)` magic default replays: the stats are exactly the
+/// `{vᵢ, cᵢ, Rᵢ}` of `gaussian_jackknife_plus`, which is recovered exactly when
+/// fed a single `x_*` (the in-module test asserts that equivalence).
+///
+/// Unit prior weights are required, as everywhere in this module: a reweighted
+/// training row is not exchangeable with the test row, so the finite-sample
+/// coverage proof does not apply. The constructor rejects non-unit weights and
+/// rows with `1 − hᵢ ≤ 1e-10` (no leave-one-out information).
+pub struct GaussianJackknifePlusStats {
+    /// Fitted coefficients `β̂ = M⁻¹Xᵀy`.
+    beta: Array1<f64>,
+    /// `M⁻¹Xᵀ` (p × n): column `i` is `vᵢ = M⁻¹xᵢ`.
+    minv_xt: Array2<f64>,
+    /// Signed leave-one-out residuals `cᵢ = rᵢ/(1 − hᵢ)` (n).
+    signed_loo: Array1<f64>,
+    /// Absolute leave-one-out residuals `Rᵢ = |cᵢ|` (n).
+    abs_loo: Array1<f64>,
+}
+
+impl GaussianJackknifePlusStats {
+    /// Factor the test-point-independent jackknife+ statistics from the
+    /// training design, response, prior weights, and penalty matrix.
+    pub fn new(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        prior_weights: &Array1<f64>,
+        s_lambda: &Array2<f64>,
+    ) -> Result<Self, String> {
+        let n = x.nrows();
+        let p = x.ncols();
+        if y.len() != n || prior_weights.len() != n {
+            return Err("gaussian jackknife+ stats: row-count mismatch".to_string());
+        }
+        if s_lambda.nrows() != p || s_lambda.ncols() != p {
+            return Err("gaussian jackknife+ stats: column-count mismatch".to_string());
+        }
+        if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
+            return Err(
+                "gaussian jackknife+ requires unit prior weights: a reweighted training row \
+                 is not exchangeable with the test row, so the finite-sample coverage proof \
+                 does not apply"
+                    .to_string(),
+            );
+        }
+        let m = x.t().dot(x) + s_lambda;
+        let chol = m
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("gaussian jackknife+ stats: normal matrix not SPD: {e:?}"))?;
+        let beta = chol.solvevec(&x.t().dot(y));
+        let mu = fast_av(x, &beta);
+        let xt = x.t().as_standard_layout().into_owned();
+        let minv_xt = chol.solve_mat(&xt);
+        let mut signed_loo = Array1::<f64>::zeros(n);
+        let mut abs_loo = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let h_i = x.row(i).dot(&minv_xt.column(i));
+            let one_minus_h = 1.0 - h_i;
+            if !(one_minus_h > 1e-10) {
+                return Err(format!(
+                    "gaussian jackknife+ stats: leverage hᵢ = {h_i} at row {i} leaves no \
+                     leave-one-out information (1 − hᵢ ≤ 1e-10); the rank-one downdate is \
+                     exact only for hᵢ < 1"
+                ));
+            }
+            let c_i = (y[i] - mu[i]) / one_minus_h;
+            signed_loo[i] = c_i;
+            abs_loo[i] = c_i.abs();
+        }
+        Ok(Self {
+            beta,
+            minv_xt,
+            signed_loo,
+            abs_loo,
+        })
+    }
+
+    /// Number of training rows backing the leave-one-out construction.
+    pub fn n(&self) -> usize {
+        self.abs_loo.len()
+    }
+
+    /// Coefficient dimension `p`.
+    pub fn p(&self) -> usize {
+        self.beta.len()
+    }
+
+    /// Jackknife+ interval at one test row `x_*` and miscoverage `alpha`,
+    /// returning the Barber et al. (2021) set with guarantee
+    /// `P(Y_* ∈ Ĉ) ≥ 1 − 2·alpha`.
+    pub fn interval(
+        &self,
+        x_star: &Array1<f64>,
+        alpha: f64,
+    ) -> Result<JackknifePlusInterval, String> {
+        let p = self.beta.len();
+        if x_star.len() != p {
+            return Err(format!(
+                "gaussian jackknife+ stats: x_* has {} entries but the fit has {p} coefficients",
+                x_star.len()
+            ));
+        }
+        let n = self.abs_loo.len();
+        let mu_star = x_star.dot(&self.beta);
+        let mut loo_preds = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            // x_*ᵀ vᵢ = x_*ᵀ M⁻¹ xᵢ.
+            let c = x_star.dot(&self.minv_xt.column(i));
+            loo_preds[i] = mu_star - c * self.signed_loo[i];
+        }
+        jackknife_plus_interval(&loo_preds, &self.abs_loo, alpha)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3221,5 +3350,139 @@ mod tests {
         let one_res = Array1::<f64>::from(vec![0.5]);
         let tiny = jackknife_plus_interval(&one_pred, &one_res, 0.2).expect("tiny");
         assert!(tiny.hi.is_infinite() && tiny.lo.is_infinite());
+    }
+
+    /// The precomputed `GaussianJackknifePlusStats` substrate (factored once,
+    /// replayed per test point — the form the predict-path magic uses) must be
+    /// bit-for-bit equivalent to the single-shot `gaussian_jackknife_plus` at
+    /// every test point. This pins the refactor: the saved-model replay can
+    /// never silently drift from the certified reference.
+    #[test]
+    fn jackknife_plus_stats_replay_matches_single_shot() {
+        use std::f64::consts::PI;
+        let n = 18usize;
+        let p = 4usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            for j in 0..p {
+                x[[i, j]] = (j as f64 * PI * t).cos();
+            }
+            y[i] = (2.0 * PI * t).sin() + 0.2 * (7.0 * i as f64 + 0.9).sin();
+        }
+        let mut s = Array2::<f64>::eye(p);
+        s *= 0.55;
+        let weights = Array1::<f64>::ones(n);
+        let alpha = 0.1;
+
+        let stats = GaussianJackknifePlusStats::new(&x, &y, &weights, &s).expect("stats");
+        assert_eq!(stats.n(), n);
+        assert_eq!(stats.p(), p);
+
+        for k in 0..7 {
+            let x_star = cosine_row(p, 0.13 + 0.11 * k as f64);
+            let single =
+                gaussian_jackknife_plus(&x, &y, &weights, &s, &x_star, alpha).expect("single");
+            let replay = stats.interval(&x_star, alpha).expect("replay");
+            assert!(
+                (single.lo - replay.lo).abs() <= 1e-12 * (1.0 + single.lo.abs()),
+                "stats replay lower {} != single-shot {} at test point {k}",
+                replay.lo,
+                single.lo
+            );
+            assert!(
+                (single.hi - replay.hi).abs() <= 1e-12 * (1.0 + single.hi.abs()),
+                "stats replay upper {} != single-shot {} at test point {k}",
+                replay.hi,
+                single.hi
+            );
+            assert_eq!(single.n, replay.n);
+        }
+
+        // Eligibility gate: a reweighted training row is rejected (no
+        // exchangeability), never silently certified.
+        let mut bad_w = Array1::<f64>::ones(n);
+        bad_w[3] = 2.0;
+        assert!(GaussianJackknifePlusStats::new(&x, &y, &bad_w, &s).is_err());
+    }
+
+    /// Held-out empirical coverage smoke: across many fresh draws of a
+    /// synthetic Gaussian-identity problem, the jackknife+ interval at a held-
+    /// out test point must cover the realized response at least at the
+    /// requested `1 − 2α` rate (small Monte-Carlo slack), with finite width.
+    #[test]
+    fn jackknife_plus_empirical_coverage_smoke() {
+        use std::f64::consts::PI;
+        let n = 40usize;
+        let p = 4usize;
+        let alpha = 0.1; // target coverage ≥ 1 − 2α = 0.8
+        let s = {
+            let mut s = Array2::<f64>::eye(p);
+            s *= 0.4;
+            s
+        };
+        let weights = Array1::<f64>::ones(n);
+
+        // Deterministic LCG so the smoke is reproducible without an RNG dep.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut unif = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        // Box–Muller standard normal.
+        let mut normal = || {
+            let u1 = unif().max(1e-12);
+            let u2 = unif();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+        };
+        let beta_true = [0.8_f64, -0.5, 0.3, 0.15];
+        let sigma = 0.5_f64;
+        let design_row = |z: f64| {
+            let mut r = Array1::<f64>::zeros(p);
+            for j in 0..p {
+                r[j] = (j as f64 * PI * z).cos();
+            }
+            r
+        };
+
+        let trials = 200usize;
+        let mut covered = 0usize;
+        for _ in 0..trials {
+            let mut x = Array2::<f64>::zeros((n, p));
+            let mut yv = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let z = unif();
+                let row = design_row(z);
+                let mut eta = 0.0;
+                for j in 0..p {
+                    x[[i, j]] = row[j];
+                    eta += beta_true[j] * row[j];
+                }
+                yv[i] = eta + sigma * normal();
+            }
+            let stats = match GaussianJackknifePlusStats::new(&x, &yv, &weights, &s) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let z_star = unif();
+            let x_star = design_row(z_star);
+            let mut eta_star = 0.0;
+            for j in 0..p {
+                eta_star += beta_true[j] * x_star[j];
+            }
+            let y_star = eta_star + sigma * normal();
+            let itv = stats.interval(&x_star, alpha).expect("coverage interval");
+            assert!(itv.certifies_finite(), "coverage trial produced infinite width");
+            if y_star >= itv.lo && y_star <= itv.hi {
+                covered += 1;
+            }
+        }
+        let rate = covered as f64 / trials as f64;
+        // Distribution-free guarantee is ≥ 0.8; allow Monte-Carlo slack below.
+        assert!(
+            rate >= 0.74,
+            "jackknife+ empirical coverage {rate} fell below the 1−2α target with slack"
+        );
     }
 }
