@@ -26065,6 +26065,26 @@ mod tests {
                 );
 
                 assert_eq!(grad_s.len(), grad_t.len(), "gradient dimension mismatch");
+
+                // Arbiter for the ψ component: a central finite difference of
+                // the cost along ψ tells us WHICH lane carries the exact
+                // gradient (the cross-lane equality alone cannot). We FD the
+                // streamed cost (the reference whose analytic ψ-gradient is
+                // FD-verified by the `iso_kappa_duchon_*_fd` pins). If the
+                // streamed analytic ψ-gradient tracks this FD but the tensor
+                // one does not, the tensor's ∂(XᵀWX)/∂ψ install is the culprit.
+                let psi_j = rho_dim;
+                let fd_h = 1e-6;
+                let mut theta_p = theta.clone();
+                theta_p[psi_j] = psi + fd_h;
+                let mut theta_m = theta.clone();
+                theta_m[psi_j] = psi - fd_h;
+                let (cost_sp, _) = eval_one(&mut streamed_eval, &mut stream_cache, &theta_p);
+                let (cost_sm, _) = eval_one(&mut streamed_eval, &mut stream_cache, &theta_m);
+                let fd_psi = (cost_sp - cost_sm) / (2.0 * fd_h);
+                let stream_psi_fd_err = (grad_s[psi_j] - fd_psi).abs();
+                let tensor_psi_fd_err = (grad_t[psi_j] - fd_psi).abs();
+
                 for j in 0..grad_s.len() {
                     let gabs = (grad_s[j] - grad_t[j]).abs();
                     let gtol = 1e-7 * (1.0 + grad_s[j].abs());
@@ -26072,7 +26092,10 @@ mod tests {
                     assert!(
                         gabs <= gtol,
                         "REML gradient[{j}] diverges between lanes at ψ={psi:.4}, \
-                         ρ={:+.2}: streamed={:+.12e}, tensor={:+.12e}, |Δ|={gabs:.3e}",
+                         ρ={:+.2}: streamed={:+.12e}, tensor={:+.12e}, |Δ|={gabs:.3e}\n  \
+                         ψ-component FD arbiter (central, h={fd_h:.0e}): fd={fd_psi:+.9e}, \
+                         streamed_err={stream_psi_fd_err:.3e}, tensor_err={tensor_psi_fd_err:.3e} \
+                         (whichever lane's err is larger carries the wrong ψ-gradient)",
                         rho[0],
                         grad_s[j],
                         grad_t[j],
