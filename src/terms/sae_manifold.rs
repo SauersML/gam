@@ -155,6 +155,14 @@ const SAE_MANIFOLD_INNER_GRAD_REL_TOL: f64 = 1.0e-5;
 /// of grinding the refine budget to the `1e12` infeasible sentinel.
 const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL: f64 = 1.0e-8;
 
+/// Fraction of the total since-entry objective reduction below which a refine
+/// round's contribution is treated as cosmetic flat-valley crawl (#1051), so the
+/// inner solve is accepted as numerically converged. At `1e-4` the inner fit has
+/// captured ≥ 99.99% of the achievable penalised-objective reduction before the
+/// criterion is ranked — far past the point where further crawl can change the
+/// Laplace evidence, yet strict enough that a materially-improving fit refines on.
+const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION: f64 = 1.0e-4;
+
 /// Above this full-`B` β width, dense beta-penalty curvature is never
 /// materialized when Grassmann frames are engaged; exact curvature is probed
 /// directly in the factored coordinate space instead.
@@ -6990,7 +6998,8 @@ impl SaeManifoldTerm {
         // to within `√εmach` of its scale IS the numerical inner optimum; ranking
         // the Laplace criterion there is correct. We accept that fixed point
         // instead of grinding the budget.
-        let mut previous_loss_total = loss.total();
+        let entry_loss_total = loss.total();
+        let mut previous_loss_total = entry_loss_total;
         loop {
             let sys = self
                 .assemble_arrow_schur(target, rho, registry)
@@ -7164,11 +7173,29 @@ impl SaeManifoldTerm {
             // cache instead of refining until the budget dies. Only engages once
             // the base budget is spent, so a healthy fit mid-descent is untouched.
             let new_loss_total = loss.total();
+            // Two stagnation signals, both required: (1) the latest refine round
+            // contributed a negligible FRACTION of the total objective reduction
+            // achieved since entry — the fit has captured essentially all the
+            // achievable improvement and is now crawling cosmetically along the
+            // weakly-identified valley; (2) the absolute relative decrease is
+            // itself tiny. The fraction test is scale- and rate-free (it fires
+            // whether the crawl decays fast or slow), so it recognises the
+            // over-smoothed / rank-deficient fixed point the bare relative floor
+            // misses, while still never firing on a fit that is materially
+            // improving round over round.
+            let total_improvement = (entry_loss_total - new_loss_total).max(0.0);
+            let round_improvement = (previous_loss_total - new_loss_total).max(0.0);
             let objective_scale = previous_loss_total.abs().max(new_loss_total.abs()) + 1.0;
-            let relative_decrease = (previous_loss_total - new_loss_total) / objective_scale;
+            let relative_decrease = round_improvement / objective_scale;
+            let captured_fraction = if total_improvement > 0.0 {
+                round_improvement / total_improvement
+            } else {
+                0.0
+            };
             let stalled = new_loss_total.is_finite()
                 && relative_decrease.is_finite()
-                && relative_decrease < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL;
+                && (relative_decrease < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+                    || captured_fraction < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION);
             previous_loss_total = new_loss_total;
             if stalled && total_inner_iter >= base_refine_iter {
                 let stationary_sys =
