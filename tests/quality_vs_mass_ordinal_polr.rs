@@ -288,7 +288,10 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
         ],
         r#"
         suppressPackageStartupMessages(library(VGAM))
-        df$yf <- factor(round(df$y), levels = c(1,2,3,4))
+        # sratio() REQUIRES an ORDERED factor (it stop()s with "response should be
+        # ordinal---see ordered()" on a plain factor); the 1<2<3<4 tiers are ordered.
+        lev <- c(1, 2, 3, 4)
+        df$yf <- ordered(round(df$y), levels = lev)
         df$sx <- sin(pi * df$x / 3)
         df$cx <- cos(pi * df$x / 3)
         # Stopping-ratio with parallel (shared) covariate slopes across cutpoints.
@@ -304,14 +307,25 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
         # Fitted class probabilities P(Y = j) on the SAME 40-pt x grid, x2 = 0.
         gx <- seq(-3, 3, length.out = 40)
         nd <- data.frame(sx = sin(pi * gx / 3), cx = cos(pi * gx / 3), x2 = rep(0, length(gx)))
-        pc <- predict(m, newdata = nd, type = "response")  # n x 4 class probs
-        emit("class1", as.numeric(pc[,1]))
-        emit("class2", as.numeric(pc[,2]))
-        emit("class3", as.numeric(pc[,3]))
-        emit("class4", as.numeric(pc[,4]))
-        emit("cum1", as.numeric(pc[,1]))
-        emit("cum2", as.numeric(pc[,1] + pc[,2]))
-        emit("cum3", as.numeric(pc[,1] + pc[,2] + pc[,3]))
+        pc <- predict(m, newdata = nd, type = "response")  # n x J class probs
+        # Re-key columns by level NAME (not a hardcoded position) onto the full
+        # ordered level set, filling any class absent from the fit with 0, so a
+        # dropped empty level cannot make pc[,4] overrun ("subscript out of bounds").
+        pc <- as.matrix(pc)
+        # If VGAM returned an unnamed matrix, its columns are the present levels in
+        # ascending order; name them by the leading levels so the keyed fill works.
+        if (is.null(colnames(pc))) colnames(pc) <- as.character(lev[seq_len(ncol(pc))])
+        full <- matrix(0.0, nrow = nrow(pc), ncol = length(lev))
+        colnames(full) <- as.character(lev)
+        have <- intersect(colnames(pc), colnames(full))
+        full[, have] <- pc[, have, drop = FALSE]
+        emit("class1", as.numeric(full[, "1"]))
+        emit("class2", as.numeric(full[, "2"]))
+        emit("class3", as.numeric(full[, "3"]))
+        emit("class4", as.numeric(full[, "4"]))
+        emit("cum1", as.numeric(full[, "1"]))
+        emit("cum2", as.numeric(full[, "1"] + full[, "2"]))
+        emit("cum3", as.numeric(full[, "1"] + full[, "2"] + full[, "3"]))
         "#,
     );
 
@@ -666,17 +680,31 @@ fn gam_continuation_ratio_matches_vgam_sratio_on_real_data() {
         ],
         r#"
         suppressPackageStartupMessages(library(VGAM))
-        df$yf <- factor(round(df$y), levels = c(1,2,3))
+        # VGAM's sratio()/cratio() families REQUIRE an ORDERED factor response
+        # (they stop() with "response should be ordinal---see ordered()" on a
+        # plain factor). The tiers 1<2<3 are genuinely ordered, so declare them so.
+        lev <- c(1, 2, 3)
+        df$yf <- ordered(round(df$y), levels = lev)
         # Stopping-ratio with parallel (shared) covariate slopes across cutpoints.
         m <- vglm(yf ~ s_temp + h_temp,
                   family = sratio(link = "logitlink", parallel = TRUE),
                   data = df)
         k <- df$test_n[1]
         nd <- data.frame(s_temp = df$test_s[1:k], h_temp = df$test_h[1:k])
-        pc <- predict(m, newdata = nd, type = "response")  # k x 3 class probs
-        emit("p1", as.numeric(pc[,1]))
-        emit("p2", as.numeric(pc[,2]))
-        emit("p3", as.numeric(pc[,3]))
+        pc <- predict(m, newdata = nd, type = "response")  # k x J class probs
+        # Index predicted-probability columns by their LEVEL NAME, not a hardcoded
+        # position: if a training fold happens to omit the top tier, VGAM returns
+        # fewer columns and a fixed pc[,3] overruns ("subscript out of bounds").
+        # Re-key onto the full ordered level set, filling any absent class with 0.
+        pc <- as.matrix(pc)
+        if (is.null(colnames(pc))) colnames(pc) <- as.character(lev[seq_len(ncol(pc))])
+        full <- matrix(0.0, nrow = nrow(pc), ncol = length(lev))
+        colnames(full) <- as.character(lev)
+        have <- intersect(colnames(pc), colnames(full))
+        full[, have] <- pc[, have, drop = FALSE]
+        emit("p1", as.numeric(full[, "1"]))
+        emit("p2", as.numeric(full[, "2"]))
+        emit("p3", as.numeric(full[, "3"]))
         "#,
     );
     let ref_p1 = r.vector("p1");
