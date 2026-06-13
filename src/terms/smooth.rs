@@ -18146,6 +18146,24 @@ pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> O
         })
 }
 
+/// The signed sectional curvature κ of a constant-curvature smooth at
+/// `term_idx`, or `None` if that term is not a `curv(...)` smooth. After a fit
+/// with κ-optimization enabled this reads the **fitted κ̂** out of the resolved
+/// spec (`freeze_term_collection_from_design` writes the optimized κ back into
+/// the spec, and `BasisMetadata::ConstantCurvature.kappa` carries the same
+/// value). This is the headline #944 estimand accessor — the κ̂ in
+/// "κ̂ = −1.8 (95% CI …)". Mirrors [`get_spatial_length_scale`].
+pub fn get_constant_curvature_kappa(spec: &TermCollectionSpec, term_idx: usize) -> Option<f64> {
+    constant_curvature_term_spec(spec, term_idx).map(|cc| cc.kappa)
+}
+
+/// Indices of every constant-curvature (`curv(...)`) smooth term in `spec`.
+pub fn constant_curvature_term_indices(spec: &TermCollectionSpec) -> Vec<usize> {
+    (0..spec.smooth_terms.len())
+        .filter(|&idx| constant_curvature_term_spec(spec, idx).is_some())
+        .collect()
+}
+
 /// Freeze a `TermCollectionSpec` by baking in the concrete knots, centers,
 /// identifiability transforms, and random-effect levels that were resolved
 /// during design-matrix construction.  The result passes `validate_frozen`
@@ -21449,6 +21467,127 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     )?;
     log_spatial_aniso_scales(&exact_joint.resolvedspec);
     Ok(exact_joint)
+}
+
+/// The end-to-end curvature-as-an-estimand report for one `curv(...)` smooth:
+/// the fitted κ̂, its profile-likelihood confidence interval, the interior
+/// κ = 0 likelihood-ratio flatness test, and the topology-free geometry
+/// verdict. This is the #944 headline — it turns "we chose hyperbolic space"
+/// into "κ̂ = −1.8 (95% CI −2.6, −1.1), flat rejected at p = …".
+#[derive(Clone, Debug)]
+pub struct CurvatureInference {
+    /// Smooth-term index of the `curv(...)` term this report is about.
+    pub term_idx: usize,
+    /// The fitted signed sectional curvature κ̂ (the outer optimiser's argmin of
+    /// the profiled REML/LAML criterion over κ).
+    pub kappa_hat: f64,
+    /// Profile-likelihood CI for κ and the geometry verdict from its sign.
+    pub ci: crate::geometry::curvature_estimand::KappaProfileCi,
+    /// Interior-point κ = 0 likelihood-ratio flatness test (full χ²₁, no
+    /// half-χ² boundary correction — κ = 0 is an interior point of the
+    /// `S^d ← ℝ^d → H^d` family).
+    pub flatness: crate::geometry::curvature_estimand::FlatnessTest,
+}
+
+/// Compute the #944 curvature inference for the constant-curvature smooth at
+/// `term_idx`, given the already-fitted resolved spec (carrying κ̂) and the same
+/// fit inputs used to produce it.
+///
+/// The profiled criterion `V_p(κ) = max_{ρ} V(κ, ρ)` is evaluated as an oracle:
+/// for each probe κ, pin the term's curvature to κ, fit with κ-optimisation
+/// **disabled** (so only the smoothing parameters ρ are profiled), and read the
+/// resulting `reml_score` (the negative-log-evidence the outer loop minimises,
+/// so κ̂ is its argmin). The exact same criterion the joint κ-fit minimised —
+/// the only difference is which coordinates move — so κ̂ is a genuine stationary
+/// point of this oracle. The statistics (profile-CI walk, interior κ=0 LR test)
+/// are then the principled likelihood-set / Wilks constructions in
+/// [`crate::geometry::curvature_estimand`].
+///
+/// `v_pp` (the initial Wald step size) is taken from a central finite difference
+/// of `V_p` at κ̂; the CI itself is the exact χ²₁ likelihood crossing, not the
+/// Wald ellipsoid, so this only sizes the first bracket step.
+#[allow(clippy::too_many_arguments)]
+pub fn curvature_inference_forspec(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    term_idx: usize,
+    family: LikelihoodSpec,
+    options: &FitOptions,
+    level: f64,
+) -> Result<CurvatureInference, EstimationError> {
+    let kappa_hat = get_constant_curvature_kappa(resolvedspec, term_idx).ok_or_else(|| {
+        EstimationError::InvalidInput(format!(
+            "curvature_inference_forspec: term {term_idx} is not a constant-curvature smooth"
+        ))
+    })?;
+    let (kappa_min, kappa_max) = constant_curvature_kappa_bounds(data, resolvedspec, term_idx);
+
+    // Profiled criterion oracle V_p(κ): pin κ, fit with κ-optimisation OFF so
+    // only ρ is profiled, return the REML/LAML negative-log-evidence. Disabling
+    // κ-opt routes `fit_term_collectionwith_spatial_length_scale_optimization`
+    // straight to `fit_term_collection_forspec` at the spec's κ.
+    let fixed_kappa_options = SpatialLengthScaleOptimizationOptions {
+        enabled: false,
+        ..SpatialLengthScaleOptimizationOptions::default()
+    };
+    let v_p = |kappa: f64| -> Result<f64, String> {
+        if !kappa.is_finite() {
+            return Err(format!("V_p probed a non-finite κ = {kappa}"));
+        }
+        let mut probe_spec = resolvedspec.clone();
+        match probe_spec.smooth_terms.get_mut(term_idx).map(|t| &mut t.basis) {
+            Some(SmoothBasisSpec::ConstantCurvature { spec, .. }) => spec.kappa = kappa,
+            _ => {
+                return Err(format!(
+                    "V_p oracle: term {term_idx} is not a constant-curvature smooth"
+                ));
+            }
+        }
+        let fit = fit_term_collectionwith_spatial_length_scale_optimization(
+            data,
+            y.to_owned(),
+            weights.to_owned(),
+            offset.to_owned(),
+            &probe_spec,
+            family.clone(),
+            options,
+            &fixed_kappa_options,
+        )
+        .map_err(|e| format!("V_p fixed-κ fit at κ={kappa} failed: {e}"))?;
+        let score = fit_score(&fit.fit);
+        if score.is_finite() {
+            Ok(score)
+        } else {
+            Err(format!("V_p fixed-κ fit at κ={kappa} returned a non-finite score"))
+        }
+    };
+
+    // Wald step seed: central FD of V_p at κ̂ (only sizes the first bracket; the
+    // CI is the exact likelihood crossing). Step a small fraction of the κ
+    // window so the FD straddles κ̂ without leaving the chart.
+    let h = (1e-3 * (kappa_max - kappa_min)).max(1e-4);
+    let v_pp = match (v_p(kappa_hat + h), v_p(kappa_hat), v_p(kappa_hat - h)) {
+        (Ok(vp), Ok(v0), Ok(vm)) => (vp - 2.0 * v0 + vm) / (h * h),
+        _ => f64::NAN, // profile_ci_walk falls back to a default step
+    };
+
+    let ci = crate::geometry::curvature_estimand::profile_ci_walk(
+        &v_p, kappa_hat, v_pp, kappa_min, kappa_max, level, 1e-4,
+    )
+    .map_err(EstimationError::InvalidInput)?;
+    let flatness =
+        crate::geometry::curvature_estimand::flatness_lr_test(&v_p, kappa_hat)
+            .map_err(EstimationError::InvalidInput)?;
+
+    Ok(CurvatureInference {
+        term_idx,
+        kappa_hat,
+        ci,
+        flatness,
+    })
 }
 
 #[cfg(test)]
