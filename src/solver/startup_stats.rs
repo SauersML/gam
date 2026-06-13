@@ -231,9 +231,24 @@ const DOMINANT_NUMERIC_MARKERS: &[&str] = &[
     "pivot ~",
     "pivot~",
     "min_pivot=",
+    // The grid-spline factor writes `pivot {j} (value {s})`, where `{j}` is the
+    // INDEX and `{s}` is the offending diagonal value — so the value follows
+    // `(value `, which must out-rank the bare `pivot ` marker below (that would
+    // otherwise grab the integer index). Placed first so the genuine value wins.
+    "(value ",
+    // The Arrow-Schur row factor's genuinely-non-PD bail formats the pivot
+    // space-delimited — `non-PD pivot {sum} at index {i}` (arrow_schur.rs) —
+    // the exact `RemlConvergenceError` / non-PD-`H_tt` autopsy class #1036 must
+    // catch. The earlier `=`/`~`-delimited pivot markers still win when present;
+    // this bare-space form is the real solver's wording and parses `{sum}`.
+    "pivot ",
     "kkt=",
     "|∇l-sβ|=",
     "|g|=",
+    // P-IRLS inner-loop non-convergence (`estimate.rs`) reports the dominant
+    // diagnostic as the final gradient norm; that scalar is the stable
+    // cross-seed fingerprint for the GLM inner-stall class.
+    "gradient norm was ",
 ];
 
 /// Parse a leading floating-point number (optionally signed, optionally in
@@ -766,6 +781,82 @@ mod tests {
             dominant_magnitude_bucket("pivot=-6e-11"),
             dominant_magnitude_bucket("pivot=-6e+11"),
         );
+    }
+
+    #[test]
+    fn dominant_magnitude_bucket_parses_real_solver_wordings() {
+        // #1036 regression: the ACTUAL Arrow-Schur non-PD bail is space-delimited
+        // (`non-PD pivot {sum} at index {i}`), NOT `pivot=`. The detector must
+        // parse the real wording or it never fires on the sphere autopsy class.
+        assert_eq!(
+            dominant_magnitude_bucket(
+                "row 3 H_tt is non-PD at base ridge 0e0; non-PD pivot -6e-11 at index 2 \
+                 (matrix is not positive definite)"
+            ),
+            Some(MagnitudeBucket {
+                sign: -1,
+                order: -11
+            })
+        );
+        // Grid-spline factor: `pivot {j} (value {s})` — the VALUE follows
+        // `(value `, which must out-rank the bare `pivot ` (an integer index).
+        assert_eq!(
+            dominant_magnitude_bucket(
+                "grid spline 2d: penalized system not positive definite at pivot 4 (value -2.5e-09)"
+            ),
+            Some(MagnitudeBucket {
+                sign: -1,
+                order: -9
+            })
+        );
+        // P-IRLS inner-loop stall: the final gradient norm is the fingerprint.
+        assert_eq!(
+            dominant_magnitude_bucket(
+                "The P-IRLS inner loop did not converge within 200 iterations. \
+                 Last gradient norm was 3.400000e+02."
+            ),
+            Some(MagnitudeBucket { sign: 1, order: 2 })
+        );
+    }
+
+    /// #1036 end-to-end: three seeds whose REAL Arrow-Schur non-PD message (the
+    /// space-delimited `non-PD pivot {sum}` wording the solver actually emits)
+    /// repeats at the same order-of-magnitude pivot must trigger the generic
+    /// structural bail — the exact sphere-autopsy class that previously burned
+    /// all 12 seeds because the detector keyed only on `pivot=`.
+    #[test]
+    fn generic_detector_fires_on_real_arrow_nonpd_wording() {
+        let real = |seed: usize, pivot: &str| {
+            SeedRejection::from_message(
+                seed,
+                "validation",
+                format!(
+                    "RemlConvergenceError: row 3 H_tt is non-PD at base ridge 0e0; \
+                     non-PD pivot {pivot} at index 2 (matrix is not positive definite)"
+                ),
+            )
+        };
+        // Three consecutive seeds, same signed pivot order (≈ -6e-11), with the
+        // KKT residual deliberately NOT in the message — the pivot is the stable
+        // cross-seed invariant the autopsy identified.
+        let rejections = vec![
+            real(0, "-6.1e-11"),
+            real(1, "-5.8e-11"),
+            real(2, "-6.4e-11"),
+        ];
+        let (sig, run) = consecutive_generic_signature(&rejections, 3)
+            .expect("three identical real-wording non-PD pivots must trigger the bail");
+        assert_eq!(run, 3);
+        assert_eq!(sig.0, FailureVariantTag::Other);
+        assert_eq!(
+            sig.1,
+            Some(MagnitudeBucket {
+                sign: -1,
+                order: -11
+            })
+        );
+        // The aggregated label is the human-readable bail signature.
+        assert_eq!(generic_signature_label(&sig), "other@-1e-11");
     }
 
     #[test]
