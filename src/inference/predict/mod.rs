@@ -3108,13 +3108,33 @@ impl BernoulliMarginalSlopePredictor {
         self.transform_internal_eta_to_base_scale(final_eta_internal, Some(grad))
     }
 
-    fn final_eta_from_theta(
+    /// Per-row final (base-scale) linear predictor for an arbitrary
+    /// coefficient vector `theta` in the saved `[marginal | logslope |
+    /// score_warp? | link_dev?]` block order. The marginal-slope rigid
+    /// kernel is applied exactly per row, so the returned η is the same
+    /// object the point predictor consumes — only parameterised by an
+    /// external draw instead of `self.theta()`. Used by the posterior
+    /// predictive path (#1049) to map each Laplace draw to its η surface
+    /// before the shared eta→bands collapse; the response scale is the
+    /// probit inverse link `μ = Φ(η)`.
+    pub fn final_eta_from_theta(
         &self,
         input: &PredictInput,
         theta: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         let (eta, _) = self.final_eta_and_gradient_from_theta(input, theta, false)?;
         Ok(eta)
+    }
+
+    /// Length of the concatenated coefficient vector this predictor
+    /// consumes (`marginal + logslope + score_warp? + link_dev?`). The
+    /// posterior predictive path validates each saved draw against this
+    /// before mapping it through [`Self::final_eta_from_theta`].
+    pub fn theta_len(&self) -> usize {
+        self.beta_marginal.len()
+            + self.beta_logslope.len()
+            + self.beta_score_warp.as_ref().map_or(0, Array1::len)
+            + self.beta_link_dev.as_ref().map_or(0, Array1::len)
     }
 
     fn eta_standard_error_from_covariance(

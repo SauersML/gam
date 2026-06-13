@@ -3236,6 +3236,66 @@ impl FittedModel {
         }
     }
 
+    /// Concrete bernoulli marginal-slope predictor with explicit error
+    /// surfacing. `predictor()` boxes the same object behind the
+    /// `PredictableModel` trait and swallows construction failures into
+    /// `None`; the posterior predictive path (#1049) needs the concrete type
+    /// (for `final_eta_from_theta` / `theta_len`) and propagatable error
+    /// messages, so it builds the predictor here instead.
+    pub fn bernoulli_marginal_slope_predictor(
+        &self,
+    ) -> Result<BernoulliMarginalSlopePredictor, String> {
+        if !matches!(
+            self.predict_model_class(),
+            PredictModelClass::BernoulliMarginalSlope
+        ) {
+            return Err(format!(
+                "bernoulli_marginal_slope_predictor: model is not a bernoulli marginal-slope \
+                 model (class {:?})",
+                self.predict_model_class()
+            ));
+        }
+        let runtime = self
+            .saved_prediction_runtime()
+            .map_err(|err| format!("bernoulli marginal-slope predictor runtime: {err}"))?;
+        let unified = self
+            .unified()
+            .ok_or_else(|| "bernoulli marginal-slope predictor requires a unified fit".to_string())?;
+        let payload = self.payload();
+        let z_column = payload
+            .z_column
+            .clone()
+            .ok_or_else(|| "bernoulli marginal-slope predictor requires a saved z column".to_string())?;
+        BernoulliMarginalSlopePredictor::from_unified(
+            unified,
+            z_column,
+            payload
+                .latent_z_normalization
+                .ok_or_else(|| "marginal-slope predictor requires saved latent-z normalization".to_string())?,
+            payload
+                .latent_measure
+                .clone()
+                .ok_or_else(|| "marginal-slope predictor requires a saved latent measure".to_string())?,
+            payload
+                .marginal_baseline
+                .ok_or_else(|| "marginal-slope predictor requires a saved marginal baseline".to_string())?,
+            payload
+                .logslope_baseline
+                .ok_or_else(|| "marginal-slope predictor requires a saved logslope baseline".to_string())?,
+            self.resolved_inverse_link()
+                .map_err(|err| format!("marginal-slope predictor inverse link: {err}"))?
+                .unwrap_or(InverseLink::Standard(StandardLink::Probit)),
+            self.family_state
+                .frailty()
+                .ok_or_else(|| "marginal-slope predictor requires a saved frailty spec".to_string())?
+                .clone(),
+            runtime.score_warp,
+            runtime.link_deviation,
+            runtime.latent_z_rank_int_calibration,
+            runtime.latent_z_conditional_calibration,
+        )
+    }
+
     /// V∞ §5 coverage floor for the measure-jet extrapolation variance: a
     /// band level "covers" a query once its kernel mass reaches this fraction
     /// of that level's web-averaged support. Magic-by-default (no dial):
