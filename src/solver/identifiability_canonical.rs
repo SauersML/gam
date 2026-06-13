@@ -377,8 +377,9 @@ pub fn canonicalize_for_identifiability(
     // orthogonalisation pass before the fail-closed audit. `try_orthogonalize_
     // blocks` is self-gating (it returns `None` — and the audit runs unchanged —
     // unless there are ≥2 plain single-channel dense blocks with an actual
-    // structural overlap to remove, deferring on any family-owned-geometry block
-    // and on clean designs), so this is byte-identical wherever there is nothing
+    // structural overlap to remove, deferring on any family-owned-geometry block,
+    // any multi-channel `stacked_design` block, and on clean designs), so this is
+    // byte-identical wherever there is nothing
     // to orthogonalise.
     canonicalize_for_identifiability_inner(specs, true)
 }
@@ -982,6 +983,23 @@ fn try_orthogonalize_blocks(
     // no overlap to remove falls through to the audit gate byte-identically.)
     let family_owned_geometry = specs.iter().any(|s| s.jacobian_callback.is_some());
     if family_owned_geometry {
+        return Ok(None);
+    }
+
+    // Multi-channel eta blocks (`stacked_design = Some(_)`, e.g. the latent-
+    // survival / survival location-scale time-transform block whose solver eta
+    // is `[entry; exit; deriv] · β`, a `3·n`-row operator) cannot be expressed
+    // by the single-channel `X_b · V_b` reparam this path builds: that reparam
+    // only rewrites the n-row `design`, and the orthogonalised-spec builder
+    // below deliberately sets `stacked_design = None`. Dropping the stacked
+    // operator silently collapses the family's eta from `3·n` rows to `n`,
+    // which trips the family's own `eta length mismatch: got n, expected 3n`
+    // shape check (gam#1068). Defer to the audit gate so the multi-channel
+    // operator survives untouched; the audit's column-selection reduction
+    // (`canonicalize_for_identifiability_inner`) does pull `stacked_design`
+    // through correctly.
+    let multi_channel_geometry = specs.iter().any(|s| s.stacked_design.is_some());
+    if multi_channel_geometry {
         return Ok(None);
     }
 
@@ -1750,6 +1768,74 @@ mod tests {
             res.dropped,
             vec![(1, 1)],
             "one direction dropped from block 1"
+        );
+    }
+
+    /// Regression for gam#1068: a multi-channel block (`stacked_design = Some`,
+    /// the latent-survival / survival-LS time-transform layout whose solver eta
+    /// is `[entry; exit; deriv] · β` — a `3·n`-row operator) must NOT lose its
+    /// stacked operator through canonicalisation, even when it shares a column
+    /// (here the constant) with a higher-priority block that would otherwise
+    /// trigger the single-channel orthogonalisation reparam. The
+    /// orthogonalisation path sets `stacked_design = None`; if it ran on this
+    /// block the family's eta would collapse from `3·n` rows to `n` and trip
+    /// `latent survival time eta length mismatch: got n, expected 3n`. The fix
+    /// defers any spec set carrying a `stacked_design` to the column-selection
+    /// audit, which preserves the stacked operator.
+    #[test]
+    fn canonical_preserves_stacked_design_for_multichannel_block() {
+        let n = 24;
+        let x = linspace(n);
+        // Mean block (higher priority) carries the constant + a linear term.
+        let mut mean = Array2::<f64>::zeros((n, 2));
+        // Time block (lower priority) single-channel `design` is the n-row exit
+        // view; its eta-producing `stacked_design` is the 3n-row [entry; exit;
+        // deriv] stack. Both carry the shared constant column (the alias the
+        // orthogonaliser would try to remove).
+        let mut time_exit = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            mean[[i, 0]] = 1.0;
+            mean[[i, 1]] = x[i];
+            time_exit[[i, 0]] = 1.0;
+            time_exit[[i, 1]] = x[i] * x[i];
+        }
+        let mut stacked = Array2::<f64>::zeros((3 * n, 2));
+        for i in 0..n {
+            // entry channel (zeros baseline), exit channel (= design), deriv.
+            stacked[[i, 0]] = 1.0;
+            stacked[[i, 1]] = x[i] * x[i] * 0.5;
+            stacked[[n + i, 0]] = 1.0;
+            stacked[[n + i, 1]] = x[i] * x[i];
+            stacked[[2 * n + i, 0]] = 0.0;
+            stacked[[2 * n + i, 1]] = 2.0 * x[i];
+        }
+
+        let mean_spec = spec_from_dense_with_priority("mean", mean, 150);
+        let mut time_spec = spec_from_dense_with_priority("time_transform", time_exit, 200);
+        time_spec.stacked_design = Some(DesignMatrix::Dense(DenseDesignMatrix::from(stacked)));
+        time_spec.stacked_offset = Some(Array1::<f64>::zeros(3 * n));
+
+        let specs = [mean_spec, time_spec];
+        let canon = canonicalize_for_identifiability(&specs)
+            .expect("multi-channel canonicalisation must succeed (defer to audit gate)");
+
+        let time_reduced = canon
+            .reduced_specs
+            .iter()
+            .find(|s| s.name == "time_transform")
+            .expect("time block survives canonicalisation");
+        let stacked_after = time_reduced
+            .stacked_design
+            .as_ref()
+            .expect("stacked_design must survive canonicalisation (gam#1068)");
+        assert_eq!(
+            stacked_after.nrows(),
+            3 * n,
+            "stacked eta operator must keep its 3·n rows; collapsing to n is the #1068 bug",
+        );
+        assert!(
+            time_reduced.stacked_offset.is_some(),
+            "stacked_offset must survive alongside stacked_design",
         );
     }
 }
