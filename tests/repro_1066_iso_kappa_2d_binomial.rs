@@ -1,0 +1,174 @@
+//! Repro for #1066: the 2-D spatial isotropic-κ optimizer hard-fails
+//! (`IntegrationError` / "isotropic analytic optimization did not converge
+//! after 80 iterations") on a standard binomial-logit geo smooth, for both the
+//! `ps`/ThinPlate and `matern` bases, where mgcv fits the same data in seconds.
+//!
+//! This is the production 2-D binomial analogue of #1053 (iso-1D Matérn). The
+//! exact-gradient FD pins pass (#1053/#901), so the math is correct — the defect
+//! is the robustness of the iso-κ outer optimizer (seed / ψ-axis step scaling /
+//! line-search) on the stiff binomial landscape at higher basis k and larger n.
+//!
+//! The fixture reproduces the failing shape at a CI-tractable size (n=2000,
+//! k=12) and asserts the fit completes (no `IntegrationError`) and produces a
+//! finite, well-fit model. A regression: it must converge, not bail.
+
+use gam::{
+    FitRequest, FitResult, StandardFitRequest,
+    basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu},
+    estimate::FitOptions,
+    smooth::{
+        ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
+        TermCollectionSpec,
+    },
+    types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink},
+};
+use ndarray::{Array1, Array2};
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
+
+/// Geo-shaped 2-D binomial-logit fixture: a smooth spatial probability field on
+/// two correlated coordinates (mimicking PC1/PC2 of a population-structure
+/// embedding), Bernoulli outcomes. Deterministic via a fixed seed.
+fn simulate_2d_binomial(n: usize) -> (Array2<f64>, Array1<f64>) {
+    let mut rng = StdRng::seed_from_u64(0x1066_2026);
+    let mut x = Array2::<f64>::zeros((n, 2));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        // Clustered geo coordinates: a couple of Gaussian blobs so the minimum
+        // pairwise center spacing r_min is small relative to the diameter r_max
+        // — exactly the geometry that pushes the ψ window's upper edge
+        // ln(100/r_min) far out (the #1066 bad-seed-basin regime).
+        let blob = rng.random_range(0.0..1.0);
+        let (cx, cy) = if blob < 0.5 { (-1.0, -0.7) } else { (1.0, 0.8) };
+        let p1 = cx + rng.random_range(-0.9..0.9);
+        let p2 = cy + rng.random_range(-0.9..0.9);
+        x[[i, 0]] = p1;
+        x[[i, 1]] = p2;
+        // Smooth spatial logit field.
+        let eta = 0.9 * (0.8 * p1).sin() + 0.6 * (0.7 * p2).cos() - 0.3 * p1 * p2;
+        let prob = 1.0 / (1.0 + (-eta).exp());
+        y[i] = if rng.random_range(0.0..1.0) < prob { 1.0 } else { 0.0 };
+    }
+    (x, y)
+}
+
+fn binomial_spec(matern: bool, num_centers: usize) -> TermCollectionSpec {
+    let basis = if matern {
+        SmoothBasisSpec::Matern {
+            feature_cols: vec![0, 1],
+            spec: MaternBasisSpec {
+                center_strategy: CenterStrategy::FarthestPoint { num_centers },
+                periodic: None,
+                length_scale: 1.0,
+                nu: MaternNu::ThreeHalves,
+                include_intercept: false,
+                double_penalty: false,
+                identifiability: MaternIdentifiability::CenterSumToZero,
+                // Isotropic κ path (the #1066 subject): aniso_log_scales = None.
+                aniso_log_scales: None,
+                nullspace_shrinkage_survived: None,
+            },
+            input_scales: None,
+        }
+    } else {
+        SmoothBasisSpec::ThinPlate {
+            feature_cols: vec![0, 1],
+            spec: gam::basis::ThinPlateBasisSpec {
+                center_strategy: CenterStrategy::FarthestPoint { num_centers },
+                length_scale: 1.0,
+                order: 2,
+                include_intercept: false,
+                double_penalty: false,
+                identifiability: gam::basis::ThinPlateIdentifiability::CenterSumToZero,
+                aniso_log_scales: None,
+                nullspace_shrinkage_survived: None,
+            },
+        }
+    };
+    TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            name: "geo".to_string(),
+            basis,
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    }
+}
+
+fn fit_options() -> FitOptions {
+    FitOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        compute_inference: false,
+        skip_rho_posterior_inference: false,
+        max_iter: 30,
+        tol: 1e-6,
+        nullspace_dims: vec![],
+        linear_constraints: None,
+        firth_bias_reduction: false,
+        adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    }
+}
+
+fn fit_geo(matern: bool, n: usize, num_centers: usize) -> Result<Array1<f64>, String> {
+    let (x, y) = simulate_2d_binomial(n);
+    let weights = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+    let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
+        data: x,
+        y,
+        weights,
+        offset,
+        spec: binomial_spec(matern, num_centers),
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Logit),
+        ),
+        options: fit_options(),
+        kappa_options,
+        wiggle: None,
+        coefficient_groups: Vec::new(),
+        penalty_block_gamma_priors: Vec::new(),
+        latent_coord: None,
+        _marker: std::marker::PhantomData,
+    }))
+    .map_err(|e| format!("{e:?}"))?;
+    match result {
+        FitResult::Standard(s) => {
+            if s.fit.beta.iter().all(|v: &f64| v.is_finite()) {
+                Ok(s.fit.beta.clone())
+            } else {
+                Err("non-finite coefficients".to_string())
+            }
+        }
+        _ => Err("expected Standard fit result".to_string()),
+    }
+}
+
+#[test]
+fn iso_kappa_2d_binomial_matern_converges_1066() {
+    gam::init_parallelism();
+    let beta = fit_geo(true, 2000, 12).unwrap_or_else(|e| {
+        panic!("#1066 matern iso-κ 2-D binomial fit hard-failed (should converge): {e}")
+    });
+    assert!(beta.iter().all(|v| v.is_finite()), "beta must be finite");
+}
+
+#[test]
+fn iso_kappa_2d_binomial_ps_converges_1066() {
+    gam::init_parallelism();
+    let beta = fit_geo(false, 2000, 12).unwrap_or_else(|e| {
+        panic!("#1066 ps/thinplate iso-κ 2-D binomial fit hard-failed (should converge): {e}")
+    });
+    assert!(beta.iter().all(|v| v.is_finite()), "beta must be finite");
+}
