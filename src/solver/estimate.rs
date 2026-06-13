@@ -3246,7 +3246,21 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 log::debug!(
                     "[psi-gram-tensor] installed n-free Gaussian sufficient statistics at psi={psi:.6}"
                 );
-            }
+                // #1033b: install the conditioned-frame exact ψ-derivatives so
+                // the Gaussian ψ-gradient HyperCoord is assembled from these
+                // k×k objects instead of the n×k ∂X/∂ψ slab — retiring the
+                // second per-trial n-pass. Same conditioned column frame as the
+                // installed Gram; the hyper-coord builder applies the per-eval
+                // Qs/free-basis transform. Failure here just keeps the slab
+                // gradient path (still correct, only slower).
+                if self.reml_state.install_gaussian_psi_gram_deriv(Arc::new((
+                    tensor.dgram_dpsi(psi),
+                    tensor.drhs_dpsi(psi),
+                ))) {
+                    log::debug!(
+                        "[psi-gram-tensor] installed n-free ψ-gradient derivatives at psi={psi:.6}"
+                    );
+                }
         }
         Ok(hyper_dirs)
     }

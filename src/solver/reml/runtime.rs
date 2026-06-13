@@ -5461,6 +5461,7 @@ impl<'a> RemlState<'a> {
             kronecker_penalty_system: None,
             kronecker_factored: None,
             gaussian_fixed_cache: RwLock::new(None),
+            gaussian_psi_gram_deriv: RwLock::new(None),
             alo_frozen_nuisance: RwLock::new(None),
             persistent_warm_start_key: RwLock::new(None),
             persistent_latent_values_fingerprint: None,
@@ -5516,6 +5517,9 @@ impl<'a> RemlState<'a> {
         // The Gaussian-fixed cache is keyed to (X, y, w, offset); replacing the
         // design invalidates it. The new surface will repopulate it on demand.
         *self.gaussian_fixed_cache.write().unwrap() = None;
+        // The conditioned-frame ψ-gram derivative is keyed to the same design;
+        // a new design invalidates it. The installing trial repopulates it.
+        *self.gaussian_psi_gram_deriv.write().unwrap() = None;
         *self.alo_frozen_nuisance.write().unwrap() = None;
         *self.persistent_warm_start_key.write().unwrap() = None;
         self.persistent_warm_start_loaded
@@ -7062,6 +7066,39 @@ impl<'a> RemlState<'a> {
         }
         *self.gaussian_fixed_cache.write().unwrap() = Some(cache);
         true
+    }
+
+    /// Install the conditioned-frame exact ψ-derivative pair
+    /// `(∂XᵀWX/∂ψ, ∂XᵀW(y−offset)/∂ψ)` for the single design-moving spatial
+    /// hyperparameter (#1033b). Shapes must match the current `p` (k×k Gram
+    /// derivative, k-vector rhs derivative) and the Gaussian-fixed cache must
+    /// be eligible — the gradient lane that consumes this only fires for
+    /// Gaussian-identity. Returns whether the pair was installed.
+    pub(crate) fn install_gaussian_psi_gram_deriv(
+        &self,
+        deriv: Arc<(ndarray::Array2<f64>, ndarray::Array1<f64>)>,
+    ) -> bool {
+        if !self.gaussian_fixed_cache_eligible()
+            || deriv.0.nrows() != self.p
+            || deriv.0.ncols() != self.p
+            || deriv.1.len() != self.p
+        {
+            return false;
+        }
+        *self.gaussian_psi_gram_deriv.write().unwrap() = Some(deriv);
+        true
+    }
+
+    /// Conditioned-frame exact ψ-derivative pair, when installed for the
+    /// current in-window Gaussian trial (#1033b). `None` keeps the slab path.
+    pub(crate) fn gaussian_psi_gram_deriv(
+        &self,
+    ) -> Option<Arc<(ndarray::Array2<f64>, ndarray::Array1<f64>)>> {
+        self.gaussian_psi_gram_deriv
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
     }
 
     pub(crate) fn gaussian_fixed_cache_if_eligible(
@@ -10956,7 +10993,7 @@ impl<'a> RemlState<'a> {
                     (coords, Some(epf), Some(repf), fixed_drift_deriv)
                 } else if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
                     (
-                        self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs)?,
+                        self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs, false)?,
                         None,
                         None,
                         None,
@@ -10969,14 +11006,16 @@ impl<'a> RemlState<'a> {
                     .is_none()
                 {
                     (
-                        self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?,
+                        self.build_tau_hyper_coords_original_basis(
+                            rho, &bundle, hyper_dirs, false,
+                        )?,
                         None,
                         None,
                         None,
                     )
                 } else {
                     (
-                        self.build_tau_hyper_coords(rho, &bundle, hyper_dirs)?,
+                        self.build_tau_hyper_coords(rho, &bundle, hyper_dirs, false)?,
                         None,
                         None,
                         None,
@@ -11090,7 +11129,7 @@ impl<'a> RemlState<'a> {
 
         let ext_coords = if !hyper_dirs.is_empty() {
             if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-                self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs)?
+                self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs, false)?
             } else if matches!(
                 bundle.pirls_result.coordinate_frame,
                 pirls::PirlsCoordinateFrame::TransformedQs
@@ -11098,9 +11137,9 @@ impl<'a> RemlState<'a> {
                 .active_constraint_free_basis(bundle.pirls_result.as_ref())
                 .is_none()
             {
-                self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?
+                self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs, false)?
             } else {
-                self.build_tau_hyper_coords(rho, &bundle, hyper_dirs)?
+                self.build_tau_hyper_coords(rho, &bundle, hyper_dirs, false)?
             }
         } else {
             Vec::new()
