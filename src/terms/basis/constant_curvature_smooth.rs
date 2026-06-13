@@ -557,6 +557,7 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linalg::faer_ndarray::FaerEigh;
 
     // Diagnostic (#1059 follow-up): show that a κ-FROZEN chart-scale length
     // makes the geodesic-exponential kernel COLLAPSE toward the constant
@@ -610,6 +611,63 @@ mod tests {
         assert!(
             s_pos < s_zero && s_zero < s_neg,
             "expected kernel spread to shrink with κ at frozen ℓ: κ=-2 {s_neg} κ=0 {s_zero} κ=+2 {s_pos}"
+        );
+
+        // Decompose the κ-monotone REML Occam term. The realized penalty is the
+        // Frobenius-normalized centered Gram S~ = S_raw/‖S_raw‖_F with
+        // S_raw = symm(zᵀ K z); the REML evidence carries +½ log|S~|_+ over its
+        // range. Print log det₊(S~) per κ to see whether the penalty-normalization
+        // Occam term (not just the modest kernel-spread shift) is what rails κ.
+        let weights = Array1::<f64>::ones(centers.nrows());
+        let z = weighted_coefficient_sum_to_zero_transform(weights.view()).unwrap();
+        let logdet_norm_penalty = |kappa: f64, ell: f64| -> f64 {
+            let k =
+                constant_curvature_kernel_matrix(centers.view(), centers.view(), kappa, ell).unwrap();
+            let s_raw = symmetrize(&z.t().dot(&k).dot(&z));
+            let (s_norm, _c) = normalize_penalty(&s_raw);
+            let sym = symmetrize(&s_norm);
+            let (evals, _v) = FaerEigh::eigh(&sym, faer::Side::Lower).unwrap();
+            let max = evals.iter().cloned().fold(0.0_f64, f64::max);
+            let tol = max * 1e-9;
+            evals
+                .iter()
+                .filter(|&&e| e > tol)
+                .map(|&e| e.ln())
+                .sum::<f64>()
+        };
+        let l_neg = logdet_norm_penalty(-2.0, ell_frozen);
+        let l_zero = logdet_norm_penalty(0.0, ell_frozen);
+        let l_pos = logdet_norm_penalty(2.0, ell_frozen);
+        eprintln!(
+            "[κ-collapse] log|S~|_+ (frozen ℓ): κ=-2 {l_neg:.4} | κ=0 {l_zero:.4} | κ=+2 {l_pos:.4}"
+        );
+
+        // GEODESIC-SCALED ℓ removes the κ-dependence of the kernel resolution:
+        // set ℓ(κ) = median geodesic distance d_κ among centers. Then the spread
+        // should be ~κ-invariant. Print the geodesic-ℓ spread per κ.
+        let geo_median_ell = |kappa: f64| -> f64 {
+            let m = centers.nrows();
+            let manifold = ConstantCurvature::new(centers.ncols(), kappa);
+            let mut dists = Vec::with_capacity(m * (m - 1) / 2);
+            for i in 0..m {
+                for j in (i + 1)..m {
+                    dists.push(manifold.distance(centers.row(i), centers.row(j)).unwrap());
+                }
+            }
+            dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            dists[dists.len() / 2]
+        };
+        let gs_neg = spread(-2.0, geo_median_ell(-2.0));
+        let gs_zero = spread(0.0, geo_median_ell(0.0));
+        let gs_pos = spread(2.0, geo_median_ell(2.0));
+        let gl_neg = logdet_norm_penalty(-2.0, geo_median_ell(-2.0));
+        let gl_zero = logdet_norm_penalty(0.0, geo_median_ell(0.0));
+        let gl_pos = logdet_norm_penalty(2.0, geo_median_ell(2.0));
+        eprintln!(
+            "[κ-collapse] geodesic ℓ: spread κ=-2 {gs_neg:.4} | κ=0 {gs_zero:.4} | κ=+2 {gs_pos:.4}"
+        );
+        eprintln!(
+            "[κ-collapse] geodesic ℓ: log|S~|_+ κ=-2 {gl_neg:.4} | κ=0 {gl_zero:.4} | κ=+2 {gl_pos:.4}"
         );
     }
 }
