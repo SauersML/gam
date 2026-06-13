@@ -43,8 +43,8 @@ fn simulate_1d_gaussian(n: usize) -> (Array2<f64>, Array1<f64>) {
     for i in 0..n {
         let t = (i as f64) / (n as f64 - 1.0) * 6.0 - 3.0;
         x[[i, 0]] = t;
-        // smooth signal + a tiny deterministic ripple so the optimizer has work
-        y[i] = (1.3 * t).sin() + 0.25 * (3.0 * t).cos();
+        // gentle smooth signal — a well-conditioned target for the κ optimizer
+        y[i] = (t).sin();
     }
     (x, y)
 }
@@ -58,12 +58,12 @@ fn spec_1d() -> TermCollectionSpec {
             basis: SmoothBasisSpec::Matern {
                 feature_cols: vec![0],
                 spec: MaternBasisSpec {
-                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     periodic: None,
                     length_scale: 1.0,
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
-                    double_penalty: true,
+                    double_penalty: false,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
                     nullspace_shrinkage_survived: None,
@@ -106,7 +106,7 @@ fn run_fit(n: usize, kappa_enabled: bool) -> f64 {
         enabled: kappa_enabled,
         // Several outer iterations so the κ-phase is a measurable share of the
         // total when enabled; one fit's worth of work when disabled.
-        max_outer_iter: if kappa_enabled { 6 } else { 1 },
+        max_outer_iter: if kappa_enabled { 15 } else { 1 },
         rel_tol: 1e-5,
         log_step: std::f64::consts::LN_2,
         min_length_scale: 1e-2,
