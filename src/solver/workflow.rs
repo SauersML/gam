@@ -4484,6 +4484,222 @@ pub fn fit_spline_scan_from_formula(
         .map_err(|reason| WorkflowError::IntegrationFailed { reason })
 }
 
+/// Inputs extracted by [`residual_cascade_fast_path`] for the O(n log n)
+/// multiresolution residual-cascade smooth
+/// ([`crate::solver::residual_cascade::fit_residual_cascade`]).
+pub struct ResidualCascadeInputs {
+    /// One slice per coordinate axis (2 or 3) of the single scattered smooth.
+    pub coords: Vec<Vec<f64>>,
+    /// Gaussian response.
+    pub y: Vec<f64>,
+    /// Observation weights (variance is `σ²/w`).
+    pub w: Vec<f64>,
+    /// Per-axis positive metric scaling `diag(metric)` of `z = diag(metric)·x`.
+    pub metric: Vec<f64>,
+    /// Sobolev smoothness order `s` of the multilevel Wendland-(3,1) prior,
+    /// clamped into the native-space window `(d/2, (d+3)/2]` (issue caveat 1).
+    pub sobolev_s: f64,
+}
+
+/// Derived dense-kernel cliff: the cascade auto-route fires only once the dense
+/// radial basis the smooth would otherwise use has SATURATED at its center cap
+/// (`default_num_centers == K_MAX`), so the dense `O(n·K² + K³)` kernel solve
+/// can no longer grow resolution with `n` and the streaming cascade's
+/// `O(n·polylog)` is the only path that keeps improving. This is the structural
+/// "past the dense-kernel cliff" condition the issue names — derived from the
+/// dense sizing rule, NOT a magic n constant or a user flag.
+fn past_dense_kernel_cliff(n: usize, d: usize) -> bool {
+    // `default_num_centers` clamps to K_MAX = 2000; equality means the dense
+    // basis is pinned at the cap and cannot densify further with n.
+    const DENSE_CENTER_CAP: usize = 2000;
+    crate::terms::basis::default_num_centers(n, d) >= DENSE_CENTER_CAP
+}
+
+/// Map a Duchon/Matérn smoothness order onto the cascade's Sobolev order,
+/// clamped into the Wendland-(3,1) native window `(d/2, (d+3)/2]` (issue
+/// caveat 1: the multilevel frame can only represent up to `H^{(d+3)/2}`).
+fn cascade_sobolev_order(requested: f64, d: usize) -> f64 {
+    let lo = d as f64 / 2.0;
+    let hi = (d as f64 + 3.0) / 2.0;
+    // Nudge strictly inside the open lower bound when the request lands on it.
+    let eps = 1e-6 * (hi - lo);
+    requested.clamp(lo + eps, hi)
+}
+
+/// Detection seam for the O(n log n) multiresolution residual-cascade fast path
+/// (issue #1032).
+///
+/// This mirrors [`spline_scan_fast_path`] in shape but carries one CRITICAL
+/// difference dictated by the issue: the cascade is **not** the same posterior
+/// as the Duchon/Matérn term it stands in for (a different finite basis — the
+/// multilevel Wendland frame, not the reduced-rank radial kernel). So unlike
+/// the 1-D scan, which silently swaps an identical posterior, this path must
+/// only fire as an explicit alternative estimator on the structural signature
+/// the issue names, never as a transparent replacement. It returns `Some` only
+/// when ALL of the following hold:
+/// - family is Gaussian + identity link (the scattered low-d smooth the
+///   cascade solves);
+/// - none of the exotic-link / constraint / Firth / Kronecker / coefficient-
+///   group / hyperprior machinery is engaged;
+/// - the model is exactly one smooth term — no linear terms, no random
+///   effects, no by-variables;
+/// - that smooth is a scattered radial spatial smooth (`Duchon` or `Matern`)
+///   over `d ∈ {2, 3}` coordinates with no shape constraint;
+/// - the offset is identically zero and every weight is finite and positive;
+/// - `n` is past the derived dense-kernel cliff
+///   ([`past_dense_kernel_cliff`]) — below it the dense radial path is both
+///   exact-posterior and cheap, so there is no reason to change estimators.
+///
+/// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric (the
+/// spec's isotropic radial distance); the quasi-uniformity guard inside
+/// [`crate::solver::residual_cascade::fit_residual_cascade`] (issue caveat 2)
+/// is the no-regression gate that refuses the iterative solve — and forces the
+/// caller back to the dense path — when a near-degenerate metric would break
+/// the BPX iteration bound.
+pub fn residual_cascade_fast_path(
+    request: &StandardFitRequest<'_>,
+) -> Option<ResidualCascadeInputs> {
+    if !request.family.is_gaussian_identity() {
+        return None;
+    }
+    if request.wiggle.is_some()
+        || request.latent_coord.is_some()
+        || !request.coefficient_groups.is_empty()
+        || !request.penalty_block_gamma_priors.is_empty()
+    {
+        return None;
+    }
+    let options = &request.options;
+    if options.latent_cloglog.is_some()
+        || options.mixture_link.is_some()
+        || options.sas_link.is_some()
+        || options.linear_constraints.is_some()
+        || options.adaptive_regularization.is_some()
+        || options.kronecker_penalty_system.is_some()
+        || options.kronecker_factored.is_some()
+        || options.firth_bias_reduction
+        || !options.nullspace_dims.is_empty()
+    {
+        return None;
+    }
+    let spec = &request.spec;
+    if !spec.linear_terms.is_empty()
+        || !spec.random_effect_terms.is_empty()
+        || spec.smooth_terms.len() != 1
+    {
+        return None;
+    }
+    let term = &spec.smooth_terms[0];
+    if !matches!(term.shape, crate::smooth::ShapeConstraint::None)
+        || term.joint_null_rotation.is_some()
+    {
+        return None;
+    }
+    // Only scattered radial spatial smooths (Duchon / Matérn) over 2–3 axes.
+    // The Duchon spectral power `p + s` and the Matérn order set the requested
+    // Sobolev smoothness; both clamp into the Wendland native window.
+    let (feature_cols, requested_s) = match &term.basis {
+        crate::smooth::SmoothBasisSpec::Duchon { feature_cols, spec } => {
+            // Pure-Duchon native order is `p + s` (kernel exponent 2(p+s)−d);
+            // the multilevel frame targets the same continuum smoothness. `p`
+            // is the polynomial nullspace degree, `s` the spectral power.
+            let p = match spec.nullspace_order {
+                crate::basis::DuchonNullspaceOrder::Zero => 0.0,
+                crate::basis::DuchonNullspaceOrder::Linear => 1.0,
+                crate::basis::DuchonNullspaceOrder::Degree(k) => k as f64,
+            };
+            (feature_cols, spec.power + p)
+        }
+        crate::smooth::SmoothBasisSpec::Matern { feature_cols, spec } => {
+            // Matérn smoothness ν sets native Sobolev order ν + d/2; the cascade
+            // frame represents up to (d+3)/2, so the clamp below applies the
+            // ceiling. (d is known just below from feature_cols.)
+            let nu = spec.nu.half_integer_value();
+            (feature_cols, nu + feature_cols.len() as f64 / 2.0)
+        }
+        _ => return None,
+    };
+    let d = feature_cols.len();
+    if !(2..=3).contains(&d) {
+        return None;
+    }
+    if request.offset.iter().any(|&v| v != 0.0) {
+        return None;
+    }
+    if request.weights.iter().any(|&v| !(v.is_finite() && v > 0.0)) {
+        return None;
+    }
+    let n = request.y.len();
+    if n != request.data.nrows() || feature_cols.iter().any(|&c| c >= request.data.ncols()) {
+        return None;
+    }
+    if !past_dense_kernel_cliff(n, d) {
+        return None;
+    }
+    let coords: Vec<Vec<f64>> = feature_cols
+        .iter()
+        .map(|&c| request.data.column(c).iter().copied().collect())
+        .collect();
+    let y: Vec<f64> = request.y.iter().copied().collect();
+    let w: Vec<f64> = request.weights.iter().copied().collect();
+    if coords.iter().any(|axis| axis.iter().any(|v| !v.is_finite()))
+        || y.iter().any(|v| !v.is_finite())
+    {
+        return None;
+    }
+    let metric = vec![1.0_f64; d];
+    let sobolev_s = cascade_sobolev_order(requested_s, d);
+    Some(ResidualCascadeInputs {
+        coords,
+        y,
+        w,
+        metric,
+        sobolev_s,
+    })
+}
+
+/// Formula-level library entry for the O(n log n) residual-cascade fast path
+/// (issue #1032).
+///
+/// Materializes the formula exactly like [`fit_from_formula`], runs the
+/// [`residual_cascade_fast_path`] detection, and — when it fires AND the
+/// quasi-uniformity guard inside the cascade certifies the metric — returns the
+/// certified [`ResidualCascadeFit`](crate::solver::residual_cascade::ResidualCascadeFit).
+/// `Ok(None)` means EITHER the model is not the cascade-eligible shape OR the
+/// quasi-uniformity guard rejected the metric; in both cases the caller falls
+/// back to the dense [`fit_from_formula`] path (the cascade is a different
+/// posterior, so the fallback is a genuine estimator choice, never a silent
+/// swap). This keeps every persistence-bearing consumer on the dense fit until
+/// the cascade payload schema lands.
+pub fn fit_residual_cascade_from_formula(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<Option<crate::solver::residual_cascade::ResidualCascadeFit>, WorkflowError> {
+    let mat = materialize(formula, data, config)?;
+    let FitRequest::Standard(request) = mat.request else {
+        return Ok(None);
+    };
+    let Some(inputs) = residual_cascade_fast_path(&request) else {
+        return Ok(None);
+    };
+    let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
+    match crate::solver::residual_cascade::fit_residual_cascade(
+        &coord_refs,
+        &inputs.y,
+        &inputs.w,
+        &inputs.metric,
+        inputs.sobolev_s,
+    ) {
+        Ok(fit) => Ok(Some(fit)),
+        // The quasi-uniformity guard (caveat 2) and any degenerate-design
+        // signal both surface as a build/solve error; treat them as "not
+        // cascade-eligible" so the caller falls back to the dense kernel path
+        // rather than failing the fit outright.
+        Err(_) => Ok(None),
+    }
+}
+
 /// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
 pub fn materialize<'a>(
     formula: &str,
