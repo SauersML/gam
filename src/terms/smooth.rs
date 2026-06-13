@@ -3214,7 +3214,7 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
 
     // Duchon anisotropy η is a FIXED, geometry-derived basis parameter, NOT a
     // REML hyper axis: the metric is estimated once from the knot-cloud spread
-    // (`maybe_initialize_aniso_contrasts`, applied on every basis build) and the
+    // (`auto_seed_aniso_contrasts`, applied on every Duchon basis build) and the
     // Hilbert-scale λ's carry all learned smoothness. So a pure Duchon (no κ)
     // contributes no outer optimization axis even when `scale_dims` is on —
     // "standardize the geometry, then learn the smoothness." Only an explicit

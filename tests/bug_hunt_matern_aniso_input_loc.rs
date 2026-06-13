@@ -10,8 +10,10 @@
 //!
 //! Both `build_matern_basis` (forward, identifiability = None ⇒ raw kernel
 //! columns) and `matern_input_location_jet_nd` / `matern_input_location_hessian_nd`
-//! (backward) thread `aniso_log_scales` through `maybe_initialize_aniso_contrasts`
-//! and then `exp(2·)`, so the analytic jets must reproduce centered finite
+//! (backward) thread `aniso_log_scales` through `centered_aniso_contrasts`
+//! (the pure forward transform — an explicit all-zero η is the isotropic metric,
+//! not a geometry-seeding sentinel; see #1042) and then `exp(2·)`, so the
+//! analytic jets must reproduce centered finite
 //! differences of the forward design *with anisotropy active*. A regression that
 //! drops the metric weights `w_a = exp(2 ψ_a)` (the historical bug — Euclidean
 //! `|t − c|` in the backward) differentiates a different function and is caught
@@ -312,22 +314,45 @@ fn aniso_jet_differs_from_isotropic_and_only_aniso_matches_fd() {
     }
 }
 
-/// Realistic auto-initialisation path: when η is left at the all-zero default,
-/// both forward and backward derive identical data-dependent contrasts from the
-/// center cloud (`maybe_initialize_aniso_contrasts`). Forward FD must still match
-/// the analytic jet, so the auto-init branch cannot desynchronise the pair.
+/// Explicit isotropic request on the jet/FFI surface (#1042): an all-zero
+/// `aniso_log_scales` is the natural way to ask for the plain isotropic Matérn,
+/// so the input-location jet at `η = [0, 0]` must equal the `None` (isotropic)
+/// jet *bit-for-bit*, NOT a data-driven anisotropic jet derived from the center
+/// cloud. The forward design honors the same literal η (it is the optimizer that
+/// seeds the metric, not the design builder), so the jet–vs–forward-FD pair must
+/// also stay synchronized. The deliberately anisotropic center cloud (wide x
+/// spread) is exactly the geometry that the old all-zero override would have
+/// hijacked into an anisotropic metric — proving the override no longer fires.
 #[test]
-fn auto_initialized_aniso_jet_matches_forward_finite_difference() {
+fn explicit_zero_aniso_jet_is_isotropic_and_matches_forward_fd() {
     let points = array![[0.3, 0.65], [0.72, 0.18], [0.48, 0.93]];
-    // Deliberately anisotropic center cloud (wider spread along x) so the
-    // auto-init produces nontrivial contrasts.
+    // Deliberately anisotropic center cloud (wider spread along x): the geometry
+    // the discarded override would have turned into a data-driven metric.
     let centers = array![[0.0, 0.0], [2.0, 0.1], [4.0, -0.1], [1.0, 0.6]];
     let ls = 1.3;
     let nu = MaternNu::ThreeHalves;
     let aniso = [0.0_f64, 0.0];
 
-    let jet = matern_input_location_jet_nd(points.view(), centers.view(), ls, nu, Some(&aniso))
-        .expect("auto-init jet");
+    let jet_zero = matern_input_location_jet_nd(points.view(), centers.view(), ls, nu, Some(&aniso))
+        .expect("explicit-zero jet");
+    let jet_iso = matern_input_location_jet_nd(points.view(), centers.view(), ls, nu, None)
+        .expect("isotropic (None) jet");
+
+    // The explicit all-zero jet must equal the isotropic jet to roundoff — the
+    // metric weights exp(2·0)=1 reduce the anisotropic radius to the Euclidean
+    // one, so no geometry-derived anisotropy may leak in.
+    let max_gap = jet_zero
+        .iter()
+        .zip(jet_iso.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_gap < 1e-12,
+        "explicit aniso=[0,0] jet must equal the isotropic (None) jet, but max|diff| = {max_gap:.3e} \
+         (a data-driven anisotropic metric was seeded from the center cloud)"
+    );
+
+    // ...and it still matches the forward finite difference of the design.
     let h = 1e-6;
     for axis in 0..points.ncols() {
         let fd = fd_first(&points, &centers, ls, nu, Some(&aniso), axis, h);
@@ -335,10 +360,10 @@ fn auto_initialized_aniso_jet_matches_forward_finite_difference() {
             for k in 0..centers.nrows() {
                 let tol = 1e-6 + 1e-5 * fd[[n, k]].abs();
                 assert!(
-                    (jet[[n, k, axis]] - fd[[n, k]]).abs() < tol,
-                    "auto-init anisotropic jet must match forward FD at axis {axis} \
+                    (jet_zero[[n, k, axis]] - fd[[n, k]]).abs() < tol,
+                    "explicit-zero jet must match forward FD at axis {axis} \
                      (n={n},k={k}): {} vs {}",
-                    jet[[n, k, axis]],
+                    jet_zero[[n, k, axis]],
                     fd[[n, k]]
                 );
             }

@@ -14394,9 +14394,52 @@ pub fn initial_aniso_contrasts(centers: ArrayView2<'_, f64>) -> Vec<f64> {
         .collect()
 }
 
-/// Detect the all-zero sentinel from `--scale-dimensions` and replace with
-/// knot-cloud-derived contrasts. Non-zero or absent aniso is passed through.
-fn maybe_initialize_aniso_contrasts(
+/// Pure forward transform of the supplied anisotropy log-scales: subtract the
+/// mean (so Σ η = 0) and zero tiny residuals. `None` (or a 1-D problem, where
+/// centering is a no-op) means *no* anisotropy.
+///
+/// This is a **continuous function of η with no hidden data dependence**: an
+/// explicit all-zero vector centers to all-zero, i.e. the isotropic metric
+/// (weights `exp(2·0) = 1`, Euclidean radius). It is therefore identical, as a
+/// design, to the `None` path through `η = 0`, and is continuous across it —
+/// `[1e-9, -1e-9]` and `[0, 0]` map to neighboring designs, not a jump.
+///
+/// The Matérn forward design (`build_matern_basis`) and its input-location
+/// jet/Hessian (`matern_metric_weights`) both apply *this* transform, so the
+/// jet differentiates exactly the function the design evaluates (#437), and an
+/// explicit isotropic request reduces to the closed-form isotropic Matérn
+/// kernel rather than a data-driven anisotropic one (#1042).
+///
+/// Auto-initialization of `η` from knot-cloud geometry is a *separate* concern
+/// handled by [`auto_seed_aniso_contrasts`]; the Matérn metric is an optimized
+/// REML hyper-axis seeded explicitly by the pilot reseed, so its design must
+/// not silently reinterpret an all-zero η as a seeding sentinel.
+fn centered_aniso_contrasts(aniso: Option<&[f64]>) -> Option<Vec<f64>> {
+    use crate::terms::smooth::center_aniso_log_scales as center;
+
+    match aniso {
+        Some(v) if v.len() > 1 => Some(center(v)),
+        Some(v) => Some(v.to_vec()),
+        None => None,
+    }
+}
+
+/// Auto-seed anisotropy contrasts from knot-cloud geometry for callers that use
+/// an all-zero vector as the "initialize me" sentinel.
+///
+/// This is the **pure-Duchon `scale_dims` seeding path**, where `η` is a FIXED,
+/// geometry-derived basis parameter that is never enrolled as a REML hyper-axis
+/// (see `spatial_term_supports_hyper_optimization`): "standardize the geometry,
+/// then learn the smoothness." A non-zero (or absent) vector is honored
+/// verbatim (centered, exactly like [`centered_aniso_contrasts`]); only an
+/// *exactly* all-zero vector is replaced by `initial_aniso_contrasts(centers)`.
+///
+/// The Matérn forward path deliberately does NOT use this — its `η` is an
+/// optimized hyper-axis seeded by the pilot reseed, so its design must be a pure
+/// function of the supplied `η` ([`centered_aniso_contrasts`]); folding the
+/// geometry seed into the design build there made the map discontinuous at
+/// `η = 0` and hijacked explicit isotropic requests (#1042).
+fn auto_seed_aniso_contrasts(
     centers: ArrayView2<'_, f64>,
     aniso: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
@@ -15866,8 +15909,7 @@ pub fn build_matern_basiswithworkspace(
     // periodic replication, the identifiability transform, and the penalty all
     // built from the same full-rank center subset. The contrasts used for the
     // rank Gram come from the selected centers so anisotropy is honored.
-    let reduce_aniso =
-        maybe_initialize_aniso_contrasts(selected_centers.view(), spec.aniso_log_scales.as_deref());
+    let reduce_aniso = centered_aniso_contrasts(spec.aniso_log_scales.as_deref());
     let original_centers = matern_rank_reduce_centers(
         data,
         &selected_centers,
@@ -15876,9 +15918,13 @@ pub fn build_matern_basiswithworkspace(
         reduce_aniso.as_deref(),
     )?;
     let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
-    // Initialize anisotropy contrasts from knot cloud geometry when the caller
-    // enabled scale-dimensions but left η at the zero default.
-    let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
+    // Center the supplied anisotropy contrasts (Σ η = 0) for the forward design.
+    // This is a pure function of the caller's η: an explicit all-zero vector is
+    // the isotropic metric, NOT a geometry-seeding sentinel — the Matérn metric
+    // is an optimized hyper-axis seeded explicitly by the pilot reseed, so the
+    // design must reduce to the isotropic kernel at η = 0 and be continuous
+    // through it (#1042).
+    let aniso = centered_aniso_contrasts(spec.aniso_log_scales.as_deref());
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
     let identifiability_transform = z_opt.clone();
     let full_transform = z_opt.as_ref().map(|z| {
@@ -21346,20 +21392,17 @@ pub fn matern_radial_second_derivative_nd(
 /// `ChunkedKernelDesignOperator`) applies, **bit-for-bit**.
 ///
 /// The forward path centres the supplied anisotropy log-scales through
-/// [`maybe_initialize_aniso_contrasts`] (subtract the mean, zero tiny
-/// residuals; auto-initialise from center geometry only when every entry is
-/// the zero default) and then squares `exp(ψ_a)`. Replicating that exact
-/// transform here is what lets the input-location jet/Hessian differentiate
-/// the *same* function the forward evaluates under anisotropy.
+/// [`centered_aniso_contrasts`] (subtract the mean, zero tiny residuals) and
+/// then squares `exp(ψ_a)`. Replicating that exact transform here is what lets
+/// the input-location jet/Hessian differentiate the *same* function the forward
+/// evaluates under anisotropy. Like the forward design, this is a pure function
+/// of the supplied `η`: an explicit all-zero vector yields the isotropic
+/// all-ones metric, matching the closed-form isotropic Matérn (#437, #1042).
 ///
 /// `None` (or a 1-D problem, where the centred contrast is a no-op) yields the
 /// isotropic all-ones metric.
-fn matern_metric_weights(
-    centers: ArrayView2<'_, f64>,
-    dim: usize,
-    aniso: Option<&[f64]>,
-) -> Vec<f64> {
-    match maybe_initialize_aniso_contrasts(centers, aniso) {
+fn matern_metric_weights(dim: usize, aniso: Option<&[f64]>) -> Vec<f64> {
+    match centered_aniso_contrasts(aniso) {
         Some(psi) => psi.iter().map(|&v| (2.0 * v).exp()).collect(),
         None => vec![1.0; dim],
     }
@@ -21413,7 +21456,7 @@ pub fn matern_input_location_jet_nd(
             dim
         );
     }
-    let weights = matern_metric_weights(centers, dim, aniso_log_scales);
+    let weights = matern_metric_weights(dim, aniso_log_scales);
     let mut out = Array3::<f64>::zeros((n_rows, n_centers, dim));
     for n in 0..n_rows {
         for k in 0..n_centers {
@@ -21484,7 +21527,7 @@ pub fn matern_input_location_hessian_nd(
             dim
         );
     }
-    let weights = matern_metric_weights(centers, dim, aniso_log_scales);
+    let weights = matern_metric_weights(dim, aniso_log_scales);
     let mut out = Array4::<f64>::zeros((n_rows, n_centers, dim, dim));
     for n in 0..n_rows {
         for k in 0..n_centers {
@@ -23222,8 +23265,12 @@ pub fn build_duchon_basiswithworkspace(
         duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
-    // enabled scale-dimensions but left η at the zero default.
-    let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
+    // enabled scale-dimensions but left η at the zero default. Duchon η is a
+    // FIXED, geometry-derived basis parameter (never a REML hyper-axis), so the
+    // all-zero auto-seed sentinel is the intended seeding mechanism here — unlike
+    // the Matérn forward path, whose η is optimized and must be honored literally.
+    let aniso =
+        auto_seed_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
     // The native reproducing-norm Gram penalty (`Primary`) is assembled from
     // kernel VALUES at the center pairs (K_CC), not from collocated D1/D2
     // derivative operators, so the build only requires the pointwise kernel to
@@ -34973,11 +35020,12 @@ mod tests {
         assert_abs_diff_eq!(eta[0].abs(), 10.0_f64.ln() / 2.0, epsilon = 1e-12);
     }
 
-    // ── maybe_initialize_aniso_contrasts tests ──────────────────────────
+    // ── auto_seed_aniso_contrasts tests (Duchon scale_dims seeding) ──────
 
     #[test]
-    fn test_maybe_initialize_replaces_zeros() {
-        // Input: Some(&[0.0, 0.0, 0.0]) → should be replaced with knot-derived values.
+    fn test_auto_seed_replaces_zeros() {
+        // Input: Some(&[0.0, 0.0, 0.0]) → the Duchon scale_dims seeding sentinel:
+        // replaced with knot-derived geometry contrasts.
         use ndarray::Array2;
         let centers = Array2::from_shape_vec(
             (5, 3),
@@ -34988,7 +35036,7 @@ mod tests {
         )
         .unwrap();
         let zeros = vec![0.0, 0.0, 0.0];
-        let result = maybe_initialize_aniso_contrasts(centers.view(), Some(&zeros));
+        let result = auto_seed_aniso_contrasts(centers.view(), Some(&zeros));
         let eta = result.expect("should return Some");
         assert_eq!(eta.len(), 3);
         // Should NOT be all zeros any more — should match initial_aniso_contrasts
@@ -34999,7 +35047,7 @@ mod tests {
     }
 
     #[test]
-    fn test_maybe_initialize_preserves_nonzero() {
+    fn test_auto_seed_preserves_nonzero() {
         // Input: Some(&[0.1, -0.05, -0.05]) → should be returned unchanged.
         use ndarray::Array2;
         let centers = Array2::from_shape_vec(
@@ -35010,18 +35058,62 @@ mod tests {
         )
         .unwrap();
         let input = vec![0.1, -0.05, -0.05];
-        let result = maybe_initialize_aniso_contrasts(centers.view(), Some(&input));
+        let result = auto_seed_aniso_contrasts(centers.view(), Some(&input));
         let eta = result.expect("should return Some");
         assert_eq!(eta, input);
     }
 
+    // ── centered_aniso_contrasts tests (pure Matérn forward transform) ───
+
     #[test]
-    fn test_maybe_initialize_preserves_none() {
+    fn test_centered_aniso_honors_explicit_all_zero_as_isotropic() {
+        // The pure forward transform must NOT reinterpret an explicit all-zero
+        // vector as a geometry-seeding sentinel: [0,0,0] → [0,0,0] (isotropic),
+        // independent of any center geometry. This is the unit-level guard for
+        // the discontinuity-at-η=0 bug (#1042); the geometry-driven override is
+        // exclusively the Duchon-only `auto_seed_aniso_contrasts` behavior.
+        let zeros = vec![0.0, 0.0, 0.0];
+        let eta = centered_aniso_contrasts(Some(&zeros)).expect("should return Some");
+        assert_eq!(eta, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_centered_aniso_subtracts_mean() {
+        // A non-zero vector is centered (Σ η = 0), zeroing tiny residuals.
+        let input = vec![0.5, 0.5];
+        let eta = centered_aniso_contrasts(Some(&input)).expect("should return Some");
+        // mean is 0.5, so both center to 0 → isotropic, matching the all-zero case.
+        assert_eq!(eta, vec![0.0, 0.0]);
+
+        let input = vec![0.3, -0.1, -0.2];
+        let eta = centered_aniso_contrasts(Some(&input)).expect("should return Some");
+        assert_abs_diff_eq!(eta.iter().sum::<f64>(), 0.0, epsilon = 1e-15);
+        // Already zero-sum, so returned essentially unchanged.
+        for (a, b) in eta.iter().zip(input.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-15);
+        }
+    }
+
+    #[test]
+    fn test_centered_aniso_preserves_none() {
+        assert!(centered_aniso_contrasts(None).is_none());
+    }
+
+    #[test]
+    fn test_centered_aniso_one_d_is_passthrough() {
+        // A 1-D contrast is a no-op (anisotropy is meaningless for d=1).
+        let input = vec![0.7];
+        let eta = centered_aniso_contrasts(Some(&input)).expect("should return Some");
+        assert_eq!(eta, vec![0.7]);
+    }
+
+    #[test]
+    fn test_auto_seed_preserves_none() {
         // Input: None → should remain None.
         use ndarray::Array2;
         let centers =
             Array2::from_shape_vec((4, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
-        let result = maybe_initialize_aniso_contrasts(centers.view(), None);
+        let result = auto_seed_aniso_contrasts(centers.view(), None);
         assert!(result.is_none());
     }
 
