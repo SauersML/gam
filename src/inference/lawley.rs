@@ -452,6 +452,21 @@ pub fn known_scale_expected_jets(
     family: &crate::types::LikelihoodSpec,
     eta: f64,
 ) -> Option<RowExpectedJets> {
+    known_scale_expected_jets_with_dispersion(family, eta, 1.0)
+}
+
+/// Expected jets for a GLM family/link pair at linear predictor `eta` with an
+/// explicit dispersion `φ` (Gaussian σ², Gamma φ = 1/shape; 1 for the
+/// scale-free Poisson/Binomial). Returns `None` for pairs whose cumulant jets
+/// are not derived yet — the consumer then reports first-order inference only
+/// (#939). This is the dispersion-carrying sibling of
+/// [`known_scale_expected_jets`]; the per-term LR Bartlett path (#1063) needs it
+/// for the estimated-scale Gaussian/Gamma families whose ε depends on φ.
+pub fn known_scale_expected_jets_with_dispersion(
+    family: &crate::types::LikelihoodSpec,
+    eta: f64,
+    dispersion: f64,
+) -> Option<RowExpectedJets> {
     use crate::types::{InverseLink, ResponseFamily, StandardLink};
     match (&family.response, &family.link) {
         (ResponseFamily::Poisson, InverseLink::Standard(StandardLink::Log)) => {
@@ -459,6 +474,14 @@ pub fn known_scale_expected_jets(
         }
         (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
             Some(RowExpectedJets::binomial_logit(eta))
+        }
+        (ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)) => {
+            (dispersion.is_finite() && dispersion > 0.0)
+                .then(|| RowExpectedJets::gaussian_identity(dispersion))
+        }
+        (ResponseFamily::Gamma, InverseLink::Standard(StandardLink::Log)) => {
+            (dispersion.is_finite() && dispersion > 0.0)
+                .then(|| RowExpectedJets::gamma_log(eta, dispersion))
         }
         _ => None,
     }
