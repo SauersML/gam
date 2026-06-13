@@ -5535,6 +5535,16 @@ impl SaeManifoldTerm {
                 //   * IBP empirical-π has cross-row rank-one terms per column
                 //     H_(i,k),(j,k) = w score_derivative_k z'_ik z'_jk for i != j;
                 //     this row-local block stores only the diagonal/self-row part.
+                //     The exact scalar `D`-coefficient `d_k = w·s'_k` is now
+                //     surfaced as `IbpHessianDiagThirdChannels::cross_row_d`
+                //     (FD-verified against ∂²value/∂ℓ_ik∂ℓ_jk in
+                //     `ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian`),
+                //     and `z_jac` carries `u_k`'s entries `z'_ik`. The exact
+                //     determinant-lemma consumer is
+                //     log det(I_K + D UᵀH₀'⁻¹U) on the NO-SELF base
+                //     H₀' = H₀ − Σ_k d_k diag(z'_ik²) — which requires re-factoring
+                //     the per-row logit-slot diagonal (a factorization-side change
+                //     in `solver::arrow_schur`, outside this assembly chokepoint).
                 //
                 // The criterion's log|H| and Γ adjoint differentiate this same
                 // assembled diagonal/quasi-Laplace Hessian, so value and gradient stay
