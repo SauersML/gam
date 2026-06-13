@@ -224,14 +224,23 @@ fn kappa_outer_loop_is_n_independent() {
     });
     eprintln!("[kappa-n-scaling] warm-up fit primed caches in {warm:.4}s");
 
-    let ns = [2_000usize, 8_000, 32_000];
+    // #1033 acceptance sweep: 1e3 → 2.56e5 (256×). `t_single` (κ loop OFF, one
+    // length-scale, one fit) absorbs the one-time O(n) tensor build + the final
+    // O(n) PIRLS assembly; `t_single` therefore scales with n. The MARGINAL
+    // `t_kappa - t_single` isolates the cost of the OUTER κ-trial loop on top of
+    // one ordinary fit — the object the issue requires to be n-INDEPENDENT. If
+    // the per-trial design realization were still O(n) it would grow ~256× here;
+    // the PsiGramTensor sufficient-statistic lane keeps it flat (the only n-work
+    // left is the single build, which lands in `t_single`, not the marginal).
+    let ns = [1_000usize, 4_000, 16_000, 64_000, 256_000];
     let mut kappa_phase = Vec::with_capacity(ns.len());
 
     eprintln!(
-        "[kappa-n-scaling] {:>8}  {:>10}  {:>10}  {:>12}",
+        "[kappa-n-scaling] {:>9}  {:>10}  {:>10}  {:>12}",
         "n", "t_kappa_s", "t_single_s", "kappa_phase_s"
     );
     for &n in &ns {
+        // Best-of-two to suppress shared-cluster wall-clock noise.
         let t_kappa = run_fit(n, true, aniso, bounds)
             .unwrap()
             .min(run_fit(n, true, aniso, bounds).unwrap());
@@ -240,20 +249,28 @@ fn kappa_outer_loop_is_n_independent() {
             .min(run_fit(n, false, aniso, bounds).unwrap());
         let phase = (t_kappa - t_single).max(0.0);
         kappa_phase.push(phase);
-        eprintln!("[kappa-n-scaling] {n:>8}  {t_kappa:>10.4}  {t_single:>10.4}  {phase:>12.4}");
+        eprintln!("[kappa-n-scaling] {n:>9}  {t_kappa:>10.4}  {t_single:>10.4}  {phase:>12.4}");
     }
 
-    let first = kappa_phase.first().copied().unwrap_or(0.0).max(1e-4);
-    let last = kappa_phase.last().copied().unwrap_or(0.0).max(1e-4);
-    let n_ratio = (ns.last().unwrap() / ns.first().unwrap()) as f64; // 16
+    let first = kappa_phase.first().copied().unwrap_or(0.0).max(1e-3);
+    let last = kappa_phase.last().copied().unwrap_or(0.0).max(1e-3);
+    let n_ratio = (ns.last().unwrap() / ns.first().unwrap()) as f64; // 256
     let phase_ratio = last / first;
     eprintln!(
         "[kappa-n-scaling] n grew {n_ratio:.0}× ; kappa-phase grew {phase_ratio:.2}× \
          (n-independent ⇒ ~1×, n-linear ⇒ ~{n_ratio:.0}×)"
     );
+    // n-independence bar: the marginal κ-phase must NOT scale with n. A truly
+    // n-free outer loop holds the marginal ~flat (ratio ~1, drifting only with
+    // the fixed O(D²k²) trial cost and timing noise); an O(n) regression would
+    // track `n_ratio`. Gate at a generous absolute ceiling well below linear —
+    // 8× across a 256× n increase is ~n^0.37, still decisively sub-linear and
+    // safely above shared-node timing jitter, so this is a real O(n)-regression
+    // tripwire rather than a calibrated timing bound.
     assert!(
-        phase_ratio <= 0.5 * n_ratio,
+        phase_ratio <= 8.0,
         "kappa outer-loop phase grew {phase_ratio:.2}× across a {n_ratio:.0}× \
-         increase in n — suggests the #1033b Gram-tensor lane regressed to an O(n) pass"
+         increase in n — the #1033 PsiGramTensor sufficient-statistic lane \
+         regressed to an O(n) per-trial pass"
     );
 }
