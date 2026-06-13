@@ -4986,6 +4986,34 @@ impl SaeManifoldTerm {
         let (assignment_grad, assignment_hdiag) =
             assignment_prior_grad_hdiag(&self.assignment, rho)?;
 
+        // #1038 softmax entropy: the exact per-row Hessian in logits is dense
+        // (`H_kj = (λ/τ²) a_k[δ_kj(m−L_k−1)+a_j(L_k+L_j+1−2m)]`), not just the
+        // `assignment_hdiag` diagonal. Build the shared penalty + `scale = λ/τ²`
+        // once here so the dense row block written into `block.htt` below, the
+        // criterion's `log|H|`, and the #1006 θ-adjoint all differentiate the
+        // SAME operator. JumpReLU / IBP keep their (separately exact) diagonal /
+        // cross-row channels and leave this `None`. The block is gauge-null in
+        // isolation (`H·𝟙 = 0`); it is only ever summed onto the gauge-breaking
+        // data-fit row block before the Cholesky factor, never factored alone.
+        let softmax_dense: Option<(crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty, f64)> =
+            match self.assignment.mode {
+                AssignmentMode::Softmax {
+                    temperature,
+                    sparsity,
+                } if k_atoms > 1 => {
+                    let inv_tau = 1.0 / temperature;
+                    let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+                    Some((
+                        crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                            k_atoms,
+                            temperature,
+                        ),
+                        scale,
+                    ))
+                }
+                _ => None,
+            };
+
         // Decoder smoothness penalty: build one KroneckerPenaltyOp per atom
         // (structure = λ·S_k ⊗ I_p, offset = beta_offsets[k]) instead of
         // materialising the dense K×K block.  The gradient is a dense K-vector
@@ -5522,8 +5550,36 @@ impl SaeManifoldTerm {
                 } else {
                     for free_idx in 0..assignment_dim {
                         block.gt[free_idx] += assignment_grad[assignment_base + free_idx];
-                        block.htt[[free_idx, free_idx]] +=
-                            assignment_hdiag[assignment_base + free_idx];
+                    }
+                    if let Some((penalty, scale)) = softmax_dense.as_ref() {
+                        // #1038: write the EXACT dense entropy Hessian (diagonal +
+                        // off-diagonals) onto the row's logit block. Softmax uses
+                        // the REDUCED K−1 free-logit chart (the last reference logit
+                        // is fixed at 0, `assignment_coord_dim() = K−1`), which
+                        // already removes the shift-gauge null. Holding z_{K-1}
+                        // fixed, the reduced Hessian over the free logits 0..K−1 is
+                        // exactly the top-left (K−1)×(K−1) submatrix of the full
+                        // K×K dense entropy Hessian (the fixed logit contributes no
+                        // row/column to the free curvature). Summing it onto the
+                        // data-fit `htt` keeps the block PD for the Cholesky factor,
+                        // and the dense Cholesky makes `log|H|` carry it exactly (no
+                        // separate Woodbury — `htt` is already a small dense per-row
+                        // factor). Its diagonal equals `assignment_hdiag` for these
+                        // logits, so we skip the diagonal-only add above.
+                        let row_logits: Vec<f64> = (0..k_atoms)
+                            .map(|k| self.assignment.logits[[row, k]])
+                            .collect();
+                        let h_dense = penalty.row_dense_hessian(&row_logits, *scale);
+                        for ki in 0..assignment_dim {
+                            for kj in 0..assignment_dim {
+                                block.htt[[ki, kj]] += h_dense[[ki, kj]];
+                            }
+                        }
+                    } else {
+                        for free_idx in 0..assignment_dim {
+                            block.htt[[free_idx, free_idx]] +=
+                                assignment_hdiag[assignment_base + free_idx];
+                        }
                     }
                 }
 
@@ -7581,6 +7637,60 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
     ) -> Result<f64, String> {
+        let k_atoms = self.k_atoms();
+        // #1038 softmax: `H` carries the DENSE entropy block, and since the
+        // entropy curvature scales linearly with `λ_sparse = exp(ρ)`,
+        // `∂H/∂ρ = H_entropy` (the full dense per-row block, not just its
+        // diagonal). The trace `½ tr(H⁻¹ ∂H/∂ρ)` must therefore contract the
+        // dense `∂H/∂ρ` against the per-row selected-inverse BLOCK, mirroring the
+        // dense `log|H|` and θ-adjoint — a diagonal-only contraction would
+        // desync the ρ-gradient from the criterion. (Softmax uses the dense
+        // `None` layout, so logit positions index atoms directly.)
+        if let AssignmentMode::Softmax {
+            temperature,
+            sparsity,
+        } = self.assignment.mode
+        {
+            if k_atoms <= 1 {
+                return Ok(0.0);
+            }
+            let inv_tau = 1.0 / temperature;
+            let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+            let penalty =
+                crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                    k_atoms, temperature,
+                );
+            // Softmax uses the reduced K−1 free-logit chart: only positions
+            // 0..K−1 are free logit coordinates (last reference logit fixed), and
+            // the reduced `∂H/∂ρ` over the free logits is the top-left
+            // (K−1)×(K−1) submatrix of the full dense block. Contract it against
+            // the matching per-row selected-inverse block.
+            let assignment_dim = self.assignment.assignment_coord_dim();
+            let total_t = cache.delta_t_len();
+            let mut trace = 0.0_f64;
+            for row in 0..self.n_obs() {
+                let row_base = cache.row_offsets[row];
+                let q = cache.row_dims[row];
+                let logit_dim = assignment_dim.min(q);
+                let row_logits: Vec<f64> =
+                    (0..k_atoms).map(|k| self.assignment.logits[[row, k]]).collect();
+                // ∂H/∂ρ over this row's free-logit block (position j ↔ atom j).
+                let dh_rho = penalty.row_dense_hessian(&row_logits, scale);
+                for kj in 0..logit_dim {
+                    let mut rhs_t = Array1::<f64>::zeros(total_t);
+                    let rhs_beta = Array1::<f64>::zeros(cache.k);
+                    rhs_t[row_base + kj] = 1.0;
+                    let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
+                        format!("assignment_log_strength_hessian_trace: {err}")
+                    })?;
+                    for ki in 0..logit_dim {
+                        // trace += (H⁻¹)_{ki,kj} · (∂H/∂ρ)_{kj,ki}; dh_rho symmetric.
+                        trace += solved.t[row_base + ki] * dh_rho[[kj, ki]];
+                    }
+                }
+            }
+            return Ok(0.5 * trace);
+        }
         let hdiag = assignment_prior_log_strength_hdiag(&self.assignment, rho)?;
         if hdiag.is_empty() {
             return Ok(0.0);
@@ -7588,7 +7698,6 @@ impl SaeManifoldTerm {
         let inv_diag = solver
             .latent_inverse_diagonal()
             .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
-        let k_atoms = self.k_atoms();
         let assignment_dim = self.assignment.assignment_coord_dim();
         let mut trace = 0.0_f64;
         for row in 0..self.n_obs() {
@@ -8219,33 +8328,15 @@ impl SaeManifoldTerm {
             return 0.0;
         };
         match self.assignment.mode {
-            AssignmentMode::Softmax {
-                temperature,
-                sparsity,
-            } => {
-                let assignments = self.assignment.assignments_row(row);
-                let inv_tau = 1.0 / temperature;
-                let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
-                let k_atoms = assignments.len();
-                let mut l = vec![0.0_f64; k_atoms];
-                let mut mean = 0.0_f64;
-                for k in 0..k_atoms {
-                    l[k] = assignments[k].max(1.0e-300).ln() + 1.0;
-                    mean += assignments[k] * l[k];
-                }
-                let mut da = vec![0.0_f64; k_atoms];
-                for k in 0..k_atoms {
-                    let indicator = if k == wrt_atom { 1.0 } else { 0.0 };
-                    da[k] = assignments[k] * (indicator - assignments[wrt_atom]) * inv_tau;
-                }
-                let dmean: f64 = (0..k_atoms).map(|k| da[k] * l[k]).sum();
-                let k = diag_atom;
-                let term = (1.0 - 2.0 * assignments[k]) * (mean - l[k]) + assignments[k] - 1.0;
-                let dl_k = da[k] / assignments[k].max(1.0e-300);
-                let dterm = -2.0 * da[k] * (mean - l[k])
-                    + (1.0 - 2.0 * assignments[k]) * (dmean - dl_k)
-                    + da[k];
-                scale * (da[k] * term + assignments[k] * dterm)
+            AssignmentMode::Softmax { .. } => {
+                // #1038: the softmax entropy Hessian is now stored DENSE in
+                // `block.htt` and its full θ-derivative `∂H_{k,j}/∂z_w` (diagonal
+                // AND off-diagonal) is added inline in `logdet_theta_adjoint` from
+                // the shared `row_dense_hessian_logit_derivative`. Returning the
+                // diagonal contribution here too would double-count, so this
+                // primitive is silent for softmax — the dense path is the single
+                // source for value, logdet, and adjoint.
+                0.0
             }
             AssignmentMode::JumpReLU {
                 temperature,
@@ -8460,6 +8551,33 @@ impl SaeManifoldTerm {
         // the evidence factor grows the matching Woodbury correction.
         let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho)?;
         let k_atoms = self.k_atoms();
+        // #1038 softmax entropy: the dense per-row entropy Hessian written into
+        // `block.htt` has off-diagonal logit terms whose θ-derivative the adjoint
+        // must contract too (not just the diagonal). Build the SAME penalty +
+        // `scale = λ/τ²` the assembly uses so value/logdet/adjoint differentiate
+        // one operator. `None` for non-softmax modes (their diagonal/cross-row
+        // channels are handled by `assignment_prior_hdiag_derivative_entry` and
+        // the IBP column pass).
+        let softmax_dense_adjoint: Option<(
+            crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty,
+            f64,
+        )> = match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } if k_atoms > 1 => {
+                let inv_tau = 1.0 / temperature;
+                let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+                Some((
+                    crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                        k_atoms,
+                        temperature,
+                    ),
+                    scale,
+                ))
+            }
+            _ => None,
+        };
         // Per active logit position: (row i, column k, global t-index,
         // (H⁻¹)_ik,ik) — the inputs to the IBP cross-row empirical-`M_k` channel.
         let mut ibp_logit_sites: Vec<(usize, usize, usize, f64)> = Vec::new();
@@ -8505,12 +8623,37 @@ impl SaeManifoldTerm {
                 }
             }
 
+            // #1038: when `w` is a logit and the assignment is softmax, the dense
+            // entropy Hessian's full θ-derivative `∂H_{k,j}/∂z_w` (diagonal AND
+            // off-diagonal) is the SAME `(a,L,m)`-derived tensor the assembly and
+            // logdet use. Compute it once per logit `w` and add it at every logit
+            // pair `(a,b)` below. The diagonal softmax case is therefore handled
+            // here, NOT in `assignment_prior_hdiag_derivative_entry` (which returns
+            // 0 for softmax to avoid double-counting).
+            let row_logits_softmax: Option<Vec<f64>> = softmax_dense_adjoint
+                .as_ref()
+                .map(|_| (0..k_atoms).map(|k| self.assignment.logits[[row, k]]).collect());
             for w in 0..q {
                 let mut gamma = 0.0_f64;
+                let softmax_dh_w: Option<Array2<f64>> = match (
+                    softmax_dense_adjoint.as_ref(),
+                    row_logits_softmax.as_ref(),
+                    jets.vars[w],
+                ) {
+                    (Some((penalty, scale)), Some(row_logits), SaeLocalRowVar::Logit { atom }) => {
+                        Some(penalty.row_dense_hessian_logit_derivative(row_logits, *scale, atom))
+                    }
+                    _ => None,
+                };
                 for a in 0..q {
                     for b in 0..q {
                         let mut dh = sae_dot(&jets.second[a][w], &jets.first[b])
                             + sae_dot(&jets.first[a], &jets.second[b][w]);
+                        if let (Some(dh_w), SaeLocalRowVar::Logit { atom: atom_a }, SaeLocalRowVar::Logit { atom: atom_b }) =
+                            (softmax_dh_w.as_ref(), jets.vars[a], jets.vars[b])
+                        {
+                            dh += dh_w[[atom_a, atom_b]];
+                        }
                         if a == b {
                             dh += match jets.vars[a] {
                                 SaeLocalRowVar::Logit { atom } => self

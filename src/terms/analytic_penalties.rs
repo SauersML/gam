@@ -2038,6 +2038,86 @@ impl SoftmaxAssignmentSparsityPenalty {
         }
         d
     }
+
+    /// Exact per-row dense softmax-entropy Hessian wrt the row's logits (#1038),
+    /// scaled by `scale = λ/τ²`. Returns the symmetric `K×K` block
+    ///
+    /// ```text
+    ///   H_kj = scale·a_k·[ δ_kj·(m − L_k − 1) + a_j·(L_k + L_j + 1 − 2m) ],
+    ///   L_k = ln a_k + 1,   m = Σ_r a_r L_r,
+    /// ```
+    ///
+    /// whose diagonal coincides with [`AnalyticPenalty::hessian_diag`] and whose
+    /// quadratic form coincides with [`AnalyticPenalty::hvp`]. This is the dense
+    /// block the Arrow-Schur row factor stores so the criterion's `log|H|` and
+    /// the #1006 θ-adjoint differentiate the SAME operator (not just its
+    /// diagonal). The entropy block alone is gauge-null (`H·𝟙 = 0`, softmax
+    /// shift-invariance); callers must add it to the gauge-breaking data-fit
+    /// row block before factoring — never factor it in isolation.
+    #[must_use]
+    pub fn row_dense_hessian(&self, row_logits: &[f64], scale: f64) -> Array2<f64> {
+        let k = self.k_atoms;
+        let a = self.softmax_row(row_logits);
+        let l: Vec<f64> = (0..k)
+            .map(|i| a[i].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0)
+            .collect();
+        let m: f64 = (0..k).map(|i| a[i] * l[i]).sum();
+        let mut h = Array2::<f64>::zeros((k, k));
+        for kk in 0..k {
+            for jj in 0..k {
+                let indicator = if kk == jj { 1.0 } else { 0.0 };
+                h[[kk, jj]] = scale
+                    * a[kk]
+                    * (indicator * (m - l[kk] - 1.0) + a[jj] * (l[kk] + l[jj] + 1.0 - 2.0 * m));
+            }
+        }
+        h
+    }
+
+    /// Derivative of the exact per-row dense entropy Hessian
+    /// [`Self::row_dense_hessian`] with respect to a single row logit `z_w`,
+    /// scaled by `scale = λ/τ²`. Returns the symmetric `K×K` block
+    /// `∂H_kj/∂z_w`, the third-derivative tensor slice the #1006 θ-adjoint
+    /// contracts against the row's selected inverse. Built from the SAME
+    /// `(a, L, m)` as [`Self::row_dense_hessian`] (`∂a_r/∂z_w = a_r(δ_rw − a_w)/τ`),
+    /// so value, logdet and adjoint stay on one branch.
+    #[must_use]
+    pub fn row_dense_hessian_logit_derivative(
+        &self,
+        row_logits: &[f64],
+        scale: f64,
+        w: usize,
+    ) -> Array2<f64> {
+        let k = self.k_atoms;
+        let inv_tau = 1.0 / self.temperature;
+        let a = self.softmax_row(row_logits);
+        let l: Vec<f64> = (0..k)
+            .map(|i| a[i].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0)
+            .collect();
+        let m: f64 = (0..k).map(|i| a[i] * l[i]).sum();
+        // ∂a_r/∂z_w = a_r (δ_rw − a_w)/τ ; ∂L_r/∂z_w = (∂a_r/∂z_w)/a_r.
+        let da: Vec<f64> = (0..k)
+            .map(|r| a[r] * (if r == w { 1.0 } else { 0.0 } - a[w]) * inv_tau)
+            .collect();
+        let dl: Vec<f64> = (0..k)
+            .map(|r| da[r] / a[r].max(ENTROPY_LOG_PROBABILITY_FLOOR))
+            .collect();
+        let dm: f64 = (0..k).map(|r| da[r] * l[r] + a[r] * dl[r]).sum();
+        let mut dh = Array2::<f64>::zeros((k, k));
+        for kk in 0..k {
+            for jj in 0..k {
+                let indicator = if kk == jj { 1.0 } else { 0.0 };
+                // bracket = δ_kj(m − L_k − 1) + a_j(L_k + L_j + 1 − 2m).
+                let bracket =
+                    indicator * (m - l[kk] - 1.0) + a[jj] * (l[kk] + l[jj] + 1.0 - 2.0 * m);
+                let dbracket = indicator * (dm - dl[kk])
+                    + da[jj] * (l[kk] + l[jj] + 1.0 - 2.0 * m)
+                    + a[jj] * (dl[kk] + dl[jj] - 2.0 * dm);
+                dh[[kk, jj]] = scale * (da[kk] * bracket + a[kk] * dbracket);
+            }
+        }
+        dh
+    }
 }
 
 impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
@@ -9684,6 +9764,75 @@ mod tests {
         for i in 0..t.len() {
             let fd = (gp[i] - gm[i]) / (2.0 * eps);
             assert_abs_diff_eq!(hv[i], fd, epsilon = 1e-6);
+        }
+    }
+
+    #[test]
+    fn softmax_row_dense_hessian_matches_hvp_and_diagonal() {
+        // #1038: the exact dense per-row entropy Hessian must (a) reproduce the
+        // analytic diagonal `hessian_diag`, (b) match the row-dense `hvp` action
+        // on arbitrary directions, and (c) be gauge-null (`H·𝟙 = 0`).
+        let pen = SoftmaxAssignmentSparsityPenalty::new(4, 0.7);
+        let row = [0.4_f64, -0.8, 1.3, -0.2];
+        let lambda = 1.4_f64;
+        let rho = array![lambda.ln()];
+        let inv_tau2 = (1.0 / 0.7_f64) * (1.0 / 0.7_f64);
+        let scale = lambda * inv_tau2;
+        let h = pen.row_dense_hessian(&row, scale);
+
+        // (a) diagonal agreement.
+        let full: Vec<f64> = row.to_vec();
+        let diag = pen
+            .hessian_diag(Array1::from_vec(full.clone()).view(), rho.view())
+            .expect("diag");
+        for k in 0..4 {
+            assert_abs_diff_eq!(h[[k, k]], diag[k], epsilon = 1e-10);
+        }
+        // (b) symmetry + HVP agreement on a probe direction.
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_abs_diff_eq!(h[[i, j]], h[[j, i]], epsilon = 1e-12);
+            }
+        }
+        let v = array![0.2_f64, -0.5, 0.7, -0.3];
+        let hv = pen.hvp(
+            Array1::from_vec(full.clone()).view(),
+            rho.view(),
+            v.view(),
+        );
+        for i in 0..4 {
+            let acc: f64 = (0..4).map(|j| h[[i, j]] * v[j]).sum();
+            assert_abs_diff_eq!(acc, hv[i], epsilon = 1e-9);
+        }
+        // (c) gauge null: H·𝟙 = 0 (softmax shift-invariance).
+        for i in 0..4 {
+            let row_sum: f64 = (0..4).map(|j| h[[i, j]]).sum();
+            assert_abs_diff_eq!(row_sum, 0.0, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn softmax_row_dense_hessian_logit_derivative_matches_finite_difference() {
+        // #1038: ∂H_{k,j}/∂z_w (the third-derivative tensor the θ-adjoint
+        // contracts) must match a central finite difference of the dense block.
+        let pen = SoftmaxAssignmentSparsityPenalty::new(4, 0.8);
+        let row = [0.3_f64, -0.6, 0.9, 0.2];
+        let scale = 1.1_f64 * (1.0 / 0.8_f64) * (1.0 / 0.8_f64);
+        let eps = 1e-6;
+        for w in 0..4 {
+            let dh = pen.row_dense_hessian_logit_derivative(&row, scale, w);
+            let mut rp = row;
+            let mut rm = row;
+            rp[w] += eps;
+            rm[w] -= eps;
+            let hp = pen.row_dense_hessian(&rp, scale);
+            let hm = pen.row_dense_hessian(&rm, scale);
+            for i in 0..4 {
+                for j in 0..4 {
+                    let fd = (hp[[i, j]] - hm[[i, j]]) / (2.0 * eps);
+                    assert_abs_diff_eq!(dh[[i, j]], fd, epsilon = 1e-6);
+                }
+            }
         }
     }
 
