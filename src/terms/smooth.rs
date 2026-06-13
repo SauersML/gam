@@ -5357,7 +5357,12 @@ fn build_tensor_bspline_basis(
                     matrix,
                     source: candidate.source,
                     normalization_scale,
-                    kronecker_factors: candidate.kronecker_factors.clone(),
+                    // Z^T S Z is no longer a Kronecker product of the original
+                    // marginal factors, so the Kronecker fast path in construction.rs
+                    // must not be taken. Clearing kronecker_factors forces the generic
+                    // block-local eigendecomposition path, which operates on the
+                    // transformed matrix and is correct.
+                    kronecker_factors: None,
                     op: candidate.op.clone(),
                 })
             })
