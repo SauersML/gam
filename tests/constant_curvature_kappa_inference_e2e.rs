@@ -52,12 +52,18 @@ fn next_gauss(state: &mut u64) -> f64 {
 
 /// Build a `TermCollectionSpec` for a `curv(...)` formula (FarthestPoint
 /// centers, auto length scale, κ seeded at 0 so the optimizer has to move it).
-fn termspec_for(formula: &str) -> gam::smooth::TermCollectionSpec {
+///
+/// `frame` is the real `[y, x1, x2]` training matrix: the spec builder now
+/// guards against degenerate (single-unique-value) smooth columns, so the
+/// schema dataset must carry the actual feature values rather than a constant
+/// placeholder, or the `curv(x1, x2)` term is rejected as a constant-column
+/// smooth before it can ever be fitted.
+fn termspec_for(formula: &str, frame: &Array2<f64>) -> gam::smooth::TermCollectionSpec {
     let parsed = parse_formula(formula).expect("formula parses");
     let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
     let ds = EncodedDataset {
         headers: headers.clone(),
-        values: Array2::<f64>::zeros((1, 3)),
+        values: frame.clone(),
         schema: DataSchema {
             columns: headers
                 .iter()
@@ -135,7 +141,7 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
         frame[(i, 1)] = feats[(i, 0)];
         frame[(i, 2)] = feats[(i, 1)];
     }
-    let spec = termspec_for("y ~ curv(x1, x2, centers=10)");
+    let spec = termspec_for("y ~ curv(x1, x2, centers=10)", &frame);
 
     let weights = Array1::<f64>::ones(n);
     let offset = Array1::<f64>::zeros(n);
