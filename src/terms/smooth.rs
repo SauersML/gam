@@ -1371,7 +1371,22 @@ impl TermCollectionSpec {
                         &frozen.support_means,
                         n_levels,
                     )?;
-                    let per_level = spec.order_s == 0.0;
+                    // Mode predicate MUST match the builder's
+                    // (`measure_jet_multiscale_mode`): per-level/multiscale
+                    // requires BOTH the auto order sentinel (`order_s == 0.0`)
+                    // AND a realized center count past the spectrum-identifiability
+                    // floor. Deriving it from `order_s == 0.0` alone desyncs at
+                    // `order_s == 0.0` with `m < MIN_CENTERS`: the builder emits a
+                    // single FUSED penalty (empty per-level scales +
+                    // `fused_penalty_normalization_scale: Some`) while a bare
+                    // `order_s == 0.0` validator demands `n_levels` per-level
+                    // scales, raising "penalty_normalization_scales has length 0,
+                    // expected N" on an otherwise-valid frozen single-scale term
+                    // (surfaces at higher d, where the auto band still carries
+                    // ≥ MIN_AUTO_SCALES eps levels). `frozen.masses.len()` is the
+                    // realized center count (already validated `== centers.nrows()`).
+                    let per_level =
+                        crate::basis::measure_jet_multiscale_mode(spec, frozen.masses.len());
                     if per_level {
                         validate_measure_jet_positive_vec_len(
                             label,
