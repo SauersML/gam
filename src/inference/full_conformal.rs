@@ -2335,6 +2335,7 @@ pub fn gaussian_jackknife_plus(
 /// training row is not exchangeable with the test row, so the finite-sample
 /// coverage proof does not apply. The constructor rejects non-unit weights and
 /// rows with `1 − hᵢ ≤ 1e-10` (no leave-one-out information).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GaussianJackknifePlusStats {
     /// Fitted coefficients `β̂ = M⁻¹Xᵀy`.
     beta: Array1<f64>,
@@ -2372,6 +2373,55 @@ impl GaussianJackknifePlusStats {
             );
         }
         let m = x.t().dot(x) + s_lambda;
+        Self::from_design_and_normal_matrix(x, y, &m)
+    }
+
+    /// Same exact jackknife+ statistics as [`new`](Self::new), but the
+    /// penalized normal matrix `M = XᵀX + Sλ` is supplied directly rather than
+    /// reassembled from `Sλ`. For a Gaussian-identity unit-weight fit the
+    /// converged penalized Hessian stored in [`FitGeometry`] *is* this `M` (the
+    /// working weights are unity and the matrix is dispersion-unscaled), so
+    /// persisting the design + `M` at fit time and replaying through this
+    /// constructor reproduces the certified interval with no penalty
+    /// re-derivation — the seam the saved-model `predict(interval=…)` magic
+    /// uses.
+    ///
+    /// `prior_weights` is validated to be unity for the exchangeability
+    /// guarantee, identically to [`new`](Self::new).
+    pub fn from_design_unit_weight_normal_matrix(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        prior_weights: &Array1<f64>,
+        m: &Array2<f64>,
+    ) -> Result<Self, String> {
+        let n = x.nrows();
+        if y.len() != n || prior_weights.len() != n {
+            return Err("gaussian jackknife+ stats: row-count mismatch".to_string());
+        }
+        if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
+            return Err(
+                "gaussian jackknife+ requires unit prior weights: a reweighted training row \
+                 is not exchangeable with the test row, so the finite-sample coverage proof \
+                 does not apply"
+                    .to_string(),
+            );
+        }
+        Self::from_design_and_normal_matrix(x, y, m)
+    }
+
+    fn from_design_and_normal_matrix(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        m: &Array2<f64>,
+    ) -> Result<Self, String> {
+        let n = x.nrows();
+        let p = x.ncols();
+        if y.len() != n {
+            return Err("gaussian jackknife+ stats: row-count mismatch".to_string());
+        }
+        if m.nrows() != p || m.ncols() != p {
+            return Err("gaussian jackknife+ stats: normal-matrix shape mismatch".to_string());
+        }
         let chol = m
             .cholesky(Side::Lower)
             .map_err(|e| format!("gaussian jackknife+ stats: normal matrix not SPD: {e:?}"))?;
@@ -3425,15 +3475,17 @@ mod tests {
         let weights = Array1::<f64>::ones(n);
 
         // Deterministic LCG so the smoke is reproducible without an RNG dep.
+        // `state` is threaded explicitly so `normal` can draw from the same
+        // stream without a second mutable borrow of a captured `unif` closure.
         let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
-        let mut unif = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        let unif = |state: &mut u64| {
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((*state >> 11) as f64) / ((1u64 << 53) as f64)
         };
         // Box–Muller standard normal.
-        let mut normal = || {
-            let u1 = unif().max(1e-12);
-            let u2 = unif();
+        let normal = |state: &mut u64| {
+            let u1 = unif(state).max(1e-12);
+            let u2 = unif(state);
             (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
         };
         let beta_true = [0.8_f64, -0.5, 0.3, 0.15];
@@ -3452,26 +3504,26 @@ mod tests {
             let mut x = Array2::<f64>::zeros((n, p));
             let mut yv = Array1::<f64>::zeros(n);
             for i in 0..n {
-                let z = unif();
+                let z = unif(&mut state);
                 let row = design_row(z);
                 let mut eta = 0.0;
                 for j in 0..p {
                     x[[i, j]] = row[j];
                     eta += beta_true[j] * row[j];
                 }
-                yv[i] = eta + sigma * normal();
+                yv[i] = eta + sigma * normal(&mut state);
             }
             let stats = match GaussianJackknifePlusStats::new(&x, &yv, &weights, &s) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let z_star = unif();
+            let z_star = unif(&mut state);
             let x_star = design_row(z_star);
             let mut eta_star = 0.0;
             for j in 0..p {
                 eta_star += beta_true[j] * x_star[j];
             }
-            let y_star = eta_star + sigma * normal();
+            let y_star = eta_star + sigma * normal(&mut state);
             let itv = stats.interval(&x_star, alpha).expect("coverage interval");
             assert!(itv.certifies_finite(), "coverage trial produced infinite width");
             if y_star >= itv.lo && y_star <= itv.hi {
