@@ -163,6 +163,12 @@ const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL: f64 = 1.0e-8;
 /// Laplace evidence, yet strict enough that a materially-improving fit refines on.
 const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION: f64 = 1.0e-4;
 
+/// Minimum completed refine rounds before the objective-stagnation fixed point
+/// may be accepted (#1051). Enough rounds to establish a meaningful
+/// total-improvement baseline for the fraction test, but far below the full
+/// refine budget — terminating the ill-conditioned crawl early is the goal.
+const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS: usize = 3;
+
 /// Above this full-`B` β width, dense beta-penalty curvature is never
 /// materialized when Grassmann frames are engaged; exact curvature is probed
 /// directly in the factored coordinate space instead.
@@ -7000,6 +7006,7 @@ impl SaeManifoldTerm {
         // instead of grinding the budget.
         let entry_loss_total = loss.total();
         let mut previous_loss_total = entry_loss_total;
+        let mut refine_rounds: usize = 0;
         loop {
             let sys = self
                 .assemble_arrow_schur(target, rho, registry)
@@ -7163,15 +7170,18 @@ impl SaeManifoldTerm {
                 ridge_beta,
             )?;
             total_inner_iter += refine_iter;
+            refine_rounds += 1;
             // #1051 — objective-stagnation fixed point. A whole refine round that
-            // failed to lower the penalised objective by a meaningful relative
-            // amount means the Newton/LM iterate is at its numerical optimum: the
-            // remaining KKT residual lives in the weakly-identified decoder /
-            // gauge directions the near-singular Schur cannot resolve. Ranking the
-            // Laplace criterion at this fixed point is correct (the only further
-            // motion is cosmetic flat-direction crawl), so accept the current
-            // cache instead of refining until the budget dies. Only engages once
-            // the base budget is spent, so a healthy fit mid-descent is untouched.
+            // failed to lower the penalised objective by a meaningful FRACTION of
+            // the total since-entry reduction means the Newton/LM iterate is at
+            // its numerical optimum: the remaining KKT residual lives in the
+            // weakly-identified decoder / gauge directions the near-singular Schur
+            // cannot resolve. Ranking the Laplace criterion at this fixed point is
+            // correct (the only further motion is cosmetic flat-valley crawl), so
+            // accept the current cache instead of refining until the budget dies.
+            // Requires a few completed refine rounds (so the fraction baseline is
+            // meaningful) but is NOT gated behind the full refine budget — the
+            // whole point is to terminate the crawl long before that.
             let new_loss_total = loss.total();
             // Two stagnation signals, both required: (1) the latest refine round
             // contributed a negligible FRACTION of the total objective reduction
@@ -7197,7 +7207,7 @@ impl SaeManifoldTerm {
                 && (relative_decrease < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
                     || captured_fraction < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION);
             previous_loss_total = new_loss_total;
-            if stalled && total_inner_iter >= base_refine_iter {
+            if stalled && refine_rounds >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
                 let stationary_sys =
                     self.assemble_arrow_schur(target, rho_fixed, registry)
                         .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
