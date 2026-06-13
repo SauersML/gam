@@ -32,6 +32,7 @@ use ::opt::{
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
@@ -2963,10 +2964,144 @@ struct OuterFirstOrderBridge<'a> {
     /// this memo preserves the objective while avoiding duplicate refinement
     /// work.
     value_probe_cache: Vec<ValueProbeCacheEntry>,
+    /// Gradient-independent cost-stall convergence guard. `opt::Bfgs` only
+    /// terminates on a small *projected gradient norm* (its stall exit ANDs
+    /// gradient-smallness with cost-smallness), so on a fully-penalized
+    /// (double-penalty) REML surface with a shallow, weakly-identified valley —
+    /// where the REML score flatlines while `‖∇_ρ V‖` plateaus *above*
+    /// tolerance — no opt-side exit ever fires and BFGS burns its entire
+    /// `max_iterations` budget (each iteration spending many line-search +
+    /// coordinate-rescue + jiggle probes) on every seed. That is the #1089
+    /// pathology: a trivial n≈30..120 Gaussian fit emitting ~850k cost-only
+    /// evaluations until a wall-clock budget kills it. This guard adds the
+    /// missing mgcv-style score-change stop: it watches the accepted-iterate
+    /// REML objective and, once it stops improving by more than a relative
+    /// tolerance over a window of consecutive accepted outer steps, publishes
+    /// the best-so-far iterate and signals BFGS to stop. The runner then
+    /// classifies the run as *converged at the flat-valley floor* rather than
+    /// non-converged — the remaining gradient lies along weakly-identified ρ
+    /// directions that do not reduce the objective.
+    cost_stall: Option<CostStallGuard>,
 }
 
 const VALUE_PROBE_CACHE_CAPACITY: usize = 256;
 const VALUE_PROBE_REJECT_COST_FLOOR: f64 = 1.0e11;
+
+/// Sentinel embedded in the [`ObjectiveEvalError::Fatal`] message the bridge
+/// returns when [`CostStallGuard`] fires. `opt::Bfgs` preserves the message
+/// verbatim in [`BfgsError::ObjectiveFailed`]; the seed-loop runner recognizes
+/// this prefix and reclassifies the (otherwise "failed") run as a converged
+/// outer result built from the published best iterate.
+const COST_STALL_CONVERGED_SENTINEL: &str = "OUTER_COST_STALL_CONVERGED";
+
+/// Number of consecutive accepted outer iterates with negligible relative
+/// objective improvement required before the cost-stall guard declares
+/// convergence. Matches the spirit of `opt`'s own `StallPolicy { window: 3 }`
+/// but, crucially, is gated on the cost alone (not on gradient smallness),
+/// which is the condition `opt` never checks in isolation.
+const COST_STALL_WINDOW: usize = 6;
+
+/// Best iterate captured by a cost-stall convergence, handed from the bridge
+/// (which is moved into `opt::Bfgs`) back to the seed-loop runner via the
+/// guard's shared cell.
+#[derive(Clone)]
+struct CostStallExit {
+    rho: Array1<f64>,
+    value: f64,
+    grad_norm: f64,
+    /// Accepted outer iterates observed when the stall fired (for the runner's
+    /// `OuterResult.iterations` field and logging).
+    iterations: usize,
+}
+
+/// Tracks the monotone best accepted-iterate REML objective and a
+/// no-improvement streak, firing a gradient-independent convergence once the
+/// objective has effectively stopped decreasing. See the `cost_stall` field
+/// doc on [`OuterFirstOrderBridge`] for the full rationale (#1089).
+struct CostStallGuard {
+    /// Relative improvement floor: an accepted step counts as "no improvement"
+    /// when `(best - cost) <= rel_tol * (1 + |best|)`. Derived from the outer
+    /// convergence tolerance so it tracks the configured precision rather than
+    /// a free-standing magic constant.
+    rel_tol: f64,
+    /// Consecutive accepted-step window with no improvement before declaring
+    /// convergence.
+    window: usize,
+    best_value: f64,
+    best_rho: Option<Array1<f64>>,
+    best_grad_norm: f64,
+    no_improve_streak: usize,
+    accepted_iters: usize,
+    /// Shared publication slot read by the seed-loop runner after
+    /// `optimizer.run()` returns the sentinel error.
+    exit: Arc<Mutex<Option<CostStallExit>>>,
+}
+
+impl CostStallGuard {
+    fn new(rel_tol: f64, window: usize, exit: Arc<Mutex<Option<CostStallExit>>>) -> Self {
+        Self {
+            rel_tol,
+            window,
+            best_value: f64::INFINITY,
+            best_rho: None,
+            best_grad_norm: f64::INFINITY,
+            no_improve_streak: 0,
+            accepted_iters: 0,
+            exit,
+        }
+    }
+
+    /// Fold one accepted-iterate `(ρ, cost, ‖g‖)` into the guard. Returns
+    /// `true` when the cost-stall convergence condition is met, after
+    /// publishing the best iterate to the shared cell.
+    fn observe(&mut self, rho: &Array1<f64>, value: f64, grad_norm: f64) -> bool {
+        if !value.is_finite() {
+            // A non-finite accepted objective is the inner-solver's problem,
+            // not a stall; reset so a later real descent is not falsely
+            // credited as a no-improvement step.
+            self.no_improve_streak = 0;
+            return false;
+        }
+        self.accepted_iters = self.accepted_iters.saturating_add(1);
+        let improvement = self.best_value - value;
+        let floor = self.rel_tol * (1.0 + self.best_value.abs());
+        if value < self.best_value {
+            self.best_value = value;
+            self.best_rho = Some(rho.clone());
+            self.best_grad_norm = grad_norm;
+        }
+        if improvement <= floor {
+            self.no_improve_streak = self.no_improve_streak.saturating_add(1);
+        } else {
+            self.no_improve_streak = 0;
+        }
+        if self.no_improve_streak < self.window {
+            return false;
+        }
+        // Publish the best iterate. Prefer the recorded best; fall back to the
+        // current point if (pathologically) none was stored.
+        let best_rho = self.best_rho.clone().unwrap_or_else(|| rho.clone());
+        let best_value = if self.best_value.is_finite() {
+            self.best_value
+        } else {
+            value
+        };
+        let best_grad_norm = if self.best_grad_norm.is_finite() {
+            self.best_grad_norm
+        } else {
+            grad_norm
+        };
+        if let Ok(mut slot) = self.exit.lock() {
+            *slot = Some(CostStallExit {
+                rho: best_rho,
+                value: best_value,
+                grad_norm: best_grad_norm,
+                iterations: self.accepted_iters,
+            });
+        }
+        true
+    }
+}
 
 #[derive(Clone)]
 struct ValueProbeCacheEntry {
@@ -3245,6 +3380,35 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // Wolfe line-search accepts the step. Cheap: throttled internally.
         crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
         self.iter_count = self.iter_count.saturating_add(1);
+        // Gradient-independent cost-stall convergence (#1089). `eval_grad` is
+        // invoked by `opt::Bfgs` at each accepted iterate (line-search COST
+        // probes go through `eval_cost`, not here), so folding the objective in
+        // here counts accepted outer steps. When the REML score has stopped
+        // improving over `COST_STALL_WINDOW` consecutive accepted steps, signal
+        // termination by returning a sentinel `Fatal`: `opt::Bfgs` cannot be
+        // stopped from an observer (its `OptimizerObserver` hooks return
+        // `()`), and an error is the only in-band way to halt it. The seed-loop
+        // runner recognizes the sentinel and rebuilds a *converged* result from
+        // the best iterate the guard published, so this is a real convergence
+        // exit, not a silent iteration cap.
+        if let Some(guard) = self.cost_stall.as_mut()
+            && guard.observe(x, eval.cost, g_norm)
+        {
+            log::info!(
+                "[OUTER] cost-stall convergence: REML objective improved < {:.3e} (relative) \
+                 over {} consecutive accepted outer steps; accepting best-so-far \
+                 (value={:.6e}, |g|={:.3e}). Dropping further gradient-norm descent on a \
+                 flat / weakly-identified ρ valley where the residual gradient lies along \
+                 directions that do not reduce the objective.",
+                guard.rel_tol,
+                guard.window,
+                guard.best_value,
+                guard.best_grad_norm,
+            );
+            return Err(ObjectiveEvalError::Fatal {
+                message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+            });
+        }
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient,
@@ -7905,6 +8069,16 @@ fn run_outer_with_plan(
                     let bounds = outer_bounds(lo, hi)?;
                     let grad_tol = outer_gradient_tolerance(config);
                     let max_iter = outer_max_iterations(config.max_iter)?;
+                    // Cost-stall convergence shared cell (#1089). The bridge is
+                    // moved into `opt::Bfgs`, so the best iterate it captures on
+                    // a flat-valley stall is handed back through this `Arc`.
+                    // Relative score-change floor is derived one decade tighter
+                    // than the outer gradient tolerance so it only triggers once
+                    // the objective is genuinely flat — never preempting a real
+                    // (if slow) descent that still clears the gradient test.
+                    let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
+                        Arc::new(Mutex::new(None));
+                    let cost_stall_rel_tol = (config.tolerance * 1.0e-2).max(f64::EPSILON);
                     let objective = OuterFirstOrderBridge {
                         obj,
                         layout,
@@ -7914,6 +8088,11 @@ fn run_outer_with_plan(
                         last_g_norm: None,
                         last_value_grad_rho: None,
                         value_probe_cache: Vec::new(),
+                        cost_stall: Some(CostStallGuard::new(
+                            cost_stall_rel_tol,
+                            COST_STALL_WINDOW,
+                            cost_stall_exit.clone(),
+                        )),
                     };
                     // Hand the precomputed (cost, gradient) seed eval to
                     // `opt::Bfgs` so its first internal `eval_grad` call is
@@ -8017,6 +8196,33 @@ fn run_outer_with_plan(
                                         failure_reason,
                                     ),
                                 ))
+                            }
+                        }
+                        Err(BfgsError::ObjectiveFailed { message })
+                            if message == COST_STALL_CONVERGED_SENTINEL =>
+                        {
+                            // The bridge's cost-stall guard halted BFGS at a
+                            // flat-valley floor (#1089). Rebuild a CONVERGED
+                            // outer result from the best iterate it published —
+                            // this is a genuine convergence (the REML score
+                            // stopped decreasing), not a failure.
+                            let exit = cost_stall_exit
+                                .lock()
+                                .ok()
+                                .and_then(|mut slot| slot.take());
+                            match exit {
+                                Some(exit) => Ok(outer_result_with_gradient_norm(
+                                    exit.rho,
+                                    exit.value,
+                                    exit.iterations,
+                                    Some(exit.grad_norm),
+                                    true,
+                                    *the_plan,
+                                )),
+                                None => Err(EstimationError::RemlOptimizationFailed(format!(
+                                    "BFGS cost-stall sentinel fired without a published best \
+                                     iterate ({context})"
+                                ))),
                             }
                         }
                         Err(BfgsError::ObjectiveFailed { message }) => {
@@ -9406,6 +9612,7 @@ mod tests {
             last_g_norm: None,
             last_value_grad_rho: None,
             value_probe_cache: Vec::new(),
+            cost_stall: None,
         };
 
         let first = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
