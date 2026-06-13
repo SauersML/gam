@@ -22,11 +22,15 @@
 //! kernel matrix `Φ_{n,k} = φ(r)`.
 
 use gam::terms::basis::{
-    CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu, build_matern_basis,
+    CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu,
+    build_matern_basis_literal_aniso,
 };
 use ndarray::{Array2, ArrayView2, array};
 
-/// Raw (un-projected) Matérn kernel design for the supplied anisotropy.
+/// Raw (un-projected) Matérn kernel design for the supplied anisotropy, built
+/// through the **public** forward entry (`build_matern_basis_literal_aniso`, the
+/// one the `matern_basis` FFI uses) which honors an explicit all-zero η as the
+/// isotropic metric rather than the κ-optimizer's geometry-seeding sentinel.
 fn forward_kernel(
     points: ArrayView2<'_, f64>,
     centers: &Array2<f64>,
@@ -45,7 +49,7 @@ fn forward_kernel(
         aniso_log_scales: aniso.map(<[f64]>::to_vec),
         nullspace_shrinkage_survived: None,
     };
-    build_matern_basis(points, &spec)
+    build_matern_basis_literal_aniso(points, &spec)
         .expect("forward Matérn kernel should build")
         .design
         .to_dense()
