@@ -781,10 +781,71 @@ pub fn fit_penalized_multinomial_formula(
     }
     let (y_one_hot, _) = one_hot_categorical_response(data, y_col, &response_name)?;
     // Build the global X dense (the design is a DesignMatrix abstraction).
-    let x_dense = design
+    let mut x_dense = design
         .design
         .try_to_dense_by_chunks("multinomial fit design")
         .map_err(EstimationError::InvalidInput)?;
+
+    // ── #715 real-data conditioning: standardize unpenalized parametric
+    // columns. Raw-unit linear covariates (penguins `body_mass_g` ~ 4e3 grams)
+    // inflate the joint Newton information by the squared column scale (a κ(H)
+    // multiplier of ~s² ≈ 1e7 against the intercept), which is what turns the
+    // near-separable LM-damped inner solve into a geometric grind that
+    // exhausts its cycle budgets — the adapter-level face of "all REML startup
+    // seeds rejected". Because these columns are UNPENALIZED (parametric terms
+    // carry no default ridge, #749), the affine reparameterization
+    // `x_j ↦ (x_j − m_j)/s_j` is EXACT for the whole criterion: the optimized
+    // REML/LAML objective, the fitted η, the selected λ, and the separation
+    // diagnostics are all invariant — only the conditioning of `H` changes.
+    // Fitted coefficients are mapped back to raw units at repack below, so the
+    // saved model and the (raw-design) predict path are untouched. Penalized
+    // columns are left alone (a penalty makes the rescaling non-equivalent),
+    // and nothing is touched when explicit coefficient bounds/constraints
+    // exist (those are stated in raw units).
+    let parametric_standardization: Vec<(usize, f64, f64)> = if design
+        .coefficient_lower_bounds
+        .is_some()
+        || design.linear_constraints.is_some()
+    {
+        Vec::new()
+    } else {
+        let p_total = x_dense.ncols();
+        let mut penalized = vec![false; p_total];
+        for bp in &design.penalties {
+            for col in bp.col_range.clone() {
+                if col < p_total {
+                    penalized[col] = true;
+                }
+            }
+        }
+        let has_intercept = !design.intercept_range.is_empty();
+        let n_rows = x_dense.nrows().max(1) as f64;
+        let mut standardized = Vec::new();
+        for (_, range) in &design.linear_ranges {
+            for col in range.clone() {
+                if col >= p_total || penalized[col] {
+                    continue;
+                }
+                let column = x_dense.column(col);
+                let mean = column.sum() / n_rows;
+                let var = column.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n_rows;
+                let scale = var.sqrt();
+                // Skip near-constant or degenerate columns: no conditioning to
+                // be gained and the back-map would divide by ~0.
+                if !(scale.is_finite() && scale > 1e-8 * (mean.abs() + 1.0)) {
+                    continue;
+                }
+                // Centering shifts mass onto the intercept; without one the
+                // shift is not representable, so scale only.
+                let center = if has_intercept { mean } else { 0.0 };
+                for v in x_dense.column_mut(col).iter_mut() {
+                    *v = (*v - center) / scale;
+                }
+                standardized.push((col, center, scale));
+            }
+        }
+        standardized
+    };
     // Preserve the per-smooth-term penalty block structure (#561): each smooth
     // term `t` contributes its own `P × P` penalty component (`Blockwise` with
     // `total_dim = P`, the term's local `S_t` embedded at its `col_range`), and
@@ -1004,6 +1065,27 @@ pub fn fit_penalized_multinomial_formula(
         }
         for i in 0..p_per_class {
             coefficients_active[[i, a]] = block.beta[i];
+        }
+    }
+    // Map the standardized-column coefficients back to raw units (the exact
+    // inverse of the conditioning reparameterization above): β_raw = b/s, with
+    // the centering mass `Σ_j b_j·m_j/s_j` returned to the intercept.
+    if !parametric_standardization.is_empty() {
+        let intercept_col = design.intercept_range.clone().next();
+        for a in 0..m {
+            let mut intercept_adjust = 0.0;
+            for &(col, center, scale) in &parametric_standardization {
+                if col < p_per_class {
+                    let raw = coefficients_active[[col, a]] / scale;
+                    coefficients_active[[col, a]] = raw;
+                    intercept_adjust += raw * center;
+                }
+            }
+            if let Some(i0) = intercept_col
+                && i0 < p_per_class
+            {
+                coefficients_active[[i0, a]] -= intercept_adjust;
+            }
         }
     }
     // Flatten every (class, term) smoothing parameter in block-major order
