@@ -214,6 +214,97 @@ impl RadialProfile {
             kind.eval_design_triplet(r)
         }
     }
+
+    /// Exact Chebyshev spectral differentiation in the `x ∈ [−1, 1]`
+    /// variable: given the coefficients `a_d` of `J(x) = Σ a_d T_d(x)`,
+    /// return the coefficients `b_d` of `J′(x) = Σ b_d T_d(x)` via the
+    /// backward recurrence
+    ///
+    /// ```text
+    /// b_D = 0;  b_{D-1} = 2·D·a_D;  b_{d-1} = b_{d+1} + 2·d·a_d  (d = D−1 … 1);
+    /// then b_0 ← b_0 / 2.
+    /// ```
+    ///
+    /// No new function evaluations — `J′` shares the value channel's
+    /// representation, so value and derivative are immune to the
+    /// objective↔gradient desync class.
+    fn differentiate_coeffs(a: &[f64]) -> Vec<f64> {
+        let len = a.len();
+        let mut b = vec![0.0_f64; len];
+        if len <= 1 {
+            return b;
+        }
+        let big_d = len - 1;
+        // b_{D-1} = 2·D·a_D (with b_D = 0 already).
+        b[big_d - 1] = 2.0 * big_d as f64 * a[big_d];
+        // b_{d-1} = b_{d+1} + 2·d·a_d for d = D−1 … 1.
+        for d in (1..big_d).rev() {
+            b[d - 1] = b[d + 1] + 2.0 * d as f64 * a[d];
+        }
+        // Halve the constant term per the first-kind convention.
+        b[0] *= 0.5;
+        b
+    }
+
+    /// Clenshaw contraction of one coefficient stack at the mapped point `x`.
+    #[inline]
+    fn clenshaw(c: &[f64], x: f64, two_x: f64) -> f64 {
+        let mut b1 = 0.0_f64;
+        let mut b2 = 0.0_f64;
+        for &a in c.iter().skip(1).rev() {
+            let b0 = a + two_x * b1 - b2;
+            b2 = b1;
+            b1 = b0;
+        }
+        c.first().copied().unwrap_or(0.0) + x * b1 - b2
+    }
+
+    /// Per-channel jet tower at an in-range radius: for each channel `c ∈
+    /// {φ, q, t}` returns `[c(r), dc/dr, d²c/dr², d³c/dr³]`.
+    ///
+    /// The derivative stacks come from iterating [`Self::differentiate_coeffs`]
+    /// in the Chebyshev `x` variable; the affine map `x(u)` contributes a
+    /// constant factor `dx/du = 2/(u_hi − u_lo)` per `u`-derivative, and the
+    /// log map `u = ln r` contributes the `du/dr = 1/r` chain. Concretely, with
+    /// `s = dx/du` and `g(u) = J(x(u))`:
+    ///
+    /// ```text
+    /// J_u   = s · J_x
+    /// J_uu  = s² · J_xx
+    /// J_uuu = s³ · J_xxx
+    /// dc/dr      = J_u / r
+    /// d²c/dr²    = (J_uu − J_u) / r²
+    /// d³c/dr³    = (J_uuu − 3·J_uu + 2·J_u) / r³
+    /// ```
+    ///
+    /// (the `r`-power chain factors follow from `d/dr = (1/r) d/du`).
+    #[inline]
+    pub fn eval_jets_inside(&self, r: f64) -> [[f64; 4]; 3] {
+        let u = r.ln();
+        let x = (2.0 * u - (self.u_lo + self.u_hi)) / (self.u_hi - self.u_lo);
+        let two_x = 2.0 * x;
+        let s = 2.0 / (self.u_hi - self.u_lo); // dx/du
+        let inv_r = 1.0 / r;
+        let mut out = [[0.0_f64; 4]; 3];
+        for (ci, c0) in self.coeff.iter().enumerate() {
+            let c1 = Self::differentiate_coeffs(c0); // coeffs of J_x
+            let c2 = Self::differentiate_coeffs(&c1); // coeffs of J_xx
+            let c3 = Self::differentiate_coeffs(&c2); // coeffs of J_xxx
+            let j_val = Self::clenshaw(c0, x, two_x);
+            let j_x = Self::clenshaw(&c1, x, two_x);
+            let j_xx = Self::clenshaw(&c2, x, two_x);
+            let j_xxx = Self::clenshaw(&c3, x, two_x);
+            // x → u → r chain.
+            let j_u = s * j_x;
+            let j_uu = s * s * j_xx;
+            let j_uuu = s * s * s * j_xxx;
+            out[ci][0] = j_val; // c(r)
+            out[ci][1] = j_u * inv_r; // dc/dr
+            out[ci][2] = (j_uu - j_u) * inv_r * inv_r; // d²c/dr²
+            out[ci][3] = (j_uuu - 3.0 * j_uu + 2.0 * j_u) * inv_r * inv_r * inv_r; // d³c/dr³
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +355,54 @@ mod tests {
             let exact = kind.eval_design_triplet(r).expect("exact");
             let via = profile.eval_or_exact(&kind, r).expect("fallback");
             assert_eq!(exact, via, "fallback must be the exact evaluator verbatim");
+        }
+    }
+
+    #[test]
+    fn jet_tower_matches_central_differences_of_value_clenshaw() {
+        // The differentiated-coefficient jet must match central differences
+        // of the value channel's own Clenshaw across the radius range — i.e.
+        // value and derivative are ONE source of truth (no transcendental
+        // re-evaluation, immune to the desync class).
+        let kind = production_duchon_kind();
+        let (r_min, r_max) = (0.05_f64, 30.0_f64);
+        let profile =
+            RadialProfile::build(&kind, r_min, r_max).expect("production Duchon profile certifies");
+        let n = 200usize;
+        // Stay strictly interior so central-difference stencils remain in range.
+        let (lo, hi) = (r_min * 1.2, r_max / 1.2);
+        for i in 0..n {
+            let r = lo * (hi / lo).powf((i as f64 + 0.5) / n as f64);
+            // Relative step in r; profile is smooth in u = ln r.
+            let h = r * 1.0e-4;
+            let jets = profile.eval_jets_inside(r);
+            for (ci, jet) in jets.iter().enumerate() {
+                let v = |rr: f64| profile.eval_inside(rr);
+                let val = |rr: f64| {
+                    let (p, q, t) = v(rr);
+                    [p, q, t][ci]
+                };
+                let f_m2 = val(r - 2.0 * h);
+                let f_m1 = val(r - h);
+                let f_p1 = val(r + h);
+                let f_p2 = val(r + 2.0 * h);
+                let f_0 = val(r);
+                // 4th-order central first/second/third derivatives.
+                let d1 = (-f_p2 + 8.0 * f_p1 - 8.0 * f_m1 + f_m2) / (12.0 * h);
+                let d2 = (-f_p2 + 16.0 * f_p1 - 30.0 * f_0 + 16.0 * f_m1 - f_m2) / (12.0 * h * h);
+                let d3 = (f_p2 - 2.0 * f_p1 + 2.0 * f_m1 - f_m2) / (2.0 * h * h * h);
+                let checks = [(jet[0], f_0), (jet[1], d1), (jet[2], d2), (jet[3], d3)];
+                // Looser per-order tolerance: higher FD orders amplify the
+                // truncation/rounding floor of the finite step.
+                let rtols = [1.0e-10_f64, 1.0e-5, 1.0e-3, 5.0e-2];
+                for (k, (jet_v, fd_v)) in checks.iter().enumerate() {
+                    let scale = jet_v.abs().max(fd_v.abs()).max(1.0e-8);
+                    assert!(
+                        (jet_v - fd_v).abs() <= rtols[k] * scale,
+                        "channel {ci} order {k} at r={r}: jet={jet_v:e} fd={fd_v:e}"
+                    );
+                }
+            }
         }
     }
 
