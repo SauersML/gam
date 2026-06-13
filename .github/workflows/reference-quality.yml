@@ -212,10 +212,22 @@ jobs:
           python -m pip install --upgrade pip
           # Core (must succeed); heavy/optional ones best-effort so one failure
           # does not block the rest.
-          pip install "numpy<2" pandas scipy scikit-learn statsmodels
+          #
+          # statsmodels: pin <0.14.2. Newer releases broke GLMGam.select_penweight
+          # — its GCV path reads `self.scale`, which the GLMGam results no longer
+          # expose, raising "'GLMGam' object has no attribute 'scale'" INSIDE
+          # statsmodels (generalized_additive_model.py:814), failing the GLMGam
+          # reference tests through no fault of the comparator script (#1070).
+          # 0.14.1 is the last release whose select_penweight GCV runs clean.
+          pip install "numpy<2" pandas scipy scikit-learn "statsmodels<0.14.2"
           pip install pygam lifelines scikit-survival properscoring scoringrules || true
           pip install geomstats GPy gpytorch || true
-          pip install numpyro arviz pymc || true
+          # arviz: pin <1.0. arviz 1.x rewrote `from_dict`, dropping the
+          # `posterior=`/`log_likelihood=` keyword constructors the NUTS and
+          # loo/PSIS reference scripts use ("from_dict() got an unexpected keyword
+          # argument 'posterior'/'log_likelihood'", #1070). The 0.x line keeps the
+          # documented kwarg constructor the scripts are written against.
+          pip install numpyro "arviz<1.0" pymc || true
           pip install interpret ngboost || true
           pip install xgboostlss lightgbmlss || true
           python -c "import numpy,scipy,sklearn,statsmodels,pandas; print('core python refs ok')"
