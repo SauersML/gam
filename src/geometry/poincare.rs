@@ -302,6 +302,96 @@ pub fn conformal_factor(p: ArrayView1<'_, f64>, curvature: f64) -> GeometryResul
     Ok(2.0 / (1.0 + curvature * sq))
 }
 
+/// Conformal-reweighted Dirichlet roughness Gram of a smooth latent field over
+/// the Poincaré ball — the hyperbolic analogue of the flat
+/// `∫ Φ'(t)ᵀ Φ'(t) dt` patch penalty.
+///
+/// The atom's latent coordinate `t_n ∈ ℝ^d` is read as a *tangent vector at the
+/// ball origin*; its ball point is `p_n = exp₀(t_n)` (the wrapped / tangent
+/// parameterisation of Nagano et al. 2019, Mathieu et al. 2019). For a decoded
+/// field `f(t) = β·Φ(t)` the hyperbolic Dirichlet energy is
+///
+/// ```text
+/// E_g[f] = ∫ gᵃᵇ ∂_a f ∂_b f dμ_g
+///        = ∫ λ(p)^{d−2} ‖∇_t f‖² dt           (g_ab = λ² δ_ab, dμ_g = λ^d dt)
+/// ```
+///
+/// with `λ(p) = 2 / (1 + c‖p‖²)` the conformal factor ([`conformal_factor`],
+/// `c < 0`). Discretising the integral against the empirical row density gives
+/// the coefficient-space Gram
+///
+/// ```text
+/// S = Σ_n w_n Φ'(t_n)ᵀ Φ'(t_n),   w_n = λ(p_n)^{d−2},
+/// ```
+/// which this function assembles from the basis first-derivative jet
+/// `basis_jacobian[n, k, a] = ∂Φ_k/∂t_a (t_n)` and the latent coordinates
+/// `coords[n, a] = t_{n,a}`. The flat patch is the `c → 0⁻` / `d = 2` limit
+/// where `w_n ≡ 1` (2-D Dirichlet energy is conformally invariant), so the
+/// hyperbolic penalty differs from the Euclidean one exactly when the data has
+/// the boundary-concentrated (exponential-volume) structure hyperbolic geometry
+/// is for. The returned Gram is symmetric PSD by construction.
+///
+/// `curvature` must be strictly negative. Returns the `(M, M)` Gram, `M` the
+/// number of basis columns.
+pub fn conformal_dirichlet_penalty(
+    coords: ArrayView2<'_, f64>,
+    basis_jacobian: ndarray::ArrayView3<'_, f64>,
+    curvature: f64,
+) -> GeometryResult<Array2<f64>> {
+    require_negative_curvature(curvature)?;
+    let n = coords.nrows();
+    let d = coords.ncols();
+    let jet_shape = basis_jacobian.shape();
+    if jet_shape[0] != n {
+        return Err(GeometryError::DimensionMismatch {
+            context: "conformal_dirichlet_penalty: basis_jacobian row count vs coords rows",
+            expected: n,
+            got: jet_shape[0],
+        });
+    }
+    if jet_shape[2] != d {
+        return Err(GeometryError::DimensionMismatch {
+            context: "conformal_dirichlet_penalty: basis_jacobian latent-axis count vs coords cols",
+            expected: d,
+            got: jet_shape[2],
+        });
+    }
+    let m = jet_shape[1];
+    let mut gram = Array2::<f64>::zeros((m, m));
+    if n == 0 || m == 0 {
+        return Ok(gram);
+    }
+    let exponent = d as f64 - 2.0;
+    let mut grad = vec![0.0_f64; m];
+    for row in 0..n {
+        // Ball point p_n = exp₀(t_n) and its conformal weight w_n = λ(p_n)^{d−2}.
+        let p = exp_origin(coords.row(row), curvature)?;
+        let lambda = conformal_factor(p.view(), curvature)?;
+        let w = lambda.powf(exponent);
+        if !(w.is_finite() && w > 0.0) {
+            continue;
+        }
+        // Accumulate w_n · ∇f outer products one latent axis at a time:
+        // S += Σ_a w_n · (∂Φ/∂t_a)(∂Φ/∂t_a)ᵀ.
+        for axis in 0..d {
+            for k in 0..m {
+                grad[k] = basis_jacobian[[row, k, axis]];
+            }
+            for i in 0..m {
+                let gi = grad[i];
+                if gi == 0.0 {
+                    continue;
+                }
+                let scaled = w * gi;
+                for j in 0..m {
+                    gram[[i, j]] += scaled * grad[j];
+                }
+            }
+        }
+    }
+    Ok(gram)
+}
+
 /// Poincaré exponential map at an arbitrary base point `p`:
 /// `exp_p(v) = p ⊕ exp_0(0.5 * lambda_p * v)`.
 ///
