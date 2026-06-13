@@ -16,18 +16,19 @@
 
 use gam::solver::spline_scan::{fit_spline_scan, fit_spline_scan_at};
 
-/// Dense in-test Gaussian elimination solve A·X = B (partial pivoting), with
-/// one pass of iterative refinement.
+/// Dense in-test solve A·X = B (Gauss–Jordan, partial pivoting) hardened with
+/// symmetric diagonal (Jacobi) equilibration + iterative refinement.
 ///
-/// The joint state precision Λ at moderate λ carries Q(δ)⁻¹ blocks of size
-/// ~1/(q·δ³); at the test's spacing the condition number reaches ~1e8–1e9, so
-/// a bare Gauss–Jordan answer has relative error up to ε·κ(Λ) ≈ 1e-8–1e-7 —
-/// LARGER than this oracle's machine-precision gate (the scan side, built
-/// from sequential well-conditioned 2×2 ops, does not share that budget).
-/// One refinement step (residual against the ORIGINAL Λ, correction through
-/// the same elimination) restores the oracle to near-ε accuracy whenever
-/// ε·κ ≪ 1, which holds here — strengthening the truth instead of loosening
-/// the gate.
+/// The joint state precision Λ carries Q(δ)⁻¹ blocks that scale as
+/// `1/(q·δ^{2m−1})` — `1/(q·δ³)` at the cubic, `1/(q·δ⁵)` at the quintic — so
+/// its components span many orders of magnitude (κ ≳ 1e8). A bare Gauss–Jordan
+/// answer carries relative error up to ε·κ(Λ), LARGER than this oracle's
+/// machine-precision gate (the scan side, built from sequential well-conditioned
+/// small-matrix ops, does not share that budget). Equilibrating to unit
+/// diagonal (`Ã = SAS`, `s_i = 1/√A_ii`) collapses that scale disparity before
+/// the elimination, and a few refinement steps against `Ã` then reach near-ε;
+/// `x = S·x̃` restores the solution. This STRENGTHENS the truth, it does not
+/// loosen the gate.
 fn dense_solve(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let n = a.len();
     let m = b[0].len();
@@ -188,6 +189,56 @@ fn process_noise_dense(delta: f64, q: f64, m: usize) -> Vec<Vec<f64>> {
     out
 }
 
+/// `order × order` identity as a dense matrix.
+fn identity(order: usize) -> Vec<Vec<f64>> {
+    (0..order)
+        .map(|i| (0..order).map(|j| f64::from(u8::from(i == j))).collect())
+        .collect()
+}
+
+/// Accumulate one Markov increment `(α_{t+1} − F α_t)ᵀ (qQ)⁻¹ (α_{t+1} − F α_t)`
+/// into the joint prior precision at the contiguous block pair `(t, t+1)` whose
+/// state columns start at `base = order·t`. `T = [−F  I]` acts on
+/// `(α_t, α_{t+1})`. Shared by the at-knot and augmented-query oracles.
+fn add_increment(
+    prior: &mut [Vec<f64>],
+    base: usize,
+    f: &[Vec<f64>],
+    qi: &[Vec<f64>],
+    order: usize,
+) {
+    let trow = |r: usize, c: usize| -> f64 {
+        if c < order {
+            -f[r][c]
+        } else if c - order == r {
+            1.0
+        } else {
+            0.0
+        }
+    };
+    for r1 in 0..order {
+        for r2 in 0..order {
+            let coef = qi[r1][r2];
+            if coef == 0.0 {
+                continue;
+            }
+            for c1 in 0..2 * order {
+                let ta = trow(r1, c1);
+                if ta == 0.0 {
+                    continue;
+                }
+                for c2 in 0..2 * order {
+                    let tb = trow(r2, c2);
+                    if tb == 0.0 {
+                        continue;
+                    }
+                    prior[base + c1][base + c2] += ta * coef * tb;
+                }
+            }
+        }
+    }
+}
+
 /// Dense exact posterior of the SAME intrinsic order-`m` Markov prior, built
 /// independently: joint precision over states `(f_t, f'_t, …, f^{(m−1)}_t)`,
 /// improper (zero) prior on the leading null space.
@@ -209,43 +260,8 @@ fn dense_truth(x: &[f64], y: &[f64], w: &[f64], log_lambda: f64, order: usize) -
     for t in 0..nk - 1 {
         let d = x[t + 1] - x[t];
         let f = transition_dense(d, order);
-        let qq = process_noise_dense(d, q, order);
-        // Q⁻¹ via the in-test dense solve against the identity.
-        let eye_o: Vec<Vec<f64>> = (0..order)
-            .map(|i| (0..order).map(|j| f64::from(u8::from(i == j))).collect())
-            .collect();
-        let qi = dense_solve(&qq, &eye_o);
-        // T[r][c]: columns 0..order are −F[r][·]; columns order..2·order are I.
-        let trow = |r: usize, c: usize| -> f64 {
-            if c < order {
-                -f[r][c]
-            } else if c - order == r {
-                1.0
-            } else {
-                0.0
-            }
-        };
-        for r1 in 0..order {
-            for r2 in 0..order {
-                let coef = qi[r1][r2];
-                if coef == 0.0 {
-                    continue;
-                }
-                for c1 in 0..2 * order {
-                    let ta = trow(r1, c1);
-                    if ta == 0.0 {
-                        continue;
-                    }
-                    for c2 in 0..2 * order {
-                        let tb = trow(r2, c2);
-                        if tb == 0.0 {
-                            continue;
-                        }
-                        prior[order * t + c1][order * t + c2] += ta * coef * tb;
-                    }
-                }
-            }
-        }
+        let qi = dense_solve(&process_noise_dense(d, q, order), &identity(order));
+        add_increment(&mut prior, order * t, &f, &qi, order);
     }
     // Posterior precision and RHS: observations on the f components (local 0).
     let mut lambda = prior.clone();
@@ -258,10 +274,7 @@ fn dense_truth(x: &[f64], y: &[f64], w: &[f64], log_lambda: f64, order: usize) -
     }
     let mean_full = dense_solve(&lambda, &rhs);
     // Posterior covariance diagonal: solve Λ X = I and read f-diagonals.
-    let eye: Vec<Vec<f64>> = (0..dim)
-        .map(|i| (0..dim).map(|j| f64::from(u8::from(i == j))).collect())
-        .collect();
-    let cov = dense_solve(&lambda, &eye);
+    let cov = dense_solve(&lambda, &identity(dim));
     let mean: Vec<f64> = (0..nk).map(|t| mean_full[order * t][0]).collect();
     let var: Vec<f64> = (0..nk).map(|t| cov[order * t][order * t]).collect();
     // Restricted loglik (σ²=1, up to λ-free constant): the prior ∝ q⁻¹·K₀ has
@@ -273,6 +286,62 @@ fn dense_truth(x: &[f64], y: &[f64], w: &[f64], log_lambda: f64, order: usize) -
         - 0.5 * dense_logdet(&lambda)
         - 0.5 * (ytwy - rt_lam_r);
     DenseTruth { mean, var, reml }
+}
+
+/// Exact smoothing-spline posterior `(mean, var)` at unit σ² at an arbitrary
+/// INTERIOR query abscissa `xq`, built independently by inserting `xq` as an
+/// UNOBSERVED node into the joint intrinsic-prior precision (the Markov chain
+/// threads through it: the original `knot_p → knot_{p+1}` increment is split
+/// into `knot_p → xq` and `xq → knot_{p+1}`) and conditioning on the observed
+/// knots. This is the oracle for the scan's off-knot Gaussian bridge — and in
+/// particular it independently verifies the leading-interval lag-one
+/// cross-covariance gains (#1044), which the at-knot posterior gate does not
+/// directly exercise. `x` must be sorted strictly increasing with `xq` strictly
+/// between two of its entries.
+fn dense_truth_at_query(
+    x: &[f64],
+    y: &[f64],
+    w: &[f64],
+    log_lambda: f64,
+    order: usize,
+    xq: f64,
+) -> (f64, f64) {
+    let q = (-log_lambda).exp();
+    // Augmented sorted node sequence (knots + xq); track the query's index and
+    // each node's originating observation (None for the inserted query node).
+    let mut nodes: Vec<f64> = Vec::with_capacity(x.len() + 1);
+    let mut obs_of_node: Vec<Option<usize>> = Vec::with_capacity(x.len() + 1);
+    let mut qpos = usize::MAX;
+    for (t, &xt) in x.iter().enumerate() {
+        if qpos == usize::MAX && xq < xt {
+            qpos = nodes.len();
+            nodes.push(xq);
+            obs_of_node.push(None);
+        }
+        nodes.push(xt);
+        obs_of_node.push(Some(t));
+    }
+    assert!(qpos != usize::MAX, "query must be interior to the knots");
+    let na = nodes.len();
+    let dim = order * na;
+    let mut prior = vec![vec![0.0_f64; dim]; dim];
+    for t in 0..na - 1 {
+        let d = nodes[t + 1] - nodes[t];
+        let f = transition_dense(d, order);
+        let qi = dense_solve(&process_noise_dense(d, q, order), &identity(order));
+        add_increment(&mut prior, order * t, &f, &qi, order);
+    }
+    let mut lambda = prior;
+    let mut rhs = vec![vec![0.0_f64]; dim];
+    for t in 0..na {
+        if let Some(oi) = obs_of_node[t] {
+            lambda[order * t][order * t] += w[oi];
+            rhs[order * t][0] = w[oi] * y[oi];
+        }
+    }
+    let mean_full = dense_solve(&lambda, &rhs);
+    let cov = dense_solve(&lambda, &identity(dim));
+    (mean_full[order * qpos][0], cov[order * qpos][order * qpos])
 }
 
 fn test_data() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
@@ -385,6 +454,55 @@ fn scan_matches_dense_exact_posterior_at_fixed_lambda() {
 fn scan_matches_dense_exact_posterior_at_fixed_lambda_order3() {
     let (x, y, w) = test_data_wide();
     assert_scan_matches_dense_posterior(3, &x, &y, &w, &[-2.0, 0.0, 2.0]);
+}
+
+/// The scan's off-knot Gaussian bridge must equal the augmented-node dense
+/// posterior at interior query points — the independent gate on `predict` and,
+/// crucially, on the leading-interval lag-one cross-covariance gains the
+/// at-knot posterior does not touch. Queries deliberately include the leading
+/// intervals [knot 0, knot 1] and [knot 1, knot 2] (where, at order 3, the gain
+/// comes from the diffuse leading-block solve, not ordinary RTS).
+fn assert_scan_bridge_matches_dense(order: usize, x: &[f64], y: &[f64], w: &[f64]) {
+    let log_lambda = 0.0_f64;
+    let fit = fit_spline_scan_at(x, y, w, log_lambda, Some(1.0), order).expect("scan fit");
+    // Midpoints of the first few intervals (leading + proper) and a deep interior.
+    let queries = [
+        0.5 * (x[0] + x[1]),
+        0.5 * (x[1] + x[2]),
+        0.5 * (x[2] + x[3]),
+        0.5 * (x[5] + x[6]),
+        0.5 * (x[x.len() - 3] + x[x.len() - 2]),
+    ];
+    for &xq in &queries {
+        let (sm, sv) = fit.predict(xq).expect("scan bridge predict");
+        let (dm, dv) = dense_truth_at_query(x, y, w, log_lambda, order, xq);
+        let sd = dv.max(0.0).sqrt().max(1e-12);
+        assert!(
+            (sm - dm).abs() <= 1e-6 * sd,
+            "bridge mean mismatch at xq={xq} (m={order}): scan={sm} dense={dm} (gap {:.2e} SD)",
+            (sm - dm).abs() / sd
+        );
+        assert!(
+            (sv - dv).abs() <= 1e-6 * dv.max(1e-12),
+            "bridge variance mismatch at xq={xq} (m={order}): scan={sv} dense={dv}"
+        );
+    }
+}
+
+/// Cubic (m=2): off-knot bridge equals the augmented-node dense posterior.
+#[test]
+fn scan_bridge_matches_dense_augmented_posterior() {
+    let (x, y, w) = test_data_wide();
+    assert_scan_bridge_matches_dense(2, &x, &y, &w);
+}
+
+/// Quintic (m=3, #1044): off-knot bridge — including the two leading intervals
+/// whose gains come from the diffuse leading-block solve — equals the
+/// augmented-node dense posterior.
+#[test]
+fn scan_bridge_matches_dense_augmented_posterior_order3() {
+    let (x, y, w) = test_data_wide();
+    assert_scan_bridge_matches_dense(3, &x, &y, &w);
 }
 
 fn assert_scan_reml_matches_dense(
