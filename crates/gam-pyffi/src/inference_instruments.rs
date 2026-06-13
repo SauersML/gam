@@ -308,23 +308,30 @@ fn riesz_functional_gradient(
     design_matrix: Option<&ndarray::Array2<f64>>,
     weights: Option<&Array1<f64>>,
 ) -> PyResult<Array1<f64>> {
-    let need_row = |name: &str, value: Option<&Array1<f64>>| {
+    // A local `fn` (not a closure) so the returned reference's lifetime is tied
+    // explicitly to `value`; a closure capturing `target` cannot express that
+    // output-borrows-input lifetime relation and trips a borrow-checker error.
+    fn need_row<'a>(
+        target: &str,
+        name: &str,
+        value: Option<&'a Array1<f64>>,
+    ) -> PyResult<&'a Array1<f64>> {
         value.ok_or_else(|| {
             py_value_error(format!(
                 "debiased_functional: target {target:?} requires `{name}`"
             ))
         })
-    };
+    }
     let functional = match target {
         "point" => SmoothFunctional::PointEvaluation {
-            design_row: need_row("design_row", design_row)?.view(),
+            design_row: need_row(target, "design_row", design_row)?.view(),
         },
         "linear" => SmoothFunctional::Linear {
-            gradient: need_row("design_row", design_row)?.view(),
+            gradient: need_row(target, "design_row", design_row)?.view(),
         },
         "contrast" => SmoothFunctional::Contrast {
-            design_row_a: need_row("design_row", design_row)?.view(),
-            design_row_b: need_row("design_row_b", design_row_b)?.view(),
+            design_row_a: need_row(target, "design_row", design_row)?.view(),
+            design_row_b: need_row(target, "design_row_b", design_row_b)?.view(),
         },
         "average_derivative" => {
             let rows = design_matrix.ok_or_else(|| {

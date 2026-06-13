@@ -118,6 +118,16 @@ jobs:
         shell: bash
         run: cargo check -p gam-pyffi --all-targets --all-features
 
+      - name: Install cargo-nextest
+        # nextest runs each `#[test]` as its own process and enforces the
+        # per-test `slow-timeout`/`terminate-after` from .config/nextest.toml:
+        # a single test that runs past the cap is SIGKILLed and reported as a
+        # FAILURE naming that exact test. `taiki-e/install-action` fetches the
+        # prebuilt nextest binary (no compile) so this stays fast.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       - name: Run tests
         shell: bash
         env:
