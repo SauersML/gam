@@ -281,13 +281,13 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
             Column::new("sigma", &gam_sigma),
         ],
         r#"
-        import properscoring as ps
-        y = np.asarray(df["y"], dtype=float)
-        mu = np.asarray(df["mu"], dtype=float)
-        sigma = np.asarray(df["sigma"], dtype=float)
-        crps = ps.crps_gaussian(y, mu=mu, sig=sigma)
-        emit("crps", crps)
-        "#,
+import properscoring as ps
+y = np.asarray(df["y"], dtype=float)
+mu = np.asarray(df["mu"], dtype=float)
+sigma = np.asarray(df["sigma"], dtype=float)
+crps = ps.crps_gaussian(y, mu=mu, sig=sigma)
+emit("crps", crps)
+"#,
     );
     let gam_crps = py.vector("crps");
     assert_eq!(gam_crps.len(), n_test, "gam crps test length mismatch");

@@ -147,6 +147,14 @@ const SAE_MANIFOLD_INNER_STEP_REL_TOL: f64 = 1.0e-4;
 /// accepting inner-solve convergence.
 const SAE_MANIFOLD_INNER_GRAD_REL_TOL: f64 = 1.0e-5;
 
+/// Relative per-refine-round penalised-objective decrease below which the inner
+/// solve is treated as having reached its numerical fixed point (#1051). On an
+/// ill-conditioned penalised bilinear fit the KKT gradient and undamped step
+/// stay above tolerance while the objective stops moving; this `√εmach`-scale
+/// floor recognises that stalled iterate as the converged inner optimum instead
+/// of grinding the refine budget to the `1e12` infeasible sentinel.
+const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL: f64 = 1.0e-8;
+
 /// Above this full-`B` β width, dense beta-penalty curvature is never
 /// materialized when Grassmann frames are engaged; exact curvature is probed
 /// directly in the factored coordinate space instead.
@@ -6970,6 +6978,19 @@ impl SaeManifoldTerm {
         };
         let mut previous_refine_grad_norm: Option<f64> = None;
         let mut saw_refine_progress = false;
+        // #1051 — objective-stagnation convergence. On an ill-conditioned
+        // penalised bilinear fit (the euclidean / Duchon decoder × latent
+        // coordinate system on a trivial shape), the inner Newton crawls: each
+        // refine round lowers the penalised objective by a shrinking amount while
+        // the KKT gradient and the undamped step stay above their relative
+        // tolerances (the near-singular Schur amplifies the step in the
+        // weakly-identified decoder direction). The grad-OR-step gate then never
+        // fires and the solve is rejected as "did not converge" — the 1e12
+        // sentinel. A Newton/LM iterate whose objective has stopped decreasing
+        // to within `√εmach` of its scale IS the numerical inner optimum; ranking
+        // the Laplace criterion there is correct. We accept that fixed point
+        // instead of grinding the budget.
+        let mut previous_loss_total = loss.total();
         loop {
             let sys = self
                 .assemble_arrow_schur(target, rho, registry)
@@ -7133,6 +7154,32 @@ impl SaeManifoldTerm {
                 ridge_beta,
             )?;
             total_inner_iter += refine_iter;
+            // #1051 — objective-stagnation fixed point. A whole refine round that
+            // failed to lower the penalised objective by a meaningful relative
+            // amount means the Newton/LM iterate is at its numerical optimum: the
+            // remaining KKT residual lives in the weakly-identified decoder /
+            // gauge directions the near-singular Schur cannot resolve. Ranking the
+            // Laplace criterion at this fixed point is correct (the only further
+            // motion is cosmetic flat-direction crawl), so accept the current
+            // cache instead of refining until the budget dies. Only engages once
+            // the base budget is spent, so a healthy fit mid-descent is untouched.
+            let new_loss_total = loss.total();
+            let objective_scale = previous_loss_total.abs().max(new_loss_total.abs()) + 1.0;
+            let relative_decrease = (previous_loss_total - new_loss_total) / objective_scale;
+            let stalled = new_loss_total.is_finite()
+                && relative_decrease.is_finite()
+                && relative_decrease < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL;
+            previous_loss_total = new_loss_total;
+            if stalled && total_inner_iter >= base_refine_iter {
+                let stationary_sys =
+                    self.assemble_arrow_schur(target, rho_fixed, registry)
+                        .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
+                if let Ok((_dt, _db, stationary_cache)) =
+                    solve_arrow_newton_step_with_options(&stationary_sys, 0.0, 0.0, options)
+                {
+                    return Ok(stationary_cache);
+                }
+            }
         }
     }
 

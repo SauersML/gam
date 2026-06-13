@@ -12790,6 +12790,46 @@ mod whitened_spectrum {
             acc
         }
 
+        /// Predicted objective decrease of the *unconstrained* (infinite trust
+        /// radius) modified-Newton step on the quadratic model — the Newton
+        /// decrement `½ Σ_{identified k} c_k² / |γ_k|`.
+        ///
+        /// For the exact Newton step `δ = Σ c_k/γ_k v_k` (range modes only) the
+        /// model decrease `m(0) − m(δ) = rhsᵀδ − ½δᵀH_pen δ` evaluates to
+        /// `½ Σ c_k²/γ_k`; reflecting negative-curvature modes to `|γ_k|` (the
+        /// modified-Newton descent step `trust_region_step` takes) makes every
+        /// term a genuine decrease, so the unconstrained model can reduce the
+        /// objective by AT MOST this amount. The null space (`|γ_k| ≤
+        /// null_cutoff`) carries no step and no decrease and is skipped — its
+        /// residual mass is a free gauge direction the outer IFT projects out
+        /// (gam#553).
+        ///
+        /// This is the curvature-aware convergence quantity the coupled
+        /// joint-Newton needs on a weakly-identified (near-flat) carrying block
+        /// (survival marginal↔logslope, link-wiggle, location-scale — gam#1040 /
+        /// gam#1088): a large penalized stationarity residual `‖∇L − Sβ‖∞` along
+        /// a low-curvature direction (`g` large, `γ` tiny) gives an enormous raw
+        /// Newton step that the trust region clamps, so the residual- and
+        /// step-norm gates never close and the loop grinds to the cycle ceiling
+        /// — yet the *achievable* objective improvement `g²/(2γ)` may be far
+        /// below `objective_tol`. When it is, the iterate IS the penalized
+        /// optimum to within tolerance (Conn–Gould–Toint, *Trust-Region
+        /// Methods*, Thm 6.4.6): no step the model can resolve lowers the
+        /// objective by more than `objective_tol`, so continuing is wall-clock
+        /// waste. A genuine defect (real curvature AND large gradient) produces
+        /// a LARGE decrement, so this never masks one.
+        pub(super) fn newton_decrement(&self) -> f64 {
+            let mut acc = 0.0;
+            for k in 0..self.gamma.len() {
+                let abs_gamma = self.gamma[k].abs();
+                if abs_gamma <= self.null_cutoff {
+                    continue;
+                }
+                acc += self.c[k] * self.c[k] / abs_gamma;
+            }
+            0.5 * acc
+        }
+
         /// Assemble the whitened step `η(λ) = Σ c_k/(γ_k+λ) v_k` over identified
         /// modes and map it back to `δ = D^{-1/2} η`. Returns `(δ, range_rhs_inf,
         /// null_rhs_inf, nullity, lambda_min_positive, reflected_negative_modes,

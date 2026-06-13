@@ -9517,10 +9517,26 @@ pub fn build_thin_plate_basiswithworkspace(
             duchon_thin_plate_fallback_params(data.ncols(), centers.nrows())
     {
         let d = data.ncols();
+        // The hybrid-Duchon partial-fraction kernel coefficients scale as
+        // `kappa^(-2(p+s-n)) = length_scale^(2(p+s-n))` (see
+        // `duchon_partial_fraction_coeffs`). With the high spectral order `s`
+        // this auto-promotion selects (s ≥ 3 for d ≥ 6) and the Matern-style
+        // auto-init length_scale (`max_range / sqrt(n)`, which is far below the
+        // center spacing for moderate n), kappa·r runs large at every center
+        // pair, every kernel block underflows toward machine epsilon, and the
+        // constrained radial Gram collapses to floating-point noise
+        // (`positive_spectral_whitener_from_gram` then rejects a rank-0 smooth —
+        // gam#1091). The natural operating scale of a radial kernel is the
+        // typical center separation, where kappa·r ≈ O(1) keeps every block
+        // O(1); promote at that scale rather than inheriting the (possibly
+        // tiny) Matern init. The outer optimizer still tunes psi = log kappa
+        // from here, but it now starts from a non-degenerate basis.
+        let promotion_length_scale =
+            hybrid_duchon_promotion_length_scale(centers.view(), spec.length_scale);
         let duchon_spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(original_centers.clone()),
             periodic: spec.periodic.clone(),
-            length_scale: Some(spec.length_scale),
+            length_scale: Some(promotion_length_scale),
             power: s as f64,
             nullspace_order,
             identifiability: spec.identifiability.clone(),
@@ -9531,12 +9547,15 @@ pub fn build_thin_plate_basiswithworkspace(
         log::info!(
             "thin-plate basis auto-promoted to hybrid Duchon ({:?}, s={}) in d={}: \
              canonical TPS would need {} centers but got {} — using Duchon's \
-             Riesz-fractional generalization with finite kernel at r=0",
+             Riesz-fractional generalization with finite kernel at r=0 \
+             (length_scale={:.4e} from center spacing, was {:.4e})",
             nullspace_order,
             s,
             d,
             thin_plate_polynomial_basis_dimension(d),
             centers.nrows(),
+            promotion_length_scale,
+            spec.length_scale,
         );
         return build_duchon_basiswithworkspace(data, &duchon_spec, workspace);
     }
@@ -23949,6 +23968,38 @@ fn duchon_thin_plate_fallback_params(
         return Some((order, s_min));
     }
     None
+}
+
+/// Length scale at which the auto-promoted hybrid-Duchon kernel is well
+/// conditioned: the typical separation between centers.
+///
+/// The hybrid spectrum `||w||^(2p)·(kappa²+||w||²)^s` produces real-space
+/// partial-fraction coefficients that scale as `length_scale^(2(p+s-n))`
+/// (`duchon_partial_fraction_coeffs`). To keep every block O(1), `kappa·r`
+/// must be O(1) at the center separations the kernel actually evaluates on,
+/// i.e. `length_scale ≈ typical center distance`. We use the geometric mean
+/// of the min and max pairwise center distances — robust to a few clustered
+/// or far-flung centers and exactly the scale where the kernel's smooth and
+/// Matern-tail parts are both resolved. Falls back to the requested length
+/// scale when fewer than two distinct centers exist (no pairwise distance).
+fn hybrid_duchon_promotion_length_scale(
+    centers: ArrayView2<'_, f64>,
+    requested_length_scale: f64,
+) -> f64 {
+    match pairwise_distance_bounds_sampled(centers) {
+        Some((r_min, r_max)) => {
+            // Geometric mean keeps the scale between the tightest and widest
+            // center pairs; both are positive and finite by construction.
+            (r_min * r_max).sqrt()
+        }
+        None => {
+            if requested_length_scale.is_finite() && requested_length_scale > 0.0 {
+                requested_length_scale
+            } else {
+                1.0
+            }
+        }
+    }
 }
 
 #[inline(always)]
