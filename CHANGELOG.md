@@ -1,3 +1,70 @@
+## v0.3.114 — gam 0.3.114 / gamfit 0.1.197 (2026-06-13)
+
+Crate + wheel release rolling up the O(n) spline-scan auto-routing, the
+measure-jet simple/multiscale split and conditioned-frame ψ-Gram tensor, the
+multinomial formula-fit corrections, the Matérn-anisotropy isotropy fixes, and
+a large batch of formula-parsing / solver-robustness fixes. (On crates.io this
+also rolls in the 0.3.113 content — `gam 0.3.113` was tagged in-tree but never
+reached crates.io, which was still on 0.3.112; this release re-syncs both
+registries.)
+
+O(n) spline scan — auto-routing + saved models (#1030, #1034):
+- feat: the FFI and CLI now auto-route a single 1-D Gaussian smooth through the
+  O(n) spline scan end-to-end, so `s(x)`-only Gaussian fits skip the dense
+  REML path. Includes an n=1e6 spline-scan benchmark + a biobank-scale
+  no-regression certificate.
+- feat: a lossless `SplineScanState` saved-model representation channel with a
+  bit-for-bit JSON round-trip gate (serde_json `float_roundtrip`), validated
+  through `FittedModel`; the scan-model payload exempts dense-only fields.
+- feat: order m∈{1,2} routed through detection + callers (m=1 dense oracle),
+  with order-general scan API names and a match-or-beat truth-recovery gate vs
+  mgcv for the spline scan.
+
+measure-jet — speed + accuracy (#1039, #1033b):
+- perf: SIMPLE (single-scale) mode is the default again, fixing the ~12× slowdown
+  vs Matérn (#1039); the simple/multiscale auto-mode split is documented and
+  hardened, with a θ-invariant Gram cache for fixed-design ρ-only trials.
+- feat: the certified Chebyshev-in-ψ Gram tensor is built in the conditioned
+  frame and fires on real spatial smooths (#1033b); n-free Gaussian ψ-gradient
+  from the tensor derivatives, with a finite-difference gradient certificate.
+- fix: density-free default α = 3/2 (from the ρ^{3−2a} derivation).
+
+Multinomial formula fits (#715):
+- fix: standardize the unpenalized parametric columns in the multinomial formula
+  fit; restore exact outer curvature for double-penalty multinomial formula fits;
+  floor the multinomial inner KKT tolerance at the softmax f64 noise floor.
+- tests re-grounded onto a like-for-like mgcv REML / `select=TRUE` comparator;
+  no quality bar weakened.
+
+Matérn anisotropy (#1042):
+- fix: honor an explicit all-zero `aniso_log_scales` as isotropic on the Matérn
+  forward path; gate the anisotropy auto-seed on center-strategy provenance
+  rather than seeding unconditionally.
+
+Survival marginal-slope (#1040, partial):
+- fix: the joint-Newton inner solve now takes a scale-invariant relative
+  objective-plateau exit on flat REML valleys, so survival marginal-slope fits
+  terminate instead of grinding to the inner-cycle ceiling every outer ρ-eval.
+- fix: early-certificate inner exits report the residual they actually certified
+  on, so the terminal verdict can no longer print `converged=true … residual=inf`
+  (inner-report truthfulness).
+
+Other fixes:
+- fix(#1025): route uncoupled multi-block inner solves to the exact
+  block-coordinate path; joint competing-risks transformation truth-recovery.
+- feat(#939): wire the Lawley/Bartlett cumulant summary fields through `main`.
+- fix(#1036): generic cross-seed structural-failure bail in the seed cascade.
+- fix: accept ragged `Column` lists in `write_columns_csv` by NA-padding the tail
+  (unblocks the varying-ν Matérn / sphere-geodesic / Grassmann quality suites).
+- fix: peel mgcv `c(...)`/`(...)` R-vector wrappers in `split_list_option`, so
+  `te(x,y, bs=c('tp','tp'), k=c(5,5))`-style per-margin options parse correctly.
+- fix: width-guard the cached marginal/logslope β-hints before block assembly so
+  a stale hint falls back to a clean cold start instead of tripping the
+  block-spec contract.
+- perf: parallelized SAE row assembly, iterator/slice-dot REML and SAE reductions,
+  fused ρ-posterior cost+gradient eval, and gradient-only routing for
+  high-dimensional REML ρ fits.
+
 ## v0.3.112 — gam 0.3.112 / gamfit 0.1.195 (2026-06-11)
 
 Crate + wheel release rolling up the over-dispersed-Gamma predictive-interval
