@@ -25899,7 +25899,11 @@ mod tests {
         let spatial_terms = spatial_length_scale_term_indices(&frozen);
         assert_eq!(spatial_terms.len(), 1, "expect a single spatial term");
         let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
-        assert_eq!(dims_per_term, vec![1], "expect one log-scale axis (coord_dim == 1)");
+        assert_eq!(
+            dims_per_term,
+            vec![1],
+            "expect one log-scale axis (coord_dim == 1)"
+        );
         let rho_dim = frozen_design.penalties.len();
         assert!(rho_dim >= 1, "expect at least one penalty block");
 
