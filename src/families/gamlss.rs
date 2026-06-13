@@ -94,6 +94,9 @@ use weighted_design_products::{
     xt_diag_y_dense, xt_diag_y_design,
 };
 
+mod row_linalg;
+use row_linalg::{psd_clamp_2x2, scale_matrix_rows};
+
 /// Typed errors surfaced from this module's helpers and family
 /// implementations. The `Display` impl writes the carried `reason` verbatim,
 /// so callers that historically returned `Result<_, String>` keep their
@@ -6815,30 +6818,6 @@ impl GaussianLocationScaleChannelHessian {
 /// The off-diagonal entry is `b` (the matrix is symmetric so only one
 /// off-diagonal value is needed).
 #[inline]
-fn psd_clamp_2x2(a: f64, b: f64, d: f64) -> (f64, f64, f64, f64, f64, f64) {
-    // Symmetric 2×2 eigenvalues via the closed-form formula.
-    let trace = a + d;
-    let det = a * d - b * b;
-    let disc = (trace * trace * 0.25 - det).max(0.0).sqrt();
-    let lam1 = (trace * 0.5 + disc).max(0.0); // larger eigenvalue (clamped)
-    let lam2 = (trace * 0.5 - disc).max(0.0); // smaller eigenvalue (clamped)
-    // Eigenvector for lam1: (lam1-d, b) normalized. Check: b*(lam1-d)+(d-lam1)*b=0 ✓
-    let (u1_0, u1_1, u2_0, u2_1) = if b.abs() > 1e-15 * (a.abs() + d.abs()).max(1.0) {
-        let ex = lam1 - d;
-        let ey = b;
-        let norm = (ex * ex + ey * ey).sqrt().max(1e-300);
-        let (e0x, e0y) = (ex / norm, ey / norm);
-        // Second eigenvector orthogonal to first: (-e0y, e0x).
-        let (e1x, e1y) = (-e0y, e0x);
-        (e0x, e0y, e1x, e1y)
-    } else if a >= d {
-        // Already diagonal (or nearly so), larger eigenvalue is a.
-        (1.0, 0.0, 0.0, 1.0)
-    } else {
-        (0.0, 1.0, 1.0, 0.0)
-    };
-    (lam1, lam2, u1_0, u1_1, u2_0, u2_1)
-}
 
 impl FamilyChannelHessian for GaussianLocationScaleChannelHessian {
     fn n_outputs(&self) -> usize {
@@ -8531,21 +8510,6 @@ impl GaussianLocationScaleWiggleHessianRowPieces {
     }
 }
 
-fn scale_matrix_rows(mat: &Array2<f64>, coeffs: &Array1<f64>) -> Result<Array2<f64>, String> {
-    if mat.nrows() != coeffs.len() {
-        return Err(GamlssError::DimensionMismatch {
-            reason: format!(
-                "row scaling dimension mismatch: matrix has {} rows but coeffs have {} entries",
-                mat.nrows(),
-                coeffs.len()
-            ),
-        }
-        .into());
-    }
-    Ok(Array2::from_shape_fn(mat.dim(), |(i, j)| {
-        mat[[i, j]] * coeffs[i]
-    }))
-}
 
 fn gaussian_pack_wiggle_joint_score(
     score_mu: &Array1<f64>,
