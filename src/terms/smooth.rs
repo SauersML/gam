@@ -1,5 +1,5 @@
 use crate::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
+    BSplineBasisSpec, BSplineBoundaryConditions,
     BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError, BasisMetadata,
     BasisPsiDerivativeResult,
     BasisPsiSecondDerivativeResult, BasisWorkspace, CenterStrategy, CenterStrategyKind,
@@ -21389,7 +21389,8 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
 mod tests {
     use super::*;
     use crate::basis::{
-        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy,
+        BSplineBasisSpec, BSplineEndpointBoundaryCondition, BSplineIdentifiability, BSplineKnotSpec,
+        BasisOptions, CenterStrategy,
         Dense, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource,
         MaternBasisSpec, MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
     };
