@@ -791,8 +791,28 @@ fm = FrechetMean(space)
 fm.fit(P_train)
 P_gs_mean = fm.estimate_
 
+# Fréchet variance must be scored in the CANONICAL Grassmann metric — the
+# principal-angle arc length √(Σ arccos²σ) — the SAME metric gam uses and the
+# one this test pins as ground truth. geomstats' projector `metric.dist` is a
+# DIFFERENT convention: it equals √2 · arc-length (the projector-embedding
+# Frobenius metric, dist(YYᵀ,ZZᵀ) = √2·‖θ‖₂), so scoring variance with it would
+# inflate every squared distance by exactly 2 and make gam's arc-length variance
+# look artificially "more central". We recover an orthonormal basis from each
+# projector (its top-K unit eigenvectors) and use the canonical arc length, so
+# `gam_mean_variance_gs` is directly comparable to gam's own evaluation.
+def basis_of(P):
+    w, V = np.linalg.eigh(P)
+    return V[:, np.argsort(w)[::-1][:K]]  # top-K eigenvectors span the subspace
+
+def arc_dist(P_mean, P_other):
+    Ym = basis_of(P_mean)
+    Yo = basis_of(P_other)
+    s = np.clip(np.linalg.svd(Ym.T @ Yo, compute_uv=False), -1.0, 1.0)
+    th = np.arccos(s)
+    return float(np.sqrt((th ** 2).sum()))
+
 def variance(P_mean):
-    return float(sum(metric.dist(P_mean, P_train[b]) ** 2 for b in range(NA)))
+    return float(sum(arc_dist(P_mean, P_train[b]) ** 2 for b in range(NA)))
 
 emit("gs_mean_variance", [variance(P_gs_mean)])
 emit("gam_mean_variance_gs", [variance(P_gam_mean)])
