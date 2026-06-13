@@ -79,6 +79,9 @@ pub struct PsiGramTensor {
     gram: Vec<Array2<f64>>,
     /// `rhs[d]` = `X_dᵀ W z` (the caller's fixed weighted response/offset).
     rhs: Vec<Array1<f64>>,
+    /// `zᵀWz` — ψ-free, captured at build so the Gaussian sufficient-statistic
+    /// triple can be assembled per trial without any row access.
+    zt_w_z: f64,
 }
 
 /// One ladder rung's outcome: a hard evaluation failure aborts the whole
@@ -241,8 +244,10 @@ impl PsiGramTensor {
             weighted.push(ws);
         }
         let mut wz = Array1::<f64>::zeros(z.len());
+        let mut zt_w_z = 0.0_f64;
         for ((slot, &w), &zv) in wz.iter_mut().zip(weights.iter()).zip(z.iter()) {
             *slot = w * zv;
+            zt_w_z += w * zv * zv;
         }
         let mut gram: Vec<Array2<f64>> = Vec::with_capacity(m * m);
         let mut rhs = Vec::with_capacity(m);
@@ -265,6 +270,7 @@ impl PsiGramTensor {
             k,
             gram,
             rhs,
+            zt_w_z,
         })
     }
 
@@ -365,6 +371,25 @@ impl PsiGramTensor {
         }
         out
     }
+
+    /// Assemble the Gaussian-identity sufficient-statistic cache at `psi`
+    /// without touching a single data row — the bridge from this tensor into
+    /// the inner PLS solver's fast path (#1033b → `GaussianFixedCache`).
+    ///
+    /// `(XᵀWX, XᵀWz, zᵀWz)` is everything the Gaussian penalized solve needs
+    /// at any λ, so a ψ-trial that holds a certified tensor can hand the
+    /// inner solver this cache instead of realizing the n×k design. The
+    /// caller is responsible for `contains(psi)` (off-window trials fall back
+    /// to the exact realizer path). Dense-path bridge only: the sparse
+    /// scatter cache stays `None`.
+    pub fn gaussian_fixed_cache_at(&self, psi: f64) -> crate::pirls::GaussianFixedCache {
+        crate::pirls::GaussianFixedCache {
+            xtwx_orig: self.gram_at(psi),
+            xtwy_orig: self.rhs_at(psi),
+            centered_weighted_y_sq: self.zt_w_z,
+            xtwx_sparse_orig: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -463,6 +488,78 @@ mod tests {
         // Outside the window the caller must fall back to the exact path.
         assert!(!tensor.contains(psi_hi + 0.5));
         assert!(!tensor.contains(psi_lo - 0.5));
+
+        // Bridge gate (#1033b → GaussianFixedCache): the n-free cache must
+        // reproduce the exactly streamed sufficient statistics, and the
+        // ridge-penalized solves through both must agree — the inner PLS
+        // consumes nothing else, so this certifies the trial-loop handoff.
+        for &psi in &[-0.9, 0.2, 0.8] {
+            let cache = tensor.gaussian_fixed_cache_at(psi);
+            let design = synth_design(psi, n, k).unwrap();
+            let mut wd = design.clone();
+            for (mut row, &wi) in wd.outer_iter_mut().zip(w.iter()) {
+                row.mapv_inplace(|v| v * wi);
+            }
+            let exact_gram = design.t().dot(&wd);
+            let exact_rhs = wd.t().dot(&z);
+            let exact_ztwz: f64 = w
+                .iter()
+                .zip(z.iter())
+                .map(|(&wi, &zi)| wi * zi * zi)
+                .sum();
+            assert!(
+                (cache.centered_weighted_y_sq - exact_ztwz).abs()
+                    <= 1e-12 * exact_ztwz.abs().max(1e-300),
+                "zᵀWz drift: cache={}, exact={exact_ztwz}",
+                cache.centered_weighted_y_sq
+            );
+            // Ridge-penalized solve agreement: (G + I)β = r on both sides.
+            let solve = |g: &Array2<f64>, r: &Array1<f64>| -> Array1<f64> {
+                let mut a = g.clone();
+                for i in 0..k {
+                    a[[i, i]] += 1.0;
+                }
+                // Small dense Gauss elimination (k = 7 in this test).
+                let mut aug = Array2::<f64>::zeros((k, k + 1));
+                aug.slice_mut(ndarray::s![.., ..k]).assign(&a);
+                aug.slice_mut(ndarray::s![.., k]).assign(r);
+                for col in 0..k {
+                    let piv = (col..k)
+                        .max_by(|&p, &q| aug[[p, col]].abs().total_cmp(&aug[[q, col]].abs()))
+                        .unwrap();
+                    if piv != col {
+                        for j in 0..=k {
+                            let tmp = aug[[col, j]];
+                            aug[[col, j]] = aug[[piv, j]];
+                            aug[[piv, j]] = tmp;
+                        }
+                    }
+                    let p = aug[[col, col]];
+                    for row in 0..k {
+                        if row == col {
+                            continue;
+                        }
+                        let f = aug[[row, col]] / p;
+                        for j in col..=k {
+                            aug[[row, j]] -= f * aug[[col, j]];
+                        }
+                    }
+                }
+                Array1::from_iter((0..k).map(|i| aug[[i, k]] / aug[[i, i]]))
+            };
+            let beta_fast = solve(&cache.xtwx_orig, &cache.xtwy_orig);
+            let beta_exact = solve(&exact_gram, &exact_rhs);
+            let bscale = beta_exact
+                .iter()
+                .fold(0.0_f64, |a, &v| a.max(v.abs()))
+                .max(1e-300);
+            for (a, b) in beta_fast.iter().zip(beta_exact.iter()) {
+                assert!(
+                    (a - b).abs() <= 1e-8 * bscale,
+                    "penalized solve drift at psi={psi}: fast={a}, exact={b}"
+                );
+            }
+        }
     }
 
     /// Certification negative: a NON-analytic (kinked) design must refuse to
