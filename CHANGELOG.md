@@ -1,3 +1,78 @@
+## v0.3.115 — gam 0.3.115 / gamfit 0.1.198 (2026-06-13)
+
+Crate + wheel release rolling up the unreleased work since 0.3.114: the O(n)
+spline scan reaching the `fit_from_formula` library entry point and gaining
+order-3 (quintic) support, a new exact O(n) multi-term additive backfitting
+module, a Bessel-K accuracy fix in the Matérn/Duchon radial lattice, the exact
+dense softmax-entropy row Hessian, the Murphy–Topel generated-regressor
+correction, analytic Jacobi-field exp-map VJPs on curved manifolds, sphere-chart
+isometry-defect certification, and the gam-pyffi module carve-out — plus a batch
+of solver-robustness fixes and a broad new reference-quality test wave.
+
+O(n) spline scan — library entry point + order-3 (#1030, #1044):
+- feat: `fit_from_formula` now auto-routes a qualifying single 1-D Gaussian
+  smooth through the exact O(n) diffuse-REML Kalman/RTS scan (new
+  `FitResult::SplineScan` variant), matching the FFI/CLI auto-routing that
+  already shipped; the conservative detector falls every other shape through to
+  the dense path unchanged.
+- feat: order-3 (quintic) smoothing splines (`λ∫(f‴)²`) via an exact diffuse
+  leading-block smoother for the two partially-diffuse leading nodes, with
+  symmetric (Jacobi) equilibration + iterative refinement of the 6×6
+  leading-block solve so the κ≈δ^{-5} stiffness is resolved at heavy smoothing.
+  Validated against the order-general dense exact-posterior oracle to 1e-6·SD
+  (posterior) and 1e-7 (REML differences); the auto-route now covers
+  penalty_order ∈ {1, 2, 3}.
+
+Exact O(n) multi-term additive backfitting (#1034 item 3):
+- feat: new `gam::solver::scan_backfit` — `fit_scan_backfit` /
+  `fit_scan_backfit_at` solve `y = α + Σⱼ fⱼ(xⱼ)` with exact O(n) spline-scan
+  inner smoothers, certified against a dense joint penalized solve, with
+  per-term λ selection validated match-or-beat vs a dense joint-REML grid on
+  truth recovery. (The module had been committed unwired and uncompiled; it is
+  now wired, compiled, and covered by three oracle tests.)
+
+Numerical accuracy:
+- fix(basis): `K_{l+½}` Bessel coefficients now come from the exact upward
+  recurrence instead of Lanczos-Γ at integer arguments, removing ~1 ULP errors
+  that amplified in the near-cancellation `r^{-0.5}·K_{1/2} + r^{0.5}·K_{3/2}`
+  radial-derivative sums of the Matérn/Duchon lattice.
+- feat(#1035): exact Chebyshev jet tower for the radial-profile derivative
+  channels.
+- feat(#1038): the softmax assignment-entropy prior's exact dense per-row
+  Hessian in logits is wired through value / log|H| / θ-adjoint / ρ-trace
+  together, so the criterion and its gradients differentiate the operator the
+  prior actually defines (previously only the diagonal was stored).
+
+Geometry + manifolds:
+- feat(#944): analytic Jacobi-field `exp_map_vjp` for κ ≠ 0 in constant-curvature
+  geometry (replacing the κ = 0-only path), with a by-reference `dot` fix.
+- feat(#1019): certified sphere-chart isometry-defect functional plus a post-fit
+  measurement/logging pass.
+- feat(#1026): per-atom fitted-turning Θ measurement for the EV-vs-Θ signal.
+
+Other:
+- feat(#1028): Murphy–Topel generated-regressor variance correction assembled
+  with J_zeta accumulation (BMS).
+- feat(#1017 Phase 0): driver-level parallel topology-candidate selection.
+- feat(#1033): ψ-Gram tensor gradient coverage surfaced at the eval_full seam,
+  with n-free k-space ψ-derivatives feeding the Gaussian gradient.
+- fix(#1036): the cross-seed structural detector parses the real non-PD wording.
+- fix(audit): RRQR keeps its own block when it already named the lower-priority
+  alias side.
+- refactor(#780): the gam-pyffi monolith is carved into focused modules
+  (`python_literal`, `benchmark_scores`, `competing_risks_decode`,
+  `summary_render`); restored a missing `PyValueError` import that would have
+  failed the wheel build.
+- perf(#1035): caller-thread line-search LL sweep / serial small row-folds; a
+  measured-no-op row-fold gating was reverted (it implied a perf win that was
+  not observed).
+- gpu: dropped the dead Phase-3 Cornish–Fisher Pólya-Gamma oracle.
+- tests: new reference-quality gates (grid_spline_2d vs mgcv te() #1031,
+  multinomial softmax truth-recovery vs mgcv/VGAM #715, competing-risks
+  total-probability identity #1025, survival marginal-slope convergence #1040,
+  measure-jet aniso isotropic-fallback regression, thread-pool fit-invariance
+  #1045).
+
 ## v0.3.114 — gam 0.3.114 / gamfit 0.1.197 (2026-06-13)
 
 Crate + wheel release rolling up the O(n) spline-scan auto-routing, the
