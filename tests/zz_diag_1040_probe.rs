@@ -119,7 +119,7 @@ fn zz_diag_1040_probe() {
                 fit.fit.outer_iterations, fit.fit.inner_cycles, fit.fit.outer_converged
             );
         }
-        Ok(other) => eprintln!("[PROBE-DONE] t={elapsed:.2}s unexpected variant {other:?}"),
+        Ok(_) => eprintln!("[PROBE-DONE] t={elapsed:.2}s unexpected non-survival-MS variant"),
         Err(e) => eprintln!("[PROBE-ERR] t={elapsed:.2}s err={e}"),
     }
     assert!(elapsed >= 0.0);
