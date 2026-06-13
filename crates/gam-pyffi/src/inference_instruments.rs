@@ -29,6 +29,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 
+use gam::inference::full_conformal::{CanonicalGlmFamily, GlmHomotopyFullConformal};
 use gam::inference::lawley::{RowExpectedJets, RowKappas, lawley_lr_bartlett_factor};
 use gam::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use gam::inference::structure_evidence::{
@@ -455,6 +456,118 @@ pub(crate) fn debiased_functional<'py>(
     Ok(out)
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// #942 — exact full-conformal prediction set for canonical-link GLMs
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Resolve the canonical-GLM family name shared with the homotopy engine.
+fn canonical_glm_family(name: &str) -> PyResult<CanonicalGlmFamily> {
+    match name {
+        "bernoulli" | "binomial" | "logit" | "bernoulli_logit" => {
+            Ok(CanonicalGlmFamily::BernoulliLogit)
+        }
+        "poisson" | "poisson_log" => Ok(CanonicalGlmFamily::PoissonLog),
+        other => Err(py_value_error(format!(
+            "glm_full_conformal: unknown family {other:?}; expected \"bernoulli\" or \"poisson\""
+        ))),
+    }
+}
+
+/// Exact (finite-sample-valid) full-conformal prediction set for a
+/// canonical-link GLM (issue #942). This surfaces the previously unreachable
+/// certified predictor–corrector engine in `src/inference/full_conformal.rs`:
+/// for each candidate response `z` the augmented penalized fit is tracked
+/// (or cold-refit when the step certificate refuses), the `n+1` absolute-
+/// residual nonconformity scores are ranked, and `z` is retained iff its
+/// conformal p-value exceeds `alpha`. The returned set has finite-sample
+/// coverage `≥ 1 − alpha` under exchangeability — a guarantee neither split
+/// conformal at small `n` nor any mature classification-conformal tool
+/// (MAPIE, glmnet, mgcv) provides for a GLM with a coverage certificate.
+///
+/// Smoothing is FROZEN at the supplied penalty `s_lambda` (the honest ρ-re-
+/// selection is the engine's Layer-3 domain), and unit prior weights are
+/// required because a reweighted training row is not exchangeable with the
+/// test row — the proof would not apply, so the engine refuses rather than
+/// silently mis-cover.
+///
+/// Inputs (all in the fitted coefficient basis):
+/// * `design` — training design `X` (`n × p`).
+/// * `response` — training response `y` (length `n`); `{0,1}` for Bernoulli,
+///   non-negative for Poisson.
+/// * `s_lambda` — the `p × p` penalty matrix `Sλ` (`≥ 0`); pass zeros for an
+///   unpenalized GLM.
+/// * `x_star` — the test design row `x_*` (length `p`).
+/// * `family` — `"bernoulli"` or `"poisson"`.
+/// * `candidates` — strictly increasing response candidates to test. Defaults
+///   to `[0, 1]` (the exhaustive Bernoulli support); a Poisson caller passes
+///   an explicit integer window.
+/// * `alpha` — target miscoverage in `(0, 1)`.
+///
+/// Returns `{"members", "p_values", "candidates", "alpha", "n_augmented",
+/// "refit_fallbacks", "margin_refits", "ties_unresolved",
+/// "max_beta_error_bound"}`. `max_beta_error_bound` is the largest certified
+/// `‖β − β̂(z)‖` over the tracked candidates — the homotopy's exactness
+/// witness (`0` when every candidate was cold-fit).
+#[pyfunction]
+#[pyo3(signature = (design, response, s_lambda, x_star, family, alpha, candidates = None))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn glm_full_conformal<'py>(
+    py: Python<'py>,
+    design: numpy::PyReadonlyArray2<'py, f64>,
+    response: numpy::PyReadonlyArray1<'py, f64>,
+    s_lambda: numpy::PyReadonlyArray2<'py, f64>,
+    x_star: numpy::PyReadonlyArray1<'py, f64>,
+    family: &str,
+    alpha: f64,
+    candidates: Option<Vec<f64>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let fam = canonical_glm_family(family)?;
+    let x = design.as_array().to_owned();
+    let y = response.as_array().to_owned();
+    let sl = s_lambda.as_array().to_owned();
+    let star = x_star.as_array().to_owned();
+    let n = x.nrows();
+    let prior_weights = Array1::<f64>::ones(n);
+
+    let engine = GlmHomotopyFullConformal::new(fam, &x, &y, &prior_weights, &sl, &star)
+        .map_err(py_value_error)?;
+
+    // Default candidate grid: the exhaustive Bernoulli support {0, 1}. A
+    // Poisson caller must supply an explicit count window — there is no honest
+    // unbounded enumeration.
+    let grid = match candidates {
+        Some(c) => c,
+        None => match fam {
+            CanonicalGlmFamily::BernoulliLogit => vec![0.0, 1.0],
+            CanonicalGlmFamily::PoissonLog => {
+                return Err(py_value_error(
+                    "glm_full_conformal: Poisson requires an explicit `candidates` count window"
+                        .to_string(),
+                ));
+            }
+        },
+    };
+
+    let set = engine
+        .prediction_set(&grid, alpha)
+        .map_err(py_value_error)?;
+
+    let p_values: Vec<f64> = set.candidates.iter().map(|c| c.p_value).collect();
+    let candidate_zs: Vec<f64> = set.candidates.iter().map(|c| c.z).collect();
+
+    let out = PyDict::new(py);
+    out.set_item("members", set.members)?;
+    out.set_item("p_values", p_values)?;
+    out.set_item("candidates", candidate_zs)?;
+    out.set_item("alpha", set.alpha)?;
+    out.set_item("n_augmented", set.n_augmented)?;
+    out.set_item("refit_fallbacks", set.refit_fallbacks)?;
+    out.set_item("margin_refits", set.margin_refits)?;
+    out.set_item("ties_unresolved", set.ties_unresolved)?;
+    out.set_item("max_beta_error_bound", set.max_beta_error_bound)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,5 +729,6 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(log_e_from_p_value, module)?)?;
     module.add_function(wrap_pyfunction!(lawley_bartlett_factor, module)?)?;
     module.add_function(wrap_pyfunction!(debiased_functional, module)?)?;
+    module.add_function(wrap_pyfunction!(glm_full_conformal, module)?)?;
     Ok(())
 }

@@ -251,7 +251,7 @@ fn build_atom_candidates(
 
     let linear = HybridAtomCandidate::linear(linear_nle, linear_num_params);
     let curved = HybridAtomCandidate::curved(1, curved_nle, curved_num_params, fitted_turning);
-    Some((linear, curved))
+    Some((linear, curved, (t_bar, b0, b1)))
 }
 
 /// Assemble the per-atom candidate slots for [`select_hybrid_split`] from the
@@ -282,6 +282,10 @@ where
     let mut slots: Vec<Vec<HybridAtomCandidate>> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     let mut manifolds: Vec<LatentManifold> = Vec::new();
+    // Per-slot fitted straight sub-model `(atom_idx, t̄, b₀, b₁)`, surfaced onto
+    // the verdict iff the slot selects LINEAR so the collapsed reconstruction can
+    // substitute it for the curved decoded image.
+    let mut linear_images: Vec<AtomLinearImage> = Vec::new();
 
     for atom_idx in eligible_d1 {
         let atom = &atoms[atom_idx];
@@ -299,7 +303,7 @@ where
             .ok()
             .flatten()
         });
-        let Some((linear, curved)) = build_atom_candidates(
+        let Some((linear, curved, (t_bar, b0, b1))) = build_atom_candidates(
             coords.view(),
             weights.view(),
             decoded.view(),
@@ -319,6 +323,12 @@ where
         slots.push(slot);
         names.push(atom.name.clone());
         manifolds.push(manifold);
+        linear_images.push(AtomLinearImage {
+            atom_idx,
+            t_bar,
+            b0,
+            b1,
+        });
     }
 
     if slots.is_empty() {
@@ -329,12 +339,16 @@ where
     let verdicts: Vec<AtomHybridVerdict> = names
         .into_iter()
         .zip(selection.atoms.iter().copied())
-        .map(|(atom_name, choice)| {
+        .zip(linear_images.into_iter())
+        .map(|((atom_name, choice), linear_image)| {
             let kept_curved = !choice.param.is_linear();
             AtomHybridVerdict {
                 atom_name,
                 choice,
                 kept_curved,
+                // Carry the straight sub-model only when the verdict collapses
+                // this slot to linear — the curved slots keep their fitted image.
+                linear_image: if kept_curved { None } else { Some(linear_image) },
             }
         })
         .collect();

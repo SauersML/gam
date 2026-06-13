@@ -7065,11 +7065,38 @@ impl SaeManifoldTerm {
                     Ok(factored) => factored,
                     Err(err) if Self::is_undamped_evidence_row_non_pd(&err) => {
                         if grad_norm <= grad_tolerance {
-                            return Err(format!(
-                                "SaeManifoldTerm::reml_criterion: stationary undamped evidence \
-                                 factorization still has a non-PD per-row H_tt block \
-                                 (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}); {err}"
-                            ));
+                            // K>1 euclidean: the softmax logit–coordinate Gauss-Newton
+                            // cross-terms (H_zt = J_z^T J_t, assembled row-locally from
+                            // the assignment JVP × basis JVP) can make the per-row H_tt
+                            // indefinite at the TRUE KKT stationary point.  Specifically,
+                            // when the two atoms' decoders specialise in opposite directions
+                            // the Schur complement of the logit block (after eliminating
+                            // the coordinate blocks) goes negative even though the priors
+                            // and the full-joint GN term are PSD — the cross terms win.
+                            // The undamped (ridge=0) log-det is then ill-defined.  Fall
+                            // back to a lightly-damped Direct factor using the caller's
+                            // nominal `ridge_ext_coord`; the per-row adaptive Cholesky
+                            // escalation handles any remaining indefiniteness.  The
+                            // resulting log-det carries a consistent positive bias of
+                            // ½·Σ_i log|I + ridge·H_tt^(i)⁻¹| across ALL ρ evaluations
+                            // at the same ridge, so the bias does NOT shift the optimal ρ.
+                            let damped_opts = ArrowSolveOptions::direct();
+                            match solve_arrow_newton_step_with_options(
+                                &sys,
+                                ridge_ext_coord,
+                                ridge_beta,
+                                &damped_opts,
+                            ) {
+                                Ok((_dt, _db, damped_cache)) => return Ok(damped_cache),
+                                Err(damped_err) => {
+                                    return Err(format!(
+                                        "SaeManifoldTerm::reml_criterion: stationary undamped \
+                                         evidence factorization has a non-PD per-row H_tt block \
+                                         (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}); \
+                                         undamped: {err}; damped fallback also failed: {damped_err}"
+                                    ));
+                                }
+                            }
                         }
                         let refine_limit = Self::refine_iteration_limit(
                             total_inner_iter,
@@ -14350,13 +14377,14 @@ impl SaeManifoldOuterObjective {
             };
             total_correctors += 1;
 
-            // Pivot invariant: min pivot ≥ √eps · max(diag_scale, 1), the same
-            // safe-SPD floor the inner solver uses — measured ON THE GAUGE
-            // QUOTIENT. A closed-form gauge null (affine chart freedom, circle
-            // rotation) is constant along the entire η-walk, so it can never
-            // signal a branch bifurcation; only a NON-gauge pivot collapse can.
-            // Without this discrimination the walk dies at η≈0 on any fixture
-            // whose ambient dimension is small enough for the gauge directions
+            // Pivot invariant: min pivot ≥ √eps · diag_scale (a purely relative
+            // floor, N-invariant — see #1095), the same safe-SPD check the
+            // inner solver uses — measured ON THE GAUGE QUOTIENT. A closed-form
+            // gauge null (affine chart freedom, circle rotation) is constant
+            // along the entire η-walk, so it can never signal a branch
+            // bifurcation; only a NON-gauge pivot collapse can. Without this
+            // discrimination the walk dies at η≈0 on any fixture whose ambient
+            // dimension is small enough for the gauge directions
             // to dominate (every p=2 atlas tile), and the fit pays for the full
             // seed cascade instead. `outer_gradient_arrow_solver` succeeds iff
             // the sub-floor pivots are explained by the closed-form gauge span
@@ -14364,7 +14392,16 @@ impl SaeManifoldOuterObjective {
             // errs honestly otherwise, which is exactly the verdict needed.
             let pivot = arrow_factor_min_pivot(&cache).min_pivot.unwrap_or(0.0);
             let diag_scale = arrow_factor_max_pivot(&cache).unwrap_or(1.0);
-            let floor = f64::EPSILON.sqrt() * diag_scale.max(1.0);
+            // #1095: the pivot floor must be PURELY RELATIVE to the Hessian
+            // scale so it remains tight on small-N datasets.  With `.max(1.0)`
+            // the floor becomes an absolute constant (√ε ≈ 1.5e-8) whenever
+            // `diag_scale < 1` — the per-sample normalised Hessian shrinks
+            // with N, so at N=180 legitimate pivots of ~4e-9 fall below
+            // the absolute floor even though pivot/diag_scale is healthy.
+            // Using the raw `diag_scale` (with the `unwrap_or(1.0)` guard
+            // already providing a non-zero default when no pivot is reported)
+            // keeps the floor dimensionless and N-invariant.
+            let floor = f64::EPSILON.sqrt() * diag_scale;
             let pivot_deficit_is_gauge = !(pivot.is_finite() && pivot >= floor)
                 && self.term.outer_gradient_arrow_solver(&cache).is_ok();
             if !(pivot.is_finite() && pivot >= floor) && !pivot_deficit_is_gauge {
