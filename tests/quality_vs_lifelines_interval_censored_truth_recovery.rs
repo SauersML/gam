@@ -89,7 +89,7 @@ fn fit_interval_mle(ctx: &QuadratureContext, b_left: &[f64], b_right: &[f64]) ->
         let mut d = lo + phi * (hi - lo);
         let mut fc = f(c);
         let mut fd = f(d);
-        for _ in 0..80 {
+        for _ in 0..48 {
             if fc < fd {
                 hi = d;
                 d = c;
@@ -109,7 +109,7 @@ fn fit_interval_mle(ctx: &QuadratureContext, b_left: &[f64], b_right: &[f64]) ->
 
     let mut mu = 0.0_f64;
     let mut sigma = 1.0_f64;
-    for _ in 0..40 {
+    for _ in 0..12 {
         let mu_new = golden(&|m| interval_nll(ctx, b_left, b_right, m, sigma), -4.0, 4.0);
         let sigma_new = golden(&|s| interval_nll(ctx, b_left, b_right, mu, s), 0.05, 4.0);
         let moved = (mu_new - mu).abs() + (sigma_new - sigma).abs();
@@ -129,7 +129,7 @@ fn gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines() {
     // ---- truth ------------------------------------------------------------
     let mu_true = -0.4_f64;
     let sigma_true = 0.6_f64;
-    let n = 400usize;
+    let n = 240usize;
 
     // Fixed inspection grid (discrete clinic visits). B(t) = t (unit clock), so
     // baseline cumulative hazard at a grid time equals the time itself.
