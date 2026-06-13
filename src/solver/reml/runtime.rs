@@ -1185,30 +1185,24 @@ fn hash_analytic_penalty_kind(
             hash_weight_field(hasher, &p.weight);
             hasher.write_f64(p.scalar_weight);
             hash_weight_schedule_option(hasher, &p.weight_schedule);
-            // Caches now live behind RwLocks (option-B refactor) so the SAE
-            // outer loop can refresh them without &mut on the registry-held
-            // Arc<IsometryPenalty>. The accessor takes the read lock briefly
-            // and clones the inner Arc — the hash sees a consistent snapshot
-            // of whatever was last installed by refresh_caches. When the
-            // SAE loop installs new caches each outer step the resulting
-            // change in the hashed bytes invalidates the REML cache key
-            // automatically, so no separate "basis identity" tag is needed
-            // beyond the Jacobian contents themselves: any change in the
-            // basis (and hence in J or H) shows up directly in these arrays.
-            match p.jacobian_cache() {
-                Some(values) => {
-                    hasher.write_bool(true);
-                    hash_array2(hasher, values.as_ref());
-                }
-                None => hasher.write_bool(false),
-            }
-            match p.jacobian_second_cache() {
-                Some(values) => {
-                    hasher.write_bool(true);
-                    hash_array2(hasher, values.as_ref());
-                }
-                None => hasher.write_bool(false),
-            }
+            // The `jacobian_cache` / `jacobian_second_cache` /
+            // `third_decoder_derivative` slots are interior-mutable
+            // (`RwLock<Option<Arc<…>>>`), lazily populated, and θ-DEPENDENT:
+            // the SAE/IFT driver calls `refresh_caches` each outer step so the
+            // cached J / H / K reflect the Jacobian at the *current* outer θ.
+            // They are NOT part of this penalty's identity — they are a pure
+            // (recomputable) function of the basis + θ, and the basis identity
+            // is already captured exactly by `duchon_radial_source` (below) for
+            // the Duchon path and by the hashed design matrix / latent
+            // fingerprint for the SAE path. Hashing the live cache snapshot made
+            // the persistent warm-start key non-reproducible across otherwise
+            // identical fits: a cold fit opens its session with the slots empty
+            // (`None`), while a repeat fit sees them populated from the prior
+            // run's converged θ, so the key drifted and the `skip-outer-
+            // validation` warm hit was lost (issue #1048). The stored payload is
+            // the converged (ρ, β) — equivalence to recomputing is unaffected by
+            // dropping these derived snapshots from the key, so we deliberately
+            // do NOT hash them.
             match p.duchon_radial_source.as_ref() {
                 Some(source) => {
                     hasher.write_bool(true);
@@ -1222,13 +1216,6 @@ fn hash_analytic_penalty_kind(
                         None => hasher.write_bool(false),
                     }
                     hasher.write_str(&format!("{:?}", source.nullspace_order));
-                }
-                None => hasher.write_bool(false),
-            }
-            match p.third_decoder_derivative() {
-                Some(values) => {
-                    hasher.write_bool(true);
-                    hash_array3(hasher, values.as_ref());
                 }
                 None => hasher.write_bool(false),
             }
@@ -13203,5 +13190,80 @@ mod tests_diagnostics {
                 pr.solve_c_array.clone(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod warm_start_key_stability_tests {
+    use super::analytic_penalty_registry_fingerprint;
+    use crate::terms::analytic_penalties::{
+        AnalyticPenaltyKind, AnalyticPenaltyRegistry, IsometryPenalty, PsiSlice,
+    };
+    use ndarray::{Array2, Array3};
+    use std::sync::Arc;
+
+    fn duchon_like_registry() -> AnalyticPenaltyRegistry {
+        // A single isometry (Duchon-style) penalty, matching the marginal-slope
+        // `duchon(...)` fit in issue #1048. Its Jacobian-derivative caches start
+        // empty (`None`) exactly as a cold fit opens its warm-start session.
+        let mut registry = AnalyticPenaltyRegistry::new();
+        let target = PsiSlice::full(6, Some(2));
+        registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+            IsometryPenalty::new_euclidean(target, 3),
+        )));
+        registry
+    }
+
+    fn populate_lazy_caches(registry: &AnalyticPenaltyRegistry) {
+        // Mimic the SAE/IFT outer driver refreshing the θ-dependent Jacobian
+        // derivative caches mid-fit. These are pure functions of basis + θ and
+        // are recomputable; their *population state* must never reach the key.
+        for penalty in &registry.penalties {
+            if let AnalyticPenaltyKind::Isometry(p) = penalty {
+                let jac = Arc::new(Array2::from_elem((4, 6), 0.123_f64));
+                let jac2 = Arc::new(Array2::from_elem((4, 12), -0.456_f64));
+                p.refresh_caches(Some(jac), Some(jac2));
+                let jac3 = Arc::new(Array3::from_elem((4, 3, 8), 0.789_f64));
+                p.set_third_decoder_derivative(Some(jac3));
+            }
+        }
+    }
+
+    /// Regression for #1048: populating the lazily-refreshed, θ-dependent
+    /// isometry Jacobian caches (`jacobian_cache` / `jacobian_second_cache` /
+    /// `third_decoder_derivative`) must NOT change the persistent warm-start
+    /// fingerprint. Before the fix the key hashed the live cache snapshot, so a
+    /// repeat fit — which opens its session with those caches already populated
+    /// from the prior run's converged θ — drifted to a different key and missed
+    /// the outer `skip-outer-validation` warm hit, re-paying the full outer
+    /// REML optimization (~30× slower repeat fits).
+    #[test]
+    fn lazy_jacobian_caches_do_not_perturb_warm_start_fingerprint() {
+        let registry = duchon_like_registry();
+        let cold = analytic_penalty_registry_fingerprint(&registry);
+        populate_lazy_caches(&registry);
+        let warm = analytic_penalty_registry_fingerprint(&registry);
+        assert_eq!(
+            cold, warm,
+            "warm-start key drifted after lazily-refreshed Jacobian caches were \
+             populated; the outer skip-outer-validation hit would be lost (#1048)"
+        );
+    }
+
+    /// Two registries that are structurally identical but differ only in
+    /// whether their derived caches are populated must hash identically — this
+    /// is the cross-fit invariant the repeat-fit warm hit relies on (cold fit:
+    /// caches empty; repeat fit: caches full).
+    #[test]
+    fn cold_and_warm_registries_share_one_fingerprint() {
+        let cold_registry = duchon_like_registry();
+        let warm_registry = duchon_like_registry();
+        populate_lazy_caches(&warm_registry);
+        assert_eq!(
+            analytic_penalty_registry_fingerprint(&cold_registry),
+            analytic_penalty_registry_fingerprint(&warm_registry),
+            "cold (empty-cache) and warm (full-cache) registries must produce the \
+             same warm-start key so the second identical fit hits the warm skip (#1048)"
+        );
     }
 }
