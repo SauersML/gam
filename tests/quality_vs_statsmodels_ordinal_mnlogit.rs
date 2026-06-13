@@ -435,8 +435,29 @@ fn gam_multinomial_recovers_true_class_simplex_on_real_data() {
     // smooth on h_temp keeps the capability faithful to the synthetic arm (a
     // penalized basis column block feeding the multinomial solver) while the
     // linear weather terms supply the rest of the ordinal signal.
+    //
+    // The throwaway gaussian fit below exists ONLY to harvest the model matrix
+    // and the per-term penalty blocks — the design columns are a function of the
+    // formula RHS and the covariates, never of the LHS values, so any well-posed
+    // continuous response yields the identical basis. We deliberately do NOT
+    // regress the integer ordinal class labels {0,1,2} here: on a short (~22-row)
+    // real split a 3-valued response can land near-constant after the every-4th
+    // hold-out, which trips gam's Gaussian near-constant guard ("response 'y' is
+    // effectively constant (sample sd ≈ 0)") and aborts the design harvest before
+    // the multinomial solver ever runs. Instead feed a strictly-varying continuous
+    // proxy `dy` (a smooth, monotone-in-row probe with guaranteed sample sd > 0)
+    // as the design-harvest response. The ordinal labels still drive the real
+    // claim via the one-hot multinomial fit further below; only the basis-builder
+    // sees the proxy.
+    let design_proxy: Vec<f64> = (0..train_rows.len())
+        .map(|k| {
+            // Continuous, never-constant: a phase ramp plus a temperature wiggle.
+            // Independent of train_y, so the harvested basis is response-free.
+            (k as f64) * 0.5 + (0.37 * train_h_temp[k]).sin()
+        })
+        .collect();
     let train_headers = vec![
-        "y".to_string(),
+        "dy".to_string(),
         "h_temp".to_string(),
         "s_temp".to_string(),
         "w_rain".to_string(),
@@ -445,7 +466,7 @@ fn gam_multinomial_recovers_true_class_simplex_on_real_data() {
     let train_records = (0..train_rows.len())
         .map(|k| {
             csv::StringRecord::from(vec![
-                train_y[k].to_string(),
+                design_proxy[k].to_string(),
                 train_h_temp[k].to_string(),
                 train_s_temp[k].to_string(),
                 train_w_rain[k].to_string(),
@@ -460,7 +481,7 @@ fn gam_multinomial_recovers_true_class_simplex_on_real_data() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let formula = "y ~ s(h_temp) + s_temp + w_rain + h_rain";
+    let formula = "dy ~ s(h_temp) + s_temp + w_rain + h_rain";
     let result = fit_from_formula(formula, &train_ds, &cfg).expect("gam builds the wine design");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit to expose the design");
