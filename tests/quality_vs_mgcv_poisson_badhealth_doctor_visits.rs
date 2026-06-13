@@ -142,33 +142,11 @@ fn gam_poisson_predicts_badhealth_visits_better_than_baseline() {
     let gam_test_mu: Vec<f64> = gam_test_eta.iter().map(|e| e.exp()).collect();
 
     // ---- fit the SAME model on TRAIN with mgcv, predict the SAME TEST -----
-    // mgcv is the mature baseline; we read back its held-out response-scale
-    // predictions (to compare accuracy) and its in-sample fitted counts (context).
-    let train_r = run_r(
-        &[
-            Column::new("age", &train_age),
-            Column::new("badh", &train_badh),
-            Column::new("numvisit", &train_numvisit),
-        ],
-        r#"
-        suppressPackageStartupMessages(library(mgcv))
-        m <- gam(numvisit ~ s(age) + badh, data = df, family = poisson, method = "REML")
-        emit("fitted", as.numeric(fitted(m)))
-        emit("edf", sum(m$edf))
-        "#,
-    );
-    let mgcv_train_fitted = train_r.vector("fitted").to_vec();
-    let mgcv_edf = train_r.scalar("edf");
-    assert_eq!(
-        mgcv_train_fitted.len(),
-        train_rows.len(),
-        "mgcv in-sample fitted length mismatch"
-    );
-
-    // Re-fit on train and predict the held-out rows on the response (count) scale.
-    // The harness exposes one data.frame per call, so the test covariates ride
-    // along in parallel columns (padded to the training length) and only the
-    // first `test_n` entries are read back inside R.
+    // mgcv is the mature baseline; we read back its in-sample fitted counts (context),
+    // edf, and held-out response-scale predictions in a SINGLE R subprocess to avoid
+    // paying two mgcv fit costs (one per run_r call).  Test covariates ride along as
+    // parallel columns padded to the training length; only the first `test_n` entries
+    // are read back for prediction inside R.
     let r = run_r(
         &[
             Column::new("age", &train_age),
@@ -181,10 +159,19 @@ fn gam_poisson_predicts_badhealth_visits_better_than_baseline() {
         r#"
         suppressPackageStartupMessages(library(mgcv))
         m <- gam(numvisit ~ s(age) + badh, data = df, family = poisson, method = "REML")
+        emit("fitted", as.numeric(fitted(m)))
+        emit("edf", sum(m$edf))
         k <- df$test_n[1]
         newd <- data.frame(age = df$test_age[1:k], badh = df$test_badh[1:k])
         emit("test_pred", as.numeric(predict(m, newdata = newd, type = "response")))
         "#,
+    );
+    let mgcv_train_fitted = r.vector("fitted").to_vec();
+    let mgcv_edf = r.scalar("edf");
+    assert_eq!(
+        mgcv_train_fitted.len(),
+        train_rows.len(),
+        "mgcv in-sample fitted length mismatch"
     );
     let mgcv_test_mu = r.vector("test_pred");
     assert_eq!(
@@ -368,11 +355,20 @@ fn gam_poisson_predicts_badhealth_visits_better_than_baseline_on_real_data() {
     let gam_test_mu: Vec<f64> = gam_test_eta.iter().map(|e| e.exp()).collect();
 
     // ---- fit the SAME 2-D model on TRAIN with mgcv, predict the SAME TEST ---
-    let train_r = run_r(
+    // Held-out test covariates ride along as parallel columns padded to the
+    // training length; only the first `test_n` entries are read back inside R.
+    // A SINGLE R subprocess emits fitted values, edf, and test predictions so we
+    // pay only one mgcv fit cost (vs two sequential run_r calls).
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age[i]).collect();
+    let test_badh: Vec<f64> = test_rows.iter().map(|&i| badh[i]).collect();
+    let r = run_r(
         &[
             Column::new("age", &train_age),
             Column::new("badh", &train_badh),
             Column::new("numvisit", &train_numvisit),
+            Column::new("test_age", &pad_to(&test_age, train_age.len())),
+            Column::new("test_badh", &pad_to(&test_badh, train_age.len())),
+            Column::new("test_n", &vec![test_age.len() as f64; train_age.len()]),
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
@@ -388,42 +384,18 @@ fn gam_poisson_predicts_badhealth_visits_better_than_baseline_on_real_data() {
                  family = poisson, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
         emit("edf", sum(m$edf))
-        "#,
-    );
-    let mgcv_train_fitted = train_r.vector("fitted").to_vec();
-    let mgcv_edf = train_r.scalar("edf");
-    assert_eq!(
-        mgcv_train_fitted.len(),
-        train_rows.len(),
-        "mgcv in-sample fitted length mismatch"
-    );
-
-    // Held-out test covariates ride along as parallel columns padded to the
-    // training length; only the first `test_n` entries are read back inside R.
-    let test_age: Vec<f64> = test_rows.iter().map(|&i| age[i]).collect();
-    let test_badh: Vec<f64> = test_rows.iter().map(|&i| badh[i]).collect();
-    let r = run_r(
-        &[
-            Column::new("age", &train_age),
-            Column::new("badh", &train_badh),
-            Column::new("numvisit", &train_numvisit),
-            Column::new("test_age", &pad_to(&test_age, train_age.len())),
-            Column::new("test_badh", &pad_to(&test_badh, train_age.len())),
-            Column::new("test_n", &vec![test_age.len() as f64; train_age.len()]),
-        ],
-        r#"
-        suppressPackageStartupMessages(library(mgcv))
-        # See above: te(age, badh) over a binary badh margin is not constructible
-        # in mgcv; s(age, by = factor(badh)) + factor(badh) models the SAME age x
-        # badh interaction (a per-health-status age curve + main effect).
-        df$badhf <- factor(df$badh)
-        m <- gam(numvisit ~ s(age, by = badhf) + badhf, data = df,
-                 family = poisson, method = "REML")
         k <- df$test_n[1]
         newd <- data.frame(age = df$test_age[1:k],
                            badhf = factor(df$test_badh[1:k], levels = levels(df$badhf)))
         emit("test_pred", as.numeric(predict(m, newdata = newd, type = "response")))
         "#,
+    );
+    let mgcv_train_fitted = r.vector("fitted").to_vec();
+    let mgcv_edf = r.scalar("edf");
+    assert_eq!(
+        mgcv_train_fitted.len(),
+        train_rows.len(),
+        "mgcv in-sample fitted length mismatch"
     );
     let mgcv_test_mu = r.vector("test_pred");
     assert_eq!(
