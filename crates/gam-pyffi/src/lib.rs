@@ -26303,7 +26303,13 @@ fn predict_table_jackknife_plus_impl(
     // Plug-in mean (= beta-hat @ x_star for the Gaussian-identity model); we
     // read it from the stored stats' beta directly to avoid touching the
     // predictor stack.
-    let alpha = 1.0 - conformal_level;
+    // The jackknife+ interval for the Barber et al. (2021) construction carries
+    // the guarantee P(Y_* ∈ Ĉ_α) ≥ 1 − 2α. To deliver ≥conformal_level
+    // coverage to the user (so that predict(interval='conformal', conformal_level=0.9)
+    // genuinely gives 90% marginal coverage), set α = (1 − conformal_level) / 2.
+    // Using α = 1 − conformal_level would yield only 1 − 2(1 − level) = 2·level − 1
+    // coverage (80% at level=0.9), mismatching the advertised guarantee.
+    let alpha = (1.0 - conformal_level) / 2.0;
     let mut mean_vec = Vec::with_capacity(n_test);
     let mut lower_vec = Vec::with_capacity(n_test);
     let mut upper_vec = Vec::with_capacity(n_test);
