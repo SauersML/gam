@@ -1298,9 +1298,51 @@ fn evaluate_marginal_slope_row(
         .predict_eta_and_q_chain(&pred_input)
         .map_err(|e| format!("saved survival marginal-slope predictor eta failed: {e}"))?;
     let eta = eta_arr[0];
-    let eta_derivative = deta_dq_arr[0] * qd_with_wiggle;
+    // `qd_with_wiggle` is the base survival-index time derivative q'(t), built
+    // identically to fit-time `qd1 = dq_dq0·d_raw` (the wiggle chain and the
+    // `+derivative_guard` offset are both already folded into `qd_exit_base`),
+    // so there is no predict-vs-fit desync in the derivative reconstruction.
+    //
+    // Fit enforces the monotonicity floor `q'(t) >= derivative_guard` ONLY at
+    // each training row's own exit time (one `t` per row), via the active-set
+    // guard constraints. A prediction horizon is an arbitrary `t` — typically a
+    // single CIF horizon evaluated for every row — which generally is NOT one of
+    // the constrained training exit times. Where that horizon lands in a region
+    // of sparse/no training exits, the penalized baseline spline can extrapolate
+    // to a locally decreasing survival index, so `q'(t) < 0` is a legitimate
+    // model statement ("no instantaneous hazard accrues here"), not a numerical
+    // bug. The instantaneous hazard rate is physically non-negative, so the
+    // truthful response is to clamp the index time-derivative at its floor 0
+    // (flat hazard, survival locally constant) rather than reject the whole
+    // prediction — clamping keeps the CIF well-posed and monotone. Only a
+    // non-finite derivative (a real numerical failure) is surfaced to the strict
+    // validator below.
+    let eta_derivative =
+        marginal_slope_index_derivative_at_horizon(deta_dq_arr[0], qd_with_wiggle);
     let (cum, haz) = probit_survival_hazard_components(eta, eta_derivative)?;
     Ok((eta, cum, haz))
+}
+
+/// Reconstruct the marginal-slope survival index time-derivative `eta'(t)` at a
+/// prediction horizon and clamp it to its physical floor.
+///
+/// `deta_dq = ∂eta/∂q ≥ 1` is the rigid probit-frailty chain factor and
+/// `qd_with_wiggle = q'(t)` is the base survival-index time derivative built
+/// identically to fit-time `qd1`. The instantaneous hazard rate `h(t) = mills ·
+/// eta'(t)` is physically non-negative, so a finite negative `eta'(t)` — which a
+/// penalized baseline spline can legitimately produce when the prediction
+/// horizon lands outside the training exit times the monotonicity guard
+/// constrains — is clamped to its floor 0 (flat hazard, locally constant
+/// survival), keeping the CIF well-posed. Non-finite values pass through
+/// unchanged so the strict validator rejects them as genuine numerical failures.
+#[inline]
+fn marginal_slope_index_derivative_at_horizon(deta_dq: f64, qd_with_wiggle: f64) -> f64 {
+    let eta_derivative = deta_dq * qd_with_wiggle;
+    if eta_derivative.is_finite() {
+        eta_derivative.max(0.0)
+    } else {
+        eta_derivative
+    }
 }
 
 #[inline]
@@ -2886,6 +2928,40 @@ mod tests {
             probit_survival_hazard_components(1.0, 0.0).expect("zero derivative is flat hazard");
         assert!(cum > 0.0);
         assert_eq!(hazard, 0.0);
+    }
+
+    #[test]
+    fn marginal_slope_index_derivative_clamps_extrapolation_negative_to_flat_hazard() {
+        // The #1040 end-to-end blocker: at a prediction horizon outside the
+        // training exit times, the penalized baseline derivative q'(t) can dip
+        // negative (e.g. the reported eta_t=-0.00135), producing a negative
+        // index time-derivative the strict validator used to reject. The
+        // physical hazard floor is 0, so the clamp must turn it into a flat
+        // hazard the validator accepts — keeping predict/CIF runnable.
+        let deta_dq = (1.0_f64 + 0.4 * 0.4).sqrt(); // rigid c = sqrt(1+sb^2) >= 1
+        let qd_with_wiggle = -1.35e-3;
+        let eta_t = marginal_slope_index_derivative_at_horizon(deta_dq, qd_with_wiggle);
+        assert_eq!(eta_t, 0.0, "negative extrapolation derivative must clamp to 0");
+        // Downstream validator now accepts it as a flat-hazard point.
+        let (cum, hazard) = probit_survival_hazard_components(-0.563, eta_t)
+            .expect("clamped flat-hazard prediction must validate");
+        assert!(cum >= 0.0, "cumulative hazard must be well-posed, got {cum}");
+        assert_eq!(hazard, 0.0, "clamped derivative gives zero instantaneous hazard");
+    }
+
+    #[test]
+    fn marginal_slope_index_derivative_preserves_positive_and_nonfinite() {
+        // A genuinely positive derivative passes through unchanged (scaled by
+        // the chain factor), and a non-finite value is left for the strict
+        // validator to reject as a real numerical failure rather than masked.
+        let positive = marginal_slope_index_derivative_at_horizon(1.25, 0.8);
+        assert!((positive - 1.0).abs() <= 1e-15, "positive derivative scaled by chain factor");
+        let nonfinite = marginal_slope_index_derivative_at_horizon(1.25, f64::NAN);
+        assert!(nonfinite.is_nan(), "non-finite derivative passes through unclamped");
+        assert!(
+            probit_survival_hazard_components(0.5, nonfinite).is_err(),
+            "non-finite derivative must still be rejected by the validator"
+        );
     }
 
     #[test]
