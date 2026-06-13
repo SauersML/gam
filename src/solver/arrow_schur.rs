@@ -6201,12 +6201,22 @@ fn maybe_inject_gpu_schur_matvec(
         return None;
     }
     let runtime = crate::gpu::runtime::GpuRuntime::global()?;
-    // Key the work predicate on (n_rows, border_k): the reduced Schur matvec is
-    // O(n · d · k) per apply and the PCG runs many applies, so the per-iteration
-    // border work `k` is the dense-Hessian width the threshold is calibrated on.
+    // #1017 Phase-1 call-site re-key: the reduced-Schur matvec is `O(n · d · k)`
+    // per apply and the PCG runs `cg_iters` applies over device-resident frames,
+    // so the offload becomes profitable on the CG-AMORTISED batched work — the
+    // exact `n × k × d` arithmetic the dense-Direct `(n, k)` floor misses (it
+    // ignores the per-row frame depth `d` and the `1/cg_iters` staging
+    // amortisation). The CG budget here is the same `max_iterations` the PCG loop
+    // launches with (`pcg.max_iterations.min(trust_region.max_iterations)`).
+    // `try_device_arrow_direct` deliberately keeps the dense gate — that path is
+    // one large factorization, not the amortised matvec.
+    let cg_iters = options
+        .pcg
+        .max_iterations
+        .min(options.trust_region.max_iterations);
     if !runtime
         .policy()
-        .dense_hessian_work_target_is_gpu(sys.rows.len(), sys.k)
+        .reduced_schur_matvec_should_offload(sys.rows.len(), sys.k, sys.d, cg_iters)
     {
         return None;
     }
@@ -11145,6 +11155,44 @@ mod tests {
         // LLM/SAE: 2000 rows × a few-thousand-wide border clears both the
         // min-p floor and the 2·n·p² flop threshold.
         assert!(policy.dense_hessian_work_target_is_gpu(2_000, 4_096));
+    }
+
+    /// #1017 Phase-1 call-site re-key: the live matvec-injection gate
+    /// (`maybe_inject_gpu_schur_matvec`) now keys on the CG-amortised
+    /// `reduced_schur_matvec_should_offload(rows, k, sys.d, cg_iters)` predicate
+    /// rather than the dense-Direct `(rows, k)` floor. This asserts the predicate
+    /// the gate consults — with the exact `cg_iters` the gate derives from the
+    /// options (`pcg.max_iterations.min(trust_region.max_iterations)`) — fires for
+    /// the SAE LLM shape (n~2000 rows × k~2048 border × d~8 frame depth) while
+    /// staying off for tiny shapes where launch latency dominates. The gate's
+    /// device-presence short-circuit (`GpuRuntime::global()?`) makes the helper
+    /// itself return `None` on a CPU-only host, so the routing logic is asserted
+    /// through the predicate it consults (the device==CPU 1e-10 numeric parity is
+    /// asserted by the box harness).
+    #[test]
+    fn matvec_gate_engages_for_llm_shape_off_for_tiny() {
+        let policy = crate::gpu::policy::GpuDispatchPolicy::default();
+        // The cg_iters the live gate derives from default options is exactly the
+        // budget the PCG loop launches with.
+        let options = ArrowSolveOptions::inexact_pcg();
+        let cg_iters = options
+            .pcg
+            .max_iterations
+            .min(options.trust_region.max_iterations);
+        assert!(cg_iters > 0);
+
+        // SAE LLM shape: few row blocks, wide border, modest frame depth. The
+        // dense-Direct `(rows, k)` floor that the gate used to consult ignores the
+        // frame depth `d` and the CG amortisation — assert the NEW predicate the
+        // re-keyed gate consults admits it.
+        let (n_llm, k_llm, d_llm) = (2_000_usize, 2_048_usize, 8_usize);
+        assert!(policy.reduced_schur_matvec_should_offload(n_llm, k_llm, d_llm, cg_iters));
+
+        // Tiny shape: narrow border below the device-loop floor → the gate stays
+        // off regardless of the CG budget (launch latency dominates).
+        assert!(!policy.reduced_schur_matvec_should_offload(30, 8, 2, cg_iters));
+        // CPU-canary `(300, 8)` shape from the dense floor's own tests: still off.
+        assert!(!policy.reduced_schur_matvec_should_offload(300, 8, 4, cg_iters));
     }
 
     /// On a host without a CUDA device the production seam must decline (return
