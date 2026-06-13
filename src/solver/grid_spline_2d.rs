@@ -1114,24 +1114,37 @@ mod tests {
         let good = fit.to_state();
         let mut bad = good.clone();
         bad.chol.pop();
-        GridSpline2dFit::from_state(&bad).expect_err("chol length mismatch must error");
+        assert!(
+            GridSpline2dFit::from_state(&bad).is_err(),
+            "chol length mismatch must error"
+        );
 
         let mut bad = good.clone();
         bad.sigma2[0] = -1.0;
-        GridSpline2dFit::from_state(&bad).expect_err("non-positive σ² must error");
+        assert!(
+            GridSpline2dFit::from_state(&bad).is_err(),
+            "non-positive σ² must error"
+        );
 
         let mut bad = good.clone();
         bad.m_axis += 1;
-        GridSpline2dFit::from_state(&bad).expect_err("m_axis ≠ K+3 must error");
+        assert!(
+            GridSpline2dFit::from_state(&bad).is_err(),
+            "m_axis ≠ K+3 must error"
+        );
 
         let mut bad = good.clone();
         bad.axis_h[0] = 0.0;
-        GridSpline2dFit::from_state(&bad).expect_err("non-positive cell width must error");
+        assert!(
+            GridSpline2dFit::from_state(&bad).is_err(),
+            "non-positive cell width must error"
+        );
 
         let mut bad = good;
-        let p = (bad.m_axis as usize) * (bad.m_axis as usize);
         bad.chol[0] = 0.0;
-        let _ = p;
-        GridSpline2dFit::from_state(&bad).expect_err("zero Cholesky pivot must error");
+        assert!(
+            GridSpline2dFit::from_state(&bad).is_err(),
+            "zero Cholesky pivot must error"
+        );
     }
 }
