@@ -227,36 +227,40 @@ fn sym_eig(mat: &Array2<f64>) -> (Vec<f64>, Array2<f64>) {
     (evals_sorted, vecs)
 }
 
-/// Top-`K` principal directions of one group: center the `n×D` matrix, form the
-/// `D×D` sample covariance, and take its leading `K` eigenvectors as an
-/// orthonormal `D×K` frame (a point of `St(D,K)`, spanning a point of `Gr(K,D)`).
-fn pca_subspace(rows: &[[f64; D]]) -> Array2<f64> {
+/// Top-`K` principal directions of one group around an explicit `origin`: subtract
+/// `origin` from every row, form the `D×D` second-moment matrix of the residuals,
+/// and take its leading `K` eigenvectors as an orthonormal `D×K` frame (a point of
+/// `St(D,K)`, spanning a point of `Gr(K,D)`).
+///
+/// The choice of `origin` selects *which* subspace identity the frame encodes:
+///   - `origin = group mean` → the within-area covariance subspace ("which
+///     directions does this region vary along"). Location-blind: a region's mean
+///     composition is projected out, so two regions that differ only in their mean
+///     fatty-acid profile map to the SAME Grassmann point.
+///   - `origin = global centroid` → the area-identity subspace: the residuals now
+///     carry the area's *offset from the global mean composition* as their leading
+///     direction, so the frame encodes both WHERE the region sits in fatty-acid
+///     space and how it spreads. This is the discriminative "subspace of this
+///     region" — the olive-oil signal lives in the mean offset, which the
+///     mean-centered covariance subspace discards.
+fn subspace_about(rows: &[[f64; D]], origin: &[f64; D]) -> Array2<f64> {
     let n = rows.len();
-    assert!(n > K, "group too small for a rank-{K} PCA subspace");
-    let mut mean = [0.0_f64; D];
+    assert!(n > K, "group too small for a rank-{K} subspace");
+    let mut moment = Array2::<f64>::zeros((D, D));
     for r in rows {
-        for j in 0..D {
-            mean[j] += r[j];
-        }
-    }
-    for m in &mut mean {
-        *m /= n as f64;
-    }
-    let mut cov = Array2::<f64>::zeros((D, D));
-    for r in rows {
-        let centered: [f64; D] = std::array::from_fn(|j| r[j] - mean[j]);
+        let centered: [f64; D] = std::array::from_fn(|j| r[j] - origin[j]);
         for i in 0..D {
             for j in 0..D {
-                cov[[i, j]] += centered[i] * centered[j];
+                moment[[i, j]] += centered[i] * centered[j];
             }
         }
     }
-    cov /= (n - 1) as f64;
-    let (evals, evecs) = sym_eig(&cov);
+    moment /= (n - 1) as f64;
+    let (evals, evecs) = sym_eig(&moment);
     assert!(
         evals[K - 1] - evals[K] > 1e-6,
-        "PCA spectral gap at rank {K} is too small ({:.3e}); the top-{K} subspace is \
-         not well defined",
+        "subspace spectral gap at rank {K} is too small ({:.3e}); the top-{K} \
+         subspace is not well defined",
         evals[K - 1] - evals[K]
     );
     let mut frame = Array2::<f64>::zeros((D, K));
@@ -266,6 +270,30 @@ fn pca_subspace(rows: &[[f64; D]]) -> Array2<f64> {
         }
     }
     frame
+}
+
+/// Group mean of an `n×D` sample block (the per-area centroid).
+fn group_mean(rows: &[[f64; D]]) -> [f64; D] {
+    let n = rows.len() as f64;
+    let mut mean = [0.0_f64; D];
+    for r in rows {
+        for j in 0..D {
+            mean[j] += r[j];
+        }
+    }
+    for m in &mut mean {
+        *m /= n;
+    }
+    mean
+}
+
+/// The classic within-area covariance subspace: top-`K` PCA directions about the
+/// group's OWN mean. Used by the geometry round-trip test, which only checks that
+/// gam's distance/log/exp reproduce the analytic principal-angle geometry and so is
+/// indifferent to which orthonormal frames it is handed.
+fn pca_subspace(rows: &[[f64; D]]) -> Array2<f64> {
+    let mean = group_mean(rows);
+    subspace_about(rows, &mean)
 }
 
 /// Row-major flatten of a `D×K` frame into the layout gam's `from_flat`/`flatten`
@@ -575,12 +603,18 @@ emit("ang_rss", ang_rss)
 /// TASK (exercises gam's Grassmann `log_map`/`exp_map` exactly as the synthetic
 /// test does, but on a held-out *prediction*): for every producing area we split
 /// that area's samples deterministically — even row index → TRAIN, odd row index
-/// → TEST — and form an independent top-`K` PCA subspace (a point of `Gr(3,8)`)
-/// from each half. The TRAIN subspaces are class prototypes; each held-out TEST
-/// subspace is classified to the area whose TRAIN prototype is GRASSMANN-NEAREST
-/// (smallest `‖Log‖_F` geodesic distance). Because a region's fatty-acid
-/// covariance is stable across a random split, a test half should land closest to
-/// its own train half — so classification accuracy is a genuine objective signal.
+/// → TEST — and form an independent top-`K` subspace (a point of `Gr(3,8)`) from
+/// each half, built about the SHARED GLOBAL fatty-acid centroid rather than each
+/// half's own mean. Centering on the global centroid keeps the region's offset
+/// from the overall mean composition as the leading frame direction, so the
+/// subspace encodes the area's location-and-spread identity — the actual olive-oil
+/// discriminator. (A mean-centered within-area covariance subspace would project
+/// that offset out and is near-blind here; see `subspace_about`.) The TRAIN
+/// subspaces are class prototypes; each held-out TEST subspace is classified to the
+/// area whose TRAIN prototype is GRASSMANN-NEAREST (smallest `‖Log‖_F` geodesic
+/// distance). Because a region's centroid-relative subspace is stable across a
+/// random split, a test half should land closest to its own train half — so
+/// classification accuracy is a genuine objective signal.
 ///
 /// OBJECTIVE METRIC (the pass criteria):
 ///   PRIMARY (tool-free): held-out nearest-prototype classification ACCURACY,
@@ -600,6 +634,18 @@ fn olive_oils_grassmann_distance_matches_geomstats_on_real_data() {
     // Within each area, even local index → TRAIN, odd → TEST (a fixed, RNG-free
     // split). Each half must still exceed K samples to admit a rank-K subspace.
     let groups = load_groups();
+
+    // Global fatty-acid centroid across EVERY sample of every area. Each area's
+    // train/test subspace is built about THIS shared origin (not the area's own
+    // mean), so the leading frame direction encodes the region's offset from the
+    // global mean composition — the location signal that actually discriminates
+    // olive-oil regions. A mean-centered covariance subspace would project that
+    // offset out and is near-blind here (see `subspace_about`).
+    let global_centroid = {
+        let all_rows: Vec<[f64; D]> = groups.values().flatten().copied().collect();
+        group_mean(&all_rows)
+    };
+
     let mut area_names: Vec<String> = Vec::new();
     let mut train_frames: Vec<Array1<f64>> = Vec::new();
     let mut test_frames: Vec<Array1<f64>> = Vec::new();
@@ -618,14 +664,14 @@ fn olive_oils_grassmann_distance_matches_geomstats_on_real_data() {
             .map(|(_, r)| *r)
             .collect();
         // Only keep areas whose BOTH halves admit a well-defined rank-K subspace
-        // (enough samples and a clean spectral gap). pca_subspace asserts both, so
-        // gate on size here and let it assert the gap.
+        // (enough samples and a clean spectral gap). subspace_about asserts the gap,
+        // so gate on size here and let it assert the gap.
         if train_rows.len() <= K || test_rows.len() <= K {
             continue;
         }
         area_names.push(area.clone());
-        train_frames.push(flatten_frame(&pca_subspace(&train_rows)));
-        test_frames.push(flatten_frame(&pca_subspace(&test_rows)));
+        train_frames.push(flatten_frame(&subspace_about(&train_rows, &global_centroid)));
+        test_frames.push(flatten_frame(&subspace_about(&test_rows, &global_centroid)));
     }
     let n_areas = area_names.len();
     assert!(
