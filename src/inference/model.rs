@@ -17,7 +17,8 @@ use crate::inference::formula_dsl::{
 };
 use crate::inference::predict::{
     BernoulliMarginalSlopePredictor, BinomialLocationScalePredictor,
-    GaussianLocationScalePredictor, PredictableModel, StandardPredictor, SurvivalPredictor,
+    DispersionLocationScalePredictor, GaussianLocationScalePredictor, PredictableModel,
+    StandardPredictor, SurvivalPredictor,
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
@@ -849,6 +850,11 @@ pub enum PredictModelClass {
     Standard,
     GaussianLocationScale,
     BinomialLocationScale,
+    /// Genuine-dispersion location-scale (#913): NegativeBinomial / Gamma / Beta
+    /// / Tweedie mean families fitted with a `noise_formula` overdispersion
+    /// channel. Predicted through the GLM mean inverse link (not the binomial
+    /// threshold-scale predictor).
+    DispersionLocationScale,
     BernoulliMarginalSlope,
     Survival,
     TransformationNormal,
@@ -861,6 +867,7 @@ impl PredictModelClass {
             Self::Standard => "standard",
             Self::GaussianLocationScale => "gaussian location-scale",
             Self::BinomialLocationScale => "binomial location-scale",
+            Self::DispersionLocationScale => "dispersion location-scale",
             Self::BernoulliMarginalSlope => "bernoulli marginal-slope",
             Self::Survival => "survival",
             Self::TransformationNormal => "transformation-normal",
@@ -978,13 +985,36 @@ fn location_scale_noise_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
         .map(|block| block.beta.clone())
 }
 
+/// Whether a `ModelKind::LocationScale` likelihood's response is one of the
+/// genuine-dispersion mean families (#913) — NegativeBinomial, Gamma, Beta or
+/// Tweedie. These carry a `noise_formula` overdispersion channel and must be
+/// predicted through the GLM mean inverse link (the
+/// [`PredictModelClass::DispersionLocationScale`] path), NOT the binomial
+/// threshold-scale predictor. The binomial location-scale (BMS ordinal) path is
+/// the only other non-Gaussian location-scale family, with a `Binomial`
+/// response.
+fn is_dispersion_location_scale_response(response: &crate::types::ResponseFamily) -> bool {
+    use crate::types::ResponseFamily;
+    matches!(
+        response,
+        ResponseFamily::NegativeBinomial { .. }
+            | ResponseFamily::Gamma
+            | ResponseFamily::Beta { .. }
+            | ResponseFamily::Tweedie { .. }
+    )
+}
+
 fn validate_location_scale_saved_fit(
     fit: &UnifiedFitResult,
     model_class: PredictModelClass,
     link_wiggle: Option<&SavedLinkWiggleRuntime>,
 ) -> Result<(), FittedModelError> {
     let primary = match model_class {
-        PredictModelClass::GaussianLocationScale => gaussian_location_scale_mean_beta(fit),
+        // Gaussian and dispersion (#913) location-scale both predict the mean
+        // through the Location block; the binomial threshold-scale class reads
+        // the Threshold block instead.
+        PredictModelClass::GaussianLocationScale
+        | PredictModelClass::DispersionLocationScale => gaussian_location_scale_mean_beta(fit),
         PredictModelClass::BinomialLocationScale => binomial_location_scale_threshold_beta(fit),
         _ => None,
     }
@@ -992,6 +1022,9 @@ fn validate_location_scale_saved_fit(
         reason: match model_class {
             PredictModelClass::GaussianLocationScale => {
                 "gaussian-location-scale saved fit is missing mean/location block".to_string()
+            }
+            PredictModelClass::DispersionLocationScale => {
+                "dispersion-location-scale saved fit is missing mean/location block".to_string()
             }
             PredictModelClass::BinomialLocationScale => {
                 "binomial-location-scale saved fit is missing threshold/location block".to_string()
@@ -2394,6 +2427,8 @@ impl FittedModel {
             ModelKind::LocationScale => {
                 if likelihood == LikelihoodSpec::gaussian_identity() {
                     PredictModelClass::GaussianLocationScale
+                } else if is_dispersion_location_scale_response(&likelihood.response) {
+                    PredictModelClass::DispersionLocationScale
                 } else {
                     PredictModelClass::BinomialLocationScale
                 }
@@ -2413,7 +2448,9 @@ impl FittedModel {
                 payload.model_kind = ModelKind::TransformationNormal;
                 Self::TransformationNormal { payload }
             }
-            PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
+            PredictModelClass::GaussianLocationScale
+            | PredictModelClass::BinomialLocationScale
+            | PredictModelClass::DispersionLocationScale => {
                 payload.model_kind = ModelKind::LocationScale;
                 Self::LocationScale { payload }
             }
@@ -2661,6 +2698,11 @@ impl FittedModel {
             FittedFamily::LocationScale { likelihood, .. } if likelihood.is_gaussian_identity() => {
                 PredictModelClass::GaussianLocationScale
             }
+            FittedFamily::LocationScale { likelihood, .. }
+                if is_dispersion_location_scale_response(&likelihood.response) =>
+            {
+                PredictModelClass::DispersionLocationScale
+            }
             FittedFamily::LocationScale { .. } => PredictModelClass::BinomialLocationScale,
             FittedFamily::Standard { .. } => PredictModelClass::Standard,
         }
@@ -2906,7 +2948,9 @@ impl FittedModel {
         };
         if matches!(
             runtime.model_class,
-            PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale
+            PredictModelClass::GaussianLocationScale
+                | PredictModelClass::BinomialLocationScale
+                | PredictModelClass::DispersionLocationScale
         ) {
             let fit = self.payload().fit_result.as_ref().ok_or_else(|| {
                 FittedModelError::MissingField {
@@ -3213,6 +3257,24 @@ impl FittedModel {
                     covariance: fit.beta_covariance().cloned(),
                     inverse_link,
                     link_wiggle: runtime.link_wiggle,
+                }) as Box<dyn PredictableModel>)
+            }
+            PredictModelClass::DispersionLocationScale => {
+                let fit = self.fit_result.as_ref()?;
+                // The mean prediction routes through the family's GLM inverse
+                // link (log for NB/Gamma/Tweedie, logit for Beta); the
+                // log-precision block feeds the overdispersion / predictive-SD
+                // channel — never the binomial threshold-scale predictor.
+                let beta_mu = gaussian_location_scale_mean_beta(fit)?;
+                let beta_noise = location_scale_noise_beta(fit)
+                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
+                let inverse_link = self.resolved_inverse_link().ok().flatten();
+                Some(Box::new(DispersionLocationScalePredictor {
+                    beta_mu,
+                    beta_noise,
+                    likelihood: self.family_state.likelihood(),
+                    inverse_link,
+                    covariance: fit.beta_covariance().cloned(),
                 }) as Box<dyn PredictableModel>)
             }
             PredictModelClass::BernoulliMarginalSlope => {

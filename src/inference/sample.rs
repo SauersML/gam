@@ -303,6 +303,9 @@ pub fn sample_saved_model(
         PredictModelClass::BinomialLocationScale => {
             laplace_gaussian_fallback(model, cfg, "binomial location-scale posterior")
         }
+        PredictModelClass::DispersionLocationScale => {
+            laplace_gaussian_fallback(model, cfg, "dispersion location-scale posterior")
+        }
         PredictModelClass::BernoulliMarginalSlope => {
             laplace_gaussian_fallback(model, cfg, "bernoulli marginal-slope posterior")
         }

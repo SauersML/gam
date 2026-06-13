@@ -2770,6 +2770,7 @@ fn pretty_predict_model_class(class: PredictModelClass) -> &'static str {
         PredictModelClass::Standard => "standard",
         PredictModelClass::GaussianLocationScale => "gaussian location-scale",
         PredictModelClass::BinomialLocationScale => "binomial location-scale",
+        PredictModelClass::DispersionLocationScale => "dispersion location-scale",
         PredictModelClass::BernoulliMarginalSlope => "bernoulli marginal-slope",
         PredictModelClass::TransformationNormal => "transformation-normal",
         PredictModelClass::Survival => "survival",
@@ -2861,6 +2862,7 @@ fn resolve_predict_offsets(
         PredictModelClass::Standard => false,
         PredictModelClass::GaussianLocationScale => true,
         PredictModelClass::BinomialLocationScale => true,
+        PredictModelClass::DispersionLocationScale => true,
         PredictModelClass::BernoulliMarginalSlope => true,
         PredictModelClass::TransformationNormal => false,
         PredictModelClass::Survival => {

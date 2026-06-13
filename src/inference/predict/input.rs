@@ -292,7 +292,14 @@ fn build_predict_input_for_model_inner(
                 auxiliary_matrix: None,
             })
         }
-        PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
+        PredictModelClass::GaussianLocationScale
+        | PredictModelClass::BinomialLocationScale
+        | PredictModelClass::DispersionLocationScale => {
+            // Dispersion location-scale (#913) persists no scale-deviation
+            // `noise_transform`, so `scale_transform_from_payload` returns
+            // `None` and the prepared noise design falls through to the raw
+            // log-precision design — exactly what the predictor's precision
+            // channel consumes.
             let spec_noise = resolve_termspec_for_prediction(
                 &model.resolved_termspec_noise,
                 training_headers,
