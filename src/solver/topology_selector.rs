@@ -610,6 +610,91 @@ where
     })
 }
 
+/// Driver-level parallel sibling of [`select_topology_with_fit`] (#1017 Phase 0).
+///
+/// Topology candidates are INDEPENDENT fits — the sequential
+/// [`select_topology_with_fit`] loop walks them one at a time, leaving 5–20× on
+/// the table on a multi-core host. This variant fans the candidate fits across
+/// the bounded-nested-Rayon [`run_topology_race_parallel`] driver (the same one
+/// the closure-profile grid and the SAE-resident race already use), then ranks
+/// the survivors through the IDENTICAL deterministic priority selector — results
+/// come back in input order, so the winner is bit-identical to the sequential
+/// path. The only contract difference is `fit_one: Fn + Sync` (each candidate
+/// fit must be callable concurrently) instead of `FnMut`; callers whose fit
+/// closure captures shared mutable state keep the sequential entry.
+pub fn select_topology_with_fit_parallel<FitHandle, FitErr>(
+    selector: &TopologyAutoSelector,
+    fit_one: impl Fn(AutoTopologyKind) -> Result<TopologyAutoFitEvidence<FitHandle>, FitErr> + Sync,
+) -> Result<TopologyAutoSelectorResult<FitHandle>, String>
+where
+    FitHandle: Send,
+    FitErr: ToString + Send,
+{
+    let candidates: Vec<AutoTopologyKind> = selector.candidates.clone();
+    let race = run_topology_race_parallel(candidates, |candidate| {
+        // Carry the candidate kind alongside the fit so per-candidate failures
+        // are reported with their topology name, exactly as the sequential path.
+        (candidate, fit_one(candidate))
+    })?;
+
+    let mut ranked = Vec::with_capacity(race.len());
+    let mut errors = Vec::new();
+    for entry in race {
+        let (candidate, fit_result) = entry.result;
+        match fit_result {
+            Ok(evidence) => {
+                let tk_score = tk_normalized_score(
+                    evidence.raw_reml,
+                    evidence.null_dim,
+                    evidence.null_space_logdet,
+                    evidence.effective_dim,
+                    evidence.n_obs,
+                    selector.score_scale,
+                )?;
+                ranked.push(TopologyAutoRankedFit {
+                    topology_name: evidence.topology_name,
+                    tk_score,
+                    raw_reml: evidence.raw_reml,
+                    effective_dim: evidence.effective_dim,
+                    n_obs: evidence.n_obs,
+                    fit_handle: evidence.fit_handle,
+                });
+            }
+            Err(err) => errors.push(format!("{}: {}", candidate.as_str(), err.to_string())),
+        }
+    }
+    if ranked.is_empty() {
+        return Err(format!(
+            "TopologyAutoSelector found no fittable topology candidates{}",
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", errors.join("; "))
+            }
+        ));
+    }
+    // Same deterministic priority ranking as the sequential path (#782): lower
+    // tk_score is better; route through the shared selector so ordering is
+    // identical regardless of which entry produced the candidates.
+    ranked = rank_priority_candidates(
+        ranked
+            .into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let score = row.tk_score;
+                PriorityCandidate::new(row, idx, score, 0)
+            })
+            .collect(),
+    )
+    .into_iter()
+    .map(|row| row.item)
+    .collect();
+    Ok(TopologyAutoSelectorResult {
+        ranked,
+        winner_index: 0,
+    })
+}
+
 pub fn tk_normalized_score(
     raw_reml: f64,
     null_dim: f64,
