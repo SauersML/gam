@@ -118,9 +118,19 @@ fn zz_diag_1040_probe() {
                 "[PROBE-DONE] t={elapsed:.2}s outer_iters={} inner_cycles={} converged={}",
                 fit.fit.outer_iterations, fit.fit.inner_cycles, fit.fit.outer_converged
             );
+            // #1040 acceptance: the survival marginal-slope outer/inner loop must
+            // reach its stopping criterion (not grind the inner joint-Newton cycle
+            // budget on the full-rank-but-ill-conditioned H_pen). The inner solve
+            // never exhausting its budget is the bug this probe pins.
+            assert!(
+                fit.fit.inner_cycles < gam::custom_family::DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
+                "survival-MS inner joint-Newton ground its full {} cycle budget without \
+                 converging (gam#1040 ill-conditioning hang); cycles={}",
+                gam::custom_family::DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
+                fit.fit.inner_cycles,
+            );
         }
-        Ok(_) => eprintln!("[PROBE-DONE] t={elapsed:.2}s unexpected non-survival-MS variant"),
-        Err(e) => eprintln!("[PROBE-ERR] t={elapsed:.2}s err={e}"),
+        Ok(_) => panic!("[PROBE] t={elapsed:.2}s unexpected non-survival-MS variant"),
+        Err(e) => panic!("[PROBE-ERR] t={elapsed:.2}s err={e}"),
     }
-    assert!(elapsed >= 0.0);
 }
