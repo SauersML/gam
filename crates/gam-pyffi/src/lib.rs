@@ -8729,6 +8729,7 @@ fn metric_provenance_label(
     fisher_factors = None,
     fisher_mass_residual = None,
     fisher_provenance = None,
+    row_loss_weights = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit<'py>(
@@ -8768,6 +8769,9 @@ fn sae_manifold_fit<'py>(
     // positions). Selects which output-Fisher `RowMetric` is installed; the gauge
     // / lens / dose consume either unchanged. Ignored when no shard is supplied.
     fisher_provenance: Option<String>,
+    // Per-row design-honesty reconstruction weights (#977); `(n,)` √w. Absent ⇒
+    // unweighted path. Installed on the term before the joint fit / ρ selection.
+    row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
     // The precomputed-basis entry point carries no Duchon centers / kernel
     // metadata, so any basis kind whose refresh needs them cannot re-evaluate
@@ -8778,6 +8782,7 @@ fn sae_manifold_fit<'py>(
     let atom_centers: Vec<Option<Array2<f64>>> = vec![None; atom_basis.len()];
     let fisher_u = fisher_factors.as_ref().map(|f| f.as_array());
     let fisher_mr = fisher_mass_residual.as_ref().map(|m| m.as_array());
+    let row_w = row_loss_weights.as_ref().map(|w| w.as_array());
     sae_manifold_fit_inner(
         py,
         z.as_array(),
@@ -8814,6 +8819,7 @@ fn sae_manifold_fit<'py>(
         fisher_u,
         fisher_mr,
         fisher_provenance.as_deref(),
+        row_w,
     )
 }
 
@@ -8860,6 +8866,11 @@ fn sae_manifold_fit_inner<'py>(
     // forward-looking `"output_fisher_downstream"`. Gauge/lens consume either
     // unchanged.
     fisher_provenance: Option<&str>,
+    // Per-row design-honesty reconstruction weights (#977). When present, the
+    // length-`n_obs` `√w` reweighting installed via `set_row_loss_weights`
+    // scales every per-row reconstruction loss before the inner joint fit and
+    // outer ρ selection. Uniform / absent ⇒ the bit-identical unweighted path.
+    row_loss_weights: Option<ArrayView1<'_, f64>>,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
@@ -9172,6 +9183,23 @@ fn sae_manifold_fit_inner<'py>(
     } else {
         "Euclidean"
     };
+
+    // Per-row design-honesty reconstruction weights (#977). Installed on the
+    // term before it is moved into the outer objective so the √w reweighting
+    // is honored by both the inner joint fit and the outer ρ criterion. The
+    // length / positivity contract is enforced inside `set_row_loss_weights`;
+    // a uniform (or absent) vector self-normalizes to the unweighted path.
+    if let Some(weights) = row_loss_weights {
+        if weights.len() != n_obs {
+            return Err(py_value_error(format!(
+                "sae_manifold_fit: weights length {} must equal the {n_obs} response rows",
+                weights.len()
+            )));
+        }
+        base_term
+            .set_row_loss_weights(weights.to_vec())
+            .map_err(py_value_error)?;
+    }
 
     let log_ard: Vec<Array1<f64>> = atom_dim
         .iter()
@@ -11577,6 +11605,7 @@ fn sae_build_atom_plans(
     fisher_factors = None,
     fisher_mass_residual = None,
     fisher_provenance = None,
+    row_loss_weights = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit_minimal<'py>(
@@ -11612,6 +11641,9 @@ fn sae_manifold_fit_minimal<'py>(
     // forward-looking `"output_fisher_downstream"`. Routed to the matching
     // `RowMetric` constructor; gauge/lens/dose consume either unchanged.
     fisher_provenance: Option<String>,
+    // Per-row design-honesty reconstruction weights (#977); `(n,)` √w. Absent ⇒
+    // unweighted path. Installed on the term before the joint fit / ρ selection.
+    row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
     let z_view = z.as_array();
     let (n_obs, _p_out) = z_view.dim();
@@ -11840,6 +11872,7 @@ fn sae_manifold_fit_minimal<'py>(
         .collect();
     let fisher_u = fisher_factors.as_ref().map(|f| f.as_array());
     let fisher_mr = fisher_mass_residual.as_ref().map(|m| m.as_array());
+    let row_w = row_loss_weights.as_ref().map(|w| w.as_array());
     let result_dict = sae_manifold_fit_inner(
         py,
         z_view,
@@ -11881,6 +11914,7 @@ fn sae_manifold_fit_minimal<'py>(
         fisher_u,
         fisher_mr,
         fisher_provenance.as_deref(),
+        row_w,
     )?;
     // Attach per-atom build plans so OOS predict can rebuild design without Python.
     let plans_py = PyList::empty(py);
