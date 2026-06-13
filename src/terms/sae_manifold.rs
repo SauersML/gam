@@ -4688,6 +4688,85 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
+    /// #1026 — the LOAD-BEARING collapsed reconstruction: the assembled
+    /// dictionary output `Σ_k a[i,k]·g_k(coord[i,k])` in which every slot whose
+    /// hybrid-split verdict selected LINEAR has its curved decoded image replaced
+    /// by its fitted straight sub-model `b₀ + (t − t̄)·b₁`. This is what makes the
+    /// verdict *change the reconstruction* instead of merely logging a choice:
+    /// the linear-collapsed atom no longer pays its `M·p` curved coefficients, it
+    /// carries a `2·p` straight image whose decoded curve has zero turning.
+    ///
+    /// The straight images are the exact weighted-least-squares lines already
+    /// realized inside [`Self::compute_hybrid_split_report`] (no re-fit, no outer
+    /// continuation, sidestepping #1051). Returns the curved reconstruction
+    /// unchanged when no verdict selected linear, or when the report has not been
+    /// computed yet (`hybrid_split_report == None`).
+    pub fn hybrid_collapsed_reconstruction(
+        &self,
+        rho: &SaeManifoldRho,
+    ) -> Result<Array2<f64>, String> {
+        let mut out = self.try_fitted_for_rho(rho)?;
+        let Some(report) = self.hybrid_split_report.as_ref() else {
+            return Ok(out);
+        };
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let mut curved_buf = vec![0.0_f64; p];
+        let mut linear_buf = vec![0.0_f64; p];
+        for verdict in &report.verdicts {
+            let Some(image) = verdict.linear_image.as_ref() else {
+                continue;
+            };
+            let atom_idx = image.atom_idx;
+            let coord_col = self.assignment.coords[atom_idx]
+                .as_matrix()
+                .column(0)
+                .to_owned();
+            for row in 0..n {
+                let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+                let a_k = a[atom_idx];
+                if a_k == 0.0 {
+                    continue;
+                }
+                // Swap the atom's contribution: subtract its curved decoded image,
+                // add its straight sub-model image at the same coordinate/mass.
+                self.atoms[atom_idx].fill_decoded_row(row, &mut curved_buf);
+                image.fill_row(coord_col[row], &mut linear_buf);
+                let mut out_row = out.row_mut(row);
+                for out_col in 0..p {
+                    out_row[out_col] += a_k * (linear_buf[out_col] - curved_buf[out_col]);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// #1026 — the reconstruction explained variance of the hybrid-collapsed
+    /// dictionary (every verdict-linear slot decoded by its straight sub-model)
+    /// against `target`. The companion of [`Self::per_atom_loao_explained_variance`]
+    /// for the dominance claim: because each linear-collapsed slot is the curved
+    /// family's `Θ → 0` sub-model and is only kept when its evidence beats the
+    /// curved candidate's parameter price, the collapsed dictionary match-or-beats
+    /// the all-curved one on EV-per-parameter — the strict-generalization floor
+    /// the #1026 hybrid argument rests on. `None` when EV is undefined (degenerate
+    /// target variance).
+    pub fn hybrid_collapsed_explained_variance(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<Option<f64>, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::hybrid_collapsed_explained_variance: target {:?} != ({n}, {p})",
+                target.dim()
+            ));
+        }
+        let collapsed = self.hybrid_collapsed_reconstruction(rho)?;
+        Ok(reconstruction_explained_variance(target, collapsed.view()))
+    }
+
     pub fn loss(
         &self,
         target: ArrayView2<'_, f64>,
@@ -7007,6 +7086,18 @@ impl SaeManifoldTerm {
         let entry_loss_total = loss.total();
         let mut previous_loss_total = entry_loss_total;
         let mut refine_rounds: usize = 0;
+        // Consecutive stall rounds: counts how many successive refine rounds
+        // ended in a stall AND a failed undamped factor.  Once this reaches
+        // `SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS` the iterate is at
+        // its numerical fixed point and cannot be improved further; returning
+        // `Err` here is the same "did not converge" signal that
+        // `is_recoverable_value_probe_refusal` already handles, so the outer
+        // BFGS treats it as an INFINITY probe and tries a different ρ instead
+        // of looping forever burning the extended progress budget.  Without
+        // this counter the stagnation handler fell through when the undamped
+        // factor failed and the loop kept extending via `saw_refine_progress`
+        // from earlier rounds, accumulating minutes of wasted work (#1094).
+        let mut consecutive_stall_factor_fail: usize = 0;
         loop {
             let sys = self
                 .assemble_arrow_schur(target, rho, registry)
@@ -7243,6 +7334,29 @@ impl SaeManifoldTerm {
                 {
                     return Ok(stationary_cache);
                 }
+                // Stagnated AND the undamped factor still fails: this is the
+                // numerical fixed point of the inner solve under rank-deficient
+                // or ill-conditioned geometry (e.g. multi-atom euclidean with
+                // near-zero initial latent coords, #1094).  The iterate cannot
+                // be improved further at this ρ.  Treat it as "inner solve did
+                // not converge" — the same signal `is_recoverable_value_probe_refusal`
+                // already handles, causing the outer BFGS to return INFINITY for
+                // this ρ probe and try a different one.  Without this early
+                // return the stagnation handler fell through and the loop kept
+                // burning the extended `progress_refine_iter` budget indefinitely.
+                consecutive_stall_factor_fail += 1;
+                if consecutive_stall_factor_fail >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
+                    return Err(format!(
+                        "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
+                         objective stalled for {consecutive_stall_factor_fail} consecutive refine \
+                         rounds (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}) and the undamped \
+                         evidence factorization failed at each stall point — the iterate is at the \
+                         numerical fixed point under rank-deficient geometry (#{consecutive_stall_factor_fail} \
+                         stall-factor-fail rounds; refusing to rank an off-optimum Laplace criterion)"
+                    ));
+                }
+            } else {
+                consecutive_stall_factor_fail = 0;
             }
         }
     }
@@ -16937,6 +17051,116 @@ mod tests {
         assert!(
             d_dead.abs() < 1e-9,
             "a zero-decoder atom carries no reconstruction ⇒ ΔEV ≈ 0; got {d_dead:.3e}"
+        );
+    }
+
+    /// #1026 — the hybrid split is **load-bearing on the reconstruction**: a slot
+    /// whose verdict selects LINEAR has its curved decoded image replaced by its
+    /// fitted straight sub-model, and that substitution match-or-beats the
+    /// all-curved reconstruction on explained variance at strictly fewer
+    /// parameters (the strict-generalization dominance floor of #1026).
+    ///
+    /// The test pins two regimes:
+    ///  * No report ⇒ the collapsed reconstruction is bit-identical to the curved
+    ///    one (the verdict cannot silently alter the fit before it is computed).
+    ///  * A genuinely STRAIGHT atom (its decoded image is a line) forces the
+    ///    dominance floor to select linear; collapsing it leaves the
+    ///    reconstruction essentially unchanged (a line collapsed to its own line),
+    ///    so EV is preserved, while the slot sheds its `M·p − 2·p` curved
+    ///    coefficients — EV-per-parameter strictly improves.
+    #[test]
+    fn hybrid_collapse_is_load_bearing_and_dominates() {
+        let (mut term, _t, rho) = small_two_atom_periodic_term();
+
+        // (1) Before the report exists, collapse == curved reconstruction.
+        let curved = term
+            .try_fitted_for_rho(&rho)
+            .expect("curved reconstruction assembles");
+        let pre = term
+            .hybrid_collapsed_reconstruction(&rho)
+            .expect("collapse with no report returns the curved fit");
+        assert!(
+            (&curved - &pre).iter().all(|d| d.abs() < 1e-15),
+            "with no hybrid-split report the collapse must equal the curved fit"
+        );
+
+        // Make atom 0 genuinely STRAIGHT: a single nonzero basis-0 coefficient
+        // decodes γ(t) = φ₀(t)·b, and we additionally drive its decoded image to a
+        // pure line by zeroing the higher harmonics — Θ → 0 ⇒ the dominance floor
+        // must select linear for this slot.
+        for basis_row in 1..term.atoms[0].decoder_coefficients.nrows() {
+            for out_col in 0..term.atoms[0].decoder_coefficients.ncols() {
+                term.atoms[0].decoder_coefficients[[basis_row, out_col]] = 0.0;
+            }
+        }
+
+        // Compute and install the real hybrid-split report (closed-form, no outer
+        // fit — sidesteps #1051).
+        let report = term
+            .compute_hybrid_split_report(&rho)
+            .expect("hybrid split report computes")
+            .expect("eligible d=1 atoms present a report");
+        term.hybrid_split_report = Some(report);
+
+        // The straight atom 0 must have collapsed to linear (its verdict carries a
+        // straight sub-model).
+        let collapsed_any = term
+            .hybrid_split_report
+            .as_ref()
+            .unwrap()
+            .verdicts
+            .iter()
+            .any(|v| v.linear_image.is_some());
+        assert!(
+            collapsed_any,
+            "a straight atom must collapse at least one slot to the linear tail"
+        );
+
+        // Target = the term's own curved reconstruction (after straightening atom
+        // 0) ⇒ EV(curved) = 1 exactly.
+        let target = term
+            .try_fitted_for_rho(&rho)
+            .expect("post-straighten curved reconstruction assembles");
+        let ev_curved = reconstruction_explained_variance(target.view(), target.view())
+            .expect("self-reconstruction EV defined");
+        assert!(
+            (ev_curved - 1.0).abs() < 1e-12,
+            "target = curved fit ⇒ EV(curved) = 1; got {ev_curved}"
+        );
+
+        // The collapsed dictionary (straight slot decoded by its line) must
+        // match-or-beat the curved EV up to the line-fit residual of an already
+        // straight image — which is ~0. This is the dominance floor measured on
+        // the EV axis: collapsing a straight atom costs no reconstruction.
+        let ev_collapsed = term
+            .hybrid_collapsed_explained_variance(target.view(), &rho)
+            .expect("collapsed EV evaluates")
+            .expect("collapsed EV defined");
+        assert!(
+            ev_collapsed >= ev_curved - 1e-6,
+            "collapsing a straight atom must preserve EV (match-or-beat dominance \
+             floor): curved {ev_curved:.9}, collapsed {ev_collapsed:.9}"
+        );
+
+        // And the collapsed slot sheds curved coefficients: its evidence-priced
+        // parameter count is the 2·p linear budget, strictly below the M·p curved
+        // decoder it replaced (M ≥ 3 basis rows here).
+        let verdict = term
+            .hybrid_split_report
+            .as_ref()
+            .unwrap()
+            .verdicts
+            .iter()
+            .find(|v| v.linear_image.is_some())
+            .expect("a collapsed slot exists");
+        let collapsed_idx = verdict.linear_image.as_ref().unwrap().atom_idx;
+        let curved_params = term.atoms[collapsed_idx].decoder_coefficients.len();
+        assert!(
+            verdict.choice.num_parameters < curved_params,
+            "the linear-collapsed slot must shed curved coefficients: linear \
+             {} < curved {}",
+            verdict.choice.num_parameters,
+            curved_params
         );
     }
 
