@@ -62,10 +62,11 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    # Backstop under GitHub's 6-hour default. The per-command wall-clock caps
-    # below fail the offending cargo test invocation with a useful name; this
-    # job timeout catches anything outside those wrappers.
-    timeout-minutes: 120
+    # Backstop just under GitHub's 6-hour ceiling (360 min). The per-command
+    # wall-clock caps and the per-test slow-timeout (nextest terminate-after)
+    # below fail an over-budget test with a useful name; this job timeout
+    # catches anything outside those wrappers.
+    timeout-minutes: 350
     steps:
       - name: Checkout
         uses: actions/checkout@v5
