@@ -445,37 +445,107 @@ fn centers_mean_geodesic_distance_jet(
     Ok((s / cnt, s1 / cnt, s2 / cnt))
 }
 
+/// Mean GEODESIC distance over all `data`→`centers` pairs at curvature κ, with
+/// its first/second κ-derivatives `(s, s′, s″)`. Smooth (every-pair average) so
+/// the jet is exact via `distance_kappa_jet`. This is the scale that actually
+/// governs the realized DESIGN's resolution — each data row's fit flexibility is
+/// set by how the data→center geodesic distances compare to the kernel length —
+/// so normalizing the kernel length by it (not by the center→center scale) is
+/// what holds the basis FLEXIBILITY κ-invariant (see
+/// [`constant_curvature_effective_length_jet`]).
+fn data_center_mean_geodesic_distance_jet(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    kappa: f64,
+) -> Result<(f64, f64, f64), BasisError> {
+    let manifold = ConstantCurvature::new(centers.ncols(), kappa);
+    let mut s = 0.0_f64;
+    let mut s1 = 0.0_f64;
+    let mut s2 = 0.0_f64;
+    let mut cnt = 0.0_f64;
+    for xi in data.outer_iter() {
+        for cj in centers.outer_iter() {
+            let (d, d1, d2) = distance_kappa_jet(&manifold, xi, cj).map_err(|e| {
+                BasisError::InvalidInput(format!(
+                    "constant-curvature data→center geodesic κ-jet failed: {e}"
+                ))
+            })?;
+            s += d;
+            s1 += d1;
+            s2 += d2;
+            cnt += 1.0;
+        }
+    }
+    if cnt <= 0.0 {
+        crate::bail_invalid_basis!(
+            "constant-curvature geodesic scale needs at least one data row and one center"
+        );
+    }
+    Ok((s / cnt, s1 / cnt, s2 / cnt))
+}
+
+/// Mean EUCLIDEAN chart distance over all `data`→`centers` pairs — the κ = 0
+/// gauge for [`constant_curvature_effective_length_jet`]. Uses the same `2‖Δ‖`
+/// convention as the geodesic distance at κ = 0 (`d₀ = 2‖Δ‖`), so the κ = 0
+/// effective length reduces exactly to `ℓ_ref`.
+fn data_center_mean_chart_distance(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut cnt = 0.0_f64;
+    for xi in data.outer_iter() {
+        for cj in centers.outer_iter() {
+            let mut s = 0.0_f64;
+            for k in 0..centers.ncols() {
+                let dlt = xi[k] - cj[k];
+                s += dlt * dlt;
+            }
+            sum += 2.0 * s.sqrt();
+            cnt += 1.0;
+        }
+    }
+    if cnt > 0.0 { sum / cnt } else { 0.0 }
+}
+
 /// Effective kernel length `L(κ)` and its κ-jet `(L, L′, L″)`.
 ///
-/// THE κ-IDENTIFICATION FIX (#1059 follow-up). A κ-FROZEN length makes the
-/// geodesic-exponential kernel's *resolution* drift with κ: spherical (κ>0)
-/// geometries compress geodesic distances, so a fixed ℓ silently broadens the
-/// kernel and inflates the effective smoothness, letting the REML criterion buy
-/// a lower deviance by cranking κ up — κ then rails to the chart bound for
-/// every truth instead of being identified. We remove that confound by tying
-/// the kernel length to the geometry's own scale:
+/// THE κ-IDENTIFICATION FIX. A κ-FROZEN length makes the geodesic-exponential
+/// kernel's *resolution* drift with κ: spherical (κ>0) geometries compress
+/// geodesic distances, so a fixed ℓ silently narrows the kernel relative to the
+/// data and inflates the basis's effective flexibility, letting REML buy a lower
+/// deviance by cranking κ up — κ then rails to the chart bound for every truth
+/// (the #944/#1059 symptom). The earlier #1059 fix normalized by the CENTER→
+/// center geodesic scale, which holds the center-Gram κ-invariant but NOT the
+/// realized design's flexibility — the design resolution is set by the DATA→
+/// center distances, and those still narrow with κ, so the deviance stayed
+/// monotone in κ and identification still failed. We instead tie the length to
+/// the geometry's own DATA-relative scale:
 ///
 /// ```text
-///   L(κ) = ℓ_ref · s(κ) / s₀,   s(κ) = mean center geodesic distance at κ,
-///                                s₀   = mean center chart distance (κ = 0 gauge)
+///   L(κ) = ℓ_ref · s_dc(κ) / s₀_dc,   s_dc(κ) = mean data→center geodesic dist at κ,
+///                                      s₀_dc   = mean data→center chart dist (κ=0 gauge)
 /// ```
 ///
-/// so `d_κ / L(κ)` keeps the typical center-pair kernel value κ-invariant. At
-/// κ = 0, `s(0) = s₀` (the κ = 0 gauge has `d₀ = 2‖Δ‖`), so `L(0) = ℓ_ref` and
-/// the construction is unchanged at the flat point. The returned jet feeds the
-/// kernel κ-derivatives through the quotient `q = d/L` chain rule.
+/// so `d_κ(data, c) / L(κ)` keeps the TYPICAL realized design entry κ-invariant
+/// — the basis flexibility no longer drifts with κ, and only the distance-matrix
+/// SHAPE (the genuine geometry signal) moves, giving V_p(κ) an interior minimum
+/// at κ⋆. At κ = 0, `s_dc(0) = s₀_dc` (`d₀ = 2‖Δ‖`), so `L(0) = ℓ_ref`. The
+/// returned jet feeds the kernel κ-derivatives through the quotient `q = d/L`
+/// chain rule.
 fn constant_curvature_effective_length_jet(
+    data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     ell_ref: f64,
     kappa: f64,
 ) -> Result<(f64, f64, f64), BasisError> {
-    let s0 = centers_mean_chart_distance(centers);
+    let s0 = data_center_mean_chart_distance(data, centers);
     if !(s0.is_finite() && s0 > 0.0) {
         crate::bail_invalid_basis!(
-            "constant-curvature effective length: degenerate centers (mean chart distance {s0})"
+            "constant-curvature effective length: degenerate data/centers (mean chart distance {s0})"
         );
     }
-    let (s, s1, s2) = centers_mean_geodesic_distance_jet(centers, kappa)?;
+    let (s, s1, s2) = data_center_mean_geodesic_distance_jet(data, centers, kappa)?;
     let inv = ell_ref / s0;
     Ok((inv * s, inv * s1, inv * s2))
 }
@@ -509,7 +579,7 @@ pub fn build_constant_curvature_basis(
     // resolution (the #1059 curvature-identification fix). At κ = 0, L = ℓ_ref.
     let length_scale = realized_constant_curvature_length_scale(centers.view(), spec.length_scale)?;
     let (ell_eff, _, _) =
-        constant_curvature_effective_length_jet(centers.view(), length_scale, spec.kappa)?;
+        constant_curvature_effective_length_jet(data, centers.view(), length_scale, spec.kappa)?;
     let raw_penalty =
         constant_curvature_kernel_matrix(centers.view(), centers.view(), spec.kappa, ell_eff)?;
     // Realized-design constraint transform: uniform coefficient sum-to-zero at
