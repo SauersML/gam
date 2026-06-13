@@ -633,9 +633,13 @@ pub fn select_topology_with_fit<FitHandle, FitErr>(
 where
     FitErr: ToString,
 {
-    let mut ranked = Vec::with_capacity(selector.candidates.len());
+    // #944 stage 4: collapse fixed simply-connected constant-curvature forms
+    // (Euclidean/Sphere) into ONE estimated-κ ConstantCurvature candidate so the
+    // discrete stack only adjudicates genuinely non-homotopic topologies.
+    let fused = AutoTopologyKind::fuse_constant_curvature_family(&selector.candidates);
+    let mut ranked = Vec::with_capacity(fused.len());
     let mut errors = Vec::new();
-    for candidate in &selector.candidates {
+    for candidate in &fused {
         match fit_one(*candidate) {
             Ok(evidence) => {
                 let tk_score = tk_normalized_score(
@@ -711,7 +715,10 @@ where
     FitHandle: Send,
     FitErr: ToString + Send,
 {
-    let candidates: Vec<AutoTopologyKind> = selector.candidates.clone();
+    // #944 stage 4: collapse fixed simply-connected constant-curvature forms
+    // into ONE estimated-κ ConstantCurvature candidate before the parallel race.
+    let candidates: Vec<AutoTopologyKind> =
+        AutoTopologyKind::fuse_constant_curvature_family(&selector.candidates);
     let race = run_topology_race_parallel(candidates, |candidate| {
         // Carry the candidate kind alongside the fit so per-candidate failures
         // are reported with their topology name, exactly as the sequential path.
