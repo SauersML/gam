@@ -20,7 +20,10 @@
 //! estimator itself; here we certify the SEAM never mis-fires.
 
 use csv::StringRecord;
-use gam::{FitConfig, encode_recordswith_inferred_schema, fit_residual_cascade_from_formula};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula,
+    fit_residual_cascade_from_formula,
+};
 
 /// Deterministic scattered 2-D sample on the unit square with a smooth truth.
 fn sample_2d(n: usize) -> gam::data::EncodedDataset {
@@ -124,5 +127,25 @@ fn extra_linear_term_falls_through() {
     assert!(
         routed.is_none(),
         "a smooth + linear term must fall through to the dense path"
+    );
+}
+
+/// `fit_from_formula` auto-route NEGATIVE (#1032): a below-cliff scattered
+/// duchon must NOT come back as `FitResult::ResidualCascade` — the dense radial
+/// posterior is exact and cheap here, so the auto-route in `fit_from_formula`
+/// falls through to the dense `fit_model` path and the user's chosen posterior
+/// is preserved (the cascade is a different posterior, never a silent swap).
+/// The cliff-scale POSITIVE (an actual `FitResult::ResidualCascade`) is left to
+/// the certification suite, which already exercises the cascade estimator; here
+/// we certify the dispatch never mis-fires below the cliff (cheap, no
+/// cliff-scale data needed).
+#[test]
+fn fit_from_formula_below_cliff_does_not_return_cascade_variant() {
+    let data = sample_2d(800);
+    let cfg = gaussian_config();
+    let result = fit_from_formula("y ~ duchon(x1, x2)", &data, &cfg).expect("dense fit ok");
+    assert!(
+        !matches!(result, FitResult::ResidualCascade(_)),
+        "below-cliff scattered duchon must NOT auto-route to the cascade variant"
     );
 }

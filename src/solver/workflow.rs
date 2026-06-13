@@ -1147,6 +1147,20 @@ pub enum FitResult {
     /// CLI/FFI save paths build the persistence payload from the same
     /// `SplineScanFit` via `assemble_spline_scan_payload`.
     SplineScan(crate::solver::spline_scan::SplineScanFit),
+    /// O(n log n) multiresolution residual-cascade smooth (#1032). UNLIKE the
+    /// 1-D scan, the cascade is NOT the same posterior as the Duchon/Matérn term
+    /// it stands in for (a different finite basis — the multilevel Wendland
+    /// frame), so it is never a silent swap: this variant is produced only when
+    /// the structural detector [`residual_cascade_fast_path`] fires on an
+    /// eligible scattered-low-d Gaussian fit past the dense-kernel cliff AND the
+    /// in-cascade quasi-uniformity guard certifies the metric; every other shape
+    /// (and a rejected metric) falls through to the dense `fit_model` path. The
+    /// cascade-bearing model carries the
+    /// [`ResidualCascadeFit`](crate::solver::residual_cascade::ResidualCascadeFit)
+    /// directly — knots-free nested geometry, coefficients, the factored
+    /// precision, and an exact per-row `predict`; the CLI/FFI save paths build
+    /// the persistence payload from its `to_state` snapshot.
+    ResidualCascade(crate::solver::residual_cascade::ResidualCascadeFit),
 }
 
 /// Result of a dispersion-channel GAMLSS location-scale fit (#913). Wraps the
@@ -4295,6 +4309,31 @@ pub fn fit_from_formula(
             )
             .map_err(|reason| WorkflowError::IntegrationFailed { reason })?;
             return Ok(FitResult::SplineScan(scan));
+        }
+        // O(n log n) multiresolution residual-cascade fast path (#1032): a
+        // scattered low-d Gaussian-identity Duchon/Matérn smooth past the
+        // dense-kernel cliff. UNLIKE the scan, the cascade is a DIFFERENT
+        // posterior from the dense radial term, so it only ever fires as an
+        // explicit alternative estimator on the exact structural signature
+        // (`residual_cascade_fast_path`) AND when the in-cascade quasi-uniformity
+        // guard certifies the metric — a rejected metric or any ineligible shape
+        // falls through to the dense `fit_model` path (a genuine estimator
+        // choice, never a silent swap). The save paths build the persistence
+        // payload from this `ResidualCascadeFit`'s `to_state` snapshot.
+        if let Some(inputs) = residual_cascade_fast_path(request) {
+            let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
+            if let Ok(fit) = crate::solver::residual_cascade::fit_residual_cascade(
+                &coord_refs,
+                &inputs.y,
+                &inputs.w,
+                &inputs.metric,
+                inputs.sobolev_s,
+            ) {
+                return Ok(FitResult::ResidualCascade(fit));
+            }
+            // The quasi-uniformity guard (caveat 2) or any degenerate-design
+            // signal surfaces as a build/solve error; fall through to the dense
+            // kernel path rather than failing the fit outright.
         }
     }
     // `fit_model` already returns `WorkflowError` end-to-end; propagate it
