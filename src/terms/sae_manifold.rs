@@ -89,6 +89,26 @@ const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 const SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR: f64 = 1.0e-12;
 const SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR: f64 = 1.0e-8;
 
+/// Largest decoder (`β`) block dimension for which the outer-gradient
+/// conditioning path may additionally probe the β coordinate basis for a
+/// near-null subspace of the joint Hessian (issue #1051).
+///
+/// The closed-form gauge orbit ([`SaeManifoldTerm::dense_step_gauge_vectors`])
+/// only covers the *chart* reparametrisation freedom (constant + linear
+/// coordinate fields). It does NOT cover a **rank-deficient decoder design** —
+/// e.g. a euclidean-1D atom fit to a straight line in a `p = 2` ambient leaves
+/// the decoder column space rank-1, so one decoder direction is unidentified by
+/// the data and the joint Hessian acquires a near-null direction that lives in
+/// the β block, not the gauge orbit. That direction is exactly a Faddeev-Popov
+/// gauge of the *same* kind (a flat direction of the evidence quotient), so it
+/// is deflated identically — but only after the β basis is admitted as a
+/// deflation candidate. The dense `k×k` Rayleigh eigendecomposition that
+/// resolves it is `O(k³)`, so it is gated to small β blocks (the trivial-shape
+/// regime that exhibits the singularity); large-`p` LLM-scale fits keep the
+/// pure gauge-orbit path untouched (they reach low decoder rank through the
+/// Grassmann frame instead, see [`SaeManifoldAtom::maybe_activate_decoder_frame`]).
+const SAE_OUTER_GRADIENT_BETA_NULL_PROBE_MAX_DIM: usize = 64;
+
 /// Nominal curvature-homotopy `η` step (#1007): the tracker covers `η ∈ [0, 1]`
 /// in this many equal predictor-corrector waypoints when the branch is clean.
 /// Five waypoints is a few corrector solves — far cheaper than the multi-seed
@@ -7073,6 +7093,25 @@ impl SaeManifoldTerm {
                 continue;
             }
             raw_gauges.push(gauge);
+        }
+        // #1051: admit the β (decoder) coordinate basis as additional deflation
+        // candidates when the block is small enough to eigendecompose cheaply.
+        // A rank-deficient decoder design (e.g. a euclidean-1D line in a p=2
+        // ambient: decoder column rank 1 of 3) puts a genuine near-null
+        // direction of the joint Hessian in the β block, OUTSIDE the closed-form
+        // chart gauge orbit. Feeding the β basis into the same Rayleigh
+        // eigendecomposition below lets that flat direction be identified and
+        // Faddeev-Popov-deflated exactly like a chart gauge, so the analytic
+        // outer gradient becomes well-defined instead of rejecting the trial ρ.
+        // The Rayleigh floor still keeps only genuinely flat (sub-floor)
+        // directions, so a well-conditioned decoder is unaffected.
+        let delta_t_len = cache.delta_t_len();
+        if cache.k > 0 && cache.k <= SAE_OUTER_GRADIENT_BETA_NULL_PROBE_MAX_DIM {
+            for beta_idx in 0..cache.k {
+                let mut unit = Array1::<f64>::zeros(full_len);
+                unit[delta_t_len + beta_idx] = 1.0;
+                raw_gauges.push(unit);
+            }
         }
         if raw_gauges.is_empty() {
             return Err(conditioning_err);
@@ -20856,6 +20895,139 @@ mod tests {
         assert!(
             err.contains("min/max pivot ratio") && err.contains("floor"),
             "guard error must report the pivot ratio and floor; got: {err}"
+        );
+    }
+
+    /// #1051: a euclidean-patch atom whose decoder design is RANK-DEFICIENT
+    /// (a straight line in a `p = 2` ambient: the decoder column space is rank
+    /// 1, so one output-channel direction is unidentified by the data) leaves a
+    /// genuine near-null direction of the joint Hessian in the β (decoder)
+    /// block. That direction is OUTSIDE the closed-form chart gauge orbit
+    /// (`dense_step_gauge_vectors` only spans per-latent-axis reparametrisation,
+    /// never per-output-channel decoder freedom), so before the fix
+    /// `outer_gradient_arrow_solver` could not deflate it and rejected the
+    /// trial ρ with "analytic outer gradient undefined" — the singular-pivot
+    /// continuation stall that made every euclidean/multi-atom atlas tile
+    /// TIMEOUT. With the β-basis admitted as a deflation candidate the flat
+    /// direction is Faddeev-Popov-deflated and the solve succeeds, regularising
+    /// the near-null β response to the Hessian scale (bounded, not 1e13).
+    fn rank_deficient_euclidean_outer_gradient_objective() -> SaeManifoldOuterObjective {
+        // Linear euclidean basis Φ(t) = [1, t] (m = 2) over a 1-D latent.
+        let coords = array![[-0.7_f64], [-0.2], [0.3], [0.8]];
+        let n = coords.nrows();
+        let mut phi = Array2::<f64>::zeros((n, 2));
+        let mut jet = Array3::<f64>::zeros((n, 2, 1));
+        for row in 0..n {
+            phi[[row, 0]] = 1.0;
+            phi[[row, 1]] = coords[[row, 0]];
+            jet[[row, 1, 0]] = 1.0; // d/dt of the linear column.
+        }
+        // p = 2 ambient, but the decoder column space is rank 1 (columns are
+        // proportional: column 1 = 2 · column 0), so the second output channel
+        // is unidentified — the line lives on a 1-D subspace of R².
+        let decoder = array![[1.0_f64, 2.0], [0.5, 1.0]];
+        let atom = SaeManifoldAtom::new(
+            "euclidean_line",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(2),
+        )
+        .unwrap();
+        let assignment = SaeAssignment::from_blocks_with_mode(
+            array![[0.9_f64], [0.8], [0.7], [0.6]],
+            vec![coords],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = array![[-1.0_f64, -2.0], [-0.3, -0.6], [0.4, 0.8], [1.1, 2.2]];
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+        SaeManifoldOuterObjective::new(term, target, None, rho, 8, 1.0, 1.0e-6, 1.0e-6)
+    }
+
+    /// A joint Hessian cache whose β block carries one genuine near-null
+    /// direction along the SECOND output channel (`out_col = 1`) — the
+    /// rank-deficient decoder's unidentified direction — with the latent block
+    /// well-conditioned and `H_tβ = 0` so the singularity is purely in β. The
+    /// chart gauge orbit cannot reach this direction (#1051).
+    fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
+        // Well-conditioned latent block (single row, dim 1).
+        let htt = ArrowFactorSlab::from_blocks(vec![array![[1.0_f64]]]);
+        // β dim = m · p = 2 · 2 = 4, laid out (col, out_col) row-major like
+        // `dense_step_gauge_vector_from_field`. Make output channel 1 (indices
+        // 1 and 3) near-null: its lower-Cholesky pivot is 1e-7, so the
+        // min/max pivot ratio falls below the 1e-12 floor and the conditioning
+        // path engages. H_tβ = 0 (zero Dense block) decouples β from latent.
+        let schur = array![
+            [1.0_f64, 0.0, 0.0, 0.0],
+            [0.0, 1.0e-7, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0e-7],
+        ];
+        ArrowFactorCache {
+            htt_factors: htt,
+            htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
+            schur_factor: Some(schur),
+            solver_mode: ArrowSolverMode::Direct,
+            ridge_t: 0.0,
+            ridge_beta: 0.0,
+            htbeta: ArrowHtbetaCache::Dense {
+                blocks: Arc::from(vec![Array2::<f64>::zeros((1, 4))].into_boxed_slice()),
+                estimated_bytes: 0,
+            },
+            d: 1,
+            row_dims: Arc::from(vec![1usize].into_boxed_slice()),
+            row_offsets: Arc::from(vec![0usize, 1usize].into_boxed_slice()),
+            k: 4,
+            manifold_mode_fingerprint: 0,
+            row_hessian_fingerprint: 0,
+            pcg_diagnostics: PcgDiagnostics::default(),
+            gauge_deflated_directions: 0,
+            cross_row_woodbury: None,
+        }
+    }
+
+    #[test]
+    fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() {
+        let obj = rank_deficient_euclidean_outer_gradient_objective();
+        let cache = rank_deficient_beta_outer_gradient_cache();
+        // Sanity: the cache genuinely trips the conditioning floor (the bug's
+        // precondition) — without it this test would not exercise the fix.
+        assert!(
+            SaeManifoldTerm::outer_gradient_conditioning_error(&cache).is_err(),
+            "fixture must be sub-floor singular so the conditioning path engages"
+        );
+        // The fix: the β-block near-null direction is admitted as a deflation
+        // candidate and Faddeev-Popov-deflated, so the solver SUCCEEDS instead
+        // of rejecting with "analytic outer gradient undefined".
+        let solver = obj
+            .term
+            .outer_gradient_arrow_solver(&cache)
+            .expect("rank-deficient decoder β-null must be deflated, not rejected (#1051)");
+        // The deflated solve must REGULARISE the near-null β response: a plain
+        // inverse divides by the 1e-7 pivot and explodes; the deflated solve is
+        // bounded at the Hessian scale.
+        let beta_null_rhs = array![0.0_f64, 0.0, 0.0, 1.0]; // output channel 1, col 1.
+        let rhs_t = Array1::<f64>::zeros(1);
+        let plain = cache
+            .full_inverse_apply(rhs_t.view(), beta_null_rhs.view())
+            .expect("plain solve")
+            .1;
+        let deflated = solver
+            .solve(rhs_t.view(), beta_null_rhs.view())
+            .expect("deflated solve")
+            .beta;
+        assert!(
+            plain[3].abs() > 1.0e13,
+            "plain near-null β solve must explode; got {}",
+            plain[3]
+        );
+        assert!(
+            deflated.iter().all(|v| v.is_finite()) && deflated[3].abs() < 10.0,
+            "deflated near-null β solve must be bounded at the Hessian scale; got {deflated:?}"
         );
     }
 
