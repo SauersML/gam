@@ -502,11 +502,7 @@ mod tests {
             }
             let exact_gram = design.t().dot(&wd);
             let exact_rhs = wd.t().dot(&z);
-            let exact_ztwz: f64 = w
-                .iter()
-                .zip(z.iter())
-                .map(|(&wi, &zi)| wi * zi * zi)
-                .sum();
+            let exact_ztwz: f64 = w.iter().zip(z.iter()).map(|(&wi, &zi)| wi * zi * zi).sum();
             assert!(
                 (cache.centered_weighted_y_sq - exact_ztwz).abs()
                     <= 1e-12 * exact_ztwz.abs().max(1e-300),
