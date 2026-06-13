@@ -5352,8 +5352,8 @@ pub fn resolve_family(
     // Auto-detect: delegate to `ResponseFamily::infer_from_response` so the
     // refusal policy for non-numeric response columns lives in one place
     // (the family layer), not duplicated across every entry point. The link
-    // is derived from the inferred response: Binomial → Logit, Gaussian →
-    // Identity. The link_choice branch above already covered the case where
+    // is derived from the inferred response: Binomial → Logit, Poisson → Log,
+    // Gaussian → Identity. The link_choice branch above already covered the case where
     // the user pinned a link without a family.
     let response = ResponseFamily::infer_from_response(y, y_kind).map_err(|refusal| {
         let err: String = WorkflowError::InvalidConfig {
@@ -5364,6 +5364,7 @@ pub fn resolve_family(
     })?;
     let link = match response {
         ResponseFamily::Binomial => InverseLink::Standard(StandardLink::Logit),
+        ResponseFamily::Poisson => InverseLink::Standard(StandardLink::Log),
         _ => InverseLink::Standard(StandardLink::Identity),
     };
     Ok(LikelihoodSpec::new(response, link))
