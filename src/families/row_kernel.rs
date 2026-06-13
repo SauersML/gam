@@ -33,6 +33,32 @@ use std::sync::Arc;
 /// the documented failure mode this logging exists to expose.
 const ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS: usize = 100_000;
 const ARROW_ROW_CHUNK: usize = 256;
+/// Maximum number of `ARROW_ROW_CHUNK`-wide row chunks processed on the
+/// caller thread instead of through Rayon. The row-decomposed objective,
+/// gradient, and curvature folds below are re-entered thousands of times
+/// across a single fit (every line-search probe, every continuation step,
+/// every outer ρ/ψ evaluation), and each Rayon entry pins a `crossbeam_epoch`
+/// guard whose global epoch advance scans the whole participant list — on a
+/// many-core box that bookkeeping dominates the arithmetic for small folds.
+/// A measured stack sample of the matern-logslope kappa phase (n≈1500, ≤6
+/// chunks) spent ~47% of self-time in `crossbeam_epoch::try_advance`/`pin`
+/// plus Rayon scheduling, versus ~6.5% in the actual row tower algebra.
+///
+/// The sequential path walks chunks `0..count` in index order, folding each
+/// chunk sequentially and reducing the chunk partials left-to-right — exactly
+/// the order `IndexedParallelIterator::collect` + in-order reduce already
+/// guarantees — so the result is bit-identical to the parallel path; only the
+/// scheduler overhead is removed. Above the threshold there is enough work to
+/// amortize one Rayon entry, so the parallel path is kept.
+const ROW_FOLD_SEQUENTIAL_MAX_CHUNKS: usize = 16;
+
+/// `true` when a row fold over `n_rows` should run on the caller thread.
+/// Threshold is in `ARROW_ROW_CHUNK`-wide chunks; see
+/// [`ROW_FOLD_SEQUENTIAL_MAX_CHUNKS`].
+#[inline]
+fn row_fold_runs_sequential(n_rows: usize) -> bool {
+    arrow_row_chunk_count(n_rows) <= ROW_FOLD_SEQUENTIAL_MAX_CHUNKS
+}
 
 /// Byte budget above which the full dense `J·F` projection (`n × K·rank` f64)
 /// is no longer materialized-and-cached whole. Aligned with `ResourcePolicy`'s
@@ -186,20 +212,31 @@ impl RowSet {
         match self {
             Self::All => {
                 let chunks = arrow_row_chunk_count(n_total);
-                (0..chunks).into_par_iter().for_each(|chunk_idx| {
+                let run_chunk = |chunk_idx: usize| {
                     let start = chunk_idx * ARROW_ROW_CHUNK;
                     let end = (start + ARROW_ROW_CHUNK).min(n_total);
                     for i in start..end {
                         body(i, 1.0);
                     }
-                });
+                };
+                if row_fold_runs_sequential(n_total) {
+                    (0..chunks).for_each(run_chunk);
+                } else {
+                    (0..chunks).into_par_iter().for_each(run_chunk);
+                }
             }
             Self::Subsample { rows, .. } => {
-                rows.par_chunks(ARROW_ROW_CHUNK).for_each(|chunk| {
-                    for r in chunk {
-                        body(r.index, r.weight);
-                    }
-                });
+                let run_chunk =
+                    |chunk: &[crate::families::marginal_slope_shared::WeightedOuterRow]| {
+                        for r in chunk {
+                            body(r.index, r.weight);
+                        }
+                    };
+                if row_fold_runs_sequential(rows.len()) {
+                    rows.chunks(ARROW_ROW_CHUNK).for_each(run_chunk);
+                } else {
+                    rows.par_chunks(ARROW_ROW_CHUNK).for_each(run_chunk);
+                }
             }
         }
     }
@@ -222,18 +259,21 @@ impl RowSet {
     {
         match self {
             Self::All => {
-                let chunk_accumulators: Vec<T> = (0..arrow_row_chunk_count(n_total))
-                    .into_par_iter()
-                    .map(|chunk_idx| {
-                        let start = chunk_idx * ARROW_ROW_CHUNK;
-                        let end = (start + ARROW_ROW_CHUNK).min(n_total);
-                        let mut acc = init();
-                        for i in start..end {
-                            acc = fold(acc, i, 1.0);
-                        }
-                        acc
-                    })
-                    .collect();
+                let map_chunk = |chunk_idx: usize| {
+                    let start = chunk_idx * ARROW_ROW_CHUNK;
+                    let end = (start + ARROW_ROW_CHUNK).min(n_total);
+                    let mut acc = init();
+                    for i in start..end {
+                        acc = fold(acc, i, 1.0);
+                    }
+                    acc
+                };
+                let chunk_range = 0..arrow_row_chunk_count(n_total);
+                let chunk_accumulators: Vec<T> = if row_fold_runs_sequential(n_total) {
+                    chunk_range.map(map_chunk).collect()
+                } else {
+                    chunk_range.into_par_iter().map(map_chunk).collect()
+                };
                 let mut total = init();
                 for acc in chunk_accumulators {
                     total = reduce(total, acc);
@@ -241,16 +281,19 @@ impl RowSet {
                 total
             }
             Self::Subsample { rows, .. } => {
-                let chunk_accumulators: Vec<T> = rows
-                    .par_chunks(ARROW_ROW_CHUNK)
-                    .map(|chunk| {
+                let map_chunk =
+                    |chunk: &[crate::families::marginal_slope_shared::WeightedOuterRow]| {
                         let mut acc = init();
                         for r in chunk {
                             acc = fold(acc, r.index, r.weight);
                         }
                         acc
-                    })
-                    .collect();
+                    };
+                let chunk_accumulators: Vec<T> = if row_fold_runs_sequential(rows.len()) {
+                    rows.chunks(ARROW_ROW_CHUNK).map(map_chunk).collect()
+                } else {
+                    rows.par_chunks(ARROW_ROW_CHUNK).map(map_chunk).collect()
+                };
                 let mut total = init();
                 for acc in chunk_accumulators {
                     total = reduce(total, acc);
@@ -279,18 +322,21 @@ impl RowSet {
     {
         match self {
             Self::All => {
-                let chunk_accumulators: Vec<Result<T, E>> = (0..arrow_row_chunk_count(n_total))
-                    .into_par_iter()
-                    .map(|chunk_idx| {
-                        let start = chunk_idx * ARROW_ROW_CHUNK;
-                        let end = (start + ARROW_ROW_CHUNK).min(n_total);
-                        let mut acc = init();
-                        for i in start..end {
-                            acc = fold(acc, i, 1.0)?;
-                        }
-                        Ok(acc)
-                    })
-                    .collect();
+                let map_chunk = |chunk_idx: usize| -> Result<T, E> {
+                    let start = chunk_idx * ARROW_ROW_CHUNK;
+                    let end = (start + ARROW_ROW_CHUNK).min(n_total);
+                    let mut acc = init();
+                    for i in start..end {
+                        acc = fold(acc, i, 1.0)?;
+                    }
+                    Ok(acc)
+                };
+                let chunk_range = 0..arrow_row_chunk_count(n_total);
+                let chunk_accumulators: Vec<Result<T, E>> = if row_fold_runs_sequential(n_total) {
+                    chunk_range.map(map_chunk).collect()
+                } else {
+                    chunk_range.into_par_iter().map(map_chunk).collect()
+                };
                 let mut total = init();
                 for acc in chunk_accumulators {
                     total = reduce(total, acc?)?;
@@ -298,16 +344,19 @@ impl RowSet {
                 Ok(total)
             }
             Self::Subsample { rows, .. } => {
-                let chunk_accumulators: Vec<Result<T, E>> = rows
-                    .par_chunks(ARROW_ROW_CHUNK)
-                    .map(|chunk| {
+                let map_chunk =
+                    |chunk: &[crate::families::marginal_slope_shared::WeightedOuterRow]| -> Result<T, E> {
                         let mut acc = init();
                         for r in chunk {
                             acc = fold(acc, r.index, r.weight)?;
                         }
                         Ok(acc)
-                    })
-                    .collect();
+                    };
+                let chunk_accumulators: Vec<Result<T, E>> = if row_fold_runs_sequential(rows.len()) {
+                    rows.chunks(ARROW_ROW_CHUNK).map(map_chunk).collect()
+                } else {
+                    rows.par_chunks(ARROW_ROW_CHUNK).map(map_chunk).collect()
+                };
                 let mut total = init();
                 for acc in chunk_accumulators {
                     total = reduce(total, acc?)?;
@@ -323,10 +372,12 @@ fn deterministic_chunked_sum<F>(n_items: usize, map_chunk: F) -> f64
 where
     F: Fn(usize) -> f64 + Send + Sync,
 {
-    let partials: Vec<f64> = (0..arrow_row_chunk_count(n_items))
-        .into_par_iter()
-        .map(map_chunk)
-        .collect();
+    let chunk_range = 0..arrow_row_chunk_count(n_items);
+    let partials: Vec<f64> = if row_fold_runs_sequential(n_items) {
+        chunk_range.map(map_chunk).collect()
+    } else {
+        chunk_range.into_par_iter().map(map_chunk).collect()
+    };
     let mut total = 0.0_f64;
     for partial in partials {
         total += partial;
