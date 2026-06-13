@@ -125,9 +125,15 @@ fn exact_affine_passes_through_at_default_tau() {
     let rough = rough_over_centers(&centers);
 
     // Default τ = 1e-3: only the ridge toll on the affine field may survive.
-    let q_default =
-        measure_jet_energy_form(centers.view(), masses.view(), &band, ORDER_S, ALPHA, TAU_DEFAULT)
-            .expect("default-τ energy form");
+    let q_default = measure_jet_energy_form(
+        centers.view(),
+        masses.view(),
+        &band,
+        ORDER_S,
+        ALPHA,
+        TAU_DEFAULT,
+    )
+    .expect("default-τ energy form");
     let e_affine = quadratic_form(&q_default, &affine);
     let e_rough = quadratic_form(&q_default, &rough);
     assert!(
@@ -176,11 +182,7 @@ const STRAND_CENTERS: usize = 24;
 fn strand_data() -> Array2<f64> {
     Array2::<f64>::from_shape_fn((STRAND_N, 2), |(i, k)| {
         let t = i as f64 / (STRAND_N - 1) as f64;
-        if k == 0 {
-            t
-        } else {
-            0.3 + 0.5 * t
-        }
+        if k == 0 { t } else { 0.3 + 0.5 * t }
     })
 }
 
@@ -224,8 +226,9 @@ fn support_domination_variance_monotone() {
     queries[(1, 0)] = 25.0;
     queries[(1, 1)] = -25.0; // far off the web
 
-    let support = measure_jet_support_curve(queries.view(), centers.view(), masses.view(), eps_band)
-        .expect("support curve from the built geometry");
+    let support =
+        measure_jet_support_curve(queries.view(), centers.view(), masses.view(), eps_band)
+            .expect("support curve from the built geometry");
 
     let near = support.row(0);
     let far = support.row(1);
@@ -256,14 +259,9 @@ fn support_domination_variance_monotone() {
     let spectrum = MeasureJetExtrapolationSpectrum::PerLevel(&lambda_phys);
     let coverage_floor = 0.05;
 
-    let var_near = measure_jet_extrapolation_variance(
-        near,
-        eps_band,
-        support_means,
-        spectrum,
-        coverage_floor,
-    )
-    .expect("extrapolation variance at the near query");
+    let var_near =
+        measure_jet_extrapolation_variance(near, eps_band, support_means, spectrum, coverage_floor)
+            .expect("extrapolation variance at the near query");
     let var_far =
         measure_jet_extrapolation_variance(far, eps_band, support_means, spectrum, coverage_floor)
             .expect("extrapolation variance at the far query");
@@ -354,9 +352,15 @@ fn near_miss_decoupling_holds_in_simple_mode() {
     });
 
     // SIMPLE-mode default τ: only the affine-order ridge toll may survive.
-    let q_default =
-        measure_jet_energy_form(centers.view(), masses.view(), &band, ORDER_S, ALPHA, TAU_DEFAULT)
-            .expect("default-τ energy form");
+    let q_default = measure_jet_energy_form(
+        centers.view(),
+        masses.view(),
+        &band,
+        ORDER_S,
+        ALPHA,
+        TAU_DEFAULT,
+    )
+    .expect("default-τ energy form");
     let e_offset = quadratic_form(&q_default, &offset);
     let e_checker = quadratic_form(&q_default, &checker);
 

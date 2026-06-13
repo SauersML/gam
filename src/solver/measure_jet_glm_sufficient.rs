@@ -252,11 +252,7 @@ mod tests {
         out
     }
 
-    fn assert_matrix_close(
-        actual: ndarray::ArrayView2<'_, f64>,
-        expected: &Array2<f64>,
-        eps: f64,
-    ) {
+    fn assert_matrix_close(actual: ndarray::ArrayView2<'_, f64>, expected: &Array2<f64>, eps: f64) {
         assert_eq!(actual.nrows(), expected.nrows());
         assert_eq!(actual.ncols(), expected.ncols());
         for row in 0..expected.nrows() {
@@ -272,11 +268,7 @@ mod tests {
         }
     }
 
-    fn assert_vector_close(
-        actual: ndarray::ArrayView1<'_, f64>,
-        expected: &Array1<f64>,
-        eps: f64,
-    ) {
+    fn assert_vector_close(actual: ndarray::ArrayView1<'_, f64>, expected: &Array1<f64>, eps: f64) {
         assert_eq!(actual.len(), expected.len());
         for index in 0..expected.len() {
             let diff = (actual[index] - expected[index]).abs();

@@ -9,7 +9,9 @@ use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::rmse;
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -38,8 +40,7 @@ fn latent_to_coords(t: f64) -> [f64; 3] {
 }
 
 fn truth(t: f64) -> f64 {
-    (2.0 * std::f64::consts::PI * t).sin()
-        + 0.5 * (4.0 * std::f64::consts::PI * t).cos()
+    (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (4.0 * std::f64::consts::PI * t).cos()
 }
 
 fn build_dataset(n: usize, sigma: f64, seed: u64) -> gam::data::EncodedDataset {
@@ -80,8 +81,8 @@ fn fit_and_time(
         ..FitConfig::default()
     };
     let start = Instant::now();
-    let result = fit_from_formula(&formula, ds, &cfg)
-        .unwrap_or_else(|e| panic!("gam fit '{formula}': {e}"));
+    let result =
+        fit_from_formula(&formula, ds, &cfg).unwrap_or_else(|e| panic!("gam fit '{formula}': {e}"));
     let elapsed = start.elapsed();
     let FitResult::Standard(fit) = result else {
         panic!("expected standard fit for '{formula}'");
