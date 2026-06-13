@@ -65,6 +65,7 @@ use crate::terms::basis::{
     create_basis, create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     periodic_bspline_first_derivative_nd,
 };
+use crate::terms::sae_chart_canonicalization::CanonicalChartTopology;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, Axis};
 use statrs::distribution::{ContinuousCDF, Normal};
@@ -128,6 +129,31 @@ impl ChartTopology {
                 }
             }
         }
+    }
+}
+
+/// Bridge from the SAE canonicalization topology to the transport topology.
+///
+/// `CanonicalChartTopology::Circle { period }` becomes a `Circle` chart whose
+/// coordinates are interpreted on `[0, period)` — the transport module's period
+/// is fixed to `TAU` (angles in radians), so the conversion rescales by mapping
+/// the period-normalized angle `t / period * TAU` at the call site. The caller
+/// must apply this rescaling before handing coordinates to `fit_transport_map`.
+///
+/// `CanonicalChartTopology::Interval` becomes `Interval { lo: 0.0, hi: 1.0 }`
+/// (the canonical unit-speed interval span set by the canonicalization step).
+impl From<&CanonicalChartTopology> for ChartTopology {
+    fn from(src: &CanonicalChartTopology) -> Self {
+        match *src {
+            CanonicalChartTopology::Circle { .. } => ChartTopology::Circle,
+            CanonicalChartTopology::Interval => ChartTopology::Interval { lo: 0.0, hi: 1.0 },
+        }
+    }
+}
+
+impl From<CanonicalChartTopology> for ChartTopology {
+    fn from(src: CanonicalChartTopology) -> Self {
+        ChartTopology::from(&src)
     }
 }
 
