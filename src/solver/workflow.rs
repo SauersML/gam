@@ -1137,6 +1137,16 @@ pub enum FitResult {
     LatentSurvival(LatentSurvivalTermFitResult),
     LatentBinary(LatentBinaryTermFitResult),
     TransformationNormal(TransformationNormalFitResult),
+    /// Exact O(n) state-space cubic/linear/quintic smoothing-spline scan
+    /// (#1030/#1034). A scan-bearing model IS a Gaussian-identity model with a
+    /// different (exact) representation: rather than a dense design + coefficient
+    /// vector it carries the Durbin–Koopman smoother posterior directly (knots,
+    /// smoothed states, pointwise variances, σ², log λ, exact diffuse-REML EDF,
+    /// and an exact per-row `predict`). Library callers that want the fitted
+    /// posterior get it here without paying the dense O(n·k²)+O(k³) route; the
+    /// CLI/FFI save paths build the persistence payload from the same
+    /// `SplineScanFit` via `assemble_spline_scan_payload`.
+    SplineScan(crate::solver::spline_scan::SplineScanFit),
 }
 
 /// Result of a dispersion-channel GAMLSS location-scale fit (#913). Wraps the
@@ -4266,6 +4276,27 @@ pub fn fit_from_formula(
     config: &FitConfig,
 ) -> Result<FitResult, WorkflowError> {
     let mat = materialize(formula, data, config)?;
+    // Exact O(n) spline-scan fast path (#1030): when the materialized request
+    // is the single 1-D Gaussian-identity penalized-smooth shape the
+    // state-space scan solves exactly, route through it and return the
+    // scan-bearing model directly — the same penalized posterior at O(n) per
+    // λ-trial instead of the dense design/Gram route. Detection is structural
+    // and conservative (see `spline_scan_fast_path`); every other shape falls
+    // through to the dense `fit_model` path unchanged. Mirrors the CLI
+    // (main.rs run_fit) and FFI consumers, which build the persistence payload
+    // from this same `SplineScanFit`.
+    if let FitRequest::Standard(request) = &mat.request {
+        if let Some(inputs) = spline_scan_fast_path(request) {
+            let scan = crate::solver::spline_scan::fit_spline_scan(
+                &inputs.x,
+                &inputs.y,
+                &inputs.w,
+                inputs.order,
+            )
+            .map_err(|reason| WorkflowError::IntegrationFailed { reason })?;
+            return Ok(FitResult::SplineScan(scan));
+        }
+    }
     // `fit_model` already returns `WorkflowError` end-to-end; propagate it
     // directly instead of stringifying then re-wrapping.
     fit_model(mat.request)
