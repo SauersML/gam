@@ -25,8 +25,6 @@ use std::sync::{Mutex, Once};
 
 const N: usize = 400;
 
-// ── Capturing logger: stores every formatted record so the test can parse the
-//    [OUTER-FD-AUDIT] verdict lines. ──
 static CAPTURE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 struct CapturingLogger;
@@ -34,9 +32,7 @@ impl log::Log for CapturingLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         metadata.level() <= log::Level::Info
     }
-AEOF
-B64A=$(base64 < /tmp/en_a.txt); B64R=$(base64 < /tmp/en_r.txt)
-/Users/user/msi-node/msi "cd /tmp/survfd && echo '$B64A'|base64 -d>/tmp/ena.txt && echo '$B64R'|base64 -d>/tmp/enr.txt && python3 /tmp/apply_replace.py tests/survival_marginal_slope_outer_gradient_fd_1040.rs /tmp/ena.txt /tmp/enr.txt" > /tmp/applyen.log 2>&1; cat /tmp/applyen.log    fn log(&self, record: &log::Record<'_>) {
+    fn log(&self, record: &log::Record<'_>) {
         let line = format!("{}", record.args());
         if line.contains("OUTER-FD-AUDIT") {
             if let Ok(mut g) = CAPTURE.lock() {
@@ -45,9 +41,9 @@ B64A=$(base64 < /tmp/en_a.txt); B64R=$(base64 < /tmp/en_r.txt)
             eprintln!("{line}");
         } else if line.contains("survival-marginal-slope/outer")
             || line.contains("[joint-newton-tr]")
-            || line.contains("seed")
+            || line.contains("KAPPA-PHASE")
+            || line.contains("startup")
         {
-            // Light progress trace so a non-terminating fit is visible.
             eprintln!("[trace] {line}");
         }
     }
@@ -85,7 +81,6 @@ fn next_gauss(state: &mut u64) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 fn next_gamma_alpha_ge_one(state: &mut u64, alpha: f64, scale: f64) -> f64 {
-    // Marsaglia-Tsang for alpha >= 1.
     let d = alpha - 1.0 / 3.0;
     let c = 1.0 / (9.0 * d).sqrt();
     loop {
@@ -171,11 +166,19 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
         .expect("encode small survival marginal-slope dataset")
 }
 
-/// Parse the worst per-coordinate analytic−FD gap and which block it lands in.
+fn field(line: &str, key: &str) -> String {
+    match line.find(key) {
+        Some(p) => {
+            let rest = &line[p + key.len()..];
+            rest.split_whitespace().next().unwrap_or("").to_string()
+        }
+        None => String::new(),
+    }
+}
+
 fn parse_components(lines: &[String]) -> Vec<(String, usize, f64, f64, f64)> {
     let mut out = Vec::new();
     for l in lines {
-        // [OUTER-FD-AUDIT/ctx] block=rho[0] i=0 analytic=.. fd=.. gap=.. ratio=..
         if !l.contains(" analytic=") || !l.contains(" fd=") || !l.contains(" gap=") {
             continue;
         }
@@ -191,16 +194,6 @@ fn parse_components(lines: &[String]) -> Vec<(String, usize, f64, f64, f64)> {
     out
 }
 
-fn field(line: &str, key: &str) -> String {
-    match line.find(key) {
-        Some(p) => {
-            let rest = &line[p + key.len()..];
-            rest.split_whitespace().next().unwrap_or("").to_string()
-        }
-        None => String::new(),
-    }
-}
-
 fn run_basis(basis_term: &str) {
     init();
     if let Ok(mut g) = CAPTURE.lock() {
@@ -213,8 +206,6 @@ fn run_basis(basis_term: &str) {
         z_column: Some("prs_z".to_string()),
         logslope_formula: Some(basis_term.to_string()),
         baseline_target: "linear".to_string(),
-        // Cap the outer loop hard: the FD audit runs at θ₀ before the loop, so a
-        // low cap keeps the test cheap even if the loop would not terminate.
         outer_max_iter: Some(2),
         gpu_policy: if cfg!(target_os = "macos") {
             gam::gpu::GpuPolicy::Off
@@ -243,8 +234,6 @@ fn run_basis(basis_term: &str) {
         lines
     );
 
-    // Report the worst gap and its block (the time-wiggle/marginal/logslope
-    // localization the fork hinges on).
     let worst = comps
         .iter()
         .max_by(|a, b| a.4.partial_cmp(&b.4).unwrap_or(std::cmp::Ordering::Equal))
@@ -258,8 +247,6 @@ fn run_basis(basis_term: &str) {
         eprintln!("[FD-DIAG] {v}");
     }
 
-    // Self-consistency: every captured analytic and fd value is finite (a NaN/inf
-    // gradient would itself be a distinct bug, surfaced here rather than hidden).
     for (block, i, a, fd, _gap) in &comps {
         assert!(
             a.is_finite() && fd.is_finite(),
