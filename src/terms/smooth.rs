@@ -1,6 +1,7 @@
 use crate::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
-    BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeResult,
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
+    BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError, BasisMetadata,
+    BasisPsiDerivativeResult,
     BasisPsiSecondDerivativeResult, BasisWorkspace, CenterStrategy, CenterStrategyKind,
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, DuchonBasisSpec,
     KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability, MeasureJetBasisSpec,
@@ -2803,6 +2804,15 @@ impl SpatialLogKappaCoords {
     ) -> Self {
         let mut out = Array1::<f64>::zeros(term_indices.len());
         for (slot, &term_idx) in term_indices.iter().enumerate() {
+            // Constant-curvature: the single ψ slot is the raw signed κ, seeded
+            // from the spec (default κ = 0). The −ln(length_scale) convention is
+            // log-κ semantics and must not touch the raw-κ coordinate; the κ
+            // window projection happens later via `clamp_to_bounds`. Mirrors the
+            // aniso constructor's κ branch.
+            if let Some(cc) = constant_curvature_term_spec(spec, term_idx) {
+                out[slot] = cc.kappa;
+                continue;
+            }
             let length_scale = get_spatial_length_scale(spec, term_idx)
                 .unwrap_or(options.min_length_scale)
                 .clamp(options.min_length_scale, options.max_length_scale);
