@@ -1,4 +1,4 @@
-//! Regression gate for #1039: measure-jet SIMPLE mode must keep the same outer
+//! Regression gate for #1039: measure-jet single-scale mode must keep the same outer
 //! footprint as Duchon/Matern. With 16 centers it uses one fused penalty and no
 //! psi dials, so this file checks both speed and accuracy parity on a cheap
 //! Gaussian low-dimensional-manifold problem. The 2.0x speed bound guards
@@ -114,7 +114,7 @@ fn held_out_rmse(
 }
 
 #[test]
-fn measure_jet_simple_mode_is_speed_competitive() {
+fn measure_jet_single_scale_mode_is_speed_competitive() {
     init_parallelism();
     let ds = build_dataset(N_TRAIN, SIGMA, TRAIN_SEED);
 
@@ -131,18 +131,18 @@ fn measure_jet_simple_mode_is_speed_competitive() {
     println!("[mjs-perf] mjs={mjs_secs:.3}s matern={matern_secs:.3}s duchon={duchon_secs:.3}s");
     assert!(
         mjs_secs <= 2.0 * matern_secs,
-        "measure-jet simple mode speed parity failed vs matern: mjs={mjs_secs:.3}s \
+        "measure-jet single-scale mode speed parity failed vs matern: mjs={mjs_secs:.3}s \
          matern={matern_secs:.3}s duchon={duchon_secs:.3}s"
     );
     assert!(
         mjs_secs <= 2.0 * duchon_secs,
-        "measure-jet simple mode speed parity failed vs duchon: mjs={mjs_secs:.3}s \
+        "measure-jet single-scale mode speed parity failed vs duchon: mjs={mjs_secs:.3}s \
          matern={matern_secs:.3}s duchon={duchon_secs:.3}s"
     );
 }
 
 #[test]
-fn measure_jet_simple_mode_accuracy_parity() {
+fn measure_jet_single_scale_mode_accuracy_parity() {
     init_parallelism();
     let ds = build_dataset(N_TRAIN, SIGMA, TRAIN_SEED);
     let test_latents = build_test_latents(N_TEST, TEST_SEED);
@@ -162,7 +162,7 @@ fn measure_jet_simple_mode_accuracy_parity() {
     let baseline = matern_rmse.min(duchon_rmse);
     assert!(
         mjs_rmse <= 1.10 * baseline,
-        "measure-jet simple mode accuracy parity failed: mjs={mjs_rmse:.5} \
+        "measure-jet single-scale mode accuracy parity failed: mjs={mjs_rmse:.5} \
          matern={matern_rmse:.5} duchon={duchon_rmse:.5} baseline={baseline:.5}"
     );
 }
