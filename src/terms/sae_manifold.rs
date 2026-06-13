@@ -3532,12 +3532,20 @@ impl SaeManifoldTerm {
                 ard_variances,
                 lowering_error,
                 // #1019: post-fit chart canonicalization (arc length for
-                // d = 1, isometry-flow for d = 2 torus) pins the chart; the
+                // d = 1, isometry-flow for d = 2 torus, flat-reference
+                // isometry-flow for d = 2 free/patch atoms) pins the chart; the
                 // certificate downgrades this atom's chart freedom to the
                 // finite isometry group with PinnedByCanonicalization
                 // provenance.
                 chart_canonicalized: atom.chart_canonicalized
-                    && (d == 1 || (d == 2 && matches!(atom.basis_kind, SaeAtomBasisKind::Torus))),
+                    && (d == 1
+                        || (d == 2
+                            && matches!(
+                                atom.basis_kind,
+                                SaeAtomBasisKind::Torus
+                                    | SaeAtomBasisKind::Duchon
+                                    | SaeAtomBasisKind::EuclideanPatch
+                            ))),
             });
             atom_offsets.push(cursor);
             atom_axis_dim.push(d);
@@ -10405,10 +10413,14 @@ impl SaeManifoldTerm {
         };
         /// Which canonical-representative construction applies to an atom:
         /// arc length for `d = 1` (#1019 stage 1), the minimum-isometry-defect
-        /// flow for `d = 2` torus atoms (#1019 stage 2).
+        /// flow for `d = 2` torus atoms (#1019 stage 2), and the same flow
+        /// against the flat reference for `d = 2` free/patch atoms (#1019
+        /// free-chart arm — a contractible Euclidean patch admits a global
+        /// polynomial flow basis, no hairy-ball obstruction).
         enum ChartPlan {
             UnitSpeed(CanonicalChartTopology),
             TorusFlow { period: f64 },
+            PatchFlow,
         }
         let mut eligible: Vec<(usize, ChartPlan)> = Vec::new();
         for atom_idx in 0..self.k_atoms() {
@@ -10432,6 +10444,13 @@ impl SaeManifoldTerm {
                 // #1019 stage 2: d = 2 torus atoms pin to the
                 // minimum-isometry-defect flow representative.
                 (SaeAtomBasisKind::Torus, 2) => ChartPlan::TorusFlow { period: 1.0 },
+                // #1019 free-chart arm: d = 2 free/patch (Euclidean-patch)
+                // atoms admit a global polynomial flow basis (contractible —
+                // no hairy ball), so they pin to the flat uniform-speed
+                // minimum-anisotropy-defect representative.
+                (SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch, 2) => {
+                    ChartPlan::PatchFlow
+                }
                 // d = 1 never matches Sphere; Precomputed bases carry no
                 // evaluator semantics to re-express the image in; S² has no
                 // global pole-free flow basis (hairy ball), so sphere charts
@@ -10550,6 +10569,7 @@ impl SaeManifoldTerm {
                 ChartPlan::TorusFlow { period } => {
                     self.canonicalize_atom_torus_flow_chart(*atom_idx, *period)
                 }
+                ChartPlan::PatchFlow => self.canonicalize_atom_patch_flow_chart(*atom_idx),
             };
             match outcome {
                 Ok(changed) => any_changed |= changed,
@@ -10753,6 +10773,89 @@ impl SaeManifoldTerm {
         // Commit: canonical coordinates, basis, decoder, and the congruence-
         // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as the affine
         // gauge pass and the d = 1 path).
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
+        let flat = Array1::from_iter(new_coords.iter().copied());
+        self.assignment.coords[atom_idx].set_flat(flat.view());
+        let atom = &mut self.atoms[atom_idx];
+        atom.basis_values = new_phi;
+        atom.basis_jacobian = new_jet;
+        atom.decoder_coefficients = repar.new_decoder;
+        atom.smooth_penalty = transport_smooth_penalty_for_decoder(
+            repar.decoder_transport.view(),
+            old_smooth_penalty.view(),
+        )?;
+        atom.chart_canonicalized = true;
+        Ok(true)
+    }
+
+    /// Apply the minimum-isometry-defect flow reparameterization against the
+    /// flat reference (#1019 free-chart arm) to one eligible `d = 2` free/patch
+    /// (Euclidean-patch) atom. Returns `Ok(true)` when the atom was
+    /// canonicalized, `Ok(false)` on an honest skip (degenerate or
+    /// already-canonical chart, only folded/non-improving flow candidates,
+    /// basis not closed under the reparameterization, or per-row image drift
+    /// above tolerance).
+    fn canonicalize_atom_patch_flow_chart(&mut self, atom_idx: usize) -> Result<bool, String> {
+        use crate::terms::sae_chart_canonicalization::{
+            CHART_RECOMPOSITION_REL_TOL, patch_isometry_flow_reparameterization,
+        };
+        let n = self.n_obs();
+        if n == 0 {
+            return Ok(false);
+        }
+        let Some(evaluator) = self.atoms[atom_idx].basis_evaluator.as_ref().cloned() else {
+            return Ok(false);
+        };
+        let coords = self.assignment.coords[atom_idx].as_matrix();
+        let Some(repar) = patch_isometry_flow_reparameterization(
+            evaluator.as_ref(),
+            self.atoms[atom_idx].decoder_coefficients.view(),
+            coords.view(),
+        )?
+        else {
+            return Ok(false);
+        };
+
+        // Per-row basis/jet at the canonical coordinates (eligibility pins
+        // `homotopy_eta == 1.0`, so the plain evaluate IS the dialed path).
+        let new_coords = repar.new_row_coords.clone();
+        let (new_phi, new_jet) = evaluator.evaluate(new_coords.view())?;
+        if new_phi.dim() != self.atoms[atom_idx].basis_values.dim()
+            || new_jet.dim() != self.atoms[atom_idx].basis_jacobian.dim()
+        {
+            return Err(format!(
+                "SaeManifoldTerm::canonicalize_atom_patch_flow_chart: canonical basis {:?} / jet {:?} must match the fitted shapes {:?} / {:?}",
+                new_phi.dim(),
+                new_jet.dim(),
+                self.atoms[atom_idx].basis_values.dim(),
+                self.atoms[atom_idx].basis_jacobian.dim()
+            ));
+        }
+
+        // Per-row image-invariance gate: the audit grid certified the image at
+        // the transport nodes; this certifies it at the coordinates the fit
+        // actually sits on. Same honest-fallback contract as the torus path.
+        let old_fit = fast_ab(
+            &self.atoms[atom_idx].basis_values,
+            &self.atoms[atom_idx].decoder_coefficients,
+        );
+        let new_fit = fast_ab(&new_phi, &repar.new_decoder);
+        let mut fit_scale = 0.0_f64;
+        let mut max_abs = 0.0_f64;
+        for (a, b) in old_fit.iter().zip(new_fit.iter()) {
+            fit_scale = fit_scale.max(a.abs()).max(b.abs());
+            max_abs = max_abs.max((a - b).abs());
+        }
+        if !(fit_scale.is_finite() && max_abs.is_finite()) {
+            return Ok(false);
+        }
+        if fit_scale > 0.0 && max_abs > CHART_RECOMPOSITION_REL_TOL * fit_scale {
+            return Ok(false);
+        }
+
+        // Commit: canonical coordinates, basis, decoder, and the congruence-
+        // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as every other
+        // canonicalization path).
         let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
         let flat = Array1::from_iter(new_coords.iter().copied());
         self.assignment.coords[atom_idx].set_flat(flat.view());

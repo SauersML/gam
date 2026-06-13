@@ -43,12 +43,29 @@
 //! exact-LS recomposition — and the same honesty gate — as the `d = 1` path
 //! (shared helper [`recompose_decoder_exact_ls`]).
 //!
+//! #1019 free-chart arm (`d = 2`, free/patch): a contractible Euclidean-patch
+//! atom (Duchon / EuclideanPatch basis kind) admits a **global** truncated
+//! flow basis — polynomial vector fields `v_{c,(a,b)}(t) = e_c · u₀^a u₁^b`
+//! on the normalized patch box ([`FreePatchFlowBasis`]) — with no hairy-ball
+//! obstruction (a contractible patch carries nowhere-vanishing vector fields).
+//! So unlike the sphere it is genuinely MINIMIZED, not merely measured: the
+//! isometry defect is descended against the flat reference `g_ref = I`
+//! ([`patch_isometry_flow_reparameterization`]), pinning the uniform-speed
+//! (minimum-anisotropy) chart, with the residual chart freedom downgraded to
+//! the flat isometry group `O(2) ⋉ ℝ²` and provenance
+//! `PinnedByCanonicalization`. The torus, free-patch, and sphere arms share one
+//! pullback-metric extraction ([`extract_pullback_metric_d2`]) and the two
+//! flow-pinned arms share one exact Gauss–Newton core
+//! ([`minimize_isometry_defect_flow`]).
+//!
 //! `S²` (sphere atoms) is the remaining #1019 stage-2 gap, refused on
 //! purpose: by the hairy-ball theorem every smooth tangent vector field on
 //! `S²` has zeros, so there is **no global pole-free flow basis** with which
-//! to parameterize `Diff(S²)` the way the torus path does. Canonicalizing
-//! sphere charts needs a genuinely different representative (harmonic-map /
-//! Plateau-type); sphere atoms are left on their fitted charts.
+//! to parameterize `Diff(S²)` the way the torus and free-patch paths do.
+//! Canonicalizing sphere charts needs a genuinely different representative
+//! (harmonic-map / Plateau-type); sphere atoms are left on their fitted
+//! charts, with the round-sphere isometry DEFECT reported as an honest
+//! measurement ([`sphere_chart_isometry_defect`]).
 
 use faer::Side as FaerSide;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -1103,6 +1120,420 @@ pub fn torus_isometry_flow_reparameterization(
     }))
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// #1019 stage 2 — d = 2 free/patch (Euclidean-patch) isometry-flow chart
+// canonicalization
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Highest total polynomial degree of the truncated vector-field flow basis on
+/// a `d = 2` Euclidean patch: monomial modes `u₀^a · u₁^b` with
+/// `1 ≤ a+b ≤ PATCH_FLOW_MAX_DEGREE`.
+///
+/// The degree is **1** (affine flows) by exact-image-freezing necessity, not
+/// timidity. The decoder lives in a polynomial basis of some fixed degree `d_b`
+/// (the Duchon / EuclideanPatch monomial families), and the image is frozen by
+/// re-expressing `γ̃ = γ ∘ φ⁻¹` in that SAME basis. Composing a degree-`d_b`
+/// decoder image with a degree-`d_f` flow yields a degree-`d_b·d_f` polynomial,
+/// which is back in the decoder basis **iff `d_f = 1`** (an affine flow leaves
+/// the polynomial degree unchanged). A higher-degree flow would push `γ ∘ φ⁻¹`
+/// out of the basis, the exact-LS recomposition gate
+/// ([`recompose_decoder_exact_ls`]) would see a large image drift, and the
+/// canonicalization would be honestly REFUSED — so a degree > 1 flow basis
+/// could never actually commit a chart here. The affine family is exactly the
+/// one that keeps the image-freezing exact, and it captures the dominant patch
+/// chart dishonesty: an anisotropic / sheared / rotated affine reparameteriza-
+/// tion (the `d = 2` analogue of the `d = 1` non-uniform-speed pathology).
+///
+/// The monomials are `(1, 0)` and `(0, 1)` per component, both components ⇒
+/// `2 · 2 = 4` flow coefficients. The constant `(0, 0)` is EXCLUDED: a uniform
+/// translation is an exact isometry of the flat patch, so it leaves the defect
+/// invariant and would only insert a null direction into the Gauss–Newton
+/// system. The 4 linear modes span the full `GL(2)` action on the chart
+/// (rotation / shear / anisotropic scale); the rotation and global-scale
+/// sub-directions are defect-null and the Levenberg damping absorbs them
+/// harmlessly.
+pub const PATCH_FLOW_MAX_DEGREE: usize = 1;
+
+/// Diffeomorphism floor `δ` for the free-patch flow — identical contract to
+/// [`TORUS_FLOW_DIFFEO_MIN_DET`]: a candidate with `det Dφ_θ ≤ δ` anywhere on
+/// the check grid is rejected, so the optimizer can never walk through a fold.
+pub const PATCH_FLOW_DIFFEO_MIN_DET: f64 = 0.1;
+
+/// Per-axis node count of the free-patch diffeomorphism-guard check grid. With
+/// the affine flow basis (`PATCH_FLOW_MAX_DEGREE = 1`) the Jacobian `Dφ_θ` is
+/// CONSTANT over the patch, so `det Dφ_θ` is a single value and any grid is
+/// exact; 48 nodes per axis keep the guard robust if the degree ever rises.
+/// The guard grid spans the normalized patch box `[-1, 1]²` slightly widened to
+/// `[-1.1, 1.1]²` so a fold just outside the data hull is still refused.
+pub const PATCH_FLOW_GUARD_NODES_PER_AXIS: usize = 48;
+
+/// Minimum per-axis node count of the free-patch decoder-recomposition audit
+/// grid (scaled up with the basis width like the torus path).
+pub const PATCH_TRANSPORT_MIN_NODES_PER_AXIS: usize = 48;
+
+/// Identity of one free-patch flow mode (for tests / diagnostics): which
+/// coordinate component the vector field moves and its monomial exponents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchFlowModeKey {
+    pub component: usize,
+    pub exps: (usize, usize),
+}
+
+/// Truncated polynomial vector-field basis on a `d = 2` Euclidean patch,
+/// `v_{c,(a,b)}(t) = e_c · u₀^a · u₁^b` where `u = (t − center) ⊙ inv_half ∈
+/// [−1, 1]²` is the affinely-normalized patch coordinate (conditioning: the raw
+/// `t` box can be far from `[−1, 1]`). Because the patch is **contractible**
+/// there is no hairy-ball obstruction — these are smooth global vector fields,
+/// so the flow `φ_θ(t) = t + Σ_k θ_k v_k(t)` parameterizes a neighborhood of
+/// the identity in `Diff(patch)` exactly the way the Fourier basis does on the
+/// torus, and any such map with `det Dφ > 0` on the patch is a diffeomorphism
+/// onto its image. The reference metric is the flat `g_ref = I` (uniform-speed
+/// coordinates), so the canonical chart is the minimum-anisotropy-defect one.
+#[derive(Debug, Clone)]
+pub struct FreePatchFlowBasis {
+    center: [f64; 2],
+    /// `2 / span` per axis: the Jacobian `∂u/∂t` of the normalization.
+    inv_half: [f64; 2],
+    /// Monomial exponents `(a, b)` with `1 ≤ a+b ≤ PATCH_FLOW_MAX_DEGREE`.
+    exps: Vec<(usize, usize)>,
+}
+
+impl FreePatchFlowBasis {
+    /// Build the basis for the patch box `[lo, hi]` per axis. Returns an error
+    /// when an axis has collapsed (`hi ≤ lo`) — a patch with no extent in some
+    /// direction has no honest flat chart.
+    pub fn new(lo: [f64; 2], hi: [f64; 2]) -> Result<Self, String> {
+        let mut center = [0.0_f64; 2];
+        let mut inv_half = [0.0_f64; 2];
+        for axis in 0..2 {
+            let span = hi[axis] - lo[axis];
+            let scale = lo[axis].abs().max(hi[axis].abs()).max(1.0);
+            if !(span.is_finite() && span > 1.0e-12 * scale) {
+                return Err(format!(
+                    "FreePatchFlowBasis: patch axis {axis} has collapsed extent [{}, {}]",
+                    lo[axis], hi[axis]
+                ));
+            }
+            center[axis] = 0.5 * (lo[axis] + hi[axis]);
+            inv_half[axis] = 2.0 / span;
+        }
+        let mut exps = Vec::new();
+        for total in 1..=PATCH_FLOW_MAX_DEGREE {
+            for a in 0..=total {
+                let b = total - a;
+                exps.push((a, b));
+            }
+        }
+        Ok(Self {
+            center,
+            inv_half,
+            exps,
+        })
+    }
+
+    /// Number of flow coefficients `θ`: 2 components × #monomials.
+    pub fn dim(&self) -> usize {
+        2 * self.exps.len()
+    }
+
+    /// Mode identities in coefficient order (for each component, each monomial).
+    /// This IS the `θ` index layout — [`Self::mode_samples`] matches it.
+    pub fn mode_layout(&self) -> Vec<PatchFlowModeKey> {
+        let mut keys = Vec::with_capacity(self.dim());
+        for component in 0..2 {
+            for &exps in &self.exps {
+                keys.push(PatchFlowModeKey { component, exps });
+            }
+        }
+        keys
+    }
+
+    /// Normalized patch coordinate `u = (t − center) ⊙ inv_half`.
+    fn normalize(&self, t: [f64; 2]) -> [f64; 2] {
+        [
+            (t[0] - self.center[0]) * self.inv_half[0],
+            (t[1] - self.center[1]) * self.inv_half[1],
+        ]
+    }
+
+    /// Sample every mode (value + gradient **in `t`**) at chart point `t`, in
+    /// `θ` order. The monomial `f(u) = u₀^a · u₁^b` has `∂f/∂t_d =
+    /// (∂f/∂u_d)·(∂u_d/∂t_d) = (∂f/∂u_d)·inv_half[d]` by the chain rule, so the
+    /// returned gradient is already in the chart coordinate the flow Jacobian
+    /// `Dφ = I + Σ θ_k ∂v_k/∂t` lives in.
+    pub fn mode_samples(&self, t: [f64; 2]) -> Vec<FlowModeSample> {
+        let u = self.normalize(t);
+        let mut out = Vec::with_capacity(self.dim());
+        for component in 0..2 {
+            for &(a, b) in &self.exps {
+                let value = pow_u(u[0], a) * pow_u(u[1], b);
+                // ∂/∂u₀ (u₀^a u₁^b) = a·u₀^{a−1}·u₁^b ; ∂/∂u₁ = b·u₀^a·u₁^{b−1}.
+                let du0 = if a == 0 {
+                    0.0
+                } else {
+                    a as f64 * pow_u(u[0], a - 1) * pow_u(u[1], b)
+                };
+                let du1 = if b == 0 {
+                    0.0
+                } else {
+                    b as f64 * pow_u(u[0], a) * pow_u(u[1], b - 1)
+                };
+                out.push(FlowModeSample {
+                    component,
+                    value,
+                    grad: [du0 * self.inv_half[0], du1 * self.inv_half[1]],
+                });
+            }
+        }
+        out
+    }
+
+    /// `φ_θ(t) = t + Σ_k θ_k v_k(t)` (no wrap — the patch is not periodic).
+    pub fn map_point(&self, theta: &[f64], t: [f64; 2]) -> [f64; 2] {
+        assert_eq!(theta.len(), self.dim(), "FreePatchFlowBasis: theta length");
+        let mut out = t;
+        for (coef, sample) in theta.iter().zip(self.mode_samples(t)) {
+            out[sample.component] += coef * sample.value;
+        }
+        out
+    }
+
+    /// Flow Jacobian `Dφ_θ(t) = I + Σ_k θ_k Dv_k(t)`, row-major.
+    pub fn flow_jacobian(&self, theta: &[f64], t: [f64; 2]) -> [[f64; 2]; 2] {
+        assert_eq!(theta.len(), self.dim(), "FreePatchFlowBasis: theta length");
+        let mut jac = [[1.0, 0.0], [0.0, 1.0]];
+        for (coef, sample) in theta.iter().zip(self.mode_samples(t)) {
+            jac[sample.component][0] += coef * sample.grad[0];
+            jac[sample.component][1] += coef * sample.grad[1];
+        }
+        jac
+    }
+
+    /// Minimum of `det Dφ_θ` over the widened normalized check grid `[−1.1,
+    /// 1.1]²` (in `t` coordinates) — the diffeomorphism guard's decision
+    /// quantity. The grid is built in `t` by inverting the normalization.
+    pub fn min_jacobian_det_on_grid(&self, theta: &[f64]) -> f64 {
+        let nodes = PATCH_FLOW_GUARD_NODES_PER_AXIS;
+        let mut min_det = f64::INFINITY;
+        for i in 0..nodes {
+            for j in 0..nodes {
+                // u ∈ [−1.1, 1.1] per axis; t = center + u / inv_half.
+                let u0 = -1.1 + 2.2 * i as f64 / (nodes - 1) as f64;
+                let u1 = -1.1 + 2.2 * j as f64 / (nodes - 1) as f64;
+                let t = [
+                    self.center[0] + u0 / self.inv_half[0],
+                    self.center[1] + u1 / self.inv_half[1],
+                ];
+                let jac = self.flow_jacobian(theta, t);
+                let det = jac[0][0] * jac[1][1] - jac[0][1] * jac[1][0];
+                min_det = min_det.min(det);
+            }
+        }
+        min_det
+    }
+}
+
+/// `u^k` for small non-negative integer `k` (avoids `f64::powi`'s branch on the
+/// hot mode-sampling path; `k ≤ PATCH_FLOW_MAX_DEGREE`).
+fn pow_u(u: f64, k: usize) -> f64 {
+    let mut acc = 1.0_f64;
+    for _ in 0..k {
+        acc *= u;
+    }
+    acc
+}
+
+/// The exact, image-frozen minimum-isometry-defect flow reparameterization of
+/// one `d = 2` **free/patch** (Euclidean-patch) atom.
+#[derive(Debug, Clone)]
+pub struct PatchIsometryFlowReparameterization {
+    /// Canonical per-row coordinates `t̃_i = φ_θ(t_i)`, shape `(n, 2)`.
+    pub new_row_coords: Array2<f64>,
+    /// Recomposed decoder `B̃ = T · B`, shape `(m, p)` — exact LS refit of the
+    /// original decoded image on the audit grid against the basis at the
+    /// transported grid (so `γ̃ = γ ∘ φ⁻¹` without ever forming `φ⁻¹`).
+    pub new_decoder: Array2<f64>,
+    /// The `(m, m)` basis transport `T` with `Φ(φ(u)) · T ≈ Φ(u)` on the audit
+    /// grid — the congruence object that transports the smoothness Gram.
+    pub decoder_transport: Array2<f64>,
+    /// Optimal flow coefficients `θ` (layout per
+    /// [`FreePatchFlowBasis::mode_layout`]).
+    pub flow_theta: Vec<f64>,
+    /// Isometry defect `E(0)` of the fitted chart (identity flow).
+    pub defect_initial: f64,
+    /// Isometry defect `E(θ)` of the canonical chart. Strictly below
+    /// `defect_initial` (the pass refuses no-improvement flows).
+    pub defect_final: f64,
+    /// The profiled global metric scale `c` at the optimum (the canonical
+    /// chart's pullback metric is `≈ c·ḡ·I` — flat, uniform-speed).
+    pub profiled_metric_scale: f64,
+    /// `min det Dφ_θ` on the guard grid. Always `> PATCH_FLOW_DIFFEO_MIN_DET`
+    /// when `Some(..)` is returned — a folded chart is refused upstream.
+    pub min_flow_jacobian_det: f64,
+    /// Max-abs recomposition error on the audit grid, relative to the image
+    /// scale. Always `≤ CHART_RECOMPOSITION_REL_TOL` when `Some(..)`.
+    pub recomposition_residual: f64,
+}
+
+/// Compute the minimum-isometry-defect flow reparameterization of a fitted
+/// `d = 2` **free/patch** atom: the canonical per-row coordinates
+/// `t̃_i = φ_θ(t_i)` and the exactly-recomposed decoder.
+///
+/// This is the #1019 unblocked free-chart case the issue charter calls out: for
+/// a manifold patch (a contractible Euclidean-patch atom) a **global** truncated
+/// flow basis DOES exist (no hairy-ball obstruction — [`FreePatchFlowBasis`]),
+/// so the defect is genuinely MINIMIZED (not merely measured as on the sphere).
+/// The reference metric is the flat `g_ref = I`, so the canonical chart is the
+/// uniform-speed (minimum-anisotropy) one. Everything else — the scale-invariant
+/// isometry defect `E(θ) = Σ_i ‖A_iᵀA_i − c·Ĝ_i‖²_F`, the analytic profiled scale
+/// `c`, the exact Gauss–Newton, the `det Dφ > δ` diffeomorphism guard, and the
+/// exact-LS decoder transport with the [`CHART_RECOMPOSITION_REL_TOL`] honesty
+/// gate — is the SHARED machinery the torus path uses
+/// ([`minimize_isometry_defect_flow`], [`recompose_decoder_exact_ls`]); see
+/// [`torus_isometry_flow_reparameterization`] for the full derivation.
+///
+/// The residual chart freedom after pinning is the finite isometry group of the
+/// flat patch with the reference uniform metric: `O(2) ⋉ ℝ²` (rotation +
+/// reflection + translation) — reported on the certificate as the
+/// `PinnedByCanonicalization` residual gauge.
+///
+/// # Honest refusals (`Ok(None)`, never a lossy or folded swap)
+///
+/// * degenerate chart: empty rows/basis, non-finite coordinates, a collapsed
+///   coordinate box on some axis, or a rank-deficient pullback metric anywhere;
+/// * the optimizer finds no strict improvement over the identity flow (the
+///   fitted chart is already minimum-defect within the flow family);
+/// * every improving candidate violates the diffeomorphism guard;
+/// * the basis cannot absorb `γ ∘ φ⁻¹` within
+///   [`CHART_RECOMPOSITION_REL_TOL`] on the audit grid (shared gate).
+pub fn patch_isometry_flow_reparameterization(
+    evaluator: &dyn SaeBasisEvaluator,
+    decoder: ArrayView2<'_, f64>,
+    row_coords: ArrayView2<'_, f64>,
+) -> Result<Option<PatchIsometryFlowReparameterization>, String> {
+    let n = row_coords.nrows();
+    let m = decoder.nrows();
+    let p = decoder.ncols();
+    if row_coords.ncols() != 2 {
+        return Err(format!(
+            "patch_isometry_flow_reparameterization: expected (n, 2) row coordinates; got {:?}",
+            row_coords.dim()
+        ));
+    }
+    if n == 0 || m == 0 || p == 0 {
+        return Ok(None);
+    }
+    let mut lo = [f64::INFINITY; 2];
+    let mut hi = [f64::NEG_INFINITY; 2];
+    for row in 0..n {
+        for axis in 0..2 {
+            let t = row_coords[[row, axis]];
+            if !t.is_finite() {
+                return Ok(None);
+            }
+            lo[axis] = lo[axis].min(t);
+            hi[axis] = hi[axis].max(t);
+        }
+    }
+
+    // ── Fitted pullback metric, normalized against the flat reference I ──────
+    let Some((g_rows, g_bar)) = extract_pullback_metric_d2(
+        "patch_isometry_flow_reparameterization",
+        evaluator,
+        decoder,
+        row_coords,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some((ghat, ghat_norm_sq)) = flat_normalized_metric(&g_rows, g_bar) else {
+        return Ok(None);
+    };
+
+    // ── Flow basis + per-row mode samples ───────────────────────────────────
+    let basis = match FreePatchFlowBasis::new(lo, hi) {
+        Ok(basis) => basis,
+        // A collapsed patch axis: no honest flat chart — refuse, don't error.
+        Err(_) => return Ok(None),
+    };
+    let q = basis.dim();
+    let mut row_modes: Vec<Vec<FlowModeSample>> = Vec::with_capacity(n);
+    for row in 0..n {
+        row_modes.push(basis.mode_samples([row_coords[[row, 0]], row_coords[[row, 1]]]));
+    }
+
+    // ── Damped Gauss–Newton on θ (shared exact core) ────────────────────────
+    let Some(minimization) = minimize_isometry_defect_flow(
+        &row_modes,
+        &ghat,
+        ghat_norm_sq,
+        q,
+        PATCH_FLOW_DIFFEO_MIN_DET,
+        &|candidate: &[f64]| basis.min_jacobian_det_on_grid(candidate),
+    ) else {
+        return Ok(None);
+    };
+    let theta = minimization.theta;
+    let defect_initial = minimization.defect_initial;
+    let min_flow_jacobian_det = basis.min_jacobian_det_on_grid(&theta);
+    if !(min_flow_jacobian_det > PATCH_FLOW_DIFFEO_MIN_DET) {
+        return Ok(None);
+    }
+
+    // ── Decoder transport on the audit grid spanning the patch box ──────────
+    let axis_nodes = PATCH_TRANSPORT_MIN_NODES_PER_AXIS.max(3 * (m as f64).sqrt().ceil() as usize);
+    let grid_rows = axis_nodes * axis_nodes;
+    let mut grid = Array2::<f64>::zeros((grid_rows, 2));
+    let mut new_grid = Array2::<f64>::zeros((grid_rows, 2));
+    for i in 0..axis_nodes {
+        for j in 0..axis_nodes {
+            let idx = i * axis_nodes + j;
+            let u = [
+                lo[0] + (hi[0] - lo[0]) * i as f64 / (axis_nodes - 1) as f64,
+                lo[1] + (hi[1] - lo[1]) * j as f64 / (axis_nodes - 1) as f64,
+            ];
+            grid[[idx, 0]] = u[0];
+            grid[[idx, 1]] = u[1];
+            let mapped = basis.map_point(&theta, u);
+            new_grid[[idx, 0]] = mapped[0];
+            new_grid[[idx, 1]] = mapped[1];
+        }
+    }
+    let (grid_phi, grid_jet) = evaluator.evaluate(grid.view())?;
+    if grid_phi.ncols() != m || grid_jet.dim() != (grid_rows, m, 2) {
+        return Err(format!(
+            "patch_isometry_flow_reparameterization: evaluator returned basis {:?} / jet {:?} on the audit grid; expected width {m}, latent_dim 2",
+            grid_phi.dim(),
+            grid_jet.dim()
+        ));
+    }
+    let Some(recomposition) =
+        recompose_decoder_exact_ls(evaluator, decoder, grid_phi.view(), new_grid.view())?
+    else {
+        return Ok(None);
+    };
+
+    // ── Canonical per-row coordinates t̃_i = φ_θ(t_i) ────────────────────────
+    let mut new_row_coords = Array2::<f64>::zeros((n, 2));
+    for row in 0..n {
+        let mapped = basis.map_point(&theta, [row_coords[[row, 0]], row_coords[[row, 1]]]);
+        new_row_coords[[row, 0]] = mapped[0];
+        new_row_coords[[row, 1]] = mapped[1];
+    }
+
+    Ok(Some(PatchIsometryFlowReparameterization {
+        new_row_coords,
+        new_decoder: recomposition.new_decoder,
+        decoder_transport: recomposition.transport,
+        flow_theta: theta,
+        defect_initial,
+        defect_final: minimization.defect_final,
+        profiled_metric_scale: minimization.profiled_scale,
+        min_flow_jacobian_det,
+        recomposition_residual: recomposition.recomposition_residual,
+    }))
+}
+
 /// Scale-invariant isometry defect of a fitted `d = 2` **sphere** atom's
 /// `(lat, lon)` chart against the round-sphere reference metric (#1019 stage 2,
 /// sphere arm).
@@ -1369,6 +1800,256 @@ pub fn d1_atom_fitted_turning(
         return Ok(None);
     }
     Ok(Some(theta))
+}
+
+#[cfg(test)]
+mod patch_flow_tests {
+    use super::*;
+    use ndarray::{Array2, Array3, ArrayView2};
+
+    /// Mock free-patch evaluator with the affine basis `Φ(t) = [1, t₀, t₁]`
+    /// (`m = 3`) and its exact jet. The decoder plants the affine decoded image
+    /// `γ(t) = M·t` (a constant anisotropic warp), so the fitted pullback metric
+    /// is the constant `G = MᵀM` everywhere — an anisotropically warped flat
+    /// chart. The affine basis is closed under affine reparameterization, so the
+    /// linear flow modes can transport the image exactly (the recomposition gate
+    /// passes), and the minimizer recovers `Dφ ≈ M⁻¹` (up to a flat O(2)
+    /// isometry), driving the anisotropy defect to ≈ 0.
+    #[derive(Debug)]
+    struct MockPatchEvaluator;
+
+    impl SaeBasisEvaluator for MockPatchEvaluator {
+        fn evaluate(
+            &self,
+            coords: ArrayView2<'_, f64>,
+        ) -> Result<(Array2<f64>, Array3<f64>), String> {
+            let n = coords.nrows();
+            let mut phi = Array2::<f64>::zeros((n, 3));
+            let mut jet = Array3::<f64>::zeros((n, 3, 2));
+            for row in 0..n {
+                let t0 = coords[[row, 0]];
+                let t1 = coords[[row, 1]];
+                phi[[row, 0]] = 1.0;
+                phi[[row, 1]] = t0;
+                phi[[row, 2]] = t1;
+                // ∂Φ/∂t₀ = [0, 1, 0]; ∂Φ/∂t₁ = [0, 0, 1].
+                jet[[row, 1, 0]] = 1.0;
+                jet[[row, 2, 1]] = 1.0;
+            }
+            Ok((phi, jet))
+        }
+
+        fn second_jet_dyn(
+            &self,
+            coords: ArrayView2<'_, f64>,
+        ) -> Option<Result<ndarray::Array4<f64>, String>> {
+            // Affine basis: second jet is exactly zero. Return it honestly
+            // (shape (n, 3, 2, 2)) after validating the coordinate width.
+            if coords.ncols() != 2 {
+                return Some(Err(format!(
+                    "MockPatchEvaluator::second_jet_dyn: expected 2 cols, got {}",
+                    coords.ncols()
+                )));
+            }
+            Some(Ok(ndarray::Array4::<f64>::zeros((coords.nrows(), 3, 2, 2))))
+        }
+
+        fn third_jet_dyn(
+            &self,
+            coords: ArrayView2<'_, f64>,
+        ) -> Option<Result<ndarray::Array5<f64>, String>> {
+            if coords.ncols() != 2 {
+                return Some(Err(format!(
+                    "MockPatchEvaluator::third_jet_dyn: expected 2 cols, got {}",
+                    coords.ncols()
+                )));
+            }
+            Some(Ok(ndarray::Array5::<f64>::zeros((
+                coords.nrows(),
+                3,
+                2,
+                2,
+                2,
+            ))))
+        }
+    }
+
+    /// Decoder for `γ(t) = M·t`: basis `[1, t₀, t₁]` ↦ outputs `(γ₀, γ₁)`.
+    /// Row 0 (const) = 0; row 1 (t₀) = (M₀₀, M₁₀); row 2 (t₁) = (M₀₁, M₁₁).
+    fn warp_decoder(m: [[f64; 2]; 2]) -> Array2<f64> {
+        let mut b = Array2::<f64>::zeros((3, 2));
+        b[[1, 0]] = m[0][0];
+        b[[1, 1]] = m[1][0];
+        b[[2, 0]] = m[0][1];
+        b[[2, 1]] = m[1][1];
+        b
+    }
+
+    /// A grid of fitted coordinates over the patch box `[0, 1]²`.
+    fn patch_coords() -> Array2<f64> {
+        let g = 9usize;
+        let mut c = Array2::<f64>::zeros((g * g, 2));
+        for i in 0..g {
+            for j in 0..g {
+                let row = i * g + j;
+                c[[row, 0]] = i as f64 / (g - 1) as f64;
+                c[[row, 1]] = j as f64 / (g - 1) as f64;
+            }
+        }
+        c
+    }
+
+    /// Scale-invariant anisotropy defect of a constant pullback metric `G`
+    /// against the flat reference — the optimum the minimizer chases is 0.
+    fn flat_defect_of_constant_metric(g: [f64; 3], n: usize) -> f64 {
+        // ḡ = sqrt(det G); Ĝ = G/ḡ; profile c against I; sum over n identical
+        // rows. With one constant metric the per-row defect is identical.
+        let det = g[0] * g[1] - g[2] * g[2];
+        let g_bar = det.sqrt();
+        let h = [g[0] / g_bar, g[1] / g_bar, g[2] / g_bar];
+        // c = <Ĝ, I> / <I, I> = (h00 + h11) / 2 ; residual = Ĝ − c·I.
+        let c = 0.5 * (h[0] + h[1]);
+        let r00 = h[0] - c;
+        let r11 = h[1] - c;
+        let r01 = h[2];
+        n as f64 * (r00 * r00 + r11 * r11 + 2.0 * r01 * r01)
+    }
+
+    #[test]
+    fn planted_warped_patch_recovers_uniform_speed_coords() {
+        // A deliberately anisotropic + sheared affine warp M: the fitted chart
+        // stretches axis 0 by 1.6, axis 1 by 0.8, with a 0.5 shear.
+        let m = [[1.6, 0.5], [0.0, 0.8]];
+        let ev = MockPatchEvaluator;
+        let decoder = warp_decoder(m);
+        let coords = patch_coords();
+        let n = coords.nrows();
+
+        // Pullback metric G = MᵀM (constant over the patch).
+        let g00 = m[0][0] * m[0][0] + m[1][0] * m[1][0];
+        let g11 = m[0][1] * m[0][1] + m[1][1] * m[1][1];
+        let g01 = m[0][0] * m[0][1] + m[1][0] * m[1][1];
+        let defect_initial = flat_defect_of_constant_metric([g00, g11, g01], n);
+        assert!(
+            defect_initial > 1e-2,
+            "the planted anisotropic warp must start with a sizeable defect; got {defect_initial:.3e}"
+        );
+
+        let repar = patch_isometry_flow_reparameterization(&ev, decoder.view(), coords.view())
+            .expect("patch reparameterization must evaluate")
+            .expect("a warped patch with a global flow basis must canonicalize");
+
+        // Acceptance (#1019): the canonical chart recovers uniform-speed coords
+        // — the residual defect is within 10% of the optimum (0). The optimum is
+        // exactly 0 (a flat patch IS isometric to itself), so the bar is a small
+        // absolute fraction of the initial defect.
+        assert!(
+            repar.defect_final <= 0.10 * defect_initial,
+            "canonicalization must drive the anisotropy defect to within 10% of the optimum; \
+             initial {defect_initial:.3e}, final {:.3e}",
+            repar.defect_final
+        );
+        // The defect-final the struct reports must match what the optimizer
+        // descended to (strict improvement over the identity flow).
+        assert!(
+            repar.defect_final < repar.defect_initial,
+            "the pass must report a strict improvement; initial {:.3e}, final {:.3e}",
+            repar.defect_initial,
+            repar.defect_final
+        );
+        // The canonical chart is a genuine diffeomorphism (guard cleared).
+        assert!(
+            repar.min_flow_jacobian_det > PATCH_FLOW_DIFFEO_MIN_DET,
+            "the canonical flow must be fold-free; min det {:.3e}",
+            repar.min_flow_jacobian_det
+        );
+        // Image frozen: the recomposition residual is within the honest gate.
+        assert!(
+            repar.recomposition_residual <= CHART_RECOMPOSITION_REL_TOL,
+            "the decoded image must be reproduced within the recomposition tolerance; got {:.3e}",
+            repar.recomposition_residual
+        );
+    }
+
+    #[test]
+    fn already_uniform_patch_is_left_as_fitted() {
+        // M = I: the fitted chart is already uniform-speed (defect 0), so the
+        // minimizer finds no strict improvement and honestly skips.
+        let ev = MockPatchEvaluator;
+        let decoder = warp_decoder([[1.0, 0.0], [0.0, 1.0]]);
+        let coords = patch_coords();
+        let out = patch_isometry_flow_reparameterization(&ev, decoder.view(), coords.view())
+            .expect("patch reparameterization must evaluate");
+        assert!(
+            out.is_none(),
+            "an already-uniform patch chart must be left as fitted (honest skip), got Some"
+        );
+    }
+
+    #[test]
+    fn collapsed_patch_axis_is_refused() {
+        // All rows share a single t₁ value: the patch has no extent on axis 1,
+        // so there is no honest flat chart — the basis builder refuses and the
+        // function returns None rather than erroring.
+        let ev = MockPatchEvaluator;
+        let decoder = warp_decoder([[1.3, 0.0], [0.0, 0.9]]);
+        let mut coords = patch_coords();
+        for row in 0..coords.nrows() {
+            coords[[row, 1]] = 0.5;
+        }
+        let out = patch_isometry_flow_reparameterization(&ev, decoder.view(), coords.view())
+            .expect("patch reparameterization must evaluate");
+        assert!(
+            out.is_none(),
+            "a patch collapsed along one axis must be refused (None), got Some"
+        );
+    }
+
+    #[test]
+    fn free_patch_flow_basis_layout_and_jacobian_at_identity() {
+        let basis = FreePatchFlowBasis::new([0.0, 0.0], [1.0, 1.0]).expect("patch basis");
+        // 2 components × 2 monomials (deg 1: (1,0),(0,1)) = 4 coefficients.
+        assert_eq!(basis.dim(), 4);
+        assert_eq!(basis.mode_layout().len(), 4);
+        // θ = 0 ⇒ Dφ = I everywhere ⇒ min det = 1.
+        let theta = vec![0.0_f64; basis.dim()];
+        let det = basis.min_jacobian_det_on_grid(&theta);
+        assert!(
+            (det - 1.0).abs() < 1e-12,
+            "identity flow has det Dφ ≡ 1; got {det}"
+        );
+        // The first two modes of component 0 are the linear fields (1,0),(0,1).
+        let layout = basis.mode_layout();
+        assert_eq!(layout[0].component, 0);
+        assert_eq!(layout[0].exps, (1, 0));
+        assert_eq!(layout[1].exps, (0, 1));
+    }
+
+    /// Finite-difference check of the analytic mode gradients (the `grad` the
+    /// Gauss–Newton Jacobian is built from) against the monomial values.
+    #[test]
+    fn free_patch_mode_gradients_match_finite_difference() {
+        let basis = FreePatchFlowBasis::new([-0.5, 0.2], [1.5, 2.2]).expect("patch basis");
+        let t = [0.3, 1.1];
+        let eps = 1e-6;
+        let base = basis.mode_samples(t);
+        let plus0 = basis.mode_samples([t[0] + eps, t[1]]);
+        let plus1 = basis.mode_samples([t[0], t[1] + eps]);
+        for k in 0..base.len() {
+            let fd0 = (plus0[k].value - base[k].value) / eps;
+            let fd1 = (plus1[k].value - base[k].value) / eps;
+            assert!(
+                (fd0 - base[k].grad[0]).abs() < 1e-4,
+                "mode {k} ∂/∂t₀ FD {fd0} vs analytic {}",
+                base[k].grad[0]
+            );
+            assert!(
+                (fd1 - base[k].grad[1]).abs() < 1e-4,
+                "mode {k} ∂/∂t₁ FD {fd1} vs analytic {}",
+                base[k].grad[1]
+            );
+        }
+    }
 }
 
 #[cfg(test)]

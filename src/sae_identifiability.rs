@@ -2298,6 +2298,7 @@ fn residual_gauge_inner(
     // the chart-freedom downgrade itself.
     let mut canonicalized_charts = 0usize;
     let mut canonicalized_torus_charts = 0usize;
+    let mut canonicalized_patch_charts = 0usize;
     for atom in &model.atoms {
         if !atom.chart_canonicalized {
             continue;
@@ -2324,9 +2325,20 @@ fn residual_gauge_inner(
                     "Isom(T², flat) = U(1)² ⋊ D₄ (axis translations + axis swap/reflections)",
                 )
             }
-            // Canonicalization only ever applies to d = 1 charts and d = 2
-            // torus charts; a flag on any other topology is structurally
-            // inconsistent and must not fabricate a record.
+            // #1019 free-chart arm: d = 2 free/patch (Euclidean-patch) charts
+            // are pinned post-fit to the flat-reference minimum-anisotropy-
+            // defect flow representative; the surviving chart freedom is the
+            // isometry group of the flat plane.
+            AtomTopology::EuclideanPatch { latent_dim: 2 } => {
+                canonicalized_patch_charts += 1;
+                (
+                    "the flat-reference isometry-flow canonical chart",
+                    "Isom(ℝ², flat) = O(2) ⋉ ℝ² (rotation + reflection + translation)",
+                )
+            }
+            // Canonicalization only ever applies to d = 1 charts, d = 2 torus
+            // charts, and d = 2 free/patch charts; a flag on any other topology
+            // is structurally inconsistent and must not fabricate a record.
             _ => continue,
         };
         verdicts.push(GeneratorVerdict {
@@ -2393,6 +2405,15 @@ fn residual_gauge_inner(
             "{summary}; {canonicalized_torus_charts} torus chart(s) pinned to the \
              isometry-flow canonical chart by post-fit canonicalization (residual chart \
              freedom = Isom(T², flat))"
+        )
+    } else {
+        summary
+    };
+    let summary = if canonicalized_patch_charts > 0 {
+        format!(
+            "{summary}; {canonicalized_patch_charts} free/patch chart(s) pinned to the \
+             flat-reference isometry-flow canonical chart by post-fit canonicalization \
+             (residual chart freedom = Isom(ℝ², flat) = O(2) ⋉ ℝ²)"
         )
     } else {
         summary
