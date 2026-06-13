@@ -32598,19 +32598,23 @@ mod tests {
     /// loudly with an actionable error rather than emit a silent 0-center basis.
     #[test]
     fn matern_cold_zero_rank_cloud_fails_loudly() {
-        // Two centers separated by far less than the kernel can resolve, on a
-        // near-singleton data cloud → realized kernel rank 0.
-        let centers = array![[0.5, 0.5], [0.5 + 1e-9, 0.5 + 1e-9]];
+        // Realized kernel rank 0: place the data cloud astronomically far from
+        // both centers at a tiny length_scale, so every Matérn kernel evaluation
+        // `(…)·exp(-√(2ν)·r/ℓ)` underflows to exactly 0.0. The whole n×2 kernel
+        // design block is then numerically zero (rank 0) — a degenerate term that
+        // must hard-error instead of emitting a silent 0-center basis (#1090).
+        let centers = array![[0.0, 0.0], [1.0, 0.0]];
         let n = 40usize;
         let mut data = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
-            data[[i, 0]] = 0.5 + 1e-12 * (i as f64);
-            data[[i, 1]] = 0.5 + 1e-12 * (i as f64);
+            // ~1e6 away on a 1e-3 length scale → exp argument ~1e9 → underflow 0.
+            data[[i, 0]] = 1.0e6 + i as f64;
+            data[[i, 1]] = 1.0e6 - i as f64;
         }
         let spec = MaternBasisSpec {
             periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
-            length_scale: 50.0,
+            length_scale: 1.0e-3,
             nu: MaternNu::FiveHalves,
             include_intercept: false,
             double_penalty: false,
