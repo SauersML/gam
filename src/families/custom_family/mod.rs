@@ -10181,6 +10181,31 @@ type DriftSecondDerivManyFn<'a> = dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Resul
     + Sync
     + 'a;
 
+/// Cheap, deterministic non-finite-curvature probe for the joint Hessian
+/// source (gam#1088). A `NaN`/`Inf` in the penalized Hessian `H_pen = H +
+/// S(λ)` makes its spectrum (`λ_max`, `λ_min`, `cond`) degenerate to `NaN`,
+/// so the KKT certificate — which thresholds on that spectrum — can *never*
+/// be satisfied, the spectral step solve returns garbage, and the projected
+/// residual neither converges nor early-exits through the finite-comparison
+/// guards. Left undetected the coupled joint-Newton loop then grinds the full
+/// `inner_loop_hard_ceiling` (1200 cycles) on *every* outer ρ-eval / seed,
+/// which is the multi-hour benchmark timeout (link-wiggle & location-scale
+/// paths). The penalty `S(λ)` is finite by construction, so a non-finite
+/// `H_pen` originates entirely in the family curvature `H` we probe here.
+///
+/// For the `Dense` variant the matrix is already materialized, so we scan it
+/// directly. For the matrix-free `Operator` variant the full operator is never
+/// formed; we scan its `diagonal`, which carries the per-row assembled
+/// curvature (`XᵀWX`) — exactly where a collapsed/`0÷0` row weight injects the
+/// `NaN`, corrupting the whole row block including its diagonal entry. Returns
+/// `true` when every probed entry is finite.
+fn joint_hessian_source_curvature_is_finite(source: &JointHessianSource) -> bool {
+    match source {
+        JointHessianSource::Dense(h_joint) => h_joint.iter().all(|v| v.is_finite()),
+        JointHessianSource::Operator { diagonal, .. } => diagonal.iter().all(|v| v.is_finite()),
+    }
+}
+
 fn materialize_joint_hessian_source(
     source: &JointHessianSource,
     total: usize,
@@ -14809,6 +14834,34 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 beta_joint
                     .slice_mut(ndarray::s![start..end])
                     .assign(&states[b].beta);
+            }
+
+            // Non-finite-curvature guard (gam#1088). A `NaN`/`Inf` in the
+            // family curvature `H` makes the penalized Hessian `H_pen = H +
+            // S(λ)` — and therefore its spectrum — degenerate, so the KKT
+            // certificate is structurally unreachable: the spectral step
+            // solve produces garbage, the projected residual neither converges
+            // nor trends down, and the residual-based divergence/stall guards
+            // below (gated on a *finite* residual that a corrupted-but-not-yet-
+            // propagated curvature can still leave finite) do not catch it.
+            // Left unguarded the loop then burns the full `inner_loop_hard_
+            // ceiling` (1200 cycles) on every outer ρ-eval / seed — the
+            // multi-hour link-wiggle & location-scale benchmark timeouts. The
+            // penalty is finite by construction, so this is a curvature defect:
+            // the trial is degenerate. Exit immediately as non-converged with
+            // the current finite β so the outer optimizer rejects this ρ-eval
+            // cleanly (mirrors the residual divergence guard below), rather
+            // than grinding to the ceiling and reporting a `NaN` H_pen
+            // spectrum at the refusal point.
+            if !joint_hessian_source_curvature_is_finite(&joint_hessian_source) {
+                cycles_done = cycle + 1;
+                log::warn!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | non-finite-curvature guard (gam#1088): the joint Hessian source carries a non-finite entry, so the penalized Hessian H_pen = H + S(λ) and its spectrum (λ_max/λ_min/cond) are degenerate and the KKT certificate can never be issued; returning unconverged with finite β so the outer optimizer rejects this ρ evaluation instead of grinding to inner_max_cycles={}.",
+                    cycle,
+                    inner_max_cycles,
+                );
+                converged = false;
+                break;
             }
 
             let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
@@ -31036,6 +31089,65 @@ mod tests {
         }
     }
 
+    /// gam#1088 fixture. A coupled two-block family whose joint Hessian carries
+    /// a `NaN` curvature entry — the degenerate-curvature signature seen in the
+    /// link-wiggle and location-scale benchmark timeouts (a collapsed/`0÷0` row
+    /// weight assembling into `XᵀWX`). The penalized Hessian `H_pen = H + S(λ)`
+    /// and its spectrum then degrade to `NaN`, so the KKT certificate is
+    /// structurally unreachable. The non-finite-curvature guard must detect
+    /// this at the head of the cycle and exit far below the budget, instead of
+    /// grinding the full `inner_max_cycles`.
+    #[derive(Clone)]
+    struct TwoBlockNonFiniteCurvatureFamily;
+
+    impl CustomFamily for TwoBlockNonFiniteCurvatureFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let beta0 = block_states[0].beta[0];
+            let beta1 = block_states[1].beta[0];
+            Ok(FamilyEvaluation {
+                log_likelihood: beta0 + beta1,
+                blockworking_sets: vec![
+                    BlockWorkingSet::ExactNewton {
+                        gradient: array![1.0],
+                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: array![1.0],
+                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                    },
+                ],
+            })
+        }
+
+        fn exact_newton_joint_hessian(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert!(block_states.len() <= isize::MAX as usize);
+            // A finite, symmetric, otherwise-PD curvature with a single NaN
+            // diagonal entry: exactly the degenerate `H_pen` spectrum the guard
+            // exists to catch (a real collapsed-weight curvature defect).
+            Ok(Some(array![[f64::NAN, 0.25], [0.25, 1.0]]))
+        }
+
+        fn exact_newton_joint_hessian_directional_derivative(
+            &self,
+            block_states: &[ParameterBlockState],
+            arr: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert!(block_states.len() <= isize::MAX as usize);
+            assert!(arr.iter().all(|v| !v.is_nan()));
+            Ok(Some(Array2::zeros((2, 2))))
+        }
+
+        fn has_explicit_joint_hessian(&self) -> bool {
+            true
+        }
+    }
+
     #[derive(Clone)]
     struct TwoBlockJointSurrogateFamily;
 
@@ -31745,6 +31857,77 @@ mod tests {
         assert!(
             err.contains("block_residual_inf"),
             "error should carry per-block residual diagnostics: {err}"
+        );
+    }
+
+    /// gam#1088 regression. A `NaN` in the joint Hessian curvature makes
+    /// `H_pen = H + S(λ)` and its spectrum degenerate, so the KKT certificate
+    /// can never be issued. Without the non-finite-curvature guard the coupled
+    /// joint-Newton loop runs to the full `inner_max_cycles` ceiling (1200 in
+    /// production) on every outer ρ-eval, which is the multi-hour benchmark
+    /// timeout. The guard must detect the degenerate curvature at the head of
+    /// the cycle and exit FAR below the ceiling — at cycle 0 — as a non-
+    /// converged, structured non-budget exit so the outer optimizer rejects
+    /// the ρ-evaluation cleanly.
+    #[test]
+    fn non_finite_curvature_exits_joint_newton_far_below_budget() {
+        let spec0 = ParameterBlockSpec {
+            name: "block0".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        let spec1 = ParameterBlockSpec {
+            name: "block1".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        // The PRODUCTION ceiling: the bug is that all 1200 cycles are burned.
+        // The guard must make the solve exit immediately regardless of how
+        // large the budget is, so we set the real ceiling here and prove the
+        // exit does not depend on a small budget.
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
+            inner_tol: 1e-12,
+            ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
+            ..BlockwiseFitOptions::default()
+        };
+        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+
+        let err = inner_blockwise_fit(
+            &TwoBlockNonFiniteCurvatureFamily,
+            &[spec0, spec1],
+            &per_block,
+            &options,
+            None,
+        )
+        .expect_err("a non-finite joint Hessian must fail the coupled exact-joint inner solve");
+        // The exit is via the structured "exited the joint Newton path before
+        // convergence" branch (an immediate early break), NOT the budget-
+        // exhaustion branch — proving the loop did not grind to the ceiling.
+        assert!(
+            err.contains("exited the joint Newton path before convergence"),
+            "non-finite curvature must take the early structured exit, not the \
+             budget path: {err}"
+        );
+        assert!(
+            !err.contains("exhausted the joint Newton budget"),
+            "non-finite curvature must NOT consume the joint Newton budget: {err}"
         );
     }
 
