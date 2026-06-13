@@ -4026,7 +4026,23 @@ impl PredictionTransform for DispersionLocationScalePredictor {
                 false,
             ),
         };
-        let (eta, mean, eta_se, mean_se) = self.state_from_backend(input, &backend)?;
+        let (eta, plugin_mean, eta_se, mean_se) = self.state_from_backend(input, &backend)?;
+        let mean = match pass {
+            // Plug-in mean is correct for the symmetric-delta full-uncertainty
+            // report (the point is the inverse link of the conditional η).
+            PredictPass::FullUncertainty => plugin_mean,
+            // The curved inverse link makes `E[g^{-1}(η)] ≠ g^{-1}(E[η])`, so the
+            // posterior-mean point integrates the inverse link over the
+            // conditional η posterior `η ~ N(eta, eta_se²)`.
+            PredictPass::PosteriorMean => {
+                let strategy = self.strategy();
+                let quadctx = crate::quadrature::QuadratureContext::new();
+                eta.iter()
+                    .zip(eta_se.iter())
+                    .map(|(&e, &se)| strategy.posterior_mean(&quadctx, e, se))
+                    .collect::<Result<Array1<f64>, _>>()?
+            }
+        };
         Ok(LinearState {
             eta,
             mean,
