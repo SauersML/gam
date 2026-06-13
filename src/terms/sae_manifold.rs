@@ -10430,6 +10430,50 @@ impl SaeManifoldTerm {
             };
             eligible.push((atom_idx, plan));
         }
+
+        // #1019 sphere arm: d = 2 sphere atoms are NOT flow-pinned (no global
+        // pole-free flow basis — hairy ball), but the isometry DEFECT against the
+        // round-sphere reference metric is well-defined at the fitted chart and
+        // is exactly the issue's acceptance quantity. Measure and log it so the
+        // honest "left as fitted" sphere arm is MEASURABLE: a round-isometric
+        // (O(3)-representative) chart scores ≈ 0, a warped chart scores large.
+        // This never mutates the atom — it is a pure read-only diagnostic.
+        for atom_idx in 0..self.k_atoms() {
+            let atom = &self.atoms[atom_idx];
+            if !matches!(atom.basis_kind, SaeAtomBasisKind::Sphere)
+                || atom.latent_dim != 2
+                || atom.homotopy_eta != 1.0
+                || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim
+            {
+                continue;
+            }
+            let Some(evaluator) = atom.basis_evaluator.as_ref().cloned() else {
+                continue;
+            };
+            let coords = self.assignment.coords[atom_idx].as_matrix();
+            match crate::terms::sae_chart_canonicalization::sphere_chart_isometry_defect(
+                evaluator.as_ref(),
+                atom.decoder_coefficients.view(),
+                coords.view(),
+            ) {
+                Ok(Some(defect)) => log::info!(
+                    "[#1019] sphere atom '{}' chart isometry defect = {defect:.6e} \
+                     (round-sphere reference; 0 = O(3)-isometric, left as fitted — \
+                     no pole-free flow basis to pin)",
+                    atom.name
+                ),
+                Ok(None) => log::info!(
+                    "[#1019] sphere atom '{}' chart isometry defect unavailable \
+                     (degenerate or pole-singular chart); left as fitted",
+                    atom.name
+                ),
+                Err(err) => log::warn!(
+                    "[#1019] sphere atom '{}' chart isometry defect errored: {err}",
+                    atom.name
+                ),
+            }
+        }
+
         if eligible.is_empty() {
             return Ok(());
         }
