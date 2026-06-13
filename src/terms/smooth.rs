@@ -3271,7 +3271,23 @@ fn measure_jet_term_spec(
 /// `spatial_term_uses_per_axis_psi` both defer here so the θ-layout
 /// sources cannot disagree.
 fn measure_jet_enrolls_psi(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
-    mj.tau0 > 0.0
+    // ψ dials ride RICH mode only: the per-scale spectral split and the
+    // (α, lnτ) dials are auto-enabled together, at the same center-count
+    // threshold the basis builder uses (single source: `measure_jet_rich_mode`).
+    // SIMPLE-mode terms (small center counts, or a pinned explicit order)
+    // stay at one fused penalty with fixed dials — Duchon/Matérn's outer
+    // footprint — so they never inflate the family's O(n) per-row evaluation
+    // count (#1039). The lnτ channel additionally needs a positive ridge.
+    mj.tau0 > 0.0 && measure_jet_term_enrolls_rich(mj)
+}
+
+/// Realized RICH-mode decision for a measure-jet spec, resolving the center
+/// count from the (post-freeze) strategy. Single source for both ψ
+/// enrollment and the ψ-dimension so the θ-layout cannot drift from the
+/// builder's penalty count.
+fn measure_jet_term_enrolls_rich(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
+    crate::basis::center_strategy_num_centers(&mj.center_strategy)
+        .is_some_and(|m| crate::basis::measure_jet_rich_mode(mj, m))
 }
 
 /// Measure-jet ψ dial boxes. The dials are NOT log-kernel-scales, so the

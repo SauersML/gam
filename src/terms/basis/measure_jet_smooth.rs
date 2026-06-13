@@ -130,6 +130,24 @@ const MEASURE_JET_PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
 /// with attested trends.
 const MEASURE_JET_DEFAULT_ORDER_S: f64 = 1.5;
 
+/// Minimum realized center count at which the auto (`order_s == 0.0`) path
+/// engages RICH mode — the per-scale spectral penalty split plus the
+/// `(α, ln τ)` outer ψ dials. Below it, the term stays in SIMPLE mode: one
+/// fused penalty at the auto order, dials fixed at build, no ψ enrollment —
+/// the same outer footprint as Duchon/Matérn (one λ, no kernel-shape ψ).
+///
+/// Rationale (profiled, #1039): the dominant per-evaluation cost in a
+/// penalized fit is the family's O(n) per-row work (e.g. the BMS rigid-normal
+/// 4th-order tower), paid once per outer/inner evaluation. Rich mode inflates
+/// the outer θ-dimension by `L` per-scale amplitudes + 2 dials, multiplying
+/// that O(n) cost by the extra evaluations — for nothing when the coefficient
+/// block is too small to identify a spectrum. A spectrum needs several
+/// coefficients per band scale; below ~`MIN_CENTERS` the fused single penalty
+/// is both faster and better-conditioned. This is auto-derivation from
+/// problem size (magic by default), persisted implicitly through the realized
+/// center count, so the freeze→replay mode is stable with no extra field.
+const MEASURE_JET_RICH_MODE_MIN_CENTERS: usize = 64;
+
 /// Auto-band scale-count clamp: at least 3 octave-ish nodes so the energy is
 /// genuinely multiscale, at most 8 so degenerate spacing cannot explode the
 /// build.
@@ -1248,11 +1266,23 @@ fn realize_measure_jet_geometry(
         log_step,
         length_scale,
         order_s_eval: order_s,
-        per_level: spec.order_s == 0.0,
+        // RICH (per-scale spectral) mode only at the auto order AND a center
+        // count large enough to identify a spectrum; otherwise SIMPLE (one
+        // fused penalty), matching Duchon/Matérn's outer footprint (#1039).
+        per_level: spec.order_s == 0.0 && m >= MEASURE_JET_RICH_MODE_MIN_CENTERS,
         z,
         kz,
         sum_to_zero_u,
     })
+}
+
+/// Whether a realized measure-jet spec with `m` centers runs in RICH mode
+/// (per-scale spectral penalties + `(α, ln τ)` ψ dials) under the auto order.
+/// The single source of truth for the mode decision, shared by the builder
+/// and the outer-engine enrollment predicates so the penalty count and the
+/// ψ-dimension cannot disagree.
+pub fn measure_jet_rich_mode(spec: &MeasureJetBasisSpec, center_count: usize) -> bool {
+    spec.order_s == 0.0 && center_count >= MEASURE_JET_RICH_MODE_MIN_CENTERS
 }
 
 /// Build the measure-jet smooth: Gaussian representer design `K(data,
@@ -1911,6 +1941,40 @@ mod tests {
         }
     }
 
+    /// The default at a typical (small) center count is SIMPLE mode: one
+    /// fused penalty (+ ridge), the same outer footprint as Duchon/Matérn —
+    /// the auto sentinel does NOT trigger the per-scale spectral split below
+    /// the rich-mode center threshold (#1039). `measure_jet_rich_mode` is the
+    /// single source for this decision.
+    #[test]
+    fn small_default_stays_simple_single_penalty() {
+        let n = 60usize;
+        let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            if k == 0 { t * 3.0 } else { 0.4 * (t * 3.0).sin() }
+        });
+        // 8 centers — the issue's configuration — at the auto order sentinel.
+        let spec = MeasureJetBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+            ..MeasureJetBasisSpec::default()
+        };
+        assert!(
+            !measure_jet_rich_mode(&spec, 8),
+            "8 centers must resolve to simple mode"
+        );
+        let built = build_measure_jet_basis(data.view(), &spec).expect("simple build");
+        assert_eq!(
+            built.penalties.len(),
+            2,
+            "simple mode emits exactly one fused penalty + ridge (not the per-scale split)"
+        );
+        // A large center count flips the same auto sentinel to rich mode.
+        assert!(
+            measure_jet_rich_mode(&spec, MEASURE_JET_RICH_MODE_MIN_CENTERS),
+            "≥ threshold centers must resolve to rich mode"
+        );
+    }
+
     /// An explicit order pins the Mellin weights and fuses the band into a
     /// single Primary candidate (+ ridge) — the spectral split's fused mode.
     #[test]
@@ -1978,7 +2042,10 @@ mod tests {
     /// and return the pinned spec so dial-perturbed rebuilds move ONLY the
     /// dials — the per-trial contract the optimizer relies on.
     fn frozen_spec_fixture(order_s: f64) -> (Array2<f64>, MeasureJetBasisSpec) {
-        let n = 40usize;
+        // ≥ MEASURE_JET_RICH_MODE_MIN_CENTERS centers so the auto
+        // (order_s == 0.0) path engages rich (per-scale + ψ) mode under test;
+        // the fused fixture (order_s > 0) is fused regardless of count.
+        let n = 140usize;
         let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
             let t = i as f64 / (n as f64 - 1.0);
             if k == 0 {
@@ -1988,7 +2055,7 @@ mod tests {
             }
         });
         let spec = MeasureJetBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 14 },
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 70 },
             order_s,
             ..MeasureJetBasisSpec::default()
         };
@@ -2192,8 +2259,9 @@ mod tests {
     /// predict-path contract).
     #[test]
     fn build_replay_roundtrip_reproduces_design_and_penalty() {
-        // A bent filament with a side cluster, n = 40 deterministic rows.
-        let n = 40usize;
+        // A bent filament with a side cluster; ≥ the rich-mode center
+        // threshold so this exercises the per-scale (spectral) replay path.
+        let n = 140usize;
         let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
             let t = i as f64 / (n as f64 - 1.0);
             if k == 0 {
@@ -2203,7 +2271,7 @@ mod tests {
             }
         });
         let spec = MeasureJetBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 14 },
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 70 },
             ..MeasureJetBasisSpec::default()
         };
         let first = build_measure_jet_basis(data.view(), &spec).expect("first build");
