@@ -169,6 +169,11 @@ const SCAN_FORMULA: &str = "y ~ s(x, double_penalty=false)";
 /// penalty_order m = 1 — the form `spline_scan_fast_path` routes to the m = 1
 /// exact O(n) scan (#1034 item 2).
 const SCAN_FORMULA_M1: &str = "y ~ s(x, degree=1, penalty_order=1, double_penalty=false)";
+/// Order-3 (quintic) smoothing spline: degree 2m−1 = 5, penalty_order m = 3 —
+/// the form `spline_scan_fast_path` routes to the m = 3 exact O(n) scan (#1044),
+/// whose two partially-diffuse leading nodes are recovered by the exact diffuse
+/// leading-block smoother.
+const SCAN_FORMULA_M3: &str = "y ~ s(x, degree=5, penalty_order=3, double_penalty=false)";
 
 #[test]
 fn scan_routed_workflow_fit_matches_dense_oracle_at_selected_lambda() {
@@ -428,6 +433,76 @@ fn order_one_scan_routes_and_recovers_truth_vs_dense() {
     assert!(
         scan_mse <= 5.0 * dense_mse + 1e-12,
         "m=1 scan catastrophically worse than the reduced-rank fit: scan MSE={scan_mse}, dense MSE={dense_mse}"
+    );
+}
+
+/// #1044 end-to-end: the order-3 (quintic) smoothing spline routes through the
+/// formula → detection → exact O(n) scan → predict pipeline. Detection must
+/// fire, the fit must carry `order == 3`, and the scan must recover the known
+/// smooth truth (#904 self-constructed truth, PRIMARY).
+///
+/// As with the m=1 arm, NO match-or-beat against the dense path: the dense
+/// formula fit is a DIFFERENT estimator (a reduced-rank degree-5 B-spline with
+/// a discrete third-difference penalty) vs the scan's exact full-knot
+/// spacing-weighted quintic spline (`λ∫(f‴)²`). Exactness of the scan's own
+/// estimand is gated by the dense order-3 joint-precision oracle in
+/// tests/spline_scan_exact_oracle.rs. A wide catastrophe guard (≤ 5× dense MSE)
+/// catches a silent λ-selection or leading-node collapse without asserting
+/// cross-estimator dominance.
+#[test]
+fn order_three_scan_routes_and_recovers_truth_vs_dense() {
+    init_parallelism();
+    let (x, y) = training_xy(200);
+    let data = encode_xy(&x, &y);
+    let cfg = gaussian_config();
+
+    let scan = fit_spline_scan_from_formula(SCAN_FORMULA_M3, &data, &cfg)
+        .expect("scan-routed m=3 fit")
+        .expect("detection must fire for a single 1-D order-3 single-penalty Gaussian smooth");
+    assert_eq!(scan.order, 3, "m=3 formula must select the order-3 scan");
+
+    // The library entry must also auto-route the m=3 scan shape (#1030).
+    match fit_from_formula(SCAN_FORMULA_M3, &data, &cfg).expect("auto-routed m=3 fit") {
+        FitResult::SplineScan(s) => assert_eq!(s.order, 3, "auto-route must select the m=3 scan"),
+        _ => panic!("fit_from_formula must auto-route the m=3 scan shape"),
+    }
+
+    // Dense reduced-rank reference on the identical formula (bypasses the
+    // auto-route, see `dense_reference_fit`).
+    let dense = dense_reference_fit(SCAN_FORMULA_M3, &data, &cfg);
+    let grid: Vec<f64> = (0..200).map(|i| 0.02 + 0.96 * i as f64 / 199.0).collect();
+    let mut dense_design = Array2::<f64>::zeros((grid.len(), 2));
+    for (i, &t) in grid.iter().enumerate() {
+        dense_design[[i, 0]] = t;
+    }
+    let design = build_term_collection_design(dense_design.view(), &dense.resolvedspec)
+        .expect("dense m=3 predict design rebuild");
+    let dense_pred = design.design.apply(&dense.fit.beta).to_vec();
+
+    let mut scan_sse = 0.0;
+    let mut dense_sse = 0.0;
+    for (i, &t) in grid.iter().enumerate() {
+        let truth = truth_fn(t);
+        let (scan_mean, scan_var) = scan.predict(t).expect("m=3 scan predict");
+        assert!(
+            scan_mean.is_finite() && scan_var.is_finite() && scan_var > 0.0,
+            "m=3 scan prediction must be finite with positive variance at x={t}"
+        );
+        scan_sse += (scan_mean - truth) * (scan_mean - truth);
+        dense_sse += (dense_pred[i] - truth) * (dense_pred[i] - truth);
+    }
+    let scan_mse = scan_sse / grid.len() as f64;
+    let dense_mse = dense_sse / grid.len() as f64;
+    // PRIMARY — the quintic smoother is C⁴ and tracks the curved truth at least
+    // as tightly as the cubic; it must resolve it well under the noise variance.
+    assert!(
+        scan_mse < 0.01,
+        "m=3 scan fails absolute truth recovery: MSE={scan_mse}"
+    );
+    // Catastrophe guard only (different estimators).
+    assert!(
+        scan_mse <= 5.0 * dense_mse + 1e-12,
+        "m=3 scan catastrophically worse than the reduced-rank fit: scan MSE={scan_mse}, dense MSE={dense_mse}"
     );
 }
 

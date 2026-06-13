@@ -1304,9 +1304,11 @@ mod tests {
     /// Gaussian bridge bit-for-bit — knot posteriors, off-knot bridge,
     /// boundary extrapolation, EDF, and derivative posteriors all compare
     /// with exact equality, because every replayed field is either stored
-    /// verbatim or derived by the fitter's own expressions.
-    #[test]
-    fn state_snapshot_round_trips_predict_bit_for_bit() {
+    /// verbatim or derived by the fitter's own expressions. Parameterized over
+    /// the smoothing order so the order-derived state/cov/gain layouts
+    /// (#1044: m=3 stores 3-wide state, 6-wide upper-tri cov, 9-wide gain) are
+    /// each round-tripped.
+    fn round_trip_predict_bit_for_bit(order: usize) {
         let n = 60usize;
         let x: Vec<f64> = (0..n).map(|i| (i as f64) / (n as f64 - 1.0)).collect();
         // Deterministic wiggly response with a tie pair to exercise pooling.
@@ -1320,7 +1322,8 @@ mod tests {
             })
             .collect();
         let w: Vec<f64> = (0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)).collect();
-        let fit = fit_spline_scan(&x, &y, &w, 2).expect("scan fit");
+        let fit = fit_spline_scan(&x, &y, &w, order).expect("scan fit");
+        assert_eq!(fit.order, order);
 
         let json = serde_json::to_string(&fit.to_state()).expect("serialize state");
         let state: SplineScanState = serde_json::from_str(&json).expect("deserialize state");
@@ -1343,8 +1346,8 @@ mod tests {
         for &xq in &[-0.2, 0.0, 0.013, 0.5, x[6], 0.987, 1.0, 1.3] {
             let (m0, v0) = fit.predict(xq).expect("predict original");
             let (m1, v1) = restored.predict(xq).expect("predict restored");
-            assert_eq!(m0.to_bits(), m1.to_bits(), "mean drift at x={xq}");
-            assert_eq!(v0.to_bits(), v1.to_bits(), "variance drift at x={xq}");
+            assert_eq!(m0.to_bits(), m1.to_bits(), "mean drift at x={xq} (m={order})");
+            assert_eq!(v0.to_bits(), v1.to_bits(), "variance drift at x={xq} (m={order})");
         }
 
         // Corrupt payloads fail loudly, not inside a later predict.
@@ -1357,6 +1360,22 @@ mod tests {
         let mut bad = fit.to_state();
         bad.knots[2] = bad.knots[1];
         SplineScanFit::from_state(&bad).expect_err("non-increasing knots must error");
+    }
+
+    #[test]
+    fn state_snapshot_round_trips_predict_bit_for_bit() {
+        round_trip_predict_bit_for_bit(2);
+    }
+
+    /// #1044: the order-1 and order-3 layouts round-trip bit-for-bit too.
+    #[test]
+    fn state_snapshot_round_trips_predict_bit_for_bit_order1() {
+        round_trip_predict_bit_for_bit(1);
+    }
+
+    #[test]
+    fn state_snapshot_round_trips_predict_bit_for_bit_order3() {
+        round_trip_predict_bit_for_bit(3);
     }
 
     /// Dense order-1 (random-walk / linear smoothing spline) posterior of the
