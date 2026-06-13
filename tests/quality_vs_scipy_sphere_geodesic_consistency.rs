@@ -12,8 +12,10 @@
 //! same geodesic surface (it is geodesic-consistent by construction), making it a
 //! meaningful secondary baseline.
 //!
-//! The intrinsic correctness property: fit `y ~ sphere(lat, lon, k=20)` on noisy
-//! samples of a radially-symmetric truth `f(p) = exp(-d_geod(p, pole)/bandwidth)`,
+//! The intrinsic correctness property: fit gam's spline-on-sphere — the SAME
+//! Laplace-Beltrami spherical-harmonic construction as mgcv `bs="sos"`, i.e.
+//! `y ~ sphere(lat, lon, kernel=harmonic, degree=4)` — on noisy samples of a
+//! radially-symmetric truth `f(p) = exp(-d_geod(p, pole)/bandwidth)`,
 //! evaluate the fitted surface at a probe grid, and test two things that a
 //! metric-respecting S² smooth must satisfy and a coordinate/chordal-confused
 //! kernel cannot:
@@ -150,16 +152,26 @@ fn gam_sphere_smooth_recovers_geodesic_truth_at_least_as_well_as_mgcv_sos() {
     }
     let m = eval_lats.len();
 
-    // ---- fit gam: y ~ sphere(lat, lon, k=20), Gaussian/REML ----------------
-    // Default kernel is the Sobolev/Wahba spline-on-sphere with k=20 centers;
+    // ---- fit gam's spline-on-sphere, the SAME construction as mgcv bs="sos" -
+    // mgcv `bs="sos"` is the Laplace-Beltrami spherical-harmonic spline on S²
+    // (Wood §5.6.2). gam's apples-to-apples analog is the `harmonic` sphere method
+    // (real spherical harmonics with the `[l(l+1)]^m` Laplace-Beltrami eigenvalue
+    // penalty), NOT the Sobolev reproducing-kernel `sphere()` default, which is a
+    // related-but-distinct smoother. Degree 4 gives a basis dimension
+    // `L(L+2) = 24`, matching mgcv's `k=20`, so the two tools are fit at comparable
+    // resolution and the match-or-beat claim is between the SAME smoother family.
     // lat/lon are interpreted in degrees (radians=false by default).
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let data = make_dataset(&lats, &lons, &ys);
-    let result =
-        fit_from_formula("y ~ sphere(lat, lon, k=20)", &data, &cfg).expect("gam sphere fit");
+    let result = fit_from_formula(
+        "y ~ sphere(lat, lon, kernel=harmonic, degree=4)",
+        &data,
+        &cfg,
+    )
+    .expect("gam sphere fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the sphere smooth");
     };
