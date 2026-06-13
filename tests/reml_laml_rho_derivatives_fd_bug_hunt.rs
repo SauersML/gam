@@ -19,6 +19,7 @@ fn opts(nullspace_dims: Vec<usize>) -> ExternalOptimOptions {
             InverseLink::Standard(StandardLink::Identity),
         ),
         compute_inference: true,
+        skip_rho_posterior_inference: false,
         max_iter: 500,
         tol: 1e-12,
         nullspace_dims,

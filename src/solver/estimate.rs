@@ -2975,10 +2975,10 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// hyperparameter (#1033b, isotropic spatial κ): when present and the
     /// trial ψ lies inside the certified window, `prepare_eval_state`
     /// installs the n-free assembled `GaussianFixedCache` after
-    /// `reset_surface`, replacing the per-trial O(n·p²) Gram re-stream. The
-    /// conditioning transform must be column-only and ψ-invariant for the
-    /// installed statistics to live in the same frame as the streamed ones —
-    /// the setter enforces an identity parametric conditioning.
+    /// `reset_surface`, replacing the per-trial O(n·p²) Gram re-stream. Built
+    /// in the conditioned frame by `build_and_set_psi_gram_tensor` (the same
+    /// fixed column transform the streamed Gram uses), so the installed
+    /// statistics are frame-exact against the streamed ones.
     psi_gram_tensor: Option<std::sync::Arc<crate::solver::psi_gram_tensor::PsiGramTensor>>,
 }
 
@@ -3092,20 +3092,49 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         );
     }
 
-    /// Attach a certified ψ-Gram tensor (#1033b) for the single design-moving
-    /// hyperparameter. Refuses (returns false) when the parametric column
-    /// conditioning is not the identity — the tensor's statistics are built in
-    /// the RAW design frame, and a non-trivial conditioning would put the
-    /// streamed and installed caches in different coordinate frames.
-    pub(crate) fn set_psi_gram_tensor(
+    /// Build and attach a certified ψ-Gram tensor (#1033b) for the single
+    /// design-moving hyperparameter ψ over `[psi_lo, psi_hi]`.
+    ///
+    /// `eval_raw_design(psi)` returns the EXACT realized design at `psi` in the
+    /// raw (user) column frame — the same realizer the per-trial path uses.
+    /// This method threads it through THIS evaluator's parametric column
+    /// conditioning before the tensor sees it, so the tensor's assembled
+    /// `XᵀWX(ψ)` lives in the SAME conditioned frame as the streamed
+    /// `gaussian_fixed_cache_if_eligible` (which forms its Gram from
+    /// `x_fit = conditioning.apply_to_design(x)`). The conditioning is a fixed,
+    /// ψ-invariant column transform (means/scales frozen from the baseline
+    /// design at construction), so applying it inside the build keeps the
+    /// expansion analytic and the per-trial installed cache frame-exact —
+    /// without restricting to identity conditioning. Returns whether a
+    /// certified tensor was attached; `false` keeps the exact per-trial path.
+    pub(crate) fn build_and_set_psi_gram_tensor(
         &mut self,
-        tensor: std::sync::Arc<crate::solver::psi_gram_tensor::PsiGramTensor>,
+        mut eval_raw_design: impl FnMut(f64) -> Result<DesignMatrix, String>,
+        weights: ArrayView1<'_, f64>,
+        z: ArrayView1<'_, f64>,
+        psi_lo: f64,
+        psi_hi: f64,
     ) -> bool {
-        if !self.conditioning.columns.is_empty() {
-            return false;
+        // Clone the (cheap) conditioning so the build closure borrows it
+        // without aliasing `self` while we set the field afterward.
+        let conditioning = self.conditioning.clone();
+        let tensor = crate::solver::psi_gram_tensor::PsiGramTensor::build(
+            |psi| {
+                let raw = eval_raw_design(psi)?;
+                Ok(conditioning.apply_to_design(&raw).to_dense())
+            },
+            weights,
+            z,
+            psi_lo,
+            psi_hi,
+        );
+        match tensor {
+            Some(tensor) => {
+                self.psi_gram_tensor = Some(std::sync::Arc::new(tensor));
+                true
+            }
+            None => false,
         }
-        self.psi_gram_tensor = Some(tensor);
-        true
     }
 
     fn prepare_eval_state(

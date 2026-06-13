@@ -175,7 +175,7 @@ fn centered_fd(
 fn assert_full_gradient_matches_fd(label: &str, f: &Fixture) {
     let (converged, _value, loss, cache) = evaluate(&f.term, &f.target, &f.rho, 8);
     let components = converged
-        .analytic_outer_rho_gradient_at_converged(&f.rho, &loss, &cache)
+        .analytic_outer_rho_gradient_at_converged(f.target.view(), &f.rho, &loss, &cache)
         .expect("analytic components");
     assert!(
         components.third_order_correction_available,

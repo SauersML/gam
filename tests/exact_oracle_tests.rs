@@ -45,6 +45,7 @@ fn logit_opts(firth: bool) -> ExternalOptimOptions {
             InverseLink::Standard(StandardLink::Logit),
         ),
         compute_inference: true,
+        skip_rho_posterior_inference: false,
         max_iter: 200,
         // Inner P-IRLS must converge tightly so cost(ρ ± δ) and grad(ρ) are
         // both evaluated at converged β̂; otherwise the FD captures β̂'s

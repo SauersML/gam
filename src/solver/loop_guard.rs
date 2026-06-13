@@ -471,6 +471,74 @@ mod tests {
         assert_eq!(streak.streak(), 4);
     }
 
+    /// Suspect #1 of gam#1040: the plateau detector MUST be scale-invariant.
+    /// A survival marginal-slope NLL objective sits at O(1e4); an absolute
+    /// flat-threshold (|ΔV| < ε_abs) never fires there because a single cycle
+    /// can move the objective by O(1) in absolute terms while the relative
+    /// change |ΔV|/|V| is already at roundoff — the iterate IS on a flat
+    /// plateau yet an absolute test calls it "still moving" forever, which is
+    /// the never-terminating hang. The relative test (|ΔV| ≤ rel_tol·|V|)
+    /// fires identically at O(1) and O(1e4), so the loop terminates as
+    /// converged on the flat valley regardless of objective magnitude.
+    #[test]
+    fn plateau_detector_is_scale_invariant_on_large_magnitude_objective() {
+        let rel_tol = 1e-8;
+        let window = 3;
+
+        // A flat plateau at O(1e4): the objective creeps by ~6e-5 per cycle,
+        // which is |ΔV|/|V| ≈ 1e-9 < rel_tol — flat — yet would dwarf any
+        // sane absolute ε if one keyed off |ΔV| directly (6e-5 ≫ 1e-8).
+        let big = 6.0e4_f64;
+        let mut det_big = PlateauDetector::new(window, rel_tol);
+        det_big.note(big);
+        let mut big_fired_at = None;
+        for k in 0..window {
+            let v = big - 6.0e-5 * (k as f64 + 1.0);
+            if det_big.note(v) == LoopVerdict::Plateaued {
+                big_fired_at = Some(k);
+                break;
+            }
+        }
+        assert!(
+            big_fired_at.is_some(),
+            "relative plateau detector must terminate on an O(1e4) flat valley \
+             within the window; instead it ran past it (the #1040 hang)"
+        );
+
+        // The SAME relative stream scaled down to O(1) fires at the SAME
+        // streak position — scale invariance, the whole point.
+        let small = 1.0_f64;
+        let mut det_small = PlateauDetector::new(window, rel_tol);
+        det_small.note(small);
+        let mut small_fired_at = None;
+        for k in 0..window {
+            let v = small - 1.0e-9 * (k as f64 + 1.0);
+            if det_small.note(v) == LoopVerdict::Plateaued {
+                small_fired_at = Some(k);
+                break;
+            }
+        }
+        assert_eq!(
+            big_fired_at, small_fired_at,
+            "plateau detection must be invariant to objective magnitude"
+        );
+
+        // A genuinely non-flat large-magnitude descent (|ΔV|/|V| ≈ 1e-2 ≫
+        // rel_tol) must NOT be called a plateau — the relative test does not
+        // weaken a real convergence check, it only rescales it.
+        let mut det_moving = PlateauDetector::new(window, rel_tol);
+        det_moving.note(big);
+        let mut moving = big;
+        for _ in 0..window {
+            moving -= 0.01 * moving;
+            assert_eq!(
+                det_moving.note(moving),
+                LoopVerdict::Continue,
+                "a 1%-per-cycle relative descent must never register as flat"
+            );
+        }
+    }
+
     /// The shared predicates pin the exact reweight.rs semantics they
     /// replaced (finite + strictly-below cap to retry; count OR window
     /// exit to exhaust).

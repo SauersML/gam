@@ -244,8 +244,8 @@ fn bms_marginal_slope_accepts_measure_jet_backbone() {
     );
 
     // (c) Measure-jet diagnostic: at the issue's small center count
-    // (`centers=16`, below the rich-mode threshold) the mjs term resolves to
-    // SIMPLE mode — one fused penalty plus the double-penalty ridge per
+    // (`centers=16`, below the multiscale-mode threshold) the mjs term resolves to
+    // single-scale mode — one fused penalty plus the double-penalty ridge per
     // surface, the same outer footprint as Duchon/Matérn (#1039). The
     // per-scale spectral split is reserved for large center counts where the
     // spectrum is identifiable; here it would only inflate the marginal-slope
@@ -258,13 +258,13 @@ fn bms_marginal_slope_accepts_measure_jet_backbone() {
     assert_eq!(
         out.marginal_design.penalties.len(),
         2,
-        "small-centers mjs surface must be SIMPLE: one fused penalty + ridge, got {}",
+        "small-centers mjs surface must be single-scale: one fused penalty + ridge, got {}",
         out.marginal_design.penalties.len()
     );
     assert_eq!(
         out.logslope_design.penalties.len(),
         2,
-        "small-centers logslope mjs surface must be SIMPLE: one fused penalty + ridge, got {}",
+        "small-centers logslope mjs surface must be single-scale: one fused penalty + ridge, got {}",
         out.logslope_design.penalties.len()
     );
 }
