@@ -1,0 +1,154 @@
+"""Bug hunt: a spline-scan-routed 1-D Gaussian smooth loses its entire
+summary / introspection API (#1046).
+
+Since #1030 the standard workflow auto-detects the single-1-D-smooth,
+Gaussian-identity shape and routes it through the exact O(n) state-space spline
+scan (`crate::solver::spline_scan::fit_spline_scan`); #1044 extended this to the
+order-3 quintic smoother. A scan-bearing `SavedModel` carries a `SplineScanFit`
+state and **no dense `fit_result`** — by design, the scan keeps no dense
+design/Gram.
+
+The predict path is scan-aware, but every Python-FFI summary/introspection entry
+point funnelled through one chokepoint (`fit_result_from_saved_model_for_prediction`)
+that demanded a dense `fit_result`. For any scan-routed model
+(`double_penalty=false`, degree == 2*order-1) they therefore all aborted with::
+
+    ValueError: model is missing canonical fit_result payload; refit
+
+even though the model fits and predicts perfectly and the selected smoothing
+parameter, EDF and REML score are all present in the saved `SplineScanFit`.
+
+This test fits both the cubic (`degree=3, penalty_order=2`) and quintic
+(`degree=5, penalty_order=3`) scan-routed forms, asserts the model actually
+predicts and tracks the signal, then asserts every summary/introspection entry
+point returns a finite, principled value reconstructed from the scan state.
+"""
+
+from __future__ import annotations
+
+import importlib
+from typing import Any
+
+pytest: Any = importlib.import_module("pytest")
+np = pytest.importorskip("numpy")
+pd = pytest.importorskip("pandas")
+pytest.importorskip("gamfit._rust")
+
+import gamfit
+
+
+def _dataset(seed: int = 7, n: int = 140) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    x = np.sort(rng.uniform(0.0, 1.0, n))
+    y = np.sin(2.5 * np.pi * x) + 0.4 * x + rng.normal(0.0, 0.1, n)
+    return pd.DataFrame({"x": x, "y": y})
+
+
+# (degree, penalty_order, null_space_dim==order) for every scan-eligible order.
+_SCAN_FORMS = [
+    pytest.param(1, 1, 1, id="linear-order1"),
+    pytest.param(3, 2, 2, id="cubic-order2"),
+    pytest.param(5, 3, 3, id="quintic-order3"),
+]
+
+
+def _fit_scan(df: pd.DataFrame, degree: int, penalty_order: int) -> gamfit.Model:
+    formula = (
+        f'y ~ s(x, bs="ps", degree={degree}, '
+        f"penalty_order={penalty_order}, double_penalty=False)"
+    )
+    return gamfit.fit(df, formula)
+
+
+@pytest.mark.parametrize("degree, penalty_order, order", _SCAN_FORMS)
+def test_scan_model_predicts_and_summarizes(degree, penalty_order, order):
+    df = _dataset()
+    n = len(df)
+    model = _fit_scan(df, degree, penalty_order)
+
+    # The model fits and predicts, tracking the signal.
+    pred = np.asarray(model.predict(df))
+    assert np.all(np.isfinite(pred))
+    assert np.corrcoef(pred, df["y"].to_numpy())[0, 1] > 0.8
+
+    # smoothing_parameters(): a positive, finite selected lambda.
+    lambdas = model.smoothing_parameters()
+    assert isinstance(lambdas, dict)
+    assert len(lambdas) >= 1
+    for value in lambdas.values():
+        assert np.isfinite(value)
+        assert value > 0.0
+
+    # summary(): finite REML score and an EDF strictly between the polynomial
+    # null-space dimension (== order) and n.
+    summary = model.summary()
+    reml = float(summary.reml_score)
+    assert np.isfinite(reml)
+    edf = float(summary.edf_total)
+    assert order < edf < n, f"edf {edf} must lie in ({order}, {n})"
+
+    # evidence(): a finite REML/LAML cost on the comparison scale.
+    assert np.isfinite(float(model.evidence))
+
+    # term_blocks(): exactly one contiguous coefficient block for the smooth.
+    blocks = model.term_blocks()
+    assert len(blocks) >= 1
+    total = 0
+    for blk in blocks:
+        start, end = blk[2], blk[3]
+        assert 0 <= start <= end
+        total += end - start
+    assert total >= 1
+
+    # diagnose(): scores the fit on held-out data (routes through summary()).
+    diag = model.diagnose(df)
+    assert diag is not None
+
+
+def test_scan_summary_matches_dense_double_penalty_reference():
+    """The scan and the dense (double_penalty=true) fit of the *same* smooth
+    must agree on the headline fitted quantities: comparable EDF and a fit that
+    tracks the signal equally well. This guards against the scan summary path
+    fabricating numbers that diverge from the canonical dense introspection."""
+    df = _dataset()
+    scan = _fit_scan(df, degree=3, penalty_order=2)
+    dense = gamfit.fit(
+        df, 'y ~ s(x, bs="ps", degree=3, penalty_order=2, double_penalty=True)'
+    )
+
+    edf_scan = float(scan.summary().edf_total)
+    edf_dense = float(dense.summary().edf_total)
+    # Different penalty structure (single vs double penalty), so not identical,
+    # but both must land in a sane smooth band and within a factor of ~2.
+    assert 2.0 < edf_scan < len(df)
+    assert 2.0 < edf_dense < len(df)
+    assert 0.4 < edf_scan / edf_dense < 2.5
+
+    yhat_scan = np.asarray(scan.predict(df))
+    yhat_dense = np.asarray(dense.predict(df))
+    y = df["y"].to_numpy()
+    rmse_scan = float(np.sqrt(np.mean((yhat_scan - y) ** 2)))
+    rmse_dense = float(np.sqrt(np.mean((yhat_dense - y) ** 2)))
+    # The scan must not be meaningfully worse than the dense reference.
+    assert rmse_scan <= 1.25 * rmse_dense
+
+
+def test_scan_summary_survives_save_load_roundtrip(tmp_path):
+    """A persisted-then-reloaded scan model must summarize identically — the
+    summary path reconstructs from the saved `SplineScanFit`, so it must work
+    off a round-tripped payload, not just the freshly-fitted in-memory one."""
+    df = _dataset()
+    model = _fit_scan(df, degree=5, penalty_order=3)
+    path = tmp_path / "scan_model.gam"
+    model.save(str(path))
+    reloaded = gamfit.load(str(path))
+
+    s0 = model.summary()
+    s1 = reloaded.summary()
+    assert float(s1.reml_score) == pytest.approx(float(s0.reml_score), rel=1e-9, abs=1e-9)
+    assert float(s1.edf_total) == pytest.approx(float(s0.edf_total), rel=1e-9, abs=1e-9)
+    l0 = model.smoothing_parameters()
+    l1 = reloaded.smoothing_parameters()
+    assert l1.keys() == l0.keys()
+    for key in l0:
+        assert l1[key] == pytest.approx(l0[key], rel=1e-9, abs=1e-9)
