@@ -552,14 +552,23 @@ pub fn measure_jet_band(
     })
 }
 
-/// First-moment-exact quadrature of the empirical measure on the cell
+/// Support-constrained quadrature of the empirical measure on the cell
 /// partition induced by the seed centers: nearest-center assignment
 /// (deterministic tie-break: lowest center index) yields per-cell masses,
-/// and each cell's quadrature NODE is its mass-weighted barycenter — so the
-/// lumped measure matches μ's zeroth AND first moments per cell, one order
-/// better than placing the mass at the seed point. Empty cells keep their
-/// seed coordinates with zero mass (the assembly skips them; their
-/// representer columns remain valid).
+/// and each non-empty cell's quadrature NODE is its **medoid** — the in-cell
+/// data row nearest the cell's mass-weighted barycenter (deterministic ties to
+/// the lowest row index). The barycenter is the right first-moment summary of
+/// the cell, but it does NOT lie in the support: on a curved stratum the
+/// barycenter of an arc of points is pulled into the interior of the curvature
+/// by `≍ κ·(cell extent)²/8`, OFF the manifold. The medoid snaps that summary
+/// back onto an actual sample point, so the node stays on the data manifold
+/// while still tracking the cell's first moment. This matters because the SAME
+/// node set is the Gaussian-representer DESIGN center set: an off-manifold
+/// representer cannot peak where the data and the truth live, a level/tilt
+/// reconstruction bias that REML cannot remove by rescaling λ (it is a
+/// basis-span defect, not a smoothness-amount one) — the dominant accuracy
+/// limiter of this smooth (#1041). Empty cells keep their seed coordinates with
+/// zero mass (the assembly skips them; their representer columns remain valid).
 pub fn measure_jet_quadrature_nodes(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -618,11 +627,32 @@ pub fn measure_jet_quadrature_nodes(
             sums[(j, k)] += data[(i, k)];
         }
     }
+    // Cell barycenters: the first moment of μ on each cell (used only as the
+    // medoid target below, never as the node itself — see the fn docs).
+    let mut barycenter = sums;
     for j in 0..m {
         let count = masses[j] * n as f64;
         if count > 0.0 {
             for k in 0..d {
-                nodes[(j, k)] = sums[(j, k)] / count;
+                barycenter[(j, k)] /= count;
+            }
+        }
+    }
+    // Medoid snap: each non-empty cell's node is the in-cell data row nearest
+    // its barycenter (lowest-row-index tie break), keeping the node on the data
+    // manifold. Empty cells retain their seed coordinates (set above by the
+    // `centers.to_owned()` initialization).
+    let mut best_d2 = vec![f64::INFINITY; m];
+    for (i, &j) in assignments.iter().enumerate() {
+        let mut d2 = 0.0_f64;
+        for k in 0..d {
+            let diff = data[(i, k)] - barycenter[(j, k)];
+            d2 += diff * diff;
+        }
+        if d2 < best_d2[j] {
+            best_d2[j] = d2;
+            for k in 0..d {
+                nodes[(j, k)] = data[(i, k)];
             }
         }
     }
@@ -2237,7 +2267,7 @@ mod tests {
     /// (first-moment-exact lumping), with empty cells keeping their seed
     /// coordinates at zero mass.
     #[test]
-    fn quadrature_nodes_are_cell_barycenters() {
+    fn quadrature_nodes_are_cell_medoids() {
         // Two tight groups around (0,0) and (10,10); a third seed far away
         // captures nothing.
         let data = array![
@@ -2254,15 +2284,25 @@ mod tests {
         assert!((masses[0] - 0.6).abs() <= 1e-15);
         assert!((masses[1] - 0.4).abs() <= 1e-15);
         assert_eq!(masses[2], 0.0);
-        // Cell 0 barycenter = mean of the three assigned rows.
-        assert!((nodes[(0, 0)] - 0.2).abs() <= 1e-12);
-        assert!((nodes[(0, 1)] - 0.0).abs() <= 1e-12);
-        // Cell 1 barycenter.
-        assert!((nodes[(1, 0)] - 10.0).abs() <= 1e-12);
-        assert!((nodes[(1, 1)] - 10.0).abs() <= 1e-12);
+        // Cell 0 barycenter = (0.2, 0.0); the in-cell row nearest it is exactly
+        // (0.2, 0.0) (row 2), so the medoid is that data point — and, unlike the
+        // barycenter, it is itself a sample.
+        assert_eq!(nodes[(0, 0)], 0.2);
+        assert_eq!(nodes[(0, 1)], 0.0);
+        // Cell 1 barycenter = (10.0, 10.0); both rows are equidistant (‖·‖²=0.05),
+        // so the lowest-row-index tie break picks row 3 = (9.8, 10.1).
+        assert_eq!(nodes[(1, 0)], 9.8);
+        assert_eq!(nodes[(1, 1)], 10.1);
         // Empty cell keeps its seed coordinates.
         assert_eq!(nodes[(2, 0)], -50.0);
         assert_eq!(nodes[(2, 1)], -50.0);
+        // Every non-empty node is an actual data row (on-manifold contract).
+        for j in [0usize, 1usize] {
+            let on_manifold = data
+                .outer_iter()
+                .any(|row| row[0] == nodes[(j, 0)] && row[1] == nodes[(j, 1)]);
+            assert!(on_manifold, "node {j} must be a sampled data point");
+        }
     }
 
     /// Freeze→replay: rebuilding from the first build's frozen transform and
