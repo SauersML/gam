@@ -1808,21 +1808,16 @@ pub fn fit_residual_cascade(
             ));
         }
         let mut fit = design.fit_reml()?;
-        // Log the realized CG iteration count at this cascade depth (issue
-        // #1032 caveat: make the n-independence of the BPX bound visible, the
-        // way #1029 logs its line-search probes). `solve_iters` is 0 on the
-        // dense route (m ≤ DENSE_GRAM_MAX) and the realized PCG count on the
-        // iterative route; a count creeping toward CG_MAX_ITERS is the runtime
-        // tell that the quasi-uniformity guard's static aspect-ratio check was
-        // too lenient for this cloud.
-        eprintln!(
-            "residual_cascade: depth={levels} centers={} cg_iters={} \
-             solve_rel_residual={:.3e} aspect_ratio={:.3e}",
-            design.num_centers(),
-            fit.certificate.solve_iters,
-            fit.certificate.solve_rel_residual,
-            design.metric_scaled_aspect_ratio(),
-        );
+        // The realized CG iteration count at this cascade depth is the runtime
+        // tell of the BPX n-independence bound (issue #1032 caveat: a count
+        // creeping toward CG_MAX_ITERS means the quasi-uniformity guard's static
+        // aspect-ratio check was too lenient for this cloud). It is exposed
+        // STRUCTURALLY rather than over stderr: the per-depth count and backward
+        // error ride on `fit.certificate` (`solve_iters` — 0 on the dense route,
+        // the PCG count on the iterative route — and `solve_rel_residual`), so a
+        // caller that wants to watch the bound reads them off the returned fit
+        // instead of scraping log lines. (A library solve never writes to
+        // stderr.)
         let gain = design.next_level_gain_bound(&fit)?;
         let tolerance = REFINE_TOL * fit.rss_pen;
         match gain {
