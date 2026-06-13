@@ -848,6 +848,13 @@ fn beta_logit_custom_family_recovers_truth_and_generalises() {
         (y.iter().map(|v| (v - m).powi(2)).sum::<f64>() / N as f64).sqrt()
     };
 
+    eprintln!(
+        "PROBE truth_rmse={truth_rmse:.5} y_sd={y_sd:.5} | b_alpha=[{:.4},{:.4}] (true [{:.3},{:.3}]) b_beta=[{:.4},{:.4}] (true [{:.3},{:.3}]) | log_lambdas={:?} lambdas={:?}",
+        b_alpha[0], b_alpha[1], TRUE_A0, TRUE_A1,
+        b_beta[0], b_beta[1], TRUE_B0, TRUE_B1,
+        fit.log_lambdas, fit.lambdas,
+    );
+
     // ── METRIC 2 (SECONDARY): held-out predictive NLL, match-or-beat R MLE ──
     let gam_test_nll: Vec<f64> = test_idx
         .iter()
