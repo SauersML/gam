@@ -3558,6 +3558,22 @@ fn set_constant_curvature_kappa(
     term_idx: usize,
     psi: &[f64],
 ) -> Result<bool, EstimationError> {
+    let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
+        crate::bail_invalid_estim!(
+            "constant-curvature κ write-back: term index {term_idx} out of range"
+        );
+    };
+    set_single_term_constant_curvature_kappa(term, psi)
+}
+
+/// Single-term κ write-back: the shared validate+apply core, also used directly
+/// on the cached per-trial build spec in the incremental realizer (whose caller
+/// has already change-checked at the collection level and rebuilds regardless
+/// of the moved flag). Mirrors [`set_single_term_measure_jet_psi_dials`].
+fn set_single_term_constant_curvature_kappa(
+    term: &mut SmoothTermSpec,
+    psi: &[f64],
+) -> Result<bool, EstimationError> {
     if psi.len() != 1 {
         crate::bail_invalid_estim!(
             "constant-curvature κ write-back expects exactly one value, got {}",
@@ -3570,11 +3586,6 @@ fn set_constant_curvature_kappa(
             "constant-curvature κ write-back produced a non-finite κ = {next_kappa}"
         );
     }
-    let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
-        crate::bail_invalid_estim!(
-            "constant-curvature κ write-back: term index {term_idx} out of range"
-        );
-    };
     let SmoothBasisSpec::ConstantCurvature { spec: cc, .. } = &mut term.basis else {
         crate::bail_invalid_estim!(
             "constant-curvature κ write-back targeted a non-constant-curvature term"
@@ -19249,10 +19260,20 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         // the MEASURE_JET_PSI_* bounds block); route through the dial setter
         // so the κ-translation below never misreads them as log-scales.
         let measure_jet_term = measure_jet_term_spec(&self.spec, term_idx).is_some();
+        // Constant-curvature ψ is the raw signed curvature κ, NOT a log-scale;
+        // route through the κ setter so `spatial_term_psi_to_length_scale_and_aniso`
+        // never misreads it (and never hits the "no length scale" rejection).
+        let constant_curvature_term = constant_curvature_term_spec(&self.spec, term_idx).is_some();
         let mut next_length_scale = None;
         let mut next_aniso: Option<Vec<f64>> = None;
         if measure_jet_term {
             if !set_measure_jet_psi_dials(&mut self.spec, term_idx, psi)
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(false);
+            }
+        } else if constant_curvature_term {
+            if !set_constant_curvature_kappa(&mut self.spec, term_idx, psi)
                 .map_err(|e| e.to_string())?
             {
                 return Ok(false);
@@ -19306,6 +19327,13 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             // barycenter nodes, frozen quadrature + transform); only the
             // dials move per trial.
             set_single_term_measure_jet_psi_dials(&mut build_spec, psi)
+                .map_err(|e| e.to_string())?;
+        } else if constant_curvature_term {
+            // The cached build spec carries the κ-fixed geometry (UserProvided
+            // centers, frozen ℓ and constraint transform); only κ moves per
+            // trial, written through the raw-κ setter to match the collection
+            // write-back above.
+            set_single_term_constant_curvature_kappa(&mut build_spec, psi)
                 .map_err(|e| e.to_string())?;
         } else {
             if let Some(length_scale) = next_length_scale {
