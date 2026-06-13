@@ -20951,6 +20951,68 @@ where
         cache.designs().into_iter().cloned().collect()
     }
 
+    // ── Discriminating outer-gradient FD audit (issue #1040) ──
+    //
+    // On a diagnostic-sized problem, run the single test that forks the two
+    // failure modes of a non-terminating outer loop: an objective↔gradient
+    // desync (analytic ≠ FD on some θ component → the trust region chases a
+    // phantom descent direction forever) vs weak identifiability (analytic ≈ FD
+    // but a near-zero outer-Hessian eigenvalue → a genuinely flat valley). This
+    // runs the real outer evaluator (`exact_fn`) at θ₀ and central-differences
+    // the criterion component-by-component, then reports the per-block analytic
+    // gradient norms, the analytic-vs-FD gaps, and the outer-Hessian spectrum.
+    //
+    // Gated strictly to small problems so it never taxes a production fit: the
+    // failing large-scale fits skip it entirely. Auto-derived from the realized
+    // (n, θ_dim) — no flag.
+    const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
+    const OUTER_FD_AUDIT_MAX_THETA_DIM: usize = 32;
+    if analytic_joint_gradient_available
+        && n_total <= OUTER_FD_AUDIT_MAX_N
+        && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM
+    {
+        let audit = (|| -> Result<crate::solver::outer_strategy::OuterGradientFdAudit, String> {
+            let mut eval_at = |theta: &Array1<f64>,
+                               mode: crate::solver::estimate::reml::unified::EvalMode|
+             -> Result<
+                (
+                    f64,
+                    Array1<f64>,
+                    crate::solver::outer_strategy::HessianResult,
+                ),
+                String,
+            > {
+                state
+                    .cache
+                    .ensure_theta(theta)
+                    .map_err(|e| format!("fd-audit ensure_theta: {e}"))?;
+                let specs = collect_specs(&state.cache);
+                let designs = collect_designs(&state.cache);
+                let row_set_borrow = current_row_set.borrow();
+                (*exact_fn_cell.borrow_mut())(theta, &specs, &designs, mode, &row_set_borrow)
+            };
+            let rho_dim_audit = rho_dim;
+            let psi_dim_audit = psi_dim;
+            let aux_dim_audit = joint_setup.auxiliary_dim();
+            let label = move |i: usize| -> String {
+                if i < rho_dim_audit {
+                    format!("rho[{i}]")
+                } else if i < rho_dim_audit + (psi_dim_audit - aux_dim_audit) {
+                    format!("psi_kappa[{}]", i - rho_dim_audit)
+                } else {
+                    format!("aux[{}]", i - rho_dim_audit - (psi_dim_audit - aux_dim_audit))
+                }
+            };
+            crate::solver::outer_strategy::outer_gradient_fd_audit(
+                &theta0, 1e-4, label, &mut eval_at,
+            )
+        })();
+        match audit {
+            Ok(audit) => audit.log_verdict("spatial-exact-joint"),
+            Err(e) => log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] skipped: {e}"),
+        }
+    }
+
     let result = {
         let eval_outer = |ctx: &mut &mut NBlockExactJointState<'_>,
                           theta: &Array1<f64>,
