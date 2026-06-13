@@ -58,14 +58,21 @@
 //! flow-pinned arms share one exact Gauss–Newton core
 //! ([`minimize_isometry_defect_flow`]).
 //!
-//! `S²` (sphere atoms) is the remaining #1019 stage-2 gap, refused on
-//! purpose: by the hairy-ball theorem every smooth tangent vector field on
-//! `S²` has zeros, so there is **no global pole-free flow basis** with which
-//! to parameterize `Diff(S²)` the way the torus and free-patch paths do.
-//! Canonicalizing sphere charts needs a genuinely different representative
-//! (harmonic-map / Plateau-type); sphere atoms are left on their fitted
-//! charts, with the round-sphere isometry DEFECT reported as an honest
-//! measurement ([`sphere_chart_isometry_defect`]).
+//! `S²` (sphere atoms): the hairy-ball theorem rules out a single global
+//! pole-free flow basis the way the torus and free-patch paths use, so the
+//! sphere representative is the **round-sphere conformal-boost flow** — the
+//! gradients of the three degree-1 harmonics (`K_z` zonal, pole-free in its one
+//! latitude component; `K_x`, `K_y` carrying the longitudinal pole the theorem
+//! forces somewhere). Minimizing the isometry defect over these three boosts
+//! breaks the conformal (Möbius) moduli down to the round sphere's isometry
+//! group `O(3)` — the chart pathology a bare harmonic energy cannot pin
+//! ([`sphere_isometry_flow_reparameterization`], on a pole-margin band so the
+//! `1/cos lat` boost stays well-conditioned). The same exact-image-frozen LS
+//! decoder transport gates the commit: a boosted image only freezes to the
+//! recomposition floor inside a basis rich enough to absorb it, so a too-poor
+//! basis honestly refuses rather than silently altering the image. The
+//! round-sphere isometry DEFECT remains available as a standalone measurement
+//! ([`sphere_chart_isometry_defect`]).
 
 use faer::Side as FaerSide;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};

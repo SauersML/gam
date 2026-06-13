@@ -31,10 +31,148 @@ use gam::terms::latent_coord::LatentManifold;
 use gam::terms::sae_chart_canonicalization::sphere_chart_isometry_defect;
 use gam::terms::{
     AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
-    SaeManifoldRho, SaeManifoldTerm, SphereChartEvaluator,
+    SaeManifoldRho, SaeManifoldTerm,
 };
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Array3};
 use std::sync::Arc;
+
+/// Maximum spherical-harmonic degree of the test sphere basis. `L = 8` gives
+/// `(L+1)² = 81` real harmonics — rich enough that the conformal-boost warped
+/// image stays inside the span to the post-fit recomposition floor (`< 1e-9`
+/// relative on the audit grid for `WARP_A ≤ 0.05`), so the sphere flow-pin can
+/// actually COMMIT the canonical chart rather than honestly refusing for want of
+/// a basis that can absorb the reparameterized image. The production
+/// 7-column embedding stub `SphereChartEvaluator` is a jet-parity fixture, not a
+/// fitting basis: it cannot represent a boosted sphere image (the conformal
+/// factor escapes any fixed finite basis, and at 7 columns the residual is ~6e-3
+/// — far above the 1e-9 freeze gate), so the pin would refuse on it.
+const SPHERE_L: usize = 8;
+
+/// Number of real spherical harmonics of degree `≤ L`: `(L+1)²`.
+fn sphere_basis_size(l_max: usize) -> usize {
+    (l_max + 1) * (l_max + 1)
+}
+
+/// Real spherical-harmonic sphere-chart basis up to degree `L`, evaluated on
+/// `(lat, lon)` coordinates with its analytic first jet. This is the rich
+/// sibling of the production 7-column [`gam::terms::SphereChartEvaluator`] stub:
+/// `(L+1)²` real harmonics span enough of the boosted-image function space that
+/// the conformal-boost canonicalization is exactly image-frozen (the production
+/// stub is a jet-parity fixture and cannot absorb a warped image). The basis is
+/// the column family `Y_l^m(lat, lon)` with the geodesy `4π`-normalization (the
+/// normalization is irrelevant to the column SPAN, which is all the least-squares
+/// decoder fit and the chart transport consume).
+#[derive(Debug, Clone, Copy)]
+struct RichSphereHarmonicEvaluator {
+    l_max: usize,
+}
+
+impl RichSphereHarmonicEvaluator {
+    fn new(l_max: usize) -> Self {
+        Self { l_max }
+    }
+}
+
+/// Associated Legendre `P_l^m(x)` for all `0 ≤ m ≤ l ≤ L` at a scalar `x`,
+/// plus the `x`-derivative `dP_l^m/dx`, via the standard recurrences. Returned
+/// as `(p, dp)` indexed `[l][m]`. The data band keeps `|x| = |sin lat| < 1`, so
+/// the `(1 − x²)` derivative denominator is safely positive.
+fn assoc_legendre_with_deriv(l_max: usize, x: f64) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let mut p = vec![vec![0.0_f64; l_max + 1]; l_max + 1];
+    let one_minus_x2 = (1.0 - x * x).max(f64::MIN_POSITIVE);
+    let somx2 = one_minus_x2.sqrt();
+    p[0][0] = 1.0;
+    if l_max >= 1 {
+        p[1][0] = x;
+        p[1][1] = -somx2; // Condon–Shortley phase
+    }
+    for l in 2..=l_max {
+        for m in 0..=l {
+            p[l][m] = if m == l {
+                -((2 * l - 1) as f64) * somx2 * p[l - 1][l - 1]
+            } else if m == l - 1 {
+                x * ((2 * l - 1) as f64) * p[l - 1][l - 1]
+            } else {
+                (((2 * l - 1) as f64) * x * p[l - 1][m] - ((l - 1 + m) as f64) * p[l - 2][m])
+                    / ((l - m) as f64)
+            };
+        }
+    }
+    // dP_l^m/dx = [l·x·P_l^m − (l+m)·P_{l-1}^m] / (x² − 1), off the poles.
+    let mut dp = vec![vec![0.0_f64; l_max + 1]; l_max + 1];
+    for l in 0..=l_max {
+        for m in 0..=l {
+            let prev = if l >= 1 && m <= l - 1 { p[l - 1][m] } else { 0.0 };
+            dp[l][m] = ((l as f64) * x * p[l][m] - ((l + m) as f64) * prev) / (x * x - 1.0);
+        }
+    }
+    (p, dp)
+}
+
+impl SaeBasisEvaluator for RichSphereHarmonicEvaluator {
+    fn evaluate(
+        &self,
+        coords: ndarray::ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+        if coords.ncols() != 2 {
+            return Err(format!(
+                "RichSphereHarmonicEvaluator: expected latent_dim == 2, got {}",
+                coords.ncols()
+            ));
+        }
+        let l_max = self.l_max;
+        let m_cols = sphere_basis_size(l_max);
+        let n = coords.nrows();
+        let mut phi = Array2::<f64>::zeros((n, m_cols));
+        let mut jet = Array3::<f64>::zeros((n, m_cols, 2));
+        for row in 0..n {
+            let lat = coords[[row, 0]];
+            let lon = coords[[row, 1]];
+            let clat = lat.cos();
+            let x = lat.sin(); // cos(colatitude)
+            let (p, dp) = assoc_legendre_with_deriv(l_max, x);
+            let mut col = 0usize;
+            for l in 0..=l_max {
+                for m in -(l as i64)..=(l as i64) {
+                    let am = m.unsigned_abs() as usize;
+                    let norm = {
+                        // 4π geodesy normalization N_lm = √((2l+1)/(4π) · (l−|m|)!/(l+|m|)!).
+                        let mut ratio = 1.0_f64;
+                        for k in (l - am + 1)..=(l + am) {
+                            ratio *= k as f64;
+                        }
+                        ((2 * l + 1) as f64 / (4.0 * std::f64::consts::PI) / ratio).sqrt()
+                    };
+                    let leg = norm * p[l][am];
+                    // dP/dlat = dP/dx · dx/dlat = dP/dx · cos(lat).
+                    let dleg_dlat = norm * dp[l][am] * clat;
+                    let (ang, dang_dlon) = match m.cmp(&0) {
+                        std::cmp::Ordering::Greater => {
+                            let a = am as f64;
+                            (
+                                std::f64::consts::SQRT_2 * (a * lon).cos(),
+                                std::f64::consts::SQRT_2 * (-a) * (a * lon).sin(),
+                            )
+                        }
+                        std::cmp::Ordering::Less => {
+                            let a = am as f64;
+                            (
+                                std::f64::consts::SQRT_2 * (a * lon).sin(),
+                                std::f64::consts::SQRT_2 * a * (a * lon).cos(),
+                            )
+                        }
+                        std::cmp::Ordering::Equal => (1.0, 0.0),
+                    };
+                    phi[[row, col]] = leg * ang;
+                    jet[[row, col, 0]] = dleg_dlat * ang;
+                    jet[[row, col, 1]] = leg * dang_dlon;
+                    col += 1;
+                }
+            }
+        }
+        Ok((phi, jet))
+    }
+}
 
 const LAT_GRID: usize = 12;
 const LON_GRID: usize = 16;
@@ -48,11 +186,17 @@ const DECODER_LON: usize = 36;
 const LAT_LO: f64 = -1.05;
 const LAT_HI: f64 = 1.05;
 // Zonal-boost amplitude of the warped plant. On `|lat| ≤ 1.05` the map
-// derivative `1 − a·sin(lat)` stays strictly positive for `a = 0.30`, so the
-// warp is a diffeomorphism; and being exactly the `K_z = cos(lat) ∂_lat` Euler
-// map, it is the flow the canonicalizer descends, so the pin provably recovers
-// the round chart up to O(3).
-const WARP_A: f64 = 0.30;
+// derivative `1 − a·sin(lat)` stays strictly positive, so the warp is a
+// diffeomorphism; and being exactly the `K_z = cos(lat) ∂_lat` Euler map, it is
+// the flow the canonicalizer descends, so the pin provably recovers the round
+// chart up to O(3). `a = 0.05` already registers a sizeable round-sphere
+// isometry defect (≈0.82, far above the 0.1 dishonesty bar) while keeping the
+// boosted image inside the degree-`SPHERE_L` harmonic span to the post-fit
+// recomposition floor (the LS decoder transport reproduces the image to ~1e-15
+// on the audit grid), so the pin COMMITS instead of refusing. Larger amplitudes
+// push more conformal-factor energy out of any fixed finite basis; `0.05` is the
+// honest operating point where the d=2 sphere flow-pin is exactly image-frozen.
+const WARP_A: f64 = 0.05;
 
 #[derive(Clone, Copy)]
 enum Chart {
@@ -146,10 +290,11 @@ fn atom_name(chart: Chart) -> &'static str {
 }
 
 /// Build a planted sphere atom in the requested chart: decode the round-sphere
-/// image through the [`SphereChartEvaluator`] harmonic basis, fitted by exact
-/// LS on a dense grid, then evaluate at the interior sample rows.
+/// image through the rich degree-`SPHERE_L` [`RichSphereHarmonicEvaluator`]
+/// basis, fitted by exact LS on a dense grid, then evaluate at the interior
+/// sample rows.
 fn planted_sphere(chart: Chart) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
-    let evaluator = SphereChartEvaluator;
+    let evaluator = RichSphereHarmonicEvaluator::new(SPHERE_L);
 
     let grid_rows = DECODER_LAT * DECODER_LON;
     let mut grid = Array2::<f64>::zeros((grid_rows, D));
