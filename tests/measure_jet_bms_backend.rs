@@ -243,24 +243,28 @@ fn bms_marginal_slope_accepts_measure_jet_backbone() {
          backbone is not recovering the marginal-slope signal"
     );
 
-    // (c) Measure-jet diagnostic analogue of the template family's lambda-count
-    // checks: in spectral (per-level) mode the mjs term contributes one penalty
-    // candidate per realized scale plus the double-penalty ridge — band+1
-    // penalties per surface, with the band read off the frozen quadrature.
-    let marginal_band = mjs_band_len(&out.marginalspec_resolved, "marginal");
+    // (c) Measure-jet diagnostic: at the issue's small center count
+    // (`centers=16`, below the rich-mode threshold) the mjs term resolves to
+    // SIMPLE mode — one fused penalty plus the double-penalty ridge per
+    // surface, the same outer footprint as Duchon/Matérn (#1039). The
+    // per-scale spectral split is reserved for large center counts where the
+    // spectrum is identifiable; here it would only inflate the marginal-slope
+    // family's O(n) per-evaluation cost for no benefit. The band is still
+    // realized (frozen quadrature non-empty), it just feeds one fused penalty.
+    assert!(
+        mjs_band_len(&out.marginalspec_resolved, "marginal") >= 1,
+        "marginal mjs surface must still realize a scale band"
+    );
     assert_eq!(
         out.marginal_design.penalties.len(),
-        marginal_band + 1,
-        "marginal mjs surface must contribute one penalty per realized scale plus \
-         the ridge (band {marginal_band} + 1), got {} penalties",
+        2,
+        "small-centers mjs surface must be SIMPLE: one fused penalty + ridge, got {}",
         out.marginal_design.penalties.len()
     );
-    let logslope_band = mjs_band_len(&out.logslopespec_resolved, "logslope");
     assert_eq!(
         out.logslope_design.penalties.len(),
-        logslope_band + 1,
-        "logslope mjs surface must contribute one penalty per realized scale plus \
-         the ridge (band {logslope_band} + 1), got {} penalties",
+        2,
+        "small-centers logslope mjs surface must be SIMPLE: one fused penalty + ridge, got {}",
         out.logslope_design.penalties.len()
     );
 }
