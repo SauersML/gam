@@ -644,6 +644,160 @@ impl ExactGaussianFullConformal {
             boundary_margin,
         }
     }
+
+    /// Collapse the exact set to the single outer `[lower, upper]` envelope an
+    /// interval-style predict surface reports. The exact set is a UNION of
+    /// intervals; the smallest interval that contains it is `[min lo, max hi]`,
+    /// and that envelope inherits the set's coverage (it is a superset). When
+    /// the set is empty (no candidate qualifies — pathological tiny α·(n+1))
+    /// the envelope collapses to the point prediction `mu_point`, the only
+    /// honest scalar answer. Infinite endpoints are passed through unchanged:
+    /// an unbounded honest set reports an unbounded interval, exactly as the
+    /// split path reports `±∞` when its multiplier is infinite.
+    pub fn outer_envelope(&self, alpha: f64, mu_point: f64) -> (f64, f64) {
+        let set = self.prediction_set(alpha);
+        if set.intervals.is_empty() {
+            return (mu_point, mu_point);
+        }
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for itv in &set.intervals {
+            lo = lo.min(itv.lo);
+            hi = hi.max(itv.hi);
+        }
+        (lo, hi)
+    }
+}
+
+/// Recover the fitted penalty `Sλ` (original coefficient basis) from the two
+/// post-fit geometry artifacts the solver already stores: the penalized
+/// Hessian `H = X'WX + Sλ` and the weighted Gram `X'WX`. Their difference is
+/// the assembled penalty at the fitted smoothing parameters — the exact `Sλ`
+/// the augmented full-conformal fit must reuse so the augmented row is treated
+/// identically to a training row. Returns an error when either artifact is
+/// absent (large-model fits skip the dense Gram), so the caller can fall back
+/// to the split path rather than fabricate a penalty.
+pub fn fitted_penalty_from_hessian_and_gram(
+    penalized_hessian: &Array2<f64>,
+    weighted_gram: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    if penalized_hessian.dim() != weighted_gram.dim() {
+        return Err(format!(
+            "full conformal: penalized Hessian {:?} and weighted Gram {:?} shape mismatch",
+            penalized_hessian.dim(),
+            weighted_gram.dim()
+        ));
+    }
+    let mut s = penalized_hessian - weighted_gram;
+    // Symmetrize to kill round-off asymmetry before the SPD factorization.
+    let p = s.nrows();
+    for i in 0..p {
+        for j in (i + 1)..p {
+            let avg = 0.5 * (s[[i, j]] + s[[j, i]]);
+            s[[i, j]] = avg;
+            s[[j, i]] = avg;
+        }
+    }
+    Ok(s)
+}
+
+/// Whether the exact Gaussian-identity full-conformal set is the right tool for
+/// a calibration fold of size `n_cal` at miscoverage `alpha` — the
+/// magic-by-default decision (no user flag). Split conformal's order-statistic
+/// multiplier is `+∞` (an unbounded, useless interval) whenever the calibration
+/// fold is too small to resolve the `(1−α)` quantile: the smallest `q̂` index
+/// `⌈(n_cal+1)(1−α)⌉` exceeds `n_cal` exactly when `n_cal < (1−α)/α`. In that
+/// small-`n` regime the FULL-conformal set still delivers finite-sample valid,
+/// typically finite, intervals because it uses all `n_cal+1` points jointly.
+/// Above the threshold split conformal is finite and cheaper, so we leave it.
+pub fn gaussian_full_conformal_is_preferred(n_cal: usize, alpha: f64) -> bool {
+    if !(alpha > 0.0 && alpha < 1.0) {
+        return false;
+    }
+    (n_cal as f64) < (1.0 - alpha) / alpha
+}
+
+/// Exact Gaussian-identity full-conformal `[lower, upper]` envelopes for a batch
+/// of test rows, using a held-out calibration fold as the `n_cal` exchangeable
+/// rows (#942 / #1054 wiring).
+///
+/// The calibration fold is labeled data not used to fit the model, so the
+/// `n_cal` calibration rows plus any one test row are exchangeable — the only
+/// requirement full conformal needs. For each test row `x_*` the augmented
+/// penalized least-squares fit at the FITTED penalty `Sλ` (reused unchanged, so
+/// the augmented row is symmetric with the calibration rows) yields the exact
+/// affine-in-`z` conformal set; we report its outer `[lower, upper]` envelope.
+///
+/// Offsets are folded into the response (`y_eff = y − offset`) so the engine
+/// sees the pure linear model `η = Xβ`; the test offset is added back to the
+/// returned envelope so the bounds live on the response scale the caller
+/// reports. Gaussian identity link makes response scale equal to the linear
+/// predictor scale, so no further transform is needed.
+///
+/// The held-out calibration fold the Gaussian full-conformal envelope router
+/// treats as the `n_cal` exchangeable rows: the design in fitted-coefficient
+/// coordinates, the labeled response, and the per-row offset.
+pub struct GaussianConformalCalibration<'a> {
+    pub x_cal: &'a Array2<f64>,
+    pub y_cal: &'a Array1<f64>,
+    pub offset_cal: &'a Array1<f64>,
+    /// The fitted penalty `Sλ` (original basis), reused unchanged so the
+    /// augmented test row stays symmetric with the calibration rows.
+    pub s_lambda: &'a Array2<f64>,
+}
+
+/// The test rows the router emits envelopes for: design in the SAME coordinates
+/// as the calibration design, per-row offset, and the model's point prediction
+/// `μ̂` on the response scale (used as the honest scalar when the exact set is
+/// empty).
+pub struct GaussianConformalTest<'a> {
+    pub x_test: &'a Array2<f64>,
+    pub offset_test: &'a Array1<f64>,
+    pub mu_test: &'a Array1<f64>,
+}
+
+/// Returns `(lower, upper)` column vectors aligned with the test rows.
+pub fn gaussian_full_conformal_envelopes(
+    cal: &GaussianConformalCalibration<'_>,
+    test: &GaussianConformalTest<'_>,
+    alpha: f64,
+) -> Result<(Array1<f64>, Array1<f64>), String> {
+    let n_cal = cal.x_cal.nrows();
+    let p = cal.x_cal.ncols();
+    if cal.y_cal.len() != n_cal || cal.offset_cal.len() != n_cal {
+        return Err("full conformal: calibration row-count mismatch".to_string());
+    }
+    if test.x_test.ncols() != p {
+        return Err("full conformal: test/calibration column mismatch".to_string());
+    }
+    let n_test = test.x_test.nrows();
+    if test.offset_test.len() != n_test || test.mu_test.len() != n_test {
+        return Err("full conformal: test row-count mismatch".to_string());
+    }
+    // Fold offsets into the response: the conformal residual is on the offset
+    // corrected linear model, so y_eff = y − offset is what the engine scores.
+    let mut y_eff = cal.y_cal.clone();
+    for i in 0..n_cal {
+        y_eff[i] -= cal.offset_cal[i];
+    }
+    let weights = Array1::<f64>::ones(n_cal);
+
+    let mut lower = Array1::<f64>::zeros(n_test);
+    let mut upper = Array1::<f64>::zeros(n_test);
+    for t in 0..n_test {
+        let x_star = test.x_test.row(t).to_owned();
+        let engine =
+            ExactGaussianFullConformal::new(cal.x_cal, &y_eff, &weights, cal.s_lambda, &x_star)?;
+        // The engine works on the offset-folded response; the point prediction
+        // on THAT scale is mu_test − offset_test.
+        let mu_folded = test.mu_test[t] - test.offset_test[t];
+        let (lo, hi) = engine.outer_envelope(alpha, mu_folded);
+        // Add the test offset back so the reported bounds are on the response
+        // scale (= linear-predictor scale under the identity link).
+        lower[t] = lo + test.offset_test[t];
+        upper[t] = hi + test.offset_test[t];
+    }
+    Ok((lower, upper))
 }
 
 /// The symmetric augmented fitting map the discrete enumeration arm walks.
