@@ -201,28 +201,8 @@ fn bms_matern_fit_is_invariant_to_worker_pool_size() {
         "host must expose >{narrow} threads to exercise the invariance gate (got {wide})"
     );
 
-    // Time the wide vs narrow fit (and a couple of intermediate pool sizes) so
-    // the same already-sanctioned run that proves invariance also yields the
-    // #1045 wall-clock A/B. Timing is logged, not asserted — only the
-    // fit-output invariance below is a hard gate.
-    let mut a_opt: Option<FitDigest> = None;
-    let mut b_opt: Option<FitDigest> = None;
-    for &threads in [wide, 32usize, narrow].iter() {
-        if threads > wide {
-            continue;
-        }
-        let t0 = std::time::Instant::now();
-        let digest = fit_on_pool(threads, &data, &spec);
-        let secs = t0.elapsed().as_secs_f64();
-        eprintln!("[1045-AB] threads={threads:>3} wallclock_s={secs:7.2}");
-        if threads == wide {
-            a_opt = Some(digest);
-        } else if threads == narrow {
-            b_opt = Some(digest);
-        }
-    }
-    let a = a_opt.expect("wide-pool fit recorded");
-    let b = b_opt.expect("narrow-pool fit recorded");
+    let a = fit_on_pool(wide, &data, &spec);
+    let b = fit_on_pool(narrow, &data, &spec);
 
     // The convergence path itself must not fork: a different iteration count or
     // converged flag means the smaller pool steered the optimizer elsewhere.
