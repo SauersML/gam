@@ -12623,6 +12623,15 @@ const JEFFREYS_COMPLETION_RESIDUAL_BAND: f64 = 300.0;
 /// curvature on a well-conditioned problem.
 const JOINT_SPECTRAL_LEVENBERG_FACTOR: f64 = 1.0e-3;
 
+/// Condition number above which a FULL-RANK (`nullity == 0`) penalized Hessian is
+/// treated as ill-conditioned enough that a family opting into
+/// [`CustomFamily::levenberg_on_ill_conditioning`] gets the self-vanishing
+/// constrained-QP Levenberg floor (gam#1040). Below it the active-set QP minimiser
+/// is well-determined and the EXACT undamped Newton/KKT solve keeps its quadratic
+/// convergence; the survival marginal-slope joint sits at cond ≈ 5.8e6, far above
+/// this gate, while a tiny well-conditioned constrained AFT sits well below it.
+const LEVENBERG_ILL_CONDITIONING_THRESHOLD: f64 = 1.0e4;
+
 #[derive(Clone, Debug)]
 struct JointSpectralNewtonStep {
     delta: Array1<f64>,
@@ -13289,6 +13298,47 @@ fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<usize> {
     }
     let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
     Some(evals.iter().filter(|x| x.abs() < cutoff).count())
+}
+
+/// Numerical null-space count AND the (range-space) condition number of a
+/// symmetric penalized Hessian, from ONE eigendecomposition.
+///
+/// `nullity` counts eigenvalues below the shared rank tolerance (`< tol·λmax`);
+/// `condition` is `λmax / λmin_range` where `λmin_range` is the smallest
+/// eigenvalue magnitude ABOVE that tolerance (the smallest *identified*
+/// curvature). On a full-rank-but-ill-conditioned `H_pen` (`nullity == 0`,
+/// `condition` large) the constrained active-set QP minimiser is unique only up
+/// to round-off along the near-null mode, so without a Levenberg floor the
+/// active set slides an O(1) proposal step every cycle and the inner solve
+/// grinds its whole budget — the survival marginal-slope hang (gam#1040). Both
+/// signals come from the single `eigh` the nullity check already paid for.
+fn symmetric_penalized_hessian_nullity_and_condition(
+    lhs: &Array2<f64>,
+) -> Option<(usize, f64)> {
+    let p = lhs.nrows();
+    if p == 0 || lhs.ncols() != p {
+        return Some((0, 1.0));
+    }
+    let (evals, _) = FaerEigh::eigh(lhs, Side::Lower).ok()?;
+    let max_abs = evals.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
+    if !(max_abs.is_finite() && max_abs > 0.0) {
+        return None;
+    }
+    let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+    let nullity = evals.iter().filter(|x| x.abs() < cutoff).count();
+    // Smallest identified (range-space) eigenvalue magnitude: the floor for the
+    // condition number. Eigenvalues below `cutoff` are the null space, excluded.
+    let min_range = evals
+        .iter()
+        .map(|x: &f64| x.abs())
+        .filter(|&m| m >= cutoff && m > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let condition = if min_range.is_finite() && min_range > 0.0 {
+        max_abs / min_range
+    } else {
+        f64::INFINITY
+    };
+    Some((nullity, condition))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15188,8 +15238,40 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // unidentified time-warp gauge) keeps the floor and its hang
                     // fix unchanged. `None` (eigensolve failed / zero Hessian)
                     // falls back to the damped path conservatively.
-                    let hpen_nullity = symmetric_penalized_hessian_nullity(&lhs);
-                    let apply_constrained_floor = hpen_nullity.map(|n| n > 0).unwrap_or(true);
+                    // gam#1040: the survival marginal-slope joint shares one
+                    // matern PC basis between the marginal and the log-slope
+                    // surface, so `H_pen` is FULL RANK (`nullity == 0`) yet
+                    // severely ill-conditioned (cond ≈ 5.8e6). With the floor
+                    // gated on `nullity > 0` alone the undamped active-set QP has
+                    // a constrained minimiser that is unique only up to round-off
+                    // along the near-null mode: the active set slides an O(1)
+                    // proposal step every cycle, `step_inf` never exhausts, the
+                    // constrained-fixed-point / KKT certificate never fires, and
+                    // the inner joint-Newton grinds the full cycle budget on EVERY
+                    // outer ρ-eval (the hours-long survival-MS hang). The family
+                    // opts into damping this case via
+                    // `levenberg_on_ill_conditioning()`; the self-vanishing μ
+                    // (∝ projected residual → 0 at the KKT fixed point) gives the
+                    // near-null mode a tiny positive curvature so the minimiser is
+                    // unique and `step_inf` exhausts, WITHOUT moving the converged
+                    // β. Apply it only when the matrix is genuinely ill-conditioned
+                    // (`cond > LEVENBERG_ILL_CONDITIONING_THRESHOLD`); a
+                    // well-conditioned full-rank constrained fit (the tiny
+                    // unpenalised loglogistic AFT, #736/#735/#721, where the floor
+                    // would cap the convergence rate at the geometric H/(H+μ) ratio)
+                    // keeps the EXACT undamped Newton/KKT solve and its quadratic
+                    // convergence. `None` (eigensolve failed / zero Hessian) falls
+                    // back to the damped path conservatively.
+                    let (hpen_nullity, hpen_condition) =
+                        match symmetric_penalized_hessian_nullity_and_condition(&lhs) {
+                            Some((n, c)) => (Some(n), c),
+                            None => (None, f64::INFINITY),
+                        };
+                    let nullity_floor = hpen_nullity.map(|n| n > 0).unwrap_or(true);
+                    let ill_conditioned_floor = family.levenberg_on_ill_conditioning()
+                        && hpen_nullity == Some(0)
+                        && hpen_condition > LEVENBERG_ILL_CONDITIONING_THRESHOLD;
+                    let apply_constrained_floor = nullity_floor || ill_conditioned_floor;
                     // Self-vanishing scale = the PROJECTED stationarity residual
                     // (`current_kkt_norm`), NOT the raw ‖∇ℓ − Sβ + ∇Φ‖∞. At a
                     // CONSTRAINED optimum the raw RHS converges to the active-set
