@@ -211,7 +211,10 @@ fn gam_loglogistic_aft_matches_lifelines_on_haberman_ages() {
     // anchor the fit used so every grid evaluation reuses the same basis.
     let train_entry = Array1::<f64>::zeros(n);
     let train_exit = Array1::<f64>::from_vec(time.clone());
-    let (resolved_cfg, anchor, anchor_row) = resolve_training_time_basis(&train_entry, &train_exit);
+    // Pass the same time_num_internal_knots the FitConfig uses (2) so the
+    // resolved knot vector and keep_cols column count match the fitted beta.
+    let (resolved_cfg, anchor, anchor_row) =
+        resolve_training_time_basis(&train_entry, &train_exit, cfg.time_num_internal_knots);
     let time_ctx = TimeBasisCtx {
         resolved_cfg,
         anchor,
@@ -362,6 +365,7 @@ emit("a_age", a_age)
 fn resolve_training_time_basis(
     train_entry: &Array1<f64>,
     train_exit: &Array1<f64>,
+    time_num_internal_knots: usize,
 ) -> (SurvivalTimeBasisConfig, f64, Array1<f64>) {
     let cfg = SurvivalTimeBasisConfig::ISpline {
         degree: 3,
@@ -373,8 +377,9 @@ fn resolve_training_time_basis(
         train_entry,
         train_exit,
         cfg,
-        // (num_internal_knots, smooth_lambda) — gam's location-scale defaults.
-        Some((8, 1e-2)),
+        // Must match the FitConfig's time_num_internal_knots so the resolved
+        // basis (knots + keep_cols) agrees with what the training engine used.
+        Some((time_num_internal_knots, 1e-2)),
     )
     .expect("resolve training survival time basis");
     let resolved_cfg = resolved_survival_time_basis_config_from_build(
