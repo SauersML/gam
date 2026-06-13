@@ -744,7 +744,10 @@ mod tests {
         // Negative tiny pivot ~ -6e-11 → sign=-1, order=floor(log10(6e-11))=-11.
         assert_eq!(
             dominant_magnitude_bucket("non-PD pivot=-6e-11; rest"),
-            Some(MagnitudeBucket { sign: -1, order: -11 })
+            Some(MagnitudeBucket {
+                sign: -1,
+                order: -11
+            })
         );
         // KKT residual stuck at 1e3 → sign=+1, order=3.
         assert_eq!(
@@ -771,7 +774,13 @@ mod tests {
         let sig = generic_signature(&rej.failure);
         assert_eq!(sig.0, FailureVariantTag::Other);
         // pivot= marker wins over |∇l-sβ|=: -6e-11 → sign=-1, order=-11.
-        assert_eq!(sig.1, Some(MagnitudeBucket { sign: -1, order: -11 }));
+        assert_eq!(
+            sig.1,
+            Some(MagnitudeBucket {
+                sign: -1,
+                order: -11
+            })
+        );
         assert_eq!(generic_signature_label(&sig), "other@-1e-11");
     }
 
@@ -798,7 +807,10 @@ mod tests {
             sig,
             (
                 FailureVariantTag::Other,
-                Some(MagnitudeBucket { sign: -1, order: -11 })
+                Some(MagnitudeBucket {
+                    sign: -1,
+                    order: -11
+                })
             )
         );
     }
@@ -840,7 +852,13 @@ mod tests {
             .expect("trailing run of three identical signatures must fire");
         assert_eq!(run, 3);
         assert_eq!(sig.0, FailureVariantTag::Other);
-        assert_eq!(sig.1, Some(MagnitudeBucket { sign: -1, order: -11 }));
+        assert_eq!(
+            sig.1,
+            Some(MagnitudeBucket {
+                sign: -1,
+                order: -11
+            })
+        );
     }
 
     /// An unquantified failure run (no parseable pivot/KKT numeric) is never
@@ -883,7 +901,10 @@ mod tests {
         assert_eq!(
             generic_signature_label(&(
                 FailureVariantTag::CertRefused,
-                Some(MagnitudeBucket { sign: -1, order: -11 })
+                Some(MagnitudeBucket {
+                    sign: -1,
+                    order: -11
+                })
             )),
             "cert_refused@-1e-11"
         );
