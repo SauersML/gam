@@ -216,6 +216,108 @@ pub struct SurvivalPredictResult {
     pub eta_se: Option<Array1<f64>>,
 }
 
+/// Trapezoidal integral of a per-row survival curve `s(t)` sampled at the shared
+/// increasing `times` grid, restricted to `[0, tau]` — the restricted mean
+/// survival time (RMST) at horizon `tau`.
+///
+/// `RMST_i(tau) = \int_0^{tau} S_i(t) dt`. This is the standard clinical-trial
+/// survival summary (`survRM2`, lifelines `restricted_mean_survival_time`,
+/// flexsurv `rmst_*`): the area under the survival curve up to `tau`, equal to
+/// the mean of `min(T_i, tau)`. The curve is integrated with the trapezoid rule
+/// over the prediction grid; the head segment `[0, times[0]]` uses `S(0) = 1`
+/// (every subject is alive at the time origin), and when `tau` falls strictly
+/// inside a grid cell the survival value at `tau` is linearly interpolated so the
+/// partial cell contributes exactly. Grid points beyond `tau` are dropped.
+///
+/// Returns `None` when the grid is empty or `tau <= 0` (no area to accumulate),
+/// or when any sampled survival value on the integrated span is non-finite.
+fn restricted_mean_survival_time_from_curve(
+    times: &[f64],
+    survival_row: ndarray::ArrayView1<'_, f64>,
+    tau: f64,
+) -> Option<f64> {
+    if times.is_empty() || !(tau > 0.0) || !tau.is_finite() {
+        return None;
+    }
+    debug_assert_eq!(times.len(), survival_row.len());
+
+    // Survival at the cell boundaries we sweep through, starting from S(0) = 1.
+    let mut prev_t = 0.0_f64;
+    let mut prev_s = 1.0_f64;
+    let mut area = 0.0_f64;
+
+    for (idx, &t) in times.iter().enumerate() {
+        if !t.is_finite() || t < prev_t {
+            return None;
+        }
+        let s = survival_row[idx];
+        if !s.is_finite() {
+            return None;
+        }
+        if t >= tau {
+            // tau lands in (prev_t, t]; interpolate S(tau) and add the partial cell.
+            let span = t - prev_t;
+            let s_tau = if span > 0.0 {
+                let w = (tau - prev_t) / span;
+                prev_s + w * (s - prev_s)
+            } else {
+                prev_s
+            };
+            area += 0.5 * (prev_s + s_tau) * (tau - prev_t);
+            return Some(area);
+        }
+        area += 0.5 * (prev_s + s) * (t - prev_t);
+        prev_t = t;
+        prev_s = s;
+    }
+
+    // tau is beyond the last grid point: extend the last survival value flat to
+    // tau (conservative, matches survRM2's tau-at-or-before-last-event contract;
+    // callers wanting a strict horizon pass a tau within the grid).
+    area += prev_s * (tau - prev_t);
+    Some(area)
+}
+
+impl SurvivalPredictResult {
+    /// Per-row restricted mean survival time `\int_0^{tau} S_i(t) dt` from the
+    /// predicted survival surface. `tau` is the restriction horizon (e.g. the
+    /// study follow-up bound). Length-`n` vector, one RMST per predicted row.
+    ///
+    /// Returns `None` if the prediction grid is empty, `tau <= 0`, or any row's
+    /// survival curve carries a non-finite value on `[0, tau]`.
+    pub fn restricted_mean_survival_time(&self, tau: f64) -> Option<Array1<f64>> {
+        let n = self.survival.nrows();
+        let mut out = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let rmst =
+                restricted_mean_survival_time_from_curve(&self.times, self.survival.row(i), tau)?;
+            out[i] = rmst;
+        }
+        Some(out)
+    }
+}
+
+impl CompetingRisksPredictResult {
+    /// Per-row restricted mean survival time of the OVERALL (all-cause) survival
+    /// curve, `\int_0^{tau} S_overall_i(t) dt`. For competing risks the relevant
+    /// restricted-mean summary is taken on the all-cause survival
+    /// `exp(-sum_k H_k(t))`; cause-specific restricted-mean-time-lost is
+    /// `tau - RMST` partitioned by CIF and is left to the CIF surface directly.
+    pub fn restricted_mean_overall_survival_time(&self, tau: f64) -> Option<Array1<f64>> {
+        let n = self.overall_survival.nrows();
+        let mut out = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let rmst = restricted_mean_survival_time_from_curve(
+                &self.times,
+                self.overall_survival.row(i),
+                tau,
+            )?;
+            out[i] = rmst;
+        }
+        Some(out)
+    }
+}
+
 /// Joint cause-specific competing-risks prediction result.
 pub struct CompetingRisksPredictResult {
     pub times: Vec<f64>,
