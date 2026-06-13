@@ -81,6 +81,7 @@ fn probe_sphere_kernels() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
+    let mut best_rmse = f64::INFINITY;
     let formulas = [
         "y ~ sphere(lat, lon, k=20)",
         "y ~ sphere(lat, lon, k=20, kernel=pseudo)",
@@ -110,11 +111,18 @@ fn probe_sphere_kernels() {
         }
         let design = build_term_collection_design(grid.view(), &fit.resolvedspec).unwrap();
         let pred: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
-        eprintln!(
-            "[probe] {f:55} edf={edf:6.3} rmse={:.5}",
-            rmse(&pred, &f_true)
-        );
+        let r = rmse(&pred, &f_true);
+        best_rmse = best_rmse.min(r);
+        eprintln!("[probe] {f:55} edf={edf:6.3} rmse={r:.5}");
     }
     eprintln!("[probe] mgcv sos k=20 reference rmse ~= 0.03379 (target to beat)");
-    assert!(m == 100, "probe grid must be 100 points");
+    eprintln!("[probe] best sphere-kernel rmse = {best_rmse:.5}");
+    // At least one sphere kernel must recover the smooth geodesic-radial truth
+    // to a generous ceiling (the mgcv sos reference is ~0.034; this loose bound
+    // is a sanity floor, not the #1079 quality bar — it only guards that the
+    // diagnostic actually fit something rather than emitting NaNs).
+    assert!(
+        best_rmse.is_finite() && best_rmse < 0.20,
+        "no sphere kernel recovered the geodesic-radial truth (best rmse={best_rmse:.5})"
+    );
 }
