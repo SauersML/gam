@@ -100,17 +100,18 @@ fn write_columns_csv(path: &std::path::Path, columns: &[Column<'_>]) {
         !columns.is_empty(),
         "reference run needs at least one column"
     );
-    let nrows = columns[0].data.len();
-    for c in columns {
-        assert_eq!(
-            c.data.len(),
-            nrows,
-            "reference column {:?} has {} rows, expected {}",
-            c.name,
-            c.data.len(),
-            nrows
-        );
-    }
+    // Ragged columns are first-class: tests routinely ship a training column
+    // (n rows), a grid column (grid_n rows), and a scalar option (1 row) in
+    // the same data.frame, and the reference bodies dereference the surplus
+    // tail with `is.finite(...)` / NaN filters on their side. The CSV row
+    // grid runs from row 0 to `nrows = max column length`; shorter columns
+    // emit `NaN` past their own length so every column appears at its
+    // natural width to the reference interpreter.
+    let nrows = columns.iter().map(|c| c.data.len()).max().unwrap_or(0);
+    assert!(
+        nrows > 0,
+        "reference run needs at least one non-empty column"
+    );
     let mut s = String::new();
     s.push_str(
         &columns
@@ -123,7 +124,16 @@ fn write_columns_csv(path: &std::path::Path, columns: &[Column<'_>]) {
     for row in 0..nrows {
         let line = columns
             .iter()
-            .map(|c| format!("{:.17e}", c.data[row]))
+            .map(|c| match c.data.get(row) {
+                // `NA` is the missing-value token recognised by R
+                // `read.csv` (its default `na.strings`) AND by pandas
+                // `read_csv` (its default `na_values` list). Both
+                // produce IEEE NaN downstream, so the reference body's
+                // `is.finite(...)` / `np.isfinite(...)` mask filters
+                // out the surplus tail of a short column cleanly.
+                Some(value) => format!("{value:.17e}"),
+                None => "NA".to_string(),
+            })
             .collect::<Vec<_>>()
             .join(",");
         s.push_str(&line);
