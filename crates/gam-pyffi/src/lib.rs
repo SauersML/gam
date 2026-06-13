@@ -25415,6 +25415,10 @@ fn predict_dataset_impl(
         columns,
         model_class: prediction_model_class_label(model),
         family: family_link_kind(&model_likelihood_spec(model)).to_string(),
+        // The plain dataset predict path returns the model-based credible /
+        // predictive band (or no interval at all); the jackknife+ provenance
+        // tag is only attached by the dedicated full-conformal predict entry.
+        interval_method: None,
     })
     .map_err(|err| format!("failed to serialize prediction payload: {err}"))
 }
@@ -25846,6 +25850,9 @@ fn predict_table_conformal_impl(
         columns,
         model_class: prediction_model_class_label(&model),
         family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
+        interval_method: Some(
+            "split-conformal (distribution-free, finite-sample marginal coverage)".to_string(),
+        ),
     })
     .map_err(|err| format!("failed to serialize conformal prediction payload: {err}"))
 }
@@ -28109,6 +28116,9 @@ fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> Summar
         covariance_kind: None,
         covariance_n: None,
         covariance_flat: None,
+        // Scan-routed (O(n) 1D spline) models carry no `curv(...)` curvature
+        // smooths, so there are no curvature estimands to report.
+        curvature_estimands: Vec::new(),
     }
 }
 
@@ -28206,7 +28216,6 @@ fn curvature_verdict_label(v: gam::geometry::CurvatureVerdict) -> &'static str {
         gam::geometry::CurvatureVerdict::Spherical => "spherical",
         gam::geometry::CurvatureVerdict::Hyperbolic => "hyperbolic",
         gam::geometry::CurvatureVerdict::Flat => "flat",
-        gam::geometry::CurvatureVerdict::Indistinguishable => "indistinguishable",
     }
 }
 
@@ -30849,7 +30858,7 @@ fn gaussian_jackknife_plus_stats_for_standard_fit(
     if !matches!(family.response, ResponseFamily::Gaussian) {
         return None;
     }
-    if !matches!(family.link, InverseLink::Identity) {
+    if !matches!(family.link, InverseLink::Standard(StandardLink::Identity)) {
         return None;
     }
     if fit_config.weight_column.is_some() {
