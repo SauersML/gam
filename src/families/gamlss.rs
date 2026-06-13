@@ -6793,14 +6793,6 @@ impl GaussianLocationScaleChannelHessian {
     }
 }
 
-/// Eigendecompose a 2×2 symmetric matrix `[[a, b], [b, d]]` and return
-/// `(λ_max.max(0), λ_min.max(0), v0[0], v0[1], v1[0], v1[1])` where
-/// `v0` and `v1` are the eigenvectors for λ_max and λ_min respectively.
-/// Negative eigenvalues are clamped to zero for PSD projection.
-/// The off-diagonal entry is `b` (the matrix is symmetric so only one
-/// off-diagonal value is needed).
-#[inline]
-
 impl FamilyChannelHessian for GaussianLocationScaleChannelHessian {
     fn n_outputs(&self) -> usize {
         2
