@@ -239,8 +239,9 @@ pub struct MeasureJetBasisSpec {
     /// Representer (Gaussian RBF) range ℓ; `0.0` sentinel = auto
     /// (median nearest-center spacing × [`MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR`]).
     pub length_scale: f64,
-    /// Add an affine-preserving shrinkage penalty alongside the jet-energy
-    /// penalty.
+    /// Add a Marra-Wood select=TRUE shrinkage penalty on the jet-energy
+    /// penalty's null space (the pseudo-affine coefficient subspace) alongside
+    /// the jet-energy penalty itself.
     pub double_penalty: bool,
     /// Realized-design identifiability policy (see type docs).
     #[serde(default)]
@@ -368,7 +369,21 @@ fn symmetric_pseudoinverse(a: &Array2<f64>, label: &str) -> Result<Array2<f64>, 
     Ok(scaled.dot(&evecs.t()))
 }
 
-fn affine_preserving_coefficient_ridge(
+/// Projector (in the constrained Gaussian-coefficient space) ONTO the
+/// pseudo-affine subspace: the coefficient directions `b̂` that, pushed through
+/// the representer `K·z`, best reproduce the affine center functions `[1, c₁…c_d]`
+/// under the mass-weighted normal equations. These directions are precisely the
+/// null space of the jet-energy penalty `Q` (which annihilates locally-affine
+/// functions of the center coordinates), so they are the part of coefficient
+/// space the main penalty leaves untouched. As functions of `x` they are bumpy,
+/// bounded sums of Gaussians that revert to the mean off-support — not true
+/// affine trends — so leaving them unpenalised lets them overfit level/tilt.
+///
+/// Returning the projector `P = Σ_k dirₖ dirₖᵀ` (rather than its complement
+/// `I − P`) makes the double penalty a genuine Marra-Wood select=TRUE term: it
+/// penalises exactly the main penalty's null space, with its own REML amplitude
+/// so the pseudo-affine subspace is shrunk only as far as the data warrants.
+fn pseudo_affine_nullspace_projector(
     kz: &Array2<f64>,
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
@@ -378,7 +393,7 @@ fn affine_preserving_coefficient_ridge(
     let p = kz.ncols();
     if kz.nrows() != m || masses.len() != m {
         crate::bail_dim_basis!(
-            "measure-jet affine-preserving ridge shape mismatch: kz {:?}, centers {:?}, masses {}",
+            "measure-jet pseudo-affine projector shape mismatch: kz {:?}, centers {:?}, masses {}",
             kz.dim(),
             centers.dim(),
             masses.len()
@@ -392,7 +407,7 @@ fn affine_preserving_coefficient_ridge(
         row.mapv_inplace(|v| v * masses[i]);
     }
     let normal = kz.t().dot(&weighted_kz);
-    let normal_pinv = symmetric_pseudoinverse(&normal, "affine ridge normal")?;
+    let normal_pinv = symmetric_pseudoinverse(&normal, "pseudo-affine projector normal")?;
     let mut affine = Array2::<f64>::ones((m, d + 1));
     for i in 0..m {
         for k in 0..d {
@@ -408,12 +423,12 @@ fn affine_preserving_coefficient_ridge(
     let beta_gram = beta.t().dot(&beta);
     let (evals, evecs) = beta_gram.eigh(Side::Lower).map_err(|e| {
         BasisError::InvalidInput(format!(
-            "measure-jet affine ridge subspace eigendecomposition failed: {e}"
+            "measure-jet pseudo-affine projector subspace eigendecomposition failed: {e}"
         ))
     })?;
     let lam_max = evals.iter().fold(0.0_f64, |acc, v| acc.max((*v).max(0.0)));
     let rank_tol = MEASURE_JET_PSEUDOINVERSE_RTOL * ((d + 1).max(1) as f64) * lam_max;
-    let mut ridge = Array2::<f64>::eye(p);
+    let mut proj = Array2::<f64>::zeros((p, p));
     for k in 0..(d + 1) {
         let lam = evals[k].max(0.0);
         if lam <= rank_tol {
@@ -422,47 +437,11 @@ fn affine_preserving_coefficient_ridge(
         let dir = beta.dot(&evecs.column(k).to_owned()) / lam.sqrt();
         for r in 0..p {
             for c in 0..p {
-                ridge[(r, c)] -= dir[r] * dir[c];
+                proj[(r, c)] += dir[r] * dir[c];
             }
         }
     }
-    Ok((&ridge + &ridge.t()) * 0.5)
-}
-
-/// Explicit linear polynomial block `[1, x₁…x_d]` (n × (d+1)) evaluated at
-/// `points`.
-///
-/// This is the measure-jet analogue of Duchon's `polynomial_block_from_order`
-/// at `Linear` order. Adding it as explicit UNPENALISED columns to the design
-/// fixes the structural accuracy deficit identified in #1041: the penalty's
-/// coefficient-space null directions correspond to bumpy, bounded Gaussian
-/// pseudo-affine functions, NOT to true linear functions of the input
-/// coordinates.  Augmenting the design with a genuine polynomial block ensures
-/// the unpenalised subspace is truly `span{1, x₁…x_d}` — exactly as Duchon
-/// does — so linear trends are recovered without bias and the measure-jet
-/// basis no longer systematically under-recovers level and tilt on smooth
-/// surfaces.
-fn measure_jet_linear_poly_block(points: ArrayView2<'_, f64>) -> Array2<f64> {
-    let n = points.nrows();
-    let d = points.ncols();
-    let mut block = Array2::<f64>::zeros((n, d + 1));
-    block.column_mut(0).fill(1.0);
-    for c in 0..d {
-        block.column_mut(c + 1).assign(&points.column(c));
-    }
-    block
-}
-
-/// Pad a square `p × p` penalty matrix with a zero border for `extra` explicit
-/// polynomial columns, yielding a `(p + extra) × (p + extra)` block-diagonal
-/// matrix `[[S, 0], [0, 0]]`.  The polynomial columns are unpenalised by
-/// construction, mirroring Duchon's zero penalty sub-block for its null space.
-fn pad_penalty_with_poly_zeros(s: &Array2<f64>, extra: usize) -> Array2<f64> {
-    let p = s.nrows();
-    let total = p + extra;
-    let mut out = Array2::<f64>::zeros((total, total));
-    out.slice_mut(ndarray::s![..p, ..p]).assign(s);
-    out
+    Ok((&proj + &proj.t()) * 0.5)
 }
 
 /// Pairwise squared distances `‖a_i − b_j‖²` via the GEMM identity
@@ -1392,22 +1371,8 @@ pub fn build_measure_jet_basis(
         Some(u) => householder_drop_first_apply(&raw_design, u),
         None => raw_design.dot(&z),
     };
-    // #1041: augment the constrained Gaussian representer block with an
-    // explicit linear polynomial block [1, x₁…x_d].  The penalty's
-    // coefficient-space null directions are bumpy Gaussian pseudo-affine
-    // functions, not true polynomials — leaving them unpenalised via REML
-    // causes a systematic level/tilt bias on smooth surfaces.  Appending a
-    // genuine polynomial block (with ZERO penalty for those columns) makes
-    // the unpenalised subspace truly span{1, x₁…x_d}, mirroring Duchon.
-    let poly_block = measure_jet_linear_poly_block(data);
-    let n_poly = poly_block.ncols(); // d + 1
-    let full_design = ndarray::concatenate(
-        Axis(1),
-        &[constrained_design.view(), poly_block.view()],
-    )
-    .map_err(|e| BasisError::InvalidInput(format!("measure-jet poly augment: {e}")))?;
     let design = crate::matrix::DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-        full_design,
+        constrained_design,
     ));
     let support_means = measure_jet_support_means(centers.view(), masses.view(), &eps_band)?;
     // Spectral/geometric split. With the auto order sentinel (order_s == 0.0)
@@ -1438,14 +1403,11 @@ pub fn build_measure_jet_basis(
         for (level, q_l) in forms.into_iter().enumerate() {
             let s_l = kz.t().dot(&q_l).dot(&kz);
             let (s_norm, c_l) = normalize_penalty(&((&s_l + &s_l.t()) * 0.5));
-            // #1041: pad the Gaussian-representer penalty block with zeros for
-            // the n_poly explicit polynomial columns (unpenalised by construction).
-            let s_padded = pad_penalty_with_poly_zeros(&s_norm, n_poly);
             let scale_weight = log_step * eps_band[level].powf(-2.0 * order_s);
             penalty_normalization_scales.push(c_l);
             raw_penalty_normalization_scales.push(c_l / scale_weight);
             candidates.push(PenaltyCandidate {
-                matrix: s_padded,
+                matrix: s_norm,
                 nullspace_dim_hint: 0,
                 source: PenaltySource::Other(format!("measure_jet_scale_{level}")),
                 normalization_scale: c_l,
@@ -1464,11 +1426,9 @@ pub fn build_measure_jet_basis(
         )?;
         let penalty = kz.t().dot(&q_form).dot(&kz);
         let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
-        // #1041: pad with zeros for the n_poly polynomial columns.
-        let penalty_padded = pad_penalty_with_poly_zeros(&penalty_norm, n_poly);
         fused_penalty_normalization_scale = Some(c_primary);
         candidates.push(PenaltyCandidate {
-            matrix: penalty_padded,
+            matrix: penalty_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::Primary,
             normalization_scale: c_primary,
@@ -1477,13 +1437,20 @@ pub fn build_measure_jet_basis(
         });
     }
     if spec.double_penalty {
-        let ridge = affine_preserving_coefficient_ridge(&kz, centers.view(), masses.view())?;
+        // #1041: the main jet-energy penalty Q annihilates the coefficient-space
+        // pseudo-affine subspace (center-affine directions), which map through the
+        // Gaussian representer into bumpy, bounded, mean-reverting functions — NOT
+        // true affine functions of x. Left unpenalised, REML cannot shrink them and
+        // they absorb noise as spurious level/tilt in-sample and revert to the mean
+        // off-support (the #1041 deficit fingerprint). The Marra-Wood select=TRUE
+        // double penalty must penalise exactly the NULL space of the main penalty,
+        // so this ridge is the projector ONTO the pseudo-affine subspace; with its
+        // own REML amplitude the subspace is shrunk only as much as the data
+        // supports a genuine trend.
+        let ridge = pseudo_affine_nullspace_projector(&kz, centers.view(), masses.view())?;
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
-        // #1041: pad the ridge (currently p×p) with zeros for the polynomial
-        // columns so it does not penalise the true affine directions.
-        let ridge_padded = pad_penalty_with_poly_zeros(&ridge_norm, n_poly);
         candidates.push(PenaltyCandidate {
-            matrix: ridge_padded,
+            matrix: ridge_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: c_ridge,
@@ -1541,7 +1508,7 @@ pub fn build_measure_jet_basis(
 /// normalization as the fit-time candidates
 /// (`normalize_penaltywith_psi_derivatives` + the cross rule), so criterion
 /// value and criterion derivative share one normalization — the #901 lesson
-/// made structural. The affine-preserving ridge candidate (when
+/// made structural. The pseudo-affine null-space ridge candidate (when
 /// `double_penalty` is on) carries identically-zero derivatives. The
 /// per-candidate layout follows the builder's ORIGINAL candidate order
 /// (scale candidates then ridge / primary then ridge); consumers align to
@@ -1564,15 +1531,7 @@ pub fn build_measure_jet_basis_psi_derivatives(
         log_step: geom.log_step,
     };
     let n = data.nrows();
-    let d = data.ncols();
-    // #1041: the total design width after the polynomial augmentation is
-    // p_gauss + n_poly, where n_poly = d + 1.  All penalty matrices emitted
-    // by the ψ-derivative producer must match this width so the caller can
-    // compose them with the augmented design.  The polynomial columns are
-    // ψ-invariant (no derivative), so the additional rows/cols are all zero.
-    let p_gauss = geom.kz.ncols();
-    let n_poly = d + 1;
-    let p = p_gauss + n_poly; // total design width, matches build_measure_jet_basis
+    let p = geom.kz.ncols(); // design width: constrained Gaussian-coefficient space
     let kz = &geom.kz;
     let sandwich = |j: &Array2<f64>| {
         let s = kz.t().dot(j).dot(kz);
@@ -1664,10 +1623,6 @@ pub fn build_measure_jet_basis_psi_derivatives(
     let n_active = raw.len();
     let ridge = spec.double_penalty;
     let n_cands = n_active + usize::from(ridge);
-    // #1041: all penalty-derivative matrices must be (p × p) where p is the
-    // TOTAL design width (p_gauss + n_poly).  The polynomial columns carry
-    // zero ψ-derivatives (they are data-coordinate functions, ψ-invariant),
-    // so every penalty derivative gains a zero border.
     let zero_p = || Array2::<f64>::zeros((p, p));
     let mut penalties_first: Vec<Vec<Array2<f64>>> =
         (0..n_coords).map(|_| Vec::with_capacity(n_cands)).collect();
@@ -1695,9 +1650,8 @@ pub fn build_measure_jet_basis_psi_derivatives(
         for coord in 0..n_coords {
             let (_, s_first, s_second, _) =
                 normalize_penaltywith_psi_derivatives(s_raw, &firsts[coord], &seconds[coord]);
-            // Pad to the total design width (zero border for polynomial cols).
-            penalties_first[coord].push(pad_penalty_with_poly_zeros(&s_first, n_poly));
-            penalties_second_diag[coord].push(pad_penalty_with_poly_zeros(&s_second, n_poly));
+            penalties_first[coord].push(s_first);
+            penalties_second_diag[coord].push(s_second);
         }
         for (pair_idx, &(a, b)) in pairs.iter().enumerate() {
             let cross_raw_mat = normalize_penalty_cross_psi_derivative(
@@ -1707,7 +1661,7 @@ pub fn build_measure_jet_basis_psi_derivatives(
                 &cross_raw[pair_idx],
                 c,
             );
-            crosses[pair_idx].push(pad_penalty_with_poly_zeros(&cross_raw_mat, n_poly));
+            crosses[pair_idx].push(cross_raw_mat);
         }
     }
     if ridge {
