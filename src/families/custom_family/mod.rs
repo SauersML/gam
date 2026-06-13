@@ -27372,24 +27372,39 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         outer.seed_cached_beta(n_rho, specs, beta)
     });
 
+    let outer_result = problem.run(&mut obj, "custom family");
+
     // ── Discriminating outer-gradient FD audit (issue #1040) ──
     //
-    // The survival marginal-slope (and every custom-family) outer ρ-REML loop
-    // is driven HERE by `problem.run`, with `outerobjectivegradienthessian_labeled`
-    // as the θ↦(V,∇V,H) evaluator. On a diagnostic-sized problem, central-
-    // difference the outer criterion component-by-component against the analytic
-    // gradient at the seed ρ₀ and report the outer-Hessian spectrum — the single
-    // test that forks a non-terminating outer loop into objective↔gradient
-    // DESYNC (analytic ≠ FD ⇒ the trust region chases a phantom descent forever)
-    // vs weak IDENTIFIABILITY (analytic ≈ FD but a ~0 outer-Hessian eigenvalue ⇒
-    // a flat valley). Gated to small problems so it never taxes a production fit.
-    {
+    // The custom-family outer ρ-REML loop is driven by `problem.run` above, with
+    // `outerobjectivegradienthessian_labeled` as the θ↦(V,∇V,H) evaluator. When
+    // the loop FAILS to certify convergence, central-difference the outer
+    // criterion component-by-component against the analytic gradient and report
+    // the outer-Hessian spectrum — the single diagnostic that forks a
+    // non-terminating outer loop into objective↔gradient DESYNC (analytic ≠ FD ⇒
+    // the trust region chases a phantom descent forever) vs weak IDENTIFIABILITY
+    // (analytic ≈ FD but a ~0 outer-Hessian eigenvalue ⇒ a flat valley).
+    //
+    // This audit costs 2·n_rho + 1 extra full outer evals (each a coupled inner
+    // solve over all n rows), so it must run ONLY on the pathology it diagnoses,
+    // never on a healthy fit: gating it by size alone (the original #1040 gate)
+    // taxed EVERY production custom-family fit — for `bernoulli-marginal-slope`
+    // at n=1500, n_rho=6 it was ~39% of the wall clock (13 phantom evals) on a
+    // fit that converged cleanly with nothing to diagnose (gam#979). A
+    // certified-converged outer result has, by definition, no desync to find, so
+    // the audit only fires when `problem.run` returned `Err` or a non-converged
+    // result — exactly when the #1040 verdict is actionable.
+    let outer_needs_audit = match &outer_result {
+        Ok(result) => !result.converged,
+        Err(_) => true,
+    };
+    if outer_needs_audit {
         const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
         const OUTER_FD_AUDIT_MAX_RHO_DIM: usize = 32;
         let audit_n = specs.iter().map(|s| s.design.nrows()).max().unwrap_or(0);
         if n_rho >= 1 && n_rho <= OUTER_FD_AUDIT_MAX_RHO_DIM && audit_n <= OUTER_FD_AUDIT_MAX_N {
             log::warn!(
-                "[OUTER-FD-AUDIT/custom-family] gate eligible n={audit_n} n_rho={n_rho} need_outer_hessian={need_outer_hessian}"
+                "[OUTER-FD-AUDIT/custom-family] outer did not certify convergence; running desync/identifiability audit n={audit_n} n_rho={n_rho} need_outer_hessian={need_outer_hessian}"
             );
             let mut eval_at = |rho: &Array1<f64>,
                                mode: EvalMode|
@@ -27427,8 +27442,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             }
         }
     }
-
-    let outer_result = problem.run(&mut obj, "custom family");
 
     let last_error_detail = obj
         .state
