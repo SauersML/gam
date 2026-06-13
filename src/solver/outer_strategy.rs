@@ -2982,12 +2982,55 @@ struct OuterFirstOrderBridge<'a> {
     /// non-converged — the remaining gradient lies along weakly-identified ρ
     /// directions that do not reduce the objective.
     cost_stall: Option<CostStallGuard>,
+    /// Count of consecutive `eval_cost` calls that returned `Recoverable`
+    /// without a single success in between. When every trial step in every
+    /// search direction is infeasible (the inner solve refuses to converge at
+    /// any neighboring ρ), BFGS would otherwise spend its full
+    /// `max_iterations × line_search_budget` budget doing inner solves that
+    /// all fail — the non-termination reported in issue #NaN-outer-loop.
+    ///
+    /// Once this counter exceeds [`PROBE_REFUSAL_FATAL_THRESHOLD`] and no
+    /// gradient evaluation has ever been accepted on this seed (`iter_count ==
+    /// 0`), the bridge escalates to `Fatal` so BFGS exits immediately via
+    /// `ObjectiveFailed`. The seed loop treats that outcome as a rejected seed
+    /// and moves on, keeping the cascade bounded.
+    ///
+    /// Reset to 0 on any successful cost evaluation so normal line-search
+    /// noise (a few recoverable probes followed by an accepted step) never
+    /// trips this guard.
+    consecutive_probe_refusals: usize,
 }
 
 const VALUE_PROBE_CACHE_CAPACITY: usize = 256;
 const VALUE_PROBE_REJECT_COST_FLOOR: f64 = 1.0e11;
 
+/// Number of consecutive recoverable `eval_cost` failures (every line-search
+/// probe infeasible) before the bridge escalates to `Fatal` and forces an
+/// immediate BFGS exit. This guard fires only before the first accepted
+/// gradient step (`iter_count == 0`): once BFGS has accepted at least one
+/// outer iteration the current ρ is feasible and isolated probe refusals are
+/// normal line-search noise, not a stuck loop.
+///
+/// The threshold covers one full StrongWolfe attempt (up to 20 probes)
+/// plus one backtracking fallback (up to 50 probes) with a small margin,
+/// so a SINGLE failed direction does not fire the guard. Two consecutive
+/// direction failures (120 probes) always does — once both Wolfe and
+/// backtracking exhausted two complete directions with no success, the
+/// neighborhood is globally infeasible and further BFGS iterations are
+/// pure waste.
+const PROBE_REFUSAL_FATAL_THRESHOLD: usize = 150;
+
+/// Sentinel prefix embedded in the [`ObjectiveEvalError::Fatal`] message the
+/// bridge returns when [`PROBE_REFUSAL_FATAL_THRESHOLD`] fires. The seed-loop
+/// runner matches this prefix and routes the failed seed to
+/// `rejection_reasons` rather than propagating a fatal error.
+const PROBE_REFUSAL_FATAL_SENTINEL: &str = "OUTER_PROBE_REFUSAL_FATAL";
+
 /// Sentinel embedded in the [`ObjectiveEvalError::Fatal`] message the bridge
+/// returns when [`CostStallGuard`] fires. `opt::Bfgs` preserves the message
+/// verbatim in [`BfgsError::ObjectiveFailed`]; the seed-loop runner recognizes
+/// this prefix and reclassifies the (otherwise "failed") run as a converged
+/// outer result built from the published best iterate.
 /// returns when [`CostStallGuard`] fires. `opt::Bfgs` preserves the message
 /// verbatim in [`BfgsError::ObjectiveFailed`]; the seed-loop runner recognizes
 /// this prefix and reclassifies the (otherwise "failed") run as a converged

@@ -3678,6 +3678,49 @@ impl ArrowSchurSystem {
         }
     }
 
+    /// Reduced-Schur matvec prologue `y = (P + ridge·I) x` written fresh into a
+    /// zeroed `y` (the caller clears `out` first; this is the first writer).
+    ///
+    /// At the SAE LLM border width (#1017) the dense `H_ββ` fallback is a `k×k`
+    /// GEMV whose `O(k²)` cost (≈4M flops at k=2048) runs once per CG iteration
+    /// and was the serial Amdahl ceiling on the per-row-parallel matvec: while
+    /// the `n`-row point-elimination term fans across all cores, this prologue
+    /// pinned one core and grows as `k²`. The dense GEMV is embarrassingly
+    /// parallel over output rows `a` — each `y[a] = Σ_b hbb[a,b]·x[b] + ridge·x[a]`
+    /// is independent and its inner sum order is identical whether one thread or
+    /// many compute it, so the result is bit-identical run-to-run (the #1017
+    /// determinism gate: the criterion ranking across topology candidates must
+    /// not move). The `penalty_op` path stays serial — it is an opaque operator
+    /// with its own structure (SAE uses the dense `hbb`), and small `k` stays
+    /// serial to avoid rayon overhead on a trivial GEMV.
+    ///
+    /// `parallel` is the caller's top-level / not-nested-in-rayon decision (the
+    /// same guard the row loop uses), so this never oversubscribes inside the
+    /// topology race.
+    fn penalty_ridge_prologue_into(&self, x: &[f64], ridge: f64, y: &mut [f64], parallel: bool) {
+        let k = self.hbb.nrows();
+        let dense_parallel = parallel
+            && self.penalty_op.is_none()
+            && self.hbb.dim() == (k, k)
+            && k >= SCHUR_PROLOGUE_PARALLEL_K_MIN;
+        if dense_parallel {
+            use rayon::prelude::*;
+            let hbb = &self.hbb;
+            y.par_iter_mut().enumerate().for_each(|(a, ya)| {
+                let mut acc = 0.0_f64;
+                for b in 0..k {
+                    acc += hbb[[a, b]] * x[b];
+                }
+                *ya = acc + ridge * x[a];
+            });
+        } else {
+            self.penalty_matvec_add(x, y);
+            for a in 0..k {
+                y[a] += ridge * x[a];
+            }
+        }
+    }
+
     /// `diag += diag(P)` without allocating; dispatches to `penalty_op`
     /// or falls back to `hbb` diagonal / `hbb_diag` inline.
     #[inline]
@@ -8320,6 +8363,16 @@ fn step_inside_trust_region(
 /// contributions are the matvec's whole cost and parallelize cleanly.
 const SCHUR_MATVEC_PARALLEL_ROW_MIN: usize = 256;
 
+/// Below this border width `k` the dense `H_ββ` penalty-prologue GEMV stays
+/// sequential: parallelizing a `k×k` matvec only pays once `k²` is large enough
+/// to dwarf the rayon fan-out, which for the arrow callers with narrow borders
+/// it never is. At the SAE LLM border (`k` in the low thousands) the `O(k²)`
+/// prologue is ≈4M flops/CG-iteration and was the serial Amdahl ceiling on the
+/// otherwise per-row-parallel matvec (#1017), so it crosses this threshold and
+/// fans out. 512 keeps the prologue serial for every non-SAE arrow system while
+/// engaging it for the wide SAE/Qwen borders the issue targets.
+const SCHUR_PROLOGUE_PARALLEL_K_MIN: usize = 512;
+
 /// Device-residency CPU analogue for the SAE reduced-Schur matvec (#1017).
 ///
 /// In the production SAE joint fit the per-row cross-block factors as
@@ -8556,15 +8609,20 @@ fn schur_matvec<B: BatchedBlockSolver + Sync>(
     // (g·δ ≈ 0 — a non-descent direction that defeats the line search).
     out.fill(0.0);
     let k = sys.k;
-    // Route the penalty-side H_ββ x product through penalty_matvec_add (#296):
-    // no Arc-clone hot-path cost when penalty_op is None (falls back to hbb inline).
+    // Top-level (not nested in a rayon worker) and big enough to amortize the
+    // fan-out: the single gate that authorizes BOTH the dense penalty-prologue
+    // GEMV and the per-row point-elimination loop to go parallel. The topology
+    // race fans candidates with `run_topology_race_parallel`, so inside a worker
+    // both stay sequential (no nested-rayon oversubscription).
+    let parallel =
+        sys.rows.len() >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    // Route the penalty-side (H_ββ + ridge·I) x product through the prologue:
+    // no Arc-clone hot-path cost when penalty_op is None (falls back to hbb
+    // inline); the dense fallback fans across cores at the wide SAE border (#1017).
     {
         let x_slice = x.as_slice().expect("x must be contiguous");
         let out_slice = out.as_slice_mut().expect("out must be contiguous");
-        sys.penalty_matvec_add(x_slice, out_slice);
-        for a in 0..k {
-            out_slice[a] += ridge_beta * x_slice[a];
-        }
+        sys.penalty_ridge_prologue_into(x_slice, ridge_beta, out_slice, parallel);
     }
     // The reduced-Schur point-elimination term: `out -= Σ_i H_βt^(i) (H_tt^(i))⁻¹
     // H_tβ^(i) x`. Each row contributes an independent length-`K` vector, so for
@@ -8575,9 +8633,8 @@ fn schur_matvec<B: BatchedBlockSolver + Sync>(
     // the criterion ranking across topology candidates must not move). Stay
     // sequential when already inside a rayon worker (the topology race fans
     // candidates with `run_topology_race_parallel`) to avoid nested-rayon
-    // oversubscription — the same guard `HyperOperator::mul_mat` uses.
-    let parallel =
-        sys.rows.len() >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    // oversubscription — the same guard `HyperOperator::mul_mat` uses. The
+    // `parallel` gate above authorizes this loop too.
     let p = resident.map(|r| r.p).unwrap_or(0);
     if parallel {
         use rayon::prelude::*;
