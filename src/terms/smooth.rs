@@ -18267,6 +18267,35 @@ impl<'d> SpatialJointContext<'d> {
         if let Some(cost) = self.cache.memoized_cost(theta) {
             return cost;
         }
+        // #1029: a BFGS line-search VALUE probe. It converges the inner PIRLS to
+        // the SAME tolerance the accepted-point full eval uses (NOT a capped
+        // surrogate — a cap returns ∞ for a feasible point and re-imports the
+        // #787/#808 outer stall), so probe and incumbent values live in ONE
+        // refinement regime (measure-consistent Armijo). It is cheaper only
+        // because it skips the gradient / hyper-dir assembly. Time the inner
+        // cost-only solve and report it alongside the trial-θ distance from the
+        // last evaluated point so this convergence-critical regression class is
+        // visible in the STAGE trace (the spatial REML lane has no PROGRESS-
+        // EXTENDED refine multiplier — that knob is SAE-only — so there is no
+        // extended polish to strip from a probe here).
+        //
+        // Capture the previous evaluated θ BEFORE `ensure_theta` overwrites it,
+        // so the logged distance reflects the backtracking step rather than 0.
+        let probe_start = std::time::Instant::now();
+        let psi_distance = self
+            .cache
+            .current_theta
+            .as_ref()
+            .filter(|reference| reference.len() == theta.len())
+            .map(|reference| {
+                reference
+                    .iter()
+                    .zip(theta.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .unwrap_or(f64::NAN);
         if self.cache.ensure_theta(theta).is_err() {
             return f64::INFINITY;
         }
@@ -18288,6 +18317,11 @@ impl<'d> SpatialJointContext<'d> {
         };
         match result {
             Ok(cost) => {
+                log::debug!(
+                    "[STAGE] {cost_label} value-probe (order=Value): elapsed={:.3}s \
+                     cost={cost:.6e} trial_theta_distance={psi_distance:.3e}",
+                    probe_start.elapsed().as_secs_f64(),
+                );
                 self.cache.store_cost(cost);
                 cost
             }
