@@ -78,9 +78,11 @@ def fit_l25_to_l44_transport(ckpt: str) -> dict:
               f"degree={result.get('degree')}  "
               f"isometry_defect={result.get('isometry_defect', float('nan')):.4f} "
               f"±{result.get('isometry_defect_se', float('nan')):.4f}", flush=True)
-        return dict(ckpt=ckpt, layer_from=25, layer_to=44, elapsed=elapsed,
-                    error=None, **{k: float(v) if isinstance(v, (int, float)) else v
-                                   for k, v in result.items()})
+        row = {k: float(v) if isinstance(v, (int, float)) else v for k, v in result.items()}
+        row["ckpt"] = ckpt
+        row["elapsed"] = elapsed
+        row["error"] = None
+        return row
     except Exception as e:
         elapsed = time.time() - t0
         print(f"  [{ckpt}] FAILED {elapsed:.1f}s: {e}", flush=True)
