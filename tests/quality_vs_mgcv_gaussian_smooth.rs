@@ -94,26 +94,10 @@ fn gam_smooth_predicts_lidar_better_than_baseline() {
     let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
 
     // ---- fit the SAME model on TRAIN with mgcv, predict the SAME TEST -----
-    // mgcv is the mature baseline; we read back its held-out predictions (to
-    // compare accuracy) and its in-sample fitted values (for context only).
-    let train_r = run_r(
-        &[
-            Column::new("range", &train_range),
-            Column::new("logratio", &train_logratio),
-        ],
-        r#"
-        suppressPackageStartupMessages(library(mgcv))
-        m <- gam(logratio ~ s(range), data = df, method = "REML")
-        emit("fitted", as.numeric(fitted(m)))
-        emit("edf", sum(m$edf))
-        "#,
-    );
-    let mgcv_train_fitted = train_r.vector("fitted").to_vec();
-    let mgcv_edf = train_r.scalar("edf");
-
-    // Re-fit on train and predict the held-out rows. The harness exposes one
-    // data.frame per call, so we pass train range/logratio plus the test range
-    // padded into a parallel column and predict on it.
+    // mgcv is the mature baseline; we read back its in-sample fitted values
+    // (for context only), edf, and held-out predictions in a SINGLE R subprocess
+    // so we pay only one mgcv fit cost.  Test ranges ride along as a padded
+    // parallel column; only the first `test_n` entries are read back in R.
     let r = run_r(
         &[
             Column::new("range", &train_range),
@@ -124,11 +108,15 @@ fn gam_smooth_predicts_lidar_better_than_baseline() {
         r#"
         suppressPackageStartupMessages(library(mgcv))
         m <- gam(logratio ~ s(range), data = df, method = "REML")
+        emit("fitted", as.numeric(fitted(m)))
+        emit("edf", sum(m$edf))
         k <- df$test_n[1]
         newd <- data.frame(range = df$test_range[1:k])
         emit("test_pred", as.numeric(predict(m, newdata = newd)))
         "#,
     );
+    let mgcv_train_fitted = r.vector("fitted").to_vec();
+    let mgcv_edf = r.scalar("edf");
     let mgcv_test_pred = r.vector("test_pred");
     assert_eq!(
         mgcv_test_pred.len(),
