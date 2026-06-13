@@ -3085,6 +3085,12 @@ pub struct ArrowSchurSystem {
     /// `tolerate_ill_conditioning` set may stiffen a gauge-explained row
     /// direction.
     pub row_gauge_deflation: Option<ArrowRowGaugeDeflation>,
+    /// Optional exact cross-row IBP low-rank source (#1038). When set, the
+    /// factorization downdates the per-row logit-slot self term and layers the
+    /// exact rank-`R` Woodbury correction onto the evidence cache (value,
+    /// log-determinant, and θ/ρ-adjoint together). `None` for all non-IBP
+    /// systems — the row-block-diagonal arrow path is then unchanged.
+    pub ibp_cross_row: Option<IbpCrossRowSource>,
 }
 
 impl Clone for ArrowSchurSystem {
@@ -3110,6 +3116,7 @@ impl Clone for ArrowSchurSystem {
             device_sae_pcg: self.device_sae_pcg.clone(),
             cross_row_penalties: self.cross_row_penalties.clone(),
             row_gauge_deflation: self.row_gauge_deflation.clone(),
+            ibp_cross_row: self.ibp_cross_row.clone(),
         }
     }
 }
@@ -3136,6 +3143,67 @@ pub struct CrossRowLatentPenalty {
     /// against it for the Newton operator to be the true Hessian at the
     /// current iterate.
     pub target_t: Array1<f64>,
+}
+
+/// Exact cross-row low-rank IBP source (#1038): the per-column rank-one Hessian
+/// terms `H_(i,k),(j,k) = d_k·z'_ik·z'_jk` (for ALL `i,j`, including the `i=j`
+/// self term) that couple DISTINCT latent rows through a shared atom column `k`.
+///
+/// Stacking over rows, this is `H_full = H₀' + U D Uᵀ`, where:
+/// * `U` is `delta_t_len × R` with `U[g, k] = z'_ik` at the global latent index
+///   `g` of row `i`'s logit slot for atom `k` (zero elsewhere) — i.e. column `k`
+///   is supported on the atom-`k` logit slot of every row;
+/// * `D = diag(d_k)`, `d_k = w·s'_k` ([`crate::terms::analytic_penalties::IbpHessianDiagThirdChannels::cross_row_d`]);
+/// * `H₀'` is the assembled latent block-diagonal `H₀` with the per-row self
+///   term `d_k·z'_ik²` REMOVED from each logit-slot diagonal (the assembled
+///   `H₀` already carries it, so the FULL rank-one outer product `U D Uᵀ` —
+///   which re-adds the `i=j` diagonal — would double-count without this
+///   downdate). The determinant lemma `log det(I_R + D UᵀH₀'⁻¹U)` is only the
+///   exact rank-`R` correction against this no-self base.
+///
+/// The arrow elimination assumes each row's `H_tt^(i)` is independent of every
+/// other row, so it structurally cannot hold this coupling block-locally. The
+/// factorization owner (`solver::arrow_schur`) consumes this source to (a)
+/// downdate the per-row logit diagonal before factoring, (b) build `U`/`D` onto
+/// the resulting [`ArrowFactorCache`] as a [`CrossRowWoodbury`], and (c) apply
+/// the exact Woodbury correction to the value/curvature solve, the evidence
+/// log-determinant, and the θ/ρ-adjoint TOGETHER (they all describe the SAME
+/// `H_full`).
+#[derive(Clone, Debug, Default)]
+pub struct IbpCrossRowSource {
+    /// Number of atom columns `R` (the rank of the cross-row update).
+    pub r: usize,
+    /// `d_k = w·s'_k`, the scalar `D`-coefficient of column `k`. Length `R`.
+    pub d: Array1<f64>,
+    /// Per-row column entries `(global_t_index, atom_k, z'_ik)`: each tuple
+    /// places `z'_ik` at `U[global_t_index, atom_k]`. The `global_t_index` is
+    /// `row_offsets[i] + local_slot` for the row's logit slot of atom `k`. Only
+    /// nonzero entries are listed (one per active (row, atom) pair).
+    pub entries: Vec<(usize, usize, f64)>,
+}
+
+impl IbpCrossRowSource {
+    /// Build the dense `delta_t_len × R` factor `U` (each column supported on
+    /// its atom's per-row logit slots) from the sparse entry list.
+    fn dense_u(&self, delta_t_len: usize) -> Array2<f64> {
+        let mut u = Array2::<f64>::zeros((delta_t_len, self.r));
+        for &(g, k, z) in &self.entries {
+            u[[g, k]] += z;
+        }
+        u
+    }
+
+    /// Per-row-slot self-term downdate: returns, for each global latent index,
+    /// the scalar `Σ_k d_k·z'_ik²` to subtract from that logit slot's diagonal
+    /// so the factored base is `H₀'` (self term removed). Indexed by global
+    /// `delta_t` position.
+    fn self_term_downdate(&self, delta_t_len: usize) -> Array1<f64> {
+        let mut down = Array1::<f64>::zeros(delta_t_len);
+        for &(g, k, z) in &self.entries {
+            down[g] += self.d[k] * z * z;
+        }
+        down
+    }
 }
 
 impl ArrowSchurSystem {
