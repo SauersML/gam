@@ -66,8 +66,10 @@ use serde::{Deserialize, Serialize};
 use crate::geometry::constant_curvature::{ConstantCurvature, distance_kappa_jet};
 
 use super::{
-    BasisBuildResult, BasisError, BasisMetadata, CenterStrategy, PenaltyCandidate, PenaltySource,
-    filter_active_penalty_candidates_with_ops, normalize_penalty, select_centers_by_strategy,
+    BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeBundle, BasisPsiDerivativeResult,
+    BasisPsiSecondDerivativeResult, CenterStrategy, PenaltyCandidate, PenaltyInfo, PenaltySource,
+    filter_active_penalty_candidates_with_ops, normalize_penalty,
+    normalize_penaltywith_psi_derivatives, select_centers_by_strategy,
     weighted_coefficient_sum_to_zero_transform,
 };
 
@@ -402,5 +404,148 @@ pub fn build_constant_curvature_basis(
         ops,
         null_eigenvectors,
         joint_null_rotation: None,
+    })
+}
+
+/// Symmetrize `M` in place to `(M + Mᵀ)/2` (the realized penalty is built from
+/// the symmetric kernel Gram; the κ-derivative blocks inherit the same exact
+/// symmetrization the value path applies before normalization).
+fn symmetrize(m: &Array2<f64>) -> Array2<f64> {
+    (m + &m.t()) * 0.5
+}
+
+/// Map a single primary-penalty κ-derivative onto the active penalty list by
+/// source — the constant-curvature analogue of the Matérn double-penalty
+/// derivative selector. The RKHS Gram is the only κ-moving penalty; the
+/// double-penalty ridge `I` is κ-independent, so its derivative is exactly
+/// zero. Any other source would mean the basis grew a penalty whose κ-movement
+/// is unaccounted for, so we refuse loudly rather than silently drop a term.
+fn active_constant_curvature_penalty_derivatives(
+    penaltyinfo: &[PenaltyInfo],
+    primary_derivative: &Array2<f64>,
+) -> Result<Vec<Array2<f64>>, BasisError> {
+    penaltyinfo
+        .iter()
+        .filter(|info| info.active)
+        .map(|info| match &info.source {
+            PenaltySource::Primary => Ok(primary_derivative.clone()),
+            PenaltySource::DoublePenaltyNullspace => {
+                Ok(Array2::<f64>::zeros(primary_derivative.raw_dim()))
+            }
+            other => Err(BasisError::InvalidInput(format!(
+                "unexpected constant-curvature penalty source in κ-derivative path: {other:?}"
+            ))),
+        })
+        .collect()
+}
+
+/// κ-derivative bundle for the constant-curvature smooth — the ψ-channel hook
+/// that lets κ join the outer LAML/REML optimization as one signed,
+/// design-moving coordinate (#944 stage 3 final wiring).
+///
+/// The outer optimizer's ψ-coordinate here is the **raw, signed curvature κ
+/// itself** (NOT `log κ` as for the Matérn kernel scale): κ = 0 must be a
+/// reachable interior point of the `S^d ← ℝ^d → H^d` family, which `log κ`
+/// cannot represent. So this returns `∂·/∂κ` and `∂²·/∂κ²` directly, and the
+/// outer assembly treats the coordinate as `ψ = κ` with `∂/∂ψ = ∂/∂κ`.
+///
+/// Every κ-fixed piece (centers, length scale ℓ, the center-space constraint
+/// transform `z`) is held constant exactly as documented in the module
+/// κ-contract, so the design moves with κ only through the geodesic-exponential
+/// kernel and:
+///
+/// ```text
+///   X = K(data, centers)·z          ⇒  ∂X/∂κ  = (∂K_dc/∂κ)·z,
+///                                       ∂²X/∂κ² = (∂²K_dc/∂κ²)·z
+///   S_raw = symm(zᵀ K(centers,centers) z)
+///                                   ⇒  ∂S_raw/∂κ  = symm(zᵀ(∂K_cc/∂κ)z), etc.
+/// ```
+///
+/// and the Frobenius penalty normalization is differentiated with the exact
+/// quotient rules through the shared `normalize_penaltywith_psi_derivatives`
+/// seam — identical to how the Matérn operator penalties propagate their
+/// normalization. The double-penalty ridge `I` is κ-independent (zero
+/// derivative).
+///
+/// Mirrors [`build_constant_curvature_basis`] so the realized design and
+/// penalties whose κ-derivatives this returns are byte-for-byte the same
+/// construction the value path produced (same centers, same ℓ, same `z`).
+pub fn build_constant_curvature_basis_kappa_derivatives(
+    data: ArrayView2<'_, f64>,
+    spec: &ConstantCurvatureBasisSpec,
+) -> Result<BasisPsiDerivativeBundle, BasisError> {
+    if data.ncols() == 0 {
+        crate::bail_invalid_basis!("constant-curvature smooth needs at least one feature column");
+    }
+    if !spec.kappa.is_finite() {
+        crate::bail_invalid_basis!("constant-curvature smooth needs a finite kappa");
+    }
+    validate_chart_points(data, spec.kappa, "data")?;
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    if centers.nrows() < 2 {
+        return Err(BasisError::InsufficientColumnsForConstraint {
+            found: centers.nrows(),
+        });
+    }
+    validate_chart_points(centers.view(), spec.kappa, "centers")?;
+    let length_scale = realized_constant_curvature_length_scale(centers.view(), spec.length_scale)?;
+
+    // κ-fixed constraint transform `z`, resolved exactly as the value builder.
+    let z = match &spec.identifiability {
+        ConstantCurvatureIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != centers.nrows() {
+                crate::bail_dim_basis!(
+                    "frozen constant-curvature identifiability transform mismatch: {} centers but transform has {} rows",
+                    centers.nrows(),
+                    transform.nrows()
+                );
+            }
+            transform.clone()
+        }
+        ConstantCurvatureIdentifiability::CenterSumToZero => {
+            let weights = Array1::<f64>::ones(centers.nrows());
+            weighted_coefficient_sum_to_zero_transform(weights.view())?
+        }
+    };
+
+    // Design κ-jets: X = K(data, centers)·z, so the κ-derivatives are the
+    // kernel κ-jets right-multiplied by the κ-fixed `z`.
+    let (_k_dc, dk_dc, dkk_dc) =
+        constant_curvature_kernel_kappa_jets(data, centers.view(), spec.kappa, length_scale)?;
+    let design_first = dk_dc.dot(&z);
+    let design_second_diag = dkk_dc.dot(&z);
+
+    // Penalty κ-jets: S_raw = symm(zᵀ K(centers,centers) z). Rebuild the value
+    // penalty (and its normalization constant) from the SAME path the value
+    // builder used so the quotient-rule normalization derivatives are exact.
+    let (k_cc, dk_cc, dkk_cc) =
+        constant_curvature_kernel_kappa_jets(centers.view(), centers.view(), spec.kappa, length_scale)?;
+    let s_raw = symmetrize(&z.t().dot(&k_cc).dot(&z));
+    let s_raw_first = symmetrize(&z.t().dot(&dk_cc).dot(&z));
+    let s_raw_second = symmetrize(&z.t().dot(&dkk_cc).dot(&z));
+    let (_s_norm, s_norm_first, s_norm_second, _c) =
+        normalize_penaltywith_psi_derivatives(&s_raw, &s_raw_first, &s_raw_second);
+
+    // Align the single primary-penalty derivative with the realized active
+    // penalty list (primary always; ridge only when double_penalty, and
+    // κ-independent). Rebuild the realized basis once to read `penaltyinfo`.
+    let base = build_constant_curvature_basis(data, spec)?;
+    let penalties_derivative =
+        active_constant_curvature_penalty_derivatives(&base.penaltyinfo, &s_norm_first)?;
+    let penaltiessecond_derivative =
+        active_constant_curvature_penalty_derivatives(&base.penaltyinfo, &s_norm_second)?;
+
+    Ok(BasisPsiDerivativeBundle {
+        first: BasisPsiDerivativeResult {
+            design_derivative: design_first,
+            penalties_derivative,
+            implicit_operator: None,
+        },
+        second: BasisPsiSecondDerivativeResult {
+            designsecond_derivative: design_second_diag,
+            penaltiessecond_derivative,
+            implicit_operator: None,
+        },
+        implicit_operator: None,
     })
 }

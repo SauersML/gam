@@ -8,7 +8,8 @@ use crate::basis::{
     MeasureJetIdentifiability, OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo,
     PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
     SphericalSplineIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
-    build_bspline_basis_1d, build_constant_curvature_basis, build_duchon_basis,
+    build_bspline_basis_1d, build_constant_curvature_basis,
+    build_constant_curvature_basis_kappa_derivatives, build_duchon_basis,
     build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
@@ -2842,6 +2843,16 @@ impl SpatialLogKappaCoords {
                 vals.extend(seed);
                 continue;
             }
+            // Constant-curvature: one signed κ slot seeded from the spec's κ
+            // (clamped feasible). The −ln(length_scale) convention below is
+            // log-κ semantics and must not touch the raw-κ coordinate. Bounds
+            // are unavailable here (no data view), so this is the raw spec κ;
+            // `reseed_from_data` / `clamp_to_bounds` later project it feasible.
+            if let Some(cc) = constant_curvature_term_spec(spec, term_idx) {
+                vals.push(cc.kappa);
+                dims.push(1);
+                continue;
+            }
             let length_scale = get_spatial_length_scale(spec, term_idx)
                 .unwrap_or(options.min_length_scale)
                 .clamp(options.min_length_scale, options.max_length_scale);
@@ -2997,6 +3008,19 @@ impl SpatialLogKappaCoords {
                 cursor += d;
                 continue;
             }
+            // Constant-curvature: the single signed-κ box from the data chart
+            // window (symmetric about κ = 0), never a κ = log-scale window.
+            if constant_curvature_term_spec(spec, term_idx).is_some() {
+                let (lo, hi) = constant_curvature_kappa_bounds(data, spec, term_idx);
+                if d >= 1 {
+                    values[cursor] = match end {
+                        AnisoBoundEnd::Lower => lo,
+                        AnisoBoundEnd::Upper => hi,
+                    };
+                }
+                cursor += d;
+                continue;
+            }
             let psi_bound = {
                 let (lo, hi) = spatial_term_psi_bounds(data, spec, term_idx, options);
                 match end {
@@ -3045,6 +3069,13 @@ impl SpatialLogKappaCoords {
             // Measure-jet dials are seeded from the realized spec and must
             // not be recentered into a κ data window.
             if measure_jet_term_spec(spec, term_idx).is_some() {
+                cursor += d;
+                continue;
+            }
+            // Constant-curvature κ is seeded from the spec (the user's curvature
+            // hint, default κ = 0); `clamp_to_bounds` projects it feasible. It
+            // is not a log-scale, so the log-κ recenter below never applies.
+            if constant_curvature_term_spec(spec, term_idx).is_some() {
                 cursor += d;
                 continue;
             }
@@ -3196,6 +3227,13 @@ impl SpatialLogKappaCoords {
                 set_measure_jet_psi_dials(&mut updated, term_idx, psi)?;
                 continue;
             }
+            // Constant-curvature: write the optimized signed κ straight back;
+            // the −exp(ψ) length-scale translation below is log-κ semantics and
+            // would misread the raw curvature.
+            if constant_curvature_term_spec(&updated, term_idx).is_some() {
+                set_constant_curvature_kappa(&mut updated, term_idx, psi)?;
+                continue;
+            }
             let (next_length_scale, next_aniso) = spatial_term_psi_to_length_scale_and_aniso(psi);
             if (d == 1 || next_length_scale.is_some())
                 && let Some(length_scale) = next_length_scale
@@ -3274,6 +3312,17 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
     if let Some(mj) = measure_jet_term_spec(spec, term_idx) {
         return measure_jet_enrolls_psi(mj);
     }
+
+    // Constant-curvature smooths always enroll their single signed curvature κ
+    // as an outer ψ-coordinate (#944 stage 3): κ̂ is the headline estimand, so
+    // unlike a fixed-ℓ kernel it is fitted by default, not gated on a
+    // user-supplied scale. The coordinate is raw κ (interior κ = 0), and its
+    // exact design/penalty κ-derivatives come from
+    // `build_constant_curvature_basis_kappa_derivatives`.
+    if constant_curvature_term_spec(spec, term_idx).is_some() {
+        return true;
+    }
+
     get_spatial_length_scale(spec, term_idx).is_some()
 }
 
@@ -3436,6 +3485,116 @@ fn set_single_term_measure_jet_psi_dials(
         crate::bail_invalid_estim!("measure-jet ψ write-back targeted a non-measure-jet term");
     };
     apply_measure_jet_psi(mj, psi)
+}
+
+/// The constant-curvature smooth's spec, when `term_idx` is one. Single
+/// accessor for every κ-ψ dispatch below, mirroring `measure_jet_term_spec`.
+fn constant_curvature_term_spec(
+    spec: &TermCollectionSpec,
+    term_idx: usize,
+) -> Option<&crate::basis::ConstantCurvatureBasisSpec> {
+    spec.smooth_terms
+        .get(term_idx)
+        .and_then(|term| match &term.basis {
+            SmoothBasisSpec::ConstantCurvature { spec, .. } => Some(spec),
+            _ => None,
+        })
+}
+
+/// Hard positive cap on |κ| relative to the data's inverse squared chart
+/// radius. The κ-stereographic chart is valid for `1 + κ‖x‖² > 0`; at
+/// `|κ| = 1/R²` (R² = max squared chart radius) the gauge `1 + κ‖x‖²` reaches
+/// the chart edge for the farthest data point, so the optimizer is boxed to a
+/// safe fraction of that scale on both sides. κ = 0 (flat) is the centre of
+/// the window, an interior point of the `S^d ← ℝ^d → H^d` family — exactly the
+/// reachability the raw-κ (not log-κ) coordinate exists to preserve.
+const CONSTANT_CURVATURE_KAPPA_CHART_FRACTION: f64 = 0.5;
+/// Floor on the data's squared chart radius used to scale the κ window, so a
+/// degenerate (near-origin) point cloud still yields a finite, usable bracket
+/// rather than an unbounded one.
+const CONSTANT_CURVATURE_MIN_CHART_RADIUS2: f64 = 1e-8;
+
+/// `(κ_min, κ_max)` outer-optimization window for a constant-curvature term,
+/// derived from the data's maximum squared chart radius `R²` so the κ-jets
+/// never leave the κ-stereographic chart. Symmetric about κ = 0:
+/// `±CONSTANT_CURVATURE_KAPPA_CHART_FRACTION / R²`.
+fn constant_curvature_kappa_bounds(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    term_idx: usize,
+) -> (f64, f64) {
+    let feature_cols = match spec.smooth_terms.get(term_idx).map(|t| &t.basis) {
+        Some(SmoothBasisSpec::ConstantCurvature { feature_cols, .. }) => feature_cols,
+        _ => return (-1.0, 1.0),
+    };
+    let mut max_r2 = CONSTANT_CURVATURE_MIN_CHART_RADIUS2;
+    for row in data.outer_iter() {
+        let mut r2 = 0.0_f64;
+        for &c in feature_cols.iter() {
+            if let Some(&v) = row.get(c)
+                && v.is_finite()
+            {
+                r2 += v * v;
+            }
+        }
+        if r2 > max_r2 {
+            max_r2 = r2;
+        }
+    }
+    let half = CONSTANT_CURVATURE_KAPPA_CHART_FRACTION / max_r2;
+    (-half, half)
+}
+
+/// Seed κ for a constant-curvature term: the spec's realized κ, projected into
+/// the data-derived chart window so the outer optimizer starts feasible.
+fn constant_curvature_kappa_seed(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    term_idx: usize,
+) -> f64 {
+    let (lo, hi) = constant_curvature_kappa_bounds(data, spec, term_idx);
+    let kappa = constant_curvature_term_spec(spec, term_idx)
+        .map(|s| s.kappa)
+        .unwrap_or(0.0);
+    kappa.clamp(lo, hi)
+}
+
+/// Write the optimized κ back into a constant-curvature term spec. Returns
+/// `true` when κ moved. Centers, ℓ, and the constraint transform `z` are
+/// κ-FIXED by the basis κ-contract, so only `kappa` changes.
+fn set_constant_curvature_kappa(
+    spec: &mut TermCollectionSpec,
+    term_idx: usize,
+    psi: &[f64],
+) -> Result<bool, EstimationError> {
+    if psi.len() != 1 {
+        crate::bail_invalid_estim!(
+            "constant-curvature κ write-back expects exactly one value, got {}",
+            psi.len()
+        );
+    }
+    let next_kappa = psi[0];
+    if !next_kappa.is_finite() {
+        crate::bail_invalid_estim!(
+            "constant-curvature κ write-back produced a non-finite κ = {next_kappa}"
+        );
+    }
+    let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
+        crate::bail_invalid_estim!(
+            "constant-curvature κ write-back: term index {term_idx} out of range"
+        );
+    };
+    let SmoothBasisSpec::ConstantCurvature { spec: cc, .. } = &mut term.basis else {
+        crate::bail_invalid_estim!(
+            "constant-curvature κ write-back targeted a non-constant-curvature term"
+        );
+    };
+    if cc.kappa != next_kappa {
+        cc.kappa = next_kappa;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 /// Returns `true` when a spatial term has NO outer optimization axes — i.e.
@@ -15671,10 +15830,19 @@ fn try_build_spatial_term_log_kappa_derivative(
                 .map_err(EstimationError::from)?
         }
         SmoothBasisSpec::Sphere { .. } => return Ok(None),
-        // Constant-curvature smooths hold κ fixed at construction (#944 stage 3
-        // foundation); the κ-as-ψ derivative channel is a later stage, so there
-        // is no log-κ derivative bundle to expose here yet.
-        SmoothBasisSpec::ConstantCurvature { .. } => return Ok(None),
+        // Constant-curvature smooths expose κ as one signed, design-moving
+        // outer ψ-coordinate (#944 stage 3 final wiring). Unlike the Matérn /
+        // Duchon / TPS kernels — whose ψ-coordinate is `log κ = −log ℓ` — the
+        // constant-curvature ψ-coordinate is the **raw curvature κ itself**, so
+        // κ = 0 stays an interior point of the `S^d ← ℝ^d → H^d` family. The
+        // bundle therefore carries `∂·/∂κ` / `∂²·/∂κ²` directly, and the chart
+        // coordinates are consumed verbatim (no input standardization — the
+        // gauge `1 + κ‖x‖²` defines what κ means; see the basis builder).
+        SmoothBasisSpec::ConstantCurvature { feature_cols, spec } => {
+            let x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            build_constant_curvature_basis_kappa_derivatives(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
         // Measure-jet routes through the GROUPED dial builder
         // (`try_build_spatial_term_log_kappa_aniso_derivativeinfos`):
         // `spatial_term_uses_per_axis_psi` is true for every enrolled
