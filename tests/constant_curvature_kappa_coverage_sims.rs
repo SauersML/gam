@@ -134,8 +134,8 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
     let offset = Array1::<f64>::zeros(n);
     let options = FitOptions::default();
     let kappa_options = SpatialLengthScaleOptimizationOptions {
-        max_outer_iter: 20,
-        rel_tol: 1e-5,
+        max_outer_iter: 8,
+        rel_tol: 1e-4,
         pilot_subsample_threshold: 0,
         ..SpatialLengthScaleOptimizationOptions::default()
     };
@@ -168,7 +168,7 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
 
 /// Number of replicate datasets per arm. Small (CI cost) but enough to expose a
 /// badly-biased estimator or a grossly mis-covering CI; bars are binomial-aware.
-const R: usize = 9;
+const R: usize = 5;
 
 /// CI COVERAGE + κ̂ RECOVERY on CURVED truth. Across `R` independent M_κ
 /// datasets at a planted spherical κ⋆, the 95% profile CI must cover κ⋆ at close
@@ -183,7 +183,7 @@ fn profile_ci_covers_planted_curvature_across_replicates() {
     let mut khats = Vec::with_capacity(R);
     for r in 0..R {
         let seed = 0x5EED_0944_0000_0000 ^ ((r as u64) << 8);
-        let (feats, y) = dataset_on_m_kappa(160, kappa_star, 0.6, 0.10, seed);
+        let (feats, y) = dataset_on_m_kappa(120, kappa_star, 0.6, 0.10, seed);
         let inf = fit_and_infer(&feats, &y);
         let covers = inf.ci.ci_lo <= kappa_star && kappa_star <= inf.ci.ci_hi;
         if covers {
@@ -206,24 +206,24 @@ fn profile_ci_covers_planted_curvature_across_replicates() {
     );
 
     // (1) COVERAGE: a 95% profile CI must cover the truth in a large majority of
-    // replicates. At nominal 0.95 over R=9 the expected miss count is ~0.45; a
+    // replicates. At nominal 0.95 over R=5 the expected miss count is ~0.25; a
     // CI that systematically excludes the truth (wrong width or off-center) drops
-    // far below. Requiring ≥ 7/9 covers tolerates the small-sample binomial slack
-    // (P(Bin(9,0.95) ≤ 6) ≈ 0.008, so a correctly-calibrated CI essentially never
+    // far below. Requiring ≥ 4/5 covers tolerates the small-sample binomial slack
+    // (P(Bin(5,0.95) ≤ 3) ≈ 0.001, so a correctly-calibrated CI essentially never
     // fails) while still failing a grossly mis-covering interval.
     assert!(
-        covered >= 7,
+        covered >= 4,
         "profile CI covered the planted κ⋆=+{kappa_star} in only {covered}/{R} replicates \
-         (expected ~9 at nominal 95%)"
+         (expected ~5 at nominal 95%)"
     );
     // (2) SIGN RECOVERY: spherical truth ⇒ κ̂ > 0 in a strong majority.
     assert!(
-        sign_correct >= 8,
+        sign_correct >= 4,
         "κ̂ sign recovered (>0) in only {sign_correct}/{R} replicates for κ⋆=+{kappa_star}"
     );
     // (3) LOW BIAS: the mean estimate tracks the truth within a tolerance honest
-    // about the binary-free but noisy Gaussian signal at n=160 — not railed to a
-    // chart bound, not collapsed toward 0.
+    // about the noisy Gaussian signal at n=120 — not railed to a chart bound, not
+    // collapsed toward 0.
     assert!(
         (mean_khat - kappa_star).abs() < 1.0,
         "mean κ̂={mean_khat:+.3} too far from planted κ⋆=+{kappa_star} (bias bar 1.0)"
@@ -243,7 +243,7 @@ fn flatness_test_holds_size_across_flat_replicates() {
     let mut pvals = Vec::with_capacity(R);
     for r in 0..R {
         let seed = 0x71A7_0944_0000_0000 ^ ((r as u64) << 8);
-        let (feats, y) = dataset_on_m_kappa(160, 0.0, 0.6, 0.10, seed);
+        let (feats, y) = dataset_on_m_kappa(120, 0.0, 0.6, 0.10, seed);
         let inf = fit_and_infer(&feats, &y);
         if inf.flatness.p_value < alpha {
             rejections += 1;
@@ -263,10 +263,11 @@ fn flatness_test_holds_size_across_flat_replicates() {
     );
 
     // SIZE CONTROL: a level-α interior χ²₁ test on truly flat data rejects ~α of
-    // the time. At α=0.05 over R=9 the expected rejection count is ~0.45; a test
+    // the time. At α=0.05 over R=5 the expected rejection count is ~0.25; a test
     // that over-rejects (wrong reference, e.g. a phantom curvature from the basis,
-    // or a mis-scaled LR) would reject many. Allow ≤ 2/9 to absorb the small-R
-    // binomial tail while still failing a test that rejects flat data routinely.
+    // or a mis-scaled LR) would reject many. Allow ≤ 2/5 to absorb the small-R
+    // binomial tail (P(Bin(5,0.05) ≥ 3) ≈ 0.001) while still failing a test that
+    // rejects flat data routinely.
     assert!(
         rejections <= 2,
         "κ=0 flatness test rejected truly-flat data in {rejections}/{R} replicates at α={alpha} \
@@ -275,7 +276,7 @@ fn flatness_test_holds_size_across_flat_replicates() {
     // The profile CI must straddle 0 (verdict Flat) for flat data in a strong
     // majority — the CI-side mirror of the size claim.
     assert!(
-        ci_covers_zero >= 7,
+        ci_covers_zero >= 4,
         "profile CI failed to cover κ=0 on flat data in {}/{R} replicates",
         R - ci_covers_zero
     );

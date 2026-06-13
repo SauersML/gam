@@ -12,11 +12,12 @@
 //! to match gam) is the canonical peer, demoted to a match-or-beat accuracy
 //! baseline on the SAME objective, never an output to reproduce.
 //!
-//! Synthetic arm (seed=20260605, n=300): x, z ~ U(0,1); truth on the log-mean
+//! Synthetic arm (seed=20260605, n=200): x, z ~ U(0,1); truth on the log-mean
 //! scale `eta_true = 2.0 + sin(pi*x)*cos(pi*z)` => mu = exp(eta) in ~[2.7,20.1];
-//! y ~ NegBinom(mu, theta=3) via the gamma-Poisson mixture. Asserts truth
-//! recovery on the linear predictor, match-or-beat mgcv, and an NB-variance
-//! Pearson chi2/n near 1.
+//! y ~ NegBinom(mu, theta=3) via the gamma-Poisson mixture.  Reduced from n=300
+//! so that mgcv's `negbin(theta) te(x,z,k=5)` R call fits within the 360s CI
+//! budget.  Asserts truth recovery on the linear predictor, match-or-beat mgcv,
+//! and an NB-variance Pearson chi2/n near 1.
 //!
 //! Real arm: the SAME capability on `badhealth` (overdispersed doctor visits),
 //! `numvisit ~ te(age, badh)`, theta fixed from train by method of moments and
@@ -39,7 +40,9 @@ use std::path::Path;
 
 const BADHEALTH_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/badhealth.csv");
 
-const N: usize = 300;
+// Reduced from 300; the smooth truth (sin·cos) is recoverable at n=200 and
+// the smaller PIRLS cost brings mgcv's negbin te() R fit within the 360s budget.
+const N: usize = 200;
 const THETA: f64 = 3.0;
 
 /// Sample one Negative-Binomial(mu, theta) count via the gamma-Poisson mixture:
@@ -115,7 +118,9 @@ fn gam_tensor_te_2d_negbin_matches_mgcv() {
         negative_binomial_theta: Some(THETA),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ te(x, z, k=7)", &ds, &cfg).expect("gam negbin te fit");
+    // k=5 (25 tensor knots): sufficient to recover the smooth sin·cos truth and
+    // keeps mgcv's negbin te() R fit within the 360s CI wall-clock budget.
+    let result = fit_from_formula("y ~ te(x, z, k=5)", &ds, &cfg).expect("gam negbin te fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for NB te(x, z)");
     };
@@ -141,7 +146,7 @@ fn gam_tensor_te_2d_negbin_matches_mgcv() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(y ~ te(x, z, k = 7), data = df,
+        m <- gam(y ~ te(x, z, k = 5), data = df,
                  family = negbin(theta = 3), method = "REML")
         emit("eta", as.numeric(predict(m, type = "link")))
         emit("edf", sum(m$edf))
