@@ -416,16 +416,27 @@ fn gam_random_intercept_by_smooth_recovers_truth_on_real_data() {
     let t_days_idx = tcol["Days"];
     let t_subject_idx = tcol["Subject"];
 
-    // ---- fit gam on TRAIN: Reaction ~ s(Days) + s(Days, by=Subject) + group(Subject) ----
+    // ---- fit gam on TRAIN: Reaction ~ s(Days,k=4) + s(Days,by=Subject,k=3) + group(Subject) ----
     // Shared Day smooth + per-subject Day deviation + per-subject random
     // intercept — the assigned capability, identical in structure to the
     // synthetic arm's `y ~ s(x) + s(x, by=g) + group(g)`.
+    //
+    // BASIS SIZING IS A WELL-POSEDNESS CONSTRAINT, NOT A TUNING KNOB. The split
+    // leaves only 8 training days per subject (144 train rows total). A
+    // per-subject `s(Days, by=Subject)` at the default k=8 demands 18·8 + 8 = 152
+    // basis columns — more columns than rows — so REML is ill-posed and the fit
+    // is rejected before it starts. Sleepstudy's per-subject Day trajectory is
+    // near-linear with mild curvature (the canonical random *slope*), so a
+    // per-subject quadratic deviation (k=3) plus a low-order shared trend (k=4)
+    // is both sufficient to capture the signal and well-identified on 8 days:
+    // 18·3 + 4 = 58 basis columns « 144 rows. This is the smallest basis that
+    // still exercises the by-subject-smooth + random-intercept combination.
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        "Reaction ~ s(Days) + s(Days, by=Subject) + group(Subject)",
+        "Reaction ~ s(Days, k=4) + s(Days, by=Subject, k=3) + group(Subject)",
         &train_ds,
         &cfg,
     )
