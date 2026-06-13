@@ -3314,25 +3314,64 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         let cached_outcome = cache_value_probe_result(&result);
         remember_value_probe(&mut self.value_probe_cache, x, cached_outcome);
         match &result {
-            Ok(cost) => log::info!(
-                "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, iter={})",
-                stage_start.elapsed().as_secs_f64(),
-                cost,
-                trial_rho_distance,
-                self.iter_count
-            ),
-            Err(ObjectiveEvalError::Recoverable { .. }) => log::info!(
-                "[STAGE] outer eval end order=Value elapsed={:.3}s outcome=recoverable trial_rho_distance={:.3e} (first-order bridge, iter={})",
-                stage_start.elapsed().as_secs_f64(),
-                trial_rho_distance,
-                self.iter_count
-            ),
-            Err(ObjectiveEvalError::Fatal { .. }) => log::info!(
-                "[STAGE] outer eval end order=Value elapsed={:.3}s outcome=fatal trial_rho_distance={:.3e} (first-order bridge, iter={})",
-                stage_start.elapsed().as_secs_f64(),
-                trial_rho_distance,
-                self.iter_count
-            ),
+            Ok(cost) => {
+                // A successful probe resets the consecutive-refusal counter: the
+                // current ρ neighbourhood has at least one feasible point, so
+                // isolated refusals on other directions are normal line-search
+                // noise, not a globally-infeasible neighbourhood.
+                self.consecutive_probe_refusals = 0;
+                log::info!(
+                    "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, iter={})",
+                    stage_start.elapsed().as_secs_f64(),
+                    cost,
+                    trial_rho_distance,
+                    self.iter_count
+                );
+            }
+            Err(ObjectiveEvalError::Recoverable { .. }) => {
+                log::info!(
+                    "[STAGE] outer eval end order=Value elapsed={:.3}s outcome=recoverable trial_rho_distance={:.3e} (first-order bridge, iter={})",
+                    stage_start.elapsed().as_secs_f64(),
+                    trial_rho_distance,
+                    self.iter_count
+                );
+                // Non-termination guard (#NaN-outer-loop): when every
+                // line-search probe is infeasible and BFGS has never
+                // accepted a gradient step (`iter_count == 0`), the
+                // neighbourhood around the seed is globally degenerate.
+                // BFGS would otherwise spend its entire max_iterations ×
+                // line_search_budget doing inner solves that all fail.
+                // Escalate to Fatal so BFGS exits immediately; the seed
+                // loop routes it as a rejected seed.
+                self.consecutive_probe_refusals =
+                    self.consecutive_probe_refusals.saturating_add(1);
+                if self.iter_count == 0
+                    && self.consecutive_probe_refusals >= PROBE_REFUSAL_FATAL_THRESHOLD
+                {
+                    log::warn!(
+                        "[OUTER] probe-refusal non-termination guard fired after {} consecutive \
+                         infeasible cost probes with no accepted gradient step; escalating to \
+                         Fatal to abort this seed (first-order bridge, iter={})",
+                        self.consecutive_probe_refusals,
+                        self.iter_count,
+                    );
+                    return Err(ObjectiveEvalError::Fatal {
+                        message: format!(
+                            "{PROBE_REFUSAL_FATAL_SENTINEL}: {consecutive} consecutive \
+                             infeasible probes with no accepted outer step",
+                            consecutive = self.consecutive_probe_refusals,
+                        ),
+                    });
+                }
+            }
+            Err(ObjectiveEvalError::Fatal { .. }) => {
+                log::info!(
+                    "[STAGE] outer eval end order=Value elapsed={:.3}s outcome=fatal trial_rho_distance={:.3e} (first-order bridge, iter={})",
+                    stage_start.elapsed().as_secs_f64(),
+                    trial_rho_distance,
+                    self.iter_count
+                );
+            }
         }
         result
     }
@@ -3408,6 +3447,10 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             self.last_g_norm = Some(g_norm);
         }
         self.last_value_grad_rho = Some(x.clone());
+        // A successful gradient evaluation means the current ρ is feasible;
+        // reset the consecutive-probe-refusal counter so the guard only fires
+        // when ALL probes in EVERY subsequent direction fail.
+        self.consecutive_probe_refusals = 0;
         self.value_probe_cache
             .retain(|entry| value_probe_reject_outcome(&entry.outcome));
         log::info!(
@@ -8268,6 +8311,21 @@ fn run_outer_with_plan(
                                      iterate ({context})"
                                 ))),
                             }
+                        }
+                        Err(BfgsError::ObjectiveFailed { message })
+                            if message.starts_with(PROBE_REFUSAL_FATAL_SENTINEL) =>
+                        {
+                            // The bridge's probe-refusal non-termination guard
+                            // (#NaN-outer-loop): every line-search cost probe at
+                            // this seed was infeasible, so BFGS would have spent
+                            // its entire max_iterations budget on inner solves
+                            // that all fail. Route as a seed rejection so the
+                            // cascade tries the next seed instead of propagating
+                            // a fatal error.
+                            Err(EstimationError::RemlOptimizationFailed(format!(
+                                "BFGS aborted: globally infeasible neighbourhood \
+                                 at seed (probe-refusal guard): {message}"
+                            )))
                         }
                         Err(BfgsError::ObjectiveFailed { message }) => {
                             Err(EstimationError::RemlOptimizationFailed(format!(
