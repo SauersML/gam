@@ -438,16 +438,33 @@ impl RiemannianManifold for ConstantCurvature {
         Ok(self.kappa)
     }
 
+    /// Euclidean reverse-mode VJP of `y = exp_x(v)` w.r.t. BOTH `x` and `v`,
+    /// returned as `(x̄, v̄)` for an incoming cotangent `ḡ = grad_output`.
+    ///
     /// A curved manifold MUST NOT inherit the trait's flat identity VJP — that
     /// default is the exact Jacobian only when `exp_p(v) = p + v`, and using it
     /// on a curved member would silently return wrong reverse-mode gradients
     /// (the exact objective↔gradient-desync the trait doc warns against).
     ///
-    /// At `κ = 0` the family IS genuinely flat: in the doubled gauge
-    /// `exp_p(v) = p ⊕_0 v = p + v`, so both Jacobians are the identity and the
-    /// flat VJP is exact. For `κ ≠ 0` the analytic Jacobi-field VJP is not yet
-    /// landed (the κ-jet API differentiates w.r.t. κ, not w.r.t. p/v), so we
-    /// refuse loudly rather than hand back a straight-through identity.
+    /// This is the exact reverse-mode of the explicit `exp_map` formula
+    /// `exp_x(v) = x ⊕_κ [ tn_κ(λ_x‖v‖/2) · v̂ ]` (with `mobius_add` inlined),
+    /// differentiated line-for-line, so it is correct-by-construction for both
+    /// arguments and matches the forward value exactly:
+    ///
+    /// ```text
+    ///   gauge = 1 + κ‖x‖²,  n = ‖v‖,  t = n/gauge,  τ = tn_κ(t),
+    ///   step = (τ/n)·v,  y = x ⊕_κ step  (Möbius),  tn′(t) = 1 + κτ².
+    /// ```
+    ///
+    /// The reverse walks back through Möbius addition, `step = scale·v`,
+    /// `scale = τ/n`, `τ = tn_κ(t)`, `t = n/gauge`, `gauge = 1 + κ‖x‖²` and
+    /// `n = ‖v‖`. At `κ = 0` (doubled-gauge flat space, `exp_p(v) = p + v`)
+    /// both Jacobians are the identity and the reverse reduces to `(ḡ, ḡ)`,
+    /// matched by the early return. At `v = 0` the differential of `exp_x` is
+    /// the identity in both slots, so we return `(ḡ, ḡ)` there too (mirroring
+    /// the `n ≤ GEOMETRY_EPS` short-circuit in `exp_map`). The conjugate-point
+    /// guard (`tn` errors at `cos(√κ t)=0`) and the Möbius antipodal-denominator
+    /// guard propagate exactly as in the forward map.
     fn exp_map_vjp(
         &self,
         point: ArrayView1<'_, f64>,
@@ -460,13 +477,84 @@ impl RiemannianManifold for ConstantCurvature {
             "constant-curvature exp_map_vjp grad_output",
             grad_output.len(),
         )?;
-        if self.kappa.abs() <= GEOMETRY_EPS {
+        let k = self.kappa;
+        if k.abs() <= GEOMETRY_EPS {
+            // Doubled-gauge flat space: exp is the chart translation x + v, so
+            // both Jacobians are the identity and the VJP is the cotangent itself.
             return Ok((grad_output.to_owned(), grad_output.to_owned()));
         }
-        Err(GeometryError::Unsupported(
-            "constant-curvature exp_map_vjp: analytic Jacobi-field VJP not yet implemented \
-             for κ ≠ 0 — do not inherit the flat identity (it is wrong for curved κ)",
-        ))
+        let d = point.len();
+        let n = tangent_vec.dot(&tangent_vec).sqrt();
+        if n <= GEOMETRY_EPS {
+            // At v = 0 the differential of exp_x is the identity in both slots.
+            return Ok((grad_output.to_owned(), grad_output.to_owned()));
+        }
+
+        // ── Forward (mirrors `exp_map` with `mobius_add` inlined). ──────────
+        let gauge = self.chart_gauge(point)?; // 1 + κ‖x‖²
+        let t = n / gauge; // λ_x‖v‖/2
+        let tau = self.tn(t)?; // generalized tangent (errors at conjugate point)
+        let scale = tau / n;
+        let step = tangent_vec.mapv(|z| z * scale);
+        let p = point.dot(&step); // ⟨x, step⟩
+        let xx = point.dot(point); // ‖x‖²
+        let ss = step.dot(&step); // ‖step‖²
+        let a = 1.0 - 2.0 * k * p - k * ss;
+        let b = 1.0 + k * xx; // = gauge
+        let denom = 1.0 - 2.0 * k * p + k * k * xx * ss;
+        if denom.abs() <= MOBIUS_DENOM_EPS {
+            return Err(GeometryError::Singular(
+                "Möbius addition at the κ>0 antipodal point",
+            ));
+        }
+        let mut y = Array1::zeros(d);
+        for i in 0..d {
+            y[i] = (a * point[i] + b * step[i]) / denom;
+        }
+
+        // ── Reverse. ────────────────────────────────────────────────────────
+        let g = grad_output;
+        let yx = g.dot(point); // ḡ·x
+        let ys = g.dot(&step); // ḡ·step
+        let yy = g.dot(&y); // ḡ·y
+        let inv_d = 1.0 / denom;
+
+        // Möbius VJP into x (holding step) and into step (holding x).
+        let mut x_bar = Array1::zeros(d);
+        let mut step_bar = Array1::zeros(d);
+        for j in 0..d {
+            x_bar[j] = (-2.0 * k * step[j] * yx + a * g[j] + 2.0 * k * point[j] * ys) * inv_d
+                - yy * (-2.0 * k * step[j] + 2.0 * k * k * point[j] * ss) * inv_d;
+            step_bar[j] = ((-2.0 * k * point[j] - 2.0 * k * step[j]) * yx + b * g[j]) * inv_d
+                - yy * (-2.0 * k * point[j] + 2.0 * k * k * xx * step[j]) * inv_d;
+        }
+
+        // step = scale·v  ⇒  scale_bar = step̄·v,  v̄ += scale·step̄.
+        let scale_bar = step_bar.dot(&tangent_vec);
+        let mut v_bar = step_bar.mapv(|z| z * scale);
+
+        // scale = τ/n  ⇒  τ_bar = scale_bar/n,  n_bar = −scale_bar·τ/n².
+        let tau_bar = scale_bar / n;
+        let mut n_bar = -scale_bar * tau / (n * n);
+
+        // τ = tn_κ(t),  tn′(t) = 1 + κτ²  ⇒  t_bar = τ_bar·(1 + κτ²).
+        let t_bar = tau_bar * (1.0 + k * tau * tau);
+
+        // t = n/gauge  ⇒  n_bar += t_bar/gauge,  gauge_bar = −t_bar·n/gauge².
+        n_bar += t_bar / gauge;
+        let gauge_bar = -t_bar * n / (gauge * gauge);
+
+        // gauge = 1 + κ‖x‖²  ⇒  x̄ += gauge_bar·2κ·x.
+        for j in 0..d {
+            x_bar[j] += gauge_bar * 2.0 * k * point[j];
+        }
+
+        // n = ‖v‖  ⇒  v̄ += n_bar·v/n.
+        for j in 0..d {
+            v_bar[j] += n_bar * tangent_vec[j] / n;
+        }
+
+        Ok((x_bar, v_bar))
     }
 }
 
@@ -858,6 +946,68 @@ mod tests {
                     "κ={kappa}: ∂²exp/∂κ²[{i}] analytic {} fd {fd2}",
                     e_kk[i]
                 );
+            }
+        }
+    }
+
+    /// The analytic Euclidean reverse-mode VJP of `exp_map` (w.r.t. BOTH the
+    /// base point and the tangent) matches central finite differences of the
+    /// forward map, at every sign of κ and across the series branch. For each
+    /// coordinate j: `x̄_fd[j] = ḡ·(exp(x+h e_j,v) − exp(x−h e_j,v))/(2h)` and
+    /// likewise `v̄_fd[j]`. The tangent is kept small enough that the geodesic
+    /// stays before the conjugate point (`‖v‖·conformal_factor(x)/2 < π/√κ`)
+    /// for κ > 0, well inside the chart for κ < 0.
+    #[test]
+    fn exp_map_vjp_matches_finite_differences() {
+        let h = 1e-6;
+        let cases: &[(ndarray::Array1<f64>, ndarray::Array1<f64>, ndarray::Array1<f64>)] = &[
+            (
+                array![0.2, -0.1],
+                array![0.12, 0.08],
+                array![1.0, -0.5],
+            ),
+            (
+                array![-0.15, 0.22],
+                array![-0.05, 0.11],
+                array![0.3, 0.7],
+            ),
+        ];
+        for &kappa in &[-1.3, -0.3, 0.0, 0.4, 1.1] {
+            let m = ConstantCurvature::new(2, kappa);
+            for (x, v, g) in cases {
+                let d = x.len();
+                let (x_bar, v_bar) = m
+                    .exp_map_vjp(x.view(), v.view(), g.view())
+                    .expect("exp_map_vjp");
+                for j in 0..d {
+                    // x̄_fd[j] = ḡ · ∂exp/∂x_j.
+                    let mut xp = x.clone();
+                    xp[j] += h;
+                    let mut xn = x.clone();
+                    xn[j] -= h;
+                    let ep = m.exp_map(xp.view(), v.view()).expect("exp x+");
+                    let en = m.exp_map(xn.view(), v.view()).expect("exp x-");
+                    let xbar_fd = g.dot(&(&ep - &en)) / (2.0 * h);
+                    assert!(
+                        (x_bar[j] - xbar_fd).abs() <= 1e-5 * x_bar[j].abs().max(1.0),
+                        "κ={kappa}: x̄[{j}] analytic {} fd {xbar_fd}",
+                        x_bar[j]
+                    );
+
+                    // v̄_fd[j] = ḡ · ∂exp/∂v_j.
+                    let mut vp = v.clone();
+                    vp[j] += h;
+                    let mut vn = v.clone();
+                    vn[j] -= h;
+                    let ep = m.exp_map(x.view(), vp.view()).expect("exp v+");
+                    let en = m.exp_map(x.view(), vn.view()).expect("exp v-");
+                    let vbar_fd = g.dot(&(&ep - &en)) / (2.0 * h);
+                    assert!(
+                        (v_bar[j] - vbar_fd).abs() <= 1e-5 * v_bar[j].abs().max(1.0),
+                        "κ={kappa}: v̄[{j}] analytic {} fd {vbar_fd}",
+                        v_bar[j]
+                    );
+                }
             }
         }
     }
