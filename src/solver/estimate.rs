@@ -2971,6 +2971,15 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// revision yet recorded" — every subsequent call is treated as a
     /// fresh-canonical case and the slow path runs.
     last_canonical_revision: Option<u64>,
+    /// Certified Chebyshev-in-ψ Gram tensor for the SINGLE design-moving
+    /// hyperparameter (#1033b, isotropic spatial κ): when present and the
+    /// trial ψ lies inside the certified window, `prepare_eval_state`
+    /// installs the n-free assembled `GaussianFixedCache` after
+    /// `reset_surface`, replacing the per-trial O(n·p²) Gram re-stream. The
+    /// conditioning transform must be column-only and ψ-invariant for the
+    /// installed statistics to live in the same frame as the streamed ones —
+    /// the setter enforces an identity parametric conditioning.
+    psi_gram_tensor: Option<std::sync::Arc<crate::solver::psi_gram_tensor::PsiGramTensor>>,
 }
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
@@ -3035,6 +3044,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             kronecker_factored: opts.kronecker_factored.clone(),
             reml_state,
             last_canonical_revision: None,
+            psi_gram_tensor: None,
         })
     }
 
@@ -3080,6 +3090,22 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             &self.reml_state,
             values,
         );
+    }
+
+    /// Attach a certified ψ-Gram tensor (#1033b) for the single design-moving
+    /// hyperparameter. Refuses (returns false) when the parametric column
+    /// conditioning is not the identity — the tensor's statistics are built in
+    /// the RAW design frame, and a non-trivial conditioning would put the
+    /// streamed and installed caches in different coordinate frames.
+    pub(crate) fn set_psi_gram_tensor(
+        &mut self,
+        tensor: std::sync::Arc<crate::solver::psi_gram_tensor::PsiGramTensor>,
+    ) -> bool {
+        if !self.conditioning.columns.is_empty() {
+            return false;
+        }
+        self.psi_gram_tensor = Some(tensor);
+        true
     }
 
     fn prepare_eval_state(
@@ -3173,6 +3199,26 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
         self.reml_state.setwarm_start_original_beta(warm_start_beta);
         self.last_canonical_revision = design_revision;
+        // #1033b: single design-moving ψ with a certified tensor — install the
+        // n-free assembled Gaussian sufficient statistics so the inner PLS and
+        // the sparse scatter skip the per-trial O(n·p²) Gram re-stream
+        // (`reset_surface` above just cleared the slot for the new design).
+        // Off-window, multi-ψ, ineligible family, or shape mismatch all fall
+        // through to the streamed builder unchanged.
+        if let Some(tensor) = self.psi_gram_tensor.as_ref()
+            && theta.len() == rho_dim + 1
+        {
+            let psi = theta[rho_dim];
+            if tensor.contains(psi)
+                && self.reml_state.install_gaussian_fixed_cache(Arc::new(
+                    tensor.gaussian_fixed_cache_at(psi),
+                ))
+            {
+                log::debug!(
+                    "[psi-gram-tensor] installed n-free Gaussian sufficient statistics at psi={psi:.6}"
+                );
+            }
+        }
         Ok(hyper_dirs)
     }
 
