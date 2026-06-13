@@ -393,15 +393,6 @@ pub(super) struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
     pub(super) options: BlockwiseFitOptions,
 }
 
-/// Row count at or below which the line-search likelihood sweep accumulates
-/// on the caller thread instead of through Rayon. See the rationale at the
-/// fold site: at small row counts the `crossbeam_epoch` pin + global epoch
-/// advance dominate the per-row arithmetic, and the sweep is re-entered once
-/// per line-search probe. Chosen so the common spatial-kappa fit shapes
-/// (n in the low thousands) stay on the caller thread, where a single
-/// row-order sum is both cheaper and deterministic.
-pub(super) const LINE_SEARCH_LL_SEQUENTIAL_MAX_ROWS: usize = 4_096;
-
 pub(super) fn bernoulli_margslope_line_search_ll_with_early_exit<F>(
     weighted_rows: &[WeightedOuterRow],
     threshold: f64,
@@ -417,37 +408,19 @@ where
     }
     let mut total_ll = 0.0;
     for chunk in weighted_rows.chunks(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
-        // The line search re-enters this likelihood sweep once per probe —
-        // thousands of times across one fit's continuation/BFGS schedule.
-        // For a small chunk the Rayon entry (a pinned `crossbeam_epoch` guard
-        // whose global epoch advance scans the whole participant list on a
-        // many-core box) costs more than evaluating the rows on the caller
-        // thread; a stack sample of the n≈1500 kappa phase spent ~47% of
-        // self-time in that scheduler/epoch bookkeeping. Below the threshold
-        // accumulate sequentially in row order — a single, deterministic
-        // left-to-right sum — and only pay Rayon when the chunk is large
-        // enough to amortize it.
-        let chunk_ll: f64 = if chunk.len() <= LINE_SEARCH_LL_SEQUENTIAL_MAX_ROWS {
-            let mut acc = 0.0_f64;
-            for wr in chunk {
-                acc += wr.weight * row_ll(wr.index)?;
-            }
-            acc
-        } else {
-            chunk
-                .into_par_iter()
-                .try_fold(
-                    || 0.0,
-                    |mut acc, wr| -> Result<_, String> {
-                        acc += wr.weight * row_ll(wr.index)?;
-                        Ok(acc)
-                    },
-                )
-                .try_reduce(
-                    || 0.0,
-                    |left, right| -> Result<_, String> { Ok(left + right) },
-                )?
-        };
+        let chunk_ll: f64 = chunk
+            .into_par_iter()
+            .try_fold(
+                || 0.0,
+                |mut acc, wr| -> Result<_, String> {
+                    acc += wr.weight * row_ll(wr.index)?;
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || 0.0,
+                |left, right| -> Result<_, String> { Ok(left + right) },
+            )?;
         total_ll += chunk_ll;
         // Every Bernoulli marginal-slope row contribution is <= 0 because it is
         // weight_i * log(CDF(.)) with nonnegative weights, so the running sum is
@@ -550,45 +523,5 @@ mod early_exit_soundness_tests {
             "HT-weighted sum 1000 spuriously exceeds the full-data threshold 500 — \
              demonstrates why an HT subsample must never certify a line-search reject"
         );
-    }
-
-    /// The serial fast path (chunks at or below
-    /// [`LINE_SEARCH_LL_SEQUENTIAL_MAX_ROWS`]) and the Rayon path must return
-    /// the identical accepted LL: the only difference is which engine walks the
-    /// rows, and both accumulate `weight·row_ll` in row order within a chunk.
-    /// A non-trivial per-row contribution (so a reduction-order bug would
-    /// surface as a mismatch) is summed below and above the threshold; the
-    /// reference is a single deterministic left-to-right sum.
-    #[test]
-    fn sequential_and_parallel_line_search_ll_agree_across_threshold() {
-        let row_ll = |i: usize| -> Result<f64, String> {
-            // Bounded, sign-varying, never zero — a value whose summation order
-            // matters numerically yet stays a valid (≤ 0 after weighting) LL is
-            // not required here since we compare engines, not the certificate.
-            Ok(-(((i % 37) as f64) * 0.013_7 + 0.5).ln())
-        };
-
-        for &n in &[
-            1_usize,
-            LINE_SEARCH_LL_SEQUENTIAL_MAX_ROWS,       // last all-serial size
-            LINE_SEARCH_LL_SEQUENTIAL_MAX_ROWS + 1,   // first Rayon size
-            LINE_SEARCH_LL_SEQUENTIAL_MAX_ROWS * 3,   // well into the Rayon path
-        ] {
-            let rows = full_data_rows(n);
-            // Deterministic reference: plain row-order sum, no early exit.
-            let reference: f64 = rows
-                .iter()
-                .map(|wr| wr.weight * row_ll(wr.index).expect("row_ll finite"))
-                .sum();
-            // A threshold above the NLL so the sweep runs to completion and
-            // returns the full LL rather than rejecting.
-            let threshold = -reference + 1.0;
-            let got = bernoulli_margslope_line_search_ll_with_early_exit(&rows, threshold, row_ll)
-                .expect("LL below threshold must accept");
-            assert!(
-                (got - reference).abs() <= 1e-9 * reference.abs().max(1.0),
-                "line-search LL engine mismatch at n={n}: got {got}, reference {reference}"
-            );
-        }
     }
 }
