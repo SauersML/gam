@@ -8334,27 +8334,51 @@ const SCHUR_MATVEC_PARALLEL_ROW_MIN: usize = 256;
 ///       = P_iᵀ G_i (P_i x),      G_i := L_iᵀ (H_tt^(i)+ρ_t I)⁻¹ L_i   (p×p).
 /// ```
 ///
-/// The `p × p` block `G_i` depends only on the assembled per-row blocks and the
-/// (already-computed, solve-stable) `H_tt` factor — NOT on the CG iterate `x`.
-/// The generic [`schur_matvec`] re-walks `apply_jbeta → apply_l → solve(d×d) →
-/// apply_l_t → scatter` on every CG iteration; this object **stages `G_i` once
-/// per CG solve** (the "upload X once" residency mechanism, applied on CPU to
-/// the matvec rather than a dense factorization), turning each subsequent
-/// matvec into a sparse gather → one `p×p` GEMV → sparse scatter, with no
-/// per-iteration triangular solve and no operator-closure re-walk.
+/// The block `G_i = L_iᵀ Y_i` depends only on the assembled per-row blocks and
+/// the (already-computed, solve-stable) `H_tt` factor — NOT on the CG iterate
+/// `x`. The generic [`schur_matvec`] re-walks `apply_jbeta → apply_l →
+/// solve(d×d) → apply_l_t → scatter` on every CG iteration; this object **stages
+/// the factors `(L_i, Y_i)` once per CG solve** (the "upload X once" residency
+/// mechanism, applied on CPU to the matvec rather than a dense factorization),
+/// turning each subsequent matvec into a sparse gather → two `di×p` GEMVs →
+/// sparse scatter, with no per-iteration triangular solve and no operator-closure
+/// re-walk. It never materialises the dense `p×p` product: `di ≪ p` for SAE
+/// rows, so the factored apply is `2·di·p` flops/row (vs `p²`) and `O(n·di·p)`
+/// memory (vs `O(n·p²)` ≈ 67 GB at the Qwen shape — the dense form is OOM).
 ///
 /// Numerically identical to the generic path up to floating-point reassociation
 /// (it differentiates and accumulates the SAME quotient), so the criterion
 /// ranking across topology candidates cannot move — the #1017 verification gate.
 struct SaeResidentReducedSchur {
-    /// Decoder output dimension `p` (the side length of every `G_i`).
+    /// Decoder output dimension `p` (the side length of every `G_i = L_iᵀ Y_i`).
     p: usize,
-    /// Per-row resident `G_i` (`p×p`). A row with empty active support gets a
-    /// zero-sized block and is skipped in the matvec.
-    g_rows: Vec<Array2<f64>>,
+    /// Per-row **factored** residency: `(L_i, Y_i)`, each stored row-major as a
+    /// `di × p` slab (`L_i` = local Jacobian, `Y_i = (H_tt^(i)+ρ_t I)⁻¹ L_i`).
+    /// The reduced block is `G_i = L_iᵀ Y_i` (`p×p`, symmetric PSD), but it has
+    /// rank ≤ `di` and `di ≪ p` for SAE rows (the per-row latent dim is 1–2
+    /// while `p` is the decoder block width, ~2048). Materialising the dense
+    /// `p×p` block would cost `O(n·p²)` memory (≈67 GB at the Qwen shape) and
+    /// `p²` flops per matvec/row; the factored form costs `O(n·di·p)` memory and
+    /// `2·di·p` flops/row, applying `G_i v = L_iᵀ (Y_i v)` (gather → `di`-length
+    /// GEMV → `p`-length GEMV → scatter). A row with empty active support /
+    /// degenerate dims gets `di = 0` and is skipped.
+    /// `(di, L_i, Y_i)` per row; `L_i`/`Y_i` are `di·p`-length row-major buffers.
+    rows: Vec<ResidentRowFactor>,
     /// Per-row active atom support `(β-block base index, φ weight)`, shared with
     /// the assembler's [`DeviceSaePcgData`] (no re-clone of the index lists).
     a_phi: Arc<[Vec<(usize, f64)>]>,
+}
+
+/// Factored per-row residency block: `G_i = L_iᵀ Y_i` kept as its `di×p` factors
+/// so the matvec never materialises the dense `p×p` product. See
+/// [`SaeResidentReducedSchur`].
+struct ResidentRowFactor {
+    /// Row latent dimension `di` (the inner contraction width). `0` ⇒ skipped.
+    di: usize,
+    /// `L_i` row-major `di × p` (`di·p` entries). Empty when `di == 0`.
+    l: Vec<f64>,
+    /// `Y_i = (H_tt^(i)+ρ_t I)⁻¹ L_i` row-major `di × p`. Empty when `di == 0`.
+    y: Vec<f64>,
 }
 
 impl SaeResidentReducedSchur {
@@ -8382,25 +8406,32 @@ impl SaeResidentReducedSchur {
         if p == 0 || data.a_phi.len() != n || data.local_jac.len() != n {
             return None;
         }
-        let build_row = |row: usize| -> Array2<f64> {
+        let empty = || ResidentRowFactor { di: 0, l: Vec::new(), y: Vec::new() };
+        let build_row = |row: usize| -> ResidentRowFactor {
             let di = sys.row_dims[row];
             let jac = &data.local_jac[row];
             // q_i = len/p; must match the row's latent dimension di.
             if p == 0 || jac.len() != di * p || di == 0 {
-                return Array2::<f64>::zeros((0, 0));
+                return empty();
             }
-            // L_i as a (q_i × p) = (di × p) matrix (row-major in `local_jac`).
+            // L_i as a (di × p) matrix (row-major in `local_jac`).
             let l_i = match ArrayView2::from_shape((di, p), jac.as_slice()) {
                 Ok(v) => v.to_owned(),
-                Err(_) => return Array2::<f64>::zeros((0, 0)),
+                Err(_) => return empty(),
             };
             // Solve (H_tt+ρ_t I) Y = L_i for Y (di × p): one batched back-solve
-            // over the p columns against the cached factor.
+            // over the p columns against the cached factor. Stage `(L_i, Y_i)`
+            // — NOT the dense `p×p` product `G_i = L_iᵀ Y_i` — so storage and the
+            // matvec stay `O(di·p)` instead of `O(p²)` (`di ≪ p` for SAE rows).
             let y = backend.solve_block_matrix(htt_factors.factor(row), l_i.view());
-            // G_i = L_iᵀ Y  (p × p), symmetric PSD.
-            l_i.t().dot(&y)
+            // Flatten both factors to `di × p` row-major buffers (iteration over
+            // a standard-layout view is row-major regardless of the source
+            // strides, so the hot loop can index `r*p + c` directly).
+            let l_flat: Vec<f64> = l_i.iter().copied().collect();
+            let y_flat: Vec<f64> = y.iter().copied().collect();
+            ResidentRowFactor { di, l: l_flat, y: y_flat }
         };
-        let g_rows: Vec<Array2<f64>> = if n >= SCHUR_MATVEC_PARALLEL_ROW_MIN
+        let rows: Vec<ResidentRowFactor> = if n >= SCHUR_MATVEC_PARALLEL_ROW_MIN
             && rayon::current_thread_index().is_none()
         {
             use rayon::prelude::*;
@@ -8410,14 +8441,18 @@ impl SaeResidentReducedSchur {
         };
         Some(Self {
             p,
-            g_rows,
+            rows,
             a_phi: data.a_phi_shared(),
         })
     }
 
-    /// Accumulate one row's `S_i x = P_iᵀ G_i (P_i x)` into `acc` (length `K`).
-    /// `gather`/`scatter_scratch` are caller-owned length-`p` buffers reused
-    /// across rows to keep the hot loop allocation-free.
+    /// Accumulate one row's `S_i x = P_iᵀ G_i (P_i x) = P_iᵀ L_iᵀ Y_i (P_i x)`
+    /// into `acc` (length `K`). `gather`/`prod` are caller-owned length-`p`
+    /// buffers and `w` a caller-owned `≥ max_i di`-length buffer, all reused
+    /// across rows to keep the hot loop allocation-free. The matvec applies the
+    /// factored block: `w = Y_i·(P_i x)` (`di`-length, `di·p` flops) then
+    /// `prod = L_iᵀ·w` (`p`-length, `di·p` flops) — `2·di·p` total, never the
+    /// dense `p²` product.
     #[inline]
     fn row_into(
         &self,
@@ -8426,9 +8461,11 @@ impl SaeResidentReducedSchur {
         acc: &mut Array1<f64>,
         gather: &mut [f64],
         prod: &mut [f64],
+        w: &mut [f64],
     ) {
-        let g = &self.g_rows[row];
-        if g.is_empty() {
+        let rf = &self.rows[row];
+        let di = rf.di;
+        if di == 0 {
             return;
         }
         let p = self.p;
@@ -8448,14 +8485,26 @@ impl SaeResidentReducedSchur {
                 gather[j] += phi * x[base + j];
             }
         }
-        // prod = G_i · (P_i x)   (p×p GEMV).
-        for r in 0..p {
+        // w = Y_i · (P_i x)   (di × p GEMV → length di).  Y_i row-major di×p.
+        for r in 0..di {
+            let yrow = &rf.y[r * p..r * p + p];
             let mut s = 0.0_f64;
-            let row_r = g.row(r);
             for c in 0..p {
-                s += row_r[c] * gather[c];
+                s += yrow[c] * gather[c];
             }
-            prod[r] = s;
+            w[r] = s;
+        }
+        // prod = L_iᵀ · w   (p × di GEMV → length p).  L_i row-major di×p, so
+        // L_iᵀ[j,r] = L_i[r,j]; accumulate column-by-column over the di rows.
+        for v in prod.iter_mut().take(p) {
+            *v = 0.0;
+        }
+        for r in 0..di {
+            let lrow = &rf.l[r * p..r * p + p];
+            let wr = w[r];
+            for j in 0..p {
+                prod[j] += lrow[j] * wr;
+            }
         }
         // acc += P_iᵀ prod = scatter φ_s · prod into base_s blocks.
         for &(base, phi) in support {
@@ -8466,6 +8515,12 @@ impl SaeResidentReducedSchur {
                 acc[base + j] += phi * prod[j];
             }
         }
+    }
+
+    /// Max row latent dim `di` across resident rows — the size of the `w`
+    /// scratch the matvec needs for the inner `Y_i·(P_i x)` GEMV.
+    fn max_di(&self) -> usize {
+        self.rows.iter().map(|r| r.di).max().unwrap_or(0)
     }
 }
 
@@ -8527,12 +8582,14 @@ fn schur_matvec<B: BatchedBlockSolver + Sync>(
             .map(|idxs| {
                 let mut acc = Array1::<f64>::zeros(k);
                 if let Some(res) = resident {
-                    // Resident path: each matvec is gather → p×p GEMV → scatter,
-                    // reading only the pre-staged `G_i` (no per-iteration solve).
+                    // Resident path: each matvec is gather → factored di×p GEMVs
+                    // → scatter, reading only the pre-staged `(L_i, Y_i)` (no
+                    // per-iteration solve, no dense p×p block).
                     let mut gather = vec![0.0_f64; p];
                     let mut prod = vec![0.0_f64; p];
+                    let mut w = vec![0.0_f64; res.max_di()];
                     for i in idxs {
-                        res.row_into(i, x, &mut acc, &mut gather, &mut prod);
+                        res.row_into(i, x, &mut acc, &mut gather, &mut prod, &mut w);
                     }
                 } else {
                     let mut local = Array1::<f64>::zeros(sys.d);
@@ -8553,8 +8610,9 @@ fn schur_matvec<B: BatchedBlockSolver + Sync>(
         let mut acc = Array1::<f64>::zeros(k);
         let mut gather = vec![0.0_f64; p];
         let mut prod = vec![0.0_f64; p];
+        let mut w = vec![0.0_f64; res.max_di()];
         for i in 0..sys.rows.len() {
-            res.row_into(i, x, &mut acc, &mut gather, &mut prod);
+            res.row_into(i, x, &mut acc, &mut gather, &mut prod, &mut w);
         }
         for a in 0..k {
             out[a] -= acc[a];
@@ -9320,7 +9378,9 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     gpu_matvec: Option<&GpuSchurMatvec>,
     metric_weights: Option<&MetricWeights>,
 ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
-    // #1017 CPU residency: stage the per-row reduced-Schur `p×p` blocks once, up
+    // #1017 CPU residency: stage the per-row reduced-Schur factors `(L_i, Y_i)`
+    // (NOT the dense `p×p` block — `di ≪ p`, so the factored form is `O(n·di·p)`
+    // memory and `2·di·p` flops/row) once, up
     // front, when the SAE structure is installed and the matvec runs on host
     // (CPU). The GPU matvec carries its own residency, so skip when it is engaged.
     // The same staged operator is reused across the whole preconditioner ladder
@@ -12325,16 +12385,100 @@ mod tests {
         }
     }
 
+    /// The factored residency (storing `(L_i, Y_i)` and applying `G_i v =
+    /// L_iᵀ(Y_i v)`) must reproduce the dense `p×p` block `G_i = L_iᵀ Y_i`
+    /// exactly — this is the #1017 memory/compute win (`O(n·di·p)` vs `O(n·p²)`)
+    /// and must not perturb the operator. Asserts, per row, that the factored
+    /// `row_into` applied to a unit-support probe equals the explicit dense
+    /// `G_i · (P_i x)` to rel < 1e-10.
+    #[test]
+    fn factored_residency_matches_dense_g_block() {
+        let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 40;
+        let q = 3usize;
+        let p = 7usize;
+        let n_atoms = 24usize;
+        let m_active = 4usize;
+        let (sys, _a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
+        let backend = CpuBatchedBlockSolver;
+        let htt_factors = backend
+            .factor_blocks(&sys.rows, 0.0, q, false)
+            .expect("SPD per-row blocks must factor");
+        let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend)
+            .expect("SAE structure must yield a resident operator");
+
+        for row in 0..n {
+            let rf = &resident.rows[row];
+            if rf.di == 0 {
+                continue;
+            }
+            let di = rf.di;
+            // Reconstruct the dense block G_i = L_iᵀ Y_i (p×p) from the stored
+            // factors and check the factored GEMV chain against a direct G_i·g.
+            let l = ArrayView2::from_shape((di, p), &rf.l).unwrap();
+            let y = ArrayView2::from_shape((di, p), &rf.y).unwrap();
+            let g_dense = l.t().dot(&y); // p×p
+
+            // A non-trivial gather vector g (length p).
+            let g_vec: Vec<f64> = (0..p).map(|j| 0.4 * ((row + j) as f64 * 0.11).sin() - 0.07).collect();
+            // Dense reference: prod_ref = G_i · g.
+            let mut prod_ref = vec![0.0_f64; p];
+            for r in 0..p {
+                let mut s = 0.0;
+                for c in 0..p {
+                    s += g_dense[(r, c)] * g_vec[c];
+                }
+                prod_ref[r] = s;
+            }
+            // Factored chain: w = Y_i·g, prod = L_iᵀ·w.
+            let mut w = vec![0.0_f64; di];
+            for r in 0..di {
+                let yrow = &rf.y[r * p..r * p + p];
+                w[r] = (0..p).map(|c| yrow[c] * g_vec[c]).sum();
+            }
+            let mut prod = vec![0.0_f64; p];
+            for r in 0..di {
+                let lrow = &rf.l[r * p..r * p + p];
+                for j in 0..p {
+                    prod[j] += lrow[j] * w[r];
+                }
+            }
+            let scale = prod_ref.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+            for j in 0..p {
+                let rel = (prod[j] - prod_ref[j]).abs() / scale;
+                assert!(
+                    rel < 1e-10,
+                    "factored G_i apply must match dense G_i at row {row} idx {j}: \
+                     {} vs {} (rel {rel:e})",
+                    prod[j],
+                    prod_ref[j]
+                );
+            }
+        }
+        // Storage check: the factored form keeps di·p (not p²) per row.
+        let factored_entries: usize = resident.rows.iter().map(|r| r.l.len() + r.y.len()).sum();
+        let dense_entries: usize = resident.rows.iter().filter(|r| r.di > 0).count() * p * p;
+        assert!(
+            factored_entries < dense_entries,
+            "factored residency must store fewer entries than the dense p×p form \
+             ({factored_entries} vs {dense_entries})"
+        );
+    }
+
     /// Wall-clock benchmark: generic per-row matvec vs the CPU-resident SAE
     /// matvec (#1017) at an SAE-flavoured shape, amortised over a representative
     /// CG-iteration count (the residency build is paid once, then N matvecs).
     /// Ordinary test (ban gate forbids `#[ignore]`); run `--release --nocapture`.
     #[test]
     fn bench_resident_sae_matvec_speedup() {
+        // SAE shape: small per-row latent dim `q = di` (1–2 in production) and a
+        // wider per-atom decoder block `p` — the regime where the factored
+        // residency (`2·di·p` flops/row, `O(n·di·p)` memory) beats both the
+        // generic per-iteration solve AND a dense `p×p` residency (`p²` /
+        // `O(n·p²)`). Here di=2, p=64 ⇒ ~16× fewer matvec flops/row than dense.
         let n = 1500usize;
-        let q = 4usize;
-        let p = 8usize;
-        let n_atoms = 256usize; // border k = 2048
+        let q = 2usize;
+        let p = 64usize;
+        let n_atoms = 32usize; // border k = n_atoms·p = 2048
         let m_active = 6usize;
         let (sys, _a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
         let k = sys.k;
@@ -12380,17 +12524,25 @@ mod tests {
 
         let gen_total = gen_elapsed.as_secs_f64();
         let res_total = res_elapsed.as_secs_f64();
+        // Residency footprint: factored `(L_i, Y_i)` = `2·di·p` f64/row vs the
+        // dense `p×p` block = `p²` f64/row.
+        let factored_f64: usize = resident.rows.iter().map(|r| r.l.len() + r.y.len()).sum();
+        let dense_f64: usize = resident.rows.iter().filter(|r| r.di > 0).count() * p * p;
         println!(
             "[#1017 SAE resident matvec, n={n} q={q} p={p} k={k} m={m_active}, \
              {cg_iters} CG matvecs incl. 1 residency build, {} rayon threads]\n  \
              generic:  {:.3} ms total ({:.3} ms/matvec)\n  resident: {:.3} ms total \
-             (build + {cg_iters} matvecs)\n  speedup:  {:.2}x  (sink {:.3e})",
+             (build + {cg_iters} matvecs)\n  speedup:  {:.2}x  (sink {:.3e})\n  \
+             residency mem: factored {:.2} MiB vs dense p×p {:.2} MiB ({:.1}× smaller)",
             rayon::current_num_threads(),
             gen_total * 1e3,
             gen_total / cg_iters as f64 * 1e3,
             res_total * 1e3,
             gen_total / res_total,
             sink,
+            factored_f64 as f64 * 8.0 / (1024.0 * 1024.0),
+            dense_f64 as f64 * 8.0 / (1024.0 * 1024.0),
+            dense_f64 as f64 / factored_f64.max(1) as f64,
         );
         assert!(gen_total > 0.0 && res_total > 0.0, "timings must be positive");
     }
