@@ -58,4 +58,9 @@ fn probe_rank_deficient_passes_guard() {
     if let Err(e) = &result {
         eprintln!("PROBE_ERR {}", e);
     }
+    assert!(
+        elapsed.as_secs() < 300,
+        "rank-deficient fit did not terminate promptly: {:.1}s",
+        elapsed.as_secs_f64()
+    );
 }
