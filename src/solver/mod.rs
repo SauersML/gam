@@ -15,6 +15,7 @@ pub(crate) mod latent_cache;
 pub mod latent_inner;
 pub mod logdet_bounds;
 pub mod loop_guard;
+pub mod measure_jet_glm_sufficient;
 pub mod measure_jet_gram_cache;
 pub mod mixture_link;
 pub mod orthogonal_reparam;
