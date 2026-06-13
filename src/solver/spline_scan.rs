@@ -531,6 +531,11 @@ pub struct SplineScanFit {
     /// λ- and data-independent additive constant. Differences across λ are
     /// exact REML criterion differences.
     pub restricted_loglik: f64,
+    /// Raw observation count `n` (pre-pooling; ties collapse to fewer knots).
+    /// The profiled σ² used the restricted residual d.o.f. `n − order`, so this
+    /// is exactly the count needed to recover the Gaussian deviance
+    /// (`σ²·(n − order)`) and the residual d.o.f. for introspection (#1046).
+    pub n_obs: usize,
     /// Smoothed full states `(f, f′)` per knot.
     smoothed_state: Vec<Vec2>,
     /// Smoothed full state covariances per knot (unit-σ² scale).
@@ -901,6 +906,7 @@ pub fn fit_spline_scan_at(
         log_lambda,
         sigma2,
         restricted_loglik,
+        n_obs,
         smoothed_state: sm_state,
         smoothed_cov: sm_cov,
         rts_gain: gains,
@@ -996,6 +1002,11 @@ pub struct SplineScanState {
     pub log_lambda: f64,
     pub sigma2: f64,
     pub restricted_loglik: f64,
+    /// Raw observation count `n` (#1046). `#[serde(default)]` → `0` for
+    /// pre-#1046 snapshots, which `from_state` treats as "unknown" and recovers
+    /// best-effort from the pooled node weights (exact for unit weights).
+    #[serde(default)]
+    pub n_obs: u64,
 }
 
 /// Serde default for [`SplineScanState::order`]: historical snapshots predate
@@ -1040,6 +1051,7 @@ impl SplineScanFit {
             log_lambda: self.log_lambda,
             sigma2: self.sigma2,
             restricted_loglik: self.restricted_loglik,
+            n_obs: self.n_obs as u64,
         }
     }
 
@@ -1145,6 +1157,15 @@ impl SplineScanFit {
             })
             .collect();
         let sigma2 = state.sigma2;
+        // #1046: raw observation count. Pre-#1046 snapshots stored `0` (serde
+        // default); recover best-effort from the pooled node weights — exact
+        // for unit weights — and floor at the knot count so the residual d.o.f.
+        // `n − order` the deviance/summary use stays strictly positive.
+        let n_obs = if state.n_obs > 0 {
+            state.n_obs as usize
+        } else {
+            (state.node_weight.iter().sum::<f64>().round() as usize).max(m)
+        };
         Ok(Self {
             order,
             knots: state.knots.clone(),
@@ -1154,6 +1175,7 @@ impl SplineScanFit {
             log_lambda: state.log_lambda,
             sigma2,
             restricted_loglik: state.restricted_loglik,
+            n_obs,
             smoothed_state,
             smoothed_cov,
             rts_gain,
@@ -1297,6 +1319,24 @@ impl SplineScanFit {
             self.smoothed_cov[t][1][1] * self.sigma2,
         )
     }
+
+    /// Selected smoothing parameter `λ = e^{log λ}` (#1046).
+    pub fn lambda(&self) -> f64 {
+        self.log_lambda.exp()
+    }
+
+    /// Raw observation count `n` used to profile σ² (#1046).
+    pub fn n_obs(&self) -> usize {
+        self.n_obs
+    }
+
+    /// Gaussian deviance — the weighted residual sum of squares `Σ wᵢ(yᵢ − f̂ᵢ)²`
+    /// (#1046). The profiled `σ² = RSS / (n − order)` (the restricted residual
+    /// d.o.f.), so `RSS = σ²·(n − order)` recovers the deviance exactly without
+    /// re-touching the raw rows the scan deliberately does not retain.
+    pub fn deviance(&self) -> f64 {
+        self.sigma2 * (self.n_obs as f64 - self.order as f64).max(0.0)
+    }
 }
 
 #[cfg(test)]
@@ -1327,11 +1367,16 @@ mod tests {
         let w: Vec<f64> = (0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)).collect();
         let fit = fit_spline_scan(&x, &y, &w, order).expect("scan fit");
         assert_eq!(fit.order, order);
+        // The raw count is retained verbatim (n rows, one tie pair collapses a
+        // knot but not the count) and drives the recovered deviance (#1046).
+        assert_eq!(fit.n_obs, n);
 
         let json = serde_json::to_string(&fit.to_state()).expect("serialize state");
         let state: SplineScanState = serde_json::from_str(&json).expect("deserialize state");
         let restored = SplineScanFit::from_state(&state).expect("restore fit");
 
+        assert_eq!(fit.n_obs, restored.n_obs);
+        assert_eq!(fit.deviance().to_bits(), restored.deviance().to_bits());
         assert_eq!(fit.knots, restored.knots);
         assert_eq!(fit.mean, restored.mean);
         assert_eq!(fit.var, restored.var);
@@ -1387,6 +1432,26 @@ mod tests {
     #[test]
     fn state_snapshot_round_trips_predict_bit_for_bit_order3() {
         round_trip_predict_bit_for_bit(3);
+    }
+
+    /// #1046 legacy gate: a pre-#1046 snapshot carries `n_obs = 0` (the serde
+    /// default). `from_state` must recover a sane positive count from the
+    /// pooled node weights — exact under unit weights — so the deviance and
+    /// residual d.o.f. it feeds the summary never go non-positive.
+    #[test]
+    fn legacy_snapshot_recovers_n_obs_from_node_weights() {
+        let n = 40usize;
+        let x: Vec<f64> = (0..n).map(|i| (i as f64) / (n as f64 - 1.0)).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| (5.0 * xi).sin()).collect();
+        let w = vec![1.0; n];
+        let fit = fit_spline_scan(&x, &y, &w, 2).expect("scan fit");
+
+        let mut legacy = fit.to_state();
+        legacy.n_obs = 0; // simulate a snapshot written before #1046
+        let restored = SplineScanFit::from_state(&legacy).expect("restore legacy");
+        // Unit weights ⇒ Σ node_weight == n exactly, so the count is recovered.
+        assert_eq!(restored.n_obs, n);
+        assert!(restored.deviance() > 0.0 && restored.deviance().is_finite());
     }
 
     /// Dense order-1 (random-walk / linear smoothing spline) posterior of the
