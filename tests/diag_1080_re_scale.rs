@@ -103,6 +103,14 @@ fn diag_1080_re_scale() {
     eprintln!("  rebuilt RSS/n={:.6}", rss / n as f64);
     eprintln!("  rmse(fitted,truth)={rmse_truth:.6}");
     eprintln!("  edf_by_block={:?}", fit.fit.edf_by_block());
-    eprintln!("  lambdas={:?}", fit.fit.lambdas);
+    eprintln!("  lambdas={:?}", fit.fit.lambdas.to_vec());
     eprintln!("  beta.len()={}", fit.fit.beta.len());
+    eprintln!(
+        "  n_smooth_terms={} n_re_terms={}",
+        fit.resolvedspec.smooth_terms.len(),
+        fit.resolvedspec.random_effect_terms.len()
+    );
+    for (i, t) in fit.resolvedspec.smooth_terms.iter().enumerate() {
+        eprintln!("    smooth[{i}] name={:?} kind={}", t.name, t.basis.structural_kind());
+    }
 }
