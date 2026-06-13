@@ -177,5 +177,68 @@ def test_marginal_slope_interval_covers_truth_at_nominal_rate():
     )
 
 
+def test_marginal_slope_sample_predict_returns_posterior_bands():
+    """Issue #1049 part 2: `model.sample(...).predict(new_data, level=)` must
+    return posterior-predictive bands instead of raising the 'posterior_predict
+    currently supports only standard GAM models' stub.
+
+    The Laplace draws already existed (sample() works and is instant); this pins
+    that they are now propagated through the marginal-slope kernel to a per-row
+    η matrix and collapsed to probability-scale credible bands. The bands are
+    ordered, clipped to [0, 1], non-degenerate, and the 50% band is tighter than
+    the 95% band, so the posterior predictive responds to the level."""
+    model, data, p_true = _fit_model()
+
+    posterior = model.sample(data, samples=300, seed=7)
+    bands95 = posterior.predict(data, level=0.95)
+    assert isinstance(bands95, dict)
+    for key in ("mean", "mean_lower", "mean_upper"):
+        assert key in bands95, f"posterior predict dropped {key!r}: got {list(bands95)}"
+
+    mean = np.asarray(bands95["mean"], dtype=float)
+    lo95 = np.asarray(bands95["mean_lower"], dtype=float)
+    hi95 = np.asarray(bands95["mean_upper"], dtype=float)
+    n = len(data["disease"])
+    assert mean.shape == (n,) and lo95.shape == (n,) and hi95.shape == (n,)
+    # Probability-scale bands: ordered, clipped, non-degenerate.
+    assert np.all(lo95 >= -1e-9) and np.all(hi95 <= 1.0 + 1e-9)
+    assert np.all(lo95 <= mean + 1e-9) and np.all(hi95 >= mean - 1e-9)
+    assert np.median(hi95 - lo95) > 1e-3
+
+    # Coverage of the known generative probability at roughly the nominal rate.
+    covered = (p_true >= lo95 - 1e-9) & (p_true <= hi95 + 1e-9)
+    coverage = float(covered.mean())
+    assert 0.80 <= coverage <= 1.0, (
+        f"95% posterior-predictive band coverage of p_true was {coverage:.3f}"
+    )
+
+    # The band responds to the requested level.
+    bands50 = posterior.predict(data, level=0.50)
+    lo50 = np.asarray(bands50["mean_lower"], dtype=float)
+    hi50 = np.asarray(bands50["mean_upper"], dtype=float)
+    assert float(np.median(hi50 - lo50)) < float(np.median(hi95 - lo95)), (
+        "50% posterior-predictive band is not tighter than the 95% band"
+    )
+
+
+def test_marginal_slope_posterior_predict_draws_matrix_shape():
+    """`sample().predict_draws(new_data)` must materialize a (n_draws, n_rows)
+    η matrix for the marginal-slope model — the per-draw kernel evaluation, not
+    the X·β fast path that only applies to standard GAMs."""
+    model, data, _ = _fit_model()
+    posterior = model.sample(data, samples=128, seed=11)
+    draws = posterior.predict_draws(data)
+    eta = np.asarray(draws.eta, dtype=float)
+    n = len(data["disease"])
+    assert eta.shape == (draws.n_draws, n), (
+        f"unexpected posterior-predictive eta shape {eta.shape}"
+    )
+    # Probit response scale: every draw maps to a valid probability.
+    mean = 0.5 * np.vectorize(math.erfc)(-eta / math.sqrt(2.0))
+    assert np.all(mean >= -1e-9) and np.all(mean <= 1.0 + 1e-9)
+    # Posterior variability is real (draws are not collapsed to the mode).
+    assert np.any(np.std(eta, axis=0) > 1e-6)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
