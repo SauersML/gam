@@ -7,12 +7,10 @@
 //!   cargo run --release --example repro1082_slow_quality -- <case>
 //! case ∈ { negbin_syn, negbin_real, cyclic, poisson_real, gaussian_te }.
 
-use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
 };
-use gam::matrix::LinearOperator;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -42,7 +40,7 @@ fn time_fit(label: &str, formula: &str, ds: &gam::inference::data::EncodedDatase
         eprintln!("[repro1082] {label}: unexpected result kind in {dt:.2}s");
         return;
     };
-    let edf = fit.fit.edf_total().ok();
+    let edf = fit.fit.edf_total();
     eprintln!(
         "[repro1082] {label} DONE :: {dt:.2}s  p={}  edf={:?}",
         fit.fit.beta.len(),
