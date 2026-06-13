@@ -153,24 +153,39 @@ fn gam_binomial_logit_generalizes_on_heldout_prostate() {
     let gam_prob: Vec<f64> = gam_eta.iter().map(|&e| inv_logit(e)).collect();
     assert_eq!(gam_prob.len(), ntest, "gam held-out probability length");
 
+    // Every reference column is shipped at the common wire width `n` (the
+    // longest natural length in this test — the full 654-row dataset used for
+    // the 1-D MLE arm below). The ragged-column harness NaN-pads any shorter
+    // column up to this width, so each reference body slices every column by its
+    // own semantic length (`ntrain` train rows, `ntest` held-out rows, `nfull`
+    // for the full-data arm) before use and never touches the NaN tail. Padding
+    // the train/test columns to a fixed `n` (rather than to `train_rows.len()`)
+    // is what keeps the 654-row full-data columns from being padded *down* to
+    // the 490-row train width — the length mismatch that previously panicked.
+    let ntrain = train_rows.len();
+
     // ---- (B) mgcv smooth baseline: fit TRAIN, predict TEST ----------------
     // Same penalized binomial GAM, trained on the identical TRAIN rows and
     // scored on the identical TEST rows. A baseline to match-or-beat on
     // held-out AUC, not a target to reproduce pointwise.
     let r = run_r(
         &[
-            Column::new("pc1", &pc1_train),
-            Column::new("pc2", &pc2_train),
-            Column::new("y", &y_train),
-            Column::new("pc1_te", &pad_to(&pc1_test, train_rows.len())),
-            Column::new("pc2_te", &pad_to(&pc2_test, train_rows.len())),
-            Column::new("ntest", &vec![ntest as f64; train_rows.len()]),
+            Column::new("pc1", &pad_to(&pc1_train, n)),
+            Column::new("pc2", &pad_to(&pc2_train, n)),
+            Column::new("y", &pad_to(&y_train, n)),
+            Column::new("pc1_te", &pad_to(&pc1_test, n)),
+            Column::new("pc2_te", &pad_to(&pc2_test, n)),
+            Column::new("ntrain", &vec![ntrain as f64; n]),
+            Column::new("ntest", &vec![ntest as f64; n]),
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(y ~ s(pc1, k=5) + s(pc2, k=5), data = df,
-                 family = binomial(link="logit"), method = "REML")
+        ntrain <- as.integer(df$ntrain[1])
         ntest <- as.integer(df$ntest[1])
+        tr <- data.frame(pc1 = df$pc1[1:ntrain], pc2 = df$pc2[1:ntrain],
+                         y = df$y[1:ntrain])
+        m <- gam(y ~ s(pc1, k=5) + s(pc2, k=5), data = tr,
+                 family = binomial(link="logit"), method = "REML")
         newd <- data.frame(pc1 = df$pc1_te[1:ntest], pc2 = df$pc2_te[1:ntest])
         emit("prob", as.numeric(predict(m, newdata = newd, type = "response")))
         "#,
@@ -185,22 +200,25 @@ fn gam_binomial_logit_generalizes_on_heldout_prostate() {
     // coefficient is the analytic MLE ground truth for gam's linear fit below.
     let sk = run_python(
         &[
-            Column::new("pc1", &pc1_train),
-            Column::new("pc2", &pc2_train),
-            Column::new("y", &y_train),
-            Column::new("pc1_te", &pad_to(&pc1_test, train_rows.len())),
-            Column::new("pc2_te", &pad_to(&pc2_test, train_rows.len())),
-            Column::new("ntest", &vec![ntest as f64; train_rows.len()]),
-            Column::new("pc1_full", &pad_to(&pc1, train_rows.len())),
-            Column::new("y_full", &pad_to(&y, train_rows.len())),
-            Column::new("nfull", &vec![n as f64; train_rows.len()]),
+            Column::new("pc1", &pad_to(&pc1_train, n)),
+            Column::new("pc2", &pad_to(&pc2_train, n)),
+            Column::new("y", &pad_to(&y_train, n)),
+            Column::new("pc1_te", &pad_to(&pc1_test, n)),
+            Column::new("pc2_te", &pad_to(&pc2_test, n)),
+            Column::new("ntrain", &vec![ntrain as f64; n]),
+            Column::new("ntest", &vec![ntest as f64; n]),
+            Column::new("pc1_full", &pc1),
+            Column::new("y_full", &y),
+            Column::new("nfull", &vec![n as f64; n]),
         ],
         r#"
 from sklearn.linear_model import LogisticRegression
+ntrain = int(np.asarray(df["ntrain"])[0])
 ntest = int(np.asarray(df["ntest"])[0])
 nfull = int(np.asarray(df["nfull"])[0])
-Xtr = np.column_stack([np.asarray(df["pc1"], float), np.asarray(df["pc2"], float)])
-ytr = np.asarray(df["y"], float)
+Xtr = np.column_stack([np.asarray(df["pc1"], float)[:ntrain],
+                       np.asarray(df["pc2"], float)[:ntrain]])
+ytr = np.asarray(df["y"], float)[:ntrain]
 Xte = np.column_stack([np.asarray(df["pc1_te"], float)[:ntest],
                        np.asarray(df["pc2_te"], float)[:ntest]])
 clf = LogisticRegression(penalty=None, solver="lbfgs", max_iter=10000)
