@@ -16,7 +16,7 @@ use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::{
-    FitConfig, FitRequest, FitResult, StandardFitResult, encode_recordswith_inferred_schema,
+    FitConfig, FitResult, StandardFitResult, encode_recordswith_inferred_schema,
     fit_from_formula, fit_model, fit_spline_scan_from_formula, init_parallelism, materialize,
 };
 use ndarray::Array2;
