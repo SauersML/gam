@@ -53,7 +53,7 @@ pub(crate) fn apply_input_standardization(x: &mut Array2<f64>, scales: &[f64]) {
 /// matches `‖x − c‖ / L_user` exactly for uniform σ_a (= σ_geom) and reduces
 /// to the natural anisotropic-Mahalanobis preconditioning when σ_a vary —
 /// the convention σ_geom = (∏σ_a)^(1/d) preserves the kernel volume scale.
-pub(crate) fn geometric_mean_scale(scales: &[f64]) -> f64 {
+fn geometric_mean_scale(scales: &[f64]) -> f64 {
     if scales.is_empty() {
         return 1.0;
     }
