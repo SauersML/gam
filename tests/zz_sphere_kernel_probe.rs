@@ -116,4 +116,5 @@ fn probe_sphere_kernels() {
         );
     }
     eprintln!("[probe] mgcv sos k=20 reference rmse ~= 0.03379 (target to beat)");
+    assert!(m == 100, "probe grid must be 100 points");
 }
