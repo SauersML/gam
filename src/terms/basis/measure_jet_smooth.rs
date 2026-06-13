@@ -59,6 +59,13 @@
 //!   scalar weights applied per block. Criterion value and criterion
 //!   derivatives cannot drift apart (the objective↔gradient desync class is
 //!   structurally excluded).
+//! - **SIMPLE/RICH auto-split (#1039).** The per-scale spectrum and the
+//!   `(α, ln τ)` ψ dials are the RICH-mode realization, auto-enabled only at
+//!   large realized center counts (see [`measure_jet_rich_mode`] and
+//!   `MEASURE_JET_RICH_MODE_MIN_CENTERS`). The default for typical center
+//!   counts is SIMPLE: one fused jet-energy penalty at the auto order with no
+//!   ψ dials — the same one-λ outer footprint as Duchon/Matérn — so a small
+//!   fit pays Duchon-class cost, never the per-scale θ-inflation.
 //!
 //! # ψ-differentiability contract (what the ψ-channel stage consumes)
 //!

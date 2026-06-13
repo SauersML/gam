@@ -472,7 +472,10 @@ class MeasureJet(Smooth):
     masses as μ-weights, local jet residuals as the roughness carrier, with
     no graph, mesh, or neighbor-set inside the statistical object. Every
     option is auto-derived from the data when omitted; set a field only to
-    pin it.
+    pin it. The per-scale spectral penalty split and the smoothness/density
+    dials auto-enable only at large center counts (a spectrum needs many
+    centers to identify); small fits use one fused penalty at Duchon-class
+    cost.
 
     Parameters
     ----------
