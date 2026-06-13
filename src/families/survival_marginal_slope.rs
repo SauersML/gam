@@ -21996,20 +21996,39 @@ pub fn fit_survival_marginal_slope_terms(
         } else {
             time_beta_seed.cloned()
         };
+        // Same width-guard pattern as `time_beta_seed` above: the cached
+        // β-hint is meaningful only when its length matches the current
+        // block design width. The hint can outlive a design rebuild (e.g.
+        // pilot-time identifiability reduction vs the real fit's reduction,
+        // or a κ-probe rematerializing raw-width designs into a slot whose
+        // hint was captured at the compiled width); feeding a stale length
+        // through to `ParameterBlockSpec` would trip the p_b validation
+        // contract with a noisy mid-fit error instead of a clean fall-back
+        // to the design's natural cold start.
+        let marginal_beta_hint = hints
+            .marginal_beta
+            .as_ref()
+            .filter(|beta| beta.len() == marginal_design.design.ncols())
+            .cloned();
+        let logslope_beta_hint = hints
+            .logslope_beta
+            .as_ref()
+            .filter(|beta| beta.len() == logslope_design.design.ncols())
+            .cloned();
         let mut blocks = vec![
             build_time_blockspec(&time_block_ref, &design_exit, rho_time, time_beta_hint),
             build_marginal_blockspec(
                 marginal_design,
                 &spec.marginal_offset,
                 rho_marginal,
-                hints.marginal_beta.clone(),
+                marginal_beta_hint,
             ),
             build_logslope_blockspec(
                 logslope_design,
                 baseline_slope,
                 &spec.logslope_offset,
                 rho_logslope,
-                hints.logslope_beta.clone(),
+                logslope_beta_hint,
                 Arc::from(
                     z_primary
                         .as_slice()
