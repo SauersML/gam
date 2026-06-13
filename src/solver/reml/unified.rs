@@ -121,6 +121,9 @@ use dense_linalg::{
 mod pseudo_logdet;
 pub(crate) use pseudo_logdet::{exact_pseudo_logdet, positive_eigenvalue_threshold};
 
+mod dense_projection;
+use dense_projection::{dense_projected_matrix, dense_trace_projected_factor};
+
 fn reml_contract_panic(message: impl Into<String>) -> ! {
     std::panic::panic_any(message.into())
 }
@@ -2807,19 +2810,6 @@ fn trace_projected_factors_batched(
     }
 
     out
-}
-
-fn dense_trace_projected_factor(matrix: &Array2<f64>, factor: &Array2<f64>) -> f64 {
-    let matrix_factor = matrix.dot(factor);
-    factor
-        .iter()
-        .zip(matrix_factor.iter())
-        .map(|(&f, &mf)| f * mf)
-        .sum()
-}
-
-fn dense_projected_matrix(matrix: &Array2<f64>, factor: &Array2<f64>) -> Array2<f64> {
-    factor.t().dot(&matrix.dot(factor))
 }
 
 fn collect_projected_trace_terms<'a>(
