@@ -18427,38 +18427,40 @@ fn run_exact_joint_spatial_optimization(
     // optimizer's ψ window and hand it to the evaluator. Every in-window trial
     // then receives its Gaussian sufficient statistics (XᵀWX(ψ), XᵀW(y−offset),
     // (y−offset)ᵀW(y−offset)) assembled n-free instead of paying the per-trial
-    // O(n·p²) Gram re-stream after the design rebuild. Certification failure,
-    // non-identity column conditioning, off-window trials, or any other
-    // ineligibility silently keep the exact streamed path (same numbers, the
-    // tensor is certified to PSI_GRAM_SPOT_RTOL against the exact rebuild).
+    // O(n·p²) Gram re-stream after the design rebuild. The realizer closure
+    // returns the RAW realized design; the evaluator threads it through its
+    // own (fixed, ψ-invariant) parametric column conditioning so the tensor
+    // lives in the same frame as the streamed Gram. Certification failure,
+    // off-window trials, or any other ineligibility silently keep the exact
+    // streamed path (same numbers, the tensor is certified to
+    // PSI_GRAM_SPOT_RTOL against the exact rebuild).
     if coord_dim == 1 && family.is_gaussian_identity() {
         let psi_lo = lower[rho_dim];
         let psi_hi = upper[rho_dim];
         let z = Array1::from_iter(y.iter().zip(offset.iter()).map(|(yi, oi)| yi - oi));
-        let cache = &mut ctx.cache;
         let theta_probe_base = theta0.clone();
-        let tensor = crate::solver::psi_gram_tensor::PsiGramTensor::build(
-            |psi| -> Result<Array2<f64>, String> {
+        // Disjoint mutable borrows of `cache` (in the realizer) and
+        // `evaluator` (the build target) — both fields of `ctx`.
+        let SpatialJointContext {
+            cache, evaluator, ..
+        } = &mut ctx;
+        let attached = evaluator.build_and_set_psi_gram_tensor(
+            |psi| {
                 let mut theta_probe = theta_probe_base.clone();
                 theta_probe[rho_dim] = psi;
                 cache.ensure_theta(&theta_probe)?;
-                Ok(cache.design().design.to_dense())
+                Ok(cache.design().design.clone())
             },
             weights,
             z.view(),
             psi_lo,
             psi_hi,
         );
-        if let Some(tensor) = tensor {
-            if ctx
-                .evaluator
-                .set_psi_gram_tensor(std::sync::Arc::new(tensor))
-            {
-                log::info!(
-                    "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
-                     in-window trials assemble Gaussian sufficient statistics n-free"
-                );
-            }
+        if attached {
+            log::info!(
+                "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
+                 in-window trials assemble Gaussian sufficient statistics n-free"
+            );
         } else {
             log::info!(
                 "[{label}] ψ-gram tensor did not certify over [{psi_lo:.3}, {psi_hi:.3}]; \
