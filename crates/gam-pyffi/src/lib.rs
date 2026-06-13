@@ -155,6 +155,7 @@ use std::sync::Arc;
 
 mod benchmark_scores;
 mod competing_risks_decode;
+mod inference_instruments;
 mod manifold_pyclasses;
 mod python_literal;
 mod sklearn_metadata;
@@ -362,6 +363,27 @@ struct SummarySmoothTermRow {
     p_value: Option<f64>,
 }
 
+/// The fitted curvature estimate for one `curv(...)` constant-curvature smooth
+/// (#944). κ̂ is read directly off the resolved (fitted) basis spec — the
+/// outer optimiser's argmin of the profiled criterion over κ — so it is an
+/// estimate the fit ALREADY produced and is surfaced with zero refit. The
+/// profile-CI and the interior κ = 0 flatness LR test require re-profiling
+/// `V_p(κ)` against the original data and are produced on demand by the
+/// `curvature_inference_json` entry (which the data-carrying caller invokes).
+#[derive(Serialize)]
+struct SummaryCurvatureRow {
+    /// `curv(...)` term name.
+    name: String,
+    /// Smooth-term index of the constant-curvature term.
+    term_idx: usize,
+    /// Fitted signed sectional curvature κ̂.
+    kappa_hat: f64,
+    /// Sign-of-κ̂ geometry tag: `"spherical"` (κ̂>0), `"flat"` (κ̂≈0), or
+    /// `"hyperbolic"` (κ̂<0). A point estimate only — the level-α verdict comes
+    /// from the profile-CI endpoints via `curvature_inference_json`.
+    geometry: &'static str,
+}
+
 #[derive(Serialize)]
 struct SummaryPayload {
     formula: String,
@@ -388,6 +410,12 @@ struct SummaryPayload {
     /// `resolved_termspec` / training feature ranges).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     smooth_terms: Vec<SummarySmoothTermRow>,
+    /// Fitted curvature estimates for any `curv(...)` constant-curvature smooths
+    /// (#944). Empty when the model has no constant-curvature term. κ̂ is the
+    /// estimate the fit already produced; the CI and flatness p-value are
+    /// produced on demand by `curvature_inference_json`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    curvature_estimands: Vec<SummaryCurvatureRow>,
     covariance_kind: Option<String>,
     covariance_n: Option<usize>,
     covariance_flat: Option<Vec<f64>>,
@@ -23462,6 +23490,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_streaming_plan, module)?)?;
     module.add_function(wrap_pyfunction!(layer_transport_fit, module)?)?;
     module.add_function(wrap_pyfunction!(layer_transport_ladder, module)?)?;
+    inference_instruments::register(module)?;
     module.add_function(wrap_pyfunction!(sae_manifold_assignment_summary, module)?)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;
     module.add_function(wrap_pyfunction!(interchange_decode_forward, module)?)?;
@@ -24551,16 +24580,31 @@ fn fit_dataset_impl(
             };
             build_latent_binary_ffi_payload(formula, &dataset, &fit_config, frailty, lat_result)?
         }
-        FitRequest::DispersionLocationScale(_) => {
-            // The genuine-dispersion location-scale family (#913) is wired
-            // through the core fit engine and the CLI, but the Python FFI
-            // payload builder does not yet construct or persist it (no Python
-            // entry point routes to this variant). Reject explicitly rather
-            // than mis-serialize a half-built payload.
-            return Err(gam::WorkflowError::SchemaMismatch {
-                reason: "dispersion location-scale fits are not yet surfaced through the Python FFI payload builder"
-                    .to_string(),
-            });
+        FitRequest::DispersionLocationScale(ls_request) => {
+            // Genuine-dispersion location-scale family (#913): NB / Gamma / Beta
+            // / Tweedie mean families whose `noise_formula` models the
+            // overdispersion channel. Magic-detected upstream from a
+            // `noise_formula` on one of those families; the FFI freezes the mean
+            // and log-precision specs and persists them via the same shared
+            // location-scale assembler the CLI uses.
+            let kind = ls_request.spec.kind;
+            let fit_result = fit_model(FitRequest::DispersionLocationScale(ls_request))?;
+            let ls_result = match fit_result {
+                FitResult::DispersionLocationScale(result) => result,
+                _ => {
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the dispersion location-scale workflow to return a dispersion location-scale fit result"
+                            .to_string(),
+                    });
+                }
+            };
+            build_dispersion_location_scale_ffi_payload(
+                formula,
+                &dataset,
+                &fit_config,
+                kind,
+                ls_result,
+            )?
         }
     };
     payload.group_metadata = fit_config.group_metadata.clone();
@@ -27720,6 +27764,47 @@ fn summary_smooth_terms(
     out
 }
 
+/// Read the fitted κ̂ off every `curv(...)` constant-curvature smooth in the
+/// resolved (fitted) spec (#944). κ̂ is the outer optimiser's argmin of the
+/// profiled criterion over κ; it lives in the basis spec the fit wrote back, so
+/// surfacing it is a pure read — no refit, no original data needed. The verdict
+/// here is the point-estimate sign tag only; the level-α geometry decision
+/// (and the κ = 0 flatness p-value) is the profile-CI from
+/// `curvature_inference_json`, which re-profiles `V_p(κ)` against the data.
+fn summary_curvature_estimands(model: &FittedModel) -> Vec<SummaryCurvatureRow> {
+    use gam::smooth::SmoothBasisSpec;
+    let payload = model.payload();
+    let Some(spec) = payload.resolved_termspec.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::<SummaryCurvatureRow>::new();
+    for (term_idx, term) in spec.smooth_terms.iter().enumerate() {
+        let SmoothBasisSpec::ConstantCurvature { spec: cc, .. } = &term.basis else {
+            continue;
+        };
+        if !cc.kappa.is_finite() {
+            continue;
+        }
+        // Sign-of-κ̂ point tag. The flatness band is a fixed, small absolute
+        // window on the curvature scale — a screening label only; the
+        // statistically-honest "flat vs curved" call is the κ = 0 LR test.
+        let geometry = if cc.kappa > 1e-6 {
+            "spherical"
+        } else if cc.kappa < -1e-6 {
+            "hyperbolic"
+        } else {
+            "flat"
+        };
+        out.push(SummaryCurvatureRow {
+            name: term.name.clone(),
+            term_idx,
+            kappa_hat: cc.kappa,
+            geometry,
+        });
+    }
+    out
+}
+
 /// Canonical fitted quantities reconstructed from a spline-scan model's saved
 /// `SplineScanFit` (#1046).
 ///
@@ -27873,6 +27958,7 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         lambdas: fit.lambdas.to_vec(),
         coefficients,
         smooth_terms,
+        curvature_estimands: summary_curvature_estimands(&model),
         covariance_kind: covariance.as_ref().map(|(kind, _)| kind.clone()),
         covariance_n: covariance.as_ref().map(|(_, cov)| cov.nrows()),
         covariance_flat: covariance.map(|(_, cov)| cov.iter().copied().collect()),
