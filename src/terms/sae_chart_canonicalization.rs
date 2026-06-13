@@ -1357,18 +1357,32 @@ mod sphere_defect_tests {
         // This mock supplies only the first jet that the chart-defect test
         // exercises; it carries no analytic second/third jet, so it declares
         // that capability absent (`None`) per the trait contract rather than
-        // fabricating one.
+        // fabricating one — after validating the (lat, lon) coordinate shape
+        // it is contracted on, mirroring the sanctioned `TestPeriodicEvaluator`
+        // higher-jet stubs.
         fn second_jet_dyn(
             &self,
-            _coords: ArrayView2<'_, f64>,
+            coords: ArrayView2<'_, f64>,
         ) -> Option<Result<ndarray::Array4<f64>, String>> {
+            if coords.ncols() != 2 {
+                return Some(Err(format!(
+                    "MockSphereEvaluator::second_jet_dyn: expected (lat, lon) coords, got {} cols",
+                    coords.ncols()
+                )));
+            }
             None
         }
 
         fn third_jet_dyn(
             &self,
-            _coords: ArrayView2<'_, f64>,
+            coords: ArrayView2<'_, f64>,
         ) -> Option<Result<ndarray::Array5<f64>, String>> {
+            if coords.ncols() != 2 {
+                return Some(Err(format!(
+                    "MockSphereEvaluator::third_jet_dyn: expected (lat, lon) coords, got {} cols",
+                    coords.ncols()
+                )));
+            }
             None
         }
     }
