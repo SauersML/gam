@@ -1111,7 +1111,11 @@ impl LatentZConditionalCalibration {
         let mut g = Array2::<f64>::zeros((p_beta, dim_theta1));
         for i in 0..n {
             let j_zeta_row = self.zeta_theta1_jacobian_row(z[i], a_block.row(i));
-            debug_assert_eq!(j_zeta_row.len(), dim_theta1);
+            assert_eq!(
+                j_zeta_row.len(),
+                dim_theta1,
+                "J_zeta row width must match the first-stage hyperparameter dimension"
+            );
             let s_i = score_zeta_sensitivity.row(i);
             // Skip the outer product when the row carries no first-stage
             // sensitivity (all-zero J_zeta on a floored row) — pure savings,
