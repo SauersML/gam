@@ -17584,13 +17584,20 @@ impl<'d> SpatialJointContext<'d> {
         })?;
 
         let design_revision = Some(self.cache.design_revision());
+        // Warm-start PIRLS from the previous outer step's converged β. This is
+        // especially impactful for GLM families (Poisson, NB, Binomial) that
+        // cannot use the Gaussian Gram tensor n-free shortcut: without the warm
+        // β every outer step cold-solves a full PIRLS from β=0, paying the full
+        // O(n·p²) cost × PIRLS-iters × outer-iters budget. With the warm β the
+        // inner solve typically converges in 1-2 Newton steps instead of 4-8.
+        let warm_beta = self.evaluator.current_beta();
         let eval = evaluate_joint_reml_outer_eval_at_theta(
             &mut self.evaluator,
             self.cache.design(),
             theta,
             self.rho_dim,
             hyper_dirs,
-            None,
+            warm_beta.as_deref(),
             if allow_second_order {
                 order
             } else {
@@ -17625,13 +17632,14 @@ impl<'d> SpatialJointContext<'d> {
             ))
         })?;
         let design_revision = Some(self.cache.design_revision());
+        let warm_beta = self.evaluator.current_beta();
         evaluate_joint_reml_efs_at_theta(
             &mut self.evaluator,
             self.cache.design(),
             theta,
             self.rho_dim,
             hyper_dirs,
-            None,
+            warm_beta.as_deref(),
             design_revision,
         )
     }
@@ -17679,6 +17687,7 @@ impl<'d> SpatialJointContext<'d> {
         }
         let design_revision = Some(self.cache.design_revision());
         let cost_label = self.kind.label();
+        let warm_beta = self.evaluator.current_beta();
         let result = {
             let design = self.cache.design();
             self.evaluator.evaluate_cost_only(
@@ -17688,7 +17697,7 @@ impl<'d> SpatialJointContext<'d> {
                 design.linear_constraints.clone(),
                 theta,
                 self.rho_dim,
-                None,
+                warm_beta.as_deref(),
                 cost_label,
                 design_revision,
             )
