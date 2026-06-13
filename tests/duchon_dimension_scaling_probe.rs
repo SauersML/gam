@@ -1,9 +1,15 @@
 //! Localization probe for #1050: sweep the Duchon ambient dimension `d` and
-//! print per-fit wall-clock so we can see WHERE the ~4x cliff (d>=20) lives.
-//! Not a gate — a measurement harness (printed via `-- --nocapture`).
+//! print CONTENTION-ROBUST internal counts (REML outer iterations, penalty
+//! count, coefficient dimension, convergence) plus a within-process
+//! basis-build vs solve timing split. Counts are deterministic regardless of
+//! box load, so they localize the d>=20 cliff even on a saturated node.
 
 use csv::StringRecord;
-use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::matrix::LinearOperator;
+use gam::smooth::build_term_collection_design;
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -16,7 +22,6 @@ const TRAIN_SEED: u64 = 1_050;
 fn build_dataset(n: usize, d: usize, seed: u64) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
     let unif = Uniform::new(-2.0, 2.0).expect("uniform");
-    // First pass: sample X and compute the truth signal sd for noise scaling.
     let xs: Vec<Vec<f64>> = (0..n)
         .map(|_| (0..d).map(|_| unif.sample(&mut rng)).collect())
         .collect();
@@ -52,7 +57,7 @@ fn build_dataset(n: usize, d: usize, seed: u64) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-fn fit_time(basis: &str, d: usize, ds: &gam::data::EncodedDataset) -> f64 {
+fn probe_one(basis: &str, d: usize, ds: &gam::data::EncodedDataset) {
     let cols: Vec<String> = (0..d).map(|i| format!("x{i}")).collect();
     let formula = format!("y ~ {basis}({}, centers=40)", cols.join(","));
     let cfg = FitConfig {
@@ -62,9 +67,33 @@ fn fit_time(basis: &str, d: usize, ds: &gam::data::EncodedDataset) -> f64 {
     let start = Instant::now();
     let res = fit_from_formula(&formula, ds, &cfg)
         .unwrap_or_else(|e| panic!("gam fit '{formula}': {e}"));
-    let dt = start.elapsed().as_secs_f64();
-    drop(res);
-    dt
+    let total = start.elapsed().as_secs_f64();
+    let FitResult::Standard(fit) = res else {
+        panic!("expected standard fit for '{formula}'");
+    };
+
+    // Contention-robust counts.
+    let outer = fit.fit.outer_iterations;
+    let conv = fit.fit.outer_converged;
+    let n_pen = fit.fit.lambdas.len();
+    let ncoef: usize = fit.fit.blocks.iter().map(|b| b.beta.len()).sum();
+    let basis_cols = fit.design.design.ncols();
+
+    // Within-process basis-rebuild timing: rebuild the design on the same data
+    // (contention scales build and solve equally, so build/total ratio is a
+    // stable relative signal even on a saturated box).
+    let mut grid = ndarray::Array2::<f64>::zeros((ds.values.nrows(), ds.headers.len()));
+    grid.assign(&ds.values);
+    let t0 = Instant::now();
+    let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+        .unwrap_or_else(|e| panic!("rebuild '{formula}': {e}"));
+    let build = t0.elapsed().as_secs_f64();
+    let _ = design.design.ncols();
+
+    println!(
+        "[probe1050] {basis:11} d={d:3} total={total:7.2}s build={build:7.3}s \
+         outer_iters={outer:3} conv={conv} n_pen={n_pen} ncoef={ncoef} basis_cols={basis_cols}"
+    );
 }
 
 #[test]
@@ -72,8 +101,7 @@ fn duchon_dimension_scaling_probe() {
     init_parallelism();
     for &d in &[12usize, 16, 18, 19, 20, 21, 22, 25] {
         let ds = build_dataset(N_TRAIN, d, TRAIN_SEED);
-        let d_t = fit_time("duchon", d, &ds);
-        let m_t = fit_time("measurejet", d, &ds);
-        println!("[probe1050] d={d:3} duchon={d_t:7.3}s measurejet={m_t:7.3}s ratio={:.2}", d_t / m_t.max(1e-9));
+        probe_one("duchon", d, &ds);
+        probe_one("measurejet", d, &ds);
     }
 }
