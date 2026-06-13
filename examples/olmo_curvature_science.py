@@ -34,7 +34,7 @@ import numpy as np
 DATA_DIR = Path("/projects/standard/hsiehph/sauer354/olmo_data")
 OUT_DIR = Path("/projects/standard/hsiehph/sauer354/olmo_data/plots")
 CHECKPOINTS = ["base", "step_2300", "stage1-step0", "stage3-step11921"]
-PCA_DIM = 8  # keep small for tractability
+PCA_DIM = 4  # 2D curv() smooth over top-2 PCs after response
 RANDOM_STATE = 42
 
 
@@ -57,13 +57,12 @@ def fit_curvature(Z: np.ndarray, label: str) -> dict:
     cols = {f"x{i}": Z[:, i] for i in range(d)}
     df = pd.DataFrame(cols)
 
-    # Formula: no response needed for curvature estimation —
-    # we use a Gaussian response = first PC as a proxy and curv() on the rest
-    # This fits κ̂ = sectional curvature of the embedding manifold
+    # Formula: Gaussian response = first PC as proxy; curv(x1, x2) fits κ̂
+    # for the 2D manifold spanned by PCs 2-3 (a proper sectional curvature).
+    # Using only 2 predictor dimensions keeps the basis small and fast.
     response = Z[:, 0]
     df["y"] = response
-    predictors = " + ".join(f"curv(x{i})" for i in range(1, min(d, 4)))
-    formula = f"y ~ {predictors}"
+    formula = "y ~ curv(x1, x2)"
 
     t0 = time.time()
     try:
