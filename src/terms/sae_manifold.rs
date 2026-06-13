@@ -10474,6 +10474,51 @@ impl SaeManifoldTerm {
             }
         }
 
+        // #1026 EV-vs-Θ measurement: log each d = 1 atom's fitted TURNING
+        // `Θ = ∫κ ds` (integrated curvature of its decoded curve). A linear SAE
+        // shatters a curved feature of turning Θ into `N(ε) ≈ Θ/(2√(2ε))` rank-1
+        // atoms at relative error ε, so the curved win is concentrated on high-Θ
+        // features and vanishes as Θ → 0. Pairing this with the atom's EV
+        // contribution (held-out reconstruction) is the discriminating
+        // hybrid-vs-shatter signal: a Θ ≈ 0 atom that still earns EV is a linear
+        // direction wearing a curved basis; a high-Θ atom earning EV is a genuine
+        // curved family. Pure read-only diagnostic, never mutates the atom.
+        for atom_idx in 0..self.k_atoms() {
+            let atom = &self.atoms[atom_idx];
+            if atom.latent_dim != 1
+                || atom.homotopy_eta != 1.0
+                || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim
+            {
+                continue;
+            }
+            let Some(evaluator) = atom.basis_evaluator.as_ref().cloned() else {
+                continue;
+            };
+            let coords = self.assignment.coords[atom_idx].as_matrix();
+            let row_coords = coords.column(0);
+            match crate::terms::sae_chart_canonicalization::d1_atom_fitted_turning(
+                evaluator.as_ref(),
+                atom.decoder_coefficients.view(),
+                row_coords,
+            ) {
+                Ok(Some(theta)) => log::info!(
+                    "[#1026] atom '{}' fitted turning Θ = {theta:.6e} rad \
+                     (∫κ ds; 0 = linear-tail direction, 2π = full curved loop; \
+                     pair with held-out EV for the hybrid-vs-shatter signal)",
+                    atom.name
+                ),
+                Ok(None) => log::info!(
+                    "[#1026] atom '{}' fitted turning unavailable \
+                     (no analytic second jet or degenerate curve)",
+                    atom.name
+                ),
+                Err(err) => log::warn!(
+                    "[#1026] atom '{}' fitted turning errored: {err}",
+                    atom.name
+                ),
+            }
+        }
+
         if eligible.is_empty() {
             return Ok(());
         }
