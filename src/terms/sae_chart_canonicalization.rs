@@ -56,6 +56,9 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::linalg::faer_ndarray::{FaerCholesky, fast_ab, fast_ata, fast_atb};
 use crate::terms::sae_manifold::{SaeBasisEvaluator, solve_design_least_squares};
 
+/// Number of integration cells for the fitted-turning quadrature (#1026).
+const TURNING_QUADRATURE_CELLS: usize = 256;
+
 /// Number of grid CELLS for the arc-length quadrature and the decoder
 /// recomposition least squares. Each cell carries a node, a midpoint, and the
 /// next node (composite Simpson), so the speed field is sampled at
@@ -1173,6 +1176,146 @@ pub fn sphere_chart_isometry_defect(
     Ok(Some(defect))
 }
 
+/// Total fitted turning `Θ = ∫ κ ds` of a `d = 1` atom's decoded curve (#1026).
+///
+/// # Why this is the discriminating measurement
+///
+/// The hybrid-vs-shatter question — does a curved atom genuinely earn its
+/// curvature, or is it just more linear directions in disguise — is answered by
+/// pairing each atom's EV contribution with its fitted **turning** `Θ`
+/// (integrated curvature). A linear SAE shatters a curved feature of total
+/// turning `Θ` into `N(ε) ≈ Θ/(2√(2ε))` rank-1 atoms at relative error `ε`
+/// (radius cancels — relative error is scale-free), so the curved win is
+/// concentrated on high-`Θ` features and vanishes as `Θ → 0`. A near-linear
+/// atom (`Θ ≈ 0`) contributing EV is a linear direction wearing a curved basis;
+/// a high-`Θ` atom contributing EV is a genuine curved family. Reporting EV-per-
+/// atom vs `Θ` (not EV vs K) directly shows which.
+///
+/// # The functional
+///
+/// For the decoded curve `γ(t) = Φ(t)·B` the unsigned total curvature is
+///
+/// ```text
+/// Θ = ∫ κ(t) ‖γ'(t)‖ dt ,   κ = ‖γ'(t) ∧ γ''(t)‖ / ‖γ'(t)‖³ ,
+/// ```
+///
+/// so `Θ = ∫ ‖γ' ∧ γ''‖ / ‖γ'‖² dt`, where the wedge norm in `ℝ^p` is the
+/// parallelogram area `‖γ'∧γ''‖ = √(‖γ'‖²‖γ''‖² − ⟨γ',γ''⟩²)` (Lagrange). `Θ`
+/// is reparameterization-invariant (it is an integral of `κ ds`), so it is the
+/// honest chart-free geometric content. Integrated by Simpson's rule over a
+/// uniform grid spanning the fitted coordinate range from the exact `(γ', γ'')`
+/// jets. Units: radians of total turning (a full hue circle ≈ `2π`).
+///
+/// Returns `None` on a degenerate atom (no rows, no second jet, a collapsed
+/// coordinate range, or a non-finite integrand) — an honest refusal, never a
+/// fabricated number.
+pub fn d1_atom_fitted_turning(
+    evaluator: &dyn SaeBasisEvaluator,
+    decoder: ArrayView2<'_, f64>,
+    row_coords: ArrayView1<'_, f64>,
+) -> Result<Option<f64>, String> {
+    let m = decoder.nrows();
+    let p = decoder.ncols();
+    if m == 0 || p == 0 || row_coords.is_empty() {
+        return Ok(None);
+    }
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for &t in row_coords.iter() {
+        if !t.is_finite() {
+            return Ok(None);
+        }
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    if !(hi > lo) {
+        return Ok(None);
+    }
+    let cells = TURNING_QUADRATURE_CELLS;
+    let nodes = 2 * cells + 1; // node, midpoint, node per cell (Simpson)
+    let h = (hi - lo) / (nodes - 1) as f64;
+    let mut grid = Array2::<f64>::zeros((nodes, 1));
+    for (i, mut row) in grid.outer_iter_mut().enumerate() {
+        row[0] = lo + h * i as f64;
+    }
+    let (_phi, jet) = evaluator.evaluate(grid.view())?;
+    if jet.dim() != (nodes, m, 1) {
+        return Err(format!(
+            "d1_atom_fitted_turning: evaluator returned jet {:?}; expected ({nodes}, {m}, 1)",
+            jet.dim()
+        ));
+    }
+    let Some(hess_result) = evaluator.second_jet_dyn(grid.view()) else {
+        // No analytic second jet for this basis family → no honest turning.
+        return Ok(None);
+    };
+    let hess = hess_result?;
+    if hess.dim() != (nodes, m, 1, 1) {
+        return Err(format!(
+            "d1_atom_fitted_turning: second_jet returned {:?}; expected ({nodes}, {m}, 1, 1)",
+            hess.dim()
+        ));
+    }
+    // Per-node curvature integrand f(t) = ‖γ'∧γ''‖/‖γ'‖² (= κ·‖γ'‖).
+    let mut integrand = vec![0.0_f64; nodes];
+    let mut g1 = vec![0.0_f64; p];
+    let mut g2 = vec![0.0_f64; p];
+    for node in 0..nodes {
+        for slot in g1.iter_mut() {
+            *slot = 0.0;
+        }
+        for slot in g2.iter_mut() {
+            *slot = 0.0;
+        }
+        for bm in 0..m {
+            let d1 = jet[[node, bm, 0]];
+            let d2 = hess[[node, bm, 0, 0]];
+            if d1 == 0.0 && d2 == 0.0 {
+                continue;
+            }
+            for j in 0..p {
+                let b = decoder[[bm, j]];
+                g1[j] += d1 * b;
+                g2[j] += d2 * b;
+            }
+        }
+        let mut n1 = 0.0_f64; // ‖γ'‖²
+        let mut n2 = 0.0_f64; // ‖γ''‖²
+        let mut dot = 0.0_f64; // ⟨γ',γ''⟩
+        for j in 0..p {
+            n1 += g1[j] * g1[j];
+            n2 += g2[j] * g2[j];
+            dot += g1[j] * g2[j];
+        }
+        if !(n1 > 0.0) {
+            // Zero speed at a node: the curve is momentarily stationary in this
+            // chart; the curvature integrand is undefined there. A genuinely
+            // collapsed curve has no honest turning.
+            return Ok(None);
+        }
+        // Wedge norm² = ‖γ'‖²‖γ''‖² − ⟨γ',γ''⟩² (Lagrange identity); clamp tiny
+        // negative round-off to 0 before the sqrt.
+        let wedge_sq = (n1 * n2 - dot * dot).max(0.0);
+        integrand[node] = wedge_sq.sqrt() / n1;
+        if !integrand[node].is_finite() {
+            return Ok(None);
+        }
+    }
+    // Composite Simpson over `cells` cells: each cell [2i, 2i+1, 2i+2] gets
+    // (h/3)(f0 + 4 f_mid + f1).
+    let mut theta = 0.0_f64;
+    for cell in 0..cells {
+        let f0 = integrand[2 * cell];
+        let fm = integrand[2 * cell + 1];
+        let f1 = integrand[2 * cell + 2];
+        theta += h / 3.0 * (f0 + 4.0 * fm + f1);
+    }
+    if !(theta.is_finite() && theta >= 0.0) {
+        return Ok(None);
+    }
+    Ok(Some(theta))
+}
+
 #[cfg(test)]
 mod sphere_defect_tests {
     use super::*;
@@ -1275,6 +1418,82 @@ mod sphere_defect_tests {
         assert!(
             out.is_none(),
             "a pole-singular chart row must be refused, got {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod turning_tests {
+    use super::*;
+    use crate::terms::sae::basis::PeriodicHarmonicEvaluator;
+    use ndarray::{Array1, Array2};
+    use std::f64::consts::TAU;
+
+    /// A unit circle `γ(t) = (cos 2πt, sin 2πt)` traversed once over `t ∈ [0,1]`
+    /// has constant curvature κ = 1 and speed 2π, so the total turning is
+    /// `Θ = ∫₀¹ κ·‖γ'‖ dt = 2π`.
+    #[test]
+    fn full_circle_turning_is_two_pi() {
+        let ev = PeriodicHarmonicEvaluator::new(3).expect("3-basis circle");
+        // Basis [1, sin2πt, cos2πt]; B maps cos→x (output 0), sin→y (output 1).
+        let mut decoder = Array2::<f64>::zeros((3, 2));
+        decoder[[2, 0]] = 1.0; // cos -> x
+        decoder[[1, 1]] = 1.0; // sin -> y
+        // Span the full period [0, 1]; the integral runs over [min, max] of the
+        // supplied coordinates, so the endpoint t = 1 must be present to close
+        // the loop (the circle's speed 2π is nonzero everywhere, no stationary
+        // point at the seam).
+        let coords = Array1::from_iter((0..=50).map(|i| i as f64 / 50.0));
+        let theta = d1_atom_fitted_turning(&ev, decoder.view(), coords.view())
+            .expect("turning must evaluate")
+            .expect("a non-degenerate circle must return Some");
+        assert!(
+            (theta - TAU).abs() < 1e-6,
+            "a full unit circle has total turning 2π; got {theta:.9}"
+        );
+    }
+
+    /// A half circle (`t ∈ [0, 0.5]`) turns through π.
+    #[test]
+    fn half_circle_turning_is_pi() {
+        let ev = PeriodicHarmonicEvaluator::new(3).expect("3-basis circle");
+        let mut decoder = Array2::<f64>::zeros((3, 2));
+        decoder[[2, 0]] = 1.0;
+        decoder[[1, 1]] = 1.0;
+        let coords = Array1::from_iter((0..=25).map(|i| 0.5 * i as f64 / 25.0));
+        let theta = d1_atom_fitted_turning(&ev, decoder.view(), coords.view())
+            .expect("turning must evaluate")
+            .expect("a non-degenerate half-circle must return Some");
+        assert!(
+            (theta - std::f64::consts::PI).abs() < 1e-6,
+            "a half circle turns through π; got {theta:.9}"
+        );
+    }
+
+    /// A straight line (only the constant + one linear-in-image direction, no
+    /// genuine curvature) has zero turning — exactly the `Θ → 0` linear-tail
+    /// signature the EV-vs-Θ measurement uses to flag a curved atom that is
+    /// really just a linear direction. Here the decoder uses a SINGLE harmonic
+    /// pair scaled so the image is a 1-D segment (x and y both ∝ cos 2πt), i.e.
+    /// the decoded curve lies on a line through the origin → wedge ≡ 0.
+    #[test]
+    fn straight_line_image_has_zero_turning() {
+        let ev = PeriodicHarmonicEvaluator::new(3).expect("3-basis circle");
+        let mut decoder = Array2::<f64>::zeros((3, 2));
+        // Both outputs ∝ cos 2πt → the image is the line y = 2x, γ collinear with
+        // γ', γ'' at every t, so the wedge norm vanishes identically.
+        decoder[[2, 0]] = 1.0;
+        decoder[[2, 1]] = 2.0;
+        // Span a coordinate range strictly inside (0, 0.25) so the speed
+        // `‖γ'‖ ∝ |sin 2πt|` never hits the stationary zero at t = 0 (where the
+        // turning integrand is genuinely undefined and the function refuses).
+        let coords = Array1::from_iter((0..=20).map(|i| 0.05 + 0.15 * i as f64 / 20.0));
+        let theta = d1_atom_fitted_turning(&ev, decoder.view(), coords.view())
+            .expect("turning must evaluate")
+            .expect("a non-degenerate segment must return Some");
+        assert!(
+            theta < 1e-9,
+            "a straight-line image has zero turning (the linear-tail signature); got {theta:.3e}"
         );
     }
 }
