@@ -12559,8 +12559,15 @@ impl SaeManifoldTerm {
         let mut grams = self.empty_decoder_gram_accumulator();
         self.accumulate_decoder_gram(&mut grams);
         let lambda_smooth = rho.lambda_smooth();
-        let mut max_diag = 0.0_f64;
-        let mut min_pos_diag = f64::INFINITY;
+        // The β-block curvature is the eigenspectrum of the per-atom penalised
+        // Gram `G_k + λ·S_k` (off-diagonal coupling matters — a Vandermonde
+        // monomial Gram can be near-singular with non-tiny diagonals, and a
+        // collapsed latent coordinate makes columns linearly dependent). We
+        // floor against the LARGEST eigenvalue (block scale) and flag deficiency
+        // when the SMALLEST positive eigenvalue falls below the relative rank
+        // cutoff of that scale.
+        let mut max_eig = 0.0_f64;
+        let mut min_pos_eig = f64::INFINITY;
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let m = atom.basis_size();
             if m == 0 || grams[atom_idx].dim() != (m, m) {
@@ -12568,32 +12575,48 @@ impl SaeManifoldTerm {
             }
             let penalty = &atom.smooth_penalty;
             let penalty_ok = penalty.dim() == (m, m);
-            for i in 0..m {
-                let mut diag = grams[atom_idx][[i, i]];
-                if penalty_ok {
-                    diag += lambda_smooth * penalty[[i, i]];
+            let mut joint = grams[atom_idx].clone();
+            if penalty_ok {
+                for i in 0..m {
+                    for j in 0..m {
+                        joint[[i, j]] += lambda_smooth * penalty[[i, j]];
+                    }
                 }
-                if diag.is_finite() {
-                    max_diag = max_diag.max(diag);
-                    if diag > 0.0 {
-                        min_pos_diag = min_pos_diag.min(diag);
+            }
+            for i in 0..m {
+                for j in 0..i {
+                    let sym = 0.5 * (joint[[i, j]] + joint[[j, i]]);
+                    joint[[i, j]] = sym;
+                    joint[[j, i]] = sym;
+                }
+            }
+            let evals = match joint.eigh(Side::Lower) {
+                Ok((evals, _)) => evals,
+                Err(_) => continue,
+            };
+            for &lambda in evals.iter() {
+                if lambda.is_finite() {
+                    max_eig = max_eig.max(lambda);
+                    if lambda > 0.0 {
+                        min_pos_eig = min_pos_eig.min(lambda);
                     }
                 }
             }
         }
-        if !(max_diag > 0.0) {
+        if !(max_eig > 0.0) {
             return nominal;
         }
-        // Only floor when the β block is genuinely ill-conditioned (a deficient
-        // direction whose curvature is below the relative rank cutoff of the
-        // block scale). A full-rank, well-conditioned decoder keeps the nominal
-        // caller ridge bit-for-bit.
+        // Only floor when the β block is genuinely rank-deficient (a direction
+        // whose curvature is below the relative rank cutoff of the block scale,
+        // or an exactly-null direction the eigensolver returned as ≤ 0). A
+        // full-rank, well-conditioned decoder keeps the nominal caller ridge
+        // bit-for-bit.
         let conditioned =
-            min_pos_diag.is_finite() && min_pos_diag >= SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_diag;
+            min_pos_eig.is_finite() && min_pos_eig >= SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_eig;
         if conditioned {
             return nominal;
         }
-        let floor = f64::EPSILON.sqrt() * max_diag;
+        let floor = f64::EPSILON.sqrt() * max_eig;
         nominal.max(floor)
     }
 
