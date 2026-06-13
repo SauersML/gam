@@ -6936,6 +6936,26 @@ fn run_outer_with_plan(
     // defect; recoverable cert refusals such as phantom multipliers are
     // not eligible for this key.
     const STRUCTURAL_EARLY_EXIT_MIN_COUNT: usize = 2;
+    // Generic cross-seed structural-failure bail (#1036). The structural
+    // early-exit above only fires for genuinely structural `CertRefused`
+    // diagnoses; it never sees the `RemlConvergenceError` / non-PD per-row
+    // H_tt / KKT-stuck class, which classifies as Budget/TrustRegion/Other and
+    // burned all 12 seeds (sphere: 3.5h for one failed candidate). This
+    // detector keys on the generic `(variant, signed-order-of-magnitude
+    // pivot/KKT bucket)` signature: when the LAST `n_struct` seeds reject with
+    // an identical *quantified* signature, the blocker is the design, not the
+    // warm-start, so we bail and skip the remaining seeds. A single deviating
+    // signature breaks the trailing run, so genuine seed-luck still runs the
+    // full cascade.
+    const GENERIC_STRUCTURAL_BAIL_MIN_RUN: usize = 3;
+    // `Some((signature, run_len))` once the generic detector has fired on a
+    // trailing run of identical quantified signatures. Drives the aggregated
+    // "structural: <signature> on seeds a..b; remaining N seeds skipped" note.
+    let mut generic_structural_bail: Option<(
+        crate::solver::startup_stats::GenericFailureSignature,
+        usize,
+        usize,
+    )> = None;
 
     'seed_attempts: for (seed_idx, seed) in seeds.iter().enumerate() {
         if started_seeds == seed_budget {
@@ -7002,6 +7022,34 @@ fn run_outer_with_plan(
                     structural_early_exit_key = Some(key);
                     break;
                 }
+            }
+        }
+        // Generic cross-seed structural bail (#1036): only for objectives that
+        // do NOT enter through the continuation path. Continuation-entry
+        // objectives demote to a heavier regime on any uniform structural
+        // signal (handled above) and must never empty their candidate set on a
+        // failure signature, so they opt out of the generic bail entirely.
+        if structural_early_exit_key.is_none()
+            && generic_structural_bail.is_none()
+            && continuation_path.is_none()
+        {
+            if let Some((sig, run_len)) =
+                crate::solver::startup_stats::consecutive_generic_signature(
+                    &seed_rejections,
+                    GENERIC_STRUCTURAL_BAIL_MIN_RUN,
+                )
+            {
+                let first_seed = seed_rejections[seed_rejections.len() - run_len].seed_idx;
+                let last_seed = seed_rejections[seed_rejections.len() - 1].seed_idx;
+                let label = crate::solver::startup_stats::generic_signature_label(&sig);
+                log::warn!(
+                    "[OUTER] {context}: generic structural bail after {run_len} consecutive \
+                     identical failure signatures ({label}) on seeds {first_seed}..{last_seed}; \
+                     skipping remaining {} seed(s)",
+                    seeds.len().saturating_sub(seed_idx),
+                );
+                generic_structural_bail = Some((sig, first_seed, last_seed));
+                break;
             }
         }
         crate::solver::estimate::reml::runtime::record_current_outer_iter_for_ift(0);
@@ -8248,6 +8296,13 @@ fn run_outer_with_plan(
         let mut early_exit_note = if structural_early_exit_key.is_some() {
             "early-exit triggered: every observed seed reported the same structural rejection"
                 .to_string()
+        } else if let Some((sig, first_seed, last_seed)) = generic_structural_bail.as_ref() {
+            let label = crate::solver::startup_stats::generic_signature_label(sig);
+            let skipped = seeds.len().saturating_sub(*last_seed + 1);
+            format!(
+                "structural: {label} on seeds {first_seed}..{last_seed}; \
+                 remaining {skipped} seeds skipped"
+            )
         } else if stopped_early_due_to_limit {
             format!(
                 "stopped early after {unsuccessful_expensive_seeds} consecutive non-converged \
