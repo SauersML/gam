@@ -5126,7 +5126,7 @@ pub struct SmallLu {
 /// Returns `None` only when a pivot is exactly zero (singular `C`).
 fn small_lu_factor(a: &Array2<f64>) -> Option<SmallLu> {
     let r = a.nrows();
-    debug_assert_eq!(a.ncols(), r, "small_lu_factor: non-square input");
+    assert_eq!(a.ncols(), r, "small_lu_factor: non-square input");
     let mut lu = a.clone();
     let mut piv: Vec<usize> = (0..r).collect();
     let mut perm_sign = 1.0_f64;
