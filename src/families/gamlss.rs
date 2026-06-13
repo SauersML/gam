@@ -1363,7 +1363,7 @@ fn penalty_nullspace_projector(penalties: &[PenaltyMatrix], dim: usize) -> Array
     let mut combined = Array2::<f64>::zeros((dim, dim));
     for pen in penalties {
         let dense = pen.to_dense();
-        debug_assert_eq!(
+        assert_eq!(
             dense.nrows(),
             dim,
             "scale penalty block dim {} != scale design cols {dim}",
