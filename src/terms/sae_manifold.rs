@@ -4485,6 +4485,71 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
+    /// Per-atom **leave-one-atom-out (LOAO) explained-variance contribution**
+    /// (#1026): for each atom `k`, the drop in reconstruction explained variance
+    /// `ΔEV_k = EV(full) − EV(full ⊖ atom_k)` when that atom's contribution
+    /// `a[i,k]·g_k(coord[i,k])` is removed from the assembled reconstruction and
+    /// nothing else is refit. Because every atom adds linearly into the same
+    /// fitted reconstruction (`fitted[i] = Σ_k a[i,k]·g_k`), zeroing one atom is
+    /// the exact "this atom withheld" counterfactual, and the EV it was earning
+    /// is `EV(full) − EV(without k)`. This is the per-atom held-out EV
+    /// attribution the #1026 roadmap pairs with each atom's fitted turning `Θ`:
+    /// a `Θ ≈ 0` atom earning a large `ΔEV` is a linear-tail direction; a
+    /// high-`Θ` atom earning a large `ΔEV` is a genuine curved family carrying
+    /// reconstruction it would otherwise shatter into `N(ε) ≈ Θ/(2√(2ε))` linear
+    /// directions. Pure read-only diagnostic — never mutates any atom.
+    ///
+    /// Returns one `Option<f64>` per atom in atom order; `None` for an atom
+    /// whose ⊖-reconstruction EV is undefined (degenerate target variance), and
+    /// `None` for the whole vector if the full-reconstruction EV is undefined.
+    pub fn per_atom_loao_explained_variance(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<Vec<Option<f64>>, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::per_atom_loao_explained_variance: target {:?} != ({n}, {p})",
+                target.dim()
+            ));
+        }
+        let full = self.try_fitted_for_rho(rho)?;
+        let Some(ev_full) = reconstruction_explained_variance(target, full.view()) else {
+            return Ok(vec![None; k_atoms]);
+        };
+        // Cache each row's assignment weights once, then subtract a single
+        // atom's decoded contribution per LOAO pass instead of reassembling the
+        // whole dictionary k times.
+        let mut weights: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for row in 0..n {
+            weights.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+        }
+        let mut g_buf = vec![0.0_f64; p];
+        let mut out = Vec::with_capacity(k_atoms);
+        for atom_idx in 0..k_atoms {
+            let mut without = full.clone();
+            for row in 0..n {
+                let a_k = weights[row][atom_idx];
+                if a_k == 0.0 {
+                    continue;
+                }
+                self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
+                let mut without_row = without.row_mut(row);
+                for out_col in 0..p {
+                    without_row[out_col] -= a_k * g_buf[out_col];
+                }
+            }
+            out.push(
+                reconstruction_explained_variance(target, without.view())
+                    .map(|ev_without| ev_full - ev_without),
+            );
+        }
+        Ok(out)
+    }
+
     pub fn loss(
         &self,
         target: ArrayView2<'_, f64>,
@@ -10557,6 +10622,20 @@ impl SaeManifoldTerm {
         // hybrid-vs-shatter signal: a Θ ≈ 0 atom that still earns EV is a linear
         // direction wearing a curved basis; a high-Θ atom earning EV is a genuine
         // curved family. Pure read-only diagnostic, never mutates the atom.
+        //
+        // The held-out EV half of the pair is the per-atom leave-one-atom-out
+        // (LOAO) explained-variance drop `ΔEV_k` (see
+        // [`Self::per_atom_loao_explained_variance`]): the EV lost when atom `k`
+        // is withheld from the assembled reconstruction. Logging `(Θ, ΔEV)`
+        // together per d = 1 atom is the discriminating EV-vs-Θ signal — a
+        // Θ ≈ 0 atom earning a large ΔEV is a linear-tail direction, a high-Θ
+        // atom earning a large ΔEV is a genuine curved family.
+        let loao_ev = self
+            .per_atom_loao_explained_variance(target, rho)
+            .unwrap_or_else(|err| {
+                log::warn!("[#1026] per-atom LOAO EV unavailable: {err}");
+                vec![None; self.k_atoms()]
+            });
         for atom_idx in 0..self.k_atoms() {
             let atom = &self.atoms[atom_idx];
             if atom.latent_dim != 1
@@ -10570,19 +10649,26 @@ impl SaeManifoldTerm {
             };
             let coords = self.assignment.coords[atom_idx].as_matrix();
             let row_coords = coords.column(0);
+            let dev = loao_ev
+                .get(atom_idx)
+                .copied()
+                .flatten()
+                .map_or_else(|| "unavailable".to_string(), |d| format!("{d:.6e}"));
             match crate::terms::sae_chart_canonicalization::d1_atom_fitted_turning(
                 evaluator.as_ref(),
                 atom.decoder_coefficients.view(),
                 row_coords,
             ) {
                 Ok(Some(theta)) => log::info!(
-                    "[#1026] atom '{}' fitted turning Θ = {theta:.6e} rad \
+                    "[#1026] atom '{}' fitted turning Θ = {theta:.6e} rad, \
+                     held-out ΔEV = {dev} \
                      (∫κ ds; 0 = linear-tail direction, 2π = full curved loop; \
-                     pair with held-out EV for the hybrid-vs-shatter signal)",
+                     Θ≈0 + large ΔEV = linear direction, high-Θ + large ΔEV = \
+                     genuine curved family — the hybrid-vs-shatter signal)",
                     atom.name
                 ),
                 Ok(None) => log::info!(
-                    "[#1026] atom '{}' fitted turning unavailable \
+                    "[#1026] atom '{}' fitted turning unavailable, held-out ΔEV = {dev} \
                      (no analytic second jet or degenerate curve)",
                     atom.name
                 ),
@@ -16201,6 +16287,73 @@ mod tests {
             vec![array![0.9_f64.ln()], array![1.1_f64.ln()]],
         );
         (term, target, rho)
+    }
+
+    /// #1026 — the per-atom **held-out EV attribution** that pairs with each
+    /// atom's fitted turning `Θ` to form the EV-vs-Θ discriminating signal.
+    ///
+    /// `per_atom_loao_explained_variance` returns, per atom, the explained
+    /// variance lost when that atom is withheld from the assembled
+    /// reconstruction (`ΔEV_k = EV(full) − EV(full ⊖ atom_k)`). With the target
+    /// set to the term's OWN full reconstruction the dictionary explains the
+    /// target exactly (`EV(full) = 1`), so every atom that genuinely carries
+    /// reconstruction must show a strictly positive ΔEV (removing it leaves a
+    /// residual), while an atom that contributes nothing (zero decoder) must
+    /// show ΔEV ≈ 0. This is the held-out half of the `(Θ, ΔEV)` pair the
+    /// post-fit pass logs: a high-`Θ` atom earning ΔEV is a genuine curved
+    /// family; a `Θ ≈ 0` atom earning ΔEV is a linear-tail direction.
+    #[test]
+    fn per_atom_loao_ev_attributes_each_load_bearing_atom() {
+        let (term, _target, rho) = small_two_atom_periodic_term();
+        // Target = the term's own full reconstruction ⇒ EV(full) = 1 exactly.
+        let target = term
+            .try_fitted_for_rho(&rho)
+            .expect("full reconstruction must assemble");
+        let ev_full = reconstruction_explained_variance(target.view(), target.view())
+            .expect("self-reconstruction EV defined");
+        assert!(
+            (ev_full - 1.0).abs() < 1e-12,
+            "target = full reconstruction ⇒ EV(full) = 1; got {ev_full}"
+        );
+
+        let dev = term
+            .per_atom_loao_explained_variance(target.view(), &rho)
+            .expect("LOAO EV must evaluate");
+        assert_eq!(dev.len(), term.k_atoms(), "one ΔEV per atom");
+
+        // Both periodic atoms genuinely carry reconstruction (nonzero decoders
+        // and nonzero assignment mass), so each must lose EV when withheld.
+        for (atom_idx, d) in dev.iter().enumerate() {
+            let d = d.unwrap_or_else(|| panic!("atom {atom_idx} ΔEV must be defined"));
+            assert!(
+                d > 1e-9,
+                "load-bearing atom {atom_idx} must earn positive held-out ΔEV; got {d:.3e}"
+            );
+            // ΔEV is bounded by EV(full) = 1 (an atom cannot carry more EV than
+            // the whole dictionary explains).
+            assert!(
+                d <= 1.0 + 1e-9,
+                "ΔEV for atom {atom_idx} cannot exceed EV(full)=1; got {d:.6e}"
+            );
+        }
+
+        // An atom withheld is the exact "this atom zeroed" counterfactual: with
+        // a zero decoder it carries no reconstruction, so its ΔEV must collapse
+        // to ~0 — the same Θ→0 dominance floor logic on the EV axis (no signal,
+        // no contribution), independent of the curved/linear question.
+        let mut dead_term = term.clone();
+        dead_term.atoms[1].decoder_coefficients.fill(0.0);
+        let dead_target = term
+            .try_fitted_for_rho(&rho)
+            .expect("reconstruction with the live atom-1 decoder");
+        let dead_dev = dead_term
+            .per_atom_loao_explained_variance(dead_target.view(), &rho)
+            .expect("LOAO EV must evaluate for the dead-atom term");
+        let d_dead = dead_dev[1].expect("dead atom ΔEV defined");
+        assert!(
+            d_dead.abs() < 1e-9,
+            "a zero-decoder atom carries no reconstruction ⇒ ΔEV ≈ 0; got {d_dead:.3e}"
+        );
     }
 
     /// #976 Layer-1 guard 2: a single Newton application cannot move a gate
