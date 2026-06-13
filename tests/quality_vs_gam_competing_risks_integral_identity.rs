@@ -442,7 +442,9 @@ fn cause_cumulative_hazard_real(
         survival_likelihood: "weibull".to_string(),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("Surv(time, event) ~ s(karno, bs='tp')", &data, &cfg)
+    // bs='cr' (cubic regression spline) is much faster than 'tp' for a single
+    // 1-D smooth and is sufficient for the covariate hazard shape we need here.
+    let result = fit_from_formula("Surv(time, event) ~ s(karno, bs='cr')", &data, &cfg)
         .unwrap_or_else(|e| panic!("gam Weibull cause-specific fit for {cause_label} failed: {e}"));
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!(
