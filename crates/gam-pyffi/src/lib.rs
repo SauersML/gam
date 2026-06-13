@@ -355,6 +355,14 @@ struct SummaryCoefficientRow {
 /// variance-component test is not a Wald χ²); penalized smooth terms carry the
 /// Wood (2013) rank-truncated Wald `chi_sq` / `p_value`. The shape mirrors the
 /// CLI's `SmoothTermSummary`.
+///
+/// This `p_value` is the *first-order* Wald reference. The summary table is
+/// built from a saved model without the training rows, so it cannot run the
+/// per-term constrained refits the second-order test needs. The
+/// **second-order-accurate, Bartlett-corrected likelihood-ratio** p-value is
+/// computed on demand by `smooth_term_lr_inference_json` (Python
+/// `Model.smooth_significance(data)`), which auto-applies the exact Lawley
+/// factor whenever the family carries closed-form cumulant jets (#939/#1063).
 #[derive(Serialize)]
 struct SummarySmoothTermRow {
     name: String,
