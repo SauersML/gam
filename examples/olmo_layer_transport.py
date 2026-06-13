@@ -33,8 +33,8 @@ DATA_DIR = Path("/projects/standard/hsiehph/sauer354/olmo_data")
 OUT_DIR = Path("/projects/standard/hsiehph/sauer354/olmo_data/plots")
 # Checkpoints that have both L25 and L44 data
 TRANSPORT_CHECKPOINTS = ["stage1-step0", "stage3-step11921"]
-# Layer pairs to test for the ladder (subsample for speed)
-LADDER_LAYERS = [0, 5, 10, 15, 20, 25, 30, 35, 40, 44, 50, 55, 63]
+# Layer pairs to test for the ladder (sparse sample for speed — 7 layers)
+LADDER_LAYERS = [0, 10, 20, 25, 30, 44, 63]
 PCA_DIM_FOR_CIRCLE = 2
 
 
@@ -50,14 +50,12 @@ def to_circular_coord(Z2d: np.ndarray) -> np.ndarray:
     return np.arctan2(Z2d[:, 1], Z2d[:, 0])
 
 
-def fit_l25_to_l44_transport(ckpt: str) -> dict:
-    """Test transport of qualia geometry from L25 to L44."""
+def fit_l25_to_l44_transport(ckpt: str, acts: np.ndarray) -> dict:
+    """Test transport of qualia geometry from L25 to L44 (acts pre-loaded)."""
     import gamfit
 
-    ckpt_dir = DATA_DIR / ckpt
-    acts = np.load(ckpt_dir / "activations.npy", mmap_mode="r")
-    X_l25 = np.array(acts[:, 25, :], dtype=np.float32)
-    X_l44 = np.array(acts[:, 44, :], dtype=np.float32)
+    X_l25 = acts[:, 25, :]
+    X_l44 = acts[:, 44, :]
 
     # Get circular chart for each layer
     Z25 = pca_whiten(X_l25, PCA_DIM_FOR_CIRCLE)
@@ -91,12 +89,10 @@ def fit_l25_to_l44_transport(ckpt: str) -> dict:
                     error=str(e)[:300], isometry_defect=float("nan"))
 
 
-def fit_layer_ladder(ckpt: str) -> list[dict]:
-    """Fit transport ladder across sampled layers."""
+def fit_layer_ladder(ckpt: str, acts: np.ndarray) -> list[dict]:
+    """Fit transport ladder across sampled layers (acts pre-loaded by caller)."""
     import gamfit
 
-    ckpt_dir = DATA_DIR / ckpt
-    acts = np.load(ckpt_dir / "activations.npy", mmap_mode="r")
     n_layers = acts.shape[1]
 
     # Filter to available layers
@@ -219,9 +215,12 @@ def main() -> None:
             continue
 
         print(f"\n=== {ckpt} ===", flush=True)
-        transport_results.append(fit_l25_to_l44_transport(ckpt))
-        ladder_rows = fit_layer_ladder(ckpt)
-        ladder_results[ckpt] = ladder_rows
+        # Load activation tensor once; pass to both transport and ladder
+        print(f"  [{ckpt}] loading activations ...", flush=True)
+        acts = np.array(np.load(acts_path, mmap_mode="r"), dtype=np.float32)
+        print(f"  [{ckpt}] loaded {acts.shape}", flush=True)
+        transport_results.append(fit_l25_to_l44_transport(ckpt, acts))
+        ladder_rows = fit_layer_ladder(ckpt, acts)
 
     # Save JSON
     output = dict(l25_l44_transport=transport_results, ladder=ladder_results)

@@ -67,26 +67,26 @@ def fit_curvature(Z: np.ndarray, label: str) -> dict:
     t0 = time.time()
     try:
         m = gamfit.fit(df, formula, family="gaussian")
-        curv_list = m.curvature(df)
-        # curvature() returns a list of per-curv()-term dicts
-        # We use the first term (we only have one curv() block)
-        result = curv_list[0] if curv_list else {}
+        # Use summary() for the fast κ̂ point estimate (no CI refit needed).
+        # Model.curvature() does a full profile-likelihood CI walk which is
+        # expensive and currently hits a known ψ-κ gradient desync (#901);
+        # the point estimate from summary is unaffected.
+        summ = m.summary()
+        curv_ests = summ.curvature_estimands  # list of dicts: name, kappa_hat, geometry
+        result = curv_ests[0] if curv_ests else {}
         elapsed = time.time() - t0
         khat = float(result.get("kappa_hat", float("nan")))
-        ci_lo = float(result.get("ci_lo", float("nan")))
-        ci_hi = float(result.get("ci_hi", float("nan")))
-        verdict = str(result.get("verdict", "unknown"))
-        print(f"  [{label}] done in {elapsed:.1f}s  κ̂={khat:.4f} "
-              f"CI=[{ci_lo:.4f},{ci_hi:.4f}] verdict={verdict}", flush=True)
+        geometry = str(result.get("geometry", "unknown"))
+        print(f"  [{label}] done in {elapsed:.1f}s  κ̂={khat:.4f}  geometry={geometry}",
+              flush=True)
         return dict(
             label=label,
             n=n, d=d,
             kappa_hat=khat,
-            ci_lo=ci_lo,
-            ci_hi=ci_hi,
-            verdict=verdict,
-            flatness_lr_pvalue=float(result.get("flatness_p_value",
-                                                 result.get("flatness_lr_pvalue", float("nan")))),
+            ci_lo=float("nan"),   # CI skipped (broken gradient in CI walk, #901)
+            ci_hi=float("nan"),
+            verdict=geometry,
+            flatness_lr_pvalue=float("nan"),
             elapsed=elapsed,
             error=None,
         )
