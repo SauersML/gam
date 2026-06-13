@@ -4791,6 +4791,102 @@ mod tests {
         payload
     }
 
+    fn gamma_dispersion_location_scale_payload() -> FittedModelPayload {
+        // A #913 genuine-dispersion location-scale model: Gamma mean family with
+        // a log-precision `noise_formula` channel. Its likelihood response is
+        // non-Gaussian and non-Binomial, so the predict-path classifier must
+        // route it to `DispersionLocationScale`, NOT the binomial threshold-scale
+        // class (issue #1064).
+        let mut payload = FittedModelPayload::new(
+            MODEL_PAYLOAD_VERSION,
+            "y ~ x".to_string(),
+            ModelKind::LocationScale,
+            FittedFamily::LocationScale {
+                likelihood: LikelihoodSpec::gamma_log(),
+                base_link: Some(InverseLink::Standard(StandardLink::Log)),
+            },
+            "gamma-location-scale".to_string(),
+        );
+        payload.data_schema = Some(DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        });
+        payload.set_training_feature_metadata(vec!["x".to_string()], vec![(-1.0, 1.0)]);
+        payload.resolved_termspec = Some(empty_termspec());
+        payload.resolved_termspec_noise = Some(empty_termspec());
+        payload.formula_noise = Some("x".to_string());
+        payload.beta_noise = Some(vec![0.0]);
+        payload.link = Some(InverseLink::Standard(StandardLink::Log));
+        payload
+    }
+
+    /// #1064 regression: a dispersion location-scale (#913) payload must be
+    /// classified as `DispersionLocationScale` at every predict-path entry —
+    /// both `from_payload` (load) and `predict_model_class` (runtime) — and never
+    /// fall through to the binomial threshold-scale class. Before the fix the
+    /// non-Gaussian `else` arm mis-routed every dispersion model to
+    /// `BinomialLocationScale`, predicting the wrong family/link.
+    #[test]
+    fn dispersion_location_scale_payload_is_not_classified_binomial() {
+        let model = FittedModel::from_payload(gamma_dispersion_location_scale_payload());
+        assert_eq!(
+            model.predict_model_class(),
+            PredictModelClass::DispersionLocationScale,
+            "Gamma dispersion location-scale must route through the dispersion \
+             predictor, not the binomial threshold-scale class",
+        );
+        assert!(
+            !matches!(
+                model.predict_model_class(),
+                PredictModelClass::BinomialLocationScale
+            ),
+            "dispersion location-scale must never be classified as binomial",
+        );
+
+        // Each of the four #913 dispersion mean families classifies the same way.
+        for likelihood in [
+            LikelihoodSpec::gamma_log(),
+            LikelihoodSpec::new(
+                ResponseFamily::NegativeBinomial {
+                    theta: 1.0,
+                    theta_fixed: false,
+                },
+                InverseLink::Standard(StandardLink::Log),
+            ),
+            LikelihoodSpec::new(
+                ResponseFamily::Beta { phi: 1.0 },
+                InverseLink::Standard(StandardLink::Logit),
+            ),
+            LikelihoodSpec::new(
+                ResponseFamily::Tweedie { p: 1.5 },
+                InverseLink::Standard(StandardLink::Log),
+            ),
+        ] {
+            let mut payload = gamma_dispersion_location_scale_payload();
+            payload.family_state = FittedFamily::LocationScale {
+                base_link: Some(likelihood.link.clone()),
+                likelihood: likelihood.clone(),
+            };
+            let model = FittedModel::from_payload(payload);
+            assert_eq!(
+                model.predict_model_class(),
+                PredictModelClass::DispersionLocationScale,
+                "dispersion family {:?} mis-classified",
+                likelihood.response,
+            );
+        }
+    }
+
     #[test]
     fn axis_clip_leaves_numeric_random_effect_group_axis_unclipped() {
         let data = array![[100.0], [-100.0]];
