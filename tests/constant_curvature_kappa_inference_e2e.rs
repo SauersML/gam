@@ -179,6 +179,59 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
     .expect("curvature inference")
 }
 
+/// DIAGNOSTIC (#1059 follow-up): print the profiled criterion V_p(κ) and its
+/// deviance / penalty decomposition on a κ grid for each planted truth. The fix
+/// is correct iff argmin_κ V_p(κ) tracks the planted κ⋆ sign — i.e. V_p has an
+/// interior minimum near κ⋆, not a monotone slope to the +bound.
+#[test]
+#[ignore = "diagnostic: prints V_p(κ) grid, not an assertion gate"]
+fn diag_vp_grid_vs_planted_kappa() {
+    use gam::smooth::SmoothBasisSpec;
+    let options = FitOptions::default();
+    let fixed_kappa = SpatialLengthScaleOptimizationOptions {
+        enabled: false,
+        ..SpatialLengthScaleOptimizationOptions::default()
+    };
+    for (label, kappa_star) in [("hyperbolic", -2.0), ("flat", 0.0), ("spherical", 2.0)] {
+        let (feats, y) = dataset_on_m_kappa(600, kappa_star, 0.5, 0.05, 0xD1A6_0001);
+        let n = y.len();
+        let mut frame = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            frame[(i, 0)] = y[i];
+            frame[(i, 1)] = feats[(i, 0)];
+            frame[(i, 2)] = feats[(i, 1)];
+        }
+        let base_spec = termspec_for("y ~ curv(x1, x2, centers=10)", &frame);
+        let weights = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        eprintln!("=== {label} (κ⋆={kappa_star}) ===");
+        for kk in [-1.9, -1.0, -0.5, 0.0, 0.5, 1.0, 1.9] {
+            let mut spec = base_spec.clone();
+            if let Some(SmoothBasisSpec::ConstantCurvature { spec: cc, .. }) =
+                spec.smooth_terms.get_mut(0).map(|t| &mut t.basis)
+            {
+                cc.kappa = kk;
+            }
+            match fit_term_collectionwith_spatial_length_scale_optimization(
+                frame.view(),
+                y.clone(),
+                weights.clone(),
+                offset.clone(),
+                &spec,
+                LikelihoodSpec::gaussian_identity(),
+                &options,
+                &fixed_kappa,
+            ) {
+                Ok(fit) => eprintln!(
+                    "  κ={kk:+.2}  V_p={:.5}  dev={:.5}  pen={:.5}",
+                    fit.fit.reml_score, fit.fit.deviance, fit.fit.stable_penalty_term
+                ),
+                Err(e) => eprintln!("  κ={kk:+.2}  fit FAILED: {e}"),
+            }
+        }
+    }
+}
+
 #[test]
 fn spherical_truth_recovers_positive_kappa_and_rejects_flat() {
     let (feats, y) = dataset_on_m_kappa(600, 2.0, 0.5, 0.05, 0x5151_0001);
