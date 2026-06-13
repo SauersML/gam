@@ -553,3 +553,63 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
         implicit_operator: None,
     })
 }
+
+#[cfg(test)]
+mod kappa_collapse_diagnostic {
+    use super::*;
+
+    // Diagnostic (#1059 follow-up): show that a κ-FROZEN chart-scale length
+    // makes the geodesic-exponential kernel COLLAPSE toward the constant
+    // function as κ grows positive (sphere distances compress), which is the
+    // degenerate optimum the REML criterion rails to. For a fixed center set we
+    // print, per κ, the median geodesic distance and the kernel "spread"
+    // 1 − mean(offdiag K). A collapsing kernel ⇒ spread → 0 as κ ↑.
+    #[test]
+    fn kernel_spread_collapses_with_kappa_at_frozen_length_scale() {
+        // 8 centers in a disk of radius 0.45 (inside every κ∈[-2,2] chart).
+        let centers = ndarray::array![
+            [0.10, 0.05],
+            [-0.20, 0.15],
+            [0.30, -0.10],
+            [-0.05, -0.25],
+            [0.22, 0.20],
+            [-0.30, -0.05],
+            [0.05, 0.30],
+            [-0.15, 0.10],
+        ];
+        // Frozen ℓ: the κ=0 chart-scale auto rule (median 2‖Δ‖).
+        let ell_frozen = realized_constant_curvature_length_scale(centers.view(), 0.0).unwrap();
+
+        let spread = |kappa: f64, ell: f64| -> f64 {
+            let k = constant_curvature_kernel_matrix(centers.view(), centers.view(), kappa, ell)
+                .unwrap();
+            let m = k.nrows();
+            let mut s = 0.0;
+            let mut cnt = 0.0;
+            for i in 0..m {
+                for j in 0..m {
+                    if i != j {
+                        s += k[(i, j)];
+                        cnt += 1.0;
+                    }
+                }
+            }
+            1.0 - s / cnt
+        };
+
+        let s_neg = spread(-2.0, ell_frozen);
+        let s_zero = spread(0.0, ell_frozen);
+        let s_pos = spread(2.0, ell_frozen);
+        eprintln!(
+            "[κ-collapse] frozen ℓ={ell_frozen:.4}: spread κ=-2 {s_neg:.4} | κ=0 {s_zero:.4} | κ=+2 {s_pos:.4}"
+        );
+
+        // The degenerate signature: positive κ collapses the kernel toward the
+        // constant (spread shrinks), so the criterion can buy cheap EDF by
+        // pushing κ up — this is the unidentifiability we are fixing.
+        assert!(
+            s_pos < s_zero && s_zero < s_neg,
+            "expected kernel spread to shrink with κ at frozen ℓ: κ=-2 {s_neg} κ=0 {s_zero} κ=+2 {s_pos}"
+        );
+    }
+}
