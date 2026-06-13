@@ -4673,6 +4673,18 @@ pub(crate) struct RemlState<'a> {
     ///
     /// Invalidated jointly with the design in `reset_surface`.
     pub(crate) gaussian_fixed_cache: RwLock<Option<Arc<crate::pirls::GaussianFixedCache>>>,
+    /// Conditioned-frame exact ψ-derivatives `(∂XᵀWX/∂ψ, ∂XᵀW(y−offset)/∂ψ)`
+    /// for the SINGLE design-moving spatial hyperparameter (#1033b), assembled
+    /// n-free from the certified Chebyshev ψ-Gram tensor and installed beside
+    /// `gaussian_fixed_cache` at the same in-window trial. When present the
+    /// Gaussian-identity ψ-gradient HyperCoord (`a_j`, `g_j`, dense `B_j`) is
+    /// formed from these k×k objects instead of realizing and contracting the
+    /// n×k ∂X/∂ψ slab — retiring the second per-trial n-pass. Lives in the
+    /// SAME conditioned column frame as `gaussian_fixed_cache.xtwx_orig`, so
+    /// the hyper-coord builder transforms it by the per-eval Qs/free-basis the
+    /// same way it transforms the streamed Gram. Invalidated with the design.
+    pub(crate) gaussian_psi_gram_deriv:
+        RwLock<Option<Arc<(ndarray::Array2<f64>, ndarray::Array1<f64>)>>>,
     /// Frozen ALO robustness weights for this REML surface.
     ///
     /// The PSIS influence scale is a non-smooth function of the current hat

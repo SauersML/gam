@@ -25810,6 +25810,283 @@ mod tests {
         );
     }
 
+    /// #1033b invariance gate: the certified ψ-Gram tensor lane must produce
+    /// the SAME REML cost and gradient as the exact per-trial streamed path at
+    /// every in-window ψ. The tensor lane installs an n-free assembled
+    /// `GaussianFixedCache` after `reset_surface` (so the inner Gaussian PLS
+    /// skips the O(n·p²) Gram re-stream); the streamed path lazily builds the
+    /// same cache from the realized X. Both feed the identical inner solver, so
+    /// a frame-correct wiring is an EQUALITY to certification round-off, not an
+    /// approximation. Any divergence here means the conditioned-frame handoff
+    /// (`build_and_set_psi_gram_tensor` → `install_gaussian_fixed_cache`) has a
+    /// frame bug. The two evaluators are byte-identical except that one carries
+    /// the tensor — the only thing the test varies is the lane.
+    #[test]
+    fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
+        use crate::solver::outer_strategy::OuterEvalOrder;
+
+        // ── 1-D isotropic Duchon Gaussian fixture, n = 600. coord_dim == 1
+        // routes through the exact-joint spatial optimizer's tensor gate; the
+        // Gaussian-identity family makes the GaussianFixedCache eligible. ──
+        let n = 600usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            let signal = 1.2 * (2.0 * std::f64::consts::PI * t).sin() + 0.4 * (t - 0.5);
+            // Deterministic pseudo-noise so the fit is non-trivial but the test
+            // is reproducible.
+            let noise = 0.15 * (((i as f64) * 12.9898).sin() * 43758.547).fract();
+            y[i] = signal + noise;
+        }
+        let weights = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let family = LikelihoodSpec::gaussian_identity();
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "psi_tensor_invariance".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        periodic: None,
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                        length_scale: Some(1.0),
+                        power: 1.0,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                        boundary: OneDimensionalBoundary::Open,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            penalty_shrinkage_floor: None,
+            ..FitOptions::default()
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        assert_eq!(spatial_terms.len(), 1, "expect a single spatial term");
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        assert_eq!(dims_per_term, vec![1], "expect one log-scale axis (coord_dim == 1)");
+        let rho_dim = frozen_design.penalties.len();
+        assert!(rho_dim >= 1, "expect at least one penalty block");
+
+        // ψ window straight from the production bounds helpers.
+        let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+        let log_kappa0 =
+            SpatialLogKappaCoords::from_length_scales(&frozen, &spatial_terms, &kappa_options);
+        let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_from_data(
+            data.view(),
+            &frozen,
+            &spatial_terms,
+            &kappa_options,
+        );
+        let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
+            data.view(),
+            &frozen,
+            &spatial_terms,
+            &kappa_options,
+        );
+        let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
+        const JOINT_RHO_BOUND: f64 = 12.0;
+        let setup = ExactJointHyperSetup::new(
+            Array1::<f64>::zeros(rho_dim),
+            Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
+            Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
+            log_kappa0,
+            log_kappa_lower,
+            log_kappa_upper,
+        );
+        let theta0 = setup.theta0();
+        let lower = setup.lower();
+        let upper = setup.upper();
+        let psi_lo = lower[rho_dim];
+        let psi_hi = upper[rho_dim];
+        assert!(psi_hi > psi_lo, "ψ window must be non-degenerate");
+
+        // Shared realizer cache — both evaluators consume the SAME realized
+        // design at each θ (the streamed path uses it directly; the tensor
+        // path used it once to build the expansion).
+        let make_cache = || {
+            SingleBlockExactJointDesignCache::new(
+                data.view(),
+                frozen.clone(),
+                frozen_design.clone(),
+                spatial_terms.clone(),
+                rho_dim,
+                dims_per_term.clone(),
+            )
+            .expect("design cache")
+        };
+        let external_opts = external_opts_for_design(&family, &frozen_design, &fit_opts);
+
+        let mut streamed_eval = crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(),
+            weights.view(),
+            &frozen_design.design,
+            offset.view(),
+            &frozen_design.penalties,
+            &external_opts,
+            "psi_tensor_invariance/streamed",
+        )
+        .expect("streamed evaluator");
+
+        let mut tensor_eval = crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(),
+            weights.view(),
+            &frozen_design.design,
+            offset.view(),
+            &frozen_design.penalties,
+            &external_opts,
+            "psi_tensor_invariance/tensor",
+        )
+        .expect("tensor evaluator");
+
+        // Attach the certified tensor to ONE evaluator, exactly as production
+        // does: the realizer returns the RAW realized design at ψ; the
+        // evaluator threads its own (fixed, ψ-invariant) conditioning inside
+        // the build so the assembled Gram lives in the streamed frame.
+        let z = Array1::from_iter(y.iter().zip(offset.iter()).map(|(yi, oi)| yi - oi));
+        let attached = {
+            let mut build_cache = make_cache();
+            let theta_probe_base = theta0.clone();
+            tensor_eval.build_and_set_psi_gram_tensor(
+                |psi| {
+                    let mut theta_probe = theta_probe_base.clone();
+                    theta_probe[rho_dim] = psi;
+                    build_cache.ensure_theta(&theta_probe)?;
+                    Ok(build_cache.design().design.clone())
+                },
+                weights.view(),
+                z.view(),
+                psi_lo,
+                psi_hi,
+            )
+        };
+        // This fixture must EXERCISE the tensor lane: a fall-through would make
+        // the equality below trivially true and prove nothing. An analytic
+        // Duchon design over the production ψ window is exactly the
+        // geometric-decay case the certificate is built for, so we require the
+        // attach. If a future basis change makes it refuse, this fails loudly
+        // (telling us to re-derive the window) rather than silently passing.
+        assert!(
+            attached,
+            "ψ-gram tensor failed to certify over the production window \
+             [{psi_lo:.3}, {psi_hi:.3}]; the invariance test would be vacuous"
+        );
+
+        // One shared realizer drives both lanes per θ.
+        let mut stream_cache = make_cache();
+        let mut tensor_cache = make_cache();
+
+        // Sample several in-window ψ (including endpoints' interior) crossed
+        // with a couple ρ values, so the comparison spans the whole certified
+        // window and is not an accident of one operating point.
+        let psi_samples = [
+            psi_lo + 0.10 * (psi_hi - psi_lo),
+            psi_lo + 0.37 * (psi_hi - psi_lo),
+            0.5 * (psi_lo + psi_hi),
+            psi_lo + 0.78 * (psi_hi - psi_lo),
+            psi_hi - 0.05 * (psi_hi - psi_lo),
+        ];
+        let rho_samples = [
+            Array1::<f64>::from_elem(rho_dim, -1.5),
+            Array1::<f64>::from_elem(rho_dim, 0.5),
+        ];
+
+        let eval_one = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+                        cache: &mut SingleBlockExactJointDesignCache<'_>,
+                        theta: &Array1<f64>|
+         -> (f64, Array1<f64>) {
+            cache.ensure_theta(theta).expect("ensure_theta");
+            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+                data.view(),
+                cache.spec(),
+                cache.design(),
+                &spatial_terms,
+            )
+            .expect("hyper_dirs build")
+            .expect("hyper_dirs present");
+            let design_revision = Some(cache.design_revision());
+            let (cost, grad, _hess) = evaluate_joint_reml_outer_eval_at_theta(
+                evaluator,
+                cache.design(),
+                theta,
+                rho_dim,
+                hyper_dirs,
+                None,
+                OuterEvalOrder::ValueAndGradient,
+                design_revision,
+            )
+            .expect("evaluate_with_order");
+            (cost, grad)
+        };
+
+        let mut worst_cost_rel = 0.0_f64;
+        let mut worst_grad_abs = 0.0_f64;
+        for rho in &rho_samples {
+            for &psi in &psi_samples {
+                assert!(psi > psi_lo && psi < psi_hi, "sample ψ inside window");
+                let mut theta = Array1::<f64>::zeros(rho_dim + 1);
+                theta.slice_mut(s![..rho_dim]).assign(rho);
+                theta[rho_dim] = psi;
+
+                let (cost_s, grad_s) = eval_one(&mut streamed_eval, &mut stream_cache, &theta);
+                let (cost_t, grad_t) = eval_one(&mut tensor_eval, &mut tensor_cache, &theta);
+
+                assert!(
+                    cost_s.is_finite() && cost_t.is_finite(),
+                    "non-finite REML cost at ψ={psi:.4}: streamed={cost_s}, tensor={cost_t}"
+                );
+                let cost_rel = (cost_s - cost_t).abs() / (1.0 + cost_s.abs());
+                worst_cost_rel = worst_cost_rel.max(cost_rel);
+                assert!(
+                    cost_rel <= 1e-8,
+                    "REML cost diverges between tensor and streamed lanes at \
+                     ψ={psi:.4}, ρ={:+.2}: streamed={cost_s:.12e}, tensor={cost_t:.12e}, \
+                     rel={cost_rel:.3e}",
+                    rho[0],
+                );
+
+                assert_eq!(grad_s.len(), grad_t.len(), "gradient dimension mismatch");
+                for j in 0..grad_s.len() {
+                    let gabs = (grad_s[j] - grad_t[j]).abs();
+                    let gtol = 1e-7 * (1.0 + grad_s[j].abs());
+                    worst_grad_abs = worst_grad_abs.max(gabs);
+                    assert!(
+                        gabs <= gtol,
+                        "REML gradient[{j}] diverges between lanes at ψ={psi:.4}, \
+                         ρ={:+.2}: streamed={:+.12e}, tensor={:+.12e}, |Δ|={gabs:.3e}",
+                        rho[0],
+                        grad_s[j],
+                        grad_t[j],
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[psi-gram-tensor invariance] worst cost rel={worst_cost_rel:.3e}, \
+             worst grad |Δ|={worst_grad_abs:.3e} over {} (ρ,ψ) points",
+            rho_samples.len() * psi_samples.len(),
+        );
+    }
+
     #[test]
     fn iso_kappa_duchon_binomial_logit_fd() {
         let (pass, worst, violations) = iso_kappa_fd_variant_driver(
