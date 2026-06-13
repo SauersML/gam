@@ -1101,9 +1101,20 @@ impl EncodeAtlas {
             })?;
             let (t, cert) =
                 self.certified_encode_row(atom, best_atom, targets.row(row), amplitudes[row])?;
-            if t.len() == latent_dim {
-                coords.row_mut(row).assign(&t);
+            // Heterogeneous-atom dictionaries with different latent_dim per atom
+            // are not supported by the batched API: the caller declares one
+            // shared `latent_dim` for the output tensor.  Silently zeroing the
+            // coord row while recording a certified=true flag would produce
+            // corrupted reconstructions downstream — error loudly instead.
+            if t.len() != latent_dim {
+                return Err(format!(
+                    "certified_encode_with_index: atom {best_atom} returned t.len()={} \
+                     but declared latent_dim={latent_dim}; heterogeneous-dim \
+                     dictionaries are not supported by this batched encode path",
+                    t.len()
+                ));
             }
+            coords.row_mut(row).assign(&t);
             certified.push(cert.certified());
         }
         Ok(EncodeResult::from_rows(coords, certified))
