@@ -3968,7 +3968,9 @@ impl DispersionLocationScalePredictor {
         let eta = self.eta_mean(input);
         let strategy = self.strategy();
         let (mean, dmu_deta) = inverse_link_mean_and_d1(&strategy, eta.view())?;
-        let p_mu = self.beta_mu.len();
+        // Mean block leads the coefficient layout `[mean | noise]`, so its
+        // covariance slice needs no leading pad and is followed by the `p_d`
+        // noise columns the mean linear predictor does not touch.
         let p_d = self.beta_noise.len();
         let eta_se = padded_design_standard_errors_from_backend(
             &input.design,
