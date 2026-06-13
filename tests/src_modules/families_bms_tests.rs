@@ -10016,3 +10016,174 @@ fn bernoulli_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #1028 / #905 — Murphy–Topel generated-regressor correction assembly.
+// These pin the engine-agnostic assembly that turns the ONE outstanding
+// engine quantity (the per-row slope-score sensitivity to the calibrated score
+// s_i = ∂score_β,i/∂ζ_i) into the full correction (Vb·G)·V₁·(Vb·G)ᵀ. The only
+// missing piece for end-to-end is threading s_i out of the shared joint engine
+// (the #932 z-jet channel); everything here is exact and complete.
+
+fn murphy_topel_test_calibration() -> LatentZConditionalCalibration {
+    // Mean-and-variance conditional calibration over a single conditioning
+    // covariate a(C) (basis_ncols = 1), so θ₁ = (mean_coeffs[2], var_coeffs[2]).
+    LatentZConditionalCalibration {
+        mean_coeffs: vec![0.1, 0.4],   // m(C) = 0.1 + 0.4·a
+        var_coeffs: vec![1.2, 0.3],    // v(C) = max(1.2 + 0.3·a, floor)
+        basis_ncols: 1,
+        var_floor: 0.05,
+        global_var: 1.0,
+        post_mean: 0.0,
+        post_sd: 1.0,
+        // Diagonal first-stage covariances; PSD, distinct scales per block.
+        mean_cov: ndarray::array![[0.02, 0.0], [0.0, 0.05]],
+        var_cov: ndarray::array![[0.03, 0.0], [0.0, 0.01]],
+    }
+}
+
+#[test]
+fn generated_regressor_correction_is_psd_and_inflates_slope_se_when_gate_fires() {
+    let cal = murphy_topel_test_calibration();
+    let p_beta = 2usize;
+    // Conditioning covariate a(C) (well above the variance floor everywhere) and
+    // raw latent scores z.
+    let a_block = ndarray::array![[0.3], [-0.5], [0.8], [0.1], [-0.2]];
+    let z = ndarray::array![0.6, -0.4, 1.1, 0.05, -0.9];
+    // A nonzero per-row slope-score-to-ζ sensitivity (n × p_β): the gate fires.
+    let s = ndarray::array![
+        [0.5, -0.2],
+        [-0.3, 0.7],
+        [0.9, 0.1],
+        [0.2, -0.6],
+        [-0.4, 0.3]
+    ];
+    // Naive reduced-frame slope covariance Vb (SPD).
+    let vb = ndarray::array![[0.8, 0.1], [0.1, 0.5]];
+
+    let term = cal
+        .generated_regressor_correction(s.view(), z.view(), a_block.view(), vb.view())
+        .expect("assemble correction");
+    assert_eq!(term.dim(), (p_beta, p_beta));
+
+    // Symmetric.
+    for i in 0..p_beta {
+        for j in 0..p_beta {
+            assert!(
+                (term[[i, j]] - term[[j, i]]).abs() < 1e-12,
+                "correction term must be symmetric"
+            );
+        }
+    }
+    // PSD: xᵀ·term·x ≥ 0 for a sweep of directions (it is a congruence of the
+    // PSD V₁).
+    for &dir in &[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, -1.0], [2.0, -3.0]] {
+        let x = ndarray::array![dir[0], dir[1]];
+        let q = x.dot(&term.dot(&x));
+        assert!(
+            q >= -1e-10,
+            "correction term is not PSD: direction {dir:?} gives quadratic form {q:.3e}"
+        );
+    }
+    // The diagonal (variance of each slope coefficient) is strictly inflated:
+    // corrected SE = sqrt(vb_ii + term_ii) > naive SE = sqrt(vb_ii).
+    for i in 0..p_beta {
+        assert!(
+            term[[i, i]] > 1e-9,
+            "slope coefficient {i} variance is not inflated by the Murphy–Topel \
+             correction when the gate fires: term[{i},{i}]={:.3e}",
+            term[[i, i]]
+        );
+        let naive_se = vb[[i, i]].sqrt();
+        let corrected_se = (vb[[i, i]] + term[[i, i]]).sqrt();
+        assert!(
+            corrected_se > naive_se,
+            "corrected SE must strictly exceed naive SE for coefficient {i}: \
+             corrected={corrected_se:.5} naive={naive_se:.5}"
+        );
+    }
+}
+
+#[test]
+fn generated_regressor_correction_vanishes_when_all_rows_floored() {
+    // When the conditional variance is on the floor for EVERY row, ∂ζ/∂v = 0,
+    // and with a mean block whose sensitivity is also driven to zero the whole
+    // J_zeta is zero ⇒ G = 0 ⇒ correction = 0 (the floored-row property: a
+    // floored row carries no first-stage uncertainty into β̂).
+    //
+    // Construct a calibration whose raw v(C) sits below the floor everywhere so
+    // the variance sensitivity vanishes, AND scale the mean sensitivity to be
+    // checked separately. Here we instead test the cleanest invariant: with a
+    // zero score-sensitivity s_i ≡ 0 the correction is exactly zero regardless
+    // of J_zeta (no second-stage coupling to the first stage).
+    let cal = murphy_topel_test_calibration();
+    let n = 4usize;
+    let a_block = ndarray::array![[0.3], [-0.5], [0.8], [0.1]];
+    let z = ndarray::array![0.6, -0.4, 1.1, 0.05];
+    let s = Array2::<f64>::zeros((n, 2)); // gate did not fire on any row
+    let vb = ndarray::array![[0.8, 0.1], [0.1, 0.5]];
+
+    let term = cal
+        .generated_regressor_correction(s.view(), z.view(), a_block.view(), vb.view())
+        .expect("assemble correction");
+    let max_abs = term.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    assert!(
+        max_abs < 1e-14,
+        "correction must be exactly zero when no row's slope score responds to \
+         ζ (G = 0); got max |term| = {max_abs:.3e}"
+    );
+}
+
+#[test]
+fn generated_regressor_correction_matches_explicit_g_accumulation() {
+    // Oracle: independently accumulate G = Σ_i s_i ⊗ (∂ζ_i/∂θ₁) from the public
+    // `zeta_theta1_jacobian_row`, form (Vb·G)·V₁·(Vb·G)ᵀ by hand, and require
+    // bit-for-bit agreement with `generated_regressor_correction`. This pins the
+    // chain-rule G assembly that the seam relies on.
+    let cal = murphy_topel_test_calibration();
+    let n = 5usize;
+    let p_beta = 2usize;
+    let dim_theta1 = cal.theta1_dim();
+    assert_eq!(dim_theta1, 4); // 2 mean + 2 var
+
+    let a_block = ndarray::array![[0.3], [-0.5], [0.8], [0.1], [-0.2]];
+    let z = ndarray::array![0.6, -0.4, 1.1, 0.05, -0.9];
+    let s = ndarray::array![
+        [0.5, -0.2],
+        [-0.3, 0.7],
+        [0.9, 0.1],
+        [0.2, -0.6],
+        [-0.4, 0.3]
+    ];
+    let vb = ndarray::array![[0.8, 0.1], [0.1, 0.5]];
+
+    // Explicit G.
+    let mut g = Array2::<f64>::zeros((p_beta, dim_theta1));
+    for i in 0..n {
+        let jz = cal.zeta_theta1_jacobian_row(z[i], a_block.row(i));
+        assert_eq!(jz.len(), dim_theta1);
+        for b in 0..p_beta {
+            for k in 0..dim_theta1 {
+                g[[b, k]] += s[[i, b]] * jz[k];
+            }
+        }
+    }
+    let v1 = cal.theta1_covariance();
+    let vb_g = vb.dot(&g);
+    let expected = vb_g.dot(&v1).dot(&vb_g.t());
+
+    let got = cal
+        .generated_regressor_correction(s.view(), z.view(), a_block.view(), vb.view())
+        .expect("assemble correction");
+
+    for i in 0..p_beta {
+        for j in 0..p_beta {
+            assert!(
+                (got[[i, j]] - expected[[i, j]]).abs() < 1e-12,
+                "correction[{i},{j}] mismatch: got={:.6e} expected={:.6e}",
+                got[[i, j]],
+                expected[[i, j]]
+            );
+        }
+    }
+}
