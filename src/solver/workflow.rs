@@ -4312,9 +4312,10 @@ pub struct SplineScanInputs {
     pub y: Vec<f64>,
     /// Observation weights (variance is `σ²/w`).
     pub w: Vec<f64>,
-    /// Smoothing-spline order `m = penalty_order ∈ {1, 2}`: `m = 1` the
+    /// Smoothing-spline order `m = penalty_order ∈ {1, 2, 3}`: `m = 1` the
     /// random-walk/linear smoother (penalty `λ∫f′²`), `m = 2` the cubic
-    /// smoother (penalty `λ∫f″²`).
+    /// smoother (penalty `λ∫f″²`), `m = 3` the quintic smoother (penalty
+    /// `λ∫(f‴)²`).
     pub order: usize,
 }
 
@@ -4407,13 +4408,14 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
     else {
         return None;
     };
-    // Smoothing-spline order m = penalty_order ∈ {1, 2}. The exact scan
+    // Smoothing-spline order m = penalty_order ∈ {1, 2, 3}. The exact scan
     // integrates the order-m integrated-Wiener prior whose natural spline has
-    // degree 2m−1 (m=1 → linear, m=2 → cubic), so require that degree to match
-    // user intent. m≥3 needs the banded smoother (spline_scan MAX_ORDER), so it
-    // falls through to the dense path.
+    // degree 2m−1 (m=1 → linear, m=2 → cubic, m=3 → quintic), so require that
+    // degree to match user intent. The de Jong exact diffuse leading-block
+    // smoother (#1044) handles the m−1 partially-diffuse leading nodes for all
+    // m ≤ MAX_ORDER; m > MAX_ORDER falls through to the dense path.
     let order = bspec.penalty_order;
-    if !(1..=2).contains(&order)
+    if !(1..=3).contains(&order)
         || bspec.degree != 2 * order - 1
         || bspec.double_penalty
         || !bspec.boundary_conditions.is_free()
