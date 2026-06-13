@@ -20595,6 +20595,7 @@ mod tests {
             row_hessian_fingerprint: 0,
             pcg_diagnostics: PcgDiagnostics::default(),
             gauge_deflated_directions: 0,
+            cross_row_woodbury: None,
         }
     }
 
@@ -20620,6 +20621,7 @@ mod tests {
             row_hessian_fingerprint: 0,
             pcg_diagnostics: PcgDiagnostics::default(),
             gauge_deflated_directions: 0,
+            cross_row_woodbury: None,
         }
     }
 
