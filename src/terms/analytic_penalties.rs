@@ -9935,7 +9935,8 @@ mod tests {
         }
         // Distinct columns do NOT couple cross-row (independent stick-breaking
         // masses): the analytic model predicts zero, and the FD must agree.
-        let mixed_distinct = mixed_fd(0 * k + 0, 1 * k + 1);
+        // Pick row 0, col 0 vs row 1, col 1 (flat indices 0 and k + 1).
+        let mixed_distinct = mixed_fd(0, k + 1);
         assert!(
             mixed_distinct.abs() < 5.0e-5,
             "distinct-column cross-row coupling must vanish; got {mixed_distinct:.3e}"

@@ -97,6 +97,7 @@ fn fit_result_kind(fit: &FitResult) -> &'static str {
         FitResult::TransformationNormal(_) => "TransformationNormal",
         FitResult::DispersionLocationScale(_) => "DispersionLocationScale",
         FitResult::SplineScan(_) => "SplineScan",
+        FitResult::ResidualCascade(_) => "ResidualCascade",
     }
 }
 
