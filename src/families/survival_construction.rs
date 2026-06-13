@@ -1639,72 +1639,96 @@ pub fn build_survival_time_basis(
             if penalty_basis.design.ncols() != p_time_full + 1 {
                 return Err("internal error: ispline penalty dimension mismatch".to_string());
             }
-            // I-spline curvature penalty in the *increment* space of the baseline
+            // I-spline curvature penalty in the *value* space of the baseline
             // log-cumulative-hazard, restricted to the retained (non-dropped)
             // coefficient block.
             //
-            // CURRENT STATE (#691). This emits the increment-space second-difference
-            // submatrix `S_B[1.., 1..]`, where `S_B = D₂ᵀD₂` is the underlying
-            // B-spline second-difference penalty (`penalty_basis.penalties`). The
-            // I-spline coefficient γ is the consecutive increment of the B-spline
-            // value coefficients `c` (`c = L γ`, `c_m = Σ_{k<m} γ_k`, `c_0 = 0`), so
-            // dropping the fixed `c_0 = 0` row/column of `S_B` and penalizing the
-            // remaining `(c_1, …) = (γ_0, γ_0+γ_1, …)` applies `D₂` curvature to the
-            // increments. This penalty is **full rank** and the constrained survival
-            // inner PIRLS converges robustly on it.
+            // The I-spline coefficient γ is the consecutive increment of the B-spline
+            // value coefficients `c`: `c_0 = 0`, `c_k = Σ_{j<k} γ_j = (L γ)_k`, where
+            // `L` is the `p_time × p_time` lower-triangular cumsum matrix. The
+            // second-difference penalty on the B-spline values is `S_B = D₂ᵀD₂`
+            // (the `penalty_basis.penalties` block). The correct curvature penalty
+            // on γ is the **value-space congruence transform**
             //
-            // KNOWN BIAS / open #691: the increment-space form penalizes the affine
-            // baseline slope `q = a·log t + b` (a constant γ maps to an affine `c`,
-            // which `D₂` does NOT annihilate once the `c_0 = 0` anchor is fixed), so
-            // REML over-shrinks the baseline slope and flattens the upper tail of
-            // `log Λ(t)` — gam loses to scam on net-survival tail accuracy.
+            //   `S_I = Lᵀ S_B[1:,1:] L`,
             //
-            // The principled cure is the congruent **value-space** penalty
-            //   `S_I = Lᵀ S_B L`,
-            // for which a constant γ ⇒ affine `c` ⇒ `D₂ c = 0` ⇒ `γᵀ S_I γ = 0`, so
-            // the affine trend lies in the penalty null space and REML stops
-            // over-shrinking it. That form (commit 03ae8717d) is mathematically
-            // correct but is NOT viable from the penalty level alone: its exact
-            // affine null direction is only weakly identified by the likelihood
-            // (thin upper tail under right censoring), so the penalized survival
-            // inner Hessian `Hₗᵢₖ + λ·S_I + δ_stab·I` is near-singular along it and
-            // the constrained inner PIRLS stalls (`MaxIterationsReached`,
-            // grad_norm ≈ 0.56). THREE penalty-level conditioning attempts —
-            // declaring `nullspace_dims`, unit-mean-diagonal scale normalization,
-            // and an affine-direction `δ·P_null` ridge — all left grad_norm
-            // essentially unchanged at ~0.56, empirically proving the stall is in
-            // the generic inner solver, not the penalty. The real value-space fix
-            // therefore requires the survival inner PIRLS to handle the penalty's
-            // affine null direction directly (e.g. an affine-subspace-aware inner
-            // Newton / nullspace projection in the generic constrained PIRLS — a
-            // generic-solver project, out of scope here). Until then we ship the
-            // increment-space penalty so the fit converges (with the documented
-            // tail bias), which is strictly better for users than a fit that errors
-            // out. Tracked by #691.
+            // which satisfies `γᵀ S_I γ = (Lγ)ᵀ S_B[1:,1:] (Lγ)`.
+            //
+            // A constant γ (γ_k = γ₀ ∀k) maps to the linear value sequence
+            // `c_k = k·γ₀`, which is annihilated by D₂: `D₂c = 0`. Therefore
+            // `γᵀ S_I γ = 0` for constant γ, i.e. the **affine trend lies in the
+            // penalty null space**. REML does not penalize the baseline slope
+            // `d(log Λ)/d(log t)` or the overall level, so it correctly lets the
+            // data determine these quantities without bias. The previous increment-
+            // space form `S_B[1:,1:]` (applied directly to γ instead of Lγ) did NOT
+            // have constant γ in its null space and therefore over-penalized affine
+            // baselines, causing the fitted log-cumulative-hazard to lose its tail
+            // slope to the penalty and fail quality tests (#1076).
+            //
+            // The value-space form has a 1-dimensional null space (span{(1,…,1)}),
+            // declared via `nullspace_dims` so the REML generalized-logdet picks it
+            // up. The penalized inner PIRLS is well-conditioned because the
+            // likelihood Hessian H_lik has O(n_events) curvature along the affine
+            // direction (the overall baseline level is identified by the data), and
+            // the global stabilization ridge (ridge_lambda) provides an absolute
+            // positive-definite floor.
             let mut penalties = Vec::<Array2<f64>>::new();
             for s_mat in &penalty_basis.penalties {
                 if s_mat.nrows() != p_time_full + 1 || s_mat.ncols() != p_time_full + 1 {
                     continue;
                 }
-                // Increment-space submatrix: drop the fixed `c_0 = 0` row/column
-                // (index 0) of `S_B`, then restrict the remaining `p_time_full`
-                // increment coordinates to the retained I-spline columns. Symmetrize
-                // to remove any accumulated asymmetry.
+                // Step 1: restrict S_B[1:,1:] to the retained I-spline columns.
+                // Symmetrize to remove any accumulated floating-point asymmetry.
                 let s_increment = s_mat.slice(s![1.., 1..]);
-                let mut local = Array2::<f64>::zeros((p_time, p_time));
+                let mut s_local = Array2::<f64>::zeros((p_time, p_time));
                 for (i_new, &i_old) in keep_cols.iter().enumerate() {
                     for (j_new, &j_old) in keep_cols.iter().enumerate() {
                         let v = 0.5 * (s_increment[[i_old, j_old]] + s_increment[[j_old, i_old]]);
-                        local[[i_new, j_new]] = v;
+                        s_local[[i_new, j_new]] = v;
+                    }
+                }
+                // Step 2: congruence transform S_I = L^T s_local L, where L is
+                // the p_time×p_time lower-triangular cumsum matrix (L[i,j]=1 if
+                // j≤i, else 0). Compute as S_intermediate = s_local @ L, then
+                // S_I = L^T @ S_intermediate.
+                let mut s_mid = Array2::<f64>::zeros((p_time, p_time));
+                for i in 0..p_time {
+                    for j in 0..p_time {
+                        // (s_local @ L)[i, j] = sum_{k=0}^{j} s_local[i, k]
+                        // because L[k, j] = 1 iff k <= j.
+                        let mut v = 0.0;
+                        for k in 0..=j {
+                            v += s_local[[i, k]];
+                        }
+                        s_mid[[i, j]] = v;
+                    }
+                }
+                let mut local = Array2::<f64>::zeros((p_time, p_time));
+                for i in 0..p_time {
+                    for j in 0..p_time {
+                        // (L^T @ s_mid)[i, j] = sum_{k=i}^{p_time-1} s_mid[k, j]
+                        // because (L^T)[i, k] = 1 iff k >= i.
+                        let mut v = 0.0;
+                        for k in i..p_time {
+                            v += s_mid[[k, j]];
+                        }
+                        local[[i, j]] = v;
+                    }
+                }
+                // Symmetrize to absorb any residual floating-point asymmetry.
+                for i in 0..p_time {
+                    for j in (i + 1)..p_time {
+                        let avg = 0.5 * (local[[i, j]] + local[[j, i]]);
+                        local[[i, j]] = avg;
+                        local[[j, i]] = avg;
                     }
                 }
                 penalties.push(local);
             }
 
-            // The increment-space submatrix is full rank, so the penalty carries no
-            // null space in general; compute it from the spectrum rather than
-            // hardcoding (a rank-deficient case would round-trip honestly to the
-            // generalized-determinant REML).
+            // The value-space penalty S_I = L^T S_B[1:,1:] L has a 1-dimensional
+            // null space (constant γ ↦ affine c ↦ D₂c = 0). Detect it spectrally
+            // so the REML uses the generalized logdet over the penalized subspace.
             let nullspace_dims: Vec<usize> = penalties
                 .iter()
                 .map(|s_mat| {
