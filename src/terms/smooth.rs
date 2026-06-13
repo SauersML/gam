@@ -24925,24 +24925,44 @@ mod tests {
         }
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
-        // Every active caller is a Duchon-iso-κ FD probe. Thin-plate is
-        // deliberately excluded from the spatial κ-axis enrollment (see
-        // `spatial_term_supports_hyper_optimization`), so the driver only
-        // needs to build the Duchon basis.
-        let basis = SmoothBasisSpec::Duchon {
-            feature_cols: vec![0],
-            spec: DuchonBasisSpec {
-                periodic: None,
-                center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                length_scale: Some(1.0),
-                power: 1.0,
-                nullspace_order: DuchonNullspaceOrder::Linear,
-                identifiability: SpatialIdentifiability::default(),
-                aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
-                boundary: OneDimensionalBoundary::Open,
-            },
-            input_scales: None,
+        // Duchon is the historical iso-κ FD probe basis; a `"matern_*"` label
+        // routes the Matérn ν=5/2 kernel instead so the same gold-standard
+        // analytic-vs-FD outer-gradient check covers the Matérn iso-κ REML
+        // gradient assembly (which has no other end-to-end FD pin). Thin-plate
+        // is deliberately excluded from κ-axis enrollment (see
+        // `spatial_term_supports_hyper_optimization`).
+        let basis = if label.starts_with("matern") {
+            SmoothBasisSpec::Matern {
+                feature_cols: vec![0],
+                spec: MaternBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    periodic: None,
+                    length_scale: 1.0,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty: false,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: None,
+                    nullspace_shrinkage_survived: None,
+                },
+                input_scales: None,
+            }
+        } else {
+            SmoothBasisSpec::Duchon {
+                feature_cols: vec![0],
+                spec: DuchonBasisSpec {
+                    periodic: None,
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    length_scale: Some(1.0),
+                    power: 1.0,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    identifiability: SpatialIdentifiability::default(),
+                    aniso_log_scales: None,
+                    operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    boundary: OneDimensionalBoundary::Open,
+                },
+                input_scales: None,
+            }
         };
         let spec = TermCollectionSpec {
             linear_terms: vec![],
@@ -25135,6 +25155,32 @@ mod tests {
         assert!(
             pass,
             "Gaussian Identity FD failed; worst_psi_rel={worst:.3e}\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    /// The Matérn ν=5/2 analogue of `iso_kappa_duchon_gaussian_identity_fd`.
+    ///
+    /// The isotropic-analytic κ optimizer was observed to stall at n≳1000 on a
+    /// well-conditioned 1-D Matérn Gaussian fit (grad_norm ≈ 0.5·|f|, nowhere
+    /// near stationary) while the Duchon path converges — and the Matérn iso-κ
+    /// *outer* REML gradient had no end-to-end FD pin (only basis-level log-κ
+    /// derivative tests). This closes that gap: it differences the same exact
+    /// analytic ψ=log κ outer gradient that the optimizer follows against a
+    /// central finite difference of the REML cost. If the analytic gradient is
+    /// wrong, the optimizer's stall is explained and this fails loudly.
+    #[test]
+    fn iso_kappa_matern_gaussian_identity_fd() {
+        let (pass, worst, violations) = iso_kappa_fd_variant_driver(
+            "matern_gaussian",
+            80,
+            LikelihoodSpec::gaussian_identity(),
+            false,
+        );
+        assert!(
+            pass,
+            "Matérn iso-κ Gaussian-identity outer-gradient FD failed; \
+             worst_psi_rel={worst:.3e}\n  {}",
             violations.join("\n  ")
         );
     }
