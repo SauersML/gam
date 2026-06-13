@@ -69,7 +69,9 @@ fn gam_tensor_te_2d_poisson_matches_mgcv() {
     // count_expected = exp(sin(pi*x) * cos(pi*z)); count ~ Poisson(count_expected).
     // Fixed seed => the SAME draws feed gam and mgcv, so any disagreement is in
     // the fitting, not the data.
-    let n = 300usize;
+    // Reduced from 300; the smooth truth (sin·cos) is recoverable at n=200 and
+    // the smaller PIRLS cost brings mgcv's Poisson te() R fit within the 360s budget.
+    let n = 200usize;
     let mut rng = StdRng::seed_from_u64(20260530);
     let u = Uniform::new(0.0_f64, 1.0).expect("uniform [0,1]");
 
@@ -111,7 +113,9 @@ fn gam_tensor_te_2d_poisson_matches_mgcv() {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("count ~ te(x, z, k=7)", &ds, &cfg).expect("gam poisson te fit");
+    // k=5 (25 tensor knots): sufficient to recover the smooth sin·cos truth and
+    // keeps mgcv's Poisson te() R fit within the 360s CI wall-clock budget.
+    let result = fit_from_formula("count ~ te(x, z, k=5)", &ds, &cfg).expect("gam poisson te fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for Poisson te(x, z)");
     };
@@ -138,7 +142,7 @@ fn gam_tensor_te_2d_poisson_matches_mgcv() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(count ~ te(x, z, k = 7), data = df,
+        m <- gam(count ~ te(x, z, k = 5), data = df,
                  family = poisson(link = "log"), method = "REML")
         emit("eta", as.numeric(predict(m, type = "link")))
         emit("edf", sum(m$edf))
@@ -168,7 +172,7 @@ fn gam_tensor_te_2d_poisson_matches_mgcv() {
     );
 
     // PRIMARY: gam must recover the true log-mean surface. The true eta_true =
-    // sin(pi*x)*cos(pi*z) ranges over [-1, 1] (signal range 2). With n=300 and
+    // sin(pi*x)*cos(pi*z) ranges over [-1, 1] (signal range 2). With n=200 and
     // counts as small as exp(-1) ~ 0.37, the Poisson information is genuinely
     // sparse, so a smoother cannot reproduce eta_true exactly; but a correct
     // tensor-product / log-link fit must stay well inside a fraction of the
