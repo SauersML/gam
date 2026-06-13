@@ -2527,11 +2527,6 @@ fn run_fitwith_predict_noise(
                 fit.geometry.clone(),
                 SavedFitSummary::from_blockwise_fit(&fit)?,
             );
-            let base_link = if matches!(kind, gam::gamlss::DispersionFamilyKind::Beta) {
-                InverseLink::Standard(StandardLink::Logit)
-            } else {
-                InverseLink::Standard(StandardLink::Log)
-            };
             let payload = assemble_location_scale_payload(
                 LocationScaleInputs {
                     formula: formula_text.to_string(),
@@ -2546,8 +2541,8 @@ fn run_fitwith_predict_noise(
                     wiggle: None,
                 },
                 LocationScaleResponse::Dispersion {
-                    likelihood: family.clone(),
-                    base_link,
+                    likelihood: kind.likelihood_spec(),
+                    base_link: kind.base_link(),
                     family_tag: kind.family_tag(),
                 },
                 SavedModelSourceMetadata {

@@ -101,6 +101,45 @@ impl DispersionFamilyKind {
     const fn mean_is_logit(self) -> bool {
         matches!(self, DispersionFamilyKind::Beta)
     }
+
+    /// The mean inverse link this dispersion family fits on: log for
+    /// NegativeBinomial / Gamma / Tweedie, logit for Beta. Single source of
+    /// truth shared by the CLI and FFI save paths so the persisted
+    /// `base_link` never diverges from the fitted channel.
+    pub fn base_link(self) -> crate::types::InverseLink {
+        use crate::types::{InverseLink, StandardLink};
+        if self.mean_is_logit() {
+            InverseLink::Standard(StandardLink::Logit)
+        } else {
+            InverseLink::Standard(StandardLink::Log)
+        }
+    }
+
+    /// The family's canonical [`LikelihoodSpec`] (mean response × mean link).
+    /// The overdispersion parameter is estimated by the log-precision channel,
+    /// so the response-family placeholder parameters (`phi`, `theta`) mirror
+    /// the [`resolve_family`](crate::solver::workflow::resolve_family) defaults
+    /// and are not consumed as fixed values at predict time. This is the single
+    /// source of truth for the persisted location-scale likelihood so the CLI
+    /// and FFI save paths cannot diverge.
+    pub fn likelihood_spec(self) -> crate::types::LikelihoodSpec {
+        use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+        let response = match self {
+            DispersionFamilyKind::NegativeBinomial => ResponseFamily::NegativeBinomial {
+                theta: 1.0,
+                theta_fixed: false,
+            },
+            DispersionFamilyKind::Gamma => ResponseFamily::Gamma,
+            DispersionFamilyKind::Beta => ResponseFamily::Beta { phi: 1.0 },
+            DispersionFamilyKind::Tweedie { p } => ResponseFamily::Tweedie { p },
+        };
+        let link = if self.mean_is_logit() {
+            InverseLink::Standard(StandardLink::Logit)
+        } else {
+            InverseLink::Standard(StandardLink::Log)
+        };
+        LikelihoodSpec::new(response, link)
+    }
 }
 
 pub const FAMILY_NEGBIN_LOCATION_SCALE: &str = "negbin-location-scale";
