@@ -42,7 +42,7 @@ const SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER: usize = 32;
 use crate::solver::arrow_schur::{
     ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem,
     ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, DeviceSaePcgData,
-    DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp,
+    DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IbpCrossRowSource,
     IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
     StreamingArrowSchur, solve_arrow_newton_step_with_proximal_correction,
     solve_streaming_reduced_beta, solve_with_lm_escalation_inner,
@@ -6151,6 +6151,51 @@ impl SaeManifoldTerm {
         }
         if let Some(deflation) = self.row_gauge_deflation_for_layout(row_layout.as_ref()) {
             sys.set_row_gauge_deflation(deflation);
+        }
+        // #1038 IBP cross-row Woodbury source. The exact IBP Hessian has the
+        // per-column rank-one cross-row block `H_(i,k),(j,k) = w·s'_k·z'_ik·z'_jk`
+        // (for ALL `i,j`, including the `i=j` self term) that couples DISTINCT
+        // latent rows through the shared empirical mass `M_k = Σ_i z_ik`. The
+        // assembled row-block-diagonal `htt` already carries the `i=j` self term
+        // `w·s'_k·z'_ik²` — it is the first summand of `assignment_hdiag`'s
+        // `hessian_diag` value `w·(score_derivative·z_jac² + score·c_ik)` written
+        // at the logit diagonal above. So the consumer (`solver::arrow_schur`,
+        // #1038 `IbpCrossRowSource`/`CrossRowWoodbury`) DOWNDATES exactly
+        // `Σ_k d_k·z'_ik²` (`self_term_downdate`) to recover the NO-SELF base
+        // `H₀'`, then re-adds the FULL rank-one `U D Uᵀ` via the determinant
+        // lemma — so value, the evidence log-determinant, and the θ/ρ-adjoint all
+        // differentiate the SAME `H_full = H₀' + U D Uᵀ`.
+        //
+        // The source is built from the SAME `ibp_assignment_third_channels`
+        // operator the #1006 θ-adjoint consumes:
+        //   * `d[k] = cross_row_d[k] = w·s'_k = w·score_derivative_k` (the column
+        //     `D`-coefficient — NOT sign-definite, hence the consumer's
+        //     indefinite-capacitance LU);
+        //   * `entries[(i,k)] = (global_t_index, k, z'_ik)` with `z'_ik =
+        //     z_jac[i·K + k]` and `global_t_index = sys.row_offsets[i] + k`. IBP
+        //     is a DENSE assignment mode (`assignment_coord_dim() = K`,
+        //     `last_row_layout = None`), so atom `k`'s logit slot is local
+        //     position `k` of row `i`'s block — exactly the `(base + pos)` index
+        //     the gradient path records in `ibp_logit_sites`
+        //     (`row_vars_for_cache_row` maps `vars[atom] = Logit { atom }`). This
+        //     pins the `U`-column convention bit-for-bit to the consumer.
+        if let Some(channels) = ibp_assignment_third_channels(&self.assignment, rho)? {
+            let mut entries: Vec<(usize, usize, f64)> =
+                Vec::with_capacity(n * k_atoms);
+            for row in 0..n {
+                let start = row * k_atoms;
+                let g_base = sys.row_offsets[row];
+                for k in 0..k_atoms {
+                    let z_prime = channels.z_jac[start + k];
+                    entries.push((g_base + k, k, z_prime));
+                }
+            }
+            let source = IbpCrossRowSource {
+                r: k_atoms,
+                d: channels.cross_row_d.clone(),
+                entries,
+            };
+            sys.set_ibp_cross_row_source(source);
         }
         // Store the active-set layout for `apply_newton_step`.
         self.last_row_layout = row_layout;
@@ -19371,6 +19416,156 @@ mod tests {
             / (2.0 * step);
 
         assert_abs_diff_eq!(grad[idx], fd, epsilon = 2.0e-7);
+    }
+
+    /// #1038 assembly-site wiring: a live IBP-active multi-atom assembly must
+    /// emit the exact cross-row Woodbury source `IbpCrossRowSource` whose
+    /// entries reproduce the NUMERICAL off-diagonal (`i≠j`) logit Hessian of the
+    /// SAE objective end-to-end. The ONLY source of cross-row `i≠j` logit
+    /// coupling is the IBP empirical-mass prior `M_k = Σ_i z_ik` (the data-fit
+    /// reconstruction of each row depends only on that row's own logits), so
+    /// `∂²(assignment_prior_value)/∂ℓ_ik∂ℓ_jk = d_k·z'_ik·z'_jk` for `i≠j`, with
+    /// `d_k = cross_row_d[k]` and `z'_ik = z_jac[i·K+k]` — exactly the rank-one
+    /// `U D Uᵀ` the assembled `sys.ibp_cross_row` encodes and the arrow-Schur
+    /// consumer rides as the exact Woodbury (value + logdet + θ/ρ-adjoint).
+    ///
+    /// This certifies the assembly-site source matches the consumer's `U`/index
+    /// convention bit-for-bit: each entry's `global_t_index` is the row's logit
+    /// slot in the latent block (`row_offsets[i] + k` for the dense IBP layout),
+    /// and the rank-one product against the central-difference Hessian closes.
+    #[test]
+    fn ibp_assembly_emits_cross_row_woodbury_source_matching_fd_hessian() {
+        let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
+        let coords1 = array![[0.15], [0.30], [0.65], [0.90]];
+        let (phi0, jet0) = periodic_basis(&coords0);
+        let (phi1, jet1) = periodic_basis(&coords1);
+        let atom0 = SaeManifoldAtom::new(
+            "periodic0",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            array![[0.25], [-0.35], [0.15]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let atom1 = SaeManifoldAtom::new(
+            "periodic1",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi1,
+            jet1,
+            array![[-0.10], [0.20], [0.30]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        // IBP-active logits (positive ⇒ near-on gate, interior π so the
+        // empirical-mass channel is live — `pi_jac ≠ 0`).
+        let logits = array![[1.2, 0.4], [0.6, 1.0], [0.9, 0.3], [1.4, 0.7]];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![coords0, coords1],
+            vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ],
+            AssignmentMode::ibp_map(0.8, 1.0, false),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
+        let target = array![[0.12], [-0.03], [0.08], [0.20]];
+        let rho = SaeManifoldRho::new(
+            0.3_f64.ln(),
+            0.7_f64.ln(),
+            vec![array![0.9_f64.ln()], array![1.1_f64.ln()]],
+        );
+
+        let n = term.assignment.n_obs();
+        let k = term.assignment.k_atoms();
+
+        // Assemble the live arrow system; it must now carry the IBP source.
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .expect("IBP arrow assembly");
+        let source = sys
+            .ibp_cross_row
+            .as_ref()
+            .expect("an IBP-active assembly must emit the cross-row Woodbury source");
+        assert_eq!(source.r, k, "the rank must be the atom count K");
+
+        // Rebuild the dense `U` and `d` the consumer sees from the sparse entries,
+        // and check the global-index convention is the dense IBP layout
+        // (`row_offsets[i] + k`), i.e. atom `k`'s logit slot of row `i`.
+        let total_t = sys.row_offsets[n];
+        let mut u = Array2::<f64>::zeros((total_t, k));
+        for &(g, atom_k, z_prime) in &source.entries {
+            u[[g, atom_k]] += z_prime;
+        }
+        for i in 0..n {
+            for atom_k in 0..k {
+                let g = sys.row_offsets[i] + atom_k;
+                // The entry for (row i, atom k) must sit at the row's logit slot.
+                assert!(
+                    u[[g, atom_k]].abs() > 0.0 || term.assignment.logits[[i, atom_k]].abs() > 1.0e3,
+                    "row {i} atom {atom_k} logit slot must carry a z' entry"
+                );
+            }
+        }
+
+        // Central-difference the assignment-prior value cross-row (i≠j) Hessian
+        // and assert it equals the rank-one `d_k·z'_ik·z'_jk` the source encodes.
+        let d = source.d.clone();
+        let step = 1.0e-5_f64;
+        let fd_cross = |i: usize, j: usize, atom_k: usize| -> f64 {
+            let bump = |si: f64, sj: f64| -> f64 {
+                let mut a = term.assignment.clone();
+                a.logits[[i, atom_k]] += si * step;
+                a.logits[[j, atom_k]] += sj * step;
+                assignment_prior_value(&a, &rho)
+            };
+            // mixed second difference ∂²V/∂ℓ_ik∂ℓ_jk
+            (bump(1.0, 1.0) - bump(1.0, -1.0) - bump(-1.0, 1.0) + bump(-1.0, -1.0))
+                / (4.0 * step * step)
+        };
+
+        for atom_k in 0..k {
+            for i in 0..n {
+                for j in 0..n {
+                    if i == j {
+                        continue;
+                    }
+                    let gi = sys.row_offsets[i] + atom_k;
+                    let gj = sys.row_offsets[j] + atom_k;
+                    let analytic = d[atom_k] * u[[gi, atom_k]] * u[[gj, atom_k]];
+                    let fd = fd_cross(i, j, atom_k);
+                    assert_abs_diff_eq!(analytic, fd, epsilon = 5.0e-6);
+                }
+            }
+        }
+
+        // Distinct atom columns do NOT couple cross-row (independent
+        // stick-breaking masses): the off-diagonal in a DIFFERENT column is zero.
+        for i in 0..n {
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let mut a = term.assignment.clone();
+                let cross = {
+                    let s = 1.0e-5_f64;
+                    let mut bump = |si: f64, sj: f64| -> f64 {
+                        a.logits[[i, 0]] = term.assignment.logits[[i, 0]] + si * s;
+                        a.logits[[j, 1]] = term.assignment.logits[[j, 1]] + sj * s;
+                        assignment_prior_value(&a, &rho)
+                    };
+                    (bump(1.0, 1.0) - bump(1.0, -1.0) - bump(-1.0, 1.0) + bump(-1.0, -1.0))
+                        / (4.0 * s * s)
+                };
+                assert_abs_diff_eq!(cross, 0.0, epsilon = 5.0e-6);
+            }
+        }
     }
 
     #[test]
