@@ -183,6 +183,25 @@ fn kappa_iso_1d_convergence_diagnostic() {
     eprintln!("[kappa-diag] any-converged={any_ok}");
 }
 
+/// Pin the sample-size threshold at which the isotropic-analytic κ optimizer
+/// tips from converging to non-converging on the *same* well-conditioned 1-D
+/// Matérn Gaussian fixture (gentle `y=sin(t)`, 12 centers, single penalty, tight
+/// bounds). n=600 converges; earlier runs showed n=1000 failing with a stuck
+/// `grad_norm≈1.9e3`. This sweep brackets the transition so the defect report
+/// carries an exact reproducer. Report-only (the printed sweep is the
+/// deliverable); the companion measurement stays gated until it is fixed.
+#[test]
+fn kappa_iso_1d_n_threshold_sweep() {
+    let bounds = (1e-2, 1e2);
+    eprintln!("[kappa-nthresh] iso-1D Matérn ν=5/2, Gaussian, single penalty, bounds={bounds:?}");
+    for &n in &[600usize, 800, 1000, 1200] {
+        match run_fit(n, true, false, bounds) {
+            Ok(dt) => eprintln!("[kappa-nthresh] n={n:>5}: CONVERGED in {dt:.1}s"),
+            Err(reason) => eprintln!("[kappa-nthresh] n={n:>5}: FAILED — {reason}"),
+        }
+    }
+}
+
 #[test]
 fn kappa_outer_loop_is_n_independent() {
     // Pick the converging path discovered by the diagnostic. Placeholder uses
