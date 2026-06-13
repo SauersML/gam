@@ -423,6 +423,42 @@ fn positive_response_single_block(seed: u64, intercept: f64) -> GlmFixture {
     }
 }
 
+/// Beta-regression design: response strictly inside (0, 1) via a logit mean
+/// plus bounded noise, so the logit link and the Beta(a, b) log-density are
+/// both well defined for every observation.
+fn unit_interval_single_block(seed: u64) -> GlmFixture {
+    let n = 180usize;
+    let p = 7usize;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut x = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        x[[i, 0]] = 1.0;
+        for j in 1..p {
+            x[[i, j]] = rng.random_range(-0.8..0.8);
+        }
+    }
+    let mut beta = Array1::<f64>::zeros(p);
+    beta[0] = 0.2;
+    for j in 1..p {
+        beta[j] = 0.2 / (j as f64).sqrt();
+    }
+    let eta = x.dot(&beta);
+    // mu = logistic(eta); jitter and clamp strictly inside the open interval.
+    let y = eta.mapv(|e| {
+        let mu = 1.0 / (1.0 + (-e).exp());
+        (mu + 0.1 * rng.random_range(-1.0..1.0)).clamp(1e-3, 1.0 - 1e-3)
+    });
+    let w = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    GlmFixture {
+        x,
+        y,
+        w,
+        offset,
+        s_list: vec![BlockwisePenalty::new(0..p, identity_ridge(p))],
+    }
+}
+
 // --- Regime R0: interior ρ across multiple families (baseline) ---------
 
 #[test]
@@ -493,6 +529,57 @@ fn glm_objective_gradient_consistent_interior_multifamily() {
             &rho,
             TOL_INTERIOR,
         );
+    }
+
+    // Tweedie-log (compound-Poisson-Gamma, fixed p): the LAML ρ-gradient runs
+    // through the Tweedie deviance weight, an unpinned channel until now.
+    let tweedie = positive_response_single_block(505, 0.5);
+    let tweedie_opts = glm_opts(
+        standard_spec(ResponseFamily::Tweedie { p: 1.5 }, StandardLink::Log),
+        vec![1],
+    );
+    for rho in [Array1::from(vec![-0.1_f64]), Array1::from(vec![0.8_f64])] {
+        assert_glm_consistent(
+            "interior/tweedie-log",
+            &tweedie,
+            &tweedie_opts,
+            &rho,
+            TOL_INTERIOR,
+        );
+    }
+
+    // Negative-binomial-log (fixed θ): the μθ/(θ+μ) IRLS weight feeds the LAML
+    // logdet ρ-derivative, a previously unpinned outer-gradient channel.
+    let negbin = positive_response_single_block(606, 0.5);
+    let negbin_opts = glm_opts(
+        standard_spec(
+            ResponseFamily::NegativeBinomial {
+                theta: 3.0,
+                theta_fixed: true,
+            },
+            StandardLink::Log,
+        ),
+        vec![1],
+    );
+    for rho in [Array1::from(vec![0.0_f64]), Array1::from(vec![0.9_f64])] {
+        assert_glm_consistent(
+            "interior/negbin-log",
+            &negbin,
+            &negbin_opts,
+            &rho,
+            TOL_INTERIOR,
+        );
+    }
+
+    // Beta-logit (fixed φ): the Beta Fisher weight φ·dμ/dη² carries the LAML
+    // ρ-derivative, the last unpinned mean-family outer-gradient channel.
+    let beta_fix = unit_interval_single_block(707);
+    let beta_opts = glm_opts(
+        standard_spec(ResponseFamily::Beta { phi: 8.0 }, StandardLink::Logit),
+        vec![1],
+    );
+    for rho in [Array1::from(vec![-0.1_f64]), Array1::from(vec![0.8_f64])] {
+        assert_glm_consistent("interior/beta-logit", &beta_fix, &beta_opts, &rho, TOL_INTERIOR);
     }
 }
 
