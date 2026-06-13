@@ -20668,10 +20668,20 @@ where
 
     let log_kappa_dim = joint_setup.log_kappa_dim();
 
+    log::warn!(
+        "[OUTER-FD-AUDIT/spatial-exact-joint] driver entry: aux_dim={} log_kappa_dim={} kappa_enabled={} rho_dim={} theta0_len={}",
+        joint_setup.auxiliary_dim(),
+        log_kappa_dim,
+        kappa_options.enabled,
+        joint_setup.rho_dim(),
+        joint_setup.theta0().len()
+    );
+
     // -----------------------------------------------------------------------
     // Fast path: kappa disabled or no spatial terms — build designs once.
     // -----------------------------------------------------------------------
     if joint_setup.auxiliary_dim() == 0 && (!kappa_options.enabled || log_kappa_dim == 0) {
+        log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] taking FAST path (no outer theta optimization in this driver)");
         let (designs, resolved_specs) = build_term_collection_designs_and_freeze_joint(
             data, block_specs,
         )

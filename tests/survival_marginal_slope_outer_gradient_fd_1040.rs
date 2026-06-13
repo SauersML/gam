@@ -9,7 +9,7 @@
 //! component by component. The audit machinery lives in
 //! `outer_strategy::outer_gradient_fd_audit` and is invoked automatically by
 //! `optimize_spatial_length_scale_exact_joint` on diagnostic-sized problems
-//! (this one: n=400, centers=6). It emits `[OUTER-FD-AUDIT/...]` log lines
+//! (this one: n=800, centers=4). It emits `[OUTER-FD-AUDIT/...]` log lines
 //! including per-block analytic gradient norms, per-coordinate analytic-vs-FD
 //! gaps, the outer-Hessian eigenvalue spectrum, and a single VERDICT line. This
 //! test drives a small survival-MS fit, captures those lines, and asserts the
@@ -23,7 +23,7 @@ use csv::StringRecord;
 use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
 use std::sync::{Mutex, Once};
 
-const N: usize = 400;
+const N: usize = 800;
 
 static CAPTURE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -257,10 +257,10 @@ fn run_basis(basis_term: &str) {
 
 #[test]
 fn survival_marginal_slope_outer_gradient_fd_audit_matern() {
-    run_basis("matern(PC1, PC2, centers=6)");
+    run_basis("matern(PC1, PC2, centers=4)");
 }
 
 #[test]
 fn survival_marginal_slope_outer_gradient_fd_audit_duchon() {
-    run_basis("duchon(PC1, PC2, centers=6, order=1)");
+    run_basis("duchon(PC1, PC2, centers=4, order=1)");
 }
