@@ -17251,6 +17251,288 @@ fn smooth_term_lr_inference_json(
     })
 }
 
+/// #1055 Riesz-representer debiased / Neyman-orthogonal estimate of a smooth
+/// functional of a fitted standard GAM model. Requires training `data` to
+/// compute per-row score contributions; eligible for Gaussian-identity and any
+/// model whose saved fit carries a dense penalized Hessian and weighted Gram.
+///
+/// `target_spec_json` is a JSON object with:
+/// * `"target"` — one of `"point"`, `"contrast"`, `"average_derivative"`,
+///   `"average_value"`, `"linear"`.
+/// * For `"point"` / `"linear"`: `"x0"` — the query row dict (same column
+///   names as training data); the design row at `x0` is evaluated from the
+///   saved model's design map.
+/// * For `"contrast"`: `"x0"` and `"x1"` — two query row dicts; the
+///   functional is `m(x0) − m(x1)`.
+/// * For `"average_derivative"` / `"average_value"`: uses the design matrix
+///   at the training data rows (already materialized from `headers`/`rows`).
+///   Optional `"weights"` key: list of per-row weights.
+///
+/// Returns `{"target", "theta_plugin", "theta_debiased", "se",
+/// "penalty_bias", "ci_lower", "ci_upper", "ci_level"}`.
+#[pyfunction]
+fn model_debiased_functional_json(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    target_spec_json: String,
+) -> PyResult<String> {
+    detach_py_result(py, "model_debiased_functional_json", move || {
+        model_debiased_functional_json_impl(&model_bytes, headers, rows, &target_spec_json)
+    })
+}
+
+fn model_debiased_functional_json_impl(
+    model_bytes: &[u8],
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    target_spec_json: &str,
+) -> Result<String, String> {
+    use gam::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
+
+    let model = load_model_impl(model_bytes)?;
+    let formula = model.payload().formula.clone();
+
+    // Only standard (non-survival, non-marginal-slope) models supported: they
+    // carry a dense penalized Hessian + weighted Gram + coefficient vector.
+    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
+        return Err(format!(
+            "debiased_functional: only standard GAM models are supported; got '{}'",
+            prediction_model_class_label(&model)
+        ));
+    }
+
+    let spec = model
+        .payload()
+        .resolved_termspec
+        .as_ref()
+        .ok_or_else(|| {
+            "debiased_functional: model is missing resolved_termspec; refit to enable".to_string()
+        })?
+        .clone();
+
+    let dataset = dataset_with_inferred_schema(headers, rows)?;
+    let (fit_config, _) = parse_fit_config(None)?;
+    let materialized =
+        materialize(&formula, &dataset, &fit_config).map_err(|e| format!("{e}"))?;
+    let standard = match materialized.request {
+        FitRequest::Standard(req) => req,
+        _ => {
+            return Err(
+                "debiased_functional: formula materialized to a non-standard fit path".to_string(),
+            );
+        }
+    };
+
+    // Rebuild the design from the saved termspec + training data so we get the
+    // same coefficient-space columns the fit used.
+    let design_built = build_term_collection_design(standard.data.view(), &spec)
+        .map_err(|e| format!("debiased_functional: design rebuild failed: {e}"))?;
+    let x = design_built
+        .design
+        .try_to_dense_arc("debiased_functional design")
+        .map_err(|e| format!("debiased_functional: design densification failed: {e}"))?;
+
+    // Recover fitted beta, H, and X'WX from the saved model.
+    let saved_fit =
+        gam::families::survival_predict::fit_result_from_saved_model_for_prediction(&model)
+            .map_err(|e| format!("debiased_functional: {e}"))?;
+    let h = saved_fit.penalized_hessian().ok_or_else(|| {
+        "debiased_functional: model does not carry a dense penalized Hessian; \
+         refit with a smaller basis (dense fits only)"
+            .to_string()
+    })?;
+    let xwx = saved_fit.weighted_gram().ok_or_else(|| {
+        "debiased_functional: model does not carry the weighted Gram X'WX; \
+         refit with a smaller basis (dense fits only)"
+            .to_string()
+    })?;
+    let beta = saved_fit.beta_flat();
+    if beta.len() != x.ncols() {
+        return Err(format!(
+            "debiased_functional: beta length {} does not match design width {}",
+            beta.len(),
+            x.ncols()
+        ));
+    }
+
+    // Penalty gradient S_lambda × beta = (H − X'WX) × beta.
+    let s_lambda = h.clone() - xwx.clone();
+    let penalty_beta = s_lambda.dot(&beta);
+
+    // Per-row score contributions ∂nll_i/∂β.
+    // For a Gaussian identity model: ∂nll_i/∂β = x_i · (η_i − y_i).
+    // Other families need their own derivative chain; currently restricted to
+    // Gaussian/identity where the score is exact and the debiasing is cleanest.
+    let y = standard.y.view();
+    let n = x.nrows();
+    let p = x.ncols();
+    let family = model.likelihood();
+    let is_gaussian_identity = matches!(family.response, ResponseFamily::Gaussian)
+        && matches!(family.link, InverseLink::Standard(StandardLink::Identity));
+    if !is_gaussian_identity {
+        return Err(format!(
+            "debiased_functional: currently only supported for Gaussian/identity models; \
+             this model uses family='{}'. Supply pre-computed row_scores via the low-level \
+             gamfit._rust.debiased_functional() call for other families.",
+            family.pretty_name()
+        ));
+    }
+    let eta = x.as_ref().dot(&beta);
+    let mut row_scores = ndarray::Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        let residual = eta[i] - y[i]; // ∂nll_i/∂η = η_i − y_i for Gaussian/identity
+        let x_row = x.row(i);
+        for j in 0..p {
+            row_scores[[i, j]] = x_row[j] * residual;
+        }
+    }
+
+    // Parse target spec.
+    let spec_val: serde_json::Value = serde_json::from_str(target_spec_json)
+        .map_err(|e| format!("debiased_functional: invalid target_spec_json: {e}"))?;
+    let target = spec_val
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "debiased_functional: target_spec_json must contain \"target\"".to_string())?;
+
+    // Build the functional gradient g = dθ/dβ from the spec.
+    let gradient: ndarray::Array1<f64> = match target {
+        "point" | "linear" => {
+            // Requires an "x0" row dict → evaluate the design at x0.
+            let x0_json = spec_val
+                .get("x0")
+                .ok_or_else(|| {
+                    format!("debiased_functional: target \"{target}\" requires \"x0\" in spec")
+                })?
+                .clone();
+            let query_headers: Vec<String> = x0_json
+                .as_object()
+                .ok_or_else(|| "debiased_functional: \"x0\" must be an object".to_string())?
+                .keys()
+                .cloned()
+                .collect();
+            let query_row: Vec<String> = query_headers
+                .iter()
+                .map(|k| {
+                    x0_json[k]
+                        .as_f64()
+                        .map(|v| format!("{v}"))
+                        .or_else(|| x0_json[k].as_str().map(|s| s.to_string()))
+                        .unwrap_or_default()
+                })
+                .collect();
+            let q_dataset = dataset_with_model_schema(&model, &query_headers, &[query_row])?;
+            let q_design = build_term_collection_design(q_dataset.values.view(), &spec)
+                .map_err(|e| format!("debiased_functional: x0 design failed: {e}"))?;
+            let qx = q_design
+                .design
+                .try_to_dense_arc("debiased_functional x0")
+                .map_err(|e| format!("debiased_functional: x0 densification failed: {e}"))?;
+            if qx.nrows() != 1 {
+                return Err("debiased_functional: x0 query produced != 1 design row".to_string());
+            }
+            qx.row(0).to_owned()
+        }
+        "contrast" => {
+            let get_row = |key: &str| -> Result<ndarray::Array1<f64>, String> {
+                let row_json = spec_val.get(key).ok_or_else(|| {
+                    format!("debiased_functional: target \"contrast\" requires \"{key}\" in spec")
+                })?;
+                let row_obj = row_json
+                    .as_object()
+                    .ok_or_else(|| format!("debiased_functional: \"{key}\" must be an object"))?;
+                let hdrs: Vec<String> = row_obj.keys().cloned().collect();
+                let vals: Vec<String> = hdrs
+                    .iter()
+                    .map(|k| {
+                        row_json[k]
+                            .as_f64()
+                            .map(|v| format!("{v}"))
+                            .or_else(|| row_json[k].as_str().map(|s| s.to_string()))
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let qd = dataset_with_model_schema(&model, &hdrs, &[vals])?;
+                let qdesign = build_term_collection_design(qd.values.view(), &spec)
+                    .map_err(|e| format!("debiased_functional: {key} design failed: {e}"))?;
+                let qx = qdesign
+                    .design
+                    .try_to_dense_arc(&format!("debiased_functional {key}"))
+                    .map_err(|e| format!("debiased_functional: {key} densification: {e}"))?;
+                Ok(qx.row(0).to_owned())
+            };
+            let row_a = get_row("x0")?;
+            let row_b = get_row("x1")?;
+            SmoothFunctional::Contrast {
+                design_row_a: row_a.view(),
+                design_row_b: row_b.view(),
+            }
+            .gradient()
+            .map_err(|e| format!("debiased_functional: contrast gradient: {e}"))?
+        }
+        "average_derivative" | "average_value" => {
+            // Uses the full training design; optional per-row weights from spec.
+            let weights: Option<ndarray::Array1<f64>> = spec_val
+                .get("weights")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|v| v.as_f64().unwrap_or(1.0))
+                        .collect::<Vec<_>>()
+                })
+                .map(ndarray::Array1::from);
+            let x_ref = x.as_ref();
+            if target == "average_value" {
+                SmoothFunctional::AverageValue {
+                    value_design: x_ref.view(),
+                    weights: weights.as_ref().map(|w| w.view()),
+                }
+                .gradient()
+                .map_err(|e| format!("debiased_functional: average_value gradient: {e}"))?
+            } else {
+                SmoothFunctional::AverageDerivative {
+                    derivative_design: x_ref.view(),
+                    weights: weights.as_ref().map(|w| w.view()),
+                }
+                .gradient()
+                .map_err(|e| format!("debiased_functional: average_derivative gradient: {e}"))?
+            }
+        }
+        other => {
+            return Err(format!(
+                "debiased_functional: unknown target {other:?}; expected one of \
+                 \"point\", \"contrast\", \"average_derivative\", \"average_value\", \"linear\""
+            ));
+        }
+    };
+
+    let input = RieszInput {
+        beta: beta.view(),
+        functional_gradient: gradient.view(),
+        row_scores: row_scores.view(),
+        penalty_beta: penalty_beta.view(),
+        leverage: None,
+    };
+    let report = debias_with_dense_hessian(&input, h.view())
+        .map_err(|e| format!("debiased_functional: Riesz engine error: {e}"))?;
+
+    let half_width = 1.959_963_984_540_054 * report.se;
+    let out = serde_json::json!({
+        "target": target,
+        "theta_plugin": report.theta_plugin,
+        "theta_debiased": report.theta_onestep,
+        "se": report.se,
+        "penalty_bias": report.penalty_bias,
+        "ci_lower": report.theta_onestep - half_width,
+        "ci_upper": report.theta_onestep + half_width,
+        "ci_level": 0.95_f64,
+    });
+    serde_json::to_string(&out)
+        .map_err(|e| format!("debiased_functional: serialization failed: {e}"))
+}
+
 #[pyfunction]
 fn summary_payload_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
     let payload = detach_py_result(py, "summary_payload_from_model", move || {
@@ -23677,6 +23959,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(curvature_inference_json, module)?)?;
     module.add_function(wrap_pyfunction!(smooth_term_lr_inference_json, module)?)?;
+    module.add_function(wrap_pyfunction!(model_debiased_functional_json, module)?)?;
     module.add_function(wrap_pyfunction!(summary_payload_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(smoothing_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(model_group_metadata, module)?)?;
