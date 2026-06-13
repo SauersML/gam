@@ -15117,6 +15117,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         const RESIDUAL_STALL_IMPROVEMENT_FACTOR: f64 = 0.9;
         const RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR: f64 = 50.0;
         let mut best_residual_seen: f64 = f64::INFINITY;
+        // Smallest *certified* stationarity residual the solve actually computed,
+        // tracked independently of `best_residual_seen` (whose updates are bound
+        // to the residual-stall counters at the post-step site below and so are
+        // skipped by every head-of-cycle / pre-line-search certificate exit). The
+        // terminal verdict reports THIS so a legitimate early-certificate exit
+        // (e.g. the cycle-0 pre-line-search KKT exit on intercept-only / already-
+        // stationary data) reports the finite residual it certified on instead of
+        // the sentinel `inf` — converged=true must never be paired with a non-
+        // finite residual in the log (#1040 inner-report truthfulness).
+        let mut min_certified_residual: f64 = f64::INFINITY;
         let mut cycles_since_residual_improved: usize = 0;
         // Number of consecutive non-improving cycles after which the
         // conditioning-based self-vanishing Levenberg–Marquardt damping is
@@ -15507,6 +15517,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &block_constraints,
                 Some(cached_active_sets.as_slice()),
             )?;
+            if current_kkt_norm.is_finite() {
+                min_certified_residual = min_certified_residual.min(current_kkt_norm);
+            }
             let pcg_rel_tol = joint_pcg_eisenstat_walker_forcing(prev_kkt_norm, current_kkt_norm);
 
             let solve_joint_constraints_dense = joint_constraints.is_some()
@@ -17142,6 +17155,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Record this cycle's KKT residual for the steady-geometric-descent
             // test at the certificate-refusal gate below (gam#787 centers≥20).
             if residual.is_finite() {
+                min_certified_residual = min_certified_residual.min(residual);
                 residual_descent_history.push_back(residual);
                 while residual_descent_history.len() > RESIDUAL_DESCENT_WINDOW {
                     residual_descent_history.pop_front();
@@ -18332,6 +18346,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // `per_block_resid` (which block stalls) and the existing TR line
             // (ρ gain-ratio + decision: model infidelity vs TR throttling), a
             // single RUST_LOG=info run separates all four #979 candidates.
+            //
+            // Report `min_certified_residual` (the smallest stationarity residual
+            // the solve actually computed) rather than the stall-tracker
+            // `best_residual_seen`: the latter is only written at the post-step
+            // residual site, so a head-of-cycle / pre-line-search certificate exit
+            // (cycle-0 KKT exit on already-stationary data) left it at the sentinel
+            // `inf` and the line read `converged=true … best_residual_inf=inf`, a
+            // self-contradicting status (#1040 inner-report truthfulness). A
+            // converged exit always certified on a finite residual ≤ tol, so the
+            // reported residual is finite whenever `converged` (every converged=true
+            // path is gated on a `≤ tol` check of a residual recorded above).
+            let reported_residual_below_tol = last_cycle_residual_below_tol
+                || (converged && min_certified_residual <= last_residual_tol);
             let verdict = format!(
                 "[PIRLS/joint-Newton terminal] converged={} terminator={} cycles={}/{} \
                  solve_wall={:.3}s best_residual_inf={:.3e} (tol={:.3e}) last_residual_below_tol={} \
@@ -18343,9 +18370,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 cycles_done,
                 inner_max_cycles,
                 inner_started.elapsed().as_secs_f64(),
-                best_residual_seen,
+                min_certified_residual,
                 last_residual_tol,
-                last_cycle_residual_below_tol,
+                reported_residual_below_tol,
                 last_cycle_obj_change_below_tol,
                 lastobjective,
             );
@@ -27542,7 +27569,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     .with_seed_inner_state(|outer: &mut CustomOuterState, beta: &Array1<f64>| {
         outer.seed_cached_beta(n_rho, specs, beta)
     });
-
 
     // ── Discriminating outer-gradient FD audit (issue #1040) ──
     //
