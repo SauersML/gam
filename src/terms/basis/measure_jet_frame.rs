@@ -31,7 +31,7 @@
 //!
 //! The prior is DIAGONAL by coordinates: the head is unpenalized, each level's
 //! innovations are an independent whitened block with prior variance `λ_ℓ⁻¹`
-//! (`= ε_ℓ^{2s}` up to the global amplitude — the RICH per-scale-candidate mode
+//! (`= ε_ℓ^{2s}` up to the global amplitude — the multiscale per-scale-candidate mode
 //! made structural). The whitened synthesis `S D^{1/2}` therefore has the frame
 //! ratio `A · J_s ≤ Σ_ℓ ε_ℓ^{−2s} ‖d_ℓ‖² ≤ B · J_s`; this module estimates
 //! `A`, `B` at runtime via a few power iterations on the whitened Gram (oracle

@@ -18226,7 +18226,54 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
-            obj_flat_streak.note(objective_change <= objective_tol);
+            // Scale-invariant objective-plateau exit (gam#1040). The flatness
+            // predicate is RELATIVE — `objective_tol = inner_tol·(1+|obj|)` —
+            // so it fires identically whether the survival NLL objective is
+            // O(1) or O(1e4); a fixed absolute ε never trips at the ~6e4
+            // magnitude of a marginal-slope survival fit. When the objective
+            // has been relative-flat for the full `FlatStreak` window the
+            // iterate has stopped moving in value. On a genuinely flat REML
+            // valley along the weakly-identified time-wiggle ρ the Newton
+            // step is tiny because the gradient is tiny (not because the
+            // trust region truncated it), so the `tr_clamped_during_stall`
+            // precondition of the residual-stall range-space certificate
+            // above is UNSATISFIED and that exit never fires — the loop used
+            // to grind to `inner_loop_hard_ceiling` every outer eval, which
+            // is the #1040 hang (outer REML rejects ρ after ρ for hours).
+            // The honest convergence statement is identical to the tr-clamped
+            // path: if the projected residual's component in range(H_pen) is
+            // at tolerance, the un-moved mass lives in ker(H_pen) — the free
+            // gauge directions the outer IFT pseudo-inverse projects out
+            // (gam#553) — and the iterate IS the REML optimum on the
+            // identifiable subspace. Report converged.
+            let plateau_verdict = obj_flat_streak.note(objective_change <= objective_tol);
+            if plateau_verdict == crate::solver::loop_guard::LoopVerdict::Plateaued
+                && all_block_stationarity_small
+                && let Some(range_residual) = projected_residual_range_space_inf(
+                    &projected_residual_vec,
+                    &joint_hessian_source,
+                    &ranges,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                    total_p,
+                )
+                && range_residual <= 4.0 * residual_tol
+            {
+                log::info!(
+                    "[JN-EXIT] cycle={cycle} reason=relative_objective_plateau (gam#1040): \
+                     |Δobjective|={objective_change:.3e} ≤ obj_tol={objective_tol:.3e} for {} \
+                     consecutive cycles (scale-invariant rel-flat streak); total projected \
+                     residual={residual:.3e} > tol={residual_tol:.3e} but its range-space \
+                     component={range_residual:.3e} ≤ 4×tol={:.3e} — the un-moved mass is a free \
+                     ker(H_pen) gauge direction the outer IFT projects out; accepting as stationary \
+                     on the identifiable subspace.",
+                    obj_flat_streak.streak(),
+                    4.0 * residual_tol,
+                );
+                converged = true;
+                break;
+            }
             // Carry the KKT-stationarity / objective-stagnation signals
             // into the next cycle so the line-search-failure path above
             // can recognise a true KKT optimum on a rank-deficient null

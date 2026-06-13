@@ -172,6 +172,7 @@ fn fit_options(max_iter: usize) -> FitOptions {
         sas_link: None,
         optimize_sas: false,
         compute_inference: true,
+        skip_rho_posterior_inference: false,
         max_iter,
         tol: 1e-5,
         nullspace_dims: vec![],

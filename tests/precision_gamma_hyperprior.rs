@@ -15,6 +15,7 @@ fn fit_options() -> FitOptions {
         sas_link: None,
         optimize_sas: false,
         compute_inference: false,
+        skip_rho_posterior_inference: false,
         max_iter: 160,
         tol: 1e-10,
         nullspace_dims: vec![],
