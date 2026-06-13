@@ -28,7 +28,7 @@ use gam::basis::{
     build_thin_plate_basis,
 };
 use gam::estimate::{AdaptiveRegularizationOptions, FitOptions};
-use gam::faer_ndarray::FaerCholesky;
+use gam::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
     build_term_collection_design,
