@@ -298,7 +298,10 @@ pub(crate) fn dominant_magnitude_bucket(message: &str) -> Option<MagnitudeBucket
 }
 
 pub(crate) fn generic_signature(failure: &InnerFailure) -> GenericFailureSignature {
-    (variant_tag(failure), dominant_magnitude_bucket(failure.message()))
+    (
+        variant_tag(failure),
+        dominant_magnitude_bucket(failure.message()),
+    )
 }
 
 /// `Some((signature, run_len))` when the LAST `min_run` rejections all carry
@@ -824,7 +827,11 @@ mod tests {
     fn generic_detector_keys_on_trailing_run() {
         let rejections = vec![
             // A one-off domain miss at an exploration seed.
-            SeedRejection::from_message(0, "validation", "likelihood evaluation failed: NaN".into()),
+            SeedRejection::from_message(
+                0,
+                "validation",
+                "likelihood evaluation failed: NaN".into(),
+            ),
             reml_nonpd(1, "-6e-11", "1.0e+03"),
             reml_nonpd(2, "-6e-11", "5.0e+03"),
             reml_nonpd(3, "-6e-11", "8.0e+03"),
