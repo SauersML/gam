@@ -483,6 +483,117 @@ fn tps_reml_fit_must_not_oversmooth_seed118_style_additive_signal() {
     );
 }
 
+/// **TEST F — high-d low-k thin-plate must not collapse onto the parametric block (gam#1091).**
+///
+/// The `geo_latlon_*_tp_k6` benchmark scenarios fit a 6-D thin-plate smooth
+/// (`thinplate(pc1..pc6, centers=6)`) on n≈767 binomial data. Canonical TPS in
+/// d=6 needs a degree-3 polynomial nullspace of size C(9,3)=84 ≫ 6 centers, so
+/// the builder auto-promotes to the hybrid Duchon spline. With the Matérn-style
+/// auto-init length_scale (`max_range / sqrt(n)`, here ≈ data_range/27.7 ≪ the
+/// center spacing) the high-order (s=4) hybrid partial-fraction coefficients —
+/// which scale as `length_scale^(2(p+s-n))` — underflow to machine epsilon, the
+/// constrained radial Gram collapses to ~1e-14 floating-point noise, and
+/// `positive_spectral_whitener_from_gram` rejects a rank-0 smooth.
+///
+/// This test reproduces that exact (d=6, k=6, tiny-length_scale) configuration
+/// and asserts the basis builds with **genuine wiggle capacity**: the smooth
+/// design, after centering out its column mean (the parametric trend the
+/// identifiability constraint removes), must retain singular directions well
+/// above floating-point noise. A pre-fix build errored at basis construction;
+/// a collapse-but-no-error build would leave a near-zero centered design.
+#[test]
+fn tps_high_d_low_k_must_not_collapse_onto_parametric_block() {
+    // d=6, n≈767, k=6 — the geo_latlon tp_k6 regime.
+    let d = 6usize;
+    let n = 767usize;
+    let centers = 6usize;
+    let mut rng = StdRng::seed_from_u64(0x10_91_7E57_BA51C04);
+    // Standardized-ish PC features: independent ~unit-SD columns, range ≈ 6.
+    let normal = Normal::new(0.0, 1.0).unwrap();
+    let mut x = Array2::<f64>::zeros((n, d));
+    for v in x.iter_mut() {
+        *v = normal.sample(&mut rng);
+    }
+
+    // Auto-init length_scale exactly as the planner derives it: max per-column
+    // range over sqrt(n). This is the tiny value that drove the collapse.
+    let max_range = (0..d)
+        .map(|c| {
+            let col = x.column(c);
+            let lo = col.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = col.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            hi - lo
+        })
+        .fold(0.0_f64, f64::max);
+    let auto_length_scale = (max_range / (n as f64).sqrt()).max(1e-6);
+
+    let spec = ThinPlateBasisSpec {
+        center_strategy: CenterStrategy::EqualMass {
+            num_centers: centers,
+        },
+        periodic: None,
+        length_scale: auto_length_scale,
+        double_penalty: false,
+        // Default identifiability — this is what routes through
+        // positive_spectral_whitener_from_gram, the exact site of the gam#1091
+        // ConstraintNullspaceCollapsed error.
+        identifiability: SpatialIdentifiability::OrthogonalToParametric,
+        radial_reparam: None,
+    };
+
+    // Pre-fix: this errored with ConstraintNullspaceCollapsed at
+    // positive_spectral_whitener_from_gram. Post-fix it must build.
+    let built = build_thin_plate_basis(x.view(), &spec).unwrap_or_else(|e| {
+        panic!(
+            "high-d low-k thin-plate (d={d}, k={centers}, length_scale={auto_length_scale:.3e}) \
+             failed to build — basis collapsed onto the parametric block (gam#1091): {e}"
+        )
+    });
+
+    let design = built.design.to_dense();
+    assert_eq!(design.nrows(), n);
+    assert!(
+        design.ncols() >= 2,
+        "promoted smooth design has too few columns ({}) to carry any wiggle",
+        design.ncols()
+    );
+
+    // Wiggle capacity: center every column (remove the parametric trend the
+    // identifiability transform projects out), then measure the spectrum of the
+    // centered Gram. A collapsed basis has max eigenvalue at floating-point
+    // noise (~1e-14); a real basis has O(n)-scale energy in several directions.
+    let mut centered = design.clone();
+    for c in 0..centered.ncols() {
+        let col = centered.column(c);
+        let mean = col.iter().sum::<f64>() / n as f64;
+        for i in 0..n {
+            centered[[i, c]] -= mean;
+        }
+    }
+    let gram = centered.t().dot(&centered);
+    let (eigs, _) = gram
+        .eigh(Side::Lower)
+        .expect("eigendecomposition of centered smooth Gram");
+    let max_eig = eigs.iter().cloned().fold(0.0_f64, f64::max);
+
+    assert!(
+        max_eig > 1e-6 * n as f64,
+        "promoted high-d low-k thin-plate basis has no wiggle capacity: centered Gram \
+         max eigenvalue {max_eig:.3e} ≪ O(n) — the radial block collapsed to noise (gam#1091)"
+    );
+
+    // At least two centered directions should carry real energy (beyond a single
+    // residual trend), confirming genuine multi-mode wiggle rather than a lone
+    // near-degenerate column.
+    let tol = 1e-9 * max_eig.max(1.0);
+    let live_dirs = eigs.iter().filter(|&&e| e > tol).count();
+    assert!(
+        live_dirs >= 2,
+        "promoted high-d low-k thin-plate basis has only {live_dirs} live centered \
+         direction(s); expected ≥2 wiggle modes (gam#1091)"
+    );
+}
+
 // Placeholder for "REML must find an interior optimum, not the upper boundary"
 // was removed: the empty `#[test]` body asserted nothing and was caught by the
 // build-time ban on assertion-less tests. Reintroduce with a real fit + bound

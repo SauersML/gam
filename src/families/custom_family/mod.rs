@@ -17061,6 +17061,68 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // range == whole space), so this branch is dormant and the strict
             // full-residual path above governs unchanged.
             //
+            // Newton-decrement convergence certificate (gam#1040 / gam#1088).
+            //
+            // The strict / identified-subspace / constrained certificates all
+            // gate on the penalized stationarity residual ‖∇L − Sβ‖∞ reaching
+            // `residual_tol`. On a weakly-identified (near-flat) carrying block
+            // — the survival marginal↔logslope alias, the binomial link-wiggle
+            // block, the gaussian/binomial location-scale μ block — that residual
+            // can stall ORDERS above tol (`g` is O(1e2) along a direction whose
+            // penalized curvature `γ` is tiny) while every step the trust region
+            // admits is clamped, so neither the residual nor the step-norm gate
+            // ever closes and the loop grinds to the cycle ceiling, the outer
+            // REML rejects ρ after ρ, and the fit times out (the #1040/#1088
+            // benchmark hangs). Yet the ACHIEVABLE objective improvement is
+            // `g²/(2γ)` — the Newton decrement — and on such a direction it is
+            // far below `objective_tol`: no step the local quadratic model can
+            // resolve lowers the penalized objective by more than `objective_tol`.
+            // By the Conn–Gould–Toint stopping criterion (*Trust-Region Methods*,
+            // Thm 6.4.6) the iterate is then the penalized optimum to within
+            // tolerance, on the entire identifiable subspace — the residual's
+            // un-resolvable mass lives on near-null directions the outer IFT
+            // pseudo-inverse projects out (gam#553). The decrement is read off
+            // the SAME D-whitened seed spectrum the step is built from (range
+            // modes only; the null space contributes none), so it is exactly the
+            // model decrease of the unconstrained modified-Newton step. A genuine
+            // defect (real curvature AND large gradient) yields a LARGE decrement,
+            // so this never certifies a non-converged iterate. Requiring the
+            // objective to also be flat (`objective_change ≤ objective_tol`)
+            // confirms we are AT the plateau, not one big step away from it.
+            if objective_change <= objective_tol
+                && let Some(decrement) =
+                    joint_spectrum.as_ref().map(|spectrum| spectrum.newton_decrement())
+                && decrement.is_finite()
+                && decrement <= objective_tol
+            {
+                log::info!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | Newton-decrement certificate (gam#1040/#1088): \
+                     residual={:.3e} (tol={:.3e}) stalled above tol on a weakly-identified block, but the \
+                     unconstrained modified-Newton step's predicted objective decrease (Newton decrement \
+                     ½gᵀH⁻¹g over identified modes)={:.3e} ≤ objective_tol={:.3e} and |Δobjective|={:.3e} ≤ {:.3e} \
+                     — no model-resolvable step lowers the penalized objective by more than tolerance, so the \
+                     iterate is the REML optimum on the identifiable subspace (Conn–Gould–Toint Thm 6.4.6); \
+                     the un-resolvable residual mass lies on near-null directions the outer IFT projects out.",
+                    cycle,
+                    residual,
+                    residual_tol,
+                    decrement,
+                    objective_tol,
+                    objective_change,
+                    objective_tol,
+                );
+                // Record the residual this exit certified on so the terminal
+                // line reports a finite certified residual (#1040 truthfulness):
+                // the converged status is earned by the decrement bound, and the
+                // finite stationarity residual at this iterate is the honest
+                // certificate witness.
+                if residual.is_finite() {
+                    min_certified_residual = min_certified_residual.min(residual);
+                }
+                converged = true;
+                break;
+            }
+
             // Unlike the constrained-stationary path below, this fires on a pure
             // identifiability null without requiring the `linearized_rel ≥ 0.5`
             // constraint-multiplier signature, which a structural rank-deficiency
