@@ -1473,7 +1473,19 @@ fn build_gaussian_mean_and_scale_blocks(
     // smooth penalty already governs. A full-space identity here over-shrinks
     // the genuine heteroscedastic curve back to a constant σ (#1073).
     let shrinkage = penalty_nullspace_projector(&log_sigma_penalty_matrices, p_noise);
-    let shrinkage_rank = (0..p_noise).filter(|&i| shrinkage[[i, i]] > 0.5).count();
+    // The rank of an orthogonal projector equals its trace (P = P² for a projector,
+    // so trace(P) = trace(P²) = ||P||_F² = sum of squared singular values = rank).
+    // The diagonal-threshold test `diag[i] > 0.5` used previously was wrong: for a
+    // rank-d projector onto a low-dimensional subspace (e.g. d=2 null directions of
+    // a TP spline with p=10 columns), each diagonal entry is O(d/p) << 0.5, so the
+    // threshold always returned 0 — misreporting the shrinkage penalty as having
+    // zero penalized dimensions. Trace-based rank is exact for a symmetric
+    // idempotent matrix (rounded to the nearest integer to absorb floating-point
+    // rounding in the eigendecomposition).
+    let shrinkage_rank = (0..p_noise)
+        .map(|i| shrinkage[[i, i]])
+        .sum::<f64>()
+        .round() as usize;
     log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(shrinkage));
     let mut log_sigma_nullspace_dims = noise_design.nullspace_dims.clone();
     // The null-space projector penalizes a rank-`shrinkage_rank` subspace, so

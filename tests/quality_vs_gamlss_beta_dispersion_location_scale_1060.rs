@@ -81,7 +81,10 @@ fn mu_true(x: f64) -> f64 {
     logistic(0.2 + 0.9 * x)
 }
 fn phi_true(x: f64) -> f64 {
-    (2.2 + 1.0 * x).exp()
+    // Moderate precision (~1.6 .. 8.1) with a clear monotone trend: enough
+    // dispersion-channel signal to recover, but well away from the (0,1)
+    // boundary so the gamlss BE() RS algorithm converges quickly and cleanly.
+    (1.3 + 0.8 * x).exp()
 }
 
 #[test]
