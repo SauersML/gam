@@ -3149,6 +3149,21 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .is_some_and(|t| t.contains_for_gradient(psi))
     }
 
+    /// True when a certified ψ-Gram tensor is installed AND `psi` lies inside its
+    /// full certified VALUE window — i.e. the n-free assembled Gaussian
+    /// sufficient statistics `XᵀWX(ψ)/XᵀWz(ψ)` reproduce the streamed Gram to the
+    /// certification tolerance. The caller uses this to skip the per-trial O(n·p)
+    /// design realization + conditioning entirely (#1033): when the value lane is
+    /// covered, `prepare_eval_state` installs the n-free `GaussianFixedCache`, so
+    /// the stale realized design is never read for its rows on the inner Gaussian
+    /// PLS fast path. Strictly narrower-or-equal callers also gate on
+    /// `psi_gram_tensor_covers_gradient` for the gradient channel.
+    pub(crate) fn psi_gram_tensor_covers(&self, psi: f64) -> bool {
+        self.psi_gram_tensor
+            .as_ref()
+            .is_some_and(|t| t.contains(psi))
+    }
+
     /// Install the n-free per-ψ Gaussian sufficient statistics from the certified
     /// ψ-Gram tensor (#1033b), when one is present and `theta`'s single ψ lies
     /// inside the certified window. Idempotent in ψ — must be called on EVERY
