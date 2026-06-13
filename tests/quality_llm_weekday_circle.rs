@@ -313,7 +313,26 @@ fn weekday_month_coeffs(interaction: f64) -> (Array2<f64>, Array2<f64>) {
 /// Fit + carve the weekday×month readout surface for a given planted
 /// interaction strength. Returns `(edge_p_value, interaction_fraction,
 /// fissions)`.
-fn carve_weekday_month(interaction: f64, noise: f64, seed: u64) -> (Option<f64>, f64, bool) {
+///
+/// `with_covariance` controls the carve channel, mirroring the two #975
+/// oracle paths exactly:
+///   * `false` (energy-only) — no posterior covariance is handed to the
+///     carve, so the fission decision rests on the interaction-energy dial
+///     alone (`fraction ≤ FISSION_MAX_INTERACTION_FRACTION`). This is the
+///     correct channel for the additive (superposition) verdict: a genuinely
+///     additive plant must fission, and only the energy path can certify
+///     "negligible" without a Wald test that would price in ridge/noise
+///     residue.
+///   * `true` — the scale-included posterior covariance + joint covariance
+///     are supplied, so the gauge-projected Wald binding test runs and
+///     `edge_p_value` is populated. This is the channel for the binding
+///     verdict: a jointly-planted interaction must reject the additive null.
+fn carve_weekday_month(
+    interaction: f64,
+    noise: f64,
+    with_covariance: bool,
+    seed: u64,
+) -> (Option<f64>, f64, bool) {
     let mut rng = SplitMix64::new(seed ^ 0xB1_D1_5E_u64);
     let (phi_a, phi_b) = bernstein_pair(N_GRID);
     let (c0, c1) = weekday_month_coeffs(interaction);
@@ -332,8 +351,8 @@ fn carve_weekday_month(interaction: f64, noise: f64, seed: u64) -> (Option<f64>,
         phi_a: phi_a.view(),
         phi_b: phi_b.view(),
         coeffs: &fit.coeffs,
-        coeff_covariance: Some(&fit.coeff_covariance),
-        joint_coeff_covariance: Some(&joint),
+        coeff_covariance: with_covariance.then_some(fit.coeff_covariance.as_slice()),
+        joint_coeff_covariance: with_covariance.then_some(&joint),
         kernel_a: None,
         kernel_b: None,
         edf: None,
@@ -353,25 +372,28 @@ fn carve_weekday_month(interaction: f64, noise: f64, seed: u64) -> (Option<f64>,
 fn weekday_is_bound_to_month_when_planted_jointly_and_fissions_when_additive() {
     // --- Superposition world: weekday + month act ADDITIVELY -------------
     // Near-noiseless additive samples carry negligible interaction energy:
-    // the carve must FISSION the pair into two independent atoms.
-    let (add_p, add_frac, add_fissions) = carve_weekday_month(0.0, 1e-4, 7);
+    // the carve must FISSION the pair into two independent atoms. Run on the
+    // energy-only channel (no covariance) — the fission certificate rests on
+    // the interaction-energy dial being below FISSION_MAX_INTERACTION_FRACTION
+    // (1e-6), the same channel the #975 additive-fission oracle uses.
+    let (_add_p, add_frac, add_fissions) = carve_weekday_month(0.0, 1e-5, false, 7);
     assert!(
         add_fissions,
-        "additive weekday+month surface must fission (interaction_fraction={:.4}, \
-         edge_p={:?})",
-        add_frac, add_p,
+        "additive weekday+month surface must fission (interaction_fraction={:.3e})",
+        add_frac,
     );
     assert!(
-        add_frac < 0.05,
-        "additive surface must carry negligible interaction energy, got {:.4}",
+        add_frac < 1e-6,
+        "additive surface must carry negligible interaction energy, got {:.3e}",
         add_frac,
     );
 
     // --- Binding world: weekday × month act JOINTLY ----------------------
     // A genuine rank-1 interaction on top of the additive part: the carve
     // must REFUSE to fission and the gauge-projected Wald binding test must
-    // REJECT — "weekday is bound to month".
-    let (bind_p, bind_frac, bind_fissions) = carve_weekday_month(2.0, 1e-3, 7);
+    // REJECT — "weekday is bound to month". Run on the covariance channel so
+    // the joint Wald test populates edge_p_value.
+    let (bind_p, bind_frac, bind_fissions) = carve_weekday_month(2.0, 1e-3, true, 7);
     let p = bind_p.expect("binding-world carve must run the joint Wald test");
     assert!(
         p < 1e-3,
