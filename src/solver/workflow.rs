@@ -4298,11 +4298,98 @@ pub struct MaterializedModel<'a> {
 }
 
 /// Parse, materialize, and fit a model in one call.
+/// Resolve the expectile asymmetry `τ` requested by `config`, if any.
+///
+/// Returns `Ok(Some(τ))` when `config.family` is `"expectile"` (optionally with
+/// an inline asymmetry, `"expectile(0.9)"`), `Ok(None)` for every other family,
+/// and `Err` when an expectile request carries an out-of-range `τ`. The inline
+/// form takes precedence over the explicit [`FitConfig::expectile_tau`] field
+/// only when both are present and disagree is rejected as a contradiction; when
+/// neither pins `τ`, the median expectile `τ = 0.5` (the ordinary mean fit) is
+/// the default.
+fn expectile_tau_for_config(config: &FitConfig) -> Result<Option<f64>, WorkflowError> {
+    let Some(raw) = config.family.as_deref() else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower == "expectile" || lower.starts_with("expectile(")) {
+        return Ok(None);
+    }
+    let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
+    // Optional inline asymmetry: `expectile(0.9)`.
+    let inline_tau = if let Some(rest) = lower.strip_prefix("expectile(") {
+        let inner = rest.strip_suffix(')').ok_or_else(|| {
+            invalid(format!(
+                "expectile family asymmetry must be written as `expectile(τ)`; got `{trimmed}`"
+            ))
+        })?;
+        let value: f64 = inner.trim().parse().map_err(|_| {
+            invalid(format!(
+                "expectile asymmetry `{}` is not a finite number",
+                inner.trim()
+            ))
+        })?;
+        Some(value)
+    } else {
+        None
+    };
+    let tau = match (inline_tau, config.expectile_tau) {
+        (Some(a), Some(b)) if (a - b).abs() > 0.0 => {
+            return Err(invalid(format!(
+                "expectile asymmetry given both inline (`expectile({a})`) and via expectile_tau \
+                 ({b}); supply exactly one"
+            )));
+        }
+        (Some(a), _) => a,
+        (None, Some(b)) => b,
+        (None, None) => 0.5,
+    };
+    if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
+        return Err(invalid(format!(
+            "expectile asymmetry τ must be finite and strictly in (0, 1); got {tau}"
+        )));
+    }
+    Ok(Some(tau))
+}
+
+/// Per-row asymmetric LAWS weight `wᵢ(τ) = τ` if `yᵢ > μᵢ` else `1 − τ`, scaled
+/// by the base prior weight. At the boundary `yᵢ = μᵢ` the two half-weights
+/// agree in the limit only at `τ = 0.5`; the convention `yᵢ > μᵢ ⇒ τ` (strict)
+/// matches Newey–Powell's lower-closed asymmetric loss and is what `expectreg`
+/// uses. The fixed point is independent of the tie convention because ties form
+/// a measure-zero set under any continuous response.
+fn expectile_row_weights(
+    y: ArrayView1<f64>,
+    mu: ArrayView1<f64>,
+    base: ArrayView1<f64>,
+    tau: f64,
+) -> Array1<f64> {
+    Array1::from_shape_fn(y.len(), |i| {
+        let asym = if y[i] > mu[i] { tau } else { 1.0 - tau };
+        base[i] * asym
+    })
+}
+
 pub fn fit_from_formula(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
 ) -> Result<FitResult, WorkflowError> {
+    // Expectile regression (Newey–Powell asymmetric least squares): when the
+    // family resolves to "expectile", the τ-expectile of `y | x` is the
+    // minimizer of `Σ wᵢ(τ)·(yᵢ − μᵢ)²`, `wᵢ(τ) = τ` if `yᵢ > μᵢ` else `1 − τ`
+    // — the smooth analogue of the τ-quantile. The minimizer is a Least
+    // Asymmetrically Weighted Squares (LAWS) fixed point: iterate the penalized
+    // Gaussian-identity GAM with `wᵢ(τ)` recomputed from the current `μᵢ` until
+    // the residual-sign pattern stabilizes. REML λ-selection runs inside each
+    // inner Gaussian solve, so every gam smooth/tensor/spatial basis becomes a
+    // penalized expectile smooth with data-driven smoothing for free. This is a
+    // genuine estimator route, not a silent swap: it fires only on the explicit
+    // `family = "expectile"`. Every other family falls through unchanged.
+    if let Some(tau) = expectile_tau_for_config(config)? {
+        return fit_expectile_laws(formula, data, config, tau);
+    }
     let mat = materialize(formula, data, config)?;
     // Exact O(n) spline-scan fast path (#1030): when the materialized request
     // is the single 1-D Gaussian-identity penalized-smooth shape the
@@ -4353,6 +4440,159 @@ pub fn fit_from_formula(
     // `fit_model` already returns `WorkflowError` end-to-end; propagate it
     // directly instead of stringifying then re-wrapping.
     fit_model(mat.request)
+}
+
+/// Least Asymmetrically Weighted Squares (LAWS) driver for expectile GAMs.
+///
+/// The τ-expectile surface minimizes `Σ wᵢ(τ)·(yᵢ − μᵢ)²` with the residual-
+/// sign asymmetric weight `wᵢ(τ)`. Because that weight is piecewise-constant in
+/// `sign(yᵢ − μᵢ)`, the objective is the supremum of a finite family of
+/// weighted least-squares problems and its minimizer is the unique fixed point
+/// of: *solve the penalized WLS with weights frozen at the current sign
+/// pattern, then recompute the sign pattern from the new fit*. The asymmetric
+/// loss is strictly convex (weights bounded in `[min(τ,1−τ), max(τ,1−τ)] > 0`),
+/// so this monotone-descent iteration converges, and since the sign pattern
+/// takes finitely many values it stabilizes in finitely many steps (Schnabel &
+/// Eilers 2009; the same Newton/IRLS-for-expectiles `expectreg` runs).
+///
+/// Each inner solve is the FULL standard Gaussian-identity GAM: any basis,
+/// tensor, spatial smooth, by-variable, random effect, plus REML λ-selection on
+/// the current asymmetric weights. The returned fit is an ordinary
+/// [`FitResult::Standard`] whose coefficients ARE the penalized τ-expectile —
+/// every downstream consumer (predict, posterior bands, persistence) works
+/// unchanged. The reported scale is the asymmetric working variance, so
+/// expectile standard errors are the sandwich-free Gaussian-form bands of the
+/// converged weighted problem (a deliberate first-rung choice; see #1100).
+fn fit_expectile_laws(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+    tau: f64,
+) -> Result<FitResult, WorkflowError> {
+    use crate::linalg::matrix::LinearOperator;
+
+    // Inner fits are ordinary Gaussian-identity GAMs; the τ asymmetry lives
+    // entirely in the per-iteration prior weights this driver injects.
+    let gaussian_config = FitConfig {
+        family: Some("gaussian".to_string()),
+        link: Some("identity".to_string()),
+        expectile_tau: None,
+        ..config.clone()
+    };
+
+    // Materialize once to capture the fixed training design, response, offset,
+    // and base prior weights. The design (basis, penalties, identifiability
+    // transforms) does not depend on the prior weights, so it is reused across
+    // every LAWS iteration; only the weight vector and the resulting β change.
+    let base_mat = materialize(formula, data, &gaussian_config)?;
+    let FitRequest::Standard(base_request) = base_mat.request else {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "expectile regression is only defined for standard (non-survival, \
+                     non-location-scale) responses"
+                .to_string(),
+        });
+    };
+    let StandardFitRequest {
+        data: design_data,
+        y,
+        weights: base_weights,
+        offset,
+        spec,
+        family: materialized_family,
+        options,
+        kappa_options,
+        wiggle,
+        coefficient_groups,
+        penalty_block_gamma_priors,
+        latent_coord,
+        _marker,
+    } = base_request;
+    // The materializer already resolved the inner family to Gaussian-identity
+    // from `gaussian_config`; assert it so a future materializer change that
+    // silently picked a different family for `"gaussian"` is caught here rather
+    // than producing a non-expectile fit.
+    if !materialized_family.is_gaussian_identity() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "expectile LAWS requires a Gaussian-identity inner family; materializer produced {}",
+                materialized_family.name()
+            ),
+        });
+    }
+
+    if wiggle.is_some() || latent_coord.is_some() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "expectile regression does not support flexible-link wiggle or latent \
+                     coordinates"
+                .to_string(),
+        });
+    }
+
+    let n = y.len();
+    let gaussian_family = LikelihoodSpec::gaussian_identity();
+    // Cold start: τ = 0.5 (symmetric) weights ⇒ the first inner fit is the OLS
+    // mean GAM, the natural warm start for any τ.
+    let mut weights = base_weights.clone();
+    let mut last_sign: Option<Vec<bool>> = None;
+    let mut last_result: Option<StandardFitResult> = None;
+
+    // The sign pattern has 2ⁿ values but LAWS visits a monotone-descent subset;
+    // empirically a handful of iterations suffice. The cap is a safety guard:
+    // on the rare oscillation between two equal-objective sign patterns (only
+    // possible when rows sit exactly on the fitted surface) the last fit is a
+    // valid τ-expectile of the perturbation-stable problem, so returning it is
+    // correct rather than an error.
+    const MAX_LAWS_ITERS: usize = 50;
+
+    for _iter in 0..MAX_LAWS_ITERS {
+        let request = StandardFitRequest {
+            data: design_data.clone(),
+            y: y.clone(),
+            weights: weights.clone(),
+            offset: offset.clone(),
+            spec: spec.clone(),
+            family: gaussian_family.clone(),
+            options: options.clone(),
+            kappa_options: kappa_options.clone(),
+            wiggle: None,
+            coefficient_groups: coefficient_groups.clone(),
+            penalty_block_gamma_priors: penalty_block_gamma_priors.clone(),
+            latent_coord: None,
+            _marker,
+        };
+        let result = fit_standard_model(request)
+            .map_err(|reason| WorkflowError::IntegrationFailed { reason })?;
+
+        // Training-scale fitted mean μ = X·β (identity link, zero-checked
+        // offset folded by the design path). The design columns match the
+        // combined coefficient vector exactly (the same contract `predict`
+        // and the safety tests rely on).
+        let mu = result.design.design.apply(&result.fit.beta);
+        if mu.len() != n {
+            return Err(WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "expectile LAWS: fitted mean length {} disagrees with response length {n}",
+                    mu.len()
+                ),
+            });
+        }
+        let mut mu_off = mu;
+        mu_off += &offset;
+
+        let sign: Vec<bool> = (0..n).map(|i| y[i] > mu_off[i]).collect();
+        let converged = last_sign.as_ref().is_some_and(|prev| prev == &sign);
+        weights = expectile_row_weights(y.view(), mu_off.view(), base_weights.view(), tau);
+        last_sign = Some(sign);
+        last_result = Some(result);
+        if converged {
+            break;
+        }
+    }
+
+    let result = last_result.ok_or_else(|| WorkflowError::IntegrationFailed {
+        reason: "expectile LAWS produced no fit".to_string(),
+    })?;
+    Ok(FitResult::Standard(result))
 }
 
 /// Inputs extracted by [`spline_scan_fast_path`] for the exact O(n)
