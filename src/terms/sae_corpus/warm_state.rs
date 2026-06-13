@@ -155,6 +155,10 @@ pub trait RowWarmCache {
 
 /// A bounded in-process LRU node.
 struct LruEntry {
+    /// The canonical row id this entry belongs to; used to detect the (rare)
+    /// u64-key collision so a colliding lookup falls through to the disk tier
+    /// rather than returning a wrong-row seed.
+    row_id: u64,
     state: RowWarmState,
     /// Monotonic stamp for LRU ordering (highest = most recently used).
     stamp: u64,
@@ -244,13 +248,21 @@ impl DiskRowWarmCache {
 impl RowWarmCache for DiskRowWarmCache {
     fn get(&mut self, row_id: u64) -> Option<RowWarmState> {
         let key = self.lru_key(row_id);
-        // Hot path: in-process LRU. Bump the recency stamp on hit.
+        // Hot path: in-process LRU. Guard against the (rare) u64-key collision
+        // by checking the stored row_id; a collision falls through to the disk
+        // tier which always re-checks the full Fingerprint.
         if let Some(entry) = self.lru.get_mut(&key) {
-            self.stamp += 1;
-            entry.stamp = self.stamp;
-            return Some(entry.state.clone());
+            if entry.row_id == row_id {
+                self.stamp += 1;
+                entry.stamp = self.stamp;
+                return Some(entry.state.clone());
+            }
+            // Collision: drop through to disk.
         }
-        // Cold path: disk tier. Decode, then promote into the LRU.
+        // Cold path: disk tier. Decode, then promote into the LRU (overwriting
+        // any colliding entry; the evicted entry's row_id diverges from key so
+        // a subsequent get for the displaced row will also fall through to disk
+        // — correct, just slower).
         let store = self.store.as_ref()?;
         let fp = self.row_fingerprint(row_id);
         let cached = store.lookup(&fp).ok().flatten()?;
@@ -259,6 +271,7 @@ impl RowWarmCache for DiskRowWarmCache {
         self.lru.insert(
             key,
             LruEntry {
+                row_id,
                 state: state.clone(),
                 stamp: self.stamp,
             },
@@ -273,6 +286,7 @@ impl RowWarmCache for DiskRowWarmCache {
         self.lru.insert(
             key,
             LruEntry {
+                row_id,
                 state: state.clone(),
                 stamp: self.stamp,
             },
@@ -299,16 +313,19 @@ impl RowWarmCache for DiskRowWarmCache {
 }
 
 /// Reduce a 32-byte [`Fingerprint`] to a `u64` LRU bucket key by folding its
-/// hex digest's leading bytes. Collisions in the `u64` space are harmless: the
+/// raw leading bytes. Collisions in the `u64` space are harmless: the
 /// disk tier always re-checks the full `Fingerprint`, and an LRU bucket
 /// collision only risks a spurious in-process miss (then a correct disk hit),
 /// never a wrong-row seed.
 fn fingerprint_to_u64(fp: &Fingerprint) -> u64 {
-    let hex = fp.to_hex();
-    let bytes = hex.as_bytes();
+    // Take the first 8 raw bytes of the 32-byte fingerprint and assemble them
+    // into a u64. Using raw bytes (not the hex-string ASCII representation)
+    // gives full 8-bit entropy per lane rather than the biased 4-bit range
+    // that hex ASCII digits occupy (0x30-0x39, 0x61-0x66).
+    let bytes = fp.as_bytes();
     let mut acc = 0u64;
-    for &b in bytes.iter().take(16) {
-        acc = acc.wrapping_shl(4) ^ u64::from(b);
+    for &b in bytes.iter().take(8) {
+        acc = acc.wrapping_shl(8) ^ u64::from(b);
     }
     // Mix so adjacent row ids (which share a long key prefix) spread across
     // buckets. Reuses the canonical splitmix64 finalizer.

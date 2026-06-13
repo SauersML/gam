@@ -81,8 +81,15 @@ impl LedgerStore {
         Self::from_fingerprint(fp.finalize())
     }
 
-    /// Bind by a precomputed structural hash (callers that already carry
-    /// the warm-state hash and have no spec in scope).
+    /// Bind by a precomputed structural hash where `structural_hash` is the
+    /// raw value produced by hashing only [`TermCollectionSpec::write_structural_shape_hash`]
+    /// into a [`Fingerprinter`] and reducing to `u64` — NOT the `structural_hash`
+    /// field of [`super::warm_state::DiskRowWarmCache`], which folds an additional
+    /// namespace prefix (`"sae-corpus-row-warm-state-v1"`) before calling
+    /// `write_structural_shape_hash` and therefore produces a different value.
+    /// Passing the warm-cache's field here will silently bind a different key
+    /// than [`Self::new`] and cause a ledger miss / fresh-start on every load.
+    /// Prefer [`Self::new`] whenever a [`TermCollectionSpec`] is in scope.
     pub fn from_structural_hash(structural_hash: u64) -> Self {
         let mut fp = Fingerprinter::new();
         fp.write_str("sae-structure-ledger-key-v1");
