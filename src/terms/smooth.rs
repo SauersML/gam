@@ -17886,7 +17886,7 @@ fn run_exact_joint_spatial_optimization(
                 let order = if matches!(mode, EvalMode::ValueGradientHessian) {
                     OuterEvalOrder::ValueGradientHessian
                 } else {
-                    OuterEvalOrder::ValueOnly
+                    OuterEvalOrder::Value
                 };
                 ctx.eval_full(theta, order, analytic_outer_hessian_available)
                     .map_err(|e| format!("fd-audit eval_full: {e}"))
