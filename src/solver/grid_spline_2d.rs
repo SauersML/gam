@@ -1106,9 +1106,20 @@ mod tests {
     #[test]
     fn grid_spline_2d_state_rejects_corruption() {
         let k = 6usize;
-        let n = 18usize;
-        let x1: Vec<f64> = (0..n).map(|i| i as f64 / (n - 1) as f64).collect();
-        let x2: Vec<f64> = (0..n).map(|i| (i as f64 * 0.37).fract()).collect();
+        // A dense grid with n > p = (k+3)² so the fit is well-posed: this test
+        // exercises `from_state` corruption rejection, not the small-n regime,
+        // so the fit must succeed first (n=18 ≪ p=81 left the penalized design
+        // rank-deficient and `fit_grid_spline_2d` refused before any assertion).
+        let side = 12usize;
+        let mut x1 = Vec::new();
+        let mut x2 = Vec::new();
+        for i in 0..side {
+            for j in 0..side {
+                x1.push(i as f64 / (side - 1) as f64);
+                x2.push(j as f64 / (side - 1) as f64);
+            }
+        }
+        let n = x1.len();
         let y: Vec<f64> = x1.iter().zip(&x2).map(|(&a, &b)| a + b).collect();
         let w = vec![1.0_f64; n];
         let fit = fit_grid_spline_2d(&x1, &x2, &y, &w, k, [1.0, 1.0]).expect("fit");
