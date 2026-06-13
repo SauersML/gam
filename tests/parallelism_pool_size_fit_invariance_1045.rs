@@ -167,16 +167,27 @@ fn fit_on_pool(
     data: &Array2<f64>,
     spec: &BernoulliMarginalSlopeTermSpec,
 ) -> FitDigest {
+    // Match faer's backend to the scoped pool too. `faer::Par::rayon(0)`
+    // resolves to `current_num_threads()` *at the call site*, so it must be set
+    // here (inside the install scope below would still read the global default
+    // captured at `set_global_parallelism` time). The two fits run
+    // sequentially, so mutating the global faer parallelism per fit is safe.
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .unwrap_or_else(|e| panic!("failed to build {threads}-thread pool: {e}"));
-    pool.install(|| fit_once(data, spec))
+    pool.install(|| {
+        faer::set_global_parallelism(faer::Par::rayon(threads));
+        fit_once(data, spec)
+    })
 }
 
 #[test]
 fn bms_matern_fit_is_invariant_to_worker_pool_size() {
-    gam::init_parallelism();
+    // NB: deliberately do NOT call `gam::init_parallelism()` here — it would
+    // freeze faer at `Par::rayon(current_num_threads())` (the global pool size)
+    // before the per-pool `set_global_parallelism` calls below, defeating the
+    // narrow-pool arm. Each `fit_on_pool` sets faer to match its scoped pool.
     let n = 1200;
     let centers = 4;
     let (data, spec) = build(n, centers);
