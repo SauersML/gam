@@ -23,6 +23,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+use crate::geometry::constant_curvature::ConstantCurvature;
 use crate::geometry::manifold::RiemannianManifold;
 use crate::geometry::{GeometryResult, GrassmannManifold, SpdManifold, StiefelManifold};
 
@@ -62,6 +63,13 @@ pub enum ResponseManifold {
     Stiefel { k: usize, n: usize },
     /// The Poincaré ball of dimension `d` with curvature `κ < 0`.
     Poincare { dim: usize, curvature: f64 },
+    /// Constant-curvature manifold `M_κ` of dimension `d` with curvature `κ`
+    /// (any finite real value). `κ > 0` → spherical, `κ = 0` → flat (Euclidean
+    /// up to scale), `κ < 0` → hyperbolic (Poincaré ball). Unlike `Poincare`,
+    /// which fixes `κ < 0`, this variant accepts any curvature including zero
+    /// and positive values, and is the target for curvature-as-estimand fits
+    /// where `κ̂` is optimized over all of ℝ (#1104).
+    ConstantCurvature { dim: usize, kappa: f64 },
 }
 
 impl ResponseManifold {
@@ -119,9 +127,29 @@ impl ResponseManifold {
                 }
                 Ok(Self::Poincare { dim, curvature })
             }
+            "constant_curvature" => {
+                let dim = dim.ok_or_else(|| {
+                    "response_geometry='constant_curvature' requires dim".to_string()
+                })?;
+                if dim == 0 {
+                    return Err(
+                        "response_geometry='constant_curvature' requires dim >= 1".to_string()
+                    );
+                }
+                // curvature defaults to 0 (flat) when not supplied — the user can
+                // supply any finite value; the κ-estimand outer loop will optimize it.
+                let kappa = curvature.unwrap_or(0.0);
+                if !kappa.is_finite() {
+                    return Err(
+                        "response_geometry='constant_curvature' requires finite curvature"
+                            .to_string(),
+                    );
+                }
+                Ok(Self::ConstantCurvature { dim, kappa })
+            }
             other => Err(format!(
                 "response_geometry must be one of 'spd', 'grassmann', 'stiefel', 'poincare', \
-                 'spherical', or 'simplex'; got {other:?}"
+                 'constant_curvature', 'spherical', or 'simplex'; got {other:?}"
             )),
         }
     }
@@ -216,9 +244,15 @@ impl ResponseManifold {
                 let curvature = get_f64("curvature")?.unwrap_or(-1.0);
                 Self::resolve("poincare", None, None, Some(dim), Some(curvature))
             }
+            "constant_curvature" => {
+                let dim = get_usize("dim")?.unwrap_or(cols);
+                // κ defaults to 0 (flat initial point for the REML optimizer).
+                let kappa = get_f64("kappa")?.or_else(|| get_f64("curvature").ok().flatten()).unwrap_or(0.0);
+                Self::resolve("constant_curvature", None, None, Some(dim), Some(kappa))
+            }
             other => Err(format!(
                 "response_geometry must be one of 'spd', 'grassmann(k=..)', 'stiefel(k=..)', \
-                 'poincare', 'spherical', or 'simplex'; got {other:?}"
+                 'poincare', 'constant_curvature', 'spherical', or 'simplex'; got {other:?}"
             )),
         }
     }
