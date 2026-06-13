@@ -329,7 +329,8 @@ fn riesz_functional_gradient(
         "average_derivative" => {
             let rows = design_matrix.ok_or_else(|| {
                 py_value_error(
-                    "debiased_functional: target \"average_derivative\" requires `design_matrix`",
+                    "debiased_functional: target \"average_derivative\" requires `design_matrix`"
+                        .to_string(),
                 )
             })?;
             SmoothFunctional::AverageDerivative {
@@ -340,7 +341,8 @@ fn riesz_functional_gradient(
         "average_value" => {
             let rows = design_matrix.ok_or_else(|| {
                 py_value_error(
-                    "debiased_functional: target \"average_value\" requires `design_matrix`",
+                    "debiased_functional: target \"average_value\" requires `design_matrix`"
+                        .to_string(),
                 )
             })?;
             SmoothFunctional::AverageValue {
