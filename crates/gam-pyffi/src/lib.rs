@@ -25924,6 +25924,19 @@ fn design_matrix_dense(
     model: &FittedModel,
     dataset: EncodedDataset,
 ) -> Result<Array2<f64>, String> {
+    // A scan-routed model never materializes a dense B-spline design — the
+    // exact O(n) state-space smoother is the whole point — so there is no model
+    // matrix to export. Replace the cryptic "missing resolved_termspec" error
+    // with a precise, actionable one (#1046).
+    if let Some(scan) = scan_introspection(model)? {
+        return Err(format!(
+            "{} is fit by the exact O(n) state-space spline scan, which does not \
+             build a dense design matrix; design_matrix() is unavailable for it. \
+             Refit with double_penalty=true if you need the explicit B-spline \
+             model matrix.",
+            scan_smooth_label(&scan)
+        ));
+    }
     if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
         return Err(format!(
             "design_matrix currently supports only standard GAM models; got '{}'. \
@@ -26714,6 +26727,26 @@ fn coefficient_provenance_for_state(
 
 fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
+    // A scan-routed model has no dense coefficient covariance to export: the
+    // exact O(n) smoother keeps only the per-knot posterior, and its natural
+    // parameter count is ~n, so the dense Gram this payload carries is both
+    // unavailable and (at O(n²)) antithetical to the representation. The
+    // cross-fit precision-group workflow that consumes this is the dense path;
+    // surface a precise, actionable error instead of the cryptic
+    // missing-fit_result one (#1046). Introspection that does NOT need the dense
+    // covariance — summary(), smoothing_parameters(), evidence(), term_blocks()
+    // — is served directly from the scan state.
+    if let Some(scan) = scan_introspection(&model)? {
+        return Err(format!(
+            "{} is fit by the exact O(n) state-space spline scan, which retains \
+             the per-knot posterior rather than a dense coefficient covariance; \
+             the dense coefficient state is unavailable. Use summary(), \
+             smoothing_parameters(), evidence(), or term_blocks() for this \
+             model's fitted quantities, or refit with double_penalty=true to \
+             obtain a dense coefficient state.",
+            scan_smooth_label(&scan)
+        ));
+    }
     let payload = model.payload();
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     let cov = fit
@@ -26755,6 +26788,23 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
 fn term_blocks_for_model_impl(
     model_bytes: &[u8],
 ) -> Result<Vec<(String, String, usize, usize)>, String> {
+    // A scan-routed model has a single smooth term occupying the smoother's
+    // entire coefficient space (its per-knot function values). Report that one
+    // contiguous block directly — without round-tripping through
+    // `coefficient_state_json_impl`, which a scan model cannot satisfy (it keeps
+    // no dense coefficient covariance) and which would be O(n²) even if it
+    // could (#1046).
+    {
+        let model = load_model_impl(model_bytes)?;
+        if let Some(scan) = scan_introspection(&model)? {
+            return Ok(vec![(
+                scan_smooth_label(&scan),
+                "smooth".to_string(),
+                0,
+                scan.n_knots,
+            )]);
+        }
+    }
     let state_json = coefficient_state_json_impl(model_bytes)?;
     let payload: TermBlocksPayload = serde_json::from_str(&state_json)
         .map_err(|err| format!("failed to parse coefficient state json: {err}"))?;
@@ -27733,8 +27783,114 @@ fn summary_smooth_terms(
     out
 }
 
+/// Canonical fitted quantities reconstructed from a spline-scan model's saved
+/// `SplineScanFit` (#1046).
+///
+/// A scan-routed model (the single-1-D-smooth, Gaussian-identity shape that
+/// `spline_scan_fast_path` diverts to the exact O(n) state-space smoother)
+/// carries **no dense `fit_result`** — by design the smoother keeps only the
+/// per-knot posterior, never a dense design/Gram. So the FFI summary surface
+/// reconstructs exactly what the smoother retained: the selected smoothing
+/// parameter, the effective d.o.f. (tr S), the diffuse REML score, the profiled
+/// scale, and the recovered deviance. This mirrors the numbers the CLI fit log
+/// already prints from the same state.
+///
+/// The dense per-coefficient β / covariance is deliberately NOT materialized:
+/// the smoother's natural parameters are the per-knot function values, of which
+/// there are ~`n` (the scan exists precisely to avoid an O(n) design and an
+/// O(n²) covariance). The summary therefore reports the model the way
+/// `summary.gam` does — a parametric block (empty here; the smoother absorbs the
+/// polynomial null space into the smooth) plus a smooth-terms table keyed on EDF
+/// — rather than dumping ~`n` basis coefficients.
+struct ScanIntrospection {
+    feature_column: String,
+    /// Effective degrees of freedom (tr S), strictly between the polynomial
+    /// null-space dimension `order` and `n`.
+    edf: f64,
+    /// Selected smoothing parameter `λ` (always positive).
+    lambda: f64,
+    /// Diffuse REML expressed as a COST (lower is better): the negative
+    /// restricted log marginal likelihood, up to a λ-free additive constant.
+    /// On the same sign convention as the dense `reml_score`; the dropped
+    /// constant means cross-comparison with a *dense* fit is approximate, while
+    /// scan-vs-scan comparison is exact.
+    reml_cost: f64,
+    /// Gaussian deviance — the weighted residual sum of squares.
+    deviance: f64,
+    /// Number of pooled knots (the smoother's natural coefficient count).
+    n_knots: usize,
+}
+
+/// Reconstruct the canonical fitted quantities for a spline-scan model, or
+/// `Ok(None)` for a dense model that should follow the standard `fit_result`
+/// path (#1046).
+fn scan_introspection(model: &FittedModel) -> Result<Option<ScanIntrospection>, String> {
+    let Some((feature_column, fit)) = model.saved_spline_scan().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    Ok(Some(ScanIntrospection {
+        feature_column: feature_column.to_string(),
+        edf: fit.edf(),
+        lambda: fit.lambda(),
+        reml_cost: -fit.restricted_loglik,
+        deviance: fit.deviance(),
+        n_knots: fit.knots.len(),
+    }))
+}
+
+/// Display label for the single smooth a scan model carries, e.g. `s(x)`.
+fn scan_smooth_label(scan: &ScanIntrospection) -> String {
+    format!("s({})", scan.feature_column)
+}
+
+/// Build the canonical FFI summary payload for a scan-routed model (#1046):
+/// scalar fitted quantities plus a one-row smooth table keyed on EDF. The
+/// parametric coefficient block is empty (the smoother absorbs the polynomial
+/// null space) and no dense covariance is emitted — keeping `summary()` O(1) in
+/// `n` regardless of how many knots the smoother spans.
+fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> SummaryPayload {
+    let smooth_terms = vec![SummarySmoothTermRow {
+        name: scan_smooth_label(scan),
+        edf: scan.edf,
+        ref_df: scan.edf,
+        // The rank-truncated Wald smooth test needs the joint coefficient
+        // covariance, which the O(n) smoother does not retain; report EDF only,
+        // as `summary.gam` does for terms whose Wald test is unavailable.
+        chi_sq: None,
+        p_value: None,
+    }];
+    SummaryPayload {
+        formula: model.payload().formula.clone(),
+        family_name: model.likelihood().pretty_name().to_string(),
+        model_class: prediction_model_class_label(model),
+        group_metadata: model.payload().group_metadata.clone(),
+        deployment_extensions: model.payload().deployment_extensions.clone(),
+        deviance: scan.deviance,
+        // null_dim is left unset: the scan does not compute the penalized-Hessian
+        // null-space logdet the TK normalizer needs, so `comparable_reml_score`
+        // returns the raw cost unchanged (and `evidence()` stays well-defined).
+        reml_score: scan.reml_cost,
+        raw_reml_score: scan.reml_cost,
+        null_space_logdet: None,
+        null_dim: None,
+        iterations: 0,
+        edf_total: Some(scan.edf),
+        lambdas: vec![scan.lambda],
+        coefficients: Vec::new(),
+        smooth_terms,
+        covariance_kind: None,
+        covariance_n: None,
+        covariance_flat: None,
+    }
+}
+
 fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
+    if let Some(scan) = scan_introspection(&model)? {
+        let payload = scan_summary_payload(&model, &scan);
+        return serde_json::to_string(&payload)
+            .map_err(|err| format!("failed to serialize summary: {err}"));
+    }
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     let smooth_terms = summary_smooth_terms(&model, &fit);
     let standard_errors = fit
@@ -27797,8 +27953,55 @@ fn check_json_impl(
     serde_json::to_string(&check).map_err(|err| format!("failed to serialize schema check: {err}"))
 }
 
+/// Render the HTML report for a scan-routed model (#1046) from its
+/// reconstructed scalar quantities and the single smooth's EDF block. No
+/// per-coefficient table — see [`scan_summary_payload`] for why the smoother's
+/// ~`n` knot values are not a summary artifact.
+fn scan_report_html(model: &FittedModel, scan: &ScanIntrospection) -> Result<String, String> {
+    let report_input = ReportInput {
+        model_path: "<in-memory>".to_string(),
+        family_name: model.likelihood().pretty_name().to_string(),
+        model_class: prediction_model_class_label(model),
+        formula: model.payload().formula.clone(),
+        n_obs: None,
+        deviance: scan.deviance,
+        reml_score: scan.reml_cost,
+        iterations: 0,
+        convergence_status: "exact (state-space spline scan)".to_string(),
+        converged: true,
+        outer_gradient_norm: None,
+        criterion_certificate: None,
+        edf_total: scan.edf,
+        r_squared: None,
+        coefficients: Vec::new(),
+        edf_blocks: vec![EdfBlockRow {
+            index: 0,
+            edf: scan.edf,
+            role: Some("smooth".to_string()),
+        }],
+        continuous_order: Vec::new(),
+        anisotropic_scales: Vec::new(),
+        measure_jet_spectra: Vec::new(),
+        diagnostics: None,
+        smooth_plots: Vec::new(),
+        alo: None,
+        notes: vec![format!(
+            "Exact O(n) state-space spline scan for {}: λ={:.4e}, EDF={:.3}. \
+             The smoother retains the per-knot posterior, not a dense \
+             design/Gram, so no per-coefficient table is shown.",
+            scan_smooth_label(scan),
+            scan.lambda,
+            scan.edf,
+        )],
+    };
+    render_html(&report_input)
+}
+
 fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
+    if let Some(scan) = scan_introspection(&model)? {
+        return scan_report_html(&model, &scan);
+    }
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     let standard_errors = fit
         .beta_standard_errors_corrected()
