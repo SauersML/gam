@@ -90,6 +90,13 @@ class Summary:
         Wald statistic) and ``p_value``. Random-effect smooths report ``edf``
         only. Empty when the model has no smooth terms or when the design
         could not be reconstructed to recover per-term coefficient blocks.
+
+        This ``p_value`` is the *first-order* Wald reference; computing it needs
+        only the saved model. For the **second-order-accurate**, Bartlett-corrected
+        likelihood-ratio p-value (the exact Lawley factor auto-applied whenever the
+        family carries closed-form cumulant jets, #939/#1063) call
+        :meth:`Model.smooth_significance(data) <gamfit.Model.smooth_significance>`,
+        which runs the per-term constrained refits the saved-model summary cannot.
     covariance_kind : str or None
         ``"corrected"`` or ``"conditional"`` depending on which posterior
         covariance variant was returned.
