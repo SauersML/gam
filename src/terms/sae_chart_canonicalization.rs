@@ -432,12 +432,16 @@ pub struct TorusFlowModeKey {
     pub is_cos: bool,
 }
 
-/// Per-mode sample of the flow basis at one chart point `t`: the scalar field
-/// value `f(t)` (the displacement this mode adds to coordinate `component`)
-/// and its gradient `∇f(t)` (the mode's contribution to row `component` of
-/// the flow Jacobian `Dφ`).
+/// Per-mode sample of a `d = 2` flow basis at one chart point `t`: the scalar
+/// field value `f(t)` (the displacement this mode adds to coordinate
+/// `component`) and its gradient `∇f(t)` (the mode's contribution to row
+/// `component` of the flow Jacobian `Dφ`). Shared by the torus
+/// ([`TorusFlowBasis`]) and the free-patch ([`FreePatchFlowBasis`]) flow
+/// families — the isometry-defect Gauss–Newton core
+/// ([`minimize_isometry_defect_flow`]) consumes only this `(component, grad)`
+/// contract, so both families descend the same exact optimizer.
 #[derive(Debug, Clone, Copy)]
-pub struct TorusFlowModeSample {
+pub struct FlowModeSample {
     pub component: usize,
     pub value: f64,
     pub grad: [f64; 2],
@@ -507,7 +511,7 @@ impl TorusFlowBasis {
     }
 
     /// Sample every mode (value + gradient) at chart point `t`, in `θ` order.
-    pub fn mode_samples(&self, t: [f64; 2]) -> Vec<TorusFlowModeSample> {
+    pub fn mode_samples(&self, t: [f64; 2]) -> Vec<FlowModeSample> {
         let tau = std::f64::consts::TAU;
         let mut out = Vec::with_capacity(self.dim());
         for component in 0..2 {
@@ -517,12 +521,12 @@ impl TorusFlowBasis {
                 let angle = w0 * t[0] + w1 * t[1];
                 let s = angle.sin();
                 let c = angle.cos();
-                out.push(TorusFlowModeSample {
+                out.push(FlowModeSample {
                     component,
                     value: s,
                     grad: [w0 * c, w1 * c],
                 });
-                out.push(TorusFlowModeSample {
+                out.push(FlowModeSample {
                     component,
                     value: c,
                     grad: [-w0 * s, -w1 * s],
@@ -625,7 +629,7 @@ struct FlowObjectiveState {
 /// `None` when the profiled scale degenerates (`c ≤ 0` or non-finite).
 fn evaluate_flow_defect(
     theta: &[f64],
-    row_modes: &[Vec<TorusFlowModeSample>],
+    row_modes: &[Vec<FlowModeSample>],
     ghat: &[[f64; 3]],
     ghat_norm_sq: f64,
 ) -> Option<FlowObjectiveState> {
@@ -669,6 +673,251 @@ fn evaluate_flow_defect(
         scale,
         a_rows,
     })
+}
+
+/// Outcome of the shared isometry-defect flow minimizer: the optimal flow
+/// coefficients and the bracket of defects/scale they achieve. Returned only
+/// when a strict, fold-free improvement over the identity flow was found.
+struct FlowMinimization {
+    theta: Vec<f64>,
+    defect_initial: f64,
+    defect_final: f64,
+    profiled_scale: f64,
+}
+
+/// Exact damped Gauss–Newton for the `d = 2` isometry defect
+/// `E(θ) = Σ_i ‖A_iᵀA_i − c·Ĝ_i‖²_F` over the flow coefficients `θ`, shared by
+/// the torus and free-patch flow families (see
+/// [`torus_isometry_flow_reparameterization`] for the full derivation of the
+/// residual, the profiled scale `c`, and the analytic Gauss–Newton Jacobian).
+///
+/// The flow family enters ONLY through `row_modes` (the per-row mode samples
+/// `W_{ik} = Dv_k(t_i)` and displacements) and the `min_det_on_grid` guard
+/// closure, so the two families descend the identical optimizer with the
+/// identical strict-descent + diffeomorphism accept test. The minimization
+/// starts at `θ = 0` (`det Dφ = 1` everywhere) and never accepts a candidate
+/// whose `min det Dφ_θ ≤ min_det` on the guard grid, so the iterate can never
+/// walk through a fold. Returns `None` (honest skip — no lossy or folded swap)
+/// when the identity chart is already isometric, the profiled scale
+/// degenerates, or no strict improvement is reachable within the family.
+fn minimize_isometry_defect_flow(
+    row_modes: &[Vec<FlowModeSample>],
+    ghat: &[[f64; 3]],
+    ghat_norm_sq: f64,
+    q: usize,
+    min_det: f64,
+    min_det_on_grid: &dyn Fn(&[f64]) -> f64,
+) -> Option<FlowMinimization> {
+    let n = row_modes.len();
+    let mut theta = vec![0.0_f64; q];
+    let mut state = evaluate_flow_defect(&theta, row_modes, ghat, ghat_norm_sq)?;
+    let defect_initial = state.defect;
+    if !(defect_initial > 0.0) {
+        // Already exactly isometric — nothing to canonicalize.
+        return None;
+    }
+    let sqrt2 = std::f64::consts::SQRT_2;
+    let mut lambda = 1.0e-4_f64;
+    let mut any_accepted = false;
+    for iteration in 0..TORUS_FLOW_GN_MAX_ITERS {
+        if iteration + 1 == TORUS_FLOW_GN_MAX_ITERS {
+            break;
+        }
+        // Residual r and Gauss–Newton Jacobian J at the current θ.
+        let mut jmat = Array2::<f64>::zeros((3 * n, q));
+        let mut rcol = Array2::<f64>::zeros((3 * n, 1));
+        for (i, (a, g)) in state.a_rows.iter().zip(ghat.iter()).enumerate() {
+            let m00 = a[0] * a[0] + a[2] * a[2];
+            let m11 = a[1] * a[1] + a[3] * a[3];
+            let m01 = a[0] * a[1] + a[2] * a[3];
+            rcol[[3 * i, 0]] = m00 - state.scale * g[0];
+            rcol[[3 * i + 1, 0]] = m11 - state.scale * g[1];
+            rcol[[3 * i + 2, 0]] = sqrt2 * (m01 - state.scale * g[2]);
+            for (k, sample) in row_modes[i].iter().enumerate() {
+                // W_{ik} has single nonzero row `component` = grad, so
+                // M = W_{ik}ᵀ A_i has entries M_{ab} = grad[a]·A[component, b]
+                // and S = M + Mᵀ.
+                let ac0 = a[2 * sample.component];
+                let ac1 = a[2 * sample.component + 1];
+                let s00 = 2.0 * sample.grad[0] * ac0;
+                let s11 = 2.0 * sample.grad[1] * ac1;
+                let s01 = sample.grad[0] * ac1 + sample.grad[1] * ac0;
+                jmat[[3 * i, k]] = s00;
+                jmat[[3 * i + 1, k]] = s11;
+                jmat[[3 * i + 2, k]] = sqrt2 * s01;
+            }
+        }
+        let jtj = fast_ata(&jmat);
+        let jtr = fast_atb(&jmat, &rcol);
+
+        // Levenberg-damped step with the diffeomorphism guard in the accept
+        // test: only strict-descent, fold-free candidates are ever taken.
+        let mut rejects = 0usize;
+        let mut accepted_step = false;
+        let mut converged = false;
+        let mut step_norm_sq = 0.0_f64;
+        while rejects < TORUS_FLOW_GN_MAX_REJECTS {
+            let mut damped = jtj.clone();
+            for d in 0..q {
+                damped[[d, d]] += lambda * (1.0 + jtj[[d, d]]);
+            }
+            let factor = match damped.cholesky(FaerSide::Lower) {
+                Ok(factor) => factor,
+                Err(_) => {
+                    lambda *= 10.0;
+                    rejects += 1;
+                    continue;
+                }
+            };
+            let mut neg_jtr = jtr.clone();
+            neg_jtr.mapv_inplace(|v| -v);
+            let delta = factor.solve_mat(&neg_jtr);
+            let mut candidate = theta.clone();
+            step_norm_sq = 0.0;
+            for k in 0..q {
+                candidate[k] += delta[[k, 0]];
+                step_norm_sq += delta[[k, 0]] * delta[[k, 0]];
+            }
+            let folded = min_det_on_grid(&candidate) <= min_det;
+            let candidate_state = if folded {
+                None
+            } else {
+                evaluate_flow_defect(&candidate, row_modes, ghat, ghat_norm_sq)
+            };
+            match candidate_state {
+                Some(next) if next.defect < state.defect => {
+                    let improvement = state.defect - next.defect;
+                    theta = candidate;
+                    state = next;
+                    any_accepted = true;
+                    accepted_step = true;
+                    lambda = (lambda / 10.0).max(1.0e-12);
+                    if improvement <= 1.0e-14 * (1.0 + state.defect) {
+                        // Converged: the accepted step no longer moves E.
+                        converged = true;
+                    }
+                    break;
+                }
+                Some(..) | None => {
+                    lambda *= 10.0;
+                    rejects += 1;
+                }
+            }
+        }
+        if !accepted_step {
+            break;
+        }
+        if converged {
+            break;
+        }
+        let theta_norm_sq: f64 = theta.iter().map(|v| v * v).sum();
+        if step_norm_sq <= 1.0e-24 * (1.0 + theta_norm_sq) {
+            break;
+        }
+    }
+    if !any_accepted || !(state.defect < defect_initial) {
+        // No strict improvement within the flow family: the fitted chart is
+        // already the canonical representative — honest skip.
+        return None;
+    }
+    Some(FlowMinimization {
+        theta,
+        defect_initial,
+        defect_final: state.defect,
+        profiled_scale: state.scale,
+    })
+}
+
+/// Extract the fitted pullback metric `G_i = J(t_i)ᵀ J(t_i)` (symmetric storage
+/// `[g00, g11, g01]`) at every row of a `d = 2` atom from the exact decoder jet,
+/// together with the geometric-mean metric scale `ḡ = exp(mean_i ½ log det G_i)`
+/// used by every `d = 2` defect for its scale-invariant normalization. Shared by
+/// the torus, free-patch, and sphere defect paths — the single source of truth
+/// for the pullback-metric extraction.
+///
+/// Returns `Ok(None)` (honest refusal) on a degenerate chart: empty rows/basis,
+/// a rank-deficient pullback metric (`det G_i ≤ 0`) anywhere — the chart is
+/// collapsed along some direction there, so no isometric representative exists —
+/// or a non-finite geometric-mean scale.
+fn extract_pullback_metric_d2(
+    label: &str,
+    evaluator: &dyn SaeBasisEvaluator,
+    decoder: ArrayView2<'_, f64>,
+    row_coords: ArrayView2<'_, f64>,
+) -> Result<Option<(Vec<[f64; 3]>, f64)>, String> {
+    let n = row_coords.nrows();
+    let m = decoder.nrows();
+    let p = decoder.ncols();
+    let (row_phi, row_jet) = evaluator.evaluate(row_coords)?;
+    if row_phi.ncols() != m || row_jet.dim() != (n, m, 2) {
+        return Err(format!(
+            "{label}: evaluator returned basis {:?} / jet {:?}; expected width {m}, latent_dim 2",
+            row_phi.dim(),
+            row_jet.dim()
+        ));
+    }
+    let mut g_rows: Vec<[f64; 3]> = Vec::with_capacity(n);
+    let mut log_det_sum = 0.0_f64;
+    let mut tangent0 = vec![0.0_f64; p];
+    let mut tangent1 = vec![0.0_f64; p];
+    for row in 0..n {
+        for slot in tangent0.iter_mut() {
+            *slot = 0.0;
+        }
+        for slot in tangent1.iter_mut() {
+            *slot = 0.0;
+        }
+        for bm in 0..m {
+            let d0 = row_jet[[row, bm, 0]];
+            let d1 = row_jet[[row, bm, 1]];
+            if d0 == 0.0 && d1 == 0.0 {
+                continue;
+            }
+            for j in 0..p {
+                let b = decoder[[bm, j]];
+                tangent0[j] += d0 * b;
+                tangent1[j] += d1 * b;
+            }
+        }
+        let mut g00 = 0.0_f64;
+        let mut g11 = 0.0_f64;
+        let mut g01 = 0.0_f64;
+        for j in 0..p {
+            g00 += tangent0[j] * tangent0[j];
+            g11 += tangent1[j] * tangent1[j];
+            g01 += tangent0[j] * tangent1[j];
+        }
+        let det = g00 * g11 - g01 * g01;
+        if !(det.is_finite() && det > 0.0) {
+            return Ok(None);
+        }
+        log_det_sum += 0.5 * det.ln();
+        g_rows.push([g00, g11, g01]);
+    }
+    let g_bar = (log_det_sum / n as f64).exp();
+    if !(g_bar.is_finite() && g_bar > 0.0) {
+        return Ok(None);
+    }
+    Ok(Some((g_rows, g_bar)))
+}
+
+/// Normalize the fitted metric rows against the **flat** reference `g_ref = I`:
+/// `Ĝ_i = G_i / ḡ` plus the reference-norm² `Σ_i ‖Ĝ_i‖²_F` the isometry-defect
+/// Gauss–Newton profiles its global scale against. Shared by the torus and
+/// free-patch families (both pin to a flat uniform-speed reference); the sphere
+/// uses the `diag(1, cos²lat)` reference instead and normalizes inline.
+fn flat_normalized_metric(g_rows: &[[f64; 3]], g_bar: f64) -> Option<(Vec<[f64; 3]>, f64)> {
+    let mut ghat: Vec<[f64; 3]> = Vec::with_capacity(g_rows.len());
+    let mut ghat_norm_sq = 0.0_f64;
+    for g in g_rows {
+        let h = [g[0] / g_bar, g[1] / g_bar, g[2] / g_bar];
+        ghat_norm_sq += h[0] * h[0] + h[1] * h[1] + 2.0 * h[2] * h[2];
+        ghat.push(h);
+    }
+    if !(ghat_norm_sq.is_finite() && ghat_norm_sq > 0.0) {
+        return None;
+    }
+    Some((ghat, ghat_norm_sq))
 }
 
 /// Compute the minimum-isometry-defect flow reparameterization of a fitted
@@ -757,193 +1006,42 @@ pub fn torus_isometry_flow_reparameterization(
         }
     }
 
-    // ── Fitted pullback metric G_i = J(t_i)ᵀ J(t_i) from the exact jet ──────
-    let (row_phi, row_jet) = evaluator.evaluate(row_coords)?;
-    if row_phi.ncols() != m || row_jet.dim() != (n, m, 2) {
-        return Err(format!(
-            "torus_isometry_flow_reparameterization: evaluator returned basis {:?} / jet {:?}; expected width {m}, latent_dim 2",
-            row_phi.dim(),
-            row_jet.dim()
-        ));
-    }
-    let mut g_rows: Vec<[f64; 3]> = Vec::with_capacity(n);
-    let mut log_det_sum = 0.0_f64;
-    let mut tangent0 = vec![0.0_f64; p];
-    let mut tangent1 = vec![0.0_f64; p];
-    for row in 0..n {
-        for slot in tangent0.iter_mut() {
-            *slot = 0.0;
-        }
-        for slot in tangent1.iter_mut() {
-            *slot = 0.0;
-        }
-        for bm in 0..m {
-            let d0 = row_jet[[row, bm, 0]];
-            let d1 = row_jet[[row, bm, 1]];
-            if d0 == 0.0 && d1 == 0.0 {
-                continue;
-            }
-            for j in 0..p {
-                let b = decoder[[bm, j]];
-                tangent0[j] += d0 * b;
-                tangent1[j] += d1 * b;
-            }
-        }
-        let mut g00 = 0.0_f64;
-        let mut g11 = 0.0_f64;
-        let mut g01 = 0.0_f64;
-        for j in 0..p {
-            g00 += tangent0[j] * tangent0[j];
-            g11 += tangent1[j] * tangent1[j];
-            g01 += tangent0[j] * tangent1[j];
-        }
-        let det = g00 * g11 - g01 * g01;
-        if !(det.is_finite() && det > 0.0) {
-            // Rank-deficient pullback metric: the chart is collapsed along
-            // some direction at this row — no isometric representative exists.
-            return Ok(None);
-        }
-        log_det_sum += 0.5 * det.ln();
-        g_rows.push([g00, g11, g01]);
-    }
-    // Geometric-mean metric scale ḡ (scale-invariant normalization).
-    let g_bar = (log_det_sum / n as f64).exp();
-    if !(g_bar.is_finite() && g_bar > 0.0) {
+    // ── Fitted pullback metric G_i = J(t_i)ᵀ J(t_i) from the exact jet, then
+    //    normalize against the flat reference g_ref = I (shared helpers) ──────
+    let Some((g_rows, g_bar)) = extract_pullback_metric_d2(
+        "torus_isometry_flow_reparameterization",
+        evaluator,
+        decoder,
+        row_coords,
+    )?
+    else {
         return Ok(None);
-    }
-    let mut ghat: Vec<[f64; 3]> = Vec::with_capacity(n);
-    let mut ghat_norm_sq = 0.0_f64;
-    for g in &g_rows {
-        let h = [g[0] / g_bar, g[1] / g_bar, g[2] / g_bar];
-        ghat_norm_sq += h[0] * h[0] + h[1] * h[1] + 2.0 * h[2] * h[2];
-        ghat.push(h);
-    }
-    if !(ghat_norm_sq.is_finite() && ghat_norm_sq > 0.0) {
+    };
+    let Some((ghat, ghat_norm_sq)) = flat_normalized_metric(&g_rows, g_bar) else {
         return Ok(None);
-    }
+    };
 
     // ── Flow basis + per-row mode samples (W_{ik} and the displacements) ────
     let basis = TorusFlowBasis::new(period)?;
     let q = basis.dim();
-    let mut row_modes: Vec<Vec<TorusFlowModeSample>> = Vec::with_capacity(n);
+    let mut row_modes: Vec<Vec<FlowModeSample>> = Vec::with_capacity(n);
     for row in 0..n {
         row_modes.push(basis.mode_samples([row_coords[[row, 0]], row_coords[[row, 1]]]));
     }
 
-    // ── Damped Gauss–Newton on θ (derivation in the function docs) ──────────
-    let mut theta = vec![0.0_f64; q];
-    let Some(mut state) = evaluate_flow_defect(&theta, &row_modes, &ghat, ghat_norm_sq) else {
+    // ── Damped Gauss–Newton on θ (shared exact core; derivation above) ──────
+    let Some(minimization) = minimize_isometry_defect_flow(
+        &row_modes,
+        &ghat,
+        ghat_norm_sq,
+        q,
+        TORUS_FLOW_DIFFEO_MIN_DET,
+        &|candidate: &[f64]| basis.min_jacobian_det_on_grid(candidate),
+    ) else {
         return Ok(None);
     };
-    let defect_initial = state.defect;
-    if !(defect_initial > 0.0) {
-        // Already exactly isometric — nothing to canonicalize.
-        return Ok(None);
-    }
-    let sqrt2 = std::f64::consts::SQRT_2;
-    let mut lambda = 1.0e-4_f64;
-    let mut any_accepted = false;
-    for iteration in 0..TORUS_FLOW_GN_MAX_ITERS {
-        if iteration + 1 == TORUS_FLOW_GN_MAX_ITERS {
-            break;
-        }
-        // Residual r and Gauss–Newton Jacobian J at the current θ.
-        let mut jmat = Array2::<f64>::zeros((3 * n, q));
-        let mut rcol = Array2::<f64>::zeros((3 * n, 1));
-        for (i, (a, g)) in state.a_rows.iter().zip(ghat.iter()).enumerate() {
-            let m00 = a[0] * a[0] + a[2] * a[2];
-            let m11 = a[1] * a[1] + a[3] * a[3];
-            let m01 = a[0] * a[1] + a[2] * a[3];
-            rcol[[3 * i, 0]] = m00 - state.scale * g[0];
-            rcol[[3 * i + 1, 0]] = m11 - state.scale * g[1];
-            rcol[[3 * i + 2, 0]] = sqrt2 * (m01 - state.scale * g[2]);
-            for (k, sample) in row_modes[i].iter().enumerate() {
-                // W_{ik} has single nonzero row `component` = grad, so
-                // M = W_{ik}ᵀ A_i has entries M_{ab} = grad[a]·A[component, b]
-                // and S = M + Mᵀ.
-                let ac0 = a[2 * sample.component];
-                let ac1 = a[2 * sample.component + 1];
-                let s00 = 2.0 * sample.grad[0] * ac0;
-                let s11 = 2.0 * sample.grad[1] * ac1;
-                let s01 = sample.grad[0] * ac1 + sample.grad[1] * ac0;
-                jmat[[3 * i, k]] = s00;
-                jmat[[3 * i + 1, k]] = s11;
-                jmat[[3 * i + 2, k]] = sqrt2 * s01;
-            }
-        }
-        let jtj = fast_ata(&jmat);
-        let jtr = fast_atb(&jmat, &rcol);
-
-        // Levenberg-damped step with the diffeomorphism guard in the accept
-        // test: only strict-descent, fold-free candidates are ever taken.
-        let mut rejects = 0usize;
-        let mut accepted_step = false;
-        let mut converged = false;
-        let mut step_norm_sq = 0.0_f64;
-        while rejects < TORUS_FLOW_GN_MAX_REJECTS {
-            let mut damped = jtj.clone();
-            for d in 0..q {
-                damped[[d, d]] += lambda * (1.0 + jtj[[d, d]]);
-            }
-            let factor = match damped.cholesky(FaerSide::Lower) {
-                Ok(factor) => factor,
-                Err(_) => {
-                    lambda *= 10.0;
-                    rejects += 1;
-                    continue;
-                }
-            };
-            let mut neg_jtr = jtr.clone();
-            neg_jtr.mapv_inplace(|v| -v);
-            let delta = factor.solve_mat(&neg_jtr);
-            let mut candidate = theta.clone();
-            step_norm_sq = 0.0;
-            for k in 0..q {
-                candidate[k] += delta[[k, 0]];
-                step_norm_sq += delta[[k, 0]] * delta[[k, 0]];
-            }
-            let folded = basis.min_jacobian_det_on_grid(&candidate) <= TORUS_FLOW_DIFFEO_MIN_DET;
-            let candidate_state = if folded {
-                None
-            } else {
-                evaluate_flow_defect(&candidate, &row_modes, &ghat, ghat_norm_sq)
-            };
-            match candidate_state {
-                Some(next) if next.defect < state.defect => {
-                    let improvement = state.defect - next.defect;
-                    theta = candidate;
-                    state = next;
-                    any_accepted = true;
-                    accepted_step = true;
-                    lambda = (lambda / 10.0).max(1.0e-12);
-                    if improvement <= 1.0e-14 * (1.0 + state.defect) {
-                        // Converged: the accepted step no longer moves E.
-                        converged = true;
-                    }
-                    break;
-                }
-                Some(..) | None => {
-                    lambda *= 10.0;
-                    rejects += 1;
-                }
-            }
-        }
-        if !accepted_step {
-            break;
-        }
-        if converged {
-            break;
-        }
-        let theta_norm_sq: f64 = theta.iter().map(|v| v * v).sum();
-        if step_norm_sq <= 1.0e-24 * (1.0 + theta_norm_sq) {
-            break;
-        }
-    }
-    if !any_accepted || !(state.defect < defect_initial) {
-        // No strict improvement within the flow family: the fitted chart is
-        // already the canonical representative — honest skip.
-        return Ok(None);
-    }
+    let theta = minimization.theta;
+    let defect_initial = minimization.defect_initial;
     let min_flow_jacobian_det = basis.min_jacobian_det_on_grid(&theta);
     if !(min_flow_jacobian_det > TORUS_FLOW_DIFFEO_MIN_DET) {
         // Unreachable through the guarded accept path; refuse defensively
@@ -998,8 +1096,8 @@ pub fn torus_isometry_flow_reparameterization(
         decoder_transport: recomposition.transport,
         flow_theta: theta,
         defect_initial,
-        defect_final: state.defect,
-        profiled_metric_scale: state.scale,
+        defect_final: minimization.defect_final,
+        profiled_metric_scale: minimization.profiled_scale,
         min_flow_jacobian_det,
         recomposition_residual: recomposition.recomposition_residual,
     }))
@@ -1077,57 +1175,14 @@ pub fn sphere_chart_isometry_defect(
     }
 
     // Fitted pullback metric G_i = J(t_i)ᵀJ(t_i) from the exact jet — identical
-    // extraction to the torus path (axis 0 = lat, axis 1 = lon).
-    let (row_phi, row_jet) = evaluator.evaluate(row_coords)?;
-    if row_phi.ncols() != m || row_jet.dim() != (n, m, 2) {
-        return Err(format!(
-            "sphere_chart_isometry_defect: evaluator returned basis {:?} / jet {:?}; expected width {m}, latent_dim 2",
-            row_phi.dim(),
-            row_jet.dim()
-        ));
-    }
-    let mut g_rows: Vec<[f64; 3]> = Vec::with_capacity(n);
-    let mut log_det_sum = 0.0_f64;
-    let mut tangent0 = vec![0.0_f64; p];
-    let mut tangent1 = vec![0.0_f64; p];
-    for row in 0..n {
-        for slot in tangent0.iter_mut() {
-            *slot = 0.0;
-        }
-        for slot in tangent1.iter_mut() {
-            *slot = 0.0;
-        }
-        for bm in 0..m {
-            let d0 = row_jet[[row, bm, 0]];
-            let d1 = row_jet[[row, bm, 1]];
-            if d0 == 0.0 && d1 == 0.0 {
-                continue;
-            }
-            for j in 0..p {
-                let b = decoder[[bm, j]];
-                tangent0[j] += d0 * b;
-                tangent1[j] += d1 * b;
-            }
-        }
-        let mut g00 = 0.0_f64;
-        let mut g11 = 0.0_f64;
-        let mut g01 = 0.0_f64;
-        for j in 0..p {
-            g00 += tangent0[j] * tangent0[j];
-            g11 += tangent1[j] * tangent1[j];
-            g01 += tangent0[j] * tangent1[j];
-        }
-        let det = g00 * g11 - g01 * g01;
-        if !(det.is_finite() && det > 0.0) {
-            return Ok(None);
-        }
-        log_det_sum += 0.5 * det.ln();
-        g_rows.push([g00, g11, g01]);
-    }
-    let g_bar = (log_det_sum / n as f64).exp();
-    if !(g_bar.is_finite() && g_bar > 0.0) {
+    // extraction to the torus / patch paths (axis 0 = lat, axis 1 = lon), via
+    // the shared helper. The sphere reference below differs (diag(1, cos²lat)
+    // vs flat I), so only the extraction is shared, not the normalization.
+    let Some((g_rows, g_bar)) =
+        extract_pullback_metric_d2("sphere_chart_isometry_defect", evaluator, decoder, row_coords)?
+    else {
         return Ok(None);
-    }
+    };
 
     // Reference metric ĝ_ref,i = diag(1, cos²lat_i) (round sphere, lat = axis 0).
     // Both G and g_ref are normalized by ḡ; g_ref carries no fitted scale so the
