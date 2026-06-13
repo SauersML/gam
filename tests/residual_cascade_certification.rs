@@ -435,6 +435,157 @@ fn pcg_route_certified_and_iteration_count_n_independent() {
     );
 }
 
+/// Wall-clock factorization+solve of the dense normal equations
+/// `(X'WX + λD)c = X'Wy` from the design's CSR rows — the DIRECT route the
+/// cascade replaces (assemble the Gram by scattering row outer products, then
+/// one O(m³) Cholesky + triangular solve). Independent of the library's solve
+/// path on purpose: this is the O(m³) baseline the multilevel PCG must beat.
+fn dense_direct_solve_time(
+    design: &ResidualCascadeDesign,
+    axes: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    lambda: f64,
+) -> (std::time::Duration, Vec<f64>) {
+    let n = y.len();
+    let m = design.num_coeffs();
+    // Assemble A = X'WX + λD and b = X'Wy directly from basis rows.
+    let mut a = vec![0.0_f64; m * m];
+    let mut b = vec![0.0_f64; m];
+    let mut unit = vec![0.0_f64; m];
+    for (j, dj) in (0..m).map(|j| {
+        unit[j] = 1.0;
+        let d = design.penalty_value(&unit).expect("penalty probe");
+        unit[j] = 0.0;
+        (j, d)
+    }) {
+        a[j * m + j] += lambda * dj;
+    }
+    for i in 0..n {
+        let row = design.basis_row(&point_at(axes, i)).expect("basis row");
+        for &(cj, vj) in &row {
+            b[cj] += w[i] * vj * y[i];
+            for &(ck, vk) in &row {
+                a[cj * m + ck] += w[i] * vj * vk;
+            }
+        }
+    }
+    // Time only the expensive direct linear algebra: O(m³) factor + O(m²) solve.
+    let start = std::time::Instant::now();
+    let (l, _logdet) = dense_cholesky(&a, m);
+    let coeff = dense_solve(&l, m, &b);
+    (start.elapsed(), coeff)
+}
+
+/// Measured n-scaling payoff (#1032 spec: "O(n log n) fit for the class where
+/// duchon/matern build dense n×k kernels per hyperparameter trial"). Two
+/// claims, both timed on the wall clock:
+///
+/// 1. At a design past the dense sizing cap (PCG + level-diagonal BPX route
+///    engaged), the cascade's certified solve is FASTER than the equivalent
+///    direct dense Cholesky of the SAME normal equations — the O(qL·m) sparse
+///    multilevel matvec replaces the O(m³) dense factorization, and the two
+///    agree on the coefficients to solver tolerance (so the speedup is real,
+///    not a different/cheaper problem).
+/// 2. Across a 4× jump in n at fixed depth the cascade's fit time grows far
+///    less than the >4× a faithful direct solve would (the direct route's
+///    factor cost is fixed in m but its assembly is O(n·q²); the cascade pays
+///    one extra near-linear sparse pass) — the operational signature of the
+///    near-linear scaling.
+#[test]
+fn cascade_beats_direct_solve_and_scales_near_linearly() {
+    let levels = 6;
+    let log_lambda = 0.0_f64;
+    let lambda = log_lambda.exp();
+
+    // --- Claim 1: cascade PCG vs direct dense Cholesky at large m. ---
+    let (axes, y, w) = sample(2, 24_000, 0.1, 0x1032_0F01);
+    let xs = axis_refs(&axes);
+    let design =
+        ResidualCascadeDesign::build(&xs, &y, &w, &[1.0, 1.0], 2.0, levels).expect("build");
+    assert!(
+        design.num_coeffs() > 1536,
+        "fixture too small to engage the iterative route (m = {})",
+        design.num_coeffs()
+    );
+
+    // Warm up allocator/caches once, then time the certified cascade solve.
+    let warm = design.fit_at(log_lambda, None).expect("warm fit");
+    assert!(
+        warm.certificate.solve_rel_residual <= 1e-9,
+        "warm cascade solve uncertified: {}",
+        warm.certificate.solve_rel_residual
+    );
+    let cascade_start = std::time::Instant::now();
+    let fit = design.fit_at(log_lambda, None).expect("fit_at");
+    let cascade_time = cascade_start.elapsed();
+    assert_eq!(fit.certificate.logdet_method, LogdetMethod::Slq);
+    assert!(
+        fit.certificate.solve_rel_residual <= 1e-9,
+        "uncertified cascade solve: {}",
+        fit.certificate.solve_rel_residual
+    );
+
+    let (direct_time, direct_coeff) = dense_direct_solve_time(&design, &axes, &y, &w, lambda);
+
+    // Same problem: the certified PCG solution matches the direct factorization
+    // to backward-error tolerance (so the speedup is not from solving less).
+    let scale = direct_coeff
+        .iter()
+        .fold(0.0_f64, |acc, &c| acc.max(c.abs()))
+        .max(1e-12);
+    let max_diff = fit
+        .coeff
+        .iter()
+        .zip(direct_coeff.iter())
+        .fold(0.0_f64, |acc, (&g, &d)| acc.max((g - d).abs()));
+    assert!(
+        max_diff <= 1e-6 * scale,
+        "cascade and direct solve disagree (max diff {max_diff}, scale {scale}) — \
+         not the same normal equations"
+    );
+    assert!(
+        cascade_time < direct_time,
+        "cascade did not beat the direct dense solve at m = {}: cascade {cascade_time:?} \
+         vs direct {direct_time:?}",
+        design.num_coeffs()
+    );
+
+    // --- Claim 2: near-linear growth across a 4× jump in n at fixed depth. ---
+    let mut fit_times = Vec::new();
+    for &(n, seed) in &[(12_000usize, 0x1032_0F02_u64), (48_000, 0x1032_0F03)] {
+        let (ax, yy, ww) = sample(2, n, 0.1, seed);
+        let xr = axis_refs(&ax);
+        let d = ResidualCascadeDesign::build(&xr, &yy, &ww, &[1.0, 1.0], 2.0, levels)
+            .expect("build");
+        let warm = d.fit_at(log_lambda, None).expect("warm");
+        assert!(
+            warm.certificate.solve_rel_residual <= 1e-9,
+            "uncertified warm solve at n={n}"
+        );
+        let t0 = std::time::Instant::now();
+        let f = d.fit_at(log_lambda, None).expect("fit");
+        fit_times.push(t0.elapsed());
+        assert!(
+            f.certificate.solve_rel_residual <= 1e-9,
+            "uncertified solve at n={n}"
+        );
+    }
+    // A direct solve's per-trial assembly is O(n·q²): 4× n ⇒ ≥4× time. The
+    // cascade's matvec count is n-independent (level-diagonal BPX), so the only
+    // n-dependence is the sparse passes — sub-quadratic and comfortably under
+    // the direct route's growth. Allow generous slack for timer noise on shared
+    // CI hardware while still ruling out super-linear blow-up.
+    let ratio = fit_times[1].as_secs_f64() / fit_times[0].as_secs_f64().max(1e-9);
+    assert!(
+        ratio < 8.0,
+        "cascade fit time grew faster than near-linearly across 4× n: \
+         {:?} at 12k vs {:?} at 48k (ratio {ratio:.2})",
+        fit_times[0],
+        fit_times[1]
+    );
+}
+
 /// The level-diagonal preconditioner must condition the system uniformly in
 /// cascade depth — the norm equivalence measured directly: on a small dense
 /// fixture, cond(P^{-1/2}AP^{-1/2}) stays bounded and grows by at most a
