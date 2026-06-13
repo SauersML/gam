@@ -3261,6 +3261,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                         "[psi-gram-tensor] installed n-free ψ-gradient derivatives at psi={psi:.6}"
                     );
                 }
+            }
         }
         Ok(hyper_dirs)
     }
