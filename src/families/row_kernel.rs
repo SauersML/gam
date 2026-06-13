@@ -246,9 +246,13 @@ impl RowSet {
     /// accumulators.
     ///
     /// Returns the reduced result. Both branches process fixed-size row chunks
-    /// in parallel, then combine the chunk accumulators in chunk-index order on
-    /// the caller thread. The resulting floating-point reduction tree is fixed
-    /// across Rayon worker counts and work-stealing decisions.
+    /// (in parallel above [`ROW_FOLD_SEQUENTIAL_MAX_CHUNKS`], on the caller
+    /// thread below it), then combine the chunk accumulators in chunk-index
+    /// order on the caller thread. The resulting floating-point reduction tree
+    /// is fixed across Rayon worker counts, work-stealing decisions, and the
+    /// sequential/parallel threshold — the chunk boundaries and the in-order
+    /// reduce are identical, so the small-fold serial path is bit-for-bit equal
+    /// to the parallel path.
     #[inline]
     pub fn par_reduce_fold<T, I, F, R>(&self, n_total: usize, init: I, fold: F, reduce: R) -> T
     where
