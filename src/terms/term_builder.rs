@@ -727,9 +727,21 @@ pub fn build_termspec(
 
 fn split_list_option(raw: &str) -> Vec<String> {
     let t = raw.trim();
+    // Accept the Python/JSON list form `[a, b]` AND mgcv's R-vector forms
+    // `c(a, b)` / `(a, b)` as bracketed wrappers around a comma-separated body.
+    // mgcv-style formulas pass per-margin numeric options as `k=c(5,5)` /
+    // `period=c(2*pi, pi)`; without R-vector peeling here those entries were
+    // split into `["c(5", "5)"]` and the downstream numeric parser then
+    // misreported the leading garbage as the invalid digit.
     let inner = t
         .strip_prefix('[')
         .and_then(|u| u.strip_suffix(']'))
+        .or_else(|| {
+            t.strip_prefix("c(")
+                .or_else(|| t.strip_prefix("C("))
+                .or_else(|| t.strip_prefix('('))
+                .and_then(|u| u.strip_suffix(')'))
+        })
         .unwrap_or(t);
     inner
         .split(',')
@@ -3064,17 +3076,7 @@ fn parse_explicit_internal_knots(
     let raw = options
         .get("knots")
         .expect("knots_option_is_list implies the key is present");
-    // Unwrap the `c(...)` / `(...)` R-vector forms down to a bare `[...]`-style
-    // body so `split_list_option` (which only peels `[...]`) sees a clean list.
-    let trimmed = raw.trim();
-    let body = trimmed
-        .strip_prefix("c(")
-        .or_else(|| trimmed.strip_prefix("C("))
-        .or_else(|| trimmed.strip_prefix('('))
-        .and_then(|v| v.strip_suffix(')'))
-        .map(|inner| format!("[{inner}]"))
-        .unwrap_or_else(|| trimmed.to_string());
-    let tokens = split_list_option(&body);
+    let tokens = split_list_option(raw);
     if tokens.is_empty() {
         return Err(TermBuilderError::invalid_option(format!(
             "knots={raw} is an empty list; supply at least one internal knot position \
