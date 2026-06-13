@@ -8469,23 +8469,13 @@ impl SaeResidentReducedSchur {
     }
 }
 
+/// Reduced-Schur matvec `out = S·x` with an optional pre-staged SAE residency
+/// operator. When `resident` is `Some`, the per-row point-elimination term is
+/// applied through the resident `p×p` blocks (#1017 CPU residency); otherwise it
+/// falls back to the generic per-row `apply → solve → transpose` path. Both
+/// routes accumulate the SAME reduced operator
+/// `S = H_ββ + ρ_β I − Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i)`.
 fn schur_matvec<B: BatchedBlockSolver + Sync>(
-    sys: &ArrowSchurSystem,
-    htt_factors: &ArrowFactorSlab,
-    ridge_beta: f64,
-    x: &Array1<f64>,
-    out: &mut Array1<f64>,
-    backend: &B,
-) {
-    schur_matvec_resident(sys, htt_factors, ridge_beta, x, out, backend, None)
-}
-
-/// [`schur_matvec`] with an optional pre-staged SAE residency operator. When
-/// `resident` is `Some`, the per-row point-elimination term is applied through
-/// the resident `p×p` blocks (#1017 CPU residency); otherwise it falls back to
-/// the generic per-row `apply → solve → transpose` path. Both routes accumulate
-/// the SAME reduced operator `S = H_ββ + ρ_β I − Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i)`.
-fn schur_matvec_resident<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
@@ -9446,7 +9436,7 @@ where
     } else {
         steihaug_cg(
             rhs,
-            |p, out| schur_matvec_resident(sys, htt_factors, ridge_beta, p, out, backend, resident),
+            |p, out| schur_matvec(sys, htt_factors, ridge_beta, p, out, backend, resident),
             apply_prec,
             max_iters,
             tol,
@@ -12048,8 +12038,8 @@ mod tests {
         // path must be bit-identical.
         let mut out_a = Array1::<f64>::zeros(k);
         let mut out_b = Array1::<f64>::zeros(k);
-        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_a, &backend);
-        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_b, &backend);
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_a, &backend, None);
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_b, &backend, None);
         for a in 0..k {
             assert_eq!(
                 out_a[a].to_bits(),
@@ -12122,11 +12112,11 @@ mod tests {
         let seq_elapsed = t_seq.elapsed();
 
         let mut out_par = Array1::<f64>::zeros(k);
-        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_par, &backend); // warm
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_par, &backend, None); // warm
         sink += out_par[0];
         let t_par = std::time::Instant::now();
         for _ in 0..calls {
-            schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_par, &backend);
+            schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_par, &backend, None);
             sink += out_par[0];
         }
         let par_elapsed = t_par.elapsed();
@@ -12283,13 +12273,13 @@ mod tests {
 
         // Generic path (no resident operator).
         let mut out_generic = Array1::<f64>::zeros(k);
-        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_generic, &backend);
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out_generic, &backend, None);
 
         // Resident path: stage G_i once, then matvec.
         let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend)
             .expect("SAE structure must yield a resident operator");
         let mut out_resident = Array1::<f64>::zeros(k);
-        schur_matvec_resident(
+        schur_matvec(
             &sys,
             &htt_factors,
             ridge_beta,
@@ -12317,7 +12307,7 @@ mod tests {
         // Determinism: rebuilding + re-applying is bit-identical run-to-run.
         let resident2 = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend).unwrap();
         let mut out_resident2 = Array1::<f64>::zeros(k);
-        schur_matvec_resident(
+        schur_matvec(
             &sys,
             &htt_factors,
             ridge_beta,
@@ -12359,11 +12349,11 @@ mod tests {
 
         // Generic: matvec re-walks apply/solve/transpose every iteration.
         let mut out = Array1::<f64>::zeros(k);
-        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out, &backend); // warm
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out, &backend, None); // warm
         sink += out[0];
         let t_gen = std::time::Instant::now();
         for _ in 0..cg_iters {
-            schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out, &backend);
+            schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out, &backend, None);
             sink += out[0];
         }
         let gen_elapsed = t_gen.elapsed();
@@ -12375,7 +12365,7 @@ mod tests {
             .expect("resident operator");
         let mut outr = Array1::<f64>::zeros(k);
         for _ in 0..cg_iters {
-            schur_matvec_resident(
+            schur_matvec(
                 &sys,
                 &htt_factors,
                 ridge_beta,
