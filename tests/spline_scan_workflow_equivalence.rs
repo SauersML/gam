@@ -16,10 +16,28 @@ use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::{
-    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula,
-    fit_spline_scan_from_formula, init_parallelism,
+    FitConfig, FitRequest, FitResult, StandardFitResult, encode_recordswith_inferred_schema,
+    fit_from_formula, fit_model, fit_spline_scan_from_formula, init_parallelism, materialize,
 };
 use ndarray::Array2;
+
+/// Dense reference fit on a scan-eligible formula, bypassing the `fit_from_formula`
+/// auto-route (#1030) so the dense reduced-rank path is available as a
+/// match-or-beat baseline. `fit_from_formula` now structurally routes a single
+/// 1-D Gaussian single-penalty smooth through the exact O(n) scan and returns
+/// `FitResult::SplineScan`; to compare the scan against the dense estimator we
+/// materialize and call `fit_model` (which carries no fast path) directly.
+fn dense_reference_fit(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    cfg: &FitConfig,
+) -> StandardFitResult {
+    let mat = materialize(formula, data, cfg).expect("materialize dense reference");
+    match fit_model(mat.request).expect("dense fit") {
+        FitResult::Standard(r) => r,
+        _ => panic!("dense reference path must return a standard fit"),
+    }
+}
 
 /// Dense in-test Gaussian elimination solve A·X = B (partial pivoting).
 fn dense_solve(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
@@ -221,11 +239,17 @@ fn scan_routed_fit_recovers_truth_at_least_as_well_as_dense_path() {
         .expect("scan-routed fit")
         .expect("detection must fire");
 
-    // Dense reference path on the identical model formula.
-    let dense = fit_from_formula(SCAN_FORMULA, &data, &cfg).expect("dense fit");
-    let FitResult::Standard(dense) = dense else {
-        panic!("dense reference path must return a standard fit");
-    };
+    // The library entry now structurally auto-routes this scan-eligible shape
+    // (#1030): `fit_from_formula` returns the exact O(n) scan posterior.
+    match fit_from_formula(SCAN_FORMULA, &data, &cfg).expect("auto-routed fit") {
+        FitResult::SplineScan(_) => {}
+        _ => panic!("fit_from_formula must auto-route a single 1-D Gaussian single-penalty smooth"),
+    }
+
+    // Dense reference path on the identical model formula (bypasses the
+    // auto-route so the reduced-rank dense estimator is the match-or-beat
+    // baseline).
+    let dense = dense_reference_fit(SCAN_FORMULA, &data, &cfg);
 
     // Interior prediction grid (truth-recovery, #904 style: the assertion is
     // against the self-constructed truth; the mature/dense path is only the
@@ -359,11 +383,15 @@ fn order_one_scan_routes_and_recovers_truth_vs_dense() {
         .expect("detection must fire for a single 1-D order-1 single-penalty Gaussian smooth");
     assert_eq!(scan.order, 1, "m=1 formula must select the order-1 scan");
 
-    // Dense reduced-rank reference on the identical formula.
-    let dense = fit_from_formula(SCAN_FORMULA_M1, &data, &cfg).expect("dense m=1 fit");
-    let FitResult::Standard(dense) = dense else {
-        panic!("dense reference path must return a standard fit");
-    };
+    // The library entry must also auto-route the m=1 scan shape (#1030).
+    match fit_from_formula(SCAN_FORMULA_M1, &data, &cfg).expect("auto-routed m=1 fit") {
+        FitResult::SplineScan(s) => assert_eq!(s.order, 1, "auto-route must select the m=1 scan"),
+        _ => panic!("fit_from_formula must auto-route the m=1 scan shape"),
+    }
+
+    // Dense reduced-rank reference on the identical formula (bypasses the
+    // auto-route, see `dense_reference_fit`).
+    let dense = dense_reference_fit(SCAN_FORMULA_M1, &data, &cfg);
     let grid: Vec<f64> = (0..200).map(|i| 0.02 + 0.96 * i as f64 / 199.0).collect();
     let mut dense_design = Array2::<f64>::zeros((grid.len(), 2));
     for (i, &t) in grid.iter().enumerate() {
