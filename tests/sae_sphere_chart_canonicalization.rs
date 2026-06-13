@@ -172,6 +172,37 @@ impl SaeBasisEvaluator for RichSphereHarmonicEvaluator {
         }
         Ok((phi, jet))
     }
+
+    fn second_jet_dyn(
+        &self,
+        coords: ndarray::ArrayView2<'_, f64>,
+    ) -> Option<Result<ndarray::Array4<f64>, String>> {
+        // The post-fit sphere canonicalization consumes only `evaluate` (basis +
+        // first jet); the exact isometry-penalty Hessian (which would need the
+        // analytic second jet) is not exercised by these chart-pin tests. Surface
+        // an explicit "not provided" rather than a fabricated zero curvature, but
+        // still validate the coordinate width so a malformed call fails loudly.
+        if coords.ncols() != 2 {
+            return Some(Err(format!(
+                "RichSphereHarmonicEvaluator::second_jet_dyn: expected latent_dim == 2, got {}",
+                coords.ncols()
+            )));
+        }
+        None
+    }
+
+    fn third_jet_dyn(
+        &self,
+        coords: ndarray::ArrayView2<'_, f64>,
+    ) -> Option<Result<ndarray::Array5<f64>, String>> {
+        if coords.ncols() != 2 {
+            return Some(Err(format!(
+                "RichSphereHarmonicEvaluator::third_jet_dyn: expected latent_dim == 2, got {}",
+                coords.ncols()
+            )));
+        }
+        None
+    }
 }
 
 const LAT_GRID: usize = 12;
