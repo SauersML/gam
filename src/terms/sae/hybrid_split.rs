@@ -377,7 +377,7 @@ mod tests {
             decoded[[i, 0]] = coords[i];
             decoded[[i, 1]] = 0.6 * coords[i];
         }
-        let (linear, curved) = build_atom_candidates(
+        let (linear, curved, _) = build_atom_candidates(
             coords.view(),
             weights.view(),
             decoded.view(),
@@ -414,7 +414,7 @@ mod tests {
         // curved wins on evidence. (curved_num_params=6 or larger tips the balance
         // back to linear for this image, which is the correct adjudication — 6 extra
         // curve parameters is overkill for a half-circle.)
-        let (linear, curved) =
+        let (linear, curved, _) =
             build_atom_candidates(coords.view(), weights.view(), decoded.view(), 5, Some(PI))
                 .expect("turning image yields a candidate pair");
         // Linear candidate must have a strictly positive data-fit residual: a
@@ -454,7 +454,7 @@ mod tests {
                 decoded[[i, 0]] = coords[i] / c; // canonical-scale decoded, not t-scale-dependent
                 decoded[[i, 1]] = 0.6 * coords[i] / c;
             }
-            let (linear, curved) = build_atom_candidates(
+            let (linear, curved, _) = build_atom_candidates(
                 coords.view(),
                 weights.view(),
                 decoded.view(),
@@ -483,7 +483,7 @@ mod tests {
                 decoded[[i, 0]] = theta.cos();
                 decoded[[i, 1]] = theta.sin();
             }
-            let (linear, curved) = build_atom_candidates(
+            let (linear, curved, _) = build_atom_candidates(
                 coords.view(),
                 weights.view(),
                 decoded.view(),
