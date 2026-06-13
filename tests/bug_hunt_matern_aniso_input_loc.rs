@@ -20,15 +20,18 @@
 //! here.
 
 use gam::terms::basis::{
-    CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu, build_matern_basis,
-    matern_input_location_hessian_nd, matern_input_location_jet_nd,
+    CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu,
+    build_matern_basis_literal_aniso, matern_input_location_hessian_nd,
+    matern_input_location_jet_nd,
 };
 use ndarray::{Array2, ArrayView2, array};
 
 /// Raw (un-projected) Matérn kernel design `Φ_{n,k} = φ(r_A)` for the supplied
-/// anisotropy, using the production forward path. `identifiability = None` and
-/// `include_intercept = false` keep the columns the bare kernel values, so this
-/// is exactly the function the input-location jet claims to differentiate.
+/// anisotropy, using the **public** forward path (`build_matern_basis_literal_aniso`,
+/// matching the input-location jet/Hessian FFI). `identifiability = None` and
+/// `include_intercept = false` keep the columns the bare kernel values, and the
+/// literal entry honors an explicit all-zero η as the isotropic metric — exactly
+/// the function the public input-location jet claims to differentiate (#437, #1042).
 fn forward_kernel(
     points: ArrayView2<'_, f64>,
     centers: &Array2<f64>,
@@ -47,7 +50,7 @@ fn forward_kernel(
         aniso_log_scales: aniso.map(<[f64]>::to_vec),
         nullspace_shrinkage_survived: None,
     };
-    build_matern_basis(points, &spec)
+    build_matern_basis_literal_aniso(points, &spec)
         .expect("forward Matérn kernel should build")
         .design
         .to_dense()

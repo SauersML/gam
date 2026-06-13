@@ -86,7 +86,8 @@ use gam::terms::basis::{
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
     SplineScratch, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
     bspline_tensor_first_derivative, build_duchon_basis, build_duchon_basis_mixed_periodicity_auto,
-    build_duchon_operator_penalty_matrices, build_matern_basis, build_periodic_bspline_basis_1d,
+    build_duchon_operator_penalty_matrices, build_matern_basis, build_matern_basis_literal_aniso,
+    build_periodic_bspline_basis_1d,
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     duchon_cubic_default, duchon_nullspace_dimension, duchon_polynomial_first_derivative_nd,
@@ -2992,7 +2993,10 @@ fn matern_basis<'py>(
         periodic: None,
         nullspace_shrinkage_survived: None,
     };
-    let built = build_matern_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
+    // Honor an explicit all-zero `aniso_log_scales` literally as the isotropic
+    // metric — this is a caller's explicit request, NOT the κ-optimizer's
+    // geometry-seeding sentinel (#1042).
+    let built = build_matern_basis_literal_aniso(pts, &spec).map_err(basis_error_to_pyerr)?;
     let design = built
         .design
         .try_to_dense_by_chunks("matern_basis")
