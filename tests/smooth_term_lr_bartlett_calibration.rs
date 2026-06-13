@@ -30,7 +30,7 @@ use gam::smooth::smooth_term_lr_inference_forspec;
 use gam::{FitConfig, FitRequest, encode_recordswith_inferred_schema, init_parallelism, materialize};
 
 use csv::StringRecord;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Poisson};
