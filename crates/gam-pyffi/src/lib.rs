@@ -9298,8 +9298,8 @@ fn sae_manifold_fit_inner<'py>(
     // events) is serialized onto the payload as the honesty surface — never a
     // silent restructure. Conservative by construction: the gates rarely certify,
     // so the common case returns the fit unchanged with an all-contested ledger.
+    let mut structure_ledger = gam::inference::structure_evidence::StructureLedger::new();
     let structure_search_json = {
-        let mut structure_ledger = gam::inference::structure_evidence::StructureLedger::new();
         let harvest_params = gam::solver::structure_harvest::HarvestParams {
             max_fusions: 4,
             max_fissions: 0,
@@ -9619,6 +9619,17 @@ fn sae_manifold_fit_inner<'py>(
     if let Some(json) = structure_search_json {
         out.set_item("structure_search", json)?;
     }
+    // Anytime-valid structure certificate (#1058 / #984): the e-BH certificate
+    // over the ledger's per-claim e-processes at the search FDR level α = 0.05.
+    // Serialized onto the payload (alongside the raw `structure_search` rounds)
+    // so the post-fit `ManifoldSAE.structure_certificate()` can surface which
+    // discovered atoms / bindings / geometries the held-out data confirmed vs
+    // left contested — without re-running any fitting. Valid at this (or any)
+    // data-dependent stopping time because each claim is an e-process.
+    let structure_certificate = structure_ledger.certify(0.05);
+    let certificate_json = serde_json::to_string(&structure_certificate)
+        .map_err(serde_json_error_to_pyerr)?;
+    out.set_item("structure_certificate", certificate_json)?;
     Ok(out.unbind())
 }
 
