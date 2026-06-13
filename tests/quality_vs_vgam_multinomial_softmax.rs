@@ -408,6 +408,63 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
          (max within-class |log λ ratio|={max_within_class_log_ratio:.3}) — the smooth \
          terms appear fused rather than independently smoothed (#561)"
     );
+
+    // ---- #715: per-(class, term) EDF must NOT collapse to the penalty null --
+    // The over-shrinkage signature this issue tracks is λ_{c,t} → ∞ driving a
+    // wiggliness ρ onto its box bound, so the term collapses onto its polynomial
+    // null space (effective df → null-space dim). `edf_per_class` is the
+    // per-PENALTY trace EDF (one entry per λ, `rank(S_k) − λ_k·tr[(H+S)⁻¹S_k]`,
+    // clamped to [0, rank]); a wiggliness penalty driven to its λ-cap reads
+    // EDF ≈ 0 (its penalized component fully shrunk), pinned at the structural
+    // `EFFECTIVE_DF_FLOOR = 1.0` boundary the λ-upper-bound enforces. The truth
+    // here is genuinely wiggly in BOTH smooths (cubic-in-x1, sigmoid-in-x2), so
+    // a fit that recovered it cannot have collapsed every term onto its null
+    // space. We assert directly against the collapse: in every active class at
+    // least one penalty must carry EDF comfortably above the floor, AND the
+    // class's total penalized EDF must exceed the floor it would sit at if every
+    // term collapsed. This catches an over-shrunk fit that still happens to pass
+    // the truth-RMSE/match-or-beat bars on the pinned draw.
+    let edf_per_penalty = model
+        .edf_per_class
+        .as_ref()
+        .expect("multinomial fit must report per-penalty EDF (inference computed)");
+    assert_eq!(
+        edf_per_penalty.len(),
+        model.lambdas.len(),
+        "EDF vector must carry one entry per smoothing parameter (per-penalty trace EDF)"
+    );
+    // The λ-upper-bound floors each penalty's structural EDF at this value; a
+    // wiggliness penalty sitting AT the floor is the over-shrinkage limit.
+    const EDF_COLLAPSE_FLOOR: f64 = 1.0; // mirrors EFFECTIVE_DF_FLOOR (#715, 590ba3668)
+    const EDF_WIGGLY_MARGIN: f64 = 0.25; // a genuinely-active term clears the floor
+    let mut edf_offset = 0usize;
+    for (a, &n_lam) in model.lambdas_per_block.iter().enumerate() {
+        let seg = &edf_per_penalty[edf_offset..edf_offset + n_lam];
+        edf_offset += n_lam;
+        let class_edf_total: f64 = seg.iter().sum();
+        let max_penalty_edf = seg.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        // At least one penalty in the class must be clearly above the collapse
+        // floor — i.e. SOME wiggliness survived REML selection.
+        assert!(
+            max_penalty_edf > EDF_COLLAPSE_FLOOR + EDF_WIGGLY_MARGIN,
+            "class {a}: every per-(class, term) penalty collapsed onto the EDF \
+             floor (max penalty EDF={max_penalty_edf:.3} ≤ {floor:.3}) — the \
+             over-shrinkage signature (λ driven to its cap, smooths collapsed \
+             onto their polynomial null space). Per-penalty EDF={seg:?}",
+            floor = EDF_COLLAPSE_FLOOR + EDF_WIGGLY_MARGIN
+        );
+        // The class total penalized EDF must exceed the all-collapsed floor
+        // (one floor unit per penalty), with margin — a fit that recovered a
+        // wiggly truth spends real degrees of freedom on the penalized columns.
+        let all_collapsed_floor = EDF_COLLAPSE_FLOOR * (n_lam as f64);
+        assert!(
+            class_edf_total > all_collapsed_floor + EDF_WIGGLY_MARGIN,
+            "class {a}: total penalized EDF={class_edf_total:.3} ≤ \
+             all-collapsed floor {all_collapsed_floor:.3} — the class's smooths \
+             are over-shrunk onto their null spaces (#715). Per-penalty \
+             EDF={seg:?}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
