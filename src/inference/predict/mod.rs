@@ -6628,20 +6628,6 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
         )));
     }
 
-    // Magic-by-default exact full-conformal route (#942 / #1054). Split
-    // conformal's order-statistic multiplier is `+∞` — an unbounded, useless
-    // interval — whenever the calibration fold is too small to resolve the
-    // (1−α) quantile. For a Gaussian-identity fit in that small-n regime the
-    // EXACT full-conformal set (using all n_cal+1 points jointly, the
-    // calibration fold as the exchangeable sample) still delivers
-    // finite-sample-valid, typically finite, intervals. The fitted penalty Sλ
-    // is recovered exactly from the stored geometry (Sλ = H − X'WX), so the
-    // augmented row is fit symmetrically with the calibration rows. No flag:
-    // the estimator is chosen from problem shape (family, link, fold size).
-    if try_gaussian_full_conformal(&mut result, input, fit, family, calibration, alpha)? {
-        return Ok(result);
-    }
-
     // Split-conformal nonconformity must be scored on the PREDICTION scale, not
     // the epistemic mean scale. The conformal interval covers a fresh response
     // `Y`, whose spread is `√(SE(μ̂)² + Var(Y|μ))` — the same predictive SE the
@@ -6691,89 +6677,6 @@ where
         ),
         None => mean_standard_error.clone(),
     }
-}
-
-/// Attempt the exact Gaussian-identity full-conformal route. Returns `Ok(true)`
-/// when it applied (and overwrote `result.mean_lower`/`mean_upper` with the
-/// exact envelopes), `Ok(false)` when the problem shape or available geometry
-/// makes split conformal the right (or only) choice. Eligibility:
-///   * Gaussian response with the identity link (response scale = η scale);
-///   * the calibration fold is small enough that split conformal is unbounded
-///     (`gaussian_full_conformal_is_preferred`);
-///   * the fitted penalty Sλ is recoverable (`H` and `X'WX` both stored) and
-///     the designs materialize densely.
-/// Any ineligibility falls through to split conformal LOUDLY by returning
-/// `false`, never a silently-invalid set.
-fn try_gaussian_full_conformal(
-    result: &mut PredictUncertaintyResult,
-    input: &PredictInput,
-    fit: &UnifiedFitResult,
-    family: &LikelihoodSpec,
-    calibration: &ConformalCalibrationFold<'_>,
-    alpha: f64,
-) -> Result<bool, EstimationError> {
-    use crate::inference::full_conformal as fc;
-    use crate::types::StandardLink;
-
-    let is_gaussian_identity = matches!(family.response, ResponseFamily::Gaussian)
-        && matches!(family.link, InverseLink::Standard(StandardLink::Identity));
-    if !is_gaussian_identity {
-        return Ok(false);
-    }
-    let n_cal = calibration.y.len();
-    if !fc::gaussian_full_conformal_is_preferred(n_cal, alpha) {
-        return Ok(false);
-    }
-    // Recover the fitted penalty Sλ = H − X'WX. Both artifacts are dense-fit
-    // only; their absence (large-model fits) is an honest fall-through.
-    let (Some(h), Some(gram)) = (fit.penalized_hessian(), fit.weighted_gram()) else {
-        return Ok(false);
-    };
-    let s_lambda = match fc::fitted_penalty_from_hessian_and_gram(h, gram) {
-        Ok(s) => s,
-        Err(_) => return Ok(false),
-    };
-    let p = s_lambda.nrows();
-
-    // Materialize the calibration and test designs in coefficient coordinates.
-    let x_cal = match calibration
-        .input
-        .design
-        .try_to_dense_by_chunks("full-conformal calibration design")
-    {
-        Ok(x) => x,
-        Err(_) => return Ok(false),
-    };
-    let x_test = match input
-        .design
-        .try_to_dense_by_chunks("full-conformal test design")
-    {
-        Ok(x) => x,
-        Err(_) => return Ok(false),
-    };
-    if x_cal.ncols() != p || x_test.ncols() != p {
-        // Coefficient-coordinate mismatch (e.g. multi-block model): not the
-        // single-block Gaussian case this exact engine handles.
-        return Ok(false);
-    }
-
-    let y_cal = calibration.y.to_owned();
-    let cal = fc::GaussianConformalCalibration {
-        x_cal: &x_cal,
-        y_cal: &y_cal,
-        offset_cal: &calibration.input.offset,
-        s_lambda: &s_lambda,
-    };
-    let test = fc::GaussianConformalTest {
-        x_test: &x_test,
-        offset_test: &input.offset,
-        mu_test: &result.mean,
-    };
-    let (lower, upper) = fc::gaussian_full_conformal_envelopes(&cal, &test, alpha)
-        .map_err(EstimationError::InvalidInput)?;
-    result.mean_lower = lower;
-    result.mean_upper = upper;
-    Ok(true)
 }
 
 /// Coefficient-level uncertainty and confidence intervals.
