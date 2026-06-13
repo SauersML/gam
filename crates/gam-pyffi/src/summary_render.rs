@@ -10,6 +10,7 @@
 //! (`summary_repr`, `summary_html`) stay in the parent module via a focused
 //! re-import.
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFloat, PyList, PyTuple};
 
