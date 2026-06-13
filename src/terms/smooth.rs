@@ -3660,6 +3660,13 @@ fn spatial_term_psi_bounds(
         -options.max_length_scale.ln(),
         -options.min_length_scale.ln(),
     );
+    // Constant-curvature: the ψ coordinate is the raw signed κ, so its window is
+    // the chart-feasible κ bracket, NOT a log-ℓ window. Mirrors the aniso bounds
+    // path's `constant_curvature_kappa_bounds` branch so the isotropic
+    // (non-aniso) seed clamp projects κ into the right interval.
+    if constant_curvature_term_spec(spec, term_idx).is_some() {
+        return constant_curvature_kappa_bounds(data, spec, term_idx);
+    }
     let Some(term) = spec.smooth_terms.get(term_idx) else {
         return fallback;
     };
