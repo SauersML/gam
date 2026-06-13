@@ -25318,6 +25318,23 @@ fn predict_columns(
             let z = gam::probability::standard_normal_quantile(0.5 + confidence_level * 0.5)?;
             let lower: Vec<f64> = eta.iter().zip(&se).map(|(m, s)| m - z * s).collect();
             let upper: Vec<f64> = eta.iter().zip(&se).map(|(m, s)| m + z * s).collect();
+            // Observation (predictive) interval (#1047): the scan IS the exact
+            // Gaussian smoothing-spline posterior, so the response-scale
+            // predictive variance is `Var(f(x*)) + σ²` where `Var(f(x*)) = se²`
+            // is the off-knot posterior variance from the bridge and
+            // `fit.sigma2` is the profiled Gaussian observation variance. The
+            // confidence band uses `se` alone; the observation band inflates by
+            // σ². Identity link means no response-scale transform is needed.
+            if options.observation_interval.unwrap_or(false) {
+                let obs_se: Vec<f64> =
+                    se.iter().map(|s| (s * s + fit.sigma2).max(0.0).sqrt()).collect();
+                let obs_lower: Vec<f64> =
+                    eta.iter().zip(&obs_se).map(|(m, s)| m - z * s).collect();
+                let obs_upper: Vec<f64> =
+                    eta.iter().zip(&obs_se).map(|(m, s)| m + z * s).collect();
+                columns.insert("observation_lower".to_string(), obs_lower);
+                columns.insert("observation_upper".to_string(), obs_upper);
+            }
             columns.insert("std_error".to_string(), se);
             columns.insert("mean_lower".to_string(), lower);
             columns.insert("mean_upper".to_string(), upper);
