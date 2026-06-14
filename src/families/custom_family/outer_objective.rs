@@ -231,47 +231,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         cached_active_sets = seed.active_sets.clone();
         refresh_all_block_etas(family, specs, &mut states)?;
     }
-    // Feasibility restoration for shape-constrained blocks (gam#1108). Every
-    // seed source has now been applied — `buildblock_states` (which routes the
-    // cold seed through `post_update_block_beta`) and, above, the warm-start
-    // copy (which routes a cached β through the SAME hook). For a family whose
-    // `post_update_block_beta` only VALIDATES feasibility against a scale-
-    // relative tolerance rather than projecting (the survival monotone
-    // time-warp block does exactly this), the resulting `states[b].beta` can be
-    // infeasible to the joint-Newton inner solve's active-set QP entry gate
-    // (`check_linear_feasibility`, fixed absolute `1e-8`): the interval-censored
-    // right-censored-at-L surrogate seed reaches it ≈5.8e-3 (scaled) outside the
-    // monotone cone, the gate rejects it as an "infeasible iterate", and the
-    // whole fit aborts. Restore feasibility ONCE here, BEFORE the first gradient
-    // evaluation (so the cached joint gradient / Hessian are built at a feasible
-    // β), by projecting each infeasible constrained block onto its polytope with
-    // the exact identity-Hessian active-set projection
-    // (`project_point_strictly_into_feasible_cone`: nearest strictly-interior
-    // point, clearing the gate by orders of magnitude in one certified solve).
-    // The per-cycle QP maintains feasibility from there. A block already
-    // feasible is left untouched (no perturbation of a well-conditioned fit); a
-    // malformed / empty-interior polytope yields `None` and is left for the gate
-    // to report honestly rather than silently forcing a point.
-    {
-        let entry_block_constraints = collect_block_linear_constraints(family, &states, specs)?;
-        let mut restored_any = false;
-        for (b, constraint) in entry_block_constraints.iter().enumerate() {
-            if let Some(constraints) = constraint
-                && check_linear_feasibility(&states[b].beta, constraints, 1e-8).is_err()
-                && let Some(restored) =
-                    crate::solver::active_set::project_point_strictly_into_feasible_cone(
-                        &states[b].beta,
-                        constraints,
-                    )
-            {
-                states[b].beta = restored;
-                restored_any = true;
-            }
-        }
-        if restored_any {
-            refresh_all_block_etas(family, specs, &mut states)?;
-        }
-    }
     let load_joint_started = std::time::Instant::now();
     if prelude_log {
         log::info!(
@@ -1840,13 +1799,30 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // or after the preconditioned-descent fallback replaced
                 // `search_delta`) fall back to box-truncating the search step.
                 let mut trial_delta;
-                let mut block_step_norms = if let Some(spectrum) = joint_spectrum.as_ref() {
+                let mut block_step_norms = if let Some(spectrum) =
+                    joint_spectrum.as_ref().filter(|_| search_joint_active_set.is_none())
+                {
                     // Exact Moré–Sorensen trust-region step at the current radius
                     // (gam#979). The step already lies in the `D`-metric ball, so
                     // no dogleg blend or box-truncation is applied: on a shrink the
                     // direction is RE-SOLVED (bending toward the gradient), the
                     // property the dogleg/truncation lacked. Re-solving reuses the
                     // cached factorization at O(p) cost.
+                    //
+                    // CONSTRAINED-PATH EXCLUSION (gam#1108). The Moré–Sorensen step
+                    // is the UNCONSTRAINED trust-region subproblem solution — it
+                    // honors the `D`-metric ball but NOT the linear inequality cone
+                    // `Aβ ≥ b`. On the constrained-QP path `joint_spectrum` is still
+                    // populated (the constrained branch builds it for the
+                    // Newton-decrement convergence certificate, NOT for the step),
+                    // so taking the spectral step here would override the QP's
+                    // feasible-to-feasible chord (`candidate_beta − beta_joint`) with
+                    // an off-cone step. The accepted trial β then leaves the monotone
+                    // time-derivative cone (raw `Aβ−b` ~5.5e-3) and the next cycle's
+                    // `check_linear_feasibility` rejects it — the interval-censored
+                    // survival warm-start abort. Gate on `is_none()` so the
+                    // constrained path falls through to box-truncating the feasible
+                    // QP chord, which keeps every sub-step in the cone.
                     trial_delta = spectrum.trust_region_step(joint_trust_radius).delta;
                     joint_trust_region_block_metric_norms(
                         &trial_delta,
