@@ -1,6 +1,6 @@
 
 #[cfg(test)]
 mod tests {
-include!("../../../tests/src_modules/smooth_tests_parts/part_000.rs");
-include!("../../../tests/src_modules/smooth_tests_parts/part_001.rs");
+include!("../../../tests/src_modules/smooth_design_assembly_constraint_tests.rs");
+include!("../../../tests/src_modules/smooth_adaptive_bounded_duchon_tests.rs");
 }

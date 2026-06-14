@@ -1418,6 +1418,58 @@ mod tests {
     }
 
     #[test]
+    fn survival_interval_censored_neg_hessian_fd() {
+        // Second μ-derivative of ℓ = log[S(L) − S(R)] for the interval kernel,
+        // FD-checked. `neg_hessian` stores −d²ℓ/dμ², so compare against the
+        // negated central second difference.
+        let ctx = QuadratureContext::new();
+        let mu = -0.2;
+        let sigma = 0.55;
+        let h = 2e-4;
+        let row = LatentSurvivalRow::interval_censored(0.0, 0.7, 1.9, 0.0, 0.0, 0.0);
+        let ll = |m: f64| {
+            LatentSurvivalRowJet::evaluate(&ctx, &row, m, sigma)
+                .unwrap()
+                .log_lik
+        };
+        let fd_d2 = (ll(mu + h) - 2.0 * ll(mu) + ll(mu - h)) / (h * h);
+        let jet = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, sigma).unwrap();
+        assert!(
+            (jet.neg_hessian - (-fd_d2)).abs() / fd_d2.abs().max(1e-12) < 1e-2,
+            "interval neg_hessian={}, fd(-d2)={}",
+            jet.neg_hessian,
+            -fd_d2
+        );
+    }
+
+    #[test]
+    fn survival_interval_censored_log_sigma_score_fd() {
+        // σ-recovery for interval data is driven by `score_log_sigma`, the
+        // derivative of ℓ = log[S(L) − S(R)] w.r.t. log σ. FD-check it directly
+        // against the row log-likelihood (this is the channel the interval fit's
+        // latent_sd estimate moves along, the test's primary metric).
+        let ctx = QuadratureContext::new();
+        let mu = 0.1;
+        let sigma: f64 = 0.6;
+        let h = 1e-5;
+        let row = LatentSurvivalRow::interval_censored(0.0, 0.8, 2.1, 0.0, 0.0, 0.0);
+        let ll_at = |s: f64| {
+            LatentSurvivalRowJet::evaluate(&ctx, &row, mu, s)
+                .unwrap()
+                .log_lik
+        };
+        // d/d(log σ) = σ · d/dσ, so FD over log σ directly.
+        let fd_dlogsigma =
+            (ll_at((sigma.ln() + h).exp()) - ll_at((sigma.ln() - h).exp())) / (2.0 * h);
+        let jet = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, sigma).unwrap();
+        assert!(
+            (jet.score_log_sigma - fd_dlogsigma).abs() / fd_dlogsigma.abs().max(1e-12) < 1e-3,
+            "interval score_log_sigma={}, fd={fd_dlogsigma}",
+            jet.score_log_sigma
+        );
+    }
+
+    #[test]
     fn log_kernel_single_term_log_sigma_derivatives_match_ghq_reference() {
         let ctx = QuadratureContext::new();
         let mu = 0.2;
