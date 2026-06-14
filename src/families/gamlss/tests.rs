@@ -1,6 +1,7 @@
+// Behavior tests for the gamlss family stack (real `#[cfg(test)] mod tests`).
+// `super::*` resolves to the parent `gamlss` module, whose flat re-exports
+// surface every concern-submodule item these tests exercise.
 
-#[cfg(test)]
-mod tests {
     use super::*;
     // Helpers exercised only by these tests; imported here (not at module scope)
     // so they are not flagged unused in a non-test `--lib` build.
@@ -8174,4 +8175,3 @@ mod tests {
             assert_wiggle_crosses_zero(&mixed, "mixed β·ψ");
         }
     }
-}

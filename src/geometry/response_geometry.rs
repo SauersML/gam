@@ -784,15 +784,13 @@ fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64) {
 /// points, not the mean — is the κ-restoring force that breaks the scale
 /// degeneracy of the dispersion / `dvol_κ`-density alone (see the module notes).
 /// Additive constants independent of κ are kept implicit; they cancel in every
-/// LR / profile-drop the CI machinery forms. `tol` / `max_iter` are unused now
-/// that μ is the closed-form flat centroid (kept for signature stability with the
-/// CI driver, which threads them through all `V_p` evaluations).
+/// LR / profile-drop the CI machinery forms. μ is the closed-form flat centroid,
+/// so the criterion is a pure function of κ with no inner tolerance/iteration
+/// budget (the outer κ̂ search owns those).
 pub fn response_curvature_criterion(
     values: ArrayView2<'_, f64>,
     dim: usize,
     kappa: f64,
-    _tol: f64,
-    _max_iter: usize,
 ) -> Result<(f64, Array1<f64>), String> {
     if !kappa.is_finite() {
         return Err("response curvature criterion: kappa must be finite".into());
@@ -894,23 +892,21 @@ pub fn fit_response_curvature(
     // and the CI walk. Every evaluation uses the same κ-independent flat-centroid
     // base, so the criterion is a clean 1-D function of κ.
     let mut v_p = |kappa: f64| -> Result<f64, String> {
-        response_curvature_criterion(values, dim, kappa, tol, max_iter).map(|(v, _)| v)
+        response_curvature_criterion(values, dim, kappa).map(|(v, _)| v)
     };
 
     // ── κ̂: golden-section minimisation inside the chart bracket. ────────────
     // The dispersion criterion is smooth and unimodal in practice; golden
     // section is derivative-free and respects the bracket bounds exactly.
     const GOLDEN_INV: f64 = 0.618_033_988_749_894_8; // 1/φ
-    const GOLDEN_TOL_REL: f64 = 1.0e-7;
-    const GOLDEN_MAX_ITER: usize = 200;
     let mut a = kappa_min;
     let mut b = kappa_max;
     let mut c = b - GOLDEN_INV * (b - a);
     let mut d_pt = a + GOLDEN_INV * (b - a);
     let mut fc = v_p(c)?;
     let mut fd = v_p(d_pt)?;
-    let ktol = GOLDEN_TOL_REL * (kappa_max - kappa_min).max(1.0);
-    for _ in 0..GOLDEN_MAX_ITER {
+    let ktol = (tol * (kappa_max - kappa_min)).max(tol).max(1.0e-12);
+    for _ in 0..max_iter {
         if (b - a).abs() <= ktol {
             break;
         }
@@ -929,7 +925,7 @@ pub fn fit_response_curvature(
         }
     }
     let kappa_hat = 0.5 * (a + b);
-    let (v_p_hat, base) = response_curvature_criterion(values, dim, kappa_hat, tol, max_iter)?;
+    let (v_p_hat, base) = response_curvature_criterion(values, dim, kappa_hat)?;
 
     // Exact outer curvature V_p''(κ̂) by a central second difference, on a step
     // scaled to the bracket; only used to size the Wald bracket of the CI walk.

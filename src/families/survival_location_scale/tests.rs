@@ -1,7 +1,4 @@
-
-#[cfg(test)]
-mod tests {
-    use super::*;
+use super::*;
     use crate::custom_family::BlockWorkingSet;
     use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
     use crate::types::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
@@ -5195,4 +5192,3 @@ mod tests {
             expected
         );
     }
-}
