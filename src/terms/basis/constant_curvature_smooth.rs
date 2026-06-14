@@ -549,8 +549,8 @@ pub(crate) fn constant_curvature_effective_length_jet(
     // at κ = 0). g is strictly increasing in L (g_L > 0: larger L ⇒ each entry
     // closer to 1), so Newton from ℓ_ref converges monotonically.
     let mut l = ell_ref;
-    pub(crate) const NEWTON_MAX_ITER: usize = 100;
-    pub(crate) const NEWTON_REL_TOL: f64 = 1.0e-13;
+    const NEWTON_MAX_ITER: usize = 100;
+    const NEWTON_REL_TOL: f64 = 1.0e-13;
     let mut converged = false;
     for _ in 0..NEWTON_MAX_ITER {
         let (g, g_l, ..) = data_center_fill_partials(data, centers, kappa, l)?;

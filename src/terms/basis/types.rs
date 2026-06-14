@@ -1667,7 +1667,7 @@ pub enum PenaltyDropReason {
 }
 
 
-pub(crate) fn default_normalization_scale() -> f64 {
+fn default_normalization_scale() -> f64 {
     1.0
 }
 

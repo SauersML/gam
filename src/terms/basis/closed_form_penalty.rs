@@ -504,7 +504,7 @@ pub fn matern_kernel_value(d: usize, ell: usize, kappa: f64, r: f64) -> f64 {
 }
 
 pub(crate) const DUCHON_SMALL_CHI_SERIES_MAX: f64 = 0.125;
-pub(crate) const DUCHON_SMALL_CHI_SERIES_MAX_TERMS: usize = 96;
+const DUCHON_SMALL_CHI_SERIES_MAX_TERMS: usize = 96;
 pub(crate) const DUCHON_SMALL_CHI_SERIES_REL_TOL: f64 = 4.0e-16;
 
 #[inline]
