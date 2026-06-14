@@ -3000,13 +3000,12 @@ fn sae_atom_inference_list<'py>(
         match &report.smooth_significance {
             Some(s) => {
                 let sd = PyDict::new(py);
-                match s.bartlett_corrected_p {
-                    Some(p) => sd.set_item("bartlett_corrected_p", p)?,
-                    None => sd.set_item("bartlett_corrected_p", py.None())?,
+                // #1103: any-n-valid split-LRT e-value for "atom smooth is
+                // non-constant" (null = constant). log E, with E_{H0}[E] ≤ 1.
+                match s.log_e_nonconstant {
+                    Some(log_e) => sd.set_item("log_e_nonconstant", log_e)?,
+                    None => sd.set_item("log_e_nonconstant", py.None())?,
                 }
-                sd.set_item("bartlett_factor", s.bartlett_factor)?;
-                sd.set_item("lr_stat", s.lr_stat)?;
-                sd.set_item("df", s.df)?;
                 a.set_item("smooth_significance", sd)?;
             }
             None => a.set_item("smooth_significance", py.None())?,
