@@ -65,12 +65,6 @@ pub enum ResidualDistribution {
 }
 
 pub trait ResidualDistributionOps {
-    fn cdf(&self, z: f64) -> f64;
-    fn pdf(&self, z: f64) -> f64;
-    fn pdf_derivative(&self, z: f64) -> f64;
-    fn pdfsecond_derivative(&self, z: f64) -> f64;
-    fn pdfthird_derivative(&self, z: f64) -> f64;
-
     /// Fourth derivative of the residual-distribution PDF, f''''(z).
     ///
     /// This is the m4 ingredient for the outer REML Hessian's Q[v_k, v_l] term.
@@ -84,76 +78,6 @@ pub trait ResidualDistributionOps {
 }
 
 impl ResidualDistributionOps for ResidualDistribution {
-    fn cdf(&self, z: f64) -> f64 {
-        match self {
-            ResidualDistribution::Gaussian => normal_cdf(z),
-            ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).mu
-            }
-            ResidualDistribution::Logistic => {
-                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).mu
-            }
-        }
-    }
-
-    fn pdf(&self, z: f64) -> f64 {
-        match self {
-            ResidualDistribution::Gaussian => normal_pdf(z),
-            ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).d1
-            }
-            ResidualDistribution::Logistic => {
-                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).d1
-            }
-        }
-    }
-
-    fn pdf_derivative(&self, z: f64) -> f64 {
-        match self {
-            ResidualDistribution::Gaussian => -z * normal_pdf(z),
-            ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).d2
-            }
-            ResidualDistribution::Logistic => {
-                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).d2
-            }
-        }
-    }
-
-    fn pdfsecond_derivative(&self, z: f64) -> f64 {
-        match self {
-            ResidualDistribution::Gaussian => {
-                let f = normal_pdf(z);
-                (z * z - 1.0) * f
-            }
-            ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).d3
-            }
-            ResidualDistribution::Logistic => {
-                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).d3
-            }
-        }
-    }
-
-    fn pdfthird_derivative(&self, z: f64) -> f64 {
-        match self {
-            ResidualDistribution::Gaussian => {
-                let f = normal_pdf(z);
-                -(z * z * z - 3.0 * z) * f
-            }
-            ResidualDistribution::Gumbel => inverse_link_pdfthird_derivative_for_inverse_link(
-                &InverseLink::Standard(StandardLink::CLogLog),
-                z,
-            )
-            .expect("standard cloglog inverse-link third derivative should evaluate"),
-            ResidualDistribution::Logistic => inverse_link_pdfthird_derivative_for_inverse_link(
-                &InverseLink::Standard(StandardLink::Logit),
-                z,
-            )
-            .expect("standard logit inverse-link third derivative should evaluate"),
-        }
-    }
-
     /// Fourth derivative of the residual-distribution PDF.
     ///
     /// # Derivations
