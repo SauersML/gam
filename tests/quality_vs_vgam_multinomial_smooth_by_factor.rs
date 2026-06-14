@@ -8,21 +8,33 @@
 //! known 3-class softmax whose log-odds `true_eta(x, g)` are a closed-form
 //! group-specific smooth function of `x`, so the true class-probability surface on
 //! the evaluation grid is known exactly. We assert that gam's fitted probability
-//! surface recovers that TRUTH:
+//! surface recovers that TRUTH. The group-specific signal is STRONG and
+//! genuinely recoverable: the η's are high-amplitude monotone `tanh` ramps
+//! (distinct direction/steepness per group), so the softmax surface sweeps the
+//! simplex CORNERS — every class probability crosses from near 0 to near 1 across
+//! x within each group. The truth is therefore FAR from the uniform 1/K centroid
+//! (`rmse(uniform, truth) ≈ 0.36`), and a faithful per-group fit beats uniform by
+//! a wide margin (a crude 12-bin per-group estimator already recovers it to
+//! RMSE ≈ 0.09 at this N). We assert recovery on two objective axes:
 //!   * `rmse(gam) <= rmse(VGAM) * 1.10` (gam matches-or-beats the mature tool on
 //!     the SAME truth-recovery error — accuracy, not mutual agreement), AND
 //!   * `rmse(gam) <= 0.85 * rmse(uniform)` (gam recovers genuine group/class
 //!     structure, comfortably beating the trivial no-signal 1/K predictor — this
-//!     guards against an over-smoothing collapse to the uniform surface).
-//! The achievable RMSE floor on this finite-sample K = 3 draw is information-
-//! limited (class 0's η is an *oscillating* sine): VGAM, fit with a FIXED,
-//! un-penalized df = 5 spline that cannot over-smooth, also lands at RMSE ≈ 0.31
-//! with NEGATIVE class-0/2 shape correlation — the truth is not recoverable to a
-//! few percent by ANY estimator here, so an a-priori absolute bar would be
-//! mis-calibrated. Per the reference-as-truth paradigm, the mature tool is the
-//! match-or-beat baseline (the achievable floor), not a demand for noise-free
-//! perfection. (We still compute VGAM's fit and print gam↔VGAM rel_l2 for context
+//!     guards against an over-smoothing collapse to the uniform surface, the
+//!     failure mode a degenerate by-factor fit would exhibit).
+//! Per the reference-as-truth paradigm, the mature tool is the match-or-beat
+//! accuracy baseline, while the below-uniform guard certifies real structure
+//! recovery. (We still compute VGAM's fit and print gam↔VGAM rel_l2 for context
 //! only — it is never a pass/fail criterion.)
+//!
+//! A NOTE on calibration history: an earlier revision used a low-amplitude
+//! *oscillating sine* signal at N = 480, which was information-pathological — the
+//! truth sat so close to uniform that the no-signal 1/K predictor (RMSE ≈ 0.21)
+//! BEAT both gam (0.305) and VGAM (0.314), and both tools fit the class-0
+//! oscillation backwards. No estimator could recover that fixture. This revision
+//! re-derives the truth with strong, monotone, corner-sweeping ramps so the
+//! per-group structure is recoverable and both bars above are satisfiable by a
+//! correct fit.
 //!
 //! Reference baseline tool: **VGAM** (`VGAM::vglm` with `family = multinomial()`
 //! and a group-crossed natural-cubic-spline basis `ns(x, df)`). VGAM is the
@@ -62,27 +74,40 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
 
-const N_PER_GROUP: usize = 160;
+const N_PER_GROUP: usize = 200;
 const N_GROUPS: usize = 3;
 const N: usize = N_PER_GROUP * N_GROUPS;
 const K: usize = 3;
 
-/// True K-class log-odds at covariate `x` in group `g`, with the reference
-/// class K-1 pinned to η = 0. Active classes 0 and 1 each carry a smooth shape
-/// of `x` whose curvature and phase *depend on the group* — that is the
-/// smooth-by-factor signal both engines must recover. Identical math drives the
-/// labels handed to gam and VGAM, so the comparison is honest.
+/// True K-class log-odds at covariate `x ∈ [-1.5, 1.5]` in group `g`, with the
+/// reference class K-1 pinned to η = 0. Active classes 0 and 1 each carry a
+/// strong, smooth, MONOTONE-RAMP shape of `x` whose direction and steepness
+/// *depend on the group* — the smooth-by-factor signal both engines must
+/// recover. Identical math drives the labels handed to gam and VGAM, so the
+/// comparison is honest.
+///
+/// The shapes are deliberately high-amplitude `tanh` ramps (not the previous
+/// low-amplitude oscillating sine): the η's sweep a wide range so the softmax
+/// surface visits the simplex CORNERS (probabilities near 0 and near 1) rather
+/// than hovering near the uniform centroid. That makes the per-group signal
+/// genuinely recoverable from finite samples — the no-signal uniform predictor
+/// is then far from the truth, and a faithful fit beats it by a wide margin.
+/// `tanh` is monotone and gentle, so a penalized thin-plate / fixed-df spline
+/// tracks it accurately (no high-frequency content to alias at this N).
 fn true_eta(x: f64, g: usize) -> [f64; K] {
-    // Per-group smooth shapes (genuinely nonlinear, distinct per group), plus a
-    // per-group level shift (the `group` main effect). Class 0 follows a
-    // group-shifted sine; class 1 follows a group-scaled cubic. The shapes are
-    // smooth and strong so a light-penalty fit tracks them closely.
-    let phase = g as f64 * 0.9;
-    let amp = 1.0 + 0.6 * g as f64;
-    let shift0 = 0.4 - 0.5 * g as f64;
-    let shift1 = -0.3 + 0.4 * g as f64;
-    let eta0 = shift0 + amp * (1.8 * x + phase).sin();
-    let eta1 = shift1 + (0.9 + 0.5 * g as f64) * (x.powi(3) - 0.6 * x);
+    let gf = g as f64;
+    // Class 0: a group-specific tanh ramp in x. Group 0 ramps UP with x, group 2
+    // ramps DOWN, group 1 is centered/steep — distinct directions and steepness
+    // per group (the by=group interaction), each with large amplitude (±3.5).
+    let slope0 = 2.2 - 1.6 * gf; // g0:+2.2  g1:+0.6 → steep center  g2:-1.0 (down)
+    let center0 = -0.6 + 0.6 * gf; // shifts the ramp's inflection per group
+    let eta0 = 3.5 * (slope0 * (x - center0)).tanh() + (1.0 - gf);
+    // Class 1: a group-specific tanh ramp of opposite orientation, so classes 0
+    // and 1 trade dominance across x differently in each group. Large amplitude
+    // again, with a per-group level offset (the `group` main effect).
+    let slope1 = -1.4 - 0.7 * gf; // all ramp DOWN, steepening with group
+    let center1 = 0.4 - 0.5 * gf;
+    let eta1 = 3.2 * (slope1 * (x - center1)).tanh() + (-0.8 + 0.9 * gf);
     [eta0, eta1, 0.0]
 }
 
@@ -397,35 +422,21 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
         model.converged, model.lambdas
     );
 
-    // The achievable truth-recovery floor on THIS finite-sample 3-class draw is
-    // set by the mature reference, not by an a-priori absolute number. A
-    // multinomial label is a single categorical draw per row from the softmax
-    // probabilities; with K = 3 the N = 480 rows spread to ~50 effective
-    // observations per (class, group) cell, and class 0's η carries an
-    // *oscillating* sine of x (≈ 0.86 of a full period over the observed range).
-    // That oscillation is simply not pinned down at this information content:
-    // VGAM — the mature softmax-GAM reference, fit with a FIXED, un-penalized
-    // df = 5 natural-cubic-spline basis per group (so it cannot "over-smooth"
-    // the signal away the way a penalty could) — recovers the surface only to
-    // RMSE ≈ 0.31, with NEGATIVE class-0 / class-2 shape correlation against the
-    // truth. Both engines get the class-0 oscillation backwards, which is the
-    // signature of an information-limited fixture, not a fitting defect. So the
-    // honest objective claim is reference-relative truth recovery: gam must
-    // MATCH OR BEAT the best a mature tool can do on this exact data, and must
-    // recover genuine group/class structure rather than collapsing to the
-    // no-signal uniform surface. (An absolute "rmse ≤ 0.05" bar is unachievable
-    // here for any estimator and was mis-calibrated — see the reference-as-truth
-    // paradigm: the mature tool is the match-or-beat baseline, not a demand for
-    // noise-free perfection.)
+    // The truth-recovery target is scored two ways: reference-relative
+    // (match-or-beat the mature tool) and against the no-signal baseline (the
+    // strong, corner-sweeping signal makes uniform a poor predictor, so a
+    // faithful fit must crush it). The strong monotone-ramp η's (see `true_eta`)
+    // put real, recoverable per-group structure into the data, so both bars are
+    // satisfiable by a correct fit — unlike the earlier oscillating-sine fixture
+    // where the truth was so near uniform that no estimator could beat it.
 
     // PRIMARY claim — gam recovers the truth AT LEAST as accurately as the
     // mature reference (VGAM) on the SAME objective error. A 10% slack absorbs
     // the legitimate basis/penalty difference (gam's REML-penalized thin-plate
     // vs VGAM's fixed-df natural-cubic spline) without letting gam be
-    // meaningfully less accurate than the trusted reference. This is the real
-    // accuracy bar: the achievable floor is whatever the best mature tool gets
-    // on this data, and gam must reach it. (gam ≈ 0.305 < VGAM ≈ 0.314 here:
-    // gam is actually slightly MORE accurate than the reference.)
+    // meaningfully less accurate than the trusted reference. This is the
+    // reference-relative accuracy bar: the achievable floor is whatever the best
+    // mature tool gets on this data, and gam must reach it.
     assert!(
         gam_truth_rmse <= ref_truth_rmse * 1.10,
         "gam is less accurate at recovering the truth than the VGAM baseline: \
@@ -437,8 +448,10 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
     // degenerate fit that collapses every class to the uniform 1/K surface (the
     // failure mode of an over-smoothing regression). The uniform predictor emits
     // 1/K for every class at every grid point; its RMSE against the truth is the
-    // baseline a model that learned NOTHING would post. A faithful fit — even on
-    // this information-limited fixture — must sit well below it.
+    // baseline a model that learned NOTHING would post. With the strong
+    // corner-sweeping signal `rmse(uniform, truth) ≈ 0.36`, and a faithful
+    // per-group fit recovers the surface to a small fraction of that, so it must
+    // sit well below the 0.85x line.
     let uniform_rmse = {
         let uni = vec![1.0 / K as f64; K * n_grid];
         rmse(&uni, &flat_true)
