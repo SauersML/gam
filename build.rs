@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -3075,8 +3075,8 @@ fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, u
             .expect("git ls-files emitted a non-UTF-8 path; repository paths must be UTF-8");
         let rel = PathBuf::from(&rel_text);
         let path = root.join(&rel);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        let line_count = match count_file_lines(&path) {
+            Ok(line_count) => line_count,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
                 panic!(
@@ -3085,7 +3085,6 @@ fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, u
                 )
             }
         };
-        let line_count = bytes.iter().filter(|byte| **byte == b'\n').count();
         if line_count > MAX_TRACKED_FILE_LINES {
             offenders.push((
                 rel,
@@ -3093,6 +3092,20 @@ fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, u
                 format!("{line_count} lines; limit is {MAX_TRACKED_FILE_LINES}"),
             ));
         }
+    }
+}
+
+fn count_file_lines(path: &Path) -> std::io::Result<usize> {
+    let file = fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = [0_u8; 64 * 1024];
+    let mut line_count = 0usize;
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            return Ok(line_count);
+        }
+        line_count += buf[..read].iter().filter(|byte| **byte == b'\n').count();
     }
 }
 
