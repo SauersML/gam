@@ -5292,8 +5292,11 @@ pub struct PredictPosteriorMeanResult {
     /// Response-scale observation (prediction) interval lower bound. `Some` only
     /// when the caller set [`PosteriorMeanOptions::include_observation_interval`]
     /// *and* the response family exposes a closed-form conditional variance; the
-    /// band is `μ ± z·√(Var(μ̂) + Var(Y|μ))` clamped to the response support
-    /// (built via [`family_observation_band`]).
+    /// band is `μ ± z·√(Var(μ̂) + Var(Y|μ))` clamped to the response support.
+    /// For heteroscedastic location-scale / dispersion predictors `Var(Y|μ)` is
+    /// the *per-row* noise from [`PredictionTransform::observation_noise`]; for
+    /// single-dispersion families it is the fit-level scalar built via
+    /// [`family_observation_band`].
     pub observation_lower: Option<Array1<f64>>,
     /// Response-scale observation (prediction) interval upper bound; companion of
     /// [`PredictPosteriorMeanResult::observation_lower`].

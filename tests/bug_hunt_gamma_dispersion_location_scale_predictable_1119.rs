@@ -323,6 +323,236 @@ fn gamma_dispersion_location_scale_assembles_covariance_and_is_predictable() {
     );
 }
 
+/// Regression for the posterior-mean *observation* (prediction) interval of a
+/// heteroscedastic dispersion location-scale model.
+///
+/// THE BUG: `predict_posterior_mean`'s observation band was assembled by
+/// `family_observation_band`, which reads a single fit-level scalar dispersion
+/// (`observation_phi()` / `observation_theta()` / `observation_standard_deviation()`)
+/// rather than the model's per-row precision submodel `precision = exp(eta_d)`.
+/// For a genuine dispersion-LS fit (the entire point of which is a non-constant
+/// variance) this collapsed the response-noise term to one constant, so the
+/// observation band had a near-constant half-width across x — too narrow where
+/// the true σ(x) is large and too wide where σ(x) is small. The companion
+/// `predict_full_uncertainty` path got this right (it routes the per-row
+/// `observation_noise(input)`), so the two prediction-interval APIs disagreed on
+/// the SAME fit.
+///
+/// THE GATE: build a Gamma dispersion-LS fit whose shape (hence σ(x)) genuinely
+/// varies across x, then assert
+///   1. the posterior-mean observation half-width VARIES across rows in step
+///      with the per-row `noise_sd` (the scalar-collapse made it ~constant), and
+///   2. the σ implied by the posterior-mean band matches the per-row predictive
+///      noise the full-uncertainty path uses, row by row.
+#[test]
+fn gamma_dispersion_posterior_mean_observation_band_is_per_row_not_scalar() {
+    use gam::predict::PredictUncertaintyOptions;
+    use gam::predict::interval_policy::PredictionTransform;
+
+    init_parallelism();
+    let n = 600usize;
+    let mut rng = Lcg(7119);
+    let x: Vec<f64> = (0..n)
+        .map(|i| -2.0 + 4.0 * (i as f64) / (n as f64 - 1.0))
+        .collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|&xi| {
+            let mu = mu_true(xi);
+            let nu = shape_true(xi);
+            rng.gamma(nu, mu / nu).max(1e-6)
+        })
+        .collect();
+
+    let headers = vec!["x".to_string(), "y".to_string()];
+    let records: Vec<csv::StringRecord> = (0..n)
+        .map(|i| csv::StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", y[i])]))
+        .collect();
+    let ds = encode_recordswith_inferred_schema(headers, records).expect("encode gamma data");
+    let col = ds.column_map();
+    let x_idx = col["x"];
+    let ncols = ds.headers.len();
+
+    let cfg = FitConfig {
+        family: Some("gamma".to_string()),
+        noise_formula: Some("s(x, k=8)".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ s(x, k=8)", &ds, &cfg).expect("gam gamma dispersion fit");
+    let FitResult::DispersionLocationScale(DispersionLocationScaleFitResult { fit, kind }) = result
+    else {
+        panic!("expected a DispersionLocationScale fit result");
+    };
+
+    let beta_mu = fit
+        .fit
+        .block_by_role(BlockRole::Location)
+        .expect("location (mean) block present")
+        .beta
+        .clone();
+    let beta_noise = fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .expect("scale (log-shape) block present")
+        .beta
+        .clone();
+    let covariance = fit
+        .fit
+        .beta_covariance()
+        .expect("joint covariance present")
+        .clone();
+
+    let predictor = DispersionLocationScalePredictor {
+        beta_mu,
+        beta_noise,
+        likelihood: kind.likelihood_spec(),
+        inverse_link: Some(kind.base_link()),
+        covariance: Some(covariance),
+    };
+
+    // Held-out grid spanning the training range so σ(x) genuinely varies.
+    let grid_n = 40usize;
+    let grid_x: Vec<f64> = (0..grid_n)
+        .map(|i| -1.8 + 3.6 * (i as f64) / (grid_n as f64 - 1.0))
+        .collect();
+    let mut test_grid = Array2::<f64>::zeros((grid_n, ncols));
+    for i in 0..grid_n {
+        test_grid[[i, x_idx]] = grid_x[i];
+    }
+    let mean_design = build_term_collection_design(test_grid.view(), &fit.meanspec_resolved)
+        .expect("rebuild mean design at grid");
+    let disp_design = build_term_collection_design(test_grid.view(), &fit.noisespec_resolved)
+        .expect("rebuild dispersion design at grid");
+    let input = PredictInput {
+        design: mean_design.design,
+        offset: Array1::<f64>::zeros(grid_n),
+        design_noise: Some(disp_design.design),
+        offset_noise: Some(Array1::<f64>::zeros(grid_n)),
+        auxiliary_scalar: None,
+        auxiliary_matrix: None,
+    };
+
+    // The per-row response-noise σ(x) the model actually implies — the exact
+    // quantity the full-uncertainty band consumes.
+    let per_row_noise = predictor
+        .observation_noise(&input)
+        .expect("observation noise must be available")
+        .expect("dispersion-LS exposes a per-row observation noise");
+    assert_eq!(per_row_noise.len(), grid_n);
+    // Sanity: σ(x) must genuinely vary (otherwise the test cannot distinguish a
+    // per-row band from a scalar one).
+    let noise_min = per_row_noise.iter().cloned().fold(f64::INFINITY, f64::min);
+    let noise_max = per_row_noise
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        noise_max > 1.5 * noise_min,
+        "test precondition: per-row σ(x) must vary materially across the grid \
+         (min={noise_min:.4}, max={noise_max:.4})"
+    );
+
+    let pm_options = PosteriorMeanOptions {
+        confidence_level: Some(0.95),
+        covariance_mode: InferenceCovarianceMode::Conditional,
+        include_observation_interval: true,
+    };
+    let pm = predictor
+        .predict_posterior_mean(&input, &fit.fit, &pm_options)
+        .expect("posterior-mean predict with observation interval");
+    let obs_lower = pm
+        .observation_lower
+        .as_ref()
+        .expect("observation lower band must be present");
+    let obs_upper = pm
+        .observation_upper
+        .as_ref()
+        .expect("observation upper band must be present");
+
+    // Recover, per row, the σ implied by the posterior-mean observation band.
+    // The band is μ ± z·√(SE(μ̂)² + σ²); with the per-row noise restored the
+    // implied √(SE²+σ²) must track √(SE²+σ_row²) row-by-row, NOT a constant.
+    let z = 1.959963984540054_f64; // Φ⁻¹(0.975)
+    let mean_se = pm
+        .eta_standard_error
+        .iter()
+        .zip(
+            // mean SE = |dμ/dη| · SE(η); on the log link dμ/dη = μ.
+            pm.mean.iter(),
+        )
+        .map(|(&se_eta, &mu)| mu.abs() * se_eta)
+        .collect::<Vec<f64>>();
+
+    let mut implied_sigma = Vec::with_capacity(grid_n);
+    for i in 0..grid_n {
+        // Use the wider (unclamped) tail as the band half-width: Gamma support
+        // is [0, ∞) so the upper edge is never clamped, giving a clean readout.
+        let half = (obs_upper[i] - pm.mean[i]) / z;
+        let total_var = (half * half - mean_se[i] * mean_se[i]).max(0.0);
+        implied_sigma.push(total_var.sqrt());
+    }
+
+    // (1) The band half-width must NOT be constant — the scalar-collapse bug made
+    //     the implied σ identical across rows.
+    let sig_min = implied_sigma.iter().cloned().fold(f64::INFINITY, f64::min);
+    let sig_max = implied_sigma
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        sig_max > 1.3 * sig_min,
+        "posterior-mean observation band must vary across rows with σ(x); a near-constant \
+         implied σ (min={sig_min:.4}, max={sig_max:.4}) is the scalar-dispersion bug"
+    );
+
+    // (2) The implied σ must match the per-row model noise it should be built
+    //     from (allowing a little slack for the small SE(μ̂)² term and the
+    //     Gamma-mean curvature in the posterior-mean point).
+    for i in 0..grid_n {
+        let rel = (implied_sigma[i] - per_row_noise[i]).abs() / per_row_noise[i].max(1e-9);
+        assert!(
+            rel < 0.20,
+            "row {i}: posterior-mean band implied σ={:.4} must match the per-row model \
+             noise σ(x)={:.4} (rel err {:.3}); the scalar-dispersion band ignored σ(x)",
+            implied_sigma[i],
+            per_row_noise[i],
+            rel
+        );
+    }
+
+    // (3) Cross-API consistency: the full-uncertainty observation band on the
+    //     SAME fit (which already used per-row noise) and the posterior-mean band
+    //     must now broadly agree on the band WIDTH at each row.
+    let unc_options = PredictUncertaintyOptions {
+        confidence_level: 0.95,
+        covariance_mode: InferenceCovarianceMode::Conditional,
+        includeobservation_interval: true,
+        ..PredictUncertaintyOptions::default()
+    };
+    let unc = predictor
+        .predict_full_uncertainty(&input, &fit.fit, &unc_options)
+        .expect("full-uncertainty predict with observation interval");
+    let unc_lo = unc
+        .observation_lower
+        .as_ref()
+        .expect("full-uncertainty observation lower present");
+    let unc_hi = unc
+        .observation_upper
+        .as_ref()
+        .expect("full-uncertainty observation upper present");
+    for i in 0..grid_n {
+        let pm_width = obs_upper[i] - obs_lower[i];
+        let unc_width = unc_hi[i] - unc_lo[i];
+        let rel = (pm_width - unc_width).abs() / unc_width.max(1e-9);
+        assert!(
+            rel < 0.25,
+            "row {i}: posterior-mean band width {pm_width:.4} must broadly agree with the \
+             full-uncertainty band width {unc_width:.4} (rel {rel:.3}); a large gap means the \
+             two prediction-interval APIs disagree on the same fit (the #1119-sibling bug)"
+        );
+    }
+}
+
 /// Shared #1119 predict-side gate for an *orthogonal* dispersion mean family
 /// (NegativeBinomial / Tweedie): the Fisher-orthogonal members returned `None`
 /// for the joint coefficient Hessian before #1119, so — exactly like the Gamma

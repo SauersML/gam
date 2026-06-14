@@ -713,20 +713,55 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
 
     if options.include_observation_interval {
         let z = validated_central_z(level)?;
-        let z_row = Array1::from_elem(result.eta.len(), z);
-        let etavar = result.eta_standard_error.mapv(|s| s * s);
-        let (obs_lower, obs_upper) = family_observation_band(
-            &transform.response_family(),
-            &result.eta,
-            &etavar,
-            &result.mean,
-            &mean_se,
-            &z_row,
-            &z_row,
-            fit,
-        );
-        result.observation_lower = obs_lower;
-        result.observation_upper = obs_upper;
+        match transform.observation_noise(input)? {
+            // Heteroscedastic location-scale / dispersion predictors carry a
+            // *per-row* observation noise σ(x) driven by their second linear
+            // predictor (the scale / log-precision submodel). The fit-level
+            // scalar dispersion read by `family_observation_band` collapses
+            // that to a single constant, which is wrong for exactly the
+            // families whose purpose is non-constant variance (Gaussian-LS,
+            // and the NB/Gamma/Beta/Tweedie dispersion-LS models). Build the
+            // predictive band from the per-row noise instead, using the same
+            // `μ ± z·√(SE(μ̂)² + σ(x)²)` convention and response-support clamp
+            // the full-uncertainty driver uses, so the two prediction-interval
+            // APIs agree on the same fit.
+            Some(noise_sd) => {
+                let bounds = transform.bounds();
+                let predictive_se = Array1::from_iter(
+                    mean_se
+                        .iter()
+                        .zip(noise_sd.iter())
+                        .map(|(&mse, &sd)| (mse * mse + sd * sd).max(0.0).sqrt()),
+                );
+                let half = predictive_se.mapv(|s| z * s);
+                let mut lower = &result.mean - &half;
+                let mut upper = &result.mean + &half;
+                bounds.clamp_in_place(&mut lower);
+                bounds.clamp_in_place(&mut upper);
+                result.observation_lower = Some(lower);
+                result.observation_upper = Some(upper);
+            }
+            // Single-distribution families with no per-row noise submodel:
+            // the fit-level scalar dispersion is the correct observation noise,
+            // and `family_observation_band` additionally applies the skew-aware
+            // Gamma predictive arm for the right-skewed positive families.
+            None => {
+                let z_row = Array1::from_elem(result.eta.len(), z);
+                let etavar = result.eta_standard_error.mapv(|s| s * s);
+                let (obs_lower, obs_upper) = family_observation_band(
+                    &transform.response_family(),
+                    &result.eta,
+                    &etavar,
+                    &result.mean,
+                    &mean_se,
+                    &z_row,
+                    &z_row,
+                    fit,
+                );
+                result.observation_lower = obs_lower;
+                result.observation_upper = obs_upper;
+            }
+        }
     }
 
     Ok(result)
