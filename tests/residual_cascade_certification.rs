@@ -11,8 +11,11 @@
 //!   is an estimator, but a deterministic one — fixed probes);
 //! - PCG iterative route: backward-error certificate honored and iteration
 //!   count n-independent (the operational content of the norm equivalence);
-//! - level-diagonal preconditioner conditioning bounded uniformly in depth
-//!   (the norm equivalence measured directly on small dense fixtures);
+//! - coarse-space additive-Schwarz preconditioner conditioning bounded
+//!   uniformly in depth (the norm equivalence measured directly on small dense
+//!   fixtures: the block-arrow P = blockdiag(A_CC, diag A_FF) is reconstructed
+//!   from the public dense system + coarse cut and its whitened condition number
+//!   must stay flat as the cascade deepens);
 //! - cascade vs a dense single-scale Wendland kernel solve on small n at
 //!   the native smoothness s = (d+3)/2 (the spec's norm-equivalence oracle);
 //! - posterior perturb-and-solve samples match the exact `σ̂²A⁻¹` moments;
@@ -340,8 +343,9 @@ fn cascade_recovers_planted_smooth() {
 
 /// SLQ logdet vs the exact dense logdet across the λ range, and invariance
 /// of the coarse-grid REML λ-selection under the SLQ substitution. SLQ only
-/// estimates the small preconditioned remainder (the level-diagonal control
-/// variate carries the bulk exactly), and the probes are FIXED, so this is a
+/// estimates the small preconditioned remainder (the coarse-space + Jacobi
+/// control variate `log|P|` carries the bulk exactly), and the probes are
+/// FIXED, so this is a
 /// deterministic, reproducible bound — honest, not exact: 1% relative plus a
 /// 0.5-nat absolute floor on the logdet, and the grid argmax may shift by at
 /// most one step.
@@ -418,8 +422,9 @@ fn pcg_route_certified_and_iteration_count_n_independent() {
             fit.certificate.solve_rel_residual
         );
         assert!(
-            fit.certificate.solve_iters >= 1 && fit.certificate.solve_iters <= 200,
-            "PCG iteration count out of range at n {n}: {}",
+            fit.certificate.solve_iters >= 1 && fit.certificate.solve_iters <= 60,
+            "PCG iteration count out of range at n {n}: {} (the coarse-space preconditioner \
+             targets the spec's 20–60 iters n-independent)",
             fit.certificate.solve_iters
         );
         // A certified-route prediction must still hand back a positive
@@ -428,11 +433,72 @@ fn pcg_route_certified_and_iteration_count_n_independent() {
         assert!(var > 0.0, "non-positive iterative-route variance {var}");
         iter_counts.push(fit.certificate.solve_iters);
     }
+    eprintln!("[1032-NINDEP] iter_counts 12k/48k = {iter_counts:?}");
+    // Genuine n-independence is an ADDITIVE bound: quadrupling n adds at most a
+    // small constant to the iteration count (the coarse-space deflation makes
+    // the conditioning, hence ~√cond iterations, depth/n-independent). This is
+    // the principled bound the pure-Jacobi diagonal could not meet — its count
+    // grew multiplicatively with n.
     assert!(
-        iter_counts[1] <= 2 * iter_counts[0],
-        "PCG iterations grew beyond constant-factor control with n: {} at 12k vs {} at 48k",
+        iter_counts[1] <= iter_counts[0] + 10,
+        "PCG iterations grew with n beyond the additive n-independence bound: {} at 12k vs {} \
+         at 48k",
         iter_counts[0],
         iter_counts[1]
+    );
+}
+
+/// Depth-independence of the iterative route — the SAME root cause as the
+/// n-independence gate (the preconditioner conditioning must not grow with the
+/// number of resolution levels) attacked from a different angle: hold n FIXED
+/// and DEEPEN the cascade, and require the realized PCG iteration count to stay
+/// flat. The pure-Jacobi diagonal failed exactly here — each added level is
+/// another cross-scale-correlated block the diagonal cannot decouple, so its
+/// count climbed level by level. The coarse-space preconditioner deflects every
+/// data-dominated level into the exact coarse solve and Jacobi-handles the
+/// penalty-dominated tail, so deepening past the resolved scale adds only
+/// well-conditioned fine levels and the count saturates.
+#[test]
+fn pcg_iteration_count_independent_of_cascade_depth() {
+    let n = 24_000;
+    let (axes, y, w) = sample(2, n, 0.1, 0x1032_0D07);
+    let xs = axis_refs(&axes);
+    let mut iters = Vec::new();
+    let mut depths = Vec::new();
+    for levels in [4usize, 6, 8] {
+        let design =
+            ResidualCascadeDesign::build(&xs, &y, &w, &[1.0, 1.0], 2.0, levels).expect("build");
+        if design.num_coeffs() <= 1536 {
+            continue; // need the iterative route to be engaged
+        }
+        let fit = design.fit_at(0.0, None).expect("fit_at");
+        assert_eq!(fit.certificate.logdet_method, LogdetMethod::Slq);
+        assert!(
+            fit.certificate.solve_rel_residual <= 1e-9,
+            "uncertified solve at depth {levels}: {}",
+            fit.certificate.solve_rel_residual
+        );
+        depths.push(levels);
+        iters.push(fit.certificate.solve_iters);
+    }
+    eprintln!("[1032-DEPTH] depths={depths:?} iters={iters:?}");
+    assert!(
+        iters.len() >= 2,
+        "fixture never engaged the iterative route across the depth sweep"
+    );
+    let lo = *iters.iter().min().unwrap();
+    let hi = *iters.iter().max().unwrap();
+    assert!(
+        hi <= 60,
+        "iteration count exceeded the n-independent target while deepening: {iters:?}"
+    );
+    // The spread across a 4×-deeper cascade is an additive constant, not growth
+    // proportional to depth — the operational content of depth-independent
+    // conditioning.
+    assert!(
+        hi <= lo + 12,
+        "PCG iteration count grew with cascade depth — preconditioner conditioning is \
+         depth-dependent (the pure-Jacobi failure mode): {iters:?}"
     );
 }
 
@@ -440,8 +506,8 @@ fn pcg_route_certified_and_iteration_count_n_independent() {
 /// where duchon/matern build dense n×k kernels per hyperparameter trial"). Two
 /// claims, certified without wall-clock thresholds:
 ///
-/// 1. At a design past the dense sizing cap (PCG + level-diagonal BPX route
-///    engaged), the certified sparse solve's matvec work is below the cubic
+/// 1. At a design past the dense sizing cap (PCG + coarse-space additive-Schwarz
+///    route engaged), the certified sparse solve's matvec work is below the cubic
 ///    dense factorization work it replaces.
 /// 2. Across a 4× jump in n at fixed depth the PCG iteration count remains
 ///    bounded by a constant factor, so total sparse work tracks the CSR size
@@ -511,11 +577,12 @@ fn cascade_sparse_work_beats_dense_factorization_and_scales_near_linearly() {
         work_ratios.push(f.certificate.solve_iters as f64 * d.num_nonzeros() as f64 / n as f64);
     }
     // The exact iteration count can drift with the realized greedy net because
-    // m is also changing with n, but a certified solve must not be hiding an
-    // unbounded PCG tail. Per-row sparse work stays within a constant factor.
+    // m is also changing with n, but the coarse-space preconditioner holds it to
+    // an ADDITIVE n-independence bound, so per-row sparse work tracks the CSR
+    // size rather than growing from iteration creep.
     assert!(
-        iter_counts[1] <= 2 * iter_counts[0],
-        "PCG iteration count grew without the BPX bound's constant-factor control: \
+        iter_counts[1] <= iter_counts[0] + 10,
+        "PCG iteration count grew with n beyond the additive coarse-space bound: \
          {} at 12k vs {} at 48k",
         iter_counts[0],
         iter_counts[1]
@@ -529,23 +596,98 @@ fn cascade_sparse_work_beats_dense_factorization_and_scales_near_linearly() {
     );
 }
 
-/// The level-diagonal preconditioner must condition the system uniformly in
-/// cascade depth — the norm equivalence measured directly: on a small dense
-/// fixture, cond(P^{-1/2}AP^{-1/2}) stays bounded and grows by at most a
-/// constant factor as the depth doubles twice.
+/// The coarse-space additive-Schwarz preconditioner must condition the system
+/// uniformly in cascade depth — the operational content of the norm
+/// equivalence, measured directly. On a small dense fixture we reconstruct the
+/// EXACT preconditioner the library's iterative route uses, `P = blockdiag(
+/// A_CC, diag A_FF)` with the coarse cut taken from the public
+/// `coarse_space_cols`, whiten `M = L_P^{-1} A L_P^{-T}` (so cond(M) =
+/// cond(P^{-1}A)), and require cond(M) to stay BOUNDED and FLAT as the depth
+/// grows. This is the gate the pure-Jacobi diagonal failed: its whitened
+/// condition number climbs with every added level (the cross-scale frame
+/// redundancy the diagonal cannot decouple), which is exactly why its CG
+/// iteration count was n-dependent. A pure-Jacobi control is measured alongside
+/// to document the contrast.
 #[test]
-fn level_diagonal_preconditioner_conditions_uniformly_in_depth() {
+fn coarse_space_preconditioner_conditions_uniformly_in_depth() {
     let n = 800;
     let (axes, y, w) = sample(2, n, 0.1, 0x1032_0006);
     let xs = axis_refs(&axes);
     let lambda = 1.0_f64;
+    let log_lambda = 0.0_f64;
+
+    // M = L_P^{-1} A L_P^{-T} for an SPD preconditioner P given by its lower
+    // Cholesky factor `lp`; cond(M) = cond(P^{-1} A). Two forward-substitution
+    // passes (U = L_P^{-1} A, then M^T solved column-by-column).
+    fn whiten(a: &[f64], lp: &[f64], m: usize) -> Vec<f64> {
+        let mut u = vec![0.0_f64; m * m];
+        for c in 0..m {
+            for i in 0..m {
+                let mut s = a[i * m + c];
+                for t in 0..i {
+                    s -= lp[i * m + t] * u[t * m + c];
+                }
+                u[i * m + c] = s / lp[i * m + i];
+            }
+        }
+        let mut mm = vec![0.0_f64; m * m];
+        for r in 0..m {
+            for i in 0..m {
+                let mut s = u[r * m + i];
+                for t in 0..i {
+                    s -= lp[i * m + t] * mm[r * m + t];
+                }
+                mm[r * m + i] = s / lp[i * m + i];
+            }
+        }
+        mm
+    }
+
+    // cond of a symmetric PD M: λmax by power iteration, λmin by inverse
+    // iteration on Cholesky(M).
+    fn cond_sym(mmat: &[f64], m: usize, seed: u64) -> f64 {
+        let matvec = |v: &[f64], out: &mut [f64]| {
+            for i in 0..m {
+                let mut s = 0.0;
+                for j in 0..m {
+                    s += mmat[i * m + j] * v[j];
+                }
+                out[i] = s;
+            }
+        };
+        let mut rng = Rng(seed);
+        let mut v: Vec<f64> = (0..m).map(|_| rng.normal()).collect();
+        let mut tmp = vec![0.0_f64; m];
+        let mut lam_max = 0.0;
+        for _ in 0..400 {
+            matvec(&v, &mut tmp);
+            lam_max = tmp.iter().map(|x| x * x).sum::<f64>().sqrt();
+            for j in 0..m {
+                v[j] = tmp[j] / lam_max;
+            }
+        }
+        let (lm, _) = dense_cholesky(mmat, m);
+        let mut u: Vec<f64> = (0..m).map(|_| rng.normal()).collect();
+        let mut inv_norm = 0.0;
+        for _ in 0..400 {
+            let s = dense_solve(&lm, m, &u);
+            inv_norm = s.iter().map(|x| x * x).sum::<f64>().sqrt();
+            for j in 0..m {
+                u[j] = s[j] / inv_norm;
+            }
+        }
+        lam_max * inv_norm
+    }
+
     let mut conds = Vec::new();
-    for levels in [2usize, 3, 4] {
+    let mut jacobi_conds = Vec::new();
+    let mut cuts = Vec::new();
+    for levels in [2usize, 4, 6] {
         let design =
             ResidualCascadeDesign::build(&xs, &y, &w, &[1.0, 1.0], 2.0, levels).expect("build");
         let oracle = dense_oracle(&design, &axes, &y, &w, lambda);
         let m = oracle.m;
-        // Reconstruct A = L L' and form M = D^{-1/2} A D^{-1/2}.
+        // A = L L' from the oracle's Cholesky factor.
         let mut a = vec![0.0_f64; m * m];
         for i in 0..m {
             for j in 0..m {
@@ -556,56 +698,47 @@ fn level_diagonal_preconditioner_conditions_uniformly_in_depth() {
                 a[i * m + j] = s;
             }
         }
+        // Coarse-space preconditioner P = blockdiag(A_CC, diag A_FF).
+        let nc = design.coarse_space_cols(log_lambda).min(m);
+        cuts.push(nc);
+        let mut p = vec![0.0_f64; m * m];
+        for i in 0..nc {
+            for j in 0..nc {
+                p[i * m + j] = a[i * m + j];
+            }
+        }
+        for j in nc..m {
+            p[j * m + j] = a[j * m + j];
+        }
+        let (lp, _) = dense_cholesky(&p, m);
+        let mp = whiten(&a, &lp, m);
+        conds.push(cond_sym(&mp, m, 0x1032_00C0));
+
+        // Pure-Jacobi control, for contrast.
         let d_inv_sqrt: Vec<f64> = (0..m).map(|j| 1.0 / a[j * m + j].sqrt()).collect();
-        let mut mmat = vec![0.0_f64; m * m];
+        let mut mj = vec![0.0_f64; m * m];
         for i in 0..m {
             for j in 0..m {
-                mmat[i * m + j] = a[i * m + j] * d_inv_sqrt[i] * d_inv_sqrt[j];
+                mj[i * m + j] = a[i * m + j] * d_inv_sqrt[i] * d_inv_sqrt[j];
             }
         }
-        // λmax by power iteration, λmin by inverse iteration on Cholesky(M).
-        let matvec = |mat: &[f64], v: &[f64], out: &mut [f64]| {
-            for i in 0..m {
-                let mut s = 0.0;
-                for j in 0..m {
-                    s += mat[i * m + j] * v[j];
-                }
-                out[i] = s;
-            }
-        };
-        let mut rng = Rng(0x1032_00C0);
-        let mut v: Vec<f64> = (0..m).map(|_| rng.normal()).collect();
-        let mut tmp = vec![0.0_f64; m];
-        let mut lam_max = 0.0;
-        for _ in 0..300 {
-            matvec(&mmat, &v, &mut tmp);
-            lam_max = tmp.iter().map(|x| x * x).sum::<f64>().sqrt();
-            for j in 0..m {
-                v[j] = tmp[j] / lam_max;
-            }
-        }
-        let (lm, _) = dense_cholesky(&mmat, m);
-        let mut u: Vec<f64> = (0..m).map(|_| rng.normal()).collect();
-        let mut inv_norm = 0.0;
-        for _ in 0..300 {
-            let s = dense_solve(&lm, m, &u);
-            inv_norm = s.iter().map(|x| x * x).sum::<f64>().sqrt();
-            for j in 0..m {
-                u[j] = s[j] / inv_norm;
-            }
-        }
-        let lam_min = 1.0 / inv_norm;
-        conds.push(lam_max / lam_min);
+        jacobi_conds.push(cond_sym(&mj, m, 0x1032_00C1));
     }
+    eprintln!(
+        "[1032-COND] coarse cuts={cuts:?} coarse_conds={conds:?} jacobi_conds={jacobi_conds:?}"
+    );
     for (idx, &c) in conds.iter().enumerate() {
         assert!(
-            c.is_finite() && c > 1.0 && c <= 2.0e4,
-            "preconditioned condition number out of range at depth index {idx}: {c} (all: {conds:?})"
+            c.is_finite() && c >= 1.0 && c <= 1.0e2,
+            "coarse-space preconditioned condition number out of range at depth index {idx}: \
+             {c} (all: {conds:?})"
         );
     }
+    // Depth independence: the deepest cascade's conditioning is within a small
+    // constant factor of the shallowest — NOT growing with depth.
     assert!(
-        conds[2] <= 6.0 * conds[0].max(10.0),
-        "conditioning degrades with depth — norm equivalence violated: {conds:?}"
+        conds[2] <= 2.5 * conds[0].max(2.0),
+        "coarse-space conditioning degrades with depth — norm equivalence violated: {conds:?}"
     );
 }
 
@@ -718,6 +851,7 @@ fn cascade_matches_dense_wendland_kernel_solve() {
         rmse_kernel <= 2.0 * noise,
         "dense kernel reference failed its own sanity gate: rmse {rmse_kernel}"
     );
+    eprintln!("[1032-WENDLAND] rmse_cascade={rmse_cascade} rmse_kernel={rmse_kernel}");
     assert!(
         rmse_cascade <= 2.0 * rmse_kernel,
         "cascade falls behind the dense kernel solve: {rmse_cascade} vs {rmse_kernel}"
@@ -853,6 +987,7 @@ fn gap_bridges_without_sagging_and_variance_grows() {
         (gap_mean - gap_truth).abs() <= 0.25,
         "gap bridge missed the planted smooth: mean {gap_mean} vs truth {gap_truth}"
     );
+    eprintln!("[1032-GAP] gap_var={gap_var} median_var={median_var}");
     assert!(
         gap_var > median_var,
         "posterior variance failed to grow into the gap: {gap_var} vs covered median {median_var}"

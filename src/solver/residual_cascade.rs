@@ -30,10 +30,19 @@
 //! level whose supports cover it, O(qL) nonzeros — and is held in CSR. For
 //! moderate column counts (`m ≤ DENSE_GRAM_MAX`) the normal equations are
 //! solved by dense Cholesky with the EXACT log-determinant (same route as the
-//! grid sibling); beyond that the solve is level-diagonal (Jacobi/BPX-flavor)
-//! preconditioned CG — the norm equivalence is precisely what makes
-//! `P^{−1/2}(X'WX+λD)P^{−1/2}` uniformly conditioned, so the iteration count
-//! is n-independent by design (the in-test gate asserts it). Every CG solve
+//! grid sibling); beyond that the solve is preconditioned CG with the two-level
+//! additive-Schwarz coarse-space preconditioner `P = blockdiag(A_CC,
+//! diag(A_FF))`. The multilevel Wendland frame is redundant across scales — a
+//! coarse bump and the fine bumps in its support are strongly correlated — so
+//! the data-fit Gram `X'WX` couples levels and a pure-diagonal preconditioner
+//! leaves a conditioning that GROWS with the number of data-identified levels
+//! (hence with n). The coarse space `C` (polynomial layer + the data-dominated
+//! coarsest levels, see `coarse_space_cols`) is solved EXACTLY by a small dense
+//! Cholesky and the penalty-dominated fine tail `F` — where `A_ll ≈ λ d_l I` is
+//! already uniformly conditioned — by its Jacobi diagonal. That deflation is
+//! what makes `P^{−1/2}(X'WX+λD)P^{−1/2}` uniformly conditioned, so the CG
+//! iteration count is genuinely n-independent (the in-test gate asserts an
+//! ADDITIVE bound across a 4× n jump, not a multiplicative one). Every CG solve
 //! reports its relative residual `‖b − Ac‖/‖b‖`: a computable backward-error
 //! certificate (`c` solves a system perturbed by no more than that fraction)
 //! inherited by every linear functional of the solution.
@@ -120,6 +129,36 @@ const LOG_LAMBDA_TOL: f64 = 1e-6;
 /// without strengthening any downstream certificate.
 const CG_RTOL: f64 = 1e-9;
 const CG_MAX_ITERS: usize = 4000;
+
+/// Coarse-space additive-Schwarz preconditioner controls (issue #1032: the
+/// "BPX/level-diagonal preconditioned CG, n-independent iters" spec).
+///
+/// The multilevel Wendland frame is redundant across scales — a coarse bump and
+/// the fine bumps inside its support are strongly correlated — so the data-fit
+/// Gram `X'WX` couples levels and a pure-diagonal (Jacobi) preconditioner leaves
+/// a conditioning that grows with the number of *data-identified* levels, hence
+/// with `n` (more rows ⇒ finer levels carry data ⇒ another collinear coarse
+/// scale the diagonal can't decouple). The cure is the textbook two-level
+/// additive Schwarz coarse space: solve the coarse block — the polynomial layer
+/// plus every level the penalty has NOT yet made diagonally dominant — EXACTLY,
+/// and precondition the remaining penalty-dominated fine levels (where
+/// `A_ll ≈ λ d_l I` is already uniformly conditioned) by their Jacobi diagonal.
+///
+/// A level is "data-dominated" while `λ d_l < COARSE_DOMINANCE · median diag
+/// (X'WX) over the level`. Because columns are laid out poly, level-0, level-1,
+/// … and `d_l` increases while the per-level data weight decreases, the
+/// data-dominated levels are exactly the coarsest prefix `[0, ncoarse)`, so the
+/// coarse space is a contiguous column prefix and the cut is a single scan. The
+/// crossover level grows only as `½ log₄(n/λ)` — `ncoarse = O(√(n/λ))` columns —
+/// so the exact coarse factorization stays small against the sparse matvecs at
+/// every n the primitive serves. [`COARSE_SPACE_MAX`] caps it as a safety valve
+/// (past the cap the finer data-dominated levels fall back to Jacobi and the
+/// iteration count rises, but the CG residual certificate still guarantees the
+/// solve); [`MIN_COARSE_LEVELS`] always deflates the two coarsest scales, which
+/// are near-collinear with the polynomial layer at every λ.
+const COARSE_DOMINANCE: f64 = 4.0;
+const COARSE_SPACE_MAX: usize = 1024;
+const MIN_COARSE_LEVELS: usize = 2;
 
 /// Quasi-uniformity guard (issue #1032, caveat 2). The BPX n-independent CG
 /// iteration bound rests on the nested ε-nets being quasi-uniform *in the
@@ -454,6 +493,90 @@ pub struct ResidualCascadeState {
     pub predict_chol: Vec<f64>,
 }
 
+/// Forward substitution `L y = b` (lower factor, row-major) into `out`.
+fn forward_sub_into(l: &[f64], p: usize, b: &[f64], out: &mut [f64]) {
+    for i in 0..p {
+        let mut s = b[i];
+        for t in 0..i {
+            s -= l[i * p + t] * out[t];
+        }
+        out[i] = s / l[i * p + i];
+    }
+}
+
+/// Back substitution `Lᵀ z = y` (lower factor, row-major) into `out`.
+fn back_sub_into(l: &[f64], p: usize, y: &[f64], out: &mut [f64]) {
+    for i in (0..p).rev() {
+        let mut s = y[i];
+        for t in i + 1..p {
+            s -= l[t * p + i] * out[t];
+        }
+        out[i] = s / l[i * p + i];
+    }
+}
+
+/// Coarse-space additive-Schwarz preconditioner for the iterative route
+/// (issue #1032). `A = X'WX + λD` is preconditioned by the symmetric positive
+/// definite block-diagonal `P = blockdiag(A_CC, diag(A_FF))`, where the coarse
+/// index set `C = [0, ncoarse)` is the polynomial layer plus the data-dominated
+/// (coarsest) levels and `F` the penalty-dominated fine tail — see the
+/// [`COARSE_DOMINANCE`]/[`COARSE_SPACE_MAX`] docs for why this delivers
+/// n-independent CG iteration counts where the pure-Jacobi diagonal does not.
+///
+/// `solve` applies `P⁻¹` (exact coarse Cholesky solve ⊕ fine Jacobi). For the
+/// SLQ log-determinant the symmetric factor `R = blockdiag(L_CC, diag√A_FF)`
+/// with `P = R Rᵀ` is exposed through `apply_r_inv`/`apply_r_inv_t`, and
+/// `log|P| = log|A_CC| + Σ_F log A_jj`.
+struct Preconditioner {
+    /// First fine column; coarse block is the principal `[0, ncoarse)` submatrix.
+    ncoarse: usize,
+    /// Lower Cholesky factor of the coarse block `A_CC` (`ncoarse × ncoarse`).
+    coarse_chol: Vec<f64>,
+    /// `log|A_CC|` (exact).
+    coarse_logdet: f64,
+    /// `1/A_jj` on the fine columns `[ncoarse, m)`.
+    inv_fine: Vec<f64>,
+    /// `1/√A_jj` on the fine columns (the `R⁻¹`/`R⁻ᵀ` fine scaling).
+    inv_sqrt_fine: Vec<f64>,
+    /// `Σ_F log A_jj` (the fine part of `log|P|`).
+    fine_logdet: f64,
+}
+
+impl Preconditioner {
+    /// `out = P⁻¹ r`: exact coarse solve on `[0, ncoarse)`, Jacobi on the tail.
+    fn solve(&self, r: &[f64], out: &mut [f64]) {
+        let nc = self.ncoarse;
+        let zc = chol_solve(&self.coarse_chol, nc, &r[..nc]);
+        out[..nc].copy_from_slice(&zc);
+        for (k, o) in out[nc..].iter_mut().enumerate() {
+            *o = r[nc + k] * self.inv_fine[k];
+        }
+    }
+
+    /// `out = R⁻ᵀ v` (coarse: `L_CCᵀ` back-solve; fine: `/√A_jj`).
+    fn apply_r_inv_t(&self, v: &[f64], out: &mut [f64]) {
+        let nc = self.ncoarse;
+        back_sub_into(&self.coarse_chol, nc, &v[..nc], &mut out[..nc]);
+        for (k, o) in out[nc..].iter_mut().enumerate() {
+            *o = v[nc + k] * self.inv_sqrt_fine[k];
+        }
+    }
+
+    /// `out = R⁻¹ v` (coarse: `L_CC` forward-solve; fine: `/√A_jj`).
+    fn apply_r_inv(&self, v: &[f64], out: &mut [f64]) {
+        let nc = self.ncoarse;
+        forward_sub_into(&self.coarse_chol, nc, &v[..nc], &mut out[..nc]);
+        for (k, o) in out[nc..].iter_mut().enumerate() {
+            *o = v[nc + k] * self.inv_sqrt_fine[k];
+        }
+    }
+
+    /// `log|P| = log|A_CC| + Σ_F log A_jj`.
+    fn logdet(&self) -> f64 {
+        self.coarse_logdet + self.fine_logdet
+    }
+}
+
 impl Core {
     /// Scale a raw point into shifted metric coordinates.
     fn scale_point(&self, x: &[f64]) -> [f64; 3] {
@@ -509,12 +632,103 @@ impl Core {
     /// Jacobi / level-diagonal preconditioner: `diag(X'WX) + λ·diag(λD)`.
     /// Levels share a constant prior weight, so this IS the level-block
     /// (BPX-flavored) diagonal in the multilevel frame.
-    fn precond_diag(&self, lambda: f64) -> Vec<f64> {
-        self.gram_diag
-            .iter()
-            .zip(self.pen_diag.iter())
-            .map(|(&g, &d)| g + lambda * d)
-            .collect()
+    /// Coarse column count of the additive-Schwarz coarse space at `λ`: the
+    /// polynomial layer plus the longest prefix of data-dominated levels
+    /// (`λ d_l < COARSE_DOMINANCE · median diag(X'WX) over the level`), with the
+    /// two coarsest levels always deflated and the total capped at
+    /// [`COARSE_SPACE_MAX`]. Because `d_l` rises while the per-level data weight
+    /// falls, the data-dominated set is a contiguous prefix, so one scan from the
+    /// coarsest level finds the cut. (See [`COARSE_DOMINANCE`].)
+    fn coarse_space_cols(&self, lambda: f64) -> usize {
+        let mut ncoarse = self.nullity();
+        let mut buf: Vec<f64> = Vec::new();
+        for (li, level) in self.levels.iter().enumerate() {
+            let a = level.col_offset;
+            let b = a + level.centers.len();
+            if b <= a {
+                continue;
+            }
+            if b > COARSE_SPACE_MAX {
+                break;
+            }
+            let dominated = if li < MIN_COARSE_LEVELS {
+                true
+            } else {
+                buf.clear();
+                buf.extend_from_slice(&self.gram_diag[a..b]);
+                buf.sort_unstable_by(|x, y| x.partial_cmp(y).unwrap());
+                let gram_median = buf[buf.len() / 2];
+                lambda * level.weight < COARSE_DOMINANCE * gram_median
+            };
+            if dominated {
+                ncoarse = b;
+            } else {
+                break;
+            }
+        }
+        // Keep at least one fine column so the split is well-defined; if every
+        // level is coarse the iterative route is degenerate anyway and the dense
+        // route would have been taken, but guard regardless.
+        ncoarse.min(self.m)
+    }
+
+    /// Build the coarse-space additive-Schwarz preconditioner at `λ`: assemble
+    /// and factor the coarse block `A_CC` from the CSR (coarse columns are the
+    /// prefix `[0, ncoarse)`, and each CSR row is column-sorted, so a row's
+    /// coarse entries are its leading run), then the Jacobi diagonal on the fine
+    /// tail. `O(n · q_C²) + O(ncoarse³)` — paid once per `λ`, not per CG step.
+    fn build_preconditioner(&self, lambda: f64) -> Result<Preconditioner, String> {
+        let m = self.m;
+        let nc = self.coarse_space_cols(lambda);
+        let mut acc = vec![0.0_f64; nc * nc];
+        for i in 0..self.w.len() {
+            let lo = self.row_ptr[i];
+            let hi = self.row_ptr[i + 1];
+            // Leading run of coarse columns (CSR rows are column-sorted).
+            let mut end = lo;
+            while end < hi && (self.col_idx[end] as usize) < nc {
+                end += 1;
+            }
+            for ea in lo..end {
+                let ca = self.col_idx[ea] as usize;
+                let va = self.w[i] * self.vals[ea];
+                for eb in ea..end {
+                    let cb = self.col_idx[eb] as usize;
+                    acc[ca * nc + cb] += va * self.vals[eb];
+                }
+            }
+        }
+        for i in 0..nc {
+            for j in i + 1..nc {
+                acc[j * nc + i] = acc[i * nc + j];
+            }
+        }
+        for i in 0..nc {
+            acc[i * nc + i] += lambda * self.pen_diag[i];
+        }
+        let coarse_logdet = cholesky_logdet(&mut acc, nc)?;
+        let mut inv_fine = Vec::with_capacity(m - nc);
+        let mut inv_sqrt_fine = Vec::with_capacity(m - nc);
+        let mut fine_logdet = 0.0;
+        for j in nc..m {
+            let p = self.gram_diag[j] + lambda * self.pen_diag[j];
+            if !(p.is_finite() && p > EIG_FLOOR) {
+                return Err(format!(
+                    "residual cascade: non-positive preconditioner diagonal {p} at column {j}"
+                ));
+            }
+            inv_fine.push(1.0 / p);
+            inv_sqrt_fine.push(1.0 / p.sqrt());
+            fine_logdet += p.ln();
+        }
+        Ok(Preconditioner {
+            ncoarse: nc,
+            coarse_chol: acc,
+            coarse_logdet,
+            inv_fine,
+            inv_sqrt_fine,
+            fine_logdet,
+        })
     }
 
     /// Preconditioned CG on `(X'WX + λD)c = b` to relative residual CG_RTOL.
@@ -526,18 +740,12 @@ impl Core {
         warm: Option<&[f64]>,
     ) -> Result<(Vec<f64>, f64, usize), String> {
         let m = self.m;
-        let prec = self.precond_diag(lambda);
-        for (j, &p) in prec.iter().enumerate() {
-            if !(p.is_finite() && p > EIG_FLOOR) {
-                return Err(format!(
-                    "residual cascade: non-positive preconditioner diagonal {p} at column {j}"
-                ));
-            }
-        }
+        let prec = self.build_preconditioner(lambda)?;
         let b_norm = b.iter().map(|v| v * v).sum::<f64>().sqrt();
         if b_norm == 0.0 {
             return Ok((vec![0.0; m], 0.0, 0));
         }
+        let mut zv = vec![0.0; m];
         let mut x = match warm {
             Some(x0) => {
                 if x0.len() != m {
@@ -548,18 +756,17 @@ impl Core {
                 }
                 x0.to_vec()
             }
-            None => b
-                .iter()
-                .zip(prec.iter())
-                .map(|(&bj, &pj)| bj / pj)
-                .collect(),
+            None => {
+                prec.solve(b, &mut zv);
+                zv.clone()
+            }
         };
         let mut r = vec![0.0; m];
         self.matvec(lambda, &x, &mut r);
         for (ri, &bi) in r.iter_mut().zip(b.iter()) {
             *ri = bi - *ri;
         }
-        let mut zv: Vec<f64> = r.iter().zip(prec.iter()).map(|(&ri, &p)| ri / p).collect();
+        prec.solve(&r, &mut zv);
         let mut p_dir = zv.clone();
         let mut rz: f64 = r.iter().zip(zv.iter()).map(|(&a, &c)| a * c).sum();
         let mut ap = vec![0.0; m];
@@ -580,9 +787,7 @@ impl Core {
                 x[j] += alpha * p_dir[j];
                 r[j] -= alpha * ap[j];
             }
-            for j in 0..m {
-                zv[j] = r[j] / prec[j];
-            }
+            prec.solve(&r, &mut zv);
             let rz_new: f64 = r.iter().zip(zv.iter()).map(|(&a, &c)| a * c).sum();
             let beta = rz_new / rz;
             rz = rz_new;
@@ -592,8 +797,8 @@ impl Core {
         }
         Err(format!(
             "residual cascade: CG failed to reach relative residual {CG_RTOL} within \
-             {CG_MAX_ITERS} iterations (the norm-equivalence preconditioner should make this \
-             n-independent; this indicates a degenerate design)"
+             {CG_MAX_ITERS} iterations (the coarse-space additive-Schwarz preconditioner should \
+             make this n-independent; this indicates a degenerate design)"
         ))
     }
 
@@ -628,26 +833,23 @@ impl Core {
         cholesky_logdet(&mut a, self.m)
     }
 
-    /// SLQ log-determinant: exact diagonal control variate `Σ log P_jj` plus
-    /// stochastic Lanczos quadrature for `tr log(P^{−1/2}AP^{−1/2})` on fixed
-    /// deterministic Rademacher probes shared across every λ (common random
-    /// numbers ⇒ the REML criterion is a smooth deterministic function of λ).
+    /// SLQ log-determinant: exact control variate `log|P|` (the coarse-space
+    /// additive-Schwarz preconditioner's own log-determinant — `log|A_CC|` plus
+    /// the fine Jacobi `Σ_F log A_jj`) plus stochastic Lanczos quadrature for
+    /// `tr log(R⁻¹ A R⁻ᵀ)`, `P = R Rᵀ`, on fixed deterministic Rademacher probes
+    /// shared across every λ (common random numbers ⇒ the REML criterion is a
+    /// smooth deterministic function of λ). The same coarse deflation that makes
+    /// the PCG iteration count n-independent makes `R⁻¹ A R⁻ᵀ` uniformly
+    /// conditioned, so the Lanczos quadrature converges in a depth-independent
+    /// number of steps too.
     fn logdet_slq(&self, lambda: f64) -> Result<f64, String> {
         let m = self.m;
-        let prec = self.precond_diag(lambda);
-        let mut logdet = 0.0;
-        for (j, &p) in prec.iter().enumerate() {
-            if !(p.is_finite() && p > EIG_FLOOR) {
-                return Err(format!(
-                    "residual cascade: non-positive diagonal {p} at column {j} in SLQ"
-                ));
-            }
-            logdet += p.ln();
-        }
-        let sqrt_p: Vec<f64> = prec.iter().map(|&p| p.sqrt()).collect();
-        // M·v = P^{−1/2} A P^{−1/2} v without forming M.
+        let prec = self.build_preconditioner(lambda)?;
+        let logdet = prec.logdet();
+        // M·v = R⁻¹ A R⁻ᵀ v (eigenvalues of P^{−1/2} A P^{−1/2}) without forming M.
         let mut scratch_in = vec![0.0; m];
         let mut scratch_out = vec![0.0; m];
+        let mut vbuf = vec![0.0; m];
         let mut trace_est = 0.0;
         let steps = SLQ_LANCZOS_STEPS.min(m);
         let mut basis: Vec<Vec<f64>> = Vec::with_capacity(steps);
@@ -669,11 +871,11 @@ impl Core {
             let mut beta: Vec<f64> = Vec::with_capacity(steps);
             let mut q_prev: Option<Vec<f64>> = None;
             for _step in 0..steps {
-                for j in 0..m {
-                    scratch_in[j] = q[j] / sqrt_p[j];
-                }
+                // v = R⁻¹ A R⁻ᵀ q.
+                prec.apply_r_inv_t(&q, &mut scratch_in);
                 self.matvec(lambda, &scratch_in, &mut scratch_out);
-                let mut v: Vec<f64> = (0..m).map(|j| scratch_out[j] / sqrt_p[j]).collect();
+                prec.apply_r_inv(&scratch_out, &mut vbuf);
+                let mut v: Vec<f64> = vbuf.clone();
                 let a: f64 = v.iter().zip(q.iter()).map(|(&x, &y)| x * y).sum();
                 alpha.push(a);
                 for j in 0..m {
@@ -1199,6 +1401,17 @@ impl ResidualCascadeDesign {
     /// guard prevents the silent O(n·iters) blow-up up front.
     pub fn quasi_uniformity_certified(&self) -> bool {
         self.metric_scaled_aspect_ratio() <= QUASI_UNIFORMITY_MAX_ASPECT
+    }
+
+    /// Number of columns `ncoarse` in the additive-Schwarz coarse space at `log
+    /// λ` (the polynomial layer plus the data-dominated coarsest levels). The
+    /// iterative-route preconditioner solves the principal `[0, ncoarse)` block
+    /// of `A = X'WX + λD` exactly and Jacobi-preconditions the fine tail; exposed
+    /// so the conditioning oracle can reconstruct that block-arrow preconditioner
+    /// from the public dense system and certify it is uniformly conditioned in
+    /// depth. See [`COARSE_DOMINANCE`].
+    pub fn coarse_space_cols(&self, log_lambda: f64) -> usize {
+        self.core.coarse_space_cols(log_lambda.exp())
     }
 
     /// Total coefficient count (`dim + 1` polynomial + all centers).
