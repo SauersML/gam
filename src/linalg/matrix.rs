@@ -191,8 +191,15 @@ fn weighted_crossprod_dense_view(
         return weighted_crossprod_dense_rows(left, weights, right, 0..n);
     }
 
-    let n_threads = rayon::current_num_threads();
-    let chunk_rows = n.div_ceil(n_threads * 4).max(1);
+    let min_parallel_work = WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
+    let Some(chunk_rows) = crate::parallel_strategy::row_reduction_chunk_rows(
+        n,
+        p_left.saturating_mul(p_right),
+        p_left.saturating_mul(p_right),
+        min_parallel_work,
+    ) else {
+        return weighted_crossprod_dense_rows(left, weights, right, 0..n);
+    };
     let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
     let partials: Vec<Array2<f64>> = starts
         .into_par_iter()
@@ -502,9 +509,15 @@ fn sparse_csr_weighted_xtwx(
         return sparse_csr_weighted_xtwx_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     }
 
-    let n_threads = rayon::current_num_threads();
-    let target_chunks = (n_threads * 8).max(1);
-    let chunk_rows = n.div_ceil(target_chunks).max(1);
+    let min_parallel_work = SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
+    let Some(chunk_rows) = crate::parallel_strategy::row_reduction_chunk_rows(
+        n,
+        avg.min(usize::MAX as u64) as usize,
+        p.saturating_mul(p),
+        min_parallel_work,
+    ) else {
+        return sparse_csr_weighted_xtwx_rows(row_ptr, col_idx, vals, p, weights, 0..n);
+    };
     let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
     let partials: Vec<Array2<f64>> = starts
         .into_par_iter()
@@ -638,8 +651,12 @@ fn sparse_csr_diag_gram(
     if rayon::current_num_threads() <= 1 || work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
         return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     }
-    let n_threads = rayon::current_num_threads();
-    let chunk_rows = n.div_ceil(n_threads * 8).max(1);
+    let min_parallel_work = SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
+    let Some(chunk_rows) =
+        crate::parallel_strategy::row_reduction_chunk_rows(n, 1, p, min_parallel_work)
+    else {
+        return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
+    };
     let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
     let partials: Vec<Array1<f64>> = starts
         .into_par_iter()
