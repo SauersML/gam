@@ -2094,12 +2094,13 @@ pub fn build_smooth_basis(
                     "measurejet smooth s must lie in (0, 2) (or be omitted for auto); got {order_s}"
                 ));
             }
-            // Default to the principled density-free exponent (the spec
-            // Default, α = 3/2): the local contribution scales as ρ^{3−2α}, so
-            // α = 3/2 cancels the sampling density exactly. The old DSL default
-            // of 1.0 weighted the roughness by ρ — over-smoothing in
-            // high-density regions, exactly the #1116/#1041 accuracy deficit
-            // vs Duchon. An explicit `alpha=` still overrides.
+            // Default to the spec Default (α = 1, density-WEIGHTED Hessian
+            // energy — the module-header default). The density-free α = 3/2
+            // (q^{−2}) over-smooths low-intrinsic-dimension manifolds where the
+            // local mass q is tiny and varies along the stratum (#1116:
+            // 13×-worse-than-matérn on a 1-D curve in 3-D); α = 1's q^{−1} is
+            // gentler and robust across intrinsic dimensions. An explicit
+            // `alpha=` still overrides for full-dimensional density-free use.
             let alpha =
                 option_f64(options, "alpha").unwrap_or(MeasureJetBasisSpec::default().alpha);
             if !alpha.is_finite() {

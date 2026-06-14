@@ -271,11 +271,18 @@ impl Default for MeasureJetBasisSpec {
         Self {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 50 },
             order_s: 0.0,
-            // Density-free limiting energy: the local contribution scales as
-            // ρ^{3−2α}, so α = 3/2 cancels the sampling density exactly
-            // (α = 1 weighted the roughness by ρ; see the module-header
-            // derivation).
-            alpha: 1.5,
+            // Density-WEIGHTED Hessian energy (the module-header default): the
+            // outer weight is q^{1−2α} = q^{−1} at α = 1. The density-free
+            // variant α = 3/2 gives q^{−2}, which on a low-intrinsic-dimension
+            // stratum (data on a 1-D/2-D manifold embedded in higher ambient d)
+            // makes the local kernel mass q tiny AND spatially varying along
+            // the manifold, so q^{−2} amplifies the penalty unevenly and
+            // over-smooths the high-frequency signal there (MEASURED #1116: on
+            // the 1-D-curve-in-3-D fixture α = 3/2 left mjs ~13× worse than
+            // matérn). α = 1's q^{−1} weighting is far gentler and is the
+            // header-derived default; an explicit `alpha=` still overrides for
+            // genuinely density-free use on a full-dimensional stratum.
+            alpha: 1.0,
             tau0: 1e-3,
             num_scales: 0,
             length_scale: 0.0,
