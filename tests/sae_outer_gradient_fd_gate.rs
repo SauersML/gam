@@ -196,10 +196,119 @@ fn assert_full_gradient_matches_fd(label: &str, f: &Fixture) {
     }
 }
 
+/// K=2 fixture whose per-atom decoder design is RANK-DEFICIENT in the data —
+/// the #1117 OLMo-circle degeneracy. The latent coordinate is squeezed into a
+/// narrow phase band so the 2nd-harmonic basis pair `[sin 2θ, cos 2θ]` is
+/// barely excited and the bare data Gram `G_k = D_kᵀ D_k` drops rank. Under K=2
+/// the shared-row logit×coordinate Gauss-Newton cross term then drives a per-row
+/// `H_tt` block genuinely indefinite at/near the stationary point, so the
+/// undamped evidence factor must condition it by unit-stiffness SPECTRAL
+/// deflation (eigenvalue → +1, ρ-independent log 1 = 0). This is precisely the
+/// branch whose former ridge-damped fallback injected a ρ-dependent evidence
+/// bias and desynced the outer value from the analytic ρ-gradient (#1117). The
+/// certificate this test asserts — analytic ∂V/∂ρ ≈ centered FD of the actual
+/// re-solved criterion — is exactly `grad·v ≈ fd·v`: it holds iff the value and
+/// gradient ride the SAME deflated factorization.
+fn rank_deficient_fixture(mode: AssignmentMode, log_lambda_sparse: f64) -> Fixture {
+    let n = 80usize;
+    let p = 6usize;
+    let k_atoms = 2usize;
+    let m = 5usize;
+    let evaluator = PeriodicHarmonicEvaluator::new(m).expect("periodic evaluator");
+
+    let mut logits = Array2::<f64>::zeros((n, k_atoms));
+    // Squeeze both atoms' latent coordinate into a ±0.5%-wide band around 0.5:
+    // the periodic 2nd-harmonic columns `[sin 2θ, cos 2θ]` are then nearly
+    // unexcited, so the bare data Gram `G_k = D_kᵀ D_k` drops rank (the #1117
+    // OLMo-circle degeneracy). Under K=2 the shared-row logit×coordinate
+    // Gauss-Newton cross term drives a per-row `H_tt` block indefinite at/near
+    // the optimum, forcing the undamped evidence factor down the spectral
+    // unit-stiffness deflation path this fix installs.
+    let mut coords = vec![Array2::<f64>::zeros((n, 1)), Array2::<f64>::zeros((n, 1))];
+    let mut target = Array2::<f64>::zeros((n, p));
+    for row in 0..n {
+        let phase = 0.5 + 0.005 * ((row as f64 / n as f64) - 0.5);
+        coords[0][[row, 0]] = phase;
+        coords[1][[row, 0]] = phase;
+        let route = if row < n / 2 { 1.4 } else { -1.4 };
+        logits[[row, 0]] = route;
+        logits[[row, 1]] = if row % 3 == 0 { 0.9 } else { 0.3 };
+        let theta = std::f64::consts::TAU * phase;
+        let basis = [
+            1.0,
+            theta.sin(),
+            theta.cos(),
+            (2.0 * theta).sin(),
+            (2.0 * theta).cos(),
+        ];
+        for col in 0..p {
+            // Deterministic, finite target so the inner solve converges; the
+            // exact values do not matter for the FD certificate.
+            let mut v = 0.0;
+            for (b, &bv) in basis.iter().enumerate() {
+                v += bv * (0.1 + 0.03 * (b as f64) - 0.01 * (col as f64));
+            }
+            target[[row, col]] = v;
+        }
+    }
+
+    let mut atoms = Vec::with_capacity(k_atoms);
+    for atom_idx in 0..k_atoms {
+        let (phi, jet) = evaluator
+            .evaluate(coords[atom_idx].view())
+            .expect("periodic basis evaluation");
+        let decoder = Array2::from_shape_fn((m, p), |(r, c)| {
+            0.1 + 0.05 * (r as f64) - 0.02 * (c as f64) + 0.01 * (atom_idx as f64)
+        });
+        let mut smooth = Array2::<f64>::eye(m);
+        smooth[[0, 0]] = 0.0;
+        let atom = SaeManifoldAtom::new(
+            format!("circle_{atom_idx}"),
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            decoder,
+            smooth,
+        )
+        .expect("circle atom")
+        .with_basis_evaluator(Arc::new(
+            PeriodicHarmonicEvaluator::new(m).expect("periodic evaluator clone"),
+        ) as Arc<dyn SaeBasisEvaluator>);
+        atoms.push(atom);
+    }
+
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        coords,
+        vec![LatentManifold::Circle { period: 1.0 }; k_atoms],
+        mode,
+    )
+    .expect("assignment");
+    let term = SaeManifoldTerm::new(atoms, assignment).expect("term");
+    let rho = SaeManifoldRho::new(
+        log_lambda_sparse,
+        -8.0,
+        vec![Array1::from_vec(vec![-8.0]), Array1::from_vec(vec![-8.0])],
+    );
+    Fixture { term, target, rho }
+}
+
 #[test]
 fn sae_outer_rho_gradient_components_match_centered_fd_softmax() {
     let f = fixture(AssignmentMode::softmax(0.7), -8.0);
     assert_full_gradient_matches_fd("softmax", &f);
+}
+
+#[test]
+fn sae_outer_rho_gradient_certificate_consistent_under_rank_deficient_k2() {
+    // K=2 rank-deficient circle: the indefinite per-row H_tt must be spectral-
+    // deflated at unit stiffness, NOT ridge-damped, so the outer REML value and
+    // its analytic ρ-gradient stay consistent (grad·v ≈ fd·v). A ρ-dependent
+    // ridge bias would break this certificate and is what stalled the outer BFGS
+    // line-search for multi-atom fits (#1117).
+    let f = rank_deficient_fixture(AssignmentMode::softmax(0.7), -8.0);
+    assert_full_gradient_matches_fd("rank_deficient_k2_softmax", &f);
 }
 
 #[test]

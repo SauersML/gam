@@ -3039,21 +3039,21 @@ mod tests {
         );
     }
 
-    /// #1118: a per-row `H_tt` that is gauge-flat AND genuinely indefinite
-    /// off the gauge orbit (the pre-stationarity state K>1 IBP row-sharing
-    /// produces) must be REFUSED by the undamped evidence factor — the gauge
-    /// deflation cannot rescue a negative non-gauge eigenvalue — yet the
-    /// lightly-damped Direct per-row factor (the SAE driver's pre-stationarity
-    /// fallback) must condition it to a finite PD factor so the inner solve can
-    /// make progress; and the STATIONARY version of the same block (the
-    /// indefinite direction now positive, i.e. genuinely PD) must factor through
-    /// the undamped evidence path to the EXACT Cholesky `L Lᵀ = H_tt` with NO
-    /// ridge bias. This pins the three-way contract the
-    /// `converge_inner_for_undamped_logdet` budget-exhaust fallback relies on:
-    /// finite-and-progressing pre-stationarity, exact-and-unbiased at the
-    /// optimum.
+    /// #1117/#1118: a per-row `H_tt` that is gauge-flat AND genuinely indefinite
+    /// off the gauge orbit (the K>1 IBP/softmax row-sharing state) must be
+    /// conditioned by the undamped evidence factor through **unit-stiffness
+    /// spectral deflation** — `factor_spectral_deflated_evidence_row` discovers
+    /// the negative/flat eigen-direction the closed-form gauge deflation cannot
+    /// rescue and stiffens it to eigenvalue `+1` (a ρ-independent `log 1 = 0`
+    /// evidence contribution), NOT a ρ-dependent `+ridge·I` bias. And the
+    /// STATIONARY version of the same block (the indefinite direction now
+    /// positive, i.e. genuinely PD) must factor through the undamped evidence
+    /// path to the EXACT Cholesky `L Lᵀ = H_tt` with NO bias. This pins the
+    /// contract the `converge_inner_for_undamped_logdet` path relies on:
+    /// finite-and-bias-free pre-stationarity (so the outer REML value and its
+    /// analytic ρ-gradient agree), exact-and-unbiased at the optimum.
     #[test]
-    fn evidence_row_refuses_indefinite_non_gauge_block_but_damped_conditions_it() {
+    fn evidence_row_spectral_deflates_indefinite_non_gauge_block_at_unit_stiffness() {
         let d = 3usize;
         let k = 2usize;
 
@@ -3062,7 +3062,7 @@ mod tests {
         // qualifies for Faddeev-Popov deflation), e_2 is GENUINELY indefinite
         // (eigenvalue −1.0 — real negative curvature, NOT a gauge orbit). The
         // gauge deflation lifts only e_1 (→ +1), leaving the −1.0 along e_2, so
-        // the deflated block is still non-PD.
+        // the closed-form gauge deflation alone cannot make the block PD.
         let mut indef = ArrowRowBlock::new(d, k);
         indef.htt = array![
             [4.0_f64, 0.0, 0.0],
@@ -3081,35 +3081,52 @@ mod tests {
             "gauge deflation must NOT rescue a genuinely-indefinite non-gauge direction"
         );
 
-        // Undamped evidence factor (tolerate_ill_conditioning, ridge_t = 0,
-        // gauge passed in) must REFUSE — there is no genuine Cholesky to
-        // preserve. This is the exact error the driver detects pre-stationarity.
-        let refused =
-            factor_one_row_result(&indef, 0.0, d, 0, true, std::slice::from_ref(&gauge_e1));
-        match &refused {
-            Err(ArrowSchurError::PerRowFactorFailed { reason, .. }) => {
-                assert!(
-                    reason.contains("H_tt is non-PD at base ridge")
-                        && reason.contains("evidence mode preserves the genuine Cholesky"),
-                    "evidence refusal must carry the #1037 non-PD-preserve message; got: {reason}"
-                );
+        // Spectral deflation DISCOVERS the negative e_2 direction (and the flat
+        // e_1) from the block's own eigendecomposition and stiffens BOTH to +1,
+        // producing an SPD block. The two sub-floor eigenvalues (−1.0 and 1e-10
+        // vs floor = 1e-8·4) are counted; the genuine e_0 (eigenvalue 4.0) is
+        // preserved exactly.
+        let spectral = factor_spectral_deflated_evidence_row(&indef, d)
+            .expect("spectral deflation must condition the indefinite non-gauge block");
+        assert_eq!(
+            spectral.gauge_deflated_directions, 2,
+            "the two sub-floor eigen-directions (−1.0 and 1e-10) must be unit-deflated"
+        );
+        // Reconstruct L Lᵀ: e_0 keeps 4.0; the two deflated axes each carry +1.
+        let ls = &spectral.factor;
+        let mut recon = Array2::<f64>::zeros((d, d));
+        for i in 0..d {
+            for j in 0..d {
+                let mut acc = 0.0_f64;
+                for kk in 0..d {
+                    acc += ls[[i, kk]] * ls[[j, kk]];
+                }
+                recon[[i, j]] = acc;
             }
-            other => panic!(
-                "undamped evidence factor must refuse the indefinite block, got {other:?}"
-            ),
         }
+        assert!(
+            (recon[[0, 0]] - 4.0).abs() < 1.0e-9,
+            "genuine direction e_0 must be preserved exactly; got {}",
+            recon[[0, 0]]
+        );
+        assert!(
+            (recon[[2, 2]] - 1.0).abs() < 1.0e-9,
+            "the genuinely-indefinite direction e_2 must be deflated to unit \
+             stiffness +1 (log 1 = 0, ρ-independent), NOT ridge-damped; got {}",
+            recon[[2, 2]]
+        );
 
-        // The driver's pre-stationarity fallback: a lightly-damped Direct
-        // per-row factor (tolerate = false, caller's nominal ridge) conditions
-        // the SAME block to a finite, well-conditioned PD factor, letting the
-        // inner solve keep making progress instead of dying on the refusal.
-        let damped = factor_one_row(&indef, 1.0e-2, d, 0, false)
-            .expect("lightly-damped Direct factor must condition the indefinite block");
+        // The undamped evidence factor (tolerate_ill_conditioning, ridge_t = 0,
+        // gauge passed in) now SUCCEEDS on this block via spectral deflation
+        // rather than refusing — so the SAE driver gets a finite, BIAS-FREE
+        // evidence cache and never falls back to a ρ-dependent ridge.
+        let factored = factor_one_row_result(&indef, 0.0, d, 0, true, std::slice::from_ref(&gauge_e1))
+            .expect("undamped evidence factor must condition the indefinite block by deflation");
         for a in 0..d {
             assert!(
-                damped[[a, a]].is_finite() && damped[[a, a]] > 0.0,
-                "damped factor must have a finite positive pivot at {a}; got {}",
-                damped[[a, a]]
+                factored.factor[[a, a]].is_finite() && factored.factor[[a, a]] > 0.0,
+                "deflated evidence factor must have a finite positive pivot at {a}; got {}",
+                factored.factor[[a, a]]
             );
         }
 
