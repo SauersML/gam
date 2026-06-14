@@ -17,10 +17,12 @@
 //!   the "layer" axis: [`fit_transport_map`] aligns the atom's latent chart
 //!   across consecutive checkpoints (topology compatibility, isometry defect,
 //!   winding degree), packaged as a [`LayerTransportReport`].
-//! * [`crate::inference::structure_evidence`] — each per-step contrast feeds a
-//!   universal-inference split-likelihood e-value into a [`StructureLedger`]
-//!   e-process under the null "the atom did not change from checkpoint 0 to
-//!   checkpoint c". Optional-stopping-safe by construction.
+//! * [`crate::inference::structure_evidence`] — each consecutive-step contrast
+//!   feeds one anytime-valid e-value (the studentized displacement mapped to a
+//!   two-sided p-value and run through the frozen κ = ½ p→e calibrator) into a
+//!   per-step [`StructureLedger`] claim under the null "the atom did not change
+//!   at this checkpoint step". A genuine e-value (`E_{H0}[E] ≤ 1`), unlike the
+//!   divergent in-sample `exp(½ z²)` likelihood ratio; optional-stopping-safe.
 //!
 //! # Honest accounting of the Riesz inputs
 //!
@@ -44,8 +46,9 @@ use crate::inference::layer_transport::{ChartTopology, LayerTransportReport, fit
 use crate::inference::riesz::{
     RieszDebiasReport, RieszInput, SmoothFunctional, debias_with_dense_hessian,
 };
-use crate::inference::structure_evidence::{ClaimKind, StructureLedger};
+use crate::inference::structure_evidence::{ClaimKind, StructureLedger, log_e_from_p_calibrator};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView4};
+use statrs::distribution::{ContinuousCDF, Normal};
 
 /// Ridge penalty on the interpolation fit of the grid values. Small relative
 /// to the unit data Hessian so the fit tracks the grid closely; non-zero so
@@ -74,8 +77,8 @@ pub struct AtomTrajectory {
     /// Consecutive-checkpoint chart correspondences (checkpoint axis reused as
     /// the transport "layer" axis).
     pub transports: Vec<LayerTransportReport>,
-    /// Anytime-valid evidence that the atom changed from checkpoint 0 to each
-    /// checkpoint `c`, accumulated as one e-process per step.
+    /// Anytime-valid evidence that the atom changed at each consecutive
+    /// checkpoint step, one calibrated e-value per step into a per-step claim.
     pub change_evidence: StructureLedger,
 }
 
@@ -86,8 +89,8 @@ pub struct AtomTrajectory {
 ///    ([`fit_layer_transport`], checkpoint axis as the layer axis);
 /// 2. evaluates the Riesz-debiased decoder-displacement contrast at the
 ///    latent-grid mode ([`SmoothFunctional::Contrast`] + penalty debiasing);
-/// 3. absorbs the contrast as a universal-inference e-value into the atom's
-///    change e-process under the no-change null.
+/// 3. absorbs the studentized contrast as a calibrated anytime-valid e-value
+///    into the step's change claim under the no-change null.
 pub fn checkpoint_atom_dynamics(
     input: &CheckpointDynamicsInput<'_>,
 ) -> Result<Vec<AtomTrajectory>, String> {
@@ -210,22 +213,22 @@ pub fn checkpoint_atom_dynamics(
                 )
             })?;
 
-            // --- anytime-valid evidence the atom changed 0 → c+1 -------------
-            // Universal-inference split-likelihood e-value under the local
-            // Gaussian model `θ̂ ~ N(θ, se²)`: the no-change null is θ = 0, the
-            // alternative plugs in the debiased estimate, and the log-e-value
-            // is the log-likelihood ratio of the OBSERVED θ̂ under the
-            // alternative vs the null. Both densities are frozen by the
-            // estimate/SE before this comparison (the contrast is computed once
-            // and not refit on its own value), so the per-step ratios compound
-            // into a valid e-process.
+            // --- anytime-valid evidence the atom changed at this step --------
+            // The debiased displacement `θ̂` with SE `se` studentizes to
+            // `z = θ̂ / se` (local Gaussian `θ̂ ~ N(θ, se²)`). Its two-sided
+            // p-value run through the frozen κ = ½ p→e calibrator is a genuine
+            // e-value for the per-step no-change null θ = 0 — `E_{H0}[E] ≤ 1`,
+            // which the naive in-sample `exp(½ z²)` ratio is NOT (it diverges
+            // under H0). One e-value per step into a per-step claim; the
+            // calibrator's contract (one e-value per independent batch) is met
+            // because each step is a distinct checkpoint transition.
             let claim = change_evidence.register(ClaimKind::Custom {
                 label: format!(
-                    "atom '{atom_name}' changed by checkpoint {}",
-                    input.checkpoint_ids[c1]
+                    "atom '{atom_name}' changed from checkpoint {} to {}",
+                    input.checkpoint_ids[c0], input.checkpoint_ids[c1]
                 ),
             });
-            let log_e = no_change_log_e_value(report.theta_onestep, report.se);
+            let log_e = no_change_log_e_value(report.theta_onestep, report.se)?;
             change_evidence.absorb_log(claim, log_e)?;
 
             step_contrasts.push(report);
@@ -396,18 +399,35 @@ fn component_contrast(
     debias_with_dense_hessian(&input, hessian).map_err(|e| format!("Riesz debiasing failed: {e}"))
 }
 
-/// Universal-inference split-likelihood log-e-value for the no-change null
-/// `θ = 0` against the plug-in alternative `θ = θ̂`, under the local Gaussian
-/// model `θ̂ ~ N(θ, se²)`. The log-likelihood ratio of the observed `θ̂` is
-/// `[(θ̂ − 0)² − (θ̂ − θ̂)²] / (2 se²) = θ̂² / (2 se²)` — the squared
-/// studentized displacement in nats. A degenerate (non-positive) SE yields a
-/// zero log-e-value (no evidence rather than spurious certainty).
-fn no_change_log_e_value(theta_hat: f64, se: f64) -> f64 {
+/// Anytime-valid log-e-value for the no-change null `θ = 0` from the debiased,
+/// studentized displacement `z = θ̂ / se` (local Gaussian `θ̂ ~ N(θ, se²)`).
+///
+/// The naive in-sample likelihood ratio `exp(½ z²)` — the alternative density
+/// re-centered on the very estimate `θ̂` it is scored against — is NOT an
+/// e-value: under H0, `z ~ N(0,1)` and `E[exp(½ z²)] = ∫ φ(z) exp(½ z²) dz`
+/// DIVERGES, so it has no `E_{H0}[E] ≤ 1` guarantee. (Universal inference earns
+/// `exp(½ z²)` validity only with a held-out evaluation fold; a single grid of
+/// decoder values affords no such split.)
+///
+/// Instead we map the displacement to its two-sided normal p-value
+/// `p = 2(1 − Φ(|z|))` and route it through the module's frozen p→e calibrator
+/// [`log_e_from_p_calibrator`] (the κ = ½ member `e(p) = ½ p^{−1/2}`, with
+/// `∫₀¹ e(p) dp = 1`, hence `E_{H0}[e(P)] ≤ 1` for any superuniform p). This is
+/// a genuine e-value: no displacement, small e; a real displacement, large e;
+/// and it compounds validly into the change e-process. A degenerate
+/// (non-positive) SE yields a zero log-e-value (no evidence, not certainty).
+fn no_change_log_e_value(theta_hat: f64, se: f64) -> Result<f64, String> {
     if !(se > 0.0) || !theta_hat.is_finite() {
-        return 0.0;
+        return Ok(0.0);
     }
-    let z = theta_hat / se;
-    0.5 * z * z
+    let z = (theta_hat / se).abs();
+    let normal = Normal::new(0.0, 1.0)
+        .map_err(|e| format!("standard normal construction failed: {e}"))?;
+    // Two-sided p-value of the studentized displacement; clamp to (0, 1] so the
+    // calibrator (which rejects p = 0) sees a finite, valid argument even at a
+    // numerically saturated tail.
+    let p = (2.0 * (1.0 - normal.cdf(z))).clamp(f64::MIN_POSITIVE, 1.0);
+    log_e_from_p_calibrator(p)
 }
 
 #[cfg(test)]
@@ -450,7 +470,9 @@ mod tests {
     #[test]
     fn no_change_atom_has_near_zero_contrast_and_no_change_evidence() {
         let n_ckpt = 5;
-        let n_grid = 9;
+        // The transport fit requires at least MIN_TRANSPORT_OBS (16) paired
+        // grid samples, so the shared latent grid must be at least that long.
+        let n_grid = 17;
         let ambient = 3;
         let grid = drift_grid(n_ckpt, n_grid, ambient, 0.5);
         let latent: Array1<f64> = Array1::linspace(0.0, 1.0, n_grid);
@@ -487,7 +509,7 @@ mod tests {
     #[test]
     fn drifting_atom_recovers_displacement_and_accumulates_change_evidence() {
         let n_ckpt = 6;
-        let n_grid = 9;
+        let n_grid = 17;
         let ambient = 3;
         let shift = 0.7_f64;
         let grid = drift_grid(n_ckpt, n_grid, ambient, shift);
@@ -545,7 +567,7 @@ mod tests {
     #[test]
     fn drift_outweighs_constant_in_change_evidence() {
         let n_ckpt = 6;
-        let n_grid = 9;
+        let n_grid = 17;
         let ambient = 3;
         let grid = drift_grid(n_ckpt, n_grid, ambient, 0.7);
         let latent: Array1<f64> = Array1::linspace(0.0, 1.0, n_grid);
