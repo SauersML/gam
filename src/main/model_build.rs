@@ -1,9 +1,11 @@
 use super::*;
 
-pub(crate) fn set_training_feature_metadata_from_dataset(payload: &mut FittedModelPayload, ds: &Dataset) {
+pub(crate) fn set_training_feature_metadata_from_dataset(
+    payload: &mut FittedModelPayload,
+    ds: &Dataset,
+) {
     payload.set_training_feature_metadata(ds.headers.clone(), ds.feature_ranges());
 }
-
 
 pub(crate) fn deviation_block_config_from_formula_linkwiggle(
     wiggle: &LinkWiggleFormulaSpec,
@@ -36,13 +38,11 @@ pub(crate) fn deviation_block_config_from_formula_linkwiggle(
     })
 }
 
-
 #[derive(Debug)]
 pub(crate) struct MarginalSlopeDeviationRouting {
     pub(crate) score_warp: Option<DeviationBlockConfig>,
     pub(crate) link_dev: Option<DeviationBlockConfig>,
 }
-
 
 pub(crate) fn route_marginal_slope_deviation_blocks(
     main_linkwiggle: Option<&LinkWiggleFormulaSpec>,
@@ -58,7 +58,6 @@ pub(crate) fn route_marginal_slope_deviation_blocks(
     })
 }
 
-
 pub(crate) fn cli_frailty_kind(
     frailty_kind: Option<FrailtyKindArg>,
 ) -> Option<gam::config_resolve::CliFrailtyKind> {
@@ -67,7 +66,6 @@ pub(crate) fn cli_frailty_kind(
         FrailtyKindArg::HazardMultiplier => gam::config_resolve::CliFrailtyKind::HazardMultiplier,
     })
 }
-
 
 pub(crate) fn cli_hazard_loading(
     hazard_loading: Option<HazardLoadingArg>,
@@ -79,7 +77,6 @@ pub(crate) fn cli_hazard_loading(
         }
     })
 }
-
 
 pub(crate) fn latent_cloglog_state_from_frailty_spec(
     frailty: &gam::families::lognormal_kernel::FrailtySpec,
@@ -119,7 +116,6 @@ pub(crate) fn latent_cloglog_state_from_frailty_spec(
         .map_err(|e| format!("invalid latent-cloglog frailty sigma: {e}"))
 }
 
-
 pub(crate) fn fit_frailty_spec_from_args(
     args: &FitArgs,
     context: &str,
@@ -132,7 +128,6 @@ pub(crate) fn fit_frailty_spec_from_args(
     )
 }
 
-
 pub(crate) fn fit_frailty_spec_from_survival_args(
     args: &SurvivalArgs,
     context: &str,
@@ -144,7 +139,6 @@ pub(crate) fn fit_frailty_spec_from_survival_args(
         context,
     )
 }
-
 
 pub(crate) fn fixed_gaussian_shift_frailty_from_spec(
     frailty: &gam::families::lognormal_kernel::FrailtySpec,
@@ -172,7 +166,6 @@ pub(crate) fn fixed_gaussian_shift_frailty_from_spec(
     }
 }
 
-
 pub(crate) fn fixed_hazard_multiplier_from_saved_family(
     family: &FittedFamily,
 ) -> Result<(f64, gam::families::lognormal_kernel::HazardLoading), String> {
@@ -193,7 +186,6 @@ pub(crate) fn fixed_hazard_multiplier_from_saved_family(
         ),
     }
 }
-
 
 pub(crate) fn build_bernoulli_marginal_slope_saved_model(
     formula: String,
@@ -256,7 +248,6 @@ pub(crate) fn build_bernoulli_marginal_slope_saved_model(
     Ok(SavedModel::from_payload(payload))
 }
 
-
 pub(crate) fn resolve_bernoulli_marginal_slope_base_link(
     linkspec: Option<&LinkFormulaSpec>,
     context: &str,
@@ -293,7 +284,6 @@ pub(crate) fn resolve_bernoulli_marginal_slope_base_link(
     Ok(InverseLink::Standard(StandardLink::Probit))
 }
 
-
 pub(crate) fn build_transformation_normal_saved_model(
     formula: String,
     data_schema: DataSchema,
@@ -325,7 +315,6 @@ pub(crate) fn build_transformation_normal_saved_model(
     );
     SavedModel::from_payload(payload)
 }
-
 
 pub(crate) fn core_saved_fit_result(
     beta: Array1<f64>,
@@ -407,8 +396,10 @@ pub(crate) fn core_saved_fit_result(
     }
 }
 
-
-pub(crate) fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodSpec) -> Option<f64> {
+pub(crate) fn family_noise_parameter(
+    fit: &UnifiedFitResult,
+    family: LikelihoodSpec,
+) -> Option<f64> {
     match family.response {
         // The generative `gaussian_scale` slot carries the *dispersion* φ for
         // Tweedie; the variance power `p` is already read from the family spec by
@@ -440,7 +431,6 @@ pub(crate) fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodS
     }
 }
 
-
 #[derive(Clone)]
 pub(crate) struct SavedFitSummary {
     pub(crate) likelihood_family: Option<LikelihoodSpec>,
@@ -456,7 +446,6 @@ pub(crate) struct SavedFitSummary {
     pub(crate) reml_score: f64,
 }
 
-
 impl SavedFitSummary {
     fn validated(self) -> Result<Self, String> {
         ensure_finite_scalar("fit_result.log_likelihood", self.log_likelihood)?;
@@ -468,7 +457,9 @@ impl SavedFitSummary {
         Ok(self)
     }
 
-    pub(crate) fn from_blockwise_fit(fit: &gam::estimate::UnifiedFitResult) -> Result<Self, String> {
+    pub(crate) fn from_blockwise_fit(
+        fit: &gam::estimate::UnifiedFitResult,
+    ) -> Result<Self, String> {
         let stable_penalty_term = fit.stable_penalty_term;
         let max_abs_eta = fit
             .block_states
@@ -529,9 +520,7 @@ impl SavedFitSummary {
     }
 }
 
-
 use gam::estimate::{ensure_finite_scalar, validate_all_finite};
-
 
 pub(crate) fn termspec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
     spec.linear_terms.iter().any(|term| {
@@ -542,13 +531,11 @@ pub(crate) fn termspec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
     })
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AloRefitRoute {
     StandardGam,
     UnifiedTermCollection,
 }
-
 
 pub(crate) fn alo_refit_route_for_termspec(spec: &TermCollectionSpec) -> AloRefitRoute {
     if termspec_has_bounded_terms(spec) {
@@ -557,8 +544,6 @@ pub(crate) fn alo_refit_route_for_termspec(spec: &TermCollectionSpec) -> AloRefi
         AloRefitRoute::StandardGam
     }
 }
-
-
 
 pub(crate) fn compact_saved_multiblock_fit_result(
     blocks: Vec<gam::estimate::FittedBlock>,
@@ -598,7 +583,6 @@ pub(crate) fn compact_saved_multiblock_fit_result(
     fit_result
 }
 
-
 pub(crate) fn compact_saved_survival_location_scale_fit_result(
     fit: &UnifiedFitResult,
     inverse_link: &InverseLink,
@@ -619,19 +603,16 @@ pub(crate) fn compact_saved_survival_location_scale_fit_result(
     Ok(fit_result)
 }
 
-
 pub(crate) fn write_model_json(path: &Path, model: &SavedModel) -> Result<(), String> {
     model.save_to_path(path)?;
     cli_out!("saved model: {}", path.display());
     Ok(())
 }
 
-
 pub(crate) fn write_payload_json(path: &Path, payload: FittedModelPayload) -> Result<(), String> {
     let model = SavedModel::from_payload(payload);
     write_model_json(path, &model)
 }
-
 
 pub(crate) fn print_inference_summary(notes: &[String]) {
     if notes.is_empty() {
@@ -642,7 +623,6 @@ pub(crate) fn print_inference_summary(notes: &[String]) {
         cli_err!("  - {}", note);
     }
 }
-
 
 pub(crate) fn set_saved_offset_columns(
     payload: &mut FittedModelPayload,

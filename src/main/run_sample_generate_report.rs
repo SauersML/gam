@@ -154,7 +154,6 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<(), String> {
     Ok(())
 }
 
-
 pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
     if args.n_draws == 0 {
         return Err("--n-draws must be > 0".to_string());
@@ -229,8 +228,9 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
     Ok(())
 }
 
-
-pub(crate) fn saved_likelihood_spec_for_generate(model: &SavedModel) -> Result<LikelihoodSpec, String> {
+pub(crate) fn saved_likelihood_spec_for_generate(
+    model: &SavedModel,
+) -> Result<LikelihoodSpec, String> {
     match &model.payload().family_state {
         FittedFamily::Standard { likelihood, .. }
         | FittedFamily::LocationScale { likelihood, .. }
@@ -242,7 +242,6 @@ pub(crate) fn saved_likelihood_spec_for_generate(model: &SavedModel) -> Result<L
         ),
     }
 }
-
 
 /// Unified generate path: uses `PredictableModel` to produce a
 /// `GenerativeSpec` for every non-survival model class.
@@ -345,7 +344,6 @@ pub(crate) fn run_generate_unified(
     }
 }
 
-
 /// Render the report for a spline-scan model (#1046) from its reconstructed
 /// scalar quantities and the single smooth's EDF block, reusing the standard
 /// `report::write_report` renderer. A scan model retains no dense design/Gram,
@@ -411,7 +409,6 @@ pub(crate) fn run_report_spline_scan(
     cli_out!("wrote report: {}", out.display());
     Ok(())
 }
-
 
 pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
     use gam::probability::standard_normal_quantile;

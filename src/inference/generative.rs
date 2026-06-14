@@ -312,7 +312,9 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             check_dispersion_len(phi, spec.mean.len(), "Tweedie dispersion phi")?;
             for (i, &phi_i) in phi.iter().enumerate() {
                 if !(phi_i.is_finite() && phi_i > 0.0) {
-                    crate::bail_invalid_estim!("invalid Tweedie dispersion phi at row {i}: {phi_i}");
+                    crate::bail_invalid_estim!(
+                        "invalid Tweedie dispersion phi at row {i}: {phi_i}"
+                    );
                 }
             }
             let mut y = Array1::<f64>::zeros(spec.mean.len());
