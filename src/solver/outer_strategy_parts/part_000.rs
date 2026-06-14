@@ -5578,6 +5578,22 @@ fn compass_search_outer(
     }
     let mut step = init_step;
     let mut polls: usize = 0;
+    // Relative-FlatStreak plateau termination (#979/#1040 survival arm). The
+    // step-contraction / max_polls exits are the ONLY stops the bare compass
+    // loop has: `step` halves only on a fully-rejected sweep (`!improved`), so
+    // a survival NLL of O(1e4) whose running minimum creeps by O(1e-5) absolute
+    // (≈ O(1e-9) relative) per sweep keeps `improved == true`, never contracts
+    // the step, and grinds `polls × seeds` to the external rc=124 timeout —
+    // absolute step/cost tolerances never fire on an O(1e4) merit. Watch the
+    // SCALE-INVARIANT running minimum with the same conservative
+    // window=3 / rel_tol=1e-8 discipline used on the BFGS host path: a genuine
+    // (even if slow) compass descent drops the running minimum by far more than
+    // 1e-8 relative per sweep and never trips it, while a frozen valley does.
+    // On a plateau we return the best iterate as a BOUNDED, status-returning
+    // `BudgetExhausted` (the caller already maps it to converged=false), never
+    // a wall-clock exit.
+    let mut plateau = crate::solver::loop_guard::PlateauDetector::standard();
+    let mut plateaued = false;
     while step > step_tol && polls < max_polls {
         let mut improved = false;
         'sweep: for i in 0..x.len() {
@@ -5606,8 +5622,30 @@ fn compass_search_outer(
         if !improved {
             step *= 0.5;
         }
+        // Feed the monotone running minimum (`best_cost`) once per completed
+        // sweep. The detector fires once relative improvement stays below
+        // rel_tol for `window` consecutive sweeps — exactly the frozen-valley
+        // signal the step/poll exits cannot see.
+        if plateau.note(best_cost) == crate::solver::loop_guard::LoopVerdict::Plateaued {
+            log::warn!(
+                "[OUTER] compass-search plateau termination: running-minimum cost stopped \
+                 improving over the detector window at best_cost={:.6e} after {} polls; \
+                 returning best-so-far (converged=false) instead of grinding to a hard timeout",
+                best_cost,
+                polls,
+            );
+            plateaued = true;
+            break;
+        }
     }
-    if step <= step_tol {
+    if plateaued {
+        // Frozen-merit valley: best iterate, bounded, non-converged status.
+        CompassSearchOutcome::BudgetExhausted {
+            point: x,
+            cost: best_cost,
+            polls,
+        }
+    } else if step <= step_tol {
         CompassSearchOutcome::Converged {
             point: x,
             cost: best_cost,
