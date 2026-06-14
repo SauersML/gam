@@ -1,5 +1,5 @@
 // Split from the original oversized module; keep included in order.
-include!("lib_parts/part_000.rs");
+include!("ffi_prelude.rs");
 
 mod benchmark_scores;
 
@@ -17,5 +17,8 @@ mod summary_render;
 
 mod survival_surface_io;
 
-include!("lib_parts/part_001.rs");
-include!("lib_parts/part_002.rs");
+include!("model_ffi.rs");
+include!("latent_basis_and_sae_ffi.rs");
+include!("reml_latent_fit_ffi.rs");
+include!("geometry_ffi.rs");
+include!("manifold_and_posterior_ffi.rs");
