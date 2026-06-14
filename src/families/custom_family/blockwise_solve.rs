@@ -1279,9 +1279,40 @@ pub(crate) fn check_linear_feasibility(
         }
     }
     if worst > tol {
+        // #1108 DIAGNOSTIC: pin down whether this infeasible β is PROJECTABLE
+        // (→ a wiring bug: the seed bypassed projection) or genuinely outside a
+        // hard polytope. Report the worst row's ‖a‖, the scaled violation, the
+        // β magnitude, and the outcome of the exact active-set projections of
+        // THIS β onto these constraints.
+        let a_worst = constraints.a.row(worst_idx);
+        let norm_worst = a_worst.dot(&a_worst).sqrt();
+        let scaled_worst = if norm_worst > 0.0 { worst / norm_worst } else { worst };
+        let beta_inf = beta.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        let interior_outcome = match crate::solver::active_set::project_point_strictly_into_feasible_cone(beta, constraints) {
+            Some(p) => {
+                let s = constraints.a.dot(&p) - &constraints.b;
+                let w = s.iter().fold(0.0_f64, |m, &v| m.max((-v).max(0.0)));
+                format!("strict-interior→worst={w:.3e}")
+            }
+            None => "strict-interior→None".to_string(),
+        };
+        let boundary_outcome = {
+            let identity = Array2::<f64>::eye(beta.len());
+            match crate::solver::active_set::solve_quadratic_with_linear_constraints(&identity, beta, beta, constraints, None) {
+                Ok((p, _)) => {
+                    let s = constraints.a.dot(&p) - &constraints.b;
+                    let w = s.iter().fold(0.0_f64, |m, &v| m.max((-v).max(0.0)));
+                    format!("boundary→worst={w:.3e}")
+                }
+                Err(e) => format!("boundary→Err({e})"),
+            }
+        };
         return Err(CustomFamilyError::ConstraintViolation {
             reason: format!(
-                "infeasible iterate: max(Aβ-b violation)={worst:.3e} at constraint row {worst_idx}"
+                "infeasible iterate: max(Aβ-b violation)={worst:.3e} at constraint row {worst_idx} \
+                 [#1108 diag: rows={}, ‖a_row‖={norm_worst:.3e}, scaled_viol={scaled_worst:.3e}, \
+                 |β|∞={beta_inf:.3e}, {interior_outcome}, {boundary_outcome}]",
+                constraints.a.nrows()
             ),
         }
         .into());
