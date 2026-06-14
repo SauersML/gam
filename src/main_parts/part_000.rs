@@ -111,8 +111,7 @@ use gam::survival_construction::{
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
     initial_survival_baseline_config_for_fit, location_scale_uses_probit_survival_baseline,
     marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_chain_rule_hessian,
-    normalize_survival_time_pair, optimize_survival_baseline_config,
-    optimize_survival_baseline_config_with_gradient,
+    normalize_survival_time_pair, optimize_survival_baseline_config_with_gradient,
     optimize_survival_baseline_config_with_gradient_only, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
     require_structural_survival_time_basis, resolve_survival_marginal_slope_time_anchor_value,
@@ -6053,67 +6052,17 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             options: options.clone(),
         };
         if baseline_cfg.target != SurvivalBaselineTarget::Linear {
-            baseline_cfg = optimize_survival_baseline_config(
-                &baseline_cfg,
-                if likelihood_mode == SurvivalLikelihoodMode::Latent {
-                    "latent survival baseline"
-                } else {
-                    "latent binary baseline"
-                },
-                |candidate| {
-                    let prepared = prepare_survival_time_stack(
-                        &age_entry,
-                        &age_exit,
-                        candidate,
-                        likelihood_mode,
-                        None,
-                        time_anchor,
-                        latent_derivative_guard,
-                        &time_build,
-                        None,
-                        Some(latent_loading),
-                    )?;
-                    let objective = match likelihood_mode {
-                        SurvivalLikelihoodMode::Latent => match fit_model(
-                            FitRequest::LatentSurvival(build_survival_request(prepared)),
-                        ) {
-                            Ok(FitResult::LatentSurvival(result)) => result.fit.reml_score,
-                            Ok(_) => {
-                                return Err(
-                                    "internal latent survival workflow returned the wrong result variant"
-                                        .to_string(),
-                                );
-                            }
-                            Err(e) => return Err(format!("latent survival fit failed: {e}")),
-                        },
-                        SurvivalLikelihoodMode::LatentBinary => match fit_model(
-                            FitRequest::LatentBinary(build_binary_request(prepared)),
-                        ) {
-                            Ok(FitResult::LatentBinary(result)) => result.fit.reml_score,
-                            Ok(_) => {
-                                return Err(
-                                    "internal latent binary workflow returned the wrong result variant"
-                                        .to_string(),
-                                );
-                            }
-                            Err(e) => return Err(format!("latent binary fit failed: {e}")),
-                        },
-                        // Enclosing `if matches!(likelihood_mode, Latent |
-                        // LatentBinary)` gates this match — defensively error
-                        // out for any other discriminant.
-                        SurvivalLikelihoodMode::Transformation
-                        | SurvivalLikelihoodMode::Weibull
-                        | SurvivalLikelihoodMode::LocationScale
-                        | SurvivalLikelihoodMode::MarginalSlope => {
-                            return Err(format!(
-                                "internal: latent baseline closure reached for non-latent mode {:?}",
-                                likelihood_mode
-                            ));
-                        }
-                    };
-                    Ok(objective)
-                },
-            )?;
+            // The latent/latent-binary baseline-θ optimization had no analytic
+            // gradient and ran on the gradient-free compass search, which has
+            // been purged. A non-linear latent baseline target therefore has no
+            // outer solver — fail loudly instead of fitting at the un-optimized
+            // seed baseline.
+            return Err(format!(
+                "non-linear latent survival baseline target {:?} in mode {:?} has no \
+                 analytic θ-gradient and the gradient-free compass-search optimizer was \
+                 removed; there is no outer solver for this baseline",
+                baseline_cfg.target, likelihood_mode,
+            ));
         }
         let prepared = prepare_survival_time_stack(
             &age_entry,
@@ -6530,8 +6479,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         // The β_j ≥ 0 active-set constraints carry no θ-dependence, so the
         // constrained envelope identity is exact. See baseline_chain_rule_gradient
         // for the full derivation. BFGS on this exact gradient converges in ≲10
-        // outer evaluations versus the ~60–84 gradient-free polls compass search
-        // spent on the same 2–3 dim θ-surface.
+        // outer evaluations on the 2–3 dim θ-surface.
         baseline_cfg = optimize_survival_baseline_config_with_gradient_only(
             &baseline_cfg,
             "survival baseline",
