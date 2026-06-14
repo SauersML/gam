@@ -493,7 +493,10 @@ pub(crate) const CHEAP_PRECHECK_RITZ_REL_TOL: f64 = 1e-3;
 /// not small). The latter is the critical safety valve: if the cheap iteration
 /// has not resolved the bottom of the spectrum it NEVER authorises a skip, so a
 /// hidden small eigenvalue cannot be missed — the term is then formed exactly.
-pub(crate) fn cheap_conditioning_bounds<HvFn>(mut hv: HvFn, p: usize) -> Result<Option<(f64, f64)>, String>
+pub(crate) fn cheap_conditioning_bounds<HvFn>(
+    mut hv: HvFn,
+    p: usize,
+) -> Result<Option<(f64, f64)>, String>
 where
     HvFn: FnMut(&Array1<f64>) -> Result<Array1<f64>, String>,
 {
@@ -773,10 +776,10 @@ pub fn jeffreys_subspace_from_penalty(
 pub fn joint_jeffreys_term<DirFn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
-    mut hessian_dir: DirFn,
+    hessian_dir: DirFn,
 ) -> Result<(f64, Array1<f64>, Array2<f64>), String>
 where
-    DirFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    DirFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
 {
     let p = h_joint.nrows();
     if h_joint.ncols() != p {
@@ -952,27 +955,65 @@ where
     // vec(Ψ ∘ Ṽ_k), kept to assemble the exact curvature in one GEMM.
     let mut a_rows = Array2::<f64>::zeros((p, m * m));
     let mut aw_rows = Array2::<f64>::zeros((p, m * m));
-    let mut axis = Array1::<f64>::zeros(p);
-    for k in 0..p {
-        axis.fill(0.0);
-        axis[k] = 1.0;
-        let hdot = match hessian_dir(&axis)? {
-            Some(hdot) => hdot,
-            None => {
-                // Family does not expose an exact directional derivative; the
-                // Jeffreys gradient/curvature degenerate to zero (objective
-                // still well-defined). This keeps the term safe rather than
-                // wrong.
-                return Ok((gate_weight * phi, Array1::zeros(p), Array2::zeros((p, p))));
+    // PARALLEL DIRECTIONAL DERIVATIVES. Each canonical axis `e_k` requires one
+    // FULL-DATA directional-derivative pass `Hdot[e_k]` (the n-row inner-Newton
+    // exact derivative) — the dominant cost (e.g. ~1.5 s × p=35 ≈ 55 s serial on
+    // a biobank fit, deterministic on the cycle where the conditioning gate
+    // arms). The p passes are fully independent pure evaluations of
+    // `(family, states, e_k)`, so we fan them across the Rayon pool here. The
+    // `Sync` bound on `DirFn` makes the evaluator safe to call concurrently;
+    // combined with the nested-BLAS guard each pass runs single-threaded faer,
+    // so the directions fan across cores with no rayon×BLAS oversubscription.
+    //
+    // The cheap per-k reduction (D_k = ZᵀHdotZ rotation, grad/a_rows/aw_rows
+    // writes) stays SERIAL below over the index-ordered results, so the outputs
+    // are bit-identical to the original `for k in 0..p` loop. Early-return
+    // semantics are preserved exactly: if ANY axis yields `Ok(None)` the family
+    // does not expose the exact derivative and the whole term degenerates to
+    // `(gate_weight·phi, 0, 0)` (matching the serial first-None behaviour); any
+    // `Err` propagates.
+    let hdots: Vec<Array2<f64>> = {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
+            .into_par_iter()
+            .map(|k| {
+                let mut axis = Array1::<f64>::zeros(p);
+                axis[k] = 1.0;
+                // Mark this whole directional pass as a nested data-parallel
+                // region so every faer GEMM it issues pins to `Par::Seq` instead
+                // of re-fanning the global Rayon pool against this p-way axis
+                // fan-out (the rayon×BLAS oversubscription guard from the
+                // nested-BLAS fix). Bit-identical: faer partitions matmul output,
+                // never the contracted axis.
+                crate::linalg::faer_ndarray::with_nested_parallel(|| hessian_dir(&axis))
+            })
+            .collect();
+        // Resolve in index order so the first anomaly (Err, then None, then a
+        // shape mismatch) wins exactly as the original serial loop did.
+        let mut hdots = Vec::with_capacity(p);
+        for hdot in results {
+            let hdot = match hdot? {
+                Some(hdot) => hdot,
+                None => {
+                    // Family does not expose an exact directional derivative; the
+                    // Jeffreys gradient/curvature degenerate to zero (objective
+                    // still well-defined). This keeps the term safe rather than
+                    // wrong.
+                    return Ok((gate_weight * phi, Array1::zeros(p), Array2::zeros((p, p))));
+                }
+            };
+            if hdot.nrows() != p || hdot.ncols() != p {
+                return Err(format!(
+                    "joint_jeffreys_term: Hdot shape {}x{} != {p}x{p}",
+                    hdot.nrows(),
+                    hdot.ncols()
+                ));
             }
-        };
-        if hdot.nrows() != p || hdot.ncols() != p {
-            return Err(format!(
-                "joint_jeffreys_term: Hdot shape {}x{} != {p}x{p}",
-                hdot.nrows(),
-                hdot.ncols()
-            ));
+            hdots.push(hdot);
         }
+        hdots
+    };
+    for (k, hdot) in hdots.into_iter().enumerate() {
         // Reduced derivative D_k = Z_J^T Hdot Z_J (m x m), rotated into the
         // eigenbasis: Ṽ_k = Vᵀ D_k V.
         let hdz = hdot.dot(&z_j);
@@ -1057,10 +1098,10 @@ where
 pub fn joint_jeffreys_second_order_completion<Dir2Fn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
-    mut hessian_second_dir: Dir2Fn,
+    hessian_second_dir: Dir2Fn,
 ) -> Result<Option<Array2<f64>>, String>
 where
-    Dir2Fn: FnMut(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    Dir2Fn: Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
 {
     let p = h_joint.nrows();
     if h_joint.ncols() != p {
@@ -1120,15 +1161,40 @@ where
     }
 
     let mut out = Array2::<f64>::zeros((p, p));
-    let mut axis_a = Array1::<f64>::zeros(p);
-    let mut axis_b = Array1::<f64>::zeros(p);
-    for a in 0..p {
-        axis_a.fill(0.0);
-        axis_a[a] = 1.0;
-        for b in a..p {
-            axis_b.fill(0.0);
-            axis_b[b] = 1.0;
-            let h2 = match hessian_second_dir(&axis_a, &axis_b)? {
+    // PARALLEL SECOND-DIRECTIONAL DERIVATIVES. Each upper-triangle pair `(a, b)`
+    // needs one FULL-DATA mixed second-directional pass `H''[e_a, e_b]` — the
+    // dominant cost (p(p+1)/2 independent passes). They are pure evaluations of
+    // `(family, states, e_a, e_b)`, so we fan the pairs across the Rayon pool;
+    // the `Sync` bound on `Dir2Fn` plus the nested-BLAS guard keep each pass
+    // single-threaded in faer, so the pairs spread across cores without
+    // rayon×BLAS oversubscription.
+    //
+    // The cheap per-pair reduction (D_ab rotation + K-trace) stays serial over
+    // the index-ordered results, so the output is bit-identical to the original
+    // double `for` loop. Early-return semantics preserved exactly: if ANY pair
+    // yields `Ok(None)` the whole completion returns `Ok(None)` (the family does
+    // not expose the exact second derivative); any `Err` propagates.
+    let pairs: Vec<(usize, usize)> = (0..p).flat_map(|a| (a..p).map(move |b| (a, b))).collect();
+    let h2s: Vec<Array2<f64>> = {
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+        let results: Vec<Result<Option<Array2<f64>>, String>> = pairs
+            .par_iter()
+            .map(|&(a, b)| {
+                let mut axis_a = Array1::<f64>::zeros(p);
+                axis_a[a] = 1.0;
+                let mut axis_b = Array1::<f64>::zeros(p);
+                axis_b[b] = 1.0;
+                // Pin nested faer GEMM to `Par::Seq` (see the value-path note).
+                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                    hessian_second_dir(&axis_a, &axis_b)
+                })
+            })
+            .collect();
+        // Resolve in pair order so the first anomaly (Err, then None, then a
+        // shape mismatch) wins exactly as the original serial double loop did.
+        let mut h2s = Vec::with_capacity(pairs.len());
+        for (&(a, b), result) in pairs.iter().zip(results.into_iter()) {
+            let h2 = match result? {
                 Some(h2) => h2,
                 None => return Ok(None),
             };
@@ -1138,18 +1204,22 @@ where
                     h2.dim()
                 ));
             }
-            let h2z = h2.dot(&z_j);
-            let d_ab = z_j.t().dot(&h2z);
-            let mut trace = 0.0_f64;
-            for i in 0..m {
-                for j in 0..m {
-                    trace += k_reduced[[i, j]] * d_ab[[j, i]];
-                }
-            }
-            let value = -0.5 * gate_weight * trace;
-            out[[a, b]] = value;
-            out[[b, a]] = value;
+            h2s.push(h2);
         }
+        h2s
+    };
+    for (&(a, b), h2) in pairs.iter().zip(h2s.into_iter()) {
+        let h2z = h2.dot(&z_j);
+        let d_ab = z_j.t().dot(&h2z);
+        let mut trace = 0.0_f64;
+        for i in 0..m {
+            for j in 0..m {
+                trace += k_reduced[[i, j]] * d_ab[[j, i]];
+            }
+        }
+        let value = -0.5 * gate_weight * trace;
+        out[[a, b]] = value;
+        out[[b, a]] = value;
     }
     Ok(Some(out))
 }
@@ -2174,7 +2244,9 @@ mod tests {
     /// Build a diagonal-matvec closure for a synthetic spectrum (the joint
     /// information on the full span is `H` itself, so a diagonal `H` exercises the
     /// Lanczos bound against a known `[λ_min, λ_max]`).
-    pub(crate) fn diag_hv(diag: Vec<f64>) -> impl FnMut(&Array1<f64>) -> Result<Array1<f64>, String> {
+    pub(crate) fn diag_hv(
+        diag: Vec<f64>,
+    ) -> impl FnMut(&Array1<f64>) -> Result<Array1<f64>, String> {
         move |v: &Array1<f64>| {
             let mut out = Array1::<f64>::zeros(v.len());
             for (i, &d) in diag.iter().enumerate() {
