@@ -4107,6 +4107,37 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    // Convergence-gate + recovery contract for the survival inverse-link search.
+    // Its production callers were removed with the compass-search inverse-link
+    // optimizer purge (#703615970); the contract is still worth pinning, so the
+    // helper lives here in the test module alongside the tests that exercise it.
+    fn recover_converged_survival_inverse_link<R>(
+        result: crate::solver::outer_strategy::OuterResult,
+        context: &str,
+        recover: R,
+    ) -> Result<InverseLink, String>
+    where
+        R: FnOnce(&ndarray::Array1<f64>) -> Option<InverseLink>,
+    {
+        if !result.converged {
+            return Err(WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+                    result.iterations,
+                    result.final_value,
+                    result.final_grad_norm_report(),
+                ),
+            }
+            .into());
+        }
+        recover(&result.rho).ok_or_else(|| {
+            format!(
+                "{context} produced an invalid inverse-link state at rho={:?}",
+                result.rho.to_vec()
+            )
+        })
+    }
+
     fn load_survival_dataset() -> crate::inference::data::EncodedDataset {
         let td = tempdir().expect("tempdir");
         let data_path = td.path().join("survival.csv");
