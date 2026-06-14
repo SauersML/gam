@@ -1930,26 +1930,14 @@ fn fit_dispersion_location_scale_model(
     request: DispersionLocationScaleFitRequest<'_>,
 ) -> Result<DispersionLocationScaleFitResult, String> {
     let kind = request.spec.kind;
-    // Assemble the joint (mean + log-precision) posterior covariance on the
-    // CONVERGED path. `BlockwiseFitOptions::default()` leaves
-    // `compute_covariance = false`, so historically the only way a dispersion
-    // location-scale fit acquired a covariance was the never-fail escalation
-    // fallback (NUTS about the mode) — which fired for Beta but not for the
-    // Fisher-orthogonal members once they began converging cleanly, leaving
-    // `summary.covariance_n = None` / no joint SEs (gam#1119). Requesting the
-    // covariance explicitly inverts the SAME penalized Hessian that already
-    // backs the EDF and posterior-mean prediction, so it is the principled,
-    // self-consistent source rather than a sampled approximation. The κ/ψ
-    // optimizer is disabled for this family (see
-    // `fit_dispersion_glm_location_scale_terms`), so the inner
-    // `fit_custom_family` runs exactly once and the covariance is computed a
-    // single time at convergence, not per outer evaluation.
-    let mut options = request.options;
-    options.compute_covariance = true;
+    // The joint (mean + log-precision) posterior covariance / EDF is requested
+    // unconditionally inside `fit_dispersion_glm_location_scale_terms`, which is
+    // the shared entry for all four genuine-dispersion mean families (gam#1119),
+    // so no per-request override is needed here.
     let fit = fit_dispersion_glm_location_scale_terms(
         request.data,
         request.spec,
-        &options,
+        &request.options,
         &request.kappa_options,
     )?;
     Ok(DispersionLocationScaleFitResult { fit, kind })
