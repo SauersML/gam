@@ -2,7 +2,7 @@ use super::*;
 
 /// Maximum number of LM ridge-escalation attempts before declaring the per-row
 /// Hessian unfactorable.
-pub(crate) const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
+const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 
 impl SaeManifoldTerm {
 

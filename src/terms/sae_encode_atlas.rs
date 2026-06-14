@@ -1843,6 +1843,13 @@ pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Ar
     let d = atom.latent_dim;
     match &atom.basis_kind {
         Periodic | Torus => regular_product_grid(d, resolution, 0.0, 1.0, false),
+        // Cylinder `S¹ × ℝ`: axis 0 is the periodic circle `[0, 1)` (no
+        // endpoint, like the harmonic axes); axis 1 is the unbounded line,
+        // covered by a strided unit box `[-0.5, 0.5]` about the origin (like the
+        // Euclidean patch). The certified radius refines each chart; out-of-cover
+        // line starts route to the exact fallback honestly.
+        Cylinder if d == 2 => cylinder_chart_center_grid(resolution),
+        Cylinder => regular_product_grid(d, resolution, -0.5, 0.5, true),
         Sphere if d == 2 => sphere_latlon_grid(resolution),
         Sphere | Duchon | EuclideanPatch | Poincare | Precomputed(_) => {
             // Unbounded / non-compact latents: a strided cover of a unit box
@@ -1912,6 +1919,31 @@ pub(crate) fn sphere_latlon_grid(resolution: usize) -> Array2<f64> {
     grid
 }
 
+/// Cylinder `S¹ × ℝ` chart-center grid: axis 0 sweeps the periodic circle over
+/// one period `[0, 1)` (no endpoint, matching the harmonic axis), axis 1 strides
+/// a unit box `[−0.5, 0.5]` about the origin on the unbounded line (with
+/// endpoint). Capped at [`SHAPE_BAND_MAX_POINTS`] total centers.
+pub(crate) fn cylinder_chart_center_grid(resolution: usize) -> Array2<f64> {
+    let mut per_axis = resolution.max(2);
+    while per_axis * per_axis > SHAPE_BAND_MAX_POINTS && per_axis > 2 {
+        per_axis -= 1;
+    }
+    let total = per_axis * per_axis;
+    let line_denom = (per_axis.max(2) - 1) as f64;
+    let mut grid = Array2::<f64>::zeros((total, 2));
+    for i in 0..per_axis {
+        // Periodic axis 0: stop one step short of the period.
+        let circle = i as f64 / per_axis as f64;
+        for j in 0..per_axis {
+            // Line axis 1: include the endpoint of the unit box.
+            let line = -0.5 + (j as f64) / line_denom;
+            grid[[i * per_axis + j, 0]] = circle;
+            grid[[i * per_axis + j, 1]] = line;
+        }
+    }
+    grid
+}
+
 /// Nominal in-chart radius: half the inter-center grid spacing, so charts tile
 /// the domain. For compact latents this is the grid step; for unbounded latents
 /// a unit default that the certified radius refines.
@@ -1920,6 +1952,11 @@ pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) ->
     match &atom.basis_kind {
         Periodic | Torus => 0.5 / (resolution.max(2) as f64),
         Sphere => std::f64::consts::PI / (resolution.max(2) as f64),
+        // Cylinder charts tile two heterogeneous axes (a `[0,1)` periodic step
+        // and a unit-box line step); the chart radius is a single scalar, so we
+        // take the tighter (periodic) step `0.5/res` to keep every chart valid
+        // on both axes. The certified Kantorovich radius refines it per chart.
+        Cylinder => 0.5 / (resolution.max(2) as f64),
         Duchon | EuclideanPatch | Poincare | Precomputed(_) => 1.0 / (resolution.max(2) as f64),
     }
 }

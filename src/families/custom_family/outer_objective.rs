@@ -5176,7 +5176,7 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
     // Allow up to a few polishing steps. The blockwise endpoint is close
     // to optimum, so step sizes should be small and line search should
     // accept full steps quickly.
-    pub(crate) const POLISH_MAX_ITER: usize = 16;
+    const POLISH_MAX_ITER: usize = 16;
     for _polish_iter in 0..POLISH_MAX_ITER {
         // Re-evaluate at current β to get the joint gradient and Hessian.
         refresh_all_block_etas(family, specs, states)?;

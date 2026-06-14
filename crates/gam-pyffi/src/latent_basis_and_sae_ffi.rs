@@ -1622,6 +1622,36 @@ fn sae_duchon_atom_m(dim: usize) -> usize {
 /// (`{1, t_a, t_a t_b}` at degree 2).
 const SAE_EUCLIDEAN_PATCH_MAX_DEGREE: usize = 2;
 
+/// Flat-line polynomial degree of a Cylinder `S¹ × ℝ` atom's line axis (axis 1).
+/// Mirrors the Euclidean-patch degree so the cylinder's flat factor matches the
+/// patch candidate it races against; `Ml = SAE_CYLINDER_LINE_DEGREE + 1`.
+const SAE_CYLINDER_LINE_DEGREE: usize = 2;
+
+/// Recover the cylinder evaluator's `(circle_harmonics H, line_degree D)` from
+/// its fitted product basis width `m = (2H + 1)·(D + 1)` and the production
+/// line-degree convention (`D = SAE_CYLINDER_LINE_DEGREE`). The line factor width
+/// `Ml = D + 1` must divide `m`, and the recovered circle width `Mc = m / Ml`
+/// must be odd (`= 2H + 1`); otherwise the basis width is inconsistent with a
+/// cylinder product and the error is surfaced rather than guessed.
+fn sae_cylinder_harmonics_degree(m: usize) -> Result<(usize, usize), String> {
+    let d_line = SAE_CYLINDER_LINE_DEGREE;
+    let ml = d_line + 1;
+    if ml == 0 || m == 0 || m % ml != 0 {
+        return Err(format!(
+            "sae_cylinder_harmonics_degree: basis size {m} is not (2H+1)·{ml} for a cylinder \
+             with line degree {d_line}"
+        ));
+    }
+    let mc = m / ml;
+    if mc < 3 || mc % 2 == 0 {
+        return Err(format!(
+            "sae_cylinder_harmonics_degree: recovered circle width {mc} (= {m}/{ml}) is not an \
+             odd 2H+1 ≥ 3 for a cylinder"
+        ));
+    }
+    Ok(((mc - 1) / 2, d_line))
+}
+
 fn gumbel_temperature_schedule_from_pydict(
     schedule: Option<&Bound<'_, PyDict>>,
 ) -> Result<Option<GumbelTemperatureSchedule>, String> {
@@ -1749,9 +1779,23 @@ fn build_sae_basis_evaluators(
                     sae_duchon_atom_m(centers.ncols()),
                 )?)
             }
+            SaeAtomBasisKind::Cylinder if d == 2 => {
+                // Cylinder `S¹ × ℝ`: recover the circle harmonic count `H` and
+                // line degree `D` from the fitted product width
+                // `m = (2H+1)·(D+1)` (the production line-degree convention), so
+                // the refreshed `Φ`/jet stays column-consistent with the seed
+                // design. An inconsistent width is surfaced, not guessed.
+                let (h, d_line) = sae_cylinder_harmonics_degree(m)?;
+                Arc::new(CylinderHarmonicEvaluator::new(h, d_line)?)
+            }
             SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => Arc::new(
                 EuclideanPatchEvaluator::new(d, SAE_EUCLIDEAN_PATCH_MAX_DEGREE)?,
             ),
+            SaeAtomBasisKind::Cylinder => {
+                return Err(format!(
+                    "build_sae_basis_evaluators: Cylinder atom {k} requires latent_dim == 2; got dim={d}, m={m}"
+                ));
+            }
             SaeAtomBasisKind::Precomputed(label) => {
                 return Err(format!(
                     "build_sae_basis_evaluators: atom {k} basis {label:?} is precomputed and has no \
@@ -4914,6 +4958,16 @@ fn sae_build_padded_basis_stacks(
                     .slice_mut(s![atom_idx, 0..m, 0..m])
                     .assign(&penalty);
             }
+            SaeAtomBasisKind::Cylinder => {
+                // Cylinder is a birth-discovered topology, never built through the
+                // seed-plan stack path (`sae_build_atom_plans` rejects it above), so
+                // it cannot reach here from a `SaeAtomBuildPlan`. Surfaced loudly if
+                // it ever does, rather than mis-built.
+                return Err(format!(
+                    "sae_build_padded_basis_stacks: atom {atom_idx} 'cylinder' is a birth-discovered \
+                     topology, not a seed-plan stack kind; it has no padded seed basis to build"
+                ));
+            }
             SaeAtomBasisKind::Precomputed(name) => {
                 return Err(format!(
                     "sae_build_padded_basis_stacks: unsupported atom {atom_idx} basis {:?}; precomputed atoms require caller-supplied padded basis arrays",
@@ -5082,6 +5136,22 @@ fn sae_build_atom_plans(
                     duchon_centers: Some(centers),
                     basis_size,
                 });
+            }
+            SaeAtomBasisKind::Cylinder => {
+                // A cylinder atom is not SEEDED through `sae_manifold_fit_minimal`:
+                // it arises only by EVIDENCE, when the #977 birth topology race
+                // selects `S¹ × ℝ` for a residual factor (the born atom's evaluator
+                // is built directly by `race_birth_topology`, and OOS refresh reads
+                // it back through `build_sae_basis_evaluators`). There is no
+                // user-facing cylinder seed geometry to derive a plan from here, so
+                // a cylinder in the seed dictionary is a caller error, surfaced
+                // loudly rather than mis-built as a torus / patch.
+                return Err(
+                    "sae_build_atom_plans: 'cylinder' is a birth-discovered topology, not a seed \
+                     dictionary kind; seed with periodic, duchon, sphere, torus, or \
+                     euclidean_patch and let the structure search grow a cylinder by evidence"
+                        .to_string(),
+                );
             }
             SaeAtomBasisKind::Precomputed(name) => {
                 return Err(format!(

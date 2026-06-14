@@ -138,7 +138,7 @@ pub fn padded_deviation_seed(seed: &Array1<f64>, min_iqr: f64, pad_fraction: f64
 /// Maximum damped-Newton outer iterations for the pooled probit pilot. A 2-D
 /// strictly-convex probit converges in well under this; the cap only guards a
 /// pathological non-finite data configuration.
-pub(crate) const POOLED_PILOT_MAX_NEWTON_ITERS: usize = 50;
+const POOLED_PILOT_MAX_NEWTON_ITERS: usize = 50;
 /// Initial Levenberg ridge added to the 2×2 Hessian diagonal before the solve.
 pub(crate) const POOLED_PILOT_RIDGE_INIT: f64 = 1e-8;
 /// Below this absolute determinant the ridged 2×2 system is treated as
@@ -150,7 +150,7 @@ pub(crate) const POOLED_PILOT_RIDGE_GROWTH: f64 = 10.0;
 /// fails rather than returning a meaningless step.
 pub(crate) const POOLED_PILOT_RIDGE_MAX: f64 = 1e6;
 /// Maximum backtracking-line-search halvings per Newton step.
-pub(crate) const POOLED_PILOT_MAX_BACKTRACKS: usize = 25;
+const POOLED_PILOT_MAX_BACKTRACKS: usize = 25;
 /// Backtracking step contraction factor.
 pub(crate) const POOLED_PILOT_BACKTRACK_SHRINK: f64 = 0.5;
 /// Objective-change tolerance below which a stalled (rejected) line search is

@@ -347,8 +347,8 @@ pub(crate) fn estimate_negbin_theta_from_eta(
     let mut hi = NEGBIN_THETA_MAX;
     theta = theta.clamp(lo, hi);
 
-    pub(crate) const MAX_NEWTON_ITERS: usize = 100;
-    pub(crate) const REL_TOL: f64 = 1e-10;
+    const MAX_NEWTON_ITERS: usize = 100;
+    const REL_TOL: f64 = 1e-10;
     for _ in 0..MAX_NEWTON_ITERS {
         let (score, info) = negbin_theta_score_and_info(y, eta, priorweights, theta);
         if !score.is_finite() {
@@ -381,5 +381,4 @@ pub(crate) fn estimate_negbin_theta_from_eta(
     }
     theta.clamp(NEGBIN_THETA_MIN, NEGBIN_THETA_MAX)
 }
-
 

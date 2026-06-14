@@ -1086,57 +1086,74 @@ fn optimize_survival_transformation_smoothing(
             |_| {},
         )
         .map_err(|err| format!("survival smoothing PIRLS failed: {err}"))?;
-        // Bad-trial guard (gam#1123). At a pathological large-λ proposal the
-        // constrained I-spline PIRLS exhausts its iteration budget
-        // (`MaxIterationsReached`) with the gradient plateaued far above tol; the
-        // unconverged β then yields a deceptively LOW LAML that lures the outer
-        // BFGS deeper into the un-fittable region (the trace shows lm_lambda
-        // climbing to ~1e6 with accept_rho railed at 1.0). Such a trial is not a
-        // valid evaluation of the LAML at this ρ — the envelope theorem that makes
-        // ∂LAML/∂ρ exact requires the inner solve to be at its β-optimum. Treat a
-        // non-converged candidate as a high-cost, gradient-free point so the outer
-        // optimizer steps AWAY from it instead of selecting it. The seed-λ fit is
-        // already converged, so the selector still has a valid region to work in.
+        // Bad-trial semantics (gam#1123). The CLI fits the transformation
+        // survival model at the SEED λ (no outer selection) and recovers the
+        // truth; the Python path additionally runs THIS outer BFGS over ρ. The
+        // two must be one engine: the outer selector may only ever IMPROVE on the
+        // seed, and a wandering trial at a bad ρ must never abort the fit. A
+        // trial ρ is only a *valid* LAML evaluation when the constrained inner
+        // PIRLS reaches its β-optimum (the envelope theorem that makes ∂LAML/∂ρ
+        // exact requires it) AND the resulting LAML cost+gradient are finite.
+        // Every other outcome at a *trial* ρ — inner non-convergence
+        // (`MaxIterationsReached`, gradient plateaued at a pathological large λ),
+        // a failed state/LAML evaluation, or a non-finite cost/gradient on the
+        // wandering trajectory — is NOT a structural error and must NOT be
+        // surfaced to the outer optimizer as an infeasible/undefined probe
+        // (which the BFGS bridge's probe-refusal guard escalates to a FATAL
+        // RemlOptimizationFailed when the whole trial neighbourhood is
+        // infeasible). Instead, return a high FINITE cost with a zero gradient so
+        // the line search sees no descent there and backtracks toward the
+        // converged seed region. This makes the Python outer loop incapable of
+        // doing worse than the CLI's seed fit. Only a genuine *structural* setup
+        // failure (e.g. `set_penalty_lambdas`) stays fatal, since it signals a
+        // bug rather than a merely-bad smoothing value.
+        let bad_trial = |reason: &str| -> Result<(f64, Array1<f64>), String> {
+            log::info!(
+                "[OUTER #1123] survival transformation smoothing candidate ρ rejected ({reason}): \
+                 inner PIRLS status={:?} grad_norm={:.3e} iters={} — returning high finite cost so \
+                 BFGS steps away from the un-fittable region toward the converged seed",
+                summary.status,
+                summary.lastgradient_norm,
+                summary.iterations,
+            );
+            Ok((
+                SURVIVAL_TRANSFORMATION_NONCONVERGED_TRIAL_COST,
+                Array1::zeros(num_smoothing),
+            ))
+        };
         let inner_converged = matches!(
             summary.status,
             crate::pirls::PirlsStatus::Converged
                 | crate::pirls::PirlsStatus::StalledAtValidMinimum
         );
         if !inner_converged {
-            log::info!(
-                "[OUTER #1123] survival transformation smoothing candidate ρ rejected: inner PIRLS \
-                 status={:?} grad_norm={:.3e} iters={} — returning high cost so BFGS steps away from \
-                 the un-fittable large-λ region",
-                summary.status,
-                summary.lastgradient_norm,
-                summary.iterations,
-            );
-            // A large finite cost with a zero gradient: the outer line search
-            // sees no descent here and backtracks toward the converged region.
-            return Ok((SURVIVAL_TRANSFORMATION_NONCONVERGED_TRIAL_COST, Array1::zeros(num_smoothing)));
+            return bad_trial("inner PIRLS did not converge");
         }
         let beta = summary.beta.as_ref().to_owned();
-        let state = candidate
-            .update_state(&beta)
-            .map_err(|err| format!("survival smoothing state eval failed: {err}"))?;
+        let state = match candidate.update_state(&beta) {
+            Ok(state) => state,
+            Err(_) => return bad_trial("inner state evaluation failed"),
+        };
         // Active-penalty ρ over ALL active blocks (smoothing + fixed ridge), in
         // block order, as the unified survival LAML evaluator requires. The
         // candidate's λ are exactly `lambdas` (smoothing entries from the
         // proposal, ridge entries frozen), so build ρ from that vector directly.
         let full_rho = Array1::from_iter(lambdas.iter().filter(|&&l| l > 0.0).map(|&l| l.ln()));
-        let (cost, grad_full) = candidate
-            .unified_lamlobjective_and_rhogradient(&beta, &state, &full_rho)
-            .map_err(|err| format!("survival LAML evaluation failed: {err}"))?;
+        let (cost, grad_full) =
+            match candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &full_rho) {
+                Ok(pair) => pair,
+                Err(_) => return bad_trial("LAML evaluation failed"),
+            };
         // Project onto the smoothing coordinates. The active-block enumeration
         // lists the smoothing blocks first (they are constructed first and the
         // ridge is appended last), so the leading `num_smoothing` gradient
         // entries are exactly ∂LAML/∂ρ_smooth with the ridge held fixed.
         if grad_full.len() < num_smoothing || !cost.is_finite() {
-            return Err("survival LAML returned an inconsistent gradient/cost".to_string());
+            return bad_trial("LAML cost non-finite or gradient too short");
         }
         let grad = grad_full.slice(s![..num_smoothing]).to_owned();
         if grad.iter().any(|g| !g.is_finite()) {
-            return Err("survival LAML gradient is non-finite".to_string());
+            return bad_trial("LAML gradient non-finite");
         }
         Ok((cost, grad))
     };
@@ -1183,12 +1200,28 @@ fn optimize_survival_transformation_smoothing(
                 -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
         >,
     );
-    let result = problem
-        .run(&mut obj, &context)
-        .map_err(|err| format!("{context} failed: {err}"))?;
-    // The selector improves the fit; if the outer loop does not certify
-    // convergence (rare flat-LAML plateau), fall back to the best ρ it reached
-    // rather than failing the whole fit — the seed is already a valid model.
+    // The outer selector only ever IMPROVES on the seed; it must never be able
+    // to fail the whole fit, because the CLI fits the IDENTICAL model at the
+    // seed λ with no outer loop and recovers the truth (gam#1123, "one engine").
+    // Per-trial bad smoothing values are already routed to a high finite cost in
+    // `eval_at`, so the only way `run` can still return Err is a pathological
+    // outer-optimizer state with no usable iterate. In that case fall back to the
+    // seed λ (a known-good, CLI-equivalent fit) rather than aborting — the
+    // selector is an enhancement, not a precondition for a valid model.
+    let result = match problem.run(&mut obj, &context) {
+        Ok(result) => result,
+        Err(err) => {
+            log::warn!(
+                "[#1123] survival transformation smoothing selector did not produce a usable ρ \
+                 ({err}); falling back to the seed λ (the CLI fits this same model at the seed and \
+                 recovers the truth)"
+            );
+            return Ok(Some(seed_lambdas));
+        }
+    };
+    // If the outer loop does not certify convergence (rare flat-LAML plateau),
+    // fall back to the best ρ it reached rather than failing — the seed is
+    // already a valid model.
     let selected_rho = result.rho;
     let mut lambdas = seed_lambdas;
     for k in 0..num_smoothing.min(selected_rho.len()) {
