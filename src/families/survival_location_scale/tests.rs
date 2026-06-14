@@ -3997,9 +3997,14 @@ use super::*;
             inverse_link_survival_prob_checked(&input.inverse_link, deterministic.eta[0])
                 .expect("expected survival");
         assert!((deterministic.survival_prob[0] - expected).abs() <= 1e-12);
-        let posterior =
-            predict_survival_location_scale_posterior_mean(&input, &fit, &Array2::zeros((6, 6)))
-                .expect("posterior mean");
+        let posterior = predict_survival_location_scalewith_uncertainty(
+            &input,
+            &fit,
+            &Array2::zeros((6, 6)),
+            true,
+            false,
+        )
+        .expect("posterior mean");
         assert!((deterministic.survival_prob[0] - posterior.survival_prob[0]).abs() <= 1e-10);
         let uncertainty = predict_survival_location_scalewith_uncertainty(
             &input,
@@ -4284,12 +4289,22 @@ use super::*;
             assert!((dense_sd - sparse_sd).abs() <= 1e-12);
         }
 
-        let dense_pm =
-            predict_survival_location_scale_posterior_mean(&dense_input, &fit, &covariance)
-                .expect("dense wiggle posterior mean");
-        let sparse_pm =
-            predict_survival_location_scale_posterior_mean(&sparse_input, &fit, &covariance)
-                .expect("sparse wiggle posterior mean");
+        let dense_pm = predict_survival_location_scalewith_uncertainty(
+            &dense_input,
+            &fit,
+            &covariance,
+            true,
+            false,
+        )
+        .expect("dense wiggle posterior mean");
+        let sparse_pm = predict_survival_location_scalewith_uncertainty(
+            &sparse_input,
+            &fit,
+            &covariance,
+            true,
+            false,
+        )
+        .expect("sparse wiggle posterior mean");
         for i in 0..dense_pm.eta.len() {
             assert!((dense_pm.eta[i] - sparse_pm.eta[i]).abs() <= 1e-12);
             assert!((dense_pm.survival_prob[i] - sparse_pm.survival_prob[i]).abs() <= 1e-10);
@@ -4331,8 +4346,14 @@ use super::*;
             [0.0, 0.0, 0.0, 0.0, 0.02, 0.005],
             [0.0, 0.0, 0.0, 0.0, 0.005, 0.02],
         ];
-        let predicted = predict_survival_location_scale_posterior_mean(&input, &fit, &covariance)
-            .expect("posterior mean");
+        let predicted = predict_survival_location_scalewith_uncertainty(
+            &input,
+            &fit,
+            &covariance,
+            true,
+            false,
+        )
+        .expect("posterior mean");
 
         let mu_h = input.x_time_exit.row(0).dot(&fit.beta_time()) + input.eta_time_offset_exit[0];
         let x_t = input.x_threshold.to_dense_arc();
@@ -4422,12 +4443,22 @@ use super::*;
             [0.0, 0.0, 0.0, 0.0, 0.005, 0.02],
         ];
 
-        let dense_pm =
-            predict_survival_location_scale_posterior_mean(&dense_input, &fit, &covariance)
-                .expect("dense posterior mean");
-        let sparse_pm =
-            predict_survival_location_scale_posterior_mean(&sparse_input, &fit, &covariance)
-                .expect("sparse posterior mean");
+        let dense_pm = predict_survival_location_scalewith_uncertainty(
+            &dense_input,
+            &fit,
+            &covariance,
+            true,
+            false,
+        )
+        .expect("dense posterior mean");
+        let sparse_pm = predict_survival_location_scalewith_uncertainty(
+            &sparse_input,
+            &fit,
+            &covariance,
+            true,
+            false,
+        )
+        .expect("sparse posterior mean");
         for i in 0..dense_pm.eta.len() {
             assert!((dense_pm.eta[i] - sparse_pm.eta[i]).abs() <= 1e-12);
             assert!((dense_pm.survival_prob[i] - sparse_pm.survival_prob[i]).abs() <= 1e-10);
@@ -4499,8 +4530,14 @@ use super::*;
             [0.01, -0.005, 0.006, -0.004, 0.003, -0.002, 0.025, 0.006],
             [0.0, 0.0, 0.001, 0.002, 0.001, 0.004, 0.006, 0.018],
         ];
-        let predicted = predict_survival_location_scale_posterior_mean(&input, &fit, &covariance)
-            .expect("wiggle posterior mean");
+        let predicted = predict_survival_location_scalewith_uncertainty(
+            &input,
+            &fit,
+            &covariance,
+            true,
+            false,
+        )
+        .expect("wiggle posterior mean");
 
         let x_t = input.x_threshold.to_dense_arc();
         let x_ls = input.x_log_sigma.to_dense_arc();
@@ -4654,8 +4691,9 @@ use super::*;
             assert!(pred.survival_prob[0].is_finite());
             assert!(pred.survival_prob[0] > 0.0 && pred.survival_prob[0] < 1.0);
             let cov = Array2::eye(6) * 1e-3;
-            let pm = predict_survival_location_scale_posterior_mean(&input, &fit, &cov)
-                .expect("posterior mean");
+            let pm =
+                predict_survival_location_scalewith_uncertainty(&input, &fit, &cov, true, false)
+                    .expect("posterior mean");
             assert!(pm.survival_prob[0].is_finite());
             assert!(pm.survival_prob[0] > 0.0 && pm.survival_prob[0] < 1.0);
         }

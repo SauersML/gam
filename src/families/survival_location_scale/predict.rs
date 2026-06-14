@@ -225,20 +225,6 @@ pub(crate) fn survival_location_scale_response_from_predictors(
     Ok(SurvivalLocationScalePredictResult { eta, survival_prob })
 }
 
-pub fn predict_survival_location_scale_posterior_mean(
-    input: &SurvivalLocationScalePredictInput,
-    fit: &UnifiedFitResult,
-    covariance: &Array2<f64>,
-) -> Result<SurvivalLocationScalePredictResult, String> {
-    let pred = predict_survival_location_scale(input, fit)?;
-    let (survival_prob, _) = exact_survival_response_moments(input, fit, covariance)?;
-
-    Ok(SurvivalLocationScalePredictResult {
-        eta: pred.eta,
-        survival_prob,
-    })
-}
-
 pub fn predict_survival_location_scalewith_uncertainty(
     input: &SurvivalLocationScalePredictInput,
     fit: &UnifiedFitResult,
