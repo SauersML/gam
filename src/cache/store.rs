@@ -944,7 +944,7 @@ impl WarmStartStore {
             // expired we return the cached listing untouched (the fast path);
             // otherwise the removals bump the dir mtime, so we drop the stale
             // cache and re-cache the survivors keyed by the post-removal mtime.
-            let any_expired = cached.entries.iter().any(|e| {
+            let any_expired = cached.iter().any(|e| {
                 meta_expired(
                     e.meta.written_unix_secs,
                     e.meta.written_nanos,
@@ -955,8 +955,8 @@ impl WarmStartStore {
             if !any_expired {
                 return cached;
             }
-            let mut survivors = Vec::with_capacity(cached.entries.len());
-            for entry in cached.entries {
+            let mut survivors = Vec::with_capacity(cached.len());
+            for entry in cached {
                 if meta_expired(
                     entry.meta.written_unix_secs,
                     entry.meta.written_nanos,
