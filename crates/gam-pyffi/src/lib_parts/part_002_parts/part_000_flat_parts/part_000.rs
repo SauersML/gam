@@ -3076,39 +3076,33 @@ fn sae_residual_gauge_dict<'py>(
     Ok(d)
 }
 
-/// Build the first-class per-atom SAE curvature report (#1099). The point
-/// estimates are the fitted empirical second-fundamental-form norms already
-/// computed for the curved-dictionary certificate. Profile-likelihood CI fields
-/// are present but unavailable until the SAE fixed-κ profile criterion is wired;
-/// this keeps the user-facing schema honest without inventing a Wald substitute.
+/// Build the per-atom SAE curvature report (#1099, rescoped under #1115). Each
+/// `kappa_hat` is the fitted empirical second-fundamental-form sup-norm bound
+/// already computed for the curved-dictionary certificate
+/// (`CertificateInputs::per_atom_kappa_hat`, the one source of truth shared with
+/// `dictionary_report`). It is a descriptive plug-in geometry summary, not an
+/// estimand with a profiled criterion: a sup-norm curvature BOUND has no
+/// confidence interval, and the delta-method SE that #1099 first shipped was
+/// conditioned on the generated latent coordinates as if known (omitting the
+/// generated-regressor channel) and under-covered, so #1115 removed it. The
+/// schema therefore carries the point bound only — no SE/CI/flatness fields.
 fn sae_curvature_report_dict<'py>(
     py: Python<'py>,
     report: &gam::terms::sae_manifold::CertificateInputs,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
-    d.set_item("ci_available", false)?;
-    d.set_item("ci_method", "unavailable")?;
-    d.set_item("level", py.None())?;
     d.set_item(
         "note",
         "SAE per-atom kappa_hat is the fitted empirical second-fundamental-form \
-         norm. Profile-likelihood CI and flatness LR fields are unavailable until \
-         the SAE fixed-kappa profile criterion is exposed.",
+         sup-norm bound (a descriptive plug-in geometry summary). It is not an \
+         estimand with a confidence interval: a curvature bound has no profiled \
+         criterion, so no SE/CI is reported.",
     )?;
     let atoms = PyList::empty(py);
     for (atom_idx, &kappa_hat) in report.per_atom_kappa_hat.iter().enumerate() {
         let a = PyDict::new(py);
         a.set_item("atom", atom_idx)?;
         a.set_item("kappa_hat", kappa_hat)?;
-        a.set_item("ci_lo", py.None())?;
-        a.set_item("ci_hi", py.None())?;
-        a.set_item("lo_at_bound", py.None())?;
-        a.set_item("hi_at_bound", py.None())?;
-        a.set_item("verdict", "unavailable")?;
-        a.set_item("flatness_lr_stat", py.None())?;
-        a.set_item("flatness_p_value", py.None())?;
-        a.set_item("ci_available", false)?;
-        a.set_item("ci_method", "unavailable")?;
         atoms.append(a)?;
     }
     d.set_item("atoms", atoms)?;

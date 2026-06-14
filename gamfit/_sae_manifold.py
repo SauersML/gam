@@ -617,11 +617,11 @@ class ManifoldSAE:
     # This is deliberately quantities-only; no global-optimality verdict exists
     # until the theorem threshold is implemented.
     incoherence_report: dict[str, Any] | None = None
-    # Per-atom curvature estimand report (#1099). ``atoms[k]["kappa_hat"]`` is
-    # the fitted empirical second-fundamental-form norm for atom k. The
-    # profile-likelihood CI and flatness LR fields mirror ``Model.curvature`` but
-    # remain ``None`` / ``"unavailable"`` until the SAE fixed-kappa profile
-    # criterion is wired.
+    # Per-atom curvature report (#1099, rescoped under #1115).
+    # ``atoms[k]`` is ``{"atom": int, "kappa_hat": float}``: the fitted empirical
+    # second-fundamental-form sup-norm bound for atom k, a descriptive plug-in
+    # geometry summary. A curvature bound is not an estimand with a profiled
+    # criterion, so no SE/CI/flatness fields are carried.
     curvature_report: dict[str, Any] | None = None
     # The unified certificate ledger (#16): ONE coherent block consolidating every
     # certificate this fit produced under a shared claim+evidence+verdict shape.
@@ -1153,16 +1153,15 @@ class ManifoldSAE:
         return dict(self.diagnostics["atoms"][k])
 
     def curvature(self) -> list[dict[str, Any]]:
-        """Per-atom SAE curvature report (#1099).
+        """Per-atom SAE curvature report (#1099, rescoped under #1115).
 
-        Returns one record per atom with ``kappa_hat`` and CI-shaped fields
-        matching :meth:`gamfit.Model.curvature`: ``ci_lo``, ``ci_hi``,
-        ``verdict``, ``flatness_lr_stat``, and ``flatness_p_value``. For SAE
-        dictionaries today, ``kappa_hat`` is available from the fitted
-        second-fundamental-form estimate, while profile-likelihood CI and
-        flatness LR fields are explicitly unavailable (``None`` /
-        ``"unavailable"``) until the fixed-kappa SAE profile criterion is
-        exposed by the Rust fit.
+        Returns one record per atom: ``{"atom": int, "kappa_hat": float}``.
+        ``kappa_hat`` is the fitted empirical second-fundamental-form sup-norm
+        bound — a descriptive plug-in geometry summary. It is not an estimand
+        with a confidence interval: a curvature bound has no profiled criterion,
+        so no SE/CI/flatness fields are reported (the delta-method SE that #1099
+        first shipped was conditioned on the generated latent coordinates as if
+        known and under-covered, so #1115 removed it).
         """
         if self.curvature_report is None:
             raise ValueError(

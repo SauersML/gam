@@ -158,23 +158,11 @@ class _CapturingRustModule:
                 ],
             },
             "curvature_report": {
-                "ci_available": False,
-                "ci_method": "unavailable",
-                "level": None,
                 "note": "fake SAE curvature report",
                 "atoms": [
                     {
                         "atom": atom_k,
                         "kappa_hat": 0.1 * float(atom_k + 1),
-                        "ci_lo": None,
-                        "ci_hi": None,
-                        "lo_at_bound": None,
-                        "hi_at_bound": None,
-                        "verdict": "unavailable",
-                        "flatness_lr_stat": None,
-                        "flatness_p_value": None,
-                        "ci_available": False,
-                        "ci_method": "unavailable",
                     }
                     for atom_k in range(k_atoms)
                 ],
@@ -361,12 +349,10 @@ def test_sae_curvature_report_is_user_reachable_and_round_trips(monkeypatch):
     assert rows[0]["kappa_hat"] == pytest.approx(0.1)
     assert rows[1]["kappa_hat"] == pytest.approx(0.2)
     for row in rows:
-        assert row["ci_available"] is False
-        assert row["ci_method"] == "unavailable"
-        assert row["ci_lo"] is None
-        assert row["ci_hi"] is None
-        assert row["verdict"] == "unavailable"
-        assert row["flatness_p_value"] is None
+        # The SAE curvature report carries the plug-in sup-norm bound only — a
+        # curvature bound is not an estimand, so no SE/CI/flatness/verdict keys
+        # (#1099 rescoped under #1115).
+        assert set(row) == {"atom", "kappa_hat"}
 
     assert fit.atom_curvature(1)["kappa_hat"] == pytest.approx(0.2)
     restored = gamfit.ManifoldSAE.from_dict(fit.to_dict())
