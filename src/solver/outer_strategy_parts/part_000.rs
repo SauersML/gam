@@ -3035,15 +3035,36 @@ const PROBE_REFUSAL_FATAL_SENTINEL: &str = "OUTER_PROBE_REFUSAL_FATAL";
 
 
 /// Sentinel embedded in the [`ObjectiveEvalError::Fatal`] message the bridge
-/// returns when [`CostStallGuard`] fires. `opt::Bfgs` preserves the message
-/// verbatim in [`BfgsError::ObjectiveFailed`]; the seed-loop runner recognizes
-/// this prefix and reclassifies the (otherwise "failed") run as a converged
-/// outer result built from the published best iterate.
-/// returns when [`CostStallGuard`] fires. `opt::Bfgs` preserves the message
-/// verbatim in [`BfgsError::ObjectiveFailed`]; the seed-loop runner recognizes
-/// this prefix and reclassifies the (otherwise "failed") run as a converged
-/// outer result built from the published best iterate.
+/// returns when [`CostStallGuard`] halts BFGS on a cost stall. `opt::Bfgs`
+/// preserves the message verbatim in [`BfgsError::ObjectiveFailed`]; the
+/// seed-loop runner recognizes this sentinel and rebuilds an outer result from
+/// the published best iterate. Whether that result is reported `converged` is
+/// NOT decided here — it is carried on the published [`CostStallExit`], gated on
+/// the projected gradient norm at the best iterate clearing the same outer
+/// gradient tolerance the genuine convergence path uses. A cost stall whose
+/// residual gradient still exceeds that tolerance is a flat-valley stall, not a
+/// stationary optimum, and is reported `converged = false`.
 const COST_STALL_CONVERGED_SENTINEL: &str = "OUTER_COST_STALL_CONVERGED";
+
+
+/// Verdict produced by folding one accepted outer iterate into
+/// [`CostStallGuard::observe`].
+enum CostStallVerdict {
+    /// The objective is still improving (or the no-improvement window has not
+    /// yet filled). Keep descending.
+    Continue,
+    /// The objective has stopped improving over the window AND the projected
+    /// gradient norm at the best iterate clears the outer gradient tolerance:
+    /// a genuine stationary optimum on a (legitimately) flat REML surface.
+    Converged,
+    /// The objective has stopped improving over the window but the projected
+    /// gradient norm at the best iterate is still above the outer gradient
+    /// tolerance: a weakly-identified flat-valley FLOOR with residual
+    /// non-stationarity. Halting here is correct (no further cost progress is
+    /// available), but the iterate is NOT a stationary optimum and must be
+    /// reported `converged = false`.
+    FlatValleyStall { residual_grad_norm: f64 },
+}
 
 
 /// Number of consecutive accepted outer iterates with negligible relative
@@ -3065,6 +3086,12 @@ struct CostStallExit {
     /// Accepted outer iterates observed when the stall fired (for the runner's
     /// `OuterResult.iterations` field and logging).
     iterations: usize,
+    /// Whether the best iterate is a genuine stationary optimum: `true` only
+    /// when its projected gradient norm cleared the outer gradient tolerance
+    /// (legitimately-flat REML surface). `false` for a flat-valley stall whose
+    /// residual gradient remains above tolerance — the runner reports the
+    /// rebuilt outer result as non-converged in that case.
+    converged: bool,
 }
 
 
@@ -3081,6 +3108,13 @@ struct CostStallGuard {
     /// Consecutive accepted-step window with no improvement before declaring
     /// convergence.
     window: usize,
+    /// Projected outer gradient-norm threshold that the best iterate must clear
+    /// for a cost stall to count as a genuine stationary optimum. This is the
+    /// SAME threshold the normal BFGS convergence path uses
+    /// (`outer_gradient_tolerance(config).threshold(seed_cost, ‖g_0‖)`),
+    /// evaluated once at seed. A cost stall above this threshold is a
+    /// flat-valley stall, reported `converged = false`.
+    grad_threshold: f64,
     best_value: f64,
     best_rho: Option<Array1<f64>>,
     best_grad_norm: f64,
@@ -3093,10 +3127,16 @@ struct CostStallGuard {
 
 
 impl CostStallGuard {
-    fn new(rel_tol: f64, window: usize, exit: Arc<Mutex<Option<CostStallExit>>>) -> Self {
+    fn new(
+        rel_tol: f64,
+        window: usize,
+        grad_threshold: f64,
+        exit: Arc<Mutex<Option<CostStallExit>>>,
+    ) -> Self {
         Self {
             rel_tol,
             window,
+            grad_threshold,
             best_value: f64::INFINITY,
             best_rho: None,
             best_grad_norm: f64::INFINITY,
@@ -3106,16 +3146,22 @@ impl CostStallGuard {
         }
     }
 
-    /// Fold one accepted-iterate `(ρ, cost, ‖g‖)` into the guard. Returns
-    /// `true` when the cost-stall convergence condition is met, after
-    /// publishing the best iterate to the shared cell.
-    fn observe(&mut self, rho: &Array1<f64>, value: f64, grad_norm: f64) -> bool {
+    /// Fold one accepted-iterate `(ρ, cost, ‖g‖)` into the guard. Returns a
+    /// [`CostStallVerdict`]: `Continue` while the score is still improving,
+    /// `Converged` when the score has stalled AND the projected gradient norm
+    /// at the best iterate clears the outer gradient tolerance (a genuine
+    /// stationary optimum on a flat REML surface), or `FlatValleyStall` when
+    /// the score has stalled but the residual gradient remains above tolerance
+    /// (a weakly-identified flat valley that is NOT stationary). Either stalled
+    /// verdict publishes the best iterate to the shared cell, tagged with its
+    /// `converged` status.
+    fn observe(&mut self, rho: &Array1<f64>, value: f64, grad_norm: f64) -> CostStallVerdict {
         if !value.is_finite() {
             // A non-finite accepted objective is the inner-solver's problem,
             // not a stall; reset so a later real descent is not falsely
             // credited as a no-improvement step.
             self.no_improve_streak = 0;
-            return false;
+            return CostStallVerdict::Continue;
         }
         self.accepted_iters = self.accepted_iters.saturating_add(1);
         let improvement = self.best_value - value;
@@ -3131,7 +3177,7 @@ impl CostStallGuard {
             self.no_improve_streak = 0;
         }
         if self.no_improve_streak < self.window {
-            return false;
+            return CostStallVerdict::Continue;
         }
         // Publish the best iterate. Prefer the recorded best; fall back to the
         // current point if (pathologically) none was stored.
@@ -3146,15 +3192,28 @@ impl CostStallGuard {
         } else {
             grad_norm
         };
+        // Convergence is STATIONARITY, not cost-flatness: a cost stall counts
+        // as a converged optimum only when the projected gradient norm at the
+        // best iterate clears the same outer gradient tolerance the genuine
+        // BFGS convergence path checks. Otherwise it is a flat-valley floor
+        // with residual non-stationarity, reported `converged = false`.
+        let converged = best_grad_norm.is_finite() && best_grad_norm <= self.grad_threshold;
         if let Ok(mut slot) = self.exit.lock() {
             *slot = Some(CostStallExit {
                 rho: best_rho,
                 value: best_value,
                 grad_norm: best_grad_norm,
                 iterations: self.accepted_iters,
+                converged,
             });
         }
-        true
+        if converged {
+            CostStallVerdict::Converged
+        } else {
+            CostStallVerdict::FlatValleyStall {
+                residual_grad_norm: best_grad_norm,
+            }
+        }
     }
 }
 
@@ -3505,34 +3564,56 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // Wolfe line-search accepts the step. Cheap: throttled internally.
         crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
         self.iter_count = self.iter_count.saturating_add(1);
-        // Gradient-independent cost-stall convergence (#1089). `eval_grad` is
-        // invoked by `opt::Bfgs` at each accepted iterate (line-search COST
-        // probes go through `eval_cost`, not here), so folding the objective in
-        // here counts accepted outer steps. When the REML score has stopped
-        // improving over `COST_STALL_WINDOW` consecutive accepted steps, signal
-        // termination by returning a sentinel `Fatal`: `opt::Bfgs` cannot be
-        // stopped from an observer (its `OptimizerObserver` hooks return
-        // `()`), and an error is the only in-band way to halt it. The seed-loop
-        // runner recognizes the sentinel and rebuilds a *converged* result from
-        // the best iterate the guard published, so this is a real convergence
-        // exit, not a silent iteration cap.
-        if let Some(guard) = self.cost_stall.as_mut()
-            && guard.observe(x, eval.cost, g_norm)
-        {
-            log::info!(
-                "[OUTER] cost-stall convergence: REML objective improved < {:.3e} (relative) \
-                 over {} consecutive accepted outer steps; accepting best-so-far \
-                 (value={:.6e}, |g|={:.3e}). Dropping further gradient-norm descent on a \
-                 flat / weakly-identified ρ valley where the residual gradient lies along \
-                 directions that do not reduce the objective.",
-                guard.rel_tol,
-                guard.window,
-                guard.best_value,
-                guard.best_grad_norm,
-            );
-            return Err(ObjectiveEvalError::Fatal {
-                message: COST_STALL_CONVERGED_SENTINEL.to_string(),
-            });
+        // Cost-stall halt (#1089). `eval_grad` is invoked by `opt::Bfgs` at
+        // each accepted iterate (line-search COST probes go through `eval_cost`,
+        // not here), so folding the objective in here counts accepted outer
+        // steps. When the REML score has stopped improving over
+        // `COST_STALL_WINDOW` consecutive accepted steps, halt BFGS by returning
+        // a sentinel `Fatal` (an observer cannot stop `opt::Bfgs`; an error is
+        // the only in-band way to halt it). The runner rebuilds the outer result
+        // from the published best iterate — but whether that result is reported
+        // CONVERGED is decided by the guard's STATIONARITY test, not by
+        // cost-flatness alone: a stall whose projected gradient still exceeds the
+        // outer gradient tolerance is a flat-valley floor (`converged = false`),
+        // a stationary one is a real optimum (`converged = true`). Both share the
+        // sentinel; the verdict rides on the published `CostStallExit.converged`.
+        if let Some(guard) = self.cost_stall.as_mut() {
+            match guard.observe(x, eval.cost, g_norm) {
+                CostStallVerdict::Continue => {}
+                CostStallVerdict::Converged => {
+                    log::info!(
+                        "[OUTER] cost-stall convergence: REML objective improved < {:.3e} \
+                         (relative) over {} consecutive accepted outer steps AND the projected \
+                         gradient cleared the outer tolerance (|g|={:.3e} <= {:.3e}); accepting \
+                         best-so-far as a stationary optimum (value={:.6e}).",
+                        guard.rel_tol,
+                        guard.window,
+                        guard.best_grad_norm,
+                        guard.grad_threshold,
+                        guard.best_value,
+                    );
+                    return Err(ObjectiveEvalError::Fatal {
+                        message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+                    });
+                }
+                CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
+                    log::warn!(
+                        "[OUTER] cost-stall FLAT-VALLEY STALL: REML objective improved < {:.3e} \
+                         (relative) over {} consecutive accepted outer steps but the projected \
+                         gradient is still ABOVE the outer tolerance (|g|={:.3e} > {:.3e}); \
+                         halting on a weakly-identified ρ valley floor and reporting NON-CONVERGED \
+                         (residual outer non-stationarity, value={:.6e}).",
+                        guard.rel_tol,
+                        guard.window,
+                        residual_grad_norm,
+                        guard.grad_threshold,
+                        guard.best_value,
+                    );
+                    return Err(ObjectiveEvalError::Fatal {
+                        message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+                    });
+                }
+            }
         }
         Ok(FirstOrderSample {
             value: eval.cost,

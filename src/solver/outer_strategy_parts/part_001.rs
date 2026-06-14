@@ -1169,6 +1169,24 @@ fn run_outer_with_plan(
                     let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
                         Arc::new(Mutex::new(None));
                     let cost_stall_rel_tol = (config.tolerance * 1.0e-2).max(f64::EPSILON);
+                    // Stationarity gate for the cost-stall exit. Convergence must
+                    // mean stationarity, not cost-flatness: a cost stall only
+                    // counts as a converged optimum when the projected gradient
+                    // norm at the best iterate clears the SAME outer gradient
+                    // tolerance the genuine BFGS convergence path uses. Evaluate
+                    // that threshold once at the seed (cost + initial gradient
+                    // norm), exactly as `opt::Bfgs` does internally. Reusing
+                    // `grad_tol` here means no new/widened tolerance is
+                    // introduced — a flat-valley stall whose residual gradient
+                    // exceeds this is surfaced as non-converged.
+                    let seed_grad_norm = seed_eval
+                        .gradient
+                        .iter()
+                        .map(|g| g * g)
+                        .sum::<f64>()
+                        .sqrt();
+                    let cost_stall_grad_threshold =
+                        grad_tol.threshold(seed_eval.cost, seed_grad_norm);
                     let objective = OuterFirstOrderBridge {
                         obj,
                         layout,
@@ -1181,6 +1199,7 @@ fn run_outer_with_plan(
                         cost_stall: Some(CostStallGuard::new(
                             cost_stall_rel_tol,
                             COST_STALL_WINDOW,
+                            cost_stall_grad_threshold,
                             cost_stall_exit.clone(),
                         )),
                         consecutive_probe_refusals: 0,
@@ -1292,11 +1311,20 @@ fn run_outer_with_plan(
                         Err(BfgsError::ObjectiveFailed { message })
                             if message == COST_STALL_CONVERGED_SENTINEL =>
                         {
-                            // The bridge's cost-stall guard halted BFGS at a
-                            // flat-valley floor (#1089). Rebuild a CONVERGED
-                            // outer result from the best iterate it published —
-                            // this is a genuine convergence (the REML score
-                            // stopped decreasing), not a failure.
+                            // The bridge's cost-stall guard halted BFGS because
+                            // the REML score stopped decreasing (#1089). Rebuild
+                            // the outer result from the best iterate it
+                            // published. Whether the run is CONVERGED is decided
+                            // by the guard's stationarity test and rides on
+                            // `exit.converged`: `true` only when the projected
+                            // gradient at the best iterate cleared the outer
+                            // gradient tolerance (a stationary optimum on a flat
+                            // surface); `false` for a flat-valley floor with
+                            // residual non-stationarity. A non-converged
+                            // cost-stall flows into the same non-convergence
+                            // reporting as MaxIterations / line-search-failed
+                            // (best-so-far returned, `converged = false`), not a
+                            // panic and not a silently-relabeled optimum.
                             let exit = cost_stall_exit
                                 .lock()
                                 .ok()
@@ -1307,7 +1335,7 @@ fn run_outer_with_plan(
                                     exit.value,
                                     exit.iterations,
                                     Some(exit.grad_norm),
-                                    true,
+                                    exit.converged,
                                     *the_plan,
                                 )),
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
