@@ -136,6 +136,7 @@ fn gpu_pirls_gating_1_newton_sign_gaussian_direction() {
             priorweights: weights.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
@@ -217,6 +218,7 @@ fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
             priorweights: weights.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
@@ -287,6 +289,7 @@ fn gpu_pirls_gating_3_offset_parity() {
             priorweights: weights.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
@@ -375,6 +378,7 @@ fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
             priorweights: weights.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
@@ -464,6 +468,7 @@ fn gpu_pirls_gating_5_qs_basis_semantics() {
             priorweights: weights.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
@@ -554,6 +559,7 @@ fn gpu_pirls_gating_6_final_hessian_at_accepted_eta() {
             priorweights: weights.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
@@ -642,6 +648,7 @@ fn gpu_pirls_gating_7_status_or_reduce() {
             priorweights: weights.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
@@ -729,6 +736,7 @@ fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
             priorweights: weights.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
@@ -755,6 +763,7 @@ fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
             priorweights: weights.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: &canonical,

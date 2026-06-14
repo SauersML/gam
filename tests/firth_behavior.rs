@@ -99,6 +99,7 @@ fn fit_beta_norm(
             priorweights: w.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: penalties,
@@ -152,6 +153,7 @@ fn proxycostwith_pirls(
             priorweights: w.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: penalties,

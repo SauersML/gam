@@ -1269,6 +1269,15 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             && inverse_link_has_fisher_weight_jet(&config.link_kind),
         transform_active.clone(),
         quadctx,
+        // #1111 / #1033 mechanism (c): frozen-W first-Fisher-step XᵀWX in the
+        // original (conditioned x_fit) frame, served n-free on the first inner
+        // iteration. Suppressed under Firth bias reduction, which shifts the
+        // working response per iteration (the installer also gates Firth off).
+        if config.firth_bias_reduction {
+            None
+        } else {
+            glm_first_step_gram.cloned()
+        },
     );
 
     // Apply integrated (GHQ) likelihood if per-observation SE is provided.

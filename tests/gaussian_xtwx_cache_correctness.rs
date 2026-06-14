@@ -145,6 +145,7 @@ fn fit_at_rho(
             priorweights: w.view(),
             covariate_se: None,
             gaussian_fixed_cache: cache,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: penalties,

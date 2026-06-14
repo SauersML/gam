@@ -133,6 +133,7 @@ fn fit_at_rho_full(
             priorweights: w.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: penalties,
@@ -330,6 +331,7 @@ fn pirls_result_exposes_final_accept_rho_in_unit_interval() {
             priorweights: w.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         },
         PenaltyConfig {
             canonical_penalties: &penalties,
