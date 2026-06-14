@@ -30,9 +30,9 @@
 use ndarray::array;
 
 use crate::inference::row_metric::RowMetric;
-use crate::inference::steering::{steer_delta, SteerPlan};
+use crate::inference::steering::{SteerPlan, steer_delta};
 use crate::inference::structure_evidence::{
-    plan_probe_for_contested_claim, CandidateProbe, ClaimKind, ProbePlan, StructureLedger,
+    CandidateProbe, ClaimKind, ProbePlan, StructureLedger, plan_probe_for_contested_claim,
 };
 use crate::terms::sae_manifold::SaeManifoldTerm;
 
@@ -88,9 +88,7 @@ impl<'a> ProbeRunner<'a> {
     /// already-computed [`SteerPlan`] rides back in the result.
     pub fn design_next(&self, ledger: &StructureLedger) -> Result<RealizedProbe, String> {
         let (claim_idx, atom_k) = self.most_contested_atom_claim(ledger)?;
-        let current_log_e = ledger.claims()[claim_idx]
-            .evidence
-            .current_e_value_log();
+        let current_log_e = ledger.claims()[claim_idx].evidence.current_e_value_log();
 
         let candidates = self.candidate_steers(atom_k)?;
         if candidates.is_empty() {
@@ -116,26 +114,24 @@ impl<'a> ProbeRunner<'a> {
             .collect();
         let fisher = array![[1.0]];
 
-        let plan = plan_probe_for_contested_claim(&probes, &fisher, PROBE_DESIGN_ALPHA, current_log_e)
-            .ok_or_else(|| {
-                format!(
-                    "ProbeRunner::design_next: no candidate probe discriminates the hypotheses \
+        let plan =
+            plan_probe_for_contested_claim(&probes, &fisher, PROBE_DESIGN_ALPHA, current_log_e)
+                .ok_or_else(|| {
+                    format!(
+                        "ProbeRunner::design_next: no candidate probe discriminates the hypotheses \
                      for atom {atom_k} (every reachable steering move delivers zero output-Fisher \
                      dose — the claim is undecidable by steering, a finding not a failure)"
-                )
-            })?;
+                    )
+                })?;
 
-        let steer = candidates
-            .into_iter()
-            .nth(plan.probe)
-            .ok_or_else(|| {
-                format!(
-                    "ProbeRunner::design_next: planner selected candidate {} of {} for atom \
+        let steer = candidates.into_iter().nth(plan.probe).ok_or_else(|| {
+            format!(
+                "ProbeRunner::design_next: planner selected candidate {} of {} for atom \
                      {atom_k}",
-                    plan.probe,
-                    probes.len()
-                )
-            })?;
+                plan.probe,
+                probes.len()
+            )
+        })?;
 
         Ok(RealizedProbe {
             plan,
@@ -172,7 +168,10 @@ impl<'a> ProbeRunner<'a> {
     /// naming a concrete atom — [`ClaimKind::AtomExists`] and
     /// [`ClaimKind::GeometryKind`] — are steerable; binding-edge and custom
     /// claims have no single atom to drive and are skipped.
-    fn most_contested_atom_claim(&self, ledger: &StructureLedger) -> Result<(usize, usize), String> {
+    fn most_contested_atom_claim(
+        &self,
+        ledger: &StructureLedger,
+    ) -> Result<(usize, usize), String> {
         let mut best: Option<(usize, usize, f64)> = None;
         for (idx, claim) in ledger.claims().iter().enumerate() {
             let Some(atom_k) = steerable_atom(&claim.kind) else {
@@ -187,11 +186,10 @@ impl<'a> ProbeRunner<'a> {
                 _ => best = Some((idx, atom_k, log_e)),
             }
         }
-        best.map(|(idx, atom_k, _)| (idx, atom_k))
-            .ok_or_else(|| {
-                "ProbeRunner: ledger has no contested claim naming a steerable atom in this term"
-                    .to_string()
-            })
+        best.map(|(idx, atom_k, _)| (idx, atom_k)).ok_or_else(|| {
+            "ProbeRunner: ledger has no contested claim naming a steerable atom in this term"
+                .to_string()
+        })
     }
 
     /// Find the ledger claim a realized steer belongs to: the contested

@@ -192,7 +192,9 @@ fn margslope_matern_logslope_above_cliff() {
             );
         }
         Ok(_) => panic!("wrong FitResult variant"),
-        Err(e) => eprintln!("[979-ABOVE-CLIFF] n={n} centers={centers} total_s={elapsed:.2} FAILED: {e}"),
+        Err(e) => {
+            eprintln!("[979-ABOVE-CLIFF] n={n} centers={centers} total_s={elapsed:.2} FAILED: {e}")
+        }
     }
     assert!(
         elapsed < 120.0,

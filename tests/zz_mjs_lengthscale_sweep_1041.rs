@@ -8,9 +8,9 @@
 //! the run completed (the numbers are the deliverable). Deleted once the auto
 //! length-scale factor is settled.
 
+use gam::families::bms::BernoulliMarginalSlopeFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::families::bms::BernoulliMarginalSlopeFitResult;
 use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
 use ndarray::Array2;
 

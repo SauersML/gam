@@ -17,9 +17,9 @@
 //! held-out grid; the assertion is relative (measure-jet vs the baseline
 //! min), so it is a basis-conditioning gate, not an absolute-accuracy bar.
 
+use gam::families::bms::BernoulliMarginalSlopeFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::families::bms::BernoulliMarginalSlopeFitResult;
 use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
 use ndarray::Array2;
 
