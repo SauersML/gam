@@ -2166,6 +2166,171 @@ use super::*;
         }
     }
 
+    /// #1117 jet-composition contract: the `SubspaceReducedEvaluator` must map
+    /// EVERY jet order by the SAME right-multiply `∂^g Φ̃ = (∂^g Φ) Q`,
+    /// contracting only the basis (column) axis. A wrong order on any field is a
+    /// wrong gradient downstream, so we pin value + first + second + third jets
+    /// of the wrapped evaluator against the inner evaluator's jets times `Q`
+    /// directly (no finite difference — this is the exact linear-algebra
+    /// identity).
+    #[test]
+    pub(crate) fn subspace_reduced_evaluator_composes_all_jets_by_q() {
+        let inner = Arc::new(PeriodicHarmonicEvaluator::new(7).unwrap());
+        let coords = array![[-0.3_f64], [0.0], [0.15], [0.42], [0.88]];
+        let m = inner.num_basis; // 7
+        // A deterministic orthonormal column map Q (M × r), r = 4: take the
+        // first 4 eigenvectors of a fixed SPD matrix so the columns are
+        // orthonormal but genuinely mix the inner columns (not a trivial
+        // selection).
+        let mut a = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                a[[i, j]] = 1.0 / (1.0 + (i as f64 - j as f64).abs());
+            }
+        }
+        let (_evals, evecs) = a.eigh(Side::Lower).unwrap();
+        let r = 4usize;
+        let mut q = Array2::<f64>::zeros((m, r));
+        for col in 0..r {
+            for row in 0..m {
+                q[[row, col]] = evecs[[row, col]];
+            }
+        }
+        let reduced = SubspaceReducedEvaluator::new(inner.clone(), q.clone()).unwrap();
+        assert_eq!(reduced.inner_width(), m);
+        assert_eq!(reduced.reduced_width(), r);
+
+        // Value + first jet.
+        let (phi_in, jet_in) = inner.evaluate(coords.view()).unwrap();
+        let (phi_red, jet_red) = reduced.evaluate(coords.view()).unwrap();
+        let phi_expect = phi_in.dot(&q);
+        assert_eq!(phi_red.dim(), phi_expect.dim());
+        for i in 0..phi_red.nrows() {
+            for j in 0..r {
+                assert_abs_diff_eq!(phi_red[[i, j]], phi_expect[[i, j]], epsilon = 1e-12);
+            }
+        }
+        for axis in 0..jet_in.shape()[2] {
+            let expect = jet_in.slice(s![.., .., axis]).to_owned().dot(&q);
+            for i in 0..jet_red.shape()[0] {
+                for j in 0..r {
+                    assert_abs_diff_eq!(jet_red[[i, j, axis]], expect[[i, j]], epsilon = 1e-12);
+                }
+            }
+        }
+
+        // Second jet: (∂²Φ) Q on each (axis_a, axis_c) fiber.
+        let h_in = inner.second_jet(coords.view()).unwrap();
+        let h_red = reduced.second_jet(coords.view()).unwrap();
+        let d = h_in.shape()[2];
+        for a_ax in 0..d {
+            for c_ax in 0..d {
+                let expect = h_in.slice(s![.., .., a_ax, c_ax]).to_owned().dot(&q);
+                for i in 0..h_red.shape()[0] {
+                    for j in 0..r {
+                        assert_abs_diff_eq!(
+                            h_red[[i, j, a_ax, c_ax]],
+                            expect[[i, j]],
+                            epsilon = 1e-12
+                        );
+                    }
+                }
+            }
+        }
+
+        // Third jet: (∂³Φ) Q on each (a, c, e) fiber.
+        let t_in = inner.third_jet(coords.view()).unwrap();
+        let t_red = reduced
+            .third_jet_dyn(coords.view())
+            .unwrap()
+            .unwrap();
+        for a_ax in 0..d {
+            for c_ax in 0..d {
+                for e_ax in 0..d {
+                    let expect = t_in
+                        .slice(s![.., .., a_ax, c_ax, e_ax])
+                        .to_owned()
+                        .dot(&q);
+                    for i in 0..t_red.shape()[0] {
+                        for j in 0..r {
+                            assert_abs_diff_eq!(
+                                t_red[[i, j, a_ax, c_ax, e_ax]],
+                                expect[[i, j]],
+                                epsilon = 1e-12
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// #1117 idempotence: once an atom is reduced to a full-rank subspace, a
+    /// second `reduce_atoms_to_data_supported_rank` pass is a NO-OP — the reduced
+    /// data Gram is full rank (`r == m`), so the fit-entry installer skips it and
+    /// the design/decoder/penalty are left byte-for-byte. This guards against a
+    /// double-reduction that would compound `Q` maps.
+    #[test]
+    pub(crate) fn rank_reduction_is_idempotent_on_already_reduced_atom() {
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+        let coords = array![[0.1], [0.45], [0.8], [0.1], [0.45], [0.8]];
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let penalty = Array2::<f64>::eye(5);
+        let decoder = array![[0.05], [-0.05], [0.05], [0.02], [-0.02]];
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            decoder,
+            penalty,
+        )
+        .unwrap()
+        .with_basis_second_jet(evaluator.clone());
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::ones((6, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+        // First pass reduces 5 → 3.
+        term.reduce_atoms_to_data_supported_rank().unwrap();
+        assert_eq!(term.atoms[0].basis_size(), 3);
+        let design_after_first = term.atoms[0].basis_values.clone();
+        let decoder_after_first = term.atoms[0].decoder_coefficients.clone();
+
+        // Second pass: the reduced Gram is full rank → SKIP. Width and contents
+        // are unchanged (no double-reduction).
+        term.reduce_atoms_to_data_supported_rank().unwrap();
+        assert_eq!(
+            term.atoms[0].basis_size(),
+            3,
+            "a second reduction pass on a full-rank reduced atom must be a no-op",
+        );
+        let design_after_second = &term.atoms[0].basis_values;
+        for i in 0..design_after_first.nrows() {
+            for j in 0..3 {
+                assert_eq!(
+                    design_after_second[[i, j]],
+                    design_after_first[[i, j]],
+                    "idempotent reduction must leave the reduced design byte-identical",
+                );
+            }
+        }
+        let decoder_after_second = &term.atoms[0].decoder_coefficients;
+        for i in 0..3 {
+            assert_eq!(
+                decoder_after_second[[i, 0]],
+                decoder_after_first[[i, 0]],
+                "idempotent reduction must leave the reduced decoder byte-identical",
+            );
+        }
+    }
+
     /// Companion to the #1117 reduction test: a FULL-rank data Gram (the
     /// `base`/`step_2300` regime) must be left UNTOUCHED — the well-conditioned
     /// fit keeps its full harmonic depth, decoder, penalty, and evaluator
@@ -4095,6 +4260,205 @@ use super::*;
         let coords = array![[0.2, -0.3], [0.7, 0.4], [-0.5, 0.9]];
         assert_third_jet_matches_central_difference(&evaluator, coords, 1.0e-6, 1.0e-5)?;
         Ok(())
+    }
+
+    /// Cylinder coordinates: periodic axis 0 (fraction-of-period) crossed with
+    /// the unbounded line axis 1. Mixed signs/magnitudes on the line axis pin the
+    /// monomial factor away from the trivial origin.
+    fn cylinder_test_coords() -> Array2<f64> {
+        array![
+            [0.0_f64, -1.3],
+            [0.125, 0.0],
+            [0.4, 0.7],
+            [0.91, 2.2],
+            [0.6, -0.45]
+        ]
+    }
+
+    /// The cylinder product basis must equal the literal outer product of the
+    /// periodic circle factor and the monomial line factor in the lexicographic
+    /// (circle-slow, line-fast) layout, and its width must be `(2H+1)·(D+1)`.
+    #[test]
+    pub(crate) fn cylinder_phi_is_circle_tensor_line_product() -> Result<(), String> {
+        let h = 2usize;
+        let degree = 2usize;
+        let evaluator = CylinderHarmonicEvaluator::new(h, degree)?;
+        let mc = 2 * h + 1;
+        let ml = degree + 1;
+        assert_eq!(evaluator.circle_basis_size(), mc);
+        assert_eq!(evaluator.line_basis_size(), ml);
+        assert_eq!(evaluator.basis_size(), mc * ml);
+
+        let coords = cylinder_test_coords();
+        let (phi, jet) = evaluator.evaluate(coords.view())?;
+        assert_eq!(phi.dim(), (coords.nrows(), mc * ml));
+        assert_eq!(jet.dim(), (coords.nrows(), mc * ml, 2));
+
+        let two_pi = std::f64::consts::TAU;
+        for row in 0..coords.nrows() {
+            let t0 = coords[[row, 0]];
+            let t1 = coords[[row, 1]];
+            // Independent reconstruction of the per-axis value factors.
+            let mut circ = vec![0.0_f64; mc];
+            circ[0] = 1.0;
+            for k in 1..=h {
+                circ[2 * k - 1] = (two_pi * k as f64 * t0).sin();
+                circ[2 * k] = (two_pi * k as f64 * t0).cos();
+            }
+            let line: Vec<f64> = (0..ml).map(|j| t1.powi(j as i32)).collect();
+            for c in 0..mc {
+                for l in 0..ml {
+                    let col = c * ml + l;
+                    let expect = circ[c] * line[l];
+                    assert_abs_diff_eq!(phi[[row, col]], expect, epsilon = 1e-12);
+                }
+            }
+            // Column 0 is the product of the two constant factors = 1, with a
+            // vanishing gradient on both axes.
+            assert_abs_diff_eq!(phi[[row, 0]], 1.0, epsilon = 1e-12);
+            assert_abs_diff_eq!(jet[[row, 0, 0]], 0.0, epsilon = 1e-12);
+            assert_abs_diff_eq!(jet[[row, 0, 1]], 0.0, epsilon = 1e-12);
+        }
+        Ok(())
+    }
+
+    /// Cylinder first jet (`∂Φ/∂t₀`, `∂Φ/∂t₁`) vs central differences.
+    #[test]
+    pub(crate) fn cylinder_jacobian_matches_central_difference() {
+        assert_jacobian_matches_central_difference(
+            &CylinderHarmonicEvaluator::new(3, 3).unwrap(),
+            cylinder_test_coords(),
+            1.0e-6,
+        );
+    }
+
+    /// Cylinder Hessian vs central differences (product rule across the two
+    /// disjoint axes: `∂²/∂t₀² = c''·l`, `∂²/∂t₁² = c·l''`, `∂²/∂t₀∂t₁ = c'·l'`).
+    /// The top circle harmonic (ω = 2π·3) sets the same ω⁴ truncation floor as
+    /// the periodic/torus cases, so a magnitude-scaled rel_tol is used.
+    #[test]
+    pub(crate) fn cylinder_second_jet_matches_fd() -> Result<(), String> {
+        let evaluator = CylinderHarmonicEvaluator::new(3, 3)?;
+        assert_second_jet_matches_central_difference(
+            &evaluator,
+            cylinder_test_coords(),
+            1.0e-6,
+            1.0e-5,
+        )?;
+        Ok(())
+    }
+
+    /// Cylinder third jet vs a central difference of the (FD-validated) second
+    /// jet, plus full symmetry across the three trailing axes.
+    #[test]
+    pub(crate) fn cylinder_third_jet_matches_fd() -> Result<(), String> {
+        let evaluator = CylinderHarmonicEvaluator::new(3, 3)?;
+        assert_third_jet_matches_central_difference(
+            &evaluator,
+            cylinder_test_coords(),
+            1.0e-6,
+            1.0e-5,
+        )?;
+        Ok(())
+    }
+
+    /// The cylinder roughness Gram is `S = Sc ⊗ Gl + Gc ⊗ Sl`: symmetric, PSD,
+    /// with the constant column (`[c=0, l=0]`, the only column with neither a
+    /// circle-bending nor a line-bending contribution) exactly in its null
+    /// space. The diagonal entries match the closed-form per-axis energies.
+    #[test]
+    pub(crate) fn cylinder_roughness_gram_is_psd_with_constant_nullspace() {
+        let h = 2usize;
+        let degree = 2usize;
+        let evaluator = CylinderHarmonicEvaluator::new(h, degree).unwrap();
+        let mc = 2 * h + 1;
+        let ml = degree + 1;
+        let m = mc * ml;
+        let s = evaluator.roughness_gram();
+        assert_eq!(s.dim(), (m, m));
+
+        // Symmetry.
+        for i in 0..m {
+            for j in 0..m {
+                assert_abs_diff_eq!(s[[i, j]], s[[j, i]], epsilon = 1e-12);
+            }
+        }
+
+        // The constant column (col 0 = [c=0, l=0]) is annihilated: neither
+        // factor bends, so its entire row/column is zero.
+        for j in 0..m {
+            assert_abs_diff_eq!(s[[0, j]], 0.0, epsilon = 1e-12);
+            assert_abs_diff_eq!(s[[j, 0]], 0.0, epsilon = 1e-12);
+        }
+
+        // Closed-form diagonal check for the pure-circle column `[c, l=0]`:
+        // `S[c0,c0] = Sc[c,c]·Gl[0,0] + Gc[c,c]·Sl[0,0]`. With l=0 the line is a
+        // constant, so `Sl[0,0] = 0` and `Gl[0,0] = ∫₀¹ 1 = 1`, giving `Sc[c,c]`.
+        let two_pi = std::f64::consts::TAU;
+        for k in 1..=h {
+            let omega4 = (two_pi * k as f64).powi(4);
+            let s_idx = 2 * k - 1;
+            let c_idx = 2 * k;
+            // Sc[s,s] = Sc[c,c] = ω⁴·½ (∫₀¹ sin² = ∫₀¹ cos² = ½).
+            assert_abs_diff_eq!(s[[s_idx * ml, s_idx * ml]], omega4 * 0.5, epsilon = 1e-6);
+            assert_abs_diff_eq!(s[[c_idx * ml, c_idx * ml]], omega4 * 0.5, epsilon = 1e-6);
+        }
+
+        // The pure-line quadratic column `[c=0, l=2]` carries only line-bending
+        // energy: `S = Gc[0,0]·Sl[2,2]` with `Gc[0,0] = 1` and
+        // `Sl[2,2] = ∫₀¹ (2)² dt = 4`.
+        if degree >= 2 {
+            let col = 2; // c=0 → col = 0*ml + 2.
+            assert_abs_diff_eq!(s[[col, col]], 4.0, epsilon = 1e-12);
+        }
+
+        // PSD: every eigenvalue ≥ 0 (within a tight tolerance).
+        let (evals, _) = s.eigh(Side::Lower).unwrap();
+        for &lam in evals.iter() {
+            assert!(
+                lam >= -1.0e-9,
+                "cylinder roughness Gram must be PSD; got eigenvalue {lam:.3e}"
+            );
+        }
+    }
+
+    /// `CylinderHarmonicEvaluator::new` rejects `circle_harmonics == 0` (an S¹
+    /// with no harmonic pair is degenerate).
+    #[test]
+    pub(crate) fn cylinder_rejects_zero_harmonics() {
+        assert!(CylinderHarmonicEvaluator::new(0, 2).is_err());
+        assert!(CylinderHarmonicEvaluator::new(1, 0).is_ok());
+    }
+
+    /// The cylinder latent manifold is the product `S¹ × ℝ`: a unit-period
+    /// circle on axis 0 and an unbounded Euclidean line on axis 1.
+    #[test]
+    pub(crate) fn cylinder_latent_manifold_is_circle_times_line() {
+        let manifold = SaeAtomBasisKind::Cylinder.latent_manifold(2);
+        match manifold {
+            LatentManifold::Product(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(parts[0], LatentManifold::Circle { period } if period == 1.0));
+                assert!(matches!(parts[1], LatentManifold::Euclidean));
+            }
+            other => panic!("expected Product[Circle, Euclidean], got {other:?}"),
+        }
+    }
+
+    /// The cylinder projection seed grid sweeps the periodic axis over one period
+    /// `[0, 1)` and holds the unbounded line axis at the hull-centered seed `0`.
+    #[test]
+    pub(crate) fn cylinder_projection_seed_grid_sweeps_circle_only() {
+        let r = 12usize;
+        let grid = SaeAtomBasisKind::Cylinder
+            .projection_seed_grid(2, r)
+            .unwrap();
+        assert_eq!(grid.dim(), (r, 2));
+        for i in 0..r {
+            assert_abs_diff_eq!(grid[[i, 0]], i as f64 / r as f64, epsilon = 1e-12);
+            assert_abs_diff_eq!(grid[[i, 1]], 0.0, epsilon = 1e-12);
+        }
+        assert!(grid.column(0).iter().all(|&t| (0.0..1.0).contains(&t)));
     }
 
     /// Issue #247: the Duchon coordinate evaluator must return a forward design
