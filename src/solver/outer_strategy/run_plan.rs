@@ -1632,4 +1632,5 @@ pub(crate) fn run_outer_with_plan(
 
 
 #[cfg(test)]
+#[path = "run_plan_tests.rs"]
 mod run_plan_tests;

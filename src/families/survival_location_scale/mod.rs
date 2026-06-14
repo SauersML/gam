@@ -87,7 +87,8 @@ use crate::matrix::{
 };
 
 use crate::mixture_link::{
-    inverse_link_jet_for_inverse_link, inverse_link_pdffourth_derivative_for_inverse_link,
+    component_inverse_link_jet, inverse_link_jet_for_inverse_link,
+    inverse_link_pdffourth_derivative_for_inverse_link,
     inverse_link_pdfthird_derivative_for_inverse_link,
 };
 
@@ -95,7 +96,7 @@ use crate::pirls::LinearInequalityConstraints;
 
 use crate::probability::erfcx_nonnegative;
 
-use crate::probability::normal_pdf;
+use crate::probability::{normal_cdf, normal_pdf};
 
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,

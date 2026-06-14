@@ -584,7 +584,7 @@ pub trait OuterObjective {
 pub(crate) struct IteratePayload {
     /// Bump on incompatible payload changes; decode rejects mismatches.
     schema: u32,
-    rho: Vec<f64>,
+    pub(crate) rho: Vec<f64>,
     /// Inner-solver iterate (PIRLS β) captured alongside ρ. The (ρ, β)
     /// pair lives on the implicit-function manifold β = β*(ρ); restoring
     /// ρ alone forces the next inner solve to reconstruct β from scratch.
@@ -595,8 +595,8 @@ pub(crate) struct IteratePayload {
     /// regardless of where ρ lives. Empty when the family did not surface
     /// an inner-β hint at write time (still useful as a ρ-only seed).
     #[serde(default)]
-    beta: Vec<f64>,
-    cost: f64,
+    pub(crate) beta: Vec<f64>,
+    pub(crate) cost: f64,
     eval_id: u64,
 }
 

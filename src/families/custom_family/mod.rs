@@ -66,7 +66,7 @@ pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex, OnceLock, Weak};
 pub(crate) use thiserror::Error;
 
-pub(crate) use crate::solver::estimate::reml::unified::{EvalMode, PseudoLogdetMode};
+pub use crate::solver::estimate::reml::unified::{EvalMode, PseudoLogdetMode};
 
 mod block_spec;
 mod blockwise_solve;

@@ -219,7 +219,7 @@ impl NuclearNormPenalty {
     /// orientation (`d = p` in the thousands) was measured eating >99% of
     /// whole-fit wall time. The dense route is kept below for small `d`
     /// (no asymptotic win) and remains the defining oracle.
-    fn right_spectral_filters_applied(
+    pub(crate) fn right_spectral_filters_applied(
         &self,
         t: ArrayView2<'_, f64>,
         v: ArrayView2<'_, f64>,
@@ -413,7 +413,7 @@ impl NuclearNormPenalty {
         }
     }
 
-    fn right_spectral_inverse_sqrt_derivative(
+    pub(crate) fn right_spectral_inverse_sqrt_derivative(
         &self,
         t: ArrayView2<'_, f64>,
         v: ArrayView2<'_, f64>,

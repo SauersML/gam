@@ -2249,7 +2249,7 @@ pub(super) mod test_support {
     //! production. The capture entry point lives next to the test that uses
     //! it.
     thread_local! {
-        static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
+        pub(crate) static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
             const { std::cell::RefCell::new(None) };
     }
 

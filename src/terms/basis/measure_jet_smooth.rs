@@ -2463,7 +2463,7 @@ mod tests {
                 .design
                 .to_dense()
         };
-        let h = 1e-4;
+        let h: f64 = 1e-4;
         let x_plus = design_at(ell0 * h.exp());
         let x_minus = design_at(ell0 * (-h).exp());
         let x_0 = design_at(ell0);

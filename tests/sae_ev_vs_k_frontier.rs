@@ -577,7 +577,6 @@ fn held_out_ev(
     n_test: usize,
 ) -> f64 {
     let k_atoms = slots.len();
-    let p = corpus.p;
     let basis_sizes: Vec<usize> = slots.iter().map(|s| s.kind.basis_size()).collect();
     let m_max = basis_sizes.iter().copied().max().unwrap();
 

@@ -8066,7 +8066,6 @@ use super::*;
         let obj = SaeManifoldOuterObjective::new(term, target, None, rho, 5, 0.4, 1.0e-6, 1.0e-6);
         assert_eq!(obj.capability().gradient, Derivative::Analytic);
     }
-}
 
 
 
@@ -8222,3 +8221,4 @@ mod inner_contract_probe_tests {
             );
         }
     }
+}

@@ -2244,10 +2244,10 @@ pub(crate) fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize>
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct WiggleDomainDiagnostics {
-    domain_min: f64,
-    domain_max: f64,
-    outside_count: usize,
-    outside_fraction: f64,
+    pub(crate) domain_min: f64,
+    pub(crate) domain_max: f64,
+    pub(crate) outside_count: usize,
+    pub(crate) outside_fraction: f64,
 }
 
 

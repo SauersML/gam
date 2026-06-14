@@ -823,6 +823,7 @@ pub(crate) fn first_order_inner_cap_schedule(
 }
 
 #[cfg(test)]
+#[path = "inner_cap_schedule_tests.rs"]
 mod inner_cap_schedule_tests;
 
 pub(crate) struct OuterSecondOrderBridge<'a> {

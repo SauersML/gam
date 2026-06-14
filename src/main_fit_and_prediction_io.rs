@@ -433,18 +433,18 @@ fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodSpec) -> Opt
 
 
 #[derive(Clone)]
-struct SavedFitSummary {
-    likelihood_family: Option<LikelihoodSpec>,
-    likelihood_scale: LikelihoodScaleMetadata,
-    log_likelihood_normalization: LogLikelihoodNormalization,
-    log_likelihood: f64,
-    iterations: usize,
-    finalgrad_norm: f64,
-    pirls_status: gam::pirls::PirlsStatus,
-    deviance: f64,
-    stable_penalty_term: f64,
-    max_abs_eta: f64,
-    reml_score: f64,
+pub(crate) struct SavedFitSummary {
+    pub(crate) likelihood_family: Option<LikelihoodSpec>,
+    pub(crate) likelihood_scale: LikelihoodScaleMetadata,
+    pub(crate) log_likelihood_normalization: LogLikelihoodNormalization,
+    pub(crate) log_likelihood: f64,
+    pub(crate) iterations: usize,
+    pub(crate) finalgrad_norm: f64,
+    pub(crate) pirls_status: gam::pirls::PirlsStatus,
+    pub(crate) deviance: f64,
+    pub(crate) stable_penalty_term: f64,
+    pub(crate) max_abs_eta: f64,
+    pub(crate) reml_score: f64,
 }
 
 

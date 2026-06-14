@@ -1012,7 +1012,7 @@ impl JumpReLUPenalty {
         resolve_learnable_weight(self.thresholds[axis], rho[axis])
     }
 
-    fn sigmoid_gate(&self, x: f64) -> f64 {
+    pub(crate) fn sigmoid_gate(&self, x: f64) -> f64 {
         if x >= 0.0 {
             1.0 / (1.0 + (-x).exp())
         } else {

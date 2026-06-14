@@ -422,7 +422,7 @@ impl OuterProblem {
     }
 
     /// Derive the runner configuration from the builder state.
-    fn config(&self) -> OuterConfig {
+    pub(crate) fn config(&self) -> OuterConfig {
         OuterConfig {
             tolerance: self.tolerance,
             rel_cost_tolerance: self.rel_cost_tolerance,

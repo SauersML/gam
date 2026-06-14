@@ -1,5 +1,5 @@
     use super::*;
-    use crate::solver::estimate::DP_FLOOR;
+    use crate::solver::estimate::{DP_FLOOR, smooth_floor_dp};
     use approx::assert_relative_eq;
     use ndarray::array;
 
@@ -6642,3 +6642,4 @@
             spectral.trace_hinv_product(&a),
             epsilon = 1e-10
         );
+    }
