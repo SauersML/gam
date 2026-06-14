@@ -214,6 +214,7 @@ fn basis_kind_tag(kind: &SaeAtomBasisKind) -> &str {
         SaeAtomBasisKind::Sphere => "sphere",
         SaeAtomBasisKind::Torus => "torus",
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch",
+        SaeAtomBasisKind::Poincare => "poincare",
         SaeAtomBasisKind::Precomputed(_) => "precomputed",
     }
 }
