@@ -288,7 +288,7 @@ fn eval_step(
 
 pub(crate) type ContinuationResult = Result<ContinuationState, ContinuationFailure>;
 
-/// Telemetry returned by a successful `prime_outer_seed` call.
+/// Telemetry returned by successful continuation seed priming.
 /// Surfaced so the outer-loop call site can emit a single structured
 /// log line distinguishing the no-op collapse path from a real anneal.
 #[derive(Debug, Clone, Copy)]
@@ -320,14 +320,6 @@ pub(crate) struct PrimingSummary {
 ///
 /// `seed` is the per-iteration ρ candidate (the loop variable in
 /// `run_outer_with_plan`). `bounds_upper` is the legal upper bound on ρ.
-pub(crate) fn prime_outer_seed(
-    obj: &mut dyn OuterObjective,
-    seed: &Array1<f64>,
-    bounds_upper: &Array1<f64>,
-) -> Result<PrimingSummary, ContinuationFailure> {
-    prime_outer_seed_with_budget(obj, seed, bounds_upper, PATH_BUDGET)
-}
-
 /// Prime the outer seed with an explicit continuation path budget. The pre-warm
 /// is an optimization, so callers may cap the rho-walk more tightly on
 /// expensive multi-seed problems and let the ordinary cold seed evaluation
@@ -381,15 +373,16 @@ pub(crate) fn prime_outer_seed_with_budget(
 /// This is the **ρ-anneal spine entry**: the single callable that walks the
 /// oversmoothing→target ρ homotopy with the full retry/ρ₀-expansion decision
 /// tree (`run_path` is the per-offset inner pass). It was historically a
-/// private helper reachable only through `prime_outer_seed` (the warm-start
+/// private helper reachable only through `prime_outer_seed_with_budget` (the warm-start
 /// pre-screen fallback). It is now `pub(crate)` so the coupled
 /// [`crate::solver::continuation_path::ContinuationPath`] can drive the ρ leg
 /// of the joint K≥2 SAE homotopy through the SAME spine rather than cloning a
 /// parallel ρ-anneal — there is no second implementation of the schedule.
 ///
 /// Callers that only want the warm-start pre-screen keep using
-/// [`prime_outer_seed`]; callers that own the coupled τ / isometry legs call
-/// this directly so the three schedules advance against one shared ρ walk.
+/// [`prime_outer_seed_with_budget`]; callers that own the coupled τ / isometry
+/// legs call this directly so the three schedules advance against one shared ρ
+/// walk.
 pub(crate) fn fit_with_continuation(
     obj: &mut dyn OuterObjective,
     target: &Array1<f64>,
@@ -860,7 +853,7 @@ mod tests {
             &mut self,
             beta: &Array1<f64>,
         ) -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError> {
-            // Contract (see `prime_outer_seed` / `eval_step` docstrings):
+            // Contract (see `prime_outer_seed_with_budget` / `eval_step` docstrings):
             // an empty-β seed means "no warm-start available, use your
             // own cold default" and must be accepted as a no-op. Only
             // a populated β is required to match `n_params`.
@@ -880,12 +873,13 @@ mod tests {
     #[test]
     fn degenerates_to_cold_start_on_easy_fits() {
         // ρ₀ would clamp to ρ* because the bounds-upper is *at* the
-        // target. prime_outer_seed must return Ok with ZERO inner
+        // target. prime_outer_seed_with_budget must return Ok with ZERO inner
         // calls — that's the no-overhead promise.
         let target = rho(&[5.0, 5.0]);
         let upper = rho(&[5.0, 5.0]);
         let mut obj = ScriptedObjective::new(2, Vec::new());
-        let summary = prime_outer_seed(&mut obj, &target, &upper).expect("collapse path");
+        let summary = prime_outer_seed_with_budget(&mut obj, &target, &upper, PATH_BUDGET)
+            .expect("collapse path");
         assert!(summary.collapsed, "must report collapsed=true on easy fits");
         assert_eq!(summary.steps_accepted, 0);
         assert_eq!(obj.rho_history.len(), 0, "no inner calls on collapse");
@@ -951,7 +945,8 @@ mod tests {
                 ScriptedResponse::Ok,
             ],
         );
-        prime_outer_seed(&mut obj, &target, &upper).expect("path completes via shrink-on-budget");
+        prime_outer_seed_with_budget(&mut obj, &target, &upper, PATH_BUDGET)
+            .expect("path completes via shrink-on-budget");
         // Confirm we did execute ρ₀ (the oversmoothed start) before
         // any of the failed attempts — direct evidence that the
         // continuation actually walked a path.
@@ -988,7 +983,7 @@ mod tests {
                 ScriptedResponse::Ok,
             ],
         );
-        prime_outer_seed(&mut obj, &target, &upper)
+        prime_outer_seed_with_budget(&mut obj, &target, &upper, PATH_BUDGET)
             .expect("path completes after single TR-floor shrink");
         assert!(obj.rho_history.len() >= 3);
     }
@@ -1016,7 +1011,7 @@ mod tests {
                 ScriptedResponse::Ok,
             ],
         );
-        let outcome = prime_outer_seed(&mut obj, &target, &upper);
+        let outcome = prime_outer_seed_with_budget(&mut obj, &target, &upper, PATH_BUDGET);
         assert!(
             outcome.is_ok(),
             "path completes after likelihood shrink, got {:?}",
@@ -1042,7 +1037,7 @@ mod tests {
                 ),
             ],
         );
-        let err = prime_outer_seed(&mut obj, &target, &upper)
+        let err = prime_outer_seed_with_budget(&mut obj, &target, &upper, PATH_BUDGET)
             .expect_err("structural failure must propagate");
         assert!(
             matches!(err, ContinuationFailure::StructuralPropagate(_)),
@@ -1098,7 +1093,8 @@ mod tests {
             }
         }
         let mut obj = ScriptedObjective::new(1, responses);
-        let err = prime_outer_seed(&mut obj, &target, &upper).expect_err("schedule must fail");
+        let err = prime_outer_seed_with_budget(&mut obj, &target, &upper, PATH_BUDGET)
+            .expect_err("schedule must fail");
         // PhantomMultiplier classifies as ShrinkStep → α-floor →
         // Stuck → ExpandRhoZero (outer) → retries doubled offset →
         // PathStuck after OVERSMOOTH_RETRY_MAX.
@@ -1144,7 +1140,7 @@ mod tests {
         //   - no with_seed_inner_state(...) installed
         // continuation walks ρ from oversmoothed rho_zero to target, so
         // step 2 forwards the published hint into seed_inner_state.
-        // Today that path raises Invalid input and prime_outer_seed
+        // Today that path raises Invalid input and prime_outer_seed_with_budget
         // returns Err — but it should not.
         let target = Array1::from_vec(vec![0.0]);
         let upper = Array1::from_vec(vec![10.0]);
@@ -1192,11 +1188,11 @@ mod tests {
         // No `.with_seed_inner_state(...)` — mirrors standard REML's
         // build_objective wiring at src/solver/estimate.rs:3202.
         let mut obj = obj;
-        let result = prime_outer_seed(&mut obj, &target, &upper);
+        let result = prime_outer_seed_with_budget(&mut obj, &target, &upper, PATH_BUDGET);
 
         assert!(
             result.is_ok(),
-            "prime_outer_seed must not reject a seed just because the \
+            "prime_outer_seed_with_budget must not reject a seed just because the \
              objective publishes inner_beta_hint without installing a \
              seed hook (issue #236). got: {:?}",
             result.err().map(|e| e.message().to_string()),
@@ -1210,7 +1206,7 @@ mod tests {
         // would reject it. Today the error message
         //   "cached inner beta has length N, but this objective does
         //    not expose an inner-state seeding hook"
-        // is surfaced verbatim through `prime_outer_seed`. Pin that
+        // is surfaced verbatim through `prime_outer_seed_with_budget`. Pin that
         // this message no longer reaches users (issue #236).
         let target = Array1::from_vec(vec![0.0]);
         let upper = Array1::from_vec(vec![10.0]);
@@ -1257,7 +1253,7 @@ mod tests {
         };
 
         let mut obj = obj;
-        match prime_outer_seed(&mut obj, &target, &upper) {
+        match prime_outer_seed_with_budget(&mut obj, &target, &upper, PATH_BUDGET) {
             Ok(_) => {}
             Err(cf) => {
                 let msg = cf.message();
@@ -1285,7 +1281,8 @@ mod tests {
                  diagnosis: active_set_incomplete",
             )],
         );
-        let err = prime_outer_seed(&mut obj, &target, &upper).expect_err("propagation expected");
+        let err = prime_outer_seed_with_budget(&mut obj, &target, &upper, PATH_BUDGET)
+            .expect_err("propagation expected");
         let msg = err.message();
         assert!(msg.contains("active_set_incomplete"), "msg='{msg}'");
     }
