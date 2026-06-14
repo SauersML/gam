@@ -3766,23 +3766,112 @@ pub(super) fn ensure_sparse_positive_definitewithridge<F>(
 where
     F: FnMut(f64) -> Result<SparseColMat<usize, f64>, EstimationError>,
 {
-    let mut ridge = 0.0_f64;
-    for _ in 0..16 {
+    // Step 1 — genuine round-off stabilization. A symmetric Hessian assembled
+    // from `XᵀWX + S_λ` is mathematically PSD; the only reason an exact-arithmetic
+    // PSD matrix fails a Cholesky is floating-point round-off in the assembly,
+    // which a fixed tiny nugget on the diagonal cures. This is the principled,
+    // scale-free first attempt and the common case.
+    let h0 = assemble(0.0)?;
+    if let Ok(factor) = factorize_sparse_spd(&h0) {
+        return Ok((h0, factor, 0.0));
+    }
+    let h_eps = assemble(FIXED_STABILIZATION_RIDGE)?;
+    if let Ok(factor) = factorize_sparse_spd(&h_eps) {
+        return Ok((h_eps, factor, FIXED_STABILIZATION_RIDGE));
+    }
+
+    // Step 2 — the matrix is genuinely non-PD (rank-deficiency, wrong-sign
+    // curvature, or weight underflow in the Hessian assembly), not mere
+    // round-off. Rather than escalate a magic ridge by powers of ten until it
+    // happens to factorize — which silently perturbs the exported curvature by
+    // an unknown amount — we SURFACE the conditioning problem and set the ridge
+    // DIRECTLY from a rigorous spectral bound.
+    //
+    // Gershgorin's circle theorem gives a guaranteed lower bound on the smallest
+    // eigenvalue: λ_min(H) ≥ min_i ( H_ii − Σ_{j≠i} |H_ij| ). Adding a diagonal
+    // ridge τ shifts the whole spectrum up by τ, so choosing
+    //
+    //     τ = (margin·scale) − gershgorin_lower_bound
+    //
+    // guarantees the Gershgorin lower bound of `H + τ·I` is `≥ margin·scale > 0`,
+    // hence the shifted matrix is provably SPD. This costs ONE bound pass
+    // (O(nnz)) and ONE factorization instead of geometric trial-and-error, and
+    // the ridge is tied to the actual most-negative curvature rather than a
+    // timeout-shaped iteration count.
+    let (gershgorin_min, diag_scale) = gershgorin_min_eig_lower_bound(&h_eps);
+
+    // Round-off margin relative to the matrix scale: enough to clear the gap
+    // between the (conservative) Gershgorin bound and the pivoting tolerance of
+    // the sparse Cholesky, without over-regularizing.
+    let scale = diag_scale.max(1.0);
+    let margin = FIXED_STABILIZATION_RIDGE * scale;
+    let direct_ridge = (margin - gershgorin_min).max(FIXED_STABILIZATION_RIDGE);
+
+    log::warn!(
+        "sparse penalized Hessian is not positive definite (Gershgorin λ_min ≥ {:.3e}, \
+         diag scale {:.3e}); regularizing curvature with direct ridge {:.3e}. Exported \
+         curvature/SEs are stabilized, not exact — investigate rank-deficiency or weight \
+         underflow in the Hessian assembly.",
+        gershgorin_min,
+        scale,
+        direct_ridge,
+    );
+
+    // The Gershgorin-derived ridge is provably sufficient; the only reason it
+    // could still fail is a degenerate non-symmetric / non-finite assembly. We
+    // allow a single conservative doubling to absorb residual pivot round-off,
+    // then fail loud rather than silently shipping a heavily-ridged surrogate.
+    for ridge in [direct_ridge, direct_ridge * 2.0] {
         let h = assemble(ridge)?;
-        match factorize_sparse_spd(&h) {
-            Ok(factor) => return Ok((h, factor, ridge)),
-            Err(_) => {
-                ridge = if ridge == 0.0 {
-                    FIXED_STABILIZATION_RIDGE
-                } else {
-                    ridge * 10.0
-                };
+        if let Ok(factor) = factorize_sparse_spd(&h) {
+            return Ok((h, factor, ridge));
+        }
+    }
+
+    Err(EstimationError::HessianNotPositiveDefinite {
+        min_eigenvalue: gershgorin_min,
+    })
+}
+
+/// Rigorous lower bound on the smallest eigenvalue of a symmetric sparse matrix
+/// via Gershgorin's circle theorem, plus the largest |diagonal| as a scale.
+///
+/// Returns `(λ_min_lower_bound, diag_scale)`. The bound is storage-agnostic:
+/// off-diagonal magnitudes are added to the radius of both endpoints, so
+/// upper-only, lower-only, and full-symmetric storage all yield a valid (and at
+/// worst conservative) lower bound — it never over-claims positive-definiteness.
+fn gershgorin_min_eig_lower_bound(h: &SparseColMat<usize, f64>) -> (f64, f64) {
+    let n = h.ncols();
+    let mut diag = vec![0.0_f64; n];
+    let mut radius = vec![0.0_f64; n];
+    let (symbolic, values) = h.parts();
+    let col_ptr = symbolic.col_ptr();
+    let row_idx = symbolic.row_idx();
+    for col in 0..n {
+        let start = col_ptr[col];
+        let end = col_ptr[col + 1];
+        for idx in start..end {
+            let row = row_idx[idx];
+            let value = values[idx];
+            if row == col {
+                diag[col] += value;
+            } else {
+                let a = value.abs();
+                radius[row] += a;
+                radius[col] += a;
             }
         }
     }
-    Err(EstimationError::HessianNotPositiveDefinite {
-        min_eigenvalue: f64::NAN,
-    })
+    let mut min_bound = f64::INFINITY;
+    let mut diag_scale = 0.0_f64;
+    for i in 0..n {
+        min_bound = min_bound.min(diag[i] - radius[i]);
+        diag_scale = diag_scale.max(diag[i].abs());
+    }
+    if !min_bound.is_finite() {
+        min_bound = f64::NEG_INFINITY;
+    }
+    (min_bound, diag_scale)
 }
 
 
