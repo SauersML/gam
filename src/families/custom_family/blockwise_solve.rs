@@ -1307,11 +1307,20 @@ pub(crate) fn check_linear_feasibility(
                 Err(e) => format!("boundary→Err({e})"),
             }
         };
+        let worst_row_nnz = (0..constraints.a.ncols())
+            .filter(|&c| constraints.a[[worst_idx, c]].abs() > 1e-12)
+            .count();
+        let simple_bounds_path = match extract_simple_lower_bounds(constraints, beta.len()) {
+            Ok(Some(_)) => "extract_simple_lower_bounds→Some(SIMPLE-BOUNDS PATH)",
+            Ok(None) => "extract_simple_lower_bounds→None(general QP)",
+            Err(_) => "extract_simple_lower_bounds→Err",
+        };
         return Err(CustomFamilyError::ConstraintViolation {
             reason: format!(
                 "infeasible iterate: max(Aβ-b violation)={worst:.3e} at constraint row {worst_idx} \
-                 [#1108 diag: rows={}, ‖a_row‖={norm_worst:.3e}, scaled_viol={scaled_worst:.3e}, \
-                 |β|∞={beta_inf:.3e}, {interior_outcome}, {boundary_outcome}]",
+                 [#1108 diag: rows={}, worst_row_nnz={worst_row_nnz}, ‖a_row‖={norm_worst:.3e}, \
+                 scaled_viol={scaled_worst:.3e}, |β|∞={beta_inf:.3e}, {interior_outcome}, \
+                 {boundary_outcome}, {simple_bounds_path}]",
                 constraints.a.nrows()
             ),
         }
