@@ -1100,20 +1100,6 @@ pub enum Solver {
 }
 
 
-/// Declares which "class" of outer optimization the caller is doing.
-///
-/// The default `Primary` class applies to the main REML outer — the
-/// canonical smoothing-parameter optimization — and has access to
-/// Arc/Bfgs/Efs/HybridEfs according to declared derivatives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum SolverClass {
-    /// The main REML outer — smoothing parameters and ψ-coords where
-    /// analytic gradient (and typically analytic Hessian) is the contract.
-    #[default]
-    Primary,
-}
-
-
 #[inline]
 fn effective_seed_budget(
     requested_budget: usize,
@@ -1627,16 +1613,6 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
 }
 
 
-/// Plan selection with an explicit [`SolverClass`] opt-in.
-///
-/// `SolverClass::Primary` is the only class, so this is identical to [`plan`].
-/// (The auxiliary gradient-free class and its compass-search dispatch were
-/// purged; there is no derivative-free solver left to opt into.)
-pub fn plan_with_class(cap: &OuterCapability, _class: SolverClass) -> OuterPlan {
-    plan(cap)
-}
-
-
 /// Log the outer optimization plan. Called once per fit at the start of
 /// outer optimization so the user can see what strategy was selected and why.
 pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
@@ -1735,8 +1711,7 @@ fn disabled_fallback_hybrid_efs_has_standalone_bfgs_primary(
     cap: &OuterCapability,
     config: &OuterConfig,
 ) -> bool {
-    config.solver_class == SolverClass::Primary
-        && config.fallback_policy == FallbackPolicy::Disabled
+    config.fallback_policy == FallbackPolicy::Disabled
         && cap.gradient == Derivative::Analytic
         && matches!(plan(cap).solver, Solver::HybridEfs)
 }
@@ -5291,7 +5266,6 @@ struct OuterConfig {
     /// enforcement; it is purely a budget. See
     /// `RemlObjectiveState::outer_inner_cap` for dual-cap semantics.
     outer_inner_cap: Option<InnerProgressFeedback>,
-    solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
     arc_initial_regularization: Option<f64>,
     /// Optional scale factor for the objective's natural magnitude.
@@ -5344,7 +5318,6 @@ impl Default for OuterConfig {
             screening_cap: None,
             screen_initial_rho: false,
             outer_inner_cap: None,
-            solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
             objective_scale: None,
@@ -5389,7 +5362,6 @@ pub struct OuterProblem {
     screening_cap: Option<Arc<AtomicUsize>>,
     screen_initial_rho: bool,
     outer_inner_cap: Option<InnerProgressFeedback>,
-    solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
     arc_initial_regularization: Option<f64>,
     objective_scale: Option<f64>,
@@ -5423,7 +5395,6 @@ impl OuterProblem {
             screening_cap: None,
             screen_initial_rho: false,
             outer_inner_cap: None,
-            solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
             objective_scale: None,
@@ -5553,13 +5524,6 @@ impl OuterProblem {
         self.outer_inner_cap = Some(feedback);
         self
     }
-    /// Opt into a specific solver class. The default and only class is
-    /// [`SolverClass::Primary`] (the main REML outer).
-    pub fn with_solver_class(mut self, class: SolverClass) -> Self {
-        self.solver_class = class;
-        self
-    }
-
     pub fn with_operator_initial_trust_radius(mut self, radius: Option<f64>) -> Self {
         self.operator_initial_trust_radius = sanitized_operator_trust_restart_radius(radius);
         self
@@ -5684,7 +5648,6 @@ impl OuterProblem {
             screening_cap: self.screening_cap.clone(),
             screen_initial_rho: self.screen_initial_rho,
             outer_inner_cap: self.outer_inner_cap.clone(),
-            solver_class: self.solver_class,
             operator_initial_trust_radius: self.operator_initial_trust_radius,
             arc_initial_regularization: self.arc_initial_regularization,
             objective_scale: self.objective_scale,
@@ -5833,7 +5796,7 @@ impl OuterProblem {
                     prior_obj_display,
                 } => {
                     let cap = primary_capability_for_config(obj.capability(), &config, context);
-                    let plan_used = plan_with_class(&cap, config.solver_class);
+                    let plan_used = plan(&cap);
                     log::info!(
                         "[CACHE] final-hit key={}.. context={} rho_dim={} prior_obj={:.6e} iter={} action=skip-outer-validation",
                         short_key,
@@ -6637,7 +6600,7 @@ fn run_outer_uncertified(
 
     if cap.n_params == 0 {
         let cost = obj.eval_cost(&Array1::zeros(0))?;
-        let the_plan = plan_with_class(&cap, config.solver_class);
+        let the_plan = plan(&cap);
         return Ok(outer_result_with_gradient_norm(
             Array1::zeros(0),
             cost,
@@ -6652,9 +6615,9 @@ fn run_outer_uncertified(
     // any centrally-derived degraded capabilities. Aux direct-search has no
     // degraded ladder — a single attempt either succeeds or the failure is
     // surfaced to the caller.
-    let fallback_attempts = match (config.fallback_policy, config.solver_class) {
-        (FallbackPolicy::Automatic, SolverClass::Primary) => automatic_fallback_attempts(&cap),
-        (FallbackPolicy::Disabled, _) => Vec::new(),
+    let fallback_attempts = match config.fallback_policy {
+        FallbackPolicy::Automatic => automatic_fallback_attempts(&cap),
+        FallbackPolicy::Disabled => Vec::new(),
     };
     let mut attempts: Vec<OuterCapability> = Vec::with_capacity(1 + fallback_attempts.len());
     attempts.push(cap.clone());
@@ -6665,7 +6628,7 @@ fn run_outer_uncertified(
     let mut last_error: Option<EstimationError> = None;
 
     for (attempt_idx, attempt_cap) in attempts.iter().enumerate() {
-        let the_plan = plan_with_class(attempt_cap, config.solver_class);
+        let the_plan = plan(attempt_cap);
         if attempt_idx > 0 {
             log::debug!("[OUTER] {context}: primary plan failed; falling back to {the_plan}");
         }
@@ -6850,7 +6813,7 @@ fn run_outer_uncertified(
 /// [`crate::solver::estimate::reml::per_atom_efs::per_atom_efs_eligible`], which
 /// requires all-penalty-like coordinates, a working `eval_efs` hook,
 /// fixed-point not disabled, and a frontier-scale ρ-dimension. This is the
-/// single auto-switch predicate; `plan`/`plan_with_class` keep selecting the
+/// single auto-switch predicate; `plan` keeps selecting the
 /// dense or standard-EFS solver for everything below the frontier threshold.
 pub fn is_per_atom_efs_frontier(cap: &OuterCapability) -> bool {
     crate::solver::estimate::reml::per_atom_efs::per_atom_efs_eligible(cap)
@@ -6885,7 +6848,7 @@ fn run_per_atom_efs_if_frontier(
         return Ok(None);
     }
 
-    let the_plan = plan_with_class(&cap, config.solver_class);
+    let the_plan = plan(&cap);
     let rho_dim = cap.theta_layout().rho_dim();
 
     let (lower, upper) = outer_bounds_template(config, cap.n_params);
