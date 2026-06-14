@@ -14,9 +14,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// On-disk schema version. Bump on incompatible format changes; old entries
@@ -90,6 +89,9 @@ impl Default for StoreOptions {
 pub struct WarmStartStore {
     root: PathBuf,
     opts: StoreOptions,
+    /// Per-store metadata index. It is populated lazily and shared by clones so
+    /// checkpoint-heavy sessions do not repeatedly open every metadata JSON.
+    index: Arc<Mutex<MetadataIndex>>,
     /// Approximate sum of bytes written under `root` by this `WarmStartStore`
     /// instance. Used to throttle the full directory-scanning eviction in
     /// [`Self::save_overwrite`] — see `EVICT_EVERY_N_SAVES`. The counter
@@ -114,6 +116,7 @@ impl Clone for WarmStartStore {
         Self {
             root: self.root.clone(),
             opts: self.opts.clone(),
+            index: Arc::clone(&self.index),
             // Independent throttle counters per clone are fine: each clone
             // will sweep once on its first save and resync from disk.
             byte_total: AtomicU64::new(self.byte_total.load(Ordering::Relaxed)),
@@ -130,6 +133,7 @@ impl WarmStartStore {
         Ok(Self {
             root,
             opts,
+            index: Arc::new(Mutex::new(MetadataIndex::default())),
             byte_total: AtomicU64::new(0),
             save_counter: AtomicU64::new(0),
             test_time_offset_ns: AtomicU64::new(0),
