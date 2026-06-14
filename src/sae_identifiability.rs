@@ -47,7 +47,12 @@
 //! ([`crate::inference::row_metric::MetricProvenance`]) and cannot misreport —
 //! there is only one metric object.
 
+use crate::geometry::curvature_estimand::{
+    FlatnessTest, KappaProfileCi, flatness_lr_test, profile_ci_walk,
+};
+use crate::inference::lawley::{RowKappas, lawley_lr_bartlett_factor};
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
+use crate::inference::riesz::{RieszDebiasReport, RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
 use crate::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use crate::linalg::faer_ndarray::{
@@ -2634,6 +2639,51 @@ fn canonical_coords_for_transport(
         }
         CanonicalChartTopology::Interval => Ok(coords.clone()),
     }
+}
+
+// ----------------------------------------------------------------------------
+// #1102 cross-checkpoint atom-dynamics FFI entry (new top-level block).
+// ----------------------------------------------------------------------------
+
+/// Run #1102 cross-checkpoint Riesz-debiased atom-trajectory dynamics for the
+/// fitted dictionary's atoms.
+///
+/// `decoder_grid` is `[n_checkpoints, n_atoms, n_grid, ambient_dim]` and
+/// `atom_names`/`checkpoint_ids`/`latent_grid` label its axes; see
+/// [`crate::inference::checkpoint_dynamics`] for the estimator and the honest
+/// accounting of which Riesz inputs the bare grid supports. This entry binds
+/// the atom axis to the fitted model: `atom_names` must name exactly the
+/// model's atoms in order, so trajectories are reported against real atoms.
+pub fn atom_checkpoint_dynamics(
+    model: &FittedSaeManifold,
+    decoder_grid: ndarray::ArrayView4<'_, f64>,
+    checkpoint_ids: &[String],
+    atom_names: &[String],
+    latent_grid: ArrayView1<'_, f64>,
+) -> Result<Vec<crate::inference::checkpoint_dynamics::AtomTrajectory>, String> {
+    if atom_names.len() != model.atoms.len() {
+        return Err(format!(
+            "atom_checkpoint_dynamics: {} atom names supplied for {} fitted atoms",
+            atom_names.len(),
+            model.atoms.len()
+        ));
+    }
+    for (idx, (supplied, fitted)) in atom_names.iter().zip(model.atoms.iter()).enumerate() {
+        if supplied != &fitted.name {
+            return Err(format!(
+                "atom_checkpoint_dynamics: atom {idx} name '{supplied}' does not match fitted atom '{}'",
+                fitted.name
+            ));
+        }
+    }
+    crate::inference::checkpoint_dynamics::checkpoint_atom_dynamics(
+        &crate::inference::checkpoint_dynamics::CheckpointDynamicsInput {
+            decoder_grid,
+            checkpoint_ids,
+            atom_names,
+            latent_grid,
+        },
+    )
 }
 
 #[cfg(test)]
