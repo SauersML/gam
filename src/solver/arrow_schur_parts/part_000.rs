@@ -6889,7 +6889,7 @@ enum MixedPrecisionAttempt {
 }
 
 
-fn back_substitute_delta_t<B: BatchedBlockSolver>(
+fn back_substitute_delta_t<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     delta_beta: ArrayView1<'_, f64>,
@@ -6898,27 +6898,70 @@ fn back_substitute_delta_t<B: BatchedBlockSolver>(
     let n = sys.rows.len();
     let total_dt_len = sys.row_offsets[n];
     let mut delta_t = Array1::<f64>::zeros(total_dt_len);
-    let mut rhs = Array1::<f64>::zeros(sys.d);
-    let mut htbeta_delta = Array1::<f64>::zeros(sys.d);
-    for i in 0..n {
+    // `Δt_i = -(H_tt^(i))⁻¹ (g_t^(i) + H_tβ^(i) Δβ)` is row-block-independent:
+    // each row writes only its own contiguous `delta_t[row_offsets[i]..]`
+    // segment. Fan out over the SAE LLM row count with the same nesting guard
+    // (`rayon::current_thread_index()`) and row-min gate the `schur_matvec` hot
+    // loop uses (#1017), so the topology race's outer candidate fan-out is not
+    // oversubscribed. Disjoint writes ⇒ no reduction, no run-to-run drift.
+    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    let solve_row = |i: usize, out: &mut [f64]| {
         let di = sys.row_dims[i];
-        let row_base = sys.row_offsets[i];
-        assert_eq!(sys.rows[i].gt.len(), di);
-        for c in 0..di {
-            htbeta_delta[c] = 0.0;
-        }
-        let mut htbeta_slice = htbeta_delta.slice_mut(ndarray::s![..di]).to_owned();
+        debug_assert_eq!(sys.rows[i].gt.len(), di);
+        let mut htbeta_slice = Array1::<f64>::zeros(di);
         sys_htbeta_apply_row(sys, i, &sys.rows[i], delta_beta, &mut htbeta_slice);
-        {
-            let mut rhs_i = rhs.slice_mut(ndarray::s![..di]);
-            for c in 0..di {
-                rhs_i[c] = sys.rows[i].gt[c] + htbeta_slice[c];
-            }
-        }
-        let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
-        let dt_i = backend.solve_block_vector(htt_factors.factor(i), rhs_slice.view());
+        let mut rhs = Array1::<f64>::zeros(di);
         for c in 0..di {
-            delta_t[row_base + c] = -dt_i[c];
+            rhs[c] = sys.rows[i].gt[c] + htbeta_slice[c];
+        }
+        let dt_i = backend.solve_block_vector(htt_factors.factor(i), rhs.view());
+        for c in 0..di {
+            out[c] = -dt_i[c];
+        }
+    };
+    if parallel {
+        use rayon::prelude::*;
+        const CHUNK: usize = 64;
+        let row_offsets = &sys.row_offsets;
+        // `par_chunks_mut` over uniform chunks does not align with variable row
+        // dims, so partition by row chunk and hand each chunk its own contiguous
+        // output segment via `split_at_mut` keyed on `row_offsets`.
+        let dt_slice = delta_t.as_slice_mut().expect("delta_t contiguous");
+        let n_chunks = n.div_ceil(CHUNK);
+        let mut remaining = dt_slice;
+        let mut segments: Vec<(usize, &mut [f64])> = Vec::with_capacity(n_chunks);
+        let mut prev_end = 0usize;
+        for chunk in 0..n_chunks {
+            let start = chunk * CHUNK;
+            let end = (start + CHUNK).min(n);
+            let seg_len = row_offsets[end] - row_offsets[start];
+            debug_assert_eq!(prev_end, row_offsets[start]);
+            let (seg, rest) = remaining.split_at_mut(seg_len);
+            remaining = rest;
+            segments.push((start, seg));
+            prev_end = row_offsets[end];
+        }
+        segments.into_par_iter().for_each(|(start, seg)| {
+            let end = (start + CHUNK).min(n);
+            let mut local = 0usize;
+            for i in start..end {
+                let di = sys.row_dims[i];
+                solve_row(i, &mut seg[local..local + di]);
+                local += di;
+            }
+        });
+    } else {
+        for i in 0..n {
+            let row_base = sys.row_offsets[i];
+            let di = sys.row_dims[i];
+            solve_row(
+                i,
+                delta_t
+                    .as_slice_mut()
+                    .expect("delta_t contiguous")
+                    .get_mut(row_base..row_base + di)
+                    .expect("row segment in bounds"),
+            );
         }
     }
     delta_t
@@ -7878,7 +7921,7 @@ fn cholesky_solve_lower(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
 }
 
 
-fn reduced_rhs_beta<B: BatchedBlockSolver>(
+fn reduced_rhs_beta<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     backend: &B,
@@ -7886,12 +7929,44 @@ fn reduced_rhs_beta<B: BatchedBlockSolver>(
     // Numerical invariant: each per-row `H_tt^(i)` factor must be PD
     // (already enforced by the adaptive-ridge `factor_blocks`).
     let k = sys.k;
+    let n = sys.rows.len();
     let mut rhs_beta = Array1::<f64>::zeros(k);
-    for (i, row) in sys.rows.iter().enumerate() {
-        let v = backend.solve_block_vector(htt_factors.factor(i), row.gt.view());
-        // H_βt^(i) · v accumulates into rhs_beta.  Routes through
-        // sys.htbeta_matvec when the dense block is absent.
-        sys_htbeta_accumulate_transpose(sys, i, row, v.view(), &mut rhs_beta);
+    // The reduced RHS sum `Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i)` is the same
+    // embarrassingly-parallel per-row reduction the `schur_matvec` hot loop
+    // already fans out (#1017): each row contributes an independent length-`K`
+    // vector. Reuse the identical deterministic chunk-fold so the f64 reduction
+    // is bit-identical run-to-run (the topology-candidate ranking gate must not
+    // move), and the identical nesting guard (`rayon::current_thread_index()`)
+    // so the topology race's outer fan-out is not oversubscribed.
+    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    if parallel {
+        use rayon::prelude::*;
+        const CHUNK: usize = 64;
+        let partials: Vec<Array1<f64>> = (0..n)
+            .into_par_iter()
+            .chunks(CHUNK)
+            .map(|idxs| {
+                let mut acc = Array1::<f64>::zeros(k);
+                for i in idxs {
+                    let row = &sys.rows[i];
+                    let v = backend.solve_block_vector(htt_factors.factor(i), row.gt.view());
+                    sys_htbeta_accumulate_transpose(sys, i, row, v.view(), &mut acc);
+                }
+                acc
+            })
+            .collect();
+        for acc in &partials {
+            for j in 0..k {
+                rhs_beta[j] += acc[j];
+            }
+        }
+    } else {
+        for (i, row) in sys.rows.iter().enumerate() {
+            let v = backend.solve_block_vector(htt_factors.factor(i), row.gt.view());
+            // H_βt^(i) · v accumulates into rhs_beta.  Routes through
+            // sys.htbeta_matvec when the dense block is absent.
+            sys_htbeta_accumulate_transpose(sys, i, row, v.view(), &mut rhs_beta);
+        }
     }
     for j in 0..k {
         rhs_beta[j] -= sys.gb[j];
