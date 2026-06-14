@@ -417,6 +417,34 @@ def test_summary_canonical_kind_for_ibp_map_label(monkeypatch):
     assert stub.threshold == pytest.approx(0.5)
 
 
+def test_summary_and_roundtrip_surface_atom_functional_evidence(monkeypatch):
+    stub = _StubModule()
+    monkeypatch.setattr(sae, "rust_module", lambda: stub)
+    evidence = {
+        "source": "riesz",
+        "marginal_slope": {"estimate": [0.5], "se": [0.1], "norm": 0.5},
+        "average_derivative": {"estimate": [[0.5]], "se": [[0.1]], "norm": 0.5},
+        "peak_contrast": {
+            "estimate": [1.2],
+            "se": [0.2],
+            "norm": 1.2,
+            "from_coord": [0.0],
+            "to_coord": [1.0],
+        },
+    }
+    fit = _make_fit("softmax", n_atoms=1)
+    fit.atoms[0].functional_evidence = evidence
+
+    summary = fit.summary()
+    assert summary["atom_functionals"] == [evidence]
+
+    payload = fit.to_dict()
+    assert payload["atoms"][0]["functional_evidence"] == evidence
+
+    restored = sae.ManifoldSAE.from_dict(payload)
+    assert restored.atoms[0].functional_evidence == evidence
+
+
 # ---------------------------------------------------------------------------
 # #608 — mixed-topology fits report "mixed" and expose per-atom topologies.
 # ---------------------------------------------------------------------------

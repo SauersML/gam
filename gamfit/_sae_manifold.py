@@ -70,6 +70,27 @@ def _structure_claim_label(kind: Any) -> str:
     return str(kind)
 
 
+def _structure_claim_atom_exists(kind: Any) -> int | None:
+    """Return the atom index for a serialized `ClaimKind::AtomExists`."""
+    if isinstance(kind, Mapping):
+        body = kind.get("AtomExists")
+        if isinstance(body, Mapping) and "atom" in body:
+            return int(body["atom"])
+    return None
+
+
+def _jsonable_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_value(v) for v in value]
+    return value
+
+
 def _canonical_assignment(value: str, label: str) -> str:
     name = str(value).strip().lower()
     canon = _ASSIGNMENT_KINDS.get(name)
@@ -90,6 +111,16 @@ def _canonical_public_assignment(value: str) -> str:
             f"expected one of {sorted(_PUBLIC_ASSIGNMENT_KINDS)}"
         )
     return canon
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Mapping):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    return value
 
 
 def _fit_disjoint_periodic_top1(
@@ -253,6 +284,169 @@ def _fit_disjoint_periodic_top1(
     )
 
 
+def _functional_basis_params(plan: Mapping[str, Any]) -> dict[str, Any] | None:
+    kind = str(plan["kind"]).lower().replace("-", "_")
+    if kind in {"periodic", "periodic_spline", "circle"}:
+        n_harmonics = int(plan.get("n_harmonics", 0))
+        if n_harmonics <= 0:
+            basis_size = int(plan.get("basis_size", 0))
+            n_harmonics = (basis_size - 1) // 2
+        if n_harmonics <= 0:
+            return None
+        return {"n_harmonics": n_harmonics}
+    if kind in {"duchon", "euclidean", "euclidean_patch"}:
+        centers = plan.get("duchon_centers")
+        if centers is None:
+            return None
+        return {"centers": np.asarray(centers, dtype=float), "m": int(plan["basis_size"])}
+    if kind == "sphere":
+        return {}
+    return None
+
+
+def _weighted_row_mean(rows: np.ndarray, weights: np.ndarray | None) -> np.ndarray | None:
+    rows = np.asarray(rows, dtype=float)
+    if rows.ndim != 2 or rows.shape[0] == 0 or not np.all(np.isfinite(rows)):
+        return None
+    if weights is None:
+        return np.mean(rows, axis=0)
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    if weights.shape[0] != rows.shape[0] or not np.all(np.isfinite(weights)):
+        return None
+    weights = np.maximum(weights, 0.0)
+    weight_sum = float(np.sum(weights))
+    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+        return None
+    return np.einsum("n,nm->m", weights / weight_sum, rows, optimize=True)
+
+
+def _channel_se_from_decoder_covariance(
+    gradient: np.ndarray,
+    covariance: np.ndarray | None,
+    output_dim: int,
+) -> np.ndarray | None:
+    if covariance is None:
+        return None
+    gradient = np.asarray(gradient, dtype=float).reshape(-1)
+    covariance = np.asarray(covariance, dtype=float)
+    basis_size = gradient.shape[0]
+    if covariance.shape != (basis_size * output_dim, basis_size * output_dim):
+        return None
+    se = np.zeros(output_dim, dtype=float)
+    for channel in range(output_dim):
+        idx = np.arange(channel, basis_size * output_dim, output_dim)
+        sub = covariance[np.ix_(idx, idx)]
+        var = float(gradient @ sub @ gradient)
+        if not np.isfinite(var):
+            return None
+        se[channel] = np.sqrt(max(var, 0.0))
+    return se
+
+
+def _vector_evidence_payload(
+    estimate: np.ndarray,
+    se: np.ndarray | None = None,
+    **extra: Any,
+) -> dict[str, Any] | None:
+    estimate = np.asarray(estimate, dtype=float)
+    if estimate.size == 0 or not np.all(np.isfinite(estimate)):
+        return None
+    payload: dict[str, Any] = {
+        "estimate": estimate.tolist(),
+        "norm": float(np.linalg.norm(estimate)),
+    }
+    if se is not None:
+        se = np.asarray(se, dtype=float)
+        if se.shape == estimate.shape and np.all(np.isfinite(se)):
+            payload["se"] = se.tolist()
+    payload.update(extra)
+    return payload
+
+
+def _atom_functional_evidence(
+    atom: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    native = atom.get("functional_evidence")
+    if native is not None:
+        return dict(native)
+
+    params = _functional_basis_params(plan)
+    if params is None:
+        return None
+    coords = np.asarray(atom["on_atom_coords_t"], dtype=float)
+    decoder = np.asarray(atom["decoder_B"], dtype=float)
+    assignments = np.asarray(atom.get("assignments_z"), dtype=float)
+    cov = None if atom.get("decoder_covariance") is None else np.asarray(atom["decoder_covariance"], dtype=float)
+    if coords.ndim != 2 or decoder.ndim != 2 or not np.all(np.isfinite(coords)):
+        return None
+    try:
+        phi, jet, _penalty = rust_module().basis_with_jet(
+            str(plan["kind"]),
+            np.ascontiguousarray(coords),
+            params,
+        )
+    except Exception:
+        return None
+    phi = np.asarray(phi, dtype=float)
+    jet = np.asarray(jet, dtype=float)
+    if (
+        phi.ndim != 2
+        or jet.ndim != 3
+        or phi.shape[0] != coords.shape[0]
+        or phi.shape[1] != decoder.shape[0]
+        or jet.shape[:2] != phi.shape
+        or not np.all(np.isfinite(phi))
+        or not np.all(np.isfinite(jet))
+    ):
+        return None
+
+    output_dim = int(decoder.shape[1])
+    value_gradient = _weighted_row_mean(phi, assignments)
+    if value_gradient is None:
+        return None
+    average_value = _vector_evidence_payload(
+        value_gradient @ decoder,
+        _channel_se_from_decoder_covariance(value_gradient, cov, output_dim),
+    )
+
+    derivative_estimates = []
+    derivative_ses = []
+    for axis in range(jet.shape[2]):
+        grad = _weighted_row_mean(jet[:, :, axis], assignments)
+        if grad is None:
+            return None
+        derivative_estimates.append(grad @ decoder)
+        axis_se = _channel_se_from_decoder_covariance(grad, cov, output_dim)
+        if axis_se is not None:
+            derivative_ses.append(axis_se)
+    derivative_est = np.vstack(derivative_estimates)
+    derivative_se = np.vstack(derivative_ses) if len(derivative_ses) == derivative_est.shape[0] else None
+    average_derivative = _vector_evidence_payload(derivative_est, derivative_se)
+
+    mean = phi @ decoder
+    norm = np.linalg.norm(mean, axis=1)
+    peak_idx = int(np.argmax(norm))
+    baseline_idx = int(np.argmin(norm))
+    contrast_gradient = phi[peak_idx] - phi[baseline_idx]
+    peak_contrast = _vector_evidence_payload(
+        contrast_gradient @ decoder,
+        _channel_se_from_decoder_covariance(contrast_gradient, cov, output_dim),
+        from_coord=coords[baseline_idx].tolist(),
+        to_coord=coords[peak_idx].tolist(),
+    )
+
+    out: dict[str, Any] = {"source": "decoder_covariance_plugin"}
+    if average_value is not None:
+        out["average_value"] = average_value
+    if average_derivative is not None:
+        out["average_derivative"] = average_derivative
+        out["marginal_slope"] = dict(average_derivative)
+    if peak_contrast is not None:
+        out["peak_contrast"] = peak_contrast
+    return out if len(out) > 1 else None
+
+
 @dataclass(slots=True)
 class SaeManifoldAtomFit:
     """Per-atom fit payload returned inside :class:`ManifoldSAE`.
@@ -295,6 +489,11 @@ class SaeManifoldAtomFit:
     shape_band_sd
         Optional per-channel posterior standard deviation of
         ``shape_band_mean``, shape ``(G, p)``, in the same units as ``X``.
+    functional_evidence
+        Optional per-atom decoder functional evidence. Native Rust/Riesz
+        payloads are passed through as-is; otherwise fresh fits may populate a
+        conservative plugin block from decoder covariance with
+        ``marginal_slope``, ``average_derivative``, and ``peak_contrast``.
     """
 
     basis: str
@@ -315,6 +514,7 @@ class SaeManifoldAtomFit:
     shape_band_coords: np.ndarray | None = None
     shape_band_mean: np.ndarray | None = None
     shape_band_sd: np.ndarray | None = None
+    functional_evidence: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -417,6 +617,12 @@ class ManifoldSAE:
     # This is deliberately quantities-only; no global-optimality verdict exists
     # until the theorem threshold is implemented.
     incoherence_report: dict[str, Any] | None = None
+    # Per-atom curvature estimand report (#1099). ``atoms[k]["kappa_hat"]`` is
+    # the fitted empirical second-fundamental-form norm for atom k. The
+    # profile-likelihood CI and flatness LR fields mirror ``Model.curvature`` but
+    # remain ``None`` / ``"unavailable"`` until the SAE fixed-kappa profile
+    # criterion is wired.
+    curvature_report: dict[str, Any] | None = None
     # The unified certificate ledger (#16): ONE coherent block consolidating every
     # certificate this fit produced under a shared claim+evidence+verdict shape.
     # ``{"overall": str, "overall_certified": bool, "claims": {claim_id: {"claim":
@@ -536,6 +742,7 @@ class ManifoldSAE:
                 atom,
                 plans[atom_idx],
             )
+            functional_evidence = _atom_functional_evidence(atom, plans[atom_idx])
             atoms.append(SaeManifoldAtomFit(
                 basis=str(atom["basis_kind"]),
                 decoder_coefficients=np.asarray(atom["decoder_B"], dtype=float),
@@ -547,6 +754,7 @@ class ManifoldSAE:
                 shape_band_coords=shape_band_coords,
                 shape_band_mean=shape_band_mean,
                 shape_band_sd=shape_band_sd,
+                functional_evidence=functional_evidence,
             ))
         fitted = np.asarray(payload["fitted"], dtype=float)
         assigns = np.asarray(payload["assignments_z"], dtype=float)
@@ -617,6 +825,11 @@ class ManifoldSAE:
                 if payload.get("incoherence_report") is None
                 else dict(payload["incoherence_report"])
             ),
+            curvature_report=(
+                None
+                if payload.get("curvature_report") is None
+                else dict(payload["curvature_report"])
+            ),
             certificates=(
                 None
                 if payload.get("certificates") is None
@@ -649,12 +862,13 @@ class ManifoldSAE:
         -------
         dict
             ``{"alpha": float, "fdr_level": float, "n_confirmed": int,
-            "claims": [{"claim": str, "e_value": float, "log_e": float,
-            "steps": int, "confirmed": bool, "evidence_remaining_nats": float},
-            ...]}``. ``evidence_remaining_nats`` is the anytime-valid budget
-            ``max(0, ln(1/α) − log_e)`` — the additional log-evidence a probe
-            must accumulate before the claim crosses the confirmation threshold
-            (0 once already confirmed).
+            "claims": [{"claim_index": int, "claim": str, "kind": dict,
+            "e_value": float, "log_e": float, "steps": int, "confirmed": bool,
+            "evidence_remaining_nats": float}, ...]}``.
+            ``evidence_remaining_nats`` is the anytime-valid budget ``max(0,
+            ln(1/α) − log_e)`` — the additional log-evidence a probe must
+            accumulate before the claim crosses the confirmation threshold (0
+            once already confirmed).
         """
         import json
         import math
@@ -678,7 +892,9 @@ class ManifoldSAE:
             le = float(entry["log_e"])
             claims.append(
                 {
+                    "claim_index": i,
                     "claim": _structure_claim_label(entry["kind"]),
+                    "kind": entry["kind"],
                     "e_value": math.exp(le),
                     "log_e": le,
                     "steps": int(entry["steps"]),
@@ -704,6 +920,161 @@ class ManifoldSAE:
         """
         cert = self.structure_certificate(alpha=alpha)
         return [c for c in cert["claims"] if not c["confirmed"]]
+
+    def contested_probe_report(self, *, alpha: float | None = None) -> list[dict[str, Any]]:
+        """KL-optimal steering-probe plans for contested SAE atom claims (#1100).
+
+        This closes the user-facing loop between the anytime-valid structure
+        certificate and steering:
+
+        1. take each contested ``AtomExists`` claim from
+           :meth:`structure_certificate`;
+        2. generate candidate on-manifold steering moves from the atom's fitted
+           coordinate quantiles;
+        3. score those candidates with
+           :func:`gamfit.plan_probe_for_contested_claim`;
+        4. return a report entry containing the selected steering payload and
+           expected evidence budget.
+
+        The null hypothesis for an ``AtomExists`` claim predicts no atom-carried
+        response to the steering push. The alternative predicts the
+        on-manifold response returned by :meth:`steer`; each candidate also
+        carries ``off_manifold_norm`` so consumers can reject moves whose chord
+        left the learned surface. An output-Fisher shard is required because the
+        design score is measured in output-information nats, not Euclidean
+        activation norm.
+        """
+        from .structure_discovery import plan_probe_for_contested_claim
+
+        if self.fisher_factors is None:
+            raise ValueError(
+                "contested_probe_report requires a fitted output-Fisher shard "
+                "(fit with fisher_factors=...); Euclidean SAE fits do not carry "
+                "the information metric needed for KL-optimal probe design"
+            )
+
+        cert = self.structure_certificate(alpha=alpha)
+        fisher = self._mean_output_fisher()
+        report: list[dict[str, Any]] = []
+        for claim in [c for c in cert["claims"] if not c["confirmed"]]:
+            atom = _structure_claim_atom_exists(claim["kind"])
+            entry: dict[str, Any] = {
+                "claim_index": int(claim["claim_index"]),
+                "claim": claim["claim"],
+                "kind": claim["kind"],
+                "log_e": float(claim["log_e"]),
+                "evidence_remaining_nats": float(claim["evidence_remaining_nats"]),
+                "probe_plan": None,
+            }
+            if atom is None:
+                entry["unplannable_reason"] = (
+                    "only AtomExists claims have an SAE steering-probe bridge"
+                )
+                report.append(entry)
+                continue
+
+            candidates = self._atom_exists_probe_candidates(atom)
+            if not candidates:
+                entry["atom"] = int(atom)
+                entry["unplannable_reason"] = (
+                    "atom has no non-degenerate coordinate-quantile steering moves"
+                )
+                report.append(entry)
+                continue
+
+            delta = np.ascontiguousarray(
+                np.stack([c["delta"] for c in candidates], axis=0), dtype=np.float64
+            )
+            predicted_null = np.zeros_like(delta)
+            predicted_alt = np.ascontiguousarray(
+                np.stack([c["predicted_mean_alt"] for c in candidates], axis=0),
+                dtype=np.float64,
+            )
+            plan = plan_probe_for_contested_claim(
+                delta,
+                predicted_null,
+                predicted_alt,
+                fisher,
+                cert["alpha"],
+                current_log_e=float(claim["log_e"]),
+            )
+            entry["atom"] = int(atom)
+            entry["atom_name"] = str(self.atoms[atom].basis)
+            entry["fisher_source"] = "mean_output_fisher"
+            entry["candidate_count"] = len(candidates)
+            if plan is None:
+                entry["unplannable_reason"] = (
+                    "candidate steering moves do not distinguish null and alternative"
+                )
+            else:
+                selected = candidates[int(plan["probe"])]
+                entry["probe_plan"] = {
+                    **dict(plan),
+                    "candidate": selected["candidate"],
+                    "steer": _jsonable_value(selected["steer"]),
+                    "predicted_mean_alt_source": (
+                        "sae_steer_delta on-manifold response for AtomExists; "
+                        "null response is zero"
+                    ),
+                }
+            report.append(entry)
+        return report
+
+    def _mean_output_fisher(self) -> np.ndarray:
+        u = np.asarray(self.fisher_factors, dtype=np.float64)
+        if u.ndim != 3:
+            raise ValueError(f"fisher_factors must be a rank-3 (N, p, r) array; got {u.shape}")
+        if u.shape[0] != self.fitted.shape[0] or u.shape[1] != self.fitted.shape[1]:
+            raise ValueError(
+                "fisher_factors shape must match fitted rows/output dimension; "
+                f"got {u.shape}, expected ({self.fitted.shape[0]}, {self.fitted.shape[1]}, r)"
+            )
+        return np.ascontiguousarray(
+            np.einsum("npr,nqr->pq", u, u, optimize=True) / float(u.shape[0]),
+            dtype=np.float64,
+        )
+
+    def _atom_exists_probe_candidates(self, atom: int) -> list[dict[str, Any]]:
+        k = self._atom_index(atom)
+        coords = np.asarray(self.coords[k], dtype=np.float64)
+        if coords.ndim != 2 or coords.shape[0] == 0:
+            return []
+        low, mid, high = np.percentile(coords, [5.0, 50.0, 95.0], axis=0)
+        moves: list[tuple[str, np.ndarray, np.ndarray]] = [
+            ("median_to_high", mid, high),
+            ("median_to_low", mid, low),
+            ("low_to_high", low, high),
+        ]
+        for axis in range(coords.shape[1]):
+            to_high = mid.copy()
+            to_high[axis] = high[axis]
+            moves.append((f"axis_{axis}_median_to_high", mid, to_high))
+            to_low = mid.copy()
+            to_low[axis] = low[axis]
+            moves.append((f"axis_{axis}_median_to_low", mid, to_low))
+
+        candidates: list[dict[str, Any]] = []
+        seen: set[tuple[float, ...]] = set()
+        for label, t_from, t_to in moves:
+            if np.allclose(t_from, t_to):
+                continue
+            key = tuple(np.round(np.concatenate([t_from, t_to]), 12).tolist())
+            if key in seen:
+                continue
+            seen.add(key)
+            steer = self.steer(k, t_from, t_to)
+            delta = np.ascontiguousarray(np.asarray(steer["delta"], dtype=np.float64).reshape(-1))
+            candidates.append(
+                {
+                    "candidate": label,
+                    "t_from": np.asarray(t_from, dtype=float).tolist(),
+                    "t_to": np.asarray(t_to, dtype=float).tolist(),
+                    "delta": delta,
+                    "predicted_mean_alt": delta.copy(),
+                    "steer": _jsonable_value(steer),
+                }
+            )
+        return candidates
 
     def _periodic_top1_projection_payload(self, x: np.ndarray) -> dict[str, Any]:
         if (
@@ -780,6 +1151,34 @@ class ManifoldSAE:
                 "this fit payload carries empty trust diagnostics; atom_diagnostics is unavailable"
             )
         return dict(self.diagnostics["atoms"][k])
+
+    def curvature(self) -> list[dict[str, Any]]:
+        """Per-atom SAE curvature report (#1099).
+
+        Returns one record per atom with ``kappa_hat`` and CI-shaped fields
+        matching :meth:`gamfit.Model.curvature`: ``ci_lo``, ``ci_hi``,
+        ``verdict``, ``flatness_lr_stat``, and ``flatness_p_value``. For SAE
+        dictionaries today, ``kappa_hat`` is available from the fitted
+        second-fundamental-form estimate, while profile-likelihood CI and
+        flatness LR fields are explicitly unavailable (``None`` /
+        ``"unavailable"``) until the fixed-kappa SAE profile criterion is
+        exposed by the Rust fit.
+        """
+        if self.curvature_report is None:
+            raise ValueError(
+                "this fitted model carries no SAE curvature report; refit to obtain one"
+            )
+        return [dict(atom) for atom in self.curvature_report.get("atoms", [])]
+
+    def atom_curvature(self, atom: int) -> dict[str, Any]:
+        """Curvature report record for one atom."""
+        k = self._atom_index(atom)
+        rows = self.curvature()
+        if k >= len(rows):
+            raise ValueError(
+                f"curvature report has {len(rows)} atom rows but model has {len(self.atoms)} atoms"
+            )
+        return dict(rows[k])
 
     def shape_uncertainty(self, atom: int = 0, *, n_sd: float = 1.96) -> dict[str, np.ndarray]:
         """Posterior ambient shape uncertainty for one atom.
@@ -1201,6 +1600,7 @@ class ManifoldSAE:
             ],
             "avg_active_atoms": float(avg_active), "mean_assignment_mass": float(mean_mass),
             "active_dims": [a.active_dim for a in self.atoms],
+            "atom_functionals": [_json_ready(a.functional_evidence) for a in self.atoms],
             "primitives": list(self.primitive_names),
         }
 
@@ -1269,6 +1669,7 @@ class ManifoldSAE:
                     "shape_band_coords": _optional_list(a.shape_band_coords),
                     "shape_band_mean": _optional_list(a.shape_band_mean),
                     "shape_band_sd": _optional_list(a.shape_band_sd),
+                    "functional_evidence": _json_ready(a.functional_evidence),
                 }
                 for a in self.atoms
             ],
@@ -1281,6 +1682,9 @@ class ManifoldSAE:
             "residual_gauge": None if self.residual_gauge is None else _jsonable(self.residual_gauge),
             "incoherence_report": (
                 None if self.incoherence_report is None else _jsonable(self.incoherence_report)
+            ),
+            "curvature_report": (
+                None if self.curvature_report is None else _jsonable(self.curvature_report)
             ),
             "certificates": (
                 None if self.certificates is None else _jsonable(self.certificates)
@@ -1313,6 +1717,11 @@ class ManifoldSAE:
                 shape_band_coords=_optional_array(a, "shape_band_coords"),
                 shape_band_mean=_optional_array(a, "shape_band_mean"),
                 shape_band_sd=_optional_array(a, "shape_band_sd"),
+                functional_evidence=(
+                    None
+                    if a.get("functional_evidence") is None
+                    else dict(a["functional_evidence"])
+                ),
             )
             for a in payload["atoms"]
         ]
@@ -1379,6 +1788,11 @@ class ManifoldSAE:
                 None
                 if payload.get("incoherence_report") is None
                 else dict(payload["incoherence_report"])
+            ),
+            curvature_report=(
+                None
+                if payload.get("curvature_report") is None
+                else dict(payload["curvature_report"])
             ),
             structure_certificate_json=(
                 None

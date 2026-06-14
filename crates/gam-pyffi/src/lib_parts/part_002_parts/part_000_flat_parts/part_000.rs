@@ -2606,6 +2606,7 @@ fn sae_manifold_fit_inner<'py>(
         out.set_item("hybrid_split", sae_hybrid_split_dict(py, report)?)?;
     }
     if let Some(report) = &fit_diagnostics.incoherence_report {
+        out.set_item("curvature_report", sae_curvature_report_dict(py, report)?)?;
         out.set_item(
             "incoherence_report",
             sae_incoherence_report_dict(py, report)?,
@@ -2869,6 +2870,45 @@ fn sae_residual_gauge_dict<'py>(
         generators.append(gd)?;
     }
     d.set_item("generators", generators)?;
+    Ok(d)
+}
+
+/// Build the first-class per-atom SAE curvature report (#1099). The point
+/// estimates are the fitted empirical second-fundamental-form norms already
+/// computed for the curved-dictionary certificate. Profile-likelihood CI fields
+/// are present but unavailable until the SAE fixed-κ profile criterion is wired;
+/// this keeps the user-facing schema honest without inventing a Wald substitute.
+fn sae_curvature_report_dict<'py>(
+    py: Python<'py>,
+    report: &gam::terms::sae_manifold::CertificateInputs,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("ci_available", false)?;
+    d.set_item("ci_method", "unavailable")?;
+    d.set_item("level", py.None())?;
+    d.set_item(
+        "note",
+        "SAE per-atom kappa_hat is the fitted empirical second-fundamental-form \
+         norm. Profile-likelihood CI and flatness LR fields are unavailable until \
+         the SAE fixed-kappa profile criterion is exposed.",
+    )?;
+    let atoms = PyList::empty(py);
+    for (atom_idx, &kappa_hat) in report.per_atom_kappa_hat.iter().enumerate() {
+        let a = PyDict::new(py);
+        a.set_item("atom", atom_idx)?;
+        a.set_item("kappa_hat", kappa_hat)?;
+        a.set_item("ci_lo", py.None())?;
+        a.set_item("ci_hi", py.None())?;
+        a.set_item("lo_at_bound", py.None())?;
+        a.set_item("hi_at_bound", py.None())?;
+        a.set_item("verdict", "unavailable")?;
+        a.set_item("flatness_lr_stat", py.None())?;
+        a.set_item("flatness_p_value", py.None())?;
+        a.set_item("ci_available", false)?;
+        a.set_item("ci_method", "unavailable")?;
+        atoms.append(a)?;
+    }
+    d.set_item("atoms", atoms)?;
     Ok(d)
 }
 
