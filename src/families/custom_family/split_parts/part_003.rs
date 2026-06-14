@@ -2820,12 +2820,30 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .iter()
                     .map(|v| v.abs())
                     .fold(0.0_f64, f64::max);
+                // Min eigenvalue of the assembled time-block λS. If negative, the
+                // penalty matrix is NOT PSD — the source of the negative quadratic
+                // penalty value (a ½βᵀSβ with PSD S cannot be < 0). Also break out
+                // the per-penalty quadratic forms βᵀS_kβ so we can see WHICH
+                // penalty matrix (I-spline curvature vs nullspace-shrinkage)
+                // carries the indefinite/negative direction.
+                let s0_min_eval = symmetric_min_eigenvalue_signed(&s_lambdas[0]);
+                let per_penalty_quad: Vec<String> = specs[0]
+                    .penalties
+                    .iter()
+                    .map(|s_k| {
+                        let q = states[0].beta.dot(&s_k.dot(&states[0].beta));
+                        format!("{q:.3e}")
+                    })
+                    .collect();
                 log::info!(
-                    "[JN-GRAD-DIAG #979] cycle={cycle} obj={:.6e} current_penalty={:.6e} block0_quad_penalty={:.6e} s0_max_abs={:.3e} raw_block_grad_inf={:?} proj_block_resid={:?} block_penalty_inf={:?} active_sizes={:?} block0_beta=[{:.3e},{:.3e}] beta_inf={:.3e} resid={:.3e}",
+                    "[JN-GRAD-DIAG #979] cycle={cycle} obj={:.6e} current_penalty={:.6e} block0_quad_penalty={:.6e} s0_max_abs={:.3e} s0_min_eval={:.3e} block0_n_penalties={} per_penalty_quad(betaᵀS_k beta)={:?} raw_block_grad_inf={:?} proj_block_resid={:?} block_penalty_inf={:?} active_sizes={:?} block0_beta=[{:.3e},{:.3e}] beta_inf={:.3e} resid={:.3e}",
                     lastobjective,
                     current_penalty,
                     block0_quad_penalty,
                     s0_max_abs,
+                    s0_min_eval,
+                    specs[0].penalties.len(),
+                    per_penalty_quad,
                     block_gradient_norms
                         .iter()
                         .map(|v| format!("{v:.3e}"))
