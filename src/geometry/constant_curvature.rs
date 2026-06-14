@@ -241,6 +241,35 @@ impl ConstantCurvature {
         Ok(2.0 / self.chart_gauge(x)?)
     }
 
+    /// Radial Jacobian determinant `J_κ(r) = det(d exp_μ)|_{‖v‖=r}` of the
+    /// exponential map in geodesic normal coordinates — the volume element that
+    /// converts the flat tangent measure `dr` into the Riemannian volume
+    /// `dvol_κ` at geodesic radius `r` from any base point (homogeneous, so it
+    /// depends only on `r`, never on the base).
+    ///
+    /// In a space form of curvature κ the Jacobi-field solution gives
+    /// `J_κ(r) = (sn_κ(r) / r)^{d−1}` with the curvature-normalized sine
+    /// `sn_κ(r) = sin(√κ r)/√κ` (κ>0), `r` (κ=0), `sinh(√−κ r)/√−κ` (κ<0).
+    /// Writing `S(u) = sn(t)/t` with `u = κ r²` (the entire function already in
+    /// the chart's [`cs_stacks`]), this is exactly `S(κ r²)^{d−1}` — analytic
+    /// through κ = 0 with no special case. `J_κ(0) = 1`.
+    ///
+    /// This is the κ-dependent volume term whose integral against the intrinsic
+    /// Gaussian is the partition function that breaks the radius/scale
+    /// degeneracy of a dispersion-only curvature criterion (#1104).
+    pub fn jacobian_radial(&self, r: f64) -> f64 {
+        let d = self.dim;
+        if d <= 1 {
+            // On a 1-D space form the exp map is a radial isometry: J ≡ 1.
+            return 1.0;
+        }
+        let u = self.kappa * r * r;
+        let s = cs_stacks(u).1[0]; // S(u) = sn_κ(r)/r ≥ 0 inside the chart
+        // S(u) → 0 at the κ>0 conjugate radius (antipodal shell); clamp the
+        // non-negativity so the (d−1) power is well defined right up to it.
+        s.max(0.0).powi((d - 1) as i32)
+    }
+
     /// Möbius addition `x ⊕_κ y` — the chart realization of geodesic
     /// translation. Rational in κ (hence trivially κ-differentiable):
     ///

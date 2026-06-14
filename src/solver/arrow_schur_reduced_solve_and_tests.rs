@@ -555,7 +555,7 @@ const SCHUR_PROLOGUE_PARALLEL_K_MIN: usize = 512;
 /// Numerically identical to the generic path up to floating-point reassociation
 /// (it differentiates and accumulates the SAME quotient), so the criterion
 /// ranking across topology candidates cannot move — the #1017 verification gate.
-struct SaeResidentReducedSchur {
+pub(crate) struct SaeResidentReducedSchur {
     /// Decoder output dimension `p` (the side length of every `G_i = L_iᵀ Y_i`).
     p: usize,
     /// Per-row **factored** residency: `(L_i, Y_i)`, each stored row-major as a
@@ -978,7 +978,7 @@ impl JacobiPreconditioner {
     /// When `sys.block_offsets` is non-empty and `max(block_size) ≤ 256`,
     /// each block gets a dense `b×b` Schur sub-matrix formed, factored, and
     /// stored.  Otherwise every column gets its own scalar entry.
-    pub fn from_arrow_schur<B: BatchedBlockSolver>(
+    pub(crate) fn from_arrow_schur<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
