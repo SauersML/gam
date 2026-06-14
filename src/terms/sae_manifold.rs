@@ -28,7 +28,8 @@
 //! [`crate::solver::arrow_schur::ArrowSchurSystem`].
 
 // Split from the original oversized module; keep included in order.
-include!("sae_manifold/part_000.rs");
-include!("sae_manifold/part_001.rs");
-include!("sae_manifold/part_002.rs");
-include!("sae_manifold/part_003.rs");
+include!("sae_manifold/types.rs");
+include!("sae_manifold/term_construction.rs");
+include!("sae_manifold/term_fit_drivers.rs");
+include!("sae_manifold/outer_objective.rs");
+include!("sae_manifold/tests.rs");
