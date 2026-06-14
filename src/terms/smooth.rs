@@ -14,4 +14,6 @@ mod shape_constraints;
 include!("smooth/term_specs.rs");
 include!("smooth/design_construction.rs");
 include!("smooth/spatial_optimization.rs");
-include!("smooth/tests_wiring.rs");
+
+#[cfg(test)]
+mod tests;
