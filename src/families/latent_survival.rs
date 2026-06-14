@@ -159,6 +159,12 @@ pub struct LatentSurvivalTermFitResult {
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
     pub latent_sd: f64,
+    /// Per-row residuals of the unpenalized NLL w.r.t. the additive baseline
+    /// time-block offsets `(entry, exit, derivative)` at the converged β̂.
+    /// Contracted against `baseline_offset_theta_partials` by
+    /// `baseline_chain_rule_gradient` to give the exact θ-gradient of the
+    /// profile penalized NLL for the outer baseline-config optimizer.
+    pub baseline_offset_residuals: crate::families::survival::OffsetChannelResiduals,
 }
 
 #[derive(Clone)]
@@ -179,6 +185,10 @@ pub struct LatentBinaryTermFitResult {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
+    /// Per-row residuals of the unpenalized NLL w.r.t. the additive baseline
+    /// time-block offsets `(entry, exit)` at the converged β̂ (the derivative
+    /// channel is identically zero for the binary deployment likelihood).
+    pub baseline_offset_residuals: crate::families::survival::OffsetChannelResiduals,
 }
 
 #[derive(Clone)]
@@ -538,11 +548,13 @@ pub fn fit_latent_survival_terms(
     }
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
     let latent_sd = family.latent_sd(&fit.block_states)?;
+    let baseline_offset_residuals = family.offset_channel_residuals(&fit.block_states)?;
     Ok(LatentSurvivalTermFitResult {
         fit,
         design: mean_design,
         resolvedspec,
         latent_sd,
+        baseline_offset_residuals,
     })
 }
 
@@ -579,10 +591,12 @@ pub fn fit_latent_binary_terms(
         build_mean_blockspec(&mean_design, spec.mean_offset.clone()),
     ];
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
+    let baseline_offset_residuals = family.offset_channel_residuals(&fit.block_states)?;
     Ok(LatentBinaryTermFitResult {
         fit,
         design: mean_design,
         resolvedspec,
+        baseline_offset_residuals,
     })
 }
 
@@ -2182,6 +2196,97 @@ impl LatentSurvivalFamily {
         Ok((acc.ll, acc.gradient))
     }
 
+    /// Per-row residuals of the unpenalized NLL with respect to the three
+    /// additive baseline time-block offsets `(entry, exit, derivative)`.
+    ///
+    /// The baseline configuration θ enters the latent-survival working model
+    /// only through the additive offsets on the three time channels
+    ///   q_entry = x_time_entry·β_time + o_E(θ),
+    ///   q_exit  = x_time_exit·β_time  + o_X(θ),
+    ///   q̇_exit = x_time_deriv·β_time + o_D(θ),
+    /// exactly the offset channel the transformation path carries through
+    /// [`WorkingModelSurvival::offset_channel_residuals`]. Because
+    /// `∂q_ch/∂o_ch = 1`, the residual `∂NLL/∂o_ch_i` equals
+    /// `−∂(log-likelihood)/∂q_ch_i`, and the per-row primary log-likelihood
+    /// gradient over `(q_entry, q_exit, q̇_exit)` is precisely the
+    /// `Q_ENTRY`/`Q_EXIT`/`QDOT_EXIT` components returned by
+    /// [`latent_survival_row_primary_gradient_hessian`]. Sampleweight-scaled to
+    /// match the [`OffsetChannelResiduals`] contract consumed by
+    /// `baseline_chain_rule_gradient`.
+    ///
+    /// At the converged (constrained) β̂ the envelope theorem makes this the
+    /// exact θ-gradient of the profile penalized NLL `0.5·deviance + 0.5·βᵀSβ`
+    /// (the `q_right` interval channel shares the time coefficients and carries
+    /// no independent baseline offset, so it contributes no separate channel).
+    pub fn offset_channel_residuals(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<crate::families::survival::OffsetChannelResiduals, String> {
+        let n = self.event_target.len();
+        if block_states.is_empty() {
+            // Degraded-fit fallback mirroring the location-scale family: an
+            // empty block-state slate (ARC deterministic-replay stall) yields
+            // zero residuals so the outer baseline-θ BFGS sees ‖g‖ = 0 and
+            // terminates cleanly at the current θ̂ rather than panicking.
+            log::warn!(
+                "LatentSurvivalFamily::offset_channel_residuals: block_states is empty \
+                 (degraded fit); returning zero offset residuals (n={n})"
+            );
+            return Ok(crate::families::survival::OffsetChannelResiduals {
+                exit: Array1::<f64>::zeros(n),
+                entry: Array1::<f64>::zeros(n),
+                derivative: Array1::<f64>::zeros(n),
+            });
+        }
+        let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
+        let q_right = self.time_q_right(block_states)?;
+        let sigma = self.latent_sd(block_states)?;
+        let include_log_sigma = self.joint_slices().log_sigma.is_some();
+        let mut entry = Array1::<f64>::zeros(n);
+        let mut exit = Array1::<f64>::zeros(n);
+        let mut derivative = Array1::<f64>::zeros(n);
+        for row_idx in 0..n {
+            let wi = self.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let event_type = latent_survival_event_type_for(self.event_target[row_idx]);
+            let row = build_latent_survival_row(
+                row_idx,
+                self.hazard_loading,
+                event_type,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                q_right[row_idx],
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                self.unloaded_mass_right[row_idx],
+                self.unloaded_hazard_exit[row_idx],
+            )?;
+            let (_, primary_gradient, _) = latent_survival_row_primary_gradient_hessian(
+                &self.quadctx,
+                &row,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                q_right[row_idx],
+                mu[row_idx],
+                sigma,
+                include_log_sigma,
+            )?;
+            // ∂NLL/∂o_ch = −w · ∂(log-likelihood)/∂q_ch.
+            entry[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_ENTRY];
+            exit[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_EXIT];
+            derivative[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT];
+        }
+        Ok(crate::families::survival::OffsetChannelResiduals {
+            exit,
+            entry,
+            derivative,
+        })
+    }
+
     /// Block-diagonal-only pullback: writes only time-time, mean-mean, and
     /// log_sigma-log_sigma rowwise contributions into per-block targets.
     /// Used by `evaluate()` to populate per-block working sets without ever
@@ -3282,6 +3387,80 @@ impl LatentBinaryFamily {
             );
         }
         Ok((ll, gradient, hessian))
+    }
+
+    /// Per-row residuals of the unpenalized NLL with respect to the baseline
+    /// time-block offsets `(entry, exit)`.
+    ///
+    /// The latent-binary deployment likelihood is a monotone scalar transform
+    /// `ℓ_bin = b(log S_row)` of the latent-survival row log-survival, so by the
+    /// chain rule `∂ℓ_bin/∂q_ch = b'(log S)·∂(log S)/∂q_ch = grad_scale·g_ch`,
+    /// where `g_ch` are the `Q_ENTRY`/`Q_EXIT` components of the survival row
+    /// primary gradient. The baseline θ enters only the additive entry/exit time
+    /// offsets (`q̇_exit` is held at the constant deployment derivative `1`, so
+    /// the derivative channel carries no baseline offset and its residual is 0).
+    /// Sampleweight-scaled to match the [`OffsetChannelResiduals`] contract.
+    pub fn offset_channel_residuals(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<crate::families::survival::OffsetChannelResiduals, String> {
+        let n = self.event_target.len();
+        if block_states.is_empty() {
+            log::warn!(
+                "LatentBinaryFamily::offset_channel_residuals: block_states is empty \
+                 (degraded fit); returning zero offset residuals (n={n})"
+            );
+            return Ok(crate::families::survival::OffsetChannelResiduals {
+                exit: Array1::<f64>::zeros(n),
+                entry: Array1::<f64>::zeros(n),
+                derivative: Array1::<f64>::zeros(n),
+            });
+        }
+        let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
+        let mut entry = Array1::<f64>::zeros(n);
+        let mut exit = Array1::<f64>::zeros(n);
+        for row_idx in 0..n {
+            let wi = self.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let row = build_latent_survival_row(
+                row_idx,
+                self.hazard_loading,
+                LatentSurvivalEventType::RightCensored,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                1.0,
+                q_exit[row_idx],
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                0.0,
+                0.0,
+            )?;
+            let (row_log_survival, survival_gradient, _) =
+                latent_survival_row_primary_gradient_hessian(
+                    &self.quadctx,
+                    &row,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    1.0,
+                    q_exit[row_idx],
+                    mu[row_idx],
+                    self.latent_sd,
+                    false,
+                )?;
+            let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
+            // ∂NLL/∂o_ch = −w · grad_scale · ∂(log S)/∂q_ch.
+            entry[row_idx] =
+                -wi * binary.grad_scale * survival_gradient[LATENT_SURVIVAL_PRIMARY_Q_ENTRY];
+            exit[row_idx] =
+                -wi * binary.grad_scale * survival_gradient[LATENT_SURVIVAL_PRIMARY_Q_EXIT];
+        }
+        Ok(crate::families::survival::OffsetChannelResiduals {
+            exit,
+            entry,
+            derivative: Array1::<f64>::zeros(n),
+        })
     }
 
     fn exact_newton_joint_hessian_directional_derivative_dense(
@@ -4970,6 +5149,64 @@ mod tests {
                 -((&gradient_plus - &gradient_minus) / (2.0 * h))
             );
         }
+    }
+
+    /// FD check for `LatentSurvivalFamily::offset_channel_residuals`: each
+    /// channel residual sums to `∂(−ℓ)/∂o_ch` for a uniform additive offset on
+    /// that time channel (the baseline-θ enters only through these offsets).
+    /// `o_ch` shifts `eta_time[ch-slice]` uniformly, so `Σ_i r^ch_i` is exactly
+    /// the directional derivative of `−ℓ` along a constant offset on channel ch.
+    /// This validates the envelope-theorem latent baseline-θ gradient primitive.
+    #[test]
+    fn latent_survival_offset_channel_residuals_match_finite_difference() {
+        let family = survival_stress_test_family(24);
+        let beta = survival_stress_test_joint_beta();
+        let states = latent_survival_states_from_joint_beta(&family, &beta);
+        let n = family.event_target.len();
+
+        let residuals = family
+            .offset_channel_residuals(&states)
+            .expect("offset channel residuals");
+        let sum_entry: f64 = residuals.entry.sum();
+        let sum_exit: f64 = residuals.exit.sum();
+        let sum_deriv: f64 = residuals.derivative.sum();
+
+        // `−ℓ` after shifting one time channel's eta by a constant δ.
+        let neg_ll_with_offset = |channel: usize, delta: f64| -> f64 {
+            let mut shifted = states.clone();
+            let slice = match channel {
+                0 => s![0..n],
+                1 => s![n..2 * n],
+                2 => s![2 * n..3 * n],
+                _ => unreachable!(),
+            };
+            shifted[LatentSurvivalFamily::BLOCK_TIME]
+                .eta
+                .slice_mut(slice)
+                .mapv_inplace(|v| v + delta);
+            let (ll, _) = family
+                .evaluate_exact_newton_joint_gradient_dense(&shifted)
+                .expect("shifted joint gradient evaluation");
+            -ll
+        };
+
+        let h = 1e-6;
+        let fd_entry = (neg_ll_with_offset(0, h) - neg_ll_with_offset(0, -h)) / (2.0 * h);
+        let fd_exit = (neg_ll_with_offset(1, h) - neg_ll_with_offset(1, -h)) / (2.0 * h);
+        let fd_deriv = (neg_ll_with_offset(2, h) - neg_ll_with_offset(2, -h)) / (2.0 * h);
+
+        assert!(
+            (sum_entry - fd_entry).abs() <= 1e-5 * fd_entry.abs().max(1.0),
+            "entry-channel residual sum mismatch: analytic={sum_entry}, fd={fd_entry}"
+        );
+        assert!(
+            (sum_exit - fd_exit).abs() <= 1e-5 * fd_exit.abs().max(1.0),
+            "exit-channel residual sum mismatch: analytic={sum_exit}, fd={fd_exit}"
+        );
+        assert!(
+            (sum_deriv - fd_deriv).abs() <= 1e-5 * fd_deriv.abs().max(1.0),
+            "derivative-channel residual sum mismatch: analytic={sum_deriv}, fd={fd_deriv}"
+        );
     }
 
     #[test]

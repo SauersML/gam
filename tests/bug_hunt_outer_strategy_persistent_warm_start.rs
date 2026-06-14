@@ -1,6 +1,5 @@
 use gam::solver::outer_strategy::{
-    DeclaredHessianForm, Derivative, HessianSource, OuterCapability, Solver, SolverClass, plan,
-    plan_with_class,
+    DeclaredHessianForm, Derivative, HessianSource, OuterCapability, Solver, plan,
 };
 
 fn cap(
@@ -81,10 +80,10 @@ fn outer_strategy_selector_falls_back_to_bfgs_when_fixed_point_disabled() {
 
 #[test]
 fn outer_strategy_selector_cost_only_fails_loudly_with_bfgs() {
-    // The gradient-free compass-search optimizer was purged. A cost-only
-    // capability (no gradient, no Hessian, no fixed-point lane) has no
-    // gradient-free solver left, so the planner emits Bfgs — which the runner
-    // rejects loudly for needing a gradient the objective cannot supply.
+    // A cost-only capability (no gradient, no Hessian, no fixed-point lane) is
+    // a programming error now that every outer objective supplies an analytic
+    // gradient. The planner emits Bfgs — which the runner rejects loudly for
+    // needing a gradient the objective cannot supply.
     let c = cap(
         Derivative::Unavailable,
         DeclaredHessianForm::Unavailable,
@@ -92,10 +91,10 @@ fn outer_strategy_selector_cost_only_fails_loudly_with_bfgs() {
         0,
         false,
     );
-    let p = plan_with_class(&c, SolverClass::Primary);
+    let p = plan(&c);
     assert_eq!(
         p.solver,
         Solver::Bfgs,
-        "cost-only capability must fail loudly via Bfgs, never a gradient-free solver"
+        "cost-only capability must fail loudly via Bfgs, never a non-gradient solver"
     );
 }

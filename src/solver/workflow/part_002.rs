@@ -3628,20 +3628,99 @@ fn materialize_survival<'a>(
             Err(e) => return Err(e.into()),
         }
     } else if baseline_cfg.target != SurvivalBaselineTarget::Linear {
-        // The cost-only baseline-θ optimizer drove a gradient-free compass
-        // search, which has been purged. A non-linear baseline target with no
-        // analytic θ-gradient (Latent / LatentBinary) therefore has no solver
-        // left — fail loudly rather than silently rerouting to a derivative
-        // method the objective cannot back.
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!(
-                "non-linear survival baseline target {:?} in mode {:?} has no analytic \
-                 θ-gradient and the gradient-free compass-search optimizer was removed; \
-                 there is no outer solver for this baseline",
-                baseline_cfg.target, survival_mode,
-            ),
+        // Latent / LatentBinary baseline-θ. The baseline configuration enters
+        // the inner latent fit only through the three additive time-block
+        // offsets (entry η, exit η, exit ∂η/∂t), so the envelope theorem at the
+        // converged β̂ gives the exact θ-gradient of the *profile penalized NLL*
+        //   V(θ) = −ℓ(β̂(θ)) + ½·β̂ᵀS β̂,
+        //     dV/dθ_k = Σ_i Σ_ch r^ch_i ∂o^ch_i/∂θ_k,
+        // with r^ch = LatentSurvivalFamily::offset_channel_residuals(β̂)
+        // (`baseline_offset_residuals` on the fit result) contracted against
+        // `baseline_offset_theta_partials` by `baseline_chain_rule_gradient`.
+        // We optimize the profile-NLL — not the LAML `reml_score` whose
+        // ½log|H+S_λ| term carries its own θ-dependence through H(β̂,θ) — and
+        // the downstream final refit re-picks ρ on the full REML surface at the
+        // converged baseline θ. BFGS converges in ≲10 outer evaluations.
+        let baseline_outcome = optimize_survival_baseline_config_with_gradient_only(
+            &baseline_cfg,
+            "workflow latent survival baseline",
+            |candidate| {
+                let (log_likelihood, stable_penalty_term, residuals) = match survival_mode {
+                    SurvivalLikelihoodMode::Latent => {
+                        let request = build_latent_survival_request(candidate)?;
+                        match fit_model(FitRequest::LatentSurvival(request)) {
+                            Ok(FitResult::LatentSurvival(result)) => (
+                                result.fit.log_likelihood,
+                                result.fit.stable_penalty_term,
+                                result.baseline_offset_residuals,
+                            ),
+                            Ok(_) => {
+                                return Err("internal latent survival workflow returned the wrong result variant".to_string());
+                            }
+                            Err(e) => return Err(format!("latent survival fit failed: {e}")),
+                        }
+                    }
+                    SurvivalLikelihoodMode::LatentBinary => {
+                        let request = build_latent_binary_request(candidate)?;
+                        match fit_model(FitRequest::LatentBinary(request)) {
+                            Ok(FitResult::LatentBinary(result)) => (
+                                result.fit.log_likelihood,
+                                result.fit.stable_penalty_term,
+                                result.baseline_offset_residuals,
+                            ),
+                            Ok(_) => {
+                                return Err("internal latent binary workflow returned the wrong result variant".to_string());
+                            }
+                            Err(e) => return Err(format!("latent binary fit failed: {e}")),
+                        }
+                    }
+                    SurvivalLikelihoodMode::Transformation
+                    | SurvivalLikelihoodMode::Weibull
+                    | SurvivalLikelihoodMode::LocationScale
+                    | SurvivalLikelihoodMode::MarginalSlope => {
+                        return Err(format!(
+                            "internal: workflow latent baseline closure reached for non-latent mode {survival_mode:?}"
+                        ));
+                    }
+                };
+                let profile_cost = -log_likelihood + 0.5 * stable_penalty_term;
+                if !profile_cost.is_finite() {
+                    return Err(format!(
+                        "workflow latent baseline: non-finite profile cost \
+                         (log_likelihood={log_likelihood}, \
+                         stable_penalty_term={stable_penalty_term}, cost={profile_cost})"
+                    ));
+                }
+                let gradient = baseline_chain_rule_gradient(
+                    age_entry.view(),
+                    age_exit.view(),
+                    candidate,
+                    &residuals,
+                )?
+                .ok_or_else(|| {
+                    "workflow latent baseline unexpectedly has no theta gradient".to_string()
+                })?;
+                Ok((profile_cost, gradient))
+            },
+        );
+        match baseline_outcome {
+            Ok(baseline) => baseline,
+            Err(e)
+                if e.contains("expects 3 blocks, got 0")
+                    || e.contains("expects 4 blocks, got 0")
+                    || (e.contains("block_states") && e.contains("got 0"))
+                    || e.contains("blockwise fit requires at least one block state")
+                    || e.contains(SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER) =>
+            {
+                log::warn!(
+                    "workflow latent survival baseline: gradient-only BFGS failed at an \
+                     empty-block_states candidate ({e}); falling back to the seed \
+                     baseline_cfg as-is"
+                );
+                baseline_cfg.clone()
+            }
+            Err(e) => return Err(WorkflowError::InvalidConfig { reason: e }.into()),
         }
-        .into());
     } else {
         baseline_cfg
     };

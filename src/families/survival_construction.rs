@@ -669,10 +669,10 @@ fn survival_baseline_config_from_theta(
 /// The two public baseline optimizers (`…_with_gradient_only`,
 /// `…_with_gradient`) differ in exactly one axis: how much derivative
 /// information the objective closure supplies, and therefore which curvature
-/// declaration the `OuterProblem` must advertise. (The cost-only optimizer was
-/// removed with the compass-search purge — a baseline θ with no analytic
-/// gradient has no solver any more.) Everything else — θ↔config conversion,
-/// the ±6 log-space box,
+/// declaration the `OuterProblem` must advertise. Every baseline-θ path now
+/// supplies an exact analytic gradient (profile-NLL envelope gradient), so both
+/// contracts route to a gradient-based solver. Everything else — θ↔config
+/// conversion, the ±6 log-space box,
 /// the single-seed config, the `run`/convergence/error-formatting boilerplate
 /// — is identical, so it lives once in [`run_baseline_theta_optimizer`] and
 /// this enum selects the per-contract `OuterProblem` configuration.

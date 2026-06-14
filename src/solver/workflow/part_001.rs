@@ -3297,6 +3297,20 @@ fn fit_survival_location_scale_model(
         })
     }
 
+    /// Profile the survival location-scale fit at a fixed inverse-link state:
+    /// substitutes `inverse_link` into the spec and runs the full penalized fit.
+    fn profile_survival_location_scale_with_inverse_link(
+        data: ArrayView2<'_, f64>,
+        spec: &SurvivalLocationScaleTermSpec,
+        inverse_link: InverseLink,
+        wiggle: Option<LinkWiggleConfig>,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Result<SurvivalLocationScaleProfile, String> {
+        let mut spec_at_link = spec.clone();
+        spec_at_link.inverse_link = inverse_link;
+        profile_survival_location_scale(data, spec_at_link, wiggle, kappa_options)
+    }
+
     fn optimize_survival_inverse_link_profile(
         data: ArrayView2<'_, f64>,
         spec: &SurvivalLocationScaleTermSpec,
@@ -3323,7 +3337,7 @@ fn fit_survival_location_scale_model(
             name: &str,
             final_wiggle: Option<LinkWiggleConfig>,
             wiggle_cfg: Option<LinkWiggleConfig>,
-            make_link: impl Fn(&Array1<f64>) -> Result<InverseLink, String>,
+            make_link: impl Fn(&Array1<f64>) -> Result<InverseLink, String> + Clone,
             recover: R,
         ) -> Result<SurvivalLocationScaleProfile, String>
         where
