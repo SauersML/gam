@@ -994,12 +994,29 @@ impl SaeManifoldTerm {
         for i in 0..delta_beta.len() {
             residual[beta_base + i] = delta_beta[i];
         }
+        let quotient = self.quotient_residual_norm_sq(residual, penalized_gram_scale)?;
+        Ok(if quotient.is_finite() {
+            quotient.max(0.0).min(raw_step_norm_sq)
+        } else {
+            raw_step_norm_sq
+        })
+    }
 
-        // Quotient out BOTH the chart reparametrisation orbit AND the
-        // rank-deficient decoder β-null (#1051): along either the penalised
-        // joint objective is flat, so the undamped Newton step there is gauge
-        // freedom, not un-converged motion. Measuring convergence on the raw
-        // step would reject a stationary line / low-rank fit forever.
+    /// Norm² of a full-length `(n·q + β)` residual vector after projecting out
+    /// BOTH the chart reparametrisation orbit AND the rank-deficient decoder
+    /// β-null (#1051/#1117): along either the penalised joint objective is flat,
+    /// so a component there is gauge freedom, not un-converged motion. Shared by
+    /// the convergence STEP gate ([`Self::quotient_newton_step_norm_sq`]) and the
+    /// convergence GRADIENT gate ([`Self::quotient_gradient_norm_sq`]) so both
+    /// measure progress on the SAME identified quotient — otherwise a
+    /// rank-deficient circle whose only remaining motion is gauge/null crawl is
+    /// recognised as converged by the step measure but rejected forever by the
+    /// raw-gradient measure, burning the inner refine budget (the #1117 stall).
+    pub(crate) fn quotient_residual_norm_sq(
+        &self,
+        mut residual: Array1<f64>,
+        penalized_gram_scale: f64,
+    ) -> Result<f64, String> {
         let mut orthonormal: Vec<Array1<f64>> = Vec::new();
         let gauges = self
             .dense_step_gauge_vectors()?
@@ -1026,11 +1043,46 @@ impl SaeManifoldTerm {
             }
             orthonormal.push(gauge);
         }
-        let quotient = residual.iter().map(|v| v * v).sum::<f64>();
+        Ok(residual.iter().map(|v| v * v).sum::<f64>())
+    }
+
+    /// Quotient KKT-gradient norm² for the inner convergence gate (#1117): the
+    /// joint gradient `[g_t (per row); g_β]` with the chart-gauge orbit and the
+    /// rank-deficient decoder β-null projected out, so a rank-deficient atom
+    /// whose residual gradient lives ONLY in those flat directions is recognised
+    /// as stationary on the identified quotient manifold.
+    ///
+    /// `grad_ext_coord` is the per-row `g_t` flattened into the dense `n·q`
+    /// coordinate layout (row `i` axis `a` at `i·q + a`); `grad_beta` is `g_β`.
+    /// Falls back to the raw norm when the layout does not match the dense gauge
+    /// basis (e.g. a streaming/heterogeneous system), exactly as the step measure
+    /// does, so non-dense paths are unaffected.
+    pub(crate) fn quotient_gradient_norm_sq(
+        &self,
+        grad_ext_coord: ArrayView1<'_, f64>,
+        grad_beta: ArrayView1<'_, f64>,
+        raw_grad_norm_sq: f64,
+        penalized_gram_scale: f64,
+    ) -> Result<f64, String> {
+        let n = self.n_obs();
+        let q = self.assignment.row_block_dim();
+        let beta_dim = self.beta_dim();
+        if grad_ext_coord.len() != n * q || grad_beta.len() != beta_dim {
+            return Ok(raw_grad_norm_sq);
+        }
+        let mut residual = Array1::<f64>::zeros(grad_ext_coord.len() + grad_beta.len());
+        for i in 0..grad_ext_coord.len() {
+            residual[i] = grad_ext_coord[i];
+        }
+        let beta_base = grad_ext_coord.len();
+        for i in 0..grad_beta.len() {
+            residual[beta_base + i] = grad_beta[i];
+        }
+        let quotient = self.quotient_residual_norm_sq(residual, penalized_gram_scale)?;
         Ok(if quotient.is_finite() {
-            quotient.max(0.0).min(raw_step_norm_sq)
+            quotient.max(0.0).min(raw_grad_norm_sq)
         } else {
-            raw_step_norm_sq
+            raw_grad_norm_sq
         })
     }
 

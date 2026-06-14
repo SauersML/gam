@@ -179,7 +179,7 @@ use super::*;
     /// quotient-dimension change and must error loudly (comparing Laplace
     /// normalizers across a changed null-space is meaningless).
     #[test]
-    pub(crate) fn evidence_gauge_deflation_count_guard_rejects_any_change() {
+    pub(crate) fn evidence_gauge_deflation_count_guard_tolerates_flicker_rejects_structural_jump() {
         let mut term = trivial_k1_euclidean_term();
         assert!(term.expected_evidence_gauge_deflated_directions.is_none());
 
@@ -191,18 +191,27 @@ use super::*;
         term.record_evidence_gauge_deflation_count(5).unwrap();
         assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
 
-        // #1117: the rank-deficiency that drove a ±1 flicker is removed at the
-        // basis layer, so the strict #1037 guard is restored — ANY change in the
-        // deflation count is a structural quotient-dimension event and must error
-        // (no hysteresis tolerance). A single-step ±1 change is rejected too.
+        // #1117: even with the basis-layer rank-revealing reduction, a single
+        // near-cutoff per-row H_tt eigenvalue can still cross the spectral floor
+        // across the ρ-walk, flickering the summed count by ±1. The strict guard
+        // refused the seed for that ±1, dropping the production K=1 path into the
+        // slow homotopy cascade (~10 min vs ~65 s). A bounded ±1 flicker now
+        // RE-ANCHORS the expected count instead of refusing.
+        term.record_evidence_gauge_deflation_count(6).unwrap();
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(6));
+        term.record_evidence_gauge_deflation_count(5).unwrap();
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
+
+        // A change LARGER than the flicker band is a genuine structural
+        // quotient-dimension event → loud error (#1037 invariant preserved).
         let err = term
-            .record_evidence_gauge_deflation_count(6)
-            .expect_err("any deflation-count change must error under the strict guard");
+            .record_evidence_gauge_deflation_count(8)
+            .expect_err("a structural deflation-count jump must error");
         assert!(
             err.contains("deflation count changed"),
             "guard must report the quotient-dimension change explicitly; got: {err}"
         );
-        // The expected count is NOT re-anchored on a refusal.
+        // The expected count is NOT re-anchored on a structural refusal.
         assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
     }
 

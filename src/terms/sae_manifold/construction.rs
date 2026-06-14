@@ -4422,17 +4422,46 @@ impl SaeManifoldTerm {
     pub(crate) fn record_evidence_gauge_deflation_count(&mut self, count: usize) -> Result<(), String> {
         match self.expected_evidence_gauge_deflated_directions {
             Some(expected) if expected == count => Ok(()),
-            Some(expected) => Err(format!(
-                "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count changed \
-                 from {expected} to {count} within one optimization; this is a structural \
-                 quotient-dimension event, refusing to compare Laplace normalizers"
-            )),
+            Some(expected) => {
+                let delta = expected.abs_diff(count);
+                if delta > Self::EVIDENCE_DEFLATION_COUNT_FLICKER_TOLERANCE {
+                    // Genuine structural quotient-dimension event: too many rows
+                    // changed deflation state at once to be a single near-cutoff
+                    // eigenvalue's flicker. Refuse to compare across it (#1037).
+                    return Err(format!(
+                        "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count \
+                         changed by {delta} from {expected} to {count} within one optimization; \
+                         this is a structural quotient-dimension event, refusing to compare \
+                         Laplace normalizers"
+                    ));
+                }
+                // Bounded ±1 flicker of a near-cutoff per-row H_tt eigenvalue
+                // crossing the spectral floor across the ρ-walk (#1117): re-anchor
+                // to the live count instead of refusing the seed and dropping the
+                // production K=1 path into the slow homotopy seed cascade (~10 min
+                // vs ~65 s). The deflated direction contributes the ρ-independent
+                // log 1 = 0 to the evidence either way, so the converged answer is
+                // unchanged; a larger structural jump still hard-refuses above.
+                log::warn!(
+                    "SaeManifoldTerm::reml_criterion: per-row evidence deflation count flickered \
+                     {expected}->{count} (a single near-cutoff H_tt eigenvalue crossing the \
+                     spectral floor across the ρ-walk); re-anchoring the quotient dimension"
+                );
+                self.expected_evidence_gauge_deflated_directions = Some(count);
+                Ok(())
+            }
             None => {
                 self.expected_evidence_gauge_deflated_directions = Some(count);
                 Ok(())
             }
         }
     }
+
+    /// Largest single-step change in the per-row evidence deflation count treated
+    /// as a tolerable *flicker* of one near-cutoff `H_tt` eigenvalue across the
+    /// ρ-walk, rather than a genuine structural quotient-dimension collapse
+    /// (#1117). See [`Self::record_evidence_gauge_deflation_count`].
+    const EVIDENCE_DEFLATION_COUNT_FLICKER_TOLERANCE: usize = 1;
 
     pub(crate) fn is_undamped_evidence_row_non_pd(err: &ArrowSchurError) -> bool {
         matches!(
@@ -4565,6 +4594,49 @@ impl SaeManifoldTerm {
                 .sum::<f64>()
                 + sys.gb.iter().map(|&v| v * v).sum::<f64>();
             let grad_norm = grad_norm_sq.sqrt();
+            // Quotient KKT-gradient (#1117): the raw joint gradient retains a
+            // persistent small component in the chart-gauge orbit and the
+            // rank-deficient decoder β-null even at a stationary fit, so the raw
+            // grad gate never clears on a rank-deficient circle and the inner
+            // refine loop crawls until the (large) progress budget dies — the
+            // 2-min stall. Measure the gradient on the SAME identified quotient
+            // the step gate already uses: a fit whose only remaining gradient
+            // lives in those flat directions is stationary on the quotient, so
+            // ranking the Laplace criterion there is correct. The dense per-row
+            // g_t is laid into the `n·q` coordinate layout the gauge basis spans;
+            // non-dense/heterogeneous systems fall back to the raw norm.
+            let quotient_grad_norm = {
+                let n = self.n_obs();
+                let q = self.assignment.row_block_dim();
+                let dense_len = n.saturating_mul(q);
+                let mut grad_ext_coord = Array1::<f64>::zeros(dense_len);
+                let mut dense_layout_ok = sys.rows.len() == n;
+                if dense_layout_ok {
+                    for (row_idx, row) in sys.rows.iter().enumerate() {
+                        let base = sys.row_offsets[row_idx];
+                        let di = sys.row_dims[row_idx];
+                        if base + di > dense_len || row.gt.len() < di {
+                            dense_layout_ok = false;
+                            break;
+                        }
+                        for axis in 0..di {
+                            grad_ext_coord[base + axis] = row.gt[axis];
+                        }
+                    }
+                }
+                if dense_layout_ok {
+                    self.quotient_gradient_norm_sq(
+                        grad_ext_coord.view(),
+                        sys.gb.view(),
+                        grad_norm_sq,
+                        rho_fixed.lambda_smooth(),
+                    )
+                    .map(|v| v.sqrt())
+                    .unwrap_or(grad_norm)
+                } else {
+                    grad_norm
+                }
+            };
             let iterate_scale = self.inner_iterate_scale();
             // Relative parameter-step tolerance for Δ (well-conditioned charts)
             // and a scaled KKT-gradient tolerance. Convergence is accepted on
@@ -4592,7 +4664,7 @@ impl SaeManifoldTerm {
                 match solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options) {
                     Ok(factored) => factored,
                     Err(err) if Self::is_undamped_evidence_row_non_pd(&err) => {
-                        if grad_norm <= grad_tolerance {
+                        if grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance {
                             // K>1: the softmax/IBP logit–coordinate Gauss-Newton
                             // cross-terms (H_zt = J_z^T J_t, assembled row-locally from
                             // the assignment JVP × basis JVP) can make a per-row H_tt
@@ -4718,7 +4790,16 @@ impl SaeManifoldTerm {
                 rho_fixed.lambda_smooth(),
             )?;
             let quotient_step_norm = quotient_step_norm_sq.sqrt();
-            if grad_norm <= grad_tolerance || quotient_step_norm <= step_tolerance {
+            // Converge on ANY of: the raw KKT gradient (well-conditioned fit),
+            // the QUOTIENT KKT gradient (#1117 — rank-deficient fit whose only
+            // residual gradient is gauge/null flat-direction crawl), or the
+            // quotient Newton step. The quotient-gradient disjunct is what lets
+            // a rank-deficient K=1 circle terminate in budget instead of crawling
+            // the weakly-identified valley until the refine budget dies.
+            if grad_norm <= grad_tolerance
+                || quotient_grad_norm <= grad_tolerance
+                || quotient_step_norm <= step_tolerance
+            {
                 return Ok(cache);
             }
             let refine_limit = Self::refine_iteration_limit(
