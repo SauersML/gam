@@ -1100,6 +1100,100 @@ impl SaeManifoldAtom {
         self
     }
 
+    /// Rank-revealing reduction of this atom's fixed-width basis onto the
+    /// data-supported subspace `Q` (`M × r`, orthonormal columns, `r ≤ M`),
+    /// the root-cause fix for issue #1117.
+    ///
+    /// A fixed-depth decoder basis (e.g. [`PeriodicHarmonicEvaluator`]) emits
+    /// `M` columns whether or not the data excites them; on a near-degenerate
+    /// checkpoint the unexcited columns make the design rank-deficient by
+    /// construction, flattening the outer REML surface and stalling the solve.
+    /// Here we replace the basis with its restriction to the data-identified
+    /// subspace, so the design is **full-rank by construction** and the outer
+    /// problem is well-posed. Everything transforms by the same `Q` congruence:
+    ///
+    /// * basis design `Φ̃ = Φ Q`  (`basis_values`, and on every refresh through
+    ///   the wrapped [`SubspaceReducedEvaluator`]),
+    /// * basis Jacobian `∂Φ̃ = (∂Φ) Q`  (`basis_jacobian`),
+    /// * decoder `B̃ = Qᵀ B`  — the minimum-norm pre-image, dropping exactly the
+    ///   data-null component that carries no curvature, so the reconstruction
+    ///   `Φ̃ B̃ = Φ Q Qᵀ B = Φ B_range` is the rank-`r` oracle,
+    /// * roughness Gram `S̃ = Qᵀ S Q` (`smooth_penalty`, `smooth_penalty_raw`),
+    /// * evaluator → `SubspaceReducedEvaluator(inner, Q)` so the reduction
+    ///   *survives* every `refresh_basis` re-evaluation.
+    ///
+    /// Requires an installed analytic second-jet evaluator (so the wrapper can
+    /// compose the jets); a caller-managed atom (no evaluator) is left
+    /// untouched. `Q` with `r == M` and `Q == I` is the well-conditioned case
+    /// and the caller should skip the reduction entirely so that path stays
+    /// byte-for-byte unchanged.
+    pub fn reduce_basis_to_subspace(&mut self, q: &Array2<f64>) -> Result<(), String> {
+        let m = self.basis_size();
+        if q.nrows() != m {
+            return Err(format!(
+                "SaeManifoldAtom::reduce_basis_to_subspace: column map has {} rows, basis width {m}",
+                q.nrows()
+            ));
+        }
+        let r = q.ncols();
+        if r == 0 || r > m {
+            return Err(format!(
+                "SaeManifoldAtom::reduce_basis_to_subspace: invalid retained rank {r} (basis width {m})"
+            ));
+        }
+        let Some(inner) = self.basis_second_jet.clone() else {
+            return Err(
+                "SaeManifoldAtom::reduce_basis_to_subspace: requires an analytic second-jet \
+                 evaluator to compose the reduced jets"
+                    .to_string(),
+            );
+        };
+        let p = self.output_dim();
+        let d = self.latent_dim;
+        // Φ̃ = Φ Q  (n × r).
+        let phi_red = self.basis_values.dot(q);
+        // ∂Φ̃[:, :, a] = (∂Φ[:, :, a]) Q  for each latent axis a.
+        let n = self.n_obs();
+        let mut jac_red = Array3::<f64>::zeros((n, r, d));
+        for axis in 0..d {
+            let slice = self.basis_jacobian.slice(s![.., .., axis]).to_owned();
+            let reduced = slice.dot(q);
+            for row in 0..n {
+                for col in 0..r {
+                    jac_red[[row, col, axis]] = reduced[[row, col]];
+                }
+            }
+        }
+        // B̃ = Qᵀ B  (r × p): the minimum-norm pre-image onto range(Q).
+        let dec_red = q.t().dot(&self.decoder_coefficients);
+        if dec_red.dim() != (r, p) {
+            return Err(format!(
+                "SaeManifoldAtom::reduce_basis_to_subspace: reduced decoder dim {:?} != ({r}, {p})",
+                dec_red.dim()
+            ));
+        }
+        // S̃ = Qᵀ S Q  (r × r) on both the raw and the (re-derived) effective Gram.
+        let s_raw_red = q.t().dot(&self.smooth_penalty_raw).dot(q);
+        let order = smooth_penalty_nullity(&s_raw_red)?;
+        let reduced_eval = SubspaceReducedEvaluator::new(inner, q.clone())?;
+        let reduced_arc: Arc<dyn SaeBasisSecondJet> = Arc::new(reduced_eval);
+        let base: Arc<dyn SaeBasisEvaluator> = reduced_arc.clone();
+
+        self.basis_values = phi_red;
+        self.basis_jacobian = jac_red;
+        self.decoder_coefficients = dec_red;
+        self.smooth_penalty_raw = s_raw_red.clone();
+        self.smooth_penalty = s_raw_red;
+        self.smooth_penalty_order = order;
+        self.basis_evaluator = Some(base);
+        self.basis_second_jet = Some(reduced_arc);
+        // The decoder frame is a profiled representation of the *previous* M×p
+        // decoder; the column count just changed, so drop it and let the joint
+        // fit re-activate it for the reduced block if still profitable.
+        self.decoder_frame = None;
+        Ok(())
+    }
+
     pub fn refresh_basis(&mut self, coords: ArrayView2<'_, f64>) -> Result<(), String> {
         // No installed evaluator means the caller is managing the basis
         // out-of-band (the construction-time `phi` / `jet` are authoritative).
@@ -3181,18 +3275,6 @@ pub struct SaeManifoldTerm {
     /// degenerate inner design. Read by [`Self::to_residual_gauge_model`], which
     /// attaches each onto its [`crate::sae_identifiability::FittedAtom`].
     atom_inner_fits: Option<Vec<Option<crate::sae_identifiability::AtomInnerFit>>>,
-    /// #1117 deep fix: per-atom data-null **range reduction** projectors
-    /// `Π_k = N_k N_kᵀ` for any decoder atom whose bare data Gram `G_k` is
-    /// rank-deficient at the spectral cutoff, one entry per [`Self::atoms`].
-    /// `Some(Π_k)` ⇒ atom `k` has a dead column subspace that is deflated
-    /// (unit-stiffness `⊗ I_p`) in the β-tier penalty operator and projected out
-    /// of the converged decoder; `None` ⇒ the full-rank atom keeps the historical
-    /// full-`B` β-tier bit-for-bit. Refreshed once per inner fit by
-    /// [`Self::data_null_decoder_projectors`] (held FIXED across the inner Newton
-    /// iterations so the deflated operator the solve descends and the undamped
-    /// log-det rank the SAME quotient), and read by `assemble_arrow_schur`. Empty
-    /// (`vec![]`) outside an inner fit, which assembly reads as "no deflation".
-    decoder_data_null_projectors: Vec<Option<Array2<f64>>>,
 }
 
 
@@ -3214,7 +3296,6 @@ impl Clone for SaeManifoldTerm {
                 .expected_evidence_gauge_deflated_directions,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
-            decoder_data_null_projectors: self.decoder_data_null_projectors.clone(),
         }
     }
 }

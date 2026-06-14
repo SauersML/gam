@@ -182,7 +182,7 @@ mod tests {
     /// quotient-dimension change and must error loudly (comparing Laplace
     /// normalizers across a changed null-space is meaningless).
     #[test]
-    fn evidence_gauge_deflation_count_guard_tolerates_flicker_rejects_structural_jump() {
+    fn evidence_gauge_deflation_count_guard_rejects_any_change() {
         let mut term = trivial_k1_euclidean_term();
         assert!(term.expected_evidence_gauge_deflated_directions.is_none());
 
@@ -194,24 +194,19 @@ mod tests {
         term.record_evidence_gauge_deflation_count(5).unwrap();
         assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
 
-        // A ±1 flicker (a single near-cutoff per-row H_tt eigenvalue crossing
-        // the spectral floor across the ρ-walk) is tolerated and RE-ANCHORS the
-        // expected count, instead of refusing the seed and dropping the K=1 path
-        // into the slow homotopy cascade (#1117).
-        term.record_evidence_gauge_deflation_count(6).unwrap();
-        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(6));
-        term.record_evidence_gauge_deflation_count(5).unwrap();
-        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
-
-        // A change LARGER than the flicker band is a genuine structural
-        // quotient-dimension event → loud error (#1037 invariant preserved).
+        // #1117: the rank-deficiency that drove a ±1 flicker is removed at the
+        // basis layer, so the strict #1037 guard is restored — ANY change in the
+        // deflation count is a structural quotient-dimension event and must error
+        // (no hysteresis tolerance). A single-step ±1 change is rejected too.
         let err = term
-            .record_evidence_gauge_deflation_count(8)
-            .expect_err("a structural deflation-count jump must error");
+            .record_evidence_gauge_deflation_count(6)
+            .expect_err("any deflation-count change must error under the strict guard");
         assert!(
             err.contains("deflation count changed"),
             "guard must report the quotient-dimension change explicitly; got: {err}"
         );
+        // The expected count is NOT re-anchored on a refusal.
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
     }
 
     /// The identity-homotopy shortcut's structural probe: the η dial is inert
@@ -2072,23 +2067,26 @@ mod tests {
     /// directions at unit stiffness (no ρ-dependent flat valley), and (b) so the
     /// converged decoder is projected onto `range(G_k)` (the rank-`r` oracle).
     ///
-    /// (a) Well-conditioned reduction + (b) rank-`r` oracle match: a decoder whose
-    /// data Gram drops one direction must yield a projector that, when subtracted,
-    /// pins the decoder's dead-direction component to zero (= the fit those
-    /// columns being absent would give) while leaving the data-fit reconstruction
-    /// untouched.
+    /// #1117 root-cause fix: a fixed-depth `M = 5` periodic circle decoder whose
+    /// data DOES NOT excite the top (2nd-harmonic) pair must be REPARAMETRIZED at
+    /// fit entry onto the data-supported subspace — the design becomes full-rank
+    /// (adaptive depth `r = 3 < M = 5`), the reconstruction is preserved (rank-`r`
+    /// oracle), and the basis re-evaluates at the reduced width (the reduction
+    /// survives refresh).
     #[test]
-    fn data_null_projector_reduces_rank_deficient_circle_decoder_to_oracle() {
-        // Collapse the latent coordinate onto TWO distinct angles: the three
-        // periodic columns `[1, sin, cos]` then span a rank-2 data subspace, so
-        // exactly ONE direction is data-null (`rank 2/3`). This is the generic
-        // degeneracy the OLMo circle exhibits (one fewer harmonic excited than
-        // the basis carries), reduced to the minimal `M = 3` reproducer.
-        let coords = array![[0.2], [0.7], [0.2], [0.7]];
-        let (phi, jet) = periodic_basis(&coords);
-        let penalty = Array2::<f64>::eye(3);
-        // A decoder with a deliberate component along the data-null direction.
-        let decoder = array![[0.05], [-0.05], [0.05]];
+    fn rank_revealing_reduction_collapses_unexcited_circle_harmonic_to_full_rank() {
+        // Build the full M = 5 periodic basis `[1, sin2πt, cos2πt, sin4πt, cos4πt]`
+        // from its evaluator, then collapse the latent coordinate onto THREE
+        // distinct phases. The first-harmonic columns `[1, sin2πt, cos2πt]` span a
+        // rank-3 data subspace; with only three phases the 2nd-harmonic pair adds
+        // no new data direction, so the bare data Gram is `rank 3/5` — exactly the
+        // OLMo `stage1-step0` deficiency reduced to a minimal reproducer.
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+        let coords = array![[0.1], [0.45], [0.8], [0.1], [0.45], [0.8]];
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        assert_eq!(phi.ncols(), 5, "fixed-depth circle basis emits M = 5 columns");
+        let penalty = Array2::<f64>::eye(5);
+        let decoder = array![[0.05], [-0.05], [0.05], [0.02], [-0.02]];
         let atom = SaeManifoldAtom::new(
             "periodic",
             SaeAtomBasisKind::Periodic,
@@ -2098,115 +2096,136 @@ mod tests {
             decoder.clone(),
             penalty,
         )
-        .unwrap();
+        .unwrap()
+        .with_basis_second_jet(evaluator.clone());
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-            Array2::<f64>::ones((4, 1)),
-            vec![coords],
+            Array2::<f64>::ones((6, 1)),
+            vec![coords.clone()],
             vec![LatentManifold::Circle { period: 1.0 }],
             AssignmentMode::softmax(0.7),
         )
         .unwrap();
         let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
 
-        let projectors = term.data_null_decoder_projectors();
-        let proj = projectors[0]
-            .as_ref()
-            .expect("rank-deficient circle decoder must yield a data-null projector");
-
-        // (a) The projector is a genuine non-trivial orthogonal projector onto the
-        // data-null subspace: symmetric, idempotent, and rank ≥ 1.
-        let pp = proj.dot(proj);
-        for i in 0..3 {
-            for j in 0..3 {
-                assert!(
-                    (proj[[i, j]] - proj[[j, i]]).abs() < 1e-9,
-                    "projector must be symmetric",
-                );
-                assert!(
-                    (pp[[i, j]] - proj[[i, j]]).abs() < 1e-7,
-                    "projector must be idempotent (Π² = Π); got Π²[{i},{j}]={} Π={}",
-                    pp[[i, j]],
-                    proj[[i, j]],
-                );
-            }
-        }
-        let proj_trace: f64 = (0..3).map(|i| proj[[i, i]]).sum();
-        assert!(
-            (proj_trace - 1.0).abs() < 1e-6,
-            "exactly one direction is data-null here, so tr(Π) = 1; got {proj_trace}",
-        );
-
-        // (b) Projecting the decoder onto range(G_k) leaves the data-fit
-        // reconstruction `Φ·B` unchanged (the dead direction carries no data
-        // signal) while removing the null component.
         let recon_before = phi.dot(&decoder);
-        term.project_decoder_onto_data_range(&projectors);
-        let reduced = term.atoms[0].decoder_coefficients.clone();
-        let recon_after = phi.dot(&reduced);
+        term.reduce_atoms_to_data_supported_rank().unwrap();
+
+        // (a) The design is now full-rank BY CONSTRUCTION: adaptive depth r = 3 < 5.
+        let r = term.atoms[0].basis_size();
+        assert_eq!(
+            r, 3,
+            "rank-revealing reduction must drop the unexcited harmonic (r = 3 < M = 5)",
+        );
+        assert_eq!(term.atoms[0].decoder_coefficients.nrows(), 3);
+        assert_eq!(term.atoms[0].basis_jacobian.dim(), (6, 3, 1));
+        assert_eq!(term.atoms[0].smooth_penalty.dim(), (3, 3));
+
+        // The reduced data Gram is full rank (no eigenvalue at the spectral floor).
+        use crate::linalg::faer_ndarray::FaerEigh;
+        let reduced_design = term.atoms[0].basis_values.clone();
+        let gram = reduced_design.t().dot(&reduced_design);
+        let (evals, _) = gram.eigh(faer::Side::Lower).unwrap();
+        let max_eig = evals.iter().cloned().fold(0.0_f64, f64::max);
+        for &lam in evals.iter() {
+            assert!(
+                lam > 1e-9 * max_eig,
+                "reduced design Gram must be full rank; got eigenvalue {lam} (max {max_eig})",
+            );
+        }
+
+        // (b) Rank-`r` oracle: the reduced reconstruction `Φ̃ B̃` equals the
+        // original data fit (the dropped direction carried no data signal).
+        let recon_after = reduced_design.dot(&term.atoms[0].decoder_coefficients);
         for i in 0..recon_before.nrows() {
             assert!(
                 (recon_before[[i, 0]] - recon_after[[i, 0]]).abs() < 1e-9,
-                "range projection must not change the data-fit reconstruction at \
-                 row {i}: before={} after={}",
+                "reduction must not change the data-fit reconstruction at row {i}: \
+                 before={} after={}",
                 recon_before[[i, 0]],
                 recon_after[[i, 0]],
             );
         }
-        // The reduced decoder has zero component along the data-null subspace
-        // (`Π·B_reduced ≈ 0`): it equals the rank-`r` oracle.
-        let null_component = proj.dot(&reduced);
-        let null_norm: f64 = null_component.iter().map(|v| v * v).sum::<f64>().sqrt();
-        assert!(
-            null_norm < 1e-9,
-            "reduced decoder must have no data-null component (rank-r oracle); \
-             got ‖Π·B‖ = {null_norm}",
+
+        // (c) The reduction SURVIVES refresh: re-evaluating the wrapped evaluator
+        // at the same coords re-emits the reduced r = 3 columns, not the full 5.
+        let (refreshed, _) = term.atoms[0]
+            .basis_evaluator
+            .as_ref()
+            .unwrap()
+            .evaluate(coords.view())
+            .unwrap();
+        assert_eq!(
+            refreshed.ncols(),
+            3,
+            "the SubspaceReducedEvaluator must re-emit the reduced width on refresh",
         );
+        for i in 0..refreshed.nrows() {
+            for j in 0..3 {
+                assert!(
+                    (refreshed[[i, j]] - reduced_design[[i, j]]).abs() < 1e-12,
+                    "refresh must reproduce the reduced design bit-for-bit",
+                );
+            }
+        }
     }
 
     /// Companion to the #1117 reduction test: a FULL-rank data Gram (the
-    /// `base`/`step_2300` regime) must produce NO projector (`None`), so the
-    /// well-conditioned fit takes the historical full-`B` path bit-for-bit and the
-    /// decoder is never perturbed.
+    /// `base`/`step_2300` regime) must be left UNTOUCHED — the well-conditioned
+    /// fit keeps its full harmonic depth, decoder, penalty, and evaluator
+    /// bit-for-bit (no reparametrization).
     #[test]
-    fn full_rank_data_gram_yields_no_data_null_projector() {
-        // Three distinct coordinates → the three periodic columns are linearly
+    fn full_rank_circle_design_keeps_full_harmonic_depth_unchanged() {
+        // Five distinct coordinates → the five periodic columns are linearly
         // independent in the data → bare data Gram is full rank.
-        let coords = array![[0.1], [0.45], [0.8]];
-        let (phi, jet) = periodic_basis(&coords);
-        let penalty = Array2::<f64>::eye(3);
-        let decoder = array![[0.05], [-0.05], [0.05]];
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+        let coords = array![[0.05], [0.27], [0.46], [0.68], [0.91]];
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let penalty = Array2::<f64>::eye(5);
+        let decoder = array![[0.05], [-0.05], [0.05], [0.02], [-0.02]];
         let atom = SaeManifoldAtom::new(
             "periodic",
             SaeAtomBasisKind::Periodic,
             1,
-            phi,
+            phi.clone(),
             jet,
             decoder.clone(),
             penalty,
         )
-        .unwrap();
+        .unwrap()
+        .with_basis_second_jet(evaluator.clone());
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-            Array2::<f64>::ones((3, 1)),
+            Array2::<f64>::ones((5, 1)),
             vec![coords],
             vec![LatentManifold::Circle { period: 1.0 }],
             AssignmentMode::softmax(0.7),
         )
         .unwrap();
         let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
-        let projectors = term.data_null_decoder_projectors();
-        assert!(
-            projectors[0].is_none(),
-            "a full-rank, well-conditioned decoder must yield NO data-null \
-             projector (the base/step_2300 path is unchanged)",
+        term.reduce_atoms_to_data_supported_rank().unwrap();
+
+        // Full harmonic depth retained: width, decoder, and basis values are all
+        // bit-for-bit the historical full-`B` path.
+        assert_eq!(
+            term.atoms[0].basis_size(),
+            5,
+            "a full-rank circle design must keep all 5 harmonic columns",
         );
-        // And the decoder is bit-for-bit untouched by the (no-op) projection.
-        term.project_decoder_onto_data_range(&projectors);
+        let after_phi = &term.atoms[0].basis_values;
+        for i in 0..5 {
+            for j in 0..5 {
+                assert_eq!(
+                    after_phi[[i, j]],
+                    phi[[i, j]],
+                    "full-rank basis must be unchanged by the (no-op) reduction",
+                );
+            }
+        }
         let after = &term.atoms[0].decoder_coefficients;
-        for i in 0..3 {
+        for i in 0..5 {
             assert_eq!(
                 after[[i, 0]],
                 decoder[[i, 0]],
-                "full-rank decoder must be unchanged by the range projection",
+                "full-rank decoder must be unchanged by the (no-op) reduction",
             );
         }
     }

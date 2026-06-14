@@ -1549,3 +1549,214 @@ impl SaeBasisThirdJet for EuclideanPatchEvaluator {
         Ok(t3)
     }
 }
+
+/// Rank-revealing subspace reparametrization of an inner basis evaluator.
+///
+/// Issue #1117: a decoder basis (e.g. [`PeriodicHarmonicEvaluator`]) emits a
+/// *fixed* number of columns `M` independent of the data, so on a
+/// near-degenerate checkpoint the higher columns are unexcited and the
+/// decoder design `Φ` is rank-deficient by construction (the OLMo
+/// `stage1-step0` PCA-32 circle: data Gram rank `3/5`, the 2nd-harmonic pair
+/// dead). A rank-deficient design leaves the inner solve conditioned only by
+/// ridges/deflation and flattens the outer REML surface, stalling BFGS.
+///
+/// This wrapper makes the design **full-rank by construction**: the
+/// data-supported subspace of the inner basis is discovered ONCE at fit entry
+/// (the eigenvectors of the weighted data Gram `G = Φᵀ W Φ` whose eigenvalue
+/// clears the relative spectral cutoff) and frozen into an orthonormal column
+/// map `Q ∈ ℝ^{M × r}` (`r = rank(G) ≤ M`). The wrapped evaluator then emits
+/// the reduced design `Φ̃ = Φ Q` (and its jets `∂Φ̃ = (∂Φ) Q`, …) on every
+/// refresh, so the reduction *survives* re-evaluation — unlike a step-time
+/// projector, which the evaluator's next `evaluate` overwrites.
+///
+/// Because `Q` is a fixed linear remix of the inner columns, the reduced basis
+/// is exactly as smooth as the inner one and every derivative composes by the
+/// same right-multiply: `∂^g Φ̃ = (∂^g Φ) Q`, contracting only the basis
+/// (column) axis. The retained columns span exactly the data-identified part of
+/// the inner basis; the smooth/REML penalty then shrinks within that span and
+/// is never asked to identify a direction the data cannot see.
+///
+/// When the inner Gram is full rank (`r == M`, the `base`/`step_2300` case),
+/// the fit-entry installer skips the wrap entirely and the inner evaluator is
+/// used unchanged, so the well-conditioned path is byte-identical.
+#[derive(Debug, Clone)]
+pub struct SubspaceReducedEvaluator {
+    inner: Arc<dyn SaeBasisSecondJet>,
+    /// `(M × r)` orthonormal column map onto the data-supported subspace.
+    q: Array2<f64>,
+}
+
+impl SubspaceReducedEvaluator {
+    /// Wrap `inner` with the column map `q` (`M_inner × r`, `r ≤ M_inner`). The
+    /// retained width is `q.ncols()`. The columns of `q` are expected to be
+    /// orthonormal (the eigenvectors of a symmetric data Gram); orthonormality
+    /// is not re-checked here — it is the caller's contract at fit entry.
+    pub fn new(inner: Arc<dyn SaeBasisSecondJet>, q: Array2<f64>) -> Result<Self, String> {
+        if q.nrows() == 0 || q.ncols() == 0 {
+            return Err(format!(
+                "SubspaceReducedEvaluator: column map must be non-empty; got {:?}",
+                q.dim()
+            ));
+        }
+        if q.ncols() > q.nrows() {
+            return Err(format!(
+                "SubspaceReducedEvaluator: retained rank {} exceeds inner basis width {}",
+                q.ncols(),
+                q.nrows()
+            ));
+        }
+        Ok(Self { inner, q })
+    }
+
+    /// Inner basis width `M` (the wrapped evaluator's column count).
+    pub fn inner_width(&self) -> usize {
+        self.q.nrows()
+    }
+
+    /// Retained (data-supported) width `r`.
+    pub fn reduced_width(&self) -> usize {
+        self.q.ncols()
+    }
+
+    fn check_inner_width(&self, got: usize, what: &str) -> Result<(), String> {
+        if got != self.q.nrows() {
+            return Err(format!(
+                "SubspaceReducedEvaluator::{what}: inner evaluator returned width {got}, \
+                 column map expects {}",
+                self.q.nrows()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Right-multiply the basis (column) axis of a per-row value matrix
+/// `phi` (`n × M`) by `q` (`M × r`), returning `(n × r)`.
+fn remix_cols_2(phi: &Array2<f64>, q: &Array2<f64>) -> Array2<f64> {
+    phi.dot(q)
+}
+
+/// Right-multiply the basis axis of a jet `jet[n, M, ..]` by `q` (`M × r`),
+/// returning the same trailing shape with the basis axis reduced to `r`. The
+/// trailing derivative axes are flattened, the `(M)`→`(r)` remix applied as one
+/// matmul, then reshaped back; this is the exact `∂^g Φ̃ = (∂^g Φ) Q` contract.
+fn remix_cols_along_basis(
+    jet: ndarray::ArrayViewD<'_, f64>,
+    q: &Array2<f64>,
+) -> Result<ndarray::ArrayD<f64>, String> {
+    let shape = jet.shape().to_vec();
+    if shape.len() < 2 {
+        return Err(format!(
+            "SubspaceReducedEvaluator: jet must have at least (n, M) axes; got {shape:?}"
+        ));
+    }
+    let n = shape[0];
+    let m = shape[1];
+    if m != q.nrows() {
+        return Err(format!(
+            "SubspaceReducedEvaluator: jet basis axis {m} != column-map rows {}",
+            q.nrows()
+        ));
+    }
+    let r = q.ncols();
+    let trailing: usize = shape[2..].iter().product::<usize>().max(1);
+    let mut out_shape = shape.clone();
+    out_shape[1] = r;
+    // Flatten the trailing derivative axes so the remix is a single
+    // `(M)→(r)` contraction over the basis axis for every (row, trailing) fiber.
+    // `to_owned()` produces a standard (row-major contiguous) layout, so the
+    // flatten and the final reshape back to `out_shape` are exact.
+    let jet_std = jet.to_owned();
+    let jet_flat = jet_std
+        .to_shape((n, m, trailing))
+        .map_err(|err| format!("SubspaceReducedEvaluator: jet reshape failed: {err}"))?;
+    let mut out_flat = Array3::<f64>::zeros((n, r, trailing));
+    for row in 0..n {
+        for t in 0..trailing {
+            for rc in 0..r {
+                let mut acc = 0.0_f64;
+                for mc in 0..m {
+                    acc += jet_flat[[row, mc, t]] * q[[mc, rc]];
+                }
+                out_flat[[row, rc, t]] = acc;
+            }
+        }
+    }
+    let out = out_flat
+        .into_shape_with_order(ndarray::IxDyn(&out_shape))
+        .map_err(|err| format!("SubspaceReducedEvaluator: out reshape failed: {err}"))?;
+    Ok(out)
+}
+
+impl SaeBasisEvaluator for SubspaceReducedEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        if n_basis != self.q.ncols() {
+            return Err(format!(
+                "SubspaceReducedEvaluator::phi_eta_split: n_basis {n_basis} != reduced width {}",
+                self.q.ncols()
+            ));
+        }
+        // A reduced column is "curved" iff its data-supported direction draws on
+        // any curved inner column. `Q[:, rc]` mixes inner columns; the reduced
+        // column carries curvature when `Q[curved_inner, rc]` is non-zero.
+        let inner_split = self.inner.phi_eta_split(self.q.nrows())?;
+        let mut inner_curved = vec![false; self.q.nrows()];
+        for &col in &inner_split.curved_cols {
+            if col < inner_curved.len() {
+                inner_curved[col] = true;
+            }
+        }
+        let mut curved = vec![false; self.q.ncols()];
+        for rc in 0..self.q.ncols() {
+            for mc in 0..self.q.nrows() {
+                if inner_curved[mc] && self.q[[mc, rc]] != 0.0 {
+                    curved[rc] = true;
+                    break;
+                }
+            }
+        }
+        Ok(PhiEtaSplit::from_curved_mask(curved))
+    }
+
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        match self.inner.third_jet_dyn(coords) {
+            Some(Ok(t3)) => {
+                if let Err(err) = self.check_inner_width(t3.shape()[1], "third_jet_dyn") {
+                    return Some(Err(err));
+                }
+                Some(
+                    remix_cols_along_basis(t3.view().into_dyn(), &self.q).and_then(|out| {
+                        out.into_dimensionality::<ndarray::Ix5>()
+                            .map_err(|err| format!("SubspaceReducedEvaluator: third jet dim: {err}"))
+                    }),
+                )
+            }
+            Some(Err(err)) => Some(Err(err)),
+            None => None,
+        }
+    }
+
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        let (phi, jet) = self.inner.evaluate(coords)?;
+        self.check_inner_width(phi.ncols(), "evaluate")?;
+        let phi_red = remix_cols_2(&phi, &self.q);
+        let jet_red = remix_cols_along_basis(jet.view().into_dyn(), &self.q)?
+            .into_dimensionality::<ndarray::Ix3>()
+            .map_err(|err| format!("SubspaceReducedEvaluator: jet dim: {err}"))?;
+        Ok((phi_red, jet_red))
+    }
+}
+
+impl SaeBasisSecondJet for SubspaceReducedEvaluator {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
+        let h = self.inner.second_jet(coords)?;
+        self.check_inner_width(h.shape()[1], "second_jet")?;
+        remix_cols_along_basis(h.view().into_dyn(), &self.q)?
+            .into_dimensionality::<ndarray::Ix4>()
+            .map_err(|err| format!("SubspaceReducedEvaluator: second jet dim: {err}"))
+    }
+}

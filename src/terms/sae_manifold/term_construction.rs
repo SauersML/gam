@@ -51,7 +51,6 @@ impl SaeManifoldTerm {
             expected_evidence_gauge_deflated_directions: None,
             hybrid_split_report: None,
             atom_inner_fits: None,
-            decoder_data_null_projectors: Vec::new(),
         })
     }
 
@@ -2688,32 +2687,11 @@ impl SaeManifoldTerm {
         // path, so this is a zero-cost capture there.
         let mut smooth_scaled_s: Vec<Array2<f64>> = Vec::with_capacity(self.atoms.len());
         let mut smooth_grad_gb = vec![0.0_f64; beta_dim];
-        // #1117 deep fix — per-atom data-null **range reduction** deflation. When
-        // the inner fit detected a rank-deficient decoder design for atom `k`, its
-        // projector `Π_k = N_k N_kᵀ` (`M_k × M_k`) onto the dead column subspace is
-        // held in `decoder_data_null_projectors`. Adding `Π_k ⊗ I_p` (unit
-        // stiffness) to the β-tier penalty operator makes the dead direction's
-        // curvature exactly `+1` — bounding the inner Newton step AND giving it a
-        // ρ-independent `log 1 = 0` evidence contribution (no flat valley), while
-        // leaving every identified direction (`Π_k v = 0`) untouched. Empty / all-
-        // `None` (full-rank, or any assembly outside an inner fit) ⇒ the historical
-        // β-tier is bit-for-bit unchanged. Captured per atom here so BOTH the
-        // full-`B` and the factored (#972) branches can emit it in their own
-        // coordinate layout below.
-        // Scaled by `penalty_scale` exactly like the smooth penalty so a
-        // streaming (multi-chunk) evidence pass sums the per-chunk deflations to
-        // ONE global unit-stiffness copy (`Σ_chunks penalty_scale = 1`); the dense
-        // single-chunk path has `penalty_scale == 1.0`, so `Π_k` is applied at
-        // full unit stiffness there.
-        let data_null_projectors: Vec<Option<Array2<f64>>> =
-            self.decoder_data_null_projectors.clone();
-        let atom_data_null = |atom_idx: usize, m: usize| -> Option<Array2<f64>> {
-            data_null_projectors
-                .get(atom_idx)
-                .and_then(|p| p.as_ref())
-                .filter(|proj| proj.dim() == (m, m))
-                .map(|proj| proj * penalty_scale)
-        };
+        // #1117 — rank deficiency is handled at the basis layer: any
+        // rank-deficient atom was reparametrized onto its data-supported subspace
+        // at fit entry (`reduce_atoms_to_data_supported_rank`), so the β-tier here
+        // always sees a full-rank design and needs no step-time data-null
+        // deflation operator. The well-conditioned (full-rank) path is unchanged.
         // Per-atom smoothness-gradient GEMMs `½(S_k+S_kᵀ)·B_k` are independent
         // across atoms; batch them across ALL GPUs (uniform-shape tiles) and
         // scale by `lambda_smooth` below. `symmetrize = true` reproduces the
@@ -2753,17 +2731,6 @@ impl SaeManifoldTerm {
                 global_offset: off,
                 k: beta_dim,
             }));
-            // #1117 — full-`B` data-null deflation `Π_k ⊗ I_p` at this atom's β
-            // offset. Only emitted when atom `k` is rank-deficient; the factored
-            // (#972) branch re-emits the same projector at the factored offset.
-            if let Some(proj) = atom_data_null(atom_idx, m) {
-                smooth_ops.push(Arc::new(IdentityRightKroneckerPenaltyOp {
-                    factor_a: proj,
-                    p,
-                    global_offset: off,
-                    k: beta_dim,
-                }));
-            }
             // Retain `λ S_k` for the factored rebuild (no-op cost on full-`B`).
             smooth_scaled_s.push(scaled_s);
         }
@@ -3769,19 +3736,6 @@ impl SaeManifoldTerm {
                     global_offset: off_c[k],
                     k: border_dim,
                 }));
-                // #1117 — factored-space data-null deflation `Π_k ⊗ I_{r_k}`. The
-                // projector lives on the basis-column (`M_k`) axis, which the
-                // output frame leaves intact, so it is emitted with the factored
-                // right dimension `r_k` and offset `off_C[k]`. No-op for full-rank
-                // atoms (`None`).
-                if let Some(proj) = atom_data_null(k, basis_sizes[k]) {
-                    ops.push(Arc::new(IdentityRightKroneckerPenaltyOp {
-                        factor_a: proj,
-                        p: r,
-                        global_offset: off_c[k],
-                        k: border_dim,
-                    }));
-                }
             }
             ops.push(Arc::new(data_op));
             // Analytic Beta-tier penalty: project the dense full-`B` `hbb` block
@@ -3861,23 +3815,12 @@ impl SaeManifoldTerm {
                 .iter()
                 .enumerate()
                 .map(|(atom_idx, factor_a)| {
-                    // #1117 — fold the data-null deflation `Π_k` into the device
-                    // PCG smooth block so the device matvec applies the SAME
-                    // `(λ S_k + Π_k) ⊗ I_p` operator the CPU CompositePenaltyOp
-                    // and the undamped evidence factor use. No-op for full-rank
-                    // atoms (`atom_data_null` returns `None`).
-                    let m = factor_a.nrows();
-                    let mut block = factor_a.clone();
-                    if let Some(proj) = atom_data_null(atom_idx, m) {
-                        for i in 0..m {
-                            for j in 0..m {
-                                block[[i, j]] += proj[[i, j]];
-                            }
-                        }
-                    }
+                    // #1117 — rank deficiency is removed at the basis layer, so the
+                    // device PCG smooth block is just `λ S_k ⊗ I_p` (full-rank
+                    // design); no data-null deflation is folded in here.
                     DeviceSaeSmoothBlock {
                         global_offset: beta_offsets[atom_idx],
-                        factor_a: block,
+                        factor_a: factor_a.clone(),
                     }
                 })
                 .collect();
@@ -4451,60 +4394,28 @@ impl SaeManifoldTerm {
         Ok((v, loss, cache))
     }
 
-    /// Largest single-step change in the per-row evidence deflation count that is
-    /// treated as a tolerable *flicker* of one (or a few) near-cutoff per-row
-    /// `H_tt` eigenvalues across the ρ-walk, rather than a genuine structural
-    /// quotient-dimension collapse (#1117).
+    /// The #1037 quotient-dimension invariant: the count of gauge-deflated
+    /// evidence directions must be CONSTANT across one optimization, because the
+    /// Laplace normalizer `½log|H|` is only comparable across ρ at a FIXED
+    /// quotient dimension. The first observation pins the expected count; a later
+    /// match is a no-op; ANY change is a structural quotient-dimension event and
+    /// must surface loudly.
     ///
-    /// The #1037 invariant — never compare Laplace normalizers across DIFFERENT
-    /// quotient dimensions — is real, and a large jump (an atom's whole decoder
-    /// block going rank-deficient, several rows flipping at once) must still
-    /// surface loudly. But on near-degenerate real data (OLMo `stage1-step0`,
-    /// post-PCA std ≈ 0.04) a SINGLE row's near-floor `H_tt` eigenvalue crosses
-    /// the spectral-deflation cutoff as ρ/θ move, toggling the summed count by
-    /// ±1 mid-optimization. The previous hard refusal on ANY change rejected the
-    /// seed for that ±1 flicker, dropping the production K=1 path into the slow
-    /// pristine-baseline homotopy seed cascade (~10 min instead of ~65 s) even
-    /// though the converged answer is identical (the deflated direction's
-    /// unit-stiffness contribution is the ρ-independent `log 1 = 0` regardless of
-    /// which side of the cutoff it momentarily lands). We therefore tolerate a
-    /// bounded flicker by RE-ANCHORING the expected count (so subsequent steps
-    /// compare against the current quotient dimension, which is what the live
-    /// factor actually produced) and warning once, while still hard-refusing a
-    /// change larger than this band as the genuine structural event the guard
-    /// exists to catch.
-    const EVIDENCE_DEFLATION_COUNT_FLICKER_TOLERANCE: usize = 1;
-
+    /// The prior ±1 "flicker" tolerance existed only because the rank-deficient
+    /// decoder design (#1117) left a near-cutoff eigenvalue toggling across the
+    /// spectral floor as ρ moved. That cause is gone: rank-deficient atoms are
+    /// now reparametrized onto their data-supported subspace at fit entry
+    /// (`reduce_atoms_to_data_supported_rank`), so the design is full-rank and
+    /// the deflation count is stable. The strict guard is therefore restored —
+    /// no hysteresis band-aid on top of the basis fix.
     fn record_evidence_gauge_deflation_count(&mut self, count: usize) -> Result<(), String> {
         match self.expected_evidence_gauge_deflated_directions {
             Some(expected) if expected == count => Ok(()),
-            Some(expected) => {
-                let delta = expected.abs_diff(count);
-                if delta > Self::EVIDENCE_DEFLATION_COUNT_FLICKER_TOLERANCE {
-                    // Genuine structural quotient-dimension event: too many rows
-                    // changed deflation state at once to be a single near-cutoff
-                    // eigenvalue's flicker. Refuse to compare across it (#1037).
-                    return Err(format!(
-                        "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count \
-                         changed by {delta} within one optimization (expected {expected}, got \
-                         {count}); this is a structural quotient-dimension event, refusing to \
-                         compare Laplace normalizers"
-                    ));
-                }
-                // Bounded ±1 flicker of a near-cutoff per-row H_tt eigenvalue:
-                // re-anchor to the live count and continue (the converged fit is
-                // unchanged — the deflated direction contributes the ρ-independent
-                // log 1 = 0 to the evidence either way). Re-anchoring keeps the
-                // production K=1 path off the slow seed-refusal homotopy cascade
-                // (#1117) while still catching a real structural collapse above.
-                log::warn!(
-                    "SaeManifoldTerm::reml_criterion: per-row evidence deflation count flickered \
-                     {expected}->{count} (a single near-cutoff H_tt eigenvalue crossing the \
-                     spectral floor across the ρ-walk); re-anchoring the quotient dimension"
-                );
-                self.expected_evidence_gauge_deflated_directions = Some(count);
-                Ok(())
-            }
+            Some(expected) => Err(format!(
+                "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count changed \
+                 from {expected} to {count} within one optimization; this is a structural \
+                 quotient-dimension event, refusing to compare Laplace normalizers"
+            )),
             None => {
                 self.expected_evidence_gauge_deflated_directions = Some(count);
                 Ok(())
@@ -5293,13 +5204,10 @@ impl SaeManifoldTerm {
                 .map(|coord| coord.as_matrix().slice(s![start..end, ..]).to_owned())
                 .collect();
             let mut chunk = self.materialize_chunk(chunk_logits, chunk_coords)?;
-            // #1117 — the data-null deflation projectors `Π_k` are a GLOBAL
-            // property of the full-design data Gram (accumulated over all rows),
-            // so each chunk carries the same global projectors; `assemble_arrow_
-            // schur_scaled` scales them by this chunk's `penalty_scale` so the
-            // per-chunk unit-stiffness deflations sum to one global copy in the
-            // streaming evidence log-det, matching the dense single-chunk path.
-            chunk.decoder_data_null_projectors = self.decoder_data_null_projectors.clone();
+            // #1117 — rank deficiency is removed at the basis layer at fit entry
+            // (`reduce_atoms_to_data_supported_rank`), so each chunk inherits the
+            // already-reduced full-rank atoms via `materialize_chunk`; there are
+            // no global deflation projectors to propagate.
             // #991: chunk terms inherit the row's design honesty weight slice
             // (global mean-1 normalization preserved — NOT re-normalized per
             // chunk — so the per-chunk sums reconstruct the global weighted

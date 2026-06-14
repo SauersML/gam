@@ -2432,66 +2432,46 @@ impl SaeManifoldTerm {
         Ok(last_loss)
     }
 
-    /// Per-atom data-null **range reduction projector** for a rank-deficient
-    /// decoder design (#1117 deep fix, the rung past the #1051 LM ridge).
+    /// Rank-revealing adaptive basis depth for rank-deficient decoder designs
+    /// (#1117 root-cause fix; supersedes the prior data-null projector deflation
+    /// + post-fit range projection and the #1051 LM ridge for this case).
     ///
     /// On a near-degenerate input manifold (e.g. the OLMo L25 PCA-32 circle, or
-    /// the `stage1-step0` checkpoint with post-PCA std ≈ 0.04) the latent
-    /// coordinate collapses so that two of the periodic atom's `M_k = 5` basis
-    /// columns are linearly dependent IN THE DATA: the bare data Gram
-    /// `G_k = D_kᵀ D_k` is rank-deficient (`rank 3/5`, the `[SAE-AUDIT]` signal).
-    /// WHICH 2-d subspace dies is data-dependent — it is whatever combination of
-    /// `[1, sin 2πt, cos 2πt, sin 4πt, cos 4πt]` the fitted `t` and assignment
-    /// weights fail to excite (typically the 2nd-harmonic pair, but never a fixed
-    /// set), so a basis-construction fix that emits fewer columns is wrong; the
-    /// dead subspace must be discovered from the data Gram each assembly.
+    /// the `stage1-step0` checkpoint with post-PCA std ≈ 0.04) the fitted latent
+    /// coordinate `t` plus the assignment weights fail to excite the full
+    /// fixed-width periodic basis `[1, sin 2πt, cos 2πt, sin 4πt, cos 4πt]`: the
+    /// bare data Gram `G_k = D_kᵀ D_k` is rank-deficient (`rank 3/5`, the
+    /// `[SAE-AUDIT]` signal). WHICH `r_k`-d subspace the data DOES support is
+    /// data-dependent — it is whatever combination of the fixed columns the data
+    /// excites — so we discover it from the Gram rather than truncating a fixed
+    /// set of columns.
     ///
-    /// We compute it by eigendecomposing each symmetrised `G_k` at the standard
-    /// relative spectral cutoff. The eigenvectors BELOW the cutoff span the
-    /// data-null subspace `N_k`; the returned projector is `Π_k = N_k N_kᵀ`
-    /// (`M_k × M_k`, rank `M_k − r_k`). A full-rank `G_k` (`base`/`step_2300`)
-    /// returns `None`, so the assembly keeps the historical full-`B` β-tier
-    /// bit-for-bit.
+    /// We symmetrise each `G_k`, eigendecompose it, and keep the eigenvectors
+    /// ABOVE the relative spectral cutoff as the orthonormal data-supported
+    /// column map `Q_k` (`M_k × r_k`, `r_k = rank(G_k)`). For any rank-deficient
+    /// atom (`r_k < M_k`) we REPARAMETRIZE its basis onto `Q_k`
+    /// ([`SaeManifoldAtom::reduce_basis_to_subspace`]): the design `Φ̃ = Φ Q_k`
+    /// becomes full-rank by construction, the decoder is the rank-`r_k` oracle
+    /// `B̃ = Q_kᵀ B`, the roughness Gram is `Q_kᵀ S Q_k`, and the evaluator is
+    /// wrapped so the reduction survives every basis refresh. The inner solve no
+    /// longer descends a flat valley and the outer REML log-det is well-posed —
+    /// no step-time deflation, ridge floor, or post-fit projection needed for
+    /// the deficiency. The depth decision is made ONCE here, before the outer
+    /// loop, so it is held fixed across the inner Newton walk.
     ///
-    /// The projector is consumed two ways, which TOGETHER are an exact rank-`r_k`
-    /// basis-column reduction without ever rebuilding the basis (the evaluator
-    /// re-emits `M_k` columns every refresh, so a physical column drop cannot
-    /// survive):
-    ///   1. **Conditioning the inner solve & the REML log-det.** One extra
-    ///      `IdentityRightKroneckerPenaltyOp { factor_a: Π_k }` (unit stiffness,
-    ///      `⊗ I_p`) is added to the β-tier penalty operator. It rides the SAME
-    ///      composite op into both the inner Newton Schur solve AND the undamped
-    ///      (`ridge = 0`) evidence factorization. Along an identified direction
-    ///      `Π_k v = 0`, so the well-conditioned block is untouched; along a dead
-    ///      direction `Π_k v = v`, so the curvature becomes exactly `+1` —
-    ///      bounding the Newton step (superseding the #1051 √εmach ridge) and,
-    ///      crucially, making the dead direction's contribution to
-    ///      `log|H + S|` a ρ-INDEPENDENT `+0` (`log 1`) instead of the spurious
-    ///      ρ-dependent `log(λ·s_dead)`. That removes the flat valley the outer
-    ///      BFGS REML criterion saw, exactly as if the dead columns were absent.
-    ///   2. **Pinning the converged fit to the rank-`r_k` oracle.** After the
-    ///      inner solve, `B_k ← (I − Π_k) B_k` projects the decoder onto
-    ///      `range(G_k)`, sending the dead-direction component to its minimum-norm
-    ///      (zero) value. Because the dead directions carry no data curvature this
-    ///      changes the data fit by nothing, and it makes the converged decoder
-    ///      identical to the fit obtained had those columns been physically
-    ///      removed.
-    ///
-    /// This is the Faddeev-Popov unit-stiffness deflation the per-row evidence
-    /// gauge already applies (`factor_gauge_deflated_evidence_row`, κ = 1),
-    /// transplanted to the decoder β-Schur block.
-    fn data_null_decoder_projectors(&self) -> Vec<Option<Array2<f64>>> {
+    /// A full-rank atom (`base`/`step_2300`, `r_k == M_k`) is SKIPPED entirely —
+    /// its basis, decoder, penalty, and evaluator are left byte-for-byte the
+    /// historical full-`B` path, so the well-conditioned fit is unchanged.
+    fn reduce_atoms_to_data_supported_rank(&mut self) -> Result<(), String> {
         let p = self.output_dim();
         if p == 0 || self.beta_dim() == 0 {
-            return vec![None; self.atoms.len()];
+            return Ok(());
         }
         let mut grams = self.empty_decoder_gram_accumulator();
         self.accumulate_decoder_gram(&mut grams);
-        let mut out = Vec::with_capacity(self.atoms.len());
-        for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let m = atom.basis_size();
+        for atom_idx in 0..self.atoms.len() {
+            let m = self.atoms[atom_idx].basis_size();
             if m == 0 || grams[atom_idx].dim() != (m, m) {
-                out.push(None);
                 continue;
             }
             // Symmetrise the bare data Gram `G_k` before the eigendecomposition.
@@ -2505,10 +2485,7 @@ impl SaeManifoldTerm {
             }
             let (evals, evecs) = match data_gram.eigh(Side::Lower) {
                 Ok(pair) => pair,
-                Err(_) => {
-                    out.push(None);
-                    continue;
-                }
+                Err(_) => continue,
             };
             let max_eig = evals.iter().fold(0.0_f64, |acc, &v| {
                 if v.is_finite() {
@@ -2519,73 +2496,50 @@ impl SaeManifoldTerm {
             });
             if !(max_eig > 0.0) {
                 // An all-zero data Gram (no assignment mass) is handled by the
-                // fatal pre-fit audit, not by a column reduction here.
-                out.push(None);
+                // fatal pre-fit audit, not by a basis reduction here.
                 continue;
             }
             let cutoff = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_eig;
-            // Columns of `evecs` whose eigenvalue is at/below the relative cutoff
-            // span the data-null subspace `N_k`. Accumulate `Π_k = N_k N_kᵀ`.
-            let mut projector = Array2::<f64>::zeros((m, m));
-            let mut null_count = 0usize;
-            for eig_idx in 0..evals.len() {
-                let lambda = evals[eig_idx];
-                if lambda.is_finite() && lambda > cutoff {
-                    continue;
-                }
-                null_count += 1;
-                for i in 0..m {
-                    let vi = evecs[[i, eig_idx]];
-                    for j in 0..m {
-                        projector[[i, j]] += vi * evecs[[j, eig_idx]];
-                    }
-                }
-            }
-            if null_count == 0 {
-                out.push(None);
-            } else {
-                out.push(Some(projector));
-            }
-        }
-        out
-    }
-
-    /// Project each rank-deficient atom's decoder coefficients onto
-    /// `range(G_k)` (drop the data-null component) so the converged fit equals
-    /// the rank-`r_k` oracle (#1117). `projectors[k] == Some(Π_k)` ⇒
-    /// `B_k ← (I − Π_k) B_k`; `None` ⇒ untouched (the full-rank atom keeps its
-    /// decoder bit-for-bit). The data-null component carries no data curvature,
-    /// so removing it leaves the reconstruction unchanged while pinning the
-    /// unidentified coordinates to their minimum-norm (zero) value.
-    fn project_decoder_onto_data_range(&mut self, projectors: &[Option<Array2<f64>>]) {
-        let p = self.output_dim();
-        for (atom_idx, projector) in projectors.iter().enumerate() {
-            let Some(proj) = projector else {
-                continue;
-            };
-            let m = self.atoms[atom_idx].basis_size();
-            if m == 0 || proj.dim() != (m, m) {
+            // Eigenvectors whose eigenvalue clears the relative cutoff span the
+            // data-supported subspace `Q_k` (the retained columns).
+            let kept: Vec<usize> = (0..evals.len())
+                .filter(|&idx| {
+                    let lambda = evals[idx];
+                    lambda.is_finite() && lambda > cutoff
+                })
+                .collect();
+            let r = kept.len();
+            // Full rank (`r == m`) → the well-conditioned path; leave it
+            // byte-for-byte unchanged. `r == 0` is a degenerate all-null Gram
+            // that the fatal pre-fit audit already rejects; do not reduce to a
+            // zero-width basis here.
+            if r == m || r == 0 {
                 continue;
             }
-            let atom = &mut self.atoms[atom_idx];
-            // `B_k ← B_k − Π_k B_k`. Π_k is symmetric idempotent, so subtracting
-            // its image leaves only the range(G_k) component.
-            let mut null_part = Array2::<f64>::zeros((m, p));
-            for i in 0..m {
-                for out_col in 0..p {
-                    let mut acc = 0.0_f64;
-                    for j in 0..m {
-                        acc += proj[[i, j]] * atom.decoder_coefficients[[j, out_col]];
-                    }
-                    null_part[[i, out_col]] = acc;
+            // Build the orthonormal column map `Q_k` (M × r) from the retained
+            // eigenvectors. The reduction needs an analytic second-jet evaluator
+            // to compose the reduced jets; atoms without one (caller-managed,
+            // e.g. an out-of-band design) keep the historical projector-free
+            // full-`B` path and rely on the LM ridge — the periodic/torus/
+            // sphere/Duchon production atoms all carry a second jet.
+            if self.atoms[atom_idx].basis_second_jet.is_none() {
+                continue;
+            }
+            let mut q = Array2::<f64>::zeros((m, r));
+            for (col, &eig_idx) in kept.iter().enumerate() {
+                for row in 0..m {
+                    q[[row, col]] = evecs[[row, eig_idx]];
                 }
             }
-            for i in 0..m {
-                for out_col in 0..p {
-                    atom.decoder_coefficients[[i, out_col]] -= null_part[[i, out_col]];
-                }
-            }
+            self.atoms[atom_idx]
+                .reduce_basis_to_subspace(&q)
+                .map_err(|err| {
+                    format!(
+                        "SaeManifoldTerm::reduce_atoms_to_data_supported_rank: atom {atom_idx}: {err}"
+                    )
+                })?;
         }
+        Ok(())
     }
 
     pub fn run_joint_fit_arrow_schur(
@@ -2662,20 +2616,27 @@ impl SaeManifoldTerm {
             self.accumulate_decoder_gram(&mut grams);
             self.finalize_decoder_identifiability_audit(&grams, self.n_obs())?;
         }
-        // #1117 deep fix — rank-`r_k` basis-column reduction of a rank-deficient
-        // decoder design. Discover each atom's data-null subspace `N_k` from the
-        // bare data Gram `G_k` ONCE here and hold it FIXED across the inner Newton
-        // iterations (so the deflated operator the solve descends and the undamped
-        // evidence factorization rank the SAME quotient). `assemble_arrow_schur`
-        // reads these to add a unit-stiffness `Π_k = N_k N_kᵀ` deflation to the
-        // β-tier penalty operator — bounding the Newton step along the dead
-        // direction (superseding the #1051 √εmach ridge) and making its REML
-        // log-det contribution a ρ-independent `log 1 = 0` rather than the
-        // spurious ρ-dependent `log(λ·s_dead)` flat valley. Full-rank atoms get
-        // `None` and ride the historical full-`B` β-tier bit-for-bit. The
-        // converged decoder is projected onto `range(G_k)` after the loop so the
-        // fit equals the rank-`r_k` oracle.
-        self.decoder_data_null_projectors = self.data_null_decoder_projectors();
+        // #1117 root-cause fix — rank-revealing adaptive basis depth. A
+        // fixed-width decoder basis (e.g. the periodic circle's
+        // `[1, sin2πt, cos2πt, sin4πt, cos4πt]`) emits `M_k` columns whether or
+        // not the fitted `t`/assignment excite them; on a near-degenerate
+        // checkpoint (OLMo `stage1-step0` PCA-32: data Gram rank `3/5`) the
+        // unexcited columns make the decoder design rank-deficient BY
+        // CONSTRUCTION, flattening the outer REML surface so BFGS stalls. We
+        // discover the data-supported subspace `Q_k = range(G_k)` ONCE here from
+        // the bare data Gram and, for any rank-deficient atom, REPARAMETRIZE its
+        // basis onto that subspace (`Φ̃ = Φ Q_k`, `B̃ = Q_kᵀ B`, `S̃ = Q_kᵀ S Q_k`,
+        // and a `SubspaceReducedEvaluator` so the reduction survives every
+        // refresh). The reduced design is full-rank, so the inner solve needs no
+        // step-time deflation and the outer REML log-det is well-conditioned —
+        // this SUPERSEDES the prior data-null projector deflation + post-fit
+        // range projection for the rank-deficiency case. Held FIXED across the
+        // inner Newton walk by pinning the basis at entry (the depth decision is
+        // made once, before the loop, exactly like the old projector). A
+        // full-rank atom (`base`/`step_2300`, `r_k == M_k`) is left untouched,
+        // so its design, decoder, and REML criterion are byte-for-byte the
+        // historical full-`B` path.
+        self.reduce_atoms_to_data_supported_rank()?;
         for outer_iteration in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ρ (including the ARD precisions) is owned by the outer engine
@@ -2943,18 +2904,11 @@ impl SaeManifoldTerm {
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             }
         }
-        // #1117 — pin the converged decoder to the rank-`r_k` oracle: drop the
-        // data-null component of every rank-deficient atom's decoder
-        // (`B_k ← (I − Π_k) B_k`). The dead directions carry no data curvature,
-        // so this leaves the reconstruction (and hence the returned loss)
-        // unchanged while sending the unidentified coordinates to their
-        // minimum-norm value — exactly the fit those columns being physically
-        // absent would produce. A no-op for full-rank atoms (`None` projectors).
-        if self.decoder_data_null_projectors.iter().any(Option::is_some) {
-            let projectors = std::mem::take(&mut self.decoder_data_null_projectors);
-            self.project_decoder_onto_data_range(&projectors);
-            self.decoder_data_null_projectors = projectors;
-        }
+        // #1117 — the rank-`r_k` oracle is already pinned: each rank-deficient
+        // atom was reparametrized onto its data-supported subspace at fit entry
+        // (`reduce_atoms_to_data_supported_rank`), so its decoder lives in the
+        // reduced `r_k`-wide coordinate by construction and carries no data-null
+        // component to project away. No post-loop projection is needed.
         // ρ is owned by the outer engine and unchanged here; just return the
         // converged inner loss at the fixed ρ.
         self.loss(target, rho)
