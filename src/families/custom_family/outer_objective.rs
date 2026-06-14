@@ -2781,7 +2781,29 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     })
                     .collect::<Vec<_>>()
             };
-            let all_block_stationarity_small = block_stationarity_norms
+            // Per-block stationarity must be judged on the IDENTIFIED (range-space)
+            // residual, not the raw active-set-projected residual (gam#979). On the
+            // survival I-spline time block the unpenalized affine baseline direction
+            // is a genuine ker(H_pen) gauge mode: the raw per-block residual keeps
+            // the full gradient component along it (the measured ~28 plateau at λ≈1e7
+            // that the absolute tol can never reach), so the raw gate falsely rejects
+            // a solve that IS stationary on every identifiable direction — the
+            // residual mass it sees is the free gauge the outer IFT projects out
+            // (gam#553). Use the range-projected per-block residual when a penalty
+            // null space exists; fall back to the raw per-block residual when it does
+            // not (there range == whole space, so they coincide and the strict gate
+            // is unchanged for every well-identified family).
+            let block_stationarity_for_gate = projected_residual_range_space_per_block_inf(
+                &projected_residual_vec,
+                &joint_hessian_source,
+                &ranges,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+                total_p,
+            )
+            .unwrap_or_else(|| block_stationarity_norms.clone());
+            let all_block_stationarity_small = block_stationarity_for_gate
                 .iter()
                 .zip(&block_stationarity_tolerances)
                 .all(|(norm, tol)| {

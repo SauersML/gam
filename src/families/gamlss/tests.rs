@@ -58,7 +58,7 @@ fn compose_theta_from_hints_test(
     if let Some(v) = mean_log_lambda_hint
         && v.len() == layout.k_mean
     {
-        theta.slice_mut(s![0..layout.mean_end()]).assign(v);
+        theta.slice_mut(s![0..layout.noise_start()]).assign(v);
     }
     if let Some(v) = noise_log_lambda_hint
         && v.len() == layout.k_noise

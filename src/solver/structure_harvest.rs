@@ -721,7 +721,17 @@ fn topology_candidates_for_dim(
             specs.push(TopologyCandidateSpec {
                 kind: AutoTopologyKind::Torus,
                 basis_kind: SaeAtomBasisKind::Torus,
-                manifold: LatentManifold::Euclidean,
+                // T² = S¹ × S¹: each axis is a unit-period circle (the
+                // fraction-of-period convention `TorusHarmonicEvaluator` shares
+                // with the periodic 1-D atom). This MUST match the production
+                // seeding (`AtomTopology::Torus` → Product[Circle, Circle] in
+                // `sae_manifold::atom`); a flat `Euclidean` manifold would leave
+                // the born atom's angles un-wrapped and the joint refit would
+                // retract on the wrong geometry.
+                manifold: LatentManifold::Product(vec![
+                    LatentManifold::Circle { period: 1.0 },
+                    LatentManifold::Circle { period: 1.0 },
+                ]),
                 latent_dim: 2,
                 evaluator: Arc::new(TorusHarmonicEvaluator::new(2, 2)?),
                 coords: coords_d(2),
@@ -729,7 +739,22 @@ fn topology_candidates_for_dim(
             specs.push(TopologyCandidateSpec {
                 kind: AutoTopologyKind::Sphere,
                 basis_kind: SaeAtomBasisKind::Sphere,
-                manifold: LatentManifold::Sphere { dim: 2 },
+                // The `SphereChartEvaluator` is a (lat, lon) intrinsic chart, so
+                // the latent manifold is the 2-D product of a bounded latitude
+                // interval and a wrapped longitude circle — NOT
+                // `LatentManifold::Sphere { dim: 2 }`, which would demand ambient
+                // unit 3-vectors the chart never produces. This matches the
+                // production seeding (`AtomTopology::Sphere` →
+                // Product[Interval(-π/2, π/2), Circle(τ)] in `sae_manifold::atom`).
+                manifold: LatentManifold::Product(vec![
+                    LatentManifold::Interval {
+                        lo: -std::f64::consts::FRAC_PI_2,
+                        hi: std::f64::consts::FRAC_PI_2,
+                    },
+                    LatentManifold::Circle {
+                        period: std::f64::consts::TAU,
+                    },
+                ]),
                 latent_dim: 2,
                 evaluator: Arc::new(SphereChartEvaluator),
                 coords: coords_d(2),

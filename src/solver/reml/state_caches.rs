@@ -228,11 +228,11 @@ pub(crate) const ALO_GRADIENT_MAX_WORK: usize = 4_000_000;
 /// site holds no private H⁻¹ convention.
 pub(crate) struct AloFactoredHessian<'a> {
     /// Dense transformed design `X` (n × p).
-    x: &'a Array2<f64>,
+    pub(crate) x: &'a Array2<f64>,
     /// The fit's sensitivity operator over the stabilized penalized Hessian.
-    sensitivity: &'a crate::solver::sensitivity::FitSensitivity<'a>,
+    pub(crate) sensitivity: &'a crate::solver::sensitivity::FitSensitivity<'a>,
     /// `H⁻¹Xᵀ` (p × n), the column-solve the gradient reuses per observation.
-    h_inv_xt: &'a Array2<f64>,
+    pub(crate) h_inv_xt: &'a Array2<f64>,
 }
 
 pub(crate) fn alo_leverage_barrier(h: f64) -> f64 {
@@ -373,9 +373,9 @@ pub(crate) fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, ene
     }
 }
 
-pub(super) struct PenaltySubspace {
-    evals: Array1<f64>,
-    rank: usize,
+pub(crate) struct PenaltySubspace {
+    pub(crate) evals: Array1<f64>,
+    pub(crate) rank: usize,
 }
 
 pub(crate) struct HyperGradHistoryEntry {
@@ -747,9 +747,9 @@ pub(crate) fn ift_quality_states() -> &'static Mutex<HashMap<usize, IftQualityRu
 
 #[derive(Clone)]
 pub(crate) struct IftModeResponseRuntimeCache {
-    rho: Array1<f64>,
-    rho_mode_response_cols: Option<Array2<f64>>,
-    ext_mode_response_cols: Option<Array2<f64>>,
+    pub(crate) rho: Array1<f64>,
+    pub(crate) rho_mode_response_cols: Option<Array2<f64>>,
+    pub(crate) ext_mode_response_cols: Option<Array2<f64>>,
 }
 
 pub(crate) static IFT_MODE_RESPONSE_CACHES: OnceLock<
@@ -763,11 +763,11 @@ pub(crate) fn ift_mode_response_caches()
 
 #[derive(Clone)]
 pub(crate) struct IftJointModeResponseRuntimeCache {
-    theta: Array1<f64>,
-    rho_dim: usize,
-    beta_original: Array1<f64>,
-    mode_response_cols: Array2<f64>,
-    active_constraints: bool,
+    pub(crate) theta: Array1<f64>,
+    pub(crate) rho_dim: usize,
+    pub(crate) beta_original: Array1<f64>,
+    pub(crate) mode_response_cols: Array2<f64>,
+    pub(crate) active_constraints: bool,
 }
 
 pub(crate) static IFT_JOINT_MODE_RESPONSE_CACHES: OnceLock<
@@ -1603,22 +1603,22 @@ pub(crate) fn finite_nonnegative_bits_or_no_signal(value: Option<f64>) -> u64 {
 }
 
 pub(crate) struct TkCorrectionTerms {
-    value: f64,
-    gradient: Option<Array1<f64>>,
-    hessian: Option<Array2<f64>>,
+    pub(crate) value: f64,
+    pub(crate) gradient: Option<Array1<f64>>,
+    pub(crate) hessian: Option<Array2<f64>>,
 }
 
 pub(crate) struct TkSharedIntermediates {
-    h_diag: Array1<f64>,
-    x_m: Array1<f64>,
-    y: Array1<f64>,
-    active_blocks: Vec<TkActiveBlock>,
+    pub(crate) h_diag: Array1<f64>,
+    pub(crate) x_m: Array1<f64>,
+    pub(crate) y: Array1<f64>,
+    pub(crate) active_blocks: Vec<TkActiveBlock>,
 }
 
 pub(crate) struct TkActiveBlock {
-    start: usize,
-    end: usize,
-    entries: Vec<(usize, f64)>,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) entries: Vec<(usize, f64)>,
 }
 
 /// Family-dependent derivative context shared by all assembly builders.
@@ -1627,11 +1627,11 @@ pub(crate) struct TkActiveBlock {
 /// return this, eliminating the tuple-order mismatch that previously existed
 /// between the two paths.
 pub(crate) struct DerivativeContext {
-    deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
-    dispersion: super::unified::DispersionHandling,
-    log_likelihood: f64,
-    firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
-    barrier_config: Option<super::unified::BarrierConfig>,
+    pub(crate) deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
+    pub(crate) dispersion: super::unified::DispersionHandling,
+    pub(crate) log_likelihood: f64,
+    pub(crate) firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
+    pub(crate) barrier_config: Option<super::unified::BarrierConfig>,
 }
 
 /// Project a `GlmLikelihoodSpec` onto a `LikelihoodSpec` for pattern matching
@@ -1824,31 +1824,31 @@ pub(crate) const MIN_IMPORTANCE_ESS_FRACTION: f64 = 0.10;
 /// Laplace/LAML evaluator already accounts for at the mode.
 pub(crate) struct Gam784BlockTarget<'t> {
     /// `X_t` (transformed-basis dense design, matching `h_total`/`solve_c_array`).
-    x_transformed: &'t Array2<f64>,
+    pub(crate) x_transformed: &'t Array2<f64>,
     /// Block eigenvectors `V_b` (columns), shape `p × m`.
-    block_vecs: Array2<f64>,
+    pub(crate) block_vecs: Array2<f64>,
     /// Block curvatures `λ_r` (the `H_total` eigenvalues), length `m`.
-    block_lambdas: Array1<f64>,
+    pub(crate) block_lambdas: Array1<f64>,
     /// Mode linear predictor η̂ = X_t β̂.
-    eta_hat: Array1<f64>,
+    pub(crate) eta_hat: Array1<f64>,
     /// Per-row observed weights `W_i` (the likelihood Hessian diagonal).
-    weights_obs: Array1<f64>,
+    pub(crate) weights_obs: Array1<f64>,
     /// Response y and prior weights for the deviance.
-    y: Array1<f64>,
-    prior_weights: Array1<f64>,
+    pub(crate) y: Array1<f64>,
+    pub(crate) prior_weights: Array1<f64>,
     /// Family/link spec for the deviance and the inverse link.
-    likelihood: GlmLikelihoodSpec,
-    inverse_link: InverseLink,
+    pub(crate) likelihood: GlmLikelihoodSpec,
+    pub(crate) inverse_link: InverseLink,
     /// Dispersion φ used to scale the deviance into a log-likelihood.
-    phi: f64,
+    pub(crate) phi: f64,
     /// Penalty scores `S_k β̂` per canonical penalty (unscaled by λ_k).
     /// Shared from the eval bundle's once-per-inner-solution cache
     /// (`EvalShared::canonical_penalty_scores_at_mode`).
-    penalty_scores: Arc<Vec<Array1<f64>>>,
+    pub(crate) penalty_scores: Arc<Vec<Array1<f64>>>,
     /// `λ_k = e^{ρ_k}` per canonical penalty, aligned with `penalty_scores`.
-    lambdas: Vec<f64>,
+    pub(crate) lambdas: Vec<f64>,
     /// Deviance at the base mode.
-    base_deviance: f64,
+    pub(crate) base_deviance: f64,
 }
 
 impl Gam784BlockTarget<'_> {
@@ -1885,8 +1885,8 @@ impl Gam784BlockTarget<'_> {
         };
         // Same floors as `calculate_deviance`: binomial clamps μ to
         // [1e-12, 1−1e-12]; the remaining families floor μ at 1e-10.
-        pub(crate) const BINOMIAL_MU_EPS: f64 = 1e-12;
-        pub(crate) const MU_FLOOR: f64 = 1e-10;
+        const BINOMIAL_MU_EPS: f64 = 1e-12;
+        const MU_FLOOR: f64 = 1e-10;
         let is_binomial = matches!(spec_response, ResponseFamily::Binomial);
         let mut out = Array1::<f64>::zeros(eta.len());
         for i in 0..eta.len() {
@@ -1914,19 +1914,19 @@ impl Gam784BlockTarget<'_> {
 }
 
 impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
-    pub(crate) fn block_dim(&self) -> usize {
+    fn block_dim(&self) -> usize {
         self.block_lambdas.len()
     }
 
-    pub(crate) fn rho_dim(&self) -> usize {
+    fn rho_dim(&self) -> usize {
         self.lambdas.len()
     }
 
-    pub(crate) fn block_curvatures(&self) -> &Array1<f64> {
+    fn block_curvatures(&self) -> &Array1<f64> {
         &self.block_lambdas
     }
 
-    pub(crate) fn excess(&self, t: &Array1<f64>) -> f64 {
+    fn excess(&self, t: &Array1<f64>) -> f64 {
         let (delta, s) = self.displacement(t);
         // Displaced mean μ(η̂ + s) via the inverse-link jet (family-uniform).
         let mut mu_disp = Array1::<f64>::zeros(self.eta_hat.len());
@@ -1962,7 +1962,7 @@ impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
         neg_loglik_diff + penalty_term - 0.5 * curv
     }
 
-    pub(crate) fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
+    fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
         let (delta, _s) = self.displacement(t);
         let mut grad = Array1::<f64>::zeros(self.lambdas.len());
         for (k, (score, &lam)) in self
@@ -1977,12 +1977,12 @@ impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
         grad
     }
 
-    pub(crate) fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64> {
+    fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64> {
         let (_delta, s) = self.displacement(t);
         self.neg_score_at(&(&self.eta_hat + &s))
     }
 
-    pub(crate) fn base_neg_score(&self) -> Array1<f64> {
+    fn base_neg_score(&self) -> Array1<f64> {
         self.neg_score_at(&self.eta_hat)
     }
 }

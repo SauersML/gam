@@ -4134,6 +4134,81 @@ pub(crate) fn residual_in_steady_geometric_descent(
 /// Returns `None` when the penalized Hessian cannot be materialized or
 /// eigendecomposed, or carries no numerical null space — in which case the
 /// caller keeps the strict total-residual refusal (no null space ⇒ range = all).
+/// Per-block inf-norms of the range-space (identified-subspace) component of the
+/// projected stationarity residual (gam#979). Same construction as
+/// [`projected_residual_range_space_inf`] — project the residual onto range(H_pen)
+/// by dropping its ker(H_pen) coordinates — but return the inf-norm restricted to
+/// EACH block's coordinate range instead of one global scalar.
+///
+/// The per-block stationarity gate (`all_block_stationarity_small`) must test the
+/// residual on the IDENTIFIED subspace, not the raw active-set-projected residual.
+/// On the survival I-spline time block the unpenalized affine baseline direction
+/// is a genuine ker(H_pen) gauge mode: the raw per-block residual keeps the full
+/// gradient component along it (large), so the raw gate falsely rejects a solve
+/// that IS stationary on every identifiable direction. The range-projected
+/// per-block residual drops exactly that gauge mass (the outer IFT pseudo-inverse
+/// projects it out anyway, gam#553), so the gate sees the true identified-subspace
+/// stationarity. Returns `None` when there is no null space (range == whole space)
+/// — there the raw per-block residual already IS the range residual, so the caller
+/// keeps its existing gate unchanged.
+pub(crate) fn projected_residual_range_space_per_block_inf(
+    projected_residual: &Array1<f64>,
+    joint_hessian_source: &JointHessianSource,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+    total_p: usize,
+) -> Option<Vec<f64>> {
+    if total_p == 0 || projected_residual.len() != total_p {
+        return None;
+    }
+    let mut h_joint = materialize_joint_hessian_source(
+        joint_hessian_source,
+        total_p,
+        "penalty-null-space per-block certificate spectrum",
+    )
+    .ok()?;
+    let model_diagonal_ridge = if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+        ridge
+    } else {
+        0.0
+    };
+    add_joint_penalty_to_matrix(&mut h_joint, ranges, s_lambdas, model_diagonal_ridge, None);
+    symmetrize_dense_in_place(&mut h_joint);
+    let (evals, evecs) = FaerEigh::eigh(&h_joint, Side::Lower).ok()?;
+    let max_abs = evals.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
+    if !(max_abs.is_finite() && max_abs > 0.0) {
+        return None;
+    }
+    let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+    let nullity = evals.iter().filter(|x| x.abs() < cutoff).count();
+    if nullity == 0 {
+        return None;
+    }
+    let mut range_component = Array1::<f64>::zeros(total_p);
+    for k in 0..evals.len() {
+        if evals[k].abs() < cutoff {
+            continue;
+        }
+        let coeff = evecs.column(k).dot(projected_residual);
+        range_component.scaled_add(coeff, &evecs.column(k));
+    }
+    Some(
+        ranges
+            .iter()
+            .map(|&(start, end)| {
+                range_component
+                    .slice(ndarray::s![start..end])
+                    .iter()
+                    .map(|x: &f64| x.abs())
+                    .fold(0.0_f64, f64::max)
+            })
+            .collect(),
+    )
+}
+
+
 pub(crate) fn projected_residual_range_space_inf(
     projected_residual: &Array1<f64>,
     joint_hessian_source: &JointHessianSource,

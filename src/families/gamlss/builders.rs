@@ -32,10 +32,6 @@ impl GamlssLambdaLayout {
         self.k_mean + self.k_noise + self.kwiggle
     }
 
-    pub(crate) fn mean_end(self) -> usize {
-        self.k_mean
-    }
-
     pub(crate) fn noise_start(self) -> usize {
         self.k_mean
     }
@@ -67,7 +63,7 @@ impl GamlssLambdaLayout {
     }
 
     pub(crate) fn mean_from(self, theta: &Array1<f64>) -> Array1<f64> {
-        theta.slice(s![0..self.mean_end()]).to_owned()
+        theta.slice(s![0..self.k_mean]).to_owned()
     }
 
     pub(crate) fn noise_from(self, theta: &Array1<f64>) -> Array1<f64> {
