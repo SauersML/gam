@@ -1280,4 +1280,65 @@ mod tests {
             );
         }
     }
+
+    /// d = 1 carries REDUCED curvature information: the transverse volume
+    /// Jacobian is identically 1 (radial isometry), so κ is identified by the
+    /// conformal-factor restoring force `−d·Σ ln λ_{y_i}` alone (#944 power
+    /// analysis). The estimator must still run end-to-end, return an INTERIOR
+    /// κ̂, and produce a valid CI — never divide/exponentiate the absent
+    /// transverse direction.
+    #[test]
+    fn fit_response_curvature_d1_uses_conformal_term_only() {
+        let sigma = 0.12;
+        let n = 400usize;
+        for &k_star in &[-1.0_f64, 0.0, 0.8] {
+            let values = synth_cloud(1, k_star, n, sigma, 0xD1 ^ (k_star.to_bits()));
+            let (kmin, kmax) = response_kappa_bounds(values.view());
+            let fit = fit_response_curvature(values.view(), 1, 0.95, 1e-12, 256)
+                .expect("d=1 curvature fit");
+            let span = kmax - kmin;
+            assert!(
+                fit.kappa_hat > kmin + 0.01 * span && fit.kappa_hat < kmax - 0.01 * span,
+                "d=1 κ⋆={k_star}: κ̂={} railed to [{kmin},{kmax}]",
+                fit.kappa_hat
+            );
+            assert!(
+                fit.profile_ci.ci_lo <= fit.kappa_hat && fit.kappa_hat <= fit.profile_ci.ci_hi,
+                "d=1 κ⋆={k_star}: CI excludes κ̂"
+            );
+            assert!(fit.kappa_hat.is_finite() && fit.v_p_hat.is_finite());
+        }
+    }
+
+    /// The criterion guard must reject κ probes AT or PAST the chart boundary
+    /// gracefully (an `Err`, never a panic / NaN): on the hyperbolic edge
+    /// `1 + κ‖y‖² ≤ 0` and on the spherical antipode. The `response_kappa_bounds`
+    /// bracket stays strictly interior, but a stray CI/LR probe can land on the
+    /// edge, so the criterion itself must be defensive.
+    #[test]
+    fn response_curvature_criterion_rejects_boundary_probes() {
+        // A cloud with a known max radius R²; the hyperbolic edge is κ = −1/R².
+        let values = array![[0.5_f64, 0.0], [-0.4, 0.3], [0.1, -0.5]];
+        let r2_max = values
+            .outer_iter()
+            .map(|r| r.dot(&r))
+            .fold(0.0_f64, f64::max);
+        // Exactly on / past the hyperbolic edge: 1 + κ‖y‖² = 0 (or < 0).
+        let kappa_edge = -1.0 / r2_max;
+        assert!(
+            response_curvature_criterion(values.view(), 2, kappa_edge).is_err(),
+            "criterion must reject the hyperbolic chart edge κ=−1/R²"
+        );
+        assert!(
+            response_curvature_criterion(values.view(), 2, 1.5 * kappa_edge).is_err(),
+            "criterion must reject past the hyperbolic chart edge"
+        );
+        // Interior κ just inside the edge succeeds and is finite.
+        let (v, _) = response_curvature_criterion(values.view(), 2, 0.9 * kappa_edge)
+            .expect("interior κ valid");
+        assert!(v.is_finite());
+        // Non-finite κ is rejected up front.
+        assert!(response_curvature_criterion(values.view(), 2, f64::NAN).is_err());
+        assert!(response_curvature_criterion(values.view(), 2, f64::INFINITY).is_err());
+    }
 }
