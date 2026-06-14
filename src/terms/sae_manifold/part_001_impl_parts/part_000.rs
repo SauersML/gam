@@ -2603,18 +2603,52 @@ impl SaeManifoldTerm {
             kron_jac: Option<Vec<f64>>,
         }
 
+        // Per-row scratch reused across all rows a rayon worker processes
+        // (#1017). The assembly closure is re-run every inner Newton iteration ×
+        // every outer ρ evaluation; allocating these eight loop-invariant-sized
+        // buffers (`k_atoms·p`, several `p`, one `q·max(w_dim,p)`) once per
+        // worker via `map_init` — rather than once per (row × assembly) inside
+        // the closure — removes the dominant small-allocation traffic the
+        // eu-stack profile attributed to allocator/barrier spin at the SAE LLM
+        // shape (p≈5120). Every buffer is fully filled (or `.fill(0.0)`'d) before
+        // it is read each row, so reuse is bit-identical to the fresh-alloc path;
+        // `gb_delta`/`g_blocks` are NOT scratch (they move into the returned
+        // `SaeAssemblyRow`) and stay allocated per row.
+        struct RowScratch {
+            decoded: Array2<f64>,
+            dg_buf: Vec<f64>,
+            fitted: Array1<f64>,
+            error: Array1<f64>,
+            error_white: Vec<f64>,
+            error_metric: Array1<f64>,
+            jac_white: Vec<f64>,
+            decoded_scratch: Vec<f64>,
+        }
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let row_results: Vec<SaeAssemblyRow> = (0..n)
             .into_par_iter()
-            .map(|row| -> Result<SaeAssemblyRow, String> {
-                let mut decoded = Array2::<f64>::zeros((k_atoms, p));
-                let mut dg_buf = vec![0.0_f64; p];
-                let mut fitted = Array1::<f64>::zeros(p);
-                let mut error = Array1::<f64>::zeros(p);
-                let mut error_white = vec![0.0_f64; w_dim];
-                let mut error_metric = Array1::<f64>::zeros(p);
-                let mut jac_white = vec![0.0_f64; q * w_dim.max(p)];
-                let mut decoded_scratch = vec![0.0_f64; p];
+            .map_init(
+                || RowScratch {
+                    decoded: Array2::<f64>::zeros((k_atoms, p)),
+                    dg_buf: vec![0.0_f64; p],
+                    fitted: Array1::<f64>::zeros(p),
+                    error: Array1::<f64>::zeros(p),
+                    error_white: vec![0.0_f64; w_dim],
+                    error_metric: Array1::<f64>::zeros(p),
+                    jac_white: vec![0.0_f64; q * w_dim.max(p)],
+                    decoded_scratch: vec![0.0_f64; p],
+                },
+                |scratch, row| -> Result<SaeAssemblyRow, String> {
+                let RowScratch {
+                    decoded,
+                    dg_buf,
+                    fitted,
+                    error,
+                    error_white,
+                    error_metric,
+                    jac_white,
+                    decoded_scratch,
+                } = scratch;
                 let mut gb_delta: Vec<(usize, f64)> = Vec::new();
                 let mut g_blocks: SaeGBlocks = std::collections::BTreeMap::new();
                 let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
@@ -2631,7 +2665,7 @@ impl SaeManifoldTerm {
                     Some(active) => {
                         for &atom_idx in active {
                             let a_k = assignments[atom_idx];
-                            self.atoms[atom_idx].fill_decoded_row(row, &mut decoded_scratch);
+                            self.atoms[atom_idx].fill_decoded_row(row, decoded_scratch.as_mut_slice());
                             for out_col in 0..p {
                                 decoded[[atom_idx, out_col]] = decoded_scratch[out_col];
                                 fitted[out_col] += a_k * decoded_scratch[out_col];
@@ -2641,7 +2675,7 @@ impl SaeManifoldTerm {
                     None => {
                         for atom_idx in 0..k_atoms {
                             let a_k = assignments[atom_idx];
-                            self.atoms[atom_idx].fill_decoded_row(row, &mut decoded_scratch);
+                            self.atoms[atom_idx].fill_decoded_row(row, decoded_scratch.as_mut_slice());
                             for out_col in 0..p {
                                 decoded[[atom_idx, out_col]] = decoded_scratch[out_col];
                                 fitted[out_col] += a_k * decoded_scratch[out_col];
@@ -2732,7 +2766,7 @@ impl SaeManifoldTerm {
                         let a_k = assignments[k];
                         let coord_start = starts[j];
                         for axis in 0..d {
-                            self.atoms[k].fill_decoded_derivative_row(row, axis, &mut dg_buf);
+                            self.atoms[k].fill_decoded_derivative_row(row, axis, dg_buf.as_mut_slice());
                             for out_col in 0..p {
                                 jac_compact[[coord_start + axis, out_col]] = a_k * dg_buf[out_col];
                             }
@@ -2764,7 +2798,7 @@ impl SaeManifoldTerm {
                             self.atoms[atom_idx].fill_decoded_derivative_row(
                                 row,
                                 axis,
-                                &mut dg_buf,
+                                dg_buf.as_mut_slice(),
                             );
                             for out_col in 0..p {
                                 jac_row[[off + axis, out_col]] = a_k * dg_buf[out_col];
