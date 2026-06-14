@@ -115,8 +115,10 @@ const LOG_LAMBDA_TOL: f64 = 1e-6;
 
 /// PCG convergence: relative residual ‖b − Ac‖/‖b‖ (the backward-error
 /// certificate) demanded of every solve, and the iteration cap past which
-/// the solve is an error rather than a silent approximation.
-const CG_RTOL: f64 = 1e-10;
+/// the solve is an error rather than a silent approximation. The certification
+/// suite gates the iterative route at 1e-9; asking for more burns matvecs
+/// without strengthening any downstream certificate.
+const CG_RTOL: f64 = 1e-9;
 const CG_MAX_ITERS: usize = 4000;
 
 /// Quasi-uniformity guard (issue #1032, caveat 2). The BPX n-independent CG
@@ -376,6 +378,10 @@ pub struct ResidualCascadeDesign {
 /// Fitted cascade with factored-by-solve posterior access.
 pub struct ResidualCascadeFit {
     core: Arc<Core>,
+    /// Dense-route prediction factor at the fit's λ. When present, pointwise
+    /// variance uses this one Cholesky factor instead of refactoring the same
+    /// precision matrix for every prediction point.
+    predict_chol: Option<Vec<f64>>,
     /// Coefficients: `dim+1` polynomial entries, then level blocks.
     pub coeff: Vec<f64>,
     /// Selected (or supplied) log smoothing parameter `log λ = log σ²/τ²`.
@@ -533,8 +539,20 @@ impl Core {
             return Ok((vec![0.0; m], 0.0, 0));
         }
         let mut x = match warm {
-            Some(x0) => x0.to_vec(),
-            None => vec![0.0; m],
+            Some(x0) => {
+                if x0.len() != m {
+                    return Err(format!(
+                        "residual cascade: warm-start length {} != system size {m}",
+                        x0.len()
+                    ));
+                }
+                x0.to_vec()
+            }
+            None => b
+                .iter()
+                .zip(prec.iter())
+                .map(|(&bj, &pj)| bj / pj)
+                .collect(),
         };
         let mut r = vec![0.0; m];
         self.matvec(lambda, &x, &mut r);
@@ -1188,6 +1206,11 @@ impl ResidualCascadeDesign {
         self.core.m
     }
 
+    /// Number of stored nonzeros in the CSR design.
+    pub fn num_nonzeros(&self) -> usize {
+        self.core.vals.len()
+    }
+
     /// Total centers across all levels.
     pub fn num_centers(&self) -> usize {
         self.core.m - self.core.nullity()
@@ -1265,6 +1288,14 @@ impl ResidualCascadeDesign {
     /// Profiled-σ² REML criterion at `log λ` (differences across λ are exact
     /// REML differences on the dense route; SLQ-estimated past the cap).
     pub fn criterion(&self, log_lambda: f64) -> Result<f64, String> {
+        Ok(self.criterion_with_warm(log_lambda, None)?.0)
+    }
+
+    fn criterion_with_warm(
+        &self,
+        log_lambda: f64,
+        warm: Option<&[f64]>,
+    ) -> Result<(f64, Vec<f64>), String> {
         if !log_lambda.is_finite() {
             return Err(format!(
                 "residual cascade: non-finite log lambda {log_lambda}"
@@ -1272,7 +1303,7 @@ impl ResidualCascadeDesign {
         }
         let core = &self.core;
         let lambda = log_lambda.exp();
-        let (coeff, _, _) = core.solve_coeff(lambda, &core.rhs, None)?;
+        let (coeff, _, _) = core.solve_coeff(lambda, &core.rhs, warm)?;
         let rss_pen = core.rss_pen(&coeff);
         if !(rss_pen > 0.0) {
             return Err(format!(
@@ -1283,7 +1314,10 @@ impl ResidualCascadeDesign {
         let dof = (core.y.len() - core.nullity()) as f64;
         let r = (core.m - core.nullity()) as f64;
         let sigma2 = rss_pen / dof;
-        Ok(-0.5 * (logdet - r * log_lambda - core.pen_logdet_const + dof * sigma2.ln()))
+        Ok((
+            -0.5 * (logdet - r * log_lambda - core.pen_logdet_const + dof * sigma2.ln()),
+            coeff,
+        ))
     }
 
     /// Fit at a FIXED `log λ`, with σ² either supplied or profiled.
@@ -1292,6 +1326,15 @@ impl ResidualCascadeDesign {
         log_lambda: f64,
         sigma2: Option<f64>,
     ) -> Result<ResidualCascadeFit, String> {
+        self.fit_at_with_warm(log_lambda, sigma2, None)
+    }
+
+    fn fit_at_with_warm(
+        &self,
+        log_lambda: f64,
+        sigma2: Option<f64>,
+        warm: Option<&[f64]>,
+    ) -> Result<ResidualCascadeFit, String> {
         if !log_lambda.is_finite() {
             return Err(format!(
                 "residual cascade: non-finite log lambda {log_lambda}"
@@ -1299,7 +1342,7 @@ impl ResidualCascadeDesign {
         }
         let core = &self.core;
         let lambda = log_lambda.exp();
-        let (coeff, rel_res, iters) = core.solve_coeff(lambda, &core.rhs, None)?;
+        let (coeff, rel_res, iters) = core.solve_coeff(lambda, &core.rhs, warm)?;
         let rss_pen = core.rss_pen(&coeff);
         let dof = (core.y.len() - core.nullity()) as f64;
         let sigma2 = match sigma2 {
@@ -1326,8 +1369,14 @@ impl ResidualCascadeDesign {
             * (logdet - r * log_lambda - core.pen_logdet_const
                 + dof * sigma2.ln()
                 + rss_pen / sigma2);
+        let predict_chol = if core.dense_gram.is_some() {
+            Some(core.assemble_predict_factor(lambda)?)
+        } else {
+            None
+        };
         Ok(ResidualCascadeFit {
             core: Arc::clone(&self.core),
+            predict_chol,
             coeff,
             log_lambda,
             sigma2,
@@ -1349,38 +1398,45 @@ impl ResidualCascadeDesign {
     pub fn fit_reml(&self) -> Result<ResidualCascadeFit, String> {
         let mut best_i = 0usize;
         let mut best_v = f64::NEG_INFINITY;
+        let mut best_coeff = Vec::new();
+        let mut warm: Option<Vec<f64>> = None;
         let step = (LOG_LAMBDA_HI - LOG_LAMBDA_LO) / (LOG_LAMBDA_GRID - 1) as f64;
         for i in 0..LOG_LAMBDA_GRID {
             let ll = LOG_LAMBDA_LO + step * i as f64;
-            let v = self.criterion(ll)?;
+            let (v, coeff) = self.criterion_with_warm(ll, warm.as_deref())?;
             if v > best_v {
                 best_v = v;
                 best_i = i;
+                best_coeff = coeff.clone();
             }
+            warm = Some(coeff);
         }
         let mut lo = LOG_LAMBDA_LO + step * best_i.saturating_sub(1) as f64;
         let mut hi = (LOG_LAMBDA_LO + step * (best_i + 1) as f64).min(LOG_LAMBDA_HI);
         let inv_phi = 0.618_033_988_749_894_9_f64;
         let mut x1 = hi - inv_phi * (hi - lo);
         let mut x2 = lo + inv_phi * (hi - lo);
-        let mut f1 = self.criterion(x1)?;
-        let mut f2 = self.criterion(x2)?;
+        let (mut f1, mut c1) = self.criterion_with_warm(x1, Some(&best_coeff))?;
+        let (mut f2, mut c2) = self.criterion_with_warm(x2, Some(&c1))?;
         while hi - lo > LOG_LAMBDA_TOL {
             if f1 < f2 {
                 lo = x1;
                 x1 = x2;
                 f1 = f2;
+                c1 = c2;
                 x2 = lo + inv_phi * (hi - lo);
-                f2 = self.criterion(x2)?;
+                (f2, c2) = self.criterion_with_warm(x2, Some(&c1))?;
             } else {
                 hi = x2;
                 x2 = x1;
                 f2 = f1;
+                c2 = c1;
                 x1 = hi - inv_phi * (hi - lo);
-                f1 = self.criterion(x1)?;
+                (f1, c1) = self.criterion_with_warm(x1, Some(&c2))?;
             }
         }
-        self.fit_at(0.5 * (lo + hi), None)
+        let warm = if f1 >= f2 { &c1 } else { &c2 };
+        self.fit_at_with_warm(0.5 * (lo + hi), None, Some(warm))
     }
 
     /// Exact upper bound on the penalized-objective decrease available from
@@ -1480,7 +1536,11 @@ impl ResidualCascadeFit {
             dense_row[c] += v;
         }
         let lambda = self.log_lambda.exp();
-        let (zsol, _, _) = core.solve_coeff(lambda, &dense_row, None)?;
+        let zsol = if let Some(l) = &self.predict_chol {
+            chol_solve(l, core.m, &dense_row)
+        } else {
+            core.solve_coeff(lambda, &dense_row, None)?.0
+        };
         let mut quad = 0.0;
         for (a, b) in dense_row.iter().zip(zsol.iter()) {
             quad += a * b;
@@ -1539,7 +1599,13 @@ impl ResidualCascadeFit {
     pub fn to_state(&self) -> Result<ResidualCascadeState, String> {
         let core = &self.core;
         let lambda = self.log_lambda.exp();
-        let predict_chol = core.assemble_predict_factor(lambda)?;
+        let predict_chol = if let Some(l) = &self.predict_chol {
+            l.clone()
+        } else if let Some(l) = &core.predict_chol {
+            l.clone()
+        } else {
+            core.assemble_predict_factor(lambda)?
+        };
         let dim = core.dim;
         let levels = core
             .levels
@@ -1762,6 +1828,7 @@ impl ResidualCascadeFit {
         };
         Ok(ResidualCascadeFit {
             core: Arc::new(core),
+            predict_chol: None,
             coeff: state.coeff.clone(),
             log_lambda: state.log_lambda,
             sigma2: state.sigma2,
