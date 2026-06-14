@@ -459,26 +459,68 @@ pub fn project_onto_linear_constraints(
     if constraints.a.ncols() != dim || constraints.a.nrows() == 0 {
         return Ok(beta);
     }
-    let mut corrections = Array2::<f64>::zeros((constraints.a.nrows(), dim));
+
+    // Deduplicate identical constraint rows before projecting (#1108). The
+    // monotone time-derivative guard emits ONE constraint row per observation,
+    // and survival data on a discrete inspection grid (interval-censored
+    // `SurvInterval(L, R, event)`, or any dataset with heavily tied event times)
+    // produces many rows sharing the SAME time and therefore the SAME (already
+    // row-normalized) `(Aᵢ, bᵢ)`. A halfspace and its exact duplicate define the
+    // SAME constraint, so the feasible polytope `{β : Aβ ≥ b}` is UNCHANGED by
+    // collapsing duplicates — but Dykstra alternating projection over the
+    // redundant copies converges only linearly and so slowly that the fixed
+    // sweep cap exits with a large residual violation (5e-3..2e-2 observed),
+    // which the downstream `check_linear_feasibility` gate (`tol = 1e-8`) then
+    // rejects as an "infeasible iterate". Projecting over the UNIQUE halfspaces
+    // (≈ the number of distinct grid times) instead converges to
+    // `DYKSTRA_PROJECTION_TOL` in a handful of sweeps. This is exact (no
+    // constraint dropped, the polytope is identical) and benefits every monotone
+    // survival fit with tied observation times, not just the interval path.
+    let n_rows = constraints.a.nrows();
+    // Bit-exact dedup key = the IEEE-754 bit patterns of `(Aᵢ.., bᵢ)`. Tied-time
+    // rows come from the same basis evaluation at the same time and the same
+    // deterministic row normalization, so duplicates are bit-identical; a
+    // non-identical near-parallel row hashes differently and is kept as its own
+    // halfspace, so no real constraint is ever merged away. O(n·dim) via the hash
+    // set rather than O(n²·dim) pairwise — safe for large-n survival fits.
+    let mut seen: std::collections::HashSet<Box<[u64]>> =
+        std::collections::HashSet::with_capacity(n_rows);
+    let mut unique_rows: Vec<usize> = Vec::with_capacity(n_rows);
+    for i in 0..n_rows {
+        let row_i = constraints.a.row(i);
+        let row_norm_sq = row_i.dot(&row_i);
+        if row_norm_sq <= DYKSTRA_ROW_DEGENERACY_FLOOR {
+            // Structurally empty row: skipped during projection anyway.
+            continue;
+        }
+        let mut key: Vec<u64> = Vec::with_capacity(dim + 1);
+        key.extend(row_i.iter().map(|v| v.to_bits()));
+        key.push(constraints.b[i].to_bits());
+        if seen.insert(key.into_boxed_slice()) {
+            unique_rows.push(i);
+        }
+    }
+
+    let mut corrections = Array2::<f64>::zeros((unique_rows.len(), dim));
     let max_sweeps = DYKSTRA_PROJECTION_MAX_SWEEPS;
     for _ in 0..max_sweeps {
         let mut max_violation = 0.0_f64;
-        for i in 0..constraints.a.nrows() {
+        for (slot, &i) in unique_rows.iter().enumerate() {
             let row = constraints.a.row(i);
             let row_norm_sq = row.dot(&row);
             if row_norm_sq <= DYKSTRA_ROW_DEGENERACY_FLOOR {
                 continue;
             }
-            let y = &beta + &corrections.row(i);
+            let y = &beta + &corrections.row(slot);
             let slack = row.dot(&y) - constraints.b[i];
             max_violation = max_violation.max((-slack).max(0.0));
             if slack >= 0.0 {
-                corrections.row_mut(i).assign(&(&y - &beta));
+                corrections.row_mut(slot).assign(&(&y - &beta));
                 continue;
             }
             let step = (constraints.b[i] - row.dot(&y)) / row_norm_sq;
             let projected = &y + &(row.to_owned() * step);
-            corrections.row_mut(i).assign(&(&y - &projected));
+            corrections.row_mut(slot).assign(&(&y - &projected));
             beta.assign(&projected);
         }
         if max_violation <= DYKSTRA_PROJECTION_TOL {
