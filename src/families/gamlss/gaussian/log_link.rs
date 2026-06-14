@@ -352,9 +352,10 @@ impl CustomFamilyGenerative for GammaLogFamily {
     ) -> Result<GenerativeSpec, String> {
         let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
         let mean = gamlss_rowwise_map(eta.len(), |i| saturated_exp_eta(eta[i]));
+        let shape = ndarray::Array1::from_elem(mean.len(), self.shape);
         Ok(GenerativeSpec {
             mean,
-            noise: NoiseModel::Gamma { shape: self.shape },
+            noise: NoiseModel::Gamma { shape },
         })
     }
 }

@@ -13,17 +13,23 @@ pub enum NoiseModel {
     Poisson,
     Tweedie {
         p: f64,
-        phi: f64,
+        /// Per-observation dispersion φ (> 0). A scalar-dispersion fit broadcasts
+        /// one value to every row; a dispersion location-scale fit (#913/#1125)
+        /// supplies the fitted per-row φ = 1/exp(eta_d(x)).
+        phi: Array1<f64>,
     },
     NegativeBinomial {
-        theta: f64,
+        /// Per-observation overdispersion θ (> 0); see `Tweedie::phi`.
+        theta: Array1<f64>,
     },
     Beta {
-        phi: f64,
+        /// Per-observation precision φ (> 0); see `Tweedie::phi`.
+        phi: Array1<f64>,
     },
     Gamma {
-        /// Fixed Gamma shape parameter (k > 0), with mean-driven scale.
-        shape: f64,
+        /// Per-observation Gamma shape k (> 0), with mean-driven scale; see
+        /// `Tweedie::phi`.
+        shape: Array1<f64>,
     },
     Bernoulli,
 }
@@ -96,13 +102,17 @@ impl NoiseModel {
                         "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
                     );
                 }
+                let phi = Self::require_positive_noise_parameter(
+                    likelihood,
+                    "Tweedie dispersion phi",
+                    gaussian_scale,
+                )?;
                 Ok(NoiseModel::Tweedie {
                     p,
-                    phi: Self::require_positive_noise_parameter(
-                        likelihood,
-                        "Tweedie dispersion phi",
-                        gaussian_scale,
-                    )?,
+                    // Scalar-dispersion fit: broadcast one φ to every row. The
+                    // dispersion location-scale path (#1125) builds the per-row
+                    // vector directly in `run_generate_unified` instead.
+                    phi: Array1::from_elem(nobs, phi),
                 })
             }
             ResponseFamily::NegativeBinomial { theta, .. } => {
@@ -119,7 +129,9 @@ impl NoiseModel {
                         "negative-binomial theta must be finite and > 0; got {theta}"
                     );
                 }
-                Ok(NoiseModel::NegativeBinomial { theta })
+                Ok(NoiseModel::NegativeBinomial {
+                    theta: Array1::from_elem(nobs, theta),
+                })
             }
             ResponseFamily::Beta { phi } => {
                 // The Beta precision φ is estimated jointly with the mean
@@ -141,15 +153,20 @@ impl NoiseModel {
                         "beta-regression phi must be finite and > 0; got {phi}"
                     );
                 }
-                Ok(NoiseModel::Beta { phi })
+                Ok(NoiseModel::Beta {
+                    phi: Array1::from_elem(nobs, phi),
+                })
             }
-            ResponseFamily::Gamma => Ok(NoiseModel::Gamma {
-                shape: Self::require_positive_noise_parameter(
+            ResponseFamily::Gamma => {
+                let shape = Self::require_positive_noise_parameter(
                     likelihood,
                     "Gamma shape",
                     gaussian_scale,
-                )?,
-            }),
+                )?;
+                Ok(NoiseModel::Gamma {
+                    shape: Array1::from_elem(nobs, shape),
+                })
+            }
             ResponseFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar generative sampling is not exposed via generic generation"
                     .to_string(),
@@ -193,6 +210,23 @@ impl NoiseModel {
             )))
         }
     }
+}
+
+/// Validate that a per-observation dispersion vector matches the mean length.
+/// Scalar-dispersion fits broadcast one value across all rows (length `n`);
+/// dispersion location-scale fits (#1125) carry the genuine per-row vector.
+fn check_dispersion_len(
+    dispersion: &Array1<f64>,
+    nobs: usize,
+    name: &str,
+) -> Result<(), EstimationError> {
+    if dispersion.len() != nobs {
+        crate::bail_invalid_estim!(
+            "{name} length {} does not match mean length {nobs}",
+            dispersion.len()
+        );
+    }
+    Ok(())
 }
 
 /// Draw one synthetic observation vector from a generative spec.
@@ -241,27 +275,32 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             if !(p.is_finite() && *p >= 1.0 && *p <= 2.0) {
                 crate::bail_invalid_estim!("invalid Tweedie power p: {p}");
             }
-            if !(phi.is_finite() && *phi > 0.0) {
-                crate::bail_invalid_estim!("invalid Tweedie dispersion phi: {phi}");
+            check_dispersion_len(phi, spec.mean.len(), "Tweedie dispersion phi")?;
+            for (i, &phi_i) in phi.iter().enumerate() {
+                if !(phi_i.is_finite() && phi_i > 0.0) {
+                    crate::bail_invalid_estim!("invalid Tweedie dispersion phi at row {i}: {phi_i}");
+                }
             }
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             if (*p - 1.0).abs() <= 1.0e-12 {
                 for i in 0..y.len() {
-                    let lam = (spec.mean[i] / *phi).max(1e-12);
+                    let phi_i = phi[i];
+                    let lam = (spec.mean[i] / phi_i).max(1e-12);
                     let dist = rand_distr::Poisson::new(lam).map_err(|e| {
                         EstimationError::InvalidInput(format!(
                             "invalid Tweedie-Poisson rate {lam}: {e}"
                         ))
                     })?;
-                    y[i] = *phi * rand_distr::Distribution::sample(&dist, rng);
+                    y[i] = phi_i * rand_distr::Distribution::sample(&dist, rng);
                 }
                 return Ok(y);
             }
             if (*p - 2.0).abs() <= 1.0e-12 {
-                let shape = (1.0 / *phi).max(1e-12);
                 for i in 0..y.len() {
+                    let phi_i = phi[i];
+                    let shape = (1.0 / phi_i).max(1e-12);
                     let mu = spec.mean[i].max(1e-12);
-                    let scale = (mu * *phi).max(1e-12);
+                    let scale = (mu * phi_i).max(1e-12);
                     let dist = rand_distr::Gamma::new(shape, scale).map_err(|e| {
                         EstimationError::InvalidInput(format!(
                             "invalid Tweedie-Gamma params shape={shape} scale={scale}: {e}"
@@ -273,9 +312,10 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             }
             let alpha = (2.0 - *p) / (*p - 1.0);
             for i in 0..y.len() {
+                let phi_i = phi[i];
                 let mu = spec.mean[i].max(1e-12);
-                let lambda = (mu.powf(2.0 - *p) / (*phi * (2.0 - *p))).max(1e-12);
-                let scale = (*phi * (*p - 1.0) * mu.powf(*p - 1.0)).max(1e-12);
+                let lambda = (mu.powf(2.0 - *p) / (phi_i * (2.0 - *p))).max(1e-12);
+                let scale = (phi_i * (*p - 1.0) * mu.powf(*p - 1.0)).max(1e-12);
                 let count_dist = rand_distr::Poisson::new(lambda).map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "invalid Tweedie compound-Poisson rate {lambda}: {e}"
@@ -297,17 +337,20 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             Ok(y)
         }
         NoiseModel::NegativeBinomial { theta } => {
-            if !(theta.is_finite() && *theta > 0.0) {
-                crate::bail_invalid_estim!("invalid negative-binomial theta: {theta}");
-            }
+            check_dispersion_len(theta, spec.mean.len(), "NegativeBinomial theta")?;
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             for i in 0..y.len() {
+                let theta_i = theta[i];
+                if !(theta_i.is_finite() && theta_i > 0.0) {
+                    crate::bail_invalid_estim!(
+                        "invalid negative-binomial theta at row {i}: {theta_i}"
+                    );
+                }
                 let mu = spec.mean[i].max(1e-12);
-                let scale = (mu / *theta).max(1e-12);
-                let gamma = rand_distr::Gamma::new(*theta, scale).map_err(|e| {
+                let scale = (mu / theta_i).max(1e-12);
+                let gamma = rand_distr::Gamma::new(theta_i, scale).map_err(|e| {
                     EstimationError::InvalidInput(format!(
-                        "invalid NegativeBinomial gamma mixture params theta={} scale={scale}: {e}",
-                        *theta
+                        "invalid NegativeBinomial gamma mixture params theta={theta_i} scale={scale}: {e}"
                     ))
                 })?;
                 let lambda = rand_distr::Distribution::sample(&gamma, rng).max(1e-12);
@@ -321,14 +364,16 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             Ok(y)
         }
         NoiseModel::Beta { phi } => {
-            if !(phi.is_finite() && *phi > 0.0) {
-                crate::bail_invalid_estim!("invalid beta-regression phi: {phi}");
-            }
+            check_dispersion_len(phi, spec.mean.len(), "Beta phi")?;
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             for i in 0..y.len() {
+                let phi_i = phi[i];
+                if !(phi_i.is_finite() && phi_i > 0.0) {
+                    crate::bail_invalid_estim!("invalid beta-regression phi at row {i}: {phi_i}");
+                }
                 let mu = spec.mean[i].clamp(1e-12, 1.0 - 1e-12);
-                let alpha = (mu * *phi).max(1e-12);
-                let beta = ((1.0 - mu) * *phi).max(1e-12);
+                let alpha = (mu * phi_i).max(1e-12);
+                let beta = ((1.0 - mu) * phi_i).max(1e-12);
                 let dist = rand_distr::Beta::new(alpha, beta).map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "invalid Beta params alpha={alpha} beta={beta}: {e}"
@@ -339,17 +384,18 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             Ok(y)
         }
         NoiseModel::Gamma { shape } => {
-            if !shape.is_finite() || *shape <= 0.0 {
-                crate::bail_invalid_estim!("invalid Gamma shape: {shape}");
-            }
+            check_dispersion_len(shape, spec.mean.len(), "Gamma shape")?;
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             for i in 0..y.len() {
+                let shape_i = shape[i];
+                if !shape_i.is_finite() || shape_i <= 0.0 {
+                    crate::bail_invalid_estim!("invalid Gamma shape at row {i}: {shape_i}");
+                }
                 let mu = spec.mean[i].max(1e-12);
-                let scale = (mu / *shape).max(1e-12);
-                let dist = rand_distr::Gamma::new(*shape, scale).map_err(|e| {
+                let scale = (mu / shape_i).max(1e-12);
+                let dist = rand_distr::Gamma::new(shape_i, scale).map_err(|e| {
                     EstimationError::InvalidInput(format!(
-                        "invalid Gamma params shape={} scale={scale}: {e}",
-                        *shape
+                        "invalid Gamma params shape={shape_i} scale={scale}: {e}"
                     ))
                 })?;
                 y[i] = rand_distr::Distribution::sample(&dist, rng);
