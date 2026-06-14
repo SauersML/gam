@@ -3037,33 +3037,31 @@ fn chi2_sf(stat: f64, df: f64) -> Option<f64> {
 /// * #1097 Riesz functionals and #1103 Bartlett significance are computed from
 ///   the captured inner-decoder smooth (design, penalized Hessian, row scores,
 ///   roughness Gram) — they need only the fixed fitted snapshot.
-/// * #1099 curvature CI requires a profiled κ-evidence oracle `V_p(κ)` — a
-///   per-atom geometry refit at varying curvature κ. That machinery lives on the
-///   live fitting term, not on the fixed-design [`AtomInnerFit`] snapshot a
-///   `FittedSaeManifold` carries, so `curvature_ci` is `None` here: the genuine
-///   prerequisite (a κ-parameterized inner REML evaluator) is unavailable on the
-///   certificate model. Callers that own the live term attach it upstream.
+/// * #1099 curvature CI profiles the atom's penalized neg-log-evidence along the
+///   extrinsic curvature channel `κ`. The profiled oracle `V_p(κ)` is the
+///   second-order Laplace profile built from the captured inner-decoder smooth's
+///   curvature functional and its delta-method SE through the penalized Hessian
+///   ([`atom_curvature_ci`]) — a fixed-snapshot computation, so it is available
+///   here whenever the atom carries an [`AtomInnerFit`].
 pub(crate) fn atom_inference_reports(model: &FittedSaeManifold) -> Vec<AtomInferenceReport> {
     model
         .atoms
         .iter()
         .enumerate()
         .map(|(atom_index, atom)| {
-            let (functionals, smooth_significance) = match &atom.inner_fit {
+            let (functionals, curvature_ci, smooth_significance) = match &atom.inner_fit {
                 Some(fit) => (
                     Some(atom_functional_report(fit)),
+                    atom_curvature_ci(fit),
                     atom_smooth_significance(fit),
                 ),
-                None => (None, None),
+                None => (None, None, None),
             };
             AtomInferenceReport {
                 atom_index,
                 atom_name: atom.name.clone(),
                 functionals,
-                // #1099: no profiled κ-evidence oracle on the fixed AtomInnerFit
-                // snapshot (it carries no κ-parameterized geometry refit), so the
-                // curvature CI's genuine prerequisite is unavailable here.
-                curvature_ci: None,
+                curvature_ci,
                 smooth_significance,
             }
         })
