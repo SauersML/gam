@@ -272,11 +272,14 @@ impl ConstantCurvature {
     /// change-of-variables criterion and breaks the radius/scale degeneracy of
     /// a dispersion-only curvature criterion.
     pub fn jacobian_radial(&self, r: f64) -> f64 {
-        let exponent = self.dim as i32 - 1;
-        if exponent == 0 {
-            // d = 1 (or the degenerate d = 0): radial isometry, J ≡ 1.
+        // The transverse exponent d − 1. At d ≤ 1 the exp map is a radial
+        // isometry (`d = 1`) or degenerate (`d = 0`): there are no transverse
+        // Jacobi directions, so J ≡ 1 with no exponentiation. Guarding `d ≤ 1`
+        // (not just `d == 1`) keeps a stray `d = 0` probe from forming `powi(−1)`.
+        if self.dim <= 1 {
             return 1.0;
         }
+        let exponent = (self.dim - 1) as i32;
         let u = self.kappa * r * r;
         let s = cs_stacks(u).1[0]; // S(u) = sn_κ(r)/r ≥ 0 inside the chart
         // Clamp S (not the power) at the κ>0 conjugate shell so the volume
