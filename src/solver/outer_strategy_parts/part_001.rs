@@ -1,4 +1,33 @@
 
+const EXPENSIVE_PREWARM_COEFF_DIM: usize = 24;
+const EXPENSIVE_PREWARM_RHO_DIM: usize = 4;
+const MULTI_SEED_PREWARM_BUDGET: usize = 8;
+const SINGLE_EXPENSIVE_PREWARM_BUDGET: usize = 16;
+
+fn continuation_prewarm_step_budget(
+    config: &OuterConfig,
+    cap: &OuterCapability,
+    seed_count: usize,
+    seed_budget: usize,
+) -> usize {
+    let default_budget = crate::solver::estimate::reml::continuation::PATH_BUDGET;
+    let p_coefficients = config
+        .rho_uncertainty_problem_size
+        .p_coefficients
+        .unwrap_or(0);
+    let multi_seed_cascade = seed_count > seed_budget.max(1);
+    let expensive_shape =
+        p_coefficients >= EXPENSIVE_PREWARM_COEFF_DIM || cap.n_params >= EXPENSIVE_PREWARM_RHO_DIM;
+
+    if multi_seed_cascade && expensive_shape {
+        MULTI_SEED_PREWARM_BUDGET.min(default_budget)
+    } else if expensive_shape {
+        SINGLE_EXPENSIVE_PREWARM_BUDGET.min(default_budget)
+    } else {
+        default_budget
+    }
+}
+
 /// Execute a single plan attempt (seed generation → solver loop → best result).
 fn run_outer_with_plan(
     obj: &mut dyn OuterObjective,
@@ -114,6 +143,24 @@ fn run_outer_with_plan(
     let expensive_seed_limit =
         expensive_unsuccessful_seed_limit(the_plan.solver, config.seed_config.risk_profile);
     let mut unsuccessful_expensive_seeds = 0usize;
+    let continuation_prewarm_budget =
+        continuation_prewarm_step_budget(config, cap, seeds.len(), seed_budget);
+    if continuation_prewarm_budget < crate::solver::estimate::reml::continuation::PATH_BUDGET {
+        let p_coefficients = config
+            .rho_uncertainty_problem_size
+            .p_coefficients
+            .unwrap_or(0);
+        log::info!(
+            "[OUTER] {context}: bounded continuation pre-warm budget to {} rho-step(s) \
+             for seed_count={} seed_budget={} rho_dim={} p_coefficients={}",
+            continuation_prewarm_budget,
+            seeds.len(),
+            seed_budget,
+            cap.n_params,
+            p_coefficients,
+        );
+    }
+    let mut continuation_prewarm_suppressed_after: Option<String> = None;
     // Tracks whether the loop broke out early due to
     // `expensive_unsuccessful_seed_limit` so the aggregate error can
     // distinguish "all generated seeds tried" from "stopped early".
@@ -525,64 +572,75 @@ fn run_outer_with_plan(
             && continuation_path.is_none()
             && enter_via_continuation_path
         {
-            let prewarm_start = std::time::Instant::now();
-            match crate::solver::estimate::reml::continuation::prime_outer_seed(
-                obj,
-                seed,
-                &bounds_template.1,
-            ) {
-                Ok(summary) => {
-                    // Skip the log line on collapse — that's the
-                    // zero-overhead easy-fit case and a log per seed would
-                    // be noise. Anything else is a real anneal worth
-                    // surfacing so large-scale runs are diagnosable.
-                    if !summary.collapsed {
-                        log::info!(
-                            "[OUTER] {context}: continuation pre-warm seed {seed_idx} steps={} elapsed={:.3}s",
-                            summary.steps_accepted,
-                            prewarm_start.elapsed().as_secs_f64(),
-                        );
+            if let Some(reason) = continuation_prewarm_suppressed_after.as_ref() {
+                log::info!(
+                    "[OUTER] {context}: skipping continuation pre-warm for seed {seed_idx} \
+                     after earlier non-structural pre-warm failure ({reason}); direct seed eval \
+                     will judge this candidate"
+                );
+            } else {
+                let prewarm_start = std::time::Instant::now();
+                match crate::solver::estimate::reml::continuation::prime_outer_seed_with_budget(
+                    obj,
+                    seed,
+                    &bounds_template.1,
+                    continuation_prewarm_budget,
+                ) {
+                    Ok(summary) => {
+                        // Skip the log line on collapse — that's the
+                        // zero-overhead easy-fit case and a log per seed would
+                        // be noise. Anything else is a real anneal worth
+                        // surfacing so large-scale runs are diagnosable.
+                        if !summary.collapsed {
+                            log::info!(
+                                "[OUTER] {context}: continuation pre-warm seed {seed_idx} steps={} elapsed={:.3}s",
+                                summary.steps_accepted,
+                                prewarm_start.elapsed().as_secs_f64(),
+                            );
+                        }
                     }
-                }
-                Err(cf) if cf.is_structural() => {
-                    // The pre-warm surfaced a structural defect of the seed's
-                    // joint design (rank/alias deficiency or a genuine
-                    // active-set KKT bug). This block runs only for
-                    // NON-continuation-entry objectives (continuation-entry
-                    // objectives drive the explicit `ContinuationPath` walk
-                    // above, where a structural refusal is a heavier-regime
-                    // demotion, never a rejection). Legacy contract: a cold solve
-                    // at the seed ρ* would hit the same defect, so disqualify the
-                    // seed and route the failure through the same structural
-                    // accounting any other pre-validation rejection takes.
-                    let msg = format!(
-                        "continuation pre-warm refused before seed eval: {}",
-                        cf.message()
-                    );
-                    log::warn!(
-                        "[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}"
-                    );
-                    rejection_reasons.push((seed_idx, "validation", msg));
-                    continue 'seed_attempts;
-                }
-                Err(cf) => {
-                    // Non-structural pre-warm failure: the continuation walk
-                    // could not complete from the heavily-oversmoothed ρ₀
-                    // (e.g. an ill-conditioned constraint KKT residual at
-                    // λ₀ ≫ λ*, a likelihood domain miss at that start, or a
-                    // stuck/budget-exhausted path). That is a property of the
-                    // warm-start schedule, NOT of the seed ρ* itself — which
-                    // the cold seed eval below judges on its own merits. The
-                    // pre-warm is a warm-start optimization, never a
-                    // feasibility gate (cf. #236, #500): a refusal here must
-                    // not disqualify a seed that would solve cold. Reset to a
-                    // clean baseline and fall through to the cold seed eval.
-                    log::warn!(
-                        "[OUTER] {context}: continuation pre-warm for seed {seed_idx} did not \
-                         complete ({}); falling back to a cold seed eval",
-                        cf.message()
-                    );
-                    obj.reset();
+                    Err(cf) if cf.is_structural() => {
+                        // The pre-warm surfaced a structural defect of the seed's
+                        // joint design (rank/alias deficiency or a genuine
+                        // active-set KKT bug). This block runs only for
+                        // NON-continuation-entry objectives (continuation-entry
+                        // objectives drive the explicit `ContinuationPath` walk
+                        // above, where a structural refusal is a heavier-regime
+                        // demotion, never a rejection). Legacy contract: a cold solve
+                        // at the seed ρ* would hit the same defect, so disqualify the
+                        // seed and route the failure through the same structural
+                        // accounting any other pre-validation rejection takes.
+                        let msg = format!(
+                            "continuation pre-warm refused before seed eval: {}",
+                            cf.message()
+                        );
+                        log::warn!(
+                            "[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}"
+                        );
+                        rejection_reasons.push((seed_idx, "validation", msg));
+                        continue 'seed_attempts;
+                    }
+                    Err(cf) => {
+                        // Non-structural pre-warm failure: the continuation walk
+                        // could not complete from the heavily-oversmoothed ρ₀
+                        // (e.g. an ill-conditioned constraint KKT residual at
+                        // λ₀ ≫ λ*, a likelihood domain miss at that start, or a
+                        // stuck/budget-exhausted path). That is a property of the
+                        // warm-start schedule, NOT of the seed ρ* itself — which
+                        // the cold seed eval below judges on its own merits. The
+                        // pre-warm is a warm-start optimization, never a
+                        // feasibility gate (cf. #236, #500): a refusal here must
+                        // not disqualify a seed that would solve cold. Reset to a
+                        // clean baseline and fall through to the cold seed eval.
+                        log::warn!(
+                            "[OUTER] {context}: continuation pre-warm for seed {seed_idx} did not \
+                             complete ({}); direct seed eval will judge this candidate and remaining \
+                             seeds will skip the pre-warm",
+                            cf.message()
+                        );
+                        obj.reset();
+                        continuation_prewarm_suppressed_after = Some(cf.message());
+                    }
                 }
             }
         }

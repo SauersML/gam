@@ -325,6 +325,19 @@ pub(crate) fn prime_outer_seed(
     seed: &Array1<f64>,
     bounds_upper: &Array1<f64>,
 ) -> Result<PrimingSummary, ContinuationFailure> {
+    prime_outer_seed_with_budget(obj, seed, bounds_upper, PATH_BUDGET)
+}
+
+/// Prime the outer seed with an explicit continuation path budget. The pre-warm
+/// is an optimization, so callers may cap the rho-walk more tightly on
+/// expensive multi-seed problems and let the ordinary cold seed evaluation
+/// judge the candidate when the cap is reached.
+pub(crate) fn prime_outer_seed_with_budget(
+    obj: &mut dyn OuterObjective,
+    seed: &Array1<f64>,
+    bounds_upper: &Array1<f64>,
+    path_budget: usize,
+) -> Result<PrimingSummary, ContinuationFailure> {
     // Pre-screen: if ρ₀ would clamp to ρ*, skip entirely. No inner
     // call, no allocation, no log line — continuation is invisible on
     // easy fits, satisfying the "magic by default" zero-overhead bar.
@@ -342,12 +355,13 @@ pub(crate) fn prime_outer_seed(
     // via `OuterEval::inner_beta_hint` from each accepted eval.
     let empty_beta: Array1<f64> = Array1::zeros(0);
 
-    match fit_with_continuation(
+    match fit_with_continuation_with_budget(
         obj,
         seed,
         bounds_upper,
         &empty_beta,
         OuterEvalOrder::ValueAndGradient,
+        path_budget,
     ) {
         Ok(state) => Ok(PrimingSummary {
             collapsed: false,
@@ -383,6 +397,17 @@ pub(crate) fn fit_with_continuation(
     initial_beta: &Array1<f64>,
     order: OuterEvalOrder,
 ) -> ContinuationResult {
+    fit_with_continuation_with_budget(obj, target, bounds_upper, initial_beta, order, PATH_BUDGET)
+}
+
+fn fit_with_continuation_with_budget(
+    obj: &mut dyn OuterObjective,
+    target: &Array1<f64>,
+    bounds_upper: &Array1<f64>,
+    initial_beta: &Array1<f64>,
+    order: OuterEvalOrder,
+    path_budget: usize,
+) -> ContinuationResult {
     if target.len() != bounds_upper.len() {
         return Err(ContinuationFailure::StructuralPropagate(
             InnerFailure::Other(format!(
@@ -394,9 +419,18 @@ pub(crate) fn fit_with_continuation(
     }
 
     let mut offset = OVERSMOOTH_OFFSET_INIT;
+    let path_budget = path_budget.max(1);
 
     for retry in 0..=OVERSMOOTH_RETRY_MAX {
-        match run_path(obj, target, bounds_upper, initial_beta, order, offset) {
+        match run_path(
+            obj,
+            target,
+            bounds_upper,
+            initial_beta,
+            order,
+            offset,
+            path_budget,
+        ) {
             Ok(state) => return Ok(state),
             Err(PathOutcome::ExpandRhoZero(last)) | Err(PathOutcome::Stuck(last)) => {
                 if retry == OVERSMOOTH_RETRY_MAX {
@@ -461,6 +495,7 @@ fn run_path(
     initial_beta: &Array1<f64>,
     order: OuterEvalOrder,
     offset: f64,
+    path_budget: usize,
 ) -> Result<ContinuationState, PathOutcome> {
     let rho0 = build_rho_zero(target, bounds_upper, offset);
     let collapsed = rho_zero_is_target(&rho0, target);
@@ -506,7 +541,7 @@ fn run_path(
         return Ok(state);
     }
 
-    walk_state_toward(obj, state, target, order, PATH_BUDGET, 1)
+    walk_state_toward(obj, state, target, order, path_budget, 1)
 }
 
 /// One **warm** continuation leg (the ContinuationPath waypoint primitive):
@@ -855,6 +890,34 @@ mod tests {
         assert_eq!(summary.steps_accepted, 0);
         assert_eq!(obj.rho_history.len(), 0, "no inner calls on collapse");
         assert_eq!(obj.seed_calls, 0);
+    }
+
+    #[test]
+    fn budgeted_prime_outer_seed_stops_before_full_path() {
+        let target = rho(&[0.0]);
+        let upper = rho(&[10.0]);
+        let mut obj = ScriptedObjective::new(
+            1,
+            vec![
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+            ],
+        );
+        let err = prime_outer_seed_with_budget(&mut obj, &target, &upper, 3)
+            .expect_err("budgeted pre-warm must stop before reaching target");
+        match err {
+            ContinuationFailure::PathBudgetExhausted { steps_taken, .. } => {
+                assert_eq!(steps_taken, 3);
+            }
+            other => panic!("expected PathBudgetExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            obj.rho_history.len(),
+            3,
+            "budget must cap the number of inner evals"
+        );
     }
 
     #[test]

@@ -94,7 +94,11 @@ pub(crate) fn classify_inner_error(message: String) -> InnerFailure {
             message,
         };
     }
-    if message.contains("inner_max_cycles") || message.contains("budget exhausted") {
+    if message.contains("inner_max_cycles")
+        || message.contains("budget exhausted")
+        || message.contains("exhausted the joint Newton budget")
+        || message.contains("did not converge after")
+    {
         return InnerFailure::BudgetExhausted { message };
     }
     if message.contains("trust-region floor") || message.contains("trust region floor") {
@@ -166,6 +170,17 @@ mod tests {
     #[test]
     fn classifies_budget_exhaustion() {
         let message = "inner_max_cycles reached without certification".to_string();
+        assert!(matches!(
+            classify_inner_error(message),
+            InnerFailure::BudgetExhausted { .. }
+        ));
+    }
+
+    #[test]
+    fn classifies_joint_newton_budget_exhaustion() {
+        let message = "coupled exact-joint inner solve exhausted the joint Newton budget \
+            without KKT convergence after 1200 cycle(s)"
+            .to_string();
         assert!(matches!(
             classify_inner_error(message),
             InnerFailure::BudgetExhausted { .. }
