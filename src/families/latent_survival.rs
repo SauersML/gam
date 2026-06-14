@@ -4002,6 +4002,30 @@ impl CustomFamily for LatentSurvivalFamily {
         true
     }
 
+    /// Engage the inner self-vanishing Levenberg–Marquardt μ on a full-rank but
+    /// indefinite / ill-conditioned penalized joint Hessian, mirroring the
+    /// sibling [`SurvivalMarginalSlopeFamily`]. Interval-censored rows contribute
+    /// `ℓ = log[S(L) − S(R)]`, the log of a DIFFERENCE of two survival kernels:
+    /// unlike the log-concave exact-event / right-censored contributions, its
+    /// per-row Hessian is legitimately INDEFINITE away from the optimum, so the
+    /// coupled exact-joint penalized Hessian on the constrained (monotone-cone)
+    /// time block can be full-rank (`nullity == 0`) yet indefinite or severely
+    /// ill-conditioned at the cold-start seed. The constrained-QP path already
+    /// REFLECTS negative-curvature modes to `|λ|` (a convex modified-Newton
+    /// model), but with this gate OFF it adds NO diagonal floor on a full-rank
+    /// ill-conditioned reflected model, so the trust-region Newton oscillates on
+    /// the near-singular mode and stalls out the inner budget before any KKT
+    /// snapshot is taken ("exited the joint Newton path before convergence — no
+    /// math snapshot"). Arming the gate adds the SAME self-vanishing μ
+    /// (∝ the projected KKT residual `‖∇ℓ − Sβ + ∇Φ‖` → 0 at the fixed point) the
+    /// marginal-slope survival inner relies on, so the step is a well-damped
+    /// modified-Newton descent that converges, while the converged β̂ is the
+    /// EXACT unconditioned optimum (μ → 0 there) — zero REML/LAML bias, exact
+    /// gradient unchanged.
+    fn levenberg_on_ill_conditioning(&self) -> bool {
+        true
+    }
+
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // `evaluate_exact_newton_joint_dense` builds a fully dense joint
         // Hessian over (Σ p_b)² across time, mean, and optional log-σ blocks
@@ -4160,6 +4184,17 @@ impl CustomFamily for LatentBinaryFamily {
     }
 
     fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
+    /// Same self-vanishing Levenberg–Marquardt gate as
+    /// [`LatentSurvivalFamily`]: the latent-binary deployment shares the
+    /// constrained (monotone-cone) coupled time block, so a full-rank but
+    /// ill-conditioned penalized joint Hessian at the cold-start seed must get
+    /// the self-vanishing μ floor rather than oscillating the constrained-QP
+    /// trust region into a snapshot-less stall. μ → 0 at the fixed point, so the
+    /// converged β̂ is exact (no REML/LAML bias).
+    fn levenberg_on_ill_conditioning(&self) -> bool {
         true
     }
 
