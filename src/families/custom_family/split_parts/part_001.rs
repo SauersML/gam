@@ -2203,6 +2203,20 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// Optional block-concatenated log-likelihood gradient `g = nabla l(theta)`
+    /// assembled from the SAME single source of truth as
+    /// [`Self::exact_newton_joint_hessian`] (e.g. a per-row jet-tower kernel), so
+    /// the damped Newton `H delta = g` is solved on a consistent (objective,
+    /// gradient, Hessian) triple. The default returns `None`, leaving the caller
+    /// on its legacy hand-assembled gradient.
+    fn exact_newton_joint_loglik_gradient(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array1<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(None)
+    }
+
     /// Optional exact directional derivative of the joint coefficient-space Hessian.
     ///
     /// Returns `Some(dH)` where `dH` is the directional derivative of the
