@@ -17,7 +17,7 @@
 //!    birth appends a residual-factor atom whose TOPOLOGY is chosen by EVIDENCE
 //!    (#977): [`race_birth_topology`] races the candidate bases matched to the
 //!    atom's intrinsic dim (`d = 1`: circle vs line; `d = 2`: torus vs
-//!    sphere/constant-curvature vs euclidean) by TK-normalized REML and seeds the
+//!    sphere/constant-curvature vs euclidean vs cylinder) by TK-normalized REML and seeds the
 //!    born atom from the winner, so the discovered dictionary is genuinely
 //!    heterogeneous rather than all-circle. Every child state is built FROM the
 //!    parent (never cold) so the engine's warm-state contract holds by
@@ -58,8 +58,8 @@ use crate::solver::{
 use crate::terms::atom_codes::SparseAtomCodes;
 use crate::terms::latent_coord::{LatentIdMode, LatentManifold};
 use crate::terms::sae::basis::{
-    EuclideanPatchEvaluator, PeriodicHarmonicEvaluator, SaeBasisSecondJet, SphereChartEvaluator,
-    TorusHarmonicEvaluator,
+    CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
+    SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
 };
 use crate::terms::sae_manifold::{
     SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
@@ -235,6 +235,7 @@ fn basis_kind_tag(kind: &SaeAtomBasisKind) -> &str {
         SaeAtomBasisKind::Torus => "torus",
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch",
         SaeAtomBasisKind::Poincare => "poincare",
+        SaeAtomBasisKind::Cylinder => "cylinder",
         SaeAtomBasisKind::Precomputed(_) => "precomputed",
     }
 }
@@ -661,11 +662,14 @@ struct TopologyCandidateSpec {
 ///   ([`EuclideanPatchEvaluator`] degree 3). These are the line-vs-circle race
 ///   the #1026 curved-vs-linear rung adjudicates post-fit, lifted to BIRTH.
 /// * **`d = 2`** — `Torus` ([`TorusHarmonicEvaluator`]), `Sphere`
-///   ([`SphereChartEvaluator`]), and a flat `Euclidean` patch
-///   ([`EuclideanPatchEvaluator`] degree 2). `Cylinder` (`S¹ × ℝ`) has no core
-///   evaluator — there is no mixed periodic/flat tensor basis in the rank-aware
-///   basis (`src/terms/sae/basis.rs`, settled), so it is honestly EXCLUDED from
-///   the realizable race rather than faked by a torus stand-in.
+///   ([`SphereChartEvaluator`]), a flat `Euclidean` patch
+///   ([`EuclideanPatchEvaluator`] degree 2), and `Cylinder` `S¹ × ℝ`
+///   ([`CylinderHarmonicEvaluator`]: a periodic circle axis tensored with a flat
+///   line axis). The cylinder is now a first-class d=2 candidate (the basis
+///   landed in `src/terms/sae/basis.rs`), so a residual that is periodic along
+///   one axis and unbounded-linear along the other earns a cylinder rather than
+///   being forced into a torus stand-in (which would wrap the linear axis
+///   spuriously) or a flat patch (which would lose the periodicity).
 ///
 /// The fixed harmonic / degree budgets mirror the seed-dictionary builder
 /// (`sae_build_atom_plans`): periodic gets `2·d_k + 1` columns, torus two
@@ -765,6 +769,27 @@ fn topology_candidates_for_dim(
                 manifold: LatentManifold::Euclidean,
                 latent_dim: 2,
                 evaluator: Arc::new(EuclideanPatchEvaluator::new(2, 2)?),
+                coords: coords_d(2),
+            });
+            specs.push(TopologyCandidateSpec {
+                kind: AutoTopologyKind::Cylinder,
+                basis_kind: SaeAtomBasisKind::Cylinder,
+                // Cylinder S¹ × ℝ: axis 0 is a unit-period circle (the
+                // fraction-of-period convention `CylinderHarmonicEvaluator` shares
+                // with the periodic / torus atoms), axis 1 is the unbounded flat
+                // line (`Euclidean`). This MUST match the production seeding
+                // (`SaeAtomBasisKind::Cylinder` → Product[Circle(1.0), Euclidean]
+                // in `sae_manifold::atom`); a flat `Euclidean` manifold would leave
+                // the born atom's phase axis un-wrapped, and a torus stand-in would
+                // wrap the linear axis spuriously. The harmonic / degree budget
+                // mirrors the torus (2 circle harmonics) and the patch (degree 2)
+                // so the cross-topology design widths stay commensurable.
+                manifold: LatentManifold::Product(vec![
+                    LatentManifold::Circle { period: 1.0 },
+                    LatentManifold::Euclidean,
+                ]),
+                latent_dim: 2,
+                evaluator: Arc::new(CylinderHarmonicEvaluator::new(2, 2)?),
                 coords: coords_d(2),
             });
         }

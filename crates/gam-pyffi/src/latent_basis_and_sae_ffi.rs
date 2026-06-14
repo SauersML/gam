@@ -1530,6 +1530,7 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
         "torus" => SaeAtomBasisKind::Torus,
         "euclidean" | "euclidean_patch" => SaeAtomBasisKind::EuclideanPatch,
         "poincare" | "poincare_patch" | "hyperbolic" => SaeAtomBasisKind::Poincare,
+        "cylinder" => SaeAtomBasisKind::Cylinder,
         other => SaeAtomBasisKind::Precomputed(other.to_string()),
     }
 }
@@ -1548,6 +1549,7 @@ fn sae_atom_basis_kind_name(kind: &SaeAtomBasisKind) -> String {
         SaeAtomBasisKind::Torus => "torus".to_string(),
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch".to_string(),
         SaeAtomBasisKind::Poincare => "poincare".to_string(),
+        SaeAtomBasisKind::Cylinder => "cylinder".to_string(),
         SaeAtomBasisKind::Precomputed(name) => name.clone(),
     }
 }
