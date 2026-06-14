@@ -61,7 +61,7 @@ pub(crate) const EFS_MAX_STEP: f64 = 5.0;
 /// - `rho`: Current log-smoothing parameters.
 /// - `gradient`: Full outer gradient `∂V_total/∂θ`, length
 ///   `n_rho + n_ext`. The caller must run
-///   [`super::reml::unified::EvalMode::ValueAndGradient`] when
+///   [`EvalMode::ValueAndGradient`] when
 ///   evaluating the cost so this slice is available.
 ///
 /// # Returns

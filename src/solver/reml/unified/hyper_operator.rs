@@ -2430,7 +2430,7 @@ impl ImplicitHyperOperator {
 /// without materializing the full dense matrix up front.
 pub struct SparseDirectionalHyperOperator {
     /// Original-basis design derivative X_τ.
-    pub(crate) x_tau: super::HyperDesignDerivative,
+    pub(crate) x_tau: super::super::HyperDesignDerivative,
     /// Design matrix X in the sparse-native basis.
     pub(crate) x_design: DesignMatrix,
     /// Working weights W (diagonal) — observed-information curvature, signed

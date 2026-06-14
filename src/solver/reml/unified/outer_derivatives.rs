@@ -58,9 +58,9 @@ pub(crate) const REML_TRACE_SLOW_LOG_MS: f64 = 100.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OuterHessianRoutePlan {
     pub(crate) use_operator: bool,
-    reason: &'static str,
-    scale_prefers_operator: bool,
-    dense_workspace_bytes: usize,
+    pub(crate) reason: &'static str,
+    pub(crate) scale_prefers_operator: bool,
+    pub(crate) dense_workspace_bytes: usize,
 }
 
 
@@ -78,7 +78,7 @@ impl OuterHessianRoutePlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OuterHessianScaleDecision {
     prefers_operator: bool,
-    reason: &'static str,
+    pub(crate) reason: &'static str,
 }
 
 
@@ -734,8 +734,8 @@ pub(crate) struct RemlDerivativeWorkspace<'a> {
 
 
 struct KktRhoCorrections {
-    gradient: Array1<f64>,
-    hessian: Option<Array2<f64>>,
+    pub(crate) gradient: Array1<f64>,
+    pub(crate) hessian: Option<Array2<f64>>,
 }
 
 
@@ -755,7 +755,7 @@ fn solve_kkt_residual_kernel(
 
 
 pub(crate) fn active_upper_rho_mask(rho: &[f64]) -> Vec<bool> {
-    let latest_theta = super::runtime::latest_outer_theta_for_ift();
+    let latest_theta = super::super::runtime::latest_outer_theta_for_ift();
     let matching_outer_theta = latest_theta.as_ref().is_some_and(|theta| {
         theta.len() >= rho.len()
             && theta
@@ -765,7 +765,7 @@ pub(crate) fn active_upper_rho_mask(rho: &[f64]) -> Vec<bool> {
                 .all(|(&recorded, &current)| recorded.to_bits() == current.to_bits())
     });
     let upper_bounds = matching_outer_theta
-        .then(super::runtime::latest_outer_rho_upper_bounds_for_ift)
+        .then(super::super::runtime::latest_outer_rho_upper_bounds_for_ift)
         .flatten();
     rho.iter()
         .enumerate()
@@ -1945,9 +1945,9 @@ pub(crate) fn compute_outer_hessian(
 
 
 struct StoredFirstDrift {
-    dense: Option<Array2<f64>>,
+    pub(crate) dense: Option<Array2<f64>>,
     dense_rotated: Option<Array2<f64>>,
-    operators: Vec<Arc<dyn HyperOperator>>,
+    pub(crate) operators: Vec<Arc<dyn HyperOperator>>,
 }
 
 
@@ -1994,8 +1994,8 @@ impl StoredFirstDrift {
 
 
 struct BorrowedStoredDriftOperator<'a> {
-    drift: &'a StoredFirstDrift,
-    dim_hint: usize,
+    pub(crate) drift: &'a StoredFirstDrift,
+    pub(crate) dim_hint: usize,
 }
 
 
@@ -2241,14 +2241,14 @@ impl HyperOperator for WeightedHyperOperator {
 struct PsiContractedContrib {
     objective: Array1<f64>,
     score: Array2<f64>,
-    ld_s: Array1<f64>,
+    pub(crate) ld_s: Array1<f64>,
     base_h2: Vec<f64>,
 }
 
 
 struct OuterHessianCoord {
-    a: f64,
-    g: Array1<f64>,
+    pub(crate) a: f64,
+    pub(crate) g: Array1<f64>,
     v: Array1<f64>,
     total_drift: StoredFirstDrift,
     base_drift: StoredFirstDrift,
@@ -2265,7 +2265,7 @@ impl OuterHessianCoord {
 
 
 struct UnifiedOuterHessianOperator {
-    hop: Arc<dyn HessianOperator>,
+    pub(crate) hop: Arc<dyn HessianOperator>,
     coords: Vec<OuterHessianCoord>,
     pair_a: Array2<f64>,
     pair_ld_s: Array2<f64>,
@@ -2288,8 +2288,8 @@ struct UnifiedOuterHessianOperator {
     is_profiled: bool,
     incl_logdet_h: bool,
     incl_logdet_s: bool,
-    kernel: OuterHessianDerivativeKernel,
-    subspace: Option<Arc<PenaltySubspaceTrace>>,
+    pub(crate) kernel: OuterHessianDerivativeKernel,
+    pub(crate) subspace: Option<Arc<PenaltySubspaceTrace>>,
     adjoint_z_c: Option<Array1<f64>>,
     leverage: Option<Array1<f64>>,
     fourth_trace: Option<Array2<f64>>,

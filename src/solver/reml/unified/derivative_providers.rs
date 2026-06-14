@@ -155,7 +155,7 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// matrix-free Hv operator without enumerating θ_iθ_j pairs, it returns
     /// `Some(op)` here.  The unified evaluator then short-circuits the
     /// kernel-based assembly path at
-    /// [`reml_laml_evaluate`](self::reml_laml_evaluate) and routes the result
+    /// [`reml_laml_evaluate`] and routes the result
     /// straight into [`HessianResult::Operator`].
     ///
     /// Default returns `None`, in which case the evaluator falls through to
@@ -427,7 +427,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
 /// where B_k = −v_k (mode response) and the Firth operators use δη = X·B_k.
 pub struct FirthAwareGlmDerivatives {
     pub(super) base: SinglePredictorGlmDerivatives,
-    pub(super) firth_op: std::sync::Arc<super::FirthDenseOperator>,
+    pub(super) firth_op: std::sync::Arc<super::super::FirthDenseOperator>,
 }
 
 
@@ -547,7 +547,7 @@ pub struct ExactJeffreysTerm {
     /// supplies the curvature/drift terms through its own
     /// `H_Φ`-aware derivative provider and only the scalar `Φ(β̂)` needs to
     /// reach the LAML cost.
-    operator: Option<std::sync::Arc<super::FirthDenseOperator>>,
+    operator: Option<std::sync::Arc<super::super::FirthDenseOperator>>,
     /// Tangent-projected value override. When `Some`, `value()` returns
     /// this scalar instead of the operator's full-space `½ log|J|`. This
     /// is used by `try_tangent_projected_evaluate` to substitute
@@ -562,7 +562,7 @@ pub struct ExactJeffreysTerm {
 
 
 impl ExactJeffreysTerm {
-    pub(crate) fn new(operator: std::sync::Arc<super::FirthDenseOperator>) -> Self {
+    pub(crate) fn new(operator: std::sync::Arc<super::super::FirthDenseOperator>) -> Self {
         Self {
             operator: Some(operator),
             value_override: None,
@@ -589,7 +589,7 @@ impl ExactJeffreysTerm {
     /// Construct a tangent-projected variant: wraps the same operator but
     /// returns `½ log|ZᵀJZ|` from `value()`.
     pub(crate) fn with_projected_value(
-        operator: std::sync::Arc<super::FirthDenseOperator>,
+        operator: std::sync::Arc<super::super::FirthDenseOperator>,
         projected_value: f64,
     ) -> Self {
         Self {
@@ -608,7 +608,7 @@ impl ExactJeffreysTerm {
     }
 
     #[inline]
-    pub(crate) fn operator_arc(&self) -> Option<std::sync::Arc<super::FirthDenseOperator>> {
+    pub(crate) fn operator_arc(&self) -> Option<std::sync::Arc<super::super::FirthDenseOperator>> {
         self.operator.as_ref().map(std::sync::Arc::clone)
     }
 }

@@ -64,7 +64,7 @@ pub enum PseudoLogdetMode {
 /// clamping, ensuring that logdet and inverse use the same smooth mapping.
 pub struct DenseSpectralOperator {
     /// Regularized eigenvalues: `r_ε(σ_i)` for each raw eigenvalue `σ_i`.
-    reg_eigenvalues: Vec<f64>,
+    pub(crate) reg_eigenvalues: Vec<f64>,
     /// Per-eigenvalue mask: `true` if the eigenpair participates in all
     /// traces, solves, and logdet contributions.  Under
     /// [`PseudoLogdetMode::Smooth`] every entry is `true`.  Under
@@ -72,26 +72,26 @@ pub struct DenseSpectralOperator {
     /// so the numerical null space is excluded consistently from
     /// `log|H|_+`, its gradient, its cross-traces, AND `H⁻¹` solves
     /// (`H⁺` on the active subspace).
-    active_mask: Vec<bool>,
+    pub(crate) active_mask: Vec<bool>,
     /// Eigenvectors of H (columns).
-    eigenvectors: Array2<f64>,
+    pub(crate) eigenvectors: Array2<f64>,
     /// Precomputed: W = U diag(1/√r_ε(σ)) for efficient traces.
     /// trace(H⁻¹ A) = Σ (AW ⊙ W)
-    w_factor: Array2<f64>,
+    pub(crate) w_factor: Array2<f64>,
     /// Precomputed kernel K_ab = 1 / (r_a r_b) for exact H⁻¹ cross traces in
     /// the eigenbasis.
     hinv_cross_kernel: Array2<f64>,
     /// Precomputed: G = U diag(1/√(√(σ² + 4ε²))) for logdet gradient traces.
     /// trace(G_ε(H) A) = Σ (AG ⊙ G) where G_ε uses φ'(σ) = 1/√(σ² + 4ε²).
-    g_factor: Array2<f64>,
+    pub(crate) g_factor: Array2<f64>,
     /// Precomputed divided-difference kernel Γ for exact logdet Hessian cross traces
     /// in the eigenbasis.
     logdet_hessian_kernel: Array2<f64>,
     /// Precomputed log-determinant: Σ ln(r_ε(σ_i)).
-    cached_logdet: f64,
-    projected_factor_cache: ProjectedFactorCache,
+    pub(crate) cached_logdet: f64,
+    pub(crate) projected_factor_cache: ProjectedFactorCache,
     /// Full dimension.
-    n_dim: usize,
+    pub(crate) n_dim: usize,
 }
 
 

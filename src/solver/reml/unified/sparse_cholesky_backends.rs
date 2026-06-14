@@ -1572,7 +1572,7 @@ pub fn compute_block_penalty_logdet_derivs(
     per_block_penalties: &[&[Array2<f64>]],
     ridge: f64,
 ) -> Result<PenaltyLogdetDerivs, String> {
-    use super::penalty_logdet::PenaltyPseudologdet;
+    use super::super::penalty_logdet::PenaltyPseudologdet;
 
     let total_k: usize = per_block_rho.iter().map(|r| r.len()).sum();
     let block_offsets: Vec<usize> = per_block_rho

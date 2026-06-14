@@ -646,7 +646,7 @@ impl PenaltyCoordinate {
 // PenaltyLogdetEigenspace, build_penalty_logdet_eigenspace,
 // scaled_penalty_logdet_nullspace_leakage, and frobenius_inner_same_shape
 // have been replaced by the canonical PenaltyPseudologdet in
-// super::penalty_logdet. All callers now use that module directly.
+// super::super::penalty_logdet. All callers now use that module directly.
 
 /// Reduced trace kernel `K = U · M · Uᵀ` for pseudo-logdet REML/LAML
 /// criteria: an orthonormal column basis `u_s` (p × r) plus the r × r
