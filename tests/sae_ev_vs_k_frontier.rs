@@ -555,7 +555,19 @@ fn run_production_fit(
 /// the test rows. The decoder is never re-fit on test rows — only the per-row
 /// assignment masses are seeded (the same cold residual-energy IBP routing the
 /// production predict path uses), so this is a genuine generalization measurement
-/// of the trained dictionary.
+/// of the trained DECODER.
+///
+/// HONESTY CAVEAT (stated, not hidden): the curved-atom test latent coordinates
+/// are seeded from the planted `theta_test` (plus the same fixed per-slot offset
+/// the train arm uses), not encoded from `z_test` alone — coordinate *recovery*
+/// is deliberately not what this frontier tests, and seeding both arms from the
+/// same planted angles keeps the hybrid-vs-linear contrast apples-to-apples. What
+/// IS held out is the decoder `B_k`: it is frozen from the TRAIN fit and never
+/// sees a test row, so EV(K) measures how well the trained decoder curve
+/// generalizes to fresh draws at known coordinates. The linear-bulk coordinate is
+/// genuinely encoded from `z_test` (projection onto the bulk direction), so the
+/// bulk arm is a full encode+decode generalization; only the curved coordinate is
+/// oracle-seeded.
 fn held_out_ev(
     fitted: &SaeManifoldTerm,
     slots: &[Slot],
@@ -850,5 +862,47 @@ fn ev_vs_k_frontier_discriminates_curved_from_linear_and_hybrid_dominates() {
         ev_kc >= 0.70,
         "ABSOLUTE BAR FAIL: hybrid held-out EV at K={k_curved} ({ev_kc:.6}) below 0.70 — the \
          curved dictionary must explain the planted curved signal out of sample"
+    );
+
+    // --- Assertion 5: the DISCRIMINATING signature — the pure-linear arm has NOT
+    // flattened where the hybrid has. ---
+    // This is the actual #1026 hypothesis test (H_flat vs H_curved). Under the
+    // Θ/(2√(2ε)) shatter law a pure-linear dictionary must keep adding secants to
+    // refine each circle, so its EV(K) is still climbing across K=k_curved->2·k_curved
+    // exactly where the hybrid (one curved atom per family) has run out of structure
+    // and flattened. Encode that as: the pure-linear arm climbs MORE over the tail
+    // doubling than the hybrid does, AND that linear tail climb is non-trivial. A
+    // corpus on which BOTH arms flatten together (H_flat) would fail this — which is
+    // the discrimination the frontier exists to perform.
+    let lin_k2c = linear_ev
+        .iter()
+        .find(|(k, _)| *k == 2 * k_curved)
+        .map(|(_, v)| *v)
+        .expect("2*k_curved is on the ladder");
+    let lin_k1 = linear_ev[0].1;
+    let lin_tail_gain = lin_k2c - lin_kc;
+    let lin_climb_gain = lin_kc - lin_k1;
+    println!(
+        "discrimination: hybrid tail/climb = {:.4} (flattens), linear tail/climb = {:.4} (still shattering)",
+        if climb_gain.abs() > 1e-9 { tail_gain / climb_gain } else { f64::NAN },
+        if lin_climb_gain.abs() > 1e-9 { lin_tail_gain / lin_climb_gain } else { f64::NAN }
+    );
+    // The pure-linear arm is still meaningfully refining over the tail doubling: a
+    // single secant per circle leaves the largest secant error, and doubling the
+    // chord count is exactly where the shatter law buys the most. We require the
+    // linear tail gain to clear a real floor (not noise) AND to exceed the hybrid's
+    // collapsed tail by a clear margin (the curvature/shatter contrast itself).
+    assert!(
+        lin_tail_gain >= 0.03,
+        "DISCRIMINATION FAIL: pure-linear tail gain ({lin_tail_gain:.6}, K={k_curved}->{}) is below \
+         0.03 — a linear dictionary must KEEP climbing by shattering circles into finer secants; \
+         if it has already flattened the corpus is not curvature-discriminating",
+        2 * k_curved
+    );
+    assert!(
+        lin_tail_gain >= tail_gain + 0.02,
+        "DISCRIMINATION FAIL: pure-linear tail gain ({lin_tail_gain:.6}) did not exceed the hybrid \
+         tail gain ({tail_gain:.6}) by 0.02 — the discriminating signature is that the curved/hybrid \
+         dictionary flattens while the pure-linear shatter is still refining at the same budget"
     );
 }
