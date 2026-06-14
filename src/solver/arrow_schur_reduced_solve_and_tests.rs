@@ -983,6 +983,7 @@ impl JacobiPreconditioner {
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
         backend: &B,
+        resident: Option<&SaeResidentReducedSchur>,
     ) -> Result<Self, ArrowSchurError> {
         let use_block = !sys.block_offsets.is_empty()
             && sys
@@ -994,6 +995,16 @@ impl JacobiPreconditioner {
                 <= BLOCK_JACOBI_MAX_BLOCK;
         if use_block {
             Self::build_block_jacobi(sys, htt_factors, ridge_beta, backend)
+        } else if let Some(res) = resident {
+            // #1017 — SAE residency scalar Jacobi. The generic scalar build
+            // probes `H_tβ^(i) e_a` and re-solves `(H_tt^(i))⁻¹` once for EVERY
+            // (row, β-column) pair: `O(n·K)` triangular solves and `O(n·K·p)`
+            // operator-probe work per Newton step, with `K = K_atoms·p` in the
+            // tens of thousands at LLM shapes. The reduced-Schur diagonal is the
+            // same quotient the resident `(L_i, Y_i)` factors already carry, so
+            // read the diagonal straight off them in one support-sparse pass —
+            // no probe, no per-column solve.
+            Self::build_scalar_jacobi_resident(sys, ridge_beta, res)
         } else {
             Self::build_scalar_jacobi(sys, htt_factors, ridge_beta, backend)
         }
@@ -1056,6 +1067,94 @@ impl JacobiPreconditioner {
                 return Err(ArrowSchurError::PcgFailed {
                     reason: format!(
                         "invalid Schur Jacobi diagonal at index {a}: {v}; \
+                         operator regularization is required"
+                    ),
+                });
+            }
+            blocks.push(BlockFactor::Scalar {
+                inv: Array1::from_elem(1, 1.0 / v),
+                range: a..a + 1,
+            });
+        }
+        Ok(Self { blocks })
+    }
+
+    /// Build scalar-diagonal Jacobi from the pre-staged SAE residency factors
+    /// `(L_i, Y_i)` (#1017).
+    ///
+    /// The generic [`Self::build_scalar_jacobi`] forms each reduced-Schur
+    /// diagonal entry `S_aa = H_ββ,aa + ρ − Σ_i (H_tβ^(i) e_a)ᵀ(H_tt^(i))⁻¹(H_tβ^(i) e_a)`
+    /// by probing the cross-block operator with the unit vector `e_a` and
+    /// re-solving `(H_tt^(i))⁻¹` for every `(row, column)` pair — `O(n·K)`
+    /// triangular solves per Newton step. For the SAE Kronecker cross-block the
+    /// `a`-th column lives on exactly one active support entry: `a = beta_base + j`
+    /// for some `(beta_base, φ) ∈ a_phi[i]` and output channel `j ∈ 0..p`, with
+    /// `H_tβ^(i) e_a = φ · L_i[:, j]`. The point-elimination quotient is then
+    ///
+    /// ```text
+    /// (H_tβ^(i) e_a)ᵀ (H_tt^(i))⁻¹ (H_tβ^(i) e_a)
+    ///     = φ² · L_i[:, j]ᵀ (H_tt^(i))⁻¹ L_i[:, j]
+    ///     = φ² · (L_i[:, j] · Y_i[:, j]),          Y_i := (H_tt^(i))⁻¹ L_i.
+    /// ```
+    ///
+    /// so the whole diagonal is accumulated in ONE support-sparse pass over the
+    /// resident factors — no probe, no per-column solve, the staged `Y_i` reused
+    /// from the matvec residency. The result is the SAME quotient the generic
+    /// path computes (up to float reassociation of the row sum), so the PCG
+    /// preconditioner — and therefore the criterion ranking — is unchanged.
+    fn build_scalar_jacobi_resident(
+        sys: &ArrowSchurSystem,
+        ridge_beta: f64,
+        resident: &SaeResidentReducedSchur,
+    ) -> Result<Self, ArrowSchurError> {
+        let k = sys.k;
+        let p = resident.p;
+        // Seed with diag(H_ββ) + ridge — same penalty source the generic path
+        // reads, so the only difference is how the point-elimination term is
+        // gathered.
+        let mut diag = Array1::<f64>::zeros(k);
+        {
+            let diag_slice = diag.as_slice_mut().expect("diag must be contiguous");
+            sys.penalty_diagonal_add(diag_slice);
+        }
+        for a in 0..k {
+            diag[a] += ridge_beta;
+        }
+        // Per-row point-elimination diagonal: for each active support entry
+        // `(beta_base, φ)` and channel `j`, subtract `φ² · L_i[:, j]·Y_i[:, j]`
+        // into `diag[beta_base + j]`. `L_i`/`Y_i` are row-major `di × p`, so the
+        // `j`-th column dot is `Σ_r L_i[r·p + j]·Y_i[r·p + j]`.
+        for (row, rf) in resident.rows.iter().enumerate() {
+            let di = rf.di;
+            if di == 0 {
+                continue;
+            }
+            let support = &resident.a_phi[row];
+            if support.is_empty() {
+                continue;
+            }
+            for &(beta_base, phi) in support {
+                if phi == 0.0 {
+                    continue;
+                }
+                let phi2 = phi * phi;
+                for j in 0..p {
+                    let mut col_dot = 0.0_f64;
+                    for r in 0..di {
+                        let idx = r * p + j;
+                        col_dot += rf.l[idx] * rf.y[idx];
+                    }
+                    diag[beta_base + j] -= phi2 * col_dot;
+                }
+            }
+        }
+        let mut blocks = Vec::with_capacity(k);
+        for a in 0..k {
+            let v = diag[a];
+            if !v.is_finite() || v <= JACOBI_DIAGONAL_PD_FLOOR {
+                return Err(ArrowSchurError::PcgFailed {
+                    reason: format!(
+                        "invalid SAE-resident Schur Jacobi diagonal at index {a}: {v}; \
                          operator regularization is required"
                     ),
                 });
@@ -1639,7 +1738,13 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     } else {
         None
     };
-    let jacobi = JacobiPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend)?;
+    let jacobi = JacobiPreconditioner::from_arrow_schur(
+        sys,
+        htt_factors,
+        ridge_beta,
+        backend,
+        resident.as_ref(),
+    )?;
     let (x0, diag0) = run_pcg_with_preconditioner(
         sys,
         htt_factors,
@@ -5022,6 +5127,55 @@ mod tests {
                 out_resident[a].to_bits(),
                 out_resident2[a].to_bits(),
                 "resident SAE matvec must be deterministic run-to-run at index {a}"
+            );
+        }
+    }
+
+    /// The #1017 SAE-resident scalar Jacobi (built from the staged `(L_i, Y_i)`
+    /// factors in one support-sparse pass) must produce the SAME reduced-Schur
+    /// diagonal — hence the SAME `BlockFactor::Scalar` inverses — as the generic
+    /// per-column probe-and-solve `build_scalar_jacobi`. A diverging
+    /// preconditioner would change the PCG iterate and the criterion ranking.
+    #[test]
+    fn resident_scalar_jacobi_matches_generic() {
+        let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64;
+        let q = 4usize;
+        let p = 5usize;
+        let n_atoms = 20usize;
+        let m_active = 4usize;
+        let (sys, _a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
+        let backend = CpuBatchedBlockSolver;
+        let htt_factors = backend
+            .factor_blocks(&sys.rows, 0.0, q, false)
+            .expect("SPD per-row blocks must factor");
+        let ridge_beta = 1e-6;
+
+        let generic = JacobiPreconditioner::build_scalar_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+            .expect("generic scalar Jacobi must build");
+        let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend)
+            .expect("SAE structure must yield a resident operator");
+        let resident_jac =
+            JacobiPreconditioner::build_scalar_jacobi_resident(&sys, ridge_beta, &resident)
+                .expect("resident scalar Jacobi must build");
+
+        // Probe both preconditioners with the same residual and compare the
+        // applied (diagonal-scaled) output: identical diagonals ⇒ identical apply.
+        let k = sys.k;
+        let r = Array1::from_iter((0..k).map(|a| 0.3 * ((a as f64) * 0.021).sin() + 0.07));
+        let out_generic = generic.apply(&r);
+        let out_resident = resident_jac.apply(&r);
+        let scale = out_generic
+            .iter()
+            .fold(0.0_f64, |m, &v| m.max(v.abs()))
+            .max(1.0);
+        for a in 0..k {
+            let rel = (out_resident[a] - out_generic[a]).abs() / scale;
+            assert!(
+                rel < 1e-9,
+                "resident vs generic SAE scalar Jacobi must agree at index {a}: \
+                 {} vs {} (rel {rel:e})",
+                out_resident[a],
+                out_generic[a]
             );
         }
     }
