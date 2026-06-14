@@ -397,6 +397,78 @@ fn response_geometry_exp_map<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
+/// Fit curvature as an estimand on a constant-curvature response geometry
+/// (#944 stage 4 / #1104). The user requests `response_geometry="constant_
+/// curvature(dim=d)"`; κ is NOT supplied — it is estimated from the manifold-
+/// valued responses by the REML/evidence outer loop (the profiled Fréchet-
+/// dispersion criterion), and the fit reports κ̂ with a profile-likelihood CI,
+/// the geometry verdict, and the interior-point Wilks flatness test of κ = 0.
+///
+/// Returns the summary tuple
+/// `(kappa_hat, ci_lo, ci_hi, lo_at_bound, hi_at_bound, verdict, lr_stat,
+///   p_value, base_point)` for the response-geometry fit summary.
+#[pyfunction(signature = (values, geometry, level=0.95))]
+#[allow(clippy::type_complexity)]
+fn response_geometry_fit_curvature<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+    geometry: String,
+    level: f64,
+) -> PyResult<(
+    f64,
+    f64,
+    f64,
+    bool,
+    bool,
+    String,
+    f64,
+    f64,
+    Py<PyArray1<f64>>,
+)> {
+    let arr = values.as_array().to_owned();
+    let fit = detach_py_result(py, "response_geometry_fit_curvature", move || {
+        let manifold =
+            gam::geometry::response_geometry::ResponseManifold::parse(&geometry, arr.ncols())?;
+        let dim = match manifold {
+            gam::geometry::response_geometry::ResponseManifold::ConstantCurvature {
+                dim,
+                ..
+            } => dim,
+            other => {
+                return Err(format!(
+                    "response_geometry_fit_curvature requires a constant_curvature geometry; \
+                     got {}",
+                    other.canonical_label()
+                ));
+            }
+        };
+        gam::geometry::response_geometry::fit_response_curvature(
+            arr.view(),
+            dim,
+            level,
+            1.0e-12,
+            256,
+        )
+    })?;
+    let verdict = match fit.profile_ci.verdict {
+        gam::geometry::CurvatureVerdict::Spherical => "spherical",
+        gam::geometry::CurvatureVerdict::Hyperbolic => "hyperbolic",
+        gam::geometry::CurvatureVerdict::Flat => "flat",
+    }
+    .to_string();
+    Ok((
+        fit.kappa_hat,
+        fit.profile_ci.ci_lo,
+        fit.profile_ci.ci_hi,
+        fit.profile_ci.lo_at_bound,
+        fit.profile_ci.hi_at_bound,
+        verdict,
+        fit.flatness.lr_stat,
+        fit.flatness.p_value,
+        fit.base.into_pyarray(py).unbind(),
+    ))
+}
+
 #[pyfunction]
 fn sinkhorn_circular_cost<'py>(py: Python<'py>, m: usize) -> PyResult<Py<PyArray2<f64>>> {
     let out = py.detach(move || sinkhorn_circular_cost_impl(m));
@@ -3766,6 +3838,14 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(multinomial_model_metadata_pyfunc, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        predict_multinomial_intervals_pyfunc,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        multinomial_smooth_significance_pyfunc,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(identifiability_check_json, module)?)?;
@@ -3826,6 +3906,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(predict_table_conformal, module)?)?;
     // #1054: exact Gaussian jackknife+ conformal intervals (no calibration fold).
     module.add_function(wrap_pyfunction!(predict_table_jackknife_plus, module)?)?;
+    // #1098: exact Gaussian full-conformal prediction set (no calibration fold).
+    module.add_function(wrap_pyfunction!(predict_table_full_conformal, module)?)?;
     // #1057: posterior-predictive replicate sampling from the fitted model.
     module.add_function(wrap_pyfunction!(generative_replicates, module)?)?;
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
@@ -3978,6 +4060,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(response_geometry_sphere_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_exp_map, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_fit_curvature, module)?)?;
     module.add_function(wrap_pyfunction!(
         response_geometry_sphere_normalize_base,
         module
@@ -6406,6 +6489,153 @@ fn predict_table_jackknife_plus_impl(
         )),
     })
     .map_err(|err| format!("failed to serialize jackknife+ prediction payload: {err}"))
+}
+
+/// #1098 EXACT Gaussian full-conformal prediction set — no calibration fold.
+///
+/// Reads the `ExactFullConformalSubstrate` precomputed at fit time (only
+/// available for Gaussian-identity, unit-weight, offset-free models without a
+/// link wiggle), rebuilds the test design from the saved `resolved_termspec`,
+/// and calls `substrate.interval(x_*, alpha)` per test row — one Cholesky each,
+/// zero refits. The exact set is a union of intervals; the returned
+/// `mean_lower`/`mean_upper` are its outer envelope (a superset, inheriting the
+/// finite-sample coverage). A `frozen_rho_certified` column reports the Layer-3
+/// self-diagnostic per row (1.0 accepted / 0.0 refused).
+///
+/// `alpha = 1 − conformal_level` (the full-conformal set `C_α` has marginal
+/// coverage `≥ 1 − α`, so `conformal_level = 1 − α` directly; unlike jackknife+
+/// there is no factor of two).
+///
+/// Falls back with a clear error when the model is ineligible (non-Gaussian
+/// family, scan-routed model, link wiggle, weighted training data, or an older
+/// serialised payload that pre-dates the substrate).
+fn predict_table_full_conformal_impl(
+    model_bytes: &[u8],
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    conformal_level: f64,
+) -> Result<String, String> {
+    if !(conformal_level > 0.0 && conformal_level < 1.0) {
+        return Err(format!(
+            "conformal_level must be in (0, 1), got {conformal_level}"
+        ));
+    }
+    let model = load_model_impl(model_bytes)?;
+    if scan_introspection(&model)
+        .map_err(String::from)?
+        .is_some()
+    {
+        return Err(
+            "exact full-conformal intervals require a penalised-spline (B-spline) model; \
+             this model was fit by the exact O(n) state-space scan. Refit with \
+             double_penalty=true to obtain the standard model that carries the substrate."
+                .to_string(),
+        );
+    }
+    let substrate = model.full_conformal.as_ref().ok_or_else(|| {
+        "exact full-conformal intervals require a Gaussian-identity GLM trained without \
+         prior weights, offsets, or a link wiggle. This model is ineligible (non-Gaussian \
+         family, weighted data, offset, link wiggle, or an older serialised payload). \
+         Use Model.predict_conformal(calibration=...) for split-conformal intervals on \
+         arbitrary families."
+            .to_string()
+    })?;
+    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
+        return Err(format!(
+            "exact full-conformal prediction supports only standard GAM models; got '{}'",
+            prediction_model_class_label(&model)
+        ));
+    }
+    let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
+    let col_map = dataset.column_map();
+    let spec = gam::survival_predict::resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        model.training_headers.as_ref(),
+        &col_map,
+        "resolved_termspec",
+    )?;
+    let design = gam::smooth::build_term_collection_design(dataset.values.view(), &spec)
+        .map_err(|err| format!("full conformal: failed to build test design: {err}"))?;
+    let x_test = design
+        .design
+        .try_to_dense_by_chunks("full conformal test design")?;
+    let n_test = x_test.nrows();
+    if x_test.ncols() != substrate.p() {
+        return Err(format!(
+            "full conformal: test design has {} columns but the stored substrate has p={}; \
+             the model may need to be refit",
+            x_test.ncols(),
+            substrate.p()
+        ));
+    }
+    // The full-conformal set C_α covers Y_* with marginal probability ≥ 1 − α,
+    // so the user's conformal_level maps directly to α = 1 − conformal_level
+    // (no factor-of-two as in the jackknife+ ≥ 1 − 2α guarantee).
+    let alpha = 1.0 - conformal_level;
+    let mut mean_vec = Vec::with_capacity(n_test);
+    let mut lower_vec = Vec::with_capacity(n_test);
+    let mut upper_vec = Vec::with_capacity(n_test);
+    let mut certified_vec = Vec::with_capacity(n_test);
+    for i in 0..n_test {
+        let x_star = x_test.row(i).to_owned();
+        let iv = substrate
+            .interval(&x_star, alpha)
+            .map_err(|e| format!("full conformal at row {i}: {e}"))?;
+        // Report the envelope centre as the point summary when finite; an
+        // unbounded honest envelope reports its finite endpoint.
+        let point = if iv.lo.is_finite() && iv.hi.is_finite() {
+            0.5 * (iv.lo + iv.hi)
+        } else if iv.lo.is_finite() {
+            iv.lo
+        } else {
+            iv.hi
+        };
+        mean_vec.push(point);
+        lower_vec.push(iv.lo);
+        upper_vec.push(iv.hi);
+        certified_vec.push(if iv.frozen_rho_certified { 1.0 } else { 0.0 });
+    }
+    let mut columns = BTreeMap::<String, Vec<f64>>::new();
+    columns.insert("linear_predictor".to_string(), mean_vec.clone());
+    columns.insert("mean".to_string(), mean_vec);
+    columns.insert("mean_lower".to_string(), lower_vec);
+    columns.insert("mean_upper".to_string(), upper_vec);
+    columns.insert("frozen_rho_certified".to_string(), certified_vec);
+    serde_json::to_string(&PredictionPayload {
+        columns,
+        model_class: prediction_model_class_label(&model),
+        family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
+        interval_method: Some(format!(
+            "exact full-conformal (distribution-free, finite-sample ≥{:.0}% coverage; \
+             #942 Layer 1 + frozen-ρ certificate)",
+            conformal_level * 100.0
+        )),
+    })
+    .map_err(|err| format!("failed to serialize full-conformal prediction payload: {err}"))
+}
+
+/// Distribution-free EXACT full-conformal prediction intervals — no held-out
+/// calibration fold required (#1098 / #942 Layer 1).
+///
+/// Routes `predict(interval='full_conformal')` for Gaussian-identity models to
+/// the `ExactFullConformalSubstrate` precomputed at fit time, giving the EXACT
+/// distribution-free set with finite-sample ≥`conformal_level` marginal
+/// coverage. Returns the same column JSON as `predict_table` plus a
+/// `frozen_rho_certified` column carrying the Layer-3 self-diagnostic.
+///
+/// Raises a descriptive Python exception for ineligible models (non-Gaussian,
+/// weighted, scan-routed, …) directing the user to `predict_conformal`.
+#[pyfunction(signature = (model_bytes, headers, rows, conformal_level=0.9))]
+fn predict_table_full_conformal(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    conformal_level: f64,
+) -> PyResult<String> {
+    detach_py_result(py, "predict_table_full_conformal", move || {
+        predict_table_full_conformal_impl(&model_bytes, headers, rows, conformal_level)
+    })
 }
 
 /// Distribution-free jackknife+ conformal prediction intervals — no held-out

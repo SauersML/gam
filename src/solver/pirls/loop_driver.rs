@@ -645,6 +645,16 @@ pub struct PirlsProblem<'a, X> {
     /// `pirls.rs:6237`). The penalty `λ·S` is still added per-λ on top of
     /// the cached `XᵀWX`.
     pub gaussian_fixed_cache: Option<&'a GaussianFixedCache>,
+    /// Frozen-weight first-Fisher-step data-fit Gram `XᵀWX` for a GLM
+    /// design-moving ψ-trial (#1111 / #1033 mechanism (c)), in *original*
+    /// (conditioned `x_fit`) coordinates. When set, the iterative GLM P-IRLS
+    /// serves its FIRST Fisher-scoring iteration's `XᵀWX` from this matrix
+    /// instead of streaming the O(N·p²) weighted cross-product; every later
+    /// iteration restreams the true moving `W`, so the converged β̂ is
+    /// unchanged. Mutually distinct from `gaussian_fixed_cache` (which is the
+    /// Gaussian-identity converged-objective short-circuit); this is the GLM
+    /// first-step lane and never short-circuits the iteration count.
+    pub glm_first_step_gram: Option<&'a Array2<f64>>,
 }
 
 // GaussianFixedCache is defined in pls_solver.
@@ -741,6 +751,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         priorweights,
         covariate_se,
         gaussian_fixed_cache,
+        glm_first_step_gram,
     } = problem;
     let quadctx = crate::quadrature::QuadratureContext::new();
     let lambdas = rho.exp();

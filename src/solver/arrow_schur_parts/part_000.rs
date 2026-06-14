@@ -6907,7 +6907,7 @@ fn back_substitute_delta_t<B: BatchedBlockSolver + Sync>(
     let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
     let solve_row = |i: usize, out: &mut [f64]| {
         let di = sys.row_dims[i];
-        debug_assert_eq!(sys.rows[i].gt.len(), di);
+        assert_eq!(sys.rows[i].gt.len(), di);
         let mut htbeta_slice = Array1::<f64>::zeros(di);
         sys_htbeta_apply_row(sys, i, &sys.rows[i], delta_beta, &mut htbeta_slice);
         let mut rhs = Array1::<f64>::zeros(di);
@@ -6935,7 +6935,7 @@ fn back_substitute_delta_t<B: BatchedBlockSolver + Sync>(
             let start = chunk * CHUNK;
             let end = (start + CHUNK).min(n);
             let seg_len = row_offsets[end] - row_offsets[start];
-            debug_assert_eq!(prev_end, row_offsets[start]);
+            assert_eq!(prev_end, row_offsets[start]);
             let (seg, rest) = remaining.split_at_mut(seg_len);
             remaining = rest;
             segments.push((start, seg));

@@ -877,6 +877,127 @@ pub struct FittedAtom {
     /// manifold for `d = 1` charts: rotation + reflection (`O(2)`) on the
     /// circle, reflection + translation on the interval.
     pub chart_canonicalized: bool,
+    /// Per-atom inner-decoder-smooth byproducts harvested at fit time, the
+    /// single source the three post-PIRLS atom inference reports
+    /// ([`AtomFunctionalReport`] #1097, [`AtomCurvatureCi`] #1099,
+    /// [`AtomSmoothSignificance`] #1103) consume in [`dictionary_report`].
+    ///
+    /// The certificate path that builds `FittedSaeManifold` does so *without* a
+    /// fit harness in scope, so it leaves this `None`; callers that own the
+    /// fitted term attach it through [`FittedAtom::with_inner_fit`] (the term
+    /// builder fills it from the live per-atom basis, decoder, assignment mass,
+    /// smoothness Gram, and the geometric `per_atom_kappa_hat`). When `None`,
+    /// all three reports below are `None`: the genuine prerequisite — the
+    /// post-fit inner-smooth design, penalized Hessian, and row scores — is
+    /// simply not present on a bare certificate-only `FittedSaeManifold`.
+    pub inner_fit: Option<AtomInnerFit>,
+}
+
+/// The fitted per-atom inner-decoder smooth, captured once at fit time so the
+/// post-PIRLS atom-inference reports reuse the *same* design, penalized Hessian,
+/// and per-row scores the identifiability certificate's curvature sees.
+///
+/// The SAE decoder reconstructs `Z_i ≈ Σ_k a_ik Φ_k(t_ik) B_k`. Holding all
+/// other atoms and the assignment fixed at the fitted optimum, atom `k`'s own
+/// contribution along a single output channel `j` is the Gaussian-identity
+/// penalized smooth `a_ik · Φ_k(t_ik)ᵀ β_{k,j}` with roughness penalty `S_k`,
+/// Gauss–Newton observation weight `w_i = a_ik²` (the assignment mass enters the
+/// channel linearly, so the normal-equation weight is its square), and
+/// dispersion the fitted reconstruction dispersion. That is an ordinary
+/// penalized WLS smooth — exactly what [`crate::inference::riesz`],
+/// [`crate::inference::lawley`], and the κ-profile machinery consume. The
+/// channel `j` is the atom's dominant decoder output direction (largest column
+/// norm of `B_k`), i.e. the channel that carries the atom's signal.
+#[derive(Debug, Clone)]
+pub struct AtomInnerFit {
+    /// `Φ_k` evaluated on the atom's active rows, `(n_active, M_k)`. The inner
+    /// GAM smooth design. Column 0 is the constant/intercept basis column.
+    pub design: Array2<f64>,
+    /// `∂Φ_k/∂t` along the atom's leading latent axis on the active rows,
+    /// `(n_active, M_k)`: the derivative design the average-derivative
+    /// functional integrates.
+    pub derivative_design: Array2<f64>,
+    /// The fitted decoder coefficients for the captured output channel,
+    /// `β_{k,j} ∈ ℝ^{M_k}`.
+    pub beta: Array1<f64>,
+    /// The atom roughness Gram `S_k`, `(M_k, M_k)`.
+    pub penalty: Array2<f64>,
+    /// The penalized Hessian `H = ΦᵀWΦ + S_k` at the fitted state, `(M_k, M_k)`.
+    pub penalized_hessian: Array2<f64>,
+    /// Per-row Gaussian-identity scores `s_i = ∂nll_i/∂β = −w_i r_i Φ_i / φ`,
+    /// `(n_active, M_k)`, on the captured channel.
+    pub row_scores: Array2<f64>,
+    /// Per-row Gauss–Newton weights `w_i = a_ik²` on the captured channel.
+    pub weights: Array1<f64>,
+    /// Fitted reconstruction dispersion `φ` (Gaussian σ²).
+    pub dispersion: f64,
+    /// Design row at the latent peak `t_peak` (largest fitted `|g_k|`).
+    pub peak_design_row: Array1<f64>,
+    /// Design row at the latent mode `t_mode` (largest assignment mass).
+    pub mode_design_row: Array1<f64>,
+    /// The atom's geometric curvature estimate `κ̂` (the dictionary
+    /// `per_atom_kappa_hat[k]`); echoed so the curvature-CI report has its
+    /// point estimate without re-deriving it.
+    pub kappa_hat: f64,
+    /// Smooth effective degrees of freedom (`tr(H⁻¹ ΦᵀWΦ)` minus the unpenalized
+    /// null dimension), the LR reference df for the Bartlett correction.
+    pub smooth_edf: f64,
+}
+
+impl FittedAtom {
+    /// Attach the inner-decoder-smooth byproducts harvested at fit time. The
+    /// term builder calls this so [`dictionary_report`] can produce the three
+    /// post-PIRLS atom inference reports.
+    pub fn with_inner_fit(mut self, inner_fit: AtomInnerFit) -> Self {
+        self.inner_fit = Some(inner_fit);
+        self
+    }
+}
+
+/// Riesz-debiased smooth functionals of one fitted atom's decoder curve
+/// (#1097). Each field is the one-step-debiased estimate of a scalar functional
+/// of the atom's inner smooth `g_k(t)`, with influence-based SE, reusing the
+/// atom fit's penalized Hessian as the
+/// [`crate::solver::sensitivity::FitSensitivity`].
+#[derive(Debug, Clone)]
+pub struct AtomFunctionalReport {
+    /// `g(t_peak) − g(t_mode)`: the peak-vs-mode contrast.
+    pub peak_contrast: Option<RieszDebiasReport>,
+    /// `‖E[∂g/∂t]‖`: the average-derivative magnitude.
+    pub average_derivative_norm: Option<RieszDebiasReport>,
+    /// `E_data[g(t_i)]`: the data-averaged decoder value.
+    pub average_value: Option<RieszDebiasReport>,
+}
+
+/// Per-atom curvature confidence interval and interior-point flatness test
+/// (#1099), profiling the atom's penalized neg-log-evidence along the curvature
+/// channel `κ` around the fitted `κ̂`.
+#[derive(Debug, Clone)]
+pub struct AtomCurvatureCi {
+    pub kappa_hat: f64,
+    pub ci: KappaProfileCi,
+    pub flatness_test: FlatnessTest,
+}
+
+/// Bartlett-corrected significance of one atom's inner smooth `h_k(t)` against a
+/// constant null (#1103): the Lawley-corrected likelihood-ratio test that the
+/// atom's decoder curve is genuinely non-constant.
+#[derive(Debug, Clone)]
+pub struct AtomSmoothSignificance {
+    pub bartlett_corrected_p: Option<f64>,
+    pub bartlett_factor: f64,
+    pub lr_stat: f64,
+    pub df: usize,
+}
+
+/// The three post-PIRLS inference reports for one atom, paired by atom index.
+#[derive(Debug, Clone)]
+pub struct AtomInferenceReport {
+    pub atom_index: usize,
+    pub atom_name: String,
+    pub functionals: Option<AtomFunctionalReport>,
+    pub curvature_ci: Option<AtomCurvatureCi>,
+    pub smooth_significance: Option<AtomSmoothSignificance>,
 }
 
 /// The fitted SAE-manifold model the certificate consumes.
@@ -2488,6 +2609,15 @@ pub struct DictionaryReport {
     /// canonical circle charts may use an arbitrary period and are rescaled by
     /// [`dictionary_report_with_transport_ladders`] before fitting.
     pub transport_ladders: Vec<AtomTransportLadderReport>,
+    /// Per-atom post-PIRLS inference reports (#1097 Riesz functionals, #1099
+    /// curvature CI, #1103 Bartlett-corrected smooth significance), one entry
+    /// per atom in [`FittedSaeManifold::atoms`] order. Each report's three
+    /// fields are computed when the atom carries its fit-time
+    /// [`AtomInnerFit`] byproducts and the relevant numerics succeed; otherwise
+    /// the field is `None` (a bare certificate-only `FittedSaeManifold` — one
+    /// built by the residual-gauge path with no fit harness — leaves every
+    /// `inner_fit` `None`, so all three fields are `None`).
+    pub atom_inference: Vec<AtomInferenceReport>,
 }
 
 /// Canonical per-layer coordinates for one atom, ready for the #1096 transport

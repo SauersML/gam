@@ -2521,6 +2521,162 @@ impl GaussianJackknifePlusStats {
     }
 }
 
+/// Persistable substrate for the EXACT Gaussian-identity full-conformal set
+/// (#942 Layer 1 + the Layer-3 frozen-ρ self-diagnostic), the analogue of
+/// [`GaussianJackknifePlusStats`] for the exact set.
+///
+/// Unlike jackknife+, the exact full-conformal set has no test-point-independent
+/// factorization: every test covariate `x_*` enters the augmented normal matrix
+/// `M = XᵀX + x_*x_*ᵀ + Sλ`, so the substrate persists the training design `X`,
+/// response `y`, and the (frozen) penalty `Sλ` and rebuilds
+/// [`ExactGaussianFullConformal`] per test row — one Cholesky per test point,
+/// zero refits. Valid for any penalized smooth with an arbitrary `Sλ` and basis.
+///
+/// `Sλ` is recovered once at fit time from the converged penalized Hessian
+/// `M₀ = XᵀX + Sλ` (the Gaussian-identity, unit-weight, dispersion-unscaled
+/// normal matrix stored in [`FitGeometry`]) as `Sλ = M₀ − XᵀX`, so no penalty
+/// re-derivation is needed — exactly the seam the jackknife+ substrate uses.
+///
+/// The frozen-ρ self-diagnostic treats the entire frozen penalty as carrying a
+/// single global log-smoothing parameter `ρ` with `S(ρ) = eᵖ·Sλ` and runs the
+/// closed-form [`GaussianRemlRhoResponse::certified_full_conformal`]: it
+/// re-selects the global ρ̂(z) on the augmented data, bounds the score
+/// perturbation freezing ρ̂ could induce, and reports whether freezing is
+/// accepted under the stated rho-grid Lipschitz assumption. This is a sound,
+/// conservative global-scale check that applies to any penalized smooth (it does
+/// not require the model to be single-penalty); per-penalty re-selection is the
+/// research-core Layer 3 and is not asserted here.
+///
+/// Unit prior weights are required, as everywhere in this module: a reweighted
+/// training row is not exchangeable with the test row.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ExactFullConformalSubstrate {
+    /// Training design `X` (n × p).
+    x: Array2<f64>,
+    /// Training response `y` (n).
+    y: Array1<f64>,
+    /// Frozen penalty `Sλ = M₀ − XᵀX` at the fitted smoothing parameters (p × p).
+    s_lambda: Array2<f64>,
+}
+
+/// One test row's exact full-conformal verdict: the outer `[lower, upper]`
+/// envelope of the exact set, plus the frozen-ρ self-diagnostics flag.
+#[derive(Clone, Debug)]
+pub struct ExactFullConformalInterval {
+    /// Outer envelope `[min lo, max hi]` of the exact (possibly multi-interval)
+    /// set, inheriting its coverage (it is a superset). Endpoints may be
+    /// infinite (honest unboundedness in low-information / high-leverage regimes).
+    pub lo: f64,
+    pub hi: f64,
+    /// The exact set itself (a union of intervals).
+    pub set: FullConformalSet,
+    /// `true` when freezing the global smoothing parameter is ACCEPTED under the
+    /// rho-grid Lipschitz assumption (the frozen exact set equals the honest
+    /// ρ-re-selecting set); `false` when the certificate REFUSED (the frozen set
+    /// may differ from the honest set and the caller should treat the envelope
+    /// as the frozen-ρ approximation, not the certified honest set).
+    pub frozen_rho_certified: bool,
+}
+
+impl ExactFullConformalSubstrate {
+    /// Build the substrate from the training design, response, prior weights,
+    /// and the converged penalized normal matrix `M₀ = XᵀX + Sλ`. Recovers the
+    /// frozen penalty `Sλ = M₀ − XᵀX` once. Rejects non-unit prior weights and
+    /// shape mismatches, identically to the rest of this module.
+    pub fn from_design_unit_weight_normal_matrix(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        prior_weights: &Array1<f64>,
+        m: &Array2<f64>,
+    ) -> Result<Self, String> {
+        let n = x.nrows();
+        let p = x.ncols();
+        if y.len() != n || prior_weights.len() != n {
+            return Err("exact full conformal substrate: row-count mismatch".to_string());
+        }
+        if m.nrows() != p || m.ncols() != p {
+            return Err("exact full conformal substrate: normal-matrix shape mismatch".to_string());
+        }
+        if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
+            return Err(
+                "exact full conformal requires unit prior weights: a reweighted training row \
+                 is not exchangeable with the test row, so the finite-sample coverage proof \
+                 does not apply"
+                    .to_string(),
+            );
+        }
+        // Sλ = M₀ − XᵀX (frozen at the fitted smoothing parameters).
+        let s_lambda = m - &x.t().dot(x);
+        Ok(Self {
+            x: x.clone(),
+            y: y.clone(),
+            s_lambda,
+        })
+    }
+
+    /// Coefficient dimension `p`.
+    pub fn p(&self) -> usize {
+        self.x.ncols()
+    }
+
+    /// Training-row count `n`.
+    pub fn n(&self) -> usize {
+        self.x.nrows()
+    }
+
+    /// The exact full-conformal verdict at one test row `x_*` and miscoverage
+    /// `alpha`: the exact set, its outer envelope, and the frozen-ρ
+    /// self-diagnostics flag. One Cholesky per call, zero refits.
+    pub fn interval(
+        &self,
+        x_star: &Array1<f64>,
+        alpha: f64,
+    ) -> Result<ExactFullConformalInterval, String> {
+        if x_star.len() != self.p() {
+            return Err(format!(
+                "exact full conformal: x_* has {} entries but the fit has {} coefficients",
+                x_star.len(),
+                self.p()
+            ));
+        }
+        // The frozen-ρ certificate treats the whole frozen penalty as one global
+        // log-smoothing parameter `ρ` with `S(ρ) = eᵖ·Sλ`. `certified_full_conformal`
+        // re-selects ρ̂(z) on the augmented data and decides whether freezing is
+        // safe; its `frozen_set` is the EXACT set at the (re-selected) frozen ρ̂₀.
+        let response = GaussianRemlRhoResponse::new(&self.x, &self.y, &self.s_lambda, x_star)?;
+        let certified = response.certified_full_conformal(alpha)?;
+        let frozen_rho_certified =
+            matches!(certified.certificate, FrozenRhoCertificate::Certified { .. });
+        let set = certified.frozen_set;
+        let (lo, hi) = if set.intervals.is_empty() {
+            // No candidate qualifies (pathological tiny α·(n+1)); collapse to the
+            // frozen plug-in mean μ̂_* = x_*ᵀβ̂, β̂ = (XᵀX+Sλ)⁻¹Xᵀy — the only
+            // honest scalar answer.
+            let m = &self.x.t().dot(&self.x) + &self.s_lambda;
+            let chol = m.cholesky(Side::Lower).map_err(|e| {
+                format!("exact full conformal: frozen normal matrix not SPD: {e:?}")
+            })?;
+            let beta = chol.solvevec(&self.x.t().dot(&self.y));
+            let mu_point = x_star.dot(&beta);
+            (mu_point, mu_point)
+        } else {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for itv in &set.intervals {
+                lo = lo.min(itv.lo);
+                hi = hi.max(itv.hi);
+            }
+            (lo, hi)
+        };
+        Ok(ExactFullConformalInterval {
+            lo,
+            hi,
+            set,
+            frozen_rho_certified,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

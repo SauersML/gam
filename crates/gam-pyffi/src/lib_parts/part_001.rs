@@ -1163,6 +1163,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "response_geometry_simplex_exp_map",
             "response_geometry_sphere_log_map",
             "response_geometry_sphere_exp_map",
+            "response_geometry_fit_curvature",
             "response_geometry_normalize_fisher_rao",
             "equivariant_rho_so2",
             "equivariant_rho_so2_jvp",

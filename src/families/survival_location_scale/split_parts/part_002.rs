@@ -2530,6 +2530,59 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         true
     }
 
+    /// Declare the per-block output channel so the pre-fit identifiability
+    /// audit routes **channel-aware** (`audit_identifiability_channel_aware`)
+    /// instead of the flat n-row Euclidean stack.
+    ///
+    /// The survival location-scale row NLL `ρ_i(η_time, η_thr, η_ls)` has THREE
+    /// output channels (see `SurvivalLocationScaleChannelHessian`):
+    ///   - channel 0 — `η_time` (time-transform predictor shift), and the
+    ///     link-wiggle correction anchors here (it perturbs the inverse link
+    ///     applied on the time/location side; cf. `AdditiveWiggleBlockLayout`
+    ///     in `block_effective_jacobian`, which anchors the wiggle at output 0),
+    ///   - channel 1 — `η_thr` (threshold / **location** predictor),
+    ///   - channel 2 — `η_ls`  (log-σ / **scale** predictor, entering the
+    ///     inverse link multiplicatively).
+    ///
+    /// Without this assignment the flat audit stacks every block's design into
+    /// one n-row Euclidean space, so the threshold's **location intercept**
+    /// (a `ones` column on channel 1) and the log-σ block's **scale intercept**
+    /// (a `ones` column on channel 2) look like two copies of the same constant
+    /// and the joint RRQR reports a (spurious) rank deficiency. The audit then
+    /// drops one of them by gauge priority, collapsing a genuine free parameter
+    /// and pinning a time-invariant covariate's coefficient to exactly 0
+    /// (gam#1110: `gam_a_age = 0`). Both intercepts are separately identifiable
+    /// — they live on orthogonal likelihood channels — and the channel-aware
+    /// audit recognises this, returning a clean (identity-gauge) verdict with no
+    /// column surgery, so every block keeps its raw width (no #1068 z-lift /
+    /// fixed-col / monotonicity desync) and the location/scale parameters
+    /// recover to the survreg/lifelines MLE.
+    ///
+    /// `wire_output_channels` installs an `AdditiveBlockJacobian` on each block
+    /// from this assignment (the blocks carry no explicit `jacobian_callback`);
+    /// that callback feeds ONLY the audit — the inner exact-Newton solve maps
+    /// β→η through `solver_design()` (the stacked `[exit; entry; deriv]`
+    /// operator), which never reads `jacobian_callback`, so the channel wiring
+    /// is invisible to the fit itself. This mirrors the survival marginal-slope
+    /// family, which wires its own multi-output Jacobian for the same reason.
+    fn output_channel_assignment(&self, specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
+        Some(
+            specs
+                .iter()
+                .map(|spec| match spec.name.as_str() {
+                    "time_transform" => 0,
+                    "threshold" => 1,
+                    "log_sigma" => 2,
+                    // The link-wiggle / time-wiggle corrections perturb the
+                    // time/location-side inverse link; anchor them on the time
+                    // channel exactly as `block_effective_jacobian` does
+                    // (`AdditiveWiggleBlockLayout::wiggle_block` → output 0).
+                    _ => 0,
+                })
+                .collect(),
+        )
+    }
+
     fn coefficient_hessian_cost(&self, specs: &[crate::custom_family::ParameterBlockSpec]) -> u64 {
         // Survival location-scale couples its blocks (threshold/time/log-σ
         // and any link/time wiggles) through the survival likelihood: every

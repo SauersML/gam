@@ -562,6 +562,47 @@ pub struct MultinomialSavedModel {
     /// inference block; falls back to `None` for the legacy fixed-λ path.
     #[serde(default)]
     pub edf_per_class: Option<Vec<f64>>,
+    /// Joint posterior coefficient covariance `H⁻¹` (#1101), block-ordered to
+    /// match the stacked active-class coefficient vector `β = [β_0; …; β_{K-2}]`
+    /// (class `a`'s `P` coefficients occupy rows/cols `a·P .. (a+1)·P`). This is
+    /// the Laplace covariance the REML driver already computes from the factored
+    /// penalized Hessian; storing it gives the predict path delta-method
+    /// per-class probability standard errors and the summary its Wald
+    /// smooth-term tests. Flattened row-major over the `(P·M)×(P·M)` matrix.
+    /// `None` for a model fitted before covariance was surfaced.
+    #[serde(default)]
+    pub coefficient_covariance_flat: Option<Vec<f64>>,
+    /// Joint coefficient-space influence matrix `F = H⁻¹ X'WX` (#1101),
+    /// block-ordered identically to [`Self::coefficient_covariance_flat`].
+    /// Its per-term diagonal block trace is the term's effective degrees of
+    /// freedom and its `tr(F_jj)²/tr(F_jj²)` the Wood reference d.f., feeding
+    /// the rank-truncated Wald smooth-term test in `summary()`. Flattened
+    /// row-major over the `(P·M)×(P·M)` matrix. `None` when unavailable.
+    #[serde(default)]
+    pub coefficient_influence_flat: Option<Vec<f64>>,
+    /// Per-(active class, smooth term) coefficient column range and unpenalized
+    /// nullspace dimension within the `P`-wide class block (#1101). Parallel to
+    /// the smooth terms the design produced; replicated across classes by the
+    /// shared-design architecture. Drives the Wald smooth-term table in
+    /// `summary()`. Empty for a wholly parametric (no-smooth) model.
+    #[serde(default)]
+    pub smooth_term_spans: Vec<MultinomialSmoothTermSpan>,
+}
+
+/// One smooth term's coefficient span within a class block, plus its
+/// unpenalized nullspace dimension and a display label (#1101). The Wald
+/// smooth-significance test in `summary()` slices the joint covariance /
+/// influence at `a·P + col_start .. a·P + col_end` for active class `a`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultinomialSmoothTermSpan {
+    /// Human-readable term label (the smooth's formula token), for the table.
+    pub label: String,
+    /// Start column of the term within the per-class `P`-wide coefficient block.
+    pub col_start: usize,
+    /// End column (exclusive) of the term within the per-class block.
+    pub col_end: usize,
+    /// Leading unpenalized (polynomial nullspace) dimension within the term.
+    pub nullspace_dim: usize,
 }
 
 impl MultinomialSavedModel {
@@ -610,6 +651,178 @@ impl MultinomialSavedModel {
         }
         probs
     }
+
+    /// Reconstruct the joint posterior covariance `H⁻¹` as a `(P·M)×(P·M)`
+    /// `ndarray`, block-ordered to match the stacked coefficient vector
+    /// `θ[a·P + i] = β[i, a]` (#1101). `None` when the model was fitted before
+    /// covariance was surfaced (legacy payload).
+    pub fn coefficient_covariance(&self) -> Option<Array2<f64>> {
+        let d = self.p_per_class.checked_mul(self.n_active_classes)?;
+        let flat = self.coefficient_covariance_flat.as_ref()?;
+        Array2::from_shape_vec((d, d), flat.clone()).ok()
+    }
+
+    /// Reconstruct the joint influence matrix `F = H⁻¹ X'WX` as a
+    /// `(P·M)×(P·M)` `ndarray`, block-ordered like
+    /// [`Self::coefficient_covariance`] (#1101). `None` when unavailable.
+    pub fn coefficient_influence(&self) -> Option<Array2<f64>> {
+        let d = self.p_per_class.checked_mul(self.n_active_classes)?;
+        let flat = self.coefficient_influence_flat.as_ref()?;
+        Array2::from_shape_vec((d, d), flat.clone()).ok()
+    }
+
+    /// Evaluate `softmax(X·β)` AND its delta-method per-class probability
+    /// standard error at fresh data rows (#1101).
+    ///
+    /// For active classes `b ∈ 0..M` the softmax Jacobian is
+    /// `∂p_c/∂η_b = p_c (δ_{cb} − p_b)`, and `∂η_b/∂β[i,a] = X[i]·δ_{ab}`, so the
+    /// gradient of class-`c` probability w.r.t. the block-ordered coefficient
+    /// vector is `g_c[a·P + i] = X[i]·p_c (δ_{ca} − p_a)` (active `a`; the
+    /// reference class `M` contributes `p_c(0 − p_a)` via every active block).
+    /// The delta-method variance is `Var(p_c) = g_cᵀ Σ g_c` with `Σ = H⁻¹` the
+    /// joint posterior covariance, and `SE(p_c) = √Var(p_c)`. Returns
+    /// `(probs (N,K), prob_se (N,K))`; `prob_se` is `None` when no covariance is
+    /// stored. The simplex `[0,1]` clamp is applied by the interval consumer, not
+    /// here (the SE itself is unclamped).
+    pub fn predict_probabilities_with_se(
+        &self,
+        x_new: ArrayView2<'_, f64>,
+    ) -> (Array2<f64>, Option<Array2<f64>>) {
+        let probs = self.predict_probabilities(x_new);
+        let Some(cov) = self.coefficient_covariance() else {
+            return (probs, None);
+        };
+        let n_new = x_new.nrows();
+        let p = self.p_per_class;
+        let m = self.n_active_classes;
+        let k = m + 1;
+        let d = p * m;
+        let mut prob_se = Array2::<f64>::zeros((n_new, k));
+        let mut grad = vec![0.0_f64; d];
+        for row in 0..n_new {
+            let prow = probs.row(row);
+            for c in 0..k {
+                let pc = prow[c];
+                // g_c[a·P + i] = X[i] · p_c · (δ_{ca} − p_a), a active.
+                for a in 0..m {
+                    let pa = prow[a];
+                    let factor = pc * (if c == a { 1.0 - pa } else { -pa });
+                    let base = a * p;
+                    for i in 0..p {
+                        grad[base + i] = x_new[[row, i]] * factor;
+                    }
+                }
+                // Var = gᵀ Σ g.
+                let mut var = 0.0_f64;
+                for r in 0..d {
+                    let gr = grad[r];
+                    if gr == 0.0 {
+                        continue;
+                    }
+                    let mut acc = 0.0_f64;
+                    for s in 0..d {
+                        acc += cov[[r, s]] * grad[s];
+                    }
+                    var += gr * acc;
+                }
+                prob_se[[row, c]] = var.max(0.0).sqrt();
+            }
+        }
+        (probs, Some(prob_se))
+    }
+
+    /// Wood (2013) rank-truncated Wald smooth-significance test per
+    /// `(active class, smooth term)` (#1101), reusing the exact scalar-summary
+    /// kernel [`crate::inference::smooth_test::wood_smooth_test`]. For active
+    /// class `a` and term span `[c0, c1)` within the class block, the global
+    /// coefficient range is `a·P + c0 .. a·P + c1`; the joint covariance and
+    /// influence are sliced there. The term EDF is the influence-block trace
+    /// `tr(F_jj)` (when present) and the reference d.f. uses `tr(F_jj)²/tr(F_jj²)`,
+    /// exactly as the scalar path. The multinomial softmax is a known-dispersion
+    /// family, so the χ²_{ref_df} branch applies. Returns one row per
+    /// `(class label, term label, edf, ref_df, statistic, p_value)`; empty when
+    /// no covariance/smooth terms are available.
+    pub fn smooth_significance(&self) -> Vec<MultinomialSmoothSignificance> {
+        let mut out = Vec::new();
+        let (Some(cov), p, m) = (
+            self.coefficient_covariance(),
+            self.p_per_class,
+            self.n_active_classes,
+        ) else {
+            return out;
+        };
+        if self.smooth_term_spans.is_empty() {
+            return out;
+        }
+        let beta = self.coefficients_active();
+        // Block-ordered θ = [β_0; …; β_{M-1}], θ[a·P + i] = β[i, a].
+        let d = p * m;
+        let mut theta = Array1::<f64>::zeros(d);
+        for a in 0..m {
+            for i in 0..p {
+                theta[a * p + i] = beta[[i, a]];
+            }
+        }
+        let influence = self.coefficient_influence();
+        for a in 0..m {
+            let class_label = self
+                .class_levels
+                .get(a)
+                .cloned()
+                .unwrap_or_else(|| format!("class{a}"));
+            let base = a * p;
+            for span in &self.smooth_term_spans {
+                if span.col_end > p {
+                    continue;
+                }
+                let start = base + span.col_start;
+                let end = base + span.col_end;
+                // Term EDF = tr(F_jj); without an influence matrix fall back to
+                // the block coefficient count (full-rank Wald on the span).
+                let block_len = (span.col_end - span.col_start) as f64;
+                let edf = influence
+                    .as_ref()
+                    .map(|f| (start..end).map(|i| f[[i, i]]).sum::<f64>())
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(block_len);
+                let result = crate::inference::smooth_test::wood_smooth_test(
+                    crate::inference::smooth_test::SmoothTestInput {
+                        beta: theta.view(),
+                        covariance: &cov,
+                        influence_matrix: influence.as_ref(),
+                        coeff_range: start..end,
+                        edf,
+                        nullspace_dim: span.nullspace_dim,
+                        residual_df: f64::INFINITY,
+                        scale: crate::inference::smooth_test::SmoothTestScale::Known,
+                    },
+                );
+                if let Some(res) = result {
+                    out.push(MultinomialSmoothSignificance {
+                        class_label: class_label.clone(),
+                        term_label: span.label.clone(),
+                        edf,
+                        ref_df: res.ref_df,
+                        statistic: res.statistic,
+                        p_value: res.p_value,
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One row of the multinomial smooth-significance table (#1101): the Wood
+/// rank-truncated Wald test for one `(active class, smooth term)` pair.
+#[derive(Debug, Clone)]
+pub struct MultinomialSmoothSignificance {
+    pub class_label: String,
+    pub term_label: String,
+    pub edf: f64,
+    pub ref_df: f64,
+    pub statistic: f64,
+    pub p_value: f64,
 }
 
 /// One-hot-encode the categorical response column and return both the
@@ -1001,6 +1214,13 @@ pub fn fit_penalized_multinomial_formula(
         // search from this seed; screening only adds the cascade cost and, on the
         // near-separable arm, the rejection stall.
         screen_initial_rho: false,
+        // #1101: compute the joint Laplace posterior covariance `H⁻¹` (and the
+        // influence matrix `F = H⁻¹ X'WX`) at the converged mode so the saved
+        // model can surface delta-method per-class probability standard errors
+        // and Wald smooth-term p-values. The driver factorizes the penalized
+        // Hessian during the inner solve regardless; this only asks it to keep
+        // and invert the factor instead of discarding it.
+        compute_covariance: true,
         ..BlockwiseFitOptions::default()
     };
     // ── Conditional Firth/Jeffreys engagement (#715 arm (b) / #753) ──────────
@@ -1114,6 +1334,144 @@ pub fn fit_penalized_multinomial_formula(
     let edf_per_class = fit.inference.as_ref().map(|info| info.edf_by_block.clone());
     let coefficients_flat: Vec<f64> = coefficients_active.iter().copied().collect();
 
+    // #1101: surface the joint Laplace posterior covariance `H⁻¹` (block-ordered
+    // [β_0; …; β_{K-2}]) and the influence matrix `F = H⁻¹ X'WX` the REML driver
+    // computed at the converged mode. These power the predict path's delta-method
+    // per-class probability standard errors and the summary's Wald smooth-term
+    // tests. The joint matrices are `(P·M)×(P·M)`; the standardization back-map
+    // applied to coefficients above is affine and exact, but covariance is
+    // reported in the FITTED (standardized) basis the joint Hessian was assembled
+    // in — predict consumes it against the same standardized design replay, so no
+    // basis re-mapping is required here (the saved coefficients and covariance
+    // both reference the training basis the termspec replays).
+    let expected_joint = p_per_class.saturating_mul(m);
+    // The joint Hessian (and thus `H⁻¹`) was assembled in the STANDARDIZED
+    // parametric basis used during fitting, while the saved coefficients and the
+    // raw predict design are in raw units. Map the covariance to raw units with
+    // the same exact affine reparameterization `β_raw = A β_std`: for each
+    // standardized parametric column `col`, `β_raw[col] = β_std[col]/scale` and
+    // the intercept absorbs `−Σ_col (center/scale)·β_std[col]`. So `A = I` except
+    // `A[col,col] = 1/scale` and `A[i0,col] = −center/scale`, replicated
+    // block-diagonally per active class, and `Cov_raw = A Cov_std Aᵀ`. With no
+    // standardization (`parametric_standardization` empty) `A = I` and this is a
+    // no-op. The smooth-term (penalized) columns are untouched by `A`, so the
+    // Wald table's per-term blocks are identical in both bases.
+    let intercept_col0 = design.intercept_range.clone().next();
+    let build_per_class_affine = |amat: &mut Array2<f64>| {
+        for &(col, center, scale) in &parametric_standardization {
+            if col >= p_per_class {
+                continue;
+            }
+            amat[[col, col]] = 1.0 / scale;
+            if let Some(i0) = intercept_col0
+                && i0 < p_per_class
+            {
+                amat[[i0, col]] = -center / scale;
+            }
+        }
+    };
+    let coefficient_covariance_flat = fit
+        .covariance_conditional
+        .as_ref()
+        .filter(|c| c.nrows() == expected_joint && c.ncols() == expected_joint)
+        .map(|cov_std| {
+            if parametric_standardization.is_empty() {
+                return cov_std.iter().copied().collect::<Vec<f64>>();
+            }
+            // Block-diagonal joint A (same per active class).
+            let mut a_joint = Array2::<f64>::eye(expected_joint);
+            let mut a_class = Array2::<f64>::eye(p_per_class);
+            build_per_class_affine(&mut a_class);
+            for a in 0..m {
+                let base = a * p_per_class;
+                for i in 0..p_per_class {
+                    for j in 0..p_per_class {
+                        a_joint[[base + i, base + j]] = a_class[[i, j]];
+                    }
+                }
+            }
+            let cov_raw = a_joint.dot(cov_std).dot(&a_joint.t());
+            cov_raw.iter().copied().collect::<Vec<f64>>()
+        });
+    // The influence matrix `F = H⁻¹ X'WX = H⁻¹(H − S_λ) = I − H⁻¹ S_λ`. The
+    // exact-Newton multinomial blocks carry no IRLS pseudo-data, so the generic
+    // inference path does not export `coefficient_influence`; reconstruct it
+    // exactly here from the joint covariance `H⁻¹` (above) and the REML-selected
+    // per-(class, term) `λ` scaling the shared penalties. Block-diagonal `S_λ`:
+    // class `a`'s block is `Σ_t λ_{a,t} · S_t`, embedded at `a·P .. (a+1)·P`.
+    let coefficient_influence_flat = fit
+        .covariance_conditional
+        .as_ref()
+        .filter(|c| c.nrows() == expected_joint && c.ncols() == expected_joint)
+        .and_then(|hinv| {
+            if fit.blocks.len() != m {
+                return None;
+            }
+            // Joint S_λ (block-diagonal across active classes).
+            let mut s_lambda = Array2::<f64>::zeros((expected_joint, expected_joint));
+            for (a, block) in fit.blocks.iter().enumerate() {
+                if block.lambdas.len() != penalties_arc.len() {
+                    return None;
+                }
+                let base = a * p_per_class;
+                for (t, pen) in penalties_arc.iter().enumerate() {
+                    let lam = block.lambdas[t];
+                    if lam == 0.0 {
+                        continue;
+                    }
+                    let dense = pen.to_dense();
+                    if dense.nrows() != p_per_class || dense.ncols() != p_per_class {
+                        return None;
+                    }
+                    for i in 0..p_per_class {
+                        for j in 0..p_per_class {
+                            s_lambda[[base + i, base + j]] += lam * dense[[i, j]];
+                        }
+                    }
+                }
+            }
+            // F = I − H⁻¹ S_λ.
+            let hinv_s = hinv.dot(&s_lambda);
+            let mut f = Array2::<f64>::eye(expected_joint);
+            f -= &hinv_s;
+            Some(f.iter().copied().collect::<Vec<f64>>())
+        });
+
+    // Per-(smooth term) coefficient span within a single class block, deduped by
+    // col_range (the #561 double-penalty migration emits two penalty blocks per
+    // term sharing one col_range; the Wald test covers the whole term block once).
+    let mut smooth_term_spans: Vec<MultinomialSmoothTermSpan> = Vec::new();
+    for (pen_idx, bp) in design.penalties.iter().enumerate() {
+        let col_start = bp.col_range.start;
+        let col_end = bp.col_range.end;
+        if col_start >= col_end || col_end > p_per_class {
+            continue;
+        }
+        if smooth_term_spans
+            .iter()
+            .any(|s| s.col_start == col_start && s.col_end == col_end)
+        {
+            continue;
+        }
+        let label = design
+            .penaltyinfo
+            .get(pen_idx)
+            .and_then(|info| info.termname.clone())
+            .unwrap_or_else(|| format!("s{pen_idx}"));
+        let nullspace_dim = design
+            .nullspace_dims
+            .get(pen_idx)
+            .copied()
+            .unwrap_or(0)
+            .min(col_end - col_start);
+        smooth_term_spans.push(MultinomialSmoothTermSpan {
+            label,
+            col_start,
+            col_end,
+            nullspace_dim,
+        });
+    }
+
     // Unpenalized deviance read directly from the converged unpenalized
     // log-likelihood the rho-prior driver already computed (issue #348):
     // MultinomialFamily::evaluate sets FamilyEvaluation.log_likelihood =
@@ -1139,6 +1497,9 @@ pub fn fit_penalized_multinomial_formula(
         penalized_neg_log_likelihood: -fit.log_likelihood + 0.5 * fit.stable_penalty_term,
         deviance,
         edf_per_class,
+        coefficient_covariance_flat,
+        coefficient_influence_flat,
+        smooth_term_spans,
     })
 }
 
@@ -1190,6 +1551,50 @@ pub fn predict_multinomial_formula(
         );
     }
     Ok(model.predict_probabilities(x_dense.view()))
+}
+
+/// Predict class probabilities AND delta-method per-class probability standard
+/// errors for a saved multinomial model on fresh data (#1101). Replays the
+/// saved termspec to build the predict design exactly as
+/// [`predict_multinomial_formula`], then applies the softmax-Jacobian delta
+/// method against the stored joint posterior covariance. Returns
+/// `(probs (N,K), prob_se (N,K) | None)`; `prob_se` is `None` for a legacy
+/// model fitted before covariance was surfaced.
+pub fn predict_multinomial_formula_with_se(
+    model: &MultinomialSavedModel,
+    data: &EncodedDataset,
+) -> Result<(Array2<f64>, Option<Array2<f64>>), EstimationError> {
+    let predict_columns = data.column_map();
+    let realigned = model.resolved_termspec.remap_feature_columns(
+        |index| -> Result<usize, EstimationError> {
+            let name = model.training_headers.get(index).ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "multinomial predict: saved training column index {index} is out of bounds \
+                     for {} training headers",
+                    model.training_headers.len()
+                ))
+            })?;
+            resolve_role_col(&predict_columns, name, "feature")
+                .map_err(|err| EstimationError::InvalidInput(err.to_string()))
+        },
+    )?;
+    let design = build_term_collection_design(data.values.view(), &realigned).map_err(|err| {
+        EstimationError::InvalidInput(format!(
+            "multinomial predict: rebuild design from saved termspec: {err}"
+        ))
+    })?;
+    let x_dense = design
+        .design
+        .try_to_dense_by_chunks("multinomial predict design")
+        .map_err(EstimationError::InvalidInput)?;
+    if x_dense.ncols() != model.p_per_class {
+        crate::bail_invalid_estim!(
+            "multinomial predict: predict design has {} cols, saved model expects {}",
+            x_dense.ncols(),
+            model.p_per_class
+        );
+    }
+    Ok(model.predict_probabilities_with_se(x_dense.view()))
 }
 
 #[cfg(test)]

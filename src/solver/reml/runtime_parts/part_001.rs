@@ -3518,6 +3518,7 @@ impl<'a> RemlState<'a> {
             kronecker_factored: None,
             gaussian_fixed_cache: RwLock::new(None),
             gaussian_psi_gram_deriv: RwLock::new(None),
+            glm_first_step_gram: RwLock::new(None),
             alo_frozen_nuisance: RwLock::new(None),
             persistent_warm_start_key: RwLock::new(None),
             persistent_latent_values_fingerprint: None,
@@ -3576,6 +3577,9 @@ impl<'a> RemlState<'a> {
         // The conditioned-frame ψ-gram derivative is keyed to the same design;
         // a new design invalidates it. The installing trial repopulates it.
         *self.gaussian_psi_gram_deriv.write().unwrap() = None;
+        // The frozen-W GLM first-step Gram is keyed to the same design + ψ; a
+        // new design invalidates it. The installing trial repopulates it.
+        *self.glm_first_step_gram.write().unwrap() = None;
         *self.alo_frozen_nuisance.write().unwrap() = None;
         *self.persistent_warm_start_key.write().unwrap() = None;
         self.persistent_warm_start_loaded
@@ -5122,6 +5126,46 @@ impl<'a> RemlState<'a> {
         }
         *self.gaussian_fixed_cache.write().unwrap() = Some(cache);
         true
+    }
+
+    /// Install the frozen-weight first-Fisher-step data-fit Gram `XᵀWX` for the
+    /// GLM design-moving ψ-sweep (#1111 / #1033 mechanism (c)). The Gram is in
+    /// the conditioned (original / `x_fit`) column frame and must match the
+    /// current `p`. Returns whether it was installed; a shape mismatch refuses
+    /// (the GLM inner then restreams the first-iteration Gram as usual).
+    ///
+    /// NOT family-gated: this is the GLM lane's own slot. The caller
+    /// ([`SpatialJointContext::eval_full`]) only installs it after certifying
+    /// that the trial's converged working weight has not drifted past tolerance
+    /// from the frozen snapshot, so the frozen-W Gram is a faithful stand-in for
+    /// the trial's first-iteration `XᵀWX`.
+    pub(crate) fn install_glm_first_step_gram(
+        &self,
+        gram: Arc<ndarray::Array2<f64>>,
+    ) -> bool {
+        if gram.nrows() != self.p || gram.ncols() != self.p {
+            return false;
+        }
+        *self.glm_first_step_gram.write().unwrap() = Some(gram);
+        true
+    }
+
+    /// Clear any installed frozen-W GLM first-step Gram. Called per-trial before
+    /// (re)installing for the current ψ, so a stale previous-ψ Gram is never
+    /// consumed when the current trial is out-of-window or has drifted.
+    pub(crate) fn clear_glm_first_step_gram(&self) {
+        *self.glm_first_step_gram.write().unwrap() = None;
+    }
+
+    /// The frozen-W GLM first-step Gram for the current in-window drift-OK trial,
+    /// if installed. Consumed exactly once by the GLM inner P-IRLS first
+    /// iteration; `None` keeps the streamed first-iteration Gram.
+    pub(crate) fn glm_first_step_gram(&self) -> Option<Arc<ndarray::Array2<f64>>> {
+        self.glm_first_step_gram
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
     }
 
     /// Install the conditioned-frame exact ψ-derivative pair

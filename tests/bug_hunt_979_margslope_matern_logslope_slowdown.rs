@@ -163,12 +163,12 @@ fn margslope_matern_logslope_timing() {
 
 /// Above-the-cliff profiling repro (#979): centers=12, n=2000 — the regime
 /// where the multi-seed continuation pre-warm *fires* and the binary
-/// marginal-slope fit became intractable (>360s). `#[ignore]`'d because it is
-/// a manual profiling harness, not a CI budget gate. Invoke directly:
+/// marginal-slope fit became intractable (>360s). Asserts the fit completes
+/// well under a generous wall budget — the regression guard for the binary
+/// arm of #979. Invoke directly:
 ///   cargo test --release --test bug_hunt_979_margslope_matern_logslope_slowdown \
-///       margslope_matern_logslope_above_cliff -- --ignored --nocapture
+///       margslope_matern_logslope_above_cliff -- --nocapture
 #[test]
-#[ignore]
 fn margslope_matern_logslope_above_cliff() {
     gam::init_parallelism();
     let n = 2000;
@@ -194,4 +194,8 @@ fn margslope_matern_logslope_above_cliff() {
         Ok(_) => panic!("wrong FitResult variant"),
         Err(e) => eprintln!("[979-ABOVE-CLIFF] n={n} centers={centers} total_s={elapsed:.2} FAILED: {e}"),
     }
+    assert!(
+        elapsed < 120.0,
+        "above-cliff margslope fit took {elapsed:.1}s at n={n} centers={centers} (budget 120s) — #979 binary slowdown"
+    );
 }

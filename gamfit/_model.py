@@ -74,7 +74,7 @@ class Model:
             (``pandas.DataFrame``, ``pyarrow.Table``, ``polars.DataFrame``,
             ``dict`` of columns, ``list`` of record dicts, ...). Columns must
             cover every predictor referenced by the fitted formula.
-        interval : float, "conformal", or None, default None
+        interval : float, "conformal", "full_conformal", or None, default None
             Single uncertainty knob. ``None`` returns the point prediction(s)
             only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
             uncertainty decomposition at that pointwise coverage; the output
@@ -92,8 +92,19 @@ class Model:
             requires a Gaussian-identity model fitted without prior weights,
             offsets, or a link wiggle; use :meth:`predict_conformal` for
             split-conformal intervals on other families.
+
+            Pass ``interval="full_conformal"`` for the EXACT full-conformal
+            set (#942 Layer 1): every observation is used for both fitting and
+            calibration, the exact prediction set is computed from one Cholesky
+            per test point with zero refits, and the output additionally gains a
+            ``frozen_rho_certified`` column reporting the Layer-3 frozen-ρ
+            self-diagnostic (whether freezing the global smoothing parameter is
+            certified equal to the honest ρ-re-selecting set). Same eligibility
+            as ``"conformal"``; ``mean_lower`` / ``mean_upper`` report the outer
+            envelope of the (possibly multi-interval) exact set.
         conformal_level : float, default 0.9
             Target marginal coverage in ``(0, 1)`` when ``interval="conformal"``
+            or ``interval="full_conformal"``
             (e.g. ``0.95`` for a 95% interval). Ignored when ``interval`` is a
             float or ``None``.
         covariance_mode : {"conditional", "smoothing", "required"}, optional
@@ -179,6 +190,30 @@ class Model:
         if interval == "conformal":
             try:
                 raw = rust_module().predict_table_jackknife_plus(
+                    self._model_bytes, headers, rows, conformal_level
+                )
+            except Exception as exc:
+                raise map_exception(exc) from exc
+            return shape_predict_response(
+                raw,
+                headers=headers,
+                rows=rows,
+                table_kind=table_kind,
+                training_table_kind=self._training_table_kind,
+                interval=conformal_level,
+                return_type=return_type,
+                id_column=id_column,
+                row_ids=row_ids,
+                restore=restore_output_table,
+            )
+        # #1098: interval='full_conformal' routes to the EXACT Gaussian
+        # full-conformal set (no held-out fold; finite-sample ≥conformal_level
+        # marginal coverage; #942 Layer 1). One Cholesky per test point, zero
+        # refits. The returned JSON carries the same column schema plus a
+        # `frozen_rho_certified` column (the Layer-3 self-diagnostic).
+        if interval == "full_conformal":
+            try:
+                raw = rust_module().predict_table_full_conformal(
                     self._model_bytes, headers, rows, conformal_level
                 )
             except Exception as exc:
