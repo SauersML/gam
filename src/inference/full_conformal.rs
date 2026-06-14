@@ -2639,15 +2639,34 @@ impl ExactFullConformalSubstrate {
                 self.p()
             ));
         }
-        // The frozen-ρ certificate treats the whole frozen penalty as one global
-        // log-smoothing parameter `ρ` with `S(ρ) = eᵖ·Sλ`. `certified_full_conformal`
-        // re-selects ρ̂(z) on the augmented data and decides whether freezing is
-        // safe; its `frozen_set` is the EXACT set at the (re-selected) frozen ρ̂₀.
-        let response = GaussianRemlRhoResponse::new(&self.x, &self.y, &self.s_lambda, x_star)?;
-        let certified = response.certified_full_conformal(alpha)?;
-        let frozen_rho_certified =
-            matches!(certified.certificate, FrozenRhoCertificate::Certified { .. });
-        let set = certified.frozen_set;
+        // The AUTHORITATIVE exact set is built at the user's fitted penalty `Sλ`
+        // (ρ frozen exactly at the fit), so the reported set reflects the model
+        // the user trained — not a re-optimized global scale.
+        let weights = Array1::<f64>::ones(self.n());
+        let engine =
+            ExactGaussianFullConformal::new(&self.x, &self.y, &weights, &self.s_lambda, x_star)?;
+        let set = engine.prediction_set(alpha);
+
+        // Frozen-ρ self-diagnostic: treat the whole frozen penalty as carrying a
+        // single global log-smoothing parameter `ρ` with `S(ρ) = eᵖ·Sλ` and run
+        // the closed-form certificate. It re-selects the global ρ̂(z) on the
+        // augmented data and decides whether freezing the global scale is safe.
+        // This is a sound conservative check around the global REML optimum (a
+        // properly fitted model already sits at ρ̂₀ ≈ 0, where this set coincides
+        // with the authoritative set above); per-penalty re-selection is the
+        // research-core Layer 3 and is not asserted here. A degenerate certificate
+        // computation must NOT void the exact set, so its failure maps to "not
+        // certified" rather than an error.
+        let frozen_rho_certified = GaussianRemlRhoResponse::new(
+            &self.x,
+            &self.y,
+            &self.s_lambda,
+            x_star,
+        )
+        .and_then(|response| response.certified_full_conformal(alpha))
+        .map(|certified| matches!(certified.certificate, FrozenRhoCertificate::Certified { .. }))
+        .unwrap_or(false);
+
         let (lo, hi) = if set.intervals.is_empty() {
             // No candidate qualifies (pathological tiny α·(n+1)); collapse to the
             // frozen plug-in mean μ̂_* = x_*ᵀβ̂, β̂ = (XᵀX+Sλ)⁻¹Xᵀy — the only
