@@ -224,6 +224,27 @@ const SAE_PRISTINE_SEED_EV_RETAIN_FLOOR: f64 = 0.95;
 const SAE_FINAL_EV_DEGRADATION_TOL: f64 = 1.0e-3;
 const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
 
+/// Reactivation band width (in units of the JumpReLU temperature `τ`) below the
+/// hard gate threshold. The forward gate value is hard-zero strictly below
+/// `threshold`, but an atom whose logit lies within `threshold − MARGIN·τ` is
+/// still admitted to the compact Newton active set for sparsity-prior support.
+/// Below the band the shifted-sigmoid derivative `σ'((l−θ)/τ)` is vanishingly
+/// small, so the band captures essentially all of the prior-gradient mass that
+/// could act on a gated atom (at `MARGIN = 4`, `σ((l−θ)/τ) < σ(−4) ≈ 0.018` at
+/// the band edge). Without the band the gate is an absorbing pruning rule, not a
+/// learnable gate.
+const JUMPRELU_REACTIVATION_MARGIN: f64 = 4.0;
+
+/// Shared band predicate for JumpReLU optimization inclusion. An atom is kept
+/// optimizable (compact-layout inclusion and prior-gradient support) when its
+/// logit is above the reactivation band's lower edge `threshold − MARGIN·τ`.
+/// This is strictly weaker than the hard forward gate `logit > threshold`,
+/// which still governs data-fit reconstruction and its logit JVP.
+#[inline]
+fn jumprelu_in_optimization_band(logit: f64, threshold: f64, temperature: f64) -> bool {
+    logit > threshold - JUMPRELU_REACTIVATION_MARGIN * temperature
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaeStreamingPlan {
     pub streaming: bool,
