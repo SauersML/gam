@@ -140,8 +140,7 @@ fn fit_expectile_predict(
         family: Some(format!("expectile({tau})")),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ s(x)", data, &cfg).map_err(|e| format!("fit error: {e}"))?;
+    let result = fit_from_formula("y ~ s(x)", data, &cfg).map_err(|e| format!("fit error: {e}"))?;
     let FitResult::Standard(fit) = result else {
         return Err("expectile fit returned a non-standard model".to_string());
     };

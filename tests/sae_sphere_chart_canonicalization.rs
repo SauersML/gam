@@ -102,7 +102,11 @@ fn assoc_legendre_with_deriv(l_max: usize, x: f64) -> (Vec<Vec<f64>>, Vec<Vec<f6
     let mut dp = vec![vec![0.0_f64; l_max + 1]; l_max + 1];
     for l in 0..=l_max {
         for m in 0..=l {
-            let prev = if l >= 1 && m <= l - 1 { p[l - 1][m] } else { 0.0 };
+            let prev = if l >= 1 && m <= l - 1 {
+                p[l - 1][m]
+            } else {
+                0.0
+            };
             dp[l][m] = ((l as f64) * x * p[l][m] - ((l + m) as f64) * prev) / (x * x - 1.0);
         }
     }

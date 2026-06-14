@@ -132,7 +132,11 @@ fn build_atom_candidates(
     decoded: ArrayView2<'_, f64>,
     curved_num_params: usize,
     fitted_turning: Option<f64>,
-) -> Option<(HybridAtomCandidate, HybridAtomCandidate, (f64, Array1<f64>, Array1<f64>))> {
+) -> Option<(
+    HybridAtomCandidate,
+    HybridAtomCandidate,
+    (f64, Array1<f64>, Array1<f64>),
+)> {
     let n = coords.len();
     let p = decoded.ncols();
     if n < MIN_ROWS_FOR_LINEAR_FIT || decoded.nrows() != n || weights.len() != n || p == 0 {
@@ -348,7 +352,11 @@ where
                 kept_curved,
                 // Carry the straight sub-model only when the verdict collapses
                 // this slot to linear — the curved slots keep their fitted image.
-                linear_image: if kept_curved { None } else { Some(linear_image) },
+                linear_image: if kept_curved {
+                    None
+                } else {
+                    Some(linear_image)
+                },
             }
         })
         .collect();
@@ -449,22 +457,17 @@ mod tests {
         let weights = Array1::<f64>::ones(n);
         for scale_exp in [-3i32, -1, 0, 1, 3] {
             let c = 10.0_f64.powi(scale_exp);
-            let coords = Array1::from_iter((0..n).map(|i| c * (-1.0 + 2.0 * (i as f64) / ((n - 1) as f64))));
+            let coords =
+                Array1::from_iter((0..n).map(|i| c * (-1.0 + 2.0 * (i as f64) / ((n - 1) as f64))));
             for i in 0..n {
                 decoded[[i, 0]] = coords[i] / c; // canonical-scale decoded, not t-scale-dependent
                 decoded[[i, 1]] = 0.6 * coords[i] / c;
             }
-            let (linear, curved, _) = build_atom_candidates(
-                coords.view(),
-                weights.view(),
-                decoded.view(),
-                10,
-                Some(0.0),
-            )
-            .expect("straight image always yields a pair");
-            let choice =
-                crate::solver::evidence::select_hybrid_atom(&[linear, curved])
-                    .expect("non-empty slot");
+            let (linear, curved, _) =
+                build_atom_candidates(coords.view(), weights.view(), decoded.view(), 10, Some(0.0))
+                    .expect("straight image always yields a pair");
+            let choice = crate::solver::evidence::select_hybrid_atom(&[linear, curved])
+                .expect("non-empty slot");
             assert!(
                 choice.param.is_linear(),
                 "straight image must select linear at any t-scale (scale={c})"
@@ -491,9 +494,8 @@ mod tests {
                 Some(PI),
             )
             .expect("curved image always yields a pair");
-            let choice =
-                crate::solver::evidence::select_hybrid_atom(&[linear, curved])
-                    .expect("non-empty slot");
+            let choice = crate::solver::evidence::select_hybrid_atom(&[linear, curved])
+                .expect("non-empty slot");
             assert_eq!(
                 choice.param,
                 crate::solver::evidence::HybridAtomParam::Curved { latent_dim: 1 },

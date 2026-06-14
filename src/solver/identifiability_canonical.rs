@@ -665,8 +665,7 @@ fn canonicalize_for_identifiability_inner(
     // dropped column is attributed to a block that actually owns its geometry.
     let owns_geometry = |name: &str| -> bool {
         specs.iter().any(|spec| {
-            spec.name == name
-                && (spec.jacobian_callback.is_some() || spec.stacked_design.is_some())
+            spec.name == name && (spec.jacobian_callback.is_some() || spec.stacked_design.is_some())
         })
     };
     let dropped_on_owned_block = audit

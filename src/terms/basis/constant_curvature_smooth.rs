@@ -431,10 +431,7 @@ fn data_center_mean_geodesic_distance_jet(
 /// gauge for [`constant_curvature_effective_length_jet`]. Uses the same `2‖Δ‖`
 /// convention as the geodesic distance at κ = 0 (`d₀ = 2‖Δ‖`), so the κ = 0
 /// effective length reduces exactly to `ℓ_ref`.
-fn data_center_mean_chart_distance(
-    data: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-) -> f64 {
+fn data_center_mean_chart_distance(data: ArrayView2<'_, f64>, centers: ArrayView2<'_, f64>) -> f64 {
     let mut sum = 0.0_f64;
     let mut cnt = 0.0_f64;
     for xi in data.outer_iter() {
@@ -695,7 +692,8 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
     // fix). The kernel exponent is q = d/L with BOTH d and L moving in κ, so the
     // kernel κ-jets carry the full quotient chain rule — see
     // `constant_curvature_kernel_kappa_jets_scaled`.
-    let l_jet = constant_curvature_effective_length_jet(data, centers.view(), length_scale, spec.kappa)?;
+    let l_jet =
+        constant_curvature_effective_length_jet(data, centers.view(), length_scale, spec.kappa)?;
 
     // Design κ-jets: X = K(data, centers)·z, so the κ-derivatives are the
     // kernel κ-jets right-multiplied by the κ-fixed `z`.
@@ -949,11 +947,7 @@ mod tests {
     /// dense design `b` (n×p) and symmetric psd penalty `s` (p×p). Returns
     /// `min_λ D(λ)`. Self-contained so the oracle does not depend on the outer
     /// solver wiring — it tests the CRITERION SHAPE the wiring profiles.
-    fn profiled_gaussian_reml_deviance(
-        b: &Array2<f64>,
-        y: &Array1<f64>,
-        s: &Array2<f64>,
-    ) -> f64 {
+    fn profiled_gaussian_reml_deviance(b: &Array2<f64>, y: &Array1<f64>, s: &Array2<f64>) -> f64 {
         let n = b.nrows();
         let p = b.ncols();
         let btb = symmetrize(&b.t().dot(b));
@@ -1074,13 +1068,8 @@ mod tests {
             let mut best_k = f64::NAN;
             let mut best_v = f64::INFINITY;
             for &kappa in &grid {
-                let (b, s) = oracle_design_and_penalty(
-                    data.view(),
-                    centers.view(),
-                    ell_ref,
-                    kappa,
-                    frozen,
-                );
+                let (b, s) =
+                    oracle_design_and_penalty(data.view(), centers.view(), ell_ref, kappa, frozen);
                 let v = profiled_gaussian_reml_deviance(&b, &y, &s);
                 if v < best_v {
                     best_v = v;
@@ -1158,8 +1147,7 @@ mod tests {
         kappa_true: f64,
         seed: u64,
     ) -> Array1<f64> {
-        let (b, _s) =
-            oracle_design_and_penalty(data, centers, ell_ref, kappa_true, false);
+        let (b, _s) = oracle_design_and_penalty(data, centers, ell_ref, kappa_true, false);
         let p = b.ncols();
         let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ seed.wrapping_mul(0x1000_0000_1b3);
         let mut next = || {

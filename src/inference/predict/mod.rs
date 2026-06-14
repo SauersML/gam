@@ -6638,8 +6638,12 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
     // exposes no closed-form conditional variance (`RoystonParmar`) we fall back
     // to the mean SE — the only available scale — which is exactly the prior
     // behavior for that family.
-    let cal_scale =
-        predictive_standard_error(family, &cal_result.mean, &cal_result.mean_standard_error, fit);
+    let cal_scale = predictive_standard_error(
+        family,
+        &cal_result.mean,
+        &cal_result.mean_standard_error,
+        fit,
+    );
     let test_scale =
         predictive_standard_error(family, &result.mean, &result.mean_standard_error, fit);
     let calibrator = crate::inference::conformal::ConformalCalibrator::from_held_out_fold(
