@@ -4393,13 +4393,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     const DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
 
     let is_dynamic = family.block_geometry_is_dynamic();
-    // EMA of per-cycle wall-clock for timing-driven adaptive early-exit (#289).
-    // α = 0.3 gives a short memory (~3 cycles) so the EMA tracks recent cost.
-    let mut ema_cycle_secs: Option<f64> = None;
-    // Initial objective for the grad-ratio predicate.
-    let initial_objective = lastobjective;
     for cycle in 0..inner_max_cycles {
-        let cycle_start = std::time::Instant::now();
         // Fires at the top of each blockwise coordinate cycle so we can count
         // iterations from CI logs when a benchmark hangs inside the first
         // outer-eval. Emitted at info-level: same rationale as the joint-Newton
@@ -4896,41 +4890,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             break;
         }
 
-        // ── Timing-driven adaptive early-exit (#289) ────────────────────────
-        // Mirror the EMA predicate from the PIRLS LM loop: when iterations
-        // become trivially cheap AND the objective/step are near-stationary,
-        // accept convergence rather than spinning to inner_max_cycles.
-        // Only fires after ≥2 data points so the EMA is meaningful.
-        let cycle_secs = cycle_start.elapsed().as_secs_f64();
-        let ema = match ema_cycle_secs {
-            None => cycle_secs,
-            Some(prev) => 0.3 * cycle_secs + 0.7 * prev,
-        };
-        ema_cycle_secs = Some(ema);
-        if cycle >= 2 {
-            let cycle_cheap = ema > 0.0 && cycle_secs < 0.25 * ema;
-            let f_abs = lastobjective.abs().max(1.0);
-            let deviance_ok = (objective_change / f_abs) < inner_tol * 10.0;
-            let step_ok = if initial_objective.abs() > 0.0 && objective_change.is_finite() {
-                (objective_change / initial_objective.abs().max(1.0)) < inner_tol * 10.0
-            } else {
-                false
-            };
-            if cycle_cheap && deviance_ok && step_ok {
-                log::info!(
-                    "[PIRLS/blockwise] cycle {} timing-driven adaptive early-exit: \
-                     cycle={:.4}s ema={:.4}s obj_rel={:.3e}",
-                    cycle,
-                    cycle_secs,
-                    ema,
-                    objective_change / f_abs,
-                );
-                converged = true;
-                break;
-            }
-        }
-        // ── end timing-driven adaptive early-exit ────────────────────────────
-
+        // NOTE: there is deliberately NO wall-clock-driven "adaptive
+        // early-exit" here — the same discipline the joint-Newton sibling loop
+        // documents above. A verdict that fires when a cycle's wall-clock falls
+        // below a fraction of a running EMA is non-deterministic: under CPU
+        // contention (a parallel sweep) the same fit accepts at a different
+        // iterate than it does run alone, and it accepts iterates up to 10×
+        // outside the real KKT/objective tolerance, biasing the REML/LAML
+        // criterion the inner residual feeds. Convergence is certified ONLY by
+        // the exact stationarity gate below.
         if max_accepted_beta_step <= step_tol && objective_change <= objective_tol {
             if exact_joint_stationarity_ok || max_proposed_beta_step <= step_tol {
                 converged = true;
