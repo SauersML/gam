@@ -3035,53 +3035,6 @@ fn atom_curvature_bound_with_decoder(
     Ok(max_kappa)
 }
 
-/// The #1099 delta-method gradient `∂κ/∂β ∈ ℝ^{M_k}` of the curvature bound with
-/// respect to the captured decoder channel `channel`'s coefficients, by central
-/// finite differences of [`atom_curvature_bound_with_decoder`]. Returns `None`
-/// when the bound is non-finite (infinite curvature / degenerate tangent at the
-/// base point) so no usable delta-method band exists.
-fn atom_curvature_bound_grad(
-    atom: &SaeManifoldAtom,
-    atom_idx: usize,
-    second: ArrayView4<'_, f64>,
-    channel: usize,
-) -> Option<Array1<f64>> {
-    let m = atom.basis_size();
-    let base = atom
-        .decoder_coefficients
-        .to_owned();
-    let kappa0 = atom_curvature_bound_with_decoder(atom, atom_idx, second, base.view()).ok()?;
-    if !kappa0.is_finite() {
-        return None;
-    }
-    // FD step scaled to the channel's coefficient magnitude, floored for
-    // conditioning. The bound is positively homogeneous of degree 1 in β, so a
-    // relative step keeps the perturbation in the locally-linear regime.
-    let chan_scale = (0..m)
-        .map(|r| base[[r, channel]].abs())
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
-    let h = 1e-6 * chan_scale;
-    let mut grad = Array1::<f64>::zeros(m);
-    let mut perturbed = base.clone();
-    for r in 0..m {
-        let orig = base[[r, channel]];
-        perturbed[[r, channel]] = orig + h;
-        let kp = atom_curvature_bound_with_decoder(atom, atom_idx, second, perturbed.view()).ok()?;
-        perturbed[[r, channel]] = orig - h;
-        let km = atom_curvature_bound_with_decoder(atom, atom_idx, second, perturbed.view()).ok()?;
-        perturbed[[r, channel]] = orig;
-        if !(kp.is_finite() && km.is_finite()) {
-            return None;
-        }
-        grad[r] = (kp - km) / (2.0 * h);
-    }
-    if grad.iter().any(|g| !g.is_finite()) {
-        return None;
-    }
-    Some(grad)
-}
-
 fn tangent_frame_rank(tangent: ArrayView2<'_, f64>) -> Result<(f64, Array2<f64>), String> {
     let p = tangent.nrows();
     let d = tangent.ncols();
