@@ -209,11 +209,16 @@ pub struct LatentSurvivalFamily {
     pub x_time_exit: Array2<f64>,
     pub x_time_derivative_exit: Array2<f64>,
     /// Time-basis design evaluated at the interval upper bound `R` (so
-    /// `q_right = x_time_right · β_time`). For non-interval rows this row equals
-    /// `x_time_exit`'s row (`q_right` is then unused by the likelihood), so the
-    /// matrix always has `n` rows and the same column count as the other time
-    /// designs.
+    /// `q_right = x_time_right · β_time + time_offset_right`). For non-interval
+    /// rows this row equals `x_time_exit`'s row (`q_right` is then unused by the
+    /// likelihood), so the matrix always has `n` rows and the same column count
+    /// as the other time designs.
     pub x_time_right: Array2<f64>,
+    /// Time-block offset at the interval upper bound `R` (length `n`).
+    pub time_offset_right: Array1<f64>,
+    /// Unloaded (background) cumulative mass at the interval upper bound `R`
+    /// (length `n`). Ignored for non-interval rows.
+    pub unloaded_mass_right: Array1<f64>,
     pub x_mean: DesignMatrix,
     pub time_linear_constraints: Option<LinearInequalityConstraints>,
     pub quadctx: Arc<QuadratureContext>,
@@ -296,6 +301,38 @@ impl LatentSurvivalFamily {
             eta_time.slice(s![2 * n..3 * n]),
             eta_mean,
         ))
+    }
+
+    /// Per-row interval upper-bound time transform `q_right = x_time_right · β_time
+    /// + time_offset_right`. Shares the time-block coefficients with `q_exit`
+    /// (same monotone basis, evaluated at `R`), so it is read off the time
+    /// block's `beta` rather than carried as an extra eta channel. For
+    /// non-interval rows `x_time_right` equals `x_time_exit`, so the (unused)
+    /// value is simply `q_exit`.
+    fn time_q_right(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Array1<f64>, LatentSurvivalError> {
+        let n = self.event_target.len();
+        let beta_time = &block_states[Self::BLOCK_TIME].beta;
+        if self.x_time_right.ncols() != beta_time.len() {
+            return Err(LatentSurvivalError::BlockMismatch {
+                reason: format!(
+                    "latent survival interval right design has {} columns but time beta has {}",
+                    self.x_time_right.ncols(),
+                    beta_time.len()
+                ),
+            });
+        }
+        if self.x_time_right.nrows() != n || self.time_offset_right.len() != n {
+            return Err(LatentSurvivalError::BlockMismatch {
+                reason: "latent survival interval right design/offset row count mismatch"
+                    .to_string(),
+            });
+        }
+        let mut q_right = self.x_time_right.dot(beta_time);
+        q_right += &self.time_offset_right;
+        Ok(q_right)
     }
 
     fn latent_sd(&self, block_states: &[ParameterBlockState]) -> Result<f64, LatentSurvivalError> {
@@ -439,7 +476,36 @@ pub fn fit_latent_survival_terms(
         build_term_collection_design(data, &spec.meanspec).map_err(|e| e.to_string())?;
     let resolvedspec = freeze_term_collection_from_design(&spec.meanspec, &mean_design)
         .map_err(|e| e.to_string())?;
-    let time_prepared = prepare_latent_time_block(&spec.time_block, spec.derivative_guard)?;
+    let time_prepared = prepare_latent_time_block(
+        &spec.time_block,
+        spec.time_design_right.as_ref(),
+        spec.derivative_guard,
+    )?;
+
+    let n = spec.event_target.len();
+    let time_offset_right = match spec.time_offset_right.as_ref() {
+        Some(offset) => {
+            if offset.len() != n {
+                return Err(format!(
+                    "latent survival interval right time offset must have length {n}, got {}",
+                    offset.len()
+                ));
+            }
+            offset.clone()
+        }
+        None => Array1::zeros(n),
+    };
+    let unloaded_mass_right = if spec.unloaded_mass_right.is_empty() {
+        Array1::zeros(n)
+    } else {
+        if spec.unloaded_mass_right.len() != n {
+            return Err(format!(
+                "latent survival interval right unloaded mass must have length {n}, got {}",
+                spec.unloaded_mass_right.len()
+            ));
+        }
+        spec.unloaded_mass_right.clone()
+    };
 
     let family = LatentSurvivalFamily {
         event_target: spec.event_target.clone(),
@@ -452,6 +518,9 @@ pub fn fit_latent_survival_terms(
         x_time_entry: time_prepared.design_entry.clone(),
         x_time_exit: time_prepared.design_exit.clone(),
         x_time_derivative_exit: time_prepared.design_derivative_exit.clone(),
+        x_time_right: time_prepared.design_right.clone(),
+        time_offset_right,
+        unloaded_mass_right,
         x_mean: mean_design.design.clone(),
         time_linear_constraints: time_prepared.linear_constraints.clone(),
         quadctx: Arc::new(QuadratureContext::new()),
@@ -489,7 +558,7 @@ pub fn fit_latent_binary_terms(
         build_term_collection_design(data, &spec.meanspec).map_err(|e| e.to_string())?;
     let resolvedspec = freeze_term_collection_from_design(&spec.meanspec, &mean_design)
         .map_err(|e| e.to_string())?;
-    let time_prepared = prepare_latent_time_block(&spec.time_block, spec.derivative_guard)?;
+    let time_prepared = prepare_latent_time_block(&spec.time_block, None, spec.derivative_guard)?;
 
     let family = LatentBinaryFamily {
         event_target: spec.event_target.clone(),
@@ -669,6 +738,7 @@ fn validate_latent_binary_inputs(
 
 fn prepare_latent_time_block(
     input: &TimeBlockInput,
+    design_right: Option<&DesignMatrix>,
     derivative_guard: f64,
 ) -> Result<PreparedLatentTimeBlock, LatentSurvivalError> {
     if !input.time_monotonicity.is_coordinate_cone() {
@@ -688,6 +758,28 @@ fn prepare_latent_time_block(
     let design_derivative_exit = input
         .design_derivative_exit
         .try_to_dense_by_chunks("latent survival derivative time design")?;
+    // The interval upper-bound design shares the time-block coefficients with
+    // the exit design; when the data has no interval rows we reuse the exit
+    // design so `q_right` stays well-defined (its likelihood contribution is
+    // gated off for non-interval rows). When present it must match the exit
+    // design's shape (same basis, evaluated at R).
+    let design_right = match design_right {
+        Some(matrix) => {
+            let dense = matrix.try_to_dense_by_chunks("latent survival interval right time design")?;
+            if dense.nrows() != design_exit.nrows() || dense.ncols() != design_exit.ncols() {
+                return Err(LatentSurvivalError::InvalidDataset {
+                    reason: format!(
+                        "latent survival interval right time design must match exit design shape \
+                         {:?}, got {:?}",
+                        design_exit.dim(),
+                        dense.dim()
+                    ),
+                });
+            }
+            dense
+        }
+        None => design_exit.clone(),
+    };
     let linear_constraints = structural_time_coefficient_constraints(
         &input.design_derivative_exit,
         &input.derivative_offset_exit,
@@ -709,6 +801,7 @@ fn prepare_latent_time_block(
         design_entry,
         design_exit,
         design_derivative_exit,
+        design_right,
         linear_constraints,
         penalties: input.penalties.clone(),
         initial_beta,
@@ -1759,6 +1852,7 @@ impl LatentSurvivalFamily {
         out[LATENT_SURVIVAL_PRIMARY_Q_ENTRY] = self.x_time_entry.row(row).dot(&d_time);
         out[LATENT_SURVIVAL_PRIMARY_Q_EXIT] = self.x_time_exit.row(row).dot(&d_time);
         out[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT] = self.x_time_derivative_exit.row(row).dot(&d_time);
+        out[LATENT_SURVIVAL_PRIMARY_Q_RIGHT] = self.x_time_right.row(row).dot(&d_time);
         out[LATENT_SURVIVAL_PRIMARY_MU] = self
             .x_mean
             .dot_row_view(row, d_beta_flat.slice(s![slices.mean.clone()]));
@@ -1792,6 +1886,7 @@ impl LatentSurvivalFamily {
                 LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
                 self.x_time_derivative_exit.row(row),
             ),
+            (LATENT_SURVIVAL_PRIMARY_Q_RIGHT, self.x_time_right.row(row)),
         ] {
             let scale = weight * primary_gradient[primary_idx];
             if scale == 0.0 {
@@ -1849,6 +1944,10 @@ impl LatentSurvivalFamily {
                 LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
                 LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
             ]],
+            primary_hessian[[
+                LATENT_SURVIVAL_PRIMARY_Q_RIGHT,
+                LATENT_SURVIVAL_PRIMARY_Q_RIGHT,
+            ]],
         ];
         let time_cross_weights = [
             (
@@ -1869,6 +1968,24 @@ impl LatentSurvivalFamily {
                 &self.x_time_exit,
                 &self.x_time_derivative_exit,
             ),
+            (
+                LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+                LATENT_SURVIVAL_PRIMARY_Q_RIGHT,
+                &self.x_time_entry,
+                &self.x_time_right,
+            ),
+            (
+                LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+                LATENT_SURVIVAL_PRIMARY_Q_RIGHT,
+                &self.x_time_exit,
+                &self.x_time_right,
+            ),
+            (
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+                LATENT_SURVIVAL_PRIMARY_Q_RIGHT,
+                &self.x_time_derivative_exit,
+                &self.x_time_right,
+            ),
         ];
         {
             let time_target = &mut target.slice_mut(s![slices.time.clone(), slices.time.clone()]);
@@ -1879,6 +1996,7 @@ impl LatentSurvivalFamily {
                 time_weights[2],
                 self.x_time_derivative_exit.row(row),
             );
+            dense_outer_accumulate(time_target, time_weights[3], self.x_time_right.row(row));
             for (a, b, lhs, rhs) in time_cross_weights {
                 let weight = primary_hessian[[a, b]];
                 if weight == 0.0 {
@@ -1922,6 +2040,7 @@ impl LatentSurvivalFamily {
                 LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
                 self.x_time_derivative_exit.row(row),
             ),
+            (LATENT_SURVIVAL_PRIMARY_Q_RIGHT, self.x_time_right.row(row)),
         ];
         for (primary_idx, time_vec) in time_mean_weights {
             let weight = primary_hessian[[primary_idx, LATENT_SURVIVAL_PRIMARY_MU]];
@@ -1958,6 +2077,7 @@ impl LatentSurvivalFamily {
                     LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
                     self.x_time_derivative_exit.row(row),
                 ),
+                (LATENT_SURVIVAL_PRIMARY_Q_RIGHT, self.x_time_right.row(row)),
             ] {
                 let weight = primary_hessian[[primary_idx, LATENT_SURVIVAL_PRIMARY_LOG_SIGMA]];
                 if weight == 0.0 {
@@ -2068,7 +2188,9 @@ impl LatentSurvivalFamily {
         log_sigma_target: Option<&mut Array2<f64>>,
     ) -> Result<(), String> {
         let h = primary_hessian;
-        // Time block: 3 squared rows + 3 symmetric crosses.
+        // Time block: 4 squared rows (entry/exit/qdot/right) + 6 symmetric
+        // crosses. The interval right-boundary functional `q_right` shares the
+        // time-block coefficients, so it accumulates into the same time target.
         dense_outer_accumulate(
             time_target,
             h[[
@@ -2093,6 +2215,14 @@ impl LatentSurvivalFamily {
             ]],
             self.x_time_derivative_exit.row(row),
         );
+        dense_outer_accumulate(
+            time_target,
+            h[[
+                LATENT_SURVIVAL_PRIMARY_Q_RIGHT,
+                LATENT_SURVIVAL_PRIMARY_Q_RIGHT,
+            ]],
+            self.x_time_right.row(row),
+        );
         for (a, b, lhs, rhs) in [
             (
                 LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
@@ -2111,6 +2241,24 @@ impl LatentSurvivalFamily {
                 LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
                 &self.x_time_exit,
                 &self.x_time_derivative_exit,
+            ),
+            (
+                LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+                LATENT_SURVIVAL_PRIMARY_Q_RIGHT,
+                &self.x_time_entry,
+                &self.x_time_right,
+            ),
+            (
+                LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+                LATENT_SURVIVAL_PRIMARY_Q_RIGHT,
+                &self.x_time_exit,
+                &self.x_time_right,
+            ),
+            (
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+                LATENT_SURVIVAL_PRIMARY_Q_RIGHT,
+                &self.x_time_derivative_exit,
+                &self.x_time_right,
             ),
         ] {
             let weight = h[[a, b]];
