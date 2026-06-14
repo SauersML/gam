@@ -1953,7 +1953,7 @@ pub(crate) fn sys_htbeta_materialize_row(
     sys: &ArrowSchurSystem,
     row_idx: usize,
     row: &ArrowRowBlock,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, ArrowSchurError> {
     let di = sys.row_dims[row_idx];
     let k = sys.k;
     let use_dense = sys.htbeta_dense_supplement || sys.htbeta_matvec.is_none();
@@ -1975,17 +1975,14 @@ pub(crate) fn sys_htbeta_materialize_row(
             }
         }
     } else if use_dense && row.htbeta.dim() != (di, k) {
-        // SAFETY: reaching here means the assembler installed neither a
-        // correctly-shaped (di, k) dense H_tβ block nor an htbeta_matvec
-        // operator — a construction-time invariant violation in the caller, not
-        // recoverable runtime input. The cross-block is mandatory for the Schur
-        // reduction and there is no meaningful fallback, so this is a hard bug.
-        panic!(
-            "row {row_idx}: htbeta shape {:?} != ({di}, {k}) and no htbeta_matvec installed",
-            row.htbeta.dim()
-        );
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "row {row_idx}: htbeta shape {:?} != ({di}, {k}) and no htbeta_matvec installed",
+                row.htbeta.dim()
+            ),
+        });
     }
-    mat
+    Ok(mat)
 }
 
 

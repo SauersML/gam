@@ -1,8 +1,8 @@
 use super::*;
 
-const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
+pub(crate) const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
 
-const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
+pub(crate) const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 
 /// Relative Cholesky-pivot floor for the analytic SAE outer-rho gradient.
 ///
@@ -12,16 +12,16 @@ const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 /// Once `min_pivot / max_pivot` is below this floor, the gradient lane must
 /// either identify a closed-form gauge orbit and stiffen only that quotient
 /// direction, or reject the trial rho as numerically singular.
-const SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR: f64 = 1.0e-12;
+pub(crate) const SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR: f64 = 1.0e-12;
 
-const SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR: f64 = 1.0e-8;
+pub(crate) const SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR: f64 = 1.0e-8;
 
 /// Relative spectral cutoff below which a penalised decoder β-curvature
 /// eigenvalue (`G_k + λ_smooth·S_k`) is treated as a genuine flat direction of
 /// the joint inner Hessian — the rank-deficient-decoder null quotiented out of
 /// the inner convergence measure and deflated in the outer gradient (#1051).
 /// Matches the `1e-9` relative rank cutoff used across the codebase.
-const SAE_DECODER_BETA_NULL_RELATIVE_FLOOR: f64 = 1.0e-9;
+pub(crate) const SAE_DECODER_BETA_NULL_RELATIVE_FLOOR: f64 = 1.0e-9;
 
 
 /// Largest decoder (`β`) block dimension for which the outer-gradient
@@ -46,7 +46,7 @@ const SAE_DECODER_BETA_NULL_RELATIVE_FLOOR: f64 = 1.0e-9;
 /// `k = M·r` up to ~512 (e.g. m=8 basis fns, p=32, r=8 → k=64, but for
 /// m=16 → k=128, m=32 → k=256); 512 covers all typical small-atom PCA cases
 /// while keeping the O(k³) cost ≈ 0.13B ops — negligible next to the solve.
-const SAE_OUTER_GRADIENT_BETA_NULL_PROBE_MAX_DIM: usize = 512;
+pub(crate) const SAE_OUTER_GRADIENT_BETA_NULL_PROBE_MAX_DIM: usize = 512;
 
 
 /// Nominal curvature-homotopy `η` step (#1007): the tracker covers `η ∈ [0, 1]`
@@ -55,18 +55,18 @@ const SAE_OUTER_GRADIENT_BETA_NULL_PROBE_MAX_DIM: usize = 512;
 /// cascade it replaces — and the step is halved adaptively when the arrow-factor
 /// min pivot shrinks, so a near-bifurcation stretch is resolved at finer
 /// granularity without a separate knob.
-const CURVATURE_WALK_INITIAL_ETA_STEP: f64 = 0.2;
+pub(crate) const CURVATURE_WALK_INITIAL_ETA_STEP: f64 = 0.2;
 
 /// Smallest curvature-homotopy `η` step (#1007). A pivot collapse (or corrector
 /// failure) that persists at this step is a DETECTED branch bifurcation, not a
 /// step-size artifact: the walk records it and defers to the seed cascade.
-const CURVATURE_WALK_MIN_ETA_STEP: f64 = 1.0 / 256.0;
+pub(crate) const CURVATURE_WALK_MIN_ETA_STEP: f64 = 1.0 / 256.0;
 
 /// Hard ceiling on accepted corrector solves in one curvature-homotopy walk
 /// (#1007). Bounds the walk's cost under repeated halving; reaching it is a
 /// structural-termination signal (the branch is not cleanly trackable) that
 /// defers to the cascade, never a spin.
-const CURVATURE_WALK_MAX_CORRECTORS: usize = 32;
+pub(crate) const CURVATURE_WALK_MAX_CORRECTORS: usize = 32;
 
 
 /// Relative floor on the Newton directional decrease, expressed as a tiny
@@ -74,7 +74,7 @@ const CURVATURE_WALK_MAX_CORRECTORS: usize = 32;
 /// f64 round-off in the quadratic model and is treated as no progress (the step
 /// is rejected). Scaling by the gradient/step norms makes the floor invariant
 /// to the problem's overall magnitude.
-const SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR: f64 = 1.0e-14;
+pub(crate) const SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR: f64 = 1.0e-14;
 
 
 /// Row count at or above which the fused SAE reconstruction data-fit
@@ -82,16 +82,16 @@ const SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR: f64 = 1.0e-14;
 /// rayon. Below this the single-threaded fused pass is cheaper than the
 /// fan-out; matched in spirit to the arrow-Schur `SCHUR_MATVEC_PARALLEL_ROW_MIN`
 /// gate so short batches inside an outer fan-out stay sequential (#1017).
-const SAE_LOSS_PARALLEL_ROW_MIN: usize = 64;
+pub(crate) const SAE_LOSS_PARALLEL_ROW_MIN: usize = 64;
 
 /// Relative tolerance on the undamped Newton step norm (scaled by the iterate
 /// scale) for accepting inner-solve convergence.
-const SAE_MANIFOLD_INNER_STEP_REL_TOL: f64 = 1.0e-4;
+pub(crate) const SAE_MANIFOLD_INNER_STEP_REL_TOL: f64 = 1.0e-4;
 
 
 /// Relative tolerance on the KKT gradient norm (scaled by the iterate scale) for
 /// accepting inner-solve convergence.
-const SAE_MANIFOLD_INNER_GRAD_REL_TOL: f64 = 1.0e-5;
+pub(crate) const SAE_MANIFOLD_INNER_GRAD_REL_TOL: f64 = 1.0e-5;
 
 
 /// Relative per-refine-round penalised-objective decrease below which the inner
@@ -100,7 +100,7 @@ const SAE_MANIFOLD_INNER_GRAD_REL_TOL: f64 = 1.0e-5;
 /// stay above tolerance while the objective stops moving; this `√εmach`-scale
 /// floor recognises that stalled iterate as the converged inner optimum instead
 /// of grinding the refine budget to the `1e12` infeasible sentinel.
-const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL: f64 = 1.0e-8;
+pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL: f64 = 1.0e-8;
 
 
 /// Fraction of the total since-entry objective reduction below which a refine
@@ -109,38 +109,38 @@ const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL: f64 = 1.0e-8;
 /// captured ≥ 99.99% of the achievable penalised-objective reduction before the
 /// criterion is ranked — far past the point where further crawl can change the
 /// Laplace evidence, yet strict enough that a materially-improving fit refines on.
-const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION: f64 = 1.0e-4;
+pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION: f64 = 1.0e-4;
 
 
 /// Minimum completed refine rounds before the objective-stagnation fixed point
 /// may be accepted (#1051). Enough rounds to establish a meaningful
 /// total-improvement baseline for the fraction test, but far below the full
 /// refine budget — terminating the ill-conditioned crawl early is the goal.
-const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS: usize = 3;
+pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS: usize = 3;
 
 
 /// Above this full-`B` β width, dense beta-penalty curvature is never
 /// materialized when Grassmann frames are engaged; exact curvature is probed
 /// directly in the factored coordinate space instead.
-const SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM: usize = 4096;
+pub(crate) const SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM: usize = 4096;
 
 
 /// Relative spectral cutoff for counting the numerical rank / nullity of a
 /// symmetric penalty Gram: eigenvalues at or below `cutoff · λ_max` are treated
 /// as zero. Shared by [`SaeManifoldTerm::symmetric_rank`] and
 /// [`smooth_penalty_nullity`] so the two stay in lockstep.
-const SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF: f64 = 1.0e-9;
+pub(crate) const SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF: f64 = 1.0e-9;
 
 
 /// Floor on the Levenberg-Marquardt ridge added to a per-row Hessian before
 /// Cholesky, so the first attempt is always strictly positive even when the
 /// caller passes a zero base ridge.
-const SAE_MANIFOLD_ROW_RIDGE_FLOOR: f64 = 1.0e-12;
+pub(crate) const SAE_MANIFOLD_ROW_RIDGE_FLOOR: f64 = 1.0e-12;
 
 
 /// Multiplicative factor by which the LM ridge is escalated after a failed
 /// Cholesky factorisation of a per-row Hessian.
-const SAE_MANIFOLD_ROW_RIDGE_GROWTH: f64 = 10.0;
+pub(crate) const SAE_MANIFOLD_ROW_RIDGE_GROWTH: f64 = 10.0;
 
 
 /// Maximum number of LM ridge-escalation attempts before declaring the per-row
@@ -149,7 +149,7 @@ const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 
 
 #[derive(Clone, Copy, Debug, Default)]
-struct SaeBetaPenaltyAssembly {
+pub(crate) struct SaeBetaPenaltyAssembly {
     dense_written: bool,
     deferred_factored: bool,
 }
@@ -171,15 +171,15 @@ impl SaeBetaPenaltyAssembly {
 /// under-fitting is a model-quality issue, but returning a K>=1 active SAE whose
 /// fitted matrix is indistinguishable from the column mean is a structural
 /// collapse and must enter the #976 CollapseEvent ledger.
-const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.10;
+pub(crate) const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.10;
 
-const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
+pub(crate) const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
 
-const SAE_PRISTINE_SEED_EV_RETAIN_FLOOR: f64 = 0.95;
+pub(crate) const SAE_PRISTINE_SEED_EV_RETAIN_FLOOR: f64 = 0.95;
 
-const SAE_FINAL_EV_DEGRADATION_TOL: f64 = 1.0e-3;
+pub(crate) const SAE_FINAL_EV_DEGRADATION_TOL: f64 = 1.0e-3;
 
-const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
+pub(crate) const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
 /// Full SAE-manifold term.
 #[derive(Debug)]
 pub struct SaeManifoldTerm {

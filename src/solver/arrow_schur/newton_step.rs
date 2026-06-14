@@ -969,7 +969,7 @@ fn try_mixed_precision_arrow_solve(
         &schur_factor_f32,
         rhs_t.view(),
         rhs_beta.view(),
-    );
+    )?;
     let certificate_tol = residual_relative_tolerance
         .max(MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER * f64::EPSILON);
     for refinement_steps in 0..=max_refinement_steps {
@@ -992,7 +992,7 @@ fn try_mixed_precision_arrow_solve(
             rhs_beta.view(),
             res_t.view(),
             res_beta.view(),
-        );
+        )?;
         if certificate <= certificate_tol {
             return Ok(Some(MixedPrecisionAttempt::Certified {
                 delta_t: x.0,
@@ -1015,7 +1015,7 @@ fn try_mixed_precision_arrow_solve(
             &schur_factor_f32,
             res_t.view(),
             res_beta.view(),
-        );
+        )?;
         if !correction
             .0
             .iter()
@@ -1118,7 +1118,7 @@ fn solve_arrow_system_f32(
     schur_factor: &Array2<f32>,
     rhs_t: ArrayView1<'_, f64>,
     rhs_beta: ArrayView1<'_, f64>,
-) -> (Array1<f64>, Array1<f64>) {
+) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
     let n = sys.rows.len();
     let mut y_rows = Vec::<Array1<f32>>::with_capacity(n);
     let mut reduced_beta = rhs_beta.mapv(|v| v as f32);
@@ -1127,7 +1127,7 @@ fn solve_arrow_system_f32(
         let base = sys.row_offsets[i];
         let rhs_i = rhs_t.slice(ndarray::s![base..base + di]).mapv(|v| v as f32);
         let y_i = cholesky_solve_lower_f32(&row_factors[i], &rhs_i);
-        let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i]).mapv(|v| v as f32);
+        let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i])?.mapv(|v| v as f32);
         for beta_col in 0..sys.k {
             let mut acc = 0.0_f32;
             for row_axis in 0..di {
@@ -1143,7 +1143,7 @@ fn solve_arrow_system_f32(
     for i in 0..n {
         let di = sys.row_dims[i];
         let base = sys.row_offsets[i];
-        let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i]).mapv(|v| v as f32);
+        let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i])?.mapv(|v| v as f32);
         let mut cross = Array1::<f32>::zeros(di);
         for row_axis in 0..di {
             let mut acc = 0.0_f32;
@@ -1158,7 +1158,7 @@ fn solve_arrow_system_f32(
         }
     }
     let x_beta = x_beta_f32.mapv(|v| v as f64);
-    (x_t, x_beta)
+    Ok((x_t, x_beta))
 }
 
 
@@ -1267,16 +1267,16 @@ fn arrow_backward_error_certificate(
     rhs_beta: ArrayView1<'_, f64>,
     res_t: ArrayView1<'_, f64>,
     res_beta: ArrayView1<'_, f64>,
-) -> f64 {
+) -> Result<f64, ArrowSchurError> {
     let residual_norm = infinity_norm_pair(res_t, res_beta);
-    let operator_norm = arrow_operator_infinity_norm(sys, ridge_t, ridge_beta);
+    let operator_norm = arrow_operator_infinity_norm(sys, ridge_t, ridge_beta)?;
     let solution_norm = infinity_norm_pair(x_t, x_beta);
     let rhs_norm = infinity_norm_pair(rhs_t, rhs_beta);
     let denom = operator_norm * solution_norm + rhs_norm;
     if denom > 0.0 {
-        residual_norm / denom
+        Ok(residual_norm / denom)
     } else {
-        residual_norm
+        Ok(residual_norm)
     }
 }
 
@@ -1290,12 +1290,16 @@ fn infinity_norm_pair(lhs: ArrayView1<'_, f64>, rhs: ArrayView1<'_, f64>) -> f64
 }
 
 
-fn arrow_operator_infinity_norm(sys: &ArrowSchurSystem, ridge_t: f64, ridge_beta: f64) -> f64 {
+fn arrow_operator_infinity_norm(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> Result<f64, ArrowSchurError> {
     let mut out = 0.0_f64;
     for i in 0..sys.rows.len() {
         let di = sys.row_dims[i];
         let row = &sys.rows[i];
-        let htbeta = sys_htbeta_materialize_row(sys, i, row);
+        let htbeta = sys_htbeta_materialize_row(sys, i, row)?;
         for a in 0..di {
             let mut row_sum = 0.0_f64;
             for b in 0..di {
@@ -1317,14 +1321,14 @@ fn arrow_operator_infinity_norm(sys: &ArrowSchurSystem, ridge_t: f64, ridge_beta
         row_sum += ridge_beta;
         for i in 0..sys.rows.len() {
             let di = sys.row_dims[i];
-            let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i]);
+            let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i])?;
             for a in 0..di {
                 row_sum += htbeta[[a, beta_row]].abs();
             }
         }
         out = out.max(row_sum);
     }
-    out
+    Ok(out)
 }
 
 
@@ -1965,18 +1969,18 @@ pub(crate) fn row_schur_contribution_factors<B: BatchedBlockSolver>(
     htt_factor: ArrayView2<'_, f64>,
     backend: &B,
     kind: SchurReductionKind,
-) -> (Array2<f64>, Array2<f64>) {
+) -> Result<(Array2<f64>, Array2<f64>), ArrowSchurError> {
     // Materialize the (d, k) cross-block, probing via the matvec when the
     // dense slab is absent.
-    let htbeta = sys_htbeta_materialize_row(sys, row_idx, row);
+    let htbeta = sys_htbeta_materialize_row(sys, row_idx, row)?;
     match kind {
         SchurReductionKind::Direct => {
             let solved = backend.solve_block_matrix(htt_factor, htbeta.view());
-            (htbeta, solved)
+            Ok((htbeta, solved))
         }
         SchurReductionKind::SqrtBa => {
             let whitened = backend.sqrt_solve_block_matrix(htt_factor, htbeta.view());
-            (whitened.clone(), whitened)
+            Ok((whitened.clone(), whitened))
         }
     }
 }
@@ -1995,8 +1999,9 @@ pub(crate) fn subtract_row_schur_contribution<B: BatchedBlockSolver>(
     backend: &B,
     kind: SchurReductionKind,
     schur: &mut Array2<f64>,
-) {
+) -> Result<(), ArrowSchurError> {
     let (left, right) =
-        row_schur_contribution_factors(sys, row_idx, row, htt_factor, backend, kind);
+        row_schur_contribution_factors(sys, row_idx, row, htt_factor, backend, kind)?;
     backend.block_gemm_subtract(schur, &left, &right);
+    Ok(())
 }

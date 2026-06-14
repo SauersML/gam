@@ -21,7 +21,6 @@ pub struct TransformationNormalConfig {
     pub response_num_internal_knots_pinned: bool,
 }
 
-
 impl Default for TransformationNormalConfig {
     fn default() -> Self {
         Self {
@@ -35,20 +34,19 @@ impl Default for TransformationNormalConfig {
     }
 }
 
-
 /// Baseline cap for the tensor-product width used by the transformation-normal
 /// response basis. Small datasets should stay compact because the fit
 /// repeatedly factorizes dense penalized Hessians.
-const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
+pub(crate) const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
 
 /// Large samples can support a richer response basis without the aggressive
 /// underfitting forced by the small-sample cap above. This upper cap keeps the
 /// tensor width bounded even when the covariate side is narrow.
-const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
+pub(crate) const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
 
 /// E[log |Z|] for Z ~ N(0, 1), used to put local log-absolute residual
 /// projections on the standard-normal scale.
-const STANDARD_NORMAL_MEAN_LOG_ABS: f64 = -0.635_181_422_730_739_1;
+pub(crate) const STANDARD_NORMAL_MEAN_LOG_ABS: f64 = -0.635_181_422_730_739_1;
 
 /// Strict-feasibility margin for `h' > 0` on the monotonicity grid. Used
 /// both by the fit-time fraction-to-boundary line search (so accepted β
@@ -72,7 +70,7 @@ pub const TRANSFORMATION_NORMAL_H_ABS_MAX: f64 = 1.0e6;
 /// At large-scale CTN dimensions p≈800, this keeps the per-worker accumulator well
 /// under 1 MiB while reducing repeated SCOP row-invariant work by 32× relative
 /// to one-column HVP dispatch.
-const SCOP_PSI_PSI_HVP_TILE_COLS: usize = 32;
+pub(crate) const SCOP_PSI_PSI_HVP_TILE_COLS: usize = 32;
 
 /// Exact dense SCOP coefficient Hessian cache limit for the inner `H·v` path.
 ///
@@ -81,10 +79,9 @@ const SCOP_PSI_PSI_HVP_TILE_COLS: usize = 32;
 /// against the same Hessian should pay the row-streaming chain rule once, then
 /// serve subsequent products as dense BLAS matvecs. Keep the cache restricted to
 /// genuinely moderate p so wide CTN fits remain row-streamed.
-const SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_DIM: usize = 384;
+pub(crate) const SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_DIM: usize = 384;
 
-const SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
-
+pub(crate) const SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// CTN-scoped ceiling on the custom-family inner exact-Newton cycle budget.
 ///
@@ -103,12 +100,11 @@ const SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// cap with the realized coefficient dimension keeps a generous margin for a
 /// genuinely nonlinear, high-dimensional transformation while refusing to grind
 /// the production large-scale cap on an easy near-Gaussian shift.
-const CTN_INNER_MAX_CYCLES_BASE: usize = 64;
+pub(crate) const CTN_INNER_MAX_CYCLES_BASE: usize = 64;
 
-const CTN_INNER_MAX_CYCLES_PER_DIM: usize = 2;
+pub(crate) const CTN_INNER_MAX_CYCLES_PER_DIM: usize = 2;
 
-const CTN_INNER_MAX_CYCLES_CEILING: usize = 400;
-
+pub(crate) const CTN_INNER_MAX_CYCLES_CEILING: usize = 400;
 
 /// Numerical floor on a Gram/penalty diagonal scale before it enters the
 /// `likelihood_scale / penalty_scale` ratio that seeds the outer log-λ search.
@@ -116,21 +112,18 @@ const CTN_INNER_MAX_CYCLES_CEILING: usize = 400;
 /// likelihood Gram) would otherwise produce a `0/0` or `x/0` seed; flooring
 /// both scales at a value far below any meaningful curvature keeps the ratio
 /// finite without perturbing well-posed problems.
-const CTN_SEED_SCALE_FLOOR: f64 = 1.0e-8;
-
+pub(crate) const CTN_SEED_SCALE_FLOOR: f64 = 1.0e-8;
 
 /// Lower bound on the cold-start seed log-λ (i.e. λ ≥ 1). Keeps the outer
 /// optimizer out of the under-regularized regime where the CTN inner solve is
 /// structurally rank-deficient (small-n / p > n); the optimizer is free to step
 /// below this once the data support it. See `ctn_penalty_scale_log_lambdas`.
-const CTN_SEED_LOG_LAMBDA_MIN: f64 = 0.0;
-
+pub(crate) const CTN_SEED_LOG_LAMBDA_MIN: f64 = 0.0;
 
 /// Upper bound on the cold-start seed log-λ, matching the outer ρ-bound used
 /// across the location-scale families: λ ≈ e¹² caps the seed in the strongly
 /// over-smoothed regime so a tiny penalty scale cannot seed an absurd λ.
-const CTN_SEED_LOG_LAMBDA_MAX: f64 = 12.0;
-
+pub(crate) const CTN_SEED_LOG_LAMBDA_MAX: f64 = 12.0;
 
 /// Floor on the warm-start global residual scale `sqrt(weighted_ss / Σw)`.
 /// Guards the degenerate near-perfect-fit case (residuals collapse to numerical
@@ -138,7 +131,6 @@ const CTN_SEED_LOG_LAMBDA_MAX: f64 = 12.0;
 /// `ln(|y−μ|)` log-scale target — stay finite. Well below any real response
 /// spread, so it never perturbs a genuine fit.
 const WARMSTART_GLOBAL_SCALE_FLOOR: f64 = 1e-6;
-
 
 /// Per-residual floor used to form the log-scale warm-start target
 /// `ln(|y−μ|) − E[ln|N(0,1)|]`. Built as `global_scale · WARMSTART_RESIDUAL_REL_FLOOR
@@ -149,13 +141,11 @@ const WARMSTART_RESIDUAL_REL_FLOOR: f64 = 1e-3;
 
 const WARMSTART_RESIDUAL_ABS_FLOOR: f64 = 1e-12;
 
-
 /// Floor on a per-row warm-start scale τ before forming `1/τ` when building the
 /// affine transformation seed targets. A degenerate τ = 0 (a collapsed warm-start
 /// scale block) would otherwise produce a non-finite reciprocal; the floor sits
 /// far below any meaningful scale so it only fires on the degenerate path.
 const WARMSTART_INV_SCALE_FLOOR: f64 = 1e-12;
-
 
 /// Ridge stabilization floor for the penalized least-squares projections that
 /// produce the default warm-start location and log-scale coefficients. These
@@ -164,5 +154,3 @@ const WARMSTART_INV_SCALE_FLOOR: f64 = 1e-12;
 /// deficient covariate design is preferable to the tighter floor used for the
 /// production inner solve.
 const WARMSTART_PROJECTION_RIDGE_FLOOR: f64 = 1e-8;
-
-

@@ -10,7 +10,7 @@ use super::*;
 /// Returns (value_basis = `[1, I_k]`, derivative_basis = `[0, M_k]`,
 /// penalties embedded with an unpenalized location row/column, regenerated
 /// I-spline knots, identity coef_transform for the I-spline shape block).
-fn build_response_basis(
+pub(crate) fn build_response_basis(
     response: &Array1<f64>,
     config: &TransformationNormalConfig,
 ) -> Result<
@@ -148,7 +148,6 @@ fn build_response_basis(
     Ok((resp_val, resp_deriv, resp_penalties, knots, transform))
 }
 
-
 fn response_endpoint_value_bases(transform: &Array2<f64>) -> (Array1<f64>, Array1<f64>) {
     let mut lower = Array1::<f64>::zeros(transform.ncols() + 1);
     let mut upper = Array1::<f64>::zeros(transform.ncols() + 1);
@@ -159,7 +158,6 @@ fn response_endpoint_value_bases(transform: &Array2<f64>) -> (Array1<f64>, Array
     }
     (lower, upper)
 }
-
 
 fn response_floor_offsets(
     response: &Array1<f64>,
@@ -181,7 +179,6 @@ fn response_floor_offsets(
         TRANSFORMATION_MONOTONICITY_EPS * (upper_y - response_median),
     )
 }
-
 
 /// Data-driven cap on the response-shape internal-knot budget keyed on how far
 /// the marginal response distribution is from a location-scale Gaussian.
@@ -249,7 +246,6 @@ fn transformation_complexity_knot_budget(
     min_internal.saturating_add(extra)
 }
 
-
 pub(crate) fn effective_response_num_internal_knots(
     config: &TransformationNormalConfig,
     n_obs: usize,
@@ -282,33 +278,23 @@ pub(crate) fn effective_response_num_internal_knots(
         .max(min_internal)
 }
 
-
 // ---------------------------------------------------------------------------
 // Tensor product construction
 // ---------------------------------------------------------------------------
 
-fn assert_rowwise_kronecker_dimensions(n: usize, p_resp: usize, p_cov: usize, context: &str) {
-    assert!(
-        p_resp > 0 && p_cov > 0,
-        "{context} rowwise Kronecker dimensions must be non-empty: n={n}, p_resp={p_resp}, p_cov={p_cov}"
-    );
+fn assert_rowwise_kronecker_dimensions(
+    n: usize,
+    p_resp: usize,
+    p_cov: usize,
+    context: &str,
+) -> Result<(), String> {
+    if p_resp == 0 || p_cov == 0 {
+        return Err(TransformationNormalError::InvalidInput {
+            reason: format!(
+                "{context} rowwise Kronecker dimensions must be non-empty: n={n}, p_resp={p_resp}, p_cov={p_cov}"
+            ),
+        }
+        .into());
+    }
+    Ok(())
 }
-
-
-fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: usize) -> ! {
-    let bytes = n
-        .saturating_mul(p_resp)
-        .saturating_mul(p_cov)
-        .saturating_mul(std::mem::size_of::<f64>());
-    // This helper enforces the large-scale invariant that CTN
-    // `KroneckerDesign` never persists as dense `n × p_resp × p_cov`.
-    // SAFETY: return type `!` makes the panic the only valid behavior;
-    // reaching here means a caller bypassed the factored-Kron dispatch
-    // and would otherwise silently allocate a process-killing buffer.
-    panic!(
-        "CTN KroneckerDesign must remain factored; refused persistent n x p_response x p_covariate materialization (n={n}, p_response={p_resp}, p_covariate={p_cov}, dense={:.1} MiB)",
-        bytes as f64 / (1024.0 * 1024.0),
-    );
-}
-
-

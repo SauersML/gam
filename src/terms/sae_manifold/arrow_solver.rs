@@ -278,14 +278,14 @@ fn cholesky_factor_apply(factor: ArrayView2<'_, f64>, vector: ArrayView1<'_, f64
 
 
 #[derive(Debug, Clone, Copy)]
-enum SaeLocalRowVar {
+pub(crate) enum SaeLocalRowVar {
     Logit { atom: usize },
     Coord { atom: usize, axis: usize },
 }
 
 
 #[derive(Debug, Clone)]
-struct SaeBorderChannel {
+pub(crate) struct SaeBorderChannel {
     atom: usize,
     basis_col: usize,
     index: usize,
@@ -294,7 +294,7 @@ struct SaeBorderChannel {
 
 
 #[derive(Debug, Clone)]
-struct SaeRowJets {
+pub(crate) struct SaeRowJets {
     vars: Vec<SaeLocalRowVar>,
     first: Vec<Vec<f64>>,
     second: Vec<Vec<Vec<f64>>>,

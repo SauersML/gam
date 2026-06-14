@@ -1,9 +1,8 @@
 use super::*;
 
-trait WorkflowCauseCountResult {
+pub(crate) trait WorkflowCauseCountResult {
     fn into_workflow_result(self) -> Result<usize, String>;
 }
-
 
 impl WorkflowCauseCountResult for usize {
     fn into_workflow_result(self) -> Result<usize, String> {
@@ -11,13 +10,11 @@ impl WorkflowCauseCountResult for usize {
     }
 }
 
-
 impl<E: ToString> WorkflowCauseCountResult for Result<usize, E> {
     fn into_workflow_result(self) -> Result<usize, String> {
         self.map_err(|err| err.to_string())
     }
 }
-
 
 /// Typed error category for the `solver::workflow` materialization and
 /// fitting pipeline.
@@ -70,7 +67,6 @@ pub enum WorkflowError {
     },
 }
 
-
 impl std::fmt::Display for WorkflowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -119,7 +115,6 @@ impl std::fmt::Display for WorkflowError {
     }
 }
 
-
 impl std::error::Error for WorkflowError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -133,13 +128,11 @@ impl std::error::Error for WorkflowError {
     }
 }
 
-
 impl From<WorkflowError> for String {
     fn from(err: WorkflowError) -> String {
         err.to_string()
     }
 }
-
 
 /// Catchall lift for legacy `Result<_, String>` chains that flow into a
 /// `WorkflowError`-returning function via `?`. Maps to `InvalidConfig` since
@@ -154,7 +147,6 @@ impl From<String> for WorkflowError {
     }
 }
 
-
 impl From<&str> for WorkflowError {
     fn from(reason: &str) -> Self {
         Self::InvalidConfig {
@@ -162,7 +154,6 @@ impl From<&str> for WorkflowError {
         }
     }
 }
-
 
 /// Cross-module cascade: a `FormulaDslError` raised inside `materialize` /
 /// `fit_from_formula` (via `parse_formula`, `parse_surv_response`, etc.) flows
@@ -176,7 +167,6 @@ impl From<crate::inference::formula_dsl::FormulaDslError> for WorkflowError {
         }
     }
 }
-
 
 /// Typed lift from term-builder errors. `TermBuilderError::ColumnNotFound`
 /// preserves the structured fields (name, role, available, similar,
@@ -211,7 +201,6 @@ impl From<crate::terms::term_builder::TermBuilderError> for WorkflowError {
         }
     }
 }
-
 
 /// Typed lift from leaf data-layer errors. `DataError::ColumnNotFound` is
 /// the variant of immediate interest — it preserves the structured fields

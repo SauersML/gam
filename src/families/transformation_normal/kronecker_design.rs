@@ -9,7 +9,7 @@ use super::*;
 /// and `transpose_mul` from the natural factor pair without ever materializing
 /// the full matrix.
 #[derive(Clone)]
-enum KroneckerDesign {
+pub(crate) enum KroneckerDesign {
     /// Row-wise Khatri–Rao product `A ⊙ B`.
     ///
     /// Element-wise definition (with `n` shared rows, `p_a` and `p_b` columns):
@@ -31,7 +31,6 @@ enum KroneckerDesign {
     },
 }
 
-
 impl KroneckerDesign {
     fn new_khatri_rao(left: &Array2<f64>, right: DesignMatrix) -> Result<Self, String> {
         if left.nrows() != right.nrows() {
@@ -44,7 +43,7 @@ impl KroneckerDesign {
             }
             .into());
         }
-        assert_rowwise_kronecker_dimensions(left.nrows(), left.ncols(), right.ncols(), "CTN");
+        assert_rowwise_kronecker_dimensions(left.nrows(), left.ncols(), right.ncols(), "CTN")?;
         Ok(KroneckerDesign::KhatriRao {
             left: left.clone(),
             right,
@@ -263,7 +262,6 @@ impl KroneckerDesign {
     }
 }
 
-
 impl LinearOperator for KroneckerDesign {
     fn nrows(&self) -> usize {
         KroneckerDesign::nrows(self)
@@ -300,7 +298,6 @@ impl LinearOperator for KroneckerDesign {
     }
 }
 
-
 impl DenseDesignOperator for KroneckerDesign {
     fn row_chunk_into(
         &self,
@@ -319,7 +316,10 @@ impl DenseDesignOperator for KroneckerDesign {
                     left.ncols(),
                     right.ncols(),
                     "CTN row chunk",
-                );
+                )
+                .map_err(|_| MatrixMaterializationError::MissingRowChunk {
+                    context: "KroneckerDesign::row_chunk_into invalid dimensions",
+                })?;
                 let left_chunk = left.slice(s![rows.clone(), ..]).to_owned();
                 let right_chunk = right.try_row_chunk(rows)?;
                 out.assign(&dense_rowwise_kronecker(
@@ -334,16 +334,11 @@ impl DenseDesignOperator for KroneckerDesign {
     fn to_dense(&self) -> Array2<f64> {
         match self {
             KroneckerDesign::KhatriRao { left, right } => {
-                assert_no_rowwise_kronecker_materialization(
-                    left.nrows(),
-                    left.ncols(),
-                    right.ncols(),
-                );
+                dense_rowwise_kronecker(left.view(), right.to_dense().view())
             }
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Kronecker-form penalties
@@ -416,8 +411,6 @@ fn build_tensor_penalties_kronecker(
     Ok(penalties)
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
@@ -438,5 +431,3 @@ fn weight_rows(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
         });
     out
 }
-
-

@@ -211,7 +211,7 @@ fn torus_projection_seed_grid(latent_dim: usize, resolution: usize) -> Option<Ar
 /// Mackay/Fellner–Schall `α ← n / (Σ sq_equiv + tr H⁻¹)` fixed point must use so
 /// that the prior energy it implies stays consistent with `ard_value`.
 #[derive(Clone, Copy, Debug)]
-struct ArdAxisPrior {
+pub(crate) struct ArdAxisPrior {
     value: f64,
     grad: f64,
     hess: f64,

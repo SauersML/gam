@@ -78,11 +78,3 @@ impl From<crate::util::block_count::BlockCountMismatch> for TransformationNormal
         }
     }
 }
-
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-/// Configuration for the response-direction basis in the transformation model.
-#[derive(Clone, Debug)]

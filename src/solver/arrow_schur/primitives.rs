@@ -4,17 +4,21 @@
 //! `use super::*;`, preserving the single-namespace resolution the previous
 //! `include!`-based layout relied on.
 
-pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-pub(crate) use std::ops::Range;
-pub(crate) use std::sync::Arc;
+pub(crate) use super::reduced_solve::ArrowSchurError;
+pub(crate) use super::system::ArrowRowBlock;
 pub(crate) use crate::cache::Fingerprinter;
 pub(crate) use crate::linalg::faer_ndarray::{FaerArrayView, FaerEigh, FaerLlt};
-pub(crate) use faer::Side;
 pub(crate) use crate::linalg::triangular::{
     cholesky_solve_matrix, cholesky_solve_vector, forward_substitution_lower_matrix,
 };
-pub(crate) use crate::terms::analytic_penalties::{AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier};
+pub(crate) use crate::terms::analytic_penalties::{
+    AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier,
+};
 pub(crate) use crate::terms::latent_coord::{LatentCoordValues, LatentManifold};
+pub(crate) use faer::Side;
+pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+pub(crate) use std::ops::Range;
+pub(crate) use std::sync::Arc;
 
 pub(crate) const DIRECT_SOLVE_MAX_K: usize = 2_000;
 
@@ -82,7 +86,6 @@ pub(crate) const EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT: u64 = 0;
 
 pub(crate) const ARROW_FACTOR_CACHE_HTBETA_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
-
 /// Matrix-free shared-block multiply for large BA/SAE Schur PCG.
 ///
 /// The closure writes `out = H_ββ x` without the LM ridge. This is the hook
@@ -108,7 +111,6 @@ pub type RowHtbetaTransposeMatvec =
 pub type StreamingArrowRowBuilder =
     Arc<dyn Fn(usize) -> Result<ArrowRowBlock, ArrowSchurError> + Send + Sync>;
 
-
 /// GPU-backed Schur matvec for CPU-driven PCG at K ≥ 5000.
 ///
 /// The closure writes `out = S·x` where `S = H_ββ + ρ·I − Σ_i Y_i^T Y_i`
@@ -122,6 +124,4 @@ pub type StreamingArrowRowBuilder =
 /// can hold it in an `Arc`.
 pub type GpuSchurMatvec = Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) + Send + Sync>;
 
-
 pub(crate) type MetricWeights = [f64];
-

@@ -265,7 +265,6 @@ fn build_transformation_row_derived(
 
 
 impl TransformationNormalFamily {
-impl TransformationNormalFamily {
     /// Build a transformation model from response values and a pre-built covariate
     /// design operator with associated penalties.
     ///

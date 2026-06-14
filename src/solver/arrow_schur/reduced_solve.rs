@@ -23,7 +23,7 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
     kind: SchurReductionKind,
     ordinal: usize,
     range: Range<usize>,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, ArrowSchurError> {
     let k = sys.k;
 
     // Build the per-row contribution factors once; both the GPU stacked-GEMM
@@ -38,7 +38,7 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
             htt_factors.factor(i),
             backend,
             kind,
-        );
+        )?;
         total_d += left.nrows();
         factors.push((left, right));
     }
@@ -68,7 +68,7 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
         if let Some(product) =
             crate::gpu::try_fast_atb_on_ordinal(ordinal, left_stack.view(), right_stack.view())
         {
-            return product.mapv(|v| -v);
+            return Ok(product.mapv(|v| -v));
         }
     }
 
@@ -77,7 +77,7 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
     for (left, right) in &factors {
         backend.block_gemm_subtract(&mut partial, left, right);
     }
-    partial
+    Ok(partial)
 }
 
 
@@ -105,7 +105,7 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     backend: &B,
     kind: SchurReductionKind,
     schur: &mut Array2<f64>,
-) {
+) -> Result<(), ArrowSchurError> {
     let n = sys.rows.len();
     let k = sys.k;
 
@@ -124,9 +124,9 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
                 backend,
                 kind,
                 schur,
-            );
+            )?;
         }
-        return;
+        return Ok(());
     };
 
     // Multi-GPU: one private `-Σ leftᵀ·right` partial per contiguous device
@@ -135,7 +135,7 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     // the tiles' GEMMs overlap across the pool. Folding the partials back into
     // the H_ββ-seeded `schur` reproduces the serial reduction (up to inter-tile
     // reassociation).
-    let partials: Vec<Array2<f64>> = std::thread::scope(|scope| {
+    let partials: Result<Vec<Array2<f64>>, ArrowSchurError> = std::thread::scope(|scope| {
         let handles: Vec<_> = tiles
             .iter()
             .map(|(ordinal, range)| {
@@ -163,9 +163,14 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
             .collect();
         handles
             .into_iter()
-            .map(|handle| handle.join().expect("schur-reduction tile thread panicked"))
+            .map(|handle| {
+                handle.join().map_err(|_| ArrowSchurError::SchurFactorFailed {
+                    reason: "schur-reduction tile thread panicked".to_string(),
+                })?
+            })
             .collect()
     });
+    let partials = partials?;
 
     // Fold partials into `schur` in tile order (contiguous, covering 0..n) so
     // the per-tile and inter-tile accumulation order is the row order; each
@@ -178,6 +183,7 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
             }
         }
     }
+    Ok(())
 }
 
 
@@ -206,7 +212,7 @@ pub(crate) fn build_dense_schur_direct<B: BatchedBlockSolver + Sync>(
         backend,
         SchurReductionKind::Direct,
         &mut schur,
-    );
+    )?;
     symmetrize_upper_from_lower(&mut schur);
     Ok(schur)
 }
@@ -237,7 +243,7 @@ pub(crate) fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver + Sync>(
         backend,
         SchurReductionKind::SqrtBa,
         &mut schur,
-    );
+    )?;
     symmetrize_upper_from_lower(&mut schur);
     Ok(schur)
 }
@@ -1218,7 +1224,7 @@ impl JacobiPreconditioner {
         // Kronecker / htbeta_matvec path transparently.
         for (i, row) in sys.rows.iter().enumerate() {
             let di = sys.row_dims[i];
-            let htbeta_full = sys_htbeta_materialize_row(sys, i, row);
+            let htbeta_full = sys_htbeta_materialize_row(sys, i, row)?;
             for (block_idx, range) in block_offsets.iter().enumerate() {
                 let b = range.end - range.start;
                 let mut solved_cols = Array2::<f64>::zeros((di, b));
@@ -2211,4 +2217,3 @@ pub(crate) fn cholesky_lower(a: &Array2<f64>) -> Result<Array2<f64>, String> {
     }
     Ok(l)
 }
-

@@ -1260,7 +1260,7 @@
             },
         );
 
-        let htbeta = sys_htbeta_materialize_row(&sys, 0, &sys.rows[0]);
+        let htbeta = sys_htbeta_materialize_row(&sys, 0, &sys.rows[0]).unwrap();
         assert_eq!(htbeta, array![[2.25_f64, -0.5, 1.25]]);
     }
 

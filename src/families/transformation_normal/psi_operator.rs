@@ -1,12 +1,11 @@
 use super::*;
 
-struct TensorKroneckerPsiOperator {
+pub(crate) struct TensorKroneckerPsiOperator {
     response_val_basis: Arc<Array2<f64>>,
     covariate_design: DesignMatrix,
     covariate_derivs: Vec<CustomFamilyBlockPsiDerivative>,
     covariate_first_cache: Arc<Vec<Mutex<Option<Arc<Array2<f64>>>>>>,
 }
-
 
 impl TensorKroneckerPsiOperator {
     fn n_data(&self) -> usize {
@@ -611,8 +610,6 @@ impl TensorKroneckerPsiOperator {
     }
 }
 
-
-
 impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -737,7 +734,6 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
     }
 }
 
-
 impl MaterializablePsiDerivativeOperator for TensorKroneckerPsiOperator {
     fn materialize_first(
         &self,
@@ -746,8 +742,6 @@ impl MaterializablePsiDerivativeOperator for TensorKroneckerPsiOperator {
         Ok(self.materialize_lifted(&self.response_val_basis, &self.materialize_cov_first(axis)?))
     }
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Per-evaluation ψ workspace
@@ -791,7 +785,6 @@ struct TransformationNormalPsiWorkspaceCacheEntry {
     beta: Arc<Array1<f64>>,
 }
 
-
 struct TransformationNormalPsiWorkspaceAxisSnapshot {
     op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis: usize,
@@ -801,7 +794,6 @@ struct TransformationNormalPsiWorkspaceAxisSnapshot {
     endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
     beta: Arc<Array1<f64>>,
 }
-
 
 struct TransformationNormalPsiWorkspacePairCacheEntry {
     objective_psi_psi: f64,
@@ -819,8 +811,7 @@ struct TransformationNormalPsiWorkspacePairCacheEntry {
     beta: Arc<Array1<f64>>,
 }
 
-
-struct TransformationNormalPsiWorkspace {
+pub(crate) struct TransformationNormalPsiWorkspace {
     family: TransformationNormalFamily,
     block_states: Vec<ParameterBlockState>,
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
@@ -828,7 +819,6 @@ struct TransformationNormalPsiWorkspace {
     pair_cache:
         Mutex<Option<Vec<Vec<Option<Arc<TransformationNormalPsiWorkspacePairCacheEntry>>>>>>,
 }
-
 
 impl TransformationNormalPsiWorkspace {
     fn new(
@@ -1379,7 +1369,6 @@ impl TransformationNormalPsiWorkspace {
     }
 }
 
-
 impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
     fn first_order_terms(
         &self,
@@ -1531,8 +1520,6 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
     }
 }
 
-
-
 fn extract_covariate_penalty_factor(penalty: &PenaltyMatrix) -> Result<Array2<f64>, String> {
     match penalty {
         PenaltyMatrix::Dense(matrix) => Ok(matrix.clone()),
@@ -1545,7 +1532,6 @@ fn extract_covariate_penalty_factor(penalty: &PenaltyMatrix) -> Result<Array2<f6
         ),
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Psi derivative builder (for κ optimization of the covariate basis)
@@ -1636,7 +1622,6 @@ pub fn build_tensor_psi_derivatives(
     Ok(derivs)
 }
 
-
 fn lift_dense_covariate_penalty_derivative_components(
     components: &[(usize, Array2<f64>)],
     shape_resp: &Array2<f64>,
@@ -1647,7 +1632,6 @@ fn lift_dense_covariate_penalty_derivative_components(
     }
     out
 }
-
 
 fn lift_covariate_penalty_derivative_components(
     components: &[(usize, PenaltyMatrix)],
@@ -1665,7 +1649,6 @@ fn lift_covariate_penalty_derivative_components(
     Ok(out)
 }
 
-
 fn push_lifted_covariate_penalty_component(
     out: &mut Vec<(usize, PenaltyMatrix)>,
     cov_penalty_idx: usize,
@@ -1680,5 +1663,3 @@ fn push_lifted_covariate_penalty_component(
         },
     ));
 }
-
-
