@@ -239,7 +239,9 @@ fn restricted_mean_survival_time_from_curve(
     if times.is_empty() || !(tau > 0.0) || !tau.is_finite() {
         return None;
     }
-    debug_assert_eq!(times.len(), survival_row.len());
+    if times.len() != survival_row.len() {
+        return None;
+    }
 
     // Survival at the cell boundaries we sweep through, starting from S(0) = 1.
     let mut prev_t = 0.0_f64;
