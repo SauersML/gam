@@ -3068,6 +3068,8 @@ const MAX_TRACKED_FILE_LINES: usize = 10_000;
 
 fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
     let output = Command::new("git")
+        .arg("-c")
+        .arg("safe.directory=*")
         .arg("-C")
         .arg(root)
         .arg("ls-files")
@@ -3154,6 +3156,8 @@ fn is_mechanical_part_path(rel: &Path) -> bool {
 /// only considers `.rs` files.
 fn scan_for_mechanical_part_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
     let output = Command::new("git")
+        .arg("-c")
+        .arg("safe.directory=*")
         .arg("-C")
         .arg(root)
         .arg("ls-files")
