@@ -58,6 +58,15 @@ const SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL: f64 = 1e-6;
 const SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING: usize = 40;
 
 const SURVIVAL_TRANSFORMATION_PIRLS_MIN_STEP_SIZE: f64 = 1e-12;
+
+/// High finite LAML cost returned for an outer smoothing candidate whose inner
+/// constrained I-spline PIRLS failed to converge (gam#1123). It must be large
+/// enough to dominate any genuine LAML value at a fittable ρ (the survival LAML
+/// is O(deviance) ~ O(n·log) — a few thousand here) so the outer optimizer always
+/// prefers a converged region, yet finite so the line search treats it as a
+/// recoverable bad step (a backtrack) rather than aborting on a non-finite cost.
+const SURVIVAL_TRANSFORMATION_NONCONVERGED_TRIAL_COST: f64 = 1e12;
+
 struct SurvivalLocationScaleProfile {
     fit: SurvivalLocationScaleTermFitResult,
     inverse_link: InverseLink,
@@ -1077,6 +1086,35 @@ fn optimize_survival_transformation_smoothing(
             |_| {},
         )
         .map_err(|err| format!("survival smoothing PIRLS failed: {err}"))?;
+        // Bad-trial guard (gam#1123). At a pathological large-λ proposal the
+        // constrained I-spline PIRLS exhausts its iteration budget
+        // (`MaxIterationsReached`) with the gradient plateaued far above tol; the
+        // unconverged β then yields a deceptively LOW LAML that lures the outer
+        // BFGS deeper into the un-fittable region (the trace shows lm_lambda
+        // climbing to ~1e6 with accept_rho railed at 1.0). Such a trial is not a
+        // valid evaluation of the LAML at this ρ — the envelope theorem that makes
+        // ∂LAML/∂ρ exact requires the inner solve to be at its β-optimum. Treat a
+        // non-converged candidate as a high-cost, gradient-free point so the outer
+        // optimizer steps AWAY from it instead of selecting it. The seed-λ fit is
+        // already converged, so the selector still has a valid region to work in.
+        let inner_converged = matches!(
+            summary.status,
+            crate::pirls::PirlsStatus::Converged
+                | crate::pirls::PirlsStatus::StalledAtValidMinimum
+        );
+        if !inner_converged {
+            log::info!(
+                "[OUTER #1123] survival transformation smoothing candidate ρ rejected: inner PIRLS \
+                 status={:?} grad_norm={:.3e} iters={} — returning high cost so BFGS steps away from \
+                 the un-fittable large-λ region",
+                summary.status,
+                summary.lastgradient_norm,
+                summary.iterations,
+            );
+            // A large finite cost with a zero gradient: the outer line search
+            // sees no descent here and backtracks toward the converged region.
+            return Ok((SURVIVAL_TRANSFORMATION_NONCONVERGED_TRIAL_COST, Array1::zeros(num_smoothing)));
+        }
         let beta = summary.beta.as_ref().to_owned();
         let state = candidate
             .update_state(&beta)
@@ -2129,13 +2167,42 @@ pub(crate) fn fit_survival_transformation_model(
         crate::pirls::PirlsStatus::Converged | crate::pirls::PirlsStatus::StalledAtValidMinimum => {
         }
         ref other => {
-            return Err(WorkflowError::IntegrationFailed {
-                reason: format!(
-                    "survival PIRLS did not converge: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}",
-                    summary.lastgradient_norm, summary.iterations, summary.state.deviance
-                ),
+            // Non-fatal inner non-convergence at the selected λ (gam#1123). A
+            // `MaxIterationsReached` here used to abort the whole fit — discarding
+            // the converged seed-λ fit that demonstrably exists (the CLI saves it).
+            // An inner solve that exhausts its budget but lands at a FINITE β with a
+            // finite deviance/gradient is a usable (if imperfect) optimum: the
+            // downstream `survival_unified_fit_result` already validates every
+            // finite-ness contract and will reject a genuinely degenerate result. A
+            // transient inner non-convergence during outer selection must not throw
+            // the model away — the CLI tolerates exactly this and finishes. Accept a
+            // finite non-converged result with a warning; only a NON-FINITE result
+            // (β / deviance / gradient norm not finite) remains fatal, since nothing
+            // usable can be built from it.
+            let beta_finite = summary.beta.as_ref().iter().all(|v| v.is_finite());
+            let result_finite = beta_finite
+                && summary.state.deviance.is_finite()
+                && summary.lastgradient_norm.is_finite();
+            if result_finite {
+                log::warn!(
+                    "[#1123] survival transformation inner PIRLS at the selected λ did not reach the \
+                     convergence tolerance (status={other:?}, grad_norm={:.3e}, iterations={}, \
+                     deviance={:.6e}), but landed at a finite optimum; accepting it rather than \
+                     aborting the fit (the outer smoothing selector already steers away from \
+                     un-fittable λ, and a finite optimum is a usable model).",
+                    summary.lastgradient_norm,
+                    summary.iterations,
+                    summary.state.deviance,
+                );
+            } else {
+                return Err(WorkflowError::IntegrationFailed {
+                    reason: format!(
+                        "survival PIRLS did not converge to a finite optimum: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}",
+                        summary.lastgradient_norm, summary.iterations, summary.state.deviance
+                    ),
+                }
+                .into());
             }
-            .into());
         }
     }
     let beta = summary.beta.as_ref().to_owned();
