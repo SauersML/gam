@@ -67,6 +67,14 @@ pub trait LatentIntervalModel {
     fn frailty_policy(
         frailty: &FrailtySpec,
     ) -> Result<LatentFrailtyResolution, crate::families::latent_survival::LatentSurvivalError>;
+
+    /// Whether this model accepts interval-censored rows (the reserved
+    /// `LATENT_SURVIVAL_EVENT_INTERVAL` event code). Survival does; binary never
+    /// observes an event window, so it rejects the interval code as an invalid
+    /// event target. Defaults to `false`.
+    fn allows_interval() -> bool {
+        false
+    }
 }
 
 /// Shared validation driver for the latent-interval families.
@@ -146,10 +154,20 @@ pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
                 ),
             });
         }
-        if event > 1 {
+        let is_interval = event == crate::families::latent_survival::LATENT_SURVIVAL_EVENT_INTERVAL;
+        if is_interval && !M::allows_interval() {
             return Err(LatentSurvivalError::InvalidDataset {
                 reason: format!(
-                    "{context} row {} has invalid event target {}; expected 0 or 1",
+                    "{context} row {} has the interval-censoring event code but {context} does not \
+                     support interval-censored rows",
+                    i + 1
+                ),
+            });
+        }
+        if event > 1 && !is_interval {
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "{context} row {} has invalid event target {}; expected 0, 1, or the interval code",
                     i + 1,
                     event
                 ),
