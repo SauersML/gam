@@ -548,7 +548,8 @@ pub fn project_onto_linear_constraints(
     }
     let mut beta = beta0_vec;
     let mut corrections = Array2::<f64>::zeros((unique_rows.len(), dim));
-    for _ in 0..DYKSTRA_PROJECTION_MAX_SWEEPS {
+    let max_sweeps = DYKSTRA_PROJECTION_MAX_SWEEPS;
+    for _ in 0..max_sweeps {
         let mut max_violation = 0.0_f64;
         for (slot, &i) in unique_rows.iter().enumerate() {
             let row = constraints.a.row(i);
