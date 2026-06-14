@@ -2444,6 +2444,32 @@ fn factor_gauge_deflated_evidence_row(
 const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
 
 
+/// Hysteresis half-width (as a fraction of `SPECTRAL_DEFLATION_REL_FLOOR`)
+/// applied to the spectral-deflation decision for *positive* near-floor
+/// eigenvalues, to stop the per-row deflation COUNT from flickering as a small
+/// positive curvature direction wanders across the cutoff over a ρ/θ-walk
+/// (#1117). The quotient-dimension guard (`record_evidence_gauge_deflation_count`)
+/// correctly refuses to compare Laplace normalizers across different deflated
+/// dimensions, so a single eigenvalue oscillating around the bare floor would
+/// otherwise toggle the count 6↔7 within one optimization and trip the guard
+/// spuriously, forcing a slow seed/homotopy cascade.
+///
+/// The decision is split by the only physically meaningful distinction at the
+/// inner optimum: a NON-POSITIVE (or non-finite) eigenvalue is a genuine null /
+/// indefinite quotient direction and is ALWAYS deflated — that boundary sits at
+/// exact zero, far from where live curvature lives, so it does not flicker (a
+/// curvature direction genuinely crossing zero IS a structural event the guard
+/// must still catch). Only a *positive* eigenvalue near `floor` is ambiguous,
+/// and for it we use the LOWER band edge `floor·(1−ε)`: a positive eigenvalue
+/// parked at the bare floor is `> floor·(1−ε)` and is therefore consistently
+/// KEPT on both sides of the walk, so the count is stable by construction. A
+/// direction that is genuinely numerically flat sits orders of magnitude below
+/// `floor` (a true rank deficiency, `λ ≪ floor·(1−ε)`), so it is still deflated
+/// exactly as before — the converged result is unchanged wherever the old path
+/// already deflated a clearly-flat or indefinite direction.
+const SPECTRAL_DEFLATION_HYSTERESIS_FRACTION: f64 = 1.0e-2;
+
+
 /// Unit-stiffness **spectral** Faddeev-Popov conditioning of a per-row evidence
 /// block `H_tt` that the undamped Cholesky refused because it is genuinely
 /// indefinite or numerically flat off the closed-form gauge orbit.
@@ -2502,14 +2528,25 @@ fn factor_spectral_deflated_evidence_row(
         return None;
     }
     let floor = SPECTRAL_DEFLATION_REL_FLOOR * max_abs;
-    // Reconstruct `Σ_i λ̃_i v_i v_iᵀ`, replacing every sub-floor eigenvalue
-    // (negative included) with unit stiffness `+1` and keeping the genuine
-    // positive spectrum untouched.
+    // Hysteresis-banded deflation floor for *positive* near-cutoff eigenvalues.
+    // The bare `floor` is a knife-edge: a small positive curvature direction
+    // parked at ~`floor` toggles deflated/not-deflated as ρ/θ move, flipping the
+    // per-row count and tripping the quotient-dimension guard spuriously
+    // (#1117). We deflate a positive eigenvalue only once it drops below the
+    // LOWER band edge `floor·(1−ε)`, so a value oscillating around the bare
+    // floor stays consistently KEPT. Non-positive / non-finite eigenvalues
+    // (genuine null / indefinite quotient directions) are still always deflated
+    // at the exact-zero boundary, which the guard must continue to honour.
+    let deflate_floor = floor * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
+    // Reconstruct `Σ_i λ̃_i v_i v_iᵀ`, replacing every deflated eigenvalue
+    // (every non-positive/non-finite one, plus any positive one that has
+    // dropped below the hysteresis floor) with unit stiffness `+1` and keeping
+    // the genuine positive spectrum untouched.
     let mut conditioned = Array2::<f64>::zeros((d, d));
     let mut deflated_count = 0usize;
     for eig_idx in 0..evals.len() {
         let lambda = evals[eig_idx];
-        let lambda_tilde = if lambda.is_finite() && lambda > floor {
+        let lambda_tilde = if lambda.is_finite() && lambda > deflate_floor {
             lambda
         } else {
             deflated_count += 1;

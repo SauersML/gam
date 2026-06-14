@@ -3185,6 +3185,85 @@ mod tests {
         );
     }
 
+    /// #1117 flicker guard: a per-row evidence block carrying ONE genuinely
+    /// indefinite direction (so spectral deflation runs) plus a small POSITIVE
+    /// eigenvalue parked right at the relative cutoff `floor = REL_FLOOR·max|λ|`
+    /// must report the SAME deflation count at two infinitesimally different
+    /// "ρ values" that straddle the bare floor. Without the hysteresis band the
+    /// positive near-floor eigenvalue would be counted as deflated on one side
+    /// (`λ ≤ floor`) and live on the other (`λ > floor`), flipping the per-row
+    /// count and tripping the quotient-dimension guard
+    /// (`record_evidence_gauge_deflation_count`) mid-optimization — the slow
+    /// seed/homotopy cascade. The genuine indefinite direction (the true
+    /// quotient null) is deflated on BOTH sides, so the count is stable.
+    #[test]
+    fn evidence_row_spectral_deflation_count_is_stable_across_the_cutoff() {
+        let d = 3usize;
+        let k = 1usize;
+        // max|λ| = 4.0 ⇒ floor = SPECTRAL_DEFLATION_REL_FLOOR·4 = 4e-8. Place the
+        // small positive eigenvalue just BELOW and just ABOVE the bare floor at
+        // two ρ-walk iterates; the third direction is genuinely indefinite
+        // (−1.0) so spectral deflation runs on both.
+        let floor = SPECTRAL_DEFLATION_REL_FLOOR * 4.0;
+
+        // The bare cutoff is the knife-edge: `λ ≤ floor` would deflate the lo
+        // iterate and keep the hi iterate, flipping the count. The hysteresis
+        // floor is `floor·(1−1e-2) = floor·0.99`, so picking both iterates
+        // strictly ABOVE it (0.995·floor and 1.05·floor) keeps them on the same
+        // (KEEP) side of the banded decision while still straddling the BARE
+        // floor — exactly the flicker regime the fix removes.
+        let near_floor_lo = floor * 0.995; // bare cutoff: deflated; banded: kept
+        let near_floor_hi = floor * 1.05; // bare cutoff: live; banded: kept
+
+        let mut block_lo = ArrowRowBlock::new(d, k);
+        block_lo.htt = array![
+            [4.0_f64, 0.0, 0.0],
+            [0.0, near_floor_lo, 0.0],
+            [0.0, 0.0, -1.0],
+        ];
+        block_lo.htbeta = array![[1.0_f64], [0.0], [0.5]];
+        block_lo.gt = array![0.0_f64, 0.0, 0.0];
+
+        let mut block_hi = block_lo.clone();
+        block_hi.htt[[1, 1]] = near_floor_hi;
+
+        let lo = factor_spectral_deflated_evidence_row(&block_lo, d)
+            .expect("indefinite block must spectrally deflate (lo iterate)");
+        let hi = factor_spectral_deflated_evidence_row(&block_hi, d)
+            .expect("indefinite block must spectrally deflate (hi iterate)");
+
+        // The genuine −1.0 quotient direction is deflated on both sides; the
+        // small positive near-floor direction is KEPT on both sides thanks to
+        // the hysteresis band, so the count does NOT flicker.
+        assert_eq!(
+            lo.gauge_deflated_directions, 1,
+            "lo iterate: only the genuine indefinite direction is deflated"
+        );
+        assert_eq!(
+            hi.gauge_deflated_directions, lo.gauge_deflated_directions,
+            "deflation count must be STABLE across an eigenvalue straddling the \
+             bare cutoff — the quotient-dimension guard must not trip mid-walk"
+        );
+
+        // Sanity: the bare (non-hysteresis) cutoff WOULD have split these two
+        // iterates, confirming the test actually exercises the flicker regime.
+        let bare_count = |lambda: f64| -> usize {
+            let mut c = 0usize;
+            for &l in &[4.0_f64, lambda, -1.0] {
+                if !(l.is_finite() && l > floor) {
+                    c += 1;
+                }
+            }
+            c
+        };
+        assert_ne!(
+            bare_count(near_floor_lo),
+            bare_count(near_floor_hi),
+            "test must straddle the bare cutoff (else it proves nothing): the \
+             un-banded decision flips the count, the banded one does not"
+        );
+    }
+
     #[test]
     fn sys_htbeta_materialize_row_sums_operator_and_dense_slab() {
         let mut sys = ArrowSchurSystem::new(1, 1, 3);
