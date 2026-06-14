@@ -3185,6 +3185,85 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 break;
             }
 
+            // Gauge-drift identified-subspace KKT certificate (gam#979 large-scale
+            // survival-MS stall). The certificate just below requires EITHER
+            // `step_inf ≤ step_tol` OR `objective_change ≤ objective_tol` as a
+            // precondition before it will even look at the range-projected
+            // residual. On the survival I-spline time block at large scale that
+            // precondition is a Catch-22: the block carries a genuine ker(H_pen)
+            // gauge mode (the unpenalized affine baseline — constant + linear time
+            // trend — that the joint design does not gauge-fix out), so the
+            // constrained QP keeps taking a small but NONZERO step (`step_inf` ~1e-4,
+            // never ≤ step_tol) that drifts the iterate ALONG that near-null
+            // direction, and because the direction has a tiny-but-nonzero curvature
+            // the merit keeps changing by `objective_change` ~0.3 per cycle (never
+            // ≤ objective_tol). Neither precondition is ever met, so the existing
+            // exit cannot fire even though the iterate IS already stationary on the
+            // entire identifiable subspace — the inner solve grinds to its hard
+            // cycle ceiling, the outer rejects the ρ-eval, and the fit times out
+            // (the measured cycles 8→20 trace: residual ~1.19e3, step_inf ~1e-4,
+            // obj_change ~0.34, beta_inf frozen at 2.269).
+            //
+            // The honest stationarity test for that regime drops the
+            // step/objective precondition and instead demands BOTH range-projected
+            // measures be at tolerance simultaneously: the GLOBAL identified-subspace
+            // residual `range_residual ≤ residual_tol` AND every BLOCK's
+            // range-projected stationarity small. The range projection drops exactly
+            // the ker(H_pen) gauge mass (the same mass the outer IFT pseudo-inverse
+            // projects out, gam#553), so when both pass the iterate is the REML
+            // optimum on the identifiable subspace by definition — the residual,
+            // step, and objective drift that remain live purely in the unidentified
+            // null and carry no outer-correctness information. The double
+            // (global + per-block) range gate cannot be satisfied by a genuinely
+            // non-stationary iterate: a real un-converged identifiable direction
+            // shows up in BOTH the global range residual and its block's
+            // range-projected component, so this never accepts a non-optimum on the
+            // identified subspace (it is strictly stronger than the single-gate exit
+            // below, only without the gauge-defeated step/objective precondition).
+            // Cheap precondition gating the O((P·M)³) range-projection eigh
+            // (gam#1082 perf discipline): only attempt this certificate once the
+            // raw residual has stopped improving for a few consecutive cycles —
+            // i.e. the iterate is no longer making descent progress in the
+            // identifiable subspace and the remaining motion is the gauge drift
+            // this exit exists to certify through. A healthy, fast-converging fit
+            // never trips this window (it converges via the strict residual / step
+            // certificates first), so it pays zero extra eigendecompositions; only
+            // a genuinely stalled solve reaches it, where one eigh per cycle on the
+            // short convergence tail is negligible against the alternative of
+            // grinding to the hard cycle ceiling.
+            const GAUGE_DRIFT_STALL_WINDOW: usize = 3;
+            if cycles_since_residual_improved >= GAUGE_DRIFT_STALL_WINDOW
+                && let Some(range_residual) = projected_residual_range_space_inf(
+                    &projected_residual_vec,
+                    &joint_hessian_source,
+                    &ranges,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                    total_p,
+                )
+                && range_residual <= residual_tol
+                && range_projected_block_stationarity_small()
+            {
+                log::info!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | gauge-drift identified-subspace KKT certificate (gam#979): total residual={:.3e} > tol={:.3e}, step_inf={:.3e} (step_tol={:.3e}) and |Δobjective|={:.3e} (obj_tol={:.3e}) both still nonzero from drift along an unidentified ker(H_pen) gauge mode (the unpenalized I-spline affine baseline), but the range-space (identified-subspace) residual={:.3e} ≤ tol={:.3e} AND every block's range-projected stationarity is at tolerance — the iterate is stationary on the entire identifiable subspace; the remaining residual/step/objective drift lives purely in the gauge null the outer IFT projects out (gam#553).",
+                    cycle,
+                    residual,
+                    residual_tol,
+                    step_inf,
+                    step_tol,
+                    objective_change,
+                    objective_tol,
+                    range_residual,
+                    residual_tol,
+                );
+                if range_residual.is_finite() {
+                    min_certified_residual = min_certified_residual.min(range_residual);
+                }
+                converged = true;
+                break;
+            }
+
             // Unlike the constrained-stationary path below, this fires on a pure
             // identifiability null without requiring the `linearized_rel ≥ 0.5`
             // constraint-multiplier signature, which a structural rank-deficiency
