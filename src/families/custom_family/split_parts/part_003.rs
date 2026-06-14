@@ -2780,6 +2780,51 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         && tol.is_finite()
                         && *norm <= RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR * *tol
                 });
+            // #979 divergence trace: separate the RAW likelihood gradient
+            // (‖∇ℓ‖∞ per block) from the constraint-PROJECTED stationarity
+            // residual (active-set dual mass subtracted). A raw gradient that
+            // grows with a static β means the likelihood gradient itself is
+            // diverging (the unbounded flat-baseline-hazard direction). A
+            // projected residual that grows while the raw gradient is bounded
+            // means the active-set dual residual is the runaway. Also surface
+            // the time-block β extent and active-set sizes so we can see whether
+            // the hazard-floor constraint is pinning the runaway direction.
+            if cycle <= 40 {
+                let active_sizes: Vec<usize> = cached_active_sets
+                    .iter()
+                    .map(|a| a.as_ref().map(|v| v.len()).unwrap_or(0))
+                    .collect();
+                let beta0_min = states[0]
+                    .beta
+                    .iter()
+                    .copied()
+                    .fold(f64::INFINITY, f64::min);
+                let beta0_max = states[0]
+                    .beta
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max);
+                log::info!(
+                    "[JN-GRAD-DIAG #979] cycle={cycle} raw_block_grad_inf={:?} proj_block_resid={:?} block_penalty_inf={:?} active_sizes={:?} block0_beta=[{:.3e},{:.3e}] beta_inf={:.3e} resid={:.3e}",
+                    block_gradient_norms
+                        .iter()
+                        .map(|v| format!("{v:.3e}"))
+                        .collect::<Vec<_>>(),
+                    block_stationarity_norms
+                        .iter()
+                        .map(|v| format!("{v:.3e}"))
+                        .collect::<Vec<_>>(),
+                    block_penalty_norms
+                        .iter()
+                        .map(|v| format!("{v:.3e}"))
+                        .collect::<Vec<_>>(),
+                    active_sizes,
+                    beta0_min,
+                    beta0_max,
+                    beta_inf,
+                    residual,
+                );
+            }
             let near_convergence = residual <= 10.0 * residual_tol;
             // Augmented-objective change: `(quad(new) − Φ_gated(new)) −
             // (quad(old) − Φ_gated(old))`. `lastobjective` is quadratic-only and
