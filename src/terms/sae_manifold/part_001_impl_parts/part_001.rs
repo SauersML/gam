@@ -2471,10 +2471,58 @@ impl SaeManifoldTerm {
         // cutoff of that scale.
         let mut max_eig = 0.0_f64;
         let mut min_pos_eig = f64::INFINITY;
+        // #1117 — a near-degenerate input manifold (e.g. the `stage1-step0` PCA-32
+        // checkpoint with post-PCA std ≈ 0.04) collapses the latent coordinate so
+        // that two of the circle atom's `M_k = 5` basis columns are linearly
+        // dependent IN THE DATA: the bare data Gram `G_k` is rank-deficient
+        // (`rank 3/5`, the `[SAE-AUDIT]` signal). At the ρ states the outer BFGS
+        // visits the smoothing penalty `λ·S_k` can fill those data-null directions,
+        // so the PENALISED Gram `G_k + λ·S_k` is full rank and well-conditioned —
+        // yet the inner Newton step still crawls the data-flat β-direction with a
+        // tiny-but-nonzero gradient (the penalty curvature there is whatever the
+        // outer loop happens to be probing, not the data scale), and the outer
+        // REML criterion the BFGS sees is ill-conditioned along it. The result is
+        // the ~4 min stall vs. the 30–52 s well-conditioned (`base`/`step_2300`)
+        // fit. We therefore also track the bare data Gram's conditioning: a
+        // data-rank-deficient atom engages the same Levenberg-Marquardt resolution
+        // even when the penalty masks the deficiency in the penalised block.
+        let mut data_deficient = false;
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let m = atom.basis_size();
             if m == 0 || grams[atom_idx].dim() != (m, m) {
                 continue;
+            }
+            // Bare data Gram `G_k = D_kᵀ D_k` conditioning — the SAME quantity the
+            // pre-fit `[SAE-AUDIT]` ranks. Deficiency here is the data-manifold
+            // property that drives the stall; detect it independently of whether
+            // the current-ρ penalty happens to cover the null direction.
+            {
+                let mut data_gram = grams[atom_idx].clone();
+                for i in 0..m {
+                    for j in 0..i {
+                        let sym = 0.5 * (data_gram[[i, j]] + data_gram[[j, i]]);
+                        data_gram[[i, j]] = sym;
+                        data_gram[[j, i]] = sym;
+                    }
+                }
+                if let Ok((evals, _)) = data_gram.eigh(Side::Lower) {
+                    let mut data_max = 0.0_f64;
+                    let mut data_min_pos = f64::INFINITY;
+                    for &lambda in evals.iter() {
+                        if lambda.is_finite() {
+                            data_max = data_max.max(lambda);
+                            if lambda > 0.0 {
+                                data_min_pos = data_min_pos.min(lambda);
+                            }
+                        }
+                    }
+                    if data_max > 0.0
+                        && !(data_min_pos.is_finite()
+                            && data_min_pos >= SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * data_max)
+                    {
+                        data_deficient = true;
+                    }
+                }
             }
             let penalty = &atom.smooth_penalty;
             let penalty_ok = penalty.dim() == (m, m);
@@ -2509,14 +2557,16 @@ impl SaeManifoldTerm {
         if !(max_eig > 0.0) {
             return nominal;
         }
-        // Only floor when the β block is genuinely rank-deficient (a direction
-        // whose curvature is below the relative rank cutoff of the block scale,
-        // or an exactly-null direction the eigensolver returned as ≤ 0). A
-        // full-rank, well-conditioned decoder keeps the nominal caller ridge
-        // bit-for-bit.
-        let conditioned =
+        // Only floor when the β block is genuinely rank-deficient — either the
+        // penalised block is ill-conditioned (a direction whose curvature is below
+        // the relative rank cutoff of the block scale, or an exactly-null direction
+        // the eigensolver returned as ≤ 0), OR the bare DATA Gram is rank-deficient
+        // even though the penalty currently masks it (#1117). A full-rank,
+        // well-conditioned decoder whose data Gram is also full rank
+        // (`base`/`step_2300`) keeps the nominal caller ridge bit-for-bit.
+        let penalised_conditioned =
             min_pos_eig.is_finite() && min_pos_eig >= SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_eig;
-        if conditioned {
+        if penalised_conditioned && !data_deficient {
             return nominal;
         }
         let floor = f64::EPSILON.sqrt() * max_eig;

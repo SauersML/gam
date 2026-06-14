@@ -2050,6 +2050,100 @@ mod tests {
         );
     }
 
+    /// Regression test for https://github.com/SauersML/gam/issues/1117.
+    ///
+    /// On a near-degenerate input manifold (the `stage1-step0` PCA-32 checkpoint:
+    /// post-PCA std ≈ 0.04) the latent coordinate collapses so two of the circle
+    /// atom's basis columns are linearly dependent IN THE DATA — the bare data
+    /// Gram `G_k` is rank-deficient (`[SAE-AUDIT]` `rank 3/5`). At the ρ states the
+    /// outer BFGS visits, the smoothing penalty `λ·S_k` can fill those data-null
+    /// directions, so the PENALISED Gram is full rank and well-conditioned. Before
+    /// #1117 the β-ridge floor inspected ONLY the penalised Gram, found it
+    /// conditioned, and returned the negligible nominal ridge; the inner Newton
+    /// step then crawled the data-flat β-direction and the outer BFGS overran its
+    /// budget (the ~4 min stall). The floor must engage on the bare-data
+    /// deficiency even when the penalty masks it in the penalised block.
+    #[test]
+    fn rank_deficient_data_gram_engages_beta_ridge_floor_when_penalty_masks_it() {
+        // Collapse the latent coordinate: every row sits at the SAME angle, so
+        // all three `Φ` rows are identical and the bare data Gram is rank 1/3 —
+        // the data-manifold degeneracy #1117 targets.
+        let coords = array![[0.3], [0.3], [0.3]];
+        let (phi, jet) = periodic_basis(&coords);
+        // A full-rank smoothness penalty (`I_3`) covers the two data-null
+        // directions, so the penalised Gram `G_k + λ·S_k` is full rank and would
+        // read as "conditioned" to the old penalised-only test.
+        let penalty = Array2::<f64>::eye(3);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            array![[0.05], [-0.05], [0.05]],
+            penalty,
+        )
+        .unwrap();
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            // Full assignment mass so the data Gram is non-trivial (rank 1, not 0).
+            Array2::<f64>::ones((3, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        // Moderate λ so the penalised Gram is genuinely well-conditioned (the
+        // masking regime); the bare data Gram is still rank-deficient.
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+        let nominal = 1.0e-6;
+        let floored = term.rank_deficient_beta_ridge_floor(&rho, nominal);
+        assert!(
+            floored > nominal,
+            "data-rank-deficient decoder must engage the LM ridge floor even when \
+             the penalty masks the deficiency in the penalised block (#1117); \
+             got floored={floored} == nominal={nominal}",
+        );
+    }
+
+    /// Companion to the #1117 floor test: a FULL-rank data Gram (the
+    /// `base`/`step_2300` regime) must keep the caller-nominal ridge bit-for-bit,
+    /// so the well-conditioned fit is unchanged.
+    #[test]
+    fn full_rank_data_gram_keeps_nominal_beta_ridge() {
+        // Distinct coordinates → the three periodic columns are linearly
+        // independent in the data → bare data Gram is full rank.
+        let coords = array![[0.1], [0.45], [0.8]];
+        let (phi, jet) = periodic_basis(&coords);
+        let penalty = Array2::<f64>::eye(3);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            array![[0.05], [-0.05], [0.05]],
+            penalty,
+        )
+        .unwrap();
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::ones((3, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+        let nominal = 1.0e-6;
+        let floored = term.rank_deficient_beta_ridge_floor(&rho, nominal);
+        assert_eq!(
+            floored, nominal,
+            "a full-rank, well-conditioned decoder must keep the nominal ridge \
+             bit-for-bit (the base/step_2300 path is unchanged); got {floored}",
+        );
+    }
+
     /// Regression test for https://github.com/SauersML/gam/issues/163 and #175.
     ///
     /// `ManifoldSAE.reconstruct(X_oos)` (and `.predict(X_subset)`) reach the
