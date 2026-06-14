@@ -6,7 +6,6 @@ use super::row_kernel::*;
 use super::*;
 
 impl BernoulliMarginalSlopeFamily {
-
     pub(super) fn exact_newton_joint_gradient_evaluation_from_cache(
         &self,
         block_states: &[ParameterBlockState],
@@ -2928,7 +2927,15 @@ impl BernoulliMarginalSlopeFamily {
                 }
                 accs
             } else {
-                chunks.into_par_iter().map(chunk_body).try_reduce(
+                chunks
+                    .into_par_iter()
+                    // Each chunk runs on a Rayon worker and issues `fast_ab` /
+                    // weighted-Gram GEMMs; pin their faer parallelism to
+                    // `Par::Seq` so they do not re-fan the global Rayon pool
+                    // against this already-parallel chunk fan-out. The serial
+                    // path above intentionally keeps top-level pool parallelism.
+                    .map(|chunk| crate::faer_ndarray::with_nested_parallel(|| chunk_body(chunk)))
+                    .try_reduce(
                     make_accs,
                     |mut left, right| -> Result<_, String> {
                         for (l, r) in left.iter_mut().zip(right.iter()) {
@@ -3779,6 +3786,15 @@ impl BernoulliMarginalSlopeFamily {
             .try_fold(
                 make_acc,
                 |(mut ll, mut gm, mut gl, mut hm, mut hl), chunk_idx| -> Result<_, String> {
+                    // Per-cycle exact-Newton block-Hessian assembly: this chunk
+                    // runs on a Rayon worker and issues `fast_xt_diag_x` /
+                    // `fast_atv` GEMMs (via `add_weighted_chunk_gram/gradient`).
+                    // Pin their faer parallelism to `Par::Seq` so they do not
+                    // re-fan the global Rayon pool against this already-parallel
+                    // chunk fold — the rayon×BLAS oversubscription behind the
+                    // intermittent `hessian_qp` stalls. Bit-identical: faer
+                    // partitions the matmul output, never the contracted axis.
+                    crate::faer_ndarray::with_nested_parallel(|| {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     let rows = end - start;
@@ -3794,19 +3810,15 @@ impl BernoulliMarginalSlopeFamily {
                     // identical BLAS-3 arithmetic — exact, just without the copy.
                     let marginal_owned = match self.marginal_design.as_dense_ref() {
                         Some(_) => None,
-                        None => Some(
-                            self.marginal_design
-                                .try_row_chunk(start..end)
-                                .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?,
-                        ),
+                        None => Some(self.marginal_design.try_row_chunk(start..end).map_err(
+                            |e| format!("bernoulli marginal_design try_row_chunk: {e}"),
+                        )?),
                     };
                     let logslope_owned = match self.logslope_design.as_dense_ref() {
                         Some(_) => None,
-                        None => Some(
-                            self.logslope_design
-                                .try_row_chunk(start..end)
-                                .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?,
-                        ),
+                        None => Some(self.logslope_design.try_row_chunk(start..end).map_err(
+                            |e| format!("bernoulli logslope_design try_row_chunk: {e}"),
+                        )?),
                     };
                     let mut gm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
                     let mut gl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
@@ -3841,11 +3853,9 @@ impl BernoulliMarginalSlopeFamily {
                             add_weighted_chunk_gram(owned, hm_w, &mut hm);
                         }
                         (None, None) => {
-                            return Err(
-                                "bernoulli marginal chunk: owned fallback missing for \
+                            return Err("bernoulli marginal chunk: owned fallback missing for \
                                  non-dense design"
-                                    .to_string(),
-                            );
+                                .to_string());
                         }
                     }
                     match (self.logslope_design.as_dense_ref(), &logslope_owned) {
@@ -3859,14 +3869,13 @@ impl BernoulliMarginalSlopeFamily {
                             add_weighted_chunk_gram(owned, hl_w, &mut hl);
                         }
                         (None, None) => {
-                            return Err(
-                                "bernoulli logslope chunk: owned fallback missing for \
+                            return Err("bernoulli logslope chunk: owned fallback missing for \
                                  non-dense design"
-                                    .to_string(),
-                            );
+                                .to_string());
                         }
                     }
                     Ok((ll, gm, gl, hm, hl))
+                    })
                 },
             )
             .try_reduce(
@@ -3911,5 +3920,4 @@ impl BernoulliMarginalSlopeFamily {
             },
         })
     }
-
 }

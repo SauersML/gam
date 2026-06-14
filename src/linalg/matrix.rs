@@ -1,6 +1,7 @@
 use crate::faer_ndarray::{
-    CrossprodAccum, CrossprodStructure, FaerArrayView, array2_to_matmut, fast_ab, fast_atb,
-    fast_atv, fast_atv_into, fast_av, fast_av_into, fast_xt_diag_x, stream_weighted_crossprod_into,
+    CrossprodAccum, CrossprodStructure, FaerArrayView, array2_to_matmut,
+    effective_global_parallelism, fast_ab, fast_atb, fast_atv, fast_atv_into, fast_av,
+    fast_av_into, fast_xt_diag_x, stream_weighted_crossprod_into,
 };
 use crate::resource::{
     MaterializationPolicy, MatrixMaterializationError, ResourcePolicy, rows_for_target_bytes,
@@ -591,7 +592,7 @@ fn streaming_sparse_csc_xt_diag_x(
     }
 
     let chunk_rows = dense_materialization_chunk_rows(n, p);
-    let par = faer::get_global_parallelism();
+    let par = effective_global_parallelism();
     let mut x_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
     let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
 
@@ -1303,7 +1304,7 @@ impl LinearOperator for DenseDesignMatrix {
                     &mut xtwx,
                     CrossprodStructure::Full,
                     CrossprodAccum::Replace,
-                    faer::get_global_parallelism(),
+                    effective_global_parallelism(),
                 );
                 Ok(xtwx)
             }
@@ -3277,7 +3278,7 @@ impl LinearOperator for TensorProductDesignOperator {
                     &mut block,
                     CrossprodStructure::Full,
                     CrossprodAccum::Replace,
-                    faer::get_global_parallelism(),
+                    effective_global_parallelism(),
                 );
                 (a_flat, b_flat, block)
             })
@@ -3665,7 +3666,7 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
                 &mut xtwx,
                 CrossprodStructure::Full,
                 CrossprodAccum::Replace,
-                faer::get_global_parallelism(),
+                effective_global_parallelism(),
             );
             return Ok(xtwx);
         }
@@ -3921,7 +3922,7 @@ impl LinearOperator for CoefficientTransformOperator {
                 &mut xtwx,
                 CrossprodStructure::Full,
                 CrossprodAccum::Replace,
-                faer::get_global_parallelism(),
+                effective_global_parallelism(),
             );
             return Ok(xtwx);
         }
@@ -4168,7 +4169,7 @@ impl LinearOperator for ResidualisedDesignOperator {
                 &mut xtwx,
                 CrossprodStructure::Full,
                 CrossprodAccum::Replace,
-                faer::get_global_parallelism(),
+                effective_global_parallelism(),
             );
             return Ok(xtwx);
         }
@@ -4198,7 +4199,7 @@ impl LinearOperator for ResidualisedDesignOperator {
                 &mut local,
                 CrossprodStructure::Full,
                 CrossprodAccum::Replace,
-                faer::get_global_parallelism(),
+                effective_global_parallelism(),
             );
             xtwx += &local;
             start = end;
@@ -5174,7 +5175,7 @@ pub fn xt_diag_x_symmetric(
                         &mut xtwx,
                         CrossprodStructure::Full,
                         CrossprodAccum::Replace,
-                        faer::get_global_parallelism(),
+                        effective_global_parallelism(),
                     );
                 } else {
                     let (symbolic, values) = xs.parts();
@@ -5730,7 +5731,7 @@ impl LinearOperator for DesignMatrix {
                             &mut xtwx,
                             CrossprodStructure::Full,
                             CrossprodAccum::Replace,
-                            faer::get_global_parallelism(),
+                            effective_global_parallelism(),
                         );
                     } else {
                         let (symbolic, values) = xs.parts();

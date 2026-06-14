@@ -14,6 +14,94 @@ use thiserror::Error;
 
 const RRQR_RANK_ALPHA: f64 = 100.0;
 
+thread_local! {
+    /// Depth of nested data-parallel row regions the current thread is inside.
+    ///
+    /// gam fans large per-row reductions (n ≈ 10^5 rows) across the global Rayon
+    /// pool, and many of those per-chunk closures then call faer GEMM
+    /// (`fast_ab`, `stream_weighted_crossprod_into`, …). faer's default parallel
+    /// policy is `Par::rayon(0)` = "use every Rayon worker", so a matmul issued
+    /// from inside an already-parallel row region tries to fan across the whole
+    /// pool a *second* time. The effective thread count then multiplies
+    /// (observed `process_threads=304` on a 52-core box) and the workers contend
+    /// for cores, producing intermittent ~18× stalls on an otherwise ~0.02 s
+    /// 35×35 assembly cycle.
+    ///
+    /// While this counter is non-zero, [`effective_global_parallelism`] (and the
+    /// `matmul_parallelism` policy that consults it) collapses to `Par::Seq`, so
+    /// the inner GEMM runs single-threaded on the Rayon worker that owns the
+    /// chunk. The outer row fan-out keeps full pool parallelism; only the nested
+    /// BLAS layer is pinned. This is exactness-preserving: faer partitions the
+    /// *output* of a matmul across threads, never the contracted (reduction)
+    /// axis, so each output cell's dot-product accumulation order is identical
+    /// under `Par::Seq` and `Par::rayon`.
+    static NESTED_PARALLEL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard marking the current thread as executing inside a data-parallel
+/// row region. Construct one at the top of a Rayon per-chunk/per-row closure
+/// (or immediately around an `into_par_iter` whose bodies call faer GEMM) so
+/// nested matmuls pin to `Par::Seq` instead of re-fanning the global pool.
+///
+/// Increments the thread-local depth on construction and decrements on drop, so
+/// it composes correctly across nesting and is robust to early returns / `?`.
+pub struct NestedParallelGuard;
+
+impl NestedParallelGuard {
+    #[inline]
+    pub fn enter() -> Self {
+        NESTED_PARALLEL_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        NestedParallelGuard
+    }
+}
+
+impl Drop for NestedParallelGuard {
+    #[inline]
+    fn drop(&mut self) {
+        NESTED_PARALLEL_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Run `body` with the current thread marked as inside a data-parallel row
+/// region, so any faer GEMM it issues (directly or transitively) pins to
+/// `Par::Seq` via [`effective_global_parallelism`] instead of re-fanning the
+/// global Rayon pool. The guard is held for exactly the duration of `body` and
+/// dropped on return — including early `?` returns from inside `body`, since the
+/// guard lives in this function's frame.
+///
+/// Call this from the per-chunk/per-row closure of an `into_par_iter` whose body
+/// performs GEMM, to prevent the Rayon-pool × faer-pool oversubscription.
+#[inline]
+pub fn with_nested_parallel<T>(body: impl FnOnce() -> T) -> T {
+    let guard = NestedParallelGuard::enter();
+    let out = body();
+    drop(guard);
+    out
+}
+
+/// `true` when the current thread is inside at least one [`NestedParallelGuard`]
+/// scope, i.e. a parallel row reduction is already in flight on this thread.
+#[inline]
+pub fn in_nested_parallel_region() -> bool {
+    NESTED_PARALLEL_DEPTH.with(|depth| depth.get() > 0)
+}
+
+/// faer parallelism policy that respects nested data-parallel regions: returns
+/// faer's global policy at the top level, but `Par::Seq` once a
+/// [`NestedParallelGuard`] is active so a GEMM issued from inside a parallel row
+/// fan-out does not multiply the live thread count against the outer pool.
+///
+/// Use this in place of `faer::get_global_parallelism()` for any matmul that can
+/// be reached from inside a row-parallel closure.
+#[inline]
+pub fn effective_global_parallelism() -> Par {
+    if in_nested_parallel_region() {
+        Par::Seq
+    } else {
+        get_global_parallelism()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum FaerLinalgError {
     #[error("Factorization failed in {context}")]
@@ -160,7 +248,10 @@ pub(crate) fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
     let flop_scale = m.saturating_mul(n).saturating_mul(k);
     let long_dim = m.max(n).max(k);
     if flop_scale >= PAR_MIN_FLOP_SCALE && long_dim >= PAR_MIN_LONG_DIM {
-        get_global_parallelism()
+        // `effective_global_parallelism` collapses to `Par::Seq` when this GEMM
+        // is reached from inside a `NestedParallelGuard` row region, preventing
+        // the Rayon-pool × faer-pool multiplicative oversubscription.
+        effective_global_parallelism()
     } else {
         Par::Seq
     }

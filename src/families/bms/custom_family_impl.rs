@@ -1,6 +1,5 @@
 use super::cell_moment_assembly::{
-    assemble_bms_block_local_s_psi, fill_link_basis_cell_coeff_jet,
-    fill_score_basis_cell_coeff_jet,
+    assemble_bms_block_local_s_psi, fill_link_basis_cell_coeff_jet, fill_score_basis_cell_coeff_jet,
 };
 use super::exact_eval_cache::*;
 use super::family::*;
@@ -164,7 +163,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
         config.max_seeds = if n_params <= 6 { 6 } else { 4 };
         config.seed_budget = 1;
-        config.screen_max_inner_iterations = 2;
+        // Two cycles is below the observed KKT reachability floor for
+        // marginal-slope startup seeds: it rejects every candidate, then pays
+        // an immediate second screening pass at cap=8. Start at the first
+        // viable cap and let the existing cascade escalate only when needed.
+        config.screen_max_inner_iterations = 8;
         config
     }
 
@@ -1018,7 +1021,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 }
 
-
 impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     pub(super) fn new(
         family: BernoulliMarginalSlopeFamily,
@@ -1126,7 +1128,6 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         self.family.y.len() >= 16_384
     }
 }
-
 
 impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
@@ -1508,7 +1509,6 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             )
     }
 }
-
 
 impl BernoulliMarginalSlopeFamily {
     pub(super) fn block_ranges_from_specs(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
@@ -2220,6 +2220,14 @@ impl BernoulliMarginalSlopeFamily {
         let traces = (0..n_chunks)
             .into_par_iter()
             .map(|chunk_idx| -> Result<Vec<f64>, String> {
+                // This chunk runs on a Rayon worker and issues `fast_ab` GEMMs
+                // below; `with_nested_parallel` pins their faer parallelism to
+                // `Par::Seq` so they do not re-fan the global Rayon pool against
+                // this already-parallel row fan-out (the rayon×BLAS
+                // oversubscription that intermittently stalled the joint-Newton
+                // `hessian_qp` cycle). Bit-identical: faer partitions the matmul
+                // output, never the contracted axis.
+                crate::faer_ndarray::with_nested_parallel(|| {
                 let start = chunk_idx * rows_per_chunk;
                 let end = (start + rows_per_chunk).min(n);
                 let rows = start..end;
@@ -2368,6 +2376,7 @@ impl BernoulliMarginalSlopeFamily {
                     }
                 }
                 Ok(acc)
+                })
             })
             .try_reduce(
                 || vec![0.0; n_dirs],
@@ -2392,7 +2401,6 @@ impl BernoulliMarginalSlopeFamily {
         Ok(Array1::from_vec(traces))
     }
 }
-
 
 impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
     pub(super) fn new(
@@ -2436,7 +2444,6 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         })
     }
 }
-
 
 impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
     for BernoulliMarginalSlopeExactNewtonJointPsiWorkspace
