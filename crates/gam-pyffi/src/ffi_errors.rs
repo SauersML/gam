@@ -557,6 +557,25 @@ create_exception!(
 );
 
 
+create_exception!(
+    _rust,
+    MissingDependencyError,
+    GamError,
+    "A required input column, frailty parameter, baseline target, or \
+     cause count is missing for the requested fit mode."
+);
+
+
+create_exception!(
+    _rust,
+    IntegrationError,
+    GamError,
+    "An underlying numerical step (PIRLS / smoothing-parameter \
+     optimizer / profile-cost evaluation) failed to converge or \
+     produced a non-finite value."
+);
+
+
 // -------------------------------------------------------------------------
 // (Removed) Legacy message-regex classifier — issue #343.
 

@@ -6,6 +6,7 @@
 //! assembly cheaper than the matrix-free operator path (see `routing`).
 
 use super::*;
+use crate::solver::estimate::smooth_floor_dp;
 
 /// Compute the outer Hessian ∂²V/∂ρₖ∂ρₗ.
 ///

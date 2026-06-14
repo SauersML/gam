@@ -9,6 +9,7 @@
 //! the `build_outer_hessian_operator` constructor.
 
 use super::*;
+use crate::solver::estimate::smooth_floor_dp;
 
 pub(crate) struct StoredFirstDrift {
     pub(crate) dense: Option<Array2<f64>>,
