@@ -62,7 +62,7 @@ Reference
 - [Full API reference](api-reference.md) — every public symbol.
 - [Exceptions](exceptions.md) — exception hierarchy and
   `explain_error()`.
-- [Cookbook](cookbook.md) — runnable recipes verified against the test
+- [Cookbook](cookbook.md) — runnable examples verified against the test
   suite.
 
 ## Example

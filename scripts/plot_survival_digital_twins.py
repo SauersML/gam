@@ -52,6 +52,14 @@ class SurvivalDataset:
     fit_opts: dict[str, str]
 
 
+def read_partitioned_dataset_csv(name: str) -> pd.DataFrame:
+    part_dir = DATASET_DIR / f"{name}_parts"
+    parts = sorted(part_dir.glob("part_*.csv"))
+    if not parts:
+        raise RuntimeError(f"{name} dataset parts missing in {part_dir}")
+    return pd.concat((pd.read_csv(part) for part in parts), ignore_index=True)
+
+
 def _parse_f64_opt(v: object) -> float | None:
     try:
         x = float(typing.cast(typing.Any, v))
@@ -74,7 +82,7 @@ def _encode_edema(raw: str) -> float:
 
 
 def load_icu_survival_death() -> SurvivalDataset:
-    d = pd.read_csv(DATASET_DIR / "icu_survival_death.csv")
+    d = read_partitioned_dataset_csv("icu_survival_death")
     d = d[["time", "age", "bmi", "hr_max", "sysbp_min", "event"]].dropna().copy()
     return SurvivalDataset(
         name="icu_survival_death",
@@ -88,7 +96,7 @@ def load_icu_survival_death() -> SurvivalDataset:
 
 
 def load_icu_survival_los() -> SurvivalDataset:
-    d = pd.read_csv(DATASET_DIR / "icu_survival_los.csv")
+    d = read_partitioned_dataset_csv("icu_survival_los")
     d = d[["age", "bmi", "hr_max", "sysbp_min", "temp_apache", "time", "event"]].dropna().copy()
     return SurvivalDataset(
         name="icu_survival_los",

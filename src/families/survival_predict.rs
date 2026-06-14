@@ -320,6 +320,117 @@ impl CompetingRisksPredictResult {
     }
 }
 
+/// Harrell's concordance index (C-index) of a survival risk score against
+/// held-out outcomes. A larger `risk[i]` must predict a SHORTER survival time
+/// (higher hazard). Over every orderable pair — pairs whose earlier observed
+/// time is a genuine event, so the failure ordering is observed — a pair is
+/// concordant when the earlier-failing subject carries the larger risk; equal
+/// risks score half credit. `C = (concordant + 0.5·tied) / comparable`.
+/// `C = 0.5` is random ranking, `C = 1.0` a perfect ordering.
+///
+/// This is the standard discrimination metric (`survival::concordance`,
+/// `lifelines.utils.concordance_index`, scikit-survival `concordance_index_censored`).
+/// `time`, `event` (1 = event, 0 = censored), and `risk` must share length `n`.
+/// Returns `None` if there are no comparable pairs (e.g. all rows censored).
+pub fn harrell_concordance(time: &[f64], event: &[f64], risk: &[f64]) -> Option<f64> {
+    let n = time.len();
+    if n != event.len() || n != risk.len() {
+        return None;
+    }
+    let mut comparable = 0.0_f64;
+    let mut concordant = 0.0_f64;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (early, late) = if time[i] < time[j] {
+                (i, j)
+            } else if time[j] < time[i] {
+                (j, i)
+            } else {
+                // Tied times are comparable only if both failed; such a pair is a
+                // pure tie (no strict outcome ordering).
+                if event[i] > 0.5 && event[j] > 0.5 {
+                    comparable += 1.0;
+                    concordant += 0.5;
+                }
+                continue;
+            };
+            if event[early] < 0.5 {
+                // The earlier subject was censored: the true ordering is unknown.
+                continue;
+            }
+            comparable += 1.0;
+            if risk[early] > risk[late] {
+                concordant += 1.0;
+            } else if risk[early] == risk[late] {
+                concordant += 0.5;
+            }
+        }
+    }
+    if comparable == 0.0 {
+        return None;
+    }
+    Some(concordant / comparable)
+}
+
+/// IPCW (inverse-probability-of-censoring-weighted) Brier score of a predicted
+/// survival probability at a fixed horizon `tau` against held-out outcomes — the
+/// Graf et al. estimator used by scikit-survival `brier_score`, `pec`, and
+/// `survival::brier`.
+///
+/// `s_pred[i]` is the model's predicted survival probability `S(tau | x_i)`.
+/// `time`/`event` are the held-out observed time and event indicator. `g_cens`
+/// is the censoring survival distribution `G(t) = P(C > t)` evaluated at the two
+/// weighting times the estimator needs per subject — supplied as a callable so
+/// the caller can pass a Kaplan–Meier fit of the censoring process. Each
+/// subject contributes:
+///   * event before `tau`        →  weight `1/G(T_i⁻)`,   target `0`  (dead);
+///   * still alive at `tau`       →  weight `1/G(tau)`,    target `1`  (alive);
+///   * censored before `tau`      →  weight `0`            (uninformative).
+/// The score is the weighted mean squared error `mean_i w_i·(target_i − s_pred_i)²`.
+/// Lower is better; `0` is perfect. Returns `None` on length mismatch or when no
+/// subject carries positive weight.
+pub fn ipcw_brier_score(
+    s_pred: &[f64],
+    time: &[f64],
+    event: &[f64],
+    tau: f64,
+    g_cens: impl Fn(f64) -> f64,
+) -> Option<f64> {
+    let n = s_pred.len();
+    if n != time.len() || n != event.len() {
+        return None;
+    }
+    let mut wsum = 0.0_f64;
+    let mut acc = 0.0_f64;
+    for i in 0..n {
+        let (target, weight) = if time[i] <= tau && event[i] > 0.5 {
+            // Failed at or before the horizon: contributes via 1/G(T_i⁻).
+            let g = g_cens(time[i]);
+            if !(g > 0.0) {
+                continue;
+            }
+            (0.0, 1.0 / g)
+        } else if time[i] > tau {
+            // Survived past the horizon: contributes via 1/G(tau).
+            let g = g_cens(tau);
+            if !(g > 0.0) {
+                continue;
+            }
+            (1.0, 1.0 / g)
+        } else {
+            // Censored at or before tau (and not an event past tau): no info.
+            continue;
+        };
+        let resid = target - s_pred[i];
+        acc += weight * resid * resid;
+        wsum += weight;
+    }
+    if wsum == 0.0 {
+        return None;
+    }
+    Some(acc / wsum)
+}
+
 /// Joint cause-specific competing-risks prediction result.
 pub struct CompetingRisksPredictResult {
     pub times: Vec<f64>,

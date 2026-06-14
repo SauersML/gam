@@ -34,6 +34,14 @@ def configure(context: dict[str, typing.Any]) -> None:
 _BENCH_RUST_LOADER: typing.Any = None
 
 
+def _read_partitioned_dataset_csv(name: str) -> pd.DataFrame:
+    part_dir = DATASET_DIR / f"{name}_parts"
+    parts = sorted(part_dir.glob("part_*.csv"))
+    if not parts:
+        raise RuntimeError(f"{name} dataset parts missing in {part_dir}")
+    return pd.concat((pd.read_csv(part) for part in parts), ignore_index=True)
+
+
 def _load_bench_rust_loader() -> typing.Any:
     global _BENCH_RUST_LOADER
     if _BENCH_RUST_LOADER is not None:
@@ -1028,7 +1036,7 @@ def _load_haberman_dataset() -> typing.Any:
 
 
 def _load_icu_survival_death_dataset() -> typing.Any:
-    d = pd.read_csv(DATASET_DIR / "icu_survival_death.csv")
+    d = _read_partitioned_dataset_csv("icu_survival_death")
     d = d[["time", "age", "bmi", "hr_max", "sysbp_min", "event"]].dropna()
     d = _coerce_positive_survival_times(d, time_col="time", dataset_name="icu_survival_death")
     rows = [
@@ -1056,7 +1064,7 @@ def _load_icu_survival_death_dataset() -> typing.Any:
 
 
 def _load_icu_survival_los_dataset() -> typing.Any:
-    d = pd.read_csv(DATASET_DIR / "icu_survival_los.csv")
+    d = _read_partitioned_dataset_csv("icu_survival_los")
     d = d[["age", "bmi", "hr_max", "sysbp_min", "temp_apache", "time", "event"]].dropna()
     d = _coerce_positive_survival_times(d, time_col="time", dataset_name="icu_survival_los")
     rows = [

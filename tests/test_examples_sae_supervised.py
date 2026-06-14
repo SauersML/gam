@@ -1,6 +1,6 @@
-"""End-to-end test for gamfit.recipes.sae_supervised.
+"""End-to-end test for gamfit.examples.sae_supervised.
 
-The recipe orchestrates two Rust kernels: ``sae_manifold_fit`` (full
+The example orchestrates two Rust kernels: ``sae_manifold_fit`` (full
 ``X``, unsupervised) and ``gamfit.fit`` (GLM head on the supervised
 slice of the SAE latents). We check that:
 
@@ -55,7 +55,7 @@ def synthetic() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def test_sae_supervised_end_to_end_returns_uniform_result(synthetic):
     X, y, mask = synthetic
-    result = gamfit.recipes.sae_supervised(
+    result = gamfit.examples.sae_supervised(
         X, y, mask, K=4, d_atom=2, atom_topology="circle",
     )
     assert isinstance(result, gamfit.SaeSupervisedFit)
@@ -65,14 +65,14 @@ def test_sae_supervised_end_to_end_returns_uniform_result(synthetic):
     assert len(result.latent_names) == 4
     # Report is a dict with expected top-level keys.
     report = result.report()
-    assert report["recipe"] == "sae_supervised"
+    assert report["example"] == "sae_supervised"
     assert report["latent_dim"] == 4
     assert "sae" in report and "head" in report
 
 
 def test_sae_supervised_predicts_on_training_X(synthetic):
     X, y, mask = synthetic
-    result = gamfit.recipes.sae_supervised(
+    result = gamfit.examples.sae_supervised(
         X, y, mask, K=4, d_atom=2, atom_topology="circle",
     )
     preds = result.predict(X)
@@ -89,7 +89,7 @@ def test_sae_supervised_predicts_on_training_X(synthetic):
 
 def test_sae_supervised_oos_predict_is_explicit_not_silent(synthetic):
     X, y, mask = synthetic
-    result = gamfit.recipes.sae_supervised(
+    result = gamfit.examples.sae_supervised(
         X, y, mask, K=4, d_atom=2, atom_topology="circle",
     )
     X_new = X + 1e-6  # Not bit-equal to training.
@@ -103,7 +103,7 @@ def test_sae_supervised_empty_mask_is_clean_error():
     y = rng.standard_normal(30)
     mask = np.zeros(30, dtype=bool)
     with pytest.raises(ValueError, match="zero rows"):
-        gamfit.recipes.sae_supervised(X, y, mask, K=3, d_atom=2)
+        gamfit.examples.sae_supervised(X, y, mask, K=3, d_atom=2)
 
 
 def test_sae_supervised_wrong_length_mask_is_clean_error():
@@ -112,4 +112,4 @@ def test_sae_supervised_wrong_length_mask_is_clean_error():
     y = rng.standard_normal(30)
     mask = np.ones(20, dtype=bool)
     with pytest.raises(ValueError, match="length 20 but X has 30 rows"):
-        gamfit.recipes.sae_supervised(X, y, mask, K=3, d_atom=2)
+        gamfit.examples.sae_supervised(X, y, mask, K=3, d_atom=2)

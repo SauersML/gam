@@ -1,4 +1,4 @@
-"""Partial-supervision gauge-fix recipe — thin Python wrapper around the
+"""Partial-supervision gauge-fix example — thin Python wrapper around the
 Rust ``gam::sae_identifiability::partial_supervision_solve`` primitive.
 
 All numerical linear algebra (Procrustes / anchor / soft-L2 ridge / QR
@@ -28,7 +28,7 @@ AuxColorName = Literal["HSV", "RGB", "LCh"]
 
 @dataclass(slots=True)
 class PartialSupervisionFit:
-    """Result of running :meth:`PartialSupervisionRecipe.fit`.
+    """Result of running :meth:`PartialSupervisionExample.fit`.
 
     Attributes
     ----------
@@ -142,8 +142,8 @@ class PartialSupervisionFit:
 
 
 @dataclass(slots=True)
-class PartialSupervisionRecipe:
-    """Gauge-fix recipe for partial supervision.
+class PartialSupervisionExample:
+    """Gauge-fix example for partial supervision.
 
     See :func:`partial_supervision` for the user-facing entry point.
     """
@@ -194,7 +194,7 @@ class PartialSupervisionRecipe:
         *,
         check_identifiability: bool = True,
     ) -> PartialSupervisionFit:
-        """Run the gauge-fix recipe.
+        """Run the gauge-fix example.
 
         Parameters
         ----------
@@ -315,8 +315,8 @@ def partial_supervision(
     free_constraint: FreeConstraint = "orthogonal_to_sup",
     anchor_idx: Sequence[int] = (0,),
     aux_name: AuxColorName | None = None,
-) -> PartialSupervisionRecipe:
-    """Build a partial-supervision gauge-fix recipe.
+) -> PartialSupervisionExample:
+    """Build a partial-supervision gauge-fix example.
 
     See module docstring and :class:`PartialSupervisionFit` for the
     semantics. All numerical work happens in Rust via
@@ -328,27 +328,27 @@ def partial_supervision(
     >>> import numpy as np, gamfit
     >>> rng = np.random.default_rng(0)
     >>> hsv = rng.standard_normal((200, 3))
-    >>> recipe = gamfit.recipes.partial_supervision(
+    >>> example = gamfit.examples.partial_supervision(
     ...     T_dim=6, aux=hsv, d_supervised=3, d_free=3,
     ...     sup_method='procrustes',
     ...     free_constraint='orthogonal_to_sup',
     ... )
-    >>> fit = recipe.fit(rng.standard_normal((200, 8)))
+    >>> fit = example.fit(rng.standard_normal((200, 8)))
     >>> fit.T_supervised.shape, fit.T_free.shape
     ((200, 3), (200, 3))
 
     Returns
     -------
-    PartialSupervisionRecipe
-        Recipe object; call ``.fit(X, T_init=None)`` to run the Rust solve.
+    PartialSupervisionExample
+        Example object; call ``.fit(X, T_init=None)`` to run the Rust solve.
 
     Raises
     ------
     ValueError
-        Raised during recipe construction for invalid dimensions, methods, or
+        Raised during example construction for invalid dimensions, methods, or
         auxiliary array shape.
     """
-    return PartialSupervisionRecipe(
+    return PartialSupervisionExample(
         T_dim=T_dim,
         aux=np.asarray(aux),
         d_supervised=d_supervised,
@@ -362,6 +362,6 @@ def partial_supervision(
 
 __all__ = [
     "partial_supervision",
-    "PartialSupervisionRecipe",
+    "PartialSupervisionExample",
     "PartialSupervisionFit",
 ]

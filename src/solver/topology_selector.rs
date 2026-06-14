@@ -1798,4 +1798,85 @@ mod tests {
         assert_eq!(small.concurrent_fits, 1);
         assert!(small.coordinator_threads + small.per_fit_threads <= 2);
     }
+
+    // --- #944 stage-4 topology collapse tests --------------------------------
+
+    /// Two fixed constant-curvature forms (Euclidean + Sphere) must be fused
+    /// into a single estimated-κ ConstantCurvature candidate, at the position of
+    /// the first fixed form. Non-CC candidates (Circle, Torus) keep their order.
+    #[test]
+    fn fuse_cc_family_collapses_euclidean_and_sphere() {
+        let input = vec![
+            AutoTopologyKind::Circle,
+            AutoTopologyKind::Euclidean,
+            AutoTopologyKind::Torus,
+            AutoTopologyKind::Sphere,
+        ];
+        let fused = AutoTopologyKind::fuse_constant_curvature_family(&input);
+        assert_eq!(
+            fused,
+            vec![
+                AutoTopologyKind::Circle,
+                AutoTopologyKind::ConstantCurvature, // replaced first fixed form
+                AutoTopologyKind::Torus,
+                // Sphere dropped — absorbed into ConstantCurvature
+            ],
+            "fused candidates: {fused:?}"
+        );
+    }
+
+    /// A single fixed form alone must NOT be fused (nothing to estimate κ across).
+    #[test]
+    fn fuse_cc_family_leaves_single_form_intact() {
+        let euclidean_only = vec![AutoTopologyKind::Euclidean, AutoTopologyKind::Circle];
+        let fused = AutoTopologyKind::fuse_constant_curvature_family(&euclidean_only);
+        assert_eq!(fused, euclidean_only, "single fixed form must not be fused");
+
+        let sphere_only = vec![AutoTopologyKind::Sphere];
+        let fused2 = AutoTopologyKind::fuse_constant_curvature_family(&sphere_only);
+        assert_eq!(fused2, sphere_only);
+    }
+
+    /// An explicit ConstantCurvature candidate alongside any fixed form fuses
+    /// by dropping the fixed forms (the explicit CC already subsumes them).
+    #[test]
+    fn fuse_cc_family_explicit_cc_absorbs_fixed_forms() {
+        let input = vec![
+            AutoTopologyKind::ConstantCurvature,
+            AutoTopologyKind::Euclidean,
+            AutoTopologyKind::Circle,
+        ];
+        let fused = AutoTopologyKind::fuse_constant_curvature_family(&input);
+        assert_eq!(
+            fused,
+            vec![AutoTopologyKind::ConstantCurvature, AutoTopologyKind::Circle],
+            "explicit CC must absorb the fixed Euclidean form"
+        );
+    }
+
+    /// Idempotence: fusing an already-fused list leaves it unchanged.
+    #[test]
+    fn fuse_cc_family_is_idempotent() {
+        let input = vec![
+            AutoTopologyKind::Circle,
+            AutoTopologyKind::ConstantCurvature,
+            AutoTopologyKind::Torus,
+        ];
+        let once = AutoTopologyKind::fuse_constant_curvature_family(&input);
+        let twice = AutoTopologyKind::fuse_constant_curvature_family(&once);
+        assert_eq!(once, twice, "fuse must be idempotent");
+        assert_eq!(once, input, "already-fused list must be unchanged");
+    }
+
+    /// Non-CC lists (no Euclidean/Sphere) are returned as-is.
+    #[test]
+    fn fuse_cc_family_noop_for_non_cc_list() {
+        let input = vec![
+            AutoTopologyKind::Circle,
+            AutoTopologyKind::Torus,
+            AutoTopologyKind::Cylinder,
+        ];
+        let fused = AutoTopologyKind::fuse_constant_curvature_family(&input);
+        assert_eq!(fused, input);
+    }
 }

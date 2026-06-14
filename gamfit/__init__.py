@@ -193,10 +193,10 @@ from ._penalty_descriptors import (
 # `gamfit._penalties.ARDPenalty`, `gamfit._penalties.BlockOrthogonalityPenalty`,
 # etc., and continue to drive the REML core.
 ARDPenalty = _ARDPenaltyDescriptor
-from . import recipes, topology
-from .recipes import (
+from . import examples, topology
+from .examples import (
+    PartialSupervisionExample,
     PartialSupervisionFit,
-    PartialSupervisionRecipe,
     SaeSupervisedFit,
     partial_supervision,
     sae_supervised,
@@ -419,7 +419,7 @@ def _build_public_api() -> list[str]:
          module is actually importable on this install* — torch-less
          installs skip them automatically, so star-import never crashes;
       3. an explicit allowlist of submodule attributes (``diagnostics``,
-         ``recipes``, ``topology``, ``identifiability``, ``manifolds``,
+         ``examples``, ``topology``, ``identifiability``, ``manifolds``,
          ``kernels``) that are part of the public API even though they are
          module objects.
     """
@@ -428,7 +428,7 @@ def _build_public_api() -> list[str]:
 
     public_submodules = {
         "diagnostics",
-        "recipes",
+        "examples",
         "topology",
         "identifiability",
         "manifolds",
