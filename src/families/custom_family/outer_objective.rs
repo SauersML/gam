@@ -8863,31 +8863,12 @@ impl CustomFamilyWarmStart {
         screened_outer_warm_start(Some(&self.inner), rho).is_some()
     }
 
-    pub(crate) fn block_beta_len(&self, block_idx: usize) -> Option<usize> {
-        self.inner.block_beta.get(block_idx).map(|beta| beta.len())
-    }
-
-    pub(crate) fn block_beta_abs_argmax_in_range(
-        &self,
-        block_idx: usize,
-        range: std::ops::Range<usize>,
-    ) -> Option<(usize, f64)> {
-        let beta = self.inner.block_beta.get(block_idx)?;
-        let end = range.end.min(beta.len());
-        if range.start >= end {
-            return None;
-        }
-        beta.slice(s![range.start..end])
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(idx, value)| (range.start + idx, value.abs()))
-            .filter(|(_, abs)| abs.is_finite())
-            .max_by(|left, right| {
-                left.1
-                    .partial_cmp(&right.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+    /// Borrow the converged per-block coefficient vector for `block_idx`.
+    /// Callers that need to evaluate the block's fitted linear predictor
+    /// `X·β` (rather than inspect raw coefficient magnitudes) read β through
+    /// this view.
+    pub(crate) fn block_beta_view(&self, block_idx: usize) -> Option<ArrayView1<'_, f64>> {
+        self.inner.block_beta.get(block_idx).map(|beta| beta.view())
     }
 
     /// Build a warm-start payload from a flat cached β and the per-block
