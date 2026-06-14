@@ -82,6 +82,7 @@ fn alo_residual_matches_closed_form_identity_link() {
         phi: 1.0,
         penalty_root: None,
         ridge: 0.0,
+        score_curvature: None,
     };
 
     let out = compute_alo_from_input(&input)
@@ -120,6 +121,7 @@ fn alo_respects_family_and_robust_weights() {
         phi: 1.0,
         penalty_root: None,
         ridge: 0.0,
+        score_curvature: None,
     };
     let out = compute_alo_from_input(&input)
         .expect("ALO should compute when family and robust weights are finite and positive");
