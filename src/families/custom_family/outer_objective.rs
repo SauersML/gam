@@ -25,6 +25,51 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     let inner_started = std::time::Instant::now();
     let mut states = buildblock_states(family, specs)?;
     refresh_all_block_etas(family, specs, &mut states)?;
+    // Phase-1 feasibility restoration for shape-constrained warm starts
+    // (gam#1108). `buildblock_states` passes each block β through
+    // `post_update_block_beta`, but that hook may only VALIDATE feasibility
+    // against the family's own scale-RELATIVE tolerance rather than project:
+    // the survival monotone time-warp block does exactly this, and its
+    // constraint rows `a·β ≥ b` are differences of large, nearly cancelling
+    // I-spline terms (Σ|aᵢβᵢ| ~ 1e7 with a·β ~ O(1)), so a relative
+    // `1e-10·Σ|aᵢβᵢ|` tolerance admits an ABSOLUTE violation up to O(1e-2).
+    // The joint-Newton inner solve's active-set QP entry gate
+    // (`check_linear_feasibility`, fixed absolute `1e-8`) then rejects that
+    // warm start as an "infeasible iterate" and the whole fit aborts — the
+    // interval-censored survival warm-start failure, where the
+    // right-censored-at-L surrogate's cold-start β is feasible to the family
+    // but not to the QP gate. Restore strict feasibility ONCE here, at
+    // warm-start entry, by projecting each constrained block's β onto its
+    // polytope with the EXACT identity-Hessian active-set projection
+    // (`project_point_strictly_into_feasible_cone`: the nearest strictly-
+    // interior point, reaching the `1e-6` scaled interior margin ≫ the `1e-8`
+    // gate in one certified solve — not the linearly-convergent iterative
+    // projection a near-redundant monotone-row system stalls). The per-cycle
+    // active-set QP maintains feasibility from there, so this is the only
+    // entry point that needs it; a block already strictly interior is returned
+    // essentially unchanged, and a malformed / empty-interior polytope yields
+    // `None` and is left for the downstream validate gate to report honestly
+    // rather than silently forcing a point.
+    {
+        let entry_block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+        let mut restored_any = false;
+        for (b, constraint) in entry_block_constraints.iter().enumerate() {
+            if let Some(constraints) = constraint
+                && check_linear_feasibility(&states[b].beta, constraints, 1e-8).is_err()
+                && let Some(restored) =
+                    crate::solver::active_set::project_point_strictly_into_feasible_cone(
+                        &states[b].beta,
+                        constraints,
+                    )
+            {
+                states[b].beta = restored;
+                restored_any = true;
+            }
+        }
+        if restored_any {
+            refresh_all_block_etas(family, specs, &mut states)?;
+        }
+    }
     let total_joint_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     let total_joint_n = joint_observation_count(&states);
     const INNER_PRELUDE_LOG_MIN_N: usize = 100_000;
