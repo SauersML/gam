@@ -2736,6 +2736,33 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         true
     }
 
+    /// Multi-start the joint location-scale REML (#1082 gaulss under-recovery).
+    ///
+    /// The default custom-family `outer_seed_config` commits `seed_budget = 1`:
+    /// after screening it fully fits exactly ONE rho seed. For a coupled
+    /// mean + log-sigma fit the profiled REML/LAML surface over the (mean-λ,
+    /// scale-λ) box is non-convex — the mean wiggliness and the modelled scale
+    /// trade off, so an oversmoothed-mean / inflated-scale basin and the true
+    /// moderate-λ basin are both stationary. A single screened seed can commit
+    /// to the oversmoothed basin (the truncated screening proxy systematically
+    /// flatters high-λ candidates), leaving the mean tensor surface under-
+    /// recovered (the gaulss-tensor RMSE(mu) miss). mgcv escapes this via its
+    /// own nested initialisation. Fully fitting a few diverse seeds and keeping
+    /// the best REML score is the standard multi-start cure for a non-convex
+    /// smoothing-parameter objective; it never weakens the criterion (the same
+    /// REML still decides), only widens the basin search. Scoped to this family
+    /// so the survival-MS / multinomial speedups (#979) keep `seed_budget = 1`.
+    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
+        if n_params == 0 {
+            return crate::seeding::SeedConfig::default();
+        }
+        let mut config = crate::seeding::SeedConfig::default();
+        config.max_seeds = if n_params <= 4 { 8 } else { 6 };
+        config.seed_budget = if n_params <= 4 { 3 } else { 2 };
+        config.screen_max_inner_iterations = 2;
+        config
+    }
+
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Operator-aware (see GaussianLocationScaleFamily for derivation): when
         // `use_joint_matrix_free_path` selects the workspace operator, joint
