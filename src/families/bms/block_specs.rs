@@ -1565,6 +1565,26 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let mut spec = spec;
     let data_view = data;
     validate_spec(data_view, &spec)?;
+    // Freeze the measure-jet representer length-scale dial on the coupled
+    // marginal + log-slope surfaces (#1116). A shared mjs basis feeds BOTH
+    // blocks; a design-moving ℓ on those shared covariates lets the outer
+    // search reach a sharp ℓ where a marginal smooth direction trades off
+    // against the log-slope into a separation-scale runaway (|β|→1e3). The auto
+    // (frozen) ℓ is well-conditioned here — the pre-#1116 behavior this
+    // restores. ℓ-learning stays on for single-surface (e.g. Gaussian) fits,
+    // where there is no marginal/log-slope coupling to destabilize.
+    let mjs_frozen_marginal =
+        crate::smooth::freeze_measure_jet_length_scale_learning(&mut spec.marginalspec);
+    let mjs_frozen_logslope =
+        crate::smooth::freeze_measure_jet_length_scale_learning(&mut spec.logslopespec);
+    if mjs_frozen_marginal + mjs_frozen_logslope > 0 {
+        log::info!(
+            "[BMS spatial] froze measure-jet length-scale learning on {} marginal + {} log-slope \
+             term(s): the coupled surface keeps ℓ at its conditioned auto value (#1116)",
+            mjs_frozen_marginal,
+            mjs_frozen_logslope
+        );
+    }
     let mut effective_kappa_options = kappa_options.clone();
     // Honor explicit `length_scale=X` in the user's formula: when every
     // spatial term in BOTH the marginal mean and log-slope blocks carries
