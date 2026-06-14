@@ -536,8 +536,32 @@ impl<'a> RemlState<'a> {
             )?;
             (rank, value, det1, det2)
         } else {
-            // No canonical penalties and no roots: fall back to the subspace
-            // eigensystem for value+rank (no derivative information available).
+            // No Kronecker system, no canonical penalties (or a length mismatch),
+            // and no penalty roots. This branch carries the combined penalty
+            // `log|Σ λ_k S_k|₊` value+rank from the subspace eigensystem of the
+            // assembled `E` (the eigenvalues of `EᵀE = Σ λ_k S_k`), but the
+            // per-component matrices `S_k` are NOT available here, so the exact
+            // ρ-derivatives `∂/∂ρ_k log|ΣλS|₊ = λ_k·tr((ΣλS)⁺ S_k)` (and the
+            // second derivative) cannot be formed component-wise from this
+            // object. The three branches above each own a per-component
+            // representation (Kronecker marginal grid, `canonical_penalties`,
+            // explicit roots) and produce the exact `det1`/`det2` from the SAME
+            // positive eigenspace as the value.
+            //
+            // REACHABILITY: the cost path keeps `rho.len()` in lockstep with
+            // `canonical_penalties.len()` (the smoothing-parameter coordinate is
+            // one λ per canonical penalty), so any penalized fit (`rho.len() > 0`)
+            // routes through the `canonical_penalties` branch above, where the
+            // exact derivatives ARE formed. `canonical_penalties` is empty ONLY
+            // when there are no smoothing parameters at all, i.e. `rho.len() == 0`
+            // — and then the derivative arrays are genuinely empty (`(0,)`/`(0,0)`),
+            // which is exact, not a desync. Returning identically-zero
+            // `rho.len()`-sized derivatives for a ρ-dependent cost term would be
+            // the #901 objective↔gradient desync bug class, so this branch must
+            // NEVER reach the outer optimizer with `rho.len() > 0` while reporting
+            // a zero gradient. Fail loud instead of silently mis-optimizing ρ if a
+            // future penalty configuration ever lands a penalized fit here without
+            // a per-component representation.
             let owned_subspace;
             let subspace = if let Some(penalty_subspace) = penalty_subspace {
                 penalty_subspace
@@ -546,6 +570,18 @@ impl<'a> RemlState<'a> {
                 &owned_subspace
             };
             let (rank, value) = self.fixed_subspace_penalty_rank_and_logdet_from_subspace(subspace);
+            if !rho.is_empty() {
+                crate::bail_invalid_estim!(
+                    "penalty log|Σλ S|₊ ρ-derivatives unavailable: rho_dim={} but no Kronecker \
+                     system, no canonical penalties, and no penalty roots provide a per-component \
+                     S_k representation. The combined EᵀE subspace eigensystem yields the value \
+                     and rank but cannot form the exact ρ-gradient λ_k·tr((ΣλS)⁺ S_k) — refusing \
+                     to feed the outer REML optimizer an identically-zero gradient for a \
+                     ρ-dependent cost term (#901 objective↔gradient desync). penalty_rank={}",
+                    rho.len(),
+                    rank
+                );
+            }
             (
                 rank,
                 value,
