@@ -237,8 +237,8 @@ fn gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines() {
         r#"
 import numpy as np
 from lifelines import WeibullFitter
-L = np.asarray(L, dtype=float)
-R = np.asarray(R, dtype=float)
+L = np.asarray(df["L"], dtype=float)
+R = np.asarray(df["R"], dtype=float)
 # Avoid exact-zero left bound for the parametric interval fit.
 L = np.clip(L, 1e-6, None)
 wf = WeibullFitter()
