@@ -67,6 +67,245 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Harvest the per-atom inner-decoder-smooth byproducts (#1097 / #1103) the
+    /// residual-gauge certificate's post-PIRLS atom inference reports consume.
+    ///
+    /// This is the post-fit harness seam: it needs the reconstruction target `Z`
+    /// (`target`) and the fitted dispersion `φ` (`dispersion`), both available
+    /// only after the joint fit converges and the engine has discarded `Z` from
+    /// the objective. For each atom `k` it captures the Gaussian-identity
+    /// penalized smooth of the atom's leading decoder output channel `j`
+    /// (largest column 2-norm of `B_k`) against its partial residual
+    /// `e_{i} = z_i − fitted_i + a_{ik} g_k(t_i)` on channel `j`, holding all
+    /// other atoms and the assignment fixed at the fitted optimum — exactly the
+    /// fixed snapshot ([`crate::sae_identifiability::AtomInnerFit`]) the Riesz
+    /// debiasing and Bartlett correction read.
+    ///
+    /// A pure read of the fitted state: it mutates only the diagnostic
+    /// `atom_inner_fits` field, never a loss / criterion / penalty / optimizer
+    /// state. Atoms with no active rows or a degenerate (rank-deficient,
+    /// non-SPD) inner Hessian get a `None` slot — the genuine prerequisite (an
+    /// SPD penalized inner Hessian on a non-empty active set) is absent there.
+    pub fn set_atom_inner_fits(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        dispersion: f64,
+    ) -> Result<(), String> {
+        if !dispersion.is_finite() || dispersion <= 0.0 {
+            return Err(format!(
+                "SaeManifoldTerm::set_atom_inner_fits: dispersion must be finite and positive, got {dispersion}"
+            ));
+        }
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::set_atom_inner_fits: target {:?} != ({n}, {p})",
+                target.dim()
+            ));
+        }
+
+        // Settled per-row assignments and per-(row, atom) decoded outputs, so the
+        // per-atom partial residual is `e_k = (z − fitted) + a_k decoded_k`.
+        let mut assignments = Vec::with_capacity(n);
+        for row in 0..n {
+            assignments.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+        }
+        let mut decoded = Array3::<f64>::zeros((n, k_atoms, p));
+        let mut dbuf = vec![0.0_f64; p];
+        for row in 0..n {
+            for atom_idx in 0..k_atoms {
+                self.atoms[atom_idx].fill_decoded_row(row, &mut dbuf);
+                for c in 0..p {
+                    decoded[[row, atom_idx, c]] = dbuf[c];
+                }
+            }
+        }
+        let mut fitted = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            for atom_idx in 0..k_atoms {
+                let a = assignments[row][atom_idx];
+                if a == 0.0 {
+                    continue;
+                }
+                for c in 0..p {
+                    fitted[[row, c]] += a * decoded[[row, atom_idx, c]];
+                }
+            }
+        }
+
+        let mut inner_fits: Vec<Option<crate::sae_identifiability::AtomInnerFit>> =
+            Vec::with_capacity(k_atoms);
+        for atom_idx in 0..k_atoms {
+            inner_fits.push(self.build_atom_inner_fit(
+                atom_idx,
+                target,
+                &assignments,
+                decoded.view(),
+                fitted.view(),
+                dispersion,
+            )?);
+        }
+        self.atom_inner_fits = Some(inner_fits);
+        Ok(())
+    }
+
+    /// Build one atom's fixed inner-smooth snapshot for the post-PIRLS atom
+    /// inference reports, or `None` when the atom has no active rows or the
+    /// penalized inner Hessian is not SPD. Returns `Err` only on a structural
+    /// inconsistency (shape mismatch), never on a benign degenerate atom.
+    fn build_atom_inner_fit(
+        &self,
+        atom_idx: usize,
+        target: ArrayView2<'_, f64>,
+        assignments: &[Array1<f64>],
+        decoded: ArrayView3<'_, f64>,
+        fitted: ArrayView2<'_, f64>,
+        dispersion: f64,
+    ) -> Result<Option<crate::sae_identifiability::AtomInnerFit>, String> {
+        let atom = &self.atoms[atom_idx];
+        let n = atom.n_obs();
+        let m = atom.basis_size();
+        let p = atom.output_dim();
+        if m == 0 || p == 0 {
+            return Ok(None);
+        }
+
+        // Leading decoder output channel j = argmax_j ‖B_k[:, j]‖, the channel
+        // that carries the atom's signal.
+        let mut j_lead = 0usize;
+        let mut best_norm = -1.0_f64;
+        for col in 0..p {
+            let mut norm = 0.0_f64;
+            for r in 0..m {
+                let v = atom.decoder_coefficients[[r, col]];
+                norm += v * v;
+            }
+            if norm > best_norm {
+                best_norm = norm;
+                j_lead = col;
+            }
+        }
+        let beta = atom.decoder_coefficients.column(j_lead).to_owned();
+
+        // Active rows: a_{ik} > 0.
+        let active: Vec<usize> = (0..n)
+            .filter(|&row| assignments[row][atom_idx] > 0.0)
+            .collect();
+        let n_active = active.len();
+        // The penalized smooth needs at least as many active rows as it has
+        // basis columns to give a non-degenerate data Gram; below that the inner
+        // fit's SPD prerequisite is genuinely unmet.
+        if n_active == 0 {
+            return Ok(None);
+        }
+
+        let mut design = Array2::<f64>::zeros((n_active, m));
+        let mut derivative_design = Array2::<f64>::zeros((n_active, m));
+        let mut row_scores = Array2::<f64>::zeros((n_active, m));
+        let mut weights = Array1::<f64>::zeros(n_active);
+        for (slot, &row) in active.iter().enumerate() {
+            let a_ik = assignments[row][atom_idx];
+            let w_i = a_ik * a_ik;
+            weights[slot] = w_i;
+            for col in 0..m {
+                design[[slot, col]] = atom.basis_values[[row, col]];
+                // Leading latent axis (axis 0) is the atom's primary coordinate;
+                // it is the one the average-derivative functional integrates.
+                derivative_design[[slot, col]] = atom.basis_jacobian[[row, col, 0]];
+            }
+            // Partial residual on channel j, then the inner-smooth working
+            // response z_i = e_i / a_ik so that w_i (z_i − Φᵀβ) = a_ik r_i.
+            let e_i = target[[row, j_lead]] - fitted[[row, j_lead]]
+                + a_ik * decoded[[row, atom_idx, j_lead]];
+            let mu_hat = design.row(slot).dot(&beta);
+            let z_i = e_i / a_ik;
+            let res_i = z_i - mu_hat;
+            // Gaussian-identity score s_i = −w_i res_i Φ_i / φ.
+            let scale = -w_i * res_i / dispersion;
+            for col in 0..m {
+                row_scores[[slot, col]] = scale * design[[slot, col]];
+            }
+        }
+
+        // Penalized inner Hessian H = ΦᵀWΦ + S̃_k.
+        let mut xtwx = Array2::<f64>::zeros((m, m));
+        for slot in 0..n_active {
+            let w_i = weights[slot];
+            for a in 0..m {
+                let xa = design[[slot, a]];
+                if xa == 0.0 {
+                    continue;
+                }
+                for b in 0..m {
+                    xtwx[[a, b]] += w_i * xa * design[[slot, b]];
+                }
+            }
+        }
+        let penalty = atom.smooth_penalty.clone();
+        if penalty.dim() != (m, m) {
+            return Err(format!(
+                "build_atom_inner_fit: atom {atom_idx} smooth penalty {:?} != ({m}, {m})",
+                penalty.dim()
+            ));
+        }
+        let penalized_hessian = &xtwx + &penalty;
+
+        // Smooth effective df = tr(H⁻¹ ΦᵀWΦ) − 1 (drop the constant/intercept
+        // null dimension). Falls back to `None`-producing degeneracy if the
+        // Hessian is not SPD.
+        let factor = match penalized_hessian.cholesky(Side::Lower) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        let h_inv_xtwx = factor.solve_mat(&xtwx);
+        let mut trace = 0.0_f64;
+        for i in 0..m {
+            trace += h_inv_xtwx[[i, i]];
+        }
+        let smooth_edf = (trace - 1.0).max(0.0);
+
+        // Peak (largest fitted |g_k| on channel j) and mode (largest assignment
+        // mass) design rows, over the active set.
+        let mut peak_slot = 0usize;
+        let mut peak_val = -1.0_f64;
+        let mut mode_slot = 0usize;
+        let mut mode_mass = -1.0_f64;
+        for (slot, &row) in active.iter().enumerate() {
+            let g_val = design.row(slot).dot(&beta).abs();
+            if g_val > peak_val {
+                peak_val = g_val;
+                peak_slot = slot;
+            }
+            let mass = assignments[row][atom_idx];
+            if mass > mode_mass {
+                mode_mass = mass;
+                mode_slot = slot;
+            }
+        }
+        let peak_design_row = design.row(peak_slot).to_owned();
+        let mode_design_row = design.row(mode_slot).to_owned();
+
+        let kappa_hat = atom_curvature_bound(self, atom_idx)?;
+
+        Ok(Some(crate::sae_identifiability::AtomInnerFit {
+            design,
+            derivative_design,
+            beta,
+            penalty,
+            penalized_hessian,
+            row_scores,
+            weights,
+            dispersion,
+            peak_design_row,
+            mode_design_row,
+            kappa_hat,
+            smooth_edf,
+        }))
+    }
+
     /// Profile the Gaussian reconstruction dispersion at the current seed
     /// state. This is the scale used to make SAE penalty seeds dimensionless
     /// before the outer rho search starts.
@@ -638,6 +877,17 @@ impl SaeManifoldTerm {
                                     | SaeAtomBasisKind::EuclideanPatch
                                     | SaeAtomBasisKind::Sphere
                             ))),
+                // #1097 / #1103: the per-atom inner-decoder-smooth snapshot,
+                // attached when the post-fit harness has run
+                // [`Self::set_atom_inner_fits`] (it needs the reconstruction
+                // target Z, dropped from the objective at fit end). `None` on a
+                // bare certificate-only model, or for a degenerate atom whose
+                // inner Hessian was not SPD.
+                inner_fit: self
+                    .atom_inner_fits
+                    .as_ref()
+                    .and_then(|fits| fits.get(atom_idx))
+                    .and_then(|slot| slot.clone()),
             });
             atom_offsets.push(cursor);
             atom_axis_dim.push(d);

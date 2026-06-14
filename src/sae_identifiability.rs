@@ -47,10 +47,8 @@
 //! ([`crate::inference::row_metric::MetricProvenance`]) and cannot misreport —
 //! there is only one metric object.
 
-use crate::geometry::curvature_estimand::{
-    FlatnessTest, KappaProfileCi, flatness_lr_test, profile_ci_walk,
-};
-use crate::inference::lawley::{RowKappas, lawley_lr_bartlett_factor};
+use crate::geometry::curvature_estimand::{FlatnessTest, KappaProfileCi};
+use crate::inference::lawley::{RowExpectedJets, RowKappas, lawley_lr_bartlett_factor};
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
 use crate::inference::riesz::{RieszDebiasReport, RieszInput, SmoothFunctional, debias_with_dense_hessian};
@@ -2649,6 +2647,261 @@ pub struct AtomTransportLadderReport {
     pub report: TransportLadderReport,
 }
 
+/// #1097 Riesz-debiased smooth functionals for one atom's captured
+/// inner-decoder smooth.
+///
+/// All three functionals are *linear* in the atom's fitted coefficient vector
+/// `β_{k,j}`, so each is one-step debiased through the SAME penalized Hessian
+/// the identifiability certificate's curvature sees
+/// ([`AtomInnerFit::penalized_hessian`]) by routing the functional gradient,
+/// the per-row scores, and the penalty gradient `S̃_k β` through
+/// [`debias_with_dense_hessian`]. A non-SPD Hessian or a degenerate functional
+/// (empty design, non-finite gradient) leaves the offending field `None`; the
+/// other two still report.
+fn atom_functional_report(fit: &AtomInnerFit) -> AtomFunctionalReport {
+    let penalty_beta = fit.penalty.dot(&fit.beta);
+
+    // A small closed-form helper: build the Riesz input for a functional
+    // gradient and debias it through the fitted penalized Hessian. The Riesz
+    // layer's own `EstimationError` is collapsed into `None` — a numerical
+    // refusal is a missing field, not a poisoned report.
+    let debias = |functional_gradient: Array1<f64>| -> Option<RieszDebiasReport> {
+        let input = RieszInput {
+            beta: fit.beta.view(),
+            functional_gradient: functional_gradient.view(),
+            row_scores: fit.row_scores.view(),
+            penalty_beta: penalty_beta.view(),
+            leverage: None,
+        };
+        debias_with_dense_hessian(&input, fit.penalized_hessian.view()).ok()
+    };
+
+    // Peak-vs-mode contrast g(t_peak) − g(t_mode): the linear functional whose
+    // gradient is the difference of the two design rows.
+    let peak_contrast = SmoothFunctional::Contrast {
+        design_row_a: fit.peak_design_row.view(),
+        design_row_b: fit.mode_design_row.view(),
+    }
+    .gradient()
+    .ok()
+    .and_then(debias);
+
+    // ‖E[∂g/∂t]‖ along the leading latent axis: the mass-weighted average of
+    // the derivative-design rows (the Gauss–Newton weights `w_i = a_ik²` are
+    // the data measure over the atom's active rows).
+    let average_derivative_norm = SmoothFunctional::AverageDerivative {
+        derivative_design: fit.derivative_design.view(),
+        weights: Some(fit.weights.view()),
+    }
+    .gradient()
+    .ok()
+    .and_then(debias);
+
+    // E_data[g(t_i)]: the mass-weighted average decoder value over active rows.
+    let average_value = SmoothFunctional::AverageValue {
+        value_design: fit.design.view(),
+        weights: Some(fit.weights.view()),
+    }
+    .gradient()
+    .ok()
+    .and_then(debias);
+
+    AtomFunctionalReport {
+        peak_contrast,
+        average_derivative_norm,
+        average_value,
+    }
+}
+
+/// #1103 Bartlett-corrected significance of one atom's inner smooth against a
+/// constant null.
+///
+/// The inner decoder smooth is the Gaussian-identity penalized WLS fit
+/// `a_ik · Φ_k(t)ᵀ β_{k,j}` with dispersion `φ = `[`AtomInnerFit::dispersion`].
+/// H0 is "the smooth is constant" — i.e. only column 0 (the intercept basis
+/// column) is free; the tested block is the remaining curvature columns
+/// `1..M_k`. The Lawley LR Bartlett factor `c` is computed on the full inner
+/// design with the atom roughness Gram as the penalty, exactly mirroring the
+/// `smooth.rs` term-LR seam ([`lawley_lr_bartlett_factor`]): the Gaussian
+/// kappas depend only on the (constant) dispersion, so one `RowKappas` is
+/// shared across the atom's active rows.
+///
+/// The LR statistic is the penalized deviance drop from the constant fit to the
+/// fitted smooth, `2[ℓ̂ − ℓ_0]/φ` realized on the same design; with `ref_df`
+/// the smooth effective degrees of freedom [`AtomInnerFit::smooth_edf`]. When
+/// the design has no curvature column (`M_k ≤ 1`), no kappas are constructible,
+/// or the factor is degenerate, `bartlett_corrected_p` is `None` and the factor
+/// falls back to `1.0` (the uncorrected χ² stands), but the raw LR statistic
+/// and df are always reported.
+fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance> {
+    let m = fit.design.ncols();
+    if m == 0 || fit.beta.len() != m {
+        // A degenerate inner design carries no smooth to test.
+        return None;
+    }
+    let n = fit.design.nrows();
+    if n == 0 || fit.weights.len() != n || fit.row_scores.nrows() != n {
+        return None;
+    }
+
+    // Reference df for the LR: the smooth effective degrees of freedom, the
+    // same Wood reference the term-LR seam uses for non-constant columns.
+    let df_float = fit.smooth_edf.max(0.0);
+    let df = df_float.round().max(1.0) as usize;
+
+    // Penalized deviance drop from the constant null to the fitted smooth, on
+    // the captured Gaussian-identity channel. The fitted-state working response
+    // is recovered from the per-row score `s_i = −w_i r_i Φ_i / φ`: projecting
+    // the score onto `β/‖β‖`-independent fitted prediction is fragile, so we use
+    // the design directly. The full prediction is `μ̂_i = Φ_iᵀ β`; the constant
+    // null's prediction is the weighted-mean of `μ̂` (the penalized projection
+    // onto the intercept column at the same weights). The residual SS uses the
+    // working response `z_i = μ̂_i + r_i` reconstructed from the scores.
+    let phi = if fit.dispersion.is_finite() && fit.dispersion > 0.0 {
+        fit.dispersion
+    } else {
+        return None;
+    };
+    let mut working_response = Array1::<f64>::zeros(n);
+    let mut weighted_mass = 0.0_f64;
+    let mut weighted_z_sum = 0.0_f64;
+    for i in 0..n {
+        let mu_hat = fit.design.row(i).dot(&fit.beta);
+        let w_i = fit.weights[i];
+        // r_i = −φ · s_{i,c} / (w_i Φ_{i,c}) is ill-defined column-wise; instead
+        // recover the scalar working residual from the score projected on the
+        // design row: s_iᵀ Φ_i = −w_i r_i ‖Φ_i‖² / φ ⇒ r_i follows. Guard the
+        // zero-norm row (an all-zero basis row contributes no residual).
+        let phi_row = fit.design.row(i);
+        let phi_norm_sq = phi_row.dot(&phi_row);
+        let r_i = if w_i > 0.0 && phi_norm_sq > 0.0 {
+            let s_dot_phi = fit.row_scores.row(i).dot(&phi_row);
+            -phi * s_dot_phi / (w_i * phi_norm_sq)
+        } else {
+            0.0
+        };
+        let z_i = mu_hat + r_i;
+        working_response[i] = z_i;
+        weighted_mass += w_i;
+        weighted_z_sum += w_i * z_i;
+    }
+    if !(weighted_mass > 0.0) {
+        return None;
+    }
+    let null_mean = weighted_z_sum / weighted_mass;
+
+    let mut rss_full = 0.0_f64;
+    let mut rss_null = 0.0_f64;
+    for i in 0..n {
+        let w_i = fit.weights[i];
+        let z_i = working_response[i];
+        let mu_hat = fit.design.row(i).dot(&fit.beta);
+        rss_full += w_i * (z_i - mu_hat) * (z_i - mu_hat);
+        rss_null += w_i * (z_i - null_mean) * (z_i - null_mean);
+    }
+    let lr_stat = ((rss_null - rss_full) / phi).max(0.0);
+
+    // The Lawley Bartlett factor on the inner design, tested block = the
+    // curvature columns 1..M_k (column 0 is the intercept under H0).
+    if m <= 1 {
+        // No curvature column: the constant null IS the full model, so there is
+        // no smooth to correct. Report the (zero) LR and df, no Bartlett factor.
+        return Some(AtomSmoothSignificance {
+            bartlett_corrected_p: None,
+            bartlett_factor: 1.0,
+            lr_stat,
+            df,
+        });
+    }
+    let tested = 1..m;
+
+    // Gaussian-identity expected jets depend only on the constant dispersion,
+    // so one RowKappas is shared across all active rows.
+    let row_kappas = RowExpectedJets::gaussian_identity(phi).kappas().ok();
+    let bartlett_factor = match row_kappas {
+        Some(kappas) => {
+            let kappas_vec: Vec<RowKappas> = vec![kappas; n];
+            lawley_lr_bartlett_factor(
+                fit.design.view(),
+                &kappas_vec,
+                Some(fit.penalty.view()),
+                tested,
+                df_float.max(1e-12),
+            )
+            .ok()
+            .filter(|c| c.is_finite() && *c > 0.0)
+        }
+        None => None,
+    };
+
+    let (factor, corrected_p) = match bartlett_factor {
+        Some(c) => {
+            let corrected = lr_stat / c;
+            let p = chi2_sf(corrected, df_float.max(1e-12));
+            (c, p)
+        }
+        // No factor computable: the uncorrected χ² stands (factor 1, no
+        // corrected p — the field documents the uncorrected fallback).
+        None => (1.0, None),
+    };
+
+    Some(AtomSmoothSignificance {
+        bartlett_corrected_p: corrected_p,
+        bartlett_factor: factor,
+        lr_stat,
+        df,
+    })
+}
+
+/// Upper-tail χ²_df survival function for the Bartlett-corrected p-value.
+fn chi2_sf(stat: f64, df: f64) -> Option<f64> {
+    if !(stat.is_finite() && stat >= 0.0 && df.is_finite() && df > 0.0) {
+        return None;
+    }
+    use statrs::distribution::{ChiSquared, ContinuousCDF};
+    let dist = ChiSquared::new(df).ok()?;
+    Some((1.0 - dist.cdf(stat)).clamp(0.0, 1.0))
+}
+
+/// Assemble the three post-PIRLS inference reports for every atom, reusing the
+/// per-atom [`AtomInnerFit`] harvested at fit time.
+///
+/// * #1097 Riesz functionals and #1103 Bartlett significance are computed from
+///   the captured inner-decoder smooth (design, penalized Hessian, row scores,
+///   roughness Gram) — they need only the fixed fitted snapshot.
+/// * #1099 curvature CI requires a profiled κ-evidence oracle `V_p(κ)` — a
+///   per-atom geometry refit at varying curvature κ. That machinery lives on the
+///   live fitting term, not on the fixed-design [`AtomInnerFit`] snapshot a
+///   `FittedSaeManifold` carries, so `curvature_ci` is `None` here: the genuine
+///   prerequisite (a κ-parameterized inner REML evaluator) is unavailable on the
+///   certificate model. Callers that own the live term attach it upstream.
+fn atom_inference_reports(model: &FittedSaeManifold) -> Vec<AtomInferenceReport> {
+    model
+        .atoms
+        .iter()
+        .enumerate()
+        .map(|(atom_index, atom)| {
+            let (functionals, smooth_significance) = match &atom.inner_fit {
+                Some(fit) => (
+                    Some(atom_functional_report(fit)),
+                    atom_smooth_significance(fit),
+                ),
+                None => (None, None),
+            };
+            AtomInferenceReport {
+                atom_index,
+                atom_name: atom.name.clone(),
+                functionals,
+                // #1099: no profiled κ-evidence oracle on the fixed AtomInnerFit
+                // snapshot (it carries no κ-parameterized geometry refit), so the
+                // curvature CI's genuine prerequisite is unavailable here.
+                curvature_ci: None,
+                smooth_significance,
+            }
+        })
+        .collect()
+}
+
 /// Produce the paired certificate for a fitted model: the residual-gauge
 /// report computed here plus the anytime-valid structure certificate from
 /// the discovery run's evidence ledger at level `alpha`. The ledger is the
@@ -2665,6 +2918,7 @@ pub fn dictionary_report(
         gauge: residual_gauge(model)?,
         structure: ledger.certify(alpha),
         transport_ladders: Vec::new(),
+        atom_inference: atom_inference_reports(model),
     })
 }
 

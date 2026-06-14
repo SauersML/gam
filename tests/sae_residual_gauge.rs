@@ -39,6 +39,7 @@ fn identity_patch_atom() -> FittedAtom {
         ard_variances: None,
         lowering_error: 0.0,
         chart_canonicalized: false,
+        inner_fit: None,
     }
 }
 
@@ -247,6 +248,7 @@ fn equal_ard_axes_name_the_rotation_subgroup_of_exactly_the_right_dimension() {
             ard_variances: Some(ard),
             lowering_error: 0.0,
             chart_canonicalized: false,
+            inner_fit: None,
         }],
         jacobian_rows: Vec::new(),
         isometry_penalty_root: Array2::<f64>::zeros((0, 9)),
@@ -321,6 +323,7 @@ fn exchangeable_atom_pair_yields_the_permutation_factor() {
                 ard_variances: None,
                 lowering_error: 0.0,
                 chart_canonicalized: false,
+                inner_fit: None,
             },
             FittedAtom {
                 name: "b".to_string(),
@@ -329,6 +332,7 @@ fn exchangeable_atom_pair_yields_the_permutation_factor() {
                 ard_variances: None,
                 lowering_error: 0.0,
                 chart_canonicalized: false,
+                inner_fit: None,
             },
         ]
     };
@@ -407,6 +411,7 @@ fn sym_f_triviality_checked_only_under_output_fisher() {
         ard_variances: None,
         lowering_error: 0.0,
         chart_canonicalized: false,
+        inner_fit: None,
     };
     let frame_a = Array2::<f64>::eye(2);
     let mut frame_b = Array2::<f64>::zeros((2, 2));
@@ -492,6 +497,7 @@ fn equal_ard_patch_atom(ard: [f64; 2]) -> FittedAtom {
         ard_variances: Some(Array1::from(ard.to_vec())),
         lowering_error: 0.0,
         chart_canonicalized: false,
+        inner_fit: None,
     }
 }
 
@@ -564,6 +570,7 @@ fn exchangeable_atom_pair_surfaces_the_permutation_factor_under_euclidean() {
         ard_variances: None,
         lowering_error: 0.0,
         chart_canonicalized: false,
+        inner_fit: None,
     };
     let frame_a = Array2::<f64>::eye(2);
     let mut frame_b = Array2::<f64>::zeros((2, 2));

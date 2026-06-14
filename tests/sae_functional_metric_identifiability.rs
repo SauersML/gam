@@ -77,6 +77,7 @@ fn identity_frame_atom() -> FittedAtom {
         ard_variances: None,
         lowering_error: 0.0,
         chart_canonicalized: false,
+        inner_fit: None,
     }
 }
 
@@ -239,6 +240,7 @@ fn lowering_error_calibration_forgives_compression_scale_curvature_only() {
             ard_variances: None,
             lowering_error,
             chart_canonicalized: false,
+            inner_fit: None,
         }],
         jacobian_rows: Vec::new(),
         isometry_penalty_root: isometry_gram_derivative_root(&frame, &w_fisher),

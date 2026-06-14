@@ -69,6 +69,7 @@ fn circle_view() -> (FittedAtom, AtomParameterView) {
         ard_variances: None,
         lowering_error: 0.9, // deliberately lossy — the exact path must ignore it
         chart_canonicalized: false,
+        inner_fit: None,
     };
     let view = AtomParameterView {
         basis_values,
@@ -131,6 +132,7 @@ fn patch_view(quadratic: bool) -> (FittedAtom, AtomParameterView) {
         ard_variances: None,
         lowering_error: 0.0,
         chart_canonicalized: false,
+        inner_fit: None,
     };
     let view = AtomParameterView {
         basis_values,
