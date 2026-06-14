@@ -55,6 +55,18 @@ pub(crate) const SAE_ATOM_COLLAPSE_RESEED_BUDGET: usize = 1;
 /// norm), so the K=1 path is byte-for-byte unchanged.
 pub(crate) const SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO: f64 = 1.0e-3;
 
+/// #976 Layer-1 guard (simultaneous-collapse arm): the reconstruction
+/// explained-variance below which a K>=2 dictionary is judged to have
+/// CO-collapsed — every atom degenerate together, so the median-relative
+/// [`SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO`] test sees no atom "behind" its peers
+/// and stays silent. This is the real-data K=2 failure (both atoms fall into one
+/// seed/basin and the fit explains ~0 variance). The floor sits far below any
+/// healthy curved-dictionary fit (real OLMo K=1 reaches EV ~0.22, K=3 ~0.40), so
+/// only a genuinely degenerate dictionary trips it; a merely-difficult target
+/// never does. When tripped, the guard reseeds all-but-the-strongest atom onto
+/// distinct residual PCs to break the shared basin.
+pub(crate) const SAE_DICTIONARY_COLLAPSE_EV_FLOOR: f64 = 0.02;
+
 /// Machine-precision support cutoff for the smooth JumpReLU assignment prior,
 /// in units of the gate temperature below the hard threshold. The forward gate
 /// remains hard-zero at and below `threshold`, but the prior value/gradient and

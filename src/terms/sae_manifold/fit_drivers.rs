@@ -5,7 +5,6 @@ use super::*;
 const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 
 impl SaeManifoldTerm {
-
     pub fn solve_newton_step(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -689,7 +688,10 @@ impl SaeManifoldTerm {
     /// already-canonical chart, only folded/non-improving flow candidates,
     /// basis not closed under the reparameterization, or per-row image drift
     /// above tolerance).
-    pub(crate) fn canonicalize_atom_patch_flow_chart(&mut self, atom_idx: usize) -> Result<bool, String> {
+    pub(crate) fn canonicalize_atom_patch_flow_chart(
+        &mut self,
+        atom_idx: usize,
+    ) -> Result<bool, String> {
         use crate::terms::sae_chart_canonicalization::{
             CHART_RECOMPOSITION_REL_TOL, patch_isometry_flow_reparameterization,
         };
@@ -772,7 +774,10 @@ impl SaeManifoldTerm {
     /// already-canonical chart, data inside the pole-band guard, only
     /// folded/non-improving flow candidates, basis not closed under the
     /// reparameterization, or per-row image drift above tolerance).
-    pub(crate) fn canonicalize_atom_sphere_flow_chart(&mut self, atom_idx: usize) -> Result<bool, String> {
+    pub(crate) fn canonicalize_atom_sphere_flow_chart(
+        &mut self,
+        atom_idx: usize,
+    ) -> Result<bool, String> {
         use crate::terms::sae_chart_canonicalization::{
             CHART_RECOMPOSITION_REL_TOL, sphere_isometry_flow_reparameterization,
         };
@@ -1845,15 +1850,48 @@ impl SaeManifoldTerm {
             }
         }
         if breached.is_empty() {
-            return Ok(());
+            // The median-relative test found no atom "behind" its peers, but the
+            // whole dictionary can still have CO-collapsed: at K>=2 a degenerate
+            // seed/basin can drive EVERY decoder small TOGETHER, so the median
+            // collapses with them and no atom is *relatively* behind. The
+            // median-relative test is structurally blind to this mode — it is the
+            // real-data K=2 failure (both atoms fall into one basin and the fit
+            // explains ~0 variance; empirically a different seed or stronger
+            // decoder-incoherence repulsion avoids the basin, but the guard must
+            // catch it for ANY seed). Detect it ABSOLUTELY from the
+            // reconstruction: a dictionary that explains essentially none of the
+            // centered target variance has collapsed regardless of relative
+            // norms.
+            let ev = self.dictionary_reconstruction_ev(target, rho)?;
+            if ev >= SAE_DICTIONARY_COLLAPSE_EV_FLOOR {
+                return Ok(());
+            }
+            // Co-collapsed. Reseed all atoms EXCEPT the strongest (kept as an
+            // anchor so the reseed targets a non-degenerate residual and the set
+            // does not re-symmetrise into the same basin) onto DISTINCT residual
+            // PCs below.
+            let anchor = (0..k)
+                .max_by(|&a, &b| {
+                    norms[a]
+                        .partial_cmp(&norms[b])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(0);
+            breached = (0..k).filter(|&a| a != anchor).collect();
+            log::warn!(
+                "SaeManifoldTerm: dictionary co-collapse (reconstruction EV={ev:.4f} < \
+                 {SAE_DICTIONARY_COLLAPSE_EV_FLOOR}) with no relative-norm breach; reseeding \
+                 {} of {k} atoms onto distinct residual PCs (anchor atom {anchor})",
+                breached.len()
+            );
         }
-        // Re-diversify every breached atom's coordinates onto a distinct,
-        // currently-unexplained PC pair of the reconstruction residual BEFORE
-        // the joint decoder LSQ, so the reseeded design column is non-constant
-        // and the LSQ hands the atom genuine residual signal (a collapsed atom
-        // re-fit on its still-degenerate constant coordinate would only recover
-        // the residual mean and re-collapse).
-        let mut reseeded_any = false;
+        // Decide which breached atoms still have reseed budget (recording a
+        // Reseeded or Terminal collapse event for each), then reseed the budgeted
+        // set onto DISTINCT residual PCs in ONE pass. A per-atom top-PC reseed
+        // would collide multiple simultaneously-collapsed atoms onto the same
+        // residual direction and re-collapse them, so the batch seed (the #671
+        // disjoint-PC rule across atom slots) is what actually breaks the basin.
+        let mut to_reseed: Vec<usize> = Vec::new();
         for &atom in &breached {
             let reseeds_used = self
                 .collapse_events
@@ -1861,8 +1899,7 @@ impl SaeManifoldTerm {
                 .filter(|e| e.atom == atom && e.action == CollapseAction::Reseeded)
                 .count();
             if reseeds_used < SAE_ATOM_COLLAPSE_RESEED_BUDGET {
-                self.reseed_collapsed_atom_decoder(atom, target, rho)?;
-                self.reseed_collapsed_atom_logits(atom);
+                to_reseed.push(atom);
                 self.collapse_events.push(CollapseEvent {
                     iteration,
                     atom,
@@ -1870,7 +1907,6 @@ impl SaeManifoldTerm {
                     floor: SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO,
                     action: CollapseAction::Reseeded,
                 });
-                reseeded_any = true;
             } else {
                 let already_terminal = self
                     .collapse_events
@@ -1887,51 +1923,96 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        // One joint least-squares decoder refit at the re-diversified state
-        // gives every atom — the reseeded ones especially — a fresh,
-        // non-degenerate decoder that distributes the available signal across
-        // the dictionary. Cheap (one n×ΣM_k design solve) and run at most once
-        // per outer iteration, only when an atom actually breached.
-        if reseeded_any {
+        if !to_reseed.is_empty() {
+            self.reseed_atoms_onto_distinct_residual_pcs(&to_reseed, target, rho)?;
+            for &atom in &to_reseed {
+                self.reseed_collapsed_atom_logits(atom);
+            }
+            // One joint least-squares decoder refit at the re-diversified state
+            // gives every atom — the reseeded ones especially — a fresh,
+            // non-degenerate decoder that distributes the available signal across
+            // the dictionary. Cheap (one n×ΣM_k design solve), run at most once
+            // per outer iteration, only when an atom actually breached.
             self.refit_decoder_least_squares_at_current_state(target, Some(rho))?;
         }
         Ok(())
     }
 
-    /// Re-diversify one collapsed atom's latent coordinates onto a distinct
-    /// principal direction of the current reconstruction residual `R = fitted −
-    /// target`, so the atom is pointed at signal the rest of the dictionary has
-    /// not yet explained. The residual is what an additional atom *should*
-    /// capture, and seeding off its PCs places the atom in a region orthogonal
-    /// to the current fit — exactly the decorrelating seed (#671) the joint LSQ
-    /// then turns into a non-zero, distinct decoder. The decoder itself is left
-    /// for the caller's joint LSQ refit; only this atom's coordinates and basis
-    /// caches move here.
-    pub(crate) fn reseed_collapsed_atom_decoder(
+    /// Fraction of the centered target variance the current dictionary explains
+    /// (`EV = 1 − ‖fitted − target‖² / ‖target − mean‖²`). Used by
+    /// [`Self::enforce_decoder_norm_guard`] as the ABSOLUTE co-collapse signal
+    /// that the median-relative decoder-norm test is blind to: when every atom
+    /// collapses together the relative test sees nothing, but a dictionary that
+    /// explains ~zero variance has unambiguously failed. Column means use
+    /// Welford's running update so a huge-but-finite target column cannot
+    /// overflow the total-sum-of-squares.
+    pub(crate) fn dictionary_reconstruction_ev(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<f64, String> {
+        let residual = self.reconstruction_residual(target, rho)?;
+        let mut ss_res = 0.0_f64;
+        for &value in residual.iter() {
+            ss_res += value * value;
+        }
+        let n = target.nrows();
+        let mut ss_tot = 0.0_f64;
+        for col in 0..target.ncols() {
+            let mut mean = 0.0_f64;
+            for (count, row) in (0..n).enumerate() {
+                let x = target[[row, col]];
+                mean += (x - mean) / (count as f64 + 1.0);
+            }
+            for row in 0..n {
+                let dev = target[[row, col]] - mean;
+                ss_tot += dev * dev;
+            }
+        }
+        if !(ss_tot > 0.0) {
+            // A constant target has zero variance to explain; treat a zero
+            // residual as fully explained and anything else as collapsed.
+            return Ok(if ss_res > 0.0 { 0.0 } else { 1.0 });
+        }
+        Ok(1.0 - ss_res / ss_tot)
+    }
+
+    /// Reseed a set of collapsed atoms onto DISTINCT principal directions of the
+    /// current reconstruction residual in one pass, reusing the production #671
+    /// disjoint-PC seeding ([`sae_pca_seed_initial_coords`], which assigns atom
+    /// slot `j` its own PC pair). Seeding each collapsed atom independently would
+    /// hand them all the SAME top residual PC and re-collapse the set, so the
+    /// simultaneous-collapse arm seeds them together. A single-element `atoms`
+    /// slice is the one-atom case (the atom seeded onto the top residual PC).
+    /// Only the reseeded atoms' coordinates and basis caches move; decoders are
+    /// left for the caller's joint LSQ refit.
+    pub(crate) fn reseed_atoms_onto_distinct_residual_pcs(
         &mut self,
-        atom: usize,
+        atoms: &[usize],
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
     ) -> Result<(), String> {
-        let residual = self.reconstruction_residual(target, rho)?;
-        let basis_kind = self.atoms[atom].basis_kind.clone();
-        let d = self.atoms[atom].latent_dim;
-        // Reuse the single production PCA-seed code path (the #671 disjoint-PC
-        // seeding) on the residual, asking it for ONE atom so there is exactly
-        // one seeding rule and the residual-PC diversification stays identical
-        // to the cold-start one. The seed is computed for atom slot 0 of a
-        // single-atom request and copied onto this atom's coordinate values.
-        let seeded = sae_pca_seed_initial_coords(residual.view(), &[basis_kind], &[d])?;
-        let n = self.n_obs();
-        let mut flat = Array1::<f64>::zeros(n * d);
-        for row in 0..n {
-            for axis in 0..d {
-                flat[row * d + axis] = seeded[[0, row, axis]];
-            }
+        if atoms.is_empty() {
+            return Ok(());
         }
-        self.assignment.coords[atom].set_flat(flat.view());
-        let coords = self.assignment.coords[atom].as_matrix();
-        self.atoms[atom].refresh_basis(coords.view())?;
+        let residual = self.reconstruction_residual(target, rho)?;
+        let basis_kinds: Vec<SaeAtomBasisKind> =
+            atoms.iter().map(|&a| self.atoms[a].basis_kind.clone()).collect();
+        let dims: Vec<usize> = atoms.iter().map(|&a| self.atoms[a].latent_dim).collect();
+        let seeded = sae_pca_seed_initial_coords(residual.view(), &basis_kinds, &dims)?;
+        let n = self.n_obs();
+        for (slot, &atom) in atoms.iter().enumerate() {
+            let d = dims[slot];
+            let mut flat = Array1::<f64>::zeros(n * d);
+            for row in 0..n {
+                for axis in 0..d {
+                    flat[row * d + axis] = seeded[[slot, row, axis]];
+                }
+            }
+            self.assignment.coords[atom].set_flat(flat.view());
+            let coords = self.assignment.coords[atom].as_matrix();
+            self.atoms[atom].refresh_basis(coords.view())?;
+        }
         Ok(())
     }
 
@@ -2458,13 +2539,12 @@ impl SaeManifoldTerm {
                 Ok(pair) => pair,
                 Err(_) => continue,
             };
-            let max_eig = evals.iter().fold(0.0_f64, |acc, &v| {
-                if v.is_finite() {
-                    acc.max(v)
-                } else {
-                    acc
-                }
-            });
+            let max_eig = evals.iter().fold(
+                0.0_f64,
+                |acc, &v| {
+                    if v.is_finite() { acc.max(v) } else { acc }
+                },
+            );
             if !(max_eig > 0.0) {
                 // An all-zero data Gram (no assignment mass) is handled by the
                 // fatal pre-fit audit, not by a basis reduction here.
@@ -3663,5 +3743,4 @@ impl SaeManifoldTerm {
             total,
         ))
     }
-
 }
