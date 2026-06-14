@@ -2804,8 +2804,28 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .iter()
                     .copied()
                     .fold(f64::NEG_INFINITY, f64::max);
+                // Penalty VALUE on block 0 (½β0ᵀ(λS)β0) vs its gradient norm
+                // (‖(λS)β0‖∞ = block_penalty_inf[0]). If the value is small while
+                // the gradient norm is 1.7e9, the objective the line search
+                // accepts on is NOT counting the penalty that the residual/step
+                // sees — the objective↔gradient desync. s_lambdas[0] direct so we
+                // also see whether the matrix itself carries the 1e9 scale.
+                let block0_quad_penalty = block_quadratic_penalty(
+                    &states[0].beta,
+                    &s_lambdas[0],
+                    ridge,
+                    options.ridge_policy,
+                );
+                let s0_max_abs = s_lambdas[0]
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0.0_f64, f64::max);
                 log::info!(
-                    "[JN-GRAD-DIAG #979] cycle={cycle} raw_block_grad_inf={:?} proj_block_resid={:?} block_penalty_inf={:?} active_sizes={:?} block0_beta=[{:.3e},{:.3e}] beta_inf={:.3e} resid={:.3e}",
+                    "[JN-GRAD-DIAG #979] cycle={cycle} obj={:.6e} current_penalty={:.6e} block0_quad_penalty={:.6e} s0_max_abs={:.3e} raw_block_grad_inf={:?} proj_block_resid={:?} block_penalty_inf={:?} active_sizes={:?} block0_beta=[{:.3e},{:.3e}] beta_inf={:.3e} resid={:.3e}",
+                    lastobjective,
+                    current_penalty,
+                    block0_quad_penalty,
+                    s0_max_abs,
                     block_gradient_norms
                         .iter()
                         .map(|v| format!("{v:.3e}"))
