@@ -1168,8 +1168,10 @@ impl<'a> RemlState<'a> {
         // not a `PseudoLogdetMode::Smooth` eigenvalue sum, so the
         // `(p − rank) · ln ε` floor leakage that motivated e33c06be on
         // dense cannot occur here: Cholesky either succeeds (H is SPD,
-        // logdet sums true log-diagonals) or fails (ridge escalates in
-        // powers of 10 via `ensure_sparse_positive_definitewithridge`).
+        // logdet sums true log-diagonals) or, when H is genuinely non-PD,
+        // `ensure_sparse_positive_definitewithridge` sets a ridge directly
+        // from a Gershgorin bound on λ_min (surfaced via `log::warn`) so the
+        // shift is provably sufficient rather than escalated blindly.
         //
         // The analogous rank-deficiency concern — that a nonzero ridge
         // δ would contribute `(p − rank(X'WX + S)) · log(δ)` to
