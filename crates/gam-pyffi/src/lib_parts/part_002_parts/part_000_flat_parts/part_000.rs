@@ -2964,10 +2964,28 @@ fn sae_riesz_report_dict<'py>(
     Ok(d)
 }
 
+/// Serialize one SAE atom decoder-functional POINT summary (#1097, narrowed
+/// under #1115): the plug-in value, the one-step penalty-debiased value, and the
+/// removed penalty bias. Deliberately carries NO standard error and NO
+/// confidence interval — the conditional-on-generated-regressors variance
+/// channel is unmodelled, so any SE would under-cover. Use the atom's
+/// `smooth_significance` (any-n-valid e-value) for an honest structure test.
+fn sae_atom_functional_estimate_dict<'py>(
+    py: Python<'py>,
+    estimate: &gam::sae_identifiability::AtomFunctionalEstimate,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("theta_plugin", estimate.theta_plugin)?;
+    d.set_item("theta_onestep", estimate.theta_onestep)?;
+    d.set_item("penalty_bias", estimate.penalty_bias)?;
+    Ok(d)
+}
+
 /// Build the result-dict list of per-atom post-PIRLS inference reports (#1097
-/// Riesz-debiased functionals + #1103 Bartlett smooth significance). One entry
-/// per fitted atom; `functionals` / `smooth_significance` are `None` (Python
-/// `None`) for atoms whose inner-decoder smooth was not harvestable.
+/// penalty-debiased functional point summaries + #1103 split-LRT smooth
+/// significance). One entry per fitted atom; `functionals` /
+/// `smooth_significance` are `None` (Python `None`) for atoms whose
+/// inner-decoder smooth was not harvestable.
 fn sae_atom_inference_list<'py>(
     py: Python<'py>,
     reports: &[gam::sae_identifiability::AtomInferenceReport],
@@ -2981,17 +2999,22 @@ fn sae_atom_inference_list<'py>(
             Some(f) => {
                 let fd = PyDict::new(py);
                 match &f.peak_contrast {
-                    Some(r) => fd.set_item("peak_contrast", sae_riesz_report_dict(py, r)?)?,
+                    Some(r) => {
+                        fd.set_item("peak_contrast", sae_atom_functional_estimate_dict(py, r)?)?
+                    }
                     None => fd.set_item("peak_contrast", py.None())?,
                 }
                 match &f.decoder_variation_norm {
-                    Some(r) => {
-                        fd.set_item("decoder_variation_norm", sae_riesz_report_dict(py, r)?)?
-                    }
+                    Some(r) => fd.set_item(
+                        "decoder_variation_norm",
+                        sae_atom_functional_estimate_dict(py, r)?,
+                    )?,
                     None => fd.set_item("decoder_variation_norm", py.None())?,
                 }
                 match &f.average_value {
-                    Some(r) => fd.set_item("average_value", sae_riesz_report_dict(py, r)?)?,
+                    Some(r) => {
+                        fd.set_item("average_value", sae_atom_functional_estimate_dict(py, r)?)?
+                    }
                     None => fd.set_item("average_value", py.None())?,
                 }
                 a.set_item("functionals", fd)?;
