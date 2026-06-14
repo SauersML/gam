@@ -1771,12 +1771,22 @@ fn compute_smoothing_correction(
     }
 
     // Ensure positive semi-definiteness without hiding a failed rho-space
-    // optimum. Tiny negative values are eigensolver roundoff and are snapped
-    // to zero; material negative curvature means the first-order smoothing
-    // correction is not a valid covariance contribution, so skip it loudly
-    // instead of projecting away the offending direction.
+    // optimum. The smoothing correction V_corr = J·V_ρ·Jᵀ is an SE *inflation*
+    // (Var(β̂|ρ̂) + uncertainty-in-ρ̂); a valid contribution must be PSD. Any
+    // negative eigenvalue means a direction along which this "inflation" would
+    // *shrink* the reported variance — that is never an honest correction,
+    // regardless of magnitude. We do NOT clamp negative directions to zero and
+    // hand back a matrix relabelled as PSD: that silently understates SEs in
+    // exactly the directions where the ρ-Hessian geometry is most suspect
+    // (near-saddle / pinv-corrupted). Instead we skip the entire correction
+    // loudly and let the caller fall back to the (un-inflated, honest) base
+    // covariance. The tolerance only governs how loud we are: a sub-tolerance
+    // negative is consistent with eigensolver roundoff (info-level), a material
+    // one warrants a warning.
     match v_corr_orig.eigh(faer::Side::Lower) {
-        Ok((eigenvalues, eigenvectors)) => {
+        // Eigenvectors are unused: any negative curvature triggers a full skip
+        // of the correction rather than per-direction reconstruction.
+        Ok((eigenvalues, _)) => {
             let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
             let spectral_scale = eigenvalues
                 .iter()
@@ -1799,18 +1809,15 @@ fn compute_smoothing_correction(
                 };
             }
             if min_eig < 0.0 {
-                let mut result = Array2::<f64>::zeros((n_coeffs_orig, n_coeffs_orig));
-                for i in 0..n_coeffs_orig {
-                    let eig = eigenvalues[i].max(0.0);
-                    let v = eigenvectors.column(i);
-                    for j in 0..n_coeffs_orig {
-                        for k in 0..n_coeffs_orig {
-                            result[[j, k]] += eig * v[j] * v[k];
-                        }
-                    }
-                }
+                log::debug!(
+                    "Smoothing correction has sub-tolerance negative eigenvalue {:.3e} \
+                     within tolerance {:.3e}; skipping correction rather than clamping \
+                     to a relabelled-PSD matrix.",
+                    min_eig,
+                    neg_tol
+                );
                 return SmoothingCorrectionComputation {
-                    correction: Some(result),
+                    correction: None,
                     hessian_rho: Some(hessian_rho),
                     active_rank: Some(active_rank_used),
                 };
