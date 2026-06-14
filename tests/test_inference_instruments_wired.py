@@ -8,6 +8,8 @@ Covers the three previously-unwired instruments now exposed through the
 * #984 anytime-valid structure discovery (``atom_birth_gate`` /
   ``e_bh_dictionary_certificate`` / ``split_likelihood_log_e`` /
   ``log_e_from_p_value``),
+* #1109 KL-optimal steering-probe design (``plan_probe_for_contested_claim`` /
+  ``select_probe_by_expected_evidence`` / ``expected_resolution_budget``),
 * #939 Lawley likelihood-ratio Bartlett correction (``lawley_bartlett_factor``).
 """
 
@@ -54,6 +56,51 @@ def test_structure_discovery_gate_and_certificate():
 
     # p->e calibration is the conservative 1/p lower bound family.
     assert gamfit.log_e_from_p_value(0.04) == pytest.approx(math.log(2.5))
+
+
+def test_kl_optimal_probe_design_reaches_python():
+    # Row-aligned candidate probes. Candidate 0 has a large raw delta, but both
+    # hypotheses predict the same response, so it teaches the e-process nothing.
+    # Candidate 1 has a smaller raw delta but separates the hypotheses along the
+    # high-Fisher axis, so it is the design-optimal probe.
+    delta = np.array([[10.0, 0.0], [0.0, 1.0]])
+    predicted_null = np.array([[4.0, 4.0], [0.0, 0.0]])
+    predicted_alt = np.array([[4.0, 4.0], [1.0, 0.2]])
+    fisher = np.array([[2.0, 0.0], [0.0, 0.5]])
+
+    selected = gamfit.select_probe_by_expected_evidence(
+        delta, predicted_null, predicted_alt, fisher
+    )
+    assert selected is not None
+    assert selected["probe"] == 1
+    assert selected["expected_log_growth"] == pytest.approx(1.01)
+    assert selected["delta"] == [0.0, 1.0]
+
+    assert gamfit.expected_resolution_budget(0.05, 1.01) == pytest.approx(
+        -math.log(0.05) / 1.01
+    )
+
+    from_zero = gamfit.plan_probe_for_contested_claim(
+        delta, predicted_null, predicted_alt, fisher, 0.05
+    )
+    assert from_zero is not None
+    assert from_zero["probe"] == 1
+    assert from_zero["budget_from_scratch"] == pytest.approx(-math.log(0.05) / 1.01)
+    assert from_zero["budget_remaining"] == pytest.approx(
+        from_zero["budget_from_scratch"]
+    )
+
+    halfway = gamfit.plan_probe_for_contested_claim(
+        delta, predicted_null, predicted_alt, fisher, 0.05, current_log_e=1.5
+    )
+    assert halfway is not None
+    assert halfway["budget_remaining"] == pytest.approx((-math.log(0.05) - 1.5) / 1.01)
+    assert halfway["budget_remaining"] < from_zero["budget_remaining"]
+
+    blind = gamfit.plan_probe_for_contested_claim(
+        delta[:1], predicted_null[:1], predicted_alt[:1], fisher, 0.05
+    )
+    assert blind is None
 
 
 def test_lawley_bartlett_factor_exponential_fixture():

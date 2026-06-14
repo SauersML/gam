@@ -24,7 +24,7 @@
 //!   corrected statistic and p-value. (See #939 follow-up issue for why the
 //!   summary path cannot auto-apply it without a per-term LR refit.)
 
-use ndarray::Array1;
+use ndarray::{Array1, Array2, ArrayView2};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use statrs::distribution::{ChiSquared, ContinuousCDF};
@@ -33,7 +33,10 @@ use gam::inference::full_conformal::{CanonicalGlmFamily, GlmHomotopyFullConforma
 use gam::inference::lawley::{RowExpectedJets, RowKappas, lawley_lr_bartlett_factor};
 use gam::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use gam::inference::structure_evidence::{
-    AtomBirthGate, GateVerdict, e_benjamini_hochberg, log_e_from_p_calibrator,
+    AtomBirthGate, CandidateProbe, GateVerdict, ProbePlan, e_benjamini_hochberg,
+    expected_resolution_budget as core_expected_resolution_budget, log_e_from_p_calibrator,
+    plan_probe_for_contested_claim as core_plan_probe_for_contested_claim,
+    select_probe_by_expected_evidence as core_select_probe_by_expected_evidence,
     split_likelihood_log_e_value,
 };
 
@@ -150,6 +153,177 @@ pub(crate) fn e_bh_dictionary_certificate(log_e_values: Vec<f64>, alpha: f64) ->
 #[pyfunction]
 pub(crate) fn log_e_from_p_value(p_value: f64) -> PyResult<f64> {
     log_e_from_p_calibrator(p_value).map_err(py_value_error)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// #1109 — KL-optimal steering-probe design
+// ───────────────────────────────────────────────────────────────────────────
+
+fn candidate_probes_from_arrays(
+    function_name: &str,
+    delta: ArrayView2<'_, f64>,
+    predicted_mean_null: ArrayView2<'_, f64>,
+    predicted_mean_alt: ArrayView2<'_, f64>,
+    fisher: ArrayView2<'_, f64>,
+) -> PyResult<(Vec<CandidateProbe>, Array2<f64>)> {
+    let (n_probes, p_out) = delta.dim();
+    if p_out == 0 {
+        return Err(py_value_error(format!(
+            "{function_name}: candidate arrays must have at least one output column"
+        )));
+    }
+    if predicted_mean_null.dim() != (n_probes, p_out) {
+        return Err(py_value_error(format!(
+            "{function_name}: predicted_mean_null shape {:?} must match delta shape {:?}",
+            predicted_mean_null.dim(),
+            delta.dim()
+        )));
+    }
+    if predicted_mean_alt.dim() != (n_probes, p_out) {
+        return Err(py_value_error(format!(
+            "{function_name}: predicted_mean_alt shape {:?} must match delta shape {:?}",
+            predicted_mean_alt.dim(),
+            delta.dim()
+        )));
+    }
+    if fisher.dim() != (p_out, p_out) {
+        return Err(py_value_error(format!(
+            "{function_name}: fisher must be square ({p_out}, {p_out}) for output dimension {p_out}; got {:?}",
+            fisher.dim()
+        )));
+    }
+    for (label, finite) in [
+        ("delta", delta.iter().all(|v| v.is_finite())),
+        (
+            "predicted_mean_null",
+            predicted_mean_null.iter().all(|v| v.is_finite()),
+        ),
+        (
+            "predicted_mean_alt",
+            predicted_mean_alt.iter().all(|v| v.is_finite()),
+        ),
+        ("fisher", fisher.iter().all(|v| v.is_finite())),
+    ] {
+        if !finite {
+            return Err(py_value_error(format!(
+                "{function_name}: {label} contains non-finite values"
+            )));
+        }
+    }
+
+    let mut probes = Vec::with_capacity(n_probes);
+    for idx in 0..n_probes {
+        probes.push(CandidateProbe {
+            delta: delta.row(idx).to_owned(),
+            predicted_mean_null: predicted_mean_null.row(idx).to_owned(),
+            predicted_mean_alt: predicted_mean_alt.row(idx).to_owned(),
+        });
+    }
+    Ok((probes, fisher.to_owned()))
+}
+
+fn probe_plan_to_pydict<'py>(
+    py: Python<'py>,
+    plan: ProbePlan,
+    probes: &[CandidateProbe],
+) -> PyResult<Bound<'py, PyDict>> {
+    let probe = &probes[plan.probe];
+    let response_diff = &probe.predicted_mean_alt - &probe.predicted_mean_null;
+    let out = PyDict::new(py);
+    out.set_item("probe", plan.probe)?;
+    out.set_item("expected_log_growth", plan.expected_log_growth)?;
+    out.set_item("budget_from_scratch", plan.budget_from_scratch)?;
+    out.set_item("budget_remaining", plan.budget_remaining)?;
+    out.set_item("delta", probe.delta.to_vec())?;
+    out.set_item("predicted_mean_null", probe.predicted_mean_null.to_vec())?;
+    out.set_item("predicted_mean_alt", probe.predicted_mean_alt.to_vec())?;
+    out.set_item("predicted_mean_diff", response_diff.to_vec())?;
+    Ok(out)
+}
+
+/// Select the steering-probe candidate whose two structural hypotheses disagree
+/// most in the output-Fisher metric (issue #1109). Inputs are row-aligned
+/// candidate arrays: `delta[i]` is the steering displacement, and
+/// `predicted_mean_null[i]` / `predicted_mean_alt[i]` are the two hypotheses'
+/// predicted output-mean responses to that same probe. The selected score is
+/// `0.5 * (mu_alt - mu_null)^T fisher (mu_alt - mu_null)` in nats per
+/// observation. Returns `None` when no candidate discriminates.
+#[pyfunction]
+pub(crate) fn select_probe_by_expected_evidence<'py>(
+    py: Python<'py>,
+    delta: numpy::PyReadonlyArray2<'py, f64>,
+    predicted_mean_null: numpy::PyReadonlyArray2<'py, f64>,
+    predicted_mean_alt: numpy::PyReadonlyArray2<'py, f64>,
+    fisher: numpy::PyReadonlyArray2<'py, f64>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let (probes, fisher) = candidate_probes_from_arrays(
+        "select_probe_by_expected_evidence",
+        delta.as_array(),
+        predicted_mean_null.as_array(),
+        predicted_mean_alt.as_array(),
+        fisher.as_array(),
+    )?;
+    let Some((idx, expected_log_growth)) =
+        core_select_probe_by_expected_evidence(&probes, &fisher)
+    else {
+        return Ok(None);
+    };
+    let probe = &probes[idx];
+    let response_diff = &probe.predicted_mean_alt - &probe.predicted_mean_null;
+    let out = PyDict::new(py);
+    out.set_item("probe", idx)?;
+    out.set_item("expected_log_growth", expected_log_growth)?;
+    out.set_item("delta", probe.delta.to_vec())?;
+    out.set_item("predicted_mean_null", probe.predicted_mean_null.to_vec())?;
+    out.set_item("predicted_mean_alt", probe.predicted_mean_alt.to_vec())?;
+    out.set_item("predicted_mean_diff", response_diff.to_vec())?;
+    Ok(Some(out))
+}
+
+/// Expected observations needed for a probe with per-observation expected
+/// evidence growth `growth_nats_per_obs` to cross the Ville threshold `1/alpha`.
+#[pyfunction]
+pub(crate) fn expected_resolution_budget(
+    alpha: f64,
+    growth_nats_per_obs: f64,
+) -> Option<f64> {
+    core_expected_resolution_budget(alpha, growth_nats_per_obs)
+}
+
+/// Plan the next steering probe for a contested structural claim (issue #1109):
+/// choose the KL-optimal candidate, report its expected evidence growth, and
+/// discount the remaining observation budget by the claim's current log
+/// e-evidence. Returns `None` when no candidate discriminates.
+#[pyfunction]
+#[pyo3(signature = (
+    delta,
+    predicted_mean_null,
+    predicted_mean_alt,
+    fisher,
+    alpha,
+    current_log_e = 0.0
+))]
+pub(crate) fn plan_probe_for_contested_claim<'py>(
+    py: Python<'py>,
+    delta: numpy::PyReadonlyArray2<'py, f64>,
+    predicted_mean_null: numpy::PyReadonlyArray2<'py, f64>,
+    predicted_mean_alt: numpy::PyReadonlyArray2<'py, f64>,
+    fisher: numpy::PyReadonlyArray2<'py, f64>,
+    alpha: f64,
+    current_log_e: f64,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let (probes, fisher) = candidate_probes_from_arrays(
+        "plan_probe_for_contested_claim",
+        delta.as_array(),
+        predicted_mean_null.as_array(),
+        predicted_mean_alt.as_array(),
+        fisher.as_array(),
+    )?;
+    let Some(plan) = core_plan_probe_for_contested_claim(&probes, &fisher, alpha, current_log_e)
+    else {
+        return Ok(None);
+    };
+    probe_plan_to_pydict(py, plan, &probes).map(Some)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -727,6 +901,9 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(split_likelihood_log_e, module)?)?;
     module.add_function(wrap_pyfunction!(e_bh_dictionary_certificate, module)?)?;
     module.add_function(wrap_pyfunction!(log_e_from_p_value, module)?)?;
+    module.add_function(wrap_pyfunction!(select_probe_by_expected_evidence, module)?)?;
+    module.add_function(wrap_pyfunction!(expected_resolution_budget, module)?)?;
+    module.add_function(wrap_pyfunction!(plan_probe_for_contested_claim, module)?)?;
     module.add_function(wrap_pyfunction!(lawley_bartlett_factor, module)?)?;
     module.add_function(wrap_pyfunction!(debiased_functional, module)?)?;
     module.add_function(wrap_pyfunction!(glm_full_conformal, module)?)?;
