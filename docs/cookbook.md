@@ -1,6 +1,6 @@
 # Cookbook
 
-Runnable recipes. Each one matches a pattern in the test suite.
+Runnable examples. Each one matches a pattern in the test suite.
 
 ## Fit a Gaussian GAM with intervals
 

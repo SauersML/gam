@@ -1,4 +1,4 @@
-"""SAE + supervised-head recipe.
+"""SAE + supervised-head example.
 
 `sae_supervised(X, Y, supervised_mask, ...)` is pure orchestration:
 
@@ -73,13 +73,13 @@ class SaeSupervisedFit:
     n_supervised: int
 
     def report(self) -> dict[str, Any]:
-        """Combined recipe-level summary.
+        """Combined example-level summary.
 
         Returns the SAE summary, the GLM head summary, and row counts. All fit
         statistics come from the underlying SAE and GAM/GLM objects.
         """
         return {
-            "recipe": "sae_supervised",
+            "example": "sae_supervised",
             "n_train": self.n_train,
             "n_supervised": self.n_supervised,
             "latent_dim": len(self.latent_names),
@@ -213,7 +213,7 @@ def sae_supervised(
         Boolean (or 0/1 integer) mask flagging the supervised rows.
         Must select at least one row.
     K : int, optional
-        Number of SAE atoms. When ``None``, the recipe picks a sane
+        Number of SAE atoms. When ``None``, the example picks a sane
         default from ``(n, p)``.
     d_atom : int, default 2
         Latent atom dimension passed to ``sae_manifold_fit``.
@@ -233,7 +233,7 @@ def sae_supervised(
     Returns
     -------
     SaeSupervisedFit
-        Uniform recipe result with ``.sae``, ``.model``, ``.report()``, and
+        Uniform example result with ``.sae``, ``.model``, ``.report()``, and
         ``.predict(X)``. Inspect ``fit.sae.assignments`` for the learned
         assignment matrix, ``fit.sae.atoms[i].decoder_covariance``, and
         ``fit.sae.shape_uncertainty(atom=i)`` when present.

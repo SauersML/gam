@@ -48,13 +48,24 @@ use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Axis;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::io::Write;
-use std::path::Path;
 
-const ICU_CSV: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/bench/datasets/icu_survival_death.csv"
-);
+const ICU_CSV_PARTS: &[&str] = &[
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/icu_survival_death_parts/part_000.csv"
+    ),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/icu_survival_death_parts/part_001.csv"
+    ),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/icu_survival_death_parts/part_002.csv"
+    ),
+];
 
 /// Number of equal-width bins per covariate axis. 14 x 12 = 168 candidate
 /// cells; after dropping empty cells we land in the spec's ~100-200 range.
@@ -65,17 +76,46 @@ const LOS_BINS: usize = 12;
 /// is held out for scoring; the rest train the posterior. Fixed, no RNG.
 const TEST_STRIDE: usize = 5;
 
+fn load_icu_age_los_event() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let (mut age, mut los, mut event) = (Vec::new(), Vec::new(), Vec::new());
+    for part in ICU_CSV_PARTS {
+        let file = File::open(part).expect("open icu_survival_death part");
+        let mut lines = BufReader::new(file).lines();
+        let header = lines
+            .next()
+            .expect("icu header line")
+            .expect("read icu header");
+        let cols: Vec<&str> = header.trim().split(',').collect();
+        let idx = |name: &str| {
+            cols.iter()
+                .position(|c| *c == name)
+                .unwrap_or_else(|| panic!("icu_survival_death part missing column {name}"))
+        };
+        let i_age = idx("age");
+        let i_los = idx("time");
+        let i_event = idx("event");
+        for line in lines {
+            let line = line.expect("read icu row");
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split(',').collect();
+            age.push(fields[i_age].trim().parse().expect("parse age"));
+            los.push(fields[i_los].trim().parse().expect("parse time"));
+            event.push(fields[i_event].trim().parse().expect("parse event"));
+        }
+    }
+    (age, los, event)
+}
+
 #[test]
 fn gam_nuts_poisson_loglink_predicts_heldout_counts() {
     init_parallelism();
 
     // ---- load the ICU survival dataset (per-patient rows) -----------------
     // columns: time (length-of-stay, days), event (death 0/1), age (years), ...
-    let ds = load_csvwith_inferred_schema(Path::new(ICU_CSV)).expect("load icu_survival_death.csv");
-    let col = ds.column_map();
-    let age_raw: Vec<f64> = ds.values.column(col["age"]).to_vec();
-    let los_raw: Vec<f64> = ds.values.column(col["time"]).to_vec();
-    let event: Vec<f64> = ds.values.column(col["event"]).to_vec();
+    let (age_raw, los_raw, event) = load_icu_age_los_event();
     let n_rows = age_raw.len();
     assert!(n_rows > 1000, "icu dataset should be large, got {n_rows}");
 

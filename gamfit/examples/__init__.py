@@ -1,11 +1,11 @@
-"""Recipe namespace: high-level runners for latent-factor workflows.
+"""Example namespace: high-level runners for latent-factor workflows.
 
-Each recipe in this submodule returns a callable runner with a ``.fit(...)``
-entry point or a direct fit result. Recipes are thin: they encode one
+Each example in this submodule returns a callable runner with a ``.fit(...)``
+entry point or a direct fit result. Examples are thin: they encode one
 coordinated procedure on top of existing Smooth / penalty / SAE machinery so
 that the call site reads as one declarative step.
 
-``partial_supervision`` returns a gauge-fix recipe for splitting supervised and
+``partial_supervision`` returns a gauge-fix example for splitting supervised and
 free latent blocks. ``sae_supervised`` fits a manifold SAE on all rows, then a
 supervised GAM/GLM head on the rows selected by ``supervised_mask``.
 """
@@ -13,8 +13,8 @@ supervised GAM/GLM head on the rows selected by ``supervised_mask``.
 from __future__ import annotations
 
 from .partial_supervision import (
+    PartialSupervisionExample,
     PartialSupervisionFit,
-    PartialSupervisionRecipe,
     partial_supervision,
 )
 from .sae_supervised import (
@@ -23,8 +23,8 @@ from .sae_supervised import (
 )
 
 __all__ = [
+    "PartialSupervisionExample",
     "PartialSupervisionFit",
-    "PartialSupervisionRecipe",
     "partial_supervision",
     "SaeSupervisedFit",
     "sae_supervised",

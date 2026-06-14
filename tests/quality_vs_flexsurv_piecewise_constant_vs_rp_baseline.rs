@@ -69,10 +69,20 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-const ICU_CSV: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/bench/datasets/icu_survival_death.csv"
-);
+const ICU_CSV_PARTS: &[&str] = &[
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/icu_survival_death_parts/part_000.csv"
+    ),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/icu_survival_death_parts/part_001.csv"
+    ),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/icu_survival_death_parts/part_002.csv"
+    ),
+];
 
 // Royston-Parmar flexible-parametric spline flexibility. gam's transformation
 // time basis uses a monotone (degree-3) I-spline on log(t); flexsurv uses a
@@ -86,46 +96,48 @@ const TIME_DEGREE: usize = 3;
 // and flexsurv see byte-identical folds.
 const TEST_STRIDE: usize = 5;
 
-/// Parse `icu_survival_death.csv` into numeric `(time, event, age)` rows,
+/// Parse partitioned `icu_survival_death` into numeric `(time, event, age)` rows,
 /// dropping non-positive times (undefined under log-time splines for *both*
 /// engines, rejected outright by flexsurvspline). Death (`event == 1`) is the
 /// modeled event; all else is right-censored.
 fn load_icu_positive_times() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let file = File::open(Path::new(ICU_CSV)).expect("open icu_survival_death.csv");
-    let mut lines = BufReader::new(file).lines();
-    let header = lines
-        .next()
-        .expect("icu header line")
-        .expect("read icu header");
-    let cols: Vec<&str> = header.trim().split(',').collect();
-    let idx = |name: &str| {
-        cols.iter()
-            .position(|c| *c == name)
-            .unwrap_or_else(|| panic!("icu_survival_death.csv missing column {name}"))
-    };
-    let i_time = idx("time");
-    let i_event = idx("event");
-    let i_age = idx("age");
-
     let (mut time, mut event, mut age) = (Vec::new(), Vec::new(), Vec::new());
-    for line in lines {
-        let line = line.expect("read icu row");
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    for part in ICU_CSV_PARTS {
+        let file = File::open(Path::new(part)).expect("open icu_survival_death part");
+        let mut lines = BufReader::new(file).lines();
+        let header = lines
+            .next()
+            .expect("icu header line")
+            .expect("read icu header");
+        let cols: Vec<&str> = header.trim().split(',').collect();
+        let idx = |name: &str| {
+            cols.iter()
+                .position(|c| *c == name)
+                .unwrap_or_else(|| panic!("icu_survival_death part missing column {name}"))
+        };
+        let i_time = idx("time");
+        let i_event = idx("event");
+        let i_age = idx("age");
+
+        for line in lines {
+            let line = line.expect("read icu row");
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = line.split(',').collect();
+            let t: f64 = f[i_time].trim().parse().expect("parse time");
+            // Drop non-positive times identically for gam and flexsurv: log(t) is
+            // undefined for the log-time splines both engines use.
+            if !(t > 0.0) {
+                continue;
+            }
+            let e: f64 = f[i_event].trim().parse().expect("parse event");
+            let a: f64 = f[i_age].trim().parse().expect("parse age");
+            time.push(t);
+            event.push(if e == 1.0 { 1.0 } else { 0.0 });
+            age.push(a);
         }
-        let f: Vec<&str> = line.split(',').collect();
-        let t: f64 = f[i_time].trim().parse().expect("parse time");
-        // Drop non-positive times identically for gam and flexsurv: log(t) is
-        // undefined for the log-time splines both engines use.
-        if !(t > 0.0) {
-            continue;
-        }
-        let e: f64 = f[i_event].trim().parse().expect("parse event");
-        let a: f64 = f[i_age].trim().parse().expect("parse age");
-        time.push(t);
-        event.push(if e == 1.0 { 1.0 } else { 0.0 });
-        age.push(a);
     }
     (time, event, age)
 }

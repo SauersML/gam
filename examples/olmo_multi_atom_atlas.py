@@ -2,18 +2,20 @@
 
 Goals
 -----
-1. K=1 sweep across all 5 checkpoints to build the full dev-trajectory curve.
-2. K=2, 3, 5 on the qualia (L25, N=635) slice — same 5 checkpoints.
+1. K=1 sweep across all stable checkpoints to build the full dev-trajectory curve.
+2. K=2, 3, 5 on the qualia (L25, N=635) slice — stable checkpoints.
 3. Outputs:
    - plots/olmo_multi_atom_grid.png  — K × checkpoint heatmap + scatter grids
    - plots/olmo_trajectory_curve.png — EV + exp/noexp AUC vs training step
-   - plots/olmo_k_sweep_ev.png       — EV vs K per checkpoint
+   - plots/olmo_k_sweep_metrics.png  — EV vs K per checkpoint
    - olmo_multi_atom_results.csv     — one row per (K, checkpoint)
 
 Bug workarounds
 ---------------
 - #1094: euclidean K>1 hangs → use atom_topology="circle" for all fits
 - #1095: circle K=1 fails on N=180 color bank → skip L44 color for now
+- #1113: stage1-step0 L25 norms are 15× larger (515 vs 33) → NaN gradient;
+         skip that checkpoint until the criterion numerics are stabilized.
 
 Usage (MSI):
     source /projects/standard/hsiehph/sauer354/gamfit-sweep-venv/bin/activate
@@ -33,16 +35,17 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint registry — ordered by training step so the trajectory is
-# chronological on the x-axis.
+# Checkpoint registry — ordered chronologically for the trajectory plot.
+# stage1-step0 is excluded: L25 activation norms are 15x larger than all
+# other checkpoints (515 vs ~33), causing NaN gradients in the SAE criterion
+# (overflow in log/exp). Filed as #1113.
 # ---------------------------------------------------------------------------
 
 CHECKPOINTS = [
-    ("stage1-step0",      "SFT-init",  0),
-    ("base",              "base",      None),   # pretrain baseline
-    ("stage3-step11921",  "SFT-end",   11921),
-    ("instruct",          "instruct",  None),   # post-SFT
-    ("step_2300",         "RLVR",      None),   # RLVR final
+    ("base",               "base"),
+    ("stage3-step11921",   "SFT-end"),
+    ("instruct",           "instruct"),
+    ("step_2300",          "RLVR"),
 ]
 
 K_SWEEP = [1, 2, 3, 5]
@@ -105,6 +108,29 @@ def kind_purity(hard: np.ndarray, kinds: list[str]) -> float:
     return float(np.mean(purities)) if purities else float("nan")
 
 
+def kind_entropy(hard: np.ndarray, kinds: list[str], n_atoms: int) -> float:
+    """
+    Mean per-atom kind entropy.  Low = atoms are concept-pure.
+    Computed only over atoms with at least 5 assigned prompts.
+    """
+    unique_atoms = np.unique(hard)
+    all_kinds = sorted(set(kinds))
+    kind_idx = {k: i for i, k in enumerate(all_kinds)}
+    entropies = []
+    for a in unique_atoms:
+        mask = hard == a
+        if mask.sum() < 5:
+            continue
+        ks = [kinds[i] for i in range(len(kinds)) if mask[i]]
+        counts = np.zeros(len(all_kinds))
+        for k in ks:
+            counts[kind_idx[k]] += 1
+        p = counts / counts.sum()
+        p = p[p > 0]
+        entropies.append(float(-np.sum(p * np.log(p))))
+    return float(np.mean(entropies)) if entropies else float("nan")
+
+
 # ---------------------------------------------------------------------------
 # SAE fit wrapper
 # ---------------------------------------------------------------------------
@@ -114,7 +140,6 @@ def fit_slice(
     n_atoms: int,
     n_iter: int,
     seed: int,
-    pca_dim: int,
 ) -> dict | None:
     """
     Run sae_manifold_fit on pre-whitened Z (N, pca_dim).
@@ -128,7 +153,7 @@ def fit_slice(
             X=Z,
             K=n_atoms,
             d_atom=2,
-            # Use circle for all K values: euclidean K>1 hangs (#1094)
+            # Use circle for all K: euclidean K>1 hangs (#1094)
             atom_topology="circle",
             n_iter=n_iter,
             random_state=seed,
@@ -145,7 +170,6 @@ def fit_slice(
     ev = float(1.0 - ((Z - fitted) ** 2).sum() / total_var) if total_var > 1e-12 else float("nan")
     asn = np.asarray(fit.assignments)
     hard = asn.argmax(axis=1) if asn.ndim == 2 else asn
-    k_active = int(len(np.unique(hard)))
     return dict(
         Z=Z,
         fitted=fitted,
@@ -154,7 +178,7 @@ def fit_slice(
         ev=ev,
         seconds=time.time() - t0,
         k_requested=n_atoms,
-        k_active=k_active,
+        k_active=int(len(np.unique(hard))),
     )
 
 
@@ -193,7 +217,6 @@ KIND_PALETTE: dict[str, str] = {
     "upload": "#aaffc3",
 }
 
-# Atom colours — up to 8 atoms
 ATOM_PALETTE = [
     "#e6194b", "#3cb44b", "#4363d8", "#f58231",
     "#911eb4", "#42d4f4", "#ffe119", "#808080",
@@ -250,13 +273,12 @@ def main() -> None:
     import matplotlib.pyplot as plt
 
     # -----------------------------------------------------------------------
-    # Accumulate results: one entry per (ckpt_key, K)
-    # results[ckpt_key][K] = fit_dict | None
+    # Accumulate results: results[ckpt_key][K] = fit_dict | None
     # -----------------------------------------------------------------------
     results: dict[str, dict[int, dict | None]] = {}
     prompts_by_ckpt: dict[str, list[dict]] = {}
 
-    for ckpt_key, ckpt_label, _step in CHECKPOINTS:
+    for ckpt_key, ckpt_label in CHECKPOINTS:
         ckpt_dir = data / ckpt_key
         if not ckpt_dir.exists():
             print(f"\nSKIP {ckpt_key}: directory not found", flush=True)
@@ -264,7 +286,8 @@ def main() -> None:
 
         print(f"\n=== {ckpt_label} ({ckpt_key}) ===", flush=True)
         X_raw, prompts = load_l25(ckpt_dir)
-        print(f"  L25 shape: {X_raw.shape}  PCA-{args.pca_dim}", flush=True)
+        norms = np.linalg.norm(X_raw, axis=1)
+        print(f"  L25: shape={X_raw.shape}  norm_mean={norms.mean():.1f} ± {norms.std():.1f}", flush=True)
         prompts_by_ckpt[ckpt_key] = prompts
 
         Z, _, _ = pca_project(X_raw, args.pca_dim)
@@ -272,17 +295,22 @@ def main() -> None:
 
         for K in K_SWEEP:
             print(f"  K={K} ...", end="", flush=True)
-            r = fit_slice(Z, K, args.n_iter, args.seed, args.pca_dim)
+            r = fit_slice(Z, K, args.n_iter, args.seed)
             results[ckpt_key][K] = r
             if r is not None:
                 sides = [p.get("side", "-") for p in prompts]
                 auc = exp_noexp_auc(r["Z"][:, 0], sides)
                 kinds = [p.get("kind", "?") for p in prompts]
                 purity = kind_purity(r["hard"], kinds)
+                h_entropy = kind_entropy(r["hard"], kinds, K)
                 r["auc"] = auc
                 r["kind_purity"] = purity
-                print(f" EV={r['ev']:.4f}  AUC={auc:.3f}  purity={purity:.3f}"
-                      f"  k_active={r['k_active']}  {r['seconds']:.1f}s", flush=True)
+                r["kind_entropy"] = h_entropy
+                print(
+                    f" EV={r['ev']:.4f}  AUC={auc:.3f}  purity={purity:.3f}"
+                    f"  entropy={h_entropy:.2f}  k_active={r['k_active']}  {r['seconds']:.1f}s",
+                    flush=True,
+                )
             else:
                 print(" FAILED", flush=True)
 
@@ -291,11 +319,11 @@ def main() -> None:
     # -----------------------------------------------------------------------
     csv_path = data / "olmo_multi_atom_results.csv"
     csv_fields = ["checkpoint", "label", "K_requested", "K_active",
-                  "EV", "AUC_exp_noexp", "kind_purity", "seconds"]
+                  "EV", "AUC_exp_noexp", "kind_purity", "kind_entropy", "seconds"]
     with open(csv_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=csv_fields)
         writer.writeheader()
-        for ckpt_key, ckpt_label, _step in CHECKPOINTS:
+        for ckpt_key, ckpt_label in CHECKPOINTS:
             if ckpt_key not in results:
                 continue
             for K in K_SWEEP:
@@ -308,24 +336,24 @@ def main() -> None:
                     "EV": f"{r['ev']:.4f}" if r else "",
                     "AUC_exp_noexp": f"{r.get('auc', float('nan')):.3f}" if r else "",
                     "kind_purity": f"{r.get('kind_purity', float('nan')):.3f}" if r else "",
+                    "kind_entropy": f"{r.get('kind_entropy', float('nan')):.2f}" if r else "",
                     "seconds": f"{r['seconds']:.1f}" if r else "",
                 })
     print(f"\nCSV saved: {csv_path}", flush=True)
 
     # -----------------------------------------------------------------------
-    # Plot 1: K-sweep EV grid (K on x-axis, one line per checkpoint)
+    # Plot 1: K-sweep metrics (EV, AUC, purity, entropy)
     # -----------------------------------------------------------------------
-    fig1, axes1 = plt.subplots(1, 3, figsize=(16, 4.5))
-    ax_ev, ax_auc, ax_purity = axes1
+    ckpt_colors = {ck: plt.cm.tab10(i / max(len(CHECKPOINTS) - 1, 1))
+                   for i, (ck, _) in enumerate(CHECKPOINTS)}
 
-    # colours per checkpoint
-    ckpt_colors = {ckpt_key: plt.cm.tab10(i / max(len(CHECKPOINTS) - 1, 1))
-                   for i, (ckpt_key, _, _) in enumerate(CHECKPOINTS)}
+    fig1, axes1 = plt.subplots(2, 2, figsize=(14, 9))
+    ax_ev, ax_auc, ax_purity, ax_entropy = axes1.ravel()
 
-    for ckpt_key, ckpt_label, _step in CHECKPOINTS:
+    for ckpt_key, ckpt_label in CHECKPOINTS:
         if ckpt_key not in results:
             continue
-        xs, evs, aucs, purities = [], [], [], []
+        xs, evs, aucs, purities, entropies = [], [], [], [], []
         for K in K_SWEEP:
             r = results[ckpt_key].get(K)
             if r is None:
@@ -334,16 +362,19 @@ def main() -> None:
             evs.append(r["ev"])
             aucs.append(r.get("auc", float("nan")))
             purities.append(r.get("kind_purity", float("nan")))
+            entropies.append(r.get("kind_entropy", float("nan")))
         c = ckpt_colors[ckpt_key]
         if xs:
             ax_ev.plot(xs, evs, "o-", color=c, label=ckpt_label, lw=2)
             ax_auc.plot(xs, aucs, "s-", color=c, label=ckpt_label, lw=2)
             ax_purity.plot(xs, purities, "^-", color=c, label=ckpt_label, lw=2)
+            ax_entropy.plot(xs, entropies, "D-", color=c, label=ckpt_label, lw=2)
 
     for ax, ylabel, title in [
-        (ax_ev, "EV (explained variance)", "Reconstruction EV vs K-atoms"),
-        (ax_auc, "AUC (exp vs noexp)", "exp/noexp separability vs K-atoms"),
-        (ax_purity, "Atom kind-purity", "Concept purity per atom vs K"),
+        (ax_ev,      "EV (explained variance)",    "Reconstruction EV vs K"),
+        (ax_auc,     "AUC (exp vs noexp)",          "exp/noexp separability vs K"),
+        (ax_purity,  "Atom kind-purity",            "Concept purity per atom vs K"),
+        (ax_entropy, "Kind entropy per atom (nats)", "Atom specificity: entropy vs K (lower=purer)"),
     ]:
         ax.set_xlabel("K (number of atoms)")
         ax.set_ylabel(ylabel)
@@ -353,7 +384,7 @@ def main() -> None:
         ax.grid(alpha=0.3)
 
     fig1.suptitle(
-        "OLMo-3-32B L25 qualia — multi-atom manifold-SAE K sweep across all checkpoints\n"
+        "OLMo-3-32B L25 qualia — manifold-SAE K sweep across checkpoints\n"
         f"(atom_topology=circle, PCA-{args.pca_dim})",
         fontsize=10,
     )
@@ -366,12 +397,11 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # Plot 2: Trajectory curve (K=1) — EV + AUC across training steps
     # -----------------------------------------------------------------------
-    # Order checkpoints for the x-axis
-    traj_order = ["stage1-step0", "base", "stage3-step11921", "instruct", "step_2300"]
-    traj_labels = {k: lbl for k, lbl, _ in CHECKPOINTS}
+    traj_ckpts = [ck for ck, _ in CHECKPOINTS]
+    traj_labels = {ck: lbl for ck, lbl in CHECKPOINTS}
 
     traj_xs, traj_evs, traj_aucs = [], [], []
-    for i, ck in enumerate(traj_order):
+    for i, ck in enumerate(traj_ckpts):
         if ck not in results:
             continue
         r = results[ck].get(1)
@@ -384,7 +414,7 @@ def main() -> None:
     if traj_xs:
         fig2, ax2 = plt.subplots(figsize=(10, 4.5))
         ax2_r = ax2.twinx()
-        xlabels = [traj_labels.get(traj_order[x], traj_order[x]) for x in traj_xs]
+        xlabels = [traj_labels.get(traj_ckpts[x], traj_ckpts[x]) for x in traj_xs]
         ax2.plot(traj_xs, traj_evs, "o-", color="#e6194b", lw=2.5, label="L25 EV (K=1)")
         ax2_r.plot(traj_xs, traj_aucs, "s--", color="#4363d8", lw=2.5, label="exp/noexp AUC (K=1)")
         ax2.set_xticks(traj_xs)
@@ -393,8 +423,10 @@ def main() -> None:
         ax2_r.set_ylabel("exp/noexp AUC", color="#4363d8")
         ax2.set_title(
             "OLMo-3-32B L25 qualia: representational geometry across training\n"
-            f"(circle K=1, PCA-{args.pca_dim})",
-            fontsize=10,
+            f"base → SFT-end → instruct → RLVR  (circle K=1, PCA-{args.pca_dim})\n"
+            "Note: stage1-step0 excluded — L25 activation norms 15× larger (515 vs ~33), "
+            "causing NaN gradients (#1113)",
+            fontsize=9,
         )
         lines1, labels1 = ax2.get_legend_handles_labels()
         lines2, labels2 = ax2_r.get_legend_handles_labels()
@@ -407,18 +439,16 @@ def main() -> None:
         print(f"Trajectory curve saved: {p2}", flush=True)
 
     # -----------------------------------------------------------------------
-    # Plot 3: Scatter grid — rows=checkpoints, cols=K values
-    # (only when we have results; skip missing)
+    # Plot 3: Multi-atom scatter grid — rows=checkpoints, cols=K × {atom, side}
     # -----------------------------------------------------------------------
-    active_ckpts = [ck for ck in traj_order if ck in results]
+    active_ckpts = [ck for ck, _ in CHECKPOINTS if ck in results]
     active_Ks = [K for K in K_SWEEP if any(
         results.get(ck, {}).get(K) is not None for ck in active_ckpts
     )]
 
     if active_ckpts and active_Ks:
         n_rows = len(active_ckpts)
-        # Two panels per K: atom-coloured + side-coloured
-        n_cols = len(active_Ks) * 2
+        n_cols = len(active_Ks) * 2  # atom-coloured + side-coloured per K
         fig3, axes3 = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2.8, n_rows * 2.6))
         if n_rows == 1:
             axes3 = axes3[np.newaxis, :]
@@ -430,27 +460,25 @@ def main() -> None:
             label = traj_labels.get(ck, ck)
             for c_idx, K in enumerate(active_Ks):
                 r = results[ck].get(K)
-                col_atom = c_idx * 2
-                col_side = c_idx * 2 + 1
-                ax_a = axes3[r_idx, col_atom]
-                ax_s = axes3[r_idx, col_side]
+                ax_a = axes3[r_idx, c_idx * 2]
+                ax_s = axes3[r_idx, c_idx * 2 + 1]
                 if r is None:
-                    ax_a.text(0.5, 0.5, "FAILED", ha="center", va="center",
-                              transform=ax_a.transAxes, fontsize=9, color="red")
-                    ax_s.text(0.5, 0.5, "FAILED", ha="center", va="center",
-                              transform=ax_s.transAxes, fontsize=9, color="red")
-                    ax_a.set_xticks([]); ax_a.set_yticks([])
-                    ax_s.set_xticks([]); ax_s.set_yticks([])
+                    for ax in (ax_a, ax_s):
+                        ax.text(0.5, 0.5, "FAILED", ha="center", va="center",
+                                transform=ax.transAxes, fontsize=9, color="red")
+                        ax.set_xticks([]); ax.set_yticks([])
                     continue
                 Z = r["Z"]
+                purity_str = f"{r.get('kind_purity', float('nan')):.2f}"
+                auc_str = f"{r.get('auc', float('nan')):.3f}"
                 _scatter_atom(ax_a, Z, r["hard"],
-                              f"{label} K={K}\nEV={r['ev']:.3f} purity={r.get('kind_purity', float('nan')):.2f}")
+                              f"{label} K={K}  EV={r['ev']:.3f}\npurity={purity_str}")
                 _scatter_side(ax_s, Z, prompts,
-                              f"{label} K={K}\nAUC={r.get('auc', float('nan')):.3f}")
+                              f"{label} K={K}  AUC={auc_str}")
 
         fig3.suptitle(
-            "OLMo-3-32B L25 qualia — atom assignments (left) and exp/noexp sides (right)\n"
-            f"Across checkpoints (rows) and K values (cols). atom_topology=circle, PCA-{args.pca_dim}",
+            "OLMo-3-32B L25 qualia — atom assignments (odd cols) and exp/noexp sides (even cols)\n"
+            f"Rows=checkpoints  Cols=K×2  atom_topology=circle  PCA-{args.pca_dim}",
             fontsize=10,
         )
         fig3.tight_layout()
@@ -460,11 +488,11 @@ def main() -> None:
         print(f"Multi-atom scatter grid saved: {p3}", flush=True)
 
     # -----------------------------------------------------------------------
-    # Plot 4: K=1 across all checkpoints — kind-coloured scatter (5 panels)
+    # Plot 4: K=1 kind-coloured scatter across all 4 checkpoints
     # -----------------------------------------------------------------------
     import matplotlib.patches as mpatches
 
-    active_k1 = [(ck, traj_labels.get(ck, ck)) for ck in traj_order
+    active_k1 = [(ck, traj_labels.get(ck, ck)) for ck in traj_ckpts
                  if ck in results and results[ck].get(1) is not None]
     if active_k1:
         n = len(active_k1)
@@ -480,7 +508,7 @@ def main() -> None:
             Z = r["Z"]
             ax.scatter(Z[:, 0], Z[:, 1], c=colors, s=9, alpha=0.65, linewidths=0)
             ax.set_title(
-                f"{label}\nEV={r['ev']:.3f} AUC={r.get('auc', float('nan')):.3f}",
+                f"{label}\nEV={r['ev']:.3f}  AUC={r.get('auc', float('nan')):.3f}",
                 fontsize=8,
             )
             ax.set_xticks([]); ax.set_yticks([])
@@ -490,7 +518,8 @@ def main() -> None:
                            for k in present[:14]]
                 ax.legend(handles=handles, fontsize=5, loc="lower right", framealpha=0.6, ncol=2)
         fig4.suptitle(
-            "OLMo-3-32B L25 qualia — K=1 kind-coloured scatter across all training checkpoints",
+            "OLMo-3-32B L25 qualia — K=1 kind-coloured scatter across training checkpoints\n"
+            "(base → SFT-end → instruct → RLVR)",
             fontsize=10,
         )
         fig4.tight_layout()
@@ -502,27 +531,32 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # Terminal summary table
     # -----------------------------------------------------------------------
-    print("\n" + "=" * 78)
+    print("\n" + "=" * 88)
     print("SUMMARY")
-    print("=" * 78)
-    header = f"{'checkpoint':<22} {'K_req':>6} {'K_act':>6} {'EV':>8} {'AUC':>8} {'purity':>8} {'secs':>6}"
+    print("=" * 88)
+    header = (f"{'checkpoint':<22} {'K_req':>6} {'K_act':>6} {'EV':>8}"
+              f" {'AUC':>8} {'purity':>8} {'entropy':>8} {'secs':>6}")
     print(header)
-    print("-" * 78)
-    for ck in traj_order:
-        if ck not in results:
+    print("-" * 88)
+    for ckpt_key, ckpt_label in CHECKPOINTS:
+        if ckpt_key not in results:
             continue
-        label = traj_labels.get(ck, ck)
         for K in K_SWEEP:
-            r = results[ck].get(K)
+            r = results[ckpt_key].get(K)
             if r is None:
-                print(f"{label:<22} {K:>6} {'—':>6} {'FAILED':>8}")
+                print(f"{ckpt_label:<22} {K:>6} {'—':>6} {'FAILED':>8}")
                 continue
-            print(f"{label:<22} {K:>6} {r['k_active']:>6} {r['ev']:>8.4f}"
-                  f" {r.get('auc', float('nan')):>8.3f}"
-                  f" {r.get('kind_purity', float('nan')):>8.3f}"
-                  f" {r['seconds']:>6.0f}s")
-    print("=" * 78)
-    print("\nDone.", flush=True)
+            print(
+                f"{ckpt_label:<22} {K:>6} {r['k_active']:>6} {r['ev']:>8.4f}"
+                f" {r.get('auc', float('nan')):>8.3f}"
+                f" {r.get('kind_purity', float('nan')):>8.3f}"
+                f" {r.get('kind_entropy', float('nan')):>8.2f}"
+                f" {r['seconds']:>6.0f}s"
+            )
+    print("=" * 88)
+
+    print("\nNote: stage1-step0 skipped — L25 norm mean=515 vs ~33 for other ckpts (#1113)")
+    print("Done.", flush=True)
 
 
 if __name__ == "__main__":

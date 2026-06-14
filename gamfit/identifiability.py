@@ -334,7 +334,7 @@ def check(
     :class:`IdentifiabilityReport`.
 
     ``fit`` may be an :class:`IdentifiableFactorFitResult` (all three
-    theorems are checked), a :class:`gamfit.recipes.PartialSupervisionFit`
+    theorems are checked), a :class:`gamfit.examples.PartialSupervisionFit`
     (iVAE-aux + random projection only — no decoder is fit), or any object
     duck-typing the attributes ``T_supervised`` / ``T_free`` / ``decoder``
     / ``encoder_state`` / ``mech_sparsity_weight``.
