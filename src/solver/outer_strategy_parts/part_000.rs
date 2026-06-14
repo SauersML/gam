@@ -3083,6 +3083,15 @@ struct OuterFirstOrderBridge<'a> {
     /// noise (a few recoverable probes followed by an accepted step) never
     /// trips this guard.
     consecutive_probe_refusals: usize,
+    /// Whole-stream plateau terminator (#979/#1040). Fed the running minimum of
+    /// every finite cost the bridge evaluates (accepted iterates AND
+    /// line-search probes), it is the last-resort deterministic outer-loop
+    /// termination guarantee: it bounds the silent grind where BFGS has
+    /// accepted ≥ 1 step (so the probe-refusal guard is disarmed) and then
+    /// spins feasible-but-non-improving cost probes — the path that otherwise
+    /// runs to an external hard timeout. See [`PlateauTerminator`] and
+    /// [`OUTER_PLATEAU_TERMINATED_SENTINEL`].
+    plateau_terminator: Option<PlateauTerminator>,
 }
 
 
@@ -3138,6 +3147,50 @@ const PROBE_REFUSAL_FATAL_SENTINEL: &str = "OUTER_PROBE_REFUSAL_FATAL";
 /// this prefix and reclassifies the (otherwise "failed") run as a converged
 /// outer result built from the published best iterate.
 const COST_STALL_CONVERGED_SENTINEL: &str = "OUTER_COST_STALL_CONVERGED";
+
+
+/// Sentinel embedded in the [`ObjectiveEvalError::Fatal`] message the bridge
+/// returns when the whole-stream [`PlateauDetector`] guard fires (#979/#1040).
+///
+/// This is the *last-resort* outer-loop termination guarantee that makes the
+/// survival marginal-slope (and every other BFGS-host) fit unable to run
+/// silently to an external hard timeout (rc=124). [`CostStallGuard`] only
+/// advances on *accepted* outer iterates (`eval_grad`), and the probe-refusal
+/// guard fires only before the first accepted step (`iter_count == 0`). Neither
+/// bounds the pathology where BFGS has accepted at least one step and then
+/// burns its entire budget on *feasible-but-non-improving* line-search cost
+/// probes (`eval_cost`) — each of which runs a full inner P-IRLS solve — never
+/// advancing the accepted-iterate count. That is the silent grind behind the
+/// hard-timeout reports.
+///
+/// The plateau guard watches the running minimum of *every* finite cost
+/// evaluated on this seed — accepted iterates and line-search probes alike — so
+/// it spans the complete eval stream. The running minimum is monotone
+/// non-increasing, so the [`PlateauDetector`] flatness predicate
+/// (relative improvement below [`PLATEAU_DEFAULT_REL_TOL`] for
+/// [`PLATEAU_DEFAULT_WINDOW`] consecutive readings) fires exactly when the
+/// optimizer has stopped making progress — and never on a genuinely-descending
+/// (even if slow) fit, which drives the running minimum down by far more than
+/// 1e-8 relative per accepted step. When it fires the bridge publishes the
+/// best iterate it has seen and returns this sentinel; the seed-loop runner
+/// rebuilds a *valid but non-converged* outer result (`converged = false`)
+/// from it, so the caller always gets a fitted model + honest status, never a
+/// hang.
+const OUTER_PLATEAU_TERMINATED_SENTINEL: &str = "OUTER_PLATEAU_TERMINATED";
+
+
+/// Best iterate captured by the whole-stream plateau guard, handed from the
+/// bridge (moved into `opt::Bfgs`) back to the seed-loop runner via a shared
+/// cell. Carries no gradient norm: the plateau verdict can fire on a
+/// line-search cost probe where only `(ρ, cost)` are known.
+#[derive(Clone)]
+struct PlateauExit {
+    rho: Array1<f64>,
+    value: f64,
+    /// Total finite cost evaluations folded into the plateau detector when it
+    /// fired (reported as `OuterResult.iterations` for diagnostics).
+    evaluations: usize,
+}
 
 
 /// Number of consecutive accepted outer iterates with negligible relative
@@ -3249,6 +3302,179 @@ impl CostStallGuard {
             });
         }
         true
+    }
+}
+
+
+/// Whole-stream stagnation terminator (#979/#1040). Wraps a
+/// [`PlateauDetector`] driven by the running minimum of every finite cost the
+/// bridge evaluates (accepted iterates AND line-search probes), so it provides
+/// the deterministic outer-loop termination guarantee that no per-accepted-step
+/// guard can: a fit that has accepted ≥ 1 step and then grinds the line search
+/// on feasible-but-non-improving probes is still bounded.
+///
+/// The running minimum is monotone non-increasing, so the detector's relative
+/// flatness predicate fires precisely when the optimizer stops reducing the
+/// objective — a genuinely-converging (even if slow) fit keeps dropping the
+/// running minimum by far more than [`PLATEAU_DEFAULT_REL_TOL`] per accepted
+/// step and never trips it. Composes with the gradient-tolerance convergence
+/// (`opt::Bfgs` exits Ok first when KKT-near), the accepted-step
+/// [`CostStallGuard`], the probe-refusal guard, and the iteration cap; it is
+/// the last net under all of them.
+struct PlateauTerminator {
+    detector: crate::solver::loop_guard::PlateauDetector,
+    best_value: f64,
+    best_rho: Option<Array1<f64>>,
+    evaluations: usize,
+    exit: Arc<Mutex<Option<PlateauExit>>>,
+}
+
+
+impl PlateauTerminator {
+    fn new(exit: Arc<Mutex<Option<PlateauExit>>>) -> Self {
+        Self {
+            detector: crate::solver::loop_guard::PlateauDetector::standard(),
+            best_value: f64::INFINITY,
+            best_rho: None,
+            evaluations: 0,
+            exit,
+        }
+    }
+
+    /// Fold one finite cost evaluation `(ρ, cost)` — accepted or line-search
+    /// probe — into the running minimum and the detector. Returns `true` when
+    /// the plateau verdict fires, after publishing the best iterate. Non-finite
+    /// costs are ignored (they are the inner solver's failure, owned by the
+    /// bridge's own error handling) and never advance the detector.
+    fn observe(&mut self, rho: &Array1<f64>, value: f64) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
+        self.evaluations = self.evaluations.saturating_add(1);
+        if value < self.best_value {
+            self.best_value = value;
+            self.best_rho = Some(rho.clone());
+        }
+        // Feed the MONOTONE running minimum, not the raw probe value: a Wolfe
+        // bracket oscillates by construction, so the raw stream would both
+        // false-positive (a flat over-step pair) and false-negative. The
+        // running minimum only flattens when no probe in any direction beats
+        // the incumbent — the true stagnation signal.
+        let verdict = self.detector.note(self.best_value);
+        if verdict != crate::solver::loop_guard::LoopVerdict::Plateaued {
+            return false;
+        }
+        let best_rho = self.best_rho.clone().unwrap_or_else(|| rho.clone());
+        let best_value = if self.best_value.is_finite() {
+            self.best_value
+        } else {
+            value
+        };
+        if let Ok(mut slot) = self.exit.lock() {
+            *slot = Some(PlateauExit {
+                rho: best_rho,
+                value: best_value,
+                evaluations: self.evaluations,
+            });
+        }
+        true
+    }
+}
+
+
+#[cfg(test)]
+mod plateau_terminator_tests {
+    use super::{PlateauExit, PlateauTerminator};
+    use ndarray::array;
+    use std::sync::{Arc, Mutex};
+
+    fn cell() -> Arc<Mutex<Option<PlateauExit>>> {
+        Arc::new(Mutex::new(None))
+    }
+
+    #[test]
+    fn genuine_descent_never_plateaus() {
+        // A real (even if slow) outer descent drives the running minimum down
+        // by far more than the 1e-8 relative floor each step; the terminator
+        // must never fire on it. 30 strictly-decreasing costs is far beyond the
+        // window=3 the detector uses.
+        let exit = cell();
+        let mut term = PlateauTerminator::new(exit.clone());
+        let mut cost = 1.0e3;
+        for _ in 0..30 {
+            cost *= 0.5; // halving each step: ~50% relative improvement
+            assert!(
+                !term.observe(&array![0.0], cost),
+                "halving descent must not be classified as a plateau"
+            );
+        }
+        assert!(exit.lock().unwrap().is_none(), "no exit published on descent");
+    }
+
+    #[test]
+    fn frozen_running_minimum_terminates_with_best_iterate() {
+        // After a real drop the stream freezes (every subsequent probe matches
+        // or exceeds the incumbent): the running minimum flattens and the
+        // terminator must fire within the detector window, publishing the BEST
+        // (lowest-cost) iterate — not the last one probed.
+        let exit = cell();
+        let mut term = PlateauTerminator::new(exit.clone());
+        assert!(!term.observe(&array![1.0], 100.0)); // baseline
+        assert!(!term.observe(&array![2.0], 10.0)); // real drop -> best here
+        // Now grind: probes that never beat 10.0. Running min stays 10.0.
+        let mut fired = false;
+        for k in 0..8 {
+            // oscillating, always >= incumbent, like a stuck Wolfe bracket
+            let probe = 10.0 + (k as f64 % 2.0) * 5.0;
+            if term.observe(&array![3.0 + k as f64], probe) {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "frozen running minimum must trigger a plateau verdict");
+        let published = exit.lock().unwrap().clone().expect("best iterate published");
+        assert_eq!(published.value, 10.0, "publishes the best (lowest) cost");
+        assert_eq!(
+            published.rho,
+            array![2.0],
+            "publishes the rho of the best iterate, not the last probe"
+        );
+        assert!(
+            published.evaluations >= 3,
+            "evaluation count spans the whole stream"
+        );
+    }
+
+    #[test]
+    fn nonfinite_costs_are_ignored() {
+        // A non-finite cost is the inner solver's failure, owned elsewhere; it
+        // must neither advance the detector nor count as an evaluation.
+        let exit = cell();
+        let mut term = PlateauTerminator::new(exit);
+        assert!(!term.observe(&array![0.0], f64::NAN));
+        assert!(!term.observe(&array![0.0], f64::INFINITY));
+        assert_eq!(term.evaluations, 0, "non-finite costs do not count");
+    }
+
+    #[test]
+    fn bounded_evaluation_count_guarantees_termination() {
+        // The core #979/#1040 guarantee: a flat stream CANNOT run unbounded.
+        // Once the running minimum is frozen, the terminator fires in O(window)
+        // evaluations — a deterministic bound, never a wall-clock timeout.
+        let exit = cell();
+        let mut term = PlateauTerminator::new(exit);
+        assert!(!term.observe(&array![0.0], 42.0)); // baseline establishes incumbent
+        let mut evals_until_fire = 0usize;
+        for _ in 0..1000 {
+            evals_until_fire += 1;
+            if term.observe(&array![0.0], 42.0) {
+                break;
+            }
+        }
+        assert!(
+            evals_until_fire <= 8,
+            "frozen stream must terminate within a small bounded count, got {evals_until_fire}"
+        );
     }
 }
 
@@ -3443,6 +3669,29 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                     trial_rho_distance,
                     self.iter_count
                 );
+                // Whole-stream plateau termination (#979/#1040). Fold the
+                // line-search cost probe into the running-minimum detector.
+                // This is the call that bounds the silent grind: a BFGS run that
+                // has accepted ≥ 1 step then spins feasible-but-non-improving
+                // probes never advances `eval_grad`, so without this the loop is
+                // bounded by nothing but the external timeout. When the running
+                // minimum plateaus, escalate to Fatal with the sentinel; the
+                // seed-loop runner rebuilds the published best iterate as a
+                // valid non-converged result.
+                if let Some(term) = self.plateau_terminator.as_mut()
+                    && term.observe(x, *cost)
+                {
+                    log::warn!(
+                        "[OUTER] plateau termination: running-minimum REML cost stopped \
+                         improving over the detector window on a line-search probe; halting \
+                         BFGS and returning best-so-far instead of grinding to a hard timeout \
+                         (first-order bridge, iter={})",
+                        self.iter_count,
+                    );
+                    return Err(ObjectiveEvalError::Fatal {
+                        message: OUTER_PLATEAU_TERMINATED_SENTINEL.to_string(),
+                    });
+                }
             }
             Err(ObjectiveEvalError::Recoverable { .. }) => {
                 log::info!(
@@ -3626,6 +3875,25 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             );
             return Err(ObjectiveEvalError::Fatal {
                 message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+            });
+        }
+        // Whole-stream plateau termination (#979/#1040). Fold the accepted
+        // iterate into the SAME running-minimum detector the line-search probes
+        // feed, so the guard spans the complete eval stream. Ordered AFTER the
+        // #1089 cost-stall *convergence* check so a true flat-valley convergence
+        // is reported as converged; this guard is the non-converged last net
+        // when even the running minimum freezes without a convergence verdict.
+        if let Some(term) = self.plateau_terminator.as_mut()
+            && term.observe(x, eval.cost)
+        {
+            log::warn!(
+                "[OUTER] plateau termination: running-minimum REML cost stopped improving over \
+                 the detector window at an accepted iterate; halting BFGS and returning \
+                 best-so-far instead of grinding to a hard timeout (first-order bridge, iter={})",
+                self.iter_count,
+            );
+            return Err(ObjectiveEvalError::Fatal {
+                message: OUTER_PLATEAU_TERMINATED_SENTINEL.to_string(),
             });
         }
         Ok(FirstOrderSample {

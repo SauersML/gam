@@ -1186,6 +1186,15 @@ fn run_outer_with_plan(
                     let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
                         Arc::new(Mutex::new(None));
                     let cost_stall_rel_tol = (config.tolerance * 1.0e-2).max(f64::EPSILON);
+                    // Whole-stream plateau termination shared cell (#979/#1040).
+                    // The last-resort guarantee the survival marginal-slope path
+                    // can never run silent to a hard timeout: when the running
+                    // minimum of every finite cost (accepted iterate OR
+                    // line-search probe) stops improving by 1e-8 relative over a
+                    // 3-reading window, the bridge publishes the best iterate
+                    // here and the runner rebuilds a valid non-converged result.
+                    let plateau_exit: Arc<Mutex<Option<PlateauExit>>> =
+                        Arc::new(Mutex::new(None));
                     let objective = OuterFirstOrderBridge {
                         obj,
                         layout,
@@ -1201,6 +1210,7 @@ fn run_outer_with_plan(
                             cost_stall_exit.clone(),
                         )),
                         consecutive_probe_refusals: 0,
+                        plateau_terminator: Some(PlateauTerminator::new(plateau_exit.clone())),
                     };
                     // Hand the precomputed (cost, gradient) seed eval to
                     // `opt::Bfgs` so its first internal `eval_grad` call is
@@ -1330,6 +1340,49 @@ fn run_outer_with_plan(
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
                                     "BFGS cost-stall sentinel fired without a published best \
                                      iterate ({context})"
+                                ))),
+                            }
+                        }
+                        Err(BfgsError::ObjectiveFailed { message })
+                            if message.starts_with(OUTER_PLATEAU_TERMINATED_SENTINEL) =>
+                        {
+                            // Whole-stream plateau terminator (#979/#1040): the
+                            // running minimum of every finite cost stopped
+                            // improving over the detector window, so BFGS was
+                            // grinding the line search with no progress (the
+                            // silent hard-timeout path). Rebuild a VALID but
+                            // NON-converged outer result from the published best
+                            // iterate: the caller gets a fitted model + honest
+                            // status, never a hang. converged=false because the
+                            // gradient test was not met — distinct from the
+                            // #1089 cost-stall *convergence* exit.
+                            let exit = plateau_exit
+                                .lock()
+                                .ok()
+                                .and_then(|mut slot| slot.take());
+                            match exit {
+                                Some(exit) => {
+                                    log::warn!(
+                                        "[OUTER warning] {context}: plateau terminator fired \
+                                         after {} finite cost evaluations with no improvement in \
+                                         the running minimum; returning best-so-far \
+                                         (value={:.6e}, converged=false) instead of grinding to a \
+                                         hard timeout",
+                                        exit.evaluations,
+                                        exit.value,
+                                    );
+                                    Ok(outer_result_with_gradient_norm(
+                                        exit.rho,
+                                        exit.value,
+                                        exit.evaluations,
+                                        None,
+                                        false,
+                                        *the_plan,
+                                    ))
+                                }
+                                None => Err(EstimationError::RemlOptimizationFailed(format!(
+                                    "BFGS plateau terminator sentinel fired without a published \
+                                     best iterate ({context})"
                                 ))),
                             }
                         }
@@ -2738,6 +2791,7 @@ mod tests {
             value_probe_cache: Vec::new(),
             cost_stall: None,
             consecutive_probe_refusals: 0,
+            plateau_terminator: None,
         };
 
         let first = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
