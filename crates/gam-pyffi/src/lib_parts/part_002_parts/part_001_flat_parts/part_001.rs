@@ -4928,6 +4928,13 @@ fn build_standard_payload(
     let jackknife_plus_stats = gaussian_jackknife_plus_stats_for_standard_fit(
         &formula, dataset, fit_config, &family, &saved_fit, design,
     );
+    // #1098 MAGIC: precompute the EXACT Gaussian-identity full-conformal
+    // substrate (distribution-free finite-sample set, no held-out fold) under
+    // the same eligibility as jackknife+. Computed here while `formula`/`family`/
+    // `saved_fit` are still owned — the payload constructor moves them below.
+    let full_conformal_substrate = exact_full_conformal_substrate_for_standard_fit(
+        &formula, dataset, fit_config, &family, &saved_fit, design,
+    );
     let mut payload = FittedModelPayload::new(
         MODEL_PAYLOAD_VERSION,
         formula,
@@ -4953,12 +4960,7 @@ fn build_standard_payload(
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
     payload.gaussian_jackknife_plus = jackknife_plus_stats;
-    // #1098 MAGIC: precompute the EXACT Gaussian-identity full-conformal
-    // substrate (distribution-free finite-sample set, no held-out fold) under
-    // the same eligibility as jackknife+. `None` for any ineligible model.
-    payload.full_conformal = exact_full_conformal_substrate_for_standard_fit(
-        &formula, dataset, fit_config, &family, &saved_fit, design,
-    );
+    payload.full_conformal = full_conformal_substrate;
     Ok(payload)
 }
 
