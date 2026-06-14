@@ -1,0 +1,91 @@
+# Mechanical file-splitting debt ledger (build.rs: scan_for_mechanical_part_files).
+#
+# Mechanical `part_<NNN>.rs` files and `*_parts/` / `split_parts/` directories are BANNED.
+# Splitting a module by line-count into part_000.rs, part_001.rs, ... is worse than one
+# big file: it destroys the logical boundaries that make code navigable. Split by COHESIVE
+# CONCERN into descriptively-named modules instead (e.g. seed_cascade.rs, continuation.rs).
+#
+# This file grandfathers the EXISTING offenders so the ban can land without bricking the
+# build. It is a RATCHET: it may only SHRINK. When you restructure a module into logical
+# files, delete its part_*.rs entries here. Adding ANY new entry is forbidden — the whole
+# point is to drive this list to zero. New mechanical part-files not listed here fail the build.
+#
+# One repo-relative path per line.
+src/families/bms/workspace_parts/part_000.rs
+src/families/bms/workspace_parts/part_001_impl_parts/part_000.rs
+src/families/bms/workspace_parts/part_001_impl_parts/part_001.rs
+src/families/bms/workspace_parts/part_001.rs
+src/families/bms/workspace_parts/part_002.rs
+src/families/custom_family/split_parts/part_000.rs
+src/families/custom_family/split_parts/part_001.rs
+src/families/custom_family/split_parts/part_002.rs
+src/families/custom_family/split_parts/part_003.rs
+src/families/custom_family/split_parts/part_004.rs
+src/families/custom_family/split_parts/part_005.rs
+src/families/gamlss/part_000.rs
+src/families/gamlss/part_001.rs
+src/families/gamlss/part_002.rs
+src/families/gamlss/part_003.rs
+src/families/gamlss/part_004.rs
+src/families/gamlss/part_005.rs
+src/families/gamlss/part_006.rs
+src/families/gamlss/part_007.rs
+src/families/gamlss/part_008.rs
+src/families/gamlss/part_009.rs
+src/families/gamlss/part_010.rs
+src/families/gamlss/part_011.rs
+src/families/survival_location_scale/split_parts/part_000.rs
+src/families/survival_location_scale/split_parts/part_001.rs
+src/families/survival_location_scale/split_parts/part_002.rs
+src/families/survival_location_scale/split_parts/part_003.rs
+src/families/survival_marginal_slope/split_parts/part_000.rs
+src/families/survival_marginal_slope/split_parts/part_001.rs
+src/families/survival_marginal_slope/split_parts/part_002.rs
+src/families/survival_marginal_slope/split_parts/part_003.rs
+src/families/survival_marginal_slope/split_parts/part_004.rs
+src/families/survival_marginal_slope/split_parts/part_005.rs
+src/families/transformation_normal/part_000.rs
+src/families/transformation_normal/part_001.rs
+src/families/transformation_normal/part_002.rs
+src/main_parts/part_000.rs
+src/main_parts/part_001.rs
+src/solver/arrow_schur_parts/part_000.rs
+src/solver/arrow_schur_parts/part_001.rs
+src/solver/estimate_parts/part_000.rs
+src/solver/outer_strategy_parts/part_000.rs
+src/solver/outer_strategy_parts/part_001.rs
+src/solver/pirls/split_parts/part_000.rs
+src/solver/pirls/split_parts/part_001.rs
+src/solver/pirls/split_parts/part_002.rs
+src/solver/reml/runtime_parts/part_000.rs
+src/solver/reml/runtime_parts/part_001.rs
+src/solver/reml/runtime_parts/part_002.rs
+src/solver/reml/unified/part_000.rs
+src/solver/reml/unified/part_001.rs
+src/solver/reml/unified/part_002.rs
+src/solver/reml/unified/part_003.rs
+src/solver/reml/unified/part_004.rs
+src/solver/reml/unified/part_005.rs
+src/solver/reml/unified/part_006.rs
+src/solver/workflow/part_000.rs
+src/solver/workflow/part_001.rs
+src/solver/workflow/part_002.rs
+src/terms/analytic_penalties_parts/part_000.rs
+src/terms/analytic_penalties_parts/part_001.rs
+src/terms/basis/split_parts/part_000.rs
+src/terms/basis/split_parts/part_001.rs
+src/terms/basis/split_parts/part_002.rs
+src/terms/basis/split_parts/part_003.rs
+src/terms/basis/split_parts/part_004.rs
+src/terms/basis/split_parts/part_005.rs
+src/terms/sae_manifold/part_000.rs
+src/terms/sae_manifold/part_001_impl_parts/part_000.rs
+src/terms/sae_manifold/part_001_impl_parts/part_001.rs
+src/terms/sae_manifold/part_001.rs
+src/terms/sae_manifold/part_002.rs
+src/terms/sae_manifold/part_003.rs
+src/terms/smooth/part_000.rs
+src/terms/smooth/part_001.rs
+src/terms/smooth/part_002.rs
+src/terms/smooth/part_003.rs
+src/terms/smooth/part_004.rs
