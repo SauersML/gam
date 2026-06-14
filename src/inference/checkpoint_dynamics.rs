@@ -437,8 +437,8 @@ fn no_change_log_e_value(theta_hat: f64, se: f64) -> Result<f64, String> {
         return Ok(0.0);
     }
     let z = (theta_hat / se).abs();
-    let normal = Normal::new(0.0, 1.0)
-        .map_err(|e| format!("standard normal construction failed: {e}"))?;
+    let normal =
+        Normal::new(0.0, 1.0).map_err(|e| format!("standard normal construction failed: {e}"))?;
     // Two-sided p-value of the studentized displacement; clamp to (0, 1] so the
     // calibrator (which rejects p = 0) sees a finite, valid argument even at a
     // numerically saturated tail.
@@ -455,12 +455,7 @@ mod tests {
     /// constant across checkpoints (no change) and atom 1's curve at the central
     /// (mode) node is displaced by a known amount `shift` in component 0 between
     /// consecutive checkpoints (a steady drift).
-    fn drift_grid(
-        n_ckpt: usize,
-        n_grid: usize,
-        ambient: usize,
-        shift: f64,
-    ) -> Array4<f64> {
+    fn drift_grid(n_ckpt: usize, n_grid: usize, ambient: usize, shift: f64) -> Array4<f64> {
         let mode = n_grid / 2;
         let mut grid = Array4::<f64>::zeros((n_ckpt, 2, n_grid, ambient));
         for c in 0..n_ckpt {
@@ -574,7 +569,10 @@ mod tests {
         assert!(
             total_log_e > 0.0,
             "steady real drift must accumulate positive change evidence, entries: {:?}",
-            cert.entries.iter().map(|e| (e.log_e, e.confirmed)).collect::<Vec<_>>()
+            cert.entries
+                .iter()
+                .map(|e| (e.log_e, e.confirmed))
+                .collect::<Vec<_>>()
         );
     }
 
