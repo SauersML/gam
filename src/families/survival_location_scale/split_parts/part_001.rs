@@ -6331,6 +6331,99 @@ fn pin_reduced_time_warp_slope(
 }
 
 
+/// Build the reduced time block for the canonical σ-scaled log-t AFT gauge
+/// (issue #892): the time warp is REMOVED entirely (`h ≡ 0`, zero free columns,
+/// no penalties, no monotonicity constraint) and the `log t` baseline is carried
+/// as a per-row LOCATION offset on the σ-scaled `q` channel
+/// (`location_log_time_offset = true`). This is the clean parametric-AFT
+/// representation `u = (log t − μ)/σ` that `survreg`/`lifelines` fit: it has no
+/// free time coefficient (so no `1e7` cold-start gradient, no ill-conditioned
+/// time curvature), no derivative-guard inequality (so the joint Newton step is
+/// never frozen by a binding time row), and no time-warp constant aliased with
+/// the threshold intercept.
+fn location_logt_offset_time_block(
+    design_entry: &Array2<f64>,
+    design_exit: &Array2<f64>,
+    design_derivative_exit: &Array2<f64>,
+    p: usize,
+) -> TimeBlockPrepared {
+    TimeBlockPrepared {
+        design_entry: Array2::<f64>::zeros((design_entry.nrows(), 0)),
+        design_exit: Array2::<f64>::zeros((design_exit.nrows(), 0)),
+        design_derivative_exit: Array2::<f64>::zeros((design_derivative_exit.nrows(), 0)),
+        coefficient_lower_bounds: None,
+        // No free time coefficients → no derivative-guard constraint. The warp
+        // derivative is `h′ ≡ 0`; monotonicity holds because the q channel
+        // contributes `qdot = inv_sigma/t > 0` to `g`.
+        linear_constraints: None,
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_beta: Some(Array1::<f64>::zeros(0)),
+        transform: TimeIdentifiabilityTransform {
+            z: Array2::<f64>::zeros((p, 0)),
+            affine_shift: Array1::zeros(p),
+        },
+        offset_entry: Array1::zeros(design_entry.nrows()),
+        offset_exit: Array1::zeros(design_exit.nrows()),
+        derivative_offset_exit: Array1::zeros(design_derivative_exit.nrows()),
+        pinned_free_row_constant: false,
+        location_log_time_offset: true,
+    }
+}
+
+
+/// Does the time-penalty null space `z` (raw `p` × reduced `r`) genuinely carry
+/// the `log t` AFT baseline, so collapsing the whole warp to the σ-scaled log-t
+/// LOCATION offset (`location_logt_offset_time_block`) is an EXACT
+/// reparameterisation of a parametric constant-scale AFT?
+///
+/// The rank-1 gauge (`rank1_reduced_time_warp_applies`) answers this for the
+/// single-column null space by checking that direction's image has a usable
+/// data-scale log-t slope. This generalises it to any rank: least-squares
+/// project `log t` onto the null-space warp image `G = design_exit · z` and ask
+/// whether the best-fitting null direction `z · c` has a usable log-t slope. When
+/// it does, `{log t}` lies in the span the warp would otherwise fit freely, so
+/// the higher null directions are spurious parametric-AFT flexibility and the
+/// log-t offset captures the baseline exactly. A degenerate or non-log-t basis
+/// fails the check and the caller keeps the (constrained) free-warp fallback.
+fn reduced_warp_logt_baseline_usable(
+    z: &Array2<f64>,
+    design_exit: &Array2<f64>,
+    log_time_exit: ndarray::ArrayView1<f64>,
+) -> bool {
+    use crate::faer_ndarray::FaerCholesky;
+    let n = design_exit.nrows();
+    let r = z.ncols();
+    if n == 0 || r == 0 || log_time_exit.len() != n {
+        return false;
+    }
+    let g = design_exit.dot(z); // (n, r) warp images of the null directions
+    let gtg = g.t().dot(&g); // (r, r)
+    let gtl = g.t().dot(&log_time_exit); // (r,)
+    // Tiny Levenberg ridge so a rank-deficient G (some null directions producing
+    // a (near-)zero warp image) still yields a well-posed projection rather than
+    // a Cholesky failure that would spuriously reject the collapse.
+    let scale = gtg
+        .diag()
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+        .max(1.0);
+    let mut ridged = gtg;
+    for i in 0..r {
+        ridged[[i, i]] += 1e-10 * scale;
+    }
+    let Ok(chol) = ridged.cholesky(faer::Side::Lower) else {
+        return false;
+    };
+    let c = chol.solvevec(&gtl);
+    if c.iter().any(|v| !v.is_finite()) {
+        return false;
+    }
+    let direction = z.dot(&c);
+    unit_log_time_slope(design_exit, &direction, log_time_exit).is_some()
+}
+
+
 fn prepare_identified_time_block(
     input: &TimeBlockInput,
     derivative_guard: f64,
@@ -6419,37 +6512,12 @@ fn prepare_identified_time_block(
             // block is empty (no free columns, no penalties, no constraints); all
             // the σ-coupling rides the existing `q`-derivative/Hessian stack, with
             // no new time×log_sigma cross-terms.
-            let empty_entry = Array2::<f64>::zeros((design_entry.nrows(), 0));
-            let empty_exit = Array2::<f64>::zeros((design_exit.nrows(), 0));
-            let empty_derivative = Array2::<f64>::zeros((design_derivative_exit.nrows(), 0));
-            return Ok(TimeBlockPrepared {
-                design_entry: empty_entry,
-                design_exit: empty_exit,
-                design_derivative_exit: empty_derivative,
-                coefficient_lower_bounds: None,
-                // No free time coefficients → no derivative-guard constraint. The
-                // warp derivative is `h′ ≡ 0`; monotonicity holds because the q
-                // channel contributes `qdot = inv_sigma/t > 0` to `g`.
-                linear_constraints: None,
-                penalties: Vec::new(),
-                nullspace_dims: Vec::new(),
-                // Empty free block: cold-start β is the zero-length vector.
-                initial_beta: Some(Array1::<f64>::zeros(0)),
-                transform: TimeIdentifiabilityTransform {
-                    z: Array2::<f64>::zeros((p, 0)),
-                    affine_shift: Array1::zeros(p),
-                },
-                // Time block contributes nothing to `u`: zero value offsets (so
-                // `h ≡ 0`) and a zero derivative offset (so `h′ ≡ 0`). The log-t
-                // baseline lives entirely on the location channel.
-                offset_entry: Array1::zeros(design_entry.nrows()),
-                offset_exit: Array1::zeros(design_exit.nrows()),
-                derivative_offset_exit: Array1::zeros(design_derivative_exit.nrows()),
-                // No free time column → threshold keeps its intercept.
-                pinned_free_row_constant: false,
-                // Apply the σ-scaled log-t baseline on the location channel.
-                location_log_time_offset: true,
-            });
+            return Ok(location_logt_offset_time_block(
+                &design_entry,
+                &design_exit,
+                &design_derivative_exit,
+                p,
+            ));
         }
         // RANK-2 case (2nd-difference penalty `{1, log t}`): kept for correctness
         // where it occurs (golden unit test), though real fits use rank-1 above.
@@ -6521,6 +6589,34 @@ fn prepare_identified_time_block(
                 // Rank-2 path keeps a free warp; no location-channel log-t offset.
                 location_log_time_offset: false,
             });
+        }
+        // GENERAL case (r ≥ 3, or r ∈ {1,2} where the clean rank-1 / rank-2 pin
+        // gauges did not match): for a fully PARAMETRIC constant-scale AFT the
+        // baseline transform is exactly `log t`, so the I-spline null space's
+        // higher affine directions are spurious flexibility. When the null space
+        // genuinely carries the `log t` baseline, collapse the ENTIRE warp to the
+        // canonical σ-scaled log-t LOCATION offset — the same clean representation
+        // the rank-1 gauge uses — instead of keeping a free monotone warp with a
+        // derivative-guard inequality.
+        //
+        // The prior free-warp fallback (kept below as a last resort) made the
+        // reduced time block carry `r` free columns AND a per-row monotonicity
+        // constraint. For this regime that cold-started (β = 0) at a degenerate
+        // warp with a ~1e7 gradient and a derivative-guard row active at the
+        // boundary; the direct-MLE joint Newton's single global step length was
+        // then capped to 0 by that one binding time row, FREEZING every block —
+        // including the fully unconstrained location covariate — at its cold-start
+        // 0 (gam#1110: log-logistic AFT `age` pinned to exactly 0, RMSE 0.267 vs
+        // lifelines 0.024). Collapsing to the log-t offset removes the free warp,
+        // the constraint, and the ill-conditioning together, recovering the clean
+        // survreg/lifelines-style parametric AFT MLE.
+        if reduced_warp_logt_baseline_usable(&z, &design_exit, log_time_exit) {
+            return Ok(location_logt_offset_time_block(
+                &design_entry,
+                &design_exit,
+                &design_derivative_exit,
+                p,
+            ));
         }
         let reduced_entry = design_entry.dot(&z);
         let reduced_exit = design_exit.dot(&z);

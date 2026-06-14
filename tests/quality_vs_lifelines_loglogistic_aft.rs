@@ -41,7 +41,7 @@
 
 use csv::StringRecord;
 use gam::families::survival_construction::{
-    SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
+    SURVIVAL_TIME_FLOOR, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, evaluate_survival_time_basis_row,
     resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
@@ -508,6 +508,26 @@ fn gam_grid_survival(
     .expect("rebuild log-sigma design at grid ages")
     .design;
 
+    // Reduced parametric-AFT representation (#892 / gam#1110): when the constant-
+    // scale affine baseline collapses to the canonical σ-scaled log-t gauge, the
+    // time warp is removed (`beta_time ≡ 0`, `h ≡ 0`) and the `log t` baseline
+    // rides the LOCATION channel — exactly as the production sampling predictor
+    // reconstructs it (`predict_survival_location_scale_batch`: it detects the
+    // regime from `beta_time` being all-zero with no baseline time-wiggle and
+    // shifts `eta_threshold_offset → eta_threshold_offset − log t` so the
+    // standardized residual is `u = inv_sigma·(log t − eta_t)`). Mirror that exact
+    // detection + shift here so this manual reconstruction reproduces the model's
+    // actual S(t|age) for BOTH representations: a genuine free time warp (non-zero
+    // `beta_time` → no shift) and the collapsed parametric AFT (zero `beta_time` →
+    // log-t location shift). Without it the collapsed baseline would be dropped and
+    // S(t|age) would be flat in t.
+    let reduced_parametric_aft = fit.fit.fit.beta_time().iter().all(|&b| b == 0.0);
+    let eta_threshold_offset = if reduced_parametric_aft {
+        grid_time.mapv(|t| -(t.max(SURVIVAL_TIME_FLOOR).ln()))
+    } else {
+        Array1::<f64>::zeros(grid_n)
+    };
+
     let input = SurvivalLocationScalePredictInput {
         x_time_exit,
         eta_time_offset_exit,
@@ -515,7 +535,7 @@ fn gam_grid_survival(
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         x_threshold,
-        eta_threshold_offset: Array1::<f64>::zeros(grid_n),
+        eta_threshold_offset,
         x_log_sigma,
         eta_log_sigma_offset: Array1::<f64>::zeros(grid_n),
         x_link_wiggle: None,
