@@ -418,7 +418,15 @@ pub(crate) fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodS
         // metadata, falling back to a unit dispersion only if the fit recorded
         // none.
         ResponseFamily::Tweedie { .. } => fit.likelihood_scale.fixed_phi().or(Some(1.0)),
-        ResponseFamily::NegativeBinomial { theta, .. } => Some(theta),
+        // The NB overdispersion θ is estimated jointly with the mean and stored
+        // in the fit's scale metadata (`EstimatedNegBinTheta`); the θ on the
+        // family spec is only the construction seed (1.0). Reading the seed was
+        // the NB sibling of the Beta #770 / Tweedie #771 bug (#1124): generate
+        // drew Var = μ + μ² instead of μ + μ²/θ̂. Consult the fitted dispersion,
+        // falling back to the seed only when the fit recorded none.
+        ResponseFamily::NegativeBinomial { theta, .. } => {
+            fit.likelihood_scale.negbin_theta().or(Some(theta))
+        }
         // Beta precision φ is estimated jointly with the mean (issue #567), so
         // the authoritative value is the fit's scale metadata, not the seed φ on
         // the original family spec. Fall back to the spec φ only if the fit did
