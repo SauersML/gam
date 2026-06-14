@@ -2542,13 +2542,38 @@ fn factor_spectral_deflated_evidence_row(
     // (every non-positive/non-finite one, plus any positive one that has
     // dropped below the hysteresis floor) with unit stiffness `+1` and keeping
     // the genuine positive spectrum untouched.
+    //
+    // PD GUARANTEE (#1118). This function is reached ONLY after the genuine
+    // undamped Cholesky has already REFUSED the block (`factor_one_row_result`
+    // Err arm), so we are committed to delivering a PD factor — declining here
+    // surfaces the hard "non-PD per-row H_tt" refusal that kills the whole K>1
+    // fit. The previous code declined in two silent ways that violated that
+    // contract on a barely-(non)-PD knife-edge: (1) `deflated_count == 0`, when
+    // the symmetric `eigh` rounds the offending direction to a tiny-POSITIVE
+    // eigenvalue just above `deflate_floor` while the unrolled scalar Cholesky
+    // underflowed its pivot to `≤ 0`; and (2) the reconstruction's own Cholesky
+    // failing because a kept eigenvalue was positive but `≪ floor`, so the
+    // assembled `Σ λ v vᵀ` was numerically indefinite. Both routed a genuinely
+    // non-PD block to the hard refusal even though a valid quotient factor
+    // exists. We instead FLOOR every reconstructed eigenvalue to a strictly
+    // positive `floor`: a direction at or below the hysteresis edge is deflated
+    // to unit stiffness `+1` (the ρ-independent `log 1 = 0` quotient convention),
+    // and any other near-floor positive direction is clamped UP to `floor` so
+    // the assembled block is PD by construction and the Cholesky cannot fail.
+    // The genuine, well-separated positive spectrum (`λ ≫ floor`) is untouched,
+    // so every block the old path already conditioned is bit-for-bit unchanged.
     let mut conditioned = Array2::<f64>::zeros((d, d));
     let mut deflated_count = 0usize;
     for eig_idx in 0..evals.len() {
         let lambda = evals[eig_idx];
         let lambda_tilde = if lambda.is_finite() && lambda > deflate_floor {
-            lambda
+            // Genuine positive direction: keep it, but clamp UP to the positive
+            // `floor` so a tiny-but-kept eigenvalue cannot make the reconstructed
+            // block numerically non-PD (it never lowers a healthy `λ ≫ floor`).
+            lambda.max(floor)
         } else {
+            // Null / indefinite / numerically-flat quotient direction: unit
+            // stiffness `+1`, contributing `log 1 = 0` to the evidence log-det.
             deflated_count += 1;
             1.0
         };
@@ -2560,16 +2585,117 @@ fn factor_spectral_deflated_evidence_row(
         }
     }
     if deflated_count == 0 {
-        // Nothing was flat/indefinite: this block should have factored at the
-        // base ridge. Decline so the caller keeps the exact-Cholesky path
-        // rather than silently re-deriving a (bit-different) reconstruction.
-        return None;
+        // The hysteresis band kept every direction (the offending eigenvalue
+        // rounded just above `deflate_floor`), yet the genuine Cholesky still
+        // refused the block — a barely-non-PD knife-edge. We are on the refused
+        // path, so we must not decline: deflate the single smallest-eigenvalue
+        // direction to unit stiffness, which removes the marginal pivot while
+        // leaving the rest of the (now positive-floored) spectrum exact.
+        let mut min_idx = 0usize;
+        let mut min_lambda = f64::INFINITY;
+        for eig_idx in 0..evals.len() {
+            let lambda = evals[eig_idx];
+            if lambda < min_lambda {
+                min_lambda = lambda;
+                min_idx = eig_idx;
+            }
+        }
+        // Subtract the kept (floored) contribution of `min_idx` and add unit
+        // stiffness in its place: `conditioned += (1 − λ̃_min) v_min v_minᵀ`.
+        let kept = min_lambda.max(floor);
+        let delta = 1.0 - kept;
+        for i in 0..d {
+            let vi = evecs[[i, min_idx]];
+            for j in 0..d {
+                conditioned[[i, j]] += delta * vi * evecs[[j, min_idx]];
+            }
+        }
+        deflated_count = 1;
     }
     let factor = cholesky_lower(&conditioned).ok()?;
     Some(ArrowRowFactorResult {
         factor,
         gauge_deflated_directions: deflated_count,
     })
+}
+
+
+/// Unit-stiffness **spectral** Faddeev-Popov conditioning of the dense REDUCED
+/// SCHUR complement `S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`
+/// for an evidence/log-det-only solve whose plain Cholesky refused `S` because
+/// it is genuinely indefinite or numerically flat (#1118, the β-block analogue
+/// of [`factor_spectral_deflated_evidence_row`]).
+///
+/// On a rank-deficient multi-atom dictionary (the OLMo K>1 capstone: several
+/// circle atoms whose 5-column decoder design is rank 3/5 on near-degenerate
+/// PCA geometry) the per-row `H_tt^(i)` blocks are unit-stiffness deflated to
+/// stay PD, but the Schur subtraction `Σ H_tβᵀ H_tt⁻¹ H_tβ` then accumulates in
+/// finite precision and can drive a pivot of the reduced β complement NEGATIVE
+/// off the inner optimum — so the evidence Cholesky hits a non-PD pivot (the
+/// reported `-0.064 at index 256`) even though every row block factored.
+///
+/// Like the per-row version this DISCOVERS the offending directions from `S`'s
+/// own symmetric eigendecomposition and replaces every eigenvalue at or below
+/// the relative floor (this INCLUDES every negative eigenvalue) by exactly `+1`
+/// while preserving its eigenvector, then clamps every kept eigenvalue UP to the
+/// positive floor so the reconstruction is PD by construction and its Cholesky
+/// cannot fail. The unit stiffness contributes a ρ-INDEPENDENT `log 1 = 0` to
+/// `log|S|` — the quotient pseudo-determinant convention shared with the gauge
+/// (#1037), per-row spectral (#1118), and data-null (#1117) deflations — so the
+/// evidence VALUE stays consistent with the analytic ρ-gradient and the outer
+/// REML line-search does not desync (a `+ridge·I` fallback would inject a
+/// ρ-dependent `½·log|I + ridge·S⁻¹|` bias). This is reached ONLY after the
+/// genuine Cholesky already refused `S` and ONLY for evidence/log-det callers
+/// (`tolerate_ill_conditioning`), so every PD Schur complement is bit-for-bit
+/// unchanged. Returns `None` only when `S` is non-finite or the
+/// eigendecomposition fails (the caller then surfaces the hard refusal).
+fn factor_spectral_deflated_evidence_dense(schur: &Array2<f64>) -> Option<Array2<f64>> {
+    let d = schur.nrows();
+    if d == 0 || schur.ncols() != d {
+        return None;
+    }
+    let mut sym = Array2::<f64>::zeros((d, d));
+    for i in 0..d {
+        for j in 0..d {
+            let v = 0.5 * (schur[[i, j]] + schur[[j, i]]);
+            if !v.is_finite() {
+                return None;
+            }
+            sym[[i, j]] = v;
+        }
+    }
+    let (evals, evecs) = sym.eigh(Side::Lower).ok()?;
+    let max_abs = evals.iter().fold(0.0_f64, |acc, &v| {
+        if v.is_finite() {
+            acc.max(v.abs())
+        } else {
+            acc
+        }
+    });
+    if !(max_abs.is_finite() && max_abs > 0.0) {
+        return None;
+    }
+    let floor = SPECTRAL_DEFLATION_REL_FLOOR * max_abs;
+    let deflate_floor = floor * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
+    // Reconstruct `Σ_i λ̃_i v_i v_iᵀ`: deflate non-positive / sub-floor
+    // directions to unit stiffness `+1`, clamp every kept direction UP to the
+    // positive `floor` so the assembled complement is PD by construction.
+    let mut conditioned = Array2::<f64>::zeros((d, d));
+    for eig_idx in 0..evals.len() {
+        let lambda = evals[eig_idx];
+        let lambda_tilde = if lambda.is_finite() && lambda > deflate_floor {
+            lambda.max(floor)
+        } else {
+            1.0
+        };
+        for i in 0..d {
+            let vi = evecs[[i, eig_idx]];
+            for j in 0..d {
+                conditioned[[i, j]] += lambda_tilde * vi * evecs[[j, eig_idx]];
+            }
+        }
+    }
+    cholesky_lower(&conditioned).ok()
 }
 
 

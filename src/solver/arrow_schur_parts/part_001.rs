@@ -337,8 +337,33 @@ fn solve_dense_reduced_system(
     options: &ArrowSolveOptions,
     metric_weights: Option<&MetricWeights>,
 ) -> Result<(Array1<f64>, Option<Array2<f64>>, PcgDiagnostics), ArrowSchurError> {
-    let factor =
-        cholesky_lower(schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
+    let factor = match cholesky_lower(schur) {
+        Ok(factor) => factor,
+        Err(e) => {
+            // Evidence/log-det-only callers must not die on a genuinely non-PD
+            // reduced Schur complement (#1118 β-block analogue). On a
+            // rank-deficient multi-atom dictionary the per-row H_tt blocks are
+            // unit-stiffness deflated to stay PD, but the Schur subtraction
+            // `Σ H_tβᵀ H_tt⁻¹ H_tβ` can still drive a β-complement pivot negative
+            // off the inner optimum (the reported `-0.064 at index 256` on the
+            // OLMo K=8 capstone). Condition the offending eigen-directions to
+            // unit stiffness exactly as the per-row evidence path does: the
+            // deflated directions contribute a ρ-independent `log 1 = 0` to
+            // `log|S|`, so the evidence value stays consistent with the analytic
+            // ρ-gradient and the EV≥0 / finite-normaliser guarantee is preserved.
+            // The discarded Δβ is solved against the conditioned factor (harmless
+            // — evidence mode ignores it). Non-evidence (step-accuracy) callers
+            // still surface the hard `SchurFactorFailed` so the outer LM loop can
+            // lift `ridge_beta` and re-form a genuinely PD complement.
+            if options.tolerate_ill_conditioning {
+                if let Some(deflated) = factor_spectral_deflated_evidence_dense(schur) {
+                    let delta_beta = cholesky_solve_vector(&deflated, rhs_beta);
+                    return Ok((delta_beta, Some(deflated), PcgDiagnostics::default()));
+                }
+            }
+            return Err(ArrowSchurError::SchurFactorFailed { reason: e });
+        }
+    };
     // Ill-conditioned-but-PD Schur guard. The per-row factor checks reject
     // any single barely-PD H_tt^(i) block, but the reduced Schur complement
     //     S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)
@@ -3261,6 +3286,63 @@ mod tests {
             bare_count(near_floor_hi),
             "test must straddle the bare cutoff (else it proves nothing): the \
              un-banded decision flips the count, the banded one does not"
+        );
+    }
+
+    /// #1118 (β-block analogue): a genuinely indefinite REDUCED SCHUR complement
+    /// — the state the OLMo K=8 capstone hits, where the per-row H_tt blocks are
+    /// deflated PD but the Schur subtraction drives a β-pivot negative (the
+    /// reported `-0.064 at index 256`) — must be conditioned by the evidence
+    /// dense factor through unit-stiffness spectral deflation rather than failing
+    /// the whole fit. The negative direction is stiffened to eigenvalue `+1`
+    /// (ρ-independent `log 1 = 0`), the genuine positive spectrum is preserved
+    /// exactly, and the result is PD so its Cholesky and `log|S|` are finite.
+    #[test]
+    fn evidence_dense_schur_deflates_indefinite_complement_at_unit_stiffness() {
+        // A 3×3 symmetric Schur complement with one genuinely NEGATIVE eigenvalue
+        // (−0.5 along e_1) and two healthy positive ones (4.0 along e_0, 2.0 along
+        // e_2). The plain Cholesky must refuse it; the evidence deflation must
+        // condition it to PD.
+        let schur = array![
+            [4.0_f64, 0.0, 0.0],
+            [0.0, -0.5, 0.0],
+            [0.0, 0.0, 2.0],
+        ];
+        assert!(
+            cholesky_lower(&schur).is_err(),
+            "an indefinite Schur complement must be refused by the plain Cholesky"
+        );
+
+        let factor = factor_spectral_deflated_evidence_dense(&schur)
+            .expect("indefinite Schur complement must spectrally deflate to a PD factor");
+
+        // Reconstruct L Lᵀ and check the spectrum: genuine directions exact, the
+        // deflated negative direction carries the +1 unit stiffness.
+        let d = 3usize;
+        let mut reconstructed = Array2::<f64>::zeros((d, d));
+        for i in 0..d {
+            for j in 0..d {
+                let mut acc = 0.0_f64;
+                for kk in 0..d {
+                    acc += factor[[i, kk]] * factor[[j, kk]];
+                }
+                reconstructed[[i, j]] = acc;
+            }
+        }
+        assert!(
+            (reconstructed[[0, 0]] - 4.0).abs() < 1.0e-9,
+            "genuine positive direction e_0 must be exact; got {}",
+            reconstructed[[0, 0]]
+        );
+        assert!(
+            (reconstructed[[2, 2]] - 2.0).abs() < 1.0e-9,
+            "genuine positive direction e_2 must be exact; got {}",
+            reconstructed[[2, 2]]
+        );
+        assert!(
+            (reconstructed[[1, 1]] - 1.0).abs() < 1.0e-9,
+            "deflated negative direction must carry exactly the +1 unit stiffness; got {}",
+            reconstructed[[1, 1]]
         );
     }
 

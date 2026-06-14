@@ -182,22 +182,32 @@ mod tests {
     /// quotient-dimension change and must error loudly (comparing Laplace
     /// normalizers across a changed null-space is meaningless).
     #[test]
-    fn evidence_gauge_deflation_count_guard_pins_then_rejects_change() {
+    fn evidence_gauge_deflation_count_guard_tolerates_flicker_rejects_structural_jump() {
         let mut term = trivial_k1_euclidean_term();
         assert!(term.expected_evidence_gauge_deflated_directions.is_none());
 
         // First observation pins the expected count.
-        term.record_evidence_gauge_deflation_count(2).unwrap();
-        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(2));
+        term.record_evidence_gauge_deflation_count(5).unwrap();
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
 
         // A matching later observation is a no-op (still Ok, count unchanged).
-        term.record_evidence_gauge_deflation_count(2).unwrap();
-        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(2));
+        term.record_evidence_gauge_deflation_count(5).unwrap();
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
 
-        // A DIFFERENT later observation is a structural event → loud error.
+        // A ±1 flicker (a single near-cutoff per-row H_tt eigenvalue crossing
+        // the spectral floor across the ρ-walk) is tolerated and RE-ANCHORS the
+        // expected count, instead of refusing the seed and dropping the K=1 path
+        // into the slow homotopy cascade (#1117).
+        term.record_evidence_gauge_deflation_count(6).unwrap();
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(6));
+        term.record_evidence_gauge_deflation_count(5).unwrap();
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
+
+        // A change LARGER than the flicker band is a genuine structural
+        // quotient-dimension event → loud error (#1037 invariant preserved).
         let err = term
-            .record_evidence_gauge_deflation_count(3)
-            .expect_err("a changed deflation count must error");
+            .record_evidence_gauge_deflation_count(8)
+            .expect_err("a structural deflation-count jump must error");
         assert!(
             err.contains("deflation count changed"),
             "guard must report the quotient-dimension change explicitly; got: {err}"
