@@ -2653,7 +2653,10 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         let (mean_rho, scale_rho) = split(log_lambdas);
         let (mean_lam, scale_lam) = split(lambdas);
         let (mean_edf, scale_edf) = split(edf);
-        log::info!(
+        // Emitted at WARN (not INFO): the test harness's effective log level is
+        // WARN, so the sibling survival WARN diagnostics surface while INFO ones
+        // are dropped — that is why the earlier info-level form never appeared.
+        log::warn!(
             "[gaulss-lambda-diag] n_mean_pen={n_mean_pen} reml_score={:.6e}\n  \
              MEAN  rho(log-lambda)=[{}] lambda=[{}] edf=[{}]\n  \
              SCALE rho(log-lambda)=[{}] lambda=[{}] edf=[{}]",
