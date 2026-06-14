@@ -460,7 +460,8 @@ pub fn project_onto_linear_constraints(
         return Ok(beta);
     }
     let mut corrections = Array2::<f64>::zeros((constraints.a.nrows(), dim));
-    for _ in 0..DYKSTRA_PROJECTION_MAX_SWEEPS {
+    let max_sweeps = DYKSTRA_PROJECTION_MAX_SWEEPS;
+    for _ in 0..max_sweeps {
         let mut max_violation = 0.0_f64;
         for i in 0..constraints.a.nrows() {
             let row = constraints.a.row(i);
