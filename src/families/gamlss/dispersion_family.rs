@@ -920,6 +920,25 @@ pub fn fit_dispersion_glm_location_scale_terms(
     // penalties λ are still REML-selected).
     let mut kappa = kappa_options.clone();
     kappa.enabled = false;
+    // A dispersion location-scale model is an inherently *predictable* model:
+    // posterior-mean prediction (the response-scale predict path the CLI/FFI
+    // drive) needs the joint `(β_μ, β_d)` posterior covariance, and so does the
+    // reported total EDF / coefficient SEs. The block-diagonal joint Hessian is
+    // always assembled here (`exact_newton_joint_hessian_with_specs` →
+    // `compute_joint_covariance`, which for this family's `RidgedQuadraticReml`
+    // outer objective uses the never-erroring SPD-retry → positive-part
+    // pseudo-inverse), so we can — and must — request the covariance
+    // unconditionally rather than leaving `covariance_conditional = None`
+    // whenever the outer optimizer happens to *converge* (the only family-
+    // independent reason NB sometimes populated covariance was that it escalated
+    // into the never-fail posterior-sampling rung, while a cleanly-converged
+    // Gamma/Tweedie fit took the `!options.compute_covariance ⇒ None` early
+    // return and stranded its covariance/EDF — gam#1119). Forcing the flag here
+    // makes all four genuine-dispersion mean families assemble the joint
+    // covariance + EDF deterministically, exactly as a predictable model
+    // requires.
+    let mut options = options.clone();
+    options.compute_covariance = true;
     fit_location_scale_terms(
         data,
         DispersionGlmLocationScaleTermBuilder {
@@ -931,7 +950,7 @@ pub fn fit_dispersion_glm_location_scale_terms(
             mean_offset: spec.mean_offset,
             noise_offset: spec.log_disp_offset,
         },
-        options,
+        &options,
         &kappa,
     )
 }
