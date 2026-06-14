@@ -3269,7 +3269,7 @@ impl ArrowSchurSystem {
             .collect();
         let row_dims: Arc<[usize]> = (0..n).map(|_| d).collect::<Vec<_>>().into();
         let row_offsets: Arc<[usize]> = (0..=n).map(|i| i * d).collect::<Vec<_>>().into();
-        let mut sys = Self {
+        Self {
             rows,
             hbb: Array2::<f64>::zeros((0, 0)),
             hbb_matvec: None,
@@ -3291,9 +3291,7 @@ impl ArrowSchurSystem {
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             ibp_cross_row: None,
-        };
-        sys.refresh_row_hessian_fingerprint();
-        sys
+        }
     }
 
     /// Allocate an arrow system using a caller-owned dense shared-block buffer.
@@ -3320,7 +3318,7 @@ impl ArrowSchurSystem {
             .collect();
         let row_dims: Arc<[usize]> = (0..n).map(|_| d).collect::<Vec<_>>().into();
         let row_offsets: Arc<[usize]> = (0..=n).map(|i| i * d).collect::<Vec<_>>().into();
-        let mut sys = Self {
+        Self {
             rows,
             hbb,
             hbb_matvec: None,
@@ -3342,9 +3340,7 @@ impl ArrowSchurSystem {
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             ibp_cross_row: None,
-        };
-        sys.refresh_row_hessian_fingerprint();
-        sys
+        }
     }
 
     /// Allocate an arrow system whose shared `H_ββ` block is supplied only as
@@ -3377,7 +3373,7 @@ impl ArrowSchurSystem {
             Arc::clone(&matvec_arc),
             diag.clone(),
         )));
-        let mut sys = Self {
+        Self {
             rows,
             hbb: Array2::<f64>::zeros((0, 0)),
             hbb_matvec: Some(matvec_arc),
@@ -3399,9 +3395,7 @@ impl ArrowSchurSystem {
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             ibp_cross_row: None,
-        };
-        sys.refresh_row_hessian_fingerprint();
-        sys
+        }
     }
 
     /// Allocate a heterogeneous BA system where each row has its own latent
@@ -3440,7 +3434,7 @@ impl ArrowSchurSystem {
             .iter()
             .map(|&dim| ArrowRowBlock::new_with_htbeta_cols(dim, htbeta_cols))
             .collect();
-        let mut sys = Self {
+        Self {
             rows,
             hbb: Array2::<f64>::zeros((0, 0)),
             hbb_matvec: None,
@@ -3462,9 +3456,7 @@ impl ArrowSchurSystem {
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             ibp_cross_row: None,
-        };
-        sys.refresh_row_hessian_fingerprint();
-        sys
+        }
     }
 
     /// Allocate a heterogeneous-row system using a caller-owned dense
@@ -3502,7 +3494,7 @@ impl ArrowSchurSystem {
             .iter()
             .map(|&di| ArrowRowBlock::new_with_htbeta_cols(di, htbeta_cols))
             .collect();
-        let mut sys = Self {
+        Self {
             rows,
             hbb,
             hbb_matvec: None,
@@ -3524,9 +3516,7 @@ impl ArrowSchurSystem {
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             ibp_cross_row: None,
-        };
-        sys.refresh_row_hessian_fingerprint();
-        sys
+        }
     }
 
     pub fn set_row_gauge_deflation(&mut self, deflation: ArrowRowGaugeDeflation) {
@@ -3569,6 +3559,11 @@ impl ArrowSchurSystem {
     }
 
     /// Store the current row-system fingerprint on the system.
+    ///
+    /// This is intentionally explicit and expensive. Cache and evidence callers
+    /// use [`Self::current_row_hessian_fingerprint`] at the point they need the
+    /// value, after assembly has populated the system, instead of hashing each
+    /// intermediate construction/mutation step.
     pub fn refresh_row_hessian_fingerprint(&mut self) {
         self.row_hessian_fingerprint = self.current_row_hessian_fingerprint();
     }
@@ -3595,14 +3590,12 @@ impl ArrowSchurSystem {
         )));
         self.hbb_matvec = Some(matvec_arc);
         self.hbb_diag = Some(diag);
-        self.refresh_row_hessian_fingerprint();
     }
 
     /// Mark the dense per-row cross-block slabs as active supplements to the
     /// installed matrix-free row operator.
     pub fn activate_dense_htbeta_supplement(&mut self) {
         self.htbeta_dense_supplement = true;
-        self.refresh_row_hessian_fingerprint();
     }
 
     /// Install a matrix-free per-row cross-block operator and its sparse
@@ -3627,7 +3620,6 @@ impl ArrowSchurSystem {
     {
         self.htbeta_matvec = Some(Arc::new(forward));
         self.htbeta_transpose_matvec = Some(Arc::new(transpose));
-        self.refresh_row_hessian_fingerprint();
     }
 
     /// Register term-block column ranges for the block-Jacobi Schur preconditioner.
@@ -3657,10 +3649,6 @@ impl ArrowSchurSystem {
     /// for structured smoothness penalties.
     pub fn set_penalty_op(&mut self, op: Arc<dyn BetaPenaltyOp>) {
         self.penalty_op = Some(op);
-        // The row-Hessian fingerprint now reads the β-block content from the
-        // installed operator; refresh it so the factorization / evidence cache
-        // (`cache_matches_system`) invalidates when the β-block changes.
-        self.refresh_row_hessian_fingerprint();
     }
 
     pub fn set_device_sae_pcg_data(&mut self, data: DeviceSaePcgData) {
@@ -3939,7 +3927,6 @@ impl ArrowSchurSystem {
             }
             hasher.finish_u64()
         };
-        self.refresh_row_hessian_fingerprint();
         Ok(())
     }
 
@@ -3955,7 +3942,6 @@ impl ArrowSchurSystem {
         let manifold = latent.manifold();
         self.manifold_mode_fingerprint = manifold_mode_fingerprint(latent);
         if manifold.is_euclidean() {
-            self.refresh_row_hessian_fingerprint();
             return;
         }
         assert_eq!(latent.n_obs(), self.rows.len());
@@ -3973,7 +3959,6 @@ impl ArrowSchurSystem {
                 htbeta_e.view(),
             );
         }
-        self.refresh_row_hessian_fingerprint();
     }
 
     fn add_ext_coord_penalty(
