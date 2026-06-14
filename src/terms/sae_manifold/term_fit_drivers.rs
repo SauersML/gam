@@ -2559,6 +2559,29 @@ impl SaeManifoldTerm {
         }
         self.refresh_basis_from_current_coords()
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+        // #1117 root-cause fix — rank-revealing adaptive basis depth, applied
+        // FIRST (before frame activation, the identifiability audit, and the
+        // outer loop) so every downstream stage sees a full-rank design. A
+        // fixed-width decoder basis (e.g. the periodic circle's
+        // `[1, sin2πt, cos2πt, sin4πt, cos4πt]`) emits `M_k` columns whether or
+        // not the fitted `t`/assignment excite them; on a near-degenerate
+        // checkpoint (OLMo `stage1-step0` PCA-32: data Gram rank `3/5`) the
+        // unexcited columns make the decoder design rank-deficient BY
+        // CONSTRUCTION, flattening the outer REML surface so BFGS stalls. We
+        // discover the data-supported subspace `Q_k = range(G_k)` ONCE here from
+        // the bare data Gram and, for any rank-deficient atom, REPARAMETRIZE its
+        // basis onto that subspace (`Φ̃ = Φ Q_k`, `B̃ = Q_kᵀ B`, `S̃ = Q_kᵀ S Q_k`,
+        // and a `SubspaceReducedEvaluator` so the reduction survives every
+        // refresh). The reduced design is full-rank, so the identifiability audit
+        // passes, the frame profiles the reduced block, the inner solve needs no
+        // step-time deflation, and the outer REML log-det is well-conditioned —
+        // this SUPERSEDES the prior data-null projector deflation + post-fit
+        // range projection for the rank-deficiency case. The depth decision is
+        // made once here and held FIXED across the inner Newton walk. A full-rank
+        // atom (`base`/`step_2300`, `r_k == M_k`) is left untouched, so its
+        // design, decoder, and REML criterion are byte-for-byte the historical
+        // full-`B` path.
+        self.reduce_atoms_to_data_supported_rank()?;
         // #972 / #977 T1 — magic-by-default decoder-frame activation. Before the
         // outer loop, auto-derive and install the low-rank Grassmann frames
         // (each atom independently, only when the factorization materially
@@ -2616,27 +2639,6 @@ impl SaeManifoldTerm {
             self.accumulate_decoder_gram(&mut grams);
             self.finalize_decoder_identifiability_audit(&grams, self.n_obs())?;
         }
-        // #1117 root-cause fix — rank-revealing adaptive basis depth. A
-        // fixed-width decoder basis (e.g. the periodic circle's
-        // `[1, sin2πt, cos2πt, sin4πt, cos4πt]`) emits `M_k` columns whether or
-        // not the fitted `t`/assignment excite them; on a near-degenerate
-        // checkpoint (OLMo `stage1-step0` PCA-32: data Gram rank `3/5`) the
-        // unexcited columns make the decoder design rank-deficient BY
-        // CONSTRUCTION, flattening the outer REML surface so BFGS stalls. We
-        // discover the data-supported subspace `Q_k = range(G_k)` ONCE here from
-        // the bare data Gram and, for any rank-deficient atom, REPARAMETRIZE its
-        // basis onto that subspace (`Φ̃ = Φ Q_k`, `B̃ = Q_kᵀ B`, `S̃ = Q_kᵀ S Q_k`,
-        // and a `SubspaceReducedEvaluator` so the reduction survives every
-        // refresh). The reduced design is full-rank, so the inner solve needs no
-        // step-time deflation and the outer REML log-det is well-conditioned —
-        // this SUPERSEDES the prior data-null projector deflation + post-fit
-        // range projection for the rank-deficiency case. Held FIXED across the
-        // inner Newton walk by pinning the basis at entry (the depth decision is
-        // made once, before the loop, exactly like the old projector). A
-        // full-rank atom (`base`/`step_2300`, `r_k == M_k`) is left untouched,
-        // so its design, decoder, and REML criterion are byte-for-byte the
-        // historical full-`B` path.
-        self.reduce_atoms_to_data_supported_rank()?;
         for outer_iteration in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ρ (including the ARD precisions) is owned by the outer engine
