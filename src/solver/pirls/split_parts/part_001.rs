@@ -1926,9 +1926,17 @@ impl<'a> GamWorkingModel<'a> {
                     self.penalty.add_to_hessian(&mut h);
                     Ok(h)
                 }
-                WorkingCoordinateDesign::TransformedExplicit { .. } => unreachable!(
-                    "TransformedExplicit excluded from the frozen first-step gate above"
-                ),
+                WorkingCoordinateDesign::TransformedExplicit { .. } => {
+                    // Excluded from `use_frozen_first_step` by the guard above
+                    // (the frozen Gram lives in the original frame the explicit
+                    // transform was not built in). A clean error rather than a
+                    // panic if a future refactor ever lets this state through.
+                    Err(EstimationError::InvalidInput(
+                        "frozen first-step Gram path reached with TransformedExplicit \
+                         coordinate design, which the gate excludes"
+                            .to_string(),
+                    ))
+                }
             };
         }
         match &self.coordinate_design {
