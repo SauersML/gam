@@ -57,7 +57,8 @@ scripts/__pycache__/
 scripts/latest_benchmark_summary.md
 scripts/codex_nightrun.sh
 *.png
-!bench/aniso_demo/*.png
+bench/aniso_demo/*.png
+bench/aniso_demo/data.csv
 bench/aniso_demo/fit_*.log
 bench/aniso_demo/model_*.json
 bench/aniso_demo/pred_*.csv
@@ -85,6 +86,13 @@ run53_duchon_matern_results.txt
 scripts/rust_digest.txt
 bench/direct_fold3_model.json
 bench/direct_fold3_model_noadapt.json
+bench/baselines/*.json
+bench/single_split_geo_disease_eas_duchon_k4_downsample300x.json
+bench/biobank_scale/
+bench/margslope_plain/runs/
+bench/margslope_smoke/runs/
+bench/gam_bench_*/
+bench/results-shards/
 bench/us48_debug_after_fix/
 bench/us48_debug_artifacts/
 bench/us48_debug_artifacts_after/
@@ -95,10 +103,15 @@ bench/biobank_scale/*/
 rust_digest.txt
 
 # Python virtual environments
+.venv/
+.venv-docs/
 .venv-bench/
 .venv-biobank/
 .venv*/
 .pytest_cache/
+gamfit/**/__pycache__/
+scripts/**/__pycache__/
+tests/**/__pycache__/
 .maturin/
 dist/
 gamfit/_rust.abi3.so
@@ -145,6 +158,12 @@ scripts/geometric_shapes_demo.gif
 scripts/geometric_shapes_demo.mp4
 scripts/geometric_shapes_demo_slow.mp4
 docs/images/geometric_shapes_demo.mp4
+scripts/bench_gamlss_surv_variants_results.json
+
+# Generated profiling/reference artifacts under tests/bench_tools.
+tests/bench_tools/gam_model_fit.joblib
+tests/bench_tools/synthetic_classification_data.csv
+tests/bench_tools/test_data.csv
 
 # local scratch notes, not part of the repo's source
 todo_history.txt

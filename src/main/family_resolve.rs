@@ -47,7 +47,7 @@ pub(crate) fn resolve_family(
     if negative_binomial_theta.is_some() && !matches!(arg, FamilyArg::NegativeBinomial) {
         return Err("--negative-binomial-theta requires --family negative-binomial".to_string());
     }
-    gam::resolve_family(
+    gam::solver::workflow::resolve_family(
         family_arg_canonical_name(arg),
         negative_binomial_theta,
         link_choice.as_ref(),

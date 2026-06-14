@@ -157,19 +157,19 @@ pub(crate) use poly_arith::{
     poly_add, poly_add_jets, poly_coeff_mask, poly_mul, poly_mul_jets, poly_scale,
     poly_scale_jets, poly_sub,
 };
-pub(crate) use error::*;
-pub(crate) use spec::*;
+pub use error::*;
+pub use spec::*;
 pub(crate) use family::*;
 pub(crate) use block_layout::*;
-pub(crate) use row_math::*;
+pub use row_math::*;
 pub(crate) use primary_geometry::*;
 pub(crate) use hessian::*;
 pub(crate) use joint_workspace::*;
 pub(crate) use row_kernel::*;
 pub(crate) use joint_eval::*;
-pub(crate) use block_jacobians::*;
+pub use block_jacobians::*;
 pub(crate) use fit_setup::*;
-pub(crate) use fit_entry::*;
+pub use fit_entry::*;
 
 #[cfg(test)]
 mod tests;

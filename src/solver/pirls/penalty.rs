@@ -162,7 +162,7 @@ impl PirlsPenalty {
 }
 
 #[derive(Clone)]
-pub(super) struct KroneckerQsTransform {
+pub(crate) struct KroneckerQsTransform {
     pub(super) marginal_qs: Vec<Array2<f64>>,
     pub(super) dims: Vec<usize>,
     pub(super) p: usize,

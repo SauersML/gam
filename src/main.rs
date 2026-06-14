@@ -153,14 +153,15 @@ pub(crate) use gam::types::{
     WigglePenaltyConfig,
 };
 
-pub(crate) use gam::{
+pub(crate) use gam::solver::workflow::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest,
     DispersionLocationScaleFitRequest, FitConfig, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,
     LinkWiggleConfig, PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest,
     SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
-    SurvivalTransformationFitRequest, TransformationNormalFitRequest, fit_model,
-    prepare_survival_time_stack, resolve_offset_column, resolve_weight_column,
+    SurvivalTransformationFitRequest, SurvivalTransformationTermSpec, TransformationNormalFitRequest,
+    WorkflowError, fit_model, prepare_survival_time_stack, residual_cascade_fast_path,
+    resolve_offset_column, resolve_weight_column, spline_scan_fast_path,
 };
 
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};

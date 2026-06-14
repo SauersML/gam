@@ -109,9 +109,9 @@ mod system;
 mod tests;
 
 pub(crate) use factorization::*;
-pub(crate) use newton_step::*;
-pub(crate) use penalty_ops::*;
-pub(crate) use primitives::*;
-pub(crate) use reduced_solve::*;
-pub(crate) use solve_options::*;
-pub(crate) use system::*;
+pub use newton_step::*;
+pub use penalty_ops::*;
+pub use primitives::*;
+pub use reduced_solve::*;
+pub use solve_options::*;
+pub use system::*;

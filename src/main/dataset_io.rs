@@ -185,14 +185,3 @@ pub(crate) fn load_datasetwith_model_schema_extra(
     requested.extend(extra_required.iter().cloned());
     load_dataset_auto_with_schema_projected(path, schema, policy, &requested).map_err(String::from)
 }
-
-
-/// Canonical family name for a CLI `--family` selection.
-///
-/// This is the one place that maps the closed `FamilyArg` enum onto the
-/// string vocabulary understood by the canonical resolver
-/// (`gam::resolve_family` in `src/solver/workflow.rs`). `Auto` returns `None`
-/// so the resolver runs response inference; every concrete variant returns the
-/// exact name the resolver matches, preserving its pinned/unpinned link
-/// semantics (e.g. `binomial-logit` pins the link, `gaussian`/`poisson`/`gamma`
-/// leave it open to refinement by a `link(...)` choice).

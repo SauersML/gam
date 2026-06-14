@@ -39,8 +39,8 @@ pub(crate) fn deviation_block_config_from_formula_linkwiggle(
 
 #[derive(Debug)]
 pub(crate) struct MarginalSlopeDeviationRouting {
-    score_warp: Option<DeviationBlockConfig>,
-    link_dev: Option<DeviationBlockConfig>,
+    pub(crate) score_warp: Option<DeviationBlockConfig>,
+    pub(crate) link_dev: Option<DeviationBlockConfig>,
 }
 
 

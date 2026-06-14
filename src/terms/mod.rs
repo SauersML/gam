@@ -68,14 +68,6 @@ pub use sae_encode_atlas::{
     AtlasConfig, AtomEncodeAtlas, BasisHessianLipschitz, CertifiedChart, ChartRegion, EncodeAtlas,
     EncodeResult, KANTOROVICH_THRESHOLD, RowCertificate, row_certificate,
 };
-pub use sae_manifold::{
-    AssignmentMode, CertificateInputs, CurvatureBifurcation, CurvatureWalkReport,
-    GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldLoss, SaeManifoldOuterObjective, SaeManifoldRho,
-    SaeManifoldTerm, SaeOuterRhoGradientComponents, ScheduleKind, SphereChartEvaluator,
-    TorusHarmonicEvaluator, dictionary_incoherence_report,
-    dictionary_incoherence_report_with_dispersion,
-};
 pub use sae_optimality_certificate::{
     CriterionCertificate, DirectionalSamples, certificate_from_samples,
     deterministic_probe_direction, probe_step,

@@ -139,3 +139,17 @@ pub use gpu::GpuDeviceInfo;
 pub use solver::protocol::{
     LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
 };
+pub use solver::workflow::{
+    BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, CrossFitScoreCalibration,
+    CtnStage1Recipe, DispersionLocationScaleFitRequest, DispersionLocationScaleFitResult,
+    FitConfig, FitRequest, FitResult, GaussianLocationScaleFitRequest, LatentBinaryFitRequest,
+    LatentSurvivalFitRequest, LinkWiggleConfig, MaterializedModel, PreparedSurvivalTimeStack,
+    ResidualCascadeInputs, SplineScanInputs, StandardBinomialWiggleConfig, StandardFitRequest,
+    StandardFitResult, SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult,
+    SurvivalMarginalSlopeFitRequest, SurvivalTransformationFitRequest,
+    SurvivalTransformationFitResult, SurvivalTransformationTermSpec,
+    TransformationNormalFitRequest, WorkflowError, fit_from_formula, fit_model,
+    fit_residual_cascade_from_formula, fit_spline_scan_from_formula, is_binary_response,
+    materialize, prepare_survival_time_stack, residual_cascade_fast_path, resolve_family,
+    resolve_offset_column, resolve_weight_column, spline_scan_fast_path,
+};

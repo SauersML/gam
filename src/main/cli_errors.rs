@@ -96,8 +96,8 @@ impl From<gam::inference::data::DataError> for CliError {
 }
 
 
-impl From<gam::WorkflowError> for CliError {
-    fn from(err: gam::WorkflowError) -> Self {
+impl From<WorkflowError> for CliError {
+    fn from(err: WorkflowError) -> Self {
         // The workflow layer is the bridge between user-supplied config /
         // formula / data and the solver. Its errors are routed through the
         // shared classifier so error text already carries CLI-friendly

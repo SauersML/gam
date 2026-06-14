@@ -716,7 +716,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         // Gaussian cubic smooth routes through the state-space scan — the
         // same penalized posterior at O(n) per λ-trial instead of the dense
         // design/Gram route — and persists the smoother state directly.
-        if let Some(inputs) = gam::spline_scan_fast_path(&standard_request) {
+        if let Some(inputs) = spline_scan_fast_path(&standard_request) {
             let scan = gam::solver::spline_scan::fit_spline_scan(
                 &inputs.x,
                 &inputs.y,
@@ -771,7 +771,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         // Unlike the 1-D scan this is a DIFFERENT posterior, so the seam only
         // fires on the exact structural signature; rejected metric or ineligible
         // shape fall through to the dense `fit_model` path.
-        if let Some(inputs) = gam::residual_cascade_fast_path(&standard_request) {
+        if let Some(inputs) = residual_cascade_fast_path(&standard_request) {
             let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
             if let Ok(cascade_fit) = gam::solver::residual_cascade::fit_residual_cascade(
                 &coord_refs,

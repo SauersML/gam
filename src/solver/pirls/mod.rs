@@ -6,7 +6,7 @@
 //! line-cut `include!` fragments.
 
 mod imports;
-pub(crate) use imports::*;
+pub use imports::*;
 
 // ── Concern modules ──────────────────────────────────────────────────────────
 mod convergence;
@@ -40,17 +40,17 @@ mod tests;
 // before the split). The pre-existing real submodules below keep their explicit
 // named re-exports so their exact visibility — and crate-facing `pub` API — is
 // preserved; globbing them too would double-import every name listed there.
-pub(crate) use curvature::*;
-pub(crate) use deviance::*;
+pub use curvature::*;
+pub use deviance::*;
 pub(crate) use dispersion::*;
-pub(crate) use family_state::*;
+pub use family_state::*;
 pub(crate) use gam_working_model::*;
-pub(crate) use glm_update::*;
-pub(crate) use low_rank::*;
-pub(crate) use newton_solve::*;
+pub use glm_update::*;
+pub use low_rank::*;
+pub use newton_solve::*;
 pub(crate) use sparse_system::*;
 pub(crate) use working_model_trait::*;
-pub(crate) use workspace::*;
+pub use workspace::*;
 
 // ── Pre-existing real-submodule re-exports (visibility preserved) ─────────────
 use convergence::effective_kkt_tolerance;

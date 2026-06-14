@@ -160,16 +160,16 @@ mod tests;
 pub(crate) use constants::*;
 pub(crate) use covariate_blocks::*;
 pub(crate) use dense_linalg::*;
-pub(crate) use error::*;
+pub use error::*;
 pub(crate) use family::*;
 pub(crate) use fit::*;
 pub(crate) use moments::*;
-pub(crate) use predict::*;
+pub use predict::*;
 pub(crate) use prepare::*;
-pub(crate) use residual_dist::*;
+pub use residual_dist::*;
 pub(crate) use row_kernel::*;
-pub(crate) use spec::*;
-pub(crate) use time_block::*;
+pub use spec::*;
+pub use time_block::*;
 pub(crate) use wiggle_geometry::*;
 // `family_solver` carries the public effective-jacobian entry point
 // (`survival_location_scale_block_effective_jacobian`,
