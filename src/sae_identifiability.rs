@@ -51,14 +51,16 @@ use crate::geometry::curvature_estimand::{FlatnessTest, KappaProfileCi};
 use crate::inference::lawley::{RowExpectedJets, RowKappas, lawley_lr_bartlett_factor};
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
-use crate::inference::riesz::{RieszDebiasReport, RieszInput, SmoothFunctional, debias_with_dense_hessian};
+use crate::inference::riesz::{
+    RieszDebiasReport, RieszInput, SmoothFunctional, debias_with_dense_hessian,
+};
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
 use crate::inference::structure_evidence::{StructureCertificate, StructureLedger};
-use crate::terms::sae_manifold::SaeManifoldTerm;
 use crate::linalg::faer_ndarray::{
     FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
 use crate::terms::sae_chart_canonicalization::CanonicalChartTopology;
+use crate::terms::sae_manifold::SaeManifoldTerm;
 use faer::Side;
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
 use std::f64::consts::TAU;

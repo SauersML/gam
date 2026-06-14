@@ -1118,19 +1118,20 @@ impl EncodeAtlas {
         // sequential inside a rayon worker (e.g. when an outer atom-level fan-out
         // owns the pool) to avoid nested oversubscription. The first row that
         // fails to encode propagates its error deterministically.
-        let encode_rows = |range: std::ops::Range<usize>| -> Result<Vec<(Array1<f64>, bool)>, String> {
-            range
-                .map(|row| {
-                    let (t, cert) = self.certified_encode_row(
-                        atom,
-                        atom_index,
-                        targets.row(row),
-                        amplitudes[row],
-                    )?;
-                    Ok((t, cert.certified()))
-                })
-                .collect()
-        };
+        let encode_rows =
+            |range: std::ops::Range<usize>| -> Result<Vec<(Array1<f64>, bool)>, String> {
+                range
+                    .map(|row| {
+                        let (t, cert) = self.certified_encode_row(
+                            atom,
+                            atom_index,
+                            targets.row(row),
+                            amplitudes[row],
+                        )?;
+                        Ok((t, cert.certified()))
+                    })
+                    .collect()
+            };
         let rows: Vec<(Array1<f64>, bool)> =
             if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
                 use rayon::prelude::*;

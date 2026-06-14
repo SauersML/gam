@@ -817,8 +817,7 @@ pub fn fit_response_curvature(
     let profile_ci = crate::geometry::curvature_estimand::profile_ci_walk(
         &mut v_p, kappa_hat, v_pp, kappa_min, kappa_max, level, ktol,
     )?;
-    let flatness =
-        crate::geometry::curvature_estimand::flatness_lr_test(&mut v_p, kappa_hat)?;
+    let flatness = crate::geometry::curvature_estimand::flatness_lr_test(&mut v_p, kappa_hat)?;
 
     Ok(ResponseCurvatureFit {
         dim,
@@ -1004,10 +1003,7 @@ mod tests {
     fn fit_response_curvature_recovers_true_kappa_and_rejects_flat() {
         let dim = 3usize;
         for &k_star in &[-1.5_f64, 0.0, 1.2] {
-            let manifold = ResponseManifold::ConstantCurvature {
-                dim,
-                kappa: k_star,
-            };
+            let manifold = ResponseManifold::ConstantCurvature { dim, kappa: k_star };
             // Base point off the origin; deterministic spread of small tangents
             // (kept well inside the chart for every κ⋆) exp-mapped to responses.
             let base = array![0.04, -0.06, 0.05];

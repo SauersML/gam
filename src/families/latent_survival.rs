@@ -769,7 +769,8 @@ fn prepare_latent_time_block(
     // design's shape (same basis, evaluated at R).
     let design_right = match design_right {
         Some(matrix) => {
-            let dense = matrix.try_to_dense_by_chunks("latent survival interval right time design")?;
+            let dense =
+                matrix.try_to_dense_by_chunks("latent survival interval right time design")?;
             if dense.nrows() != design_exit.nrows() || dense.ncols() != design_exit.ncols() {
                 return Err(LatentSurvivalError::InvalidDataset {
                     reason: format!(
@@ -1441,18 +1442,16 @@ fn latent_survival_row_primary_log_jet(
                 "latent survival numerator",
             )?
         }
-        LatentSurvivalEventType::IntervalCensored => {
-            latent_survival_interval_numerator_log_jet(
-                quadctx,
-                row,
-                q_exit,
-                q_right,
-                mu,
-                sigma,
-                log_sigma_factor,
-                directions,
-            )?
-        }
+        LatentSurvivalEventType::IntervalCensored => latent_survival_interval_numerator_log_jet(
+            quadctx,
+            row,
+            q_exit,
+            q_right,
+            mu,
+            sigma,
+            log_sigma_factor,
+            directions,
+        )?,
     };
 
     let mut total = numerator.add(&denominator.scale(-1.0));
@@ -1560,12 +1559,8 @@ fn latent_survival_interval_numerator_log_jet(
     let c_right = (-row.mass_unloaded_right).exp();
     let exp_left_value = log_left.coeff(0).exp();
     let exp_right_value = log_right.coeff(0).exp();
-    let linear_left = log_left
-        .compose_unary([exp_left_value; 5])
-        .scale(c_left);
-    let linear_right = log_right
-        .compose_unary([exp_right_value; 5])
-        .scale(c_right);
+    let linear_left = log_left.compose_unary([exp_left_value; 5]).scale(c_left);
+    let linear_right = log_right.compose_unary([exp_right_value; 5]).scale(c_right);
 
     let linear_numerator = linear_left.add(&linear_right.scale(-1.0));
     let base = linear_numerator.coeff(0);
