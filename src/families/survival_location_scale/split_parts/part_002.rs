@@ -4231,13 +4231,7 @@ fn fit_reduced_parametric_aft(
 /// `offset_channel_geometry` method needs the raw, populated per-block state.
 fn fit_survival_location_scale_with_geometry(
     spec: SurvivalLocationScaleSpec,
-) -> Result<
-    (
-        UnifiedFitResult,
-        (OffsetChannelResiduals, OffsetChannelCurvatures),
-    ),
-    String,
-> {
+) -> Result<(UnifiedFitResult, SurvivalLocationScaleConvergedGeometry), String> {
     let prepared = prepare_survival_location_scale_model(&spec)?;
     let options = survival_blockwise_fit_options(&spec);
     // Fully reduced constant-scale PARAMETRIC AFT regime (issue #736/#735/#721):
@@ -4271,10 +4265,27 @@ fn fit_survival_location_scale_with_geometry(
         }
         .into());
     }
-    let geom = prepared.family.offset_channel_geometry(&fit.block_states)?;
+    let (residuals, curvatures) =
+        prepared.family.offset_channel_geometry(&fit.block_states)?;
+    let link_param_data_fit_gradient = prepared
+        .family
+        .link_param_data_fit_gradient(&fit.block_states)?;
     let finalized = finalize_survival_location_scale_fit(&prepared, &fit)?;
-    Ok((finalized, geom))
+    Ok((
+        finalized,
+        (residuals, curvatures, link_param_data_fit_gradient),
+    ))
 }
+
+/// Converged-fit geometry returned alongside the finalized location-scale fit:
+/// the offset-channel residuals + curvatures (for the baseline-θ gradient/Hessian)
+/// and the exact inverse-link data-fit θ-gradient (`None` when the link has no
+/// free parameters).
+type SurvivalLocationScaleConvergedGeometry = (
+    OffsetChannelResiduals,
+    OffsetChannelCurvatures,
+    Option<Array1<f64>>,
+);
 
 
 /// Sentinel error string surfaced by `fit_survival_location_scale_with_geometry`
@@ -4636,7 +4647,7 @@ pub(crate) fn fit_survival_location_scale_terms(
     // optimizer returns, and (critically) avoids the post-finalize
     // `block_states` wipe that would make the geometry call error out.
     let last_geometry: std::cell::RefCell<
-        Option<(OffsetChannelResiduals, OffsetChannelCurvatures)>,
+        Option<SurvivalLocationScaleConvergedGeometry>,
     > = std::cell::RefCell::new(None);
 
     let build_spec = |rho: &Array1<f64>,
@@ -4999,7 +5010,7 @@ pub(crate) fn fit_survival_location_scale_terms(
     // without touching the value closure at the final ρ), recompute by
     // redoing one inner fit at the final ρ̂. This pays an extra fit only when
     // the cache is cold — the common location-scale path always populates it.
-    let (baseline_offset_residuals, baseline_offset_curvatures) =
+    let (baseline_offset_residuals, baseline_offset_curvatures, link_param_data_fit_gradient) =
         match last_geometry.borrow_mut().take() {
             Some(geom) => geom,
             None => {
@@ -5056,6 +5067,9 @@ pub(crate) fn fit_survival_location_scale_terms(
                              terminate at this point)"
                         );
                         let n = data.nrows();
+                        // Degraded candidate: zero residuals and `None` link
+                        // gradient → outer BFGS sees ‖g‖ = 0 and terminates at
+                        // the current θ̂ rather than panicking.
                         (
                             OffsetChannelResiduals {
                                 exit: Array1::<f64>::zeros(n),
@@ -5065,6 +5079,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                             OffsetChannelCurvatures {
                                 rows: vec![[[0.0_f64; 3]; 3]; n],
                             },
+                            None,
                         )
                     }
                     Err(e) => return Err(e),
@@ -5079,6 +5094,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         log_sigma_design: designs.remove(0),
         baseline_offset_residuals,
         baseline_offset_curvatures,
+        link_param_data_fit_gradient,
     })
 }
 

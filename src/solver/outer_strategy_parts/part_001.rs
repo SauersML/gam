@@ -2027,11 +2027,11 @@ mod tests {
     #[test]
     fn plan_cost_only_few_params_fails_loudly_with_bfgs() {
         // No analytic gradient, no analytic Hessian, few params, no
-        // fixed-point lane: a genuinely cost-only objective. The compass-search
-        // direct search was purged, so there is no gradient-free solver left.
-        // The planner emits Bfgs, which the runner rejects loudly for needing a
-        // gradient the objective cannot supply — by design, a cost-only
-        // objective has no working primary.
+        // fixed-point lane: a genuinely cost-only objective, which is a
+        // programming error since every outer objective now supplies an
+        // analytic gradient. The planner emits Bfgs, which the runner rejects
+        // loudly for needing a gradient the objective cannot supply — by
+        // design, a cost-only objective has no working primary.
         let cap = OuterCapability {
             gradient: Derivative::Unavailable,
             hessian: DeclaredHessianForm::Unavailable,

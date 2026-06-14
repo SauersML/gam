@@ -6052,17 +6052,111 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             options: options.clone(),
         };
         if baseline_cfg.target != SurvivalBaselineTarget::Linear {
-            // The latent/latent-binary baseline-θ optimization had no analytic
-            // gradient and ran on the gradient-free compass search, which has
-            // been purged. A non-linear latent baseline target therefore has no
-            // outer solver — fail loudly instead of fitting at the un-optimized
-            // seed baseline.
-            return Err(format!(
-                "non-linear latent survival baseline target {:?} in mode {:?} has no \
-                 analytic θ-gradient and the gradient-free compass-search optimizer was \
-                 removed; there is no outer solver for this baseline",
-                baseline_cfg.target, likelihood_mode,
-            ));
+            // Analytic-gradient BFGS over the latent baseline shape params
+            // (weibull scale/shape; gompertz rate/shape; gompertz-makeham
+            // rate/shape/makeham). The baseline θ enters the inner latent fit
+            // only through the three additive time-block offsets (entry η,
+            // exit η, exit ∂η/∂t), exactly as the transformation path does.
+            //
+            // We optimize the *profile penalized NLL*
+            //   V(θ) = −ℓ(β̂(θ)) + ½·β̂ᵀS β̂,
+            // NOT the LAML `reml_score` (which adds ½log|H+S_λ| with its own
+            // θ-dependence through H(β̂,θ)). At the converged (constrained) β̂
+            // the envelope theorem gives the exact gradient
+            //   dV/dθ_k = Σ_i Σ_ch r^ch_i ∂o^ch_i/∂θ_k,
+            // with r^ch = LatentSurvivalFamily::offset_channel_residuals(β̂)
+            // (carried on the fit result as `baseline_offset_residuals`) and the
+            // η-channel offset partials supplied by `baseline_offset_theta_partials`
+            // (contracted by `baseline_chain_rule_gradient`). λ is re-optimized
+            // inside each inner fit, so its channel drops by the envelope; the
+            // downstream final refit re-picks ρ on the full REML surface at the
+            // converged baseline θ. BFGS on this exact gradient converges in ≲10
+            // outer evaluations on the small 2–3 dim θ-surface.
+            baseline_cfg = optimize_survival_baseline_config_with_gradient_only(
+                &baseline_cfg,
+                if likelihood_mode == SurvivalLikelihoodMode::Latent {
+                    "latent survival baseline"
+                } else {
+                    "latent binary baseline"
+                },
+                |candidate| {
+                    let prepared = prepare_survival_time_stack(
+                        &age_entry,
+                        &age_exit,
+                        candidate,
+                        likelihood_mode,
+                        None,
+                        time_anchor,
+                        latent_derivative_guard,
+                        &time_build,
+                        None,
+                        Some(latent_loading),
+                    )?;
+                    let (log_likelihood, stable_penalty_term, residuals) = match likelihood_mode {
+                        SurvivalLikelihoodMode::Latent => match fit_model(
+                            FitRequest::LatentSurvival(build_survival_request(prepared)),
+                        ) {
+                            Ok(FitResult::LatentSurvival(result)) => (
+                                result.fit.log_likelihood,
+                                result.fit.stable_penalty_term,
+                                result.baseline_offset_residuals,
+                            ),
+                            Ok(_) => {
+                                return Err(
+                                    "internal latent survival workflow returned the wrong result variant"
+                                        .to_string(),
+                                );
+                            }
+                            Err(e) => return Err(format!("latent survival fit failed: {e}")),
+                        },
+                        SurvivalLikelihoodMode::LatentBinary => match fit_model(
+                            FitRequest::LatentBinary(build_binary_request(prepared)),
+                        ) {
+                            Ok(FitResult::LatentBinary(result)) => (
+                                result.fit.log_likelihood,
+                                result.fit.stable_penalty_term,
+                                result.baseline_offset_residuals,
+                            ),
+                            Ok(_) => {
+                                return Err(
+                                    "internal latent binary workflow returned the wrong result variant"
+                                        .to_string(),
+                                );
+                            }
+                            Err(e) => return Err(format!("latent binary fit failed: {e}")),
+                        },
+                        // Enclosing block gates this to Latent | LatentBinary —
+                        // defensively error out for any other discriminant.
+                        SurvivalLikelihoodMode::Transformation
+                        | SurvivalLikelihoodMode::Weibull
+                        | SurvivalLikelihoodMode::LocationScale
+                        | SurvivalLikelihoodMode::MarginalSlope => {
+                            return Err(format!(
+                                "internal: latent baseline closure reached for non-latent mode {:?}",
+                                likelihood_mode
+                            ));
+                        }
+                    };
+                    let profile_cost = -log_likelihood + 0.5 * stable_penalty_term;
+                    if !profile_cost.is_finite() {
+                        return Err(format!(
+                            "latent baseline: non-finite profile cost \
+                             (log_likelihood={log_likelihood}, \
+                             stable_penalty_term={stable_penalty_term}, cost={profile_cost})"
+                        ));
+                    }
+                    let gradient = baseline_chain_rule_gradient(
+                        age_entry.view(),
+                        age_exit.view(),
+                        candidate,
+                        &residuals,
+                    )?
+                    .ok_or_else(|| {
+                        "latent baseline unexpectedly has no theta gradient".to_string()
+                    })?;
+                    Ok((profile_cost, gradient))
+                },
+            )?;
         }
         let prepared = prepare_survival_time_stack(
             &age_entry,

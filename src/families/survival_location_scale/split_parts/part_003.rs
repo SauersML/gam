@@ -501,6 +501,98 @@ mod tests {
         ]
     }
 
+    /// Total data-fit log-likelihood `ℓ = Σ_i w_i·log L_i` of the survival
+    /// location-scale family at the given block states, evaluated with an
+    /// arbitrary inverse link (the rest of the family fixed). Mirrors the
+    /// `offset_channel_geometry` row loop: the dynamic geometry (u0 = h0+q0,
+    /// u1 = h1+q1) depends only on the block states, so swapping the link
+    /// re-evaluates only the kernel coefficients. Used to finite-difference the
+    /// inverse-link data-fit θ-gradient.
+    fn survival_ls_total_log_likelihood_with_link(
+        family: &SurvivalLocationScaleFamily,
+        block_states: &[ParameterBlockState],
+        link: &InverseLink,
+    ) -> f64 {
+        let mut probe = family.clone();
+        probe.inverse_link = link.clone();
+        let dynamic = probe
+            .build_dynamic_geometry(block_states)
+            .expect("dynamic geometry");
+        let mut ll = 0.0;
+        for i in 0..probe.n {
+            if probe.w[i] <= 0.0 {
+                continue;
+            }
+            let state = probe.row_predictor_state(
+                dynamic.h_entry[i],
+                dynamic.h_exit[i],
+                dynamic.hdot_exit[i],
+                dynamic.q_entry[i],
+                dynamic.q_exit[i],
+                dynamic.qdot_exit[i],
+            );
+            if let Some(kernel) = probe.exact_row_kernel(i, state).expect("row kernel") {
+                ll += kernel.log_likelihood();
+            }
+        }
+        ll
+    }
+
+    /// FD check for `SurvivalLocationScaleFamily::link_param_data_fit_gradient`:
+    /// the analytic `∂(−ℓ)/∂θ_link` for the SAS link `(ε, log δ)` must match a
+    /// central difference of the data-fit `−ℓ` at fixed β. This is the exact
+    /// data-fit term of the inverse-link profile-NLL gradient.
+    #[test]
+    fn link_param_data_fit_gradient_matches_finite_difference_sas() {
+        let mut family = survival_exact_newton_test_family();
+        let epsilon0 = 0.15;
+        let log_delta0 = -0.25;
+        family.inverse_link = InverseLink::Sas(
+            state_from_sasspec(SasLinkSpec {
+                initial_epsilon: epsilon0,
+                initial_log_delta: log_delta0,
+            })
+            .expect("sas state"),
+        );
+        let states = survival_exact_newton_test_states(&family, 0.35, 0.3, -0.1);
+
+        let analytic = family
+            .link_param_data_fit_gradient(&states)
+            .expect("link param data-fit gradient")
+            .expect("SAS link has free parameters");
+        assert_eq!(analytic.len(), 2, "SAS link has two parameters (ε, log δ)");
+
+        let neg_ll = |epsilon: f64, log_delta: f64| -> f64 {
+            let link = InverseLink::Sas(
+                state_from_sasspec(SasLinkSpec {
+                    initial_epsilon: epsilon,
+                    initial_log_delta: log_delta,
+                })
+                .expect("sas state"),
+            );
+            -survival_ls_total_log_likelihood_with_link(&family, &states, &link)
+        };
+
+        let h = 1e-6;
+        let fd_epsilon =
+            (neg_ll(epsilon0 + h, log_delta0) - neg_ll(epsilon0 - h, log_delta0)) / (2.0 * h);
+        let fd_log_delta =
+            (neg_ll(epsilon0, log_delta0 + h) - neg_ll(epsilon0, log_delta0 - h)) / (2.0 * h);
+
+        assert!(
+            (analytic[0] - fd_epsilon).abs() <= 1e-5 * fd_epsilon.abs().max(1.0),
+            "∂(−ℓ)/∂ε mismatch: analytic={}, fd={}",
+            analytic[0],
+            fd_epsilon
+        );
+        assert!(
+            (analytic[1] - fd_log_delta).abs() <= 1e-5 * fd_log_delta.abs().max(1.0),
+            "∂(−ℓ)/∂log δ mismatch: analytic={}, fd={}",
+            analytic[1],
+            fd_log_delta
+        );
+    }
+
     impl SurvivalLsLocationScaleRow {
         fn from_standardized_q(
             eta_location: f64,

@@ -890,6 +890,12 @@ pub struct SurvivalLocationScaleTermFitResult {
     /// the row likelihood is separable in `(u0, u1, g)`. Used by the analytic
     /// θ-Hessian builder (chain rule second derivative).
     pub baseline_offset_curvatures: OffsetChannelCurvatures,
+    /// Exact data-fit gradient `∂(−ℓ)/∂θ_link` of the unpenalized
+    /// log-likelihood w.r.t. the inverse-link parameters at the converged β̂
+    /// (`None` when the inverse link carries no free parameters). Equals the
+    /// envelope-theorem θ_link-gradient of the profile penalized NLL, consumed
+    /// by the inverse-link BFGS optimizer.
+    pub link_param_data_fit_gradient: Option<Array1<f64>>,
 }
 
 
@@ -2952,6 +2958,144 @@ impl SurvivalLocationScaleFamily {
             },
             OffsetChannelCurvatures { rows: curvatures },
         ))
+    }
+
+    /// Exact data-fit gradient `Σ_i ∂ℓ_i/∂θ_link` of the unpenalized
+    /// log-likelihood with respect to the inverse-link parameters θ_link
+    /// (SAS `(ε, log δ)`, BetaLogistic `(ε, log δ)`, or Mixture `ρ`), holding
+    /// the fitted β and λ fixed.
+    ///
+    /// The per-row log-likelihood is
+    ///   ℓ_i = w_i·( event_mix(d_i, logφ(u1_i) + log g_i, log S(u1_i)) − log S(u0_i) ),
+    /// where `u0 = h0 + q0` and `u1 = h1 + q1` are the standardized residuals
+    /// the inverse link evaluates (entry/exit), `log g` is the time-derivative
+    /// Jacobian (link-independent), and the link enters ONLY through the scalar
+    /// `log S(u) = log(1 − μ(u;θ))` and `log φ(u) = log d1(u;θ)` terms. Hence
+    ///   ∂(log S)/∂θ = −(∂μ/∂θ)/S,   ∂(log φ)/∂θ = (∂d1/∂θ)/d1,
+    /// with `S = 1 − μ`, `μ = jet.mu`, `d1 = jet.d1`, and the parameter partials
+    /// `∂μ/∂θ`, `∂d1/∂θ` supplied analytically by
+    /// [`InverseLinkKernel::param_partials`]. The higher-order ratio/pdf
+    /// derivatives (r, dr, …, fppp) carry the inner-Newton curvature only and do
+    /// NOT appear in the scalar ℓ, so the data-fit θ-gradient needs only the
+    /// `(μ, d1)` jet components and their param partials — all exact.
+    ///
+    /// At the converged β̂ the envelope theorem makes this the exact θ-gradient
+    /// of the profile penalized NLL `−ℓ + ½βᵀSβ` (β profiled out; the penalty
+    /// has no θ_link dependence). Returns a length-`n_link_params` vector
+    /// (`∂(−ℓ)/∂θ` so it matches the profile-cost sign), or `None` when the
+    /// inverse link carries no free parameters.
+    pub(crate) fn link_param_data_fit_gradient(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array1<f64>>, String> {
+        use crate::solver::mixture_link::{InverseLinkKernel, LinkParamPartials};
+        let n = self.n;
+        if block_states.is_empty() {
+            return Ok(None);
+        }
+        // ∂(log S)/∂θ and ∂(log φ)/∂θ contributions per row are accumulated
+        // into a θ-length vector. Probe the parameter count from the link's
+        // partials at a finite argument; `None` ⇒ no free link parameters.
+        let probe = self
+            .inverse_link
+            .param_partials(0.0)
+            .map_err(|e| format!("inverse-link param partials probe failed: {e}"))?;
+        let n_theta = match &probe {
+            None => return Ok(None),
+            Some(LinkParamPartials::Sas(_)) => 2,
+            Some(LinkParamPartials::Mixture(m)) => m.djet_drho.len(),
+        };
+        if n_theta == 0 {
+            return Ok(None);
+        }
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        // ∂(log S)/∂θ = −(∂μ/∂θ)/S at argument u (S = 1 − μ);
+        // ∂(log φ)/∂θ = (∂d1/∂θ)/d1 at argument u.
+        let dlog_survival_dtheta = |u: f64| -> Result<Vec<f64>, String> {
+            let partials = self
+                .inverse_link
+                .param_partials(u)
+                .map_err(|e| format!("inverse-link survival param partials failed: {e}"))?
+                .ok_or_else(|| "inverse-link reported no param partials".to_string())?;
+            let jet = self
+                .inverse_link
+                .jet(u)
+                .map_err(|e| format!("inverse-link jet failed at u={u}: {e}"))?;
+            let s = (1.0 - jet.mu).clamp(f64::MIN_POSITIVE, 1.0);
+            let map = |dmu: f64| -dmu / s;
+            Ok(match partials {
+                LinkParamPartials::Sas(p) => {
+                    vec![map(p.djet_depsilon.mu), map(p.djet_dlog_delta.mu)]
+                }
+                LinkParamPartials::Mixture(p) => {
+                    p.djet_drho.iter().map(|j| map(j.mu)).collect()
+                }
+            })
+        };
+        let dlog_pdf_dtheta = |u: f64| -> Result<Vec<f64>, String> {
+            let partials = self
+                .inverse_link
+                .param_partials(u)
+                .map_err(|e| format!("inverse-link pdf param partials failed: {e}"))?
+                .ok_or_else(|| "inverse-link reported no param partials".to_string())?;
+            let jet = self
+                .inverse_link
+                .jet(u)
+                .map_err(|e| format!("inverse-link jet failed at u={u}: {e}"))?;
+            let f = jet.d1;
+            if !(f.is_finite() && f > 0.0) {
+                return Err(format!(
+                    "inverse-link pdf (d1) must be finite positive for θ-gradient, got {f} at u={u}"
+                ));
+            }
+            let map = |dd1: f64| dd1 / f;
+            Ok(match partials {
+                LinkParamPartials::Sas(p) => {
+                    vec![map(p.djet_depsilon.d1), map(p.djet_dlog_delta.d1)]
+                }
+                LinkParamPartials::Mixture(p) => {
+                    p.djet_drho.iter().map(|j| map(j.d1)).collect()
+                }
+            })
+        };
+        // Accumulate ∂(−ℓ)/∂θ = −Σ_i w_i·( event_mix(d, ∂logφ(u1), ∂logS(u1))
+        //                                    − ∂logS(u0) ).
+        let mut grad = Array1::<f64>::zeros(n_theta);
+        for i in 0..n {
+            let w = self.w[i];
+            if w <= 0.0 {
+                continue;
+            }
+            let d = self.validated_event_target(i)?;
+            let u0 = dynamic.h_entry[i] + dynamic.q_entry[i];
+            let u1 = dynamic.h_exit[i] + dynamic.q_exit[i];
+            let dls_u0 = dlog_survival_dtheta(u0)?;
+            // Entry channel always contributes (left-truncation term −log S(u0)).
+            for k in 0..n_theta {
+                grad[k] += w * dls_u0[k];
+            }
+            if d <= 0.0 {
+                // Censored: +log S(u1).
+                let dls_u1 = dlog_survival_dtheta(u1)?;
+                for k in 0..n_theta {
+                    grad[k] -= w * dls_u1[k];
+                }
+            } else if d >= 1.0 {
+                // Event: +log φ(u1) (log g is link-independent).
+                let dlp_u1 = dlog_pdf_dtheta(u1)?;
+                for k in 0..n_theta {
+                    grad[k] -= w * dlp_u1[k];
+                }
+            } else {
+                // Fractional event weight: mix both branches.
+                let dls_u1 = dlog_survival_dtheta(u1)?;
+                let dlp_u1 = dlog_pdf_dtheta(u1)?;
+                for k in 0..n_theta {
+                    grad[k] -= w * (d * dlp_u1[k] + (1.0 - d) * dls_u1[k]);
+                }
+            }
+        }
+        Ok(Some(grad))
     }
 
     fn exact_newton_joint_psi_direction(

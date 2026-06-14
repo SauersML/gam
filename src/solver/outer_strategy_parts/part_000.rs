@@ -1599,12 +1599,13 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             hessian_source: H::BfgsApprox,
         },
         // No analytic gradient (with or without a declared Hessian), and the
-        // EFS/HybridEFS fixed-point lane ruled out above. There is no
-        // gradient-free solver any more — the compass-search direct search was
-        // purged. Emit a BFGS plan so the error surfaces loudly with context:
-        // the runner rejects it because BFGS requires the analytic gradient
-        // this capability declares is absent. We deliberately do NOT invent a
-        // working primary here — a cost-only objective has no solver, by design.
+        // EFS/HybridEFS fixed-point lane ruled out above. Every outer objective
+        // in the tree now supplies an analytic gradient, so a cost-only
+        // capability is a programming error. Emit a BFGS plan so it surfaces
+        // loudly with context: the runner rejects it because BFGS requires the
+        // analytic gradient this capability declares is absent. We deliberately
+        // do NOT invent a working primary here — a cost-only objective has no
+        // solver, by design.
         (Unavailable, _) => OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
