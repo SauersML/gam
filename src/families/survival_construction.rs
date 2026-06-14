@@ -4386,6 +4386,97 @@ mod tests {
         );
     }
 
+    /// Weibull (dim=2) companion to
+    /// `gompertz_makeham_baseline_chain_rule_gradient_matches_finite_difference`.
+    ///
+    /// This is the FD gate for the analytic outer θ-gradient that the
+    /// transformation/Weibull survival baseline optimizers now feed to BFGS
+    /// (`optimize_survival_baseline_config_with_gradient_only`, replacing the
+    /// gradient-free compass search). At a *fixed* β the profile-NLL surface is
+    /// `L(θ) = Σ_i [ r_X[i]·η(t_exit_i;θ) + r_E[i]·η(t_entry_i;θ)
+    ///              + r_D[i]·o_D(t_exit_i;θ) ]`,
+    /// whose exact gradient is `baseline_chain_rule_gradient`. Comparing it to a
+    /// central difference of `L` over `evaluate_survival_baseline` exercises the
+    /// Weibull scale/shape partials at both entry and exit ages. If this
+    /// disagrees with FD, the workflow's outer gradient is wrong by the same
+    /// amount.
+    #[test]
+    fn weibull_baseline_chain_rule_gradient_matches_finite_difference() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Weibull,
+            scale: Some(11.0),
+            shape: Some(1.4),
+            rate: None,
+            makeham: None,
+        };
+        let age_entry = array![5.0, 8.0, 12.0, 0.5, 20.0, 30.0, 45.0, 60.0];
+        let age_exit = array![10.0, 15.0, 25.0, 4.0, 35.0, 50.0, 65.0, 80.0];
+        let residuals = OffsetChannelResiduals {
+            exit: array![0.42, -0.18, 0.73, -0.91, 0.05, -0.27, 0.61, -0.34],
+            entry: array![-0.12, 0.31, -0.44, 0.0, 0.16, -0.22, 0.07, -0.51],
+            derivative: array![1.04, -0.65, 0.18, -1.21, 0.42, -0.13, 0.88, -0.27],
+        };
+
+        let analytic =
+            baseline_chain_rule_gradient(age_entry.view(), age_exit.view(), &cfg, &residuals)
+                .expect("analytic gradient ok")
+                .expect("Weibull baseline has a θ-gradient");
+        assert_eq!(analytic.len(), 2, "Weibull θ has 2 components");
+
+        let loss_at_cfg = |cfg_eval: &SurvivalBaselineConfig| -> f64 {
+            let mut acc = 0.0;
+            for i in 0..age_exit.len() {
+                let (eta_exit_i, od_exit_i) =
+                    evaluate_survival_baseline(age_exit[i], cfg_eval).expect("eval exit");
+                acc += residuals.exit[i] * eta_exit_i + residuals.derivative[i] * od_exit_i;
+                if residuals.entry[i] != 0.0 {
+                    let (eta_entry_i, _) =
+                        evaluate_survival_baseline(age_entry[i], cfg_eval).expect("eval entry");
+                    acc += residuals.entry[i] * eta_entry_i;
+                }
+            }
+            acc
+        };
+
+        let theta0 = survival_baseline_theta_from_config(&cfg)
+            .expect("theta seed")
+            .expect("Weibull has θ");
+        let delta = 1e-4;
+        let mut fd = Array1::<f64>::zeros(analytic.len());
+        for k in 0..analytic.len() {
+            let mut theta_plus = theta0.clone();
+            theta_plus[k] += delta;
+            let mut theta_minus = theta0.clone();
+            theta_minus[k] -= delta;
+            let cfg_plus =
+                survival_baseline_config_from_theta(cfg.target, &theta_plus).expect("cfg(θ+δ)");
+            let cfg_minus =
+                survival_baseline_config_from_theta(cfg.target, &theta_minus).expect("cfg(θ-δ)");
+            let lp = loss_at_cfg(&cfg_plus);
+            let lm = loss_at_cfg(&cfg_minus);
+            fd[k] = (lp - lm) / (2.0 * delta);
+        }
+
+        let analytic_norm = analytic.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let max_err = analytic
+            .iter()
+            .zip(fd.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        let rel = max_err / (analytic_norm + 1e-12);
+        eprintln!(
+            "weibull_baseline_chain_rule_gradient_matches_finite_difference: \
+             analytic={analytic:?} fd={fd:?} max_err={max_err:.3e} \
+             analytic_inf_norm={analytic_norm:.3e} rel={rel:.3e}"
+        );
+        assert!(
+            rel < 1e-2,
+            "analytic θ-gradient disagrees with central FD beyond 1%: \
+             analytic={analytic:?}, fd={fd:?}, max_err={max_err:.3e}, \
+             rel={rel:.3e} (analytic_inf_norm={analytic_norm:.3e})"
+        );
+    }
+
     // ─── baseline_offset_theta_partials — analytic vs central-difference ─
 
     /// Central-difference of (eta, o_D) at fixed age wrt each θ component in
