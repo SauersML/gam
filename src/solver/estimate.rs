@@ -2980,6 +2980,15 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// fixed column transform the streamed Gram uses), so the installed
     /// statistics are frame-exact against the streamed ones.
     psi_gram_tensor: Option<std::sync::Arc<crate::solver::psi_gram_tensor::PsiGramTensor>>,
+    /// Frozen-weight GLM first-Fisher-step data-fit Gram `XᵀWX` staged for the
+    /// CURRENT ψ-trial (#1111 / #1033 mechanism (c)), in the conditioned
+    /// (`x_fit`) frame. Set per-trial by [`SpatialJointContext::eval_full`] when
+    /// the frozen-W tensor covers ψ and the working weight has not drifted, then
+    /// installed onto the inner REML surface inside `prepare_eval_state` (after
+    /// `reset_surface`, on both the slow and design-revision fast paths) and
+    /// cleared. `None` (the default) clears the surface slot so a stale
+    /// previous-ψ Gram is never consumed.
+    pending_glm_first_step_gram: Option<std::sync::Arc<Array2<f64>>>,
 }
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
@@ -3045,7 +3054,17 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             reml_state,
             last_canonical_revision: None,
             psi_gram_tensor: None,
+            pending_glm_first_step_gram: None,
         })
+    }
+
+    /// Stage (or clear) the frozen-weight GLM first-Fisher-step Gram for the
+    /// next trial eval (#1111 / #1033 mechanism (c)). The staged Gram is
+    /// installed onto the inner REML surface inside `prepare_eval_state` and
+    /// then cleared; passing `None` clears any previously staged Gram so a stale
+    /// previous-ψ Gram is never consumed.
+    pub(crate) fn stage_glm_first_step_gram(&mut self, gram: Option<Array2<f64>>) {
+        self.pending_glm_first_step_gram = gram.map(std::sync::Arc::new);
     }
 
     pub(crate) fn set_analytic_penalty_registry(
@@ -3316,6 +3335,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             // slow path below clears + reinstalls these; the fast path skips
             // `reset_surface` (which clears them), so we re-install here directly.
             self.install_psi_gram_statistics(theta, rho_dim);
+            self.install_pending_glm_first_step_gram();
             return Ok(hyper_dirs);
         }
 
@@ -3366,7 +3386,27 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // (`reset_surface` above just cleared the slot for the new design). Same
         // installer the fast path uses, so both branches key the Gram to ψ.
         self.install_psi_gram_statistics(theta, rho_dim);
+        self.install_pending_glm_first_step_gram();
         Ok(hyper_dirs)
+    }
+
+    /// Install the staged frozen-W GLM first-step Gram onto the inner REML
+    /// surface for the current trial, or clear the surface slot when nothing is
+    /// staged (#1111 / #1033 mechanism (c)). Called after `reset_surface` (slow
+    /// path) and on the design-revision fast path, mirroring
+    /// `install_psi_gram_statistics`: the Gram is ψ-keyed, so it must be
+    /// (re)installed per trial and never carried over from the previous ψ.
+    fn install_pending_glm_first_step_gram(&mut self) {
+        match self.pending_glm_first_step_gram.take() {
+            Some(gram) => {
+                if !self.reml_state.install_glm_first_step_gram(gram) {
+                    // Shape mismatch against the current surface — fall back to
+                    // the exact streamed first-iteration Gram.
+                    self.reml_state.clear_glm_first_step_gram();
+                }
+            }
+            None => self.reml_state.clear_glm_first_step_gram(),
+        }
     }
 
     pub(crate) fn evaluate_with_order(
@@ -3507,6 +3547,15 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             self.reml_state
                 .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
             self.reml_state.setwarm_start_original_beta(warm_start_beta);
+            // #1111 / #1033 mechanism (c): a BFGS line-search VALUE probe runs at
+            // a DIFFERENT ψ than the full eval that staged the frozen-W first-step
+            // Gram. On the design-revision fast path `reset_surface` is skipped, so
+            // a Gram installed for a prior trial's ψ would otherwise leak into this
+            // probe's inner P-IRLS first iteration — a wrong-ψ Gram. The frozen
+            // first-step lane is gradient/full-eval-only (eval_full is the sole
+            // stager), so unconditionally clear the slot here; the probe restreams
+            // its first-iteration Gram exactly.
+            self.reml_state.clear_glm_first_step_gram();
             return Ok(());
         }
 
@@ -4705,6 +4754,9 @@ where
             priorweights: w_o.view(),
             covariate_se: None,
             gaussian_fixed_cache: final_cache_handle.as_deref(),
+            // The final reported fit must be exact at the converged ρ/ψ — never
+            // serve the frozen-W first-step approximation here.
+            glm_first_step_gram: None,
         },
         pirls::PenaltyConfig {
             canonical_penalties: reml_state.canonical_penalties(),

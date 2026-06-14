@@ -2252,23 +2252,38 @@ impl<'d> SpatialJointContext<'d> {
                 );
             }
         }
-        if theta.len() == self.rho_dim + 1 {
-            let psi = theta[self.rho_dim];
-            if let (Some(tensor), Some(beta)) = (self.frozen_glm_tensor.as_ref(), warm_beta.as_ref())
-            {
-                if tensor.contains(psi) {
-                    if let Some((current_w, _)) = self.frozen_glm_working_state(beta)? {
-                        const FROZEN_GLM_WEIGHT_DRIFT_RTOL: f64 = 1e-3;
-                        let drift_ok =
-                            tensor.weight_drift_within(current_w.view(), FROZEN_GLM_WEIGHT_DRIFT_RTOL);
+        // #1111 / #1033 mechanism (c): when the certified frozen-weight GLM
+        // ψ-tensor covers this trial's ψ AND the trial's converged working
+        // weight has not drifted past tolerance from the frozen snapshot, the
+        // first Fisher-scoring iteration's XᵀWX is faithfully reproduced by the
+        // tensor's n-free k×k assembly. Stage it on the evaluator so
+        // `prepare_eval_state` installs it onto the inner REML surface (after
+        // `reset_surface`, on BOTH the slow and design-revision fast paths) —
+        // the GLM inner P-IRLS then serves its first-iteration Gram n-free
+        // instead of restreaming the dominant O(n·p²) weighted cross-product.
+        // Outside the window or past the drift tolerance we clear the slot so a
+        // stale previous-ψ Gram is never consumed; the exact stream then runs.
+        {
+            let mut staged_gram: Option<Array2<f64>> = None;
+            if theta.len() == self.rho_dim + 1 {
+                let psi = theta[self.rho_dim];
+                if let (Some(tensor), Some(beta)) =
+                    (self.frozen_glm_tensor.as_ref(), warm_beta.as_ref())
+                    && tensor.contains(psi)
+                    && let Some((current_w, _)) = self.frozen_glm_working_state(beta)?
+                {
+                    const FROZEN_GLM_WEIGHT_DRIFT_RTOL: f64 = 1e-3;
+                    if tensor.weight_drift_within(current_w.view(), FROZEN_GLM_WEIGHT_DRIFT_RTOL) {
+                        staged_gram = Some(tensor.gram_at(psi));
                         log::debug!(
-                            "[STAGE] {} eval_full at psi={psi:.6}: frozen-W GLM tensor covers \
-                             first Fisher statistics (weight_drift_ok={drift_ok})",
+                            "[STAGE] {} eval_full at psi={psi:.6}: serving frozen-W GLM \
+                             first-Fisher-step XᵀWX n-free (weight drift within tol)",
                             kind.label(),
                         );
                     }
                 }
             }
+            self.evaluator.stage_glm_first_step_gram(staged_gram);
         }
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             self.data,

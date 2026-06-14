@@ -5752,6 +5752,11 @@ impl<'a> RemlState<'a> {
             // links this returns None and the inner solver falls back to the
             // streaming GEMM.
             let cache_handle = self.gaussian_fixed_cache_if_eligible();
+            // #1111 / #1033 mechanism (c): the frozen-W first-Fisher-step Gram
+            // (installed by the spatial GLM ψ-trial when it covers ψ and the
+            // working weight has not drifted) serves the GLM inner P-IRLS first
+            // iteration's XᵀWX n-free.
+            let glm_first_step_handle = self.glm_first_step_gram();
             let problem = pirls::PirlsProblem {
                 x: &self.x,
                 offset: self.offset.view(),
@@ -5759,6 +5764,7 @@ impl<'a> RemlState<'a> {
                 priorweights: self.weights,
                 covariate_se: None,
                 gaussian_fixed_cache: cache_handle.as_deref(),
+                glm_first_step_gram: glm_first_step_handle.as_deref(),
             };
             let penalty = pirls::PenaltyConfig {
                 canonical_penalties: &self.canonical_penalties,
@@ -6122,6 +6128,7 @@ impl<'a> RemlState<'a> {
         // belongs to the surface, not to a particular outer iteration), so
         // it is safe to reuse here for parity with `execute_pirls_if_needed`.
         let cache_handle = self.gaussian_fixed_cache_if_eligible();
+        let glm_first_step_handle = self.glm_first_step_gram();
         let problem = pirls::PirlsProblem {
             x: &self.x,
             offset: self.offset.view(),
@@ -6129,6 +6136,7 @@ impl<'a> RemlState<'a> {
             priorweights: self.weights,
             covariate_se: None,
             gaussian_fixed_cache: cache_handle.as_deref(),
+            glm_first_step_gram: glm_first_step_handle.as_deref(),
         };
         let penalty = pirls::PenaltyConfig {
             canonical_penalties: &self.canonical_penalties,
