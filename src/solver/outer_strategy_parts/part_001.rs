@@ -380,20 +380,11 @@ fn run_outer_with_plan(
         // The pre-warm is a warm-start for gradient-bearing PIRLS-inner
         // REML objectives: it walks ρ via `eval_with_order(_, ValueAndGradient)`
         // and carries the converged inner β forward through each step's
-        // `inner_beta_hint`. The derivative-free `Solver::CompassSearch`
-        // auxiliary path (survival/inverse-link baseline θ) has neither
-        // precondition — by contract it answers only `eval_cost` (its
-        // `eval`/`eval_with_order` closure is "unreachable by construction")
-        // and it carries no inner-β slot across probes. Running the pre-warm
-        // there would route straight into that error stub and reject every
-        // seed, so skip it: the direct search starts from `seed` directly,
-        // exactly as its dispatch (`Solver::CompassSearch` arm below) expects.
-        // A continuation-entry objective (SAE-manifold joint fit) MUST enter
-        // every seed through the heavy-smoothing ContinuationPath walk, so it
-        // opts into the priming pass even though it does not advertise the
-        // generic `allow_continuation_prewarm` warm-start. The `CompassSearch`
-        // exclusion still applies (its eval closure is unreachable by
-        // construction). For a continuation-entry objective a refused walk is
+        // `inner_beta_hint`. A continuation-entry objective (SAE-manifold joint
+        // fit) MUST enter every seed through the heavy-smoothing
+        // ContinuationPath walk, so it opts into the priming pass even though it
+        // does not advertise the generic `allow_continuation_prewarm`
+        // warm-start. For a continuation-entry objective a refused walk is
         // DEMOTED to a heavier regime below, not treated as a feasibility gate.
         let enter_via_continuation_path =
             obj.allow_continuation_prewarm() || continuation_path.is_some();
@@ -409,18 +400,13 @@ fn run_outer_with_plan(
         // ρ*. Re-entry / breach / underflow are non-fatal floor behaviors,
         // each consumed below — never a rejection.
         //
-        // Unlike the ρ-only `prime_outer_seed` pre-warm (which the CompassSearch
-        // exclusion below skips for the survival aux baseline whose
-        // `eval_with_order` is unreachable by construction), the walk runs for
-        // EVERY continuation-entry objective regardless of the primary solver
-        // class: the only objective that sets `requires_continuation_path_entry`
-        // is the SAE-manifold joint fit, whose `eval` / `seed_inner_state` /
-        // inner arrow-Schur ARE reachable. A small-ρ SAE fit dispatches to the
-        // derivative-free `CompassSearch` primary, and that direct search drives
-        // purely on `eval_cost` — which is exactly the cold inner solve the
-        // heavy-smoothing walk must warm first, or the cold `eval_cost` hits a
-        // non-PD inner block (the K≥2 routing-collapse failure Object 1 exists
-        // to prevent).
+        // The walk runs for EVERY continuation-entry objective regardless of the
+        // primary solver class: the only objective that sets
+        // `requires_continuation_path_entry` is the SAE-manifold joint fit,
+        // whose `eval` / `seed_inner_state` / inner arrow-Schur ARE reachable.
+        // The heavy-smoothing walk warms the cold inner solve first, or the cold
+        // `eval_cost` hits a non-PD inner block (the K≥2 routing-collapse failure
+        // Object 1 exists to prevent).
         if continuation_path.is_some() {
             {
                 // Rebuild the path per-seed against the OBJECTIVE's real ρ
@@ -568,10 +554,7 @@ fn run_outer_with_plan(
                 );
             }
         }
-        if the_plan.solver != Solver::CompassSearch
-            && continuation_path.is_none()
-            && enter_via_continuation_path
-        {
+        if continuation_path.is_none() && enter_via_continuation_path {
             if let Some(reason) = continuation_prewarm_suppressed_after.as_ref() {
                 log::info!(
                     "[OUTER] {context}: skipping continuation pre-warm for seed {seed_idx} \
@@ -1429,92 +1412,6 @@ fn run_outer_with_plan(
                     }
                 }
             }
-            Solver::CompassSearch => {
-                // Aux direct-search: uses cost values only, never queries
-                // gradient or Hessian. config.tolerance is the step-length
-                // floor, config.max_iter is the requested poll budget.
-                let projected_seed = project_to_bounds(seed, Some(&bounds_template));
-                let seed_cost = match obj.eval_cost(&projected_seed) {
-                    Ok(cost) => cost,
-                    Err(err) => {
-                        // A seed whose cost cannot even be evaluated — e.g. the SAE
-                        // pre-fit identifiability audit rejecting a seed whose
-                        // assignment has already starved an atom to a rank-0
-                        // weighted design — is a property of THIS seed, not a fatal
-                        // condition for the whole cascade. Demote it with a reason
-                        // and try the next seed rather than hard-rejecting the outer
-                        // run (mirrors the non-finite-cost demotion just below, and
-                        // honors the ContinuationPath "never reject" contract for the
-                        // aux direct-search seed path).
-                        rejection_reasons.push((
-                            seed_idx,
-                            "validation",
-                            format!("aux direct-search seed cost failed ({context}): {err}"),
-                        ));
-                        continue 'seed_attempts;
-                    }
-                };
-                if !seed_cost.is_finite() {
-                    rejection_reasons.push((
-                        seed_idx,
-                        "validation",
-                        format!("aux direct-search rejects non-finite seed cost ({seed_cost})"),
-                    ));
-                    continue 'seed_attempts;
-                }
-                started_seeds += 1;
-                seed_slot = started_seeds;
-                let (lo, hi) = &bounds_template;
-                // A compass search only emits its first-order stationarity
-                // certificate (Kolda-Lewis-Torczon Thm 3.3) once the step
-                // length contracts below `tolerance`. Starting from
-                // `COMPASS_INIT_STEP`, that takes
-                // `ceil(log2(init_step / tolerance))` non-improving sweeps,
-                // and each sweep polls all `2·dim` coordinate directions
-                // before halving. A poll budget below that contraction cost
-                // can therefore *never* reach the certificate: the search
-                // always returns `BudgetExhausted`, which survival/inverse-
-                // link callers turn into a hard "did not converge" error —
-                // even on perfectly well-posed data. (This is exactly what
-                // sank the survival non-linear-baseline path once the
-                // continuation-pre-warm gate above let it run at all.) Floor
-                // the budget at the contraction cost plus an equal allowance
-                // for improving (descent) moves, so the search can both
-                // descend to the optimum and certify it. A caller asking for
-                // more via `max_iter` still wins; this only raises budgets
-                // that are too small to be self-consistent.
-                let dim = projected_seed.len().max(1);
-                let contraction_sweeps = (COMPASS_INIT_STEP / config.tolerance)
-                    .log2()
-                    .ceil()
-                    .max(1.0) as usize;
-                let contraction_polls = contraction_sweeps.saturating_mul(2 * dim);
-                let certification_budget = contraction_polls.saturating_mul(2);
-                let max_polls = config.max_iter.max(certification_budget);
-                let outcome = compass_search_outer(
-                    obj,
-                    projected_seed,
-                    seed_cost,
-                    lo.view(),
-                    hi.view(),
-                    COMPASS_INIT_STEP,
-                    config.tolerance,
-                    max_polls,
-                );
-                match outcome {
-                    CompassSearchOutcome::Converged { point, cost, polls } => {
-                        Ok(OuterResult::new(point, cost, polls, true, *the_plan))
-                    }
-                    CompassSearchOutcome::BudgetExhausted { point, cost, polls } => {
-                        log::warn!(
-                            "[OUTER warning] {context}: compass search exhausted max_polls={} at best_cost={:.6e}",
-                            max_polls,
-                            cost,
-                        );
-                        Ok(OuterResult::new(point, cost, polls, false, *the_plan))
-                    }
-                }
-            }
         };
 
         let seed_elapsed = t_seed_start.elapsed().as_secs_f64();
@@ -2128,13 +2025,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_cost_only_few_params_selects_compass_search() {
+    fn plan_cost_only_few_params_fails_loudly_with_bfgs() {
         // No analytic gradient, no analytic Hessian, few params, no
-        // fixed-point lane: a genuinely cost-only objective (the SAE-manifold
-        // REML criterion at small ρ). The primary plan must be CompassSearch
-        // (derivative-free, eval_cost-only), NOT Bfgs — Bfgs would be rejected
-        // by the runner for needing a gradient the objective cannot supply,
-        // leaving the fit with no working primary.
+        // fixed-point lane: a genuinely cost-only objective. The compass-search
+        // direct search was purged, so there is no gradient-free solver left.
+        // The planner emits Bfgs, which the runner rejects loudly for needing a
+        // gradient the objective cannot supply — by design, a cost-only
+        // objective has no working primary.
         let cap = OuterCapability {
             gradient: Derivative::Unavailable,
             hessian: DeclaredHessianForm::Unavailable,
@@ -2146,15 +2043,14 @@ mod tests {
             disable_fixed_point: false,
         };
         let p = plan(&cap);
-        assert_eq!(p.solver, Solver::CompassSearch);
+        assert_eq!(p.solver, Solver::Bfgs);
     }
 
     #[test]
     fn plan_cost_only_many_params_with_fixed_point_still_efs() {
-        // The cost-only CompassSearch route must NOT disturb v2's EFS
-        // selection: with the fixed-point lane eligible (many params,
+        // With the fixed-point lane eligible (many params,
         // fixed_point_available), a no-gradient/no-Hessian objective still
-        // gets Efs, not CompassSearch.
+        // gets Efs.
         let cap = OuterCapability {
             gradient: Derivative::Unavailable,
             hessian: DeclaredHessianForm::Unavailable,
@@ -2172,9 +2068,8 @@ mod tests {
 
     #[test]
     fn plan_no_gradient_with_declared_hessian_stays_bfgs() {
-        // Contradictory capability (Hessian declared but no gradient) is NOT
-        // the cost-only case and must keep the Bfgs reject-with-context path,
-        // not silently become CompassSearch.
+        // Contradictory capability (Hessian declared but no gradient) keeps the
+        // Bfgs reject-with-context path.
         let cap = OuterCapability {
             gradient: Derivative::Unavailable,
             hessian: DeclaredHessianForm::Either,
@@ -4490,7 +4385,7 @@ mod tests {
         );
     }
 
-    // ─── Gated SolverClass / CompassSearch dispatch ──────────────────────
+    // ─── SolverClass dispatch ────────────────────────────────────────────
 
     fn aux_cap_unavailable(n_params: usize) -> OuterCapability {
         OuterCapability {
@@ -4507,219 +4402,10 @@ mod tests {
 
     #[test]
     fn plan_with_class_primary_is_identical_to_plan_for_unavailable_grad() {
-        // `plan_with_class(Primary)` must delegate to `plan()` verbatim. For a
-        // cost-only (gradient+Hessian Unavailable, no fixed-point) capability
-        // that now means CompassSearch under both — the Primary class no longer
-        // diverges from `plan()`. The point of this test is the *identity*, not
-        // the specific solver.
+        // `plan_with_class(Primary)` must delegate to `plan()` verbatim. The
+        // point of this test is the *identity*, not the specific solver.
         let cap = aux_cap_unavailable(3);
         assert_eq!(plan_with_class(&cap, SolverClass::Primary), plan(&cap));
-    }
-
-    #[test]
-    fn plan_with_class_aux_unavailable_routes_to_compass_search() {
-        let cap = aux_cap_unavailable(3);
-        let p = plan_with_class(&cap, SolverClass::AuxiliaryGradientFree);
-        assert_eq!(p.solver, Solver::CompassSearch);
-    }
-
-    #[test]
-    fn plan_with_class_aux_analytic_grad_defers_to_primary_plan() {
-        // Aux class + analytic gradient is a misuse: the caller should
-        // have used Primary. We defer to the standard plan so the caller
-        // still gets a well-formed result rather than silently being
-        // routed to direct search when a derivative-based solver exists.
-        let cap = OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: DeclaredHessianForm::Either,
-            n_params: 3,
-            psi_dim: 0,
-            fixed_point_available: false,
-            barrier_config: None,
-            prefer_gradient_only: false,
-            disable_fixed_point: false,
-        };
-        let p = plan_with_class(&cap, SolverClass::AuxiliaryGradientFree);
-        assert_eq!(p.solver, Solver::Arc);
-    }
-
-    #[test]
-    fn plan_with_class_aux_efs_eligible_defers_to_primary() {
-        // If the coordinate structure is EFS-eligible, use EFS even if
-        // the caller set Auxiliary — EFS is strictly better than compass
-        // search whenever it applies.
-        let cap = OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: DeclaredHessianForm::Unavailable,
-            n_params: 12,
-            psi_dim: 0,
-            fixed_point_available: true,
-            barrier_config: None,
-            prefer_gradient_only: false,
-            disable_fixed_point: false,
-        };
-        let p = plan_with_class(&cap, SolverClass::AuxiliaryGradientFree);
-        assert_eq!(p.solver, Solver::Efs);
-    }
-
-    #[test]
-    fn automatic_fallback_never_includes_compass_search() {
-        // The fallback cascade must not introduce direct-search for the
-        // primary REML path. Aux direct-search is a single-attempt
-        // method; its dispatch is orthogonal to the fallback ladder.
-        let cap = OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: DeclaredHessianForm::Either,
-            n_params: 5,
-            psi_dim: 0,
-            fixed_point_available: false,
-            barrier_config: None,
-            prefer_gradient_only: false,
-            disable_fixed_point: false,
-        };
-        let attempts = automatic_fallback_attempts(&cap);
-        for attempt_cap in &attempts {
-            let p = plan_with_class(attempt_cap, SolverClass::Primary);
-            assert_ne!(p.solver, Solver::CompassSearch);
-        }
-    }
-
-    #[test]
-    fn compass_search_budget_accounts_for_single_seed() {
-        // Aux direct-search is intrinsically a single-seed local method;
-        // generating extra seeds would just duplicate cost.
-        let b = effective_seed_budget(
-            8,
-            Solver::CompassSearch,
-            crate::seeding::SeedRiskProfile::Survival,
-            false,
-        );
-        assert_eq!(b, 1);
-    }
-
-    #[test]
-    fn run_aux_compass_projects_seed_before_seed_cost() {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let problem = OuterProblem::new(1)
-            .with_solver_class(SolverClass::AuxiliaryGradientFree)
-            .with_bounds(array![0.0], array![1.0])
-            .with_initial_rho(array![2.0])
-            .with_max_iter(64);
-        let mut obj = problem.build_objective(
-            (),
-            {
-                let seen = Arc::clone(&seen);
-                move |_: &mut (), theta: &Array1<f64>| {
-                    seen.lock().unwrap().push(theta.clone());
-                    Ok((theta[0] - 2.0).powi(2))
-                }
-            },
-            |_: &mut (), _: &Array1<f64>| {
-                Err(EstimationError::InvalidInput(
-                    "aux direct-search test should not call eval".to_string(),
-                ))
-            },
-            None::<fn(&mut ())>,
-            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-        );
-        let result = problem
-            .run(&mut obj, "aux direct-search seed projection")
-            .expect("aux direct-search should evaluate the projected seed");
-        assert_eq!(result.plan_used.solver, Solver::CompassSearch);
-        assert_eq!(result.rho, array![1.0]);
-        assert_eq!(result.final_value, 1.0);
-        assert_eq!(
-            seen.lock().unwrap().first().cloned(),
-            Some(array![1.0]),
-            "aux direct-search must project the seed before evaluating its cost",
-        );
-    }
-
-    #[test]
-    fn aux_compass_skips_continuation_prewarm_with_interior_seed() {
-        // Regression for #392 (and the structural defect shared with
-        // #375/#369): the transformation / latent survival baseline-θ
-        // optimizer builds an `AuxiliaryGradientFree` problem whose
-        // gradient/full-eval closure is "unreachable by construction"
-        // (it answers only `eval_cost`). The magic-by-default continuation
-        // pre-warm walks ρ via `ValueAndGradient`; if it ran on this path
-        // it would route straight into that error stub and reject the
-        // single seed, yielding "no candidate seeds passed outer startup
-        // validation". The seed loop must therefore skip the pre-warm
-        // whenever the plan dispatches to `Solver::CompassSearch`.
-        //
-        // This models the failing shape faithfully: dim=2 (weibull/gompertz
-        // α,λ), a *seed interior to the bounds* (bounds = seed ± 6, exactly
-        // as `optimize_survival_baseline_config` builds them) so the
-        // pre-warm's oversmoothing ρ₀ does NOT collapse to the seed — i.e.
-        // the pre-warm would genuinely execute and hit the stub if the
-        // guard were absent. The eval closure carries the exact
-        // "unreachable by construction" message the baseline aux optimizer
-        // installs and flips a flag when touched; the test asserts both
-        // that the run converges and that the stub was never invoked.
-        let gradient_touched = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let seed = array![0.5, -0.3];
-        let lower = seed.mapv(|v| v - 6.0);
-        let upper = seed.mapv(|v| v + 6.0);
-        let problem = OuterProblem::new(2)
-            .with_solver_class(SolverClass::AuxiliaryGradientFree)
-            .with_tolerance(1e-4)
-            .with_max_iter(400)
-            .with_bounds(lower, upper)
-            .with_initial_rho(seed.clone())
-            .with_seed_config(crate::seeding::SeedConfig {
-                max_seeds: 1,
-                seed_budget: 1,
-                num_auxiliary_trailing: 2,
-                ..Default::default()
-            });
-        let target = seed.clone();
-        let mut obj = problem.build_objective(
-            (),
-            move |_: &mut (), theta: &Array1<f64>| {
-                // Strictly convex bowl centered at the seed: compass search
-                // certifies stationarity by contracting its step below tol.
-                Ok((theta - &target).mapv(|v| v * v).sum())
-            },
-            {
-                let gradient_touched = Arc::clone(&gradient_touched);
-                move |_: &mut (), _: &Array1<f64>| -> Result<OuterEval, EstimationError> {
-                    gradient_touched.store(true, std::sync::atomic::Ordering::SeqCst);
-                    Err(EstimationError::InvalidInput(
-                        "baseline aux optimizer: CompassSearch dispatch only calls eval_cost; \
-                         eval(gradient) is unreachable by construction"
-                            .to_string(),
-                    ))
-                }
-            },
-            None::<fn(&mut ())>,
-            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-        );
-        let result = problem
-            .run(&mut obj, "workflow survival transformation baseline")
-            .expect(
-                "interior-seed aux CompassSearch must converge without touching \
-                 the unreachable gradient closure (the continuation pre-warm \
-                 must be skipped for the gradient-free solver class)",
-            );
-        assert_eq!(result.plan_used.solver, Solver::CompassSearch);
-        assert!(
-            result.converged,
-            "aux CompassSearch should converge on the convex baseline bowl",
-        );
-        assert!(
-            !gradient_touched.load(std::sync::atomic::Ordering::SeqCst),
-            "the 'unreachable by construction' gradient closure must never be \
-             invoked on the CompassSearch path — the continuation pre-warm \
-             skip guard is the fix for #392",
-        );
-        // Direct search lands within one step-tol contraction of the bowl
-        // minimum (the seed); the surface there is essentially zero.
-        assert!(
-            result.final_value < 1e-3,
-            "final cost {} should be near the bowl minimum",
-            result.final_value,
-        );
     }
 
     #[test]
@@ -5319,12 +5005,11 @@ mod tests {
         );
 
         let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
-        // Use the AuxiliaryGradientFree class so a no-gradient problem
-        // routes to compass search (`run_aux_compass_projects_seed_before_seed_cost`
-        // above uses the same pattern). Bounds must contain the cached rho
+        // A gradient-bearing BFGS problem. Bounds must contain the cached rho
         // so the projector doesn't snap it away.
         let problem = OuterProblem::new(1)
-            .with_solver_class(SolverClass::AuxiliaryGradientFree)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
             .with_bounds(array![-5.0], array![5.0])
             .with_initial_rho(array![-3.0]) // deliberately not 2.5
             .with_max_iter(8)
@@ -5335,8 +5020,13 @@ mod tests {
                 seen.lock().unwrap().push(theta.clone());
                 Ok((theta[0] - 2.5).powi(2))
             },
-            |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, _: &Array1<f64>| {
-                Err(EstimationError::InvalidInput("eval not used".into()))
+            |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: (theta[0] - 2.5).powi(2),
+                    gradient: array![2.0 * (theta[0] - 2.5)],
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
             },
             None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,
             None::<
@@ -5446,8 +5136,11 @@ mod tests {
         session.finalize(&payload, Some(0.25), Some(7));
 
         let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
+        // The exact final cache hit short-circuits before any solver runs, so
+        // the declared derivatives only need to make a well-formed plan.
         let problem = OuterProblem::new(1)
-            .with_solver_class(SolverClass::AuxiliaryGradientFree)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
             .with_bounds(array![-5.0], array![5.0])
             .with_initial_rho(array![-3.0])
             .with_max_iter(8)
@@ -5458,8 +5151,13 @@ mod tests {
                 seen.lock().unwrap().push(theta.clone());
                 Ok((theta[0] - 2.5).powi(2))
             },
-            |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, _: &Array1<f64>| {
-                Err(EstimationError::InvalidInput("eval not used".into()))
+            |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: (theta[0] - 2.5).powi(2),
+                    gradient: array![2.0 * (theta[0] - 2.5)],
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
             },
             None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,
             None::<
