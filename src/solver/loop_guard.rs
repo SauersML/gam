@@ -40,17 +40,14 @@
 //! recovery, and fires once it spans the window. Loops that own a
 //! scale-aware flatness predicate of their own (the custom_family
 //! joint-Newton objective-flat counter, the blockwise frozen-loglik
-//! divergence detector) consume it directly; [`PlateauDetector`] composes
-//! it with the default relative-improvement predicate for loops that just
-//! hand over their merit stream.
-//!
-//! [`PlateauDetector`] answers the question attempt caps cannot see: a
-//! loop that still "makes progress" every iteration but whose MERIT is
-//! frozen. #744 ran to cycle 1199/1200 at a flat residual; #826 burned a
-//! CI timeout on a frozen joint residual. Feed it the loop's descent
-//! quantity (penalized NLL, residual norm, |g|) once per iteration; it
-//! reports a plateau once the relative improvement stays below a
-//! tolerance for a consecutive window — long before any iteration cap.
+//! divergence detector) consume it directly — they answer the question
+//! attempt caps cannot see: a loop that still "makes progress" every
+//! iteration but whose MERIT is frozen. #744 ran to cycle 1199/1200 at a
+//! flat residual; #826 burned a CI timeout on a frozen joint residual. The
+//! caller feeds its descent quantity (penalized NLL, residual norm, |g|)
+//! through its own flatness predicate once per iteration; the streak
+//! reports a plateau once flat readings span a consecutive window — long
+//! before any iteration cap.
 //!
 //! # Verdicts, not panics
 //!
@@ -89,20 +86,13 @@
 /// was a file-local convention; see module docs for why it must be shared.)
 pub const MADSEN_DAMPING_CAP: f64 = 1e12;
 
-/// Default consecutive-window length for [`PlateauDetector`]: how many
-/// successive merit readings must show sub-tolerance relative improvement
-/// before the loop is declared plateaued. Two is the established in-tree
-/// streak convention (reweight.rs soft-acceptance) — one noisy reading can
-/// fake a plateau, two consecutive cannot — plus one for the headroom a
-/// merit that is genuinely creeping (not frozen) needs to escape.
+/// Default consecutive-window length for a [`FlatStreak`] stagnation
+/// detector: how many successive flat readings must accumulate before the
+/// loop is declared plateaued. Two is the established in-tree streak
+/// convention (reweight.rs soft-acceptance) — one noisy reading can fake a
+/// plateau, two consecutive cannot — plus one for the headroom a merit that
+/// is genuinely creeping (not frozen) needs to escape.
 pub const PLATEAU_DEFAULT_WINDOW: usize = 3;
-
-/// Default relative-improvement tolerance for [`PlateauDetector`]. 1e-8 of
-/// the merit magnitude per iteration is far below any improvement a
-/// convergent inner Newton produces mid-run, yet orders of magnitude above
-/// roundoff jitter on a frozen merit (#744's flat residual, #826's frozen
-/// joint residual both sit at exactly 0 relative change).
-pub const PLATEAU_DEFAULT_REL_TOL: f64 = 1e-8;
 
 /// Is a damped retry still alive at this damping level?
 #[inline]
@@ -173,58 +163,6 @@ impl FlatStreak {
     /// contract).
     pub fn streak(&self) -> usize {
         self.streak
-    }
-}
-
-/// Stagnation detector on a loop's merit stream: [`FlatStreak`] composed
-/// with the default relative-improvement flatness predicate.
-///
-/// Feed it the loop's descent quantity once per iteration; it answers
-/// "has the relative improvement stayed below `rel_tol` for `window`
-/// consecutive readings?". Direction-agnostic: it watches |Δmerit|
-/// relative to the merit's magnitude, so minimized NLLs, residual norms,
-/// and gradient norms all work unaltered.
-#[derive(Clone, Debug)]
-pub struct PlateauDetector {
-    rel_tol: f64,
-    streak: FlatStreak,
-    last_merit: Option<f64>,
-}
-
-impl PlateauDetector {
-    pub fn new(window: usize, rel_tol: f64) -> Self {
-        Self {
-            rel_tol,
-            streak: FlatStreak::new(window),
-            last_merit: None,
-        }
-    }
-
-    /// In-tree default tuning; see the constant docs.
-    pub fn standard() -> Self {
-        Self::new(PLATEAU_DEFAULT_WINDOW, PLATEAU_DEFAULT_REL_TOL)
-    }
-
-    /// Record one merit reading; returns the current verdict. Non-finite
-    /// merits never count toward a plateau (a NaN merit is a different
-    /// failure, owned by the loop's own error handling) and reset the
-    /// streak so recovery is observed from scratch.
-    pub fn note(&mut self, merit: f64) -> LoopVerdict {
-        if !merit.is_finite() {
-            self.streak.reset();
-            self.last_merit = None;
-            return LoopVerdict::Continue;
-        }
-        let verdict = match self.last_merit {
-            Some(prev) => {
-                let scale = prev.abs().max(merit.abs()).max(1.0);
-                self.streak
-                    .note((prev - merit).abs() <= self.rel_tol * scale)
-            }
-            None => LoopVerdict::Continue,
-        };
-        self.last_merit = Some(merit);
-        verdict
     }
 }
 
@@ -438,41 +376,6 @@ mod tests {
         );
     }
 
-    /// #744 trace shape: merit descends, then freezes. The detector must
-    /// fire within `window` readings of the freeze and NOT fire while
-    /// genuine descent is happening.
-    #[test]
-    fn plateau_fires_on_frozen_merit_and_not_during_descent() {
-        let mut det = PlateauDetector::new(3, 1e-8);
-        let mut merit = 100.0;
-        for _ in 0..50 {
-            assert_eq!(det.note(merit), LoopVerdict::Continue, "descent phase");
-            merit *= 0.9;
-        }
-        let mut fired_after = 0usize;
-        loop {
-            fired_after += 1;
-            assert!(fired_after <= 4, "plateau must fire within the window");
-            if det.note(merit) == LoopVerdict::Plateaued {
-                break;
-            }
-        }
-        assert!(fired_after >= 3, "must not fire before the streak window");
-    }
-
-    #[test]
-    fn plateau_resets_on_recovery_and_ignores_non_finite() {
-        let mut det = PlateauDetector::new(2, 1e-8);
-        det.note(10.0);
-        assert_eq!(det.note(10.0), LoopVerdict::Continue); // streak 1
-        assert_eq!(det.note(9.0), LoopVerdict::Continue); // recovery resets
-        assert_eq!(det.note(9.0), LoopVerdict::Continue); // streak 1 again
-        assert_eq!(det.note(f64::NAN), LoopVerdict::Continue); // hard reset
-        assert_eq!(det.note(9.0), LoopVerdict::Continue); // re-baseline
-        assert_eq!(det.note(9.0), LoopVerdict::Continue); // streak 1
-        assert_eq!(det.note(9.0), LoopVerdict::Plateaued); // streak 2 fires
-    }
-
     /// The streak discipline alone (caller-owned flatness predicate, the
     /// custom_family consumption shape): grows on flat, resets on
     /// recovery, fires at the window and keeps firing while flat.
@@ -488,74 +391,6 @@ mod tests {
         assert_eq!(streak.note(true), LoopVerdict::Plateaued); // 3 fires
         assert_eq!(streak.note(true), LoopVerdict::Plateaued); // persists
         assert_eq!(streak.streak(), 4);
-    }
-
-    /// Suspect #1 of gam#1040: the plateau detector MUST be scale-invariant.
-    /// A survival marginal-slope NLL objective sits at O(1e4); an absolute
-    /// flat-threshold (|ΔV| < ε_abs) never fires there because a single cycle
-    /// can move the objective by O(1) in absolute terms while the relative
-    /// change |ΔV|/|V| is already at roundoff — the iterate IS on a flat
-    /// plateau yet an absolute test calls it "still moving" forever, which is
-    /// the never-terminating hang. The relative test (|ΔV| ≤ rel_tol·|V|)
-    /// fires identically at O(1) and O(1e4), so the loop terminates as
-    /// converged on the flat valley regardless of objective magnitude.
-    #[test]
-    fn plateau_detector_is_scale_invariant_on_large_magnitude_objective() {
-        let rel_tol = 1e-8;
-        let window = 3;
-
-        // A flat plateau at O(1e4): the objective creeps by ~6e-5 per cycle,
-        // which is |ΔV|/|V| ≈ 1e-9 < rel_tol — flat — yet would dwarf any
-        // sane absolute ε if one keyed off |ΔV| directly (6e-5 ≫ 1e-8).
-        let big = 6.0e4_f64;
-        let mut det_big = PlateauDetector::new(window, rel_tol);
-        det_big.note(big);
-        let mut big_fired_at = None;
-        for k in 0..window {
-            let v = big - 6.0e-5 * (k as f64 + 1.0);
-            if det_big.note(v) == LoopVerdict::Plateaued {
-                big_fired_at = Some(k);
-                break;
-            }
-        }
-        assert!(
-            big_fired_at.is_some(),
-            "relative plateau detector must terminate on an O(1e4) flat valley \
-             within the window; instead it ran past it (the #1040 hang)"
-        );
-
-        // The SAME relative stream scaled down to O(1) fires at the SAME
-        // streak position — scale invariance, the whole point.
-        let small = 1.0_f64;
-        let mut det_small = PlateauDetector::new(window, rel_tol);
-        det_small.note(small);
-        let mut small_fired_at = None;
-        for k in 0..window {
-            let v = small - 1.0e-9 * (k as f64 + 1.0);
-            if det_small.note(v) == LoopVerdict::Plateaued {
-                small_fired_at = Some(k);
-                break;
-            }
-        }
-        assert_eq!(
-            big_fired_at, small_fired_at,
-            "plateau detection must be invariant to objective magnitude"
-        );
-
-        // A genuinely non-flat large-magnitude descent (|ΔV|/|V| ≈ 1e-2 ≫
-        // rel_tol) must NOT be called a plateau — the relative test does not
-        // weaken a real convergence check, it only rescales it.
-        let mut det_moving = PlateauDetector::new(window, rel_tol);
-        det_moving.note(big);
-        let mut moving = big;
-        for _ in 0..window {
-            moving -= 0.01 * moving;
-            assert_eq!(
-                det_moving.note(moving),
-                LoopVerdict::Continue,
-                "a 1%-per-cycle relative descent must never register as flat"
-            );
-        }
     }
 
     /// A certificate exit must never report `converged=true` while the only
