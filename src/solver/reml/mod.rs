@@ -4685,6 +4685,25 @@ pub(crate) struct RemlState<'a> {
     /// same way it transforms the streamed Gram. Invalidated with the design.
     pub(crate) gaussian_psi_gram_deriv:
         RwLock<Option<Arc<(ndarray::Array2<f64>, ndarray::Array1<f64>)>>>,
+    /// Conditioned-frame exact ψ-derivative pair `(∂XᵀWX/∂ψ, ∂XᵀW(y−offset)/∂ψ)`
+    /// for the SINGLE design-moving spatial hyperparameter in the GLM (frozen-W)
+    /// lane (#1033 / #1111), assembled n-free from
+    /// [`crate::solver::glm_sufficient_lane::FrozenWeightGramTensor::gradient_pair_if_sound`]
+    /// and installed beside `glm_first_step_gram` at the same in-window
+    /// drift-OK trial. When present, the GLM ψ-gradient HyperCoord serves its
+    /// envelope `a_j` and score `g_j` from these k×k objects instead of
+    /// realizing and contracting the n×k ∂X/∂ψ slab — the second per-trial
+    /// n-pass. Unlike the Gaussian lane the Hessian curvature `B_j` is NOT
+    /// served from the tensor: for a GLM the per-trial `B_j` term
+    /// `X_τᵀWX + XᵀWX_τ` is irreducibly n-dependent (the moving working weight
+    /// `W` does not factor out of a frozen-W k×k object), so `B_j` keeps the
+    /// exact streamed slab (#1033). Lives in the SAME conditioned column frame
+    /// as `glm_first_step_gram` / `gaussian_fixed_cache.xtwx_orig`, so the
+    /// hyper-coord builder transforms it by the per-eval Qs/free-basis the same
+    /// way. NOT family-gated (the GLM lane's own slot). Invalidated with the
+    /// design.
+    pub(crate) glm_psi_gram_deriv:
+        RwLock<Option<Arc<(ndarray::Array2<f64>, ndarray::Array1<f64>)>>>,
     /// Frozen-weight first-Fisher-step data-fit Gram `XᵀWX` for the GLM
     /// design-moving ψ-sweep (#1111 / #1033 mechanism (c)), in the conditioned
     /// (original / `x_fit`) column frame — the SAME frame as

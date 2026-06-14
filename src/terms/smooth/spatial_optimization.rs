@@ -2285,6 +2285,42 @@ impl<'d> SpatialJointContext<'d> {
             }
             self.evaluator.stage_glm_first_step_gram(staged_gram);
         }
+        // #1033 / #1111: stage the GLM frozen-W conditioned-frame ψ-gradient
+        // derivative `(∂XᵀWX/∂ψ, ∂XᵀW(y−offset)/∂ψ)` whenever the certified
+        // frozen-weight tensor covers this trial's ψ for the gradient. The
+        // provider `gradient_pair_if_sound` applies its OWN tight
+        // `GRADIENT_WEIGHT_DRIFT_RTOL` (1e-9) drift check against the trial's
+        // converged working weight, so it refuses (`None`) unless the frozen-W
+        // snapshot is a bit-tight stand-in for the trial's `XᵀWX` — independent
+        // of the looser first-step value gate above. When it serves, the GLM
+        // ψ-gradient HyperCoord forms `a_j` / `g_j` from these k×k objects
+        // instead of the n×k ∂X/∂ψ slab; `B_j` (the moving-W Hessian curvature)
+        // is irreducibly n-dependent and stays the exact slab (#1033). Outside
+        // the window or past the tight tolerance we stage `None`, clearing the
+        // slot so a stale previous-ψ pair is never consumed; the exact slab
+        // gradient then runs.
+        {
+            let mut staged_deriv: Option<(Array2<f64>, Array1<f64>)> = None;
+            if theta.len() == self.rho_dim + 1 {
+                let psi = theta[self.rho_dim];
+                if let (Some(tensor), Some(beta)) =
+                    (self.frozen_glm_tensor.as_ref(), warm_beta.as_ref())
+                    && tensor.contains_for_gradient(psi)
+                    && let Some((current_w, _)) = self.frozen_glm_working_state(beta)?
+                    && let Some((dgram_dpsi, drhs_dpsi)) =
+                        tensor.gradient_pair_if_sound(psi, current_w.view())
+                {
+                    staged_deriv = Some((dgram_dpsi, drhs_dpsi));
+                    log::debug!(
+                        "[STAGE] {} eval_full at psi={psi:.6}: serving frozen-W GLM \
+                         ψ-gradient (∂G/∂ψ, ∂b/∂ψ) n-free (gradient weight drift within \
+                         tight tol); B_j stays exact",
+                        kind.label(),
+                    );
+                }
+            }
+            self.evaluator.stage_glm_psi_gram_deriv(staged_deriv);
+        }
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             self.data,
             self.cache.spec(),

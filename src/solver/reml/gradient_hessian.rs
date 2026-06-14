@@ -3554,6 +3554,7 @@ impl<'a> RemlState<'a> {
             kronecker_factored: None,
             gaussian_fixed_cache: RwLock::new(None),
             gaussian_psi_gram_deriv: RwLock::new(None),
+            glm_psi_gram_deriv: RwLock::new(None),
             glm_first_step_gram: RwLock::new(None),
             alo_frozen_nuisance: RwLock::new(None),
             persistent_warm_start_key: RwLock::new(None),
@@ -3614,6 +3615,10 @@ impl<'a> RemlState<'a> {
         // The conditioned-frame ψ-gram derivative is keyed to the same design;
         // a new design invalidates it. The installing trial repopulates it.
         *self.gaussian_psi_gram_deriv.write().unwrap() = None;
+        // The GLM frozen-W conditioned-frame ψ-gram derivative is keyed to the
+        // same design + ψ; a new design invalidates it. The installing trial
+        // repopulates it.
+        *self.glm_psi_gram_deriv.write().unwrap() = None;
         // The frozen-W GLM first-step Gram is keyed to the same design + ψ; a
         // new design invalidates it. The installing trial repopulates it.
         *self.glm_first_step_gram.write().unwrap() = None;
@@ -5275,6 +5280,48 @@ impl<'a> RemlState<'a> {
         &self,
     ) -> Option<Arc<(ndarray::Array2<f64>, ndarray::Array1<f64>)>> {
         self.gaussian_psi_gram_deriv
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    /// Install the conditioned-frame exact ψ-derivative pair
+    /// `(∂XᵀWX/∂ψ, ∂XᵀW(y−offset)/∂ψ)` for the single design-moving spatial
+    /// hyperparameter in the GLM frozen-W lane (#1033 / #1111). Shapes must
+    /// match the current `p` (k×k Gram derivative, k-vector rhs derivative).
+    /// NOT family-gated (the GLM lane's own slot, like `glm_first_step_gram`):
+    /// the caller only installs it after `gradient_pair_if_sound` certified the
+    /// trial's working weight is within `GRADIENT_WEIGHT_DRIFT_RTOL` of the
+    /// frozen snapshot. Returns whether the pair was installed; a shape
+    /// mismatch refuses (the gradient then keeps the exact ∂X/∂ψ slab path).
+    pub(crate) fn install_glm_psi_gram_deriv(
+        &self,
+        deriv: Arc<(ndarray::Array2<f64>, ndarray::Array1<f64>)>,
+    ) -> bool {
+        if deriv.0.nrows() != self.p || deriv.0.ncols() != self.p || deriv.1.len() != self.p {
+            return false;
+        }
+        *self.glm_psi_gram_deriv.write().unwrap() = Some(deriv);
+        true
+    }
+
+    /// Clear any installed GLM frozen-W conditioned-frame ψ-gram derivative.
+    /// Called per-trial before (re)installing for the current ψ, so a stale
+    /// previous-ψ derivative is never consumed when the current trial is
+    /// out-of-window or has drifted.
+    pub(crate) fn clear_glm_psi_gram_deriv(&self) {
+        *self.glm_psi_gram_deriv.write().unwrap() = None;
+    }
+
+    /// Conditioned-frame exact ψ-derivative pair for the current in-window
+    /// drift-OK GLM trial, when installed (#1033 / #1111). Consumed by the GLM
+    /// ψ-gradient HyperCoord to serve `a_j` / `g_j` n-free (`B_j` stays the
+    /// exact slab). `None` keeps the slab path.
+    pub(crate) fn glm_psi_gram_deriv(
+        &self,
+    ) -> Option<Arc<(ndarray::Array2<f64>, ndarray::Array1<f64>)>> {
+        self.glm_psi_gram_deriv
             .read()
             .unwrap()
             .as_ref()

@@ -1491,6 +1491,49 @@ impl<'a> RemlState<'a> {
                 None
             };
 
+        // #1033 / #1111: GLM analogue of the Gaussian tensor branch. When the
+        // frozen-W lane has installed the conditioned-frame exact ψ-derivative
+        // pair `(∂G/∂ψ, ∂b/∂ψ)` (certified within the TIGHT gradient drift
+        // tolerance by `gradient_pair_if_sound`), transform it into THIS eval's
+        // (Qs, free-basis) frame and let the j==0 coordinate serve its envelope
+        // `a_j` and score `g_j` from these k×k objects — retiring the second
+        // per-trial n-pass (`X_τᵀu`, `XᵀW(X_τβ̂)`). UNLIKE the Gaussian branch
+        // the Hessian curvature `B_j` is NOT served from the tensor: for a GLM
+        // the `X_τᵀWX + XᵀWX_τ` term is irreducibly n-dependent (the moving `W`
+        // does not factor out of a frozen-W k×k object), so `B_j` keeps the
+        // exact streamed slab below (#1033). Eligible only for the GLM case (NOT
+        // Gaussian-identity, which has its own full-tensor branch above), a
+        // single ψ coordinate, gradient-only (`!for_hessian`), and no Firth.
+        let glm_tensor_psi_deriv: Option<(Array2<f64>, Array1<f64>)> =
+            if !for_hessian && !is_gaussian_identity && psi_dim == 1 && firth_op.is_none() {
+                self.glm_psi_gram_deriv().and_then(|deriv| {
+                    let (dgram_c, drhs_c) = deriv.as_ref();
+                    let p_full = reparam_result.qs.nrows();
+                    if dgram_c.nrows() != p_full
+                        || dgram_c.ncols() != p_full
+                        || drhs_c.len() != p_full
+                    {
+                        return None;
+                    }
+                    // Same fixed, ψ-invariant column map W = qs · Z as the
+                    // Gaussian branch: ∂G_t/∂ψ = Wᵀ(∂G_c/∂ψ)W, ∂b_t/∂ψ = Wᵀ(∂b_c/∂ψ).
+                    let g_qs = reparam_result.qs.t().dot(dgram_c).dot(&reparam_result.qs);
+                    let b_qs = reparam_result.qs.t().dot(drhs_c);
+                    let (dgram_t, drhs_t) = if let Some(z) = free_basis_opt.as_ref() {
+                        (z.t().dot(&g_qs).dot(z), z.t().dot(&b_qs))
+                    } else {
+                        (g_qs, b_qs)
+                    };
+                    if dgram_t.nrows() == p_dim && drhs_t.len() == p_dim {
+                        Some((dgram_t, drhs_t))
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+
         let mut coords = Vec::with_capacity(psi_dim);
 
         for j in 0..psi_dim {
@@ -1633,6 +1676,29 @@ impl<'a> RemlState<'a> {
             let mut g_j = x_tau_t_u - xt_weighted_x_tau_beta_j - s_tau_j.dot(&beta_eval);
             if let Some(firth_g_j) = firth_g_j.as_ref() {
                 g_j -= firth_g_j;
+            }
+
+            // #1033 / #1111: for the GLM single design-moving coordinate
+            // (j == 0), when the certified frozen-W ψ-derivative pair is
+            // installed, REPLACE the slab-streamed `a_j` / `g_j` with the n-free
+            // tensor identities (the slab values above were the exact reference
+            // that this bit-tight tensor reconstruction matches):
+            //   g_j = ∂b_t/∂ψ − (∂G_t/∂ψ)·β̂ − S_τ·β̂
+            //   a_j = −[∂b_t/∂ψ·β̂ − ½β̂ᵀ(∂G_t/∂ψ)β̂] + ½β̂ᵀS_τβ̂
+            // (the envelope `X_τᵀu − XᵀW(X_τβ̂)` equals `∂b/∂ψ − ∂G/∂ψ·β̂` at β̂;
+            // the asymmetric `XᵀWX_τ` halves collapse in the bilinear/quadratic
+            // forms evaluated at β̂, exactly as in the Gaussian branch). The
+            // gate already excludes Firth, so `firth_g_j` is `None` here. `B_j`
+            // is left to the exact slab below — it is irreducibly n-dependent
+            // for a GLM (moving `W`).
+            if j == 0
+                && let Some((dgram_t, drhs_t)) = glm_tensor_psi_deriv.as_ref()
+            {
+                let s_tau_beta = s_tau_j.dot(&beta_eval);
+                let dgram_beta = dgram_t.dot(&beta_eval);
+                g_j = drhs_t - &dgram_beta - &s_tau_beta;
+                let quad_g = beta_eval.dot(&dgram_beta);
+                a_j = -(drhs_t.dot(&beta_eval) - 0.5 * quad_g) + 0.5 * beta_eval.dot(&s_tau_beta);
             }
 
             // --- B_j: fixed-β Hessian drift ---
@@ -2064,6 +2130,29 @@ impl<'a> RemlState<'a> {
             None
         };
 
+        // #1033 / #1111: GLM analogue of the above, original (conditioned) frame
+        // — `(∂G/∂ψ, ∂b/∂ψ)` map directly with NO qs transform. Serves the GLM
+        // ψ-gradient `a_j` / `g_j` n-free; `B_j` stays the exact slab (the
+        // moving-W Hessian term is irreducibly n-dependent for a GLM, #1033).
+        // Gated for the GLM case only (NOT Gaussian, which uses the branch
+        // above), a single ψ coordinate, gradient-only, no Firth.
+        let glm_tensor_psi_deriv: Option<(Array2<f64>, Array1<f64>)> = if !for_hessian
+            && !is_gaussian_identity
+            && psi_dim == 1
+            && firth_op_original.is_none()
+        {
+            self.glm_psi_gram_deriv().and_then(|deriv| {
+                let (dgram_c, drhs_c) = deriv.as_ref();
+                if dgram_c.nrows() == p_dim && dgram_c.ncols() == p_dim && drhs_c.len() == p_dim {
+                    Some((dgram_c.clone(), drhs_c.clone()))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
         let mut coords = Vec::with_capacity(psi_dim);
         for (j, dir) in hyper_dirs.iter().enumerate() {
             let s_tau_j = dir.penalty_total_at(rho, p_dim)?;
@@ -2146,6 +2235,22 @@ impl<'a> RemlState<'a> {
                         &eye,
                     ));
                 }
+            }
+
+            // #1033 / #1111: GLM single design-moving coordinate (j == 0) —
+            // REPLACE the slab-streamed `a_j` / `g_j` with the n-free tensor
+            // identities (same derivation as `build_tau_hyper_coords`; here the
+            // conditioned original frame means the pair is used directly). The
+            // gate excludes Firth, so `firth_g_j` is `None`. `B_j` is left to the
+            // exact slab below — irreducibly n-dependent for a GLM.
+            if j == 0
+                && let Some((dgram_t, drhs_t)) = glm_tensor_psi_deriv.as_ref()
+            {
+                let s_tau_beta = s_tau_j.dot(&beta_eval);
+                let dgram_beta = dgram_t.dot(&beta_eval);
+                g_j = drhs_t - &dgram_beta - &s_tau_beta;
+                let quad_g = beta_eval.dot(&dgram_beta);
+                a_j = -(drhs_t.dot(&beta_eval) - 0.5 * quad_g) + 0.5 * beta_eval.dot(&s_tau_beta);
             }
 
             let c_x_tau_beta = if is_gaussian_identity {

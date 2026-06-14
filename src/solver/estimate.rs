@@ -3006,6 +3006,17 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// cleared. `None` (the default) clears the surface slot so a stale
     /// previous-ψ Gram is never consumed.
     pending_glm_first_step_gram: Option<std::sync::Arc<Array2<f64>>>,
+    /// Conditioned-frame exact ψ-derivative pair `(∂XᵀWX/∂ψ, ∂XᵀW(y−offset)/∂ψ)`
+    /// staged for the CURRENT ψ-trial in the GLM frozen-W lane (#1033 / #1111),
+    /// in the conditioned (`x_fit`) frame. Set per-trial by
+    /// [`SpatialJointContext::eval_full`] from
+    /// [`crate::solver::glm_sufficient_lane::FrozenWeightGramTensor::gradient_pair_if_sound`]
+    /// when the frozen-W tensor covers ψ for the gradient and the working weight
+    /// has not drifted, then installed onto the inner REML surface inside
+    /// `prepare_eval_state` and cleared. Serves the GLM ψ-gradient `a_j` / `g_j`
+    /// n-free; `B_j` stays the exact slab. `None` (the default) clears the
+    /// surface slot so a stale previous-ψ derivative is never consumed.
+    pending_glm_psi_gram_deriv: Option<std::sync::Arc<(Array2<f64>, Array1<f64>)>>,
 }
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
@@ -3078,6 +3089,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             last_canonical_revision: None,
             psi_gram_tensor: None,
             pending_glm_first_step_gram: None,
+            pending_glm_psi_gram_deriv: None,
         })
     }
 
@@ -3088,6 +3100,23 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// previous-ψ Gram is never consumed.
     pub(crate) fn stage_glm_first_step_gram(&mut self, gram: Option<Array2<f64>>) {
         self.pending_glm_first_step_gram = gram.map(std::sync::Arc::new);
+    }
+
+    /// Stage (or clear) the GLM frozen-W conditioned-frame exact ψ-derivative
+    /// pair `(∂XᵀWX/∂ψ, ∂XᵀW(y−offset)/∂ψ)` for the next trial eval
+    /// (#1033 / #1111). Produced by `gradient_pair_if_sound` when the frozen-W
+    /// tensor covers ψ for the gradient and the working weight has not drifted;
+    /// installed onto the inner REML surface inside `prepare_eval_state` (after
+    /// `reset_surface`, on both the slow and design-revision fast paths) and
+    /// then cleared. Serves the GLM ψ-gradient `a_j` / `g_j` n-free; the
+    /// Hessian curvature `B_j` always stays the exact n-dependent slab. Passing
+    /// `None` clears any previously staged pair so a stale previous-ψ
+    /// derivative is never consumed.
+    pub(crate) fn stage_glm_psi_gram_deriv(
+        &mut self,
+        deriv: Option<(Array2<f64>, Array1<f64>)>,
+    ) {
+        self.pending_glm_psi_gram_deriv = deriv.map(std::sync::Arc::new);
     }
 
     pub(crate) fn set_analytic_penalty_registry(
@@ -3430,6 +3459,20 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             }
             None => self.reml_state.clear_glm_first_step_gram(),
         }
+        // #1033 / #1111: the GLM frozen-W conditioned-frame ψ-gradient
+        // derivative is keyed to the same per-trial ψ as the first-step Gram, so
+        // install/clear it on the same two sites. Serves the GLM ψ-gradient
+        // `a_j` / `g_j` n-free; `B_j` stays the exact slab.
+        match self.pending_glm_psi_gram_deriv.take() {
+            Some(deriv) => {
+                if !self.reml_state.install_glm_psi_gram_deriv(deriv) {
+                    // Shape mismatch against the current surface — fall back to
+                    // the exact streamed ∂X/∂ψ slab gradient.
+                    self.reml_state.clear_glm_psi_gram_deriv();
+                }
+            }
+            None => self.reml_state.clear_glm_psi_gram_deriv(),
+        }
     }
 
     pub(crate) fn evaluate_with_order(
@@ -3579,6 +3622,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             // stager), so unconditionally clear the slot here; the probe restreams
             // its first-iteration Gram exactly.
             self.reml_state.clear_glm_first_step_gram();
+            // Same wrong-ψ-leak reasoning for the GLM frozen-W ψ-gradient
+            // derivative (#1033 / #1111): clear it so a prior trial's ψ pair
+            // never serves this probe's gradient; it restreams the exact slab.
+            self.reml_state.clear_glm_psi_gram_deriv();
             return Ok(());
         }
 
