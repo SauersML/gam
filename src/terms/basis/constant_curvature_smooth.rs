@@ -135,7 +135,7 @@ impl Default for ConstantCurvatureBasisSpec {
 /// Validate that every row of `points` is finite and inside the
 /// κ-stereographic chart (`1 + κ‖x‖² > 0`; automatic for κ ≥ 0, the open-ball
 /// constraint for κ < 0).
-fn validate_chart_points(
+pub(crate) fn validate_chart_points(
     points: ArrayView2<'_, f64>,
     kappa: f64,
     what: &str,
@@ -270,9 +270,10 @@ pub fn constant_curvature_kernel_kappa_jets(
 }
 
 /// `(K, ∂K/∂κ, ∂²K/∂κ²)` of the raw kernel matrix when the kernel uses the
-/// κ-INVARIANT effective length `L(κ) = ℓ_ref·s(κ)/s₀` (the #1059 fix). Both the
-/// geodesic distance `d_κ` and the length `L(κ)` move with κ, so the exponent is
-/// the quotient `q = d/L` and the chain rule carries both jets:
+/// fill-invariant effective length `L(κ)` (the #944 fix: `L` solves the fill
+/// target `g(L,κ)=fill⋆`, holding the kernel's effective DoF κ-invariant). Both
+/// the geodesic distance `d_κ` and the length `L(κ)` move with κ, so the exponent
+/// is the quotient `q = d/L` and the chain rule carries both jets:
 ///
 /// ```text
 ///   q  = d / L
@@ -285,7 +286,7 @@ pub fn constant_curvature_kernel_kappa_jets(
 /// [`constant_curvature_effective_length_jet`]; at κ = 0 it reduces to the
 /// fixed-ℓ jets (`L′ = L″` terms vanish only if the geometry is flat, but the
 /// formula is exact for all κ).
-fn constant_curvature_kernel_kappa_jets_scaled(
+pub(crate) fn constant_curvature_kernel_kappa_jets_scaled(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     kappa: f64,
@@ -398,7 +399,7 @@ pub fn realized_constant_curvature_length_scale(
 /// `g(L,κ) = fill⋆` for `L(κ)` so the fill — hence the basis flexibility — stays
 /// κ-invariant and only the distance-matrix SHAPE (the genuine curvature signal)
 /// moves with κ. At κ = 0 the solution is `L = ℓ_ref` by construction.
-fn data_center_reference_fill(
+pub(crate) fn data_center_reference_fill(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     ell_ref: f64,
@@ -446,7 +447,7 @@ fn data_center_reference_fill(
 ///
 /// (each obtained by differentiating `∂k/∂L` / `∂k/∂κ` once more). `g` and every
 /// partial are smooth through κ = 0 because the distance jet is entire there.
-fn data_center_fill_partials(
+pub(crate) fn data_center_fill_partials(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     kappa: f64,
@@ -537,7 +538,7 @@ fn data_center_fill_partials(
 /// The partials come from [`data_center_fill_partials`] (exact, riding
 /// `distance_kappa_jet`); the returned jet feeds `constant_curvature_kernel_
 /// kappa_jets_scaled` through the quotient `q = d/L` chain rule.
-fn constant_curvature_effective_length_jet(
+pub(crate) fn constant_curvature_effective_length_jet(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     ell_ref: f64,
@@ -548,8 +549,8 @@ fn constant_curvature_effective_length_jet(
     // at κ = 0). g is strictly increasing in L (g_L > 0: larger L ⇒ each entry
     // closer to 1), so Newton from ℓ_ref converges monotonically.
     let mut l = ell_ref;
-    const NEWTON_MAX_ITER: usize = 100;
-    const NEWTON_REL_TOL: f64 = 1.0e-13;
+    pub(crate) const NEWTON_MAX_ITER: usize = 100;
+    pub(crate) const NEWTON_REL_TOL: f64 = 1.0e-13;
     let mut converged = false;
     for _ in 0..NEWTON_MAX_ITER {
         let (g, g_l, ..) = data_center_fill_partials(data, centers, kappa, l)?;
@@ -684,7 +685,7 @@ pub fn build_constant_curvature_basis(
 /// Symmetrize `M` in place to `(M + Mᵀ)/2` (the realized penalty is built from
 /// the symmetric kernel Gram; the κ-derivative blocks inherit the same exact
 /// symmetrization the value path applies before normalization).
-fn symmetrize(m: &Array2<f64>) -> Array2<f64> {
+pub(crate) fn symmetrize(m: &Array2<f64>) -> Array2<f64> {
     (m + &m.t()) * 0.5
 }
 
@@ -694,7 +695,7 @@ fn symmetrize(m: &Array2<f64>) -> Array2<f64> {
 /// double-penalty ridge `I` is κ-independent, so its derivative is exactly
 /// zero. Any other source would mean the basis grew a penalty whose κ-movement
 /// is unaccounted for, so we refuse loudly rather than silently drop a term.
-fn active_constant_curvature_penalty_derivatives(
+pub(crate) fn active_constant_curvature_penalty_derivatives(
     penaltyinfo: &[PenaltyInfo],
     primary_derivative: &Array2<f64>,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
@@ -847,7 +848,7 @@ mod tests {
     // print, per κ, the median geodesic distance and the kernel "spread"
     // 1 − mean(offdiag K). A collapsing kernel ⇒ spread → 0 as κ ↑.
     #[test]
-    fn kernel_spread_collapses_with_kappa_at_frozen_length_scale() {
+    pub(crate) fn kernel_spread_collapses_with_kappa_at_frozen_length_scale() {
         // 8 centers in a disk of radius 0.45 (inside every κ∈[-2,2] chart).
         let centers = ndarray::array![
             [0.10, 0.05],
@@ -1041,7 +1042,7 @@ mod tests {
     /// dense design `b` (n×p) and symmetric psd penalty `s` (p×p). Returns
     /// `min_λ D(λ)`. Self-contained so the oracle does not depend on the outer
     /// solver wiring — it tests the CRITERION SHAPE the wiring profiles.
-    fn profiled_gaussian_reml_deviance(b: &Array2<f64>, y: &Array1<f64>, s: &Array2<f64>) -> f64 {
+    pub(crate) fn profiled_gaussian_reml_deviance(b: &Array2<f64>, y: &Array1<f64>, s: &Array2<f64>) -> f64 {
         let n = b.nrows();
         let p = b.ncols();
         let btb = symmetrize(&b.t().dot(b));
@@ -1093,7 +1094,7 @@ mod tests {
     /// Build the κ-scaled (`L(κ)`) constant-curvature design B = K_κ(data,c)·z
     /// and penalty S~ = (zᵀK_κ(c,c)z)/‖·‖_F for a fixed center set, mirroring the
     /// live `build_constant_curvature_basis` math.
-    fn oracle_design_and_penalty(
+    pub(crate) fn oracle_design_and_penalty(
         data: ArrayView2<'_, f64>,
         centers: ArrayView2<'_, f64>,
         ell_ref: f64,
@@ -1123,7 +1124,7 @@ mod tests {
     /// κ-confound — so the κ fix correctly lives in the LENGTH, not the penalty
     /// normalization.
     #[test]
-    fn profiled_reml_is_invariant_to_penalty_frobenius_scale() {
+    pub(crate) fn profiled_reml_is_invariant_to_penalty_frobenius_scale() {
         let (data, centers) = oracle_disk_design_centers();
         let ell_ref = realized_constant_curvature_length_scale(centers.view(), 0.0).unwrap();
         // A reproducible response with curvature-shaped signal at κ = −1.
@@ -1152,7 +1153,7 @@ mod tests {
     /// (the #944/#1059 unidentifiability), which the oracle also asserts so the
     /// witness FAILS on the pre-fix code path.
     #[test]
-    fn profiled_reml_identifies_curvature_sign_with_effective_length() {
+    pub(crate) fn profiled_reml_identifies_curvature_sign_with_effective_length() {
         let (data, centers) = oracle_disk_design_centers();
         let ell_ref = realized_constant_curvature_length_scale(centers.view(), 0.0).unwrap();
         let grid: Vec<f64> = (-30..=30).map(|i| f64::from(i) * 0.1).collect();
@@ -1208,7 +1209,7 @@ mod tests {
     /// is the gate the ψ-channel outer gradient depends on — `L′`,`L″` feed the
     /// kernel quotient jets in `constant_curvature_kernel_kappa_jets_scaled`.
     #[test]
-    fn effective_length_jet_matches_fd_of_implicit_solution() {
+    pub(crate) fn effective_length_jet_matches_fd_of_implicit_solution() {
         let (data, centers) = oracle_disk_design_centers();
         let ell_ref = realized_constant_curvature_length_scale(centers.view(), 0.0).unwrap();
         // Reference fill at κ = 0 (the target L(κ) is pinned to).
@@ -1257,7 +1258,7 @@ mod tests {
 
     /// 8 data rows + 8 centers inside a disk of radius < 0.5 (valid in every
     /// κ ∈ [−3, 3] chart). Data ≠ centers so the data→center scale is nontrivial.
-    fn oracle_disk_design_centers() -> (Array2<f64>, Array2<f64>) {
+    pub(crate) fn oracle_disk_design_centers() -> (Array2<f64>, Array2<f64>) {
         let centers = ndarray::array![
             [0.10, 0.05],
             [-0.20, 0.15],
@@ -1288,7 +1289,7 @@ mod tests {
 
     /// A curvature-shaped Gaussian response: y = B(κ⋆)·β + ε with β a fixed
     /// pseudo-random vector and ε small, so the SIGNAL geometry is κ⋆.
-    fn oracle_response(
+    pub(crate) fn oracle_response(
         data: ArrayView2<'_, f64>,
         centers: ArrayView2<'_, f64>,
         ell_ref: f64,

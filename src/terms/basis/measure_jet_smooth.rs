@@ -126,25 +126,25 @@ use super::{
 /// both the local fit and the `q^(1−2α)` outer weight. This is an absolute
 /// kernel-weight cutoff; using the same truncated q keeps the discrete
 /// functional self-consistent, but it is not a relative tail-error bound.
-const MEASURE_JET_PROFILE_CUTOFF: f64 = 3.0;
+pub(crate) const MEASURE_JET_PROFILE_CUTOFF: f64 = 3.0;
 
 /// Relative eigenvalue threshold for rank-revealing pseudo-inverses of local
 /// Gram matrices. Directions at the roundoff floor are treated as unresolved
 /// and excluded from the affine fit.
-const MEASURE_JET_PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
+pub(crate) const MEASURE_JET_PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
 
 /// Default continuous smoothness order `s` realized by the `0.0` auto
 /// sentinel. Sits mid-band in the admissible `(0, 2)` for the affine-jet
 /// (r = 2) energy: rough enough to stay pointwise-defined on filaments and
 /// sheets (`s > p/2` for intrinsic `p ≤ 2`), smooth enough to bridge gaps
 /// with attested trends.
-const MEASURE_JET_DEFAULT_ORDER_S: f64 = 1.5;
+pub(crate) const MEASURE_JET_DEFAULT_ORDER_S: f64 = 1.5;
 
 /// Auto-band scale-count clamp: at least 3 octave-ish nodes so the energy is
 /// genuinely multiscale, at most 8 so degenerate spacing cannot explode the
 /// build.
-const MEASURE_JET_MIN_AUTO_SCALES: usize = 3;
-const MEASURE_JET_MAX_AUTO_SCALES: usize = 8;
+pub(crate) const MEASURE_JET_MIN_AUTO_SCALES: usize = 3;
+pub(crate) const MEASURE_JET_MAX_AUTO_SCALES: usize = 8;
 
 /// Representer-range multiple of the median nearest-center spacing used by
 /// the `0.0` auto sentinel.
@@ -160,7 +160,7 @@ const MEASURE_JET_MAX_AUTO_SCALES: usize = 8;
 /// outer REML conditioning degraded and the smoothing-parameter search cycled
 /// for hundreds of seconds (the #1116 timeout). One spacing-width kernel fixes
 /// both at the root without touching the energy penalty or the dials.
-const MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR: f64 = 1.0;
+pub(crate) const MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR: f64 = 1.0;
 
 /// Single-scale fused-mode weight of the affine-preserving nullspace ridge,
 /// as a fraction of the primary energy penalty's Frobenius scale (#1116). The
@@ -170,14 +170,14 @@ const MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR: f64 = 1.0;
 /// search). 1e-2 lifts the unpenalized directions ~two orders below the
 /// dominant penalized modes: a definite identifiability floor that leaves the
 /// genuine spectrum (and the single primary λ) in control of the fit.
-const MEASURE_JET_FUSED_RIDGE_FRACTION: f64 = 1e-2;
+pub(crate) const MEASURE_JET_FUSED_RIDGE_FRACTION: f64 = 1e-2;
 
 /// Memory budget (in f64 entries) above which the multi-form assembly stops
 /// parallelizing over scales: parallel scale partials cost
 /// `L · n_forms · m²` doubles; past this budget the scales run sequentially
 /// (same numbers — the per-scale loop and the ordered sum are deterministic
 /// either way).
-const MEASURE_JET_PARALLEL_FORM_BUDGET_DOUBLES: usize = 1 << 26;
+pub(crate) const MEASURE_JET_PARALLEL_FORM_BUDGET_DOUBLES: usize = 1 << 26;
 
 /// Realized-design identifiability policy for the measure-jet smooth.
 /// Mirrors [`super::ConstantCurvatureIdentifiability`] (#532): the fit-time
@@ -326,7 +326,7 @@ pub struct MeasureJetEnergyJets {
 /// (`X·z = (X − 2(Xu)uᵀ) minus column 1`) instead of the O(rows·m²)
 /// constraint GEMM that the scale-smoke gate identified as the dominant
 /// build cost.
-fn householder_sum_to_zero_u(m: usize) -> Array1<f64> {
+pub(crate) fn householder_sum_to_zero_u(m: usize) -> Array1<f64> {
     let c = 1.0 / (m as f64).sqrt();
     let mut u = Array1::<f64>::from_elem(m, c);
     u[0] -= 1.0;
@@ -338,7 +338,7 @@ fn householder_sum_to_zero_u(m: usize) -> Array1<f64> {
 /// Materialize the Householder sum-to-zero basis `z` (m × (m−1)) — columns
 /// 2..m of `H = I − 2uuᵀ` — for the frozen-replay metadata. O(m²), built
 /// once per fit.
-fn householder_sum_to_zero_z(u: &Array1<f64>) -> Array2<f64> {
+pub(crate) fn householder_sum_to_zero_z(u: &Array1<f64>) -> Array2<f64> {
     let m = u.len();
     let mut z = Array2::<f64>::zeros((m, m - 1));
     for j in 0..(m - 1) {
@@ -353,7 +353,7 @@ fn householder_sum_to_zero_z(u: &Array1<f64>) -> Array2<f64> {
 /// Structured constraint application: `X·z` for the Householder `z` above,
 /// computed as `(X − 2(Xu)uᵀ)` with the first column dropped — one matvec
 /// plus a rank-1 update, O(rows·m).
-fn householder_drop_first_apply(x: &Array2<f64>, u: &Array1<f64>) -> Array2<f64> {
+pub(crate) fn householder_drop_first_apply(x: &Array2<f64>, u: &Array1<f64>) -> Array2<f64> {
     let n = x.nrows();
     let m = x.ncols();
     let t = x.dot(u);
@@ -367,7 +367,7 @@ fn householder_drop_first_apply(x: &Array2<f64>, u: &Array1<f64>) -> Array2<f64>
     out
 }
 
-fn symmetric_pseudoinverse(a: &Array2<f64>, label: &str) -> Result<Array2<f64>, BasisError> {
+pub(crate) fn symmetric_pseudoinverse(a: &Array2<f64>, label: &str) -> Result<Array2<f64>, BasisError> {
     let n = a.nrows();
     if a.ncols() != n {
         crate::bail_dim_basis!(
@@ -398,7 +398,7 @@ fn symmetric_pseudoinverse(a: &Array2<f64>, label: &str) -> Result<Array2<f64>, 
 /// normal equations. The double penalty thus shrinks the wiggle space while
 /// preserving the (pseudo-)affine component, the measure-jet analogue of leaving
 /// a smooth's null space lightly damped.
-fn affine_preserving_coefficient_ridge(
+pub(crate) fn affine_preserving_coefficient_ridge(
     kz: &Array2<f64>,
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
@@ -469,7 +469,7 @@ fn affine_preserving_coefficient_ridge(
 /// under a Gaussian profile (the kernel is flat at d ≈ 0); clamped at zero
 /// so roundoff cannot emit tiny negatives (the a = b diagonal therefore
 /// lands at roundoff scale, not an exact 0 — no caller pins it).
-fn pairwise_sq_dists(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
+pub(crate) fn pairwise_sq_dists(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
     let an: Vec<f64> = a.outer_iter().map(|r| r.dot(&r)).collect();
     let bn: Vec<f64> = b.outer_iter().map(|r| r.dot(&r)).collect();
     let mut g = a.dot(&b.t());
@@ -487,9 +487,9 @@ fn pairwise_sq_dists(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f
 /// Row-block size for streaming GEMM passes that must not materialize the
 /// full n×m distance matrix (nearest-node assignment): 64Ki rows × m ≤ a
 /// few hundred MB of transient per block, GEMM-speed throughout.
-const MEASURE_JET_ASSIGN_BLOCK_ROWS: usize = 65_536;
+pub(crate) const MEASURE_JET_ASSIGN_BLOCK_ROWS: usize = 65_536;
 
-fn validate_finite_points(points: ArrayView2<'_, f64>, what: &str) -> Result<(), BasisError> {
+pub(crate) fn validate_finite_points(points: ArrayView2<'_, f64>, what: &str) -> Result<(), BasisError> {
     for (i, row) in points.outer_iter().enumerate() {
         if row.iter().any(|v| !v.is_finite()) {
             crate::bail_invalid_basis!("measure-jet {what} row {i} has a non-finite coordinate");
@@ -500,7 +500,7 @@ fn validate_finite_points(points: ArrayView2<'_, f64>, what: &str) -> Result<(),
 
 /// Median nearest-OTHER-center distance — the resolution floor of the center
 /// quadrature, used for the band floor and the auto representer range.
-fn median_nearest_center_spacing(dist2: &Array2<f64>) -> Result<f64, BasisError> {
+pub(crate) fn median_nearest_center_spacing(dist2: &Array2<f64>) -> Result<f64, BasisError> {
     let m = dist2.nrows();
     if m < 2 {
         return Err(BasisError::InsufficientColumnsForConstraint { found: m });
@@ -719,7 +719,7 @@ pub fn measure_jet_center_masses(
 /// its own level and the band totals ~O(m²·d) instead of O(L·m³). The inner
 /// (local-fit) quadrature always uses the full center set, so the local
 /// residual identities (exact constant annihilation, PSD) are untouched.
-fn assemble_weighted_forms<F>(
+pub(crate) fn assemble_weighted_forms<F>(
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
     band: &MeasureJetBand,
@@ -1136,7 +1136,7 @@ pub fn measure_jet_support_curve(
     Ok(out)
 }
 
-fn measure_jet_support_means(
+pub(crate) fn measure_jet_support_means(
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
     eps_band: &[f64],
@@ -1223,27 +1223,27 @@ pub fn realized_measure_jet_length_scale(
 /// ψ-derivative producer — ONE realization source, so the penalty the fit
 /// uses and the penalty the ψ-channel differentiates can never drift apart
 /// (the #901 desync class, excluded structurally).
-struct RealizedMeasureJetGeometry {
-    centers: Array2<f64>,
-    masses: Array1<f64>,
-    eps_band: Vec<f64>,
-    log_step: f64,
-    length_scale: f64,
+pub(crate) struct RealizedMeasureJetGeometry {
+    pub(crate) centers: Array2<f64>,
+    pub(crate) masses: Array1<f64>,
+    pub(crate) eps_band: Vec<f64>,
+    pub(crate) log_step: f64,
+    pub(crate) length_scale: f64,
     /// Assembly order for the energy weights: the realized default in
     /// per-level mode (absorbed per candidate by normalization), the
     /// explicit value in fused mode.
-    order_s_eval: f64,
+    pub(crate) order_s_eval: f64,
     /// Spectral-split mode marker (`order_s == 0.0` sentinel).
-    per_level: bool,
-    z: Array2<f64>,
-    kz: Array2<f64>,
+    pub(crate) per_level: bool,
+    pub(crate) z: Array2<f64>,
+    pub(crate) kz: Array2<f64>,
     /// `Some(u)` on the fit path (CenterSumToZero): `z` is the Householder
     /// basis and constraint applications use the O(rows·m) structured form.
     /// `None` on the frozen-replay path (arbitrary composed transform).
-    sum_to_zero_u: Option<Array1<f64>>,
+    pub(crate) sum_to_zero_u: Option<Array1<f64>>,
 }
 
-fn realize_measure_jet_geometry(
+pub(crate) fn realize_measure_jet_geometry(
     data: ArrayView2<'_, f64>,
     spec: &MeasureJetBasisSpec,
 ) -> Result<RealizedMeasureJetGeometry, BasisError> {
@@ -1778,7 +1778,7 @@ mod tests {
 
     /// Two clusters of 2-D centers, deterministic coordinates, plus uniform
     /// masses — small enough to inspect, irregular enough to be honest.
-    fn two_cluster_centers() -> (Array2<f64>, Array1<f64>) {
+    pub(crate) fn two_cluster_centers() -> (Array2<f64>, Array1<f64>) {
         let centers = array![
             [0.00, 0.00],
             [0.31, 0.05],
@@ -1798,14 +1798,14 @@ mod tests {
         (centers, masses)
     }
 
-    fn band_for(centers: &Array2<f64>) -> MeasureJetBand {
+    pub(crate) fn band_for(centers: &Array2<f64>) -> MeasureJetBand {
         measure_jet_band(centers.view(), 0).expect("band")
     }
 
     /// The no-mass contract: constants must be annihilated to machine
     /// precision at every scale (the constant is projected, never ridged).
     #[test]
-    fn energy_form_annihilates_constants_exactly() {
+    pub(crate) fn energy_form_annihilates_constants_exactly() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
         let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 1e-3)
@@ -1831,7 +1831,7 @@ mod tests {
     /// The default local projection annihilates ambient affine functions
     /// exactly; τ is retained for ψ layout but no longer adds an affine toll.
     #[test]
-    fn energy_form_annihilates_affine_at_default_tau() {
+    pub(crate) fn energy_form_annihilates_affine_at_default_tau() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
         let m = centers.nrows();
@@ -1855,7 +1855,7 @@ mod tests {
 
     /// PSD: the energy is a sum of weighted least-squares residuals.
     #[test]
-    fn energy_form_is_psd() {
+    pub(crate) fn energy_form_is_psd() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
         let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 1e-3)
@@ -1873,7 +1873,7 @@ mod tests {
     /// A 1-D filament embedded in 2-D: high-frequency center values along the
     /// strand pay strictly more energy than a slow trend.
     #[test]
-    fn rough_vector_pays_more_than_smooth() {
+    pub(crate) fn rough_vector_pays_more_than_smooth() {
         let m = 24usize;
         let centers = Array2::<f64>::from_shape_fn((m, 2), |(i, k)| {
             let t = i as f64 / (m as f64 - 1.0);
@@ -1902,7 +1902,7 @@ mod tests {
     /// inherit (the discipline whose absence is exactly the
     /// objective↔gradient desync bug class).
     #[test]
-    fn energy_jets_match_finite_differences() {
+    pub(crate) fn energy_jets_match_finite_differences() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
         let (s0, a0, tau) = (1.3, 0.8, 1e-3);
@@ -2002,7 +2002,7 @@ mod tests {
     /// blocks, one-hot weights) and concentrate rough content at fine
     /// scales.
     #[test]
-    fn scale_spectrum_sums_to_total_and_localizes_roughness() {
+    pub(crate) fn scale_spectrum_sums_to_total_and_localizes_roughness() {
         let m = 24usize;
         let centers = Array2::<f64>::from_shape_fn((m, 2), |(i, k)| {
             let t = i as f64 / (m as f64 - 1.0);
@@ -2042,7 +2042,7 @@ mod tests {
     /// The support curve separates on-web from off-web queries at fine
     /// scales and grows monotonically in ε for any query.
     #[test]
-    fn support_curve_separates_on_web_from_off_web() {
+    pub(crate) fn support_curve_separates_on_web_from_off_web() {
         let m = 24usize;
         let centers = Array2::<f64>::from_shape_fn((m, 2), |(i, k)| {
             let t = i as f64 / (m as f64 - 1.0);
@@ -2079,7 +2079,7 @@ mod tests {
     /// there is no center-count auto-gate (#1116). `measure_jet_multiscale_mode`
     /// is the single source for this decision.
     #[test]
-    fn default_stays_single_scale_until_multiscale_opt_in() {
+    pub(crate) fn default_stays_single_scale_until_multiscale_opt_in() {
         let n = 200usize;
         let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
             let t = i as f64 / (n as f64 - 1.0);
@@ -2135,7 +2135,7 @@ mod tests {
     /// single-scale: one fused Primary penalty with the affine-preserving
     /// nullspace ridge folded in (#1116) = exactly one candidate.
     #[test]
-    fn fused_mode_emits_single_primary_candidate() {
+    pub(crate) fn fused_mode_emits_single_primary_candidate() {
         let n = 40usize;
         let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
             let t = i as f64 / (n as f64 - 1.0);
@@ -2166,7 +2166,7 @@ mod tests {
     /// the dense GEMM against the materialized basis (same matrix, two op
     /// orders), and the basis must be orthonormal with sum-to-zero columns.
     #[test]
-    fn householder_apply_matches_dense_transform() {
+    pub(crate) fn householder_apply_matches_dense_transform() {
         let m = 9usize;
         let n = 15usize;
         let u = householder_sum_to_zero_u(m);
@@ -2198,7 +2198,7 @@ mod tests {
     /// once, pin everything (nodes, masses, band, transform, realized ℓ),
     /// and return the pinned spec so dial-perturbed rebuilds move ONLY the
     /// dials — the per-trial contract the optimizer relies on.
-    fn frozen_spec_fixture(order_s: f64, multiscale: bool) -> (Array2<f64>, MeasureJetBasisSpec) {
+    pub(crate) fn frozen_spec_fixture(order_s: f64, multiscale: bool) -> (Array2<f64>, MeasureJetBasisSpec) {
         // Multiscale (per-scale + ψ) mode is the explicit opt-in (#1116); the
         // per-level fixture passes `multiscale = true`, the fused fixture
         // `false`. A large center count is kept so the multiscale spectrum is
@@ -2263,7 +2263,7 @@ mod tests {
     /// This is the end-to-end gate #901 never had: the derivative is checked
     /// against the exact object the optimizer consumes.
     #[test]
-    fn psi_producer_matches_fd_per_level_mode() {
+    pub(crate) fn psi_producer_matches_fd_per_level_mode() {
         let (data, frozen) = frozen_spec_fixture(0.0, true);
         let derivs =
             build_measure_jet_basis_psi_derivatives(data.view(), &frozen).expect("psi derivatives");
@@ -2352,7 +2352,7 @@ mod tests {
 
     /// Fused mode adds the s coordinate; gate it the same way.
     #[test]
-    fn psi_producer_matches_fd_fused_mode() {
+    pub(crate) fn psi_producer_matches_fd_fused_mode() {
         let (data, frozen) = frozen_spec_fixture(1.3, false);
         let derivs =
             build_measure_jet_basis_psi_derivatives(data.view(), &frozen).expect("psi derivatives");
@@ -2390,7 +2390,7 @@ mod tests {
     /// (first-moment-exact lumping), with empty cells keeping their seed
     /// coordinates at zero mass.
     #[test]
-    fn quadrature_nodes_are_cell_medoids() {
+    pub(crate) fn quadrature_nodes_are_cell_medoids() {
         // Two tight groups around (0,0) and (10,10); a third seed far away
         // captures nothing.
         let data = array![
@@ -2432,7 +2432,7 @@ mod tests {
     /// frozen quadrature must reproduce design and penalty bit-for-bit (the
     /// predict-path contract).
     #[test]
-    fn build_replay_roundtrip_reproduces_design_and_penalty() {
+    pub(crate) fn build_replay_roundtrip_reproduces_design_and_penalty() {
         // A bent filament with a side cluster; multiscale opt-in so this
         // exercises the per-scale (spectral) replay path (#1116).
         let n = 140usize;

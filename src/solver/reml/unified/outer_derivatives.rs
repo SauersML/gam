@@ -30,11 +30,11 @@ mod operator;
 mod routing;
 mod traces;
 
-pub use dense::*;
-pub use kkt::*;
+pub(crate) use dense::*;
+pub(crate) use kkt::*;
 pub use operator::*;
-pub use routing::*;
-pub use traces::*;
+pub(crate) use routing::*;
+pub(crate) use traces::*;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Extended Fellner–Schall (EFS) update for all hyperparameters

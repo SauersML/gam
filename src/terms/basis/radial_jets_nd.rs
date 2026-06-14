@@ -16,11 +16,11 @@ use super::*;
 /// isometry paths.
 pub(crate) struct DuchonRadialJetsNd {
     /// `(n_rows, n_centers)` matrix of `φ'(r_{nk})`; always populated.
-    phi_r: Array2<f64>,
+    pub(crate) phi_r: Array2<f64>,
     /// `(n_rows, n_centers)` matrix of `φ''(r_{nk})`; populated iff `max_order ≥ 2`.
-    phi_rr: Array2<f64>,
+    pub(crate) phi_rr: Array2<f64>,
     /// `(n_rows, n_centers)` matrix of `φ'''(r_{nk})`; populated iff `max_order ≥ 3`.
-    phi_rrr: Array2<f64>,
+    pub(crate) phi_rrr: Array2<f64>,
 }
 
 

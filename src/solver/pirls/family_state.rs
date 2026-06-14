@@ -5,7 +5,7 @@
 use super::*;
 
 #[inline]
-pub(super) fn standard_inverse_link_jet(
+pub(crate) fn standard_inverse_link_jet(
     inverse_link: &InverseLink,
     eta: f64,
 ) -> Result<MixtureInverseLinkJet, EstimationError> {

@@ -51,11 +51,11 @@ pub const PROFILE_SPOT_CHECK_POINTS: usize = 5;
 /// Certified Chebyshev interpolant of `(φ, q, t)` over `u = ln r ∈
 /// [u_lo, u_hi]` for one frozen [`RadialScalarKind`].
 pub struct RadialProfile {
-    u_lo: f64,
-    u_hi: f64,
-    m: usize,
+    pub(crate) u_lo: f64,
+    pub(crate) u_hi: f64,
+    pub(crate) m: usize,
     /// `coeff[c][p]`: Chebyshev coefficient `p` of channel `c ∈ {φ, q, t}`.
-    coeff: [Vec<f64>; 3],
+    pub(crate) coeff: [Vec<f64>; 3],
 }
 
 impl RadialProfile {
@@ -83,7 +83,7 @@ impl RadialProfile {
         None
     }
 
-    fn build_at(kind: &RadialScalarKind, u_lo: f64, u_hi: f64, m: usize) -> Option<Self> {
+    pub(crate) fn build_at(kind: &RadialScalarKind, u_lo: f64, u_hi: f64, m: usize) -> Option<Self> {
         // Chebyshev nodes of the first kind (no endpoints).
         let mut values: [Vec<f64>; 3] = [vec![0.0; m], vec![0.0; m], vec![0.0; m]];
         let mut nodes_x = vec![0.0_f64; m];
@@ -132,7 +132,7 @@ impl RadialProfile {
         })
     }
 
-    fn certify(&self, kind: &RadialScalarKind) -> bool {
+    pub(crate) fn certify(&self, kind: &RadialScalarKind) -> bool {
         // 1. Tail decay per channel, relative to that channel's own scale.
         let tail_band = (self.m / 16).max(2);
         for c in &self.coeff {
@@ -182,7 +182,7 @@ impl RadialProfile {
     /// checked [`Self::covers`]). Clenshaw over the three channels sharing
     /// one basis recurrence.
     #[inline]
-    fn eval_inside(&self, r: f64) -> (f64, f64, f64) {
+    pub(crate) fn eval_inside(&self, r: f64) -> (f64, f64, f64) {
         let u = r.ln();
         let x = (2.0 * u - (self.u_lo + self.u_hi)) / (self.u_hi - self.u_lo);
         let two_x = 2.0 * x;
@@ -228,7 +228,7 @@ impl RadialProfile {
     /// No new function evaluations — `J′` shares the value channel's
     /// representation, so value and derivative are immune to the
     /// objective↔gradient desync class.
-    fn differentiate_coeffs(a: &[f64]) -> Vec<f64> {
+    pub(crate) fn differentiate_coeffs(a: &[f64]) -> Vec<f64> {
         let len = a.len();
         let mut b = vec![0.0_f64; len];
         if len <= 1 {
@@ -248,7 +248,7 @@ impl RadialProfile {
 
     /// Clenshaw contraction of one coefficient stack at the mapped point `x`.
     #[inline]
-    fn clenshaw(c: &[f64], x: f64, two_x: f64) -> f64 {
+    pub(crate) fn clenshaw(c: &[f64], x: f64, two_x: f64) -> f64 {
         let mut b1 = 0.0_f64;
         let mut b2 = 0.0_f64;
         for &a in c.iter().skip(1).rev() {
@@ -312,7 +312,7 @@ mod tests {
     use super::super::duchon_partial_fraction_coeffs;
     use super::*;
 
-    fn production_duchon_kind() -> RadialScalarKind {
+    pub(crate) fn production_duchon_kind() -> RadialScalarKind {
         // The large-scale conditional-PGS configuration:
         // duchon(16 PCs, order=0 → p=1, power=9 → s=9, length_scale=1).
         let (p_order, s_order, dim, length_scale) = (1usize, 9usize, 16usize, 1.0_f64);
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn duchon_profile_certifies_and_matches_exact_on_dense_grid() {
+    pub(crate) fn duchon_profile_certifies_and_matches_exact_on_dense_grid() {
         let kind = production_duchon_kind();
         let (r_min, r_max) = (0.05_f64, 30.0_f64);
         let profile =
@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_radii_fall_back_to_exact() {
+    pub(crate) fn out_of_range_radii_fall_back_to_exact() {
         let kind = production_duchon_kind();
         let profile = RadialProfile::build(&kind, 0.1, 10.0).expect("profile certifies");
         for &r in &[0.01_f64, 50.0] {
@@ -359,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn jet_tower_matches_central_differences_of_value_clenshaw() {
+    pub(crate) fn jet_tower_matches_central_differences_of_value_clenshaw() {
         // The differentiated-coefficient jet must match central differences
         // of the value channel's own Clenshaw across the radius range — i.e.
         // value and derivative are ONE source of truth (no transcendental
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn degenerate_range_refuses() {
+    pub(crate) fn degenerate_range_refuses() {
         let kind = production_duchon_kind();
         assert!(RadialProfile::build(&kind, 1.0, 1.0).is_none());
         assert!(RadialProfile::build(&kind, -1.0, 2.0).is_none());

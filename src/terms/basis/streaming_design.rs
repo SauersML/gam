@@ -177,7 +177,7 @@ impl RadialScalarKind {
     }
 
     #[inline]
-    fn raw_psi_isotropic_share(&self) -> f64 {
+    pub(crate) fn raw_psi_isotropic_share(&self) -> f64 {
         match self {
             RadialScalarKind::Matern { .. } => 0.0,
             RadialScalarKind::Duchon {
@@ -199,7 +199,7 @@ impl RadialScalarKind {
     }
 
     #[inline]
-    fn is_duchon_family(&self) -> bool {
+    pub(crate) fn is_duchon_family(&self) -> bool {
         matches!(
             self,
             RadialScalarKind::Duchon { .. } | RadialScalarKind::PureDuchon { .. }
@@ -217,7 +217,7 @@ impl RadialScalarKind {
     /// policy says the materialization would exceed budget — small `n`
     /// problems still get the dense fast path.
     #[inline]
-    fn enforces_dense_materialization_budget(&self) -> bool {
+    pub(crate) fn enforces_dense_materialization_budget(&self) -> bool {
         matches!(
             self,
             RadialScalarKind::Duchon { .. }
@@ -384,15 +384,15 @@ trait ChunkedDesign {
 
 #[derive(Debug, Clone)]
 pub(crate) struct StreamingMaternEvaluator {
-    data: Arc<Array2<f64>>,
-    centers: Arc<Array2<f64>>,
-    length_scale: f64,
-    nu: MaternNu,
-    metric_weights: Arc<[f64]>,
-    ident_transform: Option<Arc<Array2<f64>>>,
-    include_intercept: bool,
-    chunk_size: usize,
-    total_cols: usize,
+    pub(crate) data: Arc<Array2<f64>>,
+    pub(crate) centers: Arc<Array2<f64>>,
+    pub(crate) length_scale: f64,
+    pub(crate) nu: MaternNu,
+    pub(crate) metric_weights: Arc<[f64]>,
+    pub(crate) ident_transform: Option<Arc<Array2<f64>>>,
+    pub(crate) include_intercept: bool,
+    pub(crate) chunk_size: usize,
+    pub(crate) total_cols: usize,
 }
 
 
@@ -452,7 +452,7 @@ impl StreamingMaternEvaluator {
         })
     }
 
-    fn raw_kernel_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+    pub(crate) fn raw_kernel_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         let chunk_n = rows.end - rows.start;
         let k_raw = self.centers.nrows();
         let dim = self.data.ncols();
@@ -486,7 +486,7 @@ impl StreamingMaternEvaluator {
             .expect("StreamingMaternEvaluator chunk shape should match generated values")
     }
 
-    fn for_row_chunk_impl(&self, start: usize, end: usize) -> Array2<f64> {
+    pub(crate) fn for_row_chunk_impl(&self, start: usize, end: usize) -> Array2<f64> {
         let raw = self.raw_kernel_chunk(start..end);
         let kernel = match self.ident_transform.as_ref() {
             Some(z) => fast_ab(&raw, z),
@@ -570,18 +570,18 @@ impl DenseDesignOperator for StreamingMaternEvaluator {
 
 #[derive(Debug, Clone)]
 pub(crate) struct StreamingSphereEvaluator {
-    data: Arc<Array2<f64>>,
-    centers: Arc<Array2<f64>>,
-    penalty_order: usize,
-    radians: bool,
-    wahba_kernel: SphereWahbaKernel,
-    constraint_transform: Option<Arc<Array2<f64>>>,
-    sin_lat_c: Arc<[f64]>,
-    cos_lat_c: Arc<[f64]>,
-    sin_lon_c: Arc<[f64]>,
-    cos_lon_c: Arc<[f64]>,
-    chunk_size: usize,
-    total_cols: usize,
+    pub(crate) data: Arc<Array2<f64>>,
+    pub(crate) centers: Arc<Array2<f64>>,
+    pub(crate) penalty_order: usize,
+    pub(crate) radians: bool,
+    pub(crate) wahba_kernel: SphereWahbaKernel,
+    pub(crate) constraint_transform: Option<Arc<Array2<f64>>>,
+    pub(crate) sin_lat_c: Arc<[f64]>,
+    pub(crate) cos_lat_c: Arc<[f64]>,
+    pub(crate) sin_lon_c: Arc<[f64]>,
+    pub(crate) cos_lon_c: Arc<[f64]>,
+    pub(crate) chunk_size: usize,
+    pub(crate) total_cols: usize,
 }
 
 
@@ -649,7 +649,7 @@ impl StreamingSphereEvaluator {
         })
     }
 
-    fn raw_kernel_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+    pub(crate) fn raw_kernel_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         let chunk_n = rows.end - rows.start;
         let k = self.centers.nrows();
         let deg = if self.radians {
@@ -725,7 +725,7 @@ impl StreamingSphereEvaluator {
             .expect("StreamingSphereEvaluator chunk shape should match generated values")
     }
 
-    fn for_row_chunk_impl(&self, start: usize, end: usize) -> Array2<f64> {
+    pub(crate) fn for_row_chunk_impl(&self, start: usize, end: usize) -> Array2<f64> {
         let raw = self.raw_kernel_chunk(start..end);
         match self.constraint_transform.as_ref() {
             Some(z) => fast_ab(&raw, z),
@@ -803,13 +803,13 @@ impl DenseDesignOperator for StreamingSphereEvaluator {
 
 #[derive(Debug, Clone)]
 pub(crate) struct StreamingBSplineEvaluator {
-    data: Arc<Array1<f64>>,
-    knots: Arc<Array1<f64>>,
-    degree: usize,
-    periodic: Option<(f64, f64, usize)>,
-    transform: Option<Arc<Array2<f64>>>,
-    chunk_size: usize,
-    total_cols: usize,
+    pub(crate) data: Arc<Array1<f64>>,
+    pub(crate) knots: Arc<Array1<f64>>,
+    pub(crate) degree: usize,
+    pub(crate) periodic: Option<(f64, f64, usize)>,
+    pub(crate) transform: Option<Arc<Array2<f64>>>,
+    pub(crate) chunk_size: usize,
+    pub(crate) total_cols: usize,
 }
 
 
@@ -843,7 +843,7 @@ impl StreamingBSplineEvaluator {
         })
     }
 
-    fn raw_chunk(&self, start: usize, end: usize) -> Array2<f64> {
+    pub(crate) fn raw_chunk(&self, start: usize, end: usize) -> Array2<f64> {
         bspline_raw_row_chunk(
             self.data.view(),
             self.knots.view(),
@@ -855,7 +855,7 @@ impl StreamingBSplineEvaluator {
         .expect("StreamingBSplineEvaluator validated inputs should build row chunks")
     }
 
-    fn for_row_chunk_impl(&self, start: usize, end: usize) -> Array2<f64> {
+    pub(crate) fn for_row_chunk_impl(&self, start: usize, end: usize) -> Array2<f64> {
         let raw = self.raw_chunk(start, end);
         match self.transform.as_ref() {
             Some(z) => fast_ab(&raw, z),
@@ -947,13 +947,13 @@ pub(crate) enum StreamingAxisMode {
 #[derive(Debug, Clone)]
 pub(crate) struct StreamingRadialState {
     /// Data matrix, shape (n, d).
-    data: Arc<Array2<f64>>,
+    pub(crate) data: Arc<Array2<f64>>,
     /// Center matrix, shape (k, d).
-    centers: Arc<Array2<f64>>,
+    pub(crate) centers: Arc<Array2<f64>>,
     /// How per-pair axis components are exposed to the derivative operator.
-    axis_mode: StreamingAxisMode,
+    pub(crate) axis_mode: StreamingAxisMode,
     /// Which radial kernel family to use for recomputation.
-    radial_kind: RadialScalarKind,
+    pub(crate) radial_kind: RadialScalarKind,
     /// Lazily materialized radial-scalar cache. (phi, q, t) per (i, j) pair
     /// — independent of axis, identical across every per-axis chunk loop —
     /// so collapses (axes × calls × chunks × n × n_knots) streaming radial
@@ -961,15 +961,15 @@ pub(crate) struct StreamingRadialState {
     /// inner `Option` is `None` when the parallel fill encountered a radial
     /// evaluation error (e.g. a non-finite r); callers fall back to the
     /// streaming path which propagates the error through `compute_pair`.
-    triplet_cache: Arc<std::sync::OnceLock<Option<StreamingTripletCache>>>,
+    pub(crate) triplet_cache: Arc<std::sync::OnceLock<Option<StreamingTripletCache>>>,
 }
 
 
 #[derive(Debug)]
 pub(crate) struct StreamingTripletCache {
-    phi: Vec<f64>,
-    q: Vec<f64>,
-    t: Vec<f64>,
+    pub(crate) phi: Vec<f64>,
+    pub(crate) q: Vec<f64>,
+    pub(crate) t: Vec<f64>,
 }
 
 
@@ -982,7 +982,7 @@ pub(crate) const STREAMING_TRIPLET_CACHE_BYTE_BUDGET: usize = 1 << 30;
 
 
 impl StreamingRadialState {
-    fn cache_fits_budget(&self) -> bool {
+    pub(crate) fn cache_fits_budget(&self) -> bool {
         let total = self
             .data
             .nrows()
@@ -992,7 +992,7 @@ impl StreamingRadialState {
         total <= STREAMING_TRIPLET_CACHE_BYTE_BUDGET
     }
 
-    fn ensure_triplet_cache(&self) -> Option<&StreamingTripletCache> {
+    pub(crate) fn ensure_triplet_cache(&self) -> Option<&StreamingTripletCache> {
         if !self.cache_fits_budget() {
             return None;
         }
@@ -1011,7 +1011,7 @@ impl StreamingRadialState {
             .as_ref()
     }
 
-    fn materialize_triplet_cache(&self) -> Option<StreamingTripletCache> {
+    pub(crate) fn materialize_triplet_cache(&self) -> Option<StreamingTripletCache> {
         let n = self.data.nrows();
         let n_knots = self.centers.nrows();
         let total = n * n_knots;
@@ -1101,7 +1101,7 @@ impl StreamingRadialState {
     }
 
     #[inline]
-    fn fill_s_buf(&self, i: usize, j: usize, s_buf: &mut [f64]) {
+    pub(crate) fn fill_s_buf(&self, i: usize, j: usize, s_buf: &mut [f64]) {
         match &self.axis_mode {
             StreamingAxisMode::PerAxis { metric_weights } => {
                 let dim = metric_weights.len();
@@ -1134,7 +1134,7 @@ impl StreamingRadialState {
     ///
     /// Returns `(phi, q, t)` and writes per-axis components into `s_buf` (length d).
     #[inline]
-    fn compute_pair(
+    pub(crate) fn compute_pair(
         &self,
         i: usize,
         j: usize,

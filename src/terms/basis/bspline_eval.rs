@@ -494,16 +494,16 @@ pub enum BasisEvalKind {
 
 
 pub(crate) struct BasisEvalScratch {
-    basis: internal::BsplineScratch,
-    lower_basis: Vec<f64>,
-    lower_scratch: internal::BsplineScratch,
-    lower_lower_basis: Vec<f64>,
-    lower_lower_scratch: internal::BsplineScratch,
+    pub(crate) basis: internal::BsplineScratch,
+    pub(crate) lower_basis: Vec<f64>,
+    pub(crate) lower_scratch: internal::BsplineScratch,
+    pub(crate) lower_lower_basis: Vec<f64>,
+    pub(crate) lower_lower_scratch: internal::BsplineScratch,
 }
 
 
 impl BasisEvalScratch {
-    fn new(degree: usize) -> Self {
+    pub(crate) fn new(degree: usize) -> Self {
         let lower_degree = degree.saturating_sub(1);
         let lower_lower_degree = degree.saturating_sub(2);
         Self {

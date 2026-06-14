@@ -970,10 +970,10 @@ pub(crate) fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, B
 
 #[derive(Debug, Clone)]
 pub(crate) struct PsdSpectralSummary {
-    min_eigenvalue: f64,
-    max_abs_eigenvalue: f64,
-    tolerance: f64,
-    effective_rank: usize,
+    pub(crate) min_eigenvalue: f64,
+    pub(crate) max_abs_eigenvalue: f64,
+    pub(crate) tolerance: f64,
+    pub(crate) effective_rank: usize,
 }
 
 

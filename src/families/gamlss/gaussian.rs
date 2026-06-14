@@ -54,7 +54,7 @@ mod location_scale;
 pub use location_scale::*;
 
 mod row_coeff_operator;
-pub use row_coeff_operator::*;
+pub(crate) use row_coeff_operator::*;
 
 mod wiggle;
 pub use wiggle::*;

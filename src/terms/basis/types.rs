@@ -19,7 +19,7 @@ unsafe impl Sync for SendPtr {}
 
 impl SendPtr {
     #[inline(always)]
-    fn add(self, offset: usize) -> *mut f64 {
+    pub(crate) fn add(self, offset: usize) -> *mut f64 {
         // SAFETY: callers pass offsets within the backing allocation and only
         // dereference the returned pointer after proving the target element is
         // uniquely owned by that worker's chunk for the whole parallel region.
@@ -322,7 +322,7 @@ pub struct MaternSplineBasis {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DuchonBasisDesign {
-    basis: Array2<f64>,
+    pub(crate) basis: Array2<f64>,
 }
 
 
@@ -341,7 +341,7 @@ pub enum OneDimensionalBoundary {
 
 
 impl OneDimensionalBoundary {
-    fn period(&self) -> Option<(f64, f64, f64)> {
+    pub(crate) fn period(&self) -> Option<(f64, f64, f64)> {
         match *self {
             OneDimensionalBoundary::Open => None,
             OneDimensionalBoundary::Cyclic { start, end } if end > start => {
@@ -545,22 +545,22 @@ pub enum CenterStrategyKind {
 /// * `n` - sample size (number of observations)
 /// * `d` - covariate dimensionality (number of input variables in the smooth)
 pub fn default_num_centers(n: usize, d: usize) -> usize {
-    const K_MIN: usize = 200;
-    const K_MAX: usize = 2000;
-    const ALPHA: f64 = 0.4;
-    const C: f64 = 8.0;
+    pub(crate) const K_MIN: usize = 200;
+    pub(crate) const K_MAX: usize = 2000;
+    pub(crate) const ALPHA: f64 = 0.4;
+    pub(crate) const C: f64 = 8.0;
     /// Per-extra-dimension growth in the center count: each covariate axis
     /// beyond the first widens the basis by 15% to keep the per-axis mesh
     /// density roughly constant as the smooth's domain dimensionality grows.
-    const PER_DIM_GROWTH: f64 = 0.15;
+    pub(crate) const PER_DIM_GROWTH: f64 = 0.15;
     /// Divisor for the data-proportional floor: the `K_MIN` floor only engages
     /// once `n` exceeds `K_MIN * FLOOR_N_DIVISOR`, so small samples are not
     /// forced up to a dense `K_MIN`-column design.
-    const FLOOR_N_DIVISOR: usize = 8;
+    pub(crate) const FLOOR_N_DIVISOR: usize = 8;
     /// Divisor for the conditioning cap: the center count never exceeds `n /
     /// COND_N_DIVISOR`, keeping the penalty matrices well-conditioned relative
     /// to the data.
-    const COND_N_DIVISOR: usize = 4;
+    pub(crate) const COND_N_DIVISOR: usize = 4;
 
     let d_factor = 1.0 + PER_DIM_GROWTH * (d.max(1) - 1) as f64;
     let raw = (C * d_factor * (n as f64).powf(ALPHA)).ceil() as usize;
@@ -591,7 +591,7 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
 /// default (mgcv's `k = 10` for a 1-D `s()`), grown gently with dimensionality
 /// and never exceeding the generous primary-predictor default.
 pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
-    const BASE_1D_CENTERS: usize = 10;
+    pub(crate) const BASE_1D_CENTERS: usize = 10;
     let modest = BASE_1D_CENTERS.saturating_mul(d.max(1));
     default_num_centers(n, d).min(modest).max(1)
 }
@@ -812,7 +812,7 @@ pub fn center_strategy_with_num_centers(
     num_centers: usize,
 ) -> Result<CenterStrategy, BasisError> {
     validate_center_count(num_centers)?;
-    fn rebuild_inner(
+    pub(crate) fn rebuild_inner(
         strategy: &CenterStrategy,
         num_centers: usize,
     ) -> Result<CenterStrategy, BasisError> {
@@ -1198,7 +1198,7 @@ impl DuchonOperatorPenaltySpec {
         // Tolerance so an exact half-integer Sobolev order (e.g. m = 1.0 for
         // ν=1/2, d=1) reliably DISABLES the matching-order operator instead
         // of flipping on a float-equality knife-edge.
-        const ORDER_EPS: f64 = 1e-9;
+        pub(crate) const ORDER_EPS: f64 = 1e-9;
         let active = || OperatorPenaltySpec::Active {
             initial_log_lambda: 0.0,
             prior: None,
@@ -1667,6 +1667,10 @@ pub enum PenaltyDropReason {
 }
 
 
+pub(crate) fn default_normalization_scale() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PenaltyInfo {
     pub source: PenaltySource,
@@ -1849,7 +1853,7 @@ pub struct AnisoPenaltyCrossProvider(
 
 
 impl AnisoPenaltyCrossProvider {
-    fn new<F>(f: F) -> Self
+    pub(crate) fn new<F>(f: F) -> Self
     where
         F: Fn(usize, usize) -> Result<Vec<Array2<f64>>, BasisError> + Send + Sync + 'static,
     {

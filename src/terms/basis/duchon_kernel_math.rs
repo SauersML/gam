@@ -157,7 +157,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     let mut d1_raw = Array2::<f64>::zeros((if build_d1 { p_colloc * dim } else { 0 }, n_basis));
     let mut d2_raw =
         Array2::<f64>::zeros((if build_d2 { p_colloc * dim * dim } else { 0 }, n_basis));
-    const R_EPS: f64 = 1e-10;
+    pub(crate) const R_EPS: f64 = 1e-10;
     for i in 0..p_colloc {
         let scale_i = row_scales[i];
         for j in 0..n_basis {
@@ -314,7 +314,7 @@ pub(crate) fn bessel_k1_stable(x: f64) -> f64 {
 
 #[inline(always)]
 pub(crate) fn bessel_k0_k1_small_series(x: f64) -> (f64, f64) {
-    const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+    pub(crate) const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
     let y = 0.25 * x * x;
     let log_half_plus_gamma = 0.5 * y.ln() + EULER_GAMMA;
     let mut i0 = 1.0;
@@ -408,7 +408,7 @@ pub(crate) fn duchon_effective_nullspace_order(
     if effective != order {
         // Dedup: warn only once per (rows, cols, requested_order) per process.
         // BFGS × P-IRLS × derivative callsites hit this path many times.
-        static SEEN: std::sync::OnceLock<
+        pub(crate) static SEEN: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashSet<(usize, usize, DuchonNullspaceOrder)>>,
         > = std::sync::OnceLock::new();
         let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -435,8 +435,8 @@ pub(crate) fn duchon_effective_nullspace_order(
 #[inline(always)]
 pub(crate) fn gamma_lanczos(x: f64) -> f64 {
     // Numerical Recipes / Lanczos approximation with reflection formula.
-    const G: f64 = 7.0;
-    const P: [f64; 9] = [
+    pub(crate) const G: f64 = 7.0;
+    pub(crate) const P: [f64; 9] = [
         0.999_999_999_999_809_9,
         676.520_368_121_885_1,
         -1_259.139_216_722_402_8,
@@ -535,14 +535,14 @@ pub(crate) fn bessel_k_real_half_integer_or_integer(nu_abs: f64, z: f64) -> Resu
 /// hot kernel evaluation loop (called n × k times per basis build).
 #[derive(Clone, Copy)]
 pub(crate) struct PolyharmonicBlockCoeff {
-    c: f64,
-    power: f64,
-    is_log_case: bool,
+    pub(crate) c: f64,
+    pub(crate) power: f64,
+    pub(crate) is_log_case: bool,
 }
 
 
 impl PolyharmonicBlockCoeff {
-    fn new(m: f64, k_dim: usize) -> Self {
+    pub(crate) fn new(m: f64, k_dim: usize) -> Self {
         assert!(
             m.is_finite() && m > 0.0,
             "PolyharmonicBlockCoeff::new: m must be finite and > 0, got {m}"
@@ -552,7 +552,7 @@ impl PolyharmonicBlockCoeff {
         // Log case: k_dim is even and `2m − k_dim` is a non-negative even
         // integer (within ε). For fractional `m` this never fires; for
         // integer `m` it matches the original integer modulo check exactly.
-        const LOG_EPS: f64 = 1e-12;
+        pub(crate) const LOG_EPS: f64 = 1e-12;
         let two_m = 2.0 * m;
         let is_log_case = k_dim.is_multiple_of(2) && {
             let n_f = (power / 2.0).round();
@@ -583,7 +583,7 @@ impl PolyharmonicBlockCoeff {
     }
 
     #[inline(always)]
-    fn eval(&self, r: f64) -> f64 {
+    pub(crate) fn eval(&self, r: f64) -> f64 {
         if r <= 0.0 {
             return self.origin_limit();
         }
@@ -595,7 +595,7 @@ impl PolyharmonicBlockCoeff {
     }
 
     #[inline(always)]
-    fn origin_limit(&self) -> f64 {
+    pub(crate) fn origin_limit(&self) -> f64 {
         if self.is_log_case {
             log_power_origin_limit(self.c, self.power, 1.0, 0.0)
         } else {
@@ -745,7 +745,7 @@ pub(crate) fn polyharmonic_block_jet4(
     let alpha = 2.0 * m - k_dim as f64;
     // Log case: k_dim even and `2m − k_dim` is a non-negative even integer
     // (within ε). For fractional `m` this never fires.
-    const LOG_EPS: f64 = 1e-12;
+    pub(crate) const LOG_EPS: f64 = 1e-12;
     let is_log_case = k_dim.is_multiple_of(2) && {
         let n_f = (alpha / 2.0).round();
         n_f >= 0.0 && (n_f * 2.0 - alpha).abs() < LOG_EPS
@@ -832,7 +832,7 @@ pub(crate) fn duchon_polyharmonic_operator_block_jets(
     // Log case: k_dim even and `2m − k_dim` is a non-negative even integer
     // (within ε). For fractional `m` this never fires; for integer `m` it
     // matches the original `k_dim % 2 == 0 && m >= k_dim / 2` check.
-    const LOG_EPS: f64 = 1e-12;
+    pub(crate) const LOG_EPS: f64 = 1e-12;
     let is_log_case = k_dim.is_multiple_of(2) && {
         let n_f = (alpha / 2.0).round();
         n_f >= 0.0 && (n_f * 2.0 - alpha).abs() < LOG_EPS
@@ -896,13 +896,13 @@ pub(crate) fn duchon_polyharmonic_operator_block_jets(
 /// recurrence is exact and replaces the per-order closed-form sum.
 pub(crate) struct BesselKLadder {
     /// `values[i] = K_{base + i}(z)` with `base ∈ {0, ½}`.
-    values: SmallVec<[f64; 16]>,
-    half_integer: bool,
+    pub(crate) values: SmallVec<[f64; 16]>,
+    pub(crate) half_integer: bool,
 }
 
 
 impl BesselKLadder {
-    fn build(z: f64, half_integer: bool, max_order_steps: usize) -> Self {
+    pub(crate) fn build(z: f64, half_integer: bool, max_order_steps: usize) -> Self {
         let zz = z.max(1e-300);
         let mut values: SmallVec<[f64; 16]> = SmallVec::with_capacity(max_order_steps + 2);
         if half_integer {
@@ -928,7 +928,7 @@ impl BesselKLadder {
 
     /// `K_{|order|}(z)` from the ladder (`K_{−ν} = K_ν`).
     #[inline]
-    fn k_abs(&self, order_abs: f64) -> f64 {
+    pub(crate) fn k_abs(&self, order_abs: f64) -> f64 {
         let base = if self.half_integer { 0.5 } else { 0.0 };
         let idx = (order_abs - base).round() as usize;
         self.values[idx]
@@ -1836,7 +1836,7 @@ pub(crate) fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f
 /// For a cap of `K = 1024` and n up to ~10⁹ this yields O(K²·d) work per
 /// call — a few hundred μs. For n < K the exact pairwise is used.
 pub(crate) fn pairwise_distance_bounds_sampled(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
-    const K_CAP: usize = 1024;
+    pub(crate) const K_CAP: usize = 1024;
     let n = points.nrows();
     let d = points.ncols();
     if n < 2 || d == 0 {

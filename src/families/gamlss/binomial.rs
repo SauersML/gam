@@ -36,19 +36,19 @@
 pub(crate) use super::*;
 
 mod kernel;
-pub use kernel::*;
+pub(crate) use kernel::*;
 
 mod location_scale;
-pub use location_scale::*;
+pub(crate) use location_scale::*;
 
 mod location_scale_workspace;
-pub use location_scale_workspace::*;
+pub(crate) use location_scale_workspace::*;
 
 mod wiggle;
 pub use wiggle::*;
 
 mod wiggle_custom_family;
-pub use wiggle_custom_family::*;
+pub(crate) use wiggle_custom_family::*;
 
 mod wiggle_workspace;
-pub use wiggle_workspace::*;
+pub(crate) use wiggle_workspace::*;

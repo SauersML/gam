@@ -1,4 +1,3 @@
-use super::*;
 
 pub(crate) fn reml_contract_panic(message: impl Into<String>) -> ! {
     std::panic::panic_any(message.into())

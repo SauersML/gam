@@ -8,9 +8,9 @@ use super::*;
 /// points to reduce allocation and improve cache locality.
 #[derive(Clone, Debug, Default)]
 pub struct BsplineScratch {
-    left: Vec<f64>,
-    right: Vec<f64>,
-    n: Vec<f64>,
+    pub(crate) left: Vec<f64>,
+    pub(crate) right: Vec<f64>,
+    pub(crate) n: Vec<f64>,
 }
 
 impl BsplineScratch {
@@ -210,7 +210,7 @@ pub(super) fn evaluate_splines_at_point_into(
 }
 
 #[inline]
-fn evaluate_spline_local_values(
+pub(crate) fn evaluate_spline_local_values(
     x: f64,
     degree: usize,
     knots: ArrayView1<f64>,
@@ -268,7 +268,7 @@ fn evaluate_spline_local_values(
 }
 
 #[inline]
-fn evaluate_splines_at_point_fixed<const DEGREE: usize>(
+pub(crate) fn evaluate_splines_at_point_fixed<const DEGREE: usize>(
     x: f64,
     knots: ArrayView1<f64>,
     basisvalues: &mut [f64],
@@ -290,7 +290,7 @@ fn evaluate_splines_at_point_fixed<const DEGREE: usize>(
 }
 
 #[inline]
-fn evaluate_splines_at_point_dynamic(
+pub(crate) fn evaluate_splines_at_point_dynamic(
     x: f64,
     degree: usize,
     knots: ArrayView1<f64>,

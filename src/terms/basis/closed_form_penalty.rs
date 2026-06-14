@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 /// Gauss-Legendre nodes and weights on `[-1, 1]` for `n` points,
 /// computed via Newton iteration on Legendre polynomial roots
 /// (Bonnet's recurrence). Returns `(nodes, weights)` ascending.
-fn compute_gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
+pub(crate) fn compute_gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
     let mut tmp: Vec<(f64, f64)> = Vec::with_capacity(n);
     let half = n.div_ceil(2);
     for i in 0..half {
@@ -54,8 +54,8 @@ fn compute_gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
     (nodes, weights)
 }
 
-fn gauss_legendre_64() -> &'static (Vec<f64>, Vec<f64>) {
-    static CACHE: OnceLock<(Vec<f64>, Vec<f64>)> = OnceLock::new();
+pub(crate) fn gauss_legendre_64() -> &'static (Vec<f64>, Vec<f64>) {
+    pub(crate) static CACHE: OnceLock<(Vec<f64>, Vec<f64>)> = OnceLock::new();
     CACHE.get_or_init(|| compute_gauss_legendre(64))
 }
 
@@ -77,7 +77,7 @@ fn gauss_legendre_64() -> &'static (Vec<f64>, Vec<f64>) {
 /// or `4(m+s) ≤ d`. The latter never coincides with the convergent
 /// regime of canonical TPS, so we use `d > 4m` as the dispatch gate.
 #[inline]
-fn schwinger_radial_is_convergent(d: usize, m: usize) -> bool {
+pub(crate) fn schwinger_radial_is_convergent(d: usize, m: usize) -> bool {
     d > 4 * m
 }
 
@@ -181,7 +181,7 @@ pub(crate) fn stable_hybrid_duchon_radial(
     accum.iter().map(|acc| inv_beta * acc.sum()).collect()
 }
 
-fn factorial_f64(n: usize) -> f64 {
+pub(crate) fn factorial_f64(n: usize) -> f64 {
     let mut acc = 1.0_f64;
     for k in 2..=n {
         acc *= k as f64;
@@ -213,9 +213,9 @@ pub fn bessel_k(nu: f64, x: f64) -> f64 {
     bessel_k_bessik(nu_abs, x)
 }
 
-const BESSEL_K_EPS: f64 = 1.0e-15;
-const BESSEL_K_MAX_ITER: usize = 10_000;
-const BESSEL_K_CHEB_C1: [f64; 7] = [
+pub(crate) const BESSEL_K_EPS: f64 = 1.0e-15;
+pub(crate) const BESSEL_K_MAX_ITER: usize = 10_000;
+pub(crate) const BESSEL_K_CHEB_C1: [f64; 7] = [
     -1.142_022_680_371_168,
     6.516_511_267_073_7e-3,
     3.087_090_173_086e-4,
@@ -224,7 +224,7 @@ const BESSEL_K_CHEB_C1: [f64; 7] = [
     3.677_95e-11,
     -1.356e-13,
 ];
-const BESSEL_K_CHEB_C2: [f64; 8] = [
+pub(crate) const BESSEL_K_CHEB_C2: [f64; 8] = [
     1.843_740_587_300_905,
     -7.685_284_084_478_67e-2,
     1.271_927_136_654_6e-3,
@@ -235,7 +235,7 @@ const BESSEL_K_CHEB_C2: [f64; 8] = [
     -1.49e-15,
 ];
 
-fn bessel_k_bessik(nu: f64, x: f64) -> f64 {
+pub(crate) fn bessel_k_bessik(nu: f64, x: f64) -> f64 {
     let nl = (nu + 0.5).floor() as usize;
     let mu = nu - nl as f64;
     let (mut rkmu, mut rk1) = if x <= 2.0 {
@@ -254,7 +254,7 @@ fn bessel_k_bessik(nu: f64, x: f64) -> f64 {
 }
 
 /// K_{n+1/2}(x) = √(π/(2x)) · e^{-x} · Σ_{k=0}^{n} (n+k)! / (k!(n-k)!) · (2x)^{-k}.
-fn bessel_k_half_integer(n: usize, x: f64) -> f64 {
+pub(crate) fn bessel_k_half_integer(n: usize, x: f64) -> f64 {
     let pref = (std::f64::consts::PI / (2.0 * x)).sqrt() * (-x).exp();
     let mut sum = 0.0_f64;
     let two_x = 2.0 * x;
@@ -267,7 +267,7 @@ fn bessel_k_half_integer(n: usize, x: f64) -> f64 {
     pref * sum
 }
 
-fn bessel_k_temme(mu: f64, x: f64) -> (f64, f64) {
+pub(crate) fn bessel_k_temme(mu: f64, x: f64) -> (f64, f64) {
     let half_x = 0.5 * x;
     let mu2 = mu * mu;
     let pimu = std::f64::consts::PI * mu;
@@ -320,7 +320,7 @@ fn bessel_k_temme(mu: f64, x: f64) -> (f64, f64) {
     panic!("bessel_k Temme series failed to converge for mu={mu} x={x}");
 }
 
-fn bessel_k_steed_cf2(mu: f64, x: f64) -> (f64, f64) {
+pub(crate) fn bessel_k_steed_cf2(mu: f64, x: f64) -> (f64, f64) {
     let mut b = 2.0 * (1.0 + x);
     let mut d = 1.0 / b;
     let mut delh = d;
@@ -365,7 +365,7 @@ fn bessel_k_steed_cf2(mu: f64, x: f64) -> (f64, f64) {
     panic!("bessel_k Steed CF2 failed to converge for mu={mu} x={x}");
 }
 
-fn bessel_k_beschb(mu: f64) -> (f64, f64, f64, f64) {
+pub(crate) fn bessel_k_beschb(mu: f64) -> (f64, f64, f64, f64) {
     let xx = 8.0 * mu * mu - 1.0;
     let gam1 = chebyshev_eval_minus1_to_1(&BESSEL_K_CHEB_C1, xx);
     let gam2 = chebyshev_eval_minus1_to_1(&BESSEL_K_CHEB_C2, xx);
@@ -374,7 +374,7 @@ fn bessel_k_beschb(mu: f64) -> (f64, f64, f64, f64) {
     (gam1, gam2, gampl, gammi)
 }
 
-fn chebyshev_eval_minus1_to_1(coeffs: &[f64], x: f64) -> f64 {
+pub(crate) fn chebyshev_eval_minus1_to_1(coeffs: &[f64], x: f64) -> f64 {
     let mut d = 0.0_f64;
     let mut dd = 0.0_f64;
     let y2 = 2.0 * x;
@@ -410,7 +410,7 @@ pub fn riesz_kernel_value(d: usize, j: f64, r: f64) -> f64 {
     // For integer `j` this is exact; for fractional `j` it never fires
     // because `2j − d` won't be an even integer to within `LOG_EPS`.
     let two_j = 2.0 * j;
-    const LOG_EPS: f64 = 1e-12;
+    pub(crate) const LOG_EPS: f64 = 1e-12;
     let offset = two_j - d as f64;
     if offset >= -LOG_EPS && (offset.round() - offset).abs() < LOG_EPS {
         let n_f64 = (offset / 2.0).round();
@@ -450,7 +450,7 @@ pub fn riesz_kernel_value(d: usize, j: f64, r: f64) -> f64 {
 /// `c_n 4n(n+d/2-1) = -c_{n-1}`, exact distributional recurrence
 /// `Δ R_{d/2+n}^d = -R_{d/2+n-1}^d` requires
 /// `A_n = A_{n-1} - (4n+d-2)/(4n(n+d/2-1))`, with `A_0 = 0`.
-fn log_riesz_finite_part_shift(d: usize, n: usize) -> f64 {
+pub(crate) fn log_riesz_finite_part_shift(d: usize, n: usize) -> f64 {
     let half_d = 0.5 * d as f64;
     let mut shift = 0.0_f64;
     for t in 1..=n {
@@ -503,12 +503,12 @@ pub fn matern_kernel_value(d: usize, ell: usize, kappa: f64, r: f64) -> f64 {
     pref * r.powf(nu) * kv
 }
 
-const DUCHON_SMALL_CHI_SERIES_MAX: f64 = 0.125;
-const DUCHON_SMALL_CHI_SERIES_MAX_TERMS: usize = 96;
-const DUCHON_SMALL_CHI_SERIES_REL_TOL: f64 = 4.0e-16;
+pub(crate) const DUCHON_SMALL_CHI_SERIES_MAX: f64 = 0.125;
+pub(crate) const DUCHON_SMALL_CHI_SERIES_MAX_TERMS: usize = 96;
+pub(crate) const DUCHON_SMALL_CHI_SERIES_REL_TOL: f64 = 4.0e-16;
 
 #[inline]
-fn use_duchon_small_chi_riesz_series(kappa: f64, r: f64) -> bool {
+pub(crate) fn use_duchon_small_chi_riesz_series(kappa: f64, r: f64) -> bool {
     kappa > 0.0
         && kappa.is_finite()
         && r > 0.0
@@ -536,7 +536,7 @@ fn use_duchon_small_chi_riesz_series(kappa: f64, r: f64) -> bool {
 /// with `kappa_derivative_order` set to 1 or 2, the corresponding
 /// analytic κ partials. It is the shared value/η/κ source for the
 /// cancellation basin; production never differentiates it numerically.
-fn duchon_small_chi_riesz_series_radial_derivatives(
+pub(crate) fn duchon_small_chi_riesz_series_radial_derivatives(
     d: usize,
     a: usize,
     b: usize,
@@ -634,7 +634,7 @@ fn duchon_small_chi_riesz_series_radial_derivatives(
     total.iter().map(|acc| acc.sum()).collect()
 }
 
-fn duchon_small_chi_riesz_series_value(d: usize, a: usize, b: usize, kappa: f64, r: f64) -> f64 {
+pub(crate) fn duchon_small_chi_riesz_series_value(d: usize, a: usize, b: usize, kappa: f64, r: f64) -> f64 {
     duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, 0, 0)[0]
 }
 
@@ -764,9 +764,9 @@ pub struct PairBlockBundle {
 /// axis per pair without changing the analytic radial formula.
 #[derive(Debug, Clone)]
 pub(crate) struct AnisoMetricPowers {
-    b: Vec<f64>,
-    b2: Vec<f64>,
-    b3: Vec<f64>,
+    pub(crate) b: Vec<f64>,
+    pub(crate) b2: Vec<f64>,
+    pub(crate) b3: Vec<f64>,
 }
 
 impl AnisoMetricPowers {
@@ -785,7 +785,7 @@ impl AnisoMetricPowers {
     }
 
     #[inline(always)]
-    fn assert_dim(&self, dim: usize) {
+    pub(crate) fn assert_dim(&self, dim: usize) {
         assert_eq!(self.b.len(), dim);
         assert_eq!(self.b2.len(), dim);
         assert_eq!(self.b3.len(), dim);
@@ -931,7 +931,7 @@ pub(crate) fn schoenberg_self_pair_bundle(
     })
 }
 
-fn hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d(
+pub(crate) fn hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d(
     q: usize,
     m: usize,
     s: usize,
@@ -964,7 +964,7 @@ fn hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d(
     Some((f, f_kappa, f_kappa2))
 }
 
-fn hybrid_self_pair_bundle_odd_d(
+pub(crate) fn hybrid_self_pair_bundle_odd_d(
     q: usize,
     m: usize,
     s: usize,
@@ -1117,7 +1117,7 @@ pub(crate) fn analytic_self_pair_bundle(
 /// the recurrence `K_b' = -(K_{b-1} + K_{b+1})/2` widens the required
 /// Bessel-order range by 1; supporting `f^{(max_order)}` therefore
 /// requires `max_order` shifts on either side of ν.
-const BESSEL_TABLE_HALF_WIDTH: i32 = 6;
+pub(crate) const BESSEL_TABLE_HALF_WIDTH: i32 = 6;
 
 /// Bundle of values `K_{ν+i}(x)` for `−H ≤ i ≤ H`, where
 /// `H = BESSEL_TABLE_HALF_WIDTH`. Returns a length-`(2H + 1)` vector
@@ -1125,7 +1125,7 @@ const BESSEL_TABLE_HALF_WIDTH: i32 = 6;
 /// derivatives of `r^a · K_b(κr)` via the recurrence
 /// `K_b' = -(K_{b-1} + K_{b+1})/2`; supporting `f^{(k)}` requires
 /// `H ≥ k`.
-fn bessel_k_table_around(nu: f64, x: f64) -> Vec<f64> {
+pub(crate) fn bessel_k_table_around(nu: f64, x: f64) -> Vec<f64> {
     let h = BESSEL_TABLE_HALF_WIDTH;
     let len = (2 * h + 1) as usize;
     let mut out = vec![0.0_f64; len];
@@ -1151,7 +1151,7 @@ fn bessel_k_table_around(nu: f64, x: f64) -> Vec<f64> {
 /// Each step triples the term count.  For the 4 derivatives we
 /// need (max order = 4) the term list grows to at most 3^4 = 81
 /// entries while staying allocation-free per pair.
-fn matern_block_radial_derivatives(
+pub(crate) fn matern_block_radial_derivatives(
     d: usize,
     ell: usize,
     kappa: f64,
@@ -1251,7 +1251,7 @@ fn matern_block_radial_derivatives(
 }
 
 /// Merge terms with equal `(a, b)` exponents to keep the list short.
-fn compress_terms(mut terms: Vec<(f64, f64, i32)>) -> Vec<(f64, f64, i32)> {
+pub(crate) fn compress_terms(mut terms: Vec<(f64, f64, i32)>) -> Vec<(f64, f64, i32)> {
     terms.sort_by(|x, y| {
         x.2.cmp(&y.2)
             .then_with(|| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -1273,7 +1273,7 @@ fn compress_terms(mut terms: Vec<(f64, f64, i32)>) -> Vec<(f64, f64, i32)> {
 /// Radial derivatives `[R^{(0)}, …, R^{(max_order)}]` of a single
 /// Riesz block `R_j^d(r) = c · r^{2j-d}` (non-log) or
 /// `c · r^{2n} · ln r` (log case `2j = d + 2n`).
-fn riesz_block_radial_derivatives(d: usize, j: f64, r: f64, max_order: usize) -> Vec<f64> {
+pub(crate) fn riesz_block_radial_derivatives(d: usize, j: f64, r: f64, max_order: usize) -> Vec<f64> {
     assert!(d >= 1, "riesz block requires dimension >= 1: d={d}");
     assert!(
         j.is_finite() && j >= 1.0,
@@ -1287,7 +1287,7 @@ fn riesz_block_radial_derivatives(d: usize, j: f64, r: f64, max_order: usize) ->
 
     // Log case detection: `2j − d` is a non-negative even integer
     // (within ε). For fractional `j` this never fires.
-    const LOG_EPS: f64 = 1e-12;
+    pub(crate) const LOG_EPS: f64 = 1e-12;
     let offset = two_j - d as f64;
     let log_case = offset >= -LOG_EPS && {
         let n_f = (offset / 2.0).round();
@@ -1552,7 +1552,7 @@ pub fn pure_duchon_self_pair_value(
 /// Riesz kernel coefficient `c_j^d` for the non-log case
 /// (`R_j^d(R) = c_j^d · R^{2j − d}`):
 ///   c_j^d = Γ(d/2 − j) / (4^j · π^{d/2} · Γ(j)).
-fn riesz_kernel_coefficient_nonlog(d: usize, j: usize) -> f64 {
+pub(crate) fn riesz_kernel_coefficient_nonlog(d: usize, j: usize) -> f64 {
     let half_d = d as f64 / 2.0;
     let num = gamma_fn(half_d - j as f64);
     let denom = 4.0_f64.powi(j as i32) * std::f64::consts::PI.powf(half_d) * gamma_fn(j as f64);
@@ -1685,7 +1685,7 @@ pub(crate) fn anisotropic_duchon_penalty_radial_with_powers(
     }
 }
 
-fn uniform_metric_radial_duchon_penalty(
+pub(crate) fn uniform_metric_radial_duchon_penalty(
     q: usize,
     m: usize,
     s: f64,
@@ -1725,21 +1725,21 @@ fn uniform_metric_radial_duchon_penalty(
     Some(value)
 }
 
-fn uniform_eta_value(eta: &[f64]) -> Option<f64> {
+pub(crate) fn uniform_eta_value(eta: &[f64]) -> Option<f64> {
     let (&first, rest) = eta.split_first()?;
     (first.is_finite() && rest.iter().all(|&value| value == first)).then_some(first)
 }
 
-fn squared_norm(x: &[f64]) -> f64 {
+pub(crate) fn squared_norm(x: &[f64]) -> f64 {
     x.iter().map(|&value| value * value).sum()
 }
 
-fn is_zero_lag(r: &[f64]) -> bool {
+pub(crate) fn is_zero_lag(r: &[f64]) -> bool {
     r.iter().all(|&value| value == 0.0)
 }
 
 /// Δ_B f(R) with f given by its radial derivatives `[f, f', f'', …]`.
-fn anisotropic_laplacian_of_radial_first(big_r: f64, s1: f64, u1: f64, fr: &[f64]) -> f64 {
+pub(crate) fn anisotropic_laplacian_of_radial_first(big_r: f64, s1: f64, u1: f64, fr: &[f64]) -> f64 {
     // Δ_B f = f''·u_1/R² + f'·(s_1/R - u_1/R³)
     let r2 = big_r * big_r;
     let r3 = r2 * big_r;
@@ -1747,7 +1747,7 @@ fn anisotropic_laplacian_of_radial_first(big_r: f64, s1: f64, u1: f64, fr: &[f64
 }
 
 /// Δ_B² f(R) with f given by its radial derivatives `[f, f', …, f^{(4)}]`.
-fn anisotropic_laplacian_of_radial_second(
+pub(crate) fn anisotropic_laplacian_of_radial_second(
     big_r: f64,
     s1: f64,
     s2: f64,
@@ -1783,12 +1783,12 @@ fn anisotropic_laplacian_of_radial_second(
 ///   s_p = Σ b_k^p, p ∈ {1, 2}   (anisotropy traces)
 ///   u_p = Σ b_k^{p+1} r_k², p ∈ {1, 2}
 /// where b_k = exp(-2 η_k).
-fn aniso_invariants(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
+pub(crate) fn aniso_invariants(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
     let powers = AnisoMetricPowers::new(eta);
     aniso_invariants_with_powers(&powers, r)
 }
 
-fn aniso_invariants_with_powers(
+pub(crate) fn aniso_invariants_with_powers(
     powers: &AnisoMetricPowers,
     r: &[f64],
 ) -> (f64, f64, f64, f64, f64) {
@@ -2084,7 +2084,7 @@ pub fn radial_derivatives_of_isotropic_duchon_kappa_partial2(
 /// each `f^{(k)}` term once.
 ///
 /// Returns `(g, g_R, g_s1, g_s2, g_u1, g_u2)`.
-fn radial_g_q_partials(
+pub(crate) fn radial_g_q_partials(
     q: usize,
     big_r: f64,
     s1: f64,
@@ -2193,7 +2193,7 @@ fn radial_g_q_partials(
 ///     g_u2u2)`
 /// All cross terms not involving `R` vanish for q ≤ 2 except
 /// `g_s1s1 = 2 F3`, `g_s1u1 = F2`, `g_u1u1 = 2 F1` at q = 2.
-fn radial_g_q_hessian(
+pub(crate) fn radial_g_q_hessian(
     q: usize,
     big_r: f64,
     s1: f64,
@@ -2333,7 +2333,7 @@ fn radial_g_q_hessian(
     }
 }
 
-fn aniso_invariants_eta_jacobian_with_powers(
+pub(crate) fn aniso_invariants_eta_jacobian_with_powers(
     eta: &[f64],
     r: &[f64],
     powers: &AnisoMetricPowers,
@@ -2723,7 +2723,7 @@ mod tests {
     use super::{bessel_k, bessel_k_half_integer, gamma_fn};
 
     /// I_ν(x) = (x/2)^ν Σ_{k=0}^∞ (x²/4)^k / (k! Γ(ν+k+1)).
-    fn bessel_i_series(nu: f64, x: f64) -> f64 {
+    pub(crate) fn bessel_i_series(nu: f64, x: f64) -> f64 {
         let half_x = 0.5 * x;
         let half_x_sq = half_x * half_x;
         let prefix = (nu * half_x.ln()).exp();
@@ -2739,7 +2739,7 @@ mod tests {
         prefix * sum
     }
 
-    fn assert_relative_close(actual: f64, expected: f64, rel_tol: f64) {
+    pub(crate) fn assert_relative_close(actual: f64, expected: f64, rel_tol: f64) {
         let scale = expected.abs();
         let diff = (actual - expected).abs();
         assert!(
@@ -2749,18 +2749,18 @@ mod tests {
     }
 
     #[test]
-    fn bessel_k_matches_classic_k0_k1_values() {
+    pub(crate) fn bessel_k_matches_classic_k0_k1_values() {
         assert_relative_close(bessel_k(0.0, 1.0), 0.421_024_438_240_708_34, 1e-12);
         assert_relative_close(bessel_k(1.0, 1.0), 0.601_907_230_197_234_6, 1e-12);
     }
 
     #[test]
-    fn bessel_k_large_order_at_moderate_x_matches_reference() {
+    pub(crate) fn bessel_k_large_order_at_moderate_x_matches_reference() {
         assert_relative_close(bessel_k(10.0, 3.0), 2_459.6, 1e-3);
     }
 
     #[test]
-    fn bessel_k_half_integer_formula_and_nearby_orders_are_continuous() {
+    pub(crate) fn bessel_k_half_integer_formula_and_nearby_orders_are_continuous() {
         for x in [0.5, 1.5, 3.0, 10.0] {
             let closed_form = bessel_k_half_integer(2, x);
             assert_relative_close(bessel_k(2.5, x), closed_form, 1e-14);
@@ -2770,7 +2770,7 @@ mod tests {
     }
 
     #[test]
-    fn bessel_k_satisfies_order_recurrence() {
+    pub(crate) fn bessel_k_satisfies_order_recurrence() {
         for nu in [0.3, 1.7, 6.2, 11.4] {
             for x in [0.5, 1.9, 2.1, 3.0, 8.0, 25.0] {
                 let k_next = bessel_k(nu + 1.0, x);
@@ -2784,7 +2784,7 @@ mod tests {
     }
 
     #[test]
-    fn bessel_i_k_wronskian_holds_for_small_x() {
+    pub(crate) fn bessel_i_k_wronskian_holds_for_small_x() {
         for nu in [0.0, 0.3, 1.7, 6.2] {
             for x in [0.5, 1.0, 1.9, 2.0] {
                 let lhs = bessel_i_series(nu, x) * bessel_k(nu + 1.0, x)
@@ -2796,7 +2796,7 @@ mod tests {
     }
 
     #[test]
-    fn bessel_k_is_continuous_across_x_equals_two_dispatch() {
+    pub(crate) fn bessel_k_is_continuous_across_x_equals_two_dispatch() {
         for nu in [0.3, 4.6] {
             let left = bessel_k(nu, 2.0 - 1e-9);
             let right = bessel_k(nu, 2.0 + 1e-9);

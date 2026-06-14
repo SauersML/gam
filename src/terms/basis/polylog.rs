@@ -21,16 +21,16 @@
 /// Per-term magnitude below which the truncated power series is considered
 /// converged: at `1e-18` the dropped tail is well under one ulp of an O(1)
 /// partial sum, so the early exit never costs accuracy.
-const SERIES_TERM_FLOOR: f64 = 1e-18;
+pub(crate) const SERIES_TERM_FLOOR: f64 = 1e-18;
 
 /// Hard term cap for the fast regime `z ≤ 0.5`, where the geometric-like decay
 /// reaches [`SERIES_TERM_FLOOR`] in well under this many terms; acts only as a
 /// non-convergence guard.
-const FAST_REGIME_MAX_TERMS: usize = 200;
+pub(crate) const FAST_REGIME_MAX_TERMS: usize = 200;
 
 /// Hard term cap for the slow `Li₃` regime `z ∈ (0.5, 1)`, raised so the series
 /// still holds ≳13 digits at `z = 0.999` before the floor triggers.
-const SLOW_TRILOG_MAX_TERMS: usize = 5000;
+pub(crate) const SLOW_TRILOG_MAX_TERMS: usize = 5000;
 
 /// Dilogarithm `Li₂(z) = Σ_{k≥1} z^k / k²` for real `z ∈ [0, 1]`.
 ///
@@ -76,7 +76,7 @@ pub(crate) fn dilog_unit(z: f64) -> f64 {
 /// non-finite input, `ζ(3)` at `z = 1`.
 #[inline]
 pub(crate) fn trilog_unit(z: f64) -> f64 {
-    const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;
+    pub(crate) const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;
     if !z.is_finite() {
         return f64::NAN;
     }

@@ -3,10 +3,10 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ConstraintNullspaceCacheKey {
-    centersrows: usize,
-    centers_cols: usize,
-    centers_hash: u64,
-    order: ConstraintNullspaceOrderKey,
+    pub(crate) centersrows: usize,
+    pub(crate) centers_cols: usize,
+    pub(crate) centers_hash: u64,
+    pub(crate) order: ConstraintNullspaceOrderKey,
 }
 
 
@@ -19,8 +19,8 @@ pub(crate) enum ConstraintNullspaceOrderKey {
 
 #[derive(Default, Clone, Debug)]
 pub(crate) struct ConstraintNullspaceCache {
-    map: HashMap<ConstraintNullspaceCacheKey, Arc<Array2<f64>>>,
-    order: Vec<ConstraintNullspaceCacheKey>,
+    pub(crate) map: HashMap<ConstraintNullspaceCacheKey, Arc<Array2<f64>>>,
+    pub(crate) order: Vec<ConstraintNullspaceCacheKey>,
 }
 
 
@@ -29,23 +29,23 @@ pub(crate) const CONSTRAINT_NULLSPACE_CACHE_MAX_ENTRIES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct OwnedDataCacheKey {
-    rows: usize,
-    cols: usize,
-    ptr: usize,
-    stride0: isize,
-    stride1: isize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) ptr: usize,
+    pub(crate) stride0: isize,
+    pub(crate) stride1: isize,
 }
 
 
 #[derive(Debug)]
 pub(crate) struct BasisCacheContext {
-    constraint_nullspace: ConstraintNullspaceCache,
-    owned_data: crate::resource::ByteLruCache<OwnedDataCacheKey, Arc<Array2<f64>>>,
+    pub(crate) constraint_nullspace: ConstraintNullspaceCache,
+    pub(crate) owned_data: crate::resource::ByteLruCache<OwnedDataCacheKey, Arc<Array2<f64>>>,
 }
 
 
 impl BasisCacheContext {
-    fn with_policy(policy: &crate::resource::ResourcePolicy) -> Self {
+    pub(crate) fn with_policy(policy: &crate::resource::ResourcePolicy) -> Self {
         Self {
             constraint_nullspace: ConstraintNullspaceCache::default(),
             owned_data: crate::resource::ByteLruCache::with_max_entries(
@@ -75,8 +75,8 @@ impl Default for BasisCacheContext {
 /// entry can be multiple gigabytes.
 #[derive(Debug)]
 pub struct BasisWorkspace {
-    cache: BasisCacheContext,
-    policy: crate::resource::ResourcePolicy,
+    pub(crate) cache: BasisCacheContext,
+    pub(crate) policy: crate::resource::ResourcePolicy,
 }
 
 
@@ -901,9 +901,9 @@ pub fn auto_streaming_chunk_size_for_dense(n_rows: usize, n_basis_cols: usize) -
     if n_rows == 0 || n_basis_cols == 0 {
         return None;
     }
-    const DENSE_THRESHOLD_BYTES: usize = 1024 * 1024 * 1024;
-    const TARGET_CHUNK_BYTES: usize = 256 * 1024 * 1024;
-    const MIN_CHUNK_ROWS: usize = 1024;
+    pub(crate) const DENSE_THRESHOLD_BYTES: usize = 1024 * 1024 * 1024;
+    pub(crate) const TARGET_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+    pub(crate) const MIN_CHUNK_ROWS: usize = 1024;
     let dense_bytes = n_rows.saturating_mul(n_basis_cols).saturating_mul(8);
     if dense_bytes <= DENSE_THRESHOLD_BYTES {
         return None;

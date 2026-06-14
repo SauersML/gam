@@ -30,57 +30,57 @@ use super::*;
 pub struct ImplicitDesignPsiDerivative {
     /// Pre-computed kernel values (materialized mode).
     /// Shape: (n * n_knots,). Empty in streaming mode.
-    phi_values: Array1<f64>,
+    pub(crate) phi_values: Array1<f64>,
 
     /// Pre-computed per (data, knot) pair axis components (materialized mode).
     /// Shape: (n * n_knots, D) stored in row-major order.
     /// Empty (0x0) in streaming mode.
-    axis_components: Array2<f64>,
+    pub(crate) axis_components: Array2<f64>,
 
     /// Pre-computed R-operator first scalar (materialized mode).
     /// Shape: (n * n_knots,). Empty in streaming mode.
-    q_values: Array1<f64>,
+    pub(crate) q_values: Array1<f64>,
 
     /// Pre-computed R-operator second scalar (materialized mode).
     /// Shape: (n * n_knots,). Empty in streaming mode.
-    t_values: Array1<f64>,
+    pub(crate) t_values: Array1<f64>,
 
     /// When set, enables streaming recomputation of q/t/s from raw inputs
     /// instead of reading from the pre-computed arrays above.
-    streaming: Option<StreamingRadialState>,
+    pub(crate) streaming: Option<StreamingRadialState>,
 
     /// Identifiability/constraint transform Z: (n_knots x p_constrained).
     /// Converts raw knot-space vectors to the identifiability-constrained
     /// basis. For Duchon this is the kernel-constraint nullspace Z_kernel;
     /// for Matern with identifiability constraints, it is the corresponding Z.
     /// `None` means the identity (no constraint).
-    ident_transform: Option<Array2<f64>>,
+    pub(crate) ident_transform: Option<Array2<f64>>,
 
     /// Optional full identifiability transform applied after Z_kernel + padding.
     /// For Duchon terms that have an additional global identifiability transform,
     /// this is applied after the kernel constraint and polynomial padding.
     /// Shape: (p_constrained + n_poly, p_final).
-    full_ident_transform: Option<Array2<f64>>,
+    pub(crate) full_ident_transform: Option<Array2<f64>>,
 
     /// Number of data points.
-    n: usize,
+    pub(crate) n: usize,
 
     /// Number of knots (raw basis functions before identifiability transform).
-    n_knots: usize,
+    pub(crate) n_knots: usize,
 
     /// Number of polynomial columns appended after the smooth part.
     /// These have zero derivative with respect to psi_d.
-    n_poly: usize,
+    pub(crate) n_poly: usize,
 
     /// Number of axes (dimension D).
-    n_axes: usize,
+    pub(crate) n_axes: usize,
 
     /// Isotropic scaling contribution per raw anisotropic psi axis.
-    psi_scale_share: f64,
+    pub(crate) psi_scale_share: f64,
 
     /// Optional exposed-axis to raw-axis linear combinations.
     /// When present, axis `a` represents Σ_i coeff_i * raw_axis_i.
-    axis_combinations: Option<Vec<Vec<(usize, f64)>>>,
+    pub(crate) axis_combinations: Option<Vec<Vec<(usize, f64)>>>,
 }
 
 
@@ -92,27 +92,27 @@ pub struct ImplicitDesignPsiDerivative {
 /// `forward_mul_axis` / `transpose_mul_axis` to expose the corresponding
 /// one-row design derivative on demand.
 pub struct LatentCoordDesignDerivative {
-    provider: Arc<dyn LocalDesignJacobianProvider>,
+    pub(crate) provider: Arc<dyn LocalDesignJacobianProvider>,
 }
 
 
 #[derive(Debug, Clone)]
 pub(crate) struct RadialLatentCoordLocalDesignJacobian {
-    latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
-    centers: Arc<Array2<f64>>,
-    radial_kind: RadialScalarKind,
-    ident_transform: Option<Array2<f64>>,
-    full_ident_transform: Option<Array2<f64>>,
-    n_poly: usize,
-    polynomial_order: Option<DuchonNullspaceOrder>,
+    pub(crate) latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+    pub(crate) centers: Arc<Array2<f64>>,
+    pub(crate) radial_kind: RadialScalarKind,
+    pub(crate) ident_transform: Option<Array2<f64>>,
+    pub(crate) full_ident_transform: Option<Array2<f64>>,
+    pub(crate) n_poly: usize,
+    pub(crate) polynomial_order: Option<DuchonNullspaceOrder>,
 }
 
 
 #[derive(Debug, Clone)]
 pub(crate) struct JetLatentCoordLocalDesignJacobian {
-    latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
-    jet: Arc<Array3<f64>>,
-    ident_transform: Option<Array2<f64>>,
+    pub(crate) latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+    pub(crate) jet: Arc<Array3<f64>>,
+    pub(crate) ident_transform: Option<Array2<f64>>,
 }
 
 
@@ -139,17 +139,17 @@ impl Clone for LatentCoordDesignDerivative {
 
 
 impl RadialLatentCoordLocalDesignJacobian {
-    fn p_constrained(&self) -> usize {
+    pub(crate) fn p_constrained(&self) -> usize {
         self.ident_transform
             .as_ref()
             .map_or(self.centers.nrows(), Array2::ncols)
     }
 
-    fn p_after_pad(&self) -> usize {
+    pub(crate) fn p_after_pad(&self) -> usize {
         self.p_constrained() + self.n_poly
     }
 
-    fn p_out(&self) -> usize {
+    pub(crate) fn p_out(&self) -> usize {
         self.full_ident_transform
             .as_ref()
             .map_or(self.p_after_pad(), Array2::ncols)
@@ -158,7 +158,7 @@ impl RadialLatentCoordLocalDesignJacobian {
 
 
 impl JetLatentCoordLocalDesignJacobian {
-    fn p_out(&self) -> usize {
+    pub(crate) fn p_out(&self) -> usize {
         self.ident_transform
             .as_ref()
             .map_or(self.jet.shape()[1], Array2::ncols)
@@ -458,7 +458,7 @@ impl LatentCoordDesignDerivative {
         Self::from_jet(latent, jet, None)
     }
 
-    fn from_jet(
+    pub(crate) fn from_jet(
         latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
         jet: Array3<f64>,
         ident_transform: Option<Array2<f64>>,
@@ -509,7 +509,7 @@ impl LatentCoordDesignDerivative {
 
 
 impl RadialLatentCoordLocalDesignJacobian {
-    fn project_and_pad(
+    pub(crate) fn project_and_pad(
         &self,
         raw_knot: &Array1<f64>,
         raw_poly: &Array1<f64>,
@@ -531,7 +531,7 @@ impl RadialLatentCoordLocalDesignJacobian {
         })
     }
 
-    fn kernel_axis_scalar(
+    pub(crate) fn kernel_axis_scalar(
         &self,
         row: usize,
         center: usize,
@@ -565,7 +565,7 @@ impl RadialLatentCoordLocalDesignJacobian {
         Ok(q * (t_row[axis] - self.centers[[center, axis]]))
     }
 
-    fn polynomial_axis_values(&self, row: usize, axis: usize) -> Array1<f64> {
+    pub(crate) fn polynomial_axis_values(&self, row: usize, axis: usize) -> Array1<f64> {
         let Some(order) = self.polynomial_order else {
             return Array1::<f64>::zeros(self.n_poly);
         };
@@ -597,7 +597,7 @@ impl RadialLatentCoordLocalDesignJacobian {
 
 
 impl JetLatentCoordLocalDesignJacobian {
-    fn project_jet(&self, raw_knot: &Array1<f64>) -> Result<Array1<f64>, BasisError> {
+    pub(crate) fn project_jet(&self, raw_knot: &Array1<f64>) -> Result<Array1<f64>, BasisError> {
         Ok(match &self.ident_transform {
             Some(z) => z.t().dot(raw_knot),
             None => raw_knot.clone(),
@@ -780,7 +780,7 @@ impl ImplicitDesignPsiDerivative {
         }
     }
 
-    fn with_psi_scale_share(mut self, psi_scale_share: f64) -> Self {
+    pub(crate) fn with_psi_scale_share(mut self, psi_scale_share: f64) -> Self {
         self.psi_scale_share = psi_scale_share;
         self
     }
@@ -881,7 +881,7 @@ impl ImplicitDesignPsiDerivative {
 
     /// Whether this operator is in streaming (recompute-on-the-fly) mode.
     #[inline]
-    fn is_streaming(&self) -> bool {
+    pub(crate) fn is_streaming(&self) -> bool {
         self.streaming.is_some()
     }
 
@@ -963,13 +963,13 @@ impl ImplicitDesignPsiDerivative {
     }
 
     /// Dimension after kernel constraint + polynomial padding (before full ident).
-    fn p_after_pad(&self) -> usize {
+    pub(crate) fn p_after_pad(&self) -> usize {
         let p_constrained = self.p_constrained();
         p_constrained + self.n_poly
     }
 
     /// Dimension after kernel constraint projection (before poly padding).
-    fn p_constrained(&self) -> usize {
+    pub(crate) fn p_constrained(&self) -> usize {
         match &self.ident_transform {
             Some(z) => z.ncols(),
             None => self.n_knots,
@@ -981,7 +981,7 @@ impl ImplicitDesignPsiDerivative {
     ///
     /// This is the core primitive: for each data point i, accumulate
     /// `v[i] * per_pair_scalar(i,j)` into knot j.
-    fn accumulate_knot_vector<F>(&self, v: &ArrayView1<f64>, per_pair: F) -> Array1<f64>
+    pub(crate) fn accumulate_knot_vector<F>(&self, v: &ArrayView1<f64>, per_pair: F) -> Array1<f64>
     where
         F: Fn(usize) -> f64 + Send + Sync,
     {
@@ -1033,7 +1033,7 @@ impl ImplicitDesignPsiDerivative {
     }
 
     /// Streaming accumulate knot vector from on-the-fly radial scalars.
-    fn streaming_accumulate_knot_vector<G>(
+    pub(crate) fn streaming_accumulate_knot_vector<G>(
         &self,
         v: &ArrayView1<f64>,
         deriv_fn: G,
@@ -1103,7 +1103,7 @@ impl ImplicitDesignPsiDerivative {
         }
     }
     /// Streaming forward multiply.
-    fn streaming_forward_mul<G>(
+    pub(crate) fn streaming_forward_mul<G>(
         &self,
         u_knot: &Array1<f64>,
         deriv_fn: G,
@@ -1172,7 +1172,7 @@ impl ImplicitDesignPsiDerivative {
         }
     }
     /// Streaming materialization: build (n x k) raw matrix then project.
-    fn streaming_materialize<G>(&self, deriv_fn: G) -> Result<Array2<f64>, BasisError>
+    pub(crate) fn streaming_materialize<G>(&self, deriv_fn: G) -> Result<Array2<f64>, BasisError>
     where
         G: Fn(f64, f64, f64, &[f64]) -> f64 + Send + Sync,
     {
@@ -1217,7 +1217,7 @@ impl ImplicitDesignPsiDerivative {
 
     /// Project a raw knot-space vector through the identifiability transform
     /// and pad with zeros for polynomial columns.
-    fn project_and_pad(&self, raw_knot_vec: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn project_and_pad(&self, raw_knot_vec: &Array1<f64>) -> Array1<f64> {
         // Step 1: apply kernel constraint Z (if present).
         let constrained = match &self.ident_transform {
             Some(z) => z.t().dot(raw_knot_vec),
@@ -1240,7 +1240,7 @@ impl ImplicitDesignPsiDerivative {
 
     /// Expand a coefficient vector from the final space back to raw knot space.
     /// This is the transpose path: p_out → (padded) → (constrained) → n_knots.
-    fn unproject(&self, u: &ArrayView1<f64>) -> Array1<f64> {
+    pub(crate) fn unproject(&self, u: &ArrayView1<f64>) -> Array1<f64> {
         // Step 1: undo full identifiability transform.
         let after_full = match &self.full_ident_transform {
             Some(zf) => zf.dot(u),
@@ -2169,7 +2169,7 @@ impl ImplicitDesignPsiDerivative {
 
     /// Project a raw (n × k) kernel-space matrix through all transforms to
     /// produce an (n × p_out) matrix: Z_kernel → pad poly → full ident.
-    fn project_matrix(&self, raw: Array2<f64>) -> Array2<f64> {
+    pub(crate) fn project_matrix(&self, raw: Array2<f64>) -> Array2<f64> {
         // Step 1: kernel constraint projection.
         let constrained = match &self.ident_transform {
             Some(z) => fast_ab(&raw, z),
@@ -2193,7 +2193,7 @@ impl ImplicitDesignPsiDerivative {
         }
     }
 
-    fn project_matrix_rows(&self, raw: Array2<f64>) -> Array2<f64> {
+    pub(crate) fn project_matrix_rows(&self, raw: Array2<f64>) -> Array2<f64> {
         let nrows = raw.nrows();
         let constrained = match &self.ident_transform {
             Some(z) => fast_ab(&raw, z),
@@ -2213,7 +2213,7 @@ impl ImplicitDesignPsiDerivative {
         }
     }
 
-    fn row_chunk_with_kernel<G>(
+    pub(crate) fn row_chunk_with_kernel<G>(
         &self,
         rows: std::ops::Range<usize>,
         deriv_fn: G,
@@ -2230,7 +2230,7 @@ impl ImplicitDesignPsiDerivative {
     /// by `forward_mul_matrix`, which does the projection on the rank side
     /// instead (`unproject_matrix(F)`) so the (n × p_out) projected
     /// derivative is never materialized for large-scale row counts.
-    fn row_chunk_with_kernel_raw<G>(
+    pub(crate) fn row_chunk_with_kernel_raw<G>(
         &self,
         rows: std::ops::Range<usize>,
         deriv_fn: G,
@@ -2492,7 +2492,7 @@ impl ImplicitDesignPsiDerivative {
         Ok(())
     }
 
-    fn transformed_axis_combination(&self, axis: usize) -> &[(usize, f64)] {
+    pub(crate) fn transformed_axis_combination(&self, axis: usize) -> &[(usize, f64)] {
         self.axis_combinations
             .as_ref()
             .expect("transformed axis combinations")
@@ -2502,12 +2502,12 @@ impl ImplicitDesignPsiDerivative {
     }
 
     #[inline]
-    fn transformed_combo_sum(combo: &[(usize, f64)]) -> f64 {
+    pub(crate) fn transformed_combo_sum(combo: &[(usize, f64)]) -> f64 {
         combo.iter().map(|(_, coeff)| *coeff).sum()
     }
 
     #[inline]
-    fn transformed_combo_axis_value_materialized(&self, idx: usize, combo: &[(usize, f64)]) -> f64 {
+    pub(crate) fn transformed_combo_axis_value_materialized(&self, idx: usize, combo: &[(usize, f64)]) -> f64 {
         combo
             .iter()
             .map(|(raw_axis, coeff)| coeff * self.axis_components[[idx, *raw_axis]])
@@ -2515,7 +2515,7 @@ impl ImplicitDesignPsiDerivative {
     }
 
     #[inline]
-    fn transformed_combo_overlap_streaming(
+    pub(crate) fn transformed_combo_overlap_streaming(
         combo_left: &[(usize, f64)],
         combo_right: &[(usize, f64)],
         sb: &[f64],
@@ -2532,7 +2532,7 @@ impl ImplicitDesignPsiDerivative {
     }
 
     #[inline]
-    fn transformed_combo_overlap_materialized(
+    pub(crate) fn transformed_combo_overlap_materialized(
         &self,
         idx: usize,
         combo_left: &[(usize, f64)],
@@ -2550,7 +2550,7 @@ impl ImplicitDesignPsiDerivative {
     }
 
     #[inline]
-    fn transformed_first_kernel_value(
+    pub(crate) fn transformed_first_kernel_value(
         phi: f64,
         q: f64,
         s_combo: f64,
@@ -2561,7 +2561,7 @@ impl ImplicitDesignPsiDerivative {
     }
 
     #[inline]
-    fn transformed_second_kernel_value(
+    pub(crate) fn transformed_second_kernel_value(
         phi: f64,
         q: f64,
         t: f64,
@@ -2809,9 +2809,9 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScalarDesignPsiDerivatives {
-    design_first: Array2<f64>,
-    design_second_diag: Array2<f64>,
-    implicit_operator: Option<ImplicitDesignPsiDerivative>,
+    pub(crate) design_first: Array2<f64>,
+    pub(crate) design_second_diag: Array2<f64>,
+    pub(crate) implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
 
 

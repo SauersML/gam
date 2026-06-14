@@ -821,32 +821,32 @@ pub(crate) fn hessian_operator_eta_cross_entry(
 ///   ∂D₂/∂η_a = [(d+2)·t + dt/dr · r] · s_a
 ///   ∂²D₂/∂η_a² = [(d+3)·dt/dr/r + d²t/dr²] · s_a² + 2·[(d+2)·t + dt/dr·r] · s_a
 pub(crate) struct MaternCrossPenaltyContext {
-    centers: Array2<f64>,
-    aniso_log_scales: Vec<f64>,
-    length_scale: f64,
-    nu: MaternNu,
-    z_transform: Option<Array2<f64>>,
-    penaltyinfo: Vec<PenaltyInfo>,
-    d0: Array2<f64>,
-    d1: Array2<f64>,
-    d2: Array2<f64>,
-    d0_eta_proj: Vec<Array2<f64>>,
-    d1_eta_proj: Vec<Array2<f64>>,
-    d2_eta_proj: Vec<Array2<f64>>,
-    op0_s_raw: Array2<f64>,
-    op1_s_raw: Array2<f64>,
-    op2_s_raw: Array2<f64>,
-    op0_c: f64,
-    op1_c: f64,
-    op2_c: f64,
-    op0_s_first_raw: Vec<Array2<f64>>,
-    op1_s_first_raw: Vec<Array2<f64>>,
-    op2_s_first_raw: Vec<Array2<f64>>,
+    pub(crate) centers: Array2<f64>,
+    pub(crate) aniso_log_scales: Vec<f64>,
+    pub(crate) length_scale: f64,
+    pub(crate) nu: MaternNu,
+    pub(crate) z_transform: Option<Array2<f64>>,
+    pub(crate) penaltyinfo: Vec<PenaltyInfo>,
+    pub(crate) d0: Array2<f64>,
+    pub(crate) d1: Array2<f64>,
+    pub(crate) d2: Array2<f64>,
+    pub(crate) d0_eta_proj: Vec<Array2<f64>>,
+    pub(crate) d1_eta_proj: Vec<Array2<f64>>,
+    pub(crate) d2_eta_proj: Vec<Array2<f64>>,
+    pub(crate) op0_s_raw: Array2<f64>,
+    pub(crate) op1_s_raw: Array2<f64>,
+    pub(crate) op2_s_raw: Array2<f64>,
+    pub(crate) op0_c: f64,
+    pub(crate) op1_c: f64,
+    pub(crate) op2_c: f64,
+    pub(crate) op0_s_first_raw: Vec<Array2<f64>>,
+    pub(crate) op1_s_first_raw: Vec<Array2<f64>>,
+    pub(crate) op2_s_first_raw: Vec<Array2<f64>>,
 }
 
 
 impl MaternCrossPenaltyContext {
-    fn project_operator(&self, mat: &Array2<f64>, row_dim: usize) -> Array2<f64> {
+    pub(crate) fn project_operator(&self, mat: &Array2<f64>, row_dim: usize) -> Array2<f64> {
         let kernel = if let Some(z) = self.z_transform.as_ref() {
             fast_ab(mat, z)
         } else {
@@ -857,7 +857,7 @@ impl MaternCrossPenaltyContext {
         padded
     }
 
-    fn compute_pair(&self, axis_a: usize, axis_b: usize) -> Result<Vec<Array2<f64>>, BasisError> {
+    pub(crate) fn compute_pair(&self, axis_a: usize, axis_b: usize) -> Result<Vec<Array2<f64>>, BasisError> {
         let p = self.centers.nrows();
         let d = self.centers.ncols();
         let mut d0_cross_raw = Array2::<f64>::zeros((p, p));
@@ -1005,17 +1005,17 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
     }
     let metric_weights = centered_aniso_metric_weights(eta);
 
-    struct CenterRowAccumulator {
-        k: usize,
-        d0: Array1<f64>,
-        d1: Array2<f64>,
-        d2: Array2<f64>,
-        d0_eta: Vec<Array1<f64>>,
-        d1_eta: Vec<Array2<f64>>,
-        d2_eta: Vec<Array2<f64>>,
-        d0_eta2: Vec<Array1<f64>>,
-        d1_eta2: Vec<Array2<f64>>,
-        d2_eta2: Vec<Array2<f64>>,
+    pub(crate) struct CenterRowAccumulator {
+        pub(crate) k: usize,
+        pub(crate) d0: Array1<f64>,
+        pub(crate) d1: Array2<f64>,
+        pub(crate) d2: Array2<f64>,
+        pub(crate) d0_eta: Vec<Array1<f64>>,
+        pub(crate) d1_eta: Vec<Array2<f64>>,
+        pub(crate) d2_eta: Vec<Array2<f64>>,
+        pub(crate) d0_eta2: Vec<Array1<f64>>,
+        pub(crate) d1_eta2: Vec<Array2<f64>>,
+        pub(crate) d2_eta2: Vec<Array2<f64>>,
     }
 
     let row_accumulators: Vec<CenterRowAccumulator> = (0..p)
@@ -1212,12 +1212,12 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
     // first/second derivatives + Frobenius norms.
     // We compute these once for axis 0 (the raw Gram S and norm c are the same
     // for all axes) and store them, then reuse c for cross-term normalization.
-    struct PerOperatorInfo {
-        s_raw: Array2<f64>,
-        c: f64,
-        s_first: Vec<Array2<f64>>, // per-axis first derivatives (normalized)
-        s_second: Vec<Array2<f64>>, // per-axis second derivatives (normalized)
-        s_first_raw: Vec<Array2<f64>>, // per-axis first derivatives (raw, for cross normalization)
+    pub(crate) struct PerOperatorInfo {
+        pub(crate) s_raw: Array2<f64>,
+        pub(crate) c: f64,
+        pub(crate) s_first: Vec<Array2<f64>>, // per-axis first derivatives (normalized)
+        pub(crate) s_second: Vec<Array2<f64>>, // per-axis second derivatives (normalized)
+        pub(crate) s_first_raw: Vec<Array2<f64>>, // per-axis first derivatives (raw, for cross normalization)
     }
 
     let compute_operator_info = |d_op: &Array2<f64>,
@@ -2363,7 +2363,7 @@ pub(crate) fn duchon_pure_closed_form_pair_block_cpd_adequate(
     if beta < 0.0 {
         return false;
     }
-    const LOG_EPS: f64 = 1e-12;
+    pub(crate) const LOG_EPS: f64 = 1e-12;
     let n_f = (beta / 2.0).round();
     let is_log_case =
         dimension.is_multiple_of(2) && n_f >= 0.0 && (n_f * 2.0 - beta).abs() < LOG_EPS;
@@ -3229,12 +3229,12 @@ pub fn build_matern_collocation_operator_matrices(
     let mut d1_raw = Array2::<f64>::zeros((p * d, p));
     let mut d2_raw = Array2::<f64>::zeros((p * d * d, p));
     let metric_weights = aniso_log_scales.map(centered_aniso_metric_weights);
-    const R_EPS: f64 = 1e-12;
+    pub(crate) const R_EPS: f64 = 1e-12;
     // Row blocks are independent: output rows [k] in d0, [k*d..(k+1)*d] in d1,
     // and [k*d*d..(k+1)*d*d] in d2 are disjoint for each collocation row k.
     // Keep small assemblies serial to avoid Rayon scheduling overhead.
-    const MATERN_COLLOCATION_PAR_WORK_THRESHOLD: usize = 32_768;
-    const MATERN_COLLOCATION_ROW_BLOCK: usize = 32;
+    pub(crate) const MATERN_COLLOCATION_PAR_WORK_THRESHOLD: usize = 32_768;
+    pub(crate) const MATERN_COLLOCATION_ROW_BLOCK: usize = 32;
     let assembly_work = p
         .saturating_mul(p)
         .saturating_mul(d.max(1))

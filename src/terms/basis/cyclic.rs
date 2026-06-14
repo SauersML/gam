@@ -104,7 +104,7 @@ pub fn create_closure_difference_penalty_jet(
 }
 
 /// Binomial coefficient `C(n, k)` for the small penalty orders used here.
-fn binomial(n: usize, k: usize) -> f64 {
+pub(crate) fn binomial(n: usize, k: usize) -> f64 {
     let mut acc = 1.0_f64;
     for i in 0..k {
         acc = acc * (n - i) as f64 / (i + 1) as f64;
@@ -190,7 +190,7 @@ mod closure_tests {
     /// At `γ = 0` the closure penalty is the open penalty; at `γ = 1` it is the
     /// cyclic penalty. The wrap piece carries the seam.
     #[test]
-    fn closure_penalty_interpolates_open_to_cyclic() {
+    pub(crate) fn closure_penalty_interpolates_open_to_cyclic() {
         let n = 8;
         let order = 2;
         let s_open = create_open_difference_penalty_matrix(n, order).unwrap();
@@ -205,7 +205,7 @@ mod closure_tests {
     /// The closure penalty's γ-derivative matches a finite difference of the
     /// penalty matrix.
     #[test]
-    fn closure_penalty_gamma_derivative_matches_fd() {
+    pub(crate) fn closure_penalty_gamma_derivative_matches_fd() {
         let n = 6;
         let order = 2;
         let g = 0.45;
@@ -221,7 +221,7 @@ mod closure_tests {
     /// null space (order-2 difference), while the cyclic penalty only leaves the
     /// constant — the wrap piece is what penalises the boundary ramp.
     #[test]
-    fn open_penalty_null_space_is_larger_than_cyclic() {
+    pub(crate) fn open_penalty_null_space_is_larger_than_cyclic() {
         let n = 7;
         let s_open = create_open_difference_penalty_matrix(n, 2).unwrap();
         let ones = ndarray::Array1::<f64>::ones(n);

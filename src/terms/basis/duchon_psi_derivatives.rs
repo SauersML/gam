@@ -22,63 +22,63 @@ pub(crate) fn duchon_scaling_exponent(p_order: usize, s_order: usize, k_dim: usi
 
 #[derive(Clone, Copy)]
 pub(crate) struct DuchonMaternDerivativeTerm {
-    coeff: f64,
-    kappa_power: usize,
-    r_power: f64,
-    bessel_order: f64,
+    pub(crate) coeff: f64,
+    pub(crate) kappa_power: usize,
+    pub(crate) r_power: f64,
+    pub(crate) bessel_order: f64,
 }
 
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PsiTriplet {
-    value: f64,
-    psi: f64,
-    psi_psi: f64,
+    pub(crate) value: f64,
+    pub(crate) psi: f64,
+    pub(crate) psi_psi: f64,
 }
 
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DuchonRadialCore {
-    phi: PsiTriplet,
+    pub(crate) phi: PsiTriplet,
 }
 
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DuchonRadialJets {
-    phi: f64,
-    phi_r: f64,
-    phi_rr: f64,
-    phi_rrr: f64,
-    q: f64,
-    q_r: f64,
-    q_rr: f64,
-    lap: f64,
-    lap_r: f64,
-    lap_rr: f64,
+    pub(crate) phi: f64,
+    pub(crate) phi_r: f64,
+    pub(crate) phi_rr: f64,
+    pub(crate) phi_rrr: f64,
+    pub(crate) q: f64,
+    pub(crate) q_r: f64,
+    pub(crate) q_rr: f64,
+    pub(crate) lap: f64,
+    pub(crate) lap_r: f64,
+    pub(crate) lap_rr: f64,
     /// R-operator radial scalar: t = R²φ = (φ'' - q) / r² = q' / r.
     /// At collision (r = 0): t = φ''''(0) / 3, computed via assembled
     /// fourth-derivative collision limits of the partial-fraction blocks.
-    t: f64,
+    pub(crate) t: f64,
     /// First radial derivative of t:
     ///   t_r = dt/dr = (q_rr - t) / r  for r > 0.
     /// At collision, the exact radial limit is t_r(0) = 0.
-    t_r: f64,
+    pub(crate) t_r: f64,
     /// Second radial derivative of t:
     ///   t_rr = d²t/dr² = [lap_rr + 2 t - (d + 4) q_rr] / r²  for r > 0,
     /// using Delta phi = d q + r² t.
     ///
     /// At collision, the exact radial limit is
     ///   t_rr(0) = φ⁽⁶⁾(0) / 15.
-    t_rr: f64,
+    pub(crate) t_rr: f64,
 }
 
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DuchonRegularizedOperatorCore {
-    q: f64,
-    t: f64,
-    t_r: f64,
-    t_rr: f64,
+    pub(crate) q: f64,
+    pub(crate) t: f64,
+    pub(crate) t_r: f64,
+    pub(crate) t_rr: f64,
 }
 
 

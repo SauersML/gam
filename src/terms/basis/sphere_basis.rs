@@ -1314,20 +1314,20 @@ pub(crate) fn build_matern_operator_penalty_psi_derivatives(
 
 
 pub(crate) struct DuchonRawPenaltyPsiDerivativeBlocks {
-    d0: Array2<f64>,
-    d1: Array2<f64>,
-    d2: Array2<f64>,
-    d0_psi: Array2<f64>,
-    d1_psi: Array2<f64>,
-    d2_psi: Array2<f64>,
-    d0_psi_psi: Array2<f64>,
-    d1_psi_psi: Array2<f64>,
-    d2_psi_psi: Array2<f64>,
+    pub(crate) d0: Array2<f64>,
+    pub(crate) d1: Array2<f64>,
+    pub(crate) d2: Array2<f64>,
+    pub(crate) d0_psi: Array2<f64>,
+    pub(crate) d1_psi: Array2<f64>,
+    pub(crate) d2_psi: Array2<f64>,
+    pub(crate) d0_psi_psi: Array2<f64>,
+    pub(crate) d1_psi_psi: Array2<f64>,
+    pub(crate) d2_psi_psi: Array2<f64>,
 }
 
 
 impl DuchonRawPenaltyPsiDerivativeBlocks {
-    fn zeros(p: usize, d: usize, cols: usize) -> Self {
+    pub(crate) fn zeros(p: usize, d: usize, cols: usize) -> Self {
         Self {
             d0: Array2::<f64>::zeros((p, cols)),
             d1: Array2::<f64>::zeros((p * d, cols)),
@@ -1341,7 +1341,7 @@ impl DuchonRawPenaltyPsiDerivativeBlocks {
         }
     }
 
-    fn add_assign(&mut self, rhs: &Self) {
+    pub(crate) fn add_assign(&mut self, rhs: &Self) {
         self.d0 += &rhs.d0;
         self.d1 += &rhs.d1;
         self.d2 += &rhs.d2;
@@ -2313,17 +2313,17 @@ pub(crate) fn build_matern_double_penalty_primarywith_psi_derivatives(
 /// perturbation in this frozen eigenbasis `U`.
 pub(crate) struct ShrinkageProjectorFrame {
     /// Eigenvectors of `sym(A)`, columns ascending in eigenvalue.
-    u: Array2<f64>,
+    pub(crate) u: Array2<f64>,
     /// Eigenvalues (ascending).
-    evals: Array1<f64>,
+    pub(crate) evals: Array1<f64>,
     /// `1` on near-null indices `N`, `0` elsewhere.
-    in_null: Vec<f64>,
+    pub(crate) in_null: Vec<f64>,
     /// Null dimension `r = |N|`.
-    null_dim: usize,
+    pub(crate) null_dim: usize,
     /// Connection-gap floor `tol` (pairs closer than this have no resolvable
     /// gap; their eigenvector sensitivity is ambiguous and they do not move the
     /// projector, so the connection entry is set to zero).
-    gap_floor: f64,
+    pub(crate) gap_floor: f64,
 }
 
 impl ShrinkageProjectorFrame {
@@ -2331,7 +2331,7 @@ impl ShrinkageProjectorFrame {
     /// Returns `None` when `A` has no near-null eigenspace at this tolerance
     /// (the value build emits no shrinkage block, so there is nothing to
     /// differentiate).
-    fn build(a_raw: &Array2<f64>) -> Result<Option<Self>, BasisError> {
+    pub(crate) fn build(a_raw: &Array2<f64>) -> Result<Option<Self>, BasisError> {
         if a_raw.nrows() == 0 {
             return Ok(None);
         }
@@ -2354,7 +2354,7 @@ impl ShrinkageProjectorFrame {
         }))
     }
 
-    fn dim(&self) -> usize {
+    pub(crate) fn dim(&self) -> usize {
         self.u.nrows()
     }
 
@@ -2362,7 +2362,7 @@ impl ShrinkageProjectorFrame {
     /// direction's `A_d = ∂A/∂η_d` (`m ≠ k`, floored at small gaps), together
     /// with the eigenbasis representation `B̂_d = Uᵀ A_d U` and the
     /// Hellmann–Feynman eigenvalue derivatives `λ_k' = B̂_d[k,k]`.
-    fn connection(&self, a_dir: &Array2<f64>) -> (Array2<f64>, Array2<f64>, Vec<f64>) {
+    pub(crate) fn connection(&self, a_dir: &Array2<f64>) -> (Array2<f64>, Array2<f64>, Vec<f64>) {
         let p = self.dim();
         let b_hat = fast_atb(&self.u, &fast_ab(&symmetrize(a_dir), &self.u));
         let mut omega = Array2::<f64>::zeros((p, p));
@@ -2383,7 +2383,7 @@ impl ShrinkageProjectorFrame {
 
     /// `P̂_d' = Ω_d I_N − I_N Ω_d` (frozen-frame projector first derivative for
     /// direction `d`; nonzero only across `N`↔`R`).
-    fn projector_first_hat(&self, omega: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn projector_first_hat(&self, omega: &Array2<f64>) -> Array2<f64> {
         let p = self.dim();
         let mut out = Array2::<f64>::zeros((p, p));
         for i in 0..p {
@@ -2399,7 +2399,7 @@ impl ShrinkageProjectorFrame {
 
     /// Lab-frame, `1/√r`-normalized first derivative of the shrinkage block for
     /// direction `d`: `R~_d = U P̂_d' Uᵀ / √r`.
-    fn first(&self, a_dir: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn first(&self, a_dir: &Array2<f64>) -> Array2<f64> {
         let (omega, _b_hat, _lam) = self.connection(a_dir);
         let p1_hat = self.projector_first_hat(&omega);
         self.to_lab(&p1_hat)
@@ -2412,7 +2412,7 @@ impl ShrinkageProjectorFrame {
     /// `∂_b Ω_a[m,k] = B̂_a'^{(b)}[m,k]/(λ_k−λ_m) − B̂_a[m,k]·(λ_k'^{(b)}−λ_m'^{(b)})/(λ_k−λ_m)²`,
     /// `B̂_a'^{(b)} = Uᵀ A_ab U + B̂_a Ω_b − Ω_b B̂_a`,  `λ_k'^{(b)} = B̂_b[k,k]`.
     /// For the diagonal case `a == b` this is the ordinary second derivative.
-    fn second(
+    pub(crate) fn second(
         &self,
         a_dir_a: &Array2<f64>,
         a_dir_b: &Array2<f64>,
@@ -2455,7 +2455,7 @@ impl ShrinkageProjectorFrame {
 
     /// Map a frozen-frame projector derivative `P̂` back to the lab frame and
     /// apply the constant `1/√r` normalization: `symmetrize(U P̂ Uᵀ) / √r`.
-    fn to_lab(&self, p_hat: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn to_lab(&self, p_hat: &Array2<f64>) -> Array2<f64> {
         let inv_norm = 1.0 / (self.null_dim as f64).sqrt();
         symmetrize(&fast_ab(&self.u, &fast_abt(p_hat, &self.u))).mapv(|v| v * inv_norm)
     }

@@ -53,11 +53,11 @@ mod run;
 mod run_plan;
 mod seed_screening;
 
-pub use bridges::*;
+pub(crate) use bridges::*;
 pub use capability::*;
 pub use fd_audit::*;
 pub use hessian_operator::*;
 pub use objective::*;
 pub use run::*;
-pub use run_plan::*;
+pub(crate) use run_plan::*;
 pub use seed_screening::*;

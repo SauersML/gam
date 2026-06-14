@@ -86,7 +86,7 @@ use super::BasisError;
 /// pool sizes. Sized like the design evaluators' streaming blocks: large
 /// enough to amortize per-chunk setup, small enough that per-chunk partial
 /// tables stay cache-resident for the d ≤ 8 regimes the jet order targets.
-const MEASURE_JET_MOMENT_CHUNK_ROWS: usize = 8192;
+pub(crate) const MEASURE_JET_MOMENT_CHUNK_ROWS: usize = 8192;
 
 /// Per-cell moment table: Gaussian-weighted coordinate moments of orders
 /// 0..=2 crossed with response channels, all centered at the cell's
@@ -140,7 +140,7 @@ impl MeasureJetMomentTable {
 /// Shape/finiteness self-consistency of a (publicly constructible) table:
 /// returns `(n_channels, d)`. Single validation source for the fallible
 /// consumers ([`merge_moment_tables`], [`jet_sufficient_stats`]).
-fn validate_table_shape(
+pub(crate) fn validate_table_shape(
     t: &MeasureJetMomentTable,
     label: &str,
 ) -> Result<(usize, usize), BasisError> {
@@ -176,7 +176,7 @@ fn validate_table_shape(
 /// per-entry update order is fixed — `wg = w·g`, then `m1 += wg·dx_k`, then
 /// `m2 += (wg·dx_k)·dx_l` with that exact association — as part of the
 /// module's bit-determinism contract.
-fn accumulate_chunk(
+pub(crate) fn accumulate_chunk(
     coords: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
     channels: &[ArrayView1<'_, f64>],
@@ -387,7 +387,7 @@ pub fn recenter_moment_table(
 /// Lexicographic total order on cell centers (`f64::total_cmp` per
 /// coordinate). The canonical-orientation key that makes the merge bitwise
 /// argument-order-independent.
-fn lex_cmp_centers(a: &Array1<f64>, b: &Array1<f64>) -> Ordering {
+pub(crate) fn lex_cmp_centers(a: &Array1<f64>, b: &Array1<f64>) -> Ordering {
     for (x, y) in a.iter().zip(b.iter()) {
         let ord = x.total_cmp(y);
         if ord != Ordering::Equal {
@@ -530,7 +530,7 @@ mod tests {
 
     /// Closeness metric for the recenter-exactness gate: relative at scale,
     /// absolute `tol` below unit scale (`|x−y| ≤ tol·(1 + max(|x|,|y|))`).
-    fn assert_tables_close(a: &MeasureJetMomentTable, b: &MeasureJetMomentTable, tol: f64) {
+    pub(crate) fn assert_tables_close(a: &MeasureJetMomentTable, b: &MeasureJetMomentTable, tol: f64) {
         let pairs = |xs: &[f64], ys: &[f64], label: &str| {
             assert_eq!(xs.len(), ys.len(), "{label}: length mismatch");
             for (i, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {
@@ -567,7 +567,7 @@ mod tests {
     }
 
     /// Bit-identity gate: every stored f64 must agree by `to_bits`.
-    fn assert_tables_bit_identical(a: &MeasureJetMomentTable, b: &MeasureJetMomentTable) {
+    pub(crate) fn assert_tables_bit_identical(a: &MeasureJetMomentTable, b: &MeasureJetMomentTable) {
         let bits = |xs: &[f64], ys: &[f64], label: &str| {
             assert_eq!(xs.len(), ys.len(), "{label}: length mismatch");
             for (i, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {
@@ -605,7 +605,7 @@ mod tests {
 
     /// Deterministic generic-float dataset (no RNG): low-discrepancy
     /// fractional parts, d = 3, with a unit channel and one value channel.
-    fn float_dataset(n: usize) -> (Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+    pub(crate) fn float_dataset(n: usize) -> (Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
         let mut coords = Array2::<f64>::zeros((n, 3));
         let mut weights = Array1::<f64>::zeros(n);
         let mut ones = Array1::<f64>::zeros(n);
@@ -626,7 +626,7 @@ mod tests {
     /// dyadic weights — every moment product and sum is exactly
     /// representable in f64, so the algebraic monoid laws become BIT
     /// identities and the tests below can pin them with `to_bits`.
-    fn dyadic_dataset() -> (Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+    pub(crate) fn dyadic_dataset() -> (Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
         let coords = ndarray::array![
             [3.0, -2.0],
             [1.0, 4.0],
@@ -656,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn recenter_is_exact() {
+    pub(crate) fn recenter_is_exact() {
         let (coords, weights, ones, y) = float_dataset(40);
         let channels = [ones.view(), y.view()];
         let c = ndarray::array![0.4, -0.3, 0.9];
@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_is_associative_and_commutative_bitwise() {
+    pub(crate) fn merge_is_associative_and_commutative_bitwise() {
         // Dyadic lattice ⇒ all moment/shift arithmetic is exact, so the
         // monoid laws hold BITWISE across groupings (the sorted-reduction
         // convention covers generic-float grouping determinism; see the
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn jet_stats_match_assemble_weighted_forms_math() {
+    pub(crate) fn jet_stats_match_assemble_weighted_forms_math() {
         // Small 2-D point set, replicating assemble_weighted_forms' local
         // loop verbatim from raw points: w_j = mass_j·exp(−d²/(2ε²)),
         // q = Σ w, Φ_{jk} = (x_{jk} − c_k)/ε, a = Φᵀw/q,
@@ -857,7 +857,7 @@ mod tests {
     /// the regime where a level/tilt bias in the centered second moment `G` or
     /// the centered cross `Bᵀv/q` would be amplified.
     #[test]
-    fn affine_projection_recovers_level_and_tilt_without_bias() {
+    pub(crate) fn affine_projection_recovers_level_and_tilt_without_bias() {
         // Asymmetric, off-center point cloud so the weighted barycenter does
         // NOT coincide with the reference center: this is exactly where a
         // mis-centered (biased) projection would leak the level into the tilt
@@ -958,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_chunked_accumulation_matches_single_pass() {
+    pub(crate) fn streaming_chunked_accumulation_matches_single_pass() {
         // Four chunks, each accumulated about its OWN center, merged in
         // chunk-index order (the sorted reduction) — versus one pass about
         // the lexicographically smallest chunk center. Dyadic lattice ⇒ the

@@ -17,37 +17,37 @@ use super::*;
 //   derivative surface. Using a fixed δ makes V(ρ) smooth and the standard
 //   envelope-theorem gradient valid:
 //     dV/dρ_k = 0.5 λ_k βᵀ S_k β + 0.5 λ_k tr(H^{-1} S_k) - 0.5 det1[k].
-pub(super) const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
+pub(crate) const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 
 
-pub(super) struct GamWorkingModel<'a> {
-    x_original: DesignMatrix,
-    coordinate_design: WorkingCoordinateDesign,
-    offset: Array1<f64>,
-    y: ArrayView1<'a, f64>,
-    priorweights: ArrayView1<'a, f64>,
-    penalty: PirlsPenalty,
-    workspace: PirlsWorkspace,
-    likelihood: GlmLikelihoodSpec,
-    link_kind: InverseLink,
-    firth_bias_reduction: bool,
-    lastmu: Array1<f64>,
-    lastweights: Array1<f64>,
-    lastz: Array1<f64>,
-    last_c: Array1<f64>,
-    last_d: Array1<f64>,
-    lasthessian_weights: Array1<f64>,
-    lasthessian_c: Array1<f64>,
-    lasthessian_d: Array1<f64>,
-    lasthessian_curvature: HessianCurvatureKind,
-    last_dmu_deta: Array1<f64>,
-    last_d2mu_deta2: Array1<f64>,
-    last_d3mu_deta3: Array1<f64>,
-    last_penalty_term: f64,
-    x_original_csr: Option<SparseRowMat<usize, f64>>,
+pub(crate) struct GamWorkingModel<'a> {
+    pub(crate) x_original: DesignMatrix,
+    pub(crate) coordinate_design: WorkingCoordinateDesign,
+    pub(crate) offset: Array1<f64>,
+    pub(crate) y: ArrayView1<'a, f64>,
+    pub(crate) priorweights: ArrayView1<'a, f64>,
+    pub(crate) penalty: PirlsPenalty,
+    pub(crate) workspace: PirlsWorkspace,
+    pub(crate) likelihood: GlmLikelihoodSpec,
+    pub(crate) link_kind: InverseLink,
+    pub(crate) firth_bias_reduction: bool,
+    pub(crate) lastmu: Array1<f64>,
+    pub(crate) lastweights: Array1<f64>,
+    pub(crate) lastz: Array1<f64>,
+    pub(crate) last_c: Array1<f64>,
+    pub(crate) last_d: Array1<f64>,
+    pub(crate) lasthessian_weights: Array1<f64>,
+    pub(crate) lasthessian_c: Array1<f64>,
+    pub(crate) lasthessian_d: Array1<f64>,
+    pub(crate) lasthessian_curvature: HessianCurvatureKind,
+    pub(crate) last_dmu_deta: Array1<f64>,
+    pub(crate) last_d2mu_deta2: Array1<f64>,
+    pub(crate) last_d3mu_deta3: Array1<f64>,
+    pub(crate) last_penalty_term: f64,
+    pub(crate) x_original_csr: Option<SparseRowMat<usize, f64>>,
     /// Optional per-observation SE for integrated (GHQ) likelihood.
     /// When present, uses integrated family-dispatched working updates.
-    covariate_se: Option<Array1<f64>>,
+    pub(crate) covariate_se: Option<Array1<f64>>,
     /// Whether the Gamma dispersion shape has been estimated and frozen for the
     /// duration of this inner P-IRLS solve. The shape (= 1/φ) is a nuisance
     /// scale that multiplies both the working weight (`w = shape·prior`) and the
@@ -58,7 +58,7 @@ pub(super) struct GamWorkingModel<'a> {
     /// curvature build and held fixed; it refreshes naturally across *outer*
     /// iterations because a fresh `GamWorkingModel` is built per inner solve.
     /// See issue #511 (regression of #359).
-    gamma_shape_locked: bool,
+    pub(crate) gamma_shape_locked: bool,
     /// Whether the Beta-regression precision `phi` has been estimated and frozen
     /// for the duration of this inner P-IRLS solve. Like the Gamma shape, `phi`
     /// is a nuisance scale entering the working weight `w ∝ (1+phi)` and the
@@ -66,7 +66,7 @@ pub(super) struct GamWorkingModel<'a> {
     /// moves the penalized argmin, so it is estimated once from the warm-start η
     /// and held fixed within the inner solve, refreshing across outer iterations
     /// (a fresh working model is built per inner solve). Issue #567.
-    beta_phi_locked: bool,
+    pub(crate) beta_phi_locked: bool,
     /// Whether the Tweedie dispersion `phi` has been estimated and frozen for the
     /// duration of this inner P-IRLS solve. Like the Gamma shape, `phi` is a
     /// nuisance scale entering only the working weight (`prior·μ^{2−p}/phi`) and
@@ -75,7 +75,7 @@ pub(super) struct GamWorkingModel<'a> {
     /// gain ratio. It is therefore estimated once from the warm-start η and held
     /// fixed within the inner solve, refreshing across outer iterations (a fresh
     /// working model is built per inner solve). Issue #771.
-    tweedie_phi_locked: bool,
+    pub(crate) tweedie_phi_locked: bool,
     /// Whether the Negative-Binomial overdispersion `theta` has been estimated
     /// and frozen for the duration of this inner P-IRLS solve. `theta` enters the
     /// working weight `W = μθ/(θ+μ)` (the NB2 Fisher information) and the working
@@ -86,8 +86,8 @@ pub(super) struct GamWorkingModel<'a> {
     /// outer iterations (a fresh working model is built per inner solve). The
     /// converged-η joint refresh in `loop_driver` re-arms this lock so the
     /// reported `theta` is exactly the ML estimate at the reported η. Issue #802.
-    negbin_theta_locked: bool,
-    quadctx: crate::quadrature::QuadratureContext,
+    pub(crate) negbin_theta_locked: bool,
+    pub(crate) quadctx: crate::quadrature::QuadratureContext,
     /// Frozen-weight first-Fisher-step data-fit Gram `XᵀWX` (#1111 / #1033
     /// mechanism (c)), in the same *original* (conditioned `x_fit`) frame
     /// `penalized_hessian` forms `compute_xtwx_blas(self.x_original, ...)` in,
@@ -96,26 +96,26 @@ pub(super) struct GamWorkingModel<'a> {
     /// O(N·p²) weighted cross-product on a large-n GLM ψ-trial. Consumed at
     /// most once per inner solve (the first `penalized_hessian` build at the
     /// warm β); later iterations restream the true moving `W`.
-    glm_first_step_gram: Option<Array2<f64>>,
+    pub(crate) glm_first_step_gram: Option<Array2<f64>>,
     /// Set once the frozen-W first-step Gram has been consumed, so subsequent
     /// inner iterations restream `XᵀWX` from the (moving) working weights.
-    glm_first_step_gram_consumed: bool,
+    pub(crate) glm_first_step_gram_consumed: bool,
 }
 
 
-pub(super) struct GamModelFinalState {
-    likelihood: GlmLikelihoodSpec,
-    coordinate_frame: PirlsCoordinateFrame,
-    finalmu: Array1<f64>,
-    finalweights: Array1<f64>,
-    scoreweights: Array1<f64>,
-    finalz: Array1<f64>,
-    final_c: Array1<f64>,
-    final_d: Array1<f64>,
-    final_dmu_deta: Array1<f64>,
-    final_d2mu_deta2: Array1<f64>,
-    final_d3mu_deta3: Array1<f64>,
-    penalty_term: f64,
+pub(crate) struct GamModelFinalState {
+    pub(crate) likelihood: GlmLikelihoodSpec,
+    pub(crate) coordinate_frame: PirlsCoordinateFrame,
+    pub(crate) finalmu: Array1<f64>,
+    pub(crate) finalweights: Array1<f64>,
+    pub(crate) scoreweights: Array1<f64>,
+    pub(crate) finalz: Array1<f64>,
+    pub(crate) final_c: Array1<f64>,
+    pub(crate) final_d: Array1<f64>,
+    pub(crate) final_dmu_deta: Array1<f64>,
+    pub(crate) final_d2mu_deta2: Array1<f64>,
+    pub(crate) final_d3mu_deta3: Array1<f64>,
+    pub(crate) penalty_term: f64,
 }
 
 
@@ -1108,4 +1108,3 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         self.supports_observed_hessian_curvature()
     }
 }
-

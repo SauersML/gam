@@ -58,12 +58,12 @@ use super::{BasisError, MeasureJetBand};
 /// mirroring `measure_jet_smooth`: weights beyond `3ε` (metric distance) are
 /// below `e^{-4.5}` of the peak and are dropped from both the local fit and
 /// the `q^(1−2α)` outer weight.
-const PROFILE_CUTOFF: f64 = 3.0;
+pub(crate) const PROFILE_CUTOFF: f64 = 3.0;
 
 /// Relative rank cutoff for the symmetric pseudo-inverse of the local affine
 /// Gram, identical to `measure_jet_smooth`'s constant so the `Ā = I` path is
 /// bit-for-bit. `64·ε_f64` times `n·λ_max`.
-const PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
+pub(crate) const PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
 
 /// A single requested derivative direction in `L`-space: the lower-triangular
 /// entry `(i, j)` with `i >= j`. The zeroth-order "direction" (the value
@@ -135,16 +135,16 @@ pub fn lower_triangular_indices(d: usize) -> Vec<LIndex> {
 /// is `1/L_ii` when `i == j` and `0` otherwise. Writing `f = ln g = −(1/d)·ln
 /// det L`, `M = L·e^f`, every derivative below is the exact product rule on
 /// `L·e^f`.
-struct NormalizedFactor {
+pub(crate) struct NormalizedFactor {
     /// `M = L / det(L)^(1/d)` (d×d, lower-triangular, `det M = 1`).
-    m: Array2<f64>,
+    pub(crate) m: Array2<f64>,
     /// `∂M/∂L_a` for each active index `a` (d×d).
-    dm: Vec<Array2<f64>>,
+    pub(crate) dm: Vec<Array2<f64>>,
     /// `∂²M/∂L_a∂L_b` for the full pair grid `a*n+b` (d×d).
-    d2m: Vec<Array2<f64>>,
+    pub(crate) d2m: Vec<Array2<f64>>,
 }
 
-fn build_normalized_factor(
+pub(crate) fn build_normalized_factor(
     l: ArrayView2<'_, f64>,
     indices: &[LIndex],
 ) -> Result<NormalizedFactor, BasisError> {
@@ -255,12 +255,12 @@ fn build_normalized_factor(
 /// active first/second `L`-directional derivatives of each. Used for the ε/2
 /// outer net, the neighbor cutoff, and the kernel exponent — exactly the role
 /// `pairwise_sq_dists` plays in the isotropic assembly.
-struct MetricDist2 {
+pub(crate) struct MetricDist2 {
     /// `dM2[(i, j)] = ‖M (x_i − x_j)‖²`.
-    dm2: Array2<f64>,
+    pub(crate) dm2: Array2<f64>,
 }
 
-fn metric_sq_dists(centers: ArrayView2<'_, f64>, m: ArrayView2<'_, f64>) -> MetricDist2 {
+pub(crate) fn metric_sq_dists(centers: ArrayView2<'_, f64>, m: ArrayView2<'_, f64>) -> MetricDist2 {
     let n = centers.nrows();
     // Y = X Mᵀ ; ‖M δ‖² = ‖Y_i − Y_j‖². Build Y once, then GEMM-style Gram with
     // the same `‖a‖²+‖b‖²−2aᵀb`, clamped at 0 (mirrors pairwise_sq_dists so the
@@ -281,15 +281,15 @@ fn metric_sq_dists(centers: ArrayView2<'_, f64>, m: ArrayView2<'_, f64>) -> Metr
 /// as `measure_jet_smooth::symmetric_pseudoinverse` (so `Ā = I` is bit-exact),
 /// additionally returning the eigenpairs so the projector's `L`-derivatives can
 /// be propagated through `G⁺` analytically.
-struct EighPinv {
-    evals: Array1<f64>,
-    evecs: Array2<f64>,
+pub(crate) struct EighPinv {
+    pub(crate) evals: Array1<f64>,
+    pub(crate) evecs: Array2<f64>,
     /// Per-mode inverse eigenvalue (0 below the rank cutoff).
-    inv: Array1<f64>,
-    pinv: Array2<f64>,
+    pub(crate) inv: Array1<f64>,
+    pub(crate) pinv: Array2<f64>,
 }
 
-fn eigh_pinv(a: &Array2<f64>, label: &str) -> Result<EighPinv, BasisError> {
+pub(crate) fn eigh_pinv(a: &Array2<f64>, label: &str) -> Result<EighPinv, BasisError> {
     let n = a.nrows();
     let (evals, evecs) = a.eigh(Side::Lower).map_err(|e| {
         BasisError::InvalidInput(format!(
@@ -337,7 +337,7 @@ fn eigh_pinv(a: &Array2<f64>, label: &str) -> Result<EighPinv, BasisError> {
 /// corrections `P⊥ Ġ G⁺ + G⁺ Ġ P⊥` divided by the retained eigenvalues, which
 /// the eigen-mode sum below captures exactly. We assemble it directly in the
 /// eigenbasis to stay exact across the rank boundary.
-fn pinv_first_deriv(ep: &EighPinv, gdot: &Array2<f64>) -> Array2<f64> {
+pub(crate) fn pinv_first_deriv(ep: &EighPinv, gdot: &Array2<f64>) -> Array2<f64> {
     let n = ep.evals.len();
     // M_pq = v_pᵀ Ġ v_q in the eigenbasis.
     let vt_g = ep.evecs.t().dot(gdot);
@@ -379,13 +379,13 @@ fn pinv_first_deriv(ep: &EighPinv, gdot: &Array2<f64>) -> Array2<f64> {
 /// metric only changes the kernel weights and the linearly transformed
 /// features; the projection algebra (`a_mean`, `B`, `G`, `G⁺`, `R`) is the
 /// isotropic one, differentiated through those two metric channels.
-struct BlockForms {
+pub(crate) struct BlockForms {
     /// `R` value (ml×ml) before the outer weight.
-    r: Array2<f64>,
+    pub(crate) r: Array2<f64>,
     /// `∂R/∂L_a` (ml×ml).
-    dr: Vec<Array2<f64>>,
+    pub(crate) dr: Vec<Array2<f64>>,
     /// `∂²R/∂L_a∂L_b` (ml×ml), full pair grid `a*n+b`.
-    d2r: Vec<Array2<f64>>,
+    pub(crate) d2r: Vec<Array2<f64>>,
 }
 
 /// Assemble one local block's residual `R = CᵀWC − B G⁺ Bᵀ / q` and its exact
@@ -395,7 +395,7 @@ struct BlockForms {
 /// `measure_jet_smooth::assemble_weighted_forms`, with value and jets sharing
 /// one walk so a value↔derivative desync is structurally impossible.
 #[allow(clippy::too_many_arguments)]
-fn block_residual_jets(
+pub(crate) fn block_residual_jets(
     phi: &Array2<f64>,            // ml×d : δ/ε (metric-free local features)
     masses_local: &Array1<f64>,  // ml
     m: ArrayView2<'_, f64>,      // d×d : M
@@ -1013,7 +1013,7 @@ mod tests {
 
     /// Two clusters of 2-D centers with uniform masses — the same fixture the
     /// isotropic jet gate uses, so the `Ā = I` oracle compares like with like.
-    fn two_cluster_centers() -> (Array2<f64>, Array1<f64>) {
+    pub(crate) fn two_cluster_centers() -> (Array2<f64>, Array1<f64>) {
         let centers = array![
             [0.00, 0.00],
             [0.31, 0.05],
@@ -1033,7 +1033,7 @@ mod tests {
         (centers, masses)
     }
 
-    fn band_for(centers: &Array2<f64>) -> MeasureJetBand {
+    pub(crate) fn band_for(centers: &Array2<f64>) -> MeasureJetBand {
         measure_jet_band(centers.view(), 0).expect("band")
     }
 
@@ -1043,7 +1043,7 @@ mod tests {
     /// feature transform, both of which are arithmetically the isotropic path
     /// when `M = I`.
     #[test]
-    fn identity_metric_reproduces_isotropic_bit_for_bit() {
+    pub(crate) fn identity_metric_reproduces_isotropic_bit_for_bit() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
         let (s0, a0) = (1.3, 0.8);
@@ -1075,7 +1075,7 @@ mod tests {
     /// gate), rel tol `5e-5`. A non-identity, non-symmetric lower-triangular
     /// `L` exercises every active channel and the off-diagonal coupling.
     #[test]
-    fn l_jets_match_finite_differences() {
+    pub(crate) fn l_jets_match_finite_differences() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
         let (s0, a0) = (1.3, 0.8);
@@ -1206,7 +1206,7 @@ mod tests {
     /// = L Lᵀ / det(L Lᵀ)^(1/d)`. The whole point of the normalization is that
     /// only the SHAPE of the metric, not its overall scale, is learned.
     #[test]
-    fn det_normalization_is_scale_invariant() {
+    pub(crate) fn det_normalization_is_scale_invariant() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
         let (s0, a0) = (1.1, 0.9);
@@ -1246,7 +1246,7 @@ mod tests {
     /// projection still kills the constant exactly), mirroring the isotropic
     /// contract.
     #[test]
-    fn anisotropic_energy_annihilates_constants() {
+    pub(crate) fn anisotropic_energy_annihilates_constants() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
         let l = array![[1.20, 0.00], [-0.30, 0.95]];

@@ -108,7 +108,7 @@ mod system;
 #[cfg(test)]
 mod tests;
 
-pub use factorization::*;
+pub(crate) use factorization::*;
 pub use newton_step::*;
 pub use penalty_ops::*;
 pub use primitives::*;

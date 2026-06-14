@@ -30,11 +30,6 @@ pub struct ThinPlatePenaltyMatrix {
 }
 
 
-pub(crate) fn default_normalization_scale() -> f64 {
-    1.0
-}
-
-
 pub(crate) fn validate_center_count(num_centers: usize) -> Result<(), BasisError> {
     if num_centers == 0 {
         crate::bail_invalid_basis!("center count must be positive");
@@ -59,9 +54,9 @@ pub(crate) fn select_equal_mass_centers(
         crate::bail_invalid_basis!("equal-mass center selection requires at least one column");
     }
     #[derive(Clone, Copy)]
-    struct Leaf {
-        start: usize,
-        end: usize,
+    pub(crate) struct Leaf {
+        pub(crate) start: usize,
+        pub(crate) end: usize,
     }
 
     // Recursive equal-mass partition that always splits the leaf along its widest
@@ -265,7 +260,7 @@ pub(crate) fn select_kmeans_centers(
     if num_centers > n {
         crate::bail_invalid_basis!("kmeans requested {num_centers} centers but data has {n} rows");
     }
-    const KMEANS_PILOT_MAX_ROWS: usize = 20_000;
+    pub(crate) const KMEANS_PILOT_MAX_ROWS: usize = 20_000;
     if n > KMEANS_PILOT_MAX_ROWS {
         let pilot_n = KMEANS_PILOT_MAX_ROWS.max(num_centers);
         // log::info! rather than warn! — this is a deliberate performance
@@ -291,7 +286,7 @@ pub(crate) fn select_kmeans_centers(
     for _ in 0..iters {
         // Assignment: find nearest center for each observation.
         if use_parallel {
-            const KMEANS_CHUNK: usize = 4096;
+            pub(crate) const KMEANS_CHUNK: usize = 4096;
             assign
                 .par_chunks_mut(KMEANS_CHUNK)
                 .enumerate()

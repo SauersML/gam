@@ -2,11 +2,11 @@ use super::*;
 
 /// Scratch memory for B-spline evaluation to avoid allocations in tight loops.
 pub struct SplineScratch {
-    inner: internal::BsplineScratch,
-    local: Vec<f64>,
-    left_inner: internal::BsplineScratch,
-    left_local: Vec<f64>,
-    left_offsets: Vec<f64>,
+    pub(crate) inner: internal::BsplineScratch,
+    pub(crate) local: Vec<f64>,
+    pub(crate) left_inner: internal::BsplineScratch,
+    pub(crate) left_local: Vec<f64>,
+    pub(crate) left_offsets: Vec<f64>,
 }
 
 
@@ -1097,11 +1097,11 @@ pub(crate) fn create_ispline_dense(
 pub struct BsplineDerivativeWorkspace {
     /// Lower-order derivative buffers, one per recursion level (`chain[depth]`
     /// holds the order-`m-1` derivative consumed by the order-`m` step).
-    chain: Vec<Vec<f64>>,
+    pub(crate) chain: Vec<Vec<f64>>,
     /// Plain (non-derivative) basis buffer for the order-1 base case.
-    lower_basis: Vec<f64>,
+    pub(crate) lower_basis: Vec<f64>,
     /// Cox–de Boor scratch for the order-1 base case.
-    lower_scratch: internal::BsplineScratch,
+    pub(crate) lower_scratch: internal::BsplineScratch,
 }
 
 
@@ -1115,7 +1115,7 @@ impl BsplineDerivativeWorkspace {
     /// Returns a level-`depth` lower-order buffer of length `len`, zero-filled,
     /// growing the chain and the buffer in place as needed.
     #[inline]
-    fn chain_buffer(&mut self, depth: usize, len: usize) -> &mut [f64] {
+    pub(crate) fn chain_buffer(&mut self, depth: usize, len: usize) -> &mut [f64] {
         if self.chain.len() <= depth {
             self.chain.resize_with(depth + 1, Vec::new);
         }

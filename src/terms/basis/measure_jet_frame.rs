@@ -57,17 +57,17 @@ pub const MEASURE_JET_FRAME_DEFAULT_ORDER_R: usize = 2;
 /// `ε/2`-net radius factor: a node claims points within `ε/2`, matching the
 /// outer-net coarsening `net_radius² = 0.25 · ε²` used by
 /// `assemble_weighted_forms` (charter §1: the nets are reused verbatim).
-const MEASURE_JET_FRAME_NET_RADIUS_FACTOR: f64 = 0.5;
+pub(crate) const MEASURE_JET_FRAME_NET_RADIUS_FACTOR: f64 = 0.5;
 
 /// Relative rank tolerance for the lifting / whitening pseudo-inverse solves,
 /// in units of the largest singular value. The frozen value makes the
 /// coarse-to-fine prediction reproducible across builds.
-const MEASURE_JET_FRAME_RANK_RTOL: f64 = 1e-10;
+pub(crate) const MEASURE_JET_FRAME_RANK_RTOL: f64 = 1e-10;
 
 /// Power-iteration budget for the frame-ratio certificate. Five iterations on a
 /// well-clustered whitened Gram resolve the extreme Rayleigh quotients to the
 /// precision the certificate budgets; deterministic from a fixed seed.
-const MEASURE_JET_FRAME_POWER_ITERS: usize = 64;
+pub(crate) const MEASURE_JET_FRAME_POWER_ITERS: usize = 64;
 
 /// A coarse-to-fine ascending scale band's worth of innovation atoms, plus the
 /// unpenalized polynomial head, realized as a single synthesis operator on the
@@ -79,21 +79,21 @@ const MEASURE_JET_FRAME_POWER_ITERS: usize = 64;
 /// (stored as `level_precisions[ℓ]`).
 pub struct MeasureJetFrame {
     /// Number of web nodes (rows of `S`): the seed centers.
-    n_nodes: usize,
+    pub(crate) n_nodes: usize,
     /// Unpenalized polynomial-head width (`= number of degree < r monomials`).
-    head_dim: usize,
+    pub(crate) head_dim: usize,
     /// Per-level innovation widths, ascending in scale.
-    level_dims: Vec<usize>,
+    pub(crate) level_dims: Vec<usize>,
     /// Per-level prior precision `λ_ℓ = ε_ℓ^{2s}` (the diagonal whitening).
-    level_precisions: Vec<f64>,
+    pub(crate) level_precisions: Vec<f64>,
     /// The dense synthesis matrix `S` (`n_nodes × total_dim`): `value = S · coef`.
     /// Column `0 .. head_dim` is the head; the remainder are the lifted, value-
     /// orthogonalized innovation columns in `[level_0 | level_1 | …]` order.
-    synthesis: Array2<f64>,
+    pub(crate) synthesis: Array2<f64>,
     /// Realized ascending scale band `ε_ℓ` (one per level).
-    eps_band: Vec<f64>,
+    pub(crate) eps_band: Vec<f64>,
     /// Smoothness order `s` baked into `level_precisions`.
-    order_s: f64,
+    pub(crate) order_s: f64,
 }
 
 /// Runtime frame-ratio certificate: estimates of the equivalence constants
@@ -420,7 +420,7 @@ pub fn build_measure_jet_frame(
 /// degree strictly less than `order_r`, in deterministic ascending-degree,
 /// lexicographic order. For `r = 2` this is `{(0,…,0)} ∪ {e_k}` — the constant
 /// plus the `d` linear terms (the ambient-affine span).
-fn enumerate_monomials_below_degree(d: usize, order_r: usize) -> Vec<Vec<usize>> {
+pub(crate) fn enumerate_monomials_below_degree(d: usize, order_r: usize) -> Vec<Vec<usize>> {
     let mut out: Vec<Vec<usize>> = Vec::new();
     let max_total = order_r - 1;
     // Degree-by-degree so the constant comes first, then linears, etc.
@@ -433,7 +433,7 @@ fn enumerate_monomials_below_degree(d: usize, order_r: usize) -> Vec<Vec<usize>>
 
 /// Recursive helper: enumerate exponent vectors over coordinates `pos..d` whose
 /// remaining-degree budget is exactly `remaining`, appending completed vectors.
-fn enumerate_fixed_total(
+pub(crate) fn enumerate_fixed_total(
     d: usize,
     remaining: usize,
     pos: usize,
@@ -455,7 +455,7 @@ fn enumerate_fixed_total(
 
 /// Evaluate the monomial design `[ ∏_k x_{i,k}^{α_k} ]` for each exponent vector
 /// `α` at each center `x_i`. Returns an `n × |exponents|` matrix.
-fn monomial_design(centers: ArrayView2<'_, f64>, exponents: &[Vec<usize>]) -> Array2<f64> {
+pub(crate) fn monomial_design(centers: ArrayView2<'_, f64>, exponents: &[Vec<usize>]) -> Array2<f64> {
     let n = centers.nrows();
     let mut out = Array2::<f64>::zeros((n, exponents.len()));
     for (j, alpha) in exponents.iter().enumerate() {
@@ -476,7 +476,7 @@ fn monomial_design(centers: ArrayView2<'_, f64>, exponents: &[Vec<usize>]) -> Ar
 /// cover in fixed index order. A node claims every not-yet-claimed center within
 /// radius `ε/2`; the survivors (nodes) index the level's atoms. Returns the node
 /// indices into `centers` in ascending order.
-fn build_eps_half_net(centers: ArrayView2<'_, f64>, eps: f64) -> Vec<usize> {
+pub(crate) fn build_eps_half_net(centers: ArrayView2<'_, f64>, eps: f64) -> Vec<usize> {
     let n = centers.nrows();
     let radius = MEASURE_JET_FRAME_NET_RADIUS_FACTOR * eps;
     let radius2 = radius * radius;
@@ -515,7 +515,7 @@ fn build_eps_half_net(centers: ArrayView2<'_, f64>, eps: f64) -> Vec<usize> {
 /// The Gaussian-bump and frame-coordinate conventions match
 /// `measure_jet_smooth::assemble_weighted_forms`: kernel `exp(−d²/(2ε²))`,
 /// frame coordinate `(x − c)/ε`, masses as the empirical-measure weights.
-fn jet_atom_columns(
+pub(crate) fn jet_atom_columns(
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
     node: usize,
@@ -556,7 +556,7 @@ fn jet_atom_columns(
 /// product via modified Gram–Schmidt with a frozen rank tolerance; drop columns
 /// whose post-orthogonalization norm falls below `rtol · max_norm`. Returns an
 /// `n × rank` matrix with orthonormal columns spanning `col(a)`.
-fn orthonormalize_columns(a: &Array2<f64>, rtol: f64) -> Result<Array2<f64>, BasisError> {
+pub(crate) fn orthonormalize_columns(a: &Array2<f64>, rtol: f64) -> Result<Array2<f64>, BasisError> {
     let n = a.nrows();
     let p = a.ncols();
     if p == 0 {
@@ -597,7 +597,7 @@ fn orthonormalize_columns(a: &Array2<f64>, rtol: f64) -> Result<Array2<f64>, Bas
 /// iteration from the all-ones seed. Falls back to the exact symmetric
 /// eigensolver if the iteration stalls (tiny / degenerate spectra), so the
 /// certificate is robust on small nets.
-fn power_top_eigenvalue(m: &Array2<f64>, iters: usize) -> f64 {
+pub(crate) fn power_top_eigenvalue(m: &Array2<f64>, iters: usize) -> f64 {
     let p = m.nrows();
     if p == 0 {
         return 0.0;
@@ -632,7 +632,7 @@ fn power_top_eigenvalue(m: &Array2<f64>, iters: usize) -> f64 {
 /// Bottom eigenvalue of a symmetric PSD matrix `m` via shifted power iteration
 /// on `top·I − m` (its top eigenvalue is `top − λ_min`). Seeded from all-ones;
 /// backed by the exact symmetric eigensolver for robustness.
-fn power_bottom_eigenvalue(m: &Array2<f64>, top: f64, iters: usize) -> f64 {
+pub(crate) fn power_bottom_eigenvalue(m: &Array2<f64>, top: f64, iters: usize) -> f64 {
     let p = m.nrows();
     if p == 0 {
         return 0.0;
@@ -664,7 +664,7 @@ mod tests {
 
     /// A deterministic quasi-uniform grid of `side × side` centers in the unit
     /// square, with uniform masses. No RNG.
-    fn grid_centers(side: usize) -> (Array2<f64>, Array1<f64>) {
+    pub(crate) fn grid_centers(side: usize) -> (Array2<f64>, Array1<f64>) {
         let n = side * side;
         let mut centers = Array2::<f64>::zeros((n, 2));
         let step = 1.0 / (side as f64 - 1.0).max(1.0);
@@ -681,13 +681,13 @@ mod tests {
     }
 
     /// Three-level ascending band on the grid, deterministic.
-    fn grid_band() -> Vec<f64> {
+    pub(crate) fn grid_band() -> Vec<f64> {
         vec![0.15, 0.30, 0.60]
     }
 
     /// Evaluate a degree < r polynomial on the centers (for affine = r=2 this is
     /// `a + b·x + c·y`).
-    fn affine_values(centers: ArrayView2<'_, f64>, a: f64, b: f64, c: f64) -> Array1<f64> {
+    pub(crate) fn affine_values(centers: ArrayView2<'_, f64>, a: f64, b: f64, c: f64) -> Array1<f64> {
         let n = centers.nrows();
         let mut v = Array1::<f64>::zeros(n);
         for i in 0..n {
@@ -702,7 +702,7 @@ mod tests {
     /// property the V0 representer basis lacked. The head reproduces the affine
     /// field exactly.
     #[test]
-    fn affine_functions_in_exact_null_space() {
+    pub(crate) fn affine_functions_in_exact_null_space() {
         let (centers, masses) = grid_centers(7);
         let band = grid_band();
         let frame = build_measure_jet_frame(
@@ -752,7 +752,7 @@ mod tests {
     /// field has a zero innovation block (checked here across a basis of the
     /// degree<r space, level by level).
     #[test]
-    fn innovations_have_vanishing_moments() {
+    pub(crate) fn innovations_have_vanishing_moments() {
         let (centers, masses) = grid_centers(7);
         let band = grid_band();
         let frame = build_measure_jet_frame(
@@ -794,7 +794,7 @@ mod tests {
     /// ORACLE (3): `S` and `Sᵀ` are exact f64 adjoints: `⟨S x, y⟩ = ⟨x, Sᵀ y⟩`
     /// for deterministic `x` (coefficient space) and `y` (value space).
     #[test]
-    fn synthesis_and_analysis_are_exact_adjoints() {
+    pub(crate) fn synthesis_and_analysis_are_exact_adjoints() {
         let (centers, masses) = grid_centers(6);
         let band = grid_band();
         let frame = build_measure_jet_frame(
@@ -826,7 +826,7 @@ mod tests {
     /// ORACLE (4): the frame ratio `B/A` is finite and `≥ 1` on a quasi-uniform
     /// net — the runtime equivalence certificate witnesses a genuine Riesz frame.
     #[test]
-    fn frame_ratio_is_finite_and_at_least_one() {
+    pub(crate) fn frame_ratio_is_finite_and_at_least_one() {
         let (centers, masses) = grid_centers(7);
         let band = grid_band();
         let frame = build_measure_jet_frame(
@@ -861,7 +861,7 @@ mod tests {
     /// "any τ including the default" clause of oracle (1)) — re-checked with the
     /// auto order_s default so the property is not band-specific.
     #[test]
-    fn affine_null_space_holds_at_default_order() {
+    pub(crate) fn affine_null_space_holds_at_default_order() {
         let (centers, masses) = grid_centers(8);
         let band = grid_band();
         let frame = build_measure_jet_frame(

@@ -41,7 +41,7 @@ pub(crate) use crate::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior,
     SasLinkState, StandardLink,
 };
-pub(crate) use ndarray::{Array1, Array2, Array3, ArrayView1, s};
+pub(crate) use ndarray::{Array1, Array2, ArrayView1, s};
 pub(crate) use std::collections::{HashMap, VecDeque};
 pub(crate) use std::ops::Range;
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

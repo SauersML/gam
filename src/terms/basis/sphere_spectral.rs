@@ -71,7 +71,7 @@ pub fn sphere_truncated_spectral_eval(cos_gamma: f64, coeffs: &[f64]) -> f64 {
 /// ℓ(ℓ+1)/2` substituted near `|cos γ| = 1` where the `(1 − x²)` denominator
 /// would otherwise lose precision.
 pub(crate) fn sphere_truncated_spectral_derivative_eval(cos_gamma: f64, coeffs: &[f64]) -> f64 {
-    const POLE_LIMIT_THRESHOLD: f64 = 1.0e-10;
+    pub(crate) const POLE_LIMIT_THRESHOLD: f64 = 1.0e-10;
     let x = cos_gamma.clamp(-1.0, 1.0);
     let lmax = coeffs.len().saturating_sub(1);
     if lmax == 0 {

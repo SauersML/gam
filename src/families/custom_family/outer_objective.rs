@@ -27,7 +27,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     refresh_all_block_etas(family, specs, &mut states)?;
     let total_joint_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     let total_joint_n = joint_observation_count(&states);
-    pub(crate) const INNER_PRELUDE_LOG_MIN_N: usize = 100_000;
+    const INNER_PRELUDE_LOG_MIN_N: usize = 100_000;
     let prelude_log = total_joint_n >= INNER_PRELUDE_LOG_MIN_N;
     if prelude_log {
         log::info!(
@@ -4536,7 +4536,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     // initial seed value is the family-declared safe step for a fresh fit; the
     // function then adapts it freely (clamped to [1e-12, 1e6] by the function
     // itself, same as the joint path).
-    pub(crate) const BLOCK_NEWTON_STEP_INITIAL: f64 = 20.0;
+    const BLOCK_NEWTON_STEP_INITIAL: f64 = 20.0;
     let mut block_max_step: Vec<f64> = vec![BLOCK_NEWTON_STEP_INITIAL; specs.len()];
 
     let mut prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
@@ -4558,7 +4558,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     // and require that `step_clamped` was observed AT LEAST ONCE inside
     // the frozen run (rather than EVERY cycle).
     let mut clamped_step_in_frozen_run: bool = false;
-    pub(crate) const DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
+    const DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
 
     let is_dynamic = family.block_geometry_is_dynamic();
     for cycle in 0..inner_max_cycles {

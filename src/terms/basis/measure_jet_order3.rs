@@ -69,12 +69,12 @@ use super::{BasisError, MeasureJetBand};
 /// the affine energy: weights past `3ε` are below `e^{-4.5}` of the peak and are
 /// dropped from both the local fit and the `q^{1−2α}` outer weight so the
 /// truncated `q` stays self-consistent across both passes.
-const MEASURE_JET3_PROFILE_CUTOFF: f64 = 3.0;
+pub(crate) const MEASURE_JET3_PROFILE_CUTOFF: f64 = 3.0;
 
 /// Relative eigenvalue threshold for the rank-revealing pseudo-inverses (frame
 /// extraction and the degree-<3 normal-equation solve). Directions at the
 /// roundoff floor are unresolved and excluded — never ridged.
-const MEASURE_JET3_PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
+pub(crate) const MEASURE_JET3_PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
 
 /// Maximum intrinsic frame dimension `q` retained from the local order-2 moment
 /// spectrum. The degree-<3 design then has at most `1 + 8 + 36 = 45` columns, so
@@ -82,16 +82,16 @@ const MEASURE_JET3_PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
 /// set of intrinsic dimension `p ≤ q` is captured exactly; on richer sets the
 /// frame keeps the `q` most energetic order-2 directions (magic by default: the
 /// cap is derived from the polynomial budget, not exposed as a dial).
-const MEASURE_JET3_FRAME_MAX: usize = 8;
+pub(crate) const MEASURE_JET3_FRAME_MAX: usize = 8;
 
 /// Memory budget (in f64 entries) above which the per-scale assembly stops
 /// parallelizing over scales — the partials cost `L · m²` doubles; past this the
 /// scales run sequentially (identical numbers: the per-scale loop and the ordered
 /// cross-scale sum are deterministic either way).
-const MEASURE_JET3_PARALLEL_BUDGET_DOUBLES: usize = 1 << 26;
+pub(crate) const MEASURE_JET3_PARALLEL_BUDGET_DOUBLES: usize = 1 << 26;
 
 /// Pairwise squared distances `‖a_i − a_j‖²`, clamped at zero for roundoff.
-fn pairwise_sq_dists(a: ArrayView2<'_, f64>) -> Array2<f64> {
+pub(crate) fn pairwise_sq_dists(a: ArrayView2<'_, f64>) -> Array2<f64> {
     let norms: Vec<f64> = a.outer_iter().map(|r| r.dot(&r)).collect();
     let mut g = a.dot(&a.t());
     g.axis_iter_mut(Axis(0))
@@ -108,7 +108,7 @@ fn pairwise_sq_dists(a: ArrayView2<'_, f64>) -> Array2<f64> {
 /// Rank-revealing symmetric pseudo-inverse via the symmetric eigendecomposition,
 /// with eigenvalues clamped at zero and a `RTOL · n · λ_max` rank cutoff. Mirrors
 /// the affine energy so both layers treat unresolved directions identically.
-fn symmetric_pseudoinverse(a: &Array2<f64>, label: &str) -> Result<Array2<f64>, BasisError> {
+pub(crate) fn symmetric_pseudoinverse(a: &Array2<f64>, label: &str) -> Result<Array2<f64>, BasisError> {
     let n = a.nrows();
     if a.ncols() != n {
         crate::bail_dim_basis!(
@@ -391,7 +391,7 @@ mod tests {
     /// Deterministic, well-spread 2D center cloud (no RNG). A 5×5 jittered grid
     /// gives a generic spread so the local degree-<3 design is full rank and the
     /// quadratic-annihilation test is non-trivial.
-    fn grid_centers() -> Array2<f64> {
+    pub(crate) fn grid_centers() -> Array2<f64> {
         let n = 5usize;
         let mut v: Vec<f64> = Vec::with_capacity(n * n * 2);
         for i in 0..n {
@@ -408,22 +408,22 @@ mod tests {
         Array2::from_shape_vec((n * n, 2), v).expect("grid centers")
     }
 
-    fn uniform_masses(m: usize) -> Array1<f64> {
+    pub(crate) fn uniform_masses(m: usize) -> Array1<f64> {
         Array1::from_elem(m, 1.0 / m as f64)
     }
 
-    fn band_for(centers: &Array2<f64>) -> MeasureJetBand {
+    pub(crate) fn band_for(centers: &Array2<f64>) -> MeasureJetBand {
         measure_jet_band(centers.view(), 0).expect("auto band")
     }
 
     /// Quadratic energy of a coefficient vector evaluated at the centers under
     /// an energy form: `f(centers)ᵀ Q f(centers)`.
-    fn energy_of(q: &Array2<f64>, f: &Array1<f64>) -> f64 {
+    pub(crate) fn energy_of(q: &Array2<f64>, f: &Array1<f64>) -> f64 {
         f.dot(&q.dot(f))
     }
 
     /// Sample an ambient quadratic `f(x) = a + bᵀx + xᵀMx` at the centers.
-    fn sample_quadratic(
+    pub(crate) fn sample_quadratic(
         centers: &Array2<f64>,
         a: f64,
         b: [f64; 2],
@@ -447,7 +447,7 @@ mod tests {
     /// to a "rough" reference, AND that the r=2 energy of the *same* quadratic is
     /// strictly, substantially larger — proving the degree gain is real.
     #[test]
-    fn order3_annihilates_ambient_quadratics_r2_does_not() {
+    pub(crate) fn order3_annihilates_ambient_quadratics_r2_does_not() {
         let centers = grid_centers();
         let masses = uniform_masses(centers.nrows());
         let band = band_for(&centers);
@@ -509,7 +509,7 @@ mod tests {
     /// ORACLE 2 — the form is PSD. Deterministic test vectors (closed-form,
     /// no RNG) must all give nonnegative energy.
     #[test]
-    fn order3_energy_form_is_psd() {
+    pub(crate) fn order3_energy_form_is_psd() {
         let centers = grid_centers();
         let masses = uniform_masses(centers.nrows());
         let band = band_for(&centers);
@@ -552,7 +552,7 @@ mod tests {
     /// averaged toward zero, while fine scales resolve its local curvature
     /// departure.) Deterministic, no RNG.
     #[test]
-    fn order3_sinusoid_energy_concentrates_at_fine_scales() {
+    pub(crate) fn order3_sinusoid_energy_concentrates_at_fine_scales() {
         let centers = grid_centers();
         let masses = uniform_masses(centers.nrows());
         let band = band_for(&centers);
