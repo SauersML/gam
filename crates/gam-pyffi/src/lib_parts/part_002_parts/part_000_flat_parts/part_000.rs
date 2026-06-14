@@ -2983,11 +2983,11 @@ fn sae_atom_inference_list<'py>(
                     Some(r) => fd.set_item("peak_contrast", sae_riesz_report_dict(py, r)?)?,
                     None => fd.set_item("peak_contrast", py.None())?,
                 }
-                match &f.average_derivative_norm {
+                match &f.decoder_variation_norm {
                     Some(r) => {
-                        fd.set_item("average_derivative_norm", sae_riesz_report_dict(py, r)?)?
+                        fd.set_item("decoder_variation_norm", sae_riesz_report_dict(py, r)?)?
                     }
-                    None => fd.set_item("average_derivative_norm", py.None())?,
+                    None => fd.set_item("decoder_variation_norm", py.None())?,
                 }
                 match &f.average_value {
                     Some(r) => fd.set_item("average_value", sae_riesz_report_dict(py, r)?)?,
