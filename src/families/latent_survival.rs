@@ -4999,6 +4999,32 @@ mod tests {
     }
 
     #[test]
+    fn latent_families_arm_self_vanishing_levenberg_on_ill_conditioning() {
+        // Regression guard for #1108. The interval-censored row contribution
+        // `ℓ = log[S(L) − S(R)]` is the log of a DIFFERENCE of survival kernels and
+        // is legitimately NON-concave (indefinite per-row Hessian) away from the
+        // optimum; on the constrained (monotone-cone) coupled time block this can
+        // make the penalized joint Hessian full-rank yet indefinite / severely
+        // ill-conditioned at the cold-start seed. The coupled exact-joint inner
+        // solver only adds the self-vanishing Levenberg–Marquardt diagonal floor
+        // (the cure for a full-rank ill-conditioned reflected QP that otherwise
+        // oscillates the trust region into a snapshot-less stall) when the family
+        // opts in via `levenberg_on_ill_conditioning()`. Both latent families MUST
+        // keep this armed (the default is `false`, which leaves the interval inner
+        // solve diverging with "exited the joint Newton path before convergence").
+        assert!(
+            learnable_sigma_test_family().levenberg_on_ill_conditioning(),
+            "LatentSurvivalFamily must arm the self-vanishing Levenberg floor so the \
+             indefinite interval-censored joint Hessian converges (see #1108)"
+        );
+        assert!(
+            fixed_sigma_binary_test_family().levenberg_on_ill_conditioning(),
+            "LatentBinaryFamily must arm the self-vanishing Levenberg floor on its \
+             constrained coupled time block (see #1108)"
+        );
+    }
+
+    #[test]
     fn latent_binary_exact_joint_hessian_and_workspace_matvec_match_fd() {
         let family = fixed_sigma_binary_test_family();
         let beta = array![0.15, 0.25, 0.1, -0.15];
