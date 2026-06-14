@@ -185,6 +185,7 @@ impl WarmStartStore {
             // another process evicted us. Drop it so we don't return data
             // for a key whose backing files are gone.
             lookup_cache_invalidate(&LookupCacheKey { fp: *key, mode });
+            self.metadata_index_remove_key(key);
             return Ok(None);
         }
         // Fast path: if the same (key, mode) was looked up before and the
@@ -233,20 +234,28 @@ impl WarmStartStore {
             {
                 continue;
             }
-            let meta = match read_meta(&path) {
+            let meta_md = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let bin = path.with_extension("bin");
+            let bin_md = match fs::metadata(&bin) {
                 Ok(m) => m,
                 Err(_) => {
                     fs::remove_file(&path).ok();
+                    self.metadata_index_remove(&path);
+                    continue;
+                }
+            };
+            let meta = match self.read_meta_indexed(&path, &meta_md, &bin_md) {
+                Ok(m) => m,
+                Err(_) => {
+                    fs::remove_file(&path).ok();
+                    self.metadata_index_remove(&path);
                     continue;
                 }
             };
             if meta.schema_version != SCHEMA_VERSION {
-                continue;
-            }
-            // Ensure the .bin sibling exists; otherwise treat as corrupt.
-            let bin = path.with_extension("bin");
-            if !bin.exists() {
-                fs::remove_file(&path).ok();
                 continue;
             }
             // Drop entries past TTL on the lookup path itself, not only in
@@ -262,6 +271,7 @@ impl WarmStartStore {
             ) {
                 fs::remove_file(&path).ok();
                 fs::remove_file(&bin).ok();
+                self.metadata_index_remove(&path);
                 continue;
             }
             let take = match best {
@@ -289,6 +299,7 @@ impl WarmStartStore {
             fs::remove_file(&meta_path).ok();
             fs::remove_file(&bin_path).ok();
             lookup_cache_invalidate(&cache_key);
+            self.metadata_index_remove(&meta_path);
             return Ok(None);
         }
         let entry = CachedEntry {
@@ -457,6 +468,7 @@ impl WarmStartStore {
         if let Ok(d) = fs::File::open(&dir) {
             d.sync_all().ok();
         }
+        self.metadata_index_upsert(&meta_final, &bin_final).ok();
         // 5. Best-effort eviction; failure here is non-fatal. Throttle the
         // full directory scan: maintain a process-wide approximate byte
         // total and only run eviction when the total may have exceeded the
@@ -541,11 +553,12 @@ impl WarmStartStore {
                         continue;
                     }
                 };
-                let meta = match read_meta(&p) {
+                let meta = match self.read_meta_indexed(&p, &meta_md, &bin_md) {
                     Ok(m) => m,
                     Err(_) => {
                         fs::remove_file(&p).ok();
                         fs::remove_file(&bin).ok();
+                        self.metadata_index_remove(&p);
                         continue;
                     }
                 };
@@ -559,6 +572,7 @@ impl WarmStartStore {
                 ) {
                     fs::remove_file(&p).ok();
                     fs::remove_file(&bin).ok();
+                    self.metadata_index_remove(&p);
                     continue;
                 }
                 let total_bytes = meta_md.len() + bin_md.len();
@@ -591,6 +605,7 @@ impl WarmStartStore {
             }
             fs::remove_file(&meta).ok();
             fs::remove_file(&bin).ok();
+            self.metadata_index_remove(&meta);
             remaining = remaining.saturating_sub(bytes);
         }
         // Resync the approximate byte counter to ground truth. Subsequent
@@ -704,6 +719,27 @@ struct CachedLookup {
     /// the same TTL cutoff as `evict_overflow` without re-reading the JSON.
     write_nanos: u128,
     entry: CachedEntry,
+}
+
+#[derive(Debug, Default)]
+struct MetadataIndex {
+    by_meta_path: HashMap<PathBuf, IndexedMeta>,
+}
+
+#[derive(Debug, Clone)]
+struct IndexedMeta {
+    meta_mtime: SystemTime,
+    meta_len: u64,
+    bin_len: u64,
+    meta: OnDiskMeta,
+}
+
+impl IndexedMeta {
+    fn matches(&self, meta_md: &fs::Metadata, bin_md: &fs::Metadata) -> bool {
+        meta_md.modified().ok() == Some(self.meta_mtime)
+            && meta_md.len() == self.meta_len
+            && bin_md.len() == self.bin_len
+    }
 }
 
 /// True iff a meta with the given (`secs`, `nanos`) write timestamp is older
@@ -850,6 +886,57 @@ fn checksum_hex(payload: &[u8]) -> String {
 }
 
 impl WarmStartStore {
+    fn read_meta_indexed(
+        &self,
+        path: &Path,
+        meta_md: &fs::Metadata,
+        bin_md: &fs::Metadata,
+    ) -> Result<OnDiskMeta, StoreError> {
+        if let Ok(index) = self.index.lock()
+            && let Some(cached) = index.by_meta_path.get(path)
+            && cached.matches(meta_md, bin_md)
+        {
+            return Ok(cached.meta.clone());
+        }
+
+        let meta = read_meta(path)?;
+        let Some(meta_mtime) = meta_md.modified().ok() else {
+            return Ok(meta);
+        };
+        if let Ok(mut index) = self.index.lock() {
+            index.by_meta_path.insert(
+                path.to_path_buf(),
+                IndexedMeta {
+                    meta_mtime,
+                    meta_len: meta_md.len(),
+                    bin_len: bin_md.len(),
+                    meta: meta.clone(),
+                },
+            );
+        }
+        Ok(meta)
+    }
+
+    fn metadata_index_upsert(&self, meta_path: &Path, bin_path: &Path) -> Result<(), StoreError> {
+        let meta_md = fs::metadata(meta_path)?;
+        let bin_md = fs::metadata(bin_path)?;
+        let _ = self.read_meta_indexed(meta_path, &meta_md, &bin_md)?;
+        Ok(())
+    }
+
+    fn metadata_index_remove(&self, meta_path: &Path) {
+        if let Ok(mut index) = self.index.lock() {
+            index.by_meta_path.remove(meta_path);
+        }
+    }
+
+    fn metadata_index_remove_key(&self, key: &Fingerprint) {
+        let dir = self.key_dir(key);
+        if let Ok(mut index) = self.index.lock() {
+            index.by_meta_path.retain(|path, _| !path.starts_with(&dir));
+        }
+    }
+
     fn test_time_offset_ns(&self) -> u64 {
         self.test_time_offset_ns.load(Ordering::Relaxed)
     }
