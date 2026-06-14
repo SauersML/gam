@@ -1,3 +1,43 @@
+## gamfit 0.1.200 (2026-06-14)
+
+PyPI Linux-wheel refresh with post-0.1.199 fixes for generation,
+dispersion location-scale prediction, survival and shape-constrained fitting,
+multinomial convergence, and SAE dictionary robustness.
+
+Fixes:
+- Negative-binomial `generate` and `sample_replicates` now use the fitted
+  `theta_hat` instead of the seed/default theta.
+- Gamma, NB, Beta, and Tweedie dispersion location-scale generation now threads
+  the fitted per-row dispersion channel, fixing homoscedastic synthetic output
+  from heteroscedastic fits.
+- Dispersion location-scale fits now assemble covariance and EDF consistently,
+  including the converged orthogonal path, and prediction gates cover Gamma, NB,
+  and Tweedie cases.
+- Posterior mean observation bands now use per-row `sigma(x)` for
+  heteroscedastic location-scale families.
+- Interval and transformation-survival fitting is more robust: trial-point
+  non-convergence is treated as high cost, interval warm starts stay feasible,
+  and constrained Newton steps respect the monotone cone.
+- Multinomial and BMS convergence paths were tightened with residual-stall
+  Newton-decrement certification, identified-subspace stationarity checks,
+  reduced Schur preconditioning, and removal of hot-path diagnostic
+  eigendecompositions.
+- `average_derivative` and default `difference_smooth` behavior have regression
+  fixes.
+
+SAE / manifold:
+- K>1 SAE dictionary fitting is more stable under deflation and rank reduction.
+- JumpReLU active-set support is canonicalized.
+- Curvature reports now expose delta-method curvature SE through the Python
+  facade.
+- Cylinder topology race and born-atom uncertainty-band work is included.
+
+Build / packaging:
+- Repairs test-target builds after the module split and dispersion type changes.
+- Replaces mechanical split fragments with named modules across major Rust
+  subsystems.
+- Removes stale local workflow/scripts/examples and redundant stub README files.
+
 ## v0.3.116 — gam 0.3.116 / gamfit 0.1.199 (2026-06-14)
 
 Large crate + wheel release rolling up the unreleased work since 0.3.115. The
