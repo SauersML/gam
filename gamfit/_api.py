@@ -867,9 +867,15 @@ def fit(
     response_geometry:
         Optional manifold-valued response geometry. Use ``"spherical"`` for
         unit-sphere responses, or ``"simplex"`` / ``"clr"`` / ``"alr"`` for
-        strictly positive compositional responses. The base point is the
-        intrinsic Fréchet mean of the training responses, not an extrinsic
-        arithmetic mean.
+        strictly positive compositional responses. Curved matrix/ball manifolds
+        are also fittable: ``"spd"`` (symmetric positive-definite cone),
+        ``"grassmann(k=..)"``, ``"stiefel(k=..)"``, ``"poincare"`` (fixed
+        curvature ``< 0``), and ``"constant_curvature"`` — the unified M_κ family
+        whose curvature κ̂ is ESTIMATED from the responses (not user-supplied) by
+        the REML/evidence outer loop, reporting κ̂ with a profile-likelihood CI,
+        the geometry verdict (spherical/flat/hyperbolic), and the Wilks flatness
+        test of κ = 0. The base point is the intrinsic Fréchet mean of the
+        training responses, not an extrinsic arithmetic mean.
     response_columns:
         Sequence of response component columns used when ``response_geometry``
         is set. One scalar Gaussian GAM is fitted for each tangent coordinate.
