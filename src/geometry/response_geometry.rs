@@ -708,9 +708,19 @@ pub fn response_curvature_criterion(
         return Err("response curvature criterion: kappa must be finite".into());
     }
     let manifold = ResponseManifold::ConstantCurvature { dim, kappa };
+    let chart = ConstantCurvature::new(dim, kappa);
     let (n_rows, _) = values.dim();
     let base = response_frechet_mean(manifold, values, None, tol, max_iter)?;
     let mut dispersion = 0.0_f64;
+    // Σᵢ ln λ_κ(yᵢ): the log Riemannian volume density (√det g = λ^a) at every
+    // data point, the change-of-variables term that ties the tangent model back
+    // to the FIXED chart points yᵢ. Without it the criterion is dispersion-only
+    // and scale-degenerate: as κ → +∞ the manifold radius 1/√κ → 0, every
+    // geodesic distance — hence D(κ) — collapses toward 0 and ½na·ln(D/na) → −∞,
+    // driving the minimiser to the upper bracket bound. The volume term is what
+    // makes V_p a proper profiled Gaussian negative-log-evidence with an interior
+    // minimum at the data-generating κ.
+    let mut log_vol = 0.0_f64;
     for row in values.outer_iter() {
         let lg = manifold
             .log_point(base.view(), row)
@@ -719,12 +729,25 @@ pub fn response_curvature_criterion(
             .sq_metric_norm(base.view(), lg.view())
             .map_err(|e| format!("response curvature criterion metric: {e}"))?;
         dispersion += sq;
+        let lam = chart
+            .conformal_factor(row)
+            .map_err(|e| format!("response curvature criterion volume: {e}"))?;
+        log_vol += lam.ln();
     }
     let nobs = (n_rows * dim) as f64;
     // Floor the dispersion so a (near-)perfect flat fit does not blow ln up; the
     // floor is far below any genuine residual scale and cancels in profile drops.
     let d = dispersion.max(1.0e-300 * nobs.max(1.0));
-    let v_p = 0.5 * nobs * (d / nobs.max(1.0)).ln();
+    // Concentrated Gaussian negative-log-evidence of the tangent model, with σ²
+    // profiled out:
+    //   −ℓ(κ) = (na/2)·ln(2π·D/(na)) + na/2 − Σᵢ ln √det g(yᵢ)
+    //         = (na/2)·ln(D)         − a·Σᵢ ln λ_κ(yᵢ)   + const_κ-free.
+    // Dropping the κ-independent additive constants (they cancel in every LR /
+    // profile drop the CI machinery forms), V_p = ½na·ln(D/na) − a·Σᵢ ln λ_κ(yᵢ).
+    // The volume term −a·Σ ln λ grows like +na·ln κ as κ → +∞ (λ ~ 2/(κ‖y‖²)),
+    // dominating the −(na/2)·ln κ of the dispersion term, so V_p → +∞ at large κ
+    // and the optimum is interior at the true curvature for both signs of κ.
+    let v_p = 0.5 * nobs * (d / nobs.max(1.0)).ln() - (dim as f64) * log_vol;
     Ok((v_p, base))
 }
 
