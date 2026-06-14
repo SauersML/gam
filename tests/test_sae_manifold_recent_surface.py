@@ -157,6 +157,28 @@ class _CapturingRustModule:
                     for _ in range(k_atoms)
                 ],
             },
+            "curvature_report": {
+                "ci_available": False,
+                "ci_method": "unavailable",
+                "level": None,
+                "note": "fake SAE curvature report",
+                "atoms": [
+                    {
+                        "atom": atom_k,
+                        "kappa_hat": 0.1 * float(atom_k + 1),
+                        "ci_lo": None,
+                        "ci_hi": None,
+                        "lo_at_bound": None,
+                        "hi_at_bound": None,
+                        "verdict": "unavailable",
+                        "flatness_lr_stat": None,
+                        "flatness_p_value": None,
+                        "ci_available": False,
+                        "ci_method": "unavailable",
+                    }
+                    for atom_k in range(k_atoms)
+                ],
+            },
         }
 
 
@@ -316,6 +338,39 @@ def test_assignment_kinds_run_through_facade(monkeypatch, assignment, expected_k
     assert fit.assignment_label == assignment
     assert fit.assignments.shape == (x.shape[0], 2)
     assert np.all(np.isfinite(fit.assignments))
+
+
+def test_sae_curvature_report_is_user_reachable_and_round_trips(monkeypatch):
+    fake = _CapturingRustModule()
+    monkeypatch.setattr(sae, "rust_module", lambda: fake)
+
+    fit = gamfit.sae_manifold_fit(
+        X=_toy_matrix(n=10, p=3),
+        K=2,
+        d_atom=1,
+        atom_topology="circle",
+        assignment="softmax",
+        isometry_weight=0.0,
+        ard_per_atom=False,
+        decoder_incoherence_weight=0.0,
+        n_iter=1,
+    )
+
+    rows = fit.curvature()
+    assert len(rows) == 2
+    assert rows[0]["kappa_hat"] == pytest.approx(0.1)
+    assert rows[1]["kappa_hat"] == pytest.approx(0.2)
+    for row in rows:
+        assert row["ci_available"] is False
+        assert row["ci_method"] == "unavailable"
+        assert row["ci_lo"] is None
+        assert row["ci_hi"] is None
+        assert row["verdict"] == "unavailable"
+        assert row["flatness_p_value"] is None
+
+    assert fit.atom_curvature(1)["kappa_hat"] == pytest.approx(0.2)
+    restored = gamfit.ManifoldSAE.from_dict(fit.to_dict())
+    assert restored.curvature() == rows
 
 
 @pytest.mark.parametrize(

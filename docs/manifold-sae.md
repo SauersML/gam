@@ -199,6 +199,29 @@ For out-of-sample tokens, `fit.per_atom_latent_for(X)` returns the per-atom
 coordinates under the frozen decoder, so the same extent / percentile read
 applies to new data.
 
+### Per-atom curvature report
+
+Fresh SAE fits also carry a first-class per-atom curvature report:
+
+```python
+curv = fit.curvature()
+curv[0]["kappa_hat"]          # fitted empirical curvature estimate for atom 0
+curv[0]["ci_lo"], curv[0]["ci_hi"]
+curv[0]["flatness_p_value"]
+```
+
+`kappa_hat` is the empirical second-fundamental-form norm used by the
+curved-dictionary identifiability certificate. The report uses the same field
+names as `Model.curvature(...)` (`ci_lo`, `ci_hi`, `verdict`,
+`flatness_lr_stat`, `flatness_p_value`) so downstream report code can consume a
+stable schema.
+
+For SAE dictionaries, the profile-likelihood CI and flatness LR test are not
+computed yet because the fixed-κ SAE profile criterion is not exposed through
+the fit. Those fields are therefore present but set to `None`, with
+`ci_available=False` and `ci_method="unavailable"`. This is intentional: no
+Wald or geometry-bound substitute is reported as a confidence interval.
+
 ## The `ManifoldSAE` result
 
 Key attributes (see the [API reference](api-reference.md#manifold-sae) for
