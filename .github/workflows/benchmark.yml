@@ -220,6 +220,18 @@ jobs:
           install-runtime-deps: "true"
           r-version: ${{ env.BENCH_R_VERSION }}
 
+      # `Verify staged R library is complete` below shells out to Rscript
+      # unconditionally, but `bench-setup` (the only step that installs R)
+      # is gated on a cache miss. On every cache hit we therefore have to
+      # bring R up ourselves; without this the verify step fails with
+      # `Rscript: command not found` and the whole bootstrap job dies. The
+      # r-lib toolcache makes the second install a fast no-op when
+      # `bench-setup` already ran in the same job.
+      - name: Set up R for runtime verification
+        uses: ./.github/actions/setup-bench-r
+        with:
+          r-version: ${{ env.BENCH_R_VERSION }}
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
