@@ -1914,7 +1914,9 @@ mod tests {
         let n = 96;
         let x = linspace(n);
         // age covariate, centred and clearly non-constant.
-        let age: Vec<f64> = (0..n).map(|i| (i as f64) - (n as f64 - 1.0) / 2.0).collect();
+        let age: Vec<f64> = (0..n)
+            .map(|i| (i as f64) - (n as f64 - 1.0) / 2.0)
+            .collect();
 
         // time_transform: owns geometry via a 3·n-row stacked operator. Its
         // n-row canonical `design` carries the shared constant (col 0) plus a
@@ -2029,7 +2031,8 @@ mod tests {
         // time keeps 2, threshold keeps 1 (`age`).
         let reduced_total: usize = canon.reduced_specs.iter().map(|s| s.design.ncols()).sum();
         assert_eq!(
-            reduced_total, 3,
+            reduced_total,
+            3,
             "joint rank = 4 raw columns − 1 surplus constant = 3; got {reduced_total} \
              (per-block reduced ncols {:?})",
             canon

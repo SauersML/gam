@@ -5365,7 +5365,14 @@ mod tests {
         // exact-event row, so the `q_right` channel is inert (the likelihood
         // does not depend on it); the FD loop below confirms its gradient/Hessian
         // entries are zero.
-        let primary = array![0.35f64.ln(), 1.4f64.ln(), 0.8, 1.6f64.ln(), -0.2, 0.4f64.ln()];
+        let primary = array![
+            0.35f64.ln(),
+            1.4f64.ln(),
+            0.8,
+            1.6f64.ln(),
+            -0.2,
+            0.4f64.ln()
+        ];
         let sigma = primary[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA].exp();
         let h_grad = 1e-6;
         let h_hess = 2e-4;

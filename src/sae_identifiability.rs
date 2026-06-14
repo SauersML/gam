@@ -2891,8 +2891,10 @@ fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance
     }
     let log_lik_alt = -0.5 * sse_alt / phi;
     let log_lik_null_sup = -0.5 * sse_null / phi;
-    let log_e =
-        crate::inference::structure_evidence::split_likelihood_log_e_value(log_lik_alt, log_lik_null_sup);
+    let log_e = crate::inference::structure_evidence::split_likelihood_log_e_value(
+        log_lik_alt,
+        log_lik_null_sup,
+    );
     if !log_e.is_finite() {
         return None;
     }
@@ -3241,7 +3243,10 @@ mod tests {
         );
         // Point summary only: the debiased value is finite (no SE/CI is
         // reported by design — #1115).
-        assert!(av.theta_onestep.is_finite(), "average-value debiased finite");
+        assert!(
+            av.theta_onestep.is_finite(),
+            "average-value debiased finite"
+        );
 
         // Decoder-variation norm (conditional on fit): g'(t) = β1 + 2β2 t, mean
         // over the grid is β1 + 2β2 * mean(t). The functional gradient is the

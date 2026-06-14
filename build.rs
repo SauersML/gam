@@ -605,10 +605,11 @@ fn main() {
 
     if !mechanical_part_offenders.is_empty() {
         sections.push(Section {
-            title: "mechanical file-splitting banned (`part_<NNN>.rs` / `*_parts/` / `split_parts/` \
+            title:
+                "mechanical file-splitting banned (`part_<NNN>.rs` / `*_parts/` / `split_parts/` \
                     is line-count splitting, not logical decomposition — split by cohesive concern \
                     into descriptively-named modules; do NOT add to mechanical_parts_baseline.txt)"
-                .to_string(),
+                    .to_string(),
             rows: mechanical_part_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
@@ -3077,7 +3078,8 @@ fn is_mechanical_part_path(rel: &Path) -> bool {
 /// a fresh violation and fails the build. Split by cohesive concern into
 /// descriptively-named modules instead.
 fn scan_for_mechanical_part_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
-    let baseline_text = fs::read_to_string(root.join(MECHANICAL_PARTS_BASELINE)).unwrap_or_default();
+    let baseline_text =
+        fs::read_to_string(root.join(MECHANICAL_PARTS_BASELINE)).unwrap_or_default();
     let baseline: std::collections::HashSet<&str> = baseline_text
         .lines()
         .map(str::trim)
@@ -3119,7 +3121,6 @@ fn scan_for_mechanical_part_files(root: &Path, offenders: &mut Vec<(PathBuf, usi
         ));
     }
 }
-
 
 struct ScannedFile {
     rel: PathBuf,
