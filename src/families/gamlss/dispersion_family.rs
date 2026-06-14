@@ -509,14 +509,29 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         )
     }
 
+    /// Exact joint coefficient-space Hessian `H_L = -∇²log L` in flattened
+    /// `[mean | log-precision]` block order.
+    ///
+    /// All four members assemble the same `Xᵀ diag(W) X` blocks; the cross
+    /// block is the per-row mixed weight `dispersion_row_cross_weight`. Beta
+    /// carries a genuinely nonzero (η_μ, η_φ) cross weight; the Fisher-
+    /// orthogonal members (NegativeBinomial / Gamma / Tweedie) report a zero
+    /// cross weight, so this returns their exact *block-diagonal* joint
+    /// Hessian. Returning that block-diagonal `H_L` — rather than `None` —
+    /// is what lets the multi-block outer-REML path (`build_joint_hessian_
+    /// closures` → `joint_outer_evaluate`) and the joint posterior covariance
+    /// (`compute_joint_covariance`) run for these families instead of failing
+    /// the "multi-block families must provide a joint outer path" gate and
+    /// silently escalating to a degraded ρ-seed fit with no covariance/EDF
+    /// (gam#1119). The orthogonal members additionally declare
+    /// `likelihood_blocks_uncoupled() = true` so the directional-derivative
+    /// and Jeffreys dispatch route through the block-diagonal-exact fallback
+    /// rather than rejecting the structurally-uncoupled Hessian.
     fn exact_newton_joint_hessian_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
-        if !matches!(self.kind, DispersionFamilyKind::Beta) {
-            return Ok(None);
-        }
         if block_states.len() != 2 || specs.len() != 2 {
             return Err(format!(
                 "{} exact joint Hessian expects 2 blocks/specs, got states={} specs={}",
@@ -544,16 +559,20 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
             ..
         } = &eval.blockworking_sets[Self::BLOCK_MEAN]
         else {
-            return Err("Beta dispersion mean block did not return diagonal weights".to_string());
+            return Err(format!(
+                "{} dispersion mean block did not return diagonal weights",
+                self.kind.family_tag()
+            ));
         };
         let BlockWorkingSet::Diagonal {
             working_weights: disp_weights,
             ..
         } = &eval.blockworking_sets[Self::BLOCK_DISP]
         else {
-            return Err(
-                "Beta dispersion precision block did not return diagonal weights".to_string(),
-            );
+            return Err(format!(
+                "{} dispersion precision block did not return diagonal weights",
+                self.kind.family_tag()
+            ));
         };
 
         let cross_weights = Array1::from_shape_fn(n, |i| {
@@ -595,6 +614,23 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
             .assign(&h_disp);
         mirror_upper_to_lower(&mut h);
         Ok(Some(h))
+    }
+
+    /// Whether the joint likelihood Hessian is block-diagonal in the
+    /// `[mean | log-precision]` coefficient vector.
+    ///
+    /// `Beta(μφ, (1−μ)φ)` carries a genuinely nonzero `(η_μ, η_φ)` Fisher
+    /// cross block (see the module header), so its blocks are coupled. The
+    /// remaining members are Fisher-orthogonal in their mean/precision
+    /// parameterizations — NB2 `(μ, θ)`, Gamma shape `ν = 1/φ`, Tweedie
+    /// `log(1/φ)` — so `∂²L/∂β_μ∂β_d = 0` and the joint Hessian is exactly
+    /// block-diagonal. Declaring that here lets the trait's directional-
+    /// derivative / Jeffreys dispatch accept the block-diagonal joint Hessian
+    /// via the working-set-exact fallback instead of rejecting it as an
+    /// untrusted structurally-uncoupled override (which would strand the
+    /// outer-REML gradient with a "dH unavailable" error, gam#1119).
+    fn likelihood_blocks_uncoupled(&self) -> bool {
+        !matches!(self.kind, DispersionFamilyKind::Beta)
     }
 
     /// The mean and precision working weights couple across both blocks, which
