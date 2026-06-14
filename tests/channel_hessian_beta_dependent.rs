@@ -112,7 +112,6 @@ fn survival_marginal_slope_w_changes_with_beta() {
         g_b.clone(),
         s_b,
         z_b.clone(),
-        g_b.clone(),
     );
     let scalars_arc: Arc<dyn std::any::Any + Send + Sync> = Arc::new(scalars_b);
 

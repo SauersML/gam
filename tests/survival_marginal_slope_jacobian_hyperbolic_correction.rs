@@ -1198,7 +1198,6 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
                 g_i,
                 s_f,
                 z_i,
-                vec![0.0_f64; N],
             ))
         };
 
