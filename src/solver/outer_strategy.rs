@@ -14,5 +14,5 @@
 //! curvature numerically.
 
 // Split from the original oversized module; keep included in order.
-include!("outer_strategy_parts/part_000.rs");
-include!("outer_strategy_parts/part_001.rs");
+include!("outer_strategy_operators.rs");
+include!("outer_strategy_run_plan_tests.rs");
