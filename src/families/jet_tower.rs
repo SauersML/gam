@@ -382,6 +382,157 @@ impl<const K: usize> Tower4<K> {
     }
 }
 
+/// Truncated SECOND-order multivariate Taylor scalar in `K` variables.
+///
+/// This is the value/gradient/Hessian-only sibling of [`Tower4`]. Every
+/// channel it carries (`v`, `g`, `h`) is computed by the SAME formulas
+/// [`Tower4`] uses for those orders, so for any program written over both
+/// towers the order-≤2 outputs are *bit-identical*: the order-2 Leibniz and
+/// Faà-di-Bruno terms read only the order-≤2 channels of their inputs (see
+/// [`Tower4::mul`] / [`Tower4::compose_unary`] — `out.h` never touches `t3`
+/// or `t4`), so dropping the third/fourth tensors cannot perturb the value,
+/// gradient, or Hessian.
+///
+/// It exists purely for performance: an inner Newton step (and the
+/// value-only ρ-homotopy pre-warm) needs at most curvature, never the
+/// outer-κ/ψ third/fourth derivatives. Evaluating a row likelihood over
+/// `Tower2` skips the `K⁴` fourth-tensor product/composition arithmetic that
+/// dominates the cold marginal-slope fit, while returning the exact same
+/// `(v, g, h)`.
+#[derive(Clone, Copy, Debug)]
+pub struct Tower2<const K: usize> {
+    /// Value ℓ.
+    pub v: f64,
+    /// Gradient ∂ℓ/∂p_a.
+    pub g: [f64; K],
+    /// Hessian ∂²ℓ/∂p_a∂p_b (symmetric).
+    pub h: [[f64; K]; K],
+}
+
+impl<const K: usize> Tower2<K> {
+    /// The additive identity.
+    pub fn zero() -> Self {
+        Self {
+            v: 0.0,
+            g: [0.0; K],
+            h: [[0.0; K]; K],
+        }
+    }
+
+    /// A constant: value `c`, all derivatives zero.
+    pub fn constant(c: f64) -> Self {
+        let mut out = Self::zero();
+        out.v = c;
+        out
+    }
+
+    /// The seeded variable `p_idx` with current value `value`:
+    /// unit first derivative in slot `idx`, zero elsewhere and above.
+    pub fn variable(value: f64, idx: usize) -> Self {
+        let mut out = Self::constant(value);
+        out.g[idx] = 1.0;
+        out
+    }
+
+    /// Exact truncated (order ≤ 2) Leibniz product. The `v`/`g`/`h` channels
+    /// match [`Tower4::mul`] term-for-term.
+    pub fn mul(&self, o: &Self) -> Self {
+        let a = self;
+        let b = o;
+        let mut out = Self::zero();
+        out.v = a.v * b.v;
+        for i in 0..K {
+            out.g[i] = a.v * b.g[i] + a.g[i] * b.v;
+        }
+        for i in 0..K {
+            for j in 0..K {
+                out.h[i][j] = a.v * b.h[i][j] + a.g[i] * b.g[j] + a.g[j] * b.g[i] + a.h[i][j] * b.v;
+            }
+        }
+        out
+    }
+
+    /// Exact (order ≤ 2) multivariate Faà di Bruno composition `f ∘ self`.
+    ///
+    /// `d = [f(u), f′(u), f″(u)]` evaluated at `u = self.v`. The `v`/`g`/`h`
+    /// channels match [`Tower4::compose_unary`] term-for-term (which uses only
+    /// `d[0..=2]` for those orders), so this is a strict truncation, not an
+    /// approximation. The full-order `[f64; 5]` derivative stacks the families
+    /// already produce can be passed by slicing their first three entries.
+    pub fn compose_unary(&self, d: [f64; 3]) -> Self {
+        let u = self;
+        let mut out = Self::zero();
+        out.v = d[0];
+        for i in 0..K {
+            out.g[i] = d[1] * u.g[i];
+        }
+        for i in 0..K {
+            for j in 0..K {
+                out.h[i][j] = d[1] * u.h[i][j] + d[2] * u.g[i] * u.g[j];
+            }
+        }
+        out
+    }
+
+    /// Multiply every channel by a plain scalar.
+    pub fn scale(&self, s: f64) -> Self {
+        let mut out = *self;
+        out.v *= s;
+        for i in 0..K {
+            out.g[i] *= s;
+            for j in 0..K {
+                out.h[i][j] *= s;
+            }
+        }
+        out
+    }
+
+    /// √self. Caller guarantees positivity.
+    pub fn sqrt(&self) -> Self {
+        let u = self.v;
+        let s = u.sqrt();
+        self.compose_unary([s, 0.5 / s, -0.25 / (u * s)])
+    }
+}
+
+impl<const K: usize> std::ops::Add for Tower2<K> {
+    type Output = Self;
+    fn add(self, o: Self) -> Self {
+        let mut out = self;
+        out.v += o.v;
+        for i in 0..K {
+            out.g[i] += o.g[i];
+            for j in 0..K {
+                out.h[i][j] += o.h[i][j];
+            }
+        }
+        out
+    }
+}
+
+impl<const K: usize> std::ops::Mul for Tower2<K> {
+    type Output = Self;
+    fn mul(self, o: Self) -> Self {
+        Tower2::mul(&self, &o)
+    }
+}
+
+impl<const K: usize> std::ops::Add<f64> for Tower2<K> {
+    type Output = Self;
+    fn add(self, c: f64) -> Self {
+        let mut out = self;
+        out.v += c;
+        out
+    }
+}
+
+impl<const K: usize> std::ops::Mul<f64> for Tower2<K> {
+    type Output = Self;
+    fn mul(self, c: f64) -> Self {
+        self.scale(c)
+    }
+}
+
 pub fn ln_gamma_derivative_stack(x: f64) -> [f64; 5] {
     [
         statrs::function::gamma::ln_gamma(x),

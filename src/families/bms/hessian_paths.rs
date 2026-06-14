@@ -227,6 +227,24 @@ impl BernoulliBlockHessianAccumulator {
         w_mg: &Array1<f64>,
         w_gg: &Array1<f64>,
     ) -> Result<(), String> {
+        // Zero-copy fast path: when BOTH designs are materialised dense the
+        // weighted Gram products read the chunk rows straight from the stored
+        // matrix as borrowed views. `try_row_chunk` would instead `.to_owned()`
+        // a fresh `(rows × p)` `Array2` every chunk every cycle — the dominant
+        // `OwnedRepr<f64>` alloc/`drop_in_place` churn the cold marginal-slope
+        // fit pays in its repeated inner Newton / ρ-homotopy pre-warm passes.
+        // `fast_xt_diag_*` is generic over `Data<Elem = f64>`, so an
+        // `ArrayView2` slice feeds the identical BLAS-3 kernels with identical
+        // arithmetic — exact, just without the copy.
+        if let (Some(x_full), Some(g_full)) = (
+            family.marginal_design.as_dense_ref(),
+            family.logslope_design.as_dense_ref(),
+        ) {
+            let x = x_full.slice(s![rows.clone(), ..]);
+            let g = g_full.slice(s![rows, ..]);
+            self.add_weighted_design_grams_from_chunks(&x, &g, w_mm, w_mg, w_gg);
+            return Ok(());
+        }
         let x = family
             .marginal_design
             .try_row_chunk(rows.clone())
@@ -239,10 +257,13 @@ impl BernoulliBlockHessianAccumulator {
         Ok(())
     }
 
-    pub(super) fn add_weighted_design_grams_from_chunks(
+    pub(super) fn add_weighted_design_grams_from_chunks<
+        SX: ndarray::Data<Elem = f64>,
+        SG: ndarray::Data<Elem = f64>,
+    >(
         &mut self,
-        x: &Array2<f64>,
-        g: &Array2<f64>,
+        x: &ndarray::ArrayBase<SX, ndarray::Ix2>,
+        g: &ndarray::ArrayBase<SG, ndarray::Ix2>,
         w_mm: &Array1<f64>,
         w_mg: &Array1<f64>,
         w_gg: &Array1<f64>,
@@ -1011,8 +1032,8 @@ impl BernoulliExactNewtonAccumulator {
     }
 }
 
-pub(super) fn add_weighted_chunk_gradient(
-    chunk: &Array2<f64>,
+pub(super) fn add_weighted_chunk_gradient<S: ndarray::Data<Elem = f64>>(
+    chunk: &ndarray::ArrayBase<S, ndarray::Ix2>,
     weights: &[f64],
     target: &mut Array1<f64>,
 ) {
@@ -1045,8 +1066,8 @@ pub(super) fn new_cell_moment_cache_stats() -> Arc<exact_kernel::CellMomentCache
     Arc::new(exact_kernel::CellMomentCacheStats::default())
 }
 
-pub(super) fn add_weighted_chunk_gram(
-    chunk: &Array2<f64>,
+pub(super) fn add_weighted_chunk_gram<S: ndarray::Data<Elem = f64>>(
+    chunk: &ndarray::ArrayBase<S, ndarray::Ix2>,
     weights: &[f64],
     target: &mut Array2<f64>,
 ) {
