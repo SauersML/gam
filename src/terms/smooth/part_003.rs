@@ -2050,16 +2050,119 @@ impl SpatialHyperKind {
 /// `kind` whose only effect is the diagnostic label routed into the cost-only
 /// evaluation path. The `eval_full / eval_efs / eval_cost` methods are the
 /// single source of truth for both anisotropic and isotropic spatial terms.
+struct SpatialFrozenGlmInputs {
+    y: Array1<f64>,
+    weights: Array1<f64>,
+    offset: Array1<f64>,
+    family: LikelihoodSpec,
+}
+
+
 struct SpatialJointContext<'d> {
     data: ArrayView2<'d, f64>,
     rho_dim: usize,
     kind: SpatialHyperKind,
     cache: SingleBlockExactJointDesignCache<'d>,
     evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
+    frozen_glm_inputs: Option<SpatialFrozenGlmInputs>,
+    frozen_glm_psi_bounds: Option<(f64, f64)>,
+    frozen_glm_tensor: Option<crate::solver::glm_sufficient_lane::FrozenWeightGramTensor>,
+    frozen_glm_tensor_attempted: bool,
 }
 
 
 impl<'d> SpatialJointContext<'d> {
+    fn frozen_glm_working_state(
+        &self,
+        beta: &Array1<f64>,
+    ) -> Result<Option<(Array1<f64>, Array1<f64>)>, EstimationError> {
+        let Some(inputs) = self.frozen_glm_inputs.as_ref() else {
+            return Ok(None);
+        };
+        if beta.len() != self.cache.design().design.ncols() {
+            return Ok(None);
+        }
+        let mut eta = self.cache.design().design.matrixvectormultiply(beta);
+        if eta.len() != inputs.offset.len() {
+            crate::bail_invalid_estim!(
+                "frozen GLM tensor warm-state row mismatch: eta={}, offset={}",
+                eta.len(),
+                inputs.offset.len()
+            );
+        }
+        eta += &inputs.offset;
+        let obs = evaluate_standard_familyobservations(
+            inputs.family.clone(),
+            None,
+            None,
+            None,
+            &inputs.y,
+            &inputs.weights,
+            &eta,
+        )?;
+        let mut working_response = obs.eta.clone();
+        for i in 0..working_response.len() {
+            let wi = obs.fisherweight[i].max(1e-12);
+            working_response[i] += obs.score[i] / wi;
+        }
+        Ok(Some((obs.fisherweight, working_response)))
+    }
+
+    fn ensure_frozen_glm_tensor(
+        &mut self,
+        theta: &Array1<f64>,
+        warm_beta: Option<&Array1<f64>>,
+    ) -> Result<(), EstimationError> {
+        if self.frozen_glm_tensor.is_some() || self.frozen_glm_tensor_attempted {
+            return Ok(());
+        }
+        let Some((psi_lo, psi_hi)) = self.frozen_glm_psi_bounds else {
+            return Ok(());
+        };
+        if theta.len() != self.rho_dim + 1 {
+            self.frozen_glm_tensor_attempted = true;
+            return Ok(());
+        }
+        let Some(beta) = warm_beta else {
+            return Ok(());
+        };
+        let Some((frozen_w, working_z)) = self.frozen_glm_working_state(beta)? else {
+            self.frozen_glm_tensor_attempted = true;
+            return Ok(());
+        };
+        let theta_probe_base = theta.clone();
+        let rho_dim = self.rho_dim;
+        let tensor = crate::solver::glm_sufficient_lane::FrozenWeightGramTensor::build(
+            |psi| {
+                let mut theta_probe = theta_probe_base.clone();
+                theta_probe[rho_dim] = psi;
+                self.cache.ensure_theta(&theta_probe)?;
+                Ok(self.cache.design().design.to_dense())
+            },
+            frozen_w.view(),
+            working_z.view(),
+            psi_lo,
+            psi_hi,
+        );
+        self.cache
+            .ensure_theta(theta)
+            .map_err(EstimationError::InvalidInput)?;
+        self.frozen_glm_tensor_attempted = true;
+        if let Some(tensor) = tensor {
+            self.frozen_glm_tensor = Some(tensor);
+            log::info!(
+                "[STAGE] {} certified frozen-W GLM ψ tensor over [{psi_lo:.3}, {psi_hi:.3}]",
+                self.kind.label(),
+            );
+        } else {
+            log::info!(
+                "[STAGE] {} frozen-W GLM ψ tensor did not certify over [{psi_lo:.3}, {psi_hi:.3}]",
+                self.kind.label(),
+            );
+        }
+        Ok(())
+    }
+
     /// Full evaluation on the current realized design + hyper_dirs.
     fn eval_full(
         &mut self,
@@ -2087,6 +2190,8 @@ impl<'d> SpatialJointContext<'d> {
             .ensure_theta(theta)
             .map_err(EstimationError::InvalidInput)?;
         let kind = self.kind;
+        let warm_beta = self.evaluator.current_beta();
+        self.ensure_frozen_glm_tensor(theta, warm_beta.as_ref())?;
         // #1033: when a certified ψ-Gram tensor covers this trial's ψ-window,
         // the value and gradient channels can both be served n-free.  The value
         // channel installs a `GaussianFixedCache` inside `prepare_eval_state`;
@@ -2111,6 +2216,24 @@ impl<'d> SpatialJointContext<'d> {
                 );
             }
         }
+        if theta.len() == self.rho_dim + 1 {
+            let psi = theta[self.rho_dim];
+            if let (Some(tensor), Some(beta)) = (self.frozen_glm_tensor.as_ref(), warm_beta.as_ref())
+            {
+                if tensor.contains(psi) {
+                    if let Some((current_w, _)) = self.frozen_glm_working_state(beta)? {
+                        const FROZEN_GLM_WEIGHT_DRIFT_RTOL: f64 = 1e-3;
+                        let drift_ok =
+                            tensor.weight_drift_within(current_w.view(), FROZEN_GLM_WEIGHT_DRIFT_RTOL);
+                        log::debug!(
+                            "[STAGE] {} eval_full at psi={psi:.6}: frozen-W GLM tensor covers \
+                             first Fisher statistics (weight_drift_ok={drift_ok})",
+                            kind.label(),
+                        );
+                    }
+                }
+            }
+        }
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             self.data,
             self.cache.spec(),
@@ -2132,7 +2255,6 @@ impl<'d> SpatialJointContext<'d> {
         // β every outer step cold-solves a full PIRLS from β=0, paying the full
         // O(n·p²) cost × PIRLS-iters × outer-iters budget. With the warm β the
         // inner solve typically converges in 1-2 Newton steps instead of 4-8.
-        let warm_beta = self.evaluator.current_beta();
         let eval = evaluate_joint_reml_outer_eval_at_theta(
             &mut self.evaluator,
             self.cache.design(),
@@ -2389,6 +2511,29 @@ fn run_exact_joint_spatial_optimization(
             &external_opts_for_design(&family, baseline_design, options),
             label,
         )?,
+        frozen_glm_inputs: if coord_dim == 1
+            && !family.is_gaussian_identity()
+            && matches!(&family.response, ResponseFamily::Binomial)
+        {
+            Some(SpatialFrozenGlmInputs {
+                y: y.to_owned(),
+                weights: weights.to_owned(),
+                offset: offset.to_owned(),
+                family: family.clone(),
+            })
+        } else {
+            None
+        },
+        frozen_glm_psi_bounds: if coord_dim == 1
+            && !family.is_gaussian_identity()
+            && matches!(&family.response, ResponseFamily::Binomial)
+        {
+            Some((lower[rho_dim], upper[rho_dim]))
+        } else {
+            None
+        },
+        frozen_glm_tensor: None,
+        frozen_glm_tensor_attempted: false,
     };
 
     // #1033b: single isotropic design-moving coordinate on a Gaussian-identity
