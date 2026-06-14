@@ -358,10 +358,3 @@ impl CustomFamilyGenerative for GammaLogFamily {
         })
     }
 }
-
-/// Built-in binomial location-scale family with a configurable inverse link.
-///
-/// Parameters:
-/// - Block 0: threshold/location T(covariates)
-/// - Block 1: log-scale log σ(covariates)
-#[derive(Clone)]

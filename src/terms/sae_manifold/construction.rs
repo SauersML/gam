@@ -788,6 +788,16 @@ impl SaeManifoldTerm {
                     AtomTopology::Torus { latent_dim: d }
                 }
                 (SaeAtomBasisKind::Sphere, _) => AtomTopology::Sphere,
+                // `Cylinder` (`S¹ × ℝ`) has exactly one continuous gauge: the
+                // rotation (shift) of the periodic axis. The unbounded line axis
+                // carries no rotational gauge, and its translation is already
+                // pinned by the design's constant column — so the identifiability
+                // gauge is that of a single circle. Fixing it as `Torus` would
+                // over-impose a second (nonexistent) circle shift; fixing it as
+                // `EuclideanPatch { 2 }` would over-impose a frame rotation
+                // mixing the periodic and linear axes. `Circle` fixes the one
+                // real continuous gauge and leaves the linear axis ungauged.
+                (SaeAtomBasisKind::Cylinder, _) => AtomTopology::Circle,
                 (
                     SaeAtomBasisKind::Duchon
                     | SaeAtomBasisKind::EuclideanPatch

@@ -1125,6 +1125,26 @@ impl SaeManifoldTerm {
                         }
                     }
                 }
+                // `Cylinder` (`S¹ × ℝ`) carries exactly one continuous gauge: the
+                // shift (rotation) of the periodic axis 0. The line axis 1 has no
+                // rotational gauge and its translation is pinned by the constant
+                // column, so we deflate only the axis-0 constant-shift field —
+                // matching the `AtomTopology::Circle` identifiability choice.
+                SaeAtomBasisKind::Cylinder => {
+                    let mut field = Array2::<f64>::zeros((n, d));
+                    if d > 0 {
+                        field.column_mut(0).fill(1.0);
+                    }
+                    if let Some(g) = self.dense_step_gauge_vector_from_field(
+                        atom_idx,
+                        field.view(),
+                        &coord_offsets,
+                        &beta_offsets,
+                        total_len,
+                    )? {
+                        out.push(g);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1218,6 +1238,19 @@ impl SaeManifoldTerm {
                     let mut phase = Array1::<f64>::zeros(q_row);
                     phase[coord_start + axis] = 1.0;
                     row_dirs.push(phase);
+                }
+            }
+            // `Cylinder` (`S¹ × ℝ`): only the periodic axis 0 carries a phase
+            // (rotation) gauge; the line axis 1 has none (matching the
+            // `AtomTopology::Circle` choice). Deflate the axis-0 phase only.
+            SaeAtomBasisKind::Cylinder => {
+                if d > 0 {
+                    self.atoms[atom_idx].fill_decoded_derivative_row(row, 0, &mut tangent);
+                    if tangent.iter().map(|&v| v * v).sum::<f64>() > 1.0e-24 {
+                        let mut phase = Array1::<f64>::zeros(q_row);
+                        phase[coord_start] = 1.0;
+                        row_dirs.push(phase);
+                    }
                 }
             }
             _ => {}

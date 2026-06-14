@@ -1550,6 +1550,376 @@ impl SaeBasisThirdJet for EuclideanPatchEvaluator {
     }
 }
 
+/// Tensor-product harmonic × polynomial evaluator for the cylinder `S¹ × ℝ`
+/// (`d = 2`): a periodic circle axis crossed with a flat (Duchon-polynomial)
+/// line axis.
+///
+/// This is the missing geometry in the `d = 2` topology race (torus vs sphere
+/// vs euclidean-patch vs **cylinder**). A feature whose latent structure is
+/// *periodic along one axis and unbounded-linear along the other* (e.g. a
+/// phase-times-magnitude direction in the residual stream) lives on `S¹ × ℝ`,
+/// not on `T²` (two circles) or `S²`; before this evaluator it was forced into
+/// a torus stand-in (wrapping the linear axis spuriously) or a flat patch
+/// (losing the periodicity). With it, the cylinder is a first-class candidate
+/// adjudicated under the same TK-normalized evidence gate.
+///
+/// # Basis
+///
+/// Axis 0 is the circle, in the `PeriodicHarmonicEvaluator` form
+/// `c(t₀) = [1, sin(2π·1·t₀), cos(2π·1·t₀), …, sin(2π·H·t₀), cos(2π·H·t₀)]`
+/// (`Mc = 2H + 1` columns; `t₀` is a fraction of one period, matching the
+/// periodic/torus convention). Axis 1 is the flat line, in the
+/// `EuclideanPatchEvaluator` form `l(t₁) = [1, t₁, t₁², …, t₁^D]`
+/// (`Ml = D + 1` columns). The product basis is
+/// `Φ_{c,l}(t) = c_c(t₀) · l_l(t₁)`, `M = Mc · Ml` columns, enumerated
+/// lexicographically with the circle index slowest (`col = c·Ml + l`), so the
+/// constant `[c=0, l=0]` is column 0.
+///
+/// # Jets (exact product rule across the two axes)
+///
+/// Because the two factors depend on disjoint coordinates, the value/derivative
+/// of `Φ_{c,l}` along a multi-index over `{axis 0, axis 1}` is simply the
+/// product of the circle factor differentiated as many times as axis 0 appears
+/// and the line factor differentiated as many times as axis 1 appears. Each
+/// per-axis derivative table (orders 0..3) is closed form (circle: the Fourier
+/// `sin → ωcos → −ω²sin → −ω³cos` chain; line: the falling-factorial monomial
+/// chain), so the value, first, second and third jets are all exact and the
+/// second/third jets pin against a finite difference of the level below.
+#[derive(Debug, Clone)]
+pub struct CylinderHarmonicEvaluator {
+    /// Number of circle harmonics `H ≥ 1` (axis-0 width is `2H + 1`).
+    pub circle_harmonics: usize,
+    /// Polynomial degree `D ≥ 0` of the flat line axis (axis-1 width is `D + 1`).
+    pub line_degree: usize,
+}
+
+impl CylinderHarmonicEvaluator {
+    pub fn new(circle_harmonics: usize, line_degree: usize) -> Result<Self, String> {
+        if circle_harmonics == 0 {
+            return Err(
+                "CylinderHarmonicEvaluator requires circle_harmonics >= 1 (S¹ needs at least one \
+                 harmonic pair)"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            circle_harmonics,
+            line_degree,
+        })
+    }
+
+    /// Circle-axis width `Mc = 2H + 1`.
+    pub fn circle_basis_size(&self) -> usize {
+        2 * self.circle_harmonics + 1
+    }
+
+    /// Line-axis width `Ml = D + 1`.
+    pub fn line_basis_size(&self) -> usize {
+        self.line_degree + 1
+    }
+
+    /// Product basis width `M = Mc · Ml`.
+    pub fn basis_size(&self) -> usize {
+        self.circle_basis_size() * self.line_basis_size()
+    }
+
+    /// Per-axis circle derivative tables, orders 0..=3, indexed `[order][col]`,
+    /// length `Mc` each. Column 0 is the constant; columns `2h-1`/`2h` carry the
+    /// `h`-th sin/cos pair at frequency `ω = 2π h`.
+    fn circle_tables(&self, t: f64) -> [Vec<f64>; 4] {
+        let mc = self.circle_basis_size();
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut table = [
+            vec![0.0_f64; mc],
+            vec![0.0_f64; mc],
+            vec![0.0_f64; mc],
+            vec![0.0_f64; mc],
+        ];
+        // Constant column: value 1, all derivatives 0.
+        table[0][0] = 1.0;
+        for h in 1..=self.circle_harmonics {
+            let omega = two_pi * (h as f64);
+            let w2 = omega * omega;
+            let w3 = w2 * omega;
+            let angle = omega * t;
+            let s = angle.sin();
+            let c = angle.cos();
+            let s_idx = 2 * h - 1;
+            let c_idx = 2 * h;
+            // sin chain: sin → ω cos → −ω² sin → −ω³ cos.
+            table[0][s_idx] = s;
+            table[1][s_idx] = omega * c;
+            table[2][s_idx] = -w2 * s;
+            table[3][s_idx] = -w3 * c;
+            // cos chain: cos → −ω sin → −ω² cos → ω³ sin.
+            table[0][c_idx] = c;
+            table[1][c_idx] = -omega * s;
+            table[2][c_idx] = -w2 * c;
+            table[3][c_idx] = w3 * s;
+        }
+        table
+    }
+
+    /// Per-axis line (monomial) derivative tables, orders 0..=3, indexed
+    /// `[order][col]`, length `Ml` each. Column `j` is `t^j`; its `k`-th
+    /// derivative is `falling(j, k) · t^{j-k}` (zero once `k > j`).
+    fn line_tables(&self, t: f64) -> [Vec<f64>; 4] {
+        let ml = self.line_basis_size();
+        let mut table = [
+            vec![0.0_f64; ml],
+            vec![0.0_f64; ml],
+            vec![0.0_f64; ml],
+            vec![0.0_f64; ml],
+        ];
+        for j in 0..ml {
+            for k in 0..4 {
+                if k > j {
+                    // falling(j, k) = 0: the monomial is exhausted.
+                    table[k][j] = 0.0;
+                    continue;
+                }
+                let mut coeff = 1.0_f64;
+                for q in 0..k {
+                    coeff *= (j - q) as f64;
+                }
+                let residual = j - k;
+                let pow = if residual == 0 {
+                    1.0
+                } else {
+                    t.powi(residual as i32)
+                };
+                table[k][j] = coeff * pow;
+            }
+        }
+        table
+    }
+
+    /// Analytic seed roughness Gram `S = ∫ (LΦ)ᵀ (LΦ)` for the cylinder, built
+    /// as the tensor sum of a per-axis curvature energy: it penalizes the
+    /// second derivative along the circle (the bending energy of the periodic
+    /// factor) plus the second derivative along the line (the thin-plate energy
+    /// of the flat factor). Because the basis is a clean tensor product and the
+    /// two coordinate measures are independent on `[0,1) × ℝ`, the cross terms
+    /// factor through the per-axis Grams.
+    ///
+    /// Concretely, with `Sc` the circle second-derivative Gram and `Gc` the
+    /// circle value Gram (both `Mc × Mc`), `Sl`/`Gl` their line counterparts
+    /// (`Ml × Ml`), the roughness operator
+    /// `‖∂²_{t₀}Φ‖² + ‖∂²_{t₁}Φ‖²` integrates to
+    /// `S = Sc ⊗ Gl + Gc ⊗ Sl` in the same lexicographic column order as the
+    /// design. This is gauge-invariant: it depends only on the basis functions,
+    /// not on any chart-specific normalization, and the constant column (zero in
+    /// both `Sc` and `Sl`) sits in the null space exactly as the smooth-penalty
+    /// nullity recovery expects.
+    ///
+    /// The circle blocks use the closed-form Fourier integrals on `[0,1)`:
+    /// `∫₀¹ 1 dt = 1`, `∫₀¹ sin²(2πht) = ∫₀¹ cos²(2πht) = ½`, all distinct-mode
+    /// and sin·cos cross integrals vanish, so `Gc` is diagonal
+    /// `diag(1, ½, ½, …)` and `Sc = diag(0, (2πh)⁴·½, …)` (the second derivative
+    /// of a mode scales its value by `(2πh)²`, squared and integrated → `(2πh)⁴`
+    /// times the value integral). The line blocks use the monomial moments on a
+    /// canonical unit interval `[0,1)` so the energy is finite and scale-fixed:
+    /// `Gl[i,j] = ∫₀¹ tⁱ⁺ʲ dt = 1/(i+j+1)` and
+    /// `Sl[i,j] = ∫₀¹ (i(i-1)t^{i-2})(j(j-1)t^{j-2}) dt`.
+    pub fn roughness_gram(&self) -> Array2<f64> {
+        let mc = self.circle_basis_size();
+        let ml = self.line_basis_size();
+        let two_pi = 2.0 * std::f64::consts::PI;
+
+        // Circle value Gram Gc and second-derivative Gram Sc (both diagonal).
+        let mut gc = Array2::<f64>::zeros((mc, mc));
+        let mut sc = Array2::<f64>::zeros((mc, mc));
+        gc[[0, 0]] = 1.0; // ∫₀¹ 1 dt
+        for h in 1..=self.circle_harmonics {
+            let omega = two_pi * (h as f64);
+            let w4 = omega.powi(4);
+            let s_idx = 2 * h - 1;
+            let c_idx = 2 * h;
+            // ∫₀¹ sin² = ∫₀¹ cos² = ½.
+            gc[[s_idx, s_idx]] = 0.5;
+            gc[[c_idx, c_idx]] = 0.5;
+            // Second derivative scales the mode by (2πh)²; squared·integrated.
+            sc[[s_idx, s_idx]] = w4 * 0.5;
+            sc[[c_idx, c_idx]] = w4 * 0.5;
+        }
+
+        // Line value Gram Gl and second-derivative Gram Sl on the canonical
+        // interval [0,1).
+        let mut gl = Array2::<f64>::zeros((ml, ml));
+        let mut sl = Array2::<f64>::zeros((ml, ml));
+        for i in 0..ml {
+            for j in 0..ml {
+                // Gl[i,j] = ∫₀¹ t^{i+j} dt = 1/(i+j+1).
+                gl[[i, j]] = 1.0 / ((i + j + 1) as f64);
+                // Sl[i,j] = ∫₀¹ (i(i-1) t^{i-2})(j(j-1) t^{j-2}) dt.
+                if i >= 2 && j >= 2 {
+                    let ci = (i * (i - 1)) as f64;
+                    let cj = (j * (j - 1)) as f64;
+                    let exp = (i - 2) + (j - 2);
+                    sl[[i, j]] = ci * cj / ((exp + 1) as f64);
+                }
+            }
+        }
+
+        // S = Sc ⊗ Gl + Gc ⊗ Sl in lexicographic (circle-slow, line-fast) order.
+        let m = mc * ml;
+        let mut s = Array2::<f64>::zeros((m, m));
+        for ca in 0..mc {
+            for la in 0..ml {
+                let row = ca * ml + la;
+                for cb in 0..mc {
+                    for lb in 0..ml {
+                        let col = cb * ml + lb;
+                        s[[row, col]] = sc[[ca, cb]] * gl[[la, lb]] + gc[[ca, cb]] * sl[[la, lb]];
+                    }
+                }
+            }
+        }
+        s
+    }
+
+    fn check_coords(&self, coords: ArrayView2<'_, f64>, what: &str) -> Result<(), String> {
+        if coords.ncols() != 2 {
+            return Err(format!(
+                "CylinderHarmonicEvaluator::{what}: expected latent_dim == 2 (S¹ × ℝ), got {}",
+                coords.ncols()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl SaeBasisEvaluator for CylinderHarmonicEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        let expected = self.basis_size();
+        if n_basis != expected {
+            return Err(format!(
+                "CylinderHarmonicEvaluator::phi_eta_split: n_basis {n_basis} != evaluator width {expected}"
+            ));
+        }
+        let ml = self.line_basis_size();
+        // A product column `[c, l]` is curved iff either factor carries
+        // curvature: the circle factor is curved on any harmonic above the
+        // first (`c > 2`, the 2nd-and-higher sin/cos), and the line factor is
+        // curved on any monomial of degree ≥ 2 (`l > 1`). The first-harmonic
+        // circle columns crossed with the affine line columns span the linear
+        // relaxation, matching the `eta`-homotopy split of the two parent
+        // evaluators.
+        let mut curved = vec![false; expected];
+        for c in 0..self.circle_basis_size() {
+            for l in 0..ml {
+                let circle_curved = c > 2;
+                let line_curved = l > 1;
+                curved[c * ml + l] = circle_curved || line_curved;
+            }
+        }
+        Ok(PhiEtaSplit::from_curved_mask(curved))
+    }
+
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        Some(<Self as SaeBasisThirdJet>::third_jet(self, coords))
+    }
+
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        self.check_coords(coords, "evaluate")?;
+        let n = coords.nrows();
+        let mc = self.circle_basis_size();
+        let ml = self.line_basis_size();
+        let m = mc * ml;
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jet = Array3::<f64>::zeros((n, m, 2));
+        for row in 0..n {
+            let t0 = coords[[row, 0]];
+            let t1 = coords[[row, 1]];
+            let circ = self.circle_tables(t0);
+            let line = self.line_tables(t1);
+            for c in 0..mc {
+                for l in 0..ml {
+                    let col = c * ml + l;
+                    // Value: c·l. ∂/∂t₀ = c'·l. ∂/∂t₁ = c·l'.
+                    phi[[row, col]] = circ[0][c] * line[0][l];
+                    jet[[row, col, 0]] = circ[1][c] * line[0][l];
+                    jet[[row, col, 1]] = circ[0][c] * line[1][l];
+                }
+            }
+        }
+        Ok((phi, jet))
+    }
+}
+
+impl SaeBasisSecondJet for CylinderHarmonicEvaluator {
+    /// Hessian of the cylinder product basis. With `Φ_{c,l} = c(t₀)·l(t₁)` and
+    /// the two factors on disjoint coordinates:
+    /// `∂²/∂t₀² = c''·l`, `∂²/∂t₁² = c·l''`, `∂²/∂t₀∂t₁ = c'·l'`.
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
+        self.check_coords(coords, "second_jet")?;
+        let n = coords.nrows();
+        let mc = self.circle_basis_size();
+        let ml = self.line_basis_size();
+        let m = mc * ml;
+        let mut h = Array4::<f64>::zeros((n, m, 2, 2));
+        for row in 0..n {
+            let t0 = coords[[row, 0]];
+            let t1 = coords[[row, 1]];
+            let circ = self.circle_tables(t0);
+            let line = self.line_tables(t1);
+            for c in 0..mc {
+                for l in 0..ml {
+                    let col = c * ml + l;
+                    h[[row, col, 0, 0]] = circ[2][c] * line[0][l];
+                    h[[row, col, 1, 1]] = circ[0][c] * line[2][l];
+                    let mixed = circ[1][c] * line[1][l];
+                    h[[row, col, 0, 1]] = mixed;
+                    h[[row, col, 1, 0]] = mixed;
+                }
+            }
+        }
+        Ok(h)
+    }
+}
+
+impl SaeBasisThirdJet for CylinderHarmonicEvaluator {
+    /// Third derivative of the cylinder product basis. The number of axis-0
+    /// derivative operators `k₀` (and axis-1 `k₁ = 3 − k₀`) in a cell `(a,b,e)`
+    /// routes that many derivatives to the circle factor and the rest to the
+    /// line factor: `∂³Φ = c^{(k₀)}(t₀) · l^{(k₁)}(t₁)`. This is the order-3
+    /// sibling of [`SaeBasisSecondJet::second_jet`].
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String> {
+        self.check_coords(coords, "third_jet")?;
+        let n = coords.nrows();
+        let mc = self.circle_basis_size();
+        let ml = self.line_basis_size();
+        let m = mc * ml;
+        let mut t3 = Array5::<f64>::zeros((n, m, 2, 2, 2));
+        for row in 0..n {
+            let t0 = coords[[row, 0]];
+            let t1 = coords[[row, 1]];
+            let circ = self.circle_tables(t0);
+            let line = self.line_tables(t1);
+            for c in 0..mc {
+                for l in 0..ml {
+                    let col = c * ml + l;
+                    for a in 0..2 {
+                        for b in 0..2 {
+                            for e in 0..2 {
+                                // k0 = number of axis-0 operators among (a,b,e).
+                                let k0 = (a == 0) as usize + (b == 0) as usize + (e == 0) as usize;
+                                let k1 = 3 - k0;
+                                t3[[row, col, a, b, e]] = circ[k0][c] * line[k1][l];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(t3)
+    }
+}
+
 /// Rank-revealing subspace reparametrization of an inner basis evaluator.
 ///
 /// Issue #1117: a decoder basis (e.g. [`PeriodicHarmonicEvaluator`]) emits a

@@ -1645,6 +1645,3 @@ impl CustomFamilyGenerative for BinomialMeanWiggleFamily {
         })
     }
 }
-
-/// Built-in Poisson log-link family (single parameter block).
-#[derive(Clone)]

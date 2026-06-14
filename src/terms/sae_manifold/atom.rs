@@ -12,6 +12,14 @@ pub enum SaeAtomBasisKind {
     Periodic,
     Sphere,
     Torus,
+    /// Cylinder `S¹ × ℝ` (`d = 2`): a periodic circle axis tensored with a flat
+    /// (Duchon-polynomial) line axis, via [`CylinderHarmonicEvaluator`]. Axis 0
+    /// is the circle (fraction-of-period convention, wrapped modulo `1.0`),
+    /// axis 1 is the unbounded line (`Euclidean`). Completes the `d = 2`
+    /// topology race (torus vs sphere vs euclidean-patch vs cylinder) so a
+    /// periodic-times-linear feature is adjudicable on its true manifold instead
+    /// of being forced into a torus or flat-patch stand-in.
+    Cylinder,
     EuclideanPatch,
     /// Hyperbolic (Poincaré-ball) tangent patch at unit curvature `c = −1`.
     ///
@@ -84,6 +92,14 @@ impl SaeAtomBasisKind {
                     )
                 }
             }
+            // `Cylinder` is `S¹ × ℝ`: axis 0 is the circle (fraction-of-period
+            // convention, shared with `Periodic`/`Torus`, wrapped modulo `1.0`)
+            // and axis 1 is the unbounded line (`Euclidean`). The product
+            // latent manifold composes the two retractions blockwise.
+            Self::Cylinder => LatentManifold::Product(vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Euclidean,
+            ]),
             // Poincaré tangent patch: the latent `t` is a tangent vector at the
             // ball origin, optimised in the unconstrained tangent chart (the
             // hyperbolic geometry enters through the penalty, not a constrained
@@ -107,6 +123,14 @@ impl SaeAtomBasisKind {
             Self::Sphere if latent_dim == 2 => sphere_projection_seed_grid(resolution),
             Self::Sphere => None,
             Self::Torus => torus_projection_seed_grid(latent_dim, resolution),
+            // `Cylinder` (`S¹ × ℝ`) has one compact (circle) axis that wraps and
+            // one unbounded (line) axis whose PCA seed already lies in the
+            // convex hull. A robust fixed-decoder projection therefore only
+            // needs to sweep the *periodic* axis (the line axis is left at its
+            // hull-centered seed `0`); a pure line offset is recovered by the
+            // unconstrained Newton step.
+            Self::Cylinder if latent_dim == 2 => cylinder_projection_seed_grid(resolution),
+            Self::Cylinder => None,
             // The tangent latent of a Poincaré patch lies in the convex hull of
             // its PCA seed exactly like the Euclidean patch, so no compact
             // projection grid is needed.
@@ -126,6 +150,19 @@ fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
             grid[[i * r + j, 0]] = lat;
             grid[[i * r + j, 1]] = lon;
         }
+    }
+    Some(grid)
+}
+
+fn cylinder_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
+    // Sweep the periodic (circle) axis over one period in fraction-of-period
+    // coordinates `[0, 1)`; hold the unbounded line axis at the hull-centered
+    // seed `0`. The Newton retraction recovers any line offset from there.
+    let r = resolution.max(2);
+    let mut grid = Array2::<f64>::zeros((r, 2));
+    for i in 0..r {
+        grid[[i, 0]] = i as f64 / r as f64;
+        grid[[i, 1]] = 0.0;
     }
     Some(grid)
 }

@@ -829,9 +829,3 @@ pub fn directionalworking_curvature_from_c_array(
     }
     DirectionalWorkingCurvature::Diagonal(w_direction)
 }
-
-
-/// Floor/ceiling for binomial mu before taking `ln(mu)` / `ln(1 - mu)`.
-/// Matches the precedent in families/lognormal_kernel.rs (1e-12) so that
-/// saturating inverse links (probit, cloglog, logit at large |eta|) cannot
-/// produce -inf in the deviance or log-likelihood reductions.

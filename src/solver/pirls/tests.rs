@@ -1,3 +1,11 @@
+//! P-IRLS regression and root-cause tests.
+//!
+//! The nested `#[cfg(test)] mod`s below address the rest of the solver through
+//! `super::`, which now resolves to this module; the re-imports here forward the
+//! sibling concern modules and the shared item surface so those paths keep
+//! pointing at the same definitions they did when this file was inlined.
+
+pub(crate) use super::*;
 
 #[cfg(test)]
 mod tests {
@@ -3204,7 +3212,3 @@ mod root_cause_tests {
         );
     }
 }
-
-
-/// Allow up to 128MB per thread for cached L-BFGS/PIRLS history
-pub(crate) const PIRLS_CACHE_BYTE_BUDGET: usize = 128 * 1024 * 1024;

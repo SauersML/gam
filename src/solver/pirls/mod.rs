@@ -101,3 +101,6 @@ use loop_driver::assert_symmetric_tol;
 pub(crate) use loop_driver::fit_model_for_fixed_rho_with_adaptive_kkt;
 
 pub use loop_driver::{PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho};
+
+/// Allow up to 128MB per thread for cached L-BFGS/PIRLS history.
+pub(crate) const PIRLS_CACHE_BYTE_BUDGET: usize = 128 * 1024 * 1024;

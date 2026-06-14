@@ -1766,9 +1766,3 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
         })
     }
 }
-
-/// One channel of a `RowCoeffOperator`: a row-major `Arc<Array2<f64>>`
-/// design matrix indexed by row coefficient pairs. Channels with the same
-/// `block` value contribute their `X^T r` outputs into the same coefficient
-/// block of the joint vector (e.g. wiggle's basis B and basis_d1 are two
-/// channels that both contribute to the wiggle output block).

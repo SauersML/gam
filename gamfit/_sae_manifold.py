@@ -440,8 +440,13 @@ def _atom_functional_evidence(
     if average_value is not None:
         out["average_value"] = average_value
     if average_derivative is not None:
+        # The conditional-on-fit average derivative E_data[∂g/∂t] of the fitted
+        # decoder curve. Deliberately NOT aliased as "marginal_slope": the latent
+        # coordinate is a fitted, generated regressor, so this is a descriptive
+        # variation of the fitted curve, not a population marginal slope (the
+        # same #1097/#1115 honesty correction the native Rust report makes by
+        # naming the field `decoder_variation_norm`, never `marginal_slope`).
         out["average_derivative"] = average_derivative
-        out["marginal_slope"] = dict(average_derivative)
     if peak_contrast is not None:
         out["peak_contrast"] = peak_contrast
     return out if len(out) > 1 else None
@@ -493,7 +498,9 @@ class SaeManifoldAtomFit:
         Optional per-atom decoder functional evidence. Native Rust/Riesz
         payloads are passed through as-is; otherwise fresh fits may populate a
         conservative plugin block from decoder covariance with
-        ``marginal_slope``, ``average_derivative``, and ``peak_contrast``.
+        ``average_value``, ``average_derivative`` (the conditional-on-fit mean
+        decoder derivative — NOT a population marginal slope; the latent
+        coordinate is a generated regressor), and ``peak_contrast``.
     """
 
     basis: str

@@ -879,6 +879,3 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
 // This function unifies all per-link hardcoded c/d computations: given the
 // inverse-link jet (h₁…h₄) and the variance-function jet (V…V₃), it returns
 // (w_obs, c_obs, d_obs) without any family- or link-specific dispatch.
-
-/// Variance-function jet evaluated at μ: V(μ), V'(μ), V''(μ), V'''(μ), V''''(μ).
-#[derive(Clone, Copy, Debug)]

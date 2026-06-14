@@ -608,8 +608,3 @@ pub(crate) fn binomial_location_scalesecond_directional_coefficients(
     }
     Ok((coeff_tt, coeff_tl, coeff_ll))
 }
-
-/// Built-in Gaussian location-scale family:
-/// - Block 0: location μ(·) with identity link
-/// - Block 1: log-scale log σ(·) with log link
-

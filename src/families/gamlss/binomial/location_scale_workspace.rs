@@ -360,11 +360,3 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         )?)))
     }
 }
-
-/// Built-in binomial location-scale family with a configurable inverse link and learnable wiggle on q.
-///
-/// Block structure:
-/// - Block 0: threshold T(covariates)
-/// - Block 1: log sigma(covariates)
-/// - Block 2: wiggle(q) represented by B-spline coefficients on q
-#[derive(Clone)]

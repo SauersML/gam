@@ -2944,5 +2944,3 @@ pub(crate) fn expect_single_block<'a>(
     }
     Ok(&block_states[0])
 }
-
-#[derive(Clone)]

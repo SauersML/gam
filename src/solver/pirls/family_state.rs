@@ -596,7 +596,3 @@ fn write_beta_logit_working_state(
     }
     Ok(())
 }
-
-
-/// Zero-allocation update of GLM working vectors using pre-allocated buffers.
-#[inline]

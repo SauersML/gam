@@ -2971,21 +2971,3 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
         })
     }
 }
-
-/// Matrix-free joint-Hessian operator for the two-block binomial
-/// location-scale family.
-///
-/// The dense joint Hessian is `H = [[X_t^T D_tt X_t, X_t^T D_tl X_ls],
-///                                  [X_ls^T D_tl X_t, X_ls^T D_ll X_ls]]`
-/// where `D_tt`, `D_tl`, `D_ll` are diagonal weight vectors derived from the
-/// rowwise scalar-composition Hessian. For a flattened direction
-/// `v = (v_t, v_ls)`, `H v` is computed as
-///
-///   u_t = X_t v_t,  u_ls = X_ls v_ls,
-///   r_t = D_tt .* u_t + D_tl .* u_ls,
-///   r_ls = D_tl .* u_t + D_ll .* u_ls,
-///   H v = (X_t^T r_t, X_ls^T r_ls).
-///
-/// Cost is Θ(n (p_t + p_ls)) per matvec versus Θ(n (p_t + p_ls)^2) to form
-/// the dense matrix. The same block-operator structure is used for first and
-/// second directional derivatives.
