@@ -578,10 +578,39 @@ const BIRTH_SEED_LOGIT: f64 = -4.0;
 
 /// Append a fresh atom whose decoder is seeded from a residual-factor direction.
 /// The new atom reuses the structural basis of atom 0 (same basis kind, latent
-/// dim, basis values + jacobian + smooth penalty) so the dictionary stays
-/// homogeneous; only its decoder coefficients carry the residual-factor
-/// direction. Routed at a small neutral mass on every row so the refit grows it
-/// if it is real and the death channel demotes it next round if it is not.
+/// dim, basis values + jacobian + smooth penalty) as its BIRTH TEMPLATE — warm
+/// inheritance by construction, so the engine's warm-state contract holds and
+/// the joint refit starts from a live basis rather than a cold curved family.
+/// Only its decoder coefficients carry the residual-factor direction. Routed at
+/// a small neutral mass on every row so the refit grows it if it is real and the
+/// death channel demotes it next round if it is not.
+///
+/// # Topology adjudication (#977)
+///
+/// The template basis is the atom's INITIAL parameterization, not its final
+/// topology. A born atom's topology is adjudicated by EVIDENCE downstream, on
+/// the discovered dictionary, at two rungs:
+///
+/// * **Existence** — the #984 held-out e-value birth gate (run inside
+///   [`crate::solver::structure_search::search`]) decides whether the atom is
+///   born at all. Only a residual factor whose held-out reconstruction
+///   likelihood-ratio crosses the Ville threshold earns an atom; the rest stay
+///   contested in the [`SearchLedger`].
+/// * **Curved (`d ≥ 1`) vs straight / cluster (`d = 0`)** — the #1026
+///   hybrid-split pass ([`SaeManifoldTerm::compute_hybrid_split_report`], run
+///   post-search over the FULL discovered dictionary) adjudicates every eligible
+///   `d = 1` atom's fitted curved image against its straight (linear
+///   special-case) secant on the common rank-aware Laplace evidence scale, and
+///   records the verdict. A born atom whose curvature does not pay collapses to
+///   the linear / cluster lane; one that earns it keeps its curved image. The
+///   dictionary is therefore genuinely heterogeneous (curved + linear atoms),
+///   not all-circle, with the per-atom verdict surfaced on the fit payload.
+///
+/// A full per-atom topology race (circle vs line vs torus vs sphere vs euclidean
+/// by `reml_score`) at birth would require refitting each candidate basis under
+/// the gate and is deferred; the existence gate + the curved-vs-linear rung
+/// above are the adjudicated minimum that makes the discovered dictionary
+/// heterogeneous and honest.
 fn born_atom(
     term: &SaeManifoldTerm,
     rho: &SaeManifoldRho,
@@ -1104,6 +1133,102 @@ mod tests {
         // residuals for the birth channel.
         let fitted = term.try_fitted().unwrap();
         -&fitted
+    }
+
+    /// #977 discovery oracle: with the production birth budget enabled, a fit
+    /// whose residuals carry an unexplained factor direction (a structure the
+    /// current dictionary does not express) HARVESTS a birth proposal — the
+    /// candidate atom whose held-out e-value the gate then adjudicates. This is
+    /// the proposal channel the production site re-enabled (`max_births > 0`);
+    /// without it K could never grow.
+    #[test]
+    fn residual_bearing_fit_harvests_birth_proposal() {
+        // A single circle atom routed on every row; its fitted reconstruction
+        // leaves a structured residual (R = −fitted has rank > 1 across the p=4
+        // output channels), so the whitened residual-factor subspace is
+        // non-empty and the birth channel mines a candidate direction.
+        let n = 40usize;
+        let active: Vec<Vec<bool>> = (0..n).map(|_| vec![true]).collect();
+        let (term, rho) = planted_term(&active);
+        // Inject a clear shared-direction (rank-1) factor into the residuals that
+        // varies smoothly with the per-row activity coordinate, so the whitened
+        // residual-factor evidence ladder selects rank ≥ 1: every row gets a
+        // multiple of the same unit output direction `u`, scaled by a per-row
+        // amplitude. This is the unexplained shared structure a born atom would
+        // absorb.
+        let p = term.output_dim();
+        let mut residuals = Array2::<f64>::zeros((n, p));
+        let u = [0.6_f64, -0.4, 0.5, -0.3];
+        for row in 0..n {
+            // A non-constant per-row amplitude so the factor is genuine shared
+            // structure (not absorbed by the diagonal noise floor).
+            let amp = 1.0 + (row as f64) / (n as f64);
+            for c in 0..p {
+                residuals[[row, c]] = amp * u[c % u.len()];
+            }
+        }
+        let params = HarvestParams {
+            max_fusions: 0,
+            max_fissions: 0,
+            // The production-enabled budget (births > 0) — the whole point of
+            // #977: K can grow.
+            max_births: 2,
+        };
+        let report = harvest_move_proposals(&term, &rho, residuals.view(), &params).unwrap();
+        let births: usize = report
+            .proposals
+            .iter()
+            .filter(|p| matches!(p.mv, StructureMove::Birth { .. }))
+            .count();
+        assert!(
+            births >= 1,
+            "a residual-bearing fit with births enabled must harvest at least \
+             one birth proposal (so K can be discovered); got {:?}",
+            report.proposals.iter().map(|p| &p.mv).collect::<Vec<_>>()
+        );
+        assert!(
+            report.births_proposed >= 1,
+            "births_proposed must count the harvested births; got {}",
+            report.births_proposed
+        );
+        assert!(
+            report.birth_skipped_reason.is_none(),
+            "the birth channel must run (no skip) on a non-degenerate residual; got {:?}",
+            report.birth_skipped_reason
+        );
+    }
+
+    /// #977 NULL oracle: a target the dictionary reconstructs exactly leaves
+    /// ZERO residual, so the birth channel finds no factor subspace and proposes
+    /// no birth — nothing is born under the null. (The round driver's e-gate is
+    /// the second line of defense; this asserts the harvest itself does not
+    /// manufacture growth where there is no unexplained structure.)
+    #[test]
+    fn fully_reconstructed_null_harvests_no_birth() {
+        let n = 40usize;
+        let active: Vec<Vec<bool>> = (0..n).map(|_| vec![true]).collect();
+        let (term, rho) = planted_term(&active);
+        // Residual ≡ 0: the dictionary reconstructs the target exactly, so there
+        // is no unexplained factor to mine.
+        let p = term.output_dim();
+        let zero_residual = Array2::<f64>::zeros((n, p));
+        let params = HarvestParams {
+            max_fusions: 0,
+            max_fissions: 0,
+            max_births: 2,
+        };
+        let report =
+            harvest_move_proposals(&term, &rho, zero_residual.view(), &params).unwrap();
+        let births: usize = report
+            .proposals
+            .iter()
+            .filter(|p| matches!(p.mv, StructureMove::Birth { .. }))
+            .count();
+        assert_eq!(
+            births, 0,
+            "a fully-reconstructed (zero-residual) null must harvest no birth \
+             proposal; got {births} births"
+        );
     }
 
     /// Oracle (#997 trigger): a planted SHATTER — two atoms with identical
