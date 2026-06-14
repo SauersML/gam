@@ -5097,7 +5097,7 @@ mod tests {
             //    parallelisation pattern (ROW_CHUNK_SIZE-row chunks,
             //    try_fold + try_reduce). The per-chunk worker calls the
             //    single-threaded oracle on its row slice.
-            pub(crate) const CHUNK_ROWS: usize = 4096;
+            const CHUNK_ROWS: usize = 4096;
             let cpu_hvp_parallel = || -> Vec<f64> {
                 let nchunks = n.div_ceil(CHUNK_ROWS);
                 (0..nchunks)
@@ -5312,7 +5312,7 @@ mod tests {
 
             // CPU side: chunked Rayon dense build over rows. Each chunk
             // builds a `[p_total, p_total]` partial then we reduce-add.
-            pub(crate) const CHUNK_ROWS: usize = 2048;
+            const CHUNK_ROWS: usize = 2048;
             let h_block_start = block.h.as_ref().map(|r| r.start).unwrap_or(0);
             let h_block_len = block.h.as_ref().map(|r| r.len()).unwrap_or(0);
             let w_block_start = block.w.as_ref().map(|r| r.start).unwrap_or(0);

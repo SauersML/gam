@@ -6,7 +6,7 @@ use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
 /// Coordinate frame for PIRLS inner iteration.
-pub(super) enum WorkingCoordinateDesign {
+pub(crate) enum WorkingCoordinateDesign {
     OriginalSparseNative,
     TransformedExplicit {
         x_transformed: DesignMatrix,
@@ -18,7 +18,7 @@ pub(super) enum WorkingCoordinateDesign {
 }
 
 #[derive(Clone)]
-pub(super) enum WorkingReparamTransform {
+pub(crate) enum WorkingReparamTransform {
     Dense(Arc<Array2<f64>>),
     Kronecker(Arc<KroneckerQsTransform>),
 }
@@ -57,7 +57,7 @@ impl WorkingReparamTransform {
 }
 
 #[derive(Clone)]
-pub(super) enum PirlsPenalty {
+pub(crate) enum PirlsPenalty {
     Dense {
         s_transformed: Array2<f64>,
         e_transformed: Array2<f64>,
@@ -306,7 +306,7 @@ pub(super) mod kron_apply_scratch {
     use std::cell::RefCell;
 
     thread_local! {
-        pub(crate) static SCRATCH: RefCell<Pair> = const { RefCell::new(Pair::new()) };
+        static SCRATCH: RefCell<Pair> = const { RefCell::new(Pair::new()) };
     }
 
     pub(super) struct Pair {

@@ -386,7 +386,7 @@ trait LocationScaleWorkflowAdapter {
 /// Shared wiggle-pilot workflow for Gaussian and binomial location-scale models
 /// (#430). The single source of truth for the policy; families differ only via
 /// their [`LocationScaleWorkflowAdapter`].
-pub(crate) fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
+fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
     request: A::Request<'_>,
 ) -> Result<A::Result, String> {
     let LocationScaleWorkflowParts {

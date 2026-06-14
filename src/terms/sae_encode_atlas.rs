@@ -1360,7 +1360,7 @@ impl EncodeAtlas {
         let rows: Vec<(Array1<f64>, bool)> =
             if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
                 use rayon::prelude::*;
-                pub(crate) const CHUNK: usize = 256;
+                const CHUNK: usize = 256;
                 let n_chunks = n.div_ceil(CHUNK);
                 let chunked: Vec<Vec<(Array1<f64>, bool)>> = (0..n_chunks)
                     .into_par_iter()
@@ -1427,7 +1427,7 @@ impl EncodeAtlas {
         let rows: Vec<(Array1<f64>, bool)> =
             if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
                 use rayon::prelude::*;
-                pub(crate) const CHUNK: usize = 256;
+                const CHUNK: usize = 256;
                 let n_chunks = n.div_ceil(CHUNK);
                 let chunked: Vec<Vec<(Array1<f64>, bool)>> = (0..n_chunks)
                     .into_par_iter()
@@ -1531,7 +1531,7 @@ impl EncodeAtlas {
         let rows: Vec<Option<(Array1<f64>, bool)>> =
             if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
                 use rayon::prelude::*;
-                pub(crate) const CHUNK: usize = 256;
+                const CHUNK: usize = 256;
                 let n_chunks = n.div_ceil(CHUNK);
                 let chunked: Vec<Vec<Option<(Array1<f64>, bool)>>> = (0..n_chunks)
                     .into_par_iter()
@@ -1623,7 +1623,7 @@ impl EncodeAtlas {
         let rows: Vec<Option<(Array1<f64>, bool)>> =
             if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
                 use rayon::prelude::*;
-                pub(crate) const CHUNK: usize = 256;
+                const CHUNK: usize = 256;
                 let n_chunks = n.div_ceil(CHUNK);
                 let chunked: Vec<Vec<Option<(Array1<f64>, bool)>>> = (0..n_chunks)
                     .into_par_iter()

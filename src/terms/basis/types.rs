@@ -5,7 +5,7 @@ use super::*;
 /// storage whose mutable borrow is held until all worker threads finish; callers
 /// may only dereference offsets that are in-bounds and disjoint across workers.
 #[derive(Clone, Copy)]
-pub(crate) struct SendPtr(*mut f64);
+pub(crate) struct SendPtr(pub(crate) *mut f64);
 
 // SAFETY: SendPtr only grants raw-pointer transport. Actual dereferences occur
 // at call sites after row-chunk partitioning proves each thread writes a
@@ -545,22 +545,22 @@ pub enum CenterStrategyKind {
 /// * `n` - sample size (number of observations)
 /// * `d` - covariate dimensionality (number of input variables in the smooth)
 pub fn default_num_centers(n: usize, d: usize) -> usize {
-    pub(crate) const K_MIN: usize = 200;
-    pub(crate) const K_MAX: usize = 2000;
-    pub(crate) const ALPHA: f64 = 0.4;
-    pub(crate) const C: f64 = 8.0;
+    const K_MIN: usize = 200;
+    const K_MAX: usize = 2000;
+    const ALPHA: f64 = 0.4;
+    const C: f64 = 8.0;
     /// Per-extra-dimension growth in the center count: each covariate axis
     /// beyond the first widens the basis by 15% to keep the per-axis mesh
     /// density roughly constant as the smooth's domain dimensionality grows.
-    pub(crate) const PER_DIM_GROWTH: f64 = 0.15;
+    const PER_DIM_GROWTH: f64 = 0.15;
     /// Divisor for the data-proportional floor: the `K_MIN` floor only engages
     /// once `n` exceeds `K_MIN * FLOOR_N_DIVISOR`, so small samples are not
     /// forced up to a dense `K_MIN`-column design.
-    pub(crate) const FLOOR_N_DIVISOR: usize = 8;
+    const FLOOR_N_DIVISOR: usize = 8;
     /// Divisor for the conditioning cap: the center count never exceeds `n /
     /// COND_N_DIVISOR`, keeping the penalty matrices well-conditioned relative
     /// to the data.
-    pub(crate) const COND_N_DIVISOR: usize = 4;
+    const COND_N_DIVISOR: usize = 4;
 
     let d_factor = 1.0 + PER_DIM_GROWTH * (d.max(1) - 1) as f64;
     let raw = (C * d_factor * (n as f64).powf(ALPHA)).ceil() as usize;
@@ -591,7 +591,7 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
 /// default (mgcv's `k = 10` for a 1-D `s()`), grown gently with dimensionality
 /// and never exceeding the generous primary-predictor default.
 pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
-    pub(crate) const BASE_1D_CENTERS: usize = 10;
+    const BASE_1D_CENTERS: usize = 10;
     let modest = BASE_1D_CENTERS.saturating_mul(d.max(1));
     default_num_centers(n, d).min(modest).max(1)
 }
@@ -812,7 +812,7 @@ pub fn center_strategy_with_num_centers(
     num_centers: usize,
 ) -> Result<CenterStrategy, BasisError> {
     validate_center_count(num_centers)?;
-    pub(crate) fn rebuild_inner(
+    fn rebuild_inner(
         strategy: &CenterStrategy,
         num_centers: usize,
     ) -> Result<CenterStrategy, BasisError> {
@@ -1198,7 +1198,7 @@ impl DuchonOperatorPenaltySpec {
         // Tolerance so an exact half-integer Sobolev order (e.g. m = 1.0 for
         // ν=1/2, d=1) reliably DISABLES the matching-order operator instead
         // of flipping on a float-equality knife-edge.
-        pub(crate) const ORDER_EPS: f64 = 1e-9;
+        const ORDER_EPS: f64 = 1e-9;
         let active = || OperatorPenaltySpec::Active {
             initial_log_lambda: 0.0,
             prior: None,

@@ -1,5 +1,3 @@
-use super::*;
-
 /// Decay law for deterministic Gumbel/concrete assignment temperature.
 #[derive(Debug, Clone)]
 pub enum ScheduleKind {

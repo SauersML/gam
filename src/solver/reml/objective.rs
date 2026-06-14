@@ -205,7 +205,7 @@ impl<'a> RemlState<'a> {
                 }
             }
 
-            pub(crate) const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
+            const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
             // Hot diagnostics walk the Hessian eigenspectrum and emit
             // ill-conditioning warnings. They are only meaningful for fully
             // converged inner modes — partial fits accepted from seed

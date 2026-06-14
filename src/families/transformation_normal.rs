@@ -91,19 +91,16 @@ mod scop_density;
 mod scop_psi;
 mod warm_start;
 
-pub use config::*;
-pub(crate) use custom_family::*;
-pub use error::*;
-pub use family::*;
-pub use fit::*;
+pub(crate) use config::*;
+pub(crate) use error::*;
+pub(crate) use family::*;
+pub(crate) use fit::*;
 pub(crate) use kronecker_design::*;
 pub(crate) use operators::*;
 pub(crate) use penalty_scaling::*;
-pub use psi_operator::*;
+pub(crate) use psi_operator::*;
 pub(crate) use response_basis::*;
-pub(crate) use scop_curvature::*;
 pub(crate) use scop_density::*;
-pub(crate) use scop_psi::*;
 pub(crate) use warm_start::*;
 
 #[cfg(test)]

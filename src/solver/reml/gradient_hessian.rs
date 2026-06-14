@@ -1841,7 +1841,7 @@ impl<'a> RemlState<'a> {
             // Smallest eigenvalue at or below this floor means the effective
             // Hessian failed positive-definiteness (Cholesky already declined),
             // so the Tierney–Kadane Laplace correction is undefined here.
-            pub(crate) const TK_HESSIAN_PD_EIGENVALUE_FLOOR: f64 = 1e-12;
+            const TK_HESSIAN_PD_EIGENVALUE_FLOOR: f64 = 1e-12;
             if let Some((idx, ev)) = evals
                 .iter()
                 .enumerate()
@@ -3920,9 +3920,9 @@ impl<'a> RemlState<'a> {
             // side of each bound, and probe the barrier curvature at unit β
             // magnitude against a 5%-of-curvature significance threshold. These
             // only shape the emitted trace line, not the fit.
-            pub(crate) const DIAGNOSTIC_BOUND_SLACK: f64 = 0.01;
-            pub(crate) const DIAGNOSTIC_BETA_MAGNITUDE: f64 = 1.0;
-            pub(crate) const DIAGNOSTIC_CURVATURE_REL_THRESHOLD: f64 = 0.05;
+            const DIAGNOSTIC_BOUND_SLACK: f64 = 0.01;
+            const DIAGNOSTIC_BETA_MAGNITUDE: f64 = 1.0;
+            const DIAGNOSTIC_CURVATURE_REL_THRESHOLD: f64 = 0.05;
             let max_idx = config
                 .constrained_indices
                 .iter()

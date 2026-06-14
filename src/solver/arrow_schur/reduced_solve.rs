@@ -806,7 +806,7 @@ pub(crate) fn schur_matvec<B: BatchedBlockSolver + Sync>(
     let p = resident.map(|r| r.p).unwrap_or(0);
     if parallel {
         use rayon::prelude::*;
-        pub(crate) const CHUNK: usize = 64;
+        const CHUNK: usize = 64;
         let n = sys.rows.len();
         let partials: Vec<Array1<f64>> = (0..n)
             .into_par_iter()

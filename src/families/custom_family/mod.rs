@@ -87,19 +87,20 @@ mod persistent_cache;
 
 // `pub use ...::*` preserves each item's own visibility (pub stays pub,
 // pub(crate) stays pub(crate)) so the prior flat-namespace API is unchanged.
-pub(crate) use block_spec::*;
+pub use block_spec::*;
 pub(crate) use blockwise_solve::*;
 pub(crate) use covariance::*;
-pub(crate) use error::*;
-pub(crate) use family_trait::*;
-pub(crate) use fit::*;
+pub use coefficient_groups::*;
+pub use error::*;
+pub use family_trait::*;
+pub use fit::*;
 pub(crate) use jeffreys::*;
-pub(crate) use joint_newton::*;
-pub(crate) use options::*;
-pub(crate) use outer_objective::*;
-pub(crate) use penalty::*;
-pub(crate) use psi_design::*;
-pub(crate) use psi_hyper::*;
+pub use joint_newton::*;
+pub use options::*;
+pub use outer_objective::*;
+pub use penalty::*;
+pub use psi_design::*;
+pub use psi_hyper::*;
 
 #[cfg(test)]
 mod test_support;

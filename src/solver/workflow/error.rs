@@ -1,5 +1,3 @@
-use super::*;
-
 pub(crate) trait WorkflowCauseCountResult {
     fn into_workflow_result(self) -> Result<usize, String>;
 }

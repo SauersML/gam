@@ -452,7 +452,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // convergence events) keep the full detail. JOINT_LOG_VERBOSE_PERIOD is
         // tuned so a 200-cycle inner solve emits ~10 detailed waypoints plus
         // 1 compact line per remaining cycle (~210 lines), down from ~800.
-        pub(crate) const JOINT_LOG_VERBOSE_PERIOD: usize = 50;
+        const JOINT_LOG_VERBOSE_PERIOD: usize = 50;
         // Residual-stall detector for joint Newton. Distinct from the
         // blockwise loglik-frozen divergence detector lower in the file:
         // that one requires the log-likelihood to be unchanged for K
@@ -476,10 +476,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // the outer optimizer sees a non-converged signal while we still
         // have a finite, in-range β to return (instead of running to the
         // hard ceiling and then handing BFGS a junk gradient).
-        pub(crate) const RESIDUAL_STALL_NO_IMPROVE_CYCLES: usize = 30;
-        pub(crate) const RESIDUAL_STALL_MIN_CYCLES: usize = 40;
-        pub(crate) const RESIDUAL_STALL_IMPROVEMENT_FACTOR: f64 = 0.9;
-        pub(crate) const RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR: f64 = 50.0;
+        const RESIDUAL_STALL_NO_IMPROVE_CYCLES: usize = 30;
+        const RESIDUAL_STALL_MIN_CYCLES: usize = 40;
+        const RESIDUAL_STALL_IMPROVEMENT_FACTOR: f64 = 0.9;
+        const RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR: f64 = 50.0;
         let mut best_residual_seen: f64 = f64::INFINITY;
         // Smallest *certified* stationarity residual the solve actually computed,
         // tracked independently of `best_residual_seen` (whose updates are bound
@@ -523,7 +523,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // early (gam#787 duchon centers≥20: the logslope block converges
         // geometrically — residual ~0.33×/cycle — but `linearized_rel ≥ 0.5`
         // routed it into the plateau-refusal break a few cycles short of tol).
-        pub(crate) const RESIDUAL_DESCENT_WINDOW: usize = 3;
+        const RESIDUAL_DESCENT_WINDOW: usize = 3;
         let mut residual_descent_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(RESIDUAL_DESCENT_WINDOW);
         let mut tr_clamped_during_stall: bool = false;
@@ -553,7 +553,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // the max. After `FULLY_REJECTED_STALL_MAX_CYCLES` consecutive cycles
         // with both conditions, exit non-converged so the outer optimizer
         // rejects this ρ cleanly instead of waiting for the cycle cap.
-        pub(crate) const FULLY_REJECTED_STALL_MAX_CYCLES: usize = 8;
+        const FULLY_REJECTED_STALL_MAX_CYCLES: usize = 8;
         let mut prev_rejected_trust_radius: Option<f64> = None;
         let mut consecutive_held_rejected_cycles: usize = 0;
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
@@ -602,7 +602,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // earlier than waiting for any single |Δobj| to individually
         // cross obj_tol — the bound is mathematically the same precision
         // contract, applied to the asymptotic tail rather than one step.
-        pub(crate) const GEOMETRIC_TAIL_WINDOW: usize = 5;
+        const GEOMETRIC_TAIL_WINDOW: usize = 5;
         let mut geometric_tail_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(GEOMETRIC_TAIL_WINDOW);
 
@@ -1721,7 +1721,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // is not a descent direction for the penalized quadratic model,
             // switch once to a diagonally preconditioned gradient step and keep
             // the same exact full-objective accept/reject test.
-            pub(crate) const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
+            const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
             let mut search_delta = delta.clone();
             let search_joint_active_set: Option<Vec<usize>> = joint_active_set.clone();
             let mut tried_preconditioned_descent = false;

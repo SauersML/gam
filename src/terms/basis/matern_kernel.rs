@@ -1005,7 +1005,7 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
     }
     let metric_weights = centered_aniso_metric_weights(eta);
 
-    pub(crate) struct CenterRowAccumulator {
+    struct CenterRowAccumulator {
         pub(crate) k: usize,
         pub(crate) d0: Array1<f64>,
         pub(crate) d1: Array2<f64>,
@@ -1212,7 +1212,7 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
     // first/second derivatives + Frobenius norms.
     // We compute these once for axis 0 (the raw Gram S and norm c are the same
     // for all axes) and store them, then reuse c for cross-term normalization.
-    pub(crate) struct PerOperatorInfo {
+    struct PerOperatorInfo {
         pub(crate) s_raw: Array2<f64>,
         pub(crate) c: f64,
         pub(crate) s_first: Vec<Array2<f64>>, // per-axis first derivatives (normalized)
@@ -2363,7 +2363,7 @@ pub(crate) fn duchon_pure_closed_form_pair_block_cpd_adequate(
     if beta < 0.0 {
         return false;
     }
-    pub(crate) const LOG_EPS: f64 = 1e-12;
+    const LOG_EPS: f64 = 1e-12;
     let n_f = (beta / 2.0).round();
     let is_log_case =
         dimension.is_multiple_of(2) && n_f >= 0.0 && (n_f * 2.0 - beta).abs() < LOG_EPS;
@@ -3229,12 +3229,12 @@ pub fn build_matern_collocation_operator_matrices(
     let mut d1_raw = Array2::<f64>::zeros((p * d, p));
     let mut d2_raw = Array2::<f64>::zeros((p * d * d, p));
     let metric_weights = aniso_log_scales.map(centered_aniso_metric_weights);
-    pub(crate) const R_EPS: f64 = 1e-12;
+    const R_EPS: f64 = 1e-12;
     // Row blocks are independent: output rows [k] in d0, [k*d..(k+1)*d] in d1,
     // and [k*d*d..(k+1)*d*d] in d2 are disjoint for each collocation row k.
     // Keep small assemblies serial to avoid Rayon scheduling overhead.
-    pub(crate) const MATERN_COLLOCATION_PAR_WORK_THRESHOLD: usize = 32_768;
-    pub(crate) const MATERN_COLLOCATION_ROW_BLOCK: usize = 32;
+    const MATERN_COLLOCATION_PAR_WORK_THRESHOLD: usize = 32_768;
+    const MATERN_COLLOCATION_ROW_BLOCK: usize = 32;
     let assembly_work = p
         .saturating_mul(p)
         .saturating_mul(d.max(1))

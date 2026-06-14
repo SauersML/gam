@@ -32,7 +32,7 @@ mod traces;
 
 pub(crate) use dense::*;
 pub(crate) use kkt::*;
-pub use operator::*;
+pub(crate) use operator::*;
 pub(crate) use routing::*;
 pub(crate) use traces::*;
 

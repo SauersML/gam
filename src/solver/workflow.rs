@@ -150,6 +150,6 @@ mod materialize;
 
 pub use error::*;
 pub use request::*;
-pub use fit::*;
+pub(crate) use fit::*;
 pub use entry::*;
 pub use materialize::*;

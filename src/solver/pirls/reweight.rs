@@ -1077,9 +1077,9 @@ where
                 && options.coefficient_lower_bounds.is_none()
                 && options.arrow_schur.is_none()
             {
-                pub(crate) const GEODESIC_ACCEPT_ALPHA: f64 = 0.75;
+                const GEODESIC_ACCEPT_ALPHA: f64 = 0.75;
                 // 1e-4 is the Transtrum-Sethna default for double precision.
-                pub(crate) const GEODESIC_FD_H: f64 = 1.0e-4;
+                const GEODESIC_FD_H: f64 = 1.0e-4;
 
                 // Snapshot the standard-step direction; clone is cheap (p)
                 // relative to the two model.update calls below.
@@ -2249,7 +2249,7 @@ pub(super) mod test_support {
     //! production. The capture entry point lives next to the test that uses
     //! it.
     thread_local! {
-        pub static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
+        static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
             const { std::cell::RefCell::new(None) };
     }
 

@@ -229,9 +229,9 @@ pub trait OuterHessianOperator: Send + Sync {
 }
 
 pub(crate) struct RhoBlockAdditiveOuterHessian {
-    base: Arc<dyn OuterHessianOperator>,
-    rho_block: Array2<f64>,
-    dim: usize,
+    pub(crate) base: Arc<dyn OuterHessianOperator>,
+    pub(crate) rho_block: Array2<f64>,
+    pub(crate) dim: usize,
 }
 
 impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {

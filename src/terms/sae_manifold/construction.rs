@@ -2195,7 +2195,7 @@ impl SaeManifoldTerm {
         };
         let data_fit = if parallel {
             use rayon::prelude::*;
-            pub(crate) const CHUNK: usize = 32;
+            const CHUNK: usize = 32;
             let partials: Vec<Result<f64, String>> = (0..n)
                 .into_par_iter()
                 .chunks(CHUNK)
@@ -6313,7 +6313,11 @@ impl SaeManifoldTerm {
                     return 0.0;
                 }
                 let logit = self.assignment.logits[[row, diag_atom]];
-                if !jumprelu_in_optimization_band(logit, threshold, temperature) {
+                if !crate::terms::sae::assignment::jumprelu_in_optimization_band(
+                    logit,
+                    threshold,
+                    temperature,
+                ) {
                     return 0.0;
                 }
                 let inv_tau = 1.0 / temperature;

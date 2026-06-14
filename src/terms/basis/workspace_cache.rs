@@ -901,9 +901,9 @@ pub fn auto_streaming_chunk_size_for_dense(n_rows: usize, n_basis_cols: usize) -
     if n_rows == 0 || n_basis_cols == 0 {
         return None;
     }
-    pub(crate) const DENSE_THRESHOLD_BYTES: usize = 1024 * 1024 * 1024;
-    pub(crate) const TARGET_CHUNK_BYTES: usize = 256 * 1024 * 1024;
-    pub(crate) const MIN_CHUNK_ROWS: usize = 1024;
+    const DENSE_THRESHOLD_BYTES: usize = 1024 * 1024 * 1024;
+    const TARGET_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+    const MIN_CHUNK_ROWS: usize = 1024;
     let dense_bytes = n_rows.saturating_mul(n_basis_cols).saturating_mul(8);
     if dense_bytes <= DENSE_THRESHOLD_BYTES {
         return None;

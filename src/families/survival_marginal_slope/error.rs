@@ -2,6 +2,7 @@
 //! with their `Display`/`Error`/`From` conversions. Self-contained: no
 //! dependency on the fitting machinery.
 
+#[derive(Debug, Clone)]
 pub enum SurvivalMarginalSlopeError {
     /// Spec, data, or runtime configuration failed input validation
     /// (finite/non-negative weights, derivative_guard > 0, supported

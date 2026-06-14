@@ -1,8 +1,8 @@
 use super::*;
 
 pub(crate) struct OuterFirstOrderBridge<'a> {
-    obj: &'a mut dyn OuterObjective,
-    layout: OuterThetaLayout,
+    pub(crate) obj: &'a mut dyn OuterObjective,
+    pub(crate) layout: OuterThetaLayout,
     /// Outer-aware inner-PIRLS cap atomic. When `Some`, the bridge stores
     /// a coarsen-then-tighten cap into it on every accepted gradient eval
     /// (see `first_order_inner_cap_schedule`).
@@ -23,32 +23,32 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// surrogate is a different objective. So `eval_cost` UNCAPS the inner solve
     /// (stores `0` = full `pirls_config.max_iterations`) before delegating, and
     /// `eval_grad`/`eval_hessian` restore the scheduled cap on the next call.
-    outer_inner_cap: Option<InnerProgressFeedback>,
+    pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
     /// Counts gradient evaluations for logging only. Inner-PIRLS scheduling
     /// uses `InnerProgressFeedback.accepted_iter` so rejected line-search
     /// probes do not relax the inner work budget.
-    iter_count: usize,
+    pub(crate) iter_count: usize,
     /// First observed `‖g‖` from `eval_grad`. Used by the schedule to
     /// compute the gradient-ratio (`last / initial`) — when the ratio
     /// drops, the optimizer is approaching convergence and the inner
     /// cap should lift to full so the cached β is at full tolerance.
-    g_norm_initial: Option<f64>,
+    pub(crate) g_norm_initial: Option<f64>,
     /// `‖g‖` from the most recent eval. Stale by one outer iter relative
     /// to the cap that consumes it (the cap is set BEFORE the new eval),
     /// but for monotone-decreasing g_norm this is safe — it makes the
     /// cap conservatively LARGER than the truly-needed value, never
     /// smaller.
-    last_g_norm: Option<f64>,
+    pub(crate) last_g_norm: Option<f64>,
     /// Most recent derivative-evaluation point. Value-only line-search probes
     /// log their distance from this reference so hidden backtracking work is
     /// visible in STAGE traces.
-    last_value_grad_rho: Option<Array1<f64>>,
+    pub(crate) last_value_grad_rho: Option<Array1<f64>>,
     /// Exact memo for recent line-search value probes. BFGS can re-query the
     /// same rejected trial when switching Wolfe strategies; the SAE inner solve
     /// behind a Value probe is deterministic, so serving an identical rho from
     /// this memo preserves the objective while avoiding duplicate refinement
     /// work.
-    value_probe_cache: Vec<ValueProbeCacheEntry>,
+    pub(crate) value_probe_cache: Vec<ValueProbeCacheEntry>,
     /// Gradient-independent cost-stall convergence guard. `opt::Bfgs` only
     /// terminates on a small *projected gradient norm* (its stall exit ANDs
     /// gradient-smallness with cost-smallness), so on a fully-penalized
@@ -66,7 +66,7 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// classifies the run as *converged at the flat-valley floor* rather than
     /// non-converged — the remaining gradient lies along weakly-identified ρ
     /// directions that do not reduce the objective.
-    cost_stall: Option<CostStallGuard>,
+    pub(crate) cost_stall: Option<CostStallGuard>,
     /// Count of consecutive `eval_cost` calls that returned `Recoverable`
     /// without a single success in between. When every trial step in every
     /// search direction is infeasible (the inner solve refuses to converge at
@@ -83,7 +83,7 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// Reset to 0 on any successful cost evaluation so normal line-search
     /// noise (a few recoverable probes followed by an accepted step) never
     /// trips this guard.
-    consecutive_probe_refusals: usize,
+    pub(crate) consecutive_probe_refusals: usize,
 }
 
 pub(crate) const VALUE_PROBE_CACHE_CAPACITY: usize = 256;
@@ -826,21 +826,21 @@ pub(crate) fn first_order_inner_cap_schedule(
 mod inner_cap_schedule_tests;
 
 pub(crate) struct OuterSecondOrderBridge<'a> {
-    obj: &'a mut dyn OuterObjective,
-    layout: OuterThetaLayout,
-    hessian_source: HessianSource,
+    pub(crate) obj: &'a mut dyn OuterObjective,
+    pub(crate) layout: OuterThetaLayout,
+    pub(crate) hessian_source: HessianSource,
     /// When the evaluator returns `HessianResult::Operator(op)` and the
     /// operator advertises an exact dense route, the bridge may materialize the
     /// operator into a dense K×K matrix so the dense ARC path can run an exact
     /// factorization instead of operator-CG.
-    materialize_operator_max_dim: usize,
+    pub(crate) materialize_operator_max_dim: usize,
     /// Counts gradient/Hessian evaluations so that progress is visible even
     /// when the upstream `opt` solver does not emit per-iteration logs of its
     /// own. Emitted at INFO from `eval_grad` and `eval_hessian` (the calls
     /// that gate one optimizer step); skipped on `eval_cost` so linesearch
     /// trial points do not flood the log. Also drives the outer-aware
     /// inner-PIRLS cap schedule (see `first_order_inner_cap_schedule`).
-    eval_count: usize,
+    pub(crate) eval_count: usize,
     /// Outer-aware inner-PIRLS cap atomic. When `Some`, the bridge stores
     /// a coarsen-then-tighten cap into it on every accepted eval_grad /
     /// eval_hessian call. Mirrors the BFGS-side wiring in
@@ -848,18 +848,18 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     /// line-search probes within an outer iter see a stable inner
     /// tolerance (Wolfe / trust-region acceptance both assume constant
     /// cost noise within a bracket).
-    outer_inner_cap: Option<InnerProgressFeedback>,
+    pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
     /// First observed `‖g‖` from `eval_grad`/`eval_hessian`. Used by the
     /// schedule's gradient-ratio gate so the cap lifts when the optimizer
     /// is approaching convergence, not just when iter count says so.
-    g_norm_initial: Option<f64>,
+    pub(crate) g_norm_initial: Option<f64>,
     /// `‖g‖` from the most recent eval. See `OuterFirstOrderBridge` for
     /// the staleness rationale: monotone-decreasing g_norm means the cap
     /// is conservatively LARGER than truly needed, never smaller.
-    last_g_norm: Option<f64>,
+    pub(crate) last_g_norm: Option<f64>,
     /// Most recent derivative-evaluation point, used to log value-probe
     /// displacement in line-search / trial-acceptance STAGE traces.
-    last_value_grad_rho: Option<Array1<f64>>,
+    pub(crate) last_value_grad_rho: Option<Array1<f64>>,
 }
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
@@ -1134,7 +1134,7 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
 /// `accepted_iter` from the feedback channel instead of inferring
 /// it from raw eval counts.
 pub(crate) struct OuterAcceptObserver {
-    feedback: InnerProgressFeedback,
+    pub(crate) feedback: InnerProgressFeedback,
 }
 
 impl OptimizerObserver for OuterAcceptObserver {
@@ -1214,21 +1214,21 @@ pub(crate) fn hessian_result_to_value(hessian: HessianResult) -> HessianValue {
 /// route; the dense-Hessian / first-order routes still use
 /// `OuterSecondOrderBridge` / `OuterFirstOrderBridge`.
 pub(crate) struct OuterOperatorBridge<'a> {
-    obj: &'a mut dyn OuterObjective,
-    layout: OuterThetaLayout,
+    pub(crate) obj: &'a mut dyn OuterObjective,
+    pub(crate) layout: OuterThetaLayout,
     /// Inner-PIRLS cap atomic, mirroring the BFGS / ARC bridges.
-    outer_inner_cap: Option<InnerProgressFeedback>,
+    pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
     /// Counts gradient/Hessian evaluations for the inner-cap schedule
     /// and progress logs.
-    eval_count: usize,
+    pub(crate) eval_count: usize,
     /// First observed `‖g‖`. Used by the inner-cap schedule's
     /// gradient-ratio gate.
-    g_norm_initial: Option<f64>,
+    pub(crate) g_norm_initial: Option<f64>,
     /// `‖g‖` from the most recent eval.
-    last_g_norm: Option<f64>,
+    pub(crate) last_g_norm: Option<f64>,
     /// Most recent derivative-evaluation point, used to log value-probe
     /// displacement in line-search STAGE traces.
-    last_value_grad_rho: Option<Array1<f64>>,
+    pub(crate) last_value_grad_rho: Option<Array1<f64>>,
 }
 
 impl ZerothOrderObjective for OuterOperatorBridge<'_> {
@@ -1446,17 +1446,17 @@ pub(crate) fn build_bridge_hessian_for_source(
 }
 
 pub(crate) struct OuterFixedPointBridge<'a> {
-    obj: &'a mut dyn OuterObjective,
-    layout: OuterThetaLayout,
-    barrier_config: Option<BarrierConfig>,
-    fixed_point_tolerance: f64,
+    pub(crate) obj: &'a mut dyn OuterObjective,
+    pub(crate) layout: OuterThetaLayout,
+    pub(crate) barrier_config: Option<BarrierConfig>,
+    pub(crate) fixed_point_tolerance: f64,
     /// Consecutive HybridEFS iterations whose ψ block was zeroed after
     /// exhausting backtracking. When this reaches
     /// [`MAX_CONSECUTIVE_PSI_STAGNATION`], the bridge surfaces the
     /// [`EFS_FIRST_ORDER_FALLBACK_MARKER`] error so the runner aborts the
     /// HybridEFS attempt and the fallback ladder routes to a joint
     /// gradient-based solver where ψ stationarity ∇_ψ V = 0 can be enforced.
-    consecutive_psi_zero_iters: usize,
+    pub(crate) consecutive_psi_zero_iters: usize,
 }
 
 impl OuterFixedPointBridge<'_> {

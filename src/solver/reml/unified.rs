@@ -206,7 +206,7 @@ pub use hessian_operator_trait::*;
 pub use hyper_operator::*;
 pub use inner_solution::*;
 pub use objective::*;
-pub use outer_derivatives::*;
+pub(crate) use outer_derivatives::*;
 pub use outer_entry_helpers::*;
 pub use penalty_coordinate::*;
 pub use sparse_cholesky_backends::*;

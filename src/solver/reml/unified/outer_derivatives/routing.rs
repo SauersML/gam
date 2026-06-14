@@ -5,8 +5,6 @@
 //! avoiding large dense `p × p` drift storage and pairwise row assembly when
 //! the model's `(n, p, K)` shape says those dominate.
 
-use super::*;
-
 pub(crate) const HESSIAN_UNAVAILABLE_PREFIX: &str = "outer Hessian unavailable:";
 
 /// Minimum coefficient dimension at which the matrix-free operator path is

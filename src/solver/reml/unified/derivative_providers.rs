@@ -426,8 +426,8 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
 ///
 /// where B_k = −v_k (mode response) and the Firth operators use δη = X·B_k.
 pub struct FirthAwareGlmDerivatives {
-    pub(super) base: SinglePredictorGlmDerivatives,
-    pub(super) firth_op: std::sync::Arc<super::super::FirthDenseOperator>,
+    pub(crate) base: SinglePredictorGlmDerivatives,
+    pub(crate) firth_op: std::sync::Arc<super::super::FirthDenseOperator>,
 }
 
 
@@ -1065,4 +1065,3 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
 // ═══════════════════════════════════════════════════════════════════════════
 //  Link-wiggle derivative provider (exact second-order Hessian corrections)
 // ═══════════════════════════════════════════════════════════════════════════
-

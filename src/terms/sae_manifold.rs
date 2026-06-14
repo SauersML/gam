@@ -114,9 +114,9 @@ pub(crate) use faer::Side;
 // The SAE assignment / basis / frame primitives this term is built from. They
 // are re-exported flat here so every submodule reaches them through
 // `use super::*` and the public surface is unchanged.
-pub use crate::terms::sae::assignment::*;
-pub use crate::terms::sae::basis::*;
-pub use crate::terms::sae::frames::*;
+pub(crate) use crate::terms::sae::assignment::*;
+pub(crate) use crate::terms::sae::basis::*;
+pub(crate) use crate::terms::sae::frames::*;
 
 mod arrow_solver;
 mod atom;
@@ -141,8 +141,7 @@ pub use arrow_solver::*;
 pub use atom::*;
 pub use certificate::*;
 pub use construction::*;
-pub use fit_drivers::*;
-pub use kronecker::*;
+pub(crate) use kronecker::*;
 pub use loss::*;
 pub use outer_objective::*;
 pub use penalties::*;

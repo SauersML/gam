@@ -1,5 +1,3 @@
-use super::*;
-
 /// Kronecker-factored per-row beta Jacobian primitive for SAE-manifold.
 ///
 /// The per-row beta Jacobian has exact Kronecker form

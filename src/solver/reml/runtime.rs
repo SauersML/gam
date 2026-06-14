@@ -43,7 +43,6 @@ pub(crate) use crate::types::{
 };
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, s};
 pub(crate) use std::collections::{HashMap, VecDeque};
-pub(crate) use std::ops::Range;
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 

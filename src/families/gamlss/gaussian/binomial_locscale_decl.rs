@@ -4,6 +4,7 @@
 // resolve through the parent namespace.
 use super::*;
 
+#[derive(Clone)]
 pub struct BinomialLocationScaleFamily {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,

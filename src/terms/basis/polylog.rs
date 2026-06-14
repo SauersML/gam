@@ -76,7 +76,7 @@ pub(crate) fn dilog_unit(z: f64) -> f64 {
 /// non-finite input, `ζ(3)` at `z = 1`.
 #[inline]
 pub(crate) fn trilog_unit(z: f64) -> f64 {
-    pub(crate) const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;
+    const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;
     if !z.is_finite() {
         return f64::NAN;
     }

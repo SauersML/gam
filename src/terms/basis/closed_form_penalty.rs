@@ -55,7 +55,7 @@ pub(crate) fn compute_gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
 }
 
 pub(crate) fn gauss_legendre_64() -> &'static (Vec<f64>, Vec<f64>) {
-    pub(crate) static CACHE: OnceLock<(Vec<f64>, Vec<f64>)> = OnceLock::new();
+    static CACHE: OnceLock<(Vec<f64>, Vec<f64>)> = OnceLock::new();
     CACHE.get_or_init(|| compute_gauss_legendre(64))
 }
 
@@ -410,7 +410,7 @@ pub fn riesz_kernel_value(d: usize, j: f64, r: f64) -> f64 {
     // For integer `j` this is exact; for fractional `j` it never fires
     // because `2j − d` won't be an even integer to within `LOG_EPS`.
     let two_j = 2.0 * j;
-    pub(crate) const LOG_EPS: f64 = 1e-12;
+    const LOG_EPS: f64 = 1e-12;
     let offset = two_j - d as f64;
     if offset >= -LOG_EPS && (offset.round() - offset).abs() < LOG_EPS {
         let n_f64 = (offset / 2.0).round();
@@ -1287,7 +1287,7 @@ pub(crate) fn riesz_block_radial_derivatives(d: usize, j: f64, r: f64, max_order
 
     // Log case detection: `2j − d` is a non-negative even integer
     // (within ε). For fractional `j` this never fires.
-    pub(crate) const LOG_EPS: f64 = 1e-12;
+    const LOG_EPS: f64 = 1e-12;
     let offset = two_j - d as f64;
     let log_case = offset >= -LOG_EPS && {
         let n_f = (offset / 2.0).round();

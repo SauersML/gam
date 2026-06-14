@@ -246,7 +246,7 @@ pub struct IsometryPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-struct IsometryHvpState<'a> {
+pub(crate) struct IsometryHvpState<'a> {
     d: usize,
     n_obs: usize,
     p: usize,

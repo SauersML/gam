@@ -39,7 +39,7 @@ pub mod structure_search;
 pub mod topology_formula;
 pub mod topology_selector;
 pub mod visualizer;
-pub(crate) mod workflow;
+pub mod workflow;
 
 pub use evidence::{
     EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, GaussianMixtureConfig,

@@ -84,7 +84,7 @@ trait LogLinkDiagonalIrlsFamily {
 /// size-check, η-clamp, saturated-exp, active-clamp guard, ll accumulation,
 /// and `FamilyEvaluation` assembly so all log-link families with the diagonal
 /// structure (Poisson, Gamma) cannot drift apart numerically.
-pub(crate) fn evaluate_log_link_diagonal_irls<F: LogLinkDiagonalIrlsFamily + ?Sized>(
+fn evaluate_log_link_diagonal_irls<F: LogLinkDiagonalIrlsFamily + ?Sized>(
     family: &F,
     block_states: &[ParameterBlockState],
 ) -> Result<FamilyEvaluation, String> {

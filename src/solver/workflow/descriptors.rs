@@ -19,14 +19,14 @@ use std::sync::Arc;
 
 use crate::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
-    BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, GumbelTemperatureSchedule,
-    IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
+    BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, IBPAssignmentPenalty,
+    IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
     MechanismSparsityPenalty, MonotonicityPenalty, NestedPrefixPenalty, NuclearNormPenalty,
     OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
-    PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule, ScheduleKind,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
-    TotalVariationPenalty,
+    PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty, TotalVariationPenalty,
 };
+use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleKind};
 
 /// A latent block a penalty descriptor can target, identified either by name or
 /// by declaration index in the `latents` object.

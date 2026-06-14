@@ -6,6 +6,7 @@
 //! cost uses (so the additive block vanishes at exact KKT).
 
 use super::*;
+use crate::estimate::reml::runtime;
 
 /// Shared precomputed REML derivative intermediates threaded from the
 /// gradient pass into the dense Hessian assembler so the per-coordinate
@@ -39,7 +40,7 @@ pub(crate) fn solve_kkt_residual_kernel(
 }
 
 pub(crate) fn active_upper_rho_mask(rho: &[f64]) -> Vec<bool> {
-    let latest_theta = crate::estimate::reml::runtime::latest_outer_theta_for_ift();
+    let latest_theta = runtime::latest_outer_theta_for_ift();
     let matching_outer_theta = latest_theta.as_ref().is_some_and(|theta| {
         theta.len() >= rho.len()
             && theta
@@ -49,7 +50,7 @@ pub(crate) fn active_upper_rho_mask(rho: &[f64]) -> Vec<bool> {
                 .all(|(&recorded, &current)| recorded.to_bits() == current.to_bits())
     });
     let upper_bounds = matching_outer_theta
-        .then(crate::estimate::reml::runtime::latest_outer_rho_upper_bounds_for_ift)
+        .then(runtime::latest_outer_rho_upper_bounds_for_ift)
         .flatten();
     rho.iter()
         .enumerate()

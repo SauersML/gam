@@ -162,7 +162,6 @@ pub(crate) use covariate_blocks::*;
 pub(crate) use dense_linalg::*;
 pub(crate) use error::*;
 pub(crate) use family::*;
-pub(crate) use family_solver::*;
 pub(crate) use fit::*;
 pub(crate) use moments::*;
 pub(crate) use predict::*;

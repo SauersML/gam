@@ -136,7 +136,7 @@ pub(crate) fn wahba_sphere_kernel_sobolev_closed_form(cos_gamma: f64, m: usize) 
         1 => (-u.ln() - 1.0) / four_pi,
         2 => (dilog_unit(one_minus_u) + 1.0 - pi2_6) / four_pi,
         3 => {
-            pub(crate) const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;
+            const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;
             let li3_u = trilog_unit(u);
             let li2_one_minus_u = dilog_unit(one_minus_u);
             let li2_u = dilog_unit(u);
@@ -242,7 +242,7 @@ pub(crate) fn wahba_sphere_kernel_from_cos_simd_kind(
 
 /// Spectral derivative of the Sobolev sphere kernel w.r.t. `cos gamma`.
 pub(crate) fn wahba_sphere_kernel_sobolev_derivative_dcos(x: f64, m: usize) -> f64 {
-    pub(crate) const POLE_LIMIT_THRESHOLD: f64 = 1.0e-10;
+    const POLE_LIMIT_THRESHOLD: f64 = 1.0e-10;
 
     let l_max = match m {
         1 => 4096_usize,

@@ -1476,7 +1476,7 @@ impl TransformationNormalFamily {
         if direction_mat.is_none() {
             let weights = self.effective_weights();
 
-            pub(crate) struct PsiPairScoreAccum {
+            struct PsiPairScoreAccum {
                 pub(crate) objective: f64,
                 pub(crate) score: Array1<f64>,
                 pub(crate) gamma: Vec<f64>,

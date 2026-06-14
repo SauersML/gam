@@ -54,7 +54,7 @@ pub(crate) fn select_equal_mass_centers(
         crate::bail_invalid_basis!("equal-mass center selection requires at least one column");
     }
     #[derive(Clone, Copy)]
-    pub(crate) struct Leaf {
+    struct Leaf {
         pub(crate) start: usize,
         pub(crate) end: usize,
     }
@@ -260,7 +260,7 @@ pub(crate) fn select_kmeans_centers(
     if num_centers > n {
         crate::bail_invalid_basis!("kmeans requested {num_centers} centers but data has {n} rows");
     }
-    pub(crate) const KMEANS_PILOT_MAX_ROWS: usize = 20_000;
+    const KMEANS_PILOT_MAX_ROWS: usize = 20_000;
     if n > KMEANS_PILOT_MAX_ROWS {
         let pilot_n = KMEANS_PILOT_MAX_ROWS.max(num_centers);
         // log::info! rather than warn! — this is a deliberate performance
@@ -286,7 +286,7 @@ pub(crate) fn select_kmeans_centers(
     for _ in 0..iters {
         // Assignment: find nearest center for each observation.
         if use_parallel {
-            pub(crate) const KMEANS_CHUNK: usize = 4096;
+            const KMEANS_CHUNK: usize = 4096;
             assign
                 .par_chunks_mut(KMEANS_CHUNK)
                 .enumerate()

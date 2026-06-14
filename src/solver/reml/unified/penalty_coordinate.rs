@@ -765,7 +765,7 @@ impl PenaltySubspaceTrace {
         assert_eq!(self.h_proj_inverse.ncols(), r);
 
         let block = {
-            pub(crate) const TARGET_CHUNK_FLOATS: usize = 1 << 16;
+            const TARGET_CHUNK_FLOATS: usize = 1 << 16;
             (TARGET_CHUNK_FLOATS / p.max(1)).clamp(1, n.max(1))
         };
 
@@ -1296,7 +1296,7 @@ impl ProjectedKktResidual {
                 // gate when the caller supplies no explicit `residual_tol`:
                 // ~1e-10 scaled by `1 + ‖r‖∞` so it degrades gracefully with the
                 // residual magnitude.
-                pub(crate) const DEFAULT_KKT_RESIDUAL_REL_TOL: f64 = 1e-10;
+                const DEFAULT_KKT_RESIDUAL_REL_TOL: f64 = 1e-10;
                 let tol = self
                     .residual_tol
                     .unwrap_or_else(|| DEFAULT_KKT_RESIDUAL_REL_TOL * (1.0 + residual_inf));

@@ -928,7 +928,7 @@ impl BernoulliMarginalSlopeFamily {
                 CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuDenestedCubicCell,
                 try_build_cubic_cell_derivative_moments,
             };
-            pub(crate) const PARITY_ROW_BUDGET: usize = 4;
+            const PARITY_ROW_BUDGET: usize = 4;
             let mut sample_cells: Vec<GpuDenestedCubicCell> = Vec::new();
             let mut sample_branches = Vec::new();
             let mut sample_cpu_moments: Vec<Vec<f64>> = Vec::new();

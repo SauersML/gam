@@ -334,7 +334,7 @@ pub(crate) fn polynomial_block_from_order(
 
 
 pub fn monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<usize>> {
-    pub(crate) fn recurse(
+    fn recurse(
         axis: usize,
         remaining_degree: usize,
         current: &mut [usize],
@@ -988,7 +988,7 @@ pub(crate) fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     // buffer (scratch workspace) and returns immutable results; the serial
     // assembly below is the only place that writes to the dense output arrays,
     // so no mutable ndarray storage is shared across workers.
-    pub(crate) struct ThinPlatePsiTileEntry {
+    struct ThinPlatePsiTileEntry {
         pub(crate) i: usize,
         pub(crate) j: usize,
         pub(crate) phi: f64,

@@ -864,7 +864,7 @@ pub(crate) fn back_substitute_delta_t<B: BatchedBlockSolver + Sync>(
     };
     if parallel {
         use rayon::prelude::*;
-        pub(crate) const CHUNK: usize = 64;
+        const CHUNK: usize = 64;
         let row_offsets = &sys.row_offsets;
         // `par_chunks_mut` over uniform chunks does not align with variable row
         // dims, so partition by row chunk and hand each chunk its own contiguous
@@ -1912,7 +1912,7 @@ pub(crate) fn reduced_rhs_beta<B: BatchedBlockSolver + Sync>(
     let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
     if parallel {
         use rayon::prelude::*;
-        pub(crate) const CHUNK: usize = 64;
+        const CHUNK: usize = 64;
         let partials: Vec<Array1<f64>> = (0..n)
             .into_par_iter()
             .chunks(CHUNK)

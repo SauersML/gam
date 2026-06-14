@@ -1242,8 +1242,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         Err(_) => true,
     };
     if outer_needs_audit {
-        pub(crate) const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
-        pub(crate) const OUTER_FD_AUDIT_MAX_RHO_DIM: usize = 32;
+        const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
+        const OUTER_FD_AUDIT_MAX_RHO_DIM: usize = 32;
         let audit_n = specs.iter().map(|s| s.design.nrows()).max().unwrap_or(0);
         if n_rho >= 1 && n_rho <= OUTER_FD_AUDIT_MAX_RHO_DIM && audit_n <= OUTER_FD_AUDIT_MAX_N {
             log::warn!(
@@ -1535,7 +1535,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                             // that produced essentially no independent information
                             // about the posterior is caught independent of model
                             // size.
-                            pub(crate) const RHAT_MIXED_MAX: f64 = 1.05;
+                            const RHAT_MIXED_MAX: f64 = 1.05;
                             let ess_floor = (10.0 * dim as f64).max(50.0);
                             let rhat = posterior.rhat;
                             let ess = posterior.ess;

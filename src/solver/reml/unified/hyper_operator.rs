@@ -1813,7 +1813,7 @@ mod implicit_matvec_scratch {
     }
 
     thread_local! {
-        pub(crate) static SCRATCH: RefCell<Scratch> = const { RefCell::new(Scratch::new()) };
+        static SCRATCH: RefCell<Scratch> = const { RefCell::new(Scratch::new()) };
     }
 
     pub(super) fn with<R>(f: impl FnOnce(&mut Scratch) -> R) -> R {

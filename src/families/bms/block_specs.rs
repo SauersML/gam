@@ -415,7 +415,7 @@ impl ReducedLogslopeReparam {
 /// when there is no logslope/marginal span, no effective-confounded direction to
 /// remove (`r == p_g`), or the whole effective logslope image is in the effective
 /// marginal span (`r == 0`); in those cases the caller keeps the raw design.
-pub(crate) fn build_reduced_logslope_reparam(
+fn build_reduced_logslope_reparam(
     marginal_design: &TermCollectionDesign,
     logslope_design: &TermCollectionDesign,
     z: &Array1<f64>,
@@ -627,7 +627,7 @@ pub(crate) fn reduced_logslope_transform_effective(
 /// `S_reduced = Tᵀ S T` over the full reduced column range `0..r`. The reduced
 /// penalty's null space is recomputed from its numerical rank so the REML
 /// log-determinant accounting stays consistent at the reduced width.
-pub(crate) fn reparameterize_logslope_design_reduced(
+fn reparameterize_logslope_design_reduced(
     logslope_design: &TermCollectionDesign,
     reparam: &ReducedLogslopeReparam,
 ) -> Result<TermCollectionDesign, String> {
@@ -1540,7 +1540,7 @@ pub(crate) fn push_deviation_aux_blockspecs(
     Ok(())
 }
 
-pub(crate) fn inner_fit(
+fn inner_fit(
     family: &BernoulliMarginalSlopeFamily,
     blocks: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,

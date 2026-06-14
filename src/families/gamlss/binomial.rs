@@ -39,7 +39,6 @@ mod kernel;
 pub(crate) use kernel::*;
 
 mod location_scale;
-pub(crate) use location_scale::*;
 
 mod location_scale_workspace;
 pub(crate) use location_scale_workspace::*;
@@ -48,7 +47,6 @@ mod wiggle;
 pub use wiggle::*;
 
 mod wiggle_custom_family;
-pub(crate) use wiggle_custom_family::*;
 
 mod wiggle_workspace;
 pub(crate) use wiggle_workspace::*;
