@@ -268,8 +268,9 @@ fn main() {
 
     // Mechanical part_NNN / *_parts/ / split_parts/ naming is banned (slop). To
     // satisfy MAX_TRACKED_FILE_LINES, split large modules into cohesively-named
-    // submodules, never numbered parts. Scans `.rs` files under `src/` only, so
-    // dataset shards (bench/datasets/*_parts/part_00N.csv) are not affected.
+    // submodules, never numbered parts. Scans every tracked `.rs` file repo-wide
+    // (src/, tests/, crates/, …); non-.rs dataset shards such as
+    // bench/datasets/*_parts/part_00N.csv are skipped (the audit is `.rs`-only).
     let mut mechanical_part_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_mechanical_part_files(&manifest_dir, &mut mechanical_part_offenders);
 
@@ -3147,15 +3148,16 @@ fn is_mechanical_part_path(rel: &Path) -> bool {
 /// Ban mechanical file-splitting (`part_<NNN>.rs`, `*_parts/`, `split_parts/`).
 /// HARD ban with NO grandfathering: every such path fails the build. Split each
 /// module by cohesive concern into descriptively-named modules instead. Scans
-/// only `.rs` files tracked under `src/`, so non-code dataset shards such as
-/// `bench/datasets/*_parts/part_00N.csv` are never considered.
+/// every `.rs` file tracked anywhere in the repo (src/, tests/, crates/, …), so
+/// no future mechanical split can slip in outside src/. Non-code dataset shards
+/// such as `bench/datasets/*_parts/part_00N.csv` are skipped because the audit
+/// only considers `.rs` files.
 fn scan_for_mechanical_part_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
         .arg("ls-files")
         .arg("-z")
-        .arg("src")
         .output()
         .expect("failed to list Git-tracked files for mechanical-part audit");
     assert!(
