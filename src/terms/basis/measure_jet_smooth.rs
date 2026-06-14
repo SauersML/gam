@@ -59,13 +59,16 @@
 //!   scalar weights applied per block. Criterion value and criterion
 //!   derivatives cannot drift apart (the objective↔gradient desync class is
 //!   structurally excluded).
-//! - **single-scale/multiscale auto-split (#1039).** The per-scale spectrum and the
-//!   `(α, ln τ)` ψ dials are the multiscale-mode realization, auto-enabled only at
-//!   large realized center counts (see [`measure_jet_multiscale_mode`] and
-//!   `MEASURE_JET_MULTISCALE_MODE_MIN_CENTERS`). The default for typical center
-//!   counts is single-scale: one fused jet-energy penalty at the auto order with no
-//!   ψ dials — the same one-λ outer footprint as Duchon/Matérn — so a small
-//!   fit pays Duchon-class cost, never the per-scale θ-inflation.
+//! - **single-scale/multiscale opt-in (#1039/#1116).** The per-scale spectrum
+//!   and the `(α, ln τ)` ψ dials are the multiscale-mode realization, engaged
+//!   ONLY when the spec opts in (`MeasureJetBasisSpec::multiscale = true`, the
+//!   DSL `mjs(…, multiscale=true)`); see [`measure_jet_multiscale_mode`]. There
+//!   is NO center-count auto-gate: at ANY center count the default is
+//!   single-scale — one fused jet-energy penalty at the auto order with no ψ
+//!   dials, the same one-λ outer footprint as Duchon/Matérn — so a fit pays
+//!   Duchon-class cost unless the user explicitly asks for the per-scale
+//!   spectrum. The flag is persisted on the spec, so freeze→replay re-enters
+//!   the same mode verbatim.
 //!
 //! # ψ-differentiability contract (what the ψ-channel stage consumes)
 //!
@@ -136,24 +139,6 @@ const MEASURE_JET_PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
 /// sheets (`s > p/2` for intrinsic `p ≤ 2`), smooth enough to bridge gaps
 /// with attested trends.
 const MEASURE_JET_DEFAULT_ORDER_S: f64 = 1.5;
-
-/// Minimum realized center count at which the auto (`order_s == 0.0`) path
-/// engages multiscale mode — the per-scale spectral penalty split plus the
-/// `(α, ln τ)` outer ψ dials. Below it, the term stays in single-scale mode: one
-/// fused penalty at the auto order, dials fixed at build, no ψ enrollment —
-/// the same outer footprint as Duchon/Matérn (one λ, no kernel-shape ψ).
-///
-/// Rationale (profiled, #1039): the dominant per-evaluation cost in a
-/// penalized fit is the family's O(n) per-row work (e.g. the BMS rigid-normal
-/// 4th-order tower), paid once per outer/inner evaluation. Multiscale mode inflates
-/// the outer θ-dimension by `L` per-scale amplitudes + 2 dials, multiplying
-/// that O(n) cost by the extra evaluations — for nothing when the coefficient
-/// block is too small to identify a spectrum. A spectrum needs several
-/// coefficients per band scale; below ~`MIN_CENTERS` the fused single penalty
-/// is both faster and better-conditioned. This is auto-derivation from
-/// problem size (magic by default), persisted implicitly through the realized
-/// center count, so the freeze→replay mode is stable with no extra field.
-const MEASURE_JET_MULTISCALE_MODE_MIN_CENTERS: usize = 64;
 
 /// Auto-band scale-count clamp: at least 3 octave-ish nodes so the energy is
 /// genuinely multiscale, at most 8 so degenerate spacing cannot explode the
@@ -253,6 +238,15 @@ pub struct MeasureJetBasisSpec {
     /// Add an affine-preserving shrinkage penalty alongside the jet-energy
     /// penalty.
     pub double_penalty: bool,
+    /// Explicit opt-in for multiscale mode: the per-scale spectral penalty
+    /// split plus the `(α, ln τ)` outer ψ dials and the affine-preserving
+    /// ridge. `false` (default) keeps the term in single-scale mode at ANY
+    /// center count — one fused jet-energy penalty, the one-λ Duchon/Matérn
+    /// footprint. There is no center-count auto-gate; the user opts in via
+    /// `mjs(…, multiscale=true)`. Persisted on the spec so freeze→replay
+    /// re-enters the same mode.
+    #[serde(default)]
+    pub multiscale: bool,
     /// Realized-design identifiability policy (see type docs).
     #[serde(default)]
     pub identifiability: MeasureJetIdentifiability,
@@ -276,6 +270,7 @@ impl Default for MeasureJetBasisSpec {
             num_scales: 0,
             length_scale: 0.0,
             double_penalty: true,
+            multiscale: false,
             identifiability: MeasureJetIdentifiability::CenterSumToZero,
             frozen_quadrature: None,
         }
@@ -1321,23 +1316,25 @@ fn realize_measure_jet_geometry(
         log_step,
         length_scale,
         order_s_eval: order_s,
-        // multiscale (per-scale spectral) mode only at the auto order AND a center
-        // count large enough to identify a spectrum; otherwise single-scale (one
-        // fused penalty), matching Duchon/Matérn's outer footprint (#1039).
-        per_level: spec.order_s == 0.0 && m >= MEASURE_JET_MULTISCALE_MODE_MIN_CENTERS,
+        // multiscale (per-scale spectral) mode is an EXPLICIT opt-in
+        // (#1116): single-scale (one fused penalty, the Duchon/Matérn outer
+        // footprint) at any center count unless the spec asks for it. No
+        // center-count auto-gate.
+        per_level: spec.multiscale,
         z,
         kz,
         sum_to_zero_u,
     })
 }
 
-/// Whether a realized measure-jet spec with `m` centers runs in multiscale mode
-/// (per-scale spectral penalties + `(α, ln τ)` ψ dials) under the auto order.
-/// The single source of truth for the mode decision, shared by the builder
-/// and the outer-engine enrollment predicates so the penalty count and the
-/// ψ-dimension cannot disagree.
-pub fn measure_jet_multiscale_mode(spec: &MeasureJetBasisSpec, center_count: usize) -> bool {
-    spec.order_s == 0.0 && center_count >= MEASURE_JET_MULTISCALE_MODE_MIN_CENTERS
+/// Whether a measure-jet spec runs in multiscale mode (per-scale spectral
+/// penalties + `(α, ln τ)` ψ dials + the affine-preserving ridge). The single
+/// source of truth for the mode decision, shared by the builder and the
+/// outer-engine enrollment predicates so the penalty count and the ψ-dimension
+/// cannot disagree. Multiscale is an explicit opt-in (`spec.multiscale`); there
+/// is no center-count auto-gate (#1116).
+pub fn measure_jet_multiscale_mode(spec: &MeasureJetBasisSpec) -> bool {
+    spec.multiscale
 }
 
 /// Build the measure-jet smooth: Gaussian representer design `K(data,
@@ -2020,16 +2017,15 @@ mod tests {
         }
     }
 
-    /// The default at a typical (small) center count is single-scale mode: ONE
-    /// fused penalty, the same one-λ outer footprint as Duchon/Matérn — the
-    /// auto sentinel does NOT trigger the per-scale spectral split below the
-    /// multiscale-mode center threshold (#1039), and the affine-preserving
-    /// ridge is multiscale-only (#1116: in single-scale the one fused candidate
-    /// already penalizes the whole non-affine span). `measure_jet_multiscale_mode`
+    /// The default is single-scale mode at ANY center count: ONE fused penalty,
+    /// the same one-λ outer footprint as Duchon/Matérn. Multiscale (the
+    /// per-scale spectral split + ψ dials + the affine-preserving ridge) is an
+    /// EXPLICIT opt-in (`spec.multiscale`, the DSL `mjs(…, multiscale=true)`) —
+    /// there is no center-count auto-gate (#1116). `measure_jet_multiscale_mode`
     /// is the single source for this decision.
     #[test]
-    fn small_default_stays_single_scale_single_penalty() {
-        let n = 60usize;
+    fn default_stays_single_scale_until_multiscale_opt_in() {
+        let n = 200usize;
         let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
             let t = i as f64 / (n as f64 - 1.0);
             if k == 0 {
@@ -2038,32 +2034,46 @@ mod tests {
                 0.4 * (t * 3.0).sin()
             }
         });
-        // 8 centers — the issue's configuration — at the auto order sentinel.
-        let spec = MeasureJetBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+        // Default (multiscale = false) stays single-scale even at a LARGE center
+        // count that, under the deleted auto-gate, would have flipped to
+        // multiscale.
+        let single = MeasureJetBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 80 },
             ..MeasureJetBasisSpec::default()
         };
         assert!(
-            !measure_jet_multiscale_mode(&spec, 8),
-            "8 centers must resolve to single-scale mode"
+            !measure_jet_multiscale_mode(&single),
+            "default must resolve to single-scale at any center count"
         );
-        let built = build_measure_jet_basis(data.view(), &spec).expect("single-scale build");
+        let built_single =
+            build_measure_jet_basis(data.view(), &single).expect("single-scale build");
         assert_eq!(
-            built.penalties.len(),
+            built_single.penalties.len(),
             1,
             "single-scale mode emits exactly one fused penalty (no ridge, no per-scale split)"
         );
-        // A large center count flips the same auto sentinel to multiscale mode.
+        // The explicit opt-in flips to multiscale at the SAME center count.
+        let multi = MeasureJetBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 80 },
+            multiscale: true,
+            ..MeasureJetBasisSpec::default()
+        };
         assert!(
-            measure_jet_multiscale_mode(&spec, MEASURE_JET_MULTISCALE_MODE_MIN_CENTERS),
-            "≥ threshold centers must resolve to multiscale mode"
+            measure_jet_multiscale_mode(&multi),
+            "multiscale=true must resolve to multiscale mode"
+        );
+        let built_multi = build_measure_jet_basis(data.view(), &multi).expect("multiscale build");
+        assert!(
+            built_multi.penalties.len() >= 2,
+            "multiscale mode emits the per-scale spectral split plus the ridge, got {}",
+            built_multi.penalties.len()
         );
     }
 
     /// An explicit order pins the Mellin weights and fuses the band into a
-    /// single Primary candidate — the spectral split's fused mode. With an
-    /// explicit order the mode is single-scale, so the multiscale-only ridge
-    /// (#1116) is not emitted: exactly one penalty.
+    /// single Primary candidate. With multiscale off (the default) the mode is
+    /// single-scale, so the multiscale-only ridge (#1116) is not emitted:
+    /// exactly one penalty.
     #[test]
     fn fused_mode_emits_single_primary_candidate() {
         let n = 40usize;
@@ -2128,10 +2138,11 @@ mod tests {
     /// once, pin everything (nodes, masses, band, transform, realized ℓ),
     /// and return the pinned spec so dial-perturbed rebuilds move ONLY the
     /// dials — the per-trial contract the optimizer relies on.
-    fn frozen_spec_fixture(order_s: f64) -> (Array2<f64>, MeasureJetBasisSpec) {
-        // ≥ MEASURE_JET_MULTISCALE_MODE_MIN_CENTERS centers so the auto
-        // (order_s == 0.0) path engages multiscale (per-scale + ψ) mode under test;
-        // the fused fixture (order_s > 0) is fused regardless of count.
+    fn frozen_spec_fixture(order_s: f64, multiscale: bool) -> (Array2<f64>, MeasureJetBasisSpec) {
+        // Multiscale (per-scale + ψ) mode is the explicit opt-in (#1116); the
+        // per-level fixture passes `multiscale = true`, the fused fixture
+        // `false`. A large center count is kept so the multiscale spectrum is
+        // identifiable when opted in.
         let n = 140usize;
         let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
             let t = i as f64 / (n as f64 - 1.0);
@@ -2144,6 +2155,7 @@ mod tests {
         let spec = MeasureJetBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 70 },
             order_s,
+            multiscale,
             ..MeasureJetBasisSpec::default()
         };
         let first = build_measure_jet_basis(data.view(), &spec).expect("fixture build");
@@ -2170,6 +2182,7 @@ mod tests {
             num_scales: eps_band.len(),
             length_scale: *length_scale,
             double_penalty: spec.double_penalty,
+            multiscale,
             identifiability: MeasureJetIdentifiability::FrozenTransform {
                 transform: constraint_transform.clone().expect("fit-time z"),
             },
@@ -2191,7 +2204,7 @@ mod tests {
     /// against the exact object the optimizer consumes.
     #[test]
     fn psi_producer_matches_fd_per_level_mode() {
-        let (data, frozen) = frozen_spec_fixture(0.0);
+        let (data, frozen) = frozen_spec_fixture(0.0, true);
         let derivs =
             build_measure_jet_basis_psi_derivatives(data.view(), &frozen).expect("psi derivatives");
         let l_count = frozen
@@ -2280,7 +2293,7 @@ mod tests {
     /// Fused mode adds the s coordinate; gate it the same way.
     #[test]
     fn psi_producer_matches_fd_fused_mode() {
-        let (data, frozen) = frozen_spec_fixture(1.3);
+        let (data, frozen) = frozen_spec_fixture(1.3, false);
         let derivs =
             build_measure_jet_basis_psi_derivatives(data.view(), &frozen).expect("psi derivatives");
         assert_eq!(
@@ -2288,7 +2301,11 @@ mod tests {
             3,
             "fused coords are (s, α, lnτ)"
         );
-        assert_eq!(derivs.penalties_first[0].len(), 2, "primary + ridge");
+        assert_eq!(
+            derivs.penalties_first[0].len(),
+            1,
+            "single-scale fused mode has exactly one candidate (primary, no ridge)"
+        );
         let pen_at = |s: f64| {
             let trial = MeasureJetBasisSpec {
                 order_s: s,
@@ -2356,8 +2373,8 @@ mod tests {
     /// predict-path contract).
     #[test]
     fn build_replay_roundtrip_reproduces_design_and_penalty() {
-        // A bent filament with a side cluster; ≥ the multiscale-mode center
-        // threshold so this exercises the per-scale (spectral) replay path.
+        // A bent filament with a side cluster; multiscale opt-in so this
+        // exercises the per-scale (spectral) replay path (#1116).
         let n = 140usize;
         let data = Array2::<f64>::from_shape_fn((n, 2), |(i, k)| {
             let t = i as f64 / (n as f64 - 1.0);
@@ -2369,6 +2386,7 @@ mod tests {
         });
         let spec = MeasureJetBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 70 },
+            multiscale: true,
             ..MeasureJetBasisSpec::default()
         };
         let first = build_measure_jet_basis(data.view(), &spec).expect("first build");
@@ -2398,6 +2416,7 @@ mod tests {
             num_scales: eps_band.len(),
             length_scale: *length_scale,
             double_penalty: spec.double_penalty,
+            multiscale: spec.multiscale,
             identifiability: MeasureJetIdentifiability::FrozenTransform {
                 transform: constraint_transform.clone().expect("fit-time z"),
             },

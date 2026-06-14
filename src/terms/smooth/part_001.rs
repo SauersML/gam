@@ -1405,21 +1405,13 @@ impl TermCollectionSpec {
                         n_levels,
                     )?;
                     // Mode predicate MUST match the builder's
-                    // (`measure_jet_multiscale_mode`): per-level/multiscale
-                    // requires BOTH the auto order sentinel (`order_s == 0.0`)
-                    // AND a realized center count past the spectrum-identifiability
-                    // floor. Deriving it from `order_s == 0.0` alone desyncs at
-                    // `order_s == 0.0` with `m < MIN_CENTERS`: the builder emits a
-                    // single FUSED penalty (empty per-level scales +
-                    // `fused_penalty_normalization_scale: Some`) while a bare
-                    // `order_s == 0.0` validator demands `n_levels` per-level
-                    // scales, raising "penalty_normalization_scales has length 0,
-                    // expected N" on an otherwise-valid frozen single-scale term
-                    // (surfaces at higher d, where the auto band still carries
-                    // ≥ MIN_AUTO_SCALES eps levels). `frozen.masses.len()` is the
-                    // realized center count (already validated `== centers.nrows()`).
-                    let per_level =
-                        crate::basis::measure_jet_multiscale_mode(spec, frozen.masses.len());
+                    // (`measure_jet_multiscale_mode`): per-level/multiscale is the
+                    // explicit `spec.multiscale` opt-in (#1116). In single-scale
+                    // mode the builder emits a single FUSED penalty (empty
+                    // per-level scales + `fused_penalty_normalization_scale:
+                    // Some`); only the multiscale opt-in carries `n_levels`
+                    // per-level scales.
+                    let per_level = crate::basis::measure_jet_multiscale_mode(spec);
                     if per_level {
                         validate_measure_jet_positive_vec_len(
                             label,
@@ -3420,25 +3412,14 @@ fn measure_jet_term_spec(
 /// sources cannot disagree.
 fn measure_jet_enrolls_psi(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
     // ψ dials ride multiscale mode only: the per-scale spectral split and the
-    // (α, lnτ) dials are auto-enabled together, at the same center-count
-    // threshold the basis builder uses (single source: `measure_jet_multiscale_mode`).
-    // single-scale-mode terms (small center counts, or a pinned explicit order)
-    // stay at one fused penalty with fixed dials — Duchon/Matérn's outer
-    // footprint — so they never inflate the family's O(n) per-row evaluation
-    // count (#1039). The lnτ channel additionally needs a positive ridge.
-    mj.tau0 > 0.0 && measure_jet_term_enrolls_multiscale(mj)
+    // (α, lnτ) dials are enabled together by the explicit `multiscale` opt-in
+    // (single source: `measure_jet_multiscale_mode`, #1116). Single-scale-mode
+    // terms (the default at any center count) stay at one fused penalty with
+    // fixed dials — Duchon/Matérn's outer footprint — so they never inflate the
+    // family's O(n) per-row evaluation count (#1039). The lnτ channel
+    // additionally needs a positive ridge.
+    mj.tau0 > 0.0 && crate::basis::measure_jet_multiscale_mode(mj)
 }
-
-
-/// Realized multiscale-mode decision for a measure-jet spec, resolving the center
-/// count from the (post-freeze) strategy. Single source for both ψ
-/// enrollment and the ψ-dimension so the θ-layout cannot drift from the
-/// builder's penalty count.
-fn measure_jet_term_enrolls_multiscale(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
-    crate::basis::center_strategy_num_centers(&mj.center_strategy)
-        .is_some_and(|m| crate::basis::measure_jet_multiscale_mode(mj, m))
-}
-
 
 /// Measure-jet ψ dial boxes. The dials are NOT log-kernel-scales, so the
 /// κ-window machinery never applies: `s` stays inside the admissible order
