@@ -2203,11 +2203,12 @@ pub trait CustomFamily {
         Ok(None)
     }
 
-    /// Optional block-concatenated log-likelihood gradient `g = ∇ℓ(θ)` assembled
-    /// from the SAME single source of truth as [`Self::exact_newton_joint_hessian`]
-    /// (e.g. a per-row jet-tower kernel), so the damped Newton `H δ = g` is solved
-    /// on a consistent (objective, gradient, Hessian) triple. The default returns
-    /// `None`, leaving the caller on its legacy hand-assembled gradient.
+    /// Optional block-concatenated log-likelihood gradient `g = nabla l(theta)`
+    /// assembled from the SAME single source of truth as
+    /// [`Self::exact_newton_joint_hessian`] (e.g. a per-row jet-tower kernel), so
+    /// the damped Newton `H delta = g` is solved on a consistent (objective,
+    /// gradient, Hessian) triple. The default returns `None`, leaving the caller
+    /// on its legacy hand-assembled gradient.
     fn exact_newton_joint_loglik_gradient(
         &self,
         block_states: &[ParameterBlockState],
