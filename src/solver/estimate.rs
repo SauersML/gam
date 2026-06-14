@@ -8335,8 +8335,9 @@ pub(crate) mod reml;
 
 pub use reml::unified::PenaltyCoordinate;
 
-// Test module split into a separate file to stay under the #780 line-count gate.
-// The included file carries its own `#[cfg(test)]`, so the bare `include!`
-// inlines only test-gated items (no outer `#[cfg(test)]` on the macro itself,
-// which the #780 ban scanner rejects as a cfg-on-src item).
-include!("estimate_diagnostic_tests.rs");
+#[cfg(test)]
+mod estimate_policy_tests;
+#[cfg(test)]
+mod continuous_order_tests;
+#[cfg(test)]
+mod invert_regularized_rho_hessian_tests;

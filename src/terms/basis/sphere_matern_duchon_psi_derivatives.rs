@@ -1141,9 +1141,10 @@ fn build_matern_operator_penalty_psi_derivatives(
                 (0.0, 0.0)
             } else {
                 let r2 = r * r;
+                let d_f64 = d as f64;
                 (
-                    (lap_psi - (d as f64) * ratio_psi) / r2,
-                    (lap_psi_psi - (d as f64) * ratio_psi_psi) / r2,
+                    (lap_psi - d_f64 * ratio_psi) / r2,
+                    (lap_psi_psi - d_f64 * ratio_psi_psi) / r2,
                 )
             };
             d0_raw[[k, j]] = phi;

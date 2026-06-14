@@ -1200,10 +1200,25 @@ fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
         || rel_str.starts_with("bench/")
         || rel_str.starts_with("benches/")
         || rel_str.starts_with("examples/")
-        || path_matches_crates_test(&rel_str);
+        || path_matches_crates_test(&rel_str)
+        || file_stem_is_exempt_test_module(rel);
     if file_is_test {
         mask.fill(true);
         return mask;
+    }
+
+    // File-level `#![cfg(test)]` inner attribute (the Rust-idiomatic way to
+    // mark a whole module as test-only when it lives in its own file). When
+    // present, the entire file is test scope — the same way an outer
+    // `#[cfg(test)] mod foo { ... }` would gate the inlined module body.
+    // The brace-tracking loop below cannot model this on its own because
+    // an inner attribute has no following `{` to open a gate.
+    let stripped_all = strip_file_lines(content);
+    for line in &stripped_all {
+        if is_cfg_test_inner_attr_line(line) {
+            mask.fill(true);
+            return mask;
+        }
     }
 
     // Brace-tracked cfg(test) regions. We maintain a stack of entry brace
@@ -1219,7 +1234,6 @@ fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
     // depth drops back to this value).
     let mut gate_stack: Vec<i32> = Vec::new();
 
-    let stripped_all = strip_file_lines(content);
     for (idx, _raw) in lines.iter().enumerate() {
         let stripped = stripped_all.get(idx).cloned().unwrap_or_default();
 
@@ -1264,6 +1278,51 @@ fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
     }
 
     mask
+}
+
+/// True when the file's stem matches the same naming pattern that
+/// `is_exempt_test_submodule_name` accepts for `#[cfg(test)] mod ...`
+/// blocks: `tests`, `test_support`, `tests_*`, or `*_tests`. When a
+/// mechanically-split `mod foo_tests { ... }` inlined via `include!` is
+/// extracted into its own file (the cohesive-module decomposition the
+/// part-file ban demands), the module body lands in a file whose stem
+/// equals the module name. The whole file is then test scope by the
+/// same rule that exempted the inline `mod`.
+fn file_stem_is_exempt_test_module(rel: &Path) -> bool {
+    let Some(stem) = rel.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    is_exempt_test_submodule_name(stem)
+}
+
+/// Recognize `#![cfg(test)]` (inner attribute, applies to the enclosing
+/// item — at file top level, the whole module). Mirrors
+/// `is_cfg_test_attr_line` but requires the `#![` opener so the outer
+/// `#[cfg(test)] item` form (which gates only the next item) is not
+/// confused with the inner form.
+fn is_cfg_test_inner_attr_line(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let mut i = 0usize;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'#' && bytes[i + 1] == b'!' && bytes[i + 2] == b'[' {
+            let rest = &stripped[i + 3..];
+            if let Some(pos) = rest.find("cfg(") {
+                let abs = i + 3 + pos;
+                let before_ok = abs == 0 || !is_ident_byte(bytes[abs - 1]);
+                if before_ok {
+                    let args_start = abs + 4;
+                    if let Some(end) = find_matching_paren(&bytes[args_start..]) {
+                        let args = &stripped[args_start..args_start + end];
+                        if cfg_args_contain_test(args) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Match `crates/<name>/tests/...` or `crates/<name>/benches/...`.
