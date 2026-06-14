@@ -1433,7 +1433,7 @@ impl BinomialLocationScaleFamily {
         // derivatives are O(n) at large scale and are called O(K) times per
         // outer REML gradient (K = number of psi coords), so a parallel pass is
         // worthwhile here.
-        pub(crate) struct PsiTermsRow {
+        struct PsiTermsRow {
             r_t: f64,
             r_ls: f64,
             dr_t: f64,
@@ -1824,7 +1824,7 @@ impl BinomialLocationScaleFamily {
         let mut d2h_tl = Array1::<f64>::zeros(n);
         let mut d2h_ll = Array1::<f64>::zeros(n);
         let mut objective_psi_psi = 0.0;
-        pub(crate) struct PsiSecondRow {
+        struct PsiSecondRow {
             r_t: f64,
             r_ls: f64,
             dr_t_i: f64,

@@ -354,7 +354,7 @@ impl<F> ExactNewtonJointPsiWorkspace for LocationScaleJointPsiWorkspace<F>
 where
     F: LocationScaleJointPsiFamily,
 {
-    pub(crate) fn second_order_terms(
+    fn second_order_terms(
         &self,
         psi_i: usize,
         psi_j: usize,
@@ -376,7 +376,7 @@ where
         )?))
     }
 
-    pub(crate) fn hessian_directional_derivative(
+    fn hessian_directional_derivative(
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,

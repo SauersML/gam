@@ -984,6 +984,13 @@ pub struct AtomFunctionalReport {
     /// fit**. A descriptive variation measure of the fitted curve, NOT a
     /// population "marginal slope" (the latent coordinate is itself a fitted,
     /// generated regressor). Point summary only.
+    ///
+    /// Despite the historical `_norm` suffix this is the **signed** mass-weighted
+    /// mean derivative `E_data[∂g/∂t]` over the single leading axis, not a
+    /// magnitude — it can be negative, and a value near 0 means the average slope
+    /// cancels (a symmetric bump), not that the curve is flat. Use
+    /// [`AtomSmoothSignificance::log_e_nonconstant`] for an honest non-constancy
+    /// test; this field only describes the average local slope.
     pub decoder_variation_norm: Option<AtomFunctionalEstimate>,
 }
 

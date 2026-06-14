@@ -399,7 +399,7 @@ pub(crate) fn binomial_location_scale_core(
     /// ensures the pointers outlive the parallel region (see SAFETY: notes
     /// on each `unsafe` site below).
     #[derive(Clone, Copy)]
-    pub(crate) struct SendPtr(*mut f64);
+    struct SendPtr(*mut f64);
     // SAFETY: pointers are constructed from live writable buffers and used
     // only for disjoint per-row writes inside a bounded parallel region; the
     // owning `Vec`s outlive the region.
