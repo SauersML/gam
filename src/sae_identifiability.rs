@@ -1006,19 +1006,35 @@ impl FittedAtom {
     }
 }
 
-/// Riesz-debiased smooth functionals of one fitted atom's decoder curve
-/// (#1097). Each field is the one-step-debiased estimate of a scalar functional
-/// of the atom's inner smooth `g_k(t)`, with influence-based SE, reusing the
-/// atom fit's penalized Hessian as the
+/// Well-posed Riesz-debiased smooth functionals of one fitted atom's decoder
+/// curve (#1097). Each field is the one-step-debiased estimate of a scalar
+/// functional of the atom's inner smooth `g_k(t)`, with influence-based SE,
+/// reusing the atom fit's penalized Hessian as the
 /// [`crate::solver::sensitivity::FitSensitivity`].
+///
+/// These are descriptive questions about a fitted decoder (conditional on the
+/// fit), NOT population causal estimands. In particular there is no per-atom
+/// "marginal slope": the latent coordinate is itself a fitted, generated
+/// regressor, so there is no exogenous treatment whose population effect a
+/// one-step debiasing would target — the derivative functional below is reported
+/// only as a conditional decoder-variation norm.
 #[derive(Debug, Clone)]
 pub struct AtomFunctionalReport {
-    /// `g(t_peak) − g(t_mode)`: the peak-vs-mode contrast.
+    /// `g(t_peak) − g(t_mode)`: the peak-vs-baseline contrast — is the atom's
+    /// peak activation significantly above its mode baseline. A well-posed
+    /// question about a fitted decoder, one-step debiased through the inner-fit
+    /// penalized Hessian.
     pub peak_contrast: Option<RieszDebiasReport>,
-    /// `‖E[∂g/∂t]‖`: the average-derivative magnitude.
-    pub average_derivative_norm: Option<RieszDebiasReport>,
-    /// `E_data[g(t_i)]`: the data-averaged decoder value.
+    /// `E_data[g(t_i)]`: the data-averaged decoder value (mean activation over
+    /// the atom's active rows). Well-posed; debiased through the same Hessian.
     pub average_value: Option<RieszDebiasReport>,
+    /// `‖E_data[∂g/∂t]‖`: how much the decoder curve varies across the data
+    /// distribution along the atom's leading latent axis, **conditional on the
+    /// fit**. This is a descriptive variation measure of the fitted curve — it
+    /// is NOT a population "marginal slope" (there is no exogenous treatment
+    /// whose causal effect this debiases; the latent coordinate is itself a
+    /// fitted, generated regressor). Reported only with that conditional reading.
+    pub decoder_variation_norm: Option<RieszDebiasReport>,
 }
 
 /// Per-atom curvature confidence interval and interior-point flatness test
@@ -2738,17 +2754,6 @@ fn atom_functional_report(fit: &AtomInnerFit) -> AtomFunctionalReport {
     .ok()
     .and_then(debias);
 
-    // ‖E[∂g/∂t]‖ along the leading latent axis: the mass-weighted average of
-    // the derivative-design rows (the Gauss–Newton weights `w_i = a_ik²` are
-    // the data measure over the atom's active rows).
-    let average_derivative_norm = SmoothFunctional::AverageDerivative {
-        derivative_design: fit.derivative_design.view(),
-        weights: Some(fit.weights.view()),
-    }
-    .gradient()
-    .ok()
-    .and_then(debias);
-
     // E_data[g(t_i)]: the mass-weighted average decoder value over active rows.
     let average_value = SmoothFunctional::AverageValue {
         value_design: fit.design.view(),
@@ -2758,10 +2763,22 @@ fn atom_functional_report(fit: &AtomInnerFit) -> AtomFunctionalReport {
     .ok()
     .and_then(debias);
 
+    // ‖E_data[∂g/∂t]‖ along the leading latent axis: the mass-weighted average
+    // of the derivative-design rows (the Gauss–Newton weights `w_i = a_ik²` are
+    // the data measure over the atom's active rows). This is the conditional-
+    // on-fit decoder-VARIATION norm, not a population marginal slope.
+    let decoder_variation_norm = SmoothFunctional::AverageDerivative {
+        derivative_design: fit.derivative_design.view(),
+        weights: Some(fit.weights.view()),
+    }
+    .gradient()
+    .ok()
+    .and_then(debias);
+
     AtomFunctionalReport {
         peak_contrast,
-        average_derivative_norm,
         average_value,
+        decoder_variation_norm,
     }
 }
 
@@ -3547,15 +3564,19 @@ mod tests {
         );
         assert!(av.se.is_finite(), "average-value SE finite");
 
-        // Average derivative magnitude: g'(t) = β1 + 2β2 t, mean over the grid is
-        // β1 + 2β2 * mean(t). The functional gradient is the mean derivative row;
-        // its plug-in is exactly that scalar.
-        let ad = report.average_derivative_norm.expect("average derivative");
+        // Decoder-variation norm (conditional on fit): g'(t) = β1 + 2β2 t, mean
+        // over the grid is β1 + 2β2 * mean(t). The functional gradient is the
+        // mean derivative row; its plug-in is exactly that scalar. This is the
+        // descriptive variation of the fitted curve, not a population marginal
+        // slope.
+        let ad = report
+            .decoder_variation_norm
+            .expect("decoder variation norm");
         let mean_t: f64 = t.iter().sum::<f64>() / n as f64;
         let expected_ad = beta[1] + 2.0 * beta[2] * mean_t;
         assert!(
             (ad.theta_plugin - expected_ad).abs() < 1e-9,
-            "average derivative plug-in {} vs expected {}",
+            "decoder variation plug-in {} vs expected {}",
             ad.theta_plugin,
             expected_ad
         );
