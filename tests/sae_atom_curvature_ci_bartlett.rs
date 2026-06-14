@@ -1,22 +1,25 @@
-//! #1099 + #1103 end-to-end: the per-atom curvature delta-method standard error
-//! and the any-n-valid atom-smooth structure e-value, both consumed through the
+//! #1115 + #1103 end-to-end: the per-atom decoder-functional POINT summaries and
+//! the any-n-valid atom-smooth structure e-value, both consumed through the
 //! public `dictionary_report` surface.
 //!
-//! #1099 reports the plug-in curvature bound `κ̂ = atom_curvature_bound(β̂)` and
-//! its delta-method SE `sqrt((∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β))` through the inner-fit
-//! penalized Hessian, with a Wald normal band. κ is a sup-norm bound read off
-//! the fitted decoder — nothing in any optimisation moves it, so there is no
-//! profiled criterion to walk; the honest uncertainty is the delta-method band.
+//! #1115 removed the #1099 per-atom curvature *confidence interval* and the
+//! influence-function SE on the #1097 functionals: those conditioned on the
+//! fitted latent coordinates / assignment (generated regressors estimated from
+//! the same activations forming the response) as if known, so they omit the
+//! generated-regressor variance channel and under-cover. What survives is the
+//! penalty-debiased POINT summary (`AtomFunctionalEstimate`: plug-in +
+//! debiased + removed bias, NO se/ci) — this test asserts the report exposes no
+//! coverage-claiming fields.
 //!
 //! #1103 reports the split-likelihood-ratio e-value for "the atom's smooth is
 //! non-constant" (the same universal-inference instrument the atom-birth gate
-//! uses), replacing the earlier Lawley–Bartlett-corrected χ².
+//! uses), replacing the earlier Lawley–Bartlett-corrected χ². It IS finite-
+//! sample valid with no regularity conditions, so it is kept.
 //!
 //! The atom's inner decoder smooth is a Gaussian-identity penalized WLS fit
-//! `g_k(t) = Φ_k(t)ᵀ β` with roughness Gram `S`. We build a fixture that carries
-//! a finite curvature gradient so the delta-method SE is real, and assert the
-//! reports are actually POPULATED (not the `None` stub) with a finite SE, a
-//! proper Wald interval, and positive non-constant evidence for a curved atom.
+//! `g_k(t) = Φ_k(t)ᵀ β` with roughness Gram `S`. We assert the reports are
+//! actually POPULATED (not the `None` stub) with finite point summaries and
+//! positive non-constant evidence for a curved atom.
 
 use gam::inference::row_metric::RowMetric;
 use gam::inference::structure_evidence::StructureLedger;
@@ -31,7 +34,7 @@ use ndarray::{Array1, Array2};
 /// that penalizes only the quadratic (curvature) column. The penalized Hessian
 /// is the honest `ΦᵀWΦ + S`; the per-row scores are the fitted-state Gaussian
 /// scores `s_i = −w_i r_i Φ_i / φ` for a planted residual field.
-fn curved_inner_fit(beta_vec: [f64; 3], dispersion: f64, kappa_hat: f64) -> AtomInnerFit {
+fn curved_inner_fit(beta_vec: [f64; 3], dispersion: f64) -> AtomInnerFit {
     let n = 64usize;
     let m = 3usize;
     let mut design = Array2::<f64>::zeros((n, m));
@@ -83,12 +86,6 @@ fn curved_inner_fit(beta_vec: [f64; 3], dispersion: f64, kappa_hat: f64) -> Atom
     let peak_design_row = design.row(n - 1).to_owned();
     let mode_design_row = design.row(n / 2).to_owned();
 
-    // Curvature-functional gradient ∂κ/∂β for the #1099 delta-method SE. The
-    // extrinsic-curvature bound is driven by the quadratic (curvature) column, so
-    // a representative finite gradient concentrates on that column; the SE
-    // sqrt((∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β)) is then a real, finite delta-method band.
-    let kappa_grad = Some(Array1::from(vec![0.0, 0.1, 1.0]));
-
     AtomInnerFit {
         design,
         derivative_design,
@@ -100,8 +97,6 @@ fn curved_inner_fit(beta_vec: [f64; 3], dispersion: f64, kappa_hat: f64) -> Atom
         dispersion,
         peak_design_row,
         mode_design_row,
-        kappa_hat,
-        kappa_grad,
     }
 }
 
@@ -133,52 +128,48 @@ fn single_atom_model(atom: FittedAtom) -> FittedSaeManifold {
 }
 
 #[test]
-fn curved_atom_reports_real_delta_method_curvature_se() {
-    // A strongly curved decoder (large quadratic, low noise) carrying a finite
-    // curvature gradient ⇒ the #1099 delta-method SE is real and the report is
-    // POPULATED (not the old None stub).
-    let fit = curved_inner_fit([0.0, 0.5, 1.0], 1e-2, 0.4);
+fn curved_atom_reports_debiased_point_summaries_without_coverage_claim() {
+    // A strongly curved decoder (large quadratic, low noise). The per-atom
+    // functional report is POPULATED with penalty-debiased POINT summaries and
+    // carries NO se/ci (the AtomFunctionalEstimate type has no such fields by
+    // construction — #1115). The #1103 split-LRT e-value, which IS valid, is
+    // populated and positive.
+    let fit = curved_inner_fit([0.0, 0.5, 1.0], 1e-2);
     let model = single_atom_model(patch_atom_with_fit("curved", fit));
     let ledger = StructureLedger::new();
     let report = dictionary_report(&model, &ledger, 0.05).expect("dictionary report");
 
     let atom = &report.atom_inference[0];
 
-    // #1099 curvature delta-method band is COMPUTED (not None).
-    let ci = atom
-        .curvature_ci
+    // Functional point summaries are populated and finite — plug-in and the
+    // penalty-debiased value, with the removed bias. No coverage-claiming field
+    // exists on the type, so there is nothing to mis-report.
+    let functionals = atom
+        .functionals
         .as_ref()
-        .expect("curved atom with a curvature gradient must report a delta-method SE");
-
-    // κ̂ is the plug-in bound; SE is a finite non-negative delta-method SE.
-    assert!(ci.kappa_hat.is_finite(), "κ̂ must be finite");
-    assert!(
-        ci.se.is_finite() && ci.se >= 0.0,
-        "delta-method SE must be finite and non-negative, got {}",
-        ci.se
-    );
-    // The Wald band is a proper interval centred at κ̂ with half-width z·SE.
-    let (lo, hi) = ci.ci_normal;
-    assert!(
-        lo.is_finite() && hi.is_finite() && lo <= hi,
-        "CI must be a proper interval, got [{lo}, {hi}]"
-    );
-    assert!(
-        ci.kappa_hat >= lo && ci.kappa_hat <= hi,
-        "κ̂ = {} must lie inside its own Wald band [{lo}, {hi}]",
-        ci.kappa_hat
-    );
-    let half = 0.5 * (hi - lo);
-    assert!(
-        (half - 1.959_963_984_540_054 * ci.se).abs() < 1e-9,
-        "Wald half-width {half} must equal z·SE for z=1.959964, SE={}",
-        ci.se
-    );
+        .expect("curved atom must report decoder-functional point summaries");
+    for estimate in [
+        functionals.average_value.as_ref(),
+        functionals.peak_contrast.as_ref(),
+        functionals.decoder_variation_norm.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(
+            estimate.theta_plugin.is_finite()
+                && estimate.theta_onestep.is_finite()
+                && estimate.penalty_bias.is_finite(),
+            "functional point summary must be finite: plugin={}, onestep={}, bias={}",
+            estimate.theta_plugin,
+            estimate.theta_onestep,
+            estimate.penalty_bias
+        );
+    }
 
     // #1103 split-LRT smooth-structure e-value is POPULATED and finite. A
     // strongly curved (non-constant) decoder must carry POSITIVE log-evidence
-    // for the non-constant alternative — the honest any-n-valid instrument
-    // earns evidence where the Bartlett-corrected χ² used to.
+    // for the non-constant alternative — the honest any-n-valid instrument.
     let sig = atom
         .smooth_significance
         .as_ref()
@@ -194,34 +185,26 @@ fn curved_atom_reports_real_delta_method_curvature_se() {
 }
 
 #[test]
-fn flat_atom_still_yields_a_real_delta_method_se() {
-    // A flat decoder (no quadratic energy) still carries a finite curvature
-    // gradient and an SPD inner Hessian, so the #1099 delta-method band is real
-    // and populated. κ̂ must lie inside its own Wald band.
-    let fit = curved_inner_fit([0.0, 0.5, 0.0], 1e-2, 0.0);
+fn flat_atom_functional_debiased_value_matches_plugin() {
+    // A flat decoder (no quadratic energy) still yields finite penalty-debiased
+    // point summaries; with negligible penalty bias the debiased value tracks
+    // the plug-in. No SE/CI is reported (#1115).
+    let fit = curved_inner_fit([0.0, 0.5, 0.0], 1e-2);
     let model = single_atom_model(patch_atom_with_fit("flat", fit));
     let ledger = StructureLedger::new();
     let report = dictionary_report(&model, &ledger, 0.05).expect("dictionary report");
 
     let atom = &report.atom_inference[0];
-    let ci = atom
-        .curvature_ci
+    let functionals = atom
+        .functionals
         .as_ref()
-        .expect("flat atom with a curvature gradient still reports a delta-method SE");
-
+        .expect("flat atom must report decoder-functional point summaries");
+    let av = functionals
+        .average_value
+        .as_ref()
+        .expect("flat atom must report an average-value point summary");
     assert!(
-        ci.se.is_finite() && ci.se >= 0.0,
-        "delta-method SE must be finite and non-negative, got {}",
-        ci.se
-    );
-    let (lo, hi) = ci.ci_normal;
-    assert!(
-        lo.is_finite() && hi.is_finite() && lo <= hi,
-        "CI must be a proper interval, got [{lo}, {hi}]"
-    );
-    assert!(
-        ci.kappa_hat >= lo && ci.kappa_hat <= hi,
-        "κ̂ = {} must lie inside its own Wald band [{lo}, {hi}]",
-        ci.kappa_hat
+        av.theta_plugin.is_finite() && av.theta_onestep.is_finite(),
+        "average-value point summary must be finite"
     );
 }
