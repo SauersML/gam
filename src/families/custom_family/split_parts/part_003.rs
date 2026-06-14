@@ -1114,6 +1114,28 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             lhs[[d, d]] += constrained_levenberg_mu;
                         }
                     }
+                    // MODIFIED-NEWTON CONVEXIFICATION (gam#1040 / gam#979). The
+                    // exact survival marginal-slope joint NLL Hessian is INDEFINITE
+                    // on the flat baseline-hazard λ valley (the linear baseline +
+                    // the z·exp(logslope) cross-coupling carry genuine negative
+                    // curvature away from the optimum). The active-set QP below
+                    // minimizes `½βᵀHβ − rhs_betaᵀβ`; with an indefinite `H` that
+                    // model has a direction that LOWERS the local quadratic
+                    // objective while moving AWAY from the KKT point. The
+                    // trust-region wrapper gates acceptance on the objective-
+                    // reduction ratio ρ — NOT on the stationarity residual — so it
+                    // accepts every such step at ρ≈1 and GROWS its radius while the
+                    // stationarity residual DIVERGES (the measured 3.5e4 → 9.5e6
+                    // blow-up on the time block). The unconstrained dense-spectral
+                    // path never exhibits this because `WhitenedHessianSpectrum`
+                    // already reflects negative-curvature modes to `|γ|`; the
+                    // constrained branch must do the same to its dense `lhs`.
+                    // Reflecting (not clamping-to-zero) keeps the curvature
+                    // magnitude so the QP stays bounded and the step length matches
+                    // the dense path; at a genuine constrained optimum the reduced
+                    // Hessian is PSD so this is a no-op and the converged β is
+                    // unchanged.
+                    let lhs = symmetric_negative_curvature_reflected(&lhs);
                     let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
                     let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
                         solve_quadratic_with_simple_lower_bounds(

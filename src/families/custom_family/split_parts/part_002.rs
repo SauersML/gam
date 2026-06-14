@@ -5571,6 +5571,59 @@ fn symmetric_psd_projection(matrix: &Array2<f64>) -> Array2<f64> {
 }
 
 
+/// Modified-Newton convexification of a symmetric (penalized) Hessian: reflect
+/// every negative-curvature eigen-direction to its magnitude `|λ|` and floor the
+/// remaining (near-null) modes to a small positive multiple of `λmax`, returning
+/// a positive-definite matrix with the SAME eigenvectors.
+///
+/// This is the exact negative-curvature handling the unconstrained dense-spectral
+/// path already performs inside `WhitenedHessianSpectrum::assemble` (negative `γ`
+/// reflected to `|γ|`). The CONSTRAINED active-set QP branch, by contrast, feeds
+/// the raw penalized Hessian to `solve_quadratic_with_linear_constraints`. On the
+/// survival marginal-slope flat baseline-hazard λ valley the EXACT joint NLL
+/// Hessian is INDEFINITE away from the optimum (the linear baseline + the
+/// z·exp(logslope) cross-coupling carry genuine negative curvature there). An
+/// indefinite QP model has a direction that lowers the local quadratic objective
+/// while moving AWAY from the KKT point, so the trust region — which gates on the
+/// objective-reduction ratio ρ, not the stationarity residual — happily accepts
+/// step after step at ρ≈1 and GROWS its radius while the stationarity residual
+/// diverges (`per_block_resid[time]` 3.5e4 → 9.5e6 over 11 cycles, the gam#1040 /
+/// gam#979 divergence). The self-vanishing Levenberg μ cannot rescue this: a
+/// μ·I shift that is tiny relative to the most-negative eigenvalue leaves the
+/// model indefinite, and a μ large enough to flip it would bias the converged β.
+///
+/// Reflecting (not merely clamping-to-zero as `symmetric_psd_projection` does)
+/// preserves the curvature MAGNITUDE on negative modes, so the modified-Newton
+/// step length matches the dense-spectral path's and the QP stays bounded (a
+/// clamp-to-zero null mode would make the QP unbounded along that direction). At
+/// a genuine optimum the constrained Hessian over the identified subspace is PSD,
+/// so the reflection is a no-op there and the converged β is unchanged — exactly
+/// the property the dense path relies on. Falls back to the (symmetrized) input
+/// if the eigendecomposition fails: the conservative undamped step, never a wrong
+/// one.
+fn symmetric_negative_curvature_reflected(matrix: &Array2<f64>) -> Array2<f64> {
+    let p = matrix.nrows();
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let Ok((evals, evecs)) = FaerEigh::eigh(&sym, Side::Lower) else {
+        return sym;
+    };
+    let lambda_max_abs = evals.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    if !(lambda_max_abs.is_finite() && lambda_max_abs > 0.0) {
+        return sym;
+    }
+    // Positive floor for near-null modes: the same relative scale the dense
+    // spectral path uses for its numerical-rank cutoff, so a flat direction
+    // gets a tiny-but-strictly-positive curvature (bounded QP) instead of a
+    // zero one (unbounded QP). Reflecting already makes every above-floor mode
+    // positive; this only lifts the genuine null modes off zero.
+    let floor = lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
+    let reflected = Array1::from_iter(evals.iter().map(|lam| lam.abs().max(floor)));
+    let scaled = &evecs * &reflected.view().insert_axis(ndarray::Axis(0));
+    scaled.dot(&evecs.t())
+}
+
+
 fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<usize> {
     let p = lhs.nrows();
     if p == 0 || lhs.ncols() != p {
