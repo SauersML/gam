@@ -517,6 +517,34 @@ pub struct CertifiedChart {
     pub beta_center: f64,
     /// Certified Newton radius: starts within `radius` of `t_c` satisfy `h ≤ ½`.
     pub certified_radius: f64,
+    /// Distilled amortized-encoder Jacobian for this chart (#1026 ladder item 3).
+    ///
+    /// The exact encode map `x ↦ t` solves `F(t; x) = J_m(t)ᵀ(m(t) − x) = 0`. By
+    /// the implicit function theorem its derivative at the converged root is
+    /// `dt/dx = −(∂_t F)⁻¹ (∂_x F) = H⁻¹ J_m` (since `∂_x F = −J_m`), so the
+    /// first-order Taylor expansion of the encode map about this chart's center
+    /// `t_c` is the closed-form AFFINE predictor
+    ///
+    /// ```text
+    /// t(x) ≈ t_c + (1/z) · A₁ · (x − z · m₁(t_c)),   A₁ = (J₁ᵀJ₁ + ridge·I)⁻¹ J₁,
+    /// ```
+    ///
+    /// with `J₁ = Bᵀ J_Φ(t_c)` and `m₁(t_c) = BᵀΦ(t_c)` the AMPLITUDE-1
+    /// reconstruction jets (the amplitude `z` factors out analytically, so the
+    /// stored Jacobian is amplitude-free). This is the DISTILLED amortized
+    /// encoder of the #1026 thread: the per-row Hessian factorization + Newton
+    /// iteration is moved OFFLINE into this `d × p` matrix, leaving a single
+    /// `O(d·p)` mat-vec online — no per-row eigendecomposition, no second-jet
+    /// evaluation. The Kantorovich certificate is still evaluated AT the
+    /// predicted start, so the amortized prediction is trusted iff `h ≤ ½` and an
+    /// uncertified row still routes to the exact multi-start solve (the encoder
+    /// approximates inference, the certificate keeps it honest — the thread's
+    /// "encoder + certificate-gated exact fallback" deployment). `None` when the
+    /// center's Gauss–Newton block is singular (no certifiable amortization).
+    pub amortized_jacobian: Option<Array2<f64>>,
+    /// Amplitude-1 chart-center reconstruction `m₁(t_c) = BᵀΦ(t_c)` (length `p`),
+    /// the anchor the amortized predictor expands the encode map around.
+    pub recon_center: Array1<f64>,
 }
 
 /// The per-atom encode atlas: a set of certified charts covering the atom's
@@ -985,16 +1013,29 @@ impl EncodeAtlas {
             let beta_center = match center_beta(atom, &center, config.ridge) {
                 Some(b) => b,
                 None => {
-                    // Degenerate center curvature: no certifiable chart here.
+                    // Degenerate center curvature: no certifiable chart here, and
+                    // no amortized Jacobian (the same singular Gauss–Newton block).
                     charts.push(CertifiedChart {
                         region,
                         lipschitz,
                         beta_center: f64::INFINITY,
                         certified_radius: 0.0,
+                        amortized_jacobian: None,
+                        recon_center: Array1::<f64>::zeros(atom.output_dim()),
                     });
                     continue;
                 }
             };
+            // Distill the amortized-encoder Jacobian at this center (#1026 ladder
+            // item 3): the IFT derivative of the encode map, precomputed offline
+            // so the online encode is one mat-vec. A finite `beta_center` (above)
+            // means the Gauss–Newton block is non-singular, so this succeeds
+            // alongside it; the pair travels together on the chart.
+            let (amortized_jacobian, recon_center) =
+                match center_amortized_jacobian(atom, &center, config.ridge) {
+                    Some((a1, m1)) => (Some(a1), m1),
+                    None => (None, Array1::<f64>::zeros(atom.output_dim())),
+                };
             // Certified radius from h = β·η·L ≤ ½ with η ≤ R (Newton step length
             // is bounded by the start distance to the root, itself ≤ chart
             // radius at worst): R_c = ½ / (β·L), capped at the nominal radius.
@@ -1008,6 +1049,8 @@ impl EncodeAtlas {
                 lipschitz,
                 beta_center,
                 certified_radius,
+                amortized_jacobian,
+                recon_center,
             });
         }
         Ok(AtomEncodeAtlas {
@@ -1089,6 +1132,177 @@ impl EncodeAtlas {
             }
         }
         Ok((t, cert))
+    }
+
+    /// Amortized (distilled) encode of one target row `x` against one atom `k`
+    /// with fixed amplitude `z` (#1026 ladder item 3).
+    ///
+    /// Routes to the nearest chart, then predicts the latent coordinate in CLOSED
+    /// FORM from that chart's precomputed implicit-function-theorem Jacobian:
+    ///
+    /// ```text
+    /// t̂ = t_c + (1/z) · A₁ · (x − z · m₁(t_c)),
+    /// ```
+    ///
+    /// a single `O(d·p)` mat-vec — no per-row Hessian factorization or
+    /// eigendecomposition, which is the amortization. The Kantorovich
+    /// certificate is then evaluated AT the predicted start `t̂` with the chart's
+    /// closed-form Lipschitz constant: the amortized prediction is trusted iff
+    /// `h ≤ ½`, and an uncertified row is flagged for the exact multi-start
+    /// solve. This is exactly the thread's "encoder + certificate-gated exact
+    /// fallback" deployment — the distilled map approximates inference, the
+    /// certificate keeps every accepted encode honest. A certified prediction
+    /// may take up to `config.newton_steps` quadratic refinement steps from `t̂`
+    /// (the certificate guarantees the basin), so the amortized start only has to
+    /// land the row in the certified ball — strictly easier than the chart-center
+    /// start of [`Self::certified_encode_row`]. A chart without a distilled
+    /// Jacobian (singular Gauss–Newton block) flags the row.
+    pub fn amortized_encode_row(
+        &self,
+        atom: &SaeManifoldAtom,
+        atom_index: usize,
+        x: ArrayView1<'_, f64>,
+        amplitude: f64,
+    ) -> Result<(Array1<f64>, RowCertificate), String> {
+        let atom_atlas = self
+            .atoms
+            .get(atom_index)
+            .ok_or_else(|| format!("amortized_encode_row: atom {atom_index} not in atlas"))?;
+        let evaluator = atom
+            .basis_evaluator
+            .as_ref()
+            .ok_or_else(|| format!("amortized_encode_row: atom {atom_index} has no evaluator"))?
+            .clone();
+        let d = atom.latent_dim;
+        let uncertified = || {
+            (
+                Array1::<f64>::zeros(d),
+                RowCertificate {
+                    beta: f64::INFINITY,
+                    eta: f64::INFINITY,
+                    lipschitz: f64::INFINITY,
+                    h: f64::INFINITY,
+                },
+            )
+        };
+        let Some((chart_idx, _)) = nearest_chart(atom_atlas, x, atom, evaluator.as_ref()) else {
+            return Ok(uncertified());
+        };
+        let chart = &atom_atlas.charts[chart_idx];
+        // A chart whose Gauss–Newton block was singular carries no distilled
+        // Jacobian — the amortized predictor cannot fire, so flag for the exact
+        // fallback (never a silent wrong encode).
+        let Some(a1) = chart.amortized_jacobian.as_ref() else {
+            return Ok(uncertified());
+        };
+        // Closed-form predicted start t̂ = t_c + (1/z)·A₁·(x − z·m₁). With z ≈ 0
+        // the amplitude-divided map is undefined (a near-inactive atom); the
+        // certificate at the chart center handles those rows, so flag here.
+        if !(amplitude.is_finite() && amplitude.abs() > 0.0) {
+            return Ok(uncertified());
+        }
+        let p = atom.output_dim();
+        let mut t_hat = chart.region.center.clone();
+        for (out_idx, &m1_out) in chart.recon_center.iter().enumerate().take(p) {
+            let resid = x[out_idx] - amplitude * m1_out;
+            for axis in 0..d {
+                t_hat[axis] += a1[[axis, out_idx]] * resid / amplitude;
+            }
+        }
+        // Evaluate the SAME Kantorovich certificate at the predicted start. The
+        // amortized prediction is trusted iff the certificate holds there.
+        let (cert, mut delta) = row_certificate(
+            atom,
+            evaluator.as_ref(),
+            t_hat.view(),
+            x,
+            amplitude,
+            chart.lipschitz,
+            self.config.ridge,
+        )?;
+        if !cert.certified() {
+            return Ok((t_hat, cert));
+        }
+        // Certified: optional quadratic refinement from the amortized start.
+        for step in 0..self.config.newton_steps {
+            t_hat = &t_hat + &delta;
+            if step + 1 < self.config.newton_steps {
+                let (_c, next_delta) = row_certificate(
+                    atom,
+                    evaluator.as_ref(),
+                    t_hat.view(),
+                    x,
+                    amplitude,
+                    chart.lipschitz,
+                    self.config.ridge,
+                )?;
+                delta = next_delta;
+            }
+        }
+        Ok((t_hat, cert))
+    }
+
+    /// Batched amortized (distilled) encode over many rows against one atom
+    /// (#1026 ladder item 3, corpus-rate). Each row uses the closed-form
+    /// per-chart Jacobian predictor and carries its own Kantorovich certificate;
+    /// uncertified rows are flagged in [`EncodeResult::encode_uncertified_count`]
+    /// for the exact multi-start fallback. Row-independent against the frozen
+    /// dictionary, so the batch fans out over rows (deterministic row-order
+    /// assembly, bit-identical run-to-run), staying sequential inside a rayon
+    /// worker to avoid nested oversubscription.
+    pub fn amortized_encode_batch(
+        &self,
+        atom: &SaeManifoldAtom,
+        atom_index: usize,
+        targets: ArrayView2<'_, f64>,
+        amplitudes: ArrayView1<'_, f64>,
+    ) -> Result<EncodeResult, String> {
+        let n = targets.nrows();
+        if amplitudes.len() != n {
+            return Err(format!(
+                "amortized_encode_batch: amplitudes len {} != rows {n}",
+                amplitudes.len()
+            ));
+        }
+        let d = atom.latent_dim;
+        let encode_rows =
+            |range: std::ops::Range<usize>| -> Result<Vec<(Array1<f64>, bool)>, String> {
+                range
+                    .map(|row| {
+                        let (t, cert) = self.amortized_encode_row(
+                            atom,
+                            atom_index,
+                            targets.row(row),
+                            amplitudes[row],
+                        )?;
+                        Ok((t, cert.certified()))
+                    })
+                    .collect()
+            };
+        let rows: Vec<(Array1<f64>, bool)> =
+            if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
+                use rayon::prelude::*;
+                const CHUNK: usize = 256;
+                let n_chunks = n.div_ceil(CHUNK);
+                let chunked: Vec<Vec<(Array1<f64>, bool)>> = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|c| {
+                        let start = c * CHUNK;
+                        let end = (start + CHUNK).min(n);
+                        encode_rows(start..end)
+                    })
+                    .collect::<Result<_, _>>()?;
+                chunked.into_iter().flatten().collect()
+            } else {
+                encode_rows(0..n)?
+            };
+        let mut coords = Array2::<f64>::zeros((n, d));
+        let mut certified = Vec::with_capacity(n);
+        for (row, (t, cert)) in rows.into_iter().enumerate() {
+            coords.row_mut(row).assign(&t);
+            certified.push(cert);
+        }
+        Ok(EncodeResult::from_rows(coords, certified))
     }
 
     /// Batched certified encode over many rows against one atom (the #988
@@ -1266,6 +1480,98 @@ impl EncodeAtlas {
         }
         Ok(EncodeResult::from_rows(coords, certified))
     }
+
+    /// LSH-routed AMORTIZED (distilled) encode — the production token-rate
+    /// encoder of #1026 ladder item 3. Identical routing to
+    /// [`Self::certified_encode_with_index`] (LSH proposes the best-aligned atom,
+    /// the atlas routes to the in-atom nearest chart), but the in-atom encode is
+    /// the closed-form per-chart Jacobian predictor + certificate gate of
+    /// [`Self::amortized_encode_row`] rather than the chart-center Newton solve.
+    /// This is the deployment path: the distilled affine map produces the encode
+    /// in one mat-vec, the Kantorovich certificate decides trust-or-fallback per
+    /// row, and uncertified rows (the adversarial tail the thread expects to
+    /// concentrate on rare tokens) are flagged for the exact multi-start solve —
+    /// compute goes where the questions are. Row-independent against the frozen
+    /// dictionary, so the batch fans out over rows with deterministic row-order
+    /// assembly (bit-identical run-to-run).
+    pub fn amortized_encode_with_index<S: AtomFrameSketch + Sync>(
+        &self,
+        atoms: &[SaeManifoldAtom],
+        index: &SaeCandidateIndex,
+        sketch: &S,
+        targets: ArrayView2<'_, f64>,
+        amplitudes: ArrayView1<'_, f64>,
+        latent_dim: usize,
+    ) -> Result<EncodeResult, String> {
+        let n = targets.nrows();
+        if amplitudes.len() != n {
+            return Err(format!(
+                "amortized_encode_with_index: amplitudes len {} != rows {n}",
+                amplitudes.len()
+            ));
+        }
+        let budget = auto_candidate_budget(atoms.len().max(1));
+        let encode_rows =
+            |range: std::ops::Range<usize>| -> Result<Vec<Option<(Array1<f64>, bool)>>, String> {
+                range
+                    .map(|row| {
+                        let proposal = index.propose(sketch, targets.row(row), budget, true);
+                        let Some(&best_atom) = proposal.proposed.first() else {
+                            return Ok(None);
+                        };
+                        let atom = atoms.get(best_atom).ok_or_else(|| {
+                            format!(
+                                "amortized_encode_with_index: proposed atom {best_atom} out of range"
+                            )
+                        })?;
+                        let (t, cert) = self.amortized_encode_row(
+                            atom,
+                            best_atom,
+                            targets.row(row),
+                            amplitudes[row],
+                        )?;
+                        if t.len() != latent_dim {
+                            return Err(format!(
+                                "amortized_encode_with_index: atom {best_atom} returned t.len()={} \
+                                 but declared latent_dim={latent_dim}; heterogeneous-dim \
+                                 dictionaries are not supported by this batched encode path",
+                                t.len()
+                            ));
+                        }
+                        Ok(Some((t, cert.certified())))
+                    })
+                    .collect()
+            };
+        let rows: Vec<Option<(Array1<f64>, bool)>> =
+            if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
+                use rayon::prelude::*;
+                const CHUNK: usize = 256;
+                let n_chunks = n.div_ceil(CHUNK);
+                let chunked: Vec<Vec<Option<(Array1<f64>, bool)>>> = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|c| {
+                        let start = c * CHUNK;
+                        let end = (start + CHUNK).min(n);
+                        encode_rows(start..end)
+                    })
+                    .collect::<Result<_, _>>()?;
+                chunked.into_iter().flatten().collect()
+            } else {
+                encode_rows(0..n)?
+            };
+        let mut coords = Array2::<f64>::zeros((n, latent_dim));
+        let mut certified = Vec::with_capacity(n);
+        for (row, slot) in rows.into_iter().enumerate() {
+            match slot {
+                Some((t, cert)) => {
+                    coords.row_mut(row).assign(&t);
+                    certified.push(cert);
+                }
+                None => certified.push(false),
+            }
+        }
+        Ok(EncodeResult::from_rows(coords, certified))
+    }
 }
 
 /// Offline `β = 1/λ_min(H_GN)` at a chart center from the Gauss-Newton block
@@ -1311,6 +1617,86 @@ fn center_beta(atom: &SaeManifoldAtom, center: &Array1<f64>, ridge: f64) -> Opti
     } else {
         None
     }
+}
+
+/// The amplitude-1 distilled amortized-encoder Jacobian at a chart center
+/// (#1026 ladder item 3). Returns `(A₁, m₁)` where `m₁ = BᵀΦ(t_c) ∈ ℝᵖ` is the
+/// amplitude-1 center reconstruction and `A₁ = (J₁ᵀJ₁ + ridge·I)⁻¹ J₁ ∈ ℝ^{d×p}`
+/// is the implicit-function-theorem derivative of the encode map `x ↦ t`
+/// (Gauss–Newton block — the residual-free, dominant curvature exactly as the
+/// offline radius-sizing `β`). With these, the online encode of a row `x` at
+/// amplitude `z` is the closed-form affine prediction
+/// `t = t_c + (1/z)·A₁·(x − z·m₁)` — one mat-vec, no per-row factorization.
+/// `None` when the basis has no jet or the Gauss–Newton block is singular (no
+/// certifiable amortization), matching `center_beta`'s gate so a chart with a
+/// finite `β` always carries a Jacobian and vice versa.
+fn center_amortized_jacobian(
+    atom: &SaeManifoldAtom,
+    center: &Array1<f64>,
+    ridge: f64,
+) -> Option<(Array2<f64>, Array1<f64>)> {
+    let evaluator = atom.basis_evaluator.as_ref()?.clone();
+    let d = atom.latent_dim;
+    let p = atom.output_dim();
+    let m = atom.basis_size();
+    let coords = center.view().to_shape((1, d)).ok()?.to_owned();
+    let (phi, jet) = evaluator.evaluate(coords.view()).ok()?;
+    let decoder = &atom.decoder_coefficients;
+    // m₁(t_c) = BᵀΦ(t_c) ∈ ℝᵖ (amplitude-1 center reconstruction).
+    let mut recon = Array1::<f64>::zeros(p);
+    for basis_col in 0..m {
+        let phi_v = phi[[0, basis_col]];
+        if phi_v == 0.0 {
+            continue;
+        }
+        for out in 0..p {
+            recon[out] += phi_v * decoder[[basis_col, out]];
+        }
+    }
+    // J₁[axis] = Bᵀ (∂Φ/∂t_axis) ∈ ℝᵖ (amplitude-1; z factors out analytically).
+    let mut jm = Array2::<f64>::zeros((d, p));
+    for axis in 0..d {
+        for basis_col in 0..m {
+            let dphi = jet[[0, basis_col, axis]];
+            if dphi == 0.0 {
+                continue;
+            }
+            for out in 0..p {
+                jm[[axis, out]] += dphi * decoder[[basis_col, out]];
+            }
+        }
+    }
+    // H_GN = J₁ J₁ᵀ + ridge·I ∈ ℝ^{d×d}.
+    let mut h = Array2::<f64>::zeros((d, d));
+    for a in 0..d {
+        for b in 0..d {
+            h[[a, b]] = jm.row(a).dot(&jm.row(b));
+        }
+        h[[a, a]] += ridge;
+    }
+    let (vals, vecs) = h.eigh(Side::Lower).ok()?;
+    let lambda_min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    if !(lambda_min.is_finite() && lambda_min > 0.0) {
+        return None;
+    }
+    // A₁ = H_GN⁻¹ J₁ via the eigendecomposition: H⁻¹ = Σ_i (1/λᵢ) vᵢ vᵢᵀ, so
+    // A₁[:, out] = Σ_i (vᵢ · J₁[:, out]) / λᵢ · vᵢ. Column-by-column keeps it the
+    // d×p Jacobian (one SPD solve reused across all p output channels).
+    let mut a1 = Array2::<f64>::zeros((d, p));
+    for out in 0..p {
+        let jcol = jm.column(out);
+        for (i, &lam) in vals.iter().enumerate() {
+            if !(lam.is_finite() && lam > 0.0) {
+                return None;
+            }
+            let vi = vecs.column(i);
+            let coeff = vi.dot(&jcol) / lam;
+            for row in 0..d {
+                a1[[row, out]] += coeff * vi[row];
+            }
+        }
+    }
+    Some((a1, recon))
 }
 
 /// Route a target row to the nearest chart of an atom by reconstruction

@@ -428,3 +428,267 @@ fn lsh_routed_encode_rejects_declared_latent_dim_mismatch() {
         "unexpected error: {err}"
     );
 }
+
+// ----------------------------------------------------------------------------
+// #1026 ladder item 3 — distilled amortized encoder.
+//
+// The amortized encoder predicts the latent coordinate in CLOSED FORM from the
+// per-chart implicit-function-theorem Jacobian (one mat-vec, no per-row Hessian
+// factorization or Newton solve), then evaluates the SAME Kantorovich
+// certificate at the prediction. Accepted iff h ≤ ½; uncertified rows flag for
+// the exact fallback. These tests assert the distilled map is honest (count
+// invariant), exact on accepted rows (recovers the planted coordinate), and
+// that its closed-form prediction is genuinely the IFT first-order map.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn amortized_encode_recovers_planted_coordinate_on_certified_rows() {
+    let atom = planted_circle_atom(16);
+    let atlas = EncodeAtlas::build(
+        std::slice::from_ref(&atom),
+        &[1.0],
+        1.0,
+        AtlasConfig {
+            grid_resolution: 48,
+            ridge: 1.0e-9,
+            newton_steps: 2,
+        },
+    )
+    .expect("atlas build");
+
+    let n = 256usize;
+    let mut targets = Array2::<f64>::zeros((n, P));
+    for row in 0..n {
+        let t = row as f64 / n as f64;
+        targets.row_mut(row).assign(&circle_target(t));
+    }
+    let amplitudes = Array1::<f64>::ones(n);
+
+    let result = atlas
+        .amortized_encode_batch(&atom, 0, targets.view(), amplitudes.view())
+        .expect("amortized batch encode");
+
+    // Honesty invariant: reported uncertified count equals actual flagged rows.
+    let actual_flagged = result.certified.iter().filter(|c| !**c).count();
+    assert_eq!(
+        result.encode_uncertified_count, actual_flagged,
+        "encode_uncertified_count must equal the number of flagged rows"
+    );
+
+    // On-manifold rows with a fine grid: the distilled affine map lands the row
+    // in the certified ball for the large majority (the IFT Jacobian is exact at
+    // the center, so a near-center on-manifold row is well-predicted).
+    let certified_count = n - result.encode_uncertified_count;
+    assert!(
+        certified_count * 100 >= n * 80,
+        "at least 80% of on-manifold rows must certify under the distilled map; got {certified_count}/{n}"
+    );
+
+    // Every CERTIFIED amortized row must reconstruct its target — the certificate
+    // is load-bearing: an accepted closed-form prediction is exact-into-the-ball.
+    let evaluator = PeriodicHarmonicEvaluator::new(M).unwrap();
+    let mut worst = 0.0_f64;
+    for row in 0..n {
+        if !result.certified[row] {
+            continue;
+        }
+        let t_hat = result.coords[[row, 0]];
+        let c = Array2::from_shape_vec((1, 1), vec![t_hat]).unwrap();
+        let (phi, _j) = evaluator.evaluate(c.view()).unwrap();
+        let recon = Array1::from(vec![phi[[0, 2]], phi[[0, 1]]]);
+        let err = (&recon - &targets.row(row).to_owned())
+            .dot(&(&recon - &targets.row(row).to_owned()))
+            .sqrt();
+        worst = worst.max(err);
+    }
+    assert!(
+        worst < 5e-2,
+        "certified amortized rows must reconstruct their targets; worst error = {worst}"
+    );
+}
+
+#[test]
+fn amortized_encode_matches_certified_newton_on_certified_rows() {
+    // The distilled encoder and the chart-center Newton encoder solve the SAME
+    // frozen-dictionary problem; on rows both certify, they must converge to the
+    // same coordinate (both land the unique root in the certified ball). This is
+    // the "encoder approximates inference" guarantee made exact by the
+    // certificate gate + the shared Newton refinement.
+    let atom = planted_circle_atom(16);
+    let atlas = EncodeAtlas::build(
+        std::slice::from_ref(&atom),
+        &[1.0],
+        1.0,
+        AtlasConfig {
+            grid_resolution: 48,
+            ridge: 1.0e-9,
+            newton_steps: 2,
+        },
+    )
+    .expect("atlas build");
+
+    let n = 200usize;
+    let mut targets = Array2::<f64>::zeros((n, P));
+    for row in 0..n {
+        let t = row as f64 / n as f64;
+        targets.row_mut(row).assign(&circle_target(t));
+    }
+    let amplitudes = Array1::<f64>::ones(n);
+
+    let amortized = atlas
+        .amortized_encode_batch(&atom, 0, targets.view(), amplitudes.view())
+        .expect("amortized batch");
+    let exact = atlas
+        .certified_encode_batch(&atom, 0, targets.view(), amplitudes.view())
+        .expect("exact batch");
+
+    let mut compared = 0usize;
+    let mut worst = 0.0_f64;
+    for row in 0..n {
+        if !(amortized.certified[row] && exact.certified[row]) {
+            continue;
+        }
+        // Compare on the circle (angle is periodic): use reconstruction distance
+        // so the wrap at the period boundary doesn't create a false gap.
+        let evaluator = PeriodicHarmonicEvaluator::new(M).unwrap();
+        let ca = Array2::from_shape_vec((1, 1), vec![amortized.coords[[row, 0]]]).unwrap();
+        let ce = Array2::from_shape_vec((1, 1), vec![exact.coords[[row, 0]]]).unwrap();
+        let (pa, _) = evaluator.evaluate(ca.view()).unwrap();
+        let (pe, _) = evaluator.evaluate(ce.view()).unwrap();
+        let ra = Array1::from(vec![pa[[0, 2]], pa[[0, 1]]]);
+        let re = Array1::from(vec![pe[[0, 2]], pe[[0, 1]]]);
+        let gap = (&ra - &re).dot(&(&ra - &re)).sqrt();
+        worst = worst.max(gap);
+        compared += 1;
+    }
+    assert!(
+        compared >= n / 2,
+        "the two paths should both certify on a large shared set; compared {compared}/{n}"
+    );
+    assert!(
+        worst < 1e-6,
+        "distilled and Newton encoders must converge to the same root on shared certified rows; worst gap = {worst}"
+    );
+}
+
+#[test]
+fn lsh_routed_amortized_encode_matches_direct_amortized_encode() {
+    // The production token-rate path: LSH selects the atom per row, then the
+    // distilled per-chart predictor encodes against it. With a single-atom
+    // dictionary every row routes to atom 0, so the routed amortized result must
+    // equal the direct per-atom amortized batch (composition correctness).
+    let atom = planted_circle_atom(8);
+    let atlas = EncodeAtlas::build(
+        std::slice::from_ref(&atom),
+        &[1.0],
+        1.0,
+        AtlasConfig {
+            grid_resolution: 32,
+            ridge: 1.0e-9,
+            newton_steps: 2,
+        },
+    )
+    .expect("atlas build");
+
+    let frame = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap();
+    let sketch =
+        RandomProjectionFrameSketch::from_decoder_blocks(&[frame], 8, 7).expect("sketch build");
+    let index = SaeCandidateIndex::build(&sketch, IndexConfig::auto(8, 1, 7)).expect("index build");
+
+    let n = 64usize;
+    let mut targets = Array2::<f64>::zeros((n, P));
+    for row in 0..n {
+        let t = row as f64 / n as f64;
+        targets.row_mut(row).assign(&circle_target(t));
+    }
+    let amplitudes = Array1::<f64>::ones(n);
+
+    let routed = atlas
+        .amortized_encode_with_index(
+            std::slice::from_ref(&atom),
+            &index,
+            &sketch,
+            targets.view(),
+            amplitudes.view(),
+            1,
+        )
+        .expect("routed amortized encode");
+    let direct = atlas
+        .amortized_encode_batch(&atom, 0, targets.view(), amplitudes.view())
+        .expect("direct amortized encode");
+
+    for row in 0..n {
+        assert_eq!(
+            routed.certified[row], direct.certified[row],
+            "row {row}: routed/direct certificate disagree"
+        );
+        if routed.certified[row] {
+            let gap = (routed.coords[[row, 0]] - direct.coords[[row, 0]]).abs();
+            assert!(
+                gap < 1e-12,
+                "row {row}: routed amortized coord must equal direct amortized coord; gap = {gap}"
+            );
+        }
+    }
+}
+
+#[test]
+fn amortized_predictor_is_the_ift_first_order_map() {
+    // The distilled Jacobian is the implicit-function-theorem derivative of the
+    // encode map x ↦ t. Perturbing the target along the manifold tangent at a
+    // chart center by a small δ must move the predicted coordinate by the IFT
+    // first-order amount — i.e. the closed-form prediction tracks the true root
+    // to first order. We verify the predictor is NOT the chart center (it
+    // actually uses the row) and that doubling the on-tangent perturbation
+    // roughly doubles the coordinate displacement (linearity of the affine map).
+    let atom = planted_circle_atom(64);
+    let atlas = EncodeAtlas::build(
+        std::slice::from_ref(&atom),
+        &[1.0],
+        1.0,
+        AtlasConfig {
+            // A coarse grid so a chart center sits well away from t* and the
+            // affine displacement is resolvable (not swamped by re-routing).
+            grid_resolution: 8,
+            ridge: 1.0e-12,
+            newton_steps: 0, // isolate the closed-form prediction, no refinement.
+        },
+    )
+    .expect("atlas build");
+
+    // Pick a base coordinate and two on-manifold targets at t0 and a small step.
+    let t0 = 0.30_f64;
+    let small = 0.01_f64;
+    let x0 = circle_target(t0);
+    let x1 = circle_target(t0 + small);
+    let x2 = circle_target(t0 + 2.0 * small);
+
+    let enc = |x: &Array1<f64>| -> (f64, bool) {
+        let (t, cert) = atlas
+            .amortized_encode_row(&atom, 0, x.view(), 1.0)
+            .expect("amortized row");
+        (t[0], cert.certified())
+    };
+    let (c0, ok0) = enc(&x0);
+    let (c1, ok1) = enc(&x1);
+    let (c2, ok2) = enc(&x2);
+    assert!(
+        ok0 && ok1 && ok2,
+        "all three near-manifold rows must certify under the distilled map"
+    );
+
+    let d1 = c1 - c0;
+    let d2 = c2 - c0;
+    // The predictor genuinely consumes the row (non-degenerate displacement).
+    assert!(
+        d1.abs() > 1e-6,
+        "the distilled prediction must move with the target (it is not the chart center): d1 = {d1}"
+    );
+    // Affine map ⇒ doubling the on-tangent step doubles the coordinate
+    // displacement (to the order of the manifold's second-order curvature).
+    let ratio = d2 / d1;
+    assert!(
+        (ratio - 2.0).abs() < 0.1,
+        "the closed-form predictor is the IFT first-order (affine) map: d2/d1 should be ≈ 2, got {ratio}"
+    );
+}
