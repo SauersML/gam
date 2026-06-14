@@ -50,6 +50,7 @@ impl SaeManifoldTerm {
             curvature_walk_report: None,
             expected_evidence_gauge_deflated_directions: None,
             hybrid_split_report: None,
+            atom_inner_fits: None,
         })
     }
 
@@ -1575,18 +1576,18 @@ impl SaeManifoldTerm {
         // rho-independent (exact weighted-LS lines realised inside the
         // adjudication — no re-fit, no #1051 outer continuation).
         //
-        // The collapse engages on the NO-RHO production path only. The rho-keyed
-        // `try_fitted_for_rho` stays the pure CURVED reconstruction: the joint
-        // fit's loss/assembly optimise the curved decoder coefficients and must
-        // see the curved image, and the #1026 adjudication itself compares the
-        // curved fit against its straight sub-model — both require the
-        // uncollapsed curve. During fitting the report is `None` regardless (it
-        // is only computed post-fit), so this gate keeps the curved/collapsed
-        // boundary explicit rather than implicit in call ordering.
+        // The collapse engages only when the caller asks for it (`collapse`):
+        // the production `try_fitted` path and the explicit
+        // `hybrid_collapsed_reconstruction` entry point. The pure-curved
+        // `try_fitted_for_rho` opts out — the joint fit's loss/assembly optimise
+        // the curved decoder coefficients and must see the curved image, and the
+        // #1026 adjudication itself compares the curved fit against its straight
+        // sub-model — both require the uncollapsed curve. (During fitting the
+        // report is `None` regardless; it is only computed post-fit.)
         let linear_images: std::collections::HashMap<
             usize,
             &crate::terms::sae::hybrid_split::AtomLinearImage,
-        > = if rho.is_none() {
+        > = if collapse {
             self.hybrid_split_report
                 .as_ref()
                 .map(|report| {
@@ -1786,17 +1787,15 @@ impl SaeManifoldTerm {
         &self,
         rho: &SaeManifoldRho,
     ) -> Result<Array2<f64>, String> {
-        // #1026 — the hybrid collapse is now applied by the SINGLE
-        // reconstruction path ([`Self::try_fitted_with_rho`]): a verdict-linear
-        // `d = 1` slot decodes its straight sub-model image in EVERY
-        // reconstruction (production `fitted()`, predict, EV), so the verdict is
-        // load-bearing rather than realised only through this method. This call
-        // therefore delegates to the rho-keyed reconstruction; the dedicated
-        // re-collapse loop it used to carry was a parallel layer that would now
-        // double-substitute the linear image. Retained as a named entry point
-        // for the #1026 EV-dominance reporting (`hybrid_collapsed_explained_variance`)
-        // and the part_003 regression battery.
-        self.try_fitted_for_rho(rho)
+        // #1026 — the hybrid collapse is realised by the SINGLE reconstruction
+        // path ([`Self::try_fitted_with_rho`]) with the collapse flag set: a
+        // verdict-linear `d = 1` slot decodes its straight sub-model image
+        // instead of its curved curve. This replaces the dedicated re-collapse
+        // loop this method used to carry (a parallel layer). The production
+        // `try_fitted` shares the identical routine at `rho = None`; this entry
+        // point keeps the rho-keyed collapse for the #1026 EV-dominance reporting
+        // (`hybrid_collapsed_explained_variance`) and the regression battery.
+        self.try_fitted_with_rho(Some(rho), true)
     }
 
     /// #1026 — the reconstruction explained variance of the hybrid-collapsed
