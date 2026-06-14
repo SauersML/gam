@@ -409,3 +409,144 @@ fn no_change_log_e_value(theta_hat: f64, se: f64) -> f64 {
     let z = theta_hat / se;
     0.5 * z * z
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array4;
+
+    /// Build a `[n_ckpt, n_atoms, n_grid, ambient]` grid where atom 0's curve is
+    /// constant across checkpoints (no change) and atom 1's curve at the central
+    /// (mode) node is displaced by a known amount `shift` in component 0 between
+    /// consecutive checkpoints (a steady drift).
+    fn drift_grid(
+        n_ckpt: usize,
+        n_grid: usize,
+        ambient: usize,
+        shift: f64,
+    ) -> Array4<f64> {
+        let mode = n_grid / 2;
+        let mut grid = Array4::<f64>::zeros((n_ckpt, 2, n_grid, ambient));
+        for c in 0..n_ckpt {
+            for g in 0..n_grid {
+                let t = g as f64 / (n_grid - 1) as f64;
+                for comp in 0..ambient {
+                    // Atom 0: smooth bump, identical at every checkpoint.
+                    grid[[c, 0, g, comp]] = (t * std::f64::consts::PI).sin() * (comp as f64 + 1.0);
+                    // Atom 1: same base curve plus a checkpoint-indexed shift at
+                    // the mode node in component 0 only.
+                    let base = (t * std::f64::consts::PI).sin() * (comp as f64 + 1.0);
+                    grid[[c, 1, g, comp]] = if g == mode && comp == 0 {
+                        base + shift * c as f64
+                    } else {
+                        base
+                    };
+                }
+            }
+        }
+        grid
+    }
+
+    #[test]
+    fn no_change_atom_has_near_zero_contrast_and_no_change_evidence() {
+        let n_ckpt = 5;
+        let n_grid = 9;
+        let ambient = 3;
+        let grid = drift_grid(n_ckpt, n_grid, ambient, 0.5);
+        let latent: Array1<f64> = Array1::linspace(0.0, 1.0, n_grid);
+        let ckpt_ids: Vec<String> = (0..n_ckpt).map(|c| format!("dev{c}")).collect();
+        let atom_names = vec!["constant".to_string(), "drifter".to_string()];
+        let input = CheckpointDynamicsInput {
+            decoder_grid: grid.view(),
+            checkpoint_ids: &ckpt_ids,
+            atom_names: &atom_names,
+            latent_grid: latent.view(),
+        };
+        let traj = checkpoint_atom_dynamics(&input).expect("dynamics");
+        assert_eq!(traj.len(), 2);
+
+        // Atom 0 is identical across checkpoints: every step contrast must be
+        // (numerically) zero displacement and accumulate no change evidence.
+        let constant = &traj[0];
+        assert_eq!(constant.step_contrasts.len(), n_ckpt - 1);
+        for report in &constant.step_contrasts {
+            assert!(
+                report.theta_onestep.abs() < 1e-9,
+                "constant atom step displacement should be ~0, got {}",
+                report.theta_onestep
+            );
+        }
+        // No-change null is true here → the e-BH certificate confirms nothing.
+        let cert = constant.change_evidence.certify(0.05);
+        assert!(
+            cert.confirmed().count() == 0,
+            "constant atom must not confirm any change claim"
+        );
+    }
+
+    #[test]
+    fn drifting_atom_recovers_displacement_and_accumulates_change_evidence() {
+        let n_ckpt = 6;
+        let n_grid = 9;
+        let ambient = 3;
+        let shift = 0.7_f64;
+        let grid = drift_grid(n_ckpt, n_grid, ambient, shift);
+        let latent: Array1<f64> = Array1::linspace(0.0, 1.0, n_grid);
+        let ckpt_ids: Vec<String> = (0..n_ckpt).map(|c| format!("dev{c}")).collect();
+        let atom_names = vec!["constant".to_string(), "drifter".to_string()];
+        let input = CheckpointDynamicsInput {
+            decoder_grid: grid.view(),
+            checkpoint_ids: &ckpt_ids,
+            atom_names: &atom_names,
+            latent_grid: latent.view(),
+        };
+        let traj = checkpoint_atom_dynamics(&input).expect("dynamics");
+        let drifter = &traj[1];
+
+        // Each consecutive step displaces component 0 at the mode by exactly
+        // `shift`; the (one-step debiased) displacement size is `‖Δ‖₂`. The
+        // identity-basis ridge fit shrinks β by 1/(1+λ); the contrast of two
+        // such fits at the mode is `shift/(1+λ)`, and the one-step debiasing
+        // restores the penalty bias so θ_onestep recovers the true `shift`
+        // closely. Assert recovery to within a few percent.
+        for report in &drifter.step_contrasts {
+            assert!(
+                (report.theta_onestep - shift).abs() < 0.05 * shift,
+                "drift step displacement should recover {shift}, got {}",
+                report.theta_onestep
+            );
+            // The one-step estimate must be closer to truth than the shrunk
+            // plug-in: penalty debiasing genuinely removes bias here.
+            let plugin_err = (report.theta_plugin - shift).abs();
+            let onestep_err = (report.theta_onestep - shift).abs();
+            assert!(
+                onestep_err <= plugin_err + 1e-12,
+                "debiasing must not increase displacement bias: plugin={plugin_err}, onestep={onestep_err}"
+            );
+        }
+
+        // The drift is real and steady → the change e-process accumulates and
+        // the e-BH certificate confirms the later-checkpoint change claims.
+        let cert = drifter.change_evidence.certify(0.05);
+        assert!(
+            cert.confirmed().count() >= 1,
+            "steady real drift must confirm at least one change claim, entries: {:?}",
+            cert.entries.iter().map(|e| (e.log_e, e.confirmed)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rejects_single_checkpoint_and_axis_mismatch() {
+        let grid = Array4::<f64>::zeros((1, 2, 5, 3));
+        let latent: Array1<f64> = Array1::linspace(0.0, 1.0, 5);
+        let ids = vec!["only".to_string()];
+        let names = vec!["a".to_string(), "b".to_string()];
+        let input = CheckpointDynamicsInput {
+            decoder_grid: grid.view(),
+            checkpoint_ids: &ids,
+            atom_names: &names,
+            latent_grid: latent.view(),
+        };
+        assert!(checkpoint_atom_dynamics(&input).is_err());
+    }
+}

@@ -3285,6 +3285,117 @@ mod tests {
     use super::*;
     use ndarray::{Array1, array};
 
+    /// #1097: the per-atom Riesz functionals must reproduce the exact linear
+    /// functionals of the fitted decoder smooth (plug-in) and produce a finite
+    /// SE, on a synthetic atom whose inner smooth is an analytic polynomial.
+    #[test]
+    fn atom_functional_report_recovers_known_functionals() {
+        use ndarray::{Array1 as A1, Array2 as A2};
+        // Polynomial basis Φ(t) = [1, t, t²] on a uniform active grid; the atom's
+        // fitted smooth is g(t) = β·Φ(t) with a known β. We assemble a genuine
+        // penalized-WLS AtomInnerFit (unit weights, identity-ish penalty) so the
+        // Riesz path runs end to end.
+        let n = 40usize;
+        let m = 3usize;
+        let beta = A1::from(vec![0.5_f64, -1.0, 2.0]);
+        let mut design = A2::<f64>::zeros((n, m));
+        let mut derivative_design = A2::<f64>::zeros((n, m));
+        let mut weights = A1::<f64>::ones(n);
+        let mut t = vec![0.0_f64; n];
+        for i in 0..n {
+            let ti = i as f64 / (n - 1) as f64;
+            t[i] = ti;
+            design[[i, 0]] = 1.0;
+            design[[i, 1]] = ti;
+            design[[i, 2]] = ti * ti;
+            // dΦ/dt = [0, 1, 2t].
+            derivative_design[[i, 0]] = 0.0;
+            derivative_design[[i, 1]] = 1.0;
+            derivative_design[[i, 2]] = 2.0 * ti;
+            weights[i] = 1.0;
+        }
+        let dispersion = 1.0_f64;
+        // Working response equals the fitted curve so residuals are zero → the
+        // plug-in is exactly the analytic functional of β; scores are zero.
+        let row_scores = A2::<f64>::zeros((n, m));
+        // Penalty S = small ridge on curvature column only; penalized Hessian
+        // H = ΦᵀWΦ + S.
+        let mut penalty = A2::<f64>::zeros((m, m));
+        penalty[[2, 2]] = 1e-3;
+        let mut xtwx = A2::<f64>::zeros((m, m));
+        for i in 0..n {
+            for a in 0..m {
+                for b in 0..m {
+                    xtwx[[a, b]] += weights[i] * design[[i, a]] * design[[i, b]];
+                }
+            }
+        }
+        let penalized_hessian = &xtwx + &penalty;
+        // Peak: |g| largest; mode: pick endpoints to give a known contrast.
+        let mut peak_slot = 0usize;
+        let mut peak_val = -1.0;
+        for i in 0..n {
+            let g = design.row(i).dot(&beta).abs();
+            if g > peak_val {
+                peak_val = g;
+                peak_slot = i;
+            }
+        }
+        let peak_design_row = design.row(peak_slot).to_owned();
+        let mode_design_row = design.row(0).to_owned();
+
+        let fit = AtomInnerFit {
+            design: design.clone(),
+            derivative_design: derivative_design.clone(),
+            beta: beta.clone(),
+            penalty,
+            penalized_hessian,
+            row_scores,
+            weights: weights.clone(),
+            dispersion,
+            peak_design_row: peak_design_row.clone(),
+            mode_design_row: mode_design_row.clone(),
+            kappa_hat: 0.0,
+            smooth_edf: 2.0,
+        };
+
+        let report = atom_functional_report(&fit);
+
+        // Average value E_w[g] = mean_i β·Φ(t_i): exact plug-in match.
+        let av = report.average_value.expect("average value");
+        let expected_av: f64 = (0..n).map(|i| design.row(i).dot(&beta)).sum::<f64>() / n as f64;
+        assert!(
+            (av.theta_plugin - expected_av).abs() < 1e-9,
+            "average value plug-in {} vs expected {}",
+            av.theta_plugin,
+            expected_av
+        );
+        assert!(av.se.is_finite(), "average-value SE finite");
+
+        // Average derivative magnitude: g'(t) = β1 + 2β2 t, mean over the grid is
+        // β1 + 2β2 * mean(t). The functional gradient is the mean derivative row;
+        // its plug-in is exactly that scalar.
+        let ad = report.average_derivative_norm.expect("average derivative");
+        let mean_t: f64 = t.iter().sum::<f64>() / n as f64;
+        let expected_ad = beta[1] + 2.0 * beta[2] * mean_t;
+        assert!(
+            (ad.theta_plugin - expected_ad).abs() < 1e-9,
+            "average derivative plug-in {} vs expected {}",
+            ad.theta_plugin,
+            expected_ad
+        );
+
+        // Peak-vs-mode contrast g(t_peak) − g(t_mode): exact plug-in.
+        let pc = report.peak_contrast.expect("peak contrast");
+        let expected_pc = peak_design_row.dot(&beta) - mode_design_row.dot(&beta);
+        assert!(
+            (pc.theta_plugin - expected_pc).abs() < 1e-9,
+            "peak contrast plug-in {} vs expected {}",
+            pc.theta_plugin,
+            expected_pc
+        );
+    }
+
     #[test]
     fn mechanism_sparsity_jacobian_value_matches_closed_form() {
         let w = array![[3.0_f64, 0.0], [4.0, 0.0]]; // col0 norm=5, col1 norm=0
