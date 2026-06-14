@@ -3231,7 +3231,34 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // a genuinely stalled solve reaches it, where one eigh per cycle on the
             // short convergence tail is negligible against the alternative of
             // grinding to the hard cycle ceiling.
+            //
+            // Tolerance (gam#1082): the range-projected residual is read off an
+            // O((P·M)³) eigendecomposition of the joint penalized Hessian and
+            // reconstructed by summing the residual's coordinates along every
+            // range-space eigenvector. On a large joint design (the multinomial
+            // smooth-by-factor fit is ~382-dim, K−1 coupled blocks × one global
+            // smooth + one smooth per group level, each select=TRUE with a
+            // wiggliness AND a null-space-shrinkage penalty) that reconstruction
+            // carries O(p·ε·‖r‖) round-off, so the identified-subspace residual
+            // FLOORS a few × above the (already tiny, `inner_tol·(1+…)`-scaled)
+            // `residual_tol`. Demanding the strict 1× `residual_tol` here is
+            // therefore unreachable for a genuinely range-stationary iterate whose
+            // remaining mass is pure ker(H_pen) gauge drift — exactly the
+            // multinomial regime, where the gauge mode keeps the objective drifting
+            // (so the sibling obj-plateau / step-or-obj exits below never fire) and
+            // the inner solve grinds to `inner_max_cycles`, each cycle paying one
+            // full Newton-step eigh (the #1082 wall-clock blow-up the profile
+            // pins on `WhitenedHessianSpectrum::decompose`). The honest, mature
+            // identified-subspace tolerance is the SAME `4×residual_tol` the
+            // relative-objective-plateau gauge exit below already uses to certify
+            // the identical mathematical condition (range-space stationarity); the
+            // 1× here was an unjustified asymmetry below the eigh-reconstruction
+            // floor. The gauge-drift precondition (raw residual stalled ≥ window
+            // AND per-block range-stationarity) is strictly stronger than the
+            // plateau exit's, so widening the global range tolerance to match it
+            // cannot accept a non-optimum on the identified subspace.
             const GAUGE_DRIFT_STALL_WINDOW: usize = 3;
+            const RANGE_RESIDUAL_EIGH_FLOOR_FACTOR: f64 = 4.0;
             if cycles_since_residual_improved >= GAUGE_DRIFT_STALL_WINDOW
                 && let Some(range_residual) = projected_residual_range_space_inf(
                     &projected_residual_vec,
@@ -3242,11 +3269,11 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     options.ridge_policy,
                     total_p,
                 )
-                && range_residual <= residual_tol
+                && range_residual <= RANGE_RESIDUAL_EIGH_FLOOR_FACTOR * residual_tol
                 && range_projected_block_stationarity_small()
             {
                 log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | gauge-drift identified-subspace KKT certificate (gam#979): total residual={:.3e} > tol={:.3e}, step_inf={:.3e} (step_tol={:.3e}) and |Δobjective|={:.3e} (obj_tol={:.3e}) both still nonzero from drift along an unidentified ker(H_pen) gauge mode (the unpenalized I-spline affine baseline), but the range-space (identified-subspace) residual={:.3e} ≤ tol={:.3e} AND every block's range-projected stationarity is at tolerance — the iterate is stationary on the entire identifiable subspace; the remaining residual/step/objective drift lives purely in the gauge null the outer IFT projects out (gam#553).",
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | gauge-drift identified-subspace KKT certificate (gam#979): total residual={:.3e} > tol={:.3e}, step_inf={:.3e} (step_tol={:.3e}) and |Δobjective|={:.3e} (obj_tol={:.3e}) both still nonzero from drift along an unidentified ker(H_pen) gauge mode (an unpenalized baseline/gauge direction the joint design does not fix out), but the range-space (identified-subspace) residual={:.3e} ≤ {:.3e} (= {}×tol, the eigh-reconstruction floor) AND every block's range-projected stationarity is at tolerance — the iterate is stationary on the entire identifiable subspace; the remaining residual/step/objective drift lives purely in the gauge null the outer IFT projects out (gam#553).",
                     cycle,
                     residual,
                     residual_tol,
@@ -3255,7 +3282,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     objective_change,
                     objective_tol,
                     range_residual,
-                    residual_tol,
+                    RANGE_RESIDUAL_EIGH_FLOOR_FACTOR * residual_tol,
+                    RANGE_RESIDUAL_EIGH_FLOOR_FACTOR,
                 );
                 if range_residual.is_finite() {
                     min_certified_residual = min_certified_residual.min(range_residual);
