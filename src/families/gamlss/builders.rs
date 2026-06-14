@@ -1816,13 +1816,46 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         let (mean_rho, scale_rho) = split(log_lambdas);
         let (mean_lam, scale_lam) = split(lambdas);
         let (mean_edf, scale_edf) = split(edf);
+        // Fitted-σ̂ summary, to directly test the σ̂-inflation hypothesis behind the
+        // mean over-recovery (#1082): if the SCALE block over-smooths, σ̂ flattens
+        // toward the global residual SD and its [min,mean,max] collapses to a
+        // narrow band — which inflates the per-row 1/σ̂² mean curvature weighting in
+        // the (correct) LAML and drives the mean λ up. The scale block's η is the
+        // second block; σ̂ = LOGB_SIGMA_FLOOR + exp(η_scale).
+        let sigma_summary = solved
+            .fit
+            .block_states
+            .get(GaussianLocationScaleFamily::BLOCK_LOG_SIGMA)
+            .map(|scale_state| {
+                let mut lo = f64::INFINITY;
+                let mut hi = f64::NEG_INFINITY;
+                let mut sum = 0.0_f64;
+                let mut count = 0usize;
+                for &eta in scale_state.eta.iter() {
+                    let sigma = LOGB_SIGMA_FLOOR + eta.exp();
+                    lo = lo.min(sigma);
+                    hi = hi.max(sigma);
+                    sum += sigma;
+                    count += 1;
+                }
+                if count > 0 {
+                    format!(
+                        "min={lo:.4} mean={:.4} max={hi:.4}",
+                        sum / count as f64
+                    )
+                } else {
+                    "n/a".to_string()
+                }
+            })
+            .unwrap_or_else(|| "n/a".to_string());
         // Emitted at WARN (not INFO): the test harness's effective log level is
         // WARN, so the sibling survival WARN diagnostics surface while INFO ones
         // are dropped — that is why the earlier info-level form never appeared.
         log::warn!(
             "[gaulss-lambda-diag] n_mean_pen={n_mean_pen} reml_score={:.6e}\n  \
              MEAN  rho(log-lambda)=[{}] lambda=[{}] edf=[{}]\n  \
-             SCALE rho(log-lambda)=[{}] lambda=[{}] edf=[{}]",
+             SCALE rho(log-lambda)=[{}] lambda=[{}] edf=[{}]\n  \
+             SIGMA_HAT {sigma_summary}  (truth sigma in [0.10, 0.35])",
             solved.fit.reml_score,
             fmt(&mean_rho),
             fmt(&mean_lam),
