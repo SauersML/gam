@@ -1,30 +1,18 @@
 use super::*;
 
-/// Reactivation band width (in units of the JumpReLU temperature `τ`) below the
-/// hard gate threshold. The forward gate value is hard-zero strictly below
-/// `threshold`, but an atom whose logit lies within `threshold − MARGIN·τ` is
-/// still admitted to the compact Newton active set for sparsity-prior support.
-/// Below the band the shifted-sigmoid derivative `σ'((l−θ)/τ)` is vanishingly
-/// small, so the band captures essentially all of the prior-gradient mass that
-/// could act on a gated atom (at `MARGIN = 4`, `σ((l−θ)/τ) < σ(−4) ≈ 0.018` at
-/// the band edge). Without the band the gate is an absorbing pruning rule, not a
-/// learnable gate.
-pub(crate) const JUMPRELU_REACTIVATION_MARGIN: f64 = 4.0;
+// The JumpReLU optimization-inclusion band is the single canonical predicate
+// `crate::terms::sae::assignment::jumprelu_in_optimization_band`, whose support
+// is the machine-precision cutoff `(logit − threshold)/τ > −36` (`σ(−36) ≈
+// 2e-16`). The compact Newton active set below MUST use exactly that band so
+// every coordinate carrying nonzero sparsity-prior value/gradient/Hessian
+// (assembled over the same −36 support in `assignment.rs`, and in the logdet
+// third-derivative adjoint in `construction.rs`) has a Newton row to receive
+// it. A former module-local copy used a tighter `−4·τ` band, which silently
+// dropped coordinates in `(−36τ, −4τ]` from the solve while the prior still put
+// gradient on them — an objective↔gradient desync that stalls the inner Newton
+// fit. That copy and its `JUMPRELU_REACTIVATION_MARGIN` constant are deleted;
+// there is now one band, one source of truth.
 
-/// Shared band predicate for JumpReLU optimization inclusion. An atom is kept
-/// optimizable (compact-layout inclusion and prior-gradient support) when its
-/// logit is above the reactivation band's lower edge `threshold − MARGIN·τ`.
-/// This is strictly weaker than the hard forward gate `logit > threshold`,
-/// which still governs data-fit reconstruction and its logit JVP.
-// Module-private: an identical `jumprelu_in_optimization_band` lives in
-// `crate::terms::sae::assignment` (the canonical crate-wide export). Both were
-// glob-re-exported from sae_manifold.rs, which collided; this copy is only used
-// locally below, so keeping it private removes the ambiguity without changing
-// behavior (#780-split duplicate).
-#[inline]
-fn jumprelu_in_optimization_band(logit: f64, threshold: f64, temperature: f64) -> bool {
-    logit > threshold - JUMPRELU_REACTIVATION_MARGIN * temperature
-}
 /// Per-row active-set layout for sparse SAE assignment (any mode).
 ///
 /// When the assignment is sparse — structurally (JumpReLU gate) or
@@ -59,11 +47,11 @@ pub struct SaeRowLayout {
 impl SaeRowLayout {
     /// JumpReLU optimization active set: atoms inside the smooth prior's
     /// machine-precision support `(logit - threshold)/tau > -36` (see
-    /// [`jumprelu_in_optimization_band`]). This is intentionally wider than the
-    /// hard forward gate `logit > threshold` so gated-off atoms can remain in the
-    /// Newton system for value-consistent prior terms. Their forward
-    /// reconstruction contribution and data-fit logit JVP remain hard-zero while
-    /// `a_k = 0`.
+    /// [`crate::terms::sae::assignment::jumprelu_in_optimization_band`], the one
+    /// canonical band). This is intentionally wider than the hard forward gate
+    /// `logit > threshold` so gated-off atoms can remain in the Newton system for
+    /// value-consistent prior terms. Their forward reconstruction contribution
+    /// and data-fit logit JVP remain hard-zero while `a_k = 0`.
     pub(crate) fn from_jumprelu(
         n: usize,
         k_atoms: usize,
@@ -77,7 +65,13 @@ impl SaeRowLayout {
         for row in 0..n {
             let row_logits = logits.row(row);
             let active: Vec<usize> = (0..k_atoms)
-                .filter(|&k| jumprelu_in_optimization_band(row_logits[k], threshold, temperature))
+                .filter(|&k| {
+                    crate::terms::sae::assignment::jumprelu_in_optimization_band(
+                        row_logits[k],
+                        threshold,
+                        temperature,
+                    )
+                })
                 .collect();
             per_row.push(active);
         }
