@@ -455,42 +455,88 @@ pub fn project_onto_linear_constraints(
         }
         .into());
     }
-    let mut beta = beta0.cloned().unwrap_or_else(|| Array1::zeros(dim));
+    let beta0_vec = beta0.cloned().unwrap_or_else(|| Array1::zeros(dim));
     if constraints.a.ncols() != dim || constraints.a.nrows() == 0 {
-        return Ok(beta);
+        return Ok(beta0_vec);
     }
 
-    // Deduplicate identical constraint rows before projecting (#1108). The
-    // monotone time-derivative guard emits ONE constraint row per observation,
-    // and survival data on a discrete inspection grid (interval-censored
-    // `SurvInterval(L, R, event)`, or any dataset with heavily tied event times)
-    // produces many rows sharing the SAME time and therefore the SAME (already
-    // row-normalized) `(Aᵢ, bᵢ)`. A halfspace and its exact duplicate define the
-    // SAME constraint, so the feasible polytope `{β : Aβ ≥ b}` is UNCHANGED by
-    // collapsing duplicates — but Dykstra alternating projection over the
-    // redundant copies converges only linearly and so slowly that the fixed
-    // sweep cap exits with a large residual violation (5e-3..2e-2 observed),
-    // which the downstream `check_linear_feasibility` gate (`tol = 1e-8`) then
-    // rejects as an "infeasible iterate". Projecting over the UNIQUE halfspaces
-    // (≈ the number of distinct grid times) instead converges to
-    // `DYKSTRA_PROJECTION_TOL` in a handful of sweeps. This is exact (no
-    // constraint dropped, the polytope is identical) and benefits every monotone
-    // survival fit with tied observation times, not just the interval path.
+    // EXACT projection of the seed onto the feasible polytope `{β : Aβ ≥ b}`.
+    //
+    // The monotone time-derivative guard emits ONE constraint row per
+    // observation, so a survival fit on a discrete / tied inspection grid (the
+    // interval-censored `SurvInterval(L, R, event)` path) hands this O(n)
+    // heavily near-parallel rows — and they are NOT bit-identical (per-row
+    // offsets / covariate-dependent derivative designs make tied-time rows
+    // distinct but nearly collinear). Dykstra alternating projection over such
+    // a system converges only LINEARLY and, at any finite sweep cap, stalls far
+    // above tolerance (5e-3..2e-2 at 100 sweeps); the previous implementation
+    // then SILENTLY returned that infeasible point, which the downstream
+    // active-set QP entry gate (`check_linear_feasibility`, `tol = 1e-8`)
+    // rejected as an "infeasible iterate" — aborting the whole interval
+    // warm start (#1108).
+    //
+    // The active-set QP solves the projection `min ½‖β − β0‖²  s.t.  Aβ ≥ b`
+    // EXACTLY in a single solve, rank-reducing the dependent guard rows
+    // internally (pivoted QR + Bland anti-cycling), so it does not stall on
+    // redundancy. Take the STRICTLY-INTERIOR projection first: it returns the
+    // nearest point whose every row clears the `1e-6` scaled interior margin,
+    // so the seed clears the downstream raw `1e-8` gate with ~100× room. If the
+    // margin-shifted system has empty interior, fall back to the exact boundary
+    // projection (`H = I`). Only if BOTH exact solves refuse AND a Dykstra
+    // safety net cannot reach tolerance do we return a HARD ERROR with the
+    // residual — never a silently-accepted infeasible seed.
     let n_rows = constraints.a.nrows();
-    // Bit-exact dedup key = the IEEE-754 bit patterns of `(Aᵢ.., bᵢ)`. Tied-time
-    // rows come from the same basis evaluation at the same time and the same
-    // deterministic row normalization, so duplicates are bit-identical; a
-    // non-identical near-parallel row hashes differently and is kept as its own
-    // halfspace, so no real constraint is ever merged away. O(n·dim) via the hash
-    // set rather than O(n²·dim) pairwise — safe for large-n survival fits.
+    // Accept a candidate projection iff it clears the downstream feasibility
+    // gate (`check_linear_feasibility`, raw absolute `1e-8`) — the exact
+    // contract the consumer enforces. The strict-interior projection clears it
+    // by orders of magnitude; the boundary projection sits at the gate, so we
+    // accept it only when it genuinely lands inside.
+    const DOWNSTREAM_FEASIBILITY_GATE_TOL: f64 = 1e-8;
+    let worst_raw_violation = |b: &Array1<f64>| -> (f64, usize) {
+        let mut worst = 0.0_f64;
+        let mut worst_row = 0usize;
+        for i in 0..n_rows {
+            let slack = constraints.a.row(i).dot(b) - constraints.b[i];
+            let viol = (-slack).max(0.0);
+            if viol > worst {
+                worst = viol;
+                worst_row = i;
+            }
+        }
+        (worst, worst_row)
+    };
+
+    if let Some(interior) =
+        crate::solver::active_set::project_point_strictly_into_feasible_cone(&beta0_vec, constraints)
+        && worst_raw_violation(&interior).0 <= DOWNSTREAM_FEASIBILITY_GATE_TOL
+    {
+        return Ok(interior);
+    }
+    let identity = Array2::<f64>::eye(dim);
+    if let Ok((boundary, _active)) =
+        crate::solver::active_set::solve_quadratic_with_linear_constraints(
+            &identity,
+            &beta0_vec,
+            &beta0_vec,
+            constraints,
+            None,
+        )
+        && worst_raw_violation(&boundary).0 <= DOWNSTREAM_FEASIBILITY_GATE_TOL
+    {
+        return Ok(boundary);
+    }
+
+    // Dykstra safety net (alternating projection is guaranteed to converge to
+    // the exact projection onto a convex intersection of halfspaces). Collapse
+    // bit-identical rows first (tied-time duplicates that DO coincide), run to
+    // the internal tolerance, then HARD-CHECK feasibility against the
+    // downstream gate — no silent infeasible return.
     let mut seen: std::collections::HashSet<Box<[u64]>> =
         std::collections::HashSet::with_capacity(n_rows);
     let mut unique_rows: Vec<usize> = Vec::with_capacity(n_rows);
     for i in 0..n_rows {
         let row_i = constraints.a.row(i);
-        let row_norm_sq = row_i.dot(&row_i);
-        if row_norm_sq <= DYKSTRA_ROW_DEGENERACY_FLOOR {
-            // Structurally empty row: skipped during projection anyway.
+        if row_i.dot(&row_i) <= DYKSTRA_ROW_DEGENERACY_FLOOR {
             continue;
         }
         let mut key: Vec<u64> = Vec::with_capacity(dim + 1);
@@ -500,10 +546,9 @@ pub fn project_onto_linear_constraints(
             unique_rows.push(i);
         }
     }
-
+    let mut beta = beta0_vec;
     let mut corrections = Array2::<f64>::zeros((unique_rows.len(), dim));
-    let max_sweeps = DYKSTRA_PROJECTION_MAX_SWEEPS;
-    for _ in 0..max_sweeps {
+    for _ in 0..DYKSTRA_PROJECTION_MAX_SWEEPS {
         let mut max_violation = 0.0_f64;
         for (slot, &i) in unique_rows.iter().enumerate() {
             let row = constraints.a.row(i);
@@ -526,6 +571,22 @@ pub fn project_onto_linear_constraints(
         if max_violation <= DYKSTRA_PROJECTION_TOL {
             break;
         }
+    }
+    let (worst, worst_row) = worst_raw_violation(&beta);
+    if worst > DOWNSTREAM_FEASIBILITY_GATE_TOL {
+        return Err(SurvivalLocationScaleError::ConstraintViolation {
+            reason: format!(
+                "project_onto_linear_constraints could not certify a feasible projection of the \
+                 seed onto the monotone time-derivative cone: worst raw violation {worst:.3e} at \
+                 row {worst_row} ({} unique of {n_rows} guard rows). Both exact active-set \
+                 projections (strict-interior and boundary) refused and the Dykstra safety net \
+                 did not reach the downstream gate tol={DOWNSTREAM_FEASIBILITY_GATE_TOL:.1e}. This \
+                 is a genuine feasibility failure of the constraint system, surfaced rather than \
+                 silently returning an infeasible seed.",
+                unique_rows.len(),
+            ),
+        }
+        .into());
     }
     Ok(beta)
 }
