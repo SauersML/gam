@@ -696,20 +696,18 @@ impl BaselineDerivativeContract {
         self,
         problem: crate::solver::outer_strategy::OuterProblem,
     ) -> crate::solver::outer_strategy::OuterProblem {
-        use crate::solver::outer_strategy::{DeclaredHessianForm, Derivative, SolverClass};
+        use crate::solver::outer_strategy::{DeclaredHessianForm, Derivative};
         match self {
             // BFGS on a 2–3 dim problem with an exact gradient typically
             // converges in 5–10 outer evaluations.
             BaselineDerivativeContract::GradientOnly => problem
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(DeclaredHessianForm::Unavailable)
-                .with_solver_class(SolverClass::Primary)
                 .with_tolerance(1e-4)
                 .with_max_iter(240),
             BaselineDerivativeContract::GradientHessian => problem
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(DeclaredHessianForm::Either)
-                .with_solver_class(SolverClass::Primary)
                 .with_tolerance(1e-4)
                 .with_max_iter(240),
         }

@@ -4385,29 +4385,6 @@ mod tests {
         );
     }
 
-    // ─── SolverClass dispatch ────────────────────────────────────────────
-
-    fn aux_cap_unavailable(n_params: usize) -> OuterCapability {
-        OuterCapability {
-            gradient: Derivative::Unavailable,
-            hessian: DeclaredHessianForm::Unavailable,
-            n_params,
-            psi_dim: 0,
-            fixed_point_available: false,
-            barrier_config: None,
-            prefer_gradient_only: false,
-            disable_fixed_point: false,
-        }
-    }
-
-    #[test]
-    fn plan_with_class_primary_is_identical_to_plan_for_unavailable_grad() {
-        // `plan_with_class(Primary)` must delegate to `plan()` verbatim. The
-        // point of this test is the *identity*, not the specific solver.
-        let cap = aux_cap_unavailable(3);
-        assert_eq!(plan_with_class(&cap, SolverClass::Primary), plan(&cap));
-    }
-
     #[test]
     fn run_arc_projects_seed_before_seed_validation_eval() {
         let seen = Arc::new(Mutex::new(Vec::new()));

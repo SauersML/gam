@@ -2099,9 +2099,7 @@ fn optimize_survival_transformation_smoothing(
     beta0: &Array1<f64>,
     structural_lower_bounds: Option<&Array1<f64>>,
 ) -> Result<Option<Vec<f64>>, String> {
-    use crate::solver::outer_strategy::{
-        Derivative, HessianResult, OuterEval, OuterProblem, SolverClass,
-    };
+    use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval, OuterProblem};
     if num_smoothing == 0 {
         return Ok(None);
     }
@@ -2178,7 +2176,6 @@ fn optimize_survival_transformation_smoothing(
     let lower = seed_rho.mapv(|v| v - 12.0);
     let upper = seed_rho.mapv(|v| v + 12.0);
     let problem = OuterProblem::new(num_smoothing)
-        .with_solver_class(SolverClass::Primary)
         .with_gradient(Derivative::Analytic)
         .with_hessian(crate::solver::outer_strategy::DeclaredHessianForm::Unavailable)
         .with_tolerance(1e-4)
