@@ -34,16 +34,29 @@
 //! + the move that produced it), so two proposals that reach the same dictionary
 //! shape collide exactly as the engine requires.
 
-use ndarray::{Array1, Array2, ArrayView2};
+use std::sync::Arc;
+
+use faer::Side;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::cache::Fingerprinter;
 use crate::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use crate::inference::structure_evidence::{ClaimKind, StructureLedger};
+use crate::linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::solver::structure_search::{
     CollapseAction, MoveBudget, MoveProposal, SearchLedger, SearchOutcome, StructureMove, search,
 };
+use crate::solver::{
+    AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, TopologyScoreScale,
+    select_topology_with_fit,
+};
 use crate::terms::atom_codes::SparseAtomCodes;
-use crate::terms::sae_manifold::{SaeAtomBasisKind, SaeManifoldRho, SaeManifoldTerm};
+use crate::terms::latent_coord::{LatentIdMode, LatentManifold};
+use crate::terms::sae::basis::{
+    EuclideanPatchEvaluator, PeriodicHarmonicEvaluator, SaeBasisEvaluator, SphereChartEvaluator,
+    TorusHarmonicEvaluator,
+};
+use crate::terms::sae_manifold::{SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
 
 /// Per-row soft-assignment mass below which an atom is treated as INACTIVE on
 /// that row when deriving the discrete co-activation support. A soft softmax /

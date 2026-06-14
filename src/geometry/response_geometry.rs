@@ -620,62 +620,64 @@ pub fn response_frechet_mean(
 // ── Curvature as an estimand on the response geometry (#944 stage 4 / #1104) ──
 //
 // `response_geometry="constant_curvature(dim=d)"` does NOT take a fixed κ from
-// the user: κ is ESTIMATED from the manifold-valued responses via the REML outer
-// loop, exactly as the smooth-term Matérn κ is. At each κ the family
-// `ConstantCurvature{dim, κ}` is laid down, the intrinsic mean μ (the tangent
-// base point) is re-solved, and κ is scored by the PROPERLY NORMALISED intrinsic
-// Gaussian likelihood — the wrapped/normal-coordinate Gaussian whose density on
-// the manifold integrates to one. This is the crux of the #1104 fix: a model
-// that is only normalised in the flat tangent space is scale-degenerate in κ.
+// the user: κ is ESTIMATED from the manifold-valued responses. At each κ the
+// family `ConstantCurvature{dim, κ}` is laid down and κ is scored by the HONEST
+// change-of-variables likelihood of the observed chart coordinates `yᵢ` w.r.t.
+// ambient Lebesgue measure `dy` — the density that is automatically normalised on
+// the SAME measure in which the data are observed, regardless of how the manifold
+// is parameterised. This is the crux of the #1104 fix.
 //
-// ## Why dispersion alone (and a mean-only log-det) rails
+// ## Why dispersion alone (and the self-normalising wrapped Gaussian) is degenerate
 //
-// The naive criterion `V_p(κ) = ½na·ln(D(κ)/na)` with `D(κ) = Σ‖log_{μ,κ}(yᵢ)‖²`
-// is a function of the geodesic distances ONLY. Changing κ rescales the manifold
-// radius `R = 1/√κ`, which rescales every distance, which rescales `D` — and a
-// σ-profiled Gaussian on the residuals is invariant to that scale up to a
-// `+na·ln(scale)` term that is monotone in κ. So `V_p` decreases without bound as
-// κ→+∞ (the whole sphere shrinks to a point, `D→0`), and κ̂ rails to the upper
-// bracket. A `−n·a·ln λ_μ` "metric log-det at the mean" term does NOT cure this:
-// for centred / unit-scale data μ ≈ 0, so `λ_μ = 2/(1+κ‖μ‖²) ≈ 2` is essentially
-// κ-independent and supplies zero restoring force — exactly the observed failure
-// on real (mean-subtracted) response clouds, where κ̂ pinned at +50…+65.
+// The generative model is the wrapped normal `yᵢ = exp_μ(vᵢ)`, `vᵢ` isotropic at
+// geodesic scale σ. Its density w.r.t. the Riemannian volume `dvol_κ` is
+// `N(sᵢ;0,σ²)/Jᵧ_κ(sᵢ)` with `sᵢ = d_κ(μ,yᵢ)` the geodesic radius and
+// `J_κ(s) = (sn_κ(s)/s)^{d−1}` the exp-map volume Jacobian
+// (`ConstantCurvature::jacobian_radial`). The naive criterion
+// `½nd·ln(Σsᵢ²/nd)` (dispersion only), and even the full `dvol_κ`-density NLL
+// `Σ[sᵢ²/2σ² + (d/2)ln2πσ² + ln J_κ(sᵢ)]`, are SCALE-DEGENERATE: rescaling the
+// manifold radius `R = 1/√|κ|` rescales every `sᵢ` and every volume element, and
+// the σ-profile absorbs the change with no κ information left. That is exactly
+// why a `dvol_κ`-normalised (self-normalising) wrapped Gaussian rails, and why an
+// intrinsic-volume partition function double-counts: the density is already
+// normalised on `dvol_κ`, so re-integrating its volume adds nothing identifying.
 //
-// ## The restoring force is the intrinsic-volume partition function
+// ## The restoring force is the ambient (chart) volume element at the DATA points
 //
-// The generative model is `rᵢ = log_μ(yᵢ) ∼ N(0, σ²I_d)` in normal coordinates,
-// `yᵢ = exp_μ(rᵢ)`. Its density on the MANIFOLD (w.r.t. the Riemannian volume
-// `dvol_κ`) is `N(r;0,σ²I)/J_κ(‖r‖)`, where `J_κ(r) = (sn_κ(r)/r)^{d−1}` is the
-// exp-map Jacobian (`ConstantCurvature::jacobian_radial`). For this to be a
-// probability density on `M_κ` it must integrate to one against `dvol_κ`, i.e.
-// the tangent Gaussian must be divided by its partition function
-//
-// ```text
-//   Z(κ, σ²) = ∫_{ℝ^d} N(r;0,σ²I) · J_κ(‖r‖) dr
-//            = E_{r∼N(0,σ²I_d)}[ J_κ(‖r‖) ]   (a clean 1-D radial expectation),
-// ```
-//
-// which DOES move with κ even when μ = 0, because it integrates the volume the
-// κ-geometry assigns to the spread of the cloud. The negative log-likelihood is
+// Curvature is identified only when the abstract manifold is tied to the CONCRETE
+// observed chart coordinates `yᵢ`. The data are observed as points of `ℝ^d` under
+// Lebesgue `dy`, so the likelihood must be the density w.r.t. `dy`, obtained from
+// the `dvol_κ`-density by the chart volume factor `dvol_κ/dy = λ_{yᵢ}^d`,
+// `λ_y = 2/(1+κ‖y‖²)`:
 //
 // ```text
-//   −ℓ(κ,σ²) = D(κ)/(2σ²) + (na/2)·ln(2πσ²) + n·ln Z(κ,σ²),
+//   −ℓ(κ,μ,σ²) = Σᵢ[ sᵢ²/(2σ²) + (d/2)ln(2πσ²) + ln J_κ(sᵢ) − d·ln λ_{yᵢ} ].
 // ```
 //
-// and `V_p(κ) = min_{σ²} −ℓ(κ,σ²)` (σ profiled by a short 1-D search, since `Z`
-// couples σ and κ and σ̂² is no longer closed-form). As κ→+∞ the manifold has
-// finite volume `∝ κ^{−d/2}`, so `Z→0` and `n·ln Z ~ −(nd/2)ln κ → +∞` faster
-// than the dispersion term falls; as κ→−1/R² (hyperbolic chart edge) `J_κ`
-// stretches, `Z` and `D` both grow and `V_p → +∞`. The minimum is therefore
-// INTERIOR at the data-generating κ on unit-scale data, with no dependence on
-// where μ sits. `κ→0` is the analytic interior point (`J_0 ≡ 1`, `Z = 1`,
-// `V_p` reduces to the flat Gaussian), so no boundary correction is needed.
+// The new term `−d·Σ ln λ_{yᵢ} = d·Σ ln((1+κ‖yᵢ‖²)/2)` is evaluated at every DATA
+// point (not at the mean), so `‖yᵢ‖² > 0` even for mean-centred clouds and it
+// supplies a genuine κ-restoring force: it grows like `+d·κ·Σ‖yᵢ‖²` for small κ
+// and `→ +∞` as κ→+∞ (each `−ln λ_{yᵢ}→+∞`), exactly opposing the dispersion /
+// `ln J_κ` terms which fall as the sphere shrinks. The minimum is therefore
+// INTERIOR at the data-generating curvature. None of `ln J_κ` or `λ` depend on σ,
+// so σ profiles in closed form `σ̂² = D/(nd)`, `D = Σ sᵢ²`.
 //
-// `V_p` is a negative log-evidence (lower is better) so κ̂ = argmin V_p, and
-// `2[V_p(0) − V_p(κ̂)]` is the Wilks LR statistic of flatness — exactly the
+// ## Reparameterisation invariance / unit-covariance of κ̂
+//
+// κ carries units of `1/length²`. Under a global rescaling `yᵢ ↦ α·yᵢ` the chart
+// of `M_κ` at scale `α` equals the chart of `M_{κ/α²}` at scale 1 (because
+// `λ` and every geodesic primitive depend on `y` only through `κ‖y‖²`). The whole
+// criterion `V(κ, αy)` therefore equals `V(α²κ, y)`, so its minimiser transforms
+// as `κ̂(αy) = κ̂(y)/α²` — the CORRECT covariance of a curvature with units
+// `1/length²`. The base point μ is held at the κ-independent flat centroid (NOT
+// re-solved per κ): re-solving the Fréchet mean per κ is precisely what
+// re-entangles κ with the chart scale and biases the estimate, so it is removed.
+//
+// `V_p` is a negative log-evidence (lower is better) so κ̂ = argmin V_p; it is the
+// full NLL summed over all `n·d` scalar observations, so `2[V_p(0) − V_p(κ̂)]` is
+// the Wilks LR statistic with a calibrated χ²₁ flatness reference — exactly the
 // contract `profile_ci_walk` / `flatness_lr_test` in `curvature_estimand.rs`
-// consume. κ joins the outer optimisation as one signed coordinate with the same
-// likelihood semantics as every other ψ; no new outer machinery is introduced.
+// consume, with no new outer machinery.
 
 /// Outcome of fitting curvature as an estimand on a constant-curvature response
 /// geometry: the optimised κ̂, its tangent base point, the profile-likelihood CI,
@@ -722,208 +724,95 @@ fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64) {
     (kappa_min, kappa_max)
 }
 
-/// Number of Gauss–Legendre nodes for the radial partition-function integral
-/// `Z(κ,σ²) = E_{χ∼chi_d}[J_κ(σχ)]`. The integrand is a smooth product of a
-/// chi density and a (d−1)-power of the entire function `S`; 64 nodes on the
-/// truncated radial domain resolve it to far below the κ-search tolerance.
-const PARTITION_GL_NODES: usize = 64;
-
-/// Upper truncation of the radial (chi) variable in units of its scale: the
-/// chi_d density past `mean + 12·sd` carries < 1e−30 of the mass for any d in
-/// range, so the truncated integral equals the full one to machine precision.
-const PARTITION_CHI_SIGMAS: f64 = 12.0;
-
-/// `ln Γ(x)` for `x > 0` — Lanczos g=7, n=9; accurate to ~1e−14 on the chi
-/// normalising constant `2^{d/2−1} Γ(d/2)` we need here.
-fn ln_gamma(x: f64) -> f64 {
-    const G: f64 = 7.0;
-    const C: [f64; 9] = [
-        0.999_999_999_999_809_93,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_13,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    if x < 0.5 {
-        // Reflection: Γ(x)Γ(1−x) = π/sin(πx).
-        let pi = std::f64::consts::PI;
-        return (pi / (pi * x).sin()).ln() - ln_gamma(1.0 - x);
-    }
-    let x = x - 1.0;
-    let mut a = C[0];
-    let t = x + G + 0.5;
-    for (i, &c) in C.iter().enumerate().skip(1) {
-        a += c / (x + i as f64);
-    }
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
-}
-
-/// Gauss–Legendre nodes/weights on `[-1, 1]` for `n` points, by Newton on the
-/// Legendre polynomial (Golub–Welsch-free; deterministic, dependency-light).
-fn gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut nodes = vec![0.0; n];
-    let mut weights = vec![0.0; n];
-    let m = n.div_ceil(2);
-    for i in 0..m {
-        // Initial guess: the asymptotic zero of P_n.
-        let mut x = (std::f64::consts::PI * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
-        let mut dp = 0.0;
-        for _ in 0..100 {
-            // Evaluate P_n(x) and P_n'(x) by the recurrence.
-            let (mut p0, mut p1) = (1.0_f64, x);
-            for k in 2..=n {
-                let kf = k as f64;
-                let p2 = ((2.0 * kf - 1.0) * x * p1 - (kf - 1.0) * p0) / kf;
-                p0 = p1;
-                p1 = p2;
-            }
-            dp = (n as f64) * (x * p1 - p0) / (x * x - 1.0);
-            let dx = p1 / dp;
-            x -= dx;
-            if dx.abs() <= 1e-15 {
-                break;
-            }
-        }
-        let w = 2.0 / ((1.0 - x * x) * dp * dp);
-        nodes[i] = -x;
-        nodes[n - 1 - i] = x;
-        weights[i] = w;
-        weights[n - 1 - i] = w;
-    }
-    (nodes, weights)
-}
-
-/// Intrinsic-Gaussian partition function `Z(κ,σ²) = E_{r∼N(0,σ²I_d)}[J_κ(‖r‖)]`,
-/// the normaliser that makes the wrapped Gaussian a proper density on `M_κ`.
-///
-/// With `‖r‖ = σ·χ`, `χ ∼ chi_d`, this is the 1-D radial integral
-/// `∫₀^∞ J_κ(σχ) · f_{chi_d}(χ) dχ`, `f_{chi_d}(χ) = χ^{d−1}e^{−χ²/2}/(2^{d/2−1}Γ(d/2))`,
-/// evaluated by Gauss–Legendre on the truncated domain `[0, χ_max]`. `J_κ(σχ) =
-/// S(κσ²χ²)^{d−1}` ([`ConstantCurvature::jacobian_radial`]). Returns `ln Z`
-/// (the criterion only ever needs the log), with `ln Z = 0` exactly at κ = 0
-/// (`J_0 ≡ 1`). At κ > 0 the integrand is clamped to be non-negative past the
-/// conjugate radius, so `Z` is the volume the κ-sphere actually assigns.
-fn response_partition_log(dim: usize, kappa: f64, sigma2: f64, nodes: &[(f64, f64)]) -> f64 {
-    if kappa == 0.0 || dim == 0 {
-        return 0.0;
-    }
-    let d = dim as f64;
-    let sigma = sigma2.max(0.0).sqrt();
-    // chi_d density normaliser: f(χ) = χ^{d−1} e^{−χ²/2} / (2^{d/2−1} Γ(d/2)).
-    let ln_norm = (0.5 * d - 1.0) * std::f64::consts::LN_2 + ln_gamma(0.5 * d);
-    let chi_mean = std::f64::consts::SQRT_2 * (ln_gamma(0.5 * (d + 1.0)) - ln_gamma(0.5 * d)).exp();
-    let chi_max = (chi_mean + PARTITION_CHI_SIGMAS).max(2.0 * chi_mean) + PARTITION_CHI_SIGMAS;
-    let chart = ConstantCurvature::new(dim, kappa);
-    // ∫₀^{χ_max} J_κ(σχ) f(χ) dχ, mapped from the GL reference [-1,1].
-    let half = 0.5 * chi_max;
-    let mut acc = 0.0_f64;
-    for &(node, weight) in nodes {
-        let chi = half * (node + 1.0);
-        let ln_fchi = (d - 1.0) * chi.max(1e-300).ln() - 0.5 * chi * chi - ln_norm;
-        let jac = chart.jacobian_radial(sigma * chi);
-        acc += weight * jac * ln_fchi.exp();
-    }
-    let z = (half * acc).max(1e-300);
-    z.ln()
-}
-
 /// Profiled curvature criterion `V_p(κ)` for the constant-curvature response
-/// geometry: the σ-profiled negative log-likelihood of the PROPERLY NORMALISED
-/// intrinsic Gaussian at curvature `κ`, with the intrinsic Fréchet mean re-solved
-/// at this κ. Lower is better (κ̂ = argmin). Returns `(V_p, base_point)`; the base
-/// is reused as the tangent expansion point at the optimum.
+/// geometry: the σ-profiled HONEST change-of-variables negative log-likelihood of
+/// the observed chart coordinates `y_i` at curvature `κ`, expressed w.r.t. ambient
+/// Lebesgue measure `dy`. Lower is better (κ̂ = argmin). Returns `(V_p, base)`;
+/// the base point is the κ-INDEPENDENT flat centroid (the tangent expansion point
+/// that the scalar GAMs are fitted around), held fixed across κ so the estimate is
+/// not re-entangled with the chart scale.
 ///
-/// `D(κ) = Σ_i ‖log_{base,κ}(y_i)‖²_{base}` is the Fréchet dispersion at the
-/// κ-mean. The model `r_i = log_μ(y_i) ∼ N(0,σ²I_d)`, `y_i = exp_μ(r_i)`, has
-/// negative log-likelihood `D/(2σ²) + (na/2)ln(2πσ²) + n·ln Z(κ,σ²)`, where the
-/// partition function `Z(κ,σ²) = E_{N(0,σ²I)}[J_κ(‖r‖)]` (see
-/// [`response_partition_log`]) normalises the wrapped Gaussian on `M_κ` and is
-/// the κ-restoring term that breaks the dispersion-only scale degeneracy. σ is
-/// profiled by a 1-D Newton/bisection because `Z` couples σ and κ (so σ̂² is no
-/// longer the closed-form `D/na`). Additive constants independent of κ are kept
-/// implicit — they cancel in every LR / profile-drop the CI machinery forms.
+/// The model is the wrapped normal `y_i = exp_{μ,κ}(v_i)` with isotropic geodesic
+/// scale σ; `s_i = d_κ(μ, y_i)` is the geodesic radius and `J_κ(s)` the exp-map
+/// volume Jacobian. The density on the Riemannian volume `dvol_κ` is
+/// `N(s_i;0,σ²)/J_κ(s_i)`; converting to ambient `dy` multiplies by the chart
+/// volume factor `λ_{y_i}^d`, `λ_y = 2/(1+κ‖y‖²)`. The negative log-likelihood is
+///
+/// ```text
+///   −ℓ(κ,σ²) = Σ_i[ s_i²/(2σ²) + (d/2)ln(2πσ²) + ln J_κ(s_i) − d·ln λ_{y_i} ].
+/// ```
+///
+/// `ln J_κ` and `λ` do not depend on σ, so σ profiles in closed form
+/// `σ̂² = D/(nd)`, `D = Σ s_i²`. The `−d·Σ ln λ_{y_i}` term — evaluated at the DATA
+/// points, not the mean — is the κ-restoring force that breaks the scale
+/// degeneracy of the dispersion / `dvol_κ`-density alone (see the module notes).
+/// Additive constants independent of κ are kept implicit; they cancel in every
+/// LR / profile-drop the CI machinery forms. `tol` / `max_iter` are unused now
+/// that μ is the closed-form flat centroid (kept for signature stability with the
+/// CI driver, which threads them through all `V_p` evaluations).
 pub fn response_curvature_criterion(
     values: ArrayView2<'_, f64>,
     dim: usize,
     kappa: f64,
-    tol: f64,
-    max_iter: usize,
+    _tol: f64,
+    _max_iter: usize,
 ) -> Result<(f64, Array1<f64>), String> {
     if !kappa.is_finite() {
         return Err("response curvature criterion: kappa must be finite".into());
     }
-    let manifold = ResponseManifold::ConstantCurvature { dim, kappa };
-    let (n_rows, _) = values.dim();
-    let base = response_frechet_mean(manifold, values, None, tol, max_iter)?;
-    let mut dispersion = 0.0_f64;
+    let (n_rows, cols) = values.dim();
+    if n_rows == 0 || cols != dim || dim == 0 {
+        return Err(format!(
+            "response curvature criterion: values must be N×{dim} with N >= 1"
+        ));
+    }
+    // κ-independent base point: the flat (ambient) centroid. Holding μ fixed across
+    // κ is the de-entangling move — re-solving the Fréchet mean per κ couples the
+    // base to the chart scale and biases κ̂ (#1104 root cause).
+    let mut base = Array1::<f64>::zeros(dim);
     for row in values.outer_iter() {
-        let lg = manifold
-            .log_point(base.view(), row)
-            .map_err(|e| format!("response curvature criterion log map: {e}"))?;
-        let sq = manifold
-            .sq_metric_norm(base.view(), lg.view())
-            .map_err(|e| format!("response curvature criterion metric: {e}"))?;
-        dispersion += sq;
+        base += &row;
+    }
+    base.mapv_inplace(|v| v / n_rows as f64);
+
+    let chart = ConstantCurvature::new(dim, kappa);
+    // Reject κ at/over the chart boundary (1 + κ‖x‖² ≤ 0) at the centroid or any
+    // data point: the geodesic primitives are undefined there. The bracket in
+    // `response_kappa_bounds` keeps the optimiser strictly inside, but a CI/LR
+    // probe can still land on the edge, so guard rather than panic.
+    chart
+        .conformal_factor(base.view())
+        .map_err(|e| format!("response curvature criterion: base off chart: {e}"))?;
+
+    let d = dim as f64;
+    let mut dispersion = 0.0_f64; // D = Σ s_i²
+    let mut ln_jac = 0.0_f64; // Σ ln J_κ(s_i)
+    let mut ln_lambda = 0.0_f64; // Σ ln λ_{y_i}
+    for row in values.outer_iter() {
+        // Geodesic radius s_i = d_κ(μ, y_i); also validates y_i is in-chart.
+        let s = chart
+            .distance(base.view(), row)
+            .map_err(|e| format!("response curvature criterion distance: {e}"))?;
+        dispersion += s * s;
+        // ln J_κ(s_i): exp-map volume Jacobian (≥ 0); floor before the log so the
+        // conjugate-shell clamp (J → 0 on the κ>0 antipodal shell) is a large
+        // finite penalty rather than −∞.
+        ln_jac += chart.jacobian_radial(s).max(1.0e-300).ln();
+        // ln λ_{y_i} = ln(2) − ln(1 + κ‖y_i‖²); `conformal_factor` validates chart.
+        let lam = chart
+            .conformal_factor(row)
+            .map_err(|e| format!("response curvature criterion conformal factor: {e}"))?;
+        ln_lambda += lam.ln();
     }
     let nobs = (n_rows * dim) as f64;
     // Floor the dispersion so a (near-)perfect flat fit does not blow ln up; the
     // floor is far below any genuine residual scale and cancels in profile drops.
-    let d = dispersion.max(1.0e-300 * nobs.max(1.0));
+    let disp = dispersion.max(1.0e-300 * nobs.max(1.0));
 
-    // Radial GL quadrature for ln Z, reused across the σ-profile inner search.
-    let (gl_nodes, gl_weights) = gauss_legendre(PARTITION_GL_NODES);
-    let nodes: Vec<(f64, f64)> = gl_nodes.into_iter().zip(gl_weights).collect();
-
-    // Negative log-likelihood at fixed κ, as a function of σ²:
-    //   φ(σ²) = D/(2σ²) + (na/2) ln(2π σ²) + n · ln Z(κ, σ²).
-    let nll = |sigma2: f64| -> f64 {
-        let s2 = sigma2.max(1.0e-300);
-        let ln_z = response_partition_log(dim, kappa, s2, &nodes);
-        d / (2.0 * s2)
-            + 0.5 * nobs * ((2.0 * std::f64::consts::PI * s2).ln())
-            + (n_rows as f64) * ln_z
-    };
-
-    // σ-profile: at κ = 0, Z ≡ 1 and the closed-form minimiser is σ̂² = D/na;
-    // for κ ≠ 0 the volume term shifts it, so we golden-section σ² in log-space
-    // around that seed (the criterion is smooth and unimodal in σ²). The bracket
-    // spans four decades each side of the flat MLE — far wider than the volume
-    // term ever moves the optimum on a valid chart.
-    let s2_flat = (d / nobs).max(1.0e-300);
-    let v_p = if kappa == 0.0 {
-        nll(s2_flat)
-    } else {
-        const GOLDEN_INV: f64 = 0.618_033_988_749_894_8;
-        let mut lo = (s2_flat.ln()) - 4.0 * std::f64::consts::LN_10;
-        let mut hi = (s2_flat.ln()) + 4.0 * std::f64::consts::LN_10;
-        let mut c = hi - GOLDEN_INV * (hi - lo);
-        let mut e = lo + GOLDEN_INV * (hi - lo);
-        let mut fc = nll(c.exp());
-        let mut fe = nll(e.exp());
-        for _ in 0..200 {
-            if (hi - lo).abs() <= 1.0e-9 {
-                break;
-            }
-            if fc < fe {
-                hi = e;
-                e = c;
-                fe = fc;
-                c = hi - GOLDEN_INV * (hi - lo);
-                fc = nll(c.exp());
-            } else {
-                lo = c;
-                c = e;
-                fc = fe;
-                e = lo + GOLDEN_INV * (hi - lo);
-                fe = nll(e.exp());
-            }
-        }
-        nll((0.5 * (lo + hi)).exp())
-    };
+    // σ profiles in closed form: σ̂² = D/(nd). Substituting and dropping the
+    // κ-independent constant (nd/2)(1 + ln 2π):
+    //   V_p(κ) = (nd/2)·ln(D/(nd)) + Σ ln J_κ(s_i) − d·Σ ln λ_{y_i}.
+    let v_p = 0.5 * nobs * (disp / nobs).ln() + ln_jac - d * ln_lambda;
     Ok((v_p, base))
 }
 
