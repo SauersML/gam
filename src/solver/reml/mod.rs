@@ -4724,4 +4724,19 @@ pub(crate) struct RemlState<'a> {
     /// evaluations. In-memory warm starts still update; only JSON/bin
     /// persistence and eviction sweeps are suppressed.
     pub(crate) persistent_warm_start_store_suppression: AtomicUsize,
+    /// Whether the cross-process ON-DISK warm-start layer is engaged at all.
+    ///
+    /// Default `false`: the optimizer's IN-MEMORY warm start (the actual
+    /// speed lever) is always on, but the disk checkpoint — `load_record`
+    /// at fit start and `store_record` at finalize, each of which opens the
+    /// shared `WarmStartStore` and pays an eviction/dir scan that is O(cache
+    /// entries) on a network filesystem — is skipped. Disk persistence has
+    /// reuse value only ACROSS processes or across repeated identical fits;
+    /// a single in-process fit (and a fortiori a loop of distinct throwaway
+    /// fits, e.g. CI-coverage replicates each on different data, #1082/#1114)
+    /// gets zero benefit from it and pays the per-fit open/scan/save in full.
+    /// The workflow dispatcher flips this to `true` only when the caller has
+    /// signalled cross-process intent by attaching a cache session — magic by
+    /// default, no flag: opt-in is the presence of a session.
+    pub(crate) persistent_warm_start_disk_enabled: AtomicBool,
 }
