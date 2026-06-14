@@ -59,7 +59,7 @@ use crate::inference::riesz::{
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
 use crate::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use crate::linalg::faer_ndarray::{
-    FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
+    FaerCholesky, FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
 use crate::terms::sae_chart_canonicalization::CanonicalChartTopology;
 use crate::terms::sae_manifold::SaeManifoldTerm;
@@ -2875,26 +2875,33 @@ fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance
 /// squared tangent speed, the same `‖g'‖²` the [`atom_curvature_bound`] κ̂
 /// normalizes by). This is the smooth-functional realization of the same
 /// extrinsic curvature `‖II⊥‖/‖tangent‖` the geometric `per_atom_kappa_hat`
-/// estimates pointwise; the CI is anchored at the reported geometric κ̂.
+/// estimates pointwise. The geometric κ̂ supplies the curvature *sign* (sphere vs
+/// hyperbolic); the CI's centre and SE are the likelihood functional's own, so
+/// the interval is self-consistent with the SE that generates it.
 ///
 /// **The profiled criterion.** For a Gaussian penalized smooth the fitted
-/// coefficient covariance is `Cov(β̂) = φ H⁻¹` ([`AtomInnerFit::penalized_hessian`]
-/// `= H`, [`AtomInnerFit::dispersion`] `= φ`). The delta-method SE of the
-/// curvature functional is `se = √(∇κᵀ Cov(β̂) ∇κ)`, computed exactly by the
-/// same influence-function debiasing the #1097 Riesz functionals use
-/// ([`debias_with_dense_hessian`], whose sandwich SE is the realized
-/// score-covariance delta-method variance). The profile negative-log-evidence is
-/// then the second-order Laplace profile `V_p(κ) = ½ v_pp (κ − κ̂)²` with outer
-/// curvature `v_pp = 1/se²` — a genuine profiled criterion with argmin at κ̂,
-/// exactly the opaque oracle [`profile_ci_walk`] and [`flatness_lr_test`]
-/// consume. For this quadratic profile the χ²₁ Wilks crossing is the exact
-/// closed-form interval `κ̂ ± z_{1−α/2}·se`, and the flatness LR statistic is
-/// `κ̂²/se²` against an interior χ²₁ (κ = 0 is interior to the spherical ↔ flat
-/// ↔ hyperbolic family, so no boundary correction).
+/// coefficient covariance is `Cov(β̂) = Σ = φ H⁻¹` ([`AtomInnerFit::penalized_hessian`]
+/// `= H`, [`AtomInnerFit::dispersion`] `= φ`). The curvature numerator `c = βᵀSβ`
+/// is a quadratic form, whose ordinary delta-method SE vanishes at the curvature
+/// boundary `c = 0` (∇c = 2Sβ = 0) — precisely a flat atom. We therefore use the
+/// EXACT quadratic-form sampling variance
+/// `Var(ĉ) = 2·tr((SΣ)²) + 4·βᵀSΣSβ`, whose second term is the ordinary delta
+/// method when `c > 0` and whose first term is the nonzero boundary variance that
+/// keeps a flat atom's CI finite. With ρ = c/t (t the tangent energy, treated as
+/// a fixed scale) and κ = sign·√ρ, the second-order Laplace profile is
+/// `V_p(κ) = ½ v_pp (κ − κ̂)²`, `v_pp = 1/se_κ²`, `se_κ = se_ρ/(2|κ̂|)` away from
+/// the cusp — a genuine profiled criterion with argmin at κ̂, exactly the opaque
+/// oracle [`profile_ci_walk`] and [`flatness_lr_test`] consume. For this
+/// quadratic profile the χ²₁ Wilks crossing is the exact closed-form interval
+/// `κ̂ ± z_{1−α/2}·se_κ` against an interior χ²₁ (κ = 0 is interior to the
+/// spherical ↔ flat ↔ hyperbolic family, so no boundary correction). At/near
+/// κ̂ = 0 the √ρ → κ cusp is handled directly: the CI is the symmetric
+/// small-curvature interval `±√(ρ̂ + z·se_ρ)` from ρ's one-sided χ² region with
+/// verdict `Flat`.
 ///
 /// Returns `None` when the inner design carries no curvature column, the tangent
-/// energy is degenerate, the Hessian is not SPD, or the SE is non-finite — the
-/// genuine prerequisites for a likelihood-based curvature claim are absent.
+/// energy is degenerate, the Hessian is not SPD, or the variance is non-finite —
+/// the genuine prerequisites for a likelihood-based curvature claim are absent.
 fn atom_curvature_ci(fit: &AtomInnerFit) -> Option<AtomCurvatureCi> {
     let m = fit.design.ncols();
     if m <= 1 || fit.beta.len() != m {
@@ -2907,38 +2914,38 @@ fn atom_curvature_ci(fit: &AtomInnerFit) -> Option<AtomCurvatureCi> {
     if fit.derivative_design.ncols() != m || fit.penalty.dim() != (m, m) {
         return None;
     }
+    // φ scales the coefficient covariance Σ = φ H⁻¹ that the curvature variance
+    // is computed through.
     let phi = if fit.dispersion.is_finite() && fit.dispersion > 0.0 {
         fit.dispersion
     } else {
         return None;
     };
-    // φ enters the SE through the score-covariance the debiasing realizes; bind
-    // it so the dispersion guard is load-bearing rather than discarded.
-    if !(phi > 0.0) {
+    // The geometric `per_atom_kappa_hat` is the headline point estimate; it
+    // supplies the *sign* (sphere vs hyperbolic orientation) the likelihood
+    // functional cannot resolve. The CI's centre and SE are taken from the
+    // likelihood functional itself (below) so the interval is self-consistent
+    // with its own SE — a CI centred away from its SE-generating estimate would
+    // be statistically incoherent.
+    let kappa_geom = fit.kappa_hat;
+    if !kappa_geom.is_finite() {
         return None;
     }
-    let kappa_hat = fit.kappa_hat;
-    if !kappa_hat.is_finite() {
-        return None;
-    }
+    let kappa_sign = if kappa_geom < 0.0 { -1.0 } else { 1.0 };
 
-    // Curvature energy `S β` and tangent (derivative-design) Gram `D = Σ w_i d_i d_iᵀ`.
+    // Curvature energy `S β` (βᵀ S β = ∫ (g'')²) and the tangent (first-derivative)
+    // energy βᵀ D β = Σ_i w_i (d_iᵀ β)² that normalizes it to a scale-free
+    // curvature ratio.
     let s_beta = fit.penalty.dot(&fit.beta);
     let curvature_energy = fit.beta.dot(&s_beta); // βᵀ S β = ∫ (g'')²
-    let mut d_beta = Array1::<f64>::zeros(m); // (D β) = Σ_i w_i d_i (d_iᵀ β)
     let mut tangent_energy = 0.0_f64; // βᵀ D β = Σ_i w_i (d_iᵀ β)²
     for i in 0..n {
         let w_i = fit.weights[i];
         if !(w_i > 0.0) {
             continue;
         }
-        let d_row = fit.derivative_design.row(i);
-        let dot = d_row.dot(&fit.beta);
-        let wd = w_i * dot;
-        tangent_energy += wd * dot;
-        for col in 0..m {
-            d_beta[col] += wd * d_row[col];
-        }
+        let dot = fit.derivative_design.row(i).dot(&fit.beta);
+        tangent_energy += w_i * dot * dot;
     }
     if !(curvature_energy.is_finite() && curvature_energy >= 0.0) {
         return None;
@@ -2949,50 +2956,64 @@ fn atom_curvature_ci(fit: &AtomInnerFit) -> Option<AtomCurvatureCi> {
         return None;
     }
 
-    // Work in the smooth energy-ratio coordinate ρ(β) = (βᵀSβ)/(βᵀDβ) = c/t,
-    // which equals the squared curvature magnitude κ̂_mag² and whose gradient is
-    // finite EVERYWHERE (the √· in κ has a cusp at κ = 0, ρ does not):
-    //   ∇ρ = (2/t) S β − (2 c / t²) D β.
-    // We take its delta-method SE through the penalized Hessian, then map ρ to the
-    // signed curvature κ (whose sign the geometric κ̂ carries).
+    // The curvature estimand is the energy ratio ρ(β) = (βᵀSβ)/(βᵀDβ) = c/t,
+    // which equals the squared curvature magnitude κ̂_mag². The numerator c = βᵀSβ
+    // is a quadratic form in the fitted coefficients, so a plain delta-method SE
+    // VANISHES at the curvature boundary (β with c = 0, where ∇c = 2Sβ = 0) — and
+    // a flat atom is exactly that boundary. We therefore use the EXACT sampling
+    // variance of the quadratic form under the Gaussian fit `β̂ ~ N(β₀, Σ)`,
+    // Σ = φ H⁻¹:
+    //   Var(ĉ) = 2·tr((SΣ)²) + 4·β₀ᵀ S Σ S β₀,
+    // whose second term reduces to the ordinary delta method when c > 0 and whose
+    // first term is the nonzero boundary variance that keeps a flat atom's CI
+    // finite. The tangent normalizer t is treated as a fixed scale (its own
+    // sampling noise is second order in the curvature signal), so
+    //   Var(ρ̂) = Var(ĉ) / t²,  ρ̂ = c/t.
     let sqrt_t = tangent_energy.sqrt();
     if !(sqrt_t > 0.0) {
         return None;
     }
     let rho_hat = curvature_energy / tangent_energy; // = κ̂_mag²
-    let inv_t = 1.0 / tangent_energy;
-    let two_c_over_t2 = 2.0 * curvature_energy * inv_t * inv_t;
-    let mut grad_rho = Array1::<f64>::zeros(m);
-    for col in 0..m {
-        grad_rho[col] = 2.0 * inv_t * s_beta[col] - two_c_over_t2 * d_beta[col];
-    }
-    if grad_rho.iter().any(|g| !g.is_finite()) {
-        return None;
-    }
-    if grad_rho.iter().all(|g| *g == 0.0) {
-        // No fitted curvature OR tangent variation moves the ratio: a degenerate
-        // (everywhere-flat) functional carries no sensitivity. Refuse.
+
+    // Σ = φ H⁻¹ via one Cholesky solve against φ·I.
+    let chol = fit
+        .penalized_hessian
+        .to_owned()
+        .cholesky(Side::Lower)
+        .ok()?;
+    let mut phi_eye = Array2::<f64>::eye(m);
+    phi_eye.mapv_inplace(|v| v * phi);
+    let sigma = chol.solve_mat(&phi_eye); // φ H⁻¹
+    if sigma.iter().any(|v| !v.is_finite()) {
         return None;
     }
 
-    // Delta-method SE of ρ̂ through the penalized Hessian, via the same
-    // influence-function debiasing the #1097 functionals use. The sandwich SE is
-    // the realized-score delta-method variance √(∇ρᵀ Cov(β̂) ∇ρ).
-    let input = RieszInput {
-        beta: fit.beta.view(),
-        functional_gradient: grad_rho.view(),
-        row_scores: fit.row_scores.view(),
-        penalty_beta: s_beta.view(),
-        leverage: None,
-    };
-    let report = debias_with_dense_hessian(&input, fit.penalized_hessian.view()).ok()?;
-    let se_rho = report.se;
+    // SΣ and its trace-square tr((SΣ)²) = Σ_ij (SΣ)_ij (SΣ)_ji.
+    let s_sigma = fit.penalty.dot(&sigma); // (m, m)
+    let mut tr_sq = 0.0_f64;
+    for a in 0..m {
+        for b in 0..m {
+            tr_sq += s_sigma[[a, b]] * s_sigma[[b, a]];
+        }
+    }
+    // β₀ᵀ S Σ S β₀ = (Sβ)ᵀ Σ (Sβ).
+    let sigma_s_beta = sigma.dot(&s_beta);
+    let quad_term = s_beta.dot(&sigma_s_beta);
+    let var_c = (2.0 * tr_sq + 4.0 * quad_term).max(0.0);
+    if !(var_c.is_finite() && var_c > 0.0) {
+        return None;
+    }
+    let var_rho = var_c / (tangent_energy * tangent_energy);
+    let se_rho = var_rho.sqrt();
     if !(se_rho.is_finite() && se_rho > 0.0) {
         return None;
     }
 
     let level = 0.95;
     let kappa_mag = rho_hat.max(0.0).sqrt(); // |κ̂_functional|
+    // Signed likelihood curvature: magnitude from the functional, sign from the
+    // geometric κ̂. This is the CI's centre and the reported point estimate.
+    let kappa_hat = kappa_sign * kappa_mag;
     // Below this curvature magnitude the √ρ → κ map's cusp makes a κ-centred
     // quadratic profile ill-conditioned: treat κ̂ as indistinguishable from flat
     // and report the honest symmetric small-curvature interval drawn from ρ's
