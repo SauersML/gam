@@ -1186,15 +1186,6 @@ fn run_outer_with_plan(
                     let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
                         Arc::new(Mutex::new(None));
                     let cost_stall_rel_tol = (config.tolerance * 1.0e-2).max(f64::EPSILON);
-                    // Whole-stream plateau termination shared cell (#979/#1040).
-                    // The last-resort guarantee the survival marginal-slope path
-                    // can never run silent to a hard timeout: when the running
-                    // minimum of every finite cost (accepted iterate OR
-                    // line-search probe) stops improving by 1e-8 relative over a
-                    // 3-reading window, the bridge publishes the best iterate
-                    // here and the runner rebuilds a valid non-converged result.
-                    let plateau_exit: Arc<Mutex<Option<PlateauExit>>> =
-                        Arc::new(Mutex::new(None));
                     let objective = OuterFirstOrderBridge {
                         obj,
                         layout,
@@ -1210,7 +1201,6 @@ fn run_outer_with_plan(
                             cost_stall_exit.clone(),
                         )),
                         consecutive_probe_refusals: 0,
-                        plateau_terminator: Some(PlateauTerminator::new(plateau_exit.clone())),
                     };
                     // Hand the precomputed (cost, gradient) seed eval to
                     // `opt::Bfgs` so its first internal `eval_grad` call is
@@ -1340,49 +1330,6 @@ fn run_outer_with_plan(
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
                                     "BFGS cost-stall sentinel fired without a published best \
                                      iterate ({context})"
-                                ))),
-                            }
-                        }
-                        Err(BfgsError::ObjectiveFailed { message })
-                            if message.starts_with(OUTER_PLATEAU_TERMINATED_SENTINEL) =>
-                        {
-                            // Whole-stream plateau terminator (#979/#1040): the
-                            // running minimum of every finite cost stopped
-                            // improving over the detector window, so BFGS was
-                            // grinding the line search with no progress (the
-                            // silent hard-timeout path). Rebuild a VALID but
-                            // NON-converged outer result from the published best
-                            // iterate: the caller gets a fitted model + honest
-                            // status, never a hang. converged=false because the
-                            // gradient test was not met — distinct from the
-                            // #1089 cost-stall *convergence* exit.
-                            let exit = plateau_exit
-                                .lock()
-                                .ok()
-                                .and_then(|mut slot| slot.take());
-                            match exit {
-                                Some(exit) => {
-                                    log::warn!(
-                                        "[OUTER warning] {context}: plateau terminator fired \
-                                         after {} finite cost evaluations with no improvement in \
-                                         the running minimum; returning best-so-far \
-                                         (value={:.6e}, converged=false) instead of grinding to a \
-                                         hard timeout",
-                                        exit.evaluations,
-                                        exit.value,
-                                    );
-                                    Ok(outer_result_with_gradient_norm(
-                                        exit.rho,
-                                        exit.value,
-                                        exit.evaluations,
-                                        None,
-                                        false,
-                                        *the_plan,
-                                    ))
-                                }
-                                None => Err(EstimationError::RemlOptimizationFailed(format!(
-                                    "BFGS plateau terminator sentinel fired without a published \
-                                     best iterate ({context})"
                                 ))),
                             }
                         }
@@ -2791,7 +2738,6 @@ mod tests {
             value_probe_cache: Vec::new(),
             cost_stall: None,
             consecutive_probe_refusals: 0,
-            plateau_terminator: None,
         };
 
         let first = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
@@ -4773,79 +4719,6 @@ mod tests {
             result.final_value < 1e-3,
             "final cost {} should be near the bowl minimum",
             result.final_value,
-        );
-    }
-
-    #[test]
-    fn compass_search_plateau_terminates_on_frozen_merit_under_bounded_polls() {
-        // #979/#1040 survival arm: a frozen-valley compass objective (a
-        // survival-NLL-scale O(1e4) merit that never improves) must terminate
-        // via the relative-FlatStreak plateau guard within a small, DETERMINISTIC
-        // poll count — NOT by grinding to `max_polls` (the proxy for the external
-        // rc=124 wall-clock timeout). The merit magnitude (1.234e4) is chosen so
-        // that any absolute-tolerance stop is irrelevant: only the
-        // scale-invariant relative-improvement guard can fire here.
-        const FROZEN_COST: f64 = 1.234e4;
-        let probe_calls = Arc::new(AtomicUsize::new(0));
-        let problem = OuterProblem::new(1).with_solver_class(SolverClass::AuxiliaryGradientFree);
-        let mut obj = problem.build_objective(
-            (),
-            {
-                let probe_calls = Arc::clone(&probe_calls);
-                move |_: &mut (), _theta: &Array1<f64>| {
-                    probe_calls.fetch_add(1, Ordering::Relaxed);
-                    // Constant cost: no coordinate probe ever beats the seed, so
-                    // the running minimum is frozen from the first sweep on.
-                    Ok(FROZEN_COST)
-                }
-            },
-            |_: &mut (), _: &Array1<f64>| {
-                Err(EstimationError::InvalidInput(
-                    "compass plateau test only calls eval_cost".to_string(),
-                ))
-            },
-            None::<fn(&mut ())>,
-            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-        );
-
-        // A HUGE poll budget and a TINY step tolerance: the step-contraction and
-        // max_polls exits cannot be what stops the loop here. If the plateau
-        // guard were absent the loop would run all 1_000_000 polls.
-        let max_polls = 1_000_000usize;
-        let step_tol = 1.0e-12;
-        let lower = array![-10.0];
-        let upper = array![10.0];
-        let outcome = compass_search_outer(
-            &mut obj,
-            array![0.0],
-            FROZEN_COST,
-            lower.view(),
-            upper.view(),
-            COMPASS_INIT_STEP,
-            step_tol,
-            max_polls,
-        );
-
-        match outcome {
-            CompassSearchOutcome::BudgetExhausted { cost, polls, .. } => {
-                assert_eq!(cost, FROZEN_COST, "publishes the best (frozen) cost");
-                assert!(
-                    polls < 64,
-                    "plateau guard must terminate within a small bounded poll count, \
-                     got {polls} (would otherwise grind to max_polls={max_polls})"
-                );
-            }
-            CompassSearchOutcome::Converged { .. } => {
-                panic!(
-                    "a frozen O(1e4) merit must NOT be reported as step-contraction \
-                     convergence; the relative plateau guard must fire first as a \
-                     bounded non-converged status"
-                );
-            }
-        }
-        assert!(
-            probe_calls.load(Ordering::Relaxed) < 64,
-            "the inner cost objective must be invoked only a bounded number of times"
         );
     }
 
