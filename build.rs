@@ -266,7 +266,6 @@ fn main() {
     let mut oversized_file_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_oversized_tracked_files(&manifest_dir, &mut oversized_file_offenders);
 
-    // Mechanical file-splitting ban. `part_<NNN>.rs` files and `*_parts/` /
     // Persistent unimplemented/todo/unreachable removal audit. Compares the
     // current set of marker-bearing functions against the on-disk ledger and
     // flags any function whose marker disappeared without a real implementation
