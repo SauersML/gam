@@ -243,12 +243,12 @@ fn bms_marginal_slope_accepts_measure_jet_backbone() {
          backbone is not recovering the marginal-slope signal"
     );
 
-    // (c) Measure-jet diagnostic: at the issue's small center count
-    // (`centers=16`, below the multiscale-mode threshold) the mjs term resolves to
-    // single-scale mode — exactly ONE fused jet-energy penalty per surface, the
-    // same one-λ outer footprint as Duchon/Matérn (#1039). The per-scale
-    // spectral split is reserved for large center counts where the spectrum is
-    // identifiable; the affine-preserving ridge is likewise multiscale-only
+    // (c) Measure-jet diagnostic: with `centers=16` and no `multiscale` opt-in
+    // (#1116) the mjs term resolves to single-scale mode — exactly ONE fused
+    // jet-energy penalty per surface, the same one-λ outer footprint as
+    // Duchon/Matérn (#1039). The per-scale spectral split is reserved for the
+    // explicit multiscale opt-in where the spectrum is identifiable; the
+    // affine-preserving ridge is likewise multiscale-only
     // (#1116: in single-scale the one fused candidate already penalizes the
     // entire non-affine span, so a second λ only over-shrinks and doubles the
     // outer search). Here single-scale would otherwise inflate the
