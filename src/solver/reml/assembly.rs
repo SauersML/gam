@@ -71,7 +71,11 @@ pub(crate) fn row_scale_dense_in_place_by_inverse_positive_or_zero(
     row_scale_dense_in_place(out, scale, DenseRowScaleMode::InversePositiveOrZero);
 }
 
-pub(crate) fn row_scale_dense_in_place(out: &mut Array2<f64>, scale: &Array1<f64>, mode: DenseRowScaleMode) {
+pub(crate) fn row_scale_dense_in_place(
+    out: &mut Array2<f64>,
+    scale: &Array1<f64>,
+    mode: DenseRowScaleMode,
+) {
     assert_eq!(
         out.nrows(),
         scale.len(),
@@ -218,7 +222,13 @@ pub(crate) fn weighted_cross_dense(
         return fast_xt_diag_y(left, weights, right);
     }
 
-    let chunk_rows = dense_weighted_chunk_rows(p + q).min(n);
+    let chunk_rows = crate::parallel_strategy::row_reduction_chunk_rows(
+        n,
+        p.saturating_mul(q),
+        p.saturating_mul(q),
+        DENSE_WEIGHTED_PRODUCT_PAR_FLOPS,
+    )
+    .unwrap_or_else(|| dense_weighted_chunk_rows(p + q).min(n));
     let chunks = n.div_ceil(chunk_rows);
     (0..chunks)
         .into_par_iter()
@@ -261,7 +271,13 @@ pub(crate) fn xt_diag_x_dense_into(
         return crate::faer_ndarray::fast_atb(x, weighted);
     }
 
-    let chunk_rows = dense_weighted_chunk_rows(p).min(n);
+    let chunk_rows = crate::parallel_strategy::row_reduction_chunk_rows(
+        n,
+        p.saturating_mul(p),
+        p.saturating_mul(p),
+        DENSE_WEIGHTED_PRODUCT_PAR_FLOPS,
+    )
+    .unwrap_or_else(|| dense_weighted_chunk_rows(p).min(n));
     let chunks = n.div_ceil(chunk_rows);
     let mut out = (0..chunks)
         .into_par_iter()

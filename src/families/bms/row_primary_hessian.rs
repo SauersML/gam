@@ -3338,7 +3338,10 @@ impl BernoulliMarginalSlopeFamily {
     /// multi-axis direction (e.g. finite-difference probes); zero directions
     /// take a separate exact zero fast path. Backs the gam#683 fast path.
     #[inline]
-    pub(crate) fn single_primary_axis(dir: &Array1<f64>, primary: &PrimarySlices) -> Option<(usize, f64)> {
+    pub(crate) fn single_primary_axis(
+        dir: &Array1<f64>,
+        primary: &PrimarySlices,
+    ) -> Option<(usize, f64)> {
         if dir.len() != primary.total {
             return None;
         }
@@ -6907,7 +6910,20 @@ impl BernoulliMarginalSlopeFamily {
                 hessian_source
             );
         }
-        let n_chunks = n.div_ceil(ROW_CHUNK_SIZE);
+        let row_work_units = primary
+            .total
+            .saturating_mul(primary.total)
+            .saturating_mul(16);
+        let reduction_cells = slices.total.saturating_mul(slices.total);
+        let chunk_rows = crate::parallel_strategy::row_reduction_chunk_rows(
+            n,
+            row_work_units,
+            reduction_cells,
+            8_000_000,
+        )
+        .unwrap_or(ROW_CHUNK_SIZE)
+        .min(n.max(1));
+        let n_chunks = crate::parallel_strategy::row_reduction_chunk_count(n, chunk_rows);
         let completed_chunks = AtomicUsize::new(0);
         let progress_step = (n_chunks / 10).max(1);
         let acc = (0..n_chunks)
@@ -6915,8 +6931,8 @@ impl BernoulliMarginalSlopeFamily {
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
                 |mut acc, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    let start = chunk_idx * chunk_rows;
+                    let end = (start + chunk_rows).min(n);
                     let chunk_len = end - start;
                     let mut w_mm = Array1::<f64>::zeros(chunk_len);
                     let mut w_mg = Array1::<f64>::zeros(chunk_len);
@@ -7038,7 +7054,7 @@ impl BernoulliMarginalSlopeFamily {
                                 "[BMS dense-H] progress chunks={}/{} rows={}/{} elapsed={:.3}s",
                                 done,
                                 n_chunks,
-                                (done * ROW_CHUNK_SIZE).min(n),
+                                (done * chunk_rows).min(n),
                                 n,
                                 started.elapsed().as_secs_f64()
                             );
@@ -7105,15 +7121,31 @@ impl BernoulliMarginalSlopeFamily {
                 BernoulliBlockHessianAccumulator::new(slices),
             )
         };
-        let n_chunks = n.div_ceil(ROW_CHUNK_SIZE);
+        let row_work_units = primary
+            .total
+            .saturating_mul(primary.total)
+            .saturating_mul(16);
+        let reduction_cells = slices
+            .total
+            .saturating_mul(slices.total)
+            .saturating_add(slices.total);
+        let chunk_rows = crate::parallel_strategy::row_reduction_chunk_rows(
+            n,
+            row_work_units,
+            reduction_cells,
+            8_000_000,
+        )
+        .unwrap_or(ROW_CHUNK_SIZE)
+        .min(n.max(1));
+        let n_chunks = crate::parallel_strategy::row_reduction_chunk_count(n, chunk_rows);
         let completed_chunks = AtomicUsize::new(0);
         let progress_step = (n_chunks / 10).max(1);
         let (log_likelihood, grad_marginal, grad_logslope, grad_h, grad_w, hessian_acc) =
             (0..n_chunks)
                 .into_par_iter()
                 .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    let start = chunk_idx * chunk_rows;
+                    let end = (start + chunk_rows).min(n);
                     let chunk_len = end - start;
                     let mut w_mm = Array1::<f64>::zeros(chunk_len);
                     let mut w_mg = Array1::<f64>::zeros(chunk_len);
@@ -7305,7 +7337,7 @@ impl BernoulliMarginalSlopeFamily {
                                 "[BMS fused exact-gradient+dense-H] progress chunks={}/{} rows={}/{} elapsed={:.3}s",
                                 done,
                                 n_chunks,
-                                (done * ROW_CHUNK_SIZE).min(n),
+                                (done * chunk_rows).min(n),
                                 n,
                                 started.elapsed().as_secs_f64()
                             );
@@ -7420,5 +7452,4 @@ impl BernoulliMarginalSlopeFamily {
         drop(process_monitor_guard);
         Ok(log_likelihood)
     }
-
 }

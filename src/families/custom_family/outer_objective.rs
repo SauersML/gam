@@ -645,6 +645,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let tr_row_measure_top =
                 crate::solver::row_measure::RowMeasure::from_options(options, total_joint_n);
             let hessian_started = std::time::Instant::now();
+            let hessian_scope_guard = crate::process_monitor::track_scope(format!(
+                "joint Newton hessian_qp cycle={cycle} n={total_joint_n} p={total_p}"
+            ));
             log::info!(
                 "[joint-newton-tr] phase=hessian_qp cycle={} r={:.3e}",
                 cycle,
@@ -725,6 +728,23 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     }
                 }
             };
+            let hessian_source_elapsed = workspace_build_started.elapsed();
+            if hessian_source_elapsed.as_secs_f64() >= 1.0 || (cycle_log && cycle == 0) {
+                let source_kind = if matches!(&joint_hessian_source, JointHessianSource::Dense(_)) {
+                    "dense"
+                } else {
+                    "operator"
+                };
+                log::info!(
+                    "[STAGE] PIRLS/inner step=cycle{} hessian-source joint_workspace_requested={} source={} elapsed={:.3}s n={} p={}",
+                    cycle,
+                    joint_workspace_requested,
+                    source_kind,
+                    hessian_source_elapsed.as_secs_f64(),
+                    total_joint_n,
+                    total_p,
+                );
+            }
 
             // Concatenate block gradients and betas.
             let Some(grad_joint) = cached_joint_gradient.clone() else {
@@ -968,8 +988,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             lhs[[d, d]] += joint_solver_diagonal_ridge - trace_diagonal_ridge;
                         }
                     }
-                    check_linear_feasibility(&beta_joint, constraints, 1e-8)
-                        .map_err(|e| format!("joint Newton constrained solve [cycle={cycle}]: {e}"))?;
+                    check_linear_feasibility(&beta_joint, constraints, 1e-8).map_err(|e| {
+                        format!("joint Newton constrained solve [cycle={cycle}]: {e}")
+                    })?;
                     let warm_joint_active =
                         flatten_joint_active_set(&cached_active_sets, &block_constraints);
                     let lower_bounds = match extract_simple_lower_bounds(constraints, total_p) {
@@ -1425,17 +1446,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             Ok(matrix) => matrix,
                             Err(_) => break,
                         };
-                        // Snapshot the Jeffreys information matrix for the
-                        // second-order completion below. For canonical families
-                        // this is the joint Newton Hessian; non-canonical
-                        // Bernoulli/binomial families override it with expected
-                        // Fisher information, which is the object Jeffreys'
-                        // prior is defined on.
-                        let jeffreys_completion_pairwise_fallback =
-                            total_p <= JEFFREYS_COMPLETION_MAX_P;
-                        let jeffreys_completion_requested = jeffreys_completion_pairwise_fallback
-                            || family
-                                .joint_jeffreys_information_contracted_trace_hessian_available();
+                        // Snapshot the Jeffreys information matrix only when a
+                        // family supplies the contracted completion. The generic
+                        // pairwise fallback costs p(p+1)/2 full second-directional
+                        // Hessian passes; at biobank scale (BMS p=35, n≈196k) it
+                        // turns a near-converged polishing cycle into ~50s of row
+                        // work. Without a contracted hook the divided-difference
+                        // H_phi model remains first-order correct and the KKT
+                        // certificate owns convergence.
+                        let jeffreys_completion_requested =
+                            family.joint_jeffreys_information_contracted_trace_hessian_available();
                         let h_info_for_completion = (jeffreys_completion_endgame
                             && inner_jeffreys_term.is_some()
                             && jeffreys_completion_requested)
@@ -1486,12 +1506,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 joint_jeffreys_subspace.as_ref(),
                             ) && let Some(completion) =
                                 custom_family_joint_jeffreys_second_order_completion(
-                                    family,
-                                    &states,
-                                    specs,
-                                    h_info,
-                                    z_joint,
-                                    jeffreys_completion_pairwise_fallback,
+                                    family, &states, specs, h_info, z_joint, false,
                                 )?
                             {
                                 lhs_true += &completion;
@@ -1570,6 +1585,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // attribute time correctly between the Hessian/QP and the
             // backtracking step search.
             let hessian_and_qp_elapsed = hessian_started.elapsed();
+            drop(hessian_scope_guard);
             let line_search_started = std::time::Instant::now();
             log::info!(
                 "[joint-newton-tr] phase=line_search cycle={} r={:.3e} hessian_qp_elapsed={:.3}s",
@@ -5233,12 +5249,12 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
             .collect()
     };
     let total_p_joint: usize = ranges_joint.last().map_or(0, |r| r.1);
-    let joint_mode_diagonal_ridge =
-        if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
-            ridge
-        } else {
-            0.0
-        };
+    let joint_mode_diagonal_ridge = if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty
+    {
+        ridge
+    } else {
+        0.0
+    };
     let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
 
     // Allow up to a few polishing steps. The blockwise endpoint is close
@@ -5369,11 +5385,7 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
             }
         } else {
             let solver = crate::linalg::utils::StableSolver::new("joint polish");
-            match solver.solvevectorwithridge_retries(
-                &h_dense,
-                &rhs,
-                JOINT_TRACE_STABILITY_RIDGE,
-            ) {
+            match solver.solvevectorwithridge_retries(&h_dense, &rhs, JOINT_TRACE_STABILITY_RIDGE) {
                 Some(d) => d,
                 None => break,
             }
@@ -5393,12 +5405,8 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
                 let (start, end) = ranges_joint[b];
                 let mut trial_beta = old_states[b].beta.clone();
                 trial_beta.scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
-                let projected = family.post_update_block_beta(
-                    &old_states,
-                    b,
-                    &specs[b],
-                    trial_beta.clone(),
-                )?;
+                let projected =
+                    family.post_update_block_beta(&old_states, b, &specs[b], trial_beta.clone())?;
                 reject_constrained_post_update_repair(
                     b,
                     &specs[b],
@@ -5711,7 +5719,8 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
 }
 
 pub(crate) struct OwnedJointDerivProvider {
-    pub(crate) compute_dh: Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
+    pub(crate) compute_dh:
+        Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
     pub(crate) compute_dh_many: Option<
         Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync>,
     >,
@@ -8137,7 +8146,8 @@ pub(crate) struct CachedInnerMode {
     pub(crate) block_logdet_s: f64,
     pub(crate) joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     pub(crate) kkt_residual: Option<crate::estimate::reml::unified::ProjectedKktResidual>,
-    pub(crate) active_constraints: Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
+    pub(crate) active_constraints:
+        Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 }
 
 pub(crate) fn screened_outer_warm_start<'a>(

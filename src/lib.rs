@@ -71,6 +71,7 @@ pub mod identifiability_diagnostics;
 pub mod inference;
 pub mod kernels;
 pub mod linalg;
+pub(crate) mod parallel_strategy;
 pub mod report;
 pub mod resource;
 pub mod sae_identifiability;
