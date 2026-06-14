@@ -591,7 +591,7 @@ impl SaeManifoldOuterObjective {
             }
         }
 
-        let arrived = bifurcation.is_none() && eta >= 1.0;
+        let mut arrived = bifurcation.is_none() && eta >= 1.0;
         // Leave the term at the real (η = 1) objective regardless of outcome so
         // an aborted walk hands the cascade the full basis.
         if !arrived {
@@ -639,6 +639,41 @@ impl SaeManifoldOuterObjective {
             match accepted_polish {
                 Ok(loss) => self.last_loss = Some(loss),
                 Err(_) => self.term.restore_mutable_state(&snapshot),
+            }
+        }
+        // Arrival quality floor (#1117). "Arrived" is only a usable certificate
+        // if the η = 1 reconstruction is actually good — the predictor-corrector
+        // walk from the Eckart-Young LINEAR anchor can track into a degenerate
+        // basin that is stationary on the gauge/decoder-null quotient (so the
+        // inner solve legitimately converges there) yet reconstructs the data
+        // badly (a NEGATIVE explained variance: worse than the data mean). The
+        // decoder-LSQ polish above is the first rescue; when even that cannot
+        // lift the EV to the arrival floor, declaring "arrived" pins the whole
+        // fit to that garbage basin (EV = -0.59 on the K = 1 periodic p = 512
+        // circle) instead of letting the documented multi-seed cascade — which
+        // cold-starts near the circle and recovers EV ≈ 0.94 — take over. So a
+        // sub-floor post-polish reconstruction DEMOTES the walk to a recorded
+        // bifurcation: the cascade runs (a ~30s cold fit here, no stall) and
+        // finds the good branch. A genuinely good arrival (the common case, and
+        // every fit that was already passing) is untouched.
+        if arrived
+            && let Ok(final_fit) = self.term.try_fitted_for_rho(&rho)
+            && let Some(final_ev) =
+                reconstruction_explained_variance(self.target.view(), final_fit.view())
+            && final_ev < CURVATURE_WALK_ARRIVAL_EV_FLOOR
+        {
+            log::info!(
+                "[#1007] curvature walk reached η=1 but the reconstruction is degenerate \
+                 (EV={final_ev:.4} < arrival floor {CURVATURE_WALK_ARRIVAL_EV_FLOOR}); demoting to \
+                 a branch bifurcation so the seed cascade can recover the good branch"
+            );
+            arrived = false;
+            self.term.set_homotopy_eta(1.0).ok();
+            if bifurcation.is_none() {
+                bifurcation = Some(CurvatureBifurcation {
+                    eta: 1.0,
+                    min_pivot: 0.0,
+                });
             }
         }
         let collapse_events = self.term.collapse_events().len();

@@ -66,6 +66,18 @@ pub(crate) const CURVATURE_WALK_MIN_ETA_STEP: f64 = 1.0 / 256.0;
 /// defers to the cascade, never a spin.
 pub(crate) const CURVATURE_WALK_MAX_CORRECTORS: usize = 32;
 
+/// Minimum η = 1 reconstruction explained-variance for the curvature-homotopy
+/// walk to certify "arrived" (#1117). The predictor-corrector walk from the
+/// Eckart-Young LINEAR anchor can converge (legitimately, on the gauge/decoder-
+/// null quotient) into a degenerate basin whose reconstruction is worse than the
+/// data mean (a NEGATIVE EV). When the post-polish EV is below this floor the
+/// arrival is demoted to a recorded bifurcation so the documented seed cascade —
+/// which cold-starts near the data manifold — recovers the good branch. The
+/// floor sits well below a genuine recovery (a real circle reconstructs at
+/// EV ≳ 0.9) but firmly above the worse-than-trivial basins, so a clean arrival
+/// is never demoted while a garbage basin always is.
+pub(crate) const CURVATURE_WALK_ARRIVAL_EV_FLOOR: f64 = 0.5;
+
 /// Relative floor on the Newton directional decrease, expressed as a tiny
 /// multiple of `‖g‖·‖Δ‖`. A predicted decrease below this is at the level of
 /// f64 round-off in the quadratic model and is treated as no progress (the step
