@@ -313,7 +313,10 @@ from ._validation import FormulaValidation
 from .structure_discovery import (
     atom_birth_gate,
     e_bh_dictionary_certificate,
+    expected_resolution_budget,
     log_e_from_p_value,
+    plan_probe_for_contested_claim,
+    select_probe_by_expected_evidence,
     split_likelihood_log_e,
 )
 from .bartlett import lawley_bartlett_factor

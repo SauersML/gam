@@ -27,6 +27,13 @@ e_bh_dictionary_certificate
     e-BH FDR-controlled list of confirmed claims from per-claim log e-values.
 log_e_from_p_value
     Calibrate a p-value into a conservative valid log e-value (``e = 1/p̂``).
+select_probe_by_expected_evidence
+    Pick the steering probe with maximal expected log-evidence growth.
+expected_resolution_budget
+    Convert per-observation evidence growth into an expected certification
+    budget.
+plan_probe_for_contested_claim
+    Pick the next probe and discount its remaining budget by current evidence.
 """
 
 from __future__ import annotations
@@ -87,3 +94,67 @@ def log_e_from_p_value(p_value: float) -> float:
     Lets a p-value-only claim join :func:`e_bh_dictionary_certificate`.
     """
     return rust_module().log_e_from_p_value(float(p_value))
+
+
+def select_probe_by_expected_evidence(
+    delta: Any,
+    predicted_mean_null: Any,
+    predicted_mean_alt: Any,
+    fisher: Any,
+) -> dict[str, Any] | None:
+    """Pick the candidate probe with maximal expected evidence growth.
+
+    ``delta``, ``predicted_mean_null``, and ``predicted_mean_alt`` are
+    row-aligned ``(n_probes, p_out)`` arrays. The score is
+    ``0.5 * (mu_alt - mu_null).T @ fisher @ (mu_alt - mu_null)``: expected
+    log-growth, in nats per observation, of the contested claim's e-process
+    under the alternative. Returns ``None`` when no candidate discriminates.
+    """
+    return rust_module().select_probe_by_expected_evidence(
+        delta,
+        predicted_mean_null,
+        predicted_mean_alt,
+        fisher,
+    )
+
+
+def expected_resolution_budget(
+    alpha: float,
+    growth_nats_per_obs: float,
+) -> float | None:
+    """Expected observations to cross the ``1 / alpha`` evidence threshold.
+
+    ``growth_nats_per_obs`` is the selected probe's expected per-observation
+    log-evidence growth. Returns ``None`` for invalid levels or non-positive
+    growth.
+    """
+    return rust_module().expected_resolution_budget(
+        float(alpha),
+        float(growth_nats_per_obs),
+    )
+
+
+def plan_probe_for_contested_claim(
+    delta: Any,
+    predicted_mean_null: Any,
+    predicted_mean_alt: Any,
+    fisher: Any,
+    alpha: float,
+    current_log_e: float = 0.0,
+) -> dict[str, Any] | None:
+    """Plan the next KL-optimal steering probe for a contested claim.
+
+    The selected probe maximizes predicted hypothesis disagreement in the
+    output-Fisher metric, then reports both the from-scratch and remaining
+    observation budgets after accounting for ``current_log_e`` already banked
+    in the claim's e-process. Returns ``None`` when steering cannot distinguish
+    the candidate hypotheses.
+    """
+    return rust_module().plan_probe_for_contested_claim(
+        delta,
+        predicted_mean_null,
+        predicted_mean_alt,
+        fisher,
+        float(alpha),
+        float(current_log_e),
+    )
