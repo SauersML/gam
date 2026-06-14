@@ -2846,14 +2846,35 @@ impl BernoulliMarginalSlopeFamily {
                     let mut w_gg = (0..n_dirs)
                         .map(|_| Array1::<f64>::zeros(len))
                         .collect::<Vec<_>>();
-                    let x_chunk = self
-                        .marginal_design
-                        .try_row_chunk(start..end)
-                        .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
-                    let g_chunk = self
-                        .logslope_design
-                        .try_row_chunk(start..end)
-                        .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
+                    // Zero-copy fast path: borrow the chunk rows from the stored
+                    // dense matrix as `ArrayView2` (wrapped in `CowArray`) when
+                    // materialised, instead of `.to_owned()`-copying a fresh
+                    // `Array2` per chunk per cycle. `fast_ab` and
+                    // `add_weighted_design_grams_from_chunks` are generic over
+                    // `Data<Elem = f64>`, so the view drives the identical BLAS-3
+                    // kernels with identical arithmetic — exact, no copy.
+                    let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                        match self.marginal_design.as_dense_ref() {
+                            Some(x_full) => x_full.slice(s![start..end, ..]).into(),
+                            None => self
+                                .marginal_design
+                                .try_row_chunk(start..end)
+                                .map_err(|e| {
+                                    format!("bernoulli marginal_design try_row_chunk: {e}")
+                                })?
+                                .into(),
+                        };
+                    let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                        match self.logslope_design.as_dense_ref() {
+                            Some(g_full) => g_full.slice(s![start..end, ..]).into(),
+                            None => self
+                                .logslope_design
+                                .try_row_chunk(start..end)
+                                .map_err(|e| {
+                                    format!("bernoulli logslope_design try_row_chunk: {e}")
+                                })?
+                                .into(),
+                        };
                     let marginal_projected =
                         crate::faer_ndarray::fast_ab(&x_chunk, &marginal_dirs);
                     let logslope_projected =
@@ -3631,14 +3652,35 @@ impl BernoulliMarginalSlopeFamily {
                         let start = chunk_idx * ROW_CHUNK_SIZE;
                         let end = (start + ROW_CHUNK_SIZE).min(n);
                         let rows = end - start;
-                        let marginal_chunk = self
-                            .marginal_design
-                            .try_row_chunk(start..end)
-                            .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
-                        let logslope_chunk = self
-                            .logslope_design
-                            .try_row_chunk(start..end)
-                            .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
+                        // Zero-copy fast path: borrow the chunk rows from the
+                        // stored dense matrix as `ArrayView2` (wrapped in
+                        // `CowArray`) when materialised, avoiding the per-chunk
+                        // `.to_owned()` copy on every pre-warm cycle.
+                        // `add_weighted_chunk_gram` is generic over
+                        // `Data<Elem = f64>`, so the view drives the identical
+                        // Gram kernel with identical arithmetic.
+                        let marginal_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                            match self.marginal_design.as_dense_ref() {
+                                Some(x_full) => x_full.slice(s![start..end, ..]).into(),
+                                None => self
+                                    .marginal_design
+                                    .try_row_chunk(start..end)
+                                    .map_err(|e| {
+                                        format!("bernoulli marginal_design try_row_chunk: {e}")
+                                    })?
+                                    .into(),
+                            };
+                        let logslope_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                            match self.logslope_design.as_dense_ref() {
+                                Some(g_full) => g_full.slice(s![start..end, ..]).into(),
+                                None => self
+                                    .logslope_design
+                                    .try_row_chunk(start..end)
+                                    .map_err(|e| {
+                                        format!("bernoulli logslope_design try_row_chunk: {e}")
+                                    })?
+                                    .into(),
+                            };
                         let mut hm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
                         let mut hl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
                         let hm_w = &mut hm_w_buf[..rows];

@@ -2223,18 +2223,45 @@ impl BernoulliMarginalSlopeFamily {
                 let start = chunk_idx * rows_per_chunk;
                 let end = (start + rows_per_chunk).min(n);
                 let rows = start..end;
-                let x_chunk = self
-                    .marginal_design
-                    .try_row_chunk(rows.clone())
-                    .map_err(|err| format!("marginal trace row chunk failed: {err}"))?;
-                let g_chunk = self
-                    .logslope_design
-                    .try_row_chunk(rows.clone())
-                    .map_err(|err| format!("logslope trace row chunk failed: {err}"))?;
-                let proj_m = crate::faer_ndarray::fast_ab(&x_chunk, &factor_m);
-                let proj_g = crate::faer_ndarray::fast_ab(&g_chunk, &factor_g);
-                let dir_proj_m = crate::faer_ndarray::fast_ab(&x_chunk, &dir_m);
-                let dir_proj_g = crate::faer_ndarray::fast_ab(&g_chunk, &dir_g);
+                // Zero-copy fast path: when BOTH designs are materialised dense
+                // the chunk rows are read straight from the stored matrix as
+                // borrowed `ArrayView2` slices. `try_row_chunk` would `.to_owned()`
+                // a fresh `(rows × p)` `Array2` for every chunk on every
+                // ρ-homotopy pre-warm pass — the dominant `OwnedRepr<f64>`
+                // alloc/`drop_in_place` churn of the cold marginal-slope fit.
+                // `fast_ab` is generic over `Data<Elem = f64>`, so the view feeds
+                // the identical BLAS-3 kernel with identical arithmetic.
+                let (proj_m, proj_g, dir_proj_m, dir_proj_g) = match (
+                    self.marginal_design.as_dense_ref(),
+                    self.logslope_design.as_dense_ref(),
+                ) {
+                    (Some(x_full), Some(g_full)) => {
+                        let x_chunk = x_full.slice(s![rows.clone(), ..]);
+                        let g_chunk = g_full.slice(s![rows.clone(), ..]);
+                        (
+                            crate::faer_ndarray::fast_ab(&x_chunk, &factor_m),
+                            crate::faer_ndarray::fast_ab(&g_chunk, &factor_g),
+                            crate::faer_ndarray::fast_ab(&x_chunk, &dir_m),
+                            crate::faer_ndarray::fast_ab(&g_chunk, &dir_g),
+                        )
+                    }
+                    _ => {
+                        let x_chunk = self
+                            .marginal_design
+                            .try_row_chunk(rows.clone())
+                            .map_err(|err| format!("marginal trace row chunk failed: {err}"))?;
+                        let g_chunk = self
+                            .logslope_design
+                            .try_row_chunk(rows.clone())
+                            .map_err(|err| format!("logslope trace row chunk failed: {err}"))?;
+                        (
+                            crate::faer_ndarray::fast_ab(&x_chunk, &factor_m),
+                            crate::faer_ndarray::fast_ab(&g_chunk, &factor_g),
+                            crate::faer_ndarray::fast_ab(&x_chunk, &dir_m),
+                            crate::faer_ndarray::fast_ab(&g_chunk, &dir_g),
+                        )
+                    }
+                };
                 let mut acc = vec![0.0; n_dirs];
                 let mut gram = vec![0.0; primary.total * primary.total];
                 let mut row_dir = Array1::<f64>::zeros(primary.total);

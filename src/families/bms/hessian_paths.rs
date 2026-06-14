@@ -304,23 +304,32 @@ impl BernoulliBlockHessianAccumulator {
 
         let need_marginal = h_q.is_some() || w_q.is_some();
         let need_logslope = h_g.is_some() || w_g.is_some();
-        let x = if need_marginal {
-            Some(
-                family
+        // Zero-copy fast path: when a design is materialised dense, borrow the
+        // chunk rows as an `ArrayView2` (wrapped in `CowArray`) instead of
+        // `.to_owned()`-copying a fresh `Array2` per chunk per cycle. `fast_atb`
+        // is generic over `Data<Elem = f64>`, so the borrowed view drives the
+        // identical BLAS-3 kernel with identical arithmetic — exact, no copy.
+        let x: Option<ndarray::CowArray<'_, f64, ndarray::Ix2>> = if need_marginal {
+            Some(match family.marginal_design.as_dense_ref() {
+                Some(x_full) => x_full.slice(s![rows.clone(), ..]).into(),
+                None => family
                     .marginal_design
                     .try_row_chunk(rows.clone())
-                    .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?,
-            )
+                    .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?
+                    .into(),
+            })
         } else {
             None
         };
-        let g = if need_logslope {
-            Some(
-                family
+        let g: Option<ndarray::CowArray<'_, f64, ndarray::Ix2>> = if need_logslope {
+            Some(match family.logslope_design.as_dense_ref() {
+                Some(g_full) => g_full.slice(s![rows.clone(), ..]).into(),
+                None => family
                     .logslope_design
-                    .try_row_chunk(rows)
-                    .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?,
-            )
+                    .try_row_chunk(rows.clone())
+                    .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?
+                    .into(),
+            })
         } else {
             None
         };
