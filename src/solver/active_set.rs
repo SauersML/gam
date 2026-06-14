@@ -1221,6 +1221,43 @@ fn fallback_projected_gradient_direction(
         .iter()
         .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
     if step_inf <= 1e-12 {
+        // The projected-gradient tangent step has collapsed to ~0: the working
+        // set holds the gradient stationary, so no descent direction remains in
+        // the working tangent space. Returning `d_total` as-is is ONLY correct
+        // when the iterate `x = beta_start + d_total` is itself feasible. When
+        // `x` is infeasible (an inactive row was violated by an earlier
+        // `alpha`-clipped step and never repaired — the KKT solve only closes
+        // residuals on ACTIVE rows), returning `d_total` leaks an infeasible
+        // iterate that the downstream `check_linear_feasibility` gate rejects
+        // as an "infeasible iterate" (#1108: the interval-censored survival
+        // surrogate landed here at scaled-violation 5.7e-3..0.12 while the
+        // exact projection of the SAME point reaches ~0 violation). Project the
+        // stationary iterate onto the feasible cone and return the corresponding
+        // direction so the solve returns a feasible point. The returned result
+        // is `beta_start + dir`, and `x = beta_start + d_total`, so to return a
+        // feasible `p` the direction is `dir = d_total + (p - x)`.
+        let (worst, _) = max_linear_constraint_violation(x, constraints);
+        if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+            let projected = project_point_strictly_into_feasible_cone(x, constraints)
+                .or_else(|| {
+                    let identity = Array2::<f64>::eye(p);
+                    solve_quadratic_with_linear_constraints(&identity, x, x, constraints, None)
+                        .ok()
+                        .map(|(beta, _active)| beta)
+                })
+                .filter(|p_candidate| {
+                    max_linear_constraint_violation(p_candidate, constraints).0
+                        <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+                });
+            let Some(projected) = projected else {
+                // No feasible repair available — let the caller report honestly
+                // rather than returning an infeasible direction.
+                return Ok(None);
+            };
+            let repair = &projected - x;
+            let active = canonicalize_active_constraint_ids(&projected, constraints, &[])?;
+            return Ok(Some((d_total + &repair, active)));
+        }
         let active = canonicalize_active_constraint_ids(x, constraints, &[])?;
         return Ok(Some((d_total.clone(), active)));
     }
