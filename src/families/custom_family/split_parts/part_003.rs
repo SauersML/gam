@@ -1135,6 +1135,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // the dense path; at a genuine constrained optimum the reduced
                     // Hessian is PSD so this is a no-op and the converged β is
                     // unchanged.
+                    //
+                    // NEWTON-DECREMENT CERTIFICATE ON THE CONSTRAINED PATH
+                    // (gam#1040 / gam#1088). The dense-spectral branch populates
+                    // `joint_spectrum` (line ~1493) so the convergence loop's
+                    // Newton-decrement exit can terminate the geometric/linear tail
+                    // when the achievable model descent `½ Σ c_k²/|γ_k|` drops below
+                    // `objective_tol`. The constrained branch never set it, so a
+                    // weakly-identified survival-MS fit (the n≈2e5 logslope block,
+                    // step clamped by the trust region, residual creeping ~7%/cycle)
+                    // had no early-exit and ground the whole budget. Build the same
+                    // D-whitened spectrum from the penalized `lhs` (decrement reflects
+                    // negative modes via `.abs()` internally, so the pre-reflection
+                    // `lhs` is the right input) and the augmented stationarity RHS, so
+                    // the decrement read is consistent with the dense path. Diagnostic
+                    // only for the convergence test — it does NOT change the QP step.
+                    if let Ok(spectrum) = whitened_spectrum::WhitenedHessianSpectrum::decompose(
+                        &lhs,
+                        &rhs_step,
+                        &joint_trust_metric_diag,
+                        KKT_REFUSAL_RANK_TOL,
+                    ) {
+                        joint_spectrum = Some(spectrum);
+                    }
                     let lhs = symmetric_negative_curvature_reflected(&lhs);
                     let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
                     let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
