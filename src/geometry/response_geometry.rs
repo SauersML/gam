@@ -629,12 +629,19 @@ pub fn response_frechet_mean(
 // point) is re-solved, and the profiled criterion
 //
 // ```text
-//   V_p(κ) = (n_rows · ambient / 2) · ln( D(κ) / (n_rows · ambient) )
+//   V_p(κ) = (n_rows · a / 2) · ln( D(κ) / (n_rows · a) ) − n_rows · a · ln λ_μ
 //   D(κ)   = min_{base} Σ_i ‖log_{base,κ}(y_i)‖²_{base}     (Fréchet dispersion)
+//   λ_μ    = 2 / (1 + κ‖μ‖²)   (conformal factor at the intrinsic mean μ = base)
 // ```
 //
 // is the concentrated Gaussian negative-log-evidence of the intercept-only
-// tangent model (σ profiled out). `V_p` is a *negative* log-evidence (lower is
+// tangent model (σ profiled out). The `−n_rows·a·ln λ_μ` term is the metric
+// log-determinant ½·ln det g_μ at the mean — the Gaussian normaliser of the
+// intrinsic tangent model. It is what makes V_p a PROPER likelihood with an
+// interior minimum at the data-generating κ: dispersion alone collapses to −∞
+// as κ→+∞ (the manifold radius 1/√κ→0 shrinks every geodesic distance), so a
+// dispersion-only criterion is scale-degenerate and its minimiser runs to the
+// upper chart bound. `V_p` is a *negative* log-evidence (lower is
 // better), so κ̂ = argmin V_p, and `2[V_p(0) − V_p(κ̂)]` is the Wilks LR statistic
 // of flatness — exactly the contract `profile_ci_walk` / `flatness_lr_test` in
 // `curvature_estimand.rs` consume. κ thus joins the outer optimisation as one
@@ -712,15 +719,6 @@ pub fn response_curvature_criterion(
     let (n_rows, _) = values.dim();
     let base = response_frechet_mean(manifold, values, None, tol, max_iter)?;
     let mut dispersion = 0.0_f64;
-    // Σᵢ ln λ_κ(yᵢ): the log Riemannian volume density (√det g = λ^a) at every
-    // data point, the change-of-variables term that ties the tangent model back
-    // to the FIXED chart points yᵢ. Without it the criterion is dispersion-only
-    // and scale-degenerate: as κ → +∞ the manifold radius 1/√κ → 0, every
-    // geodesic distance — hence D(κ) — collapses toward 0 and ½na·ln(D/na) → −∞,
-    // driving the minimiser to the upper bracket bound. The volume term is what
-    // makes V_p a proper profiled Gaussian negative-log-evidence with an interior
-    // minimum at the data-generating κ.
-    let mut log_vol = 0.0_f64;
     for row in values.outer_iter() {
         let lg = manifold
             .log_point(base.view(), row)
@@ -729,25 +727,36 @@ pub fn response_curvature_criterion(
             .sq_metric_norm(base.view(), lg.view())
             .map_err(|e| format!("response curvature criterion metric: {e}"))?;
         dispersion += sq;
-        let lam = chart
-            .conformal_factor(row)
-            .map_err(|e| format!("response curvature criterion volume: {e}"))?;
-        log_vol += lam.ln();
     }
     let nobs = (n_rows * dim) as f64;
     // Floor the dispersion so a (near-)perfect flat fit does not blow ln up; the
     // floor is far below any genuine residual scale and cancels in profile drops.
     let d = dispersion.max(1.0e-300 * nobs.max(1.0));
-    // Concentrated Gaussian negative-log-evidence of the tangent model, with σ²
-    // profiled out:
-    //   −ℓ(κ) = (na/2)·ln(2π·D/(na)) + na/2 − Σᵢ ln √det g(yᵢ)
-    //         = (na/2)·ln(D)         − a·Σᵢ ln λ_κ(yᵢ)   + const_κ-free.
-    // Dropping the κ-independent additive constants (they cancel in every LR /
-    // profile drop the CI machinery forms), V_p = ½na·ln(D/na) − a·Σᵢ ln λ_κ(yᵢ).
-    // The volume term −a·Σ ln λ grows like +na·ln κ as κ → +∞ (λ ~ 2/(κ‖y‖²)),
-    // dominating the −(na/2)·ln κ of the dispersion term, so V_p → +∞ at large κ
-    // and the optimum is interior at the true curvature for both signs of κ.
-    let v_p = 0.5 * nobs * (d / nobs.max(1.0)).ln() - (dim as f64) * log_vol;
+    // Concentrated Gaussian negative-log-evidence of the intrinsic tangent model.
+    // The residuals are the tangent vectors εᵢ = log_{μ,κ}(yᵢ) ∈ T_μM, modelled
+    // iid N(0, σ²·g_μ⁻¹) in the metric AT THE MEAN μ (the intrinsic Fréchet base),
+    // with squared-norm Σᵢ εᵢᵀ g_μ εᵢ = D(κ). The Gaussian normaliser carries the
+    // metric DETERMINANT at μ:
+    //   −ℓ(κ) = (na/2)·ln(2πσ²) − (n_rows/2)·ln det g_μ + D/(2σ²),
+    // and σ̂² = D/(na) profiles it to (dropping κ-independent constants)
+    //   V_p(κ) = ½na·ln(D/na) − ½·n_rows·ln det g_μ
+    //          = ½na·ln(D/na) − n_rows·a·ln λ_μ ,   λ_μ = 2/(1+κ‖μ‖²).
+    //
+    // WHY the determinant is at μ (one bounded point) and NOT a per-yᵢ chart
+    // Jacobian Σᵢ ln λ(yᵢ): a per-point √det g(yᵢ) diverges to −∞ at the κ<0 chart
+    // boundary (λ(y)→∞ there) faster than the dispersion's +∞, which would peg κ̂
+    // at the lower bracket bound. The intrinsic fixed-tangent-space model places
+    // the normaliser at μ, which stays interior, so V_p → +∞ at BOTH bracket ends
+    // (lower: D→∞ as boundary points recede; upper: as κ→+∞ the radius 1/√κ→0,
+    // D~1/κ so ½na·ln D ~ −(na/2)ln κ, while −n_rows·a·ln λ_μ ~ +n_rows·a·ln κ
+    // dominates 2:1 → +(na/2)ln κ). The minimum is therefore interior, at the
+    // data-generating κ. Without the determinant term V_p is dispersion-only,
+    // monotone-decreasing toward κ→+∞ (D→0, ln D→−∞), and the minimiser runs to
+    // the upper bound — the #1104 failure mode.
+    let lam_mu = chart
+        .conformal_factor(base.view())
+        .map_err(|e| format!("response curvature criterion volume: {e}"))?;
+    let v_p = 0.5 * nobs * (d / nobs.max(1.0)).ln() - (n_rows as f64) * (dim as f64) * lam_mu.ln();
     Ok((v_p, base))
 }
 
