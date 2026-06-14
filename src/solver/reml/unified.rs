@@ -101,19 +101,19 @@
 //! is independent of the trace estimator used inside the per-row work.
 
 // Split from the original oversized module; keep included in order.
-include!("unified/part_000.rs");
+include!("unified/imports.rs");
 
 mod dense_linalg;
 
-include!("unified/part_001.rs");
+include!("unified/dense_linalg_imports.rs");
 
 mod pseudo_logdet;
 
-include!("unified/part_002.rs");
+include!("unified/pseudo_logdet_imports.rs");
 
 mod dense_projection;
 
-include!("unified/part_003.rs");
-include!("unified/part_004.rs");
-include!("unified/part_005.rs");
-include!("unified/part_006.rs");
+include!("unified/hessian_operator.rs");
+include!("unified/outer_objective.rs");
+include!("unified/operators.rs");
+include!("unified/tests.rs");
