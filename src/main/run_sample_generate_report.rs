@@ -328,7 +328,11 @@ pub(crate) fn run_generate_unified(
                 generativespec_from_predict(
                     pred,
                     likelihood,
-                    family_noise_parameter(&fit_saved, family),
+                    gam::generative::family_noise_parameter(
+                        fit_saved.likelihood_scale,
+                        fit_saved.standard_deviation,
+                        &family,
+                    ),
                 )
                 .map_err(|e| format!("failed to build generative spec: {e}"))
             }
@@ -340,8 +344,16 @@ pub(crate) fn run_generate_unified(
             .predict_plugin_response(&pred_input)
             .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
         let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-        generativespec_from_predict(pred, likelihood, family_noise_parameter(&fit_saved, family))
-            .map_err(|e| format!("failed to build generative spec: {e}"))
+        generativespec_from_predict(
+            pred,
+            likelihood,
+            gam::generative::family_noise_parameter(
+                fit_saved.likelihood_scale,
+                fit_saved.standard_deviation,
+                &family,
+            ),
+        )
+        .map_err(|e| format!("failed to build generative spec: {e}"))
     }
 }
 
