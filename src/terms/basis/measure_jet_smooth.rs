@@ -162,9 +162,20 @@ const MEASURE_JET_MIN_AUTO_SCALES: usize = 3;
 const MEASURE_JET_MAX_AUTO_SCALES: usize = 8;
 
 /// Representer-range multiple of the median nearest-center spacing used by
-/// the `0.0` auto sentinel: ×2 so adjacent representers overlap and thin
-/// sampling gaps stay inside the basis span.
-const MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR: f64 = 2.0;
+/// the `0.0` auto sentinel.
+///
+/// Set to ×1: a Gaussian representer of range `ℓ = h` (the median
+/// nearest-center spacing) already overlaps its neighbors at
+/// `exp(−h²/(2ℓ²)) = exp(−1/2) ≈ 0.61`, so adjacent bumps blend smoothly while
+/// each center keeps a *distinct* response. The old ×2 made every column
+/// `exp(−1/8) ≈ 0.88` at its neighbor — the representers became nearly
+/// collinear, which (a) over-smoothed the fitted surface (the #1116/#1041
+/// accuracy deficit: measure-jet sat ~1.6× the matern/duchon truth-RMSE) and
+/// (b) drove the design Gram toward rank deficiency, so the inner PIRLS /
+/// outer REML conditioning degraded and the smoothing-parameter search cycled
+/// for hundreds of seconds (the #1116 timeout). One spacing-width kernel fixes
+/// both at the root without touching the energy penalty or the dials.
+const MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR: f64 = 1.0;
 
 /// Memory budget (in f64 entries) above which the multi-form assembly stops
 /// parallelizing over scales: parallel scale partials cost
@@ -1177,8 +1188,8 @@ pub fn measure_jet_design_matrix(
 
 /// Resolve the realized representer range ℓ. An explicit positive
 /// `spec_length_scale` is used verbatim; the `0.0` sentinel auto-initializes
-/// from the median nearest-center spacing (doubled so neighboring
-/// representers overlap across thin sampling gaps).
+/// from the median nearest-center spacing (one spacing width: neighbors
+/// overlap at exp(−1/2) ≈ 0.61, smooth blend without collinearity).
 pub fn realized_measure_jet_length_scale(
     centers: ArrayView2<'_, f64>,
     spec_length_scale: f64,
