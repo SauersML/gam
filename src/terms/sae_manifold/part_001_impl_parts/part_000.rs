@@ -4667,6 +4667,58 @@ impl SaeManifoldTerm {
                             saw_refine_progress,
                         );
                         if total_inner_iter >= refine_limit {
+                            // #1118 — pre-stationarity genuinely-indefinite non-gauge
+                            // H_tt under K>1 IBP row-sharing. With K>1 atoms sharing a
+                            // row via the IBP assignment, that row's H_tt acquires the
+                            // softmax-assignment logit × coordinate Gauss-Newton cross
+                            // term H_zt = J_zᵀJ_t off the gauge orbit; when two atoms'
+                            // decoders pull a shared row in opposite directions the
+                            // Schur complement of the logit block goes NEGATIVE
+                            // (genuine negative curvature, distinct from the gauge
+                            // nullity #1037 deflates). The undamped (ridge=0) evidence
+                            // Cholesky then has no valid block to preserve, and the
+                            // damped refinement above (LM-escalated
+                            // `run_joint_fit_arrow_schur`) cannot always cross the
+                            // indefinite basin into the PD region within the
+                            // descent-extended budget. Aborting here returns INFINITY
+                            // for THIS ρ probe; under K>1 the indefiniteness is
+                            // structural across the whole bad-ρ neighbourhood, so EVERY
+                            // probe returns INFINITY and the outer BFGS has nothing to
+                            // rank — the whole multi-atom fit dies before reaching the
+                            // well-behaved ρ region.
+                            //
+                            // Instead of aborting, emit the SAME lightly-damped Direct
+                            // factor the stationary non-PD branch above already uses
+                            // (caller's nominal `ridge_ext_coord`/`ridge_beta`; the
+                            // per-row adaptive Cholesky escalation handles the residual
+                            // indefiniteness). Its log-det carries a consistent positive
+                            // bias ½·Σ_i log|I + ridge·H_tt^(i)⁻¹| that is identical
+                            // across all ρ at the same ridge, so it gives the outer BFGS
+                            // a finite, monotone-comparable value to descend on — enough
+                            // to steer ρ toward the region where the per-row H_tt is
+                            // genuinely PD. There the undamped exact Cholesky resumes
+                            // (the `Ok(factored)` arm) and the CONVERGED evidence value
+                            // and gradient are bit-identical to today's: the floor is
+                            // emitted only pre-stationarity on a genuinely-indefinite
+                            // block, never at/near the optimum. Gated on a FINITE inner
+                            // objective so a genuinely divergent probe (blown-up iterate)
+                            // still surfaces the hard refusal rather than a damped value
+                            // over garbage curvature. K=1 (and any already-PD K>1 row)
+                            // never reaches this branch — the undamped factor succeeds
+                            // for them — so their path is unchanged.
+                            if loss.total().is_finite() {
+                                let damped_opts = ArrowSolveOptions::direct();
+                                if let Ok((_dt, _db, damped_cache)) =
+                                    solve_arrow_newton_step_with_options(
+                                        &sys,
+                                        ridge_ext_coord,
+                                        ridge_beta,
+                                        &damped_opts,
+                                    )
+                                {
+                                    return Ok(damped_cache);
+                                }
+                            }
                             return Err(format!(
                                 "SaeManifoldTerm::reml_criterion: undamped evidence \
                                  factorization hit a non-PD per-row H_tt block before KKT \

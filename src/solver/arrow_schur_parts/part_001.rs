@@ -3039,6 +3039,135 @@ mod tests {
         );
     }
 
+    /// #1118: a per-row `H_tt` that is gauge-flat AND genuinely indefinite
+    /// off the gauge orbit (the pre-stationarity state K>1 IBP row-sharing
+    /// produces) must be REFUSED by the undamped evidence factor — the gauge
+    /// deflation cannot rescue a negative non-gauge eigenvalue — yet the
+    /// lightly-damped Direct per-row factor (the SAE driver's pre-stationarity
+    /// fallback) must condition it to a finite PD factor so the inner solve can
+    /// make progress; and the STATIONARY version of the same block (the
+    /// indefinite direction now positive, i.e. genuinely PD) must factor through
+    /// the undamped evidence path to the EXACT Cholesky `L Lᵀ = H_tt` with NO
+    /// ridge bias. This pins the three-way contract the
+    /// `converge_inner_for_undamped_logdet` budget-exhaust fallback relies on:
+    /// finite-and-progressing pre-stationarity, exact-and-unbiased at the
+    /// optimum.
+    #[test]
+    fn evidence_row_refuses_indefinite_non_gauge_block_but_damped_conditions_it() {
+        let d = 3usize;
+        let k = 2usize;
+
+        // Pre-stationarity block: e_1 is a near-null GAUGE direction (curvature
+        // 1e-10, far below GAUGE_RAYLEIGH_EPS·max_diag = 1e-8·4 = 4e-8, so it
+        // qualifies for Faddeev-Popov deflation), e_2 is GENUINELY indefinite
+        // (eigenvalue −1.0 — real negative curvature, NOT a gauge orbit). The
+        // gauge deflation lifts only e_1 (→ +1), leaving the −1.0 along e_2, so
+        // the deflated block is still non-PD.
+        let mut indef = ArrowRowBlock::new(d, k);
+        indef.htt = array![
+            [4.0_f64, 0.0, 0.0],
+            [0.0, 1.0e-10, 0.0],
+            [0.0, 0.0, -1.0],
+        ];
+        indef.htbeta = array![[1.0_f64, 0.0], [0.0, 1.0], [0.5, 0.5]];
+        indef.gt = array![0.0_f64, 0.0, 0.0];
+        let gauge_e1 = array![0.0_f64, 1.0, 0.0];
+
+        // Gauge deflation cannot manufacture a PD block: the −1.0 along e_2 is
+        // genuine indefiniteness, not a near-null orbit, so deflating e_1 leaves
+        // it negative and the closed-form deflation returns None.
+        assert!(
+            factor_gauge_deflated_evidence_row(&indef, d, std::slice::from_ref(&gauge_e1)).is_none(),
+            "gauge deflation must NOT rescue a genuinely-indefinite non-gauge direction"
+        );
+
+        // Undamped evidence factor (tolerate_ill_conditioning, ridge_t = 0,
+        // gauge passed in) must REFUSE — there is no genuine Cholesky to
+        // preserve. This is the exact error the driver detects pre-stationarity.
+        let refused =
+            factor_one_row_result(&indef, 0.0, d, 0, true, std::slice::from_ref(&gauge_e1));
+        match &refused {
+            Err(ArrowSchurError::PerRowFactorFailed { reason, .. }) => {
+                assert!(
+                    reason.contains("H_tt is non-PD at base ridge")
+                        && reason.contains("evidence mode preserves the genuine Cholesky"),
+                    "evidence refusal must carry the #1037 non-PD-preserve message; got: {reason}"
+                );
+            }
+            other => panic!(
+                "undamped evidence factor must refuse the indefinite block, got {other:?}"
+            ),
+        }
+
+        // The driver's pre-stationarity fallback: a lightly-damped Direct
+        // per-row factor (tolerate = false, caller's nominal ridge) conditions
+        // the SAME block to a finite, well-conditioned PD factor, letting the
+        // inner solve keep making progress instead of dying on the refusal.
+        let damped = factor_one_row(&indef, 1.0e-2, d, 0, false)
+            .expect("lightly-damped Direct factor must condition the indefinite block");
+        for a in 0..d {
+            assert!(
+                damped[[a, a]].is_finite() && damped[[a, a]] > 0.0,
+                "damped factor must have a finite positive pivot at {a}; got {}",
+                damped[[a, a]]
+            );
+        }
+
+        // Stationary block: the previously-indefinite e_2 direction is now
+        // positive (genuine PD), the gauge direction e_1 stays near-null. The
+        // undamped evidence factor must SUCCEED and return the EXACT Cholesky of
+        // the block (with the unit-stiffness deflation on the gauge direction
+        // contributing exactly +1 there, log(1) = 0 to the evidence) — NO ridge
+        // bias. This is the converged state whose value/gradient must be
+        // bit-identical to today's.
+        let mut pd = ArrowRowBlock::new(d, k);
+        pd.htt = array![
+            [4.0_f64, 0.0, 0.0],
+            [0.0, 1.0e-10, 0.0],
+            [0.0, 0.0, 2.0],
+        ];
+        pd.htbeta = indef.htbeta.clone();
+        pd.gt = array![0.0_f64, 0.0, 0.0];
+
+        let result = factor_one_row_result(&pd, 0.0, d, 0, true, std::slice::from_ref(&gauge_e1))
+            .expect("undamped evidence factor must succeed on the genuinely-PD stationary block");
+        // Exactly one gauge direction deflated; the non-gauge spectrum is
+        // factored as-is (no ridge), so L Lᵀ reproduces H_tt on the two genuine
+        // directions and the deflated gauge direction carries the +1 stiffness.
+        assert_eq!(
+            result.gauge_deflated_directions, 1,
+            "exactly the single near-null gauge direction must be deflated"
+        );
+        let l = &result.factor;
+        let mut reconstructed = Array2::<f64>::zeros((d, d));
+        for i in 0..d {
+            for j in 0..d {
+                let mut acc = 0.0_f64;
+                for kk in 0..d {
+                    acc += l[[i, kk]] * l[[j, kk]];
+                }
+                reconstructed[[i, j]] = acc;
+            }
+        }
+        // Genuine directions: exact, no ridge bias.
+        assert!(
+            (reconstructed[[0, 0]] - 4.0).abs() < 1.0e-12,
+            "stationary factor must be the EXACT Cholesky on the genuine direction e_0; got {}",
+            reconstructed[[0, 0]]
+        );
+        assert!(
+            (reconstructed[[2, 2]] - 2.0).abs() < 1.0e-12,
+            "stationary factor must be the EXACT Cholesky on the genuine direction e_2; got {}",
+            reconstructed[[2, 2]]
+        );
+        // Gauge direction: raw curvature 1e-10 + unit Faddeev-Popov stiffness 1.0.
+        assert!(
+            (reconstructed[[1, 1]] - (1.0 + 1.0e-10)).abs() < 1.0e-9,
+            "deflated gauge direction must carry exactly the +1 unit stiffness; got {}",
+            reconstructed[[1, 1]]
+        );
+    }
+
     #[test]
     fn sys_htbeta_materialize_row_sums_operator_and_dense_slab() {
         let mut sys = ArrowSchurSystem::new(1, 1, 3);
