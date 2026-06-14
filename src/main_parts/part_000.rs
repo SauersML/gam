@@ -1819,7 +1819,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     "residual-cascade fit | levels={} | centers={} | sigma2={:.6e} | \
                      log_lambda={:.4} | reml={:.6e} | rel_resid={:.2e}",
                     cascade_fit.num_levels(),
-                    cascade_fit.design.num_centers(),
+                    cascade_fit.num_centers(),
                     cascade_fit.sigma2,
                     cascade_fit.log_lambda,
                     cascade_fit.restricted_loglik,

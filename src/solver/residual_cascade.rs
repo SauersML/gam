@@ -1591,6 +1591,11 @@ impl ResidualCascadeFit {
         self.core.m
     }
 
+    /// Total centers across all fitted resolution levels.
+    pub fn num_centers(&self) -> usize {
+        self.core.m - self.core.nullity()
+    }
+
     /// Snapshot the fit for persistence (#1032). Assembles the factored
     /// precision `L` of `A = X'WX + λD` at the fit's λ (O(m³) once) and copies
     /// the nested geometry + coefficients, dropping all training rows. The
