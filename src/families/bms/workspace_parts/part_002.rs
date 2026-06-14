@@ -29,6 +29,34 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         crate::custom_family::PseudoLogdetMode::HardPseudo
     }
 
+    /// #979/#1040 (binary twin of the survival-MS hang): engage the inner
+    /// self-vanishing Levenberg–Marquardt μ on a FULL-RANK-but-ILL-CONDITIONED
+    /// penalized Hessian, not only on a rank-deficient one.
+    ///
+    /// When a flex deviation block is active (`score_warp` / `link_dev`) the
+    /// joint inner solve takes the CONSTRAINED active-set QP path
+    /// (`block_linear_constraints` emits the structural monotonicity rows). The
+    /// marginal and log-slope surfaces share one matern PC basis, so even with
+    /// the β-independent null-space drop that lifts `σ_min(H+S)` off `ridge_floor`
+    /// (see `pseudo_logdet_mode` above), `H_pen` stays full-rank yet severely
+    /// ill-conditioned (cond ≫ 1e4) for the probit-over-2–3-PCs fits. With the
+    /// constrained Levenberg floor gated on `nullity > 0` ALONE, the near-null
+    /// mode is undamped: the active-set minimiser is unique only to round-off
+    /// along it, the proposal slides an O(1) step every cycle, `step_inf` never
+    /// exhausts, the KKT / constrained-fixed-point certificate never fires, and
+    /// the inner joint-Newton grinds its full cycle budget on EVERY outer ρ-eval
+    /// — the ~35s-per-seed pre-warm slowdown (#979). The self-vanishing μ
+    /// (∝ projected KKT residual → 0 at the fixed point) gives the near-null
+    /// mode a tiny positive curvature so the minimiser is unique and `step_inf`
+    /// exhausts, WITHOUT moving the converged β (the link-deviation / log-slope
+    /// target is preserved exactly). Applied only when genuinely ill-conditioned
+    /// (`cond > LEVENBERG_ILL_CONDITIONING_THRESHOLD`); the rigid
+    /// (no-flex / unconstrained) fit keeps the EXACT undamped Newton/KKT solve
+    /// and its quadratic convergence.
+    fn levenberg_on_ill_conditioning(&self) -> bool {
+        true
+    }
+
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Operator-aware: rigid Bernoulli marginal-slope wires the K=2
         // RowKernel through a matrix-free workspace that applies joint Hv at
