@@ -5141,6 +5141,58 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
         let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
+        // Genuinely value-only fulfilment (#979). A `Value` request — issued only
+        // by the continuation pre-warm and outer cost probes — never consumes the
+        // outer gradient. Routing it through the value+gradient assembly below
+        // paid a full coupled-joint LAML gradient (the k²·n·p² marginal/log-slope
+        // outer-derivative) at EVERY continuation step purely to carry the warm β
+        // forward — the dominant cost of the ~35s/seed marginal-slope pre-warm and
+        // the bernoulli-MS centers=20 non-finish (#979). The inner solve in
+        // `EvalMode::ValueOnly` already produces the converged block β (the only
+        // product the pre-warm needs); surface it as `inner_beta_hint` (and into
+        // `outer.warm_cache`) with a zero-length gradient and skip the outer
+        // gradient assembly. ValueAndGradient / ValueGradientHessian are unchanged.
+        if matches!(order, OuterEvalOrder::Value) {
+            return match outerobjectivegradienthessian_labeled(
+                family,
+                specs,
+                &outer_options,
+                &label_layout,
+                rho,
+                warm_ref,
+                &rho_prior,
+                EvalMode::ValueOnly,
+            ) {
+                Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
+                    let inner_beta_hint = Some(Array1::from_iter(
+                        eval.warm_start
+                            .block_beta
+                            .iter()
+                            .flat_map(|beta| beta.iter().copied()),
+                    ));
+                    outer.warm_cache = Some(eval.warm_start);
+                    outer.last_error = None;
+                    Ok(OuterEval {
+                        cost: eval.objective,
+                        gradient: Array1::zeros(rho.len()),
+                        hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+                        inner_beta_hint,
+                    })
+                }
+                Ok(eval) => {
+                    outer.warm_cache = Some(eval.warm_start);
+                    outer.last_error = Some(
+                        "custom-family value-only inner solve did not converge or objective was non-finite"
+                            .to_string(),
+                    );
+                    Ok(OuterEval::infeasible(rho.len()))
+                }
+                Err(e) => {
+                    outer.last_error = Some(e.clone());
+                    Err(EstimationError::RemlOptimizationFailed(e))
+                }
+            };
+        }
         let request_hessian =
             matches!(order, OuterEvalOrder::ValueGradientHessian) && need_outer_hessian;
         let eval_result = match outerobjectivegradienthessian_labeled(
