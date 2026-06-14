@@ -188,6 +188,18 @@ fn multinomial_formula_use_outer_hessian(total_rho_dim: usize) -> bool {
 /// the penalty-null directions feeding it.
 const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
 
+/// Calibrated convergence tolerance for the OUTER REML/LAML smoothing-parameter
+/// search on the formula multinomial path. Matches the primary GLM REML outer
+/// (`solver::workflow::materialize` uses `tol = 1e-7`, mirrored by the
+/// `LOG_LAMBDA_TOL` / `KKT_TOL_*` constants across the REML stack): tight enough
+/// that the selected λ reaches the genuine REML optimum (the recovered
+/// probability surface matches the mature reference), loose enough that the
+/// optimizer does not grind surface-irrelevant ρ digits down to the inner KKT
+/// scale (the #1082 wall-clock overrun). The caller's `tol` is floored at this
+/// value for the OUTER loop, while it continues to drive the INNER joint-Newton
+/// KKT target unchanged.
+const MULTINOMIAL_OUTER_REML_TOL: f64 = 1e-7;
+
 fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
     let mut best = (0.0_f64, 0usize, 0usize);
     for ((row, active_class), &value) in eta.indexed_iter() {
@@ -1179,21 +1191,28 @@ pub fn fit_penalized_multinomial_formula(
     // tight) INNER KKT tolerance. The #715 control-split repurposed the caller's
     // `tol` as the outer control, but feeding an inner-scale `tol = 1e-8`
     // straight into `outer_tol` makes REML grind dozens of extra exact-gradient
-    // outer iterations (each an O(D·p³) Laplace-derivative assembly over the
-    // full P·M joint design) to squeeze ρ digits that no longer move the fitted
-    // surface — the smooth-by-factor 269s wall-clock overrun (#1082). The
-    // framework's calibrated default (`BlockwiseFitOptions::default().outer_tol`,
-    // 1e-5) is the right scale for ρ selection: at that tolerance the selected λ
-    // (and thus η and the recovered probability surface) is already pinned to
-    // far below the test's accuracy bars. So the outer tolerance is floored at
-    // the framework default — never tighter than it — while the caller's `tol`
-    // continues to drive the INNER joint-Newton KKT target (`inner_tol` below),
-    // where its precision actually matters.
-    let default_outer_tol = BlockwiseFitOptions::default().outer_tol;
+    // outer iterations (each an O(D·p³) Laplace-derivative assembly over the full
+    // P·M joint design) to squeeze ρ digits that no longer move the fitted
+    // surface — the smooth-by-factor 269s wall-clock overrun (#1082).
+    //
+    // The right target is the framework's CALIBRATED REML convergence tolerance,
+    // `MULTINOMIAL_OUTER_REML_TOL = 1e-7` — the same value the primary GLM REML
+    // outer uses (`solver::workflow::materialize` `tol: 1e-7`, mirrored by the
+    // `LOG_LAMBDA_TOL`/`KKT_TOL_*` constants across the REML stack). At 1e-7 the
+    // λ-search reaches the genuine REML optimum (so the recovered probability
+    // surface matches the mature reference), but it does NOT chase the last
+    // surface-irrelevant ρ digits down to 1e-8. The earlier 1e-5 floor (the
+    // generic `BlockwiseFitOptions` default) was too LOOSE: the optimizer halted
+    // in a low-curvature region with λ still well above its optimum, UNDER-fitting
+    // the smooth-by-factor surface (truth-RMSE 0.164 vs VGAM's 0.061). So the
+    // outer tolerance is floored at the calibrated REML tol — never tighter than
+    // it (perf), never looser (accuracy) — while the caller's `tol` continues to
+    // drive the INNER joint-Newton KKT target (`inner_tol` below), where its
+    // precision actually matters.
     let outer_tol = if tol.is_finite() && tol > 0.0 {
-        tol.max(default_outer_tol)
+        tol.max(MULTINOMIAL_OUTER_REML_TOL)
     } else {
-        default_outer_tol
+        MULTINOMIAL_OUTER_REML_TOL
     };
     let inner_tol = MULTINOMIAL_FORMULA_INNER_TOL.max(tol.max(0.0));
 
