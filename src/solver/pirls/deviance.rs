@@ -4,26 +4,26 @@
 
 use super::*;
 
-const BINOMIAL_MU_EPS: f64 = 1e-12;
+pub(crate) const BINOMIAL_MU_EPS: f64 = 1e-12;
 
 
 /// Clamp `mu` away from 0 and 1 so `mu.ln()` and `(1 - mu).ln()` are finite.
 /// Centralized to keep deviance and log-likelihood symmetric — both must use
 /// the same floor or the log-lik / deviance identity drifts near saturation.
 #[inline]
-fn safe_mu_for_binomial(mu: f64) -> f64 {
+pub(crate) fn safe_mu_for_binomial(mu: f64) -> f64 {
     mu.clamp(BINOMIAL_MU_EPS, 1.0 - BINOMIAL_MU_EPS)
 }
 
 
 #[inline]
-fn xlogy(x: f64, y: f64) -> f64 {
+pub(crate) fn xlogy(x: f64, y: f64) -> f64 {
     if x == 0.0 { 0.0 } else { x * y.ln() }
 }
 
 
 #[inline]
-fn log_gamma_stirling_correction(x: f64) -> f64 {
+pub(crate) fn log_gamma_stirling_correction(x: f64) -> f64 {
     let inv = 1.0 / x;
     let inv2 = inv * inv;
     inv / 12.0 - inv * inv2 / 360.0 + inv * inv2 * inv2 / 1260.0
@@ -31,7 +31,7 @@ fn log_gamma_stirling_correction(x: f64) -> f64 {
 
 
 #[inline]
-fn log_gamma_large_ratio(base: f64, delta: f64) -> f64 {
+pub(crate) fn log_gamma_large_ratio(base: f64, delta: f64) -> f64 {
     let ratio = delta / base;
     delta * base.ln() + (base + delta - 0.5) * ratio.ln_1p() - delta
         + log_gamma_stirling_correction(base + delta)
@@ -40,7 +40,7 @@ fn log_gamma_large_ratio(base: f64, delta: f64) -> f64 {
 
 
 #[inline]
-fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
+pub(crate) fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
     let direct = ln_gamma(sum) - ln_gamma(a) - ln_gamma(b);
     if direct.is_finite() {
         return direct;
@@ -59,20 +59,20 @@ fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
 
 
 #[inline]
-fn poisson_unit_deviance(yi: f64, mui_c: f64) -> f64 {
+pub(crate) fn poisson_unit_deviance(yi: f64, mui_c: f64) -> f64 {
     xlogy(yi, yi / mui_c) - (yi - mui_c)
 }
 
 
 #[inline]
-fn gamma_unit_deviance(yi_c: f64, mui_c: f64) -> f64 {
+pub(crate) fn gamma_unit_deviance(yi_c: f64, mui_c: f64) -> f64 {
     let ratio = yi_c / mui_c;
     ratio - 1.0 - ratio.ln()
 }
 
 
 #[inline]
-fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
+pub(crate) fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
     if !is_valid_tweedie_power(p) {
         f64::NAN
     } else if !valid_tweedie_response(yi) {
@@ -87,7 +87,7 @@ fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
 
 
 #[inline]
-fn negative_binomial_unit_deviance(yi: f64, mui_c: f64, theta: f64) -> f64 {
+pub(crate) fn negative_binomial_unit_deviance(yi: f64, mui_c: f64, theta: f64) -> f64 {
     if !valid_negbin_theta(theta) || !valid_count_response(yi) {
         return f64::NAN;
     }
@@ -98,7 +98,7 @@ fn negative_binomial_unit_deviance(yi: f64, mui_c: f64, theta: f64) -> f64 {
 
 
 #[inline]
-fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
+pub(crate) fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
     if !valid_beta_phi(phi) || !valid_beta_response(yi) {
         return f64::NAN;
     }
@@ -112,7 +112,7 @@ fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
 
 
 #[inline]
-fn beta_unit_deviance(yi: f64, mui: f64, phi: f64) -> f64 {
+pub(crate) fn beta_unit_deviance(yi: f64, mui: f64, phi: f64) -> f64 {
     if !valid_beta_response(yi) {
         return f64::NAN;
     }
@@ -127,11 +127,11 @@ pub fn calculate_deviance(
     likelihood: &GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
 ) -> f64 {
-    const EPS: f64 = 1e-8;
+    pub(crate) const EPS: f64 = 1e-8;
     // Match the μ floor used by the shared PIRLS log-link working-state engine
     // (`MIN_MU = 1e-10` in `log_link_working_state`) so deviance / weights
     // stay self-consistent when the linear predictor saturates.
-    const MU_FLOOR: f64 = 1e-10;
+    pub(crate) const MU_FLOOR: f64 = 1e-10;
     match &likelihood.spec.response {
         ResponseFamily::Binomial => {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -280,8 +280,8 @@ pub fn pointwise_loglikelihood_omitting_constants(
 ) -> Array1<f64> {
     // Same μ floor as PIRLS log-link working-state writers; see note in
     // `calculate_deviance` above.
-    const MU_FLOOR: f64 = 1e-10;
-    const EPS: f64 = 1e-8;
+    pub(crate) const MU_FLOOR: f64 = 1e-10;
+    pub(crate) const EPS: f64 = 1e-8;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
     let values: Vec<f64> = match &likelihood.spec.response {
@@ -399,7 +399,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
 ) -> f64 {
     // Same μ floor as PIRLS log-link working-state writers; see note in
     // `calculate_deviance` above.
-    const MU_FLOOR: f64 = 1e-10;
+    pub(crate) const MU_FLOOR: f64 = 1e-10;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
     match &likelihood.spec.response {

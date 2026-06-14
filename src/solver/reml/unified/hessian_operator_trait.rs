@@ -35,7 +35,7 @@ pub struct StochasticTraceState {
 /// preferred over materializing an implicit operator densely. Below this, the
 /// `2·m_s + m_h` Hutch++ matvecs do not beat `dim` dense H⁻¹ HVPs, so the dense
 /// fallback is cheaper.
-const HUTCHPP_TRACE_MIN_DIM: usize = 128;
+pub(crate) const HUTCHPP_TRACE_MIN_DIM: usize = 128;
 
 
 /// Build the Hutch++ stochastic-trace configuration for an operator of the given
@@ -43,13 +43,13 @@ const HUTCHPP_TRACE_MIN_DIM: usize = 128;
 /// dimension, bounded to `[4, 16]`), and the probe budget tracks the sketch so
 /// the estimator's variance and cost stay balanced across problem sizes. Shared
 /// by every implicit-operator trace path so they cannot drift apart.
-fn hutchpp_config_for_dim(dim: usize) -> StochasticTraceConfig {
-    const SKETCH_DIM_PER: usize = 32;
-    const SKETCH_DIM_MIN: usize = 4;
-    const SKETCH_DIM_MAX: usize = 16;
-    const PROBES_PER_SKETCH: usize = 4;
-    const PROBES_MAX_FLOOR: usize = 32;
-    const PROBES_MIN_FLOOR: usize = 8;
+pub(crate) fn hutchpp_config_for_dim(dim: usize) -> StochasticTraceConfig {
+    pub(crate) const SKETCH_DIM_PER: usize = 32;
+    pub(crate) const SKETCH_DIM_MIN: usize = 4;
+    pub(crate) const SKETCH_DIM_MAX: usize = 16;
+    pub(crate) const PROBES_PER_SKETCH: usize = 4;
+    pub(crate) const PROBES_MAX_FLOOR: usize = 32;
+    pub(crate) const PROBES_MIN_FLOOR: usize = 8;
     let sketch = (dim / SKETCH_DIM_PER).clamp(SKETCH_DIM_MIN, SKETCH_DIM_MAX);
     let mut config = StochasticTraceConfig::default();
     config.hutchpp_sketch_dim = Some(sketch);

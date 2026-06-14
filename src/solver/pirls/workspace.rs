@@ -22,7 +22,7 @@ pub struct PirlsWorkspace {
     // Preallocated buffer for GEMV results (length p)
     pub vec_buf_p: Array1<f64>,
     // Cached sparse penalized-system workspace for sparse-native solve eligibility/assembly.
-    sparse_penalized_system_cache: Option<SparsePenalizedSystemCache>,
+    pub(crate) sparse_penalized_system_cache: Option<SparsePenalizedSystemCache>,
     // Factorization scratch (avoid per-iteration allocation)
     pub factorization_scratch: MemBuffer,
     // Permutation buffers for LDLT
@@ -96,7 +96,7 @@ impl PirlsWorkspace {
     }
 
     /// Ensure the sparse penalty cache is populated and consistent with `x` and `s_lambda`.
-    fn ensure_sparse_penalty_cache(
+    pub(crate) fn ensure_sparse_penalty_cache(
         &mut self,
         x: &SparseColMat<usize, f64>,
         s_lambda: &Array2<f64>,
@@ -281,7 +281,7 @@ impl std::fmt::Debug for ArrowSchurInnerConfig {
 }
 
 
-fn restore_arrow_latent_if_needed(
+pub(crate) fn restore_arrow_latent_if_needed(
     options: &WorkingModelPirlsOptions,
     snapshot: Option<Array1<f64>>,
 ) {

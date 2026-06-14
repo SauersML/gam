@@ -31,7 +31,7 @@ pub(crate) fn positive_eigenvalue_threshold(eigenvalues: &[f64]) -> f64 {
         .fold(0.0_f64, |a, b| a.max(b.abs()));
     // Safety factor above the theoretical noise floor p × ε_mach × ‖S‖, so a
     // genuine small positive mode is never misclassified as numerical zero.
-    const SAFETY_FACTOR: f64 = 100.0;
+    pub(crate) const SAFETY_FACTOR: f64 = 100.0;
     SAFETY_FACTOR * (p as f64) * f64::EPSILON * max_ev
 }
 

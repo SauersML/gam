@@ -13,7 +13,7 @@ use crate::solver::estimate::smooth_floor_dp;
 
 pub(crate) struct StoredFirstDrift {
     pub(crate) dense: Option<Array2<f64>>,
-    dense_rotated: Option<Array2<f64>>,
+    pub(crate) dense_rotated: Option<Array2<f64>>,
     pub(crate) operators: Vec<Arc<dyn HyperOperator>>,
 }
 
@@ -69,23 +69,23 @@ pub(crate) struct BorrowedStoredDriftOperator<'a> {
 }
 
 impl HyperOperator for BorrowedStoredDriftOperator<'_> {
-    pub(crate) fn dim(&self) -> usize {
+    fn dim(&self) -> usize {
         self.dim_hint
     }
 
-    pub(crate) fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(v.len());
         self.mul_vec_into(v.view(), out.view_mut());
         out
     }
 
-    pub(crate) fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+    fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(v.len());
         self.mul_vec_into(v, out.view_mut());
         out
     }
 
-    pub(crate) fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
         out.fill(0.0);
         if let Some(matrix) = self.drift.dense.as_ref() {
             dense_matvec_into(matrix, v, out.view_mut());
@@ -95,7 +95,7 @@ impl HyperOperator for BorrowedStoredDriftOperator<'_> {
         }
     }
 
-    pub(crate) fn scaled_add_mul_vec(
+    fn scaled_add_mul_vec(
         &self,
         v: ArrayView1<'_, f64>,
         scale: f64,
@@ -113,15 +113,15 @@ impl HyperOperator for BorrowedStoredDriftOperator<'_> {
         }
     }
 
-    pub(crate) fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         self.drift.apply_dot(v.view(), u.view())
     }
 
-    pub(crate) fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
+    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
         self.drift.apply_dot(v, u)
     }
 
-    pub(crate) fn to_dense(&self) -> Array2<f64> {
+    fn to_dense(&self) -> Array2<f64> {
         let mut out = self
             .drift
             .dense
@@ -133,7 +133,7 @@ impl HyperOperator for BorrowedStoredDriftOperator<'_> {
         out
     }
 
-    pub(crate) fn is_implicit(&self) -> bool {
+    fn is_implicit(&self) -> bool {
         !self.drift.operators.is_empty()
     }
 }
@@ -149,27 +149,27 @@ pub struct WeightedHyperOperator {
 }
 
 impl HyperOperator for WeightedHyperOperator {
-    pub(crate) fn as_weighted(&self) -> Option<&WeightedHyperOperator> {
+    fn as_weighted(&self) -> Option<&WeightedHyperOperator> {
         Some(self)
     }
 
-    pub(crate) fn dim(&self) -> usize {
+    fn dim(&self) -> usize {
         self.dim_hint
     }
 
-    pub(crate) fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(v.len());
         self.mul_vec_into(v.view(), out.view_mut());
         out
     }
 
-    pub(crate) fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+    fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(v.len());
         self.mul_vec_into(v, out.view_mut());
         out
     }
 
-    pub(crate) fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
         let mut nonzero_terms = self.terms.iter().filter(|(weight, _)| *weight != 0.0);
         if let Some((weight, op)) = nonzero_terms.next()
             && nonzero_terms.next().is_none()
@@ -189,7 +189,7 @@ impl HyperOperator for WeightedHyperOperator {
         }
     }
 
-    pub(crate) fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
+    fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
         let mut nonzero_terms = self.terms.iter().filter(|(weight, _)| *weight != 0.0);
         if let Some((weight, op)) = nonzero_terms.next()
             && nonzero_terms.next().is_none()
@@ -212,7 +212,7 @@ impl HyperOperator for WeightedHyperOperator {
         }
     }
 
-    pub(crate) fn scaled_add_mul_vec(
+    fn scaled_add_mul_vec(
         &self,
         v: ArrayView1<'_, f64>,
         scale: f64,
@@ -229,7 +229,7 @@ impl HyperOperator for WeightedHyperOperator {
         }
     }
 
-    pub(crate) fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         self.terms
             .iter()
             .filter(|(weight, _)| *weight != 0.0)
@@ -237,7 +237,7 @@ impl HyperOperator for WeightedHyperOperator {
             .sum()
     }
 
-    pub(crate) fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
+    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
         self.terms
             .iter()
             .filter(|(weight, _)| *weight != 0.0)
@@ -245,7 +245,7 @@ impl HyperOperator for WeightedHyperOperator {
             .sum()
     }
 
-    pub(crate) fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
         self.terms
             .iter()
             .filter(|(weight, _)| *weight != 0.0)
@@ -253,7 +253,7 @@ impl HyperOperator for WeightedHyperOperator {
             .sum()
     }
 
-    pub(crate) fn trace_projected_factor_cached(
+    fn trace_projected_factor_cached(
         &self,
         factor: &Array2<f64>,
         cache: &ProjectedFactorCache,
@@ -265,7 +265,7 @@ impl HyperOperator for WeightedHyperOperator {
             .sum()
     }
 
-    pub(crate) fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
+    fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
         let rank = factor.ncols();
         let mut projected = Array2::<f64>::zeros((rank, rank));
         for (weight, op) in &self.terms {
@@ -276,7 +276,7 @@ impl HyperOperator for WeightedHyperOperator {
         projected
     }
 
-    pub(crate) fn projected_matrix_cached(
+    fn projected_matrix_cached(
         &self,
         factor: &Array2<f64>,
         cache: &ProjectedFactorCache,
@@ -291,7 +291,7 @@ impl HyperOperator for WeightedHyperOperator {
         projected
     }
 
-    pub(crate) fn to_dense(&self) -> Array2<f64> {
+    fn to_dense(&self) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros((self.dim_hint, self.dim_hint));
         for (weight, op) in &self.terms {
             if *weight != 0.0 {
@@ -301,7 +301,7 @@ impl HyperOperator for WeightedHyperOperator {
         out
     }
 
-    pub(crate) fn is_implicit(&self) -> bool {
+    fn is_implicit(&self) -> bool {
         self.terms.iter().any(|(_, op)| op.is_implicit())
     }
 }
@@ -310,20 +310,20 @@ impl HyperOperator for WeightedHyperOperator {
 /// `D²_ψ H_L` drift already traced through the logdet kernel into `base_h2`.
 /// Indexed by ψ output row `i = idx - k_rho`.
 pub(crate) struct PsiContractedContrib {
-    objective: Array1<f64>,
-    score: Array2<f64>,
+    pub(crate) objective: Array1<f64>,
+    pub(crate) score: Array2<f64>,
     pub(crate) ld_s: Array1<f64>,
-    base_h2: Vec<f64>,
+    pub(crate) base_h2: Vec<f64>,
 }
 
 pub(crate) struct OuterHessianCoord {
     pub(crate) a: f64,
     pub(crate) g: Array1<f64>,
-    v: Array1<f64>,
-    total_drift: StoredFirstDrift,
-    base_drift: StoredFirstDrift,
-    ext_index: Option<usize>,
-    b_depends_on_beta: bool,
+    pub(crate) v: Array1<f64>,
+    pub(crate) total_drift: StoredFirstDrift,
+    pub(crate) base_drift: StoredFirstDrift,
+    pub(crate) ext_index: Option<usize>,
+    pub(crate) b_depends_on_beta: bool,
 }
 
 impl OuterHessianCoord {
@@ -334,13 +334,13 @@ impl OuterHessianCoord {
 
 pub(crate) struct UnifiedOuterHessianOperator {
     pub(crate) hop: Arc<dyn HessianOperator>,
-    coords: Vec<OuterHessianCoord>,
-    pair_a: Array2<f64>,
-    pair_ld_s: Array2<f64>,
-    g_dot_v: Array2<f64>,
-    pair_g: Vec<Vec<Option<Array1<f64>>>>,
-    base_h2: Array2<f64>,
-    m_pair_trace: Array2<f64>,
+    pub(crate) coords: Vec<OuterHessianCoord>,
+    pub(crate) pair_a: Array2<f64>,
+    pub(crate) pair_ld_s: Array2<f64>,
+    pub(crate) g_dot_v: Array2<f64>,
+    pub(crate) pair_g: Vec<Vec<Option<Array1<f64>>>>,
+    pub(crate) base_h2: Array2<f64>,
+    pub(crate) m_pair_trace: Array2<f64>,
     /// Precomputed pair-wise logdet-Hessian cross traces.
     /// `cross_trace[i, j] = tr(G_ε(H) Ḣ_i Ḣ_j)` decomposed across the
     /// dense and operator components of each coord's `total_drift`.
@@ -348,24 +348,24 @@ pub(crate) struct UnifiedOuterHessianOperator {
     /// trace as `cross_trace.row(idx).dot(alpha)`, replacing the per-HVP
     /// recomputation that previously rebuilt these traces every time the
     /// K×K outer Hessian was materialized via K matvecs.
-    cross_trace: Option<Array2<f64>>,
-    profiled_phi: f64,
-    profiled_nu: f64,
-    profiled_dp_cgrad: f64,
-    profiled_dp_cgrad2: f64,
-    is_profiled: bool,
-    incl_logdet_h: bool,
-    incl_logdet_s: bool,
+    pub(crate) cross_trace: Option<Array2<f64>>,
+    pub(crate) profiled_phi: f64,
+    pub(crate) profiled_nu: f64,
+    pub(crate) profiled_dp_cgrad: f64,
+    pub(crate) profiled_dp_cgrad2: f64,
+    pub(crate) is_profiled: bool,
+    pub(crate) incl_logdet_h: bool,
+    pub(crate) incl_logdet_s: bool,
     pub(crate) kernel: OuterHessianDerivativeKernel,
     pub(crate) subspace: Option<Arc<PenaltySubspaceTrace>>,
-    adjoint_z_c: Option<Array1<f64>>,
-    leverage: Option<Array1<f64>>,
-    fourth_trace: Option<Array2<f64>>,
-    callback_second_modes: Option<Vec<Array1<f64>>>,
+    pub(crate) adjoint_z_c: Option<Array1<f64>>,
+    pub(crate) leverage: Option<Array1<f64>>,
+    pub(crate) fourth_trace: Option<Array2<f64>>,
+    pub(crate) callback_second_modes: Option<Vec<Array1<f64>>>,
     /// Number of ρ (penalty) coordinates; coords `k_rho..` are the ψ rows. Used
     /// only when `contracted_psi` is present, to map an output index to its ψ
     /// output row.
-    k_rho: usize,
+    pub(crate) k_rho: usize,
     /// Direction-contracted ψψ second-order hook (#740). When `Some`, the build
     /// SKIPPED the `K²` per-pair `ext_coord_pair_fn` ψψ assembly (the `pair_a` /
     /// `pair_ld_s` / `base_h2` ψψ-block entries and the ψψ `pair_g` are left
@@ -373,7 +373,7 @@ pub(crate) struct UnifiedOuterHessianOperator {
     /// the ψ-row ψψ contributions in a single family row pass. The ρρ and ρψ
     /// blocks remain in the precomputed tables (cheap), so this changes only the
     /// representation of the ψψ block, not the math.
-    contracted_psi: Option<ContractedPsiSecondOrderFn>,
+    pub(crate) contracted_psi: Option<ContractedPsiSecondOrderFn>,
 }
 
 impl UnifiedOuterHessianOperator {
@@ -706,11 +706,11 @@ impl UnifiedOuterHessianOperator {
 }
 
 impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessianOperator {
-    pub(crate) fn dim(&self) -> usize {
+    fn dim(&self) -> usize {
         self.coords.len()
     }
 
-    pub(crate) fn matvec(&self, alpha: &Array1<f64>) -> Result<Array1<f64>, String> {
+    fn matvec(&self, alpha: &Array1<f64>) -> Result<Array1<f64>, String> {
         if alpha.len() != self.coords.len() {
             return Err(RemlError::DimensionMismatch {
                 reason: format!(
@@ -759,7 +759,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
     /// `matvec` incurs on every CG step.  The parallel computation is identical;
     /// results are written directly into the caller-supplied `out` buffer via
     /// `par_iter_mut().enumerate()` rather than collected into a fresh `Vec`.
-    pub(crate) fn apply_into(
+    fn apply_into(
         &self,
         alpha: &ndarray::Array1<f64>,
         out: &mut ndarray::Array1<f64>,

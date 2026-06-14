@@ -5,18 +5,18 @@
 use super::*;
 
 #[derive(Debug, Clone)]
-struct BetaEdge {
-    a: usize,
-    b: usize,
+pub(crate) struct BetaEdge {
+    pub(crate) a: usize,
+    pub(crate) b: usize,
 }
 
 
 #[derive(Debug, Clone)]
 pub(crate) struct BetaCouplingGraph {
-    num_blocks: usize,
-    edges: Vec<BetaEdge>,
-    adj_start: Vec<usize>,
-    adj_targets: Vec<usize>,
+    pub(crate) num_blocks: usize,
+    pub(crate) edges: Vec<BetaEdge>,
+    pub(crate) adj_start: Vec<usize>,
+    pub(crate) adj_targets: Vec<usize>,
 }
 
 
@@ -78,7 +78,7 @@ impl BetaCouplingGraph {
         }
     }
 
-    fn neighbours(&self, node: usize) -> &[usize] {
+    pub(crate) fn neighbours(&self, node: usize) -> &[usize] {
         &self.adj_targets[self.adj_start[node]..self.adj_start[node + 1]]
     }
 
@@ -86,7 +86,7 @@ impl BetaCouplingGraph {
         let mut parent: Vec<usize> = (0..self.num_blocks).collect();
         let mut rank = vec![0u8; self.num_blocks];
 
-        fn find(parent: &mut [usize], mut x: usize) -> usize {
+        pub(crate) fn find(parent: &mut [usize], mut x: usize) -> usize {
             while parent[x] != x {
                 parent[x] = parent[parent[x]];
                 x = parent[x];
@@ -1242,9 +1242,9 @@ impl BetaPenaltyOp for CompositePenaltyOp {
 /// `diagonal` holds the precomputed `diag(H_ββ)` supplied alongside the matvec;
 /// `to_dense` falls back to probing all `K` canonical basis vectors.
 pub struct MatvecDiagPenaltyOp {
-    k: usize,
-    matvec: SharedBetaMatvec,
-    diagonal_vec: Array1<f64>,
+    pub(crate) k: usize,
+    pub(crate) matvec: SharedBetaMatvec,
+    pub(crate) diagonal_vec: Array1<f64>,
 }
 
 

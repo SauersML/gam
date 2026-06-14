@@ -31,7 +31,7 @@ use num_dual::{
 };
 use statrs::function::gamma::ln_gamma;
 
-fn intercept_block(n: usize) -> ParameterBlockInput {
+pub(crate) fn intercept_block(n: usize) -> ParameterBlockInput {
     ParameterBlockInput {
         design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
             (n, 1),
@@ -45,7 +45,7 @@ fn intercept_block(n: usize) -> ParameterBlockInput {
     }
 }
 
-fn compose_theta_from_hints_test(
+pub(crate) fn compose_theta_from_hints_test(
     mean_penalty_count: usize,
     noise_penalty_count: usize,
     mean_log_lambda_hint: &Option<Array1<f64>>,
@@ -76,7 +76,7 @@ fn compose_theta_from_hints_test(
 }
 
 #[test]
-fn monotone_wiggle_post_update_validator_rejects_hidden_projection() {
+pub(crate) fn monotone_wiggle_post_update_validator_rejects_hidden_projection() {
     validate_monotone_wiggle_beta_nonnegative(
         &array![0.0, 1.0e-13, 2.0],
         "monotone wiggle validator test",
@@ -95,7 +95,7 @@ fn monotone_wiggle_post_update_validator_rejects_hidden_projection() {
 }
 
 #[test]
-fn logb_dlog_sigma_deta_preserves_negative_tail_precision() {
+pub(crate) fn logb_dlog_sigma_deta_preserves_negative_tail_precision() {
     let eta = -703.4873664863218;
     let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(eta);
 
@@ -111,7 +111,7 @@ fn logb_dlog_sigma_deta_preserves_negative_tail_precision() {
     assert_eq!(logb_dlog_sigma_deta(f64::INFINITY, f64::INFINITY), 1.0);
 }
 
-fn assert_rel_close(label: &str, actual: f64, expected: f64, tol: f64) {
+pub(crate) fn assert_rel_close(label: &str, actual: f64, expected: f64, tol: f64) {
     let scale = expected.abs().max(1.0);
     assert!(
         (actual - expected).abs() <= tol * scale,
@@ -120,7 +120,7 @@ fn assert_rel_close(label: &str, actual: f64, expected: f64, tol: f64) {
     );
 }
 
-fn hand_binomial_q_directional(
+pub(crate) fn hand_binomial_q_directional(
     q: NonWiggleQDerivs,
     d_eta_t: f64,
     d_eta_ls: f64,
@@ -134,7 +134,7 @@ fn hand_binomial_q_directional(
     }
 }
 
-fn hand_binomial_second_q_directional(
+pub(crate) fn hand_binomial_second_q_directional(
     q: NonWiggleQDerivs,
     u_t: f64,
     u_ls: f64,
@@ -150,7 +150,7 @@ fn hand_binomial_second_q_directional(
 }
 
 #[test]
-fn binomial_nonwiggle_tower_matches_hand_witness_channels() {
+pub(crate) fn binomial_nonwiggle_tower_matches_hand_witness_channels() {
     let links = [
         InverseLink::Standard(StandardLink::Probit),
         InverseLink::Standard(StandardLink::Logit),
@@ -309,11 +309,11 @@ fn binomial_nonwiggle_tower_matches_hand_witness_channels() {
     }
 }
 
-fn hand_trigamma(x: f64) -> f64 {
+pub(crate) fn hand_trigamma(x: f64) -> f64 {
     crate::families::jet_tower::trigamma_derivative_stack(x)[0]
 }
 
-fn hand_dispersion_row_kernel(
+pub(crate) fn hand_dispersion_row_kernel(
     kind: DispersionFamilyKind,
     yi: f64,
     eta_mu: f64,
@@ -414,7 +414,7 @@ fn hand_dispersion_row_kernel(
 }
 
 #[test]
-fn dispersion_row_towers_match_hand_witnesses() {
+pub(crate) fn dispersion_row_towers_match_hand_witnesses() {
     let cases = [
         (
             DispersionFamilyKind::NegativeBinomial,
@@ -460,11 +460,11 @@ fn dispersion_row_towers_match_hand_witnesses() {
     }
 }
 
-fn logistic_numdual<D: DualNum<f64> + Copy>(x: D) -> D {
+pub(crate) fn logistic_numdual<D: DualNum<f64> + Copy>(x: D) -> D {
     D::one() / (D::one() + (-x).exp())
 }
 
-fn bspline_basis_scalar_numdual<D: DualNum<f64> + Copy>(
+pub(crate) fn bspline_basis_scalar_numdual<D: DualNum<f64> + Copy>(
     x: D,
     knots: &Array1<f64>,
     degree: usize,
@@ -506,7 +506,7 @@ fn bspline_basis_scalar_numdual<D: DualNum<f64> + Copy>(
     basis
 }
 
-fn monotone_wiggle_basis_scalar_numdual<D: DualNum<f64> + Copy>(
+pub(crate) fn monotone_wiggle_basis_scalar_numdual<D: DualNum<f64> + Copy>(
     x: D,
     knots: &Array1<f64>,
     degree: usize,
@@ -526,7 +526,7 @@ fn monotone_wiggle_basis_scalar_numdual<D: DualNum<f64> + Copy>(
     out
 }
 
-fn wiggle_negloglik_threshold_numdual<D: DualNum<f64> + Copy>(
+pub(crate) fn wiggle_negloglik_threshold_numdual<D: DualNum<f64> + Copy>(
     beta_t: D,
     beta_ls: f64,
     betaw: &Array1<f64>,
@@ -554,7 +554,7 @@ fn wiggle_negloglik_threshold_numdual<D: DualNum<f64> + Copy>(
 }
 
 // Source-of-truth Gaussian logb negloglik. Analytic helpers MUST autodiff-match this.
-fn gaussian_negloglik_log_sigma_psi_numdual<D: DualNum<f64> + Copy>(
+pub(crate) fn gaussian_negloglik_log_sigma_psi_numdual<D: DualNum<f64> + Copy>(
     beta_mu: D,
     beta_ls: D,
     psi: D,
@@ -584,7 +584,7 @@ fn gaussian_negloglik_log_sigma_psi_numdual<D: DualNum<f64> + Copy>(
     out
 }
 
-fn gaussian_negloglik_log_sigma_psi_only_numdual<D: DualNum<f64> + Copy>(
+pub(crate) fn gaussian_negloglik_log_sigma_psi_only_numdual<D: DualNum<f64> + Copy>(
     psi: D,
     beta_mu: f64,
     beta_ls: f64,
@@ -608,7 +608,7 @@ fn gaussian_negloglik_log_sigma_psi_only_numdual<D: DualNum<f64> + Copy>(
     )
 }
 
-fn gaussian_negloglik_log_sigma_mu_psi_numdual<D: DualNum<f64> + Copy>(
+pub(crate) fn gaussian_negloglik_log_sigma_mu_psi_numdual<D: DualNum<f64> + Copy>(
     beta_mu: D,
     psi: D,
     beta_ls: f64,
@@ -632,7 +632,7 @@ fn gaussian_negloglik_log_sigma_mu_psi_numdual<D: DualNum<f64> + Copy>(
     )
 }
 
-fn gaussian_negloglik_log_sigma_ls_psi_numdual<D: DualNum<f64> + Copy>(
+pub(crate) fn gaussian_negloglik_log_sigma_ls_psi_numdual<D: DualNum<f64> + Copy>(
     beta_ls: D,
     psi: D,
     beta_mu: f64,
@@ -656,7 +656,7 @@ fn gaussian_negloglik_log_sigma_ls_psi_numdual<D: DualNum<f64> + Copy>(
     )
 }
 
-fn gaussian_negloglik_log_sigma_beta_vec_numdual<D: DualNum<f64> + Copy>(
+pub(crate) fn gaussian_negloglik_log_sigma_beta_vec_numdual<D: DualNum<f64> + Copy>(
     v: &[D],
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -678,7 +678,7 @@ fn gaussian_negloglik_log_sigma_beta_vec_numdual<D: DualNum<f64> + Copy>(
     )
 }
 
-fn gaussian_psi_test_spec(name: &str, design: Array2<f64>) -> ParameterBlockSpec {
+pub(crate) fn gaussian_psi_test_spec(name: &str, design: Array2<f64>) -> ParameterBlockSpec {
     let n = design.nrows();
     ParameterBlockSpec {
         name: name.to_string(),
@@ -696,7 +696,7 @@ fn gaussian_psi_test_spec(name: &str, design: Array2<f64>) -> ParameterBlockSpec
 }
 
 #[test]
-fn gaussian_joint_psi_firstweights_score_ls_carries_logb_chain_rule_factor() {
+pub(crate) fn gaussian_joint_psi_firstweights_score_ls_carries_logb_chain_rule_factor() {
     let y = array![1.1];
     let etamu = array![0.3];
     let eta_ls = array![-0.2];
@@ -723,7 +723,7 @@ fn gaussian_joint_psi_firstweights_score_ls_carries_logb_chain_rule_factor() {
 }
 
 #[test]
-fn cloglog_binomial_right_tail_derivatives_stay_finite() {
+pub(crate) fn cloglog_binomial_right_tail_derivatives_stay_finite() {
     let (m1, m2, m3) = binomial_neglog_q_derivatives_cloglog_closed_form(1.0, 1.0, 1000.0);
     let m4 = binomial_neglog_q_fourth_derivative_cloglog_closed_form(1.0, 1.0, 300.0);
 
@@ -734,7 +734,7 @@ fn cloglog_binomial_right_tail_derivatives_stay_finite() {
 }
 
 #[test]
-fn cloglog_binomial_fractional_right_tail_keeps_y0_branch() {
+pub(crate) fn cloglog_binomial_fractional_right_tail_keeps_y0_branch() {
     let y = 0.25;
     let weight = 2.0;
     let q = 300.0;
@@ -753,7 +753,7 @@ fn cloglog_binomial_fractional_right_tail_keeps_y0_branch() {
 }
 
 #[test]
-fn logit_binomial_tail_derivatives_are_exact_not_clipped() {
+pub(crate) fn logit_binomial_tail_derivatives_are_exact_not_clipped() {
     // Regression for issue #948 (2b): the logit curvature/4th derivative
     // must be the EXACT Bernoulli variance s = p(1-p) in the saturated
     // tail — never floored to MIN_PROB·(1−MIN_PROB) ≈ 1e-10. At q=50 the
@@ -792,7 +792,7 @@ fn logit_binomial_tail_derivatives_are_exact_not_clipped() {
 }
 
 #[test]
-fn probit_binomial_incompatible_tail_keeps_mills_score() {
+pub(crate) fn probit_binomial_incompatible_tail_keeps_mills_score() {
     let q = 40.0;
     let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(0.0, 1.0, q);
     let m4 = binomial_neglog_q_fourth_derivative_probit_closed_form(0.0, 1.0, q);
@@ -816,7 +816,7 @@ fn probit_binomial_incompatible_tail_keeps_mills_score() {
 }
 
 #[test]
-fn binomial_location_scale_loglik_uses_tail_stable_standard_links() {
+pub(crate) fn binomial_location_scale_loglik_uses_tail_stable_standard_links() {
     use crate::families::custom_family::{CustomFamily, ParameterBlockState};
 
     let n = 2usize;
@@ -879,7 +879,7 @@ fn binomial_location_scale_loglik_uses_tail_stable_standard_links() {
 }
 
 #[test]
-fn gaussian_joint_psisecondweights_eta_ab_term_carries_logb_chain_rule_factor() {
+pub(crate) fn gaussian_joint_psisecondweights_eta_ab_term_carries_logb_chain_rule_factor() {
     let y = array![1.1];
     let etamu = array![0.3];
     let eta_ls = array![-0.2];
@@ -908,7 +908,7 @@ fn gaussian_joint_psisecondweights_eta_ab_term_carries_logb_chain_rule_factor() 
 }
 
 #[test]
-fn gaussian_location_scale_coefficient_cost_delegates_to_joint_coupled_helper() {
+pub(crate) fn gaussian_location_scale_coefficient_cost_delegates_to_joint_coupled_helper() {
     // GAMLSS families (all five variants) share the joint-coupled formula
     // n · (Σ p_b)². They each pull n from `self.y.len()` and forward the
     // specs to the shared helper. This regression test pins that contract
@@ -969,7 +969,7 @@ fn gaussian_location_scale_coefficient_cost_delegates_to_joint_coupled_helper() 
 }
 
 #[test]
-fn large_n_gaussian_location_scale_keeps_exact_outer_hessian_plan() {
+pub(crate) fn large_n_gaussian_location_scale_keeps_exact_outer_hessian_plan() {
     let n = 50_001usize;
     let p_mu = 20usize;
     let p_log_sigma = 20usize;
@@ -1054,7 +1054,7 @@ fn large_n_gaussian_location_scale_keeps_exact_outer_hessian_plan() {
 
 /// Helper: build a small Gaussian location-scale family + state + specs
 /// for matrix-free joint-Hessian validation.
-fn gls_workspace_fixture() -> (
+pub(crate) fn gls_workspace_fixture() -> (
     GaussianLocationScaleFamily,
     Vec<ParameterBlockState>,
     Vec<ParameterBlockSpec>,
@@ -1127,7 +1127,7 @@ fn gls_workspace_fixture() -> (
 
 /// Helper: build a small Binomial location-scale family + state + specs
 /// for matrix-free joint-Hessian validation. Probit is the production link.
-fn bls_workspace_fixture() -> (
+pub(crate) fn bls_workspace_fixture() -> (
     BinomialLocationScaleFamily,
     Vec<ParameterBlockState>,
     Vec<ParameterBlockSpec>,
@@ -1199,7 +1199,7 @@ fn bls_workspace_fixture() -> (
 }
 
 #[test]
-fn gaussian_location_scale_workspace_matvec_matches_dense() {
+pub(crate) fn gaussian_location_scale_workspace_matvec_matches_dense() {
     // Patch 7 mirror of the CTN matrix-free reference test: the matrix-
     // free `Hv` and `diag(H)` operators must reconstruct the dense joint
     // Hessian element-wise. This pins the cross-block coefficient
@@ -1264,7 +1264,7 @@ fn gaussian_location_scale_workspace_matvec_matches_dense() {
 /// wiggle, wiggle} grid. Each test only needs to build the workspace and
 /// pass it here with the expected total coefficient dim and a short
 /// family label (used in the diff message).
-fn assert_dense_matches_canonical_basis_hvp(
+pub(crate) fn assert_dense_matches_canonical_basis_hvp(
     workspace: &dyn crate::custom_family::ExactNewtonJointHessianWorkspace,
     total: usize,
     label: &str,
@@ -1309,7 +1309,7 @@ fn assert_dense_matches_canonical_basis_hvp(
 /// fill (e.g. swapped block coordinates, sign error in `coeff_ml`)
 /// fails here before it can corrupt outer-Hessian assembly.
 #[test]
-fn gaussian_location_scale_hessian_dense_matches_canonical_basis_hvp_path() {
+pub(crate) fn gaussian_location_scale_hessian_dense_matches_canonical_basis_hvp_path() {
     assert!(file!().ends_with(".rs"));
     let (family, states, specs) = gls_workspace_fixture();
     let total = states[0].beta.len() + states[1].beta.len();
@@ -1325,7 +1325,7 @@ fn gaussian_location_scale_hessian_dense_matches_canonical_basis_hvp_path() {
 /// Bit-equivalence guard for the binomial location-scale dense Hessian
 /// hook. Same structure as the Gaussian non-wiggle test.
 #[test]
-fn binomial_location_scale_hessian_dense_matches_canonical_basis_hvp_path() {
+pub(crate) fn binomial_location_scale_hessian_dense_matches_canonical_basis_hvp_path() {
     assert!(file!().ends_with(".rs"));
     let (family, states, specs) = bls_workspace_fixture();
     let total = states[0].beta.len() + states[1].beta.len();
@@ -1344,7 +1344,7 @@ fn binomial_location_scale_hessian_dense_matches_canonical_basis_hvp_path() {
 /// ls↔wiggle GEMM because σ-chain doesn't enter the wiggle term)
 /// against the canonical-basis HVP path.
 #[test]
-fn gaussian_location_scale_wiggle_hessian_dense_matches_canonical_basis_hvp_path() {
+pub(crate) fn gaussian_location_scale_wiggle_hessian_dense_matches_canonical_basis_hvp_path() {
     assert!(file!().ends_with(".rs"));
     let (family, states, specs, _xmu, _xls, _xw) = gls_wiggle_workspace_fixture();
     let total = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
@@ -1362,7 +1362,7 @@ fn gaussian_location_scale_wiggle_hessian_dense_matches_canonical_basis_hvp_path
 /// h_tw_b, h_tw_d, h_lw_b, h_lw_d, h_ww) against the canonical-basis
 /// HVP path.
 #[test]
-fn binomial_location_scale_wiggle_hessian_dense_matches_canonical_basis_hvp_path() {
+pub(crate) fn binomial_location_scale_wiggle_hessian_dense_matches_canonical_basis_hvp_path() {
     assert!(file!().ends_with(".rs"));
     let (family, states, specs, _xt, _xls, _xw) = bls_wiggle_workspace_fixture();
     let total = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
@@ -1376,7 +1376,7 @@ fn binomial_location_scale_wiggle_hessian_dense_matches_canonical_basis_hvp_path
 }
 
 #[test]
-fn gaussian_location_scale_workspace_dh_operator_matches_dense() {
+pub(crate) fn gaussian_location_scale_workspace_dh_operator_matches_dense() {
     let (family, states, specs) = gls_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len();
     let d_beta = array![0.07, -0.04, 0.21, 0.08, -0.13];
@@ -1419,7 +1419,7 @@ fn gaussian_location_scale_workspace_dh_operator_matches_dense() {
 }
 
 #[test]
-fn binomial_location_scale_workspace_matvec_matches_dense() {
+pub(crate) fn binomial_location_scale_workspace_matvec_matches_dense() {
     // Probit + logb-sigma is the production-pipeline link combination, so
     // the cross-block coefficient `coeff_tl` must agree with the dense
     // assembly to within tight tolerance on randomly sampled directions.
@@ -1476,7 +1476,7 @@ fn binomial_location_scale_workspace_matvec_matches_dense() {
 }
 
 #[test]
-fn binomial_location_scale_operator_workspace_never_densifies_specs() {
+pub(crate) fn binomial_location_scale_operator_workspace_never_densifies_specs() {
     let n = 8usize;
     let pt = 3usize;
     let pls = 2usize;
@@ -1664,7 +1664,7 @@ fn binomial_location_scale_operator_workspace_never_densifies_specs() {
 }
 
 #[test]
-fn binomial_location_scale_workspace_dh_operator_matches_dense() {
+pub(crate) fn binomial_location_scale_workspace_dh_operator_matches_dense() {
     let (family, states, specs) = bls_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len();
     let d_beta = array![0.07, -0.04, 0.21, 0.08, -0.13];
@@ -1706,7 +1706,7 @@ fn binomial_location_scale_workspace_dh_operator_matches_dense() {
 }
 
 #[test]
-fn binomial_location_scale_workspace_d2h_operator_matches_dense() {
+pub(crate) fn binomial_location_scale_workspace_d2h_operator_matches_dense() {
     let (family, states, specs) = bls_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len();
     let d_beta_u = array![0.07, -0.04, 0.21, 0.08, -0.13];
@@ -1749,7 +1749,7 @@ fn binomial_location_scale_workspace_d2h_operator_matches_dense() {
 }
 
 #[test]
-fn binomial_location_scale_projected_trace_cache_matches_dense() {
+pub(crate) fn binomial_location_scale_projected_trace_cache_matches_dense() {
     let (family, states, specs) = bls_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len();
     let d_beta_u = array![0.07, -0.04, 0.21, 0.08, -0.13];
@@ -1818,7 +1818,7 @@ fn binomial_location_scale_projected_trace_cache_matches_dense() {
 
 #[test]
 #[should_panic(expected = "two-block cached projected trace factor row mismatch")]
-fn binomial_location_scale_projected_trace_rejects_wrong_factor_rows() {
+pub(crate) fn binomial_location_scale_projected_trace_rejects_wrong_factor_rows() {
     let (family, states, specs) = bls_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len();
     let d_beta = array![0.07, -0.04, 0.21, 0.08, -0.13];
@@ -1836,7 +1836,7 @@ fn binomial_location_scale_projected_trace_rejects_wrong_factor_rows() {
 }
 
 #[test]
-fn binomial_location_scale_workspace_dh_operator_finite_difference() {
+pub(crate) fn binomial_location_scale_workspace_dh_operator_finite_difference() {
     // FD check: [H(β + ε u) v − H(β − ε u) v] / (2ε) ≈ DH[u] v
     // The operator must agree with a centered finite-difference of the
     // dense Hessian along an arbitrary coefficient direction u.
@@ -1897,7 +1897,7 @@ fn binomial_location_scale_workspace_dh_operator_finite_difference() {
 }
 
 #[test]
-fn binomial_location_scale_workspace_d2h_operator_finite_difference() {
+pub(crate) fn binomial_location_scale_workspace_d2h_operator_finite_difference() {
     // FD check on the second directional: [DH(β + ε u') [u] v
     //                                     − DH(β − ε u') [u] v]/(2ε)
     // ≈ D²H[u', u] v. We choose u' = v as the FD-direction and probe
@@ -1957,7 +1957,7 @@ fn binomial_location_scale_workspace_d2h_operator_finite_difference() {
 }
 
 #[test]
-fn gaussian_location_scale_workspace_d2h_operator_matches_dense() {
+pub(crate) fn gaussian_location_scale_workspace_d2h_operator_matches_dense() {
     let (family, states, specs) = gls_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len();
     let d_beta_u = array![0.07, -0.04, 0.21, 0.08, -0.13];
@@ -1998,7 +1998,7 @@ fn gaussian_location_scale_workspace_d2h_operator_matches_dense() {
 }
 
 #[test]
-fn binomial_location_scale_wiggle_workspace_matvec_matches_dense() {
+pub(crate) fn binomial_location_scale_wiggle_workspace_matvec_matches_dense() {
     // Probit + linkwiggle is the production-pipeline supervised link.
     // This is the load-bearing cross-block test: it pins the b/d wiggle
     // coefficients (`coeff_tw_b/d`, `coeff_lw_b/d`, `coeffww`) and the
@@ -2050,7 +2050,7 @@ fn binomial_location_scale_wiggle_workspace_matvec_matches_dense() {
 /// Helper: build a BLS Wiggle family + states + specs fixture
 /// (mirrors the inline structure of
 /// `binomial_location_scale_wiggle_workspace_matvec_matches_dense`).
-fn bls_wiggle_workspace_fixture() -> (
+pub(crate) fn bls_wiggle_workspace_fixture() -> (
     BinomialLocationScaleWiggleFamily,
     Vec<ParameterBlockState>,
     Vec<ParameterBlockSpec>,
@@ -2162,7 +2162,7 @@ fn bls_wiggle_workspace_fixture() -> (
 }
 
 #[test]
-fn binomial_location_scale_wiggle_workspace_dh_operator_matches_dense() {
+pub(crate) fn binomial_location_scale_wiggle_workspace_dh_operator_matches_dense() {
     let (family, states, specs, _xt, _xls, _xw) = bls_wiggle_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
     let d_beta = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
@@ -2210,7 +2210,7 @@ fn binomial_location_scale_wiggle_workspace_dh_operator_matches_dense() {
 }
 
 #[test]
-fn binomial_location_scale_wiggle_workspace_dh_operator_finite_difference() {
+pub(crate) fn binomial_location_scale_wiggle_workspace_dh_operator_finite_difference() {
     let (family, states, specs, xt, xls, _xw) = bls_wiggle_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
     let u = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
@@ -2276,7 +2276,7 @@ fn binomial_location_scale_wiggle_workspace_dh_operator_finite_difference() {
 }
 
 #[test]
-fn binomial_location_scale_wiggle_expected_info_derivatives_match_finite_difference() {
+pub(crate) fn binomial_location_scale_wiggle_expected_info_derivatives_match_finite_difference() {
     let (family, states, specs, xt, xls, xw_at_base) = bls_wiggle_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
     let pt = states[0].beta.len();
@@ -2351,7 +2351,7 @@ fn binomial_location_scale_wiggle_expected_info_derivatives_match_finite_differe
 }
 
 #[test]
-fn binomial_location_scale_wiggle_workspace_d2h_operator_matches_dense() {
+pub(crate) fn binomial_location_scale_wiggle_workspace_d2h_operator_matches_dense() {
     let (family, states, specs, _xt, _xls, _xw) = bls_wiggle_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
     let d_beta_u = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
@@ -2396,7 +2396,7 @@ fn binomial_location_scale_wiggle_workspace_d2h_operator_matches_dense() {
 }
 
 #[test]
-fn binomial_location_scale_wiggle_workspace_d2h_operator_finite_difference() {
+pub(crate) fn binomial_location_scale_wiggle_workspace_d2h_operator_finite_difference() {
     // FD check: [DH(β + ε u_fd) [u] v − DH(β − ε u_fd) [u] v] / (2ε)
     // ≈ D²H[u_fd, u] v.
     let (family, states, specs, xt, xls, xw) = bls_wiggle_workspace_fixture();
@@ -2457,7 +2457,7 @@ fn binomial_location_scale_wiggle_workspace_d2h_operator_finite_difference() {
 }
 
 #[test]
-fn gaussian_location_scale_wiggle_workspace_matvec_matches_dense() {
+pub(crate) fn gaussian_location_scale_wiggle_workspace_matvec_matches_dense() {
     let n = 10usize;
     let p_mu = 3usize;
     let p_ls = 2usize;
@@ -2593,7 +2593,7 @@ fn gaussian_location_scale_wiggle_workspace_matvec_matches_dense() {
 /// Helper: build a GLS Wiggle family + states + specs fixture
 /// (mirrors the inline structure of
 /// `gaussian_location_scale_wiggle_workspace_matvec_matches_dense`).
-fn gls_wiggle_workspace_fixture() -> (
+pub(crate) fn gls_wiggle_workspace_fixture() -> (
     GaussianLocationScaleWiggleFamily,
     Vec<ParameterBlockState>,
     Vec<ParameterBlockSpec>,
@@ -2702,7 +2702,7 @@ fn gls_wiggle_workspace_fixture() -> (
 }
 
 #[test]
-fn gaussian_location_scale_wiggle_workspace_dh_operator_matches_dense() {
+pub(crate) fn gaussian_location_scale_wiggle_workspace_dh_operator_matches_dense() {
     let (family, states, specs, _xmu, _xls, _xw) = gls_wiggle_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
     let d_beta = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).sin());
@@ -2746,7 +2746,7 @@ fn gaussian_location_scale_wiggle_workspace_dh_operator_matches_dense() {
 }
 
 #[test]
-fn gaussian_location_scale_wiggle_workspace_dh_operator_finite_difference() {
+pub(crate) fn gaussian_location_scale_wiggle_workspace_dh_operator_finite_difference() {
     let (family, states, specs, xmu, xls, _xw) = gls_wiggle_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
     let u = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
@@ -2812,7 +2812,7 @@ fn gaussian_location_scale_wiggle_workspace_dh_operator_finite_difference() {
 }
 
 #[test]
-fn gaussian_location_scale_wiggle_workspace_d2h_operator_matches_dense() {
+pub(crate) fn gaussian_location_scale_wiggle_workspace_d2h_operator_matches_dense() {
     let (family, states, specs, _xmu, _xls, _xw) = gls_wiggle_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
     let d_beta_u = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).sin());
@@ -2857,7 +2857,7 @@ fn gaussian_location_scale_wiggle_workspace_d2h_operator_matches_dense() {
 }
 
 #[test]
-fn gaussian_location_scale_wiggle_workspace_d2h_operator_finite_difference() {
+pub(crate) fn gaussian_location_scale_wiggle_workspace_d2h_operator_finite_difference() {
     let (family, states, specs, xmu, xls, _xw) = gls_wiggle_workspace_fixture();
     let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
     let u_fd = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
@@ -2920,7 +2920,7 @@ fn gaussian_location_scale_wiggle_workspace_d2h_operator_finite_difference() {
 }
 
 #[test]
-fn zeroweightrows_stay_inactive_in_builtin_diagonal_families() {
+pub(crate) fn zeroweightrows_stay_inactive_in_builtin_diagonal_families() {
     let weights = Array1::from_vec(vec![0.0, 1.0]);
 
     let gaussian = GaussianLocationScaleFamily {
@@ -3015,7 +3015,7 @@ fn zeroweightrows_stay_inactive_in_builtin_diagonal_families() {
 }
 
 #[test]
-fn hard_clamped_poisson_and_gammarows_stay_locally_flat() {
+pub(crate) fn hard_clamped_poisson_and_gammarows_stay_locally_flat() {
     let poisson = PoissonLogFamily {
         y: Array1::from_vec(vec![1.0, 2.0, 3.0]),
         weights: Array1::from_vec(vec![1.0, 1.0, 1.0]),
@@ -3069,7 +3069,7 @@ fn hard_clamped_poisson_and_gammarows_stay_locally_flat() {
 }
 
 #[test]
-fn poisson_log_canonical_diagonal_weight_is_fisher_and_observed() {
+pub(crate) fn poisson_log_canonical_diagonal_weight_is_fisher_and_observed() {
     let family = PoissonLogFamily {
         y: array![0.0, 3.0],
         weights: array![1.5, 0.5],
@@ -3102,7 +3102,7 @@ fn poisson_log_canonical_diagonal_weight_is_fisher_and_observed() {
 }
 
 #[test]
-fn gamma_log_noncanonical_diagonal_uses_observed_not_fisher_weight_and_dw() {
+pub(crate) fn gamma_log_noncanonical_diagonal_uses_observed_not_fisher_weight_and_dw() {
     let family = GammaLogFamily {
         y: array![2.0, 0.25],
         weights: array![1.25, 0.75],
@@ -3168,7 +3168,7 @@ fn gamma_log_noncanonical_diagonal_uses_observed_not_fisher_weight_and_dw() {
 }
 
 #[test]
-fn gaussian_log_sigmaweight_directional_derivative_iszero_on_active_floor_branch() {
+pub(crate) fn gaussian_log_sigmaweight_directional_derivative_iszero_on_active_floor_branch() {
     let family = GaussianLocationScaleFamily {
         y: Array1::from_vec(vec![0.3]),
         weights: Array1::from_vec(vec![1.0]),
@@ -3201,7 +3201,7 @@ fn gaussian_log_sigmaweight_directional_derivative_iszero_on_active_floor_branch
 }
 
 #[test]
-fn gaussian_log_sigmaweight_directional_derivative_matches_finite_difference() {
+pub(crate) fn gaussian_log_sigmaweight_directional_derivative_matches_finite_difference() {
     let family = GaussianLocationScaleFamily {
         y: Array1::from_vec(vec![1.2]),
         weights: Array1::from_vec(vec![1.0]),
@@ -3266,7 +3266,7 @@ fn gaussian_log_sigmaweight_directional_derivative_matches_finite_difference() {
 }
 
 #[test]
-fn gaussian_sigma_helper_matches_exact_exp_link() {
+pub(crate) fn gaussian_sigma_helper_matches_exact_exp_link() {
     let eta0 = 701.0_f64;
     let eta = array![eta0];
     let (sigma, d1, d2, d3, d4) = exp_sigma_derivs_up_to_fourth_array(eta.view());
@@ -3304,7 +3304,7 @@ fn gaussian_sigma_helper_matches_exact_exp_link() {
 }
 
 #[test]
-fn gaussian_log_sigma_design_keeps_shared_mean_basis() {
+pub(crate) fn gaussian_log_sigma_design_keeps_shared_mean_basis() {
     let shared = array![[1.0, -1.5], [1.0, -0.25], [1.0, 0.75], [1.0, 2.0],];
     let shared_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(shared.clone()));
     let prepared = prepared_gaussian_log_sigma_design(&shared_design, &shared_design)
@@ -3324,7 +3324,7 @@ fn gaussian_log_sigma_design_keeps_shared_mean_basis() {
 }
 
 #[test]
-fn gaussian_diagonal_log_sigma_block_uses_fisher_score_step_in_far_tail() {
+pub(crate) fn gaussian_diagonal_log_sigma_block_uses_fisher_score_step_in_far_tail() {
     let family = GaussianLocationScaleFamily {
         y: array![0.0],
         weights: array![1.0],
@@ -3397,7 +3397,7 @@ fn gaussian_diagonal_log_sigma_block_uses_fisher_score_step_in_far_tail() {
 }
 
 #[test]
-fn gaussian_exact_joint_path_stays_finite_in_exp_link_far_tail() {
+pub(crate) fn gaussian_exact_joint_path_stays_finite_in_exp_link_far_tail() {
     let mu_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]]));
     let log_sigma_design =
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]]));
@@ -3443,7 +3443,7 @@ fn gaussian_exact_joint_path_stays_finite_in_exp_link_far_tail() {
 }
 
 #[test]
-fn gaussian_location_scale_hotloop_optimized_matches_legacy_and_is_faster_locally() {
+pub(crate) fn gaussian_location_scale_hotloop_optimized_matches_legacy_and_is_faster_locally() {
     let n = 4096usize;
     let y = Array1::from_shape_fn(n, |i| ((i as f64) * 0.003).sin() + 0.1);
     let mu = Array1::from_shape_fn(n, |i| ((i as f64) * 0.001).cos() - 0.2);
@@ -3528,7 +3528,7 @@ fn gaussian_location_scale_hotloop_optimized_matches_legacy_and_is_faster_locall
     assert!((&wls_legacy - &wls_opt).iter().all(|v| v.abs() < 1e-12));
 }
 
-fn simple_matern_term_collection(feature_cols: &[usize], length_scale: f64) -> TermCollectionSpec {
+pub(crate) fn simple_matern_term_collection(feature_cols: &[usize], length_scale: f64) -> TermCollectionSpec {
     TermCollectionSpec {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
@@ -3555,7 +3555,7 @@ fn simple_matern_term_collection(feature_cols: &[usize], length_scale: f64) -> T
     }
 }
 
-fn empty_term_collection() -> TermCollectionSpec {
+pub(crate) fn empty_term_collection() -> TermCollectionSpec {
     TermCollectionSpec {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
@@ -3563,7 +3563,7 @@ fn empty_term_collection() -> TermCollectionSpec {
     }
 }
 
-fn spatial_kappa_options() -> SpatialLengthScaleOptimizationOptions {
+pub(crate) fn spatial_kappa_options() -> SpatialLengthScaleOptimizationOptions {
     SpatialLengthScaleOptimizationOptions {
         enabled: true,
         max_outer_iter: 4,
@@ -3575,7 +3575,7 @@ fn spatial_kappa_options() -> SpatialLengthScaleOptimizationOptions {
     }
 }
 
-fn spatial_fit_smoke_options() -> BlockwiseFitOptions {
+pub(crate) fn spatial_fit_smoke_options() -> BlockwiseFitOptions {
     BlockwiseFitOptions {
         // The location-scale-wiggle spatial smoke test can need more than
         // 24 blockwise cycles after the final outer REML refit; keep the
@@ -3590,7 +3590,7 @@ fn spatial_fit_smoke_options() -> BlockwiseFitOptions {
 }
 
 #[test]
-fn binomial_location_scale_exact_probit_tailobjects_stay_finite() {
+pub(crate) fn binomial_location_scale_exact_probit_tailobjects_stay_finite() {
     let n = 6usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
     let weights = Array1::from_elem(n, 1.0);
@@ -3644,8 +3644,8 @@ fn binomial_location_scale_exact_probit_tailobjects_stay_finite() {
 }
 
 #[test]
-fn binomial_location_scale_many_smoothing_params_keeps_second_order_outer() {
-    fn spec_with_penalties(name: &str, n: usize, p: usize, k: usize) -> ParameterBlockSpec {
+pub(crate) fn binomial_location_scale_many_smoothing_params_keeps_second_order_outer() {
+    pub(crate) fn spec_with_penalties(name: &str, n: usize, p: usize, k: usize) -> ParameterBlockSpec {
         ParameterBlockSpec {
             name: name.to_string(),
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
@@ -3696,7 +3696,7 @@ fn binomial_location_scale_many_smoothing_params_keeps_second_order_outer() {
 }
 
 #[test]
-fn binomial_location_scale_term_builder_requires_exact_spatial_joint_path() {
+pub(crate) fn binomial_location_scale_term_builder_requires_exact_spatial_joint_path() {
     let n = 8usize;
     let builder = BinomialLocationScaleTermBuilder {
         y: Array1::from_elem(n, 0.0),
@@ -3724,7 +3724,7 @@ fn binomial_location_scale_term_builder_requires_exact_spatial_joint_path() {
 }
 
 #[test]
-fn binomial_location_scalewiggle_term_builder_requires_exact_spatial_joint_path() {
+pub(crate) fn binomial_location_scalewiggle_term_builder_requires_exact_spatial_joint_path() {
     let n = 8usize;
     let q_seed = Array1::linspace(-1.25, 1.25, n);
     let (wiggle_block, knots) =
@@ -3760,7 +3760,7 @@ fn binomial_location_scalewiggle_term_builder_requires_exact_spatial_joint_path(
 }
 
 #[test]
-fn binomial_location_scale_builder_populateswarm_start_betas() {
+pub(crate) fn binomial_location_scale_builder_populateswarm_start_betas() {
     let n = 12usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -3799,7 +3799,7 @@ fn binomial_location_scale_builder_populateswarm_start_betas() {
 }
 
 #[test]
-fn binomial_location_scalewiggle_builder_populateswarm_start_betas() {
+pub(crate) fn binomial_location_scalewiggle_builder_populateswarm_start_betas() {
     let n = 12usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -3845,7 +3845,7 @@ fn binomial_location_scalewiggle_builder_populateswarm_start_betas() {
 }
 
 #[test]
-fn binomial_location_scale_exact_newton_spatial_joint_hyper_returns_fullhessian() {
+pub(crate) fn binomial_location_scale_exact_newton_spatial_joint_hyper_returns_fullhessian() {
     let n = 12usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -3923,7 +3923,7 @@ fn binomial_location_scale_exact_newton_spatial_joint_hyper_returns_fullhessian(
 }
 
 #[test]
-fn binomial_location_scalewiggle_exact_newton_spatial_joint_hyper_returns_fullhessian() {
+pub(crate) fn binomial_location_scalewiggle_exact_newton_spatial_joint_hyper_returns_fullhessian() {
     let n = 14usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -4010,7 +4010,7 @@ fn binomial_location_scalewiggle_exact_newton_spatial_joint_hyper_returns_fullhe
 }
 
 #[test]
-fn gaussian_location_scale_exact_newton_spatial_joint_hyper_returns_fullhessian() {
+pub(crate) fn gaussian_location_scale_exact_newton_spatial_joint_hyper_returns_fullhessian() {
     let n = 12usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -4095,7 +4095,7 @@ fn gaussian_location_scale_exact_newton_spatial_joint_hyper_returns_fullhessian(
 /// pulls the joint ψ terms / second-order terms / mixed directional drift
 /// off `family` and checks their shapes. `label` names the family in the
 /// panic messages; `slope`/`intercept` parameterize the `d_beta` probe.
-fn assert_joint_psi_hook_surface<F: CustomFamily>(
+pub(crate) fn assert_joint_psi_hook_surface<F: CustomFamily>(
     family: &F,
     block_states: &[ParameterBlockState],
     blocks: &[ParameterBlockSpec],
@@ -4152,7 +4152,7 @@ fn assert_joint_psi_hook_surface<F: CustomFamily>(
 }
 
 #[test]
-fn binomial_location_scalewiggle_family_exposes_joint_psi_hook_surface() {
+pub(crate) fn binomial_location_scalewiggle_family_exposes_joint_psi_hook_surface() {
     let n = 12usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -4238,7 +4238,7 @@ fn binomial_location_scalewiggle_family_exposes_joint_psi_hook_surface() {
 }
 
 #[test]
-fn gaussian_location_scale_family_exposes_joint_psi_hook_surface() {
+pub(crate) fn gaussian_location_scale_family_exposes_joint_psi_hook_surface() {
     let n = 10usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -4312,7 +4312,7 @@ fn gaussian_location_scale_family_exposes_joint_psi_hook_surface() {
 }
 
 #[test]
-fn gaussian_location_scale_terms_reject_invalidweights_early() {
+pub(crate) fn gaussian_location_scale_terms_reject_invalidweights_early() {
     let n = 8usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -4341,7 +4341,7 @@ fn gaussian_location_scale_terms_reject_invalidweights_early() {
 }
 
 #[test]
-fn binomial_location_scale_terms_reject_invalid_response_early() {
+pub(crate) fn binomial_location_scale_terms_reject_invalid_response_early() {
     let n = 8usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -4371,7 +4371,7 @@ fn binomial_location_scale_terms_reject_invalid_response_early() {
 }
 
 #[test]
-fn binomial_location_scale_terms_reject_free_log_sigma_terms_early() {
+pub(crate) fn binomial_location_scale_terms_reject_free_log_sigma_terms_early() {
     let n = 8usize;
     let data = Array2::<f64>::zeros((n, 2));
     let spec = BinomialLocationScaleTermSpec {
@@ -4398,7 +4398,7 @@ fn binomial_location_scale_terms_reject_free_log_sigma_terms_early() {
 }
 
 #[test]
-fn binomial_location_scale_terms_reject_datarow_mismatch_early() {
+pub(crate) fn binomial_location_scale_terms_reject_datarow_mismatch_early() {
     let n = 8usize;
     let data = Array2::<f64>::zeros((n - 1, 2));
     let spec = BinomialLocationScaleTermSpec {
@@ -4424,7 +4424,7 @@ fn binomial_location_scale_terms_reject_datarow_mismatch_early() {
 }
 
 #[test]
-fn gaussian_location_scale_termswith_matern_spatial_blocks_fit_finitely() {
+pub(crate) fn gaussian_location_scale_termswith_matern_spatial_blocks_fit_finitely() {
     let n = 32usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -4473,7 +4473,7 @@ fn gaussian_location_scale_termswith_matern_spatial_blocks_fit_finitely() {
 /// solve, not a synthetic linear-algebra stub. A mean-flattening regression
 /// (the #365 failure mode) drives the RMSE far above the asserted bound.
 #[test]
-fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean() {
+pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean() {
     let n = 300usize;
     // Deterministic LCG -> uniform(0,1); probit gives standard-normal draws.
     let mut lcg: u64 = 0x2545_F491_4F6C_DD1D;
@@ -4546,7 +4546,7 @@ fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean() {
 }
 
 #[test]
-fn binomial_location_scale_termswith_matern_spatial_blocks_fit_finitely() {
+pub(crate) fn binomial_location_scale_termswith_matern_spatial_blocks_fit_finitely() {
     let n = 36usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -4577,7 +4577,7 @@ fn binomial_location_scale_termswith_matern_spatial_blocks_fit_finitely() {
 }
 
 #[test]
-fn binomial_location_scalewiggle_termswith_matern_spatial_blocks_fit_finitely() {
+pub(crate) fn binomial_location_scalewiggle_termswith_matern_spatial_blocks_fit_finitely() {
     let n = 30usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -4615,7 +4615,7 @@ fn binomial_location_scalewiggle_termswith_matern_spatial_blocks_fit_finitely() 
 }
 
 #[test]
-fn wiggle_family_evaluate_returns_exact_newton_blocks() {
+pub(crate) fn wiggle_family_evaluate_returns_exact_newton_blocks() {
     let n = 6usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
@@ -4700,7 +4700,7 @@ fn wiggle_family_evaluate_returns_exact_newton_blocks() {
 }
 
 #[test]
-fn wiggle_family_exact_newton_directional_derivative_matches_finite_difference() {
+pub(crate) fn wiggle_family_exact_newton_directional_derivative_matches_finite_difference() {
     let n = 7usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
@@ -4805,7 +4805,7 @@ fn wiggle_family_exact_newton_directional_derivative_matches_finite_difference()
 }
 
 #[test]
-fn wiggle_threshold_block_exacthessian_matches_autodiffobjective() {
+pub(crate) fn wiggle_threshold_block_exacthessian_matches_autodiffobjective() {
     let n = 7usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
@@ -4875,7 +4875,7 @@ fn wiggle_threshold_block_exacthessian_matches_autodiffobjective() {
 }
 
 #[test]
-fn gaussian_log_sigma_psi_terms_match_autodiff_scalar_objective() {
+pub(crate) fn gaussian_log_sigma_psi_terms_match_autodiff_scalar_objective() {
     let y = array![0.25, -0.4, 1.1];
     let weights = array![1.0, 0.7, 1.3];
     let x_mu0 = array![1.0, -0.35, 0.6];
@@ -5136,7 +5136,7 @@ fn gaussian_log_sigma_psi_terms_match_autodiff_scalar_objective() {
 }
 
 #[test]
-fn gaussian_log_sigma_psi_second_order_terms_match_autodiff_scalar_objective() {
+pub(crate) fn gaussian_log_sigma_psi_second_order_terms_match_autodiff_scalar_objective() {
     let y = array![0.25, -0.4, 1.1];
     let weights = array![1.0, 0.7, 1.3];
     let x_mu0 = array![1.0, -0.35, 0.6];
@@ -5271,7 +5271,7 @@ fn gaussian_log_sigma_psi_second_order_terms_match_autodiff_scalar_objective() {
 
 // Sibling oracle: μ also depends on ψ. Used by the joint psi-second-order
 // guardrail; the original oracle leaves μ fixed in ψ.
-fn gaussian_negloglik_log_sigma_psi_full_numdual<D: DualNum<f64> + Copy>(
+pub(crate) fn gaussian_negloglik_log_sigma_psi_full_numdual<D: DualNum<f64> + Copy>(
     beta_mu: D,
     beta_ls: D,
     psi: D,
@@ -5304,7 +5304,7 @@ fn gaussian_negloglik_log_sigma_psi_full_numdual<D: DualNum<f64> + Copy>(
 
 // Oracle with multi-column designs (β vectors). Used by the joint
 // static-Hessian guardrail and its directional derivatives.
-fn gaussian_negloglik_logb_dense_numdual<D: DualNum<f64> + Copy>(
+pub(crate) fn gaussian_negloglik_logb_dense_numdual<D: DualNum<f64> + Copy>(
     beta_mu: &[D],
     beta_ls: &[D],
     y: &Array1<f64>,
@@ -5331,7 +5331,7 @@ fn gaussian_negloglik_logb_dense_numdual<D: DualNum<f64> + Copy>(
     out
 }
 
-fn gaussian_logb_design_test_data() -> (
+pub(crate) fn gaussian_logb_design_test_data() -> (
     Array1<f64>,
     Array1<f64>,
     Array2<f64>,
@@ -5353,7 +5353,7 @@ fn gaussian_logb_design_test_data() -> (
 }
 
 #[test]
-fn gaussian_joint_static_hessian_matches_autodiff() {
+pub(crate) fn gaussian_joint_static_hessian_matches_autodiff() {
     let (y, weights, xmu, x_ls, beta_mu, beta_ls) = gaussian_logb_design_test_data();
     let etamu = xmu.dot(&beta_mu);
     let eta_ls = x_ls.dot(&beta_ls);
@@ -5517,7 +5517,7 @@ fn gaussian_joint_static_hessian_matches_autodiff() {
 }
 
 #[test]
-fn gaussian_joint_first_directional_hessian_matches_autodiff() {
+pub(crate) fn gaussian_joint_first_directional_hessian_matches_autodiff() {
     let (y, weights, xmu, x_ls, beta_mu, beta_ls) = gaussian_logb_design_test_data();
     let etamu = xmu.dot(&beta_mu);
     let eta_ls = x_ls.dot(&beta_ls);
@@ -5630,7 +5630,7 @@ fn gaussian_joint_first_directional_hessian_matches_autodiff() {
 }
 
 #[test]
-fn gaussian_joint_second_directional_hessian_matches_autodiff() {
+pub(crate) fn gaussian_joint_second_directional_hessian_matches_autodiff() {
     let (y, weights, xmu, x_ls, beta_mu, beta_ls) = gaussian_logb_design_test_data();
     let etamu = xmu.dot(&beta_mu);
     let eta_ls = x_ls.dot(&beta_ls);
@@ -5793,7 +5793,7 @@ fn gaussian_joint_second_directional_hessian_matches_autodiff() {
 }
 
 #[test]
-fn gaussian_joint_psi_second_order_terms_match_autodiff() {
+pub(crate) fn gaussian_joint_psi_second_order_terms_match_autodiff() {
     // ψ-coupled scenario: both μ and η_ls depend on ψ via per-row
     // first/second drift vectors, with non-trivial coefficients.
     let y = array![0.25, -0.4, 1.1, 0.05, -0.2];
@@ -5860,7 +5860,7 @@ fn gaussian_joint_psi_second_order_terms_match_autodiff() {
 }
 
 #[test]
-fn wiggle_family_block_hessians_match_jointhessian_principal_blocks() {
+pub(crate) fn wiggle_family_block_hessians_match_jointhessian_principal_blocks() {
     let n = 7usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
@@ -5942,7 +5942,7 @@ fn wiggle_family_block_hessians_match_jointhessian_principal_blocks() {
 
 /// Build the nontrivial-design BLS Wiggle family + designs + wiggle block
 /// shared by the FD-gradient and FD-joint-Hessian tests below.
-fn wiggle_nontrivial_fixture() -> (
+pub(crate) fn wiggle_nontrivial_fixture() -> (
     BinomialLocationScaleWiggleFamily,
     DesignMatrix,
     DesignMatrix,
@@ -5994,7 +5994,7 @@ fn wiggle_nontrivial_fixture() -> (
 }
 
 /// Rebuild the three-block state for the nontrivial-design wiggle fixture.
-fn rebuild_wiggle_nontrivial_states(
+pub(crate) fn rebuild_wiggle_nontrivial_states(
     family: &BinomialLocationScaleWiggleFamily,
     threshold_design: &DesignMatrix,
     log_sigma_design: &DesignMatrix,
@@ -6030,7 +6030,7 @@ fn rebuild_wiggle_nontrivial_states(
 }
 
 /// Extract the exact-Newton gradient for one block of a wiggle evaluation.
-fn extract_wiggle_gradient(eval: &FamilyEvaluation, block_idx: usize) -> Array1<f64> {
+pub(crate) fn extract_wiggle_gradient(eval: &FamilyEvaluation, block_idx: usize) -> Array1<f64> {
     match &eval.blockworking_sets[block_idx] {
         BlockWorkingSet::ExactNewton {
             gradient,
@@ -6041,7 +6041,7 @@ fn extract_wiggle_gradient(eval: &FamilyEvaluation, block_idx: usize) -> Array1<
 }
 
 #[test]
-fn wiggle_familygradients_match_finite_differencewith_nontrivial_designs() {
+pub(crate) fn wiggle_familygradients_match_finite_differencewith_nontrivial_designs() {
     let (family, threshold_design, log_sigma_design, wiggle_block, y, weights) =
         wiggle_nontrivial_fixture();
 
@@ -6114,7 +6114,7 @@ fn wiggle_familygradients_match_finite_differencewith_nontrivial_designs() {
 }
 
 #[test]
-fn wiggle_family_joint_hessian_matches_fd_gradients_with_nontrivial_designs() {
+pub(crate) fn wiggle_family_joint_hessian_matches_fd_gradients_with_nontrivial_designs() {
     let (family, threshold_design, log_sigma_design, wiggle_block, y, weights) =
         wiggle_nontrivial_fixture();
 
@@ -6202,7 +6202,7 @@ fn wiggle_family_joint_hessian_matches_fd_gradients_with_nontrivial_designs() {
 }
 
 #[test]
-fn wiggle_family_joint_exacthessian_directional_derivative_matches_finite_difference() {
+pub(crate) fn wiggle_family_joint_exacthessian_directional_derivative_matches_finite_difference() {
     assert!(file!().ends_with(".rs"));
     let n = 7usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
@@ -6314,7 +6314,7 @@ fn wiggle_family_joint_exacthessian_directional_derivative_matches_finite_differ
 }
 
 #[test]
-fn wiggle_family_joint_exacthessiansecond_directional_derivative_matches_finite_difference() {
+pub(crate) fn wiggle_family_joint_exacthessiansecond_directional_derivative_matches_finite_difference() {
     assert!(file!().ends_with(".rs"));
     let n = 7usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
@@ -6414,7 +6414,7 @@ fn wiggle_family_joint_exacthessiansecond_directional_derivative_matches_finite_
 }
 
 #[test]
-fn wiggle_family_joint_hessian_cross_blocks_match_finite_difference_of_gradients() {
+pub(crate) fn wiggle_family_joint_hessian_cross_blocks_match_finite_difference_of_gradients() {
     let n = 7usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
@@ -6560,7 +6560,7 @@ fn wiggle_family_joint_hessian_cross_blocks_match_finite_difference_of_gradients
 }
 
 #[test]
-fn nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_are_present() {
+pub(crate) fn nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_are_present() {
     let n = 6usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
@@ -6631,7 +6631,7 @@ fn nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_are_present
 }
 
 #[test]
-fn nonwiggle_family_joint_exacthessian_directional_derivative_matches_finite_difference() {
+pub(crate) fn nonwiggle_family_joint_exacthessian_directional_derivative_matches_finite_difference() {
     let n = 8usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
@@ -6703,7 +6703,7 @@ fn nonwiggle_family_joint_exacthessian_directional_derivative_matches_finite_dif
 }
 
 #[test]
-fn nonwiggle_family_joint_exacthessiansecond_directional_derivative_matches_finite_difference() {
+pub(crate) fn nonwiggle_family_joint_exacthessiansecond_directional_derivative_matches_finite_difference() {
     let n = 8usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
@@ -6783,7 +6783,7 @@ fn nonwiggle_family_joint_exacthessiansecond_directional_derivative_matches_fini
 }
 
 #[test]
-fn wiggle_basis_is_structurally_monotone_for_nonnegative_coefficients() {
+pub(crate) fn wiggle_basis_is_structurally_monotone_for_nonnegative_coefficients() {
     let q_seed = Array1::linspace(-2.0, 2.0, 17);
     let degree = 3usize;
     let num_internal_knots = 6usize;
@@ -6813,7 +6813,7 @@ fn wiggle_basis_is_structurally_monotone_for_nonnegative_coefficients() {
 }
 
 #[test]
-fn degeneratewiggle_seed_uses_broad_fallback_domain() {
+pub(crate) fn degeneratewiggle_seed_uses_broad_fallback_domain() {
     let q_seed = Array1::zeros(9);
     let degree = 3usize;
     let knots = initializewiggle_knots_from_seed(q_seed.view(), degree, 5)
@@ -6832,7 +6832,7 @@ fn degeneratewiggle_seed_uses_broad_fallback_domain() {
 }
 
 #[test]
-fn wiggle_block_design_matches_ispline_basis() {
+pub(crate) fn wiggle_block_design_matches_ispline_basis() {
     let q_seed = Array1::linspace(-1.0, 1.0, 11);
     let degree = 2usize;
     let num_internal_knots = 4usize;
@@ -6875,14 +6875,14 @@ fn wiggle_block_design_matches_ispline_basis() {
 }
 
 #[test]
-fn split_wiggle_penalty_orders_uses_requested_order_one_as_primary() {
+pub(crate) fn split_wiggle_penalty_orders_uses_requested_order_one_as_primary() {
     let (primary, extras) = split_wiggle_penalty_orders(2, &[1, 2, 3, 3]);
     assert_eq!(primary, 1);
     assert_eq!(extras, vec![2, 3]);
 }
 
 #[test]
-fn append_selected_wiggle_penalty_orders_keeps_order_one() {
+pub(crate) fn append_selected_wiggle_penalty_orders_keeps_order_one() {
     let q_seed = Array1::linspace(-1.0, 1.0, 11);
     let degree = 3usize;
     let num_internal_knots = 5usize;
@@ -6900,7 +6900,7 @@ fn append_selected_wiggle_penalty_orders_keeps_order_one() {
 }
 
 #[test]
-fn binomial_location_scale_generative_matches_coremu() {
+pub(crate) fn binomial_location_scale_generative_matches_coremu() {
     let n = 7usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
@@ -6939,7 +6939,7 @@ fn binomial_location_scale_generative_matches_coremu() {
 }
 
 #[test]
-fn wiggle_geometry_and_generative_use_same_sigma_link_as_core() {
+pub(crate) fn wiggle_geometry_and_generative_use_same_sigma_link_as_core() {
     let n = 8usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
@@ -7033,7 +7033,7 @@ fn wiggle_geometry_and_generative_use_same_sigma_link_as_core() {
 }
 
 #[test]
-fn poisson_extreme_eta_stays_finite_with_safe_exp() {
+pub(crate) fn poisson_extreme_eta_stays_finite_with_safe_exp() {
     use crate::families::custom_family::{CustomFamily, ParameterBlockState};
     let poisson = PoissonLogFamily {
         y: Array1::from_vec(vec![1.0, 2.0, 3.0]),
@@ -7077,7 +7077,7 @@ fn poisson_extreme_eta_stays_finite_with_safe_exp() {
 /// wiring: any future regression that detaches the override from the
 /// dispatcher will trip the FD check via stale (zero) gradients.
 #[test]
-fn binomial_location_scale_batched_gradient_matches_finite_difference() {
+pub(crate) fn binomial_location_scale_batched_gradient_matches_finite_difference() {
     use crate::families::custom_family::BlockwiseFitOptions;
 
     // 7-row, two-block intercept-only problem with a unit-Identity
@@ -7156,7 +7156,7 @@ fn binomial_location_scale_batched_gradient_matches_finite_difference() {
     }
 }
 
-fn binomial_mean_wiggle_operator_fixture() -> (
+pub(crate) fn binomial_mean_wiggle_operator_fixture() -> (
     BinomialMeanWiggleFamily,
     Vec<ParameterBlockState>,
     Vec<ParameterBlockSpec>,
@@ -7226,7 +7226,7 @@ fn binomial_mean_wiggle_operator_fixture() -> (
     (family, states, specs, x_eta)
 }
 
-fn assert_close_matrix(a: &Array2<f64>, b: &Array2<f64>, tol: f64, label: &str) {
+pub(crate) fn assert_close_matrix(a: &Array2<f64>, b: &Array2<f64>, tol: f64, label: &str) {
     assert_eq!(a.dim(), b.dim(), "{label} shape mismatch");
     let max_err = a
         .iter()
@@ -7240,7 +7240,7 @@ fn assert_close_matrix(a: &Array2<f64>, b: &Array2<f64>, tol: f64, label: &str) 
 }
 
 #[test]
-fn binomial_location_scale_expected_info_derivatives_match_finite_difference() {
+pub(crate) fn binomial_location_scale_expected_info_derivatives_match_finite_difference() {
     let base = binomial_location_scale_base_fixture();
     let family = BinomialLocationScaleFamily {
         y: base.y,
@@ -7377,7 +7377,7 @@ fn binomial_location_scale_expected_info_derivatives_match_finite_difference() {
 /// the SAME `joint_jeffreys_term` value path on the FULL identifiable span
 /// (`Z_J = I`), differing only in the information matrix consumed.
 #[test]
-fn expected_info_jeffreys_does_not_reward_probit_saturation() {
+pub(crate) fn expected_info_jeffreys_does_not_reward_probit_saturation() {
     let base = binomial_location_scale_base_fixture();
     let family = BinomialLocationScaleFamily {
         y: base.y,
@@ -7471,7 +7471,7 @@ fn expected_info_jeffreys_does_not_reward_probit_saturation() {
 }
 
 #[test]
-fn binomial_location_scale_expected_info_contracted_trace_matches_second_directional() {
+pub(crate) fn binomial_location_scale_expected_info_contracted_trace_matches_second_directional() {
     let base = binomial_location_scale_base_fixture();
     let family = BinomialLocationScaleFamily {
         y: base.y,
@@ -7537,7 +7537,7 @@ fn binomial_location_scale_expected_info_contracted_trace_matches_second_directi
 }
 
 #[test]
-fn binomial_location_scale_expected_hphi_drift_matches_finite_difference() {
+pub(crate) fn binomial_location_scale_expected_hphi_drift_matches_finite_difference() {
     let base = binomial_location_scale_base_fixture();
     let family = BinomialLocationScaleFamily {
         y: base.y,
@@ -7634,7 +7634,7 @@ fn binomial_location_scale_expected_hphi_drift_matches_finite_difference() {
 }
 
 #[test]
-fn binomial_mean_wiggle_hessian_operators_match_dense_derivatives() {
+pub(crate) fn binomial_mean_wiggle_hessian_operators_match_dense_derivatives() {
     let (family, states, specs, x_eta) = binomial_mean_wiggle_operator_fixture();
     let p_eta = x_eta.ncols();
     let pw = states[BinomialMeanWiggleFamily::BLOCK_WIGGLE].beta.len();
@@ -7698,7 +7698,7 @@ fn binomial_mean_wiggle_hessian_operators_match_dense_derivatives() {
 }
 
 #[test]
-fn binomial_mean_wiggle_planner_keeps_second_order_at_large_n() {
+pub(crate) fn binomial_mean_wiggle_planner_keeps_second_order_at_large_n() {
     let n = 50_001usize;
     let family = BinomialMeanWiggleFamily {
         y: Array1::zeros(n),
@@ -7761,12 +7761,12 @@ fn binomial_mean_wiggle_planner_keeps_second_order_at_large_n() {
 /// (y ≠ η_μ), so the old buggy `2κm` cross is genuinely nonzero — this test
 /// FAILS against the pre-fix code.
 #[test]
-fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero() {
+pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero() {
     use crate::solver::estimate::reml::unified::HyperOperator;
 
     // Materialize an `ExactNewtonJointPsiTerms` joint Hessian regardless of
     // whether the family returns it dense or operator-backed.
-    fn materialize(
+    pub(crate) fn materialize(
         dense: &Array2<f64>,
         operator: Option<&dyn HyperOperator>,
         total: usize,
@@ -7781,7 +7781,7 @@ fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero() {
     }
 
     // Max |entry| over the rectangular block H[r0..r1, c0..c1].
-    fn block_max_abs(h: &Array2<f64>, r0: usize, r1: usize, c0: usize, c1: usize) -> f64 {
+    pub(crate) fn block_max_abs(h: &Array2<f64>, r0: usize, r1: usize, c0: usize, c1: usize) -> f64 {
         let mut m = 0.0_f64;
         for r in r0..r1 {
             for c in c0..c1 {
@@ -7791,7 +7791,7 @@ fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero() {
         m
     }
 
-    const CROSS_TOL: f64 = 1e-12;
+    pub(crate) const CROSS_TOL: f64 = 1e-12;
 
     // ---- Non-wiggle GaussianLocationScaleFamily ----------------------
     {

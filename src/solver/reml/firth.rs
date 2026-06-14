@@ -3,14 +3,14 @@ use crate::linalg::utils::enforce_symmetry;
 use crate::mixture_link::fisher_weight_jet5_for_inverse_link;
 use crate::types::InverseLink;
 
-const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
+pub(crate) const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
 
 /// Reciprocal-condition-number floor below which the reduced Fisher information
 /// `I_r` is flagged as near-singular (a diagnostic warning only, not a hard
 /// gate). At `λ_min/λ_max < 1e-10` the SPD assumption on the identifiable
 /// subspace is numerically fragile and the exact pseudodet derivatives may be
 /// ill-conditioned near active-subspace boundaries.
-const FIRTH_REDUCED_FISHER_RCOND_WARN: f64 = 1e-10;
+pub(crate) const FIRTH_REDUCED_FISHER_RCOND_WARN: f64 = 1e-10;
 
 impl<'a> RemlState<'a> {
     pub(crate) fn xt_diag_x_dense_into(
@@ -22,7 +22,7 @@ impl<'a> RemlState<'a> {
     }
 
     #[inline]
-    fn parallelize_firth_derivative_rows(n: usize) -> bool {
+    pub(crate) fn parallelize_firth_derivative_rows(n: usize) -> bool {
         n >= FIRTH_DERIVATIVE_PARALLEL_MIN_N && rayon::current_num_threads() > 1
     }
 
@@ -33,21 +33,21 @@ impl<'a> RemlState<'a> {
     }
 
     #[inline]
-    fn dense_product_likely_uses_inner_parallelism(m: usize, n: usize, k: usize) -> bool {
+    pub(crate) fn dense_product_likely_uses_inner_parallelism(m: usize, n: usize, k: usize) -> bool {
         // Keep this in sync with faer_ndarray::matmul_parallelism.  When a
         // dense product is large enough for faer/BLAS-style internal
         // parallelism, do not also wrap sibling products in rayon::join: that
         // can oversubscribe CPU threads and slow down the REML hot path.
-        const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
-        const PAR_MIN_LONG_DIM: usize = 256;
+        pub(crate) const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
+        pub(crate) const PAR_MIN_LONG_DIM: usize = 256;
         let flop_scale = m.saturating_mul(n).saturating_mul(k);
         let long_dim = m.max(n).max(k);
         flop_scale >= PAR_MIN_FLOP_SCALE && long_dim >= PAR_MIN_LONG_DIM
     }
 
     #[inline]
-    fn should_join_independent_dense_products(products: &[(usize, usize, usize)]) -> bool {
-        const JOIN_MIN_TOTAL_FLOP_SCALE: usize = 128 * 1024;
+    pub(crate) fn should_join_independent_dense_products(products: &[(usize, usize, usize)]) -> bool {
+        pub(crate) const JOIN_MIN_TOTAL_FLOP_SCALE: usize = 128 * 1024;
         if rayon::current_num_threads() <= 1 {
             return false;
         }
@@ -71,7 +71,7 @@ impl<'a> RemlState<'a> {
     /// case-weight roots and their reciprocals to map reduced design
     /// derivatives back to raw design space.
     #[inline]
-    fn scale_rows_by_inverse_observation_weight_sqrt(
+    pub(crate) fn scale_rows_by_inverse_observation_weight_sqrt(
         out: &mut Array2<f64>,
         observation_weight_sqrt: Option<&Array1<f64>>,
     ) {
@@ -86,7 +86,7 @@ impl<'a> RemlState<'a> {
     /// `logit_inverse_link_jet5(eta).d1..d5` path that the Firth operator used
     /// before the weights were generalized to arbitrary inverse links.
     #[inline]
-    fn fisher_weight_derivatives(
+    pub(crate) fn fisher_weight_derivatives(
         link: &InverseLink,
         eta: f64,
     ) -> Result<(f64, f64, f64, f64, f64), EstimationError> {
@@ -94,7 +94,7 @@ impl<'a> RemlState<'a> {
     }
 
     #[inline]
-    fn cholesky_pivots_are_numerically_resolved(chol_diag: &Array1<f64>) -> bool {
+    pub(crate) fn cholesky_pivots_are_numerically_resolved(chol_diag: &Array1<f64>) -> bool {
         let mut min_pivot_sq = f64::INFINITY;
         let mut max_pivot_sq = 0.0_f64;
         for &pivot in chol_diag {
@@ -113,7 +113,7 @@ impl<'a> RemlState<'a> {
         min_pivot_sq > floor
     }
 
-    fn reduced_fisher_inverse_and_half_logdet(
+    pub(crate) fn reduced_fisher_inverse_and_half_logdet(
         fisher_reduced: &Array2<f64>,
     ) -> Result<(Array2<f64>, f64), EstimationError> {
         let r = fisher_reduced.nrows();
@@ -165,7 +165,7 @@ impl<'a> RemlState<'a> {
         Ok((k_reduced, half_log_det))
     }
 
-    fn fill_fisher_weight_derivative_arrays(
+    pub(crate) fn fill_fisher_weight_derivative_arrays(
         link: &InverseLink,
         eta: &Array1<f64>,
         w: &mut Array1<f64>,
@@ -350,7 +350,7 @@ impl<'a> RemlState<'a> {
 }
 
 impl FirthDenseOperator {
-    fn canonicalize_basis_column_signs(q_basis: &mut Array2<f64>) {
+    pub(crate) fn canonicalize_basis_column_signs(q_basis: &mut Array2<f64>) {
         for col in 0..q_basis.ncols() {
             let mut pivot_row = 0usize;
             let mut pivot_abs = 0.0_f64;
@@ -368,7 +368,7 @@ impl FirthDenseOperator {
         }
     }
 
-    fn identifiable_subspace_basis_from_gram(
+    pub(crate) fn identifiable_subspace_basis_from_gram(
         gram: &Array2<f64>,
     ) -> Result<(Array2<f64>, Array1<f64>), EstimationError> {
         let p = gram.nrows();
@@ -411,7 +411,7 @@ impl FirthDenseOperator {
     }
 
     #[inline]
-    fn trace_diag_product(diag: &Array1<f64>, matrix: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_diag_product(diag: &Array1<f64>, matrix: &Array2<f64>) -> f64 {
         assert_eq!(diag.len(), matrix.nrows());
         assert_eq!(matrix.nrows(), matrix.ncols());
         kahan_sum((0..diag.len()).map(|i| diag[i] * matrix[[i, i]]))
@@ -470,7 +470,7 @@ impl FirthDenseOperator {
         shift
     }
 
-    fn build_with_observation_weights_impl(
+    pub(crate) fn build_with_observation_weights_impl(
         link: &InverseLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
@@ -789,12 +789,12 @@ impl FirthDenseOperator {
     }
 
     #[inline]
-    fn left_scaled_xt(&self, scale: &Array1<f64>, mat: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn left_scaled_xt(&self, scale: &Array1<f64>, mat: &Array2<f64>) -> Array2<f64> {
         fast_ab(&self.x_dense_t, &(mat * &scale.view().insert_axis(Axis(1))))
     }
 
     #[inline]
-    fn apply_p_u_to_matrix(&self, a_u_reduced: &Array2<f64>, mat: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn apply_p_u_to_matrix(&self, a_u_reduced: &Array2<f64>, mat: &Array2<f64>) -> Array2<f64> {
         let mut out = RemlState::apply_hadamard_gram_to_matrix(
             &self.x_reduced,
             &self.k_reduced,
@@ -2249,7 +2249,7 @@ impl FirthDenseOperator {
     /// This mirrors the body of `apply_mtau_to_matrix` but accepts the
     /// x_tau/dot_k pieces directly, letting Primitive A reuse the same
     /// matrix-free Ṗ_τ applies without owning a `FirthTauPartialKernel`.
-    fn apply_mtau_from_reduced(
+    pub(crate) fn apply_mtau_from_reduced(
         &self,
         x_tau_reduced: &Array2<f64>,
         dot_k_reduced: &Array2<f64>,
@@ -2288,7 +2288,7 @@ impl FirthDenseOperator {
     ///   [(YBWᵀ) ⊙ (Y'B'W'ᵀ) v]_i= rowwise_bilinear(Y, B · (Wᵀdiag(v)W') · B'ᵀ, Y')_i,
     ///
     /// with S := row-wise reducedweighted Gram.
-    fn apply_p_ddot_ij(
+    pub(crate) fn apply_p_ddot_ij(
         &self,
         x_r: &Array2<f64>,
         x_ri: &Array2<f64>,
@@ -2536,7 +2536,7 @@ impl FirthDenseOperator {
     /// Hadamard-Gram pieces are evaluated column-wise via
     ///   ((Z M_A Wᵀ) ⊙ (Y M_B Xᵀ)) v row-i
     ///       = z_iᵀ M_A (Wᵀ diag(v) X) M_Bᵀ y_i.
-    fn apply_p_tau_v_to_matrix(
+    pub(crate) fn apply_p_tau_v_to_matrix(
         &self,
         kernel: &FirthTauBetaPartialKernel,
         mat: &Array2<f64>,
@@ -2704,7 +2704,7 @@ mod tests {
     use crate::types::StandardLink;
     use ndarray::{Array1, Array2, array};
 
-    fn build_logit_firth_dense_operator(
+    pub(crate) fn build_logit_firth_dense_operator(
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
@@ -2716,7 +2716,7 @@ mod tests {
         )
     }
 
-    fn build_weighted_logit_firth_dense_operator(
+    pub(crate) fn build_weighted_logit_firth_dense_operator(
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
         observation_weights: ndarray::ArrayView1<'_, f64>,
@@ -2729,23 +2729,23 @@ mod tests {
         )
     }
 
-    fn logisticweight(eta: f64) -> f64 {
+    pub(crate) fn logisticweight(eta: f64) -> f64 {
         logit_inverse_link_jet5(eta).d1
     }
 
-    fn firthphivalue(x: &Array2<f64>, beta: &Array1<f64>) -> f64 {
+    pub(crate) fn firthphivalue(x: &Array2<f64>, beta: &Array1<f64>) -> f64 {
         let eta = x.dot(beta);
         let op = build_logit_firth_dense_operator(x, &eta).expect("firth operator");
         op.jeffreys_logdet()
     }
 
-    fn firthgradphi(x: &Array2<f64>, beta: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn firthgradphi(x: &Array2<f64>, beta: &Array1<f64>) -> Array1<f64> {
         let eta = x.dot(beta);
         let op = build_logit_firth_dense_operator(x, &eta).expect("firth operator");
         op.jeffreys_beta_gradient()
     }
 
-    fn weighted_firthphivalue(
+    pub(crate) fn weighted_firthphivalue(
         x: &Array2<f64>,
         beta: &Array1<f64>,
         observation_weights: &Array1<f64>,
@@ -2757,7 +2757,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_reduced_fisher_logdet_is_finite_for_barely_pd_matrix() {
+    pub(crate) fn firth_reduced_fisher_logdet_is_finite_for_barely_pd_matrix() {
         let fisher = array![[16.0, 0.0], [0.0, 1e-15]];
         let (k_reduced, half_log_det) = RemlState::reduced_fisher_inverse_and_half_logdet(&fisher)
             .expect("barely positive-definite reduced fisher");
@@ -2782,7 +2782,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_logisticweight_derivatives_match_finite_difference() {
+    pub(crate) fn firth_logisticweight_derivatives_match_finite_difference() {
         // Validates op.w[i] (= jet.d1) and op.w1..w4[i] (= jet.d2..jet.d5)
         // against direct central finite differences of the logistic inverse
         // link pdf w(η) = μ(η)(1−μ(η)).
@@ -2844,7 +2844,7 @@ mod tests {
     }
 
     #[test]
-    fn weighted_firth_jeffreys_gradient_matches_finite_difference() {
+    pub(crate) fn weighted_firth_jeffreys_gradient_matches_finite_difference() {
         let x = array![
             [1.0, -0.7, 0.3],
             [1.0, -0.2, -0.4],
@@ -2885,7 +2885,7 @@ mod tests {
     // regression guard against the historical logit-pinned build.
     // ----------------------------------------------------------------------
 
-    fn build_link_firth_op(
+    pub(crate) fn build_link_firth_op(
         link: StandardLink,
         x: &Array2<f64>,
         beta: &Array1<f64>,
@@ -2900,11 +2900,11 @@ mod tests {
         .expect("link-general firth operator")
     }
 
-    fn link_firth_phi(link: StandardLink, x: &Array2<f64>, beta: &Array1<f64>) -> f64 {
+    pub(crate) fn link_firth_phi(link: StandardLink, x: &Array2<f64>, beta: &Array1<f64>) -> f64 {
         build_link_firth_op(link, x, beta).jeffreys_logdet()
     }
 
-    fn link_firth_grad(link: StandardLink, x: &Array2<f64>, beta: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn link_firth_grad(link: StandardLink, x: &Array2<f64>, beta: &Array1<f64>) -> Array1<f64> {
         build_link_firth_op(link, x, beta).jeffreys_beta_gradient()
     }
 
@@ -2912,7 +2912,7 @@ mod tests {
     /// numerical realization of the β-Hessian H_φ = ∂g/∂β. The Newton/REML
     /// path consumes H_φ (and its directional derivative) so this is the
     /// matrix the analytic curvature must reproduce.
-    fn numeric_firth_hessian(
+    pub(crate) fn numeric_firth_hessian(
         link: StandardLink,
         x: &Array2<f64>,
         beta: &Array1<f64>,
@@ -2934,7 +2934,7 @@ mod tests {
     }
 
     /// A fixed, well-conditioned full-rank design (deterministic, no RNG).
-    fn fixed_design_5x3() -> Array2<f64> {
+    pub(crate) fn fixed_design_5x3() -> Array2<f64> {
         array![
             [1.0, -1.10, 0.35],
             [1.0, -0.40, -0.65],
@@ -2945,7 +2945,7 @@ mod tests {
     }
 
     #[test]
-    fn link_general_logit_path_reproduces_historical_logit_build() {
+    pub(crate) fn link_general_logit_path_reproduces_historical_logit_build() {
         // Guard: the StandardLink::Logit path through the link-general builder
         // must be byte-identical to the historical logit-pinned operator for
         // Φ, the β-gradient, the PIRLS hat diagonal, and the cached weight
@@ -2994,7 +2994,7 @@ mod tests {
     }
 
     #[test]
-    fn link_general_probit_jeffreys_gradient_matches_finite_difference() {
+    pub(crate) fn link_general_probit_jeffreys_gradient_matches_finite_difference() {
         // PROBIT correctness: ∂Φ/∂β from `jeffreys_beta_gradient` must match a
         // central finite difference of Φ(β) on a well-conditioned design.
         let x = fixed_design_5x3();
@@ -3028,7 +3028,7 @@ mod tests {
     }
 
     #[test]
-    fn link_general_probit_hphi_direction_matches_finite_difference_of_hessian() {
+    pub(crate) fn link_general_probit_hphi_direction_matches_finite_difference_of_hessian() {
         // PROBIT Hessian: `hphi_direction(direction_from_deta(X·u))` is the
         // analytic directional derivative D H_φ[u] of the β-Hessian. Verify it
         // against the central finite difference of the (numerically realized)
@@ -3090,7 +3090,7 @@ mod tests {
     }
 
     #[test]
-    fn link_general_probit_jeffreys_finite_on_rank_deficient_design() {
+    pub(crate) fn link_general_probit_jeffreys_finite_on_rank_deficient_design() {
         // Identifiable-subspace behavior: a rank-deficient design (column 3 =
         // column 1 + column 2) must yield a finite Φ = ½ log|Uᵀ W U|, a finite
         // gradient, and agree with the explicit reduced two-column design.
@@ -3142,7 +3142,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_deficient_and_explicit_reduced_designs_share_same_jeffreys_objective() {
+    pub(crate) fn rank_deficient_and_explicit_reduced_designs_share_same_jeffreys_objective() {
         // Column 3 is exactly column 1 + column 2, so the original design is
         // rank-deficient but its identifiable subspace is represented exactly by
         // the explicit two-column reduced design below.
@@ -3202,7 +3202,7 @@ mod tests {
     }
 
     #[test]
-    fn full_rank_reparameterizations_share_same_jeffreys_objective() {
+    pub(crate) fn full_rank_reparameterizations_share_same_jeffreys_objective() {
         let x = array![[1.0, -1.2], [1.0, -0.4], [1.0, 0.1], [1.0, 0.7], [1.0, 1.3],];
         let basis = array![[1.4, -0.3], [0.6, 1.1]];
         let x_reparameterized = x.dot(&basis);
@@ -3259,7 +3259,7 @@ mod tests {
     }
 
     #[test]
-    fn full_rank_identifiable_basis_diagonalizes_design_metric() {
+    pub(crate) fn full_rank_identifiable_basis_diagonalizes_design_metric() {
         let x = array![[1.0, -1.2], [1.0, -0.4], [1.0, 0.1], [1.0, 0.7], [1.0, 1.3],];
         let beta = array![0.25, -0.5];
         let eta = x.dot(&beta);
@@ -3283,7 +3283,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_mixedsecond_direction_apply_is_symmetric_in_direction_order() {
+    pub(crate) fn firth_mixedsecond_direction_apply_is_symmetric_in_direction_order() {
         let x = array![
             [1.0, -1.0, 0.2],
             [1.0, -0.6, -0.3],
@@ -3323,7 +3323,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_direction_matrix_form_matches_apply_identity_form() {
+    pub(crate) fn firth_direction_matrix_form_matches_apply_identity_form() {
         let x = array![
             [1.0, -1.1, 0.2],
             [1.0, -0.6, -0.3],
@@ -3355,7 +3355,7 @@ mod tests {
     }
 
     #[test]
-    fn firthphi_tau_partial_matches_finite_difference_logdet() {
+    pub(crate) fn firthphi_tau_partial_matches_finite_difference_logdet() {
         let x = array![
             [1.0, -1.0, 0.2],
             [1.0, -0.6, -0.3],
@@ -3389,7 +3389,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_gphi_tau_matches_finite_differencegradphi() {
+    pub(crate) fn firth_gphi_tau_matches_finite_differencegradphi() {
         let x = array![
             [1.0, -1.0, 0.2],
             [1.0, -0.6, -0.3],
@@ -3428,7 +3428,7 @@ mod tests {
     /// Identity: ∂/∂τ_j [Φ_{τ_i}|β] = Φ_{τ_iτ_j}|β.
     /// Tolerance 1e-7 relative.
     #[test]
-    fn firthphi_tau_tau_pair_scalar_matches_finite_difference() {
+    pub(crate) fn firthphi_tau_tau_pair_scalar_matches_finite_difference() {
         let x = array![
             [1.0, -1.0, 0.2],
             [1.0, -0.6, -0.3],
@@ -3484,7 +3484,7 @@ mod tests {
     /// Identity: ∂/∂τ_j [(gΦ)_{τ_i}|β] = (gΦ)_{τ_iτ_j}|β.
     /// Tolerance 1e-7 relative max-abs.
     #[test]
-    fn firthphi_tau_tau_pair_g_vector_matches_finite_difference() {
+    pub(crate) fn firthphi_tau_tau_pair_g_vector_matches_finite_difference() {
         let x = array![
             [1.0, -1.0, 0.2],
             [1.0, -0.6, -0.3],
@@ -3564,7 +3564,7 @@ mod tests {
     /// Tolerance: 1e-7 relative max-abs (h chosen to balance truncation
     /// error at ~h² and evaluator roundoff at ~ε/h).
     #[test]
-    fn firthphi_tau_tau_partial_matches_finite_difference() {
+    pub(crate) fn firthphi_tau_tau_partial_matches_finite_difference() {
         let x = array![
             [1.0, -1.0, 0.2],
             [1.0, -0.6, -0.3],
@@ -3739,7 +3739,7 @@ mod tests {
     ///   3. Tolerance 1e-7 relative max-abs (h chosen to balance truncation
     ///      error at ~h² and evaluator roundoff at ~ε/h).
     #[test]
-    fn firth_d_beta_hphi_tau_partial_matches_finite_difference() {
+    pub(crate) fn firth_d_beta_hphi_tau_partial_matches_finite_difference() {
         let x = array![
             [1.0, -1.0, 0.2],
             [1.0, -0.6, -0.3],
@@ -3838,7 +3838,7 @@ mod tests {
     }
 
     #[test]
-    fn logisticweight_loses_positive_tail_mass() {
+    pub(crate) fn logisticweight_loses_positive_tail_mass() {
         let eta = 50.0_f64;
         let z = (-eta).exp();
         let stable = z / (1.0_f64 + z).powi(2);
@@ -3853,7 +3853,7 @@ mod tests {
     }
 
     #[test]
-    fn fisher_weight_jet5_logit_is_byte_identical_to_inverse_link_jet() {
+    pub(crate) fn fisher_weight_jet5_logit_is_byte_identical_to_inverse_link_jet() {
         // The generalized Firth weight jet for the canonical logit link must
         // reproduce the historical `logit_inverse_link_jet5().d1..d5` path
         // exactly so the released logit Firth fits stay numerically unchanged.
@@ -3877,11 +3877,11 @@ mod tests {
     }
 
     #[test]
-    fn fisher_weight_jet5_probit_matches_finite_difference() {
+    pub(crate) fn fisher_weight_jet5_probit_matches_finite_difference() {
         // Probit Bernoulli Fisher weight W(eta) = phi^2 / (Phi (1 - Phi)).
         // Validate the closed-form jet against central finite differences of
         // the reference scalar weight.
-        fn reference_probit_weight(eta: f64) -> f64 {
+        pub(crate) fn reference_probit_weight(eta: f64) -> f64 {
             let p = crate::probability::normal_cdf(eta);
             let q = 1.0 - p;
             let phi = crate::probability::normal_pdf(eta);
@@ -3916,7 +3916,7 @@ mod tests {
     }
 
     #[test]
-    fn fisher_weight_jet5_probit_saturates_to_zero_in_tails() {
+    pub(crate) fn fisher_weight_jet5_probit_saturates_to_zero_in_tails() {
         // Past the point where the denominator Phi(1-Phi) underflows to zero,
         // the weight and all derivatives are exactly zero (the saturated-tail
         // convention shared with the inverse-link jet).

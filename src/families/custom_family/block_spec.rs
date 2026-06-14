@@ -598,7 +598,7 @@ impl CoefficientGroupPrior {
         }
     }
 
-    fn validate(&self, context: &str) -> Result<(), String> {
+    pub(crate) fn validate(&self, context: &str) -> Result<(), String> {
         match *self {
             Self::Flat => Ok(()),
             Self::NormalLogPrecision { mean, sd } => {

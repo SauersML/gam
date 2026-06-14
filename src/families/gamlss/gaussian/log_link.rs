@@ -37,13 +37,13 @@ impl PoissonLogFamily {
 /// and the final return — exist in exactly one place.
 pub(crate) struct DiagonalIrlsRow {
     /// Weighted contribution to ℓ at this row.
-    log_lik_increment: f64,
+    pub(crate) log_lik_increment: f64,
     /// Unfloored observed Hessian weight (the driver applies `MIN_WEIGHT`).
-    observed_weight: f64,
+    pub(crate) observed_weight: f64,
     /// Per-row Newton step on the working response: `z = e + working_step`.
     /// Each family computes this with its own (score, denominator); the
     /// driver only handles the active-clamp / zero-weight guard.
-    working_step: f64,
+    pub(crate) working_step: f64,
 }
 
 /// Trait implemented by single-block log-link families that share the

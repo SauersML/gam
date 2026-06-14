@@ -2,7 +2,7 @@ use super::*;
 
 /// Maximum number of LM ridge-escalation attempts before declaring the per-row
 /// Hessian unfactorable.
-const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
+pub(crate) const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 
 impl SaeManifoldTerm {
 
@@ -231,7 +231,7 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    fn atom_affine_gauge_weights(
+    pub(crate) fn atom_affine_gauge_weights(
         &self,
         atom_idx: usize,
         rho: Option<&SaeManifoldRho>,
@@ -291,7 +291,7 @@ impl SaeManifoldTerm {
         /// against the flat reference for `d = 2` free/patch atoms (#1019
         /// free-chart arm — a contractible Euclidean patch admits a global
         /// polynomial flow basis, no hairy-ball obstruction).
-        enum ChartPlan {
+        pub(crate) enum ChartPlan {
             UnitSpeed(CanonicalChartTopology),
             TorusFlow { period: f64 },
             PatchFlow,
@@ -505,7 +505,7 @@ impl SaeManifoldTerm {
     /// Returns `Ok(true)` when the atom was canonicalized, `Ok(false)` on an
     /// honest skip (degenerate chart, basis not closed under the
     /// reparameterization, or per-row image drift above tolerance).
-    fn canonicalize_atom_unit_speed_chart(
+    pub(crate) fn canonicalize_atom_unit_speed_chart(
         &mut self,
         atom_idx: usize,
         topology: &crate::terms::sae_chart_canonicalization::CanonicalChartTopology,
@@ -601,7 +601,7 @@ impl SaeManifoldTerm {
     /// or already-canonical chart, only folded/non-improving flow candidates,
     /// basis not closed under the reparameterization, or per-row image drift
     /// above tolerance).
-    fn canonicalize_atom_torus_flow_chart(
+    pub(crate) fn canonicalize_atom_torus_flow_chart(
         &mut self,
         atom_idx: usize,
         period: f64,
@@ -689,7 +689,7 @@ impl SaeManifoldTerm {
     /// already-canonical chart, only folded/non-improving flow candidates,
     /// basis not closed under the reparameterization, or per-row image drift
     /// above tolerance).
-    fn canonicalize_atom_patch_flow_chart(&mut self, atom_idx: usize) -> Result<bool, String> {
+    pub(crate) fn canonicalize_atom_patch_flow_chart(&mut self, atom_idx: usize) -> Result<bool, String> {
         use crate::terms::sae_chart_canonicalization::{
             CHART_RECOMPOSITION_REL_TOL, patch_isometry_flow_reparameterization,
         };
@@ -772,7 +772,7 @@ impl SaeManifoldTerm {
     /// already-canonical chart, data inside the pole-band guard, only
     /// folded/non-improving flow candidates, basis not closed under the
     /// reparameterization, or per-row image drift above tolerance).
-    fn canonicalize_atom_sphere_flow_chart(&mut self, atom_idx: usize) -> Result<bool, String> {
+    pub(crate) fn canonicalize_atom_sphere_flow_chart(&mut self, atom_idx: usize) -> Result<bool, String> {
         use crate::terms::sae_chart_canonicalization::{
             CHART_RECOMPOSITION_REL_TOL, sphere_isometry_flow_reparameterization,
         };
@@ -898,7 +898,7 @@ impl SaeManifoldTerm {
     /// the full `(n·q + β)` coordinate so it can be quotiented out of the inner
     /// convergence measure and deflated in the outer gradient identically to a
     /// chart gauge.
-    fn decoder_beta_null_directions(
+    pub(crate) fn decoder_beta_null_directions(
         &self,
         penalized_gram_scale: f64,
     ) -> Result<Vec<Array1<f64>>, String> {
@@ -1200,7 +1200,7 @@ impl SaeManifoldTerm {
         }
     }
 
-    fn push_atom_row_gauge_deflations(
+    pub(crate) fn push_atom_row_gauge_deflations(
         &self,
         row_dirs: &mut Vec<Array1<f64>>,
         row: usize,
@@ -1257,7 +1257,7 @@ impl SaeManifoldTerm {
         }
     }
 
-    fn dense_step_gauge_vector_from_field(
+    pub(crate) fn dense_step_gauge_vector_from_field(
         &self,
         atom_idx: usize,
         field: ArrayView2<'_, f64>,
@@ -1464,7 +1464,7 @@ impl SaeManifoldTerm {
     /// `(gates, coords, decoder)` state against `target`, in the term's native
     /// `(n, p)` layout. The curvature-homotopy predictor (#1007) contracts this
     /// against `∂Φ/∂η` to form the data-fit half of `∂g_β/∂η`.
-    fn reconstruction_residual(
+    pub(crate) fn reconstruction_residual(
         &self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -1507,7 +1507,7 @@ impl SaeManifoldTerm {
     /// linear columns and on caller-managed atoms (no evaluator → no split).
     /// This is the η-independent derivative channel, so it is exact at any
     /// current `η`.
-    fn curvature_basis_eta_derivatives(&self) -> Result<Vec<Array2<f64>>, String> {
+    pub(crate) fn curvature_basis_eta_derivatives(&self) -> Result<Vec<Array2<f64>>, String> {
         let n = self.n_obs();
         let mut out = Vec::with_capacity(self.k_atoms());
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
@@ -1678,7 +1678,7 @@ impl SaeManifoldTerm {
     /// not the (still data-adjacent) coordinates, and a coordinate re-seed
     /// would discard exactly the warm state that makes the second chance
     /// cheap.
-    fn reseed_collapsed_atom_logits(&mut self, atom: usize) {
+    pub(crate) fn reseed_collapsed_atom_logits(&mut self, atom: usize) {
         let n = self.n_obs();
         match self.assignment.mode {
             AssignmentMode::Softmax { .. } => {
@@ -1718,7 +1718,7 @@ impl SaeManifoldTerm {
         }
     }
 
-    fn apply_newton_step_impl(
+    pub(crate) fn apply_newton_step_impl(
         &mut self,
         delta_ext_coord: ArrayView1<'_, f64>,
         delta_beta: ArrayView1<'_, f64>,
@@ -1874,7 +1874,7 @@ impl SaeManifoldTerm {
         self.set_flat_beta(beta.view())
     }
 
-    fn solve_fixed_decoder_row_step(
+    pub(crate) fn solve_fixed_decoder_row_step(
         h: ArrayView2<'_, f64>,
         g: ArrayView1<'_, f64>,
         base_ridge: f64,
@@ -1910,7 +1910,7 @@ impl SaeManifoldTerm {
         ))
     }
 
-    fn fixed_decoder_step_from_rows(
+    pub(crate) fn fixed_decoder_step_from_rows(
         sys: &ArrowSchurSystem,
         ridge_ext_coord: f64,
     ) -> Result<Array1<f64>, String> {
@@ -1951,7 +1951,7 @@ impl SaeManifoldTerm {
     /// Pure attention: the order is consumed only to decide *which row is looked
     /// at first*; each visited row runs the identical unmodified per-row
     /// objective, so this touches no loss / criterion / penalty.
-    fn enrichment_visit_order(&self) -> Vec<usize> {
+    pub(crate) fn enrichment_visit_order(&self) -> Vec<usize> {
         let n = self.n_obs();
         // No installed metric ⇒ the measure is exactly uniform and the
         // systematic draw reduces to plain index order (documented below), so
@@ -2672,7 +2672,7 @@ impl SaeManifoldTerm {
 
     /// Allocate one zero `(M_k × M_k)` Gram accumulator per atom for the
     /// chunk-aware decoder identifiability audit.
-    fn empty_decoder_gram_accumulator(&self) -> Vec<Array2<f64>> {
+    pub(crate) fn empty_decoder_gram_accumulator(&self) -> Vec<Array2<f64>> {
         self.atoms
             .iter()
             .map(|atom| {
@@ -2692,7 +2692,7 @@ impl SaeManifoldTerm {
     /// structure, so it adds no rank information), so accumulating `Φ` weighted
     /// by the per-row assignment exactly reproduces the data-fit decoder block
     /// curvature `G_k` that `assemble_arrow_schur` installs.
-    fn accumulate_decoder_gram(&self, grams: &mut [Array2<f64>]) {
+    pub(crate) fn accumulate_decoder_gram(&self, grams: &mut [Array2<f64>]) {
         let n = self.n_obs();
         let assignments = self.assignment.assignments();
         // Each atom's Gram `G_k = Φ_kᵀ diag(a_k²) Φ_k` is an independent
@@ -2807,7 +2807,7 @@ impl SaeManifoldTerm {
 
     /// Decide rank-deficiency of each accumulated decoder Gram and surface the
     /// same fatal / INFO contract as the former pivoted-QR audit.
-    fn finalize_decoder_identifiability_audit(
+    pub(crate) fn finalize_decoder_identifiability_audit(
         &self,
         grams: &[Array2<f64>],
         n_total: usize,
@@ -3311,7 +3311,7 @@ impl SaeManifoldTerm {
     /// `rhs_acc_chunk = +Σ_i H_βt^(i)(H_tt^(i))⁻¹g_t^(i)` sum across a full pass
     /// to `H_ββ − Σ_all_i (…)` and `Σ_all_i (…)` respectively, with the global
     /// β ridge added exactly once by the caller. No per-chunk ridge is applied.
-    fn accumulate_chunk_reduced_schur(
+    pub(crate) fn accumulate_chunk_reduced_schur(
         sys: &ArrowSchurSystem,
         ridge_ext_coord: f64,
         options: &ArrowSolveOptions,
@@ -3345,7 +3345,7 @@ impl SaeManifoldTerm {
     /// current β, re-materializing each chunk from a fresh re-seed via
     /// `chunk_init`. The β-penalty terms are scaled by the chunk fraction so the
     /// global smoothness penalty is counted once across the pass.
-    fn streaming_loss<F>(
+    pub(crate) fn streaming_loss<F>(
         &self,
         chunk_ranges: &[(usize, usize)],
         rho: &SaeManifoldRho,
@@ -3384,7 +3384,7 @@ impl SaeManifoldTerm {
         })
     }
 
-    fn streaming_loss_and_penalized_objective_total<F>(
+    pub(crate) fn streaming_loss_and_penalized_objective_total<F>(
         &self,
         chunk_ranges: &[(usize, usize)],
         rho: &SaeManifoldRho,

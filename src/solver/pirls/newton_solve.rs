@@ -5,14 +5,14 @@
 
 use super::*;
 
-const DENSE_OUTER_MAX_P: usize = 1024;
+pub(crate) const DENSE_OUTER_MAX_P: usize = 1024;
 
 
 // Estimated FLOP threshold below which spawning rayon workers for the dense
 // outer-product path costs more than the work itself. Calibrated to cover
 // rayon's per-task overhead (microseconds) plus the cost of zeroing one dense
 // buffer per worker; below this, everything stays on the calling thread.
-const DENSE_OUTER_PARALLEL_FLOP_THRESHOLD: u64 = 100_000;
+pub(crate) const DENSE_OUTER_PARALLEL_FLOP_THRESHOLD: u64 = 100_000;
 
 
 /// Backend selection for sparse-design XᵀWX assembly.
@@ -27,7 +27,7 @@ const DENSE_OUTER_PARALLEL_FLOP_THRESHOLD: u64 = 100_000;
 ///
 /// * **Sparse SpGEMM** (large p): faer's symbolic + numeric pipeline. Avoids
 ///   the dense p×p buffer when it would no longer be cache-resident.
-enum XtWxBackend {
+pub(crate) enum XtWxBackend {
     Dense(DenseOuterState),
     Sparse(SparseSpGemmState),
 }
@@ -44,9 +44,9 @@ enum XtWxBackend {
 /// `thread_buffers` is bounded at exactly `rayon::current_num_threads()` and
 /// reused across PIRLS iterations, so allocation cost is amortized across the
 /// entire fit rather than paid per call.
-struct DenseOuterState {
-    xtwx_dense: Array2<f64>,
-    thread_buffers: Vec<Array2<f64>>,
+pub(crate) struct DenseOuterState {
+    pub(crate) xtwx_dense: Array2<f64>,
+    pub(crate) thread_buffers: Vec<Array2<f64>>,
 }
 
 
@@ -65,34 +65,34 @@ struct DenseOuterState {
 /// materializes the current working-weight Gram factors, while Firth stores
 /// case-weight roots so reduced designs can later be mapped back with
 /// reciprocal roots.
-struct SparseSpGemmState {
-    wxvalues: Vec<f64>,
-    wx_tvalues: Vec<f64>,
-    sqrt_weights: Vec<f64>,
-    info: SparseMatMulInfo,
-    scratch: MemBuffer,
-    par: Par,
+pub(crate) struct SparseSpGemmState {
+    pub(crate) wxvalues: Vec<f64>,
+    pub(crate) wx_tvalues: Vec<f64>,
+    pub(crate) sqrt_weights: Vec<f64>,
+    pub(crate) info: SparseMatMulInfo,
+    pub(crate) scratch: MemBuffer,
+    pub(crate) par: Par,
 }
 
 
 pub(crate) struct SparseXtWxCache {
-    xtwx_symbolic: SymbolicSparseColMat<usize>,
-    xtwxvalues: Vec<f64>,
-    nrows: usize,
-    ncols: usize,
-    nnz: usize,
-    x_col_ptr: Vec<usize>,
-    xrow_idx: Vec<usize>,
+    pub(crate) xtwx_symbolic: SymbolicSparseColMat<usize>,
+    pub(crate) xtwxvalues: Vec<f64>,
+    pub(crate) nrows: usize,
+    pub(crate) ncols: usize,
+    pub(crate) nnz: usize,
+    pub(crate) x_col_ptr: Vec<usize>,
+    pub(crate) xrow_idx: Vec<usize>,
     /// CSC of Xᵀ. In CSC, column i of Xᵀ stores the nonzeros of row i of X,
     /// so this doubles as a CSR view of X for row-by-row access in the
     /// dense-outer path.
-    x_t_csc: SparseColMat<usize, f64>,
-    backend: XtWxBackend,
+    pub(crate) x_t_csc: SparseColMat<usize, f64>,
+    pub(crate) backend: XtWxBackend,
 }
 
 
 impl SparseXtWxCache {
-    fn new(x: &SparseColMat<usize, f64>) -> Result<Self, EstimationError> {
+    pub(crate) fn new(x: &SparseColMat<usize, f64>) -> Result<Self, EstimationError> {
         // For X^T X where X is CSC: X^T is a SparseRowMat, which we need to
         // convert to CSC format for the matmul API.
         let x_t_csc =
@@ -142,7 +142,7 @@ impl SparseXtWxCache {
         })
     }
 
-    fn matches(&self, x: &SparseColMat<usize, f64>) -> bool {
+    pub(crate) fn matches(&self, x: &SparseColMat<usize, f64>) -> bool {
         if self.nrows != x.nrows() || self.ncols != x.ncols() || self.nnz != x.val().len() {
             return false;
         }
@@ -150,7 +150,7 @@ impl SparseXtWxCache {
         self.x_col_ptr.as_slice() == sym.col_ptr() && self.xrow_idx.as_slice() == sym.row_idx()
     }
 
-    fn compute_numeric(
+    pub(crate) fn compute_numeric(
         &mut self,
         x: &SparseColMat<usize, f64>,
         weights: &Array1<f64>,
@@ -214,7 +214,7 @@ impl DenseOuterState {
     /// reused across calls); the workers are summed into `xtwx_dense` in
     /// place, preserving its allocation rather than replacing it with a
     /// freshly-allocated reduction result.
-    fn compute(
+    pub(crate) fn compute(
         &mut self,
         x_t: SparseColMatRef<'_, usize, f64>,
         weights: &Array1<f64>,
@@ -292,7 +292,7 @@ impl DenseOuterState {
 impl SparseSpGemmState {
     /// Compute XᵀWX into the symbolic-pattern array `xtwxvalues` via faer's
     /// sparse-sparse matmul: XᵀWX = (√W·X)ᵀ · (√W·X).
-    fn compute(
+    pub(crate) fn compute(
         &mut self,
         x: &SparseColMat<usize, f64>,
         x_t: SparseColMatRef<'_, usize, f64>,
@@ -373,7 +373,7 @@ impl SparseSpGemmState {
 /// per outer-product step — cheaper than ndarray's `row_mut(j).as_slice_mut()`
 /// because it skips the per-call stride-validation and contiguity check.
 #[inline]
-fn accumulate_outer_upper(
+pub(crate) fn accumulate_outer_upper(
     acc: &mut Array2<f64>,
     x_t: SparseColMatRef<'_, usize, f64>,
     weights: &Array1<f64>,
@@ -465,7 +465,7 @@ pub(super) fn compute_jeffreys_pirls_diagnostics(
 }
 
 
-fn ensure_positive_definitewithridge(
+pub(crate) fn ensure_positive_definitewithridge(
     hess: &mut Array2<f64>,
     label: &str,
 ) -> Result<f64, EstimationError> {
@@ -790,9 +790,9 @@ pub(super) fn project_coefficients_to_lower_bounds(
 /// time coefficients pinned around 1e-6) from being treated as interior. Both
 /// the projected-gradient norm and the active-set classifier must use the same
 /// band so KKT diagnostics and the working set agree.
-const ACTIVE_BOUND_REL_TOL: f64 = 1e-6;
+pub(crate) const ACTIVE_BOUND_REL_TOL: f64 = 1e-6;
 
-const ACTIVE_BOUND_ABS_TOL: f64 = 1e-10;
+pub(crate) const ACTIVE_BOUND_ABS_TOL: f64 = 1e-10;
 
 
 pub(super) fn projected_gradient_norm(
@@ -1002,7 +1002,7 @@ pub(super) fn constrained_stationarity_norm(
 }
 
 
-fn count_dense_upper_nnz(matrix: &Array2<f64>, tol: f64) -> usize {
+pub(crate) fn count_dense_upper_nnz(matrix: &Array2<f64>, tol: f64) -> usize {
     let p = matrix.nrows().min(matrix.ncols());
     let mut nnz = 0usize;
     for col in 0..p {
@@ -1016,7 +1016,7 @@ fn count_dense_upper_nnz(matrix: &Array2<f64>, tol: f64) -> usize {
 }
 
 
-fn estimate_sparse_native_decision(
+pub(crate) fn estimate_sparse_native_decision(
     workspace: &mut PirlsWorkspace,
     x_original: &DesignMatrix,
     s_lambda: &Array2<f64>,
@@ -1228,7 +1228,7 @@ where
 /// off-diagonal magnitudes are added to the radius of both endpoints, so
 /// upper-only, lower-only, and full-symmetric storage all yield a valid (and at
 /// worst conservative) lower bound — it never over-claims positive-definiteness.
-fn gershgorin_min_eig_lower_bound(h: &SparseColMat<usize, f64>) -> (f64, f64) {
+pub(crate) fn gershgorin_min_eig_lower_bound(h: &SparseColMat<usize, f64>) -> (f64, f64) {
     let n = h.ncols();
     let mut diag = vec![0.0_f64; n];
     let mut radius = vec![0.0_f64; n];
@@ -1263,7 +1263,7 @@ fn gershgorin_min_eig_lower_bound(h: &SparseColMat<usize, f64>) -> (f64, f64) {
 }
 
 
-fn solve_subsystem_direction(
+pub(crate) fn solve_subsystem_direction(
     h_sub: ndarray::ArrayView2<f64>,
     g_sub: ndarray::ArrayView1<f64>,
     out: &mut Array1<f64>,
@@ -1474,7 +1474,7 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
     // because `boundary_hit_step_fraction` requires `step < current_step_limit`
     // strictly), so the leaving rule is the only place anti-cycling has to
     // be enforced.
-    const BLANDS_RULE_GRACE: usize = 2;
+    pub(crate) const BLANDS_RULE_GRACE: usize = 2;
     let blands_threshold = BLANDS_RULE_GRACE * (p + 1);
     let max_iters = 8 * (p + 1);
     let mut d_free = Array1::<f64>::zeros(p);

@@ -14,7 +14,7 @@ pub(super) fn standard_inverse_link_jet(
 
 
 #[inline]
-fn bernoulli_logit_geometry_from_jet(
+pub(crate) fn bernoulli_logit_geometry_from_jet(
     eta_raw: f64,
     eta_used: f64,
     y: f64,
@@ -59,7 +59,7 @@ fn bernoulli_logit_geometry_from_jet(
 /// stored separately in `PirlsResult::solve_c_array` / `solve_d_array`
 /// and consumed directly by the REML/LAML exact-derivative code.
 #[inline]
-fn bernoulli_geometry_from_jet(
+pub(crate) fn bernoulli_geometry_from_jet(
     eta_raw: f64,
     eta_used: f64,
     y: f64,
@@ -99,7 +99,7 @@ fn bernoulli_geometry_from_jet(
 
 
 #[inline]
-fn bernoulli_exact_working_response(eta: f64, y: f64, mu: f64, dmu_deta: f64) -> f64 {
+pub(crate) fn bernoulli_exact_working_response(eta: f64, y: f64, mu: f64, dmu_deta: f64) -> f64 {
     // Preserve the exact IRLS score carrier W(z-eta) = y-mu whenever the link
     // jet is finite. Numerical conditioning belongs in the linear solve, not in
     // the Bernoulli likelihood geometry.
@@ -114,7 +114,7 @@ fn bernoulli_exact_working_response(eta: f64, y: f64, mu: f64, dmu_deta: f64) ->
 
 
 #[inline]
-fn write_identityworking_state(
+pub(crate) fn write_identityworking_state(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
@@ -141,7 +141,7 @@ fn write_identityworking_state(
 /// `V(mu) = mu`, so the Fisher weight is `prior * mu` and the canonical-link
 /// curvature buffers both equal the working weight.
 #[inline]
-fn write_poisson_log_working_state(
+pub(crate) fn write_poisson_log_working_state(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
@@ -177,7 +177,7 @@ fn write_poisson_log_working_state(
 /// prior/sample weight scaled by the fixed Gamma shape, independent of `eta`;
 /// the weight is therefore written unfloored and the curvature buffers vanish.
 #[inline]
-fn write_gamma_log_working_state(
+pub(crate) fn write_gamma_log_working_state(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
@@ -212,7 +212,7 @@ pub const BETA_MU_EPS: f64 = 1.0e-12;
 
 
 #[inline]
-fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
+pub(crate) fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
     // Match the 1e-300 MIN_DEVIANCE floor used by the REML deviance path:
     // smaller positive mu values are below a non-degenerate f64 likelihood
     // contribution, but flooring here keeps mu^(2-p) away from underflow.
@@ -221,18 +221,18 @@ fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
 
 
 #[inline]
-fn valid_negbin_theta(theta: f64) -> bool {
+pub(crate) fn valid_negbin_theta(theta: f64) -> bool {
     theta.is_finite() && theta > 0.0
 }
 
 
 #[inline]
-fn valid_count_response(y: f64) -> bool {
+pub(crate) fn valid_count_response(y: f64) -> bool {
     y.is_finite() && y >= 0.0 && (y - y.round()).abs() <= 1e-9
 }
 
 
-fn validate_count_responses(
+pub(crate) fn validate_count_responses(
     y: &ArrayView1<'_, f64>,
     priorweights: &ArrayView1<'_, f64>,
     family: &str,
@@ -249,18 +249,18 @@ fn validate_count_responses(
 
 
 #[inline]
-fn valid_beta_phi(phi: f64) -> bool {
+pub(crate) fn valid_beta_phi(phi: f64) -> bool {
     phi.is_finite() && phi > 0.0
 }
 
 
 #[inline]
-fn valid_beta_response(y: f64) -> bool {
+pub(crate) fn valid_beta_response(y: f64) -> bool {
     y.is_finite() && y > 0.0 && y < 1.0
 }
 
 
-fn validate_beta_responses(
+pub(crate) fn validate_beta_responses(
     y: &ArrayView1<'_, f64>,
     priorweights: &ArrayView1<'_, f64>,
 ) -> Result<(), EstimationError> {
@@ -276,12 +276,12 @@ fn validate_beta_responses(
 
 
 #[inline]
-fn valid_tweedie_response(y: f64) -> bool {
+pub(crate) fn valid_tweedie_response(y: f64) -> bool {
     y.is_finite() && y >= 0.0
 }
 
 
-fn validate_tweedie_responses(
+pub(crate) fn validate_tweedie_responses(
     y: &ArrayView1<'_, f64>,
     priorweights: &ArrayView1<'_, f64>,
 ) -> Result<(), EstimationError> {
@@ -297,13 +297,13 @@ fn validate_tweedie_responses(
 
 
 #[inline]
-fn safe_beta_mu(mu: f64) -> f64 {
+pub(crate) fn safe_beta_mu(mu: f64) -> f64 {
     mu.clamp(BETA_MU_EPS, 1.0 - BETA_MU_EPS)
 }
 
 
 #[inline]
-fn trigamma(mut x: f64) -> f64 {
+pub(crate) fn trigamma(mut x: f64) -> f64 {
     if !(x.is_finite() && x > 0.0) {
         return f64::NAN;
     }
@@ -321,7 +321,7 @@ fn trigamma(mut x: f64) -> f64 {
 
 
 #[inline]
-fn polygamma2(mut x: f64) -> f64 {
+pub(crate) fn polygamma2(mut x: f64) -> f64 {
     if !(x.is_finite() && x > 0.0) {
         return f64::NAN;
     }
@@ -340,7 +340,7 @@ fn polygamma2(mut x: f64) -> f64 {
 
 
 #[inline]
-fn polygamma3(mut x: f64) -> f64 {
+pub(crate) fn polygamma3(mut x: f64) -> f64 {
     if !(x.is_finite() && x > 0.0) {
         return f64::NAN;
     }
@@ -360,7 +360,7 @@ fn polygamma3(mut x: f64) -> f64 {
 
 
 #[inline]
-fn beta_logit_working_curvature_eta_derivatives(
+pub(crate) fn beta_logit_working_curvature_eta_derivatives(
     prior_weight: f64,
     phi: f64,
     mu: f64,
@@ -392,7 +392,7 @@ fn beta_logit_working_curvature_eta_derivatives(
 /// be zeroed when `eta` is clamped because the fractional power makes the local
 /// jet unreliable there. Parameter ranges and responses are validated up front.
 #[inline]
-fn write_tweedie_log_working_state(
+pub(crate) fn write_tweedie_log_working_state(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
@@ -446,7 +446,7 @@ fn write_tweedie_log_working_state(
 /// `mu * theta / (theta + mu)`, written in the numerically-stable branch form
 /// that avoids cancellation for very small or very large `mu / theta`.
 #[inline]
-fn write_negative_binomial_log_working_state(
+pub(crate) fn write_negative_binomial_log_working_state(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
@@ -484,7 +484,7 @@ fn write_negative_binomial_log_working_state(
 
 /// Working state for Beta(mu * phi, (1 - mu) * phi) with a logit link.
 #[inline]
-fn write_beta_logit_working_state(
+pub(crate) fn write_beta_logit_working_state(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,

@@ -79,13 +79,13 @@ pub struct DenseSpectralOperator {
     pub(crate) w_factor: Array2<f64>,
     /// Precomputed kernel K_ab = 1 / (r_a r_b) for exact H⁻¹ cross traces in
     /// the eigenbasis.
-    hinv_cross_kernel: Array2<f64>,
+    pub(crate) hinv_cross_kernel: Array2<f64>,
     /// Precomputed: G = U diag(1/√(√(σ² + 4ε²))) for logdet gradient traces.
     /// trace(G_ε(H) A) = Σ (AG ⊙ G) where G_ε uses φ'(σ) = 1/√(σ² + 4ε²).
     pub(crate) g_factor: Array2<f64>,
     /// Precomputed divided-difference kernel Γ for exact logdet Hessian cross traces
     /// in the eigenbasis.
-    logdet_hessian_kernel: Array2<f64>,
+    pub(crate) logdet_hessian_kernel: Array2<f64>,
     /// Precomputed log-determinant: Σ ln(r_ε(σ_i)).
     pub(crate) cached_logdet: f64,
     pub(crate) projected_factor_cache: ProjectedFactorCache,
@@ -390,12 +390,12 @@ impl DenseSpectralOperator {
 pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
     use std::sync::Mutex;
     pub(crate) struct Repeat {
-        signature: String,
-        count: u64,
-        total: f64,
-        min: f64,
-        max: f64,
-        next_heartbeat: u64,
+        pub(crate) signature: String,
+        pub(crate) count: u64,
+        pub(crate) total: f64,
+        pub(crate) min: f64,
+        pub(crate) max: f64,
+        pub(crate) next_heartbeat: u64,
     }
     pub(crate) static REPEAT: Mutex<Option<Repeat>> = Mutex::new(None);
 

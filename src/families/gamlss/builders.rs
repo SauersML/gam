@@ -6,9 +6,9 @@ use super::*;
 
 #[derive(Clone, Copy)]
 pub(crate) struct GamlssLambdaLayout {
-    k_mean: usize,
-    k_noise: usize,
-    kwiggle: usize,
+    pub(crate) k_mean: usize,
+    pub(crate) k_noise: usize,
+    pub(crate) kwiggle: usize,
 }
 
 impl GamlssLambdaLayout {
@@ -81,9 +81,9 @@ impl GamlssLambdaLayout {
 
 #[derive(Clone, Copy)]
 pub(crate) struct GamlssBetaLayout {
-    pt: usize,
-    pls: usize,
-    pw: usize,
+    pub(crate) pt: usize,
+    pub(crate) pls: usize,
+    pub(crate) pw: usize,
 }
 
 impl GamlssBetaLayout {
@@ -1858,12 +1858,12 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
 }
 
 pub(crate) struct GaussianLocationScaleTermBuilder {
-    y: Array1<f64>,
-    weights: Array1<f64>,
-    meanspec: TermCollectionSpec,
-    noisespec: TermCollectionSpec,
-    mean_offset: Array1<f64>,
-    noise_offset: Array1<f64>,
+    pub(crate) y: Array1<f64>,
+    pub(crate) weights: Array1<f64>,
+    pub(crate) meanspec: TermCollectionSpec,
+    pub(crate) noisespec: TermCollectionSpec,
+    pub(crate) mean_offset: Array1<f64>,
+    pub(crate) noise_offset: Array1<f64>,
 }
 
 impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
@@ -1982,15 +1982,15 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
 }
 
 pub(crate) struct GaussianLocationScaleWiggleTermBuilder {
-    y: Array1<f64>,
-    weights: Array1<f64>,
-    meanspec: TermCollectionSpec,
-    noisespec: TermCollectionSpec,
-    mean_offset: Array1<f64>,
-    noise_offset: Array1<f64>,
-    wiggle_knots: Array1<f64>,
-    wiggle_degree: usize,
-    wiggle_block: ParameterBlockInput,
+    pub(crate) y: Array1<f64>,
+    pub(crate) weights: Array1<f64>,
+    pub(crate) meanspec: TermCollectionSpec,
+    pub(crate) noisespec: TermCollectionSpec,
+    pub(crate) mean_offset: Array1<f64>,
+    pub(crate) noise_offset: Array1<f64>,
+    pub(crate) wiggle_knots: Array1<f64>,
+    pub(crate) wiggle_degree: usize,
+    pub(crate) wiggle_block: ParameterBlockInput,
 }
 
 impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
@@ -2129,13 +2129,13 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
 }
 
 pub(crate) struct BinomialLocationScaleTermBuilder {
-    y: Array1<f64>,
-    weights: Array1<f64>,
-    link_kind: InverseLink,
-    meanspec: TermCollectionSpec,
-    noisespec: TermCollectionSpec,
-    mean_offset: Array1<f64>,
-    noise_offset: Array1<f64>,
+    pub(crate) y: Array1<f64>,
+    pub(crate) weights: Array1<f64>,
+    pub(crate) link_kind: InverseLink,
+    pub(crate) meanspec: TermCollectionSpec,
+    pub(crate) noisespec: TermCollectionSpec,
+    pub(crate) mean_offset: Array1<f64>,
+    pub(crate) noise_offset: Array1<f64>,
 }
 
 impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
@@ -2247,16 +2247,16 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
 }
 
 pub(crate) struct BinomialLocationScaleWiggleTermBuilder {
-    y: Array1<f64>,
-    weights: Array1<f64>,
-    link_kind: InverseLink,
-    meanspec: TermCollectionSpec,
-    noisespec: TermCollectionSpec,
-    mean_offset: Array1<f64>,
-    noise_offset: Array1<f64>,
-    wiggle_knots: Array1<f64>,
-    wiggle_degree: usize,
-    wiggle_block: ParameterBlockInput,
+    pub(crate) y: Array1<f64>,
+    pub(crate) weights: Array1<f64>,
+    pub(crate) link_kind: InverseLink,
+    pub(crate) meanspec: TermCollectionSpec,
+    pub(crate) noisespec: TermCollectionSpec,
+    pub(crate) mean_offset: Array1<f64>,
+    pub(crate) noise_offset: Array1<f64>,
+    pub(crate) wiggle_knots: Array1<f64>,
+    pub(crate) wiggle_degree: usize,
+    pub(crate) wiggle_block: ParameterBlockInput,
 }
 
 impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
@@ -2633,7 +2633,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BinomialMeanWiggleTermFitResult, String> {
-    const RHO_BOUND: f64 = 12.0;
+    pub(crate) const RHO_BOUND: f64 = 12.0;
 
     validate_term_weights(
         data,
@@ -2814,14 +2814,14 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let mut outer_options = options.clone();
     outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
-    struct MeanWiggleOuterState {
-        warm_cache: Option<crate::custom_family::CustomFamilyWarmStart>,
-        last_eval: Option<(
+    pub(crate) struct MeanWiggleOuterState {
+        pub(crate) warm_cache: Option<crate::custom_family::CustomFamilyWarmStart>,
+        pub(crate) last_eval: Option<(
             Array1<f64>,
             f64,
             Array1<f64>,
-            crate::solver::outer_strategy::HessianResult,
-            crate::custom_family::CustomFamilyWarmStart,
+            pub(crate) crate::solver::outer_strategy::HessianResult,
+            pub(crate) crate::custom_family::CustomFamilyWarmStart,
         )>,
     }
 

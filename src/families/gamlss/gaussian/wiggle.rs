@@ -5,29 +5,29 @@
 use super::*;
 
 pub(crate) struct GaussianLocationScaleWiggleGeometry {
-    basis: Array2<f64>,
-    basis_d1: Array2<f64>,
-    basis_d2: Array2<f64>,
-    basis_d3: Array2<f64>,
-    dq_dq0: Array1<f64>,
-    d2q_dq02: Array1<f64>,
-    d3q_dq03: Array1<f64>,
-    d4q_dq04: Array1<f64>,
+    pub(crate) basis: Array2<f64>,
+    pub(crate) basis_d1: Array2<f64>,
+    pub(crate) basis_d2: Array2<f64>,
+    pub(crate) basis_d3: Array2<f64>,
+    pub(crate) dq_dq0: Array1<f64>,
+    pub(crate) d2q_dq02: Array1<f64>,
+    pub(crate) d3q_dq03: Array1<f64>,
+    pub(crate) d4q_dq04: Array1<f64>,
 }
 
 /// Per-row pieces of the 3-block Gaussian location-scale-wiggle joint
 /// Hessian. Both the dense path and the matrix-free workspace share these
 /// row coefficients; only the assembly differs.
 pub(crate) struct GaussianLocationScaleWiggleHessianRowPieces {
-    coeff_mm: Array1<f64>,
-    coeff_ml: Array1<f64>,
-    coeff_ll: Array1<f64>,
-    coeff_mw_b: Array1<f64>,
-    coeff_mw_d: Array1<f64>,
-    coeff_lw_b: Array1<f64>,
-    coeff_ww: Array1<f64>,
-    basis: Array2<f64>,
-    basis_d1: Array2<f64>,
+    pub(crate) coeff_mm: Array1<f64>,
+    pub(crate) coeff_ml: Array1<f64>,
+    pub(crate) coeff_ll: Array1<f64>,
+    pub(crate) coeff_mw_b: Array1<f64>,
+    pub(crate) coeff_mw_d: Array1<f64>,
+    pub(crate) coeff_lw_b: Array1<f64>,
+    pub(crate) coeff_ww: Array1<f64>,
+    pub(crate) basis: Array2<f64>,
+    pub(crate) basis_d1: Array2<f64>,
 }
 
 impl GaussianLocationScaleWiggleHessianRowPieces {
@@ -61,8 +61,8 @@ pub struct GaussianLocationScaleWiggleFamily {
     /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
     /// when the family is built without an explicit policy.
     pub policy: crate::resource::ResourcePolicy,
-    cached_row_scalars:
-        std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
+    pub(crate) cached_row_scalars:
+        pub(crate) std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
 
 impl Clone for GaussianLocationScaleWiggleFamily {
@@ -314,38 +314,38 @@ impl GaussianLocationScaleWiggleFamily {
 /// `_from_designs` assemblies. Holds exactly the quantities both consumers
 /// read downstream of the (identical) coefficient computation.
 pub(crate) struct GlsWiggleSecondDirCoeffs {
-    coeff_mm_uv: Array1<f64>,
-    coeff_ml_uv: Array1<f64>,
-    coeff_ll_uv: Array1<f64>,
-    a_u: Array1<f64>,
-    a_v: Array1<f64>,
-    a_uv: Array1<f64>,
-    c_u: Array1<f64>,
-    c_v: Array1<f64>,
-    c_uv: Array1<f64>,
-    l_u: Array1<f64>,
-    l_v: Array1<f64>,
-    l_uv: Array1<f64>,
-    dw_u: Array1<f64>,
-    dw_v: Array1<f64>,
-    dw_uv: Array1<f64>,
+    pub(crate) coeff_mm_uv: Array1<f64>,
+    pub(crate) coeff_ml_uv: Array1<f64>,
+    pub(crate) coeff_ll_uv: Array1<f64>,
+    pub(crate) a_u: Array1<f64>,
+    pub(crate) a_v: Array1<f64>,
+    pub(crate) a_uv: Array1<f64>,
+    pub(crate) c_u: Array1<f64>,
+    pub(crate) c_v: Array1<f64>,
+    pub(crate) c_uv: Array1<f64>,
+    pub(crate) l_u: Array1<f64>,
+    pub(crate) l_v: Array1<f64>,
+    pub(crate) l_uv: Array1<f64>,
+    pub(crate) dw_u: Array1<f64>,
+    pub(crate) dw_v: Array1<f64>,
+    pub(crate) dw_uv: Array1<f64>,
 }
 
 /// The two probe directions resolved to row space for the GLS Wiggle joint
 /// second directional derivative: `xi`/`zeta` are the X_mu/X_ls contractions,
 /// and `q`/`s1`/`g2` are the mixed first/second-derivative wiggle pieces.
 pub(crate) struct GlsWiggleDirPieces<'a> {
-    zeta_u: &'a Array1<f64>,
-    zeta_v: &'a Array1<f64>,
-    q_u: &'a Array1<f64>,
-    q_v: &'a Array1<f64>,
-    q_uv: &'a Array1<f64>,
-    s1_u: &'a Array1<f64>,
-    s1_v: &'a Array1<f64>,
-    s1_uv: &'a Array1<f64>,
-    g2_u: &'a Array1<f64>,
-    g2_v: &'a Array1<f64>,
-    g2_uv: &'a Array1<f64>,
+    pub(crate) zeta_u: &'a Array1<f64>,
+    pub(crate) zeta_v: &'a Array1<f64>,
+    pub(crate) q_u: &'a Array1<f64>,
+    pub(crate) q_v: &'a Array1<f64>,
+    pub(crate) q_uv: &'a Array1<f64>,
+    pub(crate) s1_u: &'a Array1<f64>,
+    pub(crate) s1_v: &'a Array1<f64>,
+    pub(crate) s1_uv: &'a Array1<f64>,
+    pub(crate) g2_u: &'a Array1<f64>,
+    pub(crate) g2_v: &'a Array1<f64>,
+    pub(crate) g2_uv: &'a Array1<f64>,
 }
 
 /// Compute the shared GLS Wiggle second-directional row coefficients from the
@@ -2662,11 +2662,11 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
 /// through `q = η_μ + η_w` (no σ-chain), so the Gaussian wiggle has one
 /// fewer cross-coefficient than the binomial wiggle.
 pub(crate) struct GaussianLocationScaleWiggleHessianWorkspace {
-    family: GaussianLocationScaleWiggleFamily,
-    block_states: Vec<ParameterBlockState>,
-    xmu: Arc<Array2<f64>>,
-    x_ls: Arc<Array2<f64>>,
-    pieces: GaussianLocationScaleWiggleHessianRowPieces,
+    pub(crate) family: GaussianLocationScaleWiggleFamily,
+    pub(crate) block_states: Vec<ParameterBlockState>,
+    pub(crate) xmu: Arc<Array2<f64>>,
+    pub(crate) x_ls: Arc<Array2<f64>>,
+    pub(crate) pieces: GaussianLocationScaleWiggleHessianRowPieces,
 }
 
 impl GaussianLocationScaleWiggleHessianWorkspace {

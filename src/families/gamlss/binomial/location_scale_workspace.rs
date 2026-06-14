@@ -5,22 +5,22 @@
 use super::*;
 
 pub(crate) struct BinomialLocationScaleHessianWorkspace {
-    family: BinomialLocationScaleFamily,
-    x_t: DesignMatrix,
-    x_ls: DesignMatrix,
-    core: BinomialLocationScaleCore,
-    coeff_tt: Array1<f64>,
-    coeff_tl: Array1<f64>,
-    coeff_ll: Array1<f64>,
-    direction_eta_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialDirectionEta>>>,
-    first_coeff_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialRowCoeffTriple>>>,
+    pub(crate) family: BinomialLocationScaleFamily,
+    pub(crate) x_t: DesignMatrix,
+    pub(crate) x_ls: DesignMatrix,
+    pub(crate) core: BinomialLocationScaleCore,
+    pub(crate) coeff_tt: Array1<f64>,
+    pub(crate) coeff_tl: Array1<f64>,
+    pub(crate) coeff_ll: Array1<f64>,
+    pub(crate) direction_eta_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialDirectionEta>>>,
+    pub(crate) first_coeff_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialRowCoeffTriple>>>,
     // No `second_coeff_cache` deliberately: see `second_coefficients` for why
     // the per-pair cache was a memory-only loss at large-scale shape.
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct BinomialDirectionKey {
-    bits: Vec<u64>,
+    pub(crate) bits: Vec<u64>,
 }
 
 impl BinomialDirectionKey {
@@ -32,14 +32,14 @@ impl BinomialDirectionKey {
 }
 
 pub(crate) struct BinomialDirectionEta {
-    t: Array1<f64>,
-    ls: Array1<f64>,
+    pub(crate) t: Array1<f64>,
+    pub(crate) ls: Array1<f64>,
 }
 
 pub(crate) struct BinomialRowCoeffTriple {
-    tt: Arc<Array1<f64>>,
-    tl: Arc<Array1<f64>>,
-    ll: Arc<Array1<f64>>,
+    pub(crate) tt: Arc<Array1<f64>>,
+    pub(crate) tl: Arc<Array1<f64>>,
+    pub(crate) ll: Arc<Array1<f64>>,
 }
 
 impl BinomialLocationScaleHessianWorkspace {

@@ -5,7 +5,7 @@ use crate::matrix::{
 use ndarray::Zip;
 
 #[inline]
-fn directional_curvature_weights(
+pub(crate) fn directional_curvature_weights(
     c_array: &Array1<f64>,
     hessian_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
@@ -58,19 +58,19 @@ pub(crate) fn link_binomial_aux(yi: f64, wi: f64, mu: f64) -> LinkBinomialAux {
 }
 
 #[derive(Clone)]
-enum TauTauDesignTerm {
+pub(crate) enum TauTauDesignTerm {
     Dense(Array2<f64>),
     Implicit(HyperDesignDerivative),
 }
 
 #[derive(Clone)]
-enum TauDesignTerm {
+pub(crate) enum TauDesignTerm {
     Dense(Array2<f64>),
     Implicit(HyperDesignDerivative),
 }
 
 #[derive(Clone)]
-enum TauPairBasis {
+pub(crate) enum TauPairBasis {
     Original,
     Transformed {
         qs: std::sync::Arc<Array2<f64>>,
@@ -78,27 +78,27 @@ enum TauPairBasis {
     },
 }
 
-struct TauTauPairHyperOperator {
-    x_tau_i: TauDesignTerm,
-    x_tau_j: TauDesignTerm,
-    x_tau_tau: Option<TauTauDesignTerm>,
-    x_design: std::sync::Arc<DesignMatrix>,
-    basis: TauPairBasis,
+pub(crate) struct TauTauPairHyperOperator {
+    pub(crate) x_tau_i: TauDesignTerm,
+    pub(crate) x_tau_j: TauDesignTerm,
+    pub(crate) x_tau_tau: Option<TauTauDesignTerm>,
+    pub(crate) x_design: std::sync::Arc<DesignMatrix>,
+    pub(crate) basis: TauPairBasis,
     // Observed-Hessian working weights (signed for non-canonical links),
     // carried as the owned [`crate::matrix::SignedWeightsArc`] newtype so the
     // sign character is construction-enforced at the operator struct boundary.
     // Sibling `ImplicitHyperOperator` and `SparseDirectionalHyperOperator` in
     // `reml/unified.rs` carry the same diagonal under the same typed Arc.
-    w_diag: crate::matrix::SignedWeightsArc,
-    c_x_tau_i_beta: Option<Array1<f64>>,
-    c_x_tau_j_beta: Option<Array1<f64>>,
-    d_cross: Option<Array1<f64>>,
-    c_xij_beta: Option<Array1<f64>>,
-    s_tau_tau: Option<Array2<f64>>,
-    p: usize,
+    pub(crate) w_diag: crate::matrix::SignedWeightsArc,
+    pub(crate) c_x_tau_i_beta: Option<Array1<f64>>,
+    pub(crate) c_x_tau_j_beta: Option<Array1<f64>>,
+    pub(crate) d_cross: Option<Array1<f64>>,
+    pub(crate) c_xij_beta: Option<Array1<f64>>,
+    pub(crate) s_tau_tau: Option<Array2<f64>>,
+    pub(crate) p: usize,
 }
 
-fn build_active_design_matrix(
+pub(crate) fn build_active_design_matrix(
     x_transformed: &DesignMatrix,
     free_basis_opt: Option<&Array2<f64>>,
 ) -> Result<DesignMatrix, String> {
@@ -248,12 +248,12 @@ impl super::unified::HyperOperator for TauTauPairHyperOperator {
 }
 
 #[derive(Clone)]
-struct TauBetaDriftDerivOperator {
-    x_tau: Array2<f64>,
-    x_design: DesignMatrix,
-    c_x_u: Array1<f64>,
-    c_x_tau_u_plus_d_cross: Array1<f64>,
-    p: usize,
+pub(crate) struct TauBetaDriftDerivOperator {
+    pub(crate) x_tau: Array2<f64>,
+    pub(crate) x_design: DesignMatrix,
+    pub(crate) c_x_u: Array1<f64>,
+    pub(crate) c_x_tau_u_plus_d_cross: Array1<f64>,
+    pub(crate) p: usize,
 }
 
 impl super::unified::HyperOperator for TauBetaDriftDerivOperator {
@@ -280,7 +280,7 @@ impl super::unified::HyperOperator for TauBetaDriftDerivOperator {
     }
 }
 
-fn drift_deriv_result_from_parts(
+pub(crate) fn drift_deriv_result_from_parts(
     dense: Option<Array2<f64>>,
     mut operators: Vec<std::sync::Arc<dyn super::unified::HyperOperator>>,
     dim_hint: usize,
@@ -316,12 +316,12 @@ fn drift_deriv_result_from_parts(
 /// Mirrors `FirthAugmentedPairHyperOperator` in shape: caller supplies the
 /// base operator, the dense `x_tau`, the prepared single-coordinate kernel,
 /// and an `Arc` to the Firth operator.
-struct FirthAugmentedSingleHyperOperator {
-    base: std::sync::Arc<dyn super::unified::HyperOperator>,
-    firth_op: std::sync::Arc<super::FirthDenseOperator>,
-    tau_kernel: super::FirthTauPartialKernel,
-    x_tau_dense: Array2<f64>,
-    p: usize,
+pub(crate) struct FirthAugmentedSingleHyperOperator {
+    pub(crate) base: std::sync::Arc<dyn super::unified::HyperOperator>,
+    pub(crate) firth_op: std::sync::Arc<super::FirthDenseOperator>,
+    pub(crate) tau_kernel: super::FirthTauPartialKernel,
+    pub(crate) x_tau_dense: Array2<f64>,
+    pub(crate) p: usize,
 }
 
 impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
@@ -381,13 +381,13 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
 /// and an `Arc` to the Firth operator.  The sign convention mirrors the
 /// single-τ wiring at `build_tau_hyper_coords` (B_j += −Hφ_τ_j|β for the
 /// diagonal; here we apply the same sign to the pair drift).
-struct FirthAugmentedPairHyperOperator {
-    base: Box<dyn super::unified::HyperOperator>,
-    firth_op: std::sync::Arc<super::FirthDenseOperator>,
-    pair_kernel: super::FirthTauTauPartialKernel,
-    x_tau_i_dense: Array2<f64>,
-    x_tau_j_dense: Array2<f64>,
-    p: usize,
+pub(crate) struct FirthAugmentedPairHyperOperator {
+    pub(crate) base: Box<dyn super::unified::HyperOperator>,
+    pub(crate) firth_op: std::sync::Arc<super::FirthDenseOperator>,
+    pub(crate) pair_kernel: super::FirthTauTauPartialKernel,
+    pub(crate) x_tau_i_dense: Array2<f64>,
+    pub(crate) x_tau_j_dense: Array2<f64>,
+    pub(crate) p: usize,
 }
 
 impl super::unified::HyperOperator for FirthAugmentedPairHyperOperator {
@@ -416,7 +416,7 @@ impl super::unified::HyperOperator for FirthAugmentedPairHyperOperator {
 }
 
 impl<'a> RemlState<'a> {
-    fn get_pairwisesecond_penalty_components(
+    pub(crate) fn get_pairwisesecond_penalty_components(
         hyper_dirs: &[DirectionalHyperParam],
         i: usize,
         j: usize,
@@ -458,7 +458,7 @@ impl<'a> RemlState<'a> {
         Ok(())
     }
 
-    fn transform_penalty_components(
+    pub(crate) fn transform_penalty_components(
         components: &[PenaltyDerivativeComponent],
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
@@ -477,7 +477,7 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
-    fn ensure_transformed_x_tau_dense<'b>(
+    pub(crate) fn ensure_transformed_x_tau_dense<'b>(
         slot: &'b mut Option<Array2<f64>>,
         dir: &DirectionalHyperParam,
         qs: &Array2<f64>,
@@ -486,7 +486,7 @@ impl<'a> RemlState<'a> {
         Ok(slot.get_or_insert(dir.transformed_x_tau(qs, free_basis_opt)?))
     }
 
-    fn tau_design_forward_mul(
+    pub(crate) fn tau_design_forward_mul(
         term: &TauDesignTerm,
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
@@ -508,7 +508,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn tau_design_forward_mul_in_basis(
+    pub(crate) fn tau_design_forward_mul_in_basis(
         term: &TauDesignTerm,
         basis: &TauPairBasis,
         u: &Array1<f64>,
@@ -521,7 +521,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn tau_design_forward_mul_original(
+    pub(crate) fn tau_design_forward_mul_original(
         term: &TauDesignTerm,
         u: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
@@ -541,7 +541,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn tau_design_transpose_mul(
+    pub(crate) fn tau_design_transpose_mul(
         term: &TauDesignTerm,
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
@@ -565,7 +565,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn tau_design_transpose_mul_in_basis(
+    pub(crate) fn tau_design_transpose_mul_in_basis(
         term: &TauDesignTerm,
         basis: &TauPairBasis,
         v: &Array1<f64>,
@@ -581,7 +581,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn tau_design_transpose_mul_original(
+    pub(crate) fn tau_design_transpose_mul_original(
         term: &TauDesignTerm,
         v: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
@@ -601,7 +601,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn tau_tau_design_forward_mul_in_basis(
+    pub(crate) fn tau_tau_design_forward_mul_in_basis(
         term: &TauTauDesignTerm,
         basis: &TauPairBasis,
         u: &Array1<f64>,
@@ -627,7 +627,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn tau_tau_design_transpose_mul_in_basis(
+    pub(crate) fn tau_tau_design_transpose_mul_in_basis(
         term: &TauTauDesignTerm,
         basis: &TauPairBasis,
         v: &Array1<f64>,
@@ -652,7 +652,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn build_tau_penalty_derivative_data<F>(
+    pub(crate) fn build_tau_penalty_derivative_data<F>(
         rho: &Array1<f64>,
         p_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
@@ -743,7 +743,7 @@ impl<'a> RemlState<'a> {
         Ok((s_tau_list, s_tau_tau, a_k_tau_j_mats, ds_k_dtau_j_mats))
     }
 
-    fn build_tau_design_data_in_basis(
+    pub(crate) fn build_tau_design_data_in_basis(
         hyper_dirs: &[DirectionalHyperParam],
         basis: &TauPairBasis,
         beta_eval: &Array1<f64>,
@@ -817,7 +817,7 @@ impl<'a> RemlState<'a> {
         Ok((x_tau_terms, x_tau_beta_list, x_tau_tau))
     }
 
-    fn canonical_penalty_matrices(
+    pub(crate) fn canonical_penalty_matrices(
         penalties: &[crate::construction::CanonicalPenalty],
     ) -> Vec<Array2<f64>> {
         penalties
@@ -829,7 +829,7 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
-    fn build_tau_tau_pair_callback(
+    pub(crate) fn build_tau_tau_pair_callback(
         basis: TauPairBasis,
         pld: std::sync::Arc<super::penalty_logdet::PenaltyPseudologdet>,
         s_tau_list: std::sync::Arc<Vec<Array2<f64>>>,
@@ -1000,7 +1000,7 @@ impl<'a> RemlState<'a> {
         )
     }
 
-    fn build_rho_tau_pair_callback(
+    pub(crate) fn build_rho_tau_pair_callback(
         pld: std::sync::Arc<super::penalty_logdet::PenaltyPseudologdet>,
         s_k_unscaled: std::sync::Arc<Vec<Array2<f64>>>,
         s_tau_list: std::sync::Arc<Vec<Array2<f64>>>,
@@ -1176,7 +1176,7 @@ impl<'a> RemlState<'a> {
         // Skip for large models that would blow memory.
         let n_x = self.x().nrows();
         let p_x = self.x().ncols();
-        const HYPER_MAX_DENSE_WORK: usize = 50_000_000;
+        pub(crate) const HYPER_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > HYPER_MAX_DENSE_WORK
             && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
         {
@@ -1868,7 +1868,7 @@ impl<'a> RemlState<'a> {
         Ok(coords)
     }
 
-    fn build_tau_fixed_drift_deriv_from_dense_tau(
+    pub(crate) fn build_tau_fixed_drift_deriv_from_dense_tau(
         x_design: DesignMatrix,
         beta_eval: Array1<f64>,
         x_tau_dense_list: Vec<Array2<f64>>,
@@ -1943,7 +1943,7 @@ impl<'a> RemlState<'a> {
         )
     }
 
-    fn build_tau_fixed_drift_deriv(
+    pub(crate) fn build_tau_fixed_drift_deriv(
         &self,
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
@@ -2296,7 +2296,7 @@ impl<'a> RemlState<'a> {
         Ok(coords)
     }
 
-    fn build_tau_fixed_drift_deriv_original_basis(
+    pub(crate) fn build_tau_fixed_drift_deriv_original_basis(
         &self,
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
@@ -2814,7 +2814,7 @@ impl<'a> RemlState<'a> {
         // Guard: SAS link ext coords require dense design materialization.
         let n_x = pirls_result.x_transformed.nrows();
         let p_x = pirls_result.x_transformed.ncols();
-        const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
+        pub(crate) const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
             log::warn!(
                 "skipping SAS link ext coordinate construction (n={n_x}, p={p_x}): \
@@ -2999,7 +2999,7 @@ impl<'a> RemlState<'a> {
         // Guard: mixture link ext coords require dense design materialization.
         let n_x = pirls_result.x_transformed.nrows();
         let p_x = pirls_result.x_transformed.ncols();
-        const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
+        pub(crate) const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
             log::warn!(
                 "skipping mixture link ext coordinate construction (n={n_x}, p={p_x}): \
@@ -3161,7 +3161,7 @@ mod tests {
     /// base operator (e.g. `ImplicitHyperOperator`) when wiring an
     /// augmentation test. `super::*` brings the unified types in via
     /// `super::unified::DenseMatrixHyperOperator`.
-    fn dense_op(matrix: Array2<f64>) -> Arc<dyn super::super::unified::HyperOperator> {
+    pub(crate) fn dense_op(matrix: Array2<f64>) -> Arc<dyn super::super::unified::HyperOperator> {
         Arc::new(super::super::unified::DenseMatrixHyperOperator { matrix })
     }
 
@@ -3177,7 +3177,7 @@ mod tests {
     ///   3. probe `mul_vec` along several v and compare to
     ///      `base · v − Hφ_τ · v` to within tight tolerance.
     #[test]
-    fn firth_augmented_single_hyper_operator_matches_dense_reference() {
+    pub(crate) fn firth_augmented_single_hyper_operator_matches_dense_reference() {
         let x = array![
             [1.0, -0.6, 0.10],
             [1.0, -0.2, 0.45],
@@ -3266,7 +3266,7 @@ mod tests {
     /// across the centered-difference ε scale, and
     /// (b) that no nonlinear approximation snuck into the operator pipeline.
     #[test]
-    fn firth_augmented_single_hyper_operator_centered_fd_matches_jacobian_column() {
+    pub(crate) fn firth_augmented_single_hyper_operator_centered_fd_matches_jacobian_column() {
         let x = array![
             [1.0, -0.4, 0.20],
             [1.0, 0.2, -0.10],

@@ -1,26 +1,26 @@
 use super::*;
 
 #[derive(Clone)]
-struct TransformationExactGeometryCache {
-    key: Vec<u64>,
-    covariate_spec_resolved: TermCollectionSpec,
-    covariate_design: TermCollectionDesign,
-    family: TransformationNormalFamily,
-    blocks: Vec<ParameterBlockSpec>,
-    derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+pub(crate) struct TransformationExactGeometryCache {
+    pub(crate) key: Vec<u64>,
+    pub(crate) covariate_spec_resolved: TermCollectionSpec,
+    pub(crate) covariate_design: TermCollectionDesign,
+    pub(crate) family: TransformationNormalFamily,
+    pub(crate) blocks: Vec<ParameterBlockSpec>,
+    pub(crate) derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
 }
 
 
 #[derive(Clone)]
-struct TransformationExactWarmStart {
-    theta: Array1<f64>,
-    warm_start: CustomFamilyWarmStart,
+pub(crate) struct TransformationExactWarmStart {
+    pub(crate) theta: Array1<f64>,
+    pub(crate) warm_start: CustomFamilyWarmStart,
 }
 
 
 impl TransformationExactWarmStart {
-    fn is_compatible_with(&self, theta: &Array1<f64>, rho: &Array1<f64>) -> bool {
-        const MAX_THETA_DISTANCE: f64 = 1.5;
+    pub(crate) fn is_compatible_with(&self, theta: &Array1<f64>, rho: &Array1<f64>) -> bool {
+        pub(crate) const MAX_THETA_DISTANCE: f64 = 1.5;
 
         self.theta.len() == theta.len()
             && self
@@ -34,7 +34,7 @@ impl TransformationExactWarmStart {
 
 
 impl TransformationExactGeometryCache {
-    fn update_initial_log_lambdas(&mut self, log_lambdas: &Array1<f64>) -> Result<(), String> {
+    pub(crate) fn update_initial_log_lambdas(&mut self, log_lambdas: &Array1<f64>) -> Result<(), String> {
         let spec = self
             .blocks
             .first_mut()
@@ -55,7 +55,7 @@ impl TransformationExactGeometryCache {
 }
 
 
-fn transformation_spatial_geometry_key(
+pub(crate) fn transformation_spatial_geometry_key(
     spec: &TermCollectionSpec,
     spatial_terms: &[usize],
 ) -> Result<Vec<u64>, String> {

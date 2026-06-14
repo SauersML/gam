@@ -181,7 +181,7 @@ pub(crate) enum DenseOrOperator<'a> {
 }
 
 impl DenseOrOperator<'_> {
-    fn nrows(&self) -> usize {
+    pub(crate) fn nrows(&self) -> usize {
         match self {
             Self::Borrowed(dense) => dense.nrows(),
             Self::Owned(dense) => dense.nrows(),
@@ -189,7 +189,7 @@ impl DenseOrOperator<'_> {
         }
     }
 
-    fn ncols(&self) -> usize {
+    pub(crate) fn ncols(&self) -> usize {
         match self {
             Self::Borrowed(dense) => dense.ncols(),
             Self::Owned(dense) => dense.ncols(),
@@ -197,7 +197,7 @@ impl DenseOrOperator<'_> {
         }
     }
 
-    fn row_chunk(&self, rows: std::ops::Range<usize>) -> Result<Array2<f64>, String> {
+    pub(crate) fn row_chunk(&self, rows: std::ops::Range<usize>) -> Result<Array2<f64>, String> {
         match self {
             Self::Borrowed(dense) => Ok(dense.slice(s![rows, ..]).to_owned()),
             Self::Owned(dense) => Ok(dense.slice(s![rows, ..]).to_owned()),
@@ -205,7 +205,7 @@ impl DenseOrOperator<'_> {
         }
     }
 
-    fn dot(&self, beta: ArrayView1<'_, f64>) -> Array1<f64> {
+    pub(crate) fn dot(&self, beta: ArrayView1<'_, f64>) -> Array1<f64> {
         let n = self.nrows();
         let p = self.ncols();
         assert_eq!(beta.len(), p);
@@ -335,12 +335,12 @@ pub(crate) fn dense_locscale_block_designs_cached<'a>(
 /// `exact_newton_joint_psi_direction`; each family wraps these into its own
 /// named struct (mu/threshold field renames only).
 pub(crate) struct LocScalePsiDirectionParts {
-    block_idx: usize,
-    local_idx: usize,
-    primary_psi: PsiDesignMap,
-    log_sigma_psi: PsiDesignMap,
-    primary_z: Array1<f64>,
-    log_sigma_z: Array1<f64>,
+    pub(crate) block_idx: usize,
+    pub(crate) local_idx: usize,
+    pub(crate) primary_psi: PsiDesignMap,
+    pub(crate) log_sigma_psi: PsiDesignMap,
+    pub(crate) primary_z: Array1<f64>,
+    pub(crate) log_sigma_z: Array1<f64>,
 }
 
 /// Shared body of every two-axis location-scale family's
@@ -445,14 +445,14 @@ pub(crate) fn locscale_joint_psi_direction_parts(
 /// labels, and field names; the ψψ map lookup and `X_{ab} β` action are the
 /// same for Gaussian/Binomial and wiggle/non-wiggle variants.
 pub(crate) struct LocScalePsiDriftConfig<'a> {
-    n: usize,
-    p_primary: usize,
-    p_log_sigma: usize,
-    primary_block_idx: usize,
-    log_sigma_block_idx: usize,
-    family_name: &'a str,
-    primary_label: &'a str,
-    policy: &'a crate::resource::ResourcePolicy,
+    pub(crate) n: usize,
+    pub(crate) p_primary: usize,
+    pub(crate) p_log_sigma: usize,
+    pub(crate) primary_block_idx: usize,
+    pub(crate) log_sigma_block_idx: usize,
+    pub(crate) family_name: &'a str,
+    pub(crate) primary_label: &'a str,
+    pub(crate) policy: &'a crate::resource::ResourcePolicy,
 }
 
 pub(crate) fn locscale_joint_psisecond_design_drifts(
@@ -610,9 +610,9 @@ pub(crate) fn exact_design_row_chunks(
     n: usize,
     p: usize,
 ) -> impl Iterator<Item = std::ops::Range<usize>> {
-    const TARGET_BYTES: usize = 8 * 1024 * 1024;
-    const MIN_ROWS: usize = 512;
-    const MAX_ROWS: usize = 131_072;
+    pub(crate) const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    pub(crate) const MIN_ROWS: usize = 512;
+    pub(crate) const MAX_ROWS: usize = 131_072;
     let rows = (TARGET_BYTES / (p.max(1) * 8))
         .clamp(MIN_ROWS, MAX_ROWS)
         .min(n.max(1));
@@ -709,11 +709,11 @@ pub(crate) fn gaussian_log_sigma_irlsinfo_directional_derivative(
 
 #[derive(Clone, Copy)]
 pub(crate) struct GaussianDiagonalRowKernel {
-    log_likelihood: f64,
-    location_working_weight: f64,
-    location_working_shift: f64,
-    log_sigma_working_weight: f64,
-    log_sigma_working_response: f64,
+    pub(crate) log_likelihood: f64,
+    pub(crate) location_working_weight: f64,
+    pub(crate) location_working_shift: f64,
+    pub(crate) log_sigma_working_weight: f64,
+    pub(crate) log_sigma_working_response: f64,
 }
 
 #[inline]

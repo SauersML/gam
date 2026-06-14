@@ -137,7 +137,7 @@ pub fn solve_arrow_newton_step_with_options(
 }
 
 
-fn estimated_htbeta_bytes(n: usize, d: usize, k: usize) -> Option<usize> {
+pub(crate) fn estimated_htbeta_bytes(n: usize, d: usize, k: usize) -> Option<usize> {
     n.checked_mul(d)?
         .checked_mul(k)?
         .checked_mul(std::mem::size_of::<f64>())
@@ -716,7 +716,7 @@ pub fn arrow_bare_quadratic_model_reduction(
 }
 
 
-fn next_proximal_ridge(current: f64, growth: f64) -> f64 {
+pub(crate) fn next_proximal_ridge(current: f64, growth: f64) -> f64 {
     if current > 0.0 {
         current * growth
     } else {
@@ -725,7 +725,7 @@ fn next_proximal_ridge(current: f64, growth: f64) -> f64 {
 }
 
 
-fn arrow_gradient_norm(sys: &ArrowSchurSystem) -> f64 {
+pub(crate) fn arrow_gradient_norm(sys: &ArrowSchurSystem) -> f64 {
     let mut sum = 0.0;
     for row in sys.rows.iter() {
         for &v in row.gt.iter() {
@@ -739,7 +739,7 @@ fn arrow_gradient_norm(sys: &ArrowSchurSystem) -> f64 {
 }
 
 
-fn arrow_gradient_dot_step(
+pub(crate) fn arrow_gradient_dot_step(
     sys: &ArrowSchurSystem,
     delta_t: ArrayView1<'_, f64>,
     delta_beta: ArrayView1<'_, f64>,
@@ -761,23 +761,23 @@ fn arrow_gradient_dot_step(
 }
 
 
-struct ArrowNewtonStepArtifacts {
-    delta_t: Array1<f64>,
-    delta_beta: Array1<f64>,
-    htt_factors: ArrowFactorSlab,
-    schur_factor: Option<Array2<f64>>,
-    pcg_diagnostics: PcgDiagnostics,
-    gauge_deflated_directions: usize,
+pub(crate) struct ArrowNewtonStepArtifacts {
+    pub(crate) delta_t: Array1<f64>,
+    pub(crate) delta_beta: Array1<f64>,
+    pub(crate) htt_factors: ArrowFactorSlab,
+    pub(crate) schur_factor: Option<Array2<f64>>,
+    pub(crate) pcg_diagnostics: PcgDiagnostics,
+    pub(crate) gauge_deflated_directions: usize,
 }
 
 
-struct ArrowBlockFactorization {
-    factors: ArrowFactorSlab,
-    gauge_deflated_directions: usize,
+pub(crate) struct ArrowBlockFactorization {
+    pub(crate) factors: ArrowFactorSlab,
+    pub(crate) gauge_deflated_directions: usize,
 }
 
 
-fn factor_blocks_for_system<B: BatchedBlockSolver>(
+pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     options: &ArrowSolveOptions,
@@ -815,7 +815,7 @@ fn factor_blocks_for_system<B: BatchedBlockSolver>(
 }
 
 
-enum MixedPrecisionAttempt {
+pub(crate) enum MixedPrecisionAttempt {
     Certified {
         delta_t: Array1<f64>,
         delta_beta: Array1<f64>,
@@ -828,7 +828,7 @@ enum MixedPrecisionAttempt {
 }
 
 
-fn back_substitute_delta_t<B: BatchedBlockSolver + Sync>(
+pub(crate) fn back_substitute_delta_t<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     delta_beta: ArrayView1<'_, f64>,
@@ -864,7 +864,7 @@ fn back_substitute_delta_t<B: BatchedBlockSolver + Sync>(
     };
     if parallel {
         use rayon::prelude::*;
-        const CHUNK: usize = 64;
+        pub(crate) const CHUNK: usize = 64;
         let row_offsets = &sys.row_offsets;
         // `par_chunks_mut` over uniform chunks does not align with variable row
         // dims, so partition by row chunk and hand each chunk its own contiguous
@@ -916,7 +916,7 @@ fn back_substitute_delta_t<B: BatchedBlockSolver + Sync>(
 }
 
 
-fn try_mixed_precision_arrow_solve(
+pub(crate) fn try_mixed_precision_arrow_solve(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
@@ -1040,7 +1040,7 @@ fn try_mixed_precision_arrow_solve(
 }
 
 
-fn mixed_precision_kappa_gate_failure(
+pub(crate) fn mixed_precision_kappa_gate_failure(
     htt_factors: &ArrowFactorSlab,
     schur_factor: &Array2<f64>,
     margin: f64,
@@ -1086,7 +1086,7 @@ fn mixed_precision_kappa_gate_failure(
 }
 
 
-fn arrow_factor_slab_to_f32(htt_factors: &ArrowFactorSlab) -> Vec<Array2<f32>> {
+pub(crate) fn arrow_factor_slab_to_f32(htt_factors: &ArrowFactorSlab) -> Vec<Array2<f32>> {
     htt_factors
         .iter()
         .map(|factor| factor.mapv(|v| v as f32))
@@ -1094,7 +1094,7 @@ fn arrow_factor_slab_to_f32(htt_factors: &ArrowFactorSlab) -> Vec<Array2<f32>> {
 }
 
 
-fn arrow_rhs(sys: &ArrowSchurSystem) -> (Array1<f64>, Array1<f64>) {
+pub(crate) fn arrow_rhs(sys: &ArrowSchurSystem) -> (Array1<f64>, Array1<f64>) {
     let n = sys.rows.len();
     let mut rhs_t = Array1::<f64>::zeros(sys.row_offsets[n]);
     for i in 0..n {
@@ -1112,7 +1112,7 @@ fn arrow_rhs(sys: &ArrowSchurSystem) -> (Array1<f64>, Array1<f64>) {
 }
 
 
-fn solve_arrow_system_f32(
+pub(crate) fn solve_arrow_system_f32(
     sys: &ArrowSchurSystem,
     row_factors: &[Array2<f32>],
     schur_factor: &Array2<f32>,
@@ -1194,7 +1194,7 @@ pub(crate) fn cholesky_solve_lower_f32(l: &Array2<f32>, b: &Array1<f32>) -> Arra
 }
 
 
-fn arrow_residual(
+pub(crate) fn arrow_residual(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
@@ -1216,7 +1216,7 @@ fn arrow_residual(
 }
 
 
-fn arrow_operator_apply(
+pub(crate) fn arrow_operator_apply(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
@@ -1257,7 +1257,7 @@ fn arrow_operator_apply(
 }
 
 
-fn arrow_backward_error_certificate(
+pub(crate) fn arrow_backward_error_certificate(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
@@ -1281,7 +1281,7 @@ fn arrow_backward_error_certificate(
 }
 
 
-fn infinity_norm_pair(lhs: ArrayView1<'_, f64>, rhs: ArrayView1<'_, f64>) -> f64 {
+pub(crate) fn infinity_norm_pair(lhs: ArrayView1<'_, f64>, rhs: ArrayView1<'_, f64>) -> f64 {
     let mut out = 0.0_f64;
     for &v in lhs.iter().chain(rhs.iter()) {
         out = out.max(v.abs());
@@ -1290,7 +1290,7 @@ fn infinity_norm_pair(lhs: ArrayView1<'_, f64>, rhs: ArrayView1<'_, f64>) -> f64
 }
 
 
-fn arrow_operator_infinity_norm(
+pub(crate) fn arrow_operator_infinity_norm(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
@@ -1544,16 +1544,16 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
 /// (H_tt^(i))⁻¹ H_tβ^(i)`, so applying `M⁻¹` to an arbitrary RHS is a single
 /// Schur back/forward substitution — exactly the algebra
 /// [`solve_arrow_newton_step_artifacts`] performs, generalized to a free RHS.
-struct ArrowBlockDiagInverse<'a, B: BatchedBlockSolver> {
-    sys: &'a ArrowSchurSystem,
-    backend: &'a B,
-    htt_factors: ArrowFactorSlab,
-    schur_factor: Array2<f64>,
+pub(crate) struct ArrowBlockDiagInverse<'a, B: BatchedBlockSolver> {
+    pub(crate) sys: &'a ArrowSchurSystem,
+    pub(crate) backend: &'a B,
+    pub(crate) htt_factors: ArrowFactorSlab,
+    pub(crate) schur_factor: Array2<f64>,
 }
 
 
 impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
-    fn build(
+    pub(crate) fn build(
         sys: &'a ArrowSchurSystem,
         ridge_t: f64,
         ridge_beta: f64,
@@ -1580,7 +1580,7 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
     ///
     /// `r_t` is flat row-major (`Σ_i row_dims[i]`); `r_β` is length `K`. The
     /// outputs `x_t` / `x_β` use the same layout.
-    fn apply(
+    pub(crate) fn apply(
         &self,
         r_t: ArrayView1<'_, f64>,
         r_beta: ArrayView1<'_, f64>,
@@ -1641,7 +1641,7 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
 /// `y_β = Σ_i H_βt^(i) x_t,i + (H_ββ + ridge_β·I) x_β`. `P_cross` adds the
 /// captured cross-row penalty Hessian to the latent block only:
 /// `y_t += P_cross · x_t`.
-fn arrow_cross_row_matvec(
+pub(crate) fn arrow_cross_row_matvec(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
@@ -1707,7 +1707,7 @@ fn arrow_cross_row_matvec(
 /// Because `M⁻¹` inverts everything except the (small, structured) `P_cross`
 /// coupling, the preconditioned operator `M⁻¹ A = I + M⁻¹ P_cross` has a
 /// tightly clustered spectrum and CG converges in a handful of iterations.
-fn solve_arrow_newton_step_cross_row(
+pub(crate) fn solve_arrow_newton_step_cross_row(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
@@ -1756,12 +1756,12 @@ fn solve_arrow_newton_step_cross_row(
     // path is exact-CG (no trust region), so we drive the residual to machine-
     // scale relative tolerance; the spectrum I + M⁻¹P_cross makes this cheap.
     // Absolute floor guards b_norm → 0; relative term tracks the RHS scale.
-    const CROSS_ROW_CG_ABS_TOL: f64 = 1e-12;
-    const CROSS_ROW_CG_REL_TOL: f64 = 1e-13;
+    pub(crate) const CROSS_ROW_CG_ABS_TOL: f64 = 1e-12;
+    pub(crate) const CROSS_ROW_CG_REL_TOL: f64 = 1e-13;
     // CG converges in at most (dim) iterations; allow a few passes over the
     // dimension to absorb round-off, with a small floor for tiny systems.
-    const CROSS_ROW_CG_MIN_ITER_BUDGET: usize = 64;
-    const CROSS_ROW_CG_ITER_MULTIPLE: usize = 4;
+    pub(crate) const CROSS_ROW_CG_MIN_ITER_BUDGET: usize = 64;
+    pub(crate) const CROSS_ROW_CG_ITER_MULTIPLE: usize = 4;
     let tol = CROSS_ROW_CG_ABS_TOL.max(CROSS_ROW_CG_REL_TOL * b_norm);
     let max_iter = (total_dt + k).max(CROSS_ROW_CG_MIN_ITER_BUDGET) * CROSS_ROW_CG_ITER_MULTIPLE;
 
@@ -1846,7 +1846,7 @@ fn solve_arrow_newton_step_cross_row(
 
 
 /// `⟨[a_t; a_β], [b_t; b_β]⟩` over the stacked latent/β vector.
-fn dot2(a_t: &Array1<f64>, a_beta: &Array1<f64>, b_t: &Array1<f64>, b_beta: &Array1<f64>) -> f64 {
+pub(crate) fn dot2(a_t: &Array1<f64>, a_beta: &Array1<f64>, b_t: &Array1<f64>, b_beta: &Array1<f64>) -> f64 {
     let mut acc = 0.0_f64;
     for i in 0..a_t.len() {
         acc += a_t[i] * b_t[i];
@@ -1859,7 +1859,7 @@ fn dot2(a_t: &Array1<f64>, a_beta: &Array1<f64>, b_t: &Array1<f64>, b_beta: &Arr
 
 
 /// Solve `L Lᵀ x = b` given the lower Cholesky factor `L`.
-fn cholesky_solve_lower(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
+pub(crate) fn cholesky_solve_lower(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
     let n = l.nrows();
     // Precondition: positive, finite factor diagonals (see
     // `cholesky_solve_vector_fixed`). Guard loudly — always, release included —
@@ -1912,7 +1912,7 @@ pub(crate) fn reduced_rhs_beta<B: BatchedBlockSolver + Sync>(
     let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
     if parallel {
         use rayon::prelude::*;
-        const CHUNK: usize = 64;
+        pub(crate) const CHUNK: usize = 64;
         let partials: Vec<Array1<f64>> = (0..n)
             .into_par_iter()
             .chunks(CHUNK)

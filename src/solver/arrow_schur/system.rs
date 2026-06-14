@@ -293,7 +293,7 @@ pub struct IbpCrossRowSource {
 impl IbpCrossRowSource {
     /// Build the dense `delta_t_len × R` factor `U` (each column supported on
     /// its atom's per-row logit slots) from the sparse entry list.
-    fn dense_u(&self, delta_t_len: usize) -> Array2<f64> {
+    pub(crate) fn dense_u(&self, delta_t_len: usize) -> Array2<f64> {
         let mut u = Array2::<f64>::zeros((delta_t_len, self.r));
         for &(g, k, z) in &self.entries {
             u[[g, k]] += z;
@@ -305,7 +305,7 @@ impl IbpCrossRowSource {
     /// the scalar `Σ_k d_k·z'_ik²` to subtract from that logit slot's diagonal
     /// so the factored base is `H₀'` (self term removed). Indexed by global
     /// `delta_t` position.
-    fn self_term_downdate(&self, delta_t_len: usize) -> Array1<f64> {
+    pub(crate) fn self_term_downdate(&self, delta_t_len: usize) -> Array1<f64> {
         let mut down = Array1::<f64>::zeros(delta_t_len);
         for &(g, k, z) in &self.entries {
             down[g] += self.d[k] * z * z;
@@ -1047,7 +1047,7 @@ impl ArrowSchurSystem {
         }
     }
 
-    fn add_ext_coord_penalty(
+    pub(crate) fn add_ext_coord_penalty(
         &mut self,
         penalty: &AnalyticPenaltyKind,
         target_t: ArrayView1<'_, f64>,
@@ -1088,7 +1088,7 @@ impl ArrowSchurSystem {
     /// double-counted and the off-row coupling cannot be stored there). The
     /// full curvature is instead applied as a matrix-free `P_cross · Δt`
     /// during the solve, via [`Self::cross_row_penalties`].
-    fn add_ext_coord_penalty_gradient_only(
+    pub(crate) fn add_ext_coord_penalty_gradient_only(
         &mut self,
         penalty: &AnalyticPenaltyKind,
         target_t: ArrayView1<'_, f64>,
@@ -1137,7 +1137,7 @@ impl ArrowSchurSystem {
         }
     }
 
-    fn add_beta_penalty(
+    pub(crate) fn add_beta_penalty(
         &mut self,
         penalty: &AnalyticPenaltyKind,
         target_beta: ArrayView1<'_, f64>,
@@ -1268,28 +1268,28 @@ pub struct StreamingArrowSchur {
     pub k: usize,
     pub chunk_size: usize,
     pub s_acc: Array2<f64>,
-    rhs_acc: Array1<f64>,
-    hbb: Array2<f64>,
-    gb: Array1<f64>,
-    row_builder: StreamingArrowRowBuilder,
+    pub(crate) rhs_acc: Array1<f64>,
+    pub(crate) hbb: Array2<f64>,
+    pub(crate) gb: Array1<f64>,
+    pub(crate) row_builder: StreamingArrowRowBuilder,
     /// Procedural cross-block operator `H_tβ^(i) x`. When present, the dense
     /// per-row `H_tβ` slabs are never materialized: `accumulate_chunk` and
     /// `back_substitute` probe this operator column-by-column to apply the
     /// cross-block, matching the Kronecker / matrix-free assembly path. When
     /// `None` (legacy dense BA callers), the per-row `row.htbeta` slab is used.
-    htbeta_matvec: Option<RowHtbetaMatvec>,
+    pub(crate) htbeta_matvec: Option<RowHtbetaMatvec>,
     /// Sparse adjoint of `htbeta_matvec`. When present, `row_htbeta` rebuilds
     /// the dense `(d_i × K)` cross-block by probing the transpose with `d_i`
     /// basis vectors — `O(d_i · m_i · p)` total, vs the `O(K · m_i · p)` cost
     /// of probing the forward operator with `K` basis vectors. Since
     /// `d_i ≪ K`, this is the per-row sparse apply that replaces the `O(K)`
     /// column-probe in the streaming reduced-Schur accumulation.
-    htbeta_transpose_matvec: Option<RowHtbetaTransposeMatvec>,
+    pub(crate) htbeta_transpose_matvec: Option<RowHtbetaTransposeMatvec>,
     /// Lift the per-row κ rejection for evidence/log-det-only solves; see
     /// [`ArrowSolveOptions::tolerate_ill_conditioning`]. Set by [`Self::solve`]
     /// from the options; defaults to `false` so direct callers of
     /// [`Self::accumulate_chunk`] keep the full guard.
-    tolerate_ill_conditioning: bool,
+    pub(crate) tolerate_ill_conditioning: bool,
     /// Set when the source system carried an exact cross-row IBP source
     /// ([`IbpCrossRowSource`], #1038). The streaming chunked accumulator cannot
     /// hold the rank-`R` Woodbury correction chunk-locally — `U`'s columns span
@@ -1301,7 +1301,7 @@ pub struct StreamingArrowSchur {
     /// loudly when this is set, forcing IBP-active fits onto the dense resident
     /// [`ArrowFactorCache::arrow_log_det`] path (which carries the exact
     /// Woodbury). See the #1038 streaming note.
-    ibp_cross_row_active: bool,
+    pub(crate) ibp_cross_row_active: bool,
 }
 
 
@@ -1414,7 +1414,7 @@ impl StreamingArrowSchur {
     /// When only the forward operator is installed (no adjoint), falls back to
     /// the `k`-column forward probe. Otherwise clones the dense `row.htbeta`
     /// slab.
-    fn row_htbeta(&self, row_idx: usize, row: &ArrowRowBlock, di: usize) -> Array2<f64> {
+    pub(crate) fn row_htbeta(&self, row_idx: usize, row: &ArrowRowBlock, di: usize) -> Array2<f64> {
         if let Some(op_t) = self.htbeta_transpose_matvec.as_ref() {
             // Probe the adjoint: for each latent index c, scatter e_c to obtain
             // row c of the (di × k) block.
@@ -1674,7 +1674,7 @@ impl StreamingArrowSchur {
         Ok((delta_t, delta_beta, schur_factor))
     }
 
-    fn back_substitute(
+    pub(crate) fn back_substitute(
         &self,
         ridge_t: f64,
         delta_beta: ArrayView1<'_, f64>,
@@ -1719,7 +1719,7 @@ impl StreamingArrowSchur {
         Ok(delta_t)
     }
 
-    fn validate_row(&self, row_idx: usize, row: &ArrowRowBlock) -> Result<(), ArrowSchurError> {
+    pub(crate) fn validate_row(&self, row_idx: usize, row: &ArrowRowBlock) -> Result<(), ArrowSchurError> {
         let expected_di = if row_idx < self.row_dims.len() {
             self.row_dims[row_idx]
         } else {
@@ -1758,7 +1758,7 @@ impl StreamingArrowSchur {
 }
 
 
-fn apply_analytic_penalty<S, G, D, P, H>(
+pub(crate) fn apply_analytic_penalty<S, G, D, P, H>(
     penalty: &AnalyticPenaltyKind,
     target: ArrayView1<'_, f64>,
     rho_local: ArrayView1<'_, f64>,
@@ -1822,9 +1822,9 @@ pub(crate) fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKi
 /// the dominant `O(N d³ + K³)` factorization cost.
 #[derive(Clone)]
 pub struct ArrowFactorSlab {
-    data: Arc<[f64]>,
-    offsets: Arc<[usize]>,
-    dims: Arc<[usize]>,
+    pub(crate) data: Arc<[f64]>,
+    pub(crate) offsets: Arc<[usize]>,
+    pub(crate) dims: Arc<[usize]>,
 }
 
 
@@ -2005,7 +2005,7 @@ pub(crate) fn sys_htbeta_materialize_row(
 /// dotting the result with `v`.  Accumulates into `out[a]` for all `a in 0..k`.
 ///
 /// `out[a] += (H_tβ^(row) e_a) · v = H_βt^(row)[a, :] · v`
-fn htbeta_probe_transpose(
+pub(crate) fn htbeta_probe_transpose(
     row: usize,
     op: &RowHtbetaMatvec,
     v: ArrayView1<'_, f64>,
@@ -2072,11 +2072,11 @@ impl std::fmt::Debug for ArrowHtbetaCache {
 
 
 impl ArrowHtbetaCache {
-    fn is_available(&self) -> bool {
+    pub(crate) fn is_available(&self) -> bool {
         !matches!(self, Self::Disabled { .. })
     }
 
-    fn apply_row(
+    pub(crate) fn apply_row(
         &self,
         row: usize,
         delta_beta: ArrayView1<'_, f64>,
@@ -2113,7 +2113,7 @@ impl ArrowHtbetaCache {
     /// `out` first) so callers can sum contributions across rows into a shared
     /// accumulator.  Returns `false` when the cache is `Disabled` and no
     /// `fallback_op` is provided.
-    fn apply_row_transpose_accumulate(
+    pub(crate) fn apply_row_transpose_accumulate(
         &self,
         row: usize,
         v: ArrayView1<'_, f64>,
@@ -2284,17 +2284,17 @@ pub struct CrossRowWoodbury {
 pub struct SmallLu {
     /// Packed `L` (unit lower, below diagonal) and `U` (upper, on/above
     /// diagonal), `R × R`, in the row-permuted order encoded by `piv`.
-    lu: Array2<f64>,
+    pub(crate) lu: Array2<f64>,
     /// Row permutation: `piv[i]` is the original row now in position `i`.
-    piv: Vec<usize>,
+    pub(crate) piv: Vec<usize>,
     /// Sign of the permutation (`±1`), folded into the determinant.
-    perm_sign: f64,
+    pub(crate) perm_sign: f64,
 }
 
 
 /// Partial-pivot LU factorization of a small dense square matrix `a` (`R × R`).
 /// Returns `None` only when a pivot is exactly zero (singular `C`).
-fn small_lu_factor(a: &Array2<f64>) -> Option<SmallLu> {
+pub(crate) fn small_lu_factor(a: &Array2<f64>) -> Option<SmallLu> {
     let r = a.nrows();
     assert_eq!(a.ncols(), r, "small_lu_factor: non-square input");
     let mut lu = a.clone();
@@ -2353,12 +2353,12 @@ fn small_lu_factor(a: &Array2<f64>) -> Option<SmallLu> {
 
 
 impl SmallLu {
-    fn dim(&self) -> usize {
+    pub(crate) fn dim(&self) -> usize {
         self.lu.nrows()
     }
 
     /// `log|det|` and the determinant sign (`±1`).
-    fn log_abs_det_and_sign(&self) -> (f64, f64) {
+    pub(crate) fn log_abs_det_and_sign(&self) -> (f64, f64) {
         let mut log_abs = 0.0_f64;
         let mut sign = self.perm_sign;
         for i in 0..self.dim() {
@@ -2380,7 +2380,7 @@ impl SmallLu {
     /// an ill-conditioned (yet validly factored) capacitance. Surfacing `None`
     /// lets the Woodbury / evidence consumers fail loudly (#1038) instead of
     /// flowing a silent `NaN` into the log-det and outer gradient.
-    fn solve(&self, b: &Array1<f64>) -> Option<Array1<f64>> {
+    pub(crate) fn solve(&self, b: &Array1<f64>) -> Option<Array1<f64>> {
         let r = self.dim();
         // Apply the row permutation: y = P b.
         let mut y = Array1::<f64>::zeros(r);
@@ -2428,7 +2428,7 @@ impl CrossRowWoodbury {
     /// the caller then proceeds with the bare `H₀'` cache and the cross-row term
     /// is absent — never silently inconsistent, since logdet/inverse/adjoint all
     /// key off the presence of this carrier).
-    fn build(
+    pub(crate) fn build(
         cache: &ArrowFactorCache,
         source: &IbpCrossRowSource,
     ) -> Result<Option<Self>, ArrowSchurError> {
@@ -2495,7 +2495,7 @@ impl CrossRowWoodbury {
     }
 
     /// The sparse `U` entry list `(global_t_index, atom_k, z'_ik)`.
-    fn source_entries(&self) -> &[(usize, usize, f64)] {
+    pub(crate) fn source_entries(&self) -> &[(usize, usize, f64)] {
         &self.entries
     }
 
@@ -2525,7 +2525,7 @@ impl CrossRowWoodbury {
     /// `diag ← diag − diag(H₀'⁻¹U C⁻¹ D Uᵀ H₀'⁻¹)`. With `G = h0inv_u` and
     /// `(C⁻¹D) = capacitance_inv_times_d()`, the entry at global index `g` is
     /// `Σ_{k,l} G[g,k] (C⁻¹D)[k,l] G[g,l]`.
-    fn subtract_inverse_diagonal(
+    pub(crate) fn subtract_inverse_diagonal(
         &self,
         diag: &mut Array1<f64>,
     ) -> Result<(), ArrowSchurError> {
@@ -2568,7 +2568,7 @@ impl CrossRowWoodbury {
     /// `log det H_full − log det H₀'` (matrix-determinant lemma). For a genuine
     /// PD `H_full` this is real; the LU sign is returned for the caller to
     /// surface a non-PD capacitance as an error rather than a silent `NaN`.
-    fn log_det_correction(&self) -> (f64, f64) {
+    pub(crate) fn log_det_correction(&self) -> (f64, f64) {
         self.capacitance_lu.log_abs_det_and_sign()
     }
 
@@ -2581,7 +2581,7 @@ impl CrossRowWoodbury {
     /// through the Schur complement, so the correction touches `u_beta` too.
     ///
     /// `entries` lets `Uᵀ·v` be formed over the sparse atom slots.
-    fn apply_inverse_correction(
+    pub(crate) fn apply_inverse_correction(
         &self,
         h0inv_rhs_t: ArrayView1<'_, f64>,
         entries: &[(usize, usize, f64)],
@@ -2638,7 +2638,7 @@ pub struct ArrowFactorMinPivot {
 
 
 impl ArrowFactorMinPivot {
-    fn combine(row: Option<f64>, schur: Option<f64>) -> Self {
+    pub(crate) fn combine(row: Option<f64>, schur: Option<f64>) -> Self {
         let min_pivot = match (row, schur) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
@@ -3010,7 +3010,7 @@ impl ArrowFactorCache {
     /// present). [`Self::full_inverse_apply`] wraps this with the rank-`R`
     /// correction; [`CrossRowWoodbury::build`] calls this directly (before the
     /// carrier exists) to form `H₀'⁻¹U`.
-    fn full_inverse_apply_base(
+    pub(crate) fn full_inverse_apply_base(
         &self,
         w_t: ArrayView1<'_, f64>,
         w_beta: ArrayView1<'_, f64>,

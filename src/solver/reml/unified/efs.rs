@@ -230,7 +230,7 @@ pub(crate) fn efs_single_loop_diagnostics(
 /// Eigenvalues below `PSI_GRAM_PINV_TOL * max_eigenvalue` are treated as
 /// zero when computing the pseudoinverse G⁺. This prevents amplification
 /// of noise in near-singular directions of the ψ-ψ Gram matrix.
-const PSI_GRAM_PINV_TOL: f64 = 1e-8;
+pub(crate) const PSI_GRAM_PINV_TOL: f64 = 1e-8;
 
 
 /// Initial step-size damping factor for the preconditioned gradient on ψ.
@@ -238,25 +238,25 @@ const PSI_GRAM_PINV_TOL: f64 = 1e-8;
 /// The raw step `Δψ_raw = -G⁺ g_ψ` is scaled by α ∈ (0, 1] before
 /// applying. This conservative initial value prevents overshooting in
 /// early iterations when the quadratic model may be inaccurate.
-const PSI_INITIAL_ALPHA: f64 = 1.0;
+pub(crate) const PSI_INITIAL_ALPHA: f64 = 1.0;
 
 
 /// Minimum number of scalar ρ/τ EFS candidates before `compute_hybrid_efs_update`
 /// fans out with rayon.  Smaller blocks are common (1-4 smoothing parameters),
 /// where task scheduling costs dominate the independent arithmetic.
-const HYBRID_EFS_SCALAR_PAR_THRESHOLD: usize = 8;
+pub(crate) const HYBRID_EFS_SCALAR_PAR_THRESHOLD: usize = 8;
 
 
 /// Minimum number of independent ψ-ψ Gram entries before exact trace assembly
 /// fans out with rayon.  This is expressed in upper-triangle pair count rather
 /// than `n_psi` so 5 ψ coordinates (15 pairs) stay serial while moderate
 /// anisotropic/design-moving blocks parallelize.
-const HYBRID_EFS_GRAM_PAIR_PAR_THRESHOLD: usize = 24;
+pub(crate) const HYBRID_EFS_GRAM_PAIR_PAR_THRESHOLD: usize = 24;
 
 
 /// Minimum number of ψ drifts before materialization/projection is done in
 /// parallel during exact Gram assembly.
-const HYBRID_EFS_PSI_DRIFT_PAR_THRESHOLD: usize = 8;
+pub(crate) const HYBRID_EFS_PSI_DRIFT_PAR_THRESHOLD: usize = 8;
 
 
 /// Result of the hybrid EFS update, containing both the step vector and
@@ -728,7 +728,7 @@ pub fn compute_hybrid_efs_update(
 /// Uses eigendecomposition with truncation: eigenvalues below
 /// `tol * max_eigenvalue` are treated as zero. For small matrices
 /// (typical n_psi = 2-10), the O(n³) cost is negligible.
-fn pseudoinverse_times_vec(
+pub(crate) fn pseudoinverse_times_vec(
     gram: &ndarray::Array2<f64>,
     v: &[f64],
     tol: f64,
@@ -792,7 +792,7 @@ fn pseudoinverse_times_vec(
 ///
 /// This is a self-contained implementation to avoid external dependencies.
 /// For larger matrices, use faer's `SelfAdjointEigendecomposition`.
-fn symmetric_eigen(a: &ndarray::Array2<f64>) -> (Vec<f64>, ndarray::Array2<f64>) {
+pub(crate) fn symmetric_eigen(a: &ndarray::Array2<f64>) -> (Vec<f64>, ndarray::Array2<f64>) {
     let n = a.nrows();
     assert_eq!(n, a.ncols(), "symmetric_eigen requires square matrix");
 
@@ -803,13 +803,13 @@ fn symmetric_eigen(a: &ndarray::Array2<f64>) -> (Vec<f64>, ndarray::Array2<f64>)
     // The off-diagonal Frobenius norm converges quadratically, so a near-machine
     // `tol` is reached in a handful of sweeps for the small matrices this serves;
     // `MAX_SWEEPS` is a generous safety cap that the convergence test hits first.
-    const MAX_SWEEPS: usize = 100;
-    const TOL: f64 = 1e-15;
+    pub(crate) const MAX_SWEEPS: usize = 100;
+    pub(crate) const TOL: f64 = 1e-15;
     // Skip a pair whose off-diagonal magnitude is already two orders below `TOL`
     // (rotating it would only add round-off), and skip a rotation whose `τ`
     // magnitude is so large the pair is numerically diagonal already.
-    const PAIR_SKIP_TOL: f64 = TOL * 0.01;
-    const TAU_DIAGONAL_THRESHOLD: f64 = 1e15;
+    pub(crate) const PAIR_SKIP_TOL: f64 = TOL * 0.01;
+    pub(crate) const TAU_DIAGONAL_THRESHOLD: f64 = 1e15;
 
     let mut sweep = 0;
     while sweep < MAX_SWEEPS {

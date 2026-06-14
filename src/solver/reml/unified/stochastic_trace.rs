@@ -85,8 +85,8 @@ impl StochasticTraceConfig {
 /// the bias satisfies `|bias| ≤ (δ_PCG · p / λ_min(H)) · ‖Ḣ_k‖₂`.
 /// Set δ_PCG small enough that this is below the Monte Carlo tolerance.
 pub struct StochasticTraceEstimator {
-    config: StochasticTraceConfig,
-    trace_state: Arc<Mutex<StochasticTraceState>>,
+    pub(crate) config: StochasticTraceConfig,
+    pub(crate) trace_state: Arc<Mutex<StochasticTraceState>>,
 }
 
 pub(crate) enum StochasticTraceTargets<'a> {
@@ -570,9 +570,9 @@ impl StochasticTraceEstimator {
         let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
 
         pub(crate) struct ImplicitSecondOrderScratch {
-            w_dx_u: Array1<f64>,
-            w_y: Array1<f64>,
-            u_s: Array1<f64>,
+            pub(crate) w_dx_u: Array1<f64>,
+            pub(crate) w_y: Array1<f64>,
+            pub(crate) u_s: Array1<f64>,
         }
 
         self.estimate_matrix_from_probe_batch(hop, total, |probe_id, z, probe_values| {
@@ -1089,7 +1089,7 @@ pub(crate) fn stochastic_trace_hinv_crosses_with_floor<'a>(
 /// This is used exclusively for Rademacher probe generation. The state is
 /// seeded deterministically from a u64 via splitmix64.
 pub(crate) struct Xoshiro256SS {
-    s: [u64; 4],
+    pub(crate) s: [u64; 4],
 }
 
 impl Xoshiro256SS {

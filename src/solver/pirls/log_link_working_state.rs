@@ -81,7 +81,7 @@ pub(super) struct LogLinkRule {
 /// the inputs its family depends on; `mu` is consumed by the identity, power,
 /// and negative-binomial arms.
 #[inline]
-fn raw_weight(weight: &WorkingWeight, mu: f64, prior_weight: f64) -> f64 {
+pub(crate) fn raw_weight(weight: &WorkingWeight, mu: f64, prior_weight: f64) -> f64 {
     match *weight {
         WorkingWeight::PoissonIdentity => prior_weight * mu,
         WorkingWeight::Constant { factor } => prior_weight * factor,
@@ -103,7 +103,7 @@ fn raw_weight(weight: &WorkingWeight, mu: f64, prior_weight: f64) -> f64 {
 /// `weight`. The proportional arm ignores `mu`; the negative-binomial arm reads
 /// it.
 #[inline]
-fn curvature_terms(curvature: &WorkingCurvature, mu: f64, weight: f64) -> (f64, f64) {
+pub(crate) fn curvature_terms(curvature: &WorkingCurvature, mu: f64, weight: f64) -> (f64, f64) {
     match *curvature {
         WorkingCurvature::Proportional { c_ratio, d_ratio } => (c_ratio * weight, d_ratio * weight),
         WorkingCurvature::NegativeBinomial { theta } => {

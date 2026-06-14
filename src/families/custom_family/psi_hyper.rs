@@ -256,12 +256,12 @@ pub(crate) fn build_contracted_psi_hook(
     // ψ → (block, local) location and block-local S_ψ for every ψ axis, built
     // once. `s_local` (block-local S_ψ) is reused for the τ-Hessian and as the
     // first leg of the bilinear `tr(S⁺ S_ψi S⁺ S_ψj)` penalty-logdet term.
-    struct PsiAxis {
-        block: usize,
-        local: usize,
-        start: usize,
-        end: usize,
-        s_psi_local: Array2<f64>,
+    pub(crate) struct PsiAxis {
+        pub(crate) block: usize,
+        pub(crate) local: usize,
+        pub(crate) start: usize,
+        pub(crate) end: usize,
+        pub(crate) s_psi_local: Array2<f64>,
     }
     let mut axes: Vec<PsiAxis> = Vec::new();
     for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
@@ -459,22 +459,22 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
 
     let s_logdet_block_cache = Arc::new(s_logdet_blocks.map(|blocks| blocks.to_vec()));
 
-    struct PsiPenaltyCacheEntry {
-        block_idx: usize,
-        local_idx: usize,
-        start: usize,
-        end: usize,
+    pub(crate) struct PsiPenaltyCacheEntry {
+        pub(crate) block_idx: usize,
+        pub(crate) local_idx: usize,
+        pub(crate) start: usize,
+        pub(crate) end: usize,
         /// Block-local S_ψ matrix, stored for use with `PenaltyPseudologdet` methods.
-        s_local: Option<Array2<f64>>,
+        pub(crate) s_local: Option<Array2<f64>>,
     }
 
-    struct RhoPenaltyCacheEntry {
-        block_idx: usize,
-        penalty_idx: usize,
-        start: usize,
-        end: usize,
+    pub(crate) struct RhoPenaltyCacheEntry {
+        pub(crate) block_idx: usize,
+        pub(crate) penalty_idx: usize,
+        pub(crate) start: usize,
+        pub(crate) end: usize,
         /// Unscaled penalty matrix S_k for use with `PenaltyPseudologdet::rho_tau_hessian_component`.
-        s_k_unscaled: Array2<f64>,
+        pub(crate) s_k_unscaled: Array2<f64>,
     }
 
     // Build the psi coordinate cache once. These block-local S_psi matrices are
@@ -1921,8 +1921,8 @@ pub(crate) fn derivative_quality_options_and_warm_start(
     warm_start: Option<&CustomFamilyWarmStart>,
     has_psi_derivatives: bool,
 ) -> (BlockwiseFitOptions, Option<CustomFamilyWarmStart>) {
-    const DIRECT_JOINT_HYPER_INNER_TOL_FLOOR: f64 = 1e-10;
-    const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
+    pub(crate) const DIRECT_JOINT_HYPER_INNER_TOL_FLOOR: f64 = 1e-10;
+    pub(crate) const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
 
     let mut eval_options = options.clone();
     // The alignment exists so exact joint-hyper evaluations with real ψ

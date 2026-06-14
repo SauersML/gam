@@ -66,7 +66,7 @@ pub enum CandidateEvaluation {
 
 impl CandidateEvaluation {
     #[inline]
-    fn penalized_objective(&self, firth_bias_reduction: bool) -> f64 {
+    pub(crate) fn penalized_objective(&self, firth_bias_reduction: bool) -> f64 {
         match self {
             Self::Screen(s) => s.penalized_objective,
             Self::Full(state) => {
@@ -80,7 +80,7 @@ impl CandidateEvaluation {
     }
 
     #[inline]
-    fn arithmetic_finite(&self) -> bool {
+    pub(crate) fn arithmetic_finite(&self) -> bool {
         match self {
             Self::Screen(s) => s.arithmetic_finite,
             Self::Full(state) => state.gradient.iter().all(|g| g.is_finite()),
@@ -88,7 +88,7 @@ impl CandidateEvaluation {
     }
 
     #[inline]
-    fn into_full(self) -> Option<WorkingState> {
+    pub(crate) fn into_full(self) -> Option<WorkingState> {
         match self {
             Self::Full(state) => Some(state),
             Self::Screen(_) => None,
@@ -107,7 +107,7 @@ pub(super) struct PirlsAcceptedStateCacheKey {
 
 
 impl PirlsAcceptedStateCacheKey {
-    fn requested(
+    pub(crate) fn requested(
         beta: &Coefficients,
         curvature: HessianCurvatureKind,
         options: &WorkingModelPirlsOptions,
@@ -115,7 +115,7 @@ impl PirlsAcceptedStateCacheKey {
         Self::new(beta, curvature, options.firth_bias_reduction, options)
     }
 
-    fn accepted(
+    pub(crate) fn accepted(
         beta: &Coefficients,
         state: &WorkingState,
         options: &WorkingModelPirlsOptions,
@@ -128,7 +128,7 @@ impl PirlsAcceptedStateCacheKey {
         )
     }
 
-    fn new(
+    pub(crate) fn new(
         beta: &Coefficients,
         curvature: HessianCurvatureKind,
         firth_active: bool,
@@ -161,11 +161,11 @@ pub(crate) struct IntegratedWorkingInput<'a> {
 
 
 pub struct WorkingDerivativeBuffersMut<'a> {
-    c: &'a mut Array1<f64>,
-    d: &'a mut Array1<f64>,
-    dmu_deta: &'a mut Array1<f64>,
-    d2mu_deta2: &'a mut Array1<f64>,
-    d3mu_deta3: &'a mut Array1<f64>,
+    pub(crate) c: &'a mut Array1<f64>,
+    pub(crate) d: &'a mut Array1<f64>,
+    pub(crate) dmu_deta: &'a mut Array1<f64>,
+    pub(crate) d2mu_deta2: &'a mut Array1<f64>,
+    pub(crate) d3mu_deta3: &'a mut Array1<f64>,
 }
 
 
@@ -236,12 +236,12 @@ pub(super) fn working_deriv_slices<'a>(
 
 
 #[derive(Clone, Copy)]
-struct WorkingBernoulliGeometry {
-    mu: f64,
-    weight: f64,
-    z: f64,
-    c: f64,
-    d: f64,
+pub(crate) struct WorkingBernoulliGeometry {
+    pub(crate) mu: f64,
+    pub(crate) weight: f64,
+    pub(crate) z: f64,
+    pub(crate) c: f64,
+    pub(crate) d: f64,
 }
 
 

@@ -87,25 +87,25 @@ pub const PER_ATOM_EFS_MIN_RHO_DIM: usize = 64;
 /// Maximum absolute step in log-λ for any single per-atom update, mirroring the
 /// `EFS_MAX_STEP` clamp the unified EFS path applies, so one outer iteration
 /// cannot move any `λ_i` by more than `exp(5)` ≈ 148×.
-const PER_ATOM_MAX_STEP: f64 = 5.0;
+pub(crate) const PER_ATOM_MAX_STEP: f64 = 5.0;
 
 /// Whole-vector backtracking halvings for the per-atom EFS line search.
-const PER_ATOM_MAX_BACKTRACK: usize = 8;
+pub(crate) const PER_ATOM_MAX_BACKTRACK: usize = 8;
 
 /// Step components below this magnitude (in θ-space) are treated as numerically
 /// zero for convergence and line-search purposes.
-const PER_ATOM_NEGLIGIBLE_STEP: f64 = 1e-12;
+pub(crate) const PER_ATOM_NEGLIGIBLE_STEP: f64 = 1e-12;
 
 /// Relative tolerance for the descent condition during backtracking; matches
 /// the unified EFS path so ULP-level cost noise near a fixed point does not
 /// trigger spurious backtracking.
-const PER_ATOM_COST_DESCENT_TOL: f64 = 1e-12;
+pub(crate) const PER_ATOM_COST_DESCENT_TOL: f64 = 1e-12;
 
 /// Finite-difference probe magnitude (in θ-space) for the θ-HVP fallback when
 /// no exact outer-Hessian operator is available. Central difference, so the
 /// error is O(h²); `1e-4` balances truncation against the inner-solve noise
 /// floor of the outer gradient.
-const THETA_HVP_FD_STEP: f64 = 1.0e-4;
+pub(crate) const THETA_HVP_FD_STEP: f64 = 1.0e-4;
 
 /// Auto-switch threshold predicate: is this problem in the frontier ρ-scaling
 /// regime where the per-atom decoupled EFS primary should take over from the
@@ -178,8 +178,8 @@ impl PerAtomEfsResult {
 /// step alone.
 #[derive(Clone, Debug)]
 pub struct SharedBorderTopology {
-    border_axes: Vec<usize>,
-    rho_dim: usize,
+    pub(crate) border_axes: Vec<usize>,
+    pub(crate) rho_dim: usize,
 }
 
 impl SharedBorderTopology {
@@ -233,7 +233,7 @@ impl SharedBorderTopology {
     }
 
     #[inline]
-    fn rho_dim(&self) -> usize {
+    pub(crate) fn rho_dim(&self) -> usize {
         self.rho_dim
     }
 }
@@ -265,11 +265,11 @@ impl PerAtomEfsConfig {
 }
 
 #[inline]
-fn project_axis(value: f64, lo: f64, hi: f64) -> f64 {
+pub(crate) fn project_axis(value: f64, lo: f64, hi: f64) -> f64 {
     value.max(lo).min(hi)
 }
 
-fn project_to_bounds(rho: &Array1<f64>, cfg: &PerAtomEfsConfig) -> Array1<f64> {
+pub(crate) fn project_to_bounds(rho: &Array1<f64>, cfg: &PerAtomEfsConfig) -> Array1<f64> {
     let mut out = rho.clone();
     for i in 0..out.len() {
         out[i] = project_axis(out[i], cfg.lower[i], cfg.upper[i]);
@@ -280,7 +280,7 @@ fn project_to_bounds(rho: &Array1<f64>, cfg: &PerAtomEfsConfig) -> Array1<f64> {
 /// Clamp a raw multiplicative log-λ step to the per-atom maximum, treating
 /// non-finite raw steps as zero (the coordinate makes no move this iteration).
 #[inline]
-fn sanitize_step(raw: f64) -> f64 {
+pub(crate) fn sanitize_step(raw: f64) -> f64 {
     if raw.is_finite() {
         raw.clamp(-PER_ATOM_MAX_STEP, PER_ATOM_MAX_STEP)
     } else {
@@ -363,7 +363,7 @@ pub fn theta_hvp_matrix_free(
 /// central FD pair. The `m` probes are independent, so they fan across rayon —
 /// but only when an exact operator backs them (the FD branch mutates shared
 /// objective state through `eval_at` and must stay sequential).
-fn border_hessian_block(
+pub(crate) fn border_hessian_block(
     topology: &SharedBorderTopology,
     operator: Option<&Arc<dyn OuterHessianOperator>>,
     rho: &Array1<f64>,
@@ -439,7 +439,7 @@ fn border_hessian_block(
 /// where the EFS multiplicative surrogate's PSD assumption is weakest); the
 /// ridge scales with the block's diagonal magnitude so it is basis-aware and
 /// vanishes for a well-conditioned block.
-fn shared_border_correction(
+pub(crate) fn shared_border_correction(
     topology: &SharedBorderTopology,
     operator: Option<&Arc<dyn OuterHessianOperator>>,
     rho: &Array1<f64>,
@@ -519,7 +519,7 @@ fn shared_border_correction(
 /// the first α whose projected cost does not increase beyond the descent
 /// tolerance. Returns the accepted `(rho_new, cost_new, alpha)`, or `None` when
 /// no halving was accepted (the caller then surfaces a stall).
-fn backtrack_cost(
+pub(crate) fn backtrack_cost(
     obj: &mut dyn OuterObjective,
     rho: &Array1<f64>,
     full_step: &Array1<f64>,
@@ -769,8 +769,8 @@ mod tests {
     use ndarray::array;
 
     /// Exact outer-Hessian operator for the quadratic mock: `v ↦ A·v`.
-    struct QuadraticOperator {
-        a: Array2<f64>,
+    pub(crate) struct QuadraticOperator {
+        pub(crate) a: Array2<f64>,
     }
 
     impl OuterHessianOperator for QuadraticOperator {
@@ -791,16 +791,16 @@ mod tests {
     /// returns the *same* analytic gradient `A(ρ − t)` plus the exact
     /// operator, and `eval_cost` the same cost. Every layer of the per-atom
     /// runner is thereby probed against one shared ground truth.
-    struct QuadraticObjective {
-        a: Array2<f64>,
-        target: Array1<f64>,
+    pub(crate) struct QuadraticObjective {
+        pub(crate) a: Array2<f64>,
+        pub(crate) target: Array1<f64>,
     }
 
     impl QuadraticObjective {
-        fn grad(&self, rho: &Array1<f64>) -> Array1<f64> {
+        pub(crate) fn grad(&self, rho: &Array1<f64>) -> Array1<f64> {
             self.a.dot(&(rho - &self.target))
         }
-        fn cost(&self, rho: &Array1<f64>) -> f64 {
+        pub(crate) fn cost(&self, rho: &Array1<f64>) -> f64 {
             let e = rho - &self.target;
             0.5 * e.dot(&self.a.dot(&e))
         }
@@ -856,7 +856,7 @@ mod tests {
         }
     }
 
-    fn wide_bounds(dim: usize) -> PerAtomEfsConfig {
+    pub(crate) fn wide_bounds(dim: usize) -> PerAtomEfsConfig {
         PerAtomEfsConfig::new(
             1e-9,
             200,
@@ -866,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn with_border_axes_sorts_dedups_and_validates() {
+    pub(crate) fn with_border_axes_sorts_dedups_and_validates() {
         let t = SharedBorderTopology::with_border_axes(8, vec![5, 1, 5, 3]).expect("topology");
         assert_eq!(t.border_axes(), &[1, 3, 5]);
         assert_eq!(t.border_count(), 3);
@@ -878,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn decoupled_primary_converges_on_separable_objective() {
+    pub(crate) fn decoupled_primary_converges_on_separable_objective() {
         // Diagonal A: the per-atom decoupled step IS the exact Newton step for
         // every coordinate, so the frontier primary must converge to the
         // target with no border correction at all.
@@ -911,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn border_correction_solves_the_coupled_block() {
+    pub(crate) fn border_correction_solves_the_coupled_block() {
         // Axes 0 and 1 are coupled through an off-diagonal Hessian block (the
         // arrow-border overlap); the rest are diagonal. With the populated
         // topology and the exact operator the runner must land on the global
@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn theta_hvp_fd_fallback_matches_the_analytic_action() {
+    pub(crate) fn theta_hvp_fd_fallback_matches_the_analytic_action() {
         // The matrix-free θ-HVP's central-difference branch must reproduce
         // H·v of the analytic quadratic to O(h²).
         let a = array![[2.0, 0.3, 0.0], [0.3, 1.5, -0.2], [0.0, -0.2, 4.0]];
@@ -975,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn full_border_reduces_to_dense_newton_in_one_correction() {
+    pub(crate) fn full_border_reduces_to_dense_newton_in_one_correction() {
         // When the border is the WHOLE ρ-vector (small K), layer 2 is the
         // exact dense Newton step on the same gradient — so from any seed a
         // pure quadratic should converge essentially immediately (Newton is
@@ -1007,9 +1007,9 @@ mod tests {
 
     /// Wraps a quadratic objective but reports its `½log|H|` term as a certified
     /// enclosure with a fixed gap, so the #1011 EFS margin gate can be exercised.
-    struct EnclosureGapObjective {
-        inner: QuadraticObjective,
-        gap: f64,
+    pub(crate) struct EnclosureGapObjective {
+        pub(crate) inner: QuadraticObjective,
+        pub(crate) gap: f64,
     }
 
     impl OuterObjective for EnclosureGapObjective {
@@ -1042,7 +1042,7 @@ mod tests {
     /// the cost down at the decision's resolution. The run instead exhausts its
     /// iteration budget without a premature `converged = true`.
     #[test]
-    fn efs_refuses_to_converge_below_the_logdet_enclosure_margin() {
+    pub(crate) fn efs_refuses_to_converge_below_the_logdet_enclosure_margin() {
         let dim = 96; // frontier-shaped K so the per-atom path is taken
         let a = Array2::from_shape_fn(
             (dim, dim),

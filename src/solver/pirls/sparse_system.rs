@@ -15,26 +15,26 @@ pub struct SparsePirlsDecision {
 }
 
 
-fn fmt_opt_usize(v: Option<usize>) -> String {
+pub(crate) fn fmt_opt_usize(v: Option<usize>) -> String {
     v.map(|v| v.to_string()).unwrap_or_else(|| "na".to_string())
 }
 
 
-fn fmt_opt_f64(v: Option<f64>) -> String {
+pub(crate) fn fmt_opt_f64(v: Option<f64>) -> String {
     v.map(|v| format!("{v:.4}"))
         .unwrap_or_else(|| "na".to_string())
 }
 
 
 impl SparsePirlsDecision {
-    fn path_str(&self) -> &'static str {
+    pub(crate) fn path_str(&self) -> &'static str {
         match self.path {
             PirlsLinearSolvePath::DenseTransformed => "dense_transformed",
             PirlsLinearSolvePath::SparseNative => "sparse_native",
         }
     }
 
-    fn format_fields(&self, path: &str) -> String {
+    pub(crate) fn format_fields(&self, path: &str) -> String {
         format!(
             "path={path} reason={} p={} nnz_x={} nnz_xtwx_symbolic={} nnz_s_lambda={} nnz_h_est={} density_h_est={}",
             self.reason,
@@ -47,7 +47,7 @@ impl SparsePirlsDecision {
         )
     }
 
-    fn log_once(&self) {
+    pub(crate) fn log_once(&self) {
         let path = self.path_str();
         let key = self.format_fields(path);
         let repetition_count = pirls_decision_repetition_count(key.clone());
@@ -68,8 +68,8 @@ impl SparsePirlsDecision {
 }
 
 
-fn pirls_decision_repetition_count(log_key: String) -> usize {
-    static PIRLS_DECISION_LOG_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+pub(crate) fn pirls_decision_repetition_count(log_key: String) -> usize {
+    pub(crate) static PIRLS_DECISION_LOG_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
     let counts = PIRLS_DECISION_LOG_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut counts = counts.lock().expect("pirls decision log counter poisoned");
     let count = counts.entry(log_key).or_insert(0);
@@ -78,23 +78,23 @@ fn pirls_decision_repetition_count(log_key: String) -> usize {
 }
 
 
-fn should_log_pirls_decision_summary(repetition_count: usize) -> bool {
+pub(crate) fn should_log_pirls_decision_summary(repetition_count: usize) -> bool {
     repetition_count > 1 && repetition_count.is_power_of_two()
 }
 
 
-const SPARSE_NATIVE_MAX_H_DENSITY: f64 = 0.30;
+pub(crate) const SPARSE_NATIVE_MAX_H_DENSITY: f64 = 0.30;
 
 
 #[derive(Clone, Debug)]
-struct SparsePenaltyPattern {
-    upper_triplets: Vec<(usize, usize, f64)>,
-    nnz_upper: usize,
+pub(crate) struct SparsePenaltyPattern {
+    pub(crate) upper_triplets: Vec<(usize, usize, f64)>,
+    pub(crate) nnz_upper: usize,
 }
 
 
 impl SparsePenaltyPattern {
-    fn from_dense_upper(matrix: &Array2<f64>, tol: f64) -> Self {
+    pub(crate) fn from_dense_upper(matrix: &Array2<f64>, tol: f64) -> Self {
         let p = matrix.nrows().min(matrix.ncols());
         let mut upper_triplets = Vec::new();
         for col in 0..p {
@@ -146,19 +146,19 @@ pub(crate) struct SparsePenalizedSystemStats {
 // nonzeros needed for spline penalties. For banded spline systems with
 // half-bandwidth b, the work scales like sum_j |N(j)|^2 = O(p b^2) instead of
 // dense O(p^3), where N(j) is the subdiagonal nonzero pattern of column j of L.
-struct SparsePenalizedSystemCache {
-    xtwx_cache: SparseXtWxCache,
-    penalty_pattern: SparsePenaltyPattern,
-    h_upper_symbolic: SymbolicSparseColMat<usize>,
-    h_uppervalues: Vec<f64>,
-    h_upper_col_ptr: Vec<usize>,
-    h_upperrow_idx: Vec<usize>,
-    p: usize,
+pub(crate) struct SparsePenalizedSystemCache {
+    pub(crate) xtwx_cache: SparseXtWxCache,
+    pub(crate) penalty_pattern: SparsePenaltyPattern,
+    pub(crate) h_upper_symbolic: SymbolicSparseColMat<usize>,
+    pub(crate) h_uppervalues: Vec<f64>,
+    pub(crate) h_upper_col_ptr: Vec<usize>,
+    pub(crate) h_upperrow_idx: Vec<usize>,
+    pub(crate) p: usize,
 }
 
 
 impl SparsePenalizedSystemCache {
-    fn new(
+    pub(crate) fn new(
         x: &SparseColMat<usize, f64>,
         penalty_pattern: SparsePenaltyPattern,
     ) -> Result<Self, EstimationError> {
@@ -182,7 +182,7 @@ impl SparsePenalizedSystemCache {
         })
     }
 
-    fn matches(
+    pub(crate) fn matches(
         &self,
         x: &SparseColMat<usize, f64>,
         penalty_pattern: &SparsePenaltyPattern,
@@ -192,7 +192,7 @@ impl SparsePenalizedSystemCache {
             && self.penalty_pattern.upper_triplets == penalty_pattern.upper_triplets
     }
 
-    fn stats(&self) -> SparsePenalizedSystemStats {
+    pub(crate) fn stats(&self) -> SparsePenalizedSystemStats {
         let upper_total = self.p.saturating_mul(self.p + 1) / 2;
         SparsePenalizedSystemStats {
             nnz_xtwx_symbolic: self.xtwx_cache.xtwx_symbolic.row_idx().len(),
@@ -206,7 +206,7 @@ impl SparsePenalizedSystemCache {
         }
     }
 
-    fn assemble_upper(
+    pub(crate) fn assemble_upper(
         &mut self,
         x: &SparseColMat<usize, f64>,
         weights: &Array1<f64>,
@@ -319,7 +319,7 @@ impl SparsePenalizedSystemCache {
 }
 
 
-fn build_penalized_symbolic(
+pub(crate) fn build_penalized_symbolic(
     p: usize,
     xtwx_col_ptr: &[usize],
     xtwxrow_idx: &[usize],

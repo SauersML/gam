@@ -9,7 +9,7 @@ use super::*;
 /// could act on a gated atom (at `MARGIN = 4`, `σ((l−θ)/τ) < σ(−4) ≈ 0.018` at
 /// the band edge). Without the band the gate is an absorbing pruning rule, not a
 /// learnable gate.
-const JUMPRELU_REACTIVATION_MARGIN: f64 = 4.0;
+pub(crate) const JUMPRELU_REACTIVATION_MARGIN: f64 = 4.0;
 
 /// Shared band predicate for JumpReLU optimization inclusion. An atom is kept
 /// optimizable (compact-layout inclusion and prior-gradient support) when its
@@ -17,7 +17,7 @@ const JUMPRELU_REACTIVATION_MARGIN: f64 = 4.0;
 /// This is strictly weaker than the hard forward gate `logit > threshold`,
 /// which still governs data-fit reconstruction and its logit JVP.
 #[inline]
-fn jumprelu_in_optimization_band(logit: f64, threshold: f64, temperature: f64) -> bool {
+pub(crate) fn jumprelu_in_optimization_band(logit: f64, threshold: f64, temperature: f64) -> bool {
     logit > threshold - JUMPRELU_REACTIVATION_MARGIN * temperature
 }
 /// Per-row active-set layout for sparse SAE assignment (any mode).
@@ -124,7 +124,7 @@ impl SaeRowLayout {
     }
 
     /// Build from explicit per-row active-atom index lists.
-    fn from_active_atoms(
+    pub(crate) fn from_active_atoms(
         active_atoms: Vec<Vec<usize>>,
         coord_dims: Vec<usize>,
         coord_offsets_full: Vec<usize>,

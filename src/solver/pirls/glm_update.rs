@@ -245,7 +245,7 @@ pub fn update_glmvectors_by_family(
 }
 
 
-fn integrated_inverse_link_from_family(
+pub(crate) fn integrated_inverse_link_from_family(
     spec: &LikelihoodSpec,
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,

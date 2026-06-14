@@ -52,8 +52,8 @@ impl TransformationNormalFamily {
         let response_upper_basis = &self.response_upper_basis;
 
         pub(crate) struct ScopAccum {
-            gradient: Array1<f64>,
-            hessian: Array2<f64>,
+            pub(crate) gradient: Array1<f64>,
+            pub(crate) hessian: Array2<f64>,
         }
 
         impl ScopAccum {
@@ -1286,14 +1286,14 @@ impl TransformationNormalFamily {
         let row_gamma = row_quantities.gamma.as_ref();
 
         pub(crate) struct DhTraceScratch {
-            gamma: Vec<f64>,
-            gamma_dir: Vec<f64>,
-            h_factor: Vec<f64>,
-            hp_factor: Vec<f64>,
-            h_factor_dir: Vec<f64>,
-            hp_factor_dir: Vec<f64>,
-            endpoint_factor: [Vec<f64>; 2],
-            endpoint_factor_dir: [Vec<f64>; 2],
+            pub(crate) gamma: Vec<f64>,
+            pub(crate) gamma_dir: Vec<f64>,
+            pub(crate) h_factor: Vec<f64>,
+            pub(crate) hp_factor: Vec<f64>,
+            pub(crate) h_factor_dir: Vec<f64>,
+            pub(crate) hp_factor_dir: Vec<f64>,
+            pub(crate) endpoint_factor: [Vec<f64>; 2],
+            pub(crate) endpoint_factor_dir: [Vec<f64>; 2],
         }
 
         impl DhTraceScratch {

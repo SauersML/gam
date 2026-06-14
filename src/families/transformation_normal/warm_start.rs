@@ -151,7 +151,7 @@ pub(crate) fn compute_warm_start(
     Ok(beta)
 }
 
-fn estimate_default_warm_start(
+pub(crate) fn estimate_default_warm_start(
     response: &Array1<f64>,
     weights: &Array1<f64>,
     covariate_design: &DesignMatrix,

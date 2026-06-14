@@ -754,9 +754,9 @@ pub(crate) fn assemble_active_constraint_block(
 }
 
 pub(crate) struct SimpleLowerBounds {
-    lower_bounds: Array1<f64>,
-    row_to_coeff: Vec<usize>,
-    coeff_to_row: Vec<Option<usize>>,
+    pub(crate) lower_bounds: Array1<f64>,
+    pub(crate) row_to_coeff: Vec<usize>,
+    pub(crate) coeff_to_row: Vec<Option<usize>>,
 }
 
 pub(crate) fn extract_simple_lower_bounds(
@@ -911,19 +911,19 @@ pub(crate) fn normalize_active_sets(
 }
 
 pub(crate) struct BlockUpdateContext<'a> {
-    family: &'a dyn CustomFamily,
-    states: &'a [ParameterBlockState],
-    spec: &'a ParameterBlockSpec,
-    block_idx: usize,
-    s_lambda: &'a Array2<f64>,
-    options: &'a BlockwiseFitOptions,
-    linear_constraints: Option<&'a LinearInequalityConstraints>,
-    cached_active_set: Option<&'a [usize]>,
+    pub(crate) family: &'a dyn CustomFamily,
+    pub(crate) states: &'a [ParameterBlockState],
+    pub(crate) spec: &'a ParameterBlockSpec,
+    pub(crate) block_idx: usize,
+    pub(crate) s_lambda: &'a Array2<f64>,
+    pub(crate) options: &'a BlockwiseFitOptions,
+    pub(crate) linear_constraints: Option<&'a LinearInequalityConstraints>,
+    pub(crate) cached_active_set: Option<&'a [usize]>,
 }
 
 pub(crate) struct BlockUpdateResult {
-    beta_new_raw: Array1<f64>,
-    active_set: Option<Vec<usize>>,
+    pub(crate) beta_new_raw: Array1<f64>,
+    pub(crate) active_set: Option<Vec<usize>>,
 }
 
 #[inline]
@@ -946,8 +946,8 @@ pub(crate) trait ParameterBlockUpdater {
 }
 
 pub(crate) struct DiagonalBlockUpdater<'a> {
-    working_response: &'a Array1<f64>,
-    working_weights: &'a Array1<f64>,
+    pub(crate) working_response: &'a Array1<f64>,
+    pub(crate) working_weights: &'a Array1<f64>,
 }
 
 impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
@@ -1045,8 +1045,8 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
 }
 
 pub(crate) struct ExactNewtonBlockUpdater<'a> {
-    gradient: &'a Array1<f64>,
-    hessian: &'a SymmetricMatrix,
+    pub(crate) gradient: &'a Array1<f64>,
+    pub(crate) hessian: &'a SymmetricMatrix,
 }
 
 impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
@@ -1241,7 +1241,7 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
 }
 
 impl BlockWorkingSet {
-    fn updater(&self) -> Box<dyn ParameterBlockUpdater + '_> {
+    pub(crate) fn updater(&self) -> Box<dyn ParameterBlockUpdater + '_> {
         match self {
             BlockWorkingSet::Diagonal {
                 working_response,
@@ -1701,7 +1701,7 @@ pub(crate) fn penalty_logdet_cholesky_fallback(
         .fold(0.0_f64, f64::max)
         .max(1.0);
 
-    const MAX_ATTEMPTS: usize = 6;
+    pub(crate) const MAX_ATTEMPTS: usize = 6;
     let initial_boost = diag_scale * 1e-8;
 
     let outcome = try_cholesky_with_escalating_ridge(

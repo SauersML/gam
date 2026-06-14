@@ -1,30 +1,30 @@
 use super::*;
 
 pub(crate) struct TensorKroneckerPsiOperator {
-    response_val_basis: Arc<Array2<f64>>,
-    covariate_design: DesignMatrix,
-    covariate_derivs: Vec<CustomFamilyBlockPsiDerivative>,
-    covariate_first_cache: Arc<Vec<Mutex<Option<Arc<Array2<f64>>>>>>,
+    pub(crate) response_val_basis: Arc<Array2<f64>>,
+    pub(crate) covariate_design: DesignMatrix,
+    pub(crate) covariate_derivs: Vec<CustomFamilyBlockPsiDerivative>,
+    pub(crate) covariate_first_cache: Arc<Vec<Mutex<Option<Arc<Array2<f64>>>>>>,
 }
 
 impl TensorKroneckerPsiOperator {
-    fn n_data(&self) -> usize {
+    pub(crate) fn n_data(&self) -> usize {
         self.response_val_basis.nrows()
     }
 
-    fn p_resp(&self) -> usize {
+    pub(crate) fn p_resp(&self) -> usize {
         self.response_val_basis.ncols()
     }
 
-    fn p_cov(&self) -> usize {
+    pub(crate) fn p_cov(&self) -> usize {
         self.covariate_design.ncols()
     }
 
-    fn p_out(&self) -> usize {
+    pub(crate) fn p_out(&self) -> usize {
         self.p_resp() * self.p_cov()
     }
 
-    fn cov_deriv(
+    pub(crate) fn cov_deriv(
         &self,
         axis: usize,
     ) -> Result<&CustomFamilyBlockPsiDerivative, crate::terms::basis::BasisError> {
@@ -36,7 +36,7 @@ impl TensorKroneckerPsiOperator {
         })
     }
 
-    fn cov_forward_first(
+    pub(crate) fn cov_forward_first(
         &self,
         axis: usize,
         u: &ndarray::ArrayView1<'_, f64>,
@@ -53,7 +53,7 @@ impl TensorKroneckerPsiOperator {
         op.forward_mul(deriv.implicit_axis, u)
     }
 
-    fn cov_transpose_first(
+    pub(crate) fn cov_transpose_first(
         &self,
         axis: usize,
         v: &ndarray::ArrayView1<'_, f64>,
@@ -70,7 +70,7 @@ impl TensorKroneckerPsiOperator {
         op.transpose_mul(deriv.implicit_axis, v)
     }
 
-    fn cov_forward_second(
+    pub(crate) fn cov_forward_second(
         &self,
         axis_d: usize,
         axis_e: usize,
@@ -100,7 +100,7 @@ impl TensorKroneckerPsiOperator {
         Ok(Array1::<f64>::zeros(self.n_data()))
     }
 
-    fn cov_transpose_second(
+    pub(crate) fn cov_transpose_second(
         &self,
         axis_d: usize,
         axis_e: usize,
@@ -130,7 +130,7 @@ impl TensorKroneckerPsiOperator {
         Ok(Array1::<f64>::zeros(self.p_cov()))
     }
 
-    fn cov_first_axis_row_chunk(
+    pub(crate) fn cov_first_axis_row_chunk(
         &self,
         axis: usize,
         rows: std::ops::Range<usize>,
@@ -151,7 +151,7 @@ impl TensorKroneckerPsiOperator {
         op.row_chunk_first(deriv.implicit_axis, rows)
     }
 
-    fn cov_first_axis_row_chunk_streaming(
+    pub(crate) fn cov_first_axis_row_chunk_streaming(
         &self,
         axis: usize,
         rows: std::ops::Range<usize>,
@@ -168,7 +168,7 @@ impl TensorKroneckerPsiOperator {
         op.row_chunk_first(deriv.implicit_axis, rows)
     }
 
-    fn cov_second_axis_row_chunk(
+    pub(crate) fn cov_second_axis_row_chunk(
         &self,
         axis_d: usize,
         axis_e: usize,
@@ -195,7 +195,7 @@ impl TensorKroneckerPsiOperator {
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p_cov())))
     }
 
-    fn lifted_row_chunk_from_cov(
+    pub(crate) fn lifted_row_chunk_from_cov(
         &self,
         rows: std::ops::Range<usize>,
         cov: &Array2<f64>,
@@ -214,7 +214,7 @@ impl TensorKroneckerPsiOperator {
         Ok(dense_rowwise_kronecker(resp, cov.view()))
     }
 
-    fn materialize_cov_first_axis_uncached(
+    pub(crate) fn materialize_cov_first_axis_uncached(
         &self,
         axis: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
@@ -235,7 +235,7 @@ impl TensorKroneckerPsiOperator {
         mat_op.materialize_first(deriv.implicit_axis)
     }
 
-    fn cov_first_axis_cache_fits_budget(&self) -> bool {
+    pub(crate) fn cov_first_axis_cache_fits_budget(&self) -> bool {
         let policy = ResourcePolicy::default_library();
         let per_axis_bytes = self
             .n_data()
@@ -246,7 +246,7 @@ impl TensorKroneckerPsiOperator {
             && all_axes_bytes <= policy.max_operator_cache_bytes
     }
 
-    fn materialize_cov_first_axis_arc(
+    pub(crate) fn materialize_cov_first_axis_arc(
         &self,
         axis: usize,
     ) -> Result<Arc<Array2<f64>>, crate::terms::basis::BasisError> {
@@ -271,7 +271,7 @@ impl TensorKroneckerPsiOperator {
         Ok(materialized)
     }
 
-    fn materialize_cov_first(
+    pub(crate) fn materialize_cov_first(
         &self,
         axis: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
@@ -283,7 +283,7 @@ impl TensorKroneckerPsiOperator {
     /// Per-axis covariate first-derivative materialization for axis `axis`,
     /// equivalent to the unit-vector dispatch through
     /// [`materialize_cov_directional`].
-    fn materialize_cov_first_axis(
+    pub(crate) fn materialize_cov_first_axis(
         &self,
         axis: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
@@ -294,7 +294,7 @@ impl TensorKroneckerPsiOperator {
     /// Calling with `v_psi = e_axis` matches [`materialize_cov_first_axis`] at axis.
     /// Used by the directional outer-HVP path to compute `cov_v` once per HVP
     /// instead of materializing each per-axis cov_j.
-    fn materialize_cov_directional(
+    pub(crate) fn materialize_cov_directional(
         &self,
         v_psi: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
@@ -316,7 +316,7 @@ impl TensorKroneckerPsiOperator {
         Ok(out)
     }
 
-    fn lifted_forward(
+    pub(crate) fn lifted_forward(
         &self,
         resp_basis: &Array2<f64>,
         axis: usize,
@@ -344,7 +344,7 @@ impl TensorKroneckerPsiOperator {
         Ok(out)
     }
 
-    fn lifted_transpose(
+    pub(crate) fn lifted_transpose(
         &self,
         resp_basis: &Array2<f64>,
         axis: usize,
@@ -367,7 +367,7 @@ impl TensorKroneckerPsiOperator {
         Ok(out)
     }
 
-    fn lifted_forward_second(
+    pub(crate) fn lifted_forward_second(
         &self,
         resp_basis: &Array2<f64>,
         axis_d: usize,
@@ -396,7 +396,7 @@ impl TensorKroneckerPsiOperator {
         Ok(out)
     }
 
-    fn lifted_transpose_second(
+    pub(crate) fn lifted_transpose_second(
         &self,
         resp_basis: &Array2<f64>,
         axis_d: usize,
@@ -420,7 +420,7 @@ impl TensorKroneckerPsiOperator {
         Ok(out)
     }
 
-    fn materialize_lifted(&self, resp_basis: &Array2<f64>, cov: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn materialize_lifted(&self, resp_basis: &Array2<f64>, cov: &Array2<f64>) -> Array2<f64> {
         dense_rowwise_kronecker(resp_basis.view(), cov.view())
     }
 
@@ -430,7 +430,7 @@ impl TensorKroneckerPsiOperator {
     /// Skips axes with `v_psi[j] == 0`, so calls with `v_psi = e_k` are
     /// numerically equivalent to a single direct `lifted_forward(_, k, β)` call
     /// (no extra n-vector accumulation, no rounding).
-    fn lifted_forward_directional(
+    pub(crate) fn lifted_forward_directional(
         &self,
         resp_basis: &Array2<f64>,
         v_psi: &ndarray::ArrayView1<'_, f64>,
@@ -458,7 +458,7 @@ impl TensorKroneckerPsiOperator {
     /// returns `Σ_j v_psi[j] · lifted_transpose(resp_basis, j, residual)`.
     ///
     /// Returns a single `(p_resp · p_cov)`-vector, NOT a stack indexed by axis.
-    fn lifted_transpose_directional(
+    pub(crate) fn lifted_transpose_directional(
         &self,
         resp_basis: &Array2<f64>,
         v_psi: &ndarray::ArrayView1<'_, f64>,
@@ -487,7 +487,7 @@ impl TensorKroneckerPsiOperator {
     /// Internal bilinear directional accumulator on a chosen response basis:
     /// returns `Σ_{j,k} v_psi[j] · w_psi[k] · lifted_transpose_second(resp_basis, j, k, residual)`.
     /// Mirror of [`lifted_forward_second_directional`] for the transpose direction.
-    fn lifted_transpose_second_directional(
+    pub(crate) fn lifted_transpose_second_directional(
         &self,
         resp_basis: &Array2<f64>,
         v_psi: &ndarray::ArrayView1<'_, f64>,
@@ -525,7 +525,7 @@ impl TensorKroneckerPsiOperator {
 
     /// Internal bilinear directional accumulator on a chosen response basis:
     /// returns `Σ_{j,k} v_psi[j] · w_psi[k] · lifted_forward_second(resp_basis, j, k, β)`.
-    fn lifted_forward_second_directional(
+    pub(crate) fn lifted_forward_second_directional(
         &self,
         resp_basis: &Array2<f64>,
         v_psi: &ndarray::ArrayView1<'_, f64>,
@@ -562,7 +562,7 @@ impl TensorKroneckerPsiOperator {
     /// Directional `Σ_j v_psi[j] · ∂(X · β)/∂ψ_j` on the value response basis.
     /// Calling with `v_psi = e_k` returns the same n-vector as
     /// [`forward_mul`](Self::forward_mul) at axis `k` (zero entries skipped).
-    fn forward_directional(
+    pub(crate) fn forward_directional(
         &self,
         v_psi: &ndarray::ArrayView1<'_, f64>,
         beta: &ndarray::ArrayView1<'_, f64>,
@@ -574,7 +574,7 @@ impl TensorKroneckerPsiOperator {
     /// Directional transpose against the value response basis.
     /// Calling with `v_psi = e_k` matches the per-axis `transpose_mul(k, residual)`
     /// surface on the trait.
-    fn transpose_directional(
+    pub(crate) fn transpose_directional(
         &self,
         v_psi: &ndarray::ArrayView1<'_, f64>,
         residual: &ndarray::ArrayView1<'_, f64>,
@@ -586,7 +586,7 @@ impl TensorKroneckerPsiOperator {
     /// Bilinear directional `Σ_{j,k} v_psi[j] · w_psi[k] · ∂²(X · β)/∂ψ_j∂ψ_k`
     /// on the value response basis. With `v_psi = e_a, w_psi = e_b` matches
     /// `forward_mul_second_diag(a)` (when a==b) or `forward_mul_second_cross(a,b)`.
-    fn forward_second_directional(
+    pub(crate) fn forward_second_directional(
         &self,
         v_psi: &ndarray::ArrayView1<'_, f64>,
         w_psi: &ndarray::ArrayView1<'_, f64>,
@@ -599,7 +599,7 @@ impl TensorKroneckerPsiOperator {
     /// Bilinear directional second-order transpose on the value response basis.
     /// With `v_psi = e_a, w_psi = e_b` matches the per-axis-pair
     /// `transpose_mul_second_diag(a)` (when a==b) or `transpose_mul_second_cross(a,b)`.
-    fn transpose_second_directional(
+    pub(crate) fn transpose_second_directional(
         &self,
         v_psi: &ndarray::ArrayView1<'_, f64>,
         w_psi: &ndarray::ArrayView1<'_, f64>,
@@ -771,52 +771,52 @@ impl MaterializablePsiDerivativeOperator for TensorKroneckerPsiOperator {
 /// first request so full-Hessian outer evaluations do not repeatedly traverse
 /// the same CTN rows for each `(ψ_i, ψ_j)` callback. The mixed
 /// `hessian_directional_derivative` hook still delegates to the direct path.
-struct TransformationNormalPsiWorkspaceCacheEntry {
-    objective_psi: f64,
-    score_psi: Array1<f64>,
-    op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-    axis: usize,
-    trace_axes: Arc<Vec<usize>>,
-    trace_axis_pos: usize,
-    row_gamma: Arc<Array2<f64>>,
-    row_h: Arc<Array1<f64>>,
-    row_h_prime: Arc<Array1<f64>>,
-    endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
-    beta: Arc<Array1<f64>>,
+pub(crate) struct TransformationNormalPsiWorkspaceCacheEntry {
+    pub(crate) objective_psi: f64,
+    pub(crate) score_psi: Array1<f64>,
+    pub(crate) op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    pub(crate) axis: usize,
+    pub(crate) trace_axes: Arc<Vec<usize>>,
+    pub(crate) trace_axis_pos: usize,
+    pub(crate) row_gamma: Arc<Array2<f64>>,
+    pub(crate) row_h: Arc<Array1<f64>>,
+    pub(crate) row_h_prime: Arc<Array1<f64>>,
+    pub(crate) endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
+    pub(crate) beta: Arc<Array1<f64>>,
 }
 
-struct TransformationNormalPsiWorkspaceAxisSnapshot {
-    op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-    axis: usize,
-    row_gamma: Arc<Array2<f64>>,
-    row_h: Arc<Array1<f64>>,
-    row_h_prime: Arc<Array1<f64>>,
-    endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
-    beta: Arc<Array1<f64>>,
+pub(crate) struct TransformationNormalPsiWorkspaceAxisSnapshot {
+    pub(crate) op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    pub(crate) axis: usize,
+    pub(crate) row_gamma: Arc<Array2<f64>>,
+    pub(crate) row_h: Arc<Array1<f64>>,
+    pub(crate) row_h_prime: Arc<Array1<f64>>,
+    pub(crate) endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
+    pub(crate) beta: Arc<Array1<f64>>,
 }
 
-struct TransformationNormalPsiWorkspacePairCacheEntry {
-    objective_psi_psi: f64,
-    score_psi_psi: Array1<f64>,
-    op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-    axis_i: usize,
-    axis_j: usize,
-    trace_axes: Arc<Vec<usize>>,
-    trace_axis_i_pos: usize,
-    trace_axis_j_pos: usize,
-    row_gamma: Arc<Array2<f64>>,
-    row_h: Arc<Array1<f64>>,
-    row_h_prime: Arc<Array1<f64>>,
-    endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
-    beta: Arc<Array1<f64>>,
+pub(crate) struct TransformationNormalPsiWorkspacePairCacheEntry {
+    pub(crate) objective_psi_psi: f64,
+    pub(crate) score_psi_psi: Array1<f64>,
+    pub(crate) op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    pub(crate) axis_i: usize,
+    pub(crate) axis_j: usize,
+    pub(crate) trace_axes: Arc<Vec<usize>>,
+    pub(crate) trace_axis_i_pos: usize,
+    pub(crate) trace_axis_j_pos: usize,
+    pub(crate) row_gamma: Arc<Array2<f64>>,
+    pub(crate) row_h: Arc<Array1<f64>>,
+    pub(crate) row_h_prime: Arc<Array1<f64>>,
+    pub(crate) endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
+    pub(crate) beta: Arc<Array1<f64>>,
 }
 
 pub(crate) struct TransformationNormalPsiWorkspace {
-    family: TransformationNormalFamily,
-    block_states: Vec<ParameterBlockState>,
-    derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    cache: Mutex<Option<Vec<TransformationNormalPsiWorkspaceCacheEntry>>>,
-    pair_cache:
+    pub(crate) family: TransformationNormalFamily,
+    pub(crate) block_states: Vec<ParameterBlockState>,
+    pub(crate) derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    pub(crate) cache: Mutex<Option<Vec<TransformationNormalPsiWorkspaceCacheEntry>>>,
+    pub(crate) pair_cache:
         Mutex<Option<Vec<Vec<Option<Arc<TransformationNormalPsiWorkspacePairCacheEntry>>>>>>,
 }
 
@@ -842,7 +842,7 @@ impl TransformationNormalPsiWorkspace {
     /// per-axis [`scop_psi_terms`] path that reloads it once per axis. Op
     /// counts are identical to the per-axis path; only the loop nesting and
     /// reduction shape change.
-    fn compute_all_axes(&self) -> Result<Vec<TransformationNormalPsiWorkspaceCacheEntry>, String> {
+    pub(crate) fn compute_all_axes(&self) -> Result<Vec<TransformationNormalPsiWorkspaceCacheEntry>, String> {
         crate::util::block_count::validate_block_count::<TransformationNormalError>(
             "TransformationNormalFamily",
             1,
@@ -934,20 +934,20 @@ impl TransformationNormalPsiWorkspace {
 
         // Single-pass row walk: for each row, load the per-row state once and
         // accumulate every axis's `objective_psi`/`score_psi` in lockstep.
-        struct PsiAllAxesAccum {
-            objective_psi: Vec<f64>,
-            score_psi: Vec<Array1<f64>>,
+        pub(crate) struct PsiAllAxesAccum {
+            pub(crate) objective_psi: Vec<f64>,
+            pub(crate) score_psi: Vec<Array1<f64>>,
         }
 
         impl PsiAllAxesAccum {
-            fn new(n_psi: usize, p_total: usize) -> Self {
+            pub(crate) fn new(n_psi: usize, p_total: usize) -> Self {
                 Self {
                     objective_psi: vec![0.0; n_psi],
                     score_psi: (0..n_psi).map(|_| Array1::<f64>::zeros(p_total)).collect(),
                 }
             }
 
-            fn merge(mut self, rhs: Self) -> Self {
+            pub(crate) fn merge(mut self, rhs: Self) -> Self {
                 for (a, v) in rhs.objective_psi.into_iter().enumerate() {
                     self.objective_psi[a] += v;
                 }
@@ -1161,7 +1161,7 @@ impl TransformationNormalPsiWorkspace {
         Ok(out)
     }
 
-    fn axis_snapshots(&self) -> Result<Vec<TransformationNormalPsiWorkspaceAxisSnapshot>, String> {
+    pub(crate) fn axis_snapshots(&self) -> Result<Vec<TransformationNormalPsiWorkspaceAxisSnapshot>, String> {
         let mut guard = self
             .cache
             .lock()
@@ -1185,7 +1185,7 @@ impl TransformationNormalPsiWorkspace {
             .collect())
     }
 
-    fn compute_pair_cache(
+    pub(crate) fn compute_pair_cache(
         &self,
     ) -> Result<Vec<Vec<Option<Arc<TransformationNormalPsiWorkspacePairCacheEntry>>>>, String> {
         let axes = self.axis_snapshots()?;
@@ -1236,13 +1236,13 @@ impl TransformationNormalPsiWorkspace {
         .max(1)
         .min(n.max(1));
 
-        struct PsiPairCacheAccum {
-            objective: f64,
-            score: Array1<f64>,
+        pub(crate) struct PsiPairCacheAccum {
+            pub(crate) objective: f64,
+            pub(crate) score: Array1<f64>,
         }
 
         impl PsiPairCacheAccum {
-            fn new(p_total: usize) -> Self {
+            pub(crate) fn new(p_total: usize) -> Self {
                 Self {
                     objective: 0.0,
                     score: Array1::<f64>::zeros(p_total),
@@ -1520,7 +1520,7 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
     }
 }
 
-fn extract_covariate_penalty_factor(penalty: &PenaltyMatrix) -> Result<Array2<f64>, String> {
+pub(crate) fn extract_covariate_penalty_factor(penalty: &PenaltyMatrix) -> Result<Array2<f64>, String> {
     match penalty {
         PenaltyMatrix::Dense(matrix) => Ok(matrix.clone()),
         PenaltyMatrix::Blockwise { .. } => Ok(penalty.to_dense()),
@@ -1622,7 +1622,7 @@ pub fn build_tensor_psi_derivatives(
     Ok(derivs)
 }
 
-fn lift_dense_covariate_penalty_derivative_components(
+pub(crate) fn lift_dense_covariate_penalty_derivative_components(
     components: &[(usize, Array2<f64>)],
     shape_resp: &Array2<f64>,
 ) -> Vec<(usize, PenaltyMatrix)> {
@@ -1633,7 +1633,7 @@ fn lift_dense_covariate_penalty_derivative_components(
     out
 }
 
-fn lift_covariate_penalty_derivative_components(
+pub(crate) fn lift_covariate_penalty_derivative_components(
     components: &[(usize, PenaltyMatrix)],
     shape_resp: &Array2<f64>,
 ) -> Result<Vec<(usize, PenaltyMatrix)>, String> {
@@ -1649,7 +1649,7 @@ fn lift_covariate_penalty_derivative_components(
     Ok(out)
 }
 
-fn push_lifted_covariate_penalty_component(
+pub(crate) fn push_lifted_covariate_penalty_component(
     out: &mut Vec<(usize, PenaltyMatrix)>,
     cov_penalty_idx: usize,
     ds_cov: Array2<f64>,

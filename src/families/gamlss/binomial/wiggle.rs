@@ -2629,24 +2629,24 @@ impl BinomialLocationScaleWiggleFamily {
 ///
 /// and combines `out_w = B^T r_b + (B')^T r_d` to form `H v` directly.
 pub(crate) struct BinomialLocationScaleWiggleHessianRowPieces {
-    coeff_tt: Array1<f64>,
-    coeff_tl: Array1<f64>,
-    coeff_ll: Array1<f64>,
-    coeff_tw_b: Array1<f64>,
-    coeff_tw_d: Array1<f64>,
-    coeff_lw_b: Array1<f64>,
-    coeff_lw_d: Array1<f64>,
-    coeffww: Array1<f64>,
-    b0: Array2<f64>,
-    d0: Array2<f64>,
+    pub(crate) coeff_tt: Array1<f64>,
+    pub(crate) coeff_tl: Array1<f64>,
+    pub(crate) coeff_ll: Array1<f64>,
+    pub(crate) coeff_tw_b: Array1<f64>,
+    pub(crate) coeff_tw_d: Array1<f64>,
+    pub(crate) coeff_lw_b: Array1<f64>,
+    pub(crate) coeff_lw_d: Array1<f64>,
+    pub(crate) coeffww: Array1<f64>,
+    pub(crate) b0: Array2<f64>,
+    pub(crate) d0: Array2<f64>,
 }
 
 pub(crate) struct ExpectedWiggleGeometryInputs<'a> {
-    x_t: Cow<'a, Array2<f64>>,
-    x_ls: Cow<'a, Array2<f64>>,
-    eta_t: &'a Array1<f64>,
-    eta_ls: &'a Array1<f64>,
-    etaw: &'a Array1<f64>,
+    pub(crate) x_t: Cow<'a, Array2<f64>>,
+    pub(crate) x_ls: Cow<'a, Array2<f64>>,
+    pub(crate) eta_t: &'a Array1<f64>,
+    pub(crate) eta_ls: &'a Array1<f64>,
+    pub(crate) etaw: &'a Array1<f64>,
 }
 
 impl BinomialLocationScaleWiggleHessianRowPieces {
@@ -2699,34 +2699,34 @@ impl BinomialLocationScaleWiggleHessianRowPieces {
 /// Hessian derivative `D_β H_L[u]`, shared by the dense `_directional_derivative`
 /// assembly and the matrix-free `bls_wiggle_directional_operator`.
 pub(crate) struct BinomialWiggleDhRowCoeffs {
-    coeff_tt: Array1<f64>,
-    coeff_tl: Array1<f64>,
-    coeff_ll: Array1<f64>,
-    coeff_tw_b: Array1<f64>,
-    coeff_tw_d: Array1<f64>,
-    coeff_tw_dd: Array1<f64>,
-    coeff_lw_b: Array1<f64>,
-    coeff_lw_d: Array1<f64>,
-    coeff_lw_dd: Array1<f64>,
-    coeffww_bb: Array1<f64>,
-    coeffww_db: Array1<f64>,
+    pub(crate) coeff_tt: Array1<f64>,
+    pub(crate) coeff_tl: Array1<f64>,
+    pub(crate) coeff_ll: Array1<f64>,
+    pub(crate) coeff_tw_b: Array1<f64>,
+    pub(crate) coeff_tw_d: Array1<f64>,
+    pub(crate) coeff_tw_dd: Array1<f64>,
+    pub(crate) coeff_lw_b: Array1<f64>,
+    pub(crate) coeff_lw_d: Array1<f64>,
+    pub(crate) coeff_lw_dd: Array1<f64>,
+    pub(crate) coeffww_bb: Array1<f64>,
+    pub(crate) coeffww_db: Array1<f64>,
 }
 
 /// All references needed to evaluate [`BinomialWiggleDhRowCoeffs`].
 pub(crate) struct BinomialWiggleDhRowInputs<'a> {
-    core0: &'a BinomialLocationScaleCore,
-    eta_t: &'a Array1<f64>,
-    etaw: &'a Array1<f64>,
-    sigma: &'a Array1<f64>,
-    m: &'a Array1<f64>,
-    g2: &'a Array1<f64>,
-    g3: &'a Array1<f64>,
-    b0: &'a Array2<f64>,
-    d0: &'a Array2<f64>,
-    dd0: &'a Array2<f64>,
-    uw: &'a Array1<f64>,
-    d_eta_t: &'a Array1<f64>,
-    d_eta_ls: &'a Array1<f64>,
+    pub(crate) core0: &'a BinomialLocationScaleCore,
+    pub(crate) eta_t: &'a Array1<f64>,
+    pub(crate) etaw: &'a Array1<f64>,
+    pub(crate) sigma: &'a Array1<f64>,
+    pub(crate) m: &'a Array1<f64>,
+    pub(crate) g2: &'a Array1<f64>,
+    pub(crate) g3: &'a Array1<f64>,
+    pub(crate) b0: &'a Array2<f64>,
+    pub(crate) d0: &'a Array2<f64>,
+    pub(crate) dd0: &'a Array2<f64>,
+    pub(crate) uw: &'a Array1<f64>,
+    pub(crate) d_eta_t: &'a Array1<f64>,
+    pub(crate) d_eta_ls: &'a Array1<f64>,
 }
 
 impl BinomialLocationScaleWiggleFamily {

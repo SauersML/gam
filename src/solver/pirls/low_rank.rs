@@ -247,7 +247,7 @@ mod low_rank_weight_pirls_tests {
     use crate::linalg::matrix::{LinearOperator, SignedWeightsView};
     use ndarray::{Array2, array};
 
-    fn tiny_design() -> DesignMatrix {
+    pub(crate) fn tiny_design() -> DesignMatrix {
         let x = array![
             [1.0, 0.5, -0.2],
             [0.3, 1.2, 0.4],
@@ -259,7 +259,7 @@ mod low_rank_weight_pirls_tests {
     }
 
     #[test]
-    fn xtwx_low_rank_matches_diagonal_when_rank_zero() {
+    pub(crate) fn xtwx_low_rank_matches_diagonal_when_rank_zero() {
         let design = tiny_design();
         let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
         let u = Array2::<f64>::zeros((5, 0));
@@ -275,7 +275,7 @@ mod low_rank_weight_pirls_tests {
     }
 
     #[test]
-    fn xtwy_low_rank_matches_dense_reference() {
+    pub(crate) fn xtwy_low_rank_matches_dense_reference() {
         let design = tiny_design();
         let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
         let u = array![
@@ -306,7 +306,7 @@ mod low_rank_weight_pirls_tests {
     }
 
     #[test]
-    fn woodbury_capacitance_is_well_formed() {
+    pub(crate) fn woodbury_capacitance_is_well_formed() {
         let uhat = array![[0.5, 0.1], [-0.2, 0.7], [0.3, -0.4]];
         let vhat = array![[0.1, 0.2], [0.6, -0.1], [-0.3, 0.4]];
         let cap = woodbury_gram_capacitance(&uhat, &vhat).unwrap();

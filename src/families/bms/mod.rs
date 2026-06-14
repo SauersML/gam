@@ -59,7 +59,7 @@ pub use deviation_runtime::ParametricAnchorBlock;
 /// geometry initializer and skips the iterative joint κ/ψ outer loop. This is
 /// a spatial-optimizer policy only; it must not gate exact outer Hessian
 /// capability or row-cell moment materialization.
-const BMS_FLEX_SPATIAL_OUTER_PILOT_ROW_THRESHOLD: usize = 50_000;
+pub(crate) const BMS_FLEX_SPATIAL_OUTER_PILOT_ROW_THRESHOLD: usize = 50_000;
 
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
@@ -211,28 +211,28 @@ pub enum LatentZNormalizationMode {
 }
 
 pub const DEFAULT_EMPIRICAL_LATENT_GRID_SIZE: usize = 65;
-const AUTO_Z_NORMAL_SKEW_TOL: f64 = 0.10;
-const AUTO_Z_NORMAL_KURT_TOL: f64 = 0.25;
-const AUTO_Z_NORMAL_KS_TOL: f64 = 0.025;
-const AUTO_Z_NORMAL_MAX_ABS: f64 = 8.0;
+pub(crate) const AUTO_Z_NORMAL_SKEW_TOL: f64 = 0.10;
+pub(crate) const AUTO_Z_NORMAL_KURT_TOL: f64 = 0.25;
+pub(crate) const AUTO_Z_NORMAL_KS_TOL: f64 = 0.025;
+pub(crate) const AUTO_Z_NORMAL_MAX_ABS: f64 = 8.0;
 /// Inner σ level at which the empirical tail mass of latent z is compared
 /// against the standard normal's theoretical two-sided tail in the auto
 /// normality gate. Chosen well inside `AUTO_Z_NORMAL_MAX_ABS` so a fat inner
 /// tail is caught before any single observation trips the hard `max |z|` bound.
-const AUTO_Z_NORMAL_TAIL_SIGMA_INNER: f64 = 4.0;
+pub(crate) const AUTO_Z_NORMAL_TAIL_SIGMA_INNER: f64 = 4.0;
 /// Outer σ level for the same tail-mass comparison; catches heavier far-tail
 /// excess that the inner level can miss.
-const AUTO_Z_NORMAL_TAIL_SIGMA_OUTER: f64 = 6.0;
+pub(crate) const AUTO_Z_NORMAL_TAIL_SIGMA_OUTER: f64 = 6.0;
 /// Multiplier applied to the normal's theoretical tail mass before comparison:
 /// the empirical tail may be up to this many times the Gaussian tail at the
 /// same σ before the gate fails, allowing for finite-sample sampling noise.
-const AUTO_Z_NORMAL_TAIL_MASS_SLACK: f64 = 2.0;
+pub(crate) const AUTO_Z_NORMAL_TAIL_MASS_SLACK: f64 = 2.0;
 /// Absolute additive floor on the inner-σ tail comparison, so the gate does
 /// not fail on round-off when the Gaussian tail itself is already tiny.
-const AUTO_Z_NORMAL_TAIL_FLOOR_INNER: f64 = 1e-5;
+pub(crate) const AUTO_Z_NORMAL_TAIL_FLOOR_INNER: f64 = 1e-5;
 /// Absolute additive floor on the outer-σ tail comparison; smaller than the
 /// inner floor because the 6σ Gaussian tail is many orders smaller than 4σ.
-const AUTO_Z_NORMAL_TAIL_FLOOR_OUTER: f64 = 1e-8;
+pub(crate) const AUTO_Z_NORMAL_TAIL_FLOOR_OUTER: f64 = 1e-8;
 /// Significance level for the conditional `E[z|C]` / `Var(z|C)` Rao gate in the
 /// core Auto path (#905). When the latent score's conditional mean or variance
 /// on the marginal-index span `a(C)` is significant at this level, the Auto
@@ -241,18 +241,18 @@ const AUTO_Z_NORMAL_TAIL_FLOOR_OUTER: f64 = 1e-8;
 /// on clear conditional structure, not finite-sample noise — the gate runs once
 /// over the whole training sample, so a per-test α this tight still has ample
 /// power against the grouping mean-shift the issue names.
-const AUTO_Z_CONDITIONAL_RAO_ALPHA: f64 = 1.0e-3;
+pub(crate) const AUTO_Z_CONDITIONAL_RAO_ALPHA: f64 = 1.0e-3;
 /// Relative ridge added to the weighted normal equations when regressing the
 /// latent score on the marginal-index span for the conditional correction.
 /// Stabilizes the solve when `a(C)` is rank-deficient or collinear (penalized
 /// spline marginal indices routinely are) without materially biasing the
 /// conditional mean/variance fit.
-const AUTO_Z_CONDITIONAL_RIDGE_REL: f64 = 1.0e-8;
+pub(crate) const AUTO_Z_CONDITIONAL_RIDGE_REL: f64 = 1.0e-8;
 /// Floor on the fitted conditional variance `v(C)`, as a fraction of the global
 /// weighted variance of the latent score. Keeps `ζ = (z−m)/√v` finite and
 /// well-scaled where the linear variance model would otherwise fit a
 /// non-positive or vanishing conditional variance.
-const AUTO_Z_CONDITIONAL_VAR_FLOOR_FRAC: f64 = 1.0e-3;
+pub(crate) const AUTO_Z_CONDITIONAL_VAR_FLOOR_FRAC: f64 = 1.0e-3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatentMeasureSpec {
@@ -409,7 +409,7 @@ impl LatentMeasureKind {
         }
     }
 
-    fn is_empirical(&self) -> bool {
+    pub(crate) fn is_empirical(&self) -> bool {
         matches!(
             self,
             Self::GlobalEmpirical { .. } | Self::LocalEmpirical { .. }
@@ -423,7 +423,7 @@ impl LatentMeasureKind {
     /// per evaluation across the whole fit. Only the local-mixture path,
     /// which genuinely synthesizes a new grid per row, returns an owned
     /// value.
-    fn empirical_grid_for_training_row(
+    pub(crate) fn empirical_grid_for_training_row(
         &self,
         row: usize,
     ) -> Result<Option<std::borrow::Cow<'_, EmpiricalZGrid>>, String> {
@@ -448,7 +448,7 @@ impl LatentMeasureKind {
     }
 }
 
-fn validate_empirical_z_grid(nodes: &[f64], weights: &[f64], context: &str) -> Result<(), String> {
+pub(crate) fn validate_empirical_z_grid(nodes: &[f64], weights: &[f64], context: &str) -> Result<(), String> {
     if nodes.len() != weights.len() {
         return Err(format!(
             "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
@@ -483,7 +483,7 @@ fn validate_empirical_z_grid(nodes: &[f64], weights: &[f64], context: &str) -> R
     Ok(())
 }
 
-fn combine_empirical_grids(
+pub(crate) fn combine_empirical_grids(
     grids: &[EmpiricalZGrid],
     mixture: &[(usize, f64)],
 ) -> Result<EmpiricalZGrid, String> {
@@ -772,7 +772,7 @@ impl LatentZRankIntCalibration {
         Self::apply_with_knots(z, &self.sorted_z, &self.weighted_cdf)
     }
 
-    fn apply_with_knots(z: f64, sorted_z: &[f64], weighted_cdf: &[f64]) -> f64 {
+    pub(crate) fn apply_with_knots(z: f64, sorted_z: &[f64], weighted_cdf: &[f64]) -> f64 {
         assert_eq!(sorted_z.len(), weighted_cdf.len());
         assert!(!sorted_z.is_empty());
         let n = sorted_z.len();
@@ -882,7 +882,7 @@ pub struct LatentZConditionalCalibration {
 
 impl LatentZConditionalCalibration {
     #[inline]
-    fn affine(coeffs: &[f64], a_row: ArrayView1<'_, f64>) -> f64 {
+    pub(crate) fn affine(coeffs: &[f64], a_row: ArrayView1<'_, f64>) -> f64 {
         let mut acc = coeffs[0];
         for (c, &x) in coeffs[1..].iter().zip(a_row.iter()) {
             acc += c * x;
@@ -890,11 +890,11 @@ impl LatentZConditionalCalibration {
         acc
     }
 
-    fn conditional_mean(&self, a_row: ArrayView1<'_, f64>) -> f64 {
+    pub(crate) fn conditional_mean(&self, a_row: ArrayView1<'_, f64>) -> f64 {
         Self::affine(&self.mean_coeffs, a_row)
     }
 
-    fn conditional_var(&self, a_row: ArrayView1<'_, f64>) -> f64 {
+    pub(crate) fn conditional_var(&self, a_row: ArrayView1<'_, f64>) -> f64 {
         if self.var_coeffs.is_empty() {
             self.global_var.max(self.var_floor)
         } else {
@@ -1156,7 +1156,7 @@ impl LatentZConditionalCalibration {
 /// fused-multiply GEMM is the same SIMD path used everywhere else in the
 /// codebase, instead of a hand-rolled triple loop whose partial sums could
 /// overflow on a single pathological row of the basis.
-fn weighted_ridge_sandwich_cov(
+pub(crate) fn weighted_ridge_sandwich_cov(
     basis: ArrayView2<'_, f64>,
     residuals: &[f64],
     weights: ArrayView1<'_, f64>,
@@ -1253,7 +1253,7 @@ fn weighted_ridge_sandwich_cov(
 }
 
 /// Weighted mean of a slice of values.
-fn weighted_mean(values: &[f64], weights: ArrayView1<'_, f64>, total_weight: f64) -> f64 {
+pub(crate) fn weighted_mean(values: &[f64], weights: ArrayView1<'_, f64>, total_weight: f64) -> f64 {
     values
         .iter()
         .zip(weights.iter())
@@ -1272,7 +1272,7 @@ fn weighted_mean(values: &[f64], weights: ArrayView1<'_, f64>, total_weight: f64
 ///
 /// Returns `None` when the test is degenerate (no usable basis directions),
 /// otherwise the asymptotic p-value.
-fn robust_conditional_score_pvalue(
+pub(crate) fn robust_conditional_score_pvalue(
     a_centered: ArrayView2<'_, f64>,
     u: &[f64],
     weights: ArrayView1<'_, f64>,
@@ -1346,7 +1346,7 @@ fn robust_conditional_score_pvalue(
 /// Returns `None` when there is no conditional structure to correct (the gate
 /// does not fire, or the basis is degenerate) — in that case the caller falls
 /// back to the existing pooled-marginal gate (rank-INT or no calibration).
-fn fit_conditional_latent_calibration_if_needed(
+pub(crate) fn fit_conditional_latent_calibration_if_needed(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     a_block: ArrayView2<'_, f64>,
@@ -1544,7 +1544,7 @@ fn fit_conditional_latent_calibration_if_needed(
 
 /// Prepend a column of ones to `a_block`, producing the `[1 | a(C)]` regression
 /// basis used by the conditional location-scale fit.
-fn build_intercept_basis(a_block: ArrayView2<'_, f64>) -> Array2<f64> {
+pub(crate) fn build_intercept_basis(a_block: ArrayView2<'_, f64>) -> Array2<f64> {
     let n = a_block.nrows();
     let p = a_block.ncols();
     let mut basis = Array2::<f64>::ones((n, p + 1));
@@ -1552,7 +1552,7 @@ fn build_intercept_basis(a_block: ArrayView2<'_, f64>) -> Array2<f64> {
     basis
 }
 
-fn build_latent_measure_with_geometry(
+pub(crate) fn build_latent_measure_with_geometry(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     policy: &LatentZPolicy,
@@ -1620,7 +1620,7 @@ fn build_latent_measure_with_geometry(
     }
 }
 
-fn latent_z_is_standard_normal_enough(
+pub(crate) fn latent_z_is_standard_normal_enough(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     policy: &LatentZPolicy,
@@ -1706,7 +1706,7 @@ fn latent_z_is_standard_normal_enough(
         && max_abs_z < AUTO_Z_NORMAL_MAX_ABS)
 }
 
-fn build_global_empirical_latent_measure(
+pub(crate) fn build_global_empirical_latent_measure(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     grid_size: usize,
@@ -1717,7 +1717,7 @@ fn build_global_empirical_latent_measure(
     Ok(measure)
 }
 
-fn weighted_ks_to_standard_normal(
+pub(crate) fn weighted_ks_to_standard_normal(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     total_weight: f64,
@@ -1750,7 +1750,7 @@ fn weighted_ks_to_standard_normal(
     Ok(ks)
 }
 
-fn weighted_tail_mass(
+pub(crate) fn weighted_tail_mass(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     total_weight: f64,
@@ -1764,7 +1764,7 @@ fn weighted_tail_mass(
         / total_weight
 }
 
-fn build_empirical_z_grid(
+pub(crate) fn build_empirical_z_grid(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     grid_size: usize,
@@ -1862,7 +1862,7 @@ fn build_empirical_z_grid(
     })
 }
 
-fn recenter_rescale_empirical_grid(nodes: &mut [f64], weights: &[f64]) {
+pub(crate) fn recenter_rescale_empirical_grid(nodes: &mut [f64], weights: &[f64]) {
     let total = weights.iter().sum::<f64>();
     if !(total.is_finite() && total > 0.0) {
         return;

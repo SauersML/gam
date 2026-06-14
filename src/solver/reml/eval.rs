@@ -7,18 +7,18 @@ use crate::linalg::utils::enforce_symmetry;
 // inverting it for sigma-point construction. Matches the analogous IFT
 // regularisation: tiny enough to leave well-conditioned Hessians intact,
 // large enough that a near-singular Hessian still yields a usable V_ρ.
-const AUTO_CUBATURE_HESSIAN_RIDGE_REL: f64 = 1e-8;
+pub(crate) const AUTO_CUBATURE_HESSIAN_RIDGE_REL: f64 = 1e-8;
 // Absolute floor for the diagonal ridge (prevents zero ridge when the
 // Hessian diagonal is degenerate / all-zero).
-const AUTO_CUBATURE_HESSIAN_RIDGE_ABS: f64 = 1e-8;
+pub(crate) const AUTO_CUBATURE_HESSIAN_RIDGE_ABS: f64 = 1e-8;
 // Inset from RHO_BOUND when clamping sigma points so the inner PIRLS
 // fit at a sigma point is strictly interior to the box constraint
 // (the box edge is unreachable by IRLS without barrier intervention).
-const AUTO_CUBATURE_RHO_CLAMP_INSET: f64 = 1e-8;
+pub(crate) const AUTO_CUBATURE_RHO_CLAMP_INSET: f64 = 1e-8;
 // Skip cubature when the first-order rho-Hessian inverse already shows
 // negligible posterior variance on rho (max diag < this threshold) and
 // neither boundary contact nor large outer-gradient flags fired.
-const AUTO_CUBATURE_RHOVAR_TRIGGER: f64 = 0.1;
+pub(crate) const AUTO_CUBATURE_RHOVAR_TRIGGER: f64 = 0.1;
 
 /// Severity classifier for first-order fallbacks taken by
 /// [`RemlState::compute_smoothing_correction_auto`].
@@ -133,7 +133,7 @@ pub(crate) type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
 /// var, no Cargo feature. The predicate inspects only build + runtime
 /// properties that determine correctness.
 #[inline]
-fn device_pirls_stage3_ready() -> bool {
+pub(crate) fn device_pirls_stage3_ready() -> bool {
     crate::gpu::cuda_selected() && crate::gpu::runtime::GpuRuntime::global().is_some()
 }
 
@@ -196,7 +196,7 @@ pub(crate) fn sigma_cubature_dispatch(
 ///   * `Ok(None)` — GPU path not eligible for this batch (sparse design,
 ///     family not in JIT-cached set, policy gate, etc.).
 ///   * `Err(_)` — GPU driver / shape failure the caller should log.
-fn sigma_cubature_evaluate_gpu_stream_pool(
+pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
     state: &RemlState<'_>,
     sigma_points: &[Array1<f64>],
 ) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu::GpuError> {
@@ -297,7 +297,7 @@ fn sigma_cubature_evaluate_gpu_stream_pool(
 /// leaky proxy that still let writes through (e.g. the adaptive-cap
 /// feedback and last_pirls_lm_lambda paths) and serialized unrelated
 /// REML evaluations racing the cubature window.
-fn sigma_cubature_evaluate_cpu_rayon(
+pub(crate) fn sigma_cubature_evaluate_cpu_rayon(
     state: &RemlState<'_>,
     sigma_points: &[Array1<f64>],
 ) -> Vec<SigmaPointResult> {
@@ -690,7 +690,7 @@ impl<'a> RemlState<'a> {
         // (BFGS / ARC / trust-region via `outer_scaled_tolerance`); deviance
         // is the dominant term in the REML cost at every scale and is the
         // natural cost proxy reachable from `PirlsResult`.
-        const HIGHGRAD_REL_TOL: f64 = 1e-3;
+        pub(crate) const HIGHGRAD_REL_TOL: f64 = 1e-3;
         let cost_scale = 1.0 + final_fit.deviance.abs();
         let highgrad = grad_norm > HIGHGRAD_REL_TOL * cost_scale;
         if !near_boundary && !highgrad {
@@ -938,7 +938,7 @@ impl<'a> RemlState<'a> {
 
     /// Emit the canonical `[smoothing-correction]` log line, update the
     /// process-wide counters, and return the outcome unchanged.
-    fn finalize_smoothing_outcome(
+    pub(crate) fn finalize_smoothing_outcome(
         &self,
         outcome: SmoothingCorrectionOutcome,
     ) -> SmoothingCorrectionOutcome {
@@ -1020,7 +1020,7 @@ mod sigma_cubature_accumulation_tests {
     /// satisfy; any drift away from it is a math bug, not a numerics
     /// issue, so the tolerance is at f64 round-off (1e-12 relative).
     #[test]
-    fn cubature_linear_exactness_recovers_jvjt() {
+    pub(crate) fn cubature_linear_exactness_recovers_jvjt() {
         // Pick a non-trivial (p, d_ρ, r) shape: p=4 outputs, d_ρ=3 inputs,
         // r=3 retained eigendirections → 2r = 6 sigma points. Use a
         // hand-built `V_ρ,r` with three distinct eigenvalues so the test
@@ -1143,7 +1143,7 @@ mod sigma_cubature_accumulation_tests {
     /// the cubature output equals exactly `A_0`. Guards the formula
     /// against a stray off-by-one in the variance subtraction.
     #[test]
-    fn cubature_single_point_collapses_to_a0() {
+    pub(crate) fn cubature_single_point_collapses_to_a0() {
         let p = 3;
         let a0: Array2<f64> = ndarray::array![[2.0, 0.5, 0.0], [0.5, 1.5, 0.25], [0.0, 0.25, 1.0]];
         let b0: Array1<f64> = ndarray::array![0.1, -0.2, 0.3];
@@ -1180,7 +1180,7 @@ mod sigma_cubature_accumulation_tests {
     /// sign of a partner, the empirical mean would acquire a non-zero
     /// J·(drift) term and this test would catch it.
     #[test]
-    fn cubature_antipodal_pairing_annihilates_linear_drift() {
+    pub(crate) fn cubature_antipodal_pairing_annihilates_linear_drift() {
         // 6 sigma points = 3 antipodal pairs along orthogonal axes.
         // Pick a non-trivial J and a non-zero b_0 so any leak shows up.
         let p = 3;
@@ -1263,7 +1263,7 @@ mod sigma_cubature_accumulation_tests {
     /// the accumulator onto either the A-side (this test fails) or the
     /// b-side (test #2/#4 fails) — not both at once.
     #[test]
-    fn cubature_constant_a_in_implies_constant_a_out_on_a_side() {
+    pub(crate) fn cubature_constant_a_in_implies_constant_a_out_on_a_side() {
         let p = 4;
         // Non-trivial SPD A_0.
         let a0: Array2<f64> = ndarray::array![
@@ -1307,7 +1307,7 @@ mod sigma_cubature_accumulation_tests {
     /// round-off. A future regression that introduced a stateful
     /// accumulator or order-dependent scratch would be caught here.
     #[test]
-    fn cubature_permutation_invariance_on_antipodal_pairs() {
+    pub(crate) fn cubature_permutation_invariance_on_antipodal_pairs() {
         let p = 4;
         let r = 3;
 
@@ -1399,7 +1399,7 @@ mod sigma_cubature_accumulation_tests {
     /// called twice on the same inputs, which is the contract either branch
     /// must satisfy.
     #[test]
-    fn cubature_dispatch_swap_site_invariant_holds_pre_gpu() {
+    pub(crate) fn cubature_dispatch_swap_site_invariant_holds_pre_gpu() {
         // device_pirls_stage3_ready is now true on CUDA hosts; no assertion here.
         // The former "must be false" check is replaced by the accumulator
         // determinism test below, which covers both CPU-only and CUDA hosts.
@@ -1450,7 +1450,7 @@ mod sigma_cubature_accumulation_tests {
     /// black-box covariance contribution). The formula is purely a
     /// total-covariance assembly; this test pins that.
     #[test]
-    fn cubature_arbitrary_spd_a_in_obeys_total_covariance_law() {
+    pub(crate) fn cubature_arbitrary_spd_a_in_obeys_total_covariance_law() {
         let p = 3;
         // Three distinct SPD A_m matrices unrelated to any Hessian
         // structure (built from random-ish but f64-exact entries via
@@ -1521,7 +1521,7 @@ mod sigma_cubature_accumulation_tests {
     /// unchanged. Pins that the accumulator is bilinear in `b_m` and
     /// does not, e.g., square the wrong row.
     #[test]
-    fn cubature_beta_scaling_propagates_quadratically() {
+    pub(crate) fn cubature_beta_scaling_propagates_quadratically() {
         let p = 3;
         let a0: Array2<f64> = ndarray::array![[2.0, 0.1, 0.0], [0.1, 1.5, 0.05], [0.0, 0.05, 1.0],];
         let raw_betas: Vec<Array1<f64>> = vec![
@@ -1566,7 +1566,7 @@ mod sigma_cubature_accumulation_tests {
     /// generic permutation (reverse order) to make sure no
     /// re-association breaks the result beyond f64 rounding noise.
     #[test]
-    fn cubature_full_reversal_permutation_invariance() {
+    pub(crate) fn cubature_full_reversal_permutation_invariance() {
         let p = 4;
         let m = 8;
         let mut points: Vec<(Array2<f64>, Array1<f64>)> = Vec::with_capacity(m);
@@ -1604,7 +1604,7 @@ mod sigma_cubature_accumulation_tests {
     /// the M doubles, which cancels with the count of duplicates. This
     /// catches off-by-one or weight-normalisation regressions.
     #[test]
-    fn cubature_m_doubling_leaves_output_unchanged() {
+    pub(crate) fn cubature_m_doubling_leaves_output_unchanged() {
         let p = 3;
         let a_mk = |s: f64| -> Array2<f64> {
             let mut a = Array2::<f64>::eye(p);
@@ -1654,7 +1654,7 @@ mod sigma_cubature_accumulation_tests {
     /// the mathematically correct degenerate output in case the gate
     /// is bypassed.
     #[test]
-    fn cubature_rank_deficient_v_rho_collapses_var_to_zero() {
+    pub(crate) fn cubature_rank_deficient_v_rho_collapses_var_to_zero() {
         let p = 3;
         let b_const: Array1<f64> = ndarray::array![0.7, -0.2, 0.4];
         // Three distinct A_m, all with the same b.
@@ -1717,7 +1717,7 @@ mod sigma_cubature_accumulation_tests {
     /// would-fail visibly in CI if regressed) is the principled place
     /// to encode it.
     #[test]
-    fn sigma_loop_v100_hill_climb_baseline() {
+    pub(crate) fn sigma_loop_v100_hill_climb_baseline() {
         // Large-scale accumulator inputs: p=50, M=8.
         let p = 50_usize;
         let m = 8_usize;
@@ -1809,7 +1809,7 @@ mod sigma_cubature_accumulation_tests {
     /// In the special case α + β = 1 this collapses to convex combination
     /// invariance on the A-side, which is what we pin here.
     #[test]
-    fn cubature_a_side_is_convex_on_input() {
+    pub(crate) fn cubature_a_side_is_convex_on_input() {
         let p = 3;
         let r = 2;
         let m = 2 * r;
@@ -1898,7 +1898,7 @@ mod sigma_cubature_accumulation_tests {
     /// Pins that the accumulator's b-side computes a *centred* second
     /// moment (not a raw second moment).
     #[test]
-    fn cubature_b_translation_leaves_output_unchanged() {
+    pub(crate) fn cubature_b_translation_leaves_output_unchanged() {
         let p = 3;
         let a_const: Array2<f64> =
             ndarray::array![[1.5, 0.2, 0.0], [0.2, 1.2, 0.1], [0.0, 0.1, 1.0],];
@@ -1947,7 +1947,7 @@ mod sigma_cubature_accumulation_tests {
     /// not introduce spurious cross-block coupling (e.g. via a buggy
     /// outer-product loop that wraps indices).
     #[test]
-    fn cubature_block_diagonal_inputs_yield_block_diagonal_output() {
+    pub(crate) fn cubature_block_diagonal_inputs_yield_block_diagonal_output() {
         let p_top = 2;
         let p_bot = 2;
         let p = p_top + p_bot;
@@ -2018,7 +2018,7 @@ mod sigma_cubature_accumulation_tests {
     /// passes the output to `enforce_symmetry` and any drift here is a
     /// silent bug masked by that downstream cleanup.
     #[test]
-    fn cubature_output_is_symmetric_for_symmetric_inputs() {
+    pub(crate) fn cubature_output_is_symmetric_for_symmetric_inputs() {
         let p = 5;
         let m = 6;
         let points: Vec<(Array2<f64>, Array1<f64>)> = (0..m)
@@ -2062,7 +2062,7 @@ mod sigma_cubature_accumulation_tests {
     /// multiset of A_m). Pins that the accumulator's A-side and b-side
     /// are truly decoupled in code, not just in math.
     #[test]
-    fn cubature_a_side_unchanged_under_b_permutation() {
+    pub(crate) fn cubature_a_side_unchanged_under_b_permutation() {
         let p = 3;
         let m = 6;
         let a_set: Vec<Array2<f64>> = (0..m)
@@ -2133,7 +2133,7 @@ mod smoothing_correction_outcome_tests {
     use ndarray::array;
     use std::sync::atomic::Ordering;
 
-    fn make_first_order(
+    pub(crate) fn make_first_order(
         reason: &'static str,
         severity: SmoothingCorrectionFallbackSeverity,
         with_matrix: bool,
@@ -2151,7 +2151,7 @@ mod smoothing_correction_outcome_tests {
     }
 
     #[test]
-    fn cubature_branch_label_and_extraction() {
+    pub(crate) fn cubature_branch_label_and_extraction() {
         let outcome = SmoothingCorrectionOutcome::Cubature {
             correction: array![[2.0, 0.0], [0.0, 2.0]],
             rank: 2,
@@ -2169,7 +2169,7 @@ mod smoothing_correction_outcome_tests {
     }
 
     #[test]
-    fn first_order_routine_branch_label_and_extraction() {
+    pub(crate) fn first_order_routine_branch_label_and_extraction() {
         let outcome = make_first_order(
             "n_rho == 0",
             SmoothingCorrectionFallbackSeverity::Routine,
@@ -2180,7 +2180,7 @@ mod smoothing_correction_outcome_tests {
     }
 
     #[test]
-    fn first_order_numerical_branch_label_and_extraction() {
+    pub(crate) fn first_order_numerical_branch_label_and_extraction() {
         let outcome = make_first_order(
             "rho Hessian inversion failed after ridge regularization",
             SmoothingCorrectionFallbackSeverity::NumericalFailure,
@@ -2191,7 +2191,7 @@ mod smoothing_correction_outcome_tests {
     }
 
     #[test]
-    fn first_order_without_matrix_returns_none() {
+    pub(crate) fn first_order_without_matrix_returns_none() {
         let outcome = make_first_order(
             "no base covariance supplied",
             SmoothingCorrectionFallbackSeverity::Routine,
@@ -2201,7 +2201,7 @@ mod smoothing_correction_outcome_tests {
     }
 
     #[test]
-    fn severity_counter_is_monotonic() {
+    pub(crate) fn severity_counter_is_monotonic() {
         let before = SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.load(Ordering::Relaxed);
         SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
         let after = SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.load(Ordering::Relaxed);
@@ -2214,7 +2214,7 @@ mod smoothing_correction_outcome_tests {
     }
 
     #[test]
-    fn cubature_counter_is_observable() {
+    pub(crate) fn cubature_counter_is_observable() {
         let before = SMOOTHING_CORRECTION_CUBATURE_COUNT.load(Ordering::Relaxed);
         SMOOTHING_CORRECTION_CUBATURE_COUNT.fetch_add(1, Ordering::Relaxed);
         let after = SMOOTHING_CORRECTION_CUBATURE_COUNT.load(Ordering::Relaxed);
@@ -2244,7 +2244,7 @@ mod smoothing_correction_outcome_tests {
     /// then scales by exactly c² when (and only when) the curvature block
     /// carries exactly one φ̂ — the fix under test.
     #[test]
-    fn cubature_smoothing_correction_is_response_scale_equivariant() {
+    pub(crate) fn cubature_smoothing_correction_is_response_scale_equivariant() {
         use crate::estimate::PenaltySpec;
         use crate::types::{
             GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink,
@@ -2254,7 +2254,7 @@ mod smoothing_correction_outcome_tests {
         // 3 penalized columns). Smooth, well-conditioned; the near-boundary ρ
         // is FORCED below, not discovered, so the data need only yield a valid
         // converged inner fit and an invertible ρ-Hessian.
-        fn design(scale: f64) -> (Array2<f64>, Array1<f64>) {
+        pub(crate) fn design(scale: f64) -> (Array2<f64>, Array1<f64>) {
             let n = 24usize;
             let p = 4usize;
             let mut x = Array2::<f64>::zeros((n, p));
@@ -2423,7 +2423,7 @@ mod smoothing_correction_outcome_tests {
     }
 
     #[test]
-    fn classification_reason_strings_are_nonempty_and_distinct() {
+    pub(crate) fn classification_reason_strings_are_nonempty_and_distinct() {
         let reasons = [
             // Routine gates.
             "n_rho == 0: unified corrected covariance equals H^{-1}",

@@ -4,7 +4,7 @@
     use ndarray::array;
 
     #[test]
-    fn trace_matrix_product_iterator_matches_scalar_reference_bitwise() {
+    pub(crate) fn trace_matrix_product_iterator_matches_scalar_reference_bitwise() {
         let left = Array2::from_shape_fn((4, 4), |(i, j)| {
             ((i as f64 + 0.25) * 0.37 + (j as f64 + 0.5) * 0.19).sin()
         });
@@ -25,7 +25,7 @@
     }
 
     #[test]
-    fn block_local_bilinear_iterator_matches_scalar_reference_bitwise() {
+    pub(crate) fn block_local_bilinear_iterator_matches_scalar_reference_bitwise() {
         let local = Array2::from_shape_fn((4, 4), |(i, j)| {
             ((i as f64 + 0.1) * 0.29 - (j as f64 + 0.7) * 0.13).sin()
         });
@@ -51,9 +51,9 @@
     }
 
     #[test]
-    fn xt_logdet_kernel_diagonal_iterator_matches_scalar_reference() {
-        struct FixedKernelHessian {
-            kernel: Array2<f64>,
+    pub(crate) fn xt_logdet_kernel_diagonal_iterator_matches_scalar_reference() {
+        pub(crate) struct FixedKernelHessian {
+            pub(crate) kernel: Array2<f64>,
         }
 
         impl HessianOperator for FixedKernelHessian {
@@ -108,7 +108,7 @@
     }
 
     #[test]
-    fn xt_projected_kernel_diagonal_iterator_matches_scalar_reference_bitwise() {
+    pub(crate) fn xt_projected_kernel_diagonal_iterator_matches_scalar_reference_bitwise() {
         let u_s = array![[0.8_f64, -0.2], [0.1, 0.9], [0.5, 0.3], [-0.4, 0.6]];
         let h_proj_inverse = array![[1.6_f64, -0.25], [-0.25, 2.1]];
         let subspace = PenaltySubspaceTrace {
@@ -137,7 +137,7 @@
     }
 
     #[test]
-    fn projected_logdet_cross_reduced_uses_trace_product_reference() {
+    pub(crate) fn projected_logdet_cross_reduced_uses_trace_product_reference() {
         let kernel = PenaltySubspaceTrace {
             u_s: Array2::<f64>::eye(3),
             h_proj_inverse: array![[1.4, 0.2, -0.1], [0.2, 1.9, 0.3], [-0.1, 0.3, 1.6]],
@@ -162,7 +162,7 @@
     }
 
     #[test]
-    fn dense_spectral_rotated_cross_kernels_match_scalar_references_bitwise() {
+    pub(crate) fn dense_spectral_rotated_cross_kernels_match_scalar_references_bitwise() {
         let h = array![[3.5, 0.4, -0.2], [0.4, 2.8, 0.3], [-0.2, 0.3, 2.2]];
         let op = DenseSpectralOperator::from_symmetric(&h).expect("spd fixture");
         let a_rot = Array2::from_shape_fn((3, 3), |(i, j)| {
@@ -213,7 +213,7 @@
     // directions — the iso-κ Duchon probit/logit FD red-line. The spectrum
     // below spans 12 decades, comfortably past the old floor.
     #[test]
-    fn batched_penalty_subspace_traces_match_exact_kernel_on_ill_conditioned_spectrum() {
+    pub(crate) fn batched_penalty_subspace_traces_match_exact_kernel_on_ill_conditioned_spectrum() {
         let p = 6usize;
         let r = 4usize;
         // Orthonormal U (p × r): columns of a fixed Householder-style basis.
@@ -281,7 +281,7 @@
     // uses across the value-only early return) read the SAME guard from the
     // SAME object, the two sides cannot drift.
     #[test]
-    fn guarded_correction_include_false_applies_neither() {
+    pub(crate) fn guarded_correction_include_false_applies_neither() {
         let value = 3.5_f64;
         let gradient = array![0.25, -0.75, 1.5];
         let correction =
@@ -302,7 +302,7 @@
     }
 
     #[test]
-    fn guarded_correction_include_true_applies_both() {
+    pub(crate) fn guarded_correction_include_true_applies_both() {
         let value = 3.5_f64;
         let gradient = array![0.25, -0.75, 1.5];
         let correction =
@@ -337,7 +337,7 @@
     // yields a coordinate of dimension `m` (matching the reduced `β`), and the
     // quadratic form is preserved exactly: `βᵀ S β = β_fᵀ (zᵀ S z) β_f`.
     #[test]
-    fn penalty_coord_projection_reduces_dim_and_preserves_quadratic_form() {
+    pub(crate) fn penalty_coord_projection_reduces_dim_and_preserves_quadratic_form() {
         // Full-space penalty root R (rank-deficient, like a smoothing penalty):
         // S = Rᵀ R is 5×5 with a 1-dim nullspace.
         let root = array![
@@ -395,7 +395,7 @@
     /// Helper: build a 5×5 diagonal SPD H with one eigenvalue placed in a
     /// chosen direction. `placement` selects whether the small eigenvalue
     /// lives inside `range(S_+)` (col 0..4) or inside `null(S_+)` (col 4).
-    fn synthetic_h_with_small_eig(
+    pub(crate) fn synthetic_h_with_small_eig(
         small_eig: f64,
         placement: SmallEigPlacement,
     ) -> (Array2<f64>, Array2<f64>) {
@@ -435,13 +435,13 @@
     }
 
     #[derive(Clone, Copy)]
-    enum SmallEigPlacement {
+    pub(crate) enum SmallEigPlacement {
         OutsideRangeSPlus,
         InsideRangeSPlus,
     }
 
     #[test]
-    fn active_projected_kkt_residual_is_reduced_before_projected_ift() {
+    pub(crate) fn active_projected_kkt_residual_is_reduced_before_projected_ift() {
         let kernel = PenaltySubspaceTrace {
             u_s: array![[1.0], [0.0]],
             h_proj_inverse: array![[0.25]],
@@ -461,7 +461,7 @@
     }
 
     #[test]
-    fn active_projected_kkt_residual_rejects_large_drop_before_projected_ift() {
+    pub(crate) fn active_projected_kkt_residual_rejects_large_drop_before_projected_ift() {
         let kernel = PenaltySubspaceTrace {
             u_s: array![[1.0], [0.0]],
             h_proj_inverse: array![[0.25]],
@@ -482,7 +482,7 @@
     /// Build a `PenaltySubspaceTrace` from a full H + U_S pair, using the
     /// exact same formula the production code uses: `H_proj⁻¹ = (U_Sᵀ H
     /// U_S)⁻¹`. Inverts the projected matrix analytically for the test.
-    fn build_subspace_kernel(h_full: &Array2<f64>, u_s: &Array2<f64>) -> PenaltySubspaceTrace {
+    pub(crate) fn build_subspace_kernel(h_full: &Array2<f64>, u_s: &Array2<f64>) -> PenaltySubspaceTrace {
         // Compute H_proj = U_Sᵀ H U_S, then invert via eigendecomposition —
         // exactly matching the production builder in
         // `joint_penalty_subspace_trace_parts`
@@ -522,7 +522,7 @@
 
     /// Direct ground-truth full-H inverse bilinear form `aᵀ H⁻¹ b`. The
     /// test fixtures all use diagonal H so we invert componentwise.
-    fn full_h_inv_bilinear(h_full: &Array2<f64>, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+    pub(crate) fn full_h_inv_bilinear(h_full: &Array2<f64>, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
         let p = h_full.nrows();
         let mut acc = 0.0_f64;
         for i in 0..p {
@@ -540,7 +540,7 @@
     /// `1/σ_min(H)`, while the projected pseudo-inverse drops that
     /// component entirely and recovers the honest correction.
     #[test]
-    fn ift_projected_pseudo_inverse_kills_null_subspace_noise() {
+    pub(crate) fn ift_projected_pseudo_inverse_kills_null_subspace_noise() {
         assert!(file!().ends_with(".rs"));
         let small_eig = 1e-12_f64;
         let (h_full, u_s) =
@@ -583,7 +583,7 @@
     /// while the projection drops it to 0 — six orders of magnitude
     /// reduction in noise, on the same input.
     #[test]
-    fn ift_full_h_solve_amplifies_null_subspace_noise_by_inverse_small_eig() {
+    pub(crate) fn ift_full_h_solve_amplifies_null_subspace_noise_by_inverse_small_eig() {
         let small_eig = 1e-12_f64;
         let (h_full, u_s) =
             synthetic_h_with_small_eig(small_eig, SmallEigPlacement::OutsideRangeSPlus);
@@ -632,7 +632,7 @@
     /// is the empirical evidence that the failing geometry is the
     /// outside-`range(S_+)` case in tests 1 and 2 above.
     #[test]
-    fn ift_projected_pseudo_inverse_cannot_help_when_small_eig_lives_inside_range_s_plus() {
+    pub(crate) fn ift_projected_pseudo_inverse_cannot_help_when_small_eig_lives_inside_range_s_plus() {
         assert!(file!().ends_with(".rs"));
         let small_eig = 1e-8_f64;
         let (h_full, u_s) =
@@ -662,7 +662,7 @@
     /// fixtures (where the subspace-projection-LAML fix is not active
     /// and the existing code path is correct).
     #[test]
-    fn ift_projected_pseudo_inverse_matches_full_h_on_well_conditioned_fixture() {
+    pub(crate) fn ift_projected_pseudo_inverse_matches_full_h_on_well_conditioned_fixture() {
         assert!(file!().ends_with(".rs"));
         // Well-conditioned H — every eigenvalue O(1).
         let p = 5usize;
@@ -692,7 +692,7 @@
     /// pathology described in `0dc469bd` (the off-diagonal entries are
     /// what propagate `r`'s null-space noise into the `a_k ∈ range(S_+)`
     /// solve).
-    fn dense_h_inv_bilinear_via_eig(h_full: &Array2<f64>, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+    pub(crate) fn dense_h_inv_bilinear_via_eig(h_full: &Array2<f64>, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
         use crate::faer_ndarray::FaerEigh;
         let (evals, evecs) = h_full
             .eigh(faer::Side::Lower)
@@ -765,7 +765,7 @@
     /// `PenaltySubspaceTrace::bilinear_pseudo_inverse` (which applies a
     /// PRECOMPUTED `h_proj_inverse`). Match between the two is non-
     /// trivial verification of the helper's inversion.
-    fn projected_pseudo_inverse_truth(
+    pub(crate) fn projected_pseudo_inverse_truth(
         h_full: &Array2<f64>,
         u_s: &Array2<f64>,
         a: &Array1<f64>,
@@ -788,7 +788,7 @@
     }
 
     #[test]
-    fn ift_projected_pseudo_inverse_saves_orders_of_magnitude_on_cross_coupled_h() {
+    pub(crate) fn ift_projected_pseudo_inverse_saves_orders_of_magnitude_on_cross_coupled_h() {
         let small_eig = 1e-12_f64;
         let p = 5usize;
         let r_subspace = 4usize;
@@ -956,7 +956,7 @@
         );
     }
 
-    fn make_factor_key(seed: u64) -> ProjectedFactorKey {
+    pub(crate) fn make_factor_key(seed: u64) -> ProjectedFactorKey {
         // Build a unique-by-seed key without going through
         // `from_factor_view` so the test can inject fingerprints
         // directly. Using public construction via a real ArrayView2
@@ -974,7 +974,7 @@
     }
 
     #[test]
-    fn projected_factor_cache_lru_evicts_oldest_under_budget() {
+    pub(crate) fn projected_factor_cache_lru_evicts_oldest_under_budget() {
         let entry_floats = 32usize;
         let entry_bytes = entry_floats * std::mem::size_of::<f64>();
         // Budget that fits exactly two entries — inserting a third must
@@ -1011,7 +1011,7 @@
     }
 
     #[test]
-    fn projected_factor_cache_zero_budget_disables_eviction() {
+    pub(crate) fn projected_factor_cache_zero_budget_disables_eviction() {
         let cache = ProjectedFactorCache::with_budget(0);
         for seed in 0..16 {
             cache.get_or_insert_with(make_factor_key(seed), || {
@@ -1022,7 +1022,7 @@
     }
 
     #[test]
-    fn projected_factor_cache_oversize_entry_is_cached_unconditionally() {
+    pub(crate) fn projected_factor_cache_oversize_entry_is_cached_unconditionally() {
         // An entry larger than the entire budget cannot be made to fit
         // by eviction; we still cache it (refusing to cache would force
         // a recompute on every query, defeating the cache's purpose).
@@ -1032,7 +1032,7 @@
         assert_eq!(cache.len(), 1);
     }
 
-    fn projected_factor_cache_wait_for_subscriber(
+    pub(crate) fn projected_factor_cache_wait_for_subscriber(
         cache: &ProjectedFactorCache,
         key: ProjectedFactorKey,
         timeout: std::time::Duration,
@@ -1087,7 +1087,7 @@
     }
 
     #[test]
-    fn projected_factor_cache_waiters_wake_when_producer_panics() {
+    pub(crate) fn projected_factor_cache_waiters_wake_when_producer_panics() {
         let cache = Arc::new(ProjectedFactorCache::with_budget(0));
         let key = make_factor_key(42);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -1141,8 +1141,8 @@
         assert_eq!(recovered[[0, 0]], 9.0);
     }
 
-    struct SentinelOuterHessianOperator {
-        matrix: Array2<f64>,
+    pub(crate) struct SentinelOuterHessianOperator {
+        pub(crate) matrix: Array2<f64>,
     }
 
     impl crate::solver::outer_strategy::OuterHessianOperator for SentinelOuterHessianOperator {
@@ -1159,8 +1159,8 @@
         }
     }
 
-    struct FamilyOperatorOnlyDerivatives {
-        op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+    pub(crate) struct FamilyOperatorOnlyDerivatives {
+        pub(crate) op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
     }
 
     impl HessianDerivativeProvider for FamilyOperatorOnlyDerivatives {
@@ -1190,7 +1190,7 @@
     /// Helper: the inflated-`penalty_logdet` sentinel `InnerSolution` shared by
     /// the envelope-tripwire regression tests. They differ only in the
     /// dispersion handling and whether a projected KKT residual is attached.
-    fn build_sentinel_tripwire_solution(
+    pub(crate) fn build_sentinel_tripwire_solution(
         dispersion: DispersionHandling,
         kkt_residual: Option<ProjectedKktResidual>,
     ) -> InnerSolution<'static> {
@@ -1242,7 +1242,7 @@
     /// `solution`. The operator-vs-dense equivalence tests all build this
     /// identical `(dense, operator, materialized)` triple before comparing
     /// entries and matvecs.
-    fn dense_and_materialized_outer_hessian(
+    pub(crate) fn dense_and_materialized_outer_hessian(
         solution: &InnerSolution<'_>,
         rho: &[f64],
         lambdas: &[f64],
@@ -1276,7 +1276,7 @@
     }
 
     #[test]
-    fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
+    pub(crate) fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
         let family_matrix = array![[42.0]];
         let family_operator = Arc::new(SentinelOuterHessianOperator {
@@ -1370,7 +1370,7 @@
     /// BUG-1: r_proj = 0 ⇒ IFT gradient correction is identically 0.
     /// This is a pure math identity test that ANCHORS the failure mode.
     #[test]
-    fn ift_gradient_correction_with_zero_projected_residual_is_zero() {
+    pub(crate) fn ift_gradient_correction_with_zero_projected_residual_is_zero() {
         let h = Array2::eye(3);
         let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
         let solution = build_gaussian_solution_at_beta(&[0.0, 0.0], array![0.5, -0.25, 0.1], false);
@@ -1411,7 +1411,7 @@
     }
 
     #[test]
-    fn ift_rho_upper_bound_masks_residual_correction_direction() {
+    pub(crate) fn ift_rho_upper_bound_masks_residual_correction_direction() {
         let h = Array2::eye(3);
         let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
         let solution = build_gaussian_solution_at_beta(&[0.0, 0.0], array![0.5, -0.25, 0.1], false);
@@ -1455,7 +1455,7 @@
     /// test: either suppress (gradient=None) or produce a numerically honest
     /// gradient (|g|∞·√ε ≤ 4·|cost|).
     #[test]
-    fn cert_zero_residual_must_not_emit_unbounded_gradient_through_gate() {
+    pub(crate) fn cert_zero_residual_must_not_emit_unbounded_gradient_through_gate() {
         // Profiled Gaussian does not satisfy the fixed-dispersion IFT identity
         // used by the projected KKT residual correction, so an inconsistent
         // envelope gradient remains a soft "unavailable derivative" result
@@ -1521,7 +1521,7 @@
     /// Any future edit that lets one shape drift from its reference breaks
     /// this test bit-for-bit, which is the point.
     #[test]
-    fn theta_mode_response_kernel_matches_preport_assembly_bitwise() {
+    pub(crate) fn theta_mode_response_kernel_matches_preport_assembly_bitwise() {
         use crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock;
 
         let h = array![[2.0, 0.3, 0.1], [0.3, 1.5, 0.2], [0.1, 0.2, 1.0]];
@@ -1614,7 +1614,7 @@
     /// `½ tr(H⁻¹·∂H/∂ρ_k)` would blow up as 1/σ_min(H) here while the
     /// projected trace `½ tr((ZᵀHZ)⁻¹·Zᵀ·λ_k S_k·Z)` is O(1).
     #[test]
-    fn envelope_gradient_uses_constraint_tangent_projection() {
+    pub(crate) fn envelope_gradient_uses_constraint_tangent_projection() {
         use crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock;
 
         // Three-parameter Gaussian REML. Choose data so the optimum places
@@ -1687,7 +1687,7 @@
     /// `gradient=None` that the outer seed validator later reports as
     /// non-finite derivatives.
     #[test]
-    fn aou_missing_projected_kkt_residual_is_contract_error() {
+    pub(crate) fn aou_missing_projected_kkt_residual_is_contract_error() {
         let solution = build_sentinel_tripwire_solution(
             DispersionHandling::Fixed {
                 phi: 1.0,
@@ -1710,7 +1710,7 @@
     }
 
     #[test]
-    fn envelope_inconsistent_gradient_skips_outer_hessian_assembly() {
+    pub(crate) fn envelope_inconsistent_gradient_skips_outer_hessian_assembly() {
         // Profiled Gaussian does not satisfy the fixed-dispersion IFT identity
         // used by the projected KKT residual correction, so an inconsistent
         // envelope gradient remains a soft "unavailable derivative" result
@@ -1733,7 +1733,7 @@
     }
 
     #[test]
-    fn test_dense_spectral_operator_simple() {
+    pub(crate) fn test_dense_spectral_operator_simple() {
         // 2×2 diagonal matrix: H = diag(2, 5)
         let h = Array2::from_diag(&array![2.0, 5.0]);
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
@@ -1757,7 +1757,7 @@
     }
 
     #[test]
-    fn test_dense_spectral_operator_solve_multi_matches_column_solves() {
+    pub(crate) fn test_dense_spectral_operator_solve_multi_matches_column_solves() {
         let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
         let rhs = array![[1.0, -1.0], [0.5, 2.0], [3.0, 0.25],];
@@ -1778,7 +1778,7 @@
     }
 
     #[test]
-    fn test_dense_spectral_operator_cross_trace_matches_column_solves() {
+    pub(crate) fn test_dense_spectral_operator_cross_trace_matches_column_solves() {
         assert!(file!().ends_with(".rs"));
         let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
@@ -1792,7 +1792,7 @@
     }
 
     #[test]
-    fn test_dense_spectral_operator_operator_cross_matches_dense_formula() {
+    pub(crate) fn test_dense_spectral_operator_operator_cross_matches_dense_formula() {
         assert!(file!().ends_with(".rs"));
         let h = array![[5.0, 0.5, 0.25], [0.5, 3.5, 0.2], [0.25, 0.2, 2.5],];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
@@ -1817,7 +1817,7 @@
     }
 
     #[test]
-    fn test_hyper_coord_total_drift_result_keeps_operator_and_dense_correction() {
+    pub(crate) fn test_hyper_coord_total_drift_result_keeps_operator_and_dense_correction() {
         assert!(file!().ends_with(".rs"));
         let h = array![[4.0, 0.25], [0.25, 3.0],];
         let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
@@ -1840,7 +1840,7 @@
     }
 
     #[test]
-    fn test_dense_spectral_operator_rotated_logdet_cross_matches_dense_path() {
+    pub(crate) fn test_dense_spectral_operator_rotated_logdet_cross_matches_dense_path() {
         assert!(file!().ends_with(".rs"));
         let h = array![[4.0, 0.5, 0.2], [0.5, 2.5, 0.3], [0.2, 0.3, 1.75],];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
@@ -1857,7 +1857,7 @@
     }
 
     #[test]
-    fn test_compute_adjoint_z_c_streaming_matches_dense_reference() {
+    pub(crate) fn test_compute_adjoint_z_c_streaming_matches_dense_reference() {
         assert!(file!().ends_with(".rs"));
         // streaming and dense paths differ only by reordering the sum that builds v;
         // with n=64, p=8 the gap is bounded by O(εn) ≈ 1e-14.
@@ -1928,7 +1928,7 @@
     }
 
     #[test]
-    fn fourth_derivative_trace_matrix_matches_scalar_pair_formula() {
+    pub(crate) fn fourth_derivative_trace_matrix_matches_scalar_pair_formula() {
         assert!(file!().ends_with(".rs"));
         let n = 37usize;
         let p = 5usize;
@@ -1984,7 +1984,7 @@
     }
 
     #[test]
-    fn operator_hessian_matches_dense_with_operator_drifts_and_extended_glm_corrections() {
+    pub(crate) fn operator_hessian_matches_dense_with_operator_drifts_and_extended_glm_corrections() {
         let h = array![[1.0e-7, 0.0], [0.0, 2.7]];
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
         let beta = array![0.4, -0.7];
@@ -2106,7 +2106,7 @@
     /// gate (the family-side half — contracted kernel == per-pair — lives in
     /// `bernoulli_contracted_psi_second_order_matches_per_pair_contraction`).
     #[test]
-    fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense() {
+    pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense() {
         // WELL-CONDITIONED inner Hessian: both eigenvalues are O(1). A
         // near-singular H (e.g. a 1e-7 diagonal entry, as the sibling
         // spectral-regularization test deliberately uses) sends H⁻¹ ~1e7 and the
@@ -2426,7 +2426,7 @@
     }
 
     #[test]
-    fn subspace_projected_leverage_and_adjoint_shortcut_match_dense() {
+    pub(crate) fn subspace_projected_leverage_and_adjoint_shortcut_match_dense() {
         // Locks down both production identities used by the subspace
         // leverage shortcut in `build_outer_hessian_operator`:
         //
@@ -2502,7 +2502,7 @@
     }
 
     #[test]
-    fn subspace_base_h2_traces_match_scalar_projected_kernel_path() {
+    pub(crate) fn subspace_base_h2_traces_match_scalar_projected_kernel_path() {
         let h = array![[3.0, 0.1, 0.0], [0.1, 5.0, 0.2], [0.0, 0.2, 7.0]];
         let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
         let u_s = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
@@ -2575,7 +2575,7 @@
     }
 
     #[test]
-    fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alpha() {
+    pub(crate) fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alpha() {
         assert!(file!().ends_with(".rs"));
         // p=4, K=2, r=2 fixture — exercises the full projection K = U_S H_proj⁻¹ U_Sᵀ
         // (the existing r=1 case at projected_operator_hessian_matches_dense_subspace_trace
@@ -2704,7 +2704,7 @@
     }
 
     #[test]
-    fn projected_operator_hessian_matches_dense_subspace_trace() {
+    pub(crate) fn projected_operator_hessian_matches_dense_subspace_trace() {
         assert!(file!().ends_with(".rs"));
         let h = array![[3.0, 0.2], [0.2, 5.0]];
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
@@ -2805,7 +2805,7 @@
     }
 
     #[test]
-    fn penalty_subspace_batched_reduction_matches_serial_operator_reduction() {
+    pub(crate) fn penalty_subspace_batched_reduction_matches_serial_operator_reduction() {
         assert!(file!().ends_with(".rs"));
         let kernel = PenaltySubspaceTrace {
             u_s: array![[1.0, 0.0], [0.2, 0.8], [-0.1, 0.6]],
@@ -2856,7 +2856,7 @@
     }
 
     #[test]
-    fn subspace_trace_large_k_routes_to_projected_operator() {
+    pub(crate) fn subspace_trace_large_k_routes_to_projected_operator() {
         let h = array![[3.0, 0.2], [0.2, 5.0]];
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
         let pcoord = PenaltyCoordinate::from_dense_root(array![[0.0, 1.0]]);
@@ -2923,7 +2923,7 @@
     }
 
     #[test]
-    fn test_dense_spectral_operator_singular() {
+    pub(crate) fn test_dense_spectral_operator_singular() {
         // Rank-1 matrix: H = [1 1; 1 1] has eigenvalues {0, 2}.
         let h = array![[1.0, 1.0], [1.0, 1.0]];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
@@ -2944,7 +2944,7 @@
     }
 
     #[test]
-    fn test_spectral_regularize_stays_finite_in_extreme_tails() {
+    pub(crate) fn test_spectral_regularize_stays_finite_in_extreme_tails() {
         let epsilon = 1e-8;
 
         let large_negative = spectral_regularize(-1e16, epsilon);
@@ -2961,7 +2961,7 @@
     }
 
     #[test]
-    fn test_smooth_floor_dp() {
+    pub(crate) fn test_smooth_floor_dp() {
         // Well above floor: should be approximately identity
         let (val, grad, _) = smooth_floor_dp(1.0);
         assert!((val - 1.0).abs() < 1e-6);
@@ -2978,7 +2978,7 @@
     }
 
     #[test]
-    fn test_gaussian_derivatives_has_no_corrections() {
+    pub(crate) fn test_gaussian_derivatives_has_no_corrections() {
         let g = GaussianDerivatives;
         assert!(!g.has_corrections());
         assert!(
@@ -2989,7 +2989,7 @@
     }
 
     #[test]
-    fn gaussian_derivatives_advertise_exact_outer_hvp_kernel() {
+    pub(crate) fn gaussian_derivatives_advertise_exact_outer_hvp_kernel() {
         let g = GaussianDerivatives;
         assert!(matches!(
             g.outer_hessian_derivative_kernel(),
@@ -2998,7 +2998,7 @@
     }
 
     #[test]
-    fn standard_gam_large_n_gaussian_prefers_operator_when_dense_work_is_large() {
+    pub(crate) fn standard_gam_large_n_gaussian_prefers_operator_when_dense_work_is_large() {
         assert!(prefer_outer_hessian_operator(320_000, 42, 6));
         assert!(matches!(
             GaussianDerivatives.outer_hessian_derivative_kernel(),
@@ -3007,7 +3007,7 @@
     }
 
     #[test]
-    fn callback_outer_hessian_routes_by_row_pair_work_even_at_small_p() {
+    pub(crate) fn callback_outer_hessian_routes_by_row_pair_work_even_at_small_p() {
         assert!(!prefer_outer_hessian_operator(155_980, 19, 23));
         assert!(outer_hessian_route_plan(155_980, 19, 23, true, true, false).use_operator);
         assert!(!outer_hessian_route_plan(155_980, 19, 23, true, false, false).use_operator);
@@ -3015,7 +3015,7 @@
     }
 
     #[test]
-    fn callback_outer_hessian_ignores_generic_large_n_small_p_crossover() {
+    pub(crate) fn callback_outer_hessian_ignores_generic_large_n_small_p_crossover() {
         assert!(prefer_outer_hessian_operator(195_780, 33, 8));
         assert!(!outer_hessian_route_plan(195_780, 33, 8, true, true, false).use_operator);
         assert!(outer_hessian_route_plan(195_780, 512, 8, true, true, false).use_operator);
@@ -3029,7 +3029,7 @@
     }
 
     #[test]
-    fn outer_hessian_route_respects_dense_workspace_budget() {
+    pub(crate) fn outer_hessian_route_respects_dense_workspace_budget() {
         let plan = outer_hessian_route_plan(10_000, 10_000, 2, true, true, false);
         assert!(plan.use_operator);
         assert_eq!(plan.reason, "dense_memory_budget");
@@ -3037,7 +3037,7 @@
     }
 
     #[test]
-    fn outer_hessian_route_reports_kernel_absent_before_scale_model() {
+    pub(crate) fn outer_hessian_route_reports_kernel_absent_before_scale_model() {
         let plan = outer_hessian_route_plan(1_000_000, 10_000, 64, false, false, false);
         assert!(!plan.use_operator);
         assert_eq!(plan.reason, "kernel_absent");
@@ -3045,7 +3045,7 @@
     }
 
     #[test]
-    fn gaussian_outer_hessian_operator_matches_dense_assembly() {
+    pub(crate) fn gaussian_outer_hessian_operator_matches_dense_assembly() {
         let h = array![[2.4, 0.2], [0.2, 1.7]];
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
         let beta = array![0.35, -0.55];
@@ -3115,7 +3115,7 @@
     /// tr(H⁻¹BH⁻¹B) = 0.5 / 0.0625 = 8`, which then clamped to `+5` — a
     /// huge spurious step at the exact optimum.
     #[test]
-    fn efs_step_is_zero_at_scalar_optimum() {
+    pub(crate) fn efs_step_is_zero_at_scalar_optimum() {
         // β̂ = z / (1 + λ) = 2 / (4/3) = 1.5, H = 1 + λ = 4/3.
         let lambda = 1.0 / 3.0;
         let beta_hat = 1.5_f64;
@@ -3201,7 +3201,7 @@
     /// and shifts by exactly the right amount when out-of-band terms
     /// `g_extra` enter the gradient.
     #[test]
-    fn efs_log_step_from_grad_recovers_canonical_form() {
+    pub(crate) fn efs_log_step_from_grad_recovers_canonical_form() {
         // Canonical agreement on stable cases: g_base = (q_eff − target)/2
         // ⇒ universal = log((d − t)/q_eff).
         let cases = [
@@ -3266,7 +3266,7 @@
     /// `tr(H⁻¹ A H⁻¹ A)`, not `tr(H⁻¹ A²)`. These coincide only when A
     /// commutes with H⁻¹ — generically they differ.
     #[test]
-    fn dense_spectral_block_local_cross_trace_matches_dense() {
+    pub(crate) fn dense_spectral_block_local_cross_trace_matches_dense() {
         let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
 
@@ -3293,7 +3293,7 @@
     }
 
     #[test]
-    fn test_reml_laml_evaluate_gaussian_basic() {
+    pub(crate) fn test_reml_laml_evaluate_gaussian_basic() {
         // Simple 2-param Gaussian model.
         let h = Array2::from_diag(&array![10.0, 8.0]);
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
@@ -3351,7 +3351,7 @@
     }
 
     #[test]
-    fn fixed_dispersion_firth_cost_subtracts_jeffreys_term() {
+    pub(crate) fn fixed_dispersion_firth_cost_subtracts_jeffreys_term() {
         assert!(file!().ends_with(".rs"));
         let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, -1.0]];
         let eta = array![0.0, 0.4, -0.2];
@@ -3408,8 +3408,8 @@
         assert_relative_eq!(result.cost, -firth_value, epsilon = 1e-12);
     }
 
-    struct FixedOuterHessianOperator {
-        matrix: Array2<f64>,
+    pub(crate) struct FixedOuterHessianOperator {
+        pub(crate) matrix: Array2<f64>,
     }
 
     impl crate::solver::outer_strategy::OuterHessianOperator for FixedOuterHessianOperator {
@@ -3436,8 +3436,8 @@
         }
     }
 
-    struct FamilyOperatorDerivatives {
-        op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+    pub(crate) struct FamilyOperatorDerivatives {
+        pub(crate) op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
     }
 
     impl HessianDerivativeProvider for FamilyOperatorDerivatives {
@@ -3473,7 +3473,7 @@
     }
 
     #[test]
-    fn family_outer_hessian_operator_short_circuits_dense_pairwise_assembly() {
+    pub(crate) fn family_outer_hessian_operator_short_circuits_dense_pairwise_assembly() {
         let supplied = array![[2.5]];
         let provider_op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator> =
             Arc::new(FixedOuterHessianOperator {
@@ -3529,8 +3529,8 @@
         assert_relative_eq!(dense[[0, 0]], supplied[[0, 0]], epsilon = 1e-12);
     }
 
-    struct FixedCorrectionDerivatives {
-        correction: Array2<f64>,
+    pub(crate) struct FixedCorrectionDerivatives {
+        pub(crate) correction: Array2<f64>,
     }
 
     impl HessianDerivativeProvider for FixedCorrectionDerivatives {
@@ -3547,7 +3547,7 @@
         }
     }
 
-    fn build_projected_rho_gradient_solution(rho: f64) -> InnerSolution<'static> {
+    pub(crate) fn build_projected_rho_gradient_solution(rho: f64) -> InnerSolution<'static> {
         let lambda = rho.exp();
         let h = array![[3.0 + 4.0 * rho, 0.0], [0.0, 5.0 + lambda],];
         let full_logdet = h[[0, 0]].ln() + h[[1, 1]].ln();
@@ -3601,7 +3601,7 @@
     }
 
     #[test]
-    fn test_rho_gradient_uses_projected_logdet_kernel_when_available() {
+    pub(crate) fn test_rho_gradient_uses_projected_logdet_kernel_when_available() {
         let rho = 0.0;
         let result = reml_laml_evaluate(
             &build_projected_rho_gradient_solution(rho),
@@ -3644,7 +3644,7 @@
     }
 
     #[test]
-    fn test_rho_corrections_serial_large_work_case_stays_finite() {
+    pub(crate) fn test_rho_corrections_serial_large_work_case_stays_finite() {
         let rho = 0.0;
         let mut solution = build_projected_rho_gradient_solution(rho);
         solution.n_observations = 40_000_000;
@@ -3661,7 +3661,7 @@
     /// and second ρ-derivatives via central finite differences. Shared by the
     /// Gaussian `InnerSolution` builders, which all carry the same two penalty
     /// matrices `s1`, `s2` and dimension `p`.
-    fn gaussian_penalty_logdet_fd(
+    pub(crate) fn gaussian_penalty_logdet_fd(
         p: usize,
         s1: &Array2<f64>,
         s2: &Array2<f64>,
@@ -3741,7 +3741,7 @@
     /// Helper: build an InnerSolution for a Gaussian model at a given rho.
     /// The Hessian H = X'X + Σ λₖ Sₖ depends on rho through the penalty,
     /// so we must rebuild InnerSolution for each rho evaluation.
-    fn build_gaussian_test_solution(rho: &[f64]) -> InnerSolution<'_> {
+    pub(crate) fn build_gaussian_test_solution(rho: &[f64]) -> InnerSolution<'_> {
         let p = 3; // 3 coefficients
         let n = 50; // 50 observations
 
@@ -3819,7 +3819,7 @@
         }
     }
 
-    fn build_large_dense_spectral_gaussian_solution(rho: f64) -> InnerSolution<'static> {
+    pub(crate) fn build_large_dense_spectral_gaussian_solution(rho: f64) -> InnerSolution<'static> {
         let p = 520usize;
         let n = 2 * p;
         let lambda = rho.exp();
@@ -3882,7 +3882,7 @@
     /// verifies that the mathematical formulas are correct (which FD catches),
     /// and serves as a regression gate.
     #[test]
-    fn test_gaussian_reml_fd_vs_analytic_gradient() {
+    pub(crate) fn test_gaussian_reml_fd_vs_analytic_gradient() {
         let rho = vec![1.0, -0.5];
         let solution = build_gaussian_test_solution(&rho);
 
@@ -3926,7 +3926,7 @@
     }
 
     #[test]
-    fn test_stochastic_trace_estimator_accuracy() {
+    pub(crate) fn test_stochastic_trace_estimator_accuracy() {
         // Build a small SPD matrix and compare stochastic trace estimate
         // against the exact DenseSpectralOperator trace.
         let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.2], [0.5, 0.2, 2.0],];
@@ -3974,7 +3974,7 @@
     }
 
     #[test]
-    fn modified_gram_schmidt_orthonormalizes_well_conditioned_input() {
+    pub(crate) fn modified_gram_schmidt_orthonormalizes_well_conditioned_input() {
         let y = array![
             [1.0, 2.0, 0.5, 3.0],
             [0.0, 1.0, 0.5, 1.5],
@@ -3998,7 +3998,7 @@
     }
 
     #[test]
-    fn modified_gram_schmidt_drops_redundant_columns() {
+    pub(crate) fn modified_gram_schmidt_drops_redundant_columns() {
         let y = array![
             [1.0, 2.0, 1.0, 4.0],
             [0.0, 1.0, 0.0, 2.0],
@@ -4021,7 +4021,7 @@
     }
 
     #[test]
-    fn hutchpp_estimate_trace_hinv_operator_matches_exact_within_tolerance() {
+    pub(crate) fn hutchpp_estimate_trace_hinv_operator_matches_exact_within_tolerance() {
         // Build a small SPD H and an HVP-only operator wrapping a dense M.
         // Compare Hutch++ to the exact tr(H⁻¹ M).
         let h = array![
@@ -4077,7 +4077,7 @@
     }
 
     #[test]
-    fn hutchpp_estimate_trace_hinv_op_squared_matches_exact() {
+    pub(crate) fn hutchpp_estimate_trace_hinv_op_squared_matches_exact() {
         // SPD H and symmetric A; compare tr(H⁻¹ A H⁻¹ A) to the exact
         // value computed via trace_hinv_product_cross(A, A) =
         // tr((H⁻¹ A) (H⁻¹ A)).
@@ -4134,7 +4134,7 @@
     }
 
     #[test]
-    fn hutchpp_estimate_trace_hinv_operator_cross_matches_exact() {
+    pub(crate) fn hutchpp_estimate_trace_hinv_operator_cross_matches_exact() {
         let h = array![
             [4.0, 1.0, 0.5, 0.0, 0.0, 0.0],
             [1.0, 3.0, 0.2, 0.0, 0.0, 0.0],
@@ -4183,7 +4183,7 @@
     }
 
     #[test]
-    fn trace_hinv_operator_cross_default_routes_implicit_to_hutchpp() {
+    pub(crate) fn trace_hinv_operator_cross_default_routes_implicit_to_hutchpp() {
         // Build a synthetic 200-dim SPD H and an HVP-only operator pair
         // (mark `is_implicit() = true`) so the trait default routes
         // through the Hutch++ path. The exact reference comes from the
@@ -4208,7 +4208,7 @@
         let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
 
         // Wrapper that masquerades as implicit so the default route fires.
-        struct ImplicitDense(Array2<f64>);
+        pub(crate) struct ImplicitDense(Array2<f64>);
         impl HyperOperator for ImplicitDense {
             fn dim(&self) -> usize {
                 self.0.nrows()
@@ -4272,7 +4272,7 @@
     }
 
     #[test]
-    fn dense_spectral_large_p_outer_gradient_matches_finite_difference() {
+    pub(crate) fn dense_spectral_large_p_outer_gradient_matches_finite_difference() {
         let rho = 0.2;
         let solution = build_large_dense_spectral_gaussian_solution(rho);
         let result =
@@ -4302,7 +4302,7 @@
     }
 
     #[test]
-    fn dense_spectral_logdet_traces_do_not_claim_hinv_kernel_equivalence() {
+    pub(crate) fn dense_spectral_logdet_traces_do_not_claim_hinv_kernel_equivalence() {
         let h = array![[4.0, 1.0], [1.0, 3.0]];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
         assert!(!op.prefers_stochastic_trace_estimation());
@@ -4318,7 +4318,7 @@
     }
 
     #[test]
-    fn dense_spectral_hinv_cross_matches_solve_contraction() {
+    pub(crate) fn dense_spectral_hinv_cross_matches_solve_contraction() {
         assert!(file!().ends_with(".rs"));
         let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
         let a = array![[1.0, 0.2, 0.1], [0.2, 0.5, 0.0], [0.1, 0.0, 0.3],];
@@ -4334,7 +4334,7 @@
     }
 
     #[test]
-    fn dense_spectral_batched_logdet_crosses_match_pairwise() {
+    pub(crate) fn dense_spectral_batched_logdet_crosses_match_pairwise() {
         assert!(file!().ends_with(".rs"));
         let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
         let h1 = array![[1.0, 0.2, 0.1], [0.2, 0.5, 0.0], [0.1, 0.0, 0.3],];
@@ -4359,7 +4359,7 @@
     }
 
     #[test]
-    fn sparse_block_local_trace_without_takahashi_matches_dense_reference() {
+    pub(crate) fn sparse_block_local_trace_without_takahashi_matches_dense_reference() {
         assert!(file!().ends_with(".rs"));
         let h = array![
             [5.0, 0.2, 0.0, 0.1],
@@ -4401,7 +4401,7 @@
     }
 
     #[test]
-    fn sparse_block_local_operator_cross_without_takahashi_matches_dense_reference() {
+    pub(crate) fn sparse_block_local_operator_cross_without_takahashi_matches_dense_reference() {
         assert!(file!().ends_with(".rs"));
         let h = array![
             [5.0, 0.2, 0.0, 0.1],
@@ -4439,7 +4439,7 @@
     }
 
     #[test]
-    fn sparse_matrix_block_operator_cross_without_takahashi_matches_dense_reference() {
+    pub(crate) fn sparse_matrix_block_operator_cross_without_takahashi_matches_dense_reference() {
         assert!(file!().ends_with(".rs"));
         let h = array![
             [5.0, 0.2, 0.0, 0.1],
@@ -4483,7 +4483,7 @@
     }
 
     #[test]
-    fn sparse_takahashi_trace_hinv_product_pairs_symmetric_lookups() {
+    pub(crate) fn sparse_takahashi_trace_hinv_product_pairs_symmetric_lookups() {
         assert!(file!().ends_with(".rs"));
         let h = array![[4.0, 0.2, 0.1], [0.2, 3.0, 0.4], [0.1, 0.4, 2.5],];
         let h_sparse =
@@ -4508,7 +4508,7 @@
     }
 
     #[test]
-    fn hyper_operator_bilinear_view_matches_owned_bilinear() {
+    pub(crate) fn hyper_operator_bilinear_view_matches_owned_bilinear() {
         assert!(file!().ends_with(".rs"));
         let dense = DenseMatrixHyperOperator {
             matrix: array![[2.0, 0.3, -0.1], [0.3, 1.5, 0.4], [-0.1, 0.4, 3.0],],
@@ -4551,7 +4551,7 @@
     }
 
     #[test]
-    fn hyper_operator_scaled_add_mul_vec_matches_owned_matvec() {
+    pub(crate) fn hyper_operator_scaled_add_mul_vec_matches_owned_matvec() {
         assert!(file!().ends_with(".rs"));
         let dense = DenseMatrixHyperOperator {
             matrix: array![[2.0, 0.3, -0.1], [0.3, 1.5, 0.4], [-0.1, 0.4, 3.0],],
@@ -4601,7 +4601,7 @@
     }
 
     #[test]
-    fn stochastic_single_second_order_estimators_match_batched_paths() {
+    pub(crate) fn stochastic_single_second_order_estimators_match_batched_paths() {
         assert!(file!().ends_with(".rs"));
         let diag = array![4.0, 3.0, 2.0];
         let hop = MatrixFreeSpdOperator::new_with_mode(
@@ -4639,7 +4639,7 @@
     }
 
     #[test]
-    fn matrix_free_logdet_traces_use_exact_spectral_algebra() {
+    pub(crate) fn matrix_free_logdet_traces_use_exact_spectral_algebra() {
         let diag = array![4.0, 3.0, 2.0];
         let h = Array2::from_diag(&diag);
         let dense = DenseSpectralOperator::from_symmetric(&h).unwrap();
@@ -4669,7 +4669,7 @@
     }
 
     #[test]
-    fn test_rademacher_probe_properties() {
+    pub(crate) fn test_rademacher_probe_properties() {
         // Verify probes have entries +/-1 and are deterministic given the same seed.
         let mut rng = Xoshiro256SS::from_seed(99);
         let mut z = Array1::zeros(100);
@@ -4697,7 +4697,7 @@
     /// Setup: H(t) = diag(2 + t, 0.01 + 2t, 3 - t) — one eigenvalue near
     /// zero so the regularization is exercised.
     #[test]
-    fn test_spectral_logdet_gradient_fd() {
+    pub(crate) fn test_spectral_logdet_gradient_fd() {
         let t0 = 0.0_f64;
         let h_step = 1e-6;
 
@@ -4746,7 +4746,7 @@
     /// S(psi) = R(psi) diag(s1, s2, 0) R(psi)^T
     /// where R(psi) is a rotation around the z-axis by angle psi.
     /// The nullspace is spanned by R(psi) * e3, which rotates as psi changes.
-    fn rotating_nullspace_penalty(psi: f64, s1: f64, s2: f64) -> Array2<f64> {
+    pub(crate) fn rotating_nullspace_penalty(psi: f64, s1: f64, s2: f64) -> Array2<f64> {
         let c = psi.cos();
         let s = psi.sin();
         // R rotates in the (0,2) plane so the nullspace direction changes.
@@ -4756,20 +4756,20 @@
     }
 
     /// Compute log|S|_+ (pseudo-logdeterminant over positive eigenvalues).
-    fn pseudo_logdet(s: &Array2<f64>, tol: f64) -> f64 {
+    pub(crate) fn pseudo_logdet(s: &Array2<f64>, tol: f64) -> f64 {
         let (eigs, _) = s.eigh(faer::Side::Lower).unwrap();
         eigs.iter().filter(|&&v| v > tol).map(|v| v.ln()).sum()
     }
 
     /// Compute d/dpsi log|S(psi)|_+ by central finite difference.
-    fn pseudo_logdet_fd_first(psi: f64, h: f64, s1: f64, s2: f64, tol: f64) -> f64 {
+    pub(crate) fn pseudo_logdet_fd_first(psi: f64, h: f64, s1: f64, s2: f64, tol: f64) -> f64 {
         let sp = rotating_nullspace_penalty(psi + h, s1, s2);
         let sm = rotating_nullspace_penalty(psi - h, s1, s2);
         (pseudo_logdet(&sp, tol) - pseudo_logdet(&sm, tol)) / (2.0 * h)
     }
 
     /// Compute d^2/dpsi^2 log|S(psi)|_+ by central finite difference.
-    fn pseudo_logdet_fd_second(psi: f64, h: f64, s1: f64, s2: f64, tol: f64) -> f64 {
+    pub(crate) fn pseudo_logdet_fd_second(psi: f64, h: f64, s1: f64, s2: f64, tol: f64) -> f64 {
         let sp = pseudo_logdet(&rotating_nullspace_penalty(psi + h, s1, s2), tol);
         let s0 = pseudo_logdet(&rotating_nullspace_penalty(psi, s1, s2), tol);
         let sm = pseudo_logdet(&rotating_nullspace_penalty(psi - h, s1, s2), tol);
@@ -4780,7 +4780,7 @@
     /// correction, and WITHOUT it, so we can verify the correction is needed.
     ///
     /// Returns (with_correction, without_correction).
-    fn analytic_pseudo_logdet_second(psi: f64, s1: f64, s2: f64, tol: f64) -> (f64, f64) {
+    pub(crate) fn analytic_pseudo_logdet_second(psi: f64, s1: f64, s2: f64, tol: f64) -> (f64, f64) {
         let s_mat = rotating_nullspace_penalty(psi, s1, s2);
 
         // Eigendecompose S
@@ -4860,12 +4860,12 @@
     }
 
     /// tr(A) for a square matrix.
-    fn trace_mat(a: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_mat(a: &Array2<f64>) -> f64 {
         (0..a.nrows()).map(|i| a[[i, i]]).sum()
     }
 
     #[test]
-    fn test_moving_nullspace_correction_needed() {
+    pub(crate) fn test_moving_nullspace_correction_needed() {
         // S(psi) = R(psi) diag(4, 1, 0) R(psi)^T — rank-2, nullspace rotates.
         let s1 = 4.0;
         let s2 = 1.0;
@@ -4911,7 +4911,7 @@
     // ═══════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_fixed_nullspace_correction_vanishes() {
+    pub(crate) fn test_fixed_nullspace_correction_vanishes() {
         // S(rho) = diag(exp(rho1), exp(rho2), 0) — the nullspace is always e3,
         // regardless of rho. The correction terms should vanish, so both
         // formulas (with and without correction) should agree with FD.
@@ -5032,7 +5032,7 @@
     }
 
     #[test]
-    fn test_symmetric_eigen_identity() {
+    pub(crate) fn test_symmetric_eigen_identity() {
         let eye = Array2::<f64>::eye(3);
         let (evals, evecs) = symmetric_eigen(&eye);
         for &e in &evals {
@@ -5052,7 +5052,7 @@
     }
 
     #[test]
-    fn test_symmetric_eigen_diagonal() {
+    pub(crate) fn test_symmetric_eigen_diagonal() {
         let mut d = Array2::<f64>::zeros((3, 3));
         d[[0, 0]] = 4.0;
         d[[1, 1]] = 2.0;
@@ -5066,7 +5066,7 @@
     }
 
     #[test]
-    fn test_pseudoinverse_times_vec_identity() {
+    pub(crate) fn test_pseudoinverse_times_vec_identity() {
         let eye = Array2::<f64>::eye(3);
         let v = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let result =
@@ -5077,7 +5077,7 @@
     }
 
     #[test]
-    fn test_pseudoinverse_times_vec_singular() {
+    pub(crate) fn test_pseudoinverse_times_vec_singular() {
         // Rank-1 matrix: G = [1 1; 1 1]. Pseudoinverse G⁺ = [0.25 0.25; 0.25 0.25].
         let mut g = Array2::<f64>::zeros((2, 2));
         g[[0, 0]] = 1.0;
@@ -5093,7 +5093,7 @@
     }
 
     #[test]
-    fn batched_implicit_trace_matches_per_operator_trace() {
+    pub(crate) fn batched_implicit_trace_matches_per_operator_trace() {
         use crate::terms::basis::ImplicitDesignPsiDerivative;
         use std::sync::Arc;
 
@@ -5176,7 +5176,7 @@
     /// Also runs once with `c_x_psi_beta = None` to lock in the Gaussian
     /// fast-path: the third term must drop out cleanly.
     #[test]
-    fn implicit_hyper_operator_third_derivative_term_matches_dense_reference() {
+    pub(crate) fn implicit_hyper_operator_third_derivative_term_matches_dense_reference() {
         use crate::terms::basis::ImplicitDesignPsiDerivative;
         use std::sync::Arc;
 
@@ -5316,7 +5316,7 @@
     /// difference quotient `(op.mul_vec(v + ε e_j) − op.mul_vec(v − ε e_j))/(2ε)`
     /// equals the j-th column of `Xᵀ diag(c_x_psi_beta) X` at any v.
     #[test]
-    fn implicit_hyper_operator_third_derivative_term_centered_fd_matches_jacobian_column() {
+    pub(crate) fn implicit_hyper_operator_third_derivative_term_centered_fd_matches_jacobian_column() {
         use crate::terms::basis::ImplicitDesignPsiDerivative;
         use std::sync::Arc;
 
@@ -5403,7 +5403,7 @@
     }
 
     #[test]
-    fn test_pseudoinverse_scalar() {
+    pub(crate) fn test_pseudoinverse_scalar() {
         let mut g = Array2::<f64>::zeros((1, 1));
         g[[0, 0]] = 4.0;
         let v = Array1::from_vec(vec![8.0]);
@@ -5416,7 +5416,7 @@
     /// surface as `CorrectedCovarianceError::Indefinite` — never as a
     /// covariance with the negative directions silently clamped to zero.
     #[test]
-    fn corrected_covariance_indefinite_returns_diagnostic() {
+    pub(crate) fn corrected_covariance_indefinite_returns_diagnostic() {
         // 2×2 outer Hessian with one positive and one clearly negative
         // eigenvalue ⇒ the projected (=full, since no active bounds) inertia
         // gate must reject. Using diag(2, -1) on a small p=2 base.
@@ -5478,7 +5478,7 @@
     /// projected-Hessian inertia gate sees a SPD matrix and we return a
     /// covariance (with the active coordinate listed in `active_constraints`).
     #[test]
-    fn corrected_covariance_indefinite_with_active_bound_succeeds() {
+    pub(crate) fn corrected_covariance_indefinite_with_active_bound_succeeds() {
         // Outer Hessian: positive on coord 0, negative on coord 1.
         let outer = ndarray::arr2(&[[3.0_f64, 0.0], [0.0, -2.0]]);
         let base = Array2::<f64>::eye(2);
@@ -5525,7 +5525,7 @@
     // unprojected analytic gradients DO see it; the projected kernel kills
     // the null-space part exactly, so it matches FD.
     // ------------------------------------------------------------------------
-    fn build_leak_proof_solution(
+    pub(crate) fn build_leak_proof_solution(
         rho: &[f64],
         x: &Array2<f64>,
         s1: &Array2<f64>,
@@ -5686,7 +5686,7 @@
     /// margin that grows with λ_j, while the projected-kernel gradient
     /// matches FD to floating-point tolerance.
     #[test]
-    fn proof_outer_rho_projected_kernel_fixes_leak() {
+    pub(crate) fn proof_outer_rho_projected_kernel_fixes_leak() {
         let n = 100;
         let p = 3;
         // Design: intercept + two "spline-like" columns. Intercept is in null(S₁) ∩ null(S₂).
@@ -5865,7 +5865,7 @@
     /// Build a Gaussian InnerSolution at an *arbitrary* β̂ (not necessarily
     /// the inner optimum), recomputing log_likelihood, penalty_quadratic,
     /// and the KKT residual r = S(λ)β̂ − ∇ℓ(β̂) consistently.
-    fn build_gaussian_solution_at_beta(
+    pub(crate) fn build_gaussian_solution_at_beta(
         rho: &[f64],
         beta_hat: Array1<f64>,
         attach_residual: bool,
@@ -5941,7 +5941,7 @@
     }
 
     #[test]
-    fn malformed_projected_kkt_residual_is_contract_error() {
+    pub(crate) fn malformed_projected_kkt_residual_is_contract_error() {
         let rho: Vec<f64> = vec![1.0, -0.5];
         let beta_hat = array![0.1, -0.2, 0.3];
         let mut sol = build_gaussian_solution_at_beta(&rho, beta_hat, false);
@@ -5967,7 +5967,7 @@
     /// At exact KKT (r = 0) the IFT correction is identically zero.
     /// Attaching `Some(zeros)` must not perturb the envelope cost/gradient.
     #[test]
-    fn ift_correction_vanishes_at_exact_kkt() {
+    pub(crate) fn ift_correction_vanishes_at_exact_kkt() {
         let rho: Vec<f64> = vec![1.0, -0.5];
         // Recompute exact β* = H⁻¹X'y at this ρ.
         let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0]];
@@ -6042,7 +6042,7 @@
     /// solver. This holds for both the no-residual envelope path and the
     /// with-residual IFT-correction path.
     #[test]
-    fn rho_gradient_at_upper_bound_is_zero_envelope_and_ift_consistent_issue_197() {
+    pub(crate) fn rho_gradient_at_upper_bound_is_zero_envelope_and_ift_consistent_issue_197() {
         // Coord 0 pinned at +RHO_BOUND, coord 1 free.
         let rho: Vec<f64> = vec![crate::solver::estimate::RHO_BOUND, -0.5];
 
@@ -6094,7 +6094,7 @@
     /// gradient must match a re-solved FD reference much better than the
     /// uncorrected envelope formula evaluated at the perturbed β̂.
     #[test]
-    fn ift_correction_recovers_fd_at_perturbed_beta() {
+    pub(crate) fn ift_correction_recovers_fd_at_perturbed_beta() {
         let rho: Vec<f64> = vec![0.5, 0.3];
 
         // Re-solve for exact β* at ρ.
@@ -6114,7 +6114,7 @@
         // exact (∂V/∂β = r, no `denom/dp` chain factor as in the profiled
         // Gaussian path).  Matches the production survival-marginal-slope
         // path that the large-scale failure exercises.
-        fn to_fixed<'a>(mut sol: InnerSolution<'a>) -> InnerSolution<'a> {
+        pub(crate) fn to_fixed<'a>(mut sol: InnerSolution<'a>) -> InnerSolution<'a> {
             sol.dispersion = DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -6243,14 +6243,14 @@
     /// finite residual made the envelope Hessian inconsistent, so ARC chased a
     /// curvature model for the wrong objective.
     #[test]
-    fn ift_correction_recovers_fd_hessian_at_perturbed_beta() {
+    pub(crate) fn ift_correction_recovers_fd_hessian_at_perturbed_beta() {
         let rho: Vec<f64> = vec![0.5, 0.3];
         let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0]];
         let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0]];
         let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
         let xty = array![5.0, 3.0, 2.0];
 
-        fn to_fixed<'a>(mut sol: InnerSolution<'a>) -> InnerSolution<'a> {
+        pub(crate) fn to_fixed<'a>(mut sol: InnerSolution<'a>) -> InnerSolution<'a> {
             sol.dispersion = DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -6362,7 +6362,7 @@
     }
 
     #[test]
-    fn bug_hunt_penalty_matrix_root_reconstructs_with_effective_rank() {
+    pub(crate) fn bug_hunt_penalty_matrix_root_reconstructs_with_effective_rank() {
         let s = ndarray::arr2(&[
             [2.0_f64, 1.0, 0.0, 0.0],
             [1.0, 2.0, 0.0, 0.0],
@@ -6392,7 +6392,7 @@
     }
 
     #[test]
-    fn bug_hunt_block_penalty_logdet_derivs_match_finite_difference_shared_columns() {
+    pub(crate) fn bug_hunt_block_penalty_logdet_derivs_match_finite_difference_shared_columns() {
         let s1 = ndarray::arr2(&[[2.0_f64, 1.0], [1.0, 1.0]]);
         let s2 = ndarray::arr2(&[[1.0_f64, 0.5], [0.5, 2.0]]);
         let rho = ndarray::arr1(&[0.2_f64, -0.4]);
@@ -6445,7 +6445,7 @@
     // that refuses `rho_curvature_scale ≤ 0 / non-finite` (would silently
     // corrupt both cost and gradient).  The test pins the contract so
     // any future change that breaks the trio is caught immediately.
-    fn build_scaled_curvature_solution(rho: &[f64], s: f64) -> InnerSolution<'static> {
+    pub(crate) fn build_scaled_curvature_solution(rho: &[f64], s: f64) -> InnerSolution<'static> {
         // 2×2 unpenalized Hessian (SPD).
         let h_unp = array![[3.0_f64, 0.5], [0.5, 5.0]];
         // Single penalty S = I (2×2), so root = I.
@@ -6514,7 +6514,7 @@
     }
 
     #[test]
-    fn issue_200_cost_gradient_agree_under_rho_curvature_scale() {
+    pub(crate) fn issue_200_cost_gradient_agree_under_rho_curvature_scale() {
         let s = 2.0_f64;
         let rho0 = vec![0.3_f64];
 
@@ -6563,7 +6563,7 @@
     }
 
     #[test]
-    fn issue_200_rejects_non_positive_rho_curvature_scale() {
+    pub(crate) fn issue_200_rejects_non_positive_rho_curvature_scale() {
         // Build a baseline solution then mutate `rho_curvature_scale` to an
         // invalid value.  The evaluator must reject rather than silently
         // emit a corrupt cost/gradient pair.
@@ -6601,7 +6601,7 @@
     /// This pins the acceptance criterion from issue #277: ValueOnly REML costs
     /// routed through Cholesky must match the eigendecomposition baseline.
     #[test]
-    fn dense_cholesky_value_only_matches_spectral() {
+    pub(crate) fn dense_cholesky_value_only_matches_spectral() {
         use approx::assert_relative_eq;
 
         // 4×4 SPD matrix.

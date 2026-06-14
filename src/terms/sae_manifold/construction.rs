@@ -157,7 +157,7 @@ impl SaeManifoldTerm {
     /// inference reports, or `None` when the atom has no active rows or the
     /// penalized inner Hessian is not SPD. Returns `Err` only on a structural
     /// inconsistency (shape mismatch), never on a benign degenerate atom.
-    fn build_atom_inner_fit(
+    pub(crate) fn build_atom_inner_fit(
         &self,
         atom_idx: usize,
         target: ArrayView2<'_, f64>,
@@ -616,7 +616,7 @@ impl SaeManifoldTerm {
         Ok(SaeTrustDiagnostics { atom_trust, atoms })
     }
 
-    fn atom_tangent_spectrum_from_assignments(
+    pub(crate) fn atom_tangent_spectrum_from_assignments(
         &self,
         atom_idx: usize,
         assignments: ArrayView2<'_, f64>,
@@ -693,7 +693,7 @@ impl SaeManifoldTerm {
     /// path), as does any atom whose coordinate chart width disagrees with its
     /// latent dimension (a structurally inconsistent atom must not masquerade
     /// as exactly certified).
-    fn atom_parameter_views(&self) -> Vec<Option<crate::sae_identifiability::AtomParameterView>> {
+    pub(crate) fn atom_parameter_views(&self) -> Vec<Option<crate::sae_identifiability::AtomParameterView>> {
         let assignments = self.assignment.assignments();
         let n = self.n_obs();
         self.atoms
@@ -752,7 +752,7 @@ impl SaeManifoldTerm {
     /// The flattened frame layout matches the certificate's
     /// `vec(frame_0) ⊕ vec(frame_1) ⊕ …`, row-major within each frame
     /// (`frame_k[i, a]` at offset `atom_offset(k) + i·latent_dim_k + a`).
-    fn to_residual_gauge_model(
+    pub(crate) fn to_residual_gauge_model(
         &self,
         metric: crate::inference::row_metric::RowMetric,
         per_atom_ard_variances: Option<&[Option<Array1<f64>>]>,
@@ -996,7 +996,7 @@ impl SaeManifoldTerm {
         ))
     }
 
-    fn residual_gauge_streamed_data_curvature(
+    pub(crate) fn residual_gauge_streamed_data_curvature(
         &self,
         metric: &crate::inference::row_metric::RowMetric,
         atom_offsets: &[usize],
@@ -1071,7 +1071,7 @@ impl SaeManifoldTerm {
         Ok((gram, n * rank))
     }
 
-    fn accumulate_residual_gauge_gram_row(gram: &mut Array2<f64>, row: &[f64]) {
+    pub(crate) fn accumulate_residual_gauge_gram_row(gram: &mut Array2<f64>, row: &[f64]) {
         for a in 0..row.len() {
             let va = row[a];
             if va == 0.0 {
@@ -1239,7 +1239,7 @@ impl SaeManifoldTerm {
         self.atoms.iter().map(|a| a.basis_size() * p).sum()
     }
 
-    fn take_border_hbb_workspace(&mut self, border_dim: usize) -> Array2<f64> {
+    pub(crate) fn take_border_hbb_workspace(&mut self, border_dim: usize) -> Array2<f64> {
         let mut workspace =
             std::mem::replace(&mut self.border_hbb_workspace, Array2::<f64>::zeros((0, 0)));
         if workspace.dim() != (border_dim, border_dim) {
@@ -1250,7 +1250,7 @@ impl SaeManifoldTerm {
         workspace
     }
 
-    fn reclaim_border_hbb_workspace(&mut self, sys: &mut ArrowSchurSystem) {
+    pub(crate) fn reclaim_border_hbb_workspace(&mut self, sys: &mut ArrowSchurSystem) {
         let workspace = std::mem::replace(&mut sys.hbb, Array2::<f64>::zeros((0, 0)));
         self.border_hbb_workspace = workspace;
     }
@@ -1646,11 +1646,11 @@ impl SaeManifoldTerm {
     ///
     /// Returns `Some((k_active_cap, cutoff))` to engage sparsity, or `None` to
     /// keep the dense full-support layout.
-    fn sparse_active_plan(&self) -> Option<(usize, f64)> {
+    pub(crate) fn sparse_active_plan(&self) -> Option<(usize, f64)> {
         // Relative magnitude cutoff: assignment mass below this fraction of the
         // row's peak `|a_k|` enters the Gram only as `O(a²)` curvature and is
         // dropped. Chosen so dropped terms are ~1e-6 of the peak self-coupling.
-        const RELATIVE_CUTOFF: f64 = 1.0e-3;
+        pub(crate) const RELATIVE_CUTOFF: f64 = 1.0e-3;
 
         let k_atoms = self.k_atoms();
         if k_atoms <= 1 {
@@ -1816,7 +1816,7 @@ impl SaeManifoldTerm {
         self.try_fitted_with_rho(Some(rho), false)
     }
 
-    fn try_fitted_with_rho(
+    pub(crate) fn try_fitted_with_rho(
         &self,
         rho: Option<&SaeManifoldRho>,
         collapse: bool,
@@ -2195,7 +2195,7 @@ impl SaeManifoldTerm {
         };
         let data_fit = if parallel {
             use rayon::prelude::*;
-            const CHUNK: usize = 32;
+            pub(crate) const CHUNK: usize = 32;
             let partials: Vec<Result<f64, String>> = (0..n)
                 .into_par_iter()
                 .chunks(CHUNK)
@@ -2456,7 +2456,7 @@ impl SaeManifoldTerm {
         Ok(total)
     }
 
-    fn decoder_smoothness_value(&self, lambda_smooth: f64) -> f64 {
+    pub(crate) fn decoder_smoothness_value(&self, lambda_smooth: f64) -> f64 {
         // Smoothness penalty value is `0.5·λ·Σ_oc B[:,oc]ᵀ S B[:,oc]`. Form the
         // `S·B` matrix product once per atom (O(M²·p)) and reduce against `B`
         // with a single O(M·p) Hadamard sum, instead of the previous
@@ -2481,7 +2481,7 @@ impl SaeManifoldTerm {
         acc
     }
 
-    fn ard_value(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
+    pub(crate) fn ard_value(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
         if rho.log_ard.len() != self.k_atoms() {
             return Err(format!(
                 "ARD rho has {} atoms but term has {}",
@@ -2948,13 +2948,13 @@ impl SaeManifoldTerm {
             .iter()
             .map(|coord| coord.effective_axis_periods())
             .collect();
-        struct SaeAssemblyRow {
-            row: usize,
-            block: ArrowRowBlock,
-            gb_delta: Vec<(usize, f64)>,
-            g_blocks: SaeGBlocks,
-            kron_a_phi: Option<Vec<(usize, f64)>>,
-            kron_jac: Option<Vec<f64>>,
+        pub(crate) struct SaeAssemblyRow {
+            pub(crate) row: usize,
+            pub(crate) block: ArrowRowBlock,
+            pub(crate) gb_delta: Vec<(usize, f64)>,
+            pub(crate) g_blocks: SaeGBlocks,
+            pub(crate) kron_a_phi: Option<Vec<(usize, f64)>>,
+            pub(crate) kron_jac: Option<Vec<f64>>,
         }
 
         // Per-row scratch reused across all rows a rayon worker processes
@@ -2968,15 +2968,15 @@ impl SaeManifoldTerm {
         // it is read each row, so reuse is bit-identical to the fresh-alloc path;
         // `gb_delta`/`g_blocks` are NOT scratch (they move into the returned
         // `SaeAssemblyRow`) and stay allocated per row.
-        struct RowScratch {
-            decoded: Array2<f64>,
-            dg_buf: Vec<f64>,
-            fitted: Array1<f64>,
-            error: Array1<f64>,
-            error_white: Vec<f64>,
-            error_metric: Array1<f64>,
-            jac_white: Vec<f64>,
-            decoded_scratch: Vec<f64>,
+        pub(crate) struct RowScratch {
+            pub(crate) decoded: Array2<f64>,
+            pub(crate) dg_buf: Vec<f64>,
+            pub(crate) fitted: Array1<f64>,
+            pub(crate) error: Array1<f64>,
+            pub(crate) error_white: Vec<f64>,
+            pub(crate) error_metric: Array1<f64>,
+            pub(crate) jac_white: Vec<f64>,
+            pub(crate) decoded_scratch: Vec<f64>,
         }
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let row_results: Vec<SaeAssemblyRow> = (0..n)
@@ -3972,7 +3972,7 @@ impl SaeManifoldTerm {
         hbb_c
     }
 
-    fn add_factored_beta_penalty_curvature_for_penalty(
+    pub(crate) fn add_factored_beta_penalty_curvature_for_penalty(
         &self,
         hbb_c: &mut Array2<f64>,
         penalty: &AnalyticPenaltyKind,
@@ -4091,7 +4091,7 @@ impl SaeManifoldTerm {
         assert_eq!(p, self.output_dim());
     }
 
-    fn ext_coord_matrix(&self) -> Array2<f64> {
+    pub(crate) fn ext_coord_matrix(&self) -> Array2<f64> {
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
         let flat = self.assignment.flatten_ext_coords();
@@ -4104,7 +4104,7 @@ impl SaeManifoldTerm {
         out
     }
 
-    fn ext_coord_manifold(&self) -> LatentManifold {
+    pub(crate) fn ext_coord_manifold(&self) -> LatentManifold {
         let mut parts = Vec::with_capacity(self.assignment.row_block_dim());
         for _ in 0..self.assignment.assignment_coord_dim() {
             parts.push(LatentManifold::Euclidean);
@@ -4127,7 +4127,7 @@ impl SaeManifoldTerm {
         }
     }
 
-    fn apply_sae_riemannian_geometry(&self, sys: &mut ArrowSchurSystem) {
+    pub(crate) fn apply_sae_riemannian_geometry(&self, sys: &mut ArrowSchurSystem) {
         let manifold = self.ext_coord_manifold();
         if manifold.is_euclidean() {
             return;
@@ -4299,7 +4299,7 @@ impl SaeManifoldTerm {
         )
     }
 
-    fn reml_criterion_with_cache_refine_policy(
+    pub(crate) fn reml_criterion_with_cache_refine_policy(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -4460,7 +4460,7 @@ impl SaeManifoldTerm {
     /// (`reml_criterion_streaming_exact`) evidence paths route through this same
     /// driver, so they converge to the identical inner state and their
     /// `ridge = 0` log-determinants stay bit-identical (#847).
-    fn converge_inner_for_undamped_logdet(
+    pub(crate) fn converge_inner_for_undamped_logdet(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -4852,7 +4852,7 @@ impl SaeManifoldTerm {
         }
     }
 
-    fn refine_round_made_progress(previous_grad_norm: Option<f64>, grad_norm: f64) -> bool {
+    pub(crate) fn refine_round_made_progress(previous_grad_norm: Option<f64>, grad_norm: f64) -> bool {
         previous_grad_norm
             .is_some_and(|prev| prev.is_finite() && grad_norm.is_finite() && grad_norm < prev)
     }
@@ -5090,7 +5090,7 @@ impl SaeManifoldTerm {
         Ok(occam_penalty - frame_dim_term)
     }
 
-    fn reml_occam_log_lambda_smooth_derivative(&self) -> Result<f64, String> {
+    pub(crate) fn reml_occam_log_lambda_smooth_derivative(&self) -> Result<f64, String> {
         let mut penalized_channel_dim = 0usize;
         for atom in &self.atoms {
             let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
@@ -5341,7 +5341,7 @@ impl SaeManifoldTerm {
         Ok(traces)
     }
 
-    fn ard_log_precision_explicit_derivatives(
+    pub(crate) fn ard_log_precision_explicit_derivatives(
         &self,
         rho: &SaeManifoldRho,
     ) -> Result<Vec<Array1<f64>>, String> {
@@ -5396,7 +5396,7 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
-    fn ard_log_precision_hessian_trace(
+    pub(crate) fn ard_log_precision_hessian_trace(
         &self,
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
@@ -5546,7 +5546,7 @@ impl SaeManifoldTerm {
         Ok(trace)
     }
 
-    fn decoder_smoothness_effective_dof_with_solver(
+    pub(crate) fn decoder_smoothness_effective_dof_with_solver(
         &self,
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
@@ -5597,7 +5597,7 @@ impl SaeManifoldTerm {
         Ok(trace)
     }
 
-    fn assignment_log_strength_hessian_trace(
+    pub(crate) fn assignment_log_strength_hessian_trace(
         &self,
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
@@ -5686,7 +5686,7 @@ impl SaeManifoldTerm {
         Ok(0.5 * trace)
     }
 
-    fn learnable_ibp_forward_alpha_data_derivative(
+    pub(crate) fn learnable_ibp_forward_alpha_data_derivative(
         &self,
         rho: &SaeManifoldRho,
         target: ArrayView2<'_, f64>,
@@ -5752,7 +5752,7 @@ impl SaeManifoldTerm {
         Ok(total)
     }
 
-    fn add_learnable_ibp_forward_alpha_data_rhs(
+    pub(crate) fn add_learnable_ibp_forward_alpha_data_rhs(
         &self,
         rho: &SaeManifoldRho,
         target: ArrayView2<'_, f64>,
@@ -5993,7 +5993,7 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
-    fn gate_derivatives_for_row(
+    pub(crate) fn gate_derivatives_for_row(
         &self,
         rho: &SaeManifoldRho,
         row: usize,
@@ -6080,7 +6080,7 @@ impl SaeManifoldTerm {
         Ok((dz, d2z))
     }
 
-    fn decoded_second_row(
+    pub(crate) fn decoded_second_row(
         atom: &SaeManifoldAtom,
         second_jet: &Array4<f64>,
         row: usize,
@@ -6283,7 +6283,7 @@ impl SaeManifoldTerm {
         })
     }
 
-    fn assignment_prior_hdiag_derivative_entry(
+    pub(crate) fn assignment_prior_hdiag_derivative_entry(
         &self,
         rho: &SaeManifoldRho,
         row: usize,
@@ -6350,7 +6350,7 @@ impl SaeManifoldTerm {
         }
     }
 
-    fn ard_majorized_hessian_derivative(
+    pub(crate) fn ard_majorized_hessian_derivative(
         &self,
         rho: &SaeManifoldRho,
         row: usize,

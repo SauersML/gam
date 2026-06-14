@@ -133,11 +133,11 @@ pub(crate) enum RhoPriorError {
 }
 
 impl RhoPriorError {
-    fn dimension_mismatch(reason: String) -> Self {
+    pub(crate) fn dimension_mismatch(reason: String) -> Self {
         RhoPriorError::DimensionMismatch { reason }
     }
 
-    fn constraint_violation(reason: String) -> Self {
+    pub(crate) fn constraint_violation(reason: String) -> Self {
         RhoPriorError::ConstraintViolation { reason }
     }
 }
@@ -154,7 +154,7 @@ pub(crate) struct RhoPriorEval {
 /// Per-coordinate scalar contribution `(cost, grad, hess)` of one *scalar*
 /// prior at `r`, or a structured error when the scalar prior is malformed.
 /// Nested `Independent` priors are not scalar and are rejected here.
-fn scalar_terms(prior: &RhoPrior, r: f64, context: &str) -> Result<(f64, f64, f64), RhoPriorError> {
+pub(crate) fn scalar_terms(prior: &RhoPrior, r: f64, context: &str) -> Result<(f64, f64, f64), RhoPriorError> {
     match prior {
         RhoPrior::Flat => Ok((0.0, 0.0, 0.0)),
         RhoPrior::Normal { mean, sd } => {
@@ -203,7 +203,7 @@ fn scalar_terms(prior: &RhoPrior, r: f64, context: &str) -> Result<(f64, f64, f6
 
 /// Saturated contribution returned (under [`InvalidPriorPolicy::Saturate`])
 /// when the prior is malformed: `+inf` cost, `NaN` gradient, `NaN` Hessian.
-fn saturated(len: usize) -> RhoPriorEval {
+pub(crate) fn saturated(len: usize) -> RhoPriorEval {
     RhoPriorEval {
         cost: f64::INFINITY,
         gradient: Array1::from_elem(len, f64::NAN),
@@ -234,7 +234,7 @@ pub(crate) fn evaluate(
 
 /// Strict evaluation: always errors on a malformed prior. Policy mapping lives
 /// in [`evaluate`].
-fn evaluate_strict(prior: &RhoPrior, rho: &Array1<f64>) -> Result<RhoPriorEval, RhoPriorError> {
+pub(crate) fn evaluate_strict(prior: &RhoPrior, rho: &Array1<f64>) -> Result<RhoPriorEval, RhoPriorError> {
     let len = rho.len();
     match prior {
         RhoPrior::Flat => Ok(RhoPriorEval {
@@ -294,7 +294,7 @@ fn evaluate_strict(prior: &RhoPrior, rho: &Array1<f64>) -> Result<RhoPriorEval, 
 mod tests {
     use super::*;
 
-    fn approx(a: f64, b: f64) {
+    pub(crate) fn approx(a: f64, b: f64) {
         assert!((a - b).abs() <= 1e-12, "expected {a} ~= {b}");
     }
 
@@ -302,7 +302,7 @@ mod tests {
     /// every valid prior variant — this is the parity guarantee the two former
     /// duplicate call sites relied on.
     #[test]
-    fn cost_grad_hess_parity_across_valid_priors() {
+    pub(crate) fn cost_grad_hess_parity_across_valid_priors() {
         let rho = Array1::from_vec(vec![-0.5, 0.25, 1.5, 0.7]);
         let priors = vec![
             RhoPrior::Flat,
@@ -374,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_prior_policy_branches() {
+    pub(crate) fn invalid_prior_policy_branches() {
         let rho = Array1::from_vec(vec![0.0, 0.0]);
         let bad_normal = RhoPrior::Normal {
             mean: 0.0,
@@ -414,13 +414,13 @@ mod tests {
     /// `ln(θ/2)` the optimizer cost drops). `log p(ρ) = ln(θ/2) − ρ/2 − θ
     /// exp(−ρ/2)`, the change-of-variables image of `d ~ Exp(θ)` under
     /// `d = exp(−ρ/2)`.
-    fn pc_log_pdf(upper: f64, tail_prob: f64, r: f64) -> f64 {
+    pub(crate) fn pc_log_pdf(upper: f64, tail_prob: f64, r: f64) -> f64 {
         let theta = pc_prior_rate(upper, tail_prob);
         (0.5 * theta).ln() - 0.5 * r - theta * (-0.5 * r).exp()
     }
 
     #[test]
-    fn pc_rate_calibrates_to_tail_statement() {
+    pub(crate) fn pc_rate_calibrates_to_tail_statement() {
         // θ = −ln(α)/U solves P(d > U) = exp(−θU) = α exactly.
         for &(upper, alpha) in &[(0.5_f64, 0.05_f64), (1.2, 0.01), (3.0, 0.25)] {
             let theta = pc_prior_rate(upper, alpha);
@@ -433,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn pc_density_integrates_to_one_and_matches_tail() {
+    pub(crate) fn pc_density_integrates_to_one_and_matches_tail() {
         // Trapezoidal integration of the normalized ρ-density. d = exp(−ρ/2)
         // ranges over (0, ∞); the density decays at both ends, so a wide grid
         // captures essentially all the mass.
@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn pc_terms_are_negative_log_density_derivatives() {
+    pub(crate) fn pc_terms_are_negative_log_density_derivatives() {
         // cost = −log p (up to the dropped constant); grad/hess are its ρ
         // derivatives, cross-checked against a finite difference of pc_log_pdf.
         let (upper, alpha) = (0.8_f64, 0.02_f64);
@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn pc_prior_pulls_toward_simpler_model() {
+    pub(crate) fn pc_prior_pulls_toward_simpler_model() {
         // The simpler (base) model is more smoothing: larger ρ ⇒ larger
         // precision λ = exp(ρ) ⇒ the penalized component collapses. The PC cost
         // must therefore make *under*-smoothing (small ρ, wiggly) more expensive
@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn pc_prior_rejects_invalid_hyperparameters() {
+    pub(crate) fn pc_prior_rejects_invalid_hyperparameters() {
         let rho = Array1::from_vec(vec![0.0]);
         for bad in [
             RhoPrior::PenalizedComplexity {

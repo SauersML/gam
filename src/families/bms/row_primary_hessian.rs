@@ -688,7 +688,7 @@ impl BernoulliMarginalSlopeFamily {
     /// every caller falls back to direct ladder quadrature per cell, so a
     /// missing forest is a performance regression only, never a numerical
     /// one.
-    fn build_cell_family_forest(
+    pub(crate) fn build_cell_family_forest(
         &self,
         block_states: &[ParameterBlockState],
         row_contexts: &[BernoulliMarginalSlopeRowExactContext],
@@ -928,7 +928,7 @@ impl BernoulliMarginalSlopeFamily {
                 CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuDenestedCubicCell,
                 try_build_cubic_cell_derivative_moments,
             };
-            const PARITY_ROW_BUDGET: usize = 4;
+            pub(crate) const PARITY_ROW_BUDGET: usize = 4;
             let mut sample_cells: Vec<GpuDenestedCubicCell> = Vec::new();
             let mut sample_branches = Vec::new();
             let mut sample_cpu_moments: Vec<Vec<f64>> = Vec::new();
@@ -1070,7 +1070,7 @@ impl BernoulliMarginalSlopeFamily {
         }))
     }
 
-    fn extend_row_cell_moments_bundle(
+    pub(crate) fn extend_row_cell_moments_bundle(
         &self,
         base: &RowCellMomentsBundle,
         required_degree: usize,
@@ -2054,7 +2054,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(RowPrimaryEvalCache::Host(rows))
     }
 
-    fn row_primary_eval_tile_bytes(rows: usize, r: usize) -> u64 {
+    pub(crate) fn row_primary_eval_tile_bytes(rows: usize, r: usize) -> u64 {
         let floats_per_row = (r as u64)
             .saturating_mul(r as u64)
             .saturating_add(r as u64)
@@ -2064,7 +2064,7 @@ impl BernoulliMarginalSlopeFamily {
             .saturating_mul(std::mem::size_of::<f64>() as u64)
     }
 
-    fn build_row_primary_hessian_tile(
+    pub(crate) fn build_row_primary_hessian_tile(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -2089,7 +2089,7 @@ impl BernoulliMarginalSlopeFamily {
         })
     }
 
-    fn build_row_primary_hessian_pin(
+    pub(crate) fn build_row_primary_hessian_pin(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -2193,7 +2193,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn cached_row_primary_hessian_from_pin<'a>(
+    pub(crate) fn cached_row_primary_hessian_from_pin<'a>(
         pin: &'a RowPrimaryEvalPin,
         row: usize,
         r: usize,
@@ -2230,7 +2230,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn cached_row_primary_eval_from_pin<'a>(
+    pub(crate) fn cached_row_primary_eval_from_pin<'a>(
         pin: &'a RowPrimaryEvalPin,
         row: usize,
         r: usize,
@@ -2357,7 +2357,7 @@ impl BernoulliMarginalSlopeFamily {
         // dense-PIRLS routing helpers were retired (no live device backend
         // in this build); revisit when a runtime device backend is
         // reintroduced.
-        const CPU_TARGET_CHUNK_FLOATS: usize = 1 << 17;
+        pub(crate) const CPU_TARGET_CHUNK_FLOATS: usize = 1 << 17;
         let cpu_rows = (CPU_TARGET_CHUNK_FLOATS / (3 * n_dirs).max(1)).clamp(1024, n.max(1));
         (cpu_rows.min(n.max(1)), false)
     }
@@ -3338,7 +3338,7 @@ impl BernoulliMarginalSlopeFamily {
     /// multi-axis direction (e.g. finite-difference probes); zero directions
     /// take a separate exact zero fast path. Backs the gam#683 fast path.
     #[inline]
-    fn single_primary_axis(dir: &Array1<f64>, primary: &PrimarySlices) -> Option<(usize, f64)> {
+    pub(crate) fn single_primary_axis(dir: &Array1<f64>, primary: &PrimarySlices) -> Option<(usize, f64)> {
         if dir.len() != primary.total {
             return None;
         }
@@ -3363,7 +3363,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn primary_direction_is_zero(dir: &Array1<f64>, primary: &PrimarySlices) -> bool {
+    pub(crate) fn primary_direction_is_zero(dir: &Array1<f64>, primary: &PrimarySlices) -> bool {
         dir.len() == primary.total && dir.iter().all(|&value| value == 0.0)
     }
 
@@ -5035,7 +5035,7 @@ impl BernoulliMarginalSlopeFamily {
     /// accumulators. The two call sites previously inlined byte-identical
     /// copies differing only in the diagnostic `score_label` / `link_label`
     /// strings threaded into the deviation-basis iterators.
-    fn accumulate_primary_third_cell_moments(
+    pub(crate) fn accumulate_primary_third_cell_moments(
         cells: &[CachedDenestedCellMoments],
         a: f64,
         b: f64,

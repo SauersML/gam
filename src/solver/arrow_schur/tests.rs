@@ -10,7 +10,7 @@
     /// the same `(atom, atom')` couplings — this is the equivalence that makes
     /// the sparse op a drop-in replacement for the dense data Gram.
     #[test]
-    fn sparse_block_kronecker_matches_dense_kronecker() {
+    pub(crate) fn sparse_block_kronecker_matches_dense_kronecker() {
         // Two atoms: atom 0 has m_0 = 2 basis cols (μ offset 0), atom 1 has
         // m_1 = 3 (μ offset 2). p = 2 output channels ⇒ dim_a = 5, k = 10.
         let p = 2usize;
@@ -129,7 +129,7 @@
     /// Hand-built dense reference for the frame-factored Gram
     /// `H[(i,li,a),(j,lj,b)] = g_ij[li,lj]·(U_iᵀU_j)[a,b]`, with the variable
     /// per-atom width `r_k`.
-    fn factored_reference_dense(
+    pub(crate) fn factored_reference_dense(
         ranks: &[usize],
         basis_sizes: &[usize],
         blocks: &[FactoredFrameGBlock],
@@ -163,7 +163,7 @@
     /// every interface, with VARIABLE per-atom rank (`r_0 = 2`, `r_1 = 3`) and a
     /// genuine cross-atom output factor `U_0ᵀU_1 ≠ 0`.
     #[test]
-    fn factored_frame_kronecker_matches_dense_reference() {
+    pub(crate) fn factored_frame_kronecker_matches_dense_reference() {
         // Atom 0: M_0 = 2, r_0 = 2. Atom 1: M_1 = 3, r_1 = 3. dim = 4 + 9 = 13.
         let ranks = vec![2usize, 3];
         let basis_sizes = vec![2usize, 3];
@@ -269,7 +269,7 @@
     /// matvec — i.e. the full-`B` border is the `r = p` special case of the
     /// factored op, not a separate path.
     #[test]
-    fn factored_frame_kronecker_reduces_to_sparse_block_at_full_rank() {
+    pub(crate) fn factored_frame_kronecker_reduces_to_sparse_block_at_full_rank() {
         let p = 2usize;
         let g00 = array![[3.0_f64, 0.5], [0.5, 4.0]];
         let g11 = array![[2.0_f64, 0.4], [0.4, 5.0]];
@@ -355,7 +355,7 @@
     /// Modified Gram–Schmidt orthonormalization of the columns of a `p × r`
     /// matrix (`r ≤ p`), used by the frame-constructor tests to build genuine
     /// `St(p, r)` representatives. Returns the orthonormal `Q` (`p × r`).
-    fn mgs_orthonormalize(a: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn mgs_orthonormalize(a: &Array2<f64>) -> Array2<f64> {
         let (p, r) = a.dim();
         let mut q = a.clone();
         for j in 0..r {
@@ -384,7 +384,7 @@
 
     /// `frame_output_gram` of an orthonormal frame with itself is the identity.
     #[test]
-    fn frame_output_gram_orthonormal_is_identity() {
+    pub(crate) fn frame_output_gram_orthonormal_is_identity() {
         let p = 5usize;
         let r = 3usize;
         // A deterministic-but-generic p×r seed, then orthonormalize.
@@ -413,7 +413,7 @@
     /// reproduce the hand-built dense `g ⊗ (UᵀU)` reference on every interface,
     /// computing the `W_ij` factors itself from the supplied frames.
     #[test]
-    fn from_frames_and_blocks_matches_dense_reference() {
+    pub(crate) fn from_frames_and_blocks_matches_dense_reference() {
         let p = 4usize;
         // Atom 0: M_0 = 2, r_0 = 2. Atom 1: M_1 = 3, r_1 = 3.
         let basis_sizes = vec![2usize, 3];
@@ -516,7 +516,7 @@
     /// unframed (`None → r_1 = p = 4`). The constructor must stand `I_p` in for
     /// the missing frame, so the within-atom-1 block is exactly `g_11 ⊗ I_4`.
     #[test]
-    fn from_frames_and_blocks_mixed_framed_unframed() {
+    pub(crate) fn from_frames_and_blocks_mixed_framed_unframed() {
         let p = 4usize;
         let basis_sizes = vec![2usize, 2]; // M_0 = 2, M_1 = 2.
         // Atom 0 gets a genuine orthonormal 4×2 frame; atom 1 stays full-B.
@@ -627,7 +627,7 @@
     /// solve it with the local cholesky_lower path, and compare to the
     /// arrow-Schur output.
     #[test]
-    fn arrow_schur_matches_dense_reference_2x2() {
+    pub(crate) fn arrow_schur_matches_dense_reference_2x2() {
         // N = 2 rows, d = 2 latent, K = 3 β.
         let n = 2;
         let d = 2;
@@ -708,7 +708,7 @@
         }
     }
 
-    fn diagonal_arrow_fixture(row_min: f64, schur_min: f64) -> ArrowSchurSystem {
+    pub(crate) fn diagonal_arrow_fixture(row_min: f64, schur_min: f64) -> ArrowSchurSystem {
         let mut sys = ArrowSchurSystem::new(2, 2, 2);
         sys.rows[0].htt = array![[row_min, 0.0], [0.0, row_min + 1.0]];
         sys.rows[1].htt = array![[row_min + 2.0, 0.0], [0.0, row_min + 3.0]];
@@ -721,7 +721,7 @@
         sys
     }
 
-    fn diagonal_fixture_dense_lambda_min(sys: &ArrowSchurSystem) -> f64 {
+    pub(crate) fn diagonal_fixture_dense_lambda_min(sys: &ArrowSchurSystem) -> f64 {
         let mut out = f64::INFINITY;
         for row in &sys.rows {
             for axis in 0..row.htt.nrows() {
@@ -735,7 +735,7 @@
     }
 
     #[test]
-    fn arrow_factor_min_pivot_matches_dense_lambda_min_ordering() {
+    pub(crate) fn arrow_factor_min_pivot_matches_dense_lambda_min_ordering() {
         let weak = diagonal_arrow_fixture(0.2, 0.8);
         let strong = diagonal_arrow_fixture(0.7, 1.2);
         let options = ArrowSolveOptions::direct();
@@ -761,11 +761,11 @@
         assert!(weak_pivot < strong_pivot);
     }
 
-    fn quartic_counterexample_value(t: f64) -> f64 {
+    pub(crate) fn quartic_counterexample_value(t: f64) -> f64 {
         0.25 * t.powi(4) - t * t + 2.0 * t
     }
 
-    fn quartic_counterexample_system(t: f64) -> ArrowSchurSystem {
+    pub(crate) fn quartic_counterexample_system(t: f64) -> ArrowSchurSystem {
         let mut sys = ArrowSchurSystem::new(1, 1, 0);
         sys.rows[0].gt = array![t.powi(3) - 2.0 * t + 2.0];
         sys.rows[0].htt = array![[3.0 * t * t - 2.0]];
@@ -773,7 +773,7 @@
     }
 
     #[test]
-    fn proximal_correction_breaks_scalar_newton_cycle() {
+    pub(crate) fn proximal_correction_breaks_scalar_newton_cycle() {
         let options = ArrowSolveOptions::direct();
         let correction = ArrowProximalCorrectionOptions {
             initial_ridge: 1e-8,
@@ -825,7 +825,7 @@
     /// `S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`.
     /// Only a block that cannot be conditioned even at `ridge_cap` errors.
     #[test]
-    fn factor_one_row_conditions_barely_pd_block_via_ridge() {
+    pub(crate) fn factor_one_row_conditions_barely_pd_block_via_ridge() {
         let d = 2;
         let k = 2;
         let mut row = ArrowRowBlock::new(d, k);
@@ -931,7 +931,7 @@
     }
 
     #[test]
-    fn factor_one_row_conditions_scalar_tiny_pivot_via_ridge() {
+    pub(crate) fn factor_one_row_conditions_scalar_tiny_pivot_via_ridge() {
         let d = 1;
         let k = 1;
         let mut row = ArrowRowBlock::new(d, k);
@@ -974,7 +974,7 @@
     /// finite-and-bias-free pre-stationarity (so the outer REML value and its
     /// analytic ρ-gradient agree), exact-and-unbiased at the optimum.
     #[test]
-    fn evidence_row_spectral_deflates_indefinite_non_gauge_block_at_unit_stiffness() {
+    pub(crate) fn evidence_row_spectral_deflates_indefinite_non_gauge_block_at_unit_stiffness() {
         let d = 3usize;
         let k = 2usize;
 
@@ -1118,7 +1118,7 @@
     /// seed/homotopy cascade. The genuine indefinite direction (the true
     /// quotient null) is deflated on BOTH sides, so the count is stable.
     #[test]
-    fn evidence_row_spectral_deflation_count_is_stable_across_the_cutoff() {
+    pub(crate) fn evidence_row_spectral_deflation_count_is_stable_across_the_cutoff() {
         let d = 3usize;
         let k = 1usize;
         // max|λ| = 4.0 ⇒ floor = SPECTRAL_DEFLATION_REL_FLOOR·4 = 4e-8. Place the
@@ -1194,7 +1194,7 @@
     /// (ρ-independent `log 1 = 0`), the genuine positive spectrum is preserved
     /// exactly, and the result is PD so its Cholesky and `log|S|` are finite.
     #[test]
-    fn evidence_dense_schur_deflates_indefinite_complement_at_unit_stiffness() {
+    pub(crate) fn evidence_dense_schur_deflates_indefinite_complement_at_unit_stiffness() {
         // A 3×3 symmetric Schur complement with one genuinely NEGATIVE eigenvalue
         // (−0.5 along e_1) and two healthy positive ones (4.0 along e_0, 2.0 along
         // e_2). The plain Cholesky must refuse it; the evidence deflation must
@@ -1243,7 +1243,7 @@
     }
 
     #[test]
-    fn sys_htbeta_materialize_row_sums_operator_and_dense_slab() {
+    pub(crate) fn sys_htbeta_materialize_row_sums_operator_and_dense_slab() {
         let mut sys = ArrowSchurSystem::new(1, 1, 3);
         sys.rows[0].htbeta = array![[0.25_f64, 0.5, 0.75]];
         sys.activate_dense_htbeta_supplement();
@@ -1281,7 +1281,7 @@
     /// therefore: a finite, well-conditioned Newton step is produced (via a
     /// bounded number of outer ridge escalations), NOT zero escalations.
     #[test]
-    fn lm_escalation_recovers_from_ill_conditioned_row() {
+    pub(crate) fn lm_escalation_recovers_from_ill_conditioned_row() {
         let n = 1;
         let d = 2;
         let k = 2;
@@ -1331,7 +1331,7 @@
     /// dense `(N·d + K) × (N·d + K)` Hessian from the same per-row blocks,
     /// invert it via dense Cholesky, and compare diagonals.
     #[test]
-    fn latent_block_inverse_diagonal_matches_dense() {
+    pub(crate) fn latent_block_inverse_diagonal_matches_dense() {
         let n = 3usize;
         let d = 2usize;
         let k = 2usize;
@@ -1419,7 +1419,7 @@
     /// step the solver itself returned (`Δ = H⁻¹g`) — both to near machine
     /// precision on the ridge-0 Direct factor.
     #[test]
-    fn full_inverse_apply_matches_dense_inverse_and_newton_step() {
+    pub(crate) fn full_inverse_apply_matches_dense_inverse_and_newton_step() {
         let n = 3usize;
         let d = 2usize;
         let k = 2usize;
@@ -1525,7 +1525,7 @@
     /// caller-assembled `tr(S_β⁻¹ M)` must match the dense Kron-block trace —
     /// the β-side analogue used by the SAE λ_smooth Fellner-Schall step.
     #[test]
-    fn schur_inverse_beta_block_matches_dense() {
+    pub(crate) fn schur_inverse_beta_block_matches_dense() {
         let n = 3usize;
         let d = 2usize;
         let k = 2usize;
@@ -1670,7 +1670,7 @@
     ///     the exact dense `log|H|`, undistorted by any κ-ceiling ridge. This
     ///     is the SAE evidence path under a wide ARD α sweep.
     #[test]
-    fn ill_conditioning_tolerated_returns_cache_with_exact_logdet() {
+    pub(crate) fn ill_conditioning_tolerated_returns_cache_with_exact_logdet() {
         let n = 2usize;
         let d = 2usize;
         let k = 2usize;
@@ -1818,7 +1818,7 @@
     }
 
     #[test]
-    fn arrow_factor_slab_accessor_matches_array_blocks_bitwise() {
+    pub(crate) fn arrow_factor_slab_accessor_matches_array_blocks_bitwise() {
         let blocks = vec![
             array![[1.0_f64]],
             array![[2.0_f64, 0.0], [0.25, 3.0]],
@@ -1837,7 +1837,7 @@
         }
     }
 
-    fn fixed_row_kernel_fixture<const D: usize>() -> (ArrowRowBlock, Array1<f64>) {
+    pub(crate) fn fixed_row_kernel_fixture<const D: usize>() -> (ArrowRowBlock, Array1<f64>) {
         let mut row = ArrowRowBlock::new(D, 0);
         for r in 0..D {
             for c in 0..D {
@@ -1852,7 +1852,7 @@
         (row, rhs)
     }
 
-    fn assert_fixed_row_kernels_match_dynamic<const D: usize>() -> usize {
+    pub(crate) fn assert_fixed_row_kernels_match_dynamic<const D: usize>() -> usize {
         let (row, rhs) = fixed_row_kernel_fixture::<D>();
         let ridge = 0.125_f64;
         let fixed = factor_row_block_cholesky_fixed::<D>(&row, ridge).expect("fixed factor");
@@ -1880,7 +1880,7 @@
     }
 
     #[test]
-    fn fixed_row_kernels_match_dynamic_path_bitwise() {
+    pub(crate) fn fixed_row_kernels_match_dynamic_path_bitwise() {
         let checked = assert_fixed_row_kernels_match_dynamic::<1>()
             + assert_fixed_row_kernels_match_dynamic::<2>()
             + assert_fixed_row_kernels_match_dynamic::<3>()
@@ -1892,7 +1892,7 @@
     /// `d×d` PD blocks, small `d×k` cross blocks, a diagonally-dominant `k×k`
     /// border. Used to exercise the #1017 production device-routing seam on the
     /// host (where the device declines, so the CPU path must answer unchanged).
-    fn dense_direct_system(n: usize, d: usize, k: usize) -> ArrowSchurSystem {
+    pub(crate) fn dense_direct_system(n: usize, d: usize, k: usize) -> ArrowSchurSystem {
         let mut sys = ArrowSchurSystem::new(n, d, k);
         for (i, row) in sys.rows.iter_mut().enumerate() {
             for r in 0..d {
@@ -1918,7 +1918,7 @@
     /// The #1017 work-based dispatch predicate must admit LLM/SAE shapes (few
     /// rows, wide border) and reject tiny shapes where launch latency wins.
     #[test]
-    fn device_dispatch_predicate_gates_on_work_not_rows() {
+    pub(crate) fn device_dispatch_predicate_gates_on_work_not_rows() {
         let policy = crate::gpu::policy::GpuDispatchPolicy::default();
         // Tiny: below the DEVICE_LOOP_MIN_P border floor → never on device.
         assert!(!policy.dense_hessian_work_target_is_gpu(300, 8));
@@ -1940,7 +1940,7 @@
     /// through the predicate it consults (the device==CPU 1e-10 numeric parity is
     /// asserted by the box harness).
     #[test]
-    fn matvec_gate_engages_for_llm_shape_off_for_tiny() {
+    pub(crate) fn matvec_gate_engages_for_llm_shape_off_for_tiny() {
         let policy = crate::gpu::policy::GpuDispatchPolicy::default();
         // The cg_iters the live gate derives from default options is exactly the
         // budget the PCG loop launches with.
@@ -1969,7 +1969,7 @@
     /// `None`), so `solve_arrow_newton_step_core` runs the unchanged CPU path
     /// and the result equals the direct CPU artifacts solve bit-for-bit.
     #[test]
-    fn device_seam_declines_without_gpu_and_matches_cpu() {
+    pub(crate) fn device_seam_declines_without_gpu_and_matches_cpu() {
         if crate::gpu::runtime::GpuRuntime::global().is_some() {
             // On a CUDA host the device may legitimately serve the step; this
             // host-only invariant does not apply. The box harness asserts the
@@ -2006,7 +2006,7 @@
     /// (bit-for-bit) because it is read from the f64 reduced-Schur factor, never
     /// the f32 solve.
     #[test]
-    fn streaming_mixed_precision_matches_f64_and_keeps_logdet_f64() {
+    pub(crate) fn streaming_mixed_precision_matches_f64_and_keeps_logdet_f64() {
         let sys = dense_direct_system(40, 3, 6);
 
         let f64_options = ArrowSolveOptions::direct().with_streaming_chunk_size(Some(8));
@@ -2056,7 +2056,7 @@
     /// The streaming dispatch turns mixed precision ON by default (#1014) but
     /// honors an explicit caller policy.
     #[test]
-    fn streaming_mixed_precision_default_upgrades_only_off() {
+    pub(crate) fn streaming_mixed_precision_default_upgrades_only_off() {
         let off = ArrowSolveOptions::direct();
         assert!(matches!(
             off.with_streaming_mixed_precision_default().mixed_precision,
@@ -2100,7 +2100,7 @@
     /// logit slots are the first `R` latent coords of every row. Returns the
     /// system (with the self term `d_k·z'_ik²` already on the logit diagonals,
     /// as the assembly writes it), the source, and the per-(row, atom) `z'_ik`.
-    fn build_ibp_woodbury_fixture() -> (ArrowSchurSystem, IbpCrossRowSource, Vec<Vec<f64>>) {
+    pub(crate) fn build_ibp_woodbury_fixture() -> (ArrowSchurSystem, IbpCrossRowSource, Vec<Vec<f64>>) {
         let n = 3usize;
         let d = 2usize;
         let k_beta = 2usize;
@@ -2151,7 +2151,7 @@
 
     /// Assemble the dense bordered `H_full` (with the i≠j cross-row terms) from
     /// the self-term system + source.
-    fn dense_h_full(
+    pub(crate) fn dense_h_full(
         sys: &ArrowSchurSystem,
         source: &IbpCrossRowSource,
         zprime: &[Vec<f64>],
@@ -2198,7 +2198,7 @@
     }
 
     #[test]
-    fn ibp_cross_row_woodbury_logdet_matches_dense() {
+    pub(crate) fn ibp_cross_row_woodbury_logdet_matches_dense() {
         let (mut sys, source, zprime) = build_ibp_woodbury_fixture();
         sys.set_ibp_cross_row_source(source.clone());
         let options = ArrowSolveOptions::direct();
@@ -2254,7 +2254,7 @@
     }
 
     #[test]
-    fn ibp_cross_row_woodbury_full_inverse_and_newton_match_dense() {
+    pub(crate) fn ibp_cross_row_woodbury_full_inverse_and_newton_match_dense() {
         let (mut sys, source, zprime) = build_ibp_woodbury_fixture();
         sys.set_ibp_cross_row_source(source.clone());
         let options = ArrowSolveOptions::direct();
@@ -2361,7 +2361,7 @@
     /// check that a system WITHOUT the source yields no Woodbury carrier and an
     /// unchanged (bare) log-determinant, so the path is a strict no-op off-IBP.
     #[test]
-    fn ibp_cross_row_woodbury_absent_is_strict_noop() {
+    pub(crate) fn ibp_cross_row_woodbury_absent_is_strict_noop() {
         let (sys, _source, zprime) = build_ibp_woodbury_fixture();
         // No set_ibp_cross_row_source call: the source is absent.
         let options = ArrowSolveOptions::direct();
@@ -2419,7 +2419,7 @@
     /// The streaming log-det path must REFUSE an IBP-active system rather than
     /// silently drop the cross-row correction (a value↔gradient desync).
     #[test]
-    fn ibp_cross_row_streaming_logdet_refuses() {
+    pub(crate) fn ibp_cross_row_streaming_logdet_refuses() {
         let (mut sys, source, _zprime) = build_ibp_woodbury_fixture();
         sys.set_ibp_cross_row_source(source);
         let mut streaming = StreamingArrowSchur::from_system(&sys, 2);
@@ -2435,7 +2435,7 @@
     /// (`n` row blocks × `d` latent coords × wide border `k`), with
     /// deterministic well-conditioned per-row blocks and cross-blocks. This is
     /// the shape the reduced-Schur matvec (#1017) walks O(cg_iters) times.
-    fn dense_arrow_system(n: usize, d: usize, k: usize) -> ArrowSchurSystem {
+    pub(crate) fn dense_arrow_system(n: usize, d: usize, k: usize) -> ArrowSchurSystem {
         let mut sys = ArrowSchurSystem::new(n, d, k);
         // Deterministic diagonally-dominant per-row H_tt and modest H_tβ.
         for i in 0..n {
@@ -2487,7 +2487,7 @@
     /// the `schur_matvec` sequential branch performs (used to compare the
     /// parallel path against). Mirrors the production routine's H_ββ + ridge
     /// prologue, then the per-row point-elimination subtraction in row order.
-    fn schur_matvec_sequential_ref<B: BatchedBlockSolver>(
+    pub(crate) fn schur_matvec_sequential_ref<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
@@ -2525,7 +2525,7 @@
     /// reassociates the same row contributions, so it agrees with the per-row
     /// fold to a tight relative tolerance, not bit-for-bit).
     #[test]
-    fn parallel_schur_matvec_deterministic_and_matches_sequential() {
+    pub(crate) fn parallel_schur_matvec_deterministic_and_matches_sequential() {
         let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path
         let d = 6usize;
         let k = 96usize;
@@ -2595,7 +2595,7 @@
     /// move a single bit. This pins the determinism/parity gate exactly at the
     /// border width where the prologue stops being serial.
     #[test]
-    fn parallel_penalty_prologue_bit_identical_to_serial() {
+    pub(crate) fn parallel_penalty_prologue_bit_identical_to_serial() {
         let k = 576usize; // ≥ SCHUR_PROLOGUE_PARALLEL_K_MIN: trips the parallel GEMV
         assert!(
             k >= SCHUR_PROLOGUE_PARALLEL_K_MIN,
@@ -2655,7 +2655,7 @@
     ///   -- --nocapture
     /// ```
     #[test]
-    fn bench_reduced_schur_matvec_parallel_speedup() {
+    pub(crate) fn bench_reduced_schur_matvec_parallel_speedup() {
         // SAE-arm-flavoured shape from the issue: many row blocks, wide border
         // k, modest frame depth d. Sized so the debug build stays quick.
         let n = 1500usize;
@@ -2734,7 +2734,7 @@
     /// Installs BOTH the matrix-free Kronecker cross-block operator (the generic
     /// matvec path: `H_tβ = L_i P_i`) AND the matching `DeviceSaePcgData` (the
     /// residency path), so the two routes see the identical operator.
-    fn sae_structured_system(
+    pub(crate) fn sae_structured_system(
         n: usize,
         q: usize,
         p: usize,
@@ -2845,7 +2845,7 @@
     /// that changed the reduced operator would change the Newton step and the
     /// criterion ranking — a correctness regression, not a speedup.
     #[test]
-    fn resident_sae_matvec_matches_generic() {
+    pub(crate) fn resident_sae_matvec_matches_generic() {
         let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 96; // trips the parallel path
         let q = 4usize;
         let p = 6usize;
@@ -2928,7 +2928,7 @@
     /// per-column probe-and-solve `build_scalar_jacobi`. A diverging
     /// preconditioner would change the PCG iterate and the criterion ranking.
     #[test]
-    fn resident_scalar_jacobi_matches_generic() {
+    pub(crate) fn resident_scalar_jacobi_matches_generic() {
         let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64;
         let q = 4usize;
         let p = 5usize;
@@ -2978,7 +2978,7 @@
     /// `row_into` applied to a unit-support probe equals the explicit dense
     /// `G_i · (P_i x)` to rel < 1e-10.
     #[test]
-    fn factored_residency_matches_dense_g_block() {
+    pub(crate) fn factored_residency_matches_dense_g_block() {
         let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 40;
         let q = 3usize;
         let p = 7usize;
@@ -3060,7 +3060,7 @@
     /// CG-iteration count (the residency build is paid once, then N matvecs).
     /// Ordinary test (ban gate forbids `#[ignore]`); run `--release --nocapture`.
     #[test]
-    fn bench_resident_sae_matvec_speedup() {
+    pub(crate) fn bench_resident_sae_matvec_speedup() {
         // SAE shape: small per-row latent dim `q = di` (1–2 in production) and a
         // wider per-atom decoder block `p` — the regime where the factored
         // residency (`2·di·p` flops/row, `O(n·di·p)` memory) beats both the

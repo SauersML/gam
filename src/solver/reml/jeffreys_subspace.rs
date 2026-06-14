@@ -36,7 +36,7 @@ use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
 
 #[inline]
-fn norm2_slice(a: &[f64]) -> f64 {
+pub(crate) fn norm2_slice(a: &[f64]) -> f64 {
     a.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
@@ -45,11 +45,11 @@ fn norm2_slice(a: &[f64]) -> f64 {
 /// directions (whose curvature is `O(n) · λ_max`-scale), positive on separating
 /// directions, keeping the Jeffreys log-det finite even when the observed
 /// information is indefinite at an off-mode trial point.
-const REDUCED_INFO_RELATIVE_FLOOR: f64 = 1e-10;
+pub(crate) const REDUCED_INFO_RELATIVE_FLOOR: f64 = 1e-10;
 
 /// Absolute floor for the degenerate case where every reduced eigenvalue is
 /// (near) zero, so `λ_max ≈ 0` cannot scale the relative floor.
-const REDUCED_INFO_ABSOLUTE_FLOOR: f64 = 1e-12;
+pub(crate) const REDUCED_INFO_ABSOLUTE_FLOOR: f64 = 1e-12;
 
 /// Upper saturation scale `Λ` of the Jeffreys antiderivative: once a
 /// direction is identified at the conditioning gate's own "clearly
@@ -59,7 +59,7 @@ const REDUCED_INFO_ABSOLUTE_FLOOR: f64 = 1e-12;
 /// regime where the relative floor exceeds the gate scale; the joins remain
 /// C¹ automatically there because the log window simply collapses to empty.
 #[inline]
-fn jeffreys_cap(floor: f64) -> f64 {
+pub(crate) fn jeffreys_cap(floor: f64) -> f64 {
     CONDITIONING_GATE_ABSOLUTE_CLEAR.max(floor)
 }
 
@@ -101,7 +101,7 @@ fn jeffreys_cap(floor: f64) -> f64 {
 /// bounded range `(ln floor − 2, ln Λ + 1]`, so `Φ` can never out-pay a
 /// data-likelihood term.
 #[inline]
-fn floored_inverse(lam: f64, floor: f64) -> f64 {
+pub(crate) fn floored_inverse(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
     if lam >= cap {
         cap / (lam * lam)
@@ -119,7 +119,7 @@ fn floored_inverse(lam: f64, floor: f64) -> f64 {
 /// `−1/λ²` in the log window, `0` inside the band (the linear continuation
 /// has no curvature in `λ`), `2·floor/(floor − λ)³` on the bottom saturation.
 #[inline]
-fn floored_inverse_prime(lam: f64, floor: f64) -> f64 {
+pub(crate) fn floored_inverse_prime(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
     if lam >= cap {
         -2.0 * cap / (lam * lam * lam)
@@ -138,7 +138,7 @@ fn floored_inverse_prime(lam: f64, floor: f64) -> f64 {
 /// bottom saturation. Needed by the drift path for the confluent-pair limit
 /// of the divided-difference kernel motion (`δΨ_ii = d''(λ_i)·λ̇_i`).
 #[inline]
-fn floored_inverse_second(lam: f64, floor: f64) -> f64 {
+pub(crate) fn floored_inverse_second(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
     if lam >= cap {
         6.0 * cap / (lam * lam * lam * lam)
@@ -159,7 +159,7 @@ fn floored_inverse_second(lam: f64, floor: f64) -> f64 {
 /// saturation. Feeds the floor-motion term of the kernel drift when the floor
 /// is in its active relative regime (`floor = REL·λ_max(β)`).
 #[inline]
-fn floored_inverse_floor_sensitivity(lam: f64, floor: f64) -> f64 {
+pub(crate) fn floored_inverse_floor_sensitivity(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
     if lam >= cap {
         if cap > CONDITIONING_GATE_ABSOLUTE_CLEAR {
@@ -183,7 +183,7 @@ fn floored_inverse_floor_sensitivity(lam: f64, floor: f64) -> f64 {
 /// `−2(2·floor + λ)/(floor − λ)⁴` on the bottom saturation, `0` elsewhere.
 /// Feeds the confluent-pair floor-motion of the kernel drift.
 #[inline]
-fn floored_inverse_prime_floor_sensitivity(lam: f64, floor: f64) -> f64 {
+pub(crate) fn floored_inverse_prime_floor_sensitivity(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
     if lam >= cap {
         if cap > CONDITIONING_GATE_ABSOLUTE_CLEAR {
@@ -211,7 +211,7 @@ fn floored_inverse_prime_floor_sensitivity(lam: f64, floor: f64) -> f64 {
 ///   `∂²Φ[a,b] = ½ Σ_ij Ψ_ij (Ṽ_a)_ij (Ṽ_b)_ij`,  `Ṽ_k = Vᵀ D_k V`.
 /// With the saturating negative branch `d` is continuous everywhere, so every
 /// divided difference is bounded by `max|d'| ≤ 2/floor`.
-fn floored_inverse_divided_differences(evals: &Array1<f64>, floor: f64) -> Array2<f64> {
+pub(crate) fn floored_inverse_divided_differences(evals: &Array1<f64>, floor: f64) -> Array2<f64> {
     let m = evals.len();
     let mut psi = Array2::<f64>::zeros((m, m));
     for i in 0..m {
@@ -250,7 +250,7 @@ fn floored_inverse_divided_differences(evals: &Array1<f64>, floor: f64) -> Array
 /// direction can still clear this relative gate (if `λ_max` is also small), so it
 /// is paired with the ABSOLUTE gate below; the term fires when EITHER gate
 /// reports under-identification (see [`conditioning_gate_weight`]).
-const CONDITIONING_GATE_RELATIVE: f64 = 1e-8;
+pub(crate) const CONDITIONING_GATE_RELATIVE: f64 = 1e-8;
 
 /// Absolute-curvature conditioning gate (the `n`-aware half of the gate).
 ///
@@ -284,7 +284,7 @@ const CONDITIONING_GATE_RELATIVE: f64 = 1e-8;
 /// be on a standardized/O(1)-column scale, which the upstream reduction already
 /// enforces; the floor below (`REDUCED_INFO_ABSOLUTE_FLOOR = 1e-12`) keeps the
 /// log-det finite once the term fires.
-const CONDITIONING_GATE_ABSOLUTE: f64 = 1.0;
+pub(crate) const CONDITIONING_GATE_ABSOLUTE: f64 = 1.0;
 
 /// Upper knot of the SMOOTH absolute conditioning ramp. Below
 /// `CONDITIONING_GATE_ABSOLUTE` (one observation-equivalent of curvature) the
@@ -296,13 +296,13 @@ const CONDITIONING_GATE_ABSOLUTE: f64 = 1.0;
 /// outer smoother (BFGS) cannot optimize across — the root cause of the #787
 /// "outer smoothing did not converge" regression. `16` ≈ a handful of
 /// observation-equivalents: comfortably past "identified by the data".
-const CONDITIONING_GATE_ABSOLUTE_CLEAR: f64 = 16.0;
+pub(crate) const CONDITIONING_GATE_ABSOLUTE_CLEAR: f64 = 16.0;
 
 /// Upper knot of the SMOOTH relative conditioning ramp (ramped in `log10` space
 /// since conditioning ratios span orders of magnitude). At
 /// `λ_min/λ_max ≥ CONDITIONING_GATE_RELATIVE_CLEAR` the relative sub-weight is
 /// `0`; at `≤ CONDITIONING_GATE_RELATIVE` it is `1`; smooth in between.
-const CONDITIONING_GATE_RELATIVE_CLEAR: f64 = 1e-6;
+pub(crate) const CONDITIONING_GATE_RELATIVE_CLEAR: f64 = 1e-6;
 
 /// Shared conditioning-gate predicate for the Jeffreys term, evaluated from the
 /// reduced-information spectrum (`λ_min`, `λ_max`). Returns `true` when the term
@@ -322,7 +322,7 @@ const CONDITIONING_GATE_RELATIVE_CLEAR: f64 = 1e-6;
 /// parameters. The term fires when EITHER criterion reports under-identification,
 /// so the weight is the MAX of the absolute and relative sub-weights.
 #[inline]
-fn conditioning_gate_weight(lambda_min: f64, lambda_max: f64) -> f64 {
+pub(crate) fn conditioning_gate_weight(lambda_min: f64, lambda_max: f64) -> f64 {
     if lambda_max <= 0.0 {
         // Degenerate / non-positive spectrum: not well-conditioned, fully active.
         return 1.0;
@@ -333,7 +333,7 @@ fn conditioning_gate_weight(lambda_min: f64, lambda_max: f64) -> f64 {
     // `ramp_down(x, under, clear)`: the still-active weight, `1` for `x ≤ under`,
     // `0` for `x ≥ clear`, C¹ cubic smoothstep `1 − (3t² − 2t³)` between.
     #[inline]
-    fn ramp_down(x: f64, under: f64, clear: f64) -> f64 {
+    pub(crate) fn ramp_down(x: f64, under: f64, clear: f64) -> f64 {
         if x <= under {
             return 1.0;
         }
@@ -369,7 +369,7 @@ fn conditioning_gate_weight(lambda_min: f64, lambda_max: f64) -> f64 {
 /// mismatch in gam#854, even when no eigenvalue is floored. Returns `(0, 0)` on the
 /// saturated / degenerate branches where `G` is locally constant (so the outer
 /// drift is byte-unchanged on every fully-active or well-conditioned fit).
-fn conditioning_gate_weight_grad(lambda_min: f64, lambda_max: f64) -> (f64, f64) {
+pub(crate) fn conditioning_gate_weight_grad(lambda_min: f64, lambda_max: f64) -> (f64, f64) {
     if lambda_max <= 0.0 || !lambda_min.is_finite() {
         // Matches `conditioning_gate_weight`'s constant-`1.0` early returns.
         return (0.0, 0.0);
@@ -377,7 +377,7 @@ fn conditioning_gate_weight_grad(lambda_min: f64, lambda_max: f64) -> (f64, f64)
     // `ramp_down`'s value and derivative: `d/dx [1 − (3t² − 2t³)] = −6 t (1−t) / (clear − under)`
     // on the open band (`under < x < clear`), `0` at/outside both knots (C¹).
     #[inline]
-    fn ramp_down_value_and_deriv(x: f64, under: f64, clear: f64) -> (f64, f64) {
+    pub(crate) fn ramp_down_value_and_deriv(x: f64, under: f64, clear: f64) -> (f64, f64) {
         if x <= under {
             return (1.0, 0.0);
         }
@@ -440,7 +440,7 @@ pub const CHEAP_CONDITIONING_PRECHECK_MIN_DIM: usize = 128;
 /// a false SKIP omits the curvature that prevents non-convergence (unacceptable),
 /// whereas a false FALL-THROUGH merely pays the exact dense path we would have
 /// paid anyway. The margin is therefore set firmly on the safe side.
-const CHEAP_PRECHECK_SAFETY_MARGIN: f64 = 8.0;
+pub(crate) const CHEAP_PRECHECK_SAFETY_MARGIN: f64 = 8.0;
 
 /// Number of Lanczos steps for the cheap conditioning pre-check. A handful of
 /// steps with full reorthogonalization resolves the extreme Ritz pair to far
@@ -450,7 +450,7 @@ const CHEAP_PRECHECK_SAFETY_MARGIN: f64 = 8.0;
 /// pre-check at `O(p·k)` matvecs — negligible against the `O(p³)`/dense-`H_id`
 /// path it guards. Capped at `p` for tiny systems (which the size gate already
 /// routes to the exact path anyway).
-const CHEAP_PRECHECK_LANCZOS_STEPS: usize = 12;
+pub(crate) const CHEAP_PRECHECK_LANCZOS_STEPS: usize = 12;
 
 /// Relative residual below which an extreme Ritz pair counts as "converged" and
 /// its residual-augmented eigenvalue bound may be trusted. Measured against the
@@ -458,7 +458,7 @@ const CHEAP_PRECHECK_LANCZOS_STEPS: usize = 12;
 /// extreme eigenvalue is resolved to three digits, far tighter than the `8×`
 /// safety margin the skip decision then applies. An unresolved residual returns
 /// `None` so the caller falls through to the exact dense path.
-const CHEAP_PRECHECK_RITZ_REL_TOL: f64 = 1e-3;
+pub(crate) const CHEAP_PRECHECK_RITZ_REL_TOL: f64 = 1e-3;
 
 /// Conservative extreme-eigenvalue bounds `(λ_min_lower, λ_max_upper)` for the
 /// reduced information `H_id = Z_Jᵀ H Z_J` on the FULL span (`Z_J = I`, so
@@ -493,7 +493,7 @@ const CHEAP_PRECHECK_RITZ_REL_TOL: f64 = 1e-3;
 /// not small). The latter is the critical safety valve: if the cheap iteration
 /// has not resolved the bottom of the spectrum it NEVER authorises a skip, so a
 /// hidden small eigenvalue cannot be missed — the term is then formed exactly.
-fn cheap_conditioning_bounds<HvFn>(mut hv: HvFn, p: usize) -> Result<Option<(f64, f64)>, String>
+pub(crate) fn cheap_conditioning_bounds<HvFn>(mut hv: HvFn, p: usize) -> Result<Option<(f64, f64)>, String>
 where
     HvFn: FnMut(&Array1<f64>) -> Result<Array1<f64>, String>,
 {
@@ -1287,7 +1287,7 @@ where
 ///     is the same residual the value/gradient pair already carries),
 ///   * `δM_a = −K Ḋ M_a + K (Z_Jᵀ ∂Hdot[e_a] Z_J)`,
 ///   * `δH_Φ_raw[a,b] = ½(⟨δM_a, M_b⟩ + ⟨M_a, δM_b⟩)`.
-fn joint_jeffreys_hphi_perturbation_derivative<BaseFn, PertFn>(
+pub(crate) fn joint_jeffreys_hphi_perturbation_derivative<BaseFn, PertFn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
     mut base_hessian_dir: BaseFn,
@@ -1556,7 +1556,7 @@ mod tests {
     /// gate transition band (exercising the gate derivative) with no floored
     /// eigenvalue, the regime of the gam#854 tension-axis miss.
     #[test]
-    fn explicit_param_derivative_matches_finite_difference() {
+    pub(crate) fn explicit_param_derivative_matches_finite_difference() {
         let p = 4usize;
         let z = Array2::<f64>::eye(p);
         let h0 = array![
@@ -1643,7 +1643,7 @@ mod tests {
     /// BELOW the relative floor (a near-separating direction), exactly where the
     /// floored pseudo-inverse and its moving floor matter.
     #[test]
-    fn perturbation_derivative_matches_finite_difference_below_floor() {
+    pub(crate) fn perturbation_derivative_matches_finite_difference_below_floor() {
         let p = 3usize;
         let z = Array2::<f64>::eye(p);
         // H0: large dominant curvature (λ_max ≈ 5e8 ⇒ relative floor = 1e-10·λ_max
@@ -1725,12 +1725,12 @@ mod tests {
     /// `0` (the term is fully skippable). Non-test code uses `conditioning_gate_weight`
     /// directly so the transition band stays continuous; the cheap matrix-free
     /// pre-check certifies a full skip by clearing the UPPER (`*_CLEAR`) knots.
-    fn conditioning_gate_skips(lambda_min: f64, lambda_max: f64) -> bool {
+    pub(crate) fn conditioning_gate_skips(lambda_min: f64, lambda_max: f64) -> bool {
         conditioning_gate_weight(lambda_min, lambda_max) == 0.0
     }
 
     #[test]
-    fn full_span_is_identity_regardless_of_penalty() {
+    pub(crate) fn full_span_is_identity_regardless_of_penalty() {
         // The principled cure: Z_J is the FULL identifiable span (the entire
         // reduced block), i.e. the identity, irrespective of the penalty's null
         // space. Jeffreys is self-limiting, so this does not bias identified
@@ -1760,14 +1760,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_block_yields_empty_span() {
+    pub(crate) fn empty_block_yields_empty_span() {
         let s = Array2::<f64>::zeros((0, 0));
         let z = jeffreys_subspace_from_penalty(s.view()).unwrap();
         assert_eq!(z.span_dim(), 0);
     }
 
     #[test]
-    fn joint_jeffreys_term_matches_finite_difference_gradient() {
+    pub(crate) fn joint_jeffreys_term_matches_finite_difference_gradient() {
         // A 2x2 quadratic-form Hessian whose log-determinant has a known
         // gradient. The SECOND direction is scaled by `ill` so the reduced
         // information is ILL-conditioned (`λ_min/λ_max ≈ 8.6e-10`, below the
@@ -1840,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_jeffreys_term_value_gradient_consistent_below_floor() {
+    pub(crate) fn joint_jeffreys_term_value_gradient_consistent_below_floor() {
         // Regression for the bernoulli-MS outer-non-convergence stall
         // (gam#787/#785): a separating direction whose reduced-information
         // eigenvalue sits BELOW the floored ridge. The released code computed the
@@ -1908,7 +1908,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_jeffreys_term_indefinite_value_gradient_consistent() {
+    pub(crate) fn joint_jeffreys_term_indefinite_value_gradient_consistent() {
         // Regression for the survival clustered-PC marginal-slope inner-solve
         // crawl (gam#814). The reduced OBSERVED information `H_id = Z_Jᵀ H Z_J` is
         // NOT PSD away from the mode for a non-canonical link, so it carries a
@@ -2013,7 +2013,7 @@ mod tests {
     }
 
     #[test]
-    fn conditioning_gate_skips_well_conditioned_information() {
+    pub(crate) fn conditioning_gate_skips_well_conditioned_information() {
         // A WELL-conditioned reduced information (`λ_min/λ_max = 0.5`, far above
         // the gate) must skip the Jeffreys term entirely: zero value, gradient
         // and curvature, so an easy fit pays no cost. The directional-derivative
@@ -2044,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn conditioning_gate_fires_only_below_threshold() {
+    pub(crate) fn conditioning_gate_fires_only_below_threshold() {
         // Bracket the COMBINED relative+absolute gate. To be SKIPPED a fit must be
         // well-conditioned both relatively (ratio ≥ 1e-8) AND absolutely
         // (λ_min ≥ 1); if EITHER fails the term fires. This pins the "no cost on a
@@ -2096,7 +2096,7 @@ mod tests {
     }
 
     #[test]
-    fn conditioning_gate_predicate_relative_and_absolute() {
+    pub(crate) fn conditioning_gate_predicate_relative_and_absolute() {
         // Unit coverage of the shared predicate's two-sided logic.
         // Well-conditioned (both gates pass) ⇒ skip.
         assert!(conditioning_gate_skips(50.0, 100.0));
@@ -2126,7 +2126,7 @@ mod tests {
     }
 
     #[test]
-    fn conditioning_gate_weight_is_continuous_and_monotone() {
+    pub(crate) fn conditioning_gate_weight_is_continuous_and_monotone() {
         // The whole point of the smooth gate (#787): the weight is C⁰/C¹ across the
         // absolute transition band [1, 16], so the outer LAML objective does not
         // jump as β̂(ρ) carries λ_min across the boundary. Sweep λ_min upward with a
@@ -2157,7 +2157,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_span_yields_zero_term() {
+    pub(crate) fn empty_span_yields_zero_term() {
         let h = Array2::<f64>::eye(3);
         let z = Array2::<f64>::zeros((3, 0));
         let hdir = |_d: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
@@ -2174,7 +2174,7 @@ mod tests {
     /// Build a diagonal-matvec closure for a synthetic spectrum (the joint
     /// information on the full span is `H` itself, so a diagonal `H` exercises the
     /// Lanczos bound against a known `[λ_min, λ_max]`).
-    fn diag_hv(diag: Vec<f64>) -> impl FnMut(&Array1<f64>) -> Result<Array1<f64>, String> {
+    pub(crate) fn diag_hv(diag: Vec<f64>) -> impl FnMut(&Array1<f64>) -> Result<Array1<f64>, String> {
         move |v: &Array1<f64>| {
             let mut out = Array1::<f64>::zeros(v.len());
             for (i, &d) in diag.iter().enumerate() {
@@ -2185,7 +2185,7 @@ mod tests {
     }
 
     #[test]
-    fn cheap_precheck_skips_clearly_well_conditioned_large_p() {
+    pub(crate) fn cheap_precheck_skips_clearly_well_conditioned_large_p() {
         // A wide (p ≥ threshold) well-conditioned spectrum: every eigenvalue in
         // [200, 250], so λ_min = 200 clears the 8x margin on the smooth absolute
         // clear knot (16) and the ratio 0.8 clears the relative margin. The
@@ -2204,7 +2204,7 @@ mod tests {
     }
 
     #[test]
-    fn cheap_precheck_does_not_skip_near_separating() {
+    pub(crate) fn cheap_precheck_does_not_skip_near_separating() {
         // One near-zero eigenvalue (λ_min = 1e-3) below the absolute gate (1.0):
         // the term is genuinely needed here. The conservative bounds must NOT
         // certify skippable, so the caller falls through to the exact formation.
@@ -2219,7 +2219,7 @@ mod tests {
     }
 
     #[test]
-    fn cheap_precheck_does_not_skip_below_size_threshold() {
+    pub(crate) fn cheap_precheck_does_not_skip_below_size_threshold() {
         // Small p: even a perfectly-conditioned spectrum is never pre-checked
         // (the exact dense eigh is already cheap there). Guarantees the small-p
         // BMS-style fits keep running the exact dense path unchanged.
@@ -2233,7 +2233,7 @@ mod tests {
     }
 
     #[test]
-    fn cheap_precheck_does_not_skip_marginal_absolute() {
+    pub(crate) fn cheap_precheck_does_not_skip_marginal_absolute() {
         // Absolutely marginal: λ_min = 2.0 clears the bare absolute gate (1.0) but
         // NOT the 8× safety margin (needs ≥ 8). The conservative pre-check must
         // refuse to skip even though the EXACT gate would skip — the asymmetric
@@ -2249,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn cheap_precheck_skip_implies_exact_gate_skips() {
+    pub(crate) fn cheap_precheck_skip_implies_exact_gate_skips() {
         // CONSISTENCY: wherever the cheap pre-check declares skippable, the EXACT
         // conditioning gate on the same spectrum must also skip (return the zero
         // term). This is the byte-identical-on-skip guarantee. Sweep a range of
@@ -2281,7 +2281,7 @@ mod tests {
     }
 
     #[test]
-    fn cheap_precheck_bails_on_nonfinite_matvec() {
+    pub(crate) fn cheap_precheck_bails_on_nonfinite_matvec() {
         // A matvec that returns non-finite values cannot certify conditioning ⇒
         // the pre-check must return false (never skip on an unresolved estimate).
         let p = 200usize;

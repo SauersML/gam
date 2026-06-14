@@ -179,7 +179,7 @@ pub(super) fn solve_intercept_for_prevalence(
     sas_link_state: Option<&SasLinkState>,
 ) -> Option<f64> {
     #[inline]
-    fn f_eta(
+    pub(crate) fn f_eta(
         link_function: LinkFunction,
         eta: f64,
         prevalence: f64,
@@ -391,14 +391,14 @@ pub(super) fn detect_logit_instability(
     // `EXTREME_BETA_NORM`: coefficient norm blow-up characteristic of the MLE
     //   escaping to infinity under separation.
     // `WEIGHT_COLLAPSE_FRACTION`: share of working weights collapsed to ~0.
-    const ORDER_SEPARATION_ETA_GAP: f64 = 1e-3;
-    const EXTREME_ETA: f64 = 30.0;
-    const SATURATION_FRACTION: f64 = 0.98;
-    const SEVERE_SATURATION_FRACTION: f64 = 0.995;
-    const DEGENERATE_DEVIANCE_PER_SAMPLE: f64 = 1e-3;
-    const EXTREME_DEGENERATE_DEVIANCE_PER_SAMPLE: f64 = 1e-6;
-    const EXTREME_BETA_NORM: f64 = 1e4;
-    const WEIGHT_COLLAPSE_FRACTION: f64 = 0.98;
+    pub(crate) const ORDER_SEPARATION_ETA_GAP: f64 = 1e-3;
+    pub(crate) const EXTREME_ETA: f64 = 30.0;
+    pub(crate) const SATURATION_FRACTION: f64 = 0.98;
+    pub(crate) const SEVERE_SATURATION_FRACTION: f64 = 0.995;
+    pub(crate) const DEGENERATE_DEVIANCE_PER_SAMPLE: f64 = 1e-3;
+    pub(crate) const EXTREME_DEGENERATE_DEVIANCE_PER_SAMPLE: f64 = 1e-6;
+    pub(crate) const EXTREME_BETA_NORM: f64 = 1e4;
+    pub(crate) const WEIGHT_COLLAPSE_FRACTION: f64 = 0.98;
 
     let n = y.len() as f64;
     if n == 0.0 {
@@ -407,7 +407,7 @@ pub(super) fn detect_logit_instability(
 
     let max_abs_eta = summary.max_abs_eta;
     let sat_fraction = {
-        const SAT_EPS: f64 = 1e-3;
+        pub(crate) const SAT_EPS: f64 = 1e-3;
         finalmu
             .iter()
             .filter(|&&m| m <= SAT_EPS || m >= 1.0 - SAT_EPS)
@@ -416,7 +416,7 @@ pub(super) fn detect_logit_instability(
     };
 
     let weight_collapse_fraction = {
-        const WEIGHT_EPS: f64 = 1e-8;
+        pub(crate) const WEIGHT_EPS: f64 = 1e-8;
         finalweights
             .iter()
             .filter(|&&w| w <= WEIGHT_EPS || !w.is_finite())
@@ -540,7 +540,7 @@ pub(super) fn build_diagonal_penalty_from_kronecker(
     let mut diag = Array1::<f64>::zeros(p);
     let mut positive_indices = Vec::new();
 
-    const KRONECKER_STRUCTURAL_ZERO_TOL: f64 = 1e-12;
+    pub(crate) const KRONECKER_STRUCTURAL_ZERO_TOL: f64 = 1e-12;
     let mut multi_idx = vec![0usize; d];
     let mut flat = 0usize;
     loop {
@@ -1476,10 +1476,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // A few passes suffice: the converged-η shape map is a strong
         // contraction (β̂ barely moves once the mean is captured), so cold
         // starts settle in 1–2 re-solves and warm starts in zero.
-        const MAX_SHAPE_REFRESH: usize = 5;
+        pub(crate) const MAX_SHAPE_REFRESH: usize = 5;
         // Relative shape tolerance below which a re-solve cannot move any
         // reported quantity meaningfully (far under statistical resolution).
-        const SHAPE_REFRESH_REL_TOL: f64 = 1e-4;
+        pub(crate) const SHAPE_REFRESH_REL_TOL: f64 = 1e-4;
         for refresh_iter in 0..MAX_SHAPE_REFRESH {
             let refreshed_shape = super::estimate_gamma_shape_from_eta(
                 y,
@@ -1558,10 +1558,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             // The converged-η Pearson map is a strong contraction (β̂ scale-free
             // here), so cold starts settle in 1–2 re-solves and warm starts in
             // zero.
-            const MAX_PHI_REFRESH: usize = 5;
+            pub(crate) const MAX_PHI_REFRESH: usize = 5;
             // Relative φ tolerance below which a re-solve cannot move any reported
             // quantity meaningfully (far under statistical resolution).
-            const PHI_REFRESH_REL_TOL: f64 = 1e-4;
+            pub(crate) const PHI_REFRESH_REL_TOL: f64 = 1e-4;
             for refresh_iter in 0..MAX_PHI_REFRESH {
                 let refreshed_phi = super::estimate_tweedie_phi_from_eta(
                     y,
@@ -1646,10 +1646,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // The mean moves between passes (φ feeds back through the digamma
         // score), so allow a few more passes than the scale-free Gamma case;
         // the contraction is fast and warm-started re-solves are cheap.
-        const MAX_PHI_REFRESH: usize = 30;
+        pub(crate) const MAX_PHI_REFRESH: usize = 30;
         // Relative φ tolerance below which a re-solve cannot move β̂ — and hence
         // any reported quantity — by a statistically meaningful amount.
-        const PHI_REFRESH_REL_TOL: f64 = 1e-4;
+        pub(crate) const PHI_REFRESH_REL_TOL: f64 = 1e-4;
         for refresh_iter in 0..MAX_PHI_REFRESH {
             let refreshed_phi = super::estimate_beta_phi_from_eta(
                 y,
@@ -1728,10 +1728,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // θ feeds back through the working response, so allow a few more passes
         // than the scale-free Gamma case; the alternation is a strong contraction
         // and warm-started re-solves are cheap.
-        const MAX_THETA_REFRESH: usize = 30;
+        pub(crate) const MAX_THETA_REFRESH: usize = 30;
         // Relative θ tolerance below which a re-solve cannot move β̂ — and hence
         // any reported quantity — by a statistically meaningful amount.
-        const THETA_REFRESH_REL_TOL: f64 = 1e-4;
+        pub(crate) const THETA_REFRESH_REL_TOL: f64 = 1e-4;
         for refresh_iter in 0..MAX_THETA_REFRESH {
             let refreshed_theta = super::estimate_negbin_theta_from_eta(
                 y,
@@ -2097,10 +2097,10 @@ pub(super) fn merge_linear_constraints(
 pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
     // Below this column count a dense factorization beats the sparse path even
     // at high sparsity, so skip the sparsity scan entirely for narrow designs.
-    const DENSE_PREFERRED_MAX_COLS: usize = 32;
+    pub(crate) const DENSE_PREFERRED_MAX_COLS: usize = 32;
     // Sparse storage + sparse Cholesky only pays off below this density (nnz as
     // a fraction of all entries); denser matrices stay dense.
-    const SPARSE_DENSITY_LIMIT: f64 = 0.20;
+    pub(crate) const SPARSE_DENSITY_LIMIT: f64 = 0.20;
 
     let nrows = x.nrows();
     let ncols = x.ncols();
@@ -2112,7 +2112,7 @@ pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> 
         return None;
     }
 
-    const ZERO_EPS: f64 = 1e-12;
+    pub(crate) const ZERO_EPS: f64 = 1e-12;
     let total = nrows.saturating_mul(ncols);
     if total == 0 {
         return None;

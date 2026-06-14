@@ -187,7 +187,7 @@ impl KroneckerQsTransform {
         self.apply_internal(vector, true)
     }
 
-    fn apply_internal(&self, vector: &Array1<f64>, transpose: bool) -> Array1<f64> {
+    pub(crate) fn apply_internal(&self, vector: &Array1<f64>, transpose: bool) -> Array1<f64> {
         assert_eq!(vector.len(), self.p);
         // Ping-pong two thread-local scratch buffers across axes so we
         // allocate at most twice per thread for the whole solver lifetime
@@ -235,7 +235,7 @@ impl KroneckerQsTransform {
         symmetrize_dense_matrix(&out)
     }
 
-    fn column(&self, j: usize) -> Array1<f64> {
+    pub(crate) fn column(&self, j: usize) -> Array1<f64> {
         let mut e = Array1::<f64>::zeros(self.p);
         e[j] = 1.0;
         self.apply(&e)
@@ -306,7 +306,7 @@ pub(super) mod kron_apply_scratch {
     use std::cell::RefCell;
 
     thread_local! {
-        static SCRATCH: RefCell<Pair> = const { RefCell::new(Pair::new()) };
+        pub(crate) static SCRATCH: RefCell<Pair> = const { RefCell::new(Pair::new()) };
     }
 
     pub(super) struct Pair {

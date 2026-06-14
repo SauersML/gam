@@ -69,15 +69,15 @@ pub trait SaeKroneckerRow {
 #[derive(Debug, Clone)]
 pub struct SaeKroneckerRows {
     /// Decoder output dimension `p`.
-    p: usize,
+    pub(crate) p: usize,
     /// Per-row sparse support: `a_phi[i]` is a `Vec<(beta_base_idx, weight)>`.
-    a_phi: Vec<Vec<(usize, f64)>>,
+    pub(crate) a_phi: Vec<Vec<(usize, f64)>>,
     /// Per-row local Jacobian `L_i`, shape `(q_i × p)` flattened row-major.
     ///
     /// Element `(c, j)` is at `local_jac[i][c * p + j]`.
     /// For heterogeneous (active-set) systems, each row may have a different
     /// `q_i = local_jac[i].len() / p`.
-    local_jac: Vec<Vec<f64>>,
+    pub(crate) local_jac: Vec<Vec<f64>>,
 }
 
 

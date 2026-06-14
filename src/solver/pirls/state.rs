@@ -131,7 +131,7 @@ impl WorkingState {
     /// tight at large n. Multiplying τ by this scale restores the advertised
     /// per-observation meaning.
     #[inline]
-    fn kkt_dimension_scale(&self) -> f64 {
+    pub(crate) fn kkt_dimension_scale(&self) -> f64 {
         let n = self.eta.len().max(1) as f64;
         let p = (self.gradient.len() as f64).max(1.0);
         n.sqrt() * p.sqrt()

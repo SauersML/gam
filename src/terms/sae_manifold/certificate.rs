@@ -337,7 +337,7 @@ pub fn dictionary_incoherence_report_with_dispersion(
 }
 
 
-fn dictionary_frame_incoherence(term: &SaeManifoldTerm) -> Result<f64, String> {
+pub(crate) fn dictionary_frame_incoherence(term: &SaeManifoldTerm) -> Result<f64, String> {
     let frames = (0..term.k_atoms())
         .map(|atom_idx| certificate_output_frame(term, atom_idx))
         .collect::<Result<Vec<_>, _>>()?;
@@ -359,7 +359,7 @@ fn dictionary_frame_incoherence(term: &SaeManifoldTerm) -> Result<f64, String> {
 }
 
 
-fn certificate_output_frame(
+pub(crate) fn certificate_output_frame(
     term: &SaeManifoldTerm,
     atom_idx: usize,
 ) -> Result<Array2<f64>, String> {
@@ -392,7 +392,7 @@ fn certificate_output_frame(
 }
 
 
-fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> Result<f64, String> {
+pub(crate) fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> Result<f64, String> {
     let atom = &term.atoms[atom_idx];
     let coords = term.assignment.coords[atom_idx].as_matrix();
     let second = atom
@@ -419,7 +419,7 @@ fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> Result<f64, 
 /// formed by finite-differencing it in the captured channel's coefficients
 /// without mutating the term. With `decoder = atom.decoder_coefficients` this is
 /// exactly `atom_curvature_bound`.
-fn atom_curvature_bound_with_decoder(
+pub(crate) fn atom_curvature_bound_with_decoder(
     atom: &SaeManifoldAtom,
     atom_idx: usize,
     second: ArrayView4<'_, f64>,
@@ -485,7 +485,7 @@ fn atom_curvature_bound_with_decoder(
     Ok(max_kappa)
 }
 
-fn tangent_frame_rank(tangent: ArrayView2<'_, f64>) -> Result<(f64, Array2<f64>), String> {
+pub(crate) fn tangent_frame_rank(tangent: ArrayView2<'_, f64>) -> Result<(f64, Array2<f64>), String> {
     let p = tangent.nrows();
     let d = tangent.ncols();
     if p == 0 || d == 0 {
@@ -518,7 +518,7 @@ fn tangent_frame_rank(tangent: ArrayView2<'_, f64>) -> Result<(f64, Array2<f64>)
 }
 
 
-fn projected_perp_norm(vector: &[f64], tangent_frame: ArrayView2<'_, f64>) -> f64 {
+pub(crate) fn projected_perp_norm(vector: &[f64], tangent_frame: ArrayView2<'_, f64>) -> f64 {
     let mut residual = vector.to_vec();
     for axis in 0..tangent_frame.ncols() {
         let mut coeff = 0.0_f64;

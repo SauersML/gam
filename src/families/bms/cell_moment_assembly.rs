@@ -1151,7 +1151,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
-    fn existing_bundle_for_degree<'a>(
+    pub(crate) fn existing_bundle_for_degree<'a>(
         &self,
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         required_degree: usize,
@@ -1174,7 +1174,7 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn row_cell_moments_for_third_degree15<'a>(
+    pub(crate) fn row_cell_moments_for_third_degree15<'a>(
         &self,
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,

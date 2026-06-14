@@ -316,7 +316,7 @@ pub(super) fn solve_penalized_least_squares_implicit(
         // The penalized Hessian is assembled from symmetric pieces (XᵀWX and
         // the penalty), so any asymmetry is pure floating-point accumulation
         // error; anything above this floor signals a genuine assembly bug.
-        const PENALIZED_HESSIAN_ASYMMETRY_TOL: f64 = 1e-8;
+        pub(crate) const PENALIZED_HESSIAN_ASYMMETRY_TOL: f64 = 1e-8;
         let xtwx_asym = max_symmetric_asymmetry(&xtwx_transformed);
         let penalty_asym = match penalty {
             PirlsPenalty::Dense { s_transformed, .. } => max_symmetric_asymmetry(s_transformed),

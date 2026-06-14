@@ -53,26 +53,26 @@ pub(crate) fn reconstruction_explained_variance(
 /// is a cost-only objective and the engine routes it to a derivative-free /
 /// finite-difference outer strategy per the planner.
 pub struct SaeManifoldOuterObjective {
-    term: SaeManifoldTerm,
+    pub(crate) term: SaeManifoldTerm,
     /// Pristine term to restore from on `reset` (multi-start baseline).
-    baseline_term: SaeManifoldTerm,
-    target: Array2<f64>,
-    registry: Option<AnalyticPenaltyRegistry>,
+    pub(crate) baseline_term: SaeManifoldTerm,
+    pub(crate) target: Array2<f64>,
+    pub(crate) registry: Option<AnalyticPenaltyRegistry>,
     /// ρ template carrying the per-atom ARD dims; `from_flat` reads its
     /// layout. Updated to each evaluated ρ so `into_fitted` can report the
     /// last ρ the engine settled on.
-    current_rho: SaeManifoldRho,
+    pub(crate) current_rho: SaeManifoldRho,
     /// Pristine ρ to restore from on `reset`.
-    baseline_rho: SaeManifoldRho,
-    inner_max_iter: usize,
-    learning_rate: f64,
-    ridge_ext_coord: f64,
-    ridge_beta: f64,
+    pub(crate) baseline_rho: SaeManifoldRho,
+    pub(crate) inner_max_iter: usize,
+    pub(crate) learning_rate: f64,
+    pub(crate) ridge_ext_coord: f64,
+    pub(crate) ridge_beta: f64,
     /// Last inner loss breakdown observed (for `into_fitted`).
-    last_loss: Option<SaeManifoldLoss>,
+    pub(crate) last_loss: Option<SaeManifoldLoss>,
     /// Optional warm-start β slot. When the cache / continuation walk seeds a
     /// β, the next inner solve opens from it instead of cold.
-    seeded_beta: Option<Array1<f64>>,
+    pub(crate) seeded_beta: Option<Array1<f64>>,
 }
 
 impl SaeManifoldOuterObjective {
@@ -657,7 +657,7 @@ impl SaeManifoldOuterObjective {
     /// the joint fit at the entry ρ, returning the converged loss and the
     /// undamped evidence cache (for the predictor IFT solve + the pivot
     /// invariant). The dial is read on the next basis refresh inside the solve.
-    fn solve_at_eta(
+    pub(crate) fn solve_at_eta(
         &mut self,
         rho: &SaeManifoldRho,
         eta: f64,
@@ -678,7 +678,7 @@ impl SaeManifoldOuterObjective {
         Ok((loss, cache))
     }
 
-    fn set_isometry_homotopy_weight(&mut self, eta: f64, targets: &[f64]) {
+    pub(crate) fn set_isometry_homotopy_weight(&mut self, eta: f64, targets: &[f64]) {
         if targets.is_empty() {
             return;
         }
@@ -689,7 +689,7 @@ impl SaeManifoldOuterObjective {
         }
     }
 
-    fn add_fit_data_collapse_penalty(
+    pub(crate) fn add_fit_data_collapse_penalty(
         &mut self,
         cost: f64,
         rho: &SaeManifoldRho,
@@ -709,7 +709,7 @@ impl SaeManifoldOuterObjective {
         }
     }
 
-    fn is_recoverable_value_probe_refusal(err: &str) -> bool {
+    pub(crate) fn is_recoverable_value_probe_refusal(err: &str) -> bool {
         err.contains("inner solve did not converge at fixed ρ")
             || err.contains(
                 "undamped evidence factorization hit a non-PD per-row H_tt block before KKT",
@@ -726,7 +726,7 @@ impl SaeManifoldOuterObjective {
     /// stationarity measure, so probe values and accepted-point values are
     /// always comparable; only an expensive grind-then-refuse becomes a cheap
     /// refusal (a recoverable line-search reject).
-    fn evaluate_with_refine_policy(
+    pub(crate) fn evaluate_with_refine_policy(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
         refine_progress_extension: bool,
@@ -774,7 +774,7 @@ impl SaeManifoldOuterObjective {
     ///   gated L1, IBP) are non-quadratic, so no Gaussian-logdet FS fixed
     ///   point exists; it stays cost-driven (the cascade still moves it via
     ///   the cost path when EFS is not the active lane for that coord).
-    fn efs_step(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<EfsEval, String> {
+    pub(crate) fn efs_step(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<EfsEval, String> {
         let rho = self.baseline_rho.from_flat(rho_flat);
         if let Some(beta) = self.seeded_beta.take()
             && beta.len() == self.term.beta_dim()

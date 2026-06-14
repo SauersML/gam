@@ -374,7 +374,7 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
 /// `compute_row_analytic_flex_from_parts_into` in
 /// `src/families/bernoulli_marginal_slope.rs`.
 #[cfg(target_os = "linux")]
-const ROW_KERNEL_BODY: &str = r#"
+pub(crate) const ROW_KERNEL_BODY: &str = r#"
 // One block per row. blockDim.x = 32; threadIdx.x parallises per-cell sums.
 // CPU parity reference: src/families/bernoulli_marginal_slope.rs
 //                      ::compute_row_analytic_flex_from_parts_into.
@@ -422,31 +422,31 @@ extern "C" __global__ void bms_flex_row_kernel(
                                              // host has already baked S_f
                                              // into the cubic coefficients.
                                              // Kept for diagnostic parity.
-    const double * __restrict__ row_q,
-    const double * __restrict__ row_b,
-    const double * __restrict__ row_mu1,
-    const double * __restrict__ row_mu2,
-    const double * __restrict__ row_zobs,
-    const double * __restrict__ row_y,
-    const double * __restrict__ row_w,
-    const unsigned int * __restrict__ cell_offsets,
-    const double * __restrict__ cell_c0,
-    const double * __restrict__ cell_c1,
-    const double * __restrict__ cell_c2,
-    const double * __restrict__ cell_c3,
-    const double * __restrict__ cell_a,       // [n_cells, 4]
-    const double * __restrict__ cell_aa,      // [n_cells, 4]
-    const double * __restrict__ cell_r,       // [n_cells, r-1, 4]
-    const double * __restrict__ cell_ar,      // [n_cells, r-1, 4]
-    const double * __restrict__ cell_sbb,     // [n_cells, 4]
-    const double * __restrict__ cell_sbh,     // [n_cells, p_h, 4]
-    const double * __restrict__ cell_sbw,     // [n_cells, p_w, 4]
-    const double * __restrict__ cell_moments, // [n_cells, 10]
-    const double * __restrict__ row_chi,
-    const double * __restrict__ row_xi,
-    const double * __restrict__ row_rho,      // [n_rows, r]
-    const double * __restrict__ row_tau,      // [n_rows, r]
-    const double * __restrict__ row_ruv,      // [n_rows, r*r]
+    pub(crate) const double * __restrict__ row_q,
+    pub(crate) const double * __restrict__ row_b,
+    pub(crate) const double * __restrict__ row_mu1,
+    pub(crate) const double * __restrict__ row_mu2,
+    pub(crate) const double * __restrict__ row_zobs,
+    pub(crate) const double * __restrict__ row_y,
+    pub(crate) const double * __restrict__ row_w,
+    pub(crate) const unsigned int * __restrict__ cell_offsets,
+    pub(crate) const double * __restrict__ cell_c0,
+    pub(crate) const double * __restrict__ cell_c1,
+    pub(crate) const double * __restrict__ cell_c2,
+    pub(crate) const double * __restrict__ cell_c3,
+    pub(crate) const double * __restrict__ cell_a,       // [n_cells, 4]
+    pub(crate) const double * __restrict__ cell_aa,      // [n_cells, 4]
+    pub(crate) const double * __restrict__ cell_r,       // [n_cells, r-1, 4]
+    pub(crate) const double * __restrict__ cell_ar,      // [n_cells, r-1, 4]
+    pub(crate) const double * __restrict__ cell_sbb,     // [n_cells, 4]
+    pub(crate) const double * __restrict__ cell_sbh,     // [n_cells, p_h, 4]
+    pub(crate) const double * __restrict__ cell_sbw,     // [n_cells, p_w, 4]
+    pub(crate) const double * __restrict__ cell_moments, // [n_cells, 10]
+    pub(crate) const double * __restrict__ row_chi,
+    pub(crate) const double * __restrict__ row_xi,
+    pub(crate) const double * __restrict__ row_rho,      // [n_rows, r]
+    pub(crate) const double * __restrict__ row_tau,      // [n_rows, r]
+    pub(crate) const double * __restrict__ row_ruv,      // [n_rows, r*r]
     double       * __restrict__ out_neglog,
     double       * __restrict__ out_grad,
     double       * __restrict__ out_hess)
@@ -503,7 +503,7 @@ extern "C" __global__ void bms_flex_row_kernel(
         C[2] = cell_c2[c]; C[3] = cell_c3[c];
 
         // Load m_0..m_9.
-        const double *m = cell_moments + (size_t)c * 10;
+        pub(crate) const double *m = cell_moments + (size_t)c * 10;
 
         // T_n = κ · Σ_e C_e · m_{e+n}, n = 0..6.
         // CPU parity: equivalent to the `eta_rs ⊗ moments` contraction in
@@ -536,16 +536,16 @@ extern "C" __global__ void bms_flex_row_kernel(
              + (R[3]*S[3])*T[6])
 
         // F_a += D(A_c) ; F_aa += H(A_c, A_c, AA_c) = D(AA_c) − Q(A_c, A_c).
-        const double *A_c  = cell_a  + (size_t)c * 4;
-        const double *AA_c = cell_aa + (size_t)c * 4;
+        pub(crate) const double *A_c  = cell_a  + (size_t)c * 4;
+        pub(crate) const double *AA_c = cell_aa + (size_t)c * 4;
         local_Fa  += D_OF(A_c);
         local_Faa += D_OF(AA_c) - Q_OF(A_c, A_c);
 
         // For each u > 0: F_u += D(R_{c,u}) ; F_au += H(A_c, R_{c,u}, AR_{c,u})
         //                                   = D(AR_{c,u}) − Q(A_c, R_{c,u}).
         for (int u = 1; u < r; ++u) {
-            const double *R_u = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
-            const double *AR_u = cell_ar + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
+            pub(crate) const double *R_u = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
+            pub(crate) const double *AR_u = cell_ar + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
             double d_R   = D_OF(R_u);
             double d_AR  = D_OF(AR_u);
             double q_AR  = Q_OF(A_c, R_u);
@@ -558,26 +558,26 @@ extern "C" __global__ void bms_flex_row_kernel(
         // CPU parity: `SparsePrimaryCoeffJetView::pair_from_b_family` with
         // `COEFF_SUPPORT_BHW` — every cross pair outside the b-row is zero.
         for (int u = 1; u < r; ++u) {
-            const double *R_u = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
+            pub(crate) const double *R_u = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
             for (int v = u; v < r; ++v) {
-                const double *R_v = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(v - 1)) * 4;
+                pub(crate) const double *R_v = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(v - 1)) * 4;
                 double q_uv = Q_OF(R_u, R_v);
                 double d_s  = 0.0;
                 // S_{bb}: u == v == 1 (b coordinate).
                 if (u == 1 && v == 1) {
-                    const double *S_bb = cell_sbb + (size_t)c * 4;
+                    pub(crate) const double *S_bb = cell_sbb + (size_t)c * 4;
                     d_s = D_OF(S_bb);
                 }
                 // S_{b·h_j}: u == 1, v in score-warp block, or symmetric.
                 else if (u == 1 && v >= 2 && v < 2 + p_h) {
                     int j = v - 2;
-                    const double *S_bh = cell_sbh + ((size_t)c * (size_t)p_h + (size_t)j) * 4;
+                    pub(crate) const double *S_bh = cell_sbh + ((size_t)c * (size_t)p_h + (size_t)j) * 4;
                     d_s = D_OF(S_bh);
                 }
                 // S_{b·w_ℓ}: u == 1, v in link-wiggle block, or symmetric.
                 else if (u == 1 && v >= 2 + p_h && v < r) {
                     int l = v - (2 + p_h);
-                    const double *S_bw = cell_sbw + ((size_t)c * (size_t)p_w + (size_t)l) * 4;
+                    pub(crate) const double *S_bw = cell_sbw + ((size_t)c * (size_t)p_w + (size_t)l) * 4;
                     d_s = D_OF(S_bw);
                 }
                 // Symmetric mirror: u in (h or w) block, v == 1 cannot happen
@@ -666,9 +666,9 @@ extern "C" __global__ void bms_flex_row_kernel(
     //   bar_e_uv = chi · a_uv + xi · a_u · a_v + tau_u · a_v + a_u · tau_v + r_uv.
     double chi = row_chi[row];
     double xi  = row_xi[row];
-    const double *rho = row_rho + (size_t)row * r;
-    const double *tau = row_tau + (size_t)row * r;
-    const double *ruv = row_ruv + (size_t)row * r * r;
+    pub(crate) const double *rho = row_rho + (size_t)row * r;
+    pub(crate) const double *tau = row_tau + (size_t)row * r;
+    pub(crate) const double *ruv = row_ruv + (size_t)row * r * r;
 
     for (int u = 0; u < r; ++u) {
         bar_e_u[u] = chi * a_u[u] + rho[u];
@@ -735,15 +735,15 @@ pub(crate) fn s_f_diagnostic_finite(inputs: &BmsFlexRowKernelInputs<'_>) -> bool
 }
 
 #[cfg(target_os = "linux")]
-struct RowKernelBackend {
-    stream: Arc<CudaStream>,
-    module: Arc<CudaModule>,
+pub(crate) struct RowKernelBackend {
+    pub(crate) stream: Arc<CudaStream>,
+    pub(crate) module: Arc<CudaModule>,
 }
 
 #[cfg(target_os = "linux")]
 impl RowKernelBackend {
-    fn probe() -> Result<&'static Self, GpuError> {
-        static BACKEND: OnceLock<Result<RowKernelBackend, GpuError>> = OnceLock::new();
+    pub(crate) fn probe() -> Result<&'static Self, GpuError> {
+        pub(crate) static BACKEND: OnceLock<Result<RowKernelBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
                 crate::gpu::backend_probe::probe_backend_with_compile("bms_flex_row", |parts| {
@@ -805,7 +805,7 @@ pub(crate) fn launch_bms_flex_row_kernel(
 }
 
 #[cfg(target_os = "linux")]
-fn launch_linux(inputs: BmsFlexRowKernelInputs<'_>) -> Result<BmsFlexRowKernelOutputs, GpuError> {
+pub(crate) fn launch_linux(inputs: BmsFlexRowKernelInputs<'_>) -> Result<BmsFlexRowKernelOutputs, GpuError> {
     let backend = RowKernelBackend::probe()?;
     let stream = &backend.stream;
 
@@ -1064,7 +1064,7 @@ pub(crate) const HVP_THREADS: u32 = 128;
 /// multiple that keeps the reduce launch occupancy-bound rather than tail-bound
 /// for the typical large-scale `p_total`.
 #[cfg(target_os = "linux")]
-const REDUCTION_THREADS: u32 = 256;
+pub(crate) const REDUCTION_THREADS: u32 = 256;
 
 /// Maximum RHS columns fused into one row-primary HVP launch. The matching
 /// CUDA source uses fixed shared arrays sized as
@@ -1124,14 +1124,14 @@ impl std::fmt::Debug for DeviceResidentRowHess {
 /// Sized-to-fit-once CTA mapping. Rows `[c * HVP_ROWS_PER_CTA, (c+1) * HVP_ROWS_PER_CTA)`
 /// belong to chunk `c`.
 #[cfg(target_os = "linux")]
-fn num_hvp_chunks(n: usize) -> usize {
+pub(crate) fn num_hvp_chunks(n: usize) -> usize {
     n.div_ceil(HVP_ROWS_PER_CTA as usize)
 }
 
 /// NVRTC source: HVP-partial kernel + HVP-reduce kernel + diag-partial +
 /// diag-reduce. All kernels mirror the CPU oracle in this file.
 #[cfg(target_os = "linux")]
-const HVP_KERNEL_SOURCE: &str = r#"
+pub(crate) const HVP_KERNEL_SOURCE: &str = r#"
 // CPU parity reference: cpu_oracle_bms_flex_row_hvp / cpu_oracle_bms_flex_row_diagonal
 // in this module.
 
@@ -1150,10 +1150,10 @@ extern "C" __global__ void bms_flex_row_hvp_partial(
     int                  h_primary_start,
     int                  w_primary_start,
     int                  rows_per_cta,
-    const double * __restrict__ row_hessians,    // [n, r*r]
-    const double * __restrict__ marginal_design, // [n, p_m] row-major
-    const double * __restrict__ logslope_design, // [n, p_g] row-major
-    const double * __restrict__ v,               // [p_total]
+    pub(crate) const double * __restrict__ row_hessians,    // [n, r*r]
+    pub(crate) const double * __restrict__ marginal_design, // [n, p_m] row-major
+    pub(crate) const double * __restrict__ logslope_design, // [n, p_g] row-major
+    pub(crate) const double * __restrict__ v,               // [p_total]
     double       * __restrict__ partial)         // [num_chunks, p_total]
 {
     int chunk = blockIdx.x;
@@ -1182,9 +1182,9 @@ extern "C" __global__ void bms_flex_row_hvp_partial(
     __shared__ double dot_reduce[128];
 
     for (int row = row_lo; row < row_hi; ++row) {
-        const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
-        const double *grow = logslope_design + (size_t)row * (size_t)p_g;
-        const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
+        pub(crate) const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
+        pub(crate) const double *grow = logslope_design + (size_t)row * (size_t)p_g;
+        pub(crate) const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
 
         // row_dir[0] = mrow · v[0..p_m]
         double local = 0.0;
@@ -1258,7 +1258,7 @@ extern "C" __global__ void bms_flex_row_hvp_partial(
 extern "C" __global__ void bms_flex_row_hvp_reduce(
     int                  num_chunks,
     int                  p_total,
-    const double * __restrict__ partial,   // [num_chunks, p_total]
+    pub(crate) const double * __restrict__ partial,   // [num_chunks, p_total]
     double       * __restrict__ out)        // [p_total]
 {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1284,10 +1284,10 @@ extern "C" __global__ void bms_flex_row_hvp_multi_partial(
     int                  w_primary_start,
     int                  rows_per_cta,
     int                  rhs_count,
-    const double * __restrict__ row_hessians,    // [n, r*r]
-    const double * __restrict__ marginal_design, // [n, p_m]
-    const double * __restrict__ logslope_design, // [n, p_g]
-    const double * __restrict__ v_rhs,           // [rhs_count, p_total]
+    pub(crate) const double * __restrict__ row_hessians,    // [n, r*r]
+    pub(crate) const double * __restrict__ marginal_design, // [n, p_m]
+    pub(crate) const double * __restrict__ logslope_design, // [n, p_g]
+    pub(crate) const double * __restrict__ v_rhs,           // [rhs_count, p_total]
     double       * __restrict__ partial)         // [rhs_count, num_chunks, p_total]
 {
     int chunk = blockIdx.x;
@@ -1309,12 +1309,12 @@ extern "C" __global__ void bms_flex_row_hvp_multi_partial(
     __shared__ double dot_reduce[128];
 
     for (int row = row_lo; row < row_hi; ++row) {
-        const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
-        const double *grow = logslope_design + (size_t)row * (size_t)p_g;
-        const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
+        pub(crate) const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
+        pub(crate) const double *grow = logslope_design + (size_t)row * (size_t)p_g;
+        pub(crate) const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
 
         for (int rhs = 0; rhs < rhs_count; ++rhs) {
-            const double *v = v_rhs + (size_t)rhs * (size_t)p_total;
+            pub(crate) const double *v = v_rhs + (size_t)rhs * (size_t)p_total;
 
             double local = 0.0;
             for (int j = tid; j < p_m; j += blockDim.x) {
@@ -1354,7 +1354,7 @@ extern "C" __global__ void bms_flex_row_hvp_multi_partial(
             int rhs = idx / r;
             int u = idx - rhs * r;
             double acc = 0.0;
-            const double *dir = row_dir + rhs * 32;
+            pub(crate) const double *dir = row_dir + rhs * 32;
             for (int vv = 0; vv < r; ++vv) {
                 acc += Hrow[u * r + vv] * dir[vv];
             }
@@ -1389,7 +1389,7 @@ extern "C" __global__ void bms_flex_row_hvp_multi_reduce(
     int                  num_chunks,
     int                  p_total,
     int                  rhs_count,
-    const double * __restrict__ partial,   // [rhs_count, num_chunks, p_total]
+    pub(crate) const double * __restrict__ partial,   // [rhs_count, num_chunks, p_total]
     double       * __restrict__ out)        // [rhs_count, p_total]
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1417,9 +1417,9 @@ extern "C" __global__ void bms_flex_row_diag_partial(
     int                  h_primary_start,
     int                  w_primary_start,
     int                  rows_per_cta,
-    const double * __restrict__ row_hessians,
-    const double * __restrict__ marginal_design,
-    const double * __restrict__ logslope_design,
+    pub(crate) const double * __restrict__ row_hessians,
+    pub(crate) const double * __restrict__ marginal_design,
+    pub(crate) const double * __restrict__ logslope_design,
     double       * __restrict__ partial)
 {
     int chunk = blockIdx.x;
@@ -1435,9 +1435,9 @@ extern "C" __global__ void bms_flex_row_diag_partial(
     __syncthreads();
 
     for (int row = row_lo; row < row_hi; ++row) {
-        const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
-        const double *grow = logslope_design + (size_t)row * (size_t)p_g;
-        const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
+        pub(crate) const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
+        pub(crate) const double *grow = logslope_design + (size_t)row * (size_t)p_g;
+        pub(crate) const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
         double h00 = Hrow[0];
         double h11 = Hrow[1 * r + 1];
         for (int j = tid; j < p_m; j += blockDim.x) {
@@ -1484,14 +1484,14 @@ __device__ __forceinline__ int bms_flex_packed_idx(int u, int v, int r) {
 extern "C" __global__ void bms_flex_row_pack_upper(
     int                  n_rows,
     int                  r,
-    const double * __restrict__ src_full,    // [n, r*r]
+    pub(crate) const double * __restrict__ src_full,    // [n, r*r]
     double       * __restrict__ dst_packed)  // [n, r*(r+1)/2]
 {
     int row = blockIdx.x;
     if (row >= n_rows) return;
     int tid = threadIdx.x;
     int per_row = r * (r + 1) / 2;
-    const double *src = src_full + (size_t)row * (size_t)r * (size_t)r;
+    pub(crate) const double *src = src_full + (size_t)row * (size_t)r * (size_t)r;
     double       *dst = dst_packed + (size_t)row * (size_t)per_row;
     // Linear scan over packed positions; map each back to (u, v).
     for (int pos = tid; pos < per_row; pos += blockDim.x) {
@@ -1525,10 +1525,10 @@ extern "C" __global__ void bms_flex_row_hvp_partial_packed(
     int                  h_primary_start,
     int                  w_primary_start,
     int                  rows_per_cta,
-    const double * __restrict__ row_hessians_packed, // [n, r*(r+1)/2]
-    const double * __restrict__ marginal_design,
-    const double * __restrict__ logslope_design,
-    const double * __restrict__ v,
+    pub(crate) const double * __restrict__ row_hessians_packed, // [n, r*(r+1)/2]
+    pub(crate) const double * __restrict__ marginal_design,
+    pub(crate) const double * __restrict__ logslope_design,
+    pub(crate) const double * __restrict__ v,
     double       * __restrict__ partial)
 {
     int chunk = blockIdx.x;
@@ -1549,9 +1549,9 @@ extern "C" __global__ void bms_flex_row_hvp_partial_packed(
     __shared__ double dot_reduce[128];
 
     for (int row = row_lo; row < row_hi; ++row) {
-        const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
-        const double *grow = logslope_design + (size_t)row * (size_t)p_g;
-        const double *Hrow = row_hessians_packed + (size_t)row * (size_t)per_row;
+        pub(crate) const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
+        pub(crate) const double *grow = logslope_design + (size_t)row * (size_t)p_g;
+        pub(crate) const double *Hrow = row_hessians_packed + (size_t)row * (size_t)per_row;
 
         // row_dir[0] = mrow · v[0..p_m]
         double local = 0.0;
@@ -1663,9 +1663,9 @@ extern "C" __global__ void bms_flex_row_dense_block_partial(
     int                  h_primary_start,
     int                  w_primary_start,
     int                  rows_per_cta,
-    const double * __restrict__ row_hessians,    // [n, r*r]
-    const double * __restrict__ marginal_design, // [n, p_m]
-    const double * __restrict__ logslope_design, // [n, p_g]
+    pub(crate) const double * __restrict__ row_hessians,    // [n, r*r]
+    pub(crate) const double * __restrict__ marginal_design, // [n, p_m]
+    pub(crate) const double * __restrict__ logslope_design, // [n, p_g]
     double       * __restrict__ partial)         // [num_chunks, p_total, p_total]
 {
     extern __shared__ double shmem[];
@@ -1689,9 +1689,9 @@ extern "C" __global__ void bms_flex_row_dense_block_partial(
     // the host-side P_i pullback oracle.
     if (tid == 0) {
         for (int row = row_lo; row < row_hi; ++row) {
-            const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
-            const double *grow = logslope_design + (size_t)row * (size_t)p_g;
-            const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
+            pub(crate) const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
+            pub(crate) const double *grow = logslope_design + (size_t)row * (size_t)p_g;
+            pub(crate) const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
             for (int u = 0; u < r; ++u) {
                 for (int v = 0; v < r; ++v) {
                     double huv = Hrow[u * r + v];
@@ -1748,7 +1748,7 @@ extern "C" __global__ void bms_flex_row_dense_block_partial(
 extern "C" __global__ void bms_flex_row_dense_block_reduce(
     int                  num_chunks,
     int                  p_total,
-    const double * __restrict__ partial,
+    pub(crate) const double * __restrict__ partial,
     double       * __restrict__ out)
 {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1774,9 +1774,9 @@ extern "C" __global__ void bms_flex_row_diag_partial_packed(
     int                  h_primary_start,
     int                  w_primary_start,
     int                  rows_per_cta,
-    const double * __restrict__ row_hessians_packed,
-    const double * __restrict__ marginal_design,
-    const double * __restrict__ logslope_design,
+    pub(crate) const double * __restrict__ row_hessians_packed,
+    pub(crate) const double * __restrict__ marginal_design,
+    pub(crate) const double * __restrict__ logslope_design,
     double       * __restrict__ partial)
 {
     int chunk = blockIdx.x;
@@ -1793,9 +1793,9 @@ extern "C" __global__ void bms_flex_row_diag_partial_packed(
     __syncthreads();
 
     for (int row = row_lo; row < row_hi; ++row) {
-        const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
-        const double *grow = logslope_design + (size_t)row * (size_t)p_g;
-        const double *Hrow = row_hessians_packed + (size_t)row * (size_t)per_row;
+        pub(crate) const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
+        pub(crate) const double *grow = logslope_design + (size_t)row * (size_t)p_g;
+        pub(crate) const double *Hrow = row_hessians_packed + (size_t)row * (size_t)per_row;
         // Diagonal entry for (u, u) sits at packed_idx(u, u, r).
         double h00 = Hrow[bms_flex_packed_idx(0, 0, r)];
         double h11 = Hrow[bms_flex_packed_idx(1, 1, r)];
@@ -1823,15 +1823,15 @@ extern "C" __global__ void bms_flex_row_diag_partial_packed(
 "#;
 
 #[cfg(target_os = "linux")]
-struct HvpKernelBackend {
-    stream: Arc<CudaStream>,
-    module: Arc<CudaModule>,
+pub(crate) struct HvpKernelBackend {
+    pub(crate) stream: Arc<CudaStream>,
+    pub(crate) module: Arc<CudaModule>,
 }
 
 #[cfg(target_os = "linux")]
 impl HvpKernelBackend {
-    fn probe() -> Result<&'static Self, GpuError> {
-        static BACKEND: OnceLock<Result<HvpKernelBackend, GpuError>> = OnceLock::new();
+    pub(crate) fn probe() -> Result<&'static Self, GpuError> {
+        pub(crate) static BACKEND: OnceLock<Result<HvpKernelBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
                 crate::gpu::backend_probe::probe_backend_with_compile("bms_flex_row hvp", |parts| {
@@ -2143,7 +2143,7 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
 /// stay thin wrappers over one launch helper.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
-enum BmsFlexRowLaunchMode {
+pub(crate) enum BmsFlexRowLaunchMode {
     /// `bms_flex_row_hvp_partial`, `H · v` per row, result left on-stream.
     HvpDeviceOut,
     /// `bms_flex_row_diag_partial`, `diag(H)` per row, downloaded to host.
@@ -2153,7 +2153,7 @@ enum BmsFlexRowLaunchMode {
 #[cfg(target_os = "linux")]
 impl BmsFlexRowLaunchMode {
     /// Name of the partial kernel this mode loads from the HVP module.
-    fn partial_kernel_name(self) -> &'static str {
+    pub(crate) fn partial_kernel_name(self) -> &'static str {
         match self {
             BmsFlexRowLaunchMode::HvpDeviceOut => "bms_flex_row_hvp_partial",
             BmsFlexRowLaunchMode::DiagonalHostOut => "bms_flex_row_diag_partial",
@@ -2167,25 +2167,25 @@ impl BmsFlexRowLaunchMode {
 /// `d_v` / output pointers differ), so this captures the long, easy-to-
 /// desynchronize prefix in a single place.
 #[cfg(target_os = "linux")]
-struct PreparedBmsFlexRowLaunchArgs {
-    n_i32: i32,
-    r_i32: i32,
-    p_m_i32: i32,
-    p_g_i32: i32,
-    p_total_i32: i32,
-    h_block_start: i32,
-    h_block_len: i32,
-    w_block_start: i32,
-    w_block_len: i32,
-    h_primary_start: i32,
-    w_primary_start: i32,
-    rows_per_cta: i32,
-    num_chunks: usize,
+pub(crate) struct PreparedBmsFlexRowLaunchArgs {
+    pub(crate) n_i32: i32,
+    pub(crate) r_i32: i32,
+    pub(crate) p_m_i32: i32,
+    pub(crate) p_g_i32: i32,
+    pub(crate) p_total_i32: i32,
+    pub(crate) h_block_start: i32,
+    pub(crate) h_block_len: i32,
+    pub(crate) w_block_start: i32,
+    pub(crate) w_block_len: i32,
+    pub(crate) h_primary_start: i32,
+    pub(crate) w_primary_start: i32,
+    pub(crate) rows_per_cta: i32,
+    pub(crate) num_chunks: usize,
 }
 
 #[cfg(target_os = "linux")]
 impl PreparedBmsFlexRowLaunchArgs {
-    fn from_storage(storage: &DeviceResidentRowHess) -> Self {
+    pub(crate) fn from_storage(storage: &DeviceResidentRowHess) -> Self {
         let p_total = storage.block.p_total;
         let num_chunks = num_hvp_chunks(storage.n);
         PreparedBmsFlexRowLaunchArgs {
@@ -2250,7 +2250,7 @@ impl PreparedBmsFlexRowLaunchArgs {
 /// into every `DriverCallFailed` reason so failures stay attributable to the
 /// originating entry point.
 #[cfg(target_os = "linux")]
-fn run_bms_flex_row_partial_reduce(
+pub(crate) fn run_bms_flex_row_partial_reduce(
     storage: &DeviceResidentRowHess,
     mode: BmsFlexRowLaunchMode,
     d_v: Option<&CudaSlice<f64>>,
@@ -2355,7 +2355,7 @@ fn run_bms_flex_row_partial_reduce(
 /// synchronizes and downloads the reduced image to a host `Vec<f64>`. `ctx`
 /// tags every `DriverCallFailed` reason with the originating entry point.
 #[cfg(target_os = "linux")]
-fn launch_bms_flex_row_host(
+pub(crate) fn launch_bms_flex_row_host(
     storage: &DeviceResidentRowHess,
     mode: BmsFlexRowLaunchMode,
     v: Option<&[f64]>,
@@ -2408,7 +2408,7 @@ fn launch_bms_flex_row_host(
 }
 
 #[cfg(target_os = "linux")]
-fn validate_bms_flex_row_hvp_multi_shape(
+pub(crate) fn validate_bms_flex_row_hvp_multi_shape(
     storage: &DeviceResidentRowHess,
     rhs_count: usize,
     v_rhs_len: usize,
@@ -2491,7 +2491,7 @@ pub fn bms_flex_row_hvp_multi_scratch_bytes_for_shape(
 }
 
 #[cfg(target_os = "linux")]
-fn run_bms_flex_row_multi_partial_reduce(
+pub(crate) fn run_bms_flex_row_multi_partial_reduce(
     storage: &DeviceResidentRowHess,
     rhs_count: usize,
     d_v_rhs: &CudaSlice<f64>,
@@ -2904,7 +2904,7 @@ pub fn launch_bms_flex_row_dense_block(
 mod tests {
     use super::*;
 
-    fn minimal_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
+    pub(crate) fn minimal_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
         BmsFlexRowKernelInputs {
             n_rows: 1,
             r: 4,
@@ -2939,35 +2939,35 @@ mod tests {
         }
     }
 
-    struct TestBuffers {
-        q: Vec<f64>,
-        b: Vec<f64>,
-        mu_1: Vec<f64>,
-        mu_2: Vec<f64>,
-        z_obs: Vec<f64>,
-        y: Vec<f64>,
-        w: Vec<f64>,
-        cell_offsets: Vec<u32>,
-        cell_c0: Vec<f64>,
-        cell_c1: Vec<f64>,
-        cell_c2: Vec<f64>,
-        cell_c3: Vec<f64>,
-        cell_a: Vec<f64>,
-        cell_aa: Vec<f64>,
-        cell_r: Vec<f64>,
-        cell_ar: Vec<f64>,
-        cell_sbb: Vec<f64>,
-        cell_sbh: Vec<f64>,
-        cell_sbw: Vec<f64>,
-        cell_moments: Vec<f64>,
-        chi_obs: Vec<f64>,
-        xi_obs: Vec<f64>,
-        rho_u: Vec<f64>,
-        tau_u: Vec<f64>,
-        r_uv: Vec<f64>,
+    pub(crate) struct TestBuffers {
+        pub(crate) q: Vec<f64>,
+        pub(crate) b: Vec<f64>,
+        pub(crate) mu_1: Vec<f64>,
+        pub(crate) mu_2: Vec<f64>,
+        pub(crate) z_obs: Vec<f64>,
+        pub(crate) y: Vec<f64>,
+        pub(crate) w: Vec<f64>,
+        pub(crate) cell_offsets: Vec<u32>,
+        pub(crate) cell_c0: Vec<f64>,
+        pub(crate) cell_c1: Vec<f64>,
+        pub(crate) cell_c2: Vec<f64>,
+        pub(crate) cell_c3: Vec<f64>,
+        pub(crate) cell_a: Vec<f64>,
+        pub(crate) cell_aa: Vec<f64>,
+        pub(crate) cell_r: Vec<f64>,
+        pub(crate) cell_ar: Vec<f64>,
+        pub(crate) cell_sbb: Vec<f64>,
+        pub(crate) cell_sbh: Vec<f64>,
+        pub(crate) cell_sbw: Vec<f64>,
+        pub(crate) cell_moments: Vec<f64>,
+        pub(crate) chi_obs: Vec<f64>,
+        pub(crate) xi_obs: Vec<f64>,
+        pub(crate) rho_u: Vec<f64>,
+        pub(crate) tau_u: Vec<f64>,
+        pub(crate) r_uv: Vec<f64>,
     }
 
-    fn make_buffers(n_cells: u32, r: usize, p_h: usize, p_w: usize) -> TestBuffers {
+    pub(crate) fn make_buffers(n_cells: u32, r: usize, p_h: usize, p_w: usize) -> TestBuffers {
         let cells = n_cells as usize;
         TestBuffers {
             q: vec![0.1; 1],
@@ -2999,14 +2999,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_minimal_inputs() {
+    pub(crate) fn validate_accepts_minimal_inputs() {
         let buffers = make_buffers(2, 4, 1, 1);
         let inputs = minimal_inputs(&buffers);
         assert!(inputs.validate().is_ok());
     }
 
     #[test]
-    fn validate_rejects_r_above_max() {
+    pub(crate) fn validate_rejects_r_above_max() {
         let r = MAX_R + 1;
         let p_h = (r - 2) / 2;
         let p_w = (r - 2) - p_h;
@@ -3030,7 +3030,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_mismatched_r_decomposition() {
+    pub(crate) fn validate_rejects_mismatched_r_decomposition() {
         let buffers = make_buffers(1, 4, 1, 1);
         let bad_inputs = BmsFlexRowKernelInputs {
             r: 4,
@@ -3047,7 +3047,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_non_monotone_offsets() {
+    pub(crate) fn validate_rejects_non_monotone_offsets() {
         // `minimal_inputs` hard-codes `n_rows = 1`, so the CSR-style row
         // pointer length is `n + 1 = 2`. Pin both `offsets[1] = total_cells`
         // and `cell_c0.len() = total_cells = 2` from `make_buffers(2, …)`,
@@ -3065,7 +3065,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_mismatched_cell_moments_length() {
+    pub(crate) fn validate_rejects_mismatched_cell_moments_length() {
         let mut buffers = make_buffers(2, 4, 1, 1);
         buffers.cell_moments.pop(); // length now 2*10 - 1
         let inputs = minimal_inputs(&buffers);
@@ -3075,7 +3075,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_on_non_linux_reports_driver_library_unavailable() {
+    pub(crate) fn launch_on_non_linux_reports_driver_library_unavailable() {
         // Mac/Windows builds must surface a typed `DriverLibraryUnavailable`
         // rather than panicking or returning Ok. On Linux this test is
         // skipped because the kernel actually launches.
@@ -3115,7 +3115,7 @@ mod tests {
     }
 
     #[test]
-    fn s_f_must_be_positive_and_finite() {
+    pub(crate) fn s_f_must_be_positive_and_finite() {
         let buffers = make_buffers(1, 4, 1, 1);
         let mut inputs = minimal_inputs(&buffers);
         inputs.s_f = 0.0;
@@ -3141,11 +3141,11 @@ mod tests {
     // hosts via cfg, but the oracle itself is platform-independent so the
     // macOS lib build can still type-check it.
 
-    const ORACLE_INV_TWO_PI: f64 = 1.0 / std::f64::consts::TAU;
-    const ORACLE_SQRT_2: f64 = std::f64::consts::SQRT_2;
-    const ORACLE_INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
+    pub(crate) const ORACLE_INV_TWO_PI: f64 = 1.0 / std::f64::consts::TAU;
+    pub(crate) const ORACLE_SQRT_2: f64 = std::f64::consts::SQRT_2;
+    pub(crate) const ORACLE_INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
-    fn oracle_erfcx_nonnegative(x: f64) -> f64 {
+    pub(crate) fn oracle_erfcx_nonnegative(x: f64) -> f64 {
         if !x.is_finite() {
             return if x > 0.0 { 0.0 } else { f64::INFINITY };
         }
@@ -3167,7 +3167,7 @@ mod tests {
         inv * poly * inv_sqrt_pi
     }
 
-    fn oracle_log_ndtr_and_mills(x: f64) -> (f64, f64) {
+    pub(crate) fn oracle_log_ndtr_and_mills(x: f64) -> (f64, f64) {
         if x == f64::INFINITY {
             return (0.0, 0.0);
         }
@@ -3189,7 +3189,7 @@ mod tests {
         // the left tail (x ≲ −38), where `erfc(-x/√2)` underflows to 0 and the
         // exp/ln cancellation is the *only* way to keep `log Φ` finite. We move
         // the branch there, far from any region the kernel or its FD lock visits.
-        const ORACLE_LEFT_TAIL_X: f64 = -37.0;
+        pub(crate) const ORACLE_LEFT_TAIL_X: f64 = -37.0;
         if x >= ORACLE_LEFT_TAIL_X {
             let mut cdf = 0.5 * crate::gpu::numerics_host::erfc(-x / ORACLE_SQRT_2);
             if cdf < 1e-300 {
@@ -3216,7 +3216,7 @@ mod tests {
     /// `grad` is row-major `n × r`, `hess` is row-major `n × r × r`.
     /// Mirrors `bms_flex_row_kernel` line-for-line so kernel + oracle diverge
     /// only if one side breaks parity.
-    fn cpu_oracle_outputs(inputs: &BmsFlexRowKernelInputs<'_>) -> BmsFlexRowKernelOutputs {
+    pub(crate) fn cpu_oracle_outputs(inputs: &BmsFlexRowKernelInputs<'_>) -> BmsFlexRowKernelOutputs {
         let n = inputs.n_rows;
         let r = inputs.r;
         let p_h = inputs.p_h;
@@ -3424,7 +3424,7 @@ mod tests {
     /// Build a non-trivial fixture: `n = 4` rows, `r = 5` (p_h = 2, p_w = 1),
     /// 2–4 cells per row, distinct values so a structural bug in either path
     /// can't be masked by accidental cancellation.
-    fn make_parity_buffers() -> TestBuffers {
+    pub(crate) fn make_parity_buffers() -> TestBuffers {
         let n = 4_usize;
         let r = 5_usize;
         let p_h = 2_usize;
@@ -3520,7 +3520,7 @@ mod tests {
         }
     }
 
-    fn parity_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
+    pub(crate) fn parity_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
         BmsFlexRowKernelInputs {
             n_rows: 4,
             r: 5,
@@ -3559,7 +3559,7 @@ mod tests {
     /// macOS, CPU CI) since the oracle is platform-independent. Guarantees the
     /// reference path used by the GPU parity test is itself well-formed.
     #[test]
-    fn cpu_oracle_produces_finite_symmetric_hessian() {
+    pub(crate) fn cpu_oracle_produces_finite_symmetric_hessian() {
         let buffers = make_parity_buffers();
         let inputs = parity_inputs(&buffers);
         inputs
@@ -3623,7 +3623,7 @@ mod tests {
     /// CUDA or not. Bounds are the genuine fifth-order central-difference
     /// truncation floor; they are not weakened to pass.
     #[test]
-    fn cpu_oracle_mills_layer_matches_finite_differences() {
+    pub(crate) fn cpu_oracle_mills_layer_matches_finite_differences() {
         // Probit neglog as the oracle assembles it, as a function of the
         // observed scalar predictor `e` with weight `w` and label `y`.
         let neglog_of = |e: f64, y: f64, w: f64| -> f64 {
@@ -3704,7 +3704,7 @@ mod tests {
     /// then asserts every element of `neglog`, `grad`, and `hess` agrees
     /// within `|Δ| <= 1e-8 + 1e-8·|cpu|` (absolute-or-relative).
     #[test]
-    fn bms_flex_row_kernel_matches_cpu_oracle_when_cuda_available() {
+    pub(crate) fn bms_flex_row_kernel_matches_cpu_oracle_when_cuda_available() {
         #[cfg(not(target_os = "linux"))]
         {
             eprintln!(
@@ -3789,7 +3789,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_source_mentions_cpu_parity_reference() {
+    pub(crate) fn kernel_source_mentions_cpu_parity_reference() {
         // Guarantee the maintainer-facing parity reference comment survives
         // refactors of the NVRTC kernel source — the dispatcher wave that
         // wires this to bms_flex.rs cross-checks parity against the CPU
@@ -3804,7 +3804,7 @@ mod tests {
 
     /// CPU oracle for [`launch_bms_flex_row_hvp`]. Mirrors the device kernel
     /// element-for-element so the GPU parity test runs against the same algebra.
-    fn cpu_oracle_bms_flex_row_hvp(
+    pub(crate) fn cpu_oracle_bms_flex_row_hvp(
         row_hessians: &[f64],
         marginal_design: &[f64],
         logslope_design: &[f64],
@@ -3876,7 +3876,7 @@ mod tests {
         out
     }
 
-    fn cpu_oracle_bms_flex_row_diagonal(
+    pub(crate) fn cpu_oracle_bms_flex_row_diagonal(
         row_hessians: &[f64],
         marginal_design: &[f64],
         logslope_design: &[f64],
@@ -3918,7 +3918,7 @@ mod tests {
     /// verify the CPU oracle satisfies the expected algebra. Platform-
     /// independent (runs on macOS / Linux without CUDA).
     #[test]
-    fn cpu_oracle_hvp_matches_hand_computation_no_hw() {
+    pub(crate) fn cpu_oracle_hvp_matches_hand_computation_no_hw() {
         let n = 4_usize;
         let r = 4_usize; // q, logslope, h(1), w(1)
         let p_m = 2_usize;
@@ -4003,7 +4003,7 @@ mod tests {
 
     /// Diagonal oracle equals the explicit per-row design² accumulator.
     #[test]
-    fn cpu_oracle_diagonal_matches_hand_computation() {
+    pub(crate) fn cpu_oracle_diagonal_matches_hand_computation() {
         let n = 3_usize;
         let r = 4_usize;
         let p_m = 2_usize;
@@ -4078,7 +4078,7 @@ mod tests {
     /// allocating the device slices directly, uploading the same arrays the
     /// CPU oracle consumes, then dispatching the device kernels.
     #[test]
-    fn bms_flex_row_hvp_kernel_matches_cpu_oracle_when_cuda_available() {
+    pub(crate) fn bms_flex_row_hvp_kernel_matches_cpu_oracle_when_cuda_available() {
         #[cfg(not(target_os = "linux"))]
         {
             eprintln!(
@@ -4223,7 +4223,7 @@ mod tests {
     }
 
     #[test]
-    fn bms_flex_row_hvp_multi_scratch_is_bounded_at_large_scale_shape() {
+    pub(crate) fn bms_flex_row_hvp_multi_scratch_is_bounded_at_large_scale_shape() {
         let n = 195_000_usize;
         let r = 20_usize;
         let p_total = 44_usize;
@@ -4249,7 +4249,7 @@ mod tests {
     }
 
     #[test]
-    fn bms_flex_row_hvp_multi_kernel_matches_cpu_oracle_when_cuda_available() {
+    pub(crate) fn bms_flex_row_hvp_multi_kernel_matches_cpu_oracle_when_cuda_available() {
         let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
             eprintln!("[bms_flex_row hvp_multi parity] no CUDA runtime — skipping device parity");
             return;
@@ -4392,7 +4392,7 @@ mod tests {
     /// Skips cleanly on non-Linux / no-CUDA hosts using the convention shared
     /// with the sibling parity tests.
     #[test]
-    fn bms_flex_row_hvp_into_device_matches_cpu_oracle_and_host_out() {
+    pub(crate) fn bms_flex_row_hvp_into_device_matches_cpu_oracle_and_host_out() {
         #[cfg(not(target_os = "linux"))]
         {
             eprintln!(
@@ -4564,7 +4564,7 @@ mod tests {
     /// Skips cleanly on non-Linux and no-CUDA hosts using the same
     /// convention as the hand-fixture parity above.
     #[test]
-    fn bms_flex_row_hvp_kernel_matches_cpu_oracle_at_n64_r20_p44() {
+    pub(crate) fn bms_flex_row_hvp_kernel_matches_cpu_oracle_at_n64_r20_p44() {
         #[cfg(not(target_os = "linux"))]
         {
             eprintln!(
@@ -4751,7 +4751,7 @@ mod tests {
     /// the device-resident dense build and the host accumulator over the
     /// same per-row Hessian + designs + P_i pullback.
     #[test]
-    fn bms_flex_row_dense_block_kernel_matches_cpu_pullback() {
+    pub(crate) fn bms_flex_row_dense_block_kernel_matches_cpu_pullback() {
         #[cfg(not(target_os = "linux"))]
         {
             eprintln!("[bms_flex_row dense_block parity] non-Linux host — skipping CUDA parity");
@@ -4956,7 +4956,7 @@ mod tests {
     ///
     /// Skips on non-Linux / no-CUDA hosts.
     #[test]
-    fn bms_flex_row_hvp_v100_hill_climb_5x_vs_cpu_at_large_scale() {
+    pub(crate) fn bms_flex_row_hvp_v100_hill_climb_5x_vs_cpu_at_large_scale() {
         #[cfg(not(target_os = "linux"))]
         {
             eprintln!("[bms_flex_row hvp hill-climb] non-Linux host — skipping V100 perf gate");
@@ -5097,7 +5097,7 @@ mod tests {
             //    parallelisation pattern (ROW_CHUNK_SIZE-row chunks,
             //    try_fold + try_reduce). The per-chunk worker calls the
             //    single-threaded oracle on its row slice.
-            const CHUNK_ROWS: usize = 4096;
+            pub(crate) const CHUNK_ROWS: usize = 4096;
             let cpu_hvp_parallel = || -> Vec<f64> {
                 let nchunks = n.div_ceil(CHUNK_ROWS);
                 (0..nchunks)
@@ -5167,7 +5167,7 @@ mod tests {
     /// shape. The dense build is `O(n * r² * p_total)` work for both
     /// paths so the ratio is well-defined.
     #[test]
-    fn bms_flex_row_dense_block_v100_hill_climb_10x_vs_cpu_at_large_scale() {
+    pub(crate) fn bms_flex_row_dense_block_v100_hill_climb_10x_vs_cpu_at_large_scale() {
         #[cfg(not(target_os = "linux"))]
         {
             eprintln!(
@@ -5312,7 +5312,7 @@ mod tests {
 
             // CPU side: chunked Rayon dense build over rows. Each chunk
             // builds a `[p_total, p_total]` partial then we reduce-add.
-            const CHUNK_ROWS: usize = 2048;
+            pub(crate) const CHUNK_ROWS: usize = 2048;
             let h_block_start = block.h.as_ref().map(|r| r.start).unwrap_or(0);
             let h_block_len = block.h.as_ref().map(|r| r.len()).unwrap_or(0);
             let w_block_start = block.w.as_ref().map(|r| r.start).unwrap_or(0);

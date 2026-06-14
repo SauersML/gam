@@ -16,7 +16,7 @@ use super::*;
 /// transient failure) the tile reduces with the exact CPU `block_gemm_subtract`
 /// loop, so the result is unchanged. The partial is negated so the caller's
 /// `schur += partial` reproduces the serial `schur -= Σ contribution`.
-fn tile_schur_partial<B: BatchedBlockSolver>(
+pub(crate) fn tile_schur_partial<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     backend: &B,
@@ -99,7 +99,7 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
 ///
 /// With a single device (or no GPU) the row loop runs serially in place, which
 /// is bit-for-bit the original behaviour.
-fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
+pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     backend: &B,
@@ -331,7 +331,7 @@ pub(crate) fn mixed_precision_reduced_beta(
 
 
 /// Infinity norm (max absolute row sum) of a dense matrix.
-fn matrix_inf_norm(a: &Array2<f64>) -> f64 {
+pub(crate) fn matrix_inf_norm(a: &Array2<f64>) -> f64 {
     let mut max_row = 0.0_f64;
     for row in a.rows() {
         let s: f64 = row.iter().map(|v| v.abs()).sum();
@@ -509,7 +509,7 @@ pub fn solve_streaming_reduced_beta(
 }
 
 
-fn step_inside_trust_region(
+pub(crate) fn step_inside_trust_region(
     step: ArrayView1<'_, f64>,
     radius: f64,
     metric_weights: Option<&MetricWeights>,
@@ -569,7 +569,7 @@ pub(crate) const SCHUR_PROLOGUE_PARALLEL_K_MIN: usize = 512;
 /// ranking across topology candidates cannot move — the #1017 verification gate.
 pub(crate) struct SaeResidentReducedSchur {
     /// Decoder output dimension `p` (the side length of every `G_i = L_iᵀ Y_i`).
-    p: usize,
+    pub(crate) p: usize,
     /// Per-row **factored** residency: `(L_i, Y_i)`, each stored row-major as a
     /// `di × p` slab (`L_i` = local Jacobian, `Y_i = (H_tt^(i)+ρ_t I)⁻¹ L_i`).
     /// The reduced block is `G_i = L_iᵀ Y_i` (`p×p`, symmetric PSD), but it has
@@ -581,23 +581,23 @@ pub(crate) struct SaeResidentReducedSchur {
     /// GEMV → `p`-length GEMV → scatter). A row with empty active support /
     /// degenerate dims gets `di = 0` and is skipped.
     /// `(di, L_i, Y_i)` per row; `L_i`/`Y_i` are `di·p`-length row-major buffers.
-    rows: Vec<ResidentRowFactor>,
+    pub(crate) rows: Vec<ResidentRowFactor>,
     /// Per-row active atom support `(β-block base index, φ weight)`, shared with
     /// the assembler's [`DeviceSaePcgData`] (no re-clone of the index lists).
-    a_phi: Arc<[Vec<(usize, f64)>]>,
+    pub(crate) a_phi: Arc<[Vec<(usize, f64)>]>,
 }
 
 
 /// Factored per-row residency block: `G_i = L_iᵀ Y_i` kept as its `di×p` factors
 /// so the matvec never materialises the dense `p×p` product. See
 /// [`SaeResidentReducedSchur`].
-struct ResidentRowFactor {
+pub(crate) struct ResidentRowFactor {
     /// Row latent dimension `di` (the inner contraction width). `0` ⇒ skipped.
-    di: usize,
+    pub(crate) di: usize,
     /// `L_i` row-major `di × p` (`di·p` entries). Empty when `di == 0`.
-    l: Vec<f64>,
+    pub(crate) l: Vec<f64>,
     /// `Y_i = (H_tt^(i)+ρ_t I)⁻¹ L_i` row-major `di × p`. Empty when `di == 0`.
-    y: Vec<f64>,
+    pub(crate) y: Vec<f64>,
 }
 
 
@@ -615,7 +615,7 @@ impl SaeResidentReducedSchur {
     /// blocks `htt_factors` carry (they factor `H_tt^(i) + ridge_t·I` — see
     /// `factor_blocks`), so solving against the factor yields `(H_tt^(i)+ρ_t I)⁻¹`
     /// exactly. The residency block is a pure function of the factor and `L_i`.
-    fn build<B: BatchedBlockSolver + Sync>(
+    pub(crate) fn build<B: BatchedBlockSolver + Sync>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         backend: &B,
@@ -681,7 +681,7 @@ impl SaeResidentReducedSchur {
     /// `prod = L_iᵀ·w` (`p`-length, `di·p` flops) — `2·di·p` total, never the
     /// dense `p²` product.
     #[inline]
-    fn row_into(
+    pub(crate) fn row_into(
         &self,
         row: usize,
         x: &Array1<f64>,
@@ -746,7 +746,7 @@ impl SaeResidentReducedSchur {
 
     /// Max row latent dim `di` across resident rows — the size of the `w`
     /// scratch the matvec needs for the inner `Y_i·(P_i x)` GEMV.
-    fn max_di(&self) -> usize {
+    pub(crate) fn max_di(&self) -> usize {
         self.rows.iter().map(|r| r.di).max().unwrap_or(0)
     }
 }
@@ -806,7 +806,7 @@ pub(crate) fn schur_matvec<B: BatchedBlockSolver + Sync>(
     let p = resident.map(|r| r.p).unwrap_or(0);
     if parallel {
         use rayon::prelude::*;
-        const CHUNK: usize = 64;
+        pub(crate) const CHUNK: usize = 64;
         let n = sys.rows.len();
         let partials: Vec<Array1<f64>> = (0..n)
             .into_par_iter()
@@ -967,19 +967,19 @@ impl std::fmt::Debug for BlockFactor {
 /// their own block layout.
 #[derive(Debug, Clone)]
 pub struct JacobiPreconditioner {
-    blocks: Vec<BlockFactor>,
+    pub(crate) blocks: Vec<BlockFactor>,
 }
 
 
 /// Maximum block size for which we attempt dense block-Jacobi factorization.
-const BLOCK_JACOBI_MAX_BLOCK: usize = 256;
+pub(crate) const BLOCK_JACOBI_MAX_BLOCK: usize = 256;
 
 
 /// Positive-definiteness floor on a Schur-complement Jacobi diagonal entry.
 /// A diagonal at or below this value (or non-finite) signals a non-PD reduced
 /// system: the preconditioner cannot invert it, so the PCG solve fails loudly
 /// and demands operator regularization rather than returning a garbage scale.
-const JACOBI_DIAGONAL_PD_FLOOR: f64 = 1e-18;
+pub(crate) const JACOBI_DIAGONAL_PD_FLOOR: f64 = 1e-18;
 
 
 impl JacobiPreconditioner {
@@ -1027,7 +1027,7 @@ impl JacobiPreconditioner {
     ///
     /// When `sys.htbeta_matvec` is set and per-row `htbeta` slabs are absent,
     /// each column is probed via the matvec (one call per column per row).
-    fn build_scalar_jacobi<B: BatchedBlockSolver>(
+    pub(crate) fn build_scalar_jacobi<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
@@ -1114,7 +1114,7 @@ impl JacobiPreconditioner {
     /// from the matvec residency. The result is the SAME quotient the generic
     /// path computes (up to float reassociation of the row sum), so the PCG
     /// preconditioner — and therefore the criterion ranking — is unchanged.
-    fn build_scalar_jacobi_resident(
+    pub(crate) fn build_scalar_jacobi_resident(
         sys: &ArrowSchurSystem,
         ridge_beta: f64,
         resident: &SaeResidentReducedSchur,
@@ -1181,7 +1181,7 @@ impl JacobiPreconditioner {
 
     /// Build term-block Jacobi: one dense `b×b` Schur block per term in
     /// `sys.block_offsets`.
-    fn build_block_jacobi<B: BatchedBlockSolver>(
+    pub(crate) fn build_block_jacobi<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
@@ -1291,7 +1291,7 @@ impl JacobiPreconditioner {
         Ok(Self { blocks })
     }
 
-    fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(r.len());
         for block in &self.blocks {
             match block {
@@ -1355,12 +1355,12 @@ pub enum SchurPreconditionerKind {
 
 /// Escalate beyond BetaBlockJacobi only when K exceeds this value and PCG
 /// exhausted `max_iterations`.
-const PRECOND_ESCALATE_K_THRESHOLD: usize = 100;
+pub(crate) const PRECOND_ESCALATE_K_THRESHOLD: usize = 100;
 
 
 /// Cholesky or scalar factor for one cluster of the beta-coefficient graph.
 #[derive(Clone)]
-enum ClusterFactor {
+pub(crate) enum ClusterFactor {
     Chol {
         cols: Vec<usize>,
         factor: FaerLlt<f64>,
@@ -1390,7 +1390,7 @@ impl std::fmt::Debug for ClusterFactor {
 
 
 /// Maximum columns per cluster before scalar fallback.
-const CLUSTER_JACOBI_MAX_CLUSTER: usize = 512;
+pub(crate) const CLUSTER_JACOBI_MAX_CLUSTER: usize = 512;
 
 
 /// Dense Schur block per connected component of the beta-coupling graph.
@@ -1400,7 +1400,7 @@ const CLUSTER_JACOBI_MAX_CLUSTER: usize = 512;
 /// connected component; applied as a triangular solve.
 #[derive(Debug, Clone)]
 pub struct ClusterJacobiPreconditioner {
-    clusters: Vec<ClusterFactor>,
+    pub(crate) clusters: Vec<ClusterFactor>,
 }
 
 
@@ -1437,7 +1437,7 @@ impl ClusterJacobiPreconditioner {
         Self::build_from_column_groups(sys, htt_factors, ridge_beta, backend, &col_groups)
     }
 
-    fn build_from_column_groups<B: BatchedBlockSolver>(
+    pub(crate) fn build_from_column_groups<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
@@ -1513,7 +1513,7 @@ impl ClusterJacobiPreconditioner {
         Ok(Self { clusters })
     }
 
-    fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(r.len());
         for cluster in &self.clusters {
             apply_cluster(cluster, r, &mut out, &ClusterApplyMode::Overwrite);
@@ -1527,8 +1527,8 @@ impl ClusterJacobiPreconditioner {
 /// overlapping columns averaged by partition-of-unity weights.
 #[derive(Debug, Clone)]
 pub struct AdditiveSchwarzPreconditioner {
-    clusters: Vec<ClusterFactor>,
-    weights: Vec<f64>,
+    pub(crate) clusters: Vec<ClusterFactor>,
+    pub(crate) weights: Vec<f64>,
 }
 
 
@@ -1601,7 +1601,7 @@ impl AdditiveSchwarzPreconditioner {
         })
     }
 
-    fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(r.len());
         for cluster in &self.clusters {
             apply_cluster(
@@ -1624,7 +1624,7 @@ impl AdditiveSchwarzPreconditioner {
 /// column touched by exactly one cluster). `Accumulate` adds the partition-of-unity
 /// weighted contribution `out[gi] += weights[gi] * value` (overlapping Schwarz
 /// clusters, where a column may belong to several clusters).
-enum ClusterApplyMode<'w> {
+pub(crate) enum ClusterApplyMode<'w> {
     Overwrite,
     Accumulate { weights: &'w [f64] },
 }
@@ -1632,7 +1632,7 @@ enum ClusterApplyMode<'w> {
 
 impl ClusterApplyMode<'_> {
     #[inline]
-    fn write(&self, out: &mut Array1<f64>, gi: usize, value: f64) {
+    pub(crate) fn write(&self, out: &mut Array1<f64>, gi: usize, value: f64) {
         match self {
             ClusterApplyMode::Overwrite => out[gi] = value,
             ClusterApplyMode::Accumulate { weights } => out[gi] += weights[gi] * value,
@@ -1644,7 +1644,7 @@ impl ClusterApplyMode<'_> {
 /// Apply a single cluster factor to the residual `r`, writing into `out`
 /// according to `mode` (overwrite for non-overlapping clusters, weighted
 /// accumulate for overlapping Schwarz clusters).
-fn apply_cluster(
+pub(crate) fn apply_cluster(
     cluster: &ClusterFactor,
     r: &Array1<f64>,
     out: &mut Array1<f64>,
@@ -1679,7 +1679,7 @@ fn apply_cluster(
 /// Build scalar diagonal inverses for a set of global column indices.
 ///
 /// Used when a cluster is non-PD or exceeds `CLUSTER_JACOBI_MAX_CLUSTER`.
-fn build_schur_scalar_inv<B: BatchedBlockSolver>(
+pub(crate) fn build_schur_scalar_inv<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
@@ -1875,17 +1875,17 @@ where
 
 
 #[derive(Debug, Clone, Copy)]
-struct IdentityPreconditioner;
+pub(crate) struct IdentityPreconditioner;
 
 
 impl IdentityPreconditioner {
-    fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
         r.clone()
     }
 }
 
 
-fn steihaug_dense_system(
+pub(crate) fn steihaug_dense_system(
     schur: &Array2<f64>,
     rhs: &Array1<f64>,
     preconditioner: &IdentityPreconditioner,
@@ -1905,7 +1905,7 @@ fn steihaug_dense_system(
 }
 
 
-fn steihaug_cg<MatVec, ApplyPrec>(
+pub(crate) fn steihaug_cg<MatVec, ApplyPrec>(
     rhs: &Array1<f64>,
     mut matvec: MatVec,
     mut apply_preconditioner: ApplyPrec,
@@ -2016,7 +2016,7 @@ where
 }
 
 
-fn step_to_trust_boundary(
+pub(crate) fn step_to_trust_boundary(
     x: &Array1<f64>,
     p: &Array1<f64>,
     radius: f64,
@@ -2038,7 +2038,7 @@ fn step_to_trust_boundary(
 }
 
 
-fn dense_matvec(a: &Array2<f64>, x: &Array1<f64>, out: &mut Array1<f64>) {
+pub(crate) fn dense_matvec(a: &Array2<f64>, x: &Array1<f64>, out: &mut Array1<f64>) {
     let n = a.nrows();
     for i in 0..n {
         let mut acc = 0.0;
@@ -2059,7 +2059,7 @@ pub(crate) fn dot(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
 }
 
 
-fn metric_dot(a: &Array1<f64>, b: &Array1<f64>, metric_weights: Option<&MetricWeights>) -> f64 {
+pub(crate) fn metric_dot(a: &Array1<f64>, b: &Array1<f64>, metric_weights: Option<&MetricWeights>) -> f64 {
     assert_eq!(a.len(), b.len());
     match metric_weights {
         Some(weights) => {

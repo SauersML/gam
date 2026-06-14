@@ -18,7 +18,7 @@ pub struct GaussianLocationScaleFamily {
     /// (first, mid, last elements of both eta vectors).
     /// Avoids recomputing O(n) scalars K+ times per REML gradient/Hessian evaluation.
     pub cached_row_scalars:
-        std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
+        pub(crate) std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
 
 impl Clone for GaussianLocationScaleFamily {
@@ -935,7 +935,7 @@ impl GaussianLocationScaleFamily {
 /// residual `(y_i − μ_i) ≠ 0`, i.e. away from the fitted mean.
 pub struct GaussianLocationScaleChannelHessian {
     /// Row-major `(n × 2 × 2)` PSD-clamped per-subject Hessian.
-    h: ndarray::Array3<f64>,
+    pub(crate) h: ndarray::Array3<f64>,
 }
 
 impl GaussianLocationScaleChannelHessian {

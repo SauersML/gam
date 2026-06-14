@@ -5,17 +5,17 @@
 use super::*;
 
 pub(crate) struct RowCoeffChannel {
-    block: usize,
-    design: Arc<Array2<f64>>,
+    pub(crate) block: usize,
+    pub(crate) design: Arc<Array2<f64>>,
 }
 
 /// Symmetric pair coefficients `c_{ab}` for `a ≤ b`. The operator adds
 /// `X_a^T diag(c_{ab}) X_b` to block `block_a`'s output and the transpose
 /// contribution `X_b^T diag(c_{ab}) X_a` to block `block_b` when `a != b`.
 pub(crate) struct RowCoeffPair {
-    a: usize,
-    b: usize,
-    coeff: Array1<f64>,
+    pub(crate) a: usize,
+    pub(crate) b: usize,
+    pub(crate) coeff: Array1<f64>,
 }
 
 /// Pooled per-call scratch for `RowCoeffOperator::mul_vec`. Each call
@@ -29,8 +29,8 @@ pub(crate) struct RowCoeffPair {
 /// zeroes-then-accumulates `r`, leaving both buffers in any state on
 /// return — callers must not depend on residual content.
 pub(crate) struct RowCoeffScratch {
-    u: Vec<Array1<f64>>,
-    r: Vec<Array1<f64>>,
+    pub(crate) u: Vec<Array1<f64>>,
+    pub(crate) r: Vec<Array1<f64>>,
 }
 
 /// Matrix-free operator for two-block-style joint-Hessian directional
@@ -44,13 +44,13 @@ pub(crate) struct RowCoeffScratch {
 /// operator dimension is the sum of all block widths. Each channel's
 /// `mul_vec` contribution is added into the slice for its output block.
 pub(crate) struct RowCoeffOperator {
-    channels: Vec<RowCoeffChannel>,
-    block_offsets: Vec<usize>,
-    block_widths: Vec<usize>,
-    dim: usize,
-    pair_coeffs: Vec<RowCoeffPair>,
-    nrows: usize,
-    scratch_pool: std::sync::Mutex<Vec<RowCoeffScratch>>,
+    pub(crate) channels: Vec<RowCoeffChannel>,
+    pub(crate) block_offsets: Vec<usize>,
+    pub(crate) block_widths: Vec<usize>,
+    pub(crate) dim: usize,
+    pub(crate) pair_coeffs: Vec<RowCoeffPair>,
+    pub(crate) nrows: usize,
+    pub(crate) scratch_pool: std::sync::Mutex<Vec<RowCoeffScratch>>,
 }
 
 impl RowCoeffOperator {
@@ -370,14 +370,14 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
 /// `NoDensifyOperator` regression tests rely on this type to panic if a future
 /// change materializes spec-backed designs.
 pub(crate) struct DesignTwoBlockRowCoeffOperator {
-    x_a: DesignMatrix,
-    x_b: DesignMatrix,
-    c_aa: Arc<Array1<f64>>,
-    c_ab: Arc<Array1<f64>>,
-    c_bb: Arc<Array1<f64>>,
-    dim: usize,
-    nrows: usize,
-    pa: usize,
+    pub(crate) x_a: DesignMatrix,
+    pub(crate) x_b: DesignMatrix,
+    pub(crate) c_aa: Arc<Array1<f64>>,
+    pub(crate) c_ab: Arc<Array1<f64>>,
+    pub(crate) c_bb: Arc<Array1<f64>>,
+    pub(crate) dim: usize,
+    pub(crate) nrows: usize,
+    pub(crate) pa: usize,
 }
 
 impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRowCoeffOperator {
@@ -606,13 +606,13 @@ impl DesignTwoBlockRowCoeffOperator {
 /// is Θ(n (p_mu + p_ls)) per `Hv` rather than Θ(n (p_mu + p_ls)²) to form
 /// the dense matrix.
 pub(crate) struct GaussianLocationScaleHessianWorkspace {
-    family: GaussianLocationScaleFamily,
-    block_states: Vec<ParameterBlockState>,
-    xmu: Arc<Array2<f64>>,
-    x_ls: Arc<Array2<f64>>,
-    coeff_mm: Array1<f64>,
-    coeff_ml: Array1<f64>,
-    coeff_ll: Array1<f64>,
+    pub(crate) family: GaussianLocationScaleFamily,
+    pub(crate) block_states: Vec<ParameterBlockState>,
+    pub(crate) xmu: Arc<Array2<f64>>,
+    pub(crate) x_ls: Arc<Array2<f64>>,
+    pub(crate) coeff_mm: Array1<f64>,
+    pub(crate) coeff_ml: Array1<f64>,
+    pub(crate) coeff_ll: Array1<f64>,
 }
 
 impl GaussianLocationScaleHessianWorkspace {

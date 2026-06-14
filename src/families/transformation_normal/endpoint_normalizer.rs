@@ -167,7 +167,7 @@ pub(crate) fn log_normal_cdf_diff_derivatives(
     })
 }
 
-fn log_normal_cdf_diff_tower(
+pub(crate) fn log_normal_cdf_diff_tower(
     upper_var: Tower4<2>,
     lower_var: Tower4<2>,
     upper: f64,
@@ -217,7 +217,7 @@ fn log_normal_cdf_diff_tower(
     Ok(tower)
 }
 
-fn log_normal_cdf_diff_tower_ordered(
+pub(crate) fn log_normal_cdf_diff_tower_ordered(
     upper_var: Tower4<2>,
     lower_var: Tower4<2>,
     upper: f64,
@@ -247,7 +247,7 @@ fn log_normal_cdf_diff_tower_ordered(
 mod tests {
     use super::*;
 
-    fn hand_factorial(n: usize) -> f64 {
+    pub(crate) fn hand_factorial(n: usize) -> f64 {
         match n {
             0 | 1 => 1.0,
             2 => 2.0,
@@ -263,7 +263,7 @@ mod tests {
         }
     }
 
-    fn hand_poly_mul_truncated(a: &[[f64; 5]; 5], b: &[[f64; 5]; 5]) -> [[f64; 5]; 5] {
+    pub(crate) fn hand_poly_mul_truncated(a: &[[f64; 5]; 5], b: &[[f64; 5]; 5]) -> [[f64; 5]; 5] {
         let mut out = [[0.0; 5]; 5];
         for ia in 0..=4 {
             for ib in 0..=(4 - ia) {
@@ -284,7 +284,7 @@ mod tests {
         out
     }
 
-    fn hand_signed_normal_pdf_ratio(
+    pub(crate) fn hand_signed_normal_pdf_ratio(
         x: f64,
         polynomial_factor: f64,
         log_z: f64,
@@ -293,7 +293,7 @@ mod tests {
         if polynomial_factor == 0.0 {
             return 0.0;
         }
-        const LOG_SQRT_2PI: f64 = 0.918_938_533_204_672_7;
+        pub(crate) const LOG_SQRT_2PI: f64 = 0.918_938_533_204_672_7;
         let log_abs = polynomial_factor.abs().ln()
             - 0.5 * x * x
             - LOG_SQRT_2PI
@@ -302,7 +302,7 @@ mod tests {
         polynomial_factor.signum() * log_abs.exp()
     }
 
-    fn hand_log_normal_cdf_diff_derivatives(
+    pub(crate) fn hand_log_normal_cdf_diff_derivatives(
         upper: f64,
         lower: f64,
     ) -> Result<LogNormalCdfDiffDerivatives, String> {
@@ -385,11 +385,11 @@ mod tests {
         })
     }
 
-    fn rel_error(actual: f64, expected: f64, floor: f64) -> f64 {
+    pub(crate) fn rel_error(actual: f64, expected: f64, floor: f64) -> f64 {
         (actual - expected).abs() / expected.abs().max(floor).max(1e-300)
     }
 
-    fn max_relative_error(
+    pub(crate) fn max_relative_error(
         actual: &LogNormalCdfDiffDerivatives,
         expected: &LogNormalCdfDiffDerivatives,
     ) -> f64 {
@@ -444,25 +444,25 @@ mod tests {
     }
 
     #[test]
-    fn tower_endpoint_normalizer_matches_hand_witness_across_ctn_regimes() {
-        struct Regime {
-            name: &'static str,
-            cases: &'static [(f64, f64)],
-            rel_tol: f64,
+    pub(crate) fn tower_endpoint_normalizer_matches_hand_witness_across_ctn_regimes() {
+        pub(crate) struct Regime {
+            pub(crate) name: &'static str,
+            pub(crate) cases: &'static [(f64, f64)],
+            pub(crate) rel_tol: f64,
         }
 
-        const WIDE: &[(f64, f64)] = &[(-2.0, -7.5), (2.0, -3.0), (8.0, -8.0)];
-        const NARROW: &[(f64, f64)] = &[(-0.249_999, -0.25), (1.000_001, 1.0), (-3.999_999, -4.0)];
-        const BOTH_POS_TAIL: &[(f64, f64)] = &[(6.5, 6.0), (8.0, 7.9), (8.0, 7.0)];
-        const BOTH_NEG_TAIL: &[(f64, f64)] = &[(-6.0, -6.5), (-7.9, -8.0), (-7.0, -8.0)];
-        const STRADDLING: &[(f64, f64)] = &[(-0.1, -2.0), (0.1, -0.1), (3.0, -4.0)];
-        const NEAR_EQUAL: &[(f64, f64)] = &[
+        pub(crate) const WIDE: &[(f64, f64)] = &[(-2.0, -7.5), (2.0, -3.0), (8.0, -8.0)];
+        pub(crate) const NARROW: &[(f64, f64)] = &[(-0.249_999, -0.25), (1.000_001, 1.0), (-3.999_999, -4.0)];
+        pub(crate) const BOTH_POS_TAIL: &[(f64, f64)] = &[(6.5, 6.0), (8.0, 7.9), (8.0, 7.0)];
+        pub(crate) const BOTH_NEG_TAIL: &[(f64, f64)] = &[(-6.0, -6.5), (-7.9, -8.0), (-7.0, -8.0)];
+        pub(crate) const STRADDLING: &[(f64, f64)] = &[(-0.1, -2.0), (0.1, -0.1), (3.0, -4.0)];
+        pub(crate) const NEAR_EQUAL: &[(f64, f64)] = &[
             (1.0e-10, 0.0),
             (-0.999_999_999_999, -1.0),
             (7.000_000_001, 7.0),
             (-7.0, -7.000_000_001),
         ];
-        const REGIMES: &[Regime] = &[
+        pub(crate) const REGIMES: &[Regime] = &[
             Regime {
                 name: "wide windows",
                 cases: WIDE,

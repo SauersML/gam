@@ -479,14 +479,14 @@ pub trait HyperOperator: Send + Sync {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ProjectedFactorKey {
-    design_id: usize,
-    factor_ptr: usize,
-    rows: usize,
-    cols: usize,
-    row_stride: isize,
-    col_stride: isize,
-    value_hash: u64,
-    value_hash2: u64,
+    pub(crate) design_id: usize,
+    pub(crate) factor_ptr: usize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) row_stride: isize,
+    pub(crate) col_stride: isize,
+    pub(crate) value_hash: u64,
+    pub(crate) value_hash2: u64,
 }
 
 
@@ -508,7 +508,7 @@ impl ProjectedFactorKey {
 }
 
 
-fn projected_factor_value_fingerprint(factor: ArrayView2<'_, f64>) -> (u64, u64) {
+pub(crate) fn projected_factor_value_fingerprint(factor: ArrayView2<'_, f64>) -> (u64, u64) {
     let mut h1 = 0xcbf2_9ce4_8422_2325_u64;
     let mut h2 = 0x9e37_79b1_85eb_ca87_u64;
     for (idx, value) in factor.iter().enumerate() {
@@ -543,43 +543,43 @@ fn projected_factor_value_fingerprint(factor: ArrayView2<'_, f64>) -> (u64, u64)
 /// ~243 MiB and a sweep over many distinct factors could otherwise
 /// pin tens of GiB.
 pub struct ProjectedFactorCache {
-    inner: Mutex<ProjectedFactorCacheInner>,
+    pub(crate) inner: Mutex<ProjectedFactorCacheInner>,
 }
 
 
-struct ProjectedFactorCacheInner {
-    entries: HashMap<ProjectedFactorKey, ProjectedFactorEntry>,
-    in_progress: HashMap<ProjectedFactorKey, Arc<ProjectedFactorInProgress>>,
-    next_seq: u64,
-    total_bytes: usize,
-    budget_bytes: usize,
+pub(crate) struct ProjectedFactorCacheInner {
+    pub(crate) entries: HashMap<ProjectedFactorKey, ProjectedFactorEntry>,
+    pub(crate) in_progress: HashMap<ProjectedFactorKey, Arc<ProjectedFactorInProgress>>,
+    pub(crate) next_seq: u64,
+    pub(crate) total_bytes: usize,
+    pub(crate) budget_bytes: usize,
 }
 
 
-struct ProjectedFactorInProgress {
-    state: Mutex<Option<ProjectedFactorInProgressState>>,
-    ready: Condvar,
+pub(crate) struct ProjectedFactorInProgress {
+    pub(crate) state: Mutex<Option<ProjectedFactorInProgressState>>,
+    pub(crate) ready: Condvar,
     /// Number of threads currently parked inside the `Wait` branch for this
     /// in-progress slot. Producer panics-recovery tests use this to block
     /// (via [`subscriber_arrived`]) on subscriber arrival deterministically.
-    waiter_count: std::sync::atomic::AtomicUsize,
+    pub(crate) waiter_count: std::sync::atomic::AtomicUsize,
     /// Notifies once a subscriber has incremented `waiter_count`. Producer
     /// panics-recovery tests park on this condvar so they don't have to
     /// spin or sleep waiting for the race window to close.
-    subscriber_arrived: (Mutex<()>, Condvar),
+    pub(crate) subscriber_arrived: (Mutex<()>, Condvar),
 }
 
 
-enum ProjectedFactorInProgressState {
+pub(crate) enum ProjectedFactorInProgressState {
     Ready(Arc<Array2<f64>>),
     Failed,
 }
 
 
-struct ProjectedFactorEntry {
-    value: Arc<Array2<f64>>,
-    bytes: usize,
-    last_used: u64,
+pub(crate) struct ProjectedFactorEntry {
+    pub(crate) value: Arc<Array2<f64>>,
+    pub(crate) bytes: usize,
+    pub(crate) last_used: u64,
 }
 
 
@@ -619,7 +619,7 @@ impl ProjectedFactorCache {
         key: ProjectedFactorKey,
         compute: impl FnOnce() -> Array2<f64>,
     ) -> Arc<Array2<f64>> {
-        enum CacheLookup {
+        pub(crate) enum CacheLookup {
             Hit(Arc<Array2<f64>>),
             Wait(Arc<ProjectedFactorInProgress>),
             Compute(Arc<ProjectedFactorInProgress>),
@@ -874,7 +874,7 @@ pub struct CompositeHyperOperator {
 /// `c_x_psi_beta` are threaded in individually so the batched path matches
 /// the per-axis path exactly. Non-implicit operators and singleton groups
 /// fall through to the original per-op trace path.
-fn composite_trace_implicit_batched(
+pub(crate) fn composite_trace_implicit_batched(
     operators: &[Arc<dyn HyperOperator>],
     factor: &Array2<f64>,
     cache: Option<&ProjectedFactorCache>,
@@ -952,7 +952,7 @@ fn composite_trace_implicit_batched(
 /// [`CompositeHyperOperator`].  It returns one exact `tr(Fᵀ B_i F)` value per
 /// input operator while sharing the expensive `X·F` projection and Duchon
 /// row-kernel sweeps across sibling implicit ψ/ρ axes.
-fn trace_projected_factors_batched(
+pub(crate) fn trace_projected_factors_batched(
     operators: &[Arc<dyn HyperOperator>],
     factor: &Array2<f64>,
     cache: &ProjectedFactorCache,
@@ -1181,7 +1181,7 @@ pub(crate) fn project_hyper_operators_batched(
 }
 
 
-fn trace_logdet_drifts_projected_factor_batched(
+pub(crate) fn trace_logdet_drifts_projected_factor_batched(
     drifts: &[DriftDerivResult],
     factor: &Array2<f64>,
     cache: &ProjectedFactorCache,
@@ -1764,7 +1764,7 @@ impl HyperCoordDrift {
         }
     }
 
-    fn infer_dim(&self) -> usize {
+    pub(crate) fn infer_dim(&self) -> usize {
         if let Some(d) = &self.dense {
             return d.nrows();
         }
@@ -1803,7 +1803,7 @@ mod implicit_matvec_scratch {
     }
 
     impl Scratch {
-        const fn new() -> Self {
+        pub(crate) const fn new() -> Self {
             Self {
                 x_v: Vec::new(),
                 n_work: Vec::new(),
@@ -1813,7 +1813,7 @@ mod implicit_matvec_scratch {
     }
 
     thread_local! {
-        static SCRATCH: RefCell<Scratch> = const { RefCell::new(Scratch::new()) };
+        pub(crate) static SCRATCH: RefCell<Scratch> = const { RefCell::new(Scratch::new()) };
     }
 
     pub(super) fn with<R>(f: impl FnOnce(&mut Scratch) -> R) -> R {
@@ -2070,8 +2070,8 @@ impl HyperOperator for ImplicitHyperOperator {
 /// progress per block, capped at the total row count. Shared by the implicit
 /// operator's row-streaming kernels so they cannot drift apart.
 pub(crate) fn byte_balanced_row_chunk(cols: usize, n_rows: usize) -> usize {
-    const TARGET_BYTES: usize = 8 * 1024 * 1024;
-    const MIN_CHUNK_ROWS: usize = 512;
+    pub(crate) const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    pub(crate) const MIN_CHUNK_ROWS: usize = 512;
     let bytes_per_row = cols.max(1) * std::mem::size_of::<f64>();
     (TARGET_BYTES / bytes_per_row)
         .max(MIN_CHUNK_ROWS)
@@ -2087,7 +2087,7 @@ impl ImplicitHyperOperator {
     /// rule. Caller wraps this in [`Self::cached_xf`] when invariance
     /// across ψ-axes lets one matrix serve every axis at this `(x_design,
     /// factor)` pair.
-    fn compute_xf(&self, factor: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn compute_xf(&self, factor: &Array2<f64>) -> Array2<f64> {
         let n_obs = self.w_diag.len();
         let rank = factor.ncols();
         let mut xf = Array2::<f64>::zeros((n_obs, rank));
@@ -2123,7 +2123,7 @@ impl ImplicitHyperOperator {
     /// built atop the same `x_design` (e.g. axis-0 and axis-1 of a 32-axis
     /// ψ-block) consult the same cache slot and hit after the first
     /// computes.
-    fn cached_xf(&self, factor: &Array2<f64>, cache: &ProjectedFactorCache) -> Arc<Array2<f64>> {
+    pub(crate) fn cached_xf(&self, factor: &Array2<f64>, cache: &ProjectedFactorCache) -> Arc<Array2<f64>> {
         let design_id = Arc::as_ptr(&self.x_design) as usize;
         let key = ProjectedFactorKey::from_factor_view(design_id, factor.view());
         cache.get_or_insert_with(key, || self.compute_xf(factor))
@@ -2135,7 +2135,7 @@ impl ImplicitHyperOperator {
     /// per-axis work is the row-kernel build (`row_chunk_first_raw`),
     /// the `K_d · U_knot` GEMM, the fused `⟨W ⊙ DXF, XF⟩` inner products,
     /// and the small dense penalty contraction.
-    fn trace_projected_factor_with_xf(&self, factor: &Array2<f64>, xf: ArrayView2<'_, f64>) -> f64 {
+    pub(crate) fn trace_projected_factor_with_xf(&self, factor: &Array2<f64>, xf: ArrayView2<'_, f64>) -> f64 {
         let rank = factor.ncols();
         let n_obs = self.w_diag.len();
         assert_eq!(xf.dim(), (n_obs, rank));
@@ -2198,7 +2198,7 @@ impl ImplicitHyperOperator {
     /// Returns `tr(Fᵀ B_d F)` for every `(axis, s_psi, c_x_psi_beta)` triple
     /// in `axes`, sharing the unproject-and-row-sweep work across axes that
     /// only differ in their axis index / penalty matrix / correction vector.
-    fn trace_projected_factor_all_axes_with_xf(
+    pub(crate) fn trace_projected_factor_all_axes_with_xf(
         &self,
         factor: &Array2<f64>,
         xf: ArrayView2<'_, f64>,
@@ -2262,7 +2262,7 @@ impl ImplicitHyperOperator {
             .collect()
     }
 
-    fn accumulate_c_correction_xt_into(
+    pub(crate) fn accumulate_c_correction_xt_into(
         &self,
         x_col: ArrayView1<'_, f64>,
         mut n_work: ArrayViewMut1<'_, f64>,
@@ -2284,7 +2284,7 @@ impl ImplicitHyperOperator {
         out_col += &p_work;
     }
 
-    fn c_correction_bilinear(&self, x_v: &Array1<f64>, x_u: &Array1<f64>) -> f64 {
+    pub(crate) fn c_correction_bilinear(&self, x_v: &Array1<f64>, x_u: &Array1<f64>) -> f64 {
         let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() else {
             return 0.0;
         };

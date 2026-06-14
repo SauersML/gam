@@ -139,7 +139,7 @@ impl SaeAtomBasisKind {
     }
 }
 
-fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
+pub(crate) fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     use std::f64::consts::PI;
     let r = resolution.max(2);
     let mut grid = Array2::<f64>::zeros((r * r, 2));
@@ -154,7 +154,7 @@ fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     Some(grid)
 }
 
-fn cylinder_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
+pub(crate) fn cylinder_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     // Sweep the periodic (circle) axis over one period in fraction-of-period
     // coordinates `[0, 1)`; hold the unbounded line axis at the hull-centered
     // seed `0`. The Newton retraction recovers any line offset from there.
@@ -167,11 +167,11 @@ fn cylinder_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     Some(grid)
 }
 
-fn torus_projection_seed_grid(latent_dim: usize, resolution: usize) -> Option<Array2<f64>> {
+pub(crate) fn torus_projection_seed_grid(latent_dim: usize, resolution: usize) -> Option<Array2<f64>> {
     if latent_dim == 0 || latent_dim >= usize::BITS as usize {
         return None;
     }
-    const MAX_GRID_POINTS: usize = 4096;
+    pub(crate) const MAX_GRID_POINTS: usize = 4096;
     let min_points = 1usize << latent_dim;
     if min_points > MAX_GRID_POINTS {
         return None;
@@ -286,7 +286,7 @@ impl ArdAxisPrior {
 /// the `e^{x}/√x` envelope out lets the log-partition and the `I1/I0` ratio be
 /// computed without ever materialising `e^{x}` (which overflows to `+inf` for
 /// `x ≳ 709`, see [`bessel_i0_log_and_ratio`]).
-fn bessel_i0_scaled_poly(ax: f64) -> f64 {
+pub(crate) fn bessel_i0_scaled_poly(ax: f64) -> f64 {
     let y = 3.75 / ax;
     0.39894228
         + y * (0.01328592
@@ -301,7 +301,7 @@ fn bessel_i0_scaled_poly(ax: f64) -> f64 {
 /// *exponentially-scaled* `I1`: `√x · e^{−x} · I1(x) ≈ poly(3.75/x)`. Pairs with
 /// [`bessel_i0_scaled_poly`] so their shared `e^{x}/√x` envelope cancels exactly
 /// in the `I1/I0` ratio.
-fn bessel_i1_scaled_poly(ax: f64) -> f64 {
+pub(crate) fn bessel_i1_scaled_poly(ax: f64) -> f64 {
     let y = 3.75 / ax;
     0.39894228
         + y * (-0.03988024
@@ -318,7 +318,7 @@ fn bessel_i1_scaled_poly(ax: f64) -> f64 {
 /// approximations; relative error < 1.6e-7 / 1.9e-7 respectively, which is far
 /// below the precision tolerance the ARD normaliser is read at. `I0` is even,
 /// so only `|x|` enters. Used for the exact von-Mises precision log-partition.
-fn bessel_i0(x: f64) -> f64 {
+pub(crate) fn bessel_i0(x: f64) -> f64 {
     let ax = x.abs();
     if ax < 3.75 {
         let t = x / 3.75;
@@ -337,7 +337,7 @@ fn bessel_i0(x: f64) -> f64 {
 /// Uses the Abramowitz & Stegun approximations paired with [`bessel_i0`]. This is
 /// needed only for the derivative of the periodic ARD precision normalizer
 /// `log I0(η)`, whose derivative is `I1(η) / I0(η)`.
-fn bessel_i1(x: f64) -> f64 {
+pub(crate) fn bessel_i1(x: f64) -> f64 {
     let ax = x.abs();
     let value = if ax < 3.75 {
         let t = x / 3.75;
@@ -1135,8 +1135,8 @@ impl SaeManifoldAtom {
         // a vanishing-speed coefficient at a small fraction of the typical
         // speed rather than a singular negative power, and clamps any non-finite
         // ratio back to a finite weight.
-        const RELATIVE_SPEED_FLOOR: f64 = 1.0e-6;
-        const RELATIVE_SPEED_CEIL: f64 = 1.0e6;
+        pub(crate) const RELATIVE_SPEED_FLOOR: f64 = 1.0e-6;
+        pub(crate) const RELATIVE_SPEED_CEIL: f64 = 1.0e6;
         let mut root_w = vec![0.0_f64; m];
         for col in 0..m {
             // Normalised squared speed (ratio to the geometric-mean center),
@@ -1174,7 +1174,7 @@ impl SaeManifoldAtom {
 /// Numerical null space: eigenvalues at or below `1e-9 · max_eig` (the same
 /// conventional relative spectral cutoff [`SaeManifoldTerm::symmetric_rank`]
 /// uses for `S`'s rank).
-fn smooth_penalty_nullity(s: &Array2<f64>) -> Result<usize, String> {
+pub(crate) fn smooth_penalty_nullity(s: &Array2<f64>) -> Result<usize, String> {
     let m = s.ncols();
     if m == 0 {
         return Ok(0);

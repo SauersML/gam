@@ -5,42 +5,42 @@
 use super::*;
 
 pub(crate) struct BinomialLocationScaleCore {
-    sigma: Array1<f64>,
-    dsigma_deta: Array1<f64>,
-    q0: Array1<f64>,
-    mu: Array1<f64>,
-    dmu_dq: Array1<f64>,
-    d2mu_dq2: Array1<f64>,
-    d3mu_dq3: Array1<f64>,
-    log_likelihood: f64,
+    pub(crate) sigma: Array1<f64>,
+    pub(crate) dsigma_deta: Array1<f64>,
+    pub(crate) q0: Array1<f64>,
+    pub(crate) mu: Array1<f64>,
+    pub(crate) dmu_dq: Array1<f64>,
+    pub(crate) d2mu_dq2: Array1<f64>,
+    pub(crate) d3mu_dq3: Array1<f64>,
+    pub(crate) log_likelihood: f64,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct NonWiggleQDerivs {
-    q_t: f64,
-    q_ls: f64,
-    q_tl: f64,
-    q_ll: f64,
-    q_tl_ls: f64,
-    q_ll_ls: f64,
+    pub(crate) q_t: f64,
+    pub(crate) q_ls: f64,
+    pub(crate) q_tl: f64,
+    pub(crate) q_ll: f64,
+    pub(crate) q_tl_ls: f64,
+    pub(crate) q_ll_ls: f64,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct NonWiggleQDirectional {
-    delta_q: f64,
-    delta_q_t: f64,
-    delta_q_ls: f64,
-    delta_q_tl: f64,
-    delta_q_ll: f64,
+    pub(crate) delta_q: f64,
+    pub(crate) delta_q_t: f64,
+    pub(crate) delta_q_ls: f64,
+    pub(crate) delta_q_tl: f64,
+    pub(crate) delta_q_ll: f64,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct BinomialLocationScaleRow {
-    sigma: f64,
-    dsigma_deta: f64,
-    q0: f64,
-    inverse_link: crate::mixture_link::InverseLinkJet,
-    ll: f64,
+    pub(crate) sigma: f64,
+    pub(crate) dsigma_deta: f64,
+    pub(crate) q0: f64,
+    pub(crate) inverse_link: crate::mixture_link::InverseLinkJet,
+    pub(crate) ll: f64,
 }
 
 /// Non-wiggle location-scale map derivatives via shared scalar core.
@@ -399,7 +399,7 @@ pub(crate) fn binomial_location_scale_core(
     /// ensures the pointers outlive the parallel region (see SAFETY: notes
     /// on each `unsafe` site below).
     #[derive(Clone, Copy)]
-    struct SendPtr(*mut f64);
+    pub(crate) struct SendPtr(*mut f64);
     // SAFETY: pointers are constructed from live writable buffers and used
     // only for disjoint per-row writes inside a bounded parallel region; the
     // owning `Vec`s outlive the region.

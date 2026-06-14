@@ -1433,18 +1433,18 @@ impl BinomialLocationScaleFamily {
         // derivatives are O(n) at large scale and are called O(K) times per
         // outer REML gradient (K = number of psi coords), so a parallel pass is
         // worthwhile here.
-        struct PsiTermsRow {
-            r_t: f64,
-            r_ls: f64,
-            dr_t: f64,
-            dr_ls: f64,
-            h_tt: f64,
-            h_tl: f64,
-            h_ll: f64,
-            dh_tt: f64,
-            dh_tl: f64,
-            dh_ll: f64,
-            obj: f64,
+        pub(crate) struct PsiTermsRow {
+            pub(crate) r_t: f64,
+            pub(crate) r_ls: f64,
+            pub(crate) dr_t: f64,
+            pub(crate) dr_ls: f64,
+            pub(crate) h_tt: f64,
+            pub(crate) h_tl: f64,
+            pub(crate) h_ll: f64,
+            pub(crate) dh_tt: f64,
+            pub(crate) dh_tl: f64,
+            pub(crate) dh_ll: f64,
+            pub(crate) obj: f64,
         }
         let y_p = self.y.as_slice().expect("y must be contiguous");
         let w_p = self.weights.as_slice().expect("weights must be contiguous");
@@ -1824,28 +1824,28 @@ impl BinomialLocationScaleFamily {
         let mut d2h_tl = Array1::<f64>::zeros(n);
         let mut d2h_ll = Array1::<f64>::zeros(n);
         let mut objective_psi_psi = 0.0;
-        struct PsiSecondRow {
-            r_t: f64,
-            r_ls: f64,
-            dr_t_i: f64,
-            dr_t_j: f64,
-            dr_ls_i: f64,
-            dr_ls_j: f64,
-            d2r_t: f64,
-            d2r_ls: f64,
-            h_tt: f64,
-            h_tl: f64,
-            h_ll: f64,
-            dh_tt_i: f64,
-            dh_tt_j: f64,
-            dh_tl_i: f64,
-            dh_tl_j: f64,
-            dh_ll_i: f64,
-            dh_ll_j: f64,
-            d2h_tt: f64,
-            d2h_tl: f64,
-            d2h_ll: f64,
-            objective: f64,
+        pub(crate) struct PsiSecondRow {
+            pub(crate) r_t: f64,
+            pub(crate) r_ls: f64,
+            pub(crate) dr_t_i: f64,
+            pub(crate) dr_t_j: f64,
+            pub(crate) dr_ls_i: f64,
+            pub(crate) dr_ls_j: f64,
+            pub(crate) d2r_t: f64,
+            pub(crate) d2r_ls: f64,
+            pub(crate) h_tt: f64,
+            pub(crate) h_tl: f64,
+            pub(crate) h_ll: f64,
+            pub(crate) dh_tt_i: f64,
+            pub(crate) dh_tt_j: f64,
+            pub(crate) dh_tl_i: f64,
+            pub(crate) dh_tl_j: f64,
+            pub(crate) dh_ll_i: f64,
+            pub(crate) dh_ll_j: f64,
+            pub(crate) d2h_tt: f64,
+            pub(crate) d2h_tl: f64,
+            pub(crate) d2h_ll: f64,
+            pub(crate) objective: f64,
         }
         let y_p = self.y.as_slice().expect("y must be contiguous");
         let w_p = self.weights.as_slice().expect("weights must be contiguous");

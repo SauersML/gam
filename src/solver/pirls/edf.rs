@@ -359,7 +359,7 @@ mod tests {
     /// `r > p` path on the dense EDF entry point and asserts that the floor is
     /// honored (no panic, finite EDF in `[0, p]`).
     #[test]
-    fn calculate_edf_floors_when_penalty_rank_exceeds_coefficient_dim() {
+    pub(crate) fn calculate_edf_floors_when_penalty_rank_exceeds_coefficient_dim() {
         // p = 2 coefficients, r = 3 penalty rows (r > p).
         let p = 2usize;
         // SPD penalized Hessian (well-conditioned, dense path).

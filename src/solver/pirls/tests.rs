@@ -36,7 +36,7 @@ mod tests {
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ShapeBuilder, array};
 
     #[test]
-    fn dense_workspace_xtwx_preserves_signed_observed_weights() {
+    pub(crate) fn dense_workspace_xtwx_preserves_signed_observed_weights() {
         let x = array![[1.0, 2.0], [3.0, -1.0], [-2.0, 4.0], [0.5, -3.0]];
         let weights = array![2.0, -1.5, 0.25, -3.0];
         let mut workspace = PirlsWorkspace::new(x.nrows(), x.ncols(), 0, 0);
@@ -63,7 +63,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_pirls_diagnostics_preserve_nonstandard_inverse_link() {
+    pub(crate) fn firth_pirls_diagnostics_preserve_nonstandard_inverse_link() {
         let x = array![[1.0, -1.2], [1.0, -0.3], [1.0, 0.4], [1.0, 1.1], [1.0, 1.8],];
         let eta = array![-1.4, -0.5, 0.2, 0.9, 1.4];
         let observation_weights = array![1.0, 0.7, 1.3, 0.9, 1.1];
@@ -110,7 +110,7 @@ mod tests {
     /// Contract:
     /// - Gaussian (Identity): residual standard deviation sigma
     /// - Binomial links: fixed at 1.0 as in mgcv
-    fn calculate_scale(
+    pub(crate) fn calculate_scale(
         beta: &Array1<f64>,
         x: ArrayView2<f64>,
         y: ArrayView1<f64>,
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn madsen_lm_reject_trajectory_doubles_per_rejection() {
+    pub(crate) fn madsen_lm_reject_trajectory_doubles_per_rejection() {
         // The companion to the accept update: on rejection, `loop_lambda`
         // is multiplied by `madsen_reject_factor` (initially 2.0), then
         // the factor doubles. Replaces the older fixed ×10 every time.
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn madsen_lm_accept_factor_matches_canonical_textbook_values() {
+    pub(crate) fn madsen_lm_accept_factor_matches_canonical_textbook_values() {
         // Madsen-Nielsen-Tingleff Eq 3.17 canonical values. Locks the
         // implementation against silent regression to the older binary
         // `if rho > 0.25 { lambda /= 10 } else { keep }` rule.
@@ -228,19 +228,19 @@ mod tests {
     /// Outputs of a single log-link working-state write: `mu`, `weights`, `z`,
     /// and the four derivative buffers. Used by the parity test to compare the
     /// unified engine against the independent pre-unification reference math.
-    struct LogLinkWorkingOutputs {
-        mu: Array1<f64>,
-        weights: Array1<f64>,
-        z: Array1<f64>,
-        c: Array1<f64>,
-        d: Array1<f64>,
-        dmu_deta: Array1<f64>,
-        d2mu_deta2: Array1<f64>,
-        d3mu_deta3: Array1<f64>,
+    pub(crate) struct LogLinkWorkingOutputs {
+        pub(crate) mu: Array1<f64>,
+        pub(crate) weights: Array1<f64>,
+        pub(crate) z: Array1<f64>,
+        pub(crate) c: Array1<f64>,
+        pub(crate) d: Array1<f64>,
+        pub(crate) dmu_deta: Array1<f64>,
+        pub(crate) d2mu_deta2: Array1<f64>,
+        pub(crate) d3mu_deta3: Array1<f64>,
     }
 
     impl LogLinkWorkingOutputs {
-        fn zeros(n: usize) -> Self {
+        pub(crate) fn zeros(n: usize) -> Self {
             Self {
                 mu: Array1::zeros(n),
                 weights: Array1::zeros(n),
@@ -253,7 +253,7 @@ mod tests {
             }
         }
 
-        fn assert_matches(&self, other: &Self, family: &str) {
+        pub(crate) fn assert_matches(&self, other: &Self, family: &str) {
             for (name, lhs, rhs) in [
                 ("mu", &self.mu, &other.mu),
                 ("weights", &self.weights, &other.weights),
@@ -279,7 +279,7 @@ mod tests {
     /// Representative `(eta, y, prior_weight)` rows exercising the shared engine
     /// edge cases: ordinary rows, the `eta` clamp (`|eta| > 700`), the
     /// `MIN_WEIGHT` floor (tiny prior weight), and a zero-prior dropped row.
-    fn log_link_parity_rows() -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    pub(crate) fn log_link_parity_rows() -> (Array1<f64>, Array1<f64>, Array1<f64>) {
         let eta = array![-2.3, 0.0, 1.7, 4.2, -800.0, 900.0, -3.0, 0.5];
         let y = array![0.0, 1.0, 3.0, 12.0, 0.0, 25.0, 2.0, 1.0];
         // Row 6 carries a tiny prior weight to trip the MIN_WEIGHT floor; row 7
@@ -289,7 +289,7 @@ mod tests {
     }
 
     /// Pre-unification Poisson reference: `V(mu) = mu`, canonical-link curvature.
-    fn reference_poisson(
+    pub(crate) fn reference_poisson(
         eta: &Array1<f64>,
         y: &Array1<f64>,
         prior: &Array1<f64>,
@@ -321,7 +321,7 @@ mod tests {
 
     /// Pre-unification Gamma reference: weight `prior * shape`, unfloored, no
     /// curvature, `mu`-jet never zeroed on clamp.
-    fn reference_gamma(
+    pub(crate) fn reference_gamma(
         eta: &Array1<f64>,
         y: &Array1<f64>,
         prior: &Array1<f64>,
@@ -343,7 +343,7 @@ mod tests {
 
     /// Pre-unification Tweedie reference: weight `prior * mu^(2-p) / phi`, the
     /// `mu`-jet zeroed on clamp, curvature `(2-p) * w`, `(2-p)^2 * w`.
-    fn reference_tweedie(
+    pub(crate) fn reference_tweedie(
         eta: &Array1<f64>,
         y: &Array1<f64>,
         prior: &Array1<f64>,
@@ -381,7 +381,7 @@ mod tests {
 
     /// Pre-unification negative-binomial reference: numerically-stable Fisher
     /// weight `mu * theta / (theta + mu)`, curvature from the NB variance jet.
-    fn reference_negbin(
+    pub(crate) fn reference_negbin(
         eta: &Array1<f64>,
         y: &Array1<f64>,
         prior: &Array1<f64>,
@@ -420,7 +420,7 @@ mod tests {
 
     /// Run a unified log-link writer through both its derivative and
     /// no-derivative branches and collect the buffers.
-    fn run_unified<F>(n: usize, write: F) -> (LogLinkWorkingOutputs, LogLinkWorkingOutputs)
+    pub(crate) fn run_unified<F>(n: usize, write: F) -> (LogLinkWorkingOutputs, LogLinkWorkingOutputs)
     where
         F: Fn(
             &mut Array1<f64>,
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn log_link_working_state_engine_matches_per_family_reference() {
+    pub(crate) fn log_link_working_state_engine_matches_per_family_reference() {
         // The unified `write_log_link_working_state` engine must reproduce the
         // exact pre-unification per-family row math bit-for-bit: `mu`, `weights`,
         // working response `z`, and the curvature buffers `c`/`d`, across every
@@ -545,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_scale_uses_offset_in_residuals() {
+    pub(crate) fn gaussian_scale_uses_offset_in_residuals() {
         // Perfect fit only if offset is included: y = offset + Xβ.
         // If offset were dropped, weighted RSS would be non-zero.
         let x = array![[1.0], [2.0], [3.0]];
@@ -572,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_scale_matchesweighted_sdwith_offset() {
+    pub(crate) fn gaussian_scale_matchesweighted_sdwith_offset() {
         let x = array![[1.0], [2.0], [4.0]];
         let beta = array![1.5];
         let offset = array![0.5, -1.0, 2.0];
@@ -608,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn kkt_diagnosticszero_for_strictly_feasible_stationary_point() {
+    pub(crate) fn kkt_diagnosticszero_for_strictly_feasible_stationary_point() {
         let constraints = LinearInequalityConstraints {
             a: array![[1.0, 0.0], [0.0, 1.0]],
             b: array![0.0, 0.0],
@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn kkt_diagnostics_capture_active_lower_bound_solution() {
+    pub(crate) fn kkt_diagnostics_capture_active_lower_bound_solution() {
         let constraints = LinearInequalityConstraints {
             a: array![[1.0, 0.0], [0.0, 1.0]],
             b: array![0.0, 0.0],
@@ -640,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_constraint_active_set_releases_positive_kkt_systemmultiplier() {
+    pub(crate) fn linear_constraint_active_set_releases_positive_kkt_systemmultiplier() {
         // min_d g^T d + 0.5 d^T H d, subject to A(beta + d) >= b
         // with beta fixed at the lower bound x >= 0 and an upper bound x <= 0.1.
         // The first active-set KKT solve at x=0 yields d=0 and lambda_sys=+1
@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_constraint_active_set_ignores_near_tangential_inactiverows() {
+    pub(crate) fn linear_constraint_active_set_ignores_near_tangential_inactiverows() {
         let hessian = array![[1.0, 0.0], [0.0, 1.0]];
         let gradient = array![-1.0, 0.0];
         let beta = array![0.0, 0.0];
@@ -705,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn default_beta_guess_logit_uses_log_odds_prevalence() {
+    pub(crate) fn default_beta_guess_logit_uses_log_odds_prevalence() {
         let y = array![0.0, 1.0, 1.0, 1.0];
         let w = Array1::ones(4);
         let beta =
@@ -719,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn default_beta_guess_probit_uses_standard_normal_quantile() {
+    pub(crate) fn default_beta_guess_probit_uses_standard_normal_quantile() {
         let y = array![0.0, 1.0, 1.0, 1.0];
         let w = Array1::ones(4);
         let beta =
@@ -736,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_native_decision_rejects_dense_design() {
+    pub(crate) fn sparse_native_decision_rejects_dense_design() {
         let x = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
             [1.0, 0.0],
             [0.0, 1.0]
@@ -748,7 +748,7 @@ mod tests {
         assert_eq!(decision.reason, "design_not_sparse");
     }
 
-    fn fixed_gaussian_beta(
+    pub(crate) fn fixed_gaussian_beta(
         x: Array2<f64>,
         y: Array1<f64>,
         penalties: Vec<crate::smooth::BlockwisePenalty>,
@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn constant_prior_mean_centers_penalty() {
+    pub(crate) fn constant_prior_mean_centers_penalty() {
         let x = Array2::<f64>::zeros((4, 1));
         let y = Array1::<f64>::zeros(4);
         let penalty = crate::smooth::BlockwisePenalty::ridge(0..1, 1.0)
@@ -819,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn functional_prior_mean_recovers_kernel_amplitude() {
+    pub(crate) fn functional_prior_mean_recovers_kernel_amplitude() {
         let x = Array2::<f64>::zeros((5, 3));
         let y = Array1::<f64>::zeros(5);
         let metadata = array![2.0];
@@ -841,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_prior_mean_matches_default_fixed_fit_bitwise() {
+    pub(crate) fn zero_prior_mean_matches_default_fixed_fit_bitwise() {
         let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0], [1.0, 4.0],];
         let y = array![0.5, 1.0, 1.5, 2.0, 2.5];
         let base_penalty = crate::smooth::BlockwisePenalty::ridge(0..2, 1.0);
@@ -856,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn pirls_decision_summary_logs_on_power_of_two_repetitions() {
+    pub(crate) fn pirls_decision_summary_logs_on_power_of_two_repetitions() {
         assert!(!should_log_pirls_decision_summary(1));
         assert!(should_log_pirls_decision_summary(2));
         assert!(!should_log_pirls_decision_summary(3));
@@ -866,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_native_decision_collects_sparse_stats_for_large_sparse_design() {
+    pub(crate) fn sparse_native_decision_collects_sparse_stats_for_large_sparse_design() {
         let triplets: Vec<_> = (0..300).map(|i| Triplet::new(i, i, 1.0)).collect();
         let x = SparseColMat::try_new_from_triplets(300, 300, &triplets)
             .expect("sparse identity should build");
@@ -883,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_native_decision_allows_moderate_sparse_designs_below_old_width_gate() {
+    pub(crate) fn sparse_native_decision_allows_moderate_sparse_designs_below_old_width_gate() {
         let triplets: Vec<_> = (0..64).map(|i| Triplet::new(i, i, 1.0)).collect();
         let x = SparseColMat::try_new_from_triplets(64, 64, &triplets)
             .expect("sparse identity should build");
@@ -900,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_native_decision_rejects_finite_lower_bounds() {
+    pub(crate) fn sparse_native_decision_rejects_finite_lower_bounds() {
         let triplets: Vec<_> = (0..64).map(|i| Triplet::new(i, i, 1.0)).collect();
         let x = SparseColMat::try_new_from_triplets(64, 64, &triplets)
             .expect("sparse identity should build");
@@ -916,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_penalized_assembly_matches_dense_diagonal_case() {
+    pub(crate) fn sparse_penalized_assembly_matches_dense_diagonal_case() {
         let triplets = vec![
             Triplet::new(0, 0, 1.0),
             Triplet::new(1, 1, 2.0),
@@ -960,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn pirls_result_stores_integrated_logit_derivative_jet() {
+    pub(crate) fn pirls_result_stores_integrated_logit_derivative_jet() {
         assert!(file!().ends_with(".rs"));
         let x = array![[1.0], [1.0], [1.0], [1.0], [1.0]];
         let y = array![0.0, 1.0, 0.0, 1.0, 1.0];
@@ -1080,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_logit_working_state_preserves_tail_fisher_mass() {
+    pub(crate) fn pure_logit_working_state_preserves_tail_fisher_mass() {
         let y = array![1.0];
         let eta = array![50.0];
         let priorweights = array![1.0];
@@ -1135,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn noncanonical_binomial_working_state_clamps_saturating_standard_links() {
+    pub(crate) fn noncanonical_binomial_working_state_clamps_saturating_standard_links() {
         for link in [StandardLink::Probit, StandardLink::CLogLog] {
             let y = array![1.0];
             let eta = array![30.0];
@@ -1176,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn gamma_log_deviance_uses_gamma_formula() {
+    pub(crate) fn gamma_log_deviance_uses_gamma_formula() {
         assert!(file!().ends_with(".rs"));
         let y = array![2.0, 5.0];
         let mu = array![1.0, 4.0];
@@ -1197,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn gamma_log_observed_curvature_matches_shape_one_closed_form() {
+    pub(crate) fn gamma_log_observed_curvature_matches_shape_one_closed_form() {
         assert!(file!().ends_with(".rs"));
         let eta = array![0.2, -0.4];
         let mu = eta.mapv(f64::exp);
@@ -1227,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn negative_binomial_log_observed_curvature_matches_size_theta_closed_form() {
+    pub(crate) fn negative_binomial_log_observed_curvature_matches_size_theta_closed_form() {
         assert!(file!().ends_with(".rs"));
         let theta = 2.5;
         let eta = array![0.2, -0.4, 1.1];
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn gamma_log_fit_profiles_shape_instead_of_fixing_one() {
+    pub(crate) fn gamma_log_fit_profiles_shape_instead_of_fixing_one() {
         let x = array![[1.0], [1.0], [1.0], [1.0], [1.0], [1.0]];
         let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
         let w = Array1::ones(y.len());
@@ -1344,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn poisson_cache_rehydration_preserves_log_derivatives() {
+    pub(crate) fn poisson_cache_rehydration_preserves_log_derivatives() {
         let x = array![[1.0], [1.0], [1.0], [1.0]];
         let y = array![1.0, 2.0, 4.0, 8.0];
         let w = Array1::ones(4);
@@ -1436,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_constraint_active_set_releases_stalewarm_boundary_hint() {
+    pub(crate) fn linear_constraint_active_set_releases_stalewarm_boundary_hint() {
         let hessian = array![[2.0]];
         let gradient = array![0.0];
         let beta = array![1e-9];
@@ -1464,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_constraint_active_set_releases_stalewarm_hint() {
+    pub(crate) fn linear_constraint_active_set_releases_stalewarm_hint() {
         let hessian = array![[1.0]];
         let gradient = array![-1.0];
         let beta = array![0.0];
@@ -1494,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn working_set_kkt_diagnostics_use_active_setmultipliers() {
+    pub(crate) fn working_set_kkt_diagnostics_use_active_setmultipliers() {
         let working_constraints = LinearInequalityConstraints {
             a: array![[1.0, 0.0], [2.0, 0.0], [0.0, 1.0]],
             b: array![0.0, 0.0, 0.0],
@@ -1520,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn compress_activeworking_set_groups_near_collinearrows() {
+    pub(crate) fn compress_activeworking_set_groups_near_collinearrows() {
         let constraints = LinearInequalityConstraints {
             a: array![
                 [0.0, 0.5, 0.0],
@@ -1545,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn lower_bound_active_set_releases_stalewarm_boundary_hint() {
+    pub(crate) fn lower_bound_active_set_releases_stalewarm_boundary_hint() {
         let hessian = array![[2.0]];
         let gradient = array![0.0];
         let beta = array![1e-9];
@@ -1570,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn select_active_set_release_worst_violation_picks_most_negative() {
+    pub(crate) fn select_active_set_release_worst_violation_picks_most_negative() {
         // Multipliers λ_i = g_i + (Hd)_i across active = {0, 1, 2}:
         //   i=0: -0.1 (mildly negative)
         //   i=1: -0.5 (most negative)
@@ -1586,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn select_active_set_release_blands_picks_lowest_index_with_negative_multiplier() {
+    pub(crate) fn select_active_set_release_blands_picks_lowest_index_with_negative_multiplier() {
         // Same setup as above. Bland's rule must pick the LOWEST index with a
         // strictly-negative multiplier (i=0), not the most negative (i=1).
         // This is the anti-cycling property — combined with Bland-compatible
@@ -1603,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn select_active_set_release_blands_deadband_ignores_round_off() {
+    pub(crate) fn select_active_set_release_blands_deadband_ignores_round_off() {
         // A multiplier of magnitude 64·ε·|g| is round-off level and must NOT
         // trigger release under Bland's rule. Otherwise pure floating-point
         // noise would cause spurious activate/release transitions and reopen
@@ -1630,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn select_active_set_release_returns_none_when_kkt_satisfied() {
+    pub(crate) fn select_active_set_release_returns_none_when_kkt_satisfied() {
         // All active multipliers ≥ 0 → KKT satisfied → no release, both rules
         // signal termination by returning None.
         let gradient = array![0.5, 1.0, 0.0];
@@ -1647,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn lower_bound_active_set_releases_stalewarm_hint() {
+    pub(crate) fn lower_bound_active_set_releases_stalewarm_hint() {
         let hessian = array![[1.0]];
         let gradient = array![-1.0];
         let beta = array![0.0];
@@ -1682,7 +1682,7 @@ mod root_cause_tests {
     use approx::assert_relative_eq;
     use ndarray::{Array1, Array2, array};
 
-    fn capture_pirls_penalized_deviance<F, R>(run: F) -> (R, Vec<f64>)
+    pub(crate) fn capture_pirls_penalized_deviance<F, R>(run: F) -> (R, Vec<f64>)
     where
         F: FnOnce() -> R,
     {
@@ -1695,7 +1695,7 @@ mod root_cause_tests {
         (result, captured)
     }
 
-    fn scalar_working_state(
+    pub(crate) fn scalar_working_state(
         beta: &Coefficients,
         curvature: HessianCurvatureKind,
         gradient: f64,
@@ -1715,20 +1715,20 @@ mod root_cause_tests {
         }
     }
 
-    fn test_working_state(beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
+    pub(crate) fn test_working_state(beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
         scalar_working_state(beta, curvature, 1.0, 1.0)
     }
 
     #[derive(Default)]
-    struct CandidateEvalFailureModel {
-        observed_updates: usize,
-        fisher_updates: usize,
-        observed_candidate_calls: usize,
-        fisher_candidate_calls: usize,
+    pub(crate) struct CandidateEvalFailureModel {
+        pub(crate) observed_updates: usize,
+        pub(crate) fisher_updates: usize,
+        pub(crate) observed_candidate_calls: usize,
+        pub(crate) fisher_candidate_calls: usize,
     }
 
     impl CandidateEvalFailureModel {
-        fn state(beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
+        pub(crate) fn state(beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
             test_working_state(beta, curvature)
         }
     }
@@ -1771,8 +1771,8 @@ mod root_cause_tests {
     }
 
     #[derive(Default)]
-    struct PermanentCandidateErrorModel {
-        candidate_calls: usize,
+    pub(crate) struct PermanentCandidateErrorModel {
+        pub(crate) candidate_calls: usize,
     }
 
     impl WorkingModel for PermanentCandidateErrorModel {
@@ -1802,10 +1802,10 @@ mod root_cause_tests {
     }
 
     #[derive(Default)]
-    struct FirthAcceptedStateFailureModel {
-        current_state_calls: usize,
-        candidate_state_calls: usize,
-        candidate_screen_calls: usize,
+    pub(crate) struct FirthAcceptedStateFailureModel {
+        pub(crate) current_state_calls: usize,
+        pub(crate) candidate_state_calls: usize,
+        pub(crate) candidate_screen_calls: usize,
     }
 
     impl WorkingModel for FirthAcceptedStateFailureModel {
@@ -1850,10 +1850,10 @@ mod root_cause_tests {
     }
 
     #[derive(Default)]
-    struct FirthPermanentCandidateErrorModel {
-        current_state_calls: usize,
-        candidate_state_calls: usize,
-        candidate_screen_calls: usize,
+    pub(crate) struct FirthPermanentCandidateErrorModel {
+        pub(crate) current_state_calls: usize,
+        pub(crate) candidate_state_calls: usize,
+        pub(crate) candidate_screen_calls: usize,
     }
 
     impl WorkingModel for FirthPermanentCandidateErrorModel {
@@ -1888,7 +1888,7 @@ mod root_cause_tests {
     }
 
     #[derive(Default)]
-    struct ActiveConstraintKktModel;
+    pub(crate) struct ActiveConstraintKktModel;
 
     impl WorkingModel for ActiveConstraintKktModel {
         fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
@@ -1912,14 +1912,14 @@ mod root_cause_tests {
         }
     }
 
-    struct PlateauStatusModel {
-        gradient: f64,
-        current_deviance: f64,
-        candidate_deviance: f64,
+    pub(crate) struct PlateauStatusModel {
+        pub(crate) gradient: f64,
+        pub(crate) current_deviance: f64,
+        pub(crate) candidate_deviance: f64,
     }
 
     impl PlateauStatusModel {
-        fn state(
+        pub(crate) fn state(
             beta: &Coefficients,
             curvature: HessianCurvatureKind,
             gradient: f64,
@@ -1961,12 +1961,12 @@ mod root_cause_tests {
         }
     }
 
-    struct LinearObjectivePlateauModel {
-        gradient: f64,
+    pub(crate) struct LinearObjectivePlateauModel {
+        pub(crate) gradient: f64,
     }
 
     impl LinearObjectivePlateauModel {
-        fn state(&self, beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
+        pub(crate) fn state(&self, beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
             let deviance = 1.0 + self.gradient * beta[0];
             scalar_working_state(beta, curvature, self.gradient, deviance)
         }
@@ -1999,7 +1999,7 @@ mod root_cause_tests {
     /// positive gradient (KKT multiplier) should be recognized as "at the
     /// bound" and excluded from the projected gradient.
     #[test]
-    fn projected_gradient_excludes_near_bound_kkt_forces() {
+    pub(crate) fn projected_gradient_excludes_near_bound_kkt_forces() {
         let gradient = array![0.5, 1e-4];
         let beta = array![1e-6, 2.0];
         let lower_bounds = array![0.0, f64::NEG_INFINITY];
@@ -2017,7 +2017,7 @@ mod root_cause_tests {
     /// coefficients as active and moves them TO the bound (direction = lb - beta),
     /// rather than computing a full unconstrained Newton step and clipping.
     #[test]
-    fn bound_solver_treats_near_bound_positive_grad_as_active() {
+    pub(crate) fn bound_solver_treats_near_bound_positive_grad_as_active() {
         let hessian = array![[2.0, 0.0], [0.0, 2.0]];
         let gradient = array![1.0, 0.0];
         let beta = array![1e-6, 5.0];
@@ -2054,7 +2054,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn pirls_converges_at_active_linear_constraint_kkt_point() {
+    pub(crate) fn pirls_converges_at_active_linear_constraint_kkt_point() {
         let mut model = ActiveConstraintKktModel;
         let options = WorkingModelPirlsOptions {
             max_iterations: 3,
@@ -2098,7 +2098,7 @@ mod root_cause_tests {
     /// though the normalized residual is ~2.6e-8. After the fix, the
     /// scale-invariant certificate accepts it under EITHER bound.
     #[test]
-    fn certifies_kkt_accepts_large_scale_pathological_case() {
+    pub(crate) fn certifies_kkt_accepts_large_scale_pathological_case() {
         let n = 320_000usize;
         let p = 20usize;
         let g_norm = 1.465e-5;
@@ -2140,7 +2140,7 @@ mod root_cause_tests {
     /// natural-scale denominator makes the test approximately invariant
     /// at small natural scale and exactly invariant in the limit.
     #[test]
-    fn certifies_kkt_is_scale_invariant() {
+    pub(crate) fn certifies_kkt_is_scale_invariant() {
         let n = 1000usize;
         let p = 10usize;
         let tol = 1e-6;
@@ -2178,7 +2178,7 @@ mod root_cause_tests {
     /// accept obviously-converged states; failures of one should not block
     /// the other.
     #[test]
-    fn certifies_kkt_accepts_under_either_bound() {
+    pub(crate) fn certifies_kkt_accepts_under_either_bound() {
         let n = 100usize;
         let p = 5usize;
         let tol = 1e-6;
@@ -2223,7 +2223,7 @@ mod root_cause_tests {
     /// converged minimum as `StalledAtValidMinimum` rather than as a hard
     /// non-convergence.
     #[test]
-    fn near_stationary_kkt_uses_ten_times_band() {
+    pub(crate) fn near_stationary_kkt_uses_ten_times_band() {
         let n = 100usize;
         let p = 4usize;
         let tol = 1e-6;
@@ -2252,7 +2252,7 @@ mod root_cause_tests {
     /// on `gᵀH⁻¹g` whenever `λ_min(H) ≥ ridge_floor`. Verify the algebraic
     /// inequality on a 2×2 worked example so the formula is locked in.
     #[test]
-    fn newton_decrement_correction_upper_bounds_true_decrement() {
+    pub(crate) fn newton_decrement_correction_upper_bounds_true_decrement() {
         // H = diag(2, 0.5).  λ_min = 0.5.  λ_lm = 0.25.
         let lambda_min = 0.5_f64;
         let lambda_lm = 0.25_f64;
@@ -2284,7 +2284,7 @@ mod root_cause_tests {
     /// Hypothesis 3: LM gain-ratio fallback should accept when both predicted
     /// and actual reduction are floating-point noise relative to the objective.
     #[test]
-    fn lm_gain_ratio_accepts_zero_step_at_stationarity() {
+    pub(crate) fn lm_gain_ratio_accepts_zero_step_at_stationarity() {
         // Simulate: objective ~ 9e5, predicted reduction ~ 5e-16, actual ~ -1e-14
         let current_penalized: f64 = 9e5;
         let predicted_reduction: f64 = 5e-16;
@@ -2311,7 +2311,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn candidate_evaluation_errors_respect_lm_exhaustion_budget() {
+    pub(crate) fn candidate_evaluation_errors_respect_lm_exhaustion_budget() {
         let mut model = CandidateEvalFailureModel::default();
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
@@ -2373,7 +2373,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn permanent_candidate_errors_do_not_trigger_lm_retries() {
+    pub(crate) fn permanent_candidate_errors_do_not_trigger_lm_retries() {
         let mut model = PermanentCandidateErrorModel::default();
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
@@ -2416,7 +2416,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn firth_candidate_reevaluation_respects_lm_retry_budget() {
+    pub(crate) fn firth_candidate_reevaluation_respects_lm_retry_budget() {
         let mut model = FirthAcceptedStateFailureModel::default();
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
@@ -2465,7 +2465,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn firth_permanent_candidate_error_propagates_without_lm_retries() {
+    pub(crate) fn firth_permanent_candidate_error_propagates_without_lm_retries() {
         // Complement to `firth_candidate_reevaluation_respects_lm_retry_budget`
         // from the opposite angle: a *non-retriable* Firth candidate-evaluation
         // failure (a structural breakdown, not a numerical overflow) must
@@ -2520,7 +2520,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn plateaued_accepted_step_does_not_report_converged_with_large_projected_gradient() {
+    pub(crate) fn plateaued_accepted_step_does_not_report_converged_with_large_projected_gradient() {
         let mut model = PlateauStatusModel {
             gradient: 5e-5,
             current_deviance: 1.0,
@@ -2560,7 +2560,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn long_constrained_objective_plateau_reports_valid_stall() {
+    pub(crate) fn long_constrained_objective_plateau_reports_valid_stall() {
         let mut model = LinearObjectivePlateauModel { gradient: -5e-5 };
         let options = WorkingModelPirlsOptions {
             max_iterations: 25,
@@ -2595,7 +2595,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn rejected_noise_scale_step_requires_near_stationary_projected_gradient() {
+    pub(crate) fn rejected_noise_scale_step_requires_near_stationary_projected_gradient() {
         let mut model = PlateauStatusModel {
             gradient: 2e-5,
             current_deviance: 1.0e6,
@@ -2635,7 +2635,7 @@ mod root_cause_tests {
     /// Helper: assert that the penalized deviance trace is non-increasing
     /// across P-IRLS iterations, allowing a small tolerance for floating-point
     /// rounding.
-    fn assert_deviance_monotone(trace: &[f64], label: &str) {
+    pub(crate) fn assert_deviance_monotone(trace: &[f64], label: &str) {
         assert!(
             trace.len() >= 2,
             "{}: expected at least 2 deviance recordings, got {}",
@@ -2662,7 +2662,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn test_deviance_monotonicity_gaussian() {
+    pub(crate) fn test_deviance_monotonicity_gaussian() {
         assert!(file!().ends_with(".rs"));
         // Simple Gaussian GAM: y ~ X beta with a smooth penalty.
         // Design matrix with an intercept column and one covariate.
@@ -2748,7 +2748,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn test_deviance_monotonicity_logistic() {
+    pub(crate) fn test_deviance_monotonicity_logistic() {
         assert!(file!().ends_with(".rs"));
         // Logistic regression: binary y with a single covariate plus intercept.
         let n = 30;
@@ -2830,7 +2830,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn test_deviance_monotonicity_logistic_multiseed() {
+    pub(crate) fn test_deviance_monotonicity_logistic_multiseed() {
         // Run logistic regression with multiple deterministic "seeds" to
         // stress-test monotonicity under varied label configurations.
         let seeds: &[u64] = &[42, 137, 271, 314, 997];
@@ -2939,7 +2939,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn solve_newton_direction_implicit_matches_dense_at_k500() {
+    pub(crate) fn solve_newton_direction_implicit_matches_dense_at_k500() {
         // Phase 2C equivalence test: PCG-against-implicit-H must produce the
         // same Newton direction as dense Cholesky on the same fully-assembled
         // Hessian H = X^T W X + ridge·I + λ·S, where S is provided in
@@ -2949,8 +2949,8 @@ mod root_cause_tests {
         use crate::terms::closed_form_operator::ClosedFormPenaltyOperator;
         use crate::terms::penalty_op::PenaltyOp;
 
-        const K: usize = 500;
-        const D: usize = 4;
+        pub(crate) const K: usize = 500;
+        pub(crate) const D: usize = 4;
 
         // Synthetic centers in [0,1]^D via deterministic LCG.
         let mut state: u64 = 0xDEADBEEF_CAFEBABE;
@@ -3059,8 +3059,8 @@ mod root_cause_tests {
     /// `ObservedExact` (when SPD) — Fisher → Observed substitution is
     /// detected by the inertia gate, not silently accepted.
     #[derive(Default)]
-    struct InnerFisherButObservedSpdAtMode {
-        observed_post_calls: usize,
+    pub(crate) struct InnerFisherButObservedSpdAtMode {
+        pub(crate) observed_post_calls: usize,
     }
 
     impl WorkingModel for InnerFisherButObservedSpdAtMode {
@@ -3096,7 +3096,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn exported_laplace_observed_exact_when_post_finalization_spd() {
+    pub(crate) fn exported_laplace_observed_exact_when_post_finalization_spd() {
         let mut model = InnerFisherButObservedSpdAtMode::default();
         let options = WorkingModelPirlsOptions {
             max_iterations: 2,
@@ -3133,7 +3133,7 @@ mod root_cause_tests {
     /// or surrogate-by-design family). Exported curvature must be
     /// `ExpectedInformationSurrogate`, not silently relabeled `ObservedExact`.
     #[derive(Default)]
-    struct CanonicalSurrogateModel;
+    pub(crate) struct CanonicalSurrogateModel;
 
     impl WorkingModel for CanonicalSurrogateModel {
         fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
@@ -3157,7 +3157,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn exported_laplace_surrogate_when_observed_unsupported() {
+    pub(crate) fn exported_laplace_surrogate_when_observed_unsupported() {
         let mut model = CanonicalSurrogateModel;
         let options = WorkingModelPirlsOptions {
             max_iterations: 2,
@@ -3188,7 +3188,7 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn dense_xtwx_signed_assembly_preserves_negative_weights() {
+    pub(crate) fn dense_xtwx_signed_assembly_preserves_negative_weights() {
         let x = array![[1.0, 2.0], [3.0, -1.0], [0.5, 4.0]];
         let weights = array![2.0, -3.0, 0.25];
         let mut chunk = Array2::<f64>::zeros((0, 0));

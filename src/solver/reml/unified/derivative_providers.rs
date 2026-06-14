@@ -213,7 +213,7 @@ pub enum OuterHessianDerivativeKernel {
 
 
 impl OuterHessianDerivativeKernel {
-    fn from_scalar_glm(ingredients: ScalarGlmIngredients<'_>) -> Self {
+    pub(crate) fn from_scalar_glm(ingredients: ScalarGlmIngredients<'_>) -> Self {
         Self::ScalarGlm {
             c_array: ingredients.c_array.clone(),
             d_array: ingredients.d_array.cloned(),
@@ -547,7 +547,7 @@ pub struct ExactJeffreysTerm {
     /// supplies the curvature/drift terms through its own
     /// `H_Φ`-aware derivative provider and only the scalar `Φ(β̂)` needs to
     /// reach the LAML cost.
-    operator: Option<std::sync::Arc<super::super::FirthDenseOperator>>,
+    pub(crate) operator: Option<std::sync::Arc<super::super::FirthDenseOperator>>,
     /// Tangent-projected value override. When `Some`, `value()` returns
     /// this scalar instead of the operator's full-space `½ log|J|`. This
     /// is used by `try_tangent_projected_evaluate` to substitute
@@ -557,7 +557,7 @@ pub struct ExactJeffreysTerm {
     /// sees the unmodified operator; only the scalar contribution to the
     /// outer LAML cost changes. For the Tier-B value-only carrier this is
     /// always `Some` (it IS the value).
-    value_override: Option<f64>,
+    pub(crate) value_override: Option<f64>,
 }
 
 
@@ -634,13 +634,13 @@ impl ExactJeffreysTerm {
 /// objects, which return value+derivative together for exactly this reason.
 pub(crate) struct GuardedCorrection {
     /// Scalar contribution to the outer REML/LAML cost.
-    value: f64,
+    pub(crate) value: f64,
     /// Contribution to the ρ-gradient (one entry per active ρ coordinate),
     /// `None` when the correction is value-only (derivative-free regime).
-    gradient: Option<Array1<f64>>,
+    pub(crate) gradient: Option<Array1<f64>>,
     /// The SINGLE guard. When `false`, NEITHER the value nor the gradient is
     /// applied; when `true`, BOTH are.
-    include: bool,
+    pub(crate) include: bool,
 }
 
 
@@ -713,11 +713,11 @@ impl BarrierConfig {
         // exactly ±1, so a row qualifies as a simple coordinate bound. The
         // constraint rows are assembled exactly, so any nonzero deviation this
         // large is a genuine multi-coefficient constraint, not round-off.
-        const SIMPLE_BOUND_ENTRY_TOL: f64 = 1e-14;
+        pub(crate) const SIMPLE_BOUND_ENTRY_TOL: f64 = 1e-14;
         // Default log-barrier strength τ used when a simple-bound BarrierConfig
         // is synthesized from constraints (a weak barrier that keeps β strictly
         // feasible without materially perturbing an interior optimum).
-        const DEFAULT_BARRIER_TAU: f64 = 1e-6;
+        pub(crate) const DEFAULT_BARRIER_TAU: f64 = 1e-6;
         let constraints = constraints?;
         let mut indices = Vec::new();
         let mut lower_bounds = Vec::new();
@@ -914,12 +914,12 @@ impl BarrierConfig {
 ///
 /// Adds C_bar[u] = −2τ·diag(u ⊙ d^(3)) and Q_bar[u,v] = 6τ·diag(u ⊙ v ⊙ d^(4)).
 pub struct BarrierDerivativeProvider<'a> {
-    inner: &'a dyn HessianDerivativeProvider,
-    tau: f64,
-    constrained_indices: &'a [usize],
-    bound_signs: &'a [f64],
-    slacks: Vec<f64>,
-    p: usize,
+    pub(crate) inner: &'a dyn HessianDerivativeProvider,
+    pub(crate) tau: f64,
+    pub(crate) constrained_indices: &'a [usize],
+    pub(crate) bound_signs: &'a [f64],
+    pub(crate) slacks: Vec<f64>,
+    pub(crate) p: usize,
 }
 
 
@@ -942,7 +942,7 @@ impl<'a> BarrierDerivativeProvider<'a> {
         })
     }
 
-    fn barrier_correction(&self, u: &Array1<f64>) -> Array2<f64> {
+    pub(crate) fn barrier_correction(&self, u: &Array1<f64>) -> Array2<f64> {
         let mut result = Array2::zeros((self.p, self.p));
         for (ci, &idx) in self.constrained_indices.iter().enumerate() {
             let inv_cube = 1.0 / (self.slacks[ci].powi(3));
@@ -951,7 +951,7 @@ impl<'a> BarrierDerivativeProvider<'a> {
         result
     }
 
-    fn barrier_second_correction(&self, u: &Array1<f64>, v: &Array1<f64>) -> Array2<f64> {
+    pub(crate) fn barrier_second_correction(&self, u: &Array1<f64>, v: &Array1<f64>) -> Array2<f64> {
         let mut result = Array2::zeros((self.p, self.p));
         for (ci, &idx) in self.constrained_indices.iter().enumerate() {
             let inv_4 = 1.0 / (self.slacks[ci].powi(4));

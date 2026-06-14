@@ -1753,12 +1753,12 @@ impl BernoulliMarginalSlopeFamily {
         // Resolve every ψ axis to its (block, local) primary location and build
         // its single-axis design map once. A σ-aux or otherwise unresolvable axis
         // disables the contracted path (caller falls back to exact per-pair).
-        struct AxisInfo {
-            block: usize,
-            dir_idx: usize,
-            map: crate::families::custom_family::PsiDesignMap,
-            deriv_block: usize,
-            deriv_local: usize,
+        pub(crate) struct AxisInfo {
+            pub(crate) block: usize,
+            pub(crate) dir_idx: usize,
+            pub(crate) map: crate::families::custom_family::PsiDesignMap,
+            pub(crate) deriv_block: usize,
+            pub(crate) deriv_local: usize,
         }
         let mut axes: Vec<AxisInfo> = Vec::with_capacity(psi_dim);
         for psi_index in 0..psi_dim {
@@ -2759,7 +2759,7 @@ impl BernoulliMarginalSlopeFamily {
         // on the LRU mutex inside `evaluate_cell_derivative_moments_lru`,
         // etc.). At large-scale n_rows the per-row body's design materialization
         // and pullback work dominates dispatch, so the par_iter is preserved.
-        const ROW_PAR_MIN_ROWS: usize = 4_096;
+        pub(crate) const ROW_PAR_MIN_ROWS: usize = 4_096;
         let run_rows_serial = rayon::current_thread_index().is_some()
             || rayon::current_num_threads() <= 1
             || n_rows < ROW_PAR_MIN_ROWS;
@@ -3289,7 +3289,7 @@ impl BernoulliMarginalSlopeFamily {
         if flex_active && n > 0 {
             self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
         }
-        const ROW_PAR_MIN_ROWS: usize = 4_096;
+        pub(crate) const ROW_PAR_MIN_ROWS: usize = 4_096;
         let run_rows_serial = rayon::current_thread_index().is_some()
             || rayon::current_num_threads() <= 1
             || n_rows < ROW_PAR_MIN_ROWS;
@@ -3451,7 +3451,7 @@ impl BernoulliMarginalSlopeFamily {
             .collect())
     }
 
-    fn find_or_push_unique_direction(
+    pub(crate) fn find_or_push_unique_direction(
         unique_dirs: &mut Vec<Array1<f64>>,
         candidate: &Array1<f64>,
     ) -> usize {

@@ -2191,7 +2191,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(Array1::zeros(n_dirs));
         }
         let rows_per_chunk = {
-            const TARGET_BYTES: usize = 8 * 1024 * 1024;
+            pub(crate) const TARGET_BYTES: usize = 8 * 1024 * 1024;
             let panels = 4usize;
             let width = rank + n_dirs;
             (TARGET_BYTES / (panels * width.max(1) * 8)).max(512).min(n)

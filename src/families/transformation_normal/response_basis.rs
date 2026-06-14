@@ -203,7 +203,7 @@ pub(crate) fn response_floor_offsets(
 /// relaxes back to the configured count, preserving CTN's expressiveness on
 /// real transformations. This adapts the *effective* basis size rather than
 /// shrinking the default, so nonlinear accuracy is untouched.
-fn transformation_complexity_knot_budget(
+pub(crate) fn transformation_complexity_knot_budget(
     response: ArrayView1<'_, f64>,
     min_internal: usize,
 ) -> usize {

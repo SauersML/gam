@@ -523,17 +523,17 @@ impl TransformationNormalFamily {
         ];
 
         pub(crate) struct PsiBatchedAccum {
-            hvp: Array2<f64>,
-            gamma: Vec<f64>,
-            gamma_psi: Vec<f64>,
-            gamma_dir: Vec<f64>,
-            gamma_psi_dir: Vec<f64>,
-            h_dir: Vec<f64>,
-            hp_dir: Vec<f64>,
-            h_psi_dir: Vec<f64>,
-            hp_psi_dir: Vec<f64>,
-            endpoint_dir: Vec<[f64; 2]>,
-            endpoint_psi_dir: Vec<[f64; 2]>,
+            pub(crate) hvp: Array2<f64>,
+            pub(crate) gamma: Vec<f64>,
+            pub(crate) gamma_psi: Vec<f64>,
+            pub(crate) gamma_dir: Vec<f64>,
+            pub(crate) gamma_psi_dir: Vec<f64>,
+            pub(crate) h_dir: Vec<f64>,
+            pub(crate) hp_dir: Vec<f64>,
+            pub(crate) h_psi_dir: Vec<f64>,
+            pub(crate) hp_psi_dir: Vec<f64>,
+            pub(crate) endpoint_dir: Vec<[f64; 2]>,
+            pub(crate) endpoint_psi_dir: Vec<[f64; 2]>,
         }
 
         impl PsiBatchedAccum {
@@ -865,23 +865,23 @@ impl TransformationNormalFamily {
         ];
 
         pub(crate) struct PsiTraceAccum {
-            value: f64,
-            gamma: Vec<f64>,
-            gamma_psi: Vec<f64>,
-            gamma_dir: Vec<f64>,
-            gamma_psi_dir: Vec<f64>,
-            h_dir: Vec<f64>,
-            hp_dir: Vec<f64>,
-            h_vv: Vec<f64>,
-            hp_vv: Vec<f64>,
-            h_psi_dir: Vec<f64>,
-            hp_psi_dir: Vec<f64>,
-            h_psi_vv: Vec<f64>,
-            hp_psi_vv: Vec<f64>,
-            endpoint_dir: Vec<[f64; 2]>,
-            endpoint_psi_dir: Vec<[f64; 2]>,
-            endpoint_vv: Vec<[f64; 2]>,
-            endpoint_psi_vv: Vec<[f64; 2]>,
+            pub(crate) value: f64,
+            pub(crate) gamma: Vec<f64>,
+            pub(crate) gamma_psi: Vec<f64>,
+            pub(crate) gamma_dir: Vec<f64>,
+            pub(crate) gamma_psi_dir: Vec<f64>,
+            pub(crate) h_dir: Vec<f64>,
+            pub(crate) hp_dir: Vec<f64>,
+            pub(crate) h_vv: Vec<f64>,
+            pub(crate) hp_vv: Vec<f64>,
+            pub(crate) h_psi_dir: Vec<f64>,
+            pub(crate) hp_psi_dir: Vec<f64>,
+            pub(crate) h_psi_vv: Vec<f64>,
+            pub(crate) hp_psi_vv: Vec<f64>,
+            pub(crate) endpoint_dir: Vec<[f64; 2]>,
+            pub(crate) endpoint_psi_dir: Vec<[f64; 2]>,
+            pub(crate) endpoint_vv: Vec<[f64; 2]>,
+            pub(crate) endpoint_psi_vv: Vec<[f64; 2]>,
         }
 
         impl PsiTraceAccum {
@@ -1130,23 +1130,23 @@ impl TransformationNormalFamily {
         ];
 
         pub(crate) struct PsiAllAxesTraceAccum {
-            values: Vec<f64>,
-            gamma: Vec<f64>,
-            gamma_dir: Vec<f64>,
-            h_dir: Vec<f64>,
-            hp_dir: Vec<f64>,
-            h_vv: Vec<f64>,
-            hp_vv: Vec<f64>,
-            endpoint_dir: Vec<[f64; 2]>,
-            endpoint_vv: Vec<[f64; 2]>,
-            gamma_psi: Vec<f64>,
-            gamma_psi_dir: Vec<f64>,
-            h_psi_dir: Vec<f64>,
-            hp_psi_dir: Vec<f64>,
-            h_psi_vv: Vec<f64>,
-            hp_psi_vv: Vec<f64>,
-            endpoint_psi_dir: Vec<[f64; 2]>,
-            endpoint_psi_vv: Vec<[f64; 2]>,
+            pub(crate) values: Vec<f64>,
+            pub(crate) gamma: Vec<f64>,
+            pub(crate) gamma_dir: Vec<f64>,
+            pub(crate) h_dir: Vec<f64>,
+            pub(crate) hp_dir: Vec<f64>,
+            pub(crate) h_vv: Vec<f64>,
+            pub(crate) hp_vv: Vec<f64>,
+            pub(crate) endpoint_dir: Vec<[f64; 2]>,
+            pub(crate) endpoint_vv: Vec<[f64; 2]>,
+            pub(crate) gamma_psi: Vec<f64>,
+            pub(crate) gamma_psi_dir: Vec<f64>,
+            pub(crate) h_psi_dir: Vec<f64>,
+            pub(crate) hp_psi_dir: Vec<f64>,
+            pub(crate) h_psi_vv: Vec<f64>,
+            pub(crate) hp_psi_vv: Vec<f64>,
+            pub(crate) endpoint_psi_dir: Vec<[f64; 2]>,
+            pub(crate) endpoint_psi_vv: Vec<[f64; 2]>,
         }
 
         impl PsiAllAxesTraceAccum {
@@ -1477,12 +1477,12 @@ impl TransformationNormalFamily {
             let weights = self.effective_weights();
 
             pub(crate) struct PsiPairScoreAccum {
-                objective: f64,
-                score: Array1<f64>,
-                gamma: Vec<f64>,
-                gamma_i: Vec<f64>,
-                gamma_j: Vec<f64>,
-                gamma_ij: Vec<f64>,
+                pub(crate) objective: f64,
+                pub(crate) score: Array1<f64>,
+                pub(crate) gamma: Vec<f64>,
+                pub(crate) gamma_i: Vec<f64>,
+                pub(crate) gamma_j: Vec<f64>,
+                pub(crate) gamma_ij: Vec<f64>,
             }
 
             impl PsiPairScoreAccum {
@@ -1660,15 +1660,15 @@ impl TransformationNormalFamily {
         let direction_mat = direction_mat.expect("directional CTN psi-psi path requires direction");
 
         pub(crate) struct PsiPairDirectionalAccum {
-            hvp: Array1<f64>,
-            gamma: Vec<f64>,
-            gamma_i: Vec<f64>,
-            gamma_j: Vec<f64>,
-            gamma_ij: Vec<f64>,
-            gamma_dot: Vec<f64>,
-            gamma_i_dot: Vec<f64>,
-            gamma_j_dot: Vec<f64>,
-            gamma_ij_dot: Vec<f64>,
+            pub(crate) hvp: Array1<f64>,
+            pub(crate) gamma: Vec<f64>,
+            pub(crate) gamma_i: Vec<f64>,
+            pub(crate) gamma_j: Vec<f64>,
+            pub(crate) gamma_ij: Vec<f64>,
+            pub(crate) gamma_dot: Vec<f64>,
+            pub(crate) gamma_i_dot: Vec<f64>,
+            pub(crate) gamma_j_dot: Vec<f64>,
+            pub(crate) gamma_ij_dot: Vec<f64>,
         }
 
         impl PsiPairDirectionalAccum {
@@ -2105,15 +2105,15 @@ impl TransformationNormalFamily {
         ];
 
         pub(crate) struct PsiPairBatchedAccum {
-            hvp: Array2<f64>,
-            gamma: Vec<f64>,
-            gamma_i: Vec<f64>,
-            gamma_j: Vec<f64>,
-            gamma_ij: Vec<f64>,
-            gamma_dot: Vec<f64>,
-            gamma_i_dot: Vec<f64>,
-            gamma_j_dot: Vec<f64>,
-            gamma_ij_dot: Vec<f64>,
+            pub(crate) hvp: Array2<f64>,
+            pub(crate) gamma: Vec<f64>,
+            pub(crate) gamma_i: Vec<f64>,
+            pub(crate) gamma_j: Vec<f64>,
+            pub(crate) gamma_ij: Vec<f64>,
+            pub(crate) gamma_dot: Vec<f64>,
+            pub(crate) gamma_i_dot: Vec<f64>,
+            pub(crate) gamma_j_dot: Vec<f64>,
+            pub(crate) gamma_ij_dot: Vec<f64>,
         }
 
         impl PsiPairBatchedAccum {
@@ -2579,19 +2579,19 @@ impl TransformationNormalFamily {
         ];
 
         pub(crate) struct PsiPairBilinearAccum {
-            value: f64,
-            gamma: Vec<f64>,
-            gamma_i: Vec<f64>,
-            gamma_j: Vec<f64>,
-            gamma_ij: Vec<f64>,
-            left: Vec<f64>,
-            left_i: Vec<f64>,
-            left_j: Vec<f64>,
-            left_ij: Vec<f64>,
-            right: Vec<f64>,
-            right_i: Vec<f64>,
-            right_j: Vec<f64>,
-            right_ij: Vec<f64>,
+            pub(crate) value: f64,
+            pub(crate) gamma: Vec<f64>,
+            pub(crate) gamma_i: Vec<f64>,
+            pub(crate) gamma_j: Vec<f64>,
+            pub(crate) gamma_ij: Vec<f64>,
+            pub(crate) left: Vec<f64>,
+            pub(crate) left_i: Vec<f64>,
+            pub(crate) left_j: Vec<f64>,
+            pub(crate) left_ij: Vec<f64>,
+            pub(crate) right: Vec<f64>,
+            pub(crate) right_i: Vec<f64>,
+            pub(crate) right_j: Vec<f64>,
+            pub(crate) right_ij: Vec<f64>,
         }
 
         impl PsiPairBilinearAccum {
@@ -2957,15 +2957,15 @@ impl TransformationNormalFamily {
         ];
 
         pub(crate) struct PsiPairTraceAccum {
-            value: f64,
-            gamma: Vec<f64>,
-            gamma_i: Vec<f64>,
-            gamma_j: Vec<f64>,
-            gamma_ij: Vec<f64>,
-            f: Vec<f64>,
-            f_i: Vec<f64>,
-            f_j: Vec<f64>,
-            f_ij: Vec<f64>,
+            pub(crate) value: f64,
+            pub(crate) gamma: Vec<f64>,
+            pub(crate) gamma_i: Vec<f64>,
+            pub(crate) gamma_j: Vec<f64>,
+            pub(crate) gamma_ij: Vec<f64>,
+            pub(crate) f: Vec<f64>,
+            pub(crate) f_i: Vec<f64>,
+            pub(crate) f_j: Vec<f64>,
+            pub(crate) f_ij: Vec<f64>,
         }
 
         impl PsiPairTraceAccum {
@@ -3438,29 +3438,29 @@ impl TransformationNormalFamily {
         // `fold(|| init, …)` and reused across all rows assigned to that
         // thread.
         pub(crate) struct Scratch {
-            out: Array2<f64>,
-            gamma: Vec<f64>,
-            gamma_dir: Vec<f64>,
-            gamma_psi: Vec<f64>,
-            gamma_psi_dir: Vec<f64>,
-            endpoint_factor: Vec<[f64; 2]>,
-            endpoint_factor_dir: Vec<[f64; 2]>,
-            endpoint_psi_cov_factor: Vec<[f64; 2]>,
-            endpoint_psi_psi_factor: Vec<[f64; 2]>,
-            endpoint_psi_cov_factor_dir: Vec<[f64; 2]>,
-            endpoint_psi_psi_factor_dir: Vec<[f64; 2]>,
-            h_factor: Vec<f64>,
-            hp_factor: Vec<f64>,
-            h_factor_dir: Vec<f64>,
-            hp_factor_dir: Vec<f64>,
-            hpsi_cov_factor: Vec<f64>,
-            hppsi_cov_factor: Vec<f64>,
-            hpsi_psi_factor: Vec<f64>,
-            hppsi_psi_factor: Vec<f64>,
-            hpsi_cov_factor_dir: Vec<f64>,
-            hppsi_cov_factor_dir: Vec<f64>,
-            hpsi_psi_factor_dir: Vec<f64>,
-            hppsi_psi_factor_dir: Vec<f64>,
+            pub(crate) out: Array2<f64>,
+            pub(crate) gamma: Vec<f64>,
+            pub(crate) gamma_dir: Vec<f64>,
+            pub(crate) gamma_psi: Vec<f64>,
+            pub(crate) gamma_psi_dir: Vec<f64>,
+            pub(crate) endpoint_factor: Vec<[f64; 2]>,
+            pub(crate) endpoint_factor_dir: Vec<[f64; 2]>,
+            pub(crate) endpoint_psi_cov_factor: Vec<[f64; 2]>,
+            pub(crate) endpoint_psi_psi_factor: Vec<[f64; 2]>,
+            pub(crate) endpoint_psi_cov_factor_dir: Vec<[f64; 2]>,
+            pub(crate) endpoint_psi_psi_factor_dir: Vec<[f64; 2]>,
+            pub(crate) h_factor: Vec<f64>,
+            pub(crate) hp_factor: Vec<f64>,
+            pub(crate) h_factor_dir: Vec<f64>,
+            pub(crate) hp_factor_dir: Vec<f64>,
+            pub(crate) hpsi_cov_factor: Vec<f64>,
+            pub(crate) hppsi_cov_factor: Vec<f64>,
+            pub(crate) hpsi_psi_factor: Vec<f64>,
+            pub(crate) hppsi_psi_factor: Vec<f64>,
+            pub(crate) hpsi_cov_factor_dir: Vec<f64>,
+            pub(crate) hppsi_cov_factor_dir: Vec<f64>,
+            pub(crate) hpsi_psi_factor_dir: Vec<f64>,
+            pub(crate) hppsi_psi_factor_dir: Vec<f64>,
         }
         let init_scratch = || Scratch {
             out: Array2::<f64>::zeros((p_total, p_total)),
@@ -3851,31 +3851,31 @@ impl TransformationNormalFamily {
         ];
 
         pub(crate) struct PsiDhTraceAccum {
-            value: f64,
-            gamma: Vec<f64>,
-            gamma_dir: Vec<f64>,
-            gamma_psi: Vec<f64>,
-            gamma_psi_dir: Vec<f64>,
-            gamma_f: Vec<f64>,
-            gamma_psi_f: Vec<f64>,
-            h_f: Vec<f64>,
-            hp_f: Vec<f64>,
-            h_f_dir: Vec<f64>,
-            hp_f_dir: Vec<f64>,
-            h_ff: Vec<f64>,
-            hp_ff: Vec<f64>,
-            hpsi_f: Vec<f64>,
-            hppsi_f: Vec<f64>,
-            hpsi_f_dir: Vec<f64>,
-            hppsi_f_dir: Vec<f64>,
-            hpsi_ff: Vec<f64>,
-            hppsi_ff: Vec<f64>,
-            endpoint_f: Vec<[f64; 2]>,
-            endpoint_f_dir: Vec<[f64; 2]>,
-            endpoint_ff: Vec<[f64; 2]>,
-            endpoint_psi_f: Vec<[f64; 2]>,
-            endpoint_psi_f_dir: Vec<[f64; 2]>,
-            endpoint_psi_ff: Vec<[f64; 2]>,
+            pub(crate) value: f64,
+            pub(crate) gamma: Vec<f64>,
+            pub(crate) gamma_dir: Vec<f64>,
+            pub(crate) gamma_psi: Vec<f64>,
+            pub(crate) gamma_psi_dir: Vec<f64>,
+            pub(crate) gamma_f: Vec<f64>,
+            pub(crate) gamma_psi_f: Vec<f64>,
+            pub(crate) h_f: Vec<f64>,
+            pub(crate) hp_f: Vec<f64>,
+            pub(crate) h_f_dir: Vec<f64>,
+            pub(crate) hp_f_dir: Vec<f64>,
+            pub(crate) h_ff: Vec<f64>,
+            pub(crate) hp_ff: Vec<f64>,
+            pub(crate) hpsi_f: Vec<f64>,
+            pub(crate) hppsi_f: Vec<f64>,
+            pub(crate) hpsi_f_dir: Vec<f64>,
+            pub(crate) hppsi_f_dir: Vec<f64>,
+            pub(crate) hpsi_ff: Vec<f64>,
+            pub(crate) hppsi_ff: Vec<f64>,
+            pub(crate) endpoint_f: Vec<[f64; 2]>,
+            pub(crate) endpoint_f_dir: Vec<[f64; 2]>,
+            pub(crate) endpoint_ff: Vec<[f64; 2]>,
+            pub(crate) endpoint_psi_f: Vec<[f64; 2]>,
+            pub(crate) endpoint_psi_f_dir: Vec<[f64; 2]>,
+            pub(crate) endpoint_psi_ff: Vec<[f64; 2]>,
         }
 
         impl PsiDhTraceAccum {

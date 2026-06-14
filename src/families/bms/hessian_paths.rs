@@ -898,7 +898,7 @@ impl BernoulliMarginalSlopeFlexRowScratch {
 /// scalar `Array2` `[[r, c]]` index, which was bounds-checked twice
 /// per element.
 #[inline]
-fn accumulate_flex_block_grad_hess(
+pub(crate) fn accumulate_flex_block_grad_hess(
     primary_range: &std::ops::Range<usize>,
     scratch: &BernoulliMarginalSlopeFlexRowScratch,
     grad: &mut Array1<f64>,

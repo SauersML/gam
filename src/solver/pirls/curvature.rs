@@ -16,7 +16,7 @@ pub struct VarianceJet {
 impl VarianceJet {
     /// Lower floor on μ before evaluating power-law variance functions, so that
     /// `μ^(p−k)` derivatives stay finite as μ → 0 instead of producing inf/NaN.
-    const VARIANCE_MU_FLOOR: f64 = 1e-10;
+    pub(crate) const VARIANCE_MU_FLOOR: f64 = 1e-10;
 
     /// Bernoulli / binomial variance V(μ) = μ(1−μ).
     #[inline]
@@ -123,9 +123,9 @@ impl VarianceJet {
 }
 
 
-const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
+pub(crate) const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
 
-const OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR: f64 = 1e-12;
+pub(crate) const OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR: f64 = 1e-12;
 
 
 /// Returns the per-row floor `max(fisher · 1e-6, 1e-12)` used by PIRLS to
@@ -194,7 +194,7 @@ pub fn outer_hessian_curvature_arrays(
 
 
 #[inline]
-fn fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
+pub(crate) fn fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
     likelihood.fixed_phi().unwrap_or(1.0)
 }
 
@@ -217,7 +217,7 @@ pub fn weight_family_for_glm_likelihood(likelihood: &GlmLikelihoodSpec) -> Weigh
 
 
 #[inline]
-fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
+pub(crate) fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
     match inverse_link {
         InverseLink::Standard(StandardLink::Identity) => WeightLink::Identity,
         InverseLink::Standard(StandardLink::Log) => WeightLink::Log,
@@ -233,7 +233,7 @@ fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
 
 
 #[inline]
-fn supports_observed_hessian_curvature_for_likelihood(
+pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
 ) -> bool {
@@ -259,7 +259,7 @@ fn supports_observed_hessian_curvature_for_likelihood(
 
 
 #[inline]
-fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
+pub(crate) fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
     match inverse_link {
         // Why: canonical links keep V(mu) representable across the full f64 eta range; only guard against inf.
         InverseLink::Standard(StandardLink::Logit | StandardLink::Log) => {
@@ -298,7 +298,7 @@ pub fn eta_clamp_active(inverse_link: &InverseLink, eta: f64) -> bool {
 /// Newton linear system X'W X + S stays numerically usable. This floor is
 /// purely a linear-algebra concern: the exact statistical weights stored in
 /// `lasthessian_weights` / `finalweights` are not affected.
-fn solver_hessian_weights_into(
+pub(crate) fn solver_hessian_weights_into(
     hessian_weights: &Array1<f64>,
     fisher_weights: &Array1<f64>,
     out: &mut Array1<f64>,
@@ -333,7 +333,7 @@ fn solver_hessian_weights_into(
 /// See `observed_weight_noncanonical` for the per-observation formulas and
 /// response.md Section 3 for the mathematical justification of why observed
 /// (not Fisher) information is required.
-fn compute_observed_hessian_curvature_arrays_into(
+pub(crate) fn compute_observed_hessian_curvature_arrays_into(
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
@@ -709,7 +709,7 @@ pub fn observed_weight_gaussian_inverse(y: f64, eta: f64, phi: f64, pw: f64) -> 
 
 
 #[inline]
-fn observed_weight_binomial_logit_from_jet(
+pub(crate) fn observed_weight_binomial_logit_from_jet(
     n_trials: f64,
     jet: MixtureInverseLinkJet,
     pw: f64,

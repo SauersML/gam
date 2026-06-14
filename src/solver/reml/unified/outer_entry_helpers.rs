@@ -101,10 +101,10 @@ pub(crate) fn rho_curvature_lambda(solution: &InnerSolution<'_>, lambda: f64) ->
 }
 
 
-fn penalty_coord_to_operator(coord: PenaltyCoordinate, scale: f64) -> Arc<dyn HyperOperator> {
-    struct OwnedPenaltyHyperOperator {
-        coord: PenaltyCoordinate,
-        scale: f64,
+pub(crate) fn penalty_coord_to_operator(coord: PenaltyCoordinate, scale: f64) -> Arc<dyn HyperOperator> {
+    pub(crate) struct OwnedPenaltyHyperOperator {
+        pub(crate) coord: PenaltyCoordinate,
+        pub(crate) scale: f64,
     }
 
     impl HyperOperator for OwnedPenaltyHyperOperator {
@@ -205,7 +205,7 @@ pub(crate) fn penalty_total_drift_result(
 }
 
 
-fn hyper_coord_drift_operators(drift: &HyperCoordDrift) -> Vec<Arc<dyn HyperOperator>> {
+pub(crate) fn hyper_coord_drift_operators(drift: &HyperCoordDrift) -> Vec<Arc<dyn HyperOperator>> {
     let mut operators: Vec<Arc<dyn HyperOperator>> = Vec::new();
     if let Some(block_local) = drift.block_local.as_ref() {
         operators.push(Arc::new(block_local.clone()));
@@ -238,7 +238,7 @@ pub(crate) fn hyper_coord_drift_operator_arc(
 }
 
 
-fn drift_parts_into_result(
+pub(crate) fn drift_parts_into_result(
     dense: Option<Array2<f64>>,
     mut operators: Vec<Arc<dyn HyperOperator>>,
     dim_hint: usize,
@@ -341,7 +341,7 @@ pub(crate) fn efs_q_eff(a_i: f64, dispersion: &DispersionHandling, dp_cgrad: f64
 }
 
 
-fn gamma_precision_rate_for_rho(prior: &crate::types::RhoPrior, idx: usize) -> Option<f64> {
+pub(crate) fn gamma_precision_rate_for_rho(prior: &crate::types::RhoPrior, idx: usize) -> Option<f64> {
     match prior {
         crate::types::RhoPrior::GammaPrecision { rate, .. } => Some(*rate),
         crate::types::RhoPrior::Independent(priors) => {
@@ -594,7 +594,7 @@ pub(crate) fn outer_hessian_entry(
 /// of `A_actᵀ A_act` (PSD; `null(A_actᵀ A_act) = null(A_act)`). Returns
 /// `None` when the active set is empty or the tangent space is empty
 /// (k_act ≥ p).
-fn compute_active_constraint_tangent_basis(a_act: &Array2<f64>) -> Option<Array2<f64>> {
+pub(crate) fn compute_active_constraint_tangent_basis(a_act: &Array2<f64>) -> Option<Array2<f64>> {
     let k_act = a_act.nrows();
     let p = a_act.ncols();
     if k_act == 0 {
@@ -622,7 +622,7 @@ fn compute_active_constraint_tangent_basis(a_act: &Array2<f64>) -> Option<Array2
 /// Dense `p × p` materialization of a penalty coordinate via canonical
 /// basis vectors. `S_k e_j` is the `j`-th column of `S_k`; assembled into
 /// a p × p matrix. Cost O(p² · matvec).
-fn materialize_penalty_coord_dense(coord: &PenaltyCoordinate, p: usize) -> Array2<f64> {
+pub(crate) fn materialize_penalty_coord_dense(coord: &PenaltyCoordinate, p: usize) -> Array2<f64> {
     // Each `PenaltyCoordinate` variant already has a structure-aware
     // materializer (`scaled_dense_matrix(1.0)`):
     //   - `DenseRoot` / `DenseRootCentered` → `Rᵀ R` via faer matmul
@@ -696,11 +696,11 @@ pub(crate) fn assemble_h_raw_dense(op: &DenseSpectralOperator) -> Array2<f64> {
 /// via `Z`. By construction this is the constraint-aware pseudo-inverse
 /// `H⁺_T = Z (ZᵀHZ)⁻¹ Zᵀ`, which is bounded independent of σ_min(H)
 /// when σ_min(ZᵀHZ) is bounded.
-struct TangentProjectedHessianOperator {
+pub(crate) struct TangentProjectedHessianOperator {
     /// Orthonormal basis for null(A_act), `p × m`.
-    z: Array2<f64>,
+    pub(crate) z: Array2<f64>,
     /// `H_T = ZᵀHZ`, re-eigendecomposed with its own `r_ε` regularization.
-    h_t_op: DenseSpectralOperator,
+    pub(crate) h_t_op: DenseSpectralOperator,
 }
 
 
@@ -757,7 +757,7 @@ impl HessianOperator for TangentProjectedHessianOperator {
 ///   value      = log|M(λ)|_+,                M(λ) = ZᵀS(λ)Z = Σ_k λ_k Zᵀ S_k Z
 ///   ∂_k value  = λ_k · tr(M⁺ · Zᵀ S_k Z)
 ///   ∂²_kl      = δ_{kl} ∂_k value − λ_k λ_l · tr(M⁺ · Zᵀ S_l Z · M⁺ · Zᵀ S_k Z)
-fn tangent_penalty_logdet(
+pub(crate) fn tangent_penalty_logdet(
     z: &Array2<f64>,
     penalty_coords: &[PenaltyCoordinate],
     lambdas: &[f64],
@@ -832,7 +832,7 @@ fn tangent_penalty_logdet(
 /// tangent-wrapped `HessianOperator` correctly projects via `ZᵀMZ` in
 /// its `trace_logdet_gradient` / `trace_hinv_product` methods. So no
 /// per-method projection is needed here — pure delegation suffices.
-struct BorrowedDerivProvider<'a>(&'a dyn HessianDerivativeProvider);
+pub(crate) struct BorrowedDerivProvider<'a>(&'a dyn HessianDerivativeProvider);
 
 
 impl<'a> HessianDerivativeProvider for BorrowedDerivProvider<'a> {

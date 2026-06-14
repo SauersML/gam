@@ -10,14 +10,14 @@ use super::*;
 /// from the same Cholesky factorization.
 pub struct SparseCholeskyOperator {
     /// The sparse Cholesky factorization.
-    factor: std::sync::Arc<crate::linalg::sparse_exact::SparseExactFactor>,
+    pub(crate) factor: std::sync::Arc<crate::linalg::sparse_exact::SparseExactFactor>,
     /// Takahashi selected inverse (precomputed H^{-1} entries on the filled pattern of L).
     /// When available, trace computations use direct lookups instead of column solves.
-    takahashi: Option<std::sync::Arc<crate::linalg::sparse_exact::TakahashiInverse>>,
+    pub(crate) takahashi: Option<std::sync::Arc<crate::linalg::sparse_exact::TakahashiInverse>>,
     /// Precomputed log-determinant from the Cholesky diagonal.
-    cached_logdet: f64,
+    pub(crate) cached_logdet: f64,
     /// Dimension of H.
-    n_dim: usize,
+    pub(crate) n_dim: usize,
 }
 
 
@@ -44,9 +44,9 @@ impl SparseCholeskyOperator {
         self
     }
 
-    const OPERATOR_SOLVE_CHUNK: usize = 64;
+    pub(crate) const OPERATOR_SOLVE_CHUNK: usize = 64;
 
-    fn takahashi_block_trace(
+    pub(crate) fn takahashi_block_trace(
         taka: &crate::linalg::sparse_exact::TakahashiInverse,
         block: &Array2<f64>,
         start: usize,
@@ -68,7 +68,7 @@ impl SparseCholeskyOperator {
         trace
     }
 
-    fn takahashi_left_multiply_block(
+    pub(crate) fn takahashi_left_multiply_block(
         taka: &crate::linalg::sparse_exact::TakahashiInverse,
         block: &Array2<f64>,
         start: usize,
@@ -96,7 +96,7 @@ impl SparseCholeskyOperator {
         out
     }
 
-    fn trace_hinv_operator_exact(&self, op: &dyn HyperOperator) -> f64 {
+    pub(crate) fn trace_hinv_operator_exact(&self, op: &dyn HyperOperator) -> f64 {
         let (range_start, range_end) = op
             .block_local_data()
             .map(|(_, start, end)| (start, end))
@@ -144,7 +144,7 @@ impl SparseCholeskyOperator {
         trace
     }
 
-    fn solve_operator_column_range_rows_exact(
+    pub(crate) fn solve_operator_column_range_rows_exact(
         &self,
         op: &dyn HyperOperator,
         col_start: usize,
@@ -194,7 +194,7 @@ impl SparseCholeskyOperator {
         Ok(solved)
     }
 
-    fn fill_scaled_block_columns(
+    pub(crate) fn fill_scaled_block_columns(
         block: &Array2<f64>,
         scale: f64,
         block_start: usize,
@@ -214,7 +214,7 @@ impl SparseCholeskyOperator {
         }
     }
 
-    fn trace_hinv_block_local_exact(
+    pub(crate) fn trace_hinv_block_local_exact(
         &self,
         block: &Array2<f64>,
         scale: f64,
@@ -282,7 +282,7 @@ impl SparseCholeskyOperator {
         trace
     }
 
-    fn solve_block_local_rows_exact(
+    pub(crate) fn solve_block_local_rows_exact(
         &self,
         block: &Array2<f64>,
         scale: f64,
@@ -339,7 +339,7 @@ impl SparseCholeskyOperator {
         Ok(solved)
     }
 
-    fn trace_hinv_block_local_cross_exact(
+    pub(crate) fn trace_hinv_block_local_cross_exact(
         &self,
         block: &Array2<f64>,
         scale: f64,
@@ -370,7 +370,7 @@ impl SparseCholeskyOperator {
         result
     }
 
-    fn trace_hinv_matrix_operator_cross_exact(
+    pub(crate) fn trace_hinv_matrix_operator_cross_exact(
         &self,
         matrix: &Array2<f64>,
         op: &dyn HyperOperator,
@@ -430,7 +430,7 @@ impl SparseCholeskyOperator {
         trace
     }
 
-    fn trace_hinv_matrix_block_operator_cross_exact(
+    pub(crate) fn trace_hinv_matrix_block_operator_cross_exact(
         &self,
         matrix: &Array2<f64>,
         op: &dyn HyperOperator,
@@ -509,7 +509,7 @@ impl SparseCholeskyOperator {
         trace
     }
 
-    fn trace_hinv_operator_cross_exact(
+    pub(crate) fn trace_hinv_operator_cross_exact(
         &self,
         left: &dyn HyperOperator,
         right: &dyn HyperOperator,
@@ -806,11 +806,11 @@ impl HessianOperator for SparseCholeskyOperator {
 /// `EvalMode::ValueOnly` returns before any trace call.
 pub struct DenseCholeskyValueOnlyOperator {
     /// LLT Cholesky factor.
-    chol: crate::faer_ndarray::FaerCholeskyFactor,
+    pub(crate) chol: crate::faer_ndarray::FaerCholeskyFactor,
     /// `2 · Σ ln(diag L)` — cached at construction time.
-    cached_logdet: f64,
+    pub(crate) cached_logdet: f64,
     /// Full parameter dimension.
-    n_dim: usize,
+    pub(crate) n_dim: usize,
 }
 
 
@@ -899,7 +899,7 @@ impl HessianOperator for DenseCholeskyValueOnlyOperator {
 /// `DenseSpectralOperator` and manually tracking block ranges separately.
 pub struct BlockCoupledOperator {
     /// Inner spectral operator over the full joint Hessian.
-    inner: DenseSpectralOperator,
+    pub(crate) inner: DenseSpectralOperator,
 }
 
 
@@ -1050,9 +1050,9 @@ impl HessianOperator for BlockCoupledOperator {
 /// explicit memory cap and delegate logdet, traces, and solves to
 /// `DenseSpectralOperator`.
 pub struct MatrixFreeSpdOperator {
-    apply: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
-    cached_logdet: crate::resource::RayonSafeOnce<f64>,
-    n_dim: usize,
+    pub(crate) apply: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
+    pub(crate) cached_logdet: crate::resource::RayonSafeOnce<f64>,
+    pub(crate) n_dim: usize,
     // `RayonSafeOnce`, not `OnceLock`: `materialize_dense_operator` invokes
     // `apply`, which for operator-source joint Hessians dispatches a nested
     // `into_par_iter` (e.g. `exact_newton_joint_hessian_matvec_from_cache`).
@@ -1062,7 +1062,7 @@ pub struct MatrixFreeSpdOperator {
     // for workers. `RayonSafeOnce` keeps init lock-free — racers may
     // duplicate the dim²-matvec build, but the first to publish wins and
     // steady-state matches `OnceLock`.
-    dense_spectral: crate::resource::RayonSafeOnce<Option<DenseSpectralOperator>>,
+    pub(crate) dense_spectral: crate::resource::RayonSafeOnce<Option<DenseSpectralOperator>>,
     // Pseudo-logdet convention threaded from the family. The dense outer path
     // already plumbs `PseudoLogdetMode` into `BlockCoupledOperator`; the
     // matrix-free path materializes a `DenseSpectralOperator` lazily and must
@@ -1071,13 +1071,13 @@ pub struct MatrixFreeSpdOperator {
     // Without this, families that declare `HardPseudo` (BMS, GAMLSS) silently
     // get Smooth full-spectrum semantics on the matrix-free path, and outer
     // gradients are inflated by `1/σ_j` over numerical null directions.
-    mode: PseudoLogdetMode,
+    pub(crate) mode: PseudoLogdetMode,
 }
 
 
 impl MatrixFreeSpdOperator {
-    const EXACT_DENSE_SPECTRAL_MAX_BYTES: usize = 512 * 1024 * 1024;
-    const EXACT_DENSE_SPECTRAL_ARRAYS: usize = 6;
+    pub(crate) const EXACT_DENSE_SPECTRAL_MAX_BYTES: usize = 512 * 1024 * 1024;
+    pub(crate) const EXACT_DENSE_SPECTRAL_ARRAYS: usize = 6;
 
     pub fn new_with_mode<F>(dim: usize, apply: F, mode: PseudoLogdetMode) -> Self
     where
@@ -1094,14 +1094,14 @@ impl MatrixFreeSpdOperator {
         }
     }
 
-    fn exact_dense_spectral_bytes(&self) -> Option<usize> {
+    pub(crate) fn exact_dense_spectral_bytes(&self) -> Option<usize> {
         self.n_dim
             .checked_mul(self.n_dim)?
             .checked_mul(std::mem::size_of::<f64>())?
             .checked_mul(Self::EXACT_DENSE_SPECTRAL_ARRAYS)
     }
 
-    fn exact_dense_spectral_budget_ok(&self) -> bool {
+    pub(crate) fn exact_dense_spectral_budget_ok(&self) -> bool {
         match self.exact_dense_spectral_bytes() {
             Some(bytes) if bytes <= Self::EXACT_DENSE_SPECTRAL_MAX_BYTES => true,
             Some(bytes) => {
@@ -1124,7 +1124,7 @@ impl MatrixFreeSpdOperator {
         }
     }
 
-    fn materialize_dense_operator(&self) -> Option<DenseSpectralOperator> {
+    pub(crate) fn materialize_dense_operator(&self) -> Option<DenseSpectralOperator> {
         if !self.exact_dense_spectral_budget_ok() {
             return None;
         }
@@ -1157,26 +1157,26 @@ impl MatrixFreeSpdOperator {
         result
     }
 
-    fn dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+    pub(crate) fn dense_spectral(&self) -> Option<&DenseSpectralOperator> {
         self.dense_spectral
             .get_or_compute(|| self.materialize_dense_operator())
             .as_ref()
     }
 
-    fn exact_dense_spectral(&self) -> &DenseSpectralOperator {
+    pub(crate) fn exact_dense_spectral(&self) -> &DenseSpectralOperator {
         self.dense_spectral().expect(
             "MatrixFreeSpdOperator exact REML algebra requires dense spectral materialization within the configured budget",
         )
     }
 
-    fn use_trace_cg(&self, rel_tol: f64) -> bool {
+    pub(crate) fn use_trace_cg(&self, rel_tol: f64) -> bool {
         rel_tol.is_finite()
             && rel_tol > 0.0
             && self.prefers_stochastic_trace_estimation()
             && self.has_matrix_free_trace_cg_operator()
     }
 
-    fn cg_trace_solve(
+    pub(crate) fn cg_trace_solve(
         &self,
         rhs: &Array1<f64>,
         rel_tol: f64,
@@ -1240,7 +1240,7 @@ impl MatrixFreeSpdOperator {
 }
 
 
-fn conjugate_gradient_trace_solve<F>(
+pub(crate) fn conjugate_gradient_trace_solve<F>(
     rhs: &Array1<f64>,
     rel_tol: f64,
     mut x: Array1<f64>,
@@ -1584,11 +1584,11 @@ pub fn compute_block_penalty_logdet_derivs(
         })
         .collect();
 
-    struct BlockPenaltyLogdetResult {
-        offset: usize,
-        value: f64,
-        first: Array1<f64>,
-        second: Array2<f64>,
+    pub(crate) struct BlockPenaltyLogdetResult {
+        pub(crate) offset: usize,
+        pub(crate) value: f64,
+        pub(crate) first: Array1<f64>,
+        pub(crate) second: Array2<f64>,
     }
 
     let compute_block = |(b, block_rho): (usize, &Array1<f64>)| {

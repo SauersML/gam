@@ -95,14 +95,14 @@ pub struct CorrectedCovariance {
 
 
 impl CorrectedCovariance {
-    fn has_structural_diagnostics(&self) -> bool {
+    pub(crate) fn has_structural_diagnostics(&self) -> bool {
         !self.active_constraints.is_empty() || !self.rank_deficient_directions.is_empty()
     }
 }
 
 
 /// Suggested action text returned with `OuterHessianIndefinite`.
-const INDEFINITE_SUGGESTED_ACTION: &str = "refit with a tighter outer tolerance, verify the inspected objective is the true \
+pub(crate) const INDEFINITE_SUGGESTED_ACTION: &str = "refit with a tighter outer tolerance, verify the inspected objective is the true \
      REML/LAML cost rather than a surrogate, and audit recent active-set transitions";
 
 
@@ -110,7 +110,7 @@ const INDEFINITE_SUGGESTED_ACTION: &str = "refit with a tighter outer tolerance,
 ///
 /// We use the same `tolerance = 1e-8` as the rest of the outer code path so the
 /// active-set view here agrees with the optimizer's view at the reported optimum.
-fn detect_active_theta_bounds(theta: Option<&[f64]>, q: usize) -> Vec<usize> {
+pub(crate) fn detect_active_theta_bounds(theta: Option<&[f64]>, q: usize) -> Vec<usize> {
     let Some(theta) = theta else {
         return Vec::new();
     };
@@ -120,7 +120,7 @@ fn detect_active_theta_bounds(theta: Option<&[f64]>, q: usize) -> Vec<usize> {
     let bound = crate::solver::estimate::RHO_BOUND;
     // Same active-bound tolerance the outer optimizer uses, so this active-set
     // view agrees with the optimizer's at the reported optimum.
-    const ACTIVE_THETA_BOUND_TOL: f64 = 1e-8;
+    pub(crate) const ACTIVE_THETA_BOUND_TOL: f64 = 1e-8;
     theta
         .iter()
         .enumerate()
@@ -135,7 +135,7 @@ fn detect_active_theta_bounds(theta: Option<&[f64]>, q: usize) -> Vec<usize> {
 /// hyperparameters) and the FIRST `rho_len` as ρ (bounded by ±RHO_BOUND).
 /// This matches the layout used everywhere else in this file: J_α has ρ
 /// columns first, then ext columns.
-fn active_bound_indices_for_theta(
+pub(crate) fn active_bound_indices_for_theta(
     theta: Option<&[f64]>,
     rho_len: usize,
     ext_len: usize,
@@ -153,7 +153,7 @@ fn active_bound_indices_for_theta(
 /// Returns `(V_θ_full, rank_deficient_free_indices)` where `V_θ_full` is q×q
 /// with rows/columns of active coordinates set to zero. If the projected
 /// Hessian is indefinite beyond tolerance, returns the diagnostic instead.
-fn projected_inverse_with_inertia_gate(
+pub(crate) fn projected_inverse_with_inertia_gate(
     outer_hessian: &Array2<f64>,
     active: &[usize],
     theta_for_diag: Option<&[f64]>,
@@ -427,7 +427,7 @@ pub struct CorrectedCovarianceDiagonal {
 
 
 impl CorrectedCovarianceDiagonal {
-    fn has_structural_diagnostics(&self) -> bool {
+    pub(crate) fn has_structural_diagnostics(&self) -> bool {
         !self.active_constraints.is_empty() || !self.rank_deficient_directions.is_empty()
     }
 }
@@ -530,7 +530,7 @@ pub fn compute_corrected_covariance_diagonal_with_constraints(
 
 
 /// Enforce exact symmetry on a square matrix by averaging off-diagonal pairs.
-fn enforce_symmetry_inplace(m: &mut Array2<f64>) {
+pub(crate) fn enforce_symmetry_inplace(m: &mut Array2<f64>) {
     let n = m.nrows();
     for i in 0..n {
         for j in (i + 1)..n {

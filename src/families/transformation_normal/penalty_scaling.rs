@@ -27,7 +27,7 @@ pub(crate) fn ctn_penalty_scale_log_lambdas(
     }))
 }
 
-fn penalty_diag_scale(penalty: &PenaltyMatrix) -> f64 {
+pub(crate) fn penalty_diag_scale(penalty: &PenaltyMatrix) -> f64 {
     match penalty {
         PenaltyMatrix::Dense(matrix) => {
             matrix_diag_mean_abs(matrix).max(matrix_frobenius_rms(matrix))
@@ -45,7 +45,7 @@ fn penalty_diag_scale(penalty: &PenaltyMatrix) -> f64 {
     }
 }
 
-fn matrix_diag_mean_abs(matrix: &Array2<f64>) -> f64 {
+pub(crate) fn matrix_diag_mean_abs(matrix: &Array2<f64>) -> f64 {
     let d = matrix.nrows().min(matrix.ncols());
     if d == 0 {
         return 0.0;
@@ -53,7 +53,7 @@ fn matrix_diag_mean_abs(matrix: &Array2<f64>) -> f64 {
     matrix.diag().iter().map(|v| v.abs()).sum::<f64>() / d as f64
 }
 
-fn matrix_frobenius_rms(matrix: &Array2<f64>) -> f64 {
+pub(crate) fn matrix_frobenius_rms(matrix: &Array2<f64>) -> f64 {
     let d = matrix.nrows().max(1).min(matrix.ncols().max(1));
     (matrix.iter().map(|v| v * v).sum::<f64>() / d as f64).sqrt()
 }
@@ -113,7 +113,7 @@ pub(crate) fn factored_weighted_cross(
 /// eliminates the per-chunk `Array2` from the previous `out += &bl.t().dot(&dw)`
 /// pattern (one allocation + one element-wise `+=` pass per chunk) and uses
 /// the multi-threaded faer kernel instead of ndarray's serial dot.
-fn chunked_weighted_bt_d(
+pub(crate) fn chunked_weighted_bt_d(
     b: &Array2<f64>,
     weights: ndarray::ArrayView1<'_, f64>,
     d: &Array2<f64>,

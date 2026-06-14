@@ -73,7 +73,7 @@ impl OuterHessianRoutePlan {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OuterHessianScaleDecision {
-    prefers_operator: bool,
+    pub(crate) prefers_operator: bool,
     pub(crate) reason: &'static str,
 }
 

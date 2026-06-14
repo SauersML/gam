@@ -244,7 +244,7 @@ pub(crate) fn custom_family_jeffreys_conditioning_gate_weight(
         return 1.0;
     }
     #[inline]
-    fn ramp_down(x: f64, under: f64, clear: f64) -> f64 {
+    pub(crate) fn ramp_down(x: f64, under: f64, clear: f64) -> f64 {
         if x <= under {
             return 1.0;
         }

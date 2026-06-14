@@ -26,14 +26,14 @@ use ndarray::{Array1, Array2};
 use std::any::type_name;
 use std::sync::atomic::Ordering;
 
-fn hash_cf_array_view(hasher: &mut Fingerprinter, values: ndarray::ArrayView1<'_, f64>) {
+pub(crate) fn hash_cf_array_view(hasher: &mut Fingerprinter, values: ndarray::ArrayView1<'_, f64>) {
     hasher.write_usize(values.len());
     for &value in values {
         hasher.write_f64(value);
     }
 }
 
-fn hash_cf_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
+pub(crate) fn hash_cf_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     hasher.write_usize(values.nrows());
     hasher.write_usize(values.ncols());
     for &value in values {
@@ -41,7 +41,7 @@ fn hash_cf_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     }
 }
 
-fn hash_cf_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> Result<(), String> {
+pub(crate) fn hash_cf_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> Result<(), String> {
     let n = design.nrows();
     let p = design.ncols();
     hasher.write_usize(n);
@@ -58,7 +58,7 @@ fn hash_cf_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> R
     Ok(())
 }
 
-fn hash_cf_penalty(hasher: &mut Fingerprinter, penalty: &PenaltyMatrix) {
+pub(crate) fn hash_cf_penalty(hasher: &mut Fingerprinter, penalty: &PenaltyMatrix) {
     match penalty {
         PenaltyMatrix::Dense(matrix) => {
             hasher.write_str("dense");
@@ -93,7 +93,7 @@ fn hash_cf_penalty(hasher: &mut Fingerprinter, penalty: &PenaltyMatrix) {
     }
 }
 
-fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
+pub(crate) fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -137,7 +137,7 @@ fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
     Some(format!("cf-{}", hasher.finish_hex()))
 }
 
-fn custom_family_cache_shape(specs: &[ParameterBlockSpec]) -> (usize, Vec<String>, Vec<usize>) {
+pub(crate) fn custom_family_cache_shape(specs: &[ParameterBlockSpec]) -> (usize, Vec<String>, Vec<usize>) {
     let n_rows = specs.first().map(|spec| spec.design.nrows()).unwrap_or(0);
     let block_names = specs.iter().map(|spec| spec.name.clone()).collect();
     let block_dims = specs.iter().map(|spec| spec.design.ncols()).collect();
@@ -203,7 +203,7 @@ pub(crate) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>
     )
 }
 
-fn persistent_block_inner_summary(
+pub(crate) fn persistent_block_inner_summary(
     warm_start: &ConstrainedWarmStart,
 ) -> Option<PersistentBlockInnerSummary> {
     warm_start.cached_inner.as_ref().and_then(|cached| {
@@ -246,7 +246,7 @@ pub(crate) fn store_persistent_custom_family_warm_start(
     // bound or a non-converged intermediate; either way they make poor
     // seed material because the load-side clamp pulls them back into
     // the interior anyway (see `outer_strategy.rs` `[CACHE] hit-clamp`).
-    const SATURATION_THRESHOLD: f64 = 9.0;
+    pub(crate) const SATURATION_THRESHOLD: f64 = 9.0;
     if warm_start
         .rho
         .iter()
@@ -280,7 +280,7 @@ pub(crate) fn store_persistent_custom_family_warm_start(
     }
 }
 
-const CUSTOM_OUTER_INNER_CAP_MARGIN: usize = 5;
+pub(crate) const CUSTOM_OUTER_INNER_CAP_MARGIN: usize = 5;
 
 pub(crate) fn update_custom_outer_inner_cap_from_warm_start(
     options: &BlockwiseFitOptions,

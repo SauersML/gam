@@ -16,10 +16,10 @@ pub(crate) struct TransformationNormalJointHessianWorkspace {
     /// matrix-free operator (dH, d²H per psi coord and per pair) would copy
     /// the full row-space Kronecker designs (~hundreds of MiB at large-scale
     /// scale) per call. Arc-sharing makes operator construction O(1).
-    family: Arc<TransformationNormalFamily>,
-    beta: Array1<f64>,
-    row_quantities: TransformationNormalRowQuantityCache,
-    dense_hessian_cache: OnceLock<Array2<f64>>,
+    pub(crate) family: Arc<TransformationNormalFamily>,
+    pub(crate) beta: Array1<f64>,
+    pub(crate) row_quantities: TransformationNormalRowQuantityCache,
+    pub(crate) dense_hessian_cache: OnceLock<Array2<f64>>,
 }
 
 impl TransformationNormalJointHessianWorkspace {
@@ -51,7 +51,7 @@ impl TransformationNormalJointHessianWorkspace {
             .is_some_and(|bytes| bytes <= SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_BYTES)
     }
 
-    fn dense_hessian(&self) -> Result<&Array2<f64>, String> {
+    pub(crate) fn dense_hessian(&self) -> Result<&Array2<f64>, String> {
         if let Some(hessian) = self.dense_hessian_cache.get() {
             return Ok(hessian);
         }
@@ -82,7 +82,7 @@ impl TransformationNormalJointHessianWorkspace {
             .ok_or_else(|| "CTN dense Hessian cache was not initialized".to_string())
     }
 
-    fn apply_hessian(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+    pub(crate) fn apply_hessian(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
         if v.len() != self.p_total() {
             return Err(TransformationNormalError::InvalidInput {
                 reason: format!(
@@ -121,7 +121,7 @@ impl TransformationNormalJointHessianWorkspace {
     }
 
     /// Exact diagonal of the unpenalized joint Hessian.
-    fn compute_diagonal(&self) -> Result<Array1<f64>, String> {
+    pub(crate) fn compute_diagonal(&self) -> Result<Array1<f64>, String> {
         if self.dense_hessian_cache_enabled() {
             return Ok(self.dense_hessian()?.diag().to_owned());
         }
@@ -254,10 +254,10 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
 /// rule instead of using the old scalar-weighted `X_deriv' diag(.) X_deriv`
 /// identity.
 pub(crate) struct TransformationNormalDhMatrixFreeOperator {
-    family: Arc<TransformationNormalFamily>,
-    beta: Array1<f64>,
-    row_quantities: TransformationNormalRowQuantityCache,
-    direction: Array1<f64>,
+    pub(crate) family: Arc<TransformationNormalFamily>,
+    pub(crate) beta: Array1<f64>,
+    pub(crate) row_quantities: TransformationNormalRowQuantityCache,
+    pub(crate) direction: Array1<f64>,
 }
 
 impl TransformationNormalDhMatrixFreeOperator {
@@ -275,17 +275,17 @@ impl TransformationNormalDhMatrixFreeOperator {
         }
     }
 
-    fn p_total(&self) -> usize {
+    pub(crate) fn p_total(&self) -> usize {
         self.family.x_deriv_kron.ncols()
     }
 
-    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         self.family
             .scop_hessian_directional_matvec(&self.beta, &self.direction, &self.row_quantities, v)
             .expect("validated CTN dH operator inputs should not fail")
     }
 
-    fn projected_gram_cache_id(&self) -> usize {
+    pub(crate) fn projected_gram_cache_id(&self) -> usize {
         let family_ptr = Arc::as_ptr(&self.family) as usize;
         let design_dims = self.family.covariate_design.nrows()
             ^ self.family.covariate_design.ncols().rotate_left(11);
@@ -371,11 +371,11 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
 /// the memory profile of matrix-free REML while matching the dense exact
 /// second derivative.
 pub(crate) struct TransformationNormalD2hMatrixFreeOperator {
-    family: Arc<TransformationNormalFamily>,
-    beta: Array1<f64>,
-    row_quantities: TransformationNormalRowQuantityCache,
-    direction_u: Array1<f64>,
-    direction_v: Array1<f64>,
+    pub(crate) family: Arc<TransformationNormalFamily>,
+    pub(crate) beta: Array1<f64>,
+    pub(crate) row_quantities: TransformationNormalRowQuantityCache,
+    pub(crate) direction_u: Array1<f64>,
+    pub(crate) direction_v: Array1<f64>,
 }
 
 impl TransformationNormalD2hMatrixFreeOperator {
@@ -395,11 +395,11 @@ impl TransformationNormalD2hMatrixFreeOperator {
         }
     }
 
-    fn p_total(&self) -> usize {
+    pub(crate) fn p_total(&self) -> usize {
         self.family.x_deriv_kron.ncols()
     }
 
-    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         self.family
             .scop_hessian_second_directional_matvec(
                 &self.beta,
@@ -452,14 +452,14 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
 }
 
 pub(crate) struct TransformationNormalPsiHessianOperator {
-    family: Arc<TransformationNormalFamily>,
-    beta: Array1<f64>,
-    op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-    axis: usize,
-    trace_axes: Arc<Vec<usize>>,
-    trace_axis_pos: usize,
-    trace_cache_id: usize,
-    row_quantities: TransformationNormalRowQuantityCache,
+    pub(crate) family: Arc<TransformationNormalFamily>,
+    pub(crate) beta: Array1<f64>,
+    pub(crate) op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    pub(crate) axis: usize,
+    pub(crate) trace_axes: Arc<Vec<usize>>,
+    pub(crate) trace_axis_pos: usize,
+    pub(crate) trace_cache_id: usize,
+    pub(crate) row_quantities: TransformationNormalRowQuantityCache,
 }
 
 impl TransformationNormalPsiHessianOperator {
@@ -525,14 +525,14 @@ impl TransformationNormalPsiHessianOperator {
         }
     }
 
-    fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
+    pub(crate) fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
         self.op
             .as_any()
             .downcast_ref::<TensorKroneckerPsiOperator>()
             .expect("validated CTN psi operator must remain tensor-backed")
     }
 
-    fn apply_columns_with_shared_cov(
+    pub(crate) fn apply_columns_with_shared_cov(
         &self,
         factor: &Array2<f64>,
         cov: &Array2<f64>,
@@ -550,7 +550,7 @@ impl TransformationNormalPsiHessianOperator {
             .expect("validated CTN psi Hessian operator batched input should not fail")
     }
 
-    fn projected_trace_table(&self, factor: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn projected_trace_table(&self, factor: &Array2<f64>) -> Array2<f64> {
         assert_eq!(factor.nrows(), self.dim());
         let axes = self.trace_axes.as_slice();
         if axes.is_empty() {
@@ -691,12 +691,12 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
 }
 
 pub(crate) struct TransformationNormalPsiDhMatrixFreeOperator {
-    family: Arc<TransformationNormalFamily>,
-    beta: Array1<f64>,
-    direction: Array1<f64>,
-    op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-    axis: usize,
-    row_quantities: TransformationNormalRowQuantityCache,
+    pub(crate) family: Arc<TransformationNormalFamily>,
+    pub(crate) beta: Array1<f64>,
+    pub(crate) direction: Array1<f64>,
+    pub(crate) op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    pub(crate) axis: usize,
+    pub(crate) row_quantities: TransformationNormalRowQuantityCache,
     // `RayonSafeOnce` (not `OnceLock`): `dense_matrix()` materializes via
     // `scop_psi_hessian_directional_derivative`, which dispatches an
     // `into_par_iter` over rows. This operator is invoked from outer
@@ -707,7 +707,7 @@ pub(crate) struct TransformationNormalPsiDhMatrixFreeOperator {
     // (see `feedback_oncelock_rayon_deadlock`). `RayonSafeOnce` keeps the
     // init lock-free; racers redundantly compute but `set()` discards the
     // losers.
-    dense_cache: crate::resource::RayonSafeOnce<Array2<f64>>,
+    pub(crate) dense_cache: crate::resource::RayonSafeOnce<Array2<f64>>,
 }
 
 impl TransformationNormalPsiDhMatrixFreeOperator {
@@ -730,18 +730,18 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
         }
     }
 
-    fn p_total(&self) -> usize {
+    pub(crate) fn p_total(&self) -> usize {
         self.beta.len()
     }
 
-    fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
+    pub(crate) fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
         self.op
             .as_any()
             .downcast_ref::<TensorKroneckerPsiOperator>()
             .expect("validated CTN psi dH operator must remain tensor-backed")
     }
 
-    fn dense_matrix(&self) -> &Array2<f64> {
+    pub(crate) fn dense_matrix(&self) -> &Array2<f64> {
         self.dense_cache.get_or_compute(|| {
             self.family
                 .scop_psi_hessian_directional_derivative(
@@ -755,7 +755,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
         })
     }
 
-    fn trace_projected_factor_dense(&self, factor: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_projected_factor_dense(&self, factor: &Array2<f64>) -> f64 {
         let dense_factor = crate::faer_ndarray::fast_ab(self.dense_matrix(), factor);
         factor
             .iter()
@@ -764,7 +764,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
             .sum()
     }
 
-    fn projected_factor_cache_id(&self) -> usize {
+    pub(crate) fn projected_factor_cache_id(&self) -> usize {
         let family_ptr = Arc::as_ptr(&self.family) as usize;
         family_ptr
             ^ self.axis.wrapping_add(0x9e37_79b9).rotate_left(17)
@@ -772,7 +772,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
             ^ self.family.covariate_design.ncols().rotate_left(29)
     }
 
-    fn projected_factor_table_bytes(&self, factor: &Array2<f64>) -> usize {
+    pub(crate) fn projected_factor_table_bytes(&self, factor: &Array2<f64>) -> usize {
         let n = self.family.response_val_basis.nrows();
         let p_resp = self.family.response_val_basis.ncols();
         let rank = factor.ncols();
@@ -782,13 +782,13 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
             .saturating_mul(std::mem::size_of::<f64>())
     }
 
-    fn projected_factor_table_fits_budget(&self, factor: &Array2<f64>) -> bool {
+    pub(crate) fn projected_factor_table_fits_budget(&self, factor: &Array2<f64>) -> bool {
         let bytes = self.projected_factor_table_bytes(factor);
         let policy = ResourcePolicy::default_library();
         bytes <= policy.max_single_materialization_bytes && bytes <= policy.max_operator_cache_bytes
     }
 
-    fn projected_factor_table(&self, factor: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn projected_factor_table(&self, factor: &Array2<f64>) -> Array2<f64> {
         assert_eq!(factor.nrows(), self.p_total());
         let n = self.family.response_val_basis.nrows();
         let p_cov = self.family.covariate_design.ncols();
@@ -838,7 +838,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
         table
     }
 
-    fn trace_projected_factor_with_projected_table(
+    pub(crate) fn trace_projected_factor_with_projected_table(
         &self,
         factor: &Array2<f64>,
         table: ArrayView2<'_, f64>,
@@ -891,7 +891,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
         total
     }
 
-    fn trace_projected_factor_streaming(&self, factor: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_projected_factor_streaming(&self, factor: &Array2<f64>) -> f64 {
         let n = self.family.response_val_basis.nrows();
         let p_cov = self.family.covariate_design.ncols();
         let rank = factor.ncols();
@@ -996,19 +996,19 @@ impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
 }
 
 pub(crate) struct TransformationNormalPsiPsiHessianOperator {
-    family: Arc<TransformationNormalFamily>,
-    beta: Array1<f64>,
-    op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-    axis_i: usize,
-    axis_j: usize,
-    trace_axes: Arc<Vec<usize>>,
-    trace_axis_i_pos: usize,
-    trace_axis_j_pos: usize,
-    trace_cache_id: usize,
-    row_gamma: Arc<Array2<f64>>,
-    row_h: Arc<Array1<f64>>,
-    row_h_prime: Arc<Array1<f64>>,
-    endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
+    pub(crate) family: Arc<TransformationNormalFamily>,
+    pub(crate) beta: Array1<f64>,
+    pub(crate) op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    pub(crate) axis_i: usize,
+    pub(crate) axis_j: usize,
+    pub(crate) trace_axes: Arc<Vec<usize>>,
+    pub(crate) trace_axis_i_pos: usize,
+    pub(crate) trace_axis_j_pos: usize,
+    pub(crate) trace_cache_id: usize,
+    pub(crate) row_gamma: Arc<Array2<f64>>,
+    pub(crate) row_h: Arc<Array1<f64>>,
+    pub(crate) row_h_prime: Arc<Array1<f64>>,
+    pub(crate) endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
 }
 
 impl TransformationNormalPsiPsiHessianOperator {
@@ -1081,18 +1081,18 @@ impl TransformationNormalPsiPsiHessianOperator {
         }
     }
 
-    fn p_total(&self) -> usize {
+    pub(crate) fn p_total(&self) -> usize {
         self.beta.len()
     }
 
-    fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
+    pub(crate) fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
         self.op
             .as_any()
             .downcast_ref::<TensorKroneckerPsiOperator>()
             .expect("validated CTN psi-psi operator must remain tensor-backed")
     }
 
-    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         self.family
             .scop_psi_psi_value_score_hvp_from_operator(
                 &self.beta,
@@ -1110,7 +1110,7 @@ impl TransformationNormalPsiPsiHessianOperator {
             .expect("CTN psi-psi operator called without HVP output")
     }
 
-    fn apply_columns_with_shared_cov(
+    pub(crate) fn apply_columns_with_shared_cov(
         &self,
         factor: &Array2<f64>,
         cov: &Array2<f64>,
@@ -1149,7 +1149,7 @@ impl TransformationNormalPsiPsiHessianOperator {
         out
     }
 
-    fn trace_columns_with_shared_cov(
+    pub(crate) fn trace_columns_with_shared_cov(
         &self,
         factor: &Array2<f64>,
         cov: &Array2<f64>,
@@ -1176,7 +1176,7 @@ impl TransformationNormalPsiPsiHessianOperator {
             .expect("validated CTN psi-psi projected trace inputs should not fail")
     }
 
-    fn projected_trace_table(&self, factor: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn projected_trace_table(&self, factor: &Array2<f64>) -> Array2<f64> {
         assert_eq!(factor.nrows(), self.p_total());
         let n_axes = self.trace_axes.len();
         let n = self.family.response_val_basis.nrows();

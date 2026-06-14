@@ -33,51 +33,51 @@ pub struct TransformationNormalFamily {
     // --- Tensor product design matrices ---
     /// Value design operator: keeps the tensor factors separate and materializes
     /// only row chunks or explicitly requested dense diagnostics.
-    x_val_kron: KroneckerDesign,
+    pub(crate) x_val_kron: KroneckerDesign,
     /// Derivative design operator: keeps the tensor factors separate.
-    x_deriv_kron: KroneckerDesign,
+    pub(crate) x_deriv_kron: KroneckerDesign,
     // --- Response-direction basis (fixed, does not depend on κ) ---
     /// Response value basis: n × p_resp. Columns: [1, I_1(y), ..., I_k(y)].
-    response_val_basis: Array2<f64>,
+    pub(crate) response_val_basis: Array2<f64>,
     /// Response value basis at the finite lower support endpoint.
-    response_lower_basis: Array1<f64>,
+    pub(crate) response_lower_basis: Array1<f64>,
     /// Response value basis at the finite upper support endpoint.
-    response_upper_basis: Array1<f64>,
+    pub(crate) response_upper_basis: Array1<f64>,
     /// Response derivative basis: n × p_resp. Columns: [0, M_1(y), ..., M_k(y)].
-    response_deriv_basis: Array2<f64>,
+    pub(crate) response_deriv_basis: Array2<f64>,
 
     // --- Covariate side (rebuilt on κ change) ---
     /// Original covariate design used on the right side of the tensor product.
-    covariate_design: DesignMatrix,
+    pub(crate) covariate_design: DesignMatrix,
     /// Dense covariate block shared by row-quantity and endpoint evaluations.
     ///
     /// CTN row quantities are rebuilt at every accepted/probed β, but the
     /// covariate design is fixed for the family. Caching this immutable
     /// `n × p_cov` block avoids repeated chunk materialization and keeps
     /// large-scale runs from churning large transient allocations.
-    covariate_dense_cache: Arc<Mutex<Option<Arc<Array2<f64>>>>>,
+    pub(crate) covariate_dense_cache: Arc<Mutex<Option<Arc<Array2<f64>>>>>,
     /// Optional non-negative row weights folded directly into the likelihood.
-    weights: Arc<Array1<f64>>,
+    pub(crate) weights: Arc<Array1<f64>>,
     /// Additive offset for the transformation linear predictor.
-    offset: Arc<Array1<f64>>,
+    pub(crate) offset: Arc<Array1<f64>>,
     // --- Tensor penalties ---
-    tensor_penalties: Vec<PenaltyMatrix>,
+    pub(crate) tensor_penalties: Vec<PenaltyMatrix>,
 
     // --- Initial values ---
-    initial_beta: Array1<f64>,
-    initial_log_lambdas: Array1<f64>,
+    pub(crate) initial_beta: Array1<f64>,
+    pub(crate) initial_log_lambdas: Array1<f64>,
 
     // --- Config ---
-    block_name: String,
+    pub(crate) block_name: String,
 
     // --- Response basis metadata (for reconstruction at predict time) ---
-    response_knots: Array1<f64>,
-    response_transform: Array2<f64>,
-    response_degree: usize,
-    response_median: f64,
-    response_floor_offset: Arc<Array1<f64>>,
-    response_lower_floor_offset: f64,
-    response_upper_floor_offset: f64,
+    pub(crate) response_knots: Array1<f64>,
+    pub(crate) response_transform: Array2<f64>,
+    pub(crate) response_degree: usize,
+    pub(crate) response_median: f64,
+    pub(crate) response_floor_offset: Arc<Array1<f64>>,
+    pub(crate) response_lower_floor_offset: f64,
+    pub(crate) response_upper_floor_offset: f64,
 
     /// Last row-space transformation quantities for an exact beta vector.
     ///
@@ -86,7 +86,7 @@ pub struct TransformationNormalFamily {
     /// coefficients. This cache keeps the expensive Khatri-Rao forward products
     /// and reciprocal powers behind a single exact-keyed entry instead of
     /// recomputing `h`, `h'`, `1/h'`, and derivative powers per call.
-    row_quantity_cache: Arc<Mutex<Option<TransformationNormalRowQuantityCache>>>,
+    pub(crate) row_quantity_cache: Arc<Mutex<Option<TransformationNormalRowQuantityCache>>>,
     /// Optional outer-score Horvitz-Thompson per-row weights.
     ///
     /// When present, this is an `n`-vector equal to the original `weights`
@@ -101,7 +101,7 @@ pub struct TransformationNormalFamily {
     ///
     /// `None` preserves byte-identical legacy behavior (`effective_weights`
     /// returns the original `weights` array).
-    outer_subsample_weights: Option<Arc<Array1<f64>>>,
+    pub(crate) outer_subsample_weights: Option<Arc<Array1<f64>>>,
 }
 
 #[derive(Clone)]
@@ -118,8 +118,8 @@ pub(crate) struct TransformationNormalRowQuantityCache {
 
 #[derive(Debug)]
 pub(crate) struct TransformationNormalRowDerived {
-    log_likelihood: f64,
-    endpoint_q: Vec<LogNormalCdfDiffDerivatives>,
+    pub(crate) log_likelihood: f64,
+    pub(crate) endpoint_q: Vec<LogNormalCdfDiffDerivatives>,
 }
 
 impl TransformationNormalRowQuantityCache {

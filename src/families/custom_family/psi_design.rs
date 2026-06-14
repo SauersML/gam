@@ -280,9 +280,9 @@ impl MaterializablePsiDerivativeOperator for crate::terms::basis::ImplicitDesign
 }
 
 pub(crate) struct EmbeddedImplicitPsiDerivativeOperator {
-    base: Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
-    total_p: usize,
-    global_range: Range<usize>,
+    pub(crate) base: Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+    pub(crate) total_p: usize,
+    pub(crate) global_range: Range<usize>,
 }
 
 impl EmbeddedImplicitPsiDerivativeOperator {
@@ -317,14 +317,14 @@ impl EmbeddedImplicitPsiDerivativeOperator {
         })
     }
 
-    fn embed_vector(&self, local: Array1<f64>) -> Array1<f64> {
+    pub(crate) fn embed_vector(&self, local: Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(self.total_p);
         out.slice_mut(ndarray::s![self.global_range.clone()])
             .assign(&local);
         out
     }
 
-    fn local_coeffs(
+    pub(crate) fn local_coeffs(
         &self,
         u: &ArrayView1<'_, f64>,
         context: &str,
@@ -476,8 +476,8 @@ impl MaterializablePsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperat
 /// at the large-scale spatial-adaptive overlay (n ≈ 320 000, p ≈ 101,
 /// six hyperparameters).
 pub(crate) struct ZeroPsiDerivativeOperator {
-    n: usize,
-    p: usize,
+    pub(crate) n: usize,
+    pub(crate) p: usize,
 }
 
 impl ZeroPsiDerivativeOperator {
@@ -658,16 +658,16 @@ pub(crate) fn stack_dense_row_blocks(blocks: &[Array2<f64>]) -> Array2<f64> {
 }
 
 pub(crate) struct EmbeddedDensePsiDerivativeOperator {
-    axis: usize,
-    total_p: usize,
-    global_range: Range<usize>,
-    first_local: Array2<f64>,
-    second_diag_local: Array2<f64>,
-    second_cross_local: HashMap<usize, Array2<f64>>,
+    pub(crate) axis: usize,
+    pub(crate) total_p: usize,
+    pub(crate) global_range: Range<usize>,
+    pub(crate) first_local: Array2<f64>,
+    pub(crate) second_diag_local: Array2<f64>,
+    pub(crate) second_cross_local: HashMap<usize, Array2<f64>>,
 }
 
 impl EmbeddedDensePsiDerivativeOperator {
-    fn new(
+    pub(crate) fn new(
         axis: usize,
         total_p: usize,
         global_range: Range<usize>,
@@ -706,7 +706,7 @@ impl EmbeddedDensePsiDerivativeOperator {
         })
     }
 
-    fn validate_axis(
+    pub(crate) fn validate_axis(
         &self,
         axis: usize,
         context: &str,
@@ -721,14 +721,14 @@ impl EmbeddedDensePsiDerivativeOperator {
         }
     }
 
-    fn embed_vector(&self, local: Array1<f64>) -> Array1<f64> {
+    pub(crate) fn embed_vector(&self, local: Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(self.total_p);
         out.slice_mut(ndarray::s![self.global_range.clone()])
             .assign(&local);
         out
     }
 
-    fn local_coeffs(
+    pub(crate) fn local_coeffs(
         &self,
         u: &ArrayView1<'_, f64>,
         context: &str,
@@ -743,7 +743,7 @@ impl EmbeddedDensePsiDerivativeOperator {
         Ok(u.slice(ndarray::s![self.global_range.clone()]).to_owned())
     }
 
-    fn cross_local(
+    pub(crate) fn cross_local(
         &self,
         axis_e: usize,
         context: &str,
@@ -961,15 +961,15 @@ pub(crate) fn build_embedded_dense_psi_operator(
 }
 
 pub(crate) struct RowwiseKroneckerPsiDerivativeOperator {
-    base: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-    time_bases: Vec<Arc<Array2<f64>>>,
-    n_per_block: usize,
-    p_time: usize,
-    p_out: usize,
+    pub(crate) base: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    pub(crate) time_bases: Vec<Arc<Array2<f64>>>,
+    pub(crate) n_per_block: usize,
+    pub(crate) p_time: usize,
+    pub(crate) p_out: usize,
 }
 
 impl RowwiseKroneckerPsiDerivativeOperator {
-    fn new(
+    pub(crate) fn new(
         base: Arc<dyn CustomFamilyPsiDerivativeOperator>,
         time_bases: Vec<Arc<Array2<f64>>>,
     ) -> Result<Self, String> {
@@ -1004,7 +1004,7 @@ impl RowwiseKroneckerPsiDerivativeOperator {
         })
     }
 
-    fn split_time_columns(&self, u: &ArrayView1<'_, f64>) -> Vec<Array1<f64>> {
+    pub(crate) fn split_time_columns(&self, u: &ArrayView1<'_, f64>) -> Vec<Array1<f64>> {
         let p_base = self.base.p_out();
         assert_eq!(u.len(), self.p_out);
         let mut cols = vec![Array1::<f64>::zeros(p_base); self.p_time];
@@ -1016,7 +1016,7 @@ impl RowwiseKroneckerPsiDerivativeOperator {
         cols
     }
 
-    fn lifted_row_chunk_with_base<F>(
+    pub(crate) fn lifted_row_chunk_with_base<F>(
         &self,
         rows: Range<usize>,
         mut base_chunk: F,
@@ -1056,7 +1056,7 @@ impl RowwiseKroneckerPsiDerivativeOperator {
     /// Canonical transpose-direction lifted matvec: for each time column `t`,
     /// weight `v` by the time basis column, delegate to the base operator via
     /// `base_op`, and scatter the per-base accumulator into the lifted layout.
-    fn lifted_transpose_mul_with_base<F>(
+    pub(crate) fn lifted_transpose_mul_with_base<F>(
         &self,
         v: &ArrayView1<'_, f64>,
         mut base_op: F,
@@ -1086,7 +1086,7 @@ impl RowwiseKroneckerPsiDerivativeOperator {
     /// Canonical forward-direction lifted matvec: split `u` into per-time-column
     /// coefficient vectors, delegate each to the base operator via `base_op`, and
     /// accumulate the time-basis-weighted contributions into the block rows.
-    fn lifted_forward_mul_with_base<F>(
+    pub(crate) fn lifted_forward_mul_with_base<F>(
         &self,
         u: &ArrayView1<'_, f64>,
         mut base_op: F,
@@ -1250,10 +1250,10 @@ pub(crate) fn build_rowwise_kronecker_psi_operator(
 
 #[derive(Clone)]
 pub(crate) struct CustomFamilyPsiDesignAction {
-    operator: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-    axis: usize,
-    row_range: Range<usize>,
-    p: usize,
+    pub(crate) operator: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    pub(crate) axis: usize,
+    pub(crate) row_range: Range<usize>,
+    pub(crate) p: usize,
 }
 
 impl CustomFamilyPsiDesignAction {
@@ -1348,7 +1348,7 @@ impl CustomFamilyPsiDesignAction {
         }
     }
 
-    fn absolute_rows(&self, rows: Range<usize>) -> Range<usize> {
+    pub(crate) fn absolute_rows(&self, rows: Range<usize>) -> Range<usize> {
         (self.row_range.start + rows.start)..(self.row_range.start + rows.end)
     }
 
@@ -1396,10 +1396,10 @@ pub(crate) enum CustomFamilyPsiSecondDesignLevel {
 
 #[derive(Clone)]
 pub(crate) struct CustomFamilyPsiSecondDesignAction {
-    operator: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-    level: CustomFamilyPsiSecondDesignLevel,
-    row_range: Range<usize>,
-    p: usize,
+    pub(crate) operator: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    pub(crate) level: CustomFamilyPsiSecondDesignLevel,
+    pub(crate) row_range: Range<usize>,
+    pub(crate) p: usize,
 }
 
 impl CustomFamilyPsiSecondDesignAction {
@@ -1494,7 +1494,7 @@ impl CustomFamilyPsiSecondDesignAction {
         }
     }
 
-    fn absolute_rows(&self, rows: Range<usize>) -> Range<usize> {
+    pub(crate) fn absolute_rows(&self, rows: Range<usize>) -> Range<usize> {
         (self.row_range.start + rows.start)..(self.row_range.start + rows.end)
     }
 
@@ -1795,9 +1795,9 @@ pub(crate) fn second_psi_linear_map<'a>(
 }
 
 pub(crate) struct CustomFamilyJointDesignChannel {
-    range: Range<usize>,
-    design: DesignMatrix,
-    psi_derivative: Option<CustomFamilyPsiDesignAction>,
+    pub(crate) range: Range<usize>,
+    pub(crate) design: DesignMatrix,
+    pub(crate) psi_derivative: Option<CustomFamilyPsiDesignAction>,
 }
 
 impl CustomFamilyJointDesignChannel {
@@ -1816,25 +1816,25 @@ impl CustomFamilyJointDesignChannel {
         }
     }
 
-    fn coefficients(&self, full: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn coefficients(&self, full: &Array1<f64>) -> Array1<f64> {
         full.slice(ndarray::s![self.range.clone()]).to_owned()
     }
 
-    fn apply(&self, full: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply(&self, full: &Array1<f64>) -> Array1<f64> {
         let coeffs = self.coefficients(full);
         self.design.matrixvectormultiply(&coeffs)
     }
 
-    fn apply_transpose(&self, values: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply_transpose(&self, values: &Array1<f64>) -> Array1<f64> {
         self.design.transpose_vector_multiply(values)
     }
 }
 
 pub(crate) struct CustomFamilyJointDesignPairContribution {
-    left_channel: usize,
-    right_channel: usize,
-    weights: Array1<f64>,
-    drift_weights: Array1<f64>,
+    pub(crate) left_channel: usize,
+    pub(crate) right_channel: usize,
+    pub(crate) weights: Array1<f64>,
+    pub(crate) drift_weights: Array1<f64>,
 }
 
 impl CustomFamilyJointDesignPairContribution {
@@ -1854,12 +1854,12 @@ impl CustomFamilyJointDesignPairContribution {
 }
 
 pub(crate) struct CustomFamilyJointPsiOperator {
-    total_dim: usize,
-    channels: Vec<CustomFamilyJointDesignChannel>,
-    pair_contributions: Vec<CustomFamilyJointDesignPairContribution>,
+    pub(crate) total_dim: usize,
+    pub(crate) channels: Vec<CustomFamilyJointDesignChannel>,
+    pub(crate) pair_contributions: Vec<CustomFamilyJointDesignPairContribution>,
     /// Optional dense correction for small cross-blocks (e.g. h/w parameters)
     /// that don't warrant their own weighted-Gram channel.
-    dense_correction: Option<Array2<f64>>,
+    pub(crate) dense_correction: Option<Array2<f64>>,
 }
 
 impl CustomFamilyJointPsiOperator {
@@ -2042,7 +2042,7 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
 
 pub(crate) fn shared_dense_design_cache()
 -> &'static Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>> {
-    static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>>> =
+    pub(crate) static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -2273,7 +2273,7 @@ impl std::fmt::Debug for ExactNewtonJointPsiTerms {
 }
 
 impl ExactNewtonJointPsiTerms {
-    fn zeros(total: usize) -> Self {
+    pub(crate) fn zeros(total: usize) -> Self {
         Self {
             objective_psi: 0.0,
             score_psi: Array1::zeros(total),
@@ -2666,9 +2666,9 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
 }
 
 pub(crate) struct ExactNewtonJointPsiDirectCache<T> {
-    entries: Vec<Mutex<Option<Option<Arc<T>>>>>,
-    lru: Mutex<std::collections::VecDeque<usize>>,
-    limit: usize,
+    pub(crate) entries: Vec<Mutex<Option<Option<Arc<T>>>>>,
+    pub(crate) lru: Mutex<std::collections::VecDeque<usize>>,
+    pub(crate) limit: usize,
 }
 
 impl<T> ExactNewtonJointPsiDirectCache<T> {
@@ -2680,7 +2680,7 @@ impl<T> ExactNewtonJointPsiDirectCache<T> {
         }
     }
 
-    fn touch_lru(&self, index: usize) -> Result<(), String> {
+    pub(crate) fn touch_lru(&self, index: usize) -> Result<(), String> {
         let mut lru = self
             .lru
             .lock()

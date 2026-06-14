@@ -9,11 +9,11 @@ use super::*;
 
 
 
-const GAMMA_SHAPE_MIN: f64 = 1e-8;
+pub(crate) const GAMMA_SHAPE_MIN: f64 = 1e-8;
 
-const GAMMA_SHAPE_MAX: f64 = 1e12;
+pub(crate) const GAMMA_SHAPE_MAX: f64 = 1e12;
 
-const GAMMA_SHAPE_TARGET_TOL: f64 = 1e-12;
+pub(crate) const GAMMA_SHAPE_TARGET_TOL: f64 = 1e-12;
 
 
 /// Saturation threshold for `|η|` diagnostics at inner P-IRLS iterates.
@@ -25,17 +25,17 @@ pub(super) const PIRLS_ETA_ABS_CAP: f64 = 40.0;
 
 
 #[inline]
-fn gamma_shape_score(shape: f64, target: f64) -> f64 {
+pub(crate) fn gamma_shape_score(shape: f64, target: f64) -> f64 {
     shape.ln() - digamma(shape) - target
 }
 
 
-fn estimate_gamma_shape_from_eta(
+pub(crate) fn estimate_gamma_shape_from_eta(
     y: ArrayView1<'_, f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> f64 {
-    const EPS: f64 = 1e-12;
+    pub(crate) const EPS: f64 = 1e-12;
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let (weighted_target, total_weight) = (0..eta.len())
@@ -104,14 +104,14 @@ fn estimate_gamma_shape_from_eta(
 /// smoothing-parameter loop drives it to the joint optimum. The estimate is
 /// clamped to a wide, strictly-positive admissible band so a transient
 /// near-degenerate residual sum cannot push `phi` non-positive or to infinity.
-fn estimate_beta_phi_from_eta(
+pub(crate) fn estimate_beta_phi_from_eta(
     y: ArrayView1<'_, f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> f64 {
-    const PHI_MIN: f64 = 1e-3;
-    const PHI_MAX: f64 = 1e6;
-    const MU_EPS: f64 = 1e-9;
+    pub(crate) const PHI_MIN: f64 = 1e-3;
+    pub(crate) const PHI_MAX: f64 = 1e6;
+    pub(crate) const MU_EPS: f64 = 1e-9;
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let (weighted_pearson, total_weight) = (0..eta.len())
@@ -169,15 +169,15 @@ fn estimate_beta_phi_from_eta(
 /// dispersion. The estimate is clamped to a wide strictly-positive band so a
 /// transient degenerate residual sum cannot push `phi` non-positive or
 /// non-finite.
-fn estimate_tweedie_phi_from_eta(
+pub(crate) fn estimate_tweedie_phi_from_eta(
     y: ArrayView1<'_, f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
     p: f64,
 ) -> f64 {
-    const PHI_MIN: f64 = 1e-6;
-    const PHI_MAX: f64 = 1e12;
-    const MU_EPS: f64 = 1e-300;
+    pub(crate) const PHI_MIN: f64 = 1e-6;
+    pub(crate) const PHI_MAX: f64 = 1e12;
+    pub(crate) const MU_EPS: f64 = 1e-300;
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let (weighted_pearson, total_weight) = (0..eta.len())
@@ -210,9 +210,9 @@ fn estimate_tweedie_phi_from_eta(
 /// `THETA_MIN` caps the heaviest overdispersion the estimator will report;
 /// `THETA_MAX` is the effective Poisson limit (`Var → mu`) used when the data is
 /// equi- or under-dispersed and the ML score has no finite interior root.
-const NEGBIN_THETA_MIN: f64 = 1e-3;
+pub(crate) const NEGBIN_THETA_MIN: f64 = 1e-3;
 
-const NEGBIN_THETA_MAX: f64 = 1e6;
+pub(crate) const NEGBIN_THETA_MAX: f64 = 1e6;
 
 
 /// Prior-weighted Negative-Binomial `theta` ML score and observed information at
@@ -228,7 +228,7 @@ const NEGBIN_THETA_MAX: f64 = 1e6;
 /// ```
 /// — the exact statistics MASS `glm.nb`/`theta.ml` Newton-iterates. Both sums
 /// share one pass over the rows.
-fn negbin_theta_score_and_info(
+pub(crate) fn negbin_theta_score_and_info(
     y: ArrayView1<'_, f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
@@ -287,7 +287,7 @@ fn negbin_theta_score_and_info(
 /// of-moments overdispersion `μ̄/(D−1)` with `D` the Poisson-Pearson ratio. This
 /// converges quadratically near the root in a handful of `O(n)` passes, matching
 /// the sibling Gamma-shape/Beta-φ converged-η estimators in this module.
-fn estimate_negbin_theta_from_eta(
+pub(crate) fn estimate_negbin_theta_from_eta(
     y: ArrayView1<'_, f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
@@ -347,8 +347,8 @@ fn estimate_negbin_theta_from_eta(
     let mut hi = NEGBIN_THETA_MAX;
     theta = theta.clamp(lo, hi);
 
-    const MAX_NEWTON_ITERS: usize = 100;
-    const REL_TOL: f64 = 1e-10;
+    pub(crate) const MAX_NEWTON_ITERS: usize = 100;
+    pub(crate) const REL_TOL: f64 = 1e-10;
     for _ in 0..MAX_NEWTON_ITERS {
         let (score, info) = negbin_theta_score_and_info(y, eta, priorweights, theta);
         if !score.is_finite() {

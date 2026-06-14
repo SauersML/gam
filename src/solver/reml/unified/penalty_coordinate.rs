@@ -993,14 +993,14 @@ impl PenaltySubspaceTrace {
 /// Caches the small `k_active × k_active` Schur inverse so subsequent
 /// per-coordinate `apply` calls only do `O(p · k_active)` work each.
 pub struct ConstrainedSubspaceKernel<'a> {
-    kernel: &'a PenaltySubspaceTrace,
+    pub(crate) kernel: &'a PenaltySubspaceTrace,
     /// `Z = K_S · Aᵀ_act`, shape `(p × k_active)`.
-    z: Array2<f64>,
+    pub(crate) z: Array2<f64>,
     /// Active-row block of the joint constraint matrix.
-    a_act: ndarray::ArrayView2<'a, f64>,
+    pub(crate) a_act: ndarray::ArrayView2<'a, f64>,
     /// `(A_act · K_S · Aᵀ_act)⁻¹`, shape `(k_active × k_active)`.
-    m_inv: Array2<f64>,
-    k_active: usize,
+    pub(crate) m_inv: Array2<f64>,
+    pub(crate) k_active: usize,
 }
 
 impl<'a> ConstrainedSubspaceKernel<'a> {
@@ -1084,12 +1084,12 @@ pub(crate) const THETA_MODE_RESPONSE_TANGENCY_GATE: f64 = 1e-6;
 /// contraction of this kernel, so atoms borrowing the shared drift can no
 /// longer see a different chain rule than their neighbors.
 pub(crate) struct ThetaModeResponseKernel<'s> {
-    hop: &'s dyn HessianOperator,
+    pub(crate) hop: &'s dyn HessianOperator,
     /// `Some` exactly when the selection rule chose the lifted constrained
     /// kernel. Built once per evaluation point (one Schur-complement
     /// factorization), shared by every gradient/Hessian consumer — the
     /// pre-port code rebuilt it per consumer site.
-    constrained: Option<ConstrainedSubspaceKernel<'s>>,
+    pub(crate) constrained: Option<ConstrainedSubspaceKernel<'s>>,
 }
 
 impl<'s> ThetaModeResponseKernel<'s> {
@@ -1211,18 +1211,18 @@ pub struct ProjectedKktResidual {
     /// The residual vector in the full coefficient coordinates. Active and
     /// reduced-range projection zero out excluded directions rather than
     /// shortening the vector, so its length remains `p`.
-    residual: Array1<f64>,
-    subspace: KktResidualSubspace,
+    pub(crate) residual: Array1<f64>,
+    pub(crate) subspace: KktResidualSubspace,
     /// The KKT-stationarity tolerance the inner solver compared the
     /// residual against when the certificate fired. `None` for legacy
     /// construction sites that haven't been threaded yet; downstream
     /// consumers fall back to `f64::NAN` in that case.
-    residual_tol: Option<f64>,
+    pub(crate) residual_tol: Option<f64>,
     /// `total_p - active_set_size` at the producing iterate. Records
     /// the dimensionality of the subspace on which the residual is
     /// stationary, which the outer optimiser uses when scoring the
     /// joint-Newton certificate's strength.
-    free_rank: Option<usize>,
+    pub(crate) free_rank: Option<usize>,
 }
 
 impl ProjectedKktResidual {

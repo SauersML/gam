@@ -29,20 +29,20 @@ use std::sync::Arc;
 /// caller thread and uses the existing faer GEMM path. Above the threshold we
 /// stream rows through rayon-local accumulation buffers to avoid materializing
 /// weighted n×p design copies at large scale.
-const DENSE_WEIGHTED_PRODUCT_PAR_FLOPS: usize = 8_000_000;
-const DENSE_ROW_SCALE_PAR_CELLS: usize = 64 * 1024;
+pub(crate) const DENSE_WEIGHTED_PRODUCT_PAR_FLOPS: usize = 8_000_000;
+pub(crate) const DENSE_ROW_SCALE_PAR_CELLS: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
-enum DenseRowScaleMode {
+pub(crate) enum DenseRowScaleMode {
     Direct,
     InversePositiveOrZero,
 }
 
 #[inline]
-fn dense_weighted_chunk_rows(cols: usize) -> usize {
-    const TARGET_BYTES: usize = 2 * 1024 * 1024;
-    const MIN_ROWS: usize = 256;
-    const MAX_ROWS: usize = 4096;
+pub(crate) fn dense_weighted_chunk_rows(cols: usize) -> usize {
+    pub(crate) const TARGET_BYTES: usize = 2 * 1024 * 1024;
+    pub(crate) const MIN_ROWS: usize = 256;
+    pub(crate) const MAX_ROWS: usize = 4096;
     let bytes_per_row = cols.max(1) * std::mem::size_of::<f64>();
     (TARGET_BYTES / bytes_per_row).clamp(MIN_ROWS, MAX_ROWS)
 }
@@ -71,7 +71,7 @@ pub(crate) fn row_scale_dense_in_place_by_inverse_positive_or_zero(
     row_scale_dense_in_place(out, scale, DenseRowScaleMode::InversePositiveOrZero);
 }
 
-fn row_scale_dense_in_place(out: &mut Array2<f64>, scale: &Array1<f64>, mode: DenseRowScaleMode) {
+pub(crate) fn row_scale_dense_in_place(out: &mut Array2<f64>, scale: &Array1<f64>, mode: DenseRowScaleMode) {
     assert_eq!(
         out.nrows(),
         scale.len(),
@@ -121,7 +121,7 @@ fn row_scale_dense_in_place(out: &mut Array2<f64>, scale: &Array1<f64>, mode: De
 }
 
 #[inline]
-fn scale_dense_row_values(row_values: &mut [f64], scale: f64, mode: DenseRowScaleMode) {
+pub(crate) fn scale_dense_row_values(row_values: &mut [f64], scale: f64, mode: DenseRowScaleMode) {
     match mode {
         DenseRowScaleMode::Direct => {
             for value in row_values {
@@ -143,7 +143,7 @@ fn scale_dense_row_values(row_values: &mut [f64], scale: f64, mode: DenseRowScal
     }
 }
 
-fn accumulate_weighted_cross_rows(
+pub(crate) fn accumulate_weighted_cross_rows(
     out: &mut Array2<f64>,
     left: &Array2<f64>,
     right: &Array2<f64>,
@@ -170,7 +170,7 @@ fn accumulate_weighted_cross_rows(
     }
 }
 
-fn accumulate_xt_diag_x_upper_rows(
+pub(crate) fn accumulate_xt_diag_x_upper_rows(
     out: &mut Array2<f64>,
     x: &Array2<f64>,
     diag: &Array1<f64>,
@@ -500,7 +500,7 @@ mod tests {
     use approx::assert_relative_eq;
     use ndarray::Array2;
 
-    fn assert_matrix_close(
+    pub(crate) fn assert_matrix_close(
         got: &Array2<f64>,
         expected: &Array2<f64>,
         epsilon: f64,
@@ -517,7 +517,7 @@ mod tests {
         }
     }
 
-    fn deterministic_matrix(n: usize, p: usize, phase: f64) -> Array2<f64> {
+    pub(crate) fn deterministic_matrix(n: usize, p: usize, phase: f64) -> Array2<f64> {
         Array2::from_shape_fn((n, p), |(i, j)| {
             let a = ((i as f64 + 1.0) * (j as f64 + 3.0) + phase).sin();
             let b = ((i as f64 + 5.0) / (j as f64 + 2.0) + phase).cos();
@@ -525,7 +525,7 @@ mod tests {
         })
     }
 
-    fn deterministic_weights(n: usize) -> Array1<f64> {
+    pub(crate) fn deterministic_weights(n: usize) -> Array1<f64> {
         Array1::from_shape_fn(n, |i| {
             if i % 17 == 0 {
                 0.0
@@ -535,7 +535,7 @@ mod tests {
         })
     }
 
-    fn weighted_cross_reference(
+    pub(crate) fn weighted_cross_reference(
         left: &Array2<f64>,
         right: &Array2<f64>,
         weights: &Array1<f64>,
@@ -553,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn row_scale_dense_into_reuses_buffer_and_matches_reference() {
+    pub(crate) fn row_scale_dense_into_reuses_buffer_and_matches_reference() {
         let x = deterministic_matrix(37, 11, 0.3);
         let weights = deterministic_weights(x.nrows());
         let mut out = Array2::<f64>::zeros(x.raw_dim());
@@ -568,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn weighted_cross_dense_matches_rowwise_reference_at_large_scale_block_size() {
+    pub(crate) fn weighted_cross_dense_matches_rowwise_reference_at_large_scale_block_size() {
         assert!(file!().ends_with(".rs"));
         let left = deterministic_matrix(2048, 96, 0.1);
         let right = deterministic_matrix(2048, 64, 0.7);
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn xt_diag_x_dense_into_matches_symmetric_reference_at_large_scale_block_size() {
+    pub(crate) fn xt_diag_x_dense_into_matches_symmetric_reference_at_large_scale_block_size() {
         assert!(file!().ends_with(".rs"));
         let x = deterministic_matrix(1024, 96, 1.1);
         let weights = deterministic_weights(x.nrows());

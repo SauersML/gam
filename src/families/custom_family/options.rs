@@ -433,8 +433,8 @@ pub fn cost_gated_first_order_max_iter(
     coefficient_gradient_cost: u64,
     has_outer_hessian: bool,
 ) -> usize {
-    const FIRST_ORDER_OUTER_WORK_BUDGET: u64 = 80_000_000_000;
-    const MIN_FIRST_ORDER_ITERS: usize = 4;
+    pub(crate) const FIRST_ORDER_OUTER_WORK_BUDGET: u64 = 80_000_000_000;
+    pub(crate) const MIN_FIRST_ORDER_ITERS: usize = 4;
 
     if has_outer_hessian || requested <= 1 || coefficient_gradient_cost == 0 {
         return requested;

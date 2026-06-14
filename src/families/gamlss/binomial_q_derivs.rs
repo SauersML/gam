@@ -75,7 +75,7 @@ pub(super) fn binomial_loglik_mu_derivatives(y: f64, mu: f64) -> (f64, f64, f64,
 /// successors underflow at least as fast as μ reaches the boundary), so the
 /// honest q-space limit is zero — NOT a clipped-μ surrogate (issue #948).
 #[inline]
-fn binomial_mu_is_interior(mu: f64) -> bool {
+pub(crate) fn binomial_mu_is_interior(mu: f64) -> bool {
     mu > 0.0 && mu < 1.0
 }
 
@@ -243,7 +243,7 @@ pub(super) fn binomial_neglog_q_fourth_derivative_probit_closed_form(
 /// would catastrophically cancel) nor floored to a surrogate (issue #948). At
 /// `q = 40`, `s ≈ e^{−40} ≈ 4.25e−18`, the true variance — not `1e−10`.
 #[inline]
-fn logit_probability_and_variance(q: f64) -> (f64, f64) {
+pub(crate) fn logit_probability_and_variance(q: f64) -> (f64, f64) {
     if q >= 0.0 {
         let t = (-q).exp();
         let denom = 1.0 + t;
@@ -601,7 +601,7 @@ mod tests {
     //   μ''   = −2 q / (π u²)
     //   μ'''  = 2 (3 q² − 1) / (π u³)
     //   μ'''' = 24 q (1 − q²) / (π u⁴)
-    fn cauchit_jet(q: f64) -> (f64, f64, f64, f64, f64) {
+    pub(crate) fn cauchit_jet(q: f64) -> (f64, f64, f64, f64, f64) {
         let u = 1.0 + q * q;
         let mu = 0.5 + q.atan() / std::f64::consts::PI;
         let d1 = 1.0 / (std::f64::consts::PI * u);
@@ -613,20 +613,20 @@ mod tests {
 
     // Analytic generic m4 for the cauchit link via the jet path, matching the
     // dispatch's `from_jet` consumer exactly.
-    fn cauchit_m4(y: f64, weight: f64, q: f64) -> f64 {
+    pub(crate) fn cauchit_m4(y: f64, weight: f64, q: f64) -> f64 {
         let (mu, d1, d2, d3, d4) = cauchit_jet(q);
         binomial_neglog_q_fourth_derivative_from_jet(y, weight, mu, d1, d2, d3, d4)
     }
 
     // Analytic generic m3 for the cauchit link via the jet path (third entry of
     // the returned (m1, m2, m3) tuple).
-    fn cauchit_m3(y: f64, weight: f64, q: f64) -> f64 {
+    pub(crate) fn cauchit_m3(y: f64, weight: f64, q: f64) -> f64 {
         let (mu, d1, d2, d3, _d4) = cauchit_jet(q);
         binomial_neglog_q_derivatives_from_jet(y, weight, mu, d1, d2, d3).2
     }
 
     #[test]
-    fn generic_binomial_m4_matches_finite_difference_of_m3_cauchit() {
+    pub(crate) fn generic_binomial_m4_matches_finite_difference_of_m3_cauchit() {
         // High-order (5-point) central finite difference of m3 = dF³/dq³ should
         // equal the analytic m4 = dF⁴/dq⁴. This independently pins the receiving
         // fourth-derivative formula and is blind to the dispatch helper naming
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_binomial_m4_matches_analytic_cauchit_ground_truth() {
+    pub(crate) fn generic_binomial_m4_matches_analytic_cauchit_ground_truth() {
         // Issue #947 concrete check: at q=0.7, y=0.3, w=2 the correct generic m4
         // is +2.1168155916; the off-by-one bug produced −10.3779706944.
         let analytic = cauchit_m4(0.3, 2.0, 0.7);
@@ -672,7 +672,7 @@ mod tests {
     // Logit inverse-link jet (μ and its first four q-derivatives), derived
     // independently of production code: with p = σ(q) and s = p(1-p),
     //   μ = p,  μ' = s,  μ'' = s(1-2p),  μ''' = s(1-6s),  μ'''' = s(1-2p)(1-12s).
-    fn logit_jet(q: f64) -> (f64, f64, f64, f64, f64) {
+    pub(crate) fn logit_jet(q: f64) -> (f64, f64, f64, f64, f64) {
         let p = 1.0 / (1.0 + (-q).exp());
         let s = p * (1.0 - p);
         (
@@ -685,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn logit_closed_form_agrees_with_generic_jet_path() {
+    pub(crate) fn logit_closed_form_agrees_with_generic_jet_path() {
         // The canonical-logit closed form and the generic μ-jet path are two
         // independent computations of the same derivative tower. Where both are
         // numerically valid (μ comfortably interior) they must agree to float
@@ -726,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn logit_curvature_exact_through_the_old_clamp_boundary() {
+    pub(crate) fn logit_curvature_exact_through_the_old_clamp_boundary() {
         // Issue #948 (2b): once 1-p < MIN_PROB (q ≳ 23) the old code floored the
         // variance at MIN_PROB·(1-MIN_PROB) ≈ 1e-10. The exact Bernoulli variance
         // is s = p(1-p) = e^{-q}/(1+e^{-q})², which must be reported verbatim.
@@ -754,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_jet_uses_raw_sub_min_prob_mu_not_floored() {
+    pub(crate) fn generic_jet_uses_raw_sub_min_prob_mu_not_floored() {
         // Issue #948 (2a): the generic μ-jet path must divide by the RAW μ, not a
         // value floored at MIN_PROB=1e-10. Feed μ = 1e-12 (a representable
         // probability two orders below the old floor) with a unit jet to isolate
@@ -785,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_jet_saturated_boundary_collapses_to_zero() {
+    pub(crate) fn generic_jet_saturated_boundary_collapses_to_zero() {
         // Issue #948 (2a): a μ that has saturated past the representable range
         // (μ ≤ 0 or μ ≥ 1, or non-finite) has no finite μ-space tower, but the
         // q-space derivatives have collapsed below precision. The honest limit is
@@ -803,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn loglik_mu_derivatives_no_nan_at_compatible_boundary() {
+    pub(crate) fn loglik_mu_derivatives_no_nan_at_compatible_boundary() {
         // The per-branch split must keep a compatible saturated observation
         // finite: y=0 kills the y/μ half (no 0/0 at μ=0), y=1 kills the
         // (1-y)/(1-μ) half (no 0/0 at μ=1).

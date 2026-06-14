@@ -8,11 +8,11 @@ use super::*;
 /// location-scale wiggle family. See `BinomialLocationScaleWiggleHessianRowPieces`
 /// for the per-row weight structure.
 pub(crate) struct BinomialLocationScaleWiggleHessianWorkspace {
-    family: BinomialLocationScaleWiggleFamily,
-    block_states: Vec<ParameterBlockState>,
-    x_t: Arc<Array2<f64>>,
-    x_ls: Arc<Array2<f64>>,
-    pieces: BinomialLocationScaleWiggleHessianRowPieces,
+    pub(crate) family: BinomialLocationScaleWiggleFamily,
+    pub(crate) block_states: Vec<ParameterBlockState>,
+    pub(crate) x_t: Arc<Array2<f64>>,
+    pub(crate) x_ls: Arc<Array2<f64>>,
+    pub(crate) pieces: BinomialLocationScaleWiggleHessianRowPieces,
 }
 
 impl BinomialLocationScaleWiggleHessianWorkspace {

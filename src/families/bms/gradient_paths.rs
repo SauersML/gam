@@ -138,27 +138,27 @@ pub fn padded_deviation_seed(seed: &Array1<f64>, min_iqr: f64, pad_fraction: f64
 /// Maximum damped-Newton outer iterations for the pooled probit pilot. A 2-D
 /// strictly-convex probit converges in well under this; the cap only guards a
 /// pathological non-finite data configuration.
-const POOLED_PILOT_MAX_NEWTON_ITERS: usize = 50;
+pub(crate) const POOLED_PILOT_MAX_NEWTON_ITERS: usize = 50;
 /// Initial Levenberg ridge added to the 2×2 Hessian diagonal before the solve.
-const POOLED_PILOT_RIDGE_INIT: f64 = 1e-8;
+pub(crate) const POOLED_PILOT_RIDGE_INIT: f64 = 1e-8;
 /// Below this absolute determinant the ridged 2×2 system is treated as
 /// singular and the ridge is escalated.
-const POOLED_PILOT_DET_FLOOR: f64 = 1e-18;
+pub(crate) const POOLED_PILOT_DET_FLOOR: f64 = 1e-18;
 /// Geometric factor by which the ridge grows when the system is singular.
-const POOLED_PILOT_RIDGE_GROWTH: f64 = 10.0;
+pub(crate) const POOLED_PILOT_RIDGE_GROWTH: f64 = 10.0;
 /// Ridge ceiling; exceeding it means the Hessian is unusable and the pilot
 /// fails rather than returning a meaningless step.
-const POOLED_PILOT_RIDGE_MAX: f64 = 1e6;
+pub(crate) const POOLED_PILOT_RIDGE_MAX: f64 = 1e6;
 /// Maximum backtracking-line-search halvings per Newton step.
-const POOLED_PILOT_MAX_BACKTRACKS: usize = 25;
+pub(crate) const POOLED_PILOT_MAX_BACKTRACKS: usize = 25;
 /// Backtracking step contraction factor.
-const POOLED_PILOT_BACKTRACK_SHRINK: f64 = 0.5;
+pub(crate) const POOLED_PILOT_BACKTRACK_SHRINK: f64 = 0.5;
 /// Objective-change tolerance below which a stalled (rejected) line search is
 /// accepted as converged instead of erroring.
-const POOLED_PILOT_STALL_TOL: f64 = 1e-10;
+pub(crate) const POOLED_PILOT_STALL_TOL: f64 = 1e-10;
 /// Minimum-magnitude signed slope returned by the pilot, so the downstream
 /// `b/√(1+b²)` rigid seed never collapses to an exactly flat (zero-slope) link.
-const POOLED_PILOT_MIN_ABS_SLOPE: f64 = 1e-6;
+pub(crate) const POOLED_PILOT_MIN_ABS_SLOPE: f64 = 1e-6;
 
 pub(super) fn pooled_probit_baseline(
     y: &Array1<f64>,
@@ -399,10 +399,10 @@ pub(super) fn rigid_pooled_probit_pilot_eta(
 /// Scaling by the diagonal keeps the ridge scale-invariant; the fraction is
 /// small enough to be numerically negligible against a well-conditioned design
 /// yet still regularise a near-singular pilot Gram.
-const PILOT_RIDGE_DIAG_FRACTION: f64 = 1e-6;
+pub(crate) const PILOT_RIDGE_DIAG_FRACTION: f64 = 1e-6;
 /// Positivity floor on the mean Hessian diagonal used to scale the pilot ridge,
 /// so a degenerate (all-zero-diagonal) Gram still receives a tiny ridge.
-const PILOT_RIDGE_DIAG_FLOOR: f64 = 1e-12;
+pub(crate) const PILOT_RIDGE_DIAG_FLOOR: f64 = 1e-12;
 
 pub(super) fn pilot_eta_for_link_dev_orthogonalisation(
     base_link: &InverseLink,
@@ -552,7 +552,7 @@ pub(super) fn joint_setup(
 }
 
 #[inline]
-fn signed_probit_neglog_derivatives_up_to_fourth_numeric(
+pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth_numeric(
     signed_margin: f64,
     weight: f64,
 ) -> (f64, f64, f64, f64) {
@@ -739,7 +739,7 @@ pub enum MarginalSlopeCovariance {
 /// is mathematically PSD but finite-precision accumulation in the dense / low-
 /// rank sums can produce a tiny negative value at a true zero; results within
 /// this tolerance are clamped to zero, anything more negative is a real error.
-const COVARIANCE_QUADRATIC_FORM_PSD_TOL: f64 = -1e-10;
+pub(crate) const COVARIANCE_QUADRATIC_FORM_PSD_TOL: f64 = -1e-10;
 
 impl MarginalSlopeCovariance {
     pub fn shape(&self) -> MarginalSlopeCovarianceShape {
@@ -1030,7 +1030,7 @@ pub fn marginal_slope_covariance_from_scores(
     } else {
         1.0
     };
-    const OFFDIAG_Z_THRESHOLD: f64 = 4.0;
+    pub(crate) const OFFDIAG_Z_THRESHOLD: f64 = 4.0;
     let mut is_stat_diagonal = true;
     'stat: for a in 0..k {
         for b in (a + 1)..k {
@@ -1145,7 +1145,7 @@ pub(super) fn empirical_rigid_calibration_eval(
         ));
     }
     let observed_slope = rigid_observed_logslope(slope, probit_scale);
-    const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_8; // 0.5 * ln(2π)
+    pub(crate) const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_8; // 0.5 * ln(2π)
 
     // Streaming LSE accumulators for log Σ wᵢ φᵢ and log Σ wᵢ Φᵢ.
     let mut log_max_phi = f64::NEG_INFINITY;
@@ -1338,7 +1338,7 @@ pub(super) fn rigid_standard_normal_neglog_only(
 }
 
 #[inline]
-fn rigid_standard_normal_tower(
+pub(crate) fn rigid_standard_normal_tower(
     marginal: BernoulliMarginalLinkMap,
     g: f64,
     z: f64,
@@ -1377,7 +1377,7 @@ fn rigid_standard_normal_tower(
 /// entries (f, f′, f″) are needed for the Hessian, so the third/fourth
 /// entries are simply not consulted.
 #[inline]
-fn rigid_standard_normal_tower2(
+pub(crate) fn rigid_standard_normal_tower2(
     marginal: BernoulliMarginalLinkMap,
     g: f64,
     z: f64,

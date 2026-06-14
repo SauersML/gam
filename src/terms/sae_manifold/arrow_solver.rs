@@ -7,11 +7,11 @@ pub struct SaeArrowVector {
 }
 
 pub(crate) struct DeflatedArrowSolver<'a> {
-    cache: &'a ArrowFactorCache,
-    gauge_basis: Vec<Array1<f64>>,
-    gauge_response_physical: Vec<Array1<f64>>,
-    woodbury_factor: Option<FaerCholeskyFactor>,
-    gauge_stiffness_recip: f64,
+    pub(crate) cache: &'a ArrowFactorCache,
+    pub(crate) gauge_basis: Vec<Array1<f64>>,
+    pub(crate) gauge_response_physical: Vec<Array1<f64>>,
+    pub(crate) woodbury_factor: Option<FaerCholeskyFactor>,
+    pub(crate) gauge_stiffness_recip: f64,
 }
 
 impl<'a> DeflatedArrowSolver<'a> {
@@ -253,7 +253,7 @@ pub(crate) fn apply_cached_arrow_hessian(
     })
 }
 
-fn cholesky_factor_apply(factor: ArrayView2<'_, f64>, vector: ArrayView1<'_, f64>) -> Array1<f64> {
+pub(crate) fn cholesky_factor_apply(factor: ArrayView2<'_, f64>, vector: ArrayView1<'_, f64>) -> Array1<f64> {
     let n = factor.nrows();
     let mut lt_v = Array1::<f64>::zeros(n);
     for row in 0..n {

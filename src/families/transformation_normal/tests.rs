@@ -3,7 +3,7 @@
     use crate::test_support::assert_matrix_derivativefd;
     use ndarray::array;
 
-    fn dense_first_order_psi_hessian(terms: &ExactNewtonJointPsiTerms) -> Array2<f64> {
+    pub(crate) fn dense_first_order_psi_hessian(terms: &ExactNewtonJointPsiTerms) -> Array2<f64> {
         if terms.hessian_psi.nrows() > 0 {
             terms.hessian_psi.clone()
         } else {
@@ -16,7 +16,7 @@
     }
 
     #[test]
-    fn ctn_penalty_scale_seed_uses_likelihood_to_penalty_ratio() {
+    pub(crate) fn ctn_penalty_scale_seed_uses_likelihood_to_penalty_ratio() {
         let likelihood_gram = array![[8.0, 0.0], [0.0, 8.0]];
         let penalties = vec![
             PenaltyMatrix::Dense(array![[2.0, 0.0], [0.0, 2.0]]),
@@ -28,7 +28,7 @@
     }
 
     #[test]
-    fn tensor_psi_penalty_derivatives_follow_shape_only_scop_layout() {
+    pub(crate) fn tensor_psi_penalty_derivatives_follow_shape_only_scop_layout() {
         let response = array![-1.0, -0.2, 0.6, 1.3];
         let (val_basis, deriv_basis, knots, transform, p_resp) = toy_response_basis(&response);
         let weights = Array1::from_elem(response.len(), 1.0);
@@ -92,7 +92,7 @@
     }
 
     #[test]
-    fn tensor_psi_row_chunks_are_window_consistent() {
+    pub(crate) fn tensor_psi_row_chunks_are_window_consistent() {
         let response = array![-1.0, -0.2, 0.6, 1.3];
         let (val_basis, deriv_basis, knots, transform, _) = toy_response_basis(&response);
         let psi = array![0.15, -0.10];
@@ -161,7 +161,7 @@
         );
     }
 
-    fn assert_shape_penalty_component(
+    pub(crate) fn assert_shape_penalty_component(
         penalty: &PenaltyMatrix,
         p_resp: usize,
         expected_right: &Array2<f64>,
@@ -180,7 +180,7 @@
         }
     }
 
-    fn toy_covariate_design_and_derivs(
+    pub(crate) fn toy_covariate_design_and_derivs(
         psi: &Array1<f64>,
     ) -> (Array2<f64>, Vec<CustomFamilyBlockPsiDerivative>) {
         let x0 = array![[1.00, 0.40], [1.10, 0.35], [1.20, 0.45], [0.95, 0.50],];
@@ -221,7 +221,7 @@
     /// Minimal SCOP-CTN config used by every toy fixture in this test module:
     /// degree-1 I-splines on 2 internal knots produce the smallest valid
     /// SCOP-CTN configuration (p_resp = 4 monotone basis columns).
-    fn toy_scop_ctn_config() -> TransformationNormalConfig {
+    pub(crate) fn toy_scop_ctn_config() -> TransformationNormalConfig {
         TransformationNormalConfig {
             double_penalty: false,
             response_degree: 1,
@@ -233,7 +233,7 @@
     /// Build (val, deriv, knots, transform, p_resp) from a real
     /// `build_response_basis` call so test fixtures match the production
     /// I-spline contract exactly.
-    fn toy_response_basis(
+    pub(crate) fn toy_response_basis(
         response: &Array1<f64>,
     ) -> (Array2<f64>, Array2<f64>, Array1<f64>, Array2<f64>, usize) {
         let config = toy_scop_ctn_config();
@@ -246,7 +246,7 @@
     /// Deterministic probe vector of length `p_total` used by tests that
     /// previously hand-rolled p_total=4 arrays. Generated from a tiny PRNG so
     /// each call with a different seed yields linearly-independent probes.
-    fn toy_probe_vector(p_total: usize, seed: u64) -> Array1<f64> {
+    pub(crate) fn toy_probe_vector(p_total: usize, seed: u64) -> Array1<f64> {
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
         Array1::from_iter((0..p_total).map(|_| {
             state = state
@@ -257,7 +257,7 @@
         }))
     }
 
-    fn toy_family_and_derivatives(
+    pub(crate) fn toy_family_and_derivatives(
         psi: &Array1<f64>,
     ) -> (
         TransformationNormalFamily,
@@ -320,7 +320,7 @@
     }
 
     #[test]
-    fn ctn_row_quantity_cache_matches_direct_formulas() {
+    pub(crate) fn ctn_row_quantity_cache_matches_direct_formulas() {
         let psi = array![0.15, -0.10];
         let (family, _, state, _) = toy_family_and_derivatives(&psi);
         let row = family
@@ -412,7 +412,7 @@
     }
 
     #[test]
-    fn ctn_endpoint_normalizer_derivatives_are_finite_in_positive_tail() {
+    pub(crate) fn ctn_endpoint_normalizer_derivatives_are_finite_in_positive_tail() {
         let q =
             log_normal_cdf_diff_derivatives(38.0, 37.0).expect("positive-tail endpoint normalizer");
         assert!(q.first[0].is_finite());
@@ -425,7 +425,7 @@
     }
 
     #[test]
-    fn transformation_normal_pit_score_uses_finite_support_normalizer() {
+    pub(crate) fn transformation_normal_pit_score_uses_finite_support_normalizer() {
         let center =
             transformation_normal_pit_score(0.0, -2.0, 2.0, 1.0e-12).expect("symmetric PIT score");
         assert!(center.abs() <= 1.0e-12);
@@ -460,7 +460,7 @@
     }
 
     #[test]
-    fn ctn_row_quantity_cache_is_exact_beta_keyed() {
+    pub(crate) fn ctn_row_quantity_cache_is_exact_beta_keyed() {
         let psi = array![0.15, -0.10];
         let (family, _, state, _) = toy_family_and_derivatives(&psi);
         let row_a = family
@@ -495,7 +495,7 @@
     }
 
     #[test]
-    fn ctn_row_quantities_reject_nonrepresentable_exact_derivatives() {
+    pub(crate) fn ctn_row_quantities_reject_nonrepresentable_exact_derivatives() {
         let h = array![0.0];
         let h_prime = array![1.0e-100];
         let h_lower = array![-8.0];
@@ -510,7 +510,7 @@
     }
 
     #[test]
-    fn transformation_normal_uses_compact_gaussian_outer_seeding() {
+    pub(crate) fn transformation_normal_uses_compact_gaussian_outer_seeding() {
         let psi = array![0.15, -0.10];
         let (family, _, _, _) = toy_family_and_derivatives(&psi);
         let seed_config = family.outer_seed_config(6);
@@ -526,7 +526,7 @@
     }
 
     #[test]
-    fn max_feasible_step_size_is_unconstrained_for_scop_derivative() {
+    pub(crate) fn max_feasible_step_size_is_unconstrained_for_scop_derivative() {
         let psi = array![0.15, -0.10];
         let (family, _, state, _) = toy_family_and_derivatives(&psi);
         let p_total = state.beta.len();
@@ -549,7 +549,7 @@
     }
 
     #[test]
-    fn warm_start_absorbs_offset_into_affine_seed() {
+    pub(crate) fn warm_start_absorbs_offset_into_affine_seed() {
         // The SCOP squared-γ warm start is built directly in β-space: choose a
         // positive constant shape seed for h', subtract its induced value
         // contribution, then solve the unconstrained location row. The fixed
@@ -616,7 +616,7 @@
     }
 
     #[test]
-    fn kronecker_dense_fast_paths_match_dense_materialization() {
+    pub(crate) fn kronecker_dense_fast_paths_match_dense_materialization() {
         let left = array![[1.0, -0.4], [0.5, 0.3], [-0.2, 0.9], [1.1, -0.7],];
         let right = array![
             [0.2, 1.0, -0.3],
@@ -658,7 +658,7 @@
     /// Strongly non-Gaussian (heavy right-skew, exponential-shaped) response so
     /// the data-driven complexity cap in `effective_response_num_internal_knots`
     /// is non-binding and the structural sample/tensor caps remain the gate.
-    fn skewed_response(n: usize) -> Array1<f64> {
+    pub(crate) fn skewed_response(n: usize) -> Array1<f64> {
         Array1::from_iter((0..n).map(|i| {
             let u = (i as f64 + 0.5) / n as f64;
             // Inverse-CDF of a unit exponential: skewness 2, excess kurtosis 6,
@@ -668,7 +668,7 @@
     }
 
     #[test]
-    fn large_samples_allow_richer_response_basis_than_small_samples() {
+    pub(crate) fn large_samples_allow_richer_response_basis_than_small_samples() {
         let config = TransformationNormalConfig::default();
         let small_resp = skewed_response(40);
         let large_resp = skewed_response(4000);
@@ -682,7 +682,7 @@
     }
 
     #[test]
-    fn near_gaussian_response_trims_response_basis_below_skewed_response() {
+    pub(crate) fn near_gaussian_response_trims_response_basis_below_skewed_response() {
         // A clean location-scale Gaussian transformation cannot identify a heavy
         // shape block, so the data-driven complexity cap must collapse its knot
         // budget far below a strongly non-Gaussian response at the same n / p_cov.
@@ -710,7 +710,7 @@
     }
 
     #[test]
-    fn transformation_normal_joint_psi_second_order_terms_match_fd() {
+    pub(crate) fn transformation_normal_joint_psi_second_order_terms_match_fd() {
         let psi = array![0.15, -0.10];
         let h = 1e-6;
         let row_offset = Arc::new(array![0.70, -0.20, 0.40, -0.50]);
@@ -786,7 +786,7 @@
     }
 
     #[test]
-    fn transformation_normal_joint_psi_first_order_matches_normalized_loglik_fd() {
+    pub(crate) fn transformation_normal_joint_psi_first_order_matches_normalized_loglik_fd() {
         let psi = array![0.15, -0.10];
         let h = 1e-6;
         let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
@@ -892,7 +892,7 @@
     }
 
     #[test]
-    fn ctn_psi_workspace_first_order_matches_per_axis_path_bit_equivalent() {
+    pub(crate) fn ctn_psi_workspace_first_order_matches_per_axis_path_bit_equivalent() {
         // Bit-equivalence guard for `TransformationNormalPsiWorkspace`. The
         // workspace's single-pass kernel must produce the same per-axis
         // `objective_psi` and `score_psi` as the per-axis `scop_psi_terms`
@@ -999,7 +999,7 @@
     /// reduction tree, so the fused output must equal the per-axis output to
     /// well within any reasonable floating-point reduction tolerance.
     #[test]
-    fn ctn_psi_hessian_trace_all_axes_matches_per_axis_path_bit_equivalent() {
+    pub(crate) fn ctn_psi_hessian_trace_all_axes_matches_per_axis_path_bit_equivalent() {
         let psi = array![0.15, -0.10];
         let (family, derivative_blocks, state, _spec) = toy_family_and_derivatives(&psi);
         let n_psi = derivative_blocks[0].len();
@@ -1101,7 +1101,7 @@
     }
 
     #[test]
-    fn ctn_psi_workspace_second_order_matches_per_pair_path() {
+    pub(crate) fn ctn_psi_workspace_second_order_matches_per_pair_path() {
         let psi = array![0.15, -0.10];
         let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
         let states = vec![state.clone()];
@@ -1186,7 +1186,7 @@
     }
 
     #[test]
-    fn transformation_normal_joint_psi_second_order_terms_are_operator_backed() {
+    pub(crate) fn transformation_normal_joint_psi_second_order_terms_are_operator_backed() {
         let psi = array![0.15, -0.10];
         let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
         let states = vec![state.clone()];
@@ -1271,7 +1271,7 @@
     }
 
     #[test]
-    fn transformation_normal_joint_psihessian_directional_derivative_matches_fd() {
+    pub(crate) fn transformation_normal_joint_psihessian_directional_derivative_matches_fd() {
         let psi = array![0.15, -0.10];
         let h = 1e-6;
         let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
@@ -1370,7 +1370,7 @@
     }
 
     #[test]
-    fn transformation_normal_joint_hessian_second_directional_derivative_matches_fd() {
+    pub(crate) fn transformation_normal_joint_hessian_second_directional_derivative_matches_fd() {
         assert!(file!().ends_with(".rs"));
         let psi = array![0.15, -0.10];
         let h = 1e-6;
@@ -1409,7 +1409,7 @@
     }
 
     #[test]
-    fn ctn_joint_hessian_workspace_matvec_matches_dense() {
+    pub(crate) fn ctn_joint_hessian_workspace_matvec_matches_dense() {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
@@ -1492,7 +1492,7 @@
     }
 
     #[test]
-    fn ctn_joint_hessian_workspace_matvec_into_primes_dense_cache() {
+    pub(crate) fn ctn_joint_hessian_workspace_matvec_into_primes_dense_cache() {
         let psi = array![0.15, -0.10];
         let (family, _, state, _) = toy_family_and_derivatives(&psi);
         let p = state.beta.len();
@@ -1544,7 +1544,7 @@
     }
 
     #[test]
-    fn ctn_coefficient_hessian_cost_uses_dense_for_small_problems() {
+    pub(crate) fn ctn_coefficient_hessian_cost_uses_dense_for_small_problems() {
         // Toy family: n=4, p_resp=2, p_cov=2 → p_total=4. The matrix-free
         // gate `use_joint_matrix_free_path(4, 4)` returns false (well below
         // every threshold), so the override must report the dense Khatri–Rao
@@ -1564,7 +1564,7 @@
     }
 
     #[test]
-    fn ctn_coefficient_hessian_cost_switches_to_matvec_when_matrix_free_active() {
+    pub(crate) fn ctn_coefficient_hessian_cost_switches_to_matvec_when_matrix_free_active() {
         // p_cov=256 keeps p_total = p_resp · p_cov ≥ JOINT_MATRIX_FREE_MIN_DIM
         // so matrix-free is ALWAYS active for any n. The override must report
         // the per-Hv matvec cost n·(p_resp + p_cov), not the dense p² gram.
@@ -1616,7 +1616,7 @@
     }
 
     #[test]
-    fn ctn_inner_and_outer_hvp_capabilities_are_advertised() {
+    pub(crate) fn ctn_inner_and_outer_hvp_capabilities_are_advertised() {
         let psi = array![0.15, -0.10];
         let (family, derivative_blocks, _, spec) = toy_family_and_derivatives(&psi);
         let specs = std::slice::from_ref(&spec);
@@ -1668,7 +1668,7 @@
     }
 
     #[test]
-    fn ctn_large_n_outer_hvp_capability_selects_operator_path() {
+    pub(crate) fn ctn_large_n_outer_hvp_capability_selects_operator_path() {
         let psi = array![0.15, -0.10];
         let (family, derivative_blocks, _, spec) = toy_family_and_derivatives(&psi);
         let specs = std::slice::from_ref(&spec);
@@ -1719,7 +1719,7 @@
     }
 
     #[test]
-    fn ctn_joint_hessian_workspace_dh_operator_matches_dense() {
+    pub(crate) fn ctn_joint_hessian_workspace_dh_operator_matches_dense() {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
@@ -1826,7 +1826,7 @@
     }
 
     #[test]
-    fn ctn_joint_hessian_workspace_d2h_operator_matches_dense() {
+    pub(crate) fn ctn_joint_hessian_workspace_d2h_operator_matches_dense() {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
@@ -1901,7 +1901,7 @@
     /// `inv_hp_cu` cache (a stale cache would only show up under ε perturbation,
     /// not in the dense-equivalence test that probes a single iterate).
     #[test]
-    fn ctn_dh_operator_matches_fd_under_beta_perturbation() {
+    pub(crate) fn ctn_dh_operator_matches_fd_under_beta_perturbation() {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
@@ -1972,7 +1972,7 @@
     /// this exercises both the cached `inv_hp_qu` and the chained Khatri–Rao
     /// apply on the perturbed iterate.
     #[test]
-    fn ctn_d2h_operator_matches_fd_under_beta_perturbation() {
+    pub(crate) fn ctn_d2h_operator_matches_fd_under_beta_perturbation() {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
@@ -2039,7 +2039,7 @@
     /// truncation). This is the `μ Dᵀ((Dv)/c²)` formula plus the
     /// β-independent `X_val^T W X_val` term.
     #[test]
-    fn ctn_hessian_matvec_matches_grad_fd() {
+    pub(crate) fn ctn_hessian_matvec_matches_grad_fd() {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
@@ -2091,7 +2091,7 @@
     }
 
     #[test]
-    fn ctn_scop_gradient_matches_loglikelihood_fd() {
+    pub(crate) fn ctn_scop_gradient_matches_loglikelihood_fd() {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
@@ -2138,7 +2138,7 @@
     }
 
     #[test]
-    fn ctn_exact_newton_joint_gradient_evaluation_matches_evaluate() {
+    pub(crate) fn ctn_exact_newton_joint_gradient_evaluation_matches_evaluate() {
         // The joint-Newton inner solver prefers
         // `exact_newton_joint_gradient_evaluation` over `evaluate()` to refresh
         // the gradient between cycles. Lock in that the override returns
@@ -2196,7 +2196,7 @@
     /// Run via:
     ///     cargo test --release ctn_pairwise_oracle_dumps_json -- --nocapture
     #[test]
-    fn ctn_pairwise_oracle_dumps_json() {
+    pub(crate) fn ctn_pairwise_oracle_dumps_json() {
         let psi = array![0.15, -0.10];
         let v = array![0.4, -0.7];
 

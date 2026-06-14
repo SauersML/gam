@@ -65,7 +65,7 @@ use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 /// Multiple smoothing components may share the same block (for example tensor
 /// product marginals); those can still be factorized block-local.  Only partial
 /// overlaps force the dense assembled fallback.
-fn are_penalties_block_factored(penalties: &[crate::construction::CanonicalPenalty]) -> bool {
+pub(crate) fn are_penalties_block_factored(penalties: &[crate::construction::CanonicalPenalty]) -> bool {
     for (i, a) in penalties.iter().enumerate() {
         for b in &penalties[i + 1..] {
             let overlaps =
@@ -85,35 +85,35 @@ fn are_penalties_block_factored(penalties: &[crate::construction::CanonicalPenal
 /// Holds the eigendecomposition and precomputed W-factor so that derivative
 /// queries are efficient without redundant factorizations.
 #[derive(Clone, Debug)]
-struct PenaltyBlockSpan {
-    start: usize,
-    end: usize,
-    rank_start: usize,
-    rank_end: usize,
+pub(crate) struct PenaltyBlockSpan {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) rank_start: usize,
+    pub(crate) rank_end: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct PenaltyPseudologdet {
     /// W factor: p × rank, with W W^T = S⁺.
-    w_factor: Array2<f64>,
+    pub(crate) w_factor: Array2<f64>,
     /// Null-space eigenvectors U₀: p × nullity (for moving-nullspace corrections).
     /// `None` if nullity == 0.
-    u_null: Option<Array2<f64>>,
+    pub(crate) u_null: Option<Array2<f64>>,
     /// Inverse squared eigenvalues on the positive eigenspace: σ_i^{-2}.
     /// Length = rank. Used for the moving-nullspace correction: tr(Σ₊⁻² L_i L_j^T).
-    inv_evals_sq: Array1<f64>,
+    pub(crate) inv_evals_sq: Array1<f64>,
     /// Positive eigenspace rank.
-    rank: usize,
+    pub(crate) rank: usize,
     /// log|S|₊ = Σ log σ_i for positive eigenvalues.
-    value: f64,
+    pub(crate) value: f64,
     /// Block/rank spans when the penalty eigenspace was assembled from disjoint blocks.
-    block_spans: Vec<PenaltyBlockSpan>,
+    pub(crate) block_spans: Vec<PenaltyBlockSpan>,
 }
 
 impl PenaltyPseudologdet {
     /// Compute tr(A B) = Σ_i Σ_k A[i,k] B[k,i] without materializing the product.
     #[inline]
-    fn trace_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         let diag_len = a.nrows().min(b.ncols());
         let inner_len = a.ncols().min(b.nrows());
         let mut total = 0.0;
@@ -181,7 +181,7 @@ impl PenaltyPseudologdet {
     ///
     /// The total logdet is the sum of per-block logdets. The W-factor is
     /// block-diagonal (embedded in p_total space).
-    fn from_penalties_block_factored(
+    pub(crate) fn from_penalties_block_factored(
         penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         ridge: f64,
@@ -191,10 +191,10 @@ impl PenaltyPseudologdet {
 
         // Collect block ranges and assemble per-block combined penalties.
         // Each penalty contributes to its own block (disjoint assumption).
-        struct BlockData {
-            start: usize,
-            end: usize,
-            local: Array2<f64>,
+        pub(crate) struct BlockData {
+            pub(crate) start: usize,
+            pub(crate) end: usize,
+            pub(crate) local: Array2<f64>,
         }
 
         // Group penalties by their exact block range.
@@ -244,15 +244,15 @@ impl PenaltyPseudologdet {
         // Process each block independently.  Keep the eigenspace local until
         // final assembly so large smooth bases do not allocate one p_total×rank
         // temporary per block.
-        struct BlockResult {
-            start: usize,
-            end: usize,
-            w_local: Array2<f64>,
-            u_null_local: Array2<f64>,
-            inv_evals_sq: Vec<f64>,
-            value: f64,
-            rank: usize,
-            nullity: usize,
+        pub(crate) struct BlockResult {
+            pub(crate) start: usize,
+            pub(crate) end: usize,
+            pub(crate) w_local: Array2<f64>,
+            pub(crate) u_null_local: Array2<f64>,
+            pub(crate) inv_evals_sq: Vec<f64>,
+            pub(crate) value: f64,
+            pub(crate) rank: usize,
+            pub(crate) nullity: usize,
         }
 
         let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
@@ -582,7 +582,7 @@ impl PenaltyPseudologdet {
     ///
     /// This gives the reduced (rank × rank) representation of S⁺ M:
     /// tr(Y) = tr(S⁺ M), and tr(Y_a Y_b^T) = tr(S⁺ M_a S⁺ M_b).
-    fn reduced(&self, m: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn reduced(&self, m: &Array2<f64>) -> Array2<f64> {
         let wt_m = self.w_factor.t().dot(m);
         wt_m.dot(&self.w_factor)
     }
@@ -596,7 +596,7 @@ impl PenaltyPseudologdet {
     /// The downstream `moving_nullspace_correction` weights each row by
     /// σ_j^{-1} = √(inv_evals_sq[j]) to form the trace without ever
     /// materializing L = U₊^T M U₀ explicitly.
-    fn leakage(&self, m: &Array2<f64>) -> Option<Array2<f64>> {
+    pub(crate) fn leakage(&self, m: &Array2<f64>) -> Option<Array2<f64>> {
         let u_null = self.u_null.as_ref()?;
         let wt_m = self.w_factor.t().dot(m);
         Some(wt_m.dot(u_null))
@@ -611,7 +611,7 @@ impl PenaltyPseudologdet {
     ///
     /// Takes the W^T S_{τ_i} U₀ matrices (from `leakage()`) rather than
     /// the full L_i, to avoid recomputing.
-    fn moving_nullspace_correction(&self, wt_si_u0: &Array2<f64>, wt_sj_u0: &Array2<f64>) -> f64 {
+    pub(crate) fn moving_nullspace_correction(&self, wt_si_u0: &Array2<f64>, wt_sj_u0: &Array2<f64>) -> f64 {
         // tr(Σ₊⁻² L_i L_j^T) where L_i = diag(√σ) · wt_si_u0.
         // = Σ_r σ_r^{-2} Σ_m L_i[r,m] L_j[r,m]
         // = Σ_r σ_r^{-2} σ_r Σ_m wt_si_u0[r,m] wt_sj_u0[r,m]
@@ -717,9 +717,9 @@ impl PenaltyPseudologdet {
             return (Array1::zeros(k), Array2::zeros((k, k)));
         }
 
-        struct ReducedPenalty {
-            span: Option<usize>,
-            y: Array2<f64>,
+        pub(crate) struct ReducedPenalty {
+            pub(crate) span: Option<usize>,
+            pub(crate) y: Array2<f64>,
         }
 
         let project = |penalty: &crate::construction::CanonicalPenalty| {
@@ -951,7 +951,7 @@ mod tests {
 
     /// Scalar S(ρ) = e^ρ. Then log|S|₊ = ρ, L' = 1, L'' = 0.
     #[test]
-    fn test_scalar_penalty_logdet() {
+    pub(crate) fn test_scalar_penalty_logdet() {
         let rho = 1.5_f64;
         let lambda = rho.exp();
         let s_k = array![[1.0]]; // unscaled
@@ -979,7 +979,7 @@ mod tests {
 
     /// Two-penalty case: S(ρ₁,ρ₂) = diag(e^ρ₁, e^ρ₂).
     #[test]
-    fn test_two_penalty_logdet() {
+    pub(crate) fn test_two_penalty_logdet() {
         let rho = [1.0_f64, -0.5];
         let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
         let s1 = array![[1.0, 0.0], [0.0, 0.0]];
@@ -1011,7 +1011,7 @@ mod tests {
     /// (gauge-invariant), not finite-differences of decomposition-dependent
     /// intermediate objects which are vulnerable to eigenspace-gauge noise.
     #[test]
-    fn test_tau_derivative_fd() {
+    pub(crate) fn test_tau_derivative_fd() {
         // S(τ) = [[1+τ, 0.5], [0.5, 2]].
         // det(S) = 2(1+τ) - 0.25 = 2τ + 1.75.
         // log|S| = log(2τ + 1.75).
@@ -1045,7 +1045,7 @@ mod tests {
 
     /// Verify that for a full-rank S, the moving-nullspace correction is zero.
     #[test]
-    fn test_no_nullspace_correction_full_rank() {
+    pub(crate) fn test_no_nullspace_correction_full_rank() {
         let s = array![[3.0, 1.0], [1.0, 2.0]];
         let pld = PenaltyPseudologdet::from_assembled(s, None).unwrap();
         assert_eq!(pld.rank(), 2);
@@ -1063,7 +1063,7 @@ mod tests {
     /// spectrum is the sole authority and is C∞ in ρ over the positive
     /// eigenspace.
     #[test]
-    fn test_assembled_pure_spectrum_classifier_issue_192_and_318() {
+    pub(crate) fn test_assembled_pure_spectrum_classifier_issue_192_and_318() {
         let ridge = 1e-4_f64;
 
         // ── #192 case: one structural null at r, one barely-active at r + 1e-10.
@@ -1120,7 +1120,7 @@ mod tests {
     /// Verify that the pseudo-logdet of a rank-deficient matrix
     /// ignores the null eigenvalues.
     #[test]
-    fn test_rank_deficient_value() {
+    pub(crate) fn test_rank_deficient_value() {
         // S = [[4, 2], [2, 1]] has rank 1, eigenvalue 5.
         let s = array![[4.0, 2.0], [2.0, 1.0]];
         let pld = PenaltyPseudologdet::from_assembled(s, None).unwrap();
@@ -1129,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn test_component_ridge_excludes_inactive_penalty_nullspace() {
+    pub(crate) fn test_component_ridge_excludes_inactive_penalty_nullspace() {
         let s1 = array![[4.0, 0.0], [0.0, 0.0]];
         let s2 = array![[0.0, 0.0], [0.0, 9.0]];
         let lambdas = [2.0_f64, 0.0_f64];
@@ -1162,7 +1162,7 @@ mod tests {
     /// crosses from well above the ridge to deep below it, and confirm a
     /// central finite difference of `value()` matches `rho_derivatives()`.
     #[test]
-    fn test_value_matches_rho_gradient_across_ridge_boundary() {
+    pub(crate) fn test_value_matches_rho_gradient_across_ridge_boundary() {
         // S(ρ) = e^{ρ0} S0 + e^{ρ1} S1, with S0 large and S1 a tiny mode that
         // dives toward (and below) the ridge as ρ1 decreases.
         let s0 = array![[1.0, 0.0], [0.0, 0.0]];
@@ -1205,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn test_components_with_stale_nullity_uses_active_sum_when_lambda_zero() {
+    pub(crate) fn test_components_with_stale_nullity_uses_active_sum_when_lambda_zero() {
         let s1 = array![[4.0, 0.0], [0.0, 0.0]];
         let s2 = array![[0.0, 0.0], [0.0, 9.0]];
         let lambdas = [2.0_f64, 0.0_f64];
@@ -1218,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rank_deficient_components_can_sum_to_full_rank_or_not() {
+    pub(crate) fn test_rank_deficient_components_can_sum_to_full_rank_or_not() {
         let s1 = array![[1.0, 0.0], [0.0, 0.0]];
         let s2 = array![[0.0, 0.0], [0.0, 1.0]];
         let full =
@@ -1233,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_penalties_ridge_excludes_inactive_penalty_nullspace() {
+    pub(crate) fn test_block_penalties_ridge_excludes_inactive_penalty_nullspace() {
         let penalties = [
             crate::construction::CanonicalPenalty::from_dense_root(array![[2.0, 0.0]], 2),
             crate::construction::CanonicalPenalty::from_dense_root(array![[0.0, 3.0]], 2),
@@ -1250,7 +1250,7 @@ mod tests {
     /// The first derivative of log|S(ψ)|₊ is zero when ψ only rotates the
     /// nullspace and doesn't change the positive eigenvalues.
     #[test]
-    fn test_nullspace_rotation_gradient_zero() {
+    pub(crate) fn test_nullspace_rotation_gradient_zero() {
         // S(ψ) = R(ψ) diag(s₁, s₂, 0) R(ψ)^T — rotating a rank-2 matrix in 3D.
         // log|S|₊ = log(s₁) + log(s₂) = const, so ∂_ψ L = 0.
         let s1 = 3.0_f64;
@@ -1281,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_factored_tau_hessian_preserves_internal_nullspace() {
+    pub(crate) fn test_block_factored_tau_hessian_preserves_internal_nullspace() {
         let s1 = 3.0_f64;
         let s2 = 1.0_f64;
         let psi = 0.5_f64;
@@ -1321,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_factored_ridge_preserves_structural_nullspace_value() {
+    pub(crate) fn test_block_factored_ridge_preserves_structural_nullspace_value() {
         let s = array![[4.0, 2.0], [2.0, 1.0]];
         let ridge = 1e-4_f64;
 
@@ -1347,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_factored_ridge_ignores_inactive_lambda_for_structural_nullity() {
+    pub(crate) fn test_block_factored_ridge_ignores_inactive_lambda_for_structural_nullity() {
         let ridge = 1e-4_f64;
         let penalties = [
             crate::construction::CanonicalPenalty::from_dense_root(array![[1.0, 0.0]], 2),
@@ -1372,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn test_overlapping_ridge_ignores_inactive_lambda_for_structural_nullity() {
+    pub(crate) fn test_overlapping_ridge_ignores_inactive_lambda_for_structural_nullity() {
         let ridge = 1e-4_f64;
         let penalties = [
             crate::construction::CanonicalPenalty {
@@ -1419,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_factored_rho_derivatives_match_dense_without_cross_block_work() {
+    pub(crate) fn test_block_factored_rho_derivatives_match_dense_without_cross_block_work() {
         let p_total = 6;
         let lambdas = [1.7_f64, 0.4_f64, 2.3_f64];
         let penalties = vec![
@@ -1482,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn test_overlapping_penalties_ridge_preserve_structural_nullspace_value() {
+    pub(crate) fn test_overlapping_penalties_ridge_preserve_structural_nullspace_value() {
         let ridge = 1e-4_f64;
         let lambdas = [2.0_f64, 3.0_f64];
         let penalties = [

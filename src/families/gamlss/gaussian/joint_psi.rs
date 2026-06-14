@@ -5,21 +5,21 @@
 use super::*;
 
 pub(crate) struct LocationScaleJointPsiDirection {
-    block_idx: usize,
-    local_idx: usize,
-    x_primary_psi: PsiDesignMap,
-    x_ls_psi: PsiDesignMap,
-    z_primary_psi: Array1<f64>,
-    z_ls_psi: Array1<f64>,
+    pub(crate) block_idx: usize,
+    pub(crate) local_idx: usize,
+    pub(crate) x_primary_psi: PsiDesignMap,
+    pub(crate) x_ls_psi: PsiDesignMap,
+    pub(crate) z_primary_psi: Array1<f64>,
+    pub(crate) z_ls_psi: Array1<f64>,
 }
 
 pub(crate) struct LocationScaleJointPsiSecondDrifts {
-    x_primary_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
-    x_ls_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
-    x_primary_ab: Option<Array2<f64>>,
-    x_ls_ab: Option<Array2<f64>>,
-    z_primary_ab: Array1<f64>,
-    z_ls_ab: Array1<f64>,
+    pub(crate) x_primary_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
+    pub(crate) x_ls_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
+    pub(crate) x_primary_ab: Option<Array2<f64>>,
+    pub(crate) x_ls_ab: Option<Array2<f64>>,
+    pub(crate) z_primary_ab: Array1<f64>,
+    pub(crate) z_ls_ab: Array1<f64>,
 }
 
 /// Shared interface that the Gaussian and Binomial location-scale families (and
@@ -272,13 +272,13 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
 /// the full-data quantities. Families that do not thread the subsample (the
 /// Binomial families) construct with `new` and the field stays `None`.
 pub(crate) struct LocationScaleJointPsiWorkspace<F: LocationScaleJointPsiFamily> {
-    family: F,
-    block_states: Vec<ParameterBlockState>,
-    derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    design_loc: Arc<Array2<f64>>,
-    design_scale: Arc<Array2<f64>>,
-    psi_directions: ExactNewtonJointPsiDirectCache<F::Direction>,
-    outer_score_subsample: Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
+    pub(crate) family: F,
+    pub(crate) block_states: Vec<ParameterBlockState>,
+    pub(crate) derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    pub(crate) design_loc: Arc<Array2<f64>>,
+    pub(crate) design_scale: Arc<Array2<f64>>,
+    pub(crate) psi_directions: ExactNewtonJointPsiDirectCache<F::Direction>,
+    pub(crate) outer_score_subsample: Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
 }
 
 impl<F: LocationScaleJointPsiFamily> LocationScaleJointPsiWorkspace<F> {
@@ -407,53 +407,53 @@ pub(crate) type GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace =
 
 #[derive(Clone)]
 pub struct GaussianJointRowScalars {
-    obs_weight: Array1<f64>,
-    w: Array1<f64>,
-    m: Array1<f64>,
-    n: Array1<f64>,
+    pub(crate) obs_weight: Array1<f64>,
+    pub(crate) w: Array1<f64>,
+    pub(crate) m: Array1<f64>,
+    pub(crate) n: Array1<f64>,
     /// κ = (dσ/dη_ls)/σ for the active sigma link.
     /// The cross Hessian block H_{μ,ls} carries an overall κ factor and the
     /// scale-scale block H_{ls,ls} carries κ².
-    kappa: Array1<f64>,
+    pub(crate) kappa: Array1<f64>,
     /// κ' = dκ/dη_ls = κ(1−κ) for the logb link. The static H_{ls,ls} block
     /// carries a κ'·(a−n) term, so κ' threads through every dH directional
     /// weight via the chain rule.
-    kappa_prime: Array1<f64>,
+    pub(crate) kappa_prime: Array1<f64>,
     /// κ'' = κ(1−κ)(1−2κ); appears in d²H_{ls,ls} via the second
     /// η-derivative of κ'·(a−n).
-    kappa_dprime: Array1<f64>,
+    pub(crate) kappa_dprime: Array1<f64>,
 }
 
 pub(crate) struct GaussianJointPsiFirstWeights {
-    objective_psirow: Array1<f64>,
-    scoremu: Array1<f64>,
-    score_ls: Array1<f64>,
-    dscoremu: Array1<f64>,
-    dscore_ls: Array1<f64>,
-    hmumu: Array1<f64>,
-    hmu_ls: Array1<f64>,
-    h_ls_ls: Array1<f64>,
-    dhmumu: Array1<f64>,
-    dhmu_ls: Array1<f64>,
-    dh_ls_ls: Array1<f64>,
+    pub(crate) objective_psirow: Array1<f64>,
+    pub(crate) scoremu: Array1<f64>,
+    pub(crate) score_ls: Array1<f64>,
+    pub(crate) dscoremu: Array1<f64>,
+    pub(crate) dscore_ls: Array1<f64>,
+    pub(crate) hmumu: Array1<f64>,
+    pub(crate) hmu_ls: Array1<f64>,
+    pub(crate) h_ls_ls: Array1<f64>,
+    pub(crate) dhmumu: Array1<f64>,
+    pub(crate) dhmu_ls: Array1<f64>,
+    pub(crate) dh_ls_ls: Array1<f64>,
 }
 
 pub(crate) struct GaussianJointPsiSecondWeights {
-    objective_psi_psirow: Array1<f64>,
-    d2scoremu: Array1<f64>,
-    d2score_ls: Array1<f64>,
-    d2hmumu: Array1<f64>,
-    d2hmu_ls: Array1<f64>,
-    d2h_ls_ls: Array1<f64>,
+    pub(crate) objective_psi_psirow: Array1<f64>,
+    pub(crate) d2scoremu: Array1<f64>,
+    pub(crate) d2score_ls: Array1<f64>,
+    pub(crate) d2hmumu: Array1<f64>,
+    pub(crate) d2hmu_ls: Array1<f64>,
+    pub(crate) d2h_ls_ls: Array1<f64>,
 }
 
 pub(crate) struct GaussianJointPsiMixedDriftWeights {
-    dhmumu_u: Array1<f64>,
-    dhmu_ls_u: Array1<f64>,
-    dh_ls_ls_u: Array1<f64>,
-    d2hmumu: Array1<f64>,
-    d2hmu_ls: Array1<f64>,
-    d2h_ls_ls: Array1<f64>,
+    pub(crate) dhmumu_u: Array1<f64>,
+    pub(crate) dhmu_ls_u: Array1<f64>,
+    pub(crate) dh_ls_ls_u: Array1<f64>,
+    pub(crate) d2hmumu: Array1<f64>,
+    pub(crate) d2hmu_ls: Array1<f64>,
+    pub(crate) d2h_ls_ls: Array1<f64>,
 }
 
 /// Apply a Horvitz–Thompson outer-row subsample mask to every per-row array

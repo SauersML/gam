@@ -1885,8 +1885,8 @@ impl Gam784BlockTarget<'_> {
         };
         // Same floors as `calculate_deviance`: binomial clamps μ to
         // [1e-12, 1−1e-12]; the remaining families floor μ at 1e-10.
-        const BINOMIAL_MU_EPS: f64 = 1e-12;
-        const MU_FLOOR: f64 = 1e-10;
+        pub(crate) const BINOMIAL_MU_EPS: f64 = 1e-12;
+        pub(crate) const MU_FLOOR: f64 = 1e-10;
         let is_binomial = matches!(spec_response, ResponseFamily::Binomial);
         let mut out = Array1::<f64>::zeros(eta.len());
         for i in 0..eta.len() {

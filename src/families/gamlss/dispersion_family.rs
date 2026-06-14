@@ -98,7 +98,7 @@ impl DispersionFamilyKind {
     }
 
     /// The mean link is logit for Beta (a probability mean) and log otherwise.
-    const fn mean_is_logit(self) -> bool {
+    pub(crate) const fn mean_is_logit(self) -> bool {
         matches!(self, DispersionFamilyKind::Beta)
     }
 
@@ -167,7 +167,7 @@ pub(super) struct DispersionRowKernel {
 }
 
 #[inline]
-fn dispersion_nb_nll_tower(
+pub(crate) fn dispersion_nb_nll_tower(
     yi: f64,
     mu_value: f64,
     theta_value: f64,
@@ -186,7 +186,7 @@ fn dispersion_nb_nll_tower(
 }
 
 #[inline]
-fn dispersion_gamma_nll_tower(
+pub(crate) fn dispersion_gamma_nll_tower(
     yi: f64,
     y_pos: f64,
     mu_value: f64,
@@ -202,7 +202,7 @@ fn dispersion_gamma_nll_tower(
 }
 
 #[inline]
-fn dispersion_beta_nll_tower(
+pub(crate) fn dispersion_beta_nll_tower(
     yi: f64,
     mu_value: f64,
     phi_value: f64,
@@ -222,14 +222,14 @@ fn dispersion_beta_nll_tower(
 }
 
 #[inline]
-fn beta_observed_cross_weight_eta(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
+pub(crate) fn beta_observed_cross_weight_eta(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
     let q = (mu * (1.0 - mu)).max(1e-12);
     let tower = dispersion_beta_nll_tower(yi, mu, phi, wi);
     q * phi * tower.h[0][1]
 }
 
 #[inline]
-fn dispersion_row_cross_weight(
+pub(crate) fn dispersion_row_cross_weight(
     kind: DispersionFamilyKind,
     yi: f64,
     eta_mu: f64,
@@ -255,7 +255,7 @@ fn dispersion_row_cross_weight(
 }
 
 #[inline]
-fn tower_score_info(
+pub(crate) fn tower_score_info(
     tower: &crate::families::jet_tower::Tower4<2>,
     idx: usize,
     wi: f64,
@@ -425,14 +425,14 @@ pub(super) fn dispersion_row_kernel(
 /// Two-block GAMLSS family for the genuine-dispersion mean families (#913).
 #[derive(Clone)]
 pub(crate) struct DispersionGlmLocationScaleFamily {
-    kind: DispersionFamilyKind,
-    y: Array1<f64>,
-    weights: Array1<f64>,
+    pub(crate) kind: DispersionFamilyKind,
+    pub(crate) y: Array1<f64>,
+    pub(crate) weights: Array1<f64>,
 }
 
 impl DispersionGlmLocationScaleFamily {
-    const BLOCK_MEAN: usize = 0;
-    const BLOCK_DISP: usize = 1;
+    pub(crate) const BLOCK_MEAN: usize = 0;
+    pub(crate) const BLOCK_DISP: usize = 1;
 }
 
 impl CustomFamily for DispersionGlmLocationScaleFamily {
@@ -666,20 +666,20 @@ pub struct DispersionGlmLocationScaleTermSpec {
     pub log_disp_offset: Array1<f64>,
 }
 
-struct DispersionGlmLocationScaleTermBuilder {
-    kind: DispersionFamilyKind,
-    y: Array1<f64>,
-    weights: Array1<f64>,
-    meanspec: TermCollectionSpec,
-    noisespec: TermCollectionSpec,
-    mean_offset: Array1<f64>,
-    noise_offset: Array1<f64>,
+pub(crate) struct DispersionGlmLocationScaleTermBuilder {
+    pub(crate) kind: DispersionFamilyKind,
+    pub(crate) y: Array1<f64>,
+    pub(crate) weights: Array1<f64>,
+    pub(crate) meanspec: TermCollectionSpec,
+    pub(crate) noisespec: TermCollectionSpec,
+    pub(crate) mean_offset: Array1<f64>,
+    pub(crate) noise_offset: Array1<f64>,
 }
 
 /// Warm start for a dispersion location-scale fit: project a link-transformed
 /// response onto the mean block and seed the log-precision block at a constant
 /// (precision ≈ 1) baseline. The block-cyclic IRLS then refines both jointly.
-fn dispersion_location_scale_warm_start(
+pub(crate) fn dispersion_location_scale_warm_start(
     kind: DispersionFamilyKind,
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -959,14 +959,14 @@ pub fn fit_dispersion_glm_location_scale_terms(
 mod tests {
     use super::*;
 
-    fn beta_fisher_cross_info_mu_phi(mu: f64, phi: f64) -> f64 {
+    pub(crate) fn beta_fisher_cross_info_mu_phi(mu: f64, phi: f64) -> f64 {
         let a = mu * phi;
         let b = (1.0 - mu) * phi;
         phi * (mu * crate::families::jet_tower::trigamma_derivative_stack(a)[0]
             - (1.0 - mu) * crate::families::jet_tower::trigamma_derivative_stack(b)[0])
     }
 
-    fn assert_close(label: &str, got: f64, want: f64, tol: f64) {
+    pub(crate) fn assert_close(label: &str, got: f64, want: f64, tol: f64) {
         assert!(
             (got - want).abs() <= tol,
             "{label}: got {got:.12e}, want {want:.12e}, |diff|={:.3e}",
@@ -975,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn beta_tower_mixed_channel_matches_cross_information_formula() {
+    pub(crate) fn beta_tower_mixed_channel_matches_cross_information_formula() {
         let mu = 0.1;
         let phi = 10.0;
         let a = mu * phi;
@@ -1008,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn orthogonal_dispersion_families_report_zero_cross_weight() {
+    pub(crate) fn orthogonal_dispersion_families_report_zero_cross_weight() {
         let cases = [
             DispersionFamilyKind::NegativeBinomial,
             DispersionFamilyKind::Gamma,

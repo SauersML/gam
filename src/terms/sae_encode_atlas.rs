@@ -65,9 +65,9 @@ use crate::terms::sae_candidate_index::{
     AtomFrameSketch, SaeCandidateIndex, auto_candidate_budget,
 };
 use crate::terms::sae_manifold::{
-    AffineCoordinateEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
-    PeriodicHarmonicEvaluator, SaeBasisEvaluator, SaeManifoldAtom, SphereChartEvaluator,
-    TorusHarmonicEvaluator,
+    AffineCoordinateEvaluator, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator,
+    EuclideanPatchEvaluator, PeriodicHarmonicEvaluator, SaeBasisEvaluator, SaeManifoldAtom,
+    SphereChartEvaluator, TorusHarmonicEvaluator,
 };
 
 use faer::Side;
@@ -83,7 +83,7 @@ pub const KANTOROVICH_THRESHOLD: f64 = 0.5;
 /// routing is cheap enough that the fan-out overhead does not pay; matched to
 /// the same order as the arrow-Schur `SCHUR_MATVEC_PARALLEL_ROW_MIN` gate so
 /// short batches inside an outer atom-level fan-out stay sequential.
-const ENCODE_BATCH_PARALLEL_ROW_MIN: usize = 256;
+pub(crate) const ENCODE_BATCH_PARALLEL_ROW_MIN: usize = 256;
 
 /// A chart region on an atom's latent coordinate: a center `t_c` plus a
 /// certified in-chart radius. Over the ball `‖t − t_c‖ ≤ radius` the jet sup
@@ -127,7 +127,7 @@ impl ChartRegion {
     /// families whose bounds are manifold-global constants (the sup over any
     /// chart equals the global sup) must refuse a malformed chart rather than
     /// certify garbage geometry.
-    fn assert_valid(&self) {
+    pub(crate) fn assert_valid(&self) {
         assert!(
             self.radius.is_finite()
                 && self.radius >= 0.0
@@ -154,7 +154,7 @@ pub trait BasisHessianLipschitz {
 /// `(2π·H)^g` for the top harmonic `H = (num_basis − 1)/2`. The constant column
 /// contributes `0` for `g ≥ 1`, so the top harmonic dominates; the bound is
 /// global (the trig magnitudes are `≤ 1` everywhere, independent of the chart).
-fn harmonic_jet_sup(num_basis: usize, order: u32) -> f64 {
+pub(crate) fn harmonic_jet_sup(num_basis: usize, order: u32) -> f64 {
     let top_harmonic = num_basis.saturating_sub(1) / 2;
     let omega = std::f64::consts::TAU * top_harmonic as f64;
     omega.powi(order as i32)
@@ -210,7 +210,7 @@ impl BasisHessianLipschitz for TorusHarmonicEvaluator {
 /// `latent_dim^g` over-counts the Leibniz routings of `g` operators across the
 /// product factors (a conservative bound — each routing's per-axis magnitude is
 /// `≤ (2π H)^{#ops on that axis}`, and the products telescope to `(2π H)^g`).
-fn torus_jet_sup(num_harmonics: usize, latent_dim: usize, order: u32) -> f64 {
+pub(crate) fn torus_jet_sup(num_harmonics: usize, latent_dim: usize, order: u32) -> f64 {
     let omega = std::f64::consts::TAU * num_harmonics as f64;
     omega.powi(order as i32) * (latent_dim as f64).powi(order as i32)
 }
@@ -290,9 +290,64 @@ impl BasisHessianLipschitz for EuclideanPatchEvaluator {
     }
 }
 
+impl BasisHessianLipschitz for CylinderHarmonicEvaluator {
+    /// Cylinder `S¹ × ℝ` product basis `Φ_{c,l} = c(t₀)·l(t₁)`, the circle
+    /// (periodic harmonic) factor on axis 0 crossed with the monomial line
+    /// factor on axis 1. Because the two factors depend on disjoint coordinates,
+    /// the order-`g` coordinate jet in any cell is exactly
+    /// `c^{(k₀)}(t₀)·l^{(k₁)}(t₁)` with `k₀ + k₁ = g`, so the per-column sup is
+    /// the max over the split `k₀ + k₁ = g` of the product of the two per-axis
+    /// per-order sups: the circle factor contributes `1` at order 0 and
+    /// `(2π·H)^{k₀}` at order `k₀ ≥ 1` (trig magnitudes `≤ 1`); the line factor
+    /// contributes the monomial-patch sup `D^{k₁}·ρ^{max(D−k₁,0)}` (`D = line
+    /// degree`, `ρ = ‖t_c‖∞ + radius`). Bounds are global in the periodic axis
+    /// and chart-local in the line axis.
+    fn value_sup(&self, chart: &ChartRegion) -> f64 {
+        cylinder_jet_sup(self.circle_harmonics, self.line_degree, chart, 0)
+    }
+    fn jacobian_sup(&self, chart: &ChartRegion) -> f64 {
+        cylinder_jet_sup(self.circle_harmonics, self.line_degree, chart, 1)
+    }
+    fn hessian_sup(&self, chart: &ChartRegion) -> f64 {
+        cylinder_jet_sup(self.circle_harmonics, self.line_degree, chart, 2)
+    }
+    fn third_sup(&self, chart: &ChartRegion) -> f64 {
+        cylinder_jet_sup(self.circle_harmonics, self.line_degree, chart, 3)
+    }
+}
+
+/// Per-column order-`g` jet sup of the cylinder product basis: the max over
+/// `k₀ + k₁ = g` of `circle_axis_sup(k₀) · line_axis_sup(k₁)`, where the circle
+/// axis sup is `(2π·H)^{k₀}` (`1` at `k₀ = 0`) and the line axis sup is the
+/// monomial-patch bound `D^{k₁}·ρ^{max(D−k₁,0)}` (`1` at `k₁ = 0`). See the
+/// [`CylinderHarmonicEvaluator`] doc comment for the derivation.
+pub(crate) fn cylinder_jet_sup(
+    circle_harmonics: usize,
+    line_degree: usize,
+    chart: &ChartRegion,
+    order: u32,
+) -> f64 {
+    let omega = std::f64::consts::TAU * circle_harmonics as f64;
+    let big_d = line_degree as f64;
+    let rho = patch_rho(chart);
+    let mut best = 0.0_f64;
+    for k0 in 0..=order {
+        let k1 = order - k0;
+        let circle = if k0 == 0 { 1.0 } else { omega.powi(k0 as i32) };
+        let line = if k1 == 0 {
+            rho.powi(line_degree as i32).max(1.0)
+        } else {
+            let residual = line_degree.saturating_sub(k1 as usize) as i32;
+            big_d.powi(k1 as i32) * rho.powi(residual)
+        };
+        best = best.max(circle * line);
+    }
+    best
+}
+
 /// Sup-norm radius `ρ = ‖t_c‖∞ + radius` of the chart (the coordinate magnitude
 /// bound used by the monomial-patch jet bounds).
-fn patch_rho(chart: &ChartRegion) -> f64 {
+pub(crate) fn patch_rho(chart: &ChartRegion) -> f64 {
     let center_inf = chart
         .center
         .iter()
@@ -303,7 +358,7 @@ fn patch_rho(chart: &ChartRegion) -> f64 {
 /// Per-column `g`-th jet sup for a monomial patch of max degree `D` in `d`
 /// coordinates over the chart: `d^g · D^g · ρ^{max(D−g,0)}` (see the
 /// [`EuclideanPatchEvaluator`] doc comment for the derivation).
-fn patch_jet_sup(latent_dim: usize, max_degree: usize, chart: &ChartRegion, order: u32) -> f64 {
+pub(crate) fn patch_jet_sup(latent_dim: usize, max_degree: usize, chart: &ChartRegion, order: u32) -> f64 {
     let d = latent_dim as f64;
     let big_d = max_degree as f64;
     let rho = patch_rho(chart);
@@ -384,7 +439,7 @@ impl DuchonOrderDegree for DuchonCoordinateEvaluator {
 
 /// Per-column `g`-th jet sup of the Duchon polynomial nullspace block, treated
 /// as a monomial patch of degree `order_degree`.
-fn duchon_poly_jet_sup(
+pub(crate) fn duchon_poly_jet_sup(
     latent_dim: usize,
     order_degree: usize,
     chart: &ChartRegion,
@@ -399,7 +454,7 @@ fn duchon_poly_jet_sup(
 /// Decoder magnitude `Σ_m ‖B_{m,:}‖₂` of an atom's frozen decoder block: the
 /// factor that converts a per-column `Φ`-jet sup `B_g` into a reconstruction
 /// jet sup `‖∂^g m‖ ≤ |z|·decoder_row_norm_sum·B_g`.
-fn decoder_row_norm_sum(decoder: ArrayView2<'_, f64>) -> f64 {
+pub(crate) fn decoder_row_norm_sum(decoder: ArrayView2<'_, f64>) -> f64 {
     let mut acc = 0.0;
     for row in decoder.rows() {
         acc += row.dot(&row).sqrt();
@@ -408,14 +463,14 @@ fn decoder_row_norm_sum(decoder: ArrayView2<'_, f64>) -> f64 {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ReconstructionJetSups {
-    value: f64,
-    jacobian: f64,
-    hessian: f64,
-    third: f64,
+pub(crate) struct ReconstructionJetSups {
+    pub(crate) value: f64,
+    pub(crate) jacobian: f64,
+    pub(crate) hessian: f64,
+    pub(crate) third: f64,
 }
 
-fn pair_trig_decoder_sup(sin_row: ArrayView1<'_, f64>, cos_row: ArrayView1<'_, f64>) -> f64 {
+pub(crate) fn pair_trig_decoder_sup(sin_row: ArrayView1<'_, f64>, cos_row: ArrayView1<'_, f64>) -> f64 {
     let aa = sin_row.dot(&sin_row);
     let bb = cos_row.dot(&cos_row);
     let ab = sin_row.dot(&cos_row);
@@ -424,7 +479,7 @@ fn pair_trig_decoder_sup(sin_row: ArrayView1<'_, f64>, cos_row: ArrayView1<'_, f
     (0.5 * (trace + disc)).sqrt()
 }
 
-fn periodic_reconstruction_jet_sups(decoder: ArrayView2<'_, f64>) -> ReconstructionJetSups {
+pub(crate) fn periodic_reconstruction_jet_sups(decoder: ArrayView2<'_, f64>) -> ReconstructionJetSups {
     let mut value = 0.0;
     let mut jacobian = 0.0;
     let mut hessian = 0.0;
@@ -459,7 +514,7 @@ fn periodic_reconstruction_jet_sups(decoder: ArrayView2<'_, f64>) -> Reconstruct
     }
 }
 
-fn reconstruction_jet_sups(atom: &SaeManifoldAtom, sups: JetSups) -> ReconstructionJetSups {
+pub(crate) fn reconstruction_jet_sups(atom: &SaeManifoldAtom, sups: JetSups) -> ReconstructionJetSups {
     if matches!(
         atom.basis_kind,
         crate::terms::sae_manifold::SaeAtomBasisKind::Periodic
@@ -488,7 +543,7 @@ fn reconstruction_jet_sups(atom: &SaeManifoldAtom, sups: JetSups) -> Reconstruct
 ///
 /// `prior_lipschitz` is the caller-supplied closed-form `L_prior` of the
 /// ARD/von-Mises coordinate prior (`0.0` if no prior is active on the encode).
-fn hessian_lipschitz_constant(
+pub(crate) fn hessian_lipschitz_constant(
     recon_sups: ReconstructionJetSups,
     amplitude: f64,
     target_norm: f64,
@@ -575,7 +630,7 @@ pub struct EncodeResult {
 }
 
 impl EncodeResult {
-    fn from_rows(coords: Array2<f64>, certified: Vec<bool>) -> Self {
+    pub(crate) fn from_rows(coords: Array2<f64>, certified: Vec<bool>) -> Self {
         let encode_uncertified_count = certified.iter().filter(|c| !**c).count();
         Self {
             coords,
@@ -601,11 +656,18 @@ impl RowCertificate {
     }
 }
 
+/// Canonical flat-axis polynomial degree of a cylinder `S¹ × ℝ` atom — the
+/// degree the topology-race builder ([`crate::solver::structure_harvest`]) uses
+/// for the line axis (`CylinderHarmonicEvaluator::new(_, 2)`). The encode atlas
+/// recovers the circle harmonic count from the basis width using this degree, so
+/// the two must agree.
+pub(crate) const SAE_CYLINDER_LINE_DEGREE: usize = 2;
+
 /// Build a basis-family handle for one atom from its [`SaeManifoldAtom`]. The
 /// atlas needs to evaluate the jet sups, which live on the concrete evaluator
 /// types; the atom carries the evaluator as `Arc<dyn SaeBasisEvaluator>`, so we
 /// reconstruct the family bound from the atom's basis kind + width + centers.
-fn family_jet_sups(atom: &SaeManifoldAtom, chart: &ChartRegion) -> Result<JetSups, String> {
+pub(crate) fn family_jet_sups(atom: &SaeManifoldAtom, chart: &ChartRegion) -> Result<JetSups, String> {
     use crate::terms::sae_manifold::SaeAtomBasisKind::*;
     let m = atom.basis_size();
     let d = atom.latent_dim;
@@ -624,6 +686,22 @@ fn family_jet_sups(atom: &SaeManifoldAtom, chart: &ChartRegion) -> Result<JetSup
         }
         Sphere => {
             let ev = SphereChartEvaluator;
+            JetSups::from_family(&ev, chart)
+        }
+        Cylinder => {
+            // Cylinder width is `(2H+1)·(D+1)` with the canonical flat-axis
+            // degree `D = SAE_CYLINDER_LINE_DEGREE` (the harvest convention).
+            // Recover the per-axis circle harmonic count `H` from
+            // `2H+1 = m/(D+1)`.
+            let ml = SAE_CYLINDER_LINE_DEGREE + 1;
+            if d != 2 || ml == 0 || m % ml != 0 {
+                return Err(format!(
+                    "EncodeAtlas: Cylinder atom requires latent_dim == 2 and width divisible by {ml}; got dim={d}, m={m}"
+                ));
+            }
+            let axis_mc = m / ml;
+            let h = axis_mc.saturating_sub(1) / 2;
+            let ev = CylinderHarmonicEvaluator::new(h.max(1), SAE_CYLINDER_LINE_DEGREE)?;
             JetSups::from_family(&ev, chart)
         }
         EuclideanPatch | Poincare => {
@@ -660,7 +738,7 @@ fn family_jet_sups(atom: &SaeManifoldAtom, chart: &ChartRegion) -> Result<JetSup
 }
 
 /// Smallest monomial-patch degree whose column count covers `m` basis columns.
-fn euclidean_patch_degree(latent_dim: usize, m: usize) -> usize {
+pub(crate) fn euclidean_patch_degree(latent_dim: usize, m: usize) -> usize {
     // Column count of a degree-D patch in d vars is C(d+D, D). Grow D until it
     // covers m; cap at m so a degenerate width still terminates.
     let mut degree = 0usize;
@@ -673,7 +751,7 @@ fn euclidean_patch_degree(latent_dim: usize, m: usize) -> usize {
 /// Largest integer `a` with `a^k ≤ n` (the floor of the `k`-th root). Used to
 /// recover the per-axis harmonic width `axis_m` from a torus basis width
 /// `m = axis_m^d`.
-fn integer_root(n: usize, k: usize) -> usize {
+pub(crate) fn integer_root(n: usize, k: usize) -> usize {
     if k == 0 {
         return 1;
     }
@@ -699,7 +777,7 @@ fn integer_root(n: usize, k: usize) -> usize {
     }
 }
 
-fn patch_column_count(latent_dim: usize, degree: usize) -> usize {
+pub(crate) fn patch_column_count(latent_dim: usize, degree: usize) -> usize {
     // C(d + D, D)
     let mut num = 1u128;
     let mut den = 1u128;
@@ -713,7 +791,7 @@ fn patch_column_count(latent_dim: usize, degree: usize) -> usize {
 /// Recover Duchon centers from an atom: when the evaluator is unavailable the
 /// atlas falls back to the atom's own latent-coordinate hull as the center set,
 /// which only affects the radial-tail bound conservatively.
-fn duchon_centers_from_atom(atom: &SaeManifoldAtom) -> Array2<f64> {
+pub(crate) fn duchon_centers_from_atom(atom: &SaeManifoldAtom) -> Array2<f64> {
     // One center at the origin in latent_dim space is a sound conservative
     // default: the chart's own r_min / r_max bracket the true radial range.
     Array2::<f64>::zeros((1, atom.latent_dim.max(1)))
@@ -721,15 +799,15 @@ fn duchon_centers_from_atom(atom: &SaeManifoldAtom) -> Array2<f64> {
 
 /// The four per-column jet sups of a basis family over a chart.
 #[derive(Debug, Clone, Copy)]
-struct JetSups {
-    value: f64,
-    jacobian: f64,
-    hessian: f64,
-    third: f64,
+pub(crate) struct JetSups {
+    pub(crate) value: f64,
+    pub(crate) jacobian: f64,
+    pub(crate) hessian: f64,
+    pub(crate) third: f64,
 }
 
 impl JetSups {
-    fn from_family<B: BasisHessianLipschitz>(family: &B, chart: &ChartRegion) -> Self {
+    pub(crate) fn from_family<B: BasisHessianLipschitz>(family: &B, chart: &ChartRegion) -> Self {
         Self {
             value: family.value_sup(chart),
             jacobian: family.jacobian_sup(chart),
@@ -759,7 +837,7 @@ impl JetSups {
 /// max where `∇f = 0` but the full curvature is negative). The residual term
 /// needs the basis second jet `∂²Φ/∂t²`; an evaluator without one returns
 /// `None`, and the row is flagged (no silent Gauss-Newton fallback).
-fn encode_grad_hess(
+pub(crate) fn encode_grad_hess(
     atom: &SaeManifoldAtom,
     evaluator: &dyn SaeBasisEvaluator,
     t: ArrayView1<'_, f64>,
@@ -847,7 +925,7 @@ fn encode_grad_hess(
 /// `δ = −H⁻¹ g` with `η = ‖δ‖`, from a symmetric PSD `H` and gradient `g`.
 /// Returns `None` when `H` is numerically singular (λ_min ≤ 0) — an
 /// uncertifiable start.
-fn beta_eta_newton(
+pub(crate) fn beta_eta_newton(
     h: ArrayView2<'_, f64>,
     g: ArrayView1<'_, f64>,
 ) -> Result<Option<(f64, f64, Array1<f64>)>, String> {
@@ -985,7 +1063,7 @@ impl EncodeAtlas {
         })
     }
 
-    fn build_atom_atlas(
+    pub(crate) fn build_atom_atlas(
         atom_index: usize,
         atom: &SaeManifoldAtom,
         amplitude_bound: f64,
@@ -1282,7 +1360,7 @@ impl EncodeAtlas {
         let rows: Vec<(Array1<f64>, bool)> =
             if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
                 use rayon::prelude::*;
-                const CHUNK: usize = 256;
+                pub(crate) const CHUNK: usize = 256;
                 let n_chunks = n.div_ceil(CHUNK);
                 let chunked: Vec<Vec<(Array1<f64>, bool)>> = (0..n_chunks)
                     .into_par_iter()
@@ -1349,7 +1427,7 @@ impl EncodeAtlas {
         let rows: Vec<(Array1<f64>, bool)> =
             if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
                 use rayon::prelude::*;
-                const CHUNK: usize = 256;
+                pub(crate) const CHUNK: usize = 256;
                 let n_chunks = n.div_ceil(CHUNK);
                 let chunked: Vec<Vec<(Array1<f64>, bool)>> = (0..n_chunks)
                     .into_par_iter()
@@ -1453,7 +1531,7 @@ impl EncodeAtlas {
         let rows: Vec<Option<(Array1<f64>, bool)>> =
             if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
                 use rayon::prelude::*;
-                const CHUNK: usize = 256;
+                pub(crate) const CHUNK: usize = 256;
                 let n_chunks = n.div_ceil(CHUNK);
                 let chunked: Vec<Vec<Option<(Array1<f64>, bool)>>> = (0..n_chunks)
                     .into_par_iter()
@@ -1545,7 +1623,7 @@ impl EncodeAtlas {
         let rows: Vec<Option<(Array1<f64>, bool)>> =
             if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
                 use rayon::prelude::*;
-                const CHUNK: usize = 256;
+                pub(crate) const CHUNK: usize = 256;
                 let n_chunks = n.div_ceil(CHUNK);
                 let chunked: Vec<Vec<Option<(Array1<f64>, bool)>>> = (0..n_chunks)
                     .into_par_iter()
@@ -1581,7 +1659,7 @@ impl EncodeAtlas {
 /// curvature estimate. (The online per-row certificate still uses the FULL
 /// Hessian; this is only the offline radius-sizing curvature.) Returns `None`
 /// for a degenerate center (`λ_min ≤ 0`), which marks an uncertifiable chart.
-fn center_beta(atom: &SaeManifoldAtom, center: &Array1<f64>, ridge: f64) -> Option<f64> {
+pub(crate) fn center_beta(atom: &SaeManifoldAtom, center: &Array1<f64>, ridge: f64) -> Option<f64> {
     let evaluator = atom.basis_evaluator.as_ref()?.clone();
     let d = atom.latent_dim;
     let p = atom.output_dim();
@@ -1630,7 +1708,7 @@ fn center_beta(atom: &SaeManifoldAtom, center: &Array1<f64>, ridge: f64) -> Opti
 /// `None` when the basis has no jet or the Gauss–Newton block is singular (no
 /// certifiable amortization), matching `center_beta`'s gate so a chart with a
 /// finite `β` always carries a Jacobian and vice versa.
-fn center_amortized_jacobian(
+pub(crate) fn center_amortized_jacobian(
     atom: &SaeManifoldAtom,
     center: &Array1<f64>,
     ridge: f64,
@@ -1703,7 +1781,7 @@ fn center_amortized_jacobian(
 /// distance: the chart whose center reconstruction `m(t_c)` is closest to `x`.
 /// Returns the chart index and the distance, or `None` when the atom has no
 /// charts.
-fn nearest_chart(
+pub(crate) fn nearest_chart(
     atom_atlas: &AtomEncodeAtlas,
     x: ArrayView1<'_, f64>,
     atom: &SaeManifoldAtom,
@@ -1749,7 +1827,7 @@ fn nearest_chart(
 
 /// Maximum number of chart centers laid down per atom (the SHAPE_BAND grid
 /// point cap; mirrors `SHAPE_BAND_MAX_POINTS` in the atom band machinery).
-const SHAPE_BAND_MAX_POINTS: usize = 512;
+pub(crate) const SHAPE_BAND_MAX_POINTS: usize = 512;
 
 /// Lay down chart centers on an atom's coordinate grid (the SHAPE_BAND grid
 /// idiom): a regular grid spanning the compact latent domain for periodic /
@@ -1760,7 +1838,7 @@ const SHAPE_BAND_MAX_POINTS: usize = 512;
 /// spans `[0, 1)`; the sphere chart spans `lat ∈ [−π/2, π/2]`, `lon ∈ [−π, π)`.
 /// These conventions match the basis evaluators (the fraction-of-period circle
 /// harmonic and the lat/lon sphere chart).
-fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Array2<f64> {
+pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Array2<f64> {
     use crate::terms::sae_manifold::SaeAtomBasisKind::*;
     let d = atom.latent_dim;
     match &atom.basis_kind {
@@ -1779,7 +1857,7 @@ fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Array2<f64> {
 /// [`SHAPE_BAND_MAX_POINTS`] total points (the per-axis resolution is reduced
 /// until the product fits). When `include_endpoint` the last grid point sits at
 /// `hi`; otherwise the axis is treated as periodic and stops one step short.
-fn regular_product_grid(
+pub(crate) fn regular_product_grid(
     d: usize,
     resolution: usize,
     lo: f64,
@@ -1819,7 +1897,7 @@ fn regular_product_grid(
 
 /// Lat/lon sphere chart grid: `lat ∈ [−π/2, π/2]`, `lon ∈ [−π, π)`, matching
 /// the [`crate::terms::sae_manifold::SphereChartEvaluator`] convention.
-fn sphere_latlon_grid(resolution: usize) -> Array2<f64> {
+pub(crate) fn sphere_latlon_grid(resolution: usize) -> Array2<f64> {
     use std::f64::consts::PI;
     let r = resolution.max(2).min(22); // 22² = 484 ≤ SHAPE_BAND_MAX_POINTS.
     let mut grid = Array2::<f64>::zeros((r * r, 2));
@@ -1837,7 +1915,7 @@ fn sphere_latlon_grid(resolution: usize) -> Array2<f64> {
 /// Nominal in-chart radius: half the inter-center grid spacing, so charts tile
 /// the domain. For compact latents this is the grid step; for unbounded latents
 /// a unit default that the certified radius refines.
-fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) -> f64 {
+pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) -> f64 {
     use crate::terms::sae_manifold::SaeAtomBasisKind::*;
     match &atom.basis_kind {
         Periodic | Torus => 0.5 / (resolution.max(2) as f64),
@@ -1848,7 +1926,7 @@ fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) -> f64 {
 
 /// Build the [`ChartRegion`] for a center, attaching the radial r_min / r_max
 /// bracket for Duchon atoms (the chart's distance range to the kernel centers).
-fn chart_region(atom: &SaeManifoldAtom, center: Array1<f64>, radius: f64) -> ChartRegion {
+pub(crate) fn chart_region(atom: &SaeManifoldAtom, center: Array1<f64>, radius: f64) -> ChartRegion {
     use crate::terms::sae_manifold::SaeAtomBasisKind::*;
     let region = ChartRegion::new(center.clone(), radius);
     match &atom.basis_kind {

@@ -494,23 +494,23 @@ pub(crate) fn ensure_exact_joint_hessian_dense_budget(
 }
 
 pub(crate) struct JointHessianBundle<'a> {
-    source: JointHessianSource,
-    beta_flat: Array1<f64>,
-    compute_dh: Box<DriftDerivFn<'a>>,
-    compute_dh_many: Option<Box<DriftDerivManyFn<'a>>>,
-    compute_d2h: Box<DriftSecondDerivFn<'a>>,
+    pub(crate) source: JointHessianSource,
+    pub(crate) beta_flat: Array1<f64>,
+    pub(crate) compute_dh: Box<DriftDerivFn<'a>>,
+    pub(crate) compute_dh_many: Option<Box<DriftDerivManyFn<'a>>>,
+    pub(crate) compute_d2h: Box<DriftSecondDerivFn<'a>>,
     /// Optional batched second-derivative callback. The unified evaluator's
     /// outer-Hessian ρ-ρ pair loop forwards the K(K+1)/2 (v_k, v_l) pairs
     /// here in one call when set, so families that fuse the per-row D²H walk
     /// (e.g. survival marginal-slope scanning n rows once per outer eval)
     /// amortise the row-walk across all pairs instead of paying it per pair.
-    compute_d2h_many: Option<Box<DriftSecondDerivManyFn<'a>>>,
-    owned_compute_dh:
+    pub(crate) compute_d2h_many: Option<Box<DriftSecondDerivManyFn<'a>>>,
+    pub(crate) owned_compute_dh:
         Option<Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>>,
-    owned_compute_dh_many: Option<
+    pub(crate) owned_compute_dh_many: Option<
         Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync>,
     >,
-    owned_compute_d2h: Option<
+    pub(crate) owned_compute_d2h: Option<
         Arc<
             dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
                 + Send
@@ -521,15 +521,15 @@ pub(crate) struct JointHessianBundle<'a> {
     /// `OwnedJointDerivProvider` so the unified evaluator can share the
     /// callback across rayon worker threads when the outer Hessian routes
     /// through the parallel pair dispatch.
-    owned_compute_d2h_many: Option<
+    pub(crate) owned_compute_d2h_many: Option<
         Arc<
             dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>
                 + Send
                 + Sync,
         >,
     >,
-    rho_curvature_scale: f64,
-    hessian_logdet_correction: f64,
+    pub(crate) rho_curvature_scale: f64,
+    pub(crate) hessian_logdet_correction: f64,
 }
 
 pub(crate) type DriftDerivFn<'a> =
@@ -1940,12 +1940,12 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
 /// that same block.  There is no shared buffer across blocks, so
 /// cross-block length confusion is structurally impossible.
 pub(crate) struct BlockEtaCheckpoint {
-    saved: Array1<f64>,
+    pub(crate) saved: Array1<f64>,
 }
 
 impl BlockEtaCheckpoint {
     /// Capture the current eta of `state`.
-    fn capture(state: &ParameterBlockState) -> Self {
+    pub(crate) fn capture(state: &ParameterBlockState) -> Self {
         Self {
             saved: state.eta.clone(),
         }
@@ -1953,7 +1953,7 @@ impl BlockEtaCheckpoint {
 
     /// Capture into a pre-allocated buffer, returning the filled checkpoint.
     /// The buffer is taken (O(1) move) and filled with eta's data (O(n) copy).
-    fn capture_reuse(state: &ParameterBlockState, buf: &mut Array1<f64>) -> Self {
+    pub(crate) fn capture_reuse(state: &ParameterBlockState, buf: &mut Array1<f64>) -> Self {
         if buf.len() == state.eta.len() {
             buf.assign(&state.eta);
             Self {
@@ -1965,17 +1965,17 @@ impl BlockEtaCheckpoint {
     }
 
     /// Return the internal buffer for recycling.
-    fn into_buffer(self) -> Array1<f64> {
+    pub(crate) fn into_buffer(self) -> Array1<f64> {
         self.saved
     }
 
     /// Restore: `state.eta = saved`.
-    fn restore_eta(&self, state: &mut ParameterBlockState) {
+    pub(crate) fn restore_eta(&self, state: &mut ParameterBlockState) {
         state.eta.assign(&self.saved);
     }
 
     /// Incremental update: `state.eta = saved + alpha * direction`.
-    fn restore_eta_with_step(
+    pub(crate) fn restore_eta_with_step(
         &self,
         state: &mut ParameterBlockState,
         alpha: f64,
@@ -2020,7 +2020,7 @@ pub(crate) enum JointTrustRegionDecision {
 }
 
 impl JointTrustRegionDecision {
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::GrowAtBoundary => "grow_at_boundary",
             Self::HoldInside => "hold_inside",
@@ -2034,10 +2034,10 @@ impl JointTrustRegionDecision {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JointTrustRegionUpdate {
-    rho: f64,
-    radius: f64,
-    accepted: bool,
-    decision: JointTrustRegionDecision,
+    pub(crate) rho: f64,
+    pub(crate) radius: f64,
+    pub(crate) accepted: bool,
+    pub(crate) decision: JointTrustRegionDecision,
 }
 
 pub(crate) fn update_joint_trust_region_radius(
@@ -2169,7 +2169,7 @@ pub(crate) fn joint_objective_floor_reached(
 /// that catapults the KKT residual off the near-converged iterate (gam#787 binary
 /// matern centers=12: residual 1.7e-4 → 4.7e-1, never recovers).
 pub(crate) fn joint_proposal_at_step_floor(proposal_step_inf: f64, step_tol: f64) -> bool {
-    const STEP_FLOOR_CERT_FACTOR: f64 = 4.0;
+    pub(crate) const STEP_FLOOR_CERT_FACTOR: f64 = 4.0;
     proposal_step_inf.is_finite()
         && step_tol.is_finite()
         && proposal_step_inf <= STEP_FLOOR_CERT_FACTOR * step_tol
@@ -2428,7 +2428,7 @@ pub(crate) fn shrink_active_joint_block_trust_radii(
     //     to `inner_loop_hard_ceiling` (1200) cycles wasting ~120 s per
     //     outer ρ-evaluation — the Rust CI Test hang and the
     //     `rust_margslope_aniso_duchon16d_*` large-scale 2400 s timeout.
-    const RADIUS_FLOOR: f64 = 1.0e-12;
+    pub(crate) const RADIUS_FLOOR: f64 = 1.0e-12;
     let any_boundary_block = block_radii
         .iter()
         .zip(block_step_norms)
@@ -2557,40 +2557,40 @@ pub(crate) fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> boo
 /// can act without re-deriving the cert math.
 #[derive(Clone, Debug)]
 pub(crate) struct KktRefusalReport {
-    block_names: Vec<String>,
-    block_widths: Vec<usize>,
-    block_beta_inf: Vec<f64>,
-    block_grad_inf: Vec<f64>,
-    block_penalty_grad_inf: Vec<f64>,
-    block_residual_inf: Vec<f64>,
-    block_carrying_residual: Option<usize>,
+    pub(crate) block_names: Vec<String>,
+    pub(crate) block_widths: Vec<usize>,
+    pub(crate) block_beta_inf: Vec<f64>,
+    pub(crate) block_grad_inf: Vec<f64>,
+    pub(crate) block_penalty_grad_inf: Vec<f64>,
+    pub(crate) block_residual_inf: Vec<f64>,
+    pub(crate) block_carrying_residual: Option<usize>,
 
-    hpen_eigenvalues_sorted_desc: Vec<f64>,
-    hpen_min_abs_eigenvalue: f64,
-    hpen_max_abs_eigenvalue: f64,
-    hpen_condition_number: f64,
-    hpen_nullity_at_rank_tol: usize,
-    hpen_rank_tol: f64,
-    hpen_null_gradient_inf: f64,
-    hpen_null_vector_block_inf: Vec<f64>,
-    hpen_null_vector_carrying_block: Option<usize>,
+    pub(crate) hpen_eigenvalues_sorted_desc: Vec<f64>,
+    pub(crate) hpen_min_abs_eigenvalue: f64,
+    pub(crate) hpen_max_abs_eigenvalue: f64,
+    pub(crate) hpen_condition_number: f64,
+    pub(crate) hpen_nullity_at_rank_tol: usize,
+    pub(crate) hpen_rank_tol: f64,
+    pub(crate) hpen_null_gradient_inf: f64,
+    pub(crate) hpen_null_vector_block_inf: Vec<f64>,
+    pub(crate) hpen_null_vector_carrying_block: Option<usize>,
 
-    active_set_rows_total: usize,
-    accepted_step_inf: f64,
-    proposal_step_inf: f64,
-    trust_radius: f64,
-    cycle: usize,
+    pub(crate) active_set_rows_total: usize,
+    pub(crate) accepted_step_inf: f64,
+    pub(crate) proposal_step_inf: f64,
+    pub(crate) trust_radius: f64,
+    pub(crate) cycle: usize,
 
-    residual_tol: f64,
-    obj_tol: f64,
-    step_tol: f64,
+    pub(crate) residual_tol: f64,
+    pub(crate) obj_tol: f64,
+    pub(crate) step_tol: f64,
 
-    linearized_rel: f64,
-    scalar_model_relerr: f64,
-    objective_change: f64,
-    projected_residual_inf: f64,
+    pub(crate) linearized_rel: f64,
+    pub(crate) scalar_model_relerr: f64,
+    pub(crate) objective_change: f64,
+    pub(crate) projected_residual_inf: f64,
 
-    diagnosis: KktRefusalDiagnosis,
+    pub(crate) diagnosis: KktRefusalDiagnosis,
 }
 
 /// Three-way classification of why the cert refused, computed from the
@@ -2645,7 +2645,7 @@ impl KktRefusalDiagnosis {
         }
     }
 
-    fn guidance(self) -> &'static str {
+    pub(crate) fn guidance(self) -> &'static str {
         match self {
             KktRefusalDiagnosis::RankDeficientHPen => {
                 "check whether the named block has a structural or numerical null direction \
@@ -2724,20 +2724,20 @@ pub(crate) const LEVENBERG_ILL_CONDITIONING_THRESHOLD: f64 = 1.0e4;
 
 #[derive(Clone, Debug)]
 pub(crate) struct JointSpectralNewtonStep {
-    delta: Array1<f64>,
-    range_rhs_inf: f64,
-    null_rhs_inf: f64,
-    lambda_max_abs: f64,
-    lambda_min_positive: f64,
-    nullity: usize,
-    rank_tol: f64,
+    pub(crate) delta: Array1<f64>,
+    pub(crate) range_rhs_inf: f64,
+    pub(crate) null_rhs_inf: f64,
+    pub(crate) lambda_max_abs: f64,
+    pub(crate) lambda_min_positive: f64,
+    pub(crate) nullity: usize,
+    pub(crate) rank_tol: f64,
     /// Number of eigen-directions whose curvature was negative (beyond the
     /// rank cutoff) and was reflected to `|λ|` to form a modified-Newton
     /// descent step. Zero for a genuinely positive-semidefinite model.
-    reflected_negative_modes: usize,
+    pub(crate) reflected_negative_modes: usize,
     /// Most negative eigenvalue encountered (≤ 0); `0.0` when the model was
     /// positive-semidefinite within the rank cutoff.
-    most_negative_eigenvalue: f64,
+    pub(crate) most_negative_eigenvalue: f64,
 }
 
 /// Production home for the exact trust-region engine ([`WhitenedHessianSpectrum`]),
@@ -2800,18 +2800,18 @@ pub(crate) mod whitened_spectrum {
     pub(crate) struct WhitenedHessianSpectrum {
         /// Generalized eigenvalues `γ_k` of `(H_pen, D)` = eigenvalues of the
         /// whitened matrix `A = D^{-1/2} H_pen D^{-1/2}`.
-        gamma: Array1<f64>,
+        pub(crate) gamma: Array1<f64>,
         /// Whitened eigenvectors `v_k` (columns) of `A`.
-        evecs: Array2<f64>,
+        pub(crate) evecs: Array2<f64>,
         /// rhs in the whitened eigenbasis: `c_k = v_kᵀ D^{-1/2} rhs`.
-        c: Array1<f64>,
+        pub(crate) c: Array1<f64>,
         /// `D^{-1/2}` diagonal, mapping a whitened step `η` back to `δ = D^{-1/2} η`.
-        d_inv_sqrt: Array1<f64>,
+        pub(crate) d_inv_sqrt: Array1<f64>,
         /// `max_k |γ_k|` (the curvature scale; `D`-whitened).
-        lambda_max_abs: f64,
+        pub(crate) lambda_max_abs: f64,
         /// Curvature magnitude at/below which a direction is treated as genuinely
         /// unidentified (penalty null space) and dropped from the step.
-        null_cutoff: f64,
+        pub(crate) null_cutoff: f64,
     }
 
     impl WhitenedHessianSpectrum {
@@ -2873,7 +2873,7 @@ pub(crate) mod whitened_spectrum {
         /// norm of the trial step as a function of the Levenberg shift `λ`. Only
         /// identified (above-`null_cutoff`) modes participate; the null space carries
         /// no step.
-        fn step_norm_sq(&self, lambda: f64) -> f64 {
+        pub(crate) fn step_norm_sq(&self, lambda: f64) -> f64 {
             let mut acc = 0.0;
             for k in 0..self.gamma.len() {
                 if self.gamma[k].abs() <= self.null_cutoff {
@@ -2933,7 +2933,7 @@ pub(crate) mod whitened_spectrum {
         /// modes and map it back to `δ = D^{-1/2} η`. Returns `(δ, range_rhs_inf,
         /// null_rhs_inf, nullity, lambda_min_positive, reflected_negative_modes,
         /// most_negative)` diagnostics consistent with the legacy spectral step.
-        fn assemble(
+        pub(crate) fn assemble(
             &self,
             lambda: f64,
             extra_min_mode: Option<(usize, f64)>,
@@ -3126,7 +3126,7 @@ pub(crate) mod whitened_spectrum {
         /// Reflected modified-Newton step (`|γ_k|` curvature, no trust region). Only
         /// used when a caller disables the trust region on an indefinite model — the
         /// trust-region path proper never reflects.
-        fn assemble_reflected(&self) -> JointSpectralNewtonStep {
+        pub(crate) fn assemble_reflected(&self) -> JointSpectralNewtonStep {
             let p = self.gamma.len();
             let mut eta = Array1::<f64>::zeros(p);
             let mut range_rhs_inf = 0.0_f64;
@@ -3178,7 +3178,7 @@ mod trust_region_subproblem_tests {
     use super::whitened_spectrum::WhitenedHessianSpectrum;
     use ndarray::array;
 
-    fn metric_norm(delta: &Array1<f64>, d: &Array1<f64>) -> f64 {
+    pub(crate) fn metric_norm(delta: &Array1<f64>, d: &Array1<f64>) -> f64 {
         delta
             .iter()
             .zip(d.iter())
@@ -3190,7 +3190,7 @@ mod trust_region_subproblem_tests {
     /// Interior case: a positive-definite model with a generous trust radius
     /// must return the exact (full) Newton step `H⁻¹ rhs`, i.e. λ = 0.
     #[test]
-    fn interior_returns_exact_newton_step() {
+    pub(crate) fn interior_returns_exact_newton_step() {
         let h = array![[3.0, 1.0], [1.0, 2.0]];
         let rhs = array![1.0, -2.0];
         let d = array![1.0, 1.0];
@@ -3207,7 +3207,7 @@ mod trust_region_subproblem_tests {
     /// Boundary case: a tight radius forces `‖δ‖_D = r` and the KKT condition
     /// `(H + λD) δ = rhs` with `λ > 0`.
     #[test]
-    fn boundary_satisfies_more_sorensen_kkt() {
+    pub(crate) fn boundary_satisfies_more_sorensen_kkt() {
         let h = array![[3.0, 1.0], [1.0, 2.0]];
         let rhs = array![1.0, -2.0];
         let d = array![1.0, 1.0];
@@ -3237,7 +3237,7 @@ mod trust_region_subproblem_tests {
     /// Indefinite model: the exact subproblem still returns a finite boundary
     /// step that is a descent direction (rhsᵀδ > 0) and lies on the boundary.
     #[test]
-    fn indefinite_model_returns_descent_step_on_boundary() {
+    pub(crate) fn indefinite_model_returns_descent_step_on_boundary() {
         // Eigenvalues +4 and -1: genuinely indefinite.
         let h = array![[1.5, 2.5], [2.5, 1.5]];
         let rhs = array![1.0, 0.4];
@@ -3264,7 +3264,7 @@ mod trust_region_subproblem_tests {
     /// Self-vanishing: as rhs → 0 the step → 0 regardless of the radius, so the
     /// converged β and the KKT fixed point are unchanged by the globalization.
     #[test]
-    fn step_vanishes_as_rhs_vanishes() {
+    pub(crate) fn step_vanishes_as_rhs_vanishes() {
         let h = array![[3.0, 1.0], [1.0, 2.0]];
         let rhs = array![1e-13, -2e-13];
         let d = array![1.0, 1.0];
@@ -3280,7 +3280,7 @@ mod trust_region_subproblem_tests {
     /// Null space: a genuinely zero-curvature direction is dropped from the step
     /// (Moore–Penrose range restriction) and reported via `null_rhs_inf`.
     #[test]
-    fn null_direction_is_dropped_and_reported() {
+    pub(crate) fn null_direction_is_dropped_and_reported() {
         // Second coordinate has zero curvature; rhs has mass there.
         let h = array![[2.0, 0.0], [0.0, 0.0]];
         let rhs = array![1.0, 0.5];
@@ -3301,7 +3301,7 @@ mod trust_region_subproblem_tests {
     /// Non-identity metric: the boundary is measured in the `D` norm, so a step
     /// with a large lightly-weighted coordinate is admissible.
     #[test]
-    fn respects_non_identity_metric() {
+    pub(crate) fn respects_non_identity_metric() {
         let h = array![[2.0, 0.0], [0.0, 8.0]];
         let rhs = array![1.0, 1.0];
         let d = array![1.0, 16.0];
@@ -3319,7 +3319,7 @@ mod trust_region_subproblem_tests {
     /// the gradient) rather than rescaling a fixed direction — the property the
     /// dogleg/truncation lacked. A halved radius must not merely halve the step.
     #[test]
-    fn radius_shrink_bends_direction_not_just_scale() {
+    pub(crate) fn radius_shrink_bends_direction_not_just_scale() {
         let h = array![[50.0, 0.0], [0.0, 0.5]];
         let rhs = array![1.0, 1.0];
         let d = array![1.0, 1.0];
@@ -3595,7 +3595,7 @@ pub(crate) fn compute_kkt_refusal_report(
 }
 
 impl KktRefusalReport {
-    fn carrying_block_label(&self) -> String {
+    pub(crate) fn carrying_block_label(&self) -> String {
         match self.block_carrying_residual {
             Some(idx) => format!(
                 "{} (idx={}, |g|={:.3e}, |Sβ|={:.3e}, |∇L-Sβ|={:.3e}, |β|={:.3e}, width={})",
@@ -3617,11 +3617,11 @@ impl KktRefusalReport {
         }
     }
 
-    fn beta_inf(&self) -> f64 {
+    pub(crate) fn beta_inf(&self) -> f64 {
         self.block_beta_inf.iter().copied().fold(0.0_f64, f64::max)
     }
 
-    fn null_direction_label(&self) -> String {
+    pub(crate) fn null_direction_label(&self) -> String {
         match self.hpen_null_vector_carrying_block {
             Some(idx) => format!(
                 "{} (idx={}, |u_block|∞={:.3e}, |uᵀg_proj|={:.3e})",
@@ -3641,7 +3641,7 @@ impl KktRefusalReport {
     /// per-block residual / eigenspectrum / diagnosis breakdown is what
     /// makes the failure actionable (vs the legacy one-liner that only
     /// reported aggregate residual + cert math).
-    fn format_structured_log(&self, four_tol: f64) -> String {
+    pub(crate) fn format_structured_log(&self, four_tol: f64) -> String {
         format!(
             "[PIRLS/joint-Newton convergence] cycle {:>3} | cert REFUSED: residual={:.3e} > tol={:.3e} (cert)\n  \
              carrying-block: {}\n  \
@@ -3683,7 +3683,7 @@ impl KktRefusalReport {
     /// Single-string formatter used by the bubbled error returned from
     /// the inner solver, where the caller wants one self-contained line
     /// even though the data is structured.
-    fn format_bubbled_error(&self) -> String {
+    pub(crate) fn format_bubbled_error(&self) -> String {
         let carrying = self.carrying_block_label();
         format!(
             "cycle={} cert REFUSED: residual={:.3e} > tol={:.3e}; \
@@ -4010,22 +4010,22 @@ pub(crate) enum ConstrainedStationaryCertificate {
 
 #[derive(Clone, Debug)]
 pub(crate) struct JointNewtonMathDiagnostic {
-    old_kkt_inf: f64,
-    linearized_next_kkt_inf: f64,
-    predicted_reduction: f64,
-    actual_reduction: f64,
-    trust_ratio: f64,
-    step_inf: f64,
-    proposal_inf: f64,
+    pub(crate) old_kkt_inf: f64,
+    pub(crate) linearized_next_kkt_inf: f64,
+    pub(crate) predicted_reduction: f64,
+    pub(crate) actual_reduction: f64,
+    pub(crate) trust_ratio: f64,
+    pub(crate) step_inf: f64,
+    pub(crate) proposal_inf: f64,
 }
 
 impl JointNewtonMathDiagnostic {
-    fn scalar_model_relative_error(&self) -> f64 {
+    pub(crate) fn scalar_model_relative_error(&self) -> f64 {
         (self.actual_reduction - self.predicted_reduction).abs()
             / self.predicted_reduction.abs().max(1.0)
     }
 
-    fn linearized_rel(&self) -> f64 {
+    pub(crate) fn linearized_rel(&self) -> f64 {
         self.linearized_next_kkt_inf / (1.0 + self.old_kkt_inf)
     }
 }

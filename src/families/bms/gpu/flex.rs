@@ -42,7 +42,7 @@ pub fn require_row_primary_hessian_supported(n: usize, r: usize) -> Result<GpuDe
 /// host-side issues (PTX cache, arena alloc, stream sync) before the real
 /// row kernel is dispatched by the row-primary cache builder.
 #[cfg(target_os = "linux")]
-const PROBE_KERNEL_SOURCE: &str = r#"
+pub(crate) const PROBE_KERNEL_SOURCE: &str = r#"
 extern "C" __global__ void bms_flex_probe() {
     // Intentionally empty. This kernel exists only so the scaffolding can
     // verify NVRTC compile + module load + launch + synchronize on the
@@ -55,7 +55,7 @@ extern "C" __global__ void bms_flex_probe() {
 #[must_use]
 pub struct BmsFlexGpuBackend {
     #[cfg(target_os = "linux")]
-    inner: crate::gpu::backend_probe::CudaBackendContext,
+    pub(crate) inner: crate::gpu::backend_probe::CudaBackendContext,
 }
 
 impl BmsFlexGpuBackend {
@@ -72,7 +72,7 @@ impl BmsFlexGpuBackend {
     /// selected device, opens a stream, and NVRTC-compiles the probe
     /// kernel. Subsequent calls return the cached handle.
     pub fn probe() -> Result<&'static Self, GpuError> {
-        static BACKEND: OnceLock<Result<BmsFlexGpuBackend, GpuError>> = OnceLock::new();
+        pub(crate) static BACKEND: OnceLock<Result<BmsFlexGpuBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
                 #[cfg(target_os = "linux")]
@@ -91,7 +91,7 @@ impl BmsFlexGpuBackend {
     }
 
     #[cfg(target_os = "linux")]
-    fn probe_linux() -> Result<Self, GpuError> {
+    pub(crate) fn probe_linux() -> Result<Self, GpuError> {
         let parts = crate::gpu::backend_probe::probe_cuda_backend("bms_flex")?;
         let backend = BmsFlexGpuBackend {
             inner: crate::gpu::backend_probe::CudaBackendContext::from_parts(parts),
@@ -104,7 +104,7 @@ impl BmsFlexGpuBackend {
 
     /// NVRTC-compile (or fetch from cache) the probe module.
     #[cfg(target_os = "linux")]
-    fn compile_probe_module(&self) -> Result<&Arc<CudaModule>, GpuError> {
+    pub(crate) fn compile_probe_module(&self) -> Result<&Arc<CudaModule>, GpuError> {
         self.inner
             .module
             .get_or_compile(&self.inner.ctx, "bms_flex", PROBE_KERNEL_SOURCE)
@@ -186,7 +186,7 @@ mod bms_flex_gpu_tests {
     use super::*;
 
     #[test]
-    fn bms_flex_gpu_policy_decision_is_explicit() {
+    pub(crate) fn bms_flex_gpu_policy_decision_is_explicit() {
         let decision = row_primary_hessian_decision(50_000, 4);
         assert_eq!(decision.kernel, GpuKernel::MarginalSlopeRows);
     }
@@ -195,7 +195,7 @@ mod bms_flex_gpu_tests {
     /// compile, module load, launch, sync). Skipped on hosts without a
     /// usable device so the test still passes on the CI/mac builders.
     #[test]
-    fn bms_flex_gpu_context_initialises_when_device_present() {
+    pub(crate) fn bms_flex_gpu_context_initialises_when_device_present() {
         let Some(runtime) = crate::gpu::runtime::GpuRuntime::global() else {
             eprintln!("[bms_flex_gpu test] no CUDA runtime — skipping device-side init smoketest");
             return;

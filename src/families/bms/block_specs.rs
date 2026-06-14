@@ -7,7 +7,7 @@ use crate::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_xt_diag_x};
 use crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA;
 use faer::Side;
 
-const BMS_PROBIT_SEPARATION_BETA_INF: f64 = 40.0;
+pub(crate) const BMS_PROBIT_SEPARATION_BETA_INF: f64 = 40.0;
 
 // ── Canonical-gauge priority ladder (issue #322) ─────────────────────────────
 //
@@ -47,7 +47,7 @@ pub(super) const GAUGE_PRIORITY_LINK_DEV: u8 = 60;
 /// the exact spatial outer loop is a coarse 1-D search over a smooth profiled
 /// objective; tightening it below this floor only burns cycles on noise in the
 /// inner-solve-reported objective without moving the selected length scale.
-const EXACT_SPATIAL_OUTER_TOL_FLOOR: f64 = 1e-6;
+pub(crate) const EXACT_SPATIAL_OUTER_TOL_FLOOR: f64 = 1e-6;
 
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
 //
@@ -286,7 +286,7 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
 /// `self.marginal_design` (a matched (design, β) pair) — picks them up with no
 /// kernel-site change; the widened `p_marginal` keeps every per-row Jacobian /
 /// gradient / Hessian projection consistent.
-fn widen_marginal_dense_with_influence(
+pub(crate) fn widen_marginal_dense_with_influence(
     marginal_dense: &Arc<Array2<f64>>,
     influence_columns: Option<&Array2<f64>>,
 ) -> Result<Arc<Array2<f64>>, String> {
@@ -317,7 +317,7 @@ fn widen_marginal_dense_with_influence(
 /// ~0 eigenvalue in `Gtt` (see [`build_reduced_logslope_reparam`]); this keeps
 /// the cut well above floating-point noise but well below any genuine surviving
 /// logslope curvature.
-const LOGSLOPE_REDUCED_BASIS_RELATIVE_TOL: f64 = 1.0e-6;
+pub(crate) const LOGSLOPE_REDUCED_BASIS_RELATIVE_TOL: f64 = 1.0e-6;
 
 /// An exact reduced-basis reparameterization of the BMS logslope design through
 /// the family's OWN internal `logslope_design` geometry, expressed as a single
@@ -415,7 +415,7 @@ impl ReducedLogslopeReparam {
 /// when there is no logslope/marginal span, no effective-confounded direction to
 /// remove (`r == p_g`), or the whole effective logslope image is in the effective
 /// marginal span (`r == 0`); in those cases the caller keeps the raw design.
-fn build_reduced_logslope_reparam(
+pub(crate) fn build_reduced_logslope_reparam(
     marginal_design: &TermCollectionDesign,
     logslope_design: &TermCollectionDesign,
     z: &Array1<f64>,
@@ -513,7 +513,7 @@ fn build_reduced_logslope_reparam(
 ///     Gtt = G_effᵀ W G_eff − (G_effᵀ W M_eff)(M_effᵀ W M_eff + εI)⁻¹(M_effᵀ W G_eff).
 /// `T` is the orthonormal eigenbasis of `Gtt` for eigenvalues above a tolerance
 /// relative to the effective logslope energy scale.
-fn reduced_logslope_transform_effective(
+pub(crate) fn reduced_logslope_transform_effective(
     marginal: ArrayView2<'_, f64>,
     logslope: ArrayView2<'_, f64>,
     z: &Array1<f64>,
@@ -627,7 +627,7 @@ fn reduced_logslope_transform_effective(
 /// `S_reduced = Tᵀ S T` over the full reduced column range `0..r`. The reduced
 /// penalty's null space is recomputed from its numerical rank so the REML
 /// log-determinant accounting stays consistent at the reduced width.
-fn reparameterize_logslope_design_reduced(
+pub(crate) fn reparameterize_logslope_design_reduced(
     logslope_design: &TermCollectionDesign,
     reparam: &ReducedLogslopeReparam,
 ) -> Result<TermCollectionDesign, String> {
@@ -722,7 +722,7 @@ fn reparameterize_logslope_design_reduced(
 /// initial_log_lambdas)` to install on the marginal block. Fixed ridges remain
 /// in this physical penalty layout and are removed from every REML/outer
 /// coordinate vector by [`PenaltyMatrix::Fixed`].
-fn marginal_penalties_with_influence_ridge(
+pub(crate) fn marginal_penalties_with_influence_ridge(
     design: &TermCollectionDesign,
     rho_marginal: &Array1<f64>,
     influence_columns: Option<&Array2<f64>>,
@@ -762,7 +762,7 @@ fn marginal_penalties_with_influence_ridge(
 
 /// Widen an optional β warm-start hint to the influence-widened marginal
 /// dimension, zero-filling the absorber coefficients `γ` (#461).
-fn widen_marginal_beta_hint(
+pub(crate) fn widen_marginal_beta_hint(
     beta_hint: Option<Array1<f64>>,
     p_marginal_widened: usize,
 ) -> Option<Array1<f64>> {
@@ -780,7 +780,7 @@ fn widen_marginal_beta_hint(
     })
 }
 
-fn argmax_by_abs<I>(values: I) -> Option<(String, usize, f64)>
+pub(crate) fn argmax_by_abs<I>(values: I) -> Option<(String, usize, f64)>
 where
     I: IntoIterator<Item = (String, usize, f64)>,
 {
@@ -795,7 +795,7 @@ where
         })
 }
 
-fn marginal_parametric_argmax_from_beta(
+pub(crate) fn marginal_parametric_argmax_from_beta(
     beta: &Array1<f64>,
     design: &TermCollectionDesign,
     spec: &TermCollectionSpec,
@@ -820,7 +820,7 @@ fn marginal_parametric_argmax_from_beta(
     argmax_by_abs(entries)
 }
 
-fn marginal_parametric_argmax_from_warm_start(
+pub(crate) fn marginal_parametric_argmax_from_warm_start(
     warm_start: &CustomFamilyWarmStart,
     design: &TermCollectionDesign,
     spec: &TermCollectionSpec,
@@ -843,7 +843,7 @@ fn marginal_parametric_argmax_from_warm_start(
     argmax_by_abs(entries)
 }
 
-fn marginal_full_argmax_from_beta(
+pub(crate) fn marginal_full_argmax_from_beta(
     beta: &Array1<f64>,
     design: &TermCollectionDesign,
 ) -> Option<(String, usize, f64)> {
@@ -892,7 +892,7 @@ fn marginal_full_argmax_from_beta(
     argmax_by_abs(entries)
 }
 
-fn marginal_full_argmax_from_warm_start(
+pub(crate) fn marginal_full_argmax_from_warm_start(
     warm_start: &CustomFamilyWarmStart,
     design: &TermCollectionDesign,
 ) -> Option<(String, usize, f64)> {
@@ -933,7 +933,7 @@ fn marginal_full_argmax_from_warm_start(
     argmax_by_abs(entries)
 }
 
-fn bernoulli_marginal_slope_runaway_error_from_argmax(
+pub(crate) fn bernoulli_marginal_slope_runaway_error_from_argmax(
     parametric_argmax: Option<(String, usize, f64)>,
     block_argmax: Option<(String, usize, f64)>,
     inner_status: &str,
@@ -981,7 +981,7 @@ fn bernoulli_marginal_slope_runaway_error_from_argmax(
     ))
 }
 
-fn bernoulli_marginal_slope_runaway_error(
+pub(crate) fn bernoulli_marginal_slope_runaway_error(
     warm_start: &CustomFamilyWarmStart,
     design: &TermCollectionDesign,
     spec: &TermCollectionSpec,
@@ -1011,7 +1011,7 @@ mod runaway_tests {
     // `build_reduced_logslope_reparam`). The geometry helper is retained here under
     // the test module because the basis-independence/weight-orthogonality unit tests
     // below exercise it directly as the canonical overlap-direction reference.
-    fn marginal_logslope_overlap_penalty(
+    pub(crate) fn marginal_logslope_overlap_penalty(
         marginal_design: &DesignMatrix,
         logslope_design: &DesignMatrix,
         z: &Array1<f64>,
@@ -1117,7 +1117,7 @@ mod runaway_tests {
     // audit must therefore drop exactly one direction (r=1), proving it removes
     // the joint-Hessian rank-soft direction the raw audit could not see.
     #[test]
-    fn effective_reduction_drops_score_weighted_confound_raw_audit_misses() {
+    pub(crate) fn effective_reduction_drops_score_weighted_confound_raw_audit_misses() {
         // G col0 = [1,2,3], col1 = [1,2,9]  (row-major rows: [1,1],[2,2],[3,9]).
         let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
         let g = Array2::<f64>::from_shape_vec((3, 2), vec![1.0, 1.0, 2.0, 2.0, 3.0, 9.0]).unwrap();
@@ -1173,7 +1173,7 @@ mod runaway_tests {
     // design) rather than emitting a zero-width transform that would delete the
     // score-effect surface.
     #[test]
-    fn effective_reduction_fully_confounded_single_column_returns_none() {
+    pub(crate) fn effective_reduction_fully_confounded_single_column_returns_none() {
         let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
         let g = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let z = Array1::from_vec(vec![1.0, 0.5, 1.0 / 3.0]);
@@ -1200,7 +1200,7 @@ mod runaway_tests {
     // No effective confound: both effective logslope columns stay independent of
     // M_eff, so nothing is reduced (r==p_g ⇒ None) and healthy fits are untouched.
     #[test]
-    fn effective_reduction_no_confound_returns_none() {
+    pub(crate) fn effective_reduction_no_confound_returns_none() {
         let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
         // diag(z)·col gives non-constant images for both columns under z below.
         let g = Array2::<f64>::from_shape_vec((3, 2), vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap();
@@ -1226,7 +1226,7 @@ mod runaway_tests {
     }
 
     #[test]
-    fn spatial_joint_setup_counts_only_learned_penalties_in_rho() {
+    pub(crate) fn spatial_joint_setup_counts_only_learned_penalties_in_rho() {
         let data = Array2::<f64>::zeros((3, 1));
         let empty_terms = TermCollectionSpec {
             linear_terms: Vec::new(),
@@ -1251,7 +1251,7 @@ mod runaway_tests {
     }
 
     #[test]
-    fn overlap_penalty_targets_score_weighted_logslope_span() {
+    pub(crate) fn overlap_penalty_targets_score_weighted_logslope_span() {
         let marginal = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
             Array2::from_shape_vec((4, 1), vec![0.0, 1.0, 2.0, 3.0]).unwrap(),
         ));
@@ -1281,7 +1281,7 @@ mod runaway_tests {
     }
 
     #[test]
-    fn overlap_penalty_skips_weight_orthogonal_channels() {
+    pub(crate) fn overlap_penalty_skips_weight_orthogonal_channels() {
         let marginal = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
             Array2::from_shape_vec((4, 1), vec![-1.0, 1.0, -1.0, 1.0]).unwrap(),
         ));
@@ -1309,7 +1309,7 @@ mod runaway_tests {
     }
 
     #[test]
-    fn runaway_diagnostic_names_unpenalized_parametric_direction_first() {
+    pub(crate) fn runaway_diagnostic_names_unpenalized_parametric_direction_first() {
         let msg = bernoulli_marginal_slope_runaway_error_from_argmax(
             Some(("sex".to_string(), 1, 52.0)),
             Some(("smooth 'matern(PC1,PC2,PC3)'".to_string(), 7, 49.0)),
@@ -1326,7 +1326,7 @@ mod runaway_tests {
     }
 
     #[test]
-    fn runaway_diagnostic_names_marginal_logslope_coupling_when_smooth_runs_away() {
+    pub(crate) fn runaway_diagnostic_names_marginal_logslope_coupling_when_smooth_runs_away() {
         let msg = bernoulli_marginal_slope_runaway_error_from_argmax(
             Some(("sex".to_string(), 1, 2.0)),
             Some(("smooth 'marginal_surface[0]'".to_string(), 6, 51.4)),
@@ -1342,7 +1342,7 @@ mod runaway_tests {
     }
 }
 
-fn build_marginal_blockspec_bms(
+pub(crate) fn build_marginal_blockspec_bms(
     design: &TermCollectionDesign,
     baseline: f64,
     offset: &Array1<f64>,
@@ -1407,7 +1407,7 @@ fn build_marginal_blockspec_bms(
     })
 }
 
-fn build_logslope_blockspec_bms(
+pub(crate) fn build_logslope_blockspec_bms(
     design: &TermCollectionDesign,
     baseline: f64,
     offset: &Array1<f64>,
@@ -1540,7 +1540,7 @@ pub(crate) fn push_deviation_aux_blockspecs(
     Ok(())
 }
 
-fn inner_fit(
+pub(crate) fn inner_fit(
     family: &BernoulliMarginalSlopeFamily,
     blocks: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,

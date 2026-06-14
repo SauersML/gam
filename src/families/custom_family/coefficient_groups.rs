@@ -19,7 +19,7 @@ use super::{
 use ndarray::{Array1, Array2, s};
 use std::collections::{BTreeMap, BTreeSet};
 
-fn coefficient_group_block_index(
+pub(crate) fn coefficient_group_block_index(
     specs: &[ParameterBlockSpec],
     selector: &CoefficientBlockSelector,
 ) -> Result<usize, String> {
@@ -41,7 +41,7 @@ fn coefficient_group_block_index(
     }
 }
 
-fn validate_group_rho_prior_coordinate(
+pub(crate) fn validate_group_rho_prior_coordinate(
     prior: &crate::types::RhoPrior,
     context: &str,
 ) -> Result<(), String> {
@@ -106,7 +106,7 @@ pub(crate) fn validate_penalized_complexity_prior(
     Ok(())
 }
 
-fn expand_custom_group_base_prior(
+pub(crate) fn expand_custom_group_base_prior(
     base_prior: &crate::types::RhoPrior,
     base_count: usize,
     context: &str,

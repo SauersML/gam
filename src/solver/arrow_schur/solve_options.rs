@@ -501,7 +501,7 @@ impl ArrowRowGaugeDeflation {
         }
     }
 
-    fn row(&self, row: usize) -> &[Array1<f64>] {
+    pub(crate) fn row(&self, row: usize) -> &[Array1<f64>] {
         self.directions.get(row).map(Vec::as_slice).unwrap_or(&[])
     }
 }

@@ -18,19 +18,19 @@ pub struct BinomialMeanWiggleFamily {
 }
 
 pub(crate) struct BinomialMeanWiggleGeometry {
-    basis: Array2<f64>,
-    basis_d1: Array2<f64>,
-    basis_d2: Array2<f64>,
-    basis_d3: Array2<f64>,
-    dq_dq0: Array1<f64>,
-    d2q_dq02: Array1<f64>,
-    d3q_dq03: Array1<f64>,
-    d4q_dq04: Array1<f64>,
+    pub(crate) basis: Array2<f64>,
+    pub(crate) basis_d1: Array2<f64>,
+    pub(crate) basis_d2: Array2<f64>,
+    pub(crate) basis_d3: Array2<f64>,
+    pub(crate) dq_dq0: Array1<f64>,
+    pub(crate) d2q_dq02: Array1<f64>,
+    pub(crate) d3q_dq03: Array1<f64>,
+    pub(crate) d4q_dq04: Array1<f64>,
 }
 
 pub(crate) struct BinomialMeanWiggleJointPsiDirection {
-    x_eta_psi: Option<Array2<f64>>,
-    z_eta_psi: Array1<f64>,
+    pub(crate) x_eta_psi: Option<Array2<f64>>,
+    pub(crate) z_eta_psi: Array1<f64>,
 }
 
 impl BinomialMeanWiggleFamily {
@@ -1528,10 +1528,10 @@ impl CustomFamily for BinomialMeanWiggleFamily {
 }
 
 pub(crate) struct BinomialMeanWiggleHessianWorkspace {
-    family: BinomialMeanWiggleFamily,
-    block_states: Vec<ParameterBlockState>,
-    x_eta: Arc<Array2<f64>>,
-    hessian_operator: Arc<RowCoeffOperator>,
+    pub(crate) family: BinomialMeanWiggleFamily,
+    pub(crate) block_states: Vec<ParameterBlockState>,
+    pub(crate) x_eta: Arc<Array2<f64>>,
+    pub(crate) hessian_operator: Arc<RowCoeffOperator>,
 }
 
 impl BinomialMeanWiggleHessianWorkspace {

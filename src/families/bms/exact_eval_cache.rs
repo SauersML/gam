@@ -13,7 +13,7 @@ pub(super) fn log_exact_work(n: usize) -> bool {
 /// the underlying `System` instance is leaked behind a `OnceLock` so the cost
 /// of `new_with_specifics` is paid once per process.
 pub(super) fn runtime_available_memory_bytes() -> u64 {
-    static SYSTEM: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
+    pub(crate) static SYSTEM: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
     let lock = SYSTEM.get_or_init(|| {
         let refresh =
             sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::everything());
@@ -29,7 +29,7 @@ pub(super) fn runtime_available_memory_bytes() -> u64 {
 /// is materialized and decremented on `Drop`, so two co-resident workspaces
 /// cannot together pin more than `available_ram * GLOBAL_FRACTION`.
 pub(super) fn bms_row_primary_hessian_pinned_bytes() -> &'static AtomicU64 {
-    static PINNED: OnceLock<AtomicU64> = OnceLock::new();
+    pub(crate) static PINNED: OnceLock<AtomicU64> = OnceLock::new();
     PINNED.get_or_init(|| AtomicU64::new(0))
 }
 
@@ -44,7 +44,7 @@ pub(super) fn bms_row_primary_hessian_pinned_bytes() -> &'static AtomicU64 {
 /// still consulted for the global-pin OOM guard, which is the actual safety
 /// valve against over-committing co-resident caches.
 pub(super) fn bms_row_primary_hessian_capacity_floor() -> &'static AtomicU64 {
-    static FLOOR: OnceLock<AtomicU64> = OnceLock::new();
+    pub(crate) static FLOOR: OnceLock<AtomicU64> = OnceLock::new();
     FLOOR.get_or_init(|| AtomicU64::new(0))
 }
 

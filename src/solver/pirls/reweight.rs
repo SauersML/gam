@@ -94,7 +94,7 @@ pub(super) fn madsen_lm_accept_factor(rho: f64) -> f64 {
 /// (issue #989). Returns `true` for an unconstrained fit (no constraint-KKT
 /// gate to honour) and when no constraint rows can be derived (no bound is
 /// finite).
-fn constraint_kkt_admits_soft_accept(
+pub(crate) fn constraint_kkt_admits_soft_accept(
     options: &WorkingModelPirlsOptions,
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
@@ -161,7 +161,7 @@ fn constraint_kkt_admits_soft_accept(
 /// non-degenerate" — which is precisely the set of states for which a
 /// 20-iteration monotone sub-tolerance plateau with a sub-tolerance model
 /// prediction is an honest "no useful progress is available" certificate.
-fn constraint_kkt_admits_progress_exhausted_stall(
+pub(crate) fn constraint_kkt_admits_progress_exhausted_stall(
     options: &WorkingModelPirlsOptions,
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
@@ -197,11 +197,11 @@ where
     M: WorkingModel + ?Sized,
     F: FnMut(&WorkingModelIterationInfo),
 {
-    const CONSTRAINED_OBJECTIVE_PLATEAU_STREAK: usize = 20;
+    pub(crate) const CONSTRAINED_OBJECTIVE_PLATEAU_STREAK: usize = 20;
     // Minimum reduced-system dimension K at which building the GPU Y_i matvec
     // backend for matrix-free InexactPCG pays for the device round-trip; below
     // this the CPU-driven PCG matvec wins (issue #288 Part B).
-    const ARROW_GPU_MATVEC_MIN_K: usize = 5000;
+    pub(crate) const ARROW_GPU_MATVEC_MIN_K: usize = 5000;
 
     // ── Anderson acceleration of depth 1 (AA(1)) for the Fisher fixed-point ──
     // PIRLS normally uses observed-information Newton (already super-linear, no
@@ -210,24 +210,24 @@ where
     // the regime where AA(1) provably improves the rate. State is local to
     // this PIRLS call; costs nothing while `force_fisher_for_rest` stays
     // false because the mixing branch is never entered.
-    const AA1_DAMPING_FLOOR: f64 = 1e-12;
-    const AA1_DISABLE_REJECT_THRESHOLD: usize = 3;
+    pub(crate) const AA1_DAMPING_FLOOR: f64 = 1e-12;
+    pub(crate) const AA1_DISABLE_REJECT_THRESHOLD: usize = 3;
 
-    struct AndersonOneState {
-        prev_beta: Option<Array1<f64>>,
-        prev_residual: Option<Array1<f64>>,
-        r_k: Array1<f64>,
-        dr: Array1<f64>,
-        dx: Array1<f64>,
-        beta_accel: Array1<f64>,
-        consecutive_accepts: usize,
-        consecutive_rejects: usize,
-        disabled: bool,
-        engaged_logged: bool,
+    pub(crate) struct AndersonOneState {
+        pub(crate) prev_beta: Option<Array1<f64>>,
+        pub(crate) prev_residual: Option<Array1<f64>>,
+        pub(crate) r_k: Array1<f64>,
+        pub(crate) dr: Array1<f64>,
+        pub(crate) dx: Array1<f64>,
+        pub(crate) beta_accel: Array1<f64>,
+        pub(crate) consecutive_accepts: usize,
+        pub(crate) consecutive_rejects: usize,
+        pub(crate) disabled: bool,
+        pub(crate) engaged_logged: bool,
     }
 
     impl AndersonOneState {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 prev_beta: None,
                 prev_residual: None,
@@ -242,7 +242,7 @@ where
             }
         }
 
-        fn ensure_len(buf: &mut Array1<f64>, len: usize) {
+        pub(crate) fn ensure_len(buf: &mut Array1<f64>, len: usize) {
             if buf.len() != len {
                 *buf = Array1::zeros(len);
             }
@@ -255,7 +255,7 @@ where
         /// Returns `Some(beta_accel)` when a finite acceleration is available,
         /// `None` when AA should be skipped (no history yet, disabled, or
         /// numerical floor hit).
-        fn aa1_mix(
+        pub(crate) fn aa1_mix(
             &mut self,
             beta_old: &Array1<f64>,
             beta_new: &Array1<f64>,
@@ -304,7 +304,7 @@ where
             Some(&self.beta_accel)
         }
 
-        fn note_accept(&mut self, iter: usize) {
+        pub(crate) fn note_accept(&mut self, iter: usize) {
             self.consecutive_accepts = self.consecutive_accepts.saturating_add(1);
             self.consecutive_rejects = 0;
             if !self.engaged_logged {
@@ -313,7 +313,7 @@ where
             }
         }
 
-        fn note_reject(&mut self, iter: usize) {
+        pub(crate) fn note_reject(&mut self, iter: usize) {
             self.consecutive_rejects = self.consecutive_rejects.saturating_add(1);
             self.consecutive_accepts = 0;
             if !self.disabled
@@ -328,7 +328,7 @@ where
             }
         }
 
-        fn update_history(&mut self, beta_old: &Array1<f64>, residual: &Array1<f64>) {
+        pub(crate) fn update_history(&mut self, beta_old: &Array1<f64>, residual: &Array1<f64>) {
             // AA history must outlive this LM attempt; assign into retained
             // buffers so accepted Fisher steps do not allocate two O(p) clones.
             match self.prev_beta.as_mut() {
@@ -342,7 +342,7 @@ where
         }
     }
 
-    fn reuse_regularized_hessian_buffer(
+    pub(crate) fn reuse_regularized_hessian_buffer(
         existing: Option<crate::linalg::matrix::SymmetricMatrix>,
         source: &crate::linalg::matrix::SymmetricMatrix,
     ) -> crate::linalg::matrix::SymmetricMatrix {
@@ -357,7 +357,7 @@ where
         }
     }
 
-    fn is_lm_retriable_candidate_error(err: &EstimationError) -> bool {
+    pub(crate) fn is_lm_retriable_candidate_error(err: &EstimationError) -> bool {
         match err {
             EstimationError::LinearSystemSolveFailed(_)
             | EstimationError::HessianNotPositiveDefinite { .. } => true,
@@ -386,10 +386,10 @@ where
     // question delegates here; the count-or-window exhaustion question is
     // `IterationBound::exhausted_at`, answered from guard-owned state, so
     // no branch in this file can re-derive either predicate locally.
-    fn lm_can_retry(loop_lambda: f64) -> bool {
+    pub(crate) fn lm_can_retry(loop_lambda: f64) -> bool {
         crate::solver::loop_guard::madsen_can_retry(loop_lambda)
     }
-    fn lm_nonconvergence_error(
+    pub(crate) fn lm_nonconvergence_error(
         options: &WorkingModelPirlsOptions,
         last_change: f64,
     ) -> EstimationError {
@@ -1077,9 +1077,9 @@ where
                 && options.coefficient_lower_bounds.is_none()
                 && options.arrow_schur.is_none()
             {
-                const GEODESIC_ACCEPT_ALPHA: f64 = 0.75;
+                pub(crate) const GEODESIC_ACCEPT_ALPHA: f64 = 0.75;
                 // 1e-4 is the Transtrum-Sethna default for double precision.
-                const GEODESIC_FD_H: f64 = 1.0e-4;
+                pub(crate) const GEODESIC_FD_H: f64 = 1.0e-4;
 
                 // Snapshot the standard-step direction; clone is cheap (p)
                 // relative to the two model.update calls below.
@@ -2250,7 +2250,7 @@ pub(super) mod test_support {
     //! it.
     thread_local! {
         pub static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
-            const { std::cell::RefCell::new(None) };
+            pub(crate) const { std::cell::RefCell::new(None) };
     }
 
     pub fn record_penalized_deviance(value: f64) {

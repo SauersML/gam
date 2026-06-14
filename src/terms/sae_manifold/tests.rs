@@ -16,7 +16,7 @@ use super::*;
     /// checkpoint (#1113), where the naive form overflows to `inf` and divides
     /// to `NaN`.
     #[test]
-    fn bessel_log_and_ratio_is_finite_and_matches_naive() {
+    pub(crate) fn bessel_log_and_ratio_is_finite_and_matches_naive() {
         // Moderate η: naive forms are finite, so the stable helper must match.
         for &eta in &[0.0_f64, 0.5, 1.0, 3.0, 3.75, 5.0, 20.0, 100.0, 300.0] {
             let (log_i0, ratio) = bessel_i0_log_and_ratio(eta);
@@ -44,7 +44,7 @@ use super::*;
         }
     }
 
-    fn assert_matrix_same_bits(left: &Array2<f64>, right: &Array2<f64>) {
+    pub(crate) fn assert_matrix_same_bits(left: &Array2<f64>, right: &Array2<f64>) {
         assert_eq!(left.dim(), right.dim());
         for ((row, col), &value) in left.indexed_iter() {
             assert_eq!(
@@ -55,7 +55,7 @@ use super::*;
         }
     }
 
-    fn assert_tensor3_same_bits(left: &Array3<f64>, right: &Array3<f64>) {
+    pub(crate) fn assert_tensor3_same_bits(left: &Array3<f64>, right: &Array3<f64>) {
         assert_eq!(left.dim(), right.dim());
         for ((row, col, axis), &value) in left.indexed_iter() {
             assert_eq!(
@@ -66,7 +66,7 @@ use super::*;
         }
     }
 
-    fn assert_eta_one_parity(
+    pub(crate) fn assert_eta_one_parity(
         evaluator: &dyn SaeBasisEvaluator,
         coords: ArrayView2<'_, f64>,
         expected_curved: usize,
@@ -103,7 +103,7 @@ use super::*;
     }
 
     #[test]
-    fn phi_eta_one_reproduces_current_atom_bases_bit_for_bit() {
+    pub(crate) fn phi_eta_one_reproduces_current_atom_bases_bit_for_bit() {
         let periodic_coords = array![[0.0_f64], [0.125], [0.4]];
         let periodic = PeriodicHarmonicEvaluator::new(7).unwrap();
         assert_eta_one_parity(&periodic, periodic_coords.view(), 4);
@@ -149,7 +149,7 @@ use super::*;
 
     /// Minimal K=1 term for direct unit tests of term-state machinery that does
     /// not depend on a real fit (e.g. the gauge-deflation count guard).
-    fn trivial_k1_euclidean_term() -> SaeManifoldTerm {
+    pub(crate) fn trivial_k1_euclidean_term() -> SaeManifoldTerm {
         let n = 4usize;
         let p = 3usize;
         let atom = SaeManifoldAtom::new(
@@ -179,7 +179,7 @@ use super::*;
     /// quotient-dimension change and must error loudly (comparing Laplace
     /// normalizers across a changed null-space is meaningless).
     #[test]
-    fn evidence_gauge_deflation_count_guard_rejects_any_change() {
+    pub(crate) fn evidence_gauge_deflation_count_guard_rejects_any_change() {
         let mut term = trivial_k1_euclidean_term();
         assert!(term.expected_evidence_gauge_deflated_directions.is_none());
 
@@ -212,7 +212,7 @@ use super::*;
     /// fundamental, all linear columns) are inert; an M = 7 periodic bank
     /// dials its h ≥ 2 harmonics, so the walk must run for it.
     #[test]
-    fn curvature_homotopy_eta_inertness_probe_tracks_curved_columns() {
+    pub(crate) fn curvature_homotopy_eta_inertness_probe_tracks_curved_columns() {
         // Caller-managed atom: no evaluator, nothing to dial.
         let term = trivial_k1_euclidean_term();
         assert!(term.curvature_homotopy_eta_is_inert().unwrap());
@@ -248,7 +248,7 @@ use super::*;
     }
 
     #[test]
-    fn linear_span_anchor_recovers_planted_two_plane_configuration() {
+    pub(crate) fn linear_span_anchor_recovers_planted_two_plane_configuration() {
         let n = 4usize;
         let p = 4usize;
         let phi = Array2::<f64>::ones((n, 2));
@@ -309,7 +309,7 @@ use super::*;
         assert_abs_diff_eq!(angle1, 0.0, epsilon = 1.0e-12);
     }
 
-    fn circle_certificate_fixture(radius: f64, planes: &[(usize, usize)]) -> SaeManifoldTerm {
+    pub(crate) fn circle_certificate_fixture(radius: f64, planes: &[(usize, usize)]) -> SaeManifoldTerm {
         let n = 16usize;
         let p = 4usize;
         let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
@@ -348,7 +348,7 @@ use super::*;
     }
 
     #[test]
-    fn dictionary_incoherence_report_orthogonal_frames_has_zero_mu_hat() {
+    pub(crate) fn dictionary_incoherence_report_orthogonal_frames_has_zero_mu_hat() {
         let term = circle_certificate_fixture(2.0, &[(0, 1), (2, 3)]);
         let report = dictionary_incoherence_report(&term).unwrap();
         assert_abs_diff_eq!(report.mu_hat, 0.0, epsilon = 1.0e-12);
@@ -383,14 +383,14 @@ use super::*;
     }
 
     #[test]
-    fn dictionary_incoherence_report_coherent_frames_has_unit_mu_hat() {
+    pub(crate) fn dictionary_incoherence_report_coherent_frames_has_unit_mu_hat() {
         let term = circle_certificate_fixture(2.0, &[(0, 1), (0, 1)]);
         let report = dictionary_incoherence_report(&term).unwrap();
         assert_abs_diff_eq!(report.mu_hat, 1.0, epsilon = 1.0e-12);
     }
 
     #[test]
-    fn dictionary_incoherence_report_circle_kappa_matches_inverse_radius() {
+    pub(crate) fn dictionary_incoherence_report_circle_kappa_matches_inverse_radius() {
         let radius = 2.5_f64;
         let mut term = circle_certificate_fixture(radius, &[(0, 1)]);
         term.set_certificate_dispersion(0.25).unwrap();
@@ -406,7 +406,7 @@ use super::*;
     }
 
     #[test]
-    fn search_strategy_exposes_fixed_and_sweep_values() {
+    pub(crate) fn search_strategy_exposes_fixed_and_sweep_values() {
         assert!(SearchStrategy::Fixed.is_fixed());
 
         let strategy = SearchStrategy::ExponentialSweep {
@@ -423,7 +423,7 @@ use super::*;
     /// prior still penalizes (an invalid objective). Regression for the
     /// audit's K==1 special-case bug.
     #[test]
-    fn k1_gate_modes_do_not_pin_assignment_to_one() {
+    pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
         // IBP-MAP, K=1: σ(0/τ)·π_0 = 0.5·1 = 0.5 (not 1.0).
         let ibp = SaeAssignment::from_blocks_with_mode(
             array![[0.0]],
@@ -461,7 +461,7 @@ use super::*;
     /// Below the threshold the hard gate keeps the value at exactly zero.
     /// Regression for the audit's miscentered-threshold bug.
     #[test]
-    fn jumprelu_surrogate_is_centered_at_threshold() {
+    pub(crate) fn jumprelu_surrogate_is_centered_at_threshold() {
         let threshold = 2.0;
         let temperature = 1.0;
         let logits = array![2.0 + 1e-6, 1.0];
@@ -478,7 +478,7 @@ use super::*;
         assert_abs_diff_eq!(gates[1], 0.0, epsilon = 1e-12);
     }
 
-    fn periodic_basis(coords: &Array2<f64>) -> (Array2<f64>, Array3<f64>) {
+    pub(crate) fn periodic_basis(coords: &Array2<f64>) -> (Array2<f64>, Array3<f64>) {
         let n = coords.nrows();
         let mut phi = Array2::<f64>::zeros((n, 3));
         let mut jet = Array3::<f64>::zeros((n, 3, 1));
@@ -503,7 +503,7 @@ use super::*;
     /// above must agree to O(eps), and the wrapped-to-`0` representative must
     /// match the unwrapped value.
     #[test]
-    fn ard_axis_prior_periodic_is_continuous_across_cut() {
+    pub(crate) fn ard_axis_prior_periodic_is_continuous_across_cut() {
         let alpha = 2.3_f64;
         let period = 1.0_f64;
         let eps = 1.0e-6;
@@ -544,7 +544,7 @@ use super::*;
     /// BOTH the Euclidean (Gaussian) and periodic (von-Mises) axes. This is the
     /// d=1 value↔grad FD agreement that the line search depends on.
     #[test]
-    fn ard_axis_prior_value_grad_fd_consistent() {
+    pub(crate) fn ard_axis_prior_value_grad_fd_consistent() {
         let alpha = 1.7_f64;
         let h = 1.0e-6;
         for &period in &[None, Some(1.0_f64), Some(std::f64::consts::TAU)] {
@@ -569,7 +569,7 @@ use super::*;
     /// torus=per-axis periodic, sphere chart=(non-periodic lat, periodic lon),
     /// embedded sphere=non-periodic (smooth retraction, no cut).
     #[test]
-    fn axis_periods_map_each_topology() {
+    pub(crate) fn axis_periods_map_each_topology() {
         assert_eq!(LatentManifold::Euclidean.axis_periods(), vec![None]);
         assert_eq!(
             LatentManifold::Circle { period: 1.0 }.axis_periods(),
@@ -605,7 +605,7 @@ use super::*;
     /// the old Euclidean prior made `loss.ard` jump by ~½α·P² when a Newton step
     /// crossed `t = 1 ≡ 0`.
     #[test]
-    fn ard_value_continuous_across_periodic_cut_d1() {
+    pub(crate) fn ard_value_continuous_across_periodic_cut_d1() {
         // Single periodic atom, one row sitting just below the cut at t≈1.
         let coords0 = array![[0.999_f64]];
         let (phi0, jet0) = periodic_basis(&coords0);
@@ -674,7 +674,7 @@ use super::*;
     /// fix skips the registry ARD on every SAE path so the smooth von-Mises
     /// built-in is the single source of truth; the objective must now stay smooth.
     #[test]
-    fn penalized_objective_continuous_across_periodic_cut_with_registry_ard() {
+    pub(crate) fn penalized_objective_continuous_across_periodic_cut_with_registry_ard() {
         let coords0 = array![[0.999_f64]];
         let (phi0, jet0) = periodic_basis(&coords0);
         let atom = SaeManifoldAtom::new(
@@ -754,7 +754,7 @@ use super::*;
     /// registry must equal the registry-free objective, and must stay continuous
     /// across the cut.
     #[test]
-    fn scad_coord_penalty_inert_and_continuous_on_periodic_axis() {
+    pub(crate) fn scad_coord_penalty_inert_and_continuous_on_periodic_axis() {
         use crate::terms::analytic_penalties::{PenaltyConcavity, ScadMcpPenalty};
 
         let coords0 = array![[0.999_f64]];
@@ -844,7 +844,7 @@ use super::*;
     /// `Some` carrier for a periodic coord, so value/gradient/curvature all see
     /// the same axis set.
     #[test]
-    fn scad_coord_penalty_active_on_euclidean_axis() {
+    pub(crate) fn scad_coord_penalty_active_on_euclidean_axis() {
         let euclid = SaeAssignment::from_blocks_with_mode_and_manifolds(
             Array2::<f64>::zeros((3, 1)),
             vec![array![[0.5_f64], [-0.7], [1.3]]],
@@ -883,7 +883,7 @@ use super::*;
     /// must therefore be non-negative (the `max(V'',0)` PSD majorizer), while the
     /// gradient stays the exact `V'`.
     #[test]
-    fn periodic_ard_curvature_is_psd_in_assembled_htt() {
+    pub(crate) fn periodic_ard_curvature_is_psd_in_assembled_htt() {
         // Two rows past the quarter period (t in (0.25, 0.75)) where cos(2πt) < 0.
         let coords0 = array![[0.40_f64], [0.60_f64]];
         let (phi0, jet0) = periodic_basis(&coords0);
@@ -935,7 +935,7 @@ use super::*;
     /// basis evaluations, assignment logits, and latent coordinates. Pins
     /// item-1 of the SAE hot-path CPU-perf refactor.
     #[test]
-    fn snapshot_restore_round_trips_mutated_state() {
+    pub(crate) fn snapshot_restore_round_trips_mutated_state() {
         let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
         let (phi0, jet0) = periodic_basis(&coords0);
         let atom = SaeManifoldAtom::new(
@@ -999,7 +999,7 @@ use super::*;
     }
 
     #[test]
-    fn ibp_path_refreshes_periodic_basis_for_two_newton_iterations() {
+    pub(crate) fn ibp_path_refreshes_periodic_basis_for_two_newton_iterations() {
         let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
         let (phi0, jet0) = periodic_basis(&coords0);
         let atom = SaeManifoldAtom::new(
@@ -1043,7 +1043,7 @@ use super::*;
         assert!(basis_delta > 1.0e-10);
     }
 
-    fn small_two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    pub(crate) fn small_two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
         let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35]];
         let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45]];
         let (phi0, jet0) = periodic_basis(&coords0);
@@ -1111,7 +1111,7 @@ use super::*;
     /// post-fit pass logs: a high-`Θ` atom earning ΔEV is a genuine curved
     /// family; a `Θ ≈ 0` atom earning ΔEV is a linear-tail direction.
     #[test]
-    fn per_atom_loao_ev_attributes_each_load_bearing_atom() {
+    pub(crate) fn per_atom_loao_ev_attributes_each_load_bearing_atom() {
         let (term, _target, rho) = small_two_atom_periodic_term();
         // Target = the term's own full reconstruction ⇒ EV(full) = 1 exactly.
         let target = term
@@ -1179,7 +1179,7 @@ use super::*;
     ///    so EV is preserved, while the slot sheds its `M·p − 2·p` curved
     ///    coefficients — EV-per-parameter strictly improves.
     #[test]
-    fn hybrid_collapse_is_load_bearing_and_dominates() {
+    pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
         let (mut term, _t, rho) = small_two_atom_periodic_term();
 
         // (1) Before the report exists, collapse == curved reconstruction.
@@ -1279,7 +1279,7 @@ use super::*;
     /// delta. Softmax canonicalization shifts whole rows, so the invariant is
     /// checked on the within-row logit DIFFERENCE, which the shift preserves.
     #[test]
-    fn assignment_logit_step_cap_bounds_single_iteration_gate_motion() {
+    pub(crate) fn assignment_logit_step_cap_bounds_single_iteration_gate_motion() {
         let (mut term, _target, _rho) = small_two_atom_periodic_term();
         let n = term.assignment.n_obs();
         let q = term.assignment.row_block_dim();
@@ -1306,7 +1306,7 @@ use super::*;
     /// an observable CollapseEvent, and the second collapse is recorded as
     /// terminal — once — instead of fighting the optimizer.
     #[test]
-    fn active_mass_guard_reseeds_once_then_records_terminal_collapse() {
+    pub(crate) fn active_mass_guard_reseeds_once_then_records_terminal_collapse() {
         let (mut term, _target, _rho) = small_two_atom_periodic_term();
         let n = term.assignment.n_obs();
         let slam = |term: &mut SaeManifoldTerm| {
@@ -1351,7 +1351,7 @@ use super::*;
     }
 
     #[test]
-    fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() {
+    pub(crate) fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() {
         let rho = SaeManifoldRho::new(0.7_f64.ln(), 1.3_f64.ln(), vec![array![0.2, -0.4]]);
         let dispersion = 0.05_f64 * 0.05;
         let scaled = rho
@@ -1404,7 +1404,7 @@ use super::*;
     }
 
     #[test]
-    fn fit_data_collapse_records_terminal_event_for_active_atom() {
+    pub(crate) fn fit_data_collapse_records_terminal_event_for_active_atom() {
         let coords = array![[0.0], [0.25], [0.5], [0.75]];
         let (phi, jet) = periodic_basis(&coords);
         let atom = SaeManifoldAtom::new(
@@ -1446,12 +1446,12 @@ use super::*;
         assert!(terminals[0].max_active_mass <= SAE_FIT_DATA_COLLAPSE_EV_FLOOR);
     }
 
-    fn deterministic_circle_noise(row: usize, col: usize) -> f64 {
+    pub(crate) fn deterministic_circle_noise(row: usize, col: usize) -> f64 {
         let x = (row as f64 + 1.0) * 12.9898 + (col as f64 + 1.0) * 78.233;
         (x.sin() * 43758.5453).sin()
     }
 
-    fn planted_circle_data(n: usize, sigma: f64) -> Array2<f64> {
+    pub(crate) fn planted_circle_data(n: usize, sigma: f64) -> Array2<f64> {
         let mut z = Array2::<f64>::zeros((n, 2));
         for row in 0..n {
             let theta = std::f64::consts::TAU * row as f64 / n as f64;
@@ -1461,7 +1461,7 @@ use super::*;
         z
     }
 
-    fn global_ev(target: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> f64 {
+    pub(crate) fn global_ev(target: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> f64 {
         let (n, p) = target.dim();
         let mut means = vec![0.0_f64; p];
         for col in 0..p {
@@ -1484,37 +1484,37 @@ use super::*;
     }
 
     #[derive(Clone, Copy)]
-    enum PlantedCircleAssignmentMode {
+    pub(crate) enum PlantedCircleAssignmentMode {
         Softmax,
         IbpMap,
     }
 
     impl PlantedCircleAssignmentMode {
-        fn label(self) -> &'static str {
+        pub(crate) fn label(self) -> &'static str {
             match self {
                 Self::Softmax => "softmax",
                 Self::IbpMap => "ibp_map",
             }
         }
 
-        fn mode(self) -> AssignmentMode {
-            const TAU: f64 = 1.0;
-            const ALPHA: f64 = 1.0;
+        pub(crate) fn mode(self) -> AssignmentMode {
+            pub(crate) const TAU: f64 = 1.0;
+            pub(crate) const ALPHA: f64 = 1.0;
             match self {
                 Self::Softmax => AssignmentMode::softmax(TAU),
                 Self::IbpMap => AssignmentMode::ibp_map(TAU, ALPHA, false),
             }
         }
 
-        fn seed_logit(self) -> f64 {
-            const TAU: f64 = 1.0;
+        pub(crate) fn seed_logit(self) -> f64 {
+            pub(crate) const TAU: f64 = 1.0;
             match self {
                 Self::Softmax => 0.0,
                 Self::IbpMap => 6.0 * TAU,
             }
         }
 
-        fn seed_gate(self) -> f64 {
+        pub(crate) fn seed_gate(self) -> f64 {
             match self {
                 Self::Softmax => 1.0,
                 Self::IbpMap => 1.0 / (1.0 + (-6.0_f64).exp()),
@@ -1522,7 +1522,7 @@ use super::*;
         }
     }
 
-    fn planted_circle_seed_term(
+    pub(crate) fn planted_circle_seed_term(
         z: ArrayView2<'_, f64>,
         assignment_mode: PlantedCircleAssignmentMode,
     ) -> (SaeManifoldTerm, f64) {
@@ -1574,7 +1574,7 @@ use super::*;
     }
 
     #[test]
-    fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionless_rho_seed() {
+    pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionless_rho_seed() {
         for assignment_mode in [
             PlantedCircleAssignmentMode::Softmax,
             PlantedCircleAssignmentMode::IbpMap,
@@ -1631,7 +1631,7 @@ use super::*;
     }
 
     #[test]
-    fn sae_value_probe_refusal_classification_is_inner_only() {
+    pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
         assert!(
             SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
                 "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ"
@@ -1650,7 +1650,7 @@ use super::*;
     }
 
     #[test]
-    fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
+    pub(crate) fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
         let (term0, target, rho) = small_two_atom_periodic_term();
         let mut full = term0.clone();
         let mut streaming = term0;
@@ -1673,7 +1673,7 @@ use super::*;
     /// estimator/threshold measure mismatch that caused the BMS HT-subsample
     /// false-reject bug; this test pins the invariant that forbids it.
     #[test]
-    fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
+    pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
         let (term0, target, rho) = small_two_atom_periodic_term();
         let mut full = term0.clone();
         let mut probe = term0;
@@ -1711,7 +1711,7 @@ use super::*;
     /// round-to-round KKT-residual drop and falls back to the base budget on
     /// a stall.
     #[test]
-    fn refine_iteration_limit_probe_budget_never_extends() {
+    pub(crate) fn refine_iteration_limit_probe_budget_never_extends() {
         let probe_base = 16usize;
         // Probe policy: base == progress, so even perfect progress cannot
         // extend past the base work budget.
@@ -1767,7 +1767,7 @@ use super::*;
     }
 
     #[test]
-    fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
+    pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
         let (mut term0, target, rho) = small_two_atom_periodic_term();
         let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
         let cold_sys = term0
@@ -1801,7 +1801,7 @@ use super::*;
     }
 
     #[test]
-    fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
+    pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
         let n = 24usize;
         let p = 2usize;
         let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
@@ -1870,7 +1870,7 @@ use super::*;
     }
 
     #[test]
-    fn streaming_plan_routes_by_memory_budget_with_identical_logdet() {
+    pub(crate) fn streaming_plan_routes_by_memory_budget_with_identical_logdet() {
         let (term0, target, rho) = small_two_atom_periodic_term();
         let total_basis: usize = term0.atoms.iter().map(|atom| atom.basis_size()).sum();
         let d_max = term0
@@ -1928,7 +1928,7 @@ use super::*;
     }
 
     #[test]
-    fn giant_host_working_set_plan_flips_to_matrix_free_before_dense_allocation() {
+    pub(crate) fn giant_host_working_set_plan_flips_to_matrix_free_before_dense_allocation() {
         let n_obs = 128usize;
         let total_basis = 48usize;
         let k_atoms = 8usize;
@@ -1964,7 +1964,7 @@ use super::*;
     }
 
     #[test]
-    fn sparse_active_layout_work_scales_with_active_atoms_not_total_k() {
+    pub(crate) fn sparse_active_layout_work_scales_with_active_atoms_not_total_k() {
         let n = 3;
         let k_atoms = 100_000;
         let mut active_rows = Vec::with_capacity(n);
@@ -2004,7 +2004,7 @@ use super::*;
     /// so an inner step with a degenerate Hessian no longer aborts the
     /// Newton driver.
     #[test]
-    fn run_joint_fit_arrow_schur_escalates_ridge_on_non_pd_row_block() {
+    pub(crate) fn run_joint_fit_arrow_schur_escalates_ridge_on_non_pd_row_block() {
         // Construct a periodic atom whose row block is rank-deficient when
         // the assignment column is zero — `H_tt` is then driven entirely by
         // the smoothness penalty / external coord ridge and floats just
@@ -2071,7 +2071,7 @@ use super::*;
     /// oracle), and the basis re-evaluates at the reduced width (the reduction
     /// survives refresh).
     #[test]
-    fn rank_revealing_reduction_collapses_unexcited_circle_harmonic_to_full_rank() {
+    pub(crate) fn rank_revealing_reduction_collapses_unexcited_circle_harmonic_to_full_rank() {
         // Build the full M = 5 periodic basis `[1, sin2πt, cos2πt, sin4πt, cos4πt]`
         // from its evaluator, then collapse the latent coordinate onto THREE
         // distinct phases. The first-harmonic columns `[1, sin2πt, cos2πt]` span a
@@ -2171,7 +2171,7 @@ use super::*;
     /// fit keeps its full harmonic depth, decoder, penalty, and evaluator
     /// bit-for-bit (no reparametrization).
     #[test]
-    fn full_rank_circle_design_keeps_full_harmonic_depth_unchanged() {
+    pub(crate) fn full_rank_circle_design_keeps_full_harmonic_depth_unchanged() {
         // Five distinct coordinates → the five periodic columns are linearly
         // independent in the data → bare data Gram is full rank.
         let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
@@ -2241,7 +2241,7 @@ use super::*;
     /// from the caller's nominal `ridge_ext_coord` / `ridge_beta` until the
     /// factor succeeds.
     #[test]
-    fn solve_newton_step_escalates_ridge_on_non_pd_row_block() {
+    pub(crate) fn solve_newton_step_escalates_ridge_on_non_pd_row_block() {
         // Same degenerate-H_tt construction as the predict/reconstruct
         // reproducer: zero assignment mass + zero smoothness penalty means
         // the only mass on H_tt comes from `ridge_t·I`, and at the nominal
@@ -2280,7 +2280,7 @@ use super::*;
     }
 
     #[test]
-    fn sae_arrow_schur_beta_quadratic_model_matches_penalized_loss_change() {
+    pub(crate) fn sae_arrow_schur_beta_quadratic_model_matches_penalized_loss_change() {
         let coords = array![[0.10], [0.35], [0.80]];
         let (phi, jet) = periodic_basis(&coords);
         let atom = SaeManifoldAtom::new(
@@ -2346,7 +2346,7 @@ use super::*;
     /// one), with compact coord starts that reproduce the `expand_row`
     /// round-trip back to full-q positions.
     #[test]
-    fn sae_row_layout_from_dense_weights_top_k_and_cutoff() {
+    pub(crate) fn sae_row_layout_from_dense_weights_top_k_and_cutoff() {
         // 3 atoms, coord dims [2, 1, 2] ⇒ full q = 3 + 5 = 8.
         let coord_dims = vec![2usize, 1, 2];
         let coord_offsets_full = vec![3usize, 5, 6];
@@ -2391,7 +2391,7 @@ use super::*;
     /// is non-zero, and the FFI-side `"beta"` latent block is what makes
     /// the descriptor builder see exactly that target shape.
     #[test]
-    fn sae_mechsparsity_beta_block_routes_through_arrow_schur_gb() {
+    pub(crate) fn sae_mechsparsity_beta_block_routes_through_arrow_schur_gb() {
         let coords = array![[0.10], [0.35], [0.80]];
         let (phi, jet) = periodic_basis(&coords);
         // Decoder shape: (M=3 basis × p=4 features); flatten_beta lays out
@@ -2494,7 +2494,7 @@ use super::*;
 
     /// Smoothed sum of singular values of an `m × p` matrix, matching
     /// `NuclearNormPenalty::value` (used by the spectrum-shrinkage assertion).
-    fn smoothed_nuclear_norm(decoder: &Array2<f64>, eps: f64) -> f64 {
+    pub(crate) fn smoothed_nuclear_norm(decoder: &Array2<f64>, eps: f64) -> f64 {
         let (_u, s, _vt) = decoder.clone().svd(false, false).unwrap();
         s.iter()
             .map(|sigma| (sigma * sigma + eps * eps).sqrt() - eps)
@@ -2512,7 +2512,7 @@ use super::*;
     ///   3. A gradient-descent step along `gb` shrinks the decoder block's
     ///      (smoothed) singular spectrum — the rank-shrinkage objective.
     #[test]
-    fn sae_nuclear_norm_beta_block_routes_through_gb_and_shrinks_spectrum() {
+    pub(crate) fn sae_nuclear_norm_beta_block_routes_through_gb_and_shrinks_spectrum() {
         let coords = array![[0.10], [0.35], [0.80]];
         let (phi, jet) = periodic_basis(&coords);
         // Full-rank (M=3 basis × p=4 features) decoder block. flatten_beta lays
@@ -2652,7 +2652,7 @@ use super::*;
     }
 
     #[derive(Debug)]
-    struct TestPeriodicEvaluator;
+    pub(crate) struct TestPeriodicEvaluator;
 
     impl SaeBasisEvaluator for TestPeriodicEvaluator {
         fn second_jet_dyn(
@@ -2690,16 +2690,16 @@ use super::*;
     }
 
     #[derive(Debug, Clone)]
-    struct SaeFdWorst {
-        index: usize,
-        analytic: f64,
-        finite_difference: f64,
-        absolute_error: f64,
-        relative_error: f64,
+    pub(crate) struct SaeFdWorst {
+        pub(crate) index: usize,
+        pub(crate) analytic: f64,
+        pub(crate) finite_difference: f64,
+        pub(crate) absolute_error: f64,
+        pub(crate) relative_error: f64,
     }
 
     impl SaeFdWorst {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 index: 0,
                 analytic: 0.0,
@@ -2709,7 +2709,7 @@ use super::*;
             }
         }
 
-        fn observe(&mut self, index: usize, analytic: f64, finite_difference: f64) {
+        pub(crate) fn observe(&mut self, index: usize, analytic: f64, finite_difference: f64) {
             let absolute_error = (analytic - finite_difference).abs();
             let scale = analytic.abs().max(finite_difference.abs()).max(1.0e-9);
             let relative_error = absolute_error / scale;
@@ -2724,14 +2724,14 @@ use super::*;
     }
 
     #[derive(Debug, Clone)]
-    struct SaeFdBlockReport {
-        label: String,
-        base_loss: f64,
-        coord: SaeFdWorst,
-        decoder: SaeFdWorst,
+    pub(crate) struct SaeFdBlockReport {
+        pub(crate) label: String,
+        pub(crate) base_loss: f64,
+        pub(crate) coord: SaeFdWorst,
+        pub(crate) decoder: SaeFdWorst,
     }
 
-    fn sae_fd_decoder(n_basis: usize, p_out: usize) -> Array2<f64> {
+    pub(crate) fn sae_fd_decoder(n_basis: usize, p_out: usize) -> Array2<f64> {
         let mut decoder = Array2::<f64>::zeros((n_basis, p_out));
         for basis in 0..n_basis {
             for out_col in 0..p_out {
@@ -2742,7 +2742,7 @@ use super::*;
         decoder
     }
 
-    fn sae_fd_target(n_obs: usize, p_out: usize) -> Array2<f64> {
+    pub(crate) fn sae_fd_target(n_obs: usize, p_out: usize) -> Array2<f64> {
         let mut target = Array2::<f64>::zeros((n_obs, p_out));
         for row in 0..n_obs {
             for out_col in 0..p_out {
@@ -2755,7 +2755,7 @@ use super::*;
         target
     }
 
-    fn sae_fd_coords(label: &str, n_obs: usize) -> Array2<f64> {
+    pub(crate) fn sae_fd_coords(label: &str, n_obs: usize) -> Array2<f64> {
         let mut coords = Array2::<f64>::zeros((n_obs, 1));
         for row in 0..n_obs {
             let x = row as f64;
@@ -2768,7 +2768,7 @@ use super::*;
         coords
     }
 
-    fn sae_fd_term(label: &str) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    pub(crate) fn sae_fd_term(label: &str) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
         let n_obs = 20usize;
         let p_out = 3usize;
         let coords = sae_fd_coords(label, n_obs);
@@ -2830,19 +2830,19 @@ use super::*;
         (term, target, rho)
     }
 
-    fn sae_fd_refresh(term: &mut SaeManifoldTerm) {
+    pub(crate) fn sae_fd_refresh(term: &mut SaeManifoldTerm) {
         let coords = term.assignment.coords[0].as_matrix();
         term.atoms[0].refresh_basis(coords.view()).unwrap();
     }
 
-    fn sae_fd_set_coord(term: &mut SaeManifoldTerm, row: usize, value: f64) {
+    pub(crate) fn sae_fd_set_coord(term: &mut SaeManifoldTerm, row: usize, value: f64) {
         let mut flat = term.assignment.coords[0].as_flat().clone();
         flat[row] = value;
         term.assignment.coords[0].set_flat(flat.view());
         sae_fd_refresh(term);
     }
 
-    fn sae_fd_total_loss(
+    pub(crate) fn sae_fd_total_loss(
         term: &SaeManifoldTerm,
         target: &Array2<f64>,
         rho: &SaeManifoldRho,
@@ -2850,7 +2850,7 @@ use super::*;
         term.loss(target.view(), rho).unwrap().total()
     }
 
-    fn sae_fd_check_case(label: &str) -> SaeFdBlockReport {
+    pub(crate) fn sae_fd_check_case(label: &str) -> SaeFdBlockReport {
         let epsilon = 1.0e-6;
         let (term, target, rho) = sae_fd_term(label);
         let base_loss = sae_fd_total_loss(&term, &target, &rho);
@@ -2917,7 +2917,7 @@ use super::*;
 
     /// Which manifold/basis a penalty-FD case runs on.
     #[derive(Clone, Copy)]
-    enum SaePenCaseKind {
+    pub(crate) enum SaePenCaseKind {
         EuclideanD1,
         PeriodicD1,
         EuclideanD2,
@@ -2925,7 +2925,7 @@ use super::*;
 
     /// Which analytic penalty a penalty-FD case exercises.
     #[derive(Clone, Copy)]
-    enum SaePenKind {
+    pub(crate) enum SaePenKind {
         Isometry,
         Ard,
         ScadMcp,
@@ -2936,7 +2936,7 @@ use super::*;
     /// Single-atom SAE term on the requested manifold for the penalty-FD checks.
     /// Mirrors `sae_fd_term` but exposes the analytic second jet the Isometry
     /// penalty needs and allows a chosen latent dimension.
-    fn sae_pen_term(
+    pub(crate) fn sae_pen_term(
         kind: SaePenCaseKind,
     ) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho, PsiSlice) {
         let n_obs = 12usize;
@@ -3033,7 +3033,7 @@ use super::*;
 
     /// Two-atom K=2 SAE term for the DecoderIncoherence FD check. Both atoms are
     /// d=1 euclidean patches so the β block is `[B_1 (M×p), B_2 (M×p)]`.
-    fn sae_pen_term_k2() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    pub(crate) fn sae_pen_term_k2() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
         let n_obs = 12usize;
         let p_out = 3usize;
         let mut atoms = Vec::with_capacity(2);
@@ -3093,7 +3093,7 @@ use super::*;
 
     /// Registry holding exactly one analytic penalty of the requested kind,
     /// sized for `term`'s coord / β block.
-    fn sae_pen_registry(
+    pub(crate) fn sae_pen_registry(
         pen: SaePenKind,
         coord_slice: &PsiSlice,
         n_obs: usize,
@@ -3162,7 +3162,7 @@ use super::*;
     /// `atom_idx`'s axis `a` for row `r` lives at `sys.rows[r].gt[off + a]` with
     /// `off = coord_offsets()[atom_idx]` (a per-atom column offset, not a row
     /// offset); the row index is the plain observation row.
-    fn sae_pen_fd_check(
+    pub(crate) fn sae_pen_fd_check(
         label: &str,
         term: &SaeManifoldTerm,
         target: &Array2<f64>,
@@ -3260,7 +3260,7 @@ use super::*;
     /// gradient (`∂P/∂B`) that the value path counts but the gradient path used
     /// to drop, alongside ARD, ScadMcp, NuclearNorm, and DecoderIncoherence.
     #[test]
-    fn sae_assembled_gradient_matches_penalized_objective_central_fd() {
+    pub(crate) fn sae_assembled_gradient_matches_penalized_objective_central_fd() {
         let p_out = 3usize;
         let mut reports: Vec<SaeFdBlockReport> = Vec::new();
 
@@ -3342,7 +3342,7 @@ use super::*;
     }
 
     #[test]
-    fn sae_reml_extra_penalty_energy_counts_live_isometry_once() {
+    pub(crate) fn sae_reml_extra_penalty_energy_counts_live_isometry_once() {
         let p_out = 3usize;
         let (term, _target, _rho, slice) = sae_pen_term(SaePenCaseKind::PeriodicD1);
         let registry = sae_pen_registry(
@@ -3374,7 +3374,7 @@ use super::*;
     }
 
     #[test]
-    fn sae_d1_assembled_gradient_matches_loss_central_fd() {
+    pub(crate) fn sae_d1_assembled_gradient_matches_loss_central_fd() {
         let reports = vec![
             sae_fd_check_case("euclidean_d1"),
             sae_fd_check_case("periodic_d1"),
@@ -3396,7 +3396,7 @@ use super::*;
         );
     }
 
-    fn assert_jacobian_matches_central_difference<E: SaeBasisEvaluator>(
+    pub(crate) fn assert_jacobian_matches_central_difference<E: SaeBasisEvaluator>(
         evaluator: &E,
         coords: Array2<f64>,
         tolerance: f64,
@@ -3435,7 +3435,7 @@ use super::*;
     }
 
     #[test]
-    fn sae_basis_evaluator_jacobians_match_central_differences() {
+    pub(crate) fn sae_basis_evaluator_jacobians_match_central_differences() {
         assert_jacobian_matches_central_difference(
             &PeriodicHarmonicEvaluator::new(7).unwrap(),
             array![[-0.37], [0.0], [0.125], [0.41]],
@@ -3504,7 +3504,7 @@ use super::*;
     /// seed already lands in the convex hull of the training coordinates).
     /// Pins the grid extents the fixed-decoder OOS seed (#628) relies on.
     #[test]
-    fn projection_seed_grid_spans_each_compact_manifold() {
+    pub(crate) fn projection_seed_grid_spans_each_compact_manifold() {
         use std::f64::consts::PI;
 
         // Periodic S¹: `resolution` phases evenly on `[0, 1)` (endpoint
@@ -3551,7 +3551,7 @@ use super::*;
     /// the cap arithmetic (`per_axis^d ≤ 4096`) the OOS seed depends on so a
     /// high-`d` torus atom never blows up the per-row global-argmin scan.
     #[test]
-    fn torus_projection_seed_grid_caps_total_points() {
+    pub(crate) fn torus_projection_seed_grid_caps_total_points() {
         // d == 1: dense, no cap (256¹ ≤ 4096).
         let g1 = SaeAtomBasisKind::Torus
             .projection_seed_grid(1, 256)
@@ -3614,7 +3614,7 @@ use super::*;
     /// per-row global argmin is unambiguous. Direct Rust pin for the #628 OOS
     /// seed, complementing the Python oracle end-to-end test.
     #[test]
-    fn seed_coords_by_decoder_projection_lands_on_grid_minimiser() {
+    pub(crate) fn seed_coords_by_decoder_projection_lands_on_grid_minimiser() {
         use std::f64::consts::PI;
 
         let resolution = 8usize;
@@ -3680,7 +3680,7 @@ use super::*;
     /// A target whose shape does not match `(n_obs, output_dim)` is a caller
     /// bug and must surface as an error rather than silently mis-seeding.
     #[test]
-    fn seed_coords_by_decoder_projection_rejects_shape_mismatch() {
+    pub(crate) fn seed_coords_by_decoder_projection_rejects_shape_mismatch() {
         let init_coords = array![[0.05], [0.05]];
         let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let (phi0, jet0) = evaluator.evaluate(init_coords.view()).unwrap();
@@ -3725,7 +3725,7 @@ use super::*;
     /// this pins that the jet equals the closed-form analytic derivative at
     /// interior, boundary (`|lat| = π/2`), and beyond-`π/2` latitudes alike.
     #[test]
-    fn sphere_chart_basis_jet_is_single_source_of_truth() {
+    pub(crate) fn sphere_chart_basis_jet_is_single_source_of_truth() {
         // A mix of interior and former clamp-boundary / beyond-π/2 latitudes;
         // the embedding and its jet are smooth everywhere, so all rows must hit
         // the same exact analytic formulas.
@@ -3806,7 +3806,7 @@ use super::*;
     /// gate discontinuously zeroed the entire latitude jet and froze the atom.
     /// Also pins continuity of the basis across `lat = π/2`.
     #[test]
-    fn sphere_chart_jet_matches_fd_at_clamp_boundary() {
+    pub(crate) fn sphere_chart_jet_matches_fd_at_clamp_boundary() {
         // Latitudes spanning interior, exactly the former boundary, and beyond.
         let coords = array![
             [std::f64::consts::FRAC_PI_2, 0.4], // exactly +π/2 (former gate flip)
@@ -3871,7 +3871,7 @@ use super::*;
     /// analytic second jet itself is exact, `-ω²·φ`). The FD step is 1e-4 (the
     /// sweet spot before f64 cancellation dominates a centered difference of an
     /// `O(1)` Jacobian).
-    fn assert_second_jet_matches_central_difference<E: SaeBasisSecondJet>(
+    pub(crate) fn assert_second_jet_matches_central_difference<E: SaeBasisSecondJet>(
         evaluator: &E,
         coords: Array2<f64>,
         abs_tol: f64,
@@ -3936,7 +3936,7 @@ use super::*;
     /// magnitude-scaled tolerance is used because the harmonic third derivatives
     /// scale like `freq³` (≈ thousands for the higher harmonics), so a pure
     /// absolute bound would be meaningless at the top of the range.
-    fn assert_third_jet_matches_central_difference<E: SaeBasisThirdJet>(
+    pub(crate) fn assert_third_jet_matches_central_difference<E: SaeBasisThirdJet>(
         evaluator: &E,
         coords: Array2<f64>,
         abs_tol: f64,
@@ -4005,7 +4005,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_periodic_second_jet_matches_fd() -> Result<(), String> {
+    pub(crate) fn isometry_periodic_second_jet_matches_fd() -> Result<(), String> {
         // Magnitude-scaled tolerance: the top harmonic (ω = 2π·3) drives a
         // O(ε²·ω⁴) ≈ 2e-5 central-difference truncation floor, far above any flat
         // 1e-5 absolute bound; rel_tol = 1e-5 tracks the ω⁴ scale (analytic exact).
@@ -4019,7 +4019,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_sphere_second_jet_matches_fd() -> Result<(), String> {
+    pub(crate) fn isometry_sphere_second_jet_matches_fd() -> Result<(), String> {
         // Stay inside the interior `(-π/2, π/2)` for lat so the chain factor
         // is active — that is where the Hessian carries information.
         let sphere_coords = array![[-0.7, -1.2], [-0.25, 0.0], [0.35, 0.9], [0.8, 2.1]];
@@ -4033,7 +4033,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_torus_second_jet_matches_fd() -> Result<(), String> {
+    pub(crate) fn isometry_torus_second_jet_matches_fd() -> Result<(), String> {
         let torus_coords = array![[0.1, 0.7], [0.42, 0.0], [0.95, 0.33], [0.5, 0.5]];
         let evaluator = TorusHarmonicEvaluator::new(2, 3).unwrap();
         assert!(evaluator.basis_size() > 0);
@@ -4043,7 +4043,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_periodic_third_jet_matches_fd() -> Result<(), String> {
+    pub(crate) fn isometry_periodic_third_jet_matches_fd() -> Result<(), String> {
         assert_third_jet_matches_central_difference(
             &PeriodicHarmonicEvaluator::new(7).unwrap(),
             array![[-0.37], [0.0], [0.125], [0.41]],
@@ -4054,7 +4054,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_sphere_third_jet_matches_fd() -> Result<(), String> {
+    pub(crate) fn isometry_sphere_third_jet_matches_fd() -> Result<(), String> {
         // Interior of `(-π/2, π/2)` for lat so the chart chain factor is active —
         // that is where the third-order curvature term carries information.
         let sphere_coords = array![[-0.7, -1.2], [-0.25, 0.0], [0.35, 0.9], [0.8, 2.1]];
@@ -4068,7 +4068,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_torus_third_jet_matches_fd() -> Result<(), String> {
+    pub(crate) fn isometry_torus_third_jet_matches_fd() -> Result<(), String> {
         let torus_coords = array![[0.1, 0.7], [0.42, 0.0], [0.95, 0.33], [0.5, 0.5]];
         let evaluator = TorusHarmonicEvaluator::new(2, 3).unwrap();
         assert!(evaluator.basis_size() > 0);
@@ -4077,7 +4077,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_affine_third_jet_is_trivial_zero() -> Result<(), String> {
+    pub(crate) fn isometry_affine_third_jet_is_trivial_zero() -> Result<(), String> {
         let evaluator = AffineCoordinateEvaluator { latent_dim: 3 };
         let coords = array![[0.2, -0.3, 0.7], [1.1, 0.0, -0.4]];
         let third = evaluator.third_jet(coords.view())?;
@@ -4090,7 +4090,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_euclidean_patch_third_jet_matches_fd() -> Result<(), String> {
+    pub(crate) fn isometry_euclidean_patch_third_jet_matches_fd() -> Result<(), String> {
         let evaluator = EuclideanPatchEvaluator::new(2, 4)?;
         let coords = array![[0.2, -0.3], [0.7, 0.4], [-0.5, 0.9]];
         assert_third_jet_matches_central_difference(&evaluator, coords, 1.0e-6, 1.0e-5)?;
@@ -4102,7 +4102,7 @@ use super::*;
     /// was a radial-only design paired with a radial+polynomial jet (or vice
     /// versa), which the consumer rejected as a "design/jet column mismatch".
     #[test]
-    fn duchon_coordinate_evaluator_phi_and_jet_share_column_count() {
+    pub(crate) fn duchon_coordinate_evaluator_phi_and_jet_share_column_count() {
         for (d, centers) in [
             (1usize, array![[-1.0], [-0.4], [0.1], [0.6], [1.2], [1.9]]),
             (
@@ -4139,7 +4139,7 @@ use super::*;
     /// difference of its own forward design — i.e. `dPhi/dt` is the true
     /// derivative of `Phi(t)`, with no stray amplification/column mismatch.
     #[test]
-    fn duchon_coordinate_evaluator_jacobian_matches_fd() {
+    pub(crate) fn duchon_coordinate_evaluator_jacobian_matches_fd() {
         let centers = array![
             [-1.0, -0.8],
             [-0.3, 0.4],
@@ -4157,7 +4157,7 @@ use super::*;
     /// The Duchon evaluator's analytic second jet must match the FD of its
     /// (FD-validated) first jet.
     #[test]
-    fn duchon_coordinate_evaluator_second_jet_matches_fd() -> Result<(), String> {
+    pub(crate) fn duchon_coordinate_evaluator_second_jet_matches_fd() -> Result<(), String> {
         let centers = array![
             [-1.0, -0.8],
             [-0.3, 0.4],
@@ -4177,7 +4177,7 @@ use super::*;
     /// FD of its (FD-validated) second jet, validating the closed form that
     /// replaced the forbidden finite-difference `third_jet_dyn` default.
     #[test]
-    fn duchon_coordinate_evaluator_third_jet_matches_fd() -> Result<(), String> {
+    pub(crate) fn duchon_coordinate_evaluator_third_jet_matches_fd() -> Result<(), String> {
         let centers = array![
             [-1.0, -0.8],
             [-0.3, 0.4],
@@ -4195,7 +4195,7 @@ use super::*;
     /// The Euclidean tangent-patch evaluator's monomial design and its
     /// first/second jets must be mutually consistent under finite differences.
     #[test]
-    fn euclidean_patch_evaluator_jets_match_fd() -> Result<(), String> {
+    pub(crate) fn euclidean_patch_evaluator_jets_match_fd() -> Result<(), String> {
         let evaluator = EuclideanPatchEvaluator::new(2, 2).unwrap();
         let coords = array![[0.0, -1.0], [3.5, 0.25], [-0.75, 1.2], [0.4, 0.9]];
         assert_jacobian_matches_central_difference(&evaluator, coords.clone(), 1.0e-6);
@@ -4207,7 +4207,7 @@ use super::*;
     }
 
     #[test]
-    fn euclidean_affine_gauge_canonicalization_preserves_reconstruction() -> Result<(), String> {
+    pub(crate) fn euclidean_affine_gauge_canonicalization_preserves_reconstruction() -> Result<(), String> {
         let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2)?);
         let canonical = array![[-1.0_f64], [-0.35], [0.1], [0.65], [1.2]];
         let mut coords = canonical.clone();
@@ -4255,7 +4255,7 @@ use super::*;
     }
 
     #[test]
-    fn quotient_step_norm_removes_pure_euclidean_affine_gauge() -> Result<(), String> {
+    pub(crate) fn quotient_step_norm_removes_pure_euclidean_affine_gauge() -> Result<(), String> {
         let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2)?);
         let coords = array![[-1.0_f64], [-0.4], [0.2], [0.8], [1.3]];
         let (phi, jet) = evaluator.evaluate(coords.view())?;
@@ -4301,7 +4301,7 @@ use super::*;
     /// Drives a single torus atom through the [`SaeManifoldTerm`] Newton loop
     /// and checks that the in-sample reconstruction R² clears 0.5.
     #[test]
-    fn sae_torus_atom_recovers_two_frequency_synthetic() {
+    pub(crate) fn sae_torus_atom_recovers_two_frequency_synthetic() {
         let n = 96usize;
         let p = 4usize;
         let h = 3usize;
@@ -4387,7 +4387,7 @@ use super::*;
     /// atom through the [`SaeManifoldTerm`] Newton loop and checks in-sample
     /// R² ≥ 0.5.
     #[test]
-    fn sae_sphere_atom_recovers_synthetic_signal() {
+    pub(crate) fn sae_sphere_atom_recovers_synthetic_signal() {
         let n = 96usize;
         let p = 3usize;
         let d = 2usize;
@@ -4475,7 +4475,7 @@ use super::*;
     /// steps end-to-end in Rust and check that the multi-step loop achieves
     /// in-sample R² ≥ 0.95.
     #[test]
-    fn sae_manifold_fit_10_steps_one_harmonic_reaches_high_r2() {
+    pub(crate) fn sae_manifold_fit_10_steps_one_harmonic_reaches_high_r2() {
         let n = 64usize;
         let m = 3usize;
         let p = 1usize;
@@ -4557,7 +4557,7 @@ use super::*;
     /// unavailable". The penalty now exposes the analytic diagonal extracted
     /// from its row-dense HVP, so the joint-fit driver completes one step.
     #[test]
-    fn softmax_assignment_hessian_diag_is_available_for_k2() {
+    pub(crate) fn softmax_assignment_hessian_diag_is_available_for_k2() {
         let n = 4usize;
         let k = 2usize;
         let logits =
@@ -4581,7 +4581,7 @@ use super::*;
     }
 
     #[test]
-    fn sae_registry_refuses_assignment_sparsity_penalties() {
+    pub(crate) fn sae_registry_refuses_assignment_sparsity_penalties() {
         let n = 3usize;
         let k = 2usize;
         let logits = Array2::<f64>::zeros((n, k));
@@ -4630,7 +4630,7 @@ use super::*;
     }
 
     #[test]
-    fn ibp_fixed_alpha_assignment_value_matches_logit_gradient_fd() {
+    pub(crate) fn ibp_fixed_alpha_assignment_value_matches_logit_gradient_fd() {
         let n = 4usize;
         let k = 3usize;
         let logits = Array2::<f64>::from_shape_vec(
@@ -4680,7 +4680,7 @@ use super::*;
     /// slot in the latent block (`row_offsets[i] + k` for the dense IBP layout),
     /// and the rank-one product against the central-difference Hessian closes.
     #[test]
-    fn ibp_assembly_emits_cross_row_woodbury_source_matching_fd_hessian() {
+    pub(crate) fn ibp_assembly_emits_cross_row_woodbury_source_matching_fd_hessian() {
         let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
         let coords1 = array![[0.15], [0.30], [0.65], [0.90]];
         let (phi0, jet0) = periodic_basis(&coords0);
@@ -4815,7 +4815,7 @@ use super::*;
     }
 
     #[test]
-    fn jumprelu_assignment_value_matches_logit_gradient_fd() {
+    pub(crate) fn jumprelu_assignment_value_matches_logit_gradient_fd() {
         let n = 4usize;
         let k = 2usize;
         let temperature = 0.35_f64;
@@ -4850,7 +4850,7 @@ use super::*;
     }
 
     #[test]
-    fn jumprelu_assignment_prior_hessian_diag_is_exact_over_logit_sweep() {
+    pub(crate) fn jumprelu_assignment_prior_hessian_diag_is_exact_over_logit_sweep() {
         let n = 6usize;
         let k = 2usize;
         let temperature = 0.35_f64;
@@ -4916,7 +4916,7 @@ use super::*;
     /// on a clean K=2 periodic torus signal, mirroring the failing
     /// reproducer in #174.
     #[test]
-    fn ibp_map_k2_periodic_torus_recovers_signal_with_lsq_init() {
+    pub(crate) fn ibp_map_k2_periodic_torus_recovers_signal_with_lsq_init() {
         use crate::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
         use faer::Side as FaerSide;
 
@@ -5101,7 +5101,7 @@ use super::*;
     /// Regression test for issue #174 + #177 combined: softmax assignment
     /// with K=2 periodic atoms should not crash and should reduce loss.
     #[test]
-    fn softmax_k2_periodic_completes_joint_fit_step() {
+    pub(crate) fn softmax_k2_periodic_completes_joint_fit_step() {
         let n = 64usize;
         let p = 4usize;
         let k = 2usize;
@@ -5185,7 +5185,7 @@ use super::*;
     /// helper for both the analytic side and the FD side, so any layout
     /// mismatch between `J`/`H` would show up as a tolerance failure rather
     /// than a silently zero gradient.
-    fn assert_isometry_wiring_matches_fd(
+    pub(crate) fn assert_isometry_wiring_matches_fd(
         evaluator: Arc<dyn SaeBasisSecondJet>,
         coords: Array2<f64>,
     ) {
@@ -5289,7 +5289,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_wiring_periodic_matches_fd() {
+    pub(crate) fn isometry_wiring_periodic_matches_fd() {
         assert_isometry_wiring_matches_fd(
             Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap()),
             array![[0.12], [0.37], [0.58], [0.81]],
@@ -5297,7 +5297,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_wiring_sphere_matches_fd() {
+    pub(crate) fn isometry_wiring_sphere_matches_fd() {
         assert_isometry_wiring_matches_fd(
             Arc::new(SphereChartEvaluator),
             array![[-0.5, 0.3], [0.2, -1.1], [0.7, 0.9]],
@@ -5305,21 +5305,21 @@ use super::*;
     }
 
     #[test]
-    fn isometry_wiring_torus_matches_fd() {
+    pub(crate) fn isometry_wiring_torus_matches_fd() {
         assert_isometry_wiring_matches_fd(
             Arc::new(TorusHarmonicEvaluator::new(2, 2).unwrap()),
             array![[0.13, 0.42], [0.66, 0.19], [0.88, 0.55]],
         );
     }
 
-    fn deterministic_decoder(n_basis: usize, p_out: usize, seed: f64) -> Array2<f64> {
+    pub(crate) fn deterministic_decoder(n_basis: usize, p_out: usize, seed: f64) -> Array2<f64> {
         Array2::<f64>::from_shape_fn((n_basis, p_out), |(i, j)| {
             let x = seed + 0.371 * (i as f64) - 0.193 * (j as f64) + 0.047 * ((i * j + 1) as f64);
             0.8 * x.sin() + 0.35 * (1.7 * x).cos()
         })
     }
 
-    fn build_isometry_atom_for_evaluator(
+    pub(crate) fn build_isometry_atom_for_evaluator(
         evaluator: Arc<dyn SaeBasisSecondJet>,
         kind: SaeAtomBasisKind,
         coords: &Array2<f64>,
@@ -5348,7 +5348,7 @@ use super::*;
         (atom, penalty, target_flat)
     }
 
-    fn assert_exact_isometry_hvp_matches_grad_fd(
+    pub(crate) fn assert_exact_isometry_hvp_matches_grad_fd(
         evaluator: Arc<dyn SaeBasisSecondJet>,
         kind: SaeAtomBasisKind,
         coords: Array2<f64>,
@@ -5401,7 +5401,7 @@ use super::*;
         }
     }
 
-    fn assert_exact_isometry_hvp_collapses_to_gn_at_zero_residual(
+    pub(crate) fn assert_exact_isometry_hvp_collapses_to_gn_at_zero_residual(
         evaluator: Arc<dyn SaeBasisSecondJet>,
         kind: SaeAtomBasisKind,
         coords: Array2<f64>,
@@ -5461,7 +5461,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_exact_hvp_sphere_matches_grad_fd_and_uses_refreshed_k() {
+    pub(crate) fn isometry_exact_hvp_sphere_matches_grad_fd_and_uses_refreshed_k() {
         assert_exact_isometry_hvp_matches_grad_fd(
             Arc::new(SphereChartEvaluator),
             SaeAtomBasisKind::Sphere,
@@ -5472,7 +5472,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_exact_hvp_torus_matches_grad_fd_and_uses_refreshed_k() {
+    pub(crate) fn isometry_exact_hvp_torus_matches_grad_fd_and_uses_refreshed_k() {
         assert_exact_isometry_hvp_matches_grad_fd(
             Arc::new(TorusHarmonicEvaluator::new(2, 2).unwrap()),
             SaeAtomBasisKind::Torus,
@@ -5483,7 +5483,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_exact_hvp_sphere_and_torus_collapse_to_gn_at_zero_residual() {
+    pub(crate) fn isometry_exact_hvp_sphere_and_torus_collapse_to_gn_at_zero_residual() {
         assert_exact_isometry_hvp_collapses_to_gn_at_zero_residual(
             Arc::new(SphereChartEvaluator),
             SaeAtomBasisKind::Sphere,
@@ -5518,7 +5518,7 @@ use super::*;
     ///   * **symmetric**, and
     ///   * **positive-semidefinite** (`vᵀB v ≥ 0`),
     /// pinning the exact seam #457 is about, end-to-end from the evaluator.
-    fn assert_isometry_psd_majorizer_live_after_atom_refresh(
+    pub(crate) fn assert_isometry_psd_majorizer_live_after_atom_refresh(
         evaluator: Arc<dyn SaeBasisSecondJet>,
         kind: SaeAtomBasisKind,
         coords: Array2<f64>,
@@ -5620,7 +5620,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_psd_majorizer_live_after_sphere_refresh() {
+    pub(crate) fn isometry_psd_majorizer_live_after_sphere_refresh() {
         assert_isometry_psd_majorizer_live_after_atom_refresh(
             Arc::new(SphereChartEvaluator),
             SaeAtomBasisKind::Sphere,
@@ -5635,7 +5635,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_psd_majorizer_live_after_circle_refresh() {
+    pub(crate) fn isometry_psd_majorizer_live_after_circle_refresh() {
         assert_isometry_psd_majorizer_live_after_atom_refresh(
             Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap()),
             SaeAtomBasisKind::Periodic,
@@ -5650,7 +5650,7 @@ use super::*;
     }
 
     #[test]
-    fn isometry_psd_majorizer_live_after_torus_refresh() {
+    pub(crate) fn isometry_psd_majorizer_live_after_torus_refresh() {
         assert_isometry_psd_majorizer_live_after_atom_refresh(
             Arc::new(TorusHarmonicEvaluator::new(2, 2).unwrap()),
             SaeAtomBasisKind::Torus,
@@ -5679,7 +5679,7 @@ use super::*;
     /// `refresh_isometry_caches_from_term` the two registry penalties carry
     /// *distinct* caches matching their *own* atoms.
     #[test]
-    fn refresh_isometry_caches_pairs_each_penalty_to_its_own_atom() {
+    pub(crate) fn refresh_isometry_caches_pairs_each_penalty_to_its_own_atom() {
         let latent_dim = 1usize;
         let p_out = 3usize;
         let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
@@ -5796,7 +5796,7 @@ use super::*;
 
     /// Build a minimal single-atom periodic SAE outer objective for the
     /// warm-start contract tests (gam#577 / gam#579).
-    fn warmstart_test_objective() -> SaeManifoldOuterObjective {
+    pub(crate) fn warmstart_test_objective() -> SaeManifoldOuterObjective {
         let coords = array![[0.10], [0.35], [0.62], [0.88]];
         let (phi, jet) = periodic_basis(&coords);
         let atom = SaeManifoldAtom::new(
@@ -5824,7 +5824,7 @@ use super::*;
         SaeManifoldOuterObjective::new(term, target, None, rho, 8, 1.0, 1.0e-6, 1.0e-6)
     }
 
-    fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
+    pub(crate) fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
         ArrowFactorCache {
             htt_factors: ArrowFactorSlab::from_blocks(vec![array![[1.0_f64, 0.0], [0.0, 1.0e-7]]]),
             htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
@@ -5845,7 +5845,7 @@ use super::*;
         }
     }
 
-    fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
+    pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
         let dim = diagonal.len();
         let mut factor = Array2::<f64>::zeros((dim, dim));
         for i in 0..dim {
@@ -5872,7 +5872,7 @@ use super::*;
     }
 
     #[test]
-    fn outer_gradient_solver_rejects_near_singular_cache_without_matching_gauge() {
+    pub(crate) fn outer_gradient_solver_rejects_near_singular_cache_without_matching_gauge() {
         let cache = near_singular_outer_gradient_cache();
         let obj = warmstart_test_objective();
         let err = match obj.term.outer_gradient_arrow_solver(&cache) {
@@ -5902,7 +5902,7 @@ use super::*;
     /// TIMEOUT. With the β-basis admitted as a deflation candidate the flat
     /// direction is Faddeev-Popov-deflated and the solve succeeds, regularising
     /// the near-null β response to the Hessian scale (bounded, not 1e13).
-    fn rank_deficient_euclidean_outer_gradient_objective() -> SaeManifoldOuterObjective {
+    pub(crate) fn rank_deficient_euclidean_outer_gradient_objective() -> SaeManifoldOuterObjective {
         // Linear euclidean basis Φ(t) = [1, t] (m = 2) over a 1-D latent.
         let coords = array![[-0.7_f64], [-0.2], [0.3], [0.8]];
         let n = coords.nrows();
@@ -5944,7 +5944,7 @@ use super::*;
     /// rank-deficient decoder's unidentified direction — with the latent block
     /// well-conditioned and `H_tβ = 0` so the singularity is purely in β. The
     /// chart gauge orbit cannot reach this direction (#1051).
-    fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
+    pub(crate) fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
         // Well-conditioned latent block (single row, dim 1).
         let htt = ArrowFactorSlab::from_blocks(vec![array![[1.0_f64]]]);
         // β dim = m · p = 2 · 2 = 4, laid out (col, out_col) row-major like
@@ -5982,7 +5982,7 @@ use super::*;
     }
 
     #[test]
-    fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() {
+    pub(crate) fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() {
         let obj = rank_deficient_euclidean_outer_gradient_objective();
         let cache = rank_deficient_beta_outer_gradient_cache();
         // Sanity: the cache genuinely trips the conditioning floor (the bug's
@@ -6023,7 +6023,7 @@ use super::*;
     }
 
     #[test]
-    fn deflated_solver_matches_plain_solve_when_no_gauge_is_installed() {
+    pub(crate) fn deflated_solver_matches_plain_solve_when_no_gauge_is_installed() {
         let cache = diagonal_latent_cache(&[2.0_f64, 5.0, 7.0]);
         let solver = DeflatedArrowSolver::plain(&cache);
         let rhs_t = array![4.0_f64, 10.0, -14.0];
@@ -6045,7 +6045,7 @@ use super::*;
     }
 
     #[test]
-    fn deflated_solver_matches_dense_quotient_pseudoinverse_on_near_null_fixture() {
+    pub(crate) fn deflated_solver_matches_dense_quotient_pseudoinverse_on_near_null_fixture() {
         let cache = diagonal_latent_cache(&[2.0_f64, 1.0e-14]);
         let gauge = array![0.0_f64, 1.0];
         let solver = DeflatedArrowSolver::from_orthonormal_gauges(&cache, vec![gauge], 2.0)
@@ -6081,7 +6081,7 @@ use super::*;
     /// erroring on `β length 0 != decoder dim` — the error dropped EVERY
     /// continuation seed and forced a full cold solve on every outer seed.
     #[test]
-    fn seed_inner_state_accepts_empty_beta_as_noslot() {
+    pub(crate) fn seed_inner_state_accepts_empty_beta_as_noslot() {
         let mut obj = warmstart_test_objective();
         let empty: Array1<f64> = Array1::zeros(0);
         let outcome = obj
@@ -6102,7 +6102,7 @@ use super::*;
     /// the seeded β. A cold start would have published the term's pristine β
     /// instead.
     #[test]
-    fn seed_inner_state_installs_and_reuses_matching_beta() {
+    pub(crate) fn seed_inner_state_installs_and_reuses_matching_beta() {
         let mut obj = warmstart_test_objective();
         let dim = obj.term.beta_dim();
         // A distinctive seed that differs from the term's pristine decoder.
@@ -6150,7 +6150,7 @@ use super::*;
     /// layout bug and must still surface a typed error rather than being
     /// silently dropped.
     #[test]
-    fn seed_inner_state_rejects_wrong_length_populated_beta() {
+    pub(crate) fn seed_inner_state_rejects_wrong_length_populated_beta() {
         let mut obj = warmstart_test_objective();
         let dim = obj.term.beta_dim();
         let wrong: Array1<f64> = Array1::zeros(dim + 1);
@@ -6174,7 +6174,7 @@ use super::*;
     /// [`SaeManifoldAtom::refresh_intrinsic_smooth_penalty`] is exercised
     /// directly. A localized (near-diagonal) basis makes each coefficient's
     /// representative speed the speed at its own sample.
-    fn intrinsic_test_atom(jacobian_scale: f64) -> SaeManifoldAtom {
+    pub(crate) fn intrinsic_test_atom(jacobian_scale: f64) -> SaeManifoldAtom {
         let m = 5usize;
         let n = m;
         let p = 1usize;
@@ -6207,13 +6207,13 @@ use super::*;
     /// space: an order-2 difference penalty annihilates the affine functions,
     /// so `nullity = 2` and the arc-length exponent is `β = ½ − 2 = −3/2`.
     #[test]
-    fn intrinsic_penalty_recovers_order_two_from_nullity() {
+    pub(crate) fn intrinsic_penalty_recovers_order_two_from_nullity() {
         let atom = intrinsic_test_atom(1.0);
         assert_eq!(atom.smooth_penalty_order, 2);
     }
 
     #[test]
-    fn line_search_snapshot_restores_intrinsic_smooth_penalty() {
+    pub(crate) fn line_search_snapshot_restores_intrinsic_smooth_penalty() {
         let atom = intrinsic_test_atom(1.0);
         let n = atom.n_obs();
         let logits = Array2::<f64>::zeros((n, 1));
@@ -6255,7 +6255,7 @@ use super::*;
     /// hence the topology evidence `tr(BᵀS̃B)`) is identical across the two
     /// reparameterizations, even though the basis Jacobian (the metric) differs.
     #[test]
-    fn intrinsic_penalty_is_invariant_to_speed_rescaling() {
+    pub(crate) fn intrinsic_penalty_is_invariant_to_speed_rescaling() {
         let a1 = intrinsic_test_atom(1.0);
         let a2 = intrinsic_test_atom(7.5);
         // Same raw Gram and decoder; only the basis Jacobian (speed) differs.
@@ -6277,7 +6277,7 @@ use super::*;
         );
     }
 
-    fn affine_canonicalization_test_term() -> SaeManifoldTerm {
+    pub(crate) fn affine_canonicalization_test_term() -> SaeManifoldTerm {
         let n = 80usize;
         let p = 2usize;
         let evaluator = EuclideanPatchEvaluator::new(1, 2).unwrap();
@@ -6316,7 +6316,7 @@ use super::*;
     }
 
     #[test]
-    fn affine_canonicalization_transports_live_penalty_instead_of_recomputing() {
+    pub(crate) fn affine_canonicalization_transports_live_penalty_instead_of_recomputing() {
         let mut term = affine_canonicalization_test_term();
         let before = term.decoder_smoothness_quadratic_form();
         let old_smooth_penalty = term.atoms[0].smooth_penalty.clone();
@@ -6377,7 +6377,7 @@ use super::*;
     /// constant-speed, otherwise the reweighting is a no-op and the gauge fix
     /// would be vacuous. The congruence preserves symmetry.
     #[test]
-    fn intrinsic_penalty_differs_from_raw_under_varying_speed() {
+    pub(crate) fn intrinsic_penalty_differs_from_raw_under_varying_speed() {
         let atom = intrinsic_test_atom(1.0);
         let diff = (&atom.smooth_penalty - &atom.smooth_penalty_raw)
             .mapv(f64::abs)
@@ -6402,7 +6402,7 @@ use super::*;
     /// `S̃ = S_raw` exactly and the topology comparison among constant-speed
     /// atoms is unaffected.
     #[test]
-    fn intrinsic_penalty_leaves_constant_speed_atom_unchanged() {
+    pub(crate) fn intrinsic_penalty_leaves_constant_speed_atom_unchanged() {
         let m = 6usize;
         let n = m;
         let mut phi = Array2::<f64>::zeros((n, m));
@@ -6435,7 +6435,7 @@ use super::*;
     }
 
     #[test]
-    fn pca_seed_handles_huge_equal_finite_columns_without_mean_overflow() {
+    pub(crate) fn pca_seed_handles_huge_equal_finite_columns_without_mean_overflow() {
         let z = array![[1.0e308_f64, 1.0e308], [1.0e308, 1.0e308]];
         let coords =
             sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Periodic], &[1]).unwrap();
@@ -6447,7 +6447,7 @@ use super::*;
     }
 
     #[test]
-    fn pca_seed_rejects_huge_finite_span_that_overflows_centering() {
+    pub(crate) fn pca_seed_rejects_huge_finite_span_that_overflows_centering() {
         let z = array![[1.0e308_f64, 0.0], [-1.0e308, 0.0]];
         let err = sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Periodic], &[1])
             .expect_err("opposite huge finite values exceed f64 centering range");
@@ -6463,7 +6463,7 @@ use super::*;
     /// is already orthonormal (idempotence of the polar projection on the
     /// Stiefel manifold), and recovers the planted span of a low-rank decoder.
     #[test]
-    fn planted_low_rank_frame_recovered_by_polar() {
+    pub(crate) fn planted_low_rank_frame_recovered_by_polar() {
         let p = 12usize;
         let r = 3usize;
         let n = 200usize;
@@ -6509,7 +6509,7 @@ use super::*;
     /// exactly `Σ M_k·r_k`, and reconstruction recovers `B_k` to machine
     /// precision.
     #[test]
-    fn factored_border_dim_invariant_and_reconstruction() {
+    pub(crate) fn factored_border_dim_invariant_and_reconstruction() {
         let m = 6usize;
         let p = 16usize;
         let r = 2usize;
@@ -6593,7 +6593,7 @@ use super::*;
     }
 
     #[test]
-    fn factored_beta_penalty_probing_matches_projected_dense_curvature() {
+    pub(crate) fn factored_beta_penalty_probing_matches_projected_dense_curvature() {
         let k_atoms = 2usize;
         let m = 4usize;
         let p = 24usize;
@@ -6726,7 +6726,7 @@ use super::*;
         assert!(sys.hbb.is_empty());
     }
 
-    fn materialize_row_htbeta_for_test(sys: &ArrowSchurSystem, row_idx: usize) -> Array2<f64> {
+    pub(crate) fn materialize_row_htbeta_for_test(sys: &ArrowSchurSystem, row_idx: usize) -> Array2<f64> {
         let di = sys.row_dims[row_idx];
         let k = sys.k;
         let row = &sys.rows[row_idx];
@@ -6752,14 +6752,14 @@ use super::*;
         out
     }
 
-    fn project_row_htbeta_to_factored_for_test(
+    pub(crate) fn project_row_htbeta_to_factored_for_test(
         term: &SaeManifoldTerm,
         htbeta_b: ArrayView2<'_, f64>,
     ) -> Array2<f64> {
         FrameProjection::new(term).project_rows(htbeta_b)
     }
 
-    fn low_rank_factored_htbeta_term(
+    pub(crate) fn low_rank_factored_htbeta_term(
         k_atoms: usize,
         m: usize,
         p: usize,
@@ -6826,12 +6826,12 @@ use super::*;
         SaeManifoldTerm::new(atoms, assignment).unwrap()
     }
 
-    fn factored_htbeta_rho(k_atoms: usize, latent_dim: usize) -> SaeManifoldRho {
+    pub(crate) fn factored_htbeta_rho(k_atoms: usize, latent_dim: usize) -> SaeManifoldRho {
         SaeManifoldRho::new(0.0, -0.2, vec![Array1::<f64>::zeros(latent_dim); k_atoms])
     }
 
     #[test]
-    fn factored_row_htbeta_native_solve_matches_full_b_then_project() {
+    pub(crate) fn factored_row_htbeta_native_solve_matches_full_b_then_project() {
         let k_atoms = 2usize;
         let m = 4usize;
         let p = 24usize;
@@ -6941,7 +6941,7 @@ use super::*;
     }
 
     #[test]
-    fn factored_row_htbeta_d2_matches_dense_full_b_then_project() {
+    pub(crate) fn factored_row_htbeta_d2_matches_dense_full_b_then_project() {
         let k_atoms = 3usize;
         let m = 5usize;
         let p = 32usize;
@@ -6999,14 +6999,14 @@ use super::*;
     }
 
     #[test]
-    fn qwen_shape_d2_factored_htbeta_assembly_stays_below_8gib() {
-        const K_ATOMS: usize = 8;
-        const M: usize = 10;
-        const P: usize = 2048;
-        const FRAME_RANK: usize = 2;
-        const LATENT_DIM: usize = 2;
-        const N_OBS: usize = 2000;
-        const EIGHT_GIB: usize = 8 * 1024 * 1024 * 1024;
+    pub(crate) fn qwen_shape_d2_factored_htbeta_assembly_stays_below_8gib() {
+        pub(crate) const K_ATOMS: usize = 8;
+        pub(crate) const M: usize = 10;
+        pub(crate) const P: usize = 2048;
+        pub(crate) const FRAME_RANK: usize = 2;
+        pub(crate) const LATENT_DIM: usize = 2;
+        pub(crate) const N_OBS: usize = 2000;
+        pub(crate) const EIGHT_GIB: usize = 8 * 1024 * 1024 * 1024;
 
         let mut term = low_rank_factored_htbeta_term(K_ATOMS, M, P, FRAME_RANK, LATENT_DIM, N_OBS);
         assert!(term.frames_active());
@@ -7062,7 +7062,7 @@ use super::*;
     /// and the Occam normalizer is bit-for-bit the historical
     /// `½·p·rank(S)·log λ` — the small-`p` evidence-equality contract.
     #[test]
-    fn factored_evidence_matches_full_b_at_small_p() {
+    pub(crate) fn factored_evidence_matches_full_b_at_small_p() {
         let m = 5usize;
         let p = 2usize;
         // Full-rank decoder (rank 2 == p): no border saving, frame must stay off.
@@ -7125,7 +7125,7 @@ use super::*;
     /// frame toward the cross-moment span and keeps `B_k`'s in-span component
     /// while staying column-orthonormal (the closed-form streaming step).
     #[test]
-    fn streaming_polar_refresh_reorients_frame() {
+    pub(crate) fn streaming_polar_refresh_reorients_frame() {
         let m = 4usize;
         let p = 12usize;
         let r = 2usize;
@@ -7182,7 +7182,7 @@ use super::*;
     }
 
     #[test]
-    fn small_p_zero_decoder_stays_full_b() {
+    pub(crate) fn small_p_zero_decoder_stays_full_b() {
         let m = 3usize;
         let p = 8usize;
         let mut phi = Array2::<f64>::zeros((m, m));
@@ -7208,7 +7208,7 @@ use super::*;
         assert_eq!(atom.border_frame_rank(), p);
     }
 
-    fn gamma_fd_tiny_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    pub(crate) fn gamma_fd_tiny_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
         let n = 10usize;
         let p = 3usize;
         let k_atoms = 2usize;
@@ -7283,7 +7283,7 @@ use super::*;
         (term, target, rho)
     }
 
-    fn fixed_state_logdet(
+    pub(crate) fn fixed_state_logdet(
         mut term: SaeManifoldTerm,
         target: &Array2<f64>,
         rho: &SaeManifoldRho,
@@ -7296,7 +7296,7 @@ use super::*;
     }
 
     #[test]
-    fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
+    pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
         let (mut term, target, rho) = gamma_fd_tiny_fixture();
         let (_value, _loss, cache) = term
             .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
@@ -7341,7 +7341,7 @@ use super::*;
     }
 
     #[test]
-    fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
+    pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
         // The #1006 empirical-π third channel: under IBP-MAP, pi_k(M_k) couples
         // every row of column k, so perturbing one logit shifts EVERY row's
         // assembled `htt` diagonal in that column. `fixed_state_logdet` rebuilds
@@ -7415,7 +7415,7 @@ use super::*;
     /// exercises the #977 `set_row_loss_weights` √w seam, which scales every
     /// production channel by `sqrt(w_row)`.
     #[test]
-    fn sae_row_jet_program_matches_production_row_jets_on_converged_cache() {
+    pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache() {
         use crate::terms::sae_row_jet_program::{
             AtomRowBasisJet, RowGate, SaeReconstructionRowProgram,
         };
@@ -7423,7 +7423,7 @@ use super::*;
         // Tiny-fixture row arity: softmax gauges the last logit as the fixed
         // reference (assignment_coord_dim = k_atoms − 1 = 1 free logit), plus
         // 2 atoms × 1 latent coord.
-        const K: usize = 3;
+        pub(crate) const K: usize = 3;
         for weighted in [false, true] {
             let (mut term, target, rho) = gamma_fd_tiny_fixture();
             if weighted {
@@ -7583,7 +7583,7 @@ use super::*;
     }
 
     #[test]
-    fn ibp_map_outer_objective_advertises_analytic_gradient() {
+    pub(crate) fn ibp_map_outer_objective_advertises_analytic_gradient() {
         // The IBP-MAP empirical-π third channel (including the cross-row M_k
         // coupling) is now assembled exactly in `logdet_theta_adjoint` (#1006),
         // so the outer objective advertises an analytic gradient like every
@@ -7835,7 +7835,7 @@ mod inner_contract_probe_tests {
     use crate::terms::{AssignmentMode, LatentManifold, SaeAssignment};
     use std::sync::Arc;
 
-    fn euclidean_line_contract_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    pub(crate) fn euclidean_line_contract_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
         let n = 150usize;
         let p = 8usize;
         let mut coords = Array2::<f64>::zeros((n, 1));
@@ -7880,7 +7880,7 @@ mod inner_contract_probe_tests {
         (term, z, rho)
     }
 
-    fn assert_contract_close(label: &str, analytic: f64, finite_difference: f64) {
+    pub(crate) fn assert_contract_close(label: &str, analytic: f64, finite_difference: f64) {
         let rel = (analytic - finite_difference).abs()
             / finite_difference.abs().max(analytic.abs()).max(1.0e-12);
         assert!(
@@ -7890,7 +7890,7 @@ mod inner_contract_probe_tests {
     }
 
     #[test]
-    fn euclidean_line_decoder_gradient_matches_penalized_objective_fd() {
+    pub(crate) fn euclidean_line_decoder_gradient_matches_penalized_objective_fd() {
         let (mut term, z, mut rho) = euclidean_line_contract_fixture();
         let ridge = 1.0e-6;
         for step in 0..6 {

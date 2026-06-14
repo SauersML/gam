@@ -60,17 +60,17 @@ pub(crate) fn lift_fit_geometry_to_raw(
 }
 
 pub(crate) struct BlockwiseFitAssembly<'a> {
-    rho_physical: Array1<f64>,
-    covariance_conditional: Option<Array2<f64>>,
-    geometry: Option<FitGeometry>,
-    canonical: Option<&'a crate::solver::identifiability_canonical::CanonicalSpecs>,
-    result_specs: &'a [ParameterBlockSpec],
-    penalized_objective: f64,
-    outer_iterations: usize,
-    outer_gradient_norm: Option<f64>,
-    criterion_certificate: Option<crate::solver::outer_strategy::CriterionCertificate>,
-    outer_converged: bool,
-    context: &'static str,
+    pub(crate) rho_physical: Array1<f64>,
+    pub(crate) covariance_conditional: Option<Array2<f64>>,
+    pub(crate) geometry: Option<FitGeometry>,
+    pub(crate) canonical: Option<&'a crate::solver::identifiability_canonical::CanonicalSpecs>,
+    pub(crate) result_specs: &'a [ParameterBlockSpec],
+    pub(crate) penalized_objective: f64,
+    pub(crate) outer_iterations: usize,
+    pub(crate) outer_gradient_norm: Option<f64>,
+    pub(crate) criterion_certificate: Option<crate::solver::outer_strategy::CriterionCertificate>,
+    pub(crate) outer_converged: bool,
+    pub(crate) context: &'static str,
 }
 
 pub(crate) fn assemble_custom_family_fit_result(
@@ -1242,8 +1242,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         Err(_) => true,
     };
     if outer_needs_audit {
-        const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
-        const OUTER_FD_AUDIT_MAX_RHO_DIM: usize = 32;
+        pub(crate) const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
+        pub(crate) const OUTER_FD_AUDIT_MAX_RHO_DIM: usize = 32;
         let audit_n = specs.iter().map(|s| s.design.nrows()).max().unwrap_or(0);
         if n_rho >= 1 && n_rho <= OUTER_FD_AUDIT_MAX_RHO_DIM && audit_n <= OUTER_FD_AUDIT_MAX_N {
             log::warn!(
@@ -1535,7 +1535,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                             // that produced essentially no independent information
                             // about the posterior is caught independent of model
                             // size.
-                            const RHAT_MIXED_MAX: f64 = 1.05;
+                            pub(crate) const RHAT_MIXED_MAX: f64 = 1.05;
                             let ess_floor = (10.0 * dim as f64).max(50.0);
                             let rhat = posterior.rhat;
                             let ess = posterior.ess;

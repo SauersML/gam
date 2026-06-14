@@ -27,7 +27,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     refresh_all_block_etas(family, specs, &mut states)?;
     let total_joint_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     let total_joint_n = joint_observation_count(&states);
-    const INNER_PRELUDE_LOG_MIN_N: usize = 100_000;
+    pub(crate) const INNER_PRELUDE_LOG_MIN_N: usize = 100_000;
     let prelude_log = total_joint_n >= INNER_PRELUDE_LOG_MIN_N;
     if prelude_log {
         log::info!(
@@ -452,7 +452,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // convergence events) keep the full detail. JOINT_LOG_VERBOSE_PERIOD is
         // tuned so a 200-cycle inner solve emits ~10 detailed waypoints plus
         // 1 compact line per remaining cycle (~210 lines), down from ~800.
-        const JOINT_LOG_VERBOSE_PERIOD: usize = 50;
+        pub(crate) const JOINT_LOG_VERBOSE_PERIOD: usize = 50;
         // Residual-stall detector for joint Newton. Distinct from the
         // blockwise loglik-frozen divergence detector lower in the file:
         // that one requires the log-likelihood to be unchanged for K
@@ -476,10 +476,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // the outer optimizer sees a non-converged signal while we still
         // have a finite, in-range β to return (instead of running to the
         // hard ceiling and then handing BFGS a junk gradient).
-        const RESIDUAL_STALL_NO_IMPROVE_CYCLES: usize = 30;
-        const RESIDUAL_STALL_MIN_CYCLES: usize = 40;
-        const RESIDUAL_STALL_IMPROVEMENT_FACTOR: f64 = 0.9;
-        const RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR: f64 = 50.0;
+        pub(crate) const RESIDUAL_STALL_NO_IMPROVE_CYCLES: usize = 30;
+        pub(crate) const RESIDUAL_STALL_MIN_CYCLES: usize = 40;
+        pub(crate) const RESIDUAL_STALL_IMPROVEMENT_FACTOR: f64 = 0.9;
+        pub(crate) const RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR: f64 = 50.0;
         let mut best_residual_seen: f64 = f64::INFINITY;
         // Smallest *certified* stationarity residual the solve actually computed,
         // tracked independently of `best_residual_seen` (whose updates are bound
@@ -523,7 +523,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // early (gam#787 duchon centers≥20: the logslope block converges
         // geometrically — residual ~0.33×/cycle — but `linearized_rel ≥ 0.5`
         // routed it into the plateau-refusal break a few cycles short of tol).
-        const RESIDUAL_DESCENT_WINDOW: usize = 3;
+        pub(crate) const RESIDUAL_DESCENT_WINDOW: usize = 3;
         let mut residual_descent_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(RESIDUAL_DESCENT_WINDOW);
         let mut tr_clamped_during_stall: bool = false;
@@ -553,7 +553,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // the max. After `FULLY_REJECTED_STALL_MAX_CYCLES` consecutive cycles
         // with both conditions, exit non-converged so the outer optimizer
         // rejects this ρ cleanly instead of waiting for the cycle cap.
-        const FULLY_REJECTED_STALL_MAX_CYCLES: usize = 8;
+        pub(crate) const FULLY_REJECTED_STALL_MAX_CYCLES: usize = 8;
         let mut prev_rejected_trust_radius: Option<f64> = None;
         let mut consecutive_held_rejected_cycles: usize = 0;
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
@@ -602,7 +602,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // earlier than waiting for any single |Δobj| to individually
         // cross obj_tol — the bound is mathematically the same precision
         // contract, applied to the asymptotic tail rather than one step.
-        const GEOMETRIC_TAIL_WINDOW: usize = 5;
+        pub(crate) const GEOMETRIC_TAIL_WINDOW: usize = 5;
         let mut geometric_tail_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(GEOMETRIC_TAIL_WINDOW);
 
@@ -1721,7 +1721,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // is not a descent direction for the penalized quadratic model,
             // switch once to a diagonally preconditioned gradient step and keep
             // the same exact full-objective accept/reject test.
-            const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
+            pub(crate) const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
             let mut search_delta = delta.clone();
             let search_joint_active_set: Option<Vec<usize>> = joint_active_set.clone();
             let mut tried_preconditioned_descent = false;
@@ -4536,7 +4536,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     // initial seed value is the family-declared safe step for a fresh fit; the
     // function then adapts it freely (clamped to [1e-12, 1e6] by the function
     // itself, same as the joint path).
-    const BLOCK_NEWTON_STEP_INITIAL: f64 = 20.0;
+    pub(crate) const BLOCK_NEWTON_STEP_INITIAL: f64 = 20.0;
     let mut block_max_step: Vec<f64> = vec![BLOCK_NEWTON_STEP_INITIAL; specs.len()];
 
     let mut prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
@@ -4558,7 +4558,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     // and require that `step_clamped` was observed AT LEAST ONCE inside
     // the frozen run (rather than EVERY cycle).
     let mut clamped_step_in_frozen_run: bool = false;
-    const DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
+    pub(crate) const DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
 
     let is_dynamic = family.block_geometry_is_dynamic();
     for cycle in 0..inner_max_cycles {
@@ -5139,7 +5139,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
 /// solver failure, residual-tolerance reached, line-search failure) and the
 /// inner backtracking-search `continue` are preserved verbatim. Mutates `states`,
 /// `cached_eval`, `current_penalty`, and `converged` in place exactly as before.
-fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -5176,7 +5176,7 @@ fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + 'static>(
     // Allow up to a few polishing steps. The blockwise endpoint is close
     // to optimum, so step sizes should be small and line search should
     // accept full steps quickly.
-    const POLISH_MAX_ITER: usize = 16;
+    pub(crate) const POLISH_MAX_ITER: usize = 16;
     for _polish_iter in 0..POLISH_MAX_ITER {
         // Re-evaluate at current β to get the joint gradient and Hessian.
         refresh_all_block_etas(family, specs, states)?;
@@ -5386,7 +5386,7 @@ fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// returned [`BlockwiseInnerResult`]. Behavior is identical to the inline code it
 /// replaced — the `?`-propagation and the `converged`-gate on `kkt_residual` are
 /// preserved verbatim.
-fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     mut states: Vec<ParameterBlockState>,
@@ -5484,9 +5484,9 @@ fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'stat
 /// By the implicit function theorem, `dβ̂/dρ_k = −v_k`. The stored `compute_dh`
 /// expects the actual perturbation direction `δβ`, so we negate `v_k` before calling it.
 pub(crate) struct BorrowedJointDerivProvider<'a> {
-    compute_dh: &'a DriftDerivFn<'a>,
-    compute_dh_many: Option<&'a DriftDerivManyFn<'a>>,
-    compute_d2h: &'a DriftSecondDerivFn<'a>,
+    pub(crate) compute_dh: &'a DriftDerivFn<'a>,
+    pub(crate) compute_dh_many: Option<&'a DriftDerivManyFn<'a>>,
+    pub(crate) compute_d2h: &'a DriftSecondDerivFn<'a>,
     /// Optional batched second-derivative callback. The unified evaluator's
     /// outer-Hessian ρ-ρ pair loop precomputes all K(K+1)/2 (v_k, v_l, u_kl)
     /// triples and calls this once per outer Hessian assembly when set, so
@@ -5495,8 +5495,8 @@ pub(crate) struct BorrowedJointDerivProvider<'a> {
     /// K(K+1)/2 separate row-walks with one. The default `None` falls back
     /// to the per-pair `compute_d2h` dispatch and preserves the historical
     /// dispatch cost.
-    compute_d2h_many: Option<&'a DriftSecondDerivManyFn<'a>>,
-    family_outer_hessian_operator:
+    pub(crate) compute_d2h_many: Option<&'a DriftSecondDerivManyFn<'a>>,
+    pub(crate) family_outer_hessian_operator:
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
 }
 
@@ -5643,25 +5643,25 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
 }
 
 pub(crate) struct OwnedJointDerivProvider {
-    compute_dh: Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
-    compute_dh_many: Option<
+    pub(crate) compute_dh: Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
+    pub(crate) compute_dh_many: Option<
         Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync>,
     >,
-    compute_d2h: Arc<
+    pub(crate) compute_d2h: Arc<
         dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
             + Send
             + Sync,
     >,
     /// Optional batched second-derivative callback. See the matching field on
     /// `BorrowedJointDerivProvider` for the dispatch contract.
-    compute_d2h_many: Option<
+    pub(crate) compute_d2h_many: Option<
         Arc<
             dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>
                 + Send
                 + Sync,
         >,
     >,
-    family_outer_hessian_operator:
+    pub(crate) family_outer_hessian_operator:
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
 }
 
@@ -5819,13 +5819,13 @@ pub(crate) type JeffreysHphiDriftFn =
 /// We negate before invoking the drift closure, so `corr = + D_β H_Φ[δβ]` is
 /// added on top of the inner provider's already-correct likelihood drift.
 pub(crate) struct JeffreysHphiAwareJointDerivatives<'a> {
-    inner: Box<dyn HessianDerivativeProvider + 'a>,
-    drift: JeffreysHphiDriftFn,
-    p: usize,
+    pub(crate) inner: Box<dyn HessianDerivativeProvider + 'a>,
+    pub(crate) drift: JeffreysHphiDriftFn,
+    pub(crate) p: usize,
 }
 
 impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
-    fn new(
+    pub(crate) fn new(
         inner: Box<dyn HessianDerivativeProvider + 'a>,
         drift: JeffreysHphiDriftFn,
         p: usize,
@@ -5834,7 +5834,7 @@ impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
     }
 
     /// `D_β H_Φ[δβ]` with the trait's `v_k → δβ = −v_k` mode-response convention.
-    fn hphi_drift(&self, v_k: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+    pub(crate) fn hphi_drift(&self, v_k: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
         let delta = v_k.mapv(|value| -value);
         (self.drift)(&delta)
     }
@@ -5992,22 +5992,22 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
 /// Optional bundle of extended (ψ) hyperparameter coordinate data to attach
 /// to an `InnerSolution` before calling the unified evaluator.
 pub(crate) struct ExtCoordBundle {
-    coords: Vec<HyperCoord>,
-    ext_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
-    rho_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
-    drift_fn: Option<FixedDriftDerivFn>,
+    pub(crate) coords: Vec<HyperCoord>,
+    pub(crate) ext_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    pub(crate) rho_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    pub(crate) drift_fn: Option<FixedDriftDerivFn>,
     /// Direction-contracted ψψ second-order hook (#740). When `Some`, the
     /// outer-Hessian operator builder skips the `K²` per-pair ψψ assembly
     /// (`ext_ext_fn`) and applies this once per matvec. `ext_ext_fn` is still
     /// kept as the documented fallback for the dense `compute_outer_hessian`
     /// path and for outer evaluations that do not build the matrix-free
     /// operator.
-    contracted_psi_fn: Option<ContractedPsiSecondOrderFn>,
+    pub(crate) contracted_psi_fn: Option<ContractedPsiSecondOrderFn>,
 }
 
 pub(crate) struct ScaledHyperOperator {
-    inner: Arc<dyn HyperOperator>,
-    scale: f64,
+    pub(crate) inner: Arc<dyn HyperOperator>,
+    pub(crate) scale: f64,
 }
 
 impl HyperOperator for ScaledHyperOperator {
@@ -6103,7 +6103,7 @@ pub(crate) fn scale_drift_deriv_result(result: DriftDerivResult, scale: f64) -> 
 }
 
 impl ExtCoordBundle {
-    fn scaled(self, scale: f64) -> Self {
+    pub(crate) fn scaled(self, scale: f64) -> Self {
         if scale == 1.0 {
             return self;
         }
@@ -6278,23 +6278,23 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
 }
 
 pub(crate) struct FirstOrderTraceSkipOperator {
-    inner: Arc<dyn HessianOperator>,
-    remaining_first_order_traces: AtomicUsize,
+    pub(crate) inner: Arc<dyn HessianOperator>,
+    pub(crate) remaining_first_order_traces: AtomicUsize,
 }
 
 impl FirstOrderTraceSkipOperator {
-    fn new(inner: Arc<dyn HessianOperator>, skip_count: usize) -> Self {
+    pub(crate) fn new(inner: Arc<dyn HessianOperator>, skip_count: usize) -> Self {
         Self {
             inner,
             remaining_first_order_traces: AtomicUsize::new(skip_count),
         }
     }
 
-    fn first_order_skip_active(&self) -> bool {
+    pub(crate) fn first_order_skip_active(&self) -> bool {
         self.remaining_first_order_traces.load(Ordering::Acquire) > 0
     }
 
-    fn consume_first_order_trace(&self) -> bool {
+    pub(crate) fn consume_first_order_trace(&self) -> bool {
         let mut current = self.remaining_first_order_traces.load(Ordering::Acquire);
         while current > 0 {
             match self.remaining_first_order_traces.compare_exchange(
@@ -8053,23 +8053,23 @@ impl std::fmt::Debug for BlockwiseInnerResult {
 
 #[derive(Clone)]
 pub(crate) struct ConstrainedWarmStart {
-    rho: Array1<f64>,
-    block_beta: Vec<Array1<f64>>,
-    active_sets: Vec<Option<Vec<usize>>>,
-    cached_inner: Option<CachedInnerMode>,
+    pub(crate) rho: Array1<f64>,
+    pub(crate) block_beta: Vec<Array1<f64>>,
+    pub(crate) active_sets: Vec<Option<Vec<usize>>>,
+    pub(crate) cached_inner: Option<CachedInnerMode>,
 }
 
 #[derive(Clone)]
 pub(crate) struct CachedInnerMode {
-    log_likelihood: f64,
-    penalty_value: f64,
-    cycles: usize,
-    converged: bool,
-    block_logdet_h: f64,
-    block_logdet_s: f64,
-    joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-    kkt_residual: Option<crate::estimate::reml::unified::ProjectedKktResidual>,
-    active_constraints: Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
+    pub(crate) log_likelihood: f64,
+    pub(crate) penalty_value: f64,
+    pub(crate) cycles: usize,
+    pub(crate) converged: bool,
+    pub(crate) block_logdet_h: f64,
+    pub(crate) block_logdet_s: f64,
+    pub(crate) joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    pub(crate) kkt_residual: Option<crate::estimate::reml::unified::ProjectedKktResidual>,
+    pub(crate) active_constraints: Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 }
 
 pub(crate) fn screened_outer_warm_start<'a>(
@@ -8777,7 +8777,7 @@ pub(crate) fn checked_penalizedobjective(
 
 #[derive(Clone)]
 pub struct CustomFamilyWarmStart {
-    inner: ConstrainedWarmStart,
+    pub(crate) inner: ConstrainedWarmStart,
 }
 
 impl CustomFamilyWarmStart {
@@ -8851,14 +8851,14 @@ impl CustomFamilyWarmStart {
 }
 
 pub(crate) struct CustomOuterState {
-    warm_cache: Option<ConstrainedWarmStart>,
-    reset_warm_cache: Option<ConstrainedWarmStart>,
-    last_error: Option<String>,
-    initial_gradient_norm: Option<f64>,
+    pub(crate) warm_cache: Option<ConstrainedWarmStart>,
+    pub(crate) reset_warm_cache: Option<ConstrainedWarmStart>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) initial_gradient_norm: Option<f64>,
 }
 
 impl CustomOuterState {
-    fn new(warm_start: Option<ConstrainedWarmStart>) -> Self {
+    pub(crate) fn new(warm_start: Option<ConstrainedWarmStart>) -> Self {
         Self {
             warm_cache: warm_start.clone(),
             reset_warm_cache: warm_start,
@@ -8867,11 +8867,11 @@ impl CustomOuterState {
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.warm_cache = self.reset_warm_cache.clone();
     }
 
-    fn seed_cached_beta(
+    pub(crate) fn seed_cached_beta(
         &mut self,
         rho_dim: usize,
         specs: &[ParameterBlockSpec],
@@ -8909,11 +8909,11 @@ pub struct CustomFamilyJointHyperEfsResult {
 }
 
 pub(crate) struct OuterObjectiveEvalResult {
-    objective: f64,
-    gradient: Array1<f64>,
-    outer_hessian: crate::solver::outer_strategy::HessianResult,
-    warm_start: ConstrainedWarmStart,
-    inner_converged: bool,
+    pub(crate) objective: f64,
+    pub(crate) gradient: Array1<f64>,
+    pub(crate) outer_hessian: crate::solver::outer_strategy::HessianResult,
+    pub(crate) warm_start: ConstrainedWarmStart,
+    pub(crate) inner_converged: bool,
 }
 
 pub(crate) fn outer_eval_result_to_joint_hyper_result(
@@ -8931,7 +8931,7 @@ pub(crate) fn outer_eval_result_to_joint_hyper_result(
 }
 
 pub(crate) struct OwnedDenseOuterHessianOperator {
-    matrix: Array2<f64>,
+    pub(crate) matrix: Array2<f64>,
 }
 
 impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHessianOperator {
@@ -8988,17 +8988,17 @@ impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHess
 }
 
 pub(crate) struct LabeledOuterHessianOperator {
-    base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
-    physical_to_outer: Vec<Option<usize>>,
-    outer_dim: usize,
+    pub(crate) base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+    pub(crate) physical_to_outer: Vec<Option<usize>>,
+    pub(crate) outer_dim: usize,
     /// Scratch buffers reused across `apply_into` calls to avoid
     /// per-call allocation of the permuted input and output vectors.
     /// `(physical_in, physical_out)`, each of length `physical_to_outer.len()`.
-    scratch: std::sync::Mutex<(ndarray::Array1<f64>, ndarray::Array1<f64>)>,
+    pub(crate) scratch: std::sync::Mutex<(ndarray::Array1<f64>, ndarray::Array1<f64>)>,
 }
 
 impl LabeledOuterHessianOperator {
-    fn new(
+    pub(crate) fn new(
         base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
         layout: &PenaltyLabelLayout,
     ) -> Self {
@@ -9336,18 +9336,18 @@ pub(crate) fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PenaltyLabelLayout {
-    penalty_counts: Vec<usize>,
-    physical_to_outer: Vec<Option<usize>>,
-    fixed_log_lambdas: Vec<Option<f64>>,
-    initial_rho: Array1<f64>,
+    pub(crate) penalty_counts: Vec<usize>,
+    pub(crate) physical_to_outer: Vec<Option<usize>>,
+    pub(crate) fixed_log_lambdas: Vec<Option<f64>>,
+    pub(crate) initial_rho: Array1<f64>,
 }
 
 impl PenaltyLabelLayout {
-    fn physical_count(&self) -> usize {
+    pub(crate) fn physical_count(&self) -> usize {
         self.physical_to_outer.len()
     }
 
-    fn has_tied_coordinates(&self) -> bool {
+    pub(crate) fn has_tied_coordinates(&self) -> bool {
         self.initial_rho.len() != self.physical_to_outer.len()
     }
 }

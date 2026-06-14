@@ -11,7 +11,7 @@ use ndarray::{Array1, Array2, ArrayView2};
 /// finite-precision accumulation in evaluating the slack at the I-spline
 /// breakpoints, so a coefficient that is feasible up to a few ulps is not
 /// spuriously rejected. Anything more negative is a genuine violation.
-const MONOTONICITY_SLACK_ROUNDOFF_TOL: f64 = -1e-10;
+pub(crate) const MONOTONICITY_SLACK_ROUNDOFF_TOL: f64 = -1e-10;
 
 /// Typed errors emitted by the deviation runtime construction and evaluation
 /// helpers in this module.
@@ -100,7 +100,7 @@ pub enum ParametricAnchorBlock {
     Logslope,
 }
 
-fn integrate_polynomial_product(left: &[f64], right: &[f64], width: f64) -> f64 {
+pub(crate) fn integrate_polynomial_product(left: &[f64], right: &[f64], width: f64) -> f64 {
     let mut total = 0.0;
     for (left_power, &left_coeff) in left.iter().enumerate() {
         for (right_power, &right_coeff) in right.iter().enumerate() {
@@ -125,29 +125,29 @@ fn integrate_polynomial_product(left: &[f64], right: &[f64], width: f64) -> f64 
 /// on each span's quadratic Bernstein controls for `w'(x)`.
 #[derive(Clone, Debug)]
 pub struct DeviationRuntime {
-    degree: usize,
-    value_span_degree: usize,
-    basis_dim: usize,
-    monotonicity_eps: f64,
-    endpoint_points: Array1<f64>,
-    span_c0: Array2<f64>,
-    span_c1: Array2<f64>,
-    span_c2: Array2<f64>,
-    span_c3: Array2<f64>,
-    monotonicity_constraint_rows: Array2<f64>,
+    pub(crate) degree: usize,
+    pub(crate) value_span_degree: usize,
+    pub(crate) basis_dim: usize,
+    pub(crate) monotonicity_eps: f64,
+    pub(crate) endpoint_points: Array1<f64>,
+    pub(crate) span_c0: Array2<f64>,
+    pub(crate) span_c1: Array2<f64>,
+    pub(crate) span_c2: Array2<f64>,
+    pub(crate) span_c3: Array2<f64>,
+    pub(crate) monotonicity_constraint_rows: Array2<f64>,
     /// Deviation basis values at the rightmost breakpoint (1 × basis_dim).
     /// Used for constant-tail continuation outside support: the deviation
     /// saturates at this value for all z > right endpoint.
-    right_boundary_value_row: Array1<f64>,
+    pub(crate) right_boundary_value_row: Array1<f64>,
     /// Cross-block installed flex block. `None` until
     /// `install_compiled_flex_block` is called.
-    installed_flex_block: Option<InstalledFlexBlock>,
+    pub(crate) installed_flex_block: Option<InstalledFlexBlock>,
     /// Stacked parametric-anchor rows at training rows (n × d). Used by
     /// `design_at_training_with_residual` to rebuild `block.design` after
     /// orthogonalisation. Dropped before serialisation; predict-time
     /// reconstruction rebuilds anchor rows fresh at the predict-time
     /// feature rows.
-    anchor_rows_at_training: Option<Array2<f64>>,
+    pub(crate) anchor_rows_at_training: Option<Array2<f64>>,
 }
 
 /// Build the integrated derivative penalty matrix `P` on the *raw* I-spline
@@ -166,7 +166,7 @@ pub struct DeviationRuntime {
 /// raw cubic span coefficients, so it can be evaluated *before* the basis
 /// transform `Z` is constructed (which is what we need to compute `Z`
 /// itself).
-fn raw_integrated_derivative_penalty(
+pub(crate) fn raw_integrated_derivative_penalty(
     endpoint_points: &Array1<f64>,
     raw_span_c0: &Array2<f64>,
     raw_span_c1: &Array2<f64>,
@@ -227,7 +227,7 @@ fn raw_integrated_derivative_penalty(
 /// of raw basis function `basis_idx` on its parametric coordinate `t`. Mirrors
 /// `DeviationRuntime::span_derivative_polynomial_coefficients` but on raw
 /// coefficients so it's callable before `Z` exists.
-fn raw_span_derivative_polynomial_coefficients(
+pub(crate) fn raw_span_derivative_polynomial_coefficients(
     span_idx: usize,
     basis_idx: usize,
     derivative_order: usize,
@@ -261,7 +261,7 @@ fn raw_span_derivative_polynomial_coefficients(
 /// of degree < `derivative_order` — that direction is structurally absent
 /// from the parameterization. This is the β-independent identifiability
 /// constraint that replaces the data-distribution-dependent moment anchor.
-fn smoothness_nullspace_orthogonal_complement(
+pub(crate) fn smoothness_nullspace_orthogonal_complement(
     raw_penalty: &Array2<f64>,
 ) -> Result<Array2<f64>, String> {
     let n = raw_penalty.nrows();
@@ -302,7 +302,7 @@ fn smoothness_nullspace_orthogonal_complement(
     Ok(z)
 }
 
-fn build_quadratic_derivative_bernstein_constraints(
+pub(crate) fn build_quadratic_derivative_bernstein_constraints(
     endpoint_points: &Array1<f64>,
     span_c1: &Array2<f64>,
     span_c2: &Array2<f64>,

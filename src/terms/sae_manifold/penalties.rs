@@ -79,7 +79,7 @@ impl SaeManifoldTerm {
         out
     }
 
-    fn add_sae_beta_penalty(
+    pub(crate) fn add_sae_beta_penalty(
         &self,
         sys: &mut ArrowSchurSystem,
         penalty: &AnalyticPenaltyKind,
@@ -206,7 +206,7 @@ impl SaeManifoldTerm {
     /// The Hessian probe only needs to sweep that segment, and its support is
     /// likewise confined to `[start, end)`, so the inner accumulation is
     /// quadratic in the atom's block size rather than the full β dimension.
-    fn add_sae_mech_sparsity_atom(
+    pub(crate) fn add_sae_mech_sparsity_atom(
         &self,
         sys: &mut ArrowSchurSystem,
         per_atom: &MechanismSparsityPenalty,
@@ -253,7 +253,7 @@ impl SaeManifoldTerm {
     /// directly and the returned vectors are local (length `M_k*p`). The PSD
     /// curvature is probed via `psd_majorizer_hvp`, which for NuclearNorm has
     /// no diagonal majorizer and delegates to its analytic spectral HVP.
-    fn add_sae_nuclear_norm_atom(
+    pub(crate) fn add_sae_nuclear_norm_atom(
         &self,
         sys: &mut ArrowSchurSystem,
         per_atom: &NuclearNormPenalty,
@@ -537,7 +537,7 @@ impl SaeManifoldTerm {
         Ok(AnalyticPenaltyKind::Isometry(Arc::new(corrected)))
     }
 
-    fn add_sae_coord_penalty(
+    pub(crate) fn add_sae_coord_penalty(
         &self,
         sys: &mut ArrowSchurSystem,
         atom_idx: usize,
@@ -639,7 +639,7 @@ impl SaeManifoldTerm {
         }
     }
 
-    fn add_sae_isometry_metric_gn_blocks(
+    pub(crate) fn add_sae_isometry_metric_gn_blocks(
         &self,
         sys: &mut ArrowSchurSystem,
         atom_idx: usize,
@@ -802,7 +802,7 @@ impl SaeManifoldTerm {
         }
     }
 
-    fn sae_isometry_weighted_jacobian_row(
+    pub(crate) fn sae_isometry_weighted_jacobian_row(
         corrected: &IsometryPenalty,
         jac: &Array2<f64>,
         row: usize,
@@ -867,7 +867,7 @@ impl SaeManifoldTerm {
     /// atom's contribution lands in its own decoder span. The isometry penalty is
     /// unscaled at the row-block (Psi) tier — mirroring its coord-block routing
     /// and `analytic_penalty_value_total` — so no `penalty_scale` is applied here.
-    fn add_sae_isometry_beta_penalty(
+    pub(crate) fn add_sae_isometry_beta_penalty(
         &self,
         sys: &mut ArrowSchurSystem,
         atom_idx: usize,

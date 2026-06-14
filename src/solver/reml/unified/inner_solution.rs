@@ -271,7 +271,7 @@ pub struct InnerSolutionBuilder<'dp> {
     pub(crate) penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
     pub(crate) rho_curvature_scale: f64,
     pub(crate) rho_prior: crate::types::RhoPrior,
-    nullspace_dim_override: Option<f64>,
+    pub(crate) nullspace_dim_override: Option<f64>,
     // Extended hyperparameter coordinates
     pub(crate) ext_coords: Vec<HyperCoord>,
     pub(crate) ext_coord_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,

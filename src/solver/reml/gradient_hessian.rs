@@ -1389,9 +1389,9 @@ impl<'a> RemlState<'a> {
 
         #[derive(Clone)]
         pub(crate) struct Jet {
-            v: f64,
-            g: Array1<f64>,
-            h: Array2<f64>,
+            pub(crate) v: f64,
+            pub(crate) g: Array1<f64>,
+            pub(crate) h: Array2<f64>,
         }
         impl Jet {
             pub(crate) fn constant(v: f64, k: usize) -> Self {

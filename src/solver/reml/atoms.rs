@@ -530,7 +530,7 @@ mod tests {
     /// `intrinsic_hessian_pseudo_logdet_parts` emits, so the test pins the
     /// atom's contract against the production kernel, not a re-derivation.
     #[test]
-    fn hessian_logdet_atom_emits_closed_form_value_and_directional_derivative() {
+    pub(crate) fn hessian_logdet_atom_emits_closed_form_value_and_directional_derivative() {
         // σ = (2, 4) ⇒ H⁺ = diag(1/2, 1/4), log|H|₊ = ln 2 + ln 4 = ln 8.
         let kernel = Arc::new(PenaltySubspaceTrace {
             u_s: array![[1.0, 0.0], [0.0, 1.0]],

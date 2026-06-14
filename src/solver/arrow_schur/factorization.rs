@@ -84,7 +84,7 @@ pub(crate) fn try_factor_blocks_batched(
 }
 
 
-fn row_block_diag_scale(row: &ArrowRowBlock, d: usize) -> f64 {
+pub(crate) fn row_block_diag_scale(row: &ArrowRowBlock, d: usize) -> f64 {
     (0..d)
         .map(|a| row.htt[[a, a]].abs())
         .fold(0.0_f64, f64::max)
@@ -128,7 +128,7 @@ pub(crate) fn cholesky_factor_kappa_estimate(factor: &Array2<f64>) -> f64 {
 /// The diagonal-ratio κ proxy is blind for scalar blocks: every positive
 /// `1×1` factor has κ=1 even when the pivot is tiny. This pivot floor catches
 /// absolute near-singularity relative to the row block scale.
-fn cholesky_factor_min_pivot_estimate(factor: &Array2<f64>) -> f64 {
+pub(crate) fn cholesky_factor_min_pivot_estimate(factor: &Array2<f64>) -> f64 {
     let d = factor.nrows();
     if d == 0 {
         return 0.0;
@@ -153,7 +153,7 @@ pub(crate) fn safe_spd_pivot_min(diag_scale: f64) -> f64 {
 }
 
 
-fn cholesky_factor_passes_safe_inversion(
+pub(crate) fn cholesky_factor_passes_safe_inversion(
     factor: &Array2<f64>,
     dim: usize,
     diag_scale: f64,
@@ -177,7 +177,7 @@ pub(crate) fn safe_spd_kappa_max(dim: usize) -> f64 {
 }
 
 
-fn factor_row_block_cholesky(
+pub(crate) fn factor_row_block_cholesky(
     row: &ArrowRowBlock,
     ridge_eff: f64,
     d: usize,
@@ -259,7 +259,7 @@ pub(crate) fn factor_row_block_cholesky_fixed<const D: usize>(
 }
 
 
-fn row_gauge_curvature(row: &ArrowRowBlock, d: usize, gauge: &Array1<f64>) -> Option<f64> {
+pub(crate) fn row_gauge_curvature(row: &ArrowRowBlock, d: usize, gauge: &Array1<f64>) -> Option<f64> {
     if gauge.len() != d {
         return None;
     }
@@ -279,7 +279,7 @@ pub(crate) fn factor_gauge_deflated_evidence_row(
     d: usize,
     gauges: &[Array1<f64>],
 ) -> Option<ArrowRowFactorResult> {
-    const GAUGE_RAYLEIGH_EPS: f64 = 1.0e-8;
+    pub(crate) const GAUGE_RAYLEIGH_EPS: f64 = 1.0e-8;
     if gauges.is_empty() {
         return None;
     }
@@ -395,7 +395,7 @@ pub(crate) const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
 /// `floor` (a true rank deficiency, `λ ≪ floor·(1−ε)`), so it is still deflated
 /// exactly as before — the converged result is unchanged wherever the old path
 /// already deflated a clearly-flat or indefinite direction.
-const SPECTRAL_DEFLATION_HYSTERESIS_FRACTION: f64 = 1.0e-2;
+pub(crate) const SPECTRAL_DEFLATION_HYSTERESIS_FRACTION: f64 = 1.0e-2;
 
 
 /// Unit-stiffness **spectral** Faddeev-Popov conditioning of a per-row evidence
@@ -731,10 +731,10 @@ pub(crate) fn factor_one_row_result(
     // diagonal magnitude), multiplies geometrically each rejection, and is
     // capped at a large multiple of the base scale so a genuinely broken block
     // surfaces as an error instead of looping forever.
-    const RIDGE_GROWTH_FACTOR: f64 = 10.0;
-    const RIDGE_SEED_DIAG_FRACTION: f64 = 1.0e-10;
-    const RIDGE_CAP_DIAG_FRACTION: f64 = 1.0e-12;
-    const RIDGE_CAP_SCALE: f64 = 1.0e12;
+    pub(crate) const RIDGE_GROWTH_FACTOR: f64 = 10.0;
+    pub(crate) const RIDGE_SEED_DIAG_FRACTION: f64 = 1.0e-10;
+    pub(crate) const RIDGE_CAP_DIAG_FRACTION: f64 = 1.0e-12;
+    pub(crate) const RIDGE_CAP_SCALE: f64 = 1.0e12;
     let diag_scale = row_block_diag_scale(row, d);
     let ridge_cap = ridge_t.max(RIDGE_CAP_DIAG_FRACTION * diag_scale) * RIDGE_CAP_SCALE;
     let mut ridge_eff = ridge_t;
@@ -1084,7 +1084,7 @@ pub(crate) fn cross_row_penalty_fingerprint(
 }
 
 
-fn write_latent_manifold(hasher: &mut Fingerprinter, manifold: &LatentManifold) {
+pub(crate) fn write_latent_manifold(hasher: &mut Fingerprinter, manifold: &LatentManifold) {
     match manifold {
         LatentManifold::Euclidean => {
             hasher.write_str("euclidean");
@@ -1124,7 +1124,7 @@ fn write_latent_manifold(hasher: &mut Fingerprinter, manifold: &LatentManifold) 
 }
 
 
-fn append_latent_metric_weights(out: &mut Vec<f64>, manifold: &LatentManifold) {
+pub(crate) fn append_latent_metric_weights(out: &mut Vec<f64>, manifold: &LatentManifold) {
     match manifold {
         LatentManifold::Euclidean => out.push(1.0),
         LatentManifold::Circle { period } => {

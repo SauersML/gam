@@ -344,7 +344,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
 /// designs). Mirrors what the per-row reference path does row-by-row,
 /// but as `rank` batched mat-vec products so the underlying operator
 /// can amortise per-call dispatch.
-fn axis_jf_via_column_dot(
+pub(crate) fn axis_jf_via_column_dot(
     design: &crate::linalg::matrix::DesignMatrix,
     f_block: &Array2<f64>,
     n_rows: usize,
@@ -448,7 +448,7 @@ where
 mod early_exit_soundness_tests {
     use super::*;
 
-    fn full_data_rows(n: usize) -> Vec<WeightedOuterRow> {
+    pub(crate) fn full_data_rows(n: usize) -> Vec<WeightedOuterRow> {
         (0..n)
             .map(|index| WeightedOuterRow {
                 index,
@@ -463,7 +463,7 @@ mod early_exit_soundness_tests {
     /// exit is a valid reject certificate: it rejects iff the full NLL exceeds
     /// the threshold and otherwise returns the exact LL.
     #[test]
-    fn full_data_early_exit_is_a_valid_reject_certificate() {
+    pub(crate) fn full_data_early_exit_is_a_valid_reject_certificate() {
         // Each row contributes log Φ = -1.0, i.e. NLL contribution 1.0; full
         // NLL over 100 rows is exactly 100.
         let rows = full_data_rows(100);
@@ -492,7 +492,7 @@ mod early_exit_soundness_tests {
     /// only ever pass the full-data row set — the auto line-search subsample
     /// that used to violate this was removed.
     #[test]
-    fn ht_subsample_against_full_data_threshold_can_falsely_reject() {
+    pub(crate) fn ht_subsample_against_full_data_threshold_can_falsely_reject() {
         // True per-row NLL: rows 0..10 contribute 10 each, rows 10..100
         // contribute 0. Full-data NLL = 100.
         let row_ll = |i: usize| -> Result<f64, String> { if i < 10 { Ok(-10.0) } else { Ok(0.0) } };

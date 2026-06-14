@@ -120,7 +120,7 @@ pub(super) struct GamModelFinalState {
 
 
 impl<'a> GamWorkingModel<'a> {
-    fn new(
+    pub(crate) fn new(
         x_transformed: Option<DesignMatrix>,
         x_original: DesignMatrix,
         coordinate_frame: PirlsCoordinateFrame,
@@ -201,7 +201,7 @@ impl<'a> GamWorkingModel<'a> {
 
     /// Set per-observation SE for integrated (GHQ) likelihood.
     /// When set, the working model uses uncertainty-aware IRLS updates.
-    fn with_covariate_se(mut self, se: Array1<f64>) -> Self {
+    pub(crate) fn with_covariate_se(mut self, se: Array1<f64>) -> Self {
         self.covariate_se = Some(se);
         self
     }
@@ -213,7 +213,7 @@ impl<'a> GamWorkingModel<'a> {
     /// (for canonical links where observed = Fisher). These flow into the outer
     /// REML H = X'W_obs X + S, ensuring log|H| uses the correct Laplace curvature.
     /// See response.md Section 3 for the mathematical justification.
-    fn into_final_state(self) -> GamModelFinalState {
+    pub(crate) fn into_final_state(self) -> GamModelFinalState {
         let GamWorkingModel {
             coordinate_design,
             lastmu,
@@ -259,14 +259,14 @@ impl<'a> GamWorkingModel<'a> {
 
     /// Compute X_transformed * β into a pre-allocated buffer, avoiding
     /// per-iteration allocation in the dense case.
-    fn transformed_matvec_into(&self, beta: &Coefficients, out: &mut Array1<f64>) {
+    pub(crate) fn transformed_matvec_into(&self, beta: &Coefficients, out: &mut Array1<f64>) {
         self.transformed_matvec_array_into(beta.as_ref(), out);
     }
 
     /// View-based sibling of `transformed_matvec_into` that operates on a raw
     /// `&Array1<f64>` to avoid wrapping (and cloning into) `Coefficients` on
     /// hot LM-screen paths.
-    fn transformed_matvec_array_into(&self, beta: &Array1<f64>, out: &mut Array1<f64>) {
+    pub(crate) fn transformed_matvec_array_into(&self, beta: &Array1<f64>, out: &mut Array1<f64>) {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
                 if let Some(dense) = x_transformed.as_dense() {
@@ -291,7 +291,7 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
-    fn transformed_transpose_matvec(&self, vec: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn transformed_transpose_matvec(&self, vec: &Array1<f64>) -> Array1<f64> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::OriginalSparseNative => {
                 self.x_original.transpose_vector_multiply(vec)
@@ -308,7 +308,7 @@ impl<'a> GamWorkingModel<'a> {
 
     /// Compute X^T W X via the shared dense assembly path.
     /// Falls back to the scalar loop for sparse matrices.
-    fn compute_xtwx_blas(
+    pub(crate) fn compute_xtwx_blas(
         workspace: &mut PirlsWorkspace,
         design: &DesignMatrix,
         weights: &Array1<f64>,
@@ -381,7 +381,7 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
-    fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
+    pub(crate) fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
         // #1111 / #1033 mechanism (c): the frozen-weight first-Fisher-step Gram
         // `XᵀWX` (in the original / `x_fit` conditioned frame) serves the FIRST
         // Fisher-scoring iteration n-free, eliding the dominant O(N·p²) weighted
@@ -457,7 +457,7 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
-    fn supports_observed_hessian_curvature(&self) -> bool {
+    pub(crate) fn supports_observed_hessian_curvature(&self) -> bool {
         supports_observed_hessian_curvature_for_likelihood(&self.likelihood, &self.link_kind)
     }
 
@@ -480,7 +480,7 @@ impl<'a> GamWorkingModel<'a> {
     /// 2. **Outer REML**: They define the Laplace Hessian H_obs = X'W_obs X + S.
     ///    The outer log|H| and trace terms MUST use observed information for the
     ///    exact Laplace approximation. See response.md Section 3.
-    fn update_hessian_curvature_arrays(
+    pub(crate) fn update_hessian_curvature_arrays(
         &mut self,
         requested: HessianCurvatureKind,
     ) -> Result<HessianCurvatureKind, EstimationError> {
@@ -506,7 +506,7 @@ impl<'a> GamWorkingModel<'a> {
         Ok(HessianCurvatureKind::Observed)
     }
 
-    fn sparse_penalized_hessian(
+    pub(crate) fn sparse_penalized_hessian(
         &mut self,
         weights: &Array1<f64>,
         ridge: f64,
@@ -538,7 +538,7 @@ impl<'a> GamWorkingModel<'a> {
     /// The LM loop calls `update_with_curvature` to upgrade the screen to a
     /// full `WorkingState` only when the screen is accepted. Rejected LM
     /// candidates therefore skip the O(np²) curvature build entirely.
-    fn screen_candidate_from_direction(
+    pub(crate) fn screen_candidate_from_direction(
         &mut self,
         beta: &Coefficients,
         direction: &Array1<f64>,
