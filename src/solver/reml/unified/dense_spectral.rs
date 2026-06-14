@@ -280,7 +280,11 @@ impl DenseSpectralOperator {
     }
 
     #[inline]
-    fn trace_hinv_product_cross_rotated(&self, a_rot: &Array2<f64>, b_rot: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_hinv_product_cross_rotated(
+        &self,
+        a_rot: &Array2<f64>,
+        b_rot: &Array2<f64>,
+    ) -> f64 {
         let mut result = 0.0;
         for ((kernel_row, a_row), b_col) in self
             .hinv_cross_kernel
@@ -302,7 +306,7 @@ impl DenseSpectralOperator {
     }
 
     #[inline]
-    fn trace_hinv_product_cross_dense(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_hinv_product_cross_dense(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         let a_rot = self.rotate_to_eigenbasis(a);
         if std::ptr::eq(a, b) {
             return self.trace_hinv_product_cross_rotated(&a_rot, &a_rot);
@@ -385,7 +389,7 @@ impl DenseSpectralOperator {
 /// (2, 4, 8, 16, …) and a final summary when the signature changes.
 pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
     use std::sync::Mutex;
-    struct Repeat {
+    pub(crate) struct Repeat {
         signature: String,
         count: u64,
         total: f64,
@@ -393,7 +397,7 @@ pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
         max: f64,
         next_heartbeat: u64,
     }
-    static REPEAT: Mutex<Option<Repeat>> = Mutex::new(None);
+    pub(crate) static REPEAT: Mutex<Option<Repeat>> = Mutex::new(None);
 
     let mut guard = match REPEAT.lock() {
         Ok(g) => g,
@@ -452,19 +456,19 @@ pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
 }
 
 impl HessianOperator for DenseSpectralOperator {
-    fn logdet(&self) -> f64 {
+    pub(crate) fn logdet(&self) -> f64 {
         self.cached_logdet
     }
 
-    fn as_exact_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+    pub(crate) fn as_exact_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
         Some(self)
     }
 
-    fn assemble_h_dense_for_tangent_projection(&self) -> Result<Array2<f64>, String> {
+    pub(crate) fn assemble_h_dense_for_tangent_projection(&self) -> Result<Array2<f64>, String> {
         Ok(assemble_h_raw_dense(self))
     }
 
-    fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
         // tr(H_reg⁻¹ A) = Σ_j (1/r_ε(σ_j)) uⱼᵀAuⱼ
         // Computed as Σ (AW ⊙ W) where W = U diag(1/√r_ε(σ)).
         let aw = a.dot(&self.w_factor);
@@ -474,7 +478,7 @@ impl HessianOperator for DenseSpectralOperator {
             .sum()
     }
 
-    fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
         // H_reg⁻¹ v = Σ_j (1/r_ε(σ_j)) (uⱼᵀv) uⱼ.  Inactive eigenpairs
         // (σ_j ≤ ε under `HardPseudo`) are skipped so the returned vector
         // lives entirely in the active subspace — otherwise v_k picks up a
@@ -495,7 +499,7 @@ impl HessianOperator for DenseSpectralOperator {
         result
     }
 
-    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
         let mut projected = self.eigenvectors.t().dot(rhs);
         for j in 0..self.n_dim {
             if self.active_mask[j] {
@@ -510,11 +514,11 @@ impl HessianOperator for DenseSpectralOperator {
         self.eigenvectors.dot(&projected)
     }
 
-    fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         self.trace_hinv_product_cross_dense(a, b)
     }
 
-    fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
+    pub(crate) fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
         if log::log_enabled!(log::Level::Info) {
             let start = std::time::Instant::now();
             let result =
@@ -532,7 +536,7 @@ impl HessianOperator for DenseSpectralOperator {
         }
     }
 
-    fn trace_hinv_matrix_operator_cross(
+    pub(crate) fn trace_hinv_matrix_operator_cross(
         &self,
         matrix: &Array2<f64>,
         op: &dyn HyperOperator,
@@ -542,7 +546,7 @@ impl HessianOperator for DenseSpectralOperator {
         self.trace_projected_cross(&left, &right)
     }
 
-    fn trace_hinv_operator_cross(
+    pub(crate) fn trace_hinv_operator_cross(
         &self,
         left: &dyn HyperOperator,
         right: &dyn HyperOperator,
@@ -576,7 +580,7 @@ impl HessianOperator for DenseSpectralOperator {
         }
     }
 
-    fn trace_logdet_gradient(&self, a: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_logdet_gradient(&self, a: &Array2<f64>) -> f64 {
         // tr(G_ε(H) A) = Σ_j φ'(σ_j) uⱼᵀAuⱼ
         // where φ'(σ) = 1/√(σ² + 4ε²).
         // Computed as Σ (AG ⊙ G) where G = U diag(√φ'(σ)).
@@ -587,7 +591,7 @@ impl HessianOperator for DenseSpectralOperator {
             .sum()
     }
 
-    fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
+    pub(crate) fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
         // h^G_i = ‖(X G)_{i,:}‖² where G_ε = G Gᵀ and G = self.g_factor.
         // The dominant cost at large scale is the (n × p)·(p × rank) matmul
         // — for matern60 with n=320K, p=101 that's ~3.3 GFLOPs and the
@@ -638,7 +642,7 @@ impl HessianOperator for DenseSpectralOperator {
         h
     }
 
-    fn trace_logdet_block_local(
+    pub(crate) fn trace_logdet_block_local(
         &self,
         block: &Array2<f64>,
         scale: f64,
@@ -656,7 +660,7 @@ impl HessianOperator for DenseSpectralOperator {
                 .sum::<f64>()
     }
 
-    fn trace_hinv_block_local(
+    pub(crate) fn trace_hinv_block_local(
         &self,
         block: &Array2<f64>,
         scale: f64,
@@ -673,7 +677,7 @@ impl HessianOperator for DenseSpectralOperator {
                 .sum::<f64>()
     }
 
-    fn trace_hinv_block_local_cross(
+    pub(crate) fn trace_hinv_block_local_cross(
         &self,
         block: &Array2<f64>,
         scale: f64,
@@ -699,7 +703,7 @@ impl HessianOperator for DenseSpectralOperator {
         scale_sq * m.iter().map(|&v| v * v).sum::<f64>()
     }
 
-    fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
+    pub(crate) fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
         if log::log_enabled!(log::Level::Info) {
             let start = std::time::Instant::now();
             let result =
@@ -717,7 +721,7 @@ impl HessianOperator for DenseSpectralOperator {
         }
     }
 
-    fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
         let hp_i = self.rotate_to_eigenbasis(h_i);
         if std::ptr::eq(h_i, h_j) {
             return self.trace_logdet_hessian_cross_rotated(&hp_i, &hp_i);
@@ -726,7 +730,7 @@ impl HessianOperator for DenseSpectralOperator {
         self.trace_logdet_hessian_cross_rotated(&hp_i, &hp_j)
     }
 
-    fn trace_logdet_hessian_cross_matrix_operator(
+    pub(crate) fn trace_logdet_hessian_cross_matrix_operator(
         &self,
         h_i: &Array2<f64>,
         h_j: &dyn HyperOperator,
@@ -736,7 +740,7 @@ impl HessianOperator for DenseSpectralOperator {
         self.trace_logdet_hessian_cross_rotated(&hp_i, &hp_j)
     }
 
-    fn trace_logdet_hessian_cross_operator(
+    pub(crate) fn trace_logdet_hessian_cross_operator(
         &self,
         h_i: &dyn HyperOperator,
         h_j: &dyn HyperOperator,
@@ -749,7 +753,7 @@ impl HessianOperator for DenseSpectralOperator {
         self.trace_logdet_hessian_cross_rotated(&hp_i, &hp_j)
     }
 
-    fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
+    pub(crate) fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
         let n = matrices.len();
         let rotated = matrices
             .iter()
@@ -766,27 +770,27 @@ impl HessianOperator for DenseSpectralOperator {
         out
     }
 
-    fn active_rank(&self) -> usize {
+    pub(crate) fn active_rank(&self) -> usize {
         self.active_mask.iter().filter(|&&active| active).count()
     }
 
-    fn dim(&self) -> usize {
+    pub(crate) fn dim(&self) -> usize {
         self.n_dim
     }
 
-    fn is_dense(&self) -> bool {
+    pub(crate) fn is_dense(&self) -> bool {
         true
     }
 
-    fn prefers_stochastic_trace_estimation(&self) -> bool {
+    pub(crate) fn prefers_stochastic_trace_estimation(&self) -> bool {
         false
     }
 
-    fn logdet_traces_match_hinv_kernel(&self) -> bool {
+    pub(crate) fn logdet_traces_match_hinv_kernel(&self) -> bool {
         false
     }
 
-    fn as_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+    pub(crate) fn as_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
         Some(self)
     }
 }

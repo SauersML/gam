@@ -1,6 +1,6 @@
 use super::*;
 
-fn beta_bits_match(cached: &Array1<f64>, candidate: &Array1<f64>) -> bool {
+pub(crate) fn beta_bits_match(cached: &Array1<f64>, candidate: &Array1<f64>) -> bool {
     cached.len() == candidate.len()
         && cached
             .iter()
@@ -117,18 +117,18 @@ pub(crate) struct TransformationNormalRowQuantityCache {
 }
 
 #[derive(Debug)]
-struct TransformationNormalRowDerived {
+pub(crate) struct TransformationNormalRowDerived {
     log_likelihood: f64,
     endpoint_q: Vec<LogNormalCdfDiffDerivatives>,
 }
 
 impl TransformationNormalRowQuantityCache {
-    fn matches_beta(&self, beta: &Array1<f64>) -> bool {
+    pub(crate) fn matches_beta(&self, beta: &Array1<f64>) -> bool {
         beta_bits_match(&self.beta, beta)
     }
 }
 
-fn build_transformation_row_derived(
+pub(crate) fn build_transformation_row_derived(
     h: &Array1<f64>,
     h_prime: &Array1<f64>,
     h_lower: &Array1<f64>,
@@ -772,7 +772,10 @@ impl TransformationNormalFamily {
     /// build at the same β so they must not alias). The subsample hash is
     /// computed over `m` so that two distinct masks at the same β never
     /// share a cache entry.
-    fn with_outer_subsample(&self, mask: &Array1<f64>) -> Result<Self, TransformationNormalError> {
+    pub(crate) fn with_outer_subsample(
+        &self,
+        mask: &Array1<f64>,
+    ) -> Result<Self, TransformationNormalError> {
         let n = self.weights.len();
         if mask.len() != n {
             crate::bail_invalid_tnorm!(
@@ -824,7 +827,7 @@ impl TransformationNormalFamily {
 
     /// Build an outer-subsample clone from a `BlockwiseFitOptions` row mask,
     /// returning `None` when no subsample is requested.
-    fn maybe_with_outer_subsample_from_options(
+    pub(crate) fn maybe_with_outer_subsample_from_options(
         &self,
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Self>, TransformationNormalError> {
@@ -843,7 +846,7 @@ impl TransformationNormalFamily {
 
     // --- Internal helpers ---
 
-    fn covariate_dense_arc(&self) -> Result<Arc<Array2<f64>>, String> {
+    pub(crate) fn covariate_dense_arc(&self) -> Result<Arc<Array2<f64>>, String> {
         let mut cache = self
             .covariate_dense_cache
             .lock()
@@ -860,7 +863,7 @@ impl TransformationNormalFamily {
         Ok(dense)
     }
 
-    fn row_quantities(
+    pub(crate) fn row_quantities(
         &self,
         beta: &Array1<f64>,
     ) -> Result<TransformationNormalRowQuantityCache, String> {

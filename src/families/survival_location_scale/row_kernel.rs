@@ -383,9 +383,9 @@ impl SurvivalLsRowKernel<'_> {
             _ => None,
         }
     }
-    const THRESHOLD_BLOCK_TIME: usize = 0;
-    const THRESHOLD_BLOCK_THR: usize = 1;
-    const THRESHOLD_BLOCK_LS: usize = 2;
+    pub(crate) const THRESHOLD_BLOCK_TIME: usize = 0;
+    pub(crate) const THRESHOLD_BLOCK_THR: usize = 1;
+    pub(crate) const THRESHOLD_BLOCK_LS: usize = 2;
 
     /// Dense per-row design vector for `channel` (length = its block width), or
     /// `None` when the channel's design is absent (time-invariant deriv channel,
@@ -468,15 +468,15 @@ pub(crate) fn row_set_from_survival_mask(
 }
 
 impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
-    fn n_rows(&self) -> usize {
+    pub(crate) fn n_rows(&self) -> usize {
         self.family.n
     }
 
-    fn n_coefficients(&self) -> usize {
+    pub(crate) fn n_coefficients(&self) -> usize {
         *self.offsets.last().expect("offsets has block bounds")
     }
 
-    fn row_kernel(
+    pub(crate) fn row_kernel(
         &self,
         row: usize,
     ) -> Result<(f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]), String> {
@@ -508,7 +508,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         Ok((-self.q.ll[row], grad, hess))
     }
 
-    fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; SLS_ROW_K] {
+    pub(crate) fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; SLS_ROW_K] {
         let d_beta = ndarray::ArrayView1::from(d_beta);
         let d_time = d_beta.slice(s![self.offsets[0]..self.offsets[1]]);
         let d_thr = d_beta.slice(s![self.offsets[1]..self.offsets[2]]);
@@ -537,7 +537,12 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         ]
     }
 
-    fn jacobian_transpose_action(&self, row: usize, v: &[f64; SLS_ROW_K], out: &mut [f64]) {
+    pub(crate) fn jacobian_transpose_action(
+        &self,
+        row: usize,
+        v: &[f64; SLS_ROW_K],
+        out: &mut [f64],
+    ) {
         let fam = self.family;
         // Time block: channels 0,1,2 via the dense time Jacobians.
         {
@@ -576,7 +581,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         }
     }
 
-    fn add_pullback_hessian(
+    pub(crate) fn add_pullback_hessian(
         &self,
         row: usize,
         h: &[[f64; SLS_ROW_K]; SLS_ROW_K],
@@ -615,7 +620,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         }
     }
 
-    fn add_diagonal_quadratic(
+    pub(crate) fn add_diagonal_quadratic(
         &self,
         row: usize,
         h: &[[f64; SLS_ROW_K]; SLS_ROW_K],
@@ -649,7 +654,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         }
     }
 
-    fn row_third_contracted(
+    pub(crate) fn row_third_contracted(
         &self,
         row: usize,
         dir: &[f64; SLS_ROW_K],
@@ -704,7 +709,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         Ok(out)
     }
 
-    fn row_fourth_contracted(
+    pub(crate) fn row_fourth_contracted(
         &self,
         row: usize,
         dir_u: &[f64; SLS_ROW_K],
@@ -731,11 +736,11 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
 }
 
 impl SurvivalLocationScaleFamily {
-    const BLOCK_TIME: usize = 0;
-    const BLOCK_THRESHOLD: usize = 1;
-    const BLOCK_LOG_SIGMA: usize = 2;
-    const BLOCK_LINK_WIGGLE: usize = 3;
-    const EVALUATE_PARALLEL_ROW_THRESHOLD: usize = 1024;
+    pub(crate) const BLOCK_TIME: usize = 0;
+    pub(crate) const BLOCK_THRESHOLD: usize = 1;
+    pub(crate) const BLOCK_LOG_SIGMA: usize = 2;
+    pub(crate) const BLOCK_LINK_WIGGLE: usize = 3;
+    pub(crate) const EVALUATE_PARALLEL_ROW_THRESHOLD: usize = 1024;
 
     /// The `RowKernel<K>` engine assumes a fixed linear coefficient-to-primary
     /// Jacobian for the row. Survival LS satisfies that after choosing the nine
@@ -1202,7 +1207,7 @@ impl SurvivalLocationScaleFamily {
         /// into a buffer of length `n`, and the pointers do not outlive the
         /// surrounding scope.
         #[derive(Clone, Copy)]
-        struct SendPtr(*mut f64);
+        pub(crate) struct SendPtr(*mut f64);
         // SAFETY: SendPtr is constructed from Array1::as_mut_ptr() on
         // length-n buffers; the rayon (0..n).into_par_iter() driver gives
         // each thread a unique i, so writes via SendPtr never alias.
@@ -1533,9 +1538,7 @@ impl SurvivalLocationScaleFamily {
                 LinkParamPartials::Sas(p) => {
                     vec![map(p.djet_depsilon.mu), map(p.djet_dlog_delta.mu)]
                 }
-                LinkParamPartials::Mixture(p) => {
-                    p.djet_drho.iter().map(|j| map(j.mu)).collect()
-                }
+                LinkParamPartials::Mixture(p) => p.djet_drho.iter().map(|j| map(j.mu)).collect(),
             })
         };
         let dlog_pdf_dtheta = |u: f64| -> Result<Vec<f64>, String> {
@@ -1559,9 +1562,7 @@ impl SurvivalLocationScaleFamily {
                 LinkParamPartials::Sas(p) => {
                     vec![map(p.djet_depsilon.d1), map(p.djet_dlog_delta.d1)]
                 }
-                LinkParamPartials::Mixture(p) => {
-                    p.djet_drho.iter().map(|j| map(j.d1)).collect()
-                }
+                LinkParamPartials::Mixture(p) => p.djet_drho.iter().map(|j| map(j.d1)).collect(),
             })
         };
         // Accumulate ∂(−ℓ)/∂θ = −Σ_i w_i·( event_mix(d, ∂logφ(u1), ∂logS(u1))
@@ -1785,7 +1786,14 @@ impl SurvivalLocationScaleFamily {
     ///
     /// Equivalent expanded form:
     /// `r'' = f''/S + 3 f f' / S^2 + 2 f^3 / S^3`.
-    pub(crate) fn survival_ratiosecond_derivative(r: f64, dr: f64, f: f64, fp: f64, fpp: f64, s: f64) -> f64 {
+    pub(crate) fn survival_ratiosecond_derivative(
+        r: f64,
+        dr: f64,
+        f: f64,
+        fp: f64,
+        fpp: f64,
+        s: f64,
+    ) -> f64 {
         (2.0 * r * dr) + (fpp / s + fp * f / (s * s))
     }
 

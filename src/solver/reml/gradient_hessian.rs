@@ -1,7 +1,7 @@
 use super::*;
 
 impl<'a> RemlState<'a> {
-    const POLISH_NORM_RATIO: f64 = 0.25;
+    pub(crate) const POLISH_NORM_RATIO: f64 = 0.25;
 
     pub(crate) fn hypergradient_owner_key(&self) -> usize {
         self as *const _ as usize
@@ -1388,34 +1388,34 @@ impl<'a> RemlState<'a> {
         }
 
         #[derive(Clone)]
-        struct Jet {
+        pub(crate) struct Jet {
             v: f64,
             g: Array1<f64>,
             h: Array2<f64>,
         }
         impl Jet {
-            fn constant(v: f64, k: usize) -> Self {
+            pub(crate) fn constant(v: f64, k: usize) -> Self {
                 Self {
                     v,
                     g: Array1::zeros(k),
                     h: Array2::zeros((k, k)),
                 }
             }
-            fn add(&self, other: &Self) -> Self {
+            pub(crate) fn add(&self, other: &Self) -> Self {
                 Self {
                     v: self.v + other.v,
                     g: &self.g + &other.g,
                     h: &self.h + &other.h,
                 }
             }
-            fn scale(&self, a: f64) -> Self {
+            pub(crate) fn scale(&self, a: f64) -> Self {
                 Self {
                     v: self.v * a,
                     g: self.g.mapv(|x| x * a),
                     h: self.h.mapv(|x| x * a),
                 }
             }
-            fn mul(&self, other: &Self) -> Self {
+            pub(crate) fn mul(&self, other: &Self) -> Self {
                 let k = self.g.len();
                 let mut h = &self.h * other.v + &other.h * self.v;
                 for i in 0..k {
@@ -1429,10 +1429,10 @@ impl<'a> RemlState<'a> {
                     h,
                 }
             }
-            fn square(&self) -> Self {
+            pub(crate) fn square(&self) -> Self {
                 self.mul(self)
             }
-            fn cube(&self) -> Self {
+            pub(crate) fn cube(&self) -> Self {
                 self.mul(self).mul(self)
             }
         }
@@ -1828,7 +1828,7 @@ impl<'a> RemlState<'a> {
         let xt = x_eff_dense.t().to_owned();
         let p = x_eff_dense.ncols();
         let n = x_eff_dense.nrows();
-        enum HFactor {
+        pub(crate) enum HFactor {
             Cholesky(crate::linalg::faer_ndarray::FaerCholeskyFactor),
             Eigh {
                 evals: Array1<f64>,
@@ -1841,7 +1841,7 @@ impl<'a> RemlState<'a> {
             // Smallest eigenvalue at or below this floor means the effective
             // Hessian failed positive-definiteness (Cholesky already declined),
             // so the Tierney–Kadane Laplace correction is undefined here.
-            const TK_HESSIAN_PD_EIGENVALUE_FLOOR: f64 = 1e-12;
+            pub(crate) const TK_HESSIAN_PD_EIGENVALUE_FLOOR: f64 = 1e-12;
             if let Some((idx, ev)) = evals
                 .iter()
                 .enumerate()
@@ -2442,7 +2442,7 @@ impl<'a> RemlState<'a> {
         // be surfaced. This has zero effect on optimization math.
         // Emit on the first eval and then once every this-many evals so a long
         // outer optimization leaves a periodic trace without flooding the log.
-        const HOT_DIAGNOSTIC_EVAL_INTERVAL: u64 = 200;
+        pub(crate) const HOT_DIAGNOSTIC_EVAL_INTERVAL: u64 = 200;
         (log::log_enabled!(log::Level::Info) || log::log_enabled!(log::Level::Warn))
             && (eval_idx == 1 || eval_idx.is_multiple_of(HOT_DIAGNOSTIC_EVAL_INTERVAL))
     }
@@ -3920,9 +3920,9 @@ impl<'a> RemlState<'a> {
             // side of each bound, and probe the barrier curvature at unit β
             // magnitude against a 5%-of-curvature significance threshold. These
             // only shape the emitted trace line, not the fit.
-            const DIAGNOSTIC_BOUND_SLACK: f64 = 0.01;
-            const DIAGNOSTIC_BETA_MAGNITUDE: f64 = 1.0;
-            const DIAGNOSTIC_CURVATURE_REL_THRESHOLD: f64 = 0.05;
+            pub(crate) const DIAGNOSTIC_BOUND_SLACK: f64 = 0.01;
+            pub(crate) const DIAGNOSTIC_BETA_MAGNITUDE: f64 = 1.0;
+            pub(crate) const DIAGNOSTIC_CURVATURE_REL_THRESHOLD: f64 = 0.05;
             let max_idx = config
                 .constrained_indices
                 .iter()
@@ -4634,9 +4634,9 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn without_persistent_warm_start_store<T>(&self, f: impl FnOnce() -> T) -> T {
-        struct StoreSuppressionGuard<'a>(&'a AtomicUsize);
+        pub(crate) struct StoreSuppressionGuard<'a>(&'a AtomicUsize);
         impl Drop for StoreSuppressionGuard<'_> {
-            fn drop(&mut self) {
+            pub(crate) fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::Relaxed);
             }
         }
@@ -4941,7 +4941,7 @@ impl<'a> RemlState<'a> {
         // Squared-norm floor (≈1e-12 in ‖Δρ‖) below which the previous ρ-step is
         // treated as a degenerate/zero-length direction the tangent predictor
         // cannot extrapolate along.
-        const DEGENERATE_DRHO_NORM_SQ: f64 = 1e-24;
+        pub(crate) const DEGENERATE_DRHO_NORM_SQ: f64 = 1e-24;
         let d_rho_norm_sq: f64 = cur_rho
             .iter()
             .zip(prev_rho.iter())
@@ -5033,7 +5033,7 @@ impl<'a> RemlState<'a> {
         // doesn't fire on a near-identity prediction (would
         // contaminate the residual percentile distribution with
         // ~zero residuals — same bug class as commit 52372fd5).
-        const TANGENT_ALPHA_NOOP_EPS: f64 = 1e-12;
+        pub(crate) const TANGENT_ALPHA_NOOP_EPS: f64 = 1e-12;
         if alpha.abs() <= TANGENT_ALPHA_NOOP_EPS {
             log::info!(
                 "[TANGENT-NOOP] reason=alpha_below_eps alpha={:.3e} eps={:.3e}",
@@ -6346,7 +6346,7 @@ impl<'a> RemlState<'a> {
 /// `adaptive_ift_max_drho` for the empirical-quality-driven loosening /
 /// tightening policy. This default is used when no IFT-quality history
 /// is available yet (the first PIRLS solve at a fresh surface).
-const IFT_WARM_START_DEFAULT_MAX_DRHO: f64 = 2.0;
+pub(crate) const IFT_WARM_START_DEFAULT_MAX_DRHO: f64 = 2.0;
 
 /// Shared relative-residual tier breakpoints for the warm-start linear
 /// predictors. `r = ‖β_converged − β_predicted‖ / ‖β_converged‖` from the
@@ -6355,13 +6355,13 @@ const IFT_WARM_START_DEFAULT_MAX_DRHO: f64 = 2.0;
 /// key off the SAME breakpoints so their caps move in lockstep (the two
 /// predictors share one quality signal). One step per decade of residual keeps
 /// the policy stable under noise.
-const IFT_RESIDUAL_TIER_EXCELLENT: f64 = 0.01;
+pub(crate) const IFT_RESIDUAL_TIER_EXCELLENT: f64 = 0.01;
 
-const IFT_RESIDUAL_TIER_VERY_GOOD: f64 = 0.05;
+pub(crate) const IFT_RESIDUAL_TIER_VERY_GOOD: f64 = 0.05;
 
-const IFT_RESIDUAL_TIER_OK: f64 = 0.20;
+pub(crate) const IFT_RESIDUAL_TIER_OK: f64 = 0.20;
 
-const IFT_RESIDUAL_TIER_MARGINAL: f64 = 0.50;
+pub(crate) const IFT_RESIDUAL_TIER_MARGINAL: f64 = 0.50;
 
 /// Adaptive |Δρ| cap for the IFT predictor, driven by the residual of
 /// the previous IFT prediction (see `last_ift_prediction_residual`).
@@ -6382,7 +6382,7 @@ const IFT_RESIDUAL_TIER_MARGINAL: f64 = 0.50;
 /// The thresholds are deliberately one-step-per-decade-of-residual so
 /// the policy remains stable under noise; small fluctuations in
 /// `last_residual` don't whipsaw the cap.
-fn adaptive_ift_max_drho(last_residual: Option<f64>) -> f64 {
+pub(crate) fn adaptive_ift_max_drho(last_residual: Option<f64>) -> f64 {
     let Some(r) = last_residual else {
         return IFT_WARM_START_DEFAULT_MAX_DRHO;
     };
@@ -6415,7 +6415,7 @@ fn adaptive_ift_max_drho(last_residual: Option<f64>) -> f64 {
 /// pair is being assembled). Adaptive policy in
 /// `adaptive_tangent_alpha_cap` adjusts this based on the IFT
 /// residual signal when present.
-const TANGENT_ALPHA_DEFAULT_CAP: f64 = 1.5;
+pub(crate) const TANGENT_ALPHA_DEFAULT_CAP: f64 = 1.5;
 
 /// Adaptive α-cap for the tangent-line predictor, sharing the IFT
 /// residual signal as a proxy for "how trustworthy is the local linear
@@ -6439,7 +6439,7 @@ const TANGENT_ALPHA_DEFAULT_CAP: f64 = 1.5;
 /// Same tier-stable, monotone-non-increasing-in-residual shape as
 /// `adaptive_ift_max_drho`; the two predictors share a single quality
 /// signal so their caps move together.
-fn adaptive_tangent_alpha_cap(last_residual: Option<f64>) -> f64 {
+pub(crate) fn adaptive_tangent_alpha_cap(last_residual: Option<f64>) -> f64 {
     let Some(r) = last_residual else {
         return TANGENT_ALPHA_DEFAULT_CAP;
     };
@@ -6499,7 +6499,7 @@ pub(crate) enum WarmStartPredictionSource {
 /// Below this magnitude in any Δρ_k, the per-component IFT contribution is
 /// numerically negligible and skipped (saves one back-solve per inactive
 /// component).
-const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
+pub(crate) const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
 
 /// Bit-pattern sentinel used by `RemlObjectiveState::last_ift_prediction_residual`
 /// to encode "no signal yet" unambiguously. Decodes via `f64::from_bits`
@@ -6550,18 +6550,18 @@ pub(crate) fn adaptive_lm_lambda_hint(
 ) -> Option<f64> {
     // Iteration-count boundaries that classify the previous PIRLS solve's
     // conditioning regime.
-    const NEWTON_FRIENDLY_MAX_ITERS: usize = 2;
-    const HARD_FIT_MIN_ITERS: usize = 10;
+    pub(crate) const NEWTON_FRIENDLY_MAX_ITERS: usize = 2;
+    pub(crate) const HARD_FIT_MIN_ITERS: usize = 10;
     // Per-regime adaptive clamp bands for the cached LM damping hint (see the
     // doc comment): Newton-friendly relaxes down to the LM-internal floor, a
     // hard fit preserves the heavy-damping signal up to gradient-descent, and
     // the default reproduces the historical static `[1e-6, 1e-3]` clamp.
-    const NEWTON_LAMBDA_FLOOR: f64 = 1e-9;
-    const NEWTON_LAMBDA_CEILING: f64 = 1e-3;
-    const HARD_FIT_LAMBDA_FLOOR: f64 = 1e-3;
-    const HARD_FIT_LAMBDA_CEILING: f64 = 1.0;
-    const DEFAULT_LAMBDA_FLOOR: f64 = 1e-6;
-    const DEFAULT_LAMBDA_CEILING: f64 = 1e-3;
+    pub(crate) const NEWTON_LAMBDA_FLOOR: f64 = 1e-9;
+    pub(crate) const NEWTON_LAMBDA_CEILING: f64 = 1e-3;
+    pub(crate) const HARD_FIT_LAMBDA_FLOOR: f64 = 1e-3;
+    pub(crate) const HARD_FIT_LAMBDA_CEILING: f64 = 1.0;
+    pub(crate) const DEFAULT_LAMBDA_FLOOR: f64 = 1e-6;
+    pub(crate) const DEFAULT_LAMBDA_CEILING: f64 = 1e-3;
     if !cached_lambda.is_finite() || cached_lambda <= 0.0 {
         return None;
     }
@@ -6579,7 +6579,7 @@ pub(crate) fn adaptive_lm_lambda_hint(
     Some(cached_lambda.clamp(floor, ceiling))
 }
 
-fn predict_warm_start_beta_ift_inner_with_outcome(
+pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
     cache: &super::IftWarmStartCache,
     canonical_penalties: &[crate::construction::CanonicalPenalty],
     new_rho: &Array1<f64>,
@@ -6859,7 +6859,7 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
     ))
 }
 
-fn predict_warm_start_beta_ift_from_mode_response_cols(
+pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
     cache: &super::IftWarmStartCache,
     new_rho: &Array1<f64>,
     p: usize,

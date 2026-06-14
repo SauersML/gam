@@ -32,7 +32,7 @@ pub(crate) enum KroneckerDesign {
 }
 
 impl KroneckerDesign {
-    fn new_khatri_rao(left: &Array2<f64>, right: DesignMatrix) -> Result<Self, String> {
+    pub(crate) fn new_khatri_rao(left: &Array2<f64>, right: DesignMatrix) -> Result<Self, String> {
         if left.nrows() != right.nrows() {
             return Err(TransformationNormalError::InvalidInput {
                 reason: format!(
@@ -50,13 +50,13 @@ impl KroneckerDesign {
         })
     }
 
-    fn nrows(&self) -> usize {
+    pub(crate) fn nrows(&self) -> usize {
         match self {
             KroneckerDesign::KhatriRao { left, .. } => left.nrows(),
         }
     }
 
-    fn ncols(&self) -> usize {
+    pub(crate) fn ncols(&self) -> usize {
         match self {
             KroneckerDesign::KhatriRao { left, right } => left.ncols() * right.ncols(),
         }
@@ -64,7 +64,7 @@ impl KroneckerDesign {
 
     /// Compute `self · beta` where beta has length p_a * p_b.
     /// Returns an n-vector.
-    fn forward_mul(&self, beta: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn forward_mul(&self, beta: &Array1<f64>) -> Array1<f64> {
         match self {
             KroneckerDesign::KhatriRao { left, right } => {
                 let pa = left.ncols();
@@ -111,7 +111,7 @@ impl KroneckerDesign {
     /// underlying `right` operator and the row-replicated Khatri-Rao image
     /// are never materialized. Storage cost matches `forward_mul`: an
     /// intermediate `n × p_resp` `right_beta` plus the `n` output.
-    fn scop_affine_squared_forward(&self, beta: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn scop_affine_squared_forward(&self, beta: &Array1<f64>) -> Array1<f64> {
         match self {
             KroneckerDesign::KhatriRao { left, right } => {
                 let pa = left.ncols();
@@ -160,7 +160,7 @@ impl KroneckerDesign {
 
     /// Compute `self^T · v` where v is an n-vector.
     /// Returns a (p_a * p_b)-vector.
-    fn transpose_mul(&self, v: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn transpose_mul(&self, v: &Array1<f64>) -> Array1<f64> {
         match self {
             KroneckerDesign::KhatriRao { left, right } => {
                 let n = left.nrows();
@@ -196,7 +196,7 @@ impl KroneckerDesign {
     ///
     /// Thin wrapper over `weighted_cross_with(self, self, ...)`. Callers thread
     /// a real `ResourcePolicy` so chunk sizing matches the surrounding workload.
-    fn weighted_gram(&self, w: &Array1<f64>, policy: &ResourcePolicy) -> Array2<f64> {
+    pub(crate) fn weighted_gram(&self, w: &Array1<f64>, policy: &ResourcePolicy) -> Array2<f64> {
         self.weighted_cross_with(w.view(), self, policy)
             .expect("validated KroneckerDesign weighted Gram dimensions")
     }
@@ -263,23 +263,23 @@ impl KroneckerDesign {
 }
 
 impl LinearOperator for KroneckerDesign {
-    fn nrows(&self) -> usize {
+    pub(crate) fn nrows(&self) -> usize {
         KroneckerDesign::nrows(self)
     }
 
-    fn ncols(&self) -> usize {
+    pub(crate) fn ncols(&self) -> usize {
         KroneckerDesign::ncols(self)
     }
 
-    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         self.forward_mul(vector)
     }
 
-    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
         self.transpose_mul(vector)
     }
 
-    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+    pub(crate) fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if weights.len() != self.nrows() {
             return Err(TransformationNormalError::InvalidInput {
                 reason: format!(
@@ -299,7 +299,7 @@ impl LinearOperator for KroneckerDesign {
 }
 
 impl DenseDesignOperator for KroneckerDesign {
-    fn row_chunk_into(
+    pub(crate) fn row_chunk_into(
         &self,
         rows: std::ops::Range<usize>,
         mut out: ArrayViewMut2<'_, f64>,
@@ -331,7 +331,7 @@ impl DenseDesignOperator for KroneckerDesign {
         Ok(())
     }
 
-    fn to_dense(&self) -> Array2<f64> {
+    pub(crate) fn to_dense(&self) -> Array2<f64> {
         match self {
             KroneckerDesign::KhatriRao { left, right } => {
                 dense_rowwise_kronecker(left.view(), right.to_dense().view())
@@ -416,7 +416,7 @@ pub(crate) fn build_tensor_penalties_kronecker(
 // ---------------------------------------------------------------------------
 
 /// Multiply each row of a matrix by the corresponding weight.
-fn weight_rows(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
+pub(crate) fn weight_rows(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
     let n = x.nrows();
     let p = x.ncols();
     assert_eq!(n, w.len());

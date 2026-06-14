@@ -12,7 +12,6 @@ pub(crate) struct PerZScoreWarpPrepared {
     pub(crate) score_dim: usize,
 }
 
-
 impl PerZScoreWarpPrepared {
     #[inline]
     pub(crate) fn basis_dim(&self) -> usize {
@@ -25,12 +24,13 @@ impl PerZScoreWarpPrepared {
     }
 }
 
-
-pub(crate) fn score_warp_component_range(runtime: &DeviationRuntime, coord: usize) -> std::ops::Range<usize> {
+pub(crate) fn score_warp_component_range(
+    runtime: &DeviationRuntime,
+    coord: usize,
+) -> std::ops::Range<usize> {
     let p = runtime.basis_dim();
     coord * p..(coord + 1) * p
 }
-
 
 pub(crate) fn score_warp_component_beta(
     runtime: &DeviationRuntime,
@@ -50,7 +50,6 @@ pub(crate) fn score_warp_component_beta(
     }
     Ok(beta.slice(s![range]).to_owned())
 }
-
 
 /// Stripe a (post-reparam) scalar score-warp `base` across K z coordinates
 /// to produce the direct-sum block `Φ_total = [Φ(z_1) | Φ(z_2) | ... | Φ(z_K)]`.
@@ -161,7 +160,6 @@ pub(crate) fn stripe_score_warp_across_z_coords(
     })
 }
 
-
 pub(crate) fn build_per_z_score_warp_aux_blockspec(
     prepared: &PerZScoreWarpPrepared,
     rho: Array1<f64>,
@@ -232,7 +230,6 @@ pub(crate) fn build_per_z_score_warp_aux_blockspec(
     Ok(spec)
 }
 
-
 // ── Block layout ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -248,7 +245,6 @@ pub(crate) struct BlockSlices {
     pub(crate) influence: Option<std::ops::Range<usize>>,
     pub(crate) total: usize,
 }
-
 
 /// Identifies one coefficient block of the survival marginal-slope joint
 /// Hessian. The discriminant order *is* the coordinate layout order
@@ -276,12 +272,11 @@ pub(crate) enum HessBlock {
     Influence,
 }
 
-
 impl HessBlock {
     /// Blocks in canonical coordinate-layout order. Iterating this array is how
     /// every assembler visits blocks; the order fixes floating-point
     /// accumulation order in the matvec / bilinear paths.
-    const ALL: [HessBlock; 6] = [
+    pub(crate) const ALL: [HessBlock; 6] = [
         HessBlock::Time,
         HessBlock::Marginal,
         HessBlock::Logslope,
@@ -290,7 +285,6 @@ impl HessBlock {
         HessBlock::Influence,
     ];
 }
-
 
 impl BlockSlices {
     /// Coordinate range occupied by `block`, or `None` when the (optional)
@@ -307,7 +301,6 @@ impl BlockSlices {
         }
     }
 }
-
 
 pub(crate) fn block_slices(
     family: &SurvivalMarginalSlopeFamily,
@@ -358,7 +351,6 @@ pub(crate) fn block_slices(
     }
 }
 
-
 /// Owned scratch buffers backing a
 /// [`crate::families::survival_marginal_slope_gpu::SurvivalFlexGpuRowInputs`] descriptor.
 ///
@@ -378,7 +370,6 @@ pub(crate) struct SurvivalFlexGpuRowBatch {
     pub(crate) weights: Vec<f64>,
     pub(crate) event: Vec<f64>,
 }
-
 
 impl SurvivalFlexGpuRowBatch {
     /// Borrow the buffers as a
@@ -406,12 +397,10 @@ impl SurvivalFlexGpuRowBatch {
     }
 }
 
-
 // ── Primary-space helpers ─────────────────────────────────────────────
 
 // Primary scalar indices: 0=q0, 1=q1, 2=qd1, 3=g
 pub(crate) const N_PRIMARY: usize = 4;
-
 
 #[derive(Clone)]
 pub(crate) struct FlexPrimarySlices {
@@ -429,7 +418,6 @@ pub(crate) struct FlexPrimarySlices {
     pub(crate) infl: Option<usize>,
     pub(crate) total: usize,
 }
-
 
 /// Pack a private `SurvivalFlexTimepointExact` into the Block 10
 /// pub-substrate input type so the shared CPU/GPU pure assembler in
@@ -451,7 +439,6 @@ pub(crate) fn block10_pack_base(
     }
 }
 
-
 pub(crate) fn block10_pack_dir(
     ext: &SurvivalFlexTimepointDirectionalExact,
 ) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointDirectional {
@@ -463,7 +450,6 @@ pub(crate) fn block10_pack_dir(
     }
 }
 
-
 pub(crate) fn block10_pack_bi(
     bi: &SurvivalFlexTimepointBiDirectionalExact,
 ) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBiDirectional {
@@ -473,7 +459,6 @@ pub(crate) fn block10_pack_bi(
         d_uv_uv: bi.d_uv_uv.iter().copied().collect(),
     }
 }
-
 
 pub(crate) fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexPrimarySlices {
     let q0 = 0usize;
@@ -511,7 +496,6 @@ pub(crate) fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexP
         total: cursor,
     }
 }
-
 
 pub(crate) fn flex_identity_block_pairs(
     primary: &FlexPrimarySlices,

@@ -174,27 +174,27 @@ pub(crate) const ALO_PERVASIVE_LEVERAGE_FRACTION: f64 = 0.25;
 // Suppress ALO when every ALO-triggering row is already high-leverage in the
 // exact pure-parametric subdesign. Those directions are unpenalized, so no
 // smoothness-parameter move can clear the leverage barrier (#862).
-const ALO_PARAMETRIC_LEVERAGE_SHARE: f64 = 0.75;
+pub(crate) const ALO_PARAMETRIC_LEVERAGE_SHARE: f64 = 0.75;
 
 // Activation gate on the leave-one-out denominator (1 - h). 0.20 means we only
 // engage once some observation's LOO predictor is amplified by >5×; below that
 // the correction is negligible and we preserve the unstabilized objective.
-const ALO_DENOM_INSTABILITY_THRESHOLD: f64 = 0.20;
+pub(crate) const ALO_DENOM_INSTABILITY_THRESHOLD: f64 = 0.20;
 
 // Activation gate on raw leverage. 0.80 is the standard "very high leverage"
 // rule-of-thumb cut (well above the 2p/n and 3p/n flags); only points past it
 // can trip the stabilizer.
-const ALO_MAX_LEVERAGE_THRESHOLD: f64 = 0.80;
+pub(crate) const ALO_MAX_LEVERAGE_THRESHOLD: f64 = 0.80;
 
 // Weight on the smooth leverage barrier 0.5·τ·Σ(h - 0.80)₊². τ = 0.5 keeps the
 // barrier a soft nudge that grows quadratically past the threshold rather than
 // a hard wall, so the augmented objective stays smooth and differentiable.
-const ALO_TAU: f64 = 0.5;
+pub(crate) const ALO_TAU: f64 = 0.5;
 
 // Weight on the PSIS-reweighted Gaussian ALO deviance term. γ = 0.5 matches τ
 // so the leverage barrier and the predictive-deviance term enter on equal
 // conservative footing; neither dominates.
-const ALO_GAMMA: f64 = 0.5;
+pub(crate) const ALO_GAMMA: f64 = 0.5;
 
 // Saturation cap (in units of φ) on each observation's standardized squared
 // leave-one-out deviance contribution w_i·(y_i − η̃_i)²/φ. PSIS bounds the
@@ -213,20 +213,20 @@ const ALO_GAMMA: f64 = 0.5;
 // every genuine bulk point is left untouched and only the pathological isolated
 // rows are bounded. This bounds the *influence* of high-leverage points on the
 // criterion (the stated design goal) without globally inflating λ.
-const ALO_DEVIANCE_SATURATION: f64 = 9.0;
+pub(crate) const ALO_DEVIANCE_SATURATION: f64 = 9.0;
 
 // Cap on n·p work for the analytic first-order gradient. Above this the dense
 // H⁻¹Xᵀ solve is too expensive to justify per outer evaluation, so the
 // stabilizer falls back to value-only augmentation (still bit-preserving the
 // gate-off path).
-const ALO_GRADIENT_MAX_WORK: usize = 4_000_000;
+pub(crate) const ALO_GRADIENT_MAX_WORK: usize = 4_000_000;
 
 /// Shared factorization of the stabilized penalized Hessian, computed once on
 /// the value path and threaded into the ALO ρ-gradient so the gradient never
 /// re-materializes dense `X` or re-factorizes the same matrix (#862). The
 /// inverse itself lives behind the one sensitivity operator (#935), so this
 /// site holds no private H⁻¹ convention.
-struct AloFactoredHessian<'a> {
+pub(crate) struct AloFactoredHessian<'a> {
     /// Dense transformed design `X` (n × p).
     x: &'a Array2<f64>,
     /// The fit's sensitivity operator over the stabilized penalized Hessian.
@@ -235,12 +235,12 @@ struct AloFactoredHessian<'a> {
     h_inv_xt: &'a Array2<f64>,
 }
 
-fn alo_leverage_barrier(h: f64) -> f64 {
+pub(crate) fn alo_leverage_barrier(h: f64) -> f64 {
     let excess = (h - ALO_MAX_LEVERAGE_THRESHOLD).max(0.0);
     excess * excess
 }
 
-fn alo_leverage_barrier_derivative(h: f64) -> f64 {
+pub(crate) fn alo_leverage_barrier_derivative(h: f64) -> f64 {
     if h > ALO_MAX_LEVERAGE_THRESHOLD {
         2.0 * (h - ALO_MAX_LEVERAGE_THRESHOLD)
     } else {
@@ -250,7 +250,7 @@ fn alo_leverage_barrier_derivative(h: f64) -> f64 {
 
 /// Raw standardized leave-one-out deviance contribution
 /// d = w·(y − η̃)²/φ for one observation, before saturation.
-fn gaussian_alo_raw_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f64 {
+pub(crate) fn gaussian_alo_raw_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f64 {
     let residual = y - eta_loo;
     prior_weight * residual * residual / phi.max(f64::MIN_POSITIVE)
 }
@@ -261,7 +261,7 @@ fn gaussian_alo_raw_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) 
 /// near-unit-leverage point whose LOO residual explodes from basis geometry
 /// (not model misfit) contributes a bounded amount to the λ-selection
 /// criterion instead of dragging λ up via global over-smoothing.
-fn gaussian_alo_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f64 {
+pub(crate) fn gaussian_alo_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f64 {
     let raw = gaussian_alo_raw_deviance(y, eta_loo, prior_weight, phi);
     ALO_DEVIANCE_SATURATION * (raw / ALO_DEVIANCE_SATURATION).tanh()
 }
@@ -269,12 +269,12 @@ fn gaussian_alo_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f
 /// Saturator derivative g'(d) = 1 − tanh²(d/cap) evaluated at the raw
 /// standardized squared LOO residual `raw`. Used to chain-rule the analytic
 /// ρ-gradient of the saturated deviance term: ∂g(d_i)/∂η̃_i = g'(d_i)·∂d_i/∂η̃_i.
-fn gaussian_alo_deviance_saturation_factor(raw: f64) -> f64 {
+pub(crate) fn gaussian_alo_deviance_saturation_factor(raw: f64) -> f64 {
     let t = (raw / ALO_DEVIANCE_SATURATION).tanh();
     1.0 - t * t
 }
 
-fn transformed_penalty_matvec(
+pub(crate) fn transformed_penalty_matvec(
     penalty: &crate::construction::CanonicalPenalty,
     beta: &Array1<f64>,
 ) -> Array1<f64> {
@@ -297,7 +297,7 @@ impl EvalShared {
     /// `canonical_penalties` slice; on a cache hit the stored length is
     /// checked against it so a frame mismatch fails loudly instead of
     /// silently feeding stale scores.
-    fn canonical_penalty_scores_at_mode(
+    pub(crate) fn canonical_penalty_scores_at_mode(
         &self,
         canonical_penalties: &[crate::construction::CanonicalPenalty],
     ) -> Result<Arc<Vec<Array1<f64>>>, EstimationError> {
@@ -334,11 +334,12 @@ impl EvalShared {
     }
 }
 
-static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, (f64, u64)>>> = OnceLock::new();
+pub(crate) static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, (f64, u64)>>> =
+    OnceLock::new();
 
-static OUTER_IFT_RESIDUAL_ENERGY_ITER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static OUTER_IFT_RESIDUAL_ENERGY_ITER: AtomicU64 = AtomicU64::new(0);
 
-fn outer_ift_residual_energy_cache() -> &'static Mutex<HashMap<Vec<u64>, (f64, u64)>> {
+pub(crate) fn outer_ift_residual_energy_cache() -> &'static Mutex<HashMap<Vec<u64>, (f64, u64)>> {
     OUTER_IFT_RESIDUAL_ENERGY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -359,7 +360,7 @@ pub(crate) fn clear_outer_ift_residual_energy_for_fit() {
     OUTER_IFT_RESIDUAL_ENERGY_ITER.store(0, Ordering::Relaxed);
 }
 
-fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option<f64>) {
+pub(crate) fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option<f64>) {
     let Some(key) = super::cache::sanitized_rhokey(theta) else {
         return;
     };
@@ -516,7 +517,7 @@ impl HyperGradientBudget {
         Some(sensitivities)
     }
 
-    fn estimate_energy_sensitivity<F>(
+    pub(crate) fn estimate_energy_sensitivity<F>(
         &self,
         pairs: &[(Array1<f64>, Array1<f64>, usize)],
         energy: F,
@@ -585,7 +586,7 @@ impl HyperGradientBudget {
         mean_positive(&estimates)
     }
 
-    fn finite_difference_pairs(&self) -> Vec<(Array1<f64>, Array1<f64>, usize)> {
+    pub(crate) fn finite_difference_pairs(&self) -> Vec<(Array1<f64>, Array1<f64>, usize)> {
         let entries: Vec<_> = self.history.iter().collect();
         let mut pairs = Vec::new();
         for i in 0..entries.len().saturating_sub(1) {
@@ -608,7 +609,7 @@ impl HyperGradientBudget {
         pairs
     }
 
-    fn estimate_trace_sensitivity(&self) -> Option<f64> {
+    pub(crate) fn estimate_trace_sensitivity(&self) -> Option<f64> {
         let last_k = self.history.back()?.k;
         if last_k == 0 {
             return None;
@@ -722,8 +723,9 @@ impl HyperGradientRuntimeState {
     }
 }
 
-static HYPERGRADIENT_BUDGETS: OnceLock<Mutex<HashMap<usize, HyperGradientRuntimeState>>> =
-    OnceLock::new();
+pub(crate) static HYPERGRADIENT_BUDGETS: OnceLock<
+    Mutex<HashMap<usize, HyperGradientRuntimeState>>,
+> = OnceLock::new();
 
 pub(crate) fn hypergradient_budgets() -> &'static Mutex<HashMap<usize, HyperGradientRuntimeState>> {
     HYPERGRADIENT_BUDGETS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -736,7 +738,7 @@ pub(crate) struct IftQualityRuntimeState {
     pub(crate) fallback_next_flat: bool,
 }
 
-static IFT_QUALITY_STATES: OnceLock<Mutex<HashMap<usize, IftQualityRuntimeState>>> =
+pub(crate) static IFT_QUALITY_STATES: OnceLock<Mutex<HashMap<usize, IftQualityRuntimeState>>> =
     OnceLock::new();
 
 pub(crate) fn ift_quality_states() -> &'static Mutex<HashMap<usize, IftQualityRuntimeState>> {
@@ -744,21 +746,23 @@ pub(crate) fn ift_quality_states() -> &'static Mutex<HashMap<usize, IftQualityRu
 }
 
 #[derive(Clone)]
-struct IftModeResponseRuntimeCache {
+pub(crate) struct IftModeResponseRuntimeCache {
     rho: Array1<f64>,
     rho_mode_response_cols: Option<Array2<f64>>,
     ext_mode_response_cols: Option<Array2<f64>>,
 }
 
-static IFT_MODE_RESPONSE_CACHES: OnceLock<Mutex<HashMap<usize, IftModeResponseRuntimeCache>>> =
-    OnceLock::new();
+pub(crate) static IFT_MODE_RESPONSE_CACHES: OnceLock<
+    Mutex<HashMap<usize, IftModeResponseRuntimeCache>>,
+> = OnceLock::new();
 
-fn ift_mode_response_caches() -> &'static Mutex<HashMap<usize, IftModeResponseRuntimeCache>> {
+pub(crate) fn ift_mode_response_caches()
+-> &'static Mutex<HashMap<usize, IftModeResponseRuntimeCache>> {
     IFT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[derive(Clone)]
-struct IftJointModeResponseRuntimeCache {
+pub(crate) struct IftJointModeResponseRuntimeCache {
     theta: Array1<f64>,
     rho_dim: usize,
     beta_original: Array1<f64>,
@@ -766,16 +770,16 @@ struct IftJointModeResponseRuntimeCache {
     active_constraints: bool,
 }
 
-static IFT_JOINT_MODE_RESPONSE_CACHES: OnceLock<
+pub(crate) static IFT_JOINT_MODE_RESPONSE_CACHES: OnceLock<
     Mutex<HashMap<usize, IftJointModeResponseRuntimeCache>>,
 > = OnceLock::new();
 
-fn ift_joint_mode_response_caches()
+pub(crate) fn ift_joint_mode_response_caches()
 -> &'static Mutex<HashMap<usize, IftJointModeResponseRuntimeCache>> {
     IFT_JOINT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn joint_ift_cache_matches_theta(
+pub(crate) fn joint_ift_cache_matches_theta(
     cache: &IftJointModeResponseRuntimeCache,
     theta: &Array1<f64>,
     new_rho: &Array1<f64>,
@@ -799,9 +803,10 @@ fn joint_ift_cache_matches_theta(
     true
 }
 
-static IFT_LATEST_OUTER_THETA: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
+pub(crate) static IFT_LATEST_OUTER_THETA: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
 
-static IFT_LATEST_OUTER_RHO_UPPER_BOUNDS: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
+pub(crate) static IFT_LATEST_OUTER_RHO_UPPER_BOUNDS: OnceLock<Mutex<Option<Array1<f64>>>> =
+    OnceLock::new();
 
 pub(crate) fn record_current_outer_theta_for_ift(theta: &Array1<f64>) {
     let value = if theta.is_empty() || theta.iter().any(|v| !v.is_finite()) {
@@ -843,11 +848,11 @@ pub(crate) fn latest_outer_theta_for_ift() -> Option<Array1<f64>> {
         .clone()
 }
 
-fn l2_norm(values: &Array1<f64>) -> f64 {
+pub(crate) fn l2_norm(values: &Array1<f64>) -> f64 {
     values.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
 
-fn mean_positive(values: &[f64]) -> Option<f64> {
+pub(crate) fn mean_positive(values: &[f64]) -> Option<f64> {
     let mut sum = 0.0;
     let mut count = 0usize;
     for &value in values {
@@ -957,14 +962,14 @@ pub(crate) fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
     }
 }
 
-fn hash_array_view(hasher: &mut Fingerprinter, values: ndarray::ArrayView1<'_, f64>) {
+pub(crate) fn hash_array_view(hasher: &mut Fingerprinter, values: ndarray::ArrayView1<'_, f64>) {
     hasher.write_usize(values.len());
     for &value in values {
         hasher.write_f64(value);
     }
 }
 
-fn hash_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
+pub(crate) fn hash_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     hasher.write_usize(values.nrows());
     hasher.write_usize(values.ncols());
     for &value in values {
@@ -972,7 +977,7 @@ fn hash_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     }
 }
 
-fn hash_aux_prior_strength(
+pub(crate) fn hash_aux_prior_strength(
     hasher: &mut Fingerprinter,
     strength: crate::terms::latent_coord::AuxPriorStrength,
 ) {
@@ -1039,7 +1044,7 @@ pub(in crate::solver::estimate) fn latent_id_mode_cache_fingerprint(
     hasher.finish_u64()
 }
 
-fn hash_array3(hasher: &mut Fingerprinter, values: &ndarray::Array3<f64>) {
+pub(crate) fn hash_array3(hasher: &mut Fingerprinter, values: &ndarray::Array3<f64>) {
     let (a, b, c) = values.dim();
     hasher.write_usize(a);
     hasher.write_usize(b);
@@ -1049,7 +1054,10 @@ fn hash_array3(hasher: &mut Fingerprinter, values: &ndarray::Array3<f64>) {
     }
 }
 
-fn hash_psi_slice(hasher: &mut Fingerprinter, target: &crate::terms::analytic_penalties::PsiSlice) {
+pub(crate) fn hash_psi_slice(
+    hasher: &mut Fingerprinter,
+    target: &crate::terms::analytic_penalties::PsiSlice,
+) {
     hasher.write_usize(target.range.start);
     hasher.write_usize(target.range.end);
     match target.latent_dim {
@@ -1061,7 +1069,7 @@ fn hash_psi_slice(hasher: &mut Fingerprinter, target: &crate::terms::analytic_pe
     }
 }
 
-fn hash_scalar_weight_schedule(
+pub(crate) fn hash_scalar_weight_schedule(
     hasher: &mut Fingerprinter,
     schedule: &crate::terms::analytic_penalties::ScalarWeightSchedule,
 ) {
@@ -1083,7 +1091,7 @@ fn hash_scalar_weight_schedule(
     hasher.write_usize(schedule.iter_count);
 }
 
-fn hash_weight_schedule_option(
+pub(crate) fn hash_weight_schedule_option(
     hasher: &mut Fingerprinter,
     schedule: &Option<crate::terms::analytic_penalties::ScalarWeightSchedule>,
 ) {
@@ -1096,7 +1104,7 @@ fn hash_weight_schedule_option(
     }
 }
 
-fn hash_gumbel_temperature_schedule(
+pub(crate) fn hash_gumbel_temperature_schedule(
     hasher: &mut Fingerprinter,
     schedule: &crate::terms::sae_manifold::GumbelTemperatureSchedule,
 ) {
@@ -1118,7 +1126,7 @@ fn hash_gumbel_temperature_schedule(
     hasher.write_usize(schedule.iter_count);
 }
 
-fn hash_gumbel_schedule_option(
+pub(crate) fn hash_gumbel_schedule_option(
     hasher: &mut Fingerprinter,
     schedule: &Option<crate::terms::sae_manifold::GumbelTemperatureSchedule>,
 ) {
@@ -1131,7 +1139,7 @@ fn hash_gumbel_schedule_option(
     }
 }
 
-fn hash_isometry_reference(
+pub(crate) fn hash_isometry_reference(
     hasher: &mut Fingerprinter,
     reference: &crate::terms::analytic_penalties::IsometryReference,
 ) {
@@ -1146,7 +1154,7 @@ fn hash_isometry_reference(
     }
 }
 
-fn hash_weight_field(
+pub(crate) fn hash_weight_field(
     hasher: &mut Fingerprinter,
     field: &crate::terms::analytic_penalties::WeightField,
 ) {
@@ -1163,7 +1171,7 @@ fn hash_weight_field(
     }
 }
 
-fn hash_sparsity_kind(
+pub(crate) fn hash_sparsity_kind(
     hasher: &mut Fingerprinter,
     kind: crate::terms::analytic_penalties::SparsityKind,
 ) {
@@ -1182,7 +1190,7 @@ fn hash_sparsity_kind(
     }
 }
 
-fn hash_difference_op_kind(
+pub(crate) fn hash_difference_op_kind(
     hasher: &mut Fingerprinter,
     kind: &crate::terms::analytic_penalties::DifferenceOpKind,
 ) {
@@ -1201,7 +1209,7 @@ fn hash_difference_op_kind(
     }
 }
 
-fn hash_groups(hasher: &mut Fingerprinter, groups: &[Vec<usize>]) {
+pub(crate) fn hash_groups(hasher: &mut Fingerprinter, groups: &[Vec<usize>]) {
     hasher.write_usize(groups.len());
     for group in groups {
         hasher.write_usize(group.len());
@@ -1211,7 +1219,7 @@ fn hash_groups(hasher: &mut Fingerprinter, groups: &[Vec<usize>]) {
     }
 }
 
-fn hash_analytic_penalty_kind(
+pub(crate) fn hash_analytic_penalty_kind(
     hasher: &mut Fingerprinter,
     penalty: &crate::terms::analytic_penalties::AnalyticPenaltyKind,
 ) {
@@ -1517,14 +1525,17 @@ pub(crate) fn analytic_penalty_registry_fingerprint(
     hasher.finish_u64()
 }
 
-fn hash_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> Result<(), String> {
+pub(crate) fn hash_design_matrix(
+    hasher: &mut Fingerprinter,
+    design: &DesignMatrix,
+) -> Result<(), String> {
     // Stream the design through fixed-byte row blocks so a large-scale design
     // is never fully materialized just to fingerprint it. Target ~8 MiB of
     // working set per chunk, with a row-count floor of 1 (always make progress)
     // and a ceiling so a very narrow design does not request an unbounded chunk.
-    const HASH_CHUNK_TARGET_BYTES: usize = 8 * 1024 * 1024;
-    const HASH_CHUNK_MIN_ROWS: usize = 1;
-    const HASH_CHUNK_MAX_ROWS: usize = 4096;
+    pub(crate) const HASH_CHUNK_TARGET_BYTES: usize = 8 * 1024 * 1024;
+    pub(crate) const HASH_CHUNK_MIN_ROWS: usize = 1;
+    pub(crate) const HASH_CHUNK_MAX_ROWS: usize = 4096;
     let n = design.nrows();
     let p = design.ncols();
     hasher.write_usize(n);
@@ -1542,7 +1553,7 @@ fn hash_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> Resu
     Ok(())
 }
 
-fn hash_canonical_penalties(
+pub(crate) fn hash_canonical_penalties(
     hasher: &mut Fingerprinter,
     penalties: &[crate::construction::CanonicalPenalty],
 ) {
@@ -1563,7 +1574,7 @@ fn hash_canonical_penalties(
     }
 }
 
-fn finite_positive_from_bits(bits: u64) -> Option<f64> {
+pub(crate) fn finite_positive_from_bits(bits: u64) -> Option<f64> {
     if bits == 0 {
         return None;
     }
@@ -1575,7 +1586,7 @@ fn finite_positive_from_bits(bits: u64) -> Option<f64> {
     }
 }
 
-fn finite_nonnegative_from_bits(bits: u64) -> Option<f64> {
+pub(crate) fn finite_nonnegative_from_bits(bits: u64) -> Option<f64> {
     let value = f64::from_bits(bits);
     if value.is_finite() && value >= 0.0 {
         Some(value)
@@ -1584,7 +1595,7 @@ fn finite_nonnegative_from_bits(bits: u64) -> Option<f64> {
     }
 }
 
-fn finite_nonnegative_bits_or_no_signal(value: Option<f64>) -> u64 {
+pub(crate) fn finite_nonnegative_bits_or_no_signal(value: Option<f64>) -> u64 {
     value
         .filter(|v| v.is_finite() && *v >= 0.0)
         .map(f64::to_bits)
@@ -1615,7 +1626,7 @@ pub(crate) struct TkActiveBlock {
 /// Both `build_dense_derivative_context` and `build_sparse_derivative_context`
 /// return this, eliminating the tuple-order mismatch that previously existed
 /// between the two paths.
-struct DerivativeContext {
+pub(crate) struct DerivativeContext {
     deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
     dispersion: super::unified::DispersionHandling,
     log_likelihood: f64,
@@ -1641,7 +1652,7 @@ pub(crate) fn reml_is_gaussian_identity(likelihood: &GlmLikelihoodSpec) -> bool 
 /// inverse-link derivatives are available, including mixture LogLog/Cauchit
 /// components. Returns `None` for any other response or link.
 #[inline]
-fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<InverseLink> {
+pub(crate) fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<InverseLink> {
     let spec = reml_spec(likelihood);
     if !matches!(spec.response, ResponseFamily::Binomial) {
         return None;
@@ -1678,9 +1689,9 @@ pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<InverseLi
 /// marginal-SD distance scale `d = exp(−ρ/2)` calibrates the exponential rate
 /// `θ = −ln(tail_prob)/upper`. We use `upper = 10`, `tail_prob = 0.01`
 /// ⇒ `θ = −ln(0.01)/10 ≈ 0.4605`.
-const FIRTH_DEFAULT_PC_UPPER: f64 = 10.0;
+pub(crate) const FIRTH_DEFAULT_PC_UPPER: f64 = 10.0;
 
-const FIRTH_DEFAULT_PC_TAIL_PROB: f64 = 0.01;
+pub(crate) const FIRTH_DEFAULT_PC_TAIL_PROB: f64 = 0.01;
 
 /// Weakly-informative DEFAULT outer ρ prior used by the firth-general policy on
 /// any smoothing coordinate the caller left unset (`RhoPrior::Flat`).
@@ -1699,7 +1710,7 @@ const FIRTH_DEFAULT_PC_TAIL_PROB: f64 = 0.01;
 /// instead of the plain PC term's persistent `+1/2` Occam pull, which would
 /// shift every identified `λ` by an `O(1/n)` amount on every fit.
 #[inline]
-fn firth_default_pc_prior() -> RhoPrior {
+pub(crate) fn firth_default_pc_prior() -> RhoPrior {
     RhoPrior::PenalizedComplexity {
         upper: FIRTH_DEFAULT_PC_UPPER,
         tail_prob: FIRTH_DEFAULT_PC_TAIL_PROB,
@@ -1712,7 +1723,7 @@ fn firth_default_pc_prior() -> RhoPrior {
 /// `Flat` (every coordinate defaulted) or it is an `Independent` with `Flat`
 /// holes. Returned per-`ρ`-coordinate so the runtime can override just those
 /// coordinates' objective contribution with the self-gated barrier.
-fn firth_default_coord_mask(configured: &RhoPrior, len: usize) -> Vec<bool> {
+pub(crate) fn firth_default_coord_mask(configured: &RhoPrior, len: usize) -> Vec<bool> {
     match configured {
         RhoPrior::Flat => vec![true; len],
         RhoPrior::Independent(priors) if priors.len() == len => {
@@ -1730,7 +1741,7 @@ fn firth_default_coord_mask(configured: &RhoPrior, len: usize) -> Vec<bool> {
 /// [`firth_default_pc_prior`]; any explicitly-configured prior is honored
 /// unchanged. Pulled out as a free function so the decision is unit-testable
 /// without constructing a full `RemlState`.
-fn resolve_effective_rho_prior(configured: &RhoPrior) -> std::borrow::Cow<'_, RhoPrior> {
+pub(crate) fn resolve_effective_rho_prior(configured: &RhoPrior) -> std::borrow::Cow<'_, RhoPrior> {
     match configured {
         // Whole prior unset → fill every coordinate with the weak PC default.
         RhoPrior::Flat => std::borrow::Cow::Owned(firth_default_pc_prior()),
@@ -1752,7 +1763,7 @@ fn resolve_effective_rho_prior(configured: &RhoPrior) -> std::borrow::Cow<'_, Rh
 }
 
 #[inline]
-fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
+pub(crate) fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
     let spec = reml_spec(likelihood);
     match (&spec.response, &spec.link) {
         // Beta carries phi inside the response variant under the LikelihoodSpec form.
@@ -1783,7 +1794,7 @@ fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
 /// block-local sampled marginalization is declined (the Monte-Carlo estimate
 /// would be noisier than the Laplace error it corrects). Auto-derived constant,
 /// not a tunable flag.
-const MIN_IMPORTANCE_ESS_FRACTION: f64 = 0.10;
+pub(crate) const MIN_IMPORTANCE_ESS_FRACTION: f64 = 0.10;
 
 /// Block-local non-Gaussian-remainder target for the adaptive Laplace-to-
 /// sampling fallback (issue #784).
@@ -1811,7 +1822,7 @@ const MIN_IMPORTANCE_ESS_FRACTION: f64 = 0.10;
 ///   ∂ΔF/∂ρ_k = λ_k (S_k β̂)·δ.
 /// The implicit β̂(ρ) channel is the same envelope term the surrounding
 /// Laplace/LAML evaluator already accounts for at the mode.
-struct Gam784BlockTarget<'t> {
+pub(crate) struct Gam784BlockTarget<'t> {
     /// `X_t` (transformed-basis dense design, matching `h_total`/`solve_c_array`).
     x_transformed: &'t Array2<f64>,
     /// Block eigenvectors `V_b` (columns), shape `p × m`.
@@ -1843,7 +1854,7 @@ struct Gam784BlockTarget<'t> {
 impl Gam784BlockTarget<'_> {
     /// Map a whitened block displacement `t` to the coefficient displacement
     /// `δ = V_b t` and the per-row score `s = X_t δ`.
-    fn displacement(&self, t: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
+    pub(crate) fn displacement(&self, t: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
         let delta = self.block_vecs.dot(t);
         let s = crate::faer_ndarray::fast_av(self.x_transformed, &delta);
         (delta, s)
@@ -1863,7 +1874,7 @@ impl Gam784BlockTarget<'_> {
     /// Rows whose inverse-link jet is infeasible return 0: the value channel
     /// scores such draws as `ΔF = ∞` (zero importance weight), so their score
     /// is never consumed.
-    fn neg_score_at(&self, eta: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn neg_score_at(&self, eta: &Array1<f64>) -> Array1<f64> {
         let spec_response = reml_spec(&self.likelihood).response.clone();
         let family = pirls::weight_family_for_glm_likelihood(&self.likelihood);
         let fam_scale = match &spec_response {
@@ -1874,8 +1885,8 @@ impl Gam784BlockTarget<'_> {
         };
         // Same floors as `calculate_deviance`: binomial clamps μ to
         // [1e-12, 1−1e-12]; the remaining families floor μ at 1e-10.
-        const BINOMIAL_MU_EPS: f64 = 1e-12;
-        const MU_FLOOR: f64 = 1e-10;
+        pub(crate) const BINOMIAL_MU_EPS: f64 = 1e-12;
+        pub(crate) const MU_FLOOR: f64 = 1e-10;
         let is_binomial = matches!(spec_response, ResponseFamily::Binomial);
         let mut out = Array1::<f64>::zeros(eta.len());
         for i in 0..eta.len() {
@@ -1903,19 +1914,19 @@ impl Gam784BlockTarget<'_> {
 }
 
 impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
-    fn block_dim(&self) -> usize {
+    pub(crate) fn block_dim(&self) -> usize {
         self.block_lambdas.len()
     }
 
-    fn rho_dim(&self) -> usize {
+    pub(crate) fn rho_dim(&self) -> usize {
         self.lambdas.len()
     }
 
-    fn block_curvatures(&self) -> &Array1<f64> {
+    pub(crate) fn block_curvatures(&self) -> &Array1<f64> {
         &self.block_lambdas
     }
 
-    fn excess(&self, t: &Array1<f64>) -> f64 {
+    pub(crate) fn excess(&self, t: &Array1<f64>) -> f64 {
         let (delta, s) = self.displacement(t);
         // Displaced mean μ(η̂ + s) via the inverse-link jet (family-uniform).
         let mut mu_disp = Array1::<f64>::zeros(self.eta_hat.len());
@@ -1951,7 +1962,7 @@ impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
         neg_loglik_diff + penalty_term - 0.5 * curv
     }
 
-    fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
         let (delta, _s) = self.displacement(t);
         let mut grad = Array1::<f64>::zeros(self.lambdas.len());
         for (k, (score, &lam)) in self
@@ -1966,12 +1977,12 @@ impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
         grad
     }
 
-    fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64> {
         let (_delta, s) = self.displacement(t);
         self.neg_score_at(&(&self.eta_hat + &s))
     }
 
-    fn base_neg_score(&self) -> Array1<f64> {
+    pub(crate) fn base_neg_score(&self) -> Array1<f64> {
         self.neg_score_at(&self.eta_hat)
     }
 }

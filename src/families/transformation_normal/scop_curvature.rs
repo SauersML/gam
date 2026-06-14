@@ -1,7 +1,7 @@
 use super::*;
 
 impl TransformationNormalFamily {
-    fn scop_gradient_and_negative_hessian(
+    pub(crate) fn scop_gradient_and_negative_hessian(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
@@ -51,13 +51,13 @@ impl TransformationNormalFamily {
         let response_lower_basis = &self.response_lower_basis;
         let response_upper_basis = &self.response_upper_basis;
 
-        struct ScopAccum {
+        pub(crate) struct ScopAccum {
             gradient: Array1<f64>,
             hessian: Array2<f64>,
         }
 
         impl ScopAccum {
-            fn new(p_total: usize) -> Self {
+            pub(crate) fn new(p_total: usize) -> Self {
                 Self {
                     gradient: Array1::<f64>::zeros(p_total),
                     hessian: Array2::<f64>::zeros((p_total, p_total)),
@@ -187,7 +187,7 @@ impl TransformationNormalFamily {
         Ok((gradient, hessian))
     }
 
-    fn scop_gradient(
+    pub(crate) fn scop_gradient(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
@@ -299,7 +299,7 @@ impl TransformationNormalFamily {
     /// `D H_ab[u] = w [ (D h_a)h_b + h_a(D h_b) + Hu h_ab
     ///              + ((D hp_a)hp_b + hp_a(D hp_b))/hp^2
     ///              - 2 hp_a hp_b HPu/hp^3 + hp_ab HPu/hp^2 ]`.
-    fn scop_hessian_directional_derivative(
+    pub(crate) fn scop_hessian_directional_derivative(
         &self,
         beta: &Array1<f64>,
         direction: &Array1<f64>,
@@ -342,7 +342,7 @@ impl TransformationNormalFamily {
             ) }.into());
         }
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        const TARGET_CHUNK_COUNT: usize = 32;
+        pub(crate) const TARGET_CHUNK_COUNT: usize = 32;
         let chunk_size = n.div_ceil(TARGET_CHUNK_COUNT).max(1);
         let n_chunks = n.div_ceil(chunk_size);
 
@@ -524,7 +524,7 @@ impl TransformationNormalFamily {
     ///    + 6 hp_a hp_b HPu HPv/hp⁴
     ///    + hp_ab HPuv/hp²
     ///    - 2 hp_ab HPu HPv/hp³ ]`.
-    fn scop_hessian_second_directional_derivative(
+    pub(crate) fn scop_hessian_second_directional_derivative(
         &self,
         beta: &Array1<f64>,
         direction_u: &Array1<f64>,
@@ -575,7 +575,7 @@ impl TransformationNormalFamily {
             ) }.into());
         }
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        const TARGET_CHUNK_COUNT: usize = 32;
+        pub(crate) const TARGET_CHUNK_COUNT: usize = 32;
         let chunk_size = n.div_ceil(TARGET_CHUNK_COUNT).max(1);
         let n_chunks = n.div_ceil(chunk_size);
 
@@ -793,7 +793,7 @@ impl TransformationNormalFamily {
         Ok(0.5 * (&out + &out.t()))
     }
 
-    fn scop_hessian_matvec_into(
+    pub(crate) fn scop_hessian_matvec_into(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
@@ -933,7 +933,7 @@ impl TransformationNormalFamily {
         Ok(())
     }
 
-    fn scop_hessian_directional_matvec(
+    pub(crate) fn scop_hessian_directional_matvec(
         &self,
         beta: &Array1<f64>,
         direction: &Array1<f64>,
@@ -946,7 +946,7 @@ impl TransformationNormalFamily {
         Ok(out.column(0).to_owned())
     }
 
-    fn scop_hessian_directional_matmat(
+    pub(crate) fn scop_hessian_directional_matmat(
         &self,
         beta: &Array1<f64>,
         direction: &Array1<f64>,
@@ -1170,7 +1170,7 @@ impl TransformationNormalFamily {
         Ok(out)
     }
 
-    fn scop_projected_response_gram_table(
+    pub(crate) fn scop_projected_response_gram_table(
         &self,
         factor: ArrayView2<'_, f64>,
     ) -> Result<Array2<f64>, String> {
@@ -1239,7 +1239,7 @@ impl TransformationNormalFamily {
             .map_err(|e| format!("SCOP projected response Gram table shape failed: {e}"))
     }
 
-    fn scop_hessian_directional_trace_from_response_grams(
+    pub(crate) fn scop_hessian_directional_trace_from_response_grams(
         &self,
         beta: &Array1<f64>,
         direction: &Array1<f64>,
@@ -1285,7 +1285,7 @@ impl TransformationNormalFamily {
         let h_prime = row_quantities.h_prime.as_ref();
         let row_gamma = row_quantities.gamma.as_ref();
 
-        struct DhTraceScratch {
+        pub(crate) struct DhTraceScratch {
             gamma: Vec<f64>,
             gamma_dir: Vec<f64>,
             h_factor: Vec<f64>,
@@ -1297,7 +1297,7 @@ impl TransformationNormalFamily {
         }
 
         impl DhTraceScratch {
-            fn new(p_resp: usize) -> Self {
+            pub(crate) fn new(p_resp: usize) -> Self {
                 Self {
                     gamma: vec![0.0; p_resp],
                     gamma_dir: vec![0.0; p_resp],
@@ -1432,7 +1432,7 @@ impl TransformationNormalFamily {
         }
     }
 
-    fn scop_hessian_second_directional_matvec(
+    pub(crate) fn scop_hessian_second_directional_matvec(
         &self,
         beta: &Array1<f64>,
         direction_u: &Array1<f64>,
@@ -1452,7 +1452,7 @@ impl TransformationNormalFamily {
         Ok(out.column(0).to_owned())
     }
 
-    fn scop_hessian_second_directional_matmat(
+    pub(crate) fn scop_hessian_second_directional_matmat(
         &self,
         beta: &Array1<f64>,
         direction_u: &Array1<f64>,
@@ -1748,7 +1748,7 @@ impl TransformationNormalFamily {
         Ok(out)
     }
 
-    fn scop_hessian_diagonal(
+    pub(crate) fn scop_hessian_diagonal(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,

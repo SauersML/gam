@@ -399,7 +399,7 @@ pub(crate) fn binomial_location_scale_core(
     /// ensures the pointers outlive the parallel region (see SAFETY: notes
     /// on each `unsafe` site below).
     #[derive(Clone, Copy)]
-    struct SendPtr(*mut f64);
+    pub(crate) struct SendPtr(*mut f64);
     // SAFETY: pointers are constructed from live writable buffers and used
     // only for disjoint per-row writes inside a bounded parallel region; the
     // owning `Vec`s outlive the region.
@@ -633,11 +633,13 @@ impl BinomialLocationScaleFamily {
         }
     }
 
-    fn exact_joint_supported(&self) -> bool {
+    pub(crate) fn exact_joint_supported(&self) -> bool {
         self.threshold_design.is_some() && self.log_sigma_design.is_some()
     }
 
-    fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
+    pub(crate) fn dense_block_designs(
+        &self,
+    ) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         dense_locscale_block_designs_cached(
             self.threshold_design.as_ref(),
             self.log_sigma_design.as_ref(),
@@ -648,7 +650,7 @@ impl BinomialLocationScaleFamily {
         )
     }
 
-    fn dense_block_designs_fromspecs<'a>(
+    pub(crate) fn dense_block_designs_fromspecs<'a>(
         &self,
         specs: &'a [ParameterBlockSpec],
     ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
@@ -664,7 +666,7 @@ impl BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_joint_dense_block_designs<'a>(
+    pub(crate) fn exact_joint_dense_block_designs<'a>(
         &'a self,
         specs: Option<&'a [ParameterBlockSpec]>,
     ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
@@ -692,7 +694,7 @@ impl BinomialLocationScaleFamily {
         Ok(None)
     }
 
-    fn exact_joint_block_designs_owned(
+    pub(crate) fn exact_joint_block_designs_owned(
         &self,
         specs: Option<&[ParameterBlockSpec]>,
     ) -> Result<Option<(DesignMatrix, DesignMatrix)>, String> {
@@ -730,7 +732,7 @@ impl BinomialLocationScaleFamily {
         Ok(Some((x_t, x_ls)))
     }
 
-    fn exact_newton_joint_gradient_from_designs(
+    pub(crate) fn exact_newton_joint_gradient_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         x_t: &DesignMatrix,
@@ -812,7 +814,7 @@ impl BinomialLocationScaleFamily {
         })
     }
 
-    fn exact_newton_joint_hessian_for_specs(
+    pub(crate) fn exact_newton_joint_hessian_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: Option<&[ParameterBlockSpec]>,
@@ -823,7 +825,7 @@ impl BinomialLocationScaleFamily {
         self.exact_newton_joint_hessian_from_design_matrices(block_states, &x_t, &x_ls)
     }
 
-    fn exact_newton_joint_hessian_directional_derivative_for_specs(
+    pub(crate) fn exact_newton_joint_hessian_directional_derivative_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: Option<&[ParameterBlockSpec]>,
@@ -840,7 +842,7 @@ impl BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_hessian_second_directional_derivative_for_specs(
+    pub(crate) fn exact_newton_joint_hessian_second_directional_derivative_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: Option<&[ParameterBlockSpec]>,
@@ -859,7 +861,7 @@ impl BinomialLocationScaleFamily {
         )
     }
 
-    fn expected_joint_information_from_designs(
+    pub(crate) fn expected_joint_information_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         x_t: &Array2<f64>,
@@ -933,7 +935,7 @@ impl BinomialLocationScaleFamily {
         Ok(Some(h))
     }
 
-    fn expected_joint_information_directional_from_designs(
+    pub(crate) fn expected_joint_information_directional_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         x_t: &Array2<f64>,
@@ -1024,7 +1026,7 @@ impl BinomialLocationScaleFamily {
         Ok(Some(d_h))
     }
 
-    fn expected_joint_information_second_directional_from_designs(
+    pub(crate) fn expected_joint_information_second_directional_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         x_t: &Array2<f64>,
@@ -1126,7 +1128,7 @@ impl BinomialLocationScaleFamily {
         Ok(Some(d2_h))
     }
 
-    fn expected_joint_contracted_trace_hessian_from_designs(
+    pub(crate) fn expected_joint_contracted_trace_hessian_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         x_t: &Array2<f64>,
@@ -1243,7 +1245,7 @@ impl BinomialLocationScaleFamily {
         Ok(Some(h))
     }
 
-    fn expected_joint_information_for_specs(
+    pub(crate) fn expected_joint_information_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: Option<&[ParameterBlockSpec]>,
@@ -1254,7 +1256,7 @@ impl BinomialLocationScaleFamily {
         self.expected_joint_information_from_designs(block_states, &x_t, &x_ls)
     }
 
-    fn expected_joint_information_directional_for_specs(
+    pub(crate) fn expected_joint_information_directional_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: Option<&[ParameterBlockSpec]>,
@@ -1271,7 +1273,7 @@ impl BinomialLocationScaleFamily {
         )
     }
 
-    fn expected_joint_information_second_directional_for_specs(
+    pub(crate) fn expected_joint_information_second_directional_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: Option<&[ParameterBlockSpec]>,
@@ -1290,7 +1292,7 @@ impl BinomialLocationScaleFamily {
         )
     }
 
-    fn expected_joint_contracted_trace_hessian_for_specs(
+    pub(crate) fn expected_joint_contracted_trace_hessian_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: Option<&[ParameterBlockSpec]>,
@@ -1307,7 +1309,7 @@ impl BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_psi_terms_for_specs(
+    pub(crate) fn exact_newton_joint_psi_terms_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -1327,7 +1329,7 @@ impl BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_psisecond_order_terms_for_specs(
+    pub(crate) fn exact_newton_joint_psisecond_order_terms_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -1348,7 +1350,7 @@ impl BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_psihessian_directional_derivative_for_specs(
+    pub(crate) fn exact_newton_joint_psihessian_directional_derivative_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -1371,7 +1373,7 @@ impl BinomialLocationScaleFamily {
 
     /// Compute the rowwise joint curvature coefficients (D_tt, D_tl, D_ll)
     /// shared by the dense joint Hessian path and the matrix-free workspace.
-    fn exact_newton_joint_hessian_row_coefficients(
+    pub(crate) fn exact_newton_joint_hessian_row_coefficients(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
@@ -1457,7 +1459,7 @@ impl BinomialLocationScaleFamily {
     /// Exact diagonal-block-only Hessians (h_tt, h_ll) used by `evaluate()`
     /// to populate per-block working sets without ever materializing the
     /// dense p×p joint matrix.
-    fn exact_newton_block_diagonal_hessians_from_design_matrices(
+    pub(crate) fn exact_newton_block_diagonal_hessians_from_design_matrices(
         &self,
         block_states: &[ParameterBlockState],
         x_t: &DesignMatrix,
@@ -1470,7 +1472,7 @@ impl BinomialLocationScaleFamily {
         Ok((h_tt, h_ll))
     }
 
-    fn exact_newton_joint_hessian_from_designs(
+    pub(crate) fn exact_newton_joint_hessian_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         x_t: &Array2<f64>,
@@ -1549,7 +1551,7 @@ impl BinomialLocationScaleFamily {
         Ok(Some(h))
     }
 
-    fn exact_newton_joint_hessian_from_design_matrices(
+    pub(crate) fn exact_newton_joint_hessian_from_design_matrices(
         &self,
         block_states: &[ParameterBlockState],
         x_t: &DesignMatrix,
@@ -1579,7 +1581,7 @@ impl BinomialLocationScaleFamily {
         Ok(Some(h))
     }
 
-    fn exact_newton_joint_hessian_directional_derivative_from_designs(
+    pub(crate) fn exact_newton_joint_hessian_directional_derivative_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         x_t: &Array2<f64>,
@@ -1696,7 +1698,7 @@ impl BinomialLocationScaleFamily {
         Ok(Some(d_h))
     }
 
-    fn exact_newton_joint_hessiansecond_directional_derivative_from_designs(
+    pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         x_t: &Array2<f64>,
@@ -1819,7 +1821,7 @@ impl BinomialLocationScaleFamily {
         Ok(Some(d2_h))
     }
 
-    fn exact_newton_joint_psi_direction(
+    pub(crate) fn exact_newton_joint_psi_direction(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -1855,7 +1857,7 @@ impl BinomialLocationScaleFamily {
         }))
     }
 
-    fn exact_newton_joint_psisecond_design_drifts(
+    pub(crate) fn exact_newton_joint_psisecond_design_drifts(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -1882,7 +1884,7 @@ impl BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_psi_terms_from_designs(
+    pub(crate) fn exact_newton_joint_psi_terms_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -2040,7 +2042,7 @@ impl BinomialLocationScaleFamily {
         // derivatives are O(n) at large scale and are called O(K) times per
         // outer REML gradient (K = number of psi coords), so a parallel pass is
         // worthwhile here.
-        struct PsiTermsRow {
+        pub(crate) struct PsiTermsRow {
             r_t: f64,
             r_ls: f64,
             dr_t: f64,
@@ -2206,7 +2208,7 @@ impl BinomialLocationScaleFamily {
         }))
     }
 
-    fn exact_newton_joint_psisecond_order_terms_from_designs(
+    pub(crate) fn exact_newton_joint_psisecond_order_terms_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -2249,7 +2251,7 @@ impl BinomialLocationScaleFamily {
         ))
     }
 
-    fn exact_newton_joint_psisecond_order_terms_from_parts(
+    pub(crate) fn exact_newton_joint_psisecond_order_terms_from_parts(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -2431,7 +2433,7 @@ impl BinomialLocationScaleFamily {
         let mut d2h_tl = Array1::<f64>::zeros(n);
         let mut d2h_ll = Array1::<f64>::zeros(n);
         let mut objective_psi_psi = 0.0;
-        struct PsiSecondRow {
+        pub(crate) struct PsiSecondRow {
             r_t: f64,
             r_ls: f64,
             dr_t_i: f64,
@@ -2717,7 +2719,7 @@ impl BinomialLocationScaleFamily {
         })
     }
 
-    fn exact_newton_joint_psihessian_directional_derivative_from_designs(
+    pub(crate) fn exact_newton_joint_psihessian_directional_derivative_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -2748,7 +2750,7 @@ impl BinomialLocationScaleFamily {
         ))
     }
 
-    fn exact_newton_joint_psihessian_directional_derivative_from_parts(
+    pub(crate) fn exact_newton_joint_psihessian_directional_derivative_from_parts(
         &self,
         block_states: &[ParameterBlockState],
         dir_a: &LocationScaleJointPsiDirection,
@@ -2942,11 +2944,11 @@ impl CustomFamily for BinomialLocationScaleFamily {
     /// The Binomial location-scale joint Hessian depends on β because the
     /// Hessian blocks are functions of q = -t/σ and the link derivatives,
     /// all of which change when β_t or β_{log σ} move.
-    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+    pub(crate) fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }
 
-    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+    pub(crate) fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Operator-aware: matrix-free workspace applies joint Hv at
         // O(n · (p_t + p_ℓ)); only fall back to the dense build cost when
         // `use_joint_matrix_free_path` declines the operator path.
@@ -2956,7 +2958,10 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    pub(crate) fn evaluate(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -3062,7 +3067,10 @@ impl CustomFamily for BinomialLocationScaleFamily {
         })
     }
 
-    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+    pub(crate) fn log_likelihood_only(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<f64, String> {
         if block_states.len() != 2 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -3102,7 +3110,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
     /// When `None`, this returns the full-data `log_likelihood_only`. Inner
     /// PIRLS line searches never install the subsample option, so they
     /// continue to score the exact full-data log-likelihood.
-    fn log_likelihood_only_with_options(
+    pub(crate) fn log_likelihood_only_with_options(
         &self,
         block_states: &[ParameterBlockState],
         options: &BlockwiseFitOptions,
@@ -3160,11 +3168,11 @@ impl CustomFamily for BinomialLocationScaleFamily {
         ll
     }
 
-    fn requires_joint_outer_hyper_path(&self) -> bool {
+    pub(crate) fn requires_joint_outer_hyper_path(&self) -> bool {
         true
     }
 
-    fn diagonalworking_weights_directional_derivative(
+    pub(crate) fn diagonalworking_weights_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         idx: usize,
@@ -3179,7 +3187,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_psi_terms(
+    pub(crate) fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3194,7 +3202,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_psisecond_order_terms(
+    pub(crate) fn exact_newton_joint_psisecond_order_terms(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3211,7 +3219,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_psihessian_directional_derivative(
+    pub(crate) fn exact_newton_joint_psihessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3228,7 +3236,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_psi_workspace(
+    pub(crate) fn exact_newton_joint_psi_workspace(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3247,7 +3255,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )))
     }
 
-    fn exact_newton_hessian_directional_derivative(
+    pub(crate) fn exact_newton_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         block_idx: usize,
@@ -3306,18 +3314,18 @@ impl CustomFamily for BinomialLocationScaleFamily {
         Ok(Some(joint.slice(s![start..end, start..end]).to_owned()))
     }
 
-    fn exact_newton_joint_hessian(
+    pub(crate) fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         self.exact_newton_joint_hessian_for_specs(block_states, None)
     }
 
-    fn has_explicit_joint_hessian(&self) -> bool {
+    pub(crate) fn has_explicit_joint_hessian(&self) -> bool {
         true
     }
 
-    fn exact_newton_joint_hessian_directional_derivative(
+    pub(crate) fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
@@ -3329,7 +3337,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_hessiansecond_directional_derivative(
+    pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_u_flat: &Array1<f64>,
@@ -3343,7 +3351,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_hessian_with_specs(
+    pub(crate) fn exact_newton_joint_hessian_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3351,7 +3359,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         self.exact_newton_joint_hessian_for_specs(block_states, Some(specs))
     }
 
-    fn exact_newton_joint_hessian_directional_derivative_with_specs(
+    pub(crate) fn exact_newton_joint_hessian_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3364,7 +3372,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+    pub(crate) fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3379,7 +3387,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn joint_jeffreys_information_with_specs(
+    pub(crate) fn joint_jeffreys_information_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3387,7 +3395,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         self.expected_joint_information_for_specs(block_states, Some(specs))
     }
 
-    fn joint_jeffreys_information_directional_derivative_with_specs(
+    pub(crate) fn joint_jeffreys_information_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3400,7 +3408,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn joint_jeffreys_information_second_directional_derivative_with_specs(
+    pub(crate) fn joint_jeffreys_information_second_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3415,7 +3423,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
+    pub(crate) fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3424,11 +3432,11 @@ impl CustomFamily for BinomialLocationScaleFamily {
         self.expected_joint_contracted_trace_hessian_for_specs(block_states, Some(specs), weight)
     }
 
-    fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
+    pub(crate) fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
         true
     }
 
-    fn joint_jeffreys_information_matches_observed_hessian(&self) -> bool {
+    pub(crate) fn joint_jeffreys_information_matches_observed_hessian(&self) -> bool {
         // The Jeffreys information above is the EXPECTED Fisher information,
         // not the observed Hessian: observed-Hessian conditioning certificates
         // ("Jeffreys provably skippable" matvec pre-checks) must not gate the
@@ -3439,7 +3447,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         false
     }
 
-    fn exact_newton_joint_gradient_evaluation(
+    pub(crate) fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3451,7 +3459,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
             .map(Some)
     }
 
-    fn exact_newton_joint_hessian_workspace(
+    pub(crate) fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3481,7 +3489,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
     /// rows are zeroed. The resulting joint Hessian is an unbiased estimator
     /// of the full-data joint Hessian. Inner PIRLS never installs the option,
     /// so the inner solve continues to consume the exact full-data Hessian.
-    fn exact_newton_joint_hessian_workspace_with_options(
+    pub(crate) fn exact_newton_joint_hessian_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -3518,11 +3526,14 @@ impl CustomFamily for BinomialLocationScaleFamily {
     /// the full-data outer score. Inner-PIRLS and final-covariance paths
     /// never install the option, so they continue to consume the exact
     /// full-data quantities.
-    fn outer_derivative_subsample_capable(&self) -> bool {
+    pub(crate) fn outer_derivative_subsample_capable(&self) -> bool {
         true
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+    pub(crate) fn inner_coefficient_hessian_hvp_available(
+        &self,
+        specs: &[ParameterBlockSpec],
+    ) -> bool {
         // Representation support means the realized two-block designs can be
         // applied as β-space operators. It does not imply that exact
         // second-order outer θ work is cheap.
@@ -3535,7 +3546,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleFamily {
-    fn generativespec(
+    pub(crate) fn generativespec(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
@@ -3587,7 +3598,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
 /// Cost is Θ(n (p_t + p_ls)) per matvec versus Θ(n (p_t + p_ls)^2) to form
 /// the dense matrix. The same block-operator structure is used for first and
 /// second directional derivatives.
-struct BinomialLocationScaleHessianWorkspace {
+pub(crate) struct BinomialLocationScaleHessianWorkspace {
     family: BinomialLocationScaleFamily,
     x_t: DesignMatrix,
     x_ls: DesignMatrix,
@@ -3602,31 +3613,31 @@ struct BinomialLocationScaleHessianWorkspace {
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
-struct BinomialDirectionKey {
+pub(crate) struct BinomialDirectionKey {
     bits: Vec<u64>,
 }
 
 impl BinomialDirectionKey {
-    fn from_array(v: &Array1<f64>) -> Self {
+    pub(crate) fn from_array(v: &Array1<f64>) -> Self {
         Self {
             bits: v.iter().map(|value| value.to_bits()).collect(),
         }
     }
 }
 
-struct BinomialDirectionEta {
+pub(crate) struct BinomialDirectionEta {
     t: Array1<f64>,
     ls: Array1<f64>,
 }
 
-struct BinomialRowCoeffTriple {
+pub(crate) struct BinomialRowCoeffTriple {
     tt: Arc<Array1<f64>>,
     tl: Arc<Array1<f64>>,
     ll: Arc<Array1<f64>>,
 }
 
 impl BinomialLocationScaleHessianWorkspace {
-    fn new(
+    pub(crate) fn new(
         family: BinomialLocationScaleFamily,
         block_states: Vec<ParameterBlockState>,
         x_t: DesignMatrix,
@@ -3657,7 +3668,7 @@ impl BinomialLocationScaleHessianWorkspace {
         })
     }
 
-    fn direction_eta(
+    pub(crate) fn direction_eta(
         &self,
         key: &BinomialDirectionKey,
         d_beta: &Array1<f64>,
@@ -3691,7 +3702,7 @@ impl BinomialLocationScaleHessianWorkspace {
             .clone()
     }
 
-    fn first_coefficients(
+    pub(crate) fn first_coefficients(
         &self,
         key: &BinomialDirectionKey,
         eta: &BinomialDirectionEta,
@@ -3735,7 +3746,7 @@ impl BinomialLocationScaleHessianWorkspace {
     /// Across outer evals the directions shift with ρ/ψ so cross-eval hits
     /// are nil. Computing on demand is O(n) — under 10 ms at this scale,
     /// dwarfed by the (n × p²) trace work that consumes the result.
-    fn second_coefficients(
+    pub(crate) fn second_coefficients(
         &self,
         eta_u: &BinomialDirectionEta,
         eta_v: &BinomialDirectionEta,
@@ -3765,7 +3776,7 @@ impl BinomialLocationScaleHessianWorkspace {
     /// `hessian_diagonal`) is row-linear in these arrays via `Xᵀ diag(W) X`,
     /// the resulting joint-Hessian is an unbiased estimator of the full-data
     /// joint Hessian.
-    fn apply_outer_subsample(
+    pub(crate) fn apply_outer_subsample(
         &mut self,
         rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
     ) {
@@ -3786,7 +3797,7 @@ impl BinomialLocationScaleHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace {
-    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+    pub(crate) fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         // Same Hv structure as `hessian_matvec`, built once via 3 GEMMs:
         //   H_tt = X_tᵀ diag(coeff_tt) X_t,
         //   H_tl = X_tᵀ diag(coeff_tl) X_ls,
@@ -3811,11 +3822,11 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         Ok(Some(h))
     }
 
-    fn hessian_matvec_available(&self) -> bool {
+    pub(crate) fn hessian_matvec_available(&self) -> bool {
         true
     }
 
-    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+    pub(crate) fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
         let total = pt + pls;
@@ -3848,7 +3859,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         Ok(Some(out))
     }
 
-    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+    pub(crate) fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
         let total = pt + pls;
@@ -3860,7 +3871,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         Ok(Some(diag))
     }
 
-    fn directional_derivative(
+    pub(crate) fn directional_derivative(
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
@@ -3869,7 +3880,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             .map(|operator| operator.to_dense()))
     }
 
-    fn directional_derivative_operator(
+    pub(crate) fn directional_derivative_operator(
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
@@ -3899,7 +3910,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         )?)))
     }
 
-    fn second_directional_derivative(
+    pub(crate) fn second_directional_derivative(
         &self,
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
@@ -3909,7 +3920,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             .map(|operator| operator.to_dense()))
     }
 
-    fn second_directional_derivative_operator(
+    pub(crate) fn second_directional_derivative_operator(
         &self,
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
@@ -3991,7 +4002,7 @@ impl BinomialLocationScaleWiggleFamily {
         }
     }
 
-    fn exact_joint_supported(&self) -> bool {
+    pub(crate) fn exact_joint_supported(&self) -> bool {
         self.threshold_design.is_some() && self.log_sigma_design.is_some()
     }
 
@@ -4003,7 +4014,7 @@ impl BinomialLocationScaleWiggleFamily {
         initializewiggle_knots_from_seed(q_seed, degree, num_internal_knots)
     }
 
-    fn wiggle_basiswith_options(
+    pub(crate) fn wiggle_basiswith_options(
         &self,
         q0: ArrayView1<'_, f64>,
         basis_options: BasisOptions,
@@ -4016,11 +4027,11 @@ impl BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn wiggle_design(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+    pub(crate) fn wiggle_design(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
         self.wiggle_basiswith_options(q0, BasisOptions::value())
     }
 
-    fn wiggle_dq_dq0(
+    pub(crate) fn wiggle_dq_dq0(
         &self,
         q0: ArrayView1<'_, f64>,
         beta_link_wiggle: ArrayView1<'_, f64>,
@@ -4039,7 +4050,7 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(d_constrained.dot(&beta_link_wiggle) + 1.0)
     }
 
-    fn wiggle_d2q_dq02(
+    pub(crate) fn wiggle_d2q_dq02(
         &self,
         q0: ArrayView1<'_, f64>,
         beta_link_wiggle: ArrayView1<'_, f64>,
@@ -4059,7 +4070,7 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(d2_constrained.dot(&beta_link_wiggle))
     }
 
-    fn wiggle_d3q_dq03(
+    pub(crate) fn wiggle_d3q_dq03(
         &self,
         q0: ArrayView1<'_, f64>,
         beta_link_wiggle: ArrayView1<'_, f64>,
@@ -4078,11 +4089,14 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(d3_constrained.dot(&beta_link_wiggle))
     }
 
-    fn wiggle_d3basis_constrained(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+    pub(crate) fn wiggle_d3basis_constrained(
+        &self,
+        q0: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
         monotone_wiggle_basis_with_derivative_order(q0, &self.wiggle_knots, self.wiggle_degree, 3)
     }
 
-    fn wiggle_d4q_dq04(
+    pub(crate) fn wiggle_d4q_dq04(
         &self,
         q0: ArrayView1<'_, f64>,
         beta_link_wiggle: ArrayView1<'_, f64>,
@@ -4106,7 +4120,9 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(d4.dot(&beta_link_wiggle))
     }
 
-    fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
+    pub(crate) fn dense_block_designs(
+        &self,
+    ) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         dense_locscale_block_designs_cached(
             self.threshold_design.as_ref(),
             self.log_sigma_design.as_ref(),
@@ -4117,7 +4133,7 @@ impl BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn dense_block_designs_fromspecs<'a>(
+    pub(crate) fn dense_block_designs_fromspecs<'a>(
         &self,
         specs: &'a [ParameterBlockSpec],
     ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
@@ -4133,7 +4149,7 @@ impl BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn exact_joint_dense_block_designs<'a>(
+    pub(crate) fn exact_joint_dense_block_designs<'a>(
         &'a self,
         specs: Option<&'a [ParameterBlockSpec]>,
     ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
@@ -4146,7 +4162,7 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(None)
     }
 
-    fn shadow_with_exact_joint_designs(
+    pub(crate) fn shadow_with_exact_joint_designs(
         &self,
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Self>, String> {
@@ -4169,7 +4185,7 @@ impl BinomialLocationScaleWiggleFamily {
         }))
     }
 
-    fn exact_newton_joint_psi_terms_for_specs(
+    pub(crate) fn exact_newton_joint_psi_terms_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -4188,7 +4204,7 @@ impl BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn exact_newton_joint_psisecond_order_terms_for_specs(
+    pub(crate) fn exact_newton_joint_psisecond_order_terms_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -4209,7 +4225,7 @@ impl BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn exact_newton_joint_psihessian_directional_derivative_for_specs(
+    pub(crate) fn exact_newton_joint_psihessian_directional_derivative_for_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -4230,7 +4246,7 @@ impl BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn exact_newton_joint_psi_direction(
+    pub(crate) fn exact_newton_joint_psi_direction(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -4266,7 +4282,7 @@ impl BinomialLocationScaleWiggleFamily {
         }))
     }
 
-    fn exact_newton_joint_psisecond_design_drifts(
+    pub(crate) fn exact_newton_joint_psisecond_design_drifts(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -4293,7 +4309,7 @@ impl BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn exact_newton_joint_psi_terms_from_designs(
+    pub(crate) fn exact_newton_joint_psi_terms_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -4756,7 +4772,7 @@ impl BinomialLocationScaleWiggleFamily {
         }))
     }
 
-    fn exact_newton_joint_psisecond_order_terms_from_designs(
+    pub(crate) fn exact_newton_joint_psisecond_order_terms_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -4806,7 +4822,7 @@ impl BinomialLocationScaleWiggleFamily {
         ))
     }
 
-    fn exact_newton_joint_psisecond_order_terms_from_parts(
+    pub(crate) fn exact_newton_joint_psisecond_order_terms_from_parts(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -5541,7 +5557,7 @@ impl BinomialLocationScaleWiggleFamily {
         })
     }
 
-    fn exact_newton_joint_psihessian_directional_derivative_from_designs(
+    pub(crate) fn exact_newton_joint_psihessian_directional_derivative_from_designs(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -5572,7 +5588,7 @@ impl BinomialLocationScaleWiggleFamily {
         ))
     }
 
-    fn exact_newton_joint_psihessian_directional_derivative_from_parts(
+    pub(crate) fn exact_newton_joint_psihessian_directional_derivative_from_parts(
         &self,
         block_states: &[ParameterBlockState],
         dir_a: &LocationScaleJointPsiDirection,
@@ -6122,7 +6138,7 @@ impl BinomialLocationScaleWiggleFamily {
     /// to assemble the joint Hessian for the 3-block wiggle family. Both the
     /// dense Hessian path and the matrix-free workspace consume these pieces
     /// without recomputing the per-row scalar derivatives.
-    fn wiggle_hessian_row_pieces(
+    pub(crate) fn wiggle_hessian_row_pieces(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<BinomialLocationScaleWiggleHessianRowPieces, String> {
@@ -6226,7 +6242,7 @@ impl BinomialLocationScaleWiggleFamily {
         })
     }
 
-    fn expected_wiggle_geometry_inputs<'a>(
+    pub(crate) fn expected_wiggle_geometry_inputs<'a>(
         &'a self,
         block_states: &'a [ParameterBlockState],
         specs: Option<&'a [ParameterBlockSpec]>,
@@ -6264,7 +6280,7 @@ impl BinomialLocationScaleWiggleFamily {
         }))
     }
 
-    fn expected_wiggle_information_with_specs(
+    pub(crate) fn expected_wiggle_information_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -6325,7 +6341,7 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(Some(out))
     }
 
-    fn expected_wiggle_information_directional_with_specs(
+    pub(crate) fn expected_wiggle_information_directional_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -6411,7 +6427,7 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(Some(out))
     }
 
-    fn expected_wiggle_information_second_directional_with_specs(
+    pub(crate) fn expected_wiggle_information_second_directional_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -6570,7 +6586,7 @@ impl BinomialLocationScaleWiggleFamily {
 ///   r_d = D_tw_d u_t + D_lw_d u_ls,
 ///
 /// and combines `out_w = B^T r_b + (B')^T r_d` to form `H v` directly.
-struct BinomialLocationScaleWiggleHessianRowPieces {
+pub(crate) struct BinomialLocationScaleWiggleHessianRowPieces {
     coeff_tt: Array1<f64>,
     coeff_tl: Array1<f64>,
     coeff_ll: Array1<f64>,
@@ -6583,7 +6599,7 @@ struct BinomialLocationScaleWiggleHessianRowPieces {
     d0: Array2<f64>,
 }
 
-struct ExpectedWiggleGeometryInputs<'a> {
+pub(crate) struct ExpectedWiggleGeometryInputs<'a> {
     x_t: Cow<'a, Array2<f64>>,
     x_ls: Cow<'a, Array2<f64>>,
     eta_t: &'a Array1<f64>,
@@ -6592,7 +6608,11 @@ struct ExpectedWiggleGeometryInputs<'a> {
 }
 
 impl BinomialLocationScaleWiggleHessianRowPieces {
-    fn assemble_dense(&self, x_t: &Array2<f64>, x_ls: &Array2<f64>) -> Result<Array2<f64>, String> {
+    pub(crate) fn assemble_dense(
+        &self,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let pw = self.b0.ncols();
@@ -6621,7 +6641,7 @@ impl BinomialLocationScaleWiggleHessianRowPieces {
     /// Block-diagonal Hessians (h_tt, h_ll, h_ww) without ever materializing
     /// the cross blocks. Used by `evaluate()` to populate per-block working
     /// sets.
-    fn assemble_block_diagonals(
+    pub(crate) fn assemble_block_diagonals(
         &self,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
@@ -6636,7 +6656,7 @@ impl BinomialLocationScaleWiggleHessianRowPieces {
 /// Per-row coefficient arrays for the BLS Wiggle joint first-directional
 /// Hessian derivative `D_β H_L[u]`, shared by the dense `_directional_derivative`
 /// assembly and the matrix-free `bls_wiggle_directional_operator`.
-struct BinomialWiggleDhRowCoeffs {
+pub(crate) struct BinomialWiggleDhRowCoeffs {
     coeff_tt: Array1<f64>,
     coeff_tl: Array1<f64>,
     coeff_ll: Array1<f64>,
@@ -6651,7 +6671,7 @@ struct BinomialWiggleDhRowCoeffs {
 }
 
 /// All references needed to evaluate [`BinomialWiggleDhRowCoeffs`].
-struct BinomialWiggleDhRowInputs<'a> {
+pub(crate) struct BinomialWiggleDhRowInputs<'a> {
     core0: &'a BinomialLocationScaleCore,
     eta_t: &'a Array1<f64>,
     etaw: &'a Array1<f64>,
@@ -6671,7 +6691,7 @@ impl BinomialLocationScaleWiggleFamily {
     /// Per-row coefficient loop for the joint first-directional Hessian
     /// derivative. The dense and operator paths build the identical 11
     /// coefficient arrays from the same canonical directional-q formulas.
-    fn binomial_wiggle_dh_row_coeffs(
+    pub(crate) fn binomial_wiggle_dh_row_coeffs(
         &self,
         n: usize,
         inputs: &BinomialWiggleDhRowInputs<'_>,
@@ -6808,11 +6828,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     /// The Binomial location-scale-wiggle joint Hessian depends on β because
     /// it involves the nonlinear link function evaluated at the combined
     /// predictor, which changes with all three coefficient blocks.
-    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+    pub(crate) fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }
 
-    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+    pub(crate) fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Operator-aware: matrix-free workspace applies joint Hv at
         // O(n · (p_t + p_ℓ + p_w)); only fall back to the dense build cost when
         // `use_joint_matrix_free_path` declines the operator path.
@@ -6834,11 +6854,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     /// the null space, so first-order perturbation theory breaks down.
     /// `HardPseudo` excludes σ ≤ ε from BOTH log|H| and its gradient
     /// consistently, so the null direction drops out of the analytic geometry.
-    fn pseudo_logdet_mode(&self) -> crate::custom_family::PseudoLogdetMode {
+    pub(crate) fn pseudo_logdet_mode(&self) -> crate::custom_family::PseudoLogdetMode {
         crate::custom_family::PseudoLogdetMode::HardPseudo
     }
 
-    fn block_linear_constraints(
+    pub(crate) fn block_linear_constraints(
         &self,
         block_states: &[ParameterBlockState],
         block_idx: usize,
@@ -6851,7 +6871,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(monotone_wiggle_nonnegative_constraints(spec.design.ncols()))
     }
 
-    fn post_update_block_beta(
+    pub(crate) fn post_update_block_beta(
         &self,
         block_states: &[ParameterBlockState],
         block_idx: usize,
@@ -6870,7 +6890,10 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(beta)
     }
 
-    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    pub(crate) fn evaluate(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 3 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -6970,7 +6993,10 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         })
     }
 
-    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+    pub(crate) fn log_likelihood_only(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<f64, String> {
         if block_states.len() != 3 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -7010,7 +7036,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     /// When `None`, this returns the full-data `log_likelihood_only`. Inner
     /// PIRLS line searches never install the subsample option, so they
     /// continue to score the exact full-data log-likelihood.
-    fn log_likelihood_only_with_options(
+    pub(crate) fn log_likelihood_only_with_options(
         &self,
         block_states: &[ParameterBlockState],
         options: &BlockwiseFitOptions,
@@ -7070,11 +7096,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         ll
     }
 
-    fn requires_joint_outer_hyper_path(&self) -> bool {
+    pub(crate) fn requires_joint_outer_hyper_path(&self) -> bool {
         true
     }
 
-    fn exact_newton_hessian_directional_derivative(
+    pub(crate) fn exact_newton_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         block_idx: usize,
@@ -7165,7 +7191,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(Some(out))
     }
 
-    fn exact_newton_joint_hessian(
+    pub(crate) fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
@@ -7190,7 +7216,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(Some(pieces.assemble_dense(&x_t, &x_ls)?))
     }
 
-    fn joint_jeffreys_information_with_specs(
+    pub(crate) fn joint_jeffreys_information_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7198,7 +7224,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         self.expected_wiggle_information_with_specs(block_states, specs)
     }
 
-    fn joint_jeffreys_information_directional_derivative_with_specs(
+    pub(crate) fn joint_jeffreys_information_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7207,7 +7233,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         self.expected_wiggle_information_directional_with_specs(block_states, specs, d_beta_flat)
     }
 
-    fn joint_jeffreys_information_second_directional_derivative_with_specs(
+    pub(crate) fn joint_jeffreys_information_second_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7222,17 +7248,17 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn joint_jeffreys_information_matches_observed_hessian(&self) -> bool {
+    pub(crate) fn joint_jeffreys_information_matches_observed_hessian(&self) -> bool {
         // Expected Fisher information override (gam#1020): observed-Hessian
         // conditioning pre-checks must not skip the expected-information gate.
         false
     }
 
-    fn has_explicit_joint_hessian(&self) -> bool {
+    pub(crate) fn has_explicit_joint_hessian(&self) -> bool {
         true
     }
 
-    fn exact_newton_joint_hessian_directional_derivative(
+    pub(crate) fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
@@ -7404,7 +7430,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(Some(d_h))
     }
 
-    fn exact_newton_joint_hessiansecond_directional_derivative(
+    pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_u_flat: &Array1<f64>,
@@ -7743,7 +7769,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(Some(d2_h))
     }
 
-    fn exact_newton_joint_hessian_with_specs(
+    pub(crate) fn exact_newton_joint_hessian_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7754,7 +7780,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         shadow.exact_newton_joint_hessian(block_states)
     }
 
-    fn exact_newton_joint_hessian_directional_derivative_with_specs(
+    pub(crate) fn exact_newton_joint_hessian_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7766,7 +7792,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         shadow.exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)
     }
 
-    fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+    pub(crate) fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7783,7 +7809,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn exact_newton_joint_psi_terms(
+    pub(crate) fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7812,7 +7838,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn exact_newton_joint_psisecond_order_terms(
+    pub(crate) fn exact_newton_joint_psisecond_order_terms(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7829,7 +7855,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn exact_newton_joint_psihessian_directional_derivative(
+    pub(crate) fn exact_newton_joint_psihessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7846,7 +7872,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         )
     }
 
-    fn exact_newton_joint_psi_workspace(
+    pub(crate) fn exact_newton_joint_psi_workspace(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7865,7 +7891,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         )))
     }
 
-    fn block_geometry(
+    pub(crate) fn block_geometry(
         &self,
         block_states: &[ParameterBlockState],
         spec: &crate::custom_family::ParameterBlockSpec,
@@ -7910,11 +7936,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         ))
     }
 
-    fn block_geometry_is_dynamic(&self) -> bool {
+    pub(crate) fn block_geometry_is_dynamic(&self) -> bool {
         true
     }
 
-    fn exact_newton_joint_hessian_workspace(
+    pub(crate) fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7946,7 +7972,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     /// Hessian is an unbiased estimator of the full-data joint Hessian.
     /// Inner PIRLS never installs the option, so the inner solve continues
     /// to consume the exact full-data Hessian.
-    fn exact_newton_joint_hessian_workspace_with_options(
+    pub(crate) fn exact_newton_joint_hessian_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -7983,11 +8009,14 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     /// the full-data outer score. Inner-PIRLS and final-covariance paths
     /// never install the option, so they continue to consume the exact
     /// full-data quantities.
-    fn outer_derivative_subsample_capable(&self) -> bool {
+    pub(crate) fn outer_derivative_subsample_capable(&self) -> bool {
         true
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+    pub(crate) fn inner_coefficient_hessian_hvp_available(
+        &self,
+        specs: &[ParameterBlockSpec],
+    ) -> bool {
         // Same gating as the workspace impl: matrix-free path is available
         // when both threshold and log-σ block designs are present (the
         // wiggle block is folded into the per-row pieces inside
@@ -8006,7 +8035,7 @@ impl BinomialLocationScaleWiggleFamily {
     /// directional derivative `D_β H_L[u]`. Channels (in order):
     /// X_t, X_ls, B (b0), B' (d0), B'' (dd0). The operator acts on the
     /// joint coefficient vector `(β_t, β_ls, β_w)`.
-    fn bls_wiggle_directional_operator(
+    pub(crate) fn bls_wiggle_directional_operator(
         &self,
         block_states: &[ParameterBlockState],
         x_t_arc: Arc<Array2<f64>>,
@@ -8172,7 +8201,7 @@ impl BinomialLocationScaleWiggleFamily {
     /// (br[k], dr[k], ddr[k]), giving 4 symmetric pair coefficients on
     /// (B, B), (B, B'), (B, B''), (B', B'). No (B'', B'') term — the
     /// formula is at most degree 2 in any single basis derivative.
-    fn bls_wiggle_second_directional_operator(
+    pub(crate) fn bls_wiggle_second_directional_operator(
         &self,
         block_states: &[ParameterBlockState],
         x_t_arc: Arc<Array2<f64>>,
@@ -8584,7 +8613,7 @@ impl BinomialLocationScaleWiggleFamily {
 /// Matrix-free joint-Hessian operator for the 3-block binomial
 /// location-scale wiggle family. See `BinomialLocationScaleWiggleHessianRowPieces`
 /// for the per-row weight structure.
-struct BinomialLocationScaleWiggleHessianWorkspace {
+pub(crate) struct BinomialLocationScaleWiggleHessianWorkspace {
     family: BinomialLocationScaleWiggleFamily,
     block_states: Vec<ParameterBlockState>,
     x_t: Arc<Array2<f64>>,
@@ -8593,7 +8622,7 @@ struct BinomialLocationScaleWiggleHessianWorkspace {
 }
 
 impl BinomialLocationScaleWiggleHessianWorkspace {
-    fn new(
+    pub(crate) fn new(
         family: BinomialLocationScaleWiggleFamily,
         block_states: Vec<ParameterBlockState>,
         x_t: Array2<f64>,
@@ -8620,7 +8649,7 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
     /// via `Xᵀ diag(W) Y`, the resulting joint-Hessian is an unbiased
     /// estimator of the full-data joint Hessian. The `b0`/`d0` basis matrices
     /// are independent of the per-row weights and remain unchanged.
-    fn apply_outer_subsample(
+    pub(crate) fn apply_outer_subsample(
         &mut self,
         rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
     ) {
@@ -8657,7 +8686,7 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWorkspace {
-    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+    pub(crate) fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         // Same Hv structure as `hessian_matvec`, but routed through the
         // already-existing `assemble_dense` row-pieces helper (eight GEMMs
         // covering h_tt, h_tl, h_ll, h_tw_b, h_tw_d, h_lw_b, h_lw_d, h_ww).
@@ -8671,11 +8700,11 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         Ok(Some(dense))
     }
 
-    fn hessian_matvec_available(&self) -> bool {
+    pub(crate) fn hessian_matvec_available(&self) -> bool {
         true
     }
 
-    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+    pub(crate) fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
         let pw = self.pieces.b0.ncols();
@@ -8723,7 +8752,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         Ok(Some(out))
     }
 
-    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+    pub(crate) fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
         let pw = self.pieces.b0.ncols();
@@ -8760,7 +8789,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         Ok(Some(diag))
     }
 
-    fn directional_derivative(
+    pub(crate) fn directional_derivative(
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
@@ -8768,7 +8797,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
             .exact_newton_joint_hessian_directional_derivative(&self.block_states, d_beta_flat)
     }
 
-    fn directional_derivative_operator(
+    pub(crate) fn directional_derivative_operator(
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
@@ -8781,7 +8810,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         )
     }
 
-    fn second_directional_derivative(
+    pub(crate) fn second_directional_derivative(
         &self,
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
@@ -8794,7 +8823,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
             )
     }
 
-    fn second_directional_derivative_operator(
+    pub(crate) fn second_directional_derivative_operator(
         &self,
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
@@ -8811,7 +8840,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleWiggleFamily {
-    fn generativespec(
+    pub(crate) fn generativespec(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {

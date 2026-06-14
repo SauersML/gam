@@ -205,7 +205,7 @@ impl<'a> RemlState<'a> {
                 }
             }
 
-            const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
+            pub(crate) const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
             // Hot diagnostics walk the Hessian eigenspectrum and emit
             // ill-conditioning warnings. They are only meaningful for fully
             // converged inner modes — partial fits accepted from seed
@@ -533,7 +533,7 @@ impl<'a> RemlState<'a> {
     /// Jeffreys term must also be evaluated on `X_eff = X Z`. Reusing the
     /// cached full-basis operator in that situation would recreate the original
     /// value/derivative mismatch this code is meant to eliminate.
-    fn build_dense_firth_operator_for_outer_basis(
+    pub(crate) fn build_dense_firth_operator_for_outer_basis(
         &self,
         pirls_result: &PirlsResult,
         bundle: &EvalShared,
@@ -598,7 +598,7 @@ impl<'a> RemlState<'a> {
     /// The actual Tierney-Kadane correction is added outside the unified
     /// evaluator so value, gradient, and Hessian can all come from the same
     /// invariant scalar correction.
-    fn build_dense_derivative_context(
+    pub(crate) fn build_dense_derivative_context(
         &self,
         pirls_result: &PirlsResult,
         bundle: &EvalShared,
@@ -693,7 +693,7 @@ impl<'a> RemlState<'a> {
     ///
     /// TK correction is NOT included here because the sparse paths compute
     /// it via sparse Cholesky solves with completely different logic.
-    fn build_sparse_derivative_context(
+    pub(crate) fn build_sparse_derivative_context(
         &self,
         pirls_result: &PirlsResult,
         bundle: &EvalShared,
@@ -805,7 +805,7 @@ impl<'a> RemlState<'a> {
 
     /// Build penalty coordinates from canonical penalties, with Kronecker
     /// fast-path when available and active.
-    fn build_penalty_coords(&self) -> Vec<super::unified::PenaltyCoordinate> {
+    pub(crate) fn build_penalty_coords(&self) -> Vec<super::unified::PenaltyCoordinate> {
         if let Some(ref kron) = self.kronecker_penalty_system
             && self.kronecker_factored.is_some()
         {
@@ -843,7 +843,7 @@ impl<'a> RemlState<'a> {
     /// `InnerAssembly`. All three assembly builders (`build_dense_assembly`,
     /// `build_sparse_assembly`, `build_dense_original_assembly`) delegate
     /// here to avoid repeating the 18-field struct literal.
-    fn finish_assembly(
+    pub(crate) fn finish_assembly(
         &self,
         pirls_result: &PirlsResult,
         ctx: DerivativeContext,
@@ -926,7 +926,7 @@ impl<'a> RemlState<'a> {
     /// (normal, ext-coord, and EFS). Callers may set `ext_coords` and pair
     /// functions on the returned assembly before passing it to
     /// `assemble_and_evaluate` or `assemble_and_evaluate_efs`.
-    fn build_dense_assembly(
+    pub(crate) fn build_dense_assembly(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -1121,7 +1121,7 @@ impl<'a> RemlState<'a> {
     /// Build an `InnerAssembly` using the sparse-exact backend.
     ///
     /// Shared ingredient builder for all sparse Cholesky evaluation paths.
-    fn build_sparse_assembly(
+    pub(crate) fn build_sparse_assembly(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -1216,7 +1216,7 @@ impl<'a> RemlState<'a> {
     /// allowing us to work in the original basis for better numerical
     /// stability with extended ψ coordinates. TK correction is zeroed
     /// in the assembly and applied post-hoc by `assemble_and_evaluate`.
-    fn build_dense_original_assembly(
+    pub(crate) fn build_dense_original_assembly(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -1466,7 +1466,7 @@ impl<'a> RemlState<'a> {
     /// branch, where `free_basis_opt` already rotates everything into a
     /// reduced QS subspace (and the original-basis penalty-coord fast path
     /// isn't wired through the projected `Z` matrix yet).
-    fn build_auto_assembly(
+    pub(crate) fn build_auto_assembly(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -1494,7 +1494,7 @@ impl<'a> RemlState<'a> {
     /// `assemble_and_evaluate` and EFS via `assemble_and_evaluate_efs` — flows
     /// through this single shared augmentation and therefore optimizes the
     /// identical objective.
-    fn apply_alo_stabilization_to_result(
+    pub(crate) fn apply_alo_stabilization_to_result(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -1543,7 +1543,7 @@ impl<'a> RemlState<'a> {
         Ok(result)
     }
 
-    fn alo_stabilization_eval(
+    pub(crate) fn alo_stabilization_eval(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -1754,7 +1754,7 @@ impl<'a> RemlState<'a> {
         }))
     }
 
-    fn high_leverage_is_pure_parametric(
+    pub(crate) fn high_leverage_is_pure_parametric(
         &self,
         alo_leverage: &Array1<f64>,
         pirls_result: &PirlsResult,
@@ -1788,7 +1788,7 @@ impl<'a> RemlState<'a> {
         Ok(all_high_rows_parametric)
     }
 
-    fn pure_parametric_column_indices(&self) -> Vec<usize> {
+    pub(crate) fn pure_parametric_column_indices(&self) -> Vec<usize> {
         let mut covered_by_penalty = vec![false; self.p];
         for penalty in self.canonical_penalties.iter() {
             for col in penalty.col_range.clone() {
@@ -1804,7 +1804,7 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
-    fn pure_parametric_projection_leverage(
+    pub(crate) fn pure_parametric_projection_leverage(
         &self,
         cols: &[usize],
         pirls_result: &PirlsResult,
@@ -1881,7 +1881,7 @@ impl<'a> RemlState<'a> {
     /// The stabilized-Hessian factorization is supplied via `factored` — the
     /// value path factors the same matrix once and shares it here, so the
     /// gradient adds no extra dense factorization (#862).
-    fn alo_stabilization_gradient(
+    pub(crate) fn alo_stabilization_gradient(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -1959,7 +1959,7 @@ impl<'a> RemlState<'a> {
     }
 
     /// Build the soft prior tuple for the given mode.
-    fn build_prior(
+    pub(crate) fn build_prior(
         &self,
         rho: &Array1<f64>,
         mode: super::unified::EvalMode,
@@ -1989,7 +1989,7 @@ impl<'a> RemlState<'a> {
     /// apply TK correction.
     ///
     /// All `evaluate_unified*` methods funnel through here.
-    fn assemble_and_evaluate(
+    pub(crate) fn assemble_and_evaluate(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -2030,7 +2030,7 @@ impl<'a> RemlState<'a> {
         Ok(result)
     }
 
-    fn assemble_and_evaluate_efs(
+    pub(crate) fn assemble_and_evaluate_efs(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -2213,7 +2213,7 @@ impl<'a> RemlState<'a> {
         self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
 
-    fn evaluate_unified_value_only_with_synthetic_ext_count(
+    pub(crate) fn evaluate_unified_value_only_with_synthetic_ext_count(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -2359,7 +2359,7 @@ impl<'a> RemlState<'a> {
         self.compute_efs_steps_inner(p)
     }
 
-    fn compute_efs_steps_inner(
+    pub(crate) fn compute_efs_steps_inner(
         &self,
         p: &Array1<f64>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
@@ -2399,7 +2399,7 @@ impl<'a> RemlState<'a> {
         self.compute_efs_steps_with_psi_ext_inner(rho, hyper_dirs)
     }
 
-    fn compute_efs_steps_with_psi_ext_inner(
+    pub(crate) fn compute_efs_steps_with_psi_ext_inner(
         &self,
         rho: &Array1<f64>,
         hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
@@ -2758,7 +2758,7 @@ impl<'a> RemlState<'a> {
     /// - Adding SAS ridge/barrier gradient contributions to `grad[k+1]`
     /// - Adding SAS ridge/barrier cost contributions to `result.cost`
     /// Build link ext_coords from the current runtime link state.
-    fn build_link_ext_coords(
+    pub(crate) fn build_link_ext_coords(
         &self,
         bundle: &EvalShared,
     ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
@@ -2776,7 +2776,7 @@ impl<'a> RemlState<'a> {
     }
 
     /// Check that Firth/Jeffreys is not active (incompatible with link ext_coords).
-    fn reject_firth_link_ext(&self) -> Result<(), EstimationError> {
+    pub(crate) fn reject_firth_link_ext(&self) -> Result<(), EstimationError> {
         if reml_robust_jeffreys_link(&self.config).is_some() {
             crate::bail_invalid_estim!(
                 "link-parameter ext_coord optimization is incompatible with \
@@ -2820,7 +2820,7 @@ impl<'a> RemlState<'a> {
     /// helper returns an error if that invariant is broken so a future
     /// builder change trips it immediately rather than silently
     /// regressing SAS/mixture optimisation.
-    fn rotate_link_ext_coords_to_original(
+    pub(crate) fn rotate_link_ext_coords_to_original(
         &self,
         bundle: &EvalShared,
         coords: &mut [super::unified::HyperCoord],
@@ -2955,7 +2955,7 @@ impl<'a> RemlState<'a> {
 
     /// Unified EFS bridge: auto-dispatches backend, injects ext_coords,
     /// and evaluates via `assemble_and_evaluate_efs`.
-    fn evaluate_efs(
+    pub(crate) fn evaluate_efs(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -2969,7 +2969,7 @@ impl<'a> RemlState<'a> {
     }
 }
 
-fn positive_penalty_rank_and_logdet(eigenvalues: &[f64]) -> (usize, f64) {
+pub(crate) fn positive_penalty_rank_and_logdet(eigenvalues: &[f64]) -> (usize, f64) {
     let threshold = super::unified::positive_eigenvalue_threshold(eigenvalues);
     let rank = eigenvalues.iter().filter(|&&ev| ev > threshold).count();
     let log_det = super::unified::exact_pseudo_logdet(eigenvalues, threshold);
@@ -2995,7 +2995,7 @@ mod tk_math_tests {
     use num_dual::{Dual3_64, Dual64, DualNum, third_derivative};
 
     #[test]
-    fn firth_default_pc_prior_fills_flat_holes() {
+    pub(crate) fn firth_default_pc_prior_fills_flat_holes() {
         let pc = firth_default_pc_prior();
         let configured = RhoPrior::Normal { mean: 0.1, sd: 2.0 };
         // A whole `Flat` prior becomes the weak PC default.
@@ -3014,7 +3014,7 @@ mod tk_math_tests {
     }
 
     #[test]
-    fn firth_default_coord_mask_marks_only_flat_coordinates() {
+    pub(crate) fn firth_default_coord_mask_marks_only_flat_coordinates() {
         // Whole-Flat → every coordinate is a firth default.
         assert_eq!(firth_default_coord_mask(&RhoPrior::Flat, 3), vec![true; 3]);
         // Independent → only the Flat holes are defaults.
@@ -3032,7 +3032,7 @@ mod tk_math_tests {
     }
 
     #[test]
-    fn firth_default_barrier_is_byte_zero_on_identified_side() {
+    pub(crate) fn firth_default_barrier_is_byte_zero_on_identified_side() {
         use super::super::rho_prior_eval::{firth_default_barrier_terms, pc_prior_rate};
         let upper = FIRTH_DEFAULT_PC_UPPER;
         let theta = pc_prior_rate(upper, FIRTH_DEFAULT_PC_TAIL_PROB);
@@ -3074,7 +3074,7 @@ mod tk_math_tests {
     }
 
     #[test]
-    fn penalty_rank_uses_actual_positive_eigenspace_not_root_rows() {
+    pub(crate) fn penalty_rank_uses_actual_positive_eigenspace_not_root_rows() {
         let e = array![[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0],];
         let s = e.t().dot(&e);
         let (evals, _) = s.eigh(Side::Lower).expect("penalty eigensystem");
@@ -3087,11 +3087,11 @@ mod tk_math_tests {
         );
     }
 
-    fn solve_vec(h: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn solve_vec(h: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
         h.cholesky(Side::Lower).expect("chol(H)").solvevec(rhs)
     }
 
-    fn solve_xt(h: &Array2<f64>, x: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn solve_xt(h: &Array2<f64>, x: &Array2<f64>) -> Array2<f64> {
         let mut xt = x.t().to_owned();
         h.cholesky(Side::Lower)
             .expect("chol(H)")
@@ -3115,7 +3115,7 @@ mod tk_math_tests {
     ///   V_TK = −¹⁄₈ Σ d_i h_ii²
     ///          + ¹⁄₁₂ Σᵢⱼ c_i c_j K_ij³
     ///          + ¹⁄₈ q · y
-    fn tk_scalar_dual<D: DualNum<f64> + Copy>(h: D, x: &[D], c: &[D], d_arr: &[D]) -> D {
+    pub(crate) fn tk_scalar_dual<D: DualNum<f64> + Copy>(h: D, x: &[D], c: &[D], d_arr: &[D]) -> D {
         let n = x.len();
         let inv_h = D::one() / h;
         let mut h_diag = vec![D::from(0.0); n];
@@ -3155,7 +3155,7 @@ mod tk_math_tests {
     /// inside H reduces to a scalar division, which Dual64 handles
     /// natively.
     #[test]
-    fn tierney_kadane_gradient_matches_dual_ad_reference_scalarhessian() {
+    pub(crate) fn tierney_kadane_gradient_matches_dual_ad_reference_scalarhessian() {
         // p = 1, n = 4 toy problem.
         let x_vec = vec![1.3_f64, -0.4, 0.7, -0.9];
         let h_val = 2.5_f64;
@@ -3274,7 +3274,7 @@ mod tk_math_tests {
     /// truncated at δ³ – Dual3's arithmetic discards higher-order terms
     /// anyway, so the propagated (re, v1, v2, v3) match the analytic
     /// values μ⁽⁰⁾..μ⁽³⁾(η₀) exactly.
-    fn taylor_mu_dual3(delta: Dual3_64, h0: f64, h1: f64, h2: f64, h3: f64) -> Dual3_64 {
+    pub(crate) fn taylor_mu_dual3(delta: Dual3_64, h0: f64, h1: f64, h2: f64, h3: f64) -> Dual3_64 {
         let inv2 = 0.5_f64;
         let inv6 = 1.0_f64 / 6.0_f64;
         let d2 = delta * delta;
@@ -3286,7 +3286,13 @@ mod tk_math_tests {
     /// later in the η-jet, so that the resulting Dual3 represents
     ///   ∂μ/∂η at η₀+δ ≈ Σ_{k=0..4} μ⁽ᵏ⁺¹⁾(η₀)·δᵏ/k!
     /// (used as the closed-form `h1(δ)` carrier inside W_obs).
-    fn taylor_mu_eta_dual3(delta: Dual3_64, h1: f64, h2: f64, h3: f64, h4: f64) -> Dual3_64 {
+    pub(crate) fn taylor_mu_eta_dual3(
+        delta: Dual3_64,
+        h1: f64,
+        h2: f64,
+        h3: f64,
+        h4: f64,
+    ) -> Dual3_64 {
         let inv2 = 0.5_f64;
         let inv6 = 1.0_f64 / 6.0_f64;
         let d2 = delta * delta;
@@ -3296,7 +3302,13 @@ mod tk_math_tests {
 
     /// Closed-form `h2(δ)` carrier (= ∂²μ/∂η² at η₀+δ) as a Dual3 Taylor
     /// polynomial – picks up `h5` in its δ³ coefficient.
-    fn taylor_mu_etaeta_dual3(delta: Dual3_64, h2: f64, h3: f64, h4: f64, h5: f64) -> Dual3_64 {
+    pub(crate) fn taylor_mu_etaeta_dual3(
+        delta: Dual3_64,
+        h2: f64,
+        h3: f64,
+        h4: f64,
+        h5: f64,
+    ) -> Dual3_64 {
         let inv2 = 0.5_f64;
         let inv6 = 1.0_f64 / 6.0_f64;
         let d2 = delta * delta;
@@ -3308,7 +3320,7 @@ mod tk_math_tests {
     ///   W_obs(η) = h₁²/(φV) − (y−μ)·(h₂·V − h₁²·V_μ)/(φV²)
     /// where V(μ)=μ(1−μ) and V_μ(μ)=1−2μ.  Built entirely from the three
     /// Taylor carriers (mu, mu_eta, mu_etaeta) using only num_dual ops.
-    fn binomial_w_obs_dual3(
+    pub(crate) fn binomial_w_obs_dual3(
         mu: Dual3_64,
         mu_eta: Dual3_64,
         mu_etaeta: Dual3_64,
@@ -3333,7 +3345,7 @@ mod tk_math_tests {
     /// Drive `pirls::e_obs_from_jets` and Dual3 AD for the same scalar
     /// fixture and assert the analytic 3rd-η-derivative of W_obs matches
     /// the AD reference to floating-point tolerance.
-    fn assert_e_obs_matches_dual3_ad(
+    pub(crate) fn assert_e_obs_matches_dual3_ad(
         link_label: &str,
         eta0: f64,
         y: f64,
@@ -3379,7 +3391,7 @@ mod tk_math_tests {
     /// origin to exercise the (η³,η²,η) polynomial structure of the
     /// Probit jets.
     #[test]
-    fn e_obs_from_jets_matches_dual3_ad_probit_bernoulli() {
+    pub(crate) fn e_obs_from_jets_matches_dual3_ad_probit_bernoulli() {
         assert!(file!().ends_with(".rs"));
         let etas = [-1.4_f64, -0.4, 0.0, 0.6, 1.3];
         let ys = [0.0_f64, 1.0];
@@ -3403,7 +3415,7 @@ mod tk_math_tests {
     /// non-trivial residual term that exercises the full (h₁..h₅,
     /// V₀..V₂) polynomial composition inside `e_obs_from_jets`.
     #[test]
-    fn e_obs_from_jets_matches_dual3_ad_cloglog_bernoulli() {
+    pub(crate) fn e_obs_from_jets_matches_dual3_ad_cloglog_bernoulli() {
         assert!(file!().ends_with(".rs"));
         let etas = [-1.6_f64, -0.5, 0.0, 0.4, 1.2];
         let ys = [0.0_f64, 1.0];
@@ -3431,7 +3443,7 @@ mod tk_math_tests {
     /// would disagree on outer-gradient propagation.  We additionally
     /// sanity-check both quantities against Dual3 AD.
     #[test]
-    fn e_obs_from_jets_matches_dual3_ad_logit_bernoulli_canonical_consistency() {
+    pub(crate) fn e_obs_from_jets_matches_dual3_ad_logit_bernoulli_canonical_consistency() {
         let etas = [-1.7_f64, -0.6, 0.0, 0.5, 1.4];
         let ys = [0.0_f64, 1.0];
         let logit = InverseLink::Standard(StandardLink::Logit);
@@ -3480,7 +3492,7 @@ mod tk_math_tests {
     /// plus the analytic `h₄, h₅` helpers.  Two SAS shape parameters are
     /// covered to exercise both the symmetric (ε≈0) and skewed regimes.
     #[test]
-    fn e_obs_from_jets_matches_dual3_ad_sas_bernoulli() {
+    pub(crate) fn e_obs_from_jets_matches_dual3_ad_sas_bernoulli() {
         let etas = [-1.1_f64, -0.3, 0.0, 0.5, 1.0];
         let ys = [0.0_f64, 1.0];
         let configs = [(-0.25_f64, 0.35_f64), (0.4_f64, -0.2_f64)];
@@ -3519,7 +3531,7 @@ mod tk_math_tests {
     /// shipped by the GAMLSS marginal-slope family.  Same Dual3 AD test
     /// against `e_obs_from_jets`, exercised at two (delta, ε) shape pairs.
     #[test]
-    fn e_obs_from_jets_matches_dual3_ad_beta_logistic_bernoulli() {
+    pub(crate) fn e_obs_from_jets_matches_dual3_ad_beta_logistic_bernoulli() {
         let etas = [-1.0_f64, -0.25, 0.0, 0.4, 0.9];
         let ys = [0.0_f64, 1.0];
         let configs = [(0.18_f64, -0.22_f64), (-0.3_f64, 0.4_f64)];
@@ -3580,7 +3592,7 @@ mod tk_math_tests {
     /// 4-component Probit/Logit/CLogLog/Cauchit mixture to exercise the
     /// dispatch path inside `inverse_link_pdf{third,fourth}_derivative_for_inverse_link`.
     #[test]
-    fn e_obs_from_jets_matches_dual3_ad_mixture_bernoulli() {
+    pub(crate) fn e_obs_from_jets_matches_dual3_ad_mixture_bernoulli() {
         assert!(file!().ends_with(".rs"));
         let spec = MixtureLinkSpec {
             components: vec![
@@ -3615,7 +3627,7 @@ mod adaptive_lm_lambda_tests {
     use super::adaptive_lm_lambda_hint;
 
     #[test]
-    fn pathological_cached_lambdas_fall_through_to_cold_default() {
+    pub(crate) fn pathological_cached_lambdas_fall_through_to_cold_default() {
         // Non-finite or non-positive cached values must return None so
         // the cold default `1e-6` is used. Locks the historical
         // contract that pathological cache slots can't poison the warm
@@ -3627,7 +3639,7 @@ mod adaptive_lm_lambda_tests {
     }
 
     #[test]
-    fn no_feedback_yet_falls_through_to_cold_default() {
+    pub(crate) fn no_feedback_yet_falls_through_to_cold_default() {
         // (last_iters == 0, last_converged == false) is the sentinel
         // `clear_warm_start_adaptive_signals` writes — there's no
         // feedback to drive an adaptive regime, so the cold default
@@ -3636,7 +3648,7 @@ mod adaptive_lm_lambda_tests {
     }
 
     #[test]
-    fn newton_friendly_regime_admits_floor_to_1e_minus_9() {
+    pub(crate) fn newton_friendly_regime_admits_floor_to_1e_minus_9() {
         // Previous fit converged in 1 iter — well-conditioned local
         // geometry. The cached λ is allowed down to 1e-9 (the LM-
         // internal floor) so the next fit can leverage the previous
@@ -3661,7 +3673,7 @@ mod adaptive_lm_lambda_tests {
     }
 
     #[test]
-    fn hard_fit_regime_preserves_heavy_damping_signal() {
+    pub(crate) fn hard_fit_regime_preserves_heavy_damping_signal() {
         // Previous fit didn't converge OR took many iters — the cached
         // λ is in the heavy-damping regime, and we want to preserve
         // that signal up to gradient-descent (1.0).
@@ -3685,7 +3697,7 @@ mod adaptive_lm_lambda_tests {
     }
 
     #[test]
-    fn default_regime_matches_historical_static_clamp() {
+    pub(crate) fn default_regime_matches_historical_static_clamp() {
         // 1-9 iters AND converged — a "moderate" fit. The clamp is
         // [1e-6, 1e-3], matching the historical static clamp before
         // the adaptive layer was introduced. Locks behavior so a
@@ -3708,7 +3720,7 @@ mod ift_warm_start_tests {
     use ndarray::Array2;
 
     #[test]
-    fn joint_ift_cache_rejects_pending_theta_when_extended_hyperparameters_change() {
+    pub(crate) fn joint_ift_cache_rejects_pending_theta_when_extended_hyperparameters_change() {
         let cache = super::IftJointModeResponseRuntimeCache {
             theta: Array1::from_vec(vec![0.1, -0.2, 0.5]),
             rho_dim: 2,
@@ -3730,7 +3742,7 @@ mod ift_warm_start_tests {
     /// `RemlState::predict_warm_start_beta_ift_with_outcome` path uses the
     /// outcome to bookkeep the IFT cache, but the regression tests below
     /// only assert on `Coefficients`.
-    fn predict_warm_start_beta_ift_inner(
+    pub(crate) fn predict_warm_start_beta_ift_inner(
         cache: &super::IftWarmStartCache,
         canonical_penalties: &[CanonicalPenalty],
         new_rho: &Array1<f64>,
@@ -3776,7 +3788,7 @@ mod ift_warm_start_tests {
     /// Build a CanonicalPenalty from a dense p×p SPD-ish penalty matrix by
     /// taking its eigendecomposition and packing the positive-eigenvalue
     /// components into the `rank × p` root.
-    fn dense_canonical_from_local(local: Array2<f64>, p: usize) -> CanonicalPenalty {
+    pub(crate) fn dense_canonical_from_local(local: Array2<f64>, p: usize) -> CanonicalPenalty {
         use crate::faer_ndarray::FaerEigh;
         use faer::Side;
         let (evals, evecs) = local.eigh(Side::Lower).expect("eigh penalty");
@@ -3814,7 +3826,7 @@ mod ift_warm_start_tests {
     /// `H_pen · (β_predict − β_cur) ≈ −Σ_k Δρ_k · e^{ρ_k} · S_k · (β_cur-μ_k)`.
     /// Tested in the original-basis path (`frame_was_original = true`).
     #[test]
-    fn ift_predictor_satisfies_linearized_foc_original_basis() {
+    pub(crate) fn ift_predictor_satisfies_linearized_foc_original_basis() {
         let p = 5usize;
         // Hand-built S_1, S_2 — diagonal-dominant SPD blocks so the
         // local matrices have full rank and the FOC is non-trivial.
@@ -3913,7 +3925,7 @@ mod ift_warm_start_tests {
     /// from the same penalties the fallback would use and asserts both
     /// β_predict are identical to ~floating-point round-off.
     #[test]
-    fn ift_predictor_precompute_path_matches_inline_path() {
+    pub(crate) fn ift_predictor_precompute_path_matches_inline_path() {
         let p = 5usize;
         let s1 = Array2::from_shape_vec(
             (p, p),
@@ -4095,7 +4107,7 @@ mod ift_warm_start_tests {
     /// (which is orthogonal) must produce the SAME prediction as solving
     /// in original basis with H_orig = qs · H_tfd · qs^T.
     #[test]
-    fn ift_predictor_basis_conversion_matches_original() {
+    pub(crate) fn ift_predictor_basis_conversion_matches_original() {
         let p = 4usize;
         let s1 = Array2::from_shape_vec(
             (p, p),
@@ -4187,7 +4199,7 @@ mod ift_warm_start_tests {
     /// Δρ above the safety cap must reject (return None), so the caller
     /// falls through to the tangent-line / flat warm-start.
     #[test]
-    fn ift_predictor_rejects_large_drho() {
+    pub(crate) fn ift_predictor_rejects_large_drho() {
         let p = 3usize;
         let s1 = Array2::from_shape_vec((p, p), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
             .unwrap();
@@ -4241,7 +4253,7 @@ mod ift_warm_start_tests {
     /// same check in front of the H_pen factor lookup so the cache miss
     /// is also avoided.
     #[test]
-    fn ift_predictor_returns_noop_when_all_drho_below_eps() {
+    pub(crate) fn ift_predictor_returns_noop_when_all_drho_below_eps() {
         use crate::estimate::reml::IftWarmStartCache;
 
         let p = 3usize;
@@ -4278,7 +4290,7 @@ mod ift_warm_start_tests {
     /// updatewarm_start_from has populated β/H but record_warm_start_rho
     /// has not stamped ρ yet) must return None.
     #[test]
-    fn ift_predictor_rejects_unstamped_cache() {
+    pub(crate) fn ift_predictor_rejects_unstamped_cache() {
         let p = 2usize;
         let cache = super::super::IftWarmStartCache {
             beta_original: ndarray::array![1.0, 2.0],
@@ -4297,7 +4309,7 @@ mod ift_warm_start_tests {
     /// policy: small residual → looser cap; large residual → tighter
     /// cap; non-finite or missing residual → default 2.0.
     #[test]
-    fn adaptive_ift_max_drho_follows_quality_tiers() {
+    pub(crate) fn adaptive_ift_max_drho_follows_quality_tiers() {
         use super::adaptive_ift_max_drho;
         // No history (first solve at this surface) → default 2.0.
         assert_eq!(adaptive_ift_max_drho(None), 2.0);
@@ -4340,7 +4352,7 @@ mod ift_warm_start_tests {
     /// blocks, par_iter vs serial iter, must agree to bit-equality
     /// (not just within-tolerance).
     #[test]
-    fn parallel_lambda_s_beta_blocks_matches_serial() {
+    pub(crate) fn parallel_lambda_s_beta_blocks_matches_serial() {
         use rayon::prelude::*;
         let p = 50usize;
         let n_penalties = 8usize;
@@ -4400,7 +4412,7 @@ mod ift_warm_start_tests {
     /// encodes "no signal" via NaN's self-inequality, so any finite
     /// non-negative value is unambiguously genuine signal.
     #[test]
-    fn ift_residual_sentinel_is_distinguishable_from_zero() {
+    pub(crate) fn ift_residual_sentinel_is_distinguishable_from_zero() {
         use super::IFT_RESIDUAL_NO_SIGNAL_BITS;
         // Sentinel decodes to NaN.
         assert!(
@@ -4439,7 +4451,7 @@ mod ift_warm_start_tests {
     /// markers added in this commit make these silent failure modes
     /// visible in production logs as bug signals.
     #[test]
-    fn ift_predictor_rejects_dim_mismatches() {
+    pub(crate) fn ift_predictor_rejects_dim_mismatches() {
         let p = 3usize;
         let s1 = Array2::from_shape_vec((p, p), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
             .unwrap();
@@ -4480,7 +4492,7 @@ mod ift_warm_start_tests {
     /// previous ρ-step). Pin down each tier transition + defensive
     /// handling.
     #[test]
-    fn adaptive_tangent_alpha_cap_follows_quality_tiers() {
+    pub(crate) fn adaptive_tangent_alpha_cap_follows_quality_tiers() {
         use super::adaptive_tangent_alpha_cap;
         // No history → default 1.5 (the original hardcoded constant).
         assert_eq!(adaptive_tangent_alpha_cap(None), 1.5);
@@ -4569,7 +4581,7 @@ mod warm_start_key_stability_tests {
     use ndarray::{Array2, Array3};
     use std::sync::Arc;
 
-    fn duchon_like_registry() -> AnalyticPenaltyRegistry {
+    pub(crate) fn duchon_like_registry() -> AnalyticPenaltyRegistry {
         // A single isometry (Duchon-style) penalty, matching the marginal-slope
         // `duchon(...)` fit in issue #1048. Its Jacobian-derivative caches start
         // empty (`None`) exactly as a cold fit opens its warm-start session.
@@ -4581,7 +4593,7 @@ mod warm_start_key_stability_tests {
         registry
     }
 
-    fn populate_lazy_caches(registry: &AnalyticPenaltyRegistry) {
+    pub(crate) fn populate_lazy_caches(registry: &AnalyticPenaltyRegistry) {
         // Mimic the SAE/IFT outer driver refreshing the θ-dependent Jacobian
         // derivative caches mid-fit. These are pure functions of basis + θ and
         // are recomputable; their *population state* must never reach the key.
@@ -4605,7 +4617,7 @@ mod warm_start_key_stability_tests {
     /// the outer `skip-outer-validation` warm hit, re-paying the full outer
     /// REML optimization (~30× slower repeat fits).
     #[test]
-    fn lazy_jacobian_caches_do_not_perturb_warm_start_fingerprint() {
+    pub(crate) fn lazy_jacobian_caches_do_not_perturb_warm_start_fingerprint() {
         let registry = duchon_like_registry();
         let cold = analytic_penalty_registry_fingerprint(&registry);
         populate_lazy_caches(&registry);
@@ -4622,7 +4634,7 @@ mod warm_start_key_stability_tests {
     /// is the cross-fit invariant the repeat-fit warm hit relies on (cold fit:
     /// caches empty; repeat fit: caches full).
     #[test]
-    fn cold_and_warm_registries_share_one_fingerprint() {
+    pub(crate) fn cold_and_warm_registries_share_one_fingerprint() {
         let cold_registry = duchon_like_registry();
         let warm_registry = duchon_like_registry();
         populate_lazy_caches(&warm_registry);

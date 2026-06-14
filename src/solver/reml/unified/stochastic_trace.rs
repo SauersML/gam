@@ -27,7 +27,7 @@ pub struct StochasticTraceConfig {
 }
 
 impl Default for StochasticTraceConfig {
-    fn default() -> Self {
+    pub(crate) fn default() -> Self {
         Self {
             n_probes_min: 10,
             n_probes_max: 200,
@@ -49,7 +49,7 @@ impl StochasticTraceConfig {
     /// cross traces never satisfy a pure relative-error test. A bounded probe
     /// budget with a scale-relative zero floor preserves the large curvature
     /// entries and lets ARC's trust-region logic absorb residual noise.
-    fn outer_hessian(dim: usize, n_coords: usize) -> Self {
+    pub(crate) fn outer_hessian(dim: usize, n_coords: usize) -> Self {
         let large_problem = dim >= 512 || n_coords >= 4;
         Self {
             n_probes_min: if large_problem { 4 } else { 6 },
@@ -102,7 +102,7 @@ pub(crate) enum StochasticTraceTargets<'a> {
 }
 
 impl StochasticTraceTargets<'_> {
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::Dense(matrices) => matrices.len(),
             Self::Mixed {
@@ -149,7 +149,7 @@ impl StochasticTraceEstimator {
         Self::new(StochasticTraceConfig::default())
     }
 
-    fn for_outer_hessian(dim: usize, n_coords: usize) -> Self {
+    pub(crate) fn for_outer_hessian(dim: usize, n_coords: usize) -> Self {
         Self::new(StochasticTraceConfig::outer_hessian(dim, n_coords))
     }
 
@@ -164,7 +164,7 @@ impl StochasticTraceEstimator {
         )
     }
 
-    fn effective_probe_min(&self) -> usize {
+    pub(crate) fn effective_probe_min(&self) -> usize {
         let floor = match self.trace_state.lock() {
             Ok(guard) => guard.monotone_probe_floor,
             Err(poisoned) => poisoned.into_inner().monotone_probe_floor,
@@ -175,7 +175,7 @@ impl StochasticTraceEstimator {
             .min(self.config.n_probes_max)
     }
 
-    fn raise_probe_floor(&self, k_drawn: usize) {
+    pub(crate) fn raise_probe_floor(&self, k_drawn: usize) {
         let mut state = match self.trace_state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -187,7 +187,7 @@ impl StochasticTraceEstimator {
         }
     }
 
-    fn estimate_from_probe_batch<F>(
+    pub(crate) fn estimate_from_probe_batch<F>(
         &self,
         hop: &dyn HessianOperator,
         n_coords: usize,
@@ -249,7 +249,7 @@ impl StochasticTraceEstimator {
         means
     }
 
-    fn estimate_matrix_from_probe_batch<F>(
+    pub(crate) fn estimate_matrix_from_probe_batch<F>(
         &self,
         hop: &dyn HessianOperator,
         n_coords: usize,
@@ -317,7 +317,7 @@ impl StochasticTraceEstimator {
         means
     }
 
-    fn max_probe_variance(m2s: &[f64], n_drawn: usize) -> f64 {
+    pub(crate) fn max_probe_variance(m2s: &[f64], n_drawn: usize) -> f64 {
         if n_drawn <= 1 {
             return 0.0;
         }
@@ -327,7 +327,7 @@ impl StochasticTraceEstimator {
             .fold(0.0_f64, f64::max)
     }
 
-    fn record_probe_batch(&self, sigma_sq: f64, n_drawn: usize) {
+    pub(crate) fn record_probe_batch(&self, sigma_sq: f64, n_drawn: usize) {
         let mut state = match self.trace_state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -336,7 +336,7 @@ impl StochasticTraceEstimator {
         state.last_probe_count = state.last_probe_count.max(n_drawn);
     }
 
-    fn estimate_hinv_traces(
+    pub(crate) fn estimate_hinv_traces(
         &self,
         hop: &dyn HessianOperator,
         targets: StochasticTraceTargets<'_>,
@@ -569,7 +569,7 @@ impl StochasticTraceEstimator {
         let mut y_vec = Array1::<f64>::zeros(n_obs);
         let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
 
-        struct ImplicitSecondOrderScratch {
+        pub(crate) struct ImplicitSecondOrderScratch {
             w_dx_u: Array1<f64>,
             w_y: Array1<f64>,
             u_s: Array1<f64>,
@@ -801,7 +801,7 @@ impl StochasticTraceEstimator {
         })
     }
 
-    fn estimate_second_order_single_dense(
+    pub(crate) fn estimate_second_order_single_dense(
         &self,
         hop: &dyn HessianOperator,
         matrix: &Array2<f64>,
@@ -832,7 +832,7 @@ impl StochasticTraceEstimator {
         })[[0, 0]]
     }
 
-    fn estimate_second_order_single_implicit(
+    pub(crate) fn estimate_second_order_single_implicit(
         &self,
         hop: &dyn HessianOperator,
         op: &ImplicitHyperOperator,
@@ -902,7 +902,7 @@ impl StochasticTraceEstimator {
         })[[0, 0]]
     }
 
-    fn estimate_second_order_single_operator(
+    pub(crate) fn estimate_second_order_single_operator(
         &self,
         hop: &dyn HessianOperator,
         op: &dyn HyperOperator,
@@ -934,7 +934,7 @@ impl StochasticTraceEstimator {
     /// ```text
     /// max_k  s_{M,k} / (√M · max(|q̄_{M,k}|, τ_rel))  ≤  ε
     /// ```
-    fn check_convergence(&self, n: usize, means: &[f64], m2s: &[f64]) -> bool {
+    pub(crate) fn check_convergence(&self, n: usize, means: &[f64], m2s: &[f64]) -> bool {
         if n < 2 {
             return false;
         }
@@ -953,7 +953,12 @@ impl StochasticTraceEstimator {
         true
     }
 
-    fn check_matrix_convergence(&self, n: usize, means: &Array2<f64>, m2s: &Array2<f64>) -> bool {
+    pub(crate) fn check_matrix_convergence(
+        &self,
+        n: usize,
+        means: &Array2<f64>,
+        m2s: &Array2<f64>,
+    ) -> bool {
         if n < 2 {
             return false;
         }
@@ -1083,13 +1088,13 @@ pub(crate) fn stochastic_trace_hinv_crosses_with_floor<'a>(
 ///
 /// This is used exclusively for Rademacher probe generation. The state is
 /// seeded deterministically from a u64 via splitmix64.
-struct Xoshiro256SS {
+pub(crate) struct Xoshiro256SS {
     s: [u64; 4],
 }
 
 impl Xoshiro256SS {
     /// Seed from a single u64 via splitmix64 expansion.
-    fn from_seed(seed: u64) -> Self {
+    pub(crate) fn from_seed(seed: u64) -> Self {
         let mut sm = seed;
         let s0 = splitmix64(&mut sm);
         let s1 = splitmix64(&mut sm);
@@ -1107,7 +1112,7 @@ impl Xoshiro256SS {
 
     /// Generate the next u64.
     #[inline]
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         let result = (self.s[1].wrapping_mul(5)).rotate_left(7).wrapping_mul(9);
 
         let t = self.s[1] << 17;
@@ -1126,17 +1131,17 @@ impl Xoshiro256SS {
 
 /// Splitmix64: deterministic expansion of a single u64 seed into a sequence.
 #[inline]
-fn splitmix64(state: &mut u64) -> u64 {
+pub(crate) fn splitmix64(state: &mut u64) -> u64 {
     crate::linalg::utils::splitmix64(state)
 }
 
 #[inline]
-fn stochastic_trace_probe_id(seed: u64, probe_index: usize) -> u64 {
+pub(crate) fn stochastic_trace_probe_id(seed: u64, probe_index: usize) -> u64 {
     let mut state = seed ^ (probe_index as u64).wrapping_mul(0xD1B54A32D192ED03);
     splitmix64(&mut state)
 }
 
-fn rademacher_probe_into(mut z: ArrayViewMut1<'_, f64>, rng: &mut Xoshiro256SS) {
+pub(crate) fn rademacher_probe_into(mut z: ArrayViewMut1<'_, f64>, rng: &mut Xoshiro256SS) {
     let mut bits: u64 = 0;
     let mut remaining_bits = 0u32;
 
@@ -1160,7 +1165,7 @@ fn rademacher_probe_into(mut z: ArrayViewMut1<'_, f64>, rng: &mut Xoshiro256SS) 
 /// norm are dropped (numerical-rank cutoff). After this call,
 /// `q.column(0..rank)` is column-orthonormal and approximates
 /// `range(y)`; later columns of `q` are zeroed.
-fn modified_gram_schmidt(y: &Array2<f64>, q: &mut Array2<f64>) -> usize {
+pub(crate) fn modified_gram_schmidt(y: &Array2<f64>, q: &mut Array2<f64>) -> usize {
     let p = y.nrows();
     let m = y.ncols();
     assert_eq!(q.dim(), (p, m));
@@ -1215,7 +1220,11 @@ fn modified_gram_schmidt(y: &Array2<f64>, q: &mut Array2<f64>) -> usize {
 /// adaptive relative-error stop) is identical, so it lives here once.
 /// `B` need not be self-adjoint: on Rademacher probes `E[zᵀ B z] = tr(B)`
 /// regardless, and the projected `tr(Qᵀ B Q)` is exact on `range(Q)`.
-fn hutchpp_estimate_trace_with_apply<F>(p: usize, config: &StochasticTraceConfig, apply: F) -> f64
+pub(crate) fn hutchpp_estimate_trace_with_apply<F>(
+    p: usize,
+    config: &StochasticTraceConfig,
+    apply: F,
+) -> f64
 where
     F: Fn(ArrayView1<'_, f64>, &mut Array1<f64>) -> Array1<f64>,
 {

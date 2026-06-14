@@ -16,7 +16,7 @@ impl TransformationNormalFamily {
     /// gives `hessian_psi`. The code below expands those derivatives directly,
     /// including both paths through `c` and `c_psi` for same-component squared
     /// shape terms.
-    fn scop_psi_terms(
+    pub(crate) fn scop_psi_terms(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
@@ -197,7 +197,7 @@ impl TransformationNormalFamily {
         })
     }
 
-    fn scop_psi_hessian_apply_from_operator(
+    pub(crate) fn scop_psi_hessian_apply_from_operator(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
@@ -221,7 +221,7 @@ impl TransformationNormalFamily {
         )
     }
 
-    fn scop_psi_hessian_apply_from_operator_with_cov(
+    pub(crate) fn scop_psi_hessian_apply_from_operator_with_cov(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
@@ -467,7 +467,7 @@ impl TransformationNormalFamily {
         Ok(out)
     }
 
-    fn scop_psi_hessian_hvp_mat_from_cov(
+    pub(crate) fn scop_psi_hessian_hvp_mat_from_cov(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
@@ -522,7 +522,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        struct PsiBatchedAccum {
+        pub(crate) struct PsiBatchedAccum {
             hvp: Array2<f64>,
             gamma: Vec<f64>,
             gamma_psi: Vec<f64>,
@@ -537,7 +537,7 @@ impl TransformationNormalFamily {
         }
 
         impl PsiBatchedAccum {
-            fn new(p_total: usize, p_resp: usize, rank: usize) -> Self {
+            pub(crate) fn new(p_total: usize, p_resp: usize, rank: usize) -> Self {
                 let projected_len = p_resp * rank;
                 Self {
                     hvp: Array2::<f64>::zeros((p_total, rank)),
@@ -554,7 +554,7 @@ impl TransformationNormalFamily {
                 }
             }
 
-            fn merge(mut self, rhs: Self) -> Self {
+            pub(crate) fn merge(mut self, rhs: Self) -> Self {
                 self.hvp += &rhs.hvp;
                 self
             }
@@ -809,7 +809,7 @@ impl TransformationNormalFamily {
         Ok(accum.hvp)
     }
 
-    fn scop_psi_hessian_trace_factor_from_cov(
+    pub(crate) fn scop_psi_hessian_trace_factor_from_cov(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
@@ -864,7 +864,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        struct PsiTraceAccum {
+        pub(crate) struct PsiTraceAccum {
             value: f64,
             gamma: Vec<f64>,
             gamma_psi: Vec<f64>,
@@ -885,7 +885,7 @@ impl TransformationNormalFamily {
         }
 
         impl PsiTraceAccum {
-            fn new(p_resp: usize, rank: usize) -> Self {
+            pub(crate) fn new(p_resp: usize, rank: usize) -> Self {
                 let projected_len = p_resp * rank;
                 Self {
                     value: 0.0,
@@ -908,7 +908,7 @@ impl TransformationNormalFamily {
                 }
             }
 
-            fn merge(mut self, rhs: Self) -> Self {
+            pub(crate) fn merge(mut self, rhs: Self) -> Self {
                 self.value += rhs.value;
                 self
             }
@@ -1064,7 +1064,7 @@ impl TransformationNormalFamily {
     ///
     /// Returns a `Vec<f64>` of length `cov_psi_per_axis.len()` with the trace
     /// of each axis's projected ψ-Hessian.
-    fn scop_psi_hessian_trace_factor_all_axes_chunk_from_cov(
+    pub(crate) fn scop_psi_hessian_trace_factor_all_axes_chunk_from_cov(
         &self,
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
@@ -1129,7 +1129,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        struct PsiAllAxesTraceAccum {
+        pub(crate) struct PsiAllAxesTraceAccum {
             values: Vec<f64>,
             gamma: Vec<f64>,
             gamma_dir: Vec<f64>,
@@ -1150,7 +1150,7 @@ impl TransformationNormalFamily {
         }
 
         impl PsiAllAxesTraceAccum {
-            fn new(p_resp: usize, rank: usize, n_psi: usize) -> Self {
+            pub(crate) fn new(p_resp: usize, rank: usize, n_psi: usize) -> Self {
                 let projected_len = p_resp * rank;
                 Self {
                     values: vec![0.0; n_psi],
@@ -1173,7 +1173,7 @@ impl TransformationNormalFamily {
                 }
             }
 
-            fn merge(mut self, rhs: Self) -> Self {
+            pub(crate) fn merge(mut self, rhs: Self) -> Self {
                 for (a, v) in rhs.values.into_iter().enumerate() {
                     self.values[a] += v;
                 }
@@ -1355,7 +1355,7 @@ impl TransformationNormalFamily {
         Ok(accum.values)
     }
 
-    fn scop_psi_psi_value_score_hvp_from_cov(
+    pub(crate) fn scop_psi_psi_value_score_hvp_from_cov(
         &self,
         beta: &Array1<f64>,
         cached_gamma: ArrayView2<'_, f64>,
@@ -1476,7 +1476,7 @@ impl TransformationNormalFamily {
         if direction_mat.is_none() {
             let weights = self.effective_weights();
 
-            struct PsiPairScoreAccum {
+            pub(crate) struct PsiPairScoreAccum {
                 objective: f64,
                 score: Array1<f64>,
                 gamma: Vec<f64>,
@@ -1486,7 +1486,7 @@ impl TransformationNormalFamily {
             }
 
             impl PsiPairScoreAccum {
-                fn new(p_total: usize, p_resp: usize) -> Self {
+                pub(crate) fn new(p_total: usize, p_resp: usize) -> Self {
                     Self {
                         objective: 0.0,
                         score: Array1::<f64>::zeros(p_total),
@@ -1497,7 +1497,7 @@ impl TransformationNormalFamily {
                     }
                 }
 
-                fn merge(mut self, rhs: Self) -> Self {
+                pub(crate) fn merge(mut self, rhs: Self) -> Self {
                     self.objective += rhs.objective;
                     self.score.scaled_add(1.0, &rhs.score);
                     self
@@ -1659,7 +1659,7 @@ impl TransformationNormalFamily {
         let weights = self.effective_weights();
         let direction_mat = direction_mat.expect("directional CTN psi-psi path requires direction");
 
-        struct PsiPairDirectionalAccum {
+        pub(crate) struct PsiPairDirectionalAccum {
             hvp: Array1<f64>,
             gamma: Vec<f64>,
             gamma_i: Vec<f64>,
@@ -1672,7 +1672,7 @@ impl TransformationNormalFamily {
         }
 
         impl PsiPairDirectionalAccum {
-            fn new(p_total: usize, p_resp: usize) -> Self {
+            pub(crate) fn new(p_total: usize, p_resp: usize) -> Self {
                 Self {
                     hvp: Array1::<f64>::zeros(p_total),
                     gamma: vec![0.0; p_resp],
@@ -1686,7 +1686,7 @@ impl TransformationNormalFamily {
                 }
             }
 
-            fn merge(mut self, rhs: Self) -> Self {
+            pub(crate) fn merge(mut self, rhs: Self) -> Self {
                 self.hvp.scaled_add(1.0, &rhs.hvp);
                 self
             }
@@ -2007,7 +2007,7 @@ impl TransformationNormalFamily {
         Ok((0.0, Array1::<f64>::zeros(p_total), Some(accum.hvp)))
     }
 
-    fn scop_psi_psi_hvp_mat_from_cov(
+    pub(crate) fn scop_psi_psi_hvp_mat_from_cov(
         &self,
         beta: &Array1<f64>,
         cached_gamma: ArrayView2<'_, f64>,
@@ -2104,7 +2104,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        struct PsiPairBatchedAccum {
+        pub(crate) struct PsiPairBatchedAccum {
             hvp: Array2<f64>,
             gamma: Vec<f64>,
             gamma_i: Vec<f64>,
@@ -2117,7 +2117,7 @@ impl TransformationNormalFamily {
         }
 
         impl PsiPairBatchedAccum {
-            fn new(p_total: usize, p_resp: usize, rank: usize) -> Self {
+            pub(crate) fn new(p_total: usize, p_resp: usize, rank: usize) -> Self {
                 let projected_len = p_resp * rank;
                 Self {
                     hvp: Array2::<f64>::zeros((p_total, rank)),
@@ -2132,7 +2132,7 @@ impl TransformationNormalFamily {
                 }
             }
 
-            fn merge(mut self, rhs: Self) -> Self {
+            pub(crate) fn merge(mut self, rhs: Self) -> Self {
                 self.hvp += &rhs.hvp;
                 self
             }
@@ -2475,7 +2475,7 @@ impl TransformationNormalFamily {
         Ok(accum.hvp)
     }
 
-    fn scop_psi_psi_bilinear_from_cov(
+    pub(crate) fn scop_psi_psi_bilinear_from_cov(
         &self,
         beta: &Array1<f64>,
         cached_gamma: ArrayView2<'_, f64>,
@@ -2578,7 +2578,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        struct PsiPairBilinearAccum {
+        pub(crate) struct PsiPairBilinearAccum {
             value: f64,
             gamma: Vec<f64>,
             gamma_i: Vec<f64>,
@@ -2595,7 +2595,7 @@ impl TransformationNormalFamily {
         }
 
         impl PsiPairBilinearAccum {
-            fn new(p_resp: usize) -> Self {
+            pub(crate) fn new(p_resp: usize) -> Self {
                 Self {
                     value: 0.0,
                     gamma: vec![0.0; p_resp],
@@ -2856,7 +2856,7 @@ impl TransformationNormalFamily {
         Ok(total)
     }
 
-    fn scop_psi_psi_trace_factor_from_cov(
+    pub(crate) fn scop_psi_psi_trace_factor_from_cov(
         &self,
         beta: &Array1<f64>,
         cached_gamma: ArrayView2<'_, f64>,
@@ -2956,7 +2956,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        struct PsiPairTraceAccum {
+        pub(crate) struct PsiPairTraceAccum {
             value: f64,
             gamma: Vec<f64>,
             gamma_i: Vec<f64>,
@@ -2969,7 +2969,7 @@ impl TransformationNormalFamily {
         }
 
         impl PsiPairTraceAccum {
-            fn new(p_resp: usize, rank: usize) -> Self {
+            pub(crate) fn new(p_resp: usize, rank: usize) -> Self {
                 let projected_len = p_resp * rank;
                 Self {
                     value: 0.0,
@@ -3197,13 +3197,13 @@ impl TransformationNormalFamily {
         Ok(total)
     }
 
-    fn scop_psi_pair_rows_per_chunk(&self, p_cov: usize) -> usize {
+    pub(crate) fn scop_psi_pair_rows_per_chunk(&self, p_cov: usize) -> usize {
         let policy = ResourcePolicy::default_library();
         crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, 4 * p_cov.max(1))
             .max(1)
     }
 
-    fn scop_psi_pair_cov_chunks(
+    pub(crate) fn scop_psi_pair_cov_chunks(
         &self,
         op: &TensorKroneckerPsiOperator,
         axis_i: usize,
@@ -3226,7 +3226,7 @@ impl TransformationNormalFamily {
         Ok((cov, cov_i, cov_j, cov_ij))
     }
 
-    fn scop_psi_psi_value_score_hvp_from_operator(
+    pub(crate) fn scop_psi_psi_value_score_hvp_from_operator(
         &self,
         beta: &Array1<f64>,
         op: &TensorKroneckerPsiOperator,
@@ -3303,7 +3303,7 @@ impl TransformationNormalFamily {
         Ok((objective, score, hvp))
     }
 
-    fn scop_psi_psi_bilinear_from_operator(
+    pub(crate) fn scop_psi_psi_bilinear_from_operator(
         &self,
         beta: &Array1<f64>,
         op: &TensorKroneckerPsiOperator,
@@ -3372,7 +3372,7 @@ impl TransformationNormalFamily {
         Ok(total)
     }
 
-    fn scop_psi_hessian_directional_derivative(
+    pub(crate) fn scop_psi_hessian_directional_derivative(
         &self,
         beta: &Array1<f64>,
         direction: &Array1<f64>,
@@ -3437,7 +3437,7 @@ impl TransformationNormalFamily {
         // win. Per-thread scratch buffers are created once via
         // `fold(|| init, …)` and reused across all rows assigned to that
         // thread.
-        struct Scratch {
+        pub(crate) struct Scratch {
             out: Array2<f64>,
             gamma: Vec<f64>,
             gamma_dir: Vec<f64>,
@@ -3790,7 +3790,7 @@ impl TransformationNormalFamily {
         Ok(out)
     }
 
-    fn scop_psi_hessian_directional_trace_factor_chunk_from_cov(
+    pub(crate) fn scop_psi_hessian_directional_trace_factor_chunk_from_cov(
         &self,
         beta: &Array1<f64>,
         direction: &Array1<f64>,
@@ -3850,7 +3850,7 @@ impl TransformationNormalFamily {
             })?,
         ];
 
-        struct PsiDhTraceAccum {
+        pub(crate) struct PsiDhTraceAccum {
             value: f64,
             gamma: Vec<f64>,
             gamma_dir: Vec<f64>,
@@ -3879,7 +3879,7 @@ impl TransformationNormalFamily {
         }
 
         impl PsiDhTraceAccum {
-            fn new(p_resp: usize, rank: usize) -> Self {
+            pub(crate) fn new(p_resp: usize, rank: usize) -> Self {
                 let projected_len = p_resp * rank;
                 Self {
                     value: 0.0,
@@ -3910,7 +3910,7 @@ impl TransformationNormalFamily {
                 }
             }
 
-            fn merge(mut self, rhs: Self) -> Self {
+            pub(crate) fn merge(mut self, rhs: Self) -> Self {
                 self.value += rhs.value;
                 self
             }

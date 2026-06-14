@@ -264,7 +264,7 @@ impl PenaltyCoordinate {
         }
     }
 
-    fn apply_root(&self, beta: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn apply_root(&self, beta: &Array1<f64>) -> Array1<f64> {
         assert_eq!(beta.len(), self.dim());
         match self {
             Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => root.dot(beta),
@@ -765,7 +765,7 @@ impl PenaltySubspaceTrace {
         assert_eq!(self.h_proj_inverse.ncols(), r);
 
         let block = {
-            const TARGET_CHUNK_FLOATS: usize = 1 << 16;
+            pub(crate) const TARGET_CHUNK_FLOATS: usize = 1 << 16;
             (TARGET_CHUNK_FLOATS / p.max(1)).clamp(1, n.max(1))
         };
 
@@ -1035,7 +1035,7 @@ impl<'a> ConstrainedSubspaceKernel<'a> {
 /// ε-level residue, see [`PenaltySubspaceTrace::with_active_constraints`])
 /// never trip it; the historical failure mode it guards (the d6b17a7f
 /// `1/σ_min ≈ 10¹²` null-space amplification) exceeds it by six orders.
-const THETA_MODE_RESPONSE_TANGENCY_GATE: f64 = 1e-6;
+pub(crate) const THETA_MODE_RESPONSE_TANGENCY_GATE: f64 = 1e-6;
 
 /// #931 migration pass 2 — the ThetaDirection shared-drift pass: the ONE
 /// per-evaluation selection of the IFT mode-response kernel behind every
@@ -1157,7 +1157,7 @@ impl<'s> ThetaModeResponseKernel<'s> {
     /// unconstrained arm carries no separate certify: its coherence with
     /// the criterion VALUE is audited end-to-end by the #934
     /// `CriterionCertificate` at every returned optimum.
-    fn certify_tangency(&self, ck: &ConstrainedSubspaceKernel<'_>, v: &Array1<f64>) {
+    pub(crate) fn certify_tangency(&self, ck: &ConstrainedSubspaceKernel<'_>, v: &Array1<f64>) {
         let residual = ck.a_act.dot(v);
         for (row, r) in residual.iter().enumerate() {
             let scale: f64 = ck
@@ -1244,7 +1244,7 @@ impl ProjectedKktResidual {
     /// active-projected residual and go through `projected_into_reduced_range`
     /// so the dropped null/range-excluded component is checked against the
     /// producing inner KKT tolerance.
-    fn from_reduced_range(residual: Array1<f64>) -> Self {
+    pub(crate) fn from_reduced_range(residual: Array1<f64>) -> Self {
         Self {
             residual,
             subspace: KktResidualSubspace::ReducedRange,
@@ -1296,7 +1296,7 @@ impl ProjectedKktResidual {
                 // gate when the caller supplies no explicit `residual_tol`:
                 // ~1e-10 scaled by `1 + ‖r‖∞` so it degrades gracefully with the
                 // residual magnitude.
-                const DEFAULT_KKT_RESIDUAL_REL_TOL: f64 = 1e-10;
+                pub(crate) const DEFAULT_KKT_RESIDUAL_REL_TOL: f64 = 1e-10;
                 let tol = self
                     .residual_tol
                     .unwrap_or_else(|| DEFAULT_KKT_RESIDUAL_REL_TOL * (1.0 + residual_inf));
