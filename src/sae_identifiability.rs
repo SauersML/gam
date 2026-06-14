@@ -49,9 +49,7 @@
 
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
-use crate::inference::riesz::{
-    RieszDebiasReport, RieszInput, SmoothFunctional, debias_with_dense_hessian,
-};
+use crate::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
 use crate::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use crate::linalg::faer_ndarray::{
@@ -878,18 +876,18 @@ pub struct FittedAtom {
     /// circle, reflection + translation on the interval.
     pub chart_canonicalized: bool,
     /// Per-atom inner-decoder-smooth byproducts harvested at fit time, the
-    /// single source the three post-PIRLS atom inference reports
-    /// ([`AtomFunctionalReport`] #1097, [`AtomCurvatureCi`] #1099,
-    /// [`AtomSmoothSignificance`] #1103) consume in [`dictionary_report`].
+    /// single source the post-PIRLS atom inference reports
+    /// ([`AtomFunctionalReport`] #1097, [`AtomSmoothSignificance`] #1103)
+    /// consume in [`dictionary_report`].
     ///
     /// The certificate path that builds `FittedSaeManifold` does so *without* a
     /// fit harness in scope, so it leaves this `None`; callers that own the
     /// fitted term attach it through [`FittedAtom::with_inner_fit`] (the term
     /// builder fills it from the live per-atom basis, decoder, assignment mass,
-    /// smoothness Gram, and the geometric `per_atom_kappa_hat`). When `None`,
-    /// all three reports below are `None`: the genuine prerequisite — the
-    /// post-fit inner-smooth design, penalized Hessian, and row scores — is
-    /// simply not present on a bare certificate-only `FittedSaeManifold`.
+    /// and smoothness Gram). When `None`, both reports below are `None`: the
+    /// genuine prerequisite — the post-fit inner-smooth design, penalized
+    /// Hessian, and row scores — is simply not present on a bare
+    /// certificate-only `FittedSaeManifold`.
     pub inner_fit: Option<AtomInnerFit>,
 }
 
@@ -935,21 +933,6 @@ pub struct AtomInnerFit {
     pub peak_design_row: Array1<f64>,
     /// Design row at the latent mode `t_mode` (largest assignment mass).
     pub mode_design_row: Array1<f64>,
-    /// The atom's plug-in curvature estimate `κ̂ = atom_curvature_bound(β̂)` (the
-    /// dictionary `per_atom_kappa_hat[k]`): a sup-norm extrinsic-curvature BOUND
-    /// read off the fitted decoder coefficients. Echoed so the curvature-CI
-    /// report has its point estimate without re-deriving it.
-    pub kappa_hat: f64,
-    /// The gradient `∂κ/∂β ∈ ℝ^{M_k}` of the curvature functional
-    /// `atom_curvature_bound` with respect to the captured decoder channel's
-    /// coefficients, evaluated at `β̂`. Captured at fit time (where the full
-    /// second-jet geometry the bound is built from lives) by finite-differencing
-    /// the bound in each coefficient. This is the delta-method sensitivity the
-    /// #1099 curvature SE propagates through the inner-fit Hessian inverse:
-    /// `SE = sqrt((∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β))`. `None` when the bound carries no usable
-    /// gradient (degenerate chart / infinite bound), in which case the curvature
-    /// CI is reported `None`.
-    pub kappa_grad: Option<Array1<f64>>,
 }
 
 impl FittedAtom {
@@ -962,62 +945,63 @@ impl FittedAtom {
     }
 }
 
-/// Well-posed Riesz-debiased smooth functionals of one fitted atom's decoder
-/// curve (#1097). Each field is the one-step-debiased estimate of a scalar
-/// functional of the atom's inner smooth `g_k(t)`, with influence-based SE,
-/// reusing the atom fit's penalized Hessian as the
-/// [`crate::solver::sensitivity::FitSensitivity`].
+/// Descriptive penalty-debiased POINT summaries of one fitted atom's decoder
+/// curve (#1097, narrowed under #1115). Each field is a scalar functional of the
+/// atom's inner smooth `g_k(t)`, reported as a plug-in value and a one-step
+/// penalty-debiased value (the regularization bias relative to the conditional
+/// target is removed through the atom fit's penalized Hessian). No standard
+/// error and no confidence interval are reported — by design (see below).
 ///
-/// These are descriptive questions about a fitted decoder (conditional on the
-/// fit), NOT population causal estimands. In particular there is no per-atom
-/// "marginal slope": the latent coordinate is itself a fitted, generated
-/// regressor, so there is no exogenous treatment whose population effect a
-/// one-step debiasing would target — the derivative functional below is reported
-/// only as a conditional decoder-variation norm.
+/// # Why these carry NO coverage claim (#1115)
+///
+/// Conditional on the fitted latent coordinates `t̂` and assignment `â`, each
+/// functional is an ordinary linear functional of the penalized-WLS coefficients
+/// `β` with a well-defined *conditional* population value, and one-step debiasing
+/// validly removes the penalty bias for that conditional target. The point
+/// estimates are therefore meaningful. A *standard error*, however, would only be
+/// honest if `t̂` and `â` were fixed/known. They are not: they are **generated
+/// regressors** estimated from the very activations that also form the response
+/// `Z`, so `Z` enters both the design (via `t̂(Z), â(Z)`) and the response. An
+/// influence-function SE built from the β-only Hessian and row scores carries no
+/// `∂t̂/∂Z` / `∂â/∂Z` channel — exactly the generated-regressor correction the
+/// marginal-slope family (#461 Stage 2) is *defined* by — so it omits a
+/// first-order variance term and is generally anti-conservative. Rather than ship
+/// an SE/CI that silently under-covers, this report exposes only the debiased
+/// point summaries; a coverage-valid interval would require either freezing the
+/// dictionary on a held-out split or propagating the generated-regressor
+/// Jacobian, neither of which the fixed inner-fit snapshot supports.
 #[derive(Debug, Clone)]
 pub struct AtomFunctionalReport {
-    /// `g(t_peak) − g(t_mode)`: the peak-vs-baseline contrast — is the atom's
-    /// peak activation significantly above its mode baseline. A well-posed
-    /// question about a fitted decoder, one-step debiased through the inner-fit
-    /// penalized Hessian.
-    pub peak_contrast: Option<RieszDebiasReport>,
-    /// `E_data[g(t_i)]`: the data-averaged decoder value (mean activation over
-    /// the atom's active rows). Well-posed; debiased through the same Hessian.
-    pub average_value: Option<RieszDebiasReport>,
-    /// `‖E_data[∂g/∂t]‖`: how much the decoder curve varies across the data
-    /// distribution along the atom's leading latent axis, **conditional on the
-    /// fit**. This is a descriptive variation measure of the fitted curve — it
-    /// is NOT a population "marginal slope" (there is no exogenous treatment
-    /// whose causal effect this debiases; the latent coordinate is itself a
-    /// fitted, generated regressor). Reported only with that conditional reading.
-    pub decoder_variation_norm: Option<RieszDebiasReport>,
+    /// `g(t_peak) − g(t_mode)`: the peak-vs-baseline contrast of the fitted
+    /// decoder, penalty-debiased through the inner-fit Hessian. Point summary
+    /// only (no coverage claim — see the type doc).
+    pub peak_contrast: Option<AtomFunctionalEstimate>,
+    /// `E_data[g(t_i)]`: the data-averaged decoder value over the atom's active
+    /// rows, penalty-debiased. Point summary only.
+    pub average_value: Option<AtomFunctionalEstimate>,
+    /// `E_data[∂g/∂t]` along the atom's leading latent axis: how much the fitted
+    /// decoder curve varies across the data distribution, **conditional on the
+    /// fit**. A descriptive variation measure of the fitted curve, NOT a
+    /// population "marginal slope" (the latent coordinate is itself a fitted,
+    /// generated regressor). Point summary only.
+    pub decoder_variation_norm: Option<AtomFunctionalEstimate>,
 }
 
-/// Per-atom curvature point estimate and delta-method standard error (#1099).
-///
-/// `kappa_hat = atom_curvature_bound(β̂)` is a sup-norm extrinsic-curvature BOUND
-/// read off the already-fitted decoder coefficients — nothing in any
-/// optimisation moves it, so there is no profiled criterion `V_p(κ)` to walk and
-/// no likelihood κ-channel. The honest uncertainty is therefore a plug-in
-/// delta-method SE: `SE = sqrt((∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β))`, with `∂κ/∂β` the gradient
-/// of the curvature functional at `β̂` ([`AtomInnerFit::kappa_grad`]) and `H⁻¹`
-/// the inner-fit penalized Hessian inverse ([`AtomInnerFit::penalized_hessian`]).
-/// `ci_normal` is the Wald interval `κ̂ ± z_{0.975} · SE`.
-///
-/// CAVEAT (honest, non-standard): `atom_curvature_bound` is a sup/max functional
-/// of the per-row, per-axis curvatures. At the fitted optimum one argmax row/axis
-/// is active; the delta method linearises around it, so the normal interval is
-/// approximate and breaks down near the active-argmax switch (where κ̂ is
-/// non-differentiable in β). It is a local sensitivity band, not an exact
-/// coverage-valid confidence set.
-#[derive(Debug, Clone)]
-pub struct AtomCurvatureCi {
-    /// The plug-in curvature bound `κ̂ = atom_curvature_bound(β̂)`.
-    pub kappa_hat: f64,
-    /// Delta-method standard error `sqrt((∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β))`.
-    pub se: f64,
-    /// Wald normal interval `(κ̂ − z·SE, κ̂ + z·SE)` at 95% (`z = 1.959964`).
-    pub ci_normal: (f64, f64),
+/// One atom decoder-functional point summary: the plug-in value and the one-step
+/// penalty-debiased value, with the removed penalty bias. Deliberately carries
+/// NO standard error / confidence interval — the conditional-on-generated-
+/// regressors variance channel is unmodelled, so any SE would under-cover
+/// (#1115). Use [`AtomSmoothSignificance`] for an honest any-n-valid structure
+/// test instead.
+#[derive(Debug, Clone, Copy)]
+pub struct AtomFunctionalEstimate {
+    /// The raw plug-in functional value `θ̂ = g·β̂`.
+    pub theta_plugin: f64,
+    /// The one-step penalty-debiased value `θ̂ − bias`, removing the
+    /// regularization bias relative to the conditional target.
+    pub theta_onestep: f64,
+    /// The removed penalty bias `(H⁻¹ g)·(Sβ̂)`.
+    pub penalty_bias: f64,
 }
 
 /// Any-n-valid structure evidence that one atom's inner smooth `h_k(t)` is
@@ -1042,13 +1026,22 @@ pub struct AtomSmoothSignificance {
     pub log_e_nonconstant: Option<f64>,
 }
 
-/// The three post-PIRLS inference reports for one atom, paired by atom index.
+/// The post-PIRLS inference reports for one atom, paired by atom index.
+///
+/// Two reports survive #1115: the descriptive penalty-debiased point summaries
+/// of the fitted decoder curve ([`AtomFunctionalReport`], no coverage claim) and
+/// the any-n-valid split-LRT smooth-structure e-value ([`AtomSmoothSignificance`],
+/// a genuine finite-sample-valid test). The #1099 per-atom curvature *confidence
+/// interval* was removed: its target (a sup-norm extrinsic-curvature BOUND read
+/// off the fitted decoder) is not an estimand with a profiled criterion, and its
+/// delta-method SE conditioned on the generated latent coordinates as if known.
+/// The plug-in curvature point estimate itself survives as
+/// `per_atom_kappa_hat` on the dictionary report.
 #[derive(Debug, Clone)]
 pub struct AtomInferenceReport {
     pub atom_index: usize,
     pub atom_name: String,
     pub functionals: Option<AtomFunctionalReport>,
-    pub curvature_ci: Option<AtomCurvatureCi>,
     pub smooth_significance: Option<AtomSmoothSignificance>,
 }
 
@@ -2661,14 +2654,16 @@ pub struct DictionaryReport {
     /// canonical circle charts may use an arbitrary period and are rescaled by
     /// [`dictionary_report_with_transport_ladders`] before fitting.
     pub transport_ladders: Vec<AtomTransportLadderReport>,
-    /// Per-atom post-PIRLS inference reports (#1097 Riesz functionals, #1099
-    /// curvature CI, #1103 split-LRT smooth-structure e-value), one entry
-    /// per atom in [`FittedSaeManifold::atoms`] order. Each report's three
+    /// Per-atom post-PIRLS inference reports (#1097 penalty-debiased functional
+    /// POINT summaries, #1103 split-LRT smooth-structure e-value), one entry
+    /// per atom in [`FittedSaeManifold::atoms`] order. The #1099 per-atom
+    /// curvature CI was removed under #1115 (a curvature BOUND is not an
+    /// estimand and its SE conditioned on generated regressors). Each report's
     /// fields are computed when the atom carries its fit-time
     /// [`AtomInnerFit`] byproducts and the relevant numerics succeed; otherwise
     /// the field is `None` (a bare certificate-only `FittedSaeManifold` — one
     /// built by the residual-gauge path with no fit harness — leaves every
-    /// `inner_fit` `None`, so all three fields are `None`).
+    /// `inner_fit` `None`, so both fields are `None`).
     pub atom_inference: Vec<AtomInferenceReport>,
 }
 
@@ -2699,25 +2694,30 @@ pub struct AtomTransportLadderReport {
     pub report: TransportLadderReport,
 }
 
-/// #1097 Riesz-debiased smooth functionals for one atom's captured
-/// inner-decoder smooth.
+/// #1097 penalty-debiased smooth-functional POINT summaries for one atom's
+/// captured inner-decoder smooth (narrowed under #1115).
 ///
 /// All three functionals are *linear* in the atom's fitted coefficient vector
-/// `β_{k,j}`, so each is one-step debiased through the SAME penalized Hessian
-/// the identifiability certificate's curvature sees
+/// `β_{k,j}`, so each is one-step penalty-debiased through the SAME penalized
+/// Hessian the identifiability certificate's curvature sees
 /// ([`AtomInnerFit::penalized_hessian`]) by routing the functional gradient,
 /// the per-row scores, and the penalty gradient `S̃_k β` through
-/// [`debias_with_dense_hessian`]. A non-SPD Hessian or a degenerate functional
-/// (empty design, non-finite gradient) leaves the offending field `None`; the
-/// other two still report.
+/// [`debias_with_dense_hessian`]. Only the resulting POINT estimates (plug-in,
+/// penalty-debiased, removed bias) are kept; the influence-function SE is
+/// discarded because it conditions on the generated latent coordinates `t̂` /
+/// assignment `â` as if known and so under-covers (see
+/// [`AtomFunctionalReport`] for the full argument). A non-SPD Hessian or a
+/// degenerate functional (empty design, non-finite gradient) leaves the
+/// offending field `None`; the other two still report.
 fn atom_functional_report(fit: &AtomInnerFit) -> AtomFunctionalReport {
     let penalty_beta = fit.penalty.dot(&fit.beta);
 
     // A small closed-form helper: build the Riesz input for a functional
-    // gradient and debias it through the fitted penalized Hessian. The Riesz
-    // layer's own `EstimationError` is collapsed into `None` — a numerical
+    // gradient and penalty-debias it through the fitted penalized Hessian, then
+    // KEEP ONLY the point estimates (the SE is not honest here — #1115). The
+    // Riesz layer's own `EstimationError` is collapsed into `None` — a numerical
     // refusal is a missing field, not a poisoned report.
-    let debias = |functional_gradient: Array1<f64>| -> Option<RieszDebiasReport> {
+    let debias = |functional_gradient: Array1<f64>| -> Option<AtomFunctionalEstimate> {
         let input = RieszInput {
             beta: fit.beta.view(),
             functional_gradient: functional_gradient.view(),
@@ -2725,7 +2725,13 @@ fn atom_functional_report(fit: &AtomInnerFit) -> AtomFunctionalReport {
             penalty_beta: penalty_beta.view(),
             leverage: None,
         };
-        debias_with_dense_hessian(&input, fit.penalized_hessian.view()).ok()
+        debias_with_dense_hessian(&input, fit.penalized_hessian.view())
+            .ok()
+            .map(|r| AtomFunctionalEstimate {
+                theta_plugin: r.theta_plugin,
+                theta_onestep: r.theta_onestep,
+                penalty_bias: r.penalty_bias,
+            })
     };
 
     // Peak-vs-mode contrast g(t_peak) − g(t_mode): the linear functional whose
@@ -2896,103 +2902,35 @@ fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance
     })
 }
 
-/// #1099 Per-atom curvature point estimate `κ̂` and delta-method standard error.
-///
-/// `κ̂ = atom_curvature_bound(β̂)` is a sup-norm extrinsic-curvature BOUND read
-/// off the fitted decoder coefficients ([`AtomInnerFit::kappa_hat`]). Nothing in
-/// any optimisation moves κ, so there is no profiled criterion `V_p(κ)` to walk
-/// and no likelihood κ-channel — a profile-likelihood CI would be a category
-/// error. The honest uncertainty is the plug-in delta method:
-///
-/// ```text
-///   SE = sqrt( (∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β) ),
-/// ```
-///
-/// with `∂κ/∂β` ([`AtomInnerFit::kappa_grad`]) the gradient of the curvature
-/// functional at `β̂` (captured at fit time by finite-differencing
-/// `atom_curvature_bound` in each decoder coefficient, where the full second-jet
-/// geometry lives) and `H⁻¹` the inner-fit penalized Hessian inverse. The
-/// reported interval is the Wald band `κ̂ ± z_{0.975}·SE`.
-///
-/// CAVEAT (honest): `atom_curvature_bound` is a sup/max over per-row, per-axis
-/// curvatures; the delta method linearises around whatever argmax row/axis is
-/// active at `β̂`, so the normal interval is approximate and non-standard near
-/// the active-argmax switch (where κ̂ is non-differentiable in β). It is a local
-/// sensitivity band, not an exact coverage-valid set.
-///
-/// Returns `None` when the inner Hessian is not SPD, the captured gradient is
-/// absent/non-finite, or `κ̂` is non-finite (a degenerate inner fit): the genuine
-/// prerequisites for a delta-method band are then absent.
-fn atom_curvature_ci(fit: &AtomInnerFit) -> Option<AtomCurvatureCi> {
-    let m = fit.design.ncols();
-    if m == 0 || fit.beta.len() != m {
-        return None;
-    }
-    if fit.penalized_hessian.dim() != (m, m) {
-        return None;
-    }
-    let kappa_hat = fit.kappa_hat;
-    if !kappa_hat.is_finite() {
-        return None;
-    }
-    // ∂κ/∂β, captured at fit time where the curvature functional's full
-    // second-jet geometry lives. Its absence (degenerate chart / infinite bound)
-    // means no delta-method band exists.
-    let grad = fit.kappa_grad.as_ref()?;
-    if grad.len() != m || grad.iter().any(|g| !g.is_finite()) {
-        return None;
-    }
-
-    // SE² = gᵀ H⁻¹ g, via one Cholesky solve H x = g (H = ΦᵀWΦ + S_k SPD).
-    let chol = fit.penalized_hessian.cholesky(Side::Lower).ok()?;
-    let h_inv_g = chol.solvevec(grad);
-    let var = grad.dot(&h_inv_g);
-    if !(var.is_finite() && var >= 0.0) {
-        return None;
-    }
-    let se = var.sqrt();
-
-    // Wald normal band κ̂ ± z_{0.975}·SE. z is the two-sided 95% normal quantile.
-    const Z_95: f64 = 1.959_963_984_540_054;
-    let half = Z_95 * se;
-    let ci_normal = (kappa_hat - half, kappa_hat + half);
-
-    Some(AtomCurvatureCi {
-        kappa_hat,
-        se,
-        ci_normal,
-    })
-}
-
-/// Assemble the three post-PIRLS inference reports for every atom, reusing the
+/// Assemble the post-PIRLS inference reports for every atom, reusing the
 /// per-atom [`AtomInnerFit`] harvested at fit time.
 ///
-/// * #1097 Riesz functionals and #1103 split-LRT smooth-structure e-value are computed from
-///   the captured inner-decoder smooth (design, penalized Hessian, row scores,
-///   roughness Gram) — they need only the fixed fitted snapshot.
-/// * #1099 curvature CI reports the plug-in curvature bound `κ̂` and its
-///   delta-method SE `sqrt((∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β))` through the inner-fit penalized
-///   Hessian ([`atom_curvature_ci`]) — a fixed-snapshot computation, available
-///   whenever the atom carries an [`AtomInnerFit`] with a captured `kappa_grad`.
+/// * #1097 penalty-debiased functional POINT summaries and the #1103 split-LRT
+///   smooth-structure e-value are computed from the captured inner-decoder
+///   smooth (design, penalized Hessian, row scores, roughness Gram) — they need
+///   only the fixed fitted snapshot.
+/// * The #1099 per-atom curvature *confidence interval* was removed under #1115:
+///   a sup-norm curvature BOUND is not an estimand with a profiled criterion,
+///   and its delta-method SE conditioned on generated latent coordinates as if
+///   known. The plug-in curvature point estimate survives as the dictionary
+///   report's `per_atom_kappa_hat`.
 pub(crate) fn atom_inference_reports(model: &FittedSaeManifold) -> Vec<AtomInferenceReport> {
     model
         .atoms
         .iter()
         .enumerate()
         .map(|(atom_index, atom)| {
-            let (functionals, curvature_ci, smooth_significance) = match &atom.inner_fit {
+            let (functionals, smooth_significance) = match &atom.inner_fit {
                 Some(fit) => (
                     Some(atom_functional_report(fit)),
-                    atom_curvature_ci(fit),
                     atom_smooth_significance(fit),
                 ),
-                None => (None, None, None),
+                None => (None, None),
             };
             AtomInferenceReport {
                 atom_index,
                 atom_name: atom.name.clone(),
                 functionals,
-                curvature_ci,
                 smooth_significance,
             }
         })
@@ -3216,9 +3154,11 @@ mod tests {
     use super::*;
     use ndarray::{Array1, array};
 
-    /// #1097: the per-atom Riesz functionals must reproduce the exact linear
-    /// functionals of the fitted decoder smooth (plug-in) and produce a finite
-    /// SE, on a synthetic atom whose inner smooth is an analytic polynomial.
+    /// #1097: the per-atom penalty-debiased functional point summaries must
+    /// reproduce the exact linear functionals of the fitted decoder smooth
+    /// (plug-in) and a finite debiased value, on a synthetic atom whose inner
+    /// smooth is an analytic polynomial. No SE/CI is asserted — none is reported
+    /// (#1115).
     #[test]
     fn atom_functional_report_recovers_known_functionals() {
         use ndarray::{Array1 as A1, Array2 as A2};
@@ -3286,8 +3226,6 @@ mod tests {
             dispersion,
             peak_design_row: peak_design_row.clone(),
             mode_design_row: mode_design_row.clone(),
-            kappa_hat: 0.0,
-            kappa_grad: None,
         };
 
         let report = atom_functional_report(&fit);
@@ -3301,7 +3239,9 @@ mod tests {
             av.theta_plugin,
             expected_av
         );
-        assert!(av.se.is_finite(), "average-value SE finite");
+        // Point summary only: the debiased value is finite (no SE/CI is
+        // reported by design — #1115).
+        assert!(av.theta_onestep.is_finite(), "average-value debiased finite");
 
         // Decoder-variation norm (conditional on fit): g'(t) = β1 + 2β2 t, mean
         // over the grid is β1 + 2β2 * mean(t). The functional gradient is the
