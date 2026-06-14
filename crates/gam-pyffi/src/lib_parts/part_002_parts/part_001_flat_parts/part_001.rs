@@ -1122,6 +1122,47 @@ fn difference_group_ranges(
     Ok(ranges)
 }
 
+/// Remove the columns covered by `exclude` from `ranges`, returning the remaining
+/// half-open `(start, end)` spans. Used so that random-effect marginalisation skips
+/// the compared factor's own group-mean columns when `group_means` is requested.
+fn subtract_design_ranges(
+    ranges: &[(usize, usize)],
+    exclude: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for &(start, end) in ranges {
+        let mut segments = vec![(start, end)];
+        for &(ex_start, ex_end) in exclude {
+            if ex_start >= ex_end {
+                continue;
+            }
+            let mut next = Vec::new();
+            for (seg_start, seg_end) in segments {
+                // No overlap: keep the segment intact.
+                if ex_end <= seg_start || ex_start >= seg_end {
+                    next.push((seg_start, seg_end));
+                    continue;
+                }
+                // Left remainder before the excluded span.
+                if seg_start < ex_start {
+                    next.push((seg_start, ex_start));
+                }
+                // Right remainder after the excluded span.
+                if ex_end < seg_end {
+                    next.push((ex_end, seg_end));
+                }
+            }
+            segments = next;
+        }
+        for (seg_start, seg_end) in segments {
+            if seg_start < seg_end {
+                out.push((seg_start, seg_end));
+            }
+        }
+    }
+    out
+}
+
 fn zero_design_ranges(x: &mut Array2<f64>, ranges: &[(usize, usize)]) {
     let ncols = x.ncols();
     for &(start, end) in ranges {
@@ -1438,7 +1479,19 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
         let xr = design_matrix_dense(&model, dataset_right)?;
         let mut xd = &xr - &xl;
         if request.marginalise_random {
-            zero_design_ranges(&mut xd, &random_ranges);
+            // The compared factor is itself fitted as a random_effect term, so its
+            // columns appear in `random_ranges`. Marginalising random effects is meant
+            // for *nuisance* effects orthogonal to the comparison; it must not silently
+            // drop the group-mean offset the caller asked to keep. When `group_means` is
+            // true we therefore exclude the compared factor's own columns
+            // (`group_ranges`) from the random-marginalisation pass, leaving them to be
+            // governed solely by the `group_means` flag below.
+            let random_to_zero = if request.group_means {
+                subtract_design_ranges(&random_ranges, &group_ranges)
+            } else {
+                random_ranges.clone()
+            };
+            zero_design_ranges(&mut xd, &random_to_zero);
         }
         if !request.group_means {
             zero_design_ranges(&mut xd, &group_ranges);
