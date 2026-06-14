@@ -1010,7 +1010,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         }
                     }
                     check_linear_feasibility(&beta_joint, constraints, 1e-8)
-                        .map_err(|e| format!("joint Newton constrained solve: {e}"))?;
+                        .map_err(|e| format!("joint Newton constrained solve [cycle={cycle}]: {e}"))?;
                     let warm_joint_active =
                         flatten_joint_active_set(&cached_active_sets, &block_constraints);
                     let lower_bounds = match extract_simple_lower_bounds(constraints, total_p) {
