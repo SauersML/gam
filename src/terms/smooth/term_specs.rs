@@ -2867,12 +2867,12 @@ fn measure_jet_learns_length_scale(mj: &crate::basis::MeasureJetBasisSpec) -> bo
 }
 
 /// Measure-jet ψ dial boxes. The dials are NOT log-kernel-scales, so the
-/// κ-window machinery never applies: `s` stays inside the admissible order
-/// interval of the affine-jet energy, `α` spans density-weighted (0) through
+/// κ-window machinery never applies: `α` spans density-weighted (0) through
 /// past-Coifman–Lafon (>1) normalization, and `lnτ` covers the ridge from
-/// numerically-exact-projection to heavy noise-floor damping.
-const MEASURE_JET_PSI_S_BOUNDS: (f64, f64) = (0.05, 1.95);
-
+/// numerically-exact-projection to heavy noise-floor damping. (The energy
+/// order `s` is the pinned explicit value or absorbed by the REML-learned
+/// per-scale amplitudes — see `measure_jet_penalty_psi_dim` — so it carries no
+/// dial box.)
 const MEASURE_JET_PSI_ALPHA_BOUNDS: (f64, f64) = (-1.0, 3.0);
 
 const MEASURE_JET_PSI_LN_TAU_BOUNDS: (f64, f64) = (-18.420680743952367, 4.605170185988092);
