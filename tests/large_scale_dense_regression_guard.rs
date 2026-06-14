@@ -154,6 +154,7 @@ fn large_scale_dense_logit_regression_guard() {
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         },
     )
     .expect("large-scale dense Bernoulli-logit fit must succeed");

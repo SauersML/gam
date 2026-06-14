@@ -879,6 +879,7 @@ mod estimate_policy_tests {
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         };
 
         let theta = array![0.10, 0.12, -0.18];
@@ -1117,6 +1118,7 @@ mod estimate_policy_tests {
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         };
 
         let theta = array![0.10, 0.12, -0.18];
@@ -1286,6 +1288,7 @@ mod estimate_policy_tests {
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         };
 
         let theta = array![0.10, 0.12, -0.18];
