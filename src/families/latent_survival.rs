@@ -111,6 +111,22 @@ impl From<String> for LatentSurvivalError {
     }
 }
 
+/// Reserved [`LatentSurvivalTermSpec::event_target`] code marking an
+/// interval-censored row `(L, R]`. Exact-event codes are `>= 1` and right
+/// censoring is `0`; the interval code is the sentinel `u8::MAX` so it never
+/// collides with an exact-event count and the dispatch is an explicit 3-way map
+/// `{0 → RightCensored, INTERVAL → IntervalCensored, k ≥ 1 → ExactEvent}`.
+pub const LATENT_SURVIVAL_EVENT_INTERVAL: u8 = u8::MAX;
+
+#[inline]
+fn latent_survival_event_type_for(code: u8) -> LatentSurvivalEventType {
+    match code {
+        0 => LatentSurvivalEventType::RightCensored,
+        LATENT_SURVIVAL_EVENT_INTERVAL => LatentSurvivalEventType::IntervalCensored,
+        _ => LatentSurvivalEventType::ExactEvent,
+    }
+}
+
 #[derive(Clone)]
 pub struct LatentSurvivalTermSpec {
     pub age_entry: Array1<f64>,
@@ -119,8 +135,20 @@ pub struct LatentSurvivalTermSpec {
     pub weights: Array1<f64>,
     pub derivative_guard: f64,
     pub time_block: TimeBlockInput,
+    /// Time-basis design evaluated at the interval upper bound `R` (so
+    /// `q_right = design_right · β_time + offset_right`). `None` when the data
+    /// carries no interval-censored rows; the family then reuses the exit design
+    /// for the unused `q_right` channel. When `Some`, rows whose
+    /// `event_target == LATENT_SURVIVAL_EVENT_INTERVAL` contribute the interval
+    /// likelihood `log[S(L) − S(R)]`.
+    pub time_design_right: Option<DesignMatrix>,
+    pub time_offset_right: Option<Array1<f64>>,
     pub unloaded_mass_entry: Array1<f64>,
     pub unloaded_mass_exit: Array1<f64>,
+    /// Unloaded (background) cumulative mass at the interval upper bound `R`.
+    /// Length-`n`; entries for non-interval rows are ignored. Empty/`None`
+    /// folds to zero (full-loading interval rows).
+    pub unloaded_mass_right: Array1<f64>,
     pub unloaded_hazard_exit: Array1<f64>,
     pub meanspec: TermCollectionSpec,
     pub mean_offset: Array1<f64>,
@@ -158,6 +186,11 @@ struct PreparedLatentTimeBlock {
     design_entry: Array2<f64>,
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
+    /// Dense time-basis design at the interval upper bound `R`. Falls back to a
+    /// clone of `design_exit` when the spec supplies no interval design, so the
+    /// `q_right` channel is always well-defined (and unused for non-interval
+    /// rows).
+    design_right: Array2<f64>,
     linear_constraints: Option<LinearInequalityConstraints>,
     penalties: Vec<Array2<f64>>,
     initial_beta: Option<Array1<f64>>,
@@ -175,6 +208,12 @@ pub struct LatentSurvivalFamily {
     pub x_time_entry: Array2<f64>,
     pub x_time_exit: Array2<f64>,
     pub x_time_derivative_exit: Array2<f64>,
+    /// Time-basis design evaluated at the interval upper bound `R` (so
+    /// `q_right = x_time_right · β_time`). For non-interval rows this row equals
+    /// `x_time_exit`'s row (`q_right` is then unused by the likelihood), so the
+    /// matrix always has `n` rows and the same column count as the other time
+    /// designs.
+    pub x_time_right: Array2<f64>,
     pub x_mean: DesignMatrix,
     pub time_linear_constraints: Option<LinearInequalityConstraints>,
     pub quadctx: Arc<QuadratureContext>,
@@ -811,9 +850,16 @@ fn build_log_sigma_blockspec(initial_sigma: f64, n_obs: usize) -> ParameterBlock
 const LATENT_SURVIVAL_PRIMARY_Q_ENTRY: usize = 0;
 const LATENT_SURVIVAL_PRIMARY_Q_EXIT: usize = 1;
 const LATENT_SURVIVAL_PRIMARY_QDOT_EXIT: usize = 2;
-const LATENT_SURVIVAL_PRIMARY_MU: usize = 3;
-const LATENT_SURVIVAL_PRIMARY_LOG_SIGMA: usize = 4;
-const LATENT_SURVIVAL_PRIMARY_DIM: usize = 5;
+// Interval-censored right boundary R: q_right = log B(R) shares the time-block
+// coefficients with q_exit (same monotone transform, different time point), so
+// it is a fourth linear functional of the time block, NOT an independent eta
+// channel. It sits before `mu`/`log_sigma` so the "trailing optional log_sigma"
+// invariant used by `active_primary` (= `LATENT_SURVIVAL_PRIMARY_LOG_SIGMA`)
+// keeps q_right always active.
+const LATENT_SURVIVAL_PRIMARY_Q_RIGHT: usize = 3;
+const LATENT_SURVIVAL_PRIMARY_MU: usize = 4;
+const LATENT_SURVIVAL_PRIMARY_LOG_SIGMA: usize = 5;
+const LATENT_SURVIVAL_PRIMARY_DIM: usize = 6;
 
 use crate::families::jet_partitions::MultiDirJet as LatentMultiDirJet;
 
@@ -848,6 +894,7 @@ struct LatentSurvivalPrimaryDirection {
     dq_entry: f64,
     dq_exit: f64,
     dqdot_exit: f64,
+    dq_right: f64,
     dmu: f64,
     dlog_sigma: f64,
 }
@@ -1079,6 +1126,7 @@ fn latent_survival_basis_direction(primary_idx: usize) -> LatentSurvivalPrimaryD
             dq_entry: 1.0,
             dq_exit: 0.0,
             dqdot_exit: 0.0,
+            dq_right: 0.0,
             dmu: 0.0,
             dlog_sigma: 0.0,
         },
@@ -1086,6 +1134,7 @@ fn latent_survival_basis_direction(primary_idx: usize) -> LatentSurvivalPrimaryD
             dq_entry: 0.0,
             dq_exit: 1.0,
             dqdot_exit: 0.0,
+            dq_right: 0.0,
             dmu: 0.0,
             dlog_sigma: 0.0,
         },
@@ -1093,6 +1142,15 @@ fn latent_survival_basis_direction(primary_idx: usize) -> LatentSurvivalPrimaryD
             dq_entry: 0.0,
             dq_exit: 0.0,
             dqdot_exit: 1.0,
+            dq_right: 0.0,
+            dmu: 0.0,
+            dlog_sigma: 0.0,
+        },
+        LATENT_SURVIVAL_PRIMARY_Q_RIGHT => LatentSurvivalPrimaryDirection {
+            dq_entry: 0.0,
+            dq_exit: 0.0,
+            dqdot_exit: 0.0,
+            dq_right: 1.0,
             dmu: 0.0,
             dlog_sigma: 0.0,
         },
@@ -1100,6 +1158,7 @@ fn latent_survival_basis_direction(primary_idx: usize) -> LatentSurvivalPrimaryD
             dq_entry: 0.0,
             dq_exit: 0.0,
             dqdot_exit: 0.0,
+            dq_right: 0.0,
             dmu: 1.0,
             dlog_sigma: 0.0,
         },
@@ -1107,6 +1166,7 @@ fn latent_survival_basis_direction(primary_idx: usize) -> LatentSurvivalPrimaryD
             dq_entry: 0.0,
             dq_exit: 0.0,
             dqdot_exit: 0.0,
+            dq_right: 0.0,
             dmu: 0.0,
             dlog_sigma: 1.0,
         },
@@ -1150,12 +1210,42 @@ fn latent_survival_map_exit_direction(
     }
 }
 
+/// Direction map for the interval-censored LEFT boundary state (mass `M_L =
+/// exp(q_exit)`). The left boundary tracks the same `q_exit` time functional as
+/// right-censoring (no hazard-derivative channel), plus the shared `mu`/`sigma`.
+fn latent_survival_map_left_direction(
+    direction: LatentSurvivalPrimaryDirection,
+) -> LatentKernelPrimaryDirection {
+    LatentKernelPrimaryDirection {
+        dq: direction.dq_exit,
+        dqd: 0.0,
+        dmu: direction.dmu,
+        dtau: direction.dlog_sigma,
+    }
+}
+
+/// Direction map for the interval-censored RIGHT boundary state (mass `M_R =
+/// exp(q_right)`). The right boundary tracks the dedicated `q_right` functional
+/// (which shares the time-block coefficients with `q_exit` but is evaluated at
+/// the interval upper bound `R`), plus the shared `mu`/`sigma`.
+fn latent_survival_map_right_direction(
+    direction: LatentSurvivalPrimaryDirection,
+) -> LatentKernelPrimaryDirection {
+    LatentKernelPrimaryDirection {
+        dq: direction.dq_right,
+        dqd: 0.0,
+        dmu: direction.dmu,
+        dtau: direction.dlog_sigma,
+    }
+}
+
 fn latent_survival_row_primary_log_jet(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
     q_entry: f64,
     q_exit: f64,
     qdot_exit: f64,
+    q_right: f64,
     mu: f64,
     sigma: f64,
     log_sigma_factor: f64,
@@ -1168,22 +1258,10 @@ fn latent_survival_row_primary_log_jet(
         sigma,
         log_sigma_factor,
     };
-    let exit_state = LatentKernelPrimaryState {
-        q: q_exit,
-        qdot: qdot_exit,
-        mu,
-        sigma,
-        log_sigma_factor,
-    };
     let entry_directions = directions
         .iter()
         .copied()
         .map(latent_survival_map_entry_direction)
-        .collect::<Vec<_>>();
-    let exit_directions = directions
-        .iter()
-        .copied()
-        .map(|dir| latent_survival_map_exit_direction(dir, row.event_type))
         .collect::<Vec<_>>();
 
     let denominator = latent_kernel_sum_log_jet(
@@ -1200,54 +1278,207 @@ fn latent_survival_row_primary_log_jet(
         "latent survival denominator",
     )?;
 
-    let numerator_terms = match row.event_type {
-        LatentSurvivalEventType::RightCensored => vec![LatentKernelPrimaryTerm {
-            coeff: 1.0,
-            q_exp: 0,
-            qdot_power: 0,
-            tau_exp: 0,
-            k: 0,
-        }],
-        LatentSurvivalEventType::ExactEvent => {
-            let mut terms = Vec::new();
-            if row.hazard_unloaded > 0.0 {
-                terms.push(LatentKernelPrimaryTerm {
-                    coeff: row.hazard_unloaded,
+    // The numerator for right-censoring / exact events is a single-state log-sum
+    // kernel at the exit mass. Interval censoring is the difference of two
+    // single-state kernels at DIFFERENT masses (L at `q_exit`, R at `q_right`),
+    // so it is assembled by `latent_survival_interval_numerator_log_jet` below.
+    let numerator = match row.event_type {
+        LatentSurvivalEventType::RightCensored | LatentSurvivalEventType::ExactEvent => {
+            let exit_state = LatentKernelPrimaryState {
+                q: q_exit,
+                qdot: qdot_exit,
+                mu,
+                sigma,
+                log_sigma_factor,
+            };
+            let exit_directions = directions
+                .iter()
+                .copied()
+                .map(|dir| latent_survival_map_exit_direction(dir, row.event_type))
+                .collect::<Vec<_>>();
+            let numerator_terms = match row.event_type {
+                LatentSurvivalEventType::RightCensored => vec![LatentKernelPrimaryTerm {
+                    coeff: 1.0,
                     q_exp: 0,
                     qdot_power: 0,
                     tau_exp: 0,
                     k: 0,
-                });
-            }
-            terms.push(LatentKernelPrimaryTerm {
-                coeff: 1.0,
-                q_exp: 1,
-                qdot_power: 1,
-                tau_exp: 0,
-                k: 1,
-            });
-            terms
+                }],
+                LatentSurvivalEventType::ExactEvent => {
+                    let mut terms = Vec::new();
+                    if row.hazard_unloaded > 0.0 {
+                        terms.push(LatentKernelPrimaryTerm {
+                            coeff: row.hazard_unloaded,
+                            q_exp: 0,
+                            qdot_power: 0,
+                            tau_exp: 0,
+                            k: 0,
+                        });
+                    }
+                    terms.push(LatentKernelPrimaryTerm {
+                        coeff: 1.0,
+                        q_exp: 1,
+                        qdot_power: 1,
+                        tau_exp: 0,
+                        k: 1,
+                    });
+                    terms
+                }
+                LatentSurvivalEventType::IntervalCensored => unreachable!(
+                    "interval-censored rows take the dedicated two-state numerator branch"
+                ),
+            };
+            latent_kernel_sum_log_jet(
+                quadctx,
+                &numerator_terms,
+                exit_state,
+                &exit_directions,
+                "latent survival numerator",
+            )?
         }
         LatentSurvivalEventType::IntervalCensored => {
-            return Err(LatentSurvivalError::UnsupportedConfiguration {
-                reason:
-                    "latent survival dynamic time derivatives do not implement interval censoring"
-                        .to_string(),
-            }
-            .into());
+            latent_survival_interval_numerator_log_jet(
+                quadctx,
+                row,
+                q_exit,
+                q_right,
+                mu,
+                sigma,
+                log_sigma_factor,
+                directions,
+            )?
         }
     };
-    let numerator = latent_kernel_sum_log_jet(
-        quadctx,
-        &numerator_terms,
-        exit_state,
-        &exit_directions,
-        "latent survival numerator",
-    )?;
 
     let mut total = numerator.add(&denominator.scale(-1.0));
-    total.coeffs[0] += -row.mass_unloaded_exit + row.mass_unloaded_entry;
+    // For interval rows the unloaded exit mass is folded into the per-boundary
+    // coefficients `exp(-mass_unloaded_{left,right})` inside the two-state
+    // numerator, so only the (constant) unloaded-entry term remains here; for
+    // right-censoring / exact events the exit/entry unloaded masses are an
+    // additive constant on the log-likelihood.
+    match row.event_type {
+        LatentSurvivalEventType::IntervalCensored => {
+            total.coeffs[0] += row.mass_unloaded_entry;
+        }
+        _ => {
+            total.coeffs[0] += -row.mass_unloaded_exit + row.mass_unloaded_entry;
+        }
+    }
     Ok(total)
+}
+
+/// Interval-censored numerator jet `log[ c_L·K_{0,M_L} − c_R·K_{0,M_R} ]` where
+/// `M_L = exp(q_exit)`, `M_R = exp(q_right)`, `c_L = exp(-mass_unloaded_left)`
+/// and `c_R = exp(-mass_unloaded_right)`.
+///
+/// This is the dynamic-time analogue of the static
+/// [`LatentSurvivalRowJet::interval_censored`] kernel: the interval likelihood
+/// is the difference of two BOUNDARY survival masses, each a single-state
+/// order-0 kernel, but at two DISTINCT cumulative masses. Because the two
+/// boundaries respond to different time functionals (`q_exit` vs `q_right`) we
+/// cannot fold them into one `latent_kernel_sum_log_jet` state. Instead we:
+///   1. build each boundary's `log K_{0,M}` jet at its own state, with its own
+///      direction map (left → `dq_exit`, right → `dq_right`; both share
+///      `mu`/`sigma`),
+///   2. lift each to the LINEAR domain via `exp` (a unary composition whose five
+///      derivatives at value `v` are all `exp(v)`), scaled by its coefficient
+///      `c_L` (resp. `−c_R`),
+///   3. add the two linear-domain jets, and
+///   4. drop back to the log domain via the same `log` unary composition the
+///      single-state path uses.
+/// Every multi-direction coefficient (value, score, neg-Hessian, 3rd, 4th)
+/// follows by the Faà-di-Bruno composition already implemented in
+/// `MultiDirJet::compose_unary`, so the derivative reductions are consistent
+/// with the exact-event/right-censored branches by construction.
+fn latent_survival_interval_numerator_log_jet(
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_exit: f64,
+    q_right: f64,
+    mu: f64,
+    sigma: f64,
+    log_sigma_factor: f64,
+    directions: &[LatentSurvivalPrimaryDirection],
+) -> Result<LatentMultiDirJet, String> {
+    let single_k0 = [LatentKernelPrimaryTerm {
+        coeff: 1.0,
+        q_exp: 0,
+        qdot_power: 0,
+        tau_exp: 0,
+        k: 0,
+    }];
+
+    let left_state = LatentKernelPrimaryState {
+        q: q_exit,
+        qdot: 1.0,
+        mu,
+        sigma,
+        log_sigma_factor,
+    };
+    let right_state = LatentKernelPrimaryState {
+        q: q_right,
+        qdot: 1.0,
+        mu,
+        sigma,
+        log_sigma_factor,
+    };
+    let left_directions = directions
+        .iter()
+        .copied()
+        .map(latent_survival_map_left_direction)
+        .collect::<Vec<_>>();
+    let right_directions = directions
+        .iter()
+        .copied()
+        .map(latent_survival_map_right_direction)
+        .collect::<Vec<_>>();
+
+    let log_left = latent_kernel_sum_log_jet(
+        quadctx,
+        &single_k0,
+        left_state,
+        &left_directions,
+        "latent survival interval left boundary",
+    )?;
+    let log_right = latent_kernel_sum_log_jet(
+        quadctx,
+        &single_k0,
+        right_state,
+        &right_directions,
+        "latent survival interval right boundary",
+    )?;
+
+    // Lift each boundary's log-kernel jet to the linear domain and scale by the
+    // unloaded-mass prefactor. exp''''(v) = exp(v) for all orders, so the unary
+    // derivative tower is `[exp(v); exp(v); exp(v); exp(v); exp(v)]`.
+    let c_left = (-row.mass_unloaded_left).exp();
+    let c_right = (-row.mass_unloaded_right).exp();
+    let exp_left_value = log_left.coeff(0).exp();
+    let exp_right_value = log_right.coeff(0).exp();
+    let linear_left = log_left
+        .compose_unary([exp_left_value; 5])
+        .scale(c_left);
+    let linear_right = log_right
+        .compose_unary([exp_right_value; 5])
+        .scale(c_right);
+
+    let linear_numerator = linear_left.add(&linear_right.scale(-1.0));
+    let base = linear_numerator.coeff(0);
+    if !(base.is_finite() && base > 0.0) {
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!(
+                "latent survival interval numerator must be a positive survival-mass difference, \
+                 got c_L*K0(M_L) - c_R*K0(M_R) = {base}; require M_L < M_R (i.e. L < R)"
+            ),
+        }
+        .into());
+    }
+    // Drop back to the log domain. `latent_unary_derivatives_log(base)` is the
+    // unary derivative tower of `ln` at the positive base value, so the composed
+    // value channel is `ln(base)` and the higher coefficients are the
+    // log-of-a-difference score / curvature, consistent with the single-state
+    // log-sum path (which composes `ln` at its normalised base of 1).
+    Ok(linear_numerator.compose_unary(latent_unary_derivatives_log(base)))
 }
 
 fn latent_survival_row_primary_gradient_hessian(
@@ -1256,6 +1487,7 @@ fn latent_survival_row_primary_gradient_hessian(
     q_entry: f64,
     q_exit: f64,
     qdot_exit: f64,
+    q_right: f64,
     mu: f64,
     sigma: f64,
     include_log_sigma: bool,
@@ -1275,6 +1507,7 @@ fn latent_survival_row_primary_gradient_hessian(
         q_entry,
         q_exit,
         qdot_exit,
+        q_right,
         mu,
         sigma,
         log_sigma_factor,
@@ -1289,6 +1522,7 @@ fn latent_survival_row_primary_gradient_hessian(
             q_entry,
             q_exit,
             qdot_exit,
+            q_right,
             mu,
             sigma,
             log_sigma_factor,
@@ -1302,6 +1536,7 @@ fn latent_survival_row_primary_gradient_hessian(
                 q_entry,
                 q_exit,
                 qdot_exit,
+                q_right,
                 mu,
                 sigma,
                 log_sigma_factor,
@@ -1321,6 +1556,7 @@ fn latent_survival_row_primary_third_contracted(
     q_entry: f64,
     q_exit: f64,
     qdot_exit: f64,
+    q_right: f64,
     mu: f64,
     sigma: f64,
     direction: &Array1<f64>,
@@ -1336,6 +1572,7 @@ fn latent_survival_row_primary_third_contracted(
         dq_entry: direction[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
         dq_exit: direction[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
         dqdot_exit: direction[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+        dq_right: direction[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
         dmu: direction[LATENT_SURVIVAL_PRIMARY_MU],
         dlog_sigma: direction[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
     };
@@ -1349,6 +1586,7 @@ fn latent_survival_row_primary_third_contracted(
                 q_entry,
                 q_exit,
                 qdot_exit,
+                q_right,
                 mu,
                 sigma,
                 log_sigma_factor,
@@ -1368,6 +1606,7 @@ fn latent_survival_row_primary_fourth_contracted(
     q_entry: f64,
     q_exit: f64,
     qdot_exit: f64,
+    q_right: f64,
     mu: f64,
     sigma: f64,
     direction_u: &Array1<f64>,
@@ -1384,6 +1623,7 @@ fn latent_survival_row_primary_fourth_contracted(
         dq_entry: direction_u[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
         dq_exit: direction_u[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
         dqdot_exit: direction_u[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+        dq_right: direction_u[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
         dmu: direction_u[LATENT_SURVIVAL_PRIMARY_MU],
         dlog_sigma: direction_u[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
     };
@@ -1391,6 +1631,7 @@ fn latent_survival_row_primary_fourth_contracted(
         dq_entry: direction_v[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
         dq_exit: direction_v[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
         dqdot_exit: direction_v[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+        dq_right: direction_v[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
         dmu: direction_v[LATENT_SURVIVAL_PRIMARY_MU],
         dlog_sigma: direction_v[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
     };
@@ -1404,6 +1645,7 @@ fn latent_survival_row_primary_fourth_contracted(
                 q_entry,
                 q_exit,
                 qdot_exit,
+                q_right,
                 mu,
                 sigma,
                 log_sigma_factor,

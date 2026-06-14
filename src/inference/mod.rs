@@ -29,6 +29,7 @@ pub mod posterior;
 pub mod posterior_bands;
 pub mod predict;
 pub mod probability;
+pub mod probe_runner;
 pub mod psis;
 pub mod quadrature;
 pub mod residual_factor;

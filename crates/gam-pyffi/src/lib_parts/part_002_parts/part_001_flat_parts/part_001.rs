@@ -4953,7 +4953,64 @@ fn build_standard_payload(
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
     payload.gaussian_jackknife_plus = jackknife_plus_stats;
+    // #1098 MAGIC: precompute the EXACT Gaussian-identity full-conformal
+    // substrate (distribution-free finite-sample set, no held-out fold) under
+    // the same eligibility as jackknife+. `None` for any ineligible model.
+    payload.full_conformal = exact_full_conformal_substrate_for_standard_fit(
+        &formula, dataset, fit_config, &family, &saved_fit, design,
+    );
     Ok(payload)
+}
+
+/// Precompute the exact Gaussian-identity full-conformal substrate at fit time
+/// under the SAME eligibility gate as the jackknife+ substrate
+/// ([`gaussian_jackknife_plus_stats_for_standard_fit`]): Gaussian-identity,
+/// unit-weight, offset-free, link-wiggle-free, with the converged penalized
+/// normal matrix `M = XᵀX + Sλ` available. Returns `None` (never an error) for
+/// any ineligible model; predict then errors clearly or falls back.
+fn exact_full_conformal_substrate_for_standard_fit(
+    formula: &str,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    family: &LikelihoodSpec,
+    saved_fit: &gam::estimate::UnifiedFitResult,
+    design: &TermCollectionDesign,
+) -> Option<gam::inference::full_conformal::ExactFullConformalSubstrate> {
+    if !matches!(family.response, ResponseFamily::Gaussian) {
+        return None;
+    }
+    if !matches!(family.link, InverseLink::Standard(StandardLink::Identity)) {
+        return None;
+    }
+    if fit_config.weight_column.is_some() {
+        return None;
+    }
+    if fit_config.offset_column.is_some() {
+        return None;
+    }
+    if fit_config.flexible_link {
+        return None;
+    }
+    let response_name = response_column_name(formula)?;
+    let col_map = dataset.column_map();
+    let response_col = *col_map.get(&response_name)?;
+    let y = dataset.values.column(response_col).to_owned();
+    let x = design.design.try_to_dense_arc("full-conformal design").ok()?;
+    if x.nrows() != y.len() {
+        return None;
+    }
+    let m = saved_fit.penalized_hessian()?;
+    if m.nrows() != x.ncols() || m.ncols() != x.ncols() {
+        return None;
+    }
+    let weights = Array1::<f64>::ones(y.len());
+    gam::inference::full_conformal::ExactFullConformalSubstrate::from_design_unit_weight_normal_matrix(
+        x.as_ref(),
+        &y,
+        &weights,
+        m,
+    )
+    .ok()
 }
 
 fn build_transformation_normal_ffi_payload(

@@ -937,6 +937,95 @@ fn predict_multinomial_formula_pyfunc<'py>(
     Ok(probs.into_pyarray(py).unbind())
 }
 
+/// Predict class probabilities WITH delta-method per-class probability standard
+/// errors and z-scaled confidence bounds for a saved multinomial model (#1101).
+/// Returns a dict with `probs`, `prob_se`, `mean_lower`, `mean_upper` (all
+/// `(N_new, K)` arrays, columns aligned with `class_levels`) plus the `z`
+/// multiplier used. The bounds are the simplex-clamped delta band
+/// `p_c ± z·SE(p_c)`. `prob_se`/bounds are NaN-free only when the saved model
+/// carries covariance (REML-fitted models do); a legacy payload yields
+/// `prob_se = None`.
+#[pyfunction(signature = (model_bytes, headers, rows, z = 1.959963984540054))]
+fn predict_multinomial_intervals_pyfunc<'py>(
+    py: Python<'py>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    z: f64,
+) -> PyResult<Py<PyDict>> {
+    let (probs, prob_se) = detach_pyresult(py, "predict_multinomial_intervals", move || {
+        let envelope: MultinomialModelEnvelope =
+            serde_json::from_slice(&model_bytes).map_err(|err| {
+                py_value_error(format!("failed to deserialize multinomial model: {err}"))
+            })?;
+        if envelope.model_class != "multinomial" {
+            return Err(py_value_error(format!(
+                "predict_multinomial_intervals: model_class = {:?}, expected 'multinomial'",
+                envelope.model_class
+            )));
+        }
+        let dataset = dataset_with_inferred_schema(headers, rows).map_err(py_value_error)?;
+        gam::families::multinomial::predict_multinomial_formula_with_se(&envelope.saved, &dataset)
+            .map_err(estimation_error_to_pyerr)
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("z", z)?;
+    out.set_item("probs", probs.clone().into_pyarray(py))?;
+    match prob_se {
+        Some(se) => {
+            // Simplex-clamped delta band p_c ± z·SE(p_c).
+            let mut lower = probs.clone();
+            let mut upper = probs.clone();
+            for ((r, c), &s) in se.indexed_iter() {
+                let p = probs[[r, c]];
+                lower[[r, c]] = (p - z * s).clamp(0.0, 1.0);
+                upper[[r, c]] = (p + z * s).clamp(0.0, 1.0);
+            }
+            out.set_item("prob_se", se.into_pyarray(py))?;
+            out.set_item("mean_lower", lower.into_pyarray(py))?;
+            out.set_item("mean_upper", upper.into_pyarray(py))?;
+        }
+        None => {
+            out.set_item("prob_se", py.None())?;
+            out.set_item("mean_lower", py.None())?;
+            out.set_item("mean_upper", py.None())?;
+        }
+    }
+    Ok(out.unbind())
+}
+
+/// Wood rank-truncated Wald smooth-significance table for a saved multinomial
+/// model (#1101). Returns a list of dicts, one per `(active class, smooth term)`:
+/// `class`, `term`, `edf`, `ref_df`, `statistic`, `p_value`. Empty when the
+/// model has no smooth terms or no stored covariance.
+#[pyfunction(signature = (model_bytes))]
+fn multinomial_smooth_significance_pyfunc<'py>(
+    py: Python<'py>,
+    model_bytes: Vec<u8>,
+) -> PyResult<Py<pyo3::types::PyList>> {
+    let envelope: MultinomialModelEnvelope = serde_json::from_slice(&model_bytes)
+        .map_err(|err| py_value_error(format!("failed to deserialize multinomial model: {err}")))?;
+    if envelope.model_class != "multinomial" {
+        return Err(py_value_error(format!(
+            "multinomial_smooth_significance: model_class = {:?}, expected 'multinomial'",
+            envelope.model_class
+        )));
+    }
+    let rows = envelope.saved.smooth_significance();
+    let list = pyo3::types::PyList::empty(py);
+    for r in rows {
+        let row = PyDict::new(py);
+        row.set_item("class", r.class_label)?;
+        row.set_item("term", r.term_label)?;
+        row.set_item("edf", r.edf)?;
+        row.set_item("ref_df", r.ref_df)?;
+        row.set_item("statistic", r.statistic)?;
+        row.set_item("p_value", r.p_value)?;
+        list.append(row)?;
+    }
+    Ok(list.unbind())
+}
+
 /// Inspect a multinomial saved-model byte blob and return the class-level
 /// metadata needed by `MultinomialModel.summary()` and `.classes_`. Keeping
 /// this on the FFI side avoids re-encoding the serde envelope in Python.

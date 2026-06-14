@@ -1591,6 +1591,18 @@ pub(super) struct GamWorkingModel<'a> {
     /// reported `theta` is exactly the ML estimate at the reported η. Issue #802.
     negbin_theta_locked: bool,
     quadctx: crate::quadrature::QuadratureContext,
+    /// Frozen-weight first-Fisher-step data-fit Gram `XᵀWX` (#1111 / #1033
+    /// mechanism (c)), in the same *original* (conditioned `x_fit`) frame
+    /// `penalized_hessian` forms `compute_xtwx_blas(self.x_original, ...)` in,
+    /// i.e. BEFORE any Qs conjugation. When present it serves the FIRST
+    /// Fisher-scoring iteration's `XᵀWX` n-free, eliding the dominant
+    /// O(N·p²) weighted cross-product on a large-n GLM ψ-trial. Consumed at
+    /// most once per inner solve (the first `penalized_hessian` build at the
+    /// warm β); later iterations restream the true moving `W`.
+    glm_first_step_gram: Option<Array2<f64>>,
+    /// Set once the frozen-W first-step Gram has been consumed, so subsequent
+    /// inner iterations restream `XᵀWX` from the (moving) working weights.
+    glm_first_step_gram_consumed: bool,
 }
 
 
@@ -1625,6 +1637,7 @@ impl<'a> GamWorkingModel<'a> {
         firth_bias_reduction: bool,
         transform: Option<WorkingReparamTransform>,
         quadctx: crate::quadrature::QuadratureContext,
+        glm_first_step_gram: Option<Array2<f64>>,
     ) -> Self {
         let coordinate_design = match coordinate_frame {
             PirlsCoordinateFrame::OriginalSparseNative => {
@@ -1684,6 +1697,8 @@ impl<'a> GamWorkingModel<'a> {
             tweedie_phi_locked: false,
             negbin_theta_locked: false,
             quadctx,
+            glm_first_step_gram,
+            glm_first_step_gram_consumed: false,
         }
     }
 
@@ -1870,6 +1885,52 @@ impl<'a> GamWorkingModel<'a> {
     }
 
     fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
+        // #1111 / #1033 mechanism (c): the frozen-weight first-Fisher-step Gram
+        // `XᵀWX` (in the original / `x_fit` conditioned frame) serves the FIRST
+        // Fisher-scoring iteration n-free, eliding the dominant O(N·p²) weighted
+        // cross-product on a large-n GLM ψ-trial. It is only correct for the
+        // first build at the warm β with FISHER curvature (the frozen tensor was
+        // assembled from the canonical Fisher weights), and only in the two
+        // original-frame coordinate designs (TransformedImplicit conjugates the
+        // original-frame Gram afterward; OriginalSparseNative is already in that
+        // frame). For TransformedExplicit the streamed Gram lives in the Qs frame
+        // the tensor was not built in, so that variant always restreams. Every
+        // later iteration restreams the true (moving) `W`, so the converged β̂ is
+        // unchanged — only the first Gram build is skipped.
+        let use_frozen_first_step = !self.glm_first_step_gram_consumed
+            && self.glm_first_step_gram.is_some()
+            && self.lasthessian_curvature == HessianCurvatureKind::Fisher
+            && !matches!(
+                self.coordinate_design,
+                WorkingCoordinateDesign::TransformedExplicit { .. }
+            );
+        if use_frozen_first_step {
+            // Take the cached original-frame Gram exactly once.
+            let xtwx = self
+                .glm_first_step_gram
+                .take()
+                .expect("frozen first-step Gram present by the guard above");
+            self.glm_first_step_gram_consumed = true;
+            log::debug!(
+                "[frozen-glm-gram] serving first Fisher-step XᵀWX n-free (p={})",
+                xtwx.nrows()
+            );
+            return match &self.coordinate_design {
+                WorkingCoordinateDesign::TransformedImplicit { transform } => {
+                    let mut h = transform.conjugate_matrix(&xtwx);
+                    self.penalty.add_to_hessian(&mut h);
+                    Ok(h)
+                }
+                WorkingCoordinateDesign::OriginalSparseNative => {
+                    let mut h = xtwx;
+                    self.penalty.add_to_hessian(&mut h);
+                    Ok(h)
+                }
+                WorkingCoordinateDesign::TransformedExplicit { .. } => unreachable!(
+                    "TransformedExplicit excluded from the frozen first-step gate above"
+                ),
+            };
+        }
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
                 let mut h = Self::compute_xtwx_blas(&mut self.workspace, x_transformed, weights)?;

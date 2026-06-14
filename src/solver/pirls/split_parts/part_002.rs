@@ -777,6 +777,7 @@ mod tests {
             priorweights: weights.view(),
             covariate_se: None,
             gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
         };
         let penalty = PenaltyConfig {
             canonical_penalties: &canonical,
@@ -999,6 +1000,7 @@ mod tests {
                 priorweights: w.view(),
                 covariate_se: Some(covariate_se.view()),
                 gaussian_fixed_cache: None,
+                glm_first_step_gram: None,
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
@@ -1300,6 +1302,7 @@ mod tests {
                 priorweights: w.view(),
                 covariate_se: None,
                 gaussian_fixed_cache: None,
+                glm_first_step_gram: None,
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
@@ -1379,6 +1382,7 @@ mod tests {
                 priorweights: w.view(),
                 covariate_se: None,
                 gaussian_fixed_cache: None,
+                glm_first_step_gram: None,
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
@@ -2710,6 +2714,7 @@ mod root_cause_tests {
                     priorweights: w.view(),
                     covariate_se: None,
                     gaussian_fixed_cache: None,
+                    glm_first_step_gram: None,
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
@@ -2796,6 +2801,7 @@ mod root_cause_tests {
                     priorweights: w.view(),
                     covariate_se: None,
                     gaussian_fixed_cache: None,
+                    glm_first_step_gram: None,
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
@@ -2901,6 +2907,7 @@ mod root_cause_tests {
                         priorweights: w.view(),
                         covariate_se: None,
                         gaussian_fixed_cache: None,
+                        glm_first_step_gram: None,
                     },
                     PenaltyConfig {
                         canonical_penalties: &canonical,

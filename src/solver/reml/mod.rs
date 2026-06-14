@@ -4685,6 +4685,25 @@ pub(crate) struct RemlState<'a> {
     /// same way it transforms the streamed Gram. Invalidated with the design.
     pub(crate) gaussian_psi_gram_deriv:
         RwLock<Option<Arc<(ndarray::Array2<f64>, ndarray::Array1<f64>)>>>,
+    /// Frozen-weight first-Fisher-step data-fit Gram `XᵀWX` for the GLM
+    /// design-moving ψ-sweep (#1111 / #1033 mechanism (c)), in the conditioned
+    /// (original / `x_fit`) column frame — the SAME frame as
+    /// `gaussian_fixed_cache.xtwx_orig`.
+    ///
+    /// Assembled n-free per in-window ψ-trial from the certified frozen-weight
+    /// Chebyshev tensor ([`crate::solver::glm_sufficient_lane::FrozenWeightGramTensor`])
+    /// and installed only when the trial's converged working weight has not
+    /// drifted past tolerance from the frozen snapshot. When present, the GLM
+    /// inner P-IRLS serves its FIRST Fisher-scoring iteration's `XᵀWX` from this
+    /// cache instead of restreaming the O(N·p²) weighted cross-product — the
+    /// dominant per-trial n-term in a large-n Poisson/Binomial κ-sweep. The
+    /// penalty `Sλ` is still added per-λ on top, and every subsequent inner
+    /// iteration restreams the true (moving) `W`, so the converged β̂ is
+    /// unchanged; only the first-iteration Gram build is elided. Unlike
+    /// `gaussian_fixed_cache` this is NOT family-gated — it is the GLM lane's
+    /// own slot, consumed once per inner solve. Invalidated with the design in
+    /// `reset_surface`.
+    pub(crate) glm_first_step_gram: RwLock<Option<Arc<ndarray::Array2<f64>>>>,
     /// Frozen ALO robustness weights for this REML surface.
     ///
     /// The PSIS influence scale is a non-smooth function of the current hat

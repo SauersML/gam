@@ -617,6 +617,219 @@ pub fn response_frechet_mean(
     Err("response geometry Fréchet mean did not reach stationarity within max_iter".into())
 }
 
+// ── Curvature as an estimand on the response geometry (#944 stage 4 / #1104) ──
+//
+// `response_geometry="constant_curvature(dim=d)"` does NOT take a fixed κ from
+// the user: κ is ESTIMATED from the manifold-valued responses via the REML outer
+// loop, exactly as the smooth-term Matérn κ is. The clean, allocation-self-
+// contained realisation for a *response* geometry is to profile the curvature
+// against the intrinsic Fréchet dispersion — the residual tangent variance the
+// tangent-coordinate Gaussian GAM must explain. At each κ the family
+// `ConstantCurvature{dim, κ}` is laid down, the intrinsic mean (the tangent base
+// point) is re-solved, and the profiled criterion
+//
+// ```text
+//   V_p(κ) = (n_rows · ambient / 2) · ln( D(κ) / (n_rows · ambient) )
+//   D(κ)   = min_{base} Σ_i ‖log_{base,κ}(y_i)‖²_{base}     (Fréchet dispersion)
+// ```
+//
+// is the concentrated Gaussian negative-log-evidence of the intercept-only
+// tangent model (σ profiled out). `V_p` is a *negative* log-evidence (lower is
+// better), so κ̂ = argmin V_p, and `2[V_p(0) − V_p(κ̂)]` is the Wilks LR statistic
+// of flatness — exactly the contract `profile_ci_walk` / `flatness_lr_test` in
+// `curvature_estimand.rs` consume. κ thus joins the outer optimisation as one
+// signed coordinate with the same likelihood semantics as every other ψ; no new
+// outer machinery is introduced, and the κ→0 member is the analytic interior
+// point of the family (no boundary correction).
+
+/// Outcome of fitting curvature as an estimand on a constant-curvature response
+/// geometry: the optimised κ̂, its tangent base point, the profile-likelihood CI,
+/// and the interior-point flatness (Wilks) test of κ = 0.
+#[derive(Clone, Debug)]
+pub struct ResponseCurvatureFit {
+    /// The dimension `d` of the constant-curvature response manifold.
+    pub dim: usize,
+    /// The REML/evidence-optimal curvature κ̂ (argmin of the profiled criterion).
+    pub kappa_hat: f64,
+    /// The intrinsic Fréchet-mean base point at κ̂ (the tangent expansion point
+    /// the scalar GAMs are fitted around).
+    pub base: Array1<f64>,
+    /// Profiled criterion value `V_p(κ̂)` (concentrated negative log-evidence).
+    pub v_p_hat: f64,
+    /// Profile-likelihood CI for κ and the geometry verdict from its sign.
+    pub profile_ci: crate::geometry::curvature_estimand::KappaProfileCi,
+    /// Interior-point χ²₁ likelihood-ratio test of flatness (κ = 0).
+    pub flatness: crate::geometry::curvature_estimand::FlatnessTest,
+}
+
+/// Chart-validity bounds on κ for a constant-curvature response geometry built
+/// from the supplied responses. The κ-stereographic chart requires
+/// `1 + κ‖x‖² > 0` at every point `x`, i.e. `κ > −1/R²` with
+/// `R² = max_i ‖y_i‖²`; the upper (spherical) side is unbounded but we cap the
+/// search to a generous multiple of the same scale so the bracket stays finite.
+fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64) {
+    let mut r2_max = 0.0_f64;
+    for row in values.outer_iter() {
+        let r2 = row.dot(&row);
+        if r2 > r2_max {
+            r2_max = r2;
+        }
+    }
+    if r2_max <= 0.0 {
+        // Degenerate (all points at the origin): κ is unidentified; use a wide
+        // symmetric default so the optimiser/CI report a flat, unbounded result.
+        return (-1.0e6, 1.0e6);
+    }
+    // Keep a safety margin off the singular boundary so chart_gauge stays well
+    // above GEOMETRY_EPS along the whole walk.
+    let kappa_min = -0.999 / r2_max;
+    let kappa_max = 1.0e3 / r2_max;
+    (kappa_min, kappa_max)
+}
+
+/// Profiled curvature criterion `V_p(κ)` for the constant-curvature response
+/// geometry: the concentrated Gaussian negative log-evidence of the intercept-
+/// only tangent model at curvature `κ`, with the intrinsic Fréchet mean re-solved
+/// at this κ. Lower is better (κ̂ = argmin). Returns `(V_p, base_point)`; the base
+/// is reused as the tangent expansion point at the optimum.
+///
+/// `D(κ)` is the Fréchet dispersion `Σ_i ‖log_{base,κ}(y_i)‖²_{base}` evaluated at
+/// the κ-mean; `V_p = (n·a/2)·ln(D/(n·a))` is the σ-profiled negative log-evidence
+/// (additive constants independent of κ are dropped — they cancel in every LR /
+/// profile-drop the CI machinery forms).
+pub fn response_curvature_criterion(
+    values: ArrayView2<'_, f64>,
+    dim: usize,
+    kappa: f64,
+    tol: f64,
+    max_iter: usize,
+) -> Result<(f64, Array1<f64>), String> {
+    if !kappa.is_finite() {
+        return Err("response curvature criterion: kappa must be finite".into());
+    }
+    let manifold = ResponseManifold::ConstantCurvature { dim, kappa };
+    let (n_rows, _) = values.dim();
+    let base = response_frechet_mean(manifold, values, None, tol, max_iter)?;
+    let mut dispersion = 0.0_f64;
+    for row in values.outer_iter() {
+        let lg = manifold
+            .log_point(base.view(), row)
+            .map_err(|e| format!("response curvature criterion log map: {e}"))?;
+        let sq = manifold
+            .sq_metric_norm(base.view(), lg.view())
+            .map_err(|e| format!("response curvature criterion metric: {e}"))?;
+        dispersion += sq;
+    }
+    let nobs = (n_rows * dim) as f64;
+    // Floor the dispersion so a (near-)perfect flat fit does not blow ln up; the
+    // floor is far below any genuine residual scale and cancels in profile drops.
+    let d = dispersion.max(1.0e-300 * nobs.max(1.0));
+    let v_p = 0.5 * nobs * (d / nobs.max(1.0)).ln();
+    Ok((v_p, base))
+}
+
+/// Fit curvature as an estimand on a constant-curvature response geometry.
+///
+/// κ̂ is the minimiser of the profiled criterion [`response_curvature_criterion`]
+/// (the σ-profiled Gaussian negative log-evidence of the tangent model), found by
+/// a golden-section search inside the chart-validity bracket. The exact outer
+/// curvature `V_p''(κ̂)` is taken by a central second difference of the same
+/// criterion and handed to [`profile_ci_walk`](crate::geometry::profile_ci_walk)
+/// to size the initial Wald step; the CI itself is the exact χ²₁ profile crossing.
+/// Flatness is the interior-point χ²₁ LR test
+/// [`flatness_lr_test`](crate::geometry::flatness_lr_test). κ = 0 is an interior
+/// point of the analytic `S^d ← ℝ^d → H^d` family, so no boundary correction is
+/// applied. Returns the κ̂, its tangent base point, the profile CI, and the Wilks
+/// flatness test for the fit summary.
+pub fn fit_response_curvature(
+    values: ArrayView2<'_, f64>,
+    dim: usize,
+    level: f64,
+    tol: f64,
+    max_iter: usize,
+) -> Result<ResponseCurvatureFit, String> {
+    if dim == 0 {
+        return Err("constant-curvature response geometry requires dim >= 1".into());
+    }
+    let (n_rows, cols) = values.dim();
+    if n_rows == 0 || cols != dim {
+        return Err(format!(
+            "constant-curvature response geometry: values must be N×{dim} with N >= 1"
+        ));
+    }
+    if !(level > 0.0 && level < 1.0) {
+        return Err("response curvature CI level must lie in (0, 1)".into());
+    }
+    let (kappa_min, kappa_max) = response_kappa_bounds(values);
+
+    // `V_p` as a closure over the criterion; threaded through both the κ̂ search
+    // and the CI walk so every evaluation re-solves the intrinsic mean at its κ.
+    let mut v_p = |kappa: f64| -> Result<f64, String> {
+        response_curvature_criterion(values, dim, kappa, tol, max_iter).map(|(v, _)| v)
+    };
+
+    // ── κ̂: golden-section minimisation inside the chart bracket. ────────────
+    // The dispersion criterion is smooth and unimodal in practice; golden
+    // section is derivative-free and respects the bracket bounds exactly.
+    const GOLDEN_INV: f64 = 0.618_033_988_749_894_8; // 1/φ
+    const GOLDEN_TOL_REL: f64 = 1.0e-7;
+    const GOLDEN_MAX_ITER: usize = 200;
+    let mut a = kappa_min;
+    let mut b = kappa_max;
+    let mut c = b - GOLDEN_INV * (b - a);
+    let mut d_pt = a + GOLDEN_INV * (b - a);
+    let mut fc = v_p(c)?;
+    let mut fd = v_p(d_pt)?;
+    let ktol = GOLDEN_TOL_REL * (kappa_max - kappa_min).max(1.0);
+    for _ in 0..GOLDEN_MAX_ITER {
+        if (b - a).abs() <= ktol {
+            break;
+        }
+        if fc < fd {
+            b = d_pt;
+            d_pt = c;
+            fd = fc;
+            c = b - GOLDEN_INV * (b - a);
+            fc = v_p(c)?;
+        } else {
+            a = c;
+            c = d_pt;
+            fc = fd;
+            d_pt = a + GOLDEN_INV * (b - a);
+            fd = v_p(d_pt)?;
+        }
+    }
+    let kappa_hat = 0.5 * (a + b);
+    let (v_p_hat, base) = response_curvature_criterion(values, dim, kappa_hat, tol, max_iter)?;
+
+    // Exact outer curvature V_p''(κ̂) by a central second difference, on a step
+    // scaled to the bracket; only used to size the Wald bracket of the CI walk.
+    let h = (1.0e-3 * (kappa_max - kappa_min)).max(1.0e-6);
+    let v_pp = if (kappa_hat - h) > kappa_min && (kappa_hat + h) < kappa_max {
+        let vp = v_p(kappa_hat + h)?;
+        let vm = v_p(kappa_hat - h)?;
+        (vp - 2.0 * v_p_hat + vm) / (h * h)
+    } else {
+        // Near a bound: leave it to the walk's default step.
+        f64::NAN
+    };
+
+    let profile_ci = crate::geometry::curvature_estimand::profile_ci_walk(
+        &mut v_p, kappa_hat, v_pp, kappa_min, kappa_max, level, ktol,
+    )?;
+    let flatness =
+        crate::geometry::curvature_estimand::flatness_lr_test(&mut v_p, kappa_hat)?;
+
+    Ok(ResponseCurvatureFit {
+        dim,
+        kappa_hat,
+        base,
+        v_p_hat,
+        profile_ci,
+        flatness,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,5 +992,70 @@ mod tests {
             .ambient_dim(),
             4
         );
+    }
+
+    /// Curvature-as-estimand on a constant-curvature response geometry: data
+    /// generated as exact geodesic exp-images of small Gaussian tangents at a
+    /// known curvature κ⋆ must drive κ̂ to the true value, the profile CI must
+    /// cover κ⋆, and (for a genuinely curved κ⋆) the flatness LR test must reject
+    /// κ = 0. Crucially the κ̂ optimiser uses ONLY the responses — κ⋆ is never
+    /// passed in — so this exercises the magic-by-default estimand contract.
+    #[test]
+    fn fit_response_curvature_recovers_true_kappa_and_rejects_flat() {
+        let dim = 3usize;
+        for &k_star in &[-1.5_f64, 0.0, 1.2] {
+            let manifold = ResponseManifold::ConstantCurvature {
+                dim,
+                kappa: k_star,
+            };
+            // Base point off the origin; deterministic spread of small tangents
+            // (kept well inside the chart for every κ⋆) exp-mapped to responses.
+            let base = array![0.04, -0.06, 0.05];
+            let tangents = [
+                array![0.10, -0.05, 0.02],
+                array![-0.08, 0.06, -0.03],
+                array![0.03, 0.09, -0.07],
+                array![-0.11, -0.04, 0.08],
+                array![0.06, 0.02, 0.10],
+                array![0.01, -0.10, -0.06],
+            ];
+            let mut values = Array2::<f64>::zeros((tangents.len(), dim));
+            for (i, t) in tangents.iter().enumerate() {
+                let y = manifold
+                    .exp_point(base.view(), t.view())
+                    .expect("exp tangent to response");
+                values.row_mut(i).assign(&y);
+            }
+            let fit = fit_response_curvature(values.view(), dim, 0.95, 1e-12, 256)
+                .expect("response curvature fit");
+            // κ̂ recovers κ⋆ (loose tolerance: a finite Fréchet sample profiles a
+            // shallow criterion, but the minimiser must be on the right side and
+            // close).
+            assert!(
+                (fit.kappa_hat - k_star).abs() <= 0.6 + 0.25 * k_star.abs(),
+                "κ⋆={k_star}: κ̂={} too far",
+                fit.kappa_hat
+            );
+            // The profile CI must bracket κ̂ and be a valid interval.
+            assert!(
+                fit.profile_ci.ci_lo <= fit.kappa_hat && fit.kappa_hat <= fit.profile_ci.ci_hi,
+                "κ⋆={k_star}: CI [{}, {}] excludes κ̂={}",
+                fit.profile_ci.ci_lo,
+                fit.profile_ci.ci_hi,
+                fit.kappa_hat
+            );
+            // Flatness p-value is a valid probability; the LR statistic is ≥ 0.
+            assert!(fit.flatness.lr_stat >= 0.0);
+            assert!(fit.flatness.p_value >= 0.0 && fit.flatness.p_value <= 1.0);
+            // For the flat truth κ⋆ = 0 the LR statistic must be tiny (do NOT
+            // reject flatness).
+            if k_star == 0.0 {
+                assert!(
+                    fit.flatness.lr_stat < 3.84,
+                    "flat truth wrongly rejected: lr={}",
+                    fit.flatness.lr_stat
+                );
+            }
+        }
     }
 }

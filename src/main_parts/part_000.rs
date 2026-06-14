@@ -2005,6 +2005,23 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                         // predict falls back to the posterior band as documented.
                     }
                 }
+                // Exact full-conformal substrate (#1098): same eligibility, persists
+                // X + y + frozen Sλ so the EXACT distribution-free set replays per
+                // test point. Sλ = M − XᵀX is recovered inside the substrate ctor.
+                match gam::inference::full_conformal::ExactFullConformalSubstrate::from_design_unit_weight_normal_matrix(
+                    &x_dense,
+                    &y,
+                    &weights,
+                    m,
+                ) {
+                    Ok(sub) => {
+                        payload.full_conformal = Some(sub);
+                    }
+                    Err(_) => {
+                        // Precondition failure: skip; predict errors clearly or
+                        // falls back to jackknife+/posterior band.
+                    }
+                }
             }
         }
         set_saved_offset_columns(
