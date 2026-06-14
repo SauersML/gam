@@ -52,9 +52,11 @@ use crate::geometry::curvature_estimand::{
 };
 use crate::inference::lawley::{RowKappas, lawley_lr_bartlett_factor};
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
+use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
 use crate::inference::riesz::{RieszDebiasReport, RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
 use crate::inference::structure_evidence::{StructureCertificate, StructureLedger};
+use crate::terms::sae_manifold::SaeManifoldTerm;
 use crate::linalg::faer_ndarray::{
     FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
@@ -2664,6 +2666,48 @@ pub fn dictionary_report(
         structure: ledger.certify(alpha),
         transport_ladders: Vec::new(),
     })
+}
+
+// --- #1100: closed-loop probe runner FFI ---------------------------------
+// Top-level entry points exposing the steering→structure-evidence probe loop
+// (`crate::inference::probe_runner::ProbeRunner`) beside `dictionary_report`, so
+// the Python driver can design and absorb interventional probes against the same
+// fitted term and evidence ledger the certificate is built from.
+
+/// Design the next interventional probe for the most contested steerable claim
+/// in `ledger`, against the fitted SAE-manifold `term` read through its per-row
+/// output-Fisher `metric`.
+///
+/// Thin top-level wrapper over [`crate::inference::probe_runner::ProbeRunner::design_next`]:
+/// it selects the contested claim furthest from certification, realizes candidate
+/// latent moves of its atom through `crate::inference::steering::steer_delta`,
+/// and routes their doses through
+/// `crate::inference::structure_evidence::plan_probe_for_contested_claim` to pick
+/// the most discriminating one. The returned
+/// [`crate::inference::probe_runner::RealizedProbe`] carries both the experiment
+/// plan and the chosen intervention's on-manifold activation delta with its
+/// dosimetry and validity radius.
+pub fn design_probe(
+    term: &SaeManifoldTerm,
+    metric: &RowMetric,
+    ledger: &StructureLedger,
+) -> Result<RealizedProbe, String> {
+    ProbeRunner { term, metric }.design_next(ledger)
+}
+
+/// Absorb a realized probe outcome into `ledger`, banking the delivered
+/// behavioral dose (`realized_nats`, the observed output-Fisher KL of the steered
+/// response) as anytime-valid evidence for the probe's claim.
+///
+/// Thin top-level wrapper over [`crate::inference::probe_runner::ProbeRunner::absorb`].
+pub fn absorb_probe(
+    term: &SaeManifoldTerm,
+    metric: &RowMetric,
+    ledger: &mut StructureLedger,
+    probe: &RealizedProbe,
+    realized_nats: f64,
+) {
+    ProbeRunner { term, metric }.absorb(ledger, probe, realized_nats);
 }
 
 /// Produce the paired certificate plus #1096 per-atom layer-transport ladders.
