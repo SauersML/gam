@@ -13,6 +13,15 @@ A fitted `Model` exposes five inspection methods:
 `gamfit.validate_formula(...)` validates a formula and data against the
 parser and schema without fitting.
 
+The top-level package also exposes research/inference instruments used by
+the SAE and structure-discovery workflows: `split_likelihood_log_e`,
+`e_bh_dictionary_certificate`, `log_e_from_p_value`,
+`select_probe_by_expected_evidence`, `expected_resolution_budget`,
+`plan_probe_for_contested_claim`, `lawley_bartlett_factor`,
+`glm_full_conformal`, and `debiased_functional`. These are low-level
+building blocks rather than `Model` methods; see the [API
+reference](api-reference.md) for signatures.
+
 ## summary()
 
 ```python

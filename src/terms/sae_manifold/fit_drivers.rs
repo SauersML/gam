@@ -1,289 +1,6 @@
+use super::*;
 
 impl SaeManifoldTerm {
-
-    fn live_decoder_incoherence_penalty(
-        &self,
-        base: &Arc<DecoderIncoherencePenalty>,
-    ) -> Option<DecoderIncoherencePenalty> {
-        let k_atoms = self.k_atoms();
-        if k_atoms < 2 {
-            return None;
-        }
-        let p = self.output_dim();
-        let block_sizes: Vec<usize> = self.atoms.iter().map(|atom| atom.basis_size()).collect();
-        let m_total: usize = block_sizes.iter().sum();
-        let gates = self.assignment.assignments();
-        let n = gates.nrows();
-        let inv_n = if n > 0 { 1.0 / n as f64 } else { 0.0 };
-        let mut coactivation = Array2::<f64>::zeros((k_atoms, k_atoms));
-        for j in 0..k_atoms {
-            for k in 0..k_atoms {
-                let mut s = 0.0;
-                for row in 0..n {
-                    s += gates[[row, j]] * gates[[row, k]];
-                }
-                coactivation[[j, k]] = s * inv_n;
-            }
-        }
-        let mut per_fit: DecoderIncoherencePenalty = (**base).clone();
-        per_fit.block_sizes = block_sizes;
-        per_fit.p_out = p;
-        per_fit.target = PsiSlice {
-            range: 0..m_total * p,
-            latent_dim: Some(m_total),
-        };
-        per_fit.coactivation = coactivation;
-        Some(per_fit)
-    }
-
-    fn live_mechanism_sparsity_penalties(
-        &self,
-        base: &Arc<MechanismSparsityPenalty>,
-    ) -> Vec<(MechanismSparsityPenalty, usize, usize)> {
-        let beta_offsets = self.beta_offsets();
-        let p = self.output_dim();
-        let mut out = Vec::with_capacity(self.atoms.len());
-        for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let m = atom.basis_size();
-            let start = beta_offsets[atom_idx];
-            let end = start + m * p;
-            let mut per_atom: MechanismSparsityPenalty = (**base).clone();
-            per_atom.target = PsiSlice {
-                range: start..end,
-                latent_dim: Some(m),
-            };
-            out.push((per_atom, start, end));
-        }
-        out
-    }
-
-    fn live_nuclear_norm_penalties(
-        &self,
-        base: &Arc<NuclearNormPenalty>,
-    ) -> Vec<(NuclearNormPenalty, usize, usize)> {
-        let beta_offsets = self.beta_offsets();
-        let p = self.output_dim();
-        let mut out = Vec::with_capacity(self.atoms.len());
-        for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let m = atom.basis_size();
-            let start = beta_offsets[atom_idx];
-            let end = start + m * p;
-            let mut per_atom: NuclearNormPenalty = (**base).clone();
-            per_atom.n_eff = m;
-            per_atom.target = PsiSlice {
-                range: start..end,
-                latent_dim: Some(p),
-            };
-            out.push((per_atom, start, end));
-        }
-        out
-    }
-
-    fn add_sae_beta_penalty(
-        &self,
-        sys: &mut ArrowSchurSystem,
-        penalty: &AnalyticPenaltyKind,
-        target_beta: ArrayView1<'_, f64>,
-        rho_local: ArrayView1<'_, f64>,
-        penalty_scale: f64,
-        dense_beta_curvature: bool,
-    ) -> bool {
-        // MechanismSparsityPenalty is a group-lasso over a single
-        // (latent_dim, p) decoder matrix and indexes its target via
-        // `target.range.start + latent * p + feature`, treating its range as
-        // one contiguous (M, p) block. The flat SAE β layout concatenates the
-        // per-atom decoder blocks `[B_1 (M_1×p), B_2 (M_2×p), …]`, so for K≥2
-        // (and in general for K=1, where it collapses to the same single
-        // block) the penalty must operate per atom on its own
-        // `[beta_offsets[k] .. beta_offsets[k+1])` slice with `latent_dim = M_k`.
-        // Build a per-atom view of the penalty (cloning only the cheap
-        // descriptor: range + latent_dim) and accumulate each atom's
-        // contribution into the corresponding β segment. This removes the
-        // K≥2 limitation (#240) at root rather than guarding it away.
-        // DecoderIncoherencePenalty (#671) is a cross-atom decoder
-        // column-space incoherence term restricted to co-activating atom pairs.
-        // Its descriptor carries only placeholder shape/co-activation: the live
-        // M_k (per-atom basis sizes), p_out, β target span, and the per-pair
-        // co-activation weights `W[j,k] = mean_n gate[n,j]·gate[n,k]` are all
-        // injected here from the current SAE state before the penalty's
-        // gradient / PSD curvature are accumulated into the β-tier system.
-        if let AnalyticPenaltyKind::DecoderIncoherence(base) = penalty {
-            let Some(per_fit) = self.live_decoder_incoherence_penalty(base) else {
-                return false;
-            };
-            let beta_dim = self.beta_dim();
-            let grad = per_fit.grad_target(target_beta, rho_local);
-            for j in 0..beta_dim {
-                sys.gb[j] += penalty_scale * grad[j];
-            }
-            if !dense_beta_curvature {
-                return true;
-            }
-            // `hbb` is the PSD Newton / PIRLS curvature block: probe the PSD
-            // majorizer (the Gauss-Newton Hessian, which is already PSD here).
-            let mut probe = Array1::<f64>::zeros(beta_dim);
-            for j in 0..beta_dim {
-                probe.fill(0.0);
-                probe[j] = 1.0;
-                let hv = per_fit.psd_majorizer_hvp(target_beta, rho_local, probe.view());
-                for i in 0..beta_dim {
-                    sys.hbb[[i, j]] += penalty_scale * hv[i];
-                }
-            }
-            return true;
-        }
-        if let AnalyticPenaltyKind::MechanismSparsity(base) = penalty {
-            let mut any = false;
-            for (per_atom, start, end) in self.live_mechanism_sparsity_penalties(base) {
-                any |= self.add_sae_mech_sparsity_atom(
-                    sys,
-                    &per_atom,
-                    target_beta,
-                    rho_local,
-                    start,
-                    end,
-                    penalty_scale,
-                    dense_beta_curvature,
-                );
-            }
-            return any;
-        }
-        // NuclearNormPenalty is a smoothed sum of singular values of a single
-        // (n_eff, latent_dim) matrix. The flat SAE β layout concatenates the
-        // per-atom decoder blocks `[B_1 (M_1×p), B_2 (M_2×p), …]`, so it must
-        // operate per atom on that atom's own `[beta_offsets[k] .. +M_k*p)`
-        // slice as an `M_k × p` matrix (`n_eff = M_k`, `latent_dim = p`). This
-        // penalizes the embedding rank of each atom's decoder independently.
-        if let AnalyticPenaltyKind::NuclearNorm(base) = penalty {
-            let mut any = false;
-            for (per_atom, start, end) in self.live_nuclear_norm_penalties(base) {
-                any |= self.add_sae_nuclear_norm_atom(
-                    sys,
-                    &per_atom,
-                    target_beta,
-                    rho_local,
-                    start,
-                    end,
-                    penalty_scale,
-                    dense_beta_curvature,
-                );
-            }
-            return any;
-        }
-        let k = self.beta_dim();
-        let grad = penalty.grad_target(target_beta, rho_local);
-        for j in 0..k {
-            sys.gb[j] += penalty_scale * grad[j];
-        }
-        if !dense_beta_curvature {
-            return true;
-        }
-        // `hbb` is the PSD Newton / PIRLS curvature block for the β tier:
-        // accumulate the PSD majorizer (exact for convex penalties), not the
-        // indefinite exact Hessian, so the solve stays positive-definite.
-        if let Some(diag) = penalty.psd_majorizer_diag(target_beta, rho_local) {
-            for j in 0..k {
-                sys.hbb[[j, j]] += penalty_scale * diag[j];
-            }
-            return true;
-        }
-        let mut probe = Array1::<f64>::zeros(k);
-        for j in 0..k {
-            probe.fill(0.0);
-            probe[j] = 1.0;
-            let hv = penalty.psd_majorizer_hvp(target_beta, rho_local, probe.view());
-            for i in 0..k {
-                sys.hbb[[i, j]] += penalty_scale * hv[i];
-            }
-        }
-        true
-    }
-
-    /// Accumulate one atom's MechanismSparsity contribution into `sys`. The
-    /// `per_atom` penalty has its `target.range` set to that atom's β segment
-    /// `[start, end)` and `latent_dim = M_k`, so `grad_target` / `hvp` return
-    /// full-length β vectors whose nonzero support lies inside `[start, end)`.
-    /// The Hessian probe only needs to sweep that segment, and its support is
-    /// likewise confined to `[start, end)`, so the inner accumulation is
-    /// quadratic in the atom's block size rather than the full β dimension.
-    fn add_sae_mech_sparsity_atom(
-        &self,
-        sys: &mut ArrowSchurSystem,
-        per_atom: &MechanismSparsityPenalty,
-        target_beta: ArrayView1<'_, f64>,
-        rho_local: ArrayView1<'_, f64>,
-        start: usize,
-        end: usize,
-        penalty_scale: f64,
-        dense_beta_curvature: bool,
-    ) -> bool {
-        let grad = per_atom.grad_target(target_beta, rho_local);
-        for j in start..end {
-            sys.gb[j] += penalty_scale * grad[j];
-        }
-        if !dense_beta_curvature {
-            return true;
-        }
-        let k = self.beta_dim();
-        let mut probe = Array1::<f64>::zeros(k);
-        for j in start..end {
-            probe.fill(0.0);
-            probe[j] = 1.0;
-            // `hbb` is the PSD Newton / PIRLS curvature block, so probe the PSD
-            // majorizer. The group-lasso Hessian `factor·(I − ŵŵᵀ)/‖w‖` is
-            // already PSD, so its majorizer equals the exact Hessian (the trait
-            // default delegates), but we use the majorizer name to honor the
-            // curvature-block contract uniformly with the other SAE penalties.
-            let hv = per_atom.psd_majorizer_hvp(target_beta, rho_local, probe.view());
-            for i in start..end {
-                sys.hbb[[i, j]] += penalty_scale * hv[i];
-            }
-        }
-        true
-    }
-
-    /// Accumulate one atom's NuclearNorm contribution into `sys`. The
-    /// `per_atom` penalty has `n_eff = M_k` and `latent_dim = Some(p)`, so it
-    /// treats this atom's β segment `[start, end)` as an `M_k × p` matrix and
-    /// shrinks its singular spectrum (embedding rank).
-    ///
-    /// Unlike MechanismSparsity, `NuclearNormPenalty::grad_target` / `hvp`
-    /// reshape the *entire* `target` argument they are given (they do not use
-    /// `self.target.range` to slice), so the local `M_k × p` block is passed
-    /// directly and the returned vectors are local (length `M_k*p`). The PSD
-    /// curvature is probed via `psd_majorizer_hvp`, which for NuclearNorm has
-    /// no diagonal majorizer and delegates to its analytic spectral HVP.
-    fn add_sae_nuclear_norm_atom(
-        &self,
-        sys: &mut ArrowSchurSystem,
-        per_atom: &NuclearNormPenalty,
-        target_beta: ArrayView1<'_, f64>,
-        rho_local: ArrayView1<'_, f64>,
-        start: usize,
-        end: usize,
-        penalty_scale: f64,
-        dense_beta_curvature: bool,
-    ) -> bool {
-        let block = target_beta.slice(s![start..end]);
-        let block_len = end - start;
-        let grad = per_atom.grad_target(block, rho_local);
-        for local in 0..block_len {
-            sys.gb[start + local] += penalty_scale * grad[local];
-        }
-        if !dense_beta_curvature {
-            return true;
-        }
-        let mut probe = Array1::<f64>::zeros(block_len);
-        for local in 0..block_len {
-            probe.fill(0.0);
-            probe[local] = 1.0;
-            let hv = per_atom.psd_majorizer_hvp(block, rho_local, probe.view());
-            for i in 0..block_len {
-                sys.hbb[[start + i, start + local]] += penalty_scale * hv[i];
-            }
-        }
-        true
-    }
 
     pub fn solve_newton_step(
         &mut self,
@@ -333,7 +50,7 @@ impl SaeManifoldTerm {
     /// `loss` line-search trial, plus the row-layout state read by
     /// `apply_newton_step` when unpacking compact Newton steps. See
     /// [`SaeManifoldMutableState`].
-    fn snapshot_mutable_state(&self) -> SaeManifoldMutableState {
+    pub(crate) fn snapshot_mutable_state(&self) -> SaeManifoldMutableState {
         let atoms = self
             .atoms
             .iter()
@@ -357,7 +74,7 @@ impl SaeManifoldTerm {
     /// Restore the mutable state captured by [`Self::snapshot_mutable_state`].
     /// Assigns into the existing arrays in place so the restore reuses the
     /// already-allocated buffers rather than reallocating per trial.
-    fn restore_mutable_state(&mut self, snapshot: &SaeManifoldMutableState) {
+    pub(crate) fn restore_mutable_state(&mut self, snapshot: &SaeManifoldMutableState) {
         for (atom, (basis_values, basis_jacobian, decoder, smooth_penalty)) in
             self.atoms.iter_mut().zip(snapshot.atoms.iter())
         {
@@ -371,7 +88,7 @@ impl SaeManifoldTerm {
         self.last_row_layout.clone_from(&snapshot.last_row_layout);
     }
 
-    fn refresh_basis_from_current_coords(&mut self) -> Result<(), String> {
+    pub(crate) fn refresh_basis_from_current_coords(&mut self) -> Result<(), String> {
         for atom_idx in 0..self.k_atoms() {
             let coords = self.assignment.coords[atom_idx].as_matrix();
             self.atoms[atom_idx].refresh_basis(coords.view())?;
@@ -379,7 +96,7 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    fn canonicalize_affine_gauge_after_accept(
+    pub(crate) fn canonicalize_affine_gauge_after_accept(
         &mut self,
         rho: Option<&SaeManifoldRho>,
     ) -> Result<(), String> {
@@ -397,7 +114,7 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    fn canonicalize_atom_affine_gauge(
+    pub(crate) fn canonicalize_atom_affine_gauge(
         &mut self,
         atom_idx: usize,
         rho: Option<&SaeManifoldRho>,
@@ -1133,7 +850,7 @@ impl SaeManifoldTerm {
     /// gate and `run_joint_fit_arrow_schur`'s non-descent stationarity gate
     /// must agree on it, or a point one of them calls converged is mid-flight
     /// to the other (the objective↔gradient desync class).
-    fn inner_iterate_scale(&self) -> f64 {
+    pub(crate) fn inner_iterate_scale(&self) -> f64 {
         let mut iterate_norm_sq = 0.0_f64;
         for &v in self.assignment.logits.iter() {
             iterate_norm_sq += v * v;
@@ -1252,7 +969,7 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
-    fn quotient_newton_step_norm_sq(
+    pub(crate) fn quotient_newton_step_norm_sq(
         &self,
         delta_ext_coord: ArrayView1<'_, f64>,
         delta_beta: ArrayView1<'_, f64>,
@@ -1313,7 +1030,7 @@ impl SaeManifoldTerm {
         })
     }
 
-    fn dense_step_gauge_vectors(&self) -> Result<Vec<Array1<f64>>, String> {
+    pub(crate) fn dense_step_gauge_vectors(&self) -> Result<Vec<Array1<f64>>, String> {
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
         let p = self.output_dim();
@@ -1413,7 +1130,7 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
-    fn row_gauge_deflation_for_layout(
+    pub(crate) fn row_gauge_deflation_for_layout(
         &self,
         row_layout: Option<&SaeRowLayout>,
     ) -> Option<ArrowRowGaugeDeflation> {
@@ -1734,7 +1451,7 @@ impl SaeManifoldTerm {
     /// entry walk's corrector problem η-invariant, which
     /// [`SaeManifoldOuterObjective::run_curvature_homotopy_entry_at_rho`] uses
     /// to collapse the η-grid to its first corrector.
-    fn curvature_homotopy_eta_is_inert(&self) -> Result<bool, String> {
+    pub(crate) fn curvature_homotopy_eta_is_inert(&self) -> Result<bool, String> {
         for atom in &self.atoms {
             if let Some(evaluator) = atom.basis_evaluator.as_ref()
                 && !evaluator
@@ -1788,7 +1505,7 @@ impl SaeManifoldTerm {
     /// `∂r_i/∂η = Σ_{k'} a_ik' (∂Φ^η_{k'}[i,:]/∂η) · B_{k'}`. The smoothness and
     /// ARD penalties do not depend on `η`, so they contribute nothing. The
     /// predictor solves `Δβ = −H⁻¹ · ∂g_β/∂η · Δη` on the cached evidence factor.
-    fn curvature_beta_gradient_eta_derivative(
+    pub(crate) fn curvature_beta_gradient_eta_derivative(
         &self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -1857,7 +1574,7 @@ impl SaeManifoldTerm {
     /// keep-or-kill decision belongs to the evidence-gated structure search,
     /// not to an inner-loop heuristic. Observable events, never silent deaths,
     /// never fit errors.
-    fn enforce_active_mass_guard(
+    pub(crate) fn enforce_active_mass_guard(
         &mut self,
         iteration: usize,
         rho: Option<&SaeManifoldRho>,
@@ -2462,7 +2179,7 @@ impl SaeManifoldTerm {
     /// A full-rank atom (`base`/`step_2300`, `r_k == M_k`) is SKIPPED entirely —
     /// its basis, decoder, penalty, and evaluator are left byte-for-byte the
     /// historical full-`B` path, so the well-conditioned fit is unchanged.
-    fn reduce_atoms_to_data_supported_rank(&mut self) -> Result<(), String> {
+    pub(crate) fn reduce_atoms_to_data_supported_rank(&mut self) -> Result<(), String> {
         let p = self.output_dim();
         if p == 0 || self.beta_dim() == 0 {
             return Ok(());

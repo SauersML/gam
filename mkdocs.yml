@@ -119,6 +119,7 @@ nav:
   - Getting started:
     - Install and first model: getting-started.md
     - Data input formats: data-input.md
+    - CLI reference: cli.md
   - Building a model:
     - Formula DSL: formulas.md
     - Difference smooths: difference-smooths.md
@@ -142,4 +143,5 @@ nav:
     - Cookbook: cookbook.md
     - GPU acceleration: gpu_acceleration.md
     - REML scaling: reml_scaling.md
+    - Measure-jet V∞ notes: measure_jet_v_infinity.md
   - Changelog: changelog.md

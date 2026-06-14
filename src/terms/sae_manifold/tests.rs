@@ -1,9 +1,6 @@
+use crate::linalg::faer_ndarray::fast_ata;
 
-#[cfg(test)]
-mod tests {
-    use crate::linalg::faer_ndarray::fast_ata;
-
-    use super::*;
+use super::*;
     use crate::solver::arrow_schur::{
         ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics,
     };
@@ -7983,4 +7980,3 @@ mod inner_contract_probe_tests {
             );
         }
     }
-}

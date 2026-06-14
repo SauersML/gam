@@ -9,7 +9,8 @@ Formula-based generalized additive models for Python, backed by a Rust
 engine.
 
 `gamfit` fits Gaussian, binomial (including Bernoulli marginal-slope),
-Poisson, and Gamma GLMs with smooth terms, random effects,
+Poisson, negative-binomial, Gamma, Beta, Tweedie, and multinomial GLMs
+with smooth terms, random effects,
 bounded/constrained coefficients, location-scale extensions, survival
 likelihoods, and flexible/learnable links. Smoothing parameters are
 selected by REML or LAML. Posterior sampling uses NUTS where supported,
@@ -73,9 +74,12 @@ inputs are all accepted without conversion.
 - Surface smooths in arbitrary dimension: thin-plate, Duchon (scale-free
   by default, hybrid with `length_scale=...`), and Matérn, with
   automatic knot placement.
-- Manifold smooths: periodic 1-D, cylinder / torus tensor products,
+- Tensor-product and manifold smooths: `te(...)` / `ti(...)` B-spline
+  tensors, periodic 1-D, cylinder / torus tensor products,
   intrinsic sphere (Wahba kernel or spherical harmonics), and
   boundary-conditioned B-splines.
+- Dispersion GAMLSS for Gamma, Beta, negative-binomial, and Tweedie via
+  `noise_formula=`.
 - Per-axis anisotropy inside a single joint smooth.
 - Marginal-slope models that separate baseline risk from a calibrated
   score's effect, for Bernoulli and survival outcomes.
@@ -126,8 +130,10 @@ model.report("report.html")
 | `gamfit.Model` | Fitted model: `predict`, `summary`, `check`, `diagnose`, `plot`, `report`, `sample`, `save`. |
 | `gamfit.SurvivalPrediction` | Per-row hazard / survival surface. |
 | `gamfit.CompetingRisksPrediction`, `competing_risks_cif` | Competing-risks CIF evaluation. |
+| `gamfit.MultinomialModel` | Multinomial-logit / softmax model. |
 | `gamfit.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive`, `PairedPosteriorSamples` | Posterior interface. |
 | `gamfit.ResponseGeometryModel`, `sphere_frechet_mean`, `simplex_frechet_mean`, `alr`, `clr`, `closure` | Response-geometry utilities. |
+| `gamfit.smooth.Duchon`, `Matern`, `BSpline`, `TensorBSpline`, `MeasureJet`, `Sphere` | Smooth descriptors for `smooths=` and torch. |
 | `gamfit.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn estimators. |
 
 Full reference: <https://gamfit.readthedocs.io/en/latest/api-reference/>.
@@ -138,14 +144,17 @@ Full reference: <https://gamfit.readthedocs.io/en/latest/api-reference/>.
 uv add "gamfit[pandas]"     # pandas + pyarrow input/output
 uv add "gamfit[plot]"       # matplotlib-based plotting
 uv add "gamfit[sklearn]"    # scikit-learn integration
-uv add "gamfit[torch]"      # PyTorch bridge
-uv add "gamfit[all]"        # everything
+uv add "gamfit[cuda]"       # NVIDIA CUDA 12 wheel libraries on Linux x86_64
+uv add "gamfit[all]"        # pandas + plot + sklearn extras
+uv add torch                # PyTorch bridge dependency
 ```
 
 ## GPU acceleration
 
 CUDA support (cuBLAS / cuSOLVER / cuSPARSE) is built into the same
-wheel; there is no separate `gamfit-gpu` package. Per-op dispatch
+wheel; there is no separate `gamfit-gpu` package. Install
+`gamfit[cuda]` on Linux x86_64 when you want PyPI's NVIDIA CUDA 12
+runtime libraries instead of a system CUDA toolkit. Per-op dispatch
 thresholds are derived at probe time from measured GPU FP64 throughput,
 CPU FP64 throughput, and PCIe bandwidth, so small kernels stay on the
 CPU. Inspect the calibrated thresholds with

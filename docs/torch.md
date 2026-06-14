@@ -10,11 +10,13 @@ gradients flow through `loss.backward()`.
 The torch dependency is optional:
 
 ```bash
-pip install gamfit[torch]
+pip install torch
 ```
 
 Importing `gamfit` does not import torch. Importing `gamfit.torch` without
-torch installed raises `ImportError` with an install hint.
+torch installed raises `ImportError` with an install hint. The package
+metadata does not define a `gamfit[torch]` extra; choose the PyTorch wheel
+that matches your CPU/CUDA environment.
 
 ## Differentiable Gaussian REML
 
@@ -57,7 +59,7 @@ model = gamfit.fit_array(X_train, y_train, "y ~ s(x0) + x1 + x2")
 frozen = gt.from_fitted(model)
 
 X = torch.as_tensor(X_test, dtype=torch.float64)
-preds = frozen(X)   # (N, P): typically [eta, mean]
+preds = frozen(X)   # response-scale point predictions
 ```
 
 The forward pass crosses the NumPy / Rust boundary. Gradients do not flow
@@ -94,6 +96,9 @@ workloads, prefer `gamfit.torch.fit` or the batched and additive primitives
 | Basis evaluations | `bspline_basis`, `bspline_basis_derivative`, `duchon_basis`, `periodic_spline_curve_basis`, `sphere_basis` |
 | Penalty / ridge | `smoothness_penalty`, `gaussian_weighted_ridge`, `gaussian_weighted_ridge_batch` |
 | Penalty modules | `ARDPenalty`, `BlockOrthogonalityPenalty`, `GumbelTemperatureSchedule`, `IBPAssignmentPenalty`, `IsometryPenalty`, `IvaeRidgeMeanGauge`, `JumpReLUPenalty`, `LazyPcaBasis`, `MechanismSparsityPenalty`, `RiemannianRetraction`, `TopologyAutoSelector` |
+| Manifold SAE | `ManifoldSAE`, `ManifoldSAEConfig`, `DecoderConfig`, `RemlConfig`, `SparsityConfig`, `ManifoldSAEOutput` |
+| Harvest / Fisher factors | `HarvestShard`, `harvest_output_fisher_factors`, `harvest_downstream_output_fisher_factors`, `save_harvest_shard`, `load_harvest_shard` |
+| Hyperbolic / interchange | `PoincareAtoms`, `InterchangeSwapDecoder` |
 | Skip transcoder | `SkipAffineSmooth`, `SkipTranscoderResult`, `skip_transcoder` |
 | Response geometry | `closure`, `clr`, `alr`, `inverse_alr`, `simplex_log_map`, `simplex_exp_map`, `simplex_frechet_mean`, `sphere_log_map`, `sphere_exp_map`, `sphere_frechet_mean` |
 | Fitted-model loader | `from_fitted` |

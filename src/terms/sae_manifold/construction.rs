@@ -1,3 +1,4 @@
+use super::*;
 
 impl SaeManifoldTerm {
     #[must_use = "build error must be handled"]
@@ -425,7 +426,7 @@ impl SaeManifoldTerm {
     /// Euclidean metric of the term's own `(n_obs, output_dim)` shape. Either way
     /// a metric always exists, so the diagnostics are never gated by a flag — the
     /// Euclidean fallback is the bit-identical isotropic path.
-    fn diagnostic_metric(&self) -> Result<crate::inference::row_metric::RowMetric, String> {
+    pub(crate) fn diagnostic_metric(&self) -> Result<crate::inference::row_metric::RowMetric, String> {
         match self.row_metric() {
             Some(metric) => Ok(metric.clone()),
             None => {
@@ -1087,7 +1088,7 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    fn advance_temperature_schedule(&mut self) -> Result<Option<f64>, String> {
+    pub(crate) fn advance_temperature_schedule(&mut self) -> Result<Option<f64>, String> {
         let Some(schedule) = self.temperature_schedule.as_mut() else {
             return Ok(None);
         };
@@ -1155,7 +1156,7 @@ impl SaeManifoldTerm {
     ///
     /// The K=1 case trivially satisfies (2). Beta-tier and rho-tier
     /// penalties are not constrained here.
-    fn validate_analytic_penalty_registry(
+    pub(crate) fn validate_analytic_penalty_registry(
         &self,
         registry: &AnalyticPenaltyRegistry,
     ) -> Result<(), String> {
@@ -1451,7 +1452,7 @@ impl SaeManifoldTerm {
     /// installed frames; this helper enforces the stronger invariant the large-p
     /// solver needs: every atom whose current decoder satisfies the activation
     /// predicate has an active frame after the pass.
-    fn ensure_decoder_frames_active_for_current_decoder(&mut self) -> Result<(), String> {
+    pub(crate) fn ensure_decoder_frames_active_for_current_decoder(&mut self) -> Result<(), String> {
         self.auto_activate_decoder_frames()?;
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let expected_rank = atom.decoder_frame_activation_rank()?;
@@ -1499,7 +1500,7 @@ impl SaeManifoldTerm {
     /// authoritative `B_k = C_k U_newᵀ` and the `(C_k, U_new)` pair stay
     /// consistent (a no-op in span for a truly rank-`r` atom). Un-framed atoms
     /// are skipped. Returns the number of frames refreshed.
-    fn refresh_active_frames_from_data(
+    pub(crate) fn refresh_active_frames_from_data(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -2579,7 +2580,7 @@ impl SaeManifoldTerm {
         )
     }
 
-    fn assemble_arrow_schur_scaled_with_beta_penalty_probe_threshold(
+    pub(crate) fn assemble_arrow_schur_scaled_with_beta_penalty_probe_threshold(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -3911,7 +3912,7 @@ impl SaeManifoldTerm {
     /// `T = hbb · Φ` (right multiply, columns fold `U`), then `Φᵀ · T` (left
     /// multiply, rows fold `U`). Analytic Beta-tier penalties are rare and small,
     /// so this only fires when one is actually installed.
-    fn project_dense_penalty_to_factored(
+    pub(crate) fn project_dense_penalty_to_factored(
         &self,
         hbb: ArrayView2<'_, f64>,
         projection: &FrameProjection,
@@ -3919,7 +3920,7 @@ impl SaeManifoldTerm {
         projection.project_block(hbb)
     }
 
-    fn build_factored_beta_penalty_curvature(
+    pub(crate) fn build_factored_beta_penalty_curvature(
         &self,
         registry: &AnalyticPenaltyRegistry,
         penalty_scale: f64,
@@ -4135,7 +4136,7 @@ impl SaeManifoldTerm {
     /// `S_k` so the REML criterion's `−½·p·rank(S)·log λ_smooth` Occam term
     /// uses the *effective* penalty rank rather than the ambient basis size
     /// (a thin-plate / B-spline penalty has a non-trivial null space).
-    fn symmetric_rank(s: &Array2<f64>) -> Result<usize, String> {
+    pub(crate) fn symmetric_rank(s: &Array2<f64>) -> Result<usize, String> {
         let m = s.ncols();
         if m == 0 {
             return Ok(0);
@@ -4212,7 +4213,7 @@ impl SaeManifoldTerm {
         )
     }
 
-    fn reml_criterion_with_refine_policy(
+    pub(crate) fn reml_criterion_with_refine_policy(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -4408,7 +4409,7 @@ impl SaeManifoldTerm {
     /// (`reduce_atoms_to_data_supported_rank`), so the design is full-rank and
     /// the deflation count is stable. The strict guard is therefore restored —
     /// no hysteresis band-aid on top of the basis fix.
-    fn record_evidence_gauge_deflation_count(&mut self, count: usize) -> Result<(), String> {
+    pub(crate) fn record_evidence_gauge_deflation_count(&mut self, count: usize) -> Result<(), String> {
         match self.expected_evidence_gauge_deflated_directions {
             Some(expected) if expected == count => Ok(()),
             Some(expected) => Err(format!(
@@ -4423,7 +4424,7 @@ impl SaeManifoldTerm {
         }
     }
 
-    fn is_undamped_evidence_row_non_pd(err: &ArrowSchurError) -> bool {
+    pub(crate) fn is_undamped_evidence_row_non_pd(err: &ArrowSchurError) -> bool {
         matches!(
             err,
             ArrowSchurError::PerRowFactorFailed { reason, .. }
@@ -4816,7 +4817,7 @@ impl SaeManifoldTerm {
         }
     }
 
-    fn refine_iteration_limit(
+    pub(crate) fn refine_iteration_limit(
         total_inner_iter: usize,
         base_refine_iter: usize,
         progress_refine_iter: usize,
@@ -4846,7 +4847,7 @@ impl SaeManifoldTerm {
             .is_some_and(|prev| prev.is_finite() && grad_norm.is_finite() && grad_norm < prev)
     }
 
-    fn outer_gradient_arrow_solver<'a>(
+    pub(crate) fn outer_gradient_arrow_solver<'a>(
         &'a self,
         cache: &'a ArrowFactorCache,
     ) -> Result<DeflatedArrowSolver<'a>, String> {
@@ -5011,7 +5012,7 @@ impl SaeManifoldTerm {
             .map_err(|_| conditioning_err)
     }
 
-    fn outer_gradient_conditioning_error(cache: &ArrowFactorCache) -> Result<(), String> {
+    pub(crate) fn outer_gradient_conditioning_error(cache: &ArrowFactorCache) -> Result<(), String> {
         let pivot = arrow_factor_min_pivot(cache);
         let Some(min_pivot) = pivot.min_pivot else {
             return Err(
@@ -5057,7 +5058,7 @@ impl SaeManifoldTerm {
     /// frame degrees of freedom profiled OUT of the border are counted explicitly
     /// in the Laplace dimension accounting (evidence honesty) so the criterion
     /// cannot buy a free evidence boost by hiding decoder freedom in the frame.
-    fn reml_occam_term(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
+    pub(crate) fn reml_occam_term(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
         let mut penalized_channel_dim = 0usize;
         for atom in &self.atoms {
             let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
@@ -5248,7 +5249,7 @@ impl SaeManifoldTerm {
     /// the Mackay/Fellner–Schall fixed point `α ← n / (sumsq + tr H⁻¹)`
     /// consistent with the actual periodic prior energy rather than the
     /// origin-dependent raw `t²`.
-    fn ard_coord_sumsq(&self) -> Vec<Array1<f64>> {
+    pub(crate) fn ard_coord_sumsq(&self) -> Vec<Array1<f64>> {
         let mut out = Vec::with_capacity(self.k_atoms());
         for coord in &self.assignment.coords {
             let d = coord.latent_dim();
@@ -5289,7 +5290,7 @@ impl SaeManifoldTerm {
     /// This `tr_kj(H⁻¹)` is exactly the posterior-variance term the deleted
     /// `α = n/‖t‖²` rule dropped; the corrected Mackay/Fellner-Schall fixed
     /// point is `α_new = n / (‖t_kj‖² + tr_kj(H⁻¹))`.
-    fn ard_inverse_traces(
+    pub(crate) fn ard_inverse_traces(
         &self,
         cache: &ArrowFactorCache,
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
@@ -5464,7 +5465,7 @@ impl SaeManifoldTerm {
     /// This is `βᵀ (⊕_k S_k ⊗ I_p) β` — the un-scaled (λ-free) penalty energy
     /// in the flat β layout, the denominator of the λ_smooth Fellner-Schall
     /// update. `S_k` is symmetrised defensively (as the assembler does).
-    fn decoder_smoothness_quadratic_form(&self) -> f64 {
+    pub(crate) fn decoder_smoothness_quadratic_form(&self) -> f64 {
         // `Σ_k Σ_oc B_k[:,oc]ᵀ ½(S_k+S_kᵀ) B_k[:,oc]` = `Σ_k <B_k, ½(S_k+S_kᵀ)·B_k>`.
         // The per-atom `½(S+Sᵀ)·B_k` GEMMs are independent, so they ride the
         // multi-GPU batched smoothness GEMM (uniform-shape tiles across every
@@ -5495,7 +5496,7 @@ impl SaeManifoldTerm {
     /// `⊗ I_p` only couples equal `oc`, but `S_β` itself couples channels
     /// through the data-fit block, so all `p` channels are summed (no
     /// channel-block-identity shortcut). Total cost `beta_dim` Schur solves.
-    fn decoder_smoothness_effective_dof(
+    pub(crate) fn decoder_smoothness_effective_dof(
         &self,
         cache: &ArrowFactorCache,
         lambda_smooth: f64,
@@ -5853,7 +5854,7 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    fn border_channels_for_cache(
+    pub(crate) fn border_channels_for_cache(
         &self,
         cache: &ArrowFactorCache,
     ) -> Result<Vec<SaeBorderChannel>, String> {
@@ -5898,7 +5899,7 @@ impl SaeManifoldTerm {
         Ok(channels)
     }
 
-    fn row_vars_for_cache_row(
+    pub(crate) fn row_vars_for_cache_row(
         &self,
         row: usize,
         cache: &ArrowFactorCache,
@@ -5941,7 +5942,7 @@ impl SaeManifoldTerm {
             .collect()
     }
 
-    fn atom_second_jets(&self) -> Result<Vec<Array4<f64>>, String> {
+    pub(crate) fn atom_second_jets(&self) -> Result<Vec<Array4<f64>>, String> {
         let mut out = Vec::with_capacity(self.k_atoms());
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let coords = self.assignment.coords[atom_idx].as_matrix();
@@ -6089,7 +6090,7 @@ impl SaeManifoldTerm {
         }
     }
 
-    fn row_jets_for_logdet(
+    pub(crate) fn row_jets_for_logdet(
         &self,
         rho: &SaeManifoldRho,
         row: usize,
@@ -6870,7 +6871,7 @@ impl SaeManifoldTerm {
     /// prior-dominated coordinates contribute 0 to both the trace and the
     /// count, hence 0 edf). The residual dof is floored at 1 so `φ̂` stays
     /// finite and positive.
-    fn reconstruction_dispersion(
+    pub(crate) fn reconstruction_dispersion(
         &self,
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
@@ -7077,7 +7078,7 @@ impl SaeManifoldTerm {
         Ok(SaeShapeUncertainty { dispersion, atoms })
     }
 
-    fn shape_uncertainty_without_decoder_covariance(&self, dispersion: f64) -> SaeShapeUncertainty {
+    pub(crate) fn shape_uncertainty_without_decoder_covariance(&self, dispersion: f64) -> SaeShapeUncertainty {
         let p = self.output_dim();
         let mut atoms = Vec::with_capacity(self.k_atoms());
         for (k, atom) in self.atoms.iter().enumerate() {
@@ -7109,688 +7110,318 @@ impl SaeManifoldTerm {
         }
         SaeShapeUncertainty { dispersion, atoms }
     }
+}
 
-    /// Returns whether Beta-tier analytic curvature was accumulated into the
-    /// dense `sys.hbb` block or deferred for exact factored-space probing.
-    fn add_sae_analytic_penalty_contributions(
-        &self,
-        sys: &mut ArrowSchurSystem,
-        registry: &AnalyticPenaltyRegistry,
-        penalty_scale: f64,
-        row_layout: Option<&SaeRowLayout>,
-        dense_beta_curvature: bool,
-        factored_row_projection: Option<&FrameProjection>,
-    ) -> Result<SaeBetaPenaltyAssembly, ArrowSchurError> {
-        let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
-        let layout = registry.rho_layout();
-        let beta = self.flatten_beta();
-        let mut beta_assembly = SaeBetaPenaltyAssembly::default();
-        for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(layout.iter()) {
-            let rho_local = rho_global.slice(s![rho_slice.clone()]);
-            // The coordinate ARD prior is owned by the built-in `ArdAxisPrior`
-            // path (the unconditional row-block gradient/curvature write above,
-            // and `ard_value`/`loss.ard` for the energy). That path uses the
-            // smooth von-Mises energy `V(t) = (α/κ²)(1−cos κt)` on periodic
-            // (Circle) axes, whose value, gradient (`α/κ·sin κt`), and curvature
-            // (`α·cos κt`) are mutually FD-consistent and continuous across the
-            // branch cut. The registry `ARDPenalty` is the legacy Euclidean
-            // Gaussian (`½λt²`, grad `λt`, curvature `λ`): adding it here would
-            // (a) double-count the coordinate prior in both gradient and Newton
-            // curvature, and (b) reintroduce the period-discontinuous `½λt²`
-            // energy — its grad `λt` is continuous but its value jumps by
-            // `½λ(t_after²−t_before²)` across the cut, so a near-zero Newton step
-            // crossing the cut changes the line-search objective discontinuously
-            // and Armijo rejects it. Skip it on every SAE path so the von-Mises
-            // built-in is the single source of truth (matching the REML criterion,
-            // which already scores only `loss.ard`).
-            if matches!(penalty, AnalyticPenaltyKind::Ard(_)) {
-                continue;
-            }
-            match tier {
-                PenaltyTier::Psi => {
-                    if matches!(penalty, AnalyticPenaltyKind::NuclearNorm(_)) {
-                        // NuclearNorm is a Psi-tier penalty but it targets each
-                        // atom's decoder (β) matrix singular spectrum, not the
-                        // coord "t" row block. Route it to the β tier so it
-                        // shrinks each atom's embedding rank.
-                        if self.add_sae_beta_penalty(
-                            sys,
-                            penalty,
-                            beta.view(),
-                            rho_local,
-                            penalty_scale,
-                            dense_beta_curvature,
-                        ) {
-                            beta_assembly.record_curvature(dense_beta_curvature);
-                        }
-                    } else {
-                        // Every other Psi-tier penalty here is row-block
-                        // supported with a coord-shape that matches each
-                        // atom — `validate_analytic_penalty_registry`
-                        // refused everything else upfront, so this branch
-                        // is total and the K=1 vs K>=2 path is the same
-                        // loop. Row-block coord penalties (ARD,
-                        // BlockOrthogonality, Sparsity/TopK/JumpReLU,
-                        // RowPrecisionPrior, ScadMcp, Isometry) target the
-                        // "t" latent block (n_obs × d) and apply per atom
-                        // — accumulate into the corresponding row offsets.
-                        assert!(
-                            sae_penalty_is_row_block_supported(penalty),
-                            "validate_analytic_penalty_registry should have \
-                             refused non-row-block Psi-tier penalty {:?} \
-                             (registry layout name {name:?})",
-                            penalty.name()
-                        );
-                        let offsets = self.assignment.coord_offsets();
-                        for atom_idx in 0..self.k_atoms() {
-                            let off = offsets[atom_idx];
-                            let coord = &self.assignment.coords[atom_idx];
-                            if let AnalyticPenaltyKind::Isometry(iso) = penalty {
-                                let corrected_kind =
-                                    self.corrected_isometry_penalty(iso, atom_idx, coord)?;
-                                self.add_sae_coord_penalty(
-                                    sys,
-                                    atom_idx,
-                                    off,
-                                    coord,
-                                    &corrected_kind,
-                                    rho_local,
-                                    row_layout,
-                                    factored_row_projection,
-                                );
-                                // The isometry penalty value depends on the
-                                // decoder B as well as the latent coords, through
-                                // the pullback metric `g = JᵀWJ` with the model
-                                // Jacobian `J = (∂Φ/∂t)·B`. `add_sae_coord_penalty`
-                                // only routes `∂P/∂t` into `gt`; the matching
-                                // `∂P/∂B` must be accumulated into `gb`, or the
-                                // assembled gradient disagrees with the penalized
-                                // objective on the β block (value path counts the
-                                // isometry energy, which moves with B).
-                                if let AnalyticPenaltyKind::Isometry(corrected) = &corrected_kind {
-                                    self.add_sae_isometry_beta_penalty(
-                                        sys,
-                                        atom_idx,
-                                        coord,
-                                        corrected,
-                                        rho_local,
-                                        dense_beta_curvature,
-                                    );
-                                    beta_assembly.record_curvature(dense_beta_curvature);
-                                }
-                            } else {
-                                self.add_sae_coord_penalty(
-                                    sys,
-                                    atom_idx,
-                                    off,
-                                    coord,
-                                    penalty,
-                                    rho_local,
-                                    row_layout,
-                                    factored_row_projection,
-                                );
-                            }
-                        }
-                    }
-                }
-                PenaltyTier::Beta => {
-                    // β-tier analytic penalties are global (B-only); minibatch-
-                    // scaled so per-chunk sums reconstruct one global copy.
-                    if self.add_sae_beta_penalty(
-                        sys,
-                        penalty,
-                        beta.view(),
-                        rho_local,
-                        penalty_scale,
-                        dense_beta_curvature,
-                    ) {
-                        beta_assembly.record_curvature(dense_beta_curvature);
-                    }
-                }
-                PenaltyTier::Rho => {}
-            }
-        }
-        Ok(beta_assembly)
+
+/// Helper for padded FFI callers. Arrays use `(K, N, M_max)` and
+/// `(K, N, M_max, D_max)` storage, with `basis_sizes` and `latent_dims`
+/// selecting each atom's active prefix.
+///
+/// `evaluators`, when non-empty, must have length `K`. Each entry attaches an
+/// optional [`SaeBasisEvaluator`] to the matching atom so the Rust Newton
+/// loop can refresh `Phi`/`dPhi/dt` between iterations without rebuilding the
+/// term from Python. An empty slice leaves every atom in snapshot-only mode.
+#[must_use = "build error must be handled"]
+pub fn term_from_padded_blocks_with_mode(
+    n_obs: usize,
+    p_out: usize,
+    basis_kinds: &[SaeAtomBasisKind],
+    basis_values: ArrayView3<'_, f64>,
+    basis_jacobian: ArrayView4<'_, f64>,
+    basis_sizes: &[usize],
+    latent_dims: &[usize],
+    decoder_coefficients: ArrayView3<'_, f64>,
+    smooth_penalties: ArrayView3<'_, f64>,
+    logits: ArrayView2<'_, f64>,
+    coords: &[Array2<f64>],
+    mode: AssignmentMode,
+    evaluators: &[Option<Arc<dyn SaeBasisEvaluator>>],
+) -> Result<SaeManifoldTerm, String> {
+    let k_atoms = basis_sizes.len();
+    if latent_dims.len() != k_atoms || basis_kinds.len() != k_atoms || coords.len() != k_atoms {
+        return Err("term_from_padded_blocks: K-length metadata mismatch".into());
     }
-
-    fn corrected_isometry_penalty(
-        &self,
-        iso: &Arc<IsometryPenalty>,
-        atom_idx: usize,
-        coord: &LatentCoordValues,
-    ) -> Result<AnalyticPenaltyKind, ArrowSchurError> {
-        // Isometry requires per-step cache refresh from the atom's second jet
-        // before value / grad_target / hvp are live. The registry-held
-        // IsometryPenalty was constructed with p_out equal to the latent dim
-        // from the JSON latent spec; clone it and correct p_out to the atom's
-        // true decoder output dimension before refreshing caches.
-        let atom = &self.atoms[atom_idx];
-        let p = atom.decoder_coefficients.ncols();
-        let mut corrected: IsometryPenalty = (**iso).clone();
-        corrected.p_out = p;
-        // Single-source-of-truth gauge metric: the isometry pullback weight is
-        // taken from the SAME RowMetric the reconstruction likelihood whitens
-        // through. There is no independent gauge-weight setter, so a
-        // likelihood-metric ≠ gauge-metric state is unrepresentable. When the
-        // term carries no RowMetric (Euclidean default) the gauge weight stays
-        // Identity, matching the isotropic likelihood exactly. The metric's
-        // p_out must agree with the atom's true decoder output dimension.
-        if let Some(metric) = self.row_metric.as_ref() {
-            // Only a metric that actually drives the gauge installs a non-identity
-            // pullback weight: any non-Euclidean provenance (OutputFisher or the
-            // #974 WhitenedStructured) pulls the isometry penalty back through its
-            // per-row inner product. A Euclidean metric reduces the gauge to the
-            // bare `J_nᵀ J_n` (Identity weight), so it is left untouched and the
-            // gauge is bit-for-bit the historical isotropic pullback.
-            if metric.drives_gauge() {
-                if metric.p_out() == p {
-                    corrected.weight = metric.to_weight_field();
-                } else {
-                    return Err(ArrowSchurError::SchurFactorFailed {
-                        reason: format!(
-                            "corrected_isometry_penalty: RowMetric p_out {} disagrees with atom \
-                             {} decoder output dim {p}; the gauge metric must match the likelihood \
-                             metric",
-                            metric.p_out(),
-                            atom_idx
-                        ),
-                    });
-                }
-            }
-        }
-        let coords_mat = coord.as_matrix();
-        let second_jet_installed =
-            refresh_isometry_caches_from_atom(&corrected, atom, coords_mat.view())
-                .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        if !second_jet_installed {
-            match atom
-                .basis_evaluator
-                .as_ref()
-                .and_then(|e| e.second_jet_dyn(coords_mat.view()))
-            {
-                Some(Ok(hess)) => {
-                    let n_obs = coords_mat.nrows();
-                    let d = atom.latent_dim;
-                    let m = atom.basis_size();
-                    if hess.dim() != (n_obs, m, d, d) {
-                        return Err(ArrowSchurError::SchurFactorFailed {
-                            reason: format!(
-                                "SAE Isometry atom '{}': second_jet_dyn returned shape {:?}, \
-                                 expected ({n_obs}, {m}, {d}, {d})",
-                                atom.name,
-                                hess.dim()
-                            ),
-                        });
-                    }
-                    let b = &atom.decoder_coefficients;
-                    let mut jac2 = Array2::<f64>::zeros((n_obs, p * d * d));
-                    for n in 0..n_obs {
-                        for i in 0..p {
-                            for a in 0..d {
-                                for c in 0..d {
-                                    let mut acc = 0.0;
-                                    for mm in 0..m {
-                                        acc += hess[[n, mm, a, c]] * b[[mm, i]];
-                                    }
-                                    jac2[[n, (i * d + a) * d + c]] = acc;
-                                }
-                            }
-                        }
-                    }
-                    corrected.set_jacobian_second_cache(Some(Arc::new(jac2)));
-                }
-                Some(Err(reason)) => {
-                    return Err(ArrowSchurError::SchurFactorFailed { reason });
-                }
-                None => {
-                    return Err(ArrowSchurError::SchurFactorFailed {
-                        reason: format!(
-                            "IsometryPenalty requested for SAE atom '{}' (basis kind {:?}) but \
-                             this evaluator does not expose an analytic second jet; use \
-                             AffineCoordinateEvaluator, SphereChartEvaluator, \
-                             PeriodicHarmonicEvaluator, or TorusHarmonicEvaluator for \
-                             SAE-Isometry",
-                            atom.name, atom.basis_kind
-                        ),
-                    });
-                }
-            }
-        }
-        Ok(AnalyticPenaltyKind::Isometry(Arc::new(corrected)))
+    if !evaluators.is_empty() && evaluators.len() != k_atoms {
+        return Err(format!(
+            "term_from_padded_blocks: evaluators length {} must equal K={k_atoms} or be empty",
+            evaluators.len()
+        ));
     }
-
-    fn add_sae_coord_penalty(
-        &self,
-        sys: &mut ArrowSchurSystem,
-        atom_idx: usize,
-        dense_off: usize,
-        coord: &LatentCoordValues,
-        penalty: &AnalyticPenaltyKind,
-        rho_local: ArrayView1<'_, f64>,
-        row_layout: Option<&SaeRowLayout>,
-        factored_row_projection: Option<&FrameProjection>,
-    ) {
-        let n = coord.n_obs();
-        let d = coord.latent_dim();
-        // Origin-anchored magnitude shrinkage (SCAD/MCP) is restricted to the
-        // Euclidean axes: a periodic chart axis has no origin, and folding a
-        // raw-|t| energy there is period-discontinuous and breaks the joint
-        // Newton solve (issue #795). Evaluate the axis-separable penalty on the
-        // Euclidean-only compacted coordinate and scatter its gradient / PSD
-        // curvature back to those axis slots — periodic axes get nothing. This
-        // mirrors the value accounting in `analytic_penalty_value_total` exactly,
-        // so the assembled gradient stays the gradient of the line-search
-        // objective.
-        if sae_coord_penalty_is_origin_anchored_magnitude(penalty) {
-            if let Some((euclidean_axes, compacted)) =
-                sae_coord_penalty_euclidean_restriction(coord)
-            {
-                let de = euclidean_axes.len();
-                let grad = penalty.grad_target(compacted.view(), rho_local);
-                let diag = penalty.psd_majorizer_diag(compacted.view(), rho_local);
-                for row in 0..n {
-                    if let Some(row_off) =
-                        sae_coord_penalty_offset(row_layout, dense_off, row, atom_idx)
-                    {
-                        for (j, &axis) in euclidean_axes.iter().enumerate() {
-                            sys.rows[row].gt[row_off + axis] += grad[row * de + j];
-                            if let Some(diag) = diag.as_ref() {
-                                sys.rows[row].htt[[row_off + axis, row_off + axis]] +=
-                                    diag[row * de + j];
-                            }
-                        }
-                    }
-                }
-                return;
-            }
-        }
-        let target = coord.as_flat().view();
-        let grad = penalty.grad_target(target, rho_local);
-        for row in 0..n {
-            if let Some(row_off) = sae_coord_penalty_offset(row_layout, dense_off, row, atom_idx) {
-                for axis in 0..d {
-                    sys.rows[row].gt[row_off + axis] += grad[row * d + axis];
-                }
-            }
-        }
-        if let AnalyticPenaltyKind::Isometry(corrected) = penalty {
-            self.add_sae_isometry_metric_gn_blocks(
-                sys,
-                atom_idx,
-                dense_off,
-                coord,
-                corrected,
-                rho_local,
-                row_layout,
-                factored_row_projection,
-            );
-            return;
-        }
-        // `htt` is the PSD Newton / PIRLS curvature block: accumulate the PSD
-        // majorizer (exact for convex penalties), not the indefinite exact
-        // Hessian, for the same PSD-Newton reason used throughout the analytic
-        // penalty assembly.
-        if let Some(diag) = penalty.psd_majorizer_diag(target, rho_local) {
-            for row in 0..n {
-                if let Some(row_off) =
-                    sae_coord_penalty_offset(row_layout, dense_off, row, atom_idx)
-                {
-                    for axis in 0..d {
-                        sys.rows[row].htt[[row_off + axis, row_off + axis]] += diag[row * d + axis];
-                    }
-                }
-            }
-            return;
-        }
-        let mut probe = Array1::<f64>::zeros(n * d);
-        for axis in 0..d {
-            probe.fill(0.0);
-            for row in 0..n {
-                probe[row * d + axis] = 1.0;
-            }
-            let hv = penalty.psd_majorizer_hvp(target, rho_local, probe.view());
-            for row in 0..n {
-                if let Some(row_off) =
-                    sae_coord_penalty_offset(row_layout, dense_off, row, atom_idx)
-                {
-                    for b in 0..d {
-                        sys.rows[row].htt[[row_off + b, row_off + axis]] += hv[row * d + b];
-                    }
-                }
-            }
-        }
+    if logits.dim() != (n_obs, k_atoms) {
+        return Err(format!(
+            "term_from_padded_blocks: logits must be ({n_obs}, {k_atoms}); got {:?}",
+            logits.dim()
+        ));
     }
-
-    fn add_sae_isometry_metric_gn_blocks(
-        &self,
-        sys: &mut ArrowSchurSystem,
-        atom_idx: usize,
-        dense_off: usize,
-        coord: &LatentCoordValues,
-        corrected: &Arc<IsometryPenalty>,
-        rho_local: ArrayView1<'_, f64>,
-        row_layout: Option<&SaeRowLayout>,
-        factored_row_projection: Option<&FrameProjection>,
-    ) {
-        let n_obs = coord.n_obs();
-        let d = coord.latent_dim();
-        let atom = &self.atoms[atom_idx];
-        let p = atom.decoder_coefficients.ncols();
-        let m = atom.basis_size();
-        let Some(jac) = corrected.jacobian_cache() else {
-            return;
+    let mut atoms = Vec::with_capacity(k_atoms);
+    for k in 0..k_atoms {
+        let m = basis_sizes[k];
+        let d = latent_dims[k];
+        let phi = basis_values.slice(s![k, 0..n_obs, 0..m]).to_owned();
+        let jet = basis_jacobian.slice(s![k, 0..n_obs, 0..m, 0..d]).to_owned();
+        let b = decoder_coefficients.slice(s![k, 0..m, 0..p_out]).to_owned();
+        let s = smooth_penalties.slice(s![k, 0..m, 0..m]).to_owned();
+        let atom = SaeManifoldAtom::new(
+            format!("atom_{k}"),
+            basis_kinds[k].clone(),
+            d,
+            phi,
+            jet,
+            b,
+            s,
+        )?;
+        let atom = match evaluators.get(k).and_then(|slot| slot.clone()) {
+            Some(evaluator) => atom.with_basis_evaluator(evaluator),
+            None => atom,
         };
-        if jac.dim() != (n_obs, p * d) {
-            return;
-        }
-        let Some(jac2) = corrected.jacobian_second_cache() else {
-            return;
-        };
-        if jac2.dim() != (n_obs, p * d * d) {
-            return;
-        }
-        let beta_off = self.beta_offsets()[atom_idx];
-        let beta_block = m * p;
-        let jet = &atom.basis_jacobian;
-        // Resolve the learnable isometry strength `scalar_weight · exp(rho)` in
-        // log-space with a clamped exponent: the naive `scalar_weight *
-        // rho.exp()` overflows to `inf` for `rho ≳ 709`, and the downstream
-        // `inf · jacobian` / `inf · 0.0` then injects NaN into the GN curvature
-        // block and β-penalty, poisoning the joint solve (#742, Issue 4).
-        let mu = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
-        // A negligible (or non-finite) effective isometry weight contributes a
-        // zero curvature block; writing zeros would still flip the solver onto
-        // the dense-supplement Schur path (and invalidate caches) for no model
-        // change. Skip entirely so `isometry_weight≈0` is bit-identical to the
-        // no-isometry assembly. (`isometry_weight=0` never constructs the
-        // penalty at all; this guards the ρ-sweep driving `exp(ρ)` to ~0.)
-        if !(mu.is_finite() && mu > 0.0) {
-            return;
-        }
-        // Coherence invariant for the coupled Gauss-Newton block. The isometry
-        // residual `r_{ab} = (JᵀWJ − G_ref)_{ab}` yields one residual Jacobian
-        // `A = [A_t | A_β]`, so `[[htt,cross],[crossᵀ,hbb]] = μ AᵀA` is PSD *as a
-        // whole* and its Schur complement is PSD — but ONLY while all three
-        // blocks stay that exact pullback. After assembly the latent blocks pass
-        // through `apply_riemannian_latent_geometry`, which on a *curved* chart
-        // rewrites `htt` with the (indefinite) Riemannian connection term and
-        // column-projects the `htbeta` cross-block to `T_tM`, while the shared
-        // `hbb` is left untouched. That projection breaks the `μ AᵀA` coherence:
-        // the cross-block is then a nonzero coupling NOT paired with diagonals
-        // from the same Jacobian, and the Schur complement
-        // `hbb − Σ crossᵀ htt⁻¹ cross` can go indefinite (the #681 sphere
-        // failure mode flagged in the math review).
-        //
-        // The decision must therefore key on whether the geometry transform is
-        // the IDENTITY for this chart, NOT on `is_euclidean()`. A flat periodic
-        // chart (`Circle`/`Torus`) is non-Euclidean yet transforms as the exact
-        // identity — its tangent projection is the identity, it carries no
-        // connection term, and it adds no normal pinning — so the coupled block
-        // survives exactly and the full cross-coupling must be kept. Keying on
-        // `is_euclidean()` instead wrongly dropped the cross-block for the
-        // single-circle fit, leaving a block-diagonal Hessian that misses the
-        // strong isometry `t`↔`B` coupling; the joint Newton step then never
-        // reaches the KKT stationarity the REML criterion now requires, and the
-        // arrow-Schur proximal ridge saturates at 1e15 (issue #795, a regression
-        // of #681). For a genuinely curved chart (Sphere, an active Interval
-        // boundary) we contribute only the PSD `htt` diagonal block and DROP the
-        // cross-block: a block-diagonal `diag(μ A_tᵀA_t, μ A_βᵀA_β)` of two PSD
-        // blocks is still PSD, so the Schur stays PSD by construction while the
-        // gradient (which alone fixes the stationary point) is unchanged.
-        let couple_cross_block = coord.manifold().preserves_isometry_cross_block_coherence();
-        let mut metric_coord_jac = Array2::<f64>::zeros((d * d, d));
-        let mut metric_beta_jac = Array2::<f64>::zeros((d * d, beta_block));
-        let mut wrote_dense_cross = false;
-        for row in 0..n_obs {
-            let Some(row_off) = sae_coord_penalty_offset(row_layout, dense_off, row, atom_idx)
-            else {
-                continue;
-            };
-            let Some(wj) = Self::sae_isometry_weighted_jacobian_row(corrected, &jac, row, p, d)
-            else {
-                return;
-            };
-            metric_coord_jac.fill(0.0);
+        atoms.push(atom);
+    }
+    let manifolds = basis_kinds
+        .iter()
+        .zip(latent_dims.iter().copied())
+        .map(|(kind, d)| kind.latent_manifold(d))
+        .collect();
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits.to_owned(),
+        coords.to_vec(),
+        manifolds,
+        mode,
+    )?;
+    SaeManifoldTerm::new(atoms, assignment)
+}
+
+
+/// Build the per-row Jacobian `J` and Hessian `H` of the decoded output
+/// `Z_n = Phi_n B` with respect to the latent coordinates `t_n` of a single
+/// SAE atom and install them on the supplied [`IsometryPenalty`].
+///
+/// Layout follows the convention used by [`IsometryPenalty::grad_target`] and
+/// friends:
+///
+/// * `J ∈ ℝ^{n_obs × (p · d)}`, flattened as `J[n, i*d + a]` —
+///   `J[n, i, a] = ∂Z_{n,i} / ∂t_{n,a} = Σ_m dPhi[n, m, a] · B[m, i]`.
+/// * `H ∈ ℝ^{n_obs × (p · d · d)}`, flattened as `H[n, (i*d + a)*d + c]` —
+///   `H[n, i, a, c] = ∂J[n, i, a] / ∂t_{n, c} = Σ_m d²Phi[n, m, a, c] · B[m, i]`.
+/// * `K`, an `Array3` of shape `(n_obs, p, d·d·d)` with last axis packed
+///   `((a·d + c)·d + e)` — `K[n, i, a, c, e] = ∂³Z_{n,i} / ∂t_a ∂t_c ∂t_e =
+///   Σ_m d³Phi[n, m, a, c, e] · B[m, i]`. Installed via the new third-jet slot
+///   whenever the base evaluator's `third_jet_dyn` yields a jet AND the penalty
+///   carries no `duchon_radial_source`. This is the residual-curvature source
+///   for the exact isometry `hvp`.
+///
+/// Returns `Ok(true)` when both caches were installed (i.e. the atom was
+/// built via [`SaeManifoldAtom::with_basis_second_jet`], so its
+/// `basis_second_jet` slot holds a [`SaeBasisSecondJet`] implementation
+/// that supplies the analytic Hessian). Returns `Ok(false)` when only the
+/// base [`SaeBasisEvaluator`] is installed (no second jet available) — in
+/// that case only the first-jet `jacobian_cache` is installed and the
+/// penalty's `has_jacobian_second_source` check still has a chance to
+/// succeed via a pre-supplied `duchon_radial_source`. Returns `Err` on
+/// shape mismatches (which would indicate a buggy evaluator) or when the
+/// second-jet implementation itself fails (e.g. wrong latent dimension).
+///
+/// This entry point takes `&IsometryPenalty` rather than `&mut` because the
+/// caches are interior-mutable (see [`IsometryPenalty::refresh_caches`]).
+pub fn refresh_isometry_caches_from_atom(
+    penalty: &IsometryPenalty,
+    atom: &SaeManifoldAtom,
+    coords: ArrayView2<'_, f64>,
+) -> Result<bool, String> {
+    let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
+        format!(
+            "refresh_isometry_caches_from_atom: atom {} has no basis evaluator",
+            atom.name
+        )
+    })?;
+    let (_phi, jet) = evaluator.evaluate(coords)?;
+
+    let n_obs = coords.nrows();
+    let d = atom.latent_dim;
+    let m = atom.basis_size();
+    let p = atom.decoder_coefficients.ncols();
+    if penalty.p_out != p {
+        return Err(format!(
+            "refresh_isometry_caches_from_atom: penalty.p_out={} but atom.decoder.cols={p}",
+            penalty.p_out
+        ));
+    }
+    if jet.dim() != (n_obs, m, d) {
+        return Err(format!(
+            "refresh_isometry_caches_from_atom: evaluator first jet has shape {:?}, expected ({n_obs}, {m}, {d})",
+            jet.dim()
+        ));
+    }
+
+    // J[n, i*d + a] = Σ_m dPhi[n, m, a] · B[m, i].
+    let b = &atom.decoder_coefficients;
+    let mut jac = Array2::<f64>::zeros((n_obs, p * d));
+    for n in 0..n_obs {
+        for i in 0..p {
             for a in 0..d {
-                for b in 0..d {
-                    let metric_row = a * d + b;
+                let mut acc = 0.0;
+                for mm in 0..m {
+                    acc += jet[[n, mm, a]] * b[[mm, i]];
+                }
+                jac[[n, i * d + a]] = acc;
+            }
+        }
+    }
+
+    // The second jet is sourced from the optional `basis_second_jet`
+    // slot. The trait split (`SaeBasisEvaluator` vs `SaeBasisSecondJet`)
+    // encodes "no closed-form Hessian" as trait absence: when the atom
+    // was built with `with_basis_evaluator` (base trait only) the slot
+    // is `None` and the `H` cache is not installed. When the atom was
+    // built with `with_basis_second_jet` the slot holds the same Arc
+    // upcast to the supertrait, and `second_jet` returns the analytic
+    // Hessian here.
+    let jac2_opt = if let Some(second_eval) = atom.basis_second_jet.as_ref() {
+        let hess = second_eval.second_jet(coords)?;
+        if hess.dim() != (n_obs, m, d, d) {
+            return Err(format!(
+                "refresh_isometry_caches_from_atom: evaluator second jet has shape {:?}, expected ({n_obs}, {m}, {d}, {d})",
+                hess.dim()
+            ));
+        }
+        let mut jac2 = Array2::<f64>::zeros((n_obs, p * d * d));
+        for n in 0..n_obs {
+            for i in 0..p {
+                for a in 0..d {
                     for c in 0..d {
                         let mut acc = 0.0;
-                        for i in 0..p {
-                            acc += jac2[[row, (i * d + a) * d + c]] * wj[[i, b]];
-                            acc += wj[[i, a]] * jac2[[row, (i * d + b) * d + c]];
+                        for mm in 0..m {
+                            acc += hess[[n, mm, a, c]] * b[[mm, i]];
                         }
-                        metric_coord_jac[[metric_row, c]] = acc;
+                        jac2[[n, (i * d + a) * d + c]] = acc;
                     }
                 }
             }
-            if couple_cross_block {
-                metric_beta_jac.fill(0.0);
-                for a in 0..d {
-                    for b in 0..d {
-                        let metric_row = a * d + b;
-                        for basis_col in 0..m {
-                            let jet_a = jet[[row, basis_col, a]];
-                            let jet_b = jet[[row, basis_col, b]];
-                            for output in 0..p {
-                                metric_beta_jac[[metric_row, basis_col * p + output]] =
-                                    jet_a * wj[[output, b]] + wj[[output, a]] * jet_b;
+        }
+        Some(Arc::new(jac2))
+    } else {
+        None
+    };
+
+    // Third jet K[n, i, ((a·d + c)·d + e)] = Σ_m d³Phi[n, m, a, c, e] · B[m, i]
+    // feeds the residual-curvature term of the exact isometry Hessian
+    //   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
+    //             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd}.
+    // Sourced from the base evaluator's object-safe `third_jet_dyn` forwarder
+    // (closed-form analytic override for every basis with an analytic Hessian:
+    // sphere/circle/torus/affine/euclidean/duchon; `None` otherwise — no
+    // finite-difference fallback). Installed only when the penalty
+    // has no `duchon_radial_source` — a Duchon penalty already carries its own
+    // analytic third source and `jacobian_third` would shadow it with this
+    // cache. Always written (Some or None) so a stale K from a prior outer step
+    // never survives a refresh.
+    let jac3_opt = if penalty.duchon_radial_source.is_none() {
+        match evaluator.third_jet_dyn(coords) {
+            Some(third) => {
+                let t3 = third?;
+                if t3.dim() != (n_obs, m, d, d, d) {
+                    return Err(format!(
+                        "refresh_isometry_caches_from_atom: evaluator third jet has shape {:?}, expected ({n_obs}, {m}, {d}, {d}, {d})",
+                        t3.dim()
+                    ));
+                }
+                let mut jac3 = Array3::<f64>::zeros((n_obs, p, d * d * d));
+                for n in 0..n_obs {
+                    for i in 0..p {
+                        for a in 0..d {
+                            for c in 0..d {
+                                for e in 0..d {
+                                    let mut acc = 0.0;
+                                    for mm in 0..m {
+                                        acc += t3[[n, mm, a, c, e]] * b[[mm, i]];
+                                    }
+                                    jac3[[n, i, ((a * d) + c) * d + e]] = acc;
+                                }
                             }
                         }
                     }
                 }
+                Some(Arc::new(jac3))
             }
-            for c in 0..d {
-                for e in 0..d {
-                    let mut acc = 0.0;
-                    for metric_row in 0..(d * d) {
-                        acc +=
-                            metric_coord_jac[[metric_row, c]] * metric_coord_jac[[metric_row, e]];
-                    }
-                    sys.rows[row].htt[[row_off + c, row_off + e]] += mu * acc;
-                }
-                if !couple_cross_block {
-                    continue;
-                }
-                for beta_col in 0..beta_block {
-                    let mut acc = 0.0;
-                    for metric_row in 0..(d * d) {
-                        acc += metric_coord_jac[[metric_row, c]]
-                            * metric_beta_jac[[metric_row, beta_col]];
-                    }
-                    if let Some(projection) = factored_row_projection {
-                        let basis_col = beta_col / p;
-                        let output = beta_col % p;
-                        let c_base = projection.border_offsets[atom_idx]
-                            + basis_col * projection.ranks[atom_idx];
-                        let mut hrow = sys.rows[row].htbeta.row_mut(row_off + c);
-                        let hrow_slice = hrow.as_slice_mut().expect("htbeta row is contiguous");
-                        projection.accumulate_output_project(
-                            atom_idx,
-                            c_base,
-                            output,
-                            mu * acc,
-                            hrow_slice,
-                        );
-                    } else {
-                        sys.rows[row].htbeta[[row_off + c, beta_off + beta_col]] += mu * acc;
-                    }
-                    wrote_dense_cross = true;
-                }
-            }
+            None => None,
         }
-        if wrote_dense_cross {
-            sys.activate_dense_htbeta_supplement();
-        }
-    }
+    } else {
+        None
+    };
 
-    fn sae_isometry_weighted_jacobian_row(
-        corrected: &IsometryPenalty,
-        jac: &Array2<f64>,
-        row: usize,
-        p: usize,
-        d: usize,
-    ) -> Option<Array2<f64>> {
-        match &corrected.weight {
-            WeightField::Identity => {
-                let mut out = Array2::<f64>::zeros((p, d));
-                for i in 0..p {
-                    for a in 0..d {
-                        out[[i, a]] = jac[[row, i * d + a]];
-                    }
-                }
-                Some(out)
-            }
-            WeightField::Factored { u, rank, p_out } => {
-                if *p_out != p || u.nrows() != jac.nrows() || u.ncols() != p * *rank {
-                    return None;
-                }
-                let mut projected = Array2::<f64>::zeros((*rank, d));
-                for weight_axis in 0..*rank {
-                    for a in 0..d {
-                        let mut acc = 0.0;
-                        for i in 0..p {
-                            acc += u[[row, i * *rank + weight_axis]] * jac[[row, i * d + a]];
-                        }
-                        projected[[weight_axis, a]] = acc;
-                    }
-                }
-                let mut out = Array2::<f64>::zeros((p, d));
-                for i in 0..p {
-                    for a in 0..d {
-                        let mut acc = 0.0;
-                        for weight_axis in 0..*rank {
-                            acc += u[[row, i * *rank + weight_axis]] * projected[[weight_axis, a]];
-                        }
-                        out[[i, a]] = acc;
-                    }
-                }
-                Some(out)
-            }
-        }
-    }
+    let installed = jac2_opt.is_some();
+    penalty.refresh_caches(Some(Arc::new(jac)), jac2_opt);
+    penalty.set_third_decoder_derivative(jac3_opt);
+    Ok(installed)
+}
 
-    /// Accumulate the isometry penalty's decoder-block gradient `∂P/∂B` into the
-    /// β-tier `gb` and its decoder-block Gauss-Newton majorizer into `hbb`. The
-    /// isometry value
-    ///   `P = ½ μ Σ_n ‖J_nᵀ W J_n − G_ref‖²_F`
-    /// is a function of the model Jacobian `J_n[i, a] = Σ_m (∂Φ/∂t)[n, m, a]·B[m, i]`,
-    /// so it depends on the decoder `B` as well as the latent coords `t`. The
-    /// penalty exposes `∂P/∂J` (shape `(n_obs, p·d)`, layout `[n, i·d + a]`) via
-    /// [`IsometryPenalty::grad_jacobian`]; the chain rule through
-    /// `∂J[n, i·d + a]/∂B[m, i] = (∂Φ/∂t)[n, m, a]` gives
-    ///   `∂P/∂B[m, i] = Σ_n Σ_a (∂P/∂J)[n, i·d + a] · (∂Φ/∂t)[n, m, a]`.
-    /// Since `J` is linear in `B`, the PSD decoder curvature is the exact
-    /// pullback of the J-space Gauss-Newton block:
-    ///   `Σ_n jet[n,m,a] · B_GN^J[n,(i,a),(i',a')] · jet[n,m',a']`.
-    /// This drops only the indefinite residual-curvature term, matching the
-    /// file-wide PSD-majorizer convention for Newton / Arrow-Schur blocks.
-    /// The flat β layout is `β[beta_offsets[k] + m·p + i] = B_k[m, i]`, so each
-    /// atom's contribution lands in its own decoder span. The isometry penalty is
-    /// unscaled at the row-block (Psi) tier — mirroring its coord-block routing
-    /// and `analytic_penalty_value_total` — so no `penalty_scale` is applied here.
-    fn add_sae_isometry_beta_penalty(
-        &self,
-        sys: &mut ArrowSchurSystem,
-        atom_idx: usize,
-        coord: &LatentCoordValues,
-        corrected: &Arc<IsometryPenalty>,
-        rho_local: ArrayView1<'_, f64>,
-        dense_beta_curvature: bool,
-    ) {
-        let atom = &self.atoms[atom_idx];
-        let d = coord.latent_dim();
-        let p = atom.decoder_coefficients.ncols();
-        let m = atom.basis_size();
-        let n_obs = coord.n_obs();
-        let grad_jac = corrected.grad_jacobian(coord.as_flat().view(), rho_local);
-        if grad_jac.dim() != (n_obs, p * d) {
-            return;
-        }
-        let jet = &atom.basis_jacobian;
-        let beta_off = self.beta_offsets()[atom_idx];
-        for basis_col in 0..m {
-            for i in 0..p {
-                let mut acc = 0.0;
-                for n in 0..n_obs {
-                    for a in 0..d {
-                        acc += grad_jac[[n, i * d + a]] * jet[[n, basis_col, a]];
-                    }
-                }
-                sys.gb[beta_off + basis_col * p + i] += acc;
-            }
-        }
-        if !dense_beta_curvature {
-            return;
-        }
-        let Some(jac) = corrected.jacobian_cache() else {
-            return;
+
+/// Walk an [`AnalyticPenaltyRegistry`] and refresh every Isometry penalty
+/// against the SAE atom it owns. The alignment rule is positional within each
+/// `(latent_dim, p_out)` signature: the penalty's `target.latent_dim` must
+/// equal the atom's `latent_dim` AND the penalty's `p_out` must equal the
+/// atom's decoder column count `p`. Multi-atom configurations install one
+/// isometry penalty per atom, so the *k*-th isometry penalty matching a given
+/// signature is paired with the *k*-th atom matching that same signature. This
+/// reduces to the unambiguous single-atom/single-penalty case wired by
+/// `solver/workflow.rs`, and never collapses multiple penalties onto the first
+/// matching atom (which would leave every later atom's coords un-refreshed).
+///
+/// Returns the number of penalties that got both caches populated (i.e. the
+/// number of atoms whose `basis_second_jet` slot holds a
+/// [`SaeBasisSecondJet`] implementation supplying the analytic Hessian).
+pub fn refresh_isometry_caches_from_term(
+    registry: &AnalyticPenaltyRegistry,
+    term: &SaeManifoldTerm,
+    coords_per_atom: &[Array2<f64>],
+) -> Result<usize, String> {
+    if coords_per_atom.len() != term.atoms.len() {
+        return Err(format!(
+            "refresh_isometry_caches_from_term: coords_per_atom length {} != number of atoms {}",
+            coords_per_atom.len(),
+            term.atoms.len()
+        ));
+    }
+    let mut refreshed_with_second = 0usize;
+    // Per-signature cursor: how many atoms matching a given (latent_dim, p_out)
+    // have already been consumed by earlier isometry penalties. Pairing the
+    // k-th penalty of a signature with the k-th atom of that signature gives a
+    // stable one-to-one mapping for multi-atom configs.
+    let mut consumed_per_signature: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+    for entry in registry.penalties.iter() {
+        let AnalyticPenaltyKind::Isometry(p) = entry else {
+            continue;
         };
-        if jac.dim() != (n_obs, p * d) {
-            return;
-        }
-        let mut weighted_jacobian_rows = Vec::with_capacity(n_obs);
-        for n in 0..n_obs {
-            let Some(wj) = Self::sae_isometry_weighted_jacobian_row(corrected, &jac, n, p, d)
-            else {
-                return;
-            };
-            weighted_jacobian_rows.push(wj);
-        }
-        // Resolve the learnable isometry strength `scalar_weight · exp(rho)` in
-        // log-space with a clamped exponent: the naive `scalar_weight *
-        // rho.exp()` overflows to `inf` for `rho ≳ 709`, and the downstream
-        // `inf · jacobian` / `inf · 0.0` then injects NaN into the GN curvature
-        // block and β-penalty, poisoning the joint solve (#742, Issue 4).
-        let mu = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
-        let mut metric_jvp = Array2::<f64>::zeros((d, d));
-        let mut jac_hvp = Array2::<f64>::zeros((p, d));
-        let mut beta_hvp = Array2::<f64>::zeros((m, p));
-        for probe_basis_col in 0..m {
-            for probe_output in 0..p {
-                beta_hvp.fill(0.0);
-                for n in 0..n_obs {
-                    let wj = &weighted_jacobian_rows[n];
-                    metric_jvp.fill(0.0);
-                    for a in 0..d {
-                        let probe_jet_a = jet[[n, probe_basis_col, a]];
-                        for b in 0..d {
-                            metric_jvp[[a, b]] = probe_jet_a * wj[[probe_output, b]]
-                                + wj[[probe_output, a]] * jet[[n, probe_basis_col, b]];
-                        }
-                    }
-                    jac_hvp.fill(0.0);
-                    for i in 0..p {
-                        for c in 0..d {
-                            let mut acc = 0.0;
-                            for b in 0..d {
-                                acc += metric_jvp[[c, b]] * wj[[i, b]];
-                            }
-                            for a in 0..d {
-                                acc += metric_jvp[[a, c]] * wj[[i, a]];
-                            }
-                            jac_hvp[[i, c]] = mu * acc;
-                        }
-                    }
-                    for basis_row in 0..m {
-                        for i in 0..p {
-                            let mut acc = 0.0;
-                            for a in 0..d {
-                                acc += jac_hvp[[i, a]] * jet[[n, basis_row, a]];
-                            }
-                            beta_hvp[[basis_row, i]] += acc;
-                        }
-                    }
-                }
-                let beta_col = beta_off + probe_basis_col * p + probe_output;
-                for basis_row in 0..m {
-                    for i in 0..p {
-                        sys.hbb[[beta_off + basis_row * p + i, beta_col]] +=
-                            beta_hvp[[basis_row, i]];
-                    }
-                }
+        let Some(p_latent_dim) = p.target.latent_dim else {
+            continue;
+        };
+        let signature = (p_latent_dim, p.p_out);
+        let already_consumed = consumed_per_signature.entry(signature).or_insert(0);
+        // Advance to the (already_consumed)-th atom matching this signature.
+        let mut seen = 0usize;
+        let mut paired: Option<usize> = None;
+        for (atom_idx, atom) in term.atoms.iter().enumerate() {
+            let matches = atom.latent_dim == p_latent_dim
+                && atom.decoder_coefficients.ncols() == p.p_out
+                && atom.basis_evaluator.is_some();
+            if !matches {
+                continue;
             }
+            if seen == *already_consumed {
+                paired = Some(atom_idx);
+                break;
+            }
+            seen += 1;
+        }
+        let Some(atom_idx) = paired else {
+            continue;
+        };
+        *already_consumed += 1;
+        let atom = &term.atoms[atom_idx];
+        let coords = coords_per_atom[atom_idx].view();
+        if refresh_isometry_caches_from_atom(p, atom, coords)? {
+            refreshed_with_second += 1;
         }
     }
-
+    Ok(refreshed_with_second)
 }

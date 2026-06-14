@@ -10,6 +10,10 @@ configure_device(Device::Cuda);
 
 Python callers can pass `{"device": "cuda"}` through the `config` dict; `device="cpu"` is the default. The `gpu` config string controls policy logging and auto/force/off behavior, while `device` controls the actual solver dispatch.
 
+Install `gamfit[cuda]` on Linux x86_64 when you want PyPI's NVIDIA CUDA
+12 runtime libraries in the environment. CPU-only installs can still
+import gamfit; CUDA probing happens lazily at runtime.
+
 ## Accelerated Paths
 
 `src/solver/gpu/pirls_gpu.rs` owns the dense PIRLS Newton step. It uploads the dense design and working weights through pinned host buffers, scales rows with cuBLAS `Ddgmm`, forms `X'WX` with cuBLAS `Dgemm`, adds the penalty Hessian with cuBLAS `Dgeam`, and factors the penalized Hessian with cuSOLVER `Dpotrf`. Newton directions use cuSOLVER `Dpotrs`; the log determinant is read from the Cholesky diagonal.
@@ -18,7 +22,15 @@ Python callers can pass `{"device": "cuda"}` through the `config` dict; `device=
 
 `src/solver/gpu/arrow_schur_gpu.rs` owns the arrow-Schur latent-coordinate CUDA helpers. Dense Direct/SqrtBA solves use CUDA row-block Cholesky, Schur accumulation into the shared beta block, cuSOLVER for the reduced beta step, and row-local GPU back-substitution. Large matrix-free systems use the GPU Schur matvec hook instead of forming a dense shared beta factor.
 
-`src/gpu/bms_flex_row.rs` owns the Bernoulli marginal-slope FLEX row-primary Hessian assembly. When `crate::gpu::bms_flex::row_primary_hessian_decision(n, r).use_gpu` is true and the latent measure is standard-normal, `build_row_primary_hessian_cache` in `src/families/bernoulli_marginal_slope.rs` packs per-row cell coefficient families (`cell_a`, `cell_aa`, `cell_r`, `cell_ar`, `cell_sbb`, `cell_sbh`, `cell_sbw`), the per-cell derivative moments produced by `src/gpu/cubic_cell/mod.rs`, the per-row scalars (`q`, `b`, `μ_1`, `μ_2`, `z_obs`, `y`, `w`), and the pre-evaluated observed-point terms (`chi_obs`, `xi_obs`, `rho_u`, `tau_u`, `r_uv`) into a `BmsFlexRowKernelInputs` SoA bundle and calls `launch_bms_flex_row_kernel`. The kernel runs one CUDA block per row, 32 threads parallelising the per-cell moment contractions `D(R) = κ·Σ_k R_k·m_k` and `H(R,S,U) = κ·(D(U) − Σ_{p,q} R_p·S_q·T_{p+q})` (`κ = 1/(2π)`); thread 0 finalises the implicit-function-theorem solve and the observed-point Mills assembly. The kernel writes the symmetric `n × r²` row Hessian directly back into the host-pinned `RowPrimaryHessianPin`.
+`src/families/bms/gpu/` owns the Bernoulli marginal-slope FLEX
+row-primary Hessian assembly. When
+`row_primary_hessian_decision(n, r).use_gpu` is true and the latent
+measure is standard-normal, the BMS row path packs per-row cell
+coefficient families, derivative moments, row scalars, and observed
+point terms into a structure-of-arrays bundle and launches the FLEX row
+kernel. The kernel runs one CUDA block per row, parallelises the per-cell
+moment contractions, finalises the implicit-function-theorem solve, and
+writes the symmetric row Hessian back to host-pinned storage.
 
 ## Dispatch
 
@@ -34,13 +46,25 @@ The solver runtime switch is:
 crate::solver::gpu::configure_device(crate::solver::gpu::Device::Cuda);
 ```
 
-The dense PIRLS path checks `cuda_selected()` before CPU `X'WX` assembly and before the stable dense Newton solve. The dense HVP evidence logdet also checks the same runtime switch before falling back to CPU eigendecomposition. Arrow-Schur selects dense CUDA helpers for dense Direct/SqrtBA solves and the GPU Schur matvec hook for large matrix-free PCG systems. The BMS marginal-slope FLEX row-Hessian path consults `row_primary_hessian_decision(n, r)` (threshold `row_kernel_min_n = 50_000`, default in `src/gpu/policy.rs`); any GPU error under `gpu=auto` falls back to the existing CPU rayon row loop, while `gpu=force` propagates the error.
+The dense PIRLS path checks `cuda_selected()` before CPU `X'WX`
+assembly and before the stable dense Newton solve. The dense HVP
+evidence logdet also checks the same runtime switch before CPU
+eigendecomposition. Arrow-Schur selects dense CUDA helpers for dense
+Direct/SqrtBA solves and the GPU Schur matvec hook for large matrix-free
+PCG systems. The BMS marginal-slope FLEX row-Hessian path consults
+`row_primary_hessian_decision(n, r)`; any GPU error under `gpu=auto`
+returns to the existing CPU rayon row loop, while `gpu=force`
+propagates the error.
 
 ## Transfer And Precision Policy
 
 Host-to-device copies use cudarc pinned allocations and a CUDA stream. The current operations are dependency ordered on one stream because `Ddgmm -> Dgemm -> Dgeam -> Dpotrf -> Dpotrs` is a true data dependency chain. Large large-scale inputs amortize transfer cost over `O(N p^2)` GEMM and `O(p^3)` factorization work.
 
-The production solve keeps Hessian assembly, factorization, master weights, and REML traces in `f64` to preserve CPU parity. The GPU dispatch policy currently defaults mixed precision to `Off`, and the solver boundary uses `f64` before any Cholesky or evidence derivative is evaluated.
+The production solve keeps Hessian assembly, factorization, master
+weights, and REML traces in `f64` to preserve CPU parity. The GPU
+dispatch policy defaults mixed precision to refinement: lower-precision
+work is accepted only behind residual/refinement checks, and the solver
+boundary uses `f64` before Cholesky or evidence derivatives are exposed.
 
 ## Benchmarks
 

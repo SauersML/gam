@@ -29,6 +29,15 @@ enum (`model_type` plus `payload`; the Rust save path writes it with
 
 It does not contain the training data.
 
+Saved model payloads cover the current Python-facing model classes:
+standard scalar GAMs, location-scale / dispersion fits, survival
+transformation / Weibull / location-scale / marginal-slope / latent
+models, transformation-normal models, Bernoulli marginal-slope models,
+multinomial models, and competing-risks prediction payloads. The saved
+schema also records the training table kind so a loaded model preserves
+the same default prediction container policy for ambiguous dict/list
+inputs.
+
 After loading, every method works as on the original model:
 
 ```python

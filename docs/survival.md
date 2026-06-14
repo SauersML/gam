@@ -11,7 +11,7 @@ parameterised.
 gamfit.fit(df, "Surv(entry, exit, event) ~ age + s(bmi)")
 ```
 
-The three arguments are column names:
+The usual three-argument form names:
 
 - `entry`: left-truncation time. Use `0` if there is no truncation.
 - `exit`: observation time (event time or censoring time).
@@ -21,9 +21,22 @@ The three arguments are column names:
 
 All three columns must be numeric. Negative or non-finite times are
 rejected; zero times are accepted and internally floored, and `exit` is
-advanced to at least `entry + 1e-9` during fitting/prediction. The
-2-column R/mgcv form `Surv(time, status)` is rejected with an error
-message that suggests adding a zero `entry` column.
+advanced to at least `entry + 1e-9` during fitting/prediction.
+
+The right-censored shorthand `Surv(time, event)` is also accepted and is
+lowered to `Surv(0, time, event)` with a synthetic zero-entry column.
+
+Interval-censored responses use a distinct spelling:
+
+```python
+gamfit.fit(df, "SurvInterval(left, right, event) ~ s(age)",
+           survival_likelihood="latent")
+```
+
+`SurvInterval(L, R, event)` observes a bracket `T in (L, R]`.
+Bracketed rows require finite `R >= L`. This path is dedicated to the
+latent interval-censored likelihood and is not the same as
+left-truncated `Surv(entry, exit, event)`.
 
 ## Likelihood modes
 
@@ -133,6 +146,12 @@ F = 1.0 - pred.survival_at([10, 20])
 h = pred.hazard_at([1, 5, 10, 20])
 H = pred.cumulative_hazard_at([10, 20])
 ```
+
+Restricted mean survival time (RMST) is the area under the survival
+curve up to `tau`. In Python, evaluate `pred.survival_at(grid)` and
+integrate over the grid you choose; the Rust survival prediction result
+also carries a `restricted_mean_survival_time(tau)` helper for native
+callers.
 
 For dense surfaces on large cohorts use the chunked iterators or stream
 to CSV:

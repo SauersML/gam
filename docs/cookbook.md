@@ -9,13 +9,13 @@ import gamfit
 import pandas as pd
 
 train = pd.DataFrame({
-    "y": [1.2, 1.9, 3.1, 4.5, 5.2, 6.3],
-    "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+    "y": [1.2, 1.9, 3.1, 4.5, 5.2, 6.3, 7.1, 7.8, 8.0, 7.7, 7.2, 6.5],
+    "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
 })
 
 model = gamfit.fit(train, "y ~ s(x)")
 preds = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)
-# columns: eta, mean, effective_se, mean_lower, mean_upper
+# columns: linear_predictor, mean, std_error, mean_lower, mean_upper
 ```
 
 ## Validate a formula before fitting
@@ -358,6 +358,20 @@ gs.fit(X, y)
 model.report("report.html")     # writes to disk
 html = model.report()           # returns the string for inline display
 ```
+
+## Example index
+
+Focused demos live under `examples/`:
+
+| Area | Examples |
+| --- | --- |
+| Manifold / SAE | `sae_manifold_demo.py`, `sae_manifold_uncertainty.py`, `sae_manifold_ibp_topology_atoms.py`, `topology_selection_demo.py` |
+| Torch | `torch_autograd_sae_training_demo.py` and the `gamfit.torch` tests for REML primitives, smooth APIs, and manifold SAE parity |
+| Streaming / scale | `streaming_bspline_demo.py`, `streaming_matern_demo.py`, `streaming_arrow_schur_k100k_demo.py` |
+| Response geometry / topology | `sphere_optimization_demo.py`, `product_torus_demo.py`, `grassmann_subspace_demo.py`, `spd_metric_learning_demo.py` |
+| LLM probes | `olmo_sae_atlas.py`, `olmo_structure_discovery.py`, `layer_transport_maps.py`, `causal_hue_steering.py` |
+
+Performance-oriented Rust examples live under `examples/perf/`.
 
 ## Per-group trajectories (factor by smooth)
 

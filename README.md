@@ -18,8 +18,9 @@ Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>
 ## Scope
 
 Supported response families: Gaussian, binomial / Bernoulli (including a
-marginal-slope variant for calibrated risk scores), Poisson, Gamma, and
-parametric / semi-parametric survival.
+marginal-slope variant for calibrated risk scores), Poisson,
+negative-binomial, Gamma, Beta, Tweedie, multinomial-logit, conditional
+transformation-normal, and parametric / semi-parametric survival.
 
 Supported term types in formulas: parametric terms, univariate smooths
 (`s`), tensor-product smooths (`te`, `ti`), radial smooths in arbitrary
@@ -45,7 +46,8 @@ pip install gamfit
 ```
 
 Optional extras: `gamfit[pandas]`, `gamfit[plot]`, `gamfit[sklearn]`,
-`gamfit[torch]`, `gamfit[all]`.
+`gamfit[cuda]`, `gamfit[all]`. PyTorch is optional but is installed as
+the `torch` package itself; there is no `gamfit[torch]` package extra.
 
 For the Rust CLI:
 
@@ -69,7 +71,7 @@ CLI:
 
 ```bash
 gam fit data.csv 'y ~ smooth(x) + group(site)' --out model.json
-gam predict model.json new_data.csv --uncertainty
+gam predict model.json new_data.csv --out predictions.csv --uncertainty
 gam report model.json data.csv
 ```
 
@@ -241,7 +243,8 @@ whichever `libcudart.so.12` is reachable.
 | `docs/` | MkDocs/Material documentation sources. |
 | `tests/` | Rust and Python integration tests. |
 | `bench/` | Benchmark harness, configs, datasets, plots. |
-| `scripts/` | Demo and diagnostic scripts, including the manifold smooths gallery. |
+| `examples/` | Python and Rust demos, including SAE and topology examples. |
+| `scripts/` | Documentation figure, gallery, and diagnostic scripts. |
 
 ## Development
 
@@ -255,7 +258,8 @@ uv pip install --python .venv-docs/bin/python -r docs/requirements.txt
 .venv-docs/bin/mkdocs serve
 ```
 
-Benchmarks: `python3 bench/run_suite.py --help`.
+Benchmarks: `python3 bench/run_suite.py --help` for the suite runner or
+`python3 bench/run.py --help` for the current benchmark entrypoint.
 
 ## Documentation
 

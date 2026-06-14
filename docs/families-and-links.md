@@ -1,9 +1,9 @@
 # Families and link functions
 
 `gamfit` supports Gaussian, binomial, Poisson, negative-binomial, beta,
-Gamma, and Royston-Parmar likelihoods, plus survival ([survival.md](survival.md)),
-conditional transformation-normal ([marginal-slope.md](marginal-slope.md)),
-location-scale ([location-scale.md](location-scale.md)) and
+Gamma, Tweedie, multinomial-logit, and Royston-Parmar likelihoods, plus
+survival ([survival.md](survival.md)), conditional transformation-normal,
+location-scale / dispersion ([location-scale.md](location-scale.md)) and
 marginal-slope families. The family is inferred from the response unless
 overridden via `family=`.
 
@@ -30,7 +30,8 @@ gamfit.fit(df, "y ~ s(x)", family="poisson", link="log")  # explicit
 The `family=` kwarg accepts `"gaussian"`, `"binomial"` (aliases
 `"binomial-logit"`, `"binomial-probit"`, `"binomial-cloglog"`),
 `"latent-cloglog-binomial"`, `"poisson"`, `"negative-binomial"`,
-`"beta"`, and `"gamma"`. Omitting
+`"beta"`, `"gamma"`, `"tweedie"`, `"royston-parmar"`, and
+`"multinomial"` / `"softmax"`. Omitting
 `family=` triggers auto-detection. Survival, transformation-normal,
 and Bernoulli marginal-slope families are selected via `Surv(...)` or
 dedicated fit options (Python: `transformation_normal=True`,
@@ -78,6 +79,33 @@ gamfit.fit(df, "count ~ s(time)",
 ```
 
 Pass the offset column via `offset=`; do not include it on the formula RHS.
+
+### Dispersion families
+
+Gamma, Beta, negative-binomial, and Tweedie can be fit as ordinary
+mean models or as two-submodel dispersion fits with `noise_formula=`.
+For the dispersion path, the secondary formula models Gamma shape, Beta
+precision, negative-binomial size, or Tweedie inverse dispersion.
+
+```python
+gamfit.fit(df, "rate ~ s(age)", family="negative-binomial", link="log")
+gamfit.fit(df, "prop ~ s(x)", family="beta", noise_formula="s(x)")
+gamfit.fit(df, "claim ~ te(age, year)", family="tweedie", link="log")
+```
+
+`negative_binomial_theta` / `--negative-binomial-theta` fixes the
+negative-binomial size parameter when a constant-size model is desired.
+
+### Multinomial
+
+Use `family="multinomial"` (aliases `"multinomial-logit"`,
+`"categorical"`, `"categorical-logit"`, `"softmax"`) for a vector
+softmax model. The Python API returns a `MultinomialModel`; scalar
+`Model.predict` details do not apply to that class.
+
+`gamfit.fit(..., family="multinomial")` dispatches to the dedicated
+multinomial formula path. `gamfit.validate_formula(...)` uses the scalar
+materialization preflight, so it is not a multinomial validator.
 
 ### `sas`
 

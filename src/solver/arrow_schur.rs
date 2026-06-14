@@ -90,6 +90,28 @@
 //! find yourself extending `ArrowSchurSystem` with an outer-REML gradient
 //! hook, re-read the inner/outer cost split documented above first.
 
-// Split from the original oversized module; keep included in order.
-include!("arrow_schur_penalty_ops_and_newton.rs");
-include!("arrow_schur_reduced_solve_and_tests.rs");
+// Re-modularized into real concern submodules under `arrow_schur/`. The shared
+// external imports, tuning constants, and function-pointer aliases live in
+// `primitives`; every other module pulls them in through `use super::*;`. The
+// parent re-exports each module's surface so the long-standing
+// `crate::solver::arrow_schur::<Item>` paths used across the crate keep
+// resolving unchanged.
+
+mod factorization;
+mod newton_step;
+mod penalty_ops;
+mod primitives;
+mod reduced_solve;
+mod solve_options;
+mod system;
+
+#[cfg(test)]
+mod tests;
+
+pub use factorization::*;
+pub use newton_step::*;
+pub use penalty_ops::*;
+pub use primitives::*;
+pub use reduced_solve::*;
+pub use solve_options::*;
+pub use system::*;

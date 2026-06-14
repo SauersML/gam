@@ -5,11 +5,12 @@ location-scale GAM additionally models a second parameter — the
 log-scale of the response distribution — as its own smooth function of
 covariates.
 
-The engine implements two-parameter location-scale fits for Gaussian
-responses (mean and scale), Binomial responses (threshold and scale),
-and survival responses (time/threshold survival index and scale). It is
-not a full multi-parameter GAMLSS
-implementation: no separate skewness or kurtosis submodels.
+The engine implements two-parameter location-scale / dispersion fits for
+Gaussian responses (mean and scale), Binomial responses (threshold and
+scale), Gamma / Beta / negative-binomial / Tweedie responses (mean and
+dispersion), and survival responses (time/threshold survival index and
+scale). It is not a full arbitrary-parameter GAMLSS implementation: no
+separate skewness or kurtosis submodels.
 
 Use it when:
 
@@ -45,6 +46,8 @@ This is supported for:
 - Binomial location-scale: joint threshold and scale. The default
   inverse link is logit; explicit links such as probit/cloglog use the
   same threshold-scale parameterization.
+- Dispersion GAMLSS: Gamma shape, Beta precision, negative-binomial
+  size, and Tweedie inverse-dispersion submodels.
 - Survival location-scale: pair with `survival_likelihood="location-scale"`:
 
 ```python
@@ -66,13 +69,15 @@ as a standard Gaussian fit:
 
 ```python
 preds = model.predict(test_df, interval=0.95)
-# Columns: eta, mean, effective_se, effective_variance, mean_lower, mean_upper
+# Columns: linear_predictor, mean, noise_scale, std_error, mean_lower, mean_upper
 ```
 
-`effective_se` is the delta-method standard error on the linear
-predictor, and `effective_variance` is its square. `mean_lower` /
-`mean_upper` are response-scale pointwise Wald bands at the requested
-`interval`.
+`noise_scale` is the fitted scale / dispersion channel on the response
+model's natural scale. `std_error` is the response-scale delta-method
+standard error. `mean_lower` / `mean_upper` are response-scale pointwise
+Wald bands at the requested `interval`. Without `interval=`, standard
+point-payload models return a 1-D NumPy array of response-scale point
+predictions.
 
 For survival location-scale, predictions return a
 [`SurvivalPrediction`](predictions.md#survivalprediction). Pass any

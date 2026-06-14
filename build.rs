@@ -3075,12 +3075,16 @@ fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, u
             .expect("git ls-files emitted a non-UTF-8 path; repository paths must be UTF-8");
         let rel = PathBuf::from(&rel_text);
         let path = root.join(&rel);
-        let bytes = fs::read(&path).unwrap_or_else(|e| {
-            panic!(
-                "failed to read tracked file for line-count audit: {}: {e}",
-                rel.display()
-            )
-        });
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                panic!(
+                    "failed to read tracked file for line-count audit: {}: {err}",
+                    rel.display()
+                )
+            }
+        };
         let line_count = bytes.iter().filter(|byte| **byte == b'\n').count();
         if line_count > MAX_TRACKED_FILE_LINES {
             offenders.push((

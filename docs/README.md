@@ -5,7 +5,8 @@ engine. REML / LAML smoothing, NUTS or Gaussian Laplace posteriors,
 survival, location-scale, and flexible links in one API.
 
 `gamfit` fits Gaussian, binomial (including Bernoulli marginal-slope),
-Poisson, and Gamma GLMs with smooth terms, random effects,
+Poisson, negative-binomial, Gamma, Beta, Tweedie, and multinomial GLMs
+with smooth terms, random effects,
 bounded/constrained coefficients, location-scale extensions, survival
 likelihoods, and flexible/learnable links. Smoothing parameters are
 selected by REML or LAML. Posterior sampling uses NUTS where supported,
@@ -23,6 +24,8 @@ Starting out
   understand the return value.
 - [Data input formats](data-input.md) — pandas, polars, pyarrow, numpy,
   dict of columns, list of records.
+- [CLI reference](cli.md) — `gam fit`, `predict`, `diagnose`, `sample`,
+  `generate`, and `report`.
 
 Building a model
 
@@ -59,7 +62,8 @@ Using a fitted model
 
 Reference
 
-- [Full API reference](api-reference.md) — every public symbol.
+- [Full API reference](api-reference.md) — public Python symbols and
+  smooth descriptors.
 - [Exceptions](exceptions.md) — exception hierarchy and
   `explain_error()`.
 - [Cookbook](cookbook.md) — runnable examples verified against the test
@@ -104,5 +108,3 @@ posterior.save("posterior.npz")
 ## License
 
 AGPL-3.0-or-later. See [LICENSE on GitHub](https://github.com/SauersML/gam/blob/main/LICENSE).
-
-- [Difference smooths](difference-smooths.md)

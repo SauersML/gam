@@ -1,71 +1,71 @@
 use super::*;
 
 
-const TK_BLOCK_SIZE: usize = 128;
+pub(crate) const TK_BLOCK_SIZE: usize = 128;
 
 /// Upper bound on the parallel row-chunk length for the TK accumulation, so a
 /// large `n / (4·threads)` split does not produce chunks so coarse that load
 /// balancing across rayon workers suffers. Pairs with the [`TK_BLOCK_SIZE`]
 /// lower bound. The `4×` oversubscription on the thread count keeps each worker
 /// fed with several chunks for work stealing.
-const TK_CHUNK_MAX_ROWS: usize = 2048;
+pub(crate) const TK_CHUNK_MAX_ROWS: usize = 2048;
 
-const TK_CHUNK_OVERSUBSCRIBE: usize = 4;
+pub(crate) const TK_CHUNK_OVERSUBSCRIBE: usize = 4;
 
-const TK_MAX_OBSERVATIONS: usize = 20_000;
+pub(crate) const TK_MAX_OBSERVATIONS: usize = 20_000;
 
-const TK_MAX_COEFFICIENTS: usize = 2_000;
+pub(crate) const TK_MAX_COEFFICIENTS: usize = 2_000;
 
-const ADAPTIVE_KKT_ETA: f64 = 0.1;
+pub(crate) const ADAPTIVE_KKT_ETA: f64 = 0.1;
 
-const ADAPTIVE_KKT_FLOOR_REML_DIVISOR: f64 = 100.0;
+pub(crate) const ADAPTIVE_KKT_FLOOR_REML_DIVISOR: f64 = 100.0;
 
-const TK_MAX_DENSE_WORK: usize = 5_000_000;
+pub(crate) const TK_MAX_DENSE_WORK: usize = 5_000_000;
 
 // `n * p` catches bam-shaped tall designs while avoiding small-n wide problems.
-const LARGE_N_EFS_THRESHOLD: f64 = 1.0e8;
+pub(crate) const LARGE_N_EFS_THRESHOLD: f64 = 1.0e8;
 
-const EFS_SINGLE_LOOP_PIRLS_SWEEPS: usize = 2;
+pub(crate) const EFS_SINGLE_LOOP_PIRLS_SWEEPS: usize = 2;
 
-const EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL: usize = usize::MAX / 4;
+pub(crate) const EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL: usize = usize::MAX / 4;
 
 // Bail after 3 consecutive iterations whose surrogate/partial-inner drift is >= 10%.
-const EFS_SINGLE_LOOP_BIAS_THRESHOLD: f64 = 0.10;
+pub(crate) const EFS_SINGLE_LOOP_BIAS_THRESHOLD: f64 = 0.10;
 
-const EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT: usize = 3;
+pub(crate) const EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT: usize = 3;
 
-const HGB_INNER_FLOOR: f64 = 1e-12;
+pub(crate) const HGB_INNER_FLOOR: f64 = 1e-12;
 
-const HGB_LINEAR_FLOOR: f64 = 1e-12;
+pub(crate) const HGB_LINEAR_FLOOR: f64 = 1e-12;
 
-const HGB_TRACE_FLOOR: f64 = 1e-12;
+pub(crate) const HGB_TRACE_FLOOR: f64 = 1e-12;
 
-const HGB_HISTORY_CAP: usize = 10;
+pub(crate) const HGB_HISTORY_CAP: usize = 10;
 
-const HGB_WARMUP_ITERS_MIN: usize = 3;
+pub(crate) const HGB_WARMUP_ITERS_MIN: usize = 3;
 
-const HGB_WARMUP_ITERS_MAX: usize = 10;
+pub(crate) const HGB_WARMUP_ITERS_MAX: usize = 10;
 
-const HGB_TARGET_FRACTION: f64 = 0.1;
+pub(crate) const HGB_TARGET_FRACTION: f64 = 0.1;
 
 // Treat log-lambda finite differences as local only up to a 1.0 log-scale step.
-const HGB_FD_DRHO_MAX_SQUARED: f64 = 1.0;
+pub(crate) const HGB_FD_DRHO_MAX_SQUARED: f64 = 1.0;
 
-const HGB_MIN_PAIRS_FOR_SENSITIVITY: usize = 3;
+pub(crate) const HGB_MIN_PAIRS_FOR_SENSITIVITY: usize = 3;
 
-const HGB_REGRESSION_RIDGE: f64 = 1e-6;
+pub(crate) const HGB_REGRESSION_RIDGE: f64 = 1e-6;
 
-const HGB_SENS_STABILITY_RATIO: f64 = 1.5;
+pub(crate) const HGB_SENS_STABILITY_RATIO: f64 = 1.5;
 
-const S_INNER_INIT: f64 = 1.0;
+pub(crate) const S_INNER_INIT: f64 = 1.0;
 
-const S_LINEAR_INIT: f64 = 1.0;
+pub(crate) const S_LINEAR_INIT: f64 = 1.0;
 
-const S_TRACE_INIT: f64 = 1.0;
+pub(crate) const S_TRACE_INIT: f64 = 1.0;
 
-const HGB_SENS_FLOOR: f64 = 1e-6;
+pub(crate) const HGB_SENS_FLOOR: f64 = 1e-6;
 
-const IFT_QUALITY_HISTORY_CAP: usize = 5;
+pub(crate) const IFT_QUALITY_HISTORY_CAP: usize = 5;
 
 
 /// Clamp bound on a linear predictor `eta` so `exp(eta)` cannot overflow f64
@@ -73,7 +73,7 @@ const IFT_QUALITY_HISTORY_CAP: usize = 5;
 /// as a local const because that one is private to the `pirls` module. Used to
 /// detect out-of-range η rows when materializing the logit fifth-derivative
 /// channel (an out-of-range row contributes zero rather than a garbage jet).
-const ETA_OVERFLOW_CLAMP: f64 = 700.0;
+pub(crate) const ETA_OVERFLOW_CLAMP: f64 = 700.0;
 
 
 /// Rolling-quality bands and step-cap adjustment factors for the IFT step-cap
@@ -82,15 +82,15 @@ const ETA_OVERFLOW_CLAMP: f64 = 700.0;
 /// predictions; below `GROW` the linearization is reliably excellent and the cap
 /// is loosened, above `SHRINK` it is tightened, in between it is held. A rolling
 /// quality at or above `FLAT_FALLBACK` flips the predictor to flat warm-start.
-const IFT_QUALITY_GROW_BAND: f64 = 1e-3;
+pub(crate) const IFT_QUALITY_GROW_BAND: f64 = 1e-3;
 
-const IFT_QUALITY_SHRINK_BAND: f64 = 1e-1;
+pub(crate) const IFT_QUALITY_SHRINK_BAND: f64 = 1e-1;
 
-const IFT_QUALITY_FLAT_FALLBACK_BAND: f64 = 0.5;
+pub(crate) const IFT_QUALITY_FLAT_FALLBACK_BAND: f64 = 0.5;
 
-const IFT_STEP_CAP_GROW_FACTOR: f64 = 1.5;
+pub(crate) const IFT_STEP_CAP_GROW_FACTOR: f64 = 1.5;
 
-const IFT_STEP_CAP_SHRINK_FACTOR: f64 = 0.5;
+pub(crate) const IFT_STEP_CAP_SHRINK_FACTOR: f64 = 0.5;
 
 
 // KKT residual acceptance tolerances for the active-set inner solver.
@@ -98,36 +98,36 @@ const IFT_STEP_CAP_SHRINK_FACTOR: f64 = 0.5;
 // barrier-stopping tolerance used in PIRLS); stationarity uses a looser
 // 5e-6 because the gradient is scaled by penalised Hessian curvature
 // that can carry an extra ~order of magnitude of roundoff at convergence.
-const KKT_TOL_PRIMAL: f64 = 1e-7;
+pub(crate) const KKT_TOL_PRIMAL: f64 = 1e-7;
 
-const KKT_TOL_DUAL: f64 = 1e-7;
+pub(crate) const KKT_TOL_DUAL: f64 = 1e-7;
 
-const KKT_TOL_COMP: f64 = 1e-7;
+pub(crate) const KKT_TOL_COMP: f64 = 1e-7;
 
-const KKT_TOL_STAT: f64 = 5e-6;
+pub(crate) const KKT_TOL_STAT: f64 = 5e-6;
 
 
 // Slack threshold below which a linear-inequality constraint Aβ ≥ b is
 // considered active when extracting the constraint-free tangent basis.
 // Chosen ~3 orders of magnitude above f64 roundoff on the dot product so
 // constraints that just-touch within IRLS roundoff are correctly flagged.
-const ACTIVE_CONSTRAINT_SLACK_TOL: f64 = 1e-8;
+pub(crate) const ACTIVE_CONSTRAINT_SLACK_TOL: f64 = 1e-8;
 
 
 // Norm threshold for accepting a Gram–Schmidt residual as a basis
 // direction when orthonormalising active-row vectors / null-space
 // directions. One order of magnitude below ACTIVE_CONSTRAINT_SLACK_TOL
 // because we are comparing squared-norm residuals after subtraction.
-const ORTHONORM_DROP_TOL: f64 = 1e-10;
+pub(crate) const ORTHONORM_DROP_TOL: f64 = 1e-10;
 
 
 #[derive(Debug, Clone)]
-struct AloStabilizationEval {
-    cost: f64,
-    gradient: Option<Array1<f64>>,
-    k_hat: Option<f64>,
-    max_leverage: f64,
-    min_denominator: f64,
+pub(crate) struct AloStabilizationEval {
+    pub(crate) cost: f64,
+    pub(crate) gradient: Option<Array1<f64>>,
+    pub(crate) k_hat: Option<f64>,
+    pub(crate) max_leverage: f64,
+    pub(crate) min_denominator: f64,
 }
 
 
@@ -143,7 +143,7 @@ struct AloStabilizationEval {
 // Below this sample size the leave-one-out leverage estimate is too noisy to
 // distinguish a genuinely influential point from sampling jitter, so the
 // stabilization stays off entirely.
-const ALO_STABILIZATION_MIN_N: usize = 20;
+pub(crate) const ALO_STABILIZATION_MIN_N: usize = 20;
 
 // Effective-dof fraction (edf / n) above which the design is treated as
 // over-parameterized / near-interpolating and the ALO stabilization is
@@ -166,7 +166,7 @@ const ALO_STABILIZATION_MIN_N: usize = 20;
 // were not on identical data. The 0.70 cut leaves genuinely identified,
 // moderately-fit designs (where a few isolated rows carry the high leverage)
 // fully stabilized while excluding the basis-saturation artifact.
-const ALO_EDF_FRACTION_SATURATION: f64 = 0.70;
+pub(crate) const ALO_EDF_FRACTION_SATURATION: f64 = 0.70;
 
 // Fraction of rows that may clear the leverage activation threshold before the
 // high leverage is judged pervasive (a basis-geometry artifact) rather than
@@ -177,7 +177,7 @@ const ALO_EDF_FRACTION_SATURATION: f64 = 0.70;
 // `alo_stabilization_eval`). 0.25 is well above the handful of rows a real
 // outlier cluster produces yet far below the pervasive activation a saturated
 // `te()` basis exhibits.
-const ALO_PERVASIVE_LEVERAGE_FRACTION: f64 = 0.25;
+pub(crate) const ALO_PERVASIVE_LEVERAGE_FRACTION: f64 = 0.25;
 
 // Suppress ALO when every ALO-triggering row is already high-leverage in the
 // exact pure-parametric subdesign. Those directions are unpenalized, so no

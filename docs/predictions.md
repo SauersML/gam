@@ -10,7 +10,10 @@ shape depends on the fitted model class and on the keyword arguments
 model.predict(
     data,
     *,
-    interval: float | None = None,
+    interval: float | str | None = None,
+    conformal_level: float = 0.9,
+    covariance_mode: str | None = None,
+    observation_interval: bool = False,
     return_type: str | None = None,
     id_column: str | None = None,
 )
@@ -19,7 +22,10 @@ model.predict(
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `data` | required | Table-like input matching the training schema. |
-| `interval` | `None` | Single uncertainty knob (issue #342). `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. On standard GLMs / location-scale this populates `std_error`, `mean_lower`, `mean_upper`. On survival location-scale it populates `survival_se` and `eta_se` on the returned `SurvivalPrediction`. Other survival likelihoods and competing-risks reject any non-`None` value at the Rust boundary. Ignored by transformation-normal and bernoulli marginal-slope. (Issue #310 renamed the column from `effective_se` to `std_error` and dropped the redundant `effective_variance` column.) |
+| `interval` | `None` | Single uncertainty knob. `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. `"conformal"` requests exact jackknife+ intervals for eligible Gaussian-identity fits; `"full_conformal"` requests the exact full-conformal set. On standard GLMs / location-scale this populates `std_error`, `mean_lower`, `mean_upper`. On survival location-scale it populates `survival_se` and `eta_se` on the returned `SurvivalPrediction`. Other survival likelihoods and competing-risks reject non-`None` interval requests at the Rust boundary. |
+| `conformal_level` | `0.9` | Marginal coverage for `interval="conformal"` or `"full_conformal"`. Ignored for numeric Wald intervals. |
+| `covariance_mode` | `None` | Python accepts `"conditional"`, `"smoothing"`, or `"required"` for interval covariance. `None` prefers smoothing-corrected covariance when available. The CLI uses the equivalent `--covariance-mode conditional|corrected` names. |
+| `observation_interval` | `False` | When `True` and `interval` is numeric, adds response-scale prediction interval columns for families with an observation variance. |
 | `return_type` | `None` | One of `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"` for table-shaped outputs. Defaults to the input table kind, falling back to the training table kind. |
 | `id_column` | `None` | Name of a column in `data` whose stringified values are carried through into table outputs and `SurvivalPrediction`. |
 
@@ -27,17 +33,18 @@ model.predict(
 
 | Model class | Default return | Columns / fields |
 | --- | --- | --- |
-| Gaussian, binomial, Poisson, negative-binomial, Gamma | Table | `linear_predictor`, `mean`; adds `std_error`, `mean_lower`, `mean_upper` when `interval` is set. |
-| Gaussian / binomial location-scale | Table | `linear_predictor`, `mean`; adds `std_error`, `mean_lower`, `mean_upper` when `interval` is set. |
+| Gaussian, binomial, Poisson, negative-binomial, Gamma, Beta, Tweedie | 1-D `numpy.ndarray` | Response-scale point predictions. Table form has `linear_predictor`, `mean`; adds `std_error`, `mean_lower`, `mean_upper` when `interval` is set. |
+| Gaussian / binomial / dispersion location-scale | 1-D `numpy.ndarray` | Response-scale point predictions. Table form has `linear_predictor`, `mean`, `noise_scale`; adds `std_error`, `mean_lower`, `mean_upper` when `interval` is set. |
 | Transformation-normal | 1-D `numpy.ndarray` | Per-row conditional z-scores. |
-| Bernoulli marginal-slope | 1-D `numpy.ndarray` | Per-row probabilities clipped to `[0, 1]`. |
+| Bernoulli marginal-slope | 1-D `numpy.ndarray` | Per-row probabilities clipped to `[0, 1]`. Table form has `mean`; with `interval=` it also includes `linear_predictor`, `std_error`, `mean_lower`, and `mean_upper`. |
 | Survival (any likelihood mode) | `SurvivalPrediction` | Per-row hazard / survival evaluators. |
 | Competing-risks survival | `CompetingRisksPrediction` | Endpoint-stacked hazard, survival, CIF, and overall survival arrays. |
 
-For the array-returning classes (transformation-normal and bernoulli
-marginal-slope), passing `return_type=` switches the output to a table with
-`"z"` for transformation-normal or `"mean"` for bernoulli marginal-slope.
-Passing `id_column=` adds that stringified id column first.
+For all point-payload classes, passing `return_type=`, `id_column=`, or
+numeric `interval=` switches output to a table. Transformation-normal
+uses `"z"` as the value column; bernoulli marginal-slope uses `"mean"`
+for probabilities. Passing `id_column=` adds that stringified id column
+first.
 
 ## Wald intervals
 
@@ -48,6 +55,21 @@ preds = model.predict(test_df, interval=0.95)
 
 Intervals are computed from the asymptotic covariance of the fitted
 coefficients propagated through the inverse link.
+
+For response-scale prediction intervals, also pass
+`observation_interval=True`:
+
+```python
+preds = model.predict(test_df, interval=0.95, observation_interval=True)
+# adds observation_lower, observation_upper when the family supports it
+```
+
+For eligible Gaussian-identity models, use conformal intervals:
+
+```python
+preds = model.predict(test_df, interval="conformal", conformal_level=0.95)
+full = model.predict(test_df, interval="full_conformal", conformal_level=0.95)
+```
 
 ## Carrying an identifier column
 

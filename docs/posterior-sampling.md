@@ -44,6 +44,29 @@ model.sample(
 
 Total returned draws are `chains * samples`.
 
+## Posterior predictive replicates
+
+`Model.sample(...)` draws coefficient uncertainty. For observation-level
+synthetic responses from the fitted predictive distribution, use
+`sample_replicates`:
+
+```python
+rep = model.sample_replicates(test_df, n_draws=200, seed=42)
+# shape: (200, n_rows)
+```
+
+The replicate path uses the saved family and fitted dispersion
+(Gaussian / Poisson / Bernoulli / Gamma / Beta / Tweedie /
+negative-binomial) around the plug-in response mean. It is useful for
+simulation, posterior-predictive checks, and calibration probes.
+
+For a small built-in posterior-predictive check:
+
+```python
+ppc = model.posterior_predictive_check(train_df, n_draws=200, seed=42)
+# keys: mean, sd, min, max
+```
+
 ## Sampler dispatch
 
 The dispatch is in `src/inference/sample.rs::sample_saved_model`:

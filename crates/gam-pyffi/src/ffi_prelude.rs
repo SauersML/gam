@@ -1,48 +1,56 @@
-use csv::StringRecord;
+//! Shared pyo3 / numpy / ndarray / `gam`-engine imports for the FFI boundary.
+//!
+//! Every FFI submodule pulls this in via `use crate::ffi_prelude::*;` so the
+//! large, hand-curated set of engine re-exports lives in exactly one place
+//! instead of being duplicated across each concern module. Re-exports are
+//! `pub(crate)` so the glob is visible to sibling FFI modules but never
+//! escapes the crate.
 
-use faer::Side;
+pub(crate) use csv::StringRecord;
 
-use gam::DispersionLocationScaleFitResult;
+pub(crate) use faer::Side;
 
-use gam::basis::create_duchon_basis_1d_derivative_dense;
+pub(crate) use gam::DispersionLocationScaleFitResult;
 
-use gam::estimate::{
+pub(crate) use gam::basis::create_duchon_basis_1d_derivative_dense;
+
+pub(crate) use gam::estimate::{
     BlockRole, EstimationError, ExternalOptimOptions,
     optimize_external_designwith_heuristic_lambdas, saved_latent_cloglog_state_from_fit,
     saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 
-use gam::faer_ndarray::{
+pub(crate) use gam::faer_ndarray::{
     FaerCholesky, FaerSvd, array2_to_matmut, factorize_symmetricwith_fallback, fast_ata, fast_atb,
     fast_xt_diag_x,
 };
 
-use gam::families::bms::BernoulliMarginalSlopeFitResult;
+pub(crate) use gam::families::bms::BernoulliMarginalSlopeFitResult;
 
-use gam::families::inverse_link::apply_inverse_link_vec;
+pub(crate) use gam::families::inverse_link::apply_inverse_link_vec;
 
-use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
+pub(crate) use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
 
-use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_likelihood_modename};
+pub(crate) use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_likelihood_modename};
 
-use gam::families::survival_predict::{
+pub(crate) use gam::families::survival_predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
 
-use gam::gamlss::{
+pub(crate) use gam::gamlss::{
     BinomialLocationScaleFitResult, DispersionFamilyKind, GaussianLocationScaleFitResult,
 };
 
-use gam::gaussian_reml::{
+pub(crate) use gam::gaussian_reml::{
     GaussianRemlMultiBackwardProblem, build_gaussian_reml_eigen_cache_batched,
     gaussian_reml_blocks_orthogonal_shared_scale, gaussian_reml_free_b_score,
     gaussian_reml_multi_closed_form_backward, gaussian_reml_multi_closed_form_backward_batch,
     gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache,
 };
 
-use gam::geometry::manifold::GeometryError as EngineGeometryError;
+pub(crate) use gam::geometry::manifold::GeometryError as EngineGeometryError;
 
-use gam::geometry::poincare::{
+pub(crate) use gam::geometry::poincare::{
     conformal_factor as poincare_conformal_factor_impl, exp_map as poincare_exp_map_impl,
     exp_origin as poincare_exp_origin_impl, from_lorentz as poincare_from_lorentz_impl,
     log_map as poincare_log_map_impl, log_origin as poincare_log_origin_impl,
@@ -57,24 +65,24 @@ use gam::geometry::poincare::{
     to_lorentz as poincare_to_lorentz_impl,
 };
 
-use gam::geometry::simplex::{closure as simplex_closure, simplex_frechet_mean};
+pub(crate) use gam::geometry::simplex::{closure as simplex_closure, simplex_frechet_mean};
 
-use gam::hmc::{NutsConfig, NutsResult};
+pub(crate) use gam::hmc::{NutsConfig, NutsResult};
 
-use gam::inference::data::{
+pub(crate) use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
     encode_recordswith_schema,
 };
 
-use gam::inference::formula_dsl::{parse_formula, parse_surv_response};
+pub(crate) use gam::inference::formula_dsl::{parse_formula, parse_surv_response};
 
-use gam::inference::model::{
+pub(crate) use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel, FittedModelPayload, GroupMetadata,
     MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedDeploymentExtension,
     SavedLatentZNormalization, SchemaColumn, append_deployment_extension_columns,
 };
 
-use gam::inference::model_payload_builders::{
+pub(crate) use gam::inference::model_payload_builders::{
     BernoulliMarginalSlopeInputs, LatentWindowInputs, LocationScaleInputs, LocationScaleResponse,
     LocationScaleWiggle, SavedModelSourceMetadata, SurvivalLocationScaleInputs,
     SurvivalMarginalSlopeInputs, SurvivalTimewiggle, SurvivalTimewiggleBeta,
@@ -85,33 +93,33 @@ use gam::inference::model_payload_builders::{
     assemble_transformation_normal_payload,
 };
 
-use gam::inference::posterior_bands::{self, PosteriorPredictBandsPayload};
+pub(crate) use gam::inference::posterior_bands::{self, PosteriorPredictBandsPayload};
 
-use gam::inference::predict::input::build_predict_input_for_model;
+pub(crate) use gam::inference::predict::input::build_predict_input_for_model;
 
-use gam::kernels::sinkhorn_barycenter::{
+pub(crate) use gam::kernels::sinkhorn_barycenter::{
     circular_cost as sinkhorn_circular_cost_impl, euclidean_cost as sinkhorn_euclidean_cost_impl,
     geodesic_sphere_cost as sinkhorn_geodesic_sphere_cost_impl,
     sinkhorn_barycenter as sinkhorn_barycenter_impl,
     sinkhorn_barycenter_vjp as sinkhorn_barycenter_vjp_impl,
 };
 
-use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
+pub(crate) use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 
-use gam::smooth::{
+pub(crate) use gam::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design, smooth_term_feature_cols,
 };
 
-use gam::solver::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;
+pub(crate) use gam::solver::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;
 
-use gam::solver::evidence::{
+pub(crate) use gam::solver::evidence::{
     RemlCandidate, compare_reml_fits as compare_reml_fits_core, log_bayes_factor,
 };
 
-use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
+pub(crate) use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 
-use gam::terms::basis::{
+pub(crate) use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability, MaternNu,
     OneDimensionalBoundary, OperatorPenaltySpec, PeriodicBSplineBasisSpec, SpatialIdentifiability,
@@ -130,9 +138,9 @@ use gam::terms::basis::{
     spherical_spline_design_jet,
 };
 
-use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
+pub(crate) use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
 
-use gam::terms::interchange_decoder::{
+pub(crate) use gam::terms::interchange_decoder::{
     InterchangeDecodeForward as CoreInterchangeDecodeForward,
     InterchangeSwapForward as CoreInterchangeSwapForward,
     interchange_decode_backward as core_interchange_decode_backward,
@@ -141,26 +149,26 @@ use gam::terms::interchange_decoder::{
     interchange_swap_forward as core_interchange_swap_forward,
 };
 
-use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
+pub(crate) use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
 
-use gam::terms::linear_dictionary::{
+pub(crate) use gam::terms::linear_dictionary::{
     LinearDictionaryAssignment, LinearDictionaryConfig, fit_linear_dictionary,
 };
 
-use gam::terms::sae_manifold::{
+pub(crate) use gam::terms::sae_manifold::{
     AssignmentMode, DuchonCoordinateEvaluator, EuclideanPatchEvaluator, GumbelTemperatureSchedule,
     PeriodicHarmonicEvaluator, SPHERE_CHART_PENALTY_DIAGONAL, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldRho, ScheduleKind, SphereChartEvaluator, TorusHarmonicEvaluator,
     sphere_chart_basis_jet, term_from_padded_blocks_with_mode,
 };
 
-use gam::terms::skip_transcoder::{
+pub(crate) use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
 };
 
-use gam::terms::smooth::BlockwisePenalty;
+pub(crate) use gam::terms::smooth::BlockwisePenalty;
 
-use gam::terms::{
+pub(crate) use gam::terms::{
     AnalyticPenalty as AnalyticPenaltyTrait, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     EdgeRestriction as CoreEdgeRestriction, GatedSAEDecoder,
     IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty, MaternBasisGradientTarget,
@@ -169,43 +177,43 @@ use gam::terms::{
     SheafConsistencyPenalty as CoreSheafConsistencyPenalty, StreamingMaternBasisGradientEvaluator,
 };
 
-use gam::transformation_normal::TransformationNormalFitResult;
+pub(crate) use gam::transformation_normal::TransformationNormalFitResult;
 
-use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink};
+pub(crate) use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink};
 
-use gam::{
+pub(crate) use gam::{
     FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize, resolve_offset_column,
 };
 
-use ndarray::{
+pub(crate) use ndarray::{
     Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, Axis, IxDyn, s,
 };
 
-use numpy::{
+pub(crate) use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayDyn, PyArrayMethods,
     PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
 };
 
-use pyo3::IntoPyObjectExt;
+pub(crate) use pyo3::IntoPyObjectExt;
 
 pub(crate) type PyObject = pyo3::Py<pyo3::PyAny>;
 
-use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
+pub(crate) use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
 
-use pyo3::prelude::*;
+pub(crate) use pyo3::prelude::*;
 
-use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyString, PyTuple, PyType};
+pub(crate) use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyString, PyTuple, PyType};
 
-use serde::de::{MapAccess, Visitor};
+pub(crate) use serde::de::{MapAccess, Visitor};
 
-use serde::{Deserialize, Serialize};
+pub(crate) use serde::{Deserialize, Serialize};
 
-use std::cmp::Ordering;
+pub(crate) use std::cmp::Ordering;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+pub(crate) use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use std::fmt;
+pub(crate) use std::fmt;
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+pub(crate) use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use std::sync::Arc;
+pub(crate) use std::sync::Arc;

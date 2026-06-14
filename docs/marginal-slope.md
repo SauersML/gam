@@ -69,6 +69,12 @@ model = gamfit.fit(
 probs = model.predict(test_df, return_type="dict")["mean"]
 ```
 
+By default, Bernoulli marginal-slope prediction returns a 1-D NumPy
+array of probabilities. Passing `return_type=` asks for a table. Passing
+`interval=0.95` asks for the interval table with `linear_predictor`,
+`mean`, `std_error`, `mean_lower`, and `mean_upper`; probability-scale
+values are clipped to `[0, 1]`.
+
 - `family="bernoulli-marginal-slope"` names the likelihood;
   `logslope_formula=` is the slope surface as a function of covariates.
 - `transformation_normal_stage1=gamfit.CtnStage1(response=..., covariates=...)`

@@ -425,36 +425,10 @@ struct ValidationPayload {
 }
 
 
-// =========================================================================
-// gamfit exception hierarchy (Rust-defined, Python-visible)
-// =========================================================================
-//
-// The Rust engine has rich `thiserror`-typed errors — `EstimationError`
-// alone has ~20 variants. Historically those variants were flattened to
-// `String` at the FFI boundary and reclassified on the Python side by
-// regex on the message text. That round-trip discarded structured
-// information that already existed upstream.
-//
-// The principled design (issue #343) is variant-dispatch at the
-// engine→Python boundary: each engine error variant maps to a concrete
-// Python exception class via a typed mapping function, with no
-// string-regex bridge. The classes themselves live here (defined via
-// `pyo3::create_exception!`) so the Rust extension owns the canonical
-// type identity; `gamfit/_exceptions.py` re-exports them so the public
-// names remain `gamfit.GamError`, `gamfit.FormulaError`, etc.
-//
-// Inheritance: every gamfit exception is a subclass of `GamError`, and
-// `GamError` itself is a subclass of Python's built-in `ValueError`.
-// That preserves the historical contract that `except ValueError`
-// catches every engine-side failure (the Rust extension previously
-// raised bare `PyValueError` for everything), while `except GamError`
-// becomes the documented broad catch — see issue #330.
-//
-// Adding a new engine error variant: extend `estimation_error_to_pyerr`
-// (or the per-enum analogue) with the new variant; do NOT add new
-// patterns to a message-regex classifier.
-
-use pyo3::create_exception;
+// The gamfit exception hierarchy and the typed engine→Python error
+// adaptors now live in `crate::ffi_errors`; they are re-exported at the
+// crate root so the `#[pyfunction]`s below keep referring to them by their
+// bare names (`py_value_error`, `estimation_error_to_pyerr`, etc.).
 
 
 create_exception!(

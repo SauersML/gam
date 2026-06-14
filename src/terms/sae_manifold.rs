@@ -26,10 +26,129 @@
 //! [`SaeManifoldTerm::assemble_arrow_schur`] materializes the Gauss-Newton
 //! bordered Hessian in that layout and hands it to
 //! [`crate::solver::arrow_schur::ArrowSchurSystem`].
+//!
+//! # Module organization
+//!
+//! This term is large enough that its concerns live in dedicated submodules,
+//! re-exported flat from here so the public surface is unchanged:
+//!
+//! * [`streaming_plan`] — host/device memory budgeting and the in-core vs
+//!   matrix-free streaming admission plan.
+//! * [`schedule`] — assignment-temperature annealing and the discrete-`K`
+//!   search strategy.
+//! * [`atom`] — one manifold atom (`SaeManifoldAtom`): basis topology, the
+//!   decoder/frame algebra, the intrinsic arc-length penalty, and the ARD
+//!   coordinate prior / Bessel normaliser it rests on.
+//! * [`rho`] — the REML-selected continuous hyperparameters and their flat
+//!   outer-coordinate layout.
+//! * [`kronecker`] — the matrix-free Kronecker-factored β Jacobian primitive.
+//! * [`loss`] — the loss breakdown and outer-ρ gradient component value objects.
+//! * [`arrow_solver`] — the gauge-deflated arrow-factor solve and the per-row
+//!   jet bookkeeping the curvature assembly threads through it.
+//! * [`row_layout`] — the per-row active-set layout for sparse assignment.
+//! * [`shape_uncertainty`] — the posterior shape-band payload types.
+//! * [`certificate`] — the curved-dictionary global-optimality certificate and
+//!   the post-fit diagnostics it feeds.
+//! * [`term`] — the `SaeManifoldTerm` aggregate, its shared numeric constants,
+//!   and the mutable-state snapshot the inner line search restores.
+//! * [`construction`] — term construction, accessors, frame/border bookkeeping,
+//!   loss/penalty/criterion evaluation, and the arrow-Schur assembly.
+//! * [`penalties`] — the live analytic-penalty curvature contributions.
+//! * [`fit_drivers`] — gauge canonicalization, the Newton step, and the joint /
+//!   fixed-decoder / streaming fit drivers.
+//! * [`outer_objective`] — the generic-engine REML outer objective and the
+//!   curvature-homotopy entry walk.
 
-// Split from the original oversized module; keep included in order.
-include!("sae_manifold/types.rs");
-include!("sae_manifold/term_construction.rs");
-include!("sae_manifold/term_fit_drivers.rs");
-include!("sae_manifold/outer_objective.rs");
-include!("sae_manifold/tests.rs");
+use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
+
+use std::sync::Arc;
+
+pub(crate) use crate::solver::arrow_schur::{
+    ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem,
+    ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, DeviceSaePcgData,
+    DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IbpCrossRowSource,
+    IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
+    StreamingArrowSchur, solve_arrow_newton_step_with_proximal_correction,
+    solve_streaming_reduced_beta, solve_with_lm_escalation_inner,
+};
+
+pub(crate) use crate::terms::analytic_penalties::{
+    AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DecoderIncoherencePenalty,
+    IbpHessianDiagThirdChannels, IsometryPenalty, MechanismSparsityPenalty, NuclearNormPenalty,
+    PenaltyTier, PsiSlice, WeightField, resolve_learnable_weight,
+};
+
+pub(crate) use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
+
+pub(crate) use crate::terms::sae_criterion_atoms::SaeCriterion;
+
+pub(crate) use crate::terms::sae_optimality_certificate::{
+    CriterionCertificate, DirectionalSamples, certificate_from_samples,
+    deterministic_probe_direction, probe_step,
+};
+
+pub(crate) use crate::linalg::faer_ndarray::{
+    FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb,
+};
+
+pub(crate) use crate::linalg::triangular::cholesky_solve_vector;
+
+pub(crate) use crate::solver::arrow_schur::{
+    ArrowFactorCache, ArrowRowGaugeDeflation, arrow_factor_max_pivot, arrow_factor_min_pivot,
+    solve_arrow_newton_step_with_options,
+};
+
+pub(crate) use crate::solver::estimate::EstimationError;
+
+pub(crate) use crate::solver::evidence::arrow_log_det_from_cache;
+
+pub(crate) use crate::solver::outer_strategy::{
+    DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
+    OuterEvalOrder, OuterObjective, SeedOutcome,
+};
+
+pub(crate) use crate::solver::structure_search::{CollapseAction, CollapseEvent};
+
+pub(crate) use faer::Side;
+
+// The SAE assignment / basis / frame primitives this term is built from. They
+// are re-exported flat here so every submodule reaches them through
+// `use super::*` and the public surface is unchanged.
+pub use crate::terms::sae::assignment::*;
+pub use crate::terms::sae::basis::*;
+pub use crate::terms::sae::frames::*;
+
+mod arrow_solver;
+mod atom;
+mod certificate;
+mod construction;
+mod fit_drivers;
+mod kronecker;
+mod loss;
+mod outer_objective;
+mod penalties;
+mod rho;
+mod row_layout;
+mod schedule;
+mod shape_uncertainty;
+mod streaming_plan;
+mod term;
+
+#[cfg(test)]
+mod tests;
+
+pub use arrow_solver::*;
+pub use atom::*;
+pub use certificate::*;
+pub use construction::*;
+pub use fit_drivers::*;
+pub use kronecker::*;
+pub use loss::*;
+pub use outer_objective::*;
+pub use penalties::*;
+pub use rho::*;
+pub use row_layout::*;
+pub use schedule::*;
+pub use shape_uncertainty::*;
+pub use streaming_plan::*;
+pub use term::*;

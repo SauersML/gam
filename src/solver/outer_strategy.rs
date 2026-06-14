@@ -13,6 +13,51 @@
 //! falls back to BFGS or an EFS variant instead of synthesizing second-order
 //! curvature numerically.
 
-// Split from the original oversized module; keep included in order.
-include!("outer_strategy_operators.rs");
-include!("outer_strategy_run_plan.rs");
+use crate::cache::{LoadSource, Session as CacheSession};
+
+use crate::estimate::EstimationError;
+
+use crate::solver::estimate::reml::unified::BarrierConfig;
+
+use crate::solver::priority_selection::{
+    PriorityBudgetStage, PriorityStageSummary, rank_indices_with_budget_cascade,
+};
+
+use crate::solver::startup_stats::{
+    SeedRejection, StartupStats, format_no_seeds_passed, uniform_structural_key,
+};
+
+use ::opt::{
+    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FallbackPolicy as OptFallbackPolicy,
+    FirstOrderObjective, FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective,
+    FixedPointSample, FixedPointStatus, GradientTolerance, HessianFallbackPolicy,
+    HessianMaterialization, HessianOperator, HessianValue, MatrixFreeTrustRegion, MaxIterations,
+    ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver,
+    SecondOrderObjective, SecondOrderSample, Solution, StepInfo, Tolerance, ZerothOrderObjective,
+};
+
+use ndarray::{Array1, Array2, ArrayView2};
+
+use std::sync::Arc;
+
+use std::sync::Mutex;
+
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+mod bridges;
+mod capability;
+mod fd_audit;
+mod hessian_operator;
+mod objective;
+mod run;
+mod run_plan;
+mod seed_screening;
+
+pub use bridges::*;
+pub use capability::*;
+pub use fd_audit::*;
+pub use hessian_operator::*;
+pub use objective::*;
+pub use run::*;
+pub use run_plan::*;
+pub use seed_screening::*;

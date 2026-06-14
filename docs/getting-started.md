@@ -24,16 +24,19 @@ uv pip install gamfit
 uv add "gamfit[pandas]"     # pandas + pyarrow input/output
 uv add "gamfit[plot]"       # matplotlib-based plotting
 uv add "gamfit[sklearn]"    # scikit-learn integration
-uv add "gamfit[torch]"      # PyTorch bridge
-uv add "gamfit[all]"        # everything
+uv add "gamfit[cuda]"       # NVIDIA CUDA 12 wheel libraries on Linux x86_64
+uv add "gamfit[all]"        # pandas + plot + sklearn extras
+uv add torch                # PyTorch bridge dependency
 ```
 
 `gamfit` runs without any extra. The extras only affect input/output
 conversions and auxiliary modules: without `pandas`/`pyarrow`,
 `predict()` returns the format you supplied; without `matplotlib`,
 `Model.plot()` and posterior trace plots raise; without `scikit-learn`,
-`gamfit.sklearn` fails to import; without `torch`, `gamfit.torch` fails
-to import.
+`gamfit.sklearn` fails to import; without the separate `torch` package,
+`gamfit.torch` fails to import. `gamfit[cuda]` installs CUDA 12 runtime
+libraries for Linux x86_64 environments that do not use a system CUDA
+toolkit.
 
 ### Verifying the install
 
@@ -59,6 +62,13 @@ train = [
     {"y": 3.1, "x": 2.0},
     {"y": 4.5, "x": 3.0},
     {"y": 5.0, "x": 4.0},
+    {"y": 5.4, "x": 5.0},
+    {"y": 5.6, "x": 6.0},
+    {"y": 5.5, "x": 7.0},
+    {"y": 5.2, "x": 8.0},
+    {"y": 4.8, "x": 9.0},
+    {"y": 4.4, "x": 10.0},
+    {"y": 4.1, "x": 11.0},
 ]
 
 model = gamfit.fit(train, "y ~ s(x)")
@@ -84,22 +94,21 @@ A 2-D smooth fit to scattered observations:
 preds = model.predict([{"x": 1.5}, {"x": 2.5}])
 ```
 
-For Gaussian/binomial/standard models, `predict()` returns a table with
-columns `eta` (linear predictor) and `mean` (response-scale). The
-container type matches the input or training kind (pandas in, pandas
-out, etc.).
+For standard scalar models, `predict()` returns a 1-D NumPy array of
+response-scale point predictions by default. Ask for a table with
+`return_type=`, `id_column=`, or `interval=`.
 
 For pointwise Wald intervals, pass `interval=`:
 
 ```python
 preds = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)
-# Columns: eta, mean, effective_se, effective_variance, mean_lower, mean_upper
+# Columns: linear_predictor, mean, std_error, mean_lower, mean_upper
 ```
 
-Transformation-normal and Bernoulli marginal-slope models return a 1-D
-NumPy array by default; passing `id_column=` or `return_type=` switches
-them to the table form. Survival models return a `SurvivalPrediction`
-object with `.hazard_at(...)`, `.survival_at(...)`,
+Transformation-normal and Bernoulli marginal-slope models follow the
+same point-vector default; table form uses `z` for transformation-normal
+and `mean` for marginal-slope probabilities. Survival models return a
+`SurvivalPrediction` object with `.hazard_at(...)`, `.survival_at(...)`,
 `.cumulative_hazard_at(...)`, chunk iterators, and CSV writers.
 
 See [predictions.md](predictions.md) for details on `return_type`,

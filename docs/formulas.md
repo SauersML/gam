@@ -6,10 +6,18 @@ Every model in `gamfit` uses a Wilkinson-style formula:
 response ~ term + term + ... + option(...)
 ```
 
-Terms are joined with `+`. `*` and `:` are not supported — interactions come
-from multivariate smooths (`s(x1, x2)`, `matern(...)`, `duchon(...)`),
-and intrinsic sphere smooths (`sphere(lat, lon)`). Tensor-product
-formula terms are parsed but not currently built; see below.
+Terms are joined with `+`. Wilkinson-Rogers operators are supported for
+ordinary linear atoms:
+
+- `x:z` adds the interaction only.
+- `x*z` expands to `x + z + x:z`.
+- `x/z` expands to `x + x:z`.
+- `(x + z + w)^2` expands all non-empty interactions up to order 2.
+
+Function-call terms such as `s(x)` are opaque to those operators; use
+multivariate smooths (`s(x1, x2)`, `matern(...)`, `duchon(...)`),
+intrinsic sphere smooths (`sphere(lat, lon)`), and tensor-product
+smooths (`te(...)`, `ti(...)`) for smooth interactions.
 
 This page lists each right-hand-side term, its options, and the
 formula-level configuration terms (`link(...)`, `linkwiggle(...)`,
@@ -30,7 +38,8 @@ Poisson vs Gamma is chosen by whether `y` is integer-valued — `family=`
 is optional in that case. `family=` accepts `gaussian`, `binomial`
 (aliases `binomial-logit`, `binomial-probit`, `binomial-cloglog`),
 `latent-cloglog-binomial`, `poisson`, `negative-binomial`, `gamma`,
-and `beta`. Survival, transformation-normal, and Bernoulli
+`beta`, `tweedie`, `royston-parmar`, and `multinomial`. Survival,
+transformation-normal, and Bernoulli
 marginal-slope families are selected through `Surv(...)` or dedicated
 fit options rather than `family=`.
 
@@ -39,6 +48,8 @@ fit options rather than `family=`.
 ```
 y ~ x                                # implicit penalized linear
 y ~ linear(x)                        # explicit linear
+y ~ x * z                            # x + z + x:z
+y ~ x / z                            # x + x:z
 y ~ linear(x, min=0)                 # box-constrained coefficient >= 0
 y ~ linear(x, min=-1, max=1)         # box-constrained coefficient
 y ~ nonnegative(x)                   # sugar for linear(x, min=0)
@@ -264,10 +275,12 @@ the poles.
 
 ### Tensor product (`te`, `tensor`, `interaction`) {#periodic-cyclic-smooths}
 
-The formula parser accepts `te(...)`, `tensor(...)`, and
-`interaction(...)`, but the current Rust term builder does not construct
-a tensor-product smooth from formula terms. These terms currently fail
-with `unsupported smooth type 'tensor'`.
+`te(...)`, `tensor(...)`, and `interaction(...)` build penalized
+tensor-product B-splines for covariates whose axes have different units
+or scales. Each margin is a 1-D B-spline; REML selects one smoothing
+parameter per margin. The fit and predict paths freeze the margin knots,
+periodicity, and tensor identifiability transform in the saved model, so
+fresh prediction grids use the same tensor basis as training.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -276,12 +289,20 @@ with `unsupported smooth type 'tensor'`.
 | `degree` | 3 | Polynomial degree (all margins). |
 | `penalty_order` | 2 | Difference-penalty order. |
 | `double_penalty` | `false` | Ridge alongside per-margin penalties. |
-| `bc` | none | Per-margin boundary conditions (list form). |
+| `bc` | none | Per-margin boundary conditions (list form). `periodic` / `cyclic` margins are supported; endpoint constraints such as `clamped` or `anchored` are rejected for tensor margins. |
 | `periodic`, `period`, `periods`, `origin`, `origins` | — | Per-margin periodicity (see below). |
 | `by`, `identifiability` | — | See common options above. |
 
 `k` and `knots` cannot both be set. Margins requested as a single
 value are broadcast across all margins.
+
+Examples:
+
+```python
+gamfit.fit(df, "y ~ te(space, time, k=[12, 8])")
+gamfit.fit(df, "y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k=5)")
+gamfit.fit(df, "y ~ te(u, v, bc=['periodic', 'periodic'], period=[2*pi, 2*pi], k=5)")
+```
 
 ### Picking the right smooth
 
@@ -331,7 +352,7 @@ There are two distinct mechanisms, matched to the kernel:
   length-scale kernel, so Matérn keeps it.
 - Thin-plate: inputs are automatically standardized; `scale_dims` is
   not a learned anisotropy knob for this family.
-- Tensor-product formula terms are parsed but not currently built.
+- Tensor-product formula terms are built as penalized tensor B-splines.
 
 ## Link function
 

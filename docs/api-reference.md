@@ -35,6 +35,11 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
+::: gamfit.compare_models
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: gamfit.cross_fit_shared_precision_groups
     options:
       show_root_heading: true
@@ -60,7 +65,52 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
+::: gamfit.cuda_subprocess_env
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.cuda_subprocess_library_dirs
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: gamfit.explain_error
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.linear_dictionary_fit
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.conditional_prior_ivae
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.glm_full_conformal
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.lawley_bartlett_factor
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.layer_transport_fit
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.layer_transport_ladder
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.sae_checkpoint_dynamics
     options:
       show_root_heading: true
       heading_level: 3
@@ -90,6 +140,18 @@ topical guides for narrative explanations.
       members_order: source
 
 ::: gamfit.CompetingRisksCIF
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members_order: source
+
+::: gamfit.MultinomialModel
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members_order: source
+
+::: gamfit.MultinomialPrediction
     options:
       show_root_heading: true
       heading_level: 3
@@ -154,6 +216,11 @@ topical guides for narrative explanations.
       heading_level: 3
 
 ::: gamfit.SharedPrecisionGroup
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.LinearDictionaryFit
     options:
       show_root_heading: true
       heading_level: 3
@@ -309,6 +376,21 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
+::: gamfit.smooth.MeasureJet
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.smooth.Pca
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.smooth.LatentCoord
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: gamfit.smooth.Categorical
     options:
       show_root_heading: true
@@ -320,6 +402,100 @@ topical guides for narrative explanations.
       heading_level: 3
 
 ::: gamfit.TermBlock
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+## Topology and smooth descriptors
+
+::: gamfit.Circle
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.Cylinder
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.Torus
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.TopologySphere
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.EuclideanPatch
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.PeriodicHarmonic
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.Fourier
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+## Penalties and latent-coordinate tools
+
+::: gamfit.ARDPenalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.IBPPenalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.OrthogonalityPenalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.BlockOrthogonalityPenalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.SparsityPenalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.SoftmaxAssignmentSparsityPenalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.TopKActivationPenalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.JumpReLUPenalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.NuclearNormPenalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.ScadMcpPenalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.CompositePenalty
     options:
       show_root_heading: true
       heading_level: 3
@@ -370,6 +546,31 @@ topical guides for narrative explanations.
 See the [Manifold SAE dictionary guide](manifold-sae.md) for the narrative.
 
 ::: gamfit.sae_manifold_fit
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.atom_trust_scores
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.sae_trust_diagnostics
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.sae_benchmark
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.sweep_sae_benchmark
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.format_sae_benchmark_markdown
     options:
       show_root_heading: true
       heading_level: 3
