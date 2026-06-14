@@ -1110,16 +1110,42 @@ fn build_matern_operator_penalty_psi_derivatives(
                 ratio_psi,
                 ratio_psi_psi,
                 _lap,
-                _lap_psi,
-                _lap_psi_psi,
+                lap_psi,
+                lap_psi_psi,
             ) = matern_operator_psi_triplet(r, length_scale, nu, d)?;
-            let (_, _q_shape, t, t_r, t_rr) =
+            let (_, _q_shape, t, _t_r, _t_rr) =
                 matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
             let q = ratio;
             let q_psi = ratio_psi;
             let q_psi_psi = ratio_psi_psi;
-            let t_psi = 4.0 * t + r * t_r;
-            let t_psi_psi = 16.0 * t + 9.0 * r * t_r + r * r * t_rr;
+            // Mixed-curvature Hessian scalar t = (φ''(r) − φ'(r)/r)/r² and its
+            // ψ-derivatives (ψ = log κ = −log ℓ, with r held fixed). The earlier
+            // `4t + r·t_r` / `16t + 9 r·t_r + r²·t_rr` expressions confused the
+            // fixed-ℓ radial derivative `t_r` with the fixed-r ψ-derivative and
+            // were simply wrong (verified against finite differences, #1122):
+            // they made the operator-penalty D₂ ψ-gradient inconsistent with the
+            // penalty itself, so the isotropic-κ joint REML gradient never went
+            // to zero and the Matérn fit stalled at the 80-iteration cap while
+            // the thin-plate/Duchon siblings (different penalty path) converged.
+            //
+            // The Laplacian `lap = φ''(r) + (d−1)·φ'(r)/r` already returns exact
+            // ψ-derivatives from `matern_operator_psi_triplet`, and `r` is fixed
+            // under ψ, so the linear identity
+            //   t = (lap − d·ratio)/r²  ⇒  t_ψ = (lap_ψ − d·ratio_ψ)/r²,
+            //   t_ψψ = (lap_ψψ − d·ratio_ψψ)/r²
+            // gives the correct, FD-matching derivatives. At a center collision
+            // (r = 0) `t` and its ψ-derivatives are multiplied by displacement
+            // factors that vanish identically, so we use the same 0 convention
+            // as the value-side `t`.
+            let (t_psi, t_psi_psi) = if r < 1e-14 {
+                (0.0, 0.0)
+            } else {
+                let r2 = r * r;
+                (
+                    (lap_psi - d * ratio_psi) / r2,
+                    (lap_psi_psi - d * ratio_psi_psi) / r2,
+                )
+            };
             d0_raw[[k, j]] = phi;
             d0_raw_psi[[k, j]] = phi_psi;
             d0_raw_psi_psi[[k, j]] = phi_psi_psi;
