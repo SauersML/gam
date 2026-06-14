@@ -2219,9 +2219,15 @@ impl LatentSurvivalFamily {
     /// `baseline_chain_rule_gradient`.
     ///
     /// At the converged (constrained) β̂ the envelope theorem makes this the
-    /// exact θ-gradient of the profile penalized NLL `0.5·deviance + 0.5·βᵀSβ`
-    /// (the `q_right` interval channel shares the time coefficients and carries
-    /// no independent baseline offset, so it contributes no separate channel).
+    /// exact θ-gradient of the profile penalized NLL `0.5·deviance + 0.5·βᵀSβ`.
+    /// The interval upper-bound `q_right = x_time_right·β_time + o_R(θ)` channel
+    /// DOES carry its own baseline-θ offset `o_R(θ)` (the time basis evaluated at
+    /// the bracket upper bound `R`), distinct from the exit offset at `L`, so its
+    /// residual `−∂(log-likelihood)/∂q_right` is returned in the dedicated
+    /// [`OffsetChannelResiduals::right`] channel; it is exactly 0 on every
+    /// non-interval row (the `Q_RIGHT` primary channel is inert there) and the
+    /// baseline-θ chain rule contracts it against the `age_right`-evaluated
+    /// η-partial.
     pub fn offset_channel_residuals(
         &self,
         block_states: &[ParameterBlockState],
@@ -2240,6 +2246,7 @@ impl LatentSurvivalFamily {
                 exit: Array1::<f64>::zeros(n),
                 entry: Array1::<f64>::zeros(n),
                 derivative: Array1::<f64>::zeros(n),
+                right: Array1::<f64>::zeros(n),
             });
         }
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
@@ -2249,6 +2256,7 @@ impl LatentSurvivalFamily {
         let mut entry = Array1::<f64>::zeros(n);
         let mut exit = Array1::<f64>::zeros(n);
         let mut derivative = Array1::<f64>::zeros(n);
+        let mut right = Array1::<f64>::zeros(n);
         for row_idx in 0..n {
             let wi = self.weights[row_idx];
             if wi <= MIN_WEIGHT {
@@ -2283,11 +2291,19 @@ impl LatentSurvivalFamily {
             entry[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_ENTRY];
             exit[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_EXIT];
             derivative[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT];
+            // Interval upper-bound (`R`) channel. `q_right` shares the time-block
+            // coefficients but carries its OWN baseline-θ η-offset evaluated at
+            // `R` (`o_R(θ)`), so the profile-NLL θ-gradient must include it.
+            // `∂(log-likelihood)/∂q_right` is exactly 0 for non-interval rows
+            // (the `Q_RIGHT` channel is inert there), so this is 0 except on
+            // interval-censored rows.
+            right[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_RIGHT];
         }
         Ok(crate::families::survival::OffsetChannelResiduals {
             exit,
             entry,
             derivative,
+            right,
         })
     }
 
@@ -3418,6 +3434,7 @@ impl LatentBinaryFamily {
                 exit: Array1::<f64>::zeros(n),
                 entry: Array1::<f64>::zeros(n),
                 derivative: Array1::<f64>::zeros(n),
+                right: Array1::<f64>::zeros(n),
             });
         }
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
@@ -3464,6 +3481,9 @@ impl LatentBinaryFamily {
             exit,
             entry,
             derivative: Array1::<f64>::zeros(n),
+            // Latent-binary deployment has no interval upper bound; the `R`
+            // channel is structurally absent (every row is right-censored).
+            right: Array1::<f64>::zeros(n),
         })
     }
 

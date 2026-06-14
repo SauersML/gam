@@ -997,12 +997,17 @@ impl SurvivalWorkspace {
 }
 
 /// Per-observation gradients of the unpenalized survival NLL with respect
-/// to each of the three additive offset channels, at a given β. See
+/// to each additive offset channel, at a given β. See
 /// [`WorkingModelSurvival::offset_channel_residuals`] for the algebra.
 ///
-/// Contract: all three arrays have length `n` = number of observations.
+/// Contract: all four arrays have length `n` = number of observations.
 /// Rows with non-positive sampleweight are 0 in every channel. The
-/// `derivative` channel is 0 in all non-event rows.
+/// `derivative` channel is 0 in all non-event rows. The `right` channel is
+/// the interval upper-bound (`R`) η-offset sensitivity and is exactly 0 for
+/// every NON-interval-censored model and every non-interval row of the latent
+/// interval model (only the dedicated `SurvInterval(L, R, event)` latent fit
+/// populates it); the baseline-θ chain rule contracts it against the
+/// `age_right`-evaluated η-partial.
 #[derive(Clone, Debug)]
 pub struct OffsetChannelResiduals {
     /// ∂NLL/∂o_X: w·(exp(η_exit) − δ) per row.
@@ -1011,6 +1016,10 @@ pub struct OffsetChannelResiduals {
     pub entry: Array1<f64>,
     /// ∂NLL/∂o_D: −w·δ / s (event-row only).
     pub derivative: Array1<f64>,
+    /// ∂NLL/∂o_R: interval upper-bound (`R`) η-offset sensitivity,
+    /// `−w·∂(log-lik)/∂q_right`. Nonzero only for interval-censored latent
+    /// rows; exactly 0 for every other channel/model.
+    pub right: Array1<f64>,
 }
 
 /// Per-observation Hessians of the unpenalized survival NLL with respect
@@ -2290,10 +2299,12 @@ impl WorkingModelSurvival {
             }
         }
 
+        let right = Array1::<f64>::zeros(r_exit.len());
         Ok(OffsetChannelResiduals {
             exit: r_exit,
             entry: r_entry,
             derivative: r_deriv,
+            right,
         })
     }
 

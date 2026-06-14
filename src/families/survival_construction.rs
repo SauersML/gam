@@ -2137,19 +2137,23 @@ pub fn baseline_offset_theta_partials(
 ///
 ///   d[0.5·deviance + 0.5·βᵀS_λβ] / dθ_k
 ///     = Σᵢ r_X[i]·(∂o_X_i/∂θ_k) + r_D[i]·(∂o_D_i/∂θ_k) + r_E[i]·(∂o_E_i/∂θ_k)
+///       + r_R[i]·(∂o_R_i/∂θ_k)
 ///
 /// where `r_X = residuals.exit`, `r_D = residuals.derivative`, `r_E =
-/// residuals.entry` (all sampleweight-scaled already). Exit and derivative
-/// partials both come from the `age_exit[i]` evaluation; the entry partial from
-/// `age_entry[i]`. Origin-entry rows have `r_E[i] == 0` exactly, so the entry
-/// partial is skipped for those rows (avoiding the `age > 0` precondition failure
-/// when `age_entry` is 0).
+/// residuals.entry`, `r_R = residuals.right` (all sampleweight-scaled already).
+/// Exit and derivative partials both come from the `age_exit[i]` evaluation;
+/// the entry partial from `age_entry[i]`; the interval upper-bound (`R`)
+/// η-partial from `age_right[i]`. Origin-entry rows have `r_E[i] == 0` exactly
+/// and non-interval rows have `r_R[i] == 0` exactly, so those partials are
+/// skipped for those rows (avoiding the `age > 0` precondition failure when an
+/// inactive boundary age is 0 / a placeholder).
 ///
 /// Returns `Ok(None)` when the provider reports no θ-parameters.
 fn baseline_chain_rule_gradient_with_partials<F>(
     label: &'static str,
     age_entry: ndarray::ArrayView1<'_, f64>,
     age_exit: ndarray::ArrayView1<'_, f64>,
+    age_right: ndarray::ArrayView1<'_, f64>,
     cfg: &SurvivalBaselineConfig,
     residuals: &crate::families::survival::OffsetChannelResiduals,
     partials: F,
@@ -2159,17 +2163,21 @@ where
 {
     let n = age_exit.len();
     if age_entry.len() != n
+        || age_right.len() != n
         || residuals.exit.len() != n
         || residuals.entry.len() != n
         || residuals.derivative.len() != n
+        || residuals.right.len() != n
     {
         return Err(format!(
-            "{label}: length mismatch (age_entry={}, age_exit={}, r_exit={}, r_entry={}, r_deriv={})",
+            "{label}: length mismatch (age_entry={}, age_exit={}, age_right={}, r_exit={}, r_entry={}, r_deriv={}, r_right={})",
             age_entry.len(),
             n,
+            age_right.len(),
             residuals.exit.len(),
             residuals.entry.len(),
             residuals.derivative.len(),
+            residuals.right.len(),
         ));
     }
     // Probe θ-dim via any valid positive age. If the provider returns None the
@@ -2223,6 +2231,29 @@ where
                 grad[k] += r_e * partials_entry[k].0;
             }
         }
+        // Interval upper-bound (`R`) channel: `q_right = X_time(R)·β + o_R(θ)`
+        // carries its own baseline-θ η-offset evaluated at `age_right[i]`. It is
+        // an η-level offset with NO time-derivative channel (the interval
+        // likelihood `log[S(L) − S(R)]` has no hazard-derivative term), so it
+        // contracts against the η-partial `.0` only. Nonzero only for
+        // interval-censored latent rows; for every other channel/model
+        // `r_right[i] == 0` exactly, so the (possibly placeholder) `age_right[i]`
+        // partial is never consulted.
+        let r_r = residuals.right[i];
+        if r_r != 0.0 {
+            let partials_right = partials(age_right[i], cfg)?
+                .ok_or_else(|| format!("{label}: unexpected None from partials at right boundary"))?;
+            if partials_right.len() != theta_dim {
+                return Err(format!(
+                    "{label}: theta_dim drifted at right boundary ({} != {})",
+                    partials_right.len(),
+                    theta_dim
+                ));
+            }
+            for k in 0..theta_dim {
+                grad[k] += r_r * partials_right[k].0;
+            }
+        }
     }
     Ok(Some(grad))
 }
@@ -2238,27 +2269,32 @@ where
 ///     = Σᵢ (∂NLL_i/∂o_X[i])·(∂o_X_i/∂θ_k)
 ///       + (∂NLL_i/∂o_E[i])·(∂o_E_i/∂θ_k)
 ///       + (∂NLL_i/∂o_D[i])·(∂o_D_i/∂θ_k)
+///       + (∂NLL_i/∂o_R[i])·(∂o_R_i/∂θ_k)
 ///
-/// The three `∂NLL_i/∂o_channel` terms are the `exit`, `entry`, `derivative`
-/// fields of [`OffsetChannelResiduals`] (sampleweight-scaled already). The
-/// `∂o/∂θ_k` terms come from [`baseline_offset_theta_partials`] per obs at
+/// The four `∂NLL_i/∂o_channel` terms are the `exit`, `entry`, `derivative`,
+/// `right` fields of [`OffsetChannelResiduals`] (sampleweight-scaled already).
+/// The `∂o/∂θ_k` terms come from [`baseline_offset_theta_partials`] per obs at
 /// the appropriate age.
 ///
 /// Per the RP offset convention:
 ///   o_E[i] = eta_target(age_entry[i])
 ///   o_X[i] = eta_target(age_exit[i])
 ///   o_D[i] = d/dt eta_target(t) |_{t=age_exit[i]}
+///   o_R[i] = eta_target(age_right[i])   (interval upper bound `R`; η-level only)
 ///
-/// so the exit and derivative partials are both evaluated at `age_exit[i]`
-/// and the entry partial at `age_entry[i]`. The origin-entry case
-/// (`entry_at_origin[i]`) has `r_entry[i] = 0` exactly, so we skip the
-/// `baseline_offset_theta_partials(age_entry, ..)` call for those rows
-/// (avoiding the `age > 0` precondition failure when age_entry is 0).
+/// so the exit and derivative partials are both evaluated at `age_exit[i]`,
+/// the entry partial at `age_entry[i]`, and the interval-right η-partial at
+/// `age_right[i]`. The origin-entry case (`entry_at_origin[i]`) has
+/// `r_entry[i] = 0` exactly and every non-interval row has `r_right[i] = 0`
+/// exactly, so we skip the `baseline_offset_theta_partials(age, ..)` call for
+/// those rows (avoiding the `age > 0` precondition failure when an inactive
+/// boundary age is 0 / a placeholder).
 ///
 /// Returns `Ok(None)` when `cfg.target == Linear` (no θ-parameters).
 pub fn baseline_chain_rule_gradient(
     age_entry: ndarray::ArrayView1<'_, f64>,
     age_exit: ndarray::ArrayView1<'_, f64>,
+    age_right: ndarray::ArrayView1<'_, f64>,
     cfg: &SurvivalBaselineConfig,
     residuals: &crate::families::survival::OffsetChannelResiduals,
 ) -> Result<Option<Array1<f64>>, String> {
@@ -2266,6 +2302,7 @@ pub fn baseline_chain_rule_gradient(
         "baseline_chain_rule_gradient",
         age_entry,
         age_exit,
+        age_right,
         cfg,
         residuals,
         baseline_offset_theta_partials,
@@ -2284,9 +2321,13 @@ pub fn marginal_slope_baseline_chain_rule_gradient(
     cfg: &SurvivalBaselineConfig,
     residuals: &crate::families::survival::OffsetChannelResiduals,
 ) -> Result<Option<Array1<f64>>, String> {
+    // Marginal-slope has no interval upper-bound channel; `residuals.right` is
+    // all-zero, so the right channel never contracts and `age_exit` serves as an
+    // unconsulted placeholder for the (unused) `age_right` argument.
     baseline_chain_rule_gradient_with_partials(
         "marginal_slope_baseline_chain_rule_gradient",
         age_entry,
+        age_exit,
         age_exit,
         cfg,
         residuals,

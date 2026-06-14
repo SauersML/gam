@@ -2897,6 +2897,8 @@ impl SurvivalLocationScaleFamily {
                     exit: Array1::<f64>::zeros(n),
                     entry: Array1::<f64>::zeros(n),
                     derivative: Array1::<f64>::zeros(n),
+                    // Location-scale has no interval upper-bound channel.
+                    right: Array1::<f64>::zeros(n),
                 },
                 OffsetChannelCurvatures {
                     rows: vec![[[0.0_f64; 3]; 3]; n],
@@ -2955,6 +2957,8 @@ impl SurvivalLocationScaleFamily {
                 exit,
                 entry,
                 derivative,
+                // Location-scale has no interval upper-bound channel.
+                right: Array1::<f64>::zeros(n),
             },
             OffsetChannelCurvatures { rows: curvatures },
         ))

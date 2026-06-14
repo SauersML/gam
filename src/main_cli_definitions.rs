@@ -5461,6 +5461,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         baseline_chain_rule_gradient(
                             age_entry.view(),
                             age_exit.view(),
+                            // No interval channel on this path; `residuals.right`
+                            // is all-zero so `age_exit` is an unconsulted placeholder.
+                            age_exit.view(),
                             candidate,
                             residuals,
                         )?
@@ -6148,6 +6151,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     let gradient = baseline_chain_rule_gradient(
                         age_entry.view(),
                         age_exit.view(),
+                        // CLI latent path does not materialize interval brackets;
+                        // `residuals.right` is all-zero so `age_exit` is an
+                        // unconsulted placeholder for `age_right`.
+                        age_exit.view(),
                         candidate,
                         &residuals,
                     )?
@@ -6613,6 +6620,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 })?;
                 let gradient = baseline_chain_rule_gradient(
                     age_entry.view(),
+                    age_exit.view(),
+                    // RP transformation path has no interval channel; `residuals.right`
+                    // is all-zero so `age_exit` is an unconsulted placeholder.
                     age_exit.view(),
                     candidate,
                     &residuals,

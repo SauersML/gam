@@ -3964,6 +3964,8 @@ impl SurvivalMarginalSlopeFamily {
                 exit,
                 entry,
                 derivative,
+                // Marginal-slope has no interval upper-bound channel.
+                right: Array1::<f64>::zeros(self.n),
             },
             OffsetChannelCurvatures { rows: curvatures },
         ))

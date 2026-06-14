@@ -3092,6 +3092,10 @@ fn fit_survival_transformation_model(
                 let gradient = baseline_chain_rule_gradient(
                     spec.age_entry.view(),
                     spec.age_exit.view(),
+                    // RP transformation has no interval upper-bound channel;
+                    // `residuals.right` is all-zero so `age_exit` is an unconsulted
+                    // placeholder for `age_right`.
+                    spec.age_exit.view(),
                     candidate,
                     &residuals,
                 )?

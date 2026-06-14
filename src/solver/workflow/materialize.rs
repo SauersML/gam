@@ -3578,6 +3578,9 @@ fn materialize_survival<'a>(
                     baseline_chain_rule_gradient(
                         age_entry.view(),
                         age_exit.view(),
+                        // Location-scale has no interval channel; `residuals.right`
+                        // is all-zero so `age_exit` is an unconsulted placeholder.
+                        age_exit.view(),
                         candidate,
                         residuals,
                     )?
@@ -3691,9 +3694,18 @@ fn materialize_survival<'a>(
                          stable_penalty_term={stable_penalty_term}, cost={profile_cost})"
                     ));
                 }
+                // Interval upper-bound boundary ages for the `right` channel.
+                // When the formula carries no `SurvInterval(L, R, event)` column
+                // `age_right` is None and every row's `residuals.right` is 0, so
+                // `age_exit` is an unconsulted placeholder; when present it is the
+                // per-row `R` the interval likelihood `log[S(L) − S(R)]` brackets
+                // against, and its baseline-θ η-offset sensitivity is the missing
+                // gradient channel the latent interval fit needs.
+                let age_right_view = age_right.as_ref().unwrap_or(&age_exit);
                 let gradient = baseline_chain_rule_gradient(
                     age_entry.view(),
                     age_exit.view(),
+                    age_right_view.view(),
                     candidate,
                     &residuals,
                 )?
