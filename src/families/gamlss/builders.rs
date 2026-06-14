@@ -1312,10 +1312,10 @@ pub(crate) fn fit_binomial_mean_wiggle(
 pub(crate) trait LocationScaleFamilyBuilder {
     type Family: CustomFamily + Clone + Send + Sync + 'static;
 
-    pub(crate) fn meanspec(&self) -> &TermCollectionSpec;
-    pub(crate) fn noisespec(&self) -> &TermCollectionSpec;
+    fn meanspec(&self) -> &TermCollectionSpec;
+    fn noisespec(&self) -> &TermCollectionSpec;
 
-    pub(crate) fn build_blocks(
+    fn build_blocks(
         &self,
         theta: &Array1<f64>,
         mean_design: &TermCollectionDesign,
@@ -1324,42 +1324,42 @@ pub(crate) trait LocationScaleFamilyBuilder {
         noise_beta_hint: Option<Array1<f64>>,
     ) -> Result<Vec<ParameterBlockSpec>, String>;
 
-    pub(crate) fn build_family(
+    fn build_family(
         &self,
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family;
 
-    pub(crate) fn extract_primary_betas(
+    fn extract_primary_betas(
         &self,
         fit: &UnifiedFitResult,
     ) -> Result<(Array1<f64>, Array1<f64>), String>;
 
-    pub(crate) fn mean_penalty_count(&self, mean_design: &TermCollectionDesign) -> usize {
+    fn mean_penalty_count(&self, mean_design: &TermCollectionDesign) -> usize {
         mean_design.penalties.len()
     }
 
-    pub(crate) fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
+    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
         noise_design.penalties.len()
     }
 
-    pub(crate) fn exact_spatial_joint_supported(&self) -> bool {
+    fn exact_spatial_joint_supported(&self) -> bool {
         false
     }
 
-    pub(crate) fn require_exact_spatial_joint(&self) -> bool {
+    fn require_exact_spatial_joint(&self) -> bool {
         false
     }
 
-    pub(crate) fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
+    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
         crate::seeding::SeedRiskProfile::GeneralizedLinear
     }
 
-    pub(crate) fn extra_rho0(&self) -> Result<Array1<f64>, String> {
+    fn extra_rho0(&self) -> Result<Array1<f64>, String> {
         Ok(Array1::zeros(0))
     }
 
-    pub(crate) fn build_psiderivative_blocks(
+    fn build_psiderivative_blocks(
         &self,
         arr: ndarray::ArrayView2<'_, f64>,
         term_spec: &TermCollectionSpec,
@@ -1869,15 +1869,15 @@ pub(crate) struct GaussianLocationScaleTermBuilder {
 impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
     type Family = GaussianLocationScaleFamily;
 
-    pub(crate) fn meanspec(&self) -> &TermCollectionSpec {
+    fn meanspec(&self) -> &TermCollectionSpec {
         &self.meanspec
     }
 
-    pub(crate) fn noisespec(&self) -> &TermCollectionSpec {
+    fn noisespec(&self) -> &TermCollectionSpec {
         &self.noisespec
     }
 
-    pub(crate) fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
+    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
         // Mirror the Binomial location-scale path: the log-sigma (scale)
         // block carries an extra full-space shrinkage penalty so its
         // polynomial nullspace (constant log-sigma, plus the linear term for
@@ -1889,15 +1889,15 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         noise_design.penalties.len() + 1
     }
 
-    pub(crate) fn exact_spatial_joint_supported(&self) -> bool {
+    fn exact_spatial_joint_supported(&self) -> bool {
         true
     }
 
-    pub(crate) fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
+    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
         crate::seeding::SeedRiskProfile::Gaussian
     }
 
-    pub(crate) fn build_blocks(
+    fn build_blocks(
         &self,
         theta: &Array1<f64>,
         mean_design: &TermCollectionDesign,
@@ -1926,7 +1926,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         Ok(vec![meanspec, noisespec])
     }
 
-    pub(crate) fn build_family(
+    fn build_family(
         &self,
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
@@ -1944,7 +1944,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         }
     }
 
-    pub(crate) fn extract_primary_betas(
+    fn extract_primary_betas(
         &self,
         fit: &UnifiedFitResult,
     ) -> Result<(Array1<f64>, Array1<f64>), String> {
@@ -1963,7 +1963,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         Ok((mean_beta, noise_beta))
     }
 
-    pub(crate) fn build_psiderivative_blocks(
+    fn build_psiderivative_blocks(
         &self,
         data: ndarray::ArrayView2<'_, f64>,
         meanspec_resolved: &TermCollectionSpec,
@@ -1996,37 +1996,37 @@ pub(crate) struct GaussianLocationScaleWiggleTermBuilder {
 impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
     type Family = GaussianLocationScaleWiggleFamily;
 
-    pub(crate) fn meanspec(&self) -> &TermCollectionSpec {
+    fn meanspec(&self) -> &TermCollectionSpec {
         &self.meanspec
     }
 
-    pub(crate) fn noisespec(&self) -> &TermCollectionSpec {
+    fn noisespec(&self) -> &TermCollectionSpec {
         &self.noisespec
     }
 
-    pub(crate) fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
+    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
         // Same full-space log-sigma shrinkage penalty as the non-wiggle
         // Gaussian builder; see GaussianLocationScaleTermBuilder.
         noise_design.penalties.len() + 1
     }
 
-    pub(crate) fn exact_spatial_joint_supported(&self) -> bool {
+    fn exact_spatial_joint_supported(&self) -> bool {
         true
     }
 
-    pub(crate) fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
+    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
         crate::seeding::SeedRiskProfile::Gaussian
     }
 
-    pub(crate) fn require_exact_spatial_joint(&self) -> bool {
+    fn require_exact_spatial_joint(&self) -> bool {
         true
     }
 
-    pub(crate) fn extra_rho0(&self) -> Result<Array1<f64>, String> {
+    fn extra_rho0(&self) -> Result<Array1<f64>, String> {
         initial_log_lambdas_orzeros(&self.wiggle_block)
     }
 
-    pub(crate) fn build_blocks(
+    fn build_blocks(
         &self,
         theta: &Array1<f64>,
         mean_design: &TermCollectionDesign,
@@ -2067,7 +2067,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         Ok(vec![meanspec, noisespec, wigglespec])
     }
 
-    pub(crate) fn build_family(
+    fn build_family(
         &self,
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
@@ -2088,7 +2088,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         }
     }
 
-    pub(crate) fn extract_primary_betas(
+    fn extract_primary_betas(
         &self,
         fit: &UnifiedFitResult,
     ) -> Result<(Array1<f64>, Array1<f64>), String> {
@@ -2107,7 +2107,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         Ok((mean_beta, noise_beta))
     }
 
-    pub(crate) fn build_psiderivative_blocks(
+    fn build_psiderivative_blocks(
         &self,
         data: ndarray::ArrayView2<'_, f64>,
         meanspec_resolved: &TermCollectionSpec,
@@ -2141,27 +2141,27 @@ pub(crate) struct BinomialLocationScaleTermBuilder {
 impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
     type Family = BinomialLocationScaleFamily;
 
-    pub(crate) fn meanspec(&self) -> &TermCollectionSpec {
+    fn meanspec(&self) -> &TermCollectionSpec {
         &self.meanspec
     }
 
-    pub(crate) fn noisespec(&self) -> &TermCollectionSpec {
+    fn noisespec(&self) -> &TermCollectionSpec {
         &self.noisespec
     }
 
-    pub(crate) fn exact_spatial_joint_supported(&self) -> bool {
+    fn exact_spatial_joint_supported(&self) -> bool {
         true
     }
 
-    pub(crate) fn require_exact_spatial_joint(&self) -> bool {
+    fn require_exact_spatial_joint(&self) -> bool {
         true
     }
 
-    pub(crate) fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
+    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
         noise_design.penalties.len() + 1
     }
 
-    pub(crate) fn build_blocks(
+    fn build_blocks(
         &self,
         theta: &Array1<f64>,
         mean_design: &TermCollectionDesign,
@@ -2191,7 +2191,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         Ok(vec![thresholdspec, log_sigmaspec])
     }
 
-    pub(crate) fn build_family(
+    fn build_family(
         &self,
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
@@ -2209,7 +2209,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         }
     }
 
-    pub(crate) fn extract_primary_betas(
+    fn extract_primary_betas(
         &self,
         fit: &UnifiedFitResult,
     ) -> Result<(Array1<f64>, Array1<f64>), String> {
@@ -2228,7 +2228,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         Ok((mean_beta, noise_beta))
     }
 
-    pub(crate) fn build_psiderivative_blocks(
+    fn build_psiderivative_blocks(
         &self,
         data: ndarray::ArrayView2<'_, f64>,
         meanspec_resolved: &TermCollectionSpec,
@@ -2262,31 +2262,31 @@ pub(crate) struct BinomialLocationScaleWiggleTermBuilder {
 impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
     type Family = BinomialLocationScaleWiggleFamily;
 
-    pub(crate) fn meanspec(&self) -> &TermCollectionSpec {
+    fn meanspec(&self) -> &TermCollectionSpec {
         &self.meanspec
     }
 
-    pub(crate) fn noisespec(&self) -> &TermCollectionSpec {
+    fn noisespec(&self) -> &TermCollectionSpec {
         &self.noisespec
     }
 
-    pub(crate) fn exact_spatial_joint_supported(&self) -> bool {
+    fn exact_spatial_joint_supported(&self) -> bool {
         true
     }
 
-    pub(crate) fn require_exact_spatial_joint(&self) -> bool {
+    fn require_exact_spatial_joint(&self) -> bool {
         true
     }
 
-    pub(crate) fn extra_rho0(&self) -> Result<Array1<f64>, String> {
+    fn extra_rho0(&self) -> Result<Array1<f64>, String> {
         initial_log_lambdas_orzeros(&self.wiggle_block)
     }
 
-    pub(crate) fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
+    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
         noise_design.penalties.len() + 1
     }
 
-    pub(crate) fn build_blocks(
+    fn build_blocks(
         &self,
         theta: &Array1<f64>,
         mean_design: &TermCollectionDesign,
@@ -2328,7 +2328,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         Ok(vec![thresholdspec, log_sigmaspec, wigglespec])
     }
 
-    pub(crate) fn build_family(
+    fn build_family(
         &self,
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
@@ -2348,7 +2348,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         }
     }
 
-    pub(crate) fn extract_primary_betas(
+    fn extract_primary_betas(
         &self,
         fit: &UnifiedFitResult,
     ) -> Result<(Array1<f64>, Array1<f64>), String> {
@@ -2367,7 +2367,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         Ok((mean_beta, noise_beta))
     }
 
-    pub(crate) fn build_psiderivative_blocks(
+    fn build_psiderivative_blocks(
         &self,
         data: ndarray::ArrayView2<'_, f64>,
         meanspec_resolved: &TermCollectionSpec,
@@ -2633,7 +2633,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BinomialMeanWiggleTermFitResult, String> {
-    pub(crate) const RHO_BOUND: f64 = 12.0;
+    const RHO_BOUND: f64 = 12.0;
 
     validate_term_weights(
         data,
@@ -2814,7 +2814,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let mut outer_options = options.clone();
     outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
-    pub(crate) struct MeanWiggleOuterState {
+    struct MeanWiggleOuterState {
         warm_cache: Option<crate::custom_family::CustomFamilyWarmStart>,
         last_eval: Option<(
             Array1<f64>,
