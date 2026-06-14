@@ -47,7 +47,8 @@ use gam::inference::data::{
 use gam::inference::formula_dsl::{
     LinkChoice, LinkFormulaSpec, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
     effectivelinkwiggle_formulaspec, formula_rhs_text, parse_formula, parse_link_choice,
-    parse_matching_auxiliary_formula, parse_surv_response, parsed_term_column_names,
+    parse_matching_auxiliary_formula, parse_surv_interval_response, parse_surv_response,
+    parsed_term_column_names,
     require_inverse_link_supports_joint_wiggle, require_likelihood_spec_supports_joint_wiggle,
     require_linkchoice_supports_joint_wiggle, validate_auxiliary_formula_controls,
     validate_marginal_slope_z_column_exclusion,
@@ -1600,6 +1601,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     };
     let standard_wiggle = if learn_linkwiggle
         && fit_config.noise_formula.is_none()
@@ -1677,6 +1679,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 rho_prior: Default::default(),
                 kronecker_penalty_system: None,
                 kronecker_factored: None,
+                persist_warm_start_disk: false,
             },
         )
         .map_err(|e| format!("fit_gam (forced Firth) failed: {e}"))?;
@@ -4622,6 +4625,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         };
         let alo_result = match alo_refit_route_for_termspec(&spec) {
             AloRefitRoute::UnifiedTermCollection => {

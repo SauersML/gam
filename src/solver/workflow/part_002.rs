@@ -2196,6 +2196,7 @@ fn materialize_standard<'a>(
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: config.persist_warm_start_disk,
     };
     let kappa_options = SpatialLengthScaleOptimizationOptions::default();
 
@@ -2436,6 +2437,7 @@ fn materialize_survival<'a>(
     entry_col: Option<&str>,
     exit_col: &str,
     event_col: &str,
+    interval_right_col: Option<&str>,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
     let mut inference_notes = Vec::new();
 
