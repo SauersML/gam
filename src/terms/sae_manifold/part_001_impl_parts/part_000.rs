@@ -259,19 +259,11 @@ impl SaeManifoldTerm {
         }
         let penalized_hessian = &xtwx + &penalty;
 
-        // Smooth effective df = tr(H⁻¹ ΦᵀWΦ) − 1 (drop the constant/intercept
-        // null dimension). Falls back to `None`-producing degeneracy if the
-        // Hessian is not SPD.
-        let factor = match penalized_hessian.cholesky(Side::Lower) {
-            Ok(f) => f,
-            Err(_) => return Ok(None),
-        };
-        let h_inv_xtwx = factor.solve_mat(&xtwx);
-        let mut trace = 0.0_f64;
-        for i in 0..m {
-            trace += h_inv_xtwx[[i, i]];
+        // SPD prerequisite: the inner penalized Hessian must factor, else the
+        // atom's inner-smooth fit is degenerate and no report is producible.
+        if penalized_hessian.cholesky(Side::Lower).is_err() {
+            return Ok(None);
         }
-        let smooth_edf = (trace - 1.0).max(0.0);
 
         // Peak (largest fitted |g_k| on channel j) and mode (largest assignment
         // mass) design rows, over the active set.
@@ -319,7 +311,6 @@ impl SaeManifoldTerm {
             peak_design_row,
             mode_design_row,
             kappa_hat,
-            smooth_edf,
             geodesic_length_jet,
             penalty_order,
             xtw_z,
