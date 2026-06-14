@@ -810,6 +810,39 @@ impl ArdAxisPrior {
 }
 
 
+/// Large-argument (`|x| >= 3.75`) Abramowitz & Stegun 9.8.2 polynomial for the
+/// *exponentially-scaled* `I0`: `√x · e^{−x} · I0(x) ≈ poly(3.75/x)`. Factoring
+/// the `e^{x}/√x` envelope out lets the log-partition and the `I1/I0` ratio be
+/// computed without ever materialising `e^{x}` (which overflows to `+inf` for
+/// `x ≳ 709`, see [`bessel_i0_log_and_ratio`]).
+fn bessel_i0_scaled_poly(ax: f64) -> f64 {
+    let y = 3.75 / ax;
+    0.39894228
+        + y * (0.01328592
+            + y * (0.00225319
+                + y * (-0.00157565
+                    + y * (0.00916281
+                        + y * (-0.02057706
+                            + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377)))))))
+}
+
+
+/// Large-argument (`|x| >= 3.75`) Abramowitz & Stegun 9.8.4 polynomial for the
+/// *exponentially-scaled* `I1`: `√x · e^{−x} · I1(x) ≈ poly(3.75/x)`. Pairs with
+/// [`bessel_i0_scaled_poly`] so their shared `e^{x}/√x` envelope cancels exactly
+/// in the `I1/I0` ratio.
+fn bessel_i1_scaled_poly(ax: f64) -> f64 {
+    let y = 3.75 / ax;
+    0.39894228
+        + y * (-0.03988024
+            + y * (-0.00362018
+                + y * (0.00163801
+                    + y * (-0.01031555
+                        + y * (0.02282967
+                            + y * (-0.02895312 + y * (0.01787654 - y * 0.00420059)))))))
+}
+
+
 /// Modified Bessel function of the first kind, order zero, `I0(x)`.
 ///
 /// Abramowitz & Stegun 9.8.1 (|x| <= 3.75) and 9.8.2 (|x| > 3.75) polynomial
@@ -826,15 +859,7 @@ fn bessel_i0(x: f64) -> f64 {
                 + t2 * (3.0899424
                     + t2 * (1.2067492 + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813)))))
     } else {
-        let y = 3.75 / ax;
-        let poly = 0.39894228
-            + y * (0.01328592
-                + y * (0.00225319
-                    + y * (-0.00157565
-                        + y * (0.00916281
-                            + y * (-0.02057706
-                                + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377)))))));
-        (ax.exp() / ax.sqrt()) * poly
+        (ax.exp() / ax.sqrt()) * bessel_i0_scaled_poly(ax)
     }
 }
 
@@ -854,17 +879,42 @@ fn bessel_i1(x: f64) -> f64 {
                 + t2 * (0.51498869
                     + t2 * (0.15084934 + t2 * (0.02658733 + t2 * (0.00301532 + t2 * 0.00032411))))))
     } else {
-        let y = 3.75 / ax;
-        let poly = 0.39894228
-            + y * (-0.03988024
-                + y * (-0.00362018
-                    + y * (0.00163801
-                        + y * (-0.01031555
-                            + y * (0.02282967
-                                + y * (-0.02895312 + y * (0.01787654 - y * 0.00420059)))))));
-        (ax.exp() / ax.sqrt()) * poly
+        (ax.exp() / ax.sqrt()) * bessel_i1_scaled_poly(ax)
     };
     if x < 0.0 { -value } else { value }
+}
+
+
+/// Overflow-free `(log I0(η), I1(η)/I0(η))` for `η >= 0`, the only two Bessel
+/// quantities the von-Mises ARD precision normaliser and its ρ-gradient need.
+///
+/// The naive `bessel_i0(η).ln()` and `bessel_i1(η)/bessel_i0(η)` both route
+/// through `e^{η}/√η`, which overflows to `+inf` once `η ≳ 709`. Two `+inf`s
+/// then divide to `NaN`, poisoning the very first outer ρ-gradient on
+/// large-norm / ill-conditioned checkpoints (issue #1113: a dispersion-inflated
+/// ARD seed pushes `η = α/κ²` past the overflow threshold at iter 0). For a
+/// periodic circle atom (`κ = 2π`) this fires for any seed precision
+/// `α ≳ 2.8e4`, well inside the reachable seed range.
+///
+/// We never form `e^{η}`. For the small branch (`η < 3.75`) the A&S series are
+/// finite, so we evaluate them directly. For the large branch the shared
+/// `e^{η}/√η` envelope cancels in the *log* (`log I0 = η − ½ ln η + ln poly`)
+/// and in the *ratio* (`I1/I0 = poly₁/poly₀`), so both are computed from the
+/// bounded scaled polynomials alone — exact for non-degenerate η and finite for
+/// every finite η.
+fn bessel_i0_log_and_ratio(eta: f64) -> (f64, f64) {
+    let ax = eta.abs();
+    if ax < 3.75 {
+        let i0 = bessel_i0(ax);
+        let i1 = bessel_i1(ax);
+        (i0.ln(), i1 / i0)
+    } else {
+        let poly0 = bessel_i0_scaled_poly(ax);
+        let poly1 = bessel_i1_scaled_poly(ax);
+        let log_i0 = ax - 0.5 * ax.ln() + poly0.ln();
+        let ratio = poly1 / poly0;
+        (log_i0, ratio)
+    }
 }
 
 
@@ -3082,6 +3132,17 @@ pub struct SaeManifoldTerm {
     /// sees which atoms genuinely earn their curvature and which collapse to the
     /// linear tail. Read via [`Self::hybrid_split_report`].
     hybrid_split_report: Option<crate::terms::sae::hybrid_split::SaeHybridSplitReport>,
+    /// Per-atom inner-decoder-smooth byproducts harvested post-fit (#1097 /
+    /// #1103), one entry per atom in [`Self::atoms`] order. Each is the fixed
+    /// fitted snapshot the residual-gauge certificate's three post-PIRLS atom
+    /// inference reports consume
+    /// ([`crate::sae_identifiability::AtomInnerFit`]). `None` until
+    /// [`Self::set_atom_inner_fits`] runs (it needs the reconstruction target
+    /// `Z`, available only at the post-fit harness seam where the dispersion is
+    /// also profiled); a per-atom `None` means that atom had no active rows or a
+    /// degenerate inner design. Read by [`Self::to_residual_gauge_model`], which
+    /// attaches each onto its [`crate::sae_identifiability::FittedAtom`].
+    atom_inner_fits: Option<Vec<Option<crate::sae_identifiability::AtomInnerFit>>>,
 }
 
 
@@ -3102,6 +3163,7 @@ impl Clone for SaeManifoldTerm {
             expected_evidence_gauge_deflated_directions: self
                 .expected_evidence_gauge_deflated_directions,
             hybrid_split_report: self.hybrid_split_report.clone(),
+            atom_inner_fits: self.atom_inner_fits.clone(),
         }
     }
 }

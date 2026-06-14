@@ -1544,18 +1544,62 @@ impl SaeManifoldTerm {
     }
 
     pub fn try_fitted(&self) -> Result<Array2<f64>, String> {
-        self.try_fitted_with_rho(None)
+        // Production/user-facing reconstruction: honours the #1026 hybrid-split
+        // verdict (verdict-linear `d = 1` slots decode their straight sub-model).
+        self.try_fitted_with_rho(None, true)
     }
 
     pub(crate) fn try_fitted_for_rho(&self, rho: &SaeManifoldRho) -> Result<Array2<f64>, String> {
-        self.try_fitted_with_rho(Some(rho))
+        // Internal/fitting reconstruction: the pure CURVED image (the joint fit
+        // and the #1026 adjudication both require the uncollapsed curve).
+        self.try_fitted_with_rho(Some(rho), false)
     }
 
-    fn try_fitted_with_rho(&self, rho: Option<&SaeManifoldRho>) -> Result<Array2<f64>, String> {
+    fn try_fitted_with_rho(
+        &self,
+        rho: Option<&SaeManifoldRho>,
+        collapse: bool,
+    ) -> Result<Array2<f64>, String> {
         let n = self.n_obs();
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
         let mut out = Array2::<f64>::zeros((n, p));
+        // #1026 — the curved/linear hybrid-split verdict is LOAD-BEARING on the
+        // production reconstruction, not just a side report. When
+        // [`Self::compute_hybrid_split_report`] (run post-fit in
+        // `canonicalize_charts_post_fit`) adjudicated a `d = 1` atom's evidence
+        // in favour of its straight (Θ→0) sub-model, the model's output
+        // reconstruction (`fitted()` / `try_fitted` → predict and the user-facing
+        // output) decodes that slot with its fitted linear image instead of its
+        // curved decoded curve. The linear images are coordinate-keyed and
+        // rho-independent (exact weighted-LS lines realised inside the
+        // adjudication — no re-fit, no #1051 outer continuation).
+        //
+        // The collapse engages on the NO-RHO production path only. The rho-keyed
+        // `try_fitted_for_rho` stays the pure CURVED reconstruction: the joint
+        // fit's loss/assembly optimise the curved decoder coefficients and must
+        // see the curved image, and the #1026 adjudication itself compares the
+        // curved fit against its straight sub-model — both require the
+        // uncollapsed curve. During fitting the report is `None` regardless (it
+        // is only computed post-fit), so this gate keeps the curved/collapsed
+        // boundary explicit rather than implicit in call ordering.
+        let linear_images: std::collections::HashMap<
+            usize,
+            &crate::terms::sae::hybrid_split::AtomLinearImage,
+        > = if rho.is_none() {
+            self.hybrid_split_report
+                .as_ref()
+                .map(|report| {
+                    report
+                        .verdicts
+                        .iter()
+                        .filter_map(|v| v.linear_image.as_ref().map(|img| (img.atom_idx, img)))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
         // Reuse a single scratch buffer across all (row, atom) pairs instead of
         // allocating a fresh `Array1<f64>` of length p per call.
         let mut g_buf = vec![0.0_f64; p];
@@ -1565,8 +1609,15 @@ impl SaeManifoldTerm {
                 None => self.assignment.try_assignments_row(row)?,
             };
             for atom_idx in 0..k_atoms {
-                self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
                 let a_k = a[atom_idx];
+                if let Some(image) = linear_images.get(&atom_idx) {
+                    // Verdict-linear slot: substitute the straight sub-model image
+                    // at this row's fitted on-atom coordinate.
+                    let t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
+                    image.fill_row(t, &mut g_buf);
+                } else {
+                    self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
+                }
                 let mut out_row = out.row_mut(row);
                 for out_col in 0..p {
                     out_row[out_col] += a_k * g_buf[out_col];
@@ -1735,40 +1786,17 @@ impl SaeManifoldTerm {
         &self,
         rho: &SaeManifoldRho,
     ) -> Result<Array2<f64>, String> {
-        let mut out = self.try_fitted_for_rho(rho)?;
-        let Some(report) = self.hybrid_split_report.as_ref() else {
-            return Ok(out);
-        };
-        let n = self.n_obs();
-        let p = self.output_dim();
-        let mut curved_buf = vec![0.0_f64; p];
-        let mut linear_buf = vec![0.0_f64; p];
-        for verdict in &report.verdicts {
-            let Some(image) = verdict.linear_image.as_ref() else {
-                continue;
-            };
-            let atom_idx = image.atom_idx;
-            let coord_col = self.assignment.coords[atom_idx]
-                .as_matrix()
-                .column(0)
-                .to_owned();
-            for row in 0..n {
-                let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
-                let a_k = a[atom_idx];
-                if a_k == 0.0 {
-                    continue;
-                }
-                // Swap the atom's contribution: subtract its curved decoded image,
-                // add its straight sub-model image at the same coordinate/mass.
-                self.atoms[atom_idx].fill_decoded_row(row, &mut curved_buf);
-                image.fill_row(coord_col[row], &mut linear_buf);
-                let mut out_row = out.row_mut(row);
-                for out_col in 0..p {
-                    out_row[out_col] += a_k * (linear_buf[out_col] - curved_buf[out_col]);
-                }
-            }
-        }
-        Ok(out)
+        // #1026 — the hybrid collapse is now applied by the SINGLE
+        // reconstruction path ([`Self::try_fitted_with_rho`]): a verdict-linear
+        // `d = 1` slot decodes its straight sub-model image in EVERY
+        // reconstruction (production `fitted()`, predict, EV), so the verdict is
+        // load-bearing rather than realised only through this method. This call
+        // therefore delegates to the rho-keyed reconstruction; the dedicated
+        // re-collapse loop it used to carry was a parallel layer that would now
+        // double-substitute the linear image. Retained as a named entry point
+        // for the #1026 EV-dominance reporting (`hybrid_collapsed_explained_variance`)
+        // and the part_003 regression battery.
+        self.try_fitted_for_rho(rho)
     }
 
     /// #1026 — the reconstruction explained variance of the hybrid-collapsed
@@ -2248,7 +2276,9 @@ impl SaeManifoldTerm {
                     Some(p) => {
                         let kappa = std::f64::consts::TAU / p;
                         let eta = alpha / (kappa * kappa);
-                        let log_i0 = bessel_i0(eta).ln();
+                        // Overflow-free `log I0(η)`; `bessel_i0(η).ln()` would be
+                        // `+inf` for `η ≳ 709` (#1113).
+                        let log_i0 = bessel_i0_log_and_ratio(eta).0;
                         acc += energy + (n as f64) * (-eta + log_i0);
                     }
                 }
@@ -5035,9 +5065,12 @@ impl SaeManifoldTerm {
                     Some(p) => {
                         let kappa = std::f64::consts::TAU / p;
                         let eta = alpha / (kappa * kappa);
-                        let i0 = bessel_i0(eta);
-                        let i1 = bessel_i1(eta);
-                        n * eta * (-1.0 + i1 / i0)
+                        // d/d(log α) of `n[-η + log I0(η)]` = `n η (I1/I0 - 1)`.
+                        // The ratio is computed without forming `e^{η}`, so it
+                        // stays finite for large `η` instead of the `inf/inf =
+                        // NaN` that `bessel_i1(η)/bessel_i0(η)` produces (#1113).
+                        let ratio = bessel_i0_log_and_ratio(eta).1;
+                        n * eta * (-1.0 + ratio)
                     }
                 };
                 atom_out[axis] = energy_deriv + normalizer_deriv;
