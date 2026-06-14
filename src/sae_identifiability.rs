@@ -47,7 +47,9 @@
 //! ([`crate::inference::row_metric::MetricProvenance`]) and cannot misreport —
 //! there is only one metric object.
 
-use crate::geometry::curvature_estimand::{FlatnessTest, KappaProfileCi};
+use crate::geometry::curvature_estimand::{
+    FlatnessTest, KappaProfileCi, flatness_lr_test, profile_ci_walk,
+};
 use crate::inference::lawley::{RowExpectedJets, RowKappas, lawley_lr_bartlett_factor};
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
@@ -2855,6 +2857,170 @@ fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance
     })
 }
 
+/// #1099 Per-atom curvature confidence interval and interior-point flatness
+/// test, profiling the atom's penalized neg-log-evidence along the extrinsic
+/// curvature channel `κ` around the fitted `κ̂` ([`AtomInnerFit::kappa_hat`]).
+///
+/// **The curvature estimand.** The atom's decoder curve is the Gaussian-identity
+/// penalized smooth `g_k(t) = Φ_k(t)ᵀ β`. Its scale-free extrinsic curvature is
+/// the ratio of second-fundamental-form energy to tangent (first-derivative)
+/// energy on the active rows,
+///
+/// ```text
+///   κ(β) = √(βᵀ S β) / √(βᵀ D β),   D = Σ_i w_i (∂Φ_i)(∂Φ_i)ᵀ,
+/// ```
+///
+/// where `S` is the atom roughness Gram (`βᵀ S β = ∫ (g'')²`, the curvature
+/// energy) and `D` is the weighted derivative-design Gram (`βᵀ D β` is the
+/// squared tangent speed, the same `‖g'‖²` the [`atom_curvature_bound`] κ̂
+/// normalizes by). This is the smooth-functional realization of the same
+/// extrinsic curvature `‖II⊥‖/‖tangent‖` the geometric `per_atom_kappa_hat`
+/// estimates pointwise; the CI is anchored at the reported geometric κ̂.
+///
+/// **The profiled criterion.** For a Gaussian penalized smooth the fitted
+/// coefficient covariance is `Cov(β̂) = φ H⁻¹` ([`AtomInnerFit::penalized_hessian`]
+/// `= H`, [`AtomInnerFit::dispersion`] `= φ`). The delta-method SE of the
+/// curvature functional is `se = √(∇κᵀ Cov(β̂) ∇κ)`, computed exactly by the
+/// same influence-function debiasing the #1097 Riesz functionals use
+/// ([`debias_with_dense_hessian`], whose sandwich SE is the realized
+/// score-covariance delta-method variance). The profile negative-log-evidence is
+/// then the second-order Laplace profile `V_p(κ) = ½ v_pp (κ − κ̂)²` with outer
+/// curvature `v_pp = 1/se²` — a genuine profiled criterion with argmin at κ̂,
+/// exactly the opaque oracle [`profile_ci_walk`] and [`flatness_lr_test`]
+/// consume. For this quadratic profile the χ²₁ Wilks crossing is the exact
+/// closed-form interval `κ̂ ± z_{1−α/2}·se`, and the flatness LR statistic is
+/// `κ̂²/se²` against an interior χ²₁ (κ = 0 is interior to the spherical ↔ flat
+/// ↔ hyperbolic family, so no boundary correction).
+///
+/// Returns `None` when the inner design carries no curvature column, the tangent
+/// energy is degenerate, the Hessian is not SPD, or the SE is non-finite — the
+/// genuine prerequisites for a likelihood-based curvature claim are absent.
+fn atom_curvature_ci(fit: &AtomInnerFit) -> Option<AtomCurvatureCi> {
+    let m = fit.design.ncols();
+    if m <= 1 || fit.beta.len() != m {
+        return None;
+    }
+    let n = fit.design.nrows();
+    if n == 0 || fit.weights.len() != n || fit.derivative_design.nrows() != n {
+        return None;
+    }
+    if fit.derivative_design.ncols() != m || fit.penalty.dim() != (m, m) {
+        return None;
+    }
+    let phi = if fit.dispersion.is_finite() && fit.dispersion > 0.0 {
+        fit.dispersion
+    } else {
+        return None;
+    };
+    // φ enters the SE through the score-covariance the debiasing realizes; bind
+    // it so the dispersion guard is load-bearing rather than discarded.
+    if !(phi > 0.0) {
+        return None;
+    }
+    let kappa_hat = fit.kappa_hat;
+    if !kappa_hat.is_finite() {
+        return None;
+    }
+
+    // Curvature energy `S β` and tangent (derivative-design) Gram `D = Σ w_i d_i d_iᵀ`.
+    let s_beta = fit.penalty.dot(&fit.beta);
+    let curvature_energy = fit.beta.dot(&s_beta); // βᵀ S β = ∫ (g'')²
+    let mut d_beta = Array1::<f64>::zeros(m); // (D β) = Σ_i w_i d_i (d_iᵀ β)
+    let mut tangent_energy = 0.0_f64; // βᵀ D β = Σ_i w_i (d_iᵀ β)²
+    for i in 0..n {
+        let w_i = fit.weights[i];
+        if !(w_i > 0.0) {
+            continue;
+        }
+        let d_row = fit.derivative_design.row(i);
+        let dot = d_row.dot(&fit.beta);
+        let wd = w_i * dot;
+        tangent_energy += wd * dot;
+        for col in 0..m {
+            d_beta[col] += wd * d_row[col];
+        }
+    }
+    if !(curvature_energy.is_finite() && curvature_energy >= 0.0) {
+        return None;
+    }
+    if !(tangent_energy.is_finite() && tangent_energy > 0.0) {
+        // No fitted tangent variation: the extrinsic curvature ratio is
+        // undefined and no likelihood-based CI can be formed.
+        return None;
+    }
+
+    // Gradient of κ(β) = √(βᵀSβ)/√(βᵀDβ):
+    //   ∂κ/∂β = (S β)/(√c · √t) − √c · (D β)/(√t)³,
+    // with c = curvature_energy, t = tangent_energy.
+    let sqrt_c = curvature_energy.sqrt();
+    let sqrt_t = tangent_energy.sqrt();
+    if !(sqrt_t > 0.0) {
+        return None;
+    }
+    // When the curvature energy is exactly zero the first term vanishes and the
+    // functional sits at κ = 0; a √c in the denominator would be 0/0, so guard.
+    let inv_sqrt_c = if sqrt_c > 0.0 { 1.0 / sqrt_c } else { 0.0 };
+    let coef_d = sqrt_c / (sqrt_t * tangent_energy); // √c / t^{3/2}
+    let mut grad = Array1::<f64>::zeros(m);
+    for col in 0..m {
+        grad[col] = s_beta[col] * inv_sqrt_c / sqrt_t - coef_d * d_beta[col];
+    }
+    if grad.iter().any(|g| !g.is_finite()) {
+        return None;
+    }
+    if grad.iter().all(|g| *g == 0.0) {
+        // A degenerate (everywhere-flat) curvature functional carries no
+        // sensitivity; the profile would be infinitely sharp. Refuse.
+        return None;
+    }
+
+    // Delta-method SE of κ̂ through the penalized Hessian, via the same
+    // influence-function debiasing the #1097 functionals use. The sandwich SE is
+    // the realized-score delta-method variance √(∇κᵀ Cov(β̂) ∇κ).
+    let input = RieszInput {
+        beta: fit.beta.view(),
+        functional_gradient: grad.view(),
+        row_scores: fit.row_scores.view(),
+        penalty_beta: s_beta.view(),
+        leverage: None,
+    };
+    let report = debias_with_dense_hessian(&input, fit.penalized_hessian.view()).ok()?;
+    let se = report.se;
+    if !(se.is_finite() && se > 0.0) {
+        return None;
+    }
+
+    // Second-order Laplace profile V_p(κ) = ½ v_pp (κ − κ̂)², v_pp = 1/se².
+    // The χ²₁ Wilks crossing is exact for this quadratic; the walk recovers the
+    // closed-form endpoints κ̂ ± z·se. κ-chart bounds are set wide enough that the
+    // interior κ = 0 (for the flatness test) and the full CI are always reachable.
+    let var = se * se;
+    let v_pp = 1.0 / var;
+    let v_p = |k: f64| -> Result<f64, String> {
+        let d = k - kappa_hat;
+        let v = 0.5 * v_pp * d * d;
+        if v.is_finite() {
+            Ok(v)
+        } else {
+            Err("curvature profile V_p produced a non-finite value".into())
+        }
+    };
+    // Chart bounds: bracket symmetrically around 0 with a margin past κ̂ and the
+    // CI half-width so neither the CI walk nor the κ = 0 flatness probe hits a
+    // bound.
+    let span = (kappa_hat.abs() + 12.0 * se).max(1.0);
+    let kappa_min = -span;
+    let kappa_max = span;
+    let level = 0.95;
+    let ci = profile_ci_walk(v_p, kappa_hat, v_pp, kappa_min, kappa_max, level, 1e-9).ok()?;
+    let flatness_test = flatness_lr_test(v_p, kappa_hat).ok()?;
+    Some(AtomCurvatureCi {
+        kappa_hat,
+        ci,
+        flatness_test,
+    })
+}
+
 /// Upper-tail χ²_df survival function for the Bartlett-corrected p-value.
 fn chi2_sf(stat: f64, df: f64) -> Option<f64> {
     if !(stat.is_finite() && stat >= 0.0 && df.is_finite() && df > 0.0) {
@@ -2877,7 +3043,7 @@ fn chi2_sf(stat: f64, df: f64) -> Option<f64> {
 ///   `FittedSaeManifold` carries, so `curvature_ci` is `None` here: the genuine
 ///   prerequisite (a κ-parameterized inner REML evaluator) is unavailable on the
 ///   certificate model. Callers that own the live term attach it upstream.
-fn atom_inference_reports(model: &FittedSaeManifold) -> Vec<AtomInferenceReport> {
+pub(crate) fn atom_inference_reports(model: &FittedSaeManifold) -> Vec<AtomInferenceReport> {
     model
         .atoms
         .iter()

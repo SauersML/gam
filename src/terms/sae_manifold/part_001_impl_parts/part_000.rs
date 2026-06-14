@@ -531,6 +531,16 @@ impl SaeManifoldTerm {
             )?
         };
 
+        // #1097 / #1103: per-atom Riesz-debiased functionals and Bartlett smooth
+        // significance, read straight off the certificate model — which carries
+        // each atom's `inner_fit` snapshot when the caller harvested it via
+        // [`Self::set_atom_inner_fits`] before this report. Atoms without a
+        // harvested inner fit degrade their inference fields to `None` inside
+        // `atom_inference_reports`, so this is always populated (one entry per
+        // atom) and never gated by a flag.
+        let atom_inference =
+            crate::sae_identifiability::atom_inference_reports(&certificate_model);
+
         Ok(SaeManifoldFitDiagnostics {
             atom_two_lens,
             residual_gauge,
@@ -540,6 +550,7 @@ impl SaeManifoldTerm {
                 )?),
                 None => None,
             },
+            atom_inference,
         })
     }
 

@@ -2470,6 +2470,17 @@ fn sae_manifold_fit_inner<'py>(
     term.set_certificate_dispersion(shape_uncertainty.dispersion)
         .map_err(py_value_error)?;
 
+    // #1097 / #1103: harvest each atom's fixed inner-decoder-smooth snapshot
+    // (design, derivative design, penalized inner Hessian, per-row Gaussian
+    // scores, roughness Gram, peak/mode design rows) at the settled state, so
+    // the diagnostics report can produce per-atom Riesz-debiased functionals and
+    // Bartlett smooth significance. Needs the reconstruction target `Z` (dropped
+    // from the objective at fit end) and the fitted dispersion, both available
+    // here. A degenerate atom (no active rows / non-SPD inner Hessian) yields a
+    // `None` slot inside; a structural shape inconsistency surfaces loudly.
+    term.set_atom_inner_fits(z_view.view(), &rho, shape_uncertainty.dispersion)
+        .map_err(py_value_error)?;
+
     // Additive post-fit diagnostics (#980): the two-score per-atom lens
     // (presence / behavioral coupling / discrepancy) and the residual-gauge
     // certificate. Both read the fitted term + its single per-row metric; under a
@@ -2701,6 +2712,14 @@ fn sae_manifold_fit_inner<'py>(
             sae_incoherence_report_dict(py, report)?,
         )?;
     }
+    // #1097 / #1103 — per-atom Riesz-debiased smooth-functional inference
+    // (peak-vs-mode contrast, average-derivative magnitude, data-averaged value;
+    // each with plug-in + one-step-debiased estimate, SE, penalty bias, 95% CI)
+    // and Bartlett-corrected smooth significance. One entry per fitted atom.
+    out.set_item(
+        "atom_inference",
+        sae_atom_inference_list(py, &fit_diagnostics.atom_inference)?,
+    )?;
     // #16 — ONE coherent certificate ledger. Every certificate this fit produced
     // implements the shared claim+evidence+conservative-verdict contract
     // ([`gam::inference::certificates::Certificate`]); the ledger folds them into
@@ -2923,6 +2942,78 @@ fn sae_hybrid_split_dict<'py>(
     }
     d.set_item("atoms", atoms)?;
     Ok(d)
+}
+
+/// Serialize one Riesz-debiased smooth-functional report (#1097): the plug-in
+/// estimate, the one-step penalty-debiased estimate, its influence-based SE, the
+/// removed penalty bias, and a 95% Wald interval on the debiased estimate.
+fn sae_riesz_report_dict<'py>(
+    py: Python<'py>,
+    report: &gam::inference::riesz::RieszDebiasReport,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("theta_plugin", report.theta_plugin)?;
+    d.set_item("theta_onestep", report.theta_onestep)?;
+    d.set_item("se", report.se)?;
+    d.set_item("penalty_bias", report.penalty_bias)?;
+    // 95% Wald interval on the debiased estimate (z = 1.959963985 for 0.975).
+    let z = 1.959_963_984_540_054_f64;
+    d.set_item("ci_lo", report.theta_onestep - z * report.se)?;
+    d.set_item("ci_hi", report.theta_onestep + z * report.se)?;
+    Ok(d)
+}
+
+/// Build the result-dict list of per-atom post-PIRLS inference reports (#1097
+/// Riesz-debiased functionals + #1103 Bartlett smooth significance). One entry
+/// per fitted atom; `functionals` / `smooth_significance` are `None` (Python
+/// `None`) for atoms whose inner-decoder smooth was not harvestable.
+fn sae_atom_inference_list<'py>(
+    py: Python<'py>,
+    reports: &[gam::sae_identifiability::AtomInferenceReport],
+) -> PyResult<Bound<'py, PyList>> {
+    let list = PyList::empty(py);
+    for report in reports {
+        let a = PyDict::new(py);
+        a.set_item("atom_index", report.atom_index)?;
+        a.set_item("atom_name", &report.atom_name)?;
+        match &report.functionals {
+            Some(f) => {
+                let fd = PyDict::new(py);
+                match &f.peak_contrast {
+                    Some(r) => fd.set_item("peak_contrast", sae_riesz_report_dict(py, r)?)?,
+                    None => fd.set_item("peak_contrast", py.None())?,
+                }
+                match &f.average_derivative_norm {
+                    Some(r) => {
+                        fd.set_item("average_derivative_norm", sae_riesz_report_dict(py, r)?)?
+                    }
+                    None => fd.set_item("average_derivative_norm", py.None())?,
+                }
+                match &f.average_value {
+                    Some(r) => fd.set_item("average_value", sae_riesz_report_dict(py, r)?)?,
+                    None => fd.set_item("average_value", py.None())?,
+                }
+                a.set_item("functionals", fd)?;
+            }
+            None => a.set_item("functionals", py.None())?,
+        }
+        match &report.smooth_significance {
+            Some(s) => {
+                let sd = PyDict::new(py);
+                match s.bartlett_corrected_p {
+                    Some(p) => sd.set_item("bartlett_corrected_p", p)?,
+                    None => sd.set_item("bartlett_corrected_p", py.None())?,
+                }
+                sd.set_item("bartlett_factor", s.bartlett_factor)?;
+                sd.set_item("lr_stat", s.lr_stat)?;
+                sd.set_item("df", s.df)?;
+                a.set_item("smooth_significance", sd)?;
+            }
+            None => a.set_item("smooth_significance", py.None())?,
+        }
+        list.append(a)?;
+    }
+    Ok(list)
 }
 
 /// Build the result-dict entry for the residual-gauge certificate
