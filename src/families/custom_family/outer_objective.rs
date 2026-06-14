@@ -2003,7 +2003,33 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     && !proposal_at_step_floor
                 {
                     model_rejects += 1;
-                    if !tried_preconditioned_descent {
+                    // CONSTRAINED-PATH GUARD (#1108). The preconditioned-descent
+                    // substitution replaces `search_delta` with an UNCONSTRAINED
+                    // diagonally-preconditioned gradient step (`δ = M⁻¹·rhs`). That
+                    // direction respects neither the active set nor the linear
+                    // inequality cone `Aβ ≥ b`, and nothing downstream re-projects
+                    // it: a constrained family that maintains feasibility purely
+                    // through the QP (e.g. `LatentSurvivalFamily`, whose
+                    // `max_feasible_step_size` is `None` and whose
+                    // `post_update_block_beta` is the identity) has no barrier clip
+                    // in `apply_joint_feasibility_limit` to pull the gradient step
+                    // back onto the monotone time-derivative cone. The trial β then
+                    // leaves the cone, the objective-descent test ACCEPTS it (the
+                    // gradient step does lower the unconstrained merit), and the
+                    // NEXT cycle's `check_linear_feasibility` rejects the accepted
+                    // iterate as an "infeasible iterate" (raw `Aβ−b` violation
+                    // ~5.5e-3) — aborting the whole interval-censored warm start.
+                    // The QP's `search_delta` is a feasible-to-feasible chord
+                    // (`candidate_beta − beta_joint`, both endpoints in the convex
+                    // cone), so box-truncating it to a SMALLER trust radius keeps
+                    // every sub-step feasible. On the constrained path we therefore
+                    // never swap in the unconstrained descent direction; we only
+                    // shrink the radius and re-truncate the constrained chord. The
+                    // comment on the preconditioned branch already promised it
+                    // "preserves linear constraints when present" — this makes the
+                    // implementation honor that contract.
+                    let constrained_path_active = search_joint_active_set.is_some();
+                    if !tried_preconditioned_descent && !constrained_path_active {
                         match joint_preconditioned_descent_delta(
                             &joint_hessian_source,
                             &ranges,
