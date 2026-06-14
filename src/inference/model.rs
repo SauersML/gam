@@ -534,8 +534,7 @@ pub struct FittedModelPayload {
     /// posterior band. `#[serde(default)]` so pre-existing models deserialize as
     /// no exact substrate available.
     #[serde(default)]
-    pub full_conformal:
-        Option<crate::inference::full_conformal::ExactFullConformalSubstrate>,
+    pub full_conformal: Option<crate::inference::full_conformal::ExactFullConformalSubstrate>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

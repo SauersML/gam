@@ -40,9 +40,7 @@
 //! of the decoder displacement at `t₀`); its SE is propagated by the
 //! delta method through that norm.
 
-use crate::inference::layer_transport::{
-    ChartTopology, LayerTransportReport, fit_layer_transport,
-};
+use crate::inference::layer_transport::{ChartTopology, LayerTransportReport, fit_layer_transport};
 use crate::inference::riesz::{
     RieszDebiasReport, RieszInput, SmoothFunctional, debias_with_dense_hessian,
 };
@@ -94,8 +92,7 @@ pub fn checkpoint_atom_dynamics(
     input: &CheckpointDynamicsInput<'_>,
 ) -> Result<Vec<AtomTrajectory>, String> {
     let shape = input.decoder_grid.shape();
-    let (n_checkpoints, n_atoms, n_grid, ambient_dim) =
-        (shape[0], shape[1], shape[2], shape[3]);
+    let (n_checkpoints, n_atoms, n_grid, ambient_dim) = (shape[0], shape[1], shape[2], shape[3]);
     if n_checkpoints < 2 {
         return Err(format!(
             "checkpoint dynamics needs at least two checkpoints, got {n_checkpoints}"
@@ -169,8 +166,14 @@ pub fn checkpoint_atom_dynamics(
             // checkpoints' decoder curves through their shared latent index.
             // The "from"/"to" coordinates are the decoder values projected to
             // the first ambient component, the available scalar chart sample.
-            let coords_from = input.decoder_grid.slice(ndarray::s![c0, atom, .., 0]).to_owned();
-            let coords_to = input.decoder_grid.slice(ndarray::s![c1, atom, .., 0]).to_owned();
+            let coords_from = input
+                .decoder_grid
+                .slice(ndarray::s![c0, atom, .., 0])
+                .to_owned();
+            let coords_to = input
+                .decoder_grid
+                .slice(ndarray::s![c1, atom, .., 0])
+                .to_owned();
             let (lo, hi) = interval_bounds(coords_from.view(), coords_to.view());
             let topology = ChartTopology::Interval { lo, hi };
             let transport = fit_layer_transport(
@@ -190,18 +193,16 @@ pub fn checkpoint_atom_dynamics(
             transports.push(transport);
 
             // --- Riesz-debiased decoder-displacement contrast at the mode ----
-            let report = contrast_at_mode(
-                &ContrastAtMode {
-                    grid: input.decoder_grid,
-                    atom,
-                    c0,
-                    c1,
-                    ambient_dim,
-                    n_grid,
-                    hessian: hessian.view(),
-                    mode_row: mode_row.view(),
-                },
-            )
+            let report = contrast_at_mode(&ContrastAtMode {
+                grid: input.decoder_grid,
+                atom,
+                c0,
+                c1,
+                ambient_dim,
+                n_grid,
+                hessian: hessian.view(),
+                mode_row: mode_row.view(),
+            })
             .map_err(|e| {
                 format!(
                     "checkpoint contrast for atom '{atom_name}' step {} → {} failed: {e}",
@@ -337,9 +338,8 @@ fn contrast_at_mode(args: &ContrastAtMode<'_>) -> Result<RieszDebiasReport, Stri
         (var_components.sum() / ambient_dim as f64).sqrt()
     };
 
-    let mut report = witness.ok_or_else(|| {
-        "checkpoint contrast requires at least one ambient component".to_string()
-    })?;
+    let mut report = witness
+        .ok_or_else(|| "checkpoint contrast requires at least one ambient component".to_string())?;
     report.theta_plugin = theta_plugin;
     report.theta_onestep = norm_one;
     report.se = se;
@@ -393,8 +393,7 @@ fn component_contrast(
         penalty_beta: penalty_beta.view(),
         leverage: None,
     };
-    debias_with_dense_hessian(&input, hessian)
-        .map_err(|e| format!("Riesz debiasing failed: {e}"))
+    debias_with_dense_hessian(&input, hessian).map_err(|e| format!("Riesz debiasing failed: {e}"))
 }
 
 /// Universal-inference split-likelihood log-e-value for the no-change null
