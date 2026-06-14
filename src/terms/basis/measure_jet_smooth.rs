@@ -162,6 +162,16 @@ const MEASURE_JET_MAX_AUTO_SCALES: usize = 8;
 /// both at the root without touching the energy penalty or the dials.
 const MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR: f64 = 1.0;
 
+/// Single-scale fused-mode weight of the affine-preserving nullspace ridge,
+/// as a fraction of the primary energy penalty's Frobenius scale (#1116). The
+/// ridge's role is identifiability — flooring the fused energy's near-nullspace
+/// — not smoothing selection, so it is fused at a small FIXED fraction rather
+/// than carrying its own REML λ (which would double the single-scale outer
+/// search). 1e-2 lifts the unpenalized directions ~two orders below the
+/// dominant penalized modes: a definite identifiability floor that leaves the
+/// genuine spectrum (and the single primary λ) in control of the fit.
+const MEASURE_JET_FUSED_RIDGE_FRACTION: f64 = 1e-2;
+
 /// Memory budget (in f64 entries) above which the multi-form assembly stops
 /// parallelizing over scales: parallel scale partials cost
 /// `L · n_forms · m²` doubles; past this budget the scales run sequentially
@@ -1424,8 +1434,41 @@ pub fn build_measure_jet_basis(
             spec.alpha,
             spec.tau0,
         )?;
-        let penalty = kz.t().dot(&q_form).dot(&kz);
-        let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
+        let mut penalty = kz.t().dot(&q_form).dot(&kz);
+        penalty = (&penalty + &penalty.t()) * 0.5;
+        // Single-scale nullspace stabilization, FUSED (not a second REML λ).
+        //
+        // The fused jet-residual energy penalizes only the LOCAL jet residual,
+        // so it has a large near-nullspace of
+        // globally-smooth-but-not-locally-affine modes; on low-effective-rank
+        // data those weakly-penalized directions are unidentified and the inner
+        // solve / outer REML cycle (MEASURED #1116: with NO stabilizer the
+        // bms-accuracy fit was 3s→59s and less accurate). The
+        // affine-preserving ridge `I − P_affine` stabilizes exactly those
+        // directions. But its job is IDENTIFIABILITY, not smoothing selection —
+        // it does not need its own learned λ. As a separate candidate it
+        // doubled the single-scale outer-REML search into 2-D (the #1116
+        // perf-parity 2.8× vs Duchon's 1-λ fit). Instead fold it into the
+        // primary at a small FIXED fraction of the primary's Frobenius scale:
+        // the near-nullspace gets a definite floor (κ ≈ 1/ε_ridge bounded), the
+        // smoothing strength stays owned by the single primary λ, and the outer
+        // footprint is one λ — Duchon/Matérn parity. Multiscale mode keeps the
+        // ridge as a genuine learned candidate (its per-scale spectrum IS the
+        // estimand).
+        if spec.double_penalty {
+            let ridge = affine_preserving_coefficient_ridge(&kz, centers.view(), masses.view())?;
+            let primary_fro = trace_of_product(&penalty, &penalty).sqrt();
+            let ridge_fro = trace_of_product(&ridge, &ridge).sqrt();
+            if primary_fro.is_finite()
+                && primary_fro > 0.0
+                && ridge_fro.is_finite()
+                && ridge_fro > 0.0
+            {
+                let w = MEASURE_JET_FUSED_RIDGE_FRACTION * primary_fro / ridge_fro;
+                penalty = &penalty + &(&ridge * w);
+            }
+        }
+        let (penalty_norm, c_primary) = normalize_penalty(&penalty);
         fused_penalty_normalization_scale = Some(c_primary);
         candidates.push(PenaltyCandidate {
             matrix: penalty_norm,
@@ -1436,17 +1479,11 @@ pub fn build_measure_jet_basis(
             op: None,
         });
     }
-    // The affine-preserving coefficient ridge `I − P_affine` penalizes every
-    // non-affine coefficient direction UNIFORMLY. The fused jet-residual energy
-    // penalizes only the LOCAL jet residual, so it has a large near-nullspace
-    // of globally-smooth-but-not-locally-affine modes; on low-effective-rank
-    // data those weakly-penalized directions are unidentified and the inner
-    // solve / outer REML cycle (MEASURED #1116: dropping the ridge made the
-    // bms-accuracy fit 3s→59s AND less accurate — the ridge was doing genuine
-    // nullspace stabilization, not redundant double-penalization). So the ridge
-    // is kept in single-scale mode too. It is the mgcv `select=` nullspace
-    // companion to the primary energy.
-    if spec.double_penalty {
+    // Multiscale mode: the affine-preserving ridge is a genuine learned
+    // candidate (the per-scale split leaves its own spectrum to estimate). In
+    // single-scale mode it is fused into the primary above (a fixed
+    // identifiability floor, not a second λ) — see that block.
+    if spec.double_penalty && per_level {
         let ridge = affine_preserving_coefficient_ridge(&kz, centers.view(), masses.view())?;
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
@@ -1596,8 +1633,27 @@ pub fn build_measure_jet_basis_psi_derivatives(
             spec.alpha,
             spec.tau0,
         )?;
+        // Single-scale fuses the affine-preserving ridge into the primary value
+        // at the fixed identifiability fraction (mirrors `build_measure_jet_basis`
+        // so the normalization scale `c` matches the fitted penalty). The ridge
+        // is ψ-invariant, so every jet slot of the fused candidate is unchanged.
+        let mut q_value = sandwich(&jets.q);
+        if spec.double_penalty {
+            let ridge =
+                affine_preserving_coefficient_ridge(kz, geom.centers.view(), geom.masses.view())?;
+            let primary_fro = trace_of_product(&q_value, &q_value).sqrt();
+            let ridge_fro = trace_of_product(&ridge, &ridge).sqrt();
+            if primary_fro.is_finite()
+                && primary_fro > 0.0
+                && ridge_fro.is_finite()
+                && ridge_fro > 0.0
+            {
+                let w = MEASURE_JET_FUSED_RIDGE_FRACTION * primary_fro / ridge_fro;
+                q_value = &q_value + &(&ridge * w);
+            }
+        }
         let raw = vec![(
-            sandwich(&jets.q),
+            q_value,
             vec![
                 sandwich(&jets.dq_ds),
                 sandwich(&jets.dq_dalpha),
@@ -1622,11 +1678,11 @@ pub fn build_measure_jet_basis_psi_derivatives(
     };
     let n_active = raw.len();
     // Mirror the build-path gate (`build_measure_jet_basis`): the
-    // affine-preserving ridge candidate is emitted whenever `double_penalty`
-    // is on (single-scale and multiscale alike — #1116: it stabilizes the
-    // fused energy's near-nullspace; the ψ-derivative penalty count must match
-    // the build path, count desync = the gam#860 trap class).
-    let ridge = spec.double_penalty;
+    // affine-preserving ridge is a SEPARATE candidate only in multiscale mode.
+    // In single-scale mode it is FUSED into the primary value above (#1116), so
+    // no separate candidate — the ψ-derivative penalty count must match the
+    // build path, count desync = the gam#860 trap class.
+    let ridge = spec.double_penalty && geom.per_level;
     let n_cands = n_active + usize::from(ridge);
     let zero_p = || Array2::<f64>::zeros((p, p));
     let mut penalties_first: Vec<Vec<Array2<f64>>> =
@@ -2028,8 +2084,9 @@ mod tests {
         });
         // Default (multiscale = false) stays single-scale even at a LARGE center
         // count that, under the deleted auto-gate, would have flipped to
-        // multiscale: one fused jet-energy penalty + the affine-preserving
-        // nullspace-stabilizing ridge (#1116) = exactly two candidates.
+        // multiscale: exactly ONE candidate — the fused jet-energy penalty with
+        // the affine-preserving nullspace ridge folded in at a fixed fraction
+        // (#1116), the one-λ Duchon/Matérn footprint.
         let single = MeasureJetBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 80 },
             ..MeasureJetBasisSpec::default()
@@ -2042,8 +2099,8 @@ mod tests {
             build_measure_jet_basis(data.view(), &single).expect("single-scale build");
         assert_eq!(
             built_single.penalties.len(),
-            2,
-            "single-scale mode emits one fused penalty + the nullspace ridge"
+            1,
+            "single-scale mode emits one fused penalty (ridge folded in, not a 2nd λ)"
         );
         // The explicit opt-in flips to multiscale at the SAME center count: the
         // per-scale spectral split (several candidates) + the ridge, strictly
@@ -2068,8 +2125,8 @@ mod tests {
 
     /// An explicit order pins the Mellin weights and fuses the band into a
     /// single Primary candidate. With multiscale off (the default) the mode is
-    /// single-scale: one fused Primary penalty + the affine-preserving
-    /// nullspace ridge (#1116) = two candidates.
+    /// single-scale: one fused Primary penalty with the affine-preserving
+    /// nullspace ridge folded in (#1116) = exactly one candidate.
     #[test]
     fn fused_mode_emits_single_primary_candidate() {
         let n = 40usize;
@@ -2089,8 +2146,8 @@ mod tests {
         let built = build_measure_jet_basis(data.view(), &spec).expect("fused build");
         assert_eq!(
             built.penalties.len(),
-            2,
-            "fused single-scale mode emits one Primary candidate + the nullspace ridge"
+            1,
+            "fused single-scale mode emits exactly one Primary candidate (ridge folded in)"
         );
         let BasisMetadata::MeasureJet { order_s, .. } = &built.metadata else {
             panic!("measure-jet build must return MeasureJet metadata");
@@ -2299,8 +2356,8 @@ mod tests {
         );
         assert_eq!(
             derivs.penalties_first[0].len(),
-            2,
-            "single-scale fused mode has the primary candidate + the nullspace ridge"
+            1,
+            "single-scale fused mode has exactly one candidate (ridge folded into the primary)"
         );
         let pen_at = |s: f64| {
             let trial = MeasureJetBasisSpec {
@@ -2320,11 +2377,6 @@ mod tests {
                 "s jet of the fused candidate: analytic {x:.6e} vs FD {y:.6e}"
             );
         }
-        // The ridge candidate carries identically-zero ψ derivatives.
-        assert!(
-            derivs.penalties_first[0][1].iter().all(|v| *v == 0.0),
-            "ridge candidate must have zero ψ drift in fused mode"
-        );
     }
 
     /// Quadrature nodes must be the mass-weighted cell barycenters
