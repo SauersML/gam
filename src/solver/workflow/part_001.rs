@@ -3218,6 +3218,38 @@ fn fit_survival_transformation_model(
 }
 
 
+/// Map a converged outer-optimizer result to its recovered inverse-link state,
+/// or surface a convergence/recovery failure as a `WorkflowError`. Used by the
+/// survival location-scale inverse-link profiling path to turn the optimized
+/// `rho` into the concrete `InverseLink` before the final fixed-link refit.
+fn recover_converged_survival_inverse_link<R>(
+    result: crate::solver::outer_strategy::OuterResult,
+    context: &str,
+    recover: R,
+) -> Result<InverseLink, String>
+where
+    R: FnOnce(&Array1<f64>) -> Option<InverseLink>,
+{
+    if !result.converged {
+        return Err(WorkflowError::IntegrationFailed {
+            reason: format!(
+                "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm_report(),
+            ),
+        }
+        .into());
+    }
+    recover(&result.rho).ok_or_else(|| {
+        format!(
+            "{context} produced an invalid inverse-link state at rho={:?}",
+            result.rho.to_vec()
+        )
+    })
+}
+
+
 fn fit_survival_location_scale_model(
     request: SurvivalLocationScaleFitRequest<'_>,
 ) -> Result<SurvivalLocationScaleFitResult, String> {
