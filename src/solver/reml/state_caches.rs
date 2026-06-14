@@ -1,42 +1,5 @@
 use super::*;
 
-use crate::cache::Fingerprinter;
-
-use crate::construction::{
-    create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
-};
-
-use crate::faer_ndarray::array2_to_matmut;
-
-use crate::inference::hmc::BlockExcessTarget;
-
-use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
-
-use crate::linalg::utils::{
-    StableSolver, boundary_hit_indices, enforce_symmetry, symmetric_spectrum_condition_number,
-};
-
-use crate::mixture_link::inverse_link_has_fisher_weight_jet;
-
-use crate::pirls::PirlsWorkspace;
-
-use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
-
-use crate::solver::outer_strategy::{HessianResult, OuterEval};
-
-use crate::solver::persistent_warm_start::{PersistentWarmStartRecord, load_record, store_record};
-
-use crate::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior,
-    SasLinkState, StandardLink,
-};
-
-use std::collections::{HashMap, VecDeque};
-
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-
 
 const TK_BLOCK_SIZE: usize = 128;
 

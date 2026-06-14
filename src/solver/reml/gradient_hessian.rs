@@ -1,3 +1,4 @@
+use super::*;
 
 impl<'a> RemlState<'a> {
     const POLISH_NORM_RATIO: f64 = 0.25;

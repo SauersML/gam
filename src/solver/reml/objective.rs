@@ -1,3 +1,4 @@
+use super::*;
 
 impl<'a> RemlState<'a> {
     /// Compute the scalar outer objective value used by the planner-selected
