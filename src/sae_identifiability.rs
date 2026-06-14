@@ -48,7 +48,7 @@
 //! there is only one metric object.
 
 use crate::geometry::curvature_estimand::{
-    FlatnessTest, KappaProfileCi, flatness_lr_test, profile_ci_walk,
+    CurvatureVerdict, FlatnessTest, KappaProfileCi, flatness_lr_test, profile_ci_walk,
 };
 use crate::inference::lawley::{RowExpectedJets, RowKappas, lawley_lr_bartlett_factor};
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
@@ -2949,53 +2949,101 @@ fn atom_curvature_ci(fit: &AtomInnerFit) -> Option<AtomCurvatureCi> {
         return None;
     }
 
-    // Gradient of κ(β) = √(βᵀSβ)/√(βᵀDβ):
-    //   ∂κ/∂β = (S β)/(√c · √t) − √c · (D β)/(√t)³,
-    // with c = curvature_energy, t = tangent_energy.
-    let sqrt_c = curvature_energy.sqrt();
+    // Work in the smooth energy-ratio coordinate ρ(β) = (βᵀSβ)/(βᵀDβ) = c/t,
+    // which equals the squared curvature magnitude κ̂_mag² and whose gradient is
+    // finite EVERYWHERE (the √· in κ has a cusp at κ = 0, ρ does not):
+    //   ∇ρ = (2/t) S β − (2 c / t²) D β.
+    // We take its delta-method SE through the penalized Hessian, then map ρ to the
+    // signed curvature κ (whose sign the geometric κ̂ carries).
     let sqrt_t = tangent_energy.sqrt();
     if !(sqrt_t > 0.0) {
         return None;
     }
-    // When the curvature energy is exactly zero the first term vanishes and the
-    // functional sits at κ = 0; a √c in the denominator would be 0/0, so guard.
-    let inv_sqrt_c = if sqrt_c > 0.0 { 1.0 / sqrt_c } else { 0.0 };
-    let coef_d = sqrt_c / (sqrt_t * tangent_energy); // √c / t^{3/2}
-    let mut grad = Array1::<f64>::zeros(m);
+    let rho_hat = curvature_energy / tangent_energy; // = κ̂_mag²
+    let inv_t = 1.0 / tangent_energy;
+    let two_c_over_t2 = 2.0 * curvature_energy * inv_t * inv_t;
+    let mut grad_rho = Array1::<f64>::zeros(m);
     for col in 0..m {
-        grad[col] = s_beta[col] * inv_sqrt_c / sqrt_t - coef_d * d_beta[col];
+        grad_rho[col] = 2.0 * inv_t * s_beta[col] - two_c_over_t2 * d_beta[col];
     }
-    if grad.iter().any(|g| !g.is_finite()) {
+    if grad_rho.iter().any(|g| !g.is_finite()) {
         return None;
     }
-    if grad.iter().all(|g| *g == 0.0) {
-        // A degenerate (everywhere-flat) curvature functional carries no
-        // sensitivity; the profile would be infinitely sharp. Refuse.
+    if grad_rho.iter().all(|g| *g == 0.0) {
+        // No fitted curvature OR tangent variation moves the ratio: a degenerate
+        // (everywhere-flat) functional carries no sensitivity. Refuse.
         return None;
     }
 
-    // Delta-method SE of κ̂ through the penalized Hessian, via the same
+    // Delta-method SE of ρ̂ through the penalized Hessian, via the same
     // influence-function debiasing the #1097 functionals use. The sandwich SE is
-    // the realized-score delta-method variance √(∇κᵀ Cov(β̂) ∇κ).
+    // the realized-score delta-method variance √(∇ρᵀ Cov(β̂) ∇ρ).
     let input = RieszInput {
         beta: fit.beta.view(),
-        functional_gradient: grad.view(),
+        functional_gradient: grad_rho.view(),
         row_scores: fit.row_scores.view(),
         penalty_beta: s_beta.view(),
         leverage: None,
     };
     let report = debias_with_dense_hessian(&input, fit.penalized_hessian.view()).ok()?;
-    let se = report.se;
-    if !(se.is_finite() && se > 0.0) {
+    let se_rho = report.se;
+    if !(se_rho.is_finite() && se_rho > 0.0) {
         return None;
     }
 
-    // Second-order Laplace profile V_p(κ) = ½ v_pp (κ − κ̂)², v_pp = 1/se².
+    let level = 0.95;
+    let kappa_mag = rho_hat.max(0.0).sqrt(); // |κ̂_functional|
+    // Below this curvature magnitude the √ρ → κ map's cusp makes a κ-centred
+    // quadratic profile ill-conditioned: treat κ̂ as indistinguishable from flat
+    // and report the honest symmetric small-curvature interval drawn from ρ's
+    // one-sided χ² region (ρ ≥ 0).
+    let cusp_floor = 1e-9_f64.max(1e-6 * se_rho.sqrt());
+    if !(kappa_mag > cusp_floor) {
+        // FLAT regime: the CI is symmetric about 0 with half-width √(ρ_hi), where
+        // ρ_hi = ρ̂ + z_{1-α/2}·se_ρ is the upper χ²₁ Wilks endpoint of the
+        // quadratic ρ-profile. `wald_half_width(1/se_ρ², level)` returns exactly
+        // z_{1-α/2}·se_ρ. The flatness LR against ρ = 0 is ≈ ρ̂²/se_ρ².
+        let z_se = crate::geometry::curvature_estimand::wald_half_width(
+            1.0 / (se_rho * se_rho),
+            level,
+        )
+        .unwrap_or(0.0);
+        let rho_hi = (rho_hat + z_se).max(0.0);
+        let kappa_hi = rho_hi.sqrt();
+        let lr_stat = (rho_hat * rho_hat / (se_rho * se_rho)).max(0.0);
+        let ci = KappaProfileCi {
+            kappa_hat,
+            ci_lo: -kappa_hi,
+            ci_hi: kappa_hi,
+            lo_at_bound: false,
+            hi_at_bound: false,
+            verdict: CurvatureVerdict::Flat,
+        };
+        let flatness_test = FlatnessTest {
+            lr_stat,
+            p_value: chi2_sf(lr_stat, 1.0).unwrap_or(1.0),
+            kappa_hat,
+        };
+        return Some(AtomCurvatureCi {
+            kappa_hat,
+            ci,
+            flatness_test,
+        });
+    }
+
+    // CURVED regime: map ρ's SE to a κ-SE by the delta method through κ = √ρ,
+    // dκ/dρ = 1/(2√ρ) = 1/(2 κ_mag), so se_κ = se_ρ / (2 κ_mag) — the standard
+    // curvature-magnitude SE away from the cusp.
+    let se_kappa = se_rho / (2.0 * kappa_mag);
+    if !(se_kappa.is_finite() && se_kappa > 0.0) {
+        return None;
+    }
+
+    // Second-order Laplace profile V_p(κ) = ½ v_pp (κ − κ̂)², v_pp = 1/se_κ².
     // The χ²₁ Wilks crossing is exact for this quadratic; the walk recovers the
-    // closed-form endpoints κ̂ ± z·se. κ-chart bounds are set wide enough that the
-    // interior κ = 0 (for the flatness test) and the full CI are always reachable.
-    let var = se * se;
-    let v_pp = 1.0 / var;
+    // closed-form endpoints κ̂ ± z·se_κ. κ-chart bounds are set wide enough that
+    // the interior κ = 0 (for the flatness test) and the full CI are reachable.
+    let v_pp = 1.0 / (se_kappa * se_kappa);
     let v_p = |k: f64| -> Result<f64, String> {
         let d = k - kappa_hat;
         let v = 0.5 * v_pp * d * d;
@@ -3005,13 +3053,9 @@ fn atom_curvature_ci(fit: &AtomInnerFit) -> Option<AtomCurvatureCi> {
             Err("curvature profile V_p produced a non-finite value".into())
         }
     };
-    // Chart bounds: bracket symmetrically around 0 with a margin past κ̂ and the
-    // CI half-width so neither the CI walk nor the κ = 0 flatness probe hits a
-    // bound.
-    let span = (kappa_hat.abs() + 12.0 * se).max(1.0);
+    let span = (kappa_hat.abs() + 12.0 * se_kappa).max(1.0);
     let kappa_min = -span;
     let kappa_max = span;
-    let level = 0.95;
     let ci = profile_ci_walk(v_p, kappa_hat, v_pp, kappa_min, kappa_max, level, 1e-9).ok()?;
     let flatness_test = flatness_lr_test(v_p, kappa_hat).ok()?;
     Some(AtomCurvatureCi {
