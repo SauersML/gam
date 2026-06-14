@@ -1,5 +1,5 @@
-// Split from the original oversized module; keep included in order.
-include!("split_parts/part_000.rs");
+// Concern-named fragments inlined into this module's namespace; keep in order.
+include!("imports.rs");
 
 // ── Submodule split ─────────────────────────────────────────────────────────
 mod convergence;
@@ -22,5 +22,5 @@ mod reweight;
 
 mod state;
 
-include!("split_parts/part_001.rs");
-include!("split_parts/part_002.rs");
+include!("working_model_core.rs");
+include!("tests.rs");

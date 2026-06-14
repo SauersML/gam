@@ -25,9 +25,9 @@
 //! values rather than mapping onto the full real line.
 
 // Split from the original oversized module; keep included in order.
-include!("transformation_normal/part_000.rs");
+include!("transformation_normal/imports.rs");
 
 mod endpoint_normalizer;
 
-include!("transformation_normal/part_001.rs");
-include!("transformation_normal/part_002.rs");
+include!("transformation_normal/family_core.rs");
+include!("transformation_normal/custom_family_impl.rs");

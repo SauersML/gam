@@ -1,5 +1,5 @@
 // Split from the original oversized module; keep included in order.
-include!("workflow/part_000.rs");
+include!("workflow/imports.rs");
 
 /// Shared analytic-penalty descriptor parser. Both this in-process workflow
 /// pipeline and the Python FFI (`gam-pyffi`) build their analytic-penalty
@@ -8,5 +8,5 @@ include!("workflow/part_000.rs");
 /// identical for every caller.
 pub mod descriptors;
 
-include!("workflow/part_001.rs");
-include!("workflow/part_002.rs");
+include!("workflow/fit_request.rs");
+include!("workflow/materialize.rs");
