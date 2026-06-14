@@ -49,11 +49,14 @@
 
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
 use crate::inference::structure_evidence::{StructureCertificate, StructureLedger};
+use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::linalg::faer_ndarray::{
     FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
+use crate::terms::sae_chart_canonicalization::CanonicalChartTopology;
 use faer::Side;
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
+use std::f64::consts::TAU;
 
 /// Smoothed column-2-norm of the decoder Jacobian.
 ///
@@ -2473,6 +2476,40 @@ pub struct DictionaryReport {
     /// What the data established
     /// ([`crate::inference::structure_evidence::StructureLedger::certify`]).
     pub structure: StructureCertificate,
+    /// Per-atom inter-layer transport ladders (#1096). Empty when the caller
+    /// has not supplied at least one atom's canonical coordinates across two or
+    /// more layers. These reports are computed in the transport module's chart
+    /// convention: circle coordinates are radians on `[0, 2π)`, while SAE
+    /// canonical circle charts may use an arbitrary period and are rescaled by
+    /// [`dictionary_report_with_transport_ladders`] before fitting.
+    pub transport_ladders: Vec<AtomTransportLadderReport>,
+}
+
+/// Canonical per-layer coordinates for one atom, ready for the #1096 transport
+/// ladder integration.
+///
+/// The caller owns extraction from the SAE fit: `layers[i]`, `coords[i]`, and
+/// `topologies[i]` describe the same atom at the same layer. This type keeps
+/// that extraction outside [`dictionary_report`] so the core certificate can be
+/// wired without reaching into `SaeManifoldTerm`.
+#[derive(Debug, Clone)]
+pub struct AtomTransportLadderInput {
+    /// Index into [`FittedSaeManifold::atoms`].
+    pub atom_index: usize,
+    /// Layer labels in ladder order.
+    pub layers: Vec<usize>,
+    /// One canonical coordinate vector per layer, all over the same rows.
+    pub coords: Vec<Array1<f64>>,
+    /// One canonical chart topology per layer.
+    pub topologies: Vec<CanonicalChartTopology>,
+}
+
+/// One atom's fitted inter-layer transport ladder.
+#[derive(Debug, Clone)]
+pub struct AtomTransportLadderReport {
+    pub atom_index: usize,
+    pub atom_name: String,
+    pub report: TransportLadderReport,
 }
 
 /// Produce the paired certificate for a fitted model: the residual-gauge
@@ -2490,7 +2527,113 @@ pub fn dictionary_report(
     Ok(DictionaryReport {
         gauge: residual_gauge(model)?,
         structure: ledger.certify(alpha),
+        transport_ladders: Vec::new(),
     })
+}
+
+/// Produce the paired certificate plus #1096 per-atom layer-transport ladders.
+///
+/// This is the strict wiring seam for callers that already have canonical
+/// per-layer atom coordinates. It validates atom indices, topology/coordinate
+/// lengths, finite coordinates, and the circle-period convention before calling
+/// [`transport_ladder`]. Single-layer inputs are refused: no transport estimand
+/// exists without at least one adjacent layer pair.
+pub fn dictionary_report_with_transport_ladders(
+    model: &FittedSaeManifold,
+    ledger: &StructureLedger,
+    alpha: f64,
+    ladders: &[AtomTransportLadderInput],
+) -> Result<DictionaryReport, String> {
+    let mut report = dictionary_report(model, ledger, alpha)?;
+    report.transport_ladders = atom_transport_ladder_reports(model, ladders)?;
+    Ok(report)
+}
+
+/// Fit #1096 transport ladders for the supplied atom/layer coordinate blocks.
+pub fn atom_transport_ladder_reports(
+    model: &FittedSaeManifold,
+    ladders: &[AtomTransportLadderInput],
+) -> Result<Vec<AtomTransportLadderReport>, String> {
+    let mut out = Vec::with_capacity(ladders.len());
+    for input in ladders {
+        let atom = model.atoms.get(input.atom_index).ok_or_else(|| {
+            format!(
+                "atom transport ladder index {} out of range for {} fitted atoms",
+                input.atom_index,
+                model.atoms.len()
+            )
+        })?;
+        let depth = input.layers.len();
+        if depth < 2 {
+            return Err(format!(
+                "atom transport ladder for atom {} ('{}') needs at least two layers, got {depth}",
+                input.atom_index, atom.name
+            ));
+        }
+        if input.coords.len() != depth || input.topologies.len() != depth {
+            return Err(format!(
+                "atom transport ladder for atom {} ('{}') has {} layers, {} coordinate blocks, {} topologies",
+                input.atom_index,
+                atom.name,
+                depth,
+                input.coords.len(),
+                input.topologies.len()
+            ));
+        }
+
+        let mut coords = Vec::with_capacity(depth);
+        let mut topologies = Vec::with_capacity(depth);
+        for (layer_pos, (coord, topology)) in
+            input.coords.iter().zip(input.topologies.iter()).enumerate()
+        {
+            coords.push(canonical_coords_for_transport(
+                coord,
+                topology,
+                input.atom_index,
+                &atom.name,
+                input.layers[layer_pos],
+            )?);
+            topologies.push(ChartTopology::from(topology));
+        }
+
+        let report = transport_ladder(&input.layers, &coords, &topologies).map_err(|e| {
+            format!(
+                "atom transport ladder for atom {} ('{}') failed: {e}",
+                input.atom_index, atom.name
+            )
+        })?;
+        out.push(AtomTransportLadderReport {
+            atom_index: input.atom_index,
+            atom_name: atom.name.clone(),
+            report,
+        });
+    }
+    Ok(out)
+}
+
+fn canonical_coords_for_transport(
+    coords: &Array1<f64>,
+    topology: &CanonicalChartTopology,
+    atom_index: usize,
+    atom_name: &str,
+    layer: usize,
+) -> Result<Array1<f64>, String> {
+    if coords.iter().any(|v| !v.is_finite()) {
+        return Err(format!(
+            "atom transport ladder for atom {atom_index} ('{atom_name}') layer {layer} has non-finite coordinates"
+        ));
+    }
+    match topology {
+        CanonicalChartTopology::Circle { period } => {
+            if !(period.is_finite() && *period > 0.0) {
+                return Err(format!(
+                    "atom transport ladder for atom {atom_index} ('{atom_name}') layer {layer} has invalid circle period {period}"
+                ));
+            }
+            Ok(coords.mapv(|t| (t / *period) * TAU))
+        }
+        CanonicalChartTopology::Interval => Ok(coords.clone()),
+    }
 }
 
 #[cfg(test)]

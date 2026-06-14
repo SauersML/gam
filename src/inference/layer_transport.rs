@@ -144,7 +144,7 @@ impl ChartTopology {
 /// (the canonical unit-speed interval span set by the canonicalization step).
 impl From<&CanonicalChartTopology> for ChartTopology {
     fn from(src: &CanonicalChartTopology) -> Self {
-        match *src {
+        match src {
             CanonicalChartTopology::Circle { .. } => ChartTopology::Circle,
             CanonicalChartTopology::Interval => ChartTopology::Interval { lo: 0.0, hi: 1.0 },
         }
