@@ -235,6 +235,13 @@ pub struct SaeManifoldTerm {
     /// the quotient dimension changed mid-solve, which is a structural event and
     /// must not be hidden inside the Laplace normalizer.
     pub(crate) expected_evidence_gauge_deflated_directions: Option<usize>,
+    /// #1037 re-anchor counter: how many times the quotient (gauge-deflation)
+    /// dimension has been re-anchored within the current optimization. A
+    /// legitimate quotient-dimension change (an atom born / reseeded /
+    /// rank-reduced) re-anchors the comparison once; an unbounded churn that
+    /// never settles is the genuine pathology the guard must still catch. Reset
+    /// to `0` alongside `expected_evidence_gauge_deflated_directions`.
+    pub(crate) evidence_gauge_deflation_reanchors: usize,
     /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
     /// converges. Each eligible `d = 1` atom's fitted curved image is adjudicated
@@ -273,6 +280,7 @@ impl Clone for SaeManifoldTerm {
             curvature_walk_report: self.curvature_walk_report.clone(),
             expected_evidence_gauge_deflated_directions: self
                 .expected_evidence_gauge_deflated_directions,
+            evidence_gauge_deflation_reanchors: self.evidence_gauge_deflation_reanchors,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
         }

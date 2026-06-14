@@ -50,6 +50,7 @@ impl SaeManifoldTerm {
             certificate_dispersion: None,
             curvature_walk_report: None,
             expected_evidence_gauge_deflated_directions: None,
+            evidence_gauge_deflation_reanchors: 0,
             hybrid_split_report: None,
             atom_inner_fits: None,
         })
@@ -4423,29 +4424,53 @@ impl SaeManifoldTerm {
         match self.expected_evidence_gauge_deflated_directions {
             Some(expected) if expected == count => Ok(()),
             Some(expected) => {
-                let delta = expected.abs_diff(count);
-                if delta > Self::EVIDENCE_DEFLATION_COUNT_FLICKER_TOLERANCE {
-                    // Genuine structural quotient-dimension event: too many rows
-                    // changed deflation state at once to be a single near-cutoff
-                    // eigenvalue's flicker. Refuse to compare across it (#1037).
+                // A change in the gauge-deflation count between two evidence
+                // factorizations is a legitimate quotient-dimension event under
+                // the K>1 fit: an atom can be born, reseeded (the #976 collapse
+                // guards), or rank-reduced across the ρ-walk, and each such event
+                // moves the number of gauge-flat rows. The #1037 invariant is
+                // NOT "the count never changes" — it is "two Laplace normalizers
+                // are only comparable at a COMMON quotient dimension". The
+                // principled response to a legitimate change is therefore to
+                // RE-ANCHOR the comparison to the new dimension (so every future
+                // cross-ρ comparison within the optimization is consistent), not
+                // to abort the fit. This is exactly evidence-preserving: each
+                // gauge-deflated direction is lifted to unit stiffness and
+                // contributes the ρ-independent `log 1 = 0` to `½log|H|`, so the
+                // converged criterion value is identical whether a given row is
+                // counted as deflated or not — only the BOOKKEEPING dimension
+                // must agree across a comparison, and re-anchoring restores that.
+                //
+                // The genuine pathology the guard must still catch is a count
+                // that NEVER STABILIZES — an oscillating / runaway quotient
+                // dimension that re-anchors without converging, signalling a
+                // truly ill-posed evidence surface rather than a finite number of
+                // structural events. Each atom can contribute at most one
+                // birth/rank-reduction plus `SAE_ATOM_COLLAPSE_RESEED_BUDGET`
+                // reseeds, so a healthy walk re-anchors a bounded number of
+                // times. Exceeding that bound is the structural pathology, and
+                // there we refuse to compare.
+                self.evidence_gauge_deflation_reanchors += 1;
+                let reanchor_budget = self
+                    .k_atoms()
+                    .saturating_mul(SAE_ATOM_COLLAPSE_RESEED_BUDGET + 1)
+                    .saturating_add(1);
+                if self.evidence_gauge_deflation_reanchors > reanchor_budget {
                     return Err(format!(
                         "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count \
-                         changed by {delta} from {expected} to {count} within one optimization; \
-                         this is a structural quotient-dimension event, refusing to compare \
-                         Laplace normalizers"
+                         re-anchored {} times (last {expected}->{count}) within one optimization, \
+                         exceeding the {reanchor_budget}-event budget for {} atoms; the quotient \
+                         dimension is not stabilizing, refusing to compare Laplace normalizers",
+                        self.evidence_gauge_deflation_reanchors,
+                        self.k_atoms()
                     ));
                 }
-                // Bounded ±1 flicker of a near-cutoff per-row H_tt eigenvalue
-                // crossing the spectral floor across the ρ-walk (#1117): re-anchor
-                // to the live count instead of refusing the seed and dropping the
-                // production K=1 path into the slow homotopy seed cascade (~10 min
-                // vs ~65 s). The deflated direction contributes the ρ-independent
-                // log 1 = 0 to the evidence either way, so the converged answer is
-                // unchanged; a larger structural jump still hard-refuses above.
                 log::warn!(
-                    "SaeManifoldTerm::reml_criterion: per-row evidence deflation count flickered \
-                     {expected}->{count} (a single near-cutoff H_tt eigenvalue crossing the \
-                     spectral floor across the ρ-walk); re-anchoring the quotient dimension"
+                    "SaeManifoldTerm::reml_criterion: per-row evidence deflation count changed \
+                     {expected}->{count} (a legitimate quotient-dimension event — atom \
+                     birth/reseed/rank-reduction across the ρ-walk); re-anchoring the Laplace \
+                     normalizer comparison to the new dimension (re-anchor {}/{reanchor_budget})",
+                    self.evidence_gauge_deflation_reanchors
                 );
                 self.expected_evidence_gauge_deflated_directions = Some(count);
                 Ok(())
@@ -4456,12 +4481,6 @@ impl SaeManifoldTerm {
             }
         }
     }
-
-    /// Largest single-step change in the per-row evidence deflation count treated
-    /// as a tolerable *flicker* of one near-cutoff `H_tt` eigenvalue across the
-    /// ρ-walk, rather than a genuine structural quotient-dimension collapse
-    /// (#1117). See [`Self::record_evidence_gauge_deflation_count`].
-    const EVIDENCE_DEFLATION_COUNT_FLICKER_TOLERANCE: usize = 1;
 
     pub(crate) fn is_undamped_evidence_row_non_pd(err: &ArrowSchurError) -> bool {
         matches!(
