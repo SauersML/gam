@@ -8,11 +8,11 @@
 //!
 //! Every Python `Smooth` subclass that is re-exported from `gamfit.torch`
 //! must have a matching variant here, so that dispatch never fails for a
-//! class the user can legitimately import. Entries whose tensor backend is
-//! not yet wired (`TensorBSpline`, `Matern`, `Categorical`) still resolve
-//! to a registered variant; the `fit.py` cascade then raises
-//! `NotImplementedError` at the point where it would actually need the
-//! tensor backend.
+//! class the user can legitimately import. `TensorBSpline` (te tensor
+//! product) and `Matern` (kernel-Gram penalty) are now fully wired on the
+//! torch path; only `Categorical` remains backend-unwired and resolves to a
+//! registered variant whose `fit.py` cascade raises `NotImplementedError`
+//! at the point where it would actually need the tensor backend.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TorchSmoothEntry {

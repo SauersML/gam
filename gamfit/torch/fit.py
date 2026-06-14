@@ -27,10 +27,12 @@ import torch
 from ..smooth import (
     BSpline,
     Duchon,
+    Matern,
     Pca,
     PeriodicSplineCurve,
     Sphere,
     Smooth,
+    TensorBSpline,
 )
 from ._basis import bspline_basis, duchon_basis, periodic_spline_curve_basis, sphere_basis
 from ._dispatch import (
@@ -125,6 +127,60 @@ def _torch_smooth_dispatch_key(class_name: str) -> str:
             "gamfit._rust is missing torch_smooth_dispatch_key; rebuild gamfit"
         )
     return str(dispatch_key(class_name))
+
+
+def _marginal_bspline_design_penalty(
+    marginal: BSpline, x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build one marginal's ``(design, penalty)`` for a tensor-product smooth.
+
+    Mirrors the scalar :class:`BSpline` branch exactly: the design carries the
+    autograd VJP back to ``x`` through :func:`bspline_basis`, and the penalty
+    shares the SAME resolved knot vector and effective degree as the design so
+    the difference penalty regularizes the basis the design actually spans
+    (auto-knot derivation may downgrade the degree for small n — #340).
+
+    ``x`` is the 1D marginal coordinate ``(N,)``. Returns ``(B_x, S_x)`` where
+    ``B_x`` is ``(N, k)`` (differentiable) and ``S_x`` is ``(k, k)``.
+    """
+    from .._api import smoothness_penalty as _smoothness_penalty
+
+    marg_knots = marginal.knots
+    if marg_knots is None or isinstance(marg_knots, int):
+        from .._api import _resolve_knots
+        resolved = _resolve_knots(
+            marg_knots,
+            x.detach().cpu().to(torch.float64).numpy(),
+            label="knots", degree=int(marginal.degree),
+        )
+        knots_np = resolved.locations
+        eff_degree = int(resolved.order)
+        knots = torch.as_tensor(knots_np, dtype=torch.float64, device=x.device)
+    else:
+        knots = _to_tensor(marg_knots, x).reshape(-1)
+        knots_np = knots.detach().cpu().to(torch.float64).numpy()
+        eff_degree = int(marginal.degree)
+    design = bspline_basis(
+        x, knots, degree=eff_degree, periodic=bool(marginal.periodic),
+    )
+    penalty_np, _null_basis = _smoothness_penalty(
+        knots_np, degree=eff_degree, order=int(marginal.penalty_order),
+    )
+    penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=x.device)
+    return design.to(torch.float64), penalty
+
+
+def _kron_eye(left: int, mat: torch.Tensor, right: int) -> torch.Tensor:
+    """Form ``I_left ⊗ mat ⊗ I_right`` for the Kronecker-sum tensor penalty.
+
+    ``left`` / ``right`` are the products of the basis sizes of the marginals
+    before / after the axis ``mat`` penalizes. The result lives in the same
+    column space as the row-major Khatri-Rao tensor design (earliest marginal
+    varies slowest), so it composes term-by-term into ``S = Σ_a I ⊗ S_a ⊗ I``.
+    """
+    eye_l = torch.eye(left, dtype=mat.dtype, device=mat.device)
+    eye_r = torch.eye(right, dtype=mat.dtype, device=mat.device)
+    return torch.kron(torch.kron(eye_l, mat), eye_r)
 
 
 def _build_design_penalty(
@@ -308,6 +364,84 @@ def _build_design_penalty(
         ) * float(pca.smooth_penalty)
         return design, penalty
 
+    if entry == "tensor_bspline" and isinstance(smooth, TensorBSpline):
+        marginals = list(smooth.marginals)
+        if not marginals:
+            raise ValueError("TensorBSpline: no marginals")
+        if points.shape[1] != len(marginals):
+            raise ValueError(
+                f"TensorBSpline has {len(marginals)} marginals but points have "
+                f"d={points.shape[1]}"
+            )
+        # Per-marginal 1D B-spline design + difference penalty (shared knots).
+        marg_designs: list[torch.Tensor] = []
+        marg_penalties: list[torch.Tensor] = []
+        for j, marg in enumerate(marginals):
+            b_j, s_j = _marginal_bspline_design_penalty(marg, points[:, j])
+            marg_designs.append(b_j)
+            marg_penalties.append(s_j)
+        sizes = [b.shape[1] for b in marg_designs]
+        # Design: row-wise Khatri-Rao (tensor) product of the marginal bases,
+        # earliest marginal varying slowest — the autograd VJP flows back to
+        # `points` through each `bspline_basis` factor exactly as the scalar
+        # BSpline path does, since the Hadamard-outer product is plain torch
+        # algebra over the differentiable marginal designs.
+        design = marg_designs[0]
+        for b_j in marg_designs[1:]:
+            n = design.shape[0]
+            design = (design.unsqueeze(2) * b_j.unsqueeze(1)).reshape(n, -1)
+        # Penalty: single-λ Kronecker-sum  S = Σ_a I ⊗ S_a ⊗ I  (mgcv te()-style
+        # isotropic tensor penalty), matching the Rust TensorBSpline penalty
+        # `S = Σ_i I ⊗ … ⊗ S_i ⊗ … ⊗ I` (src/terms/smooth/part_001.rs:486).
+        total = 1
+        for k in sizes:
+            total *= k
+        penalty = torch.zeros(
+            total, total, dtype=torch.float64, device=points.device
+        )
+        for a, s_a in enumerate(marg_penalties):
+            left = 1
+            for k in sizes[:a]:
+                left *= k
+            right = 1
+            for k in sizes[a + 1:]:
+                right *= k
+            penalty = penalty + _kron_eye(left, s_a, right)
+        return design.to(torch.float64), penalty
+
+    if entry == "matern" and isinstance(smooth, Matern):
+        from .._api import matern_basis as _matern_basis
+        if smooth.centers is None:
+            raise ValueError("Matern requires centers on the torch path")
+        from .._basis_eval import matern_evaluate, _matern_nu_string
+        centers_t = _coerce_2d(_to_tensor(smooth.centers, points), "Matern.centers")
+        if centers_t.shape[1] != points.shape[1]:
+            raise ValueError(
+                f"Matern: points d={points.shape[1]} but centers "
+                f"d={centers_t.shape[1]}"
+            )
+        # Design: Matérn kernel evaluated points-vs-centers, autograd VJP back to
+        # `points` via the analytic Rust input-location jet (matern_evaluate).
+        design = matern_evaluate(smooth, points)
+        # Penalty: the Matérn covariance Gram K_cc among centers — the
+        # REML-compatible RKHS penalty by Duchon's kernel-Gram identity (the
+        # RKHS norm of f = Σ αᵢ k(·, cᵢ) is αᵀ K_cc α). centers/length_scale/ν
+        # are structural, so this carries no autograd path.
+        centers_np = centers_t.detach().cpu().to(torch.float64).numpy()
+        gram_np = _matern_basis(
+            centers_np,
+            centers_np,
+            length_scale=float(smooth.length_scale),
+            nu=_matern_nu_string(float(smooth.nu)),
+            aniso_log_scales=smooth.aniso_log_scales,
+        )
+        penalty = torch.as_tensor(
+            gram_np, dtype=torch.float64, device=points.device
+        )
+        # Symmetrize against round-off so REML sees an exactly symmetric penalty.
+        penalty = 0.5 * (penalty + penalty.transpose(0, 1))
+        return design.to(torch.float64), penalty
+
     expected_smooth_type = {
         "duchon": "Duchon",
         "bspline": "BSpline",
@@ -328,8 +462,6 @@ def _build_design_penalty(
     # the torch path. Raise the same NotImplementedError-shape the previous
     # Python cascade used so callers see a consistent message.
     unwired_entries = {
-        "tensor_bspline": "TensorBSpline",
-        "matern": "Matern",
         "categorical": "Categorical",
     }
     if entry in unwired_entries:
@@ -340,6 +472,7 @@ def _build_design_penalty(
             "gamfit.torch.fit; needs a Rust PyO3 binding for the underlying "
             "basis + penalty. Currently supported on the torch path: "
             "Duchon (any d for basis; d=1 for penalty), BSpline (d=1), "
+            "TensorBSpline (te), Matern (kernel-Gram penalty), "
             "Sphere (S²), PeriodicSplineCurve, Pca."
         )
 
