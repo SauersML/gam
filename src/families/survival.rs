@@ -2732,9 +2732,7 @@ pub fn assemble_competing_risks_cif_from_endpoints(
             .map(assemble_row)
             .collect::<Result<_, _>>()?
     } else {
-        (0..n_rows)
-            .map(assemble_row)
-            .collect::<Result<_, _>>()?
+        (0..n_rows).map(assemble_row).collect::<Result<_, _>>()?
     };
 
     for (row, (cif_flat, surv_row)) in rows.into_iter().enumerate() {
