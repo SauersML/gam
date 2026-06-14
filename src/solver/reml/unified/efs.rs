@@ -803,13 +803,13 @@ pub(crate) fn symmetric_eigen(a: &ndarray::Array2<f64>) -> (Vec<f64>, ndarray::A
     // The off-diagonal Frobenius norm converges quadratically, so a near-machine
     // `tol` is reached in a handful of sweeps for the small matrices this serves;
     // `MAX_SWEEPS` is a generous safety cap that the convergence test hits first.
-    pub(crate) const MAX_SWEEPS: usize = 100;
-    pub(crate) const TOL: f64 = 1e-15;
+    const MAX_SWEEPS: usize = 100;
+    const TOL: f64 = 1e-15;
     // Skip a pair whose off-diagonal magnitude is already two orders below `TOL`
     // (rotating it would only add round-off), and skip a rotation whose `τ`
     // magnitude is so large the pair is numerically diagonal already.
-    pub(crate) const PAIR_SKIP_TOL: f64 = TOL * 0.01;
-    pub(crate) const TAU_DIAGONAL_THRESHOLD: f64 = 1e15;
+    const PAIR_SKIP_TOL: f64 = TOL * 0.01;
+    const TAU_DIAGONAL_THRESHOLD: f64 = 1e15;
 
     let mut sweep = 0;
     while sweep < MAX_SWEEPS {

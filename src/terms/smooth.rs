@@ -11,6 +11,12 @@ mod input_standardization;
 
 mod shape_constraints;
 
+mod penalty_priors;
+pub use penalty_priors::{
+    CoefficientGroupPrior, CoefficientGroupSpec, CoefficientSelector, PenaltyBlockGammaPriorMetadata,
+    RealizedCoefficientGroups,
+};
+
 include!("smooth/term_specs.rs");
 include!("smooth/design_construction.rs");
 include!("smooth/spatial_optimization.rs");

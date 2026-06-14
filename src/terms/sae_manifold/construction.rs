@@ -1650,7 +1650,7 @@ impl SaeManifoldTerm {
         // Relative magnitude cutoff: assignment mass below this fraction of the
         // row's peak `|a_k|` enters the Gram only as `O(a²)` curvature and is
         // dropped. Chosen so dropped terms are ~1e-6 of the peak self-coupling.
-        pub(crate) const RELATIVE_CUTOFF: f64 = 1.0e-3;
+        const RELATIVE_CUTOFF: f64 = 1.0e-3;
 
         let k_atoms = self.k_atoms();
         if k_atoms <= 1 {
@@ -2948,7 +2948,7 @@ impl SaeManifoldTerm {
             .iter()
             .map(|coord| coord.effective_axis_periods())
             .collect();
-        pub(crate) struct SaeAssemblyRow {
+        struct SaeAssemblyRow {
             pub(crate) row: usize,
             pub(crate) block: ArrowRowBlock,
             pub(crate) gb_delta: Vec<(usize, f64)>,
@@ -2968,7 +2968,7 @@ impl SaeManifoldTerm {
         // it is read each row, so reuse is bit-identical to the fresh-alloc path;
         // `gb_delta`/`g_blocks` are NOT scratch (they move into the returned
         // `SaeAssemblyRow`) and stay allocated per row.
-        pub(crate) struct RowScratch {
+        struct RowScratch {
             pub(crate) decoded: Array2<f64>,
             pub(crate) dg_buf: Vec<f64>,
             pub(crate) fitted: Array1<f64>,

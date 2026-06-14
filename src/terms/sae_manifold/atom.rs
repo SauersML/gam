@@ -171,7 +171,7 @@ pub(crate) fn torus_projection_seed_grid(latent_dim: usize, resolution: usize) -
     if latent_dim == 0 || latent_dim >= usize::BITS as usize {
         return None;
     }
-    pub(crate) const MAX_GRID_POINTS: usize = 4096;
+    const MAX_GRID_POINTS: usize = 4096;
     let min_points = 1usize << latent_dim;
     if min_points > MAX_GRID_POINTS {
         return None;
@@ -1135,8 +1135,8 @@ impl SaeManifoldAtom {
         // a vanishing-speed coefficient at a small fraction of the typical
         // speed rather than a singular negative power, and clamps any non-finite
         // ratio back to a finite weight.
-        pub(crate) const RELATIVE_SPEED_FLOOR: f64 = 1.0e-6;
-        pub(crate) const RELATIVE_SPEED_CEIL: f64 = 1.0e6;
+        const RELATIVE_SPEED_FLOOR: f64 = 1.0e-6;
+        const RELATIVE_SPEED_CEIL: f64 = 1.0e6;
         let mut root_w = vec![0.0_f64; m];
         for col in 0..m {
             // Normalised squared speed (ratio to the geometric-mean center),

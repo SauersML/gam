@@ -1388,7 +1388,7 @@ impl<'a> RemlState<'a> {
         }
 
         #[derive(Clone)]
-        pub(crate) struct Jet {
+        struct Jet {
             pub(crate) v: f64,
             pub(crate) g: Array1<f64>,
             pub(crate) h: Array2<f64>,
@@ -1828,7 +1828,7 @@ impl<'a> RemlState<'a> {
         let xt = x_eff_dense.t().to_owned();
         let p = x_eff_dense.ncols();
         let n = x_eff_dense.nrows();
-        pub(crate) enum HFactor {
+        enum HFactor {
             Cholesky(crate::linalg::faer_ndarray::FaerCholeskyFactor),
             Eigh {
                 evals: Array1<f64>,
@@ -2442,7 +2442,7 @@ impl<'a> RemlState<'a> {
         // be surfaced. This has zero effect on optimization math.
         // Emit on the first eval and then once every this-many evals so a long
         // outer optimization leaves a periodic trace without flooding the log.
-        pub(crate) const HOT_DIAGNOSTIC_EVAL_INTERVAL: u64 = 200;
+        const HOT_DIAGNOSTIC_EVAL_INTERVAL: u64 = 200;
         (log::log_enabled!(log::Level::Info) || log::log_enabled!(log::Level::Warn))
             && (eval_idx == 1 || eval_idx.is_multiple_of(HOT_DIAGNOSTIC_EVAL_INTERVAL))
     }
@@ -4634,7 +4634,7 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn without_persistent_warm_start_store<T>(&self, f: impl FnOnce() -> T) -> T {
-        pub(crate) struct StoreSuppressionGuard<'a>(&'a AtomicUsize);
+        struct StoreSuppressionGuard<'a>(&'a AtomicUsize);
         impl Drop for StoreSuppressionGuard<'_> {
             fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::Relaxed);
@@ -4941,7 +4941,7 @@ impl<'a> RemlState<'a> {
         // Squared-norm floor (≈1e-12 in ‖Δρ‖) below which the previous ρ-step is
         // treated as a degenerate/zero-length direction the tangent predictor
         // cannot extrapolate along.
-        pub(crate) const DEGENERATE_DRHO_NORM_SQ: f64 = 1e-24;
+        const DEGENERATE_DRHO_NORM_SQ: f64 = 1e-24;
         let d_rho_norm_sq: f64 = cur_rho
             .iter()
             .zip(prev_rho.iter())
@@ -5033,7 +5033,7 @@ impl<'a> RemlState<'a> {
         // doesn't fire on a near-identity prediction (would
         // contaminate the residual percentile distribution with
         // ~zero residuals — same bug class as commit 52372fd5).
-        pub(crate) const TANGENT_ALPHA_NOOP_EPS: f64 = 1e-12;
+        const TANGENT_ALPHA_NOOP_EPS: f64 = 1e-12;
         if alpha.abs() <= TANGENT_ALPHA_NOOP_EPS {
             log::info!(
                 "[TANGENT-NOOP] reason=alpha_below_eps alpha={:.3e} eps={:.3e}",
@@ -6550,18 +6550,18 @@ pub(crate) fn adaptive_lm_lambda_hint(
 ) -> Option<f64> {
     // Iteration-count boundaries that classify the previous PIRLS solve's
     // conditioning regime.
-    pub(crate) const NEWTON_FRIENDLY_MAX_ITERS: usize = 2;
-    pub(crate) const HARD_FIT_MIN_ITERS: usize = 10;
+    const NEWTON_FRIENDLY_MAX_ITERS: usize = 2;
+    const HARD_FIT_MIN_ITERS: usize = 10;
     // Per-regime adaptive clamp bands for the cached LM damping hint (see the
     // doc comment): Newton-friendly relaxes down to the LM-internal floor, a
     // hard fit preserves the heavy-damping signal up to gradient-descent, and
     // the default reproduces the historical static `[1e-6, 1e-3]` clamp.
-    pub(crate) const NEWTON_LAMBDA_FLOOR: f64 = 1e-9;
-    pub(crate) const NEWTON_LAMBDA_CEILING: f64 = 1e-3;
-    pub(crate) const HARD_FIT_LAMBDA_FLOOR: f64 = 1e-3;
-    pub(crate) const HARD_FIT_LAMBDA_CEILING: f64 = 1.0;
-    pub(crate) const DEFAULT_LAMBDA_FLOOR: f64 = 1e-6;
-    pub(crate) const DEFAULT_LAMBDA_CEILING: f64 = 1e-3;
+    const NEWTON_LAMBDA_FLOOR: f64 = 1e-9;
+    const NEWTON_LAMBDA_CEILING: f64 = 1e-3;
+    const HARD_FIT_LAMBDA_FLOOR: f64 = 1e-3;
+    const HARD_FIT_LAMBDA_CEILING: f64 = 1.0;
+    const DEFAULT_LAMBDA_FLOOR: f64 = 1e-6;
+    const DEFAULT_LAMBDA_CEILING: f64 = 1e-3;
     if !cached_lambda.is_finite() || cached_lambda <= 0.0 {
         return None;
     }

@@ -291,7 +291,7 @@ impl SaeManifoldTerm {
         /// against the flat reference for `d = 2` free/patch atoms (#1019
         /// free-chart arm — a contractible Euclidean patch admits a global
         /// polynomial flow basis, no hairy-ball obstruction).
-        pub(crate) enum ChartPlan {
+        enum ChartPlan {
             UnitSpeed(CanonicalChartTopology),
             TorusFlow { period: f64 },
             PatchFlow,

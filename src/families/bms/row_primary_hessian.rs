@@ -2357,7 +2357,7 @@ impl BernoulliMarginalSlopeFamily {
         // dense-PIRLS routing helpers were retired (no live device backend
         // in this build); revisit when a runtime device backend is
         // reintroduced.
-        pub(crate) const CPU_TARGET_CHUNK_FLOATS: usize = 1 << 17;
+        const CPU_TARGET_CHUNK_FLOATS: usize = 1 << 17;
         let cpu_rows = (CPU_TARGET_CHUNK_FLOATS / (3 * n_dirs).max(1)).clamp(1024, n.max(1));
         (cpu_rows.min(n.max(1)), false)
     }

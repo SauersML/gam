@@ -1030,7 +1030,7 @@ pub fn marginal_slope_covariance_from_scores(
     } else {
         1.0
     };
-    pub(crate) const OFFDIAG_Z_THRESHOLD: f64 = 4.0;
+    const OFFDIAG_Z_THRESHOLD: f64 = 4.0;
     let mut is_stat_diagonal = true;
     'stat: for a in 0..k {
         for b in (a + 1)..k {
@@ -1145,7 +1145,7 @@ pub(super) fn empirical_rigid_calibration_eval(
         ));
     }
     let observed_slope = rigid_observed_logslope(slope, probit_scale);
-    pub(crate) const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_8; // 0.5 * ln(2π)
+    const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_8; // 0.5 * ln(2π)
 
     // Streaming LSE accumulators for log Σ wᵢ φᵢ and log Σ wᵢ Φᵢ.
     let mut log_max_phi = f64::NEG_INFINITY;

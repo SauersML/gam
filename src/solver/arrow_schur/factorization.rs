@@ -279,7 +279,7 @@ pub(crate) fn factor_gauge_deflated_evidence_row(
     d: usize,
     gauges: &[Array1<f64>],
 ) -> Option<ArrowRowFactorResult> {
-    pub(crate) const GAUGE_RAYLEIGH_EPS: f64 = 1.0e-8;
+    const GAUGE_RAYLEIGH_EPS: f64 = 1.0e-8;
     if gauges.is_empty() {
         return None;
     }
@@ -731,10 +731,10 @@ pub(crate) fn factor_one_row_result(
     // diagonal magnitude), multiplies geometrically each rejection, and is
     // capped at a large multiple of the base scale so a genuinely broken block
     // surfaces as an error instead of looping forever.
-    pub(crate) const RIDGE_GROWTH_FACTOR: f64 = 10.0;
-    pub(crate) const RIDGE_SEED_DIAG_FRACTION: f64 = 1.0e-10;
-    pub(crate) const RIDGE_CAP_DIAG_FRACTION: f64 = 1.0e-12;
-    pub(crate) const RIDGE_CAP_SCALE: f64 = 1.0e12;
+    const RIDGE_GROWTH_FACTOR: f64 = 10.0;
+    const RIDGE_SEED_DIAG_FRACTION: f64 = 1.0e-10;
+    const RIDGE_CAP_DIAG_FRACTION: f64 = 1.0e-12;
+    const RIDGE_CAP_SCALE: f64 = 1.0e12;
     let diag_scale = row_block_diag_scale(row, d);
     let ridge_cap = ridge_t.max(RIDGE_CAP_DIAG_FRACTION * diag_scale) * RIDGE_CAP_SCALE;
     let mut ridge_eff = ridge_t;

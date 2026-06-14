@@ -2633,7 +2633,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BinomialMeanWiggleTermFitResult, String> {
-    pub(crate) const RHO_BOUND: f64 = 12.0;
+    const RHO_BOUND: f64 = 12.0;
 
     validate_term_weights(
         data,
@@ -2814,7 +2814,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let mut outer_options = options.clone();
     outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
-    pub(crate) struct MeanWiggleOuterState {
+    struct MeanWiggleOuterState {
         pub(crate) warm_cache: Option<crate::custom_family::CustomFamilyWarmStart>,
         pub(crate) last_eval: Option<(
             Array1<f64>,

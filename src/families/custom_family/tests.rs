@@ -955,7 +955,7 @@ pub(crate) fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_boun
     // S = U diag(σ) Uᵀ where σ has `nullspace_dims` trailing zeros.
     // We use deterministic orthonormal columns from a simple QR of a
     // structured matrix to mimic the eigenstructure without random.
-    pub(crate) fn build_duchon_shape(p: usize, nullspace: usize, signal_scale: f64) -> Array2<f64> {
+    fn build_duchon_shape(p: usize, nullspace: usize, signal_scale: f64) -> Array2<f64> {
         // Diagonal eigenvalue spectrum, geometric decay across the
         // signal subspace then zeros on the nullspace.
         let rank = p - nullspace;
@@ -1982,7 +1982,7 @@ pub(crate) fn public_warm_start_compatibility_checks_rho_dimension() {
 #[test]
 pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
     #[derive(Clone)]
-    pub(crate) struct ZeroFamily;
+    struct ZeroFamily;
 
     impl CustomFamily for ZeroFamily {
         fn evaluate(
@@ -1997,7 +1997,7 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
         }
     }
 
-    pub(crate) struct BlockLocalPsiWorkspace;
+    struct BlockLocalPsiWorkspace;
 
     impl ExactNewtonJointPsiWorkspace for BlockLocalPsiWorkspace {
         fn second_order_terms(
@@ -2058,7 +2058,7 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
 #[test]
 pub(crate) fn custom_family_outer_derivatives_respects_missing_second_order_capability() {
     #[derive(Clone)]
-    pub(crate) struct OneBlockFirstOrderOnlyFamily;
+    struct OneBlockFirstOrderOnlyFamily;
 
     impl CustomFamily for OneBlockFirstOrderOnlyFamily {
         fn evaluate(
@@ -2332,7 +2332,7 @@ pub(crate) fn custom_family_outer_derivatives_exposes_surrogate_second_order_geo
     // cubic regularization. The previous behavior forced these families
     // onto BFGS+BfgsApprox and caused benchmark hangs at iter 0.
     #[derive(Clone)]
-    pub(crate) struct SurrogateFamily;
+    struct SurrogateFamily;
 
     impl CustomFamily for SurrogateFamily {
         fn evaluate(
@@ -2382,7 +2382,7 @@ pub(crate) fn custom_family_outer_derivatives_exposes_surrogate_second_order_geo
 #[test]
 pub(crate) fn custom_family_outer_derivatives_keeps_strict_second_order_geometry() {
     #[derive(Clone)]
-    pub(crate) struct StrictFamily;
+    struct StrictFamily;
 
     impl CustomFamily for StrictFamily {
         fn evaluate(
@@ -2881,7 +2881,7 @@ pub(crate) fn custom_family_outer_derivatives_keeps_second_order_for_large_inner
     // that were hanging 45-minute GH jobs on BFGS+BfgsApprox Strong Wolfe
     // failures at iter 0.
     #[derive(Clone)]
-    pub(crate) struct StrictFamily;
+    struct StrictFamily;
 
     impl CustomFamily for StrictFamily {
         fn evaluate(
@@ -5911,7 +5911,7 @@ pub(crate) fn checked_penalizedobjective_rejects_non_finite_values() {
 #[test]
 pub(crate) fn exact_newton_dh_closure_rejects_non_finite_directional_derivative() {
     #[derive(Clone)]
-    pub(crate) struct OneBlockNonFiniteJointDhFamily;
+    struct OneBlockNonFiniteJointDhFamily;
 
     impl CustomFamily for OneBlockNonFiniteJointDhFamily {
         fn evaluate(
@@ -6249,7 +6249,7 @@ pub(crate) fn make_heterogeneous_eta_specs(n: usize) -> Vec<ParameterBlockSpec> 
 pub(crate) fn uniform_eta_lengths_do_not_panic() {
     let n = 10;
     #[derive(Clone)]
-    pub(crate) struct UniformEtaFamily;
+    struct UniformEtaFamily;
     impl CustomFamily for UniformEtaFamily {
         fn evaluate(
             &self,
@@ -6373,7 +6373,7 @@ pub(crate) fn heterogeneous_eta_single_cycle_completes() {
 pub(crate) fn heterogeneous_eta_no_panic_when_all_blocks_converged() {
     let n = 10;
     #[derive(Clone)]
-    pub(crate) struct AllConvergedFamily {
+    struct AllConvergedFamily {
         pub(crate) n: usize,
     }
     impl CustomFamily for AllConvergedFamily {
@@ -6431,7 +6431,7 @@ pub(crate) fn heterogeneous_eta_no_panic_when_all_blocks_converged() {
 pub(crate) fn heterogeneous_eta_completes_when_only_small_block_steps() {
     let n = 10;
     #[derive(Clone)]
-    pub(crate) struct OnlySmallBlockStepsFamily {
+    struct OnlySmallBlockStepsFamily {
         pub(crate) n: usize,
     }
     impl CustomFamily for OnlySmallBlockStepsFamily {
@@ -7415,10 +7415,10 @@ pub(crate) fn joint_inner_convergence_rejects_objective_flat_non_kkt_stall() {
 
 #[test]
 pub(crate) fn joint_trust_region_block_metric_does_not_starve_unrelated_blocks() {
-    pub(crate) const TIME_W: usize = 12;
-    pub(crate) const MARG_W: usize = 11;
-    pub(crate) const LOG_W: usize = 10;
-    pub(crate) const P: usize = TIME_W + MARG_W + LOG_W;
+    const TIME_W: usize = 12;
+    const MARG_W: usize = 11;
+    const LOG_W: usize = 10;
+    const P: usize = TIME_W + MARG_W + LOG_W;
 
     let mut h = Array2::<f64>::zeros((P, P));
     let mut g = Array1::<f64>::zeros(P);

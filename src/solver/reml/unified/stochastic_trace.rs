@@ -569,7 +569,7 @@ impl StochasticTraceEstimator {
         let mut y_vec = Array1::<f64>::zeros(n_obs);
         let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
 
-        pub(crate) struct ImplicitSecondOrderScratch {
+        struct ImplicitSecondOrderScratch {
             pub(crate) w_dx_u: Array1<f64>,
             pub(crate) w_y: Array1<f64>,
             pub(crate) u_s: Array1<f64>,

@@ -51,7 +51,7 @@ impl TransformationNormalFamily {
         let response_lower_basis = &self.response_lower_basis;
         let response_upper_basis = &self.response_upper_basis;
 
-        pub(crate) struct ScopAccum {
+        struct ScopAccum {
             pub(crate) gradient: Array1<f64>,
             pub(crate) hessian: Array2<f64>,
         }
@@ -342,7 +342,7 @@ impl TransformationNormalFamily {
             ) }.into());
         }
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        pub(crate) const TARGET_CHUNK_COUNT: usize = 32;
+        const TARGET_CHUNK_COUNT: usize = 32;
         let chunk_size = n.div_ceil(TARGET_CHUNK_COUNT).max(1);
         let n_chunks = n.div_ceil(chunk_size);
 
@@ -575,7 +575,7 @@ impl TransformationNormalFamily {
             ) }.into());
         }
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        pub(crate) const TARGET_CHUNK_COUNT: usize = 32;
+        const TARGET_CHUNK_COUNT: usize = 32;
         let chunk_size = n.div_ceil(TARGET_CHUNK_COUNT).max(1);
         let n_chunks = n.div_ceil(chunk_size);
 
@@ -1285,7 +1285,7 @@ impl TransformationNormalFamily {
         let h_prime = row_quantities.h_prime.as_ref();
         let row_gamma = row_quantities.gamma.as_ref();
 
-        pub(crate) struct DhTraceScratch {
+        struct DhTraceScratch {
             pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_dir: Vec<f64>,
             pub(crate) h_factor: Vec<f64>,

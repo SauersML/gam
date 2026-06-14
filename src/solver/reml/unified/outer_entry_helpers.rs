@@ -102,7 +102,7 @@ pub(crate) fn rho_curvature_lambda(solution: &InnerSolution<'_>, lambda: f64) ->
 
 
 pub(crate) fn penalty_coord_to_operator(coord: PenaltyCoordinate, scale: f64) -> Arc<dyn HyperOperator> {
-    pub(crate) struct OwnedPenaltyHyperOperator {
+    struct OwnedPenaltyHyperOperator {
         pub(crate) coord: PenaltyCoordinate,
         pub(crate) scale: f64,
     }

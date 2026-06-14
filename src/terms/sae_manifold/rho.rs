@@ -93,8 +93,8 @@ impl SaeManifoldRho {
     /// finite-normal band, so the resulting strength is always a finite,
     /// strictly-positive `f64` (no overflow to `inf`, no underflow to `0.0`).
     pub(crate) fn stable_exp_strength(log_strength: f64) -> f64 {
-        pub(crate) const MAX_LOG_STRENGTH: f64 = 700.0;
-        pub(crate) const MIN_LOG_STRENGTH: f64 = -700.0;
+        const MAX_LOG_STRENGTH: f64 = 700.0;
+        const MIN_LOG_STRENGTH: f64 = -700.0;
         log_strength.clamp(MIN_LOG_STRENGTH, MAX_LOG_STRENGTH).exp()
     }
 

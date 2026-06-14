@@ -1498,8 +1498,8 @@ use super::*;
         }
 
         pub(crate) fn mode(self) -> AssignmentMode {
-            pub(crate) const TAU: f64 = 1.0;
-            pub(crate) const ALPHA: f64 = 1.0;
+            const TAU: f64 = 1.0;
+            const ALPHA: f64 = 1.0;
             match self {
                 Self::Softmax => AssignmentMode::softmax(TAU),
                 Self::IbpMap => AssignmentMode::ibp_map(TAU, ALPHA, false),
@@ -1507,7 +1507,7 @@ use super::*;
         }
 
         pub(crate) fn seed_logit(self) -> f64 {
-            pub(crate) const TAU: f64 = 1.0;
+            const TAU: f64 = 1.0;
             match self {
                 Self::Softmax => 0.0,
                 Self::IbpMap => 6.0 * TAU,
@@ -7364,13 +7364,13 @@ use super::*;
 
     #[test]
     pub(crate) fn qwen_shape_d2_factored_htbeta_assembly_stays_below_8gib() {
-        pub(crate) const K_ATOMS: usize = 8;
-        pub(crate) const M: usize = 10;
-        pub(crate) const P: usize = 2048;
-        pub(crate) const FRAME_RANK: usize = 2;
-        pub(crate) const LATENT_DIM: usize = 2;
-        pub(crate) const N_OBS: usize = 2000;
-        pub(crate) const EIGHT_GIB: usize = 8 * 1024 * 1024 * 1024;
+        const K_ATOMS: usize = 8;
+        const M: usize = 10;
+        const P: usize = 2048;
+        const FRAME_RANK: usize = 2;
+        const LATENT_DIM: usize = 2;
+        const N_OBS: usize = 2000;
+        const EIGHT_GIB: usize = 8 * 1024 * 1024 * 1024;
 
         let mut term = low_rank_factored_htbeta_term(K_ATOMS, M, P, FRAME_RANK, LATENT_DIM, N_OBS);
         assert!(term.frames_active());
@@ -7787,7 +7787,7 @@ use super::*;
         // Tiny-fixture row arity: softmax gauges the last logit as the fixed
         // reference (assignment_coord_dim = k_atoms − 1 = 1 free logit), plus
         // 2 atoms × 1 latent coord.
-        pub(crate) const K: usize = 3;
+        const K: usize = 3;
         for weighted in [false, true] {
             let (mut term, target, rho) = gamma_fd_tiny_fixture();
             if weighted {

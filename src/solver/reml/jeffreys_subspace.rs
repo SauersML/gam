@@ -333,7 +333,7 @@ pub(crate) fn conditioning_gate_weight(lambda_min: f64, lambda_max: f64) -> f64 
     // `ramp_down(x, under, clear)`: the still-active weight, `1` for `x ≤ under`,
     // `0` for `x ≥ clear`, C¹ cubic smoothstep `1 − (3t² − 2t³)` between.
     #[inline]
-    pub(crate) fn ramp_down(x: f64, under: f64, clear: f64) -> f64 {
+    fn ramp_down(x: f64, under: f64, clear: f64) -> f64 {
         if x <= under {
             return 1.0;
         }
@@ -377,7 +377,7 @@ pub(crate) fn conditioning_gate_weight_grad(lambda_min: f64, lambda_max: f64) ->
     // `ramp_down`'s value and derivative: `d/dx [1 − (3t² − 2t³)] = −6 t (1−t) / (clear − under)`
     // on the open band (`under < x < clear`), `0` at/outside both knots (C¹).
     #[inline]
-    pub(crate) fn ramp_down_value_and_deriv(x: f64, under: f64, clear: f64) -> (f64, f64) {
+    fn ramp_down_value_and_deriv(x: f64, under: f64, clear: f64) -> (f64, f64) {
         if x <= under {
             return (1.0, 0.0);
         }

@@ -112,7 +112,7 @@ impl<'a> RemlState<'a> {
         // accumulate many such blocks and OOM).  Restrict the early-out
         // to truly small problems: `p` below threshold AND `n·p` small enough
         // that one dense `n×p` block is in the few-tens-of-MB range.
-        pub(crate) const SMALL_NP_DENSE_BUDGET: usize = 4_000_000;
+        const SMALL_NP_DENSE_BUDGET: usize = 4_000_000;
         let n_obs = self.y.len();
         if p < Self::SMALL_P_DENSE_THRESHOLD && n_obs.saturating_mul(p) < SMALL_NP_DENSE_BUDGET {
             return dense_backend("p_below_threshold_and_small", None, None);

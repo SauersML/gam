@@ -934,7 +934,7 @@ impl TransformationNormalPsiWorkspace {
 
         // Single-pass row walk: for each row, load the per-row state once and
         // accumulate every axis's `objective_psi`/`score_psi` in lockstep.
-        pub(crate) struct PsiAllAxesAccum {
+        struct PsiAllAxesAccum {
             pub(crate) objective_psi: Vec<f64>,
             pub(crate) score_psi: Vec<Array1<f64>>,
         }
@@ -1236,7 +1236,7 @@ impl TransformationNormalPsiWorkspace {
         .max(1)
         .min(n.max(1));
 
-        pub(crate) struct PsiPairCacheAccum {
+        struct PsiPairCacheAccum {
             pub(crate) objective: f64,
             pub(crate) score: Array1<f64>,
         }

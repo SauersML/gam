@@ -197,11 +197,11 @@ where
     M: WorkingModel + ?Sized,
     F: FnMut(&WorkingModelIterationInfo),
 {
-    pub(crate) const CONSTRAINED_OBJECTIVE_PLATEAU_STREAK: usize = 20;
+    const CONSTRAINED_OBJECTIVE_PLATEAU_STREAK: usize = 20;
     // Minimum reduced-system dimension K at which building the GPU Y_i matvec
     // backend for matrix-free InexactPCG pays for the device round-trip; below
     // this the CPU-driven PCG matvec wins (issue #288 Part B).
-    pub(crate) const ARROW_GPU_MATVEC_MIN_K: usize = 5000;
+    const ARROW_GPU_MATVEC_MIN_K: usize = 5000;
 
     // ── Anderson acceleration of depth 1 (AA(1)) for the Fisher fixed-point ──
     // PIRLS normally uses observed-information Newton (already super-linear, no
@@ -210,10 +210,10 @@ where
     // the regime where AA(1) provably improves the rate. State is local to
     // this PIRLS call; costs nothing while `force_fisher_for_rest` stays
     // false because the mixing branch is never entered.
-    pub(crate) const AA1_DAMPING_FLOOR: f64 = 1e-12;
-    pub(crate) const AA1_DISABLE_REJECT_THRESHOLD: usize = 3;
+    const AA1_DAMPING_FLOOR: f64 = 1e-12;
+    const AA1_DISABLE_REJECT_THRESHOLD: usize = 3;
 
-    pub(crate) struct AndersonOneState {
+    struct AndersonOneState {
         pub(crate) prev_beta: Option<Array1<f64>>,
         pub(crate) prev_residual: Option<Array1<f64>>,
         pub(crate) r_k: Array1<f64>,
@@ -342,7 +342,7 @@ where
         }
     }
 
-    pub(crate) fn reuse_regularized_hessian_buffer(
+    fn reuse_regularized_hessian_buffer(
         existing: Option<crate::linalg::matrix::SymmetricMatrix>,
         source: &crate::linalg::matrix::SymmetricMatrix,
     ) -> crate::linalg::matrix::SymmetricMatrix {
@@ -357,7 +357,7 @@ where
         }
     }
 
-    pub(crate) fn is_lm_retriable_candidate_error(err: &EstimationError) -> bool {
+    fn is_lm_retriable_candidate_error(err: &EstimationError) -> bool {
         match err {
             EstimationError::LinearSystemSolveFailed(_)
             | EstimationError::HessianNotPositiveDefinite { .. } => true,
@@ -386,10 +386,10 @@ where
     // question delegates here; the count-or-window exhaustion question is
     // `IterationBound::exhausted_at`, answered from guard-owned state, so
     // no branch in this file can re-derive either predicate locally.
-    pub(crate) fn lm_can_retry(loop_lambda: f64) -> bool {
+    fn lm_can_retry(loop_lambda: f64) -> bool {
         crate::solver::loop_guard::madsen_can_retry(loop_lambda)
     }
-    pub(crate) fn lm_nonconvergence_error(
+    fn lm_nonconvergence_error(
         options: &WorkingModelPirlsOptions,
         last_change: f64,
     ) -> EstimationError {

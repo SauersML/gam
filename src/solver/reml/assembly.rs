@@ -40,9 +40,9 @@ pub(crate) enum DenseRowScaleMode {
 
 #[inline]
 pub(crate) fn dense_weighted_chunk_rows(cols: usize) -> usize {
-    pub(crate) const TARGET_BYTES: usize = 2 * 1024 * 1024;
-    pub(crate) const MIN_ROWS: usize = 256;
-    pub(crate) const MAX_ROWS: usize = 4096;
+    const TARGET_BYTES: usize = 2 * 1024 * 1024;
+    const MIN_ROWS: usize = 256;
+    const MAX_ROWS: usize = 4096;
     let bytes_per_row = cols.max(1) * std::mem::size_of::<f64>();
     (TARGET_BYTES / bytes_per_row).clamp(MIN_ROWS, MAX_ROWS)
 }

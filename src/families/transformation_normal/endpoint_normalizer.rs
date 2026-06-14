@@ -293,7 +293,7 @@ mod tests {
         if polynomial_factor == 0.0 {
             return 0.0;
         }
-        pub(crate) const LOG_SQRT_2PI: f64 = 0.918_938_533_204_672_7;
+        const LOG_SQRT_2PI: f64 = 0.918_938_533_204_672_7;
         let log_abs = polynomial_factor.abs().ln()
             - 0.5 * x * x
             - LOG_SQRT_2PI
@@ -445,24 +445,24 @@ mod tests {
 
     #[test]
     pub(crate) fn tower_endpoint_normalizer_matches_hand_witness_across_ctn_regimes() {
-        pub(crate) struct Regime {
+        struct Regime {
             pub(crate) name: &'static str,
             pub(crate) cases: &'static [(f64, f64)],
             pub(crate) rel_tol: f64,
         }
 
-        pub(crate) const WIDE: &[(f64, f64)] = &[(-2.0, -7.5), (2.0, -3.0), (8.0, -8.0)];
-        pub(crate) const NARROW: &[(f64, f64)] = &[(-0.249_999, -0.25), (1.000_001, 1.0), (-3.999_999, -4.0)];
-        pub(crate) const BOTH_POS_TAIL: &[(f64, f64)] = &[(6.5, 6.0), (8.0, 7.9), (8.0, 7.0)];
-        pub(crate) const BOTH_NEG_TAIL: &[(f64, f64)] = &[(-6.0, -6.5), (-7.9, -8.0), (-7.0, -8.0)];
-        pub(crate) const STRADDLING: &[(f64, f64)] = &[(-0.1, -2.0), (0.1, -0.1), (3.0, -4.0)];
-        pub(crate) const NEAR_EQUAL: &[(f64, f64)] = &[
+        const WIDE: &[(f64, f64)] = &[(-2.0, -7.5), (2.0, -3.0), (8.0, -8.0)];
+        const NARROW: &[(f64, f64)] = &[(-0.249_999, -0.25), (1.000_001, 1.0), (-3.999_999, -4.0)];
+        const BOTH_POS_TAIL: &[(f64, f64)] = &[(6.5, 6.0), (8.0, 7.9), (8.0, 7.0)];
+        const BOTH_NEG_TAIL: &[(f64, f64)] = &[(-6.0, -6.5), (-7.9, -8.0), (-7.0, -8.0)];
+        const STRADDLING: &[(f64, f64)] = &[(-0.1, -2.0), (0.1, -0.1), (3.0, -4.0)];
+        const NEAR_EQUAL: &[(f64, f64)] = &[
             (1.0e-10, 0.0),
             (-0.999_999_999_999, -1.0),
             (7.000_000_001, 7.0),
             (-7.0, -7.000_000_001),
         ];
-        pub(crate) const REGIMES: &[Regime] = &[
+        const REGIMES: &[Regime] = &[
             Regime {
                 name: "wide windows",
                 cases: WIDE,

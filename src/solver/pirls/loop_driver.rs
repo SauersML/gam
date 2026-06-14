@@ -179,7 +179,7 @@ pub(super) fn solve_intercept_for_prevalence(
     sas_link_state: Option<&SasLinkState>,
 ) -> Option<f64> {
     #[inline]
-    pub(crate) fn f_eta(
+    fn f_eta(
         link_function: LinkFunction,
         eta: f64,
         prevalence: f64,
@@ -391,14 +391,14 @@ pub(super) fn detect_logit_instability(
     // `EXTREME_BETA_NORM`: coefficient norm blow-up characteristic of the MLE
     //   escaping to infinity under separation.
     // `WEIGHT_COLLAPSE_FRACTION`: share of working weights collapsed to ~0.
-    pub(crate) const ORDER_SEPARATION_ETA_GAP: f64 = 1e-3;
-    pub(crate) const EXTREME_ETA: f64 = 30.0;
-    pub(crate) const SATURATION_FRACTION: f64 = 0.98;
-    pub(crate) const SEVERE_SATURATION_FRACTION: f64 = 0.995;
-    pub(crate) const DEGENERATE_DEVIANCE_PER_SAMPLE: f64 = 1e-3;
-    pub(crate) const EXTREME_DEGENERATE_DEVIANCE_PER_SAMPLE: f64 = 1e-6;
-    pub(crate) const EXTREME_BETA_NORM: f64 = 1e4;
-    pub(crate) const WEIGHT_COLLAPSE_FRACTION: f64 = 0.98;
+    const ORDER_SEPARATION_ETA_GAP: f64 = 1e-3;
+    const EXTREME_ETA: f64 = 30.0;
+    const SATURATION_FRACTION: f64 = 0.98;
+    const SEVERE_SATURATION_FRACTION: f64 = 0.995;
+    const DEGENERATE_DEVIANCE_PER_SAMPLE: f64 = 1e-3;
+    const EXTREME_DEGENERATE_DEVIANCE_PER_SAMPLE: f64 = 1e-6;
+    const EXTREME_BETA_NORM: f64 = 1e4;
+    const WEIGHT_COLLAPSE_FRACTION: f64 = 0.98;
 
     let n = y.len() as f64;
     if n == 0.0 {
@@ -540,7 +540,7 @@ pub(super) fn build_diagonal_penalty_from_kronecker(
     let mut diag = Array1::<f64>::zeros(p);
     let mut positive_indices = Vec::new();
 
-    pub(crate) const KRONECKER_STRUCTURAL_ZERO_TOL: f64 = 1e-12;
+    const KRONECKER_STRUCTURAL_ZERO_TOL: f64 = 1e-12;
     let mut multi_idx = vec![0usize; d];
     let mut flat = 0usize;
     loop {
@@ -2097,10 +2097,10 @@ pub(super) fn merge_linear_constraints(
 pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
     // Below this column count a dense factorization beats the sparse path even
     // at high sparsity, so skip the sparsity scan entirely for narrow designs.
-    pub(crate) const DENSE_PREFERRED_MAX_COLS: usize = 32;
+    const DENSE_PREFERRED_MAX_COLS: usize = 32;
     // Sparse storage + sparse Cholesky only pays off below this density (nnz as
     // a fraction of all entries); denser matrices stay dense.
-    pub(crate) const SPARSE_DENSITY_LIMIT: f64 = 0.20;
+    const SPARSE_DENSITY_LIMIT: f64 = 0.20;
 
     let nrows = x.nrows();
     let ncols = x.ncols();
@@ -2112,7 +2112,7 @@ pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> 
         return None;
     }
 
-    pub(crate) const ZERO_EPS: f64 = 1e-12;
+    const ZERO_EPS: f64 = 1e-12;
     let total = nrows.saturating_mul(ncols);
     if total == 0 {
         return None;

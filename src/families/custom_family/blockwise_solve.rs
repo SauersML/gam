@@ -1701,7 +1701,7 @@ pub(crate) fn penalty_logdet_cholesky_fallback(
         .fold(0.0_f64, f64::max)
         .max(1.0);
 
-    pub(crate) const MAX_ATTEMPTS: usize = 6;
+    const MAX_ATTEMPTS: usize = 6;
     let initial_boost = diag_scale * 1e-8;
 
     let outcome = try_cholesky_with_escalating_ridge(

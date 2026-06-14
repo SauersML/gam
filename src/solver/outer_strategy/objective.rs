@@ -889,29 +889,29 @@ pub struct ClosureObjective<
     Fsp = fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
     Fseed = fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>,
 > {
-    pub(crate) state: S,
-    pub(crate) cap: OuterCapability,
-    pub(crate) cost_fn: Fc,
-    pub(crate) eval_fn: Fe,
+    state: S,
+    cap: OuterCapability,
+    cost_fn: Fc,
+    eval_fn: Fe,
     /// Optional order-aware eval closure. When `None`, `eval_with_order()`
     /// falls back to `eval()`.
-    pub(crate) eval_order_fn: Option<Feo>,
+    eval_order_fn: Option<Feo>,
     /// Optional reset closure. When `None`, `reset()` is a no-op.
-    pub(crate) reset_fn: Option<Fr>,
+    reset_fn: Option<Fr>,
     /// Optional EFS evaluation closure. When `None`, the default
     /// `OuterObjective::eval_efs` returns an error.
-    pub(crate) efs_fn: Option<Fefs>,
+    efs_fn: Option<Fefs>,
     /// Optional seed-screening ranking proxy closure. When `None`,
     /// `eval_screening_proxy()` falls back to `eval_cost()` (the trait
     /// default), preserving legacy behavior for non-REML objectives.
-    pub(crate) screening_proxy_fn: Option<Fsp>,
+    screening_proxy_fn: Option<Fsp>,
     /// Optional inner-state seeding closure. Objectives with PIRLS / Newton
     /// inner state install cached β here before the first outer eval.
-    pub(crate) seed_fn: Option<Fseed>,
+    seed_fn: Option<Fseed>,
     /// Whether a seed hook should also opt the objective into generic
     /// continuation pre-warm. High-dimensional REML keeps the seed hook for
     /// cache/warm-start replay but declines the expensive rho-anneal pre-pass.
-    pub(crate) continuation_prewarm: bool,
+    continuation_prewarm: bool,
 }
 
 impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> OuterObjective

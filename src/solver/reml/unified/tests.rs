@@ -52,7 +52,7 @@
 
     #[test]
     pub(crate) fn xt_logdet_kernel_diagonal_iterator_matches_scalar_reference() {
-        pub(crate) struct FixedKernelHessian {
+        struct FixedKernelHessian {
             pub(crate) kernel: Array2<f64>,
         }
 
@@ -4208,7 +4208,7 @@
         let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
 
         // Wrapper that masquerades as implicit so the default route fires.
-        pub(crate) struct ImplicitDense(Array2<f64>);
+        struct ImplicitDense(Array2<f64>);
         impl HyperOperator for ImplicitDense {
             fn dim(&self) -> usize {
                 self.0.nrows()
@@ -6114,7 +6114,7 @@
         // exact (∂V/∂β = r, no `denom/dp` chain factor as in the profiled
         // Gaussian path).  Matches the production survival-marginal-slope
         // path that the large-scale failure exercises.
-        pub(crate) fn to_fixed<'a>(mut sol: InnerSolution<'a>) -> InnerSolution<'a> {
+        fn to_fixed<'a>(mut sol: InnerSolution<'a>) -> InnerSolution<'a> {
             sol.dispersion = DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -6250,7 +6250,7 @@
         let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
         let xty = array![5.0, 3.0, 2.0];
 
-        pub(crate) fn to_fixed<'a>(mut sol: InnerSolution<'a>) -> InnerSolution<'a> {
+        fn to_fixed<'a>(mut sol: InnerSolution<'a>) -> InnerSolution<'a> {
             sol.dispersion = DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,

@@ -1533,9 +1533,9 @@ pub(crate) fn hash_design_matrix(
     // is never fully materialized just to fingerprint it. Target ~8 MiB of
     // working set per chunk, with a row-count floor of 1 (always make progress)
     // and a ceiling so a very narrow design does not request an unbounded chunk.
-    pub(crate) const HASH_CHUNK_TARGET_BYTES: usize = 8 * 1024 * 1024;
-    pub(crate) const HASH_CHUNK_MIN_ROWS: usize = 1;
-    pub(crate) const HASH_CHUNK_MAX_ROWS: usize = 4096;
+    const HASH_CHUNK_TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const HASH_CHUNK_MIN_ROWS: usize = 1;
+    const HASH_CHUNK_MAX_ROWS: usize = 4096;
     let n = design.nrows();
     let p = design.ncols();
     hasher.write_usize(n);
@@ -1885,8 +1885,8 @@ impl Gam784BlockTarget<'_> {
         };
         // Same floors as `calculate_deviance`: binomial clamps μ to
         // [1e-12, 1−1e-12]; the remaining families floor μ at 1e-10.
-        pub(crate) const BINOMIAL_MU_EPS: f64 = 1e-12;
-        pub(crate) const MU_FLOOR: f64 = 1e-10;
+        const BINOMIAL_MU_EPS: f64 = 1e-12;
+        const MU_FLOOR: f64 = 1e-10;
         let is_binomial = matches!(spec_response, ResponseFamily::Binomial);
         let mut out = Array1::<f64>::zeros(eta.len());
         for i in 0..eta.len() {

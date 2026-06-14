@@ -690,7 +690,7 @@ impl<'a> RemlState<'a> {
         // (BFGS / ARC / trust-region via `outer_scaled_tolerance`); deviance
         // is the dominant term in the REML cost at every scale and is the
         // natural cost proxy reachable from `PirlsResult`.
-        pub(crate) const HIGHGRAD_REL_TOL: f64 = 1e-3;
+        const HIGHGRAD_REL_TOL: f64 = 1e-3;
         let cost_scale = 1.0 + final_fit.deviance.abs();
         let highgrad = grad_norm > HIGHGRAD_REL_TOL * cost_scale;
         if !near_boundary && !highgrad {
@@ -2254,7 +2254,7 @@ mod smoothing_correction_outcome_tests {
         // 3 penalized columns). Smooth, well-conditioned; the near-boundary ρ
         // is FORCED below, not discovered, so the data need only yield a valid
         // converged inner fit and an invertible ρ-Hessian.
-        pub(crate) fn design(scale: f64) -> (Array2<f64>, Array1<f64>) {
+        fn design(scale: f64) -> (Array2<f64>, Array1<f64>) {
             let n = 24usize;
             let p = 4usize;
             let mut x = Array2::<f64>::zeros((n, p));

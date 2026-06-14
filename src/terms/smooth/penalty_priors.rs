@@ -10,15 +10,113 @@
 //! bodies are byte-identical and the entry points consumed elsewhere in
 //! `smooth.rs` are re-imported by the parent so every call site is unchanged.
 
-use super::{
-    CoefficientGroupSpec, CoefficientSelector, PenaltyBlockInfo, RealizedCoefficientGroups,
-    TermCollectionDesign,
-};
+use super::{PenaltyBlockInfo, TermCollectionDesign};
 use crate::basis::BasisError;
 use crate::estimate::PenaltySpec;
 use ndarray::{Array1, Array2};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+
+/// Selector that maps a declared coefficient group onto columns of the realized
+/// term-collection design matrix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CoefficientSelector {
+    /// Explicit global coefficient indices in the realized design matrix.
+    GlobalColumns(Vec<usize>),
+    /// A half-open global coefficient range.
+    GlobalRange(Range<usize>),
+    LinearTerm(String),
+    RandomEffectTerm(String),
+    SmoothTerm(String),
+    /// Selected basis columns within one smooth term.
+    SmoothTermColumns {
+        term: String,
+        columns: Vec<usize>,
+    },
+}
+
+/// Hyperprior placed on a coefficient group's precision / log-precision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CoefficientGroupPrior {
+    Flat,
+    NormalLogPrecision {
+        mean: f64,
+        sd: f64,
+    },
+    GammaPrecision {
+        shape: f64,
+        rate: f64,
+    },
+    /// Penalized-complexity prior calibrated by `P(exp(-ρ/2) > upper) =
+    /// tail_prob`; see [`crate::types::RhoPrior::PenalizedComplexity`].
+    PenalizedComplexity {
+        upper: f64,
+        tail_prob: f64,
+    },
+}
+
+impl CoefficientGroupPrior {
+    fn to_rho_prior(&self) -> crate::types::RhoPrior {
+        match *self {
+            Self::Flat => crate::types::RhoPrior::Flat,
+            Self::NormalLogPrecision { mean, sd } => crate::types::RhoPrior::Normal { mean, sd },
+            Self::GammaPrecision { shape, rate } => {
+                crate::types::RhoPrior::GammaPrecision { shape, rate }
+            }
+            Self::PenalizedComplexity { upper, tail_prob } => {
+                crate::types::RhoPrior::PenalizedComplexity { upper, tail_prob }
+            }
+        }
+    }
+
+    fn validate(&self, context: &str) -> Result<(), BasisError> {
+        match *self {
+            Self::Flat => Ok(()),
+            Self::NormalLogPrecision { mean, sd } => {
+                if !mean.is_finite() {
+                    crate::bail_invalid_basis!(
+                        "{context} Normal log-precision prior requires finite mean, got {mean}"
+                    );
+                }
+                if !sd.is_finite() || sd <= 0.0 {
+                    crate::bail_invalid_basis!(
+                        "{context} Normal log-precision prior requires sd > 0, got {sd}"
+                    );
+                }
+                Ok(())
+            }
+            Self::GammaPrecision { shape, rate } => {
+                validate_gamma_precision_prior(context, shape, rate)
+            }
+            Self::PenalizedComplexity { upper, tail_prob } => {
+                validate_penalized_complexity_prior(context, upper, tail_prob)
+            }
+        }
+    }
+}
+
+/// A declared coefficient group: a named selector set plus optional parent and
+/// prior, used to realize hierarchical penalties on the design.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoefficientGroupSpec {
+    pub name: String,
+    pub selectors: Vec<CoefficientSelector>,
+    pub parent: Option<String>,
+    pub prior: Option<CoefficientGroupPrior>,
+    #[serde(skip, default)]
+    pub prior_mean: crate::solver::estimate::CoefficientPriorMean,
+}
+
+/// The penalties / null-space dims / rho-prior realized from a coefficient
+/// group hierarchy against a concrete design.
+#[derive(Debug, Clone)]
+pub struct RealizedCoefficientGroups {
+    pub penalty_specs: Vec<PenaltySpec>,
+    pub nullspace_dims: Vec<usize>,
+    pub rho_prior: crate::types::RhoPrior,
+    pub group_column_indices: Vec<(String, Vec<usize>)>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PenaltyBlockGammaPriorMetadata<'a> {

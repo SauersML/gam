@@ -1176,7 +1176,7 @@ impl<'a> RemlState<'a> {
         // Skip for large models that would blow memory.
         let n_x = self.x().nrows();
         let p_x = self.x().ncols();
-        pub(crate) const HYPER_MAX_DENSE_WORK: usize = 50_000_000;
+        const HYPER_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > HYPER_MAX_DENSE_WORK
             && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
         {
@@ -2814,7 +2814,7 @@ impl<'a> RemlState<'a> {
         // Guard: SAS link ext coords require dense design materialization.
         let n_x = pirls_result.x_transformed.nrows();
         let p_x = pirls_result.x_transformed.ncols();
-        pub(crate) const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
+        const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
             log::warn!(
                 "skipping SAS link ext coordinate construction (n={n_x}, p={p_x}): \
@@ -2999,7 +2999,7 @@ impl<'a> RemlState<'a> {
         // Guard: mixture link ext coords require dense design materialization.
         let n_x = pirls_result.x_transformed.nrows();
         let p_x = pirls_result.x_transformed.ncols();
-        pub(crate) const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
+        const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
             log::warn!(
                 "skipping mixture link ext coordinate construction (n={n_x}, p={p_x}): \

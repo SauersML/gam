@@ -121,9 +121,9 @@ pub(super) fn update_scaled_diagonal_in_place(
 /// whether curvature comes from Fisher or observed information — we always
 /// clamp to the Fisher-curvature floor via `max(·, ε)`.
 pub(super) fn compute_lm_d2(h: &SymmetricMatrix) -> Array1<f64> {
-    pub(crate) const D2_EPS: f64 = 1e-8;
-    pub(crate) const D2_MIN: f64 = 1e-8;
-    pub(crate) const D2_MAX: f64 = 1e8;
+    const D2_EPS: f64 = 1e-8;
+    const D2_MIN: f64 = 1e-8;
+    const D2_MAX: f64 = 1e8;
     let p = h.nrows();
     let mut d2 = Array1::<f64>::zeros(p);
     match h {

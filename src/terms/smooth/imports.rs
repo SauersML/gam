@@ -24,6 +24,11 @@ use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
 };
 
+use penalty_priors::{
+    realize_coefficient_groups, realize_keyed_penalty_block_gamma_priors,
+    realize_penalty_block_gamma_priors,
+};
+
 use crate::custom_family::{
     BlockEffectiveJacobian, BlockGeometryDirectionalDerivative, BlockWorkingSet,
     BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart,

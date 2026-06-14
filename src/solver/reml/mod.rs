@@ -854,7 +854,7 @@ mod tests {
         assert_eq!(hyper_dirs.len(), x_tau_mats.len());
         assert_eq!(hyper_dirs.len(), s_tau_mats.len());
 
-        pub(crate) const TARGET_PHYSICAL_STEP: f64 = 1e-5;
+        const TARGET_PHYSICAL_STEP: f64 = 1e-5;
 
         let n_dirs = hyper_dirs.len();
         let mut h_ttfd = Array2::<f64>::zeros((n_dirs, n_dirs));
@@ -2573,7 +2573,7 @@ mod tests {
         // Cost-level FD reference.  Central second differences give O(h²)
         // accuracy; the step is sized so the physical perturbation on X / S
         // stays near `1e-5` (same scale as the gradient tests).
-        pub(crate) const TARGET_PHYSICAL_STEP: f64 = 1e-5;
+        const TARGET_PHYSICAL_STEP: f64 = 1e-5;
         let x_tau_mats = [&x_tau_0, &x_tau_1];
         let s_tau_mats = [&s_tau_0, &s_tau_1];
         let steps: [f64; 2] = {

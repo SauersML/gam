@@ -1207,7 +1207,7 @@ impl SurvivalLocationScaleFamily {
         /// into a buffer of length `n`, and the pointers do not outlive the
         /// surrounding scope.
         #[derive(Clone, Copy)]
-        pub(crate) struct SendPtr(*mut f64);
+        struct SendPtr(*mut f64);
         // SAFETY: SendPtr is constructed from Array1::as_mut_ptr() on
         // length-n buffers; the rayon (0..n).into_par_iter() driver gives
         // each thread a unique i, so writes via SendPtr never alias.

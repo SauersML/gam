@@ -619,7 +619,7 @@ impl ProjectedFactorCache {
         key: ProjectedFactorKey,
         compute: impl FnOnce() -> Array2<f64>,
     ) -> Arc<Array2<f64>> {
-        pub(crate) enum CacheLookup {
+        enum CacheLookup {
             Hit(Arc<Array2<f64>>),
             Wait(Arc<ProjectedFactorInProgress>),
             Compute(Arc<ProjectedFactorInProgress>),
@@ -2070,8 +2070,8 @@ impl HyperOperator for ImplicitHyperOperator {
 /// progress per block, capped at the total row count. Shared by the implicit
 /// operator's row-streaming kernels so they cannot drift apart.
 pub(crate) fn byte_balanced_row_chunk(cols: usize, n_rows: usize) -> usize {
-    pub(crate) const TARGET_BYTES: usize = 8 * 1024 * 1024;
-    pub(crate) const MIN_CHUNK_ROWS: usize = 512;
+    const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const MIN_CHUNK_ROWS: usize = 512;
     let bytes_per_row = cols.max(1) * std::mem::size_of::<f64>();
     (TARGET_BYTES / bytes_per_row)
         .max(MIN_CHUNK_ROWS)

@@ -1753,7 +1753,7 @@ impl BernoulliMarginalSlopeFamily {
         // Resolve every ψ axis to its (block, local) primary location and build
         // its single-axis design map once. A σ-aux or otherwise unresolvable axis
         // disables the contracted path (caller falls back to exact per-pair).
-        pub(crate) struct AxisInfo {
+        struct AxisInfo {
             pub(crate) block: usize,
             pub(crate) dir_idx: usize,
             pub(crate) map: crate::families::custom_family::PsiDesignMap,
@@ -2759,7 +2759,7 @@ impl BernoulliMarginalSlopeFamily {
         // on the LRU mutex inside `evaluate_cell_derivative_moments_lru`,
         // etc.). At large-scale n_rows the per-row body's design materialization
         // and pullback work dominates dispatch, so the par_iter is preserved.
-        pub(crate) const ROW_PAR_MIN_ROWS: usize = 4_096;
+        const ROW_PAR_MIN_ROWS: usize = 4_096;
         let run_rows_serial = rayon::current_thread_index().is_some()
             || rayon::current_num_threads() <= 1
             || n_rows < ROW_PAR_MIN_ROWS;
@@ -3289,7 +3289,7 @@ impl BernoulliMarginalSlopeFamily {
         if flex_active && n > 0 {
             self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
         }
-        pub(crate) const ROW_PAR_MIN_ROWS: usize = 4_096;
+        const ROW_PAR_MIN_ROWS: usize = 4_096;
         let run_rows_serial = rayon::current_thread_index().is_some()
             || rayon::current_num_threads() <= 1
             || n_rows < ROW_PAR_MIN_ROWS;

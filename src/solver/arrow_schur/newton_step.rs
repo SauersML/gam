@@ -1756,12 +1756,12 @@ pub(crate) fn solve_arrow_newton_step_cross_row(
     // path is exact-CG (no trust region), so we drive the residual to machine-
     // scale relative tolerance; the spectrum I + M⁻¹P_cross makes this cheap.
     // Absolute floor guards b_norm → 0; relative term tracks the RHS scale.
-    pub(crate) const CROSS_ROW_CG_ABS_TOL: f64 = 1e-12;
-    pub(crate) const CROSS_ROW_CG_REL_TOL: f64 = 1e-13;
+    const CROSS_ROW_CG_ABS_TOL: f64 = 1e-12;
+    const CROSS_ROW_CG_REL_TOL: f64 = 1e-13;
     // CG converges in at most (dim) iterations; allow a few passes over the
     // dimension to absorb round-off, with a small floor for tiny systems.
-    pub(crate) const CROSS_ROW_CG_MIN_ITER_BUDGET: usize = 64;
-    pub(crate) const CROSS_ROW_CG_ITER_MULTIPLE: usize = 4;
+    const CROSS_ROW_CG_MIN_ITER_BUDGET: usize = 64;
+    const CROSS_ROW_CG_ITER_MULTIPLE: usize = 4;
     let tol = CROSS_ROW_CG_ABS_TOL.max(CROSS_ROW_CG_REL_TOL * b_norm);
     let max_iter = (total_dt + k).max(CROSS_ROW_CG_MIN_ITER_BUDGET) * CROSS_ROW_CG_ITER_MULTIPLE;
 

@@ -1584,7 +1584,7 @@ pub fn compute_block_penalty_logdet_derivs(
         })
         .collect();
 
-    pub(crate) struct BlockPenaltyLogdetResult {
+    struct BlockPenaltyLogdetResult {
         pub(crate) offset: usize,
         pub(crate) value: f64,
         pub(crate) first: Array1<f64>,

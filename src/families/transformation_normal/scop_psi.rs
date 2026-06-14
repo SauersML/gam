@@ -522,7 +522,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        pub(crate) struct PsiBatchedAccum {
+        struct PsiBatchedAccum {
             pub(crate) hvp: Array2<f64>,
             pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_psi: Vec<f64>,
@@ -864,7 +864,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        pub(crate) struct PsiTraceAccum {
+        struct PsiTraceAccum {
             pub(crate) value: f64,
             pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_psi: Vec<f64>,
@@ -1129,7 +1129,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        pub(crate) struct PsiAllAxesTraceAccum {
+        struct PsiAllAxesTraceAccum {
             pub(crate) values: Vec<f64>,
             pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_dir: Vec<f64>,
@@ -1659,7 +1659,7 @@ impl TransformationNormalFamily {
         let weights = self.effective_weights();
         let direction_mat = direction_mat.expect("directional CTN psi-psi path requires direction");
 
-        pub(crate) struct PsiPairDirectionalAccum {
+        struct PsiPairDirectionalAccum {
             pub(crate) hvp: Array1<f64>,
             pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_i: Vec<f64>,
@@ -2104,7 +2104,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        pub(crate) struct PsiPairBatchedAccum {
+        struct PsiPairBatchedAccum {
             pub(crate) hvp: Array2<f64>,
             pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_i: Vec<f64>,
@@ -2578,7 +2578,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        pub(crate) struct PsiPairBilinearAccum {
+        struct PsiPairBilinearAccum {
             pub(crate) value: f64,
             pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_i: Vec<f64>,
@@ -2956,7 +2956,7 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        pub(crate) struct PsiPairTraceAccum {
+        struct PsiPairTraceAccum {
             pub(crate) value: f64,
             pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_i: Vec<f64>,
@@ -3437,7 +3437,7 @@ impl TransformationNormalFamily {
         // win. Per-thread scratch buffers are created once via
         // `fold(|| init, …)` and reused across all rows assigned to that
         // thread.
-        pub(crate) struct Scratch {
+        struct Scratch {
             pub(crate) out: Array2<f64>,
             pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_dir: Vec<f64>,
@@ -3850,7 +3850,7 @@ impl TransformationNormalFamily {
             })?,
         ];
 
-        pub(crate) struct PsiDhTraceAccum {
+        struct PsiDhTraceAccum {
             pub(crate) value: f64,
             pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_dir: Vec<f64>,

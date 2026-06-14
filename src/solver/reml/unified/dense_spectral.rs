@@ -389,7 +389,7 @@ impl DenseSpectralOperator {
 /// (2, 4, 8, 16, …) and a final summary when the signature changes.
 pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
     use std::sync::Mutex;
-    pub(crate) struct Repeat {
+    struct Repeat {
         pub(crate) signature: String,
         pub(crate) count: u64,
         pub(crate) total: f64,
@@ -397,7 +397,7 @@ pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
         pub(crate) max: f64,
         pub(crate) next_heartbeat: u64,
     }
-    pub(crate) static REPEAT: Mutex<Option<Repeat>> = Mutex::new(None);
+    static REPEAT: Mutex<Option<Repeat>> = Mutex::new(None);
 
     let mut guard = match REPEAT.lock() {
         Ok(g) => g,

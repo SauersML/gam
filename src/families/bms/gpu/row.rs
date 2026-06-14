@@ -743,7 +743,7 @@ pub(crate) struct RowKernelBackend {
 #[cfg(target_os = "linux")]
 impl RowKernelBackend {
     pub(crate) fn probe() -> Result<&'static Self, GpuError> {
-        pub(crate) static BACKEND: OnceLock<Result<RowKernelBackend, GpuError>> = OnceLock::new();
+        static BACKEND: OnceLock<Result<RowKernelBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
                 crate::gpu::backend_probe::probe_backend_with_compile("bms_flex_row", |parts| {
@@ -1831,7 +1831,7 @@ pub(crate) struct HvpKernelBackend {
 #[cfg(target_os = "linux")]
 impl HvpKernelBackend {
     pub(crate) fn probe() -> Result<&'static Self, GpuError> {
-        pub(crate) static BACKEND: OnceLock<Result<HvpKernelBackend, GpuError>> = OnceLock::new();
+        static BACKEND: OnceLock<Result<HvpKernelBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
                 crate::gpu::backend_probe::probe_backend_with_compile("bms_flex_row hvp", |parts| {
@@ -3189,7 +3189,7 @@ mod tests {
         // the left tail (x ≲ −38), where `erfc(-x/√2)` underflows to 0 and the
         // exp/ln cancellation is the *only* way to keep `log Φ` finite. We move
         // the branch there, far from any region the kernel or its FD lock visits.
-        pub(crate) const ORACLE_LEFT_TAIL_X: f64 = -37.0;
+        const ORACLE_LEFT_TAIL_X: f64 = -37.0;
         if x >= ORACLE_LEFT_TAIL_X {
             let mut cdf = 0.5 * crate::gpu::numerics_host::erfc(-x / ORACLE_SQRT_2);
             if cdf < 1e-300 {

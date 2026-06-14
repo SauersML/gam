@@ -38,8 +38,8 @@ impl<'a> RemlState<'a> {
         // dense product is large enough for faer/BLAS-style internal
         // parallelism, do not also wrap sibling products in rayon::join: that
         // can oversubscribe CPU threads and slow down the REML hot path.
-        pub(crate) const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
-        pub(crate) const PAR_MIN_LONG_DIM: usize = 256;
+        const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
+        const PAR_MIN_LONG_DIM: usize = 256;
         let flop_scale = m.saturating_mul(n).saturating_mul(k);
         let long_dim = m.max(n).max(k);
         flop_scale >= PAR_MIN_FLOP_SCALE && long_dim >= PAR_MIN_LONG_DIM
@@ -47,7 +47,7 @@ impl<'a> RemlState<'a> {
 
     #[inline]
     pub(crate) fn should_join_independent_dense_products(products: &[(usize, usize, usize)]) -> bool {
-        pub(crate) const JOIN_MIN_TOTAL_FLOP_SCALE: usize = 128 * 1024;
+        const JOIN_MIN_TOTAL_FLOP_SCALE: usize = 128 * 1024;
         if rayon::current_num_threads() <= 1 {
             return false;
         }
@@ -3881,7 +3881,7 @@ mod tests {
         // Probit Bernoulli Fisher weight W(eta) = phi^2 / (Phi (1 - Phi)).
         // Validate the closed-form jet against central finite differences of
         // the reference scalar weight.
-        pub(crate) fn reference_probit_weight(eta: f64) -> f64 {
+        fn reference_probit_weight(eta: f64) -> f64 {
             let p = crate::probability::normal_cdf(eta);
             let q = 1.0 - p;
             let phi = crate::probability::normal_pdf(eta);

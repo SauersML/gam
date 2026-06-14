@@ -3645,7 +3645,7 @@ pub(crate) fn binomial_location_scale_exact_probit_tailobjects_stay_finite() {
 
 #[test]
 pub(crate) fn binomial_location_scale_many_smoothing_params_keeps_second_order_outer() {
-    pub(crate) fn spec_with_penalties(name: &str, n: usize, p: usize, k: usize) -> ParameterBlockSpec {
+    fn spec_with_penalties(name: &str, n: usize, p: usize, k: usize) -> ParameterBlockSpec {
         ParameterBlockSpec {
             name: name.to_string(),
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
@@ -7766,7 +7766,7 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
 
     // Materialize an `ExactNewtonJointPsiTerms` joint Hessian regardless of
     // whether the family returns it dense or operator-backed.
-    pub(crate) fn materialize(
+    fn materialize(
         dense: &Array2<f64>,
         operator: Option<&dyn HyperOperator>,
         total: usize,
@@ -7781,7 +7781,7 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
     }
 
     // Max |entry| over the rectangular block H[r0..r1, c0..c1].
-    pub(crate) fn block_max_abs(h: &Array2<f64>, r0: usize, r1: usize, c0: usize, c1: usize) -> f64 {
+    fn block_max_abs(h: &Array2<f64>, r0: usize, r1: usize, c0: usize, c1: usize) -> f64 {
         let mut m = 0.0_f64;
         for r in r0..r1 {
             for c in c0..c1 {
@@ -7791,7 +7791,7 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
         m
     }
 
-    pub(crate) const CROSS_TOL: f64 = 1e-12;
+    const CROSS_TOL: f64 = 1e-12;
 
     // ---- Non-wiggle GaussianLocationScaleFamily ----------------------
     {

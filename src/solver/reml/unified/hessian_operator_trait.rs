@@ -44,12 +44,12 @@ pub(crate) const HUTCHPP_TRACE_MIN_DIM: usize = 128;
 /// the estimator's variance and cost stay balanced across problem sizes. Shared
 /// by every implicit-operator trace path so they cannot drift apart.
 pub(crate) fn hutchpp_config_for_dim(dim: usize) -> StochasticTraceConfig {
-    pub(crate) const SKETCH_DIM_PER: usize = 32;
-    pub(crate) const SKETCH_DIM_MIN: usize = 4;
-    pub(crate) const SKETCH_DIM_MAX: usize = 16;
-    pub(crate) const PROBES_PER_SKETCH: usize = 4;
-    pub(crate) const PROBES_MAX_FLOOR: usize = 32;
-    pub(crate) const PROBES_MIN_FLOOR: usize = 8;
+    const SKETCH_DIM_PER: usize = 32;
+    const SKETCH_DIM_MIN: usize = 4;
+    const SKETCH_DIM_MAX: usize = 16;
+    const PROBES_PER_SKETCH: usize = 4;
+    const PROBES_MAX_FLOOR: usize = 32;
+    const PROBES_MIN_FLOOR: usize = 8;
     let sketch = (dim / SKETCH_DIM_PER).clamp(SKETCH_DIM_MIN, SKETCH_DIM_MAX);
     let mut config = StochasticTraceConfig::default();
     config.hutchpp_sketch_dim = Some(sketch);

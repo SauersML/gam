@@ -2169,7 +2169,7 @@ pub(crate) fn joint_objective_floor_reached(
 /// that catapults the KKT residual off the near-converged iterate (gam#787 binary
 /// matern centers=12: residual 1.7e-4 → 4.7e-1, never recovers).
 pub(crate) fn joint_proposal_at_step_floor(proposal_step_inf: f64, step_tol: f64) -> bool {
-    pub(crate) const STEP_FLOOR_CERT_FACTOR: f64 = 4.0;
+    const STEP_FLOOR_CERT_FACTOR: f64 = 4.0;
     proposal_step_inf.is_finite()
         && step_tol.is_finite()
         && proposal_step_inf <= STEP_FLOOR_CERT_FACTOR * step_tol
@@ -2428,7 +2428,7 @@ pub(crate) fn shrink_active_joint_block_trust_radii(
     //     to `inner_loop_hard_ceiling` (1200) cycles wasting ~120 s per
     //     outer ρ-evaluation — the Rust CI Test hang and the
     //     `rust_margslope_aniso_duchon16d_*` large-scale 2400 s timeout.
-    pub(crate) const RADIUS_FLOOR: f64 = 1.0e-12;
+    const RADIUS_FLOOR: f64 = 1.0e-12;
     let any_boundary_block = block_radii
         .iter()
         .zip(block_step_norms)

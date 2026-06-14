@@ -120,7 +120,7 @@ pub(crate) fn detect_active_theta_bounds(theta: Option<&[f64]>, q: usize) -> Vec
     let bound = crate::solver::estimate::RHO_BOUND;
     // Same active-bound tolerance the outer optimizer uses, so this active-set
     // view agrees with the optimizer's at the reported optimum.
-    pub(crate) const ACTIVE_THETA_BOUND_TOL: f64 = 1e-8;
+    const ACTIVE_THETA_BOUND_TOL: f64 = 1e-8;
     theta
         .iter()
         .enumerate()

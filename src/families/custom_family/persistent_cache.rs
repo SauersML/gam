@@ -246,7 +246,7 @@ pub(crate) fn store_persistent_custom_family_warm_start(
     // bound or a non-converged intermediate; either way they make poor
     // seed material because the load-side clamp pulls them back into
     // the interior anyway (see `outer_strategy.rs` `[CACHE] hit-clamp`).
-    pub(crate) const SATURATION_THRESHOLD: f64 = 9.0;
+    const SATURATION_THRESHOLD: f64 = 9.0;
     if warm_start
         .rho
         .iter()

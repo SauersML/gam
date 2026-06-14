@@ -256,7 +256,7 @@ pub(crate) fn build_contracted_psi_hook(
     // ψ → (block, local) location and block-local S_ψ for every ψ axis, built
     // once. `s_local` (block-local S_ψ) is reused for the τ-Hessian and as the
     // first leg of the bilinear `tr(S⁺ S_ψi S⁺ S_ψj)` penalty-logdet term.
-    pub(crate) struct PsiAxis {
+    struct PsiAxis {
         pub(crate) block: usize,
         pub(crate) local: usize,
         pub(crate) start: usize,
@@ -459,7 +459,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
 
     let s_logdet_block_cache = Arc::new(s_logdet_blocks.map(|blocks| blocks.to_vec()));
 
-    pub(crate) struct PsiPenaltyCacheEntry {
+    struct PsiPenaltyCacheEntry {
         pub(crate) block_idx: usize,
         pub(crate) local_idx: usize,
         pub(crate) start: usize,
@@ -468,7 +468,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         pub(crate) s_local: Option<Array2<f64>>,
     }
 
-    pub(crate) struct RhoPenaltyCacheEntry {
+    struct RhoPenaltyCacheEntry {
         pub(crate) block_idx: usize,
         pub(crate) penalty_idx: usize,
         pub(crate) start: usize,
@@ -1921,8 +1921,8 @@ pub(crate) fn derivative_quality_options_and_warm_start(
     warm_start: Option<&CustomFamilyWarmStart>,
     has_psi_derivatives: bool,
 ) -> (BlockwiseFitOptions, Option<CustomFamilyWarmStart>) {
-    pub(crate) const DIRECT_JOINT_HYPER_INNER_TOL_FLOOR: f64 = 1e-10;
-    pub(crate) const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
+    const DIRECT_JOINT_HYPER_INNER_TOL_FLOOR: f64 = 1e-10;
+    const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
 
     let mut eval_options = options.clone();
     // The alignment exists so exact joint-hyper evaluations with real ψ

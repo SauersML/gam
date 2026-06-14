@@ -72,7 +72,7 @@ impl BmsFlexGpuBackend {
     /// selected device, opens a stream, and NVRTC-compiles the probe
     /// kernel. Subsequent calls return the cached handle.
     pub fn probe() -> Result<&'static Self, GpuError> {
-        pub(crate) static BACKEND: OnceLock<Result<BmsFlexGpuBackend, GpuError>> = OnceLock::new();
+        static BACKEND: OnceLock<Result<BmsFlexGpuBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
                 #[cfg(target_os = "linux")]

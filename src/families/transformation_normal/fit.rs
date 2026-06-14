@@ -20,7 +20,7 @@ pub(crate) struct TransformationExactWarmStart {
 
 impl TransformationExactWarmStart {
     pub(crate) fn is_compatible_with(&self, theta: &Array1<f64>, rho: &Array1<f64>) -> bool {
-        pub(crate) const MAX_THETA_DISTANCE: f64 = 1.5;
+        const MAX_THETA_DISTANCE: f64 = 1.5;
 
         self.theta.len() == theta.len()
             && self

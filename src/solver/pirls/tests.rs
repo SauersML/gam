@@ -2949,8 +2949,8 @@ mod root_cause_tests {
         use crate::terms::closed_form_operator::ClosedFormPenaltyOperator;
         use crate::terms::penalty_op::PenaltyOp;
 
-        pub(crate) const K: usize = 500;
-        pub(crate) const D: usize = 4;
+        const K: usize = 500;
+        const D: usize = 4;
 
         // Synthetic centers in [0,1]^D via deterministic LCG.
         let mut state: u64 = 0xDEADBEEF_CAFEBABE;

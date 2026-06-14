@@ -713,11 +713,11 @@ impl BarrierConfig {
         // exactly ±1, so a row qualifies as a simple coordinate bound. The
         // constraint rows are assembled exactly, so any nonzero deviation this
         // large is a genuine multi-coefficient constraint, not round-off.
-        pub(crate) const SIMPLE_BOUND_ENTRY_TOL: f64 = 1e-14;
+        const SIMPLE_BOUND_ENTRY_TOL: f64 = 1e-14;
         // Default log-barrier strength τ used when a simple-bound BarrierConfig
         // is synthesized from constraints (a weak barrier that keeps β strictly
         // feasible without materially perturbing an interior optimum).
-        pub(crate) const DEFAULT_BARRIER_TAU: f64 = 1e-6;
+        const DEFAULT_BARRIER_TAU: f64 = 1e-6;
         let constraints = constraints?;
         let mut indices = Vec::new();
         let mut lower_bounds = Vec::new();

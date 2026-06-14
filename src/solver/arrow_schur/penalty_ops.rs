@@ -86,7 +86,7 @@ impl BetaCouplingGraph {
         let mut parent: Vec<usize> = (0..self.num_blocks).collect();
         let mut rank = vec![0u8; self.num_blocks];
 
-        pub(crate) fn find(parent: &mut [usize], mut x: usize) -> usize {
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
             while parent[x] != x {
                 parent[x] = parent[parent[x]];
                 x = parent[x];

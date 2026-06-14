@@ -610,9 +610,9 @@ pub(crate) fn exact_design_row_chunks(
     n: usize,
     p: usize,
 ) -> impl Iterator<Item = std::ops::Range<usize>> {
-    pub(crate) const TARGET_BYTES: usize = 8 * 1024 * 1024;
-    pub(crate) const MIN_ROWS: usize = 512;
-    pub(crate) const MAX_ROWS: usize = 131_072;
+    const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const MIN_ROWS: usize = 512;
+    const MAX_ROWS: usize = 131_072;
     let rows = (TARGET_BYTES / (p.max(1) * 8))
         .clamp(MIN_ROWS, MAX_ROWS)
         .min(n.max(1));

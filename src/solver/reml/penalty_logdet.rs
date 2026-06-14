@@ -191,7 +191,7 @@ impl PenaltyPseudologdet {
 
         // Collect block ranges and assemble per-block combined penalties.
         // Each penalty contributes to its own block (disjoint assumption).
-        pub(crate) struct BlockData {
+        struct BlockData {
             pub(crate) start: usize,
             pub(crate) end: usize,
             pub(crate) local: Array2<f64>,
@@ -244,7 +244,7 @@ impl PenaltyPseudologdet {
         // Process each block independently.  Keep the eigenspace local until
         // final assembly so large smooth bases do not allocate one p_total×rank
         // temporary per block.
-        pub(crate) struct BlockResult {
+        struct BlockResult {
             pub(crate) start: usize,
             pub(crate) end: usize,
             pub(crate) w_local: Array2<f64>,
@@ -717,7 +717,7 @@ impl PenaltyPseudologdet {
             return (Array1::zeros(k), Array2::zeros((k, k)));
         }
 
-        pub(crate) struct ReducedPenalty {
+        struct ReducedPenalty {
             pub(crate) span: Option<usize>,
             pub(crate) y: Array2<f64>,
         }

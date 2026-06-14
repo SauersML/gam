@@ -2042,7 +2042,7 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
 
 pub(crate) fn shared_dense_design_cache()
 -> &'static Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>> {
-    pub(crate) static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>>> =
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
