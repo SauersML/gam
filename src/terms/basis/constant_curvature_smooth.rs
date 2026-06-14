@@ -388,50 +388,26 @@ pub fn realized_constant_curvature_length_scale(
     Ok(median)
 }
 
-/// Mean GEODESIC distance over all `data`→`centers` pairs at curvature κ, with
-/// its first/second κ-derivatives `(s, s′, s″)`. Smooth (every-pair average) so
-/// the jet is exact via `distance_kappa_jet`. This is the scale that actually
-/// governs the realized DESIGN's resolution — each data row's fit flexibility is
-/// set by how the data→center geodesic distances compare to the kernel length —
-/// so normalizing the kernel length by it (not by the center→center scale) is
-/// what holds the basis FLEXIBILITY κ-invariant (see
-/// [`constant_curvature_effective_length_jet`]).
-fn data_center_mean_geodesic_distance_jet(
+/// Reference kernel "fill" `fill⋆` — the κ = 0 mean data→center kernel entry
+/// `(1/N) Σᵢⱼ exp(−d₀(xᵢ,cⱼ)/ℓ_ref)` with `d₀ = 2‖Δ‖` the κ = 0 chart gauge.
+///
+/// The fill is the scalar that measures the kernel's *effective resolution* (how
+/// much each data row "sees" the centers): it is monotone in `ℓ/scale`, so
+/// pinning it across κ pins the realized design's flexibility (its effective
+/// degrees of freedom). [`constant_curvature_effective_length_jet`] solves
+/// `g(L,κ) = fill⋆` for `L(κ)` so the fill — hence the basis flexibility — stays
+/// κ-invariant and only the distance-matrix SHAPE (the genuine curvature signal)
+/// moves with κ. At κ = 0 the solution is `L = ℓ_ref` by construction.
+fn data_center_reference_fill(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
-    kappa: f64,
-) -> Result<(f64, f64, f64), BasisError> {
-    let manifold = ConstantCurvature::new(centers.ncols(), kappa);
-    let mut s = 0.0_f64;
-    let mut s1 = 0.0_f64;
-    let mut s2 = 0.0_f64;
-    let mut cnt = 0.0_f64;
-    for xi in data.outer_iter() {
-        for cj in centers.outer_iter() {
-            let (d, d1, d2) = distance_kappa_jet(&manifold, xi, cj).map_err(|e| {
-                BasisError::InvalidInput(format!(
-                    "constant-curvature data→center geodesic κ-jet failed: {e}"
-                ))
-            })?;
-            s += d;
-            s1 += d1;
-            s2 += d2;
-            cnt += 1.0;
-        }
-    }
-    if cnt <= 0.0 {
+    ell_ref: f64,
+) -> Result<f64, BasisError> {
+    if !(ell_ref.is_finite() && ell_ref > 0.0) {
         crate::bail_invalid_basis!(
-            "constant-curvature geodesic scale needs at least one data row and one center"
+            "constant-curvature reference fill needs a positive finite ℓ_ref; got {ell_ref}"
         );
     }
-    Ok((s / cnt, s1 / cnt, s2 / cnt))
-}
-
-/// Mean EUCLIDEAN chart distance over all `data`→`centers` pairs — the κ = 0
-/// gauge for [`constant_curvature_effective_length_jet`]. Uses the same `2‖Δ‖`
-/// convention as the geodesic distance at κ = 0 (`d₀ = 2‖Δ‖`), so the κ = 0
-/// effective length reduces exactly to `ℓ_ref`.
-fn data_center_mean_chart_distance(data: ArrayView2<'_, f64>, centers: ArrayView2<'_, f64>) -> f64 {
     let mut sum = 0.0_f64;
     let mut cnt = 0.0_f64;
     for xi in data.outer_iter() {
@@ -441,53 +417,171 @@ fn data_center_mean_chart_distance(data: ArrayView2<'_, f64>, centers: ArrayView
                 let dlt = xi[k] - cj[k];
                 s += dlt * dlt;
             }
-            sum += 2.0 * s.sqrt();
+            let d0 = 2.0 * s.sqrt(); // κ = 0 chart gauge d₀ = 2‖Δ‖
+            sum += (-d0 / ell_ref).exp();
             cnt += 1.0;
         }
     }
-    if cnt > 0.0 { sum / cnt } else { 0.0 }
+    if cnt <= 0.0 {
+        crate::bail_invalid_basis!(
+            "constant-curvature reference fill needs at least one data row and one center"
+        );
+    }
+    Ok(sum / cnt)
 }
 
-/// Effective kernel length `L(κ)` and its κ-jet `(L, L′, L″)`.
+/// The mean-kernel-entry "fill" `g(L,κ) = (1/N) Σᵢⱼ exp(−d_κ(xᵢ,cⱼ)/L)` together
+/// with the five partials needed by the implicit-function jet:
+/// `(g, g_L, g_κ, g_LL, g_κκ, g_Lκ)`.
 ///
-/// THE κ-IDENTIFICATION FIX. A κ-FROZEN length makes the geodesic-exponential
-/// kernel's *resolution* drift with κ: spherical (κ>0) geometries compress
-/// geodesic distances, so a fixed ℓ silently narrows the kernel relative to the
-/// data and inflates the basis's effective flexibility, letting REML buy a lower
-/// deviance by cranking κ up — κ then rails to the chart bound for every truth
-/// (the #944/#1059 symptom). The earlier #1059 fix normalized by the CENTER→
-/// center geodesic scale, which holds the center-Gram κ-invariant but NOT the
-/// realized design's flexibility — the design resolution is set by the DATA→
-/// center distances, and those still narrow with κ, so the deviance stayed
-/// monotone in κ and identification still failed. We instead tie the length to
-/// the geometry's own DATA-relative scale:
+/// With `k = exp(−d/L)` and the per-pair geodesic jet `(d, d', d'')` (exact via
+/// [`distance_kappa_jet`]):
 ///
 /// ```text
-///   L(κ) = ℓ_ref · s_dc(κ) / s₀_dc,   s_dc(κ) = mean data→center geodesic dist at κ,
-///                                      s₀_dc   = mean data→center chart dist (κ=0 gauge)
+///   ∂k/∂L = k·d/L²,                  ∂k/∂κ = −k·d'/L
+///   g_LL  = (1/N)Σ k·d·(d − 2L)/L⁴
+///   g_κκ  = (1/N)Σ k·((d')²/L − d'')/L
+///   g_Lκ  = (1/N)Σ k·d'·(L − d)/L³
 /// ```
 ///
-/// so `d_κ(data, c) / L(κ)` keeps the TYPICAL realized design entry κ-invariant
-/// — the basis flexibility no longer drifts with κ, and only the distance-matrix
-/// SHAPE (the genuine geometry signal) moves, giving V_p(κ) an interior minimum
-/// at κ⋆. At κ = 0, `s_dc(0) = s₀_dc` (`d₀ = 2‖Δ‖`), so `L(0) = ℓ_ref`. The
-/// returned jet feeds the kernel κ-derivatives through the quotient `q = d/L`
-/// chain rule.
+/// (each obtained by differentiating `∂k/∂L` / `∂k/∂κ` once more). `g` and every
+/// partial are smooth through κ = 0 because the distance jet is entire there.
+fn data_center_fill_partials(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    kappa: f64,
+    l: f64,
+) -> Result<(f64, f64, f64, f64, f64, f64), BasisError> {
+    if !(l.is_finite() && l > 0.0) {
+        crate::bail_invalid_basis!(
+            "constant-curvature fill partials need a positive finite length; got {l}"
+        );
+    }
+    let manifold = ConstantCurvature::new(centers.ncols(), kappa);
+    let l2 = l * l;
+    let l3 = l2 * l;
+    let l4 = l2 * l2;
+    let mut g = 0.0_f64;
+    let mut g_l = 0.0_f64;
+    let mut g_k = 0.0_f64;
+    let mut g_ll = 0.0_f64;
+    let mut g_kk = 0.0_f64;
+    let mut g_lk = 0.0_f64;
+    let mut cnt = 0.0_f64;
+    for xi in data.outer_iter() {
+        for cj in centers.outer_iter() {
+            let (d, d1, d2) = distance_kappa_jet(&manifold, xi, cj).map_err(|e| {
+                BasisError::InvalidInput(format!(
+                    "constant-curvature data→center fill κ-jet failed: {e}"
+                ))
+            })?;
+            let k = (-d / l).exp();
+            g += k;
+            g_l += k * d / l2;
+            g_k += -k * d1 / l;
+            g_ll += k * d * (d - 2.0 * l) / l4;
+            g_kk += k * ((d1 * d1) / l - d2) / l;
+            g_lk += k * d1 * (l - d) / l3;
+            cnt += 1.0;
+        }
+    }
+    if cnt <= 0.0 {
+        crate::bail_invalid_basis!(
+            "constant-curvature fill partials need at least one data row and one center"
+        );
+    }
+    Ok((
+        g / cnt,
+        g_l / cnt,
+        g_k / cnt,
+        g_ll / cnt,
+        g_kk / cnt,
+        g_lk / cnt,
+    ))
+}
+
+/// Effective kernel length `L(κ)` and its EXACT κ-jet `(L, L′, L″)`.
+///
+/// THE κ-IDENTIFICATION FIX (#944). A κ-FROZEN length makes the geodesic-
+/// exponential kernel's *resolution* drift with κ: spherical (κ>0) geometries
+/// compress geodesic distances, narrowing the kernel relative to the data and
+/// inflating the basis's effective flexibility, so REML buys a lower deviance by
+/// cranking κ up — κ rails to the chart bound for every truth (the #944/#1059
+/// symptom). The earlier #1059 fix normalized by the mean data→center geodesic
+/// distance `s_dc(κ)`; but holding the mean DISTANCE fixed does NOT hold the
+/// kernel's flexibility fixed — the effective degrees of freedom still drift
+/// ~30% across the bracket (verified), so the deviance stayed monotone in κ.
+///
+/// We instead hold the kernel's "fill" — the mean realized kernel entry
+/// `g(L,κ) = (1/N) Σᵢⱼ exp(−d_κ(xᵢ,cⱼ)/L)` — κ-INVARIANT, which pins the
+/// realized design's effective degrees of freedom (the EDF is flat to <0.5% in κ
+/// under this rule, verified numerically). `L(κ)` is the implicit solution of
+///
+/// ```text
+///   g(L(κ), κ) = fill⋆,   fill⋆ = g(ℓ_ref, 0)   (the κ=0 reference fill)
+/// ```
+///
+/// so changing κ moves ONLY the distance-matrix SHAPE (the genuine curvature
+/// signal), giving `V_p(κ)` an interior minimum at the data-generating κ for
+/// curved truth. At κ = 0 the solution is `L = ℓ_ref` exactly.
+///
+/// The jet is EXACT via the implicit-function theorem. Differentiating
+/// `g(L(κ),κ) ≡ fill⋆` once gives `g_L·L′ + g_κ = 0`, and once more gives
+/// `g_LL·(L′)² + 2 g_Lκ·L′ + g_κκ + g_L·L″ = 0`:
+///
+/// ```text
+///   L′  = −g_κ / g_L
+///   L″  = −( g_LL·(L′)² + 2 g_Lκ·L′ + g_κκ ) / g_L .
+/// ```
+///
+/// The partials come from [`data_center_fill_partials`] (exact, riding
+/// `distance_kappa_jet`); the returned jet feeds `constant_curvature_kernel_
+/// kappa_jets_scaled` through the quotient `q = d/L` chain rule.
 fn constant_curvature_effective_length_jet(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     ell_ref: f64,
     kappa: f64,
 ) -> Result<(f64, f64, f64), BasisError> {
-    let s0 = data_center_mean_chart_distance(data, centers);
-    if !(s0.is_finite() && s0 > 0.0) {
+    let fill_star = data_center_reference_fill(data, centers, ell_ref)?;
+    // Newton solve g(L, κ) = fill⋆ for L, warm-started at ℓ_ref (the exact root
+    // at κ = 0). g is strictly increasing in L (g_L > 0: larger L ⇒ each entry
+    // closer to 1), so Newton from ℓ_ref converges monotonically.
+    let mut l = ell_ref;
+    const NEWTON_MAX_ITER: usize = 100;
+    const NEWTON_REL_TOL: f64 = 1.0e-13;
+    let mut converged = false;
+    for _ in 0..NEWTON_MAX_ITER {
+        let (g, g_l, ..) = data_center_fill_partials(data, centers, kappa, l)?;
+        if !(g_l.is_finite() && g_l > 0.0) {
+            crate::bail_invalid_basis!(
+                "constant-curvature effective length: non-positive fill slope g_L = {g_l} \
+                 (degenerate data/centers at κ = {kappa})"
+            );
+        }
+        let step = (g - fill_star) / g_l;
+        l -= step;
+        if !(l.is_finite() && l > 0.0) {
+            crate::bail_invalid_basis!(
+                "constant-curvature effective length: Newton left the positive axis (L = {l}) \
+                 solving the fill target at κ = {kappa}"
+            );
+        }
+        if step.abs() <= NEWTON_REL_TOL * l {
+            converged = true;
+            break;
+        }
+    }
+    if !converged {
         crate::bail_invalid_basis!(
-            "constant-curvature effective length: degenerate data/centers (mean chart distance {s0})"
+            "constant-curvature effective length: fill-target Newton did not converge at κ = {kappa}"
         );
     }
-    let (s, s1, s2) = data_center_mean_geodesic_distance_jet(data, centers, kappa)?;
-    let inv = ell_ref / s0;
-    Ok((inv * s, inv * s1, inv * s2))
+    // Exact implicit-function-theorem jet at the converged root.
+    let (_, g_l, g_k, g_ll, g_kk, g_lk) = data_center_fill_partials(data, centers, kappa, l)?;
+    let l1 = -g_k / g_l;
+    let l2 = -(g_ll * l1 * l1 + 2.0 * g_lk * l1 + g_kk) / g_l;
+    Ok((l, l1, l2))
 }
 
 /// Build the constant-curvature reproducing-kernel smooth: realized design
@@ -1105,6 +1199,60 @@ mod tests {
             "frozen-ℓ criterion is expected to RAIL hyperbolic truth to the +bound (the bug \
              L(κ) fixes); if it no longer rails, the frozen-vs-scaled contrast is stale: κ̂={k_frozen_hyp}"
         );
+    }
+
+    /// The fill-invariant effective-length κ-jet `(L, L′, L″)` must be EXACT:
+    /// `L` solves the fill target `g(L,κ)=fill⋆` (verify the fill is held
+    /// κ-invariant), and `L′`, `L″` match central finite differences of the
+    /// implicit solution `L(κ)` itself (re-solving the Newton root at κ±h). This
+    /// is the gate the ψ-channel outer gradient depends on — `L′`,`L″` feed the
+    /// kernel quotient jets in `constant_curvature_kernel_kappa_jets_scaled`.
+    #[test]
+    fn effective_length_jet_matches_fd_of_implicit_solution() {
+        let (data, centers) = oracle_disk_design_centers();
+        let ell_ref = realized_constant_curvature_length_scale(centers.view(), 0.0).unwrap();
+        // Reference fill at κ = 0 (the target L(κ) is pinned to).
+        let fill_star =
+            data_center_reference_fill(data.view(), centers.view(), ell_ref).unwrap();
+        // Solve-only helper: the converged Newton root L(κ) for FD of the jet.
+        let solve_l = |kappa: f64| -> f64 {
+            constant_curvature_effective_length_jet(data.view(), centers.view(), ell_ref, kappa)
+                .unwrap()
+                .0
+        };
+        let h = 1e-5_f64;
+        for &kappa in &[-1.5_f64, -0.5, -1e-7, 0.0, 1e-7, 0.8, 1.7] {
+            let (l, l1, l2) =
+                constant_curvature_effective_length_jet(data.view(), centers.view(), ell_ref, kappa)
+                    .unwrap();
+            // L solves the fill target: g(L, κ) = fill⋆.
+            let (g, ..) =
+                data_center_fill_partials(data.view(), centers.view(), kappa, l).unwrap();
+            assert!(
+                (g - fill_star).abs() <= 1e-10 * (1.0 + fill_star.abs()),
+                "κ={kappa}: fill not held invariant: g(L,κ)={g} vs fill⋆={fill_star}"
+            );
+            // κ = 0 ⇒ L = ℓ_ref exactly (the reference point).
+            if kappa == 0.0 {
+                assert!(
+                    (l - ell_ref).abs() <= 1e-10 * ell_ref,
+                    "L(0) must equal ℓ_ref; got {l} vs {ell_ref}"
+                );
+            }
+            // L′, L″ vs central FD of the re-solved implicit root.
+            let lp = solve_l(kappa + h);
+            let lm = solve_l(kappa - h);
+            let fd1 = (lp - lm) / (2.0 * h);
+            let fd2 = (lp - 2.0 * l + lm) / (h * h);
+            assert!(
+                (l1 - fd1).abs() <= 1e-5 * (1.0 + fd1.abs()),
+                "κ={kappa}: L′ analytic {l1} vs FD {fd1}"
+            );
+            assert!(
+                (l2 - fd2).abs() <= 1e-3 * (1.0 + fd2.abs()),
+                "κ={kappa}: L″ analytic {l2} vs FD {fd2}"
+            );
+        }
     }
 
     /// 8 data rows + 8 centers inside a disk of radius < 0.5 (valid in every

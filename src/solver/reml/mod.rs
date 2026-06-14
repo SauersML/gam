@@ -3645,7 +3645,7 @@ pub(crate) struct DirectionalHyperParam {
     // decomposition as the first derivatives.
     pub(crate) penaltysecond_components: Option<Vec<Option<Vec<PenaltyDerivativeComponent>>>>,
     pub(crate) penaltysecond_component_provider: Option<
-        pub(crate) std::sync::Arc<
+        std::sync::Arc<
             dyn Fn(usize) -> Result<Option<Vec<PenaltyDerivativeComponent>>, EstimationError>
                 + Send
                 + Sync

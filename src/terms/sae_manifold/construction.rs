@@ -7201,18 +7201,11 @@ impl SaeManifoldTerm {
             let stride = n_rows.div_ceil(SHAPE_BAND_MAX_POINTS).max(1);
             let eval_rows: Vec<usize> = (0..n_rows).step_by(stride).collect();
             for (gi, &row) in eval_rows.iter().enumerate() {
-                // Φ_k(t) at this on-atom row, as an (m, 1) rhs.
-                let mut phi_col = Array2::<f64>::zeros((m, 1));
-                for b in 0..m {
-                    phi_col[[b, 0]] = atom.basis_values[[row, b]];
-                }
+                // Φ_k(t) at this on-atom row.
+                let phi_t = atom.basis_values.row(row).to_owned();
                 // H_k⁻¹ Φ(t), then the quadratic form Φ(t)ᵀ H_k⁻¹ Φ(t).
-                let solved = chol.solve_mat(&phi_col);
-                let mut quad = 0.0_f64;
-                for b in 0..m {
-                    quad += phi_col[[b, 0]] * solved[[b, 0]];
-                }
-                let quad = quad.max(0.0);
+                let solved = chol.solvevec(&phi_t);
+                let quad = phi_t.dot(&solved).max(0.0);
                 // Var_c(t) = φ · Φ(t)ᵀ H_k⁻¹ Φ(t) — identical across channels (the
                 // inner Hessian is shared; the decoder differs only in the mean).
                 let sd = (dispersion * quad).sqrt();

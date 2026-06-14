@@ -1986,6 +1986,8 @@ pub(crate) fn chart_region(atom: &SaeManifoldAtom, center: Array1<f64>, radius: 
             let r_max = center_norm + radius;
             region.with_radial_bounds(r_min, r_max)
         }
-        Periodic | Sphere | Torus | EuclideanPatch | Poincare | Precomputed(_) => region,
+        // Cylinder has no radial kernel block (it is a harmonic × polynomial
+        // tensor, not a Duchon radial basis), so it needs no radial r_min/r_max.
+        Periodic | Sphere | Torus | Cylinder | EuclideanPatch | Poincare | Precomputed(_) => region,
     }
 }

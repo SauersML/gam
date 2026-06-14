@@ -62,7 +62,7 @@ pub struct GaussianLocationScaleWiggleFamily {
     /// when the family is built without an explicit policy.
     pub policy: crate::resource::ResourcePolicy,
     pub(crate) cached_row_scalars:
-        pub(crate) std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
+        std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
 
 impl Clone for GaussianLocationScaleWiggleFamily {

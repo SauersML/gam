@@ -43,7 +43,7 @@ pub(crate) struct BmsFlexBlockContext {
     pub(super) ordering: Vec<crate::families::identifiability_compiler::BlockOrder>,
     /// W-metric row Hessian built from the validated `training_row_weights`.
     pub(super) row_hess:
-        pub(crate) crate::families::bernoulli_marginal_slope_identifiability::BernoulliRowHessian,
+        crate::families::bernoulli_marginal_slope_identifiability::BernoulliRowHessian,
     /// Dense candidate basis at training rows (n × p_candidate), cached to
     /// avoid a second `design()` call after context construction.
     pub(super) candidate_design_dense: Array2<f64>,

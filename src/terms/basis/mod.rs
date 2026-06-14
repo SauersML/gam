@@ -1,28 +1,49 @@
-// Split from the original oversized module; keep included in order.
+//! Spline / spatial / spherical basis construction, penalties, and the
+//! hyperparameter (`ψ`) derivative machinery that the smooth terms build on.
+//!
+//! The module is decomposed into single-concern submodules. Shared crate
+//! imports live in [`imports.rs`](imports.rs) and are pulled into this module's
+//! namespace; every submodule re-imports them (together with the sibling
+//! re-exports below) through `use super::*`. The `pub use <module>::*`
+//! re-exports flatten each concern back onto the `basis::` path so external
+//! callers keep referring to e.g. `basis::CenterStrategy` regardless of which
+//! submodule now owns the item.
+
+// Crate-wide imports, shared by every submodule via `use super::*`.
 include!("imports.rs");
 
+// ---- Manifold / geometric smooth specifications and kernels ----
 mod constant_curvature_smooth;
-
 mod cyclic;
-
-mod measure_jet_moments;
-
-mod measure_jet_predict;
-
-mod measure_jet_smooth;
-
-mod polylog;
-
-mod sphere_kernels;
-
 mod sphere_spec;
-
+mod sphere_kernels;
 mod sphere_spectral;
 
-include!("core_types_and_bspline_eval.rs");
-include!("bspline_build_and_matern_penalty.rs");
-include!("sphere_matern_duchon_psi_derivatives.rs");
-include!("duchon_thinplate_and_periodic_splines.rs");
+// ---- Measure-jet smooth (V0 / V∞) ----
+mod measure_jet_moments;
+mod measure_jet_predict;
+mod measure_jet_smooth;
+
+// ---- Scalar math primitives ----
+mod polylog;
+
+// ---- Core types, evaluation, planning, and the (ψ) derivative engine ----
+mod types;
+mod internal;
+mod bspline_eval;
+mod spline_eval_scalar;
+mod bspline_build;
+mod center_selection;
+mod streaming_design;
+mod workspace_cache;
+mod implicit_psi_derivative;
+mod matern_kernel;
+mod duchon_kernel_math;
+mod duchon_psi_derivatives;
+mod duchon_thinplate;
+mod periodic_duchon;
+mod sphere_basis;
+mod radial_jets_nd;
 
 /// Closed-form scalar building blocks for Riesz, Matérn, and isotropic
 /// hybrid Duchon kernels.
@@ -36,4 +57,60 @@ pub mod closed_form_penalty;
 
 pub mod radial_profile;
 
-include!("tests_include.rs");
+// ---- Flat re-exports: preserve the external `basis::X` path surface ----
+
+pub use constant_curvature_smooth::{
+    ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, build_constant_curvature_basis,
+    build_constant_curvature_basis_kappa_derivatives, constant_curvature_kernel_kappa_jets,
+    constant_curvature_kernel_matrix, realized_constant_curvature_length_scale,
+};
+
+pub use measure_jet_moments::{
+    MeasureJetJetStats, MeasureJetMomentTable, accumulate_moment_table, jet_sufficient_stats,
+    merge_moment_tables, recenter_moment_table,
+};
+
+pub use measure_jet_predict::{MeasureJetExtrapolationSpectrum, measure_jet_extrapolation_variance};
+
+pub use measure_jet_smooth::{
+    MeasureJetBand, MeasureJetBasisSpec, MeasureJetEnergyJets, MeasureJetFrozenQuadrature,
+    MeasureJetIdentifiability, build_measure_jet_basis, build_measure_jet_basis_psi_derivatives,
+    measure_jet_band, measure_jet_center_masses, measure_jet_design_matrix,
+    measure_jet_energy_form, measure_jet_energy_form_with_jets, measure_jet_energy_forms_per_scale,
+    measure_jet_multiscale_mode, measure_jet_quadrature_nodes, measure_jet_scale_spectrum,
+    measure_jet_support_curve, realized_measure_jet_length_scale,
+};
+
+pub use sphere_spec::{
+    SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
+};
+
+pub use cyclic::{
+    create_closure_difference_penalty_jet, create_cyclic_difference_penalty_matrix,
+    create_open_difference_penalty_matrix,
+};
+
+pub(crate) use cyclic::{
+    create_cyclic_bspline_basis_dense, cyclic_distance_1d, cyclic_uniform_knot_vector,
+    wrap_to_period,
+};
+
+// Concern modules: flatten each onto `basis::` so external paths are unchanged.
+pub use bspline_build::*;
+pub use bspline_eval::*;
+pub use center_selection::*;
+pub use duchon_kernel_math::*;
+pub use duchon_psi_derivatives::*;
+pub use duchon_thinplate::*;
+pub use implicit_psi_derivative::*;
+pub use matern_kernel::*;
+pub use periodic_duchon::*;
+pub use radial_jets_nd::*;
+pub use sphere_basis::*;
+pub use spline_eval_scalar::*;
+pub use streaming_design::*;
+pub use types::*;
+pub use workspace_cache::*;
+
+#[cfg(test)]
+mod tests;

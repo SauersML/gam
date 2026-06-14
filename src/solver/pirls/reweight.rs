@@ -2250,7 +2250,7 @@ pub(super) mod test_support {
     //! it.
     thread_local! {
         pub static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
-            pub(crate) const { std::cell::RefCell::new(None) };
+            const { std::cell::RefCell::new(None) };
     }
 
     pub fn record_penalized_deviance(value: f64) {

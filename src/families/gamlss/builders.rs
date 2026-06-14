@@ -2820,8 +2820,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             Array1<f64>,
             f64,
             Array1<f64>,
-            pub(crate) crate::solver::outer_strategy::HessianResult,
-            pub(crate) crate::custom_family::CustomFamilyWarmStart,
+            crate::solver::outer_strategy::HessianResult,
+            crate::custom_family::CustomFamilyWarmStart,
         )>,
     }
 
