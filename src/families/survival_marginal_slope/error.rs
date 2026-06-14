@@ -97,8 +97,3 @@ impl From<String> for SurvivalMarginalSlopeError {
     }
 }
 
-
-// ── Spec and result types ─────────────────────────────────────────────
-
-#[derive(Clone)]
-

@@ -5,6 +5,7 @@
 
 use super::*;
 
+#[derive(Clone)]
 pub(crate) struct PerZScoreWarpPrepared {
     pub(crate) block: ParameterBlockInput,
     pub(crate) runtime: DeviationRuntime,
@@ -528,7 +529,3 @@ pub(crate) fn flex_identity_block_pairs(
     }
     pairs
 }
-
-
-#[derive(Clone)]
-

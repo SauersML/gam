@@ -5,6 +5,14 @@
 
 use super::*;
 
+/// The time block has one beta vector but THREE design matrices (entry, exit,
+/// derivative-at-exit). The ParameterBlockSpec uses the exit design as its
+/// "official" design, so block_states[0].eta = design_exit @ beta + offset_exit.
+/// This eta is NOT used in the likelihood computation — row_neglog_directional
+/// recomputes all 3 linear predictors from beta_time directly. The exit-design
+/// eta exists only to satisfy the CustomFamily/PIRLS interface; ExactNewton
+/// blocks do not use eta for working response/weights.
+#[derive(Clone)]
 pub(crate) struct SurvivalMarginalSlopeFamily {
     pub(crate) n: usize,
     pub(crate) event: Arc<Array1<f64>>,
@@ -221,9 +229,6 @@ pub(crate) struct ThetaHints {
     pub(crate) link_dev_beta: Option<Array1<f64>>,
     pub(crate) influence_beta: Option<Array1<f64>>,
 }
-
-
-#[derive(Clone)]
 
 impl SurvivalMarginalSlopeFamily {
     pub(crate) fn time_derivative_lower_bound(&self) -> f64 {

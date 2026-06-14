@@ -4,6 +4,7 @@
 
 use super::*;
 
+#[derive(Clone)]
 pub struct SurvivalMarginalSlopeTermSpec {
     pub age_entry: Array1<f64>,
     pub age_exit: Array1<f64>,
@@ -111,17 +112,6 @@ pub struct SurvivalMarginalSlopeFitResult {
     pub influence_absorber_width: Option<usize>,
 }
 
-
-// ── Family struct ─────────────────────────────────────────────────────
-
-/// The time block has one beta vector but THREE design matrices (entry, exit,
-/// derivative-at-exit). The ParameterBlockSpec uses the exit design as its
-/// "official" design, so block_states[0].eta = design_exit @ beta + offset_exit.
-/// This eta is NOT used in the likelihood computation — row_neglog_directional
-/// recomputes all 3 linear predictors from beta_time directly. The exit-design
-/// eta exists only to satisfy the CustomFamily/PIRLS interface; ExactNewton
-/// blocks do not use eta for working response/weights.
-#[derive(Clone)]
 
 pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     let n = spec.age_entry.len();

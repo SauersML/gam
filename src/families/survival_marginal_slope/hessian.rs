@@ -1566,19 +1566,3 @@ impl HyperOperator for BlockHessianOperator {
         false
     }
 }
-
-
-// ── Closed-form row kernel ─────────────────────────────────────────────
-//
-// The survival marginal-slope NLL for row i is:
-//
-//   ℓ_i = w_i [ (1-d)·neglogΦ(-η₁) + logΦ(-η₀) − d·logφ(η₁) − d·log(a'₁) ]
-//
-// with η₀ = q₀c + s_f g z, η₁ = q₁c + s_f g z, a'₁ = qd₁·c,
-// c = √(1 + (s_f g)²), s_f = 1/√(1+σ²).
-//
-// All derivatives w.r.t. the 4 primary scalars (q₀, q₁, qd₁, g) are
-// closed-form scalar formulas. No jets, no per-row heap allocation.
-
-#[inline]
-

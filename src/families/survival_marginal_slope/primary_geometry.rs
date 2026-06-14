@@ -5,6 +5,7 @@
 
 use super::*;
 
+#[derive(Clone)]
 pub(crate) struct DynamicQBlockwiseAccumulator {
     pub(crate) log_likelihood: f64,
     pub(crate) grad_time: Array1<f64>,
