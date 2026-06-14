@@ -15,4 +15,4 @@
 
 // Split from the original oversized module; keep included in order.
 include!("outer_strategy_operators.rs");
-include!("outer_strategy_run_plan_tests.rs");
+include!("outer_strategy_run_plan.rs");
