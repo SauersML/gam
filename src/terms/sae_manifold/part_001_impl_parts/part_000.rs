@@ -281,27 +281,6 @@ impl SaeManifoldTerm {
         let peak_design_row = design.row(peak_slot).to_owned();
         let mode_design_row = design.row(mode_slot).to_owned();
 
-        let kappa_hat = atom_curvature_bound(self, atom_idx)?;
-
-        // #1099 delta-method sensitivity ∂κ/∂β of the plug-in curvature bound
-        // w.r.t. the captured decoder channel j_lead's coefficients, formed by
-        // finite-differencing `atom_curvature_bound_with_decoder` where the full
-        // second-jet geometry lives. The curvature-CI report propagates it
-        // through H⁻¹ as SE = sqrt((∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β)). `None` when the bound
-        // carries no usable gradient (degenerate chart / infinite curvature).
-        let kappa_grad = atom
-            .basis_evaluator
-            .as_ref()
-            .and_then(|evaluator| {
-                evaluator.second_jet_dyn(
-                    self.assignment.coords[atom_idx].as_matrix().view(),
-                )
-            })
-            .and_then(|jet| jet.ok())
-            .and_then(|second| {
-                atom_curvature_bound_grad(atom, atom_idx, second.view(), j_lead)
-            });
-
         Ok(Some(crate::sae_identifiability::AtomInnerFit {
             design,
             derivative_design,
@@ -313,8 +292,6 @@ impl SaeManifoldTerm {
             dispersion,
             peak_design_row,
             mode_design_row,
-            kappa_hat,
-            kappa_grad,
         }))
     }
 
