@@ -266,6 +266,13 @@ fn main() {
     let mut oversized_file_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_oversized_tracked_files(&manifest_dir, &mut oversized_file_offenders);
 
+    // Mechanical file-splitting ban. `part_<NNN>.rs` files and `*_parts/` /
+    // `split_parts/` directories split a module by line count instead of by
+    // cohesive concern. Banned for new code; existing offenders grandfathered
+    // in the shrink-only `mechanical_parts_baseline.txt` ledger.
+    let mut mechanical_part_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_mechanical_part_files(&manifest_dir, &mut mechanical_part_offenders);
+
     // Persistent unimplemented/todo/unreachable removal audit. Compares the
     // current set of marker-bearing functions against the on-disk ledger and
     // flags any function whose marker disappeared without a real implementation
@@ -590,6 +597,19 @@ fn main() {
             title: "tracked file over 10k lines (split the file; issue #780 line-count gate)"
                 .to_string(),
             rows: oversized_file_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !mechanical_part_offenders.is_empty() {
+        sections.push(Section {
+            title: "mechanical file-splitting banned (`part_<NNN>.rs` / `*_parts/` / `split_parts/` \
+                    is line-count splitting, not logical decomposition — split by cohesive concern \
+                    into descriptively-named modules; do NOT add to mechanical_parts_baseline.txt)"
+                .to_string(),
+            rows: mechanical_part_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -3020,6 +3040,83 @@ fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, u
                 format!("{line_count} lines; limit is {MAX_TRACKED_FILE_LINES}"),
             ));
         }
+    }
+}
+
+/// Shrink-only debt ledger of grandfathered mechanical-split files (crate-root
+/// relative). New mechanical part-files must NOT be added here.
+const MECHANICAL_PARTS_BASELINE: &str = "mechanical_parts_baseline.txt";
+
+/// Is this repo-relative path a mechanical line-count split rather than a logical
+/// module? True when the file stem is `part_<digits>` OR any ancestor directory
+/// component ends in `_parts` or is exactly `split_parts`.
+fn is_mechanical_part_path(rel: &Path) -> bool {
+    if let Some(stem) = rel.file_stem().and_then(|s| s.to_str()) {
+        let is_part_n = stem
+            .strip_prefix("part_")
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
+        if is_part_n {
+            return true;
+        }
+    }
+    for comp in rel.components() {
+        if let std::path::Component::Normal(os) = comp {
+            if let Some(name) = os.to_str() {
+                if name == "split_parts" || name.ends_with("_parts") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Ban mechanical file-splitting (`part_<NNN>.rs`, `*_parts/`, `split_parts/`).
+/// Existing offenders are grandfathered by `mechanical_parts_baseline.txt` (a
+/// ratchet that may only shrink); any mechanical part-file NOT in that ledger is
+/// a fresh violation and fails the build. Split by cohesive concern into
+/// descriptively-named modules instead.
+fn scan_for_mechanical_part_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
+    let baseline_text = fs::read_to_string(root.join(MECHANICAL_PARTS_BASELINE)).unwrap_or_default();
+    let baseline: std::collections::HashSet<&str> = baseline_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("ls-files")
+        .arg("-z")
+        .arg("src")
+        .output()
+        .expect("failed to list Git-tracked files for mechanical-part audit");
+    assert!(
+        output.status.success(),
+        "git ls-files failed during mechanical-part audit"
+    );
+
+    for raw in output.stdout.split(|b| *b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let rel_text = String::from_utf8(raw.to_vec())
+            .expect("git ls-files emitted a non-UTF-8 path; repository paths must be UTF-8");
+        if !rel_text.ends_with(".rs") {
+            continue;
+        }
+        let rel = PathBuf::from(&rel_text);
+        if !is_mechanical_part_path(&rel) || baseline.contains(rel_text.as_str()) {
+            continue;
+        }
+        offenders.push((
+            rel,
+            0,
+            "mechanical line-count split; decompose by cohesive concern into named modules \
+             (and never add to mechanical_parts_baseline.txt)"
+                .to_string(),
+        ));
     }
 }
 
