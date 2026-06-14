@@ -1436,23 +1436,17 @@ pub fn build_measure_jet_basis(
             op: None,
         });
     }
-    // The affine-preserving coefficient ridge is a SECOND penalty on the
-    // non-affine (wiggly) coefficient directions — the very directions the
-    // jet-residual energy already penalizes. In MULTISCALE mode each scale
-    // owns its own narrow band, so a single fused-energy candidate does not
-    // cover the full wiggle space and the ridge supplies the missing
-    // nullspace shrinkage (mgcv `select=` double-penalty pattern). In
-    // SINGLE-SCALE (fused) mode the one primary candidate already penalizes
-    // the entire non-affine span, and the affine span itself is pinned by the
-    // `CenterSumToZero` identifiability constraint — so the ridge is not
-    // covering an unpenalized nullspace, it is DOUBLE-penalizing the wiggle.
-    // That second λ both (a) over-shrinks the fitted surface toward affine
-    // (the #1116/#1041 residual accuracy gap vs the sharp Duchon r³ basis) and
-    // (b) turns the documented one-λ single-scale footprint into a degenerate
-    // 2-D outer REML search (two near-collinear wiggle-λ directions) that
-    // cycles to the iteration cap on low-effective-rank data (the #1116
-    // perf-parity timeout). Emit it only where it earns its keep: multiscale.
-    if spec.double_penalty && per_level {
+    // The affine-preserving coefficient ridge `I − P_affine` penalizes every
+    // non-affine coefficient direction UNIFORMLY. The fused jet-residual energy
+    // penalizes only the LOCAL jet residual, so it has a large near-nullspace
+    // of globally-smooth-but-not-locally-affine modes; on low-effective-rank
+    // data those weakly-penalized directions are unidentified and the inner
+    // solve / outer REML cycle (MEASURED #1116: dropping the ridge made the
+    // bms-accuracy fit 3s→59s AND less accurate — the ridge was doing genuine
+    // nullspace stabilization, not redundant double-penalization). So the ridge
+    // is kept in single-scale mode too. It is the mgcv `select=` nullspace
+    // companion to the primary energy.
+    if spec.double_penalty {
         let ridge = affine_preserving_coefficient_ridge(&kz, centers.view(), masses.view())?;
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
@@ -1628,13 +1622,11 @@ pub fn build_measure_jet_basis_psi_derivatives(
     };
     let n_active = raw.len();
     // Mirror the build-path gate (`build_measure_jet_basis`): the
-    // affine-preserving ridge candidate is emitted only in multiscale mode,
-    // where the per-scale split leaves wiggle directions a single fused
-    // candidate would not. In single-scale mode the one fused candidate
-    // already penalizes the whole non-affine span, so no ridge candidate is
-    // emitted and the ψ-derivative penalty count must match (count desync =
-    // the gam#860 trap class).
-    let ridge = spec.double_penalty && geom.per_level;
+    // affine-preserving ridge candidate is emitted whenever `double_penalty`
+    // is on (single-scale and multiscale alike — #1116: it stabilizes the
+    // fused energy's near-nullspace; the ψ-derivative penalty count must match
+    // the build path, count desync = the gam#860 trap class).
+    let ridge = spec.double_penalty;
     let n_cands = n_active + usize::from(ridge);
     let zero_p = || Array2::<f64>::zeros((p, p));
     let mut penalties_first: Vec<Vec<Array2<f64>>> =
@@ -2036,7 +2028,8 @@ mod tests {
         });
         // Default (multiscale = false) stays single-scale even at a LARGE center
         // count that, under the deleted auto-gate, would have flipped to
-        // multiscale.
+        // multiscale: one fused jet-energy penalty + the affine-preserving
+        // nullspace-stabilizing ridge (#1116) = exactly two candidates.
         let single = MeasureJetBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 80 },
             ..MeasureJetBasisSpec::default()
@@ -2049,10 +2042,12 @@ mod tests {
             build_measure_jet_basis(data.view(), &single).expect("single-scale build");
         assert_eq!(
             built_single.penalties.len(),
-            1,
-            "single-scale mode emits exactly one fused penalty (no ridge, no per-scale split)"
+            2,
+            "single-scale mode emits one fused penalty + the nullspace ridge"
         );
-        // The explicit opt-in flips to multiscale at the SAME center count.
+        // The explicit opt-in flips to multiscale at the SAME center count: the
+        // per-scale spectral split (several candidates) + the ridge, strictly
+        // more candidates than the single fused penalty.
         let multi = MeasureJetBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 80 },
             multiscale: true,
@@ -2064,16 +2059,17 @@ mod tests {
         );
         let built_multi = build_measure_jet_basis(data.view(), &multi).expect("multiscale build");
         assert!(
-            built_multi.penalties.len() >= 2,
-            "multiscale mode emits the per-scale spectral split plus the ridge, got {}",
-            built_multi.penalties.len()
+            built_multi.penalties.len() > built_single.penalties.len(),
+            "multiscale mode emits the per-scale spectral split plus the ridge, got {} (vs single-scale {})",
+            built_multi.penalties.len(),
+            built_single.penalties.len()
         );
     }
 
     /// An explicit order pins the Mellin weights and fuses the band into a
     /// single Primary candidate. With multiscale off (the default) the mode is
-    /// single-scale, so the multiscale-only ridge (#1116) is not emitted:
-    /// exactly one penalty.
+    /// single-scale: one fused Primary penalty + the affine-preserving
+    /// nullspace ridge (#1116) = two candidates.
     #[test]
     fn fused_mode_emits_single_primary_candidate() {
         let n = 40usize;
@@ -2093,8 +2089,8 @@ mod tests {
         let built = build_measure_jet_basis(data.view(), &spec).expect("fused build");
         assert_eq!(
             built.penalties.len(),
-            1,
-            "fused single-scale mode must emit exactly one Primary candidate (no ridge)"
+            2,
+            "fused single-scale mode emits one Primary candidate + the nullspace ridge"
         );
         let BasisMetadata::MeasureJet { order_s, .. } = &built.metadata else {
             panic!("measure-jet build must return MeasureJet metadata");
@@ -2303,8 +2299,8 @@ mod tests {
         );
         assert_eq!(
             derivs.penalties_first[0].len(),
-            1,
-            "single-scale fused mode has exactly one candidate (primary, no ridge)"
+            2,
+            "single-scale fused mode has the primary candidate + the nullspace ridge"
         );
         let pen_at = |s: f64| {
             let trial = MeasureJetBasisSpec {
@@ -2324,6 +2320,11 @@ mod tests {
                 "s jet of the fused candidate: analytic {x:.6e} vs FD {y:.6e}"
             );
         }
+        // The ridge candidate carries identically-zero ψ derivatives.
+        assert!(
+            derivs.penalties_first[0][1].iter().all(|v| *v == 0.0),
+            "ridge candidate must have zero ψ drift in fused mode"
+        );
     }
 
     /// Quadrature nodes must be the mass-weighted cell barycenters
