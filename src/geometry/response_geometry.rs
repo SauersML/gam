@@ -687,12 +687,41 @@ pub struct ResponseCurvatureFit {
     /// The dimension `d` of the constant-curvature response manifold.
     pub dim: usize,
     /// The REML/evidence-optimal curvature κ̂ (argmin of the profiled criterion).
+    ///
+    /// **Units `1/length²`** — κ̂ is therefore *scale-dependent*: rescaling the
+    /// cloud `y ↦ α·y` rescales `κ̂ ↦ κ̂/α²`. For a scale-free statement of how
+    /// curved the cloud is, read [`kappa_r2`](Self::kappa_r2) instead. When the
+    /// cloud is curved BEYOND what its spread can resolve (it fills a large
+    /// fraction of the sphere `S^d(1/√κ̂)`), the optimiser rails to the
+    /// chart-resolution cap and [`railed_at_resolution_limit`](Self::railed_at_resolution_limit)
+    /// is `true`: κ̂ is then a *lower bound on |κ|*, not a point estimate.
     pub kappa_hat: f64,
+    /// The DIMENSIONLESS geometric invariant the cloud actually determines:
+    /// `κ̂ · r²` with `r` = [`characteristic_radius`](Self::characteristic_radius).
+    /// This is scale-FREE (`κ̂·r²` is invariant under `y ↦ α·y`, since `κ̂ ↦ κ̂/α²`
+    /// and `r ↦ α·r`) — the honest answer to "how curved is this cloud relative
+    /// to its own spread". `|κ̂·r²| ≪ 1` ⇒ nearly flat at this scale; `κ̂·r² ↗ (π/2)²`
+    /// ⇒ the cloud fills the sphere and curvature is at the chart-resolution limit.
+    pub kappa_r2: f64,
+    /// Characteristic geodesic radius `r` of the cloud at κ = 0 (the doubled-gauge
+    /// chart distance `r = 2·max_i‖y_i − μ‖`): the length scale against which κ̂ is
+    /// dimensionless. Reported so the caller can convert between scale-dependent κ̂
+    /// and the scale-free `κ̂·r²` without re-deriving the chart gauge.
+    pub characteristic_radius: f64,
     /// The intrinsic Fréchet-mean base point at κ̂ (the tangent expansion point
     /// the scalar GAMs are fitted around).
     pub base: Array1<f64>,
     /// Profiled criterion value `V_p(κ̂)` (concentrated negative log-evidence).
     pub v_p_hat: f64,
+    /// `true` when the κ̂ search converged ONTO the chart-resolution cap rather
+    /// than an interior optimum: the data want curvature at or beyond the
+    /// conjugate radius of their geodesic spread (the cloud fills the sphere).
+    /// In that case κ̂ / the CI upper end are NOT a resolved point estimate but a
+    /// HONEST "curvature exceeds chart-resolvable range at this scale" flag — the
+    /// caller must report it as such and never as a silent `κ̂ = ci_hi`. The
+    /// hyperbolic side cannot rail this way (κ < 0 has no conjugate radius), so a
+    /// rail here always means strongly spherical relative to the spread.
+    pub railed_at_resolution_limit: bool,
     /// Profile-likelihood CI for κ and the geometry verdict from its sign.
     pub profile_ci: crate::geometry::curvature_estimand::KappaProfileCi,
     /// Interior-point χ²₁ likelihood-ratio test of flatness (κ = 0).
@@ -700,7 +729,10 @@ pub struct ResponseCurvatureFit {
 }
 
 /// Chart-validity bounds on κ for a constant-curvature response geometry built
-/// from the supplied responses.
+/// from the supplied responses, plus the characteristic geodesic radius
+/// `ρ_max = 2·max_i‖y_i − μ‖` against which κ is made dimensionless.
+///
+/// Returns `(kappa_min, kappa_max, rho_max)`.
 ///
 /// * **Lower (hyperbolic) bound.** The κ-stereographic chart requires
 ///   `1 + κ‖x‖² > 0` at every point measured from the chart origin, i.e.
@@ -715,7 +747,13 @@ pub struct ResponseCurvatureFit {
 ///   stays strictly inside the first conjugate shell with a 10% margin:
 ///   `√κ·ρ_max ≤ 0.9π ⇒ κ_max = (0.9π / ρ_max)²`. This keeps every geodesic
 ///   radius before the antipodal singularity along the whole search/CI walk.
-fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64) {
+///
+/// `κ_max` is the chart-RESOLUTION limit of the cloud: at it the geodesic spread
+/// fills `(0.9π)² ≈ (π/2·1.8)²` of the conjugate shell, i.e. the cloud nearly
+/// fills the sphere `S^d(1/√κ_max)`. The DIMENSIONLESS product `κ_max·ρ_max²
+/// = (0.9π)²` is fixed and data-scale-free — it is the natural "the cloud is
+/// maximally curved relative to its spread" sentinel the rail check compares κ̂ to.
+fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64, f64) {
     let (n_rows, dim) = values.dim();
     // ‖y_i‖² from the chart origin (governs the λ / hyperbolic-chart constraint).
     let mut r2_max = 0.0_f64;
@@ -746,19 +784,19 @@ fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64) {
     if r2_max <= 0.0 && s2_max <= 0.0 {
         // Degenerate (all points at the origin): κ is unidentified; use a wide
         // symmetric default so the optimiser/CI report a flat, unbounded result.
-        return (-1.0e6, 1.0e6);
+        return (-1.0e6, 1.0e6, 0.0);
     }
     // Keep a safety margin off the singular hyperbolic boundary.
     let kappa_min = if r2_max > 0.0 { -0.999 / r2_max } else { -1.0e6 };
     // Conjugate-radius cap: ρ_max = 2·max‖y_i − μ‖ is the κ=0 geodesic radius.
+    let rho_max = 2.0 * s2_max.sqrt();
     let kappa_max = if s2_max > 0.0 {
-        let rho_max = 2.0 * s2_max.sqrt();
         let edge = 0.9 * std::f64::consts::PI / rho_max;
         edge * edge
     } else {
         1.0e6
     };
-    (kappa_min, kappa_max)
+    (kappa_min, kappa_max, rho_max)
 }
 
 /// Profiled curvature criterion `V_p(κ)` for the constant-curvature response
@@ -867,6 +905,23 @@ pub fn response_curvature_criterion(
 /// point of the analytic `S^d ← ℝ^d → H^d` family, so no boundary correction is
 /// applied. Returns the κ̂, its tangent base point, the profile CI, and the Wilks
 /// flatness test for the fit summary.
+///
+/// ## Scale-awareness and honest railing (#1104)
+///
+/// κ has units `1/length²`, so a cloud of characteristic geodesic radius `r`
+/// resolves only the DIMENSIONLESS product `κ·r²` (every chart primitive depends
+/// on `y` through `κ‖y‖²`, hence `V(κ, αy) = V(α²κ, y)` and `κ̂ ↦ κ̂/α²` under
+/// `y ↦ αy`). The fit therefore also returns:
+/// * `kappa_r2 = κ̂·r²` — the scale-FREE invariant the cloud actually determines
+///   (how curved relative to its own spread), and `characteristic_radius = r`;
+/// * `railed_at_resolution_limit` — `true` when the data want curvature at or
+///   beyond the conjugate radius of their spread (the cloud fills the sphere),
+///   so the search converges onto the spherical cap. There κ̂ is a LOWER BOUND on
+///   `|κ|`, not a resolved point estimate, and the caller must report "curvature
+///   exceeds chart-resolvable range at this scale" rather than silently quoting
+///   `κ̂ = ci_hi`. This is the #1104 fix: a tightly-concentrated near-spherical
+///   cloud (e.g. unit-normalised OLMo activations) no longer SILENTLY rails to a
+///   huge scale-dependent `ci_hi` while claiming a point estimate + CI.
 pub fn fit_response_curvature(
     values: ArrayView2<'_, f64>,
     dim: usize,
@@ -886,7 +941,7 @@ pub fn fit_response_curvature(
     if !(level > 0.0 && level < 1.0) {
         return Err("response curvature CI level must lie in (0, 1)".into());
     }
-    let (kappa_min, kappa_max) = response_kappa_bounds(values);
+    let (kappa_min, kappa_max, rho_max) = response_kappa_bounds(values);
 
     // `V_p` as a closure over the criterion; threaded through both the κ̂ search
     // and the CI walk. Every evaluation uses the same κ-independent flat-centroid
@@ -927,6 +982,30 @@ pub fn fit_response_curvature(
     let kappa_hat = 0.5 * (a + b);
     let (v_p_hat, base) = response_curvature_criterion(values, dim, kappa_hat)?;
 
+    // ── Honest chart-resolution-rail detection. ─────────────────────────────
+    // The spherical cap κ_max is the curvature at which the cloud's geodesic
+    // spread ρ_max fills `(0.9π)²` of the conjugate shell — i.e. the cloud nearly
+    // fills the sphere S^d(1/√κ_max). When the criterion's optimum sits AT that
+    // cap (the data want κ ≥ κ_max, but the chart cannot resolve a sphere smaller
+    // than the cloud), the search converges onto the upper bracket and κ̂ ≈ κ_max
+    // is NOT a resolved point estimate — it is a lower bound on |κ|. We flag this
+    // so the caller reports "curvature exceeds chart-resolvable range at this
+    // scale" instead of silently quoting κ̂ / ci_hi as if interior. The detection
+    // is scale-free: it triggers when κ̂ lands within the final golden-section
+    // resolution of κ_max (the dimensionless product κ̂·ρ_max² ↗ (0.9π)²), never
+    // by an absolute κ threshold. The hyperbolic side has no conjugate radius, so
+    // only the spherical (upper) cap can rail this way.
+    let span = kappa_max - kappa_min;
+    let rail_margin = (0.02 * span).max(ktol);
+    let railed_at_resolution_limit = kappa_hat >= kappa_max - rail_margin;
+
+    // Dimensionless scale-free invariant κ̂·r²: the geometric content the cloud
+    // actually determines (invariant under y ↦ αy). r = ρ_max is the κ=0 doubled-
+    // gauge characteristic radius; for a degenerate (point) cloud r = 0 and the
+    // product is 0 (κ unidentified). This is what the caller should report as the
+    // honest "how curved relative to its spread" number alongside the dimensional κ̂.
+    let kappa_r2 = kappa_hat * rho_max * rho_max;
+
     // Exact outer curvature V_p''(κ̂) by a central second difference, on a step
     // scaled to the bracket; only used to size the Wald bracket of the CI walk.
     let h = (1.0e-3 * (kappa_max - kappa_min)).max(1.0e-6);
@@ -947,6 +1026,9 @@ pub fn fit_response_curvature(
     Ok(ResponseCurvatureFit {
         dim,
         kappa_hat,
+        kappa_r2,
+        characteristic_radius: rho_max,
+        railed_at_resolution_limit,
         base,
         v_p_hat,
         profile_ci,
@@ -1205,7 +1287,7 @@ mod tests {
         let mut k_hats = Vec::new();
         for (idx, &k_star) in k_stars.iter().enumerate() {
             let values = synth_cloud(dim, k_star, n, sigma, 0xC0FFEE ^ (idx as u64 + 1));
-            let (kmin, kmax) = response_kappa_bounds(values.view());
+            let (kmin, kmax, _rho) = response_kappa_bounds(values.view());
             let fit = fit_response_curvature(values.view(), dim, 0.95, 1e-12, 256)
                 .expect("response curvature fit");
             k_hats.push(fit.kappa_hat);
@@ -1293,7 +1375,7 @@ mod tests {
         let n = 400usize;
         for &k_star in &[-1.0_f64, 0.0, 0.8] {
             let values = synth_cloud(1, k_star, n, sigma, 0xD1 ^ (k_star.to_bits()));
-            let (kmin, kmax) = response_kappa_bounds(values.view());
+            let (kmin, kmax, _rho) = response_kappa_bounds(values.view());
             let fit = fit_response_curvature(values.view(), 1, 0.95, 1e-12, 256)
                 .expect("d=1 curvature fit");
             let span = kmax - kmin;

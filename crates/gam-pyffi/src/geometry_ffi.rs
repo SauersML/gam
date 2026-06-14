@@ -406,7 +406,17 @@ fn response_geometry_exp_map<'py>(
 ///
 /// Returns the summary tuple
 /// `(kappa_hat, ci_lo, ci_hi, lo_at_bound, hi_at_bound, verdict, lr_stat,
-///   p_value, base_point)` for the response-geometry fit summary.
+///   p_value, railed_at_resolution_limit, kappa_r2, characteristic_radius,
+///   base_point)` for the response-geometry fit summary.
+///
+/// `railed_at_resolution_limit` (#1104): `true` when the cloud is curved BEYOND
+/// what its spread can resolve (it fills the sphere), so κ̂ railed to the chart
+/// conjugate cap — κ̂/`ci_hi` are then a LOWER BOUND on |κ|, an honest "curvature
+/// exceeds chart-resolvable range at this scale", NOT a resolved point estimate.
+/// `kappa_r2 = κ̂·r²` is the scale-FREE invariant the cloud determines (invariant
+/// under `y ↦ αy`); `characteristic_radius = r` is the κ=0 doubled-gauge spread it
+/// is dimensionless to. Read these (not the scale-dependent κ̂ alone) when the data
+/// have been arbitrarily rescaled — e.g. unit-normalised OLMo activations.
 #[pyfunction(signature = (values, geometry, level=0.95))]
 #[allow(clippy::type_complexity)]
 fn response_geometry_fit_curvature<'py>(
@@ -421,6 +431,9 @@ fn response_geometry_fit_curvature<'py>(
     bool,
     bool,
     String,
+    f64,
+    f64,
+    bool,
     f64,
     f64,
     Py<PyArray1<f64>>,
@@ -465,6 +478,9 @@ fn response_geometry_fit_curvature<'py>(
         verdict,
         fit.flatness.lr_stat,
         fit.flatness.p_value,
+        fit.railed_at_resolution_limit,
+        fit.kappa_r2,
+        fit.characteristic_radius,
         fit.base.into_pyarray(py).unbind(),
     ))
 }

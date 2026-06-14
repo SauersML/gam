@@ -207,6 +207,17 @@ def fit_response_curvature(values: Any, *, geometry: str, level: float = 0.95) -
     geometry ``verdict`` (spherical / hyperbolic / flat from the CI sign), and the
     interior-point Wilks flatness test of κ = 0 (``flatness_lr`` /
     ``flatness_pvalue``).
+
+    Scale-awareness (#1104): κ has units 1/length², so ``kappa_hat`` is
+    *scale-dependent*. ``railed_at_resolution_limit`` is ``True`` when the cloud
+    is curved beyond what its spread can resolve (it fills the sphere) and κ̂
+    railed to the chart conjugate cap — κ̂ / ``ci_hi`` are then a LOWER BOUND on
+    |κ| ("curvature exceeds chart-resolvable range at this scale"), NOT a resolved
+    point estimate. ``kappa_r2`` = κ̂·r² is the scale-FREE invariant the cloud
+    actually determines (invariant under ``y → α·y``); ``characteristic_radius``
+    = r is the κ=0 spread it is dimensionless to. For arbitrarily-rescaled data
+    (e.g. unit-normalised activations) read ``kappa_r2`` / the rail flag, NOT the
+    scale-dependent ``kappa_hat`` alone.
     """
     np = _np()
     (
@@ -218,6 +229,9 @@ def fit_response_curvature(values: Any, *, geometry: str, level: float = 0.95) -
         verdict,
         lr_stat,
         p_value,
+        railed,
+        kappa_r2,
+        characteristic_radius,
         base_point,
     ) = _ffi(
         "response_geometry_fit_curvature",
@@ -235,6 +249,9 @@ def fit_response_curvature(values: Any, *, geometry: str, level: float = 0.95) -
         "verdict": str(verdict),
         "flatness_lr": float(lr_stat),
         "flatness_pvalue": float(p_value),
+        "railed_at_resolution_limit": bool(railed),
+        "kappa_r2": float(kappa_r2),
+        "characteristic_radius": float(characteristic_radius),
         "base_point": list(map(float, base_point)),
     }
 

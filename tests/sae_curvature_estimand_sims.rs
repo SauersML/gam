@@ -136,6 +136,45 @@ fn synth_cloud(dim: usize, k_star: f64, n: usize, sigma: f64, seed: u64) -> Arra
     values
 }
 
+/// A near-spherical cloud (curvature `k_star > 0`) whose geodesic spread FILLS a
+/// large fraction of the sphere `S^d(1/√k_star)`: isotropic-direction tangents of
+/// geodesic length drawn UNIFORMLY in `[0.55, 0.92]·(π/(2√k_star))` (a band that
+/// is most of the way to the conjugate radius `π/(2√k_star)` but strictly inside
+/// it, so every `exp_0` stays in-chart). Mean-centred like the real preprocessing.
+///
+/// This is the #1104 OLMo failure mode made deterministic: the cloud is genuinely
+/// high-curvature RELATIVE TO ITS SPREAD, so the resolvable κ saturates the chart
+/// conjugate cap and the estimator must rail HONESTLY (flagging it), not silently.
+fn synth_cloud_fills_sphere(dim: usize, k_star: f64, n: usize, seed: u64) -> Array2<f64> {
+    let manifold = ConstantCurvature::new(dim, k_star);
+    let origin = Array1::<f64>::zeros(dim);
+    let conj = std::f64::consts::PI / (2.0 * k_star.sqrt()); // conjugate radius in t
+    let mut state = seed | 1;
+    let mut values = Array2::<f64>::zeros((n, dim));
+    for i in 0..n {
+        // Isotropic unit direction × geodesic length filling most of the sphere.
+        let mut dir: Array1<f64> = (0..dim).map(|_| next_gauss(&mut state)).collect();
+        let nrm = dir.dot(&dir).sqrt().max(1.0e-12);
+        dir.mapv_inplace(|v| v / nrm);
+        let frac = 0.55 + 0.37 * next_unit(&mut state); // ∈ [0.55, 0.92]
+        let len = frac * conj;
+        let t = dir.mapv(|v| v * len);
+        let y = manifold
+            .exp_map(origin.view(), t.view())
+            .expect("fill-the-sphere tangent is strictly inside the conjugate radius");
+        values.row_mut(i).assign(&y);
+    }
+    let mut mean = Array1::<f64>::zeros(dim);
+    for row in values.outer_iter() {
+        mean += &row;
+    }
+    mean.mapv_inplace(|v| v / n as f64);
+    for mut row in values.outer_iter_mut() {
+        row -= &mean;
+    }
+    values
+}
+
 const DIM: usize = 2;
 const SIGMA: f64 = 0.08;
 const LEVEL: f64 = 0.95;
@@ -388,6 +427,101 @@ fn response_curvature_kappa_hat_is_unit_covariant_under_rescaling() {
             );
         }
     }
+}
+
+/// (5) HONEST CHART-RESOLUTION RAIL on a cloud that is genuinely high-curvature
+/// RELATIVE TO ITS SPREAD (the #1104 OLMo-fingerprint failure mode).
+///
+/// When a near-spherical cloud fills a large fraction of the sphere `S^d(1/√κ⋆)`
+/// — i.e. the geodesic spread approaches the conjugate radius — the data want
+/// curvature at or beyond what the chart can resolve, and the κ̂ search converges
+/// onto the spherical cap. The estimator must NOT silently report `κ̂ = ci_hi` as
+/// an interior point estimate: it must flag `railed_at_resolution_limit = true`,
+/// and the scale-FREE invariant `κ̂·r²` must be near the cap's dimensionless
+/// sentinel `(0.9π)²` (the cloud-fills-the-sphere limit), NOT a tiny number that
+/// would falsely read "flat". This is the exact OLMo behaviour we want made
+/// honest: a tight near-spherical cloud reports "curvature exceeds chart-
+/// resolvable range at this scale", never a silent rail.
+///
+/// We build the failure mode directly: spread σ so large (relative to the chart
+/// radius `1/√κ⋆`) that `exp_0(σz)` lands most points out near the equator of the
+/// sphere. With κ⋆ = +1 and σ = 0.9 the κ=0 chart radius of the farthest point
+/// approaches the conjugate cap, so the optimum is the cap.
+#[test]
+fn response_curvature_flags_rail_on_high_curvature_relative_to_spread() {
+    let dim = 5usize; // matches the OLMo per-layer fingerprint dim
+    let n = 2000usize;
+    // Strongly-curved sphere with a geodesic spread that fills a large fraction of
+    // it: the κ=0 chart radius of the farthest point approaches the conjugate cap,
+    // so κ is unresolvable beyond it — the OLMo unit-normalised regime. We cap each
+    // tangent at a safe fraction of the conjugate radius `π/(2√κ⋆)` so EVERY draw
+    // stays strictly in-chart (no exp_map antipode error), while the spread is still
+    // a large fraction of the sphere (the fill-the-sphere / rail condition).
+    let k_star = 4.0;
+    let seed = 0x1104_0000_DEAD_BEEF_u64; // distinct deterministic seed
+    let values = synth_cloud_fills_sphere(dim, k_star, n, seed);
+
+    let fit = fit_response_curvature(values.view(), dim, LEVEL, FIT_TOL, FIT_ITERS)
+        .expect("response curvature fit on high-curvature-relative-to-spread cloud");
+
+    println!(
+        "\n#1104 chart-resolution rail: κ̂={:.3}  κ̂·r²={:.3}  r={:.3}  railed={}  CI=[{:.3},{:.3}]",
+        fit.kappa_hat,
+        fit.kappa_r2,
+        fit.characteristic_radius,
+        fit.railed_at_resolution_limit,
+        fit.profile_ci.ci_lo,
+        fit.profile_ci.ci_hi,
+    );
+
+    // (a) The estimator HONESTLY flags that κ̂ is at the chart-resolution limit:
+    // it must NOT pretend this is an interior point estimate.
+    assert!(
+        fit.railed_at_resolution_limit,
+        "high-curvature-relative-to-spread cloud must flag railed_at_resolution_limit; \
+         got κ̂={} not flagged (silent rail — the #1104 bug)",
+        fit.kappa_hat
+    );
+
+    // (b) The scale-FREE invariant κ̂·r² sits near the cloud-fills-the-sphere
+    // sentinel (0.9π)² ≈ 8.0 — the cloud genuinely fills the sphere; it does NOT
+    // read as flat (which a scale-dependent tiny-r² reading could falsely suggest).
+    let sentinel = (0.9 * std::f64::consts::PI).powi(2);
+    assert!(
+        fit.kappa_r2 > 0.5 * sentinel,
+        "scale-free κ̂·r²={:.3} should be near the fill-the-sphere sentinel {:.3}, \
+         not a small (falsely-flat) value",
+        fit.kappa_r2,
+        sentinel
+    );
+    assert!(
+        fit.kappa_r2 <= sentinel + 1.0e-6,
+        "κ̂·r²={:.3} cannot exceed the conjugate-cap sentinel {:.3}",
+        fit.kappa_r2,
+        sentinel
+    );
+
+    // (c) The dimensional κ̂ remains finite and positive (a spherical lower bound),
+    // and the reported characteristic radius is the scale it is dimensionless to.
+    assert!(
+        fit.kappa_hat.is_finite() && fit.kappa_hat > 0.0,
+        "railed κ̂ must be a finite positive lower bound on |κ|, got {}",
+        fit.kappa_hat
+    );
+    assert!(fit.characteristic_radius > 0.0);
+
+    // (d) Contrast: a WELL-RESOLVED interior cloud (small spread vs chart radius)
+    // at the SAME κ⋆ must NOT rail — the flag is specific to the unresolvable
+    // regime, not always-on.
+    let interior = synth_cloud(dim, k_star, n, 0.04, seed ^ 0xABCD);
+    let fit_in = fit_response_curvature(interior.view(), dim, LEVEL, FIT_TOL, FIT_ITERS)
+        .expect("interior fit");
+    assert!(
+        !fit_in.railed_at_resolution_limit,
+        "well-resolved interior cloud must NOT flag a rail (κ̂={}, κ̂·r²={})",
+        fit_in.kappa_hat,
+        fit_in.kappa_r2
+    );
 }
 
 /// Recover the chart-validity / conjugate-radius bracket the estimator uses, so
