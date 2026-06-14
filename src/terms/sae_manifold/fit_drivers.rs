@@ -1879,7 +1879,7 @@ impl SaeManifoldTerm {
                 .unwrap_or(0);
             breached = (0..k).filter(|&a| a != anchor).collect();
             log::warn!(
-                "SaeManifoldTerm: dictionary co-collapse (reconstruction EV={ev:.4f} < \
+                "SaeManifoldTerm: dictionary co-collapse (reconstruction EV={ev:.4} < \
                  {SAE_DICTIONARY_COLLAPSE_EV_FLOOR}) with no relative-norm breach; reseeding \
                  {} of {k} atoms onto distinct residual PCs (anchor atom {anchor})",
                 breached.len()
