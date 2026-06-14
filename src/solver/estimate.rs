@@ -4119,11 +4119,29 @@ where
             .with_seed_config(reml_seed_config)
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
             .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
-            .with_objective_scale(if gaussian_identity {
-                Some(n_obs as f64)
-            } else {
-                None
-            })
+            // n-scaled absolute gradient floor for EVERY family (#1082).
+            //
+            // The REML/LAML profiled criterion is a sum over n rows
+            // (deviance / −2·loglik + the penalty/logdet terms), so it and its
+            // ∂/∂logλ gradient inherit an O(n) scale for Poisson, NB, binomial,
+            // Tweedie, beta — exactly as for Gaussian-identity. The previous gate
+            // restricted `with_objective_scale` to the Gaussian-identity arm on
+            // the (incorrect) premise that only that criterion is O(n). For a
+            // non-Gaussian tensor/cyclic/CI/badhealth fit at n≈1.5k–5k the fixed
+            // `abs = tol ≈ 1e-6` gradient floor is then orders of magnitude below
+            // the n-scaled gradient's converged residual: the relative-from-seed
+            // test declares convergence iters earlier, but the binding abs floor
+            // keeps the outer optimizer chasing sub-floor log-λ changes, paying a
+            // full k²·n·p² LAML-Hessian assembly per phantom iteration until it
+            // exhausts the iteration budget — the #1082 outer-loop "cycling"
+            // timeout. Lifting the floor to ~n·1e-9 (the same calibration the
+            // spatial/custom-family outer already uses via `with_problem_size`,
+            // #1053/#1066/#1069) lets the loop terminate as soon as the relative
+            // reduction is met, for every family, while the relative-to-cost
+            // component still owns the actual convergence decision. ARC σ and the
+            // initial trust radius stay Gaussian-gated: those exploit the
+            // Gaussian profile being quadratic-in-log-λ, which is family-specific.
+            .with_objective_scale(Some(n_obs as f64))
             .with_problem_size(n_obs, x_o.ncols())
             .with_arc_initial_regularization(if gaussian_identity { Some(0.25) } else { None })
             .with_operator_initial_trust_radius(if gaussian_identity { Some(4.0) } else { None })
