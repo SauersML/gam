@@ -5044,6 +5044,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     };
     let joint_x_for_fit = joint_x.clone();
     let fit = detach_estimation_result(py, "gaussian_reml_fit_blocks_forward", move || {
@@ -5488,6 +5489,7 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     };
 
     let heuristic_owned: Option<Vec<f64>> = init_log_lambda.map(|rho| vec![rho.exp()]);

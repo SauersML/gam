@@ -110,6 +110,7 @@ fn fit_options(outer_iters: usize) -> FitOptions {
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     }
 }
 

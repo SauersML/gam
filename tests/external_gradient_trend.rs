@@ -66,6 +66,7 @@ fn analytic_gradient_matchescost_trend() {
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     };
 
     let analytic = evaluate_externalgradient(
@@ -158,6 +159,7 @@ fn hypothesis_analytic_gradient_matchescost_trend() {
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     };
 
     let mut same_sign = 0usize;

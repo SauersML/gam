@@ -528,6 +528,7 @@ fn gaussian_reml_fit_blocks_forward_native(
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     };
     let offset = Array1::<f64>::zeros(n_rows);
     let fit = gam::estimate::fit_gamwith_heuristic_lambdas(

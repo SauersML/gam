@@ -59,6 +59,7 @@ fn probit_fit_and_predict_fast_integration() {
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         },
     )
     .expect("probit fit should succeed");
@@ -272,6 +273,7 @@ fn cloglog_fit_and_predict_fast_integration() {
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         },
     )
     .expect("cloglog fit should succeed");
