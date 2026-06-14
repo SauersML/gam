@@ -64,16 +64,21 @@
 //!   for: at σ = 0.08, |κ⋆| ≤ 4 needs n ≳ 1e3; halving σ quadruples the n
 //!   needed for the same |κ⋆|.
 //!
-//! * **Tolerances.** Recovery bias is O(1/n) plus an O(σ²) chart-curvature bias,
-//!   so the band `|κ̂ − κ⋆| ≤ 0.9 + 0.35·|κ⋆|` (absolute floor + relative slope)
-//!   is loose enough to never flake on a correctly-centred estimator yet tight
-//!   enough to catch a sign flip, a rail, or a wrong-regime estimate. Coverage
-//!   is asserted ≥ 0.85 empirically against the 0.95 nominal level (a
-//!   conservative bar that admits Monte-Carlo slack at the replicate counts
-//!   used while still failing a grossly anticonservative CI). The κ = 0 size is
-//!   asserted ≤ 0.25 (vs α = 0.05 nominal; generous for the replicate count but
-//!   well below the ~1.0 a broken/degenerate test would show), and power at
-//!   |κ⋆| = 4 is asserted ≥ 0.60.
+//! * **Tolerances (Monte-Carlo-se-anchored, not arbitrary).** Recovery bias is
+//!   O(1/n) plus an O(σ²) chart-curvature bias, so the band
+//!   `|κ̂ − κ⋆| ≤ 0.9 + 0.35·|κ⋆|` (absolute floor + relative slope) is loose
+//!   enough to never flake on a correctly-centred estimator yet tight enough to
+//!   catch a sign flip, a rail, or a wrong-regime estimate. The coverage/size
+//!   loops use R = 80 replicates, whose binomial MC standard error
+//!   (√(p(1−p)/R) ≈ 0.024 near both 0.95 and 0.05) sets every Monte-Carlo bound:
+//!   coverage is asserted in [0.88, 0.995] against the 0.95 nominal level (the
+//!   floor ~2.9 MC-se below nominal catches an anticonservative CI; the ceiling
+//!   forces the Wilks interval to MISS ≈5% of the time, catching an over-wide
+//!   one), and the κ = 0 size is asserted ≤ 0.175 (~5 MC-se above α = 0.05 — far
+//!   below the ≈1.0 a broken test, or the ≳0.25 a grossly anticonservative test,
+//!   would show). Power at |κ⋆| = 4 is asserted ≥ 0.60. The resolvable-n law
+//!   `info ∝ n·σ⁴` is what makes σ = 0.08, n = 1500 sufficient to separate these
+//!   rates from their null values; halving σ would need 16× the n to hold them.
 
 use gam::geometry::constant_curvature::ConstantCurvature;
 use gam::geometry::manifold::RiemannianManifold;
@@ -237,7 +242,14 @@ fn response_curvature_recovers_and_is_monotone_across_kappa_grid() {
 #[test]
 fn response_curvature_profile_ci_covers_at_nominal_rate() {
     let truths = [-2.0_f64, 0.0, 2.0];
-    let replicates = 40usize;
+    // R = 80: the binomial MC standard error of a 0.95-coverage estimate is
+    // √(0.95·0.05/80) ≈ 0.0244, so the ≥0.88 floor sits ~2.9 MC-se below the 0.95
+    // nominal level (admits honest Monte-Carlo slack while failing any interval
+    // whose true coverage is ≤ ~0.83, i.e. grossly anticonservative). The ≤1.0
+    // ceiling is exercised by the UPPER bound below: a correct Wilks interval
+    // covers ≈0.95, NOT ≈1.0 — an interval that never misses is over-wide and the
+    // χ²₁ calibration is wrong in the conservative direction.
+    let replicates = 80usize;
     let n = 1500usize;
 
     println!("\n#944 response-curvature CI coverage (dim={DIM}, n={n}, σ={SIGMA}, R={replicates}):");
@@ -257,9 +269,19 @@ fn response_curvature_profile_ci_covers_at_nominal_rate() {
         let rate = covered as f64 / replicates as f64;
         println!("  {k_star:5.1}     {covered:3}/{replicates}      {rate:.3}");
         assert!(
-            rate >= 0.85,
-            "κ⋆={k_star}: 95% profile CI covered only {rate:.3} (<0.85 of replicates) — \
-             anticonservative interval",
+            rate >= 0.88,
+            "κ⋆={k_star}: 95% profile CI covered only {rate:.3} (<0.88 of {replicates} replicates) — \
+             anticonservative interval (true coverage well below the 0.95 nominal level)",
+        );
+        // Upper coverage bound: a Wilks χ²₁ interval at nominal 0.95 must MISS
+        // sometimes. Covering every replicate (rate ≈ 1.0) at this R means the
+        // interval is systematically too wide (conservative mis-calibration). The
+        // ceiling 0.995 ≈ nominal + 1.8·MC-se admits MC luck but flags a CI that
+        // never errs.
+        assert!(
+            rate <= 0.995,
+            "κ⋆={k_star}: 95% profile CI covered {rate:.3} (>0.995) — over-conservative interval, \
+             a correctly-calibrated χ²₁ Wilks CI must miss ≈5% of the time",
         );
     }
 }
@@ -277,7 +299,13 @@ fn response_curvature_profile_ci_covers_at_nominal_rate() {
 /// Both rates are printed for the report.
 #[test]
 fn response_curvature_flatness_test_holds_size_and_has_power() {
-    let replicates = 40usize;
+    // R = 80: the binomial MC standard error of a true-α=0.05 size estimate is
+    // √(0.05·0.95/80) ≈ 0.0244. The ≤0.175 bound sits ~5 MC-se above the 0.05
+    // nominal level — generous enough to never flake on a correctly-calibrated
+    // interior χ²₁ test, but FAR below the ≈1.0 a broken/degenerate (or grossly
+    // anticonservative, true-size ≳0.25) test would show. This replaces the prior
+    // 5×-nominal 0.25 bound, which would have passed a test with true size 0.20.
+    let replicates = 80usize;
     let n = 1500usize;
 
     // ── SIZE at the flat null κ⋆ = 0 ──────────────────────────────────────────
@@ -297,8 +325,9 @@ fn response_curvature_flatness_test_holds_size_and_has_power() {
          {rejections}/{replicates} = {size:.3} (nominal α=0.05)"
     );
     assert!(
-        size <= 0.25,
-        "flatness test mis-sized at κ⋆=0: empirical size {size:.3} ≫ α (spurious rejection of flat)"
+        size <= 0.175,
+        "flatness test mis-sized at κ⋆=0: empirical size {size:.3} ≫ α=0.05 (>0.175, ~5 MC-se \
+         above nominal) — spurious rejection of flat data"
     );
 
     // ── POWER at the strongly-curved alternatives |κ⋆| = 4 ────────────────────
