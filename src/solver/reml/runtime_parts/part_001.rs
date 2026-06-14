@@ -3526,6 +3526,7 @@ impl<'a> RemlState<'a> {
             analytic_penalty_registry_fingerprint: 0,
             persistent_warm_start_loaded: AtomicBool::new(false),
             persistent_warm_start_store_suppression: AtomicUsize::new(0),
+            persistent_warm_start_disk_enabled: AtomicBool::new(false),
         })
     }
 
@@ -4305,8 +4306,28 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
         }
+        // Opt-in only: opening the cross-process outer-iterate session also
+        // opens the shared on-disk `WarmStartStore` (dir/eviction scan). Skip
+        // it for in-process fits that never attached a cache session
+        // (#1082/#1114).
+        if !self
+            .persistent_warm_start_disk_enabled
+            .load(Ordering::Relaxed)
+        {
+            return None;
+        }
         let key = self.persistent_warm_start_cache_key()?;
         crate::solver::persistent_warm_start::open_outer_session(&key)
+    }
+
+    /// Engage the cross-process ON-DISK warm-start layer. Called by the
+    /// workflow dispatcher only when the caller attached a cache session (the
+    /// magic-by-default opt-in signal for cross-process / repeat-fit
+    /// persistence). Until this is set the disk load/store/eviction-scan path
+    /// is skipped entirely and only the in-memory warm start is used.
+    pub(crate) fn enable_persistent_warm_start_disk(&self) {
+        self.persistent_warm_start_disk_enabled
+            .store(true, Ordering::Relaxed);
     }
 
     fn persistent_warm_start_cache_key(&self) -> Option<String> {
@@ -4414,6 +4435,16 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return;
         }
+        // Cross-process disk restore is opt-in (a cache session was attached).
+        // Without it, skip the `persistent_store()` open + dir/eviction scan
+        // entirely — the in-memory warm start fully serves an in-process fit
+        // (#1082/#1114).
+        if !self
+            .persistent_warm_start_disk_enabled
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
         if self
             .persistent_warm_start_loaded
             .swap(true, Ordering::Relaxed)
@@ -4475,6 +4506,19 @@ impl<'a> RemlState<'a> {
 
     fn store_persistent_warm_start(&self) {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        // Cross-process disk checkpoint is opt-in (a cache session was
+        // attached). Without it, never touch the shared `WarmStartStore`:
+        // `store_record` opens the store and pays an eviction/dir scan that is
+        // O(cache entries) on a network FS, and a throwaway in-process fit
+        // (CI-coverage replicate, posterior probe) writes a record nothing will
+        // ever read — pure overhead that, accumulated across a refit loop,
+        // dominated the profile (#1082/#1114).
+        if !self
+            .persistent_warm_start_disk_enabled
+            .load(Ordering::Relaxed)
+        {
             return;
         }
         if self
