@@ -77,6 +77,14 @@ use faer::Side;
 /// the certified ball; at or above it the start is uncertified.
 pub const KANTOROVICH_THRESHOLD: f64 = 0.5;
 
+/// Row count at or above which the corpus-rate certified-encode batch
+/// (`certified_encode_batch` / `certified_encode_with_index`) fans its
+/// per-row encodes out over rayon. Below this the per-row Newton + chart
+/// routing is cheap enough that the fan-out overhead does not pay; matched to
+/// the same order as the arrow-Schur `SCHUR_MATVEC_PARALLEL_ROW_MIN` gate so
+/// short batches inside an outer atom-level fan-out stay sequential.
+const ENCODE_BATCH_PARALLEL_ROW_MIN: usize = 256;
+
 /// A chart region on an atom's latent coordinate: a center `t_c` plus a
 /// certified in-chart radius. Over the ball `‖t − t_c‖ ≤ radius` the jet sup
 /// bounds returned by [`BasisHessianLipschitz`] hold, so the Kantorovich
@@ -1102,13 +1110,49 @@ impl EncodeAtlas {
             ));
         }
         let d = atom.latent_dim;
+        // Per-row encode is independent against a frozen dictionary (#1010), so
+        // the corpus-rate batch fans out over rows (#1026 amortized-encoder leg /
+        // #977 Stage-3 corpus encode). Each row produces an owned `(t, certified)`
+        // pair; results are assembled back in row order so the output is
+        // bit-identical run-to-run regardless of thread scheduling. Stay
+        // sequential inside a rayon worker (e.g. when an outer atom-level fan-out
+        // owns the pool) to avoid nested oversubscription. The first row that
+        // fails to encode propagates its error deterministically.
+        let encode_rows = |range: std::ops::Range<usize>| -> Result<Vec<(Array1<f64>, bool)>, String> {
+            range
+                .map(|row| {
+                    let (t, cert) = self.certified_encode_row(
+                        atom,
+                        atom_index,
+                        targets.row(row),
+                        amplitudes[row],
+                    )?;
+                    Ok((t, cert.certified()))
+                })
+                .collect()
+        };
+        let rows: Vec<(Array1<f64>, bool)> =
+            if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
+                use rayon::prelude::*;
+                const CHUNK: usize = 256;
+                let n_chunks = n.div_ceil(CHUNK);
+                let chunked: Vec<Vec<(Array1<f64>, bool)>> = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|c| {
+                        let start = c * CHUNK;
+                        let end = (start + CHUNK).min(n);
+                        encode_rows(start..end)
+                    })
+                    .collect::<Result<_, _>>()?;
+                chunked.into_iter().flatten().collect()
+            } else {
+                encode_rows(0..n)?
+            };
         let mut coords = Array2::<f64>::zeros((n, d));
         let mut certified = Vec::with_capacity(n);
-        for row in 0..n {
-            let (t, cert) =
-                self.certified_encode_row(atom, atom_index, targets.row(row), amplitudes[row])?;
+        for (row, (t, cert)) in rows.into_iter().enumerate() {
             coords.row_mut(row).assign(&t);
-            certified.push(cert.certified());
+            certified.push(cert);
         }
         Ok(EncodeResult::from_rows(coords, certified))
     }
@@ -1124,7 +1168,7 @@ impl EncodeAtlas {
     /// order the atlas was built from and the sketch/index were built over).
     /// A row with no LSH proposal (empty bucket) is flagged uncertified — it
     /// routes to the exact multi-start fallback, never a silent wrong encode.
-    pub fn certified_encode_with_index<S: AtomFrameSketch>(
+    pub fn certified_encode_with_index<S: AtomFrameSketch + Sync>(
         &self,
         atoms: &[SaeManifoldAtom],
         index: &SaeCandidateIndex,
@@ -1141,39 +1185,83 @@ impl EncodeAtlas {
             ));
         }
         let budget = auto_candidate_budget(atoms.len().max(1));
+        // LSH-routed per-row encode is independent across rows (sublinear atom
+        // selection + frozen-dictionary in-atom Newton), so the corpus-rate batch
+        // fans out over rows (#1026 amortized-encoder/routing leg / #977 Stage-3).
+        // `None` coords (no LSH candidate) carry through as a zeroed row flagged
+        // uncertified — identical to the sequential semantics. Results assemble
+        // back in row order (bit-identical run-to-run); the first encode error
+        // propagates deterministically. Stay sequential inside a rayon worker to
+        // avoid nested oversubscription.
+        let encode_rows =
+            |range: std::ops::Range<usize>| -> Result<Vec<Option<(Array1<f64>, bool)>>, String> {
+                range
+                    .map(|row| {
+                        // The row direction is the (unit-tolerant) target; the LSH
+                        // ranks atoms by how much of that direction lies in each
+                        // atom's column space. `propose` returns the top-`budget`
+                        // atom ids by exact frame alignment.
+                        let proposal = index.propose(sketch, targets.row(row), budget, true);
+                        let Some(&best_atom) = proposal.proposed.first() else {
+                            // No LSH candidate: flag for the exact fallback.
+                            return Ok(None);
+                        };
+                        let atom = atoms.get(best_atom).ok_or_else(|| {
+                            format!(
+                                "certified_encode_with_index: proposed atom {best_atom} out of range"
+                            )
+                        })?;
+                        let (t, cert) = self.certified_encode_row(
+                            atom,
+                            best_atom,
+                            targets.row(row),
+                            amplitudes[row],
+                        )?;
+                        // Heterogeneous-atom dictionaries with different latent_dim
+                        // per atom are not supported by the batched API: the caller
+                        // declares one shared `latent_dim` for the output tensor.
+                        // Silently zeroing the coord row while recording a
+                        // certified=true flag would produce corrupted
+                        // reconstructions downstream — error loudly instead.
+                        if t.len() != latent_dim {
+                            return Err(format!(
+                                "certified_encode_with_index: atom {best_atom} returned t.len()={} \
+                                 but declared latent_dim={latent_dim}; heterogeneous-dim \
+                                 dictionaries are not supported by this batched encode path",
+                                t.len()
+                            ));
+                        }
+                        Ok(Some((t, cert.certified())))
+                    })
+                    .collect()
+            };
+        let rows: Vec<Option<(Array1<f64>, bool)>> =
+            if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
+                use rayon::prelude::*;
+                const CHUNK: usize = 256;
+                let n_chunks = n.div_ceil(CHUNK);
+                let chunked: Vec<Vec<Option<(Array1<f64>, bool)>>> = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|c| {
+                        let start = c * CHUNK;
+                        let end = (start + CHUNK).min(n);
+                        encode_rows(start..end)
+                    })
+                    .collect::<Result<_, _>>()?;
+                chunked.into_iter().flatten().collect()
+            } else {
+                encode_rows(0..n)?
+            };
         let mut coords = Array2::<f64>::zeros((n, latent_dim));
         let mut certified = Vec::with_capacity(n);
-        for row in 0..n {
-            // The row direction is the (unit-tolerant) target; the LSH ranks
-            // atoms by how much of that direction lies in each atom's column
-            // space. `propose` returns the top-`budget` atom ids by exact frame
-            // alignment.
-            let proposal = index.propose(sketch, targets.row(row), budget, true);
-            let Some(&best_atom) = proposal.proposed.first() else {
-                // No LSH candidate: flag for the exact fallback.
-                certified.push(false);
-                continue;
-            };
-            let atom = atoms.get(best_atom).ok_or_else(|| {
-                format!("certified_encode_with_index: proposed atom {best_atom} out of range")
-            })?;
-            let (t, cert) =
-                self.certified_encode_row(atom, best_atom, targets.row(row), amplitudes[row])?;
-            // Heterogeneous-atom dictionaries with different latent_dim per atom
-            // are not supported by the batched API: the caller declares one
-            // shared `latent_dim` for the output tensor.  Silently zeroing the
-            // coord row while recording a certified=true flag would produce
-            // corrupted reconstructions downstream — error loudly instead.
-            if t.len() != latent_dim {
-                return Err(format!(
-                    "certified_encode_with_index: atom {best_atom} returned t.len()={} \
-                     but declared latent_dim={latent_dim}; heterogeneous-dim \
-                     dictionaries are not supported by this batched encode path",
-                    t.len()
-                ));
+        for (row, slot) in rows.into_iter().enumerate() {
+            match slot {
+                Some((t, cert)) => {
+                    coords.row_mut(row).assign(&t);
+                    certified.push(cert);
+                }
+                None => certified.push(false),
             }
-            coords.row_mut(row).assign(&t);
-            certified.push(cert.certified());
         }
         Ok(EncodeResult::from_rows(coords, certified))
     }
