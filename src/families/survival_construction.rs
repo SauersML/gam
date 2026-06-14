@@ -1607,53 +1607,126 @@ pub fn build_survival_time_basis(
                 if s_mat.nrows() != p_time_full + 1 || s_mat.ncols() != p_time_full + 1 {
                     continue;
                 }
-                // Step 1: restrict S_B[1:,1:] to the retained I-spline columns.
-                // Symmetrize to remove any accumulated floating-point asymmetry.
+                // I-spline value-space penalty, computed in the CORRECT order
+                // (gam#979). The B-spline value coefficients are the cumulative
+                // sum of the I-spline increment coefficients, `c = L γ_full`, where
+                // `L` is the FULL `p_time_full × p_time_full` LOWER-triangular
+                // all-ones cumsum matrix (`L[i,j] = 1 iff j ≤ i`, so
+                // `c_i = Σ_{j≤i} γ_j`). The value-space curvature penalty on the
+                // full increment vector is the symmetric congruence
+                //
+                //   `S_I_full = Lᵀ · S_B[1:,1:] · L`,
+                //
+                // which is PSD because `S_B[1:,1:]` is a principal submatrix of the
+                // PSD `S_B = D₂ᵀD₂` and congruence by any matrix preserves PSD.
+                //
+                // CRITICAL ORDERING (the gam#979 indefiniteness bug): the retained
+                // columns `keep_cols` must be selected as a PRINCIPAL SUBMATRIX of
+                // the FULL congruence `S_I_full` — i.e. congruence FIRST, selection
+                // SECOND. The previous code selected `keep_cols` from `S_B[1:,1:]`
+                // first and then applied a `p_time × p_time` cumsum to that
+                // already-reduced block. Because the cumsum `L` couples every
+                // increment, restricting the increment index set BEFORE the cumsum
+                // does NOT commute with it: the reduced operator is a different,
+                // generally INDEFINITE matrix (measured `s0_min_eval = −9.8e7`),
+                // which makes `½γᵀS_Iγ` unbounded below and the penalized survival
+                // NLL diverge (β drifts up the negative-eigenvalue mode, the inner
+                // joint-Newton follows the unbounded objective, the outer REML never
+                // terminates — the #979 hang). Doing the congruence on the full γ
+                // and then taking the `keep_cols` principal submatrix restores the
+                // PSD guarantee (a principal submatrix of a PSD matrix is PSD).
                 let s_increment = s_mat.slice(s![1.., 1..]);
-                let mut s_local = Array2::<f64>::zeros((p_time, p_time));
+                if s_increment.nrows() != p_time_full || s_increment.ncols() != p_time_full {
+                    return Err(format!(
+                        "internal error: ispline penalty increment block must be {p_time_full}x{p_time_full}, got {}x{}",
+                        s_increment.nrows(),
+                        s_increment.ncols(),
+                    ));
+                }
+                // Symmetrize the (already-symmetric) source to absorb any
+                // accumulated floating-point asymmetry before the congruence.
+                let mut s_full = Array2::<f64>::zeros((p_time_full, p_time_full));
+                for i in 0..p_time_full {
+                    for j in 0..p_time_full {
+                        s_full[[i, j]] =
+                            0.5 * (s_increment[[i, j]] + s_increment[[j, i]]);
+                    }
+                }
+                // S_mid = S_B[1:,1:] · L  (right-multiply by lower-triangular
+                // cumsum): (S·L)[i,j] = Σ_k S[i,k]·L[k,j] = Σ_{k≥j} S[i,k]
+                // because L[k,j] = 1 iff j ≤ k.
+                let mut s_mid_full = Array2::<f64>::zeros((p_time_full, p_time_full));
+                for i in 0..p_time_full {
+                    for j in 0..p_time_full {
+                        let mut v = 0.0;
+                        for k in j..p_time_full {
+                            v += s_full[[i, k]];
+                        }
+                        s_mid_full[[i, j]] = v;
+                    }
+                }
+                // S_I_full = Lᵀ · S_mid = Lᵀ · S · L:
+                // (Lᵀ·S_mid)[i,j] = Σ_k Lᵀ[i,k]·S_mid[k,j] = Σ_{k≥i} S_mid[k,j]
+                // because Lᵀ[i,k] = L[k,i] = 1 iff i ≤ k.
+                let mut s_full_congruent = Array2::<f64>::zeros((p_time_full, p_time_full));
+                for i in 0..p_time_full {
+                    for j in 0..p_time_full {
+                        let mut v = 0.0;
+                        for k in i..p_time_full {
+                            v += s_mid_full[[k, j]];
+                        }
+                        s_full_congruent[[i, j]] = v;
+                    }
+                }
+                // Principal submatrix on the retained (shape-varying) columns.
+                let mut local = Array2::<f64>::zeros((p_time, p_time));
                 for (i_new, &i_old) in keep_cols.iter().enumerate() {
                     for (j_new, &j_old) in keep_cols.iter().enumerate() {
-                        let v = 0.5 * (s_increment[[i_old, j_old]] + s_increment[[j_old, i_old]]);
-                        s_local[[i_new, j_new]] = v;
-                    }
-                }
-                // Step 2: congruence transform S_I = L^T s_local L, where L is
-                // the p_time×p_time lower-triangular cumsum matrix (L[i,j]=1 if
-                // j≤i, else 0). Compute as S_intermediate = s_local @ L, then
-                // S_I = L^T @ S_intermediate.
-                let mut s_mid = Array2::<f64>::zeros((p_time, p_time));
-                for i in 0..p_time {
-                    for j in 0..p_time {
-                        // (s_local @ L)[i, j] = sum_{k=0}^{j} s_local[i, k]
-                        // because L[k, j] = 1 iff k <= j.
-                        let mut v = 0.0;
-                        for k in 0..=j {
-                            v += s_local[[i, k]];
-                        }
-                        s_mid[[i, j]] = v;
-                    }
-                }
-                let mut local = Array2::<f64>::zeros((p_time, p_time));
-                for i in 0..p_time {
-                    for j in 0..p_time {
-                        // (L^T @ s_mid)[i, j] = sum_{k=i}^{p_time-1} s_mid[k, j]
-                        // because (L^T)[i, k] = 1 iff k >= i.
-                        let mut v = 0.0;
-                        for k in i..p_time {
-                            v += s_mid[[k, j]];
-                        }
-                        local[[i, j]] = v;
-                    }
-                }
-                // Symmetrize to absorb any residual floating-point asymmetry.
-                for i in 0..p_time {
-                    for j in (i + 1)..p_time {
-                        let avg = 0.5 * (local[[i, j]] + local[[j, i]]);
-                        local[[i, j]] = avg;
-                        local[[j, i]] = avg;
+                        // Symmetrize on the way out to absorb residual
+                        // floating-point asymmetry.
+                        local[[i_new, j_new]] = 0.5
+                            * (s_full_congruent[[i_old, j_old]]
+                                + s_full_congruent[[j_old, i_old]]);
                     }
                 }
                 penalties.push(local);
+            }
+
+            // PSD contract (gam#979). The value-space congruence Lᵀ S_B[1:,1:] L,
+            // restricted to a principal submatrix, is positive semidefinite by
+            // construction. A negative eigenvalue here means the construction has
+            // regressed to the increment-space / wrong-ordering form that made the
+            // penalized survival NLL unbounded below (the #979 divergence). Verify
+            // it here, at construction, so the defect can never silently reach the
+            // inner solver again. The tolerance is the same relative scale the
+            // nullspace detection below uses; a numerically tiny negative (round-off
+            // on the genuine 1-D null direction) is allowed, a structural one is not.
+            for (idx, s_mat) in penalties.iter().enumerate() {
+                let p = s_mat.nrows();
+                if p == 0 {
+                    continue;
+                }
+                if let Ok((evals, _)) =
+                    crate::faer_ndarray::FaerEigh::eigh(s_mat, faer::Side::Lower)
+                {
+                    let evals_slice: &[f64] = evals.as_slice().ok_or_else(|| {
+                        "internal error: ispline penalty eigenvalues not contiguous".to_string()
+                    })?;
+                    let max_ev = evals_slice
+                        .iter()
+                        .copied()
+                        .fold(0.0_f64, |a, b| a.max(b.abs()))
+                        .max(1.0);
+                    let min_ev = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
+                    let neg_tol = -100.0 * (p as f64) * f64::EPSILON * max_ev;
+                    if min_ev < neg_tol {
+                        return Err(format!(
+                            "internal error (gam#979): assembled ispline time-block penalty {idx} is \
+                             indefinite (min eigenvalue {min_ev:.3e} < tol {neg_tol:.3e}, max |eig| \
+                             {max_ev:.3e}); the value-space congruence Lᵀ S_B[1:,1:] L must be PSD"
+                        ));
+                    }
+                }
             }
 
             // The value-space penalty S_I = L^T S_B[1:,1:] L has a 1-dimensional
