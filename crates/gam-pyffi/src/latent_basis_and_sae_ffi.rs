@@ -1534,6 +1534,24 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
     }
 }
 
+/// The canonical lowercase string name of an atom basis kind — the inverse of
+/// [`sae_atom_basis_kind_from_str`] for the round-trippable kinds, and the
+/// string the python `from_payload` boundary reads under each atom's
+/// `"basis_kind"` key and each plan's `"kind"` key. Derived from the FITTED
+/// atom (not the user's input metadata) so a structure-search-grown / shrunk
+/// dictionary serializes its DISCOVERED per-atom topology, not the input one.
+fn sae_atom_basis_kind_name(kind: &SaeAtomBasisKind) -> String {
+    match kind {
+        SaeAtomBasisKind::Periodic => "periodic".to_string(),
+        SaeAtomBasisKind::Duchon => "duchon".to_string(),
+        SaeAtomBasisKind::Sphere => "sphere".to_string(),
+        SaeAtomBasisKind::Torus => "torus".to_string(),
+        SaeAtomBasisKind::EuclideanPatch => "euclidean_patch".to_string(),
+        SaeAtomBasisKind::Poincare => "poincare".to_string(),
+        SaeAtomBasisKind::Precomputed(name) => name.clone(),
+    }
+}
+
 /// Default per-axis harmonic order for a torus atom (Φ has `(2H+1)^d`
 /// columns). Three harmonics per axis gives a 7-column 1-D factor and a
 /// 49-column tensor basis at `d=2`, which is the smallest expansion that
@@ -2000,6 +2018,12 @@ fn sae_manifold_fit_inner<'py>(
         ));
     }
     let k_atoms = atom_dim.len();
+    // The SEED dictionary size, captured before the structure search may grow or
+    // shrink it (#977). Used to map a structure-search-BORN atom (index ≥
+    // `seed_k_atoms`) back to its template plan when serializing the variable-K
+    // `atom_plans`: births clone atom 0's basis, so a born atom's build plan is
+    // the seed template's, re-derived from the fitted atom below.
+    let seed_k_atoms = k_atoms;
     if k_atoms == 0 {
         return Err(py_value_error(
             "sae_manifold_fit requires at least one atom".to_string(),
@@ -2403,24 +2427,46 @@ fn sae_manifold_fit_inner<'py>(
         .map_err(py_value_error)?;
     }
 
-    // #997 — evidence-guarded structure search around the production fit. Harvest
-    // death (diverged ARD ∪ terminal collapse) and fusion (co-activation)
-    // proposals from the fitted dictionary, then run the e-gated move engine over
-    // a held-out estimation/evaluation row split. Births and fissions (which GROW
-    // the atom count) are held out of the production landing so the returned
-    // dictionary shape stays stable for the python `from_payload` boundary;
-    // deaths and fusions are demote-never-reject / fold moves that keep K, so the
-    // returned `atoms`/`logits`/`assignments` stay K-shaped while the ledger
-    // certifies the proposal stream. The SearchLedger (+ the joint fit's collapse
+    // #977 / #997 — evidence-guarded structure search around the production fit:
+    // the genuine dictionary learner. Harvest deaths (diverged ARD ∪ terminal
+    // collapse), fusions (co-activation), fission audits (absorption asymmetry),
+    // and BIRTHS (whitened residual-factor subspace), then run the e-gated move
+    // engine over a held-out estimation/evaluation row split. Every move — and in
+    // particular every birth/fission that GROWS K — must pass the #984 held-out
+    // e-value gate ([`run_atom_birth_gate`], invoked inside [`search`] for births,
+    // fissions, and fusions) before it lands; deaths demote-never-reject. So K is
+    // DISCOVERED from the data (grown by certified births, shrunk by demoted
+    // deaths / fused atoms) rather than pinned at the user's input K, and the
+    // returned `atoms`/`logits`/`assignments`/`atom_plans` reflect the discovered
+    // K (the variable-K payload boundary below threads the post-search shape
+    // through `from_payload`). The SearchLedger (+ the joint fit's collapse
     // events) is serialized onto the payload as the honesty surface — never a
-    // silent restructure. Conservative by construction: the gates rarely certify,
-    // so the common case returns the fit unchanged with an all-contested ledger.
+    // silent restructure. Conservative by construction: only evidence-earning
+    // atoms are born; the gates rarely certify, so the common all-contested case
+    // returns the fit unchanged.
+    //
+    // Move budgets are magic-by-default — derived from the fitted dictionary, not
+    // surfaced as user flags. The per-round breadth scales with the current atom
+    // count so a small dictionary proposes few candidates and a large one a few
+    // more, while `max_moves` (below) caps how many of those land per round and
+    // `max_rounds` bounds the harvest→gate→refit loop. A genuine residual factor
+    // earns its atom across rounds; a spurious one fails the held-out gate and is
+    // recorded contested.
     let mut structure_ledger = gam::inference::structure_evidence::StructureLedger::new();
     let structure_search_json = {
+        // Per-round harvest breadth derived from the fitted K (magic-by-default):
+        // propose at most a handful of each move kind, scaled gently with the
+        // dictionary size, with a small fixed floor so even a K=1 fit can grow
+        // (the #1117 rank-revealing basis makes K>1 fits converge, so births no
+        // longer hit the old K>1 wall). The e-gate, not these caps, decides what
+        // lands; the caps only keep the proposal stream finite.
+        let k_now = term.k_atoms().max(1);
+        let births_per_round = (k_now + 1).min(4);
+        let fissions_per_round = k_now.min(4);
         let harvest_params = gam::solver::structure_harvest::HarvestParams {
             max_fusions: 4,
-            max_fissions: 0,
-            max_births: 0,
+            max_fissions: fissions_per_round,
+            max_births: births_per_round,
         };
         let refit_params = gam::solver::structure_harvest::ProductionRefitParams {
             inner_max_iter: max_iter,
@@ -2428,8 +2474,15 @@ fn sae_manifold_fit_inner<'py>(
             ridge_ext_coord,
             ridge_beta,
         };
+        // Moves that may LAND this round (accepted births/fissions/fusions +
+        // demoted deaths); remaining proposals are recorded `Deferred` and
+        // replayed next round. Sized to the current dictionary plus headroom for
+        // the new birth/fission proposals so a single round can both prune a dead
+        // atom and grow a genuinely-supported one. Magic-by-default — a function
+        // of the fitted K, never a user flag.
+        let max_moves = k_now + births_per_round + fissions_per_round;
         let budget = gam::solver::structure_search::MoveBudget {
-            max_moves: term.k_atoms().max(1),
+            max_moves,
             alpha: 0.05,
         };
         let config = gam::solver::structure_harvest::RoundDriverConfig {
@@ -2466,6 +2519,27 @@ fn sae_manifold_fit_inner<'py>(
     // computed over ALL rows (the mask is an internal split device, not a
     // property of the returned fit).
     term.clear_row_loss_weights();
+
+    // #977 — VARIABLE-K boundary. The structure search above may have GROWN K
+    // (certified births / fissions) or shrunk it (demoted deaths fold to ~0
+    // routing — they keep their index but carry no mass). The returned payload
+    // must reflect the DISCOVERED dictionary, not the user's input K, so every
+    // downstream per-atom field is re-derived FROM THE FITTED TERM here. The
+    // input `k_atoms` / `atom_basis` / `atom_dim` described the seed dictionary;
+    // they are stale the moment a birth lands. `term.k_atoms()` is the source of
+    // truth from this point on, and the per-atom basis-kind / active-dim vectors
+    // are read off each fitted atom (born atoms inherit a template basis at
+    // birth; their topology is then adjudicated by the post-fit curved-vs-linear
+    // hybrid-split pass — see `set_atom_inner_fits` below — and reported on the
+    // payload's `hybrid_split` key, so the dictionary is genuinely heterogeneous
+    // rather than all-circle).
+    let k_atoms = term.k_atoms();
+    let atom_basis: Vec<String> = term
+        .atoms
+        .iter()
+        .map(|atom| sae_atom_basis_kind_name(&atom.basis_kind))
+        .collect();
+    let atom_dim: Vec<usize> = term.atoms.iter().map(|atom| atom.latent_dim).collect();
 
     term.set_certificate_dispersion(shape_uncertainty.dispersion)
         .map_err(py_value_error)?;
@@ -2628,19 +2702,29 @@ fn sae_manifold_fit_inner<'py>(
         // Posterior shape uncertainty for this atom: φ-scaled decoder
         // covariance Cov(β_k) and the closed-form ambient band (coords / mean /
         // per-channel sd) along the atom's on-atom coordinates.
-        let unc = &shape_uncertainty.atoms[atom_idx];
-        // Omitted (not set) above the SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES
-        // budget — the python reader treats the key as optional and the band
-        // quantities below remain exact.
-        if let Some(cov) = &unc.decoder_covariance {
-            atom_dict.set_item("decoder_covariance", cov.clone().into_pyarray(py))?;
+        //
+        // #977 variable-K: `shape_uncertainty` was assembled from the PRE-search
+        // joint-Hessian Schur factor and is indexed by the SEED dictionary. A
+        // structure-search-BORN atom (index ≥ the seed K) has no entry, so the
+        // band keys are simply omitted for it — the python reader treats every
+        // `shape_band_*` / `decoder_covariance` key as optional (`_opt_arr`), so
+        // a born atom returns `None` bands rather than a stale or panicking read.
+        // The atom's decoder, coordinates, assignments, basis kind, and active
+        // dim (all read from the fitted term above) are exact regardless.
+        if let Some(unc) = shape_uncertainty.atoms.get(atom_idx) {
+            // Omitted (not set) above the SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES
+            // budget — the python reader treats the key as optional and the band
+            // quantities below remain exact.
+            if let Some(cov) = &unc.decoder_covariance {
+                atom_dict.set_item("decoder_covariance", cov.clone().into_pyarray(py))?;
+            }
+            atom_dict.set_item(
+                "shape_band_coords",
+                unc.band_coords.clone().into_pyarray(py),
+            )?;
+            atom_dict.set_item("shape_band_mean", unc.band_mean.clone().into_pyarray(py))?;
+            atom_dict.set_item("shape_band_sd", unc.band_sd.clone().into_pyarray(py))?;
         }
-        atom_dict.set_item(
-            "shape_band_coords",
-            unc.band_coords.clone().into_pyarray(py),
-        )?;
-        atom_dict.set_item("shape_band_mean", unc.band_mean.clone().into_pyarray(py))?;
-        atom_dict.set_item("shape_band_sd", unc.band_sd.clone().into_pyarray(py))?;
         atoms_py.append(atom_dict)?;
     }
 
@@ -2740,6 +2824,59 @@ fn sae_manifold_fit_inner<'py>(
         }
         out.set_item("certificates", certificate_ledger_dict(py, &ledger)?)?;
     }
+    // #977 — VARIABLE-K `atom_plans`, emitted from the POST-search dictionary so
+    // its length matches the returned `atoms` exactly (the python `from_payload`
+    // boundary zips `payload["atoms"]` with `plans[atom_idx]`, so a length
+    // mismatch from a grown K would IndexError). Each plan is re-derived from the
+    // fitted atom: `kind` + `latent_dim` straight off the atom, `basis_size` from
+    // its Φ width, `n_harmonics` recovered from the basis size for the harmonic
+    // families, and `duchon_centers` inherited from the seed template (a
+    // structure-search-born atom clones atom 0's basis, so it carries the seed
+    // template's centers). This REPLACES the old post-hoc seed-K plan list that
+    // `sae_manifold_fit_minimal` attached after the fact — that list was pinned
+    // at the input K and was exactly the plumbing constraint the #997 comment
+    // cited for disabling births; emitting the plans here makes variable K
+    // first-class with no truncation or padding.
+    let atom_plans_py = PyList::empty(py);
+    for (atom_idx, atom) in term.atoms.iter().enumerate() {
+        let entry = PyDict::new(py);
+        let kind = &atom.basis_kind;
+        let latent_dim = atom.latent_dim;
+        let basis_size = atom.basis_size();
+        let kind_name = sae_atom_basis_kind_name(kind);
+        // Recover the per-(axis-)harmonic order from the fitted basis width for
+        // the harmonic families; 0 for the non-harmonic kinds (the python reader
+        // only consults `n_harmonics` for periodic/torus atoms).
+        let n_harmonics = match kind {
+            SaeAtomBasisKind::Periodic => basis_size.saturating_sub(1) / 2,
+            SaeAtomBasisKind::Torus => {
+                // basis_size = (2H+1)^latent_dim; recover the per-axis 2H+1, then H.
+                match sae_torus_axis_basis_size(basis_size, latent_dim.max(1)) {
+                    Ok(axis_m) => axis_m.saturating_sub(1) / 2,
+                    Err(_) => 0,
+                }
+            }
+            _ => 0,
+        };
+        entry.set_item("kind", kind_name)?;
+        entry.set_item("latent_dim", latent_dim)?;
+        entry.set_item("n_harmonics", n_harmonics)?;
+        entry.set_item("basis_size", basis_size)?;
+        // Born atoms (index ≥ seed K) inherit atom 0's basis template, so they
+        // carry the seed template's Duchon centers (None for a periodic template).
+        let center_src = atom_idx.min(seed_k_atoms.saturating_sub(1));
+        match atom_centers.get(center_src).and_then(|c| c.as_ref()) {
+            Some(centers) => {
+                entry.set_item("duchon_centers", centers.clone().into_pyarray(py))?;
+            }
+            None => {
+                entry.set_item("duchon_centers", py.None())?;
+            }
+        }
+        atom_plans_py.append(entry)?;
+    }
+    out.set_item("atom_plans", atom_plans_py)?;
+
     // Contract keys the python `ManifoldSAE.from_payload` boundary reads
     // unconditionally (tightened in 23db2c80a, which rejected stale payload
     // shapes python-side without adding the producer side): the fitted atom
@@ -5290,37 +5427,15 @@ fn sae_manifold_fit_minimal<'py>(
         fisher_provenance.as_deref(),
         row_w,
     )?;
-    // Attach per-atom build plans so OOS predict can rebuild design without Python.
-    let plans_py = PyList::empty(py);
-    for plan in &plans {
-        let entry = PyDict::new(py);
-        let kind_name: &str = match &plan.kind {
-            SaeAtomBasisKind::Periodic => "periodic",
-            SaeAtomBasisKind::Duchon => "duchon",
-            SaeAtomBasisKind::Sphere => "sphere",
-            SaeAtomBasisKind::Torus => "torus",
-            SaeAtomBasisKind::EuclideanPatch => "euclidean_patch",
-            SaeAtomBasisKind::Poincare => "poincare",
-            SaeAtomBasisKind::Precomputed(_) => "precomputed",
-        };
-        entry.set_item("kind", kind_name)?;
-        entry.set_item("latent_dim", plan.latent_dim)?;
-        entry.set_item("n_harmonics", plan.n_harmonics)?;
-        entry.set_item("basis_size", plan.basis_size)?;
-        match &plan.duchon_centers {
-            Some(centers) => {
-                entry.set_item("duchon_centers", centers.clone().into_pyarray(py))?;
-            }
-            None => {
-                entry.set_item("duchon_centers", py.None())?;
-            }
-        }
-        plans_py.append(entry)?;
-    }
-    {
-        let result_bound = result_dict.bind(py);
-        result_bound.set_item("atom_plans", plans_py)?;
-    }
+    // #977 — the per-atom `atom_plans` are now emitted by `sae_manifold_fit_inner`
+    // FROM THE POST-SEARCH dictionary (variable K), so OOS predict can rebuild the
+    // design for the DISCOVERED atoms (births included) without Python. The old
+    // post-hoc attachment here re-derived plans from the seed `plans` (input K),
+    // which would shadow the grown dictionary with a too-short list and break the
+    // `from_payload` zip the moment a birth landed — exactly the plumbing
+    // constraint #997 cited. The seed `plans` still build the cold-start design
+    // and the per-atom Duchon centers threaded into the inner driver above; they
+    // are no longer the serialized plan surface.
     Ok(result_dict)
 }
 
