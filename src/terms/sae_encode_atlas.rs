@@ -527,10 +527,12 @@ fn family_jet_sups(atom: &SaeManifoldAtom, chart: &ChartRegion) -> Result<JetSup
             let ev = SphereChartEvaluator;
             JetSups::from_family(&ev, chart)
         }
-        EuclideanPatch => {
+        EuclideanPatch | Poincare => {
             // The patch width fixes max_degree implicitly; bound by a degree that
             // covers the column count (conservative). Degree d-patch column count
             // grows fast; we recover the smallest degree whose patch is ≥ m.
+            // Poincare atoms use the same tangent-coordinate polynomial decoder;
+            // their intrinsic smoothness differs in the penalty, not in Phi(t).
             let degree = euclidean_patch_degree(d, m);
             let ev = EuclideanPatchEvaluator::new(d, degree)?;
             JetSups::from_family(&ev, chart)
@@ -1233,7 +1235,7 @@ fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Array2<f64> {
     match &atom.basis_kind {
         Periodic | Torus => regular_product_grid(d, resolution, 0.0, 1.0, false),
         Sphere if d == 2 => sphere_latlon_grid(resolution),
-        Sphere | Duchon | EuclideanPatch | Precomputed(_) => {
+        Sphere | Duchon | EuclideanPatch | Poincare | Precomputed(_) => {
             // Unbounded / non-compact latents: a strided cover of a unit box
             // about the origin per axis. The certified radius refines each chart;
             // out-of-cover starts route to the exact fallback honestly.
@@ -1309,7 +1311,7 @@ fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) -> f64 {
     match &atom.basis_kind {
         Periodic | Torus => 0.5 / (resolution.max(2) as f64),
         Sphere => std::f64::consts::PI / (resolution.max(2) as f64),
-        Duchon | EuclideanPatch | Precomputed(_) => 1.0 / (resolution.max(2) as f64),
+        Duchon | EuclideanPatch | Poincare | Precomputed(_) => 1.0 / (resolution.max(2) as f64),
     }
 }
 
@@ -1338,6 +1340,6 @@ fn chart_region(atom: &SaeManifoldAtom, center: Array1<f64>, radius: f64) -> Cha
             let r_max = center_norm + radius;
             region.with_radial_bounds(r_min, r_max)
         }
-        _ => region,
+        Periodic | Sphere | Torus | EuclideanPatch | Poincare | Precomputed(_) => region,
     }
 }

@@ -920,7 +920,7 @@ impl WarmStartStore {
     fn metadata_index_upsert(&self, meta_path: &Path, bin_path: &Path) -> Result<(), StoreError> {
         let meta_md = fs::metadata(meta_path)?;
         let bin_md = fs::metadata(bin_path)?;
-        let _ = self.read_meta_indexed(meta_path, &meta_md, &bin_md)?;
+        self.read_meta_indexed(meta_path, &meta_md, &bin_md)?;
         Ok(())
     }
 
