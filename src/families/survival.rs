@@ -2582,6 +2582,12 @@ pub struct CompetingRisksCifResult {
     pub overall_survival: Array2<f64>,
 }
 
+/// Subject-count threshold below which competing-risks CIF assembly stays on the
+/// serial path. The per-row work (a `n_times`-long prefix-sum recurrence with a
+/// handful of `exp`/`exp_m1` per element) is cheap, so small panels avoid rayon
+/// fan-out overhead; large panels (the #1082 quality-test sizes) amortize it.
+const COMPETING_RISKS_CIF_PARALLEL_ROW_MIN: usize = 256;
+
 pub fn assemble_competing_risks_cif(
     times: ArrayView1<'_, f64>,
     cumulative_hazard: ArrayView3<'_, f64>,
@@ -2644,7 +2650,20 @@ pub fn assemble_competing_risks_cif_from_endpoints(
         .collect();
     let mut overall_survival = Array2::<f64>::zeros((n_rows, n_times));
 
-    for row in 0..n_rows {
+    // Per-row CIF assembly. The TIME axis is a sequential prefix-sum recurrence
+    // (`previous_*` carry forward across `time_idx`) and MUST stay ordered, so it
+    // is left as the inner serial loop. The ROW (subject) axis is fully
+    // independent: every `previous_*`/`increments` buffer is allocated fresh per
+    // row, no state crosses rows, and each row writes only its own disjoint
+    // output slices. The per-row result is byte-identical regardless of which
+    // thread runs it, so we fan the outer row loop out over rayon and write the
+    // owned per-row buffers back serially in row order (deterministic, bit-exact
+    // vs. the serial implementation).
+    //
+    // `cif_flat` is endpoint-major: `cif_flat[endpoint * n_times + time_idx]`.
+    let assemble_row = |row: usize| -> Result<(Vec<f64>, Vec<f64>), SurvivalError> {
+        let mut cif_flat = vec![0.0_f64; n_endpoints * n_times];
+        let mut surv_row = vec![0.0_f64; n_times];
         let mut previous_cif = vec![0.0_f64; n_endpoints];
         let mut previous_cumulative = vec![0.0_f64; n_endpoints];
         let mut increments = vec![0.0_f64; n_endpoints];
@@ -2673,7 +2692,7 @@ pub fn assemble_competing_risks_cif_from_endpoints(
                     previous_cif[endpoint] +=
                         survival_left * interval_failure * increments[endpoint] / total_increment;
                 }
-                cif[endpoint][[row, time_idx]] = previous_cif[endpoint].clamp(0.0, 1.0);
+                cif_flat[endpoint * n_times + time_idx] = previous_cif[endpoint].clamp(0.0, 1.0);
             }
             previous_total_cumulative += total_increment;
             // Derive `S(t)` from the stored cause-specific CIFs at this time so
@@ -2694,9 +2713,38 @@ pub fn assemble_competing_risks_cif_from_endpoints(
             // `S_left - S_new` to leading order.
             let mut fsum_at_t = 0.0_f64;
             for endpoint in 0..n_endpoints {
-                fsum_at_t += cif[endpoint][[row, time_idx]];
+                fsum_at_t += cif_flat[endpoint * n_times + time_idx];
             }
-            overall_survival[[row, time_idx]] = (1.0_f64 - fsum_at_t).clamp(0.0, 1.0);
+            surv_row[time_idx] = (1.0_f64 - fsum_at_t).clamp(0.0, 1.0);
+        }
+        Ok((cif_flat, surv_row))
+    };
+
+    // Nesting guard (`rayon::current_thread_index().is_none()`) keeps us from
+    // oversubscribing when this routine is itself called from inside a rayon
+    // worker, and the row-count gate keeps small inputs on the serial path.
+    let rows: Vec<(Vec<f64>, Vec<f64>)> = if n_rows >= COMPETING_RISKS_CIF_PARALLEL_ROW_MIN
+        && rayon::current_thread_index().is_none()
+    {
+        use rayon::prelude::*;
+        (0..n_rows)
+            .into_par_iter()
+            .map(assemble_row)
+            .collect::<Result<_, _>>()?
+    } else {
+        (0..n_rows)
+            .map(assemble_row)
+            .collect::<Result<_, _>>()?
+    };
+
+    for (row, (cif_flat, surv_row)) in rows.into_iter().enumerate() {
+        for endpoint in 0..n_endpoints {
+            for time_idx in 0..n_times {
+                cif[endpoint][[row, time_idx]] = cif_flat[endpoint * n_times + time_idx];
+            }
+        }
+        for time_idx in 0..n_times {
+            overall_survival[[row, time_idx]] = surv_row[time_idx];
         }
     }
 
