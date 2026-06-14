@@ -3513,6 +3513,90 @@ fn layer_transport_ladder(
     Ok(out.unbind())
 }
 
+/// Cross-checkpoint Riesz-debiased atom-trajectory dynamics (issue #1102).
+///
+/// `decoder_grid` is `[n_checkpoints, n_atoms, n_grid, ambient_dim]`: every
+/// atom's decoder curve sampled on the shared `latent_grid` at every checkpoint.
+/// `checkpoint_ids` / `atom_names` label the checkpoint and atom axes (lengths
+/// must match the corresponding grid axes). For each atom this walks consecutive
+/// checkpoints and, per step `c → c+1`:
+///   1. fits the inter-checkpoint transport map (checkpoint axis reused as the
+///      transport "layer" axis);
+///   2. evaluates the Riesz penalty-debiased decoder-displacement contrast
+///      `‖g^{(c+1)}(t_mode) − g^{(c)}(t_mode)‖` with a delta-method SE;
+///   3. accumulates an anytime-valid e-process under the no-change null.
+///
+/// Returns `{"trajectories": [ {atom_name, step_contrasts:[...riesz...],
+/// transports:[...transport...], change_evidence:{...certificate...}} ]}`.
+/// See `gam::inference::checkpoint_dynamics` for the estimator and the honest
+/// accounting of which Riesz inputs a bare decoder grid supports.
+#[pyfunction(signature = (decoder_grid, checkpoint_ids, atom_names, latent_grid, alpha = 0.05))]
+fn sae_checkpoint_dynamics(
+    py: Python<'_>,
+    decoder_grid: PyReadonlyArray4<'_, f64>,
+    checkpoint_ids: Vec<String>,
+    atom_names: Vec<String>,
+    latent_grid: PyReadonlyArray1<'_, f64>,
+    alpha: f64,
+) -> PyResult<Py<PyDict>> {
+    use gam::inference::checkpoint_dynamics::{CheckpointDynamicsInput, checkpoint_atom_dynamics};
+    if !(alpha > 0.0 && alpha < 1.0) {
+        return Err(PyValueError::new_err(format!(
+            "sae_checkpoint_dynamics: alpha must be in (0, 1), got {alpha}"
+        )));
+    }
+    let grid = decoder_grid.as_array();
+    let lat = latent_grid.as_array();
+    let input = CheckpointDynamicsInput {
+        decoder_grid: grid,
+        checkpoint_ids: &checkpoint_ids,
+        atom_names: &atom_names,
+        latent_grid: lat,
+    };
+    let trajectories = checkpoint_atom_dynamics(&input).map_err(PyValueError::new_err)?;
+
+    let out = PyDict::new(py);
+    let traj_list = PyList::empty(py);
+    for traj in &trajectories {
+        let t = PyDict::new(py);
+        t.set_item("atom_name", &traj.atom_name)?;
+        let steps = PyList::empty(py);
+        for report in &traj.step_contrasts {
+            steps.append(sae_riesz_report_dict(py, report)?)?;
+        }
+        t.set_item("step_contrasts", steps)?;
+        let transports = PyList::empty(py);
+        for report in &traj.transports {
+            transports.append(layer_transport_report_to_pydict(py, report)?)?;
+        }
+        t.set_item("transports", transports)?;
+        // Anytime-valid change evidence: the e-BH certificate of the atom's
+        // change e-process at level `alpha`, one entry per consecutive-step
+        // claim with its accumulated log-evidence and confirmation verdict.
+        let certificate = traj.change_evidence.certify(alpha);
+        let ev = PyDict::new(py);
+        ev.set_item("alpha", certificate.alpha)?;
+        let entries = PyList::empty(py);
+        for entry in &certificate.entries {
+            let e = PyDict::new(py);
+            let label = match &entry.kind {
+                gam::inference::structure_evidence::ClaimKind::Custom { label } => label.clone(),
+                other => format!("{other:?}"),
+            };
+            e.set_item("claim", label)?;
+            e.set_item("log_e", entry.log_e)?;
+            e.set_item("steps", entry.steps)?;
+            e.set_item("confirmed", entry.confirmed)?;
+            entries.append(e)?;
+        }
+        ev.set_item("entries", entries)?;
+        t.set_item("change_evidence", ev)?;
+        traj_list.append(t)?;
+    }
+    out.set_item("trajectories", traj_list)?;
+    Ok(out.unbind())
+}
+
 /// PCA seed: returns coords with shape `(k_atoms, n_obs, d_max)`. For periodic
 /// atoms, column 0 is `atan2(Z·v2, Z·v1) / (2π)` (per-atom v2 picked from PCs)
 /// and remaining columns are min-max normalized projections onto subsequent
