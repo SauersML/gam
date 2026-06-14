@@ -59,5 +59,8 @@ pub(crate) use fd_audit::*;
 pub(crate) use hessian_operator::*;
 pub(crate) use objective::*;
 pub(crate) use run::*;
+// Re-export the outer-problem driver at `pub` (not just `pub(crate)`) so the
+// gam-pyffi crate can construct it directly for the SAE joint-fit FFI path.
+pub use run::OuterProblem;
 pub(crate) use run_plan::*;
 pub(crate) use seed_screening::*;
