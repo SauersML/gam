@@ -2057,6 +2057,33 @@ struct SpatialFrozenGlmInputs {
     family: LikelihoodSpec,
 }
 
+/// True when the frozen-weight GLM ψ-tensor (#1111 / #1033 mechanism (c)) is a
+/// faithful first-Fisher-step provider for this family.
+///
+/// The mechanism freezes the working weight `w = w(η_warm)` and working response
+/// `z = z(η_warm)` once per outer ψ-sweep, so it is exact for ANY family whose
+/// per-iteration PIRLS reduces to a Gaussian working model with a SINGLE
+/// canonical Fisher weight at a FIXED dispersion — i.e. the one-parameter
+/// exponential families Binomial, Poisson, Gamma, and Negative-Binomial (the
+/// θ-fixed running-seed weight `W = μθ/(θ+μ)` is a clean per-row Fisher weight).
+/// These are precisely the "Poisson/Binomial/etc" families the issue names.
+///
+/// Tweedie and Beta jointly estimate an extra dispersion parameter that moves
+/// the working weight outside the frozen snapshot, so the frozen-W stand-in is
+/// not faithful for them and they keep the exact per-trial PIRLS rebuild.
+/// Gaussian-identity is served by the (exact, converged) `PsiGramTensor` lane,
+/// and Royston-Parmar is the survival path, neither of which routes here.
+fn frozen_glm_tensor_eligible_family(family: &LikelihoodSpec) -> bool {
+    !family.is_gaussian_identity()
+        && matches!(
+            &family.response,
+            ResponseFamily::Binomial
+                | ResponseFamily::Poisson
+                | ResponseFamily::Gamma
+                | ResponseFamily::NegativeBinomial { .. }
+        )
+}
+
 
 struct SpatialJointContext<'d> {
     data: ArrayView2<'d, f64>,
@@ -2511,10 +2538,7 @@ fn run_exact_joint_spatial_optimization(
             &external_opts_for_design(&family, baseline_design, options),
             label,
         )?,
-        frozen_glm_inputs: if coord_dim == 1
-            && !family.is_gaussian_identity()
-            && matches!(&family.response, ResponseFamily::Binomial)
-        {
+        frozen_glm_inputs: if coord_dim == 1 && frozen_glm_tensor_eligible_family(&family) {
             Some(SpatialFrozenGlmInputs {
                 y: y.to_owned(),
                 weights: weights.to_owned(),
@@ -2524,10 +2548,7 @@ fn run_exact_joint_spatial_optimization(
         } else {
             None
         },
-        frozen_glm_psi_bounds: if coord_dim == 1
-            && !family.is_gaussian_identity()
-            && matches!(&family.response, ResponseFamily::Binomial)
-        {
+        frozen_glm_psi_bounds: if coord_dim == 1 && frozen_glm_tensor_eligible_family(&family) {
             Some((lower[rho_dim], upper[rho_dim]))
         } else {
             None
