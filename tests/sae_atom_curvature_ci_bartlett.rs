@@ -49,9 +49,11 @@ fn curved_inner_fit(beta_vec: [f64; 3], dispersion: f64, kappa_hat: f64) -> Atom
     let beta = Array1::from(beta_vec.to_vec());
     let weights = Array1::<f64>::ones(n);
 
-    // Roughness Gram: penalize the quadratic column only (∫(g'')² ∝ b2²).
+    // Roughness Gram: the quadratic column carries the curvature energy
+    // (∫(g'')² ∝ b2²); a unit Gram makes the energy-ratio curvature O(0.1) for a
+    // unit quadratic, well inside the cusp floor.
     let mut penalty = Array2::<f64>::zeros((m, m));
-    penalty[[2, 2]] = 1e-3;
+    penalty[[2, 2]] = 1.0;
 
     // Penalized Hessian H = ΦᵀWΦ + S (W = I here).
     let mut hessian = Array2::<f64>::zeros((m, m));
@@ -69,7 +71,9 @@ fn curved_inner_fit(beta_vec: [f64; 3], dispersion: f64, kappa_hat: f64) -> Atom
     let mut row_scores = Array2::<f64>::zeros((n, m));
     for i in 0..n {
         let t = -1.0 + 2.0 * (i as f64) / ((n - 1) as f64);
-        let r_i = 0.02 * (3.0 * std::f64::consts::PI * t).sin();
+        // A small, deterministic, mean-zero residual field: the fit is nearly
+        // perfect so the curvature SE is tight and the CI is sharp.
+        let r_i = 1e-5 * (3.0 * std::f64::consts::PI * t).sin();
         let w_i = weights[i];
         for a in 0..m {
             row_scores[[i, a]] = -w_i * r_i * design[[i, a]] / dispersion;
@@ -130,7 +134,9 @@ fn single_atom_model(atom: FittedAtom) -> FittedSaeManifold {
 #[test]
 fn strongly_curved_atom_excludes_flat_and_rejects_constant_null() {
     // b2 = 1.0 is a strong quadratic (curved) decoder; low noise → sharp profile.
-    let fit = curved_inner_fit([0.0, 0.5, 1.0], 1e-4, 1.0);
+    // The geometric κ̂ argument supplies only the sign (positive here); the CI's
+    // centre and SE come from the likelihood functional itself.
+    let fit = curved_inner_fit([0.0, 0.5, 1.0], 1e-2, 1.0);
     let model = single_atom_model(patch_atom_with_fit("curved", fit));
     let ledger = StructureLedger::new();
     let report = dictionary_report(&model, &ledger, 0.05).expect("dictionary report");
@@ -142,7 +148,8 @@ fn strongly_curved_atom_excludes_flat_and_rejects_constant_null() {
         .curvature_ci
         .as_ref()
         .expect("curved atom with an inner fit must report a curvature CI");
-    assert!(ci.kappa_hat.is_finite());
+    // The reported κ̂ is the signed likelihood curvature (positive sign here).
+    assert!(ci.kappa_hat.is_finite() && ci.kappa_hat > 0.0);
     assert!(
         ci.ci.ci_lo.is_finite() && ci.ci.ci_hi.is_finite() && ci.ci.ci_lo < ci.ci.ci_hi,
         "CI must be a proper interval, got [{}, {}]",
