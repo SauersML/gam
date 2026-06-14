@@ -796,6 +796,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_disable_fixed_point(multi_block_beta_dependent)
         .with_fallback_policy(fallback_policy)
         .with_tolerance(options.outer_tol)
+        .with_rel_cost_tolerance(options.outer_rel_cost_tol)
         .with_max_iter(outer_max_iter)
         .with_bfgs_step_cap(bfgs_step_cap)
         .with_seed_config(family.outer_seed_config(n_rho))

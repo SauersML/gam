@@ -122,6 +122,10 @@ pub(crate) fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
     hasher.write_f64(options.inner_tol);
     hasher.write_usize(options.outer_max_iter);
     hasher.write_f64(options.outer_tol);
+    hasher.write_bool(options.outer_rel_cost_tol.is_some());
+    if let Some(value) = options.outer_rel_cost_tol {
+        hasher.write_f64(value);
+    }
     hasher.write_f64(options.minweight);
     hasher.write_f64(options.ridge_floor);
     hasher.write_str(&format!("{:?}", options.ridge_policy));

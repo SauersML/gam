@@ -1214,6 +1214,28 @@ pub fn fit_penalized_multinomial_formula(
     } else {
         MULTINOMIAL_OUTER_REML_TOL
     };
+    // #1082 root cause: the outer convergence test derives BOTH the absolute
+    // projected-gradient floor (`max(outer_tol, n·1e-9)`) AND the relative-cost
+    // stop (`rel_cost = outer_tol`) from the single `outer_tol`. The accuracy of
+    // the smooth-by-factor surface is governed by the ABSOLUTE floor reaching the
+    // n-scaled REML resolution `n·1e-9` (≈ 1.8e-6 at n = 1800) — that is why the
+    // earlier 1e-5 floor UNDER-fit (its absolute floor was pinned at 1e-5, well
+    // above the genuine optimum's gradient) and why 1e-7 recovered accuracy (it
+    // unpins the floor down to the n-scaled 1.8e-6). But tightening `outer_tol`
+    // to 1e-7 ALSO tightened the rel-cost stop to 1e-7, which on this family's
+    // dead-flat REML ridge NEVER trips — so the optimizer no longer converges and
+    // grinds all the way to `outer_max_iter`, each surplus step an O(D·p³) Laplace-
+    // derivative assembly over the 382-dim joint design (the >600s wall-clock
+    // overrun; tightening tol REINTRODUCED the crawl the 1e-5 floor had removed).
+    //
+    // The two requirements live on two different criteria, so they must be set
+    // independently. Keep `outer_tol = 1e-7` (drives the accurate absolute floor)
+    // but FLOOR the relative-cost stop at the framework default 1e-5 (the loose,
+    // fast value that resolves the cost-decrease plateau without chasing the flat
+    // tail). The absolute n·1e-9 floor still gates final λ accuracy; the rel-cost
+    // stop just lets the optimizer DECLARE convergence on the flat ridge instead
+    // of crawling to the iteration cap.
+    let outer_rel_cost_tol = Some(BlockwiseFitOptions::default().outer_tol);
     let inner_tol = MULTINOMIAL_FORMULA_INNER_TOL.max(tol.max(0.0));
 
     let options = BlockwiseFitOptions {
@@ -1221,6 +1243,7 @@ pub fn fit_penalized_multinomial_formula(
         inner_tol,
         outer_max_iter,
         outer_tol,
+        outer_rel_cost_tol,
         ridge_floor: MULTINOMIAL_FORMULA_RIDGE_FLOOR,
         // #747: the stabilization floor is SOLVER-ONLY — it keeps the inner
         // joint-Newton linear solve finite during screening (bounding the step

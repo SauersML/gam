@@ -6,6 +6,21 @@ pub(crate) const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
 #[derive(Clone, Debug)]
 pub(crate) struct OuterConfig {
     pub(crate) tolerance: f64,
+    /// Optional override for the *relative-cost-decrease* convergence stop,
+    /// decoupled from `tolerance`. `outer_gradient_tolerance` normally derives
+    /// BOTH the absolute projected-gradient floor (`max(tolerance, scale·1e-9)`)
+    /// AND the relative-cost stop (`rel_cost = tolerance`) from the single
+    /// `tolerance`. That conflation forces a caller who needs a *tight absolute
+    /// floor* (to resolve λ to the genuine REML optimum at large `n`, where the
+    /// floor is `scale·1e-9`) to also accept a *tight rel-cost stop*, which on a
+    /// flat REML ridge never trips and grinds the optimizer to `max_iter` —
+    /// dozens of surplus O(D·p³) Laplace-derivative outer iterations (the #1082
+    /// multinomial smooth-by-factor wall-clock blow-up). When `Some(r)`, the
+    /// rel-cost stop uses `r` while the absolute floor keeps using `tolerance`
+    /// via `objective_scale`, so accuracy (absolute floor) and perf (loose
+    /// rel-cost) are selected independently. `None` preserves the legacy coupling
+    /// (`rel_cost = tolerance`) for every existing path byte-for-byte.
+    pub(crate) rel_cost_tolerance: Option<f64>,
     pub(crate) max_iter: usize,
     pub(crate) bounds: Option<(Array1<f64>, Array1<f64>)>,
     pub(crate) seed_config: crate::seeding::SeedConfig,
@@ -66,6 +81,7 @@ impl Default for OuterConfig {
     fn default() -> Self {
         Self {
             tolerance: 1e-5,
+            rel_cost_tolerance: None,
             max_iter: 200,
             bounds: None,
             seed_config: crate::seeding::SeedConfig::default(),
@@ -109,6 +125,7 @@ pub struct OuterProblem {
     psi_dim: usize,
     barrier_config: Option<BarrierConfig>,
     tolerance: f64,
+    rel_cost_tolerance: Option<f64>,
     max_iter: usize,
     bounds: Option<(Array1<f64>, Array1<f64>)>,
     rho_bound: f64,
@@ -141,6 +158,7 @@ impl OuterProblem {
             psi_dim: 0,
             barrier_config: None,
             tolerance: 1e-5,
+            rel_cost_tolerance: None,
             max_iter: 200,
             bounds: None,
             rho_bound: 30.0,
@@ -317,6 +335,19 @@ impl OuterProblem {
         self
     }
 
+    /// Decouple the *relative-cost-decrease* convergence stop from the
+    /// absolute projected-gradient floor. By default both are derived from the
+    /// single `with_tolerance` value (`abs = max(tol, scale·1e-9)`,
+    /// `rel_cost = tol`). Supplying `Some(r)` here makes the rel-cost stop use
+    /// `r` while the absolute floor keeps using `tolerance` (so a caller can
+    /// keep a tight absolute floor for accuracy at large `n` AND a loose
+    /// rel-cost stop for perf on a flat REML ridge — see #1082). `None` keeps
+    /// the legacy coupling.
+    pub fn with_rel_cost_tolerance(mut self, rel_cost: Option<f64>) -> Self {
+        self.rel_cost_tolerance = rel_cost.filter(|v| v.is_finite() && *v > 0.0);
+        self
+    }
+
     /// Cap the infinity-norm displacement of BFGS cost-only line-search probes
     /// on the **rho axes** (the first `n_params - psi_dim` outer parameters,
     /// = log-λ). Also scales the initial inverse metric so the first trial
@@ -394,6 +425,7 @@ impl OuterProblem {
     fn config(&self) -> OuterConfig {
         OuterConfig {
             tolerance: self.tolerance,
+            rel_cost_tolerance: self.rel_cost_tolerance,
             max_iter: self.max_iter,
             bounds: self.bounds.clone(),
             seed_config: self.seed_config,
@@ -1659,7 +1691,7 @@ pub(crate) fn outer_gradient_tolerance(config: &OuterConfig) -> GradientToleranc
     GradientTolerance {
         abs,
         rel_initial_grad: None,
-        rel_cost: Some(config.tolerance),
+        rel_cost: Some(config.rel_cost_tolerance.unwrap_or(config.tolerance)),
         projected: true,
     }
 }
