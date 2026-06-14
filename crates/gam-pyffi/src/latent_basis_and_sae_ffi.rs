@@ -2411,7 +2411,7 @@ fn sae_manifold_fit_inner<'py>(
     // settled ρ. Computed before `into_fitted` consumes the objective; reflects
     // the fitted (smooth) decoder shape, independent of any top-k assignment
     // gate applied below.
-    let shape_uncertainty = objective
+    let mut shape_uncertainty = objective
         .decoder_shape_uncertainty()
         .map_err(py_value_error)?;
     let (mut term, mut rho, loss) = objective.into_fitted();
@@ -2553,6 +2553,20 @@ fn sae_manifold_fit_inner<'py>(
     // here. A degenerate atom (no active rows / non-SPD inner Hessian) yields a
     // `None` slot inside; a structural shape inconsistency surfaces loudly.
     term.set_atom_inner_fits(z_view.view(), &rho, shape_uncertainty.dispersion)
+        .map_err(py_value_error)?;
+
+    // #977 — COMPLETE the per-atom shape band for any structure-search-BORN atom
+    // (index ≥ the seed K the Schur factor was assembled at). `shape_uncertainty`
+    // above was read off the PRE-search joint-Hessian Schur factor, so a born atom
+    // has no Schur block and would be reported with NO uncertainty band — a silent
+    // gap. This fills that atom's band from its OWN fitted penalized inner Hessian
+    // `H_k = Φ_kᵀ W_k Φ_k + S̃_k` (harvested by `set_atom_inner_fits` for every
+    // atom): the principled per-atom Laplace band `Var_c(t) = φ · Φ_k(t)ᵀ H_k⁻¹
+    // Φ_k(t)`. Seed atoms keep their exact joint-Hessian band (untouched); only
+    // missing bands are filled, and a degenerate born atom (no active rows /
+    // non-SPD inner Hessian) keeps an honest NaN band rather than a fabricated one.
+    // After this, NO post-search atom is reported without an uncertainty band.
+    term.complete_born_atom_shape_bands(&mut shape_uncertainty)
         .map_err(py_value_error)?;
 
     // Additive post-fit diagnostics (#980): the two-score per-atom lens
@@ -2704,13 +2718,16 @@ fn sae_manifold_fit_inner<'py>(
         // per-channel sd) along the atom's on-atom coordinates.
         //
         // #977 variable-K: `shape_uncertainty` was assembled from the PRE-search
-        // joint-Hessian Schur factor and is indexed by the SEED dictionary. A
-        // structure-search-BORN atom (index ≥ the seed K) has no entry, so the
-        // band keys are simply omitted for it — the python reader treats every
-        // `shape_band_*` / `decoder_covariance` key as optional (`_opt_arr`), so
-        // a born atom returns `None` bands rather than a stale or panicking read.
-        // The atom's decoder, coordinates, assignments, basis kind, and active
-        // dim (all read from the fitted term above) are exact regardless.
+        // joint-Hessian Schur factor (indexed by the SEED dictionary), then
+        // COMPLETED above (`complete_born_atom_shape_bands`) so every post-search
+        // atom — born atoms included — carries a band: seed atoms keep their exact
+        // joint-Hessian band, born atoms get the per-atom Laplace band from their
+        // own fitted inner Hessian, and a genuinely-degenerate atom keeps an
+        // honest NaN band. `decoder_covariance` is still present only for the
+        // Schur-assembled atoms (the dense lift is omitted for born atoms and at
+        // LLM-scale `p`); the python reader treats it as optional (`_opt_arr`). The
+        // atom's decoder, coordinates, assignments, basis kind, and active dim (all
+        // read from the fitted term above) are exact regardless.
         if let Some(unc) = shape_uncertainty.atoms.get(atom_idx) {
             // Omitted (not set) above the SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES
             // budget — the python reader treats the key as optional and the band

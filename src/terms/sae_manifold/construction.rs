@@ -7078,6 +7078,142 @@ impl SaeManifoldTerm {
         Ok(SaeShapeUncertainty { dispersion, atoms })
     }
 
+    /// #977 — complete the per-atom shape band for any atom the pre-search
+    /// Schur factor could not cover (a structure-search-BORN atom, whose index
+    /// is ≥ the seed `K` the Schur cache was assembled at), from that atom's OWN
+    /// fitted penalized inner Hessian.
+    ///
+    /// The Schur path ([`Self::assemble_shape_uncertainty`]) reads the joint
+    /// inverse-Hessian β-block per atom, but that factor is assembled ONCE before
+    /// the structure search runs, so it is indexed by the SEED dictionary. A born
+    /// atom therefore has no Schur block and would otherwise be reported with NO
+    /// uncertainty band — a silent gap. This method closes it: every atom carries
+    /// a band, none is reported without one.
+    ///
+    /// The principled per-atom band is the Laplace posterior of the atom's inner
+    /// reconstruction smooth, which [`Self::set_atom_inner_fits`] already fits at
+    /// the settled state for EVERY atom (born included). With the Gaussian-identity
+    /// inner smooth, each output channel `c`'s decoder posterior is
+    /// `Cov(β_{k,c}) = φ · H_k⁻¹`, where `H_k = Φ_kᵀ W_k Φ_k + S̃_k` is the atom's
+    /// fitted penalized inner Hessian (`AtomInnerFit::penalized_hessian`). The
+    /// ambient point `m_k(t) = Φ_k(t)·B_k` is linear in `B_k`, so its per-channel
+    /// posterior variance is the closed form
+    ///   `Var_c(t) = φ · Φ_k(t)ᵀ H_k⁻¹ Φ_k(t)`,
+    /// which is the SAME for every channel `c` (the inner Hessian is shared across
+    /// channels; the decoder differs only in the mean). The band is evaluated at
+    /// the same evenly-strided on-atom coordinate subset the Schur path uses, so a
+    /// born atom's band is reported exactly where its data lives.
+    ///
+    /// This is a strict completion: an atom whose band the Schur path already
+    /// filled (a finite `band_sd`) is left untouched; only atoms with a missing
+    /// entry (index past the assembled set) or an all-NaN band (the
+    /// no-decoder-covariance fallback) are filled. An atom whose inner fit is
+    /// degenerate (`None` — no active rows / non-SPD inner Hessian) is left with
+    /// its NaN band, faithfully reporting "unidentified" rather than fabricating a
+    /// number. Requires [`Self::set_atom_inner_fits`] to have run; without it the
+    /// completion is a no-op (the band stays as the Schur path left it).
+    pub fn complete_born_atom_shape_bands(
+        &self,
+        unc: &mut SaeShapeUncertainty,
+    ) -> Result<(), String> {
+        let inner_fits = match &self.atom_inner_fits {
+            Some(fits) => fits,
+            // No inner fits harvested: nothing to complete from. Leave the bands
+            // as the Schur path produced them.
+            None => return Ok(()),
+        };
+        let p = self.output_dim();
+        let dispersion = unc.dispersion;
+        // Grow the per-atom band list to the post-search atom count so a born
+        // atom (index past the Schur-assembled set) has a slot. New slots start
+        // as NaN bands and are filled below from the inner fit.
+        while unc.atoms.len() < self.k_atoms() {
+            let k = unc.atoms.len();
+            let atom = &self.atoms[k];
+            let n_rows = atom.n_obs();
+            let d = atom.latent_dim;
+            let stride = n_rows.div_ceil(SHAPE_BAND_MAX_POINTS).max(1);
+            let eval_rows: Vec<usize> = (0..n_rows).step_by(stride).collect();
+            let g = eval_rows.len();
+            let coords_mat = self.assignment.coords[k].as_matrix();
+            let mut band_coords = Array2::<f64>::zeros((g, d));
+            let mut band_mean = Array2::<f64>::zeros((g, p));
+            let band_sd = Array2::<f64>::from_elem((g, p), f64::NAN);
+            let mut decoded = vec![0.0_f64; p];
+            for (gi, &row) in eval_rows.iter().enumerate() {
+                for axis in 0..d {
+                    band_coords[[gi, axis]] = coords_mat[[row, axis]];
+                }
+                atom.fill_decoded_row(row, &mut decoded);
+                for c in 0..p {
+                    band_mean[[gi, c]] = decoded[c];
+                }
+            }
+            unc.atoms.push(SaeAtomShapeUncertainty {
+                decoder_covariance: None,
+                band_coords,
+                band_mean,
+                band_sd,
+            });
+        }
+
+        for (k, atom) in self.atoms.iter().enumerate() {
+            let band = &mut unc.atoms[k];
+            // Only complete a MISSING band: an atom the Schur path already filled
+            // (a finite sd anywhere) keeps its joint-Hessian band untouched.
+            let already_filled = band.band_sd.iter().any(|v| v.is_finite());
+            if already_filled {
+                continue;
+            }
+            let inner = match inner_fits.get(k).and_then(|f| f.as_ref()) {
+                Some(f) => f,
+                // Degenerate atom (no active rows / non-SPD inner Hessian): leave
+                // the NaN band — honestly "unidentified", never a fabricated band.
+                None => continue,
+            };
+            let m = atom.basis_size();
+            if inner.penalized_hessian.dim() != (m, m) {
+                return Err(format!(
+                    "complete_born_atom_shape_bands: atom {k} inner Hessian {:?} != ({m}, {m})",
+                    inner.penalized_hessian.dim()
+                ));
+            }
+            // Factor the atom's own penalized inner Hessian H_k = ΦᵀWΦ + S̃_k. It
+            // was checked SPD when the inner fit was built; re-factor here to solve
+            // H_k⁻¹ Φ(t). A factorization failure (numerical drift since the inner
+            // fit) leaves the NaN band rather than a fabricated number.
+            let chol = match inner.penalized_hessian.cholesky(Side::Lower) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // Evenly-strided on-atom rows, matched to the band the Schur path uses.
+            let n_rows = atom.n_obs();
+            let stride = n_rows.div_ceil(SHAPE_BAND_MAX_POINTS).max(1);
+            let eval_rows: Vec<usize> = (0..n_rows).step_by(stride).collect();
+            for (gi, &row) in eval_rows.iter().enumerate() {
+                // Φ_k(t) at this on-atom row, as an (m, 1) rhs.
+                let mut phi_col = Array2::<f64>::zeros((m, 1));
+                for b in 0..m {
+                    phi_col[[b, 0]] = atom.basis_values[[row, b]];
+                }
+                // H_k⁻¹ Φ(t), then the quadratic form Φ(t)ᵀ H_k⁻¹ Φ(t).
+                let solved = chol.solve_mat(&phi_col);
+                let mut quad = 0.0_f64;
+                for b in 0..m {
+                    quad += phi_col[[b, 0]] * solved[[b, 0]];
+                }
+                let quad = quad.max(0.0);
+                // Var_c(t) = φ · Φ(t)ᵀ H_k⁻¹ Φ(t) — identical across channels (the
+                // inner Hessian is shared; the decoder differs only in the mean).
+                let sd = (dispersion * quad).sqrt();
+                for c in 0..p {
+                    band.band_sd[[gi, c]] = sd;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn shape_uncertainty_without_decoder_covariance(&self, dispersion: f64) -> SaeShapeUncertainty {
         let p = self.output_dim();
         let mut atoms = Vec::with_capacity(self.k_atoms());
