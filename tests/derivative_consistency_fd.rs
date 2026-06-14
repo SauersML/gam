@@ -63,6 +63,7 @@ fn gaussian_opts(nullspace_dims: Vec<usize>) -> ExternalOptimOptions {
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     }
 }
 

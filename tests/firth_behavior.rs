@@ -197,6 +197,7 @@ fn firthfd_step_size_sensitivity() {
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     };
     let base_rho = 12.0;
     let cost_at = |rho: f64| -> f64 {

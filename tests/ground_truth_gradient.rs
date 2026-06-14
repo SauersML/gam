@@ -202,6 +202,7 @@ fn test_lamlgradient_nonfirthwell_conditioned() {
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     };
     let rho = array![0.0];
     let analytic = evaluate_externalgradient(
@@ -277,6 +278,7 @@ fn test_lamlgradient_logitwith_firthwell_conditioned() {
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     };
     let rho = array![0.0];
     let analytic = evaluate_externalgradient(
@@ -353,6 +355,7 @@ fn stress_test_firthgradientvs_conditioning() {
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         };
         let rho = array![0.0];
         let Ok(analytic) = evaluate_externalgradient(
