@@ -16,7 +16,7 @@ pub struct VarianceJet {
 impl VarianceJet {
     /// Lower floor on μ before evaluating power-law variance functions, so that
     /// `μ^(p−k)` derivatives stay finite as μ → 0 instead of producing inf/NaN.
-    pub(crate) const VARIANCE_MU_FLOOR: f64 = 1e-10;
+    const VARIANCE_MU_FLOOR: f64 = 1e-10;
 
     /// Bernoulli / binomial variance V(μ) = μ(1−μ).
     #[inline]

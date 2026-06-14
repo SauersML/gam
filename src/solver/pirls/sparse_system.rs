@@ -69,7 +69,7 @@ impl SparsePirlsDecision {
 
 
 pub(crate) fn pirls_decision_repetition_count(log_key: String) -> usize {
-    pub(crate) static PIRLS_DECISION_LOG_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    static PIRLS_DECISION_LOG_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
     let counts = PIRLS_DECISION_LOG_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut counts = counts.lock().expect("pirls decision log counter poisoned");
     let count = counts.entry(log_key).or_insert(0);

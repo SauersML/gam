@@ -35,7 +35,7 @@ pub(crate) fn estimate_gamma_shape_from_eta(
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> f64 {
-    pub(crate) const EPS: f64 = 1e-12;
+    const EPS: f64 = 1e-12;
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let (weighted_target, total_weight) = (0..eta.len())
@@ -109,9 +109,9 @@ pub(crate) fn estimate_beta_phi_from_eta(
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> f64 {
-    pub(crate) const PHI_MIN: f64 = 1e-3;
-    pub(crate) const PHI_MAX: f64 = 1e6;
-    pub(crate) const MU_EPS: f64 = 1e-9;
+    const PHI_MIN: f64 = 1e-3;
+    const PHI_MAX: f64 = 1e6;
+    const MU_EPS: f64 = 1e-9;
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let (weighted_pearson, total_weight) = (0..eta.len())
@@ -175,9 +175,9 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
     priorweights: ArrayView1<'_, f64>,
     p: f64,
 ) -> f64 {
-    pub(crate) const PHI_MIN: f64 = 1e-6;
-    pub(crate) const PHI_MAX: f64 = 1e12;
-    pub(crate) const MU_EPS: f64 = 1e-300;
+    const PHI_MIN: f64 = 1e-6;
+    const PHI_MAX: f64 = 1e12;
+    const MU_EPS: f64 = 1e-300;
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let (weighted_pearson, total_weight) = (0..eta.len())

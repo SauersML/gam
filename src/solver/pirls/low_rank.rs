@@ -247,7 +247,7 @@ mod low_rank_weight_pirls_tests {
     use crate::linalg::matrix::{LinearOperator, SignedWeightsView};
     use ndarray::{Array2, array};
 
-    pub(crate) fn tiny_design() -> DesignMatrix {
+    fn tiny_design() -> DesignMatrix {
         let x = array![
             [1.0, 0.5, -0.2],
             [0.3, 1.2, 0.4],

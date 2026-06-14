@@ -127,11 +127,11 @@ pub fn calculate_deviance(
     likelihood: &GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
 ) -> f64 {
-    pub(crate) const EPS: f64 = 1e-8;
+    const EPS: f64 = 1e-8;
     // Match the μ floor used by the shared PIRLS log-link working-state engine
     // (`MIN_MU = 1e-10` in `log_link_working_state`) so deviance / weights
     // stay self-consistent when the linear predictor saturates.
-    pub(crate) const MU_FLOOR: f64 = 1e-10;
+    const MU_FLOOR: f64 = 1e-10;
     match &likelihood.spec.response {
         ResponseFamily::Binomial => {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -280,8 +280,8 @@ pub fn pointwise_loglikelihood_omitting_constants(
 ) -> Array1<f64> {
     // Same μ floor as PIRLS log-link working-state writers; see note in
     // `calculate_deviance` above.
-    pub(crate) const MU_FLOOR: f64 = 1e-10;
-    pub(crate) const EPS: f64 = 1e-8;
+    const MU_FLOOR: f64 = 1e-10;
+    const EPS: f64 = 1e-8;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
     let values: Vec<f64> = match &likelihood.spec.response {
@@ -399,7 +399,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
 ) -> f64 {
     // Same μ floor as PIRLS log-link working-state writers; see note in
     // `calculate_deviance` above.
-    pub(crate) const MU_FLOOR: f64 = 1e-10;
+    const MU_FLOOR: f64 = 1e-10;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
     match &likelihood.spec.response {

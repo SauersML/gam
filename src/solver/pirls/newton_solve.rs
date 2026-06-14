@@ -1474,7 +1474,7 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
     // because `boundary_hit_step_fraction` requires `step < current_step_limit`
     // strictly), so the leaving rule is the only place anti-cycling has to
     // be enforced.
-    pub(crate) const BLANDS_RULE_GRACE: usize = 2;
+    const BLANDS_RULE_GRACE: usize = 2;
     let blands_threshold = BLANDS_RULE_GRACE * (p + 1);
     let max_iters = 8 * (p + 1);
     let mut d_free = Array1::<f64>::zeros(p);

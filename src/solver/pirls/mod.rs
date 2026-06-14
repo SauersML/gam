@@ -35,8 +35,11 @@ mod workspace;
 mod tests;
 
 // ── Concern-module re-export glue ────────────────────────────────────────────
-// Glob re-exports keep every concern module's items reachable from `super::*`
-// inside its siblings (and preserve the crate-facing API the flat module had).
+// Glob re-exports keep each newly-split concern module's items reachable from
+// `super::*` inside its siblings (reproducing the flat namespace the file shared
+// before the split). The pre-existing real submodules below keep their explicit
+// named re-exports so their exact visibility — and crate-facing `pub` API — is
+// preserved; globbing them too would double-import every name listed there.
 pub(crate) use curvature::*;
 pub(crate) use deviance::*;
 pub(crate) use dispersion::*;
