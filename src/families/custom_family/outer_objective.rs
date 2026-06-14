@@ -1799,30 +1799,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // or after the preconditioned-descent fallback replaced
                 // `search_delta`) fall back to box-truncating the search step.
                 let mut trial_delta;
-                let mut block_step_norms = if let Some(spectrum) =
-                    joint_spectrum.as_ref().filter(|_| search_joint_active_set.is_none())
-                {
+                let mut block_step_norms = if let Some(spectrum) = joint_spectrum.as_ref() {
                     // Exact Moré–Sorensen trust-region step at the current radius
                     // (gam#979). The step already lies in the `D`-metric ball, so
                     // no dogleg blend or box-truncation is applied: on a shrink the
                     // direction is RE-SOLVED (bending toward the gradient), the
                     // property the dogleg/truncation lacked. Re-solving reuses the
-                    // cached factorization at O(p) cost.
-                    //
-                    // CONSTRAINED-PATH EXCLUSION (gam#1108). The Moré–Sorensen step
-                    // is the UNCONSTRAINED trust-region subproblem solution — it
-                    // honors the `D`-metric ball but NOT the linear inequality cone
-                    // `Aβ ≥ b`. On the constrained-QP path `joint_spectrum` is still
-                    // populated (the constrained branch builds it for the
-                    // Newton-decrement convergence certificate, NOT for the step),
-                    // so taking the spectral step here would override the QP's
-                    // feasible-to-feasible chord (`candidate_beta − beta_joint`) with
-                    // an off-cone step. The accepted trial β then leaves the monotone
-                    // time-derivative cone (raw `Aβ−b` ~5.5e-3) and the next cycle's
-                    // `check_linear_feasibility` rejects it — the interval-censored
-                    // survival warm-start abort. Gate on `is_none()` so the
-                    // constrained path falls through to box-truncating the feasible
-                    // QP chord, which keeps every sub-step in the cone.
+                    // cached factorization at O(p) cost. On the constrained path the
+                    // resulting (unconstrained) step is projected back onto the cone
+                    // just below (gam#1108), preserving this step's fast convergence
+                    // while keeping every accepted iterate feasible.
                     trial_delta = spectrum.trust_region_step(joint_trust_radius).delta;
                     joint_trust_region_block_metric_norms(
                         &trial_delta,
@@ -1859,6 +1845,33 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         0.25,
                     );
                     continue;
+                }
+                // CONSTRAINED-PATH FEASIBILITY PROJECTION (gam#1108). The
+                // trust-region trial step (Moré–Sorensen / dogleg / box-trunc) is
+                // taken in the UNCONSTRAINED D-metric ball, and
+                // `apply_joint_feasibility_limit` is a no-op for families whose
+                // `max_feasible_step_size` is `None` (e.g. `LatentSurvivalFamily`),
+                // so the step can cross the monotone time-derivative cone `Aβ ≥ b`.
+                // The next cycle's `check_linear_feasibility` gate would then reject
+                // the accepted iterate — the interval-censored survival warm-start
+                // abort. Project the trial iterate back onto the cone with the exact
+                // identity-Hessian active-set projection, preserving the trust
+                // step's fast convergence while guaranteeing every accepted iterate
+                // is feasible. No-op when the joint design is unconstrained or the
+                // trial is already feasible; `block_step_norms` is recomputed from
+                // the projected step just below so the trust-radius bookkeeping
+                // stays consistent.
+                if let Some(constraints) = joint_constraints.as_ref() {
+                    let trial_beta = &beta_joint + &trial_delta;
+                    if check_linear_feasibility(&trial_beta, constraints, 1e-8).is_err()
+                        && let Some(projected) =
+                            crate::solver::active_set::project_point_strictly_into_feasible_cone(
+                                &trial_beta,
+                                constraints,
+                            )
+                    {
+                        trial_delta = &projected - &beta_joint;
+                    }
                 }
                 block_step_norms = joint_trust_region_block_metric_norms(
                     &trial_delta,
