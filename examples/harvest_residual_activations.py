@@ -6,9 +6,8 @@ matrix). Streams documents from a Hugging Face dataset, tokenizes into
 fixed-length sequences, hooks one decoder layer's output, and saves all
 token positions (BOS dropped) until the requested token budget is reached.
 
-Output format matches the Manifold-SAE ``llm_sweep`` cache consumed by
-``adjudicated_dictionary_real_llm.py``: a dict with ``X`` of shape
-``(n_tokens, d_model)`` float32 and a ``sig`` metadata dict.
+Output format is a generic Manifold-SAE activation cache: a dict with
+``X`` of shape ``(n_tokens, d_model)`` float32 and a ``sig`` metadata dict.
 
 Example:
   python harvest_residual_activations.py --model Qwen/Qwen2.5-0.5B \

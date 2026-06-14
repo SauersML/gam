@@ -57,6 +57,7 @@ scripts/__pycache__/
 scripts/latest_benchmark_summary.md
 scripts/codex_nightrun.sh
 *.png
+bench/aniso_demo/
 bench/aniso_demo/*.png
 bench/aniso_demo/data.csv
 bench/aniso_demo/fit_*.log

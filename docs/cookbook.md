@@ -369,7 +369,6 @@ Focused demos live under `examples/`:
 | Torch | `torch_autograd_sae_training_demo.py` and the `gamfit.torch` tests for REML primitives, smooth APIs, and manifold SAE parity |
 | Streaming / scale | `streaming_bspline_demo.py`, `streaming_matern_demo.py`, `streaming_arrow_schur_k100k_demo.py` |
 | Response geometry / topology | `sphere_optimization_demo.py`, `product_torus_demo.py`, `grassmann_subspace_demo.py`, `spd_metric_learning_demo.py` |
-| LLM probes | `olmo_sae_atlas.py`, `olmo_structure_discovery.py`, `layer_transport_maps.py`, `causal_hue_steering.py` |
 
 Performance-oriented Rust examples live under `examples/perf/`.
 
