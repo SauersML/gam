@@ -1,9 +1,9 @@
 //! Predict-side measure-jet honesty: the closed-form extrapolation variance
-//! of V∞ §5 (`docs/measure_jet_v_infinity.md`), slice 3.
+//! from the frame notes (`docs/measure_jet_frame.md` §5).
 //!
-//! V0's Gaussian representers decay off-support toward the parametric
-//! backbone with SMALL Vp — confident reversion, which the honesty contract
-//! forbids. The structural fix prices ignorance off the web from the SAME
+//! The current Gaussian representers decay off-support toward the parametric
+//! backbone with small posterior variance — confident reversion, which the
+//! honesty contract forbids. The structural fix prices ignorance off the web from the SAME
 //! fitted spectrum that smooths on it: every band level ℓ carries a fitted
 //! amplitude λ̂_ℓ (prior precision of the level's innovations), and a query
 //! that the level-ℓ kernel mass does not cover simply has an UNKNOWN level-ℓ
@@ -85,7 +85,7 @@ pub enum MeasureJetExtrapolationSpectrum<'a> {
     Fused(f64),
 }
 
-/// V∞ §5: closed-form extrapolation variance at a query — the price of
+/// Frame-note §5: closed-form extrapolation variance at a query — the price of
 /// ignorance off the web, read from the fitted spectrum. `ε★` = the first
 /// covering scale (smallest band scale at which the query's kernel mass
 /// clears `coverage_floor` × `q̄_ℓ`); levels finer than `ε★` contribute
@@ -263,7 +263,7 @@ mod tests {
             .expect("valid inputs");
             assert!(
                 v >= prev,
-                "variance decreased with distance: V({d:.3}) = {v:.12} < {prev:.12}"
+                "variance decreased with distance: variance({d:.3}) = {v:.12} < {prev:.12}"
             );
             prev = v;
         }

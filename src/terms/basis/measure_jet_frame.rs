@@ -1,11 +1,11 @@
-//! Measure-jet V∞ slice 4: the jet-frame synthesis function space.
+//! Measure-jet frame synthesis function space.
 //!
-//! V0's representer basis (one Gaussian RBF per center) is *value-coupled*: its
-//! columns reach across the web with a confident parametric backbone, so it
-//! cannot represent an ambient-affine function without paying an `O(τ)` toll and
-//! it does not give a clean per-scale diagonal prior. This module realizes the
-//! function space the V∞ charter (`docs/measure_jet_v_infinity.md` §1) calls
-//! *"the jet frame is the model"*: the per-level `ε/2`-nets that
+//! The current representer basis (one Gaussian RBF per center) is
+//! *value-coupled*: its columns reach across the web with a confident
+//! parametric backbone, so it cannot represent an ambient-affine function
+//! without paying an `O(τ)` toll and it does not give a clean per-scale
+//! diagonal prior. This module realizes the frame function space described in
+//! `docs/measure_jet_frame.md` §1: the per-level `ε/2`-nets that
 //! `measure_jet_smooth::assemble_weighted_forms` already constructs are PROMOTED
 //! from outer-quadrature points to the index set of a multiscale frame.
 //!
@@ -15,7 +15,7 @@
 //! * The **head** is an unpenalized global polynomial block of degree `< r`
 //!   (`r = 2` ⇒ `{1, x_1, …, x_d}`, the ambient-affine space). It passes
 //!   ambient-affine functions through EXACTLY at any `τ`, structurally killing
-//!   the `O(τ)` affine toll — this is the property the V0 representer basis
+//!   the `O(τ)` affine toll — this is the property the Gaussian-representer basis
 //!   lacked, and oracle (1) pins it.
 //!
 //! * Each **innovation** lives at one `(level ℓ, net node a)`: a Gaussian bump
@@ -23,20 +23,21 @@
 //!   monomials `{1, frame coords}` with frame coordinate `(x − c_a)/ε_ℓ`. The
 //!   coarse-to-fine PREDICTION (lifting) step projects each level's monomial
 //!   action onto the span of the head plus all coarser levels and keeps only the
-//!   residual, so every innovation column is orthogonal — in the *value* sense
-//!   `Sᵀ S` — to the polynomial head and to every coarser innovation. That is
-//!   vanishing moments by construction (oracle (2)): a degree `< r` polynomial
+//!   residual, so every innovation column is orthogonal — in the mass inner
+//!   product `Sᵀ M_μ S` — to the polynomial head and to every coarser
+//!   innovation. That is vanishing moments by construction (oracle (2)): a degree `< r` polynomial
 //!   evaluated on the web is reproduced entirely by the head and leaves the
 //!   innovations untouched.
 //!
 //! The prior is DIAGONAL by coordinates: the head is unpenalized, each level's
-//! innovations are an independent whitened block with prior variance `λ_ℓ⁻¹`
-//! (`= ε_ℓ^{2s}` up to the global amplitude — the multiscale per-scale-candidate mode
-//! made structural). The whitened synthesis `S D^{1/2}` therefore has the frame
-//! ratio `A · J_s ≤ Σ_ℓ ε_ℓ^{−2s} ‖d_ℓ‖² ≤ B · J_s`; this module estimates
-//! `A`, `B` at runtime via a few power iterations on the whitened Gram (oracle
-//! (4) checks `1 ≤ B/A < ∞` on a quasi-uniform net), so every fit can ship its
-//! own frame-ratio certificate.
+//! innovations are an independent block with precision `λ_ℓ = ε_ℓ^{-2s}`
+//! (prior variance `ε_ℓ^{2s}` up to the global amplitude — the multiscale per-scale-candidate mode
+//! made structural). The whitened synthesis `S D^{1/2}` therefore has a
+//! value-space frame ratio
+//! `A · value_energy ≤ Σ_ℓ ε_ℓ^{−2s} ‖d_ℓ‖² ≤ B · value_energy`; this module
+//! estimates `A`, `B` at runtime via a few power iterations on the whitened
+//! value Gram (oracle (4) checks that `B/A` is finite and at least one on a
+//! quasi-uniform net), so every fit can ship its own frame-ratio certificate.
 //!
 //! Everything here is deterministic (no RNG): the nets are greedy on a fixed
 //! index order, the power iterations start from a fixed all-ones seed, and the
@@ -75,16 +76,18 @@ pub(crate) const MEASURE_JET_FRAME_POWER_ITERS: usize = 64;
 ///
 /// Coefficients are laid out as `[ head | level_0 | level_1 | … ]`; the prior is
 /// diagonal: the `head_dim` head coordinates are unpenalized, and the
-/// `level_dims[ℓ]` coordinates of level `ℓ` share the precision `λ_ℓ = ε_ℓ^{2s}`
+/// `level_dims[ℓ]` coordinates of level `ℓ` share the precision `λ_ℓ = ε_ℓ^{-2s}`
 /// (stored as `level_precisions[ℓ]`).
 pub struct MeasureJetFrame {
     /// Number of web nodes (rows of `S`): the seed centers.
     pub(crate) n_nodes: usize,
+    /// Web-node quadrature masses defining the value inner product.
+    pub(crate) masses: Array1<f64>,
     /// Unpenalized polynomial-head width (`= number of degree < r monomials`).
     pub(crate) head_dim: usize,
     /// Per-level innovation widths, ascending in scale.
     pub(crate) level_dims: Vec<usize>,
-    /// Per-level prior precision `λ_ℓ = ε_ℓ^{2s}` (the diagonal whitening).
+    /// Per-level prior precision `λ_ℓ = ε_ℓ^{-2s}` (the diagonal whitening).
     pub(crate) level_precisions: Vec<f64>,
     /// The dense synthesis matrix `S` (`n_nodes × total_dim`): `value = S · coef`.
     /// Column `0 .. head_dim` is the head; the remainder are the lifted, value-
@@ -96,18 +99,18 @@ pub struct MeasureJetFrame {
     pub(crate) order_s: f64,
 }
 
-/// Runtime frame-ratio certificate: estimates of the equivalence constants
-/// `A ≤ Σ_ℓ ε_ℓ^{−2s} ‖d_ℓ‖² / J_s ≤ B`, with `J_s = ‖S_white coef‖²` the value
-/// energy of the whitened synthesis. `ratio = B / A ≥ 1` is the frame condition
-/// number; finiteness witnesses that the innovations are a genuine (Riesz)
-/// frame for their span.
+/// Runtime value-space frame-ratio certificate: estimates of the equivalence
+/// constants `A ≤ coefficient_energy / value_energy ≤ B`, where
+/// `value_energy = zᵀ(SD^{1/2})ᵀM_μ(SD^{1/2})z`. `ratio = B / A ≥ 1` is the
+/// condition number; finiteness witnesses that the innovations form a Riesz
+/// frame for their span under the mass value inner product.
 #[derive(Clone, Copy, Debug)]
 pub struct MeasureJetFrameRatioCertificate {
-    /// Lower frame constant `A` (smallest singular value² of the whitened Gram).
+    /// Lower frame constant `A = 1/λ_max` for coefficient-energy / value-energy.
     pub lower_a: f64,
-    /// Upper frame constant `B` (largest singular value² of the whitened Gram).
+    /// Upper frame constant `B = 1/λ_min` for coefficient-energy / value-energy.
     pub upper_b: f64,
-    /// Condition number `B / A ≥ 1`; `f64::INFINITY` iff the frame is degenerate.
+    /// Condition number `B / A ≥ 1`; non-finite iff the frame is degenerate.
     pub ratio: f64,
     /// Number of power-iteration sweeps actually run (for the audit trail).
     pub iterations: usize,
@@ -134,7 +137,7 @@ impl MeasureJetFrame {
         &self.level_dims
     }
 
-    /// Per-level diagonal prior precision `λ_ℓ = ε_ℓ^{2s}`.
+    /// Per-level diagonal prior precision `λ_ℓ = ε_ℓ^{-2s}`.
     pub fn level_precisions(&self) -> &[f64] {
         &self.level_precisions
     }
@@ -169,7 +172,8 @@ impl MeasureJetFrame {
 
     /// Analysis `Sᵀ`: map nodal web values to the coefficient dual.
     /// `values.len()` must equal [`n_nodes`](Self::n_nodes). This is the EXACT
-    /// f64 adjoint of [`synthesize`](Self::synthesize) (oracle (3)).
+    /// f64 adjoint of [`synthesize`](Self::synthesize) under the mass value
+    /// inner product `uᵀM_μv` (oracle (3)).
     pub fn analyze(&self, values: ArrayView1<'_, f64>) -> Result<Array1<f64>, BasisError> {
         if values.len() != self.n_nodes {
             crate::bail_dim_basis!(
@@ -178,12 +182,13 @@ impl MeasureJetFrame {
                 values.len()
             );
         }
-        Ok(self.synthesis.t().dot(&values))
+        let weighted = &values * &self.masses;
+        Ok(self.synthesis.t().dot(&weighted))
     }
 
     /// The diagonal whitening vector `D^{1/2}` over the coefficient layout: the
     /// head block is `1` (unpenalized) and each level `ℓ` block is
-    /// `λ_ℓ^{−1/2} = ε_ℓ^{−s}` (so that whitened coefficients have unit prior
+    /// `λ_ℓ^{−1/2} = ε_ℓ^{s}` (so that whitened coefficients have unit prior
     /// variance, and the whitened energy is `Σ_ℓ ε_ℓ^{−2s} ‖d_ℓ‖²` of §1).
     pub fn whitening_sqrt(&self) -> Array1<f64> {
         let mut w = Array1::<f64>::ones(self.total_dim());
@@ -198,12 +203,12 @@ impl MeasureJetFrame {
         w
     }
 
-    /// Estimate the frame-ratio certificate `A · J_s ≤ Σ_ℓ ε_ℓ^{−2s} ‖d_ℓ‖² ≤
-    /// B · J_s` by a few deterministic power iterations on the whitened Gram
-    /// `M = (S D^{1/2})ᵀ (S D^{1/2})` restricted to the innovation block (the
-    /// head is unpenalized and excluded from the frame energy). `B` is the top
-    /// eigenvalue (power iteration), `A` the bottom (inverse power iteration via
-    /// a shifted, deflated sweep); both seeded from the all-ones vector.
+    /// Estimate the value-space frame-ratio certificate
+    /// `A · value_energy ≤ Σ_ℓ ε_ℓ^{−2s} ‖d_ℓ‖² ≤ B · value_energy` by a few deterministic power iterations on the whitened
+    /// value-Gram `M = (S D^{1/2})ᵀ M_μ (S D^{1/2})` restricted to the innovation
+    /// block (the head is unpenalized and excluded from the frame energy). Since
+    /// the documented quotient is coefficient energy divided by value energy,
+    /// `A = 1/λ_max(M)` and `B = 1/λ_min(M)`.
     pub fn frame_ratio_certificate(&self) -> MeasureJetFrameRatioCertificate {
         let p = self.total_dim();
         let n_innov = p - self.head_dim;
@@ -227,13 +232,21 @@ impl MeasureJetFrame {
                 s_white[(i, j)] = self.synthesis[(i, col)] * scale;
             }
         }
-        // Gram of the whitened innovation block: M = Sᵀ S (n_innov × n_innov).
-        let m = s_white.t().dot(&s_white);
+        // Gram of the whitened innovation block: M = Sᵀ M_μ S (n_innov × n_innov).
+        let mut mass_s_white = s_white.clone();
+        for (i, mut row) in mass_s_white.outer_iter_mut().enumerate() {
+            row.mapv_inplace(|v| v * self.masses[i]);
+        }
+        let m = s_white.t().dot(&mass_s_white);
         let top = power_top_eigenvalue(&m, MEASURE_JET_FRAME_POWER_ITERS);
         let bottom = power_bottom_eigenvalue(&m, top, MEASURE_JET_FRAME_POWER_ITERS);
-        let lower_a = bottom.max(0.0);
-        let upper_b = top.max(lower_a);
-        let ratio = if lower_a > 0.0 {
+        let lower_a = if top > 0.0 { 1.0 / top } else { f64::INFINITY };
+        let upper_b = if bottom > 0.0 {
+            1.0 / bottom
+        } else {
+            f64::INFINITY
+        };
+        let ratio = if lower_a.is_finite() && lower_a > 0.0 {
             upper_b / lower_a
         } else {
             f64::INFINITY
@@ -254,8 +267,8 @@ impl MeasureJetFrame {
 ///
 /// Construction (charter §1):
 ///   1. Head = degree `< r` global monomials evaluated on the centers, then
-///      `QR`-orthonormalized in the value inner product (so the head columns are
-///      a value-orthonormal basis of the ambient-affine span — exact
+///      `QR`-orthonormalized in the mass value inner product (so the head columns are
+///      a mass-orthonormal basis of the ambient-affine span — exact
 ///      pass-through).
 ///   2. Per level (coarse→fine): build the `ε_ℓ/2`-net on the centers (greedy,
 ///      deterministic), form one atom per net node × local jet monomial
@@ -263,7 +276,7 @@ impl MeasureJetFrame {
 ///      LIFT: subtract the value-projection onto the head plus all already-built
 ///      (coarser) innovation columns, and drop columns whose residual norm falls
 ///      below the rank tolerance. The survivors are the level-`ℓ` innovations.
-///   3. Prior precision `λ_ℓ = ε_ℓ^{2s}` per level.
+///   3. Prior precision `λ_ℓ = ε_ℓ^{-2s}` per level.
 pub fn build_measure_jet_frame(
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
@@ -318,10 +331,10 @@ pub fn build_measure_jet_frame(
     // Value-orthonormalize the head via the symmetric value Gram: head columns
     // become an orthonormal basis of the ambient-affine value span, so a degree
     // < r polynomial is reproduced by the head and leaves the innovations zero.
-    let head = orthonormalize_columns(&head_raw, MEASURE_JET_FRAME_RANK_RTOL)?;
+    let head = orthonormalize_columns(&head_raw, masses, MEASURE_JET_FRAME_RANK_RTOL)?;
     let head_dim = head.ncols();
 
-    // The growing pool of value-orthonormal columns: head first, then the lifted
+    // The growing pool of mass-orthonormal columns: head first, then the lifted
     // innovations as they are constructed level by level.
     let mut ortho_pool: Vec<Array1<f64>> = (0..head_dim).map(|j| head.column(j).to_owned()).collect();
     let mut innovation_cols: Vec<Array1<f64>> = Vec::new();
@@ -336,17 +349,17 @@ pub fn build_measure_jet_frame(
         let net = build_eps_half_net(centers, eps);
         let mut level_count = 0usize;
         for &node in net.iter() {
-            let atom_block = jet_atom_columns(centers, masses, node, eps, d);
+            let atom_block = jet_atom_columns(centers, node, eps, d);
             for raw in atom_block.into_iter() {
                 // Lift: subtract the value-projection onto the orthonormal pool
                 // (head + coarser innovations). The residual is the innovation;
                 // vanishing moments hold because the head is in the pool.
                 let mut resid = raw;
                 for basis_col in ortho_pool.iter() {
-                    let proj = basis_col.dot(&resid);
+                    let proj = mass_dot(basis_col, &resid, masses);
                     resid.scaled_add(-proj, basis_col);
                 }
-                let norm = resid.dot(&resid).sqrt();
+                let norm = mass_dot(&resid, &resid, masses).sqrt();
                 if norm > MEASURE_JET_FRAME_RANK_RTOL {
                     resid /= norm;
                     ortho_pool.push(resid.clone());
@@ -357,7 +370,7 @@ pub fn build_measure_jet_frame(
         }
         // Recorded in reverse (coarse→fine); reversed back to band order below.
         level_dims.push(level_count);
-        level_precisions.push(eps.powf(2.0 * order_s));
+        level_precisions.push(eps.powf(-2.0 * order_s));
     }
     // level_dims / level_precisions were filled coarse→fine (reverse of band).
     // Re-order to ascending-scale (band) order so the public layout matches
@@ -407,6 +420,7 @@ pub fn build_measure_jet_frame(
 
     Ok(MeasureJetFrame {
         n_nodes: n,
+        masses: masses.to_owned(),
         head_dim,
         level_dims,
         level_precisions,
@@ -507,17 +521,17 @@ pub(crate) fn build_eps_half_net(centers: ArrayView2<'_, f64>, eps: f64) -> Vec<
 }
 
 /// Build the local jet-atom columns for a single net node at `node` and scale
-/// `eps`: a Gaussian bump `w_i = mass_i · exp(−‖x_i − c‖²/(2ε²))` modulated by
+/// `eps`: a pointwise Gaussian bump `w_i = exp(−‖x_i − c‖²/(2ε²))` modulated by
 /// the local frame monomials `{1, (x_{i,k} − c_k)/ε}` for each coordinate `k`.
 /// Returns `1 + d` raw value-columns over the web (one per local monomial); the
 /// caller lifts them against the coarser pool.
 ///
 /// The Gaussian-bump and frame-coordinate conventions match
 /// `measure_jet_smooth::assemble_weighted_forms`: kernel `exp(−d²/(2ε²))`,
-/// frame coordinate `(x − c)/ε`, masses as the empirical-measure weights.
+/// frame coordinate `(x − c)/ε`; masses enter the discrete inner product, not
+/// these pointwise values.
 pub(crate) fn jet_atom_columns(
     centers: ArrayView2<'_, f64>,
-    masses: ArrayView1<'_, f64>,
     node: usize,
     eps: f64,
     d: usize,
@@ -535,7 +549,7 @@ pub(crate) fn jet_atom_columns(
             let diff = xi[k] - c[k];
             dd += diff * diff;
         }
-        bump[i] = masses[i] * (-dd * inv_two_eps2).exp();
+        bump[i] = (-dd * inv_two_eps2).exp();
     }
     let mut cols: Vec<Array1<f64>> = Vec::with_capacity(1 + d);
     // Monomial {1}: the bump itself.
@@ -552,11 +566,15 @@ pub(crate) fn jet_atom_columns(
     cols
 }
 
-/// Orthonormalize the columns of `a` in the standard Euclidean (value) inner
-/// product via modified Gram–Schmidt with a frozen rank tolerance; drop columns
+/// Orthonormalize the columns of `a` in the mass value inner product via
+/// modified Gram–Schmidt with a frozen rank tolerance; drop columns
 /// whose post-orthogonalization norm falls below `rtol · max_norm`. Returns an
 /// `n × rank` matrix with orthonormal columns spanning `col(a)`.
-pub(crate) fn orthonormalize_columns(a: &Array2<f64>, rtol: f64) -> Result<Array2<f64>, BasisError> {
+pub(crate) fn orthonormalize_columns(
+    a: &Array2<f64>,
+    masses: ArrayView1<'_, f64>,
+    rtol: f64,
+) -> Result<Array2<f64>, BasisError> {
     let n = a.nrows();
     let p = a.ncols();
     if p == 0 {
@@ -565,7 +583,8 @@ pub(crate) fn orthonormalize_columns(a: &Array2<f64>, rtol: f64) -> Result<Array
     // Reference scale: the largest raw column norm, for a relative drop test.
     let mut max_norm = 0.0_f64;
     for j in 0..p {
-        let nj = a.column(j).dot(&a.column(j)).sqrt();
+        let col = a.column(j).to_owned();
+        let nj = mass_dot(&col, &col, masses).sqrt();
         max_norm = max_norm.max(nj);
     }
     let drop_below = (rtol * max_norm).max(f64::MIN_POSITIVE);
@@ -573,10 +592,10 @@ pub(crate) fn orthonormalize_columns(a: &Array2<f64>, rtol: f64) -> Result<Array
     for j in 0..p {
         let mut v = a.column(j).to_owned();
         for q in basis.iter() {
-            let proj = q.dot(&v);
+            let proj = mass_dot(q, &v, masses);
             v.scaled_add(-proj, q);
         }
-        let norm = v.dot(&v).sqrt();
+        let norm = mass_dot(&v, &v, masses).sqrt();
         if norm > drop_below {
             v /= norm;
             basis.push(v);
@@ -591,6 +610,15 @@ pub(crate) fn orthonormalize_columns(a: &Array2<f64>, rtol: f64) -> Result<Array
         out.column_mut(j).assign(&col);
     }
     Ok(out)
+}
+
+#[inline]
+pub(crate) fn mass_dot(u: &Array1<f64>, v: &Array1<f64>, masses: ArrayView1<'_, f64>) -> f64 {
+    u.iter()
+        .zip(v.iter())
+        .zip(masses.iter())
+        .map(|((&ui, &vi), &mi)| mi * ui * vi)
+        .sum()
 }
 
 /// Top eigenvalue of a symmetric PSD matrix `m` by deterministic power
@@ -699,7 +727,7 @@ mod tests {
     /// ORACLE (1): ambient-affine functions live in the EXACT null space of the
     /// innovations at ANY τ (here: at the default band): the innovation analysis
     /// of an affine field is ~0 (energy ≤ 1e-10 × the rough field energy), the
-    /// property the V0 representer basis lacked. The head reproduces the affine
+    /// property the Gaussian-representer basis lacked. The head reproduces the affine
     /// field exactly.
     #[test]
     pub(crate) fn affine_functions_in_exact_null_space() {
@@ -715,7 +743,7 @@ mod tests {
         .expect("frame builds");
 
         let f = affine_values(centers.view(), 0.4, -1.3, 2.1);
-        let rough = f.dot(&f);
+        let rough = mass_dot(&f, &f, masses.view());
         // Analysis: the dual coefficients. The innovation block must vanish.
         let dual = frame.analyze(f.view()).expect("analyze");
         let head_dim = frame.head_dim();
@@ -748,7 +776,7 @@ mod tests {
 
     /// ORACLE (2): vanishing moments — the synthesis innovations annihilate
     /// degree < r polynomials at EVERY level. Equivalently, every innovation
-    /// column is value-orthogonal to the polynomial head, so `Sᵀ` of any affine
+    /// column is mass-orthogonal to the polynomial head, so `SᵀM_μ` of any affine
     /// field has a zero innovation block (checked here across a basis of the
     /// degree<r space, level by level).
     #[test]
@@ -780,7 +808,7 @@ mod tests {
             for _ in 0..dim {
                 let column = s.column(col);
                 for (bidx, basis_field) in affine_basis.iter().enumerate() {
-                    let ip = column.dot(basis_field);
+                    let ip = mass_dot(&column.to_owned(), basis_field, masses.view());
                     assert!(
                         ip.abs() <= 1e-9,
                         "level {l} innovation column {col} couples to affine basis {bidx}: <c,p>={ip:.3e}"
@@ -814,7 +842,7 @@ mod tests {
 
         let sx = frame.synthesize(x.view()).expect("synthesize");
         let sty = frame.analyze(y.view()).expect("analyze");
-        let lhs = sx.dot(&y);
+        let lhs = mass_dot(&sx, &y, masses.view());
         let rhs = x.dot(&sty);
         let scale = lhs.abs().max(rhs.abs()).max(1.0);
         assert!(
@@ -874,7 +902,7 @@ mod tests {
         )
         .expect("frame builds");
         let f = affine_values(centers.view(), -2.0, 3.5, -0.75);
-        let rough = f.dot(&f);
+        let rough = mass_dot(&f, &f, masses.view());
         let dual = frame.analyze(f.view()).expect("analyze");
         let mut innov_energy = 0.0;
         for j in frame.head_dim()..frame.total_dim() {

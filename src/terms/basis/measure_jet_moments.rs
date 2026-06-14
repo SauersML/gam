@@ -1,6 +1,6 @@
-//! Measure-jet V∞ §2 data interface: per-cell frozen-weight polynomial
+//! Measure-jet frame data interface: per-cell frozen-weight polynomial
 //! moment tables with a binomial-shift merge monoid
-//! (`docs/measure_jet_v_infinity.md`, §2 "Data interface: moments or
+//! (`docs/measure_jet_frame.md`, §2 "Data interface: moments or
 //! nothing").
 //!
 //! This module aggregates caller-computed weights into order-0..2 coordinate
@@ -64,7 +64,7 @@
 //!
 //! [`jet_sufficient_stats`] reproduces, in closed form from a stored table
 //! whose weights were computed for the same center and scale, exactly the
-//! local-fit quantities the V0 workhorse
+//! local-fit quantities the current workhorse
 //! (`measure_jet_smooth.rs::assemble_weighted_forms`) computes from raw
 //! points per (center, scale) block: the kernel mass `q`, the dimensionless
 //! weighted feature mean `a_mean`, the dimensionless slope Gram
@@ -94,7 +94,7 @@ pub(crate) const MEASURE_JET_MOMENT_CHUNK_ROWS: usize = 8192;
 ///
 /// Channel convention: channel 0 is the UNIT channel (`g ≡ 1`); further
 /// channels carry responses (`y`, and later `y²`, PIRLS working `z`, `w` per
-/// the V∞ charter). The table itself never enforces the convention — it
+/// the frame notes). The table itself never enforces the convention — it
 /// aggregates whatever the caller hands it — but [`jet_sufficient_stats`]
 /// reads `q`, `a_mean`, and the Gram off channel 0.
 ///
@@ -530,7 +530,11 @@ mod tests {
 
     /// Closeness metric for the recenter-exactness gate: relative at scale,
     /// absolute `tol` below unit scale (`|x−y| ≤ tol·(1 + max(|x|,|y|))`).
-    pub(crate) fn assert_tables_close(a: &MeasureJetMomentTable, b: &MeasureJetMomentTable, tol: f64) {
+    pub(crate) fn assert_tables_close(
+        a: &MeasureJetMomentTable,
+        b: &MeasureJetMomentTable,
+        tol: f64,
+    ) {
         let pairs = |xs: &[f64], ys: &[f64], label: &str| {
             assert_eq!(xs.len(), ys.len(), "{label}: length mismatch");
             for (i, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {
@@ -567,7 +571,10 @@ mod tests {
     }
 
     /// Bit-identity gate: every stored f64 must agree by `to_bits`.
-    pub(crate) fn assert_tables_bit_identical(a: &MeasureJetMomentTable, b: &MeasureJetMomentTable) {
+    pub(crate) fn assert_tables_bit_identical(
+        a: &MeasureJetMomentTable,
+        b: &MeasureJetMomentTable,
+    ) {
         let bits = |xs: &[f64], ys: &[f64], label: &str| {
             assert_eq!(xs.len(), ys.len(), "{label}: length mismatch");
             for (i, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {

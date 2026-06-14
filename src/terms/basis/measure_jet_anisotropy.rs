@@ -21,9 +21,9 @@
 //! det-normalized factor `M = L / det(L)^(1/d)` (so `M Mᵀ = Ā`, `det M = 1`):
 //!
 //! ```text
-//!   ‖M δ‖²       = δᵀ Ā δ           (metric squared distance → kernel),
-//!   (M δ)/ε      = M·(δ/ε)          (metric local affine features),
-//!   Y = X Mᵀ     (transformed centers; E_A(X) ≡ E_I(Y)).
+//!   ‖δ M‖²       = δ Ā δᵀ           (metric squared distance → kernel),
+//!   (δ/ε)M       = metric local affine features,
+//!   Y = X M      (transformed row centers; E_A(X) ≡ E_I(Y)).
 //! ```
 //!
 //! Because the local affine residual projects each block's center values onto
@@ -251,21 +251,21 @@ pub(crate) fn build_normalized_factor(
 // Per-block algebra and its exact L-jets.
 // ----------------------------------------------------------------------------
 
-/// Squared metric distances `δᵀĀδ = ‖M δ‖²` for every center pair, plus the
+/// Squared metric distances `δĀδᵀ = ‖δ M‖²` for every center pair, plus the
 /// active first/second `L`-directional derivatives of each. Used for the ε/2
 /// outer net, the neighbor cutoff, and the kernel exponent — exactly the role
 /// `pairwise_sq_dists` plays in the isotropic assembly.
 pub(crate) struct MetricDist2 {
-    /// `dM2[(i, j)] = ‖M (x_i − x_j)‖²`.
+    /// `dM2[(i, j)] = ‖(x_i − x_j) M‖²`.
     pub(crate) dm2: Array2<f64>,
 }
 
 pub(crate) fn metric_sq_dists(centers: ArrayView2<'_, f64>, m: ArrayView2<'_, f64>) -> MetricDist2 {
     let n = centers.nrows();
-    // Y = X Mᵀ ; ‖M δ‖² = ‖Y_i − Y_j‖². Build Y once, then GEMM-style Gram with
+    // Y = X M ; ‖δ M‖² = ‖Y_i − Y_j‖². Build Y once, then GEMM-style Gram with
     // the same `‖a‖²+‖b‖²−2aᵀb`, clamped at 0 (mirrors pairwise_sq_dists so the
     // `M = I` path lands identically).
-    let y = centers.dot(&m.t());
+    let y = centers.dot(&m);
     let yn: Vec<f64> = y.outer_iter().map(|r| r.dot(&r)).collect();
     let g = y.dot(&y.t());
     let mut dm2 = Array2::<f64>::zeros((n, n));
@@ -339,36 +339,132 @@ pub(crate) fn eigh_pinv(a: &Array2<f64>, label: &str) -> Result<EighPinv, BasisE
 /// eigenbasis to stay exact across the rank boundary.
 pub(crate) fn pinv_first_deriv(ep: &EighPinv, gdot: &Array2<f64>) -> Array2<f64> {
     let n = ep.evals.len();
-    // M_pq = v_pᵀ Ġ v_q in the eigenbasis.
     let vt_g = ep.evecs.t().dot(gdot);
     let mhat = vt_g.dot(&ep.evecs); // (n×n) in eigen coords
-    // Coefficient c_pq for the pseudo-inverse derivative.
-    //   range×range:  −inv_p·inv_q
-    //   range×null :  +inv_p²        (and symmetric null×range)
-    //   null ×null :   0
-    let mut coeff = Array2::<f64>::zeros((n, n));
-    for p in 0..n {
-        let ip = ep.inv[p];
-        let p_range = ip != 0.0;
-        for q in 0..n {
-            let iq = ep.inv[q];
-            let q_range = iq != 0.0;
-            coeff[(p, q)] = if p_range && q_range {
-                -ip * iq
-            } else if p_range && !q_range {
-                ip * ip
-            } else if !p_range && q_range {
-                iq * iq
-            } else {
-                0.0
-            };
-        }
-    }
-    // d(G⁺) = V · (coeff ⊙ M̂) · Vᵀ.
     let mut core = Array2::<f64>::zeros((n, n));
     for p in 0..n {
         for q in 0..n {
-            core[(p, q)] = coeff[(p, q)] * mhat[(p, q)];
+            core[(p, q)] = pinv_div1(ep, p, q) * mhat[(p, q)];
+        }
+    }
+    ep.evecs.dot(&core).dot(&ep.evecs.t())
+}
+
+#[inline]
+pub(crate) fn pinv_active(ep: &EighPinv, i: usize) -> bool {
+    ep.inv[i] != 0.0
+}
+
+#[inline]
+pub(crate) fn pinv_value(ep: &EighPinv, i: usize) -> f64 {
+    if pinv_active(ep, i) {
+        ep.inv[i]
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+pub(crate) fn pinv_prime(ep: &EighPinv, i: usize) -> f64 {
+    if pinv_active(ep, i) {
+        -ep.inv[i] * ep.inv[i]
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+pub(crate) fn pinv_half_second(ep: &EighPinv, i: usize) -> f64 {
+    if pinv_active(ep, i) {
+        ep.inv[i] * ep.inv[i] * ep.inv[i]
+    } else {
+        0.0
+    }
+}
+
+pub(crate) fn pinv_div1(ep: &EighPinv, i: usize, j: usize) -> f64 {
+    if i == j {
+        return pinv_prime(ep, i);
+    }
+    let li = ep.evals[i];
+    let lj = ep.evals[j];
+    let denom = li - lj;
+    let scale = li.abs().max(lj.abs()).max(1.0);
+    if denom.abs() <= 16.0 * f64::EPSILON * scale {
+        if pinv_active(ep, i) == pinv_active(ep, j) {
+            0.5 * (pinv_prime(ep, i) + pinv_prime(ep, j))
+        } else {
+            0.0
+        }
+    } else {
+        (pinv_value(ep, i) - pinv_value(ep, j)) / denom
+    }
+}
+
+pub(crate) fn pinv_div2(ep: &EighPinv, i: usize, k: usize, j: usize) -> f64 {
+    if i == k && k == j {
+        return pinv_half_second(ep, i);
+    }
+    let li = ep.evals[i];
+    let lk = ep.evals[k];
+    let lj = ep.evals[j];
+    if i == j {
+        let h = lk - li;
+        let scale = li.abs().max(lk.abs()).max(1.0);
+        if h.abs() <= 16.0 * f64::EPSILON * scale {
+            return pinv_half_second(ep, i);
+        }
+        return (pinv_value(ep, k) - pinv_value(ep, i) - pinv_prime(ep, i) * h) / (h * h);
+    }
+    if i == k {
+        let denom = li - lj;
+        let scale = li.abs().max(lj.abs()).max(1.0);
+        if denom.abs() <= 16.0 * f64::EPSILON * scale {
+            return pinv_half_second(ep, i);
+        }
+        return (pinv_prime(ep, i) - pinv_div1(ep, i, j)) / denom;
+    }
+    if k == j {
+        let denom = li - lj;
+        let scale = li.abs().max(lj.abs()).max(1.0);
+        if denom.abs() <= 16.0 * f64::EPSILON * scale {
+            return pinv_half_second(ep, j);
+        }
+        return (pinv_div1(ep, i, j) - pinv_prime(ep, j)) / denom;
+    }
+    let denom = li - lj;
+    let scale = li.abs().max(lj.abs()).max(1.0);
+    if denom.abs() <= 16.0 * f64::EPSILON * scale {
+        let h = lk - li;
+        if h.abs() <= 16.0 * f64::EPSILON * scale {
+            pinv_half_second(ep, i)
+        } else {
+            (pinv_value(ep, k) - pinv_value(ep, i) - pinv_prime(ep, i) * h) / (h * h)
+        }
+    } else {
+        (pinv_div1(ep, i, k) - pinv_div1(ep, k, j)) / denom
+    }
+}
+
+pub(crate) fn pinv_second_deriv(
+    ep: &EighPinv,
+    gx: &Array2<f64>,
+    gy: &Array2<f64>,
+    gxy: &Array2<f64>,
+) -> Array2<f64> {
+    let n = ep.evals.len();
+    let gx_hat = ep.evecs.t().dot(gx).dot(&ep.evecs);
+    let gy_hat = ep.evecs.t().dot(gy).dot(&ep.evecs);
+    let gxy_hat = ep.evecs.t().dot(gxy).dot(&ep.evecs);
+    let mut core = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            let mut value = pinv_div1(ep, i, j) * gxy_hat[(i, j)];
+            for k in 0..n {
+                value += pinv_div2(ep, i, k, j)
+                    * (gx_hat[(i, k)] * gy_hat[(k, j)] + gy_hat[(i, k)] * gx_hat[(k, j)]);
+            }
+            core[(i, j)] = value;
         }
     }
     ep.evecs.dot(&core).dot(&ep.evecs.t())
@@ -386,12 +482,18 @@ pub(crate) struct BlockForms {
     pub(crate) dr: Vec<Array2<f64>>,
     /// `∂²R/∂L_a∂L_b` (ml×ml), full pair grid `a*n+b`.
     pub(crate) d2r: Vec<Array2<f64>>,
+    /// Kernel mass `q = Σ_a w_a` before the outer density exponent.
+    pub(crate) q: f64,
+    /// `∂q/∂L_a`.
+    pub(crate) dq: Vec<f64>,
+    /// `∂²q/∂L_a∂L_b`, full pair grid `a*n+b`.
+    pub(crate) d2q: Vec<f64>,
 }
 
 /// Assemble one local block's residual `R = CᵀWC − B G⁺ Bᵀ / q` and its exact
-/// first/second `L`-jets. `phi[a,k] = δ_{a,k}/ε`, `w[a] = mass·exp(−‖M φ_a‖²/2)`.
-/// `dphi`/`d2phi` are the directional derivatives of `M φ` (i.e. `Ṁ φ`,
-/// `M̈ φ`). This is the metric generalization of the inner loop in
+/// first/second `L`-jets. `phi[a,k] = δ_{a,k}/ε`, `w[a] = mass·exp(−‖φ_a M‖²/2)`.
+/// `dpsi`/`d2psi` are the directional derivatives of `φ M` (i.e. `φ Ṁ`,
+/// `φ M̈`). This is the metric generalization of the inner loop in
 /// `measure_jet_smooth::assemble_weighted_forms`, with value and jets sharing
 /// one walk so a value↔derivative desync is structurally impossible.
 #[allow(clippy::too_many_arguments)]
@@ -406,16 +508,16 @@ pub(crate) fn block_residual_jets(
     let ml = phi.nrows();
     let n = n_active;
 
-    // Transformed features psi = phi·Mᵀ (ml×d) and its L-derivatives.
-    let psi = phi.dot(&m.t());
+    // Transformed row features psi = phi·M (ml×d) and its L-derivatives.
+    let psi = phi.dot(&m);
     let mut dpsi: Vec<Array2<f64>> = Vec::with_capacity(n);
     for a in 0..n {
-        dpsi.push(phi.dot(&dm[a].t()));
+        dpsi.push(phi.dot(&dm[a]));
     }
     let mut d2psi: Vec<Array2<f64>> = Vec::with_capacity(n * n);
     for a in 0..n {
         for b in 0..n {
-            d2psi.push(phi.dot(&d2m[a * n + b].t()));
+            d2psi.push(phi.dot(&d2m[a * n + b]));
         }
     }
 
@@ -617,7 +719,7 @@ pub(crate) fn block_residual_jets(
                         hd[(r, c)] += d2w[x * n + y][a] * pr * pc
                             + dw[x][a] * (dpry * pc + pr * dpcy)
                             + dw[y][a] * (dprx * pc + pr * dpcx)
-                            + w[a] * (d2pr * pc + dprx * dpry + dpry * dpcx + pr * d2pc);
+                            + w[a] * (d2pr * pc + dprx * dpcy + dpry * dpcx + pr * d2pc);
                     }
                 }
             }
@@ -680,32 +782,14 @@ pub(crate) fn block_residual_jets(
     for x in 0..n {
         dgpinv.push(pinv_first_deriv(&ep, &dg[x]));
     }
-    // Second derivative of G⁺: differentiate dG⁺(direction y) of the
-    // first-derivative formula. We use the operator identity for the
-    // symmetric (range-restricted) pseudo-inverse:
-    //   (G⁺)'' = −G⁺ G'' G⁺
-    //            + G⁺ G' G⁺ G' G⁺ + G⁺ G' G⁺ G' G⁺   (the two G'-G' orders)
-    //            + range/null curvature corrections.
-    // On the retained range the projector is constant to first order in the
-    // generic (non-degenerate retained spectrum) regime, so the standard
-    // matrix-inverse second derivative on the range block is exact and the
-    // null block stays null. We assemble it as the derivative of the
-    // eigenbasis first-derivative expression with the eigenvectors held to
-    // first order — equivalently the closed form below — and FD-gate it.
+    // Second derivative of G⁺ as a fixed-rank spectral matrix function:
+    // K_xy = DK[G][G_xy] + D²K[G][G_x, G_y]. The divided-difference formulas
+    // include retained-range, inactive-range, and cross terms without assuming
+    // an inverse on a frozen range block.
     let mut d2gpinv: Vec<Array2<f64>> = Vec::with_capacity(n * n);
     for x in 0..n {
         for y in 0..n {
-            let gpx = &dgpinv[x];
-            let gpy = &dgpinv[y];
-            // −G⁺ G''_xy G⁺
-            let term0 = gpinv.dot(&d2g[x * n + y]).dot(&gpinv);
-            // For the symmetric pinv on the range, (G⁺)' = −G⁺ G' G⁺ + P⊥-terms.
-            // Its further derivative gives  −(G⁺)'_x G'_y G⁺ − G⁺ G'_y (G⁺)'_x
-            // − G⁺ G''_xy G⁺  (the last is term0). Assemble with the exact
-            // first-order pinv derivatives already in hand.
-            let cross = gpx.dot(&dg[y]).dot(&gpinv) + gpinv.dot(&dg[y]).dot(gpx);
-            let d2gp = &(-(&term0)) - &cross;
-            d2gpinv.push(d2gp);
+            d2gpinv.push(pinv_second_deriv(&ep, &dg[x], &dg[y], &d2g[x * n + y]));
         }
     }
 
@@ -814,7 +898,14 @@ pub(crate) fn block_residual_jets(
         }
     }
 
-    BlockForms { r, dr, d2r }
+    BlockForms {
+        r,
+        dr,
+        d2r,
+        q,
+        dq,
+        d2q,
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -895,7 +986,9 @@ pub fn measure_jet_anisotropy_energy_form_with_jets(
 
     for &eps in &band.eps {
         let cutoff2 = (PROFILE_CUTOFF * eps) * (PROFILE_CUTOFF * eps);
-        let scale_weight = band.log_step * eps.powf(-2.0 * order_s);
+        let intrinsic_dim = d as f64;
+        let eta = 2.0 * order_s + intrinsic_dim * (2.0 - 2.0 * alpha);
+        let scale_weight = band.log_step * eps.powf(-eta);
         let net_radius2 = 0.25 * eps * eps;
 
         // Greedy ε/2-net over the metric distances, mass aggregated to nearest
@@ -967,23 +1060,38 @@ pub fn measure_jet_anisotropy_energy_form_with_jets(
                 n,
             );
 
-            // Outer weight base = log_step · ε^(−2s) · net_mass_i · q^(1−2α).
+            // Outer weight base = log_step · ε^(−η) · net_mass_i · q^(1−2α),
+            // η = 2s + d(2−2α), preserving the advertised |ξ|^(2s) order for
+            // the available dimension parameter.
             // q here is the block's metric kernel mass (matches the isotropic
             // assembly's `q`); it is metric-dependent but enters the energy as
             // a fixed outer scalar, identical to the isotropic convention.
             let base = scale_weight * net_mass[i] * q_block.powf(1.0 - 2.0 * alpha);
+            let beta = 1.0 - 2.0 * alpha;
 
-            // Scatter value + jets with the constant outer weight `base`.
+            // Scatter value + jets with the outer q^β product rule. The block
+            // derivatives are for R; q, dq and d2q carry the metric-dependent
+            // density weight.
             for (a, &ja) in idx.iter().enumerate() {
                 for (c, &jc) in idx.iter().enumerate() {
                     q_form[(ja, jc)] += base * blk.r[(a, c)];
                     for x in 0..n {
-                        d_first[x][(ja, jc)] += base * blk.dr[x][(a, c)];
+                        let qx_over_q = blk.dq[x] / blk.q;
+                        d_first[x][(ja, jc)] +=
+                            base * (blk.dr[x][(a, c)] + beta * qx_over_q * blk.r[(a, c)]);
                     }
                     for x in 0..n {
                         for y in 0..n {
-                            d_second[x * n + y][(ja, jc)] +=
-                                base * blk.d2r[x * n + y][(a, c)];
+                            let qx_over_q = blk.dq[x] / blk.q;
+                            let qy_over_q = blk.dq[y] / blk.q;
+                            let qxy_over_q = blk.d2q[x * n + y] / blk.q;
+                            let density_d2 =
+                                beta * qxy_over_q + beta * (beta - 1.0) * qx_over_q * qy_over_q;
+                            d_second[x * n + y][(ja, jc)] += base
+                                * (blk.d2r[x * n + y][(a, c)]
+                                    + beta * qx_over_q * blk.dr[y][(a, c)]
+                                    + beta * qy_over_q * blk.dr[x][(a, c)]
+                                    + density_d2 * blk.r[(a, c)]);
                         }
                     }
                 }

@@ -1,12 +1,12 @@
 //! Measure-jet spline smooth: multiscale local-jet-residual energy of the
-//! empirical measure (V0, center-quadratured).
+//! empirical measure (center-quadratured current implementation).
 //!
 //! The term penalizes, at every quadrature point and every scale, the failure
 //! of `f` to be locally affine *in the measure*:
 //!
 //! ```text
 //!   Q = Σ_ℓ  w_ℓ · Σ_i  mass_i · q_i(ε_ℓ)^(1−2α) · R_{i,ℓ},
-//!   w_ℓ = log_step · ε_ℓ^(−2s),
+//!   w_ℓ = log_step · ε_ℓ^(−η),   η = 2s + d(2−2α),
 //! ```
 //!
 //! where `R_{i,ℓ}` is the residual quadratic form of the exact weighted
@@ -34,18 +34,16 @@
 //!   not create an affine toll. The retained rank is a numerical property of
 //!   the weighted cell, not a smoothing dial.
 //! - **Mellin band.** Scales form a geometric grid from the center-spacing
-//!   floor to the half-diameter; `w_ℓ = log_step · ε_ℓ^(−2s)` is the
-//!   quadrature of `∫ ε^(−2s) (·) dε/ε`, giving a continuous smoothness
-//!   order `s ∈ (0, 2)` with no preferred internal scale (default 1.5). On a
-//!   flat stratum the symbol of the band-limited form is `≍ |ξ|^{2s}`
-//!   (substitute `t = ε|ξ|` in the Mellin integral) — fractional Duchon on
-//!   the web with learned order.
+//!   floor to the half-diameter; `w_ℓ = log_step · ε_ℓ^(−η)`, with
+//!   `η = 2s + d(2−2α)`, is the fixed-order quadrature weight used by this
+//!   implementation. It keeps the advertised continuous smoothness order
+//!   `s ∈ (0, 2)` from silently changing when `α` changes.
 //! - **Density normalization.** The outer quadrature weight
 //!   `mass_i · q_i^(1−2α)` realizes `dμ(x)/q_ε(x)^(2α−1)`. On a p-dimensional
-//!   stratum with sampling density `ρ`, `q_ε ~ Cρ ε^p` and the local affine
-//!   residual scales as `R_ε ~ Cρ ε^{p+4}|Hf|²`, so the limiting density
-//!   factor is `ρ^(3−2α)`: `α = 1` (default) is density-weighted Hessian
-//!   energy, while density-free Hessian energy would use `α = 3/2`.
+//!   stratum with sampling density `ρ`, `q_ε ~ Cρ ε^p` and the local residual
+//!   contributes an extra `ε^{p(2−2α)}` factor. The fixed-order scale weight
+//!   cancels that factor using the available dimension parameter; without that
+//!   correction, the symbol exponent would be `2s + 2p(α−1)`.
 //! - **Frozen-quadrature replay.** The penalty and extrapolation diagnostic
 //!   depend on the FIT data through center masses, the realized band, on-web
 //!   support anchors, and penalty normalization scales. The freeze step
@@ -103,14 +101,14 @@
 //!
 //! The outer sum is coarsened per scale to a deterministic ε/2-net (the
 //! outer Riemann sum needs resolution ε, not the center-spacing floor), so
-//! the band totals ~O(m²·d) instead of O(L·m³) — the V0 realization of the
-//! pyramid principle that each scale interacts at its own level. This is
+//! the band totals ~O(m²·d) instead of O(L·m³) — the current realization of
+//! the pyramid principle that each scale interacts at its own level. This is
 //! mass-lumped quadrature of the displayed outer integral; it is first-
 //! moment exact for the cell locations and carries the usual
 //! `O(diam²/ε²)` relative scale for smooth Gaussian-weighted functionals,
 //! not an estimand-preserving identity.
-//! The long-form home for the ladder and the substrate contracts is the V∞
-//! charter (`docs/measure_jet_v_infinity.md`); its §2 moment substrate is
+//! The long-form home for the ladder and the substrate contracts is the
+//! frame notes (`docs/measure_jet_frame.md`); its §2 moment substrate is
 //! `measure_jet_moments.rs`, its §5 extrapolation pricing
 //! `measure_jet_predict.rs`.
 
@@ -397,7 +395,10 @@ pub(crate) fn householder_drop_first_apply(x: &Array2<f64>, u: &Array1<f64>) -> 
     out
 }
 
-pub(crate) fn symmetric_pseudoinverse(a: &Array2<f64>, label: &str) -> Result<Array2<f64>, BasisError> {
+pub(crate) fn symmetric_pseudoinverse(
+    a: &Array2<f64>,
+    label: &str,
+) -> Result<Array2<f64>, BasisError> {
     let n = a.nrows();
     if a.ncols() != n {
         crate::bail_dim_basis!(
@@ -519,7 +520,10 @@ pub(crate) fn pairwise_sq_dists(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) 
 /// few hundred MB of transient per block, GEMM-speed throughout.
 pub(crate) const MEASURE_JET_ASSIGN_BLOCK_ROWS: usize = 65_536;
 
-pub(crate) fn validate_finite_points(points: ArrayView2<'_, f64>, what: &str) -> Result<(), BasisError> {
+pub(crate) fn validate_finite_points(
+    points: ArrayView2<'_, f64>,
+    what: &str,
+) -> Result<(), BasisError> {
     for (i, row) in points.outer_iter().enumerate() {
         if row.iter().any(|v| !v.is_finite()) {
             crate::bail_invalid_basis!("measure-jet {what} row {i} has a non-finite coordinate");
@@ -612,23 +616,12 @@ pub fn measure_jet_band(
     })
 }
 
-/// Support-constrained quadrature of the empirical measure on the cell
-/// partition induced by the seed centers: nearest-center assignment
-/// (deterministic tie-break: lowest center index) yields per-cell masses,
-/// and each non-empty cell's quadrature NODE is its **medoid** — the in-cell
-/// data row nearest the cell's mass-weighted barycenter (deterministic ties to
-/// the lowest row index). The barycenter is the right first-moment summary of
-/// the cell, but it does NOT lie in the support: on a curved stratum the
-/// barycenter of an arc of points is pulled into the interior of the curvature
-/// by `≍ κ·(cell extent)²/8`, OFF the manifold. The medoid snaps that summary
-/// back onto an actual sample point, so the node stays on the data manifold
-/// while still tracking the cell's first moment. This matters because the SAME
-/// node set is the Gaussian-representer DESIGN center set: an off-manifold
-/// representer cannot peak where the data and the truth live, a level/tilt
-/// reconstruction bias that REML cannot remove by rescaling λ (it is a
-/// basis-span defect, not a smoothness-amount one) — the dominant accuracy
-/// limiter of this smooth (#1041). Empty cells keep their seed coordinates with
-/// zero mass (the assembly skips them; their representer columns remain valid).
+/// First-moment-exact quadrature of the empirical measure on the cell partition
+/// induced by the seed centers: nearest-center assignment (deterministic
+/// tie-break: lowest center index) yields per-cell masses, and each non-empty
+/// cell's quadrature node is its mass-weighted barycenter. Empty cells keep
+/// their seed coordinates with zero mass (the assembly skips them; their
+/// representer columns remain valid).
 pub fn measure_jet_quadrature_nodes(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -687,32 +680,15 @@ pub fn measure_jet_quadrature_nodes(
             sums[(j, k)] += data[(i, k)];
         }
     }
-    // Cell barycenters: the first moment of μ on each cell (used only as the
-    // medoid target below, never as the node itself — see the fn docs).
+    // Cell barycenters: the first moment of μ on each cell. These are the
+    // realized nodes for first-moment-exact lumping.
     let mut barycenter = sums;
     for j in 0..m {
         let count = masses[j] * n as f64;
         if count > 0.0 {
             for k in 0..d {
                 barycenter[(j, k)] /= count;
-            }
-        }
-    }
-    // Medoid snap: each non-empty cell's node is the in-cell data row nearest
-    // its barycenter (lowest-row-index tie break), keeping the node on the data
-    // manifold. Empty cells retain their seed coordinates (set above by the
-    // `centers.to_owned()` initialization).
-    let mut best_d2 = vec![f64::INFINITY; m];
-    for (i, &j) in assignments.iter().enumerate() {
-        let mut d2 = 0.0_f64;
-        for k in 0..d {
-            let diff = data[(i, k)] - barycenter[(j, k)];
-            d2 += diff * diff;
-        }
-        if d2 < best_d2[j] {
-            best_d2[j] = d2;
-            for k in 0..d {
-                nodes[(j, k)] = data[(i, k)];
+                nodes[(j, k)] = barycenter[(j, k)];
             }
         }
     }
@@ -737,7 +713,8 @@ pub fn measure_jet_center_masses(
 /// Per block the closure receives `(scale_idx, eps, q, base)` where `q` is
 /// the truncated kernel sum used by the local residual and `base`
 /// is the fully-assembled outer weight
-/// `log_step · ε^(−2s) · net_mass_i · q^(1−2α)`, and writes, per requested
+/// `log_step · ε^(−η) · net_mass_i · q^(1−2α)`, with
+/// `η = 2s + d(2−2α)` for the available dimension parameter, and writes, per requested
 /// form, one weight triple `[w_R, w_2, w_3]`. Only `w_R` is live:
 /// `R = CᵀWC − B·G⁺·Bᵀ/q`, with `G⁺` the rank-revealing pseudo-inverse.
 /// The extra slots are retained for the ψ layout and receive zero local
@@ -804,7 +781,8 @@ where
             (0..n_forms).map(|_| Array2::<f64>::zeros((m, m))).collect();
         let cutoff2 = (MEASURE_JET_PROFILE_CUTOFF * eps) * (MEASURE_JET_PROFILE_CUTOFF * eps);
         let inv_two_eps2 = 1.0 / (2.0 * eps * eps);
-        let scale_weight = band.log_step * eps.powf(-2.0 * order_s);
+        let eta = 2.0 * order_s + (d as f64) * (2.0 - 2.0 * alpha);
+        let scale_weight = band.log_step * eps.powf(-eta);
         // Outer-quadrature coarsening: greedy ε/2-net over the centers in
         // fixed index order (deterministic), with every center's mass
         // aggregated to its nearest net member (lowest-index tie break).
@@ -1011,7 +989,8 @@ pub fn measure_jet_energy_form_with_jets(
         3,
         &|_, eps: f64, q: f64, base: f64, out: &mut [[f64; 3]]| {
             let gs = -2.0 * eps.ln();
-            let ga = -2.0 * q.max(f64::MIN_POSITIVE).ln();
+            let intrinsic_dim = centers.ncols() as f64;
+            let ga = 2.0 * intrinsic_dim * eps.ln() - 2.0 * q.max(f64::MIN_POSITIVE).ln();
             out[0] = [base, 0.0, 0.0];
             out[1] = [gs * base, 0.0, 0.0];
             out[2] = [gs * gs * base, 0.0, 0.0];
@@ -1429,7 +1408,7 @@ pub fn build_measure_jet_basis(
     // fitted order is read off the spectrum (ŝ = −½ · slope of ln λ̂_ℓ on
     // ln ε_ℓ) instead of being optimized. An explicit s > 0 pins the Mellin
     // weights and fuses the band into one candidate. The Mellin prefactor
-    // ε^(−2s)·log_step inside each per-scale form is absorbed by the
+    // ε^(−η)·log_step inside each per-scale form is absorbed by the
     // per-candidate Frobenius normalization, so REML owns the amplitudes
     // outright. The sentinel itself is persisted in the metadata as the mode
     // marker: a replay MUST re-enter the same mode or the penalty count
@@ -1450,7 +1429,9 @@ pub fn build_measure_jet_basis(
         for (level, q_l) in forms.into_iter().enumerate() {
             let s_l = kz.t().dot(&q_l).dot(&kz);
             let (s_norm, c_l) = normalize_penalty(&((&s_l + &s_l.t()) * 0.5));
-            let scale_weight = log_step * eps_band[level].powf(-2.0 * order_s);
+            let intrinsic_dim = centers.ncols() as f64;
+            let eta = 2.0 * order_s + intrinsic_dim * (2.0 - 2.0 * spec.alpha);
+            let scale_weight = log_step * eps_band[level].powf(-eta);
             penalty_normalization_scales.push(c_l);
             raw_penalty_normalization_scales.push(c_l / scale_weight);
             candidates.push(PenaltyCandidate {
@@ -1636,11 +1617,12 @@ pub fn build_measure_jet_basis_psi_derivatives(
             spec.tau0,
             6 * l_count,
             3,
-            &|scale_idx, _, q: f64, base: f64, out: &mut [[f64; 3]]| {
+            &|scale_idx, eps: f64, q: f64, base: f64, out: &mut [[f64; 3]]| {
                 for slot in out.iter_mut() {
                     *slot = [0.0, 0.0, 0.0];
                 }
-                let ga = -2.0 * q.max(f64::MIN_POSITIVE).ln();
+                let intrinsic_dim = geom.centers.ncols() as f64;
+                let ga = 2.0 * intrinsic_dim * eps.ln() - 2.0 * q.max(f64::MIN_POSITIVE).ln();
                 let k0 = 6 * scale_idx;
                 out[k0] = [base, 0.0, 0.0];
                 out[k0 + 1] = [ga * base, 0.0, 0.0];
@@ -1671,15 +1653,14 @@ pub fn build_measure_jet_basis_psi_derivatives(
         // (n_active = 1) aligned with the build's penalty list while contributing
         // no penalty ψ-derivative (the penalty is ℓ-independent). MUST match
         // `measure_jet_penalty_psi_dim` (= 0 coords) and the build's 1 candidate.
-        let q_value =
-            sandwich(&measure_jet_energy_form(
-                geom.centers.view(),
-                geom.masses.view(),
-                &band,
-                geom.order_s_eval,
-                spec.alpha,
-                spec.tau0,
-            )?);
+        let q_value = sandwich(&measure_jet_energy_form(
+            geom.centers.view(),
+            geom.masses.view(),
+            &band,
+            geom.order_s_eval,
+            spec.alpha,
+            spec.tau0,
+        )?);
         let raw = vec![(q_value, Vec::new(), Vec::new(), Vec::new())];
         (0usize, Vec::new(), raw)
     };
@@ -1802,8 +1783,11 @@ pub fn build_measure_jet_basis_psi_derivatives(
             all_crosses.push((0..n_cands).map(|_| zero_p()).collect());
         }
     }
-    let pair_index: Vec<((usize, usize), Vec<Array2<f64>>)> =
-        all_pairs.iter().copied().zip(all_crosses.into_iter()).collect();
+    let pair_index: Vec<((usize, usize), Vec<Array2<f64>>)> = all_pairs
+        .iter()
+        .copied()
+        .zip(all_crosses.into_iter())
+        .collect();
     let shifted_pairs = all_pairs;
     let provider = AnisoPenaltyCrossProvider::new(move |a, b| {
         pair_index
@@ -2266,7 +2250,10 @@ mod tests {
     /// once, pin everything (nodes, masses, band, transform, realized ℓ),
     /// and return the pinned spec so dial-perturbed rebuilds move ONLY the
     /// dials — the per-trial contract the optimizer relies on.
-    pub(crate) fn frozen_spec_fixture(order_s: f64, multiscale: bool) -> (Array2<f64>, MeasureJetBasisSpec) {
+    pub(crate) fn frozen_spec_fixture(
+        order_s: f64,
+        multiscale: bool,
+    ) -> (Array2<f64>, MeasureJetBasisSpec) {
         // Multiscale (per-scale + ψ) mode is the explicit opt-in (#1116); the
         // per-level fixture passes `multiscale = true`, the fused fixture
         // `false`. A large center count is kept so the multiscale spectrum is
@@ -2444,7 +2431,11 @@ mod tests {
         );
         // The ℓ coordinate carries one (all-zero) penalty candidate: the penalty
         // is ℓ-independent, so its ψ-derivative is identically zero.
-        assert_eq!(derivs.penalties_first[0].len(), 1, "one fitted penalty candidate");
+        assert_eq!(
+            derivs.penalties_first[0].len(),
+            1,
+            "one fitted penalty candidate"
+        );
         assert!(
             derivs.penalties_first[0][0].iter().all(|v| *v == 0.0)
                 && derivs.penalties_second_diag[0][0].iter().all(|v| *v == 0.0),
@@ -2489,7 +2480,7 @@ mod tests {
     /// (first-moment-exact lumping), with empty cells keeping their seed
     /// coordinates at zero mass.
     #[test]
-    pub(crate) fn quadrature_nodes_are_cell_medoids() {
+    pub(crate) fn quadrature_nodes_are_cell_barycenters() {
         // Two tight groups around (0,0) and (10,10); a third seed far away
         // captures nothing.
         let data = array![
@@ -2506,25 +2497,15 @@ mod tests {
         assert!((masses[0] - 0.6).abs() <= 1e-15);
         assert!((masses[1] - 0.4).abs() <= 1e-15);
         assert_eq!(masses[2], 0.0);
-        // Cell 0 barycenter = (0.2, 0.0); the in-cell row nearest it is exactly
-        // (0.2, 0.0) (row 2), so the medoid is that data point — and, unlike the
-        // barycenter, it is itself a sample.
+        // Cell 0 barycenter = (0.2, 0.0).
         assert_eq!(nodes[(0, 0)], 0.2);
         assert_eq!(nodes[(0, 1)], 0.0);
-        // Cell 1 barycenter = (10.0, 10.0); both rows are equidistant (‖·‖²=0.05),
-        // so the lowest-row-index tie break picks row 3 = (9.8, 10.1).
-        assert_eq!(nodes[(1, 0)], 9.8);
-        assert_eq!(nodes[(1, 1)], 10.1);
+        // Cell 1 barycenter = (10.0, 10.0), which is not a sampled row.
+        assert_eq!(nodes[(1, 0)], 10.0);
+        assert_eq!(nodes[(1, 1)], 10.0);
         // Empty cell keeps its seed coordinates.
         assert_eq!(nodes[(2, 0)], -50.0);
         assert_eq!(nodes[(2, 1)], -50.0);
-        // Every non-empty node is an actual data row (on-manifold contract).
-        for j in [0usize, 1usize] {
-            let on_manifold = data
-                .outer_iter()
-                .any(|row| row[0] == nodes[(j, 0)] && row[1] == nodes[(j, 1)]);
-            assert!(on_manifold, "node {j} must be a sampled data point");
-        }
     }
 
     /// Freeze→replay: rebuilding from the first build's frozen transform and

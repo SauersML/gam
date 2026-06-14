@@ -1,4 +1,4 @@
-//! V∞ acceptance gate 5 (docs/measure_jet_v_infinity.md §7.5): scale smoke —
+//! Measure-jet frame acceptance gate 5 (docs/measure_jet_frame.md §7.5): scale smoke —
 //! "fast" as a CI gate, not a vibe. Gates the measure-jet BUILD path (no
 //! REML fit): masses O(n·m·d), design O(n·m·d), energy O(m²·d·L). The point
 //! is catching an O(n²) regression anywhere in that path, not benchmarking.

@@ -1,7 +1,7 @@
-//! V∞ estimand-level acceptance battery (docs/measure_jet_v_infinity.md §7),
+//! Measure-jet frame acceptance battery (docs/measure_jet_frame.md §7),
 //! landed against the CURRENT public measure-jet surface
 //! (`gam::basis::measure_jet_*`). These gates restate the charter's §7
-//! contracts as properties of the SHIPPED V0/single-scale realization — they do not
+//! contracts as properties of the shipped single-scale realization — they do not
 //! wait for the unlanded jet-frame basis (charter §8 slice 4). Every bound is
 //! a principled ceiling derived below from the energy/variance structure, not
 //! a tuned threshold, and the geometry is fully deterministic (no RNG).
@@ -273,7 +273,7 @@ fn support_domination_variance_monotone() {
          extrapolation variance ({var_far:.6e}) than the near query ({var_near:.6e})"
     );
     // And the off-web query must be strictly more uncertain than the on-web
-    // one here — the honest off-support widening the V0 path lacked.
+    // one here — the honest off-support widening the current path lacked.
     assert!(
         var_far > var_near,
         "far-off-web query is not strictly more uncertain than the on-web query: \

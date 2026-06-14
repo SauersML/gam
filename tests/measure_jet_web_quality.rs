@@ -32,7 +32,7 @@
 //!    log-intensity off-gap.
 //! 5. **Interval honesty**: 95% pointwise bands built from the fit's
 //!    smoothing-corrected coefficient
-//!    covariance Vp must approximately cover the true mean at held-out
+//!    covariance must approximately cover the true mean at held-out
 //!    on-web points.
 
 use csv::StringRecord;
@@ -267,7 +267,7 @@ fn rmse_vs_truth(pred: &[f64], test: &[WebPoint], truth_scale: f64) -> f64 {
         .sqrt()
 }
 
-/// Pointwise prediction SE from a coefficient covariance: se_i = √(sᵢᵀ V sᵢ)
+/// Pointwise prediction SE from a coefficient covariance: se_i = sqrt(s_i^T covariance s_i).
 /// for design row sᵢ (same access pattern as the mgcv-CI quality suite).
 fn pointwise_se(design: ArrayView2<'_, f64>, cov: &Array2<f64>) -> Vec<f64> {
     let p = design.ncols();
@@ -295,9 +295,9 @@ fn pointwise_se(design: ArrayView2<'_, f64>, cov: &Array2<f64>) -> Vec<f64> {
 }
 
 /// Test-local mirror of the production measure-jet extrapolation variance
-/// producer. The interval contract is `Var_total = Var_Vp + Var_extrap`, where
+/// producer. The interval contract is total variance = posterior variance + extrapolation variance, where
 /// `Var_extrap` prices finite-support uncertainty from the frozen measure-jet
-/// spectrum; a Vp-only band is intentionally incomplete for this smooth.
+/// spectrum; a posterior-covariance-only band is intentionally incomplete for this smooth.
 fn measure_jet_extrapolation_variance_for_fit(
     fit: &gam::StandardFitResult,
     data: &gam::data::EncodedDataset,
@@ -578,7 +578,7 @@ fn measure_jet_web_quality_contracts() {
     );
 
     // Contract 5 — interval honesty: pointwise 95% bands from the fit's PUBLIC
-    // smoothing-corrected coefficient covariance Vp (`beta_covariance_corrected`,
+    // smoothing-corrected coefficient covariance (`beta_covariance_corrected`,
     // the mgcv `predict(se.fit = TRUE)` analog used across the CI quality suite)
     // must approximately cover the TRUE mean at held-out on-web points.
     // Held-out ON-WEB points outside the gap: coverage is a claim about
@@ -592,14 +592,14 @@ fn measure_jet_web_quality_contracts() {
     let pred = design.design.apply(&interval_fit.fit.beta);
     let dense = design.design.to_dense();
 
-    // Vp propagates smoothing-parameter uncertainty into the band; it is the
+    // The corrected covariance propagates smoothing-parameter uncertainty into the band; it is the
     // covariance the rest of the CI quality suite gates coverage on. If the
     // measure-jet path fails to populate it, that is an honest red, not a
     // reason to fall back to a weaker object.
     let vp = interval_fit
         .fit
         .beta_covariance_corrected()
-        .expect("standard gaussian fit exposes the smoothing-corrected covariance Vp");
+        .expect("standard gaussian fit exposes the smoothing-corrected covariance");
     let mut se = pointwise_se(dense.view(), vp);
     let extrap = measure_jet_extrapolation_variance_for_fit(&interval_fit, &data, &coverage_test);
     for (s, v) in se.iter_mut().zip(extrap.iter()) {
@@ -615,10 +615,10 @@ fn measure_jet_web_quality_contracts() {
     let coverage = hits as f64 / coverage_test.len() as f64;
 
     // Window [0.85, 1.0] for the PRODUCTION total variance:
-    // `Vp + measure_jet_extrapolation_variance`. All ~390 trials share one
+    // posterior variance plus `measure_jet_extrapolation_variance`. All ~390 trials share one
     // fitted curve and one noise draw, so the empirical rate is far noisier
     // than a binomial count would suggest. The 0.85 floor still rejects
-    // systematically small SEs (a Vp that drops the measure-jet block,
+    // systematically small SEs (a covariance that drops the measure-jet block,
     // smoothing-variance term, or finite-support term under-covers by far more
     // than 10 nominal points). The upper edge is inclusive by construction:
     // the measure-jet extrapolation term is a one-sided honesty add-on for

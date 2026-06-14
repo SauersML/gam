@@ -1,5 +1,6 @@
-//! V∞ acceptance gate 3 (docs/measure_jet_v_infinity.md §7.3): near-miss
-//! strand decoupling, asserted at the ESTIMAND level against the V0 energy.
+//! Measure-jet frame acceptance gate 3 (docs/measure_jet_frame.md §7.3):
+//! near-miss strand decoupling, asserted at the estimand level against the
+//! current energy.
 //!
 //! Two parallel 1-D strands in 2-D at separation δ = 2× the along-strand
 //! center spacing are close enough that every mid-band scale sees both, yet

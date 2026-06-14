@@ -1,4 +1,4 @@
-//! Order-3 (cubic, r = 3) measure-jet energy via the two-pass frame trick.
+//! Order-3 (quadratic-annihilating, r = 3) measure-jet energy via the two-pass frame trick.
 //!
 //! The affine-jet (r = 2) energy in [`super::measure_jet_smooth`] penalizes the
 //! local residual of a weighted **degree-<2 (affine)** fit: it annihilates affine
@@ -11,10 +11,11 @@
 //! ## The ambient-d⁴ obstruction and the two-pass cure
 //!
 //! Done naively in the ambient `d` coordinates, a degree-<3 fit needs the full
-//! cubic monomial design — `O(d²)` quadratic monomials and the cubic block on top
-//! — so the local Gram is an `O(d³)`–`O(d⁴)` object. For ambient `d` in the tens
-//! that is intractable and ill-conditioned (the data sits on a thin
-//! low-dimensional set, so most cubic monomials are degenerate noise).
+//! quadratic monomial design — `1 + d + d(d+1)/2` columns. Its normal equations
+//! require moments through degree 4, because products of quadratic basis
+//! functions have degree up to 4. For ambient `d` in the tens that is costly and
+//! ill-conditioned (the data sits on a thin low-dimensional set, so many
+//! quadratic monomials are degenerate noise).
 //!
 //! The cure is a **two-pass local fit** that exploits the same empirical-measure
 //! geometry the r = 2 energy already learns:
@@ -27,16 +28,16 @@
 //!    frame captures the tangent (and, where the set bends, the dominant normal)
 //!    geometry without ever naming an ambient axis.
 //!
-//! 2. **Pass 2 — moments of frame-projected coordinates to degree 3.** We project
+//! 2. **Pass 2 — moments of frame-projected coordinates to degree 4.** We project
 //!    the centered scaled features into the frame, `Y = Φ̃·U` (`ml × q`), and run
 //!    the degree-<3 polynomial fit *in the frame coordinates*: the design columns
 //!    are `[1, y_a, y_a·y_b (a ≤ b)]`, dimension
 //!    `p₃ = 1 + q + q(q+1)/2 ≤ 1 + 8 + 36 = 45`. The local roughness is the
-//!    weighted residual of *this* fit. Because `Y` is a linear image of the
-//!    ambient features, **any ambient quadratic restricted to the neighborhood is
-//!    a quadratic in `Y`**, hence is in the column span of the degree-<3 design
-//!    and is annihilated exactly. No `d³`/`d⁴` object is ever built — the cubic
-//!    moments live in the `q`-dimensional frame, costing `O(q²)` columns.
+//!    weighted residual of *this* fit. This annihilates quadratics in the
+//!    retained frame coordinates. It annihilates arbitrary ambient quadratics
+//!    only when the retained frame spans the local affine hull; otherwise
+//!    quadratic terms in dropped directions can leak. No ambient high-order
+//!    object is built — the degree-4 moments live in the `q`-dimensional frame.
 //!
 //! The residual operator is the weighted-least-squares projector complement
 //!
@@ -48,7 +49,8 @@
 //! pseudo-inverse (degenerate frame directions and aliased monomials carry zero
 //! penalty rather than being ridged). Each scale's local `R` is scattered into the
 //! `m × m` center-space energy with the same Mellin outer weight
-//! `log_step · ε^{−2s} · m_i · q^{1−2α}` as the affine energy, so the two energies
+//! `log_step · ε^{−η} · m_i · q^{1−2α}`, `η = 2s + d(2−2α)`, as the affine energy,
+//! so the two energies
 //! are the *same functional at a different polynomial degree* and compose cleanly.
 //!
 //! The first design column is the constant, so `R·1 = 0` exactly: the energy
@@ -78,8 +80,8 @@ pub(crate) const MEASURE_JET3_PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
 
 /// Maximum intrinsic frame dimension `q` retained from the local order-2 moment
 /// spectrum. The degree-<3 design then has at most `1 + 8 + 36 = 45` columns, so
-/// the cubic local fit stays bounded regardless of the ambient `d`. Data on a
-/// set of intrinsic dimension `p ≤ q` is captured exactly; on richer sets the
+/// the quadratic local fit stays bounded regardless of the ambient `d`. Data on a
+/// set whose local affine hull has dimension `p ≤ q` is captured exactly; on richer sets the
 /// frame keeps the `q` most energetic order-2 directions (magic by default: the
 /// cap is derived from the polynomial budget, not exposed as a dial).
 pub(crate) const MEASURE_JET3_FRAME_MAX: usize = 8;
@@ -192,7 +194,8 @@ pub fn measure_jet_order3_energy_form(
         let mut out = Array2::<f64>::zeros((m, m));
         let cutoff2 = (MEASURE_JET3_PROFILE_CUTOFF * eps) * (MEASURE_JET3_PROFILE_CUTOFF * eps);
         let inv_two_eps2 = 1.0 / (2.0 * eps * eps);
-        let scale_weight = band.log_step * eps.powf(-2.0 * order_s);
+        let eta = 2.0 * order_s + (d as f64) * (2.0 - 2.0 * alpha);
+        let scale_weight = band.log_step * eps.powf(-eta);
 
         // Outer-quadrature coarsening: greedy ε/2-net over the centers in fixed
         // index order (deterministic), every center's mass aggregated to its

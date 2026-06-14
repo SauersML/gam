@@ -1,7 +1,7 @@
-//! Whitened arrow solver for the V-infinity measure-jet system.
+//! Whitened arrow solver for the measure-jet frame system.
 //!
 //! This module implements the solver described in
-//! `docs/measure_jet_v_infinity.md` section 3 for the whitened matrix
+//! `docs/measure_jet_frame.md` section 3 for the whitened matrix
 //! `M = I + D^{1/2} S^T W S D^{1/2}`.  The matrix is block-arrow shaped:
 //! a dense polynomial/parametric head and a block-diagonal multilevel tail,
 //! with each tail level coupled only to the head.  One arrow Cholesky

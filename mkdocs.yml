@@ -143,5 +143,5 @@ nav:
     - Cookbook: cookbook.md
     - GPU acceleration: gpu_acceleration.md
     - REML scaling: reml_scaling.md
-    - Measure-jet V∞ notes: measure_jet_v_infinity.md
+    - Measure-jet frame notes: measure_jet_frame.md
   - Changelog: changelog.md
