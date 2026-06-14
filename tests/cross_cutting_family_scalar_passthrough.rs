@@ -22,6 +22,7 @@ fn base_options() -> FitOptions {
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     }
 }
 

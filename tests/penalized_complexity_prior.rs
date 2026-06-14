@@ -64,6 +64,7 @@ fn fit_options(rho_prior: RhoPrior) -> FitOptions {
         rho_prior,
         kronecker_penalty_system: None,
         kronecker_factored: None,
+        persist_warm_start_disk: false,
     }
 }
 

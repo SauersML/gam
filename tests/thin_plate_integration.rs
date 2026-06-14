@@ -69,6 +69,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         },
     )
     .expect("fit_gam with TPS should succeed");
@@ -159,6 +160,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         },
     )
     .expect("fit_gam with TPS should succeed");
@@ -323,6 +325,7 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         },
     )
     .expect("fit_gam with 3D TPS should succeed");
