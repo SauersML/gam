@@ -49,7 +49,7 @@ use crate::survival_construction::{
 };
 use crate::term_builder::resolve_role_col;
 use crate::types::{
-    InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily, StandardLink,
+    InverseLink, LikelihoodSpec, ResponseFamily, StandardLink,
 };
 
 /// Reconstruct the `LinkWiggleFormulaSpec` from a saved model's
@@ -140,80 +140,20 @@ fn validate_explicit_link_wiggle_joint_hessian(
     Ok(())
 }
 
+/// Resolve the scalar generative dispersion for a fitted model.
+///
+/// Thin adapter over the single canonical
+/// [`crate::generative::family_noise_parameter`]: the replicate-sampling path
+/// here and the CLI `gam generate` path both route through that one helper, so
+/// the fitted dispersion (NB θ̂, Beta/Tweedie φ̂, Gamma k̂) can never be read
+/// inconsistently between them. A divergent second copy of this logic was the
+/// root cause of #1124.
 fn family_noise_parameter(fit: &UnifiedFitResult, likelihood: &LikelihoodSpec) -> Option<f64> {
-    family_noise_parameter_from_scale(fit.likelihood_scale, fit.standard_deviation, likelihood)
-}
-
-fn family_noise_parameter_from_scale(
-    likelihood_scale: LikelihoodScaleMetadata,
-    standard_deviation: f64,
-    likelihood: &LikelihoodSpec,
-) -> Option<f64> {
-    if let ResponseFamily::NegativeBinomial { theta, .. } = likelihood.response {
-        // The NB overdispersion θ is estimated during the fit and stored in
-        // `likelihood_scale` (`EstimatedNegBinTheta`); the θ embedded in the
-        // response spec is only the construction-time seed (left at 1.0). Read
-        // the fitted value, falling back to the seed only for fit-free
-        // construction — exactly as the Beta (#770), Tweedie and Gamma arms
-        // below already consult `likelihood_scale`. Returning the seed was the
-        // NB sibling of #770: generate/sample_replicates drew Var = μ + μ²
-        // instead of μ + μ²/θ̂ (#1124).
-        return likelihood_scale.negbin_theta().or(Some(theta));
-    }
-    if let ResponseFamily::Tweedie { .. } = likelihood.response {
-        return likelihood_scale.fixed_phi().or(Some(1.0));
-    }
-    if let ResponseFamily::Beta { phi } = likelihood.response {
-        return likelihood_scale.fixed_phi().or(Some(phi));
-    }
-    if matches!(likelihood.response, ResponseFamily::Gamma) {
-        likelihood_scale.gamma_shape().or(Some(standard_deviation))
-    } else {
-        Some(standard_deviation)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn family_noise_parameter_uses_estimated_tweedie_phi_not_variance_power() {
-        let likelihood = LikelihoodSpec::new(
-            ResponseFamily::Tweedie { p: 1.5 },
-            InverseLink::Standard(StandardLink::Log),
-        );
-        let noise = family_noise_parameter_from_scale(
-            LikelihoodScaleMetadata::EstimatedTweediePhi { phi: 7.25 },
-            0.0,
-            &likelihood,
-        )
-        .expect("Tweedie sampling must expose a dispersion");
-
-        assert_eq!(
-            noise, 7.25,
-            "Tweedie sampler noise parameter is dispersion phi, not variance power p"
-        );
-    }
-
-    #[test]
-    fn family_noise_parameter_uses_estimated_beta_phi_not_family_seed() {
-        let likelihood = LikelihoodSpec::new(
-            ResponseFamily::Beta { phi: 1.0 },
-            InverseLink::Standard(StandardLink::Logit),
-        );
-        let noise = family_noise_parameter_from_scale(
-            LikelihoodScaleMetadata::EstimatedBetaPhi { phi: 12.0 },
-            0.0,
-            &likelihood,
-        )
-        .expect("Beta sampling must expose a precision");
-
-        assert_eq!(
-            noise, 12.0,
-            "Beta sampler noise parameter is estimated precision phi, not the family seed"
-        );
-    }
+    crate::generative::family_noise_parameter(
+        fit.likelihood_scale,
+        fit.standard_deviation,
+        likelihood,
+    )
 }
 
 /// Build a `LikelihoodSpec` for a saved model. Saved models already carry the

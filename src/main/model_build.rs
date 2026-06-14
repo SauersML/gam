@@ -396,40 +396,10 @@ pub(crate) fn core_saved_fit_result(
     }
 }
 
-pub(crate) fn family_noise_parameter(
-    fit: &UnifiedFitResult,
-    family: LikelihoodSpec,
-) -> Option<f64> {
-    match family.response {
-        // The generative `gaussian_scale` slot carries the *dispersion* φ for
-        // Tweedie; the variance power `p` is already read from the family spec by
-        // `NoiseModel::from_likelihood`, so emitting `p` here drew responses with
-        // φ = p (≈1.5) regardless of the data. φ is estimated jointly with the
-        // mean (issue #771), so the authoritative value is the fit's scale
-        // metadata, falling back to a unit dispersion only if the fit recorded
-        // none.
-        ResponseFamily::Tweedie { .. } => fit.likelihood_scale.fixed_phi().or(Some(1.0)),
-        // The NB overdispersion θ is estimated jointly with the mean and stored
-        // in the fit's scale metadata (`EstimatedNegBinTheta`); the θ on the
-        // family spec is only the construction seed (1.0). Reading the seed was
-        // the NB sibling of the Beta #770 / Tweedie #771 bug (#1124): generate
-        // drew Var = μ + μ² instead of μ + μ²/θ̂. Consult the fitted dispersion,
-        // falling back to the seed only when the fit recorded none.
-        ResponseFamily::NegativeBinomial { theta, .. } => {
-            fit.likelihood_scale.negbin_theta().or(Some(theta))
-        }
-        // Beta precision φ is estimated jointly with the mean (issue #567), so
-        // the authoritative value is the fit's scale metadata, not the seed φ on
-        // the original family spec. Fall back to the spec φ only if the fit did
-        // not record an estimated/fixed dispersion.
-        ResponseFamily::Beta { phi } => fit.likelihood_scale.fixed_phi().or(Some(phi)),
-        ResponseFamily::Gamma => fit
-            .likelihood_scale
-            .gamma_shape()
-            .or(Some(fit.standard_deviation)),
-        _ => Some(fit.standard_deviation),
-    }
-}
+// The generative dispersion picker `family_noise_parameter` lived here as a
+// third divergent copy; it now lives once in `gam::generative` and the live
+// `gam generate` path (`run_sample_generate_report`) calls it directly. See the
+// doc comment there for the per-family rationale (#1124).
 
 #[derive(Clone)]
 pub(crate) struct SavedFitSummary {

@@ -1,7 +1,65 @@
 use crate::custom_family::{CustomFamily, ParameterBlockState};
 use crate::estimate::{EstimationError, PredictResult};
-use crate::types::{LikelihoodSpec, ResponseFamily, is_valid_tweedie_power};
+use crate::types::{
+    LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily, is_valid_tweedie_power,
+};
 use ndarray::{Array1, Array2};
+
+/// THE single source of truth for the scalar dispersion the generative
+/// observation model uses for a fitted family — the value handed to
+/// [`NoiseModel::from_likelihood`] / [`generativespec_from_predict`] as
+/// `gaussian_scale`.
+///
+/// For every exponential-dispersion / overdispersed family the dispersion is
+/// **estimated jointly with the mean** and recorded in the fit's
+/// [`LikelihoodScaleMetadata`] (`scale`); the value embedded in the response
+/// spec (`likelihood.response`) is only the construction-time *seed* (e.g.
+/// `theta = 1.0`, `phi = 1.0`), left un-updated after the fit refreshes the
+/// estimate. Generation must therefore read the *fitted* dispersion off `scale`,
+/// falling back to the seed only for fit-free construction. Reading the seed was
+/// the shared root cause of a whole family of bugs — Gamma #678, Beta #769/#770,
+/// Tweedie #771, and the NB sibling #1124 (`Var = mu + mu^2` instead of
+/// `mu + mu^2/theta_hat`).
+///
+/// This helper exists in exactly one place precisely because that bug class
+/// recurred: the dispersion-picking logic had been duplicated across the CLI
+/// `gam generate` path and the Python `sample_replicates` path, and fixing one
+/// copy left the other drawing at the seed. Both paths now call this function,
+/// so the set of supported families and the interpretation of each dispersion
+/// parameter can never diverge again. (The per-row dispersion location-scale
+/// path, #913/#1125, is the one exception that bypasses this scalar picker — it
+/// threads a full `exp(eta_d(x))` vector via
+/// [`NoiseModel::from_likelihood_with_per_row_dispersion`] instead.)
+///
+/// `standard_deviation` is the fit's residual scale, used as the Gamma-shape and
+/// Gaussian-`sigma` fallback. Returns `None` only for families that carry no
+/// dispersion at all in the fallback arm (never, in practice, for the families
+/// above).
+pub fn family_noise_parameter(
+    scale: LikelihoodScaleMetadata,
+    standard_deviation: f64,
+    likelihood: &LikelihoodSpec,
+) -> Option<f64> {
+    match likelihood.response {
+        // Tweedie: `gaussian_scale` carries the *dispersion* phi; the variance
+        // power `p` is read straight off the family spec by `from_likelihood`.
+        // phi is estimated jointly with the mean (#771), so consult the fit's
+        // scale metadata; unit dispersion is the fit-free fallback.
+        ResponseFamily::Tweedie { .. } => scale.fixed_phi().or(Some(1.0)),
+        // NB overdispersion theta is estimated jointly with the mean and stored
+        // as `EstimatedNegBinTheta`; the spec theta is only the seed (#1124).
+        ResponseFamily::NegativeBinomial { theta, .. } => scale.negbin_theta().or(Some(theta)),
+        // Beta precision phi is estimated jointly with the mean (#567/#770); the
+        // spec phi is only the seed.
+        ResponseFamily::Beta { phi } => scale.fixed_phi().or(Some(phi)),
+        // Gamma shape k is estimated jointly with the mean (#678); fall back to
+        // the residual scale only when the fit recorded no shape.
+        ResponseFamily::Gamma => scale.gamma_shape().or(Some(standard_deviation)),
+        // Gaussian / Poisson / Binomial: the residual scale is the generative
+        // sigma (Poisson/Binomial ignore it downstream).
+        _ => Some(standard_deviation),
+    }
+}
 
 /// Observation-noise model used for generative sampling.
 #[derive(Clone, Debug)]
@@ -484,6 +542,117 @@ pub trait CustomFamilyGenerative: CustomFamily {
 mod tests {
     use super::*;
     use crate::families::strategy::{FamilyStrategy, strategy_for_spec};
+
+    /// The canonical dispersion picker must read the *fitted* dispersion off the
+    /// scale metadata, never the construction seed embedded in the response
+    /// spec. This is the single guard for the whole "generate draws at the seed
+    /// dispersion" bug family — Gamma #678, Beta #769/#770, Tweedie #771, and
+    /// the NB sibling #1124 — now that the picker lives in exactly one place
+    /// (previously three divergent copies let a fix in one miss the others).
+    #[test]
+    fn family_noise_parameter_reads_fitted_dispersion_not_seed() {
+        // NB: spec carries the seed theta = 1; the fit estimated theta_hat.
+        let nb = LikelihoodSpec::negative_binomial_log(1.0);
+        assert_eq!(
+            family_noise_parameter(
+                LikelihoodScaleMetadata::EstimatedNegBinTheta { theta: 2.97 },
+                0.0,
+                &nb,
+            ),
+            Some(2.97),
+            "NB picker must read theta_hat (#1124), not the seed theta=1"
+        );
+
+        // Tweedie: the picker must return the dispersion phi, never the variance
+        // power p that lives on the spec.
+        let tw = LikelihoodSpec::tweedie_log(1.5);
+        assert_eq!(
+            family_noise_parameter(
+                LikelihoodScaleMetadata::EstimatedTweediePhi { phi: 7.25 },
+                0.0,
+                &tw,
+            ),
+            Some(7.25),
+            "Tweedie picker must read phi_hat (#771), not the variance power p"
+        );
+
+        // Beta: spec carries the seed phi = 1; the fit estimated phi_hat.
+        let beta = LikelihoodSpec::beta_logit(1.0);
+        assert_eq!(
+            family_noise_parameter(
+                LikelihoodScaleMetadata::EstimatedBetaPhi { phi: 12.0 },
+                0.0,
+                &beta,
+            ),
+            Some(12.0),
+            "Beta picker must read phi_hat (#770), not the seed phi=1"
+        );
+
+        // Gamma: the estimated shape must win over the residual-scale fallback.
+        let gamma = LikelihoodSpec::gamma_log();
+        assert_eq!(
+            family_noise_parameter(
+                LikelihoodScaleMetadata::EstimatedGammaShape { shape: 4.5 },
+                0.123,
+                &gamma,
+            ),
+            Some(4.5),
+            "Gamma picker must read shape_hat (#678), not the residual-scale fallback"
+        );
+    }
+
+    /// With no fitted dispersion recorded (fit-free construction), the picker
+    /// falls back to the seed on the spec / the residual scale. It must never
+    /// return `None` for a dispersion family, or generation would have nothing
+    /// to draw with.
+    #[test]
+    fn family_noise_parameter_falls_back_to_seed_when_unfitted() {
+        // `ProfiledGaussian` carries no fixed_phi / negbin_theta / gamma_shape,
+        // so every accessor returns `None` and the picker must use the fallback.
+        let none = LikelihoodScaleMetadata::ProfiledGaussian;
+        assert_eq!(
+            family_noise_parameter(none, 0.0, &LikelihoodSpec::negative_binomial_log(3.5)),
+            Some(3.5),
+            "NB picker must fall back to the spec seed theta"
+        );
+        assert_eq!(
+            family_noise_parameter(none, 0.0, &LikelihoodSpec::beta_logit(8.0)),
+            Some(8.0),
+            "Beta picker must fall back to the spec seed phi"
+        );
+        assert_eq!(
+            family_noise_parameter(none, 0.0, &LikelihoodSpec::tweedie_log(1.5)),
+            Some(1.0),
+            "Tweedie picker must fall back to unit dispersion"
+        );
+        assert_eq!(
+            family_noise_parameter(none, 2.0, &LikelihoodSpec::gamma_log()),
+            Some(2.0),
+            "Gamma picker must fall back to the residual scale"
+        );
+    }
+
+    /// End-to-end through the exact composition `gam generate` and
+    /// `sample_replicates` use — picker → `from_likelihood`. The seed-spec
+    /// theta = 1 plus an estimated theta_hat must yield a per-row NB noise model
+    /// at theta_hat, not at the seed. This is the #1124 repro at the unit level,
+    /// from the angle of the *composed* path rather than `from_likelihood` alone.
+    #[test]
+    fn picker_then_from_likelihood_threads_fitted_nb_theta() {
+        let nobs = 6usize;
+        let seed_spec = LikelihoodSpec::negative_binomial_log(1.0);
+        let scale = LikelihoodScaleMetadata::EstimatedNegBinTheta { theta: 2.751 };
+        let picked = family_noise_parameter(scale, 0.0, &seed_spec);
+        let noise =
+            NoiseModel::from_likelihood(&seed_spec, nobs, picked).expect("NB noise model builds");
+        let NoiseModel::NegativeBinomial { theta } = noise else {
+            panic!("expected an NB observation noise model");
+        };
+        assert!(
+            theta.len() == nobs && theta.iter().all(|&t| (t - 2.751).abs() < 1e-12),
+            "NB generate composes the seed theta=1 instead of theta_hat (#1124): {theta:?}"
+        );
+    }
 
     /// Structural equality for `NoiseModel` (no derived `PartialEq` so that
     /// the live enum can carry per-observation arrays). Two models are equal
