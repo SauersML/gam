@@ -1,6 +1,3 @@
-
-#[cfg(test)]
-mod tests {
     use super::*;
     use crate::solver::estimate::DP_FLOOR;
     use approx::assert_relative_eq;
@@ -6645,5 +6642,3 @@ mod tests {
             spectral.trace_hinv_product(&a),
             epsilon = 1e-10
         );
-    }
-}
