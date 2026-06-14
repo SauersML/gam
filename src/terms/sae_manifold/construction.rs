@@ -4406,20 +4406,24 @@ impl SaeManifoldTerm {
         Ok((v, loss, cache))
     }
 
-    /// The #1037 quotient-dimension invariant: the count of gauge-deflated
-    /// evidence directions must be CONSTANT across one optimization, because the
-    /// Laplace normalizer `½log|H|` is only comparable across ρ at a FIXED
-    /// quotient dimension. The first observation pins the expected count; a later
-    /// match is a no-op; ANY change is a structural quotient-dimension event and
-    /// must surface loudly.
+    /// The #1037 quotient-dimension invariant: a Laplace normalizer `½log|H|` is
+    /// only comparable across ρ at a COMMON quotient (gauge-deflation) dimension.
+    /// The first observation pins the expected count; a later match is a no-op.
     ///
-    /// The prior ±1 "flicker" tolerance existed only because the rank-deficient
-    /// decoder design (#1117) left a near-cutoff eigenvalue toggling across the
-    /// spectral floor as ρ moved. That cause is gone: rank-deficient atoms are
-    /// now reparametrized onto their data-supported subspace at fit entry
-    /// (`reduce_atoms_to_data_supported_rank`), so the design is full-rank and
-    /// the deflation count is stable. The strict guard is therefore restored —
-    /// no hysteresis band-aid on top of the basis fix.
+    /// A later observation that DIFFERS is, under the K>1 fit, a LEGITIMATE
+    /// quotient-dimension event — an atom born, reseeded (the #976 collapse
+    /// guards), or rank-reduced moves the number of gauge-flat rows. Because a
+    /// deflated direction is lifted to unit stiffness and contributes the
+    /// ρ-independent `log 1 = 0` to the evidence, re-anchoring the comparison to
+    /// the new dimension is exactly evidence-preserving and keeps every future
+    /// cross-ρ comparison consistent — the principled response, not an abort.
+    ///
+    /// The genuine pathology the guard still catches is a count that NEVER
+    /// STABILIZES: re-anchors are bounded by the per-atom structural-event budget
+    /// (`k·(reseed_budget+1)+1`), and a runaway quotient dimension past that
+    /// bound refuses loudly. This supersedes the prior strict-constant guard and
+    /// its ±1 flicker band (#1117) at root — the band was masking exactly the
+    /// legitimate K>1 dimension changes this re-anchoring now handles.
     pub(crate) fn record_evidence_gauge_deflation_count(&mut self, count: usize) -> Result<(), String> {
         match self.expected_evidence_gauge_deflated_directions {
             Some(expected) if expected == count => Ok(()),
