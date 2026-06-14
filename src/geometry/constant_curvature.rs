@@ -254,20 +254,34 @@ impl ConstantCurvature {
     /// the chart's [`cs_stacks`]), this is exactly `S(κ r²)^{d−1}` — analytic
     /// through κ = 0 with no special case. `J_κ(0) = 1`.
     ///
-    /// This is the κ-dependent volume term whose integral against the intrinsic
-    /// Gaussian is the partition function that breaks the radius/scale
-    /// degeneracy of a dispersion-only curvature criterion (#1104).
+    /// On a 1-D space form (`d = 1`) the exponent is 0, so `J_κ ≡ 1`: the exp
+    /// map is a radial isometry and the volume Jacobian carries no curvature
+    /// information (consistent with #944's reduced-information d = 1 power
+    /// analysis — there κ is identified by the conformal-factor term alone).
+    ///
+    /// Past the κ>0 conjugate radius (`√κ·r > π`, the antipodal shell) `S(u)`
+    /// turns negative. The geodesic ball is no longer embedded there, so the
+    /// well-defined non-negative volume element is `max(S(u), 0)^{d−1}` — the
+    /// clamp is on `S` itself, not on the (possibly even) power, so it stays a
+    /// genuine `→ 0⁺` collapse at the shell for every `d` (an even `d−1` would
+    /// otherwise resurrect a spurious positive volume past the cut). The
+    /// `response_kappa_bounds` cap keeps the search strictly before this shell;
+    /// the clamp only hardens stray CI/LR probes.
+    ///
+    /// This is the κ-dependent volume term whose log enters the #1104 honest
+    /// change-of-variables criterion and breaks the radius/scale degeneracy of
+    /// a dispersion-only curvature criterion.
     pub fn jacobian_radial(&self, r: f64) -> f64 {
-        let d = self.dim;
-        if d <= 1 {
-            // On a 1-D space form the exp map is a radial isometry: J ≡ 1.
+        let exponent = self.dim as i32 - 1;
+        if exponent == 0 {
+            // d = 1 (or the degenerate d = 0): radial isometry, J ≡ 1.
             return 1.0;
         }
         let u = self.kappa * r * r;
         let s = cs_stacks(u).1[0]; // S(u) = sn_κ(r)/r ≥ 0 inside the chart
-        // S(u) → 0 at the κ>0 conjugate radius (antipodal shell); clamp the
-        // non-negativity so the (d−1) power is well defined right up to it.
-        s.max(0.0).powi((d - 1) as i32)
+        // Clamp S (not the power) at the κ>0 conjugate shell so the volume
+        // element collapses to 0⁺ there regardless of the parity of d−1.
+        s.max(0.0).powi(exponent)
     }
 
     /// Möbius addition `x ⊕_κ y` — the chart realization of geodesic
