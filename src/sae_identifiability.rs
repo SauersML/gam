@@ -1035,8 +1035,14 @@ pub struct AtomSmoothSignificance {
 /// interval* was removed: its target (a sup-norm extrinsic-curvature BOUND read
 /// off the fitted decoder) is not an estimand with a profiled criterion, and its
 /// delta-method SE conditioned on the generated latent coordinates as if known.
-/// The plug-in curvature point estimate itself survives as
-/// `per_atom_kappa_hat` on the dictionary report.
+/// The plug-in curvature point estimate itself survives — as the per-atom
+/// `kappa_hat` entries of
+/// [`crate::terms::sae_manifold::CertificateInputs::per_atom_kappa_hat`] (the
+/// #1008 empirical curved-dictionary report, surfaced to Python as
+/// `ManifoldSAE.curvature_report`), the single source of truth for the bound.
+/// It is deliberately *not* duplicated onto this report: a descriptive geometry
+/// bound is a property of the fitted decoder frames, not of the post-PIRLS
+/// inner-smooth inference snapshot this type carries.
 #[derive(Debug, Clone)]
 pub struct AtomInferenceReport {
     pub atom_index: usize,
@@ -2658,7 +2664,10 @@ pub struct DictionaryReport {
     /// POINT summaries, #1103 split-LRT smooth-structure e-value), one entry
     /// per atom in [`FittedSaeManifold::atoms`] order. The #1099 per-atom
     /// curvature CI was removed under #1115 (a curvature BOUND is not an
-    /// estimand and its SE conditioned on generated regressors). Each report's
+    /// estimand and its SE conditioned on generated regressors); the surviving
+    /// plug-in curvature point estimate lives on
+    /// [`crate::terms::sae_manifold::CertificateInputs::per_atom_kappa_hat`],
+    /// not here. Each report's
     /// fields are computed when the atom carries its fit-time
     /// [`AtomInnerFit`] byproducts and the relevant numerics succeed; otherwise
     /// the field is `None` (a bare certificate-only `FittedSaeManifold` — one
@@ -2914,8 +2923,9 @@ fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance
 /// * The #1099 per-atom curvature *confidence interval* was removed under #1115:
 ///   a sup-norm curvature BOUND is not an estimand with a profiled criterion,
 ///   and its delta-method SE conditioned on generated latent coordinates as if
-///   known. The plug-in curvature point estimate survives as the dictionary
-///   report's `per_atom_kappa_hat`.
+///   known. The plug-in curvature point estimate survives on
+///   [`crate::terms::sae_manifold::CertificateInputs::per_atom_kappa_hat`] (the
+///   #1008 empirical curved-dictionary report), not on this report.
 pub(crate) fn atom_inference_reports(model: &FittedSaeManifold) -> Vec<AtomInferenceReport> {
     model
         .atoms

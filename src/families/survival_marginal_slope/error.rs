@@ -2,8 +2,6 @@
 //! with their `Display`/`Error`/`From` conversions. Self-contained: no
 //! dependency on the fitting machinery.
 
-use super::*;
-
 pub enum SurvivalMarginalSlopeError {
     /// Spec, data, or runtime configuration failed input validation
     /// (finite/non-negative weights, derivative_guard > 0, supported
@@ -96,4 +94,3 @@ impl From<String> for SurvivalMarginalSlopeError {
         SurvivalMarginalSlopeError::InvalidInput { reason }
     }
 }
-

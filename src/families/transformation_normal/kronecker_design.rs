@@ -263,23 +263,23 @@ impl KroneckerDesign {
 }
 
 impl LinearOperator for KroneckerDesign {
-    pub(crate) fn nrows(&self) -> usize {
+    fn nrows(&self) -> usize {
         KroneckerDesign::nrows(self)
     }
 
-    pub(crate) fn ncols(&self) -> usize {
+    fn ncols(&self) -> usize {
         KroneckerDesign::ncols(self)
     }
 
-    pub(crate) fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         self.forward_mul(vector)
     }
 
-    pub(crate) fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
         self.transpose_mul(vector)
     }
 
-    pub(crate) fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if weights.len() != self.nrows() {
             return Err(TransformationNormalError::InvalidInput {
                 reason: format!(
@@ -299,7 +299,7 @@ impl LinearOperator for KroneckerDesign {
 }
 
 impl DenseDesignOperator for KroneckerDesign {
-    pub(crate) fn row_chunk_into(
+    fn row_chunk_into(
         &self,
         rows: std::ops::Range<usize>,
         mut out: ArrayViewMut2<'_, f64>,
@@ -331,7 +331,7 @@ impl DenseDesignOperator for KroneckerDesign {
         Ok(())
     }
 
-    pub(crate) fn to_dense(&self) -> Array2<f64> {
+    fn to_dense(&self) -> Array2<f64> {
         match self {
             KroneckerDesign::KhatriRao { left, right } => {
                 dense_rowwise_kronecker(left.view(), right.to_dense().view())

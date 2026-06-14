@@ -1,4 +1,5 @@
 use super::*;
+use crate::solver::estimate::smooth_floor_dp;
 
 pub(crate) const HESSIAN_UNAVAILABLE_PREFIX: &str = "outer Hessian unavailable:";
 

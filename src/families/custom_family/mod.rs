@@ -66,7 +66,7 @@ pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex, OnceLock, Weak};
 pub(crate) use thiserror::Error;
 
-pub use crate::solver::estimate::reml::unified::{EvalMode, PseudoLogdetMode};
+pub(crate) use crate::solver::estimate::reml::unified::{EvalMode, PseudoLogdetMode};
 
 mod block_spec;
 mod blockwise_solve;
@@ -87,19 +87,19 @@ mod persistent_cache;
 
 // `pub use ...::*` preserves each item's own visibility (pub stays pub,
 // pub(crate) stays pub(crate)) so the prior flat-namespace API is unchanged.
-pub use block_spec::*;
-pub use blockwise_solve::*;
-pub use covariance::*;
-pub use error::*;
-pub use family_trait::*;
-pub use fit::*;
-pub use jeffreys::*;
-pub use joint_newton::*;
-pub use options::*;
-pub use outer_objective::*;
-pub use penalty::*;
-pub use psi_design::*;
-pub use psi_hyper::*;
+pub(crate) use block_spec::*;
+pub(crate) use blockwise_solve::*;
+pub(crate) use covariance::*;
+pub(crate) use error::*;
+pub(crate) use family_trait::*;
+pub(crate) use fit::*;
+pub(crate) use jeffreys::*;
+pub(crate) use joint_newton::*;
+pub(crate) use options::*;
+pub(crate) use outer_objective::*;
+pub(crate) use penalty::*;
+pub(crate) use psi_design::*;
+pub(crate) use psi_hyper::*;
 
 #[cfg(test)]
 mod test_support;

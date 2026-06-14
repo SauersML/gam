@@ -5091,31 +5091,23 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     // non-converged β̂ produces large envelope-theorem violations in the
     // analytic outer gradient.
     if use_joint_newton && !converged {
-        let ranges_joint: Vec<(usize, usize)> = {
-            let mut offset = 0;
-            specs
-                .iter()
-                .map(|s| {
-                    let start = offset;
-                    offset += s.design.ncols();
-                    (start, offset)
-                })
-                .collect()
-        };
-        let total_p_joint: usize = ranges_joint.last().map_or(0, |r| r.1);
-        let joint_mode_diagonal_ridge =
-            if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
-                ridge
-            } else {
-                0.0
-            };
-        let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
+        polish_joint_newton_step(
+            family,
+            specs,
+            options,
+            &s_lambdas,
+            ridge,
+            joint_bundle,
+            inner_tol,
+            &cached_active_sets,
+            &mut states,
+            &mut cached_eval,
+            &mut current_penalty,
+            &mut converged,
+        )?;
+    }
 
-        // Allow up to a few polishing steps. The blockwise endpoint is close
-        // to optimum, so step sizes should be small and line search should
-        // accept full steps quickly.
-        const POLISH_MAX_ITER: usize = 16;
-        for _polish_iter in 0..POLISH_MAX_ITER {
+    ORPHAN_DELETE_MARKER_BEGIN
             // Re-evaluate at current β to get the joint gradient and Hessian.
             refresh_all_block_etas(family, specs, &mut states)?;
             let eval_for_polish = family.evaluate(&states)?;
@@ -5305,17 +5297,45 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     break;
                 }
             }
-            if !accepted_polish {
-                // Restore and stop polishing.
-                for (b, s) in old_states.iter().enumerate() {
-                    states[b] = s.clone();
-                }
-                refresh_all_block_etas(family, specs, &mut states)?;
-                break;
-            }
-        }
-    }
+    assemble_inner_blockwise_result(
+        family,
+        specs,
+        states,
+        block_log_lambdas,
+        options,
+        s_lambdas,
+        ridge,
+        joint_bundle,
+        cached_active_sets,
+        &cached_eval,
+        converged,
+        cycles_done,
+        last_residual_tol,
+    )
+}
 
+/// Final result assembly for the blockwise / polish fall-through path of
+/// [`inner_blockwise_fit`]. Computes the penalty value, the block log-dets, the
+/// (converged-only) projected KKT residual for the IFT, and the active-constraint
+/// block, then moves `states`, `s_lambdas`, and `cached_active_sets` into the
+/// returned [`BlockwiseInnerResult`]. Behavior is identical to the inline code it
+/// replaced — the `?`-propagation and the `converged`-gate on `kkt_residual` are
+/// preserved verbatim.
+fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    mut states: Vec<ParameterBlockState>,
+    block_log_lambdas: &[Array1<f64>],
+    options: &BlockwiseFitOptions,
+    s_lambdas: Vec<Array2<f64>>,
+    ridge: f64,
+    joint_bundle: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
+    cached_active_sets: Vec<Option<Vec<usize>>>,
+    cached_eval: &FamilyEvaluation,
+    converged: bool,
+    cycles_done: usize,
+    last_residual_tol: f64,
+) -> Result<BlockwiseInnerResult, String> {
     // Reuse cached evaluation from the last cycle's end (or the initial eval if 0 cycles ran).
     let penalty_value = total_quadratic_penalty(
         &states,
@@ -5329,7 +5349,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     let (block_logdet_h, block_logdet_s) =
         blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
     let kkt_residual = if converged {
-        match exact_newton_joint_gradient_from_eval(&cached_eval, specs, &states)? {
+        match exact_newton_joint_gradient_from_eval(cached_eval, specs, &states)? {
             Some(gradient) => {
                 let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
                 let local_total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();

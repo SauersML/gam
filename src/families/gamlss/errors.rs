@@ -4,12 +4,6 @@
 // resolve through the parent namespace.
 use super::*;
 
-use joint_packing::{
-    binomial_pack_mean_wiggle_joint_score, binomial_pack_mean_wiggle_joint_symmetrichessian,
-    gaussian_pack_joint_score, gaussian_pack_joint_symmetrichessian,
-    gaussian_pack_wiggle_joint_score, gaussian_pack_wiggle_joint_symmetrichessian,
-};
-
 /// Typed errors surfaced from this module's helpers and family
 /// implementations. The `Display` impl writes the carried `reason` verbatim,
 /// so callers that historically returned `Result<_, String>` keep their

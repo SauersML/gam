@@ -1677,7 +1677,7 @@ pub(crate) fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Op
 /// breaks the τ-τ Hessian-vs-FD and stationarity-cancellation identities
 /// (#825). Unsupported links return `None` instead of pretending they are Logit.
 #[inline]
-pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<InverseLink> {
+pub(crate) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<InverseLink> {
     if !config.firth_bias_reduction {
         return None;
     }

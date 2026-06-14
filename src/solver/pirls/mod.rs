@@ -1,26 +1,103 @@
-// Concern-named fragments inlined into this module's namespace; keep in order.
-include!("imports.rs");
+//! The penalized iteratively-reweighted-least-squares (P-IRLS) inner solver,
+//! split by concern into real submodules. Each concern module pulls the shared
+//! crate-level import surface and every sibling's items through a single
+//! `use super::*;`, backed by the `pub(crate) use <mod>::*;` re-exports below —
+//! reproducing the flat namespace the module historically shared, without any
+//! line-cut `include!` fragments.
 
-// ── Submodule split ─────────────────────────────────────────────────────────
+mod imports;
+pub(crate) use imports::*;
+
+// ── Concern modules ──────────────────────────────────────────────────────────
 mod convergence;
-
+mod curvature;
 mod damping;
-
+mod deviance;
+mod dispersion;
 mod edf;
-
+mod family_state;
+mod gam_working_model;
+mod glm_update;
 mod gpu_dispatch;
-
 mod log_link_working_state;
-
 mod loop_driver;
-
+mod low_rank;
+mod newton_solve;
 mod penalty;
-
 mod pls_solver;
-
 mod reweight;
-
+mod sparse_system;
 mod state;
+mod working_model_trait;
+mod workspace;
 
-include!("working_model_core.rs");
-include!("tests.rs");
+#[cfg(test)]
+mod tests;
+
+// ── Concern-module re-export glue ────────────────────────────────────────────
+// Glob re-exports keep every concern module's items reachable from `super::*`
+// inside its siblings (and preserve the crate-facing API the flat module had).
+pub(crate) use curvature::*;
+pub(crate) use deviance::*;
+pub(crate) use dispersion::*;
+pub(crate) use family_state::*;
+pub(crate) use gam_working_model::*;
+pub(crate) use glm_update::*;
+pub(crate) use low_rank::*;
+pub(crate) use newton_solve::*;
+pub(crate) use sparse_system::*;
+pub(crate) use working_model_trait::*;
+pub(crate) use workspace::*;
+
+// ── Pre-existing real-submodule re-exports (visibility preserved) ─────────────
+use convergence::effective_kkt_tolerance;
+
+use damping::{
+    add_scaled_diagonal_to_upper_sparse, compute_lm_d2, update_scaled_diagonal_in_place,
+};
+
+pub use edf::StablePLSResult;
+
+use edf::{
+    calculate_edf_from_sparse_factor, calculate_edf_with_penalty,
+    calculate_edfwithworkspace_from_factor, calculate_edfwithworkspace_with_penalty,
+};
+
+use log_link_working_state::ETA_CLAMP;
+
+/// The canonical PIRLS numeric floors live in [`log_link_working_state`]; this
+/// re-export gives every family in the crate one shared `MIN_WEIGHT` so the
+/// weighted normal equations stay well posed with a single retunable value.
+pub(crate) use log_link_working_state::MIN_WEIGHT;
+
+use penalty::{
+    KroneckerQsTransform, PirlsPenalty, WorkingCoordinateDesign, WorkingReparamTransform,
+    attach_penalty_shift,
+};
+
+use pls_solver::solve_penalized_least_squares_implicit;
+
+pub use pls_solver::{GaussianFixedCache, SparseXtwxPrecomputed};
+
+pub use reweight::runworking_model_pirls;
+
+pub(crate) use state::array1_l2_norm;
+
+pub use state::{
+    AdaptiveKktTolerance, ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind,
+    PirlsCoordinateFrame, PirlsLinearSolvePath, PirlsResult, PirlsStatus,
+    WorkingModelIterationInfo, WorkingModelPirlsResult, WorkingState,
+};
+
+// loop_driver owns: default_beta_guess_external, solve_intercept_for_prevalence,
+// assemble_pirls_result, detect_logit_instability, stack_lambdaweighted_penalty_root_canonical,
+// build_sparse_native_reparam_result, build_diagonal_penalty_from_kronecker, canonical_prior_shift,
+// canonical_prior_mean_aggregate, PirlsProblem, PenaltyConfig, fit_model_for_fixed_rho,
+// fit_model_for_fixed_rho_with_adaptive_kkt, PirlsConfig, make_reparam_operator,
+// build_transformed_lower_bound_constraints*, build_transformed_linear_constraints*,
+// merge_linear_constraints, sparse_from_denseview.
+use loop_driver::assert_symmetric_tol;
+
+pub(crate) use loop_driver::fit_model_for_fixed_rho_with_adaptive_kkt;
+
+pub use loop_driver::{PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho};

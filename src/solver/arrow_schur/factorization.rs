@@ -5,9 +5,9 @@
 use super::*;
 
 #[derive(Debug, Clone)]
-struct ArrowRowFactorResult {
-    factor: Array2<f64>,
-    gauge_deflated_directions: usize,
+pub(crate) struct ArrowRowFactorResult {
+    pub(crate) factor: Array2<f64>,
+    pub(crate) gauge_deflated_directions: usize,
 }
 
 
@@ -1153,4 +1153,3 @@ fn append_latent_metric_weights(out: &mut Vec<f64>, manifold: &LatentManifold) {
         }
     }
 }
-

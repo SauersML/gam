@@ -1,4 +1,5 @@
 use super::*;
+use crate::solver::estimate::smooth_floor_dp;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  The single evaluator
@@ -1609,4 +1610,3 @@ pub fn reml_laml_evaluate(
         ext_mode_response_cols,
     })
 }
-

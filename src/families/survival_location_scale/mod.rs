@@ -130,8 +130,8 @@ mod numeric_guards;
 // can reach them through `use super::*` exactly as the pre-split single
 // namespace did. The primitives themselves are `pub(super)` in `numeric_guards`.
 pub(in crate::families::survival_location_scale) use numeric_guards::{
-    StableDifference, compensated_difference, safe_hadamard_product, safe_linear_combo2_arrays,
-    safe_product, safe_product3, safe_sum2, safe_sum3, sanitize_survival_weight_vector, softplus,
+    compensated_difference, safe_hadamard_product, safe_linear_combo2_arrays, safe_product,
+    safe_product3, safe_sum2, safe_sum3, sanitize_survival_weight_vector, softplus,
 };
 
 mod constants;
@@ -157,18 +157,18 @@ mod tests;
 // `crate::families::survival_location_scale::Name` paths (and the `gam::`
 // library re-export) resolve unchanged. Only `pub` / `pub(crate)` items are
 // re-exported; private helpers stay encapsulated in their concern module.
-pub use constants::*;
-pub use covariate_blocks::*;
-pub use dense_linalg::*;
-pub use error::*;
-pub use family::*;
-pub use family_solver::*;
-pub use fit::*;
-pub use moments::*;
-pub use predict::*;
-pub use prepare::*;
-pub use residual_dist::*;
-pub use row_kernel::*;
-pub use spec::*;
-pub use time_block::*;
-pub use wiggle_geometry::*;
+pub(crate) use constants::*;
+pub(crate) use covariate_blocks::*;
+pub(crate) use dense_linalg::*;
+pub(crate) use error::*;
+pub(crate) use family::*;
+pub(crate) use family_solver::*;
+pub(crate) use fit::*;
+pub(crate) use moments::*;
+pub(crate) use predict::*;
+pub(crate) use prepare::*;
+pub(crate) use residual_dist::*;
+pub(crate) use row_kernel::*;
+pub(crate) use spec::*;
+pub(crate) use time_block::*;
+pub(crate) use wiggle_geometry::*;

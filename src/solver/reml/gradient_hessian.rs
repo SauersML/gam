@@ -458,7 +458,7 @@ impl<'a> RemlState<'a> {
             && self.runtime_mixture_link_state.is_none()
     }
 
-    pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
+    pub(crate) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
         match pirls_result.coordinate_frame {
             pirls::PirlsCoordinateFrame::OriginalSparseNative => {
                 pirls_result.beta_transformed.as_ref().clone()
@@ -3846,7 +3846,7 @@ impl<'a> RemlState<'a> {
     // `c · dη/dψ_total` per-row diagonal matches FD
     // `c · (η_+ − η_−) / 2h`.
 
-    pub(super) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
+    pub(crate) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
         let lin = pr.linear_constraints_transformed.as_ref()?;
         let beta_t = pr.beta_transformed.as_ref();
         let mut activerows: Vec<Array1<f64>> = Vec::new();
@@ -4636,7 +4636,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn without_persistent_warm_start_store<T>(&self, f: impl FnOnce() -> T) -> T {
         pub(crate) struct StoreSuppressionGuard<'a>(&'a AtomicUsize);
         impl Drop for StoreSuppressionGuard<'_> {
-            pub(crate) fn drop(&mut self) {
+            fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::Relaxed);
             }
         }
@@ -6238,7 +6238,7 @@ impl<'a> RemlState<'a> {
     /// The math (problem, penalty config, link kind, basis, KKT,
     /// failure-classification → `EstimationError` mapping) is bit-identical
     /// to the non-screening / non-EFS branch of `execute_pirls_if_needed`.
-    pub(super) fn execute_pirls_stateless_for_cubature(
+    pub(crate) fn execute_pirls_stateless_for_cubature(
         &self,
         rho: &Array1<f64>,
     ) -> Result<Arc<PirlsResult>, EstimationError> {

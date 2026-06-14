@@ -1,5 +1,3 @@
-use super::*;
-
 /// Typed errors emitted by the survival location-scale family pipeline.
 ///
 /// Each variant carries a pre-formatted `reason` string so `Display` is

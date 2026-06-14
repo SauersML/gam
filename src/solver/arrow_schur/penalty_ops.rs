@@ -4,6 +4,7 @@
 
 use super::*;
 
+#[derive(Debug, Clone)]
 struct BetaEdge {
     a: usize,
     b: usize,
@@ -20,7 +21,7 @@ pub(crate) struct BetaCouplingGraph {
 
 
 impl BetaCouplingGraph {
-    fn build(block_offsets: &[Range<usize>], htbeta_rows: &[Array2<f64>]) -> Self {
+    pub(crate) fn build(block_offsets: &[Range<usize>], htbeta_rows: &[Array2<f64>]) -> Self {
         let num_blocks = block_offsets.len();
         if num_blocks == 0 {
             return Self {
@@ -81,7 +82,7 @@ impl BetaCouplingGraph {
         &self.adj_targets[self.adj_start[node]..self.adj_start[node + 1]]
     }
 
-    fn component_partition(&self) -> Vec<Vec<usize>> {
+    pub(crate) fn component_partition(&self) -> Vec<Vec<usize>> {
         let mut parent: Vec<usize> = (0..self.num_blocks).collect();
         let mut rank = vec![0u8; self.num_blocks];
 
@@ -124,7 +125,7 @@ impl BetaCouplingGraph {
         parts
     }
 
-    fn expand_one_hop(&self, seed: &[usize]) -> Vec<usize> {
+    pub(crate) fn expand_one_hop(&self, seed: &[usize]) -> Vec<usize> {
         let mut expanded = seed.to_vec();
         for &block in seed {
             expanded.extend_from_slice(self.neighbours(block));
@@ -681,7 +682,7 @@ impl DeviceSaePcgData {
     /// per CG-solve build (cost `O(Σ_i m_i)`, dwarfed by the per-row factor solves
     /// in the same build), so the resident matvec borrows the index lists without
     /// re-cloning them on every CG iteration.
-    fn a_phi_shared(&self) -> Arc<[Vec<(usize, f64)>]> {
+    pub(crate) fn a_phi_shared(&self) -> Arc<[Vec<(usize, f64)>]> {
         Arc::from(self.a_phi.clone().into_boxed_slice())
     }
 }

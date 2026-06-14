@@ -214,7 +214,7 @@ impl MixedPrecisionPolicy {
         }
     }
 
-    fn is_enabled(self) -> bool {
+    pub(crate) fn is_enabled(self) -> bool {
         matches!(self, MixedPrecisionPolicy::Certified { .. })
     }
 }

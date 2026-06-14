@@ -27,7 +27,7 @@ pub struct StochasticTraceConfig {
 }
 
 impl Default for StochasticTraceConfig {
-    pub(crate) fn default() -> Self {
+    fn default() -> Self {
         Self {
             n_probes_min: 10,
             n_probes_max: 200,

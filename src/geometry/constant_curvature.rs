@@ -1054,6 +1054,55 @@ mod tests {
         }
     }
 
+    /// The radial volume Jacobian `J_κ(s) = (sn_κ(s)/s)^{d−1}` is analytic and
+    /// continuous through the flat point κ = 0 and through the sign change, has
+    /// the removable value `J_κ(0) = 1` at s = 0 for every κ, reduces to the
+    /// flat `s^{d−1}/s^{d−1} = 1` (i.e. `S(0)=1`) limit, collapses to `0⁺` at the
+    /// κ>0 conjugate shell (`√κ·s = π`) regardless of the parity of `d−1`, and is
+    /// the radial isometry `J ≡ 1` at `d ≤ 1` with no exponentiation.
+    #[test]
+    fn jacobian_radial_is_stable_through_flat_and_at_d_le_1() {
+        // d = 1: radial isometry, identically 1 at every κ and radius.
+        for &kappa in &[-2.0, -1e-9, 0.0, 1e-9, 3.0] {
+            let m = ConstantCurvature::new(1, kappa);
+            for &s in &[0.0, 0.1, 1.0, 5.0] {
+                assert_eq!(m.jacobian_radial(s), 1.0, "d=1 J≡1 at κ={kappa}, s={s}");
+            }
+        }
+        // d = 0 (degenerate): the d ≤ 1 guard must NOT form powi(−1).
+        let m0 = ConstantCurvature::new(0, 0.7);
+        assert_eq!(m0.jacobian_radial(0.4), 1.0, "d=0 guarded to 1");
+
+        // d = 3: continuity through κ = 0 and J(0) = 1; the flat limit is the
+        // analytic value of S(κs²)² → 1 as κ → 0.
+        let s = 0.3_f64;
+        let flat = ConstantCurvature::new(3, 0.0).jacobian_radial(s);
+        assert!((flat - 1.0).abs() <= 1e-15, "flat J(0.3) = {flat}");
+        let near_plus = ConstantCurvature::new(3, 1e-8).jacobian_radial(s);
+        let near_minus = ConstantCurvature::new(3, -1e-8).jacobian_radial(s);
+        assert!(
+            (near_plus - 1.0).abs() <= 1e-6 && (near_minus - 1.0).abs() <= 1e-6,
+            "J continuous through κ=0: {near_plus}, {near_minus}"
+        );
+        // J(0) = 1 at every κ (removable s = 0 singularity of sn_κ/s).
+        for &kappa in &[-1.5, 0.0, 2.5] {
+            let m = ConstantCurvature::new(3, kappa);
+            assert!((m.jacobian_radial(0.0) - 1.0).abs() <= 1e-15);
+        }
+
+        // κ > 0 conjugate shell at √κ·s = π collapses to 0⁺ for both even and
+        // odd d−1 (the clamp is on S, not on the power).
+        let kappa = 1.0_f64;
+        let s_shell = std::f64::consts::PI / kappa.sqrt();
+        for &d in &[3usize, 4] {
+            let m = ConstantCurvature::new(d, kappa);
+            // Just past the shell S(u) < 0; the volume element must be exactly 0,
+            // never a spurious positive value resurrected by an even d−1 power.
+            let past = m.jacobian_radial(s_shell * 1.01);
+            assert_eq!(past, 0.0, "d={d}: J past conjugate shell must be 0");
+        }
+    }
+
     /// Sectional curvature is κ — the family's defining identity, exposed
     /// through the trait so curvature-consuming code needs no special case.
     #[test]

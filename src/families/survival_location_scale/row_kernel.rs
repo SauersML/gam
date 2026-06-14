@@ -468,15 +468,15 @@ pub(crate) fn row_set_from_survival_mask(
 }
 
 impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
-    pub(crate) fn n_rows(&self) -> usize {
+    fn n_rows(&self) -> usize {
         self.family.n
     }
 
-    pub(crate) fn n_coefficients(&self) -> usize {
+    fn n_coefficients(&self) -> usize {
         *self.offsets.last().expect("offsets has block bounds")
     }
 
-    pub(crate) fn row_kernel(
+    fn row_kernel(
         &self,
         row: usize,
     ) -> Result<(f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]), String> {
@@ -508,7 +508,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         Ok((-self.q.ll[row], grad, hess))
     }
 
-    pub(crate) fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; SLS_ROW_K] {
+    fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; SLS_ROW_K] {
         let d_beta = ndarray::ArrayView1::from(d_beta);
         let d_time = d_beta.slice(s![self.offsets[0]..self.offsets[1]]);
         let d_thr = d_beta.slice(s![self.offsets[1]..self.offsets[2]]);
@@ -537,7 +537,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         ]
     }
 
-    pub(crate) fn jacobian_transpose_action(
+    fn jacobian_transpose_action(
         &self,
         row: usize,
         v: &[f64; SLS_ROW_K],
@@ -581,7 +581,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         }
     }
 
-    pub(crate) fn add_pullback_hessian(
+    fn add_pullback_hessian(
         &self,
         row: usize,
         h: &[[f64; SLS_ROW_K]; SLS_ROW_K],
@@ -620,7 +620,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         }
     }
 
-    pub(crate) fn add_diagonal_quadratic(
+    fn add_diagonal_quadratic(
         &self,
         row: usize,
         h: &[[f64; SLS_ROW_K]; SLS_ROW_K],
@@ -654,7 +654,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         }
     }
 
-    pub(crate) fn row_third_contracted(
+    fn row_third_contracted(
         &self,
         row: usize,
         dir: &[f64; SLS_ROW_K],
@@ -709,7 +709,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         Ok(out)
     }
 
-    pub(crate) fn row_fourth_contracted(
+    fn row_fourth_contracted(
         &self,
         row: usize,
         dir_u: &[f64; SLS_ROW_K],

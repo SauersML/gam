@@ -5,7 +5,7 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 impl CustomFamily for TransformationNormalFamily {
-    pub(crate) fn evaluate(
+    fn evaluate(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
@@ -65,7 +65,7 @@ impl CustomFamily for TransformationNormalFamily {
         })
     }
 
-    pub(crate) fn log_likelihood_only(
+    fn log_likelihood_only(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<f64, String> {
@@ -85,7 +85,7 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(row_quantities.log_likelihood)
     }
 
-    pub(crate) fn log_likelihood_only_with_options(
+    fn log_likelihood_only_with_options(
         &self,
         block_states: &[ParameterBlockState],
         options: &BlockwiseFitOptions,
@@ -118,7 +118,7 @@ impl CustomFamily for TransformationNormalFamily {
     /// this override is the gating condition for routing CTN's inner solve
     /// through the matrix-free joint-Newton path without paying the dense H
     /// tax on every gradient refresh.
-    pub(crate) fn exact_newton_joint_gradient_evaluation(
+    fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
@@ -139,12 +139,12 @@ impl CustomFamily for TransformationNormalFamily {
         }))
     }
 
-    pub(crate) fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         // The Hessian depends on β through 1/h'² where h' = X_deriv · β.
         true
     }
 
-    pub(crate) fn joint_jeffreys_term_required(&self) -> bool {
+    fn joint_jeffreys_term_required(&self) -> bool {
         // CTN models a continuous response through a monotone transformation
         // `h(Y|x) ~ N(0,1)`; there is no separation/under-identification
         // regime to bound. The Fisher information is `O(n)` on every
@@ -166,7 +166,7 @@ impl CustomFamily for TransformationNormalFamily {
         false
     }
 
-    pub(crate) fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Khatri–Rao tensor design: the coefficient block is X = R ⊙ C with
         // rows length p_resp · p_cov. Two regimes:
         //
@@ -216,14 +216,14 @@ impl CustomFamily for TransformationNormalFamily {
         )
     }
 
-    pub(crate) fn coefficient_gradient_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+    fn coefficient_gradient_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // One row-quantity pass plus two transpose products. The SCOP derivative
         // is structurally positive, so coefficient line searches no longer run a
         // full derivative-grid fraction-to-boundary scan on every attempt.
         self.coefficient_hessian_cost(specs) / 2
     }
 
-    pub(crate) fn outer_derivative_policy(
+    fn outer_derivative_policy(
         &self,
         specs: &[crate::families::custom_family::ParameterBlockSpec],
         psi_dim: usize,
@@ -280,7 +280,7 @@ impl CustomFamily for TransformationNormalFamily {
         }
     }
 
-    pub(crate) fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
+    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
         crate::seeding::SeedConfig {
             bounds: (-12.0, 12.0),
             max_seeds: if n_params <= 8 { 1 } else { 2 },
@@ -291,7 +291,7 @@ impl CustomFamily for TransformationNormalFamily {
         }
     }
 
-    pub(crate) fn max_feasible_step_size(
+    fn max_feasible_step_size(
         &self,
         block_states: &[ParameterBlockState],
         block_index: usize,
@@ -323,7 +323,7 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(None)
     }
 
-    pub(crate) fn block_linear_constraints(
+    fn block_linear_constraints(
         &self,
         block_states: &[ParameterBlockState],
         block_index: usize,
@@ -340,7 +340,7 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(None)
     }
 
-    pub(crate) fn exact_newton_hessian_directional_derivative(
+    fn exact_newton_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         block_index: usize,
@@ -355,7 +355,7 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(dd))
     }
 
-    pub(crate) fn exact_newton_joint_hessian(
+    fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
@@ -366,7 +366,7 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(hessian))
     }
 
-    pub(crate) fn exact_newton_joint_hessian_directional_derivative(
+    fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
@@ -374,7 +374,7 @@ impl CustomFamily for TransformationNormalFamily {
         self.exact_newton_hessian_directional_derivative(block_states, 0, d_beta_flat)
     }
 
-    pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative(
+    fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_u_flat: &Array1<f64>,
@@ -391,7 +391,7 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(d2))
     }
 
-    pub(crate) fn exact_newton_joint_psi_terms(
+    fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
@@ -433,7 +433,7 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(terms))
     }
 
-    pub(crate) fn exact_newton_joint_psisecond_order_terms(
+    fn exact_newton_joint_psisecond_order_terms(
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
@@ -540,7 +540,7 @@ impl CustomFamily for TransformationNormalFamily {
         }))
     }
 
-    pub(crate) fn exact_newton_joint_psihessian_directional_derivative(
+    fn exact_newton_joint_psihessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
@@ -569,7 +569,7 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(hess))
     }
 
-    pub(crate) fn exact_newton_joint_hessian_workspace(
+    fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -601,7 +601,7 @@ impl CustomFamily for TransformationNormalFamily {
         ))
     }
 
-    pub(crate) fn exact_newton_joint_psi_workspace(
+    fn exact_newton_joint_psi_workspace(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -621,7 +621,7 @@ impl CustomFamily for TransformationNormalFamily {
         ))))
     }
 
-    pub(crate) fn exact_newton_joint_hessian_workspace_with_options(
+    fn exact_newton_joint_hessian_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -640,7 +640,7 @@ impl CustomFamily for TransformationNormalFamily {
         }
     }
 
-    pub(crate) fn exact_newton_joint_psi_workspace_with_options(
+    fn exact_newton_joint_psi_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -677,7 +677,7 @@ impl CustomFamily for TransformationNormalFamily {
         ))))
     }
 
-    pub(crate) fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
+    fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
         // CTN's per-axis [`scop_psi_terms`] kernel walks all `n` rows serially
         // and is invoked once per ψ axis. Opting in here amortizes the per-row
         // state load across axes and parallelizes the row walk via the
@@ -686,7 +686,7 @@ impl CustomFamily for TransformationNormalFamily {
         true
     }
 
-    pub(crate) fn inner_coefficient_hessian_hvp_available(
+    fn inner_coefficient_hessian_hvp_available(
         &self,
         specs: &[ParameterBlockSpec],
     ) -> bool {
@@ -696,11 +696,11 @@ impl CustomFamily for TransformationNormalFamily {
             == self.response_val_basis.ncols().saturating_mul(self.covariate_design.ncols()))
     }
 
-    pub(crate) fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+    fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         self.inner_coefficient_hessian_hvp_available(specs)
     }
 
-    pub(crate) fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+    fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // Dense materialization remains mathematically available through the
         // outer-HVP operator, but SCOP's primary production path is the
         // matrix-free θθ operator above.

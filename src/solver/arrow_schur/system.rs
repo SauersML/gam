@@ -749,7 +749,7 @@ impl ArrowSchurSystem {
     /// `y += P x` without allocating a new Arc; dispatches to `penalty_op`
     /// or falls back to `hbb` inline, avoiding the K×K clone hot-path cost.
     #[inline]
-    fn penalty_matvec_add(&self, x: &[f64], y: &mut [f64]) {
+    pub(crate) fn penalty_matvec_add(&self, x: &[f64], y: &mut [f64]) {
         if let Some(op) = self.penalty_op.as_ref() {
             op.matvec(x, y);
         } else {
@@ -783,7 +783,13 @@ impl ArrowSchurSystem {
     /// `parallel` is the caller's top-level / not-nested-in-rayon decision (the
     /// same guard the row loop uses), so this never oversubscribes inside the
     /// topology race.
-    fn penalty_ridge_prologue_into(&self, x: &[f64], ridge: f64, y: &mut [f64], parallel: bool) {
+    pub(crate) fn penalty_ridge_prologue_into(
+        &self,
+        x: &[f64],
+        ridge: f64,
+        y: &mut [f64],
+        parallel: bool,
+    ) {
         let k = self.hbb.nrows();
         let dense_parallel = parallel
             && self.penalty_op.is_none()
@@ -810,7 +816,7 @@ impl ArrowSchurSystem {
     /// `diag += diag(P)` without allocating; dispatches to `penalty_op`
     /// or falls back to `hbb` diagonal / `hbb_diag` inline.
     #[inline]
-    fn penalty_diagonal_add(&self, diag: &mut [f64]) {
+    pub(crate) fn penalty_diagonal_add(&self, diag: &mut [f64]) {
         if let Some(op) = self.penalty_op.as_ref() {
             op.diagonal(diag);
         } else if let Some(hbb_diag) = self.hbb_diag.as_ref() {
@@ -829,7 +835,12 @@ impl ArrowSchurSystem {
     /// Add the `b×b` penalty sub-block for `id` to `out`, routing through
     /// `penalty_op` or falling back to `hbb` / `hbb_diag` inline.
     #[inline]
-    fn penalty_block_add(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+    pub(crate) fn penalty_block_add(
+        &self,
+        id: BetaBlockId,
+        offsets: &[Range<usize>],
+        out: &mut Array2<f64>,
+    ) {
         if let Some(op) = self.penalty_op.as_ref() {
             op.block(id, offsets, out);
         } else {
@@ -856,7 +867,7 @@ impl ArrowSchurSystem {
     /// Used by the cluster-Jacobi preconditioner (#299) which groups columns
     /// by spectral adjacency rather than contiguous block ranges.
     #[inline]
-    fn penalty_subblock_add(&self, cols: &[usize], out: &mut Array2<f64>) {
+    pub(crate) fn penalty_subblock_add(&self, cols: &[usize], out: &mut Array2<f64>) {
         let b = cols.len();
         if let Some(op) = self.penalty_op.as_ref() {
             // Probe each column basis vector and extract the sub-block entries.
@@ -1108,7 +1119,11 @@ impl ArrowSchurSystem {
     /// `d`), the only shape cross-row latent penalties are defined on; the
     /// flat-index convention `flat = i·d + j` matches every penalty's
     /// `latent_dim`/row-major contract.
-    fn apply_cross_row_penalty_hessian(&self, v: ArrayView1<'_, f64>, out: &mut Array1<f64>) {
+    pub(crate) fn apply_cross_row_penalty_hessian(
+        &self,
+        v: ArrayView1<'_, f64>,
+        out: &mut Array1<f64>,
+    ) {
         for cross in &self.cross_row_penalties {
             assert_eq!(cross.target_t.len(), v.len());
             let hv =
