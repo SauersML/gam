@@ -266,6 +266,7 @@ from ._model import (
     CompetingRisksPrediction,
     Model,
     MultinomialModel,
+    MultinomialPrediction,
     SurvivalPrediction,
     TermBlock,
     competing_risks_cif,
