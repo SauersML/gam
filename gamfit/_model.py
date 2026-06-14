@@ -951,6 +951,38 @@ class Model:
         return self.report()
 
 
+class MultinomialPrediction:
+    """Multinomial class-probability prediction with delta-method uncertainty.
+
+    Returned by :meth:`MultinomialModel.predict` with ``interval='confidence'``
+    (#1101). Every array is ``(N, K)`` with columns aligned to :attr:`classes`
+    (column ``j`` is class ``classes[j]``):
+
+    * :attr:`mean` — fitted class probabilities (rows sum to 1);
+    * :attr:`std_error` — delta-method per-class probability standard error
+      ``SE(p_c)`` from the softmax Jacobian and the joint posterior covariance;
+    * :attr:`mean_lower` / :attr:`mean_upper` — simplex-clamped band
+      ``p_c ± z·SE(p_c)`` at the requested :attr:`level`.
+    """
+
+    __slots__ = ("classes", "mean", "std_error", "mean_lower", "mean_upper", "level")
+
+    def __init__(self, *, classes, mean, std_error, mean_lower, mean_upper, level):
+        self.classes = list(classes)
+        self.mean = mean
+        self.std_error = std_error
+        self.mean_lower = mean_lower
+        self.mean_upper = mean_upper
+        self.level = float(level)
+
+    def __repr__(self) -> str:
+        n = getattr(self.mean, "shape", ["?"])[0]
+        return (
+            f"MultinomialPrediction(n={n}, classes={self.classes!r}, "
+            f"level={self.level})"
+        )
+
+
 class MultinomialModel:
     """Fitted penalized multinomial-logit GAM.
 
@@ -1016,21 +1048,88 @@ class MultinomialModel:
         return int(self._metadata["iterations"])
 
     # ------------------------------------------------------------------ predict
-    def predict(self, data: Any) -> Any:
+    def predict(self, data: Any, *, interval: str | None = None, level: float = 0.95) -> Any:
         """Predict class probabilities for new rows.
 
-        Returns an ``(N, K)`` numpy array whose columns are aligned with
-        :attr:`classes_` (column ``j`` is ``P(Y = self.classes_[j] | x)``).
-        Rows sum to 1.
+        With ``interval=None`` (default) returns an ``(N, K)`` numpy array whose
+        columns are aligned with :attr:`classes_` (column ``j`` is
+        ``P(Y = self.classes_[j] | x)``); rows sum to 1.
+
+        With ``interval='confidence'`` returns a
+        :class:`MultinomialPrediction` carrying the same ``(N, K)`` ``mean``
+        probabilities plus delta-method per-class probability standard errors
+        (``std_error``) and simplex-clamped confidence bounds (``mean_lower`` /
+        ``mean_upper``) at the requested ``level``. The bounds come from the
+        softmax-Jacobian delta method ``p_c ± z·SE(p_c)`` against the joint
+        Laplace posterior covariance ``H⁻¹`` (#1101). Available only for
+        REML-fitted models (which carry the covariance); a model without stored
+        covariance raises.
         """
         headers, rows, _ = normalize_table(data)
+        if interval is None:
+            try:
+                probs = rust_module().predict_multinomial_formula_pyfunc(
+                    self._model_bytes, headers, rows
+                )
+            except Exception as exc:
+                raise map_exception(exc) from exc
+            return probs
+        if interval != "confidence":
+            raise ValueError(
+                f"MultinomialModel.predict: interval={interval!r} is not supported; "
+                "use None or 'confidence'"
+            )
+        if not (0.0 < level < 1.0):
+            raise ValueError(f"level must be in (0, 1), got {level}")
+        # Two-sided normal quantile for the requested level.
         try:
-            probs = rust_module().predict_multinomial_formula_pyfunc(
-                self._model_bytes, headers, rows
+            from statistics import NormalDist
+
+            z = NormalDist().inv_cdf(0.5 + level / 2.0)
+        except Exception:  # pragma: no cover - statistics is stdlib
+            z = 1.959963984540054
+        try:
+            out = rust_module().predict_multinomial_intervals_pyfunc(
+                self._model_bytes, headers, rows, z
             )
         except Exception as exc:
             raise map_exception(exc) from exc
-        return probs
+        if out.get("prob_se") is None:
+            raise ValueError(
+                "MultinomialModel.predict(interval='confidence'): this model carries no "
+                "posterior covariance (refit with the current REML path to enable intervals)"
+            )
+        return MultinomialPrediction(
+            classes=self.classes_,
+            mean=out["probs"],
+            std_error=out["prob_se"],
+            mean_lower=out["mean_lower"],
+            mean_upper=out["mean_upper"],
+            level=level,
+        )
+
+    def std_error(self, data: Any) -> Any:
+        """Delta-method per-class probability standard errors for new rows.
+
+        Returns an ``(N, K)`` numpy array column-aligned with :attr:`classes_`.
+        Equivalent to ``predict(data, interval='confidence').std_error``.
+        """
+        return self.predict(data, interval="confidence").std_error
+
+    def smooth_significance(self) -> list[dict]:
+        """Wood rank-truncated Wald smooth-term significance table (#1101).
+
+        One row per ``(active class, smooth term)`` with keys ``class``,
+        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` — the same
+        kernel the scalar :meth:`Model.summary` smooth-term p-values use. Empty
+        when the model has no smooth terms or no stored covariance.
+        """
+        try:
+            return list(
+                rust_module().multinomial_smooth_significance_pyfunc(self._model_bytes)
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
 
     # ------------------------------------------------------------------ summary
     def summary(self) -> str:
@@ -1073,6 +1172,29 @@ class MultinomialModel:
             lines.append(
                 f"    class {levels[a]!r} vs ref: " + ", ".join(row_bits)
             )
+        # Wood rank-truncated Wald smooth-term significance table (#1101): the
+        # same kernel the scalar `Model.summary` uses. Present only for
+        # REML-fitted models carrying covariance + smooth terms.
+        try:
+            sig = self.smooth_significance()
+        except Exception:
+            sig = []
+        if sig:
+            lines.append("  smooth terms (Wood rank-truncated Wald):")
+            lines.append(
+                "    class                 term            edf   ref.df    chi.sq   p-value"
+            )
+            for r in sig:
+                lines.append(
+                    "    {cls:<20} {term:<14} {edf:6.3g} {ref:7.3g} {stat:9.4g} {p:9.3g}".format(
+                        cls=str(r["class"])[:20],
+                        term=str(r["term"])[:14],
+                        edf=float(r["edf"]),
+                        ref=float(r["ref_df"]),
+                        stat=float(r["statistic"]),
+                        p=float(r["p_value"]),
+                    )
+                )
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ identity / repr
@@ -1091,6 +1213,7 @@ __all__ = [
     "CompetingRisksPrediction",
     "Model",
     "MultinomialModel",
+    "MultinomialPrediction",
     "SurvivalPrediction",
     "TermBlock",
     "competing_risks_cif",

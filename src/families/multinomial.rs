@@ -744,11 +744,9 @@ impl MultinomialSavedModel {
     /// no covariance/smooth terms are available.
     pub fn smooth_significance(&self) -> Vec<MultinomialSmoothSignificance> {
         let mut out = Vec::new();
-        let (Some(cov), p, m) = (
-            self.coefficient_covariance(),
-            self.p_per_class,
-            self.n_active_classes,
-        ) else {
+        let p = self.p_per_class;
+        let m = self.n_active_classes;
+        let Some(cov) = self.coefficient_covariance() else {
             return out;
         };
         if self.smooth_term_spans.is_empty() {
@@ -1338,12 +1336,10 @@ pub fn fit_penalized_multinomial_formula(
     // [β_0; …; β_{K-2}]) and the influence matrix `F = H⁻¹ X'WX` the REML driver
     // computed at the converged mode. These power the predict path's delta-method
     // per-class probability standard errors and the summary's Wald smooth-term
-    // tests. The joint matrices are `(P·M)×(P·M)`; the standardization back-map
-    // applied to coefficients above is affine and exact, but covariance is
-    // reported in the FITTED (standardized) basis the joint Hessian was assembled
-    // in — predict consumes it against the same standardized design replay, so no
-    // basis re-mapping is required here (the saved coefficients and covariance
-    // both reference the training basis the termspec replays).
+    // tests. The joint matrices are `(P·M)×(P·M)`. The covariance is mapped back
+    // to RAW units (see below) so it pairs with the raw predict design; the
+    // influence is kept in the fitted basis (the Wald table only slices penalized
+    // columns, which the standardization affine leaves identity-mapped).
     let expected_joint = p_per_class.saturating_mul(m);
     // The joint Hessian (and thus `H⁻¹`) was assembled in the STANDARDIZED
     // parametric basis used during fitting, while the saved coefficients and the
