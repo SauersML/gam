@@ -239,8 +239,8 @@ the full surface):
 
 Methods: `predict` / `reconstruct(X)`, `encode(X)` (out-of-sample gates),
 `project(X, k)` and `per_atom_latent_for(X)` (coordinates), `shape_band(k)`,
-`summary()`, `get_decoder()` / `get_anchors()`, and `to_dict` / `from_dict` /
-`save` / `load`.
+`curvature()` / `atom_curvature(k)`, `summary()`, `get_decoder()` /
+`get_anchors()`, and `to_dict` / `from_dict` / `save` / `load`.
 
 ### Out-of-sample and encoder distillation (issue #357)
 
