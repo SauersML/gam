@@ -13,7 +13,7 @@ use crate::families::wiggle::{
 };
 use crate::inference::formula_dsl::{
     inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message, parse_formula,
-    parse_surv_response, parsed_term_column_names,
+    parse_surv_interval_response, parse_surv_response, parsed_term_column_names,
 };
 use crate::inference::predict::{
     BernoulliMarginalSlopePredictor, BinomialLocationScalePredictor,
@@ -2616,6 +2616,11 @@ impl FittedModel {
                 required.insert(entry);
             }
             required.insert(exit);
+        } else if let Some((left, right, _event)) =
+            parse_surv_interval_response(parsed.response.as_str()).map_err(|e| e.to_string())?
+        {
+            required.insert(left);
+            required.insert(right);
         } else if matches!(
             self.predict_model_class(),
             PredictModelClass::TransformationNormal
@@ -2684,6 +2689,9 @@ impl FittedModel {
         if parse_surv_response(parsed.response.as_str())
             .map_err(|e| e.to_string())?
             .is_some()
+            || parse_surv_interval_response(parsed.response.as_str())
+                .map_err(|e| e.to_string())?
+                .is_some()
         {
             return Ok(Vec::new());
         }
