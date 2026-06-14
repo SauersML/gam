@@ -5311,6 +5311,24 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 EvalMode::ValueOnly,
             ) {
                 Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
+                    // Adapt the inner-cycle cap from THIS probe's converged
+                    // cost, exactly as the value+gradient main eval does below.
+                    // Value-only line-search probes are the MOST FREQUENT outer
+                    // call (several per outer iteration), and omitting the cap
+                    // update here left every probe running the full
+                    // `inner_max_cycles` (1200) budget even after a warm-started
+                    // solve converges in a handful of cycles — the dominant
+                    // runtime multiplier on a large joint design (the multinomial
+                    // smooth-by-factor >360s cliff). `gradient_norm = None`: a
+                    // value-only probe has no gradient, so the cap is driven
+                    // purely by the converged cycle count (the gradient-norm
+                    // near-optimum uncapping is handled by the main eval).
+                    update_custom_outer_inner_cap_from_warm_start(
+                        &outer_options,
+                        &eval.warm_start,
+                        None,
+                        &mut outer.initial_gradient_norm,
+                    );
                     outer.warm_cache = Some(eval.warm_start);
                     outer.last_error = None;
                     Ok(eval.objective)
