@@ -2847,14 +2847,23 @@ fn measure_jet_term_spec(
 /// `spatial_term_uses_per_axis_psi` both defer here so the θ-layout
 /// sources cannot disagree.
 fn measure_jet_enrolls_psi(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
-    // ψ dials ride multiscale mode only: the per-scale spectral split and the
-    // (α, lnτ) dials are enabled together by the explicit `multiscale` opt-in
-    // (single source: `measure_jet_multiscale_mode`, #1116). Single-scale-mode
-    // terms (the default at any center count) stay at one fused penalty with
-    // fixed dials — Duchon/Matérn's outer footprint — so they never inflate the
-    // family's O(n) per-row evaluation count (#1039). The lnτ channel
-    // additionally needs a positive ridge.
-    mj.tau0 > 0.0 && crate::basis::measure_jet_multiscale_mode(mj)
+    // Two independent enrollment sources (#1116):
+    //   * the design-moving representer length-scale ℓ (`learn_length_scale`),
+    //     available in EVERY mode (it is the cure for the over-smoothing on
+    //     low-intrinsic-dimension manifolds — matérn's log_kappa analog);
+    //   * the multiscale penalty dials (s, α, lnτ): the per-scale spectral
+    //     split's (α, lnτ) ride the explicit `multiscale` opt-in, and the lnτ
+    //     channel additionally needs a positive ridge (τ = 0 is the
+    //     pseudo-inverse oracle mode where lnτ is undefined).
+    // A term enrolls if EITHER source is active.
+    measure_jet_learns_length_scale(mj) || (mj.tau0 > 0.0 && crate::basis::measure_jet_multiscale_mode(mj))
+}
+
+/// Whether the design-moving ℓ dial is enrolled for this term. ℓ is learnable
+/// in every mode; an explicitly-pinned positive `length_scale` with
+/// `learn_length_scale = false` freezes it (matches a user-fixed kernel scale).
+fn measure_jet_learns_length_scale(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
+    mj.learn_length_scale
 }
 
 /// Measure-jet ψ dial boxes. The dials are NOT log-kernel-scales, so the
@@ -2868,6 +2877,16 @@ const MEASURE_JET_PSI_ALPHA_BOUNDS: (f64, f64) = (-1.0, 3.0);
 
 const MEASURE_JET_PSI_LN_TAU_BOUNDS: (f64, f64) = (-18.420680743952367, 4.605170185988092);
 
+/// Log-ℓ box for the design-moving representer length-scale dial (#1116). An
+/// ABSOLUTE window in the data coordinate scale (ln of ℓ ∈ [1e-3, 1e2]): wide
+/// enough to let REML shrink ℓ ~orders below the auto ambient-spacing seed
+/// (the fix for the 1-D-curve-in-3-D over-smoothing) or grow it for very smooth
+/// surfaces, while keeping the Gaussian kernel numerically well-scaled. Absolute
+/// (not seed-relative) so the bound producer needs no data view, matching the
+/// other dial boxes. `ln(1e-3) = -6.9077…`, `ln(1e2) = 4.6051…`.
+const MEASURE_JET_PSI_LN_LENGTH_SCALE_BOUNDS: (f64, f64) =
+    (-6.907755278982137, 4.605170185988092);
+
 
 /// Is this measure-jet term in fused (pinned-order) mode? The `order_s`
 /// sentinel is the spectral/fused mode marker (see the basis module docs).
@@ -2877,41 +2896,73 @@ fn measure_jet_is_fused(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
 }
 
 
-/// ψ dimension of a measure-jet term: fused mode carries (s, α, lnτ);
-/// per-level (spectral) mode carries (α, lnτ) — the order is absorbed by the
-/// REML-learned per-scale amplitudes. MUST agree with the coordinate layout
-/// of `build_measure_jet_basis_psi_derivatives`.
-fn measure_jet_psi_dim(mj: &crate::basis::MeasureJetBasisSpec) -> usize {
-    if measure_jet_is_fused(mj) { 3 } else { 2 }
-}
-
-
-/// Seed ψ from the term's realized dials, in producer coordinate order.
-fn measure_jet_psi_seed(mj: &crate::basis::MeasureJetBasisSpec) -> Vec<f64> {
-    let ln_tau = mj.tau0.max(f64::MIN_POSITIVE).ln();
-    if measure_jet_is_fused(mj) {
-        vec![mj.order_s, mj.alpha, ln_tau]
+/// Number of multiscale PENALTY dials (excluding the design-moving ℓ):
+/// fused mode carries (s, α, lnτ) = 3; per-level (spectral) mode carries
+/// (α, lnτ) = 2; single-scale (the default) carries none of these. MUST agree
+/// with the penalty-coordinate layout of `build_measure_jet_basis_psi_derivatives`.
+fn measure_jet_penalty_psi_dim(mj: &crate::basis::MeasureJetBasisSpec) -> usize {
+    if !crate::basis::measure_jet_multiscale_mode(mj) {
+        0
+    } else if measure_jet_is_fused(mj) {
+        3
     } else {
-        vec![mj.alpha, ln_tau]
+        2
     }
 }
 
+/// ψ dimension of a measure-jet term. The design-moving ℓ dial (when enrolled)
+/// is coordinate 0; the multiscale penalty dials follow. MUST agree with the
+/// coordinate layout of `build_measure_jet_basis_psi_derivatives` (ℓ first).
+fn measure_jet_psi_dim(mj: &crate::basis::MeasureJetBasisSpec) -> usize {
+    usize::from(measure_jet_learns_length_scale(mj)) + measure_jet_penalty_psi_dim(mj)
+}
 
-/// One end of the per-coordinate dial boxes, in producer coordinate order.
+
+/// Seed ψ from the term's realized dials, in producer coordinate order: ℓ first
+/// (when enrolled), then the multiscale penalty dials. The ℓ seed is the
+/// realized representer range `ln(length_scale)` (the resolved spec carries the
+/// concrete auto value after the design build/freeze).
+fn measure_jet_psi_seed(mj: &crate::basis::MeasureJetBasisSpec) -> Vec<f64> {
+    let mut seed = Vec::with_capacity(measure_jet_psi_dim(mj));
+    if measure_jet_learns_length_scale(mj) {
+        // length_scale > 0 after resolution; the 0.0 sentinel (pre-resolution)
+        // falls back to the centre of the log-ℓ box so the optimizer still
+        // starts feasible and the first data-aware reseed corrects it.
+        let ell = if mj.length_scale > 0.0 {
+            mj.length_scale
+        } else {
+            1.0
+        };
+        seed.push(ell.ln());
+    }
+    if measure_jet_penalty_psi_dim(mj) > 0 {
+        let ln_tau = mj.tau0.max(f64::MIN_POSITIVE).ln();
+        if measure_jet_is_fused(mj) {
+            seed.extend_from_slice(&[mj.order_s, mj.alpha, ln_tau]);
+        } else {
+            seed.extend_from_slice(&[mj.alpha, ln_tau]);
+        }
+    }
+    seed
+}
+
+
+/// One end of the per-coordinate dial boxes, in producer coordinate order
+/// (ℓ first when enrolled, then the multiscale penalty dials).
 fn measure_jet_psi_bound_values(mj: &crate::basis::MeasureJetBasisSpec, upper: bool) -> Vec<f64> {
     let pick = |b: (f64, f64)| if upper { b.1 } else { b.0 };
-    if measure_jet_is_fused(mj) {
-        vec![
-            pick(MEASURE_JET_PSI_S_BOUNDS),
-            pick(MEASURE_JET_PSI_ALPHA_BOUNDS),
-            pick(MEASURE_JET_PSI_LN_TAU_BOUNDS),
-        ]
-    } else {
-        vec![
-            pick(MEASURE_JET_PSI_ALPHA_BOUNDS),
-            pick(MEASURE_JET_PSI_LN_TAU_BOUNDS),
-        ]
+    let mut bounds = Vec::with_capacity(measure_jet_psi_dim(mj));
+    if measure_jet_learns_length_scale(mj) {
+        bounds.push(pick(MEASURE_JET_PSI_LN_LENGTH_SCALE_BOUNDS));
     }
+    if measure_jet_penalty_psi_dim(mj) > 0 {
+        if measure_jet_is_fused(mj) {
+            bounds.push(pick(MEASURE_JET_PSI_S_BOUNDS));
+        }
+        bounds.push(pick(MEASURE_JET_PSI_ALPHA_BOUNDS));
+        bounds.push(pick(MEASURE_JET_PSI_LN_TAU_BOUNDS));
+    }
+    bounds
 }
 
 
@@ -2930,30 +2981,49 @@ fn apply_measure_jet_psi(
             measure_jet_psi_dim(mj)
         );
     }
-    let (next_s, next_alpha, next_tau) = if measure_jet_is_fused(mj) {
-        (Some(psi[0]), psi[1], psi[2].exp())
-    } else {
-        (None, psi[0], psi[1].exp())
-    };
-    if !(next_alpha.is_finite() && next_tau.is_finite() && next_tau > 0.0) {
-        crate::bail_invalid_estim!(
-            "measure-jet ψ write-back produced non-finite dials (alpha={next_alpha}, tau={next_tau})"
-        );
-    }
     let mut changed = false;
-    if let Some(s) = next_s
-        && s != mj.order_s
-    {
-        mj.order_s = s;
-        changed = true;
+    // Coordinate 0 (when enrolled) is the design-moving ln(ℓ); the multiscale
+    // penalty dials follow. Same order as `measure_jet_psi_seed` and the
+    // producer (`build_measure_jet_basis_psi_derivatives`).
+    let mut cursor = 0usize;
+    if measure_jet_learns_length_scale(mj) {
+        let next_ell = psi[cursor].exp();
+        cursor += 1;
+        if !(next_ell.is_finite() && next_ell > 0.0) {
+            crate::bail_invalid_estim!(
+                "measure-jet ψ write-back produced a non-finite/non-positive length_scale (ℓ={next_ell})"
+            );
+        }
+        if next_ell != mj.length_scale {
+            mj.length_scale = next_ell;
+            changed = true;
+        }
     }
-    if next_alpha != mj.alpha {
-        mj.alpha = next_alpha;
-        changed = true;
-    }
-    if next_tau != mj.tau0 {
-        mj.tau0 = next_tau;
-        changed = true;
+    if measure_jet_penalty_psi_dim(mj) > 0 {
+        let (next_s, next_alpha, next_tau) = if measure_jet_is_fused(mj) {
+            (Some(psi[cursor]), psi[cursor + 1], psi[cursor + 2].exp())
+        } else {
+            (None, psi[cursor], psi[cursor + 1].exp())
+        };
+        if !(next_alpha.is_finite() && next_tau.is_finite() && next_tau > 0.0) {
+            crate::bail_invalid_estim!(
+                "measure-jet ψ write-back produced non-finite dials (alpha={next_alpha}, tau={next_tau})"
+            );
+        }
+        if let Some(s) = next_s
+            && s != mj.order_s
+        {
+            mj.order_s = s;
+            changed = true;
+        }
+        if next_alpha != mj.alpha {
+            mj.alpha = next_alpha;
+            changed = true;
+        }
+        if next_tau != mj.tau0 {
+            mj.tau0 = next_tau;
+            changed = true;
+        }
     }
     Ok(changed)
 }

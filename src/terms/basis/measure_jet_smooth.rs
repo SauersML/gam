@@ -73,14 +73,23 @@
 //! # ψ-differentiability contract (what the ψ-channel stage consumes)
 //!
 //! Mirroring the constant-curvature κ-contract (#944): centers, masses, the
-//! band, and the representer range ℓ are all deliberately hyperparameter-
-//! FIXED at build time. Consequences, available TODAY from this module:
+//! band are deliberately hyperparameter-FIXED at build time; the representer
+//! range ℓ is the ONE design-moving dial (REML-learned, #1116). Consequences:
 //!
-//! - **Design drift is identically zero** for every measure-jet ψ
-//!   coordinate: the Gaussian representer design depends on none of
-//!   (s, α, τ), so `∂X/∂ψ ≡ 0` and the channels are penalty-only
+//! - **Penalty-dial design drift is identically zero**: the (s, α, τ) dials
+//!   reweight only the jet-energy penalty, never the Gaussian representer
+//!   design (`∂X/∂{s,α,τ} ≡ 0`), so those channels are penalty-only
 //!   (`is_penalty_like` auto-derives true in the outer engine's
 //!   `DirectionalHyperParam`).
+//! - **The representer range ℓ is a design-moving dial** (matérn's `log_kappa`
+//!   analog, #1116): `X = K(data, centers; ℓ)·z` depends on ℓ, so
+//!   `∂X/∂lnℓ = (K ⊙ r²/ℓ²)·z ≠ 0`, while the jet-energy penalty does NOT
+//!   depend on ℓ (`∂S/∂lnℓ ≡ 0`). ℓ is REML-learned and rebuilds the design
+//!   per outer trial; it does not change the basis RANK (the Gaussian kernel
+//!   is PD ∀ℓ > 0 → rank ≡ m centers) but it does change which m-dim subspace
+//!   the representers span — the span-alignment lever that fixes over-smoothing
+//!   on low-intrinsic-dimension manifolds. FD-gated by
+//!   `psi_producer_matches_fd_length_scale`.
 //! - **Exact (s, α) penalty jets are shipped**:
 //!   [`measure_jet_energy_form_with_jets`] returns `∂Q/∂s`, `∂²Q/∂s²`,
 //!   `∂Q/∂α`, `∂²Q/∂α²`, `∂²Q/∂s∂α` in closed form — both dials enter only
@@ -220,6 +229,14 @@ pub struct MeasureJetFrozenQuadrature {
     pub fused_penalty_normalization_scale: Option<f64>,
 }
 
+/// Serde default for [`MeasureJetBasisSpec::learn_length_scale`]: REML-learn ℓ.
+/// A function (not a literal) because `#[serde(default)]` on a `bool` would
+/// deserialize a missing field as `false`, silently freezing ℓ on every spec
+/// that predates the field — the opposite of the intended default.
+fn measure_jet_learn_length_scale_default() -> bool {
+    true
+}
+
 /// Measure-jet smooth configuration (`mjs(x0, …, xd)`).
 ///
 /// The feature columns are ambient coordinates of data concentrated near an
@@ -248,6 +265,18 @@ pub struct MeasureJetBasisSpec {
     /// Add an affine-preserving shrinkage penalty alongside the jet-energy
     /// penalty.
     pub double_penalty: bool,
+    /// REML-learn the representer range ℓ as a design-moving outer dial
+    /// (`true`, default), mirroring Matérn's `log_kappa`. The Gaussian kernel is
+    /// strictly PD for every ℓ > 0, so ℓ does NOT change the basis rank (always
+    /// `m` centers) — but it changes WHICH `m`-dim subspace the representers
+    /// span, i.e. the span alignment with the true surface. The frozen
+    /// ambient-spacing ℓ over-smooths data on a low-intrinsic-dimension manifold
+    /// (#1116: 13× worse than Matérn on a 1-D curve in 3-D, where ambient
+    /// nearest-center spacing over-estimates the resolution needed); letting
+    /// REML pick ℓ recovers the aligned subspace. `false` freezes ℓ at the auto
+    /// (or explicit) value with no outer enrollment.
+    #[serde(default = "measure_jet_learn_length_scale_default")]
+    pub learn_length_scale: bool,
     /// Explicit opt-in for multiscale mode: the per-scale spectral penalty
     /// split plus the `(α, ln τ)` outer ψ dials and the affine-preserving
     /// ridge. `false` (default) keeps the term in single-scale mode at ANY
@@ -287,6 +316,7 @@ impl Default for MeasureJetBasisSpec {
             num_scales: 0,
             length_scale: 0.0,
             double_penalty: true,
+            learn_length_scale: true,
             multiscale: false,
             identifiability: MeasureJetIdentifiability::CenterSumToZero,
             frozen_quadrature: None,
@@ -1632,56 +1662,60 @@ pub fn build_measure_jet_basis_psi_derivatives(
         }
         (2usize, vec![(0usize, 1usize)], raw)
     } else {
-        let jets = measure_jet_energy_form_with_jets(
-            geom.centers.view(),
-            geom.masses.view(),
-            &band,
-            geom.order_s_eval,
-            spec.alpha,
-            spec.tau0,
-        )?;
-        // Single-scale fuses the affine-preserving ridge into the primary value
-        // at the fixed identifiability fraction (mirrors `build_measure_jet_basis`
-        // so the normalization scale `c` matches the fitted penalty). The ridge
-        // is ψ-invariant, so every jet slot of the fused candidate is unchanged.
-        let mut q_value = sandwich(&jets.q);
-        if spec.double_penalty {
-            let ridge =
-                affine_preserving_coefficient_ridge(kz, geom.centers.view(), geom.masses.view())?;
-            let primary_fro = trace_of_product(&q_value, &q_value).sqrt();
-            let ridge_fro = trace_of_product(&ridge, &ridge).sqrt();
-            if primary_fro.is_finite()
-                && primary_fro > 0.0
-                && ridge_fro.is_finite()
-                && ridge_fro > 0.0
-            {
-                let w = MEASURE_JET_FUSED_RIDGE_FRACTION * primary_fro / ridge_fro;
-                q_value = &q_value + &(&ridge * w);
-            }
+        // Single-scale mode (the default): the penalty dials (s, α, lnτ) are NOT
+        // enrolled — the fused penalty is fixed and only the design-moving ℓ
+        // coordinate (added below) varies. So there are ZERO penalty-derivative
+        // COORDINATES (n_coords = 0), but the term still has ONE fitted penalty
+        // candidate (the fused primary), so we emit one `raw` entry with EMPTY
+        // per-coordinate derivative vecs. That keeps the candidate COUNT
+        // (n_active = 1) aligned with the build's penalty list while contributing
+        // no penalty ψ-derivative (the penalty is ℓ-independent). MUST match
+        // `measure_jet_penalty_psi_dim` (= 0 coords) and the build's 1 candidate.
+        let q_value =
+            sandwich(&measure_jet_energy_form(
+                geom.centers.view(),
+                geom.masses.view(),
+                &band,
+                geom.order_s_eval,
+                spec.alpha,
+                spec.tau0,
+            )?);
+        let raw = vec![(q_value, Vec::new(), Vec::new(), Vec::new())];
+        (0usize, Vec::new(), raw)
+    };
+    // Design-moving ℓ coordinate (#1116). The Gaussian representer design
+    // `X = K(data, centers; ℓ)·z` is the ONLY ℓ-dependent object (the jet-energy
+    // penalty uses the ε-band, not ℓ; the constraint transform `z` acts in
+    // center-coefficient space). With `u = lnℓ` and `a = r²/ℓ²`:
+    //   ∂K/∂u = K ⊙ a,     ∂²K/∂u² = K ⊙ (a² − 2a),
+    // and `∂X/∂u = (∂K/∂u)·z`, `∂²X/∂u² = (∂²K/∂u²)·z`. Cross terms with the
+    // (s, α, lnτ) penalty dials vanish: those carry zero design drift and the
+    // penalty carries zero ℓ drift. FD-gated by `psi_producer_matches_fd_length_scale`.
+    let length_scale_design = if spec.learn_length_scale {
+        let ell = geom.length_scale;
+        let k = measure_jet_design_matrix(data, geom.centers.view(), ell)?;
+        let r2 = pairwise_sq_dists(data, geom.centers.view());
+        let inv_l2 = 1.0 / (ell * ell);
+        let mut dk = k.clone();
+        let mut d2k = k.clone();
+        for ((dk_v, d2k_v), &r2_v) in dk.iter_mut().zip(d2k.iter_mut()).zip(r2.iter()) {
+            let a = r2_v * inv_l2;
+            let kij = *dk_v;
+            *dk_v = kij * a;
+            *d2k_v = kij * (a * a - 2.0 * a);
         }
-        let raw = vec![(
-            q_value,
-            vec![
-                sandwich(&jets.dq_ds),
-                sandwich(&jets.dq_dalpha),
-                sandwich(&jets.dq_dlogtau),
-            ],
-            vec![
-                sandwich(&jets.d2q_ds2),
-                sandwich(&jets.d2q_dalpha2),
-                sandwich(&jets.d2q_dlogtau2),
-            ],
-            vec![
-                sandwich(&jets.d2q_ds_dalpha),
-                sandwich(&jets.d2q_ds_dlogtau),
-                sandwich(&jets.d2q_dalpha_dlogtau),
-            ],
-        )];
-        (
-            3usize,
-            vec![(0usize, 1usize), (0usize, 2usize), (1usize, 2usize)],
-            raw,
-        )
+        // Apply the SAME constraint transform the design uses. Fit path:
+        // structured Householder drop-first; replay path: dense composed z.
+        let (dx_du, d2x_du2) = match &geom.sum_to_zero_u {
+            Some(u_house) => (
+                householder_drop_first_apply(&dk, u_house),
+                householder_drop_first_apply(&d2k, u_house),
+            ),
+            None => (dk.dot(&geom.z), d2k.dot(&geom.z)),
+        };
+        Some((dx_du, d2x_du2))
+    } else {
+        None
     };
     let n_active = raw.len();
     // Mirror the build-path gate (`build_measure_jet_basis`): the
@@ -1741,8 +1775,22 @@ pub fn build_measure_jet_basis_psi_derivatives(
             pair_crosses.push(zero_p());
         }
     }
+    // Prepend the design-moving ℓ coordinate at index 0 when enrolled. ℓ
+    // carries the nonzero `design_first/second`, ZERO penalty derivatives (the
+    // penalty is ℓ-independent), and no cross terms with the penalty dials
+    // (those carry zero design drift). Every penalty-dial coordinate and cross
+    // pair therefore shifts up by one.
+    let coord_offset = usize::from(length_scale_design.is_some());
+    if coord_offset == 1 {
+        penalties_first.insert(0, (0..n_cands).map(|_| zero_p()).collect());
+        penalties_second_diag.insert(0, (0..n_cands).map(|_| zero_p()).collect());
+    }
+    let shifted_pairs: Vec<(usize, usize)> = pairs
+        .iter()
+        .map(|&(a, b)| (a + coord_offset, b + coord_offset))
+        .collect();
     let pair_index: Vec<((usize, usize), Vec<Array2<f64>>)> =
-        pairs.iter().copied().zip(crosses.into_iter()).collect();
+        shifted_pairs.iter().copied().zip(crosses.into_iter()).collect();
     let provider = AnisoPenaltyCrossProvider::new(move |a, b| {
         pair_index
             .iter()
@@ -1754,18 +1802,25 @@ pub fn build_measure_jet_basis_psi_derivatives(
                 ))
             })
     });
+    let n_coords_total = n_coords + coord_offset;
+    let mut design_first: Vec<Array2<f64>> = (0..n_coords_total)
+        .map(|_| Array2::<f64>::zeros((n, p)))
+        .collect();
+    let mut design_second_diag: Vec<Array2<f64>> = (0..n_coords_total)
+        .map(|_| Array2::<f64>::zeros((n, p)))
+        .collect();
+    if let Some((dx_du, d2x_du2)) = length_scale_design {
+        design_first[0] = dx_du;
+        design_second_diag[0] = d2x_du2;
+    }
     Ok(AnisoBasisPsiDerivatives {
-        design_first: (0..n_coords)
-            .map(|_| Array2::<f64>::zeros((n, p)))
-            .collect(),
-        design_second_diag: (0..n_coords)
-            .map(|_| Array2::<f64>::zeros((n, p)))
-            .collect(),
+        design_first,
+        design_second_diag,
         design_second_cross: Vec::new(),
         design_second_cross_pairs: Vec::new(),
         penalties_first,
         penalties_second_diag,
-        penalties_cross_pairs: pairs,
+        penalties_cross_pairs: shifted_pairs,
         penalties_cross_provider: Some(provider),
         implicit_operator: None,
     })
@@ -2216,6 +2271,10 @@ mod tests {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 70 },
             order_s,
             multiscale,
+            // These fixtures gate the PENALTY-dial derivatives; freeze ℓ so the
+            // coordinate layout is exactly the penalty dials (the design-moving
+            // ℓ dial has its own FD gate, `psi_producer_matches_fd_length_scale`).
+            learn_length_scale: false,
             ..MeasureJetBasisSpec::default()
         };
         let first = build_measure_jet_basis(data.view(), &spec).expect("fixture build");
@@ -2242,6 +2301,7 @@ mod tests {
             num_scales: eps_band.len(),
             length_scale: *length_scale,
             double_penalty: spec.double_penalty,
+            learn_length_scale: false,
             multiscale,
             identifiability: MeasureJetIdentifiability::FrozenTransform {
                 transform: constraint_transform.clone().expect("fit-time z"),
@@ -2350,38 +2410,64 @@ mod tests {
         }
     }
 
-    /// Fused mode adds the s coordinate; gate it the same way.
+    /// Design-moving ℓ dial (#1116): the producer's `design_first[0]` /
+    /// `design_second_diag[0]` must match central finite differences of the
+    /// REBUILT design `X(ℓ)` under frozen geometry, and the ℓ coordinate must
+    /// carry IDENTICALLY ZERO penalty derivatives (the jet-energy penalty is
+    /// ℓ-independent). This is the FD gate matérn's log_kappa has and mjs lacked.
     #[test]
-    pub(crate) fn psi_producer_matches_fd_fused_mode() {
-        let (data, frozen) = frozen_spec_fixture(1.3, false);
+    pub(crate) fn psi_producer_matches_fd_length_scale() {
+        // Single-scale default with ℓ learning ON; frozen geometry so only ℓ
+        // moves across the FD trials.
+        let (data, mut frozen) = frozen_spec_fixture(0.0, false);
+        frozen.learn_length_scale = true;
         let derivs =
             build_measure_jet_basis_psi_derivatives(data.view(), &frozen).expect("psi derivatives");
+        // ℓ is the only coordinate in single-scale + learn_length_scale.
         assert_eq!(
-            derivs.penalties_first.len(),
-            3,
-            "fused coords are (s, α, lnτ)"
-        );
-        assert_eq!(
-            derivs.penalties_first[0].len(),
+            derivs.design_first.len(),
             1,
-            "single-scale fused mode has exactly one candidate (ridge folded into the primary)"
+            "single-scale + learn_length_scale enrolls exactly the ℓ coordinate"
         );
-        let pen_at = |s: f64| {
+        // The ℓ coordinate carries one (all-zero) penalty candidate: the penalty
+        // is ℓ-independent, so its ψ-derivative is identically zero.
+        assert_eq!(derivs.penalties_first[0].len(), 1, "one fitted penalty candidate");
+        assert!(
+            derivs.penalties_first[0][0].iter().all(|v| *v == 0.0)
+                && derivs.penalties_second_diag[0][0].iter().all(|v| *v == 0.0),
+            "the jet-energy penalty must not move with ℓ"
+        );
+        // Rebuild the DESIGN at ℓ·e^{±h} (perturb via spec.length_scale; the
+        // realized resolver uses an explicit positive length_scale verbatim).
+        let ell0 = frozen.length_scale;
+        let design_at = |ell: f64| {
             let trial = MeasureJetBasisSpec {
-                order_s: s,
+                length_scale: ell,
                 ..frozen.clone()
             };
             build_measure_jet_basis(data.view(), &trial)
                 .expect("trial build")
-                .penalties
+                .design
+                .to_dense()
         };
         let h = 1e-4;
-        let fd = (&pen_at(1.3 + h)[0] - &pen_at(1.3 - h)[0]) / (2.0 * h);
-        let scale = fd.iter().fold(1e-30_f64, |acc, v| acc.max(v.abs()));
-        for (x, y) in derivs.penalties_first[0][0].iter().zip(fd.iter()) {
+        let x_plus = design_at(ell0 * h.exp());
+        let x_minus = design_at(ell0 * (-h).exp());
+        let x_0 = design_at(ell0);
+        let fd_first = (&x_plus - &x_minus) / (2.0 * h);
+        let fd_second = (&x_plus - &(&x_0 * 2.0) + &x_minus) / (h * h);
+        let scale1 = fd_first.iter().fold(1e-30_f64, |acc, v| acc.max(v.abs()));
+        for (x, y) in derivs.design_first[0].iter().zip(fd_first.iter()) {
             assert!(
-                (x - y).abs() <= 5e-5 * scale,
-                "s jet of the fused candidate: analytic {x:.6e} vs FD {y:.6e}"
+                (x - y).abs() <= 5e-5 * scale1,
+                "∂X/∂lnℓ: analytic {x:.6e} vs FD {y:.6e}"
+            );
+        }
+        let scale2 = fd_second.iter().fold(1e-30_f64, |acc, v| acc.max(v.abs()));
+        for (x, y) in derivs.design_second_diag[0].iter().zip(fd_second.iter()) {
+            assert!(
+                (x - y).abs() <= 1e-3 * scale2,
+                "∂²X/∂lnℓ²: analytic {x:.6e} vs FD {y:.6e}"
             );
         }
     }
@@ -2476,6 +2562,7 @@ mod tests {
             num_scales: eps_band.len(),
             length_scale: *length_scale,
             double_penalty: spec.double_penalty,
+            learn_length_scale: spec.learn_length_scale,
             multiscale: spec.multiscale,
             identifiability: MeasureJetIdentifiability::FrozenTransform {
                 transform: constraint_transform.clone().expect("fit-time z"),
