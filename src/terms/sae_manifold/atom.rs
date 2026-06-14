@@ -332,7 +332,7 @@ fn bessel_i1(x: f64) -> f64 {
 /// and in the *ratio* (`I1/I0 = poly₁/poly₀`), so both are computed from the
 /// bounded scaled polynomials alone — exact for non-degenerate η and finite for
 /// every finite η.
-fn bessel_i0_log_and_ratio(eta: f64) -> (f64, f64) {
+pub(crate) fn bessel_i0_log_and_ratio(eta: f64) -> (f64, f64) {
     let ax = eta.abs();
     if ax < 3.75 {
         let i0 = bessel_i0(ax);

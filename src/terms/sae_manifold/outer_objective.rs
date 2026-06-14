@@ -1,6 +1,6 @@
 use super::*;
 
-fn reconstruction_explained_variance(
+pub(crate) fn reconstruction_explained_variance(
     target: ArrayView2<'_, f64>,
     fitted: ArrayView2<'_, f64>,
 ) -> Option<f64> {
@@ -1088,7 +1088,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 }
 
-fn sae_manifold_newton_directional_decrease(
+pub(crate) fn sae_manifold_newton_directional_decrease(
     sys: &ArrowSchurSystem,
     delta_ext_coord: ArrayView1<'_, f64>,
     delta_beta: ArrayView1<'_, f64>,
@@ -1133,7 +1133,7 @@ fn sae_manifold_newton_directional_decrease(
 /// pre-symmetrises each `S_k` (the assembly path needs `½(S+Sᵀ)`); the value /
 /// quadratic-form callers pass `false` since the quadratic form only sees the
 /// symmetric part regardless.
-fn batched_smooth_sb(
+pub(crate) fn batched_smooth_sb(
     sb_inputs: &[(ArrayView2<'_, f64>, ArrayView2<'_, f64>)],
     symmetrize: bool,
 ) -> Vec<Array2<f64>> {
@@ -1408,7 +1408,7 @@ pub fn linear_span_anchor(
     })
 }
 
-fn sae_cholesky_solve_neg_gradient(
+pub(crate) fn sae_cholesky_solve_neg_gradient(
     h: ArrayView2<'_, f64>,
     g: ArrayView1<'_, f64>,
 ) -> Result<Array1<f64>, String> {
@@ -1460,14 +1460,14 @@ fn sae_cholesky_solve_neg_gradient(
     Ok(x)
 }
 
-fn solve_basis_transport(
+pub(crate) fn solve_basis_transport(
     new_phi: ArrayView2<'_, f64>,
     old_phi: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, String> {
     solve_design_least_squares(new_phi, old_phi)
 }
 
-fn transport_smooth_penalty_for_decoder(
+pub(crate) fn transport_smooth_penalty_for_decoder(
     decoder_transport: ArrayView2<'_, f64>,
     old_smooth_penalty: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, String> {

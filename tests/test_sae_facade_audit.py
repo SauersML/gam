@@ -217,6 +217,30 @@ class _FakeRustModule:
         ss_tot = float(np.sum((observed - observed.mean(axis=0, keepdims=True)) ** 2))
         return 1.0 - ss_res / max(ss_tot, 1.0e-12)
 
+    def basis_with_jet(self, kind, coords, params):
+        """Minimal real periodic Fourier basis (width 2H+1) plus its phase jet.
+
+        Enough for the `_periodic_shape_band` / `_atom_functional_evidence`
+        readers exercised by the variable-K round-trip: a (G, 2H+1) design, its
+        (G, 2H+1, 1) derivative tower, and a zero penalty stub.
+        """
+        if str(kind) != "periodic":
+            raise ValueError(f"fake basis_with_jet only models 'periodic'; got {kind!r}")
+        coords = np.asarray(coords, dtype=float)
+        theta = 2.0 * np.pi * coords[:, 0]
+        h = int(params["n_harmonics"])
+        cols = [np.ones_like(theta)]
+        jet_cols = [np.zeros_like(theta)]
+        for m in range(1, h + 1):
+            cols.append(np.cos(m * theta))
+            cols.append(np.sin(m * theta))
+            jet_cols.append(-2.0 * np.pi * m * np.sin(m * theta))
+            jet_cols.append(2.0 * np.pi * m * np.cos(m * theta))
+        phi = np.stack(cols, axis=1)
+        jet = np.stack(jet_cols, axis=1)[:, :, None]
+        penalty = np.zeros((phi.shape[1], phi.shape[1]), dtype=float)
+        return phi, jet, penalty
+
     def sae_manifold_fit_minimal(
         self,
         z,
@@ -554,3 +578,126 @@ def test_ard_per_atom_controls_native_ard_plumbing(monkeypatch):
         decoder_incoherence_weight=0.0,
     )
     assert fake.last_native_ard_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# #977 — VARIABLE-K discovery boundary. The structure search may GROW K via
+# evidence-gated births; the Rust producer re-derives every per-atom field from
+# the post-search dictionary so each has length == discovered K. A born atom
+# (index >= seed K) carries NO posterior shape-band keys (its uncertainty came
+# from the pre-search Schur factor, which is indexed by the seed dictionary), so
+# `from_payload` must read those bands as optional and return `None` rather than
+# panic, and the scalar `atom_topology` must collapse to "mixed" when births
+# made the dictionary heterogeneous.
+# ---------------------------------------------------------------------------
+def _grown_k_payload(n_obs: int, p_out: int) -> dict[str, object]:
+    """Seed = 2 periodic atoms; discovered = 3 (a born euclidean atom).
+
+    The born atom (index 2) deliberately omits every `shape_band_*` /
+    `decoder_covariance` key, mirroring the Rust producer's omission for an atom
+    with no entry in the seed-indexed `shape_uncertainty`. All length-K fields
+    (`atoms`, `atom_plans`, `assignments_z`, `logits`, `chosen_k`) carry the
+    DISCOVERED K = 3.
+    """
+    rng = np.random.default_rng(977)
+    k = 3
+    assignments = rng.random((n_obs, k))
+    assignments /= assignments.sum(axis=1, keepdims=True)
+    logits = np.log(np.clip(assignments, 1e-9, None))
+    kinds = ["periodic", "periodic", "euclidean"]
+    dims = [1, 1, 2]
+    sizes = [3, 3, 4]
+    nharm = [1, 1, 0]
+    atoms = []
+    for idx in range(k):
+        atom = {
+            "basis_kind": kinds[idx],
+            "decoder_B": rng.standard_normal((sizes[idx], p_out)),
+            "assignments_z": assignments[:, idx],
+            "on_atom_coords_t": rng.standard_normal((n_obs, dims[idx])),
+            "active_dim": dims[idx],
+        }
+        # Only the two SEED atoms carry posterior bands; the born atom omits them.
+        if idx < 2:
+            grid = np.linspace(0.0, 1.0, 5).reshape(-1, 1)
+            atom["shape_band_coords"] = grid
+            atom["shape_band_mean"] = rng.standard_normal((grid.shape[0], p_out))
+            atom["shape_band_sd"] = np.abs(rng.standard_normal((grid.shape[0], p_out)))
+        atoms.append(atom)
+    return {
+        "atoms": atoms,
+        "atom_plans": [
+            {
+                "kind": kinds[idx],
+                "latent_dim": dims[idx],
+                "basis_size": sizes[idx],
+                "n_harmonics": nharm[idx],
+                "duchon_centers": None,
+            }
+            for idx in range(k)
+        ],
+        "assignments_z": assignments,
+        "logits": logits,
+        "fitted": rng.standard_normal((n_obs, p_out)),
+        "reml_score": -2.0,
+        "chosen_k": k,
+        "dispersion": 1.0,
+        "oos_projection_top1": False,
+        "diagnostics": _diagnostics(k),
+    }
+
+
+def test_grown_k_payload_round_trips_through_from_payload(monkeypatch):
+    monkeypatch.setattr(sae, "rust_module", lambda: _FakeRustModule())
+    n_obs, p_out = 16, 3
+    x = np.random.default_rng(1).standard_normal((n_obs, p_out))
+    payload = _grown_k_payload(n_obs, p_out)
+    # The seed dictionary was 2 periodic atoms; `topology` is the SEED scalar.
+    model = sae.ManifoldSAE.from_payload(
+        x, payload, topology="circle", assignment="softmax", penalties=[]
+    )
+    # Discovered K (= 3) threads through every per-atom surface.
+    assert len(model.atoms) == 3
+    assert model.low_level.chosen_k == 3
+    assert model.assignments.shape == (n_obs, 3)
+    assert model.low_level_logits.shape == (n_obs, 3)
+    assert len(model.coords) == 3
+    assert len(model.decoder_blocks) == 3
+    assert model.basis_specs == ["periodic", "periodic", "euclidean"]
+    # The scalar topology is re-derived from the POST-search kinds: a born
+    # euclidean atom makes the dictionary heterogeneous, so the honest scalar
+    # collapses to "mixed" even though the seed argument said "circle".
+    assert model.atom_topologies == ["circle", "circle", "euclidean"]
+    assert model.atom_topology == "mixed"
+    # The two seed atoms carry their posterior bands; the born atom (index 2) has
+    # `None` bands rather than a stale read or a panic.
+    assert model.atoms[0].shape_band_coords is not None
+    assert model.atoms[1].shape_band_mean is not None
+    assert model.atoms[2].shape_band_coords is None
+    assert model.atoms[2].shape_band_mean is None
+    assert model.atoms[2].shape_band_sd is None
+    assert model.atoms[2].decoder_covariance is None
+
+
+def test_from_payload_rejects_plans_atoms_length_mismatch(monkeypatch):
+    monkeypatch.setattr(sae, "rust_module", lambda: _FakeRustModule())
+    x = np.random.default_rng(2).standard_normal((16, 3))
+    payload = _grown_k_payload(16, 3)
+    # Drop one plan so atom_plans (2) disagrees with atoms (3) — the producer-side
+    # contract violation a grown K could surface as an opaque IndexError.
+    payload["atom_plans"] = payload["atom_plans"][:2]
+    with pytest.raises(ValueError, match="atom_plans"):
+        sae.ManifoldSAE.from_payload(
+            x, payload, topology="circle", assignment="softmax", penalties=[]
+        )
+
+
+def test_from_payload_rejects_chosen_k_mismatch(monkeypatch):
+    monkeypatch.setattr(sae, "rust_module", lambda: _FakeRustModule())
+    x = np.random.default_rng(3).standard_normal((16, 3))
+    payload = _grown_k_payload(16, 3)
+    payload["chosen_k"] = 2  # stale seed K vs 3 emitted atoms
+    with pytest.raises(ValueError, match="chosen_k"):
+        sae.ManifoldSAE.from_payload(
+            x, payload, topology="circle", assignment="softmax", penalties=[]
+        )

@@ -1178,6 +1178,13 @@ fn born_atom(
     factor_dir: ArrayView2<'_, f64>,
 ) -> Result<(SaeManifoldTerm, SaeManifoldRho), String> {
     let k = term.k_atoms();
+    if term.atoms.is_empty() {
+        return Err(
+            "born_atom: cannot birth from an empty dictionary (no template atom to seed the \
+             coordinate block / basis from)"
+                .to_string(),
+        );
+    }
     let template = &term.atoms[0];
     let m = template.basis_size();
     let p = term.output_dim();

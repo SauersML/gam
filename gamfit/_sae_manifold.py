@@ -668,6 +668,37 @@ class ManifoldSAE:
     @classmethod
     def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False, *, assignment_label: str | None = None, tau: float = 0.5, sparsity_strength: float = 1.0, smoothness: float = 1.0, learning_rate: float = 0.04, max_iter: int = 50, random_state: int = 0, top_k: int | None = None, jumprelu_threshold: float = 0.0) -> "ManifoldSAE":
         plans = list(payload["atom_plans"])
+        # #977 variable-K boundary contract: the structure search may have GROWN
+        # K (evidence-gated births / fissions) or shrunk routing mass; the Rust
+        # producer re-derives EVERY per-atom field from the post-search dictionary
+        # so each one has length == discovered K. Assert that contract here at the
+        # single ingest point rather than letting a producer drift surface as an
+        # opaque ``plans[atom_idx]`` IndexError (grown K) or a silent truncation
+        # (shrunk lists). ``atom_plans`` is zipped positionally against
+        # ``payload["atoms"]`` below, and ``chosen_k`` / ``assignments_z`` /
+        # ``logits`` must agree on the same K.
+        payload_atoms = list(payload["atoms"])
+        k_discovered = len(payload_atoms)
+        if len(plans) != k_discovered:
+            raise ValueError(
+                "SAE payload is inconsistent at the variable-K boundary: "
+                f"{k_discovered} atoms but {len(plans)} atom_plans; every "
+                "per-atom field must have length == the discovered K"
+            )
+        chosen_k_declared = int(payload["chosen_k"])
+        if chosen_k_declared != k_discovered:
+            raise ValueError(
+                "SAE payload chosen_k does not match the atom count: "
+                f"chosen_k={chosen_k_declared} but {k_discovered} atoms were "
+                "emitted; the discovered K must thread through every field"
+            )
+        for field in ("assignments_z", "logits"):
+            arr = np.asarray(payload[field], dtype=float)
+            if arr.ndim != 2 or arr.shape[1] != k_discovered:
+                raise ValueError(
+                    f"SAE payload '{field}' must be (N, K=={k_discovered}); "
+                    f"got shape {arr.shape}"
+                )
         def _opt_arr(atom: Mapping[str, Any], key: str) -> np.ndarray | None:
             value = atom.get(key)
             return None if value is None else np.asarray(value, dtype=float)
@@ -737,7 +768,7 @@ class ManifoldSAE:
             )
 
         atoms: list[SaeManifoldAtomFit] = []
-        for atom_idx, atom in enumerate(payload["atoms"]):
+        for atom_idx, atom in enumerate(payload_atoms):
             shape_band_coords, shape_band_mean, shape_band_sd = _shape_band_arrays(
                 atom,
                 plans[atom_idx],
@@ -773,9 +804,21 @@ class ManifoldSAE:
             for p in plans
         ]
         canonical = _canonical_assignment(assignment, "assignment")
+        # #977 variable-K: the scalar ``atom_topology`` MUST be derived from the
+        # POST-search ``kinds`` (the discovered dictionary), not the seed
+        # ``topology`` argument. A fit that seeds an all-``periodic`` dictionary
+        # but grows a heterogeneous one via evidence-gated births would otherwise
+        # report the stale seed scalar (e.g. ``"circle"``) while
+        # ``atom_topologies`` already reflects the heterogeneous truth — the
+        # honest scalar collapses to ``"mixed"`` exactly when the per-atom
+        # topologies disagree. ``basis_specs`` (== ``kinds``) remains the per-atom
+        # source of truth either way; the seed ``topology`` arg is only a fallback
+        # for an empty dictionary.
+        atom_topologies = _topologies_for_bases(kinds)
+        scalar_topology = _topology_for_bases(kinds) if kinds else str(topology)
         return cls(
-            atoms=atoms, atom_topology=str(topology),
-            atom_topologies=_topologies_for_bases(kinds),
+            atoms=atoms, atom_topology=scalar_topology,
+            atom_topologies=atom_topologies,
             assignment=canonical,
             assignment_label=str(assignment if assignment_label is None else assignment_label),
             primitive_names=["rust_module.sae_manifold_fit_minimal", *penalties],

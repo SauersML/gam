@@ -550,71 +550,43 @@ pub fn fit_latent_survival_terms(
             mean_design.design.nrows(),
         ));
     }
-    // Interval warm start (issue #1108). Interval-censored rows contribute
-    // `ℓ = log[S(L) − S(R)]`, the log of a DIFFERENCE of survival kernels — a
-    // genuinely NON-concave likelihood whose per-row Hessian is indefinite away
-    // from the optimum. From the cold seed (`β_time = 1e-4`, `σ = 0.5`) the
-    // coupled exact-joint inner Newton lands OUTSIDE the basin where the
-    // reflected/LM-damped modified-Newton model is descent-consistent, so every
-    // trust-region step fails the actual-objective check and the inner solve
-    // stalls out ("exited the joint Newton path before convergence"). This stall
-    // happens FIRST inside `fit_custom_family`'s outer ρ-seed startup validation
-    // (every ρ seed's trial inner fit diverges → `solver_started = 0`), so the
-    // warm start must be established BEFORE that `fit_custom_family` call and
-    // threaded into the inner solve via `initial_beta` — every ρ-seed trial fit
-    // (and the final refit) then starts from the warm β, since `buildblock_states`
-    // seeds each block from `spec.initial_beta`.
+    // Interval warm start (issue #1108). Interval-censored rows contribute the
+    // NON-concave `ℓ = log[S(L) − S(R)]`; the coupled exact-joint inner Newton
+    // diverges from the cold seed (β_time = 1e-4, σ = 0.5) — the failure surfaces
+    // first as `fit_custom_family`'s outer ρ-seed startup validation rejecting
+    // every seed (`solver_started = 0`). We warm-start from a LOG-CONCAVE
+    // surrogate whose β/σ land in the interval basin, threaded via `initial_beta`
+    // (consumed by every inner solve, including each ρ-seed validation fit).
     //
-    // The warm surrogate treats each bracket as an EXACT EVENT observed at its
-    // lower bound `L` (event code `1`): the exact-event density
-    // `ℓ = log(h(L)·S(L)) = log h(L) + log K_{0,B(L)}` is LOG-CONCAVE (PD
-    // Hessian) and — unlike right-censoring at `L`, which only constrains the
-    // baseline shape up to `L` and leaves σ unidentified — its event-time
-    // likelihood identifies BOTH the baseline shape AND the frailty spread σ, so
-    // it lands the warm β/σ in the interval likelihood's basin. It reuses the
-    // EXACT same exit (`x_time_exit` at `L`), derivative (`x_time_derivative_exit`
-    // at `L`), mean and log-σ designs the interval fit uses, so its converged β
-    // transfers directly. The warm fit runs at the seed λ via
-    // `fit_custom_family_fixed_log_lambdas` (the inner solve only — NOT the outer
-    // ρ-seed validation, which the log-concave surrogate does not need and which
-    // would otherwise re-incur startup cost). The warm start only seeds
-    // `initial_beta`; the EXACT interval objective/gradient/Hessian are unchanged,
-    // so the converged β̂/σ̂ are the true interval MLE (no approximation, no fake
-    // convergence). A warm-fit failure is non-fatal: fall through to the cold
-    // seed.
+    // Surrogate = right-censored at the bracket LOWER bound `L`. Its survival
+    // mass `S(L) = K_{0,B(L)}` is log-concave (PD Hessian) and — crucially —
+    // its time-block design is the SAME fixed-knot I-spline basis the interval
+    // fit uses, which is FULL RANK regardless of how heavily the inspection-grid
+    // `L` values are TIED (the basis columns are functions of the frozen knots,
+    // not of the observed time multiplicities). Unlike an exact-event surrogate
+    // it imposes NO per-row `q̇(L) > 0` hazard-derivative feasibility condition
+    // (which the tied/degenerate cold-start derivative design can violate), so it
+    // is robust where exact-event-at-L is not. The warm σ then refines from the
+    // bracket-width spread inside the (now in-basin) interval fit.
+    //
+    // Failure is NON-SILENT (#1108): a surrogate that errors or returns a
+    // non-finite / all-zero degenerate β is surfaced as a hard error rather than
+    // silently reverting to the diverging cold start (which masked the real
+    // failure across several attempts). Only `initial_beta` is seeded; the EXACT
+    // interval objective/gradient/Hessian are unchanged, so σ̂ is the true MLE.
     let has_interval_rows = spec
         .event_target
         .iter()
         .any(|&code| code == LATENT_SURVIVAL_EVENT_INTERVAL);
-    let interval_row_count = spec
-        .event_target
-        .iter()
-        .filter(|&&code| code == LATENT_SURVIVAL_EVENT_INTERVAL)
-        .count();
-    // [#1108 DIAG] remove after diagnosis.
-    log::debug!(
-        "[#1108 WARM] fit_latent_survival_terms entry: n={} interval_rows={} has_interval={} latent_sd_fixed={:?} n_blocks={}",
-        n,
-        interval_row_count,
-        has_interval_rows,
-        latent_sd,
-        blocks.len(),
-    );
     if has_interval_rows {
-        let warm_event_target = spec.event_target.mapv(|code| {
-            if code == LATENT_SURVIVAL_EVENT_INTERVAL {
-                1u8
-            } else {
-                code
-            }
-        });
+        let warm_event_target = spec
+            .event_target
+            .mapv(|code| if code == LATENT_SURVIVAL_EVENT_INTERVAL { 0u8 } else { code });
         let mut warm_family = family.clone();
         warm_family.event_target = warm_event_target;
-        // The exact-event-at-L surrogate ignores the interval upper bound `R`, so
-        // the (unused) `q_right` channel cannot drift the fit; leaving the right
+        // Right-censored-at-L ignores the interval upper bound `R`, so the
+        // (unused) `q_right` channel cannot drift the fit; leaving the right
         // design/mass in place is harmless (no interval row remains to read it).
-        // [#1108 DIAG] remove after diagnosis.
-        log::debug!("[#1108 WARM] attempting exact-event-at-L surrogate fit (fixed-lambda inner solve)");
         let warm_fit = fit_custom_family_fixed_log_lambdas(
             &warm_family,
             &blocks,
@@ -623,77 +595,35 @@ pub fn fit_latent_survival_terms(
             0,
             None,
             false,
-        );
-        match &warm_fit {
-            Ok(wf) => {
-                let betas: Vec<String> = wf
-                    .block_states
-                    .iter()
-                    .map(|s| {
-                        let norm = s.beta.iter().map(|v| v * v).sum::<f64>().sqrt();
-                        format!("|beta|={norm:.4e}(p={})", s.beta.len())
-                    })
-                    .collect();
-                let warm_sd = warm_family.latent_sd(&wf.block_states);
-                // [#1108 DIAG] remove after diagnosis.
-                log::debug!(
-                    "[#1108 WARM] surrogate CONVERGED: {} warm_sigma={:?}",
-                    betas.join(" "),
-                    warm_sd,
-                );
-            }
-            Err(e) => {
-                // [#1108 DIAG] remove after diagnosis.
-                log::debug!("[#1108 WARM] surrogate FAILED: {e}");
-            }
+        )
+        .map_err(|e| {
+            format!(
+                "latent interval warm start: right-censored-at-L surrogate fit failed \
+                 (so the interval fit cannot be safely warm-started; this surrogate is \
+                 log-concave and should converge — investigate the surrogate, not the \
+                 interval kernel): {e}"
+            )
+        })?;
+        let warm_beta_usable = warm_fit.block_states.iter().any(|s| {
+            s.beta.iter().all(|v| v.is_finite()) && s.beta.iter().any(|&v| v != 0.0)
+        });
+        if !warm_beta_usable {
+            return Err(
+                "latent interval warm start: right-censored-at-L surrogate returned a \
+                 degenerate (non-finite or all-zero) β across every block; the warm start \
+                 cannot seed the interval fit. This indicates the surrogate's time-block \
+                 design is rank-deficient or the inner solve stalled at the seed — \
+                 investigate the surrogate before retrying the interval fit."
+                    .to_string(),
+            );
         }
-        if let Ok(warm_fit) = warm_fit {
-            for (block, state) in blocks.iter_mut().zip(warm_fit.block_states.iter()) {
-                if state.beta.iter().all(|v| v.is_finite()) {
-                    block.initial_beta = Some(state.beta.clone());
-                }
-            }
-            // [#1108 DIAG] remove after diagnosis.
-            let seeded: Vec<String> = blocks
-                .iter()
-                .map(|b| match &b.initial_beta {
-                    Some(beta) => {
-                        let norm = beta.iter().map(|v| v * v).sum::<f64>().sqrt();
-                        format!("|init_beta|={norm:.4e}")
-                    }
-                    None => "init_beta=None".to_string(),
-                })
-                .collect();
-            log::debug!("[#1108 WARM] seeded interval blocks: {}", seeded.join(" "));
-        }
-        // [#1108 DIAG] remove after diagnosis. ISOLATION PROBE: run the INTERVAL
-        // family's inner solve at the seed lambda FROM the warm beta. This
-        // separates "does the interval inner joint-Newton converge in-basin"
-        // (this probe) from "does the outer rho-seed startup validation work"
-        // (the real fit_custom_family below). If this CONVERGES, the warm beta is
-        // in-basin and the failure is in the outer rho machinery, not the basin.
-        // If it FAILS, the warm beta is NOT in-basin / the interval inner solve
-        // diverges even warm-started, and the error text tells us why.
-        let interval_inner_probe = fit_custom_family_fixed_log_lambdas(
-            &family, &blocks, options, None, 0, None, false,
-        );
-        match &interval_inner_probe {
-            Ok(p) => {
-                let probe_sd = family.latent_sd(&p.block_states);
-                log::debug!(
-                    "[#1108 PROBE] interval inner solve from warm beta CONVERGED, sigma={probe_sd:?}"
-                );
-            }
-            Err(e) => {
-                log::debug!("[#1108 PROBE] interval inner solve from warm beta FAILED: {e}");
+        for (block, state) in blocks.iter_mut().zip(warm_fit.block_states.iter()) {
+            if state.beta.iter().all(|v| v.is_finite()) {
+                block.initial_beta = Some(state.beta.clone());
             }
         }
     }
-    let fit = fit_custom_family(&family, &blocks, options).map_err(|e| {
-        // [#1108 DIAG] remove after diagnosis.
-        log::debug!("[#1108 WARM] interval fit_custom_family FAILED: {e}");
-        e.to_string()
-    })?;
+    let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
     let latent_sd = family.latent_sd(&fit.block_states)?;
     let baseline_offset_residuals = family.offset_channel_residuals(&fit.block_states)?;
     Ok(LatentSurvivalTermFitResult {

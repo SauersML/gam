@@ -1,20 +1,20 @@
 use super::*;
 
-const SAE_BYTES_PER_F64: usize = 8;
+pub(crate) const SAE_BYTES_PER_F64: usize = 8;
 
-const SAE_HOST_IN_CORE_FALLBACK_BYTES: usize = 2 * 1024 * 1024 * 1024;
+pub(crate) const SAE_HOST_IN_CORE_FALLBACK_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-const SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR: usize = 3;
+pub(crate) const SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR: usize = 3;
 
-const SAE_HOST_MEMORY_BUDGET_FRACTION_DENOMINATOR: usize = 5;
+pub(crate) const SAE_HOST_MEMORY_BUDGET_FRACTION_DENOMINATOR: usize = 5;
 
-const SAE_CPU_L2_CACHE_BYTES: usize = 1024 * 1024;
+pub(crate) const SAE_CPU_L2_CACHE_BYTES: usize = 1024 * 1024;
 
-const SAE_CHUNK_CACHE_MULTIPLE: usize = 8;
+pub(crate) const SAE_CHUNK_CACHE_MULTIPLE: usize = 8;
 
-const SAE_MIN_STREAMING_CHUNK_ROWS: usize = 256;
+pub(crate) const SAE_MIN_STREAMING_CHUNK_ROWS: usize = 256;
 
-const SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER: usize = 32;
+pub(crate) const SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaeStreamingPlan {
     pub streaming: bool,
@@ -30,7 +30,7 @@ pub struct SaeStreamingPlan {
     pub matrix_free_admitted: bool,
 }
 
-fn sae_streaming_plan_from_budget(
+pub(crate) fn sae_streaming_plan_from_budget(
     n_obs: usize,
     total_basis: usize,
     k_atoms: usize,
@@ -162,7 +162,7 @@ impl SaeStreamingPlan {
     }
 }
 
-fn sae_host_available_memory_bytes() -> usize {
+pub(crate) fn sae_host_available_memory_bytes() -> usize {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     let available = sys.available_memory() as usize;
@@ -173,7 +173,7 @@ fn sae_host_available_memory_bytes() -> usize {
     }
 }
 
-fn sae_host_in_core_budget_bytes() -> (usize, usize) {
+pub(crate) fn sae_host_in_core_budget_bytes() -> (usize, usize) {
     let available = sae_host_available_memory_bytes();
     let fraction = available.saturating_mul(SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR)
         / SAE_HOST_MEMORY_BUDGET_FRACTION_DENOMINATOR;

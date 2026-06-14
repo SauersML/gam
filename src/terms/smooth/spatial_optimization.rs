@@ -3729,6 +3729,8 @@ fn freeze_geometry_from_metadata(
             BasisMetadata::Matern {
                 centers,
                 input_scales: meta_scales,
+                identifiability_transform,
+                nullspace_shrinkage_survived,
                 ..
             },
         ) => {
@@ -3737,6 +3739,29 @@ fn freeze_geometry_from_metadata(
                 && let Some(s) = meta_scales.clone()
             {
                 *spec_scales = Some(s);
+            }
+            // Pin BOTH the cold-build identifiability transform `Z` AND the
+            // double-penalty nullspace-shrinkage decision into a
+            // `FrozenTransform` (gam#787/#860, #1122). Without this, the
+            // κ-optimizer's per-trial value rebuild re-runs the κ-DEPENDENT
+            // spectral test (`build_nullspace_shrinkage_penalty`), whose
+            // tolerance scales with `λ_max(A(κ))`: as κ moves, near-null
+            // eigenvalues of the projected kernel Gram `A` cross the threshold,
+            // so the `DoublePenaltyNullspace` block `P/√r` (and its null
+            // dimension `r`) JUMP discontinuously between line-search trials.
+            // The analytic ψ-gradient — assembled in a fixed frozen eigenbasis
+            // — cannot follow those discrete jumps, so the joint REML objective
+            // V(κ) is piecewise-discontinuous while the gradient is smooth: an
+            // objective↔gradient desync that stalls the isotropic-κ optimizer
+            // with a large residual gradient at the iteration cap. Freezing the
+            // decision (and the transform that `A` is built from) makes the
+            // per-trial value rebuild and the analytic gradient share one fixed
+            // `Z` and one fixed `r`, restoring a smooth, differentiable V(κ).
+            if let Some(transform) = identifiability_transform.clone() {
+                spec.identifiability = MaternIdentifiability::FrozenTransform {
+                    transform,
+                    nullspace_shrinkage_survived: Some(*nullspace_shrinkage_survived),
+                };
             }
             Some(frozen)
         }
@@ -4312,6 +4337,32 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         if self.spatial_realization_geometry[term_idx].is_none()
             && let Some(frozen) = freeze_geometry_from_metadata(&build_spec, &local.metadata)
         {
+            // Mirror the frozen identifiability (pinned `Z` + double-penalty
+            // nullspace-shrinkage decision, #787/#860/#1122) back onto the
+            // collection spec the analytic ψ-gradient reads
+            // (`try_build_spatial_log_kappa_hyper_dirs(self.spec(), …)`). The
+            // value rebuild consumes the cached `build_spec`, so without this
+            // copy the gradient would keep re-running the κ-DEPENDENT spectral
+            // test on the un-frozen collection spec while the value uses the
+            // frozen decision — re-introducing the very objective↔gradient
+            // desync the freeze removes. Pinning both to the same frozen
+            // transform keeps the per-trial value and its analytic gradient on
+            // one fixed `Z` and one fixed null dimension `r`.
+            if let (
+                SmoothBasisSpec::Matern {
+                    spec: frozen_spec, ..
+                },
+                Some(SmoothBasisSpec::Matern { spec: live_spec, .. }),
+            ) = (
+                &frozen.basis,
+                self.spec
+                    .smooth_terms
+                    .get_mut(term_idx)
+                    .map(|t| &mut t.basis),
+            ) {
+                live_spec.identifiability = frozen_spec.identifiability.clone();
+                live_spec.center_strategy = frozen_spec.center_strategy.clone();
+            }
             self.spatial_realization_geometry[term_idx] = Some(frozen);
         }
 

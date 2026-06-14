@@ -160,7 +160,10 @@ impl<'a> DeflatedArrowSolver<'a> {
     }
 }
 
-fn flatten_arrow_parts(t: ArrayView1<'_, f64>, beta: ArrayView1<'_, f64>) -> Array1<f64> {
+pub(crate) fn flatten_arrow_parts(
+    t: ArrayView1<'_, f64>,
+    beta: ArrayView1<'_, f64>,
+) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(t.len() + beta.len());
     for i in 0..t.len() {
         out[i] = t[i];
@@ -171,7 +174,7 @@ fn flatten_arrow_parts(t: ArrayView1<'_, f64>, beta: ArrayView1<'_, f64>) -> Arr
     out
 }
 
-fn apply_cached_arrow_hessian(
+pub(crate) fn apply_cached_arrow_hessian(
     cache: &ArrowFactorCache,
     v_t: ArrayView1<'_, f64>,
     v_beta: ArrayView1<'_, f64>,
@@ -295,6 +298,6 @@ pub(crate) struct SaeRowJets {
     pub(crate) beta_l_deriv: Vec<Vec<Vec<f64>>>,
 }
 
-fn sae_dot(a: &[f64], b: &[f64]) -> f64 {
+pub(crate) fn sae_dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
 }

@@ -130,10 +130,6 @@ pub(crate) const SAE_MANIFOLD_ROW_RIDGE_FLOOR: f64 = 1.0e-12;
 /// Cholesky factorisation of a per-row Hessian.
 pub(crate) const SAE_MANIFOLD_ROW_RIDGE_GROWTH: f64 = 10.0;
 
-/// Maximum number of LM ridge-escalation attempts before declaring the per-row
-/// Hessian unfactorable.
-const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SaeBetaPenaltyAssembly {
     pub(crate) dense_written: bool,
@@ -304,10 +300,10 @@ impl Clone for SaeManifoldTerm {
 /// basis caches keeps every rejected trial's baseline and nonlinear objective
 /// on the same lagged-diffusivity quadratic.
 #[derive(Debug)]
-struct SaeManifoldMutableState {
+pub(crate) struct SaeManifoldMutableState {
     /// Per-atom `(basis_values, basis_jacobian, decoder_coefficients, smooth_penalty)`.
-    atoms: Vec<(Array2<f64>, Array3<f64>, Array2<f64>, Array2<f64>)>,
-    logits: Array2<f64>,
-    coords: Vec<LatentCoordValues>,
-    last_row_layout: Option<SaeRowLayout>,
+    pub(crate) atoms: Vec<(Array2<f64>, Array3<f64>, Array2<f64>, Array2<f64>)>,
+    pub(crate) logits: Array2<f64>,
+    pub(crate) coords: Vec<LatentCoordValues>,
+    pub(crate) last_row_layout: Option<SaeRowLayout>,
 }
