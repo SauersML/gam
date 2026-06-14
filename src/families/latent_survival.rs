@@ -5458,4 +5458,113 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn latent_survival_interval_row_primary_derivatives_match_fd() {
+        // Interval-censored row jet `ℓ = log[S(L) − S(R)] − log S(entry)`. The
+        // dynamic two-state numerator differentiates BOTH boundary masses
+        // `M_L = exp(q_exit)` (left, `q_exit`) and `M_R = exp(q_right)` (right,
+        // `q_right`) independently — channels that the static
+        // `LatentSurvivalRowJet::interval_censored` (μ-only) never exercises. This
+        // FD-verifies the gradient AND neg-Hessian of the interval contribution
+        // w.r.t. ALL six primary coordinates (q_entry, q_exit/L, qdot_exit,
+        // q_right/R, mu, log_sigma) on a WELL-POSED bracket where `S(L) − S(R)` is
+        // comfortably positive (M_L = e^{−0.4} ≈ 0.67 well below M_R = e^{0.5} ≈
+        // 1.65, so the survival-mass difference is large and the log-of-a-
+        // difference curvature is well-conditioned).
+        let quadctx = QuadratureContext::new();
+        // Bracket masses: entry < L < R with comfortable gaps.
+        let q_entry = -1.2_f64; // M_entry = e^{−1.2} ≈ 0.30
+        let q_exit = -0.4_f64; // L: M_L = e^{−0.4} ≈ 0.67
+        let q_right = 0.5_f64; // R: M_R = e^{0.5} ≈ 1.65 (> M_L)
+        let mu = -0.15_f64;
+        let log_sigma = 0.3_f64; // σ ≈ 1.35
+        // Small, monotone unloaded masses (entry ≤ left ≤ right); qdot is inert
+        // for the interval contribution.
+        let row = LatentSurvivalRow::interval_censored(
+            q_entry.exp(), // mass_entry (consistency only; jet reads q's)
+            q_exit.exp(),  // mass_left
+            q_right.exp(), // mass_right
+            0.01,          // mass_unloaded_entry
+            0.02,          // mass_unloaded_left
+            0.05,          // mass_unloaded_right
+        );
+        assert!(matches!(
+            row.event_type,
+            LatentSurvivalEventType::IntervalCensored
+        ));
+
+        // [q_entry, q_exit/L, qdot_exit, q_right/R, mu, log_sigma]. qdot_exit is
+        // inert for interval rows (no hazard-derivative channel); the FD loop
+        // confirms its gradient/Hessian entries are 0.
+        let primary = array![q_entry, q_exit, 0.7, q_right, mu, log_sigma];
+        let sigma = primary[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA].exp();
+        let h_grad = 1e-6;
+        let h_hess = 2e-4;
+
+        let (_, gradient, neg_hessian) = latent_survival_row_primary_gradient_hessian(
+            &quadctx,
+            &row,
+            primary[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+            primary[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+            primary[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+            primary[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
+            primary[LATENT_SURVIVAL_PRIMARY_MU],
+            sigma,
+            true,
+        )
+        .expect("analytic interval row primary gradient/hessian");
+
+        // The interval contribution must be a positive survival-mass difference
+        // at this bracket, so the value channel is finite.
+        let value = latent_survival_row_loglik_from_primary(&quadctx, &row, &primary);
+        assert!(
+            value.is_finite(),
+            "interval row log-likelihood must be finite on a well-posed bracket, got {value}"
+        );
+
+        for j in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+            let mut plus = primary.clone();
+            plus[j] += h_grad;
+            let mut minus = primary.clone();
+            minus[j] -= h_grad;
+            let fd_grad = (latent_survival_row_loglik_from_primary(&quadctx, &row, &plus)
+                - latent_survival_row_loglik_from_primary(&quadctx, &row, &minus))
+                / (2.0 * h_grad);
+            let rel_grad =
+                (gradient[j] - fd_grad).abs() / gradient[j].abs().max(fd_grad.abs()).max(1e-12);
+            assert!(
+                rel_grad < 2e-4,
+                "interval row primary grad[{j}] mismatch: analytic={}, fd={fd_grad}, rel={rel_grad}",
+                gradient[j]
+            );
+
+            for k in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                let mut pp = primary.clone();
+                pp[j] += h_hess;
+                pp[k] += h_hess;
+                let mut pm = primary.clone();
+                pm[j] += h_hess;
+                pm[k] -= h_hess;
+                let mut mp = primary.clone();
+                mp[j] -= h_hess;
+                mp[k] += h_hess;
+                let mut mm = primary.clone();
+                mm[j] -= h_hess;
+                mm[k] -= h_hess;
+                let fd_neg_hess = -(latent_survival_row_loglik_from_primary(&quadctx, &row, &pp)
+                    - latent_survival_row_loglik_from_primary(&quadctx, &row, &pm)
+                    - latent_survival_row_loglik_from_primary(&quadctx, &row, &mp)
+                    + latent_survival_row_loglik_from_primary(&quadctx, &row, &mm))
+                    / (4.0 * h_hess * h_hess);
+                let analytic = neg_hessian[[j, k]];
+                let abs_err = (analytic - fd_neg_hess).abs();
+                let rel = abs_err / analytic.abs().max(fd_neg_hess.abs()).max(1e-10);
+                assert!(
+                    abs_err < 5e-5 || rel < 3e-3,
+                    "interval row primary neg_hess[{j},{k}] mismatch: analytic={analytic}, fd={fd_neg_hess}, abs_err={abs_err}, rel={rel}"
+                );
+            }
+        }
+    }
 }
