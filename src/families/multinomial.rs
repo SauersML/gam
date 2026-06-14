@@ -77,6 +77,7 @@ use crate::solver::workflow::{
 };
 use crate::terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    freeze_term_collection_from_design,
 };
 use crate::terms::term_builder::resolve_role_col;
 use crate::types::ResponseColumnKind;
@@ -983,8 +984,22 @@ pub fn fit_penalized_multinomial_formula(
             "multinomial fit: init_lambda must be finite and > 0 (got {init_lambda})"
         );
     }
-    let (spec, design, y_col, response_name, y_kind) =
+    let (raw_spec, design, y_col, response_name, y_kind) =
         build_formula_design_for_multinomial(formula, data, config)?;
+    // Freeze the data-derived basis state (B-spline knot vectors, by-factor
+    // level sets, spatial centers, joint-null rotations, residualization
+    // charts) from the fit design back onto the spec. The raw geometry spec
+    // records only *which* columns and *what kind* of basis each smooth uses;
+    // the actual column count and basis evaluation depend on quantities the
+    // builder derives from the training data (knot placement, the distinct
+    // by-factor levels, etc.). Saving the raw spec made predict re-derive those
+    // from the (smaller, differently-distributed) predict frame, so the rebuilt
+    // design had a different column count than the fitted one — the panic
+    // "predict design has 42 cols, saved model expects 191" for an `s(x,
+    // by=group)` smooth-by-factor model. Every other family's persistence path
+    // freezes the spec the same way (see `freeze_term_collection_from_design`
+    // call sites in `main_parts`); multinomial was the lone exception.
+    let spec = freeze_term_collection_from_design(&raw_spec, &design)?;
     let class_levels = match y_kind {
         ResponseColumnKind::Categorical { levels } => levels,
         ResponseColumnKind::Binary => vec!["0".to_string(), "1".to_string()],
