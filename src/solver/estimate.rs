@@ -2114,6 +2114,13 @@ pub struct ExternalOptimOptions {
     pub kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
     /// Full Kronecker factored basis for P-IRLS factored reparameterization.
     pub kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
+    /// Engage the cross-process ON-DISK persistent warm-start layer for this
+    /// fit. Default `false`: only the in-memory warm start runs, so throwaway /
+    /// replicate / CI-coverage loops pay no disk I/O (#1082). A caller that
+    /// wants cross-process resume threads `true` down from
+    /// `FitConfig::persist_warm_start_disk`; the standard `RemlState`
+    /// constructor then calls `enable_persistent_warm_start_disk()`.
+    pub persist_warm_start_disk: bool,
 }
 
 fn resolve_external_family(
@@ -3044,6 +3051,12 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         }
         if let Some(kf) = opts.kronecker_factored.clone() {
             reml_state.set_kronecker_factored(kf);
+        }
+        if opts.persist_warm_start_disk {
+            // Caller opted into cross-process resume (#1082): engage the
+            // on-disk warm-start layer. Default-false keeps replicate/CI loops
+            // disk-silent.
+            reml_state.enable_persistent_warm_start_disk();
         }
 
         Ok(Self {
@@ -4054,6 +4067,11 @@ where
     }
     if let Some(kf) = opts.kronecker_factored.clone() {
         reml_state.set_kronecker_factored(kf);
+    }
+    if opts.persist_warm_start_disk {
+        // Caller opted into cross-process resume (#1082): engage the on-disk
+        // warm-start layer. Default-false keeps replicate/CI loops disk-silent.
+        reml_state.enable_persistent_warm_start_disk();
     }
     reml_state.setwarm_start_original_beta(warm_start_beta);
 
@@ -5435,6 +5453,14 @@ pub struct FitOptions {
     pub kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
     /// Full Kronecker factored basis for P-IRLS factored reparameterization.
     pub kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
+    /// Engage the cross-process ON-DISK persistent warm-start layer.
+    ///
+    /// Default `false`: only the always-on in-memory warm start runs, so a
+    /// single fit and throwaway/replicate/CI-coverage loops pay zero disk I/O
+    /// (#1082). Set `true` (threaded from `FitConfig::persist_warm_start_disk`)
+    /// to engage cross-process / repeat-fit resume; the standard `RemlState`
+    /// then calls `enable_persistent_warm_start_disk()`.
+    pub persist_warm_start_disk: bool,
 }
 
 impl Default for FitOptions {
@@ -5457,6 +5483,7 @@ impl Default for FitOptions {
             rho_prior: crate::types::RhoPrior::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
+            persist_warm_start_disk: false,
         }
     }
 }
@@ -7737,6 +7764,7 @@ where
         rho_prior: opts.rho_prior.clone(),
         kronecker_penalty_system: opts.kronecker_penalty_system.clone(),
         kronecker_factored: opts.kronecker_factored.clone(),
+        persist_warm_start_disk: opts.persist_warm_start_disk,
     };
 
     let result = optimize_external_designwith_heuristic_lambdas_andwarm_start(

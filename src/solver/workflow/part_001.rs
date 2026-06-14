@@ -4076,7 +4076,7 @@ use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
     LinkChoice, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm, effectivelinkwiggle_formulaspec,
     marginal_slope_logslope_surfaces, parse_formula, parse_link_choice,
-    parse_matching_auxiliary_formula, parse_surv_response,
+    parse_matching_auxiliary_formula, parse_surv_interval_response, parse_surv_response,
     require_inverse_link_supports_joint_wiggle, validate_marginal_slope_z_column_exclusion,
 };
 
@@ -4239,6 +4239,15 @@ pub struct FitConfig {
     /// explicit array-valued `centers=` differs, routing through
     /// `CenterStrategy::UserProvided` instead of `FarthestPoint`/`EqualMass`.
     pub smooth_overrides: Option<JsonValue>,
+    /// Engage the cross-process ON-DISK persistent warm-start layer (#1082).
+    ///
+    /// Default `false`: only the always-on in-memory warm start runs, so a
+    /// single fit and throwaway/replicate/CI-coverage loops pay zero disk I/O
+    /// (no `WarmStartStore` dir/eviction scan, no record load/store). Set
+    /// `true` to engage cross-process / repeat-fit resume: the flag threads
+    /// `FitConfig → FitOptions → ExternalOptimOptions` down to the standard
+    /// `RemlState`, which then calls `enable_persistent_warm_start_disk()`.
+    pub persist_warm_start_disk: bool,
 }
 
 
@@ -4288,6 +4297,7 @@ impl Default for FitConfig {
             analytic_penalties: None,
             topology_auto_selector: None,
             smooth_overrides: None,
+            persist_warm_start_disk: false,
         }
     }
 }
@@ -5059,7 +5069,31 @@ pub fn materialize<'a>(
     let parsed = parse_formula(formula)?;
     let col_map = data.column_map();
 
-    if let Some((entry_col, exit_col, event_col)) = parse_surv_response(&parsed.response)? {
+    if let Some((left_col, right_col, event_col)) = parse_surv_interval_response(&parsed.response)? {
+        if config.transformation_normal {
+            return Err(WorkflowError::InvalidConfig {
+                reason: "transformation_normal cannot be combined with a SurvInterval(...) response"
+                    .to_string(),
+            });
+        }
+        // Interval censoring `T ∈ (L, R]` is only defined for the latent
+        // hazard-window survival likelihood, whose kernel carries the
+        // `log[S(L) − S(R)]` interval contribution. Route the left boundary `L`
+        // through the standard exit channel and the right boundary `R` through
+        // the dedicated interval-right channel; `event_col` distinguishes
+        // bracketed (interval) rows from right-censored rows beyond the last
+        // inspection (which carry an infinite/sentinel `R`).
+        materialize_survival(
+            &parsed,
+            data,
+            &col_map,
+            config,
+            None,
+            &left_col,
+            &event_col,
+            Some(&right_col),
+        )
+    } else if let Some((entry_col, exit_col, event_col)) = parse_surv_response(&parsed.response)? {
         if config.transformation_normal {
             return Err(WorkflowError::InvalidConfig {
                 reason: "transformation_normal cannot be combined with a Surv(...) response"
@@ -5078,6 +5112,7 @@ pub fn materialize<'a>(
             entry_col.as_deref(),
             &exit_col,
             &event_col,
+            None,
         )
     } else {
         // Non-survival response: `timewiggle(...)` and `survmodel(...)` are
