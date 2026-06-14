@@ -84,11 +84,6 @@ fn curved_inner_fit(beta_vec: [f64; 3], dispersion: f64, kappa_hat: f64) -> Atom
     let peak_design_row = design.row(n - 1).to_owned();
     let mode_design_row = design.row(n / 2).to_owned();
 
-    // Smooth EDF for an M=3 basis with one penalized curvature column: tr(H⁻¹ ΦᵀWΦ)
-    // minus the unpenalized null dimension (intercept) ≈ the two free non-null
-    // columns; a fixed reference df of 2 is the analytic Wood reference here.
-    let smooth_edf = 2.0;
-
     // REML cross terms: working response z_i = g(t_i) + r_i; b = ΦᵀW z, zᵀW z.
     let mut xtw_z = Array1::<f64>::zeros(m);
     let mut ztw_z = 0.0_f64;
@@ -127,7 +122,6 @@ fn curved_inner_fit(beta_vec: [f64; 3], dispersion: f64, kappa_hat: f64) -> Atom
         peak_design_row,
         mode_design_row,
         kappa_hat,
-        smooth_edf,
         geodesic_length_jet,
         penalty_order: 2,
         xtw_z,
@@ -230,19 +224,22 @@ fn curved_atom_reports_real_mkappa_evidence_ci() {
         ci.flatness_test.p_value
     );
 
-    // #1103 Bartlett-corrected smooth significance is POPULATED with a finite,
-    // positive correction factor.
+    // #1103 split-LRT smooth-structure e-value is POPULATED and finite. A
+    // strongly curved (non-constant) decoder must carry POSITIVE log-evidence
+    // for the non-constant alternative — the honest any-n-valid instrument
+    // earns evidence where the Bartlett-corrected χ² used to.
     let sig = atom
         .smooth_significance
         .as_ref()
-        .expect("curved atom must report a Bartlett-corrected smooth significance");
-    assert!(sig.lr_stat.is_finite() && sig.lr_stat >= 0.0);
+        .expect("curved atom must report a split-LRT smooth-structure e-value");
+    let log_e = sig
+        .log_e_nonconstant
+        .expect("curved atom must carry a finite non-constant log-e-value");
+    assert!(log_e.is_finite(), "log-e must be finite, got {log_e}");
     assert!(
-        sig.bartlett_factor.is_finite() && sig.bartlett_factor > 0.0,
-        "Bartlett factor must be finite and positive, got {}",
-        sig.bartlett_factor
+        log_e > 0.0,
+        "a strongly curved (non-constant) atom must accumulate positive split-LRT evidence, got log_e={log_e}"
     );
-    assert!(sig.df >= 1);
 }
 
 #[test]

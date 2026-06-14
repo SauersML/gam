@@ -50,7 +50,6 @@
 use crate::geometry::curvature_estimand::{
     CurvatureVerdict, FlatnessTest, KappaProfileCi, flatness_lr_test, profile_ci_walk,
 };
-use crate::inference::lawley::{RowExpectedJets, RowKappas, lawley_lr_bartlett_factor};
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
 use crate::inference::riesz::{
@@ -943,9 +942,6 @@ pub struct AtomInnerFit {
     /// `per_atom_kappa_hat[k]`); echoed so the curvature-CI report has its
     /// point estimate without re-deriving it.
     pub kappa_hat: f64,
-    /// Smooth effective degrees of freedom (`tr(H⁻¹ ΦᵀWΦ)` minus the unpenalized
-    /// null dimension), the LR reference df for the Bartlett correction.
-    pub smooth_edf: f64,
     /// The constant-curvature geodesic-length jet of the atom's own latent
     /// chart, captured at the fitted curvature so the #1099 κ-profile can move κ
     /// through the *exact* `M_κ` evidence machinery rather than a surrogate.
@@ -1047,15 +1043,26 @@ pub struct AtomCurvatureCi {
     pub flatness_test: FlatnessTest,
 }
 
-/// Bartlett-corrected significance of one atom's inner smooth `h_k(t)` against a
-/// constant null (#1103): the Lawley-corrected likelihood-ratio test that the
-/// atom's decoder curve is genuinely non-constant.
+/// Any-n-valid structure evidence that one atom's inner smooth `h_k(t)` is
+/// genuinely non-constant (#1103): the same split-likelihood-ratio e-value the
+/// atom-birth gate uses ([`crate::inference::structure_evidence`]), under the
+/// null H0 = "the atom's decoder curve is constant in its latent coordinate".
+///
+/// This replaces the earlier Lawley–Bartlett-corrected χ² test. That correction
+/// was a category error here: the penalized smooth's null is effectively
+/// rank ≈ n, the first-order χ² is the wrong reference entirely, and an O(1/n)
+/// Bartlett factor (whose own stated size shift is ≈0.15%, flipping no admit/
+/// demote decision) does not rescue it. The split-LRT e-value is finite-sample
+/// valid with NO regularity conditions — exactly the instrument for "does this
+/// atom earn a latent dimension".
 #[derive(Debug, Clone)]
 pub struct AtomSmoothSignificance {
-    pub bartlett_corrected_p: Option<f64>,
-    pub bartlett_factor: f64,
-    pub lr_stat: f64,
-    pub df: usize,
+    /// `log E` for "the atom's smooth is non-constant" (null = constant). A
+    /// universal-inference split-likelihood-ratio e-value: `E_{H0}[E] ≤ 1`
+    /// exactly, so `E ≥ 1/α` certifies the non-constant alternative at level α,
+    /// at any data-dependent stopping time. `None` when the split is degenerate
+    /// (too few active rows / a fold with no curvature column).
+    pub log_e_nonconstant: Option<f64>,
 }
 
 /// The three post-PIRLS inference reports for one atom, paired by atom index.
@@ -2678,7 +2685,7 @@ pub struct DictionaryReport {
     /// [`dictionary_report_with_transport_ladders`] before fitting.
     pub transport_ladders: Vec<AtomTransportLadderReport>,
     /// Per-atom post-PIRLS inference reports (#1097 Riesz functionals, #1099
-    /// curvature CI, #1103 Bartlett-corrected smooth significance), one entry
+    /// curvature CI, #1103 split-LRT smooth-structure e-value), one entry
     /// per atom in [`FittedSaeManifold::atoms`] order. Each report's three
     /// fields are computed when the atom carries its fit-time
     /// [`AtomInnerFit`] byproducts and the relevant numerics succeed; otherwise
@@ -2782,65 +2789,56 @@ fn atom_functional_report(fit: &AtomInnerFit) -> AtomFunctionalReport {
     }
 }
 
-/// #1103 Bartlett-corrected significance of one atom's inner smooth against a
-/// constant null.
+/// #1103 Any-n-valid structure evidence that one atom's inner smooth is
+/// non-constant, via the split-likelihood-ratio e-value.
 ///
 /// The inner decoder smooth is the Gaussian-identity penalized WLS fit
-/// `a_ik · Φ_k(t)ᵀ β_{k,j}` with dispersion `φ = `[`AtomInnerFit::dispersion`].
-/// H0 is "the smooth is constant" — i.e. only column 0 (the intercept basis
-/// column) is free; the tested block is the remaining curvature columns
-/// `1..M_k`. The Lawley LR Bartlett factor `c` is computed on the full inner
-/// design with the atom roughness Gram as the penalty, exactly mirroring the
-/// `smooth.rs` term-LR seam ([`lawley_lr_bartlett_factor`]): the Gaussian
-/// kappas depend only on the (constant) dispersion, so one `RowKappas` is
-/// shared across the atom's active rows.
+/// `a_ik · Φ_k(t)ᵀ β_{k,j}` with dispersion `φ = `[`AtomInnerFit::dispersion`],
+/// working response `z_i` reconstructed from the captured per-row scores. H0 is
+/// "the smooth is constant": only the intercept column 0 is free.
 ///
-/// The LR statistic is the penalized deviance drop from the constant fit to the
-/// fitted smooth, `2[ℓ̂ − ℓ_0]/φ` realized on the same design; with `ref_df`
-/// the smooth effective degrees of freedom [`AtomInnerFit::smooth_edf`]. When
-/// the design has no curvature column (`M_k ≤ 1`), no kappas are constructible,
-/// or the factor is degenerate, `bartlett_corrected_p` is `None` and the factor
-/// falls back to `1.0` (the uncorrected χ² stands), but the raw LR statistic
-/// and df are always reported.
+/// We compute the universal-inference e-value the atom-birth gate
+/// ([`crate::inference::structure_evidence::split_likelihood_log_e_value`]) uses:
+///
+/// * Split the active rows deterministically into an ESTIMATION fold (even
+///   index) and an EVALUATION fold (odd index).
+/// * On the estimation fold, fit the penalized smooth (the alternative) by
+///   `β̂ = (ΦᵀWΦ + S)⁻¹ ΦᵀW z` — any fitter is admissible; zero conditions.
+/// * On the evaluation fold, score the Gaussian log-likelihood under that
+///   prefit alternative, and the SUPREMUM of the evaluation-fold log-likelihood
+///   over the null class (the constant fit = weighted-mean response refit on the
+///   eval fold — the honest constrained sup on D₀).
+/// * `log E = ℓ_alt(D₀) − sup_{H0} ℓ(D₀)`, with `E_{H0}[E] ≤ 1` exactly.
+///
+/// The dispersion `φ` is held fixed at the fitted reconstruction dispersion in
+/// both log-likelihoods so it cancels structurally and the e-value isolates the
+/// mean-curvature evidence. Returns `None` when the design has no curvature
+/// column (`M_k ≤ 1`), either fold is empty, or the inner Gram is not SPD.
 fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance> {
     let m = fit.design.ncols();
-    if m == 0 || fit.beta.len() != m {
-        // A degenerate inner design carries no smooth to test.
+    if m <= 1 || fit.beta.len() != m {
+        // No curvature column: the constant null IS the full model — there is no
+        // non-constant alternative to earn an e-value.
         return None;
     }
     let n = fit.design.nrows();
     if n == 0 || fit.weights.len() != n || fit.row_scores.nrows() != n {
         return None;
     }
-
-    // Reference df for the LR: the smooth effective degrees of freedom, the
-    // same Wood reference the term-LR seam uses for non-constant columns.
-    let df_float = fit.smooth_edf.max(0.0);
-    let df = df_float.round().max(1.0) as usize;
-
-    // Penalized deviance drop from the constant null to the fitted smooth, on
-    // the captured Gaussian-identity channel. The fitted-state working response
-    // is recovered from the per-row score `s_i = −w_i r_i Φ_i / φ`: projecting
-    // the score onto `β/‖β‖`-independent fitted prediction is fragile, so we use
-    // the design directly. The full prediction is `μ̂_i = Φ_iᵀ β`; the constant
-    // null's prediction is the weighted-mean of `μ̂` (the penalized projection
-    // onto the intercept column at the same weights). The residual SS uses the
-    // working response `z_i = μ̂_i + r_i` reconstructed from the scores.
     let phi = if fit.dispersion.is_finite() && fit.dispersion > 0.0 {
         fit.dispersion
     } else {
         return None;
     };
-    let mut working_response = Array1::<f64>::zeros(n);
-    let mut weighted_mass = 0.0_f64;
-    let mut weighted_z_sum = 0.0_f64;
+
+    // Per-row working response z_i = μ̂_i + r_i, reconstructing the scalar
+    // residual r_i from the captured score projected onto the design row
+    // (s_iᵀ Φ_i = −w_i r_i ‖Φ_i‖² / φ ⇒ r_i). Same reconstruction the previous
+    // deviance path used; here it feeds the two folds' likelihoods.
+    let mut z = Array1::<f64>::zeros(n);
     for i in 0..n {
         let mu_hat = fit.design.row(i).dot(&fit.beta);
         let w_i = fit.weights[i];
-        // r_i = −φ · s_{i,c} / (w_i Φ_{i,c}) is ill-defined column-wise; instead
-        // recover the scalar working residual from the score projected on the
-        // design row: s_iᵀ Φ_i = −w_i r_i ‖Φ_i‖² / φ ⇒ r_i follows. Guard the
-        // zero-norm row (an all-zero basis row contributes no residual).
         let phi_row = fit.design.row(i);
         let phi_norm_sq = phi_row.dot(&phi_row);
         let r_i = if w_i > 0.0 && phi_norm_sq > 0.0 {
@@ -2849,76 +2847,75 @@ fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance
         } else {
             0.0
         };
-        let z_i = mu_hat + r_i;
-        working_response[i] = z_i;
-        weighted_mass += w_i;
-        weighted_z_sum += w_i * z_i;
+        z[i] = mu_hat + r_i;
     }
-    if !(weighted_mass > 0.0) {
+
+    // Deterministic estimation/evaluation split by row parity.
+    let est: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+    let eval: Vec<usize> = (0..n).filter(|i| i % 2 == 1).collect();
+    if est.is_empty() || eval.is_empty() {
         return None;
     }
-    let null_mean = weighted_z_sum / weighted_mass;
 
-    let mut rss_full = 0.0_f64;
-    let mut rss_null = 0.0_f64;
-    for i in 0..n {
+    // Penalized smooth fit on the estimation fold: β̂ = (ΦᵀWΦ + S)⁻¹ ΦᵀW z.
+    let mut a_gram = fit.penalty.clone();
+    let mut b = Array1::<f64>::zeros(m);
+    for &i in &est {
         let w_i = fit.weights[i];
-        let z_i = working_response[i];
-        let mu_hat = fit.design.row(i).dot(&fit.beta);
-        rss_full += w_i * (z_i - mu_hat) * (z_i - mu_hat);
-        rss_null += w_i * (z_i - null_mean) * (z_i - null_mean);
-    }
-    let lr_stat = ((rss_null - rss_full) / phi).max(0.0);
-
-    // The Lawley Bartlett factor on the inner design, tested block = the
-    // curvature columns 1..M_k (column 0 is the intercept under H0).
-    if m <= 1 {
-        // No curvature column: the constant null IS the full model, so there is
-        // no smooth to correct. Report the (zero) LR and df, no Bartlett factor.
-        return Some(AtomSmoothSignificance {
-            bartlett_corrected_p: None,
-            bartlett_factor: 1.0,
-            lr_stat,
-            df,
-        });
-    }
-    let tested = 1..m;
-
-    // Gaussian-identity expected jets depend only on the constant dispersion,
-    // so one RowKappas is shared across all active rows.
-    let row_kappas = RowExpectedJets::gaussian_identity(phi).kappas().ok();
-    let bartlett_factor = match row_kappas {
-        Some(kappas) => {
-            let kappas_vec: Vec<RowKappas> = vec![kappas; n];
-            lawley_lr_bartlett_factor(
-                fit.design.view(),
-                &kappas_vec,
-                Some(fit.penalty.view()),
-                tested,
-                df_float.max(1e-12),
-            )
-            .ok()
-            .filter(|c| c.is_finite() && *c > 0.0)
+        if !(w_i > 0.0) {
+            continue;
         }
-        None => None,
-    };
-
-    let (factor, corrected_p) = match bartlett_factor {
-        Some(c) => {
-            let corrected = lr_stat / c;
-            let p = chi2_sf(corrected, df_float.max(1e-12));
-            (c, p)
+        let row = fit.design.row(i);
+        for r in 0..m {
+            let xr = row[r];
+            if xr == 0.0 {
+                continue;
+            }
+            b[r] += w_i * xr * z[i];
+            for c in 0..m {
+                a_gram[[r, c]] += w_i * xr * row[c];
+            }
         }
-        // No factor computable: the uncorrected χ² stands (factor 1, no
-        // corrected p — the field documents the uncorrected fallback).
-        None => (1.0, None),
-    };
+    }
+    let beta_alt = a_gram.cholesky(Side::Lower).ok()?.solvevec(&b);
+
+    // Null sup on the EVALUATION fold: the weighted-mean response (the constant
+    // fit's MLE on D₀, the honest constrained sup over the null class).
+    let mut eval_mass = 0.0_f64;
+    let mut eval_wz = 0.0_f64;
+    for &i in &eval {
+        let w_i = fit.weights[i];
+        eval_mass += w_i;
+        eval_wz += w_i * z[i];
+    }
+    if !(eval_mass > 0.0) {
+        return None;
+    }
+    let null_mean = eval_wz / eval_mass;
+
+    // Gaussian log-likelihoods on the evaluation fold at fixed dispersion φ;
+    // the −½ log(2πφ) and weight-log terms are identical under both models, so
+    // log E = −(½/φ) [ Σ w(z − μ_alt)² − Σ w(z − μ_null)² ].
+    let mut sse_alt = 0.0_f64;
+    let mut sse_null = 0.0_f64;
+    for &i in &eval {
+        let w_i = fit.weights[i];
+        let mu_alt = fit.design.row(i).dot(&beta_alt);
+        let r_alt = z[i] - mu_alt;
+        let r_null = z[i] - null_mean;
+        sse_alt += w_i * r_alt * r_alt;
+        sse_null += w_i * r_null * r_null;
+    }
+    let log_lik_alt = -0.5 * sse_alt / phi;
+    let log_lik_null_sup = -0.5 * sse_null / phi;
+    let log_e =
+        crate::inference::structure_evidence::split_likelihood_log_e_value(log_lik_alt, log_lik_null_sup);
+    if !log_e.is_finite() {
+        return None;
+    }
 
     Some(AtomSmoothSignificance {
-        bartlett_corrected_p: corrected_p,
-        bartlett_factor: factor,
-        lr_stat,
-        df,
+        log_e_nonconstant: Some(log_e),
     })
 }
 
@@ -3198,20 +3195,10 @@ where
     Some(0.5 * (a + b))
 }
 
-/// Upper-tail χ²_df survival function for the Bartlett-corrected p-value.
-fn chi2_sf(stat: f64, df: f64) -> Option<f64> {
-    if !(stat.is_finite() && stat >= 0.0 && df.is_finite() && df > 0.0) {
-        return None;
-    }
-    use statrs::distribution::{ChiSquared, ContinuousCDF};
-    let dist = ChiSquared::new(df).ok()?;
-    Some((1.0 - dist.cdf(stat)).clamp(0.0, 1.0))
-}
-
 /// Assemble the three post-PIRLS inference reports for every atom, reusing the
 /// per-atom [`AtomInnerFit`] harvested at fit time.
 ///
-/// * #1097 Riesz functionals and #1103 Bartlett significance are computed from
+/// * #1097 Riesz functionals and #1103 split-LRT smooth-structure e-value are computed from
 ///   the captured inner-decoder smooth (design, penalized Hessian, row scores,
 ///   roughness Gram) — they need only the fixed fitted snapshot.
 /// * #1099 curvature CI profiles the atom's penalized neg-log-evidence along the
@@ -3544,7 +3531,6 @@ mod tests {
             peak_design_row: peak_design_row.clone(),
             mode_design_row: mode_design_row.clone(),
             kappa_hat: 0.0,
-            smooth_edf: 2.0,
             geodesic_length_jet: None,
             penalty_order: 1,
             xtw_z,
