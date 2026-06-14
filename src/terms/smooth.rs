@@ -1,5 +1,5 @@
 // Split from the original oversized module; keep included in order.
-include!("smooth/part_000.rs");
+include!("smooth/imports.rs");
 
 mod bspline_boundary;
 
@@ -11,7 +11,7 @@ mod input_standardization;
 
 mod shape_constraints;
 
-include!("smooth/part_001.rs");
-include!("smooth/part_002.rs");
-include!("smooth/part_003.rs");
-include!("smooth/part_004.rs");
+include!("smooth/term_specs.rs");
+include!("smooth/design_construction.rs");
+include!("smooth/spatial_optimization.rs");
+include!("smooth/tests_wiring.rs");
