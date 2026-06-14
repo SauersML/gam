@@ -1,3 +1,97 @@
+## v0.3.116 — gam 0.3.116 / gamfit 0.1.199 (2026-06-14)
+
+Large crate + wheel release rolling up the unreleased work since 0.3.115. The
+headline is a wave of new user-facing modeling capability — interval-censored
+survival from a formula, full multinomial prediction inference, expectile GAMs,
+magic Poisson auto-detection, restricted mean survival time, exact full-conformal
+prediction intervals, and per-term likelihood-ratio tests — alongside a deep
+solver-robustness cleanup (the derivative-free compass-search optimizer is gone,
+several silent-failure crutches now fail loud), the SAE/manifold interpretability
+stack, and a broad reference-quality test expansion. Build, rustfmt, and the
+clippy correctness/suspicious gate are all green.
+
+New modeling capability:
+- feat(#1108): interval-censored survival is now fittable from a user formula —
+  a dedicated `SurvInterval(L, R, event)` response (disambiguated from
+  delayed-entry `Surv(entry, exit, event)`) materializes the time basis at both
+  boundaries with frozen-knot column reuse and routes through the latent-survival
+  path. Completes the deferred wiring step; covered by a gauge-invariant σ̂
+  truth-recovery + match-or-beat-lifelines test.
+- feat(#1101): multinomial-logit inference completeness — H⁻¹ covariance,
+  `MultinomialPredictor` delta-method prediction intervals + standard errors,
+  posterior_predict, and a per-term Wald summary, wired through the FFI and the
+  Python surface. The fitted spec is frozen so `predict` rebuilds the exact
+  fitted design.
+- feat(#1100): expectile GAMs via a LAWS (asymmetric-least-squares) outer loop.
+- feat(#1065): magic-by-default Poisson auto-detection for non-negative integer
+  count responses.
+- feat(survival): restricted mean survival time (RMST) output.
+- feat(#1054, #942): exact full-conformal prediction intervals —
+  `predict(interval='conformal')` auto-routes to the exact Gaussian jackknife+
+  path and the exact GLM full-conformal engine, surfaced to Python.
+- feat(#1063): per-term likelihood-ratio statistics with a magic Lawley–Bartlett
+  correction (dispersion-carrying known-scale jets for Gaussian/Gamma), through
+  the FFI and Python API.
+- feat(#1032): `FitResult::ResidualCascade` variant + `fit_from_formula`
+  auto-route with a quasi-uniformity guard, plus serde state replay.
+- feat(#1057): generative replicate sampling + posterior-predictive checks
+  (`Model.sample_replicates`).
+- feat(#1049): posterior_predict for the Bernoulli marginal-slope path.
+
+Geometry, manifolds & SAE interpretability:
+- feat(#1061): SPD / Grassmann / Stiefel / Poincaré are now selectable response
+  geometries.
+- feat(#1104, #944): `ConstantCurvature` response manifold with an end-to-end
+  curvature-as-estimand inference layer (κ̂ + profile CI + κ=0 LR from a real
+  fit).
+- feat(#1097, #1099, #1102, #1103, #1055): per-atom Riesz-debiased functionals,
+  per-atom curvature profile-likelihood CIs with flat-cusp handling,
+  cross-checkpoint atom-trajectory dynamics, and any-n e-value atom-smooth
+  significance — wired end-to-end into `dictionary_report` and the Python facade
+  (`Model.debiased_functional()`, `sae_checkpoint_dynamics`).
+- feat(#1026): evidence-scored curved+linear-tail hybrid dictionary split made
+  load-bearing on reconstruction, with leave-one-atom-out held-out EV
+  attribution.
+- feat(#1058): anytime-valid structure certificate surfaced post-fit.
+- feat(#1038): exact cross-row integration-by-parts Woodbury on the arrow
+  evidence cache (wired at the assembly site).
+
+Solver robustness (deslop):
+- The derivative-free compass-search optimizer is removed entirely: the last
+  gradient-free callers (Weibull / transformation survival baselines) were
+  migrated to exact-gradient BFGS, and `Solver::CompassSearch` and its dispatch
+  were ripped out — it could hang, so it is gone.
+- The arrow/Schur Woodbury path now fails loud instead of propagating a silent
+  NaN.
+- Removed the wall-clock fake-convergence early-exit in blockwise PIRLS.
+- Cost-stall convergence must now clear the gradient tolerance, not just a flat
+  cost.
+- Replaced the magic 16-iteration ridge-escalation cap with a principled
+  Gershgorin spectral ridge.
+- Stopped silently clamping negative-eigenvalue smoothing corrections into a
+  fake-PSD covariance; refuse phantom zero penalty-logdet ρ-derivatives instead
+  of silently desyncing the outer optimizer.
+- Constrained joint-Newton path: Newton-decrement certificate wired in,
+  negative-curvature reflection convexifies the QP (#1040).
+
+Performance:
+- perf(#1017): CPU-resident reduced-Schur operator for the SAE matvec — factored
+  (Lᵢ, Yᵢ) residency replacing the dense p×p block, with a work-based offload
+  predicate and a parallelized per-row matvec.
+- perf(#1082): parallelize competing-risks CIF assembly over the (independent)
+  row axis behind the rayon nesting guard + a row-count gate, byte-identical to
+  the serial path; n-scaled outer-gradient floor across all families;
+  warm-started β in the spatial outer loop; right-sized quality-test fixtures.
+
+Reference-quality tests: a broad new wave across the mature comparators
+(lifelines interval censoring, VGAM multinomial smooth-by-factor, mgcv tensor
+products, frailty survival, PyMC/InterpretML, conformal coverage, and more).
+
+Known limitations (tracked, not regressions): several quality fits still exceed
+the wall-clock budget (#1082, #1116) and the survival marginal-slope path is slow
+on some bases (#979) — under active investigation; these are perf/coverage gaps,
+not correctness defects in the shipped surface.
+
 ## v0.3.115 — gam 0.3.115 / gamfit 0.1.198 (2026-06-13)
 
 Crate + wheel release rolling up the unreleased work since 0.3.114: the O(n)
