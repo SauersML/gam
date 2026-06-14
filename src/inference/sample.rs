@@ -150,7 +150,15 @@ fn family_noise_parameter_from_scale(
     likelihood: &LikelihoodSpec,
 ) -> Option<f64> {
     if let ResponseFamily::NegativeBinomial { theta, .. } = likelihood.response {
-        return Some(theta);
+        // The NB overdispersion θ is estimated during the fit and stored in
+        // `likelihood_scale` (`EstimatedNegBinTheta`); the θ embedded in the
+        // response spec is only the construction-time seed (left at 1.0). Read
+        // the fitted value, falling back to the seed only for fit-free
+        // construction — exactly as the Beta (#770), Tweedie and Gamma arms
+        // below already consult `likelihood_scale`. Returning the seed was the
+        // NB sibling of #770: generate/sample_replicates drew Var = μ + μ²
+        // instead of μ + μ²/θ̂ (#1124).
+        return likelihood_scale.negbin_theta().or(Some(theta));
     }
     if let ResponseFamily::Tweedie { .. } = likelihood.response {
         return likelihood_scale.fixed_phi().or(Some(1.0));

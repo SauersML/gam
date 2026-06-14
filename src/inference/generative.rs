@@ -106,7 +106,14 @@ impl NoiseModel {
                 })
             }
             ResponseFamily::NegativeBinomial { theta, .. } => {
-                let theta = *theta;
+                // The NB overdispersion θ is estimated jointly with the mean and
+                // the authoritative post-fit value is handed in as
+                // `gaussian_scale` (from `likelihood_scale.negbin_theta()`);
+                // the θ embedded in the response spec is only the seed (1.0).
+                // Reading the seed was the NB sibling of the Beta #770 bug:
+                // generate drew Var = μ + μ² (θ = 1) regardless of the fitted
+                // overdispersion (#1124). Mirror the Beta arm below.
+                let theta = gaussian_scale.unwrap_or(*theta);
                 if !(theta.is_finite() && theta > 0.0) {
                     crate::bail_invalid_estim!(
                         "negative-binomial theta must be finite and > 0; got {theta}"
