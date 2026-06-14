@@ -3526,9 +3526,14 @@ fn layer_transport_ladder(
 ///      `‖g^{(c+1)}(t_mode) − g^{(c)}(t_mode)‖` with a delta-method SE;
 ///   3. accumulates an anytime-valid e-process under the no-change null.
 ///
-/// Returns `{"trajectories": [ {atom_name, step_contrasts:[...riesz...],
-/// transports:[...transport...], change_evidence:{...certificate...}} ]}`.
-/// See `gam::inference::checkpoint_dynamics` for the estimator and the honest
+/// Returns `{"trajectories": [ {atom_name,
+/// conditional_step_contrasts:[...riesz...], transports:[...transport...],
+/// change_evidence:{...certificate...}} ]}`. The PRIMARY, coverage-valid
+/// deliverable is `change_evidence` (the anytime-valid change e-process);
+/// `conditional_step_contrasts` is a descriptive readout CONDITIONAL ON THE
+/// FITTED COORDINATES (its SE conditions away the generated-regressor
+/// uncertainty in t̂/â — issue #1115), not a coverage-valid CI. See
+/// `gam::inference::checkpoint_dynamics` for the estimator and the honest
 /// accounting of which Riesz inputs a bare decoder grid supports.
 #[pyfunction(signature = (decoder_grid, checkpoint_ids, atom_names, latent_grid, alpha = 0.05))]
 fn sae_checkpoint_dynamics(
@@ -3561,10 +3566,10 @@ fn sae_checkpoint_dynamics(
         let t = PyDict::new(py);
         t.set_item("atom_name", &traj.atom_name)?;
         let steps = PyList::empty(py);
-        for report in &traj.step_contrasts {
+        for report in &traj.conditional_step_contrasts {
             steps.append(sae_riesz_report_dict(py, report)?)?;
         }
-        t.set_item("step_contrasts", steps)?;
+        t.set_item("conditional_step_contrasts", steps)?;
         let transports = PyList::empty(py);
         for report in &traj.transports {
             transports.append(layer_transport_report_to_pydict(py, report)?)?;

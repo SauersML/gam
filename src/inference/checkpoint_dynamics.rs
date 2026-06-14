@@ -69,16 +69,32 @@ pub struct CheckpointDynamicsInput<'a> {
 }
 
 /// The training-dynamics trajectory of one atom across the checkpoint axis.
+///
+/// The PRIMARY, coverage-valid deliverable is [`Self::change_evidence`]: the
+/// anytime-valid e-process answering "did atom k change during training?".
+/// [`Self::conditional_step_contrasts`] is a secondary, descriptive readout (see
+/// its docs for the conditional caveat).
 pub struct AtomTrajectory {
     pub atom_name: String,
     /// Debiased `g^{(c+1)}(t_mode) − g^{(c)}(t_mode)` for each consecutive
     /// checkpoint step, with its plug-in SE.
-    pub step_contrasts: Vec<RieszDebiasReport>,
+    ///
+    /// CONDITIONAL ON THE FITTED COORDINATES (not a coverage-valid CI). The
+    /// debiased SE here conditions away the generated-regressor uncertainty in
+    /// the estimated latent coordinates `t̂` and activations `â` — the exact
+    /// correction the marginal-slope family exists to make (issue #1115). It is
+    /// reported only as a conditional contrast point estimate with a plug-in SE,
+    /// NOT as an interval with frequentist coverage for the population
+    /// displacement. The headline change verdict is carried by the e-process
+    /// [`Self::change_evidence`], which IS anytime-valid; this field is a
+    /// descriptive companion. Read the SE accordingly.
+    pub conditional_step_contrasts: Vec<RieszDebiasReport>,
     /// Consecutive-checkpoint chart correspondences (checkpoint axis reused as
     /// the transport "layer" axis).
     pub transports: Vec<LayerTransportReport>,
-    /// Anytime-valid evidence that the atom changed at each consecutive
-    /// checkpoint step, one calibrated e-value per step into a per-step claim.
+    /// PRIMARY deliverable: anytime-valid evidence that the atom changed at each
+    /// consecutive checkpoint step, one calibrated e-value per step into a
+    /// per-step claim. Valid at any data-dependent stopping time.
     pub change_evidence: StructureLedger,
 }
 
@@ -236,7 +252,7 @@ pub fn checkpoint_atom_dynamics(
 
         trajectories.push(AtomTrajectory {
             atom_name,
-            step_contrasts,
+            conditional_step_contrasts: step_contrasts,
             transports,
             change_evidence,
         });
@@ -490,8 +506,8 @@ mod tests {
         // Atom 0 is identical across checkpoints: every step contrast must be
         // (numerically) zero displacement and accumulate no change evidence.
         let constant = &traj[0];
-        assert_eq!(constant.step_contrasts.len(), n_ckpt - 1);
-        for report in &constant.step_contrasts {
+        assert_eq!(constant.conditional_step_contrasts.len(), n_ckpt - 1);
+        for report in &constant.conditional_step_contrasts {
             assert!(
                 report.theta_onestep.abs() < 1e-9,
                 "constant atom step displacement should be ~0, got {}",
@@ -531,7 +547,7 @@ mod tests {
         // `shift/(1+λ)` tracks the true displacement to sub-percent, and every
         // reported quantity is finite. (The component displacement lives in a
         // single ambient channel, so the L2 size IS that channel's contrast.)
-        for report in &drifter.step_contrasts {
+        for report in &drifter.conditional_step_contrasts {
             assert!(
                 (report.theta_plugin - shift).abs() < 1e-2 * shift,
                 "drift step plug-in displacement should track {shift}, got {}",
