@@ -211,75 +211,25 @@ impl WarmStartStore {
                 let bin = hit.meta_path.with_extension("bin");
                 fs::remove_file(&hit.meta_path).ok();
                 fs::remove_file(&bin).ok();
+                // Removing the entry stales any cached directory listing.
+                self.metadata_index_remove(&hit.meta_path);
                 return Ok(None);
             }
             lookup_cache_invalidate(&cache_key);
         }
+        // Resolve all valid entries for this key directory. `scan_key_dir`
+        // serves the listing from the per-store directory cache when the dir's
+        // mtime is unchanged since the last scan (no re-`read_dir`, no per-file
+        // `stat`, no JSON re-parse), and drops TTL-expired / corrupt entries in
+        // passing — exactly the syscall storm #1114 traced.
         let mut best: Option<(OnDiskMeta, PathBuf)> = None;
-        for entry in fs::read_dir(&dir)? {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            // Only consume *.json (skip .bin, .tmp.*, etc.)
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            // Skip in-flight temp files: <runid>.json.tmp.<pid>
-            if path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|n| n.contains(".tmp."))
-            {
-                continue;
-            }
-            let meta_md = match fs::metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let bin = path.with_extension("bin");
-            let bin_md = match fs::metadata(&bin) {
-                Ok(m) => m,
-                Err(_) => {
-                    fs::remove_file(&path).ok();
-                    self.metadata_index_remove(&path);
-                    continue;
-                }
-            };
-            let meta = match self.read_meta_indexed(&path, &meta_md, &bin_md) {
-                Ok(m) => m,
-                Err(_) => {
-                    fs::remove_file(&path).ok();
-                    self.metadata_index_remove(&path);
-                    continue;
-                }
-            };
-            if meta.schema_version != SCHEMA_VERSION {
-                continue;
-            }
-            // Drop entries past TTL on the lookup path itself, not only in
-            // the throttled `evict_overflow` sweep. Otherwise an expired
-            // entry can survive arbitrarily long when `save_overwrite` does
-            // not happen to trigger a sweep on the current save (see
-            // `EVICT_EVERY_N_SAVES`).
-            if meta_expired(
-                meta.written_unix_secs,
-                meta.written_nanos,
-                self.opts.ttl,
-                now_nanos,
-            ) {
-                fs::remove_file(&path).ok();
-                fs::remove_file(&bin).ok();
-                self.metadata_index_remove(&path);
-                continue;
-            }
+        for scanned in self.scan_key_dir(&dir, now_nanos) {
             let take = match best {
                 None => true,
-                Some((ref cur, _)) => mode.better(&meta, cur),
+                Some((ref cur, _)) => mode.better(&scanned.meta, cur),
             };
             if take {
-                best = Some((meta, path));
+                best = Some((scanned.meta, scanned.meta_path));
             }
         }
         let (meta, meta_path) = match best {
@@ -514,76 +464,33 @@ impl WarmStartStore {
             if !key_dir.is_dir() {
                 continue;
             }
-            let inner = match fs::read_dir(&key_dir) {
-                Ok(rd) => rd,
-                Err(_) => continue,
-            };
-            for f in inner {
-                let p = match f {
-                    Ok(e) => e.path(),
-                    Err(_) => continue,
-                };
-                let name = match p.file_name().and_then(|s| s.to_str()) {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                // Sweep tmp files from other processes. Same-PID tmps may
-                // be in-flight writes from this very process; leave them.
-                if name.contains(".tmp.") {
-                    if let Some(pid) = parse_tmp_pid(&name)
-                        && pid != std::process::id()
-                    {
-                        fs::remove_file(&p).ok();
-                    }
-                    continue;
-                }
-                if p.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
-                }
-                let meta_md = match fs::metadata(&p) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let bin = p.with_extension("bin");
-                let bin_md = match fs::metadata(&bin) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        // Orphan meta — clean it up.
-                        fs::remove_file(&p).ok();
-                        continue;
-                    }
-                };
-                let meta = match self.read_meta_indexed(&p, &meta_md, &bin_md) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        fs::remove_file(&p).ok();
-                        fs::remove_file(&bin).ok();
-                        self.metadata_index_remove(&p);
-                        continue;
-                    }
-                };
-                let write_nanos = (meta.written_unix_secs as u128) * 1_000_000_000u128
-                    + meta.written_nanos as u128;
-                if meta_expired(
-                    meta.written_unix_secs,
-                    meta.written_nanos,
-                    self.opts.ttl,
-                    now_nanos,
-                ) {
-                    fs::remove_file(&p).ok();
-                    fs::remove_file(&bin).ok();
-                    self.metadata_index_remove(&p);
-                    continue;
-                }
-                let total_bytes = meta_md.len() + bin_md.len();
-                all.push((p, bin, total_bytes, write_nanos));
+            // `scan_key_dir` reuses the per-store directory-listing cache when
+            // the key dir's mtime is unchanged, so an unchanged dir costs a
+            // single `stat` rather than a `read_dir` + per-file `stat` + JSON
+            // read of every entry. It also sweeps foreign tmp files and drops
+            // corrupt / TTL-expired entries, mirroring the old inline pass.
+            let scanned = self.scan_key_dir(&key_dir, now_nanos);
+            for entry in &scanned {
+                let write_nanos = (entry.meta.written_unix_secs as u128) * 1_000_000_000u128
+                    + entry.meta.written_nanos as u128;
+                let total_bytes = entry.meta_len + entry.bin_len;
+                all.push((
+                    entry.meta_path.clone(),
+                    entry.bin_path.clone(),
+                    total_bytes,
+                    write_nanos,
+                ));
             }
             // Sweep now-empty key dirs.
-            if fs::read_dir(&key_dir)
-                .map(|mut it| it.next().is_none())
-                .unwrap_or(false)
+            if scanned.is_empty()
+                && fs::read_dir(&key_dir)
+                    .map(|mut it| it.next().is_none())
+                    .unwrap_or(false)
             {
                 fs::remove_dir(&key_dir).ok();
+                if let Ok(mut index) = self.index.lock() {
+                    index.by_key_dir.remove(&key_dir);
+                }
             }
         }
         let total: u64 = all.iter().map(|e| e.2).sum();
@@ -724,6 +631,17 @@ struct CachedLookup {
 #[derive(Debug, Default)]
 struct MetadataIndex {
     by_meta_path: HashMap<PathBuf, IndexedMeta>,
+    /// Per-key-directory cached listing, keyed by the directory's mtime.
+    ///
+    /// A key dir's mtime is bumped by the OS whenever an entry is created,
+    /// renamed, or removed inside it (which is exactly when our entries
+    /// change). So a matching `dir_mtime` means the set of `<runid>.{json,bin}`
+    /// pairs is byte-for-byte what we scanned last time, letting
+    /// [`WarmStartStore::scan_key_dir`] return the cached `Vec<ScannedEntry>`
+    /// without a fresh `read_dir` or any per-file `stat`/JSON read. This is
+    /// what kills the metadata-syscall storm in repeated `lookup_with` /
+    /// `evict_overflow` calls within one fit (gam#1114).
+    by_key_dir: HashMap<PathBuf, ScannedDir>,
 }
 
 #[derive(Debug, Clone)]
@@ -740,6 +658,26 @@ impl IndexedMeta {
             && meta_md.len() == self.meta_len
             && bin_md.len() == self.bin_len
     }
+}
+
+/// Cached result of scanning one key directory: its mtime at scan time plus
+/// the resolved entries. Reused verbatim while the dir's mtime is unchanged.
+#[derive(Debug, Clone)]
+struct ScannedDir {
+    dir_mtime: SystemTime,
+    entries: Vec<ScannedEntry>,
+}
+
+/// One resolved `(meta, bin)` pair discovered during a key-dir scan. Carries
+/// everything both the lookup ranker and the eviction sweep need so neither
+/// has to re-`stat` or re-read the files when the dir is unchanged.
+#[derive(Debug, Clone)]
+struct ScannedEntry {
+    meta_path: PathBuf,
+    bin_path: PathBuf,
+    meta_len: u64,
+    bin_len: u64,
+    meta: OnDiskMeta,
 }
 
 /// True iff a meta with the given (`secs`, `nanos`) write timestamp is older
@@ -921,12 +859,22 @@ impl WarmStartStore {
         let meta_md = fs::metadata(meta_path)?;
         let bin_md = fs::metadata(bin_path)?;
         self.read_meta_indexed(meta_path, &meta_md, &bin_md)?;
+        // A fresh entry just landed in this key dir, so any cached listing for
+        // the dir is stale. Drop it; the next scan rebuilds and re-caches.
+        if let Some(parent) = meta_path.parent()
+            && let Ok(mut index) = self.index.lock()
+        {
+            index.by_key_dir.remove(parent);
+        }
         Ok(())
     }
 
     fn metadata_index_remove(&self, meta_path: &Path) {
         if let Ok(mut index) = self.index.lock() {
             index.by_meta_path.remove(meta_path);
+            if let Some(parent) = meta_path.parent() {
+                index.by_key_dir.remove(parent);
+            }
         }
     }
 
@@ -934,7 +882,185 @@ impl WarmStartStore {
         let dir = self.key_dir(key);
         if let Ok(mut index) = self.index.lock() {
             index.by_meta_path.retain(|path, _| !path.starts_with(&dir));
+            index.by_key_dir.remove(&dir);
         }
+    }
+
+    /// Cached listing lookup for one key directory.
+    ///
+    /// Returns the cached `Vec<ScannedEntry>` if the directory's current mtime
+    /// matches the cached scan (no entry added/removed since), otherwise
+    /// `None` so the caller performs a fresh scan via [`Self::scan_key_dir`].
+    ///
+    /// A matching dir mtime guarantees the *set* of files is unchanged, but TTL
+    /// is wall-clock relative, so an entry valid at scan time can expire while
+    /// the listing is still cached. The caller re-applies the TTL cutoff to the
+    /// returned entries; this only proves the file set is stable.
+    fn cached_dir_scan(&self, dir: &Path, dir_md: &fs::Metadata) -> Option<Vec<ScannedEntry>> {
+        let dir_mtime = dir_md.modified().ok()?;
+        let index = self.index.lock().ok()?;
+        let cached = index.by_key_dir.get(dir)?;
+        if cached.dir_mtime == dir_mtime {
+            Some(cached.entries.clone())
+        } else {
+            None
+        }
+    }
+
+    fn store_dir_scan(&self, dir: &Path, dir_mtime: SystemTime, entries: &[ScannedEntry]) {
+        if let Ok(mut index) = self.index.lock() {
+            index.by_key_dir.insert(
+                dir.to_path_buf(),
+                ScannedDir {
+                    dir_mtime,
+                    entries: entries.to_vec(),
+                },
+            );
+        }
+    }
+
+    /// Scan one key directory, resolving every valid `(meta, bin)` pair and
+    /// cleaning up corrupt / orphaned / schema-mismatched files in passing.
+    ///
+    /// Serves both [`Self::lookup_with`] and [`Self::evict_overflow`]: when the
+    /// directory's mtime is unchanged since the previous scan it returns the
+    /// cached listing without a single `read_dir`, `metadata`, or JSON read —
+    /// the metadata-syscall storm that #1114 traced. A fresh scan re-caches the
+    /// listing keyed by the dir mtime observed *after* any cleanup, so a later
+    /// unchanged call hits the cache. (`now_nanos` drives the TTL drop; expired
+    /// entries are removed and excluded from the result.)
+    ///
+    /// `.tmp.*` files belonging to other processes are swept; same-PID temps
+    /// (in-flight writes from us) are left alone.
+    fn scan_key_dir(&self, dir: &Path, now_nanos: u128) -> Vec<ScannedEntry> {
+        let dir_md = match fs::metadata(dir) {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        if let Some(cached) = self.cached_dir_scan(dir, &dir_md) {
+            // The file set is unchanged, but TTL is wall-clock relative: an
+            // entry valid when scanned may have expired since. Re-apply the
+            // cutoff against `now_nanos`, removing any that crossed it. If none
+            // expired we return the cached listing untouched (the fast path);
+            // otherwise the removals bump the dir mtime, so we drop the stale
+            // cache and re-cache the survivors keyed by the post-removal mtime.
+            let any_expired = cached.entries.iter().any(|e| {
+                meta_expired(
+                    e.meta.written_unix_secs,
+                    e.meta.written_nanos,
+                    self.opts.ttl,
+                    now_nanos,
+                )
+            });
+            if !any_expired {
+                return cached;
+            }
+            let mut survivors = Vec::with_capacity(cached.entries.len());
+            for entry in cached.entries {
+                if meta_expired(
+                    entry.meta.written_unix_secs,
+                    entry.meta.written_nanos,
+                    self.opts.ttl,
+                    now_nanos,
+                ) {
+                    fs::remove_file(&entry.meta_path).ok();
+                    fs::remove_file(&entry.bin_path).ok();
+                    self.metadata_index_remove(&entry.meta_path);
+                } else {
+                    survivors.push(entry);
+                }
+            }
+            if let Some(mtime) = fs::metadata(dir).ok().and_then(|m| m.modified().ok()) {
+                self.store_dir_scan(dir, mtime, &survivors);
+            }
+            return survivors;
+        }
+        let read_dir = match fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => return Vec::new(),
+        };
+        let mut entries = Vec::new();
+        let mut mutated = false;
+        for f in read_dir {
+            let path = match f {
+                Ok(e) => e.path(),
+                Err(_) => continue,
+            };
+            let name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            if name.contains(".tmp.") {
+                if let Some(pid) = parse_tmp_pid(name)
+                    && pid != std::process::id()
+                {
+                    fs::remove_file(&path).ok();
+                    mutated = true;
+                }
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let meta_md = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let bin = path.with_extension("bin");
+            let bin_md = match fs::metadata(&bin) {
+                Ok(m) => m,
+                Err(_) => {
+                    fs::remove_file(&path).ok();
+                    self.metadata_index_remove(&path);
+                    mutated = true;
+                    continue;
+                }
+            };
+            let meta = match self.read_meta_indexed(&path, &meta_md, &bin_md) {
+                Ok(m) => m,
+                Err(_) => {
+                    fs::remove_file(&path).ok();
+                    fs::remove_file(&bin).ok();
+                    self.metadata_index_remove(&path);
+                    mutated = true;
+                    continue;
+                }
+            };
+            if meta.schema_version != SCHEMA_VERSION {
+                continue;
+            }
+            if meta_expired(
+                meta.written_unix_secs,
+                meta.written_nanos,
+                self.opts.ttl,
+                now_nanos,
+            ) {
+                fs::remove_file(&path).ok();
+                fs::remove_file(&bin).ok();
+                self.metadata_index_remove(&path);
+                mutated = true;
+                continue;
+            }
+            entries.push(ScannedEntry {
+                meta_path: path,
+                bin_path: bin,
+                meta_len: meta_md.len(),
+                bin_len: bin_md.len(),
+                meta,
+            });
+        }
+        // Cache keyed by the mtime *after* any cleanup so the next unchanged
+        // call is a cache hit. If cleanup mutated the dir, re-stat to capture
+        // the post-mutation mtime; otherwise reuse the mtime we already read.
+        let final_mtime = if mutated {
+            fs::metadata(dir).ok().and_then(|m| m.modified().ok())
+        } else {
+            dir_md.modified().ok()
+        };
+        if let Some(mtime) = final_mtime {
+            self.store_dir_scan(dir, mtime, &entries);
+        }
+        entries
     }
 
     fn test_time_offset_ns(&self) -> u64 {
