@@ -1770,6 +1770,171 @@ impl SaeManifoldTerm {
         }
     }
 
+    /// #976 Layer-1 guard (decoder arm): the per-atom **decoder-norm** floor,
+    /// checked once per accepted outer iteration of the joint K>1 fit.
+    ///
+    /// The gate-mass guard ([`Self::enforce_active_mass_guard`]) catches an atom
+    /// whose *assignment* support vanished, but it is blind to the real-data K>1
+    /// failure (#853/#976 class) where the assignment gates stay spread across
+    /// rows yet every atom's *decoder* `B_k` collapses to ≈0. A zero decoder
+    /// decodes nothing, so the dictionary explains nothing (EV≈0) and every
+    /// per-row coordinate Hessian `H_tt` — whose curvature is carried by `Φ·B`
+    /// — goes rank-deficient at once, surfacing as the `0 → K·n` evidence
+    /// gauge-deflation jump that aborts `reml_criterion`. The decoder-norm guard
+    /// closes that blind spot.
+    ///
+    /// The collapse statistic is each atom's decoder Frobenius norm as a RATIO
+    /// to the dictionary's MEDIAN decoder norm (scale-free: a uniformly small
+    /// but well-conditioned decoder never trips it; only an atom that has fallen
+    /// far behind its peers does). A breach is answered, within the SAME shared
+    /// per-atom budget as the mass guard, by re-diversifying the atom's latent
+    /// coordinates onto a distinct, currently-unexplained direction of the
+    /// reconstruction residual and re-fitting all decoders by joint least
+    /// squares so the reseeded atom claims real signal rather than re-collapsing
+    /// — then recorded as a [`CollapseEvent`]. After the budget a breach is
+    /// recorded once as terminal and left for the evidence-gated structure
+    /// search, exactly like the mass arm.
+    ///
+    /// **K=1 is a strict no-op**: with a single atom there is no peer to fall
+    /// behind, the median equals the atom's own norm, the ratio is exactly `1`,
+    /// and the early return below fires before any state is touched. The K=1
+    /// fit path is therefore byte-for-byte unchanged.
+    pub(crate) fn enforce_decoder_norm_guard(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        iteration: usize,
+        rho: &SaeManifoldRho,
+    ) -> Result<(), String> {
+        let n = self.n_obs();
+        let k = self.k_atoms();
+        // A single atom has no dictionary peer to be distinct from, so the
+        // decoder-incoherence failure mode this guard catches cannot exist;
+        // returning here keeps the K=1 path untouched.
+        if n == 0 || k < 2 {
+            return Ok(());
+        }
+        let mut norms = vec![0.0_f64; k];
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let mut acc = 0.0_f64;
+            for &value in atom.decoder_coefficients.iter() {
+                acc += value * value;
+            }
+            norms[atom_idx] = acc.sqrt();
+        }
+        // Median decoder norm: the robust dictionary scale. (A mean would let a
+        // few large atoms mask a cluster of collapsed ones.)
+        let mut sorted = norms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if k % 2 == 1 {
+            sorted[k / 2]
+        } else {
+            0.5 * (sorted[k / 2 - 1] + sorted[k / 2])
+        };
+        // No usable scale (every decoder is ≈0, e.g. the cold-start zero seed):
+        // the joint solve has not yet placed any signal, so there is nothing to
+        // be "behind"; defer to the mass guard / inner solve rather than reseed
+        // against an all-zero reference.
+        if !(median > 0.0) {
+            return Ok(());
+        }
+        let floor = SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO * median;
+        let mut breached: Vec<usize> = Vec::new();
+        for atom in 0..k {
+            if norms[atom] < floor {
+                breached.push(atom);
+            }
+        }
+        if breached.is_empty() {
+            return Ok(());
+        }
+        // Re-diversify every breached atom's coordinates onto a distinct,
+        // currently-unexplained PC pair of the reconstruction residual BEFORE
+        // the joint decoder LSQ, so the reseeded design column is non-constant
+        // and the LSQ hands the atom genuine residual signal (a collapsed atom
+        // re-fit on its still-degenerate constant coordinate would only recover
+        // the residual mean and re-collapse).
+        let mut reseeded_any = false;
+        for &atom in &breached {
+            let reseeds_used = self
+                .collapse_events
+                .iter()
+                .filter(|e| e.atom == atom && e.action == CollapseAction::Reseeded)
+                .count();
+            if reseeds_used < SAE_ATOM_COLLAPSE_RESEED_BUDGET {
+                self.reseed_collapsed_atom_decoder(atom, target, rho)?;
+                self.reseed_collapsed_atom_logits(atom);
+                self.collapse_events.push(CollapseEvent {
+                    iteration,
+                    atom,
+                    max_active_mass: norms[atom] / median,
+                    floor: SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO,
+                    action: CollapseAction::Reseeded,
+                });
+                reseeded_any = true;
+            } else {
+                let already_terminal = self
+                    .collapse_events
+                    .iter()
+                    .any(|e| e.atom == atom && e.action == CollapseAction::Terminal);
+                if !already_terminal {
+                    self.collapse_events.push(CollapseEvent {
+                        iteration,
+                        atom,
+                        max_active_mass: norms[atom] / median,
+                        floor: SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO,
+                        action: CollapseAction::Terminal,
+                    });
+                }
+            }
+        }
+        // One joint least-squares decoder refit at the re-diversified state
+        // gives every atom — the reseeded ones especially — a fresh,
+        // non-degenerate decoder that distributes the available signal across
+        // the dictionary. Cheap (one n×ΣM_k design solve) and run at most once
+        // per outer iteration, only when an atom actually breached.
+        if reseeded_any {
+            self.refit_decoder_least_squares_at_current_state(target, Some(rho))?;
+        }
+        Ok(())
+    }
+
+    /// Re-diversify one collapsed atom's latent coordinates onto a distinct
+    /// principal direction of the current reconstruction residual `R = fitted −
+    /// target`, so the atom is pointed at signal the rest of the dictionary has
+    /// not yet explained. The residual is what an additional atom *should*
+    /// capture, and seeding off its PCs places the atom in a region orthogonal
+    /// to the current fit — exactly the decorrelating seed (#671) the joint LSQ
+    /// then turns into a non-zero, distinct decoder. The decoder itself is left
+    /// for the caller's joint LSQ refit; only this atom's coordinates and basis
+    /// caches move here.
+    pub(crate) fn reseed_collapsed_atom_decoder(
+        &mut self,
+        atom: usize,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<(), String> {
+        let residual = self.reconstruction_residual(target, rho)?;
+        let basis_kind = self.atoms[atom].basis_kind.clone();
+        let d = self.atoms[atom].latent_dim;
+        // Reuse the single production PCA-seed code path (the #671 disjoint-PC
+        // seeding) on the residual, asking it for ONE atom so there is exactly
+        // one seeding rule and the residual-PC diversification stays identical
+        // to the cold-start one. The seed is computed for atom slot 0 of a
+        // single-atom request and copied onto this atom's coordinate values.
+        let seeded = sae_pca_seed_initial_coords(residual.view(), &[basis_kind], &[d])?;
+        let n = self.n_obs();
+        let mut flat = Array1::<f64>::zeros(n * d);
+        for row in 0..n {
+            for axis in 0..d {
+                flat[row * d + axis] = seeded[[0, row, axis]];
+            }
+        }
+        self.assignment.coords[atom].set_flat(flat.view());
+        let coords = self.assignment.coords[atom].as_matrix();
+        self.atoms[atom].refresh_basis(coords.view())?;
+        Ok(())
+    }
+
     pub(crate) fn apply_newton_step_impl(
         &mut self,
         delta_ext_coord: ArrayView1<'_, f64>,
@@ -2413,6 +2578,12 @@ impl SaeManifoldTerm {
         // search's signal, not the inner loop's. Genuinely degenerate bases
         // (zero rows regardless of gates) still fail the audit — correctly.
         self.enforce_active_mass_guard(0, Some(rho))?;
+        // #976 decoder arm at entry: if a warm-started decoder arrives already
+        // collapsed (e.g. a ρ-sweep state seeded from a prior degenerate fit),
+        // reseed it before the audit. An all-zero cold seed has a zero median
+        // decoder norm, so the guard returns early and the cold-start path is
+        // untouched.
+        self.enforce_decoder_norm_guard(target, 0, rho)?;
         // ── Pre-fit decoder identifiability audit ──────────────────────────
         //
         // Each decoder atom `k` contributes `η_i += a_ik · Φ_k(t_ik) · B_k`,
@@ -2696,6 +2867,13 @@ impl SaeManifoldTerm {
             // line-search trial, and any re-seed is simply the next
             // iteration's starting state.
             self.enforce_active_mass_guard(outer_iteration, Some(rho))?;
+            // #976 Layer-1 guard 3b (decoder arm): the gate-mass guard above is
+            // blind to a dictionary whose gates stay spread but whose decoders
+            // have all collapsed to ≈0 (the real-data K>1 failure that drives
+            // EV→0 and the `0 → K·n` evidence-deflation abort). Catch a decoder
+            // that has fallen far behind its peers and reseed it onto the
+            // residual; a strict no-op for K=1.
+            self.enforce_decoder_norm_guard(target, outer_iteration, rho)?;
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step
             // (lifted through the OLD frames in `apply_newton_step`), re-polar each

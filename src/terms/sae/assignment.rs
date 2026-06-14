@@ -40,6 +40,21 @@ pub(crate) const SAE_ATOM_ACTIVE_MASS_FLOOR: f64 = 1.0e-3;
 /// to adjudicate — re-seeding in a loop would fight the optimizer.
 pub(crate) const SAE_ATOM_COLLAPSE_RESEED_BUDGET: usize = 1;
 
+/// #976 Layer-1 guard (decoder arm): an atom whose decoder block Frobenius norm
+/// has fallen to this fraction of the dictionary's MEDIAN decoder norm carries
+/// no material reconstruction signal — it has degenerated to (near-)zero output
+/// and decodes the same nothing as every other collapsed atom. This is the
+/// real-data K>1 failure that the gate-mass floor cannot see: the assignment
+/// gates can stay spread across rows (mass guard satisfied) while the decoders
+/// all collapse to ~0, giving EV≈0 and a rank-deficient per-row coordinate
+/// Hessian on every row (the 0→K·n evidence-deflation jump). The statistic is a
+/// RATIO to the dictionary median so it is scale-free and never fires for a
+/// uniformly-small but well-conditioned decoder; only an atom that has fallen
+/// far behind its peers is caught. By construction this is a no-op for K=1
+/// (a single atom has no peer to fall behind, and the median equals its own
+/// norm), so the K=1 path is byte-for-byte unchanged.
+pub(crate) const SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO: f64 = 1.0e-3;
+
 /// Machine-precision support cutoff for the smooth JumpReLU assignment prior,
 /// in units of the gate temperature below the hard threshold. The forward gate
 /// remains hard-zero at and below `threshold`, but the prior value/gradient and

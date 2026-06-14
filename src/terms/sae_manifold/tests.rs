@@ -172,14 +172,18 @@ use super::*;
         SaeManifoldTerm::new(vec![atom], assignment).unwrap()
     }
 
-    /// The #1037 quotient-dimension guard: the recorded count of gauge-deflated
-    /// evidence directions must be CONSTANT across a single optimization. The
-    /// first observation pins the expected count; a later observation that
-    /// matches is a no-op; a later observation that DIFFERS is a structural
-    /// quotient-dimension change and must error loudly (comparing Laplace
-    /// normalizers across a changed null-space is meaningless).
+    /// The #1037 quotient-dimension guard (re-anchoring semantics): the recorded
+    /// count of gauge-deflated evidence directions need not be CONSTANT — a
+    /// legitimate quotient-dimension event (atom birth / #976 reseed /
+    /// rank-reduction) moves it, and each such change is evidence-preserving (a
+    /// deflated direction contributes `log 1 = 0` to `½log|H|` either way). The
+    /// guard therefore RE-ANCHORS the comparison to the new dimension instead of
+    /// aborting, so cross-ρ comparisons within the optimization stay consistent.
+    /// The genuine pathology it must still catch is a count that NEVER
+    /// STABILIZES: re-anchors beyond the per-atom structural-event budget mean
+    /// the quotient dimension is runaway, which is refused loudly.
     #[test]
-    pub(crate) fn evidence_gauge_deflation_count_guard_tolerates_flicker_rejects_structural_jump() {
+    pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runaway() {
         let mut term = trivial_k1_euclidean_term();
         assert!(term.expected_evidence_gauge_deflated_directions.is_none());
 
@@ -191,28 +195,29 @@ use super::*;
         term.record_evidence_gauge_deflation_count(5).unwrap();
         assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
 
-        // #1117: even with the basis-layer rank-revealing reduction, a single
-        // near-cutoff per-row H_tt eigenvalue can still cross the spectral floor
-        // across the ρ-walk, flickering the summed count by ±1. The strict guard
-        // refused the seed for that ±1, dropping the production K=1 path into the
-        // slow homotopy cascade (~10 min vs ~65 s). A bounded ±1 flicker now
-        // RE-ANCHORS the expected count instead of refusing.
-        term.record_evidence_gauge_deflation_count(6).unwrap();
+        // K=1 ⇒ re-anchor budget = 1·(RESEED_BUDGET + 1) + 1 = 3 legitimate
+        // quotient-dimension events. Each DIFFERING observation (any magnitude:
+        // the #1037 invariant is dimension-consistency of the comparison, not a
+        // ±1 flicker band) re-anchors the expected count and stays Ok while
+        // under budget.
+        term.record_evidence_gauge_deflation_count(6).unwrap(); // re-anchor 1
         assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(6));
-        term.record_evidence_gauge_deflation_count(5).unwrap();
-        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
+        term.record_evidence_gauge_deflation_count(9).unwrap(); // re-anchor 2 (a larger jump still re-anchors)
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(9));
+        term.record_evidence_gauge_deflation_count(7).unwrap(); // re-anchor 3 (at budget)
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(7));
 
-        // A change LARGER than the flicker band is a genuine structural
-        // quotient-dimension event → loud error (#1037 invariant preserved).
+        // A FOURTH re-anchor exceeds the budget: the count is not stabilizing →
+        // loud error (#1037 invariant preserved as a runaway-quotient guard).
         let err = term
             .record_evidence_gauge_deflation_count(8)
-            .expect_err("a structural deflation-count jump must error");
+            .expect_err("a runaway quotient dimension must error past the re-anchor budget");
         assert!(
-            err.contains("deflation count changed"),
-            "guard must report the quotient-dimension change explicitly; got: {err}"
+            err.contains("not stabilizing") && err.contains("re-anchored"),
+            "guard must report the runaway re-anchoring explicitly; got: {err}"
         );
-        // The expected count is NOT re-anchored on a structural refusal.
-        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
+        // The expected count is NOT re-anchored on a runaway refusal.
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(7));
     }
 
     /// The identity-homotopy shortcut's structural probe: the η dial is inert
@@ -1173,6 +1178,99 @@ use super::*;
         );
     }
 
+    /// #976 decoder arm (prevention): a K>1 fit whose second atom's decoder has
+    /// collapsed to ≈0 — gates still spread, so the gate-mass guard is satisfied
+    /// — is caught by [`SaeManifoldTerm::enforce_decoder_norm_guard`], which
+    /// reseeds the collapsed atom onto the reconstruction residual and re-fits
+    /// the decoders so the atom recovers a NON-degenerate, DISTINCT decoder.
+    /// This is the disease the real-data K=2/K=3 OLMo fits hit (every decoder →
+    /// 0 ⇒ EV=0 ⇒ every per-row H_tt gauge-flat ⇒ the 0→K·n deflation abort).
+    #[test]
+    pub(crate) fn decoder_norm_guard_reseeds_collapsed_atom_to_distinct_nonzero() {
+        let (term0, target, rho) = small_two_atom_periodic_term();
+        let mut term = term0.clone();
+        // Collapse atom 1's decoder to ≈0 while leaving its assignment gates
+        // spread (the mass guard sees nothing wrong). Atom 0 keeps its signal.
+        term.atoms[1].decoder_coefficients.fill(0.0);
+        term.atoms[1].refresh_intrinsic_smooth_penalty();
+
+        let norm = |a: &SaeManifoldAtom| -> f64 {
+            a.decoder_coefficients.iter().map(|v| v * v).sum::<f64>().sqrt()
+        };
+        assert!(norm(&term.atoms[1]) < 1e-12, "atom 1 starts collapsed");
+
+        term.enforce_decoder_norm_guard(target.view(), 0, &rho)
+            .expect("decoder-norm guard must not error on a recoverable collapse");
+
+        // The guard recorded a Reseeded collapse event for the collapsed atom.
+        let reseeded = term
+            .collapse_events()
+            .iter()
+            .any(|e| e.atom == 1 && e.action == CollapseAction::Reseeded);
+        assert!(
+            reseeded,
+            "collapsed atom 1 must be recorded as Reseeded; events: {:?}",
+            term.collapse_events()
+        );
+
+        // After the reseed + joint LSQ refit, atom 1 carries a non-degenerate
+        // decoder again (well above the collapse floor relative to atom 0).
+        let n1 = norm(&term.atoms[1]);
+        let n0 = norm(&term.atoms[0]);
+        assert!(
+            n0 > 0.0 && n1 > SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO * n0,
+            "reseeded atom 1 decoder must be non-degenerate: ‖B0‖={n0:.3e} ‖B1‖={n1:.3e}"
+        );
+
+        // The reseeded atom's coordinates are diversified (not a single
+        // collapsed constant), so its design column is non-degenerate.
+        let c1 = term.assignment.coords[1].as_matrix();
+        let (lo, hi) = c1
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        assert!(
+            hi - lo > 1e-6,
+            "reseeded atom 1 coordinates must span a non-trivial range; got [{lo}, {hi}]"
+        );
+
+        // The reseeded decoder is DISTINCT from atom 0's (not a duplicate): the
+        // residual-seeded coordinates point atom 1 at unexplained signal, so the
+        // two decoder column-spaces are not collinear.
+        let b0 = &term.atoms[0].decoder_coefficients;
+        let b1 = &term.atoms[1].decoder_coefficients;
+        let dot: f64 = b0.iter().zip(b1.iter()).map(|(x, y)| x * y).sum();
+        let cos = dot.abs() / (n0 * n1);
+        assert!(
+            cos < 0.999,
+            "reseeded atom 1 decoder must be distinct from atom 0 (|cos|={cos:.4})"
+        );
+    }
+
+    /// #976 decoder arm is a strict no-op for K=1: a single atom has no peer to
+    /// fall behind, so the guard must never reseed or record an event even when
+    /// the lone decoder is tiny. This pins the "K=1 path unchanged" guarantee.
+    #[test]
+    pub(crate) fn decoder_norm_guard_is_noop_for_k1() {
+        let mut term = trivial_k1_euclidean_term();
+        let n = term.n_obs();
+        let p = term.output_dim();
+        let target = Array2::<f64>::zeros((n, p));
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0_f64]]);
+        let before = term.atoms[0].decoder_coefficients.clone();
+        term.enforce_decoder_norm_guard(target.view(), 0, &rho)
+            .expect("K=1 decoder-norm guard must be a no-op, never error");
+        assert!(
+            term.collapse_events().is_empty(),
+            "K=1 must record no decoder-collapse events"
+        );
+        assert_eq!(
+            term.atoms[0].decoder_coefficients, before,
+            "K=1 decoder must be untouched by the guard"
+        );
+    }
+
     /// #1026 — the hybrid split is **load-bearing on the reconstruction**: a slot
     /// whose verdict selects LINEAR has its curved decoded image replaced by its
     /// fitted straight sub-model, and that substitution match-or-beats the
@@ -1653,7 +1751,8 @@ use super::*;
         );
         assert!(
             !SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-                "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count changed"
+                "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count re-anchored \
+                 4 times within one optimization; the quotient dimension is not stabilizing"
             )
         );
     }
