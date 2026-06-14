@@ -3455,7 +3455,6 @@ mod trust_region_subproblem_tests {
 
 
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_kkt_refusal_report(
     cycle: usize,
     states: &[ParameterBlockState],

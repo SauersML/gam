@@ -32,4 +32,3 @@
             result.warm_start,
         ))
     }
-}
