@@ -1831,8 +1831,6 @@ impl SaeManifoldTerm {
                 target.dim()
             ));
         }
-        let fitted = self.try_fitted_for_rho(rho)?;
-        let mut data_fit = 0.0_f64;
         // The likelihood whitens through the RowMetric **only** when the metric
         // is a genuinely estimated noise model (`metric.whitens_likelihood()`,
         // i.e. `WhitenedStructured` — the #974 residual-covariance seam). For
@@ -1851,7 +1849,6 @@ impl SaeManifoldTerm {
             .row_metric
             .as_ref()
             .is_some_and(|metric| metric.whitens_likelihood());
-        let mut resid_row = ndarray::Array1::<f64>::zeros(target.ncols());
         // #991 design honesty weights: the reconstruction channel of row `i`
         // is weighted by `w_i` (mean-1 HT inclusion correction). The assembly
         // applies the same `w_i` via a `√w_i` scaling of the row residual /
@@ -1859,24 +1856,87 @@ impl SaeManifoldTerm {
         // gradient/Hessian carry the identical per-row factor. `None` ⇒ the
         // historical unweighted sum, bit-for-bit.
         let row_loss_w = self.row_loss_weights.as_deref();
-        for row in 0..target.nrows() {
-            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
-            for out_col in 0..target.ncols() {
-                resid_row[out_col] = target[[row, out_col]] - fitted[[row, out_col]];
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        // #1017: the data-fit is the dominant per-line-search-trial cost (it
+        // re-runs every Armijo halving × every inner Newton iteration × every
+        // outer ρ evaluation). The old path materialised the whole `n × p`
+        // fitted matrix (`try_fitted_for_rho`) and then walked it AGAIN to form
+        // the residual sum — two sequential `n·p` passes plus an `n·p`
+        // allocation per trial. Fuse the reconstruction and the residual reduce
+        // into ONE row-parallel pass that never materialises the fitted matrix:
+        // each row decodes its atoms into per-worker scratch, differences
+        // against the target, and contributes its scalar `0.5·w·‖r‖²` to a
+        // chunk-ordered fold (bit-identical run-to-run). Per-worker scratch
+        // (`map_init`) keeps the only allocations one `g_buf`/`fitted_row` pair
+        // per rayon thread rather than per row. Stay sequential inside a worker
+        // (the topology race owns the outer pool) to avoid nested
+        // oversubscription.
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let row_data_fit = |row: usize, g_buf: &mut [f64], fitted_row: &mut [f64]| -> Result<f64, String> {
+            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            for slot in fitted_row.iter_mut() {
+                *slot = 0.0;
             }
+            for atom_idx in 0..k_atoms {
+                self.atoms[atom_idx].fill_decoded_row(row, g_buf);
+                let a_k = a[atom_idx];
+                for out_col in 0..p {
+                    fitted_row[out_col] += a_k * g_buf[out_col];
+                }
+            }
+            for out_col in 0..p {
+                fitted_row[out_col] = target[[row, out_col]] - fitted_row[out_col];
+            }
+            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
+            let mut acc = 0.0_f64;
             match self.row_metric.as_ref() {
                 Some(metric) if whitens => {
-                    for w in metric.whiten_residual_row(row, resid_row.view()) {
-                        data_fit += 0.5 * w_row * w * w;
+                    let resid = ArrayView1::from(&fitted_row[..p]);
+                    for w in metric.whiten_residual_row(row, resid) {
+                        acc += 0.5 * w_row * w * w;
                     }
                 }
                 _ => {
-                    for &r in resid_row.iter() {
-                        data_fit += 0.5 * w_row * r * r;
+                    for &r in fitted_row[..p].iter() {
+                        acc += 0.5 * w_row * r * r;
                     }
                 }
             }
-        }
+            Ok(acc)
+        };
+        let data_fit = if parallel {
+            use rayon::prelude::*;
+            const CHUNK: usize = 32;
+            let partials: Vec<Result<f64, String>> = (0..n)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map_init(
+                    || (vec![0.0_f64; p], vec![0.0_f64; p]),
+                    |(g_buf, fitted_row), idxs| {
+                        let mut acc = 0.0_f64;
+                        for row in idxs {
+                            acc += row_data_fit(row, g_buf, fitted_row)?;
+                        }
+                        Ok(acc)
+                    },
+                )
+                .collect();
+            let mut total = 0.0_f64;
+            for partial in partials {
+                total += partial?;
+            }
+            total
+        } else {
+            let mut g_buf = vec![0.0_f64; p];
+            let mut fitted_row = vec![0.0_f64; p];
+            let mut total = 0.0_f64;
+            for row in 0..n {
+                total += row_data_fit(row, &mut g_buf, &mut fitted_row)?;
+            }
+            total
+        };
         let assignment_sparsity = assignment_prior_value(&self.assignment, rho);
         let smoothness = penalty_scale * self.decoder_smoothness_value(rho.lambda_smooth());
         let ard = self.ard_value(rho)?;

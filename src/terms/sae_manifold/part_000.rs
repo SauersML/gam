@@ -147,6 +147,13 @@ const CURVATURE_WALK_MAX_CORRECTORS: usize = 32;
 const SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR: f64 = 1.0e-14;
 
 
+/// Row count at or above which the fused SAE reconstruction data-fit
+/// (`loss_scaled`) fans its per-row decode + residual reduction out over
+/// rayon. Below this the single-threaded fused pass is cheaper than the
+/// fan-out; matched in spirit to the arrow-Schur `SCHUR_MATVEC_PARALLEL_ROW_MIN`
+/// gate so short batches inside an outer fan-out stay sequential (#1017).
+const SAE_LOSS_PARALLEL_ROW_MIN: usize = 64;
+
 /// Relative tolerance on the undamped Newton step norm (scaled by the iterate
 /// scale) for accepting inner-solve convergence.
 const SAE_MANIFOLD_INNER_STEP_REL_TOL: f64 = 1.0e-4;
