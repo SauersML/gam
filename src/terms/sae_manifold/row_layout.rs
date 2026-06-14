@@ -16,8 +16,13 @@ pub(crate) const JUMPRELU_REACTIVATION_MARGIN: f64 = 4.0;
 /// logit is above the reactivation band's lower edge `threshold − MARGIN·τ`.
 /// This is strictly weaker than the hard forward gate `logit > threshold`,
 /// which still governs data-fit reconstruction and its logit JVP.
+// Module-private: an identical `jumprelu_in_optimization_band` lives in
+// `crate::terms::sae::assignment` (the canonical crate-wide export). Both were
+// glob-re-exported from sae_manifold.rs, which collided; this copy is only used
+// locally below, so keeping it private removes the ambiguity without changing
+// behavior (#780-split duplicate).
 #[inline]
-pub(crate) fn jumprelu_in_optimization_band(logit: f64, threshold: f64, temperature: f64) -> bool {
+fn jumprelu_in_optimization_band(logit: f64, threshold: f64, temperature: f64) -> bool {
     logit > threshold - JUMPRELU_REACTIVATION_MARGIN * temperature
 }
 /// Per-row active-set layout for sparse SAE assignment (any mode).
