@@ -10,8 +10,12 @@
 //!
 //! Unlike the old compiled-row path, the cumulative masses and baseline hazard
 //! are rebuilt inside the optimizer from the current time-basis coefficients.
-//! The current family-level fit surface uses exact events and right censoring;
-//! interval-censored rows exist at the kernel layer but are not exposed here.
+//! The family-level fit surface supports exact events, right censoring, and
+//! interval censoring `T ∈ (L, R]` (contribution `log[S(L) − S(R)]`). Interval
+//! rows carry the reserved [`LATENT_SURVIVAL_EVENT_INTERVAL`] event code and a
+//! dedicated upper-bound time channel (`time_design_right` / `q_right`); the
+//! 3-way event dispatch is [`latent_survival_event_type_for`]. Reached from the
+//! formula DSL via `SurvInterval(L, R, event) ~ ...`.
 
 use crate::estimate::UnifiedFitResult;
 use crate::families::custom_family::{
