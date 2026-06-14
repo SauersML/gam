@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use crate::cache::Fingerprinter;
 
-use crate::linalg::faer_ndarray::{FaerArrayView, FaerLlt};
+use crate::linalg::faer_ndarray::{FaerArrayView, FaerEigh, FaerLlt};
+use faer::Side;
 
 use crate::linalg::triangular::{
     cholesky_solve_matrix, cholesky_solve_vector, forward_substitution_lower_matrix,
@@ -2435,6 +2436,106 @@ fn factor_gauge_deflated_evidence_row(
 }
 
 
+/// Relative spectral floor (vs the block's largest-magnitude eigenvalue) below
+/// which a per-row `H_tt` eigen-direction is treated as non-identified and
+/// unit-stiffness deflated rather than ridge-damped. Matches the magnitude of
+/// the gauge Rayleigh qualifier and the `SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF`
+/// data-null detection so the three deflation paths agree on what "flat" means.
+const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
+
+
+/// Unit-stiffness **spectral** Faddeev-Popov conditioning of a per-row evidence
+/// block `H_tt` that the undamped Cholesky refused because it is genuinely
+/// indefinite or numerically flat off the closed-form gauge orbit.
+///
+/// This is the spectral sibling of [`factor_gauge_deflated_evidence_row`]: that
+/// one deflates a SUPPLIED orbit direction (the circle rotation gauge, etc.);
+/// this one DISCOVERS the offending directions from the block's own symmetric
+/// eigendecomposition, for the case (#1117/#1118, K>1 IBP/softmax row-sharing)
+/// where the logit×coordinate Gauss-Newton cross term drives an eigenvalue of
+/// `H_tt` negative (or to a numerically-flat near-zero) at a direction that is
+/// NOT a known gauge vector. `d ≤ 3` here so the eigendecomposition is trivial.
+///
+/// Each eigenvalue at or below `floor = SPECTRAL_DEFLATION_REL_FLOOR · max|λ|`
+/// (this INCLUDES every negative eigenvalue) is replaced by exactly `+1` while
+/// its eigenvector is preserved; the strictly-positive, well-separated
+/// directions are reconstructed bit-for-bit (`Σ λ_i v_i v_iᵀ`). The result is
+/// SPD by construction, so the Cholesky succeeds and the evidence log-det is
+/// finite.
+///
+/// The stiffness is UNIT (`+1`), not `max|λ|` and not `ridge·I`: a deflated
+/// direction therefore contributes exactly `log 1 = 0` to `log|H|`, with ZERO
+/// θ/ρ dependence — the same quotient pseudo-determinant convention the gauge
+/// deflation (κ=1) and the #1117 data-null projector use. This is what makes
+/// the value and the analytic outer ρ-gradient consistent: a ridge fallback
+/// (`+ridge·I`) injects a ρ-dependent bias `½·log|I + ridge·H_tt⁻¹|` into the
+/// VALUE that the analytic gradient (built for the undamped Laplace log-det)
+/// never sees, desyncing the outer line-search; unit-stiffness deflation has no
+/// such bias because the deflated direction's contribution is the ρ-independent
+/// constant `0`. Returns `None` only if the block is non-finite or the
+/// eigendecomposition fails (the caller then surfaces the hard refusal).
+fn factor_spectral_deflated_evidence_row(
+    row: &ArrowRowBlock,
+    d: usize,
+) -> Option<ArrowRowFactorResult> {
+    if d == 0 || row.htt.dim() != (d, d) {
+        return None;
+    }
+    // Symmetrise defensively before the eigendecomposition (the assembled
+    // block is symmetric up to reduction order; the eig routine assumes exact
+    // symmetry).
+    let mut sym = Array2::<f64>::zeros((d, d));
+    for i in 0..d {
+        for j in 0..d {
+            let v = 0.5 * (row.htt[[i, j]] + row.htt[[j, i]]);
+            if !v.is_finite() {
+                return None;
+            }
+            sym[[i, j]] = v;
+        }
+    }
+    let (evals, evecs) = sym.eigh(Side::Lower).ok()?;
+    let max_abs = evals
+        .iter()
+        .fold(0.0_f64, |acc, &v| if v.is_finite() { acc.max(v.abs()) } else { acc });
+    if !(max_abs.is_finite() && max_abs > 0.0) {
+        return None;
+    }
+    let floor = SPECTRAL_DEFLATION_REL_FLOOR * max_abs;
+    // Reconstruct `Σ_i λ̃_i v_i v_iᵀ`, replacing every sub-floor eigenvalue
+    // (negative included) with unit stiffness `+1` and keeping the genuine
+    // positive spectrum untouched.
+    let mut conditioned = Array2::<f64>::zeros((d, d));
+    let mut deflated_count = 0usize;
+    for eig_idx in 0..evals.len() {
+        let lambda = evals[eig_idx];
+        let lambda_tilde = if lambda.is_finite() && lambda > floor {
+            lambda
+        } else {
+            deflated_count += 1;
+            1.0
+        };
+        for i in 0..d {
+            let vi = evecs[[i, eig_idx]];
+            for j in 0..d {
+                conditioned[[i, j]] += lambda_tilde * vi * evecs[[j, eig_idx]];
+            }
+        }
+    }
+    if deflated_count == 0 {
+        // Nothing was flat/indefinite: this block should have factored at the
+        // base ridge. Decline so the caller keeps the exact-Cholesky path
+        // rather than silently re-deriving a (bit-different) reconstruction.
+        return None;
+    }
+    let factor = cholesky_lower(&conditioned).ok()?;
+    Some(ArrowRowFactorResult {
+        factor,
+        gauge_deflated_directions: deflated_count,
+    })
+}
+
+
 fn cholesky_solve_vector_fixed<const D: usize>(
     l: ArrayView2<'_, f64>,
     b: ArrayView1<'_, f64>,
@@ -2618,6 +2719,27 @@ fn factor_one_row_result(
                             // criterion null direction, contributing nothing to
                             // the Laplace normalizer). Zero theta/rho dependence,
                             // so criterion derivatives stay exact on the quotient.
+                            return Ok(deflated);
+                        }
+                        // #1117/#1118 — the offending direction is NOT a supplied
+                        // gauge vector: under K>1 IBP/softmax row-sharing the
+                        // logit×coordinate Gauss-Newton cross term drives an
+                        // eigenvalue of this row's H_tt negative (or numerically
+                        // flat) at a direction the closed-form gauge orbit does
+                        // not span. DISCOVER it from the block's own symmetric
+                        // eigendecomposition and deflate it at the SAME unit
+                        // stiffness (eigenvalue → +1), so its evidence
+                        // contribution is the ρ-independent constant log 1 = 0.
+                        // This replaces the previous ridge-damped evidence
+                        // fallback, whose ½·log|I + ridge·H_tt⁻¹| bias was
+                        // ρ-DEPENDENT and therefore desynced the outer REML value
+                        // (which saw it) from the analytic ρ-gradient (built for
+                        // the undamped Laplace log-det, which did not) — the
+                        // multi-atom outer line-search non-convergence (#1117).
+                        // The undamped exact Cholesky still owns every genuinely
+                        // PD block (this arm is reached only on a refused factor),
+                        // so K=1 and any PD K>1 row are bit-for-bit unchanged.
+                        if let Some(deflated) = factor_spectral_deflated_evidence_row(row, d) {
                             return Ok(deflated);
                         }
                     }
