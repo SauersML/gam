@@ -2621,6 +2621,52 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mut solved = run_exact_joint_spatial!()
         .map_err(|err| format!("exact two-block spatial optimization failed: {err}"))?;
 
+    // #1082 gaulss under-recovery diagnostic: surface the REML-selected per-block
+    // smoothing parameter (log-λ = ρ) and the realized effective df, split into
+    // the MEAN block's penalties and the SCALE (log-σ) block's penalties. If the
+    // mean tensor is over-smoothed (RMSE(mu) too high), this prints a large
+    // mean-block ρ and a small mean EDF — pinpointing whether the joint
+    // location-scale REML criterion selects the mean-λ too high. Penalty order in
+    // `lambdas` / `edf_by_block` is mean-block penalties first, then scale-block
+    // (the build order in `build_two_block_exact_joint_setup`); we split at the
+    // mean design's penalty count.
+    {
+        let n_mean_pen = solved.designs[0].penalties.len();
+        let lambdas = solved.fit.lambdas.as_slice().unwrap_or(&[]);
+        let log_lambdas = solved.fit.log_lambdas.as_slice().unwrap_or(&[]);
+        let edf = solved
+            .fit
+            .inference
+            .as_ref()
+            .map(|inf| inf.edf_by_block.as_slice())
+            .unwrap_or(&[]);
+        let fmt = |s: &[f64]| -> String {
+            s.iter()
+                .map(|v| format!("{v:.4}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let split = |s: &[f64]| -> (Vec<f64>, Vec<f64>) {
+            let cut = n_mean_pen.min(s.len());
+            (s[..cut].to_vec(), s[cut..].to_vec())
+        };
+        let (mean_rho, scale_rho) = split(log_lambdas);
+        let (mean_lam, scale_lam) = split(lambdas);
+        let (mean_edf, scale_edf) = split(edf);
+        eprintln!(
+            "[gaulss-lambda-diag] n_mean_pen={n_mean_pen} reml_score={:.6e}\n  \
+             MEAN  rho(log-lambda)=[{}] lambda=[{}] edf=[{}]\n  \
+             SCALE rho(log-lambda)=[{}] lambda=[{}] edf=[{}]",
+            solved.fit.reml_score,
+            fmt(&mean_rho),
+            fmt(&mean_lam),
+            fmt(&mean_edf),
+            fmt(&scale_rho),
+            fmt(&scale_lam),
+            fmt(&scale_edf),
+        );
+    }
+
     let expected_noise_penalty_count = builder.noise_penalty_count(&solved.designs[1]);
     let actual_noise_penalty_count = solved.designs[1].penalties.len();
     if expected_noise_penalty_count > actual_noise_penalty_count {
