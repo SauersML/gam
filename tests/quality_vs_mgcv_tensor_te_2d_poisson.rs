@@ -248,13 +248,17 @@ fn gam_tensor_te_2d_poisson_matches_mgcv_on_real_data() {
     let mut train_ds = ds.clone();
     train_ds.values = train_values;
 
-    // ---- fit gam on TRAIN: numvisit ~ te(age, badh, k=5), Poisson / log -----
-    // badh is binary, so it gets a tiny basis; the smooth structure is in age.
+    // ---- fit gam on TRAIN: numvisit ~ te(age, badh, k=[5, 2]), Poisson/log ---
+    // `badh` is BINARY {0,1} (exactly 2 unique values), so its tensor margin can
+    // hold at most a 2-function (linear-across-the-two-levels) basis. We give it
+    // k=2 explicitly and let the continuous `age` margin carry the smooth shape
+    // at k=5. This mirrors the per-margin k=c(5,2) the mgcv reference uses below,
+    // keeping both fits on the SAME tensor basis dimensions (apples-to-apples).
     let cfg = FitConfig {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("numvisit ~ te(age, badh, k=5)", &train_ds, &cfg)
+    let result = fit_from_formula("numvisit ~ te(age, badh, k=[5, 2])", &train_ds, &cfg)
         .expect("gam poisson te fit on badhealth");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for Poisson te(age, badh)");
@@ -288,11 +292,15 @@ fn gam_tensor_te_2d_poisson_matches_mgcv_on_real_data() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        # badh is binary {0,1}, so its cubic-regression margin can hold at most
-        # k=2 knots; age is continuous (41 distinct values) and takes k=5. Per-
-        # margin k avoids mgcv's place.knots failing on the 2-value badh margin
-        # while keeping the same effective basis gam builds (tiny basis on badh).
-        m <- gam(numvisit ~ te(age, badh, k = c(5, 2)), data = df,
+        # badh is BINARY {0,1} (exactly 2 unique values), so its tensor margin can
+        # hold at most a 2-function basis. mgcv's default `cr` (cubic-regression)
+        # margin has a hard minimum of k=3 and would REJECT k=2 ("k too small -
+        # reset to default") then fail constructing 5 knots on a 2-value covariate.
+        # A thin-plate (`tp`) margin DOES support k=2, giving exactly the linear-
+        # across-the-two-levels effect that fully represents a binary covariate.
+        # age is continuous and keeps the smooth `cr` margin at k=5. The resulting
+        # tensor basis dimensions c(5, 2) match the gam side (apples-to-apples).
+        m <- gam(numvisit ~ te(age, badh, bs = c("cr", "tp"), k = c(5, 2)), data = df,
                  family = poisson(link = "log"), method = "REML")
         k <- df$test_n[1]
         newd <- data.frame(age = df$test_age[1:k], badh = df$test_badh[1:k])
