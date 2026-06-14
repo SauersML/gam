@@ -2835,6 +2835,36 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         format!("{q:.3e}")
                     })
                     .collect();
+                // Convergence-gate trace (gam#979 endgame): the range-space
+                // (identified-subspace) residual, the Newton decrement, and the
+                // residual/objective tolerances + gate booleans. After the PSD
+                // fix the solve is stationary (objective flat) but the absolute
+                // KKT residual plateaus above tol on the penalty-null affine
+                // direction; this surfaces exactly which certificate is being
+                // denied so we scale the right gate.
+                let range_residual_diag = projected_residual_range_space_inf(
+                    &projected_residual_vec,
+                    &joint_hessian_source,
+                    &ranges,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                    total_p,
+                );
+                let decrement_diag = joint_spectrum
+                    .as_ref()
+                    .map(|spectrum| spectrum.newton_decrement());
+                log::info!(
+                    "[JN-CONV-DIAG #979] cycle={cycle} resid={residual:.3e} residual_tol={residual_tol:.3e} range_residual={range_residual_diag:?} newton_decrement={decrement_diag:?} all_block_stationarity_small={all_block_stationarity_small} block_stat_norms={:?} block_stat_tols={:?}",
+                    block_stationarity_norms
+                        .iter()
+                        .map(|v| format!("{v:.3e}"))
+                        .collect::<Vec<_>>(),
+                    block_stationarity_tolerances
+                        .iter()
+                        .map(|v| format!("{v:.3e}"))
+                        .collect::<Vec<_>>(),
+                );
                 log::info!(
                     "[JN-GRAD-DIAG #979] cycle={cycle} obj={:.6e} current_penalty={:.6e} block0_quad_penalty={:.6e} s0_max_abs={:.3e} s0_min_eval={:.3e} block0_n_penalties={} per_penalty_quad(betaᵀS_k beta)={:?} raw_block_grad_inf={:?} proj_block_resid={:?} block_penalty_inf={:?} active_sizes={:?} block0_beta=[{:.3e},{:.3e}] beta_inf={:.3e} resid={:.3e}",
                     lastobjective,
