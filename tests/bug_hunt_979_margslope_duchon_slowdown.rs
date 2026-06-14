@@ -1,4 +1,4 @@
-//! Repro for #979 (the ACTUAL failing case from gamfit 0.1.199): the binary
+//! Repro for #979 (the ACTUAL failing case from gamfit 0.1.200): the binary
 //! Bernoulli marginal-slope arm over a **pure Duchon** spatial basis became
 //! pathologically slow, while the *identical* Duchon basis fitting a plain
 //! Gaussian smooth completed in ~2s.
@@ -157,7 +157,7 @@ fn build_margslope(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalS
 }
 
 /// #979 binary-arm regression guard: bernoulli marginal-slope over a pure
-/// Duchon basis (the actual gamfit 0.1.199 failing case). At n=2000, centers=10,
+/// Duchon basis (the actual gamfit 0.1.200 failing case). At n=2000, centers=10,
 /// d=2 this timed out at 600s. Asserts the full fit completes under a generous
 /// wall budget. While the bug is unfixed this test is slow/fails — the
 /// coordinator's fix makes it pass.
