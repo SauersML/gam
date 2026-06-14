@@ -4261,7 +4261,18 @@ pub fn blockwise_fit_from_parts(
         fitted_link: FittedLinkState::Standard(None),
         geometry,
         block_states,
-        pirls_status: crate::pirls::PirlsStatus::Converged,
+        // Report the inner status honestly from the threaded `outer_converged`
+        // flag rather than hardcoding `Converged`. When the outer optimization
+        // did not converge (e.g. it escalated to posterior sampling), surface
+        // `StalledAtValidMinimum` — the same non-converged-but-usable bucket the
+        // smooth-term path maps to — so downstream consumers
+        // (`pirls_status.is_converged()`, `outer_converged` derivation) do not
+        // report a non-converged fit as converged.
+        pirls_status: if outer_converged {
+            crate::pirls::PirlsStatus::Converged
+        } else {
+            crate::pirls::PirlsStatus::StalledAtValidMinimum
+        },
         max_abs_eta: 0.0,
         constraint_kkt: None,
         artifacts: crate::solver::estimate::FitArtifacts {

@@ -990,8 +990,11 @@ use thiserror::Error;
 /// the smoothing-correction propagation step. It does NOT enter the LAML
 /// objective, its gradient, the saved coefficients, or any user-visible
 /// summary — the rho-Hessian itself is recomputed from first principles
-/// in every place that consults it. The canonical ledger record is
-/// `StabilizationLedger::numerical_perturbation(LAML_RIDGE, FixedConstant, None)`.
+/// in every place that consults it. Classified as
+/// [`crate::types::StabilizationKind::NumericalPerturbation`]; no ledger
+/// record is emitted at this site because the perturbation never escapes the
+/// local `V_rho` inverse (it touches no saved coefficient, objective, or
+/// user-visible summary).
 const LAML_RIDGE: f64 = 1e-8;
 /// Minimum penalized deviance floor.
 pub(crate) const DP_FLOOR: f64 = 1e-12;
@@ -4912,7 +4915,17 @@ where
                 };
                 if let Ok(f) = candidate.factorize() {
                     if ridge > 0.0 {
-                        log::warn!("Stabilized Hessian factorized with ridge {:.3e}", ridge,);
+                        // This ridged factor is reused for the reported standard
+                        // errors, covariance, and bias correction below, so those
+                        // quantities are stabilized approximations, not the exact
+                        // (unridged) Hessian-based values.
+                        log::warn!(
+                            "Inference Hessian was rank-deficient and required a stabilizing \
+                             ridge {:.3e}; reported standard errors, covariance, and bias \
+                             correction are computed from the ridge-stabilized factor and are \
+                             approximations, not exact unridged values",
+                            ridge,
+                        );
                     }
                     break f;
                 }

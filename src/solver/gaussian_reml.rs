@@ -2121,18 +2121,26 @@ pub fn build_gaussian_reml_eigen_cache_batched(
     if uniform_square && k > 1 {
         let mut lower_matrices = xtwx_matrices.clone();
         if crate::gpu::try_cholesky_batched_lower_inplace(&mut lower_matrices).is_some() {
-            let transforms =
-                batched_whitened_penalty_transforms(&lower_matrices, penalty).unwrap_or_default();
+            // The batched penalty transform is an optional accelerator. On
+            // failure we must NOT fabricate an empty Vec (indexing it per-block
+            // would silently drop the transform for every block and could index
+            // out of range) — instead route every block through the same
+            // no-GPU-transform path used when the batched transform is
+            // unavailable, which recomputes the whitened penalty on CPU from the
+            // already-valid Cholesky factor `lower`.
+            let transforms = batched_whitened_penalty_transforms(&lower_matrices, penalty);
             return lower_matrices
                 .into_iter()
                 .enumerate()
                 .map(|(b, lower)| {
+                    let precomputed_transform =
+                        transforms.as_ref().map(|t| t[b].clone());
                     gaussian_reml_eigen_cache_from_lower_with_transform(
                         lower,
                         penalty,
                         nullspace_dim,
                         fingerprints[b],
-                        transforms.get(b).cloned(),
+                        precomputed_transform,
                     )
                 })
                 .collect();
