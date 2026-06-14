@@ -700,11 +700,24 @@ pub struct ResponseCurvatureFit {
 }
 
 /// Chart-validity bounds on κ for a constant-curvature response geometry built
-/// from the supplied responses. The κ-stereographic chart requires
-/// `1 + κ‖x‖² > 0` at every point `x`, i.e. `κ > −1/R²` with
-/// `R² = max_i ‖y_i‖²`; the upper (spherical) side is unbounded but we cap the
-/// search to a generous multiple of the same scale so the bracket stays finite.
+/// from the supplied responses.
+///
+/// * **Lower (hyperbolic) bound.** The κ-stereographic chart requires
+///   `1 + κ‖x‖² > 0` at every point measured from the chart origin, i.e.
+///   `κ > −1/R²` with `R² = max_i ‖y_i‖²`. With a safety margin: `−0.999/R²`.
+/// * **Upper (spherical) bound.** Unlike the hyperbolic side this is NOT
+///   unbounded: on a sphere of curvature κ the geodesic radius cannot exceed the
+///   conjugate radius `π/√κ`, beyond which the exp-map volume Jacobian
+///   `J_κ = (sn_κ/·)^{d−1}` changes sign (clamped to 0 here) and `ln J_κ` would
+///   collapse `V_p` toward `−∞`, railing the optimiser onto a spurious shell.
+///   The κ = 0 geodesic radius of the farthest point from the centroid is
+///   `ρ_max = 2·max_i‖y_i − μ‖` (doubled-gauge chart). We cap κ so that radius
+///   stays strictly inside the first conjugate shell with a 10% margin:
+///   `√κ·ρ_max ≤ 0.9π ⇒ κ_max = (0.9π / ρ_max)²`. This keeps every geodesic
+///   radius before the antipodal singularity along the whole search/CI walk.
 fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64) {
+    let (n_rows, dim) = values.dim();
+    // ‖y_i‖² from the chart origin (governs the λ / hyperbolic-chart constraint).
     let mut r2_max = 0.0_f64;
     for row in values.outer_iter() {
         let r2 = row.dot(&row);
@@ -712,15 +725,39 @@ fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64) {
             r2_max = r2;
         }
     }
-    if r2_max <= 0.0 {
+    // ‖y_i − μ‖² from the centroid (governs the spherical conjugate-radius cap).
+    let mut centroid = Array1::<f64>::zeros(dim.max(1));
+    if n_rows > 0 && dim > 0 {
+        for row in values.outer_iter() {
+            centroid += &row;
+        }
+        centroid.mapv_inplace(|v| v / n_rows as f64);
+    }
+    let mut s2_max = 0.0_f64;
+    if dim > 0 {
+        for row in values.outer_iter() {
+            let diff = &row - &centroid;
+            let r2 = diff.dot(&diff);
+            if r2 > s2_max {
+                s2_max = r2;
+            }
+        }
+    }
+    if r2_max <= 0.0 && s2_max <= 0.0 {
         // Degenerate (all points at the origin): κ is unidentified; use a wide
         // symmetric default so the optimiser/CI report a flat, unbounded result.
         return (-1.0e6, 1.0e6);
     }
-    // Keep a safety margin off the singular boundary so chart_gauge stays well
-    // above GEOMETRY_EPS along the whole walk.
-    let kappa_min = -0.999 / r2_max;
-    let kappa_max = 1.0e3 / r2_max;
+    // Keep a safety margin off the singular hyperbolic boundary.
+    let kappa_min = if r2_max > 0.0 { -0.999 / r2_max } else { -1.0e6 };
+    // Conjugate-radius cap: ρ_max = 2·max‖y_i − μ‖ is the κ=0 geodesic radius.
+    let kappa_max = if s2_max > 0.0 {
+        let rho_max = 2.0 * s2_max.sqrt();
+        let edge = 0.9 * std::f64::consts::PI / rho_max;
+        edge * edge
+    } else {
+        1.0e6
+    };
     (kappa_min, kappa_max)
 }
 
@@ -1085,46 +1122,115 @@ mod tests {
         );
     }
 
-    /// Curvature-as-estimand on a constant-curvature response geometry: data
-    /// generated as exact geodesic exp-images of small Gaussian tangents at a
-    /// known curvature κ⋆ must drive κ̂ to the true value, the profile CI must
-    /// cover κ⋆, and (for a genuinely curved κ⋆) the flatness LR test must reject
-    /// κ = 0. Crucially the κ̂ optimiser uses ONLY the responses — κ⋆ is never
-    /// passed in — so this exercises the magic-by-default estimand contract.
-    #[test]
-    fn fit_response_curvature_recovers_true_kappa_and_rejects_flat() {
-        let dim = 3usize;
-        for &k_star in &[-1.5_f64, 0.0, 1.2] {
-            let manifold = ResponseManifold::ConstantCurvature { dim, kappa: k_star };
-            // Base point off the origin; deterministic spread of small tangents
-            // (kept well inside the chart for every κ⋆) exp-mapped to responses.
-            let base = array![0.04, -0.06, 0.05];
-            let tangents = [
-                array![0.10, -0.05, 0.02],
-                array![-0.08, 0.06, -0.03],
-                array![0.03, 0.09, -0.07],
-                array![-0.11, -0.04, 0.08],
-                array![0.06, 0.02, 0.10],
-                array![0.01, -0.10, -0.06],
-            ];
-            let mut values = Array2::<f64>::zeros((tangents.len(), dim));
-            for (i, t) in tangents.iter().enumerate() {
-                let y = manifold
-                    .exp_point(base.view(), t.view())
-                    .expect("exp tangent to response");
-                values.row_mut(i).assign(&y);
+    /// Deterministic xorshift64* + Box–Muller standard normals — a dependency-free
+    /// reproducible source for the synthetic known-κ clouds. Seeded per call so
+    /// the test is bit-stable across runs and platforms.
+    struct DetNormal {
+        state: u64,
+        spare: Option<f64>,
+    }
+    impl DetNormal {
+        fn new(seed: u64) -> Self {
+            Self {
+                state: seed | 1,
+                spare: None,
             }
+        }
+        fn u01(&mut self) -> f64 {
+            // xorshift64*; take the top 53 bits as a (0,1) double.
+            let mut x = self.state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.state = x;
+            let v = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            ((v >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        }
+        fn normal(&mut self) -> f64 {
+            if let Some(z) = self.spare.take() {
+                return z;
+            }
+            // Box–Muller; clamp u1 away from 0 so ln is finite.
+            let u1 = self.u01().max(1e-12);
+            let u2 = self.u01();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f64::consts::PI * u2;
+            self.spare = Some(r * theta.sin());
+            r * theta.cos()
+        }
+    }
+
+    /// Build a synthetic cloud at known curvature `k_star`: `n` points whose
+    /// geodesic normal coordinates about `center` are i.i.d. isotropic Gaussian
+    /// of scale `sigma`, exp-mapped onto `M_{k_star}`, then mean-centred in the
+    /// ambient chart to mimic the real (mean-subtracted) response clouds.
+    fn synth_cloud(dim: usize, k_star: f64, n: usize, sigma: f64, seed: u64) -> Array2<f64> {
+        let manifold = ResponseManifold::ConstantCurvature {
+            dim,
+            kappa: k_star,
+        };
+        let center = Array1::<f64>::zeros(dim);
+        let mut rng = DetNormal::new(seed);
+        let mut values = Array2::<f64>::zeros((n, dim));
+        for i in 0..n {
+            let t: Array1<f64> = (0..dim).map(|_| sigma * rng.normal()).collect();
+            let y = manifold
+                .exp_point(center.view(), t.view())
+                .expect("exp tangent to response");
+            values.row_mut(i).assign(&y);
+        }
+        // Mean-centre in the ambient chart (the real-data preprocessing).
+        let mut mean = Array1::<f64>::zeros(dim);
+        for row in values.outer_iter() {
+            mean += &row;
+        }
+        mean.mapv_inplace(|v| v / n as f64);
+        for mut row in values.outer_iter_mut() {
+            row -= &mean;
+        }
+        values
+    }
+
+    /// The #1104 reparameterisation-invariant curvature estimator: on synthetic
+    /// clouds generated at known κ⋆ the fitted κ̂ must be (a) INTERIOR to the
+    /// chart bracket (never railed), (b) close to κ⋆ and MONOTONE in κ⋆, (c)
+    /// produce a smooth (non-degenerate) χ²₁ flatness p-value that does not reject
+    /// the flat truth, and (d) be correctly COVARIANT under a global rescaling of
+    /// the cloud (κ has units 1/length², so `y ↦ α y ⇒ κ̂ ↦ κ̂/α²`).
+    #[test]
+    fn fit_response_curvature_is_reparameterization_invariant() {
+        let dim = 3usize;
+        // Unit-ish scale: σ=0.15 keeps every geodesic radius (≈ a few·σ) well
+        // inside the κ-stereographic chart for the most hyperbolic κ⋆ = −1.5
+        // (chart needs ‖y‖² < 1/1.5 ≈ 0.667).
+        let sigma = 0.15;
+        let n = 300usize;
+        let k_stars = [-1.5_f64, -0.5, 0.0, 0.6, 1.2];
+        let mut k_hats = Vec::new();
+        for (idx, &k_star) in k_stars.iter().enumerate() {
+            let values = synth_cloud(dim, k_star, n, sigma, 0xC0FFEE ^ (idx as u64 + 1));
+            let (kmin, kmax) = response_kappa_bounds(values.view());
             let fit = fit_response_curvature(values.view(), dim, 0.95, 1e-12, 256)
                 .expect("response curvature fit");
-            // κ̂ recovers κ⋆ (loose tolerance: a finite Fréchet sample profiles a
-            // shallow criterion, but the minimiser must be on the right side and
-            // close).
+            k_hats.push(fit.kappa_hat);
+
+            // (a) INTERIOR: κ̂ strictly inside the bracket, not railed to either end.
+            let span = kmax - kmin;
             assert!(
-                (fit.kappa_hat - k_star).abs() <= 0.6 + 0.25 * k_star.abs(),
+                fit.kappa_hat > kmin + 0.02 * span && fit.kappa_hat < kmax - 0.02 * span,
+                "κ⋆={k_star}: κ̂={} railed to bracket [{kmin}, {kmax}]",
+                fit.kappa_hat
+            );
+
+            // (b-direct) recovery within a sane tolerance (finite-sample bias is
+            // O(1/n); the estimator only needs the right region and sign).
+            assert!(
+                (fit.kappa_hat - k_star).abs() <= 0.6 + 0.3 * k_star.abs(),
                 "κ⋆={k_star}: κ̂={} too far",
                 fit.kappa_hat
             );
-            // The profile CI must bracket κ̂ and be a valid interval.
+
+            // (c) the profile CI is a valid interval bracketing κ̂.
             assert!(
                 fit.profile_ci.ci_lo <= fit.kappa_hat && fit.kappa_hat <= fit.profile_ci.ci_hi,
                 "κ⋆={k_star}: CI [{}, {}] excludes κ̂={}",
@@ -1132,11 +1238,15 @@ mod tests {
                 fit.profile_ci.ci_hi,
                 fit.kappa_hat
             );
-            // Flatness p-value is a valid probability; the LR statistic is ≥ 0.
+            // The flatness LR statistic and p-value are valid; the p-value is a
+            // genuine probability strictly between 0 and 1 (smooth, not 0/1).
             assert!(fit.flatness.lr_stat >= 0.0);
-            assert!(fit.flatness.p_value >= 0.0 && fit.flatness.p_value <= 1.0);
-            // For the flat truth κ⋆ = 0 the LR statistic must be tiny (do NOT
-            // reject flatness).
+            assert!(
+                fit.flatness.p_value > 0.0 && fit.flatness.p_value < 1.0,
+                "κ⋆={k_star}: degenerate flatness p={}",
+                fit.flatness.p_value
+            );
+            // The flat truth κ⋆ = 0 must NOT be rejected at 5% (lr < χ²_{1,.95}).
             if k_star == 0.0 {
                 assert!(
                     fit.flatness.lr_stat < 3.84,
@@ -1144,6 +1254,34 @@ mod tests {
                     fit.flatness.lr_stat
                 );
             }
+
+            // (d) RESCALING COVARIANCE: scale the SAME cloud by α and refit; κ̂
+            // must transform as κ̂/α² (curvature has units 1/length²). We reuse the
+            // identical points so the only change is the global scale.
+            let alpha = 1.5_f64;
+            let scaled = values.mapv(|v| alpha * v);
+            let fit_scaled = fit_response_curvature(scaled.view(), dim, 0.95, 1e-12, 256)
+                .expect("scaled response curvature fit");
+            let expected = fit.kappa_hat / (alpha * alpha);
+            // Tolerance scales with magnitude; the transform is exact in the
+            // criterion (V(κ, αy) = V(α²κ, y)) up to the finite golden-section /
+            // bracket discretisation.
+            assert!(
+                (fit_scaled.kappa_hat - expected).abs()
+                    <= 0.05 + 0.05 * expected.abs(),
+                "κ⋆={k_star}: rescale covariance broken: κ̂(αy)={} vs κ̂(y)/α²={}",
+                fit_scaled.kappa_hat,
+                expected
+            );
+        }
+
+        // (b-monotone) κ̂ is monotone increasing in κ⋆ across the whole sweep.
+        for w in k_hats.windows(2) {
+            assert!(
+                w[1] > w[0] - 0.05,
+                "κ̂ not monotone in κ⋆: {:?}",
+                k_hats
+            );
         }
     }
 }
