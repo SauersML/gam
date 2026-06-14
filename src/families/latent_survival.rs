@@ -21,7 +21,7 @@ use crate::estimate::UnifiedFitResult;
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, fit_custom_family,
+    PenaltyMatrix, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::{FamilyMetadata, ParameterLink};
 use crate::families::latent_interval::{
@@ -557,34 +557,57 @@ pub fn fit_latent_survival_terms(
     // coupled exact-joint inner Newton lands OUTSIDE the basin where the
     // reflected/LM-damped modified-Newton model is descent-consistent, so every
     // trust-region step fails the actual-objective check and the inner solve
-    // stalls out ("exited the joint Newton path before convergence"). Right-
-    // censoring each bracket at its LOWER bound `L` keeps `S(L) = K_{0,B(L)}`,
-    // which IS log-concave (PD Hessian) and converges from the cold seed in a
-    // few cycles. That warm fit shares the EXACT same time-exit / mean / log-σ
-    // designs (the interval kernel evaluates `M_L = exp(q_exit)` at the same
-    // `q_exit = log B(L)`), so its converged `β` is directly transferable as the
-    // interval fit's starting point — putting the indefinite-Hessian solve
-    // in-basin where the existing reflection + self-vanishing LM damping
-    // converge. The warm start only seeds `initial_beta`; the EXACT interval
-    // objective/gradient/Hessian are unchanged, so the converged β̂ and σ̂ are the
-    // true interval MLE (no approximation, no fake convergence).
+    // stalls out ("exited the joint Newton path before convergence"). This stall
+    // happens FIRST inside `fit_custom_family`'s outer ρ-seed startup validation
+    // (every ρ seed's trial inner fit diverges → `solver_started = 0`), so the
+    // warm start must be established BEFORE that `fit_custom_family` call and
+    // threaded into the inner solve via `initial_beta` — every ρ-seed trial fit
+    // (and the final refit) then starts from the warm β, since `buildblock_states`
+    // seeds each block from `spec.initial_beta`.
+    //
+    // The warm surrogate treats each bracket as an EXACT EVENT observed at its
+    // lower bound `L` (event code `1`): the exact-event density
+    // `ℓ = log(h(L)·S(L)) = log h(L) + log K_{0,B(L)}` is LOG-CONCAVE (PD
+    // Hessian) and — unlike right-censoring at `L`, which only constrains the
+    // baseline shape up to `L` and leaves σ unidentified — its event-time
+    // likelihood identifies BOTH the baseline shape AND the frailty spread σ, so
+    // it lands the warm β/σ in the interval likelihood's basin. It reuses the
+    // EXACT same exit (`x_time_exit` at `L`), derivative (`x_time_derivative_exit`
+    // at `L`), mean and log-σ designs the interval fit uses, so its converged β
+    // transfers directly. The warm fit runs at the seed λ via
+    // `fit_custom_family_fixed_log_lambdas` (the inner solve only — NOT the outer
+    // ρ-seed validation, which the log-concave surrogate does not need and which
+    // would otherwise re-incur startup cost). The warm start only seeds
+    // `initial_beta`; the EXACT interval objective/gradient/Hessian are unchanged,
+    // so the converged β̂/σ̂ are the true interval MLE (no approximation, no fake
+    // convergence). A warm-fit failure is non-fatal: fall through to the cold
+    // seed.
     let has_interval_rows = spec
         .event_target
         .iter()
         .any(|&code| code == LATENT_SURVIVAL_EVENT_INTERVAL);
     if has_interval_rows {
-        // Reinterpret every interval bracket as right-censored at its lower
-        // bound `L` (the interval kernel's left boundary already lives in the
-        // `q_exit` / `x_time_exit` channel). Right-censoring code is `0`.
-        let warm_event_target = spec
-            .event_target
-            .mapv(|code| if code == LATENT_SURVIVAL_EVENT_INTERVAL { 0 } else { code });
+        let warm_event_target = spec.event_target.mapv(|code| {
+            if code == LATENT_SURVIVAL_EVENT_INTERVAL {
+                1u8
+            } else {
+                code
+            }
+        });
         let mut warm_family = family.clone();
         warm_family.event_target = warm_event_target;
-        // The right-censored-at-L surrogate ignores the interval upper bound, so
+        // The exact-event-at-L surrogate ignores the interval upper bound `R`, so
         // the (unused) `q_right` channel cannot drift the fit; leaving the right
         // design/mass in place is harmless (no interval row remains to read it).
-        let warm_fit = fit_custom_family(&warm_family, &blocks, options);
+        let warm_fit = fit_custom_family_fixed_log_lambdas(
+            &warm_family,
+            &blocks,
+            options,
+            None,
+            0,
+            None,
+            false,
+        );
         if let Ok(warm_fit) = warm_fit {
             for (block, state) in blocks.iter_mut().zip(warm_fit.block_states.iter()) {
                 if state.beta.iter().all(|v| v.is_finite()) {
@@ -592,8 +615,6 @@ pub fn fit_latent_survival_terms(
                 }
             }
         }
-        // A warm-fit failure is non-fatal: fall through to the cold seed (the
-        // interval fit still runs, just without the basin warm start).
     }
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
     let latent_sd = family.latent_sd(&fit.block_states)?;
