@@ -2969,10 +2969,6 @@ fn atom_curvature_ci(fit: &AtomInnerFit) -> Option<AtomCurvatureCi> {
     // finite. The tangent normalizer t is treated as a fixed scale (its own
     // sampling noise is second order in the curvature signal), so
     //   Var(ρ̂) = Var(ĉ) / t²,  ρ̂ = c/t.
-    let sqrt_t = tangent_energy.sqrt();
-    if !(sqrt_t > 0.0) {
-        return None;
-    }
     let rho_hat = curvature_energy / tangent_energy; // = κ̂_mag²
 
     // Σ = φ H⁻¹ via one Cholesky solve against φ·I.
