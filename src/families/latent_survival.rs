@@ -592,7 +592,7 @@ pub fn fit_latent_survival_terms(
         .filter(|&&code| code == LATENT_SURVIVAL_EVENT_INTERVAL)
         .count();
     // [#1108 DIAG] remove after diagnosis.
-    eprintln!(
+    log::debug!(
         "[#1108 WARM] fit_latent_survival_terms entry: n={} interval_rows={} has_interval={} latent_sd_fixed={:?} n_blocks={}",
         n,
         interval_row_count,
@@ -614,7 +614,7 @@ pub fn fit_latent_survival_terms(
         // the (unused) `q_right` channel cannot drift the fit; leaving the right
         // design/mass in place is harmless (no interval row remains to read it).
         // [#1108 DIAG] remove after diagnosis.
-        eprintln!("[#1108 WARM] attempting exact-event-at-L surrogate fit (fixed-lambda inner solve)");
+        log::debug!("[#1108 WARM] attempting exact-event-at-L surrogate fit (fixed-lambda inner solve)");
         let warm_fit = fit_custom_family_fixed_log_lambdas(
             &warm_family,
             &blocks,
@@ -636,7 +636,7 @@ pub fn fit_latent_survival_terms(
                     .collect();
                 let warm_sd = warm_family.latent_sd(&wf.block_states);
                 // [#1108 DIAG] remove after diagnosis.
-                eprintln!(
+                log::debug!(
                     "[#1108 WARM] surrogate CONVERGED: {} warm_sigma={:?}",
                     betas.join(" "),
                     warm_sd,
@@ -644,7 +644,7 @@ pub fn fit_latent_survival_terms(
             }
             Err(e) => {
                 // [#1108 DIAG] remove after diagnosis.
-                eprintln!("[#1108 WARM] surrogate FAILED: {e}");
+                log::debug!("[#1108 WARM] surrogate FAILED: {e}");
             }
         }
         if let Ok(warm_fit) = warm_fit {
@@ -664,7 +664,7 @@ pub fn fit_latent_survival_terms(
                     None => "init_beta=None".to_string(),
                 })
                 .collect();
-            eprintln!("[#1108 WARM] seeded interval blocks: {}", seeded.join(" "));
+            log::debug!("[#1108 WARM] seeded interval blocks: {}", seeded.join(" "));
         }
         // [#1108 DIAG] remove after diagnosis. ISOLATION PROBE: run the INTERVAL
         // family's inner solve at the seed lambda FROM the warm beta. This
@@ -680,18 +680,18 @@ pub fn fit_latent_survival_terms(
         match &interval_inner_probe {
             Ok(p) => {
                 let probe_sd = family.latent_sd(&p.block_states);
-                eprintln!(
+                log::debug!(
                     "[#1108 PROBE] interval inner solve from warm beta CONVERGED, sigma={probe_sd:?}"
                 );
             }
             Err(e) => {
-                eprintln!("[#1108 PROBE] interval inner solve from warm beta FAILED: {e}");
+                log::debug!("[#1108 PROBE] interval inner solve from warm beta FAILED: {e}");
             }
         }
     }
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| {
         // [#1108 DIAG] remove after diagnosis.
-        eprintln!("[#1108 WARM] interval fit_custom_family FAILED: {e}");
+        log::debug!("[#1108 WARM] interval fit_custom_family FAILED: {e}");
         e.to_string()
     })?;
     let latent_sd = family.latent_sd(&fit.block_states)?;
