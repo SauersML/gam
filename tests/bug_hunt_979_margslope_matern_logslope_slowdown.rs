@@ -160,3 +160,38 @@ fn margslope_matern_logslope_timing() {
         "margslope matern-logslope fit took {elapsed:.1}s at n={n} centers={centers} (budget 60s)"
     );
 }
+
+/// Above-the-cliff profiling repro (#979): centers=12, n=2000 — the regime
+/// where the multi-seed continuation pre-warm *fires* and the binary
+/// marginal-slope fit became intractable (>360s). `#[ignore]`'d because it is
+/// a manual profiling harness, not a CI budget gate. Invoke directly:
+///   cargo test --release --test bug_hunt_979_margslope_matern_logslope_slowdown \
+///       margslope_matern_logslope_above_cliff -- --ignored --nocapture
+#[test]
+#[ignore]
+fn margslope_matern_logslope_above_cliff() {
+    gam::init_parallelism();
+    let n = 2000;
+    let centers = 12;
+    let (data, spec) = build(n, centers);
+    let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
+        data: data.view(),
+        spec,
+        options: BlockwiseFitOptions::default(),
+        kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+        policy: ResourcePolicy::default_library(),
+    });
+    let start = Instant::now();
+    let result = fit_model(request);
+    let elapsed = start.elapsed().as_secs_f64();
+    match result {
+        Ok(FitResult::BernoulliMarginalSlope(out)) => {
+            eprintln!(
+                "[979-ABOVE-CLIFF] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged={}",
+                out.fit.outer_iterations, out.fit.inner_cycles, out.fit.outer_converged
+            );
+        }
+        Ok(_) => panic!("wrong FitResult variant"),
+        Err(e) => eprintln!("[979-ABOVE-CLIFF] n={n} centers={centers} total_s={elapsed:.2} FAILED: {e}"),
+    }
+}
