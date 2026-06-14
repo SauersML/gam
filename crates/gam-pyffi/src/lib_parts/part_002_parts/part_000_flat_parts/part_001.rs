@@ -529,6 +529,7 @@ fn glm_reml_fit_latent_impl(
         firth_bias_reduction: Some(false),
         penalty_shrinkage_floor: None,
         rho_prior: RhoPrior::Flat,
+        persist_warm_start_disk: false,
         kronecker_penalty_system: None,
         kronecker_factored: None,
     };
@@ -1643,6 +1644,7 @@ fn gaussian_reml_fit_formula_table_impl(
         adaptive_regularization: None,
         penalty_shrinkage_floor: None,
         rho_prior: Default::default(),
+        persist_warm_start_disk: false,
         kronecker_penalty_system: None,
         kronecker_factored: None,
     };
