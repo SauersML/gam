@@ -3252,6 +3252,7 @@ impl LatentBinaryFamily {
                     q_entry[row_idx],
                     q_exit[row_idx],
                     1.0,
+                    q_exit[row_idx],
                     mu[row_idx],
                     self.latent_sd,
                     false,
