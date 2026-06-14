@@ -1,34 +1,34 @@
 // Split from the original oversized module; keep included in order.
-include!("gamlss/part_000.rs");
+include!("gamlss/imports.rs");
 
 mod dispersion_family;
 
-include!("gamlss/part_001.rs");
+include!("gamlss/dispersion_family_imports.rs");
 
 mod binomial_q_derivs;
 
-include!("gamlss/part_002.rs");
+include!("gamlss/binomial_q_derivs_imports.rs");
 
 mod binomial_q_coeffs;
 
-include!("gamlss/part_003.rs");
+include!("gamlss/binomial_q_coeffs_imports.rs");
 
 mod validation;
 
-include!("gamlss/part_004.rs");
+include!("gamlss/validation_imports.rs");
 
 mod weighted_design_products;
 
-include!("gamlss/part_005.rs");
+include!("gamlss/weighted_design_products_imports.rs");
 
 mod row_linalg;
 
-include!("gamlss/part_006.rs");
+include!("gamlss/row_linalg_imports.rs");
 
 mod joint_packing;
 
-include!("gamlss/part_007.rs");
-include!("gamlss/part_008.rs");
-include!("gamlss/part_009.rs");
-include!("gamlss/part_010.rs");
-include!("gamlss/part_011.rs");
+include!("gamlss/core_errors_and_builders.rs");
+include!("gamlss/gaussian_and_log_families.rs");
+include!("gamlss/binomial_location_scale.rs");
+include!("gamlss/binomial_location_scale_wiggle_workspace.rs");
+include!("gamlss/gamlss_tests.rs");
