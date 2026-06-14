@@ -842,7 +842,7 @@ pub fn prepare_survival_time_stack(
         // of the zero-derivative Linear baseline, but ONLY for the offset: the
         // outer `baseline_cfg.target` stays `Linear`, so the
         // `baseline_cfg.target != Linear` optimize gate
-        // (`optimize_survival_baseline_config*`) never fires and no baseline-shape
+        // (the gradient baseline optimizers) never fires and no baseline-shape
         // search is introduced. With shape = 1 the Weibull baseline-hazard
         // derivative is `1/age_exit` (the natural data hazard scale), so the seed
         // starts with `qd1` at O(1/T) interior — barrier gradient O(10-10²),
@@ -3201,11 +3201,11 @@ fn materialize_survival<'a>(
             Ok::<_, String>((prepared, time_block))
         };
 
-    // Warm-start cache for the outer CompassSearch over the baseline config: each probe
+    // Warm-start cache for the outer baseline-config optimization: each probe
     // runs a complete inner BFGS over ρ (log-smoothing) starting from zeros if cold; by
     // capturing the previous probe's converged ρ (threshold + log_sigma blocks) and
     // injecting it here, the next inner BFGS typically converges in 1-3 iterations
-    // instead of ~10, cutting per-probe cost roughly 5-10× across up to 60 probes per fit.
+    // instead of ~10, cutting per-probe cost roughly 5-10× across the probes per fit.
     let location_scale_smoothing_warm_start: RefCell<Option<(Array1<f64>, Array1<f64>)>> =
         RefCell::new(None);
     let build_location_scale_request =
@@ -3242,7 +3242,7 @@ fn materialize_survival<'a>(
             };
             // During baseline-θ BFGS probes we hold the inverse-link state
             // fixed: otherwise every probe would trigger a nested
-            // CompassSearch over the SAS / BetaLogistic / Mixture link
+            // optimization over the SAS / BetaLogistic / Mixture link
             // parameters, defeating the BFGS speedup entirely. The final
             // fit (after baseline has converged) flips this back on, so
             // joint baseline + link optimization still happens — just
@@ -3536,9 +3536,7 @@ fn materialize_survival<'a>(
         // the probit-channel baseline q(t) instead, so we contract against
         // `marginal_slope_baseline_offset_theta_partials` exactly as the
         // marginal-slope path does. BFGS w/ this analytic gradient
-        // typically converges in ≲10 outer evaluations — one order of
-        // magnitude fewer probes than the gradient-free compass sweep that
-        // used to run on this path.
+        // typically converges in ≲10 outer evaluations.
         let probit_channel =
             location_scale_uses_probit_survival_baseline(Some(&survival_inverse_link));
         // Catch errors at the optimizer-call site so a single bad θ
@@ -3630,40 +3628,20 @@ fn materialize_survival<'a>(
             Err(e) => return Err(e.into()),
         }
     } else if baseline_cfg.target != SurvivalBaselineTarget::Linear {
-        optimize_survival_baseline_config(
-            &baseline_cfg,
-            "workflow survival baseline",
-            |candidate| {
-                match survival_mode {
-                SurvivalLikelihoodMode::LocationScale => Err(
-                    "internal: location-scale baseline profiling uses analytic chain-rule gradient and should not reach the workflow scalar profile closure"
-                        .to_string(),
-                ),
-                SurvivalLikelihoodMode::MarginalSlope => Err(
-                    "internal: marginal-slope baseline profiling uses analytic GM-probit gradient and should not reach the workflow scalar profile closure"
-                        .to_string(),
-                ),
-                SurvivalLikelihoodMode::Latent => Ok(fit_latent_survival_model(
-                    build_latent_survival_request(candidate)?,
-                )
-                .map_err(|e| format!("latent survival fit failed: {e}"))?
-                .fit
-                .reml_score),
-                SurvivalLikelihoodMode::LatentBinary => Ok(fit_latent_binary_model(
-                    build_latent_binary_request(candidate)?,
-                )
-                .map_err(|e| format!("latent binary fit failed: {e}"))?
-                .fit
-                .reml_score),
-                SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
-                    Err(
-                        "internal: Transformation/Weibull survival baseline should not enter the workflow scalar profile closure (outer guard filters them above)"
-                            .to_string(),
-                    )
-                }
-            }
-            },
-        )?
+        // The cost-only baseline-θ optimizer drove a gradient-free compass
+        // search, which has been purged. A non-linear baseline target with no
+        // analytic θ-gradient (Latent / LatentBinary) therefore has no solver
+        // left — fail loudly rather than silently rerouting to a derivative
+        // method the objective cannot back.
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "non-linear survival baseline target {:?} in mode {:?} has no analytic \
+                 θ-gradient and the gradient-free compass-search optimizer was removed; \
+                 there is no outer solver for this baseline",
+                baseline_cfg.target, survival_mode,
+            ),
+        }
+        .into());
     } else {
         baseline_cfg
     };

@@ -3057,8 +3057,7 @@ fn fit_survival_transformation_model(
         // η-channel offset partials supplied by baseline_offset_theta_partials
         // (contracted by baseline_chain_rule_gradient). See the derivation header
         // on baseline_chain_rule_gradient. BFGS over this exact gradient converges
-        // in ≲10 outer evaluations versus the ~60–84 gradient-free polls compass
-        // search spent on the same 2–3 dim surface.
+        // in ≲10 outer evaluations on the 2–3 dim surface.
         baseline_cfg = optimize_survival_baseline_config_with_gradient_only(
             &baseline_cfg,
             "workflow survival transformation baseline",
@@ -3305,205 +3304,36 @@ fn fit_survival_location_scale_model(
         })
     }
 
-    fn profile_survival_location_scale_with_inverse_link(
-        data: ArrayView2<'_, f64>,
-        spec: &SurvivalLocationScaleTermSpec,
-        inverse_link: InverseLink,
-        wiggle: Option<LinkWiggleConfig>,
-        kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<SurvivalLocationScaleProfile, String> {
-        let mut spec_at_link = spec.clone();
-        spec_at_link.inverse_link = inverse_link;
-        profile_survival_location_scale(data, spec_at_link, wiggle, kappa_options)
-    }
-
     fn optimize_survival_inverse_link_profile(
         data: ArrayView2<'_, f64>,
         spec: &SurvivalLocationScaleTermSpec,
         wiggle: Option<LinkWiggleConfig>,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
     ) -> Result<SurvivalLocationScaleProfile, String> {
-        fn optimize_link_parameters<F, R>(
-            data: ArrayView2<'_, f64>,
-            spec: &SurvivalLocationScaleTermSpec,
-            kappa_options: &SpatialLengthScaleOptimizationOptions,
-            init: Array1<f64>,
-            name: &str,
-            final_wiggle: Option<LinkWiggleConfig>,
-            objective: F,
-            recover: R,
-        ) -> Result<SurvivalLocationScaleProfile, String>
-        where
-            F: FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
-            R: Fn(&Array1<f64>) -> Option<InverseLink>,
-        {
-            use crate::solver::outer_strategy::{OuterProblem, SolverClass};
-            let dim = init.len();
-            // Inverse-link parameters (SAS epsilon/log_delta, BetaLogistic shape,
-            // Mixture rho) have no analytic ∂LAML/∂θ_link; route through the
-            // gated gradient-free CompassSearch variant rather than BFGS. Box
-            // bounds keep line-search probes inside a physically admissible
-            // region (|epsilon|, |log_delta| ≤ 6 gives the SAS link a finite
-            // range on both tails).
-            let lower = init.mapv(|v| v - 6.0);
-            let upper = init.mapv(|v| v + 6.0);
-            let problem = OuterProblem::new(dim)
-                .with_solver_class(SolverClass::AuxiliaryGradientFree)
-                .with_tolerance(1e-4)
-                .with_max_iter(240)
-                .with_bounds(lower, upper)
-                .with_initial_rho(init.clone())
-                .with_seed_config(crate::seeding::SeedConfig {
-                    max_seeds: 1,
-                    seed_budget: 1,
-                    num_auxiliary_trailing: dim,
-                    ..Default::default()
-                });
-            let context = format!("survival inverse-link optimization ({name}, dim={dim})");
-            let mut obj = problem.build_objective(
-                objective,
-                |f: &mut F, rho: &ndarray::Array1<f64>| f(rho),
-                |_: &mut F, _: &ndarray::Array1<f64>| {
-                    Err(EstimationError::InvalidInput(
-                        "inverse-link aux optimizer: CompassSearch dispatch only \
-                         calls eval_cost; eval(gradient) is unreachable by \
-                         construction"
-                            .to_string(),
-                    ))
-                },
-                None::<fn(&mut F)>,
-                None::<
-                    fn(
-                        &mut F,
-                        &ndarray::Array1<f64>,
-                    )
-                        -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
-                >,
-            );
-            let result = problem
-                .run(&mut obj, &context)
-                .map_err(|err| format!("{context} failed: {err}"))?;
-            let link = recover_converged_survival_inverse_link(result, &context, recover)?;
-            profile_survival_location_scale_with_inverse_link(
-                data,
-                spec,
-                link,
-                final_wiggle,
-                kappa_options,
-            )
-            .map_err(|err| format!("{context} final profiling failed: {err}"))
-        }
-
+        // Inverse-link parameters (SAS epsilon/log_delta, BetaLogistic shape,
+        // Mixture rho) have no analytic ∂LAML/∂θ_link. The only optimizer that
+        // could fit them was the gradient-free compass search, which has been
+        // purged. There is no solver left for these parameters, so fail loudly
+        // rather than silently fitting at the (un-optimized) seed link state.
         match spec.inverse_link.clone() {
-            InverseLink::Sas(state0) => {
-                let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
-                let wiggle_cfg = wiggle.clone();
-                optimize_link_parameters(
-                    data,
-                    spec,
-                    kappa_options,
-                    init,
-                    "SAS",
-                    wiggle.clone(),
-                    |theta: &Array1<f64>| {
-                        let state = state_from_sasspec(SasLinkSpec {
-                            initial_epsilon: theta[0],
-                            initial_log_delta: theta[1],
-                        })
-                        .map_err(EstimationError::InvalidInput)?;
-                        Ok(profile_survival_location_scale_with_inverse_link(
-                            data,
-                            spec,
-                            InverseLink::Sas(state),
-                            wiggle_cfg.clone(),
-                            kappa_options,
-                        )
-                        .map_err(EstimationError::InvalidInput)?
-                        .objective())
-                    },
-                    |rho| {
-                        state_from_sasspec(SasLinkSpec {
-                            initial_epsilon: rho[0],
-                            initial_log_delta: rho[1],
-                        })
-                        .ok()
-                        .map(InverseLink::Sas)
-                    },
-                )
-            }
-            InverseLink::BetaLogistic(state0) => {
-                let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
-                let wiggle_cfg = wiggle.clone();
-                optimize_link_parameters(
-                    data,
-                    spec,
-                    kappa_options,
-                    init,
-                    "BetaLogistic",
-                    wiggle.clone(),
-                    |theta: &Array1<f64>| {
-                        let state = state_from_beta_logisticspec(SasLinkSpec {
-                            initial_epsilon: theta[0],
-                            initial_log_delta: theta[1],
-                        })
-                        .map_err(EstimationError::InvalidInput)?;
-                        Ok(profile_survival_location_scale_with_inverse_link(
-                            data,
-                            spec,
-                            InverseLink::BetaLogistic(state),
-                            wiggle_cfg.clone(),
-                            kappa_options,
-                        )
-                        .map_err(EstimationError::InvalidInput)?
-                        .objective())
-                    },
-                    |rho| {
-                        state_from_beta_logisticspec(SasLinkSpec {
-                            initial_epsilon: rho[0],
-                            initial_log_delta: rho[1],
-                        })
-                        .ok()
-                        .map(InverseLink::BetaLogistic)
-                    },
-                )
-            }
-            InverseLink::Mixture(state0) if !state0.rho.is_empty() => {
-                let components = state0.components.clone();
-                let components_recover = components.clone();
-                let wiggle_cfg = wiggle.clone();
-                optimize_link_parameters(
-                    data,
-                    spec,
-                    kappa_options,
-                    state0.rho.clone(),
-                    "mixture",
-                    wiggle.clone(),
-                    move |rho: &Array1<f64>| {
-                        let state = state_fromspec(&MixtureLinkSpec {
-                            components: components.clone(),
-                            initial_rho: rho.clone(),
-                        })
-                        .map_err(EstimationError::InvalidInput)?;
-                        Ok(profile_survival_location_scale_with_inverse_link(
-                            data,
-                            spec,
-                            InverseLink::Mixture(state),
-                            wiggle_cfg.clone(),
-                            kappa_options,
-                        )
-                        .map_err(EstimationError::InvalidInput)?
-                        .objective())
-                    },
-                    move |rho| {
-                        state_fromspec(&MixtureLinkSpec {
-                            components: components_recover.clone(),
-                            initial_rho: rho.to_owned(),
-                        })
-                        .ok()
-                        .map(InverseLink::Mixture)
-                    },
-                )
-            }
+            InverseLink::Sas(_) => Err(
+                "survival inverse-link optimization (SAS) requires the gradient-free \
+                 compass-search optimizer, which was removed; the SAS epsilon/log_delta \
+                 link parameters have no analytic gradient and no remaining solver"
+                    .to_string(),
+            ),
+            InverseLink::BetaLogistic(_) => Err(
+                "survival inverse-link optimization (BetaLogistic) requires the \
+                 gradient-free compass-search optimizer, which was removed; the link \
+                 parameters have no analytic gradient and no remaining solver"
+                    .to_string(),
+            ),
+            InverseLink::Mixture(state0) if !state0.rho.is_empty() => Err(
+                "survival inverse-link optimization (mixture) requires the gradient-free \
+                 compass-search optimizer, which was removed; the mixture rho parameters \
+                 have no analytic gradient and no remaining solver"
+                    .to_string(),
+            ),
             _ => profile_survival_location_scale(data, spec.clone(), wiggle, kappa_options),
         }
     }

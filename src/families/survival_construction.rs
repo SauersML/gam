@@ -666,21 +666,18 @@ fn survival_baseline_config_from_theta(
 
 /// Derivative contract for the shared baseline-θ outer optimizer.
 ///
-/// The three public baseline optimizers (`optimize_survival_baseline_config`,
-/// `…_with_gradient_only`, `…_with_gradient`) differ in exactly one axis: how
-/// much derivative information the objective closure supplies, and therefore
-/// which outer solver class and curvature declaration the `OuterProblem` must
-/// advertise. Everything else — θ↔config conversion, the ±6 log-space box,
+/// The two public baseline optimizers (`…_with_gradient_only`,
+/// `…_with_gradient`) differ in exactly one axis: how much derivative
+/// information the objective closure supplies, and therefore which curvature
+/// declaration the `OuterProblem` must advertise. (The cost-only optimizer was
+/// removed with the compass-search purge — a baseline θ with no analytic
+/// gradient has no solver any more.) Everything else — θ↔config conversion,
+/// the ±6 log-space box,
 /// the single-seed config, the `run`/convergence/error-formatting boilerplate
 /// — is identical, so it lives once in [`run_baseline_theta_optimizer`] and
 /// this enum selects the per-contract `OuterProblem` configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BaselineDerivativeContract {
-    /// Cost-only: no analytic derivatives. Routes to the gradient-free
-    /// CompassSearch over the small baseline θ. The `eval_fn` supplied by the
-    /// adapter is unreachable under this dispatch (CompassSearch calls only
-    /// `eval_cost`), so the adapter passes the explicit "unreachable" stub.
-    CostOnly,
     /// Cost + analytic gradient, no analytic Hessian. Routes to BFGS, which
     /// builds its own quasi-Newton curvature from successive gradients.
     GradientOnly,
@@ -701,31 +698,8 @@ impl BaselineDerivativeContract {
     ) -> crate::solver::outer_strategy::OuterProblem {
         use crate::solver::outer_strategy::{DeclaredHessianForm, Derivative, SolverClass};
         match self {
-            // CompassSearch over the small baseline θ (2-dim weibull/gompertz
-            // α,λ; 3-dim gompertz-makeham α,λ,γ) at tol=1e-4 on a smooth REML
-            // surface. Every probe runs a complete inner BFGS over the
-            // smoothing log-λ from cold start (no ρ warm-start across probes),
-            // so probe count is the dominant per-fit cost for this
-            // non-linear-baseline path, which lacks the analytic baseline
-            // gradient the marginal-slope path has under `GradientHessian`.
-            //
-            // We do NOT pin a magic poll cap here. A direct search can only
-            // certify first-order stationarity once its step contracts below
-            // tol, which from init_step=1.0 takes ceil(log2(1/tol))·2·dim
-            // polls (≈56 for dim=2, ≈84 for dim=3) — so any fixed cap below
-            // that (the prior `60`) made dim≥2 baselines report spurious
-            // non-convergence. The CompassSearch dispatch now floors the
-            // budget at that contraction cost plus a descent allowance, so it
-            // is correct for every dim; `max_iter` here is only an upper
-            // request, kept generous so genuinely hard surfaces can take the
-            // descent steps they need before certifying.
-            BaselineDerivativeContract::CostOnly => problem
-                .with_solver_class(SolverClass::AuxiliaryGradientFree)
-                .with_tolerance(1e-4)
-                .with_max_iter(400),
             // BFGS on a 2–3 dim problem with an exact gradient typically
-            // converges in 5–10 outer evaluations versus the ~60 polls compass
-            // search used to spend on the same surface.
+            // converges in 5–10 outer evaluations.
             BaselineDerivativeContract::GradientOnly => problem
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(DeclaredHessianForm::Unavailable)
@@ -878,47 +852,6 @@ where
     run_baseline_theta_optimizer(initial, context, contract, cost_fn, eval_fn)
 }
 
-/// Cost-only outer baseline-config optimizer. Thin adapter over
-/// [`run_baseline_theta_optimizer`] under the
-/// [`BaselineDerivativeContract::CostOnly`] contract: it wraps the
-/// scalar-cost objective into a θ-space `cost_fn` and supplies the explicit
-/// "unreachable" `eval_fn`, since the gradient-free CompassSearch dispatch
-/// never requests a gradient.
-pub fn optimize_survival_baseline_config<F>(
-    initial: &SurvivalBaselineConfig,
-    context: &str,
-    mut objective: F,
-) -> Result<SurvivalBaselineConfig, String>
-where
-    F: FnMut(&SurvivalBaselineConfig) -> Result<f64, String>,
-{
-    let target = initial.target;
-    let cost_fn = move |_: &mut (), theta: &Array1<f64>| {
-        let cfg = survival_baseline_config_from_theta(target, theta)
-            .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        objective(&cfg).map_err(crate::estimate::EstimationError::InvalidInput)
-    };
-    let eval_fn = |_: &mut (),
-                   _: &Array1<f64>|
-     -> Result<
-        crate::solver::outer_strategy::OuterEval,
-        crate::estimate::EstimationError,
-    > {
-        Err(crate::estimate::EstimationError::InvalidInput(
-            "baseline aux optimizer: CompassSearch dispatch only calls eval_cost; \
-             eval(gradient) is unreachable by construction"
-                .to_string(),
-        ))
-    };
-    run_baseline_theta_optimizer(
-        initial,
-        context,
-        BaselineDerivativeContract::CostOnly,
-        cost_fn,
-        eval_fn,
-    )
-}
-
 /// Gradient-only outer baseline-config optimizer. Thin adapter over
 /// [`run_baseline_theta_optimizer`] under the
 /// [`BaselineDerivativeContract::GradientOnly`] contract, which advertises
@@ -928,8 +861,7 @@ where
 /// closed-form θ-gradient (`baseline_chain_rule_gradient` /
 /// `marginal_slope_baseline_chain_rule_gradient`) but no native analytic
 /// θ-Hessian; BFGS on a 2–3 dim problem with an exact gradient typically
-/// converges in 5–10 outer evaluations versus the ~60 polls compass search
-/// used to spend on the same surface.
+/// converges in 5–10 outer evaluations.
 pub fn optimize_survival_baseline_config_with_gradient_only<F>(
     initial: &SurvivalBaselineConfig,
     context: &str,
@@ -3528,7 +3460,7 @@ mod tests {
         build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
         evaluate_survival_marginal_slope_baseline, marginal_slope_baseline_chain_rule_gradient,
         marginal_slope_baseline_chain_rule_hessian, marginal_slope_baseline_offset_theta_partials,
-        optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
+        optimize_survival_baseline_config_with_gradient,
         optimize_survival_baseline_config_with_gradient_only,
         resolve_survival_marginal_slope_time_anchor_value, survival_baseline_config_from_theta,
         survival_baseline_theta_from_config,
@@ -3586,19 +3518,16 @@ mod tests {
         );
     }
 
-    /// Derivative-contract parity for the three public baseline optimizers.
+    /// Derivative-contract parity for the two public baseline optimizers.
     ///
     /// After the unification onto `run_baseline_theta_optimizer`, the
-    /// cost-only, gradient-only, and gradient+Hessian entry points differ
-    /// *only* in how much derivative information they hand the outer solver —
-    /// not in the surface they minimize. We exercise that invariant on a known
+    /// gradient-only and gradient+Hessian entry points differ *only* in how
+    /// much derivative information they hand the outer solver — not in the
+    /// surface they minimize. We exercise that invariant on a known
     /// strictly-convex quadratic in θ-space (Weibull baseline: θ = (ln scale,
     /// ln shape)) whose unique minimizer is `theta_star`, supplying the same
-    /// objective as cost-only `f`, as `(f, ∇f)`, and as `(f, ∇f, ∇²f)`. All
-    /// three contracts must recover the same minimizer config; the bounds are
-    /// driven by the shared 1e-4 outer tolerance (the gradient-free compass
-    /// certifies stationarity once its step contracts below 1e-4, so its
-    /// positional error is O(1e-4)), not weakened to pass.
+    /// objective as `(f, ∇f)` and as `(f, ∇f, ∇²f)`. Both contracts must
+    /// recover the same minimizer config, not weakened to pass.
     #[test]
     fn baseline_optimizer_contracts_agree_on_shared_surface() {
         // SPD curvature and interior minimizer in θ-space. A is well away from
@@ -3638,14 +3567,6 @@ mod tests {
             Ok(0.5 * d.dot(&ad))
         };
 
-        let cost_only = cost_at.clone();
-        let result_cost_only = optimize_survival_baseline_config(
-            &initial,
-            "baseline parity (cost-only)",
-            move |cfg| cost_only(cfg),
-        )
-        .expect("cost-only baseline optimization converges");
-
         let curvature_grad = curvature.clone();
         let star_grad = theta_star.clone();
         let cost_for_grad = cost_at.clone();
@@ -3678,15 +3599,12 @@ mod tests {
         )
         .expect("gradient+Hessian baseline optimization converges");
 
-        let theta_cost_only = recovered_theta(&result_cost_only);
         let theta_grad_only = recovered_theta(&result_grad_only);
         let theta_grad_hess = recovered_theta(&result_grad_hess);
 
-        // Each contract recovers the true minimizer. The gradient-free compass
-        // certifies at step < 1e-4, so 2e-3 is a safe, un-weakened bound;
-        // the gradient paths land far tighter but share the same assertion.
+        // Each contract recovers the true minimizer. 2e-3 is a safe,
+        // un-weakened bound; both gradient paths land far tighter.
         for (label, theta) in [
-            ("cost-only", &theta_cost_only),
             ("gradient-only", &theta_grad_only),
             ("gradient+Hessian", &theta_grad_hess),
         ] {
@@ -3705,10 +3623,6 @@ mod tests {
         let pairwise_max = |a: &Array1<f64>, b: &Array1<f64>| -> f64 {
             (a - b).mapv(f64::abs).fold(0.0_f64, |acc, &v| acc.max(v))
         };
-        assert!(
-            pairwise_max(&theta_cost_only, &theta_grad_only) <= 2e-3,
-            "cost-only vs gradient-only disagree: {theta_cost_only:?} vs {theta_grad_only:?}"
-        );
         assert!(
             pairwise_max(&theta_grad_only, &theta_grad_hess) <= 2e-3,
             "gradient-only vs gradient+Hessian disagree: {theta_grad_only:?} vs {theta_grad_hess:?}"
@@ -4391,8 +4305,8 @@ mod tests {
     ///
     /// This is the FD gate for the analytic outer θ-gradient that the
     /// transformation/Weibull survival baseline optimizers now feed to BFGS
-    /// (`optimize_survival_baseline_config_with_gradient_only`, replacing the
-    /// gradient-free compass search). At a *fixed* β the profile-NLL surface is
+    /// (`optimize_survival_baseline_config_with_gradient_only`). At a *fixed* β
+    /// the profile-NLL surface is
     /// `L(θ) = Σ_i [ r_X[i]·η(t_exit_i;θ) + r_E[i]·η(t_entry_i;θ)
     ///              + r_D[i]·o_D(t_exit_i;θ) ]`,
     /// whose exact gradient is `baseline_chain_rule_gradient`. Comparing it to a
