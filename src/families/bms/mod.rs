@@ -1924,8 +1924,10 @@ pub(crate) mod hessian_paths;
 pub(crate) mod install_flex;
 pub(crate) mod row_kernel;
 #[cfg(test)]
-#[path = "../../../tests/src_modules/families_bms_tests.rs"]
-mod tests;
+mod tests {
+    include!("../../../tests/src_modules/families_bms_identifiability_rigid_tests.rs");
+    include!("../../../tests/src_modules/families_bms_joint_hessian_hvp_correction_tests.rs");
+}
 pub(crate) mod axis_direction_search;
 pub(crate) mod cell_moment_assembly;
 pub(crate) mod custom_family_impl;
