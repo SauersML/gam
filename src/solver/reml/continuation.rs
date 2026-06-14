@@ -347,12 +347,22 @@ pub(crate) fn prime_outer_seed_with_budget(
     // via `OuterEval::inner_beta_hint` from each accepted eval.
     let empty_beta: Array1<f64> = Array1::zeros(0);
 
+    // Value-only walk (#979). The pre-warm's ONLY product is a warm inner β at
+    // (or near) the seed ρ — it never consumes the outer gradient it used to
+    // request. Each `ValueAndGradient` step paid a full k²·n·p² LAML gradient
+    // assembly purely to carry `inner_beta_hint` forward; `Value` skips that
+    // assembly (see `compute_outer_eval_with_order`'s value-only branch) while
+    // still running the inner solve and surfacing the warmed β, so the walk
+    // forwards the same hint at a fraction of the per-step cost. This is the
+    // dominant lever on the ~35s/seed marginal-slope pre-warm and the
+    // centers=20 non-finish: the cold eval that follows the pre-warm asks for
+    // the gradient once, at the seed, instead of once per continuation step.
     match fit_with_continuation_with_budget(
         obj,
         seed,
         bounds_upper,
         &empty_beta,
-        OuterEvalOrder::ValueAndGradient,
+        OuterEvalOrder::Value,
         path_budget,
     ) {
         Ok(state) => Ok(PrimingSummary {

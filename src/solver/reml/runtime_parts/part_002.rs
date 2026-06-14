@@ -2581,11 +2581,49 @@ impl<'a> RemlState<'a> {
             }
         };
 
+        // Genuinely value-only fulfilment (#979). A `Value` request never needs
+        // the outer gradient — the continuation pre-warm asks for it purely to
+        // run the inner P-IRLS and warm `warm_start_beta`, which the inner solve
+        // above (`obtain_eval_bundle`) has already done. The previous code rode
+        // the value+gradient path for `Value`, paying the full k²·n·p² LAML
+        // gradient assembly at EVERY continuation step (the dominant cost of the
+        // ~35s/seed marginal-slope pre-warm and the centers=20 non-finish). Skip
+        // the gradient assembly entirely: assemble the cost with `ValueOnly`,
+        // return a zero-length gradient (no outer optimiser ever consumes a
+        // `Value`-order gradient — the runner only requests `Value` for cost
+        // probes / pre-warm), and surface the warmed β so the continuation walk's
+        // `inner_beta_hint` forwarding is unchanged. ValueAndGradient and
+        // ValueGradientHessian are byte-identical to before.
+        if matches!(order, crate::solver::outer_strategy::OuterEvalOrder::Value) {
+            let t_assemble = std::time::Instant::now();
+            let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+                self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?
+            } else {
+                self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueOnly)?
+            };
+            store_ift_residual_energy_for_outer_theta(p, result.ift_residual_energy);
+            log::debug!(
+                "[REML] outer-eval value-only done | cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
+                result.cost,
+                t_assemble.elapsed().as_secs_f64() * 1000.0,
+                t_eval_start.elapsed().as_secs_f64() * 1000.0
+            );
+            // Deliberately NOT cached into `store_outer_eval`: that cache serves
+            // gradient/Hessian-bearing requests, and a gradient-free entry would
+            // force a re-evaluation the moment the optimiser asks for a real
+            // gradient at the same ρ. A value-only probe is cheap to repeat.
+            return Ok(OuterEval {
+                cost: result.cost,
+                gradient: Array1::zeros(p.len()),
+                hessian: HessianResult::Unavailable,
+                inner_beta_hint: self.current_original_basis_beta(),
+            });
+        }
+
         let decision = match order {
-            // Value-only requests ride the gradient path: this evaluator's
-            // assembly contract requires a gradient (see the `result.gradient`
-            // demand below), so the cheapest honest fulfilment of a value-only
-            // order here is value+gradient with the Hessian skipped.
+            // Value+gradient: this evaluator's assembly contract requires a
+            // gradient (see the `result.gradient` demand below), so fulfil it as
+            // value+gradient with the Hessian skipped.
             crate::solver::outer_strategy::OuterEvalOrder::Value
             | crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => None,
             crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian => {
