@@ -168,11 +168,13 @@ fn beta_generative_noise_uses_estimated_phi_not_seed() {
 
     // The observation model that generation/prediction-variance uses must carry
     // the *estimated* precision, not the seed phi = 1.0. The bug leaves it at 1.0,
-    // so `gam generate` draws Beta responses with ~20x too much variance.
+    // so `gam generate` draws Beta responses with ~20x too much variance. The
+    // dispersion field is now a per-row vector (#1125) broadcast from the scalar
+    // estimate, so every row must carry the fitted precision.
     assert!(
-        (noise_phi - estimated_phi).abs() < 1e-6,
+        noise_phi.iter().all(|&p| (p - estimated_phi).abs() < 1e-6),
         "Beta generative noise uses the seed precision, not the fitted one: \
-         noise phi={noise_phi}, estimated phi={estimated_phi} \
-         (gam generate would draw responses with phi={noise_phi})"
+         noise phi={noise_phi:?}, estimated phi={estimated_phi} \
+         (gam generate would draw responses with phi={noise_phi:?})"
     );
 }
